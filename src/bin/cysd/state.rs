@@ -450,6 +450,16 @@ pub struct Surface {
     /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     pub pending_input_bytes: AtomicU64,
+    /// ★R1-blocking-2 입력줄 게이트 — **직접 write 경로와 큐 Inject 경로의 상호배제**.
+    ///
+    /// 왜 필요한가(codex 감사 실측): `surface.send_text` 는 writer 에 Program 을 넣은 **뒤**
+    /// `pending_input_bytes` 를 기록한다. 그 창에서 watchdog 이 pending=0 을 보고 ready 로
+    /// 판정해 Inject 를 넣으면 **두 본문이 한 제출로 합쳐진다**(오너 임무 게이트가
+    /// `delivery_concatenated`·`delivery_substring` 이상징후를 실제로 발행한 축).
+    ///
+    /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
+    /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
+    pub input_gate: std::sync::Mutex<()>,
     /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
@@ -3028,6 +3038,7 @@ impl Daemon {
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             pending_input_bytes: AtomicU64::new(0),
+            input_gate: std::sync::Mutex::new(()),
             queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),

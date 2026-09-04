@@ -3058,6 +3058,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★B2′: 비-clear_first 본문은 human_verified 여부로 Data/Program 이 갈린다 —
             //   Program 만 writer 의 최소 간격 기준점을 찍는다(send_text_write_req doc 참조).
             let write_req = send_text_write_req(&text, clear_first, human_verified);
+            // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
+            //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
+            //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
+            //   락 순서 계약: pending_queue → input_gate. 여기서는 input_gate 하나만 잡고
+            //   그 안에서 다른 락을 잡지 않는다(사이클 없음).
+            let _gate = surface.input_gate.lock().unwrap();
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
@@ -3076,6 +3082,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 };
                 surface.pending_input_bytes.store(next, Ordering::Relaxed);
             }
+            drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             if !human_verified {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
@@ -9049,18 +9056,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★R1 배달 원장 + ★★R4 human 신뢰 제거 — send_text 전 경로 커버리지를 한 자리에 박제한다.
-    ///
-    /// 적발 인계 ②: `cys send --to master "…"` 는 `clear_first` 없이 **Data 분기**를 탄다.
-    /// 원장을 Inject 사이트에만 걸면 정작 사고 경로가 원장에 남지 않는다. 여기서 두 분기를
-    /// 모두 dispatch 로 관통시켜 박제한다.
-    ///
-    /// ★R4 계약 교체(라운드3 검증자 N3 실측 봉합): 종전 이 테스트는 "`human:true` 면 무조건
-    /// 무기록"을 박제했는데, 그 계약 자체가 결함이었다 — `human` 은 클라이언트 자기신고라
-    /// 원시 소켓 한 줄이면 누구나 붙일 수 있고, 그 순간 원장이 비어 층2 라벨 폴백으로 내려가
-    /// 무라벨 push 가 오너 임무가 됐다. 새 계약은 **데몬이 발급한 operator.token 이 일치할 때만**
-    /// 무기록이다. 아래 ②/③ 대조가 그 분기점이며, ③(인계 ③ 불변식)이 깨지면 온보딩이 사망한다.
-    #[test]
     /// ★B1(0.14.30) C4 핀: 같은 발신자의 대기 큐가 있는데 직접 send 가 앞지르면
     /// `queue.order_inverted` 를 남긴다(queue-starvation-case.md §8 실사고 — 구 회신이 신 지시보다
     /// 늦게 도착해 수신자가 집행을 정지했다). 재정렬은 하지 않는다(직접 send 는 의도된 steer).
@@ -9114,6 +9109,18 @@ mod tests {
         );
     }
 
+    /// ★R1 배달 원장 + ★★R4 human 신뢰 제거 — send_text 전 경로 커버리지를 한 자리에 박제한다.
+    ///
+    /// 적발 인계 ②: `cys send --to master "…"` 는 `clear_first` 없이 **Data 분기**를 탄다.
+    /// 원장을 Inject 사이트에만 걸면 정작 사고 경로가 원장에 남지 않는다. 여기서 두 분기를
+    /// 모두 dispatch 로 관통시켜 박제한다.
+    ///
+    /// ★R4 계약 교체(라운드3 검증자 N3 실측 봉합): 종전 이 테스트는 "`human:true` 면 무조건
+    /// 무기록"을 박제했는데, 그 계약 자체가 결함이었다 — `human` 은 클라이언트 자기신고라
+    /// 원시 소켓 한 줄이면 누구나 붙일 수 있고, 그 순간 원장이 비어 층2 라벨 폴백으로 내려가
+    /// 무라벨 push 가 오너 임무가 됐다. 새 계약은 **데몬이 발급한 operator.token 이 일치할 때만**
+    /// 무기록이다. 아래 ②/③ 대조가 그 분기점이며, ③(인계 ③ 불변식)이 깨지면 온보딩이 사망한다.
+    #[test]
     fn send_text_ledger_records_unless_operator_token_verifies_human() {
         let _g = ACL_ENV_LOCK.lock().unwrap();
         // ★R5-B: 상태 디렉터리 격리는 `daemon_with_acl` 이 스레드 로컬로 건다(종전의 손수

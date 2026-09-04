@@ -4294,21 +4294,13 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
     Ok(())
 }
 
-/// try_send로 writer 채널에 인계한 머리 메시지를 큐에서 제거한다.
-/// deliver_queued가 front 읽기·인계·이 호출을 한 락 임계영역으로 묶으므로 호출 시점에
-/// 머리는 항상 방금 보낸 항목이다. 그래도 머리 일치를 확인하고 제거하는 belt-and-suspenders
-/// 가드 — 무조건 pop_front이 미배달 새 머리를 삼키는 일을 구조적으로 차단한다.
-/// ★G1(W2-A): 판정을 텍스트에서 **id**로 승격 — 텍스트 비교는 동일 문구 중복 항목
-/// (빈 문자열 Return 큐가 대표례)에서 원리상 모호했다. id는 유일하므로 가드가 완전해진다.
-fn pop_delivered_head(q: &mut std::collections::VecDeque<crate::state::QueueEntry>, delivered_id: &str) {
-    if q.front().map(|e| e.id.as_str()) == Some(delivered_id) {
-        q.pop_front();
-    }
-}
-
 /// ★B1(0.14.30): 병합 배달분 제거 — 인계에 성공한 id 집합만 큐에서 뺀다(순서 보존·나머지 유지).
-/// 단건이면 `pop_delivered_head` 와 결과가 같다(머리 1개 제거). 인계 실패 경로에서는 호출되지
-/// 않으므로 '보내지 않은 항목을 지운다' 는 경로가 구조적으로 없다.
+/// 단건이면 머리 1개 제거로 종전 동작과 같다. 인계 실패 경로에서는 호출되지 않으므로
+/// '보내지 않은 항목을 지운다' 는 경로가 구조적으로 없다.
+///
+/// 판정이 텍스트가 아니라 **id** 인 것이 핵심이다(G1(W2-A)): 텍스트 비교는 동일 문구 중복
+/// 항목(빈 문자열 Return 큐가 대표례)에서 원리상 모호했고, 무조건 pop_front 이면 락이 풀린
+/// 창에 새로 들어온 **미배달** 머리를 삼킨다. id 대조가 그 두 경로를 함께 막는다.
 fn pop_delivered_ids(
     q: &mut std::collections::VecDeque<crate::state::QueueEntry>,
     ids: &[String],
@@ -4843,6 +4835,7 @@ fn queue_digest_max_chars() -> usize {
 /// 발신자 내부 순서가 보존된다.
 pub(crate) fn plan_queue_merge(
     froms: &[Option<String>],
+    origins: &[String],
     chars: &[usize],
     max_items: usize,
     max_chars: usize,
@@ -4851,21 +4844,36 @@ pub(crate) fn plan_queue_merge(
         return Vec::new();
     }
     let head_from = froms[0].clone();
+    let head_origin = origins.first().cloned().unwrap_or_default();
     let mut picked = vec![0usize];
-    let mut total = chars.first().copied().unwrap_or(0);
     for i in 1..froms.len() {
         if picked.len() >= max_items {
             break;
         }
+        // ★R1-blocking-3(codex 감사): **연속 구간만** 병합한다. 종전엔 다른 발신자를
+        //   `continue` 로 건너뛰고 뒤의 같은 발신자를 당겼는데, 그러면 A1,B1,A2 가 A1+A2 로
+        //   나가 B1 보다 늦게 들어온 A2 가 먼저 도착한다 — head-only 단일 큐가 갖고 있던
+        //   **발신자 간 FIFO** 가 깨진다(§8 역전 사고와 같은 계열).
         if froms[i] != head_from {
-            continue; // 다른 발신자는 이번 다이제스트에 섞지 않는다
+            break;
         }
-        let next = total.saturating_add(chars[i]);
-        if next > max_chars {
+        // origin 도 키다 — `send`(본문)와 `send-key`(Return)를 섞으면 제출 키가 본문
+        //   다이제스트 안으로 들어간다.
+        if origins.get(i) != Some(&head_origin) {
+            break;
+        }
+        // ★R1-major-4: 상한 판정은 **최종 렌더 결과**의 문자 수다. 원문 합만 세면 머리말·
+        //   번호 오버헤드만큼 초과 배달된다(원문 4000 → 실제 4042자).
+        let mut cand = picked.clone();
+        cand.push(i);
+        let texts: Vec<String> = cand
+            .iter()
+            .map(|&j| "x".repeat(chars.get(j).copied().unwrap_or(0)))
+            .collect();
+        if render_queue_digest(head_from.as_deref(), &texts).chars().count() > max_chars {
             break; // 상한 초과분은 **자르지 않고** 다음 배달로 이월한다(유실 0)
         }
-        total = next;
-        picked.push(i);
+        picked = cand;
     }
     picked
 }
@@ -4903,7 +4911,7 @@ pub(crate) struct Delivered {
 /// quiet 판정)는 호출부 책임 — 이 헬퍼는 게이트를 통과한 뒤의 원자 배달만 담당한다.
 ///
 /// 임계영역(현행 순서·원자성 그대로 — 절대 불변): pending_queue 락 획득 → front →
-/// record_audited → try_send → pop_delivered_head(id) → 락 해제.
+/// record_audited → try_send → pop_delivered_ids(ids) → 락 해제.
 ///
 /// - ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). `cys send --queued` 는 enqueue
 ///   시점에 조기 반환하므로 **여기가 유일한 주입 지점**이다. 임계영역(pending_queue 락)
@@ -4919,15 +4927,30 @@ pub(crate) struct Delivered {
 ///   하지 않고** None — RPC 강제 배달이 게이트 통과·조준 해석과 실배달 사이 창에서 틱·clear 와
 ///   경합해도 '조준한 항목이 아닌 다음 항목'을 forced 로 오배달하지 않는다(pop-by-id 와 같은
 ///   belt-and-suspenders 층). watchdog 틱은 None 을 넘긴다('그 시점 머리'가 곧 조준 — 현행 동일).
+/// `expect_pending`: 준비 판정이 **본** `pending_input_bytes` 값. `Some(v)` 이면 배달 직전
+/// 임계영역에서 그 값이 그대로인지 재확인하고, 달라졌으면 배달하지 않는다(메시지 보존).
+///
+/// ★R1-blocking-2(codex 감사): 판정과 주입 사이에 직접 send 가 입력줄을 점유하면 두 본문이
+/// 한 제출로 합쳐진다. 판정→주입을 `input_gate` 안에서 원자로 만들고, 그 안에서 값을 다시
+/// 읽어 **확인 후 행동**(check-then-act)을 성립시킨다. `None` 은 재확인 없음(운영자 강제 배달) —
+/// 그 경로도 게이트는 잡으므로 두 writer 인계가 동시에 일어나지는 않는다.
 pub(crate) fn deliver_head_locked(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     forced: bool,
     overdue: bool,
     expect_head_id: Option<&str>,
+    expect_pending: Option<u64>,
 ) -> Option<Delivered> {
     let delivered = {
         let mut q = s.pending_queue.lock().unwrap();
+        // 락 순서 계약: pending_queue → input_gate (state.rs Surface::input_gate doc).
+        let _gate = s.input_gate.lock().unwrap();
+        if let Some(want) = expect_pending {
+            if s.pending_input_bytes.load(Ordering::Relaxed) != want {
+                return None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
+            }
+        }
         let entry = q.front().cloned()?;
         if expect_head_id.is_some_and(|want| want != entry.id) {
             return None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
@@ -4938,9 +4961,11 @@ pub(crate) fn deliver_head_locked(
         let merge_on = !forced && expect_head_id.is_none();
         let picked: Vec<usize> = if merge_on && q.len() > 1 {
             let froms: Vec<Option<String>> = q.iter().map(|e| e.from.clone()).collect();
+            let origins: Vec<String> = q.iter().map(|e| e.origin.clone()).collect();
             let chars: Vec<usize> = q.iter().map(|e| e.text.chars().count()).collect();
             plan_queue_merge(
                 &froms,
+                &origins,
                 &chars,
                 queue_digest_max_items(),
                 queue_digest_max_chars(),
@@ -5210,7 +5235,7 @@ pub(crate) fn force_deliver_entry(
     // 배달 = 단일 헬퍼 공유(forced=true·overdue=false — 이벤트 층 구분만, 임계영역 동일).
     // expect_head_id: 게이트·조준과 실배달 사이 창에서 틱이 먼저 배달했거나 clear 가 drain
     // 했으면 무부작용 None → Raced(조준 아닌 다음 항목을 forced 로 오배달하지 않는다).
-    deliver_head_locked(daemon, s, true, false, Some(&target.id))
+    deliver_head_locked(daemon, s, true, false, Some(&target.id), None)
         .ok_or(ForceDeliverDenied::Raced)
 }
 
@@ -5304,9 +5329,13 @@ fn deliver_queued(
             merged_ready_marker(disk, embed, &agent)
         });
         let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
+        // ★R1-blocking-2: 준비 판정이 **본** 입력줄 점유량. 배달 직전 임계영역에서 이 값이
+        //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
+        //   마커 없는 quiet 폴백 경로도 같은 값을 쓴다(그 경로도 같은 writer 로 들어간다).
+        let pending_at_verdict = s.pending_input_bytes.load(Ordering::Relaxed);
         let overdue = if let Some(marker) = marker.as_deref() {
             let (marker_seen, line) = observe_prompt(&s, marker);
-            let pending = s.pending_input_bytes.load(Ordering::Relaxed);
+            let pending = pending_at_verdict;
             let input = input_line_state(
                 pending,
                 line.as_ref().map(|(b, a)| PromptLine {
@@ -5404,7 +5433,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
-        if deliver_head_locked(daemon, &s, false, overdue, None).is_some() {
+        if deliver_head_locked(daemon, &s, false, overdue, None, Some(pending_at_verdict)).is_some() {
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
             // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
@@ -7623,7 +7652,7 @@ mod tests {
     }
 
     use super::{
-        collect_scoped_for_shutdown, pop_delivered_head,
+        collect_scoped_for_shutdown, pop_delivered_ids,
         prune_surface_health_keys, prune_watchdog_debounce_maps, LOAD_DEBOUNCE_SECS,
     };
     use crate::state::LedgerEntry;
@@ -7971,39 +8000,39 @@ mod tests {
     }
 
     #[test]
-    fn pop_delivered_head_removes_matching_head() {
+    fn pop_delivered_ids_removes_matching_head() {
         // 정상 경로: 보낸 항목이 여전히 머리 → 제거(판정 = id). 뒤 항목은 보존.
         let mut deque = q(&["msg1", "msg2"]);
-        pop_delivered_head(&mut deque, "id-msg1");
+        pop_delivered_ids(&mut deque, &["id-msg1".to_string()]);
         assert_eq!(deque, q(&["msg2"]));
     }
 
     #[test]
-    fn pop_delivered_head_noop_on_empty_after_clear() {
+    fn pop_delivered_ids_noop_on_empty_after_clear() {
         // lost-clear 시나리오: front 읽은 뒤 락이 풀린 창에서 queue.clear가 drain →
         // 빈 큐. 핵심은 '빈 큐를 건드리지 않고' 손상 없이 빠져나오는 것.
         // (이미 PTY로 간 메시지는 회수 불가 — 아키텍처 한계)
         let mut deque = q(&[]);
-        pop_delivered_head(&mut deque, "id-msg1");
+        pop_delivered_ids(&mut deque, &["id-msg1".to_string()]);
         assert!(deque.is_empty());
     }
 
     #[test]
-    fn pop_delivered_head_preserves_new_message_after_clear_and_enqueue() {
+    fn pop_delivered_ids_preserves_new_message_after_clear_and_enqueue() {
         // 유해 변종(이 수정의 핵심 회귀 가드): front("msgA") 읽고 락 해제 →
         // 그 창에서 clear가 drain([]) 후 새 메시지 "msgB" enqueue → 큐=["msgB"].
         // 무조건 pop_front이면 미배달 "msgB"를 삼켜 조용히 유실시킨다.
         // 머리가 보낸 "msgA"(id)가 아니므로 제거하지 않아야 한다 — "msgB"는 다음 틱에 배달.
         let mut deque = q(&["msgB"]);
-        pop_delivered_head(&mut deque, "id-msgA");
+        pop_delivered_ids(&mut deque, &["id-msgA".to_string()]);
         assert_eq!(deque, q(&["msgB"]), "미배달 새 메시지가 유실되면 안 된다");
     }
 
     #[test]
-    fn pop_delivered_head_preserves_replacement_head() {
+    fn pop_delivered_ids_preserves_replacement_head() {
         // clear→enqueue가 여러 건이어도 머리 불일치면 한 건도 삼키지 않는다.
         let mut deque = q(&["msgB", "msgC"]);
-        pop_delivered_head(&mut deque, "id-msgA");
+        pop_delivered_ids(&mut deque, &["id-msgA".to_string()]);
         assert_eq!(deque, q(&["msgB", "msgC"]));
     }
 
@@ -8011,15 +8040,15 @@ mod tests {
     /// 2건 — send-key --queued의 실경로)라도 id가 다르면 절대 pop하지 않는다.
     /// 텍스트 비교였다면 배달된 1번 항목의 ack가 미배달 2번 항목을 오삼킴할 수 있었다.
     #[test]
-    fn pop_delivered_head_same_text_different_id_never_pops() {
+    fn pop_delivered_ids_same_text_different_id_never_pops() {
         // 시나리오: front(id=ret-1) 읽고 락 해제 → 그 창에서 clear+재enqueue로 머리가
         // 같은 텍스트("")의 다른 항목(id=ret-2)으로 교체 → ret-1 ack가 ret-2를 삼키면 안 된다.
         let mut deque: VecDeque<crate::state::QueueEntry> =
             [qe("ret-2", ""), qe("ret-3", "")].into_iter().collect();
-        pop_delivered_head(&mut deque, "ret-1");
+        pop_delivered_ids(&mut deque, &["ret-1".to_string()]);
         assert_eq!(deque.len(), 2, "동일 텍스트라도 id 불일치면 pop 금지(오삼킴 차단)");
         // 대조군: 머리 id 일치 시에만 정확히 그 항목 하나를 제거.
-        pop_delivered_head(&mut deque, "ret-2");
+        pop_delivered_ids(&mut deque, &["ret-2".to_string()]);
         assert_eq!(deque.len(), 1);
         assert_eq!(deque.front().map(|e| e.id.as_str()), Some("ret-3"));
     }
@@ -8034,7 +8063,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     // production deliver_queued의 임계영역과 동일한 순서(★G1 W2-A: QueueEntry·pop-by-id 이식):
-    // 락 획득 → front().cloned() → try_send(writer) → pop_delivered_head(id) → 락 해제.
+    // 락 획득 → front().cloned() → try_send(writer) → pop_delivered_ids(ids) → 락 해제.
     fn deliver_one_atomic(
         queue: &Mutex<VecDeque<crate::state::QueueEntry>>,
         writer: &std::sync::mpsc::SyncSender<String>,
@@ -8045,7 +8074,7 @@ mod tests {
         if writer.try_send(entry.text.clone()).is_err() {
             return None;
         }
-        pop_delivered_head(&mut q, &entry.id);
+        pop_delivered_ids(&mut q, &[entry.id.clone()]);
         Some(entry.text)
     }
 
@@ -8398,27 +8427,121 @@ mod tests {
 
     use super::{plan_queue_merge, render_queue_digest};
 
-    /// 같은 발신자만 모으고 상한(건수)에서 멈춘다 — 다른 발신자는 섞이지 않는다.
+    /// 머리에서 **연속한** 같은 발신자만 모으고 상한(건수)에서 멈춘다.
+    ///
+    /// ★R1 계약 교체(codex 감사): 종전 픽스처는 `[A,B,A,A,None,A]` 에서 `[0,2,3]` 을 기대했다 —
+    /// 즉 **다른 발신자를 건너뛰고 뒤의 같은 발신자를 당기는** 동작을 박제하고 있었고, 그것이
+    /// 바로 발신자 간 FIFO 를 깨는 결함이었다. 픽스처를 연속 버스트로 바꿔 같은 의도(건수 상한)를
+    /// 유지하면서 올바른 계약을 잰다.
     #[test]
     fn b1_merge_plan_picks_same_sender_up_to_item_cap() {
         let froms = vec![
             Some("surface:19".to_string()),
+            Some("surface:19".to_string()),
+            Some("surface:19".to_string()),
+            Some("surface:19".to_string()),
             Some("surface:12".to_string()),
-            Some("surface:19".to_string()),
-            Some("surface:19".to_string()),
-            None,
             Some("surface:19".to_string()),
         ];
         let chars = vec![10, 10, 10, 10, 10, 10];
         assert_eq!(
-            plan_queue_merge(&froms, &chars, 3, 10_000),
-            vec![0, 2, 3],
-            "머리와 같은 발신자만 큐 순서대로 · 건수 상한에서 정지"
+            plan_queue_merge(&froms, &vec!["send".to_string(); froms.len()], &chars, 3, 10_000),
+            vec![0, 1, 2],
+            "머리에서 연속한 같은 발신자만 · 건수 상한에서 정지"
         );
         assert_eq!(
-            plan_queue_merge(&froms, &chars, 1, 10_000),
+            plan_queue_merge(&froms, &vec!["send".to_string(); froms.len()], &chars, 1, 10_000),
             vec![0],
             "상한 1 = 병합 비활성(종전 1건 배달과 동일)"
+        );
+    }
+
+    /// ★R1-blocking-2 (codex 감사 · 실패 먼저 잠금): direct write 와 queue Inject 가 한 제출로
+    /// 합쳐지는 경쟁을 막는다.
+    ///
+    /// 기제: `surface.send_text` 는 writer 에 Program 을 넣은 **뒤** `pending_input_bytes` 를
+    /// 기록한다. 그 창에서 watchdog 이 pending=0 을 보고 ready 로 판정해 Inject 를 넣으면 두 본문이
+    /// 한 제출로 합쳐진다(오너 임무 게이트가 `delivery_concatenated`·`delivery_substring` 이상징후를
+    /// 실제로 발행한 그 축이다). 배달 직전에 **판정이 본 pending 값이 그대로인지** 재확인해야 한다.
+    #[test]
+    fn b1_delivery_aborts_when_pending_input_changed_after_ready_verdict() {
+        let daemon = drill_daemon("r1-race");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let e = daemon.next_queue_entry("[보고] 큐 본문".into(), Some("surface:9".into()), "send");
+        s.pending_queue.lock().unwrap().push_back(e);
+
+        // ⓐ 판정이 본 값(0) 과 배달 시점 값(직접 send 가 끼어들어 12)이 다르면 **배달하지 않는다**.
+        s.pending_input_bytes.store(12, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0)).is_none(),
+            "판정 이후 직접 send 가 입력줄을 점유했는데 큐를 밀어 넣었다 — 두 본문이 한 제출로 합쳐진다"
+        );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미배달분은 보존돼야 한다");
+
+        // ⓑ 음성 대조: 값이 그대로면 정상 배달된다(무조건 거부 구현 차단).
+        s.pending_input_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0)).is_some(),
+            "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다"
+        );
+    }
+
+    /// ★R1-blocking-3 (codex 감사 · 실패 먼저 잠금): 발신자 간 FIFO 를 깨지 않는다.
+    ///
+    /// 종전 구현은 다른 발신자를 `continue` 로 **건너뛰고** 뒤의 같은 발신자를 골랐다. A1,B1,A2 가
+    /// A1+A2 로 묶여 나가면 B1 보다 늦게 들어온 A2 가 먼저 도착한다 — head-only 단일 큐가 갖고
+    /// 있던 발신자 간 FIFO 가 깨진다(그리고 그 역전은 §8 이 기록한 실사고와 같은 계열이다).
+    #[test]
+    fn b1_merge_preserves_cross_sender_fifo() {
+        let froms = vec![Some("A".into()), Some("B".into()), Some("A".into())];
+        let origins = vec!["send".to_string(); 3];
+        assert_eq!(
+            plan_queue_merge(&froms, &origins, &[1, 1, 1], 5, 4000),
+            vec![0],
+            "다른 발신자를 건너뛰고 뒤의 같은 발신자를 당기면 발신자 간 FIFO 가 깨진다"
+        );
+        // 양성 대조: 머리에서 **연속**한 같은 발신자는 그대로 병합된다(버스트 봉인 유지).
+        let froms2 = vec![Some("A".into()), Some("A".into()), Some("B".into())];
+        assert_eq!(
+            plan_queue_merge(&froms2, &vec!["send".to_string(); 3], &[1, 1, 1], 5, 4000),
+            vec![0, 1]
+        );
+    }
+
+    /// ★R1-blocking-3: `send` 와 `send-key` 는 같은 발신자여도 병합하지 않는다 —
+    /// Return 키가 본문 다이제스트에 섞여 들어가는 경로다(제출이 본문이 된다).
+    #[test]
+    fn b1_merge_never_mixes_send_and_send_key() {
+        let froms = vec![Some("A".into()), Some("A".into())];
+        let origins = vec!["send".to_string(), "send-key".to_string()];
+        assert_eq!(
+            plan_queue_merge(&froms, &origins, &[1, 1], 5, 4000),
+            vec![0],
+            "origin 이 다르면 병합 금지 — Return 이 본문에 섞인다"
+        );
+        // 양성 대조: 같은 origin 이면 병합된다.
+        assert_eq!(
+            plan_queue_merge(&froms, &vec!["send-key".to_string(); 2], &[1, 1], 5, 4000),
+            vec![0, 1]
+        );
+    }
+
+    /// ★R1-major-4: 문자 상한은 **최종 렌더 결과**를 기준으로 센다. 원문 합만 세면 머리말·번호
+    /// 오버헤드만큼 초과 배달된다(원문 4000 → 실제 4042자).
+    #[test]
+    fn b1_merge_cap_counts_rendered_output_not_raw_sum() {
+        let froms = vec![Some("A".into()); 3];
+        let origins = vec!["send".to_string(); 3];
+        // 원문 합 3000 이지만 렌더 오버헤드를 더하면 상한 3050 을 넘는 조합.
+        let picked = plan_queue_merge(&froms, &origins, &[1000, 1000, 1000], 5, 3050);
+        let texts: Vec<String> = picked.iter().map(|&i| "x".repeat([1000, 1000, 1000][i])).collect();
+        let rendered = render_queue_digest(Some("A"), &texts).chars().count();
+        assert!(
+            rendered <= 3050,
+            "렌더 결과 {rendered}자가 상한 3050 을 넘었다 — 상한이 오버헤드를 안 세고 있다"
         );
     }
 
@@ -8427,18 +8550,30 @@ mod tests {
     fn b1_merge_plan_carries_over_instead_of_truncating() {
         let froms = vec![Some("a".into()), Some("a".into()), Some("a".into())];
         let chars = vec![3000, 1500, 100];
-        let picked = plan_queue_merge(&froms, &chars, 5, 4000);
+        let picked = plan_queue_merge(&froms, &vec!["send".to_string(); froms.len()], &chars, 5, 4000);
         assert_eq!(picked, vec![0], "3000+1500 > 4000 → 둘째부터 이월");
         // 머리 단독이 상한을 넘어도 배달은 막지 않는다(막으면 그 자체가 기아다).
         let big = vec![Some("a".into()), Some("a".into())];
-        assert_eq!(plan_queue_merge(&big, &[9000, 10], 5, 4000), vec![0]);
+        assert_eq!(plan_queue_merge(&big, &vec!["send".to_string(); big.len()], &[9000, 10], 5, 4000), vec![0]);
     }
 
     /// 발신자가 없는(None) 항목끼리도 같은 축으로 묶인다 — 판정은 값 동등성 하나다.
+    ///
+    /// ★R1 계약 교체(codex 감사): 종전 픽스처 `[None, a, None]` → `[0,2]` 는 건너뛰기 병합을
+    /// 박제한 것이었다. None 끼리 묶이는 것은 맞되 **연속 구간**에서만이다.
     #[test]
     fn b1_merge_plan_treats_missing_sender_as_its_own_group() {
-        let froms = vec![None, Some("a".into()), None];
-        assert_eq!(plan_queue_merge(&froms, &[1, 1, 1], 5, 4000), vec![0, 2]);
+        let froms = vec![None, None, Some("a".into())];
+        assert_eq!(
+            plan_queue_merge(&froms, &vec!["send".to_string(); froms.len()], &[1, 1, 1], 5, 4000),
+            vec![0, 1]
+        );
+        // 음성 대조: 사이에 다른 발신자가 끼면 거기서 멈춘다(건너뛰지 않는다).
+        let split = vec![None, Some("a".into()), None];
+        assert_eq!(
+            plan_queue_merge(&split, &vec!["send".to_string(); split.len()], &[1, 1, 1], 5, 4000),
+            vec![0]
+        );
     }
 
     /// 다이제스트는 각 항목 **원문을 그대로** 담는다(바이트 보존 = sha 전수 대조 성립 조건).
@@ -8901,7 +9036,7 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         // 빈 큐 = None + 이벤트 0(부작용 없음).
-        assert!(deliver_head_locked(&daemon, &s, false, false, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None).is_none());
         assert_eq!(
             daemon
                 .bus
@@ -8919,7 +9054,7 @@ mod tests {
             q.push_back(e1);
             q.push_back(e2);
         }
-        let d = deliver_head_locked(&daemon, &s, true, false, None).expect("머리 배달");
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None).expect("머리 배달");
         assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
         assert_eq!(d.remaining, 1);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
@@ -8963,7 +9098,7 @@ mod tests {
         let e1 = daemon.next_queue_entry("현재 머리".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e1.clone());
         // 조준(다른 id)과 머리 불일치 → 배달·pop·이벤트 전무.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999")).is_none());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None).is_none());
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "불일치 시 pop 금지");
         assert_eq!(
             daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.delivered").count(),
@@ -8971,7 +9106,7 @@ mod tests {
             "불일치 시 배달 영수증도 없다(무부작용)"
         );
         // 대조군: 일치하면 정상 배달.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id)).is_some());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None).is_some());
         assert!(s.pending_queue.lock().unwrap().is_empty());
     }
 

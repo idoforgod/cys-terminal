@@ -636,6 +636,7 @@ pub struct RecordReport {
 /// ★주입 **직전** 호출(감사 상세 포함) — 전문 + 제출 단위 조각을 원장에 남긴다.
 ///
 /// 호출 규약·불변식은 `record` 와 같다. 조각의 의미와 대안 비교는 모듈 머리말 R6 절.
+#[cfg(test)]
 pub fn record_full(
     socket_path: &Path,
     surface_id: u64,

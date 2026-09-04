@@ -255,6 +255,37 @@ fn collect_for(
     // ── 증분 read + 파싱 (마지막 유효 관측이 승리) ──
     let lines = read_new_lines(state);
     if lines.is_empty() {
+        // ★R1-blocking-1: 신규 줄이 없어도 **낡은 매핑은 값을 비운다**. 세션 교체 후 옛 파일에는
+        //   줄이 붙지 않으므로 여기서 그냥 반환하면 이전 numeric snapshot 이 무기한 남는다
+        //   (B6 목적 미달 — codex 감사). statusline 이 신선하면 그 진실값은 건드리지 않는다.
+        if !statusline_fresh {
+            let prev = s.observed_usage.lock().unwrap().clone();
+            if let Some(p) = prev {
+                let mt = mtime_epoch(std::path::Path::new(&p.session_file));
+                if let Some(next) = idle_stale_transition(
+                    &p,
+                    state.heuristic,
+                    now,
+                    mt,
+                    usage_max_session_age_secs(),
+                ) {
+                    state.last_discovery = 0.0; // 다음 틱 재발견 강제(가드 본문과 동일 계약)
+                    *s.observed_usage.lock().unwrap() = Some(next.clone());
+                    daemon.bus.publish(
+                        "usage.updated",
+                        "usage",
+                        Some(s.id),
+                        json!({
+                            "surface_ref": cys::surface_ref(s.id),
+                            "role": s.role.lock().unwrap().clone(),
+                            "agent": next.agent, "ctx_pct": next.ctx_pct,
+                            "ctx_tokens": next.ctx_tokens, "ctx_window": next.ctx_window,
+                            "rate": next.rate, "source": next.source,
+                        }),
+                    );
+                }
+            }
+        }
         return;
     }
     let prev = s.observed_usage.lock().unwrap().clone();
@@ -634,6 +665,40 @@ pub(crate) fn mapping_is_fresh(heuristic: bool, now: f64, session_mtime: f64, ma
         return true;
     }
     now - session_mtime <= max_age
+}
+
+/// ★R1-blocking-1 낡은 매핑의 **idle 전이**(순수) — 신규 줄이 없을 때도 값을 비운다.
+///
+/// 왜 필요한가(codex 감사 실측): 세션이 교체되면 옛 rollout 파일에는 더 이상 줄이 붙지 않는다.
+/// 즉 "신규 줄 0" 은 stale 의 **정상 증상**인데, `collect_for` 는 그 경우 freshness 검사 전에
+/// 반환해 이전 numeric snapshot 이 무기한 남았다 — B6 이 막으려던 바로 그 상태(낡은 값을
+/// 측정된 사실로 위장)가 idle 경로로 그대로 통과했다.
+///
+/// 반환 계약: 비울 것이 있을 때만 `Some(새 스냅샷)`. `None` 인 경우는 넷이다 —
+/// ⓐ 신선함 ⓑ 등록 매핑(heuristic=false — 소유자 명시) ⓒ 이미 비워진 stale(멱등 — 매 틱
+/// `:stale:stale` 로 자라지 않는다) ⓓ statusline(서버 진실값은 이 경로가 건드리지 않는다).
+pub(crate) fn idle_stale_transition(
+    prev: &ObservedUsage,
+    heuristic: bool,
+    now: f64,
+    session_mtime: f64,
+    max_age: f64,
+) -> Option<ObservedUsage> {
+    if prev.source == "statusline" || prev.source.ends_with(":stale") {
+        return None;
+    }
+    if mapping_is_fresh(heuristic, now, session_mtime, max_age) {
+        return None;
+    }
+    if prev.ctx_tokens.is_none() && prev.ctx_window.is_none() && prev.ctx_pct.is_none() {
+        return None; // 비울 수치가 없다 — 무의미한 이벤트를 내지 않는다
+    }
+    let mut next = prev.clone();
+    next.ctx_tokens = None;
+    next.ctx_window = None;
+    next.ctx_pct = None;
+    next.source = format!("{}:stale", prev.source);
+    Some(next)
 }
 
 /// ★B6 재발견 필요 판정(순수) — 신선도 가드가 `last_discovery = 0.0` 으로 강제하는 그 판정.
@@ -1399,6 +1464,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★R1-blocking-1 (codex 감사 · 실패 먼저 잠금): **신규 줄이 없어도** 낡은 매핑은 값을
+    /// 비워야 한다. 세션이 교체되면 옛 파일에는 더 이상 줄이 붙지 않으므로 "신규 줄 0" 은
+    /// stale 의 **정상 증상**이다 — 그런데 collect_for 는 그 경우 freshness 검사 **전에**
+    /// 반환해 이전 numeric snapshot 이 무기한 남았다. 내 기존 B6 검체는 판정자·수동 전이만
+    /// 봐서 이 조기 반환을 못 봤다(검체가 축을 안 보고 있었다).
+    ///
+    /// 이 검체는 그 축을 직접 잰다: 이전 스냅샷(수치 보유) + 오래된 mtime + 신규 줄 0.
+    #[test]
+    fn b6_idle_stale_clears_previous_snapshot_without_new_lines() {
+        let prev = ObservedUsage {
+            agent: "codex".into(),
+            ctx_tokens: Some(197_878),
+            ctx_window: Some(258_400),
+            ctx_pct: Some(76),
+            rate: Vec::new(),
+            source: "rollout:heuristic".into(),
+            session_file: "/x/rollout-old.jsonl".into(),
+            updated_at: 1.0,
+        };
+        let now = crate::state::now_epoch();
+        let old_mt = now - 20.9 * 3600.0; // dept-1 실측(20.9시간 정지)
+        // ⓐ 낡음 + 이전 수치 보유 → 비운 스냅샷을 낸다.
+        let got = idle_stale_transition(&prev, true, now, old_mt, 900.0)
+            .expect("낡은 매핑인데 전이가 없다 — 이전 수치가 무기한 남는다");
+        assert!(got.ctx_tokens.is_none() && got.ctx_window.is_none() && got.ctx_pct.is_none());
+        assert_eq!(got.source, "rollout:heuristic:stale", "provenance 에 stale 이 남아야 한다");
+        assert_eq!(got.session_file, prev.session_file, "어느 파일이 낡았는지는 보존");
+        // ⓑ 음성 대조 — 신선하면 전이 없음(무조건 비우는 구현 차단).
+        assert!(idle_stale_transition(&prev, true, now, now - 10.0, 900.0).is_none());
+        // ⓒ 음성 대조 — 등록 매핑(heuristic=false)은 나이로 비우지 않는다.
+        assert!(idle_stale_transition(&prev, false, now, old_mt, 900.0).is_none());
+        // ⓓ 멱등 — 이미 비워진 stale 스냅샷은 매 틱 다시 전이하지 않는다(:stale:stale 방지).
+        assert!(idle_stale_transition(&got, true, now, old_mt, 900.0).is_none());
+        // ⓔ statusline 진실값은 이 경로가 건드리지 않는다.
+        let mut sl = prev.clone();
+        sl.source = "statusline".into();
+        assert!(idle_stale_transition(&sl, true, now, old_mt, 900.0).is_none());
+    }
+
     /// ★생산 배선 핀(#4 회귀 0): 가드는 ⓐ statusline 조기 반환 **뒤**에 있고 ⓑ 세 수치를
     /// 비우며 ⓒ `:stale` 을 붙이고 ⓓ 재발견을 강제한다. claude statusline 경로는 이 지점에
     /// 도달하지 않으므로 무영향이다(그 순서가 깨지면 claude 값이 지워질 수 있다).
@@ -1425,6 +1529,16 @@ mod tests {
         ] {
             assert!(tail.contains(needle), "가드 계약 누락: {needle}");
         }
+        // ★R1-blocking-1 배선 핀: idle 전이는 `lines.is_empty()` **반환 안**에서 불려야 한다.
+        //   순수 함수 검체만으로는 호출부가 사라져도 초록이라(codex 가 지적한 '축을 안 보는
+        //   검체' 재발) 여기서 호출 위치를 함께 잠근다.
+        let empty_ret = body.find("if lines.is_empty()").expect("무신규라인 분기 소실");
+        let idle_call = body.find("idle_stale_transition(").expect("idle 전이 호출 소실");
+        assert!(
+            empty_ret < idle_call && idle_call < sl,
+            "idle 전이가 무신규라인 분기 안(그리고 statusline 반환 앞)에 없다 — \
+             낡은 수치가 무기한 남는 경로가 다시 열린다"
+        );
     }
 
     /// 소비자 계약 핀: stale 표기는 `:stale` 접미로 드러나고 값은 비어 있다(판정 불가를 값으로
