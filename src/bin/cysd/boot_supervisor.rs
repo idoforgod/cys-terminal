@@ -671,10 +671,85 @@ pub const PROGRESS_STALL_SECS: f64 = 126.0;
 /// 무장 여부와 무관하게 fence 가 살아난다. 게이트는 그 우연을 막는다(codex #7 의 요지다).
 pub const ENV_FENCE_ARMED: &str = "CYS_FENCE_ARMED";
 
-/// [`ENV_FENCE_ARMED`] 판독 — **기본 false**(미설정·미지값 전부 꺼짐).
+/// (R4 [4]) **러너 계약 준비도** — 이 빌드가 fence 를 감당할 수 있는가.
+///
+/// ## 왜 env 스위치만으로는 부족한가 (codex [4] · gemini 가 놓친 지점 · master 심판)
+/// [`ENV_FENCE_ARMED`] 하나로 arm 된다면, CAS 폐쇄면도 자가종료도 없는 빌드에서 **환경변수를
+/// 켜는 것만으로** fence 가 살아난다. 그때 세대를 올려봐야 그 거절을 집행할 주체가 없으므로
+/// 우리는 '무해해졌다' 고 믿으면서 실제로는 아무것도 막지 못한 채 표와 파일만 흔든다.
+/// 스위치는 **의도**를 나타내고 준비도는 **능력**을 나타낸다 — 다른 사실이므로 AND 여야 한다.
+///
+/// ## 왜 bool 하나가 아니라 여섯 칸인가
+/// `ready == false` 만 남으면 **무엇이 없어서 못 켜는지** 알 수 없고, 그 상태는 판독자에게
+/// '아직 안 됨' 과 '고장' 을 같아 보이게 한다(이 저장소가 PEND 사유 계약에서 이미 값을 치른
+/// 계급이다). 여섯 칸은 codex 가 지목한 목록 그대로이고, B4 가 하나씩 착지시킬 때마다 그
+/// 칸만 뒤집는다 — 무엇이 남았는지가 항상 [`RunnerReadiness::missing`] 으로 화면에 있다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunnerReadiness {
+    /// §2-7 러너의 side-effect RPC 가 lease 로 CAS 되어 구 세대를 **실제로 거절**하는가.
+    pub lease_cas_closed: bool,
+    /// terminal 기록과 표 갱신이 **원자 handler** 안에서 함께 일어나는가.
+    pub atomic_handler: bool,
+    /// epoch 가 러너까지 **전달되어** lease identity 에 실리는가.
+    pub epoch_propagated: bool,
+    /// 세대가 밀린 러너가 **스스로 종료**하는가(무kill 계약에서 회수의 유일한 주체다).
+    pub self_terminate: bool,
+    /// boot-last **골든 writer** 가 실재하는가.
+    pub boot_last_writer: bool,
+    /// fence 고아 원장이 **영속**되어 재시작을 넘는가(R3 #9).
+    pub durable_history: bool,
+}
+
+impl RunnerReadiness {
+    /// 여섯이 **전부** 참일 때만 준비됐다. 하나라도 비면 fence 는 막는 것 없이 표만 흔든다.
+    pub const fn ready(&self) -> bool {
+        self.lease_cas_closed
+            && self.atomic_handler
+            && self.epoch_propagated
+            && self.self_terminate
+            && self.boot_last_writer
+            && self.durable_history
+    }
+
+    /// 빠진 칸의 이름 — **왜** 못 켜는지 사람과 이벤트가 함께 읽는다.
+    pub fn missing(&self) -> Vec<&'static str> {
+        [
+            (self.lease_cas_closed, "lease_cas_closed"),
+            (self.atomic_handler, "atomic_handler"),
+            (self.epoch_propagated, "epoch_propagated"),
+            (self.self_terminate, "self_terminate"),
+            (self.boot_last_writer, "boot_last_writer"),
+            (self.durable_history, "durable_history"),
+        ]
+        .into_iter()
+        .filter(|(ok, _)| !ok)
+        .map(|(_, name)| name)
+        .collect()
+    }
+}
+
+/// **이 빌드의 준비도 — 지금은 전부 false 다.**
+///
+/// B4 가 각 계약을 착지시키면서 그 칸을 하나씩 뒤집는다. 한꺼번에 true 로 바꾸지 마라 —
+/// 이 상수의 값은 '그렇게 되기를 바란다' 가 아니라 '빌드와 검체에 실재한다' 는 주장이다.
+pub const RUNNER_READINESS: RunnerReadiness = RunnerReadiness {
+    lease_cas_closed: false,
+    atomic_handler: false,
+    epoch_propagated: false,
+    self_terminate: false,
+    boot_last_writer: false,
+    durable_history: false,
+};
+
+/// [`ENV_FENCE_ARMED`] 판독 — env 가 무장을 **요구**하는가(의도 축 하나만 본다).
 /// 켜는 쪽만 명시적이어야 한다: 오타 하나로 위험한 경로가 열리면 안 된다.
-pub fn fence_armed_from(env_val: Option<&str>) -> bool {
+pub fn env_asks_arm(env_val: Option<&str>) -> bool {
     matches!(env_val.map(str::trim), Some("1") | Some("true"))
+}
+
+/// (R4 [4]) 최종 무장 판정 — **의도 AND 능력**. 어느 한쪽만으로는 절대 켜지지 않는다.
+pub fn fence_armed_from(env_val: Option<&str>, readiness: RunnerReadiness) -> bool {
+    readiness.ready() && env_asks_arm(env_val)
 }
 
 /// (R4 [1]) epoch 후보 하나 — **비교가 아니라 동등성으로만** 쓰이는 식별자다(실측: 이 저장소
@@ -1599,6 +1674,8 @@ struct SupState {
     admission_capped_reported: bool,
     /// (R3 #7) fence 미무장 고지 래치 — 감독자 수명 1회.
     fence_disarmed_reported: bool,
+    /// (R4 [5]) armed 경로에서 나이 회수를 **보류했다**는 고지 래치 — 감독자 수명 1회.
+    orphan_hold_reported: bool,
     /// (R3 #7) fence 무장 여부. **기본 false** — 켜는 쪽만 명시적이다.
     fence_armed: bool,
     /// (R3 #2) 이 감독자 수명의 영속 epoch — lease identity 의 한 축.
@@ -1782,6 +1859,24 @@ fn notify_fence_disarmed_once(daemon: &Arc<Daemon>, st: &mut SupState) {
     );
 }
 
+/// (R4 [5]) armed 경로에서 **나이만으로 지우지 않았다**는 사실의 1회성 가청화.
+///
+/// 이 보류는 부트가 안 나는 상태로 이어질 수 있다(고아가 분모에 남아 admission 상한을 채운다).
+/// 그런 정지가 조용하면 운영자는 원인을 찾을 자리가 없다 — 안 하기로 정한 것과 그냥 안 되는
+/// 것은 다르고, 그 차이를 말하는 것이 이 한 줄의 값이다.
+fn notify_orphan_hold_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize) {
+    if st.orphan_hold_reported {
+        return;
+    }
+    st.orphan_hold_reported = true;
+    publish(
+        daemon,
+        "boot_supervisor.orphan_hold",
+        json!({"held": held, "cap": MAX_LIVE_BOOT_RUNS, "armed": true,
+               "note": "armed 에서는 나이 추정으로 고아를 지우지 않는다 — 확인된 exit(B4 러너 ACK)과 영속 history 착지 전까지 fail-closed"}),
+    );
+}
+
 fn notify_capped_once(daemon: &Arc<Daemon>, st: &mut SupState, kind: &str, why: &str) {
     if st.notify_capped_reported {
         return;
@@ -1886,7 +1981,21 @@ fn tick_in(
     //   이것은 관측이 아니라 추정이다(진짜 회수는 `try_wait` 관측 ④ⓐ·러너 자멸 ④ⓒ 이고 둘 다
     //   B4 다). 여기서 접지 않으면 상한이 한 번 차는 순간 **부트가 영구 정지**한다 — 유계는
     //   지키되 영구 정지는 만들지 않는다는 균형이고, 그 정직한 한계는 모듈 머리말에 적었다.
-    if let Ok(mut g) = daemon.boot_fenced.lock() {
+    //
+    // ★R4 [5](codex major 일부 · master 심판 · **지금 명시**): 그 균형은 **미무장에서만** 옳다.
+    //   미무장이면 dispatch 가 0 이므로 추정이 틀려도 새 프로세스가 늘지 않고, 이 접기는 상한이
+    //   한 번 차면 부트가 영영 안 나는 것만 막는다. 그러나 armed 가 되는 순간 같은 삭제는
+    //   **살아 있는 고아를 없는 것으로 세어 새 런을 낳는 문**이 된다 — fence 가 막으려던 바로
+    //   그 이중 실행이다. 확인된 exit(§2-7 러너의 ACK)과 영속 history 가 착지하기 전까지
+    //   armed 에서는 회수하지 않고 **fail-closed** 로 둔다(구현 완성은 B4 · 계약은 여기서 못박는다).
+    //   ★unknown-live 도 같은 방향이다: 관측이 안 되면 상한에 걸린 것으로 친다
+    //   (`admission_state` 가 `None` 을 돌리는 갈래 — 못 세는데 낳는 것이 이 축의 최악이다).
+    if st.fence_armed {
+        let held = daemon.boot_fenced.lock().map(|g| g.len()).unwrap_or(MAX_LIVE_BOOT_RUNS);
+        if held > 0 {
+            notify_orphan_hold_once(daemon, st, held);
+        }
+    } else if let Ok(mut g) = daemon.boot_fenced.lock() {
         g.retain(|f| now - f.at < FENCED_REAP_AGE_SECS);
     }
 
@@ -2242,12 +2351,27 @@ pub fn spawn(daemon: Arc<Daemon>) {
         let mut st = SupState::default();
         // ★R3 #7: fence 무장은 **env 로만** 켜진다(기본 꺼짐). 켜는 조건은 §2-7 러너의 CAS·자멸
         //   계약과 그 검체가 닫히는 것이고(B4), 그때 이 스위치 하나로 경로 전체가 살아난다.
-        st.fence_armed = fence_armed_from(std::env::var(ENV_FENCE_ARMED).ok().as_deref());
+        let arm_req = std::env::var(ENV_FENCE_ARMED).ok();
+        st.fence_armed = fence_armed_from(arm_req.as_deref(), RUNNER_READINESS);
         // ★R3 #2: lease identity 의 epoch 는 **데몬 수명당 하나**이고 디스크에 영속한다.
         //   스풀이 아니라 그 부모(상태 디렉터리)에 둔다 — 스풀은 인텐트 스캔·GC 의 대상이다.
         st.epoch = epoch;
         if st.fence_armed {
             eprintln!("[cysd] boot-supervisor: fence ARMED (epoch={})", st.epoch);
+        } else if env_asks_arm(arm_req.as_deref()) {
+            // ★R4 [4]: 요구했는데 못 켠 것은 **조용하면 안 된다.** 조용하면 운영자는 켰다고
+            //   믿고, 그 믿음 위에 다음 판단이 쌓인다. 무엇이 빠졌는지까지 함께 말한다.
+            let missing = RUNNER_READINESS.missing();
+            eprintln!(
+                "[cysd] boot-supervisor: fence 무장 요청을 거절했다 — 빌드 미준비 {missing:?}"
+            );
+            publish(
+                &daemon,
+                "boot_supervisor.fence_arm_refused",
+                json!({"env": ENV_FENCE_ARMED, "requested": true, "armed": false,
+                       "missing": missing,
+                       "note": "env 는 의도이고 readiness 는 능력이다 — 능력 없이 켜면 막는 것 없이 표만 흔든다"}),
+            );
         }
         loop {
             tokio::time::sleep(Duration::from_secs(SUPERVISOR_INTERVAL_SECS)).await;
@@ -3343,6 +3467,56 @@ mod tests {
         assert!(feed > 0, "admission 상한 정지가 조용하다(통보 0)");
     }
 
+    /// ★R4 [5](codex major · master 심판) — **armed 에서는 나이만으로 고아를 지우지 않는다.**
+    ///
+    /// 미무장에서 나이 회수는 영구 정지만 막는 무해한 추정이다(dispatch 가 0이라 새 프로세스가
+    /// 늘지 않는다). 그러나 armed 가 되면 같은 삭제가 **살아 있는 고아를 없는 것으로 세어 새
+    /// 런을 낳는 문**이 된다 — fence 가 막으려던 바로 그 이중 실행이다. 확인된 exit(§2-7 러너의
+    /// ACK)과 영속 history 가 착지하기 전까지 이 자제가 계약이다.
+    ///
+    /// ★대조군을 **같은 검체 안에** 둔다: 같은 형상을 미무장으로 한 번 더 돌려 회수가 실제로
+    /// 일어나는지 본다. 대조가 없으면 위 단언은 '어차피 아무것도 안 지워지는 코드' 에서도
+    /// 초록이라 공허하다(이 세션이 두 번 겪은 계급이다).
+    #[test]
+    fn armed_path_holds_orphans_instead_of_dropping_them_by_age() {
+        let d = tmp_daemon("hold");
+        let dir = tmp_spool("hold");
+        {
+            let mut g = d.boot_fenced.lock().unwrap();
+            g.push(crate::state::FencedRun {
+                intent: "old".into(),
+                epoch: 0,
+                generation: 1,
+                pid: None,
+                why: "hb_stall",
+                at: 1.0,
+            });
+        }
+        let now = 1.0 + FENCED_REAP_AGE_SECS + 1.0;
+        // ① 무장 — 나이를 넘겼어도 원장에 남는다.
+        let mut armed = SupState::default();
+        armed.fence_armed = true;
+        let before = d.bus.latest_seq();
+        let _ = tick_in(&d, &dir, &mut armed, ok_runner, remove_spool_file, now);
+        assert_eq!(
+            d.boot_fenced.lock().unwrap().len(),
+            1,
+            "armed 인데 나이만으로 고아를 지웠다 — 살아 있을 수 있는 런을 없는 것으로 세고 \
+             새로 낳는 문이다(fence 가 막으려던 이중 실행)"
+        );
+        assert!(
+            d.bus.latest_seq() > before,
+            "회수 보류가 조용하다 — 정지가 조용하면 운영자가 원인을 찾을 자리가 없다"
+        );
+        // ② 대조군: 같은 형상을 미무장으로 — 이때는 회수된다.
+        let mut disarmed = SupState::default();
+        let _ = tick_in(&d, &dir, &mut disarmed, ok_runner, remove_spool_file, now);
+        assert!(
+            d.boot_fenced.lock().unwrap().is_empty(),
+            "미무장인데 회수되지 않았다 — 대조군이 서지 않으면 ①의 단언이 공허하다"
+        );
+    }
+
     /// ★B3-2R ④ⓓ — 고아는 나이로 **추정 회수**된다(영구 정지 금지).
     #[test]
     fn aged_orphans_are_reaped_so_boots_resume() {
@@ -3523,13 +3697,103 @@ mod tests {
     /// ★R3 #7 — 무장 판독은 **켜는 쪽만 명시적**이다(오타 하나로 위험 경로가 열리면 안 된다).
     #[test]
     fn fence_arm_switch_defaults_to_off() {
-        assert!(!fence_armed_from(None), "미설정이 무장이면 안 된다");
-        assert!(!fence_armed_from(Some("")), "빈 값이 무장이면 안 된다");
-        assert!(!fence_armed_from(Some("0")), "0 이 무장이면 안 된다");
-        assert!(!fence_armed_from(Some("yes")), "미지값이 무장이면 안 된다(켜는 쪽만 명시적)");
-        assert!(fence_armed_from(Some("1")));
-        assert!(fence_armed_from(Some("true")));
-        assert!(fence_armed_from(Some(" 1 ")), "공백은 다듬어 받는다");
+        assert!(!env_asks_arm(None), "미설정이 무장이면 안 된다");
+        assert!(!env_asks_arm(Some("")), "빈 값이 무장이면 안 된다");
+        assert!(!env_asks_arm(Some("0")), "0 이 무장이면 안 된다");
+        assert!(!env_asks_arm(Some("yes")), "미지값이 무장이면 안 된다(켜는 쪽만 명시적)");
+        assert!(env_asks_arm(Some("1")));
+        assert!(env_asks_arm(Some("true")));
+        assert!(env_asks_arm(Some(" 1 ")), "공백은 다듬어 받는다");
+    }
+
+    /// ★R4 [4](codex · master 심판) — 무장은 **의도 AND 능력**이다.
+    ///
+    /// gemini 가 R3 에서 놓친 지점이 정확히 이것이다: env 스위치 하나로 arm 되면, CAS 폐쇄면도
+    /// 자가종료도 없는 빌드에서 환경변수를 켜는 것만으로 fence 가 살아난다. 그 창에서 세대를
+    /// 올려봐야 거절을 집행할 주체가 없으니 막은 것 없이 표와 파일만 흔든다.
+    #[test]
+    fn arming_requires_both_the_env_and_a_ready_build() {
+        let none = RunnerReadiness {
+            lease_cas_closed: false,
+            atomic_handler: false,
+            epoch_propagated: false,
+            self_terminate: false,
+            boot_last_writer: false,
+            durable_history: false,
+        };
+        let all = RunnerReadiness {
+            lease_cas_closed: true,
+            atomic_handler: true,
+            epoch_propagated: true,
+            self_terminate: true,
+            boot_last_writer: true,
+            durable_history: true,
+        };
+        // ① env 만으로는 안 된다 — 이 검체가 R3 [4] 그 자체다.
+        assert!(
+            !fence_armed_from(Some("1"), none),
+            "env 만으로 무장했다 — 능력 없는 빌드에서 fence 가 살아난다(R3 [4] 재발)"
+        );
+        // ② 한 칸만 비어도 안 된다(AND 는 전칭이다).
+        for hole in 0..6 {
+            let mut r = all;
+            match hole {
+                0 => r.lease_cas_closed = false,
+                1 => r.atomic_handler = false,
+                2 => r.epoch_propagated = false,
+                3 => r.self_terminate = false,
+                4 => r.boot_last_writer = false,
+                _ => r.durable_history = false,
+            }
+            assert!(
+                !fence_armed_from(Some("1"), r),
+                "칸 하나가 비었는데 무장했다({:?}) — AND 가 OR 로 무너졌다",
+                r.missing()
+            );
+            assert_eq!(r.missing().len(), 1, "빠진 칸을 정확히 지목하지 못한다");
+        }
+        // ③ 능력만으로도 안 된다 — 운영자가 켜지 않은 것을 대신 켜지 않는다.
+        assert!(!fence_armed_from(None, all), "env 없이 무장했다");
+        // ④ 둘 다 참이면 무장한다(AND 가 항상 false 인 사문이 아님을 함께 잰다).
+        assert!(fence_armed_from(Some("1"), all), "둘 다 참인데 무장하지 않았다");
+        // ⑤ ★이 빌드의 실제 준비도는 아직 false 다(B4 전) — 봉인이 실재함을 못 박는다.
+        assert!(
+            !RUNNER_READINESS.ready(),
+            "빌드 준비도가 true 다 — B4 계약이 착지했는가? 아니라면 봉인이 뚫린 것이다"
+        );
+        assert_eq!(
+            RUNNER_READINESS.missing().len(),
+            6,
+            "준비도 칸이 이유 없이 뒤집혔다: {:?}",
+            RUNNER_READINESS.missing()
+        );
+    }
+
+    /// ★R4 [4] 소스핀 — 무장 판정이 **한 지점**이고 그 지점이 readiness 를 AND 한다.
+    ///
+    /// 순수 함수만 옳고 호출부가 `env_asks_arm` 을 직접 대입하면 검체는 초록인데 프로덕션은
+    /// env 단독으로 arm 된다(공허 통과). 판정 지점을 닫힌 집합으로 못 박는다.
+    #[test]
+    fn arming_is_decided_at_exactly_one_place_that_ands_readiness() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        assert_eq!(
+            prod.matches("st.fence_armed = ").count(),
+            1,
+            "무장 대입 지점이 1곳이 아니다 — 판정이 갈라지면 한쪽만 readiness 를 본다"
+        );
+        assert!(
+            prod.contains("st.fence_armed = fence_armed_from(arm_req.as_deref(), RUNNER_READINESS)"),
+            "무장 대입이 readiness 를 AND 하는 판정을 거치지 않는다(env 단독 무장 재발)"
+        );
+        let at = prod.find("pub fn fence_armed_from(").expect("fence_armed_from 소실");
+        let body = &prod[at..];
+        let body = &body[..body.find("\n}").expect("fence_armed_from 본문 끝 소실")];
+        assert!(
+            body.contains("readiness.ready()") && body.contains("&&"),
+            "무장 판정이 readiness 를 AND 하지 않는다: {body:?}"
+        );
     }
 
     /// ★R4 [1] 소스핀 — epoch 영속의 **세 계약**(O_EXCL · fsync · 원자 교체)과 순서, 그리고
