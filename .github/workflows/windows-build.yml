@@ -822,6 +822,9 @@ jobs:
         timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
+          # ★annotation 이스케이프. GitHub 워크플로 명령은 `%`·개행을 이스케이프해야 본문이
+          #   잘리지 않는다(`%` 를 **먼저** 바꾼다 — 순서를 뒤집으면 %0A 의 % 가 다시 먹힌다).
+          function Esc([string]$s) { $s -replace '%','%25' -replace "`r",'' -replace "`n",'%0A' }
           # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
           #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
           #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
@@ -874,8 +877,22 @@ jobs:
             # 콜백 정리 확인: 정식 동작본 확인 갈래가 스테이징 .new 를 지웠다(§1 '콜백' 삭제자)
             $noNew = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
             $ok1 = $exit4 -and $hasMark -and $l1Ok -and $unrecEmpty -and $rbEmpty -and $nuOk -and $prOk -and $cysOld -and $cysdOld -and $lockAlive -and $noNew
-            Write-Host ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new정리={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
-            if (-not $ok1) { throw "T4-15a: 거부 계약 위반 — P6(배타 핸들 ⇒ exit 4 + 구본 무손상) 또는 §3 토큰 스키마 회귀" }
+            $res1 = ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new정리={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
+            Write-Host $res1
+            if (-not $ok1) {
+              # ★실패 사유를 annotation 채널로 올린다(2026-09-04 진단 배선). 이 스텝은 이미 11개
+              #   판정 필드를 전부 찍지만 그건 **로그**뿐이고, 이 저장소의 CI 로그는 토큰 없이
+              #   읽을 수 없다(익명 403). 그래서 3레인 동시 실패가 "exit code 1" 한 줄로만
+              #   관측됐다 — 진단 정보가 부족한 게 아니라 **읽히는 채널에 없었다**.
+              #   실패했을 때만 올린다(성공 런의 annotation 을 더럽히지 않는다).
+              $d1 = $res1
+              if ($hasMark) { $d1 += "`n-- cys-install-failure.txt --`n" + ((Get-Content $failMark) -join "`n") }
+              $rem = (Get-ChildItem (Join-Path $dir '*') -File -Include 'cys*.exe','cysd*.exe' -ErrorAction SilentlyContinue |
+                      ForEach-Object { "{0} {1}B" -f $_.Name, $_.Length }) -join "`n"
+              $d1 += "`n-- 설치 디렉터리 실행파일 잔재(.new/.prev 세대 판정용) --`n" + $rem
+              Write-Host ("::error title=T4-15a::" + (Esc $d1))
+              throw "T4-15a: 거부 계약 위반 — P6(배타 핸들 ⇒ exit 4 + 구본 무손상) 또는 §3 토큰 스키마 회귀"
+            }
           } finally {
             $fs.Close()
           }
@@ -890,7 +907,9 @@ jobs:
           $markerOk = (Test-Path $marker) -and ((Get-Content $marker -Raw) -match [regex]::Escape($expVer))
           $lockAlive2 = -not $lock.HasExited
           $ok2 = ($ri2.ExitCode -eq 0) -and $healedCys -and $healedCysd -and $noMark -and $markerOk -and $lockAlive2
-          Write-Host ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2)
+          $res2 = ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2)
+          Write-Host $res2
+          if (-not $ok2) { Write-Host ("::error title=T4-15b::" + (Esc $res2)) }   # 위 T4-15a 와 같은 이유(로그 403)
           # 정리(이후 스텝 오염 방지): 잠금 해제 → 스탠드인 대피 잔해 제거
           try { $lock.Kill($true) } catch {}
           Start-Sleep 1
