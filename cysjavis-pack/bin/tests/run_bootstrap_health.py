@@ -5505,13 +5505,13 @@ def h_pred_6():
     #     훑어서 cysd 감독자 상수(f64·u32·usize)가 통째로 대조 밖이었다 — python 이 값을 바꿔도
     #     아무도 모르는 무측정 계급이다. 이제 표가 (python 키 · 소스 · 타입)을 지고 감독자 파일도 훑는다.
     import javis_budget as BU
-    _PARITY_SRC = {"cys": os.path.join("src", "bin", "cys.rs"),
-                   "cysd_boot_supervisor": os.path.join("src", "bin", "cysd", "boot_supervisor.rs")}
+    #   ★경로는 레지스트리가 소유한다(핀 이사 계약 U-2 · H-META-PIN ⓒ): 검체가 경로 리터럴을
+    #     직접 들면 그 파일이 이사할 때 이 핀만 조용히 죽는다. 논리 이름으로 묻는다.
     _NUM = {"u64": r"\d+", "u32": r"\d+", "usize": r"\d+", "f64": r"\d+(?:\.\d+)?"}
-    _src_cache, bad, pend = {}, [], []
+    _src_cache = {"cys": _scan_source("readiness"),
+                  "cysd_boot_supervisor": _scan_source("boot_supervisor")}
+    bad, pend = [], []
     for rust_name, (py_name, src_key, kind) in BU.RUST_PARITY_CONSTS.items():
-        if src_key not in _src_cache:
-            _src_cache[src_key] = _repo_file(_PARITY_SRC[src_key])
         m = re.search(r"const %s: %s = (%s);" % (re.escape(rust_name), kind, _NUM[kind]),
                       _src_cache[src_key])
         if not m:
@@ -5523,7 +5523,7 @@ def h_pred_6():
                        % (rust_name, m.group(1), py_name, BU.parity_value(py_name)))
     # 유도 상수는 값이 아니라 **유도식**을 핀한다 — python 에 값을 복제하면 그 복제가 새 드리프트면이
     #   되기 때문이다(W-B 지적 수용). 누가 유도를 리터럴로 굳히면 여기서 잡힌다.
-    _dsrc = _src_cache.get("cysd_boot_supervisor") or _repo_file(_PARITY_SRC["cysd_boot_supervisor"])
+    _dsrc = _src_cache["cysd_boot_supervisor"]
     for rust_name, expr in BU.CYSD_DERIVED_PINS.items():
         m = re.search(r"const %s: [a-z0-9]+ = (.+?);" % re.escape(rust_name), _dsrc)
         if not m:
@@ -6441,6 +6441,10 @@ SCAN_TARGET_CONSUMERS = {
     "H-SAFE-2": "readiness",
     "H-TIME-3": "readiness",
     "H-OBS-2": "readiness",
+    # ★(2026-09-05) 예산 파리티 검체 — cys.rs 의 BUDGET 상수와 감독자 임계를 핀한다. 종전엔
+    #   경로를 직접 들어 동결 목록에 있었으나, cysd 감독자까지 넓히면서 두 경로를 레지스트리로
+    #   묻도록 이사했다(`readiness` + `boot_supervisor`). 선언은 1:1 규약대로 주 경로를 적는다.
+    "H-PRED-6": "readiness",
     # ★(U-17) 인증 전제 판정기 검체 — 판정부를 `profile_gate` 로 묻는다(직접 경로 0).
     "H-AUTH-PARSE": "profile_gate",
     # ★(U-18) create 게이트 검체 — 문안에 실리는 판정기 안정 문자열을 정본에서 뽑는다.
@@ -6453,7 +6457,7 @@ SCAN_TARGET_CONSUMERS = {
 # 새 직접 독자는 이사 때 함께 옮겨지지 않아 조용히 죽기 때문이다(H-META-PIN ⓓ 가 적색).
 SCAN_TARGET_DIRECT_LEGACY = frozenset({
     "H-CONC-2", "H-CONC-3", "H-EXIT-2", "H-EXIT-3", "H-EXIT-4", "H-IDENT-1",
-    "H-PRED-2", "H-PRED-6", "H-PRED-7", "H-SAFE-1", "H-SAFE-W",
+    "H-PRED-2", "H-PRED-7", "H-SAFE-1", "H-SAFE-W",   # H-PRED-6 은 2026-09-05 레지스트리 경유로 이사
     "H-SEED-1", "H-SEED-3", "H-SEED-6", "H-TIME-1",
 })
 
