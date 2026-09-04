@@ -7,18 +7,36 @@
   깨지고 Gatekeeper 가 "손상되었기 때문에 열 수 없습니다"로 차단 · 정본 src/lib.rs `ENV_PY_NO_BYTECODE`)
   은 3층으로 봉인돼 있고 각 층은 **지점별** 핀이 지킨다 — Rust: `python_command` 팩토리 핀 ·
   `spawn_env_pairs` 핀 · 직스폰 전수 열거 핀 `bundled_python_spawn_sites_are_enumerated_and_sealed`
-  (src/lib.rs:2536-2643 · cargo test) · 훅 셸 층: H-PYSEAL-1(run_bootstrap_health.py:4059).
+  (src/lib.rs:2536-2643 · cargo test) · 훅 셸 층: H-PYSEAL-1(run_bootstrap_health.py:4074).
   그러나 **강제점 전체 집합을 한 자리에서 세는** 검체는 없었다: 강제점 하나가 조용히 사라지거나
   (예: cys-dept 헤드 export 삭제) 새 진입점(훅 · bin 셸 스크립트 · Rust 직스폰)이 봉인 없이 생겨도,
   cargo 테스트를 안 도는 팩 레인(pack-release · 팩 단독 CI)은 초록이다. 0.14.27 의 SEAL-1 3중 구현은
   **신규 구현 대상이 아니라 census 회귀 테스트로 유지 여부만 확인**한다(CLAUDE.md 정정 기록
   2026-08-29) — 이 파일이 그 census 다.
 
-census 정의(CEO 승인 · 표는 전부 2026-09-03 grep 실측값으로 고정 — 추정 0):
-  ⓐ 강제점 집합 — 비주석 코드의 강제/정의 **11점(패턴 12줄)** 을 파일별 **정확 개수**로 고정.
+census 정의(CEO 승인 · 표는 전부 grep 실측값으로 고정 — 추정 0 · 초판 2026-09-03 · ⓐ 확장 2026-09-04):
+  ⓐ 강제점 집합 — 비주석 코드의 강제/정의 **17점(패턴 18줄)** 을 파일별 **정확 개수**로 고정.
      0 = 봉인 소실(SEAL-1 재발 경로). 초과도 FAIL 이다 — 중복 강제는 무해하지만 "어느 지점이 정본인가"가
      흐려진다(늘렸으면 봉인을 확인하고 이 표에 등재하라).
-  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **17개 목록** 고정
+     ★2026-09-04 갱신(A6 후속 · **11점 12줄 → 17점 18줄** · 추가 6줄 = 6점) — 사유: 초판 표가 강제점
+     3종을 놓쳤고 셋 다 **변조로 실증**했다(각각 그 줄만 지워도 census 가 `PYSEAL-CENSUS-OK`/exit 0 =
+     초록이었다). 즉 "census 가 초록이니 봉인이 전수 유지된다"는 문장이 그 사이 거짓이었다.
+       ① `src/bin/cys.rs:16578` `run_scoped`(= `cys run -- <명령>` 임의 명령 스폰의 방어심도) — ⓑ 는
+          같은 파일 주석(:8709·:16577)이 니들을 계속 보유해 집합에서 안 빠지므로 못 잡고, ⓒ(iii) 은
+          스폰 줄이 `Command::new(&command[0])`(:16573)라 "py"/"python" 이 없어 애초에 지점으로 세지
+          않으며, src/lib.rs 의 봉인기전 marker assert(:2624-2628)도 cys.rs 를 목록에 넣지 않았다 —
+          2언어 어느 핀도 이 지점을 지키지 않았다.
+       ② 층3 호출부 3곳(`src/bin/cys.rs:1257` · `src/bin/cysd/main.rs:1089` ·
+          `src-tauri/src/main.rs:5748`) — 층3 은 함수 정의(src/lib.rs:159)만으로는 무효이고 이 세 호출이
+          있어야 성립한다(src/lib.rs:150-155 "스레드가 생기기 전 각 바이너리 main 첫 줄" 계약).
+          src/lib.rs:2977 핀은 함수를 **직접 호출해** 행동만 검사하므로 호출부 소멸을 보지 못한다.
+       ③ 켜짐 값 상수 `src/lib.rs:97 PY_NO_BYTECODE_ON = "1"` — 빈 값이면 CPython 이 '끔'으로 읽어
+          층1·층2·층3 이 **동시에** 죽는다(값 규약 근거 src/lib.rs:95-96). cargo 측 핀
+          (src/lib.rs:2503 `assert!(!PY_NO_BYTECODE_ON.is_empty(), …)`)은 잡지만, 이 census 의 존재
+          이유가 바로 "cargo 를 안 도는 팩 레인"이라 같은 계급의 구멍이었다.
+     (표가 세는 것은 줄 번호가 아니라 **비주석 줄의 개수**다 — 주석의 행번호는 2026-09-04 grep 재실측.)
+  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **18개 목록** 고정
+     (2026-09-04 W-A A2: 17→18 · 훅 런처/본체 분할 검체 등재 — 등재 사유는 목록 주석 참조)
      (확장자 13종 · target/node_modules/_worktrees/.git 제외 · 이 파일 자신 제외 · grep -rl 동형).
      신규/소멸 → FAIL: 그 파일의 봉인을 점검한 뒤 목록을 갱신하라(갱신 = "봉인을 확인했다"는 선언).
   ⓒ 신규 진입점 검출(양방향):
@@ -40,8 +58,12 @@ census 정의(CEO 승인 · 표는 전부 2026-09-03 grep 실측값으로 고정
 1 = FAIL 1건 이상 · 2 = UNMEASURED(레포 루트에 src/lib.rs 부재 = 팩 단독 설치 — **측정 불능은 통과가
 아니다**). 루트 해소: `PYSEAL_CENSUS_ROOT`(비어 있지 않으면 · 변조 대조용 사본 루트) → 기본
 dirname(PACK)(= git 워크트리). stdlib 전용 · 쓰기 0 · 결정론(정렬 key=str · LC_ALL 무관) · 실측 <0.1s.
-변조 대조(계측 타당성): ceo/bugfix-2026-09-03/impl/W-A/evidence/checks/check-A6-mutation.sh —
-cys-dept export 1줄 제거 사본에서 exit 1 + FAIL 줄 전부 cys-dept 언급.
+변조 대조(계측 타당성): ceo/bugfix-2026-09-04/impl/W-A/evidence/checks/check-A6-mutation.sh
+(초판 = ceo/bugfix-2026-09-03/… · **이 포인터는 계약이 아니라 흔적이다** — 팩 밖 절대경로라 통합
+리포로 병합되면 거짓이 될 수 있으니 발견 즉시 갱신하라). 실증 내용: ⓪실 루트 PASS(양성) ·
+⓪′**무변조 rsync 전체 사본 PASS**(귀속 기준선 — 부분 사본은 docs/ 결손으로 ⓑ 가 항상 FAIL 해
+"무엇 때문에 FAIL 했는가"가 오염된다) · ①cys.rs run_scoped 1줄 제거 ②층3 호출부 3줄 제거
+③`PY_NO_BYTECODE_ON` 값 `"1"`→`""` 치환 사본이 각각 **정확히 그 항목만** FAIL(exit 1).
 
     CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_pyseal_census.py
 """
@@ -97,26 +119,49 @@ def _rel(path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⓐ 강제점 집합 — 11점(패턴 12줄) · 비주석 코드 · 파일별 정확 개수 (행번호는 2026-09-03 실측)
+# ⓐ 강제점 집합 — 17점(패턴 18줄) · 비주석 코드 · 파일별 정확 개수 (행번호는 2026-09-04 실측)
 #   mode "sub"  = 비주석 줄 가운데 패턴을 **부분 문자열**로 포함하는 줄 수
 #   mode "line" = 비주석 줄 가운데 패턴과 **줄 전체가 정확히 같은** 줄 수(들여쓰기·조건 분기 안으로
 #                 들어가면 "무조건 헤드 export" 계약이 깨진 것이므로 FAIL 이 맞다 — H-PYSEAL-1 과 동형)
+#   ★2026-09-04 A6 후속으로 6줄(=6점) 추가 — 6번째는 R2 적대검증이 변조로 찾은 층2 값 줄 — 사유·변조 실증은 상단 독스트링 ⓐ 갱신 절.
 # ═══════════════════════════════════════════════════════════════════════════
 ENFORCEMENT = (
     ("src/lib.rs", "//", (
-        ("sub", 'pub const ENV_PY_NO_BYTECODE: &str = "PYTHONDONTWRITEBYTECODE";', 1),  # 정본 상수(:94)
-        ("sub", "cmd.env(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON);", 1),                  # python_command 팩토리(:133)
-        ("sub", "set_var(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON)", 1),                   # in-process 층3(:159)
-        ("sub", "ENV_PY_NO_BYTECODE.to_string(),", 1),                                  # spawn_env_pairs 항목(:1173)
+        ("sub", 'pub const ENV_PY_NO_BYTECODE: &str = "PYTHONDONTWRITEBYTECODE";', 1),  # 정본 상수 = 키(:94)
+        ("sub", 'pub const PY_NO_BYTECODE_ON: &str = "1";', 1),                         # ★정본 상수 = 켜짐 값(:97) —
+                                                                                        #   빈 값이면 CPython 이 '끔'으로
+                                                                                        #   읽어 층1·2·3 동시 무효(:95-96)
+        ("sub", "cmd.env(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON);", 1),                  # python_command 팩토리 = 층1(:133)
+        ("sub", "set_var(ENV_PY_NO_BYTECODE, PY_NO_BYTECODE_ON)", 1),                   # in-process 층3 정의(:159)
+        ("sub", "ENV_PY_NO_BYTECODE.to_string(),", 1),                                  # spawn_env_pairs 키 = 층2(:1173)
+        ("sub", "PY_NO_BYTECODE_ON.to_string(),", 1),                                   # ★spawn_env_pairs **값**(:1174) —
+                                                                                        #   층2 는 키·값을 두 줄로 push 한다.
+                                                                                        #   값을 `String::new()` 로 바꾸면
+                                                                                        #   pane·훅·스케줄 잡이 빈 값을 상속해
+                                                                                        #   CPython 이 '끔'으로 읽는다(층2 사망).
+                                                                                        #   ③과 정확히 같은 계급의 구멍이었다
+                                                                                        #   (2026-09-04 R2 적대검증 변조 실증).
+    )),
+    ("src/bin/cys.rs", "//", (
+        ("sub", "cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);", 1),        # ★run_scoped = `cys run -- <명령>`
+                                                                                        #   임의 명령 스폰 방어심도(:16578)
+        ("line", "    cys::seal_python_bytecode_in_process();", 1),                      # ★층3 호출부 — cys main 선두(:1257)
+                                                                                        #   line 모드인 이유: 이 항목의 계약은
+                                                                                        #   '스레드 생성 전 main 선두'(lib.rs:150-155)
+                                                                                        #   라 **위치**가 본질이다. sub 면 조건
+                                                                                        #   분기 안으로 옮겨도 초록이다(R2 실증).
     )),
     ("src/bin/cysd/boot_supervisor.rs", "//", (
         ("sub", ".env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)", 1),            # run_ensure_team tokio 직봉인(:816)
     )),
     ("src/bin/cysd/main.rs", "//", (
         ("sub", ".env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)", 1),            # office-bridge tokio 직봉인(:1653)
+        ("line", "    cys::seal_python_bytecode_in_process();", 1),                      # ★층3 호출부 — cysd main 선두(:1089)
+                                                                                        #   (`#[tokio::main]`→async_main 인 이유)
     )),
     ("src-tauri/src/main.rs", "//", (
         ("sub", "cmd.env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON);", 1),        # inject_runtime_path(:4092)
+        ("line", "    cys::seal_python_bytecode_in_process();", 1),                      # ★층3 호출부 — GUI main 선두(:5748)
     )),
     ("cysjavis-pack/hooks/_lib.sh", "#", (
         ("line", "PYTHONDONTWRITEBYTECODE=1", 1),                                       # 프리루드 무조건 대입(:265)
@@ -157,7 +202,7 @@ def check_enforcement():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ⓑ 참조 파일 집합 — grep -rl 동형(확장자 13종 · 4 디렉토리 제외 · 자기 제외) · 2026-09-03 실측 17
+# ⓑ 참조 파일 집합 — grep -rl 동형(확장자 13종 · 4 디렉토리 제외 · 자기 제외) · 2026-09-04 실측 18
 #   (확장자 없는 cysjavis-pack/bin/cys-dept 는 정의상 이 집합 밖이고 ⓐ·ⓒ(ii) 가 핀한다.)
 # ═══════════════════════════════════════════════════════════════════════════
 REF_EXTS = (".rs", ".sh", ".py", ".ts", ".js", ".md", ".toml", ".yml", ".yaml", ".json", ".plist", ".bat", ".ps1")
@@ -165,6 +210,11 @@ REF_SKIP_DIRS = frozenset(("target", "node_modules", "_worktrees", ".git"))
 REF_NEEDLES = (b"PYTHONDONTWRITEBYTECODE", b"ENV_PY_NO_BYTECODE")
 REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와 동일) · 중복 없음
     "cysjavis-pack/bin/tests/run_bootstrap_health.py",
+    # ★2026-09-04 W-A A2 등재 — 훅 런처/본체 분할 검체. **봉인 점검 결과(등재 = 이 선언)**:
+    #   python 서브프로세스를 하나도 띄우지 않는다(스폰 대상은 전부 `sh`/`dash`/`bash` 런처다) —
+    #   따라서 새 python 진입점도 강제점도 아니다. 니들을 보유하는 이유는 단 하나, 프리루드의
+    #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
+    "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
     "cysjavis-pack/hooks/_lib.sh",
     "docs/RELEASE.md",
