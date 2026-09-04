@@ -791,6 +791,52 @@ mod tests {
         );
     }
 
+    /// ★정규화·해시 **골든 벡터** 파리티(W-A cd3b8e5 fixture `digest_vectors` 소비).
+    ///
+    /// 바로 위 [`normalize_and_digest_are_the_ledger_key`] 와 무엇이 다른가 — 그쪽은 이 모듈이
+    /// 자기 규칙에 충실한지를 재고, 이쪽은 **python 과 같은 값을 내는지**를 잰다. 그리고 층1
+    /// 케이스(`layer1`)로는 그것을 잴 수 없다: 그 케이스들의 원장 레코드는 **소비자 자신의**
+    /// 정규화·digest 로 만들어지므로, python 과 Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은
+    /// 양쪽 다 초록인 채 통과한다. 리터럴 골든만이 그 대칭 이탈을 가른다 — 명세 §2-3 이 층1
+    /// 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized` 이기 때문이다.
+    ///
+    /// 담긴 축: 공백 접기 · 전각 공백 · 트림 · **sha256 표준 벡터**(대조 키가 진짜 sha256 인가) ·
+    /// 한글 기본형 ↔ 공백 재배치본이 **같은 해시**(TUI 재배치 내성) · 빈 입력 · 공백뿐 · CRLF ·
+    /// 내부 다중 공백. 기대값은 전부 python 현행 함수의 **실측치**다(지어낸 값 0).
+    #[test]
+    fn normalize_and_digest_match_the_golden_vectors() {
+        let c = corpus();
+        let items = c["digest_vectors"]
+            .as_array()
+            .expect("digest_vectors 섹션 부재 — 대칭 이탈 탐지기가 사라졌다");
+        assert!(items.len() >= 10, "골든 벡터가 줄었다: {}", items.len());
+        let mut fails: Vec<String> = Vec::new();
+        for it in items {
+            let name = it["name"].as_str().unwrap_or("?");
+            let text = item_text(it);
+            let e = &it["expect"];
+            let want_norm = e["normalized"].as_str().expect("expect.normalized");
+            let got_norm = normalize(&text);
+            if got_norm != want_norm {
+                fails.push(format!("{name}: 정규화 기대 {want_norm:?} / 실측 {got_norm:?}"));
+                continue; // 해시는 정규화의 함수다 — 앞이 틀리면 뒤는 파생 실패다
+            }
+            let want_sha = e["sha256"].as_str().expect("expect.sha256");
+            let got_sha = digest_text(&text);
+            if got_sha != want_sha {
+                fails.push(format!("{name}: sha256 기대 {want_sha} / 실측 {got_sha}"));
+            }
+            // 재정규화 금지 계약 — 이미 정규화된 문자열에 digest_normalized 를 걸면 같은 값이다.
+            assert_eq!(digest_normalized(&got_norm), got_sha, "{name}: 두 진입점이 갈렸다");
+        }
+        assert!(
+            fails.is_empty(),
+            "정규화·해시 골든 이탈 {}건 — python 과 **다른 키**로 원장을 대조하게 된다(층1 전건 미스):\n  - {}",
+            fails.len(),
+            fails.join("\n  - ")
+        );
+    }
+
     /// ★투명문자 집합 파리티 — python `unicodedata.category(ch)=="Cf"` + 폴백 목록의 실측
     /// 전수(170자 21구간). 근사하면 갈리므로 측정값을 박제한다.
     #[test]
