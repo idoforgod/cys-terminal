@@ -217,11 +217,23 @@ mod tests {
     /// `flock_reacquire_after_holder_release` 가 간헐 적색이 됐다(단독 실행에서도 3회 중 1회).
     /// 결함이 아니라 검체끼리의 충돌이었고, 그 적색은 **아무것도 재지 않는다**.
     /// 원자 카운터를 더해 커널이 아니라 프로그램이 유일성을 보증하게 한다.
+    /// 검체 전용 임시 디렉터리 — **호출마다 유일**하다(원자 카운터가 커널이 아니라 프로그램에서
+    /// 유일성을 보증한다 · `65ff6c4`).
+    ///
+    /// ★이름을 16진으로 줄인 이유(2026-09-05 실측 · FLAKE-PROBE-1 의 실체):
+    /// 이 디렉터리 아래에 unix 도메인 소켓을 바인드하는 검체가 있고, 그 경로는 **SUN_LEN**
+    /// 을 넘을 수 없다(실측 경계 — 103바이트 성공 / 104바이트 실패). 종전 십진 형식
+    /// `cysd-deadman-test-<pid>-<nanos>-<seq>` 는 macOS 의 긴 TMPDIR(49자)에서 pid 가 **5자리일
+    /// 때 정확히 104** 가 되어 `probe_responds_to_live_socket_and_times_out_on_hung` 이
+    /// 결정론으로 죽었다. pid 자릿수에 따라 갈리므로 실행마다 붙었다 떨어졌다 해서 '간헐
+    /// 플레이크'·'`--test-threads=1` 한정' 으로 오진됐던 것이다 — **부하도 스레드 수도 무관하다.**
+    /// 카운터를 도로 빼는 것은 답이 아니다(그것이 막는 디렉터리 충돌은 실재한다) — 같은 정보를
+    /// 더 짧게 적는다.
     fn tmp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering as AOrd};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "cysd-deadman-test-{}-{}-{}",
+            "cysd-dm-{:x}-{:x}-{:x}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -229,6 +241,17 @@ mod tests {
                 .as_nanos(),
             SEQ.fetch_add(1, AOrd::Relaxed)
         ));
+        // ★예산 단언 — 넘으면 `SUN_LEN` 패닉으로 **사유 없이** 죽는 대신 왜 죽는지 말하고 죽는다.
+        //   이 디렉터리 아래 자식 이름의 최장은 9자(`live.sock`·`heartbeat`)이므로 구분자까지
+        //   10바이트를 남긴다. 다음 사람이 TMPDIR 이 더 긴 기계에서 이것을 밟으면, 한 줄로 원인과
+        //   조치를 함께 읽는다.
+        assert!(
+            d.as_os_str().len() + 10 <= 103,
+            "검체 임시 경로가 unix 소켓 상한(SUN_LEN)을 넘는다: 디렉터리 {}바이트 + 자식 10바이트 \
+             > 103. TMPDIR 이 {}바이트로 길다 — 이름을 더 줄이거나 TMPDIR 을 짧게 잡아야 한다",
+            d.as_os_str().len(),
+            std::env::temp_dir().as_os_str().len()
+        );
         std::fs::create_dir_all(&d).unwrap();
         d
     }
