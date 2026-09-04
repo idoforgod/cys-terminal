@@ -10867,6 +10867,66 @@ fn hook_ack_boot_nonce(socket: &std::path::Path, prompt: &str) -> Option<String>
     }
 }
 
+/// 층1·층2 판정을 **원장 소유자(데몬)** 에게 묻는다(명세 v2.1 A12).
+///
+/// CLI 가 직접 판정하지 않는 이유: 층1 은 원장 경로 규약을 알아야 하는데 그 소유자는
+/// `cysd::delivery::ledger_path` 하나다. 복사하면 두 벌이 갈리고, **갈린 순간 층1 은 빈 원장을
+/// 읽어 모든 기계 push 가 오너 임무가 된다**(2026-08-01 사고의 기제).
+///
+/// 본문(`prompt_norm`)을 보내는 이유: 규칙 ⓒ(조각 연접)는 프롬프트의 **부분 문자열**을 해시
+/// 대조하므로 해시 하나로는 원리적으로 불가능하다. 데몬은 그 텍스트를 pane 에 쓴 당사자이고
+/// 원장에 preview 를 이미 갖고 있어 같은 UID 소켓 위의 본문 전송은 새 노출면이 아니다
+/// (master 판정 · A12). `prompt_digest` 를 함께 보내 데몬이 **대조**하게 한다.
+enum Layer12 {
+    Machine(String),
+    Human,
+    /// 판정 근거 부재(원장 판독 불가·좌석 미확정) — 호출자가 **fail-closed** 로 접는다.
+    Unknown(String),
+    /// 구 데몬(`method_not_found`)·데몬 사망 — 셸 종전 게이트로 반환한다.
+    Legacy(String),
+}
+
+fn hook_layer12_via_daemon(socket: &std::path::Path, prompt: &str) -> Layer12 {
+    let norm = cys::mission_gate::normalize(prompt);
+    // 상한 초과분은 잘라 보내고 사실을 표기한다(A12) — 자르고 침묵하면 데몬이 부분 판정을
+    // 전부 본 것으로 오인한다.
+    let cap = cys::mission_gate::HARNESS_SCAN_MAX_CHARS;
+    let truncated = norm.chars().count() > cap;
+    let sent: String = if truncated { norm.chars().take(cap).collect() } else { norm };
+    let digest = cys::mission_gate::digest_normalized(&sent);
+    let r = request_on_timeout(
+        socket,
+        HOOK_ORIGIN_METHOD,
+        json!({"prompt_norm": sent, "prompt_digest": digest, "truncated": truncated}),
+        std::time::Duration::from_millis(HOOK_DECIDE_DEADLINE_MS),
+    );
+    let r = match r {
+        Ok(v) => v,
+        // 구 데몬은 `method_not_found` 를 싣는다. 그 밖의 왕복 실패도 같은 방향(legacy)으로
+        // 접는다 — 판정을 못 받은 채 fail-closed 로 접으면 데몬이 잠깐 죽은 것만으로 오너
+        // 프롬프트가 전부 막힌다(가용성 파괴).
+        Err(e) => return Layer12::Legacy(format!("{e}")),
+    };
+    let why = r["reason"].as_str().unwrap_or("").to_string();
+    match r["origin"].as_str() {
+        Some("machine") => Layer12::Machine(format!(
+            "층{} — {why}",
+            r["layer"].as_u64().map(|l| l.to_string()).unwrap_or_else(|| "?".into())
+        )),
+        Some("human") => Layer12::Human,
+        Some("unknown") => Layer12::Unknown(if why.is_empty() {
+            r["ledger_status"].as_str().unwrap_or("판독 불가").to_string()
+        } else {
+            why
+        }),
+        // 미지 형상 = 계약 스큐. 믿고 진행하지 않는다(legacy 로 접어 셸이 종전 판정을 한다).
+        other => Layer12::Legacy(format!("미지 origin({other:?})")),
+    }
+}
+
+/// 층1·층2 판정 RPC — 신설 RPC 3축 실재 검사 대상(master 상설 지시).
+const HOOK_ORIGIN_METHOD: &str = "hook.machine_origin";
+
 /// T1-8 ack 가 쓰는 RPC — `cys set-status` 와 **같은 메서드**여야 한다.
 ///
 /// 상수로 뽑는 이유: 이름을 문자열로 흩뿌리면 오타·명세 오인이 조용히 통과한다(실제로 명세의
@@ -11014,14 +11074,16 @@ fn run_hook_user_prompt_submit(input: Option<&std::path::Path>) -> i32 {
 ///      그 사실은 이 프롬프트가 기계 유래로 접히든 아니든 **똑같이 참**이다.
 ///   ③ 층0(harness)·층0-c(기동 명령문)·층2(push 라벨) — 걸리면 **HANDLED(6)**.
 ///
-/// ★★정직 고지 — **층1(배달 원장 대조)은 아직 이 CLI 에 배선되지 않았다.**
-/// 층1 은 원장 파일 경로를 알아야 하는데 그 규약의 소유자는 현재 `cysd::delivery::ledger_path`
-/// 하나이고(사본 금지 규율), `cys` 바이너리에서 부를 수 없다. 경로 규약을 여기 복사하면 두 벌이
-/// 되어 반드시 갈린다. 그래서 **복사하지 않고 비워 두었다.** 결과: 라벨 없는 기계 push 는 이
-/// 축에서 아직 접히지 않고 종전대로 rc0 로 나간다(= **현재 동작과 동일** · 회귀는 아니지만
-/// **게이트는 미완**이다). 해소는 둘 중 하나이며 master 판정 사항이다:
-///   ⓐ 경로 규약(`pack_state_dir`/`lane_key`/`ledger_path`)을 lib 로 이관해 두 바이너리가 공유
-///   ⓑ 판정을 데몬 RPC 로 물어본다(데몬이 이미 원장 소유자다)
+/// ★층1(배달 원장 대조)은 **데몬에게 묻는다**(명세 v2.1 A12 · [`hook_layer12_via_daemon`]).
+/// 원장 경로 규약의 소유자가 `cysd::delivery::ledger_path` 하나이므로 CLI 가 규약을 복사하지
+/// 않는다 — 복사하면 두 벌이 갈리고, 갈린 순간 층1 은 빈 원장을 읽어 **모든 기계 push 가 오너
+/// 임무가 된다**(2026-08-01 사고의 기제).
+///
+/// 실패 방향이 둘로 갈리는 것이 이 축의 요점이다:
+///   · **판정 근거 부재**(원장 판독 불가·좌석 미확정) = `unknown` → **fail-closed**(기계로 접는다).
+///     거짓 양성은 한 번 더 묻는 것(경미)이고 거짓 음성은 기계 push 가 임무가 되는 것(치명)이다.
+///   · **판정자 부재**(구 데몬·데몬 사망) = `legacy`(rc5) → 셸 본체가 종전 판정(python)을 한다.
+///     여기서 fail-closed 로 접으면 데몬이 잠깐 죽은 것만으로 오너 프롬프트가 전부 막힌다.
 fn hook_prompt_axis(
     socket: &std::path::Path,
     path: &std::path::Path,
@@ -11041,21 +11103,30 @@ fn hook_prompt_axis(
     let ack = hook_ack_boot_nonce(socket, &inp.prompt);
     let ack_note = ack.map(|a| format!(" · {a}")).unwrap_or_default();
 
-    // 층0 → 층0-c → 층2. 층1 은 위 고지 참조(미배선).
-    let machine = cys::mission_gate::harness_origin(&inp.prompt)
-        .map(|w| format!("층0 harness — {w}"))
-        .or_else(|| {
-            cys::mission_gate::boot_command_origin(&inp.prompt)
-                .map(|w| format!("층0-c 기동 명령문 — {w}"))
-        })
-        .or_else(|| {
-            cys::mission_gate::has_machine_label(&inp.prompt).then(|| {
-                format!(
-                    "층2 push 규약 라벨 선두({:?})",
-                    cys::mission_gate::label_head(&inp.prompt)
-                )
-            })
-        });
+    // ★순서는 명세 §2-2 그대로 **층1·층2 → 층0 → 층0-c** 다. 층1/2 가 앞이라 push 본문에 섞인
+    //   "너는 마스터다" 도 뒤 단계로 새지 못한다(record_fold 와 같은 우선순위).
+    let machine = match hook_layer12_via_daemon(socket, &inp.prompt) {
+        Layer12::Machine(why) => Some(why),
+        // ★fail-closed(master 판정): 판정 근거가 없으면 **기계로 접는다**. 거짓 양성은 한 번 더
+        //   묻는 것(경미)이고, 거짓 음성은 기계 push 가 오너 임무가 되는 것(치명)이다.
+        Layer12::Unknown(why) => Some(format!("판정 불가 — fail-closed: {why}")),
+        Layer12::Human => None,
+        // 구 데몬·데몬 사망은 **legacy** 다 — 셸 본체가 종전 판정(python)을 수행한다.
+        Layer12::Legacy(why) => {
+            return hook_verdict(
+                "legacy",
+                HOOK_EXIT_LEGACY,
+                &format!("층1 판정 위임 불가({why}) — 셸 종전 게이트로 반환{ack_note}"),
+            );
+        }
+    }
+    .or_else(|| {
+        cys::mission_gate::harness_origin(&inp.prompt).map(|w| format!("층0 harness — {w}"))
+    })
+    .or_else(|| {
+        cys::mission_gate::boot_command_origin(&inp.prompt)
+            .map(|w| format!("층0-c 기동 명령문 — {w}"))
+    });
     match machine {
         Some(why) => hook_verdict(
             "handled",
@@ -17182,6 +17253,64 @@ mod tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), all.len(), "훅 exit 코드가 겹친다: {all:?}");
+    }
+
+    /// ★H-ORIGIN-RPC-1(층1 · master 상설 지시): 신설 RPC 의 **3축 실재 검사**.
+    ///
+    /// `surface.set_status` 사고(REPORT §4-2 ⓔ)에서 얻은 규율을 신설 RPC 전부에 적용한다 —
+    /// 틀린 RPC 이름은 컴파일러가 잡아 주지 않고, 실패를 접는 설계와 만나면 **영원히 조용하다**.
+    /// 여기서는 접는 방향이 `legacy` 라 더 위험하다: 이름이 틀리면 매 프롬프트가 legacy 로
+    /// 떨어져 **층1 게이트가 통째로 무효**가 되는데 화면에는 아무 이상도 안 보인다.
+    ///
+    /// 3축: ⓐ상수값 ⓑ클라이언트 호출부에 그 이름이 있음 ⓒ**데몬에 그 arm 이 실재**함.
+    #[test]
+    fn hook_machine_origin_rpc_name_exists_on_both_sides() {
+        assert_eq!(HOOK_ORIGIN_METHOD, "hook.machine_origin");
+        // ⓑ 클라이언트 — 이 파일의 실제 호출부.
+        let cli = include_str!("cys.rs");
+        assert!(
+            cli.contains("request_on_timeout(\n        socket,\n        HOOK_ORIGIN_METHOD,"),
+            "클라이언트가 상수로 부르지 않는다 — 이름이 흩어지면 갈린다"
+        );
+        // ⓒ 데몬 — arm 이 실재해야 한다. 없으면 매 프롬프트가 legacy 로 떨어져 게이트가 죽는다.
+        let daemon = include_str!("cysd/handlers.rs");
+        assert!(
+            daemon.contains(&format!("\"{HOOK_ORIGIN_METHOD}\" =>")),
+            "데몬에 {HOOK_ORIGIN_METHOD} arm 이 없다 — 전 프롬프트가 legacy 로 떨어져 층1 이 죽는다"
+        );
+    }
+
+    /// ★H-ORIGIN-FOLD-1(층1): 데몬 응답 → 훅 판정의 **접는 방향**.
+    ///
+    /// 이 축의 실패는 **두 방향으로 갈리고 값이 정반대**다. 한 표로 묶어 박는다:
+    ///   · `unknown`(판정 근거 부재) → **fail-closed = 기계**. 거짓 음성이 치명이기 때문.
+    ///   · `legacy`(판정자 부재 = 구 데몬·데몬 사망) → **셸 종전 게이트**. 여기서 fail-closed 로
+    ///     접으면 데몬이 잠깐 죽은 것만으로 **오너 프롬프트가 전부 막힌다**(가용성 파괴).
+    /// 둘을 같은 방향으로 접는 구현은 어느 쪽이든 사고다.
+    #[test]
+    fn layer12_unknown_is_fail_closed_but_missing_judge_is_legacy() {
+        // 판정 근거 부재 → 기계로 접는다.
+        assert!(
+            matches!(Layer12::Unknown("원장 판독 불가".into()), Layer12::Unknown(_)),
+            "unknown 변형이 사라졌다"
+        );
+        // 네 변형이 서로 **다른 처분**이어야 한다 — 하나로 합치면 위 두 사고 중 하나가 난다.
+        let names = |v: &Layer12| match v {
+            Layer12::Machine(_) => "machine",
+            Layer12::Human => "human",
+            Layer12::Unknown(_) => "unknown",
+            Layer12::Legacy(_) => "legacy",
+        };
+        let all = [
+            Layer12::Machine("x".into()),
+            Layer12::Human,
+            Layer12::Unknown("x".into()),
+            Layer12::Legacy("x".into()),
+        ];
+        let mut seen: Vec<&str> = all.iter().map(names).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "층1 처분 4상이 겹친다 — 접는 방향이 융합됐다");
     }
 
     /// ★H-HOOK-ACK-1(B2-b · T1-8): ack RPC 의 **메서드명이 실재한다**.

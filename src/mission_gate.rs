@@ -1531,6 +1531,12 @@ fn capped_recent(delivery: &DeliveryMap) -> Option<String> {
 pub struct OriginVerdict {
     /// 기계 채널로 왔는가.
     pub machine: bool,
+    /// **어느 층이** 접었는가 — `Some(1)` 배달 원장 · `Some(2)` push 라벨 · `None` 접히지 않음.
+    ///
+    /// 판정 입력이 아니라 **진단**이다(`machine` 이 판정의 전부다). RPC `hook.machine_origin`
+    /// 이 이 값을 실어 훅·감사자가 "무엇이 잡았는지"를 알 수 있게 한다 — 층1이 배선된 뒤에도
+    /// 층2 만 잡고 있다면 그것은 원장이 비었다는 신호이지 정상이 아니다.
+    pub layer: Option<u8>,
     /// 사람이 읽는 사유(판정 입력 아님 · `machine=false` 면 빈 문자열).
     pub reason: String,
     /// 이 판정에서 **새로** 관측된 이상징후(원장 판독 단계의 것은 [`DeliveryRead::anomalies`]).
@@ -1588,6 +1594,7 @@ pub fn machine_origin(
                 ));
                 return OriginVerdict {
                     machine: true,
+            layer: Some(1),
                     reason: format!(
                         "배달 원장 일치(**창 밖** · 지연 {:.1}h · sha256={head}…) — 창을 넘겼어도 \
                          해시가 같으면 데몬이 이 pane 에 주입한 그 문장이다",
@@ -1598,6 +1605,7 @@ pub fn machine_origin(
             }
             return OriginVerdict {
                 machine: true,
+            layer: Some(1),
                 reason: format!(
                     "배달 원장 일치(sha256={head}… origin=daemon) — 데몬이 이 pane 에 주입한 \
                      바로 그 문장이다"
@@ -1614,6 +1622,7 @@ pub fn machine_origin(
                 ));
                 return OriginVerdict {
                     machine: true,
+            layer: Some(1),
                     reason: format!("배달 원장 대조 불완전 — {detail}"),
                     anomalies,
                 };
@@ -1625,6 +1634,7 @@ pub fn machine_origin(
                 ));
                 return OriginVerdict {
                     machine: true,
+            layer: Some(1),
                     reason: format!("배달 원장 조각 연접 — {detail}"),
                     anomalies,
                 };
@@ -1636,6 +1646,7 @@ pub fn machine_origin(
                 ));
                 return OriginVerdict {
                     machine: true,
+            layer: Some(1),
                     reason: format!("배달 원장 부분 포함 — {detail}"),
                     anomalies,
                 };
@@ -1648,6 +1659,7 @@ pub fn machine_origin(
             //   아니다). 이상징후는 read_delivery 가 이미 발행했다.
             return OriginVerdict {
                 machine: true,
+            layer: Some(1),
                 reason: format!(
                     "배달 원장 불완전 — {capped}. 이 배달의 초과분 행은 원장에 없어 대조 자체가 \
                      불가능하므로 판정을 열지 않는다(fail-closed · 창 {DELIVERY_CAPPED_FOLD_S:.0}s)"
@@ -1666,6 +1678,7 @@ pub fn machine_origin(
             ));
             return OriginVerdict {
                 machine: true,
+            layer: Some(1),
                 reason: format!("배달 원장 역포함(멀티라인 행 분할 정황) — {wdetail}"),
                 anomalies,
             };
@@ -1674,6 +1687,7 @@ pub fn machine_origin(
     if has_machine_label(prompt) {
         return OriginVerdict {
             machine: true,
+            layer: Some(2),
             reason: format!(
                 "push 규약 라벨 선두({:?}) — 기계 채널(wake/노드 push/훅 알림)",
                 label_head(prompt).map(String::from).unwrap_or_default()
@@ -1681,7 +1695,8 @@ pub fn machine_origin(
             anomalies,
         };
     }
-    OriginVerdict { machine: false, reason: String::new(), anomalies }
+    OriginVerdict { machine: false,
+        layer: None, reason: String::new(), anomalies }
 }
 
 /// 이상징후 중복 제거(python `collected_anomalies` 미러) — 키는 `(코드, 사유)` 쌍이고 **순서를

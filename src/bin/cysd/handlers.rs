@@ -521,6 +521,83 @@ fn announce_npm_prefix_pollution_with(
     let _ = s.write_tx.try_send(req);
 }
 
+/// `hook.machine_origin` 의 판정 본체 — 원장을 **읽고**(IO) 판정은 `mission_gate` 에 맡긴다.
+///
+/// 여기서 하는 일은 셋뿐이다: ①원장·회전 세대·기동 표식을 읽어 [`LedgerInput`] 으로 환원 ②
+/// [`read_delivery`]·[`machine_origin`] 호출 ③ 결과를 RPC 형상으로 옮김. **판정 규칙을 여기에
+/// 쓰지 않는다** — 규칙의 소유자는 `mission_gate` 하나이고 python 과의 파리티도 그쪽이 진다.
+///
+/// `unknown` 은 원장 **판독 불가**일 때만 낸다. '부재'는 unknown 이 아니다 — 데몬이 아직 아무
+/// 배달도 안 했다는 정상 상태이고, 그것을 unknown 으로 접으면 부트스트랩이 영영 막힌다
+/// (호출자가 unknown 을 fail-closed 로 접기 때문이다).
+fn hook_machine_origin_verdict(daemon: &Arc<Daemon>, sid: u64, norm: &str) -> serde_json::Value {
+    use cys::mission_gate as mg;
+
+    // 파일 I/O 는 여기서만 — 판정 함수는 순수하게 유지한다(검체가 원장 상태를 직접 먹인다).
+    let read_file = |p: &std::path::Path| -> mg::LedgerFile {
+        match std::fs::metadata(p) {
+            Err(_) => mg::LedgerFile::Missing,
+            Ok(m) if m.is_dir() => {
+                mg::LedgerFile::Unreadable(format!("자리가 파일이 아니다: {}", p.display()))
+            }
+            Ok(m) if m.len() > mg::LEDGER_MAX_READ_BYTES => mg::LedgerFile::Unreadable(format!(
+                "판독 상한 초과({} B > {} B)",
+                m.len(),
+                mg::LEDGER_MAX_READ_BYTES
+            )),
+            Ok(_) => match std::fs::read(p) {
+                Ok(b) => mg::LedgerFile::Content(String::from_utf8_lossy(&b).into_owned()),
+                Err(e) => mg::LedgerFile::Unreadable(format!("판독 실패({e})")),
+            },
+        }
+    };
+    let main_p = crate::delivery::ledger_path(&daemon.socket_path);
+    let rot_p = main_p.with_extension("jsonl.1");
+    let main = read_file(&main_p);
+    let rotated = read_file(&rot_p);
+    // 기동 표식 — 원장이 **부재인데** 이것이 있으면 삭제·손상이다(mission_gate 가 그 구분을 든다).
+    let epoch_raw = std::fs::read_to_string(crate::delivery::epoch_path(&daemon.socket_path)).ok();
+
+    let me = sid.to_string();
+    let label = main_p.display().to_string();
+    let inp = mg::LedgerInput {
+        main: &main,
+        rotated: &rotated,
+        daemon_epoch: epoch_raw.as_deref(),
+        me: &me,
+        now: crate::state::now_epoch(),
+        window_s: mg::delivery_window_s(),
+        path_label: &label,
+    };
+    let read = mg::read_delivery(&inp);
+    let v = mg::machine_origin(norm, &read.map, read.status);
+
+    // 이상징후는 **판독 단계 + 판정 단계** 둘 다 싣는다(한쪽만 실으면 흔적이 반쪽이 된다).
+    let mut all: Vec<(String, String)> = read.anomalies.clone();
+    all.extend(v.anomalies.iter().cloned());
+    all.extend(mg::env_anomalies());
+    let anomalies: Vec<serde_json::Value> = mg::dedup_anomalies(&all)
+        .into_iter()
+        .map(|(code, detail)| json!({"code": code, "detail": detail}))
+        .collect();
+
+    // origin 3상. `unknown` 은 **판독 불가에서만** 나온다(부재는 정상이다).
+    let origin = if v.machine {
+        "machine"
+    } else if read.status == mg::LedgerStatus::Unreadable {
+        "unknown"
+    } else {
+        "human"
+    };
+    json!({
+        "origin": origin,
+        "layer": v.layer,
+        "reason": v.reason,
+        "ledger_status": read.status.as_str(),
+        "anomalies": anomalies,
+    })
+}
+
 /// pane 에 넣을 고지 `WriteReq` — **순수**(채널도 데몬도 만지지 않는다).
 ///
 /// 집행(`try_send`)에서 분리한 이유는 codex R2 #2 의 "Inject 수신 단언" 때문이다: 실제 채널로
@@ -2429,6 +2506,70 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   이 arm 은 프롬프트 앞이지만 선언 확정 후 1회 호출이라 수 ms 원자 쓰기(tmp→rename ·
         //   fsync 없음)를 허용한다. 연결별 tokio task 라 다른 연결의 hook.decide 를 막지 않는다.
         //
+        // ★(부트 v2 · 명세 v2.1 **A12**) 층1 판정 프런트도어 — **원장 소유자가 판독한다**.
+        //
+        // 왜 데몬인가: 층1(배달 원장 대조)은 원장 파일 경로를 알아야 하는데 그 규약의 소유자는
+        // `delivery::ledger_path` **하나**다(`pack_state_dir`/`lane_key` 포함). `cys` CLI 로
+        // 규약을 복사하면 두 벌이 되어 반드시 갈리고, **갈린 순간 층1 은 빈 원장을 읽어 모든
+        // 기계 push 가 오너 임무가 된다** — 2026-08-01 사고의 기제 그 자체다. 그래서 판정을
+        // 원장 소유자에게 맡기고 CLI 는 묻기만 한다.
+        //
+        // 계약(A12): `{session_id, prompt_norm, prompt_digest?, truncated?}` →
+        //   `{origin: human|machine|unknown, layer: 1|2|null, anomalies: [...]}`
+        //   · `prompt_norm` 이 오면 규칙 ⓐ~ⓖ 전부 · `prompt_digest` 만이면 ⓐⓑ(전문·창 밖)뿐이다
+        //     (ⓒ조각 연접은 **부분 문자열 해시 대조**라 해시 하나로는 원리적으로 불가능하다).
+        //   · `prompt_digest` 가 함께 오면 **대조**한다 — 불일치는 invalid_params(둘 중 하나가
+        //     거짓이라는 뜻이고, 조용히 한쪽을 택하면 판정 근거가 위조된다).
+        //   · `unknown` = 원장 **판독 불가**(판정 근거 부재). 호출자는 fail-closed 로 접는다.
+        "hook.machine_origin" => {
+            if params.get("surface_id").is_some() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다",
+                ));
+            }
+            let Some(sid) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) else {
+                // 좌석 미확정 = 이 프롬프트가 어느 pane 것인지 모른다 = 층1 의 전제(surface 결박)가
+                // 없다. 판정을 지어내지 않고 unknown 을 낸다(호출자가 fail-closed 로 접는다).
+                return Reply::Single(ok_response(
+                    &id,
+                    json!({"origin": "unknown", "layer": null,
+                           "anomalies": [{"code": "seat_unresolved",
+                                          "detail": "발신 pane 을 커널 peer pid 로 확정하지 못했다"}]}),
+                ));
+            };
+            let norm = param_str(&params, "prompt_norm").unwrap_or_default();
+            let digest_in = param_str(&params, "prompt_digest");
+            if norm.is_empty() && digest_in.is_none() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: prompt_norm 또는 prompt_digest 중 하나는 있어야 한다",
+                ));
+            }
+            if norm.chars().count() > cys::mission_gate::HARNESS_SCAN_MAX_CHARS {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: prompt_norm 이 상한을 넘었다 — truncated 로 잘라 보내라",
+                ));
+            }
+            // digest 동반 시 **대조**(조용한 한쪽 채택 금지).
+            if let (Some(d), false) = (digest_in.as_deref(), norm.is_empty()) {
+                let calc = cys::mission_gate::digest_normalized(&norm);
+                if calc != d {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "hook.machine_origin: prompt_digest 가 prompt_norm 과 불일치한다",
+                    ));
+                }
+            }
+            let reply = hook_machine_origin_verdict(daemon, sid, &norm);
+            Reply::Single(ok_response(&id, reply))
+        }
+
         // ★인가 계약(hook.decide 동형): surface_id 는 신고할 수 없다 — 좌석은 데몬이 커널
         //   peer pid 의 조상 체인(resolve_caller_surface · record 경로)으로 도출한다.
         //   lane 도 지정할 수 없다(R3-P2-6): 인텐트는 항상 **수신 데몬 자신의 레인**(빈값 =
@@ -10240,6 +10381,89 @@ mod tests {
             src[start..end].contains("announce_npm_prefix_pollution(daemon, s.id)"),
             "surface.create 가 번들 오염 고지를 잃었다 — 경고에 소비자가 다시 0이 된다"
         );
+    }
+
+    /// ★H-ORIGIN-1(층1 · 명세 v2.1 A12): `hook.machine_origin` 이 **원장을 실제로 읽고** 판정한다.
+    ///
+    /// 이 검체가 닫는 구멍: 종전 훅 CLI 는 층0/0-c/2 만 봤고 층1 을 못 봤다. 그래서 **라벨 없는
+    /// 기계 push** — 데몬이 주입했지만 `[라벨]` 이 없는 문장 — 이 오너 임무로 통과했다.
+    /// 그것이 2026-08-01 사고의 기제이고, 여기서 그 문장을 **실제로 재현**한다.
+    ///
+    /// ★원장은 **생산 writer**(`delivery::record`)로 쓴다. 검체가 원장 줄을 손으로 지으면 그
+    /// 사본이 생산 형식과 갈리고, 갈린 뒤에도 검체는 초록이다(자기 사본을 자기가 읽으므로).
+    #[test]
+    fn hook_machine_origin_reads_the_real_ledger_and_folds_unlabeled_pushes() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        let norm = |t: &str| cys::mission_gate::normalize(t);
+
+        // ── ① 원장 **부재** = 정상(부트스트랩 불가침). unknown 이 아니라 human 이다. ──────
+        //    여기서 unknown 을 내면 호출자가 fail-closed 로 접어 **오너가 임무를 영영 못 준다**.
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm("릴리스 게이트를 통과시켜라"));
+        assert_eq!(
+            v["origin"], "human",
+            "원장 부재를 판정 불가로 접었다 — 부트스트랩이 영영 막힌다: {v}"
+        );
+
+        // ── ② ★라벨 없는 기계 push — 이 사고의 본체 ──────────────────────────────────
+        //    `[라벨]` 이 없어 층2 는 못 본다. 층1(원장 대조)만이 잡을 수 있다.
+        let unlabeled = "다음 액션 착수";
+        assert!(
+            !cys::mission_gate::has_machine_label(unlabeled),
+            "검체 전제 붕괴 — 이 문장에 라벨이 있으면 층2 가 잡아 층1 을 시험하지 못한다"
+        );
+        crate::delivery::record(
+            &daemon.socket_path,
+            sid,
+            unlabeled,
+            crate::delivery::Origin::Send,
+            None,
+        );
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm(unlabeled));
+        assert_eq!(
+            v["origin"], "machine",
+            "라벨 없는 기계 push 가 오너 프롬프트로 통과했다 — 2026-08-01 사고 재발: {v}"
+        );
+        assert_eq!(v["layer"], 1, "층2 가 잡았다면 이 검체는 층1 을 시험하지 못한 것이다: {v}");
+
+        // ── ③ 음성 대조 — 원장에 없는 문장은 오너 것이다(과차단 금지) ──────────────────
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm("이건 내가 직접 친 문장이다"));
+        assert_eq!(
+            v["origin"], "human",
+            "원장에 없는 오너 문장을 기계로 접었다 — 오너가 임무를 못 준다: {v}"
+        );
+
+        // ── ④ 남의 pane 배달은 내 판정에 쓰이지 않는다(surface 결박) ────────────────────
+        let other = make_surface(&daemon, None);
+        let mine_only = "남의 pane 으로 간 배달";
+        crate::delivery::record(
+            &daemon.socket_path,
+            other,
+            mine_only,
+            crate::delivery::Origin::Send,
+            None,
+        );
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm(mine_only));
+        assert_eq!(
+            v["origin"], "human",
+            "남의 pane 배달로 내 프롬프트를 접었다 — 결박이 풀리면 아무나 내 게이트를 닫는다: {v}"
+        );
+
+        // ── ⑤ 원장 **판독 불가** = unknown(부재와 융합 금지) ───────────────────────────
+        let d2 = isolated_daemon();
+        let s2 = make_surface(&d2, None);
+        let led = crate::delivery::ledger_path(&d2.socket_path);
+        if let Some(parent) = led.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&led);
+        std::fs::create_dir_all(&led).expect("원장 자리에 디렉터리 생성"); // 손상 재현
+        let v = hook_machine_origin_verdict(&d2, s2, &norm("아무 문장"));
+        assert_eq!(
+            v["origin"], "unknown",
+            "손상 원장을 정상으로 접었다 — 판정 근거 없이 게이트가 열린다: {v}"
+        );
+        assert_eq!(v["ledger_status"], "unreadable", "{v}");
     }
 
     /// ★H-NPM-7(codex R2 #2 · blocking): **고지가 Windows pane 에도 실제로 주입된다.**
