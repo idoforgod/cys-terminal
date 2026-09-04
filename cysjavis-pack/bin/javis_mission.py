@@ -156,6 +156,7 @@ MISSION_MIN_CHARS 미만이면 기계 산출이다. 마커가 오너 문장 **�
 
 ## 사용
     javis_mission.py record            # stdin=UserPromptSubmit hook JSON (훅 전용)
+                                       #   ★[deprecated · 1릴리스 병존] → `cys hook`(Rust)
     javis_mission.py status [--json]   # 0=임무 있음 / 1=없음 / 2=판독 불가(=없음 취급)
     javis_mission.py set "<임무>"      # 오너 확인(`cys feed push --wait` exit 0) 승인 시에만 기록
     javis_mission.py clear [--reason "<사유>"]
@@ -1979,8 +1980,19 @@ def cmd_record(argv):
       독자 규칙으로 답하면 `status` 와 갈릴 수 있다. 판정처는 언제나 `gate()` 하나다.
     ★P0-5: 판정 본체는 `_record_step` 으로 분리됐다(stdin 무접촉) — 이 래퍼는 stdin 1회
       판독만 더한다. exit·stderr·대장 부작용은 분리 전과 동일하다(구 서브커맨드 계약 불변).
+    ★★deprecated (0.14.30 · 부트 v2 §2-3): 대장 **writer 는 훅 Rust(`cys hook
+      user-prompt-submit`) 단일**이 되고 python 은 reader 로 강등된다. 이 서브커맨드는 구팩
+      스큐 폴백을 위해 **1릴리스 병존**한 뒤 제거된다 — 거동·exit·대장 부작용은 이 릴리스에서
+      한 글자도 바뀌지 않는다. 경고는 **stderr 로만** 낸다(훅이 stdout 을 라인 프로토콜로
+      파싱한다 — 오염은 곧 파서 오작동이다). 경고를 `_record_step` 에 넣으면 안 된다:
+      `cmd_hook_triage` 가 같은 본체를 쓰고 그쪽이 **평시 훅 경로**라 매 오너 프롬프트마다
+      경고가 뜬다(hooks/role-bootstrap.sh 의 정상 경로는 `hook-triage` 다).
     """
     _ = argv
+    sys.stderr.write("[mission] ★deprecated: `record` 는 1릴리스 병존 후 제거된다(부트 v2 §2-3) "
+                     "— 대장 writer 는 `cys hook user-prompt-submit`(Rust) 단일이고 평시 훅 "
+                     "경로는 `hook-triage` 다. python 은 reader 로 강등된다(이 릴리스에서 "
+                     "거동·exit 는 무변경).\n")
     return _record_step(_read_hook_stdin())
 
 
@@ -2375,6 +2387,357 @@ def cmd_hook_triage(argv):
     return mo_rc
 
 
+# ── 판정표 단일 원본(fixture) 적재 — 층0·층0-c·층1·층2 파리티 (0.14.30 A3 · 명세 §2-3) ──
+# ## 왜 fixture 인가
+# 이 모듈의 판정 규칙은 부트 v2 에서 Rust(`src/mission_gate.rs`)로 이식된다. 두 구현이 같은
+# 판정을 하는지는 **같은 표**를 양쪽이 소비할 때만 결정론으로 확인된다 — 사본을 두면 한쪽만
+# 고쳐지고 둘 다 초록인 채로 층1 이 조용히 죽는다(형제 선례: javis_detect + detect-corpus.json).
+# ## 계약면에 무엇을 싣고 무엇을 싣지 않는가
+#   싣는다  : 판정 bool · 잔여문·블록수·자유텍스트 유의미 글자수 · ledger_status · 이상징후 코드
+#   안 싣는다: **한국어 진단 산문**(문구를 다듬는 순간 계측기가 거짓말을 시작한다 —
+#             bin/tests/parity_todo_decl.py:17-20 의 규율을 그대로 따른다)
+# ## 3분기 계약(javis_detect._load_corpus 와 동형 · 이유는 그 docstring 참조)
+#   · fixture 부재      → 내장 리터럴 폴백(팩 tar 는 `tests/` 를 제외한다 — 설치본에서도
+#                         self-test 가 의미 있게 돌아야 한다). 라벨로 폴백 사실을 드러낸다.
+#   · fixture 존재+불량 → **hard fail**(조용한 폴백은 corpus 부식을 통과로 접는다).
+#   · 정상              → fixture ⊇ 내장 리터럴 불변식까지 검사.
+MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2")
+
+# 내장 폴백(= fixture 의 진부분집합). 축마다 **양방향**(접힘 1 · 통과 1)을 갖춘다 — 한 방향만
+# 두면 "전부 접는다"·"전부 통과시킨다"는 무력화가 초록으로 지나간다.
+MISSION_CORPUS_FALLBACK = {
+    "layer0": [
+        {"name": "L0-real-incident-task-notification",
+         "text": "<task-notification><task-id>abcdefgh</task-id><status>completed</status>"
+                 "<summary>done</summary></task-notification>",
+         "expect": {"harness": True, "residual": "", "blocks": 1, "free_meaningful": 0}},
+        {"name": "L0-generic-block-with-free-text",
+         "text": "<div><p>x</p></div> 고쳐",
+         "expect": {"harness": False, "residual": "<div><p>x</p></div> 고쳐",
+                    "blocks": 1, "free_meaningful": 2}},
+    ],
+    "layer0c": [
+        {"name": "L0c-cys-launch-agent",
+         "text": "cys launch-agent --role master --agent claude",
+         "expect": {"boot_command": True}},
+        {"name": "L0c-hangul-present",
+         "text": "cys boot 실행하고 결과 보고해",
+         "expect": {"boot_command": False}},
+    ],
+    "layer1": [
+        {"name": "L1-exact-match", "my_surface": "7", "now_epoch": 1700000000.0,
+         "ledger": {"present": True,
+                    "records": [{"gen": 0, "surface": "7", "ts_offset_s": -60.0,
+                                 "body": "다음 액션 착수", "origin": "send"}]},
+         "prompt": "다음 액션 착수",
+         "expect": {"ledger_status": "ok", "machine": True, "label": False, "anomalies": []}},
+        {"name": "L1-no-match-no-label", "my_surface": "7", "now_epoch": 1700000000.0,
+         "ledger": {"present": True,
+                    "records": [{"gen": 0, "surface": "7", "ts_offset_s": -60.0,
+                                 "body": "다음 액션 착수", "origin": "send"}]},
+         "prompt": "이건 오너가 직접 친 문장이다",
+         "expect": {"ledger_status": "ok", "machine": False, "label": False, "anomalies": []}},
+    ],
+    "layer2": [
+        {"name": "L2-plain-label", "text": "[wakeup] 다음 액션 착수",
+         "expect": {"label": True, "head": "["}},
+        {"name": "L2-owner-plain", "text": "다음 액션 착수해줘",
+         "expect": {"label": False, "head": "다"}},
+    ],
+}
+
+
+def mission_corpus_path():
+    """판정표 단일 원본의 위치 — 팩 상대 고정 경로(레인 이동에도 함께 움직인다).
+
+    ★Rust 소비자(`src/mission_gate.rs`)가 `include_str!` 로 같은 파일을 흡수한다 —
+      **파일을 옮기거나 이름을 바꾸면 빌드 타임 결합이 깨진다**(선례 cys.rs 의 role-bootstrap.sh).
+    """
+    return os.path.join(_SELF_DIR, "tests", "fixtures", "mission-origin-corpus.json")
+
+
+def _corpus_text(spec):
+    """fixture 의 text/prompt/body 값 → 실제 문자열. None = 스키마 위반.
+
+    문자열이거나 `{"repeat": {"unit": "...", "times": N}}` 생성 지시자다. 거대 검체(8MB 급)를
+    JSON 에 인라인하면 fixture 자체가 터지므로 지시자로 표현한다.
+    """
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, dict):
+        r = spec.get("repeat")
+        if isinstance(r, dict) and isinstance(r.get("unit"), str) \
+                and isinstance(r.get("times"), int) and not isinstance(r.get("times"), bool) \
+                and r["times"] >= 0:
+            return r["unit"] * r["times"]
+    return None
+
+
+def _load_mission_corpus():
+    """판정표 적재. 반환 (source_label, data, err) — 계약은 위 섹션 주석 참조."""
+    path = mission_corpus_path()
+    if not os.path.isfile(path):
+        data = {"$constants": None, "anomaly_codes": None, "harness_markers": None}
+        for sec in MISSION_CORPUS_SECTIONS:
+            data[sec] = [dict(c) for c in MISSION_CORPUS_FALLBACK[sec]]
+        return ("내장 리터럴(fixture 부재 폴백)", data, None)
+    try:
+        with open(path, "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
+    except Exception as e:
+        return (None, None, "fixture 판독 불가 %s: %s" % (path, e))
+    if not isinstance(data, dict):
+        return (None, None, "fixture 스키마 위반 %s: 최상위가 객체가 아니다" % path)
+    for sec in MISSION_CORPUS_SECTIONS:
+        if not isinstance(data.get(sec), list) or not data[sec]:
+            return (None, None,
+                    "fixture 스키마 위반 %s: %r 은 비어있지 않은 배열이어야 한다" % (path, sec))
+        for i, it in enumerate(data[sec]):
+            if not isinstance(it, dict) or not isinstance(it.get("name"), str) or not it["name"]:
+                return (None, None, "fixture 스키마 위반 %s: %s[%d] 에 name 이 없다" % (path, sec, i))
+            if not isinstance(it.get("expect"), dict):
+                return (None, None,
+                        "fixture 스키마 위반 %s: %s[%d](%s) 에 expect 객체가 없다"
+                        % (path, sec, i, it["name"]))
+            key = "prompt" if sec == "layer1" else "text"
+            if _corpus_text(it.get(key)) is None:
+                return (None, None,
+                        "fixture 스키마 위반 %s: %s[%d](%s).%s 는 문자열 또는 "
+                        "{repeat:{unit,times}} 여야 한다" % (path, sec, i, it["name"], key))
+            if sec == "layer1":
+                if not isinstance(it.get("ledger"), dict):
+                    return (None, None,
+                            "fixture 스키마 위반 %s: layer1[%d](%s).ledger 객체가 없다"
+                            % (path, i, it["name"]))
+                # now_epoch 이 없으면 read_delivery 가 **현재 시각**을 쓰고 ts_offset 계약이
+                # 통째로 무의미해진다(창 밖 케이스가 창 안이 된다). 빠지면 스키마 위반이다.
+                if not isinstance(it.get("now_epoch"), (int, float)) \
+                        or isinstance(it.get("now_epoch"), bool):
+                    return (None, None,
+                            "fixture 스키마 위반 %s: layer1[%d](%s).now_epoch(수) 가 없다 — "
+                            "ts_offset 은 이 기준시각에 대한 상대값이다" % (path, i, it["name"]))
+    if not isinstance(data.get("anomaly_codes"), list) or \
+            not all(isinstance(c, str) for c in data["anomaly_codes"]):
+        return (None, None, "fixture 스키마 위반 %s: anomaly_codes 는 문자열 배열이어야 한다" % path)
+    hm = data.get("harness_markers")
+    if not isinstance(hm, dict) or not isinstance(hm.get("notify"), list) \
+            or not isinstance(hm.get("context"), list):
+        return (None, None,
+                "fixture 스키마 위반 %s: harness_markers 는 {notify:[…],context:[…]} 여야 한다" % path)
+    if not isinstance(data.get("$constants"), dict):
+        return (None, None, "fixture 스키마 위반 %s: $constants 객체가 없다" % path)
+    # 단일 원본 불변식: fixture ⊇ 내장 리터럴. 리터럴에만 고치고 fixture 를 안 고치는
+    # 드리프트(사본 분화의 재발 경로)를 여기서 잡는다.
+    for sec in MISSION_CORPUS_SECTIONS:
+        have = {c["name"]: c for c in data[sec]}
+        for lit in MISSION_CORPUS_FALLBACK[sec]:
+            got = have.get(lit["name"])
+            if got is None:
+                return (None, None,
+                        "fixture 가 내장 %s 케이스 %r 를 포함하지 않는다(단일 원본 위반)"
+                        % (sec, lit["name"]))
+            for k, v in lit.items():
+                if got.get(k) != v:
+                    return (None, None,
+                            "fixture 의 %s/%s 가 내장 리터럴과 갈렸다(필드 %r): fixture=%r 내장=%r"
+                            % (sec, lit["name"], k, got.get(k), v))
+    return ("fixture %s" % path, data, None)
+
+
+def _corpus_ledger_lines(case, gen):
+    """layer1 케이스 → 세대 gen(0=본 파일 · 1=회전본 .1)의 원장 본문.
+
+    ★레코드 필드 **사본 금지**(bin/tests/run_bootstrap_health.py:1357-1358 규약): `sha256`·
+      `chars`·`preview` 는 fixture 가 주지 않고 **판별 소유자의 자기 함수**로 만든다. 그래야
+      정규화·해시가 갈리는 순간 파리티가 깨진 것으로 드러난다(사본이면 둘 다 초록이다).
+    ★시각은 절대값이 아니라 오프셋이다 — 창(`DELIVERY_WINDOW_S`)은 env 로 흔들리므로 창
+      의존 케이스는 `ts_offset_window_mult`(창 배수)로 적어야 오버라이드에도 뜻이 보존된다.
+    """
+    ledger = case["ledger"]
+    now = case.get("now_epoch")
+    out = []
+    for rec in ledger.get("records") or []:
+        if int(rec.get("gen", 0)) != gen:
+            continue
+        if "raw" in rec:                          # 손상 줄 원문 주입
+            out.append("%s\n" % rec["raw"])
+            continue
+        norm = _normalize_delivery(_corpus_text(rec.get("body")))
+        if "ts_offset_window_mult" in rec:
+            ts = now + float(rec["ts_offset_window_mult"]) * DELIVERY_WINDOW_S
+        else:
+            ts = now + float(rec.get("ts_offset_s", 0))
+        row = {"v": rec.get("v", SCHEMA_VERSION), "surface": rec.get("surface", ""),
+               "ts_epoch": ts, "sha256": _digest_norm(norm),
+               "origin": rec.get("origin", "send"),
+               "chars": len(norm), "preview": norm[:PREVIEW_CHARS]}
+        for k in ("units", "parts_capped", "part", "parent"):
+            if k in rec:
+                row[k] = rec[k]
+        out.append(json.dumps(row, ensure_ascii=False) + "\n")
+    return "".join(out)
+
+
+def _selftest_mission_corpus(fails):
+    """판정표 fixture 소비 — 층0·층0-c·층1·층2 + 상수·이상징후·마커 열거 파리티.
+
+    실패 문안은 전부 `mission-origin-corpus <층>/<케이스명>` 으로 시작한다(변조 검체가 어느
+    핀이 죽었는지 기계로 특정할 수 있어야 한다 — bin/tests/test_mission_origin_parity.py).
+    """
+    import tempfile as _tf
+
+    source, data, err = _load_mission_corpus()
+    if err:
+        # fixture 가 존재하는데 불량 — 폴백하지 않는다(측정 실패는 hard fail).
+        fails.append("mission-origin-corpus 적재 실패: %s" % err)
+        return
+    if source.startswith("내장"):
+        print("javis_mission self-test NOTE: mission-origin-corpus fixture 부재 — 내장 리터럴 "
+              "폴백으로 돈다(팩 tar 는 tests/ 를 제외한다)", file=sys.stderr)
+
+    # ── ① 상수 파리티 ────────────────────────────────────────────────────────
+    consts = data.get("$constants")
+    if consts:
+        live = {"SCHEMA_VERSION": SCHEMA_VERSION, "MISSION_MIN_CHARS": MISSION_MIN_CHARS,
+                "MISSION_MAX_CHARS": MISSION_MAX_CHARS,
+                "HARNESS_SCAN_MAX_CHARS": HARNESS_SCAN_MAX_CHARS,
+                "HARNESS_SCAN_PREFIX_CHARS": HARNESS_SCAN_PREFIX_CHARS,
+                "PREVIEW_CHARS": PREVIEW_CHARS, "PART_PREVIEW_CHARS": PART_PREVIEW_CHARS,
+                "DELIVERY_PART_MIN_CHARS": DELIVERY_PART_MIN_CHARS,
+                "DELIVERY_WITHIN_MIN_CHARS": DELIVERY_WITHIN_MIN_CHARS,
+                "DELIVERY_SPAN_OCC_BUDGET": DELIVERY_SPAN_OCC_BUDGET,
+                "DELIVERY_CAPPED_FOLD_S": DELIVERY_CAPPED_FOLD_S,
+                "DELIVERY_SCAN_LINES": DELIVERY_SCAN_LINES,
+                "LEDGER_MAX_READ_BYTES": LEDGER_MAX_READ_BYTES}
+        for k, v in sorted(live.items()):
+            if k in consts and consts[k] != v:
+                fails.append("mission-origin-corpus $constants/%s 파리티 이탈: fixture=%r 코드=%r"
+                             % (k, consts[k], v))
+        # env 오버라이드가 걸린 상수는 **오버라이드가 없을 때만** 기본값을 잰다.
+        for k, name, cur in (("DELIVERY_WINDOW_S_DEFAULT", "CYS_DELIVERY_WINDOW_S", DELIVERY_WINDOW_S),
+                             ("MISSION_TTL_S_DEFAULT", "CYS_MISSION_TTL_S", MISSION_TTL_S)):
+            if k not in consts:
+                continue
+            if (os.environ.get(name) or "").strip():
+                print("javis_mission self-test NOTE: %s 오버라이드가 걸려 있어 %s 파리티는 "
+                      "이 런에서 재지 않는다(검체 bin/tests/test_mission_origin_parity.py 가 "
+                      "env 를 벗기고 무조건 잰다)" % (name, k), file=sys.stderr)
+            elif consts[k] != cur:
+                fails.append("mission-origin-corpus $constants/%s 파리티 이탈: fixture=%r 코드=%r"
+                             % (k, consts[k], cur))
+
+    # ── ② 이상징후 열거 파리티(등재소 ↔ fixture · 양방향) ──────────────────────
+    if data.get("anomaly_codes") is not None:
+        fx, code = set(data["anomaly_codes"]), set(ANOMALY_CODES)
+        for c in sorted(fx - code):
+            fails.append("mission-origin-corpus anomaly_codes/%s 가 fixture 에만 있다 — "
+                         "ANOMALY_CODES 등재소가 SOT 다(fixture 는 확장 창구가 아니다)" % c)
+        for c in sorted(code - fx):
+            fails.append("mission-origin-corpus anomaly_codes/%s 가 등재소에만 있다 — "
+                         "Rust 파리티 대상 목록이 코드와 갈렸다" % c)
+
+    # ── ③ harness 마커 열거 파리티(순서까지) ─────────────────────────────────
+    if data.get("harness_markers") is not None:
+        for key, live_markers in (("notify", list(HARNESS_NOTIFY_MARKERS)),
+                                  ("context", list(HARNESS_CONTEXT_MARKERS))):
+            if list(data["harness_markers"].get(key) or []) != live_markers:
+                fails.append("mission-origin-corpus harness_markers/%s 파리티 이탈: fixture=%r "
+                             "코드=%r" % (key, data["harness_markers"].get(key), live_markers))
+
+    def _eq(sec, name, field, got, want):
+        if got != want:
+            fails.append("mission-origin-corpus %s/%s: %s=%r (기대 %r)"
+                         % (sec, name, field, got, want))
+
+    # ── ④ 층0 — harness 내부 알림 ────────────────────────────────────────────
+    for c in data["layer0"]:
+        t, e, n = _corpus_text(c["text"]), c["expect"], c["name"]
+        if "harness" in e:
+            _eq("layer0", n, "harness", harness_origin(t)[0], e["harness"])
+        if "residual" in e:
+            _eq("layer0", n, "residual", strip_harness_blocks(t), e["residual"])
+        if "blocks" in e or "free_meaningful" in e:
+            free, blocks = generic_block_free_text(t)
+            if "blocks" in e:
+                _eq("layer0", n, "blocks", blocks, e["blocks"])
+            if "free_meaningful" in e:
+                _eq("layer0", n, "free_meaningful", _meaningful_chars(free), e["free_meaningful"])
+
+    # ── ⑤ 층0-c — 기동 명령문 ────────────────────────────────────────────────
+    for c in data["layer0c"]:
+        _eq("layer0c", c["name"], "boot_command",
+            boot_command_origin(_corpus_text(c["text"]))[0], c["expect"]["boot_command"])
+
+    # ── ⑥ 층2 — push 규약 라벨 ───────────────────────────────────────────────
+    for c in data["layer2"]:
+        t, e, n = _corpus_text(c["text"]), c["expect"], c["name"]
+        if "label" in e:
+            _eq("layer2", n, "label", has_machine_label(t), e["label"])
+        if "head" in e:
+            _eq("layer2", n, "head", _label_head(t), e["head"])
+
+    # ── ⑦ 층1 — 배달 원장 대조(밀폐 원장 파일을 실제로 쓰고 읽는다) ───────────
+    #    ★delivery-map 을 손으로 적지 않고 **원장 줄**로 적는 이유: `stale`·회전·surface 결박·
+    #      스키마 스큐는 전부 read_delivery 가 계산하므로, map 을 적으면 그 규칙들이 파리티
+    #      대상에서 통째로 빠진다.
+    env_pairs = set((c, d) for c, d in ENV_ANOMALIES)
+    keep = {k: os.environ.get(k) for k in ("CYS_STATE_DIR", "CYS_SURFACE_ID",
+                                           "CYS_MISSION", "AITERM_SURFACE_ID")}
+    try:
+        with _tf.TemporaryDirectory() as td:
+            os.environ["CYS_STATE_DIR"] = os.path.join(td, "state")
+            os.environ.pop("CYS_MISSION", None)
+            os.environ.pop("AITERM_SURFACE_ID", None)
+            os.environ["CYS_SURFACE_ID"] = "corpus"
+            dp = delivery_ledger_path()
+            if not dp or not os.path.abspath(dp).startswith(os.path.abspath(td)):
+                fails.append("mission-origin-corpus layer1: 밀폐 붕괴 — CYS_STATE_DIR 격리가 "
+                             "무시됐다(path=%r). 실 사용자 원장을 읽을 뻔했다" % dp)
+                return
+            rot, ep = dp + ".1", delivery_epoch_path()
+            try:
+                os.makedirs(os.path.dirname(dp))
+            except OSError:
+                pass
+            for c in data["layer1"]:
+                n, e = c["name"], c["expect"]
+                for q in (dp, rot, ep):
+                    if q and os.path.exists(q):
+                        os.remove(q)
+                del _ANOMALY_SINK[:]
+                os.environ["CYS_SURFACE_ID"] = c.get("my_surface") or ""
+                led = c["ledger"]
+                if led.get("present"):
+                    body = led["raw"] if isinstance(led.get("raw"), str) \
+                        else _corpus_ledger_lines(c, 0)
+                    with open(dp, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(body)
+                    g1 = "" if isinstance(led.get("raw"), str) else _corpus_ledger_lines(c, 1)
+                    if g1:
+                        with open(rot, "w", encoding="utf-8", newline="\n") as f:
+                            f.write(g1)
+                prompt = _corpus_text(c["prompt"])
+                deliv, status, _detail = read_delivery(now=c.get("now_epoch"))
+                mach = machine_origin(prompt, deliv, status)[0]
+                obs = [a["code"] for a in collected_anomalies()
+                       if (a["code"], a["detail"]) not in env_pairs]
+                if "ledger_status" in e:
+                    _eq("layer1", n, "ledger_status", status, e["ledger_status"])
+                if "machine" in e:
+                    _eq("layer1", n, "machine", mach, e["machine"])
+                if "label" in e:
+                    _eq("layer1", n, "label", has_machine_label(prompt), e["label"])
+                if "anomalies" in e:
+                    _eq("layer1", n, "anomalies", obs, list(e["anomalies"]))
+    finally:
+        del _ANOMALY_SINK[:]                     # 뒤 배터리로 새지 않게 비운다
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 # ── 밀폐 self-test(assert 배터리 · preflight/CI 관례 — 선례 javis_detect.cmd_self_test) ──
 def _selftest_anomaly_registry(fails):
     """★R6 회귀 핀 — **발행 코드 전수 ↔ 등재소 ↔ 문서 열거**를 1:1 로 묶는다.
@@ -2435,6 +2798,7 @@ def cmd_self_test():
         return 1
     fails = []
     _selftest_anomaly_registry(fails)
+    _selftest_mission_corpus(fails)          # 판정표 단일 원본 소비(A3 · Rust 파리티 대상)
 
     def want_none(p, why):
         m, r = extract_mission(p, detect)
@@ -3866,13 +4230,18 @@ def cmd_self_test():
           "record→MO→path(★R2-2·R2-5: 안전 임계 라인이 임의 내용 필드보다 앞) · "
           "path 제어문자 봉인(개행 주입 무력화·정상 경로 무변형) · "
           "path=ledger_path 일치 · 기계 라벨=machine · 층0 독립(harness "
-          "알림 MO=human·record 폴드 유지) · 파싱 실패=record rc2+MO unknown 각자 fail-closed)"
+          "알림 MO=human·record 폴드 유지) · 파싱 실패=record rc2+MO unknown 각자 fail-closed) · "
+          "★판정표 단일 원본(A3 · tests/fixtures/mission-origin-corpus.json): 층0/층0-c/층1/층2 "
+          "케이스 소비 + $constants·ANOMALY_CODES·HARNESS_MARKERS 열거 파리티 + fixture ⊇ 내장 "
+          "리터럴 불변식(부재면 내장 폴백 · 불량이면 hard fail)"
           % (MISSION_MIN_CHARS, MISSION_TTL_S))
     return 0
 
 
 _USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|delivery-path|machine-origin|hook-triage] [--self-test]
   record : stdin=UserPromptSubmit hook JSON → 임무 대장 갱신(훅 전용)
+           ★[deprecated · 1릴리스 병존] writer 는 `cys hook user-prompt-submit`(Rust)
+             단일로 이전 · 평시 훅 경로는 `hook-triage` · python 은 reader 로 강등
   status : 0=임무 있음(자율 착수 가) / 1=임무 없음(보고·정지) / 2=판독 불가(=없음 취급)
   set    : 오너 확인 채널(`cys feed push --wait` exit 0) 승인 시에만 기록
            — **이 명령 경로로는** 자기해제 불가(파일 직접 조작은 별개 · 보장 범위는
