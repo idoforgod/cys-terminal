@@ -117,22 +117,48 @@ jobs:
           #   실제 체크아웃 바이트를 LF 로 만드는지는 이 레인만이 실측할 수 있다.
           WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
-          python "$R" --only "$WIN_SPECIMENS"
-          python "$R" --only "$WIN_SPECIMENS" --json > win-health.json
-          python - <<'PY'
+          # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
+          #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은
+          #   정작 실패했을 때만 실행되지 않았다 — 진단이 필요 없을 때만 진단이 도는 구조다.
+          #   실측: 8d03bf4 런(33874334807)의 annotation 은 "exit code 1" 한 줄이 전부였다.
+          #   더구나 전 검체를 두 번 돌려 간헐 검체(H-CONC-3 등)는 두 판정이 갈릴 수 있었다.
+          #   ci-branch 가 이미 쓰는 검증된 형식(`--json > 파일 || rc=$?` → 판독 블록)으로 맞춘다.
+          rc=0
+          python "$R" --only "$WIN_SPECIMENS" --json > win-health.json || rc=$?
+          python - "$rc" <<'PY'
           import json, sys
-          d = json.load(open("win-health.json", encoding="utf-8"))
+          rc = int(sys.argv[1])
+          try:
+              d = json.load(open("win-health.json", encoding="utf-8"))
+          except Exception as e:                      # noqa: BLE001 — 파싱 실패도 관측 실패다
+              print("::error::건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. "
+                    "이 상태의 '문제 없음' 은 근거가 아니다(fail-closed)." % e, file=sys.stderr)
+              sys.exit(1)
           s = d["summary"]
           print("[win-health] verdict=%s pass=%s fail=%s skip=%s pending=%s"
                 % (s["verdict"], s["pass"], s["fail"], s["skip"], s["pending"]))
           for r in d["specimens"]:
               print("  %-6s %-12s %s" % (r["status"].upper(), r["id"], r.get("reason", r.get("detail", ""))[:160]))
+          # ★실패 검체는 annotation 채널로 올린다(2026-09-04). 이 저장소의 CI 로그는 토큰 없이
+          #   읽을 수 없어(익명 403) print 는 원인 추적에 쓸 수 없다 — check-runs 의 annotations
+          #   만이 익명으로 읽힌다. ci-branch 가 이미 쓰는 형식을 그대로 따른다(검증됨:
+          #   그 형식 덕에 H-CONC-3 을 로그 없이 특정했다).
+          for r in d["specimens"]:
+              if r["status"] == "fail":
+                  print("::error title=%s::%s"
+                        % (r["id"], (r.get("reason") or r.get("detail") or "")[:600]))
           # 측정 실패는 조용한 통과가 아니다 — 실기 목적이 skip 무더기로 무력화되면 잡을 세운다.
           if s["fail"]:
               sys.exit(1)
           if s["pass"] == 0:
               print("::error::Windows 실기에서 PASS 0건 — 검체가 전부 skip/pending 이면 이 잡은 "
                     "무검증 베이스라인을 재생산한다(fail-closed).", file=sys.stderr)
+              sys.exit(1)
+          # 러너가 0 이 아닌 rc 로 끝났는데 위 갈래가 아무것도 잡지 못했다면, 우리가 모르는
+          # 이유로 죽은 것이다 — 그 상태의 초록은 근거가 아니다(rc 포획의 존재 이유).
+          if rc != 0:
+              print("::error::건강성 러너가 rc=%d 로 끝났는데 실패 검체는 0건이다 — 판정 불가(fail-closed)."
+                    % rc, file=sys.stderr)
               sys.exit(1)
           PY
 
