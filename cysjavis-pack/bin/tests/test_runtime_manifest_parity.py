@@ -190,6 +190,11 @@ class ManifestSchemaParityTests(unittest.TestCase):
                          "설치 경로 확정은 설치 스텝 한 곳에서만 나와야 한다(생산자 단일)")
         self.assertEqual(1, code.count('"CYS_INSTALL_VER=$markerVer"'),
                          "검증된 마커 값 확정도 한 곳에서만 나와야 한다")
+        # ★트리거 핀: 이 레인이 수리 브랜치에서 돌지 않으면 위 단언들은 **한 번도 실행되지 않는
+        #   문장**이 된다(D4·#10 이 잡은 '0회 실행 게이트'와 같은 계급 — master 판정 2026-09-04).
+        self.assertIn("'fix/**'", src.split("jobs:")[0],
+                      "windows-build 가 fix/** 에서 돌지 않는다 — 수리 레인의 Windows 변경이 "
+                      "태그 레인에 가서야 드러난다")
         consumers = code.count("$dir = $env:CYS_INSTALL_DIR")
         self.assertGreaterEqual(consumers, 7,
                                 "확정값을 받는 스텝이 7곳 미만이다 — 어딘가 자체 탐색으로 돌아갔다")
