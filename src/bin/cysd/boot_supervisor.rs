@@ -26,7 +26,9 @@
 //!      총량은 유계가 되지만 이미 매달린 프로세스는 그대로다.
 //!   ② 고아 원장(`Daemon::boot_fenced` · pid 포함) — **사람이 찾아갈 수 있게** 만든다.
 //!      회수는 운영자나 watchdog(`duplicate_procs` 축)의 몫이다.
-//!   ③ 나이 기반 추정 회수([`FENCED_REAP_AGE_SECS`]) — 상한이 **영구 정지**가 되지 않게 한다.
+//!   ③ 나이는 **진단 축**이다(R5 [4]) — 회수 근거가 아니다. 고아를 원장에서 빼는 유일한
+//!     근거는 **확인된 exit 관측**(A18 [5] · B4)이고, [`FENCED_REAP_AGE_SECS`] 를 넘긴 보유는
+//!     "너무 오래 쥐고 있다" 는 신호로만 보고된다.
 //!      이것은 관측이 아니라 추정이다(프로세스가 실제로 끝났는지 보지 않는다).
 //! 진짜 회수는 러너 자신이 lease 상실을 보고 **스스로 끝내는 것**(명세 §2-7 · B4)이다.
 //!
@@ -698,6 +700,17 @@ pub struct RunnerReadiness {
     pub boot_last_writer: bool,
     /// fence 고아 원장이 **영속**되어 재시작을 넘는가(R3 #9).
     pub durable_history: bool,
+    /// (R5 [5]) admission **active map 원자 예약**이 구현·검증됐는가(A18 [2]).
+    ///
+    /// 이 칸이 없으면 '예약 없이 낳는' 빌드에서도 arm 될 수 있었다 — 그 창에서 fence 는
+    /// 유계를 세지 못한 채 세대만 올린다.
+    pub admission_reserved: bool,
+    /// (R5 [5]) 러너의 **확인된 exit** 을 관측·기록하는가(A18 [5]).
+    ///
+    /// 고아 회수의 **유일한 근거**다(나이는 추정이라 근거가 아니다 — R5 [4]). 이 칸이 false 인
+    /// 동안 원장은 자라기만 하므로, 그 상태에서 arm 되면 상한이 차고 부트가 멎는다. 그래서
+    /// 회수 주체가 없으면 애초에 무장하지 못하게 막는다.
+    pub confirmed_exit_observed: bool,
 }
 
 impl RunnerReadiness {
@@ -709,6 +722,8 @@ impl RunnerReadiness {
             && self.self_terminate
             && self.boot_last_writer
             && self.durable_history
+            && self.admission_reserved
+            && self.confirmed_exit_observed
     }
 
     /// 빠진 칸의 이름 — **왜** 못 켜는지 사람과 이벤트가 함께 읽는다.
@@ -720,6 +735,8 @@ impl RunnerReadiness {
             (self.self_terminate, "self_terminate"),
             (self.boot_last_writer, "boot_last_writer"),
             (self.durable_history, "durable_history"),
+            (self.admission_reserved, "admission_reserved"),
+            (self.confirmed_exit_observed, "confirmed_exit_observed"),
         ]
         .into_iter()
         .filter(|(ok, _)| !ok)
@@ -739,6 +756,8 @@ pub const RUNNER_READINESS: RunnerReadiness = RunnerReadiness {
     self_terminate: false,
     boot_last_writer: false,
     durable_history: false,
+    admission_reserved: false,
+    confirmed_exit_observed: false,
 };
 
 /// [`ENV_FENCE_ARMED`] 판독 — env 가 무장을 **요구**하는가(의도 축 하나만 본다).
@@ -827,6 +846,22 @@ pub fn bump_boot_epoch(dir: &Path) -> Result<u64, String> {
 
 /// epoch 를 **원자 교체 + fsync** 로 내린다 — rename 만으로는 크래시를 못 넘는다.
 ///
+/// ## Windows 도 replace-safe 다 — 추정이 아니라 실측이다 (R5 [3])
+/// `std::fs::rename` 은 Windows 에서 **기존 목적지를 덮어쓴다**. 근거는 표준 라이브러리 소스다:
+/// `library/std/src/sys/fs/windows.rs` 의 `rename` 이
+/// `MoveFileExW(old, new, MOVEFILE_REPLACE_EXISTING)` 를 부르고, `ACCESS_DENIED` 면
+/// `SetFileInformationByHandle`/`FileRenameInfoEx` 로 폴백한다. 동시 기동도 막히지 않는다 —
+/// 같은 파일의 기본 `share_mode` 가 `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`
+/// 라, 다른 데몬이 이 파일을 **읽는 중이어도** 그 핸들이 rename 을 막지 않는다.
+///
+/// ★그러므로 "Windows 는 덮어쓰기 rename 이 안 된다" 는 통념으로 **목적지를 먼저 지우고
+/// rename 하는 수정을 하지 마라.** 그 순간 원자성이 깨진다: 목적지가 잠깐 사라지고, 그 창에서
+/// 크래시하면 epoch 를 통째로 잃는다(다음 기동이 이전 값을 몰라 재사용 방지가 사라진다).
+/// 아래 소스핀이 그 회귀를 막는다.
+///
+/// ★정직한 잔여: 디렉터리 fsync 는 `#[cfg(unix)]` 라 Windows 에서는 건너뛴다(이식 가능한
+/// 대응물이 없다). 파일 **내용**은 `sync_all`(FlushFileBuffers)로 이미 매체에 있다.
+///
 /// 순서가 계약이다: tmp 에 쓰고 → `sync_all`(바이트가 실제로 매체에 있다) → rename(원자 교체).
 /// fsync 를 건너뛰면 rename 은 성공했는데 내용이 0바이트인 파일이 남을 수 있고, 그러면 다음
 /// 기동의 판독이 조용히 실패해 재사용 방지가 사라진다. tmp 이름은 nonce 라 **호출마다 유일**
@@ -871,12 +906,17 @@ fn persist_epoch(path: &Path, value: u64) -> std::io::Result<()> {
 /// 중인 1을 더한다.
 const MAX_LIVE_BOOT_RUNS: usize = MAX_ATTEMPTS as usize + 1;
 
-/// (B3-2R ④ⓓ) fence 고아를 **추정 회수**하는 나이 — 이 나이를 넘긴 고아는 원장에서 뺀다.
+/// (B3-2R ④ⓓ → R5 [4] 개정) fence 고아를 **오래 쥐고 있다**고 보는 나이 — **진단 임계**다.
 ///
-/// ★정직한 한계: 이것은 **관측이 아니라 추정**이다. 진짜 회수(프로세스가 실제로 끝났는지)는
-/// 자식 핸들 `try_wait` 관측(④ⓐ)이나 러너의 자멸(④ⓒ)이 있어야 하고 둘 다 §2-7 러너(B4)에
-/// 딸린다. 그때까지는 인텐트 수명과 같은 상한으로 접어 **영구 정지만 막는다** — 상한에 걸린
-/// 동안에는 새 부트가 나지 않으므로 그 정지가 조용하면 안 된다(아래 loud 통보).
+/// ★R5 [4](codex · master 심판): 종전에는 이 나이를 넘긴 고아를 **지웠다**. 그 삭제는 관측이
+/// 아니라 추정이었고, 추정으로 지우면 **살아 있는 러너를 없는 것으로 세어 새 런을 낳는 문**이
+/// 열린다. 그래서 나이 기반 삭제는 armed 여부와 무관하게 **폐지**했다. 원장에서 빼는 유일한
+/// 근거는 **확인된 exit 관측**이다(A18 [5] · B4 · [`RunnerReadiness::confirmed_exit_observed`]).
+///
+/// ★영구 정지 우려는 사슬로 닫힌다: 미무장이면 fence 가 원장에 아무것도 넣지 않아 원장이 애초에
+/// 비어 있고, 무장은 readiness 8칸이 막으며, 무장이 열리는 시점에는 `confirmed_exit_observed`
+/// 가 참이므로 회수 경로가 이미 존재한다. 값은 여전히 [`INTENT_MAX_AGE_SECS`] 유도다(예산 파리티
+/// 유도식 핀이 그 관계를 지킨다) — 의미만 '삭제 나이' 에서 '보고 임계' 로 바뀌었다.
 const FENCED_REAP_AGE_SECS: f64 = INTENT_MAX_AGE_SECS;
 
 /// ★B3(§2-6) fence 판정 — **순수 함수**. 이 런의 소유권(lease)을 회수해야 하는가.
@@ -1891,7 +1931,7 @@ fn notify_fence_disarmed_once(daemon: &Arc<Daemon>, st: &mut SupState) {
 /// 이 보류는 부트가 안 나는 상태로 이어질 수 있다(고아가 분모에 남아 admission 상한을 채운다).
 /// 그런 정지가 조용하면 운영자는 원인을 찾을 자리가 없다 — 안 하기로 정한 것과 그냥 안 되는
 /// 것은 다르고, 그 차이를 말하는 것이 이 한 줄의 값이다.
-fn notify_orphan_hold_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize) {
+fn notify_orphan_hold_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize, aged: usize) {
     if st.orphan_hold_reported {
         return;
     }
@@ -1899,8 +1939,9 @@ fn notify_orphan_hold_once(daemon: &Arc<Daemon>, st: &mut SupState, held: usize)
     publish(
         daemon,
         "boot_supervisor.orphan_hold",
-        json!({"held": held, "cap": MAX_LIVE_BOOT_RUNS, "armed": true,
-               "note": "armed 에서는 나이 추정으로 고아를 지우지 않는다 — 확인된 exit(B4 러너 ACK)과 영속 history 착지 전까지 fail-closed"}),
+        json!({"held": held, "aged": aged, "cap": MAX_LIVE_BOOT_RUNS,
+               "age_threshold_secs": FENCED_REAP_AGE_SECS,
+               "note": "고아는 나이로 지우지 않는다(armed 무관 · R5 [4]) — 원장에서 빼는 유일한 근거는 확인된 exit 관측(A18 [5] · B4)이고, 나이는 '너무 오래 쥐고 있다' 는 진단 신호일 뿐이다"}),
     );
 }
 
@@ -2017,13 +2058,20 @@ fn tick_in(
     //   armed 에서는 회수하지 않고 **fail-closed** 로 둔다(구현 완성은 B4 · 계약은 여기서 못박는다).
     //   ★unknown-live 도 같은 방향이다: 관측이 안 되면 상한에 걸린 것으로 친다
     //   (`admission_state` 가 `None` 을 돌리는 갈래 — 못 세는데 낳는 것이 이 축의 최악이다).
-    if st.fence_armed {
-        let held = daemon.boot_fenced.lock().map(|g| g.len()).unwrap_or(MAX_LIVE_BOOT_RUNS);
-        if held > 0 {
-            notify_orphan_hold_once(daemon, st, held);
-        }
-    } else if let Ok(mut g) = daemon.boot_fenced.lock() {
-        g.retain(|f| now - f.at < FENCED_REAP_AGE_SECS);
+    //   ★R5 [4] 개정(codex · master 심판): 그 자제를 **armed 무관**으로 넓혔다. 종전에는
+    //   미무장에서만 나이로 지웠는데, 대조군이 '나이가 지나면 지운다' 이면 **exit ACK 없는
+    //   삭제를 정상으로 검증**하게 된다. 나이는 근거가 아니라 진단이다 — 원장에서 빼는 유일한
+    //   근거는 확인된 exit 관측(A18 [5] · B4)이고, 그때까지 원장은 보유만 한다.
+    let (held, aged) = match daemon.boot_fenced.lock() {
+        Ok(g) => (
+            g.len(),
+            g.iter().filter(|f| now - f.at >= FENCED_REAP_AGE_SECS).count(),
+        ),
+        // 못 세면 상한에 걸린 것으로 친다(fail-closed · admission 과 같은 규율).
+        Err(_) => (MAX_LIVE_BOOT_RUNS, 0),
+    };
+    if held > 0 {
+        notify_orphan_hold_once(daemon, st, held, aged);
     }
 
     // ── 판정·실행 ──────────────────────────────────────────────────────────────
@@ -3494,62 +3542,21 @@ mod tests {
         assert!(feed > 0, "admission 상한 정지가 조용하다(통보 0)");
     }
 
-    /// ★R4 [5](codex major · master 심판) — **armed 에서는 나이만으로 고아를 지우지 않는다.**
+    /// ★R5 [4](codex · master 심판) — **고아는 나이만으로 원장에서 빠지지 않는다**(armed 무관).
     ///
-    /// 미무장에서 나이 회수는 영구 정지만 막는 무해한 추정이다(dispatch 가 0이라 새 프로세스가
-    /// 늘지 않는다). 그러나 armed 가 되면 같은 삭제가 **살아 있는 고아를 없는 것으로 세어 새
-    /// 런을 낳는 문**이 된다 — fence 가 막으려던 바로 그 이중 실행이다. 확인된 exit(§2-7 러너의
-    /// ACK)과 영속 history 가 착지하기 전까지 이 자제가 계약이다.
+    /// 종전에는 미무장이면 나이가 지난 고아를 지웠다. 그런데 대조군이 '나이가 지나면 지운다'
+    /// 이면 **exit ACK 없는 삭제를 정상으로 검증**하게 된다 — codex 가 짚은 그 지점이다. 나이는
+    /// 관측이 아니라 추정이고, 추정으로 지우면 살아 있는 러너를 없는 것으로 세어 새 런을 낳는
+    /// 문이 열린다. 원장에서 빼는 유일한 근거는 **확인된 exit 관측**이다(A18 [5] · B4).
     ///
-    /// ★대조군을 **같은 검체 안에** 둔다: 같은 형상을 미무장으로 한 번 더 돌려 회수가 실제로
-    /// 일어나는지 본다. 대조가 없으면 위 단언은 '어차피 아무것도 안 지워지는 코드' 에서도
-    /// 초록이라 공허하다(이 세션이 두 번 겪은 계급이다).
+    /// ★대가를 정직하게 함께 잰다: 회수가 없으니 상한이 찬 채로 남고 부트는 나지 않는다.
+    /// 그 정지가 조용하지 않은지를 단언한다. 그것이 무해한 이유는 사슬이다 — 미무장에서는
+    /// fence 가 원장에 애초에 아무것도 넣지 않고, 무장은 readiness 8칸이 막으며, 무장이 열릴
+    /// 때는 `confirmed_exit_observed` 가 참이라 회수 경로가 이미 존재한다.
     #[test]
-    fn armed_path_holds_orphans_instead_of_dropping_them_by_age() {
+    fn orphans_are_never_dropped_by_age_alone() {
         let d = tmp_daemon("hold");
         let dir = tmp_spool("hold");
-        {
-            let mut g = d.boot_fenced.lock().unwrap();
-            g.push(crate::state::FencedRun {
-                intent: "old".into(),
-                epoch: 0,
-                generation: 1,
-                pid: None,
-                why: "hb_stall",
-                at: 1.0,
-            });
-        }
-        let now = 1.0 + FENCED_REAP_AGE_SECS + 1.0;
-        // ① 무장 — 나이를 넘겼어도 원장에 남는다.
-        let mut armed = SupState::default();
-        armed.fence_armed = true;
-        let before = d.bus.latest_seq();
-        let _ = tick_in(&d, &dir, &mut armed, ok_runner, remove_spool_file, now);
-        assert_eq!(
-            d.boot_fenced.lock().unwrap().len(),
-            1,
-            "armed 인데 나이만으로 고아를 지웠다 — 살아 있을 수 있는 런을 없는 것으로 세고 \
-             새로 낳는 문이다(fence 가 막으려던 이중 실행)"
-        );
-        assert!(
-            d.bus.latest_seq() > before,
-            "회수 보류가 조용하다 — 정지가 조용하면 운영자가 원인을 찾을 자리가 없다"
-        );
-        // ② 대조군: 같은 형상을 미무장으로 — 이때는 회수된다.
-        let mut disarmed = SupState::default();
-        let _ = tick_in(&d, &dir, &mut disarmed, ok_runner, remove_spool_file, now);
-        assert!(
-            d.boot_fenced.lock().unwrap().is_empty(),
-            "미무장인데 회수되지 않았다 — 대조군이 서지 않으면 ①의 단언이 공허하다"
-        );
-    }
-
-    /// ★B3-2R ④ⓓ — 고아는 나이로 **추정 회수**된다(영구 정지 금지).
-    #[test]
-    fn aged_orphans_are_reaped_so_boots_resume() {
-        let d = tmp_daemon("reap");
-        let dir = tmp_spool("reap");
-        enqueue_in(&dir, &req("r", None), 0.0).unwrap();
         {
             let mut g = d.boot_fenced.lock().unwrap();
             for i in 0..MAX_LIVE_BOOT_RUNS {
@@ -3563,19 +3570,67 @@ mod tests {
                 });
             }
         }
-        let mut st = SupState::default();
-        // 회수 나이를 넘긴 시점 — 고아가 접히고 부트가 다시 난다.
+        // 나이를 훌쩍 넘긴 시점 — 종전이라면 여기서 전부 지워졌다.
         let now = 1.0 + FENCED_REAP_AGE_SECS + 1.0;
-        // 인텐트도 그 시점엔 수명을 넘기므로, 수명 안쪽 시각으로 새로 넣는다.
         enqueue_in(&dir, &req("r2", None), now).unwrap();
+        // ① 미무장 — 남는다.
+        let mut disarmed = SupState::default();
+        let before = d.bus.latest_seq();
+        let spawned = tick_in(&d, &dir, &mut disarmed, ok_runner, remove_spool_file, now);
         assert_eq!(
-            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, now),
-            1,
-            "고아가 회수되지 않아 부트가 영구 정지했다"
+            d.boot_fenced.lock().unwrap().len(),
+            MAX_LIVE_BOOT_RUNS,
+            "미무장에서 나이만으로 고아를 지웠다 — exit ACK 없는 삭제를 정상으로 만드는 대조군이다"
         );
+        assert_eq!(
+            spawned, 0,
+            "상한이 찼는데 낳았다 — admission 이 고아 원장을 분모로 세지 않는다"
+        );
+        // ★seq 증가만 보면 안 된다(실측으로 확인했다): 상한 정지 이벤트가 따로 나므로 통보를
+        //   지워도 seq 는 늘고, 그러면 이 단언은 통보 소실을 가르지 못한다. 이름으로 잰다.
+        let evts = d.bus.replay_after(before);
         assert!(
-            d.boot_fenced.lock().unwrap().is_empty(),
-            "나이 넘긴 고아가 원장에 남았다"
+            evts.iter().any(|e| e["name"] == "boot_supervisor.orphan_hold"),
+            "고아 보유가 이름 있는 이벤트로 나가지 않는다 — 부트가 안 나는 상태의 원인을 \
+             운영자가 찾을 자리가 없다: {:?}",
+            evts.iter().map(|e| e["name"].clone()).collect::<Vec<_>>()
+        );
+        // ② 무장 — 같다. 이 자제는 armed 여부와 무관하다(R4 에서는 armed 만이었다).
+        let mut armed = SupState::default();
+        armed.fence_armed = true;
+        let _ = tick_in(&d, &dir, &mut armed, ok_runner, remove_spool_file, now);
+        assert_eq!(
+            d.boot_fenced.lock().unwrap().len(),
+            MAX_LIVE_BOOT_RUNS,
+            "armed 에서 나이만으로 고아를 지웠다"
+        );
+    }
+
+    /// ★R5 [4] 소스핀 — 나이는 **삭제에 쓰이지 않는다**.
+    ///
+    /// 행위 검체만 있으면 누가 조건을 되살렸을 때 '고아를 안 넣는 형상' 에서는 조용히 초록일 수
+    /// 있다. 나이 상수와 원장 축소가 **같은 줄에 오는 것 자체**를 금지해 형상과 무관하게 잡는다.
+    #[test]
+    fn age_is_a_diagnostic_axis_and_never_a_deletion_reason() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        for line in prod.lines() {
+            assert!(
+                !(line.contains("FENCED_REAP_AGE_SECS") && line.contains("retain(")),
+                "나이가 다시 삭제 근거가 됐다({}) — 추정으로 지우면 살아 있는 러너를 없는 것으로 \
+                 세어 새 런을 낳는다",
+                line.trim()
+            );
+        }
+        assert!(
+            !prod.contains("retain(|f| now - f.at"),
+            "나이 기반 원장 축소가 되살아났다(R5 [4] 회귀)"
+        );
+        assert_eq!(
+            prod.matches("notify_orphan_hold_once(").count(),
+            2,
+            "고아 보유 통보의 정의 1 + 호출 1 이어야 한다 — 호출이 빠지면 정지가 조용해진다"
         );
     }
 
@@ -3747,6 +3802,8 @@ mod tests {
             self_terminate: false,
             boot_last_writer: false,
             durable_history: false,
+            admission_reserved: false,
+            confirmed_exit_observed: false,
         };
         let all = RunnerReadiness {
             lease_cas_closed: true,
@@ -3755,6 +3812,8 @@ mod tests {
             self_terminate: true,
             boot_last_writer: true,
             durable_history: true,
+            admission_reserved: true,
+            confirmed_exit_observed: true,
         };
         // ① env 만으로는 안 된다 — 이 검체가 R3 [4] 그 자체다.
         assert!(
@@ -3762,7 +3821,7 @@ mod tests {
             "env 만으로 무장했다 — 능력 없는 빌드에서 fence 가 살아난다(R3 [4] 재발)"
         );
         // ② 한 칸만 비어도 안 된다(AND 는 전칭이다).
-        for hole in 0..6 {
+        for hole in 0..8 {
             let mut r = all;
             match hole {
                 0 => r.lease_cas_closed = false,
@@ -3770,7 +3829,11 @@ mod tests {
                 2 => r.epoch_propagated = false,
                 3 => r.self_terminate = false,
                 4 => r.boot_last_writer = false,
-                _ => r.durable_history = false,
+                5 => r.durable_history = false,
+                // ★R5 [5]: 이 둘이 B4 전제를 게이트한다 — admission 예약과 exit 관측이 없으면
+                //   fence 는 유계를 세지도, 고아를 회수하지도 못한 채 세대만 올린다.
+                6 => r.admission_reserved = false,
+                _ => r.confirmed_exit_observed = false,
             }
             assert!(
                 !fence_armed_from(Some("1"), r),
@@ -3790,7 +3853,7 @@ mod tests {
         );
         assert_eq!(
             RUNNER_READINESS.missing().len(),
-            6,
+            8,
             "준비도 칸이 이유 없이 뒤집혔다: {:?}",
             RUNNER_READINESS.missing()
         );
@@ -3919,6 +3982,88 @@ mod tests {
         );
     }
 
+    /// ★R5 [3] — **이미 목적지가 있는 상태**에서의 동시 기동.
+    ///
+    /// 현행 동시 검체는 빈 디렉터리에서 시작하므로 첫 rename 이 '없는 목적지 만들기' 다. Windows
+    /// 에서 문제가 되는 것은 그쪽이 아니라 **덮어쓰기**이고, 게다가 다른 데몬이 그 파일을 읽는
+    /// 중일 수 있다. 그 조합을 직접 만든다.
+    ///
+    /// 실측 근거(rust-src): `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)` 가 덮어쓰고, 기본
+    /// `share_mode` 에 `FILE_SHARE_DELETE` 가 있어 읽는 핸들이 rename 을 막지 않는다. 이 검체는
+    /// 그 두 사실이 **이 코드 경로에서도 성립하는지**를 잰다(문서를 믿지 않고 잰다).
+    #[test]
+    fn concurrent_bumps_over_an_existing_destination_all_succeed() {
+        let d = std::env::temp_dir().join(format!("cysd-epoch-ovr-{:x}", epoch_nonce()));
+        std::fs::create_dir_all(&d).unwrap();
+        // 목적지를 먼저 만든다 — 이제 모든 동시 bump 가 replace 경로를 탄다.
+        let seed = bump_boot_epoch(&d).expect("seed bump 실패");
+        assert!(d.join("boot-epoch").exists(), "seed 가 목적지를 만들지 못했다");
+        const N: usize = 12;
+        let hs: Vec<_> = (0..N)
+            .map(|_| {
+                let d = d.clone();
+                std::thread::spawn(move || {
+                    // 절반은 **읽는 중**인 상태를 만든다 — 읽는 핸들이 rename 을 막으면 여기서 터진다.
+                    let _peek = std::fs::read_to_string(d.join("boot-epoch"));
+                    bump_boot_epoch(&d)
+                })
+            })
+            .collect();
+        let vals: Vec<u64> = hs
+            .into_iter()
+            .map(|h| h.join().expect("스레드 패닉").expect("기존 목적지 위 replace 가 실패했다"))
+            .collect();
+        let on_disk: u64 = std::fs::read_to_string(d.join("boot-epoch"))
+            .expect("목적지가 사라졌다 — remove 후 rename 으로 바뀌었는가")
+            .trim()
+            .parse()
+            .expect("목적지가 수치가 아니다(찢긴 쓰기)");
+        let leftovers = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy() != "boot-epoch")
+            .count();
+        std::fs::remove_dir_all(&d).ok();
+        let uniq: std::collections::HashSet<u64> = vals.iter().copied().collect();
+        assert_eq!(uniq.len(), N, "동시 replace 가 같은 epoch 를 냈다: {vals:?}");
+        assert!(!vals.contains(&seed), "seed 값이 재사용됐다 — 직전 값 회피가 무너졌다");
+        assert!(
+            vals.contains(&on_disk),
+            "디스크 값이 어느 쓰기의 것도 아니다 — 찢긴 교체다(원자성 붕괴)"
+        );
+        assert_eq!(leftovers, 0, "tmp 잔해가 남았다");
+    }
+
+    /// ★R5 [3] 소스핀 — **목적지를 먼저 지우고 rename 하지 않는다.**
+    ///
+    /// "Windows 는 덮어쓰기 rename 이 안 된다" 는 통념으로 누가 remove+rename 으로 '고치면'
+    /// 그 순간 원자성이 깨진다: 목적지가 잠깐 사라지고, 그 창에서 크래시하면 epoch 를 통째로
+    /// 잃는다(다음 기동이 이전 값을 몰라 재사용 방지가 사라진다). 실측으로 그럴 필요가 없음이
+    /// 확인됐으므로(MoveFileExW REPLACE_EXISTING), 지금 옳은 것을 **지키는** 핀을 세운다.
+    #[test]
+    fn epoch_persist_never_deletes_the_destination_before_renaming() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn persist_epoch(").expect("persist_epoch 소실");
+        let body = &prod[at..];
+        let body = &body[..body.find("\n}").expect("persist_epoch 본문 끝 소실")];
+        // 이 함수의 모든 삭제는 **자기 tmp** 에만 향한다.
+        assert_eq!(
+            body.matches("remove_file(&tmp)").count(),
+            body.matches("remove_file(").count(),
+            "persist_epoch 이 tmp 아닌 것을 지운다 — 목적지 선삭제는 원자 교체를 깬다"
+        );
+        assert!(
+            !body.contains("remove_file(path)") && !body.contains("remove_file(&path)"),
+            "목적지 선삭제가 들어왔다 — 크래시 창에서 epoch 를 통째로 잃는다"
+        );
+        assert!(
+            body.contains("std::fs::rename(&tmp, path)"),
+            "원자 교체가 사라졌다(MoveFileExW REPLACE_EXISTING 경로)"
+        );
+    }
+
     /// ★R4 [1]·[6] — **연속 기동은 매번 다른 epoch 를 내고, 최신값이 디스크에 남는다.**
     /// tmp 잔해가 남지 않는 것도 함께 잰다(A13 규약 — 자기 것만 치운다).
     #[test]
@@ -3926,7 +4071,15 @@ mod tests {
         let d = std::env::temp_dir().join(format!("cysd-epoch-seq-{:x}", epoch_nonce()));
         std::fs::create_dir_all(&d).unwrap();
         let a = bump_boot_epoch(&d).expect("첫 bump 실패");
-        let b = bump_boot_epoch(&d).expect("둘째 bump 실패");
+        // ★R5 [3]: 둘째 bump 는 **이미 있는 목적지 위로** 덮어쓴다. 그 사전 조건을 명시로
+        //   단언해야 이 검체가 Windows 의 replace 경로(MoveFileExW REPLACE_EXISTING)를 실제로
+        //   밟는다는 것이 문서가 아니라 측정이 된다. 없으면 '어차피 없던 파일을 만드는' 경로만
+        //   재고도 초록이다.
+        assert!(
+            d.join("boot-epoch").exists(),
+            "첫 bump 뒤 목적지가 없다 — 덮어쓰기 경로를 재지 못한다(검체 자기검증)"
+        );
+        let b = bump_boot_epoch(&d).expect("둘째 bump 실패 — 기존 목적지 위 replace 가 막혔다");
         let on_disk: u64 = std::fs::read_to_string(d.join("boot-epoch"))
             .expect("epoch 파일 부재")
             .trim()
