@@ -5492,6 +5492,92 @@ class Preflight:
                  % (bundle, len(added), len(modified), len(missing), ", ".join(rel), pycache,
                     recovery))
 
+    # ── C80 동봉 런타임 봉인 매니페스트 (부트 v2 §2-10 G5 · 명세의 "C-SEAL") ──
+    #
+    # 왜 C76 과 별개인가: C76(코드서명)은 **macOS 전용**이다. Windows 설치본에는 sealed-resource
+    # 봉인이 아예 없어 설치 후 `runtime/**` 오염을 잡을 수단이 0이었다 — 이 체크가 그 공백을
+    # 메운다. mac 에서는 코드서명이 여전히 권위이고(서명 키 없이는 위조 불가) 이건 보조층이다.
+    #
+    # ★등급 WARN 고정(master 판정 2026-09-04 D1 · 레인 분리): 발행 차단은 릴리스 게이트
+    #   (release-gate-gatekeeper.sh)가 FAIL 로 하고, **기계 preflight 는 부팅을 막지 않는다**.
+    #   C76 이 같은 판단을 이미 문서화했다(:5275 "이미 파손된 기계가 READY→NOT READY 로
+    #   뒤집혀 부팅 자체가 막힌다"). 실제로 2026-09-04 오너 머신이 파손 상태였다 — FAIL 등급이면
+    #   그 기계가 그날로 부팅 불능 판정을 받았을 것이다.
+    # ★자동 수정 0: C76 과 같다. 번들 안 파일 삭제는 App Management(TCC)에 막힐 수 있고,
+    #   무엇인지 모르는 파일을 지우는 자동화가 더 위험하다. 처방만 말한다.
+    # ★구버전은 SKIP: 매니페스트는 v0.14.30 부터 실린다. 그 이전 설치본에 없는 것은 정상이며
+    #   경고할 일이 아니다(거짓 경보 금지 — C76 의 '판정 불가는 SKIP' 규율과 동형).
+    RUNTIME_SEAL_RECOVERY = ("복구는 v0.14.30 이상으로 재설치 — 설치기가 .app(또는 설치 폴더)을 "
+                             "**통째로 교체**하므로 오염 파일이 함께 사라지고 봉인이 자연 복원된다"
+                             "(부분 삭제 불요·권장하지 않음). 상세 진단은 `cys doctor`")
+
+    def _find_runtime_seal_pair(self):
+        """(매니페스트 경로, runtime 트리 경로) 또는 None. 설치 형태별 후보를 전부 본다."""
+        cands = []
+        bundle = self._find_app_bundle()
+        if bundle:                                   # macOS .app
+            res = os.path.join(bundle, "Contents", "Resources")
+            cands.append((os.path.join(res, "runtime-manifest.json"),
+                          os.path.join(res, "runtime")))
+        cys = shutil.which("cys")
+        if cys:
+            # 설치 루트 기준(Windows NSIS: %LOCALAPPDATA%\cys · 그 외 비번들 설치).
+            # ★realpath 로 푼다 — 심링크 그림자(예: ~/.local/bin/cys)를 설치 루트로 오인하면
+            #   런타임 트리를 못 찾아 조용히 SKIP 된다.
+            d = os.path.dirname(os.path.realpath(cys))
+            cands.append((os.path.join(d, "runtime-manifest.json"), os.path.join(d, "runtime")))
+            cands.append((os.path.join(d, "resources", "runtime-manifest.json"),
+                          os.path.join(d, "runtime")))
+        for man, root in cands:
+            if os.path.isfile(man) and os.path.isdir(root):
+                return man, root
+        # 매니페스트는 없는데 런타임 트리는 있는가 = 구버전 설치본(정상)인지 구분해 돌려준다.
+        for _man, root in cands:
+            if os.path.isdir(root):
+                return None, root
+        return None, None
+
+    def c80_runtime_seal(self):
+        cid = "C80.runtime-seal"
+        if self.skipped(cid):
+            return
+        try:
+            import javis_runtime_seal as _seal
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "javis_runtime_seal 판독 불가(%s) — 판정 불가" % e)
+            return
+        man, root = self._find_runtime_seal_pair()
+        if not root:
+            self.add(cid, SKIP, "동봉 런타임 트리 미발견(비번들 설치·개발 빌드) — 검사 대상 없음")
+            return
+        if not man:
+            self.add(cid, SKIP, "runtime-manifest 부재 — v0.14.30 이전 설치본이면 정상"
+                                "(이 봉인은 0.14.30 부터 실린다) · 트리: %s" % root)
+            return
+        try:
+            m = _seal.load_manifest(man)
+            d = _seal.classify(m, root)
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "봉인 대조 실패(%s) — 판정 불가" % e)
+            return
+        total = len(d["missing"]) + len(d["added"]) + len(d["changed"])
+        if total == 0:
+            self.add(cid, PASS, "동봉 런타임 봉인 무결 — 항목 %d개 일치(%s)"
+                     % (len(m.get("entries") or {}), root))
+            return
+        # 원인 파일을 말한다 — "손상되었습니다" 한 줄은 안내가 아니다(C76 과 같은 규율).
+        sample = (d["added"] + d["changed"] + d["missing"])[:3]
+        npm_hint = ""
+        if any("node_modules" in p or p.startswith("node/bin/") for p in
+               (d["added"] + d["changed"])):
+            npm_hint = (" ★node_modules 오염 — `npm i -g <패키지>` 가 동봉 node 의 기본 prefix"
+                        "(=번들 안)로 설치된 흔적이다. 전역 설치는 번들 밖 prefix 로 하라")
+        self.add(cid, WARN,
+                 "동봉 런타임 봉인 파손 — 추가 %d건·변경 %d건·누락 %d건(예: %s)%s · 이 설치본을 "
+                 "그대로 재배포하면 받는 쪽에서 무결성 검증이 깨진다 · %s"
+                 % (len(d["added"]), len(d["changed"]), len(d["missing"]),
+                    ", ".join(sample), npm_hint, self.RUNTIME_SEAL_RECOVERY))
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -5536,6 +5622,10 @@ class Preflight:
             self.c78_radio,
             # C79(R6 W0-5) — cycle-verifier heartbeat 신선도. WARN-only(S0 shadow 전 미필수).
             self.c79_cycle_verifier_heartbeat,
+            # C80(2026-09-04 부트 v2 §2-10) — 동봉 런타임 봉인 매니페스트. 읽기 전용·WARN-only.
+            # Windows 에는 코드서명 봉인(C76)이 없어 이 체크가 유일한 변조 탐지다.
+            # 번호 규율: C63·C64 는 결번 재사용 금지라 다음 자유 번호는 C80(§5-4).
+            self.c80_runtime_seal,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
