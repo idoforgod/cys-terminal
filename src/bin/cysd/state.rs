@@ -1710,6 +1710,54 @@ pub struct Daemon {
     /// 플래그로 잡히지 않는다 — `boot_supervisor.tick_panic` 이벤트가 보조 관측이고, 인텐트
     /// 수명(1800s)이 피해 상한이다.
     pub supervisor_alive: AtomicBool,
+    /// (B3 · 명세 §3-3) **진행 중인 부트 런** — 감독자가 스폰 직전에 등록하고, 러너가
+    /// `hb`·`progress_step` 을 갱신하며, fence 판정과 side-effect RPC 의 CAS 근거가 된다.
+    ///
+    /// `Option` 하나인 이유는 계약이다: 레인당 실행은 **항상 ≤1**(G1). 여럿을 표현할 수 있게
+    /// 두면 그 불변식이 자료구조에서 사라지고, 그때부터는 주석만 남는다.
+    pub boot_run_active: Mutex<Option<BootRunActive>>,
+    /// (B3-2R ⑥·④ⓓ) fence 된 런의 원장 — **회수하지 못한 고아**의 목록이다(무kill 계약).
+    /// 길이가 곧 admission 상한의 분모다. 유계는 감독자가 [`crate::boot_supervisor`] 에서 건다.
+    pub boot_fenced: Mutex<Vec<FencedRun>>,
+}
+
+/// (B3 · §3-3) 진행 중인 부트 런의 관측 표. **데몬 인메모리**다 — 영속 소유권은 스풀 인텐트
+/// 파일(`state`·`generation`)이 갖고, 이 표는 그 위에 얹히는 살아있는 관측이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootRunActive {
+    /// 스풀 인텐트 id(=decl_id).
+    pub intent: String,
+    /// 이 런의 lease 세대. 러너의 side-effect RPC 는 이 값으로 CAS 된다.
+    pub generation: u32,
+    /// 이 런이 담당하는 역할들. **현재는 비어 있다** — 채우는 주체가 §2-7 러너(B4)다.
+    pub roles: Vec<String>,
+    /// 러너의 마지막 생존 신고(epoch 초).
+    ///
+    /// ★등록 시각으로 초기화하고, `started` 와 **같은 값이면 '한 번도 보고하지 않았다'** 는
+    /// 뜻이다(그 구별이 fence 발효 조건이다 — [`crate::boot_supervisor::fence_verdict`]).
+    pub hb: f64,
+    /// 러너가 보고한 단계 이름. 이 값이 변하지 않는 동안이 진행 정체의 척도다(ⓑ · B3-3).
+    pub progress_step: String,
+    /// 이 세대가 시작된 시각(epoch 초) — 절대 마감의 기준(ⓒ · B3-3).
+    pub started: f64,
+    /// (B3-2R ④ⓑ) 낳은 프로세스의 pid. **관측용이지 종료용이 아니다** — 이 데몬은 아무것도
+    /// 죽이지 않는다. 고아가 생겼을 때 사람이 `cys ps`·watchdog 으로 **찾아갈 수 있게** 싣는다.
+    pub pid: Option<u32>,
+}
+
+/// (B3-2R ⑥) **fence 된 런의 별도 원장**. terminal 과 섞지 않는다 — terminal 은 '이 인텐트가
+/// 어떻게 끝났는가' 하나뿐인데, fence 된 시도는 끝난 것이 아니라 **소유권을 잃은 것**이라
+/// 같은 칸에 쓰면 마지막 하나만 남고 앞의 이력이 사라진다(codex⑤).
+///
+/// 이 목록은 동시에 **전역 admission 상한의 분모**다(④ⓓ): 무kill 이라 fence 된 러너는 살아
+/// 있을 수 있고, 그 미회수 고아 수가 새 스폰을 막는 근거가 된다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FencedRun {
+    pub intent: String,
+    pub generation: u32,
+    pub pid: Option<u32>,
+    pub why: &'static str,
+    pub at: f64,
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
@@ -2367,6 +2415,8 @@ impl Daemon {
             auto_route_seen: Mutex::new(HashMap::new()),
             // (P2 · R3-P2-4) 기본 false — set 주체는 boot_supervisor::spawn 하나뿐이다.
             supervisor_alive: AtomicBool::new(false),
+            boot_run_active: Mutex::new(None),
+            boot_fenced: Mutex::new(Vec::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
