@@ -2802,16 +2802,47 @@ def h_conc_3():
                    "    json.dump(d, open(p, 'w'))\n", 0o644)
         nprocs = [subprocess.Popen([PY, nchild, "n%d" % k, "6"],
                                    env=_base_env({"CYS_SETTINGS": naive}),
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                   for k in range(4)]
+        ndied = 0
         for pr in nprocs:
             pr.communicate(timeout=120)
-        nmarks = (json.loads(_read(naive) or "{}") or {}).get("marks") or []
-        need(len(nmarks) < 4 * 6,
-             "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
-             "(marks=%d) — 위 GREEN 은 검출력 미확인" % len(nmarks))
-        notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출"
-                     % (4 * 6 - len(nmarks), 4 * 6))
+            if pr.returncode != 0:
+                ndied += 1
+        # ★대조군의 파손은 **정상 결과**다 — 그것이 이 군을 두는 이유다(직렬화가 없다).
+        #   그런데 종전 이 줄은 맨몸 `json.loads` 라, 대조군이 자기 파일을 이어붙이면 검체가
+        #   **판정이 아니라 traceback 으로 죽었다**(CI 적색 `JSONDecodeError: Extra data:
+        #   line 1 column 52`). 위 ⓒ에서 같은 계급을 이미 한 번 고쳤는데 이 대조군 줄이 남아
+        #   **같은 결함의 두 번째 인스턴스**였다.
+        #   기제(생산 코드 아님 · 이 대조군 자식의 `json.dump(d, open(p,'w'))`):
+        #     `open(p,'w')` 의 truncate 는 **열 때** 일어나고 쓰기는 각자 offset 에서 난다 —
+        #     P1·P2 가 모두 연 뒤 P2 가 긴 본문(59B)을 쓰고 P1 이 짧은 본문(51B)을 offset 0 에
+        #     쓰면 0..51 만 덮이고 51..59 는 P2 의 꼬리로 남는다 →
+        #     `{"marks": [...5건...]}`(정확히 51B) + 꼬리 = **Extra data: line 1 column 52**.
+        #   ★이 서명은 settings.json 에서는 나올 수 없다: `_settings_rmw` 는 `indent=2` 로 써서
+        #     1행이 `{` 하나다(1행 52열에 완결 JSON 이 끝날 수 없다). 생산 writer 6종은 전부
+        #     고유 tmp+replace 다 — 즉 이 적색의 출처는 **대조군 파일**(`naive.json`)이다.
+        nraw = _read(naive)
+        try:
+            nmarks = (json.loads(nraw or "{}") or {}).get("marks") or []
+        except ValueError as _nje:
+            # 파손 = lost update 보다 **더 강한** 무직렬화 증거다. 검출로 센다(크래시 금지).
+            _nev = os.path.join(tempfile.gettempdir(),
+                                "h-conc-3-naive-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_nev, "w", encoding="utf-8") as _f:
+                    _f.write(nraw)
+            except OSError:
+                _nev = "(증거 보존 실패)"
+            notes.append("음성 대조군: 무직렬화 RMW 가 **파일을 이어붙였다**(%s · %d바이트 · "
+                         "자식 비정상종료 %d/4 · 증거=%s) — lost update 보다 강한 검출"
+                         % (_nje, len(nraw), ndied, _nev))
+        else:
+            need(len(nmarks) < 4 * 6 or ndied > 0,
+                 "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
+                 "(marks=%d · 자식 비정상종료 0) — 위 GREEN 은 검출력 미확인" % len(nmarks))
+            notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출(자식 비정상종료 %d/4)"
+                         % (4 * 6 - len(nmarks), 4 * 6, ndied))
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
     calib = "skip(no-git)"
     if old is not None:
