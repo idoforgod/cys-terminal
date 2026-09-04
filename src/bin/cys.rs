@@ -6369,9 +6369,23 @@ fn diag_runtime_seal(ctx: &DoctorCtx) -> DiagItem {
             action: String::new(),
         },
         Some(1) => {
-            // stdout 은 `verify --json` 의 1줄이다. 파싱 실패해도 '파손'이라는 사실은 exit 1 이
-            // 이미 말했으므로 등급을 낮추지 않고, 세부만 비운다.
+            // stdout 은 `verify --json` 의 1줄이다.
+            // ★페이로드가 없으면 Fail 이라고 말하지 않는다(2026-09-04 실사고 교훈): 파이썬
+            //   **uncaught 예외의 종료코드도 1** 이라, 인코딩 사고·크래시가 '봉인 파손'으로
+            //   둔갑할 수 있다. 실제로 그 사고가 windows-build 레인에서 났다(도구 쪽은
+            //   `_widen_stdio` 로 닫았지만, 여기서도 '판정 근거가 있을 때만 파손'을 요구한다).
             let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            if !v["counts"].is_object() {
+                return skip(format!(
+                    "봉인 대조 판정 불가(exit 1 인데 --json 판정 페이로드가 없다 — 판독기가 중도 \
+                     사망했을 수 있다) — {}",
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ));
+            }
             let n = |k: &str| v["counts"][k].as_u64().unwrap_or(0);
             let mut sample: Vec<String> = Vec::new();
             for k in ["added", "changed", "missing"] {
@@ -21217,6 +21231,24 @@ mod tests {
         let it = diag_runtime_seal(&ctx);
         assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
         assert!(it.detail.contains("판정 불가"), "{}", it.detail);
+
+        // ★exit 1 인데 판정 페이로드가 없으면 '파손'이라 말하지 않는다 — 파이썬 uncaught
+        //   예외의 종료코드도 1이라 크래시가 봉인 사고로 둔갑한다(2026-09-04 windows-build 실사고).
+        //   판독기를 '무조건 exit 1' 흉내로 바꿔치기해 그 갈래를 실제로 태운다.
+        std::fs::write(
+            ctx.pack_dir.join("bin/javis_runtime_seal.py"),
+            "import sys\nsys.exit(1)\n",
+        )
+        .unwrap();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(
+            it.status,
+            DiagStatus::Skip,
+            "판정 근거 없는 exit 1 을 Fail 로 적었다 — 크래시가 봉인 파손으로 둔갑한다: {}",
+            it.detail
+        );
+        assert!(it.detail.contains("판정 불가"), "{}", it.detail);
+        std::fs::copy(tool_src, ctx.pack_dir.join("bin/javis_runtime_seal.py")).unwrap();
 
         // 파일 이름 상수가 번들 경로 상수와 갈리면 판독기가 파일을 못 찾는다(무증상 Skip).
         assert!(

@@ -491,7 +491,10 @@ jobs:
           # windows-build.yml 의 설치 후 검증 스텝이 실기로 대조한다(가정을 측정으로 바꾼다).
           # 러너 python 을 쓴다(동봉 python 으로 돌리면 그 import 가 트리 안에 __pycache__ 를
           # 써서 검증 대상을 오염시킨다 — SEAL-1 과 같은 계급).
-          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+          # ★PYTHONUTF8=1 — 러너 기본 stdout 인코딩(cp1252/cp949)에 `✓` 가 없어 성공 메시지가
+          #   UnicodeEncodeError 로 죽고, 그 exit 1 이 이 도구 계약의 '불일치'와 겹쳤다
+          #   (2026-09-04 windows-build 실사고 · 도구 자신도 _widen_stdio 로 닫았다 — 이건 2층).
+          PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
             --root "$RT" --out src-tauri/resources/runtime-manifest.json \
             --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
             --source win-src

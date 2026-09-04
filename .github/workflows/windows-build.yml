@@ -113,7 +113,10 @@ jobs:
           # ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1 · release.yml 과 동일 절차) ──
           # 이 레인이 매니페스트의 **실기 검증처**다: 아래 자기완결 검증 스텝이 실제 설치본 트리와
           # 이 파일을 대조해, "소스 트리 해시가 NSIS 를 거쳐 설치본까지 살아남는가"를 측정한다.
-          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+          # ★PYTHONUTF8=1 — 러너 기본 stdout 인코딩(cp1252/cp949)에 `✓` 가 없어 성공 메시지가
+          #   UnicodeEncodeError 로 죽고, 그 exit 1 이 이 도구 계약의 '불일치'와 겹쳤다
+          #   (2026-09-04 windows-build 실사고 · 도구 자신도 _widen_stdio 로 닫았다 — 이건 2층).
+          PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
             --root "$RT" --out src-tauri/resources/runtime-manifest.json \
             --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
             --source win-src

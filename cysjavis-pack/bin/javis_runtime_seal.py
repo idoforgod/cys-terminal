@@ -55,6 +55,25 @@ import sys
 SCHEMA = 1
 MANIFEST_BASENAME = "runtime-manifest.json"
 
+
+def _widen_stdio():
+    """사람용 출력(한글·✓·→)이 좁은 기본 인코딩에서 **도구를 죽이지 않게** 한다.
+
+    ★2026-09-04 실사고: windows-build 레인의 emit 이 exit 1 로 죽었다. 원인은 봉인도 트리도
+      아니고 성공 메시지 한 줄이었다 — Windows 러너의 기본 stdout 인코딩(cp1252/cp949)에
+      `✓`(U+2713)가 없어 `UnicodeEncodeError` 가 났고, 그 **uncaught 예외의 종료코드 1** 이
+      이 도구의 계약에서는 하필 '불일치(봉인 파손)' 다. 즉 **인코딩 사고가 봉인 사고로 둔갑**했다.
+      (재현: `LC_ALL=C PYTHONUTF8=0 python3 … emit` → UnicodeEncodeError · rc 1.)
+    ★호출측 env(`PYTHONUTF8=1`)로도 막히지만, 그건 호출 지점 수만큼 사본이 필요하고 새 호출부가
+      생기는 순간 다시 샌다. 도구 자신이 닫는 것이 유일하게 빠짐없는 자리다(SEAL-1 층3 과 같은 논리).
+    `errors="replace"` 로 두는 이유: 출력이 예뻐지는 것보다 **판정이 살아남는 것**이 중요하다.
+    """
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 — 재설정 불가 스트림(파이프 래핑 등)이면 그대로 둔다
+            pass
+
 # 판독 청크. 726MB 트리에서 1MB 청크로 전수 sha256 이 웜캐시 0.49s(실측 2026-09-04) —
 # 표본화가 필요 없다. 표본화는 "측정한 척"이라 여기서는 쓰지 않는다.
 _CHUNK = 1 << 20
@@ -257,6 +276,7 @@ def _cmd_verify(a):
 
 
 def main(argv=None):
+    _widen_stdio()          # ★사람용 출력이 도구를 죽이지 않게(위 주석의 실사고) — 파싱 전에 먼저.
     ap = argparse.ArgumentParser(description="동봉 런타임 트리 봉인 매니페스트(생성·검증)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

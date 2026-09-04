@@ -293,6 +293,38 @@ class RuntimeSealTests(unittest.TestCase):
         rc = self._emit(out=out)
         self.assertEqual(2, rc, "emit 판독 실패가 rc %d — 판정 불가(2)여야 한다" % rc)
 
+    # ── ⑬ 좁은 stdout 인코딩이 도구를 죽이지 않는다 (2026-09-04 windows-build 실사고) ──
+    #   러너 기본 인코딩(cp1252/cp949)에 `✓`(U+2713)가 없어 성공 메시지 한 줄이
+    #   UnicodeEncodeError 를 냈고, **uncaught 예외의 종료코드 1** 이 이 도구 계약에서는
+    #   하필 '불일치(봉인 파손)' 였다 — 인코딩 사고가 봉인 사고로 둔갑했다.
+    #   여기서 두 갈래(정상=0 · 오염=1)를 좁은 인코딩으로 재현해 종료코드가 **의미대로** 나오는지 본다.
+    def _narrow_env(self):
+        e = dict(os.environ)
+        e["PYTHONIOENCODING"] = "cp1252"   # 러너의 좁은 기본 인코딩 재현(명시 주입)
+        e.pop("PYTHONUTF8", None)
+        return e
+
+    def test_narrow_stdout_encoding_does_not_crash_the_tool(self):
+        env = self._narrow_env()
+        out = os.path.join(self.tmp, "narrow.json")
+        p = subprocess.run([sys.executable, TOOL, "emit", "--root", self.root, "--out", out],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(0, p.returncode,
+                         "좁은 인코딩에서 emit 이 죽었다(rc %d) — 인코딩 사고가 봉인 사고로 "
+                         "둔갑한다: %s" % (p.returncode, p.stderr[-400:]))
+        p = subprocess.run([sys.executable, TOOL, "verify", "--root", self.root,
+                            "--manifest", out], capture_output=True, text=True, env=env)
+        self.assertEqual(0, p.returncode, "좁은 인코딩에서 무결 트리가 rc %d — %s"
+                         % (p.returncode, p.stderr[-400:]))
+        # 오염은 여전히 1(불일치)이어야 한다 — 죽어서 1이 나오는 것과 구분된다.
+        _write(os.path.join(self.root, "node", "lib", "node_modules", "@x", "p.json"), b"{}\n")
+        p = subprocess.run([sys.executable, TOOL, "verify", "--root", self.root,
+                            "--manifest", out, "--json"], capture_output=True, text=True, env=env)
+        self.assertEqual(1, p.returncode, p.stderr[-400:])
+        d = json.loads(p.stdout)
+        self.assertEqual(1, d["counts"]["added"],
+                         "좁은 인코딩에서 --json 페이로드가 깨졌다: %r" % p.stdout[:200])
+
     # ── ⑪ 매니페스트 자기 제외 ─────────────────────────────────────────
     def test_manifest_inside_root_is_self_excluded(self):
         inside = os.path.join(self.root, rs.MANIFEST_BASENAME)
