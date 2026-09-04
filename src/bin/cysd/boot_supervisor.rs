@@ -4088,18 +4088,52 @@ mod tests {
     /// 미배선으로 오판**해 이번엔 반대 방향의 거짓 적색이 된다.
     #[test]
     fn readiness_claims_cannot_outrun_the_build() {
-        /// 이 이름이 **배선**돼 있는가 — 정의·호출·비어있지 않은 본문 셋 다.
+        /// 호출 지점 `pos` 를 감싸는 함수 이름.
+        fn enclosing_fn(src: &str, pos: usize) -> Option<&str> {
+            let at = src[..pos].rfind("fn ")?;
+            let rest = &src[at + 3..];
+            let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+            Some(&rest[..end])
+        }
+        /// 이 호출자가 **살아 있는가** — 진입점이거나, 자기 자신이 아닌 곳에서 불린다.
+        ///
+        /// ★정적 한계(master 판정): 도달성은 **한 단계**만 본다. 완전한 도달성 분석은 문자열
+        /// 위에서 할 수 없고, 문자열 기반 정적 핀은 원리적으로 우회 가능하다. 그래서 완전
+        /// 봉인은 B4 에서 **타입**으로 옮긴다(IG-28 갱신).
+        fn is_alive(caller: &str, src: &str) -> bool {
+            const ENTRY: [&str; 5] = ["spawn", "tick_in", "dispatch", "run_ensure_team", "main"];
+            if ENTRY.contains(&caller) {
+                return true;
+            }
+            src.match_indices(&format!("{caller}(")).any(|(i, _)| {
+                !src[..i].ends_with("fn ")
+                    && enclosing_fn(src, i).is_some_and(|e| e != caller)
+            })
+        }
+        /// 이 이름이 **배선**돼 있는가 — 정의 · **살아있는** 호출 · 비어있지 않은 본문 셋 다.
+        ///
+        /// ## R8 에서 닫은 두 우회(codex R7 · 정당)
+        /// ⓐ **dead call** — 아무도 부르지 않는 함수 안의 호출은 배선이 아니다. ★내 R7 합성
+        ///    표본 자체가 그랬다(`fn t() { reserve_admission(); }` 의 `t` 를 아무도 안 부른다):
+        ///    내가 만든 양성 증거가 바로 그 우회의 예시였다.
+        /// ⓑ **자기재귀** — `fn f() { f(); }` 는 호출이 아니다.
         fn wired(name: &str, src: &str) -> bool {
             let def = format!("fn {name}(");
             let Some(dpos) = src.find(&def) else {
                 return false;
             };
-            let calls = src
-                .matches(&format!("{name}("))
-                .count()
-                .saturating_sub(src.matches(&def).count());
-            if calls == 0 {
-                return false; // 정의만 있고 아무도 부르지 않는다 = 배선이 아니다
+            let live_call = src.match_indices(&format!("{name}(")).any(|(i, _)| {
+                if src[..i].ends_with("fn ") {
+                    return false; // 정의 자신
+                }
+                match enclosing_fn(src, i) {
+                    Some(c) if c == name => false, // ⓑ 자기재귀
+                    Some(c) => is_alive(c, src),   // ⓐ dead call 배제
+                    None => false,
+                }
+            });
+            if !live_call {
+                return false;
             }
             let after = &src[dpos..];
             let Some(open) = after.find('{') else {
@@ -4138,22 +4172,30 @@ mod tests {
             ("admission_reserved", "reserve_admission"),
             ("confirmed_exit_observed", "release_confirmed_exit"),
         ];
-        fn claimed(r: RunnerReadiness, field: &str) -> bool {
-            match field {
-                "lease_cas_closed" => r.lease_cas_closed,
-                "atomic_handler" => r.atomic_handler,
-                "epoch_propagated" => r.epoch_propagated,
-                "self_terminate" => r.self_terminate,
-                "boot_last_writer" => r.boot_last_writer,
-                "durable_history" => r.durable_history,
-                "admission_reserved" => r.admission_reserved,
-                _ => r.confirmed_exit_observed,
-            }
+        /// (R8 · codex R7 ⓒ) 이름→필드 **조회를 없앤다**. 종전 `claimed` 의 wildcard 가
+        /// 미지 이름을 `confirmed_exit_observed` 로 접어, 표에 오타가 나면 엉뚱한 칸을 읽었다.
+        /// 값과 이름과 마커를 **한 자리에서** 함께 만들면 그 별칭이 구조적으로 불가능하다.
+        fn claims(r: RunnerReadiness) -> [(&'static str, bool, &'static str); 8] {
+            [
+                ("lease_cas_closed", r.lease_cas_closed, "lease_ok"),
+                ("atomic_handler", r.atomic_handler, "commit_terminal_atomic"),
+                ("epoch_propagated", r.epoch_propagated, "propagate_epoch_to_runner"),
+                ("self_terminate", r.self_terminate, "runner_self_exit_on_stale_lease"),
+                ("boot_last_writer", r.boot_last_writer, "write_boot_last"),
+                ("durable_history", r.durable_history, "persist_fenced_history"),
+                ("admission_reserved", r.admission_reserved, "reserve_admission"),
+                (
+                    "confirmed_exit_observed",
+                    r.confirmed_exit_observed,
+                    "release_confirmed_exit",
+                ),
+            ]
         }
-        fn missing(r: RunnerReadiness, src: &str, ev: &[(&'static str, &str)]) -> Vec<&'static str> {
-            ev.iter()
-                .filter(|(f, m)| claimed(r, f) && !wired(m, src))
-                .map(|(f, _)| *f)
+        fn missing(r: RunnerReadiness, src: &str) -> Vec<&'static str> {
+            claims(r)
+                .into_iter()
+                .filter(|(_, claimed, marker)| *claimed && !wired(marker, src))
+                .map(|(f, _, _)| f)
                 .collect()
         }
 
@@ -4167,13 +4209,11 @@ mod tests {
                 &include_str!("handlers.rs")[..include_str!("handlers.rs").find("#[cfg(test)]").unwrap()]
             ),
         );
-        let ev: Vec<(&'static str, &str)> = EVIDENCE.to_vec();
-
         // ① 실제 빌드 — 주장이 없으니(전부 false) 결손도 없다.
         assert!(
-            missing(RUNNER_READINESS, &prod, &ev).is_empty(),
+            missing(RUNNER_READINESS, &prod).is_empty(),
             "준비도 칸이 배선 없이 참이다: {:?}",
-            missing(RUNNER_READINESS, &prod, &ev)
+            missing(RUNNER_READINESS, &prod)
         );
         // ② ★실제 코드에서 **양성**도 잰다 — 이것이 R6 판에 없던 절반이다.
         //    `lease_ok` 는 이 파일에 정의되고 handlers.rs 에서 불린다. 여기서 false 가 나오면
@@ -4194,28 +4234,44 @@ mod tests {
             !wired("reserve_admission", defined_but_never_called),
             "아무도 부르지 않는 함수를 배선으로 읽었다"
         );
-        let fully_wired = "fn reserve_admission() { do_work(); }\nfn t() { reserve_admission(); }";
+        // ★R8 ⓐ dead call — 호출자가 죽어 있으면 배선이 아니다. ★내 R7 합성 표본이 정확히
+        //   이 형태였다(`t` 를 아무도 부르지 않는다): 양성 증거로 내세운 것이 실은 우회의
+        //   예시였다(codex 지적 · 정확).
+        let dead_caller = "fn reserve_admission() { do_work(); }\nfn t() { reserve_admission(); }";
+        assert!(
+            !wired("reserve_admission", dead_caller),
+            "죽은 호출자(아무도 부르지 않는 t) 안의 호출을 배선으로 읽었다 — R7 판의 구멍이다"
+        );
+        // ★R8 ⓑ 자기재귀 — 자기가 자기를 부르는 것은 배선이 아니다.
+        let self_recursive = "fn reserve_admission() { reserve_admission(); }";
+        assert!(
+            !wired("reserve_admission", self_recursive),
+            "자기재귀를 호출로 셌다 — 스스로를 부르는 고립 함수가 통과한다"
+        );
+        // 살아있는 호출자(진입점)에서 불리면 배선이다 — 항상 적색인 사문이 아님을 함께 보인다.
+        let fully_wired =
+            "fn reserve_admission() { do_work(); }\nfn tick_in() { reserve_admission(); }";
         assert!(
             wired("reserve_admission", fully_wired),
-            "정의·호출·본문이 다 있는데 미배선으로 읽었다 — 항상 적색인 사문이다"
+            "정의·살아있는 호출·본문이 다 있는데 미배선으로 읽었다 — 항상 적색인 사문이다"
         );
-        // ④ 합성 준비도 — 칸을 뒤집으면 배선 없는 것이 전부 적발된다(8칸 전수).
-        for (field, _) in EVIDENCE {
-            if field == "lease_cas_closed" {
-                continue; // 이 칸의 배선은 실재한다(② 에서 확인) — 뒤집어도 결손이 아니다
-            }
+        // ④ 합성 준비도 — 배선 없는 칸을 뒤집으면 정확히 그 칸이 적발된다.
+        //    ★칸을 이름이 아니라 **값으로** 뒤집는다(R8 ⓒ): 이름→필드 조회가 사라졌으므로
+        //      표에 오타가 나도 엉뚱한 칸을 읽는 별칭이 구조적으로 불가능하다.
+        let flips: [(&str, fn(&mut RunnerReadiness)); 7] = [
+            ("atomic_handler", |r| r.atomic_handler = true),
+            ("epoch_propagated", |r| r.epoch_propagated = true),
+            ("self_terminate", |r| r.self_terminate = true),
+            ("boot_last_writer", |r| r.boot_last_writer = true),
+            ("durable_history", |r| r.durable_history = true),
+            ("admission_reserved", |r| r.admission_reserved = true),
+            ("confirmed_exit_observed", |r| r.confirmed_exit_observed = true),
+        ];
+        for (field, flip) in flips {
             let mut r = RUNNER_READINESS;
-            match field {
-                "atomic_handler" => r.atomic_handler = true,
-                "epoch_propagated" => r.epoch_propagated = true,
-                "self_terminate" => r.self_terminate = true,
-                "boot_last_writer" => r.boot_last_writer = true,
-                "durable_history" => r.durable_history = true,
-                "admission_reserved" => r.admission_reserved = true,
-                _ => r.confirmed_exit_observed = true,
-            }
+            flip(&mut r);
             assert_eq!(
-                missing(r, &prod, &ev),
+                missing(r, &prod),
                 vec![field],
                 "{field} 를 배선 없이 참으로 주장했는데 통과했다 — 분리 배포가 열린다"
             );
