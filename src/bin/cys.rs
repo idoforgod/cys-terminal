@@ -20078,7 +20078,10 @@ mod tests {
     /// **훅 원문을 읽어** 대조한다.
     #[test]
     fn h_hook_forge_2_the_shell_reads_the_token_by_exact_line_source_pin() {
-        let hook = include_str!("../../cysjavis-pack/hooks/role-bootstrap.sh");
+        // ★부트 v2 A2(2026-09-04): 훅이 런처 + 본체로 갈렸고 이 핀이 읽는 앵커(토큰 정확일치·rc
+        //   교차·claim rc)는 전부 **본체**로 옮겨갔다. 등록되는 파일은 여전히
+        //   `role-bootstrap.sh`(런처)지만, 이 테스트가 재는 것은 판독 규칙이므로 본체를 읽는다.
+        let hook = include_str!("../../cysjavis-pack/hooks/role-bootstrap-legacy.sh");
         // ⓐ 종전 규칙(전문 substring)이 사라졌다.
         for gone in [
             "*\"[cys-hook] hook-decide: proceed\"*",
@@ -20144,7 +20147,10 @@ mod tests {
     /// 외곽 데드라인 + 선행 claim rc0 게이트**로 배선돼 있는가(R3-P2-3 · R3-RISK-2).
     #[test]
     fn p2_boot_intent_the_shell_frontdoor_reads_the_token_by_exact_line_source_pin() {
-        let hook = include_str!("../../cysjavis-pack/hooks/role-bootstrap.sh");
+        // ★부트 v2 A2(2026-09-04): 훅이 런처 + 본체로 갈렸고 이 핀이 읽는 앵커(토큰 정확일치·rc
+        //   교차·claim rc)는 전부 **본체**로 옮겨갔다. 등록되는 파일은 여전히
+        //   `role-bootstrap.sh`(런처)지만, 이 테스트가 재는 것은 판독 규칙이므로 본체를 읽는다.
+        let hook = include_str!("../../cysjavis-pack/hooks/role-bootstrap-legacy.sh");
         for anchor in [
             // 줄 단위 정확 일치 3종 전수 — 미지 토큰은 조용히 통과하지 못한다
             "\"[cys-hook] boot-intent: enqueued\"",
