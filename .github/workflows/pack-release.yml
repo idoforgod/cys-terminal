@@ -85,6 +85,24 @@ jobs:
       - name: Secret/PII scan (pre-build hard-gate)
         run: bash scripts/secret-scan.sh --all
 
+      # ★H-SECRET-1 — 스캐너가 **살아 있는가**를 증명하는 메타 게이트 (IG-2 · master 지시 2026-09-04).
+      #   위 secret-scan.sh 는 트리가 깨끗하면 초록이다. 그런데 **스캐너가 죽어 있어도**(정규식
+      #   파손·조기 exit 0·파일 목록 0건) 깨끗한 트리는 똑같이 초록이다 — 종료코드만 보는 게이트는
+      #   자기 고장을 통과로 접는다. H-SECRET-1 은 규칙별 양성 표본을 임시 파일(저장소 밖)에 넣고
+      #   **그 규칙 라벨로** 잡히는지까지 확인한다(라벨을 보는 이유: 아무 규칙이나 걸려도 exit 1 이라
+      #   6종 중 5종이 죽어도 종료코드는 같다). 자기 면제 동결도 함께 본다.
+      #   ★왜 지금 넣는가: 2026-09-04 팩 fixture 에 오너 핸들이 실제로 유출됐고(수리 011a6f6),
+      #   그 계급을 잡는 규칙(handle→HANDLE)이 이 검체 안에 있다. 종전에 이 검체는 ci-branch
+      #   잡2 에서만 돌았고 **발행 레인에는 0회** 였다 — "안 도는 검체는 게이트가 아니다".
+      #   실측 22.1s(러너 자기완결·저장소 밖 임시파일·사용자 HOME 무접촉).
+      - name: H-SECRET-1 — 시크릿 스캐너 계측 타당성 (발행 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "::error::건강성 러너 누락: $R — 스캐너 계측 타당성 판정 불가(fail-closed)"; exit 1; }
+          python3 "$R" --only H-SECRET-1
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
