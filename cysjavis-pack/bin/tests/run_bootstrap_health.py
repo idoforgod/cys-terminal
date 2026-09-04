@@ -2705,6 +2705,49 @@ def h_conc_3():
             need('settings_path + ".tmp"' not in _code_lines(_read(_mp)),
                  "%s 에 고정 .tmp 재구현이 남아 있다(교차 파손 경로 · 발행만 원자적이고 "
                  "스테이징을 공유하면 원자성이 사라진다)" % _mod)
+    # ★핀의 사각 닫기(2026-09-05 · master 승인). 위 핀은 문자열 `settings_path + ".tmp"`
+    #   **하나만** 훑는다. 그런데 같은 계급의 결함이 **변수 이름만 다른** `path + ".tmp"` 로
+    #   `javis_dept_migrate._migrate_directive` 에 살아 있었다(대상이 MASTER_DIRECTIVE.md 라
+    #   settings 가 아니었고, 그래서 핀의 시야 밖이었다). 금지의 근거는 파일 이름이 아니라
+    #   **스테이징 공유**다 — `os.replace` 는 발행만 원자적이므로 tmp 를 공유하면 그 보장이
+    #   사라진다. 그러니 이제 **패턴 전반**(`<식별자> + ".tmp"`)을 팩 발행 모듈 전수로 훑는다.
+    #   알려진 잔존 사이트는 **파일별 개수 census** 로 얼린다: 새 파일·개수 증가 = 적색,
+    #   감소 = 통과(수리 방향은 막지 않는다).
+    #   ★범위 고지(정직): `bin/*.py`(발행 모듈)만 본다. `bin/tests/` 는 격리 임시 디렉터리에만
+    #   쓰고 제품 경로가 아니라 제외했다 — 그쪽은 이 축에서 무관측이다.
+    _FIXED_TMP_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*\s*\+\s*["\']\.tmp["\']')
+
+    def _fixed_tmp_count(_text):
+        _n = 0
+        for _ln in _code_lines(_text).splitlines():
+            if _FIXED_TMP_RE.search(_ln.split("#", 1)[0]):
+                _n += 1
+        return _n
+
+    # 2026-09-05 실측 census(커밋 트리 기준). `javis_dept_migrate.py` 는 이 라운드에서 유일 tmp 로
+    #   수리해 0건이므로 목록에 없다 — 되살아나면 그 자체로 적색이다.
+    _FIXED_TMP_CENSUS = {
+        "grill_gate.py": 1, "javis_cycle_autopilot.py": 3, "javis_fleet_report.py": 1,
+        "javis_formation.py": 1, "javis_hud_bridge.py": 1, "javis_learn.py": 4,
+        "javis_mission.py": 2, "javis_preflight.py": 3, "javis_rsi.py": 2,
+        "javis_serena_probe.py": 1,
+    }
+    _grew = {}
+    for _fn in sorted(f for f in os.listdir(BIN_DIR) if f.endswith(".py")):
+        _c = _fixed_tmp_count(_read(os.path.join(BIN_DIR, _fn)))
+        if _c > _FIXED_TMP_CENSUS.get(_fn, 0):
+            _grew[_fn] = "%d건(얼린 값 %d)" % (_c, _FIXED_TMP_CENSUS.get(_fn, 0))
+    need(not _grew,
+         "고정 `.tmp` 재구현이 새로 생겼다 — 공유 스테이징은 교차 파손 경로다(유일 tmp"
+         "(mkstemp)+os.replace 로 바꿔라): %r" % _grew)
+    # 계측 타당성(음성 대조군): 검출기가 실제 패턴을 잡고 주석은 잡지 않는다 —
+    #   검출력 없는 census 로 얻은 GREEN 은 아무것도 증명하지 않는다.
+    need(_fixed_tmp_count('    tmp = path + ".tmp"\n') == 1,
+         "계측 타당성 실패: 고정 tmp 검출기가 실제 패턴을 못 잡는다(핀이 공허하다)")
+    need(_fixed_tmp_count('# tmp = path + ".tmp"\n') == 0,
+         "계측 타당성 실패: 주석까지 잡는다(제거를 설명한 문서가 회귀로 보고된다)")
+    notes.append("고정 tmp census %d파일·%d건 이내(신규 0 · 검출기 음성 대조 2축 통과)"
+                 % (len(_FIXED_TMP_CENSUS), sum(_FIXED_TMP_CENSUS.values())))
     notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0(preflight+dept_migrate+guard_register+bootstrap)")
     # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 실측 5 writer 중 Rust 두 축
     pk = _repo_file(os.path.join("src", "pack.rs"))

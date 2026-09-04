@@ -123,20 +123,23 @@ except Exception:
 
 
 @contextlib.contextmanager
-def _settings_lock(settings_path):
-    """settings.json 파일별 공용 락 — 획득 실패는 **열화**이지 중단이 아니다(백필을 포기하면
-    부서 훅이 영영 안 붙는다 · preflight 와 동일 판단)."""
+def _file_lock(path, what="settings"):
+    """파일별 공용 락(`<path>.cys-lock`) — 획득 실패는 **열화**이지 중단이 아니다(백필을 포기하면
+    부서 훅이 영영 안 붙는다 · preflight 와 동일 판단).
+    ★대상이 settings.json 하나가 아니다(2026-09-05 · master 승인): `_migrate_directive` 도 같은
+      규약으로 MASTER_DIRECTIVE.md 를 교체하므로 락 소유자를 **파일별**로 일반화한다. 락 파일명
+      규약(`<대상>.cys-lock`)은 preflight `_settings_rmw`·guard_register 와 동일하다."""
     lk = None
     if _lock is not None:
         try:
-            lk = _lock.FileLock(settings_path + ".cys-lock", owner="dept-migrate",
+            lk = _lock.FileLock(path + ".cys-lock", owner="dept-migrate",
                                 blocking=True, timeout=10.0, soft=True)
             lk.acquire()
             if lk.status != _lock.ACQUIRED:
-                sys.stderr.write("[dept-migrate] settings 락 미획득(%s) — 직렬화 없이 진행: %s\n"
-                                 % (lk.status, settings_path))
+                sys.stderr.write("[dept-migrate] %s 락 미획득(%s) — 직렬화 없이 진행: %s\n"
+                                 % (what, lk.status, path))
         except Exception as e:
-            sys.stderr.write("[dept-migrate] settings 락 사용 불가(%s) — 직렬화 없이 진행\n" % e)
+            sys.stderr.write("[dept-migrate] %s 락 사용 불가(%s) — 직렬화 없이 진행\n" % (what, e))
             lk = None
     try:
         yield
@@ -150,7 +153,7 @@ def _settings_lock(settings_path):
 
 def _register_hook(settings_path, cmd, do_fix):
     """returns (action, detail). action ∈ ok|would|fixed|skip|error."""
-    with _settings_lock(settings_path):   # ★읽기→쓰기 전 구간 직렬화(lost update 차단)
+    with _file_lock(settings_path):   # ★읽기→쓰기 전 구간 직렬화(lost update 차단)
         if os.path.islink(settings_path):
             return "skip", "symlink 거부: %s" % settings_path
         if not os.path.isfile(settings_path):
@@ -253,8 +256,18 @@ def _strip_stale_block(content):
 
 
 def _migrate_directive(pack, do_fix):
-    """③ 스테일 교리 백필. returns (action, detail). action ∈ ok|would|fixed|skip|error."""
+    """③ 스테일 교리 백필. returns (action, detail). action ∈ ok|would|fixed|skip|error.
+
+    ★읽기→교체 전 구간을 파일별 공용 락으로 직렬화한다(2026-09-05 · master 승인). 종전엔 락이
+      없었고 스테이징도 고정 `.tmp` 여서 `_register_hook` 이 settings 에서 걷어낸 것과 **같은
+      계급**(공유 스테이징 = 교차 파손)이 이 경로에 남아 있었다."""
     path = os.path.join(pack, DIRECTIVE_REL)
+    with _file_lock(path, "directive"):
+        return _migrate_directive_locked(path, do_fix)
+
+
+def _migrate_directive_locked(path, do_fix):
+    """락을 잡은 채 수행하는 본체(락 획득은 `_migrate_directive` 가 소유한다)."""
     if os.path.islink(path):
         return "skip", "symlink 거부: %s" % path
     if not os.path.isfile(path):
@@ -282,11 +295,24 @@ def _migrate_directive(pack, do_fix):
     backup = path + ".bak-migrate"
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
+    # ★고정 `.tmp` 금지(2026-09-05 · master 승인 · `2559d4d` 가 settings 에서 걷어낸 그 계급).
+    #   종전 이 자리는 `path + ".tmp"` 라 **모든 프로세스가 같은 스테이징 파일**을 열었다:
+    #   P1 이 큰 본문을 쓰는 도중 P2 가 같은 tmp 를 truncate 하고 짧게 써서 replace 하면 P1 의 fd 는
+    #   이미 발행된 파일을 계속 가리켜 자기 오프셋에 이어 쓴다 → 교리 문서가 "짧은 본문 + 잔여 꼬리".
+    #   `os.replace` 는 **발행**만 원자적이라는 뜻이고, 스테이징을 공유하면 그 보장이 사라진다.
+    d = os.path.dirname(os.path.abspath(path)) or "."
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(src)
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-deptdir-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError as e:
         return "error", "교체 실패: %s" % e
     return "fixed", "스테일 §3 교체 — 메인 팩 최신 본(④-c 포함) 동기화(백업 .bak-migrate)%s" % drift
