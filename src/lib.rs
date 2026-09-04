@@ -11,6 +11,7 @@ pub mod factory_reset;
 /// 이쪽은 **교체가 반쪽으로 끝나는 것**을 막는다(같은 사고의 다른 절반).
 pub mod app_bundle;
 pub mod declaration;
+pub mod mission_gate;
 pub mod directive_compose;
 pub mod edit_kinds;
 /// 첫기동 관문 코퍼스 — **코드 임베드 정본**(U-12 · K-1). `agents.json` 값 수정은 사용자 소유

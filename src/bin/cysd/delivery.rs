@@ -259,27 +259,19 @@ pub enum Outcome {
 /// 공백 집합을 `char::is_whitespace()`(= Unicode White_Space property)로 정의한 이유:
 /// python `re.compile(r"\s+")` 는 여기에 더해 U+001C..U+001F 를 포함해 **미세하게 다르다**.
 /// 그래서 판독자도 라이브러리 의미에 기대지 않고 White_Space 집합을 명시 구현한다(양쪽 박제).
+///
+/// ★부트 v2(B1): 구현이 **lib `cys::mission_gate` 로 이관**됐고 여기는 위임만 남는다.
+/// 이유: `cys hook`(CLI 바이너리)이 층1 원장 대조를 하려면 같은 산식이 필요한데, 종전에는 이
+/// 함수가 `cysd` 바이너리 안에만 있어 사본을 만들 수밖에 없었다. 사본이 갈리는 순간 해시가
+/// 안 맞아 원장 대조는 **조용히** 무력화된다(항상 '미일치' = fail-open). 이 파일의 기존
+/// 검체들은 위임을 관통해 그대로 계약을 잰다 — 그것이 이관의 회귀 방어다.
 pub fn normalize(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut pending_space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.push(ch);
-    }
-    out
+    cys::mission_gate::normalize(text)
 }
 
-/// 이미 정규화된 문자열의 sha256 소문자 hex.
+/// 이미 정규화된 문자열의 sha256 소문자 hex(lib 위임 — 위 `normalize` 주석 참조).
 fn digest_normalized(norm: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(norm.as_bytes()))
+    cys::mission_gate::digest_normalized(norm)
 }
 
 /// 정규화 본문의 sha256 소문자 hex. **테스트 전용 편의 함수**다.

@@ -607,8 +607,8 @@ mod tests {
         let fire = c["fire"].as_array().expect("fire 배열 부재");
         let skip = c["skip"].as_array().expect("skip 배열 부재");
         // 규모 핀 — python self-test 가 출력하는 수와 같아야 한다(코퍼스가 조용히 줄면 잡힌다).
-        assert_eq!(fire.len(), 49, "FIRE 코퍼스 규모가 바뀌었다");
-        assert_eq!(skip.len(), 44, "SKIP 코퍼스 규모가 바뀌었다");
+        assert_eq!(fire.len(), 53, "FIRE 코퍼스 규모가 바뀌었다");
+        assert_eq!(skip.len(), 49, "SKIP 코퍼스 규모가 바뀌었다");
 
         let mut fails: Vec<String> = Vec::new();
         for it in fire {
