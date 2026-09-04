@@ -11050,7 +11050,15 @@ def h_boot_intent_1():
         need('"", // lane 자기 고정' in dae,
              "(ⓔ) boot.enqueue arm 의 lane 자기 고정(빈값) 인자가 없다 — 호출자 lane 이 열리면 "
              "레인↔팩 불일치 표면(R3-P2-6)")
-        need("boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id" in dae,
+        # ★부트 v2(W-B B2-a) 개명 수용 — **추가만**(구 이름을 지우지 않는다).
+        #   구: boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id
+        #   신: boot_enqueue_writes_a_v3_intent_with_own_lane_and_content_derived_id
+        #   개명 사유: 인텐트 id 가 '호출마다 유일한 카운터'에서 '선언 **내용** 기반 decl_id'
+        #   로 바뀌었다(명세 §2-5). 이 핀이 재는 것은 이름이 아니라 **'lane 항상 빈값' 을 재는
+        #   cargo 검체의 실재**이며, 신 검체도 `it["lane"] == json!("")` 를 그대로 단언한다.
+        #   두 이름 중 하나라도 있으면 통과다 — 구 이름을 지우면 롤백 브랜치에서 오적발이 난다.
+        need(("boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id" in dae)
+             or ("boot_enqueue_writes_a_v3_intent_with_own_lane_and_content_derived_id" in dae),
              "(ⓔ) 'enqueue 산출 인텐트 lane 항상 빈값' 핀(cargo 검체)이 삭제됐다")
         need("boot_enqueue_refuses_when_supervisor_is_off" in dae,
              "(ⓕ 데몬면) supervisor_off 미기록 핀(cargo 검체)이 삭제됐다")
