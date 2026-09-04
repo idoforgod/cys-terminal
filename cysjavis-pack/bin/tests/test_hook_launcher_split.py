@@ -66,6 +66,7 @@ def rd(path):
 STUB_BODY = """#!/bin/sh
 # 스텁 본체 — 실행 사실과 인자 파일 내용을 남긴다(실 본체 무접촉).
 echo "BODY-RAN" >> "$MARK"
+printf '%s' "${PYTHONDONTWRITEBYTECODE:-}" > "$MARK.seal"
 if [ -n "${1:-}" ] && [ -f "$1" ]; then
   printf '%s' "$(cat "$1")" > "$MARK.arg"
   printf '%s' "$1" > "$MARK.argpath"
@@ -102,8 +103,11 @@ def lab(root, name):
     env = dict(os.environ)
     for k in ("AITERM_SURFACE_ID", "CYS_PACK_DIR", "CYS_MISSION", "CYS_SOCKET"):
         env.pop(k, None)
+    # ★CYS_PACK_DIR 를 실험실로 고정하는 이유(밀폐): 런처의 프리루드 2단 폴백은 키가 없으면
+    #   `$HOME/.cys/pack/hooks/_lib.sh`(사용자 실팩)로 간다 — 그러면 이 검체가 기계에 따라
+    #   다른 것을 재게 된다. 실험실을 레인으로 지정하면 레인 가드도 같은 팩으로 통과한다.
     env.update({"CYS_SURFACE_ID": "7", "CYS_STATE_DIR": state, "MARK": mark,
-                "CYSLOG": os.path.join(d, "cys.log"),
+                "CYS_PACK_DIR": d, "CYSLOG": os.path.join(d, "cys.log"),
                 "PATH": binp + os.pathsep + env.get("PATH", "")})
     return hooks, binp, state, env, mark
 
@@ -131,7 +135,11 @@ try:
           not [n for n in os.listdir(state) if n.startswith("hook-input-")], str(os.listdir(state)))
 
     # ───────── H-HOOK-IN-2: 단일 소유 — 0/3 이면 본체 미실행 · 그 밖은 본체 1회 ─────────
-    matrix = [(0, False), (3, False), (1, True), (4, True), (5, True), (127, True), (2, True)]
+    # ★rc 계약(master 판정 2026-09-04 ①): **6=처리완료 · 3=억제** 만 본체를 건너뛴다.
+    #   rc 0 은 `HOOK_EXIT_PROCEED`(종전 의미 불변)라 **반드시 본체가 돌아야 한다** — 0 을
+    #   처리완료로 읽는 순간 모든 마스터 선언이 무음 사망한다(이 행이 그 회귀의 유일한 관측점).
+    matrix = [(6, False), (3, False), (0, True), (1, True), (4, True), (5, True),
+              (127, True), (2, True)]
     for rc, expect_body in matrix:
         hooks, binp, state, env, mark = lab(root, "in2-%d" % rc)
         w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
@@ -144,9 +152,9 @@ try:
     # ★둘 다 도는 경로가 없다: 위 매트릭스 전체에서 ran ∈ {0,1} 이고 rc 0/3 에서만 0 이다.
     hooks, binp, state, env, mark = lab(root, "in2-dup")
     w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
-    w(os.path.join(binp, "cys"), stub_cys(rc_input=0, supports_input=True), 0o755)
+    w(os.path.join(binp, "cys"), stub_cys(rc_input=6, supports_input=True), 0o755)
     run(hooks, env)
-    check("IN-2z 처리완료(rc 0)에서 입력 파일도 회수된다(런처가 지운다)",
+    check("IN-2z 처리완료(rc 6)에서 입력 파일도 회수된다(런처가 지운다)",
           not [n for n in os.listdir(state) if n.startswith("hook-input-")], str(os.listdir(state)))
 
     # ───────── ★능력 프로브: 구 CLI(--input 미지원)는 위임 자체를 하지 않는다 ─────────
@@ -182,7 +190,8 @@ try:
     check("SELF-1b 자기완결 실행 — exit 0 · 본체 위임 성립",
           r.returncode == 0 and rd(mark).count("BODY-RAN") == 1, repr((r.returncode, r.stderr[-200:])))
     src = rd(LAUNCHER)
-    check("SELF-1c 런처 소스가 공용 프리루드를 소스하지 않는다", "_lib.sh" not in src)
+    check("SELF-1c 런처는 프리루드를 **하드 의존하지 않는다**(부재 시 조용한 강등 · loud-skip 0)",
+          "_lib.sh 소실" not in src and "|| :" in src, repr([l for l in src.splitlines() if "_lib.sh" in l]))
     check("SELF-1d 런처가 프리루드 규약 심볼을 쓰지 않는다(소비 훅 판정에서 제외되어야 한다)",
           not any(m in src for m in ("CYS_PY", "PYBIN", "python3", "cys_norm_", "cys_is_abs",
                                      "cys_native_path", "cys_require_surface", "cys_have_surface",
@@ -199,7 +208,7 @@ try:
     # ───────── H-HOOK-WIN-PATH: 경로 2벌(T2-1) ─────────
     hooks, binp, state, env, mark = lab(root, "win")
     w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
-    w(os.path.join(binp, "cys"), stub_cys(rc_input=0, supports_input=True), 0o755)
+    w(os.path.join(binp, "cys"), stub_cys(rc_input=6, supports_input=True), 0o755)
     # cygpath 스텁: -u 는 항등(POSIX 복원) · -w 는 네이티브 표기 모사(접두 부착)
     w(os.path.join(binp, "cygpath"),
       '#!/bin/sh\ncase "$1" in\n  -u) printf "%s" "$2" ;;\n'
@@ -213,6 +222,27 @@ try:
     check("WIN-1c 네이티브 표기를 파일 조작에 쓰지 않았다(WINPFX 디렉터리 미생성)",
           not os.path.exists(os.path.join(os.path.dirname(hooks), "WINPFX::")),
           str(os.listdir(os.path.dirname(hooks))))
+
+    # ───────── 프리루드: **있으면 소비 · 없으면 자기완결 강등**(master 판정 ②) ─────────
+    hooks, binp, state, env, mark = lab(root, "prelude")
+    w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
+    w(os.path.join(binp, "cys"), stub_cys(supports_input=False), 0o755)
+    shutil.copy(os.path.join(HOOKS, "_lib.sh"), os.path.join(hooks, "_lib.sh"))
+    r = run(hooks, env)
+    check("PRELUDE-1a 프리루드가 있으면 정상 위임(강등 아님)",
+          r.returncode == 0 and rd(mark).count("BODY-RAN") == 1, repr((r.returncode, r.stderr[-200:])))
+    check("PRELUDE-1b 프리루드의 바이트코드 봉인(SEAL-1)이 본체까지 상속된다",
+          rd(mark + ".seal") == "1", repr(rd(mark + ".seal")))
+    hooks2, binp2, state2, env2, mark2 = lab(root, "prelude-none")
+    w(os.path.join(hooks2, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
+    w(os.path.join(binp2, "cys"), stub_cys(supports_input=False), 0o755)
+    r = run(hooks2, env2)
+    check("PRELUDE-2 프리루드가 없어도 죽지 않는다(조용한 강등 · loud-skip 아님)",
+          r.returncode == 0 and rd(mark2).count("BODY-RAN") == 1 and "소실" not in r.stderr,
+          repr((r.returncode, r.stderr[-200:])))
+    src_l = rd(LAUNCHER)
+    check("PRELUDE-3 2단 폴백 문자열 보유(G-PRELUDE `no2` 계약)",
+          "CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" in src_l)
 
     # ───────── 반드시 exit 0 · 고지 계약 ─────────
     hooks, binp, state, env, mark = lab(root, "nobody")     # 본체 없음
@@ -280,20 +310,20 @@ try:
     # ───────── ★음성 대조 1: 능력 프로브를 떼면 구 CLI 에서 부트가 무음 사망한다 ─────────
     mut_hooks = os.path.join(root, "mut1", "hooks")
     os.makedirs(mut_hooks)
-    mut = src.replace('&& cys hook user-prompt-submit --help 2>/dev/null | grep -q -- \'--input\'',
-                      '&& true')
+    mut = src.replace("      6|3) rm -f \"$IN\" 2>/dev/null; exit 0 ;;",
+                      "      0|3) rm -f \"$IN\" 2>/dev/null; exit 0 ;;")
     check("MUT-1a 변조 앵커 실재(계측 타당성)", mut != src)
     w(os.path.join(mut_hooks, "role-bootstrap.sh"), mut, 0o755)
     w(os.path.join(mut_hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
     d = os.path.dirname(mut_hooks)
     binm = os.path.join(d, "bin"); os.makedirs(binm, exist_ok=True)
-    w(os.path.join(binm, "cys"), stub_cys(rc_input=0, supports_input=False), 0o755)
+    w(os.path.join(binm, "cys"), stub_cys(rc_input=0, supports_input=True), 0o755)
     envm = dict(env)
     envm.update({"MARK": os.path.join(d, "mark"), "CYSLOG": os.path.join(d, "cys.log"),
                  "CYS_STATE_DIR": os.path.join(d, "state"),
                  "PATH": binm + os.pathsep + os.environ.get("PATH", "")})
     r = run(mut_hooks, envm)
-    check("MUT-1b 프로브를 떼면 구 CLI rc 0 에서 **본체가 안 돈다**(무음 사망 재현) — "
+    check("MUT-1b rc 0 을 처리완료로 읽는 변조본은 **본체가 안 돈다**(무음 사망 재현) — "
           "이 검체가 실제로 그 갈래를 재고 있다",
           rd(os.path.join(d, "mark")).count("BODY-RAN") == 0,
           repr(rd(os.path.join(d, "mark"))))
