@@ -360,6 +360,19 @@ HOOK_BODY_FILES = [
     (os.path.join("hooks", "role-bootstrap-legacy.sh"), "role-bootstrap.sh"),
 ]
 
+# ★npm_config_prefix **번들 오염** 처방 문안 — 정본은 Rust `npm_prefix_bundle_warning`
+#   (src/lib.rs)이고, 그 함수의 독스트링이 "pane 첫 줄 고지와 **preflight 가 같은 문자열**을
+#   쓴다 · 문안을 두 벌 두면 한쪽만 고쳐져 사용자가 서로 다른 처방을 받는다"를 계약으로 못박는다.
+#   python 에서 Rust 를 호출할 수단이 없으므로 문장을 **옮겨 두되**, 드리프트는 검체가 잡는다
+#   (`test_preflight_npm_prefix.py` ⑥ — Rust 원본이 이 레인에 들어오면 핵심 문장 대조가 켜진다).
+#   ★값을 덮지 않는다는 것이 계약이다(사용자 설정) — 그래서 이 축은 WARN 이고 처방도 '권함'이다.
+NPM_PREFIX_BUNDLE_WARNING = (
+    "npm_config_prefix 가 설치본 안을 가리킵니다 — npm 전역 설치가 설치본을 변경하면 "
+    "코드서명·봉인이 깨져 다음 실행이 차단될 수 있습니다(그래도 값은 덮지 않습니다 — "
+    "사용자 설정입니다). 설치본 밖(예: $HOME/.local · Windows 는 %LOCALAPPDATA%\\cys-npm)으로 "
+    "옮기시길 권합니다."
+)
+
 # ★소망상태 매니페스트의 파이썬 측 — **각성 티어**(awakening tier · A9 · W3).
 #   "없으면 부트 발화 자체가 사라지는" 훅 집합이다: SessionStart(=/clear 후 지침 재주입) +
 #   UserPromptSubmit(=마스터 선언 부트 발화). Rust 측 정본은 `src/pack.rs AWAKENING_HOOKS` 이고
@@ -5432,6 +5445,50 @@ class Preflight:
         self.add(cid, PASS, "%s self-test OK (명명 대조·진위 게이트·쿨다운/차단기·seq/로테이션·"
                             "커서·close 시퀀스)" % p)
 
+    # ── C81 npm_config_prefix 번들 오염 — **데몬 판정의 소비자**(부트 v2 A6 · W-B #2 협업) ──
+    #
+    # ★이 검사에는 술어가 없다. 있는 것은 **판독과 문안**뿐이다. 판정 주체는 데몬이고
+    #   (`cys status --json` → `result.daemon.npm_prefix_polluted` · bool · 항상 존재 ·
+    #   호출마다 재평가), preflight 는 그 bool 을 소비만 한다. 같은 술어를 python 으로 다시
+    #   구현하면 경로 정규화·Windows 대소문자·형제 접두(`cys.app-old`) 같은 함정이 **두 벌**이
+    #   되고, 두 판정이 갈리는 순간 사용자는 pane 고지와 preflight 에서 **서로 다른 처방**을
+    #   받는다 — 정본 문안 함수가 독스트링으로 금지한 바로 그 상태다.
+    # ★티어 WARN: 데몬은 이 값을 **덮지 않는다**(사용자 설정이다). 부트를 막을 사안이 아니다.
+    # ★미측정 규약(이 파일의 계급 구분 그대로): 키가 없으면 SKIP 이다. 키 부재를 '깨끗함'으로
+    #   접으면 구 데몬 전 기계에서 이 축이 **거짓 초록**이 되고, FAIL 로 접으면 부트 v2 미배선
+    #   스큐가 부트를 막는다. 재지 못한 것은 결손도 통과도 아니다.
+    def c81_npm_prefix_polluted(self):
+        cid = "C81.npm-prefix-polluted"
+        if self.skipped(cid):
+            return
+        cys = shutil.which("cys")
+        if not cys:
+            self.add(cid, SKIP, "PATH 에 cys 없음 — 데몬 판정 조회 불가(C11 소관)")
+            return
+        try:
+            r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                               text=True, timeout=15, env=_utf8_env())
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "cys status --json 실행 불가(%s) — 미측정" % e)
+            return
+        if r.returncode != 0:
+            self.add(cid, SKIP, "cys status --json rc=%d — 미측정(데몬 미가동 가능)" % r.returncode)
+            return
+        try:
+            payload = json.loads(r.stdout or "{}")
+        except Exception:  # noqa: BLE001
+            self.add(cid, SKIP, "cys status --json 판독 불가(JSON 아님) — 미측정")
+            return
+        daemon = (payload.get("result") or {}).get("daemon") or {}
+        if "npm_prefix_polluted" not in daemon:
+            self.add(cid, SKIP, "daemon.npm_prefix_polluted 키 부재 — 구 데몬·부트 v2 미배선(미측정). "
+                                "키 부재를 '깨끗함'으로 접지 않는다")
+            return
+        if daemon.get("npm_prefix_polluted") is True:
+            self.add(cid, WARN, NPM_PREFIX_BUNDLE_WARNING)
+        else:
+            self.add(cid, PASS, "npm_config_prefix 번들 오염 없음(데몬 판정)")
+
     # ── C79 cycle-verifier heartbeat (R6 W0-5) — 전 등급 WARN 티어(READY 미차단) ──
     # ★FAIL 금지 근거: 검증자 pane 은 전자동 사이클 **live** 단계의 전제(autopilot 게이트6)
     #   일 뿐, S0 shadow 단계 전에는 미필수다 — 부트 비치명. 부재·노화·수리 실패 전부
@@ -5592,6 +5649,9 @@ class Preflight:
             self.c78_radio,
             # C79(R6 W0-5) — cycle-verifier heartbeat 신선도. WARN-only(S0 shadow 전 미필수).
             self.c79_cycle_verifier_heartbeat,
+            # C81(부트 v2 A6 · W-B #2 협업) — 데몬이 판정한 npm_config_prefix 번들 오염 **소비**.
+            #   WARN-only(값을 덮지 않는 것이 계약 — 부트를 막지 않는다).
+            self.c81_npm_prefix_polluted,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
