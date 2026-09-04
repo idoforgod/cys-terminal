@@ -11127,16 +11127,29 @@ fn hook_prompt_axis(
         cys::mission_gate::boot_command_origin(&inp.prompt)
             .map(|w| format!("층0-c 기동 명령문 — {w}"))
     });
+    let (verdict, code, detail) = hook_prompt_outcome(machine.as_deref(), role, seat_reason);
+    hook_verdict(verdict, code, &format!("{detail}{ack_note}"))
+}
+
+/// 층 판정 → (토큰, exit, 상세)의 **순수 매핑**(master 계약 확정 2026-09-04).
+///
+/// 집행(`hook_verdict` 의 stderr 출력)에서 분리한 이유: rc6/rc0 두 경로는 이 축의 **계약 그
+/// 자체**인데, 그것을 재려면 데몬 왕복이 필요한 함수 안에 묻혀 있으면 검체가 못 닿는다.
+/// 값으로 뽑아 두면 데몬 없이 두 경로를 전수로 잰다(`npm_prefix_pane_notice_req` 와 같은 규율).
+///
+/// 계약: 기계 유래면 **6 HANDLED**(런처 종료) · 아니면 **0 PROCEED**(셸이 자기 게이트 계속).
+/// 억제 3·판정불가 4·legacy 5 는 이 함수 앞에서 이미 갈린다.
+fn hook_prompt_outcome(
+    machine: Option<&str>,
+    role: &str,
+    seat_reason: &str,
+) -> (&'static str, i32, String) {
     match machine {
-        Some(why) => hook_verdict(
-            "handled",
-            HOOK_EXIT_HANDLED,
-            &format!("기계 유래 — 임무 아님({why}){ack_note}"),
-        ),
-        None => hook_verdict(
+        Some(why) => ("handled", HOOK_EXIT_HANDLED, format!("기계 유래 — 임무 아님({why})")),
+        None => (
             "proceed",
             HOOK_EXIT_PROCEED,
-            &format!("role={role:?} · {seat_reason} — 오너 프롬프트{ack_note}"),
+            format!("role={role:?} · {seat_reason} — 오너 프롬프트"),
         ),
     }
 }
@@ -17335,6 +17348,53 @@ mod tests {
         assert!(
             !src.contains("\"surface.set_status\""),
             "존재하지 않는 RPC 이름(surface.set_status)이 코드에 되살아났다 — ack 가 무음 실패한다"
+        );
+    }
+
+    /// ★H-HOOK-RC-1(master 계약 확정 2026-09-04): **rc6 경로·rc0 경로·rc2 스큐 핀** 3종.
+    ///
+    /// 계약 그대로: 처리완료(기계 유래 판정 완료) = **6 HANDLED** · 오너 프롬프트 = **0 PROCEED**
+    /// (종전 의미 불변 — 구 셸 폴백이 계속 진행) · 억제는 종전 **3**. 런처(W-A A2)는 `6|3` 에서만
+    /// 종료하고 나머지는 legacy 본체로 간다.
+    ///
+    /// ★rc2 는 **구 CLI 스큐 전용**이다. 구 `cys` 는 `--input` 을 모르므로 clap 이 **알 수 없는
+    /// 인자**로 죽고 그 종료코드가 2다 — 런처의 `*) legacy` 가 그것을 종전 경로로 접는다.
+    /// 여기서는 그 **기구**(clap 의 unknown-argument exit code)를 박는다. 우리가 2 를 쓰기
+    /// 시작하면 "구 CLI 스큐"와 "신 CLI 판정"이 구별 불가가 되므로 H-HOOK-EXIT-1 이 그 자리를
+    /// 비워 둔 것을 함께 단언한다.
+    #[test]
+    fn hook_rc6_and_rc0_paths_and_rc2_is_old_cli_skew_only() {
+        // ── rc6: 기계 유래 판정이 서면 처리완료다(런처 종료) ──────────────────────────
+        for why in ["층1 — 배달 원장 일치", "층0 harness — 마커", "층0-c 기동 명령문 — cys boot"] {
+            let (tok, code, detail) = hook_prompt_outcome(Some(why), "master", "seat ok");
+            assert_eq!(code, HOOK_EXIT_HANDLED, "기계 유래인데 처리완료가 아니다: {why}");
+            assert_eq!(tok, "handled");
+            assert!(detail.contains(why), "판정 근거가 상세에서 빠졌다: {detail}");
+        }
+        // ── rc0: 오너 프롬프트는 **종전 의미 그대로** proceed ────────────────────────
+        let (tok, code, detail) = hook_prompt_outcome(None, "master", "seat ok");
+        assert_eq!(code, HOOK_EXIT_PROCEED, "오너 프롬프트가 rc0 가 아니다 — 구 셸 폴백이 끊긴다");
+        assert_eq!(tok, "proceed");
+        assert!(detail.contains("오너 프롬프트"), "{detail}");
+        // 두 경로가 **다른 코드**여야 한다 — 같으면 런처가 처리완료를 '계속 진행'으로 읽는다.
+        assert_ne!(HOOK_EXIT_HANDLED, HOOK_EXIT_PROCEED);
+
+        // ── rc2: 구 CLI 스큐 전용(우리는 절대 내지 않는다) ────────────────────────────
+        use clap::Parser;
+        // 구 CLI 가 `--input` 을 만났을 때와 **같은 기구**: clap 의 알 수 없는 인자.
+        let e = match Cli::try_parse_from(["cys", "hook", "user-prompt-submit", "--input-that-old-cli-lacks"]) {
+            Err(e) => e,
+            Ok(_) => panic!("알 수 없는 인자가 통과했다 — 구 CLI 스큐 판정 근거가 무너진다"),
+        };
+        assert_eq!(
+            e.exit_code(),
+            2,
+            "clap 의 사용 오류 코드가 2 가 아니다 — 런처의 구 CLI 스큐 판정 근거가 무너진다"
+        );
+        // 신 CLI 는 `--input` 을 **안다**(그래서 rc2 가 안 난다) — 스큐와 판정이 구별된다.
+        assert!(
+            Cli::try_parse_from(["cys", "hook", "user-prompt-submit", "--input", "/tmp/x.json"]).is_ok(),
+            "신 CLI 가 --input 을 모른다 — 구 CLI 와 구별 불가가 된다"
         );
     }
 
