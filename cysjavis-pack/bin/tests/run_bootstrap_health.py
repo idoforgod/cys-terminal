@@ -11652,7 +11652,16 @@ def _u26_gate(*paths):
                        "않는다**. 이것은 통과가 아니라 미측정이므로 이 런은 GREEN 을 잃고 "
                        "exit 2 가 된다(헤더 '미측정 축 계약')."
                        % (U26_OFF_ENV, os.environ.get(U26_OFF_ENV)))
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    # ★`isdir` 이 아니라 `exists` 다: **git worktree 의 `.git` 은 디렉터리가 아니라 gitdir
+    #   포인터 파일**이라, isdir 로만 보면 워크트리에서 이 검체군 5종(H-CI-TAG-1·H-EVID-1·
+    #   H-FAKE-1/2/3)이 통째로 Skip 된다 — 아무도 재지 않은 채 GREEN 이 나는 '돌지 않는 초록'
+    #   이다. 실제로 그 공백이 회귀 1건을 놓쳤다(2026-09-04: 워커 로컬은 GREEN, CI 는 RED).
+    #   `_git_show`(:312)가 같은 이유로 이미 `exists` 를 쓴다 — 그 수리가 이 지점에 오지
+    #   않았을 뿐이다(계급이 안 닫힌 채 지점만 고쳐진 전형).
+    #   ⚠`git rev-parse --is-inside-work-tree` 는 쓰지 않는다: REPO_DIR 이 **무관한 상위 레포
+    #     안에** 놓인 배포 팩까지 '체크아웃' 으로 판정해 Skip 이 Fail 로 뒤집힌다. `.git` 이
+    #     REPO_DIR **에** 있을 것을 요구하는 편이 정확하다.
+    if not os.path.exists(os.path.join(REPO_DIR, ".git")):
         raise Skip("레포 체크아웃이 아니다(배포 팩) — 검증 인프라 검체 적용 불가")
     for p in paths:
         need(os.path.exists(p),
