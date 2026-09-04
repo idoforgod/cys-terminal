@@ -192,7 +192,9 @@ class ManifestSchemaParityTests(unittest.TestCase):
                          "검증된 마커 값 확정도 한 곳에서만 나와야 한다")
         # ★트리거 핀: 이 레인이 수리 브랜치에서 돌지 않으면 위 단언들은 **한 번도 실행되지 않는
         #   문장**이 된다(D4·#10 이 잡은 '0회 실행 게이트'와 같은 계급 — master 판정 2026-09-04).
-        self.assertIn("'fix/**'", src.split("jobs:")[0],
+        trig = "\n".join(l for l in src.split("jobs:")[0].split("\n")
+                         if not l.lstrip().startswith("#"))   # 주석 제외 — 아래 ⑦과 같은 이유
+        self.assertIn("'fix/**'", trig,
                       "windows-build 가 fix/** 에서 돌지 않는다 — 수리 레인의 Windows 변경이 "
                       "태그 레인에 가서야 드러난다")
         consumers = code.count("$dir = $env:CYS_INSTALL_DIR")
@@ -202,6 +204,29 @@ class ManifestSchemaParityTests(unittest.TestCase):
         self.assertEqual(consumers - 1, code.count("-ne $env:CYS_INSTALL_VER"),
                          "확정값을 받고도 마커 동일성을 확인하지 않는 스텝이 있다 "
                          "(매니페스트 검증 스텝 1곳만 자체 SOT 대조를 쓴다)")
+
+    # ── ⑦ Windows 실기 두 레인이 **수리 브랜치에서 돈다** (master 판정 2026-09-04) ──
+    def test_both_windows_lanes_run_on_the_fix_branches(self):
+        """`fix/**` 가 빠지면 수리 레인의 Windows 변경은 **태그 시점에야** 처음 검증된다 —
+        되돌리는 비용이 가장 비싼 자리에서 처음 드러난다는 뜻이다. 실제로 windows-build 를
+        편입하자마자(`153b1d1`) 첫 실발화가 실회귀 1건을 잡았다(좁은 인코딩 → `16d2341`).
+        windows-health 도 같은 계급이라 함께 못 박는다.
+
+        ★이 단언의 더 나은 장기 거처는 `run_bootstrap_health.py` 의 **H-WIN-11**(Windows CI 잡
+        계약 자기검증 — '조건부 잡 = 돌지 않는 초록' 교리를 이미 지킨다)이다. 그 파일이 세 레인에서
+        각각 다르게 진화 중이라(블롭 3종 상이) 통합 충돌면을 만들지 않으려고 여기 두었다 —
+        통합 후 H-WIN-11 로 옮기는 것이 옳다(master 보고 완료)."""
+        for name in ("windows-build.yml", "windows-health.yml"):
+            p = os.path.join(REPO, ".github", "workflows", name)
+            self.assertTrue(os.path.isfile(p), "%s 가 사라졌다" % name)
+            head = read(p).split("jobs:")[0]          # 트리거 절만 본다(잡 본문 오탐 차단)
+            # ★주석을 먼저 걷어낸다. 이 절의 롤백 안내 주석에 `'fix/**'` 문자열이 그대로 들어
+            #   있어서, 걷어내지 않으면 **트리거를 지워도 통과**한다(실측으로 이 구멍을 봤다 —
+            #   "설명문에 이름이 있다 = 배선됐다"는 착각의 재발).
+            code = "\n".join(l for l in head.split("\n") if not l.lstrip().startswith("#"))
+            self.assertIn("'fix/**'", code,
+                          "%s 가 fix/** 에서 돌지 않는다 — 수리 레인의 Windows 변경이 "
+                          "태그 레인에 가서야 드러난다" % name)
 
     def test_windows_lane_ships_the_manifest_as_a_bundle_resource(self):
         conf = os.path.join(REPO, "src-tauri", "tauri.windows.conf.json")
