@@ -677,26 +677,112 @@ pub fn fence_armed_from(env_val: Option<&str>) -> bool {
     matches!(env_val.map(str::trim), Some("1") | Some("true"))
 }
 
-/// (R3 #2 · codex BLOCK) **재시작마다 유일한 영속 epoch** 를 하나 올려 돌려준다.
+/// (R4 [1]) epoch 후보 하나 — **비교가 아니라 동등성으로만** 쓰이는 식별자다(실측: 이 저장소
+/// 어디에도 epoch 에 대한 대소 비교가 없다).
+///
+/// ## 왜 카운터가 아닌가 — 종전 read-modify-write 의 두 결함
+///  ⓐ `saturating_add` 는 천장에서 **멈춘다**. 그 뒤로는 모든 재시작이 같은 값을 돌려주어
+///    epoch 가 존재 이유(재시작 간 ABA 차단)를 **조용히** 잃는다 — 값을 올리는 코드가 값을
+///    올리지 않는 순간이 있는데 아무도 알지 못한다. 실패가 침묵하는 형태라 가장 나쁘다.
+///  ⓑ RMW 는 프로세스 간 잠금을 요구한다. unix 에서는 데몬 startup flock(`main.rs`
+///    `acquire_startup_lock`)이 그것을 이미 주지만 **그 함수는 `#[cfg(unix)]` 라 Windows 에는
+///    없다** — 거기서는 동시에 뜬 두 데몬이 같은 이전 값을 읽어 같은 다음 값을 쓴다.
+///
+/// nonce 는 둘 다 **구조적으로** 없앤다: 더하지 않으므로 넘칠 수 없고, 판정이 읽기-쓰기 경주에
+/// 걸리지 않으므로 잠금이 필요 없다(같은 순간에 떠도 pid 가 다르면 값이 다르다).
+///
+/// ## 정직 고지 — 이 값은 비밀이 아니다
+/// 암호학적 원천이 아니다(시계·pid·프로세스 내 카운터의 혼합 · `lib.rs` `tmp_suffix` 와 같은
+/// 관용구). epoch 는 **식별자**이고 인가는 좌석 토큰이 진다. 이 값을 비밀로 쓰려는 코드가
+/// 생기면 그때는 원천부터 바꿔야 한다 — 여기서 조용히 겸직시키지 마라.
+fn epoch_nonce() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(seq.wrapping_mul(1442695040888963407))
+        .wrapping_add(u64::from(std::process::id()))
+}
+
+/// 직전 값과 우연히 겹쳤을 때 다시 뽑는 횟수. 이것은 **쓰기 재시도가 아니라 이름 뽑기**다.
+const NONCE_TRIES: usize = 8;
+
+/// (R3 #2 · R4 [1]) **재시작마다 유일한 영속 epoch** 를 정하고 **디스크에 내린 뒤** 돌려준다.
 ///
 /// generation 만으로는 ABA 를 막지 못한다: 데몬이 재시작하면 인메모리 표가 비고 세대가 되감길
 /// 수 있어, 옛 러너가 든 (intent, generation) 이 새 런의 그것과 **우연히 같아질** 수 있다.
 /// epoch 를 lease identity 에 넣으면 그 재사용이 끊긴다.
 ///
-/// 파일 하나에 카운터를 영속한다 — 판독 실패·파손은 **0 으로 보지 않고** 시각 기반 값으로
-/// 접는다(0 으로 접으면 재시작마다 같은 값이 되어 이 함수의 존재 이유가 사라진다).
-pub fn bump_boot_epoch(dir: &Path) -> u64 {
+/// ## 왜 `Result` 인가 — 못 남겼으면 열지 않는다
+/// 종전은 `let _ = std::fs::write(..)` 로 **영속 실패를 삼켰다**. 그러면 디스크에 아무것도 없는
+/// 채로 감독자가 열리고, 다음 재시작은 '이전 값' 을 모르므로 재사용 방지가 사라진다 — lease
+/// identity 가 근거 없이 발급된다. 이제 실패는 `Err` 로 나가고, 호출부([`spawn`])는 그 경우
+/// **감독자를 열지 않는다**(`supervisor_alive` 미set → 훅이 legacy 폴백을 탄다). 이 모듈이
+/// 이미 여러 곳에서 쓰는 규율 그대로다: 못 남기면 낳지 않는다.
+///
+/// ## 판독은 조언적이다(쓰기와 계급이 다르다)
+/// 이전 값 판독은 **직전과 같은 nonce 를 피하는 데만** 쓴다. 못 읽어도 진행한다 — '읽을 수
+/// 없다' 와 '첫 기동이라 없다' 는 구별되지 않고, 거기서 멈추면 파일 하나가 부트를 영구히
+/// 막는다. 반면 **쓰기 실패는 진행을 막는다**(위 문단).
+pub fn bump_boot_epoch(dir: &Path) -> Result<u64, String> {
     let p = dir.join("boot-epoch");
     let prev = std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    let next = match prev {
-        Some(v) => v.saturating_add(1),
-        // 없거나 판독 불가 — 시계에서 시작한다(재시작 간 충돌 가능성을 낮춘다).
-        None => now_epoch() as u64,
-    };
-    let _ = std::fs::write(&p, next.to_string());
-    next
+    let mut next = epoch_nonce();
+    for _ in 0..NONCE_TRIES {
+        if Some(next) != prev {
+            break;
+        }
+        next = epoch_nonce();
+    }
+    if Some(next) == prev {
+        // 시계가 멎고 카운터도 안 돌면 여기 온다 — 그때 같은 값을 쓰는 것은 재사용 방지를
+        // 끄는 것과 같으므로 열지 않는다.
+        return Err("epoch nonce 가 직전 값과 계속 같다(시계 정지 의심)".to_string());
+    }
+    persist_epoch(&p, next).map_err(|e| format!("epoch 영속 실패({}): {e}", p.display()))?;
+    Ok(next)
+}
+
+/// epoch 를 **원자 교체 + fsync** 로 내린다 — rename 만으로는 크래시를 못 넘는다.
+///
+/// 순서가 계약이다: tmp 에 쓰고 → `sync_all`(바이트가 실제로 매체에 있다) → rename(원자 교체).
+/// fsync 를 건너뛰면 rename 은 성공했는데 내용이 0바이트인 파일이 남을 수 있고, 그러면 다음
+/// 기동의 판독이 조용히 실패해 재사용 방지가 사라진다. tmp 이름은 nonce 라 **호출마다 유일**
+/// 하고(`create_new` = O_EXCL 이 커널 수준으로 보증한다), 어느 경로로 빠져나가든 자기 것만 치운다.
+fn persist_epoch(path: &Path, value: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{:x}", epoch_nonce()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    if let Err(e) = f.write_all(value.to_string().as_bytes()).and_then(|()| f.sync_all()) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f); // Windows: 열린 핸들이 있으면 rename 이 공유위반으로 막힌다.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // 디렉터리 엔트리까지 내려야 rename 자체가 크래시를 넘는다. 실패는 치명이 아니다 —
+    // 파일 내용은 이미 매체에 있고, 여기서 막으면 얻는 것보다 잃는 것이 크다(최선 노력).
+    #[cfg(unix)]
+    if let Some(d) = path.parent() {
+        let _ = std::fs::File::open(d).and_then(|df| df.sync_all());
+    }
+    Ok(())
 }
 
 /// (B3-2R ④ⓓ) **전역 동시 런 상한** — 살아 있는 런 + 회수하지 못한 fence 고아의 합.
@@ -2130,16 +2216,36 @@ pub fn spawn(daemon: Arc<Daemon>) {
     // ★(P2 · R3-P2-4 blocker) 생존 플래그 — 태스크 기동 **직전**에만 set 한다. 꺼짐(off)이면
     //   위에서 이미 return 했으므로 영영 미set 이고, `boot.enqueue` arm 은 미set 을 보고 스풀에
     //   쓰지 않는다('등록 성공·발화자 0' 무음 스큐의 봉인 — Daemon::supervisor_alive 주석 정본).
+    // ★R4 [1](codex BLOCK · master 심판): **epoch 를 디스크에 내린 뒤에만** 감독자를 연다.
+    //   종전에는 생존 플래그를 먼저 세우고 epoch 영속은 태스크 안에서 실패를 삼켰다 — 그러면
+    //   lease identity 의 근거가 없는 채로 dispatch 가 열린다. 순서를 뒤집어 영속 성공을
+    //   개방 조건으로 만든다. 실패하면 `supervisor_alive` 를 세우지 않으므로 `boot.enqueue`
+    //   arm 이 스풀에 쓰지 않고 훅이 종전 legacy 폴백을 탄다(부트 0회가 되지 않는다).
+    //   ★부수 효과 하나가 더 옳아졌다: 이 파일 I/O 가 async 블록 밖으로 나와 executor 를
+    //   막지 않는다(종전에는 틱 태스크 첫 줄에서 동기 fs 를 했다).
+    let dir = spool_dir(&daemon.socket_path);
+    let epoch = match bump_boot_epoch(dir.parent().unwrap_or(&dir)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[cysd] boot-supervisor: epoch 영속 실패 — 감독자를 열지 않는다 ({e})");
+            publish(
+                &daemon,
+                "boot_supervisor.epoch_persist_failed",
+                json!({"error": e, "opened": false,
+                       "note": "lease identity 를 못 남기면 열지 않는다 — 훅은 legacy 폴백을 탄다"}),
+            );
+            return;
+        }
+    };
     daemon.supervisor_alive.store(true, Ordering::SeqCst);
     tokio::spawn(async move {
-        let dir = spool_dir(&daemon.socket_path);
         let mut st = SupState::default();
         // ★R3 #7: fence 무장은 **env 로만** 켜진다(기본 꺼짐). 켜는 조건은 §2-7 러너의 CAS·자멸
         //   계약과 그 검체가 닫히는 것이고(B4), 그때 이 스위치 하나로 경로 전체가 살아난다.
         st.fence_armed = fence_armed_from(std::env::var(ENV_FENCE_ARMED).ok().as_deref());
         // ★R3 #2: lease identity 의 epoch 는 **데몬 수명당 하나**이고 디스크에 영속한다.
         //   스풀이 아니라 그 부모(상태 디렉터리)에 둔다 — 스풀은 인텐트 스캔·GC 의 대상이다.
-        st.epoch = bump_boot_epoch(dir.parent().unwrap_or(&dir));
+        st.epoch = epoch;
         if st.fence_armed {
             eprintln!("[cysd] boot-supervisor: fence ARMED (epoch={})", st.epoch);
         }
@@ -3426,6 +3532,127 @@ mod tests {
         assert!(fence_armed_from(Some(" 1 ")), "공백은 다듬어 받는다");
     }
 
+    /// ★R4 [1] 소스핀 — epoch 영속의 **세 계약**(O_EXCL · fsync · 원자 교체)과 순서, 그리고
+    /// **카운터로의 회귀 금지**를 코드에서 직접 확인한다.
+    ///
+    /// 행위 검체로는 fsync 유무를 가를 수 없다(크래시를 일으켜야 갈린다). 그래서 이 축만
+    /// 소스로 못 박는다 — 재는 척하는 행위 검체보다 정직하다.
+    #[test]
+    fn epoch_persist_is_atomic_synced_and_never_a_saturating_counter() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        let at = prod.find("fn persist_epoch(").expect("persist_epoch 소실");
+        let body = &prod[at..];
+        let body = &body[..body.find("\n}").expect("persist_epoch 본문 끝 소실")];
+        for (needle, why) in [
+            ("create_new(true)", "tmp 를 O_EXCL 로 열지 않는다 — 남의 tmp 를 덮어쓸 수 있다"),
+            ("sync_all()", "fsync 가 없다 — rename 은 성공했는데 내용이 비는 창이 열린다"),
+            ("rename(", "원자 교체가 아니다 — 제자리 쓰기는 판독자에게 찢긴 파일을 보인다"),
+        ] {
+            assert!(body.contains(needle), "persist_epoch 에 {needle} 이 없다: {why}");
+        }
+        assert!(
+            body.find("sync_all()").unwrap() < body.find("rename(").unwrap(),
+            "fsync 가 rename 뒤로 갔다 — 그 순서면 크래시 창이 그대로 남는다"
+        );
+        // ★카운터 회귀 차단: epoch 는 더하지 않는다. 더하는 순간 천장에서 조용히 멈추고,
+        //   그때부터 모든 재시작이 같은 값을 돌려주어 ABA 가 다시 열린다.
+        let bat = prod.find("pub fn bump_boot_epoch(").expect("bump_boot_epoch 소실");
+        let bbody = &prod[bat..];
+        let bbody = &bbody[..bbody.find("\n}").expect("bump_boot_epoch 본문 끝 소실")];
+        for bad in ["saturating_add", "checked_add", "wrapping_add"] {
+            assert!(
+                !bbody.contains(bad),
+                "epoch 가 다시 카운터가 됐다({bad}) — 천장·경주 둘 다 되살아난다"
+            );
+        }
+    }
+
+    /// ★R4 [1]·[6] — **영속 실패는 삼켜지지 않는다.**
+    ///
+    /// 종전 코드는 `let _ = std::fs::write(..)` 였다. 그러면 디스크에 아무것도 없는 채로
+    /// 감독자가 열리고, 다음 재시작은 '이전 값' 을 몰라 재사용 방지가 사라진다.
+    #[cfg(unix)]
+    #[test]
+    fn epoch_persist_failure_is_reported_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("cysd-epoch-ro-{:x}", epoch_nonce()));
+        std::fs::create_dir_all(&d).unwrap();
+        // 이름을 예측하는 결함 주입이 아니라 **권한**으로 막는다(A-M4 교훈: 이름 주입은
+        // tmp 가 유일해지는 순간 무력화된다).
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // ★검체 자기검증 — 이 환경에서 권한 주입이 실제로 듣는가(root 면 안 듣는다).
+        //   안 들으면 이 검체는 아무것도 재지 못한다. 그 무측정을 조용히 통과시키지 않는다.
+        let injection_works = std::fs::File::create(d.join("probe")).is_err();
+        let r = bump_boot_epoch(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&d).ok();
+        assert!(
+            injection_works,
+            "권한 주입이 듣지 않는 환경이다(root 의심) — 이 검체는 무측정이고, 무측정은 통과가 아니다"
+        );
+        assert!(
+            r.is_err(),
+            "영속 실패를 삼켰다 — lease identity 의 근거 없이 감독자가 열린다"
+        );
+    }
+
+    /// ★R4 [1]·[6] — **동시 기동이 같은 epoch 를 내지 않는다.**
+    ///
+    /// 종전은 파일을 읽어 +1 하는 RMW 라 프로세스 간 잠금을 요구했다. unix 는 데몬 startup
+    /// flock 이 그것을 주지만 그 함수는 `#[cfg(unix)]` 라 **Windows 에는 없다**. nonce 는
+    /// 잠금 없이도 겹치지 않는다 — 이 검체가 그 성질을 직접 잰다(스레드는 프로세스 간 경주의
+    /// 하한 모형이다: 같은 pid·같은 순간이라 조건이 오히려 더 가혹하다).
+    #[test]
+    fn concurrent_epoch_bumps_never_collide() {
+        let d = std::env::temp_dir().join(format!("cysd-epoch-conc-{:x}", epoch_nonce()));
+        std::fs::create_dir_all(&d).unwrap();
+        const N: usize = 16;
+        let hs: Vec<_> = (0..N)
+            .map(|_| {
+                let d = d.clone();
+                std::thread::spawn(move || bump_boot_epoch(&d))
+            })
+            .collect();
+        let vals: Vec<u64> = hs
+            .into_iter()
+            .map(|h| h.join().expect("스레드 패닉").expect("동시 bump 가 실패했다"))
+            .collect();
+        std::fs::remove_dir_all(&d).ok();
+        let uniq: std::collections::HashSet<u64> = vals.iter().copied().collect();
+        assert_eq!(
+            uniq.len(),
+            N,
+            "동시 bump 가 같은 epoch 를 냈다 — 잠금 없는 RMW 의 재발이다: {vals:?}"
+        );
+    }
+
+    /// ★R4 [1]·[6] — **연속 기동은 매번 다른 epoch 를 내고, 최신값이 디스크에 남는다.**
+    /// tmp 잔해가 남지 않는 것도 함께 잰다(A13 규약 — 자기 것만 치운다).
+    #[test]
+    fn successive_epochs_differ_and_the_latest_is_on_disk() {
+        let d = std::env::temp_dir().join(format!("cysd-epoch-seq-{:x}", epoch_nonce()));
+        std::fs::create_dir_all(&d).unwrap();
+        let a = bump_boot_epoch(&d).expect("첫 bump 실패");
+        let b = bump_boot_epoch(&d).expect("둘째 bump 실패");
+        let on_disk: u64 = std::fs::read_to_string(d.join("boot-epoch"))
+            .expect("epoch 파일 부재")
+            .trim()
+            .parse()
+            .expect("epoch 파일이 수치가 아니다");
+        let leftovers: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "boot-epoch")
+            .collect();
+        std::fs::remove_dir_all(&d).ok();
+        assert_ne!(a, b, "연속 기동이 같은 epoch 를 냈다 — 재시작 간 ABA 가 열린다");
+        assert_eq!(on_disk, b, "디스크에 최신 epoch 가 없다 — 다음 기동이 재사용을 못 피한다");
+        assert!(leftovers.is_empty(), "tmp 잔해가 남았다: {leftovers:?}");
+    }
+
     /// ★B3-2R ③(codex③) — fence 의 **CAS 술어**를 직접 잰다.
     ///
     /// ★배선 검체로 만들려던 첫 시도는 **공허했다**(변이로 적발했다): 표와 스냅샷의 세대가
@@ -3963,6 +4190,16 @@ mod tests {
         assert!(
             ret < alive && alive < task,
             "생존 플래그 set 위치가 계약(조기 return 뒤·태스크 기동 앞)을 벗어났다"
+        );
+        // ★R4 [1](codex BLOCK · master 심판): epoch 영속이 **생존 플래그보다 앞**이다.
+        //   뒤로 가면 lease identity 를 디스크에 못 남긴 채로 dispatch 가 열린다 — 이 모듈이
+        //   여러 곳에서 지키는 '못 남기면 낳지 않는다' 를 이 축에서만 어기는 셈이 된다.
+        let epoch_at = body
+            .find("bump_boot_epoch(")
+            .expect("epoch 영속 호출 지점 소실(R4 [1] 재발)");
+        assert!(
+            ret < epoch_at && epoch_at < alive,
+            "epoch 영속이 생존 플래그 뒤로 갔다 — 못 남긴 채로 감독자가 열린다"
         );
         // env 판독은 이 1지점뿐이다(축별 1지점 규약 — 판독 지점이 늘면 조합이 갈린다).
         assert_eq!(
