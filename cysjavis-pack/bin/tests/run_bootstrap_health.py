@@ -7055,6 +7055,16 @@ def _fake_pack_with_hooks(pack):
                       ("", "pack-guard.sh")):
         _w(os.path.join(pack, "hooks", script), "#!/bin/sh\nexit 0\n")
     _w(os.path.join(pack, "bin", "javis_reflect.py"), "import sys;sys.exit(0)\n", 0o644)
+    # ★훅 **본체**(부트 v2 A2 분할 · 2026-09-04): C28 은 등록 집합과 별개로 `HOOK_BODY_FILES`
+    #   실재를 잰다(본체가 없으면 런처가 exit 0 만 하고 부트가 안 난다). 이 픽스처의 의도는
+    #   "파일 요건은 충족된 팩 — **등록 판정만** 재자"이므로 본체도 있어야 한다. 목록은
+    #   preflight 정본에서 읽는다(사본을 두면 다음 본체가 늘 때 이 픽스처만 조용히 낡는다).
+    try:
+        _bodies = getattr(_preflight_mod(), "HOOK_BODY_FILES", [])
+    except Exception:
+        _bodies = [(os.path.join("hooks", "role-bootstrap-legacy.sh"), "role-bootstrap.sh")]
+    for _rel, _owner in _bodies:
+        _w(os.path.join(pack, _rel), "#!/bin/bash\nexit 0\n")
     return pack
 
 
