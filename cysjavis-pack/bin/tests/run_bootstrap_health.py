@@ -2789,7 +2789,24 @@ def h_conc_3():
         need(not fails, "경합 writer 실패: %r" % fails)
         # 파손 0: 파싱 성공 + 사용자 키 보존
         raw = _read(target)
-        data = json.loads(raw)          # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        # ★맨몸 `json.loads` 금지(cherry-pick -x 2559d4d · W-A): 종전 이 줄은 파손 시
+        #   **JSONDecodeError 로 크래시**해 검체가 FAIL 이 아니라 traceback 으로 죽었다 —
+        #   판정이 아니라 계측기 사망이라 원인 추적이 불가능했다(파일 내용이 사라진다).
+        #   파손은 **판정 결과**(FAIL)여야 하고 그 증거(파일 원문)는 남아야 한다.
+        try:
+            data = json.loads(raw)      # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        except ValueError as _je:
+            _ev = os.path.join(tempfile.gettempdir(),
+                               "h-conc-3-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_ev, "w", encoding="utf-8") as _f:
+                    _f.write(raw)
+            except OSError:
+                _ev = "(증거 보존 실패)"
+            need(False,
+                 "settings.json 교차 파손 — %s · %d바이트 · 머리 80=%r · 꼬리 80=%r · 증거=%s "
+                 "(‘Extra data’ 는 찢긴 쓰기의 서명이다: 완결 JSON 뒤에 남은 이전 본문의 꼬리)"
+                 % (_je, len(raw), raw[:80], raw[-80:], _ev))
         need(data.get("theme") == "dark", "경합이 사용자 키를 지웠다")
         # lost update 0: 모든 writer 의 모든 mark 가 남는다
         marks = data.get("marks") or []
@@ -2827,16 +2844,42 @@ def h_conc_3():
                    "    json.dump(d, open(p, 'w'))\n", 0o644)
         nprocs = [subprocess.Popen([PY, nchild, "n%d" % k, "6"],
                                    env=_base_env({"CYS_SETTINGS": naive}),
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                   for k in range(4)]
+        ndied = 0
         for pr in nprocs:
             pr.communicate(timeout=120)
-        nmarks = (json.loads(_read(naive) or "{}") or {}).get("marks") or []
-        need(len(nmarks) < 4 * 6,
-             "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
-             "(marks=%d) — 위 GREEN 은 검출력 미확인" % len(nmarks))
-        notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출"
-                     % (4 * 6 - len(nmarks), 4 * 6))
+            if pr.returncode != 0:
+                ndied += 1
+        # ★대조군의 파손은 **정상 결과**다 — 그것이 이 군을 두는 이유다(직렬화가 없다).
+        #   그런데 종전 이 줄은 맨몸 `json.loads` 라, 대조군이 자기 파일을 이어붙이면 검체가
+        #   **판정이 아니라 traceback 으로 죽었다**(CI 적색 `JSONDecodeError: Extra data:
+        #   line 1 column 52`). 위 ⓒ와 **같은 결함의 두 번째 인스턴스**였다.
+        #   ★이 서명은 settings.json 에서는 나올 수 없다: `_settings_rmw` 는 `indent=2` 로 써서
+        #     1행이 여는 중괄호 하나다. 대조군 문서는 마크 N개일 때 `8N+11` 바이트라 이어붙은
+        #     다음 열이 `8N+12` 이고 **N=4 → 44 · N=5 → 52** 다 — CI 가 본 그 숫자다.
+        #   (cherry-pick -x e1ae6ce · W-A)
+        nraw = _read(naive)
+        try:
+            nmarks = (json.loads(nraw or "{}") or {}).get("marks") or []
+        except ValueError as _nje:
+            # 파손 = lost update 보다 **더 강한** 무직렬화 증거다. 검출로 센다(크래시 금지).
+            _nev = os.path.join(tempfile.gettempdir(),
+                                "h-conc-3-naive-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_nev, "w", encoding="utf-8") as _f:
+                    _f.write(nraw)
+            except OSError:
+                _nev = "(증거 보존 실패)"
+            notes.append("음성 대조군: 무직렬화 RMW 가 **파일을 이어붙였다**(%s · %d바이트 · "
+                         "자식 비정상종료 %d/4 · 증거=%s) — lost update 보다 강한 검출"
+                         % (_nje, len(nraw), ndied, _nev))
+        else:
+            need(len(nmarks) < 4 * 6 or ndied > 0,
+                 "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
+                 "(marks=%d · 자식 비정상종료 0) — 위 GREEN 은 검출력 미확인" % len(nmarks))
+            notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출(자식 비정상종료 %d/4)"
+                         % (4 * 6 - len(nmarks), 4 * 6, ndied))
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
     calib = "skip(no-git)"
     if old is not None:
