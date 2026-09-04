@@ -8838,6 +8838,143 @@ mod tests {
         );
     }
 
+    /// ★FLAKE-DEADMAN-1 규명(master C4 전 필수 · 2026-09-05) — **PTY 자식은 락 fd 를
+    /// 상속하지 않는다.**
+    ///
+    /// ## 무엇을 가르는 실험인가
+    /// `deadman::tests::flock_reacquire_after_holder_release` 와 `cys.rs` 의 doctor flock 검체가
+    /// 같은 서명으로 간헐 적색이었다: **홀더가 놓은 직후의 재획득이 EWOULDBLOCK**. 주인님이
+    /// 지목한 최악 가설은 '자식 프로세스가 락 fd 를 상속해(CLOEXEC 누락) 부모가 놓은 뒤에도
+    /// 락이 살아 있다' 이고, 그것이 참이면 검체 문제가 아니라 **프로덕션 락 누수**다.
+    ///
+    /// 러스트 `File` 은 기본 `O_CLOEXEC` 이라 그 경로로는 안 샌다는 것이 정설이지만, 이
+    /// 저장소는 **PTY 를 낳는다** — PTY 스폰은 fd 를 수동으로 다루는 구현이 많아 CLOEXEC 이
+    /// 빠질 수 있는 현실적 경로다. 그래서 이 저장소가 실제로 쓰는 경로(`create_surface`)로
+    /// 직접 잰다: 락 획득 → PTY 자식 스폰 → 부모 fd drop → 새 fd 로 재획득.
+    ///
+    /// 재획득이 실패하면 상속이 실재한다(C4 블로커). 성공하면 그 가설은 기각되고
+    /// FLAKE-DEADMAN-1 은 검체 격리 계급으로 내려간다. 어느 쪽이든 열린 질문 하나가 닫힌다.
+    ///
+    /// ★실험의 검출력을 함께 잰다: 자식이 실제로 떴는지(pid 생존) 확인하지 않으면, 스폰이
+    /// 조용히 실패한 트리에서도 초록이 나온다 — 아무것도 재지 않은 초록이다.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_pty_child_does_not_inherit_the_lock_fd() {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-fdinherit-{:x}-{:x}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("cys.lock");
+        std::fs::write(&lock, b"1").unwrap();
+
+        // ① 부모가 락을 쥔다.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "전제 실패 — 부모가 락을 잡지 못했다"
+        );
+
+        // ② 락을 쥔 채 PTY 자식을 낳는다(이 저장소가 실제로 하는 그 행위).
+        let daemon = isolated_daemon();
+        let pane = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("PTY 자식 스폰 실패 — 이 실험은 자식이 실제로 떠야 성립한다");
+        let child = pane.pid;
+        daemon.surfaces.lock().unwrap().insert(pane.id, pane.clone());
+        // ★검출력 자기검증 — 자식이 살아 있어야 '상속했다면 락이 남는다' 가 성립한다.
+        assert!(
+            child > 0 && unsafe { libc::kill(child as libc::pid_t, 0) } == 0,
+            "자식이 살아 있지 않다(pid={child}) — 상속 여부를 잴 수 없는 무측정이다"
+        );
+
+        // ③ 부모가 fd 를 놓는다. ④ 새 fd 로 재획득한다.
+        drop(holder);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let errno = std::io::Error::last_os_error();
+        drop(contender);
+        unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rc, 0,
+            "★PTY 자식이 락 fd 를 상속했다 — 부모가 놓았는데 락이 살아 있다(errno={errno}). \
+             이것은 검체 격리 문제가 아니라 **프로덕션 락 누수**다(C4 블로커)"
+        );
+    }
+
+    /// ★위 실험의 **검출력 증명**(양성 대조군) — 일부러 상속시키면 반드시 잡혀야 한다.
+    ///
+    /// 위 검체가 초록인 것이 '상속이 없다' 인지 '이 측정법이 아무것도 못 잰다' 인지는 그것만으로
+    /// 갈리지 않는다. 이 세션이 반복해 만난 계급이다 — 그래서 `dup2` 로 CLOEXEC 을 지운 fd 를
+    /// 자식에게 **일부러 물려주고**, 부모가 놓은 뒤 재획득이 **실패하는지** 잰다. 여기서 실패가
+    /// 나와야 위 검체의 초록이 비로소 '상속 없음' 이라는 뜻을 갖는다.
+    #[cfg(unix)]
+    #[test]
+    fn the_fd_inheritance_probe_can_actually_detect_inheritance() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-fdctl-{:x}-{:x}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("cys.lock");
+        std::fs::write(&lock, b"1").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "전제 실패 — 부모가 락을 잡지 못했다"
+        );
+        let raw = holder.as_raw_fd();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // `dup2` 는 새 fd 의 CLOEXEC 을 지운다 — exec 를 넘어 자식이 그 기술자를 물려받는다.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("대조군 자식 스폰 실패");
+        drop(holder);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        drop(contender);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(
+            rc, 0,
+            "일부러 상속시킨 fd 를 쥔 자식이 있는데 재획득이 성공했다 — 이 측정법은 상속을 \
+             탐지하지 못한다. 그렇다면 위 검체의 초록은 '상속 없음' 이 아니라 **무측정**이다"
+        );
+    }
+
     /// ★결함#6-b 예약어 핀 — `owner` 는 데몬이 **도출**하는 신원 등급이지 pane 이 자칭할 수
     /// 있는 역할이 아니다. 자칭이 열리면 부서 ACL 첫 줄 `{"from":"owner","to":"*","allow":true}`
     /// 가 그 pane 에게 그대로 열려 '워커 직접 조향 차단'이 무력화된다(claim_role·create 대칭).

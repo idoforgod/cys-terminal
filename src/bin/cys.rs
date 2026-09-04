@@ -22541,7 +22541,17 @@ mod tests {
         // 홀더 사라짐 + 기록 pid 사망 → 3중 부정 충족 → 제거.
         std::fs::write(&lock, b"999999").unwrap();
         let item = diag_orphan_socket(&ctx, true);
-        assert_eq!(item.status, DiagStatus::Ok);
+        // ★판독 가능하게(2026-09-05): 이 단언이 간헐로 깨졌을 때 `left: Warn / right: Ok` 만
+        //   남아 **어느 Warn 갈래인지** 알 수 없었다(락 미획득인지 · 홀더 pid 미기재인지 ·
+        //   살아있는 홀더 판정인지). 갈래마다 `detail` 문면이 다르므로 그것을 함께 싣는다 —
+        //   다음 재현에서 원인 추론을 처음부터 다시 하지 않아도 된다.
+        assert_eq!(
+            item.status,
+            DiagStatus::Ok,
+            "3중 부정 충족인데 Ok 가 아니다 — 갈래 판독: {:?} / detail={:?}",
+            item.status,
+            item.detail
+        );
         assert!(!ctx.socket_path.exists(), "홀더 부재 확정 시에만 제거");
         assert!(lock.exists(), "소켓 진단도 락 파일은 절대 unlink 하지 않는다");
         let _ = std::fs::remove_dir_all(&base);
