@@ -85,6 +85,44 @@ BIN_DIR = os.path.dirname(TESTS_DIR)
 PACK_DIR = os.path.dirname(BIN_DIR)
 HOOKS_DIR = os.path.join(PACK_DIR, "hooks")
 REPO_DIR = os.path.dirname(PACK_DIR)          # 레포 체크아웃일 때만 유효(배포 팩은 무의미)
+
+_GIT_CHECKOUT = None          # _is_git_checkout() 1회 판정 캐시(환경 질의라 런 중 불변)
+
+
+def _is_git_checkout():
+    """REPO_DIR 이 **레포 체크아웃의 뿌리**인가 — 배포 팩과 가르는 이 파일의 단일 술어.
+
+    ★왜 술어 하나인가: 종전엔 이 판정이 7곳에 손으로 흩어져 있었고 그중 일부만 고쳐졌다.
+      `_git_show`(:312)는 worktree 를 인정하도록 이미 고쳐졌는데, 그것을 부르는 호출부들이
+      앞에서 `isdir` 로 막고 있어 **수리가 도달하지 못했다**. 판정이 흩어지면 클래스가
+      반만 닫힌다 — 그래서 한 곳으로 모은다.
+    ★worktree 의 `.git` 은 디렉터리가 아니라 gitdir 포인터 **파일**이다. `isdir` 로만 보면
+      워크트리에서 이 판정이 거짓이 되어, 계측 타당성 대조가 조용히 생략되거나(검체는 그대로
+      PASS · detail 에 `계측검증=skip(no-git)` 만 남는다) 검증 인프라 검체가 통째로 Skip 된다.
+      아무도 재지 않은 채 초록이 나는 자리이고, 실제로 그 공백이 회귀 1건을 놓쳤다(2026-09-04).
+    ★`--show-toplevel` 을 쓰고 `--is-inside-work-tree` 를 쓰지 **않는** 이유: 후자는 REPO_DIR 이
+      **무관한 상위 레포 안에** 놓이기만 해도 참이다($HOME 을 dotfiles 레포로 쓰는 흔한 구성의
+      `~/.cys` 배포 팩이 그렇다). 그러면 Skip 이어야 할 자리가 "레포인데 파일이 없다 = 삭제"
+      로 읽혀 **Fail 로 뒤집힌다** — 판정 의미가 바뀐다. 우리가 묻는 것은 '어딘가 레포 안인가'
+      가 아니라 '**REPO_DIR 이 그 레포의 뿌리인가**' 이므로 toplevel 동일성을 요구한다.
+    ★git 부재·비레포·타임아웃은 예외가 아니라 정상 갈래다 — `.git` 실재 여부로 폴백한다
+      (worktree 의 포인터 파일도 인정하므로 `isdir` 이 아니라 `exists`).
+    """
+    global _GIT_CHECKOUT
+    if _GIT_CHECKOUT is not None:
+        return _GIT_CHECKOUT
+    verdict = None
+    try:
+        r = subprocess.run(["git", "-C", REPO_DIR, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            verdict = os.path.realpath(r.stdout.strip()) == os.path.realpath(REPO_DIR)
+    except Exception:      # noqa: BLE001 — git 부재·타임아웃은 정상 갈래(아래 폴백)
+        verdict = None
+    if verdict is None:
+        verdict = os.path.exists(os.path.join(REPO_DIR, ".git"))
+    _GIT_CHECKOUT = verdict
+    return verdict
 PY = sys.executable or "python3"
 # ★bash 단일 해소(2026-08-10 W-A · run 31396459407/31396849323 근저원인): 네이티브 Windows
 #   python 의 CreateProcess 는 PATH 탐색 **이전에** System32 를 뒤져 WSL 스텁 bash.exe 를
@@ -3627,7 +3665,7 @@ def h_win_5():
 
     # ── 계측기 자기검증: 같은 탐지기가 구 코드에서는 FIRE 해야 한다 ──
     calib = "skip(no-git)"
-    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if _is_git_checkout():
         r = _run(["git", "-C", REPO_DIR, "grep", "-ln", "python3", CALIBRATION_REF,
                   "--", "cysjavis-pack/hooks/"], timeout=60)
         old_files = [l.split(":", 1)[1] for l in r.stdout.splitlines() if ":" in l]
@@ -5945,7 +5983,7 @@ def h_deliver_1():
 
     # ★계측 타당성: 기준 트리에는 정본도 신규 키도 없다(탐지기가 구 결함에서 FIRE 한다).
     calib = "skip(no-git)"
-    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if _is_git_checkout():
         need(_git_show(frg_rel) is None,
              "계측 타당성 실패: 기준 트리에 이미 관문 정본이 있다면 K-1 은 결함이 아니다")
         old_aj = _git_show(os.path.join("cysjavis-pack", "agents.json"))
@@ -6216,7 +6254,7 @@ def h_gate_sot_1():
     notes.append("팩 python 사본 0건(문면 %d종 대조)" % len(sot_needles))
 
     calib = "skip(no-git)"
-    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if _is_git_checkout():
         need(_git_show(frg_rel) is None,
              "계측 타당성 실패: 기준 트리에 이미 SOT 가 있다면 S-1 은 결함이 아니다")
         calib = "기준 트리 SOT 부재 확인"
@@ -9771,7 +9809,7 @@ def h_ready_13():
 
     # 계측 타당성 — 기준 트리에는 이 판정부가 없었다(있었다면 U-13 은 결함이 아니다)
     calib = "skip(no-git)"
-    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if _is_git_checkout():
         need(_git_show(rel) is None, "계측 타당성 실패: 기준 트리에 이미 판정부가 있다")
         old_cli = _git_show(os.path.join("src", "bin", "cys.rs"))
         if old_cli is not None:
@@ -9972,7 +10010,7 @@ def h_killchain_1():
     # 킬체인의 형태를 갖고 있었다. 기준 트리에서 결함이 재현되지 않으면 이 검체는 '원래 안 나는
     # 일을 안 난다고 확인' 하는 공허한 검사이므로, 재현 실패는 **적색**이다.
     calib = "skip(no-git)"
-    if os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if _is_git_checkout():
         need(_git_show(rel) is None, "계측 타당성 실패: 기준 트리에 이미 가드 판정부가 있다")
         old_cli = _git_show(os.path.join("src", "bin", "cys.rs"))
         if old_cli is not None:
@@ -11910,7 +11948,9 @@ def _u26_gate(*paths):
                        "않는다**. 이것은 통과가 아니라 미측정이므로 이 런은 GREEN 을 잃고 "
                        "exit 2 가 된다(헤더 '미측정 축 계약')."
                        % (U26_OFF_ENV, os.environ.get(U26_OFF_ENV)))
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    # 판정은 `_is_git_checkout()` 단일 술어가 한다(worktree 의 .git 은 포인터 파일 — 그
+    # 근거와 rev-parse 선택 이유는 그 술어의 docstring 에 모아 두었다).
+    if not _is_git_checkout():
         raise Skip("레포 체크아웃이 아니다(배포 팩) — 검증 인프라 검체 적용 불가")
     for p in paths:
         need(os.path.exists(p),
@@ -12421,7 +12461,7 @@ def h_doc_keychain_1():
     ★설계 U-8 이 이 게이트를 요구했으나 만들어지지 않았고, 그래서 정정판이 세 곳에만 착지하고
       네 번째(agents.json)가 남았다. 문서 정합은 사람 눈으로 세 번 실패한 축이다(레인 대조
       게이트의 교훈과 같은 계급) — 네 벌을 **동시에** 단언하는 기계만이 막는다."""
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    if not _is_git_checkout():
         raise Skip("레포 체크아웃이 아니다(배포 팩) — 문서 4벌 정합 검체 적용 불가")
     texts, v = {}, []
     for rel, why in _U28_DOC_SITES:

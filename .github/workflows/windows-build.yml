@@ -110,6 +110,16 @@ jobs:
           fi
           ls -la "$RT/git/bin/bash.exe"
           du -sh "$RT" "$RT/git" "$RT/python" || true
+          # ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1 · release.yml 과 동일 절차) ──
+          # 이 레인이 매니페스트의 **실기 검증처**다: 아래 자기완결 검증 스텝이 실제 설치본 트리와
+          # 이 파일을 대조해, "소스 트리 해시가 NSIS 를 거쳐 설치본까지 살아남는가"를 측정한다.
+          # ★PYTHONUTF8=1 — 러너 기본 stdout 인코딩(cp1252/cp949)에 `✓` 가 없어 성공 메시지가
+          #   UnicodeEncodeError 로 죽고, 그 exit 1 이 이 도구 계약의 '불일치'와 겹쳤다
+          #   (2026-09-04 windows-build 실사고 · 도구 자신도 _widen_stdio 로 닫았다 — 이건 2층).
+          PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+            --root "$RT" --out src-tauri/resources/runtime-manifest.json \
+            --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
+            --source win-src
 
       - name: Build Windows x64 (Tauri → NSIS setup.exe)
         shell: bash
@@ -890,6 +900,33 @@ jobs:
           # ★본문을 일부러 재들여쓰지 않는다 — 재들여쓰기는 60~90줄짜리 공백 diff 를 만들어 행 번호
           #   참조와 리뷰를 통째로 무효화한다(PowerShell 은 들여쓰기에 의미가 없다).
           try {
+          # ★annotation 이스케이프. GitHub 워크플로 명령은 `%`·개행을 이스케이프해야 본문이
+          #   잘리지 않는다(`%` 를 **먼저** 바꾼다 — 순서를 뒤집으면 %0A 의 % 가 다시 먹힌다).
+          function Esc([string]$s) { $s -replace '%','%25' -replace "`r",'' -replace "`n",'%0A' }
+          # ★관측 프로브 2종. **진단은 어떤 경우에도 판정을 죽이지 않는다** — 이 스텝은
+          #   `$ErrorActionPreference='Stop'` 이라 프로브 한 줄이 던지면 T4-15 가 진단 때문에
+          #   적색이 된다. 그래서 전부 try/catch 로 감싸 실패를 **문자열로** 돌려준다.
+          #   ⚠진짜 핸들 소유자 열거는 sysinternals handle.exe 가 필요한데 러너에 없다.
+          #     여기서는 측정 가능한 근사만 적는다: ①그 파일을 **이미지로 실행 중**인 프로세스
+          #     (이미지락의 주인) ②실시간 검사 프로세스 생존(AV 가 순간 핸들을 쥐는 전형).
+          #     `Get-Process.Path` 는 보호 프로세스에서 던지므로 CIM(데이터 질의)을 쓴다.
+          function ImageHolders([string]$path) {
+            try {
+              $o = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $path) } |
+                     ForEach-Object { "{0}(pid {1})" -f $_.Name, $_.ProcessId })
+              if (-not $o) { return "none" }
+              return ($o -join ",")
+            } catch { return ("probe-failed: " + $_.Exception.Message) }
+          }
+          function AvProcs() {
+            try {
+              $o = @(Get-Process -Name MsMpEng,MpDefenderCoreService,MpCmdRun -ErrorAction SilentlyContinue |
+                     ForEach-Object { "{0}(pid {1})" -f $_.ProcessName, $_.Id })
+              if (-not $o) { return "none" }
+              return ($o -join ",")
+            } catch { return ("probe-failed: " + $_.Exception.Message) }
+          }
           # ★설치 트리는 앞의 '자기완결 검증' 스텝이 계약 경로(%LOCALAPPDATA%\cys)로 확정하고
           #   버전 마커로 동일성을 못 박은 값을 그대로 받는다(R1 codex #9 · master 판정 2026-09-04).
           #   재귀 검색으로 되돌리지 마라 — 잔존 설치를 집어 초록이 거짓이 된다.
@@ -928,7 +965,11 @@ jobs:
           $fs = [System.IO.File]::Open($cysd, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
           try {
             # ③ 잠긴 채 무인 업그레이드 — **거부(exit 4)가 정답**이다(성공 주장 = P6 위반)
+            #   ★소요를 잰다: 이 결함은 간헐(완주 10런 중 4 = 40%)이라 **성공·실패 런의 소요
+            #     분포**가 원인 후보(핸들 해제 지연·AV 검사 창)를 가르는 1차 신호다.
+            $swA = [System.Diagnostics.Stopwatch]::StartNew()
             $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+            $swA.Stop(); $msA = $swA.ElapsedMilliseconds
             $exit4 = ($ri.ExitCode -eq 4)
             $failMark = Join-Path $dir 'cys-install-failure.txt'
             $hasMark = Test-Path $failMark
@@ -948,16 +989,34 @@ jobs:
             $lockAlive = -not $lock.HasExited
             # 콜백 정리 확인: 정식 동작본 확인 갈래가 스테이징 .new 를 지웠다(§1 '콜백' 삭제자)
             $noNew = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
-            $ok1 = $exit4 -and $hasMark -and $l1Ok -and $unrecEmpty -and $rbEmpty -and $nuOk -and $prOk -and $cysOld -and $cysdOld -and $lockAlive -and $noNew
-            $res1 = ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new정리={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
+            # ★`$noNew` 는 **단언에서 뺀다**(2026-09-04 master 판정 · 계약 정합).
+            #   거부 갈래의 `.new` 잔존은 성문 계약이 **정상**이라 부른다 —
+            #   `docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:243-244`
+            #   "cys.new.exe 가 남아 있어도 정상이다(거부된 배치의 스테이징 잔존 — NSIS-CONTRACT §1).
+            #    다음 완주가 스스로 지우고 새로 추출하므로(`CYS_PLACE` ②) 손대지 않아도 된다."
+            #   구현도 그렇다: `src-tauri/nsis-hooks.nsh:205` 가 추출 직전 멱등 `Delete`,
+            #   실패 시 `:207` `placement refused - stale .new.exe is locked` 로 유음 실패.
+            #   ⚠종전 단언은 `CYS_ABORT_RESCUE` 를 '.new 삭제자' 로 오독한 데서 나왔다.
+            #     계약 `:105-107` 에서 콜백의 역할은 `.new`(신본)→prev 순으로 **자리를 닫는 것**이고
+            #     `.new` 는 그 **승격 재료**다. 즉 단언이 성문 규범과 **반대 방향**을 요구했다.
+            #   값은 버리지 않는다 — 아래 RESULT/OBS 에 **관측값으로 계속 남긴다**(간헐 인과 추적용).
+            $ok1 = $exit4 -and $hasMark -and $l1Ok -and $unrecEmpty -and $rbEmpty -and $nuOk -and $prOk -and $cysOld -and $cysdOld -and $lockAlive
+            $res1 = ("T4-15a RESULT: {0}  배타 핸들 거부 (exit={1}[4 기대] · 실패파일={2} · 1행={3} · unrec空={4} · rb空={5} · not-updated[cys]={6} · refused[cysd]={7} · cys구본={8} · cysd구본={9} · 프로세스생존={10} · .new잔존정리[관측·단언아님]={11})" -f ($(if($ok1){'PASS'}else{'FAIL'})), $ri.ExitCode, $hasMark, $l1Ok, $unrecEmpty, $rbEmpty, $nuOk, $prOk, $cysOld, $cysdOld, $lockAlive, $noNew)
             Write-Host $res1
+            # ★관측값(성공·실패 공통). master 지시 2026-09-04: 성공 런에서도 boolean 을 남겨야
+            #   40% 간헐을 기다리지 않고 판정이 확정된다. 수준만 다르다(성공=notice · 실패=error).
+            $obsA = ("T4-15a OBS: 시도=①잠금상태(거부 기대) · 설치기 소요={0}ms · 잠금핸들=pwsh(FileShare.Read on cysd) · " +
+                     "cys.exe 이미지보유={1} · cysd.exe 이미지보유={2} · 실시간검사={3} · 스탠드인 pid={4} 생존={5}") -f `
+                    $msA, (ImageHolders $cys), (ImageHolders $cysd), (AvProcs), $lock.Id, (-not $lock.HasExited)
+            Write-Host $obsA
+            if ($ok1) { Write-Host ("::notice title=T4-15a::" + (Esc ($res1 + "`n" + $obsA))) }
             if (-not $ok1) {
               # ★실패 사유를 annotation 채널로 올린다(2026-09-04 진단 배선). 이 스텝은 이미 11개
               #   판정 필드를 전부 찍지만 그건 **로그**뿐이고, 이 저장소의 CI 로그는 토큰 없이
               #   읽을 수 없다(익명 403). 그래서 3레인 동시 실패가 "exit code 1" 한 줄로만
               #   관측됐다 — 진단 정보가 부족한 게 아니라 **읽히는 채널에 없었다**.
               #   실패했을 때만 올린다(성공 런의 annotation 을 더럽히지 않는다).
-              $d1 = $res1
+              $d1 = $res1 + "`n" + $obsA
               if ($hasMark) { $d1 += "`n-- cys-install-failure.txt --`n" + ((Get-Content $failMark) -join "`n") }
               $rem = (Get-ChildItem (Join-Path $dir '*') -File -Include 'cys*.exe','cysd*.exe' -ErrorAction SilentlyContinue |
                       ForEach-Object { "{0} {1}B" -f $_.Name, $_.Length }) -join "`n"
@@ -969,20 +1028,36 @@ jobs:
             $fs.Close()
           }
           # ④ 치유: 핸들 해제 후 재실행 — 계약 안내문의 기계 검증(스탠드인 프로세스는 계속 실행 중)
+          $swB = [System.Diagnostics.Stopwatch]::StartNew()
           $ri2 = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
           $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  -ErrorAction SilentlyContinue | Select-Object -First 1)
           $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1)
           if (-not $srcCys -or -not $srcCysd) { Die "T4-15: 빌드 사이드카(src-tauri/binaries)를 못 찾음" }
+          $swB.Stop(); $msB = $swB.ElapsedMilliseconds
+          $srcCys  = (Get-ChildItem 'src-tauri/binaries/cys-*.exe'  | Select-Object -First 1)
+          $srcCysd = (Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1)
           $healedCys  = (ShaOf $cys)  -eq (ShaOf $srcCys.FullName)
           $healedCysd = (ShaOf $cysd) -eq (ShaOf $srcCysd.FullName)
           $noMark = -not (Test-Path (Join-Path $dir 'cys-install-failure.txt'))
           $marker = Join-Path $dir 'cys-installed-version.txt'
           $markerOk = (Test-Path $marker) -and ((Get-Content $marker -Raw) -match [regex]::Escape($expVer))
           $lockAlive2 = -not $lock.HasExited
-          $ok2 = ($ri2.ExitCode -eq 0) -and $healedCys -and $healedCysd -and $noMark -and $markerOk -and $lockAlive2
-          $res2 = ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2)
+          # ★`.new` 잔존 0 은 **여기서** 단언한다(2026-09-04 master 판정 · 계약 정합).
+          #   계약이 잔존 0 을 요구하는 곳은 **성공 배치**다 —
+          #   `docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:122`
+          #   "`*.new.exe` … ★비어 있어야 한다(성공 배치는 rename 으로 소멸 + Delete 벨트 ·
+          #    `CYS_PLACE` ⑧ `cys_pl_commit`)" · `:125-126` PASS 조건에도 "잔존 0" 명기.
+          #   ④ 재실행 치유는 exit 0 의 **성공 배치**이므로 이 단언의 정당한 자리가 여기다.
+          $noNew2 = -not ((Test-Path (Join-Path $dir 'cys.new.exe')) -or (Test-Path (Join-Path $dir 'cysd.new.exe')))
+          $ok2 = ($ri2.ExitCode -eq 0) -and $healedCys -and $healedCysd -and $noMark -and $markerOk -and $lockAlive2 -and $noNew2
+          $res2 = ("T4-15b RESULT: {0}  재실행 치유 (exit={1}[0 기대] · cys신본={2} · cysd신본={3} · 실패파일 삭제={4} · 버전마커={5} · 프로세스생존={6} · .new잔존0[계약:122]={7})" -f ($(if($ok2){'PASS'}else{'FAIL'})), $ri2.ExitCode, $healedCys, $healedCysd, $noMark, $markerOk, $lockAlive2, $noNew2)
           Write-Host $res2
-          if (-not $ok2) { Write-Host ("::error title=T4-15b::" + (Esc $res2)) }   # 위 T4-15a 와 같은 이유(로그 403)
+          $obsB = ("T4-15b OBS: 시도=②핸들해제후(성공 기대) · 설치기 소요={0}ms · cys.exe 이미지보유={1} · " +
+                   "cysd.exe 이미지보유={2} · 실시간검사={3} · 스탠드인 pid={4} 생존={5}") -f `
+                  $msB, (ImageHolders $cys), (ImageHolders $cysd), (AvProcs), $lock.Id, (-not $lock.HasExited)
+          Write-Host $obsB
+          if ($ok2)      { Write-Host ("::notice title=T4-15b::" + (Esc ($res2 + "`n" + $obsB))) }
+          if (-not $ok2) { Write-Host ("::error title=T4-15b::" + (Esc ($res2 + "`n" + $obsB))) }   # 위 T4-15a 와 같은 이유(로그 403)
           # 정리(이후 스텝 오염 방지): 잠금 해제 → 스탠드인 대피 잔해 제거
           try { $lock.Kill($true) } catch {}
           Start-Sleep 1

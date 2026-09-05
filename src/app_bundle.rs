@@ -54,6 +54,20 @@ pub const PYTHON_RUNTIME: &str = "Resources/runtime/python/bin/python3";
 pub const PACK_TARBALL: &str = "Resources/pack.tar.gz";
 /// 팩 매니페스트(임베드 권위 SOT).
 pub const PACK_MANIFEST: &str = "Resources/pack-manifest.json";
+/// 동봉 런타임 봉인 매니페스트(부트 v2 명세 §2-10 G5 · `runtime/**` 전 항목 sha256·심링크 대상).
+/// 산출은 `scripts/build-macos-signed.sh` 가 **.app 트리에서** 뜬다(서명 직전 · 그 자리라야
+/// dedup·심링크 복원까지 끝난 바이트가 잡힌다). 판독기는 `cysjavis-pack/bin/javis_runtime_seal.py`.
+///
+/// ★`VerifySpec::installed()` 에 **일부러 넣지 않았다**. 이 파일은 v0.14.30 부터 실리므로,
+///   필수 리소스로 올리면 이미 설치된 구버전 번들이 전부 `ResourceMissing` → "번들 손상" 토스트로
+///   뒤집힌다(멀쩡한 기계를 고장으로 보고하는 회귀). 명세도 상수 추가까지만 요구한다 —
+///   봉인 판정의 주체는 mac 에선 코드서명(C76), Windows 에선 이 매니페스트를 읽는 preflight 다.
+///   구버전 무회귀가 확인된 뒤 필수 목록 승격을 별도 결정으로 다루면 된다.
+///
+/// ★Windows 는 이 경로 문자열을 쓰지 않는다. 이 상수는 `Contents/` 기준 macOS 번들 레이아웃
+///   전용이고(위 형제 상수들과 같은 계약), Windows 설치본은 `Contents` 세그먼트 자체가 없어
+///   설치 루트에서 exe_dir 기준으로 해소된다 — 그쪽 배선은 NSIS bundle.resources 가 담당한다.
+pub const RUNTIME_MANIFEST: &str = "Resources/runtime-manifest.json";
 
 /// 번들 결손의 갈래. **"무엇이 없는가"를 파일 단위로 말할 수 있어야** 사용자에게 진짜 안내가 된다
 /// ("손상되었습니다" 한 줄은 안내가 아니다).
@@ -1273,6 +1287,25 @@ mod tests {
         assert!(s.resources.contains(&PYTHON_RUNTIME.to_string()), "동봉 python");
         assert!(!s.codesign, "기동 자기점검은 codesign 을 돌리지 않는다(doctor app-seal 담당)");
         assert!(VerifySpec::release().codesign, "교체 게이트는 봉인까지 본다");
+    }
+
+    #[test]
+    fn runtime_manifest_is_shipped_but_deliberately_not_a_required_resource() {
+        // 부트 v2 §2-10 G5. 두 가지를 동시에 못박는다 —
+        //  ⓐ 경로 계약: 형제 상수들과 같은 `Resources/` 기준이고 **runtime/ 안이 아니다**.
+        //     안에 두면 자기 자신을 해시 범위에 넣는 자기참조가 된다.
+        //  ⓑ **의도된 부재**: 필수 리소스 목록에 넣지 않는다. v0.14.30 부터 실리는 파일이라
+        //     필수로 올리는 순간 이미 설치된 구버전 번들이 전부 ResourceMissing 으로 뒤집혀
+        //     멀쩡한 기계에 "번들 손상" 을 띄운다. 나중에 누가 "빠졌네" 하고 넣는 것을 막는
+        //     핀이다 — 승격하려면 구버전 무회귀를 먼저 증명하고 이 테스트를 함께 고쳐라.
+        assert!(RUNTIME_MANIFEST.starts_with("Resources/"), "Contents/ 기준 상대 경로 계약");
+        assert!(!RUNTIME_MANIFEST.starts_with("Resources/runtime/"),
+                "매니페스트가 자기 해시 범위(runtime/) 안에 들어가면 자기참조가 된다");
+        let s = VerifySpec::installed();
+        assert!(!s.resources.contains(&RUNTIME_MANIFEST.to_string()),
+                "의도된 부재 — 필수로 올리면 구버전 설치본이 전부 '손상'으로 오보된다");
+        assert!(!VerifySpec::release().resources.contains(&RUNTIME_MANIFEST.to_string()),
+                "교체 게이트도 같다 — 구 번들을 정당하게 교체하지 못하게 된다");
     }
 
     #[test]

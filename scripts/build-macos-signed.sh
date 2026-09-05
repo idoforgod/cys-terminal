@@ -198,6 +198,38 @@ APP_PYC2=$({ find "$APP/Contents/Resources/runtime" -name '*.pyc' 2>/dev/null ||
   echo "  ✗ dedup·링크복원 후 .pyc 개수 변동: ${SRC_PYC} → ${APP_PYC2} (봉인 무회귀 위반)" >&2; exit 1; }
 echo "  ✓ SEAL-2 무회귀: .pyc ${APP_PYC2}개 유지 (dedup·링크복원이 선컴파일 봉인을 건드리지 않음)"
 
+# ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1) ─────────────────────────────
+# ★자리가 전부다. 여기는 런타임 트리가 **바이트 확정되는 유일한 창**이다:
+#   위쪽 dedup(:176)·링크복원(:190)이 Resources 를 마지막으로 바꾼 뒤이고, 아래 재봉인(:~215)
+#   전이다. 서명 뒤에 쓰면 봉인이 깨지고(Gatekeeper 차단), 그 전 어디에 써도 낡는다 —
+#   ⓐprep 시점 해시는 :117-133 의 inside-out 재서명이 Mach-O 바이트를 바꿔 무효
+#   ⓑTauri 번들러가 심볼릭링크를 역참조(upstream #13219)해 구조가 달라짐
+#   ⓒdedup·복원이 .app 안에서 157 경로를 다시 링크로 되돌림.
+#   즉 **소스 트리(src-tauri/runtime)가 아니라 .app 트리에서** 떠야 한다(2026-09-04 실측 확정).
+# ★번들 밖 python 강제: cys pane 은 동봉 runtime 을 PATH 선두에 물려 `command -v python3` 가
+#   .app 안 python 으로 해소될 수 있다. .app 안 바이너리를 한 번이라도 exec 하면 macOS 가 번들
+#   보호를 걸어 SIGKILL·codesign "Operation not permitted" 를 만든다(2026-08-01 실측 ·
+#   precompile-bundled-python.sh:45-49). release-gate-gatekeeper.sh 의 $GATE_PY 선택과 동형이다.
+SEAL_PY=""
+for cand in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  real="$(readlink -f -- "$cand" 2>/dev/null || printf '%s' "$cand")"
+  case "$cand:$real" in *".app/"*) continue ;; esac
+  SEAL_PY="$cand"; break
+done
+[ -n "$SEAL_PY" ] || { echo "  ✗ 번들 밖 python3 없음 — runtime-manifest 산출 불가(측정 불능은 통과가 아니다)" >&2; exit 1; }
+echo "== runtime-manifest 산출 (설치 후 변조 검출용 · 서명 대상) =="
+"$SEAL_PY" cysjavis-pack/bin/javis_runtime_seal.py emit \
+  --root "$APP/Contents/Resources/runtime" \
+  --out  "$APP/Contents/Resources/runtime-manifest.json" \
+  --app-version "$VERSION" --source mac-app
+# 산출 직후 자기대조 — 쓰자마자 어긋나면 산출기가 고장 난 것이다(무음 통과 금지).
+"$SEAL_PY" cysjavis-pack/bin/javis_runtime_seal.py verify \
+  --root "$APP/Contents/Resources/runtime" \
+  --manifest "$APP/Contents/Resources/runtime-manifest.json" >/dev/null || {
+  echo "  ✗ 산출 직후 runtime-manifest 자기대조 실패 — 서명 중단" >&2; exit 1; }
+echo "  ✓ runtime-manifest 자기대조 통과 (이 파일은 아래 재봉인에 포함된다)"
+
 # dedup은 Resources를 바꿔 Tauri가 봉인한 외부 앱 서명을 깬다 → 외부 앱 서명만 재봉인(--force · ★--deep 금지).
 # 중첩 Mach-O(pre-sign된 runtime bin/git·Tauri가 서명한 sidecar/framework/메인바이너리)는 그대로 유효하다.
 echo "== dedup 후 외부 앱 서명 재봉인 (inside-out 유지·--deep 금지) =="

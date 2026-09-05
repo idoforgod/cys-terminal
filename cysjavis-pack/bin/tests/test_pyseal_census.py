@@ -214,6 +214,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   스텝 env 로 `PYTHONDONTWRITEBYTECODE: '1'` 을 실제로 건다(`:255`). 그 스텝이 Windows
     #   러너에서 python 을 호출하므로 봉인이 그 실행에 **적용된다**. 따라서 니들 보유는 정상이며
     #   제거 대상이 아니다(제거하면 그 레인만 봉인이 빠진다).
+    # ★2026-09-04 W-C C1 등재 — 동봉 런타임 봉인(runtime-manifest) 배선. **봉인 점검 결과**:
+    #   둘 다 **새 python 진입점이 맞다**(러너 python3 로 javis_runtime_seal.py 를 emit/verify
+    #   호출한다). 그래서 전 호출 지점에 봉인을 붙였다 — release.yml 은 두 호출 모두 인라인
+    #   `PYTHONDONTWRITEBYTECODE=1` 접두, windows-build.yml 은 emit 이 인라인 접두이고 설치본
+    #   대조 스텝은 step-level `env:` 로 건다. 봉인이 필요한 이유가 이 레인에서는 특히 구체적이다:
+    #   검증 대상이 **동봉 런타임 트리 자신**이라, 판독기가 그 트리 안에 __pycache__ 를 새로 쓰면
+    #   자기가 검사할 대상을 오염시켜 '추가 파일' 오탐을 만든다(SEAL-1 과 같은 계급).
+    ".github/workflows/release.yml",
     ".github/workflows/windows-build.yml",
     "cysjavis-pack/bin/tests/run_bootstrap_health.py",
     # ★2026-09-04 W-A A2 등재 — 훅 런처/본체 분할 검체. **봉인 점검 결과(등재 = 이 선언)**:
@@ -224,6 +232,11 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     "cysjavis-pack/bin/tests/test_org_audit.py",
     "cysjavis-pack/hooks/_lib.sh",
     "docs/RELEASE.md",
+    # ★2026-09-04 W-C 등재 — 사용자 대면 릴리스 노트. **봉인 점검 결과**: 진입점도 강제점도
+    #   아니다. python 을 한 번도 띄우지 않으며, 니들은 W-A A6(번들 파이썬 캐시 차단의 전 지점
+    #   회귀 테스트)를 사용자 언어로 설명하는 **산문 1줄**에만 있다. 등재 이유는 이 센서스가
+    #   확장자 기준 전수 스캔이라 산문 언급도 집합에 들어오기 때문이다(누락이 아니라 성격 표기).
+    "docs/RELEASE_NOTES_0.14.30.md",
     "docs/plans/v4-repair-spec.md",
     "scripts/deploy_gate.py",
     "scripts/installer-app/install-core.sh",

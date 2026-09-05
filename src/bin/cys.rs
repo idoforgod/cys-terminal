@@ -5112,6 +5112,10 @@ struct DoctorCtx {
     /// 자기 앱 번들 루트(`…/cys.app`). 번들 밖 실행(cargo run·비번들 설치)이면 None =
     /// 코드서명 봉인 검사 **판정 불가**(Skip). 테스트는 여기에 임시 번들을 주입한다.
     app_bundle: Option<std::path::PathBuf>,
+    /// 자기 실행 파일이 놓인 디렉터리(= 비번들 설치의 설치 루트 · Windows NSIS 는
+    /// `%LOCALAPPDATA%\cys`). `runtime-seal` 이 동봉 런타임 트리를 찾는 두 번째 후보다.
+    /// 해소 실패면 None = 그 후보를 보지 않는다(추측 경로를 만들지 않는다).
+    exe_dir: Option<std::path::PathBuf>,
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
@@ -6345,6 +6349,213 @@ fn diag_app_seal(ctx: &DoctorCtx) -> DiagItem {
     }
 }
 
+/// 동봉 런타임 봉인(`runtime-manifest.json`)이 실리기 시작한 버전. 이보다 낮은 설치본에
+/// 매니페스트가 없는 것은 정상이며 경고할 일이 아니다(거짓 경보 금지).
+const RUNTIME_SEAL_SINCE: &str = "0.14.30";
+/// 매니페스트 파일 이름. 번들 경로 상수(`cys::app_bundle::RUNTIME_MANIFEST`)의 꼬리와 같아야
+/// 한다 — 비번들 설치는 `Resources/` 접두가 없어 basename 만 필요하다(테스트가 동일성을 못박는다).
+const RUNTIME_MANIFEST_BASENAME: &str = "runtime-manifest.json";
+
+/// 동봉 런타임(`runtime/**`) 봉인 진단 — `app-seal`(코드서명)이 **macOS 전용**이라 비는 자리를
+/// 메운다. Windows 설치본에는 코드서명 봉인이 아예 없어, 설치 후 오염(대표 사례: 번들 안 node 로
+/// 한 `npm i -g`)을 잡을 축이 이 매니페스트 하나뿐이다.
+///
+/// ★왜 preflight C80 과 따로 있는가(레인 분리 · master 판정 D1 2026-09-04): 기계 preflight 는
+///   부팅을 막지 않아야 해서 파손을 WARN 으로만 적고 **"상세 진단은 `cys doctor`"** 로 넘긴다.
+///   그 넘김의 받는 자리가 여기다 — 여기까지 없으면 그 안내가 막다른 길이 된다. doctor 는
+///   사용자가 직접 부르는 진단이지 부트 게이트가 아니므로(부트 경로가 doctor exit 를 소비하는
+///   곳 0건 · 실측), 확증된 파손은 `app-seal` 과 같은 등급인 Fail 로 적는다.
+///
+/// ★판정은 결정론 도구에 위임한다 — `javis_runtime_seal.py verify` 의 exit **0=일치 / 1=불일치 /
+///   2=판정 불가**(R1 codex #7 에서 세운 계약). Rust 로 트리 순회·해시·심링크 규칙을 다시 짜면
+///   판독기가 둘이 되어 조용히 드리프트한다(그 드리프트를 막으려고
+///   `test_runtime_manifest_parity.py` 가 존재한다 — 여기서 사본을 만들면 그 검체가 무의미해진다).
+///
+/// 등급: Ok(무결) · Warn(봉인 탑재 버전인데 매니페스트가 없다 = 감지축 소실) ·
+///       Fail(확증된 파손) · Skip(대상 없음·구버전·판정 불가). 읽기 전용 — `--fix` 무관.
+fn diag_runtime_seal(ctx: &DoctorCtx) -> DiagItem {
+    let name = "runtime-seal";
+    let skip = |detail: String| DiagItem {
+        name,
+        status: DiagStatus::Skip,
+        detail,
+        action: String::new(),
+    };
+
+    // (매니페스트, runtime 트리) 후보 — 설치 형태별. preflight C80 `_find_runtime_seal_pair` 와
+    // 같은 순서다(mac 번들 → 설치 루트 → 설치 루트/resources).
+    let mut cands: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    if let Some(b) = ctx.app_bundle.as_ref() {
+        let res = b.join("Contents").join("Resources");
+        cands.push((res.join(RUNTIME_MANIFEST_BASENAME), res.join("runtime")));
+    }
+    if let Some(d) = ctx.exe_dir.as_ref() {
+        cands.push((d.join(RUNTIME_MANIFEST_BASENAME), d.join("runtime")));
+        cands.push((
+            d.join("resources").join(RUNTIME_MANIFEST_BASENAME),
+            d.join("runtime"),
+        ));
+    }
+    let pair = cands.iter().find(|(m, r)| m.is_file() && r.is_dir());
+    let Some((manifest, root)) = pair else {
+        // 매니페스트는 없는데 트리는 있는가 = 구버전 설치본(정상)인지 갈라야 한다.
+        let Some((_, root)) = cands.iter().find(|(_, r)| r.is_dir()) else {
+            return skip("동봉 런타임 트리 미발견(개발 빌드·비번들 설치) — 검사 대상 없음".into());
+        };
+        // 판독처는 **실행 중인 자기 바이너리의 버전**이다. 설치기가 바이너리와 런타임 트리를
+        // 한 벌로 넣으므로 이보다 직접적인 근거가 없다(preflight 는 남의 설치본을 보는 외부
+        // 스크립트라 Info.plist·버전 마커를 읽지만, doctor 는 그 설치본 자신이다).
+        let (Some(have), Some(since)) = (
+            cys::pack::parse_semver(&ctx.binary_version),
+            cys::pack::parse_semver(RUNTIME_SEAL_SINCE),
+        ) else {
+            return skip(format!(
+                "runtime-manifest 부재 + 자기 버전 판독 불가({}) — 판정 불가(통과가 아니다) · 트리: {}",
+                ctx.binary_version,
+                root.display()
+            ));
+        };
+        if have < since {
+            return skip(format!(
+                "runtime-manifest 부재 — 이 설치본({})은 봉인 도입(v{}) 이전이라 정상 · 트리: {}",
+                ctx.binary_version,
+                RUNTIME_SEAL_SINCE,
+                root.display()
+            ));
+        }
+        return DiagItem {
+            name,
+            status: DiagStatus::Warn,
+            detail: format!(
+                "runtime-manifest 부재 — 이 설치본({})은 봉인 탑재 버전(v{} 이상)인데 매니페스트가 \
+                 없다: 설치 후 runtime/** 변조를 잡을 축이 사라진 상태다(Windows 에는 코드서명 \
+                 봉인이 없어 이것이 유일한 축) · 트리: {}",
+                ctx.binary_version,
+                RUNTIME_SEAL_SINCE,
+                root.display()
+            ),
+            action: RUNTIME_SEAL_RECOVERY.into(),
+        };
+    };
+
+    let tool = ctx.pack_dir.join("bin").join("javis_runtime_seal.py");
+    if !tool.is_file() {
+        return skip(format!(
+            "판독기 부재({}) — 판정 불가 · `cys init-pack` 으로 팩을 복구하라",
+            tool.display()
+        ));
+    }
+    // 인터프리터: 동봉 python 우선(Windows 러너·사용자 기계에 `python3` 가 없는 경우가 흔하다),
+    // 없으면 PATH 의 python3. ★`cys::python_command` 가 PYTHONDONTWRITEBYTECODE 를 심어 준다 —
+    // 이게 없으면 판독 자체가 검사 대상 트리 안에 __pycache__ 를 써서 스스로를 오염시킨다(SEAL-1).
+    // ★후보를 순서대로 시도한다 — 동봉 python 이 있어도 실행 불가(권한·손상)일 수 있고, 그때
+    //   조용히 '판정 불가'로 접히면 이 축이 무력해진다. 첫 성공 스폰을 쓴다.
+    let bundled = if cfg!(windows) {
+        root.join("python").join("python3.exe")
+    } else {
+        root.join("python").join("bin").join("python3")
+    };
+    let mut pys: Vec<std::ffi::OsString> = Vec::new();
+    if bundled.is_file() {
+        pys.push(bundled.into_os_string());
+    }
+    pys.push("python3".into());
+    let mut last_err = String::new();
+    let mut spawned = None;
+    for py in &pys {
+        match cys::python_command(py)
+            .arg(&tool)
+            .arg("verify")
+            .arg("--root")
+            .arg(root)
+            .arg("--manifest")
+            .arg(manifest)
+            .arg("--json")
+            .arg("--max-list")
+            .arg("3")
+            .output()
+        {
+            Ok(o) => {
+                spawned = Some(o);
+                break;
+            }
+            Err(e) => last_err = format!("{}: {e}", py.to_string_lossy()),
+        }
+    }
+    let Some(out) = spawned else {
+        return skip(format!("판독기 실행 실패({last_err}) — 판정 불가"));
+    };
+    match out.status.code() {
+        Some(0) => DiagItem {
+            name,
+            status: DiagStatus::Ok,
+            detail: format!("동봉 런타임 봉인 무결 — {}", root.display()),
+            action: String::new(),
+        },
+        Some(1) => {
+            // stdout 은 `verify --json` 의 1줄이다.
+            // ★페이로드가 없으면 Fail 이라고 말하지 않는다(2026-09-04 실사고 교훈): 파이썬
+            //   **uncaught 예외의 종료코드도 1** 이라, 인코딩 사고·크래시가 '봉인 파손'으로
+            //   둔갑할 수 있다. 실제로 그 사고가 windows-build 레인에서 났다(도구 쪽은
+            //   `_widen_stdio` 로 닫았지만, 여기서도 '판정 근거가 있을 때만 파손'을 요구한다).
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            if !v["counts"].is_object() {
+                return skip(format!(
+                    "봉인 대조 판정 불가(exit 1 인데 --json 판정 페이로드가 없다 — 판독기가 중도 \
+                     사망했을 수 있다) — {}",
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ));
+            }
+            let n = |k: &str| v["counts"][k].as_u64().unwrap_or(0);
+            let mut sample: Vec<String> = Vec::new();
+            for k in ["added", "changed", "missing"] {
+                if let Some(a) = v[k].as_array() {
+                    sample.extend(a.iter().filter_map(|s| s.as_str()).map(str::to_string));
+                }
+            }
+            sample.truncate(3);
+            let npm_note = if sample.iter().any(|p| p.contains("node_modules")) {
+                " ★node_modules 오염 — `npm i -g <패키지>` 가 동봉 node 의 기본 prefix(=번들 안)로 \
+                 설치된 흔적이다. 전역 설치는 번들 밖 prefix 로 하라."
+            } else {
+                ""
+            };
+            DiagItem {
+                name,
+                status: DiagStatus::Fail,
+                detail: format!(
+                    "동봉 런타임 봉인 파손 — {} · 추가 {}건·변경 {}건·누락 {}건(예: {}){} \
+                     이 설치본을 그대로 재배포하면 받는 쪽에서 무결성 검증이 깨진다.",
+                    root.display(),
+                    n("added"),
+                    n("changed"),
+                    n("missing"),
+                    if sample.is_empty() { "(목록 없음)".into() } else { sample.join(", ") },
+                    npm_note
+                ),
+                action: RUNTIME_SEAL_RECOVERY.into(),
+            }
+        }
+        // exit 2(판정 불가) 및 그 밖의 코드·시그널 종료 — 통과로 적지 않는다.
+        other => skip(format!(
+            "봉인 대조 판정 불가(exit {}) — {} · 측정 불능은 통과가 아니다",
+            other.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+            String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>()
+        )),
+    }
+}
+
+/// 봉인 파손·부재 시의 복구 처방. preflight C80 의 문안과 같은 계약이다 — 부분 삭제를 권하지
+/// 않는다(무엇인지 모르는 파일을 지우는 자동화가 더 위험하고, 설치기가 통째로 교체하면 오염
+/// 파일이 함께 사라져 봉인이 자연 복원된다).
+const RUNTIME_SEAL_RECOVERY: &str = "복구는 v0.14.30 이상으로 재설치 — 설치기가 .app(또는 설치 \
+폴더)을 통째로 교체하므로 오염 파일이 함께 사라지고 봉인이 자연 복원된다(부분 삭제 불요·권장하지 \
+않음). 전역 npm 설치가 원인이면 그 패키지를 앱 밖 prefix 로 다시 설치하라";
+
 /// ★T4: 팩 드리프트 관측 — 읽기 전용(--fix 무관 · "pack 본체 불가침" 계약 유지).
 /// manifest↔디스크 해시 대조 + 원장 kind 별 계상(pending_kind_counts 자구 동형 — pub(crate)라
 /// bin 비가시·직접 집계) + 손상 의심 라벨(cys::merge3::suspect_damage + json_gate import 소비 —
@@ -6496,6 +6707,8 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_legacy_config(ctx),
         // M3: 자기 앱 번들 코드서명 봉인(설치본이 스스로 봉인을 깼는지) — 읽기 전용, --fix 무관.
         diag_app_seal(ctx),
+        // 동봉 런타임 봉인 — app-seal 이 macOS 전용이라 비는 자리(특히 Windows)를 메운다.
+        diag_runtime_seal(ctx),
     ]
 }
 
@@ -6901,6 +7114,9 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
         binary_version: env!("CARGO_PKG_VERSION").to_string(),
         // 번들 밖 실행이면 None → app-seal 은 Skip(판정 불가). 탐지 실패를 정상으로 적지 않는다.
         app_bundle: std::env::current_exe().ok().as_deref().and_then(detect_app_bundle),
+        exe_dir: std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf())),
     };
     let items = run_doctor_diagnostics(&ctx, fix);
     let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
@@ -8033,6 +8249,27 @@ fn fetch_surfaces() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 번들 안 npm 으로 전역 설치해 앱 봉인이 깨진 사용자를 위한 복구 1문장.
+///
+/// ★왜 매크로(리터럴 조각)인가: `install_hint_for` 는 `&'static str` 을 돌려주므로 런타임
+///   포맷이 불가하다. 그런데 이 문장은 **두 곳 이상**에서 같아야 한다 — 힌트와
+///   `WINDOWS_AGENT_PATH_HINT`, 그리고 팩 preflight C80(런타임 봉인)의 처방까지.
+///   두 곳이 다른 말을 하면 사용자는 어느 쪽을 믿을지 모른다. `concat!` 은 리터럴만 받으므로
+///   조각을 매크로로 두어 **단일 출처**를 만든다(핀: `npm_hints_share_one_recovery_sentence`).
+///
+/// ★사실 관계: 번들 node 의 npm 은 기본 전역 prefix 가 **node 설치 루트(=번들 안)** 라,
+///   제품이 안내하는 `npm i -g` 를 그대로 따르면 패키지가 앱 번들 안에 설치되어 코드서명
+///   봉인이 깨진다. 2026-09-04 실측으로 오너 머신이 정확히 그 상태였다
+///   (`codesign --verify` → file added 11줄 · 전부 `@openai/codex`). 그래서 이 안내가
+///   설치 위치를 명시하고, 이미 당한 사용자에게 복구 경로를 준다.
+macro_rules! bundle_npm_recovery {
+    () => {
+        "이미 번들 안 npm 으로 설치해 앱 봉인이 깨졌다면 그 패키지를 번들 밖으로 옮긴 뒤 앱을 \
+재설치하십시오 — 설치기가 앱을 통째로 교체하므로 봉인이 자연 복원됩니다(부분 삭제는 권장하지 \
+않습니다 · 진단은 `cys doctor`)"
+    };
+}
+
 /// 플랫폼별 설치 힌트(G29·B8) — 의무 CLI 미설치는 exit 0 성공이 아니라 typed `missing` outcome 이다.
 /// OS 를 인자로 받는 순수형이 정본이다(lib.rs `bundled_git_bash_path_for` 와 동일 이유 —
 /// 회귀 핀이 다른 플랫폼 CI 에서도 Windows 분기를 실제로 밟게 하기 위해서다 · MF-1 핀).
@@ -8045,7 +8282,10 @@ fn install_hint_for(agent: &str, os: &str) -> &'static str {
                 "`curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭"
             }
         }
-        "codex" => "`npm i -g @openai/codex` (선택 리뷰어)",
+        "codex" => concat!(
+            "`npm i -g @openai/codex` (선택 리뷰어) — 사용자 공간(npm_config_prefix 기본값)에 ",
+            "설치됩니다. ", bundle_npm_recovery!()
+        ),
         "gemini" => "Antigravity CLI `agy` 설치 후 agents.json 의 cmd 경로 확인 (선택 리뷰어)",
         "grok" => "grok CLI 설치 (선택 리뷰어 — 미설치면 건너뜀이 정상)",
         _ => "해당 CLI 설치 후 agents.json 의 cmd 를 확인 (선택 노드)",
@@ -8060,8 +8300,11 @@ fn install_hint(agent: &str) -> &'static str {
 /// B8: agents.json 의 cmd 가 Windows 실설치 경로와 어긋날 때의 안내 — 후보 전탐색까지 빈손일 때만.
 /// (비 Windows 빌드에서는 `full_miss_hint` 회귀 핀만 참조한다 — cfg 게이트 대신 핀 가시성.)
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_AGENT_PATH_HINT: &str = "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 \
-(agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex)";
+const WINDOWS_AGENT_PATH_HINT: &str = concat!(
+    "agents.json의 cmd 경로를 실제 설치 경로로 수정하세요 ",
+    "(agy: npm i -g @google/antigravity 후 where agy / codex: npm i -g @openai/codex 후 where codex). ",
+    "전역 설치는 사용자 공간(npm_config_prefix 기본값)에 놓입니다. ", bundle_npm_recovery!()
+);
 
 /// B8 전탐색 빈손 시의 **최종 hint 판정**(순수 · OS 무관 컴파일 = 회귀 핀 대상).
 ///
@@ -19122,6 +19365,38 @@ mod tests {
         }
     }
 
+    /// ★C1-6(부트 v2 · 2026-09-04) — npm 형 설치 안내 2곳이 **같은 복구 문장**을 갖는지.
+    ///
+    /// 왜: 제품이 `npm i -g` 를 안내하는데 번들 node 의 기본 전역 prefix 가 번들 안이라,
+    /// 그 안내를 따른 사용자의 앱 봉인이 실제로 깨졌다(2026-09-04 오너 머신 실측 —
+    /// `codesign --verify` file added 11줄이 전부 @openai/codex). 안내가 설치 위치를 말하지
+    /// 않으면 같은 사고가 반복되고, 두 안내가 서로 다른 복구를 말하면 사용자는 어느 쪽을
+    /// 믿을지 모른다. 문장 하나를 매크로로 공유하는 구조 자체를 여기서 못박는다.
+    #[test]
+    fn npm_hints_share_one_recovery_sentence() {
+        let codex = install_hint_for("codex", "macos");
+        // ⓐ 설치 위치를 명시한다 — "어디에 깔리는가"를 말하지 않는 안내가 사고의 원인이었다.
+        assert!(codex.contains("사용자 공간"), "codex 힌트가 설치 위치를 말하지 않는다: {codex}");
+        assert!(codex.contains("npm_config_prefix"), "prefix 기준을 명시해야 한다: {codex}");
+        // ⓑ 이미 당한 사용자의 복구 경로가 있다.
+        assert!(codex.contains(bundle_npm_recovery!()), "codex 힌트에 복구 문장이 없다: {codex}");
+        // ⓒ 두 안내가 **같은 문장**을 쓴다(복사본 드리프트 차단).
+        assert!(
+            WINDOWS_AGENT_PATH_HINT.contains(bundle_npm_recovery!()),
+            "Windows 경로수정 힌트가 다른 복구 문장을 쓴다 — 두 안내가 갈리면 사용자가 헷갈린다"
+        );
+        // ⓓ 복구 문장은 '통째 교체' 를 말한다(부분 삭제 유도 금지 — preflight C80 처방과 동형).
+        assert!(bundle_npm_recovery!().contains("통째로 교체"));
+        assert!(bundle_npm_recovery!().contains("cys doctor"));
+        // ⓔ 의무 CLI claude 는 npm 형이 아니므로 이 문장이 섞이면 안 된다(MF-1 계급 오염 방지).
+        for os in ["macos", "windows", "linux"] {
+            assert!(
+                !install_hint_for("claude", os).contains(bundle_npm_recovery!()),
+                "claude 힌트에 npm 복구 문장이 섞였다({os}) — 네이티브 설치기와 무관하다"
+            );
+        }
+    }
+
     /// ★(W4 · B19) 폴더신뢰 판정이 **어댑터 선언을 실제로 소비**하고, 내장 needle 폴백을
     /// 잃지 않았음을 핀한다(무회귀 = 종전 감지의 상위집합).
     #[test]
@@ -22306,6 +22581,7 @@ mod tests {
             settings_paths: vec![base.join("settings.json").to_string_lossy().into_owned()],
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
             app_bundle: None, // 기본은 번들 밖 = app-seal Skip(다른 doctor 테스트에 부작용 0)
+            exe_dir: None,    // 기본은 설치 루트 미주입 = runtime-seal Skip(부작용 0)
         }
     }
 
@@ -22583,6 +22859,129 @@ mod tests {
             !doctor_pid_is_cysd(std::process::id()),
             "테스트 바이너리(cys-<hash>) ≠ cysd"
         );
+    }
+
+
+    /// ★`runtime-seal` 3분류 — master 판정 2026-09-04("doctor 라벨"의 받는 자리 신설).
+    /// preflight C80 이 WARN 으로 적고 "상세 진단은 `cys doctor`" 로 넘기는데, 여기 항목이
+    /// 없으면 그 안내가 막다른 길이 된다. 네 갈래를 한 검체로 못 박는다:
+    ///   ①트리 없음 = Skip(대상 없음) ②구버전 + 매니페스트 부재 = Skip(정상 · 거짓 경보 0)
+    ///   ③봉인 탑재 버전 + 매니페스트 부재 = **Warn**(감지축 소실) ④무결 = Ok / 오염 = **Fail**
+    /// ④는 판독을 결정론 도구(javis_runtime_seal.py)에 위임하므로 python3 가 있어야 한다 —
+    /// 없는 환경(드묾)에서는 그 절만 건너뛴다(선례: tar 검체의 python3 부재 스킵).
+    #[test]
+    fn diag_runtime_seal_splits_absence_by_version_and_flags_pollution() {
+        let base = std::env::temp_dir().join(format!("cys-doc-rtseal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let install = base.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        let mut ctx = doctor_ctx_at(&base);
+
+        // ① 런타임 트리 자체가 없다(개발 빌드) → 검사 대상 없음.
+        ctx.exe_dir = Some(install.clone());
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
+        assert!(it.detail.contains("트리 미발견"), "{}", it.detail);
+
+        // 축소 런타임 트리. ★`runtime/python/bin/python3` 는 일부러 만들지 않는다 —
+        // 만들면 진단이 그 '가짜 인터프리터'를 먼저 스폰해 보게 된다(실행 실패 시 python3 로
+        // 폴백하지만, 픽스처가 의도를 흐리지 않게 아예 두지 않는다).
+        let rt = install.join("runtime");
+        std::fs::create_dir_all(rt.join("lib")).unwrap();
+        std::fs::write(rt.join("lib/a.txt"), "alpha\n").unwrap();
+        std::fs::write(rt.join("lib/b.txt"), "bravo\n").unwrap();
+
+        // ② 구버전 설치본 + 매니페스트 부재 = 정상(SKIP). 여기서 경고를 내면 기존 사용자
+        //    전원이 거짓 경보를 받는다.
+        ctx.binary_version = "0.14.29".into();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
+        assert!(it.detail.contains("0.14.29"), "판독한 버전을 말해야 한다: {}", it.detail);
+
+        // ③ 봉인 탑재 버전 + 매니페스트 부재 = WARN. 실려 있어야 할 것이 사라진 상태다.
+        ctx.binary_version = RUNTIME_SEAL_SINCE.into();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(!it.action.is_empty(), "처방이 있어야 안내다");
+
+        // ④ 판독기 배선 — 팩 bin 에 도구를 놓고 실제 매니페스트를 뜬다.
+        let tool_src = std::path::Path::new("cysjavis-pack/bin/javis_runtime_seal.py");
+        if !tool_src.is_file() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // 리포 밖 실행 — 배선 검증 불가
+        }
+        std::fs::create_dir_all(ctx.pack_dir.join("bin")).unwrap();
+        std::fs::copy(tool_src, ctx.pack_dir.join("bin/javis_runtime_seal.py")).unwrap();
+        let manifest = install.join("runtime-manifest.json");
+        let emitted = cys::python_command("python3")
+            .arg(ctx.pack_dir.join("bin/javis_runtime_seal.py"))
+            .arg("emit")
+            .arg("--root")
+            .arg(&rt)
+            .arg("--out")
+            .arg(&manifest)
+            .status();
+        match emitted {
+            Ok(s) if s.success() => {}
+            _ => {
+                let _ = std::fs::remove_dir_all(&base);
+                return; // python3 부재/실패 — 배선 절만 스킵(다른 갈래는 위에서 이미 봉인)
+            }
+        }
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Ok, "무결 트리는 Ok: {}", it.detail);
+
+        // 오염 주입 → **Fail**(app-seal 과 같은 등급 — doctor 는 부트 게이트가 아니다).
+        std::fs::create_dir_all(rt.join("lib/node_modules/@openai/codex")).unwrap();
+        std::fs::write(rt.join("lib/node_modules/@openai/codex/package.json"), "{}\n").unwrap();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Fail, "확증된 파손은 Fail: {}", it.detail);
+        assert!(it.detail.contains("추가 1건"), "3분류 계수를 말해야 한다: {}", it.detail);
+        assert!(
+            it.detail.contains("npm i -g"),
+            "node_modules 오염이면 원인(전역 설치 prefix)을 말해야 한다: {}",
+            it.detail
+        );
+        // 읽기 전용 — 진단이 오염 파일을 지우지 않는다(자동 삭제 0).
+        assert!(rt.join("lib/node_modules/@openai/codex/package.json").exists());
+
+        // 매니페스트가 판독 불가면 통과가 아니라 판정 불가(exit 2 → Skip).
+        std::fs::write(&manifest, "{not json").unwrap();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
+        assert!(it.detail.contains("판정 불가"), "{}", it.detail);
+
+        // ★exit 1 인데 판정 페이로드가 없으면 '파손'이라 말하지 않는다 — 파이썬 uncaught
+        //   예외의 종료코드도 1이라 크래시가 봉인 사고로 둔갑한다(2026-09-04 windows-build 실사고).
+        //   판독기를 '무조건 exit 1' 흉내로 바꿔치기해 그 갈래를 실제로 태운다.
+        std::fs::write(
+            ctx.pack_dir.join("bin/javis_runtime_seal.py"),
+            "import sys\nsys.exit(1)\n",
+        )
+        .unwrap();
+        let it = diag_runtime_seal(&ctx);
+        assert_eq!(
+            it.status,
+            DiagStatus::Skip,
+            "판정 근거 없는 exit 1 을 Fail 로 적었다 — 크래시가 봉인 파손으로 둔갑한다: {}",
+            it.detail
+        );
+        assert!(it.detail.contains("판정 불가"), "{}", it.detail);
+        std::fs::copy(tool_src, ctx.pack_dir.join("bin/javis_runtime_seal.py")).unwrap();
+
+        // 파일 이름 상수가 번들 경로 상수와 갈리면 판독기가 파일을 못 찾는다(무증상 Skip).
+        assert!(
+            cys::app_bundle::RUNTIME_MANIFEST.ends_with(RUNTIME_MANIFEST_BASENAME),
+            "번들 상수와 basename 이 갈렸다"
+        );
+        // 등재 확인 — 돌지 않는 진단은 게이트가 아니다.
+        assert!(
+            run_doctor_diagnostics(&doctor_ctx_at(&base), false)
+                .iter()
+                .any(|i| i.name == "runtime-seal"),
+            "runtime-seal 이 doctor 진단 목록에 없다"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

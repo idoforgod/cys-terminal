@@ -85,6 +85,24 @@ jobs:
       - name: Secret/PII scan (pre-build hard-gate)
         run: bash scripts/secret-scan.sh --all
 
+      # ★H-SECRET-1 — 스캐너가 **살아 있는가**를 증명하는 메타 게이트 (IG-2 · master 지시 2026-09-04).
+      #   위 secret-scan.sh 는 트리가 깨끗하면 초록이다. 그런데 **스캐너가 죽어 있어도**(정규식
+      #   파손·조기 exit 0·파일 목록 0건) 깨끗한 트리는 똑같이 초록이다 — 종료코드만 보는 게이트는
+      #   자기 고장을 통과로 접는다. H-SECRET-1 은 규칙별 양성 표본을 임시 파일(저장소 밖)에 넣고
+      #   **그 규칙 라벨로** 잡히는지까지 확인한다(라벨을 보는 이유: 아무 규칙이나 걸려도 exit 1 이라
+      #   6종 중 5종이 죽어도 종료코드는 같다). 자기 면제 동결도 함께 본다.
+      #   ★왜 지금 넣는가: 2026-09-04 팩 fixture 에 오너 핸들이 실제로 유출됐고(수리 011a6f6),
+      #   그 계급을 잡는 규칙(handle→HANDLE)이 이 검체 안에 있다. 종전에 이 검체는 ci-branch
+      #   잡2 에서만 돌았고 **발행 레인에는 0회** 였다 — "안 도는 검체는 게이트가 아니다".
+      #   실측 22.1s(러너 자기완결·저장소 밖 임시파일·사용자 HOME 무접촉).
+      - name: H-SECRET-1 — 시크릿 스캐너 계측 타당성 (발행 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "::error::건강성 러너 누락: $R — 스캐너 계측 타당성 판정 불가(fail-closed)"; exit 1; }
+          python3 "$R" --only H-SECRET-1
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
@@ -152,6 +170,12 @@ jobs:
           #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
           #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
+          # ★C1(2026-09-04 · 부트 v2 W-C): test_runtime_seal 편입 — 동봉 런타임 봉인 매니페스트
+          #   (javis_runtime_seal.py)의 회귀 핀. 대상 모듈은 배송 팩 내용물이고, Windows 는
+          #   코드서명 sealed-resource 봉인이 없어 **설치 후 runtime/** 오염을 잡을 유일한 수단**이다.
+          #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
+          #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
+          #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
@@ -159,7 +183,9 @@ jobs:
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
-                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }

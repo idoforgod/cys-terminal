@@ -18,6 +18,16 @@
      ★낱말 grep(smartscreen/defender/…)은 **제거하지 않고 보조 축으로 AND** 유지한다
        (마커 껍데기만 남고 카피가 비는 사고 + 기존 루트 밴드 감시 축 보존).
   ⑥ SHA256SUMS.txt — 신버전 전수·구버전 0줄 + **실자산 바이트 해시 대조** (오너 지시 ⓑ)
+  ⑧ 무버전 자산 버전 결속 — `latest.json` 의 version·플랫폼 URL 이 신버전을 가리키는지 +
+     팩 미러 자기정합(pack-manifest.json 의 digest == 실제 pack.tar.gz 바이트).
+     ★왜 필요한가(2026-09-04 W-C R2 ④): ⑥ 의 구버전 탐지 정규식은 'cys_<숫자>.<숫자>.<숫자>_' 라
+       **파일명에 버전이 없는 자산 8종**(app.tar.gz 4 · latest.json · pack.tar.gz ·
+       pack-manifest 2)에 걸리지 않는다. 그것들만 구버전으로 남겨도 ①~⑦ 이 전부 통과해
+       **7/7 PASS 도장이 찍힌다**(실측: 발행 전 현행 사이트의 latest.json 이 구버전이었다).
+       ⑥ 은 'SUMS 는 새건데 바이트가 낡음'을, ⑧ 은 '교체 자체를 잊어 둘 다 낡음'을 잡는다.
+     ★pack_version 은 **본체 버전과 동등 단언하지 않는다** — 팩-only 릴리스 레인이 따로 있어
+       (scripts/release-lane-check.sh) 팩 버전이 본체보다 앞설 수 있다. 동등을 요구하면 정상
+       상태를 실패로 만든다. 그래서 팩은 자기정합(digest↔바이트)만 본다.
   ⑦ 메인페이지 macOS(Safari) 안내 삭제 확인 (2026-08-24 오너 지시) — 루트(`/`)에서
      ⓐ`dl-hero__macnote` 0건 ⓑ`dl-hero__winnote` **정확히 1건**(윈도우 안내 생존)
      ⓒ`App Translocation` 0건. 셋을 **AND** 로 본다.
@@ -32,6 +42,7 @@
 종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완)
 """
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -62,6 +73,46 @@ TRANSLOCATION_TOKEN = "App Translocation"
 MACNOTE_EXPECT = 0
 WINNOTE_EXPECT = 1          # ★0 도 실패다 — 윈도우 안내 소실 회귀를 여기서 잡는다
 TRANSLOCATION_EXPECT = 0
+
+
+# ⑧ 전용 — 파일명에 버전이 없어 ⑥ 의 구버전 정규식에 걸리지 않는 자산(실측 8종).
+VERSIONLESS_ASSETS = ("cys_aarch64.app.tar.gz", "cys_aarch64.app.tar.gz.sig",
+                      "cys_x64.app.tar.gz", "cys_x64.app.tar.gz.sig",
+                      "latest.json", "pack.tar.gz",
+                      "pack-manifest.json", "pack-manifest.json.minisig")
+
+
+def versionless_verdict(latest, manifest, pack_digest_ok, ver):
+    """⑧ 판정 — 순수함수(네트워크 무접촉)라 --self-test 가 합성 표본으로 시험한다.
+
+    latest / manifest = 파싱된 dict 또는 None(수신·판독 실패 = 통과가 아니라 실패).
+    pack_digest_ok    = manifest['digest'] 가 실제 pack.tar.gz 바이트와 일치하는가(True/False/None).
+    """
+    bad = []
+    if latest is None:
+        bad.append("latest.json 판독 불가")
+    else:
+        lv = latest.get("version")
+        if lv != ver:
+            bad.append("latest.json version=%r (기대 %r)" % (lv, ver))
+        tag = "/v%s/" % ver
+        plats = latest.get("platforms") or {}
+        if not plats:
+            bad.append("latest.json platforms 비어 있음")
+        for name in sorted(plats):
+            url = (plats.get(name) or {}).get("url", "")
+            if tag not in url:
+                bad.append("latest.json platforms.%s url 이 %s 를 안 가리킴" % (name, tag))
+    if manifest is None:
+        bad.append("pack-manifest.json 판독 불가")
+    elif not manifest.get("digest"):
+        bad.append("pack-manifest.json digest 없음")
+    if pack_digest_ok is False:
+        bad.append("pack.tar.gz 바이트가 pack-manifest digest 와 불일치")
+    elif pack_digest_ok is None:
+        bad.append("pack.tar.gz 대조 불가")
+    return (not bad), ("; ".join(bad) if bad else
+                       "latest.json %s 결속(플랫폼 %d) · 팩 미러 digest 일치" % (ver, len(latest.get("platforms") or {})))
 
 
 def main_macnote_counts(html):
@@ -101,6 +152,17 @@ def clen(url):
     return int(m.group(1)) if m else None
 
 
+def get_json(url):
+    """JSON 수신 — 실패(빈 응답·파싱 오류)는 None. 측정 불능은 통과가 아니다(호출부에서 실패 처리)."""
+    raw = get(url)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
 def code(url):
     return subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-A", UA,
                            "-I", "--max-time", "120", url], capture_output=True).stdout.decode()
@@ -134,6 +196,36 @@ def self_test():
     # ⓓ 윈도우 안내 중복(2건) = 실패
     v, d = macnote_verdict(main_macnote_counts("<div>\n" + win_p + win_p + "</div>"))
     ok("⑦ⓓ winnote 2건은 실패", not v, d)
+
+    # ── ⑧ 무버전 자산 버전 결속 (2026-09-04 R2 ④) ──
+    # 이 축이 없던 동안 '무버전 자산만 구버전' 상태가 7/7 PASS 로 통과했다. 그 사고를 합성
+    # 표본으로 재현해 **실제로 실패로 잡히는지**를 여기서 못박는다(음성 대조 없으면 vacuous).
+    # 합성 버전이다 — 실제 릴리스 버전을 박으면 범프 때마다 이 픽스처가 낡고
+    # 버전 센서스에 미분류로 걸린다(2026-09-04 실측). 자릿수 형식만 같으면 된다.
+    V, OLD = "9.9.9", "9.9.8"
+    def mk(ver, tag=None):
+        tag = tag or ver
+        return {"version": ver, "platforms": {
+            "darwin-aarch64": {"url": "https://example.invalid/releases/download/v%s/cys_aarch64.app.tar.gz" % tag},
+            "windows-x86_64": {"url": "https://example.invalid/releases/download/v%s/cys_%s_x64-setup.exe" % (tag, tag)}}}
+    man = {"pack_version": "0.14.31", "digest": "deadbeef"}   # 팩 버전은 본체와 달라도 정상이다
+
+    v, d = versionless_verdict(mk(V), man, True, V)
+    ok("⑧ⓐ 전부 신버전이면 통과", v, d)
+    v, d = versionless_verdict(mk(OLD, OLD), man, True, V)
+    ok("⑧ⓑ latest.json 이 통째로 구버전이면 실패", not v, d)
+    v, d = versionless_verdict(mk(V, OLD), man, True, V)
+    ok("⑧ⓒ version 만 갱신되고 URL 이 구버전 태그면 실패", not v, d)
+    v, d = versionless_verdict(mk(V), man, False, V)
+    ok("⑧ⓓ 팩 미러 바이트가 digest 와 어긋나면 실패", not v, d)
+    v, d = versionless_verdict(None, man, True, V)
+    ok("⑧ⓔ latest.json 판독 불가는 통과가 아니라 실패", not v, d)
+    v, d = versionless_verdict(mk(V), man, None, V)
+    ok("⑧ⓕ 팩 대조 불가도 통과가 아니라 실패", not v, d)
+    # ★핵심 회귀: 버전 붙은 자산은 전부 신버전인데 **무버전 자산만** 구버전인 상태.
+    #   이것이 종전 7축이 7/7 PASS 를 주던 바로 그 형상이다.
+    v, d = versionless_verdict(mk(OLD, OLD), man, True, V)
+    ok("⑧ⓖ ★무버전 자산만 구버전인 형상은 반드시 실패", not v, d)
 
     total = tally["pass"] + tally["fail"]
     print("\n=== self-test %d/%d PASS (실패 %d건) ===" % (tally["pass"], total, tally["fail"]))
@@ -246,22 +338,40 @@ def main(argv):
             if len(p) == 2:
                 want[p[1]] = p[0]
         mismatch = []
+        # ★2026-09-04 R2 ④: 대조 대상을 배포 4종에서 **SUMS 전 항목**으로 넓혔다. 종전에는
+        #   무버전 자산(app.tar.gz·pack.tar.gz·latest.json 등)이 SUMS 에 등재돼 있어도 바이트를
+        #   한 번도 확인하지 않아, 'SUMS 는 갱신했는데 자산은 구버전' 사고를 그쪽에서 놓쳤다.
+        #   비용: 자산 전체를 받으므로 회선 사용이 늘어난다(실측 4종 832MB → 전 항목 약 1.2GB).
+        #   릴리스당 1회 도는 게이트라 이 비용을 받는다 — 놓치는 것이 더 비싸다.
+        for f in sorted(want):
+            blob = subprocess.run(["curl", "-s", "-A", UA, "--max-time", "600",
+                                   "%s/downloads/%s" % (SITE, f)], capture_output=True).stdout
+            if not blob:
+                mismatch.append("%s 수신 실패" % f)
+            elif hashlib.sha256(blob).hexdigest() != want[f]:
+                mismatch.append("%s 해시 불일치" % f)
         for f in four:
             if f not in want:
                 mismatch.append("%s 미등재" % f)
-                continue
-            blob = subprocess.run(["curl", "-s", "-A", UA, "--max-time", "600",
-                                   "%s/downloads/%s" % (SITE, f)], capture_output=True).stdout
-            if hashlib.sha256(blob).hexdigest() != want[f]:
-                mismatch.append("%s 해시 불일치" % f)
         ok6 = not mismatch
-        detail += " · 실자산 대조 " + (", ".join(mismatch) if mismatch else "4종 일치")
+        detail += " · 실자산 대조 " + (", ".join(mismatch) if mismatch else "%d종 일치" % len(want))
     check("⑥ SHA256SUMS.txt 전수·실자산 대조", ok6, detail)
 
     # ⑦ 메인페이지 macOS(Safari) 안내 삭제 확인 (오너 지시 2026-08-24)
     # 이미 받아둔 main_html 을 재사용한다 — 추가 왕복 없음.
     ok7, detail7 = macnote_verdict(main_macnote_counts(main_html))
     check("⑦ 메인 macOS 안내 삭제 · 윈도우 안내 잔존", ok7, detail7)
+
+    # ⑧ 무버전 자산 버전 결속 (2026-09-04 W-C R2 ④)
+    latest = get_json("%s/downloads/latest.json" % SITE)
+    manifest = get_json("%s/downloads/pack-manifest.json" % SITE)
+    pack_ok = None
+    if manifest and manifest.get("digest"):
+        blob = subprocess.run(["curl", "-s", "-A", UA, "--max-time", "600",
+                               "%s/downloads/pack.tar.gz" % SITE], capture_output=True).stdout
+        pack_ok = bool(blob) and hashlib.sha256(blob).hexdigest() == manifest["digest"]
+    ok8, detail8 = versionless_verdict(latest, manifest, pack_ok, ver)
+    check("⑧ 무버전 자산 버전 결속(latest.json·팩 미러)", ok8, detail8)
 
     npass = sum(1 for r in results if r)
     print("\n=== %d/%d PASS ===" % (npass, len(results)))

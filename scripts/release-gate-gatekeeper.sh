@@ -31,6 +31,26 @@
 #      ⓐ번들 파일 전수 센서스 diff == 0(예상치 못한 파일 생성 = 이름 지목 FAIL)
 #      ⓑcodesign --verify --deep --strict 재통과 를 단언한다. HOME·PATH·팩 env 는 임시
 #      스크래치로 격리(하네스 test_preflight_c11b_seal.py 와 동형) — 실환경 무접촉.
+#   ⑦ DMG 봉투(envelope) 축 — 격리 부착 사본 DMG **자신**에 (a) xcrun stapler validate ·
+#      (b) spctl --assess --type open --context context:primary-signature — W-C C2 신설(2026-09-03).
+#      DMG 마다 1회(앱 단위가 아니다) · ⑦-a 는 full 과 --diagnose-degraded-ok 두 모드에서 조건
+#      없이 실행되고(오프라인 평가라 spctl 정책에 의존하지 않는다), ⑦-b 는 ④ 와 같이 full 모드
+#      에서만 돈다(진단 강등에서는 SKIP 1줄 고지).
+#      ★도달 조건 — 2026-09-04 R2 교정(codex 감사 REVISE ①): 기본(발행) 모드의 degraded 는 아래
+#      F2 폐쇄가 대상 분기보다 **앞**이라 exit 2 로 닫히므로 ⑦ 자체가 실행되지 않는다. 종전
+#      종전의 '모드와 무관하게 돈다'는 표기는 도달 가능한 두 모드 안에서만 참이었고, 그래서 절차서가
+#      증적 생성 조건을 잘못 약속했다. fail-closed 를 우선하는 현 흐름이 의도이므로 **흐름은 두고
+#      서술을 사실에 맞췄다**(택일 ⓐ).
+#      ★왜 신설하는가: 사용자가 브라우저로 받은 격리 DMG 를 여는 순간 Gatekeeper 가 보는 것은
+#      **DMG 자신의 서명·공증 티켓**인데, ①~⑥ 은 DMG 안의 앱만 평가해 봉투(DMG 서명·staple
+#      누락)를 놓쳤다. scripts/build-macos-signed.sh:325-336 이 같은 두 검사를 하지만 그것은
+#      빌드 시점 러너 산출물 검사라 발행될(다운로드된) 실물 바이트가 아니며, 이 게이트는
+#      release-postprocess.py 가 draft 백업 DMG 에 재실행하므로 여기가 발행 전 마지막 지점이다.
+#      ★평가식 근거: spctl(8) "-t open to assess the opening of documents" · 실측 2026-09-03
+#      v0.14.29 DMG 2종(aarch64·x64) 격리 사본 — stapler validate rc=0("The validate action
+#      worked!") · spctl -t open accepted(source=Notarized Developer ID) · 미서명 합성 DMG
+#      (hdiutil create · Fake.app)는 stapler 비영·spctl rejected(test_release_postprocess_gate.py
+#      DmgAxisTests 가 음성 대조로 박제).
 #
 # ★스코프 판정(공백 B · Windows 레인 · 2026-08-20): Windows 산출물에는 SEAL-2 선컴파일이 없고
 #   이 게이트도 macOS 전용이다 — 여기서 수리하지 않는다. 오너 앵커: 윈도우 설치파일은 신중 접근,
@@ -59,6 +79,7 @@
 #   옵션: --keep(작업 폴더 보존) · --quarantine-value <문자열>(기본 = 실측 Safari 형식)
 #         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤⑥ 강등 평가 · 발행 경로 사용 금지)
 #         --seal2-only(진단 전용 — 대상 .app 에 ⑤ 전칭 검사만 단독 실행 · 적대 픽스처 테스트의 호출 지점)
+#         --runtime-manifest-only(진단 전용 — 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행)
 #
 # 종료 코드
 #   0 = 전 검사 PASS (기본 모드에선 full 에서만 도달 가능 · --diagnose-degraded-ok 의 0 은 진단용이다)
@@ -93,6 +114,7 @@ usage() {
   --diagnose-degraded-ok    진단 전용: degraded(spctl assessments disabled) 폐쇄를 열어
                             ①②③⑤⑥ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
   --seal2-only              진단 전용: 대상 .app 에 ⑤ SEAL-2 전칭 검사만 단독 실행
+  --runtime-manifest-only   진단 전용: 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행
   -h, --help                이 도움말
 종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(degraded 폐쇄 포함)
 USAGE
@@ -104,6 +126,7 @@ while [ $# -gt 0 ]; do
     --quarantine-value) QVAL="${2:-}"; shift 2 ;;
     --diagnose-degraded-ok) DIAG_DEGRADED=1; shift ;;
     --seal2-only) SEAL2_ONLY=1; shift ;;
+    --runtime-manifest-only) RTMAN_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; usage >&2; exit 2 ;;
     *) TARGET="$1"; shift ;;
@@ -114,7 +137,7 @@ done
 
 # ── 도구 fail-closed (없으면 판정 불가 = exit 2 · 통과 아님) ──
 # --seal2-only(진단)는 ⑤ 만 돌므로 러너 python3 해소만 요구한다 — macOS 밖(픽스처 테스트)에서도 돈다.
-if [ "$SEAL2_ONLY" != "1" ]; then
+if [ "$SEAL2_ONLY" != "1" ] && [ "${RTMAN_ONLY:-0}" != "1" ]; then
   for t in hdiutil spctl codesign xattr ditto find uuidgen; do
     command -v "$t" >/dev/null 2>&1 || { echo "✗ 필수 도구 없음: $t (macOS + Xcode CLT 필요)" >&2; exit 2; }
   done
@@ -140,6 +163,8 @@ done
 # 전부). 부재는 skip 이 아니라 판정 불가다(⑥ 이 못 돌면 첫-부팅 계급이 무검증 — 함수 안에서 폐쇄).
 GATE_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PREFLIGHT_PY="$GATE_SCRIPT_DIR/../cysjavis-pack/bin/javis_preflight.py"
+# ── ⑧용 런타임 봉인 판독기(리포 상대) — 같은 이유로 부재는 skip 이 아니라 판정 불가다. ──
+SEAL_PY_TOOL="$GATE_SCRIPT_DIR/../cysjavis-pack/bin/javis_runtime_seal.py"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cys-gk-gate.XXXXXX")" || exit 2
 # macOS 는 /var·/tmp 가 심볼릭링크라 mount·codesign 이 실경로(/private/…)로 되돌려 출력한다.
@@ -282,6 +307,7 @@ PYSEAL
   return 0
 }
 SEAL2_TARGETS=0   # python 런타임을 실제로 검사한 앱 수 — 0이면 판정 불가(측정 불능≠통과)
+RTMAN_TARGETS=0
 
 # ── 봉인 위반 파일 이름 지목(②·⑥ 재검증 실패 시) — codesign 출력에서 file/resource added·
 #    modified·missing 라인만 뽑아 기계 라인(SEAL_CULPRIT:)으로 승격한다. verbatim 덤프는 사람용,
@@ -300,6 +326,47 @@ print_seal_culprits() {
 # codesign --verify --deep --strict 재통과를 단언한다. ★읽기 전용 DMG 마운트(APP_SRC)가 아니라
 # 사본이어야 한다 — 읽기 전용 지반에선 결함 코드도 쓰기에 실패해 검사가 공허해진다.
 # 반환: 0=수행(위반은 ok/bad 집계) · 2=판정 불가 · 3=대상 아님(Contents/MacOS/cys 부재 — 설치 도우미 등)
+# ── ⑧ runtime-manifest 축 (부트 v2 §2-10 G5 · W-C C1 신설 2026-09-04) ─────────────────
+# ★왜 ②(codesign)와 별개인가: ② 는 **이 산출물이 mac 에서 봉인돼 있는가**를 본다. ⑧ 은
+#   **배송될 매니페스트가 실제 트리와 맞는가**를 본다 — 그 매니페스트는 Windows 설치본에서
+#   코드서명이 없는 자리를 대신할 유일한 변조 탐지 수단이므로, 틀린 채로 나가면 그 레인의
+#   봉인이 통째로 거짓이 된다. mac DMG 에서 미리 잡는 이유가 그것이다(같은 생성기·같은 스키마).
+# ★등급: 여기서는 FAIL 이다(master 판정 2026-09-04 D1 · 레인 분리). 기계 preflight(C80)는
+#   부팅을 막지 않으려 WARN 이지만, **발행은 막는다** — 산출물은 고칠 수 있고 사용자 기계는
+#   그렇지 않다.
+# ★번들 안 exec 0: 판독기는 러너 python($GATE_PY)으로 돌리고 트리는 읽기만 한다(⑤ 와 동형).
+# 반환: 0=검사 수행(위반은 bad 로 집계) · 2=판정 불가 · 3=대상 아님(런타임 미동봉 앱)
+runtime_manifest_check() {
+  local app="$1" name man rt out rc n
+  name="$(basename "$app")"
+  rt="$app/Contents/Resources/runtime"
+  man="$app/Contents/Resources/runtime-manifest.json"
+  [ -d "$rt" ] || return 3
+  if [ ! -f "$SEAL_PY_TOOL" ]; then
+    echo "✗ ⑧ runtime-manifest($name): 판독기 부재($SEAL_PY_TOOL) — 리포 체크아웃에서 실행하라(측정 불능은 통과가 아니다)" >&2
+    return 2
+  fi
+  if [ ! -f "$man" ]; then
+    bad "⑧ runtime-manifest($name)" "매니페스트 부재 — runtime/ 을 동봉하는 산출물은 반드시 함께 실어야 한다(설치 후 변조 탐지의 유일 수단 · Windows 레인엔 코드서명 대체물이 없다)"
+    return 0
+  fi
+  out="$("$GATE_PY" "$SEAL_PY_TOOL" verify --root "$rt" --manifest "$man" --max-list 20 2>&1)"; rc=$?
+  case "$rc" in
+    0)
+      n="$(printf '%s' "$out" | sed -n 's/.*항목 \([0-9]*\)개 일치.*/\1/p' | head -1)"
+      ok "⑧ runtime-manifest($name)" "봉인 무결 — 항목 ${n:-?}개 일치"
+      return 0 ;;
+    1)
+      bad "⑧ runtime-manifest($name)" "매니페스트와 실제 runtime 트리가 불일치 — 배송 전 산출물이 이미 어긋났다"
+      printf '%s\n' "$out" | sed 's/^/     | /'
+      return 0 ;;
+    *)
+      echo "✗ ⑧ runtime-manifest($name): 판독 실패(rc=$rc) — 판정 불가" >&2
+      printf '%s\n' "$out" | sed 's/^/     | /' >&2
+      return 2 ;;
+  esac
+}
+
 firstboot_sim_check() {
   local app="$1" name pre post sim_out sim_rc simhome added removed reverify_out reverify_rc viol
   name="$(basename "$app")"
@@ -421,6 +488,24 @@ if [ "$SEAL2_ONLY" = "1" ]; then
   exit 0
 fi
 
+# ── 진단 전용: --runtime-manifest-only — ⑧ 만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
+#   --seal2-only 와 같은 계약: 적대 픽스처 박제의 호출 지점이고, 발행 경로가 이 플래그를 싣지
+#   않음은 test_release_postprocess_gate.py 의 핀이 지킨다. macOS 도구를 요구하지 않으므로
+#   합성 픽스처만으로 축의 양·음성을 전부 잰다.
+if [ "${RTMAN_ONLY:-0}" = "1" ]; then
+  TARGET="${TARGET%/}"
+  [ -d "$TARGET" ] || { echo "✗ --runtime-manifest-only 대상 없음(.app 디렉터리 필요): $TARGET" >&2; exit 2; }
+  echo "[진단 전용] --runtime-manifest-only: $TARGET — ⑧ 만 돈다(발행 판정 아님)"
+  runtime_manifest_check "$TARGET"; RTMAN_RC=$?
+  case "$RTMAN_RC" in
+    0) ;;
+    3) echo "✗ --runtime-manifest-only: 동봉 런타임 없음(Contents/Resources/runtime)" >&2; exit 2 ;;
+    *) exit 2 ;;
+  esac
+  [ "$FAIL_N" -gt 0 ] && exit 1
+  exit 0
+fi
+
 # ── spctl 정책 선확인 → 모드 결정 (무음 통과 금지) ──
 # CYS_GATE_FORCE_DEGRADED=1 = 시험 주입점(degraded 폐쇄의 단위 재현 전용): degraded **방향
 # 으로만** 강제할 수 있다 — full 을 강제하는 주입점은 우회 벡터라 만들지 않는다(fail-closed 단방향).
@@ -470,6 +555,8 @@ echo
 
 APPS=()          # 평가 대상 .app 원본 경로
 SRC_KIND=""
+# ⑦ DMG 봉투 축 결과(dmg 분기에서만 채워진다) — set -u 안전 초기화 · 미실행 = 빈 값(0 으로 오독 금지)
+ST7_OUT=""; ST7_RC=""; SP7_OUT=""; SP7_RC=""
 
 case "$TARGET" in
   *.dmg)
@@ -486,6 +573,33 @@ case "$TARGET" in
     else
       bad "① quarantine 부착(DMG)" "xattr -w 실패 — 이후 검사는 실사용자 경로가 아니다"
       echo; echo "=== 판정 불가 ==="; exit 2
+    fi
+
+    # ── ⑦ DMG 봉투 축 — 격리 부착 사본 DMG 자신의 공증 티켓·Gatekeeper 열기 평가 (헤더 ⑦ 참조) ──
+    #   ①~⑥ 은 DMG 안의 앱만 본다. 사용자가 격리 DMG 를 여는 순간 평가되는 것은 DMG 자신의
+    #   서명·staple 이므로 마운트 전에 사본 "$DMG" 를 직접 평가한다(원본 무변경 계약 유지).
+    #   build-macos-signed.sh:325-336 과 같은 두 검사지만 대상이 발행될 실물 바이트다.
+    # ⑦-a 공증 티켓 동봉(DMG) — 오프라인 증거라 spctl 정책에 의존하지 않는다(③ 과 같은 관례).
+    #   ★단 여기에 도달하는 실행은 full 과 --diagnose-degraded-ok 뿐이다 — 기본 모드의 degraded 는
+    #   위 F2 폐쇄(exit 2)에서 이미 닫혔다. "모드 무관"이 아니라 "도달한 두 모드에서 조건 없이"다.
+    ST7_OUT="$(xcrun stapler validate "$DMG" 2>&1)"; ST7_RC=$?
+    if [ "$ST7_RC" -eq 0 ]; then
+      ok "⑦-a stapler validate(DMG)" "공증 티켓 동봉 확인"
+    else
+      bad "⑦-a stapler validate(DMG)" "rc=$ST7_RC · $(printf '%s' "$ST7_OUT" | tail -2 | tr '\n' ' ')"
+    fi
+    # ⑦-b Gatekeeper 열기 평가(DMG) — full 모드에서만(④ 와 같은 관례 · spctl(8) -t open = 문서 열기 평가)
+    if [ "$MODE" = "full" ]; then
+      SP7_OUT="$(spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG" 2>&1)"; SP7_RC=$?
+      if [ "$SP7_RC" -eq 0 ] && printf '%s' "$SP7_OUT" | grep -q "accepted"; then
+        ok "⑦-b spctl --assess --type open --context context:primary-signature(DMG)" "$(printf '%s' "$SP7_OUT" | tr '\n' ' ' | sed "s|$DMG|<dmg>|g")"
+      else
+        bad "⑦-b spctl --assess --type open --context context:primary-signature(DMG)" "rc=$SP7_RC"
+        echo "     ── spctl 출력(verbatim) ──"
+        printf '%s\n' "$SP7_OUT" | sed "s|$DMG|<dmg>|g" | sed 's/^/     | /'
+      fi
+    else
+      echo "SKIP ⑦-b spctl --assess --type open(DMG) — assessments disabled (진단 전용 강등 · --diagnose-degraded-ok · 위 배너 참조)"
     fi
 
     MP="$WORK/mnt"
@@ -518,6 +632,7 @@ case "$TARGET" in
     SRC_KIND="app"
     APPS+=("$TARGET")
     info ".app 직접 지정 모드 — DMG 마운트 없이 사본에 quarantine 을 직접 부착한다"
+    info "⑦ DMG 축: .app 직접 지정 모드 — 대상 아님(DMG 없음)"
     ;;
   *)
     echo "✗ 대상은 .dmg 파일 또는 .app 디렉터리여야 한다: $TARGET" >&2; exit 2 ;;
@@ -600,6 +715,14 @@ for APP_SRC in "${APPS[@]}"; do
     *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
   esac
 
+  # ── ⑧ runtime-manifest 대조 — 원본 트리(마운트된 DMG 안 / 직접 지정 .app) 판독 전용 ──
+  runtime_manifest_check "$APP_SRC"; RTMAN_RC=$?
+  case "$RTMAN_RC" in
+    0) RTMAN_TARGETS=$((RTMAN_TARGETS+1)) ;;
+    3) info "⑧ runtime-manifest($APP_NAME): 동봉 런타임 없음 — 대상 아님(설치 도우미 등)" ;;
+    *) echo; echo "=== 판정 불가 ==="; exit 2 ;;
+  esac
+
   # ── 실패 시 진단: 서명 요약 ──
   if [ "$CS_RC" -ne 0 ] || { [ "$MODE" = "full" ] && [ "${SPCTL_RC:-1}" -ne 0 ]; } || [ "$ST_RC" -ne 0 ]; then
     echo "     ── codesign -dv --verbose=4 요약 ──"
@@ -620,6 +743,13 @@ fi
 #  MacOS/cys 없는 픽스처 앱은 ②③ FAIL 로 exit 1 에 도달하고, 진짜 산출물의 진짜 PASS 만 ⑥ 을 요구).
 if [ "$SIM_TARGETS" -eq 0 ] && [ "$FAIL_N" -eq 0 ]; then
   echo "✗ ⑥ 첫-부팅 모사: 평가한 앱 어디에도 Contents/MacOS/cys 가 없다 — 기록자 모사 0회로는 PASS 를 선언할 수 없다(레이아웃이 정말 바뀌었다면 게이트를 의도적으로 갱신하라)" >&2
+  echo; echo "=== 판정 불가 ==="; exit 2
+fi
+
+# ⑧ 도 같다 — 런타임을 동봉하는 산출물에서 한 번도 대조하지 못했는데 FAIL 이 0 이면
+# "매니페스트 검증 0회의 PASS" 다. ⑤·⑥ 과 같은 폐쇄를 건다.
+if [ "$RTMAN_TARGETS" -eq 0 ] && [ "$FAIL_N" -eq 0 ]; then
+  echo "✗ ⑧ runtime-manifest: 평가한 앱 어디에도 Contents/Resources/runtime 이 없다 — 대조 0회로는 PASS 를 선언할 수 없다" >&2
   echo; echo "=== 판정 불가 ==="; exit 2
 fi
 

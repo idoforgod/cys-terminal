@@ -37,7 +37,7 @@ echo
 
 if [ -z "$NONPACK" ]; then
   echo "판정: ★PACK-ONLY 레인 (전 변경이 cysjavis-pack/ 내부 — 인테리어만 교체)"
-  echo "  절차: ① 버전 6곳 범프 불요·version-check 불요"
+  echo "  절차: ① 버전 8곳(수동 6 + Cargo.lock 2패키지) 범프 불요·version-check 불요"
   echo "        ② git tag pack-vX.Y.Z && git push origin pack-vX.Y.Z"
   echo "        ③ CI(pack-release.yml)가 서명 팩 3종+latest.json 캐리포워드 발행"
   echo "  버전: pack-vX.Y.Z 는 현재 pack_version(최신 릴리스 manifest)보다 커야 한다"
@@ -48,7 +48,7 @@ else
   echo "판정: 본체(BINARY) 레인 — 팩 외 변경 $N_NP 건 (건물 재시공)"
   echo "$NONPACK" | head -15 | sed 's/^/    /'
   [ "$N_NP" -gt 15 ] && echo "    … 외 $((N_NP-15))건"
-  echo "  절차: 버전 6곳 범프 + Cargo.lock + version-check + git tag vX.Y.Z"
+  echo "  절차: 버전 8곳(수동 6 + Cargo.lock 2패키지) 범프 + version-check + git tag vX.Y.Z"
   # ★A13(v4-repair · 2026-08-16): 릴리스 시퀀싱 1단계는 'win T3 green 증적→태그'다. 태그 파이프라인
   #   (release.yml)과 windows-build.yml 은 기계 결합이 없으므로(트리거 분리·의도), 이 판별기가
   #   런북 수동 순서를 상기시키는 것이 명시 배선이다 — 증적 없이 태그하면 게이트를 사람 손으로 건너뛴 것.

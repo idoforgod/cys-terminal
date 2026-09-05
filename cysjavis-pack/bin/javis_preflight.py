@@ -5605,6 +5605,169 @@ class Preflight:
                  % (bundle, len(added), len(modified), len(missing), ", ".join(rel), pycache,
                     recovery))
 
+    # ── C80 동봉 런타임 봉인 매니페스트 (부트 v2 §2-10 G5 · 명세의 "C-SEAL") ──
+    #
+    # 왜 C76 과 별개인가: C76(코드서명)은 **macOS 전용**이다. Windows 설치본에는 sealed-resource
+    # 봉인이 아예 없어 설치 후 `runtime/**` 오염을 잡을 수단이 0이었다 — 이 체크가 그 공백을
+    # 메운다. mac 에서는 코드서명이 여전히 권위이고(서명 키 없이는 위조 불가) 이건 보조층이다.
+    #
+    # ★등급 WARN 고정(master 판정 2026-09-04 D1 · 레인 분리): 발행 차단은 릴리스 게이트
+    #   (release-gate-gatekeeper.sh)가 FAIL 로 하고, **기계 preflight 는 부팅을 막지 않는다**.
+    #   C76 이 같은 판단을 이미 문서화했다(:5275 "이미 파손된 기계가 READY→NOT READY 로
+    #   뒤집혀 부팅 자체가 막힌다"). 실제로 2026-09-04 오너 머신이 파손 상태였다 — FAIL 등급이면
+    #   그 기계가 그날로 부팅 불능 판정을 받았을 것이다.
+    # ★자동 수정 0: C76 과 같다. 번들 안 파일 삭제는 App Management(TCC)에 막힐 수 있고,
+    #   무엇인지 모르는 파일을 지우는 자동화가 더 위험하다. 처방만 말한다.
+    # ★구버전은 SKIP: 매니페스트는 v0.14.30 부터 실린다. 그 이전 설치본에 없는 것은 정상이며
+    #   경고할 일이 아니다(거짓 경보 금지 — C76 의 '판정 불가는 SKIP' 규율과 동형).
+    #   ★단 "부재=무조건 SKIP" 은 틀렸다(R1 codex #6): 0.14.30 **이상** 설치본에서 매니페스트만
+    #   사라진 경우까지 정상으로 덮으면, Windows 에서 유일한 변조 감지축이 조용히 없어진다
+    #   (mac 은 코드서명이 남지만 Windows 는 남는 게 0). 그래서 부재를 만나면 **설치본 버전을
+    #   판독해** 갈래를 나눈다 — 구버전이면 SKIP, 봉인 탑재 버전이면 WARN, 판독 불가면
+    #   '판정 불가' SKIP(측정 불능은 통과가 아니다 · R1 codex #7 에서 세운 같은 규율).
+    RUNTIME_SEAL_RECOVERY = ("복구는 v0.14.30 이상으로 재설치 — 설치기가 .app(또는 설치 폴더)을 "
+                             "**통째로 교체**하므로 오염 파일이 함께 사라지고 봉인이 자연 복원된다"
+                             "(부분 삭제 불요·권장하지 않음). 상세 진단은 `cys doctor`")
+
+    # 이 봉인(runtime-manifest)이 실리기 시작한 버전. 이보다 낮은 설치본에 없는 것은 정상이다.
+    RUNTIME_SEAL_SINCE = "0.14.30"
+
+    def _installed_version_near(self, root):
+        """설치본 버전 판독 → (버전문자열|None, 판독처 설명). 판독처는 **설치 형태**가 정한다.
+
+        · macOS 번들: `<bundle>/Contents/Info.plist` 의 `CFBundleShortVersionString`
+          (실측 2026-09-04: 오너 설치본 `/Applications/cys.app` = "0.14.29" · XML plist).
+        · 그 외(Windows NSIS 포함): 설치 루트의 `cys-installed-version.txt`.
+          이 마커는 NSIS 훅이 **모든 게이트를 통과한 뒤에만** 쓴다(src-tauri/nsis-hooks.nsh:784
+          `cys_post_ok`) — 즉 '마지막으로 실제 반영된 버전'이다. 판정 재료로서는 정보성이지만
+          (WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:140), 여기서 묻는 것은 '설치가 성공한 버전이
+          무엇인가' 하나뿐이라 이 용도에는 정확하다.
+        판독 실패는 거짓말하지 않고 None 을 돌려준다 — 호출자가 '판정 불가'로 표현한다."""
+        bundle = self._app_bundle_of(root)
+        if bundle:
+            plist = os.path.join(bundle, "Contents", "Info.plist")
+            try:
+                import plistlib
+                with open(plist, "rb") as f:
+                    d = plistlib.load(f)
+                v = d.get("CFBundleShortVersionString") if isinstance(d, dict) else None
+            except Exception as e:  # noqa: BLE001 — 손상 plist·바이너리 형식 등
+                return None, "%s 판독 실패(%s)" % (plist, e)
+            if not isinstance(v, str) or not v.strip():
+                return None, "%s 에 CFBundleShortVersionString 없음" % plist
+            return v.strip(), plist
+        marker = os.path.join(os.path.dirname(root), "cys-installed-version.txt")
+        try:
+            with open(marker, encoding="utf-8", errors="replace") as f:
+                v = f.read().strip()
+        except OSError as e:
+            return None, "%s 판독 실패(%s)" % (marker, e)
+        if not v:
+            return None, "%s 가 비어 있음" % marker
+        return v, marker
+
+    def _runtime_seal_expected(self, ver):
+        """이 버전의 설치본은 매니페스트를 **싣고 있어야 하는가**. True/False/None(판정 불가).
+
+        비교는 결정론 도구(`javis_semver`)에 위임한다 — 문자열 대소 비교를 여기서 재발명하면
+        "0.14.9 vs 0.14.30" 같은 사전식 함정을 다시 만든다. `compare(기준선, 설치본)` 의
+        MAIN_AHEAD = 설치본이 기준선보다 낮다 = 구버전(SKIP).
+        ★알려진 경계: `0.14.30-rc1` 은 semver 상 0.14.30 미만이라 구버전으로 접힌다 —
+        정식 릴리스에만 걸리는 게이트라는 뜻이고, 거짓 경보보다 이쪽이 안전하다(fail-safe)."""
+        if not ver:
+            return None
+        try:
+            import javis_semver as _sv
+        except Exception:  # noqa: BLE001 — 팩에서 빠졌으면 판정 불가(추측 금지)
+            return None
+        verdict, _ev = _sv.compare(self.RUNTIME_SEAL_SINCE, ver)
+        if verdict == _sv.INCOMPARABLE:
+            return None
+        return verdict != _sv.MAIN_AHEAD
+
+    def _find_runtime_seal_pair(self):
+        """(매니페스트 경로, runtime 트리 경로) 또는 None. 설치 형태별 후보를 전부 본다."""
+        cands = []
+        bundle = self._find_app_bundle()
+        if bundle:                                   # macOS .app
+            res = os.path.join(bundle, "Contents", "Resources")
+            cands.append((os.path.join(res, "runtime-manifest.json"),
+                          os.path.join(res, "runtime")))
+        cys = shutil.which("cys")
+        if cys:
+            # 설치 루트 기준(Windows NSIS: %LOCALAPPDATA%\cys · 그 외 비번들 설치).
+            # ★realpath 로 푼다 — 심링크 그림자(예: ~/.local/bin/cys)를 설치 루트로 오인하면
+            #   런타임 트리를 못 찾아 조용히 SKIP 된다.
+            d = os.path.dirname(os.path.realpath(cys))
+            cands.append((os.path.join(d, "runtime-manifest.json"), os.path.join(d, "runtime")))
+            cands.append((os.path.join(d, "resources", "runtime-manifest.json"),
+                          os.path.join(d, "runtime")))
+        for man, root in cands:
+            if os.path.isfile(man) and os.path.isdir(root):
+                return man, root
+        # 매니페스트는 없는데 런타임 트리는 있는가 = 구버전 설치본(정상)인지 구분해 돌려준다.
+        for _man, root in cands:
+            if os.path.isdir(root):
+                return None, root
+        return None, None
+
+    def c80_runtime_seal(self):
+        cid = "C80.runtime-seal"
+        if self.skipped(cid):
+            return
+        try:
+            import javis_runtime_seal as _seal
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "javis_runtime_seal 판독 불가(%s) — 판정 불가" % e)
+            return
+        man, root = self._find_runtime_seal_pair()
+        if not root:
+            self.add(cid, SKIP, "동봉 런타임 트리 미발견(비번들 설치·개발 빌드) — 검사 대상 없음")
+            return
+        if not man:
+            # 부재를 만나면 설치본 버전으로 갈래를 나눈다(R1 codex #6) — 무조건 SKIP 은
+            # "신규 설치에서 매니페스트만 소실"을 정상으로 덮어 감지축을 통째로 없앤다.
+            ver, where = self._installed_version_near(root)
+            expected = self._runtime_seal_expected(ver)
+            if expected is None:
+                self.add(cid, SKIP, "runtime-manifest 부재 + 설치본 버전 판독 불가(%s) — "
+                                    "판정 불가(통과가 아니다) · 트리: %s" % (where, root))
+                return
+            if not expected:
+                self.add(cid, SKIP, "runtime-manifest 부재 — 설치본 %s 는 봉인 도입(v%s) 이전이라 "
+                                    "정상 · 판독처: %s · 트리: %s"
+                         % (ver, self.RUNTIME_SEAL_SINCE, where, root))
+                return
+            self.add(cid, WARN,
+                     "runtime-manifest 부재 — 설치본 %s 는 봉인 탑재 버전(v%s 이상)인데 매니페스트가 "
+                     "없다: 설치 후 runtime/** 변조를 잡을 축이 사라진 상태다(Windows 에는 코드서명 "
+                     "봉인이 없어 이것이 유일한 축) · 판독처: %s · 트리: %s · %s"
+                     % (ver, self.RUNTIME_SEAL_SINCE, where, root, self.RUNTIME_SEAL_RECOVERY))
+            return
+        try:
+            m = _seal.load_manifest(man)
+            d = _seal.classify(m, root)
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "봉인 대조 실패(%s) — 판정 불가" % e)
+            return
+        total = len(d["missing"]) + len(d["added"]) + len(d["changed"])
+        if total == 0:
+            self.add(cid, PASS, "동봉 런타임 봉인 무결 — 항목 %d개 일치(%s)"
+                     % (len(m.get("entries") or {}), root))
+            return
+        # 원인 파일을 말한다 — "손상되었습니다" 한 줄은 안내가 아니다(C76 과 같은 규율).
+        sample = (d["added"] + d["changed"] + d["missing"])[:3]
+        npm_hint = ""
+        if any("node_modules" in p or p.startswith("node/bin/") for p in
+               (d["added"] + d["changed"])):
+            npm_hint = (" ★node_modules 오염 — `npm i -g <패키지>` 가 동봉 node 의 기본 prefix"
+                        "(=번들 안)로 설치된 흔적이다. 전역 설치는 번들 밖 prefix 로 하라")
+        self.add(cid, WARN,
+                 "동봉 런타임 봉인 파손 — 추가 %d건·변경 %d건·누락 %d건(예: %s)%s · 이 설치본을 "
+                 "그대로 재배포하면 받는 쪽에서 무결성 검증이 깨진다 · %s"
+                 % (len(d["added"]), len(d["changed"]), len(d["missing"]),
+                    ", ".join(sample), npm_hint, self.RUNTIME_SEAL_RECOVERY))
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -5652,6 +5815,10 @@ class Preflight:
             # C81(부트 v2 A6 · W-B #2 협업) — 데몬이 판정한 npm_config_prefix 번들 오염 **소비**.
             #   WARN-only(값을 덮지 않는 것이 계약 — 부트를 막지 않는다).
             self.c81_npm_prefix_polluted,
+            # C80(2026-09-04 부트 v2 §2-10) — 동봉 런타임 봉인 매니페스트. 읽기 전용·WARN-only.
+            # Windows 에는 코드서명 봉인(C76)이 없어 이 체크가 유일한 변조 탐지다.
+            # 번호 규율: C63·C64 는 결번 재사용 금지라 다음 자유 번호는 C80(§5-4).
+            self.c80_runtime_seal,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

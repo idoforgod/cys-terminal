@@ -6,7 +6,7 @@ name: release
 #   (P0 이력: 과거 '--draft=수동 Publish 누락 위험'으로 자동 발행을 썼으나, v0.14.0(2026-07-28)부터
 #    draft 생성까지만 CI — 공개 발행·latest 마킹은 오너 승인 후 별도 집행이 정책이다. 되돌리지 마라.
 #    구 배포 repo cys-terminal-releases는 Archive — 마지막 미러가 구 설치본 이주 경로로 영구 생존.)
-# 사용: 버전 6곳 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
+# 사용: 버전 8곳(수동 6 + Cargo.lock 2패키지) 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
 #       (수동 실행도 가능 — Actions 탭 Run workflow)
 # 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY
 
@@ -208,11 +208,35 @@ jobs:
         shell: bash
         run: bash scripts/secret-scan.sh --all
 
-      # 버전 SOT 6곳 일치 hard-gate — 드리프트인 채 발행 차단(v0.12.11에서 wxs 2곳 0.12.10 잔류
+      # ★H-SECRET-1 — 스캐너가 **살아 있는가**를 증명하는 메타 게이트 (IG-2 · master 지시 2026-09-04).
+      #   위 secret-scan.sh 는 트리가 깨끗하면 초록이다. 그런데 **스캐너가 죽어 있어도**(정규식
+      #   파손·조기 exit 0·파일 목록 0건) 깨끗한 트리는 똑같이 초록이다 — 종료코드만 보는 게이트는
+      #   자기 고장을 통과로 접는다. H-SECRET-1 은 규칙별 양성 표본을 임시 파일(저장소 밖)에 넣고
+      #   **그 규칙 라벨로** 잡히는지까지 확인한다(라벨을 보는 이유: 아무 규칙이나 걸려도 exit 1 이라
+      #   6종 중 5종이 죽어도 종료코드는 같다). 자기 면제 동결도 함께 본다.
+      #   ★왜 지금 넣는가: 2026-09-04 팩 fixture 에 오너 핸들이 실제로 유출됐고(수리 011a6f6),
+      #   그 계급을 잡는 규칙(handle→HANDLE)이 이 검체 안에 있다. 종전에 이 검체는 ci-branch
+      #   잡2 에서만 돌았고 **발행 레인에는 0회** 였다 — "안 도는 검체는 게이트가 아니다".
+      #   실측 22.1s(러너 자기완결·저장소 밖 임시파일·사용자 HOME 무접촉).
+      - name: H-SECRET-1 — 시크릿 스캐너 계측 타당성 (발행 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "::error::건강성 러너 누락: $R — 스캐너 계측 타당성 판정 불가(fail-closed)"; exit 1; }
+          python3 "$R" --only H-SECRET-1
+
+      # 버전 SOT 8곳(수동 6 + Cargo.lock 2패키지) 일치 hard-gate — 드리프트인 채 발행 차단
+      # (v0.12.11에서 wxs 2곳 0.12.10 잔류
       # 실증·2026-07-05). 태그 push면 태그=소스 버전까지 단언, workflow_dispatch(브랜치)면 상호 일치만.
       - name: Version SOT check (drift hard-gate)
         shell: bash
         run: |
+          # ★음성 대조 선행(2026-09-04 W-C R2 ②): 아래 version-check.sh 를 발행 차단 근거로
+          #   신뢰하기 **직전에**, 그 게이트가 8곳 중 하나만 누락돼도 실제로 죽는지 증명한다.
+          #   통과만 보이는 게이트는 '언제나 초록인 검사'와 구별되지 않는다. 하네스는 임시
+          #   디렉터리 사본만 변조하므로 작업 트리를 건드리지 않는다(stdlib 전용·네트워크 0).
+          python3 scripts/tests/test_version_sot_mutation.py
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             sh scripts/version-check.sh "$GITHUB_REF_NAME"
           else
@@ -353,13 +377,21 @@ jobs:
           #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
           #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
+          # ★C1(2026-09-04 · 부트 v2 W-C): test_runtime_seal 편입 — 동봉 런타임 봉인 매니페스트
+          #   (javis_runtime_seal.py)의 회귀 핀. 대상 모듈은 배송 팩 내용물이고, Windows 는
+          #   코드서명 sealed-resource 봉인이 없어 **설치 후 runtime/** 오염을 잡을 유일한 수단**이다.
+          #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
+          #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
+          #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
-                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
@@ -452,6 +484,21 @@ jobs:
             exit 1
           fi
           ls -la "$RT/git/bin/bash.exe"
+          # ── runtime-manifest 산출 (부트 v2 명세 §2-10 G5 · 티켓 C1) ──
+          # Windows 에는 코드서명 sealed-resource 봉인이 없다 — 설치 후 runtime/** 오염
+          # (예: npm i -g 가 번들 안으로)을 탐지할 수단이 이 매니페스트뿐이다.
+          # mac 과 달리 여기는 소스 트리에서 떠도 된다: Windows 레그엔 inside-out 재서명도
+          # 심볼릭링크 역참조도 없어 이 트리가 그대로 NSIS 에 실린다. **그 전제 자체를**
+          # windows-build.yml 의 설치 후 검증 스텝이 실기로 대조한다(가정을 측정으로 바꾼다).
+          # 러너 python 을 쓴다(동봉 python 으로 돌리면 그 import 가 트리 안에 __pycache__ 를
+          # 써서 검증 대상을 오염시킨다 — SEAL-1 과 같은 계급).
+          # ★PYTHONUTF8=1 — 러너 기본 stdout 인코딩(cp1252/cp949)에 `✓` 가 없어 성공 메시지가
+          #   UnicodeEncodeError 로 죽고, 그 exit 1 이 이 도구 계약의 '불일치'와 겹쳤다
+          #   (2026-09-04 windows-build 실사고 · 도구 자신도 _widen_stdio 로 닫았다 — 이건 2층).
+          PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py emit \
+            --root "$RT" --out src-tauri/resources/runtime-manifest.json \
+            --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
+            --source win-src
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
       # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를
@@ -540,7 +587,10 @@ jobs:
       #   돌지 않아, 봉인이 깨진 앱도 조용히 통과한다(2026-08-01 실사고 "손상되었기 때문에 열 수
       #   없습니다" — 공증·staple 은 정상이었고 동봉 python 의 .pyc 쓰기가 봉인을 깼다. 당시 검증은
       #   curl 사본=quarantine 없음만 봐서 사고 경로를 한 번도 재현하지 못했다).
-      #   이 스텝은 그 경로를 CI 에서 기계로 재현한다 — 사본에 quarantine 부착 → 마운트 → ditto 설치
+      #   이 스텝은 그 경로를 CI 에서 기계로 재현한다 — 사본에 quarantine 부착 → ⑦ DMG 봉투 평가
+      #   (xcrun stapler validate + spctl --assess --type open --context context:primary-signature ·
+      #   W-C 신설 2026-09-03: 종전 ①~⑥ 은 DMG **안의 앱**만 봤고, 사용자가 격리 DMG 를 여는 순간
+      #   평가되는 DMG 자신의 서명·공증 티켓은 무검증이었다) → 마운트 → ditto 설치
       #   모사 → codesign --verify --deep --strict + stapler validate + spctl --assess.
       # **왜 여기(업로드 앞)인가**: Windows CRT 게이트와 동형. tauri-action(수집·업로드) 뒤에 두면
       #   draft 정책이 뒤집히는 순간 공개된 산출물을 사후 실패시키는 구조 의존이 된다. 앞에 세워
@@ -552,6 +602,23 @@ jobs:
       #   그 플래그 문자열 자체를 싣지 않음은 test_release_postprocess_gate.py 의 핀이 지키므로
       #   여기 주석에도 문자열을 쓰지 않는다. v0.14.19 실측
       #   (run 32039644404) 두 레그 모두 full 모드였으므로 이 폐쇄의 릴리스 경로 회귀는 0이다.
+      # ★게이트의 회귀 그물을 **게이트 직전에** 돌린다 (R1 codex #10 · 2026-09-04).
+      #   종전에 test_release_postprocess_gate.py 는 **어느 레인에서도 실행 0회**였다 —
+      #   release.yml 안 유일 등장이 주석 한 줄(:559)이었고 레인 대조 게이트는 주석을 제거한
+      #   뒤 스캔하므로 그 비대칭조차 보이지 않았다. 30 검체가 ①~⑧ 축·진단 플래그 부재 핀·
+      #   후처리 배선을 지키는데, 그것들이 검증 0회로 발행 경로에 실려 있었다.
+      #   여기(게이트 호출 직전)가 자리인 이유: 아래 게이트를 **발행 차단 근거로 신뢰하기
+      #   직전에** 그 게이트가 실제로 결함을 잡는지 증명한다(version-check 음성 대조와 같은 규율).
+      #   합성 픽스처·tempfile 전용(러너 자기완결·산출물 무접촉) · 실측 약 8s.
+      - name: 릴리스 게이트 회귀 그물 (test_release_postprocess_gate · 게이트 신뢰 직전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_release_postprocess_gate.py"
+          [ -f "$f" ] || { echo "::error::게이트 회귀 그물 누락: $f (git add 누락 의심) — 이 파일 없이 게이트를 신뢰할 수 없다" >&2; exit 1; }
+          python3 "$f"
+
       - name: macOS Gatekeeper 게이트 (quarantine 부착 + spctl 실평가 · 업로드 전)
         if: matrix.platform == 'macos-latest'
         shell: bash
@@ -577,6 +644,7 @@ jobs:
               echo "### macOS Gatekeeper 게이트 — $(basename "$d") (${{ matrix.target }})"
               grep -E '^GATE_MODE=' "$GLOG" | tail -1 || echo 'GATE_MODE=(미출력 — 태그 트리의 게이트 스크립트가 구판)'
               grep -E '^spctl: ' "$GLOG" | tail -1 || true
+              grep -E '^(PASS|FAIL) ⑦' "$GLOG" || echo '⑦ DMG 축 (미출력 — 태그 트리의 게이트 스크립트가 구판)'
               echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가·degraded 폐쇄 포함)"
               echo
             } >> "$GITHUB_STEP_SUMMARY"
@@ -638,6 +706,15 @@ jobs:
           #     로그에서 재검한다. !error 는 makensis 를 이미 hard-fail 시키고 pipefail 이 그 종료코드를
           #     보존한다(1차 게이트) — grep 은 래퍼가 종료코드를 삼키는 회귀·가드의 경고 강등 회귀까지
           #     로그 층에서 잡는 2차 벨트다. 토큰은 계약 문서의 문자열 그대로(창작 금지).
+          # ── runtime-manifest 번들링 직전 자기대조 (부트 v2 §2-10 · 티켓 C1·D3) ──
+          # 잴 수 있는 것만 잰다: "**실을 매니페스트**가 **실을 트리**와 맞는가". prep 에서 뜬 뒤
+          # 여기까지 오는 사이에 트리를 건드린 스텝이 있으면 여기서 걸린다(무음 드리프트 차단).
+          # ★설치본 트리와의 대조는 여기서 못 한다 — setup.exe 안 레이아웃은 풀어봐야 알고,
+          #   그 실측은 windows-build.yml 의 **실제 무인 설치 후 대조** 스텝이 담당한다.
+          #   이 레인은 그보다 약한, 그러나 확실한 축만 맡는다(측정 못 하는 것을 측정한 척하지 않는다).
+          PYTHONDONTWRITEBYTECODE=1 python3 cysjavis-pack/bin/javis_runtime_seal.py verify \
+            --root src-tauri/runtime --manifest src-tauri/resources/runtime-manifest.json \
+            --max-list 30 || { echo "::error::runtime-manifest 가 번들링 직전 트리와 불일치 — 발행 차단" >&2; exit 1; }
           bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" build --target "${{ matrix.target }}" --verbose 2>&1 | tee nsis-build.log
           if grep -E 'refusing to build a blind oracle|sidecar source not found at compile time|version resource regression' nsis-build.log; then
             echo "::error::NSIS 훅 빌드 가드 발화(위 매치 라인) — 오라클 전제가 깨진 설치기는 출하 금지(NSIS-CONTRACT.md §5)" >&2
@@ -792,6 +869,24 @@ jobs:
         shell: bash
         run: bash scripts/secret-scan.sh --all
 
+      # ★H-SECRET-1 — 스캐너가 **살아 있는가**를 증명하는 메타 게이트 (IG-2 · master 지시 2026-09-04).
+      #   위 secret-scan.sh 는 트리가 깨끗하면 초록이다. 그런데 **스캐너가 죽어 있어도**(정규식
+      #   파손·조기 exit 0·파일 목록 0건) 깨끗한 트리는 똑같이 초록이다 — 종료코드만 보는 게이트는
+      #   자기 고장을 통과로 접는다. H-SECRET-1 은 규칙별 양성 표본을 임시 파일(저장소 밖)에 넣고
+      #   **그 규칙 라벨로** 잡히는지까지 확인한다(라벨을 보는 이유: 아무 규칙이나 걸려도 exit 1 이라
+      #   6종 중 5종이 죽어도 종료코드는 같다). 자기 면제 동결도 함께 본다.
+      #   ★왜 지금 넣는가: 2026-09-04 팩 fixture 에 오너 핸들이 실제로 유출됐고(수리 011a6f6),
+      #   그 계급을 잡는 규칙(handle→HANDLE)이 이 검체 안에 있다. 종전에 이 검체는 ci-branch
+      #   잡2 에서만 돌았고 **발행 레인에는 0회** 였다 — "안 도는 검체는 게이트가 아니다".
+      #   실측 22.1s(러너 자기완결·저장소 밖 임시파일·사용자 HOME 무접촉).
+      - name: H-SECRET-1 — 시크릿 스캐너 계측 타당성 (발행 차단)
+        shell: bash
+        run: |
+          set -euo pipefail
+          R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+          [ -f "$R" ] || { echo "::error::건강성 러너 누락: $R — 스캐너 계측 타당성 판정 불가(fail-closed)"; exit 1; }
+          python3 "$R" --only H-SECRET-1
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
@@ -855,13 +950,21 @@ jobs:
           #   산식이 파이썬 검체 0건(무측정 변경)이던 격차 봉합. 픽스처 원장·뮤테이션
           #   양방향(PASS↔WARN) 검증 · 3완전 레인 동시·대칭 등재(release 는 양 루프) ·
           #   격리 CYS_PACK_DIR 하네스(라이브 무접촉) · 실측 0.01s.
+          # ★C1(2026-09-04 · 부트 v2 W-C): test_runtime_seal 편입 — 동봉 런타임 봉인 매니페스트
+          #   (javis_runtime_seal.py)의 회귀 핀. 대상 모듈은 배송 팩 내용물이고, Windows 는
+          #   코드서명 sealed-resource 봉인이 없어 **설치 후 runtime/** 오염을 잡을 유일한 수단**이다.
+          #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
+          #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
+          #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
-                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
