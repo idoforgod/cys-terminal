@@ -583,6 +583,42 @@ jobs:
       #   release(소비 직전 증명)에서 잡는다. 밀폐 합성 PE 픽스처·tempfile 만 사용(러너 자기완결 ·
       #   실측 0.01s). 팩 스위트가 아니므로 pack-release 미편입 — 사유는 위 레인 대조 게이트의
       #   ALLOWED("test_verify_win_crt") 등재 참조(대상이 팩 tar 에 실리지 않는다).
+      # ★IG-35 1단계(2026-09-05 · master 지시): **CI 는 팩 검체군을 돌지 않는다.** 등재 76 종 중
+      #   CI 어느 레인에도 없는 것이 47 종이었고(실측), 그래서 같은 트리에서 health 초록과 팩 검체
+      #   적색이 동시에 성립했다 — IG-31 과 같은 계급이고 규모가 더 크다("안 도는 검체는 게이트가
+      #   아니다"의 재발). 좁힌 축부터 시작하고 전수 확대는 초록 1사이클 뒤다(A10 승격 관행).
+      #   ★이번에 넣은 것(3종 · 실측 합계 0.75s): 이번 릴리스가 실제로 겪은 사고 세 갈래를 재는
+      #     것들이다 — 본 레인 원장 오염 격리 · settings 찢긴 쓰기 · 상태 루트.
+      #   ★뺀 것과 이유(문면에 남긴다):
+      #     · test_lane_isolation_v1 — 실측 43s. 값은 높지만 러너 예산 때문에 **확대 1순위**로 미룬다.
+      #     · test_preflight_phase1_checks · test_verify_gate — `JAVIS_ROOT`·`CYS_PROBE_RUNS` 격리
+      #       env 가 없으면 **rc 2 하드 거부**다(라이브 오염 차단 가드). 배선 표면이 커져 2단계로.
+      #     · test_phoenix_* 13 종 — 격리 하네스가 데몬을 띄운다. CI 초행이라 **환경 기인 적색**
+      #       위험이 크다(IG-12 가 기록한 계급). 초록 1사이클 뒤에 넣는다.
+      #     · Windows·release 레인 대칭 등재도 초록 1사이클 뒤(IG-31 이 그렇게 했다).
+      #   ★배선 함정 회피(IG-31 에서 W-C 가 한 그대로): ①이 스텝에 `if:` 를 달지 않는다(돌지 않는
+      #     초록 금지) ②rc 를 잡은 뒤 **파싱보다 먼저** 로그 꼬리를 방출한다(보고가 실패 하류에
+      #     있으면 적색의 이유가 사라진다) ③트리거 대조 완료 — 이 파일은 `branches: ['feat/**',
+      #     'fix/**']` 이고 통합 브랜치 `fix/0.14.30-bugfix` 가 `fix/**` 에 매치한다(실측).
+      - name: 팩 검체 — 레인·상태 격리군 (IG-35 1단계 · macOS)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t (mac) =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$f" > "/tmp/ig35-$t.log" 2>&1
+            r=$?
+            tail -40 "/tmp/ig35-$t.log"
+            if [ $r -ne 0 ]; then
+              echo "::error::$t rc=$r (IG-35 1단계 — 적색이면 좁히지 말고 그대로 보고한다)"
+              rc=$r
+            fi
+          done
+          exit $rc
+
       - name: verify_win_crt 게이트 도구 밀폐 스위트 (macOS)
         shell: bash
         run: |

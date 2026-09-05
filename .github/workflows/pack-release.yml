@@ -186,6 +186,7 @@ jobs:
                    test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
                    test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
                    test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
