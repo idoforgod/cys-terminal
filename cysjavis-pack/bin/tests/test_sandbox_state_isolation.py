@@ -215,20 +215,57 @@ else:
           "크기 %d→%d · 앞4KB %s" % (before_jsonl[0], after_jsonl[0],
                                      "동일" if same_head else "변경됨"))
 
-# ── 4. 레인 판정 핀 — 샌드박스 소켓이 base 로 접힌다 ──────────────────────────
-dv = os.path.join(REPO, "src", "bin", "cysd", "delivery.rs")
-if not os.path.isfile(dv):
+# ── 4. 레인 판정 핀 — Rust 판정부가 **현 규칙**을 쓰는가 ─────────────────────
+#    ★2026-09-05 수리: 이 절은 `src/bin/cysd/delivery.rs` 한 곳만 보고 있었는데, W-B 의
+#      `161d306` 이 레인 판정을 **`src/lane.rs` 단일 소유자로 승격**하면서 그 파일에서 함수가
+#      사라졌다. 종전 코드는 미발견 시 `body` 가 **빈 문자열**이 되어 뒤 단언이 '없다'를 참으로
+#      돌려주는 자리였다 — 통합 트리에서 세 축이 동시에 죽었고, 그건 결함이 아니라 **핀이 재는
+#      자리를 잃은 것**이다(IG-19·H-META-PIN 과 같은 계급). 그래서 셋을 고친다:
+#      ⓐ 소유 후보를 순서대로 찾고 **어디서도 못 찾으면 명시적 실패**다(빈 본문 단언 금지).
+#      ⓑ 단언을 **현 규칙**(부모 디렉터리가 정확히 `cys`)으로 갱신하고, 그 단언이 **구 구현에서는
+#         걸리지 않는다**는 음성 대조를 함께 둔다 — 구 구현에서도 통과하는 단언은 규칙을 재지 않는다.
+#      ⓒ 승격 전 트리(그 함수가 아직 delivery.rs 에 있고 구 규칙인 트리)는 **PEND**로 크게 적는다.
+#         조용히 통과시키지 않으며, 그 경우에도 '구 규칙이 실재한다'를 단언해 축을 비우지 않는다.
+_LANE_OWNERS = (os.path.join("src", "lane.rs"),                       # 161d306 승격 후 소유자
+                os.path.join("src", "bin", "cysd", "delivery.rs"))    # 승격 전 소유자
+_CUR_RULE = 'it.next() == Some("cys")'      # 부모 디렉터리까지 본다(715ccb9 · W-B Rust 파리티)
+_OLD_RULE = 'last == "cys" || last == "cys.sock"'
+_OLD_IMPL_SNIPPET = (                        # 음성 대조용 — 승격 전 구현의 판정 꼬리(사본)
+    'fn socket_is_base(sock: &str) -> bool {\n'
+    '    let norm = sock.replace(\'\\\\\', "/");\n'
+    '    let last = norm.rsplit(\'/\').next().unwrap_or("");\n'
+    '    last == "cys" || last == "cys.sock"\n}')
+_owner, _body = None, ""
+if not os.path.isdir(os.path.join(REPO, "src")):
     print("SKIP 4 레인 판정 핀(src 부재 — 팩 단독 배포)")
 else:
-    with io.open(dv, encoding="utf-8", errors="replace") as f:
-        src = f.read()
-    i = src.find("fn socket_is_base(")
-    body = src[i:src.find("\n}\n", i)] if i > 0 else ""
-    check("4 socket_is_base 실재", i > 0)
-    check("4b 판정이 basename 만 본다(=샌드박스 cys.sock 도 base)",
-          'last == "cys" || last == "cys.sock"' in body,
-          "이 성질 때문에 CYS_STATE_DIR 누락이 곧 본 레인 조준이 된다")
-    check("4c 부서 레인만 분리된다(cys-dept- 성분)", 'part.starts_with("cys-dept-")' in body)
+    for _rel in _LANE_OWNERS:
+        _fp = os.path.join(REPO, _rel)
+        if not os.path.isfile(_fp):
+            continue
+        with io.open(_fp, encoding="utf-8", errors="replace") as f:
+            _src = f.read()
+        _i = _src.find("fn socket_is_base(")
+        if _i > 0:
+            _owner, _body = _rel, _src[_i:_src.find("\n}\n", _i)]
+            break
+    # ⓐ 미발견은 조용한 통과가 아니라 **실패**다(승격 경로가 또 바뀌면 여기서 운다).
+    check("4 레인 판정 함수 소유자를 찾았다(미발견=적색 · 빈 본문 단언 금지)",
+          bool(_owner) and bool(_body), "후보=%r" % (_LANE_OWNERS,))
+    # ⓑ 음성 대조 먼저 — 현 규칙 핀이 **구 구현에서는 걸리지 않아야** 한다.
+    check("4a′ 음성 대조: 현 규칙 핀이 구 구현에는 걸리지 않는다(핀의 판별력)",
+          _CUR_RULE not in _OLD_IMPL_SNIPPET and _OLD_RULE in _OLD_IMPL_SNIPPET)
+    if _CUR_RULE in _body:
+        check("4b 판정이 **부모 디렉터리까지** 본다(승격 후 현 규칙 · 샌드박스 cys.sock 은 비-base)",
+              True, "소유자=%s" % _owner)
+    else:
+        # ⓒ 승격 전 트리 — 크게 적고, 축을 비우지 않기 위해 구 규칙 실재를 단언한다.
+        print("PEND 4b 현 규칙 핀 미발효 — 이 트리는 레인 판정 승격(161d306) 전이다"
+              "(소유자=%s · C4 유입 시 자동 발효)" % _owner)
+        check("4b(승격 전) 구 규칙이 실재한다 — 축을 비우지 않는다",
+              _OLD_RULE in _body, "소유자=%s" % _owner)
+    check("4c 부서 레인만 분리된다(cys-dept- 성분 · 승격 전후 공통 규칙)",
+          'part.starts_with("cys-dept-")' in _body)
 
 # ── 5. 팩 내장 하네스(javis_phoenix_harness) 격리 — 실사고의 진짜 오염자 ──────────
 #    2026-09-04: 오염자는 손으로 만든 샌드박스가 아니라 **팩이 스스로 돌리는 시험 하네스**였다.
