@@ -219,10 +219,18 @@ pub const ENV_SUPERVISOR: &str = "CYS_BOOT_SUPERVISOR";
 /// 봤는가" 를 재구성하는 것은 거의 불가능하다. 그래서 판독은 데몬 1회이고 나머지는 물어본다.
 pub const ENV_BOOT_V2: &str = "CYS_BOOT_V2";
 
-/// [`ENV_BOOT_V2`] 판독(순수). `Some("0")` 만 끔 — 미설정·빈값·그 외는 켜짐이다.
+/// [`ENV_BOOT_V2`] 판독(순수) — **기본 꺼짐**. 켜는 쪽만 명시적이다.
+///
+/// ## ★극성을 뒤집었다(2026-09-05 · master 판정 · IG-33 §5)
+/// 명세 §5 는 "기본 1"(켜짐)로 적지만, v0.14.30 은 부트 v2 를 **휴면으로 싣는다**. 러너
+/// (B4-R)·자동 arm·레인 락이 없는 상태이므로 기본 켜짐으로 출하하면 사용자가 켠 적 없는
+/// 경로가 기본값으로 돈다. 그래서 이 릴리스에서는 **opt-in** 이다.
+/// ★명세와 갈린 채로 두지 않는다 — 이 divergence 는 master 판정으로 등재됐고, 여기 적는 이유는
+/// 다음 사람이 명세만 보고 "기본 1 인데 코드가 틀렸다" 며 되돌리지 않게 하기 위해서다.
+///
 /// (`supervisor_off_from` 과 **반대 극성**인 점에 주의: 그쪽은 "꺼짐인가", 이쪽은 "켜짐인가".)
 pub fn boot_v2_enabled_from(env_val: Option<&str>) -> bool {
-    env_val != Some("0")
+    matches!(env_val.map(str::trim), Some("1") | Some("true"))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3227,18 +3235,52 @@ mod tests {
         assert_eq!(decide(&v1, 0, 1.0), Disposition::Retire("schema_mismatch"));
     }
 
-    /// ★롤백 스위치 판독(명세 §5) — 기본 켜짐, `0` 만 끔. `supervisor_off_from` 과 **극성이
-    /// 반대**라 한쪽을 복사해 쓰면 조용히 뒤집힌다.
+    /// ★롤백 스위치 판독 — **기본 꺼짐**(2026-09-05 · master 판정 · IG-33 §5).
+    ///
+    /// ★종전 기대치는 '기본 켜짐' 이었다(명세 §5 "기본 1"). v0.14.30 이 부트 v2 를 **휴면으로
+    /// 싣기로** 확정되면서 전제가 바뀌었다 — 러너(B4-R)·자동 arm·레인 락이 없는 상태에서 기본
+    /// 켜짐이면 사용자가 켠 적 없는 경로가 기본값으로 돈다. **약화가 아니라 전제 교체**이고,
+    /// 명세와의 divergence 는 master 판정으로 등재됐다.
     #[test]
-    fn boot_v2_switch_defaults_on_and_only_zero_turns_it_off() {
-        assert!(boot_v2_enabled_from(None), "미설정은 켜짐이어야 한다");
-        assert!(boot_v2_enabled_from(Some("")), "빈값은 켜짐");
+    fn boot_v2_switch_defaults_off_and_only_explicit_turns_it_on() {
+        assert!(!boot_v2_enabled_from(None), "미설정이 켜짐이면 opt-in 이 아니다");
+        assert!(!boot_v2_enabled_from(Some("")), "빈값이 켜짐이면 안 된다");
+        assert!(!boot_v2_enabled_from(Some("yes")), "미지값이 켜짐이면 안 된다(켜는 쪽만 명시적)");
+        assert!(!boot_v2_enabled_from(Some("0")), "0 은 당연히 꺼짐");
         assert!(boot_v2_enabled_from(Some("1")));
-        assert!(boot_v2_enabled_from(Some("yes")));
-        assert!(!boot_v2_enabled_from(Some("0")), "0 이 끔이어야 한다");
+        assert!(boot_v2_enabled_from(Some("true")));
+        assert!(boot_v2_enabled_from(Some(" 1 ")), "공백은 다듬어 받는다");
         // 극성 대조 — 두 스위치를 헷갈리면 롤백이 정반대로 동작한다.
         assert!(supervisor_off_from(Some("0"), None));
         assert!(!supervisor_off_from(None, None));
+    }
+
+    /// ★B6 음성 대조(master 제약) — **토글을 켜도 fence 는 arm 되지 않는다.**
+    ///
+    /// v0.14.30 은 부트 v2 를 휴면으로 싣는다. 그런데 토글만 켜지고 fence 가 반쯤 발효하면
+    /// 사용자는 켰다고 믿는데 실제로는 아무 일도 일어나지 않거나 — 더 나쁘게는 절반만
+    /// 일어난다. 두 축이 **독립**임을 못 박는다: 스위치는 '감독자 경로를 쓰는가' 이고
+    /// fence 무장은 '러너 계약이 빌드에 있는가' 다.
+    ///
+    /// ★'켜지지 않음' 과 '필드 부재' 를 접지 않는다: 여덟 칸은 **존재하고 전부 false** 이며,
+    /// `missing()` 이 그 여덟을 **이름으로** 돌려준다. 정보가 없는 것이 아니라 없다고 말할 수
+    /// 있는 상태다.
+    #[test]
+    fn turning_the_v2_toggle_on_does_not_arm_the_fence() {
+        assert!(boot_v2_enabled_from(Some("1")), "전제: 토글이 켜졌다");
+        // B4-R 부재 — 여덟 칸이 전부 false 다(부재가 아니라 false 다).
+        assert!(!RUNNER_READINESS.ready(), "토글과 무관하게 빌드는 준비되지 않았다");
+        assert_eq!(
+            RUNNER_READINESS.missing().len(),
+            8,
+            "준비 안 된 칸을 이름으로 말하지 못한다 — '켜지지 않음' 과 '정보 없음' 이 같아진다: {:?}",
+            RUNNER_READINESS.missing()
+        );
+        // ★그리고 env 로 무장을 요구해도 켜지지 않는다 — 두 축이 AND 이기 때문이다.
+        assert!(
+            !fence_armed_from(Some("1"), RUNNER_READINESS),
+            "토글이 켜진 상태에서 fence 가 무장했다 — 러너 없이 반쯤 발효한다"
+        );
     }
 
     /// ★유계성 — 실패하는 실행자에 대해 디스패치 총량이 `MAX_ATTEMPTS` 를 넘지 않는다.

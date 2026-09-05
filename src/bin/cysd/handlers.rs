@@ -8996,6 +8996,56 @@ mod tests {
         );
     }
 
+    // CYS_BOOT_V2 는 프로세스 전역 env 라 판독 윈도를 직렬화한다(ACL_ENV_LOCK 과 같은 패턴).
+    // 현재 이 값을 심는 테스트는 없지만, 없다는 사실에 기대는 검체는 다음 사람이 하나를
+    // 추가하는 순간 조용히 무의미해진다 — 기대지 않고 잠근다.
+    static BOOT_V2_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// ★음성 대조(2026-09-05 · master 판정) — **미설정이면 안팎이 모두 꺼짐이어야 한다.**
+    ///
+    /// 바로 위 검체는 "노출된다는 사실"만 재고 값은 재지 않았다. 그 틈에서 이번 건이 자랐다 —
+    /// 극성이 opt-out 이던 시절 `org.status` 는 아무도 켠 적 없는 스위치를 **켜졌다고 답했다**.
+    /// 거동은 바뀌지 않았지만(러너 부재로 아무것도 spawn 되지 않고 `fence_armed` 는 별개 축이라
+    /// false 다) **제품이 자기 자신에 대해 거짓을 말했다.**
+    ///
+    /// ★그래서 **내부 판독과 바깥에 답하는 값을 따로** 잰다. 둘이 갈리는 것이 이 건의 핵심이고,
+    /// 한쪽만 재는 검체는 갈라진 순간을 잡지 못한다.
+    #[test]
+    fn unset_boot_v2_reads_off_inside_and_answers_off_outside() {
+        let _g = BOOT_V2_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok();
+        std::env::remove_var(crate::boot_supervisor::ENV_BOOT_V2);
+
+        // ⓐ 안쪽 — 순수 판독.
+        let inside = crate::boot_supervisor::boot_v2_enabled_from(
+            std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok().as_deref(),
+        );
+
+        // ⓑ 바깥 — 데몬이 밖에 답하는 값.
+        let dir = std::env::temp_dir().join(format!("cysd-bv2off-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        // ★단언보다 먼저 되돌린다 — 실패해도 프로세스 전역 env 를 더럽힌 채 나가지 않는다.
+        if let Some(v) = saved {
+            std::env::set_var(crate::boot_supervisor::ENV_BOOT_V2, v);
+        }
+
+        assert!(!inside, "미설정인데 내부 판독이 켜짐이다 — opt-in 이 아니다");
+        assert_eq!(
+            r["result"]["boot_v2_enabled"],
+            json!(false),
+            "미설정인데 org.status 가 켜졌다고 답한다 — 꺼진 기능을 켜졌다고 말하는 것이다 ({r})"
+        );
+    }
+
     /// ★B5(§2-8) H-NONCE-1..5 — 논스 ack 저장 모델의 다섯 갈래를 한자리에서 잰다.
     ///
     /// ★arm 은 이번 릴리스에서 **explicit RPC 하나뿐**이다(A19-1). 자동 arm-at-inject 는 주입
@@ -11405,7 +11455,16 @@ mod tests {
         assert_eq!(r1["result"]["enqueued"], json!(true), "응답: {r1}");
         assert_eq!(r1["result"]["outcome"], json!("enqueued"));
         assert_eq!(r1["result"]["surface_id"], json!(sid));
-        assert_eq!(r1["result"]["executor"], json!("runner"), "기본 스위치는 v2 러너다");
+        // ★전제 교체(2026-09-05 · master · IG-33 §5): 종전 기대치는 "기본 스위치는 v2 러너다"
+        //   였다. v0.14.30 이 부트 v2 를 **휴면으로 싣기로** 확정되면서 `CYS_BOOT_V2` 가
+        //   opt-in(기본 꺼짐)이 됐고, 그래서 미설정 환경의 스냅샷은 python 이다.
+        //   ★약화가 아니라 전제 교체다 — 스냅샷이 스위치를 **따라간다**는 계약 자체는 그대로이고,
+        //   그 계약을 재는 값만 바뀌었다.
+        assert_eq!(
+            r1["result"]["executor"],
+            json!("python"),
+            "기본(opt-in 미설정) 스위치에서 스냅샷이 python 이 아니다 — 스위치를 안 따라간다"
+        );
         // ⓐ 같은 선언 이벤트의 **재전송** → dedup · 파일 1건(종전엔 2건이 생겼다).
         let r2 = boot_enqueue_call(&daemon, Some(pid), params);
         assert_eq!(r2["result"]["outcome"], json!("dedup"), "재전송이 dedup 이 아니다: {r2}");
@@ -11428,7 +11487,8 @@ mod tests {
             assert_eq!(it["lane"], json!(""), "lane 자기 고정 위반");
             assert_eq!(it["surface_id"], json!(sid));
             assert_eq!(it["state"], json!("pending"));
-            assert_eq!(it["executor"], json!("runner"));
+            // 위와 같은 전제 교체 — opt-in 미설정이면 스냅샷은 python 이다(IG-33 §5).
+            assert_eq!(it["executor"], json!("python"));
             assert_eq!(it["generation"], json!(0));
         }
     }
