@@ -221,9 +221,13 @@ jobs:
         run: |
           set -uo pipefail
           LOG="$(mktemp)"
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon:: > "$LOG" 2>&1
-          rc=$?
-          cat "$LOG"
+          # ★실시간 스트리밍(tee) — 종전에는 rc 를 잡은 뒤에야 꼬리를 뱉어서, 타임아웃으로
+          #   죽으면 "왜 멈췄는지"가 하나도 안 남았다. tee 로 러너 로그에 흘리면 잘려도 마지막
+          #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
+          # ★--nocapture: --test-threads=1 이라 libtest 가 검체명을 실행 **전에** 찍는다 —
+          #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon:: 2>&1 | tee "$LOG"
+          rc="${PIPESTATUS[0]}"
           [ "$rc" -eq 0 ] && exit 0
           echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
           tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
