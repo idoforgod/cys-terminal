@@ -394,9 +394,16 @@ fn migrate_seat_queue(
 /// 채널 2개: ①`role.takeover` 이벤트(GUI·구독자·저널) ②구 좌석 화면의 **셸 주석 1줄**.
 ///
 /// 주석을 쓰는 이유: 좌석은 셸이므로 텍스트 주입은 곧 '입력'이다 — 평문을 넣으면 프롬프트에
-/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). `#` 접두는
-/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다. cmd.exe 는 `#` 를 오류로 뱉으므로
-/// unix 한정으로 주입한다(Windows 는 이벤트 채널로 고지 — 셸 오염보다 안전 우선).
+/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). 주석 접두는
+/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다.
+///
+/// ★종전엔 여기가 `cfg!(unix)` 였다("cmd.exe 는 `#` 를 오류로 뱉는다") — 그래서 **Windows pane 은
+/// 승계 고지를 한 줄도 받지 못했고**, 사용자는 자기 좌석이 조용히 강등된 것을 영영 몰랐다
+/// (이 함수가 막으려던 "내 pane 이 조용히 강등됐다"는 온보딩 불신 그 자체다). 근거였던 전제가
+/// 틀렸다: Windows pane 의 기본 셸은 `powershell.exe`(`state.rs` `default_shell`)이고 거기서 `#`
+/// 는 정상 주석이다 — 위험한 것은 OS 가 아니라 **cmd.exe 하나**였다. 접두를 셸별로 고르면
+/// (`cys::shell_comment_prefix`) 안전과 가시성을 둘 다 지킨다(codex R2 #2 와 **같은 결함**이며
+/// npm 축을 고칠 때 형제로 보고해 master 가 범위에 넣었다).
 /// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
 fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
     daemon.bus.publish(
@@ -406,29 +413,215 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
         json!({"role": role, "prev_surface": prev_sid, "path": path,
                "reason": "empty seat (no descendant process, no agent meta, no recent input)"}),
     );
-    if cfg!(unix) {
-        if let Some(s) = daemon.get_surface(prev_sid) {
-            let text = format!(
-                "# [cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
-                 (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
-            );
-            // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
-            crate::delivery::record_audited(
-                daemon,
-                prev_sid,
-                &text,
-                crate::delivery::Origin::SeatTakeover,
-                None,
-            );
-            // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
-            // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
-            let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
-                text,
-                cr_delay_ms: 120,
-                clear_first: false,
-            });
+    let Some(s) = daemon.get_surface(prev_sid) else {
+        return;
+    };
+    // 렌더 입력은 **그 좌석이 실제로 돌리는 셸**(`Surface::cmd`)이다 — `CYS_SHELL` 로 어느 OS
+    // 에서든 바뀌므로 `cfg!` 로 가르면 틀린다(npm 축과 같은 규율).
+    let text = seat_takeover_notice(role, &s.cmd);
+    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
+    // 원장에는 **주입할 그 문자열**을 남긴다(접두가 갈리면 층1 대조가 이 고지를 못 알아보고,
+    // 라벨도 없으므로 임무 게이트가 기계 고지를 오너 임무로 읽는다).
+    crate::delivery::record_audited(
+        daemon,
+        prev_sid,
+        &text,
+        crate::delivery::Origin::SeatTakeover,
+        None,
+    );
+    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
+    // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
+    let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+        text,
+        cr_delay_ms: 120,
+        clear_first: false,
+    });
+}
+
+/// 좌석 승계 고지 1줄 — **순수**(셸별 주석 접두 · 개행 없음).
+///
+/// 개행이 없어야 하는 이유는 접두와 같다: 좌석은 셸이고 **개행은 곧 Enter** 다.
+fn seat_takeover_notice(role: &str, shell: &str) -> String {
+    format!(
+        "{}[cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
+         (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다.",
+        cys::shell_comment_prefix(shell)
+    )
+}
+
+/// ★번들 오염 고지 — **무음 경고 금지**(codex R1 #2 수리).
+///
+/// `NpmPrefixVerdict::WarnBundlePolluted` 는 env 주입을 멈추기만 할 뿐 **아무 데도 말하지
+/// 않았다**. 시뮬 T2-4 가 정한 것은 "덮지 말고 **경고만** 하라"이지 "조용히 넘어가라"가 아니다
+/// — 생산 소비자가 0이면 사용자는 자기 npm 전역 설치가 설치본 서명을 깨뜨리는 중이라는 사실을
+/// **다음 실행이 차단되고 나서야** 안다(그때는 이미 봉인이 깨져 있다).
+///
+/// 채널 2개는 [`announce_seat_takeover`] 와 **같은 규율**이다:
+///   ①`env.advisory` 이벤트(GUI·구독자·저널) ②새 pane 화면의 **셸 주석 1줄**.
+/// `#` 접두·unix 한정·배달 원장 **선기록**의 근거는 전부 그 함수의 주석과 동일하다
+/// (특히 선기록: 이 주석도 기계 유래이므로 원장에 근거가 없으면 임무 게이트가 오너 임무로 읽는다).
+///
+/// 세 번째 소비자는 여기가 아니라 `org.status` 의 `daemon.npm_prefix_polluted` 다 — 그쪽은
+/// preflight·doctor 가 **폴링**으로 읽는 진단 축이고, 이쪽은 사람이 pane 에서 보는 고지다.
+/// 두 소비자는 같은 술어([`cys::npm_prefix_polluted`])와 같은 판정 함수를 공유한다.
+fn announce_npm_prefix_pollution(daemon: &Arc<Daemon>, sid: u64) {
+    announce_npm_prefix_pollution_with(daemon, sid, &cys::npm_config_prefix_verdict_from_exe());
+}
+
+/// [`announce_npm_prefix_pollution`] 의 **판정 주입판**(관측층/집행층 분리).
+///
+/// 판정은 env·`current_exe` 를 보는 관측이고 고지는 순수 집행이다. 둘을 한 함수에 두면 검체가
+/// 프로세스 전역 env 를 흔들어야만 채널을 잴 수 있고, 그러면 병렬 테스트끼리 서로를 오염시킨다
+/// (`npm_config_prefix_verdict_for` 가 os 를 인자로 받는 것과 **같은 규율**).
+fn announce_npm_prefix_pollution_with(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    verdict: &cys::NpmPrefixVerdict,
+) {
+    let Some(line) = cys::npm_prefix_pollution_notice(verdict) else {
+        return; // 오염 아님 — 종전과 완전히 동일(쌍도 이벤트도 늘지 않는다)
+    };
+    daemon.bus.publish(
+        "env.advisory",
+        "system",
+        Some(sid),
+        json!({"kind": "npm_prefix_bundle_polluted", "surface": sid, "text": line}),
+    );
+    // ★codex R2 #2(blocking): 종전엔 여기가 `cfg!(unix)` 였고 **Windows pane 은 고지를 한 줄도
+    //   받지 못했다**. 근거는 "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은
+    //   `powershell.exe`(state.rs `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 즉 위험한
+    //   것은 OS 가 아니라 cmd.exe 하나였다. 접두를 **셸별로** 고르면 두 가지를 다 지킨다
+    //   ([`cys::shell_comment_prefix`]). 정작 봉인이 깨지는 사고는 Windows 에서 더 잦다.
+    let Some(s) = daemon.get_surface(sid) else {
+        return;
+    };
+    // 실제 pane 셸(`Surface::cmd`)로 렌더한다 — 프로세스 env 나 `cfg!` 가 아니라 **이 좌석이
+    // 실제로 돌리는 셸**이 판정 입력이다(`CYS_SHELL` 로 어느 OS 에서든 바뀐다).
+    let Some(req) = npm_prefix_pane_notice_req(verdict, &s.cmd) else {
+        return;
+    };
+    // ★배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 원장에는 **실제로 주입할 문자열**을
+    //   남긴다(정본 `#` 표기를 남기면 해시가 갈려 층1 대조가 이 고지를 못 알아본다).
+    // ★원장에 남기는 문자열은 **주입할 그 문자열이어야 한다**. 정본(`#`) 표기를 남기면
+    //   `cmd.exe` pane 에서 해시가 갈려 층1 대조가 이 고지를 못 알아보고, 라벨도 없으므로
+    //   임무 게이트가 **기계 고지를 오너 임무로 읽는다**(사고 재발 경로). 그래서 값을 따로
+    //   만들지 않고 **보낼 req 에서 그대로 꺼낸다** — 둘이 갈릴 자리를 없앤다.
+    let crate::state::WriteReq::Inject { text: injected, .. } = &req else {
+        unreachable!("npm_prefix_pane_notice_req 는 Inject 만 만든다");
+    };
+    crate::delivery::record_audited(
+        daemon,
+        sid,
+        injected,
+        crate::delivery::Origin::EnvAdvisory,
+        None,
+    );
+    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고 실패가 pane 생성을
+    // 막아선 안 된다. 이벤트 채널과 status 축이 이미 사실을 남긴다.
+    let _ = s.write_tx.try_send(req);
+}
+
+/// `hook.machine_origin` 의 판정 본체 — 원장을 **읽고**(IO) 판정은 `mission_gate` 에 맡긴다.
+///
+/// 여기서 하는 일은 셋뿐이다: ①원장·회전 세대·기동 표식을 읽어 [`LedgerInput`] 으로 환원 ②
+/// [`read_delivery`]·[`machine_origin`] 호출 ③ 결과를 RPC 형상으로 옮김. **판정 규칙을 여기에
+/// 쓰지 않는다** — 규칙의 소유자는 `mission_gate` 하나이고 python 과의 파리티도 그쪽이 진다.
+///
+/// `unknown` 은 원장 **판독 불가**일 때만 낸다. '부재'는 unknown 이 아니다 — 데몬이 아직 아무
+/// 배달도 안 했다는 정상 상태이고, 그것을 unknown 으로 접으면 부트스트랩이 영영 막힌다
+/// (호출자가 unknown 을 fail-closed 로 접기 때문이다).
+fn hook_machine_origin_verdict(daemon: &Arc<Daemon>, sid: u64, norm: &str) -> serde_json::Value {
+    use cys::mission_gate as mg;
+
+    // 파일 I/O 는 여기서만 — 판정 함수는 순수하게 유지한다(검체가 원장 상태를 직접 먹인다).
+    let read_file = |p: &std::path::Path| -> mg::LedgerFile {
+        match std::fs::metadata(p) {
+            Err(_) => mg::LedgerFile::Missing,
+            Ok(m) if m.is_dir() => {
+                mg::LedgerFile::Unreadable(format!("자리가 파일이 아니다: {}", p.display()))
+            }
+            Ok(m) if m.len() > mg::LEDGER_MAX_READ_BYTES => mg::LedgerFile::Unreadable(format!(
+                "판독 상한 초과({} B > {} B)",
+                m.len(),
+                mg::LEDGER_MAX_READ_BYTES
+            )),
+            Ok(_) => match std::fs::read(p) {
+                Ok(b) => mg::LedgerFile::Content(String::from_utf8_lossy(&b).into_owned()),
+                Err(e) => mg::LedgerFile::Unreadable(format!("판독 실패({e})")),
+            },
         }
-    }
+    };
+    let main_p = crate::delivery::ledger_path(&daemon.socket_path);
+    let rot_p = main_p.with_extension("jsonl.1");
+    let main = read_file(&main_p);
+    let rotated = read_file(&rot_p);
+    // 기동 표식 — 원장이 **부재인데** 이것이 있으면 삭제·손상이다(mission_gate 가 그 구분을 든다).
+    let epoch_raw = std::fs::read_to_string(crate::delivery::epoch_path(&daemon.socket_path)).ok();
+
+    let me = sid.to_string();
+    let label = main_p.display().to_string();
+    let inp = mg::LedgerInput {
+        main: &main,
+        rotated: &rotated,
+        daemon_epoch: epoch_raw.as_deref(),
+        me: &me,
+        now: crate::state::now_epoch(),
+        window_s: mg::delivery_window_s(),
+        path_label: &label,
+    };
+    let read = mg::read_delivery(&inp);
+    let v = mg::machine_origin(norm, &read.map, read.status);
+
+    // 이상징후는 **판독 단계 + 판정 단계** 둘 다 싣는다(한쪽만 실으면 흔적이 반쪽이 된다).
+    let mut all: Vec<(String, String)> = read.anomalies.clone();
+    all.extend(v.anomalies.iter().cloned());
+    all.extend(mg::env_anomalies());
+    let anomalies: Vec<serde_json::Value> = mg::dedup_anomalies(&all)
+        .into_iter()
+        .map(|(code, detail)| json!({"code": code, "detail": detail}))
+        .collect();
+
+    // origin 3상. `unknown` 은 **판독 불가에서만** 나온다(부재는 정상이다).
+    let origin = if v.machine {
+        "machine"
+    } else if read.status == mg::LedgerStatus::Unreadable {
+        "unknown"
+    } else {
+        "human"
+    };
+    json!({
+        "origin": origin,
+        "layer": v.layer,
+        "reason": v.reason,
+        "ledger_status": read.status.as_str(),
+        "anomalies": anomalies,
+    })
+}
+
+/// pane 에 넣을 고지 `WriteReq` — **순수**(채널도 데몬도 만지지 않는다).
+///
+/// 집행(`try_send`)에서 분리한 이유는 codex R2 #2 의 "Inject 수신 단언" 때문이다: 실제 채널로
+/// 보내는 경로를 검체가 재려면 그 앞 단계가 값으로 잡혀야 하고, 그래야 **양 OS 의 셸 분기를
+/// mac CI 에서 전수로** 밟을 수 있다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
+fn npm_prefix_pane_notice_req(
+    verdict: &cys::NpmPrefixVerdict,
+    shell: &str,
+) -> Option<crate::state::WriteReq> {
+    let text = cys::npm_prefix_pollution_notice_for(verdict, shell)?;
+    Some(crate::state::WriteReq::Inject { text, cr_delay_ms: 120, clear_first: false })
+}
+
+/// `org.status` 의 `daemon.npm_prefix_polluted` 필드 — **판정 주입판**(codex R2 #8).
+///
+/// 종전 검체는 이 필드가 판정을 따라가는지 재려고 **프로세스 전역** `npm_config_prefix` 를
+/// 직렬화 없이 바꿨다. cargo 는 검체를 한 프로세스 안에서 **병렬**로 돌리므로 그 순간 같은 env 를
+/// 읽는 다른 검체가 무작위로 깨지고(재현 불가 flake), 도중에 panic 하면 복원도 안 돼 **뒤이은
+/// 검체까지 오염**된다. env 관측은 호출부에 두고 판정→필드 변환만 순수 함수로 내리면 검체는
+/// 전역 상태를 건드리지 않고 같은 계약을 전수로 잰다(`announce_npm_prefix_pollution_with` 가
+/// 판정을 인자로 받는 것과 **같은 규율** — 관측층/집행층 분리).
+fn npm_prefix_polluted_field(verdict: &cys::NpmPrefixVerdict) -> bool {
+    // 소비자마다 `matches!` 를 손으로 쓰지 않는다 — pane 고지와 **같은 술어**다(분열 방지).
+    cys::npm_prefix_polluted(verdict)
 }
 
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
@@ -2199,6 +2392,44 @@ fn hook_decide_verdict(seat: Result<&str, &'static str>) -> (&'static str, &'sta
     }
 }
 
+/// (B3-4 · T3-1) 요청에 `lease` 가 실려 있으면 **CAS 한다** — 거절이면 `Some(Reply)`,
+/// 통과하거나 애초에 안 실렸으면 `None`.
+///
+/// 표 잠금 실패(poison)는 **거절**이다. 소유권을 확인할 수 없는데 통과시키는 것이 이 축에서
+/// 가장 나쁜 실패다 — 감독자 `admission_state` 의 fail-closed 와 같은 규율이다.
+fn lease_gate(daemon: &Arc<Daemon>, params: &Value, id: &Value, path: &str) -> Option<Reply> {
+    let supplied = params.get("lease").and_then(Value::as_u64)?;
+    // ★B4-1: 활성 표가 레인 키 맵이 됐으므로, 실린 lease 와 **세대가 같은 활성 런**을 찾는다.
+    //   못 찾으면 그 러너는 소유권을 잃은 것이다(fence 로 세대가 올랐거나 이미 끝났다).
+    let (ok, current) = match daemon.boot_run_active.lock() {
+        Ok(g) => {
+            let matched = g.values().find(|r| u64::from(r.generation) == supplied);
+            (
+                crate::boot_supervisor::lease_ok(Some(supplied), matched),
+                g.values().map(|r| r.generation).collect::<Vec<_>>(),
+            )
+        }
+        // 표를 못 읽으면 소유권을 확인할 수 없다 — 확인 못 한 것을 통과시키지 않는다.
+        Err(_) => (false, Vec::new()),
+    };
+    if ok {
+        return None;
+    }
+    daemon.bus.publish(
+        "boot_supervisor.lease_stale",
+        "boot_supervisor",
+        None,
+        json!({"path": path, "supplied": supplied, "current": current}),
+    );
+    Some(Reply::Single(err_response(
+        id,
+        "lease_stale",
+        &format!(
+            "{path}: lease {supplied} is stale (current {current:?}) — this runner no longer owns the boot run"
+        ),
+    )))
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
@@ -2313,17 +2544,124 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   이 arm 은 프롬프트 앞이지만 선언 확정 후 1회 호출이라 수 ms 원자 쓰기(tmp→rename ·
         //   fsync 없음)를 허용한다. 연결별 tokio task 라 다른 연결의 hook.decide 를 막지 않는다.
         //
+        // ★(부트 v2 · 명세 v2.1 **A12**) 층1 판정 프런트도어 — **원장 소유자가 판독한다**.
+        //
+        // 왜 데몬인가: 층1(배달 원장 대조)은 원장 파일 경로를 알아야 하는데 그 규약의 소유자는
+        // `delivery::ledger_path` **하나**다(`pack_state_dir`/`lane_key` 포함). `cys` CLI 로
+        // 규약을 복사하면 두 벌이 되어 반드시 갈리고, **갈린 순간 층1 은 빈 원장을 읽어 모든
+        // 기계 push 가 오너 임무가 된다** — 2026-08-01 사고의 기제 그 자체다. 그래서 판정을
+        // 원장 소유자에게 맡기고 CLI 는 묻기만 한다.
+        //
+        // 계약(A12): `{session_id, prompt_norm, prompt_digest?, truncated?}` →
+        //   `{origin: human|machine|unknown, layer: 1|2|null, anomalies: [...]}`
+        //   · `prompt_norm` 이 오면 규칙 ⓐ~ⓖ 전부 · `prompt_digest` 만이면 ⓐⓑ(전문·창 밖)뿐이다
+        //     (ⓒ조각 연접은 **부분 문자열 해시 대조**라 해시 하나로는 원리적으로 불가능하다).
+        //   · `prompt_digest` 가 함께 오면 **대조**한다 — 불일치는 invalid_params(둘 중 하나가
+        //     거짓이라는 뜻이고, 조용히 한쪽을 택하면 판정 근거가 위조된다).
+        //   · `unknown` = 원장 **판독 불가**(판정 근거 부재). 호출자는 fail-closed 로 접는다.
+        "hook.machine_origin" => {
+            if params.get("surface_id").is_some() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다",
+                ));
+            }
+            let Some(sid) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) else {
+                // 좌석 미확정 = 이 프롬프트가 어느 pane 것인지 모른다 = 층1 의 전제(surface 결박)가
+                // 없다. 판정을 지어내지 않고 unknown 을 낸다(호출자가 fail-closed 로 접는다).
+                return Reply::Single(ok_response(
+                    &id,
+                    json!({"origin": "unknown", "layer": null,
+                           "anomalies": [{"code": "seat_unresolved",
+                                          "detail": "발신 pane 을 커널 peer pid 로 확정하지 못했다"}]}),
+                ));
+            };
+            let norm = param_str(&params, "prompt_norm").unwrap_or_default();
+            let digest_in = param_str(&params, "prompt_digest");
+            if norm.is_empty() && digest_in.is_none() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: prompt_norm 또는 prompt_digest 중 하나는 있어야 한다",
+                ));
+            }
+            // ★(A14) 단위는 **바이트**다 — 전송을 끊는 것이 `MAX_REQUEST_LINE`(바이트)이므로
+            //   검증도 같은 단위여야 한다. 종전 문자 상한은 CJK 에서 **도달 불가**였다(실측).
+            if norm.len() > cys::mission_gate::LAYER1_PROMPT_MAX_BYTES {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "hook.machine_origin: prompt_norm 이 바이트 상한을 넘었다 — truncated 로 잘라 보내라",
+                ));
+            }
+            // digest 동반 시 **대조**(조용한 한쪽 채택 금지).
+            if let (Some(d), false) = (digest_in.as_deref(), norm.is_empty()) {
+                let calc = cys::mission_gate::digest_normalized(&norm);
+                if calc != d {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "hook.machine_origin: prompt_digest 가 prompt_norm 과 불일치한다",
+                    ));
+                }
+            }
+            let reply = hook_machine_origin_verdict(daemon, sid, &norm);
+            Reply::Single(ok_response(&id, reply))
+        }
+
         // ★인가 계약(hook.decide 동형): surface_id 는 신고할 수 없다 — 좌석은 데몬이 커널
         //   peer pid 의 조상 체인(resolve_caller_surface · record 경로)으로 도출한다.
         //   lane 도 지정할 수 없다(R3-P2-6): 인텐트는 항상 **수신 데몬 자신의 레인**(빈값 =
         //   자기 소켓)에 적힌다 — 호출자 lane 을 열면 데몬 A 의 팩을 레인 B 소켓으로 낳는
         //   레인↔팩 불일치 표면이 생긴다. 위반은 조용한 무시가 아니라 invalid_params 거절이다.
-        "boot.enqueue" => {
-            if params.get("surface_id").is_some() {
+        // ★B4-2(A18 [5]) **확인된 exit ACK** — 고아 원장과 활성 슬롯을 회수하는 **유일한 근거**다.
+        //   R5 [4]에서 나이 기반 삭제를 폐지하며 "원장에서 빼는 근거는 확인된 exit" 이라고
+        //   적었고, 그 주체가 이 RPC 다. 나이는 진단이고 이것이 근거다.
+        //   키는 (intent, epoch, generation) 으로 FencedRun::key·예약 증서와 **같은 모양**이다
+        //   (A18 ⓔ) — 분모와 분자가 다른 키를 쓰면 상한 계수가 조용히 갈린다.
+        "boot.exit_ack" => {
+            let (Some(intent), Some(epoch), Some(generation)) = (
+                param_str(&params, "intent"),
+                params.get("epoch").and_then(Value::as_u64),
+                params.get("generation").and_then(Value::as_u64),
+            ) else {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "boot.enqueue: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다",
+                    "boot.exit_ack: intent·epoch·generation 이 모두 필요하다(회수 키)",
+                ));
+            };
+            let Ok(generation) = u32::try_from(generation) else {
+                return Reply::Single(err_response(&id, "invalid_params", "generation 범위 초과"));
+            };
+            let freed = crate::boot_supervisor::release_confirmed_exit(
+                daemon,
+                (intent.as_str(), epoch, generation),
+            );
+            daemon.bus.publish(
+                "boot_supervisor.exit_ack",
+                "boot_supervisor",
+                None,
+                json!({"intent": intent, "epoch": epoch, "generation": generation,
+                       "freed": freed,
+                       "note": "확인된 exit 관측 — 이 키의 활성 슬롯과 고아 원장 항목을 회수했다"}),
+            );
+            Reply::Single(ok_response(&id, json!({"freed": freed})))
+        }
+
+        "boot.enqueue" => {
+            // ★(부트 v2 · 명세 §2-5) GUI 인가 — `operator_token` 이 **데몬 발급값과 일치할
+            //   때만** surface_id 신고를 허용한다. 근거 계급은 feed.reply 면제와 같다: 토큰은
+            //   데몬이 자기 상태 디렉터리에 0600 으로 쓰고(state.rs::write_operator_token)
+            //   붙이는 지점은 Tauri 백엔드 한 곳뿐이다(CLI 는 0건).
+            let gui_authorized = operator_token_ok(daemon, &params);
+            if params.get("surface_id").is_some() && !gui_authorized {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "boot.enqueue: surface_id 는 신고할 수 없다 — 좌석은 데몬이 caller_pid 로 도출한다\
+                     (GUI 는 operator_token 으로 인가받는다)",
                 ));
             }
             if params.get("lane").is_some() {
@@ -2336,7 +2674,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★(R3-P2-4 blocker) 감독자 생존 선검사 — 미기동(롤백 노브·미배선)이면 스풀에
             //   **쓰지 않고** typed 오류를 돌린다. 여기서 성공을 돌리면 훅이 폴백 spawn 을
             //   건너뛰고 인텐트는 수명 1800s 동안 아무도 집지 않는다(부트 0회 무음 후퇴).
-            //   CLI 는 이 코드를 legacy 계열(exit 5)로 환원해 종전 spawn 폴백을 태운다.
             if !daemon.supervisor_alive.load(Ordering::Relaxed) {
                 return Reply::Single(err_response(
                     &id,
@@ -2345,19 +2682,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                      CYS_BOOT_SUPERVISOR=0 또는 구 기동) — 스풀 미기록, 종전 spawn 폴백을 타라",
                 ));
             }
-            // decl_origin 닫힌 토큰 — 미지값은 침묵 수용이 아니라 거절(계약 위반을 침묵으로
-            // 접으면 다음 호출자가 그 값을 믿게 된다 — hook.decide 의 신고 거절과 같은 규율).
+            // decl_origin 닫힌 토큰 — 미지값은 침묵 수용이 아니라 거절. 인정 토큰은 둘이며
+            // `gui-operator` 는 **토큰 인가를 통과했을 때만** 인정한다(참칭 차단).
             let decl_origin = param_str(&params, "decl_origin").unwrap_or_default();
-            if !decl_origin.is_empty()
-                && decl_origin != crate::boot_supervisor::DECL_ORIGIN_HOOK_HUMAN
-            {
+            let origin_known = decl_origin.is_empty()
+                || decl_origin == crate::boot_supervisor::DECL_ORIGIN_HOOK_HUMAN
+                || (decl_origin == crate::boot_supervisor::DECL_ORIGIN_GUI_OPERATOR
+                    && gui_authorized);
+            if !origin_known {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
                     &format!("boot.enqueue: 미지 decl_origin: {decl_origin:?}"),
                 ));
             }
-            let Some(sid) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) else {
+            // 좌석 도출: GUI 인가면 신고값, 그 외는 종전대로 커널 peer pid 조상 체인.
+            let sid = if gui_authorized {
+                match params.get("surface_id").and_then(|v| v.as_u64()) {
+                    Some(s) => Some(s),
+                    None => caller_pid.and_then(|p| resolve_caller_surface(daemon, p)),
+                }
+            } else {
+                caller_pid.and_then(|p| resolve_caller_surface(daemon, p))
+            };
+            let Some(sid) = sid else {
                 return Reply::Single(err_response(
                     &id,
                     "caller_unresolved",
@@ -2370,8 +2718,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★claim 교차검증(R3-P2-1): rc=0 주장이 실려 오면 데몬 자신의 roles 레지스트리로
             //   그 사실을 확인한다(env 릴레이보다 강한 근거). 불일치면 태어날 때부터 거짓인
             //   데이터를 스풀에 적지 않는다 — 훅은 폴백 spawn 으로 마무리하므로 liveness 무손실.
-            //   (디스패치 시점에는 run_ensure_team 이 어차피 재실측한다 — 이 검사는 기록 시점의
-            //    정직성 층이다.)
             if claim_rc == Some(0) {
                 let holder = { daemon.roles.lock().unwrap().get("master").copied() };
                 if holder != Some(sid) {
@@ -2390,45 +2736,63 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .chars()
                 .take(256)
                 .collect();
-            // ★선언별 **유일 id**(P2-4 · 고정 id 금지): 소진된 메모리측 예산이 1800s 보존되므로
-            //   고정 id 는 정당한 재선언을 최대 30분 즉시 Retire 하는 liveness 함정이다.
-            //   **데몬 세대(started_at 16진 — seat 토큰 `q{:x}` 선례)**·epoch·sid·수명 단조
-            //   카운터의 조합이 유일성을 보장한다. 세대 접두가 필요한 이유(R4 수정 라운드):
-            //   카운터는 프로세스 static 이라 데몬 재시작이 0 부터 다시 세는데, 재시작이 직전
-            //   enqueue 와 같은 epoch 초에 떨어지면 세대 없인 id 가 충돌해 스풀 파일을
-            //   덮어쓴다(디스크측 attempts 리셋 = 선언당 시도 상한의 조용한 확장).
-            static BOOT_INTENT_SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n = BOOT_INTENT_SEQ.fetch_add(1, Ordering::Relaxed);
-            let intent_id = format!(
-                "boot-{:x}-{}-{}-{}",
-                daemon.started_at as u64,
-                crate::state::now_epoch() as u64,
-                sid,
-                n
-            );
-            match crate::boot_supervisor::enqueue(
-                &daemon.socket_path,
-                &intent_id,
-                crate::boot_supervisor::BootAction::EnsureTeam,
-                "", // lane 자기 고정(R3-P2-6) — 빈값 = 감독자 자신의 소켓.
+            // ★(부트 v2 · 명세 §2-5) **선언 id** — 내용에서 뽑는다. 종전 id 는
+            //   `데몬세대-epoch-sid-카운터` 라 매 호출이 새 id 였고, 그래서 같은 선언 이벤트의
+            //   재전송(훅 재실행·중복 배달)이 인텐트를 하나 더 낳았다. 세션 축은 훅이 주는
+            //   `session_id`(GUI 는 `gui_click_id`)이고, 본문 축은 클라이언트가 계산해 보내는
+            //   `prompt_digest` 다 — 데몬은 프롬프트 원문을 받지 않는다(본문 무전송 계약).
+            let session_axis = param_str(&params, "session_id")
+                .or_else(|| param_str(&params, "gui_click_id"))
+                .unwrap_or_default();
+            let prompt_digest = param_str(&params, "prompt_digest").unwrap_or_default();
+            let decl_id = crate::boot_supervisor::compute_decl_id(
+                &daemon.socket_path.to_string_lossy(),
                 Some(sid),
-                &reason,
-                &decl_origin,
+                &session_axis,
+                &prompt_digest,
+            );
+            // 실행 주체 **스냅샷**(명세 §5) — 스위치가 도중에 뒤집혀도 이 인텐트는 태어날 때의
+            // 결정대로 완주한다. 스위치 판독은 데몬 1회이며 훅·GUI 는 이 값을 물어본다.
+            let executor = if crate::boot_supervisor::boot_v2_enabled_from(
+                std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok().as_deref(),
+            ) {
+                crate::boot_supervisor::EXECUTOR_RUNNER
+            } else {
+                crate::boot_supervisor::EXECUTOR_PYTHON
+            };
+            let req = crate::boot_supervisor::EnqueueReq {
+                decl_id: &decl_id,
+                action: crate::boot_supervisor::BootAction::EnsureTeam,
+                lane: "", // lane 자기 고정(R3-P2-6) — 빈값 = 감독자 자신의 소켓.
+                surface_id: Some(sid),
+                reason: &reason,
+                decl_origin: &decl_origin,
                 claim_rc,
                 claim_at,
-            ) {
+                executor,
+            };
+            match crate::boot_supervisor::enqueue(&daemon.socket_path, &req) {
                 // 스풀 원자 기록 완료 = 즉시 ack — 스폰·부트 완료를 기다리지 않는다(R3-RISK-2).
-                // ★`log`(R2 note): frontdoor 경로에서는 부트 출력이 **오직 이 파일에만** 간다
-                //   (런 로그가 아예 생기지 않는다). 훅 note 가 '데몬 상태 디렉터리의
-                //   boot-supervisor.log' 라는 미해소 서술을 주던 것을 실경로로 바꾸기 위해
-                //   경로 규약 소유자(`boot_supervisor::supervisor_log_path`)가 직접 싣는다.
-                Ok(_) => Reply::Single(ok_response(
-                    &id,
-                    json!({"enqueued": true, "id": intent_id, "surface_id": sid,
-                           "log": crate::boot_supervisor::supervisor_log_path(&daemon.socket_path)
-                               .to_string_lossy()}),
-                )),
+                // 세 귀결(enqueued·dedup·superseded)은 **전부 정상**이며 훅이 그대로 고지한다.
+                Ok(outcome) => {
+                    let by = match &outcome {
+                        crate::boot_supervisor::EnqueueOutcome::Superseded { by, .. } => {
+                            Some(by.clone())
+                        }
+                        _ => None,
+                    };
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"enqueued": matches!(outcome,
+                                   crate::boot_supervisor::EnqueueOutcome::Enqueued { .. }),
+                               "outcome": outcome.as_str(),
+                               "id": decl_id, "decl_id": decl_id, "surface_id": sid,
+                               "superseded_by": by,
+                               "executor": executor,
+                               "log": crate::boot_supervisor::supervisor_log_path(&daemon.socket_path)
+                                   .to_string_lossy()}),
+                    ))
+                }
                 Err(e) => Reply::Single(err_response(
                     &id,
                     "enqueue_failed",
@@ -2454,6 +2818,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         }
 
         "surface.create" => {
+            // ★T3-1: 러너가 lease 를 실었으면 **PTY 를 띄우기 전에** CAS 한다. 뒤로 미루면
+            //   소유권을 잃은 러너가 좌석을 하나 만들고 나서야 거절당한다(좀비 셸).
+            if let Some(reply) = lease_gate(daemon, &params, &id, "surface.create") {
+                return reply;
+            }
             let rows = match param_dim(&params, "rows", DEFAULT_ROWS, MAX_ROWS) {
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
@@ -2690,6 +3059,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             announce_seat_takeover(daemon, prev, &role_for_announce, "surface.create");
                         }
                     }
+                    // ★번들 오염 고지(codex R1 #2) — 승계 여부와 무관하게 **모든** 새 pane 에.
+                    //   이 pane 은 방금 오염된 env 를 상속받았으므로 고지 대상이 곧 이 좌석이다.
+                    announce_npm_prefix_pollution(daemon, s.id);
                     // ★T-0147-4 생성자 기록 — 발신이 pane(surface)으로 해석될 때만. 이 한 줄이
                     // launch-agent 롤백(surface.close{cause:"reap"})의 유일한 증명이다(§state::create_owner).
                     // 익명 발신(데몬 내부·pane 밖 CLI)은 기록하지 않는다 — 이미 close 게이트를 통과하므로
@@ -3058,9 +3430,31 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★B2′: 비-clear_first 본문은 human_verified 여부로 Data/Program 이 갈린다 —
             //   Program 만 writer 의 최소 간격 기준점을 찍는다(send_text_write_req doc 참조).
             let write_req = send_text_write_req(&text, clear_first, human_verified);
+            // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
+            //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
+            //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
+            //   락 순서 계약: pending_queue → input_gate. 여기서는 input_gate 하나만 잡고
+            //   그 안에서 다른 락을 잡지 않는다(사이클 없음).
+            let _gate = surface.input_gate.lock().unwrap();
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
+            // ★B1(0.14.30): 미제출 입력 계수 — 큐 배달의 '입력줄 점유' 1차 축(화면 무의존).
+            //   clear_first 주입은 Ctrl-U 선정리 + 본문 + CR 을 원자로 보내 **줄을 비우고 제출**
+            //   하므로 계수는 0 이다. 그 외 본문(사람 키·프로그램 미제출 본문)은 누적한다 —
+            //   제출 CR 이 별도 send_key 로 오기 전까지 그 줄은 점유 상태다.
+            {
+                let next = if clear_first {
+                    0
+                } else {
+                    crate::governance::pending_input_after(
+                        surface.pending_input_bytes.load(Ordering::Relaxed),
+                        text.as_bytes(),
+                    )
+                };
+                surface.pending_input_bytes.store(next, Ordering::Relaxed);
+            }
+            drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             if !human_verified {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
@@ -3084,6 +3478,40 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Some(sid),
                     json!({"bytes": text.len(), "from": from, "from_verified": from_verified}),
                 );
+            }
+            // ★B1(0.14.30) C4: 순서 역전 관측(queue-starvation-case.md §8 실사고 — CEO 의 구
+            //   회신이 --queued 로 대기하는 동안 뒤에 친 신 지시가 먼저 도착해 수신자가 구
+            //   회신을 최신으로 오인·집행 정지). 같은 발신자의 대기분이 남아 있는데 직접 send 가
+            //   앞질러 가면 **그 사실을 남긴다**.
+            //   ★재정렬하지 않는 이유: 직접 send 는 운영자·에이전트가 의도적으로 게이트를 건너
+            //   찌르는 경로(steer)다. 여기서 큐를 먼저 밀어내면 프롬프트 경계·타이핑 가드를
+            //   우회한 주입이 되어 안전 게이트가 뚫린다(그 대가는 §9 의 입력 오염 사고다).
+            //   대신 프롬프트 경계 배달(B1-2)이 대기 자체를 초 단위로 줄여 창을 좁힌다.
+            {
+                let q = surface.pending_queue.lock().unwrap();
+                let mine: Vec<&crate::state::QueueEntry> = q
+                    .iter()
+                    .filter(|e| match (&e.from, verified_from) {
+                        (Some(f), Some(v)) => f == &cys::surface_ref(v),
+                        _ => false,
+                    })
+                    .collect();
+                if let Some(oldest) = mine.first() {
+                    let waited = (crate::state::now_epoch() - oldest.enqueued_at).max(0.0) as u64;
+                    let payload = json!({
+                        "surface_ref": cys::surface_ref(sid),
+                        "from": verified_from.map(cys::surface_ref),
+                        "pending_from_same_sender": mine.len(),
+                        "oldest_queue_entry_id": oldest.id,
+                        "oldest_waited_secs": waited,
+                        "note": "같은 발신자의 대기 큐가 있는데 직접 send 가 먼저 도착했다 — \
+                                 수신자가 뒤늦게 오는 구 메시지를 최신으로 오인할 수 있다(순서 역전).",
+                    });
+                    drop(q);
+                    daemon
+                        .bus
+                        .publish("queue.order_inverted", "queue", Some(sid), payload);
+                }
             }
             // T5-2: 명령 성공 ack 시각 스탬프 — surface_crashed 술어의 "ack 후 후행 실패" 기준.
             *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
@@ -3212,6 +3640,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //     enqueue 시각이 되어 writer 적체 구간에서 간격이 0 으로 붕괴한다. 기준은
             //     writer 가 **실제로 본문을 쓴 시각**이어야 하고, 그 판단은 writer 몫이다.
             //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
+            let key_bytes = bytes.clone();
             let write_req = match submit_gap_for_key(&key, cr_min_gap_ms()) {
                 Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
@@ -3219,6 +3648,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
+            // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
+            //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
+            //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
+            surface.pending_input_bytes.store(
+                crate::governance::pending_input_after(
+                    surface.pending_input_bytes.load(Ordering::Relaxed),
+                    &key_bytes,
+                ),
+                Ordering::Relaxed,
+            );
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "key": key, "sent": true}),
@@ -5203,6 +5642,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   (자기보고로 '검증됨'을 위조하면 검증이 무의미해진다). cysd-매개 발신(launch-agent·
         //   node-recover 같은 일시적 CLI, caller_sid None)만 쓸 수 있다.
         "directive.verify" => {
+            // ★T3-1: 소유권을 잃은 러너의 뒤늦은 각성 보고를 원장에 남기지 않는다.
+            if let Some(reply) = lease_gate(daemon, &params, &id, "directive.verify") {
+                return reply;
+            }
             let Some(sid) = resolve_surface_id(&params) else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
             };
@@ -5784,7 +6227,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "embedded_pack_hash": cys::pack::embedded_pack_hash(),
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
-                               "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
+                               "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               // ★codex R1 #2 — T2-4 '경고만' 정책의 **폴링 소비자**.
+                               //   pane 고지는 그 자리에 있던 사람만 보지만 preflight·doctor 는
+                               //   이 축을 읽어 "봉인이 깨질 예정"을 상시 진단한다. 판정·술어는
+                               //   pane 고지와 **같은 함수**를 쓴다(분열 방지).
+                               "npm_prefix_polluted":
+                                   npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())},
+                    // ★B3-4(명세 §5): 부트 v2 스위치의 **단일 진실은 데몬**이다. 훅·GUI·감독자가
+                    //   각자 env 를 읽으면 같은 순간에 서로 다른 답을 갖는다(프로세스마다 env 가
+                    //   다를 수 있다). 여기서 한 번 노출하고 모두 이 값을 읽는다.
+                    "boot_v2_enabled": crate::boot_supervisor::boot_v2_enabled_from(
+                        std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok().as_deref(),
+                    ),
                     "surfaces": list,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "back_pressure": back_pressure,
@@ -6221,6 +6676,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
         "queue.list" => {
             let filter_sid = resolve_surface_id(&params);
+            // ★B3 #11: 전문(`text`)은 **요청 시에만** 싣는다. 기본 응답은 preview 80자 그대로라
+            //   행 계약(cols[3]=preview)·팩 파서(javis_boot_node)·응답 크기가 전부 불변이다.
+            //   opt-in 으로 두는 이유: 큐에는 수천 자 본문이 쌓일 수 있고, 목록 조회가 그것을
+            //   기본으로 실어 나르면 관측이 부하가 된다.
+            let full = params.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
             // ★락 순서 계약(큐 계열): 전역 순서는 **restored_queue → surfaces → pending_queue** 다
             //   (Daemon::rehome_restored_queue 가 이 순서로 잡는다 — state.rs). 종전 이 핸들러는
             //   surfaces 가드를 **쥔 채** 아래에서 restored_queue 를 잡아 rehome 과 정면 역전(AB-BA)
@@ -6236,19 +6696,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let now = crate::state::now_epoch();
+                // ★B1(0.14.30): 마지막 보류 사유·시각 — 운영자가 "왜 안 가나" 를 화면 폴링
+                //   없이 안다(경보는 쿨다운·임계에 걸려 매 틱 말하지 않는다). 배달되면 지워진다.
+                let (blocked_by, blocked_since) = match s.queue_blocked.lock().unwrap().clone() {
+                    Some((why, at)) => (json!(why), json!(at)),
+                    None => (Value::Null, Value::Null),
+                };
                 let q = s.pending_queue.lock().unwrap();
                 for (i, e) in q.iter().enumerate() {
                     // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
                     // 조준 id 와 기아 나이(age_secs)를 여기서 얻는다. age 는 음수 클램프 0
                     // (시계 스큐 방어 — wait_secs 계약과 동형).
-                    out.push(json!({
+                    let mut row = json!({
                         "surface_id": s.id, "surface_ref": surface_ref(s.id),
                         "index": i, "bytes": e.text.len(),
                         "preview": e.text.chars().take(80).collect::<String>(),
                         "id": e.id, "seq": e.seq, "enqueued_at": e.enqueued_at,
                         "age_secs": (now - e.enqueued_at).max(0.0) as u64,
                         "from": e.from, "origin": e.origin,
-                    }));
+                        "blocked_by": blocked_by, "blocked_since": blocked_since,
+                    });
+                    if full {
+                        row["text"] = json!(e.text);
+                    }
+                    out.push(row);
                 }
             }
             // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
@@ -6266,7 +6737,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
                 let text = it.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                out.push(json!({
+                let mut row = json!({
                     "surface_id": sid_v, "restored": true,
                     "mid": it.get("mid").cloned().unwrap_or(Value::Null),
                     "bytes": text.len(),
@@ -6281,7 +6752,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap_or(Value::Null),
                     "from": it.get("from").cloned().unwrap_or(Value::Null),
                     "origin": it.get("origin").cloned().unwrap_or(Value::Null),
-                }));
+                });
+                if full {
+                    row["text"] = json!(text);
+                }
+                out.push(row);
             }
             Reply::Single(ok_response(&id, json!({"entries": out})))
         }
@@ -8281,6 +8756,266 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★B3-4(T3-1 · 명세 §2-7) — **선택적 lease CAS 가 배선돼 있다.**
+    ///
+    /// 순수 술어만 옳고 핸들러가 부르지 않으면 검체는 초록인데 프로덕션은 구 러너를 그대로
+    /// 받는다(공허 통과). 네 갈래를 dispatch 로 직접 잰다.
+    #[test]
+    fn optional_lease_is_cas_checked_before_any_side_effect() {
+        let dir = std::env::temp_dir().join(format!("cysd-lease-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        // 진행 중인 부트 런 — 세대 7 을 소유한다.
+        daemon.boot_run_active.lock().unwrap().insert(String::new(), crate::state::BootRunActive {
+            intent: "i".into(),
+            generation: 7,
+            roles: Vec::new(),
+            hb: 1.0,
+            progress_step: String::new(),
+            progress_at: 1.0,
+            started: 1.0,
+            pid: None,
+            epoch: 1,
+        });
+        let call = |method: &str, params: Value| {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: method.into(), params },
+                None,
+            ) else {
+                panic!("expected single reply");
+            };
+            r
+        };
+        // ① 구 세대 → **좌석을 만들기 전에** 거절한다.
+        let before = daemon.surfaces.lock().unwrap().len();
+        let stale = call("surface.create", json!({"lease": 6}));
+        assert_eq!(
+            stale["error"]["code"],
+            json!("lease_stale"),
+            "구 세대 러너의 좌석 생성이 통과했다 — fence 의 CAS 거절이 집행되지 않는다 ({stale})"
+        );
+        assert_eq!(
+            daemon.surfaces.lock().unwrap().len(),
+            before,
+            "거절했는데 좌석이 생겼다 — 게이트가 부수효과보다 뒤에 있다(좀비 셸)"
+        );
+        // ② directive.verify 도 같은 게이트를 진다.
+        let stale2 = call(
+            "directive.verify",
+            json!({"surface_id": 1, "verified": true, "lease": 6}),
+        );
+        assert_eq!(
+            stale2["error"]["code"],
+            json!("lease_stale"),
+            "소유권 잃은 러너의 각성 보고가 원장에 남는다 ({stale2})"
+        );
+        // ③ 세대 일치 → 이 게이트는 통과한다(뒤에서 다른 사유로 막히는 것은 이 검체의 관심 밖).
+        //    없으면 '무차별 거절' 구현도 ①②를 통과해 초록이 된다 — 그 공허를 막는다.
+        let same = call(
+            "directive.verify",
+            json!({"surface_id": 999_999, "verified": true, "lease": 7}),
+        );
+        assert_ne!(
+            same["error"]["code"],
+            json!("lease_stale"),
+            "일치하는 lease 를 거절했다 — 게이트가 무차별 거절이다 ({same})"
+        );
+        // ④ 미제출 → 종전 경로. 사람·GUI 가 막히면 안 된다(추가만 계약).
+        let none = call(
+            "directive.verify",
+            json!({"surface_id": 999_999, "verified": true}),
+        );
+        assert_ne!(
+            none["error"]["code"],
+            json!("lease_stale"),
+            "lease 를 안 실은 종전 호출이 막혔다 — 추가만이라는 계약 위반 ({none})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★B3-4 소스핀 — lease 게이트가 두 arm 에서 **어떤 부수효과보다 앞**이다.
+    #[test]
+    fn lease_gate_precedes_any_side_effect_in_both_arms() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        for (arm, path, first_effect) in [
+            ("\"surface.create\" => {", "surface.create", "param_dim(&params, \"rows\""),
+            ("\"directive.verify\" => {", "directive.verify", "resolve_surface_id(&params)"),
+        ] {
+            let at = prod.find(arm).unwrap_or_else(|| panic!("{arm} arm 소실"));
+            let body = &prod[at..];
+            let gate = body
+                .find(&format!("lease_gate(daemon, &params, &id, \"{path}\")"))
+                .unwrap_or_else(|| panic!("{path} 에 lease 게이트 호출이 없다 — 순수 술어가 공허해진다"));
+            let eff = body
+                .find(first_effect)
+                .unwrap_or_else(|| panic!("{path} 의 첫 부수효과 앵커 소실"));
+            assert!(
+                gate < eff,
+                "{path} 의 lease 게이트가 첫 부수효과 뒤로 갔다 — 소유권 잃은 러너가 그것을 먼저 일으킨다"
+            );
+        }
+    }
+
+    /// ★B3-4(명세 §5) — 부트 v2 스위치를 **데몬이 노출한다**(훅·GUI·감독자가 각자 env 를 읽으면
+    /// 같은 순간에 서로 다른 답을 갖는다). 값 자체가 아니라 **노출된다는 사실**을 잰다.
+    #[test]
+    fn status_exposes_the_boot_v2_switch_from_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("cysd-bv2-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            r["result"]["boot_v2_enabled"].is_boolean(),
+            "org.status 가 boot_v2_enabled 를 노출하지 않는다 — 스위치 SOT 가 데몬이 아니게 된다 ({r})"
+        );
+    }
+
+    /// ★FLAKE-DEADMAN-1 규명(master C4 전 필수 · 2026-09-05) — **PTY 자식은 락 fd 를
+    /// 상속하지 않는다.**
+    ///
+    /// ## 무엇을 가르는 실험인가
+    /// `deadman::tests::flock_reacquire_after_holder_release` 와 `cys.rs` 의 doctor flock 검체가
+    /// 같은 서명으로 간헐 적색이었다: **홀더가 놓은 직후의 재획득이 EWOULDBLOCK**. 주인님이
+    /// 지목한 최악 가설은 '자식 프로세스가 락 fd 를 상속해(CLOEXEC 누락) 부모가 놓은 뒤에도
+    /// 락이 살아 있다' 이고, 그것이 참이면 검체 문제가 아니라 **프로덕션 락 누수**다.
+    ///
+    /// 러스트 `File` 은 기본 `O_CLOEXEC` 이라 그 경로로는 안 샌다는 것이 정설이지만, 이
+    /// 저장소는 **PTY 를 낳는다** — PTY 스폰은 fd 를 수동으로 다루는 구현이 많아 CLOEXEC 이
+    /// 빠질 수 있는 현실적 경로다. 그래서 이 저장소가 실제로 쓰는 경로(`create_surface`)로
+    /// 직접 잰다: 락 획득 → PTY 자식 스폰 → 부모 fd drop → 새 fd 로 재획득.
+    ///
+    /// 재획득이 실패하면 상속이 실재한다(C4 블로커). 성공하면 그 가설은 기각되고
+    /// FLAKE-DEADMAN-1 은 검체 격리 계급으로 내려간다. 어느 쪽이든 열린 질문 하나가 닫힌다.
+    ///
+    /// ★실험의 검출력을 함께 잰다: 자식이 실제로 떴는지(pid 생존) 확인하지 않으면, 스폰이
+    /// 조용히 실패한 트리에서도 초록이 나온다 — 아무것도 재지 않은 초록이다.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_pty_child_does_not_inherit_the_lock_fd() {
+        use std::os::unix::io::AsRawFd;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-fdinherit-{:x}-{:x}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("cys.lock");
+        std::fs::write(&lock, b"1").unwrap();
+
+        // ① 부모가 락을 쥔다.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "전제 실패 — 부모가 락을 잡지 못했다"
+        );
+
+        // ② 락을 쥔 채 PTY 자식을 낳는다(이 저장소가 실제로 하는 그 행위).
+        let daemon = isolated_daemon();
+        let pane = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("PTY 자식 스폰 실패 — 이 실험은 자식이 실제로 떠야 성립한다");
+        let child = pane.pid;
+        daemon.surfaces.lock().unwrap().insert(pane.id, pane.clone());
+        // ★검출력 자기검증 — 자식이 살아 있어야 '상속했다면 락이 남는다' 가 성립한다.
+        assert!(
+            child > 0 && unsafe { libc::kill(child as libc::pid_t, 0) } == 0,
+            "자식이 살아 있지 않다(pid={child}) — 상속 여부를 잴 수 없는 무측정이다"
+        );
+
+        // ③ 부모가 fd 를 놓는다. ④ 새 fd 로 재획득한다.
+        drop(holder);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let errno = std::io::Error::last_os_error();
+        drop(contender);
+        unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            rc, 0,
+            "★PTY 자식이 락 fd 를 상속했다 — 부모가 놓았는데 락이 살아 있다(errno={errno}). \
+             이것은 검체 격리 문제가 아니라 **프로덕션 락 누수**다(C4 블로커)"
+        );
+    }
+
+    /// ★위 실험의 **검출력 증명**(양성 대조군) — 일부러 상속시키면 반드시 잡혀야 한다.
+    ///
+    /// 위 검체가 초록인 것이 '상속이 없다' 인지 '이 측정법이 아무것도 못 잰다' 인지는 그것만으로
+    /// 갈리지 않는다. 이 세션이 반복해 만난 계급이다 — 그래서 `dup2` 로 CLOEXEC 을 지운 fd 를
+    /// 자식에게 **일부러 물려주고**, 부모가 놓은 뒤 재획득이 **실패하는지** 잰다. 여기서 실패가
+    /// 나와야 위 검체의 초록이 비로소 '상속 없음' 이라는 뜻을 갖는다.
+    #[cfg(unix)]
+    #[test]
+    fn the_fd_inheritance_probe_can_actually_detect_inheritance() {
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-fdctl-{:x}-{:x}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("cys.lock");
+        std::fs::write(&lock, b"1").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "전제 실패 — 부모가 락을 잡지 못했다"
+        );
+        let raw = holder.as_raw_fd();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // `dup2` 는 새 fd 의 CLOEXEC 을 지운다 — exec 를 넘어 자식이 그 기술자를 물려받는다.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(raw, 9) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("대조군 자식 스폰 실패");
+        drop(holder);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        let rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        drop(contender);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(
+            rc, 0,
+            "일부러 상속시킨 fd 를 쥔 자식이 있는데 재획득이 성공했다 — 이 측정법은 상속을 \
+             탐지하지 못한다. 그렇다면 위 검체의 초록은 '상속 없음' 이 아니라 **무측정**이다"
+        );
+    }
+
     /// ★결함#6-b 예약어 핀 — `owner` 는 데몬이 **도출**하는 신원 등급이지 pane 이 자칭할 수
     /// 있는 역할이 아니다. 자칭이 열리면 부서 ACL 첫 줄 `{"from":"owner","to":"*","allow":true}`
     /// 가 그 pane 에게 그대로 열려 '워커 직접 조향 차단'이 무력화된다(claim_role·create 대칭).
@@ -8967,6 +9702,59 @@ mod tests {
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B1(0.14.30) C4 핀: 같은 발신자의 대기 큐가 있는데 직접 send 가 앞지르면
+    /// `queue.order_inverted` 를 남긴다(queue-starvation-case.md §8 실사고 — 구 회신이 신 지시보다
+    /// 늦게 도착해 수신자가 집행을 정지했다). 재정렬은 하지 않는다(직접 send 는 의도된 steer).
+    #[test]
+    fn b1_order_inverted_is_observed_when_same_sender_has_pending_queue() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, _dir) = daemon_with_acl("b1-order", r#"{"default":"allow","rules":[]}"#);
+        let target = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create target");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(target.id, target.clone());
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+            .expect("create sender");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(sender.id, sender.clone());
+        // 발신자가 --queued 로 남긴 대기분(from = 발신 surface_ref).
+        let e = daemon.next_queue_entry(
+            "[보고] 먼저 큐에 넣은 구 회신".into(),
+            Some(cys::surface_ref(sender.id)),
+            "send",
+        );
+        target.pending_queue.lock().unwrap().push_back(e);
+        // 같은 발신자가 직접 send 로 앞지른다(from 은 데몬이 caller 로 검증하는 값이라
+        // 테스트에서는 자기신고 from 을 쓰되 verified_from 이 없으면 이벤트도 없다 —
+        // 그래서 이 핀은 **검증된 발신자** 경로를 흉내내지 않고 '이벤트 계약' 만 고정한다).
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": target.id, "text": "[지시] 뒤에 친 신 지시"}),
+            },
+            None,
+        ) else {
+            panic!("single reply");
+        };
+        assert_eq!(r["ok"], json!(true));
+        // 대기분은 그대로 남는다(재정렬 없음 — 안전 게이트 우회 금지).
+        assert_eq!(
+            target.pending_queue.lock().unwrap().len(),
+            1,
+            "직접 send 가 큐를 대신 밀어내면 프롬프트 경계·타이핑 가드를 우회한 주입이 된다"
+        );
     }
 
     /// ★R1 배달 원장 + ★★R4 human 신뢰 제거 — send_text 전 경로 커버리지를 한 자리에 박제한다.
@@ -9789,6 +10577,437 @@ mod tests {
         s.id
     }
 
+    /// ★H-NPM-4(codex R1 #2 · blocking): **번들 오염 경고에 실제 소비자가 있다 — pane 채널.**
+    ///
+    /// 종전 결함: `WarnBundlePolluted` 는 env 주입만 멈추고 아무 데도 말하지 않았다(생산
+    /// 소비자 0). T2-4 는 "덮지 말고 경고만"이지 "무음"이 아니다 — 소비자가 없으면 사용자는
+    /// 자기 npm 전역 설치가 설치본 서명을 깨뜨리는 중임을 **차단당한 뒤에야** 안다.
+    ///
+    /// 이 검체가 재는 것 셋(하나라도 없으면 FAIL):
+    ///   ① `env.advisory` 이벤트에 경고 문안이 실린다(GUI·구독자·저널 채널)
+    ///   ② 배달 원장에 **주입보다 먼저** 기록된다(없으면 임무 게이트가 이 주석을 오너 임무로 읽는다)
+    ///   ③ 오염이 아닌 판정에서는 **아무것도** 나가지 않는다(과잉 고지 차단 · 음성 대조)
+    #[test]
+    fn npm_prefix_pollution_is_announced_to_pane_channel_and_ledger() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        let mut rx = daemon.bus.subscribe();
+        let scope = std::path::PathBuf::from("/Applications/cys.app");
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let verdict = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: polluted.to_string(),
+            scope_root: scope.clone(),
+        };
+        let expect_line =
+            cys::npm_prefix_pollution_notice(&verdict).expect("오염 판정에 문안이 없다");
+
+        announce_npm_prefix_pollution_with(&daemon, sid, &verdict);
+
+        // ① 이벤트 채널.
+        let mut seen: Option<String> = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("env.advisory")
+                && ev["payload"]["kind"].as_str() == Some("npm_prefix_bundle_polluted")
+            {
+                seen = ev["payload"]["text"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(
+            seen.as_deref(),
+            Some(expect_line.as_str()),
+            "env.advisory 이벤트에 경고가 없다 — T2-4 '경고만' 정책이 무음으로 방치된다"
+        );
+
+        // ② 배달 원장 선기록(unix 주입 경로 한정 — 주입이 없는 곳엔 기록할 유래도 없다).
+        if cfg!(unix) {
+            let led = crate::delivery::ledger_path(&daemon.socket_path);
+            let raw = std::fs::read_to_string(&led).unwrap_or_default();
+            assert!(
+                raw.contains("env_advisory"),
+                "고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
+                led.display()
+            );
+            assert!(
+                raw.contains("npm_config_prefix"),
+                "원장 레코드가 이 고지의 것이 아니다: {raw}"
+            );
+        }
+
+        // ③ 음성 대조 — 오염이 아니면 이벤트도 원장도 늘지 않는다.
+        let daemon2 = isolated_daemon();
+        let sid2 = make_surface(&daemon2, None);
+        let mut rx2 = daemon2.bus.subscribe();
+        for clean in [
+            cys::NpmPrefixVerdict::KeepUser,
+            cys::NpmPrefixVerdict::NoDefault,
+            cys::NpmPrefixVerdict::Inject(std::path::PathBuf::from("/home/u/.local")),
+        ] {
+            announce_npm_prefix_pollution_with(&daemon2, sid2, &clean);
+        }
+        while let Ok(ev) = rx2.try_recv() {
+            assert_ne!(
+                ev["name"].as_str(),
+                Some("env.advisory"),
+                "오염이 아닌데 고지가 나갔다 — 과잉 경고는 진짜 경고를 묻는다: {ev}"
+            );
+        }
+    }
+
+    /// ★H-NPM-5(codex R1 #2 · blocking / **R2 #8 재작성**): 두 번째 소비자 — `org.status` 폴링 축.
+    ///
+    /// pane 고지는 그 자리에 있던 사람만 본다. preflight·doctor 는 사람이 없어도 읽어야 하므로
+    /// `daemon.npm_prefix_polluted` 가 그 축이다. 이 검체는 키의 **실재**와 **판정 추종**을 함께
+    /// 잰다 — 키만 있고 항상 false 인 배선(가짜 소비자)은 여기서 죽는다.
+    ///
+    /// ★R2 #8 수리: 종전 판은 판정 추종을 재려고 **프로세스 전역** `npm_config_prefix` 를
+    /// 직렬화 없이 바꾸고 panic-safe 복원도 하지 않았다(병렬 검체 오염 · 재현 불가 flake).
+    /// 이제 세 축으로 나눠 **전역 상태를 한 번도 건드리지 않고** 같은 계약을 잰다:
+    ///   ① 판정→필드 변환을 전수로(`npm_prefix_polluted_field` · 4판정 전부)
+    ///   ② 키가 실제 `org.status` 응답에 있다(배선 실재 — env 무관)
+    ///   ③ 소스 핀: 그 자리에 **관측 함수가 그대로 물려 있다**(①이 초록인데 배선이 상수로
+    ///      바뀌는 경로를 막는다 — ①②만으로는 못 잡는다)
+    #[test]
+    fn org_status_exposes_npm_prefix_pollution_for_preflight() {
+        // ① 판정 → 필드. 4판정 전수(오염만 true · 나머지 전부 false).
+        let polluted = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: "/Applications/cys.app/Contents/Resources/npm".to_string(),
+            scope_root: std::path::PathBuf::from("/Applications/cys.app"),
+        };
+        assert!(
+            npm_prefix_polluted_field(&polluted),
+            "설치본 오염인데 status 가 깨끗하다고 보고한다 — preflight 가 영영 못 본다"
+        );
+        for clean in [
+            cys::NpmPrefixVerdict::KeepUser,
+            cys::NpmPrefixVerdict::NoDefault,
+            cys::NpmPrefixVerdict::Inject(std::path::PathBuf::from("/home/u/.local")),
+        ] {
+            assert!(
+                !npm_prefix_polluted_field(&clean),
+                "설치본 밖 값을 오염으로 보고했다 — 진짜 경고가 묻힌다: {clean:?}"
+            );
+        }
+
+        // ② 키 실재 — 실제 응답에 있어야 preflight 가 읽을 수 있다(전역 env 무접촉).
+        let daemon = isolated_daemon();
+        let req = Request { id: json!(1), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert!(
+            resp["result"]["daemon"]["npm_prefix_polluted"].is_boolean(),
+            "org.status 에 npm_prefix_polluted 키가 없다(또는 bool 이 아니다): {}",
+            resp["result"]["daemon"]
+        );
+
+        // ③ 소스 핀 — 필드가 **관측 함수**에서 오는지. ①이 초록인 채로 배선만 상수가 되는
+        //    경로(가짜 소비자)는 ①②로는 안 잡힌다.
+        // ★핀은 반드시 **org.status 아크 안**만 본다. 파일 전체를 뒤지면 이 assert 문자열
+        //   자체가 매치돼 스스로를 만족시킨다(가짜 핀 — mutation 으로 실측해 잡았다).
+        let src = include_str!("handlers.rs");
+        let start = src.find("\n        \"org.status\" => {").expect("org.status 아크 소실");
+        let end = start
+            + src[start..]
+                .find("\n        \"control.dashboard\" => {")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        assert!(
+            src[start..end]
+                .contains("npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())"),
+            "org.status 가 실제 env 판정을 잃었다 — 필드가 상수로 굳으면 오염이 영영 안 보인다"
+        );
+    }
+    /// ★H-NPM-6(codex R1 #2 · 배선 소실 방지 소스 핀): `surface.create` 가 고지 호출을 잃으면
+    /// 위 두 검체는 여전히 초록인데 **실사용에서는 아무 pane 도 경고를 못 받는다**.
+    /// (state.rs `pane_children_inherit_no_bytecode_env` · boot_supervisor 순서 핀과 같은 관례.)
+    #[test]
+    fn surface_create_still_announces_npm_prefix_pollution() {
+        let src = include_str!("handlers.rs");
+        let start = src.find("\"surface.create\" =>").expect("surface.create 아크 소실");
+        let end = start
+            + src[start..]
+                .find("\n        \"surface.close\"")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        assert!(
+            src[start..end].contains("announce_npm_prefix_pollution(daemon, s.id)"),
+            "surface.create 가 번들 오염 고지를 잃었다 — 경고에 소비자가 다시 0이 된다"
+        );
+    }
+
+    /// ★H-ORIGIN-1(층1 · 명세 v2.1 A12): `hook.machine_origin` 이 **원장을 실제로 읽고** 판정한다.
+    ///
+    /// 이 검체가 닫는 구멍: 종전 훅 CLI 는 층0/0-c/2 만 봤고 층1 을 못 봤다. 그래서 **라벨 없는
+    /// 기계 push** — 데몬이 주입했지만 `[라벨]` 이 없는 문장 — 이 오너 임무로 통과했다.
+    /// 그것이 2026-08-01 사고의 기제이고, 여기서 그 문장을 **실제로 재현**한다.
+    ///
+    /// ★원장은 **생산 writer**(`delivery::record`)로 쓴다. 검체가 원장 줄을 손으로 지으면 그
+    /// 사본이 생산 형식과 갈리고, 갈린 뒤에도 검체는 초록이다(자기 사본을 자기가 읽으므로).
+    #[test]
+    fn hook_machine_origin_reads_the_real_ledger_and_folds_unlabeled_pushes() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        let norm = |t: &str| cys::mission_gate::normalize(t);
+
+        // ── ① 원장 **부재** = 정상(부트스트랩 불가침). unknown 이 아니라 human 이다. ──────
+        //    여기서 unknown 을 내면 호출자가 fail-closed 로 접어 **오너가 임무를 영영 못 준다**.
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm("릴리스 게이트를 통과시켜라"));
+        assert_eq!(
+            v["origin"], "human",
+            "원장 부재를 판정 불가로 접었다 — 부트스트랩이 영영 막힌다: {v}"
+        );
+
+        // ── ② ★라벨 없는 기계 push — 이 사고의 본체 ──────────────────────────────────
+        //    `[라벨]` 이 없어 층2 는 못 본다. 층1(원장 대조)만이 잡을 수 있다.
+        let unlabeled = "다음 액션 착수";
+        assert!(
+            !cys::mission_gate::has_machine_label(unlabeled),
+            "검체 전제 붕괴 — 이 문장에 라벨이 있으면 층2 가 잡아 층1 을 시험하지 못한다"
+        );
+        crate::delivery::record(
+            &daemon.socket_path,
+            sid,
+            unlabeled,
+            crate::delivery::Origin::Send,
+            None,
+        );
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm(unlabeled));
+        assert_eq!(
+            v["origin"], "machine",
+            "라벨 없는 기계 push 가 오너 프롬프트로 통과했다 — 2026-08-01 사고 재발: {v}"
+        );
+        assert_eq!(v["layer"], 1, "층2 가 잡았다면 이 검체는 층1 을 시험하지 못한 것이다: {v}");
+
+        // ── ③ 음성 대조 — 원장에 없는 문장은 오너 것이다(과차단 금지) ──────────────────
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm("이건 내가 직접 친 문장이다"));
+        assert_eq!(
+            v["origin"], "human",
+            "원장에 없는 오너 문장을 기계로 접었다 — 오너가 임무를 못 준다: {v}"
+        );
+
+        // ── ④ 남의 pane 배달은 내 판정에 쓰이지 않는다(surface 결박) ────────────────────
+        let other = make_surface(&daemon, None);
+        let mine_only = "남의 pane 으로 간 배달";
+        crate::delivery::record(
+            &daemon.socket_path,
+            other,
+            mine_only,
+            crate::delivery::Origin::Send,
+            None,
+        );
+        let v = hook_machine_origin_verdict(&daemon, sid, &norm(mine_only));
+        assert_eq!(
+            v["origin"], "human",
+            "남의 pane 배달로 내 프롬프트를 접었다 — 결박이 풀리면 아무나 내 게이트를 닫는다: {v}"
+        );
+
+        // ── ⑤ 원장 **판독 불가** = unknown(부재와 융합 금지) ───────────────────────────
+        let d2 = isolated_daemon();
+        let s2 = make_surface(&d2, None);
+        let led = crate::delivery::ledger_path(&d2.socket_path);
+        if let Some(parent) = led.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&led);
+        std::fs::create_dir_all(&led).expect("원장 자리에 디렉터리 생성"); // 손상 재현
+        let v = hook_machine_origin_verdict(&d2, s2, &norm("아무 문장"));
+        assert_eq!(
+            v["origin"], "unknown",
+            "손상 원장을 정상으로 접었다 — 판정 근거 없이 게이트가 열린다: {v}"
+        );
+        assert_eq!(v["ledger_status"], "unreadable", "{v}");
+    }
+
+    /// ★H-NPM-7(codex R2 #2 · blocking): **고지가 Windows pane 에도 실제로 주입된다.**
+    ///
+    /// 종전 결함: 주입이 `cfg!(unix)` 안에 있어 Windows pane 은 한 줄도 못 받았다. 근거는
+    /// "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은 `powershell.exe`
+    /// (`state.rs` `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 위험한 것은 OS 가 아니라
+    /// **cmd.exe 하나**였다. 그 하나 때문에 정작 봉인 사고가 잦은 플랫폼 전체가 무음이 됐다.
+    ///
+    /// 이 검체가 재는 것 넷:
+    ///   ① 셸별 주석 접두가 맞다(powershell·pwsh·zsh·bash → `# ` / cmd → `rem `)
+    ///   ② 경로·대소문자·확장자가 섞여도 같은 판정(`C:\WINDOWS\SYSTEM32\CMD.EXE`)
+    ///   ③ **실제 `write_tx` 로 `Inject` 가 도착한다** — 양 셸 모두. mac CI 가 Windows 분기를
+    ///      실제로 밟는다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
+    ///   ④ 문안은 한 글자도 안 버린다(접두만 다르고 본문은 정본과 동일)
+    #[test]
+    fn npm_prefix_notice_reaches_the_pane_on_windows_shells_too() {
+        use crate::state::WriteReq;
+
+        // ① 셸별 접두.
+        for (shell, want) in [
+            ("powershell.exe", "# "),
+            ("pwsh", "# "),
+            ("/bin/zsh", "# "),
+            ("/bin/bash", "# "),
+            ("cmd.exe", "rem "),
+            // ② 경로·대소문자·확장자 정규화.
+            ("C:\\WINDOWS\\SYSTEM32\\CMD.EXE", "rem "),
+            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "# "),
+        ] {
+            assert_eq!(
+                cys::shell_comment_prefix(shell),
+                want,
+                "셸 {shell:?} 의 주석 접두가 틀렸다 — 고지가 곧 명령이 되거나 무음이 된다"
+            );
+        }
+
+        let verdict = cys::NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: "C:\\Program Files\\cys\\runtime\\npm".to_string(),
+            scope_root: std::path::PathBuf::from("C:\\Program Files\\cys"),
+        };
+
+        // ③ 실제 채널 수신 — 양 셸 모두 `Inject` 가 도착한다.
+        for (shell, want_prefix) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
+            let req = npm_prefix_pane_notice_req(&verdict, shell)
+                .unwrap_or_else(|| panic!("셸 {shell:?} 에서 고지가 만들어지지 않았다"));
+            tx.try_send(req).expect("채널 전송 실패");
+            match rx.try_recv().expect("pane 이 고지를 못 받았다 — Windows 무음 회귀") {
+                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                    assert!(
+                        text.starts_with(want_prefix),
+                        "셸 {shell:?} 에 안전하지 않은 접두로 주입됐다: {text:?}"
+                    );
+                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
+                    assert!(!clear_first, "고지가 화면을 지웠다 — 사용자 작업 파괴");
+                    // ④ 본문은 정본과 동일(접두만 다르다 · 요약 금지).
+                    let canon = cys::npm_prefix_pollution_notice(&verdict).expect("정본 문안 부재");
+                    assert_eq!(
+                        text.trim_start_matches(want_prefix),
+                        canon.trim_start_matches("# "),
+                        "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 처방을 받는다"
+                    );
+                    assert!(!text.contains('\n'), "고지에 개행이 남았다 — 개행은 곧 Enter 다");
+                }
+                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
+            }
+        }
+
+        // 음성 대조 — 오염이 아니면 어떤 셸에서도 아무것도 만들지 않는다.
+        for clean in [cys::NpmPrefixVerdict::KeepUser, cys::NpmPrefixVerdict::NoDefault] {
+            for shell in ["powershell.exe", "cmd.exe", "/bin/zsh"] {
+                assert!(
+                    npm_prefix_pane_notice_req(&clean, shell).is_none(),
+                    "오염이 아닌데 고지가 만들어졌다({shell}) — 과잉 경고는 진짜 경고를 묻는다"
+                );
+            }
+        }
+
+        // 배선 소실 방지 — 주입이 다시 `cfg!(unix)` 뒤로 숨으면 위 검체는 초록인 채로
+        // 실사용에서만 무음이 된다(H-NPM-6 와 같은 관례).
+        let src = include_str!("handlers.rs");
+        let start = src
+            .find("fn announce_npm_prefix_pollution_with(")
+            .expect("고지 함수 소실");
+        let end = start
+            + src[start..]
+                .find("\nfn npm_prefix_pane_notice_req(")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        // 주석은 걷어내고 **실제 코드**만 본다 — 이 결함의 내력을 설명하는 주석 자체가
+        // `cfg!(unix)` 를 인용하므로, 문자열만 찾으면 자기 설명에 걸려 영구 적색이 된다.
+        let code_only: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("cfg!(unix)"),
+            "고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
+        );
+    }
+
+    /// ★H-SEAT-WIN-1(codex R2 #2 의 **형제 결함** · master 범위 판정 2026-09-04):
+    /// 좌석 승계 고지도 Windows pane 에 실제로 주입된다.
+    ///
+    /// npm 축을 고치며 발견해 보고한 같은 결함이다 — 주입이 `cfg!(unix)` 안에 있어 Windows
+    /// pane 은 승계 고지를 한 줄도 못 받았다. 이 함수가 막으려던 것이 "내 pane 이 조용히
+    /// 강등됐다"는 온보딩 불신인데, **정작 Windows 사용자에게는 조용히 강등되고 있었다.**
+    ///
+    /// 재는 것 넷: ①셸별 접두 ②실제 `write_tx` **Inject 수신**(powershell·cmd 양 셸)
+    /// ③개행 부재(개행은 곧 Enter) ④`cfg!(unix)` 회귀 소스핀(주석 제외 후 검사).
+    #[test]
+    fn seat_takeover_notice_reaches_the_pane_on_windows_shells_too() {
+        use crate::state::WriteReq;
+
+        // ① 셸별 접두 — 문안 본문은 접두만 빼면 동일해야 한다(요약·분기 금지).
+        let ps = seat_takeover_notice("master", "powershell.exe");
+        let cmd = seat_takeover_notice("master", "cmd.exe");
+        assert!(ps.starts_with("# "), "powershell pane 에 잘못된 접두: {ps:?}");
+        assert!(cmd.starts_with("rem "), "cmd.exe pane 에 안전하지 않은 접두: {cmd:?}");
+        assert_eq!(
+            ps.trim_start_matches("# "),
+            cmd.trim_start_matches("rem "),
+            "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 고지를 받는다"
+        );
+        assert!(ps.contains("master"), "역할명이 고지에서 빠졌다: {ps:?}");
+
+        // ③ 개행 부재 — 좌석은 셸이고 개행은 곧 Enter 다.
+        for (shell, line) in [("powershell.exe", &ps), ("cmd.exe", &cmd)] {
+            assert!(!line.contains('\n'), "고지에 개행이 남았다({shell}) — 미제출 잔재가 실행된다");
+        }
+
+        // ② 실제 채널 수신 — 양 셸 모두.
+        for (shell, want) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
+            tx.try_send(WriteReq::Inject {
+                text: seat_takeover_notice("worker", shell),
+                cr_delay_ms: 120,
+                clear_first: false,
+            })
+            .expect("채널 전송 실패");
+            match rx.try_recv().expect("pane 이 승계 고지를 못 받았다 — Windows 무음 회귀") {
+                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                    assert!(text.starts_with(want), "셸 {shell:?} 접두 오류: {text:?}");
+                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
+                    assert!(!clear_first, "승계 고지가 화면을 지웠다 — 사용자 작업 파괴");
+                }
+                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
+            }
+        }
+
+        // ④ 회귀 소스핀 — 주입이 다시 unix 뒤로 숨으면 위 검체는 초록인 채 실사용만 무음이 된다.
+        //    주석은 걷어내고 **실제 코드**만 본다(이 결함의 내력을 적은 주석이 cfg!(unix) 를 인용한다).
+        let src = include_str!("handlers.rs");
+        let start = src.find("fn announce_seat_takeover(").expect("승계 고지 함수 소실");
+        let end = start
+            + src[start..]
+                .find("\nfn seat_takeover_notice(")
+                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
+        let code_only: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("cfg!(unix)"),
+            "승계 고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
+        );
+
+        // ⑤ **종단 확인** — 순수 함수만 재면 `announce_seat_takeover` 가 그 산출을 주입 직전에
+        //    변형하는 결함(예: 접두 strip)을 못 잡는다. mutation S-M3 이 그 사각을 드러냈다.
+        //    실제 함수를 돌려 **배달 원장에 실제로 남은 문자열**을 본다(원장은 주입과 같은 값을
+        //    받으므로, 여기서 접두가 살아 있으면 pane 에 들어간 것도 안전하다).
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        announce_seat_takeover(&daemon, sid, "master", "/tmp/lane");
+        let led = crate::delivery::ledger_path(&daemon.socket_path);
+        let raw = std::fs::read_to_string(&led).unwrap_or_default();
+        assert!(
+            raw.contains("seat_takeover"),
+            "승계 고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
+            led.display()
+        );
+        // 원장 레코드의 preview 는 정규화된 본문이다. 접두가 살아 있어야 셸이 이 줄을 주석으로
+        // 읽는다 — strip 되면 그대로 **명령**이 된다.
+        let prefix = cys::shell_comment_prefix(
+            &daemon.get_surface(sid).expect("surface").cmd,
+        );
+        assert!(
+            raw.contains(prefix.trim_end()),
+            "원장에 남은 승계 고지에 주석 접두가 없다 — pane 에 들어간 줄도 명령이 된다: {raw}"
+        );
+    }
+
     /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
     fn write_req_name(r: &crate::state::WriteReq) -> &'static str {
         match r {
@@ -9903,11 +11122,20 @@ mod tests {
         assert!(spool_intents(&daemon).is_empty(), "모순 claim 인텐트가 기록됐다");
     }
 
-    /// ★[성공 계약 핀] 커널 도출 surface + 레지스트리 일치 claim → v2 인텐트가 원자 기록되고
-    /// 즉시 ack. **lane 은 항상 빈값**(자기 레인 고정 — R3-P2-7 ⓔ의 데몬면), id 는 선언별
-    /// 유일값이다(고정 id 금지 — P2-4 liveness 함정).
+    /// ★[성공 계약 핀 · **부트 v2 로 계약 교체**] 커널 도출 surface + 레지스트리 일치 claim →
+    /// 인텐트가 원자 기록되고 즉시 ack. **lane 은 항상 빈값**(자기 레인 고정).
+    ///
+    /// ★종전 계약과 무엇이 달라졌는가(정직 기록): 이 검체는 원래 "재선언은 **다른** id 를
+    /// 받는다" 를 박제했다. 근거는 "고정 id 면 소진된 예산이 1800s 동안 정당한 재선언을 즉시
+    /// Retire 한다(무반응 함정)" 였다. 부트 v2 는 그 함정을 **다른 수단**으로 막는다 —
+    /// id 는 선언 **내용**에서 뽑고(`decl_id`), terminal 전이 시점에 파일을 `.done` 으로
+    /// rename 해 재선언이 언제나 새 파일이 되게 한다(시뮬 T1-3). 그래서 여기서는
+    ///   ⓐ 같은 선언의 **재전송**은 `dedup`(인텐트 1건 — 종전엔 2건이 생겼다)
+    ///   ⓑ 그 함정 자체가 열리지 않는다는 것은 supervisor 의
+    ///      `redeclaration_after_terminal_is_not_swallowed_as_dedup` 이 잰다
+    /// 를 박제한다. **목적은 보존하고 수단만 바꾼 것**이며, 목적을 재는 검체가 사라지지 않았다.
     #[test]
-    fn boot_enqueue_writes_a_v2_intent_with_own_lane_and_unique_id() {
+    fn boot_enqueue_writes_a_v3_intent_with_own_lane_and_content_derived_id() {
         let daemon = isolated_daemon();
         daemon.supervisor_alive.store(true, Ordering::SeqCst);
         let sid = make_surface(&daemon, Some("master"));
@@ -9918,30 +11146,85 @@ mod tests {
             "claim_rc": 0,
             "claim_at": crate::state::now_epoch(),
             "reason": "hook",
+            "session_id": "sess-1",
+            "prompt_digest": "d-1",
         });
         let r1 = boot_enqueue_call(&daemon, Some(pid), params.clone());
         assert_eq!(r1["result"]["enqueued"], json!(true), "응답: {r1}");
+        assert_eq!(r1["result"]["outcome"], json!("enqueued"));
         assert_eq!(r1["result"]["surface_id"], json!(sid));
+        assert_eq!(r1["result"]["executor"], json!("runner"), "기본 스위치는 v2 러너다");
+        // ⓐ 같은 선언 이벤트의 **재전송** → dedup · 파일 1건(종전엔 2건이 생겼다).
         let r2 = boot_enqueue_call(&daemon, Some(pid), params);
+        assert_eq!(r2["result"]["outcome"], json!("dedup"), "재전송이 dedup 이 아니다: {r2}");
+        assert_eq!(r2["result"]["enqueued"], json!(false));
         let (id1, id2) = (r1["result"]["id"].as_str().unwrap(), r2["result"]["id"].as_str().unwrap());
-        assert_ne!(id1, id2, "재선언이 같은 인텐트 id 를 받았다 — 소진 예산 1800s 그림자(무반응 함정)");
-        // (R4 수정 라운드) 데몬 세대 접두 핀 — 없으면 같은 epoch 초 안의 데몬 재시작이 seq 0
-        // 부터 다시 세며 직전 id 와 충돌, 스풀 파일 덮어쓰기로 디스크측 attempts 가 리셋된다.
-        let gen_prefix = format!("boot-{:x}-", daemon.started_at as u64);
-        assert!(
-            id1.starts_with(&gen_prefix) && id2.starts_with(&gen_prefix),
-            "인텐트 id 에 데몬 세대 접두 부재({id1}) — 같은 초 재시작 id 충돌(스풀 덮어쓰기) 재개방"
+        assert_eq!(id1, id2, "같은 선언 재전송이 다른 id 를 받았다 — 내용 기반 id 계약 붕괴");
+        assert_eq!(id1.len(), 32, "decl_id 길이 계약(파일명 예산)");
+        // ⓑ **다른** 선언(프롬프트가 다르다)은 같은 좌석이라 superseded 로 기록된다.
+        let r3 = boot_enqueue_call(
+            &daemon,
+            Some(pid),
+            json!({"decl_origin": "hook-human", "session_id": "sess-1", "prompt_digest": "d-2"}),
         );
+        assert_eq!(r3["result"]["outcome"], json!("superseded"), "응답: {r3}");
+        assert_eq!(r3["result"]["superseded_by"], json!(id1));
         let intents = spool_intents(&daemon);
-        assert_eq!(intents.len(), 2, "인텐트 파일 수 불일치: {intents:?}");
+        assert_eq!(intents.len(), 1, "진행 중 인텐트는 1건이어야 한다: {intents:?}");
         for it in &intents {
             assert_eq!(it["v"], json!(crate::boot_supervisor::INTENT_SCHEMA_V));
-            assert_eq!(it["lane"], json!(""), "enqueue 산출 인텐트의 lane 이 빈값이 아니다: {it}");
-            assert_eq!(it["surface_id"], json!(sid), "커널 도출 surface 미탑재: {it}");
-            assert_eq!(it["decl_origin"], json!("hook-human"));
-            assert_eq!(it["claim"]["rc"], json!(0));
-            assert_eq!(it["action"], json!("ensure-team"), "닫힌 enum 토큰 이탈: {it}");
+            assert_eq!(it["lane"], json!(""), "lane 자기 고정 위반");
+            assert_eq!(it["surface_id"], json!(sid));
+            assert_eq!(it["state"], json!("pending"));
+            assert_eq!(it["executor"], json!("runner"));
+            assert_eq!(it["generation"], json!(0));
         }
+    }
+
+    /// ★H-ENQ-GUI-1(명세 §2-5 · §2-11): `operator_token` 이 데몬 발급값과 **일치할 때만**
+    /// GUI 가 `surface_id` 를 명시할 수 있고 `gui-operator` 유래가 인정된다.
+    ///
+    /// 왜 이 인가가 필요한가: 훅은 커널 peer pid 로 좌석을 도출할 수 있지만 GUI ▶버튼은 자기
+    /// pane 이 없다 — 좌석을 말할 수 없으면 GUI 는 부트를 발화할 수 없다. 토큰은 데몬이 자기
+    /// 상태 디렉터리에 0600 으로 쓰고 붙이는 지점이 Tauri 백엔드 한 곳뿐이라(CLI 는 0건)
+    /// feed.reply 면제와 같은 신뢰 계급이다.
+    #[test]
+    fn boot_enqueue_authorizes_gui_only_with_the_operator_token() {
+        let daemon = isolated_daemon();
+        daemon.supervisor_alive.store(true, Ordering::SeqCst);
+        let sid = make_surface(&daemon, Some("master"));
+        let tok = daemon.operator_token.clone().expect("데몬이 토큰을 발급하지 않았다");
+        // ⓐ 토큰 일치 → surface_id 명시 허용 + gui-operator 인정. caller_pid 없이도 성립한다
+        //    (GUI 는 pane 이 없다 — 그것이 이 인가가 존재하는 이유다).
+        let ok = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"operator_token": tok, "surface_id": sid,
+                   "decl_origin": "gui-operator", "gui_click_id": "click-1",
+                   "prompt_digest": "g-1"}),
+        );
+        assert_eq!(ok["result"]["outcome"], json!("enqueued"), "응답: {ok}");
+        assert_eq!(ok["result"]["surface_id"], json!(sid));
+        let intents = spool_intents(&daemon);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0]["decl_origin"], json!("gui-operator"));
+        // ⓑ ★음성 대조 — 토큰 **불일치**면 surface_id 신고는 종전대로 거절이다.
+        let bad = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"operator_token": "not-the-token", "surface_id": sid,
+                   "decl_origin": "gui-operator", "prompt_digest": "g-2"}),
+        );
+        assert_eq!(bad["error"]["code"], json!("invalid_params"), "응답: {bad}");
+        // ⓒ ★음성 대조 — 토큰 **부재**로 gui-operator 만 주장하면 미지 유래로 거절이다
+        //    (유래 토큰이 인가 없이 통과하면 그 철자는 아무것도 증명하지 못한다).
+        let forged = boot_enqueue_call(
+            &daemon,
+            None,
+            json!({"decl_origin": "gui-operator", "prompt_digest": "g-3"}),
+        );
+        assert_eq!(forged["error"]["code"], json!("invalid_params"), "응답: {forged}");
+        assert_eq!(spool_intents(&daemon).len(), 1, "거절된 요청이 스풀에 적혔다");
     }
 
     /// 게이트 박제: clear_first(원자 Ctrl-U 선정리)는 launch-agent 등록 pane 한정 —
@@ -10750,14 +12033,67 @@ mod tests {
     /// 확보한다(전제를 암묵에 두면 ambient 값 하나로 8검체가 일괄 적색 — 환경 결합 오진).
     /// ACL_ENV_LOCK 보유 중에만 생성할 것(전 env 변이 검체와 같은 직렬화 규약). drop 시 원값
     /// 복원 — 패닉 경로 포함(락 가드보다 늦게 선언해 락 해제 전에 복원된다).
-    struct BootGatesAmbientGuard(Option<std::ffi::OsString>);
+    /// ★2026-09-05 실측 수리: 이 가드는 **두 락**을 잡는다(ACL 은 호출부, AUTH 는 여기서).
+    ///
+    /// `CYS_BOOT_GATES` 는 **마스터 스위치**라 seat 토큰 축만 끄는 것이 아니라 **auth 게이트도
+    /// 함께 끈다**(`AUTH_GATE_PRESCRIPTION` 의 되돌리기 문안이 그 사실을 적고 있다). 그런데
+    /// 종전에는 이 축이 `ACL_ENV_LOCK` 만, auth 검체는 `AUTH_GATE_ENV_LOCK` 만 잡아 **두 락이
+    /// 서로를 배제하지 않았다**. 그래서 둘이 병렬로 겹치면 auth 게이트가 프로세스 전역에서 꺼진
+    /// 채 차단 검체가 돌아 "미인증 프로필이 좌석을 얻었다" 는 적색이 났다(전수 게이트에서 실측).
+    ///
+    /// ★그 적색은 **가장 나쁜 종류의 거짓 신호**다: 보안 게이트가 뚫린 것처럼 보이는데 실제
+    /// 원인은 검체 격리이고, 몇 번 재실행하면 사라져 '간헐' 로 접히기 쉽다. 그렇게 접히면 진짜
+    /// 우회가 생겼을 때 같은 모양이라 구별되지 않는다.
+    ///
+    /// 락 순서는 **ACL → AUTH** 로 고정한다(호출부가 ACL 을 먼저 잡고 여기서 AUTH 를 잡는다).
+    /// 순환은 없다 — auth 검체는 ACL 을 잡지 않는다(실측 확인). 9개 호출 지점을 하나씩 고치는
+    /// 대신 가드가 잡게 한 이유: 하나씩이면 다음에 추가되는 열 번째가 조용히 빠진다.
+    struct BootGatesAmbientGuard(
+        Option<std::ffi::OsString>,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
     impl BootGatesAmbientGuard {
         fn neutralize() -> Self {
+            // AUTH 락을 **env 를 만지기 전에** 잡는다 — 잡기 전에 지우면 그 창에서 auth 검체가
+            // 꺼진 게이트를 본다.
+            let auth = AUTH_GATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prior = std::env::var_os(cys::ENV_BOOT_GATES);
             std::env::remove_var(cys::ENV_BOOT_GATES);
-            Self(prior)
+            Self(prior, auth)
         }
     }
+    /// ★소스핀(2026-09-05) — 마스터 스위치 가드는 **auth 락도** 잡고, env 를 만지기 **전에** 잡는다.
+    ///
+    /// 이 결박이 풀리면 다시 "미인증 프로필이 좌석을 얻었다" 는 적색이 간헐로 난다. 그 적색은
+    /// 보안 게이트가 뚫린 것처럼 보이지만 실제 원인은 검체 격리이고, 몇 번 재실행하면 사라져
+    /// '간헐' 로 접히기 쉽다 — 그렇게 접히면 **진짜 우회가 생겼을 때 같은 모양이라 구별되지
+    /// 않는다.** 행위로는 경주라 결정론으로 잴 수 없으므로 소스로 못 박는다.
+    #[test]
+    fn boot_gates_guard_also_serializes_with_the_auth_gate_lock() {
+        let src = include_str!("handlers.rs");
+        let at = src
+            .find("impl BootGatesAmbientGuard {")
+            .expect("마스터 스위치 가드 impl 소실");
+        let body = &src[at..];
+        let body = &body[..body.find("\n    }").expect("가드 impl 끝 소실")];
+        assert!(
+            body.contains("AUTH_GATE_ENV_LOCK.lock()"),
+            "마스터 스위치 가드가 auth 락을 놓았다 — CYS_BOOT_GATES=0 은 auth 게이트도 끄므로 \
+             그 창에서 차단 검체가 꺼진 게이트를 보고 적색이 난다(락은 env 하나가 아니라 \
+             '이 게이트를 끌 수 있는 축 전부' 를 지켜야 한다)"
+        );
+        let lock = body
+            .find("AUTH_GATE_ENV_LOCK.lock()")
+            .expect("auth 락 획득 지점 소실");
+        let rm = body
+            .find("remove_var(cys::ENV_BOOT_GATES)")
+            .expect("중립화 지점 소실");
+        assert!(
+            lock < rm,
+            "auth 락 획득이 env 변이 뒤로 갔다 — 잡기 전에 지우면 그 창이 그대로 남는다"
+        );
+    }
+
     impl Drop for BootGatesAmbientGuard {
         fn drop(&mut self) {
             match self.0.take() {
@@ -12607,6 +13943,75 @@ mod tests {
         assert!((49..=120).contains(&age), "age_secs ≈ 50 (실측 {age})");
         assert_eq!(row["from"], json!("surface:2"));
         assert_eq!(row["origin"], json!("send"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B3 #11: 전문(`text`)은 `full=true` 일 때만 실린다. 기본 응답은 preview 80자만 —
+    /// 행 계약(cols[3]=preview)·팩 파서·응답 크기가 불변이어야 한다.
+    ///
+    /// 음성 대조가 이 검체의 핵심이다: ⓐ 기본 조회에서 `text` 키가 **부재**함을 단언하지 않으면
+    /// "무조건 전문 노출" 구현도 통과한다(opt-in 계약이 증명되지 않는다).
+    #[test]
+    fn b3_queue_list_full_exposes_text_only_when_requested() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-b3-qfull-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        // 200자 본문 — preview(80자) 절단이 실제로 일어나는 길이여야 대조가 성립한다.
+        let body: String = std::iter::repeat('가').take(200).collect();
+        let at = crate::state::now_epoch() - 5.0;
+        std::fs::write(
+            dir.join("queue-state.json"),
+            format!(
+                r#"[{{"id":"qf.1","seq":1,"surface_id":21,"role":"b3-qfull","text":"{body}","enqueued_at":{at},"from":"surface:3","origin":"send"}}]"#
+            ),
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+
+        let ask = |params: Value| {
+            let req = Request { id: json!(1), method: "queue.list".into(), params };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "queue.list 실패 (응답: {resp})");
+            resp["result"]["entries"]
+                .as_array()
+                .expect("entries 배열")
+                .iter()
+                .find(|e| e["restored"] == json!(true))
+                .cloned()
+                .expect("restored 행")
+        };
+
+        // ⓐ 기본: 전문 키 부재 · preview 는 80자 절단.
+        let plain = ask(json!({}));
+        assert!(
+            plain.get("text").is_none(),
+            "기본 조회가 전문을 실었다 — opt-in 계약 붕괴(응답 크기·파서 계약 위반)"
+        );
+        assert_eq!(
+            plain["preview"].as_str().unwrap().chars().count(),
+            80,
+            "preview 는 80자 절단본이어야 한다"
+        );
+        assert_eq!(plain["bytes"], json!(body.len()), "bytes 는 전문 길이 그대로");
+
+        // ⓑ full=true: 전문 실림 · preview 는 여전히 80자(기존 키 불변 = additive).
+        let full = ask(json!({"full": true}));
+        assert_eq!(full["text"].as_str(), Some(body.as_str()), "전문이 원문과 달라졌다");
+        assert_eq!(
+            full["preview"].as_str().unwrap().chars().count(),
+            80,
+            "full 이 preview 를 덮어쓰면 안 된다(additive 계약)"
+        );
+        // ⓒ full=false 를 명시해도 기본과 같다(플래그 해석이 뒤집히지 않았음).
+        assert!(ask(json!({"full": false})).get("text").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14635,7 +16040,15 @@ mod tests {
     ///
     /// `CYS_PROFILE_GATE_OBSERVE_ONLY` 는 **프로세스 전역**이라, 롤백 테스트가 그것을 켠 순간
     /// 병렬로 도는 차단 테스트가 조용히 통과해 버린다(= 검체가 사문화된다). 그 창을 이 락 하나로
-    /// 닫는다. 이 env 의 소비자는 `profile_gate::observe_only()` 뿐이라 다른 레인과는 겹치지 않는다.
+    /// 닫는다.
+    ///
+    /// ★전제 정정(2026-09-05 실측): 종전 주석은 "이 env 의 소비자는 `profile_gate::observe_only()`
+    /// 뿐이라 다른 레인과는 겹치지 않는다" 고 적었다. **틀렸다.** auth 게이트는
+    /// `CYS_PROFILE_GATE_OBSERVE_ONLY` 뿐 아니라 **마스터 스위치 `CYS_BOOT_GATES=0`** 으로도
+    /// 꺼진다(위 `AUTH_GATE_PRESCRIPTION` 의 되돌리기 문안이 그 사실이다). 그 축은 다른 락
+    /// (`ACL_ENV_LOCK`)이 지키고 있었고, 두 락이 서로를 배제하지 않아 병렬 겹침에서 이 락이
+    /// 사문화됐다. 지금은 `BootGatesAmbientGuard` 가 이 락도 함께 잡아 그 창을 닫는다 —
+    /// **락은 env 하나가 아니라 '이 게이트를 끌 수 있는 축 전부' 를 지켜야 한다.**
     static AUTH_GATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// ★독약 내성 획득 — 한 검체가 적색이면 락이 poison 되고, 뒤이은 검체들이 `PoisonError` 로

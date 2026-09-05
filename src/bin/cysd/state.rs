@@ -123,6 +123,30 @@ pub struct QueueEntry {
 /// exited 예외**(exited_reclaim — 죽은 좌석 회수의 큐 인멸을 명시 행위로 감사)를 경유할
 /// 때만 Some((cleared_by_surface, via)) — {cleared_by, via} 두 키를 additive 로 얹는다.
 /// 자기 큐 clear·자력종료·close drain 등 기존 경로는 전부 None(payload 바이트 동일 유지).
+/// ★B3 #19 `surface.exited` payload — 자력 종료(셸 EOF) 통지의 스키마 단일 소유.
+///
+/// 왜 role·agent 를 싣는가: 종전 payload 는 `surface_ref` 하나뿐이라 **어느 역할 좌석이
+/// 죽었는지**를 이 이벤트만으로 알 수 없었다. 그 사실은 60초 grace 뒤 reap 이 내는
+/// `surface.reaped`(role 포함)에서야 처음 등장하고, `CYS_REAP_EXITED=0` 이면 영영 오지
+/// 않는다 — 감시자가 "master 좌석이 죽었다"를 1분 늦게 알거나 못 알게 된다.
+///
+/// 이 빌더는 **역할 반납을 하지 않는다**(관측 층). 반납은 reap → `close_surface` 가 하며
+/// 그 사이의 grace 는 크래시 포렌식·노드 복구 창으로 의도된 것이다(governance
+/// `exited_surface_due` 주석). 주소 해석은 별도로 이미 안전하다 — `system.resolve_role`
+/// 이 exited 보유자를 not_found 로 강등한다.
+///
+/// 계약: 기존 키 `surface_ref` 불변 · `role`/`agent` 는 additive 이며 **부재 시 null**
+/// (역할 없는 스크래치 pane 과 역할 좌석을 소비부가 구분할 수 있어야 한다). `agent` 는
+/// surface.list 와 같은 형태(이름 문자열)다 — 같은 사실을 두 표면이 다른 모양으로 내면
+/// 소비부가 좌석마다 다른 것을 본다.
+pub fn surface_exited_payload(sid: u64, role: Option<String>, agent: Option<String>) -> Value {
+    json!({
+        "surface_ref": cys::surface_ref(sid),
+        "role": role,
+        "agent": agent,
+    })
+}
+
 pub fn queue_dropped_payload(
     reason: &str,
     dropped: &[QueueEntry],
@@ -175,9 +199,15 @@ pub fn queue_delivered_payload(
     delivered_at: f64,
     overdue: bool,
     forced: bool,
+    merged: &[String],
 ) -> Value {
     json!({
         "bytes": entry.text.len(),
+        // ★B1(0.14.30): 이 배달에 **함께 실린** 항목 id 전량(머리 포함 · 단건이면 1개).
+        //   병합 배달(발신자별 다이제스트)에서 소비자가 "몇 건이 한 턴에 갔나" 를 알아야
+        //   버스트 감축을 사후 측정할 수 있다(수용 기준 ③ 버스트 0).
+        "merged_ids": merged,
+        "merged": merged.len(),
         "remaining": remaining,
         "entry_ids": wakeup_ids,
         "surface_ref": surface_ref,
@@ -415,6 +445,25 @@ pub struct Surface {
     pub agent_exit_notified: AtomicBool,
     /// T3-13 타이핑 가드: 사람(UI) 입력의 마지막 시각 — 원격 주입 충돌 보호
     pub last_human_input: Mutex<Option<Instant>>,
+    /// ★B1(0.14.30): 이 pane 에 쓰였으나 **제출(CR)·선정리(Ctrl-U/Ctrl-C)를 아직 보지 못한**
+    /// 입력 바이트 수. 큐 배달의 '입력줄 점유' 1차 축이다(화면 무의존 결정론 신호 —
+    /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
+    /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
+    pub pending_input_bytes: AtomicU64,
+    /// ★R1-blocking-2 입력줄 게이트 — **직접 write 경로와 큐 Inject 경로의 상호배제**.
+    ///
+    /// 왜 필요한가(codex 감사 실측): `surface.send_text` 는 writer 에 Program 을 넣은 **뒤**
+    /// `pending_input_bytes` 를 기록한다. 그 창에서 watchdog 이 pending=0 을 보고 ready 로
+    /// 판정해 Inject 를 넣으면 **두 본문이 한 제출로 합쳐진다**(오너 임무 게이트가
+    /// `delivery_concatenated`·`delivery_substring` 이상징후를 실제로 발행한 축).
+    ///
+    /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
+    /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
+    pub input_gate: std::sync::Mutex<()>,
+    /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
+    /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
+    /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
+    pub queue_blocked: Mutex<Option<(String, f64)>>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
@@ -1175,6 +1224,35 @@ mod dedup_tests {
         pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
+    /// ★B3 #19: `surface.exited` 는 **어느 역할 좌석이 죽었는지**를 그 자리에서 말한다.
+    ///
+    /// 종전엔 `surface_ref` 하나뿐이라 감시자가 역할 사실을 60초 뒤 `surface.reaped` 에서야
+    /// 얻었고(`CYS_REAP_EXITED=0` 이면 영영), 그 1분이 곧 "master 가 죽은 줄 모르는 창" 이었다.
+    #[test]
+    fn b3_surface_exited_payload_carries_role_and_agent() {
+        let p = super::surface_exited_payload(
+            7,
+            Some("master".to_string()),
+            Some("claude".to_string()),
+        );
+        assert_eq!(p["surface_ref"], serde_json::json!("surface:7"), "기존 키 불변");
+        assert_eq!(p["role"], serde_json::json!("master"), "역할 좌석 사실이 실려야 한다");
+        assert_eq!(p["agent"], serde_json::json!("claude"), "agent 는 이름 문자열(surface.list 형태)");
+    }
+
+    /// 음성 대조: 역할 없는 스크래치 pane 은 role·agent 가 **null** 이어야 한다 —
+    /// 키를 항상 채우거나(빈 문자열) 아예 빼면 소비부가 '역할 좌석 사망'과 '스크래치 종료'를
+    /// 구분하지 못한다. 이 단언이 없으면 "무조건 master 를 싣는" 구현도 위 검체를 통과한다.
+    #[test]
+    fn b3_surface_exited_payload_distinguishes_roleless_pane() {
+        let p = super::surface_exited_payload(9, None, None);
+        assert_eq!(p["surface_ref"], serde_json::json!("surface:9"));
+        assert!(p["role"].is_null(), "역할 부재는 null 이어야 한다: {}", p["role"]);
+        assert!(p["agent"].is_null(), "agent 부재는 null 이어야 한다: {}", p["agent"]);
+        // 키 자체는 존재해야 한다(부재와 null 은 다른 사실이다 — 소비부가 키로 스키마를 판별한다).
+        assert!(p.get("role").is_some() && p.get("agent").is_some(), "키는 항상 존재");
+    }
+
     #[test]
     fn non_worker_passthrough() {
         let r = roles(&[("master", 1)]);
@@ -1632,6 +1710,88 @@ pub struct Daemon {
     /// 플래그로 잡히지 않는다 — `boot_supervisor.tick_panic` 이벤트가 보조 관측이고, 인텐트
     /// 수명(1800s)이 피해 상한이다.
     pub supervisor_alive: AtomicBool,
+    /// (B3 · 명세 §3-3) **진행 중인 부트 런** — 감독자가 스폰 직전에 등록하고, 러너가
+    /// `hb`·`progress_step` 을 갱신하며, fence 판정과 side-effect RPC 의 CAS 근거가 된다.
+    ///
+    /// `Option` 하나인 이유는 계약이다: 레인당 실행은 **항상 ≤1**(G1). 여럿을 표현할 수 있게
+    /// 두면 그 불변식이 자료구조에서 사라지고, 그때부터는 주석만 남는다.
+    /// ★B4-1(A18 [2]) **레인별** 활성 런 표 — 키는 레인이다.
+    ///
+    /// 종전에는 `Option` 하나였고 등록이 무조건 덮어쓰기였다. 그러면 이미 활성인 런이 조용히
+    /// 표에서 지워져 **관측 밖 고아**가 된다(fence 도 admission 도 세지 못한다). G1 은 "레인당
+    /// 실행 ≤1" 이지 "전역 1" 이 아니므로, 레인을 키로 두면 그 불변식을 자료구조가 지고
+    /// 서로 다른 레인의 동시 진행도 정직하게 표현된다.
+    pub boot_run_active: Mutex<std::collections::HashMap<String, BootRunActive>>,
+    /// (B3-2R ⑥·④ⓓ) fence 된 런의 원장 — **회수하지 못한 고아**의 목록이다(무kill 계약).
+    /// 길이가 곧 admission 상한의 분모다. 유계는 감독자가 [`crate::boot_supervisor`] 에서 건다.
+    pub boot_fenced: Mutex<Vec<FencedRun>>,
+}
+
+/// (B3 · §3-3) 진행 중인 부트 런의 관측 표. **데몬 인메모리**다 — 영속 소유권은 스풀 인텐트
+/// 파일(`state`·`generation`)이 갖고, 이 표는 그 위에 얹히는 살아있는 관측이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootRunActive {
+    /// 스풀 인텐트 id(=decl_id).
+    pub intent: String,
+    /// 이 런의 lease 세대. 러너의 side-effect RPC 는 이 값으로 CAS 된다.
+    pub generation: u32,
+    /// 이 런이 담당하는 역할들. **현재는 비어 있다** — 채우는 주체가 §2-7 러너(B4)다.
+    pub roles: Vec<String>,
+    /// 러너의 마지막 생존 신고(epoch 초).
+    ///
+    /// ★등록 시각으로 초기화하고, `started` 와 **같은 값이면 '한 번도 보고하지 않았다'** 는
+    /// 뜻이다(그 구별이 fence 발효 조건이다 — [`crate::boot_supervisor::fence_verdict`]).
+    pub hb: f64,
+    /// 러너가 보고한 단계 이름. 이 값이 변하지 않는 동안이 진행 정체의 척도다(ⓑ · B3-3).
+    ///
+    /// ★[`BootRunActive::progress_at`] 과 **반드시 함께** 움직인다. 한쪽만 갱신하면 진행 중인
+    /// 런이 등록 시각 기준으로 정체처럼 보여 **건강한 부트가 잘린다** — 이 저장소가 반복해서
+    /// 맞은 계급이라 소스핀이 그 짝을 강제한다
+    /// ([`crate::boot_supervisor`] 의 `progress_axis_is_wired_at_the_call_site_and_moves_in_pairs`).
+    pub progress_step: String,
+    /// (B3-3 · §2-6 ⓑ) [`BootRunActive::progress_step`] 이 **마지막으로 바뀐** 시각(epoch 초).
+    ///
+    /// 등록 시각(= `started`)으로 초기화한다. 정체 판정의 기준은 이 값이지만, 단계 이름이 비어
+    /// 있는 동안 — 즉 **한 번도 보고하지 않은 동안** — 은 발효하지 않는다. `hb <= started` 가 ⓐ
+    /// 에서 하는 역할과 **동형**이다: '멎었다'와 '보고 배선이 아직 없다'를 구별하지 못하는 신호로
+    /// 파괴적 조치를 하면 안 된다. 보고 주체가 §2-7 러너(B4)라 지금은 항상 비어 있다.
+    pub progress_at: f64,
+    /// 이 세대가 시작된 시각(epoch 초) — 절대 마감의 기준(ⓒ · B3-3).
+    pub started: f64,
+    /// (B3-2R ④ⓑ) 낳은 프로세스의 pid. **관측용이지 종료용이 아니다** — 이 데몬은 아무것도
+    /// 죽이지 않는다. 고아가 생겼을 때 사람이 `cys ps`·watchdog 으로 **찾아갈 수 있게** 싣는다.
+    pub pid: Option<u32>,
+    /// (R3 #2 · codex) **재시작마다 유일한 영속 epoch** — lease identity 의 한 축이다.
+    ///
+    /// generation 만으로는 ABA 를 막지 못한다: 데몬이 재시작하면 이 표가 비고 세대가 되감길 수
+    /// 있어 옛 러너의 (intent, generation) 이 새 런의 그것과 **우연히 같아질** 수 있다. epoch 가
+    /// 그 재사용을 끊는다. 디스크에 영속하므로 재시작을 건너뛰지 않는다.
+    pub epoch: u64,
+}
+
+/// (B3-2R ⑥) **fence 된 런의 별도 원장**. terminal 과 섞지 않는다 — terminal 은 '이 인텐트가
+/// 어떻게 끝났는가' 하나뿐인데, fence 된 시도는 끝난 것이 아니라 **소유권을 잃은 것**이라
+/// 같은 칸에 쓰면 마지막 하나만 남고 앞의 이력이 사라진다(codex⑤).
+///
+/// 이 목록은 동시에 **전역 admission 상한의 분모**다(④ⓓ): 무kill 이라 fence 된 러너는 살아
+/// 있을 수 있고, 그 미회수 고아 수가 새 스폰을 막는 근거가 된다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FencedRun {
+    pub intent: String,
+    /// (R3 #9) 유일 키의 한 축 — 재시작 전후를 가른다.
+    pub epoch: u64,
+    pub generation: u32,
+    pub pid: Option<u32>,
+    pub why: &'static str,
+    pub at: f64,
+}
+
+impl FencedRun {
+    /// (R3 #9) **중복 방지 키** — 같은 (intent, epoch, generation) 을 두 번 기록하지 않는다.
+    /// 중복이 들어가면 admission 분모가 부풀어 부트가 이유 없이 멈춘다.
+    pub fn key(&self) -> (&str, u64, u32) {
+        (self.intent.as_str(), self.epoch, self.generation)
+    }
 }
 
 /// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
@@ -2289,6 +2449,8 @@ impl Daemon {
             auto_route_seen: Mutex::new(HashMap::new()),
             // (P2 · R3-P2-4) 기본 false — set 주체는 boot_supervisor::spawn 하나뿐이다.
             supervisor_alive: AtomicBool::new(false),
+            boot_run_active: Mutex::new(std::collections::HashMap::new()),
+            boot_fenced: Mutex::new(Vec::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
@@ -2959,6 +3121,9 @@ impl Daemon {
             crash_notified: AtomicBool::new(false),
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
+            pending_input_bytes: AtomicU64::new(0),
+            input_gate: std::sync::Mutex::new(()),
+            queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
             last_injected: Mutex::new(None),
@@ -3228,11 +3393,25 @@ impl Daemon {
                     queue_dropped_payload("process_exited", &dropped, None),
                 );
             }
+            // ★B3 #19: 자력 종료(셸 EOF)한 좌석이 **역할을 쥐고 있었다는 사실**을 이 시점에
+            //   싣는다(additive — 기존 키 불변). 종전 페이로드에는 role 이 없어 "어느 역할
+            //   좌석이 죽었나" 를 여기서 알 수 없었고, 그 사실은 **60초 뒤** reap 의
+            //   `surface.reaped`(role 포함)에서야 처음 등장했다 — `CYS_REAP_EXITED=0` 이면
+            //   영영 오지 않는다. 역할 반납 자체는 reap→close_surface 가 이미 하므로(grace 는
+            //   크래시 포렌식·노드복구 창) 여기서 roles 맵을 건드리지 않는다 — 이 수정은
+            //   **경고(관측)** 층이다.
+            let exited_role = surf.role.lock().unwrap().clone();
+            let exited_agent = surf
+                .agent_meta
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(name, _)| name.clone());
             daemon.bus.publish(
                 "surface.exited",
                 "surface",
                 Some(surf.id),
-                json!({"surface_ref": cys::surface_ref(surf.id)}),
+                surface_exited_payload(surf.id, exited_role, exited_agent),
             );
         });
 
@@ -6962,7 +7141,7 @@ mod tests {
     fn queue_delivered_payload_pins_wid_echo_and_wait_clamp() {
         let e = w2b_entry("qc.9", 9, "[wakeup W-a1b2] 보고", 100.0);
         let wids = vec!["W-a1b2".to_string()];
-        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9, false, false);
+        let p = queue_delivered_payload(&e, 4, &wids, "surface:12", 107.9, false, false, &[e.id.clone()]);
         assert_eq!(p["bytes"], json!(e.text.len()), "기존 키 bytes 불변");
         assert_eq!(p["remaining"], json!(4), "기존 키 remaining 불변");
         assert_eq!(
@@ -6984,14 +7163,14 @@ mod tests {
         assert_eq!(p["overdue"], json!(false), "additive overdue — 정상 배달은 false");
         assert_eq!(p["forced"], json!(false), "additive forced — watchdog 배달은 false");
         // W-id 봉입 없는 일반 배달 = 빈 배열(키는 항상 존재 — 에코 계약).
-        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0, false, false);
+        let p0 = queue_delivered_payload(&e, 0, &[], "surface:12", 99.0, false, false, &[e.id.clone()]);
         assert_eq!(p0["entry_ids"], json!([] as [&str; 0]));
         assert_eq!(p0["wait_secs"], json!(0), "시계 역행(delivered < enqueued)은 0 클램프");
         // overdue(단계형 제한 배달)·forced(운영자 강제) 표기는 이벤트 층에서만 구분된다.
-        let po = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, true, false);
+        let po = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, true, false, &[e.id.clone()]);
         assert_eq!(po["overdue"], json!(true));
         assert_eq!(po["forced"], json!(false));
-        let pf = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, false, true);
+        let pf = queue_delivered_payload(&e, 0, &[], "surface:12", 108.0, false, true, &[e.id.clone()]);
         assert_eq!(pf["forced"], json!(true));
         // W-id 에코·기존 키는 overdue/forced 와 무관하게 동일(계약 불변).
         assert_eq!(po["bytes"], p["bytes"]);

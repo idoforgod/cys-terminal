@@ -208,15 +208,50 @@ pub fn dedupe_loss_log(prev: Option<&str>, reason: &str, every_n: u64) -> (bool,
 mod tests {
     use super::*;
 
+    /// 검체용 임시 디렉터리 — **호출마다 유일**해야 한다.
+    ///
+    /// ★2026-09-05 실측 수리: 종전 이름은 `pid + 나노초` 였는데 이 기계의 시계 해상도가
+    /// **1µs** 다(2만 회 호출에 고유값 1093개). 즉 같은 마이크로초에 두 검체가 부르면 pid 도
+    /// 나노초도 같아 **같은 디렉터리**를 만들고, 그러면 둘이 같은 `cys.lock` 을 공유한다.
+    /// cargo 는 검체를 병렬 실행하므로 그때 한쪽의 홀더가 다른 쪽의 재획득을 막아
+    /// `flock_reacquire_after_holder_release` 가 간헐 적색이 됐다(단독 실행에서도 3회 중 1회).
+    /// 결함이 아니라 검체끼리의 충돌이었고, 그 적색은 **아무것도 재지 않는다**.
+    /// 원자 카운터를 더해 커널이 아니라 프로그램이 유일성을 보증하게 한다.
+    /// 검체 전용 임시 디렉터리 — **호출마다 유일**하다(원자 카운터가 커널이 아니라 프로그램에서
+    /// 유일성을 보증한다 · `65ff6c4`).
+    ///
+    /// ★이름을 16진으로 줄인 이유(2026-09-05 실측 · FLAKE-PROBE-1 의 실체):
+    /// 이 디렉터리 아래에 unix 도메인 소켓을 바인드하는 검체가 있고, 그 경로는 **SUN_LEN**
+    /// 을 넘을 수 없다(실측 경계 — 103바이트 성공 / 104바이트 실패). 종전 십진 형식
+    /// `cysd-deadman-test-<pid>-<nanos>-<seq>` 는 macOS 의 긴 TMPDIR(49자)에서 pid 가 **5자리일
+    /// 때 정확히 104** 가 되어 `probe_responds_to_live_socket_and_times_out_on_hung` 이
+    /// 결정론으로 죽었다. pid 자릿수에 따라 갈리므로 실행마다 붙었다 떨어졌다 해서 '간헐
+    /// 플레이크'·'`--test-threads=1` 한정' 으로 오진됐던 것이다 — **부하도 스레드 수도 무관하다.**
+    /// 카운터를 도로 빼는 것은 답이 아니다(그것이 막는 디렉터리 충돌은 실재한다) — 같은 정보를
+    /// 더 짧게 적는다.
     fn tmp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "cysd-deadman-test-{}-{}",
+            "cysd-dm-{:x}-{:x}-{:x}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, AOrd::Relaxed)
         ));
+        // ★예산 단언 — 넘으면 `SUN_LEN` 패닉으로 **사유 없이** 죽는 대신 왜 죽는지 말하고 죽는다.
+        //   이 디렉터리 아래 자식 이름의 최장은 9자(`live.sock`·`heartbeat`)이므로 구분자까지
+        //   10바이트를 남긴다. 다음 사람이 TMPDIR 이 더 긴 기계에서 이것을 밟으면, 한 줄로 원인과
+        //   조치를 함께 읽는다.
+        assert!(
+            d.as_os_str().len() + 10 <= 103,
+            "검체 임시 경로가 unix 소켓 상한(SUN_LEN)을 넘는다: 디렉터리 {}바이트 + 자식 10바이트 \
+             > 103. TMPDIR 이 {}바이트로 길다 — 이름을 더 줄이거나 TMPDIR 을 짧게 잡아야 한다",
+            d.as_os_str().len(),
+            std::env::temp_dir().as_os_str().len()
+        );
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -403,10 +438,31 @@ mod tests {
             "경합자 즉시 획득 실패"
         );
         drop(holder); // 홀더 사망 모사(fd 해제=flock 해제).
+        // ★2026-09-05: 이 단언이 간헐로 -1 이었다(단독 실행에서도 3~6회 중 1회). 원인 규명 중이며
+        //   확인된 사실만 적는다 — ①순수 flock 시퀀스는 2000회 동시 실행에서 실패 0(시맨틱 문제
+        //   아님) ②같은 바이너리의 다른 검체가 자식을 spawn·SIGKILL 하므로 **SIGCHLD 가 오간다**.
+        //   `flock` 은 신호로 `EINTR` 을 돌릴 수 있고 그것은 '락을 못 얻었다' 가 아니라 '다시
+        //   불러라' 다 — 재시도가 표준 요구사항이므로 여기서 그것부터 지킨다(EINTR 만 재시도하고
+        //   다른 errno 는 그대로 실패시킨다 · 마스킹 금지).
+        //   그래도 실패하면 **errno 를 남긴다** — 종전엔 -1 만 보여 다음 사람이 같은 자리에서
+        //   다시 추측해야 했다.
+        let mut rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let mut errs: Vec<i32> = Vec::new();
+        for _ in 0..8 {
+            if rc == 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            errs.push(e.raw_os_error().unwrap_or(0));
+            if e.raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+            rc = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        }
         assert_eq!(
-            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            rc,
             0,
-            "홀더 해제 후 재획득 성공"
+            "홀더 해제 후 재획득 성공 (errno 이력={errs:?} — EINTR(4)이면 신호 경합, 그 외는 실제 경합)"
         );
         std::fs::remove_dir_all(&d).ok();
     }

@@ -218,6 +218,11 @@ pub enum Origin {
     /// 오발급한다. 그래서 감독자는 **행위보다 먼저** 이 유래로 기록한다
     /// (`boot_supervisor::dispatch_one` · 순서 불변식은 같은 파일의 소스 핀이 지킨다).
     Supervisor,
+    /// ★환경 진단 고지(`# [cys] …` 주석 1줄 주입) — npm 번들 오염 경고가 첫 소비자다.
+    ///
+    /// `SeatTakeover` 와 같은 성격이다: 사용자에게 **보여 주려고** pane 에 밀어 넣는 기계
+    /// 문장이므로 원장에 근거가 있어야 한다. 없으면 임무 게이트가 이 주석을 오너 임무로 읽는다.
+    EnvAdvisory,
 }
 
 impl Origin {
@@ -232,6 +237,7 @@ impl Origin {
             Origin::Boot => "boot",
             Origin::GuiAuto => "gui_auto",
             Origin::Supervisor => "supervisor",
+            Origin::EnvAdvisory => "env_advisory",
         }
     }
 }
@@ -259,27 +265,19 @@ pub enum Outcome {
 /// 공백 집합을 `char::is_whitespace()`(= Unicode White_Space property)로 정의한 이유:
 /// python `re.compile(r"\s+")` 는 여기에 더해 U+001C..U+001F 를 포함해 **미세하게 다르다**.
 /// 그래서 판독자도 라이브러리 의미에 기대지 않고 White_Space 집합을 명시 구현한다(양쪽 박제).
+///
+/// ★부트 v2(B1): 구현이 **lib `cys::mission_gate` 로 이관**됐고 여기는 위임만 남는다.
+/// 이유: `cys hook`(CLI 바이너리)이 층1 원장 대조를 하려면 같은 산식이 필요한데, 종전에는 이
+/// 함수가 `cysd` 바이너리 안에만 있어 사본을 만들 수밖에 없었다. 사본이 갈리는 순간 해시가
+/// 안 맞아 원장 대조는 **조용히** 무력화된다(항상 '미일치' = fail-open). 이 파일의 기존
+/// 검체들은 위임을 관통해 그대로 계약을 잰다 — 그것이 이관의 회귀 방어다.
 pub fn normalize(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut pending_space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            pending_space = !out.is_empty();
-            continue;
-        }
-        if pending_space {
-            out.push(' ');
-            pending_space = false;
-        }
-        out.push(ch);
-    }
-    out
+    cys::mission_gate::normalize(text)
 }
 
-/// 이미 정규화된 문자열의 sha256 소문자 hex.
+/// 이미 정규화된 문자열의 sha256 소문자 hex(lib 위임 — 위 `normalize` 주석 참조).
 fn digest_normalized(norm: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(norm.as_bytes()))
+    cys::mission_gate::digest_normalized(norm)
 }
 
 /// 정규화 본문의 sha256 소문자 hex. **테스트 전용 편의 함수**다.
@@ -292,6 +290,16 @@ fn digest_normalized(norm: &str) -> String {
 /// python `javis_mission.delivery_digest` 와의 동치를 박제하는 것이 이 함수의 유일한 임무다).
 #[cfg(test)]
 pub fn digest(text: &str) -> String {
+    digest_text(text)
+}
+
+/// ★B1(0.14.30): 원문 → 정규화 → sha256(원장 대조 키와 **같은 산식**).
+///
+/// 왜 생산 경로에 필요해졌나: 병합 배달(다이제스트)은 여러 항목을 한 본문으로 주입하므로
+/// 전문 레코드의 sha 는 합성본의 것이다. 그러면 "보낸 항목이 전부 배달됐나(유실 0)" 를 원장만
+/// 보고는 확인할 수 없다 — 수용 기준 §7 ①이 요구하는 sha 전수 대조가 성립하려면 항목별 sha 가
+/// 원장에 있어야 한다. `digest_parts[].sha256` 이 그 자리다.
+pub fn digest_text(text: &str) -> String {
     digest_normalized(&normalize(text))
 }
 
@@ -326,121 +334,29 @@ fn default_state_root() -> PathBuf {
     tests::unisolated_sandbox_root()
 }
 
-/// `javis_bootstrap._socket_is_base` 미러. 소켓 미설정('')=base.
-fn socket_is_base(sock: &str) -> bool {
-    let sock = sock.trim();
-    if sock.is_empty() {
-        return true;
-    }
-    let norm = sock.replace('\\', "/");
-    if sock.starts_with("\\\\") || norm.to_ascii_lowercase().starts_with("//./pipe/") {
-        // Windows named pipe — 성분 분해 부적합. 기존 basename 동작 보존.
-        let last = norm.rsplit('/').next().unwrap_or("");
-        return last == "cys" || last == "cys.sock";
-    }
-    for part in norm.split('/') {
-        if part.starts_with("cys-dept-") {
-            return false;
-        }
-    }
-    let last = norm.rsplit('/').next().unwrap_or("");
-    last == "cys" || last == "cys.sock"
-}
-
-/// SHA-1 hex — **비암호학적 용도 전용**(파일명 슬러그가 `javis_bootstrap._sanitize_sock_key`
-/// (`hashlib.sha1(...).hexdigest()[:16]`)와 **정확히** 같아야 하기 때문에 존재한다).
-/// 새 크레이트를 들이지 않는다(오프라인 빌드 계약 · sha1 은 Cargo.lock 에 전이로도 없다).
-/// 서명·인증에 쓰지 말 것 — 그쪽은 `sha2`/`minisign-verify` 가 소유한다.
-/// 정확성은 표준 시험벡터(`sha1("abc")`)로 박제한다.
-fn sha1_hex(data: &[u8]) -> String {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, c) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h[0], h[1], h[2], h[3], h[4]);
-        for (i, wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let tmp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = tmp;
-        }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-    }
-    h.iter().map(|v| format!("{v:08x}")).collect()
-}
-
-/// `javis_bootstrap._sanitize_sock_key` 미러(경로 구분자·':' → '_' · 과길면 앞 120자+sha1 16자).
-fn sanitize_sock_key(sock: &str) -> String {
-    let mut raw = sock.trim().to_string();
-    if raw.is_empty() {
-        raw = "base".to_string();
-    }
-    // python 은 os.sep, '/', '\\', ':' 를 치환한다. unix os.sep='/', windows os.sep='\\' 이므로
-    // 셋의 합집합은 어느 OS 에서도 {'/','\\',':'} 로 동일하다.
-    raw = raw
-        .chars()
-        .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
-        .collect();
-    let raw = raw.trim_matches('_').to_string();
-    let mut raw = if raw.is_empty() { "base".to_string() } else { raw };
-    if raw.chars().count() > 160 {
-        let head: String = raw.chars().take(120).collect();
-        let h = sha1_hex(raw.as_bytes());
-        raw = format!("{head}-{}", &h[..16]);
-    }
-    raw
-}
-
-/// 이 데몬이 속한 레인 키 — `javis_bootstrap.lane_key` 미러.
-/// pane 은 `CYS_SOCKET`(= 이 데몬의 socket_path, state.rs 가 주입)을 보므로 양쪽 값이 일치한다.
-pub fn lane_key(socket_path: &Path) -> String {
-    let s = socket_path.to_string_lossy();
-    if socket_is_base(&s) {
-        "base".to_string()
-    } else {
-        sanitize_sock_key(&s)
-    }
-}
-
+/// 레인 판정 원시(`socket_is_base`·`sanitize_sock_key`·`lane_key`)의 **소유자는 lib
+/// [`cys::lane`] 하나다**(2026-09-04 B2-c e-1로 이관 · 규칙·값 무변경).
+///
+/// 왜 옮겼는가: 훅 CLI(`cys hook user-prompt-submit`)가 **임무 대장** 경로를 같은 레인 규약으로
+/// 만들어야 하는데(명세 §2-2 e), 판정이 이 데몬 바이너리 안에만 있으면 CLI 는 **복사**할 수밖에
+/// 없다. 복사본은 갈리고, 갈리는 순간 대장과 원장이 서로 다른 레인을 가리켜 층1 이 **조용히**
+/// 무력화된다 — 2026-09-04 P0(레인 격리 누출)의 반대 방향 사고다.
+///
+/// 여기 남는 것은 **경로 두 개**뿐이다(호출부 무개정). `lane_key` 는 이름조차 남기지 않았다 —
+/// 얇은 재수출도 '두 번째 이름'이라 언젠가 한쪽만 고쳐진다. 상태 루트만 데몬 것을 쓴다 —
+/// `pack_state_dir()` 은 테스트 빌드에서 실 HOME 대신 샌드박스로 접히고(R5-B), 그 방어선을
+/// lib 으로 끌고 가지 않는 것이 이 분리의 요점이다.
 /// 배달 원장 경로 — **항상 레인 접미**(base 레인도 `delivery-base.jsonl`).
 /// skip·lock 과 같은 규약이다: 역사적 무접미 경로가 없으므로 base 예외를 만들 이유가 없고,
 /// 접미가 항상 있으면 "이 파일이 어느 레인 것인가"가 파일명만으로 결정론이다.
+/// 이름 규칙은 [`cys::lane::ledger_path_in`] 이 소유하고, 여기서는 **루트만** 데몬 것을 준다.
 pub fn ledger_path(socket_path: &Path) -> PathBuf {
-    pack_state_dir().join(format!("delivery-{}.jsonl", lane_key(socket_path)))
+    cys::lane::ledger_path_in(&pack_state_dir(), socket_path)
 }
 
 /// 데몬 인스턴스 표식 경로 — 임무의 **세션 결박**(過去 임무 무기한 유효 차단)에 쓴다.
 pub fn epoch_path(socket_path: &Path) -> PathBuf {
-    pack_state_dir().join(format!("delivery-{}.epoch.json", lane_key(socket_path)))
+    cys::lane::epoch_path_in(&pack_state_dir(), socket_path)
 }
 
 fn iso_utc(epoch: f64) -> String {
@@ -626,12 +542,25 @@ pub struct RecordReport {
 /// ★주입 **직전** 호출(감사 상세 포함) — 전문 + 제출 단위 조각을 원장에 남긴다.
 ///
 /// 호출 규약·불변식은 `record` 와 같다. 조각의 의미와 대안 비교는 모듈 머리말 R6 절.
+#[cfg(test)]
 pub fn record_full(
     socket_path: &Path,
     surface_id: u64,
     text: &str,
     origin: Origin,
     from_surface: Option<u64>,
+) -> RecordReport {
+    record_full_with(socket_path, surface_id, text, origin, from_surface, &Value::Null)
+}
+
+/// `record_full` + 추가 사실 병합(계약은 `record_audited_with` doc 참조).
+pub fn record_full_with(
+    socket_path: &Path,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+    extra: &Value,
 ) -> RecordReport {
     let blank = |o: Outcome| RecordReport {
         outcome: o,
@@ -674,6 +603,12 @@ pub fn record_full(
         //   판독자가 "프롬프트가 이 레코드의 조각인가" 를 물을 필요조차 없는 레코드다.
         "units": units.len(),
     });
+    // ★B1: 호출부가 아는 사실을 병합 — 기존 키는 절대 덮지 않는다(스키마 계약).
+    if let (Some(add), Some(dst)) = (extra.as_object(), rec.as_object_mut()) {
+        for (k, v) in add {
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
     if dropped > 0 {
         // ★R7 — **판독자가 볼 수 있는 자리**에 초과 사실을 남긴다.
         //   종전에는 데몬 버스 이벤트(`delivery.parts_incomplete`)뿐이었고, 임무 게이트는 버스를
@@ -743,7 +678,27 @@ pub fn record_audited(
     origin: Origin,
     from_surface: Option<u64>,
 ) -> bool {
-    let report = record_full(&daemon.socket_path, surface_id, text, origin, from_surface);
+    record_audited_with(daemon, surface_id, text, origin, from_surface, &Value::Null)
+}
+
+/// ★B1(0.14.30): `record_audited` + **호출부가 아는 추가 사실**을 같은 레코드에 실는다.
+///
+/// 왜 필요한가(queue-starvation-case.md §4-ⓓ): 원장에는 배달 시각만 있고 **enqueue 시각이
+/// 없어** 사후에 전수 지연을 계산할 수 없었다(그 문서의 표본이 18건에 그친 이유). 큐 배달만
+/// 아는 사실(항목 id·enqueue 시각·대기초)을 여기서 실어 원장 한 파일로 전수 측정이 되게 한다.
+///
+/// `extra` 는 객체여야 하며 **기존 키를 덮지 않는다**(충돌 키는 무시 — 스키마 계약 보호).
+/// 객체가 아니면(Null 등) 종전 레코드와 바이트 동일하다.
+pub fn record_audited_with(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    text: &str,
+    origin: Origin,
+    from_surface: Option<u64>,
+    extra: &Value,
+) -> bool {
+    let report =
+        record_full_with(&daemon.socket_path, surface_id, text, origin, from_surface, extra);
     // ★R6: 조각(제출 단위) 기록이 불완전하면 그 행들은 층1 미대조다 — 차단할 수 없으니 드러낸다.
     if report.parts_dropped > 0 || report.parts_failed.is_some() {
         let path = ledger_path(&daemon.socket_path);
@@ -798,6 +753,9 @@ pub fn record_audited(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// 레인 판정 원시는 lib [`cys::lane`] 이 소유한다(B2-c e-1 이관) — 아래 검체 3종은
+    /// **데몬이 실제로 부르는 그 함수**를 그대로 부른다(목·사본 금지 · 판정 규칙 무변경).
+    use cys::lane::{lane_key, socket_is_base};
 
     // ══════════════════════════════════════════════════════════════════════════
     // ★R5-B 테스트 상태 격리 — "라이브 원장을 테스트가 더럽히지 않는다"
@@ -1046,6 +1004,137 @@ pub(crate) mod tests {
     }
 
     /// ★R5-B 회귀: 스레드 로컬 격리가 실제로 원장 경로를 접고, drop 후 복원되는가.
+    /// 소켓→레인 판정 **공유 코퍼스** — python `javis_lane` 이 소비하는 **같은 파일**을
+    /// 컴파일 타임에 싣는다. 경로가 바뀌면 여기서 빌드가 깨진다(사본 분화를 컴파일러가 막는다).
+    const LANE_CORPUS: &str = include_str!("../../../cysjavis-pack/bin/tests/fixtures/lane-key-corpus.json");
+
+    /// ★H-LANE-2(P0 파리티): 소켓→base 판정이 **공유 코퍼스**와 일치한다.
+    ///
+    /// H-LANE-ISO 가 사고 재현·회귀 방지를 맡는다면 이 검체는 **2언어 대칭 이탈 탐지기**다 —
+    /// python `javis_lane.socket_is_base` 가 같은 파일을 소비하므로, 한쪽만 고쳐지면 그 순간
+    /// 한쪽이 적색이 된다. 레인 판정이 갈리면 두 구현이 **서로 다른 원장 파일**을 읽어
+    /// 층1 이 조용히 실패한다(오염의 반대 방향 사고).
+    #[test]
+    fn socket_base_verdict_matches_the_shared_lane_corpus() {
+        let c: serde_json::Value =
+            serde_json::from_str(LANE_CORPUS).expect("lane-key-corpus.json 판독 불가");
+        let cases = c["cases"].as_array().expect("cases 배열 부재");
+        assert!(cases.len() >= 17, "레인 코퍼스가 줄었다: {}", cases.len());
+        let mut fails: Vec<String> = Vec::new();
+        for it in cases {
+            let sock = it["sock"].as_str().expect("sock");
+            let want = it["is_base"].as_bool().expect("is_base");
+            let got = socket_is_base(sock);
+            if got != want {
+                fails.push(format!(
+                    "{sock:?}: 기대 is_base={want} / 실측 {got} — why: {}",
+                    it["why"].as_str().unwrap_or("")
+                ));
+            }
+            // lane_key 도 함께 대조한다 — base 면 정확히 "base", 아니면 절대 "base" 가 아니다.
+            let k = lane_key(Path::new(sock));
+            if want && k != "base" {
+                fails.push(format!("{sock:?}: base 인데 lane_key={k}"));
+            }
+            if !want && k == "base" {
+                fails.push(format!("{sock:?}: 비-base 인데 lane_key=base — 본 레인을 공유한다"));
+            }
+        }
+        assert!(fails.is_empty(), "레인 판정 파리티 이탈:\n  - {}", fails.join("\n  - "));
+    }
+
+    /// ★H-LANE-ISO(P0 · master 등재 2026-09-04): **격리 소켓이 본 레인을 오염시키지 않는다.**
+    ///
+    /// 실사고: `~/.cys/state-harness/cys.sock` · `/var/folders/…/l1-new-*/cys.sock` 로 띄운
+    /// 데몬이 본 레인 `delivery-base.jsonl`·`.epoch.json` 에 썼다(외부 좌석 레코드 70건 ·
+    /// epoch 덮어씀) → 본부 임무 게이트 오탐 폐쇄 + 전 노드 층1 원장 오염.
+    ///
+    /// 원인: 종전 `socket_is_base` 가 **basename 만** 봐서 디렉터리를 무시했다. 역설적으로
+    /// `/tmp/whatever.sock` 처럼 **파일명이 다르면** 올바로 격리됐다 — 즉 **가장 흔한 격리
+    /// 방식**(관례 파일명 유지 + 디렉터리 분리)만 조용히 실패했다.
+    ///
+    /// ★이 검체는 **음성 대조군을 내장**한다: 구 규칙(basename 판정)을 그 자리에서 재현해
+    /// 오염이 **실제로 일어났음**을 먼저 보이고, 신 규칙이 그것을 막는 것을 보인다. 그래야
+    /// "이 검체가 무엇을 지키는지"가 검체 안에서 자명하다.
+    #[test]
+    fn isolated_socket_never_folds_into_the_base_lane() {
+        // 구 규칙 재현 — basename 만 보던 판정(음성 대조군).
+        let old_rule = |sock: &str| -> bool {
+            let norm = sock.replace('\\', "/");
+            if norm.split('/').any(|p| p.starts_with("cys-dept-")) {
+                return false;
+            }
+            let last = norm.rsplit('/').next().unwrap_or("");
+            last == "cys" || last == "cys.sock"
+        };
+
+        // 실사고에서 관측된 격리 소켓 2종.
+        let leaky = [
+            "/Users/x/.cys/state-harness/cys.sock",
+            "/var/folders/ab/T/l1-new-1234/cys.sock",
+        ];
+        for sock in leaky {
+            // ① 음성 대조 — 구 규칙에서는 **base 로 접혔다**(사고 재현).
+            assert!(
+                old_rule(sock),
+                "음성 대조군이 성립하지 않는다 — 구 규칙에서 이 소켓이 base 가 아니면 \
+                 이 검체는 사고를 재현하지 못한다: {sock}"
+            );
+            // ② 신 규칙 — 자기 레인이다.
+            assert!(!socket_is_base(sock), "격리 소켓이 아직도 base 로 접힌다: {sock}");
+            let k = lane_key(Path::new(sock));
+            assert_ne!(k, "base", "레인 키가 base 다 — 본 레인 파일을 공유한다: {sock}");
+            // ③ 그래서 원장·epoch 파일이 **본 레인과 다른 이름**이다.
+            let led = ledger_path(Path::new(sock));
+            let ep = epoch_path(Path::new(sock));
+            let base_led = ledger_path(Path::new("/Users/x/.local/state/cys/cys.sock"));
+            let base_ep = epoch_path(Path::new("/Users/x/.local/state/cys/cys.sock"));
+            assert_ne!(led, base_led, "격리 데몬이 본 레인 원장에 쓴다: {}", led.display());
+            assert_ne!(ep, base_ep, "격리 데몬이 본 레인 epoch 을 덮는다: {}", ep.display());
+            assert!(
+                led.file_name().unwrap().to_string_lossy().starts_with("delivery-"),
+                "원장 파일명 규약이 깨졌다: {}", led.display()
+            );
+        }
+
+        // ④ 하위호환 — **진짜 기본 소켓은 여전히 base** 다(기존 delivery-base.jsonl 유효).
+        for ok in ["/Users/x/.local/state/cys/cys.sock", "/home/u/.local/state/cys/cys.sock", ""] {
+            assert!(socket_is_base(ok), "기본 소켓이 base 에서 빠졌다 — 기존 원장이 고아가 된다: {ok:?}");
+        }
+        // ⑤ 종전에 이미 비-base 였던 것들은 그대로다(회귀 없음).
+        for no in ["/tmp/whatever.sock", "/Users/x/.local/state/cys-dept-sales/cys.sock"] {
+            assert!(!socket_is_base(no), "비-base 판정이 뒤집혔다: {no}");
+        }
+        // ⑥ ★부모 이름은 **정확히** `cys` 여야 한다 — 접두 비교로 완화하면 `cys` 로 시작하는
+        //    아무 디렉터리나 base 특권을 얻는다(mutation P-M2 가 이 사각을 드러냈다).
+        //    `cys-dept-` 는 앞선 가드가 먼저 잡으므로 그것만으로는 이 자리를 못 잰다.
+        for near in [
+            "/Users/x/.local/state/cys-harness/cys.sock",
+            "/Users/x/.local/state/cystest/cys.sock",
+            "/Users/x/.local/state/cys2/cys.sock",
+            "/Users/x/.cys/cys.sock",
+        ] {
+            assert!(
+                !socket_is_base(near),
+                "부모 이름이 `cys` 가 아닌데 base 로 접혔다 — 접두 비교로 완화된 것 같다: {near}"
+            );
+        }
+        // ⑥ 기계 독립 — 이 판정은 **경로 모양**만 본다(실제 홈·존재 여부 무관).
+        //    그래야 python 과 공유하는 소켓→lane_key 매트릭스가 기계마다 같은 답을 낸다.
+        assert!(socket_is_base("/nonexistent/machine/.local/state/cys/cys.sock"));
+
+        // ⑦ ★**알려진 한계를 검체로 고정한다**(master 조건 ①) — 숨기거나 '없는 셈' 치지 않는다.
+        //    기본 트리를 다른 곳에 미러한 `<임의>/cys/cys.sock` 은 **여전히 base 로 접힌다.**
+        //    이 단언이 깨지면(즉 누군가 절대경로 비교로 바꿔 막으면) 기계 의존이 생겼다는 뜻이니
+        //    공유 fixture 부터 다시 보라 — 그때는 이 핀을 **의도적으로** 갱신해야 한다.
+        for mirrored in ["/tmp/cys/cys.sock", "/var/tmp/mirror/cys/cys.sock"] {
+            assert!(
+                socket_is_base(mirrored),
+                "알려진 한계가 조용히 바뀌었다 — 절대경로 비교로 막았다면 기계 의존이 생긴 것이다: {mirrored}"
+            );
+        }
+    }
+
     /// (env 를 건드리지 않으므로 병렬 러너에서 다른 테스트와 간섭하지 않는다 — 그것이 채택 이유다.)
     #[test]
     fn isolate_state_dir_scopes_paths_to_this_thread_and_restores() {
@@ -1096,37 +1185,6 @@ pub(crate) mod tests {
             digest("abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn sha1_matches_standard_vectors() {
-        // FIPS 180-1 부록 시험벡터 — python hashlib.sha1 과의 동치를 박제한다.
-        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(
-            sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
-        );
-        // 64바이트 경계(패딩이 블록을 하나 더 만드는 지점)
-        assert_eq!(
-            sha1_hex(&[b'a'; 64]),
-            "0098ba824b5c16427bd7a1122a5a442a25ec644d"
-        );
-    }
-
-    #[test]
-    fn long_socket_path_key_uses_sha1_tail_like_pack() {
-        // python: raw[:120] + "-" + sha1(raw)[:16]  (raw = 새니타이즈 결과 · 앞뒤 '_' strip 뒤)
-        // 비-base 여야 이 분기에 온다 → cys-dept- 성분을 넣는다.
-        let long = format!("/{}/cys-dept-x/cys.sock", "d".repeat(200));
-        let k = lane_key(Path::new(&long));
-        assert_eq!(k.chars().count(), 120 + 1 + 16);
-        let raw = format!("{}_cys-dept-x_cys.sock", "d".repeat(200));
-        assert!(k.ends_with(&sha1_hex(raw.as_bytes())[..16]), "sha1 꼬리 불일치: {k}");
-        assert!(k.starts_with(&"d".repeat(120)));
-        // ★교차언어 앵커: 아래 리터럴은 `javis_bootstrap.lane_key(동일 입력)` 실측값이다.
-        //   양쪽이 갈리면 원장이 **조용히** 무력화되므로 값 자체를 박제한다.
-        assert_eq!(k, format!("{}-24618710175be9a6", "d".repeat(120)));
     }
 
     #[test]

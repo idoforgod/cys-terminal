@@ -10,6 +10,8 @@ pub mod factory_reset;
 /// 재발 차단. SEAL-1(아래 `ENV_PY_NO_BYTECODE`)이 **번들이 스스로 봉인을 깨는 것**을 막는다면,
 /// 이쪽은 **교체가 반쪽으로 끝나는 것**을 막는다(같은 사고의 다른 절반).
 pub mod app_bundle;
+pub mod declaration;
+pub mod mission_gate;
 pub mod directive_compose;
 pub mod edit_kinds;
 /// 첫기동 관문 코퍼스 — **코드 임베드 정본**(U-12 · K-1). `agents.json` 값 수정은 사용자 소유
@@ -19,6 +21,9 @@ pub mod first_run_gates;
 /// ready 를 잘못 선언했을 때 실제로 좌석을 죽이는 것은 **제출 Return** 이므로, 판정(U-13)과 별개로
 /// 전송 직전에 한 번 더 화면을 본다. 생애 창은 첫 각성 ack 이전으로 상한이 걸려 있다.
 pub mod inject_guard;
+/// 레인 판정·경로 규약의 **단일 소유자**(2026-09-04 B2-c e-1) — 데몬(원장·표식)·훅 CLI(임무 대장)·
+/// python(`javis_lane`) 셋이 같은 규칙을 써야 하고, 사본이 갈리면 층1 판정이 조용히 무력화된다.
+pub mod lane;
 pub mod license;
 pub mod merge3;
 pub mod pack;
@@ -46,6 +51,12 @@ pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
 /// 실어 나르기만 한다. `CYS_SURFACE_ID`(자기신고라 위조 가능·신뢰 안 함)와 달리 이 값은
 /// 데몬 발급 비밀의 **대조**라 자기신고가 아니다. 관측 채널(로그·stdout·surface.list) 등재 금지.
 pub const ENV_SEAT_TOKEN: &str = "CYS_SEAT_TOKEN";
+
+/// ★(B5 · 명세 §2-8 · T1-8) 부트 논스 — 데몬이 pane 스폰 시 PTY env 로만 배달하는 발급 비밀.
+/// 훅(`cys hook user-prompt-submit --input`)이 **이 값이 프롬프트에 실려 도착했는지**를 보고
+/// 그 자리에서 ack 를 신고한다. env 로만 오므로 프롬프트가 이 값을 담고 있다는 사실 자체가
+/// "데몬이 주입한 디렉티브가 실제로 이 세션에 도착했다"는 증거다.
+pub const ENV_BOOT_NONCE: &str = "CYS_BOOT_NONCE";
 pub const ENV_SURFACE_REF: &str = "CYS_SURFACE_REF";
 pub const ENV_ROLE: &str = "CYS_ROLE";
 
@@ -427,6 +438,142 @@ pub fn next_busy_delay(prev: std::time::Duration, rand01: f64) -> std::time::Dur
         .clamp(PIPE_BUSY_RETRY_INTERVAL, PIPE_BUSY_BACKOFF_CAP);
     let span = hi - PIPE_BUSY_RETRY_INTERVAL; // hi ≥ 하한이 클램프로 보장됨.
     PIPE_BUSY_RETRY_INTERVAL + std::time::Duration::from_secs_f64(span.as_secs_f64() * r)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 상태 JSON 원자 쓰기 — python `javis_lock.atomic_write_json` 파리티 (명세 v2.1 **A13**)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ★왜 `pack::write_atomic_mode` 를 쓰지 않는가(두 벌인 이유):
+//   그쪽 tmp 이름은 `.{fname}.tmp.{pid}` 로 **pid 당 하나로 고정**이다. 같은 pid 안에서 두
+//   task 가 같은 파일을 쓰면 서로의 tmp 를 파손한다 — python 이 주석으로 못박은 바로 그 실패
+//   모드다("고정 `.tmp` 이름을 쓰면 동시 writer가 서로의 임시 파일을 파손"). 데몬은 연결별
+//   tokio task 로 병행하므로 이 축에서는 **호출마다 유일한** 이름이 필요하다. 그쪽은 설치
+//   경로용(fsync + unix mode)이고 이쪽은 상태 파일용(무 fsync + 유일 tmp)이라 목적도 갈린다.
+//
+// ★재시도를 넣지 않는 이유(A13 · 실측으로 확정): python 정본은 재시도를 **위험해서 기각**했다
+//   — `javis_bootstrap._Log._persist` 원문: "쓰기 재시도 루프: 공유 위반은 수 초 지속될 수
+//   있고 부트 경로의 동기 재시도는 **싱글플라이트 락 보유 연장(치명 앵커 ③)** 이다. 어차피
+//   다음 단계의 write 가 곧 같은 내용을 다시 시도한다(유실 없음)". 명세 초안의 '5회 백오프'는
+//   오기였고 master 가 A13 으로 정정했다.
+//
+// ★실패 계수·미러 1줄은 **호출부** 몫이다(python 도 `_Log._persist` 가 진다) — 이 함수는
+//   `io::Result` 를 정직하게 돌려주기만 한다. 계수를 여기 넣으면 "어느 파일의 실패인지"를
+//   잃고, 호출부마다 다른 누적 정책이 필요해진다.
+
+/// 상태 JSON 을 원자적으로 쓴다 — python `javis_lock.atomic_write_json` 과 **바이트 동일**.
+///
+/// 바이트 계약: `indent=1`(공백 **한 칸**) · `ensure_ascii=false`(한글 그대로) · **말미 개행**.
+/// 세 가지가 다 맞아야 두 구현이 같은 파일을 낳는다 — 하나라도 갈리면 골든 대조가 깨진다.
+///
+/// tmp 이름은 `.tmp-<basename>-<rand>` 로 **호출마다 유일**하며(python `mkstemp` 동형 · pid 를
+/// 넣지 않는다), 성공하면 rename 으로 사라지고 실패하면 `finally` 자리에서 **자기 것만** 지운다
+/// (남의 tmp 를 pid 로 스캔해 지우지 않는다 — 남의 진행 중 쓰기를 파손하는 경로다).
+///
+/// ## ★키 순서 — 골든 대조를 하려면 **타입 구조체**로 넘겨라 (실측으로 확정)
+/// `serde_json` 은 `preserve_order` 없이 빌드돼 있어 [`serde_json::Value`] 의 객체가 내부적으로
+/// `BTreeMap` 이다 — 즉 **키가 알파벳순으로 정렬돼** 나간다. python `json.dump` 는 **삽입
+/// 순서**를 보존하므로, 같은 내용을 `Value` 로 넘기면 들여쓰기·escape 는 같은데 **키 순서만
+/// 갈린다**(실측: `{"result","n","t"}` → Rust `n,result,t` / python `result,n,t`).
+///
+/// 그래서 이 함수는 `T: Serialize` 로 **제네릭**이다. serde 는 구조체를 **필드 선언 순서**로
+/// 직렬화하므로, python 과 같은 순서로 필드를 선언한 구조체를 넘기면 바이트가 정확히 같아진다
+/// (`LedgerRecord` 가 이미 그 방식이다). boot-last 골든 writer(B4-4)도 반드시 구조체여야 한다.
+///
+/// `preserve_order` 피처를 켜지 않는 이유: 크레이트 **전역**이라 데몬 프로토콜 JSON 의 키 순서
+/// 까지 바꾼다 — 폭발 반경이 이 축의 이득보다 크다.
+pub fn atomic_write_json<T>(path: &Path, value: &T) -> std::io::Result<()>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut buf = Vec::new();
+    let fmt = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+    value
+        .serialize(&mut ser)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    buf.push(b'\n');
+    atomic_write_bytes(path, &buf)
+}
+
+/// [`atomic_write_json`] 의 바이트 절반 — 같은 tmp·rename 규약을 쓰는 비-JSON 소비자용.
+pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "파일명 없음"))?;
+
+    // mkstemp 동형 — `create_new`(O_EXCL)가 커널 수준 유일성을 보증한다(house 관행:
+    // `boot_supervisor::insert_intent_exclusive`). 충돌하면 다음 후보로 넘어간다.
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..TMP_NAME_TRIES {
+        let tmp = tmp_path_for(dir, base);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o644); // python `atomic_write_bytes` 의 mode=0o644 와 같다
+        }
+        let mut f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue; // 이름 충돌뿐 — 다른 후보로(이것은 '재시도'가 아니라 이름 뽑기다)
+            }
+            Err(e) => return Err(e),
+        };
+        // 여기서부터는 tmp 가 **내 것**이다 — 어느 경로로 빠져나가든 내가 치운다.
+        let res = f.write_all(data).and_then(|_| {
+            drop(f); // Windows: 열려 있는 핸들이 있으면 rename 이 공유위반으로 막힌다
+            // `std::fs::rename` 은 Windows 에서 MoveFileEx REPLACE_EXISTING 의미다(대상 덮어씀).
+            std::fs::rename(&tmp, path)
+        });
+        return match res {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // ★자기 것만 지운다. 재시도하지 않는다(A13) — 실패는 호출부가 계수·보고한다.
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        };
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "tmp 이름을 얻지 못했다")
+    }))
+}
+
+/// tmp 이름 후보 수 — 이름 **충돌**에만 쓰이며 쓰기 실패 재시도가 아니다(A13: 재시도 0).
+const TMP_NAME_TRIES: usize = 16;
+
+/// tmp **경로**를 만든다 — 호출마다 다른 이름이어야 한다.
+///
+/// 이름 구성을 따로 뽑은 이유(mutation A-M3 이 드러낸 사각): `tmp_suffix()` 만 시험하면
+/// "난수는 유일한데 쓰기 경로가 그것을 **안 쓰는**" 변이를 못 잡는다. 성공 경로는 tmp 를
+/// rename 으로 지우므로 이름을 사후에 관측할 수도 없다. 그래서 **구성 함수 자체**를 박는다.
+fn tmp_path_for(dir: &Path, base: &str) -> PathBuf {
+    dir.join(format!(".tmp-{base}-{}", tmp_suffix()))
+}
+
+/// tmp 이름의 난수 꼬리(python `mkstemp` 의 무작위 부분 대응).
+/// 암호학적 품질 불요 — 같은 디렉터리 안에서 **동시 writer 끼리 갈리기만** 하면 된다.
+fn tmp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    // pid 를 **이름에 넣지 않는다**(A13) — 그러나 프로세스 간 충돌을 줄이려 섞기에는 쓴다.
+    let mixed = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(seq.wrapping_mul(1442695040888963407))
+        .wrapping_add(std::process::id() as u64);
+    format!("{mixed:016x}")
 }
 
 /// jitter 전용 저비용 난수(∈[0,1)) — 암호학적 품질 불요(토큰 생성 금지, 위상 분산 전용).
@@ -908,7 +1055,10 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
         let fresh = windows_registry_path();
         let home = home_dir();
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
-        let user_bins: Vec<String> = windows_user_bin_dirs(&home, appdata.as_deref())
+        // ★B7: `%LOCALAPPDATA%\cys-npm` 는 ⑥이 얹는 npm 기본 prefix 다 — 주입과 발견은 한 쌍.
+        let localappdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let user_bins: Vec<String> =
+            windows_user_bin_dirs(&home, appdata.as_deref(), localappdata.as_deref())
             .into_iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
@@ -1007,6 +1157,368 @@ pub fn inject_claude_code_git_bash_path_for(
         ENV_CLAUDE_CODE_GIT_BASH_PATH.to_string(),
         p.to_string_lossy().into_owned(),
     ));
+}
+
+/// ── B7(F4 · 명세 §2-10 · 시뮬 T2-4): npm 전역 prefix ────────────────────────────
+///
+/// npm 전역 설치 prefix 를 지정하는 env 키. npm 은 `npm_config_<key>` **소문자** 규약으로
+/// 설정을 env 에서 읽는다(대문자 `NPM_CONFIG_PREFIX` 도 npm 이 접지만, 우리가 쓰는 철자는
+/// 하나로 고정한다 — 두 철자를 동시에 얹으면 어느 쪽이 이겼는지 진단이 불가능해진다).
+pub const ENV_NPM_CONFIG_PREFIX: &str = "npm_config_prefix";
+
+/// Windows 기본 prefix 가 놓이는 `%LOCALAPPDATA%` 하위 디렉터리 이름.
+///
+/// `%LOCALAPPDATA%\npm`(npm 관례)이 아니라 **전용 이름**을 쓰는 이유: 우리가 만들어 준
+/// 기본값과 사용자가 스스로 쓰던 npm 트리를 구별할 수 있어야 G5(봉인) 진단이 "누가 넣었나"를
+/// 말할 수 있다. `%APPDATA%\npm` 은 [`windows_user_bin_dirs`] 가 PATH 후보로 이미 싣는다.
+pub const NPM_PREFIX_WIN_SUBDIR: &str = "cys-npm";
+
+/// `npm_config_prefix` 기본값(**순수** — env 도 디스크도 보지 않는다).
+///
+/// os 를 인자로 받는 이유는 [`bundled_git_bash_path_for`] 와 동일하다 — 회귀 핀이 mac CI 에서도
+/// Windows 분기를 **실제로 밟는다**(cfg 로 갈라 두면 그 분기는 영원히 시험되지 않는다).
+///
+///   · `windows` → `%LOCALAPPDATA%\cys-npm`
+///   · 그 외      → `$HOME/.local`  (claude native 설치 위치 `~/.local/bin` 의 부모 =
+///     [`compose_unix_pane_path`] 가 이미 PATH 말미에 얹는 그 트리와 같은 곳이다)
+///
+/// 근거 좌표(home·localappdata)가 없으면 `None` = **무주입**(fail-open). 없는 경로를 prefix 로
+/// 통보하는 쪽이 미통보보다 나쁘다(npm 이 그 경로에 설치를 시도하다 실패한다).
+pub fn npm_config_prefix_default_for(
+    os: &str,
+    home: Option<&Path>,
+    localappdata: Option<&Path>,
+) -> Option<PathBuf> {
+    if os == "windows" {
+        return localappdata
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(NPM_PREFIX_WIN_SUBDIR));
+    }
+    home.filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(".local"))
+}
+
+/// 설치 스코프 루트(**순수**) — "이 트리 아래는 우리 설치본이다" 의 좌표.
+///
+/// macOS 는 실행물이 `…/X.app/Contents/MacOS/` 에 있으므로 exe_dir 자신이 아니라 **번들
+/// 루트**(`X.app`)가 스코프다. 그 레이아웃 판정의 SOT 는 [`crate::app_bundle::enclosing_bundle`]
+/// 하나이며 여기서 **재사용**한다 — 규칙 사본을 만들면 한쪽만 고쳐지는 회귀가 난다
+/// (`BUNDLED_GIT_BASH_REL` 재사용 계약과 같은 규율). 입력 arity 만 다르므로(그쪽은 exe 경로,
+/// 여기는 exe_dir) 더미 파일명을 얹어 같은 규칙에 태운다.
+///
+/// Windows·Linux 는 설치 디렉터리가 곧 exe_dir 이다(NSIS `<install>\cys.exe`).
+/// 번들 레이아웃이 아니면 exe_dir 을 그대로 돌려준다 — 개발 빌드(`target/debug/`)에서는
+/// 그 디렉터리 아래를 prefix 로 쓰는 사람이 없으므로 무해하다.
+pub fn install_scope_root_for(exe_dir: &Path, os: &str) -> PathBuf {
+    if os == "macos" {
+        if let Some(root) = crate::app_bundle::enclosing_bundle(&exe_dir.join("x")) {
+            return root;
+        }
+    }
+    exe_dir.to_path_buf()
+}
+
+/// `npm_config_prefix` 에 대한 **판정**(순수). 네 값은 서로 배타적이며 각각 다른 행동을 낳는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpmPrefixVerdict {
+    /// 사용자 값 부재 → 기본값을 얹는다.
+    Inject(PathBuf),
+    /// 사용자 값 존재 · 설치본 **밖** → 무접촉. 그 값이 우리 것보다 나쁘더라도 **사용자
+    /// 소유물**이다(⑤ 불가침 계약 ①과 같은 규율).
+    KeepUser,
+    /// 사용자 값 존재 · 설치본 **내부** → 무접촉 + **경고**.
+    ///
+    /// ★시뮬 T2-4 가 명세 §2-10 을 뒤집은 지점이다(§4 반영 목록 = v2.1 · 명세보다 우선).
+    /// v2 초안은 "기본값으로 **덮고** 고지"였다. 그러나 그것은 사용자가 **의도적으로** 설정한
+    /// 값을 우리가 말없이 무효화하는 것이라 MAJ#1(fail-open) 정신과 정면으로 충돌한다.
+    /// 그래서 덮지 않고 **경고만** 한다 — G5(봉인 보존)의 정의를 "우리 기본값이 번들을
+    /// 오염시키지 않는다"로 **정직하게 축소**하고, 사용자의 의도적 오염은 보장 밖으로 둔다.
+    WarnBundlePolluted {
+        /// 사용자가 설정한 값(원문).
+        user_value: String,
+        /// 그 값이 그 아래에 있다고 판정된 설치 스코프 루트.
+        scope_root: PathBuf,
+    },
+    /// 기본값 좌표가 없다(home·%LOCALAPPDATA% 부재) → 무접촉. **fail-open**.
+    NoDefault,
+}
+
+/// [`NpmPrefixVerdict`] 산출(**순수**). env·디스크는 호출부가 관측해 인자로 넘긴다.
+///
+/// 판정 순서가 곧 우선순위다: 사용자 값 있음(→ 번들 내부인가) → 없음(→ 기본값 있는가).
+/// 사용자 값을 먼저 보는 이유는 ①이 불가침이기 때문이다 — 기본값 계산 실패가 사용자 값
+/// 존중을 뒤집어선 안 된다.
+pub fn npm_config_prefix_verdict_for(
+    os: &str,
+    exe_dir: &Path,
+    home: Option<&Path>,
+    localappdata: Option<&Path>,
+    user_value: Option<&str>,
+) -> NpmPrefixVerdict {
+    if let Some(uv) = user_value.filter(|v| !v.trim().is_empty()) {
+        let scope_root = install_scope_root_for(exe_dir, os);
+        if path_is_within_for(uv, &scope_root.to_string_lossy(), os) {
+            return NpmPrefixVerdict::WarnBundlePolluted {
+                user_value: uv.to_string(),
+                scope_root,
+            };
+        }
+        return NpmPrefixVerdict::KeepUser;
+    }
+    match npm_config_prefix_default_for(os, home, localappdata) {
+        Some(p) => NpmPrefixVerdict::Inject(p),
+        None => NpmPrefixVerdict::NoDefault,
+    }
+}
+
+/// `candidate` 가 `root` 아래(또는 root 자신)인가 — **순수·어휘적 판정**(디스크 무접촉).
+///
+/// `starts_with` 를 쓰는 이유이자 그 한계: `Path::starts_with` 는 **컴포넌트 단위**로 비교하므로
+/// `/a/bc` 가 `/a/b` 아래로 잘못 잡히는 접두 사고가 없다(문자열 비교였다면 났다).
+/// 대신 심볼릭 링크·`..`·대소문자(Windows)는 **풀지 않는다** — 이 판정의 소비자는 경고 한 줄
+/// 뿐이라 오탐·미탐의 대가가 모두 작고, 여기서 `canonicalize` 를 부르면 순수성과 함께
+/// "존재하지 않는 경로는 판정 불가" 라는 새 실패 모드가 생긴다(그쪽이 더 나쁘다).
+pub fn path_is_within(candidate: &Path, root: &Path) -> bool {
+    !root.as_os_str().is_empty() && candidate.starts_with(root)
+}
+
+/// 경로 비교용 **어휘 정규화**(순수·디스크 무접촉) — `(절대경로인가, 컴포넌트 목록)`.
+///
+/// os 를 인자로 받는 이유는 [`npm_config_prefix_default_for`] 와 같다: mac CI 가 Windows 분기를
+/// **실제로 밟아야** 한다. `std::path` 로는 그럴 수 없다 — unix 빌드의 `Path` 는 `\` 를 구분자로
+/// 보지 않아 `C:\Program Files\cys` 가 컴포넌트 **한 개**가 된다. 그래서 종전 검체(POSIX 경로만)는
+/// Windows 오염을 한 건도 재현하지 못했다(codex R1 #8 · "실제 Windows 오염 prefix 미탐").
+///
+/// windows 규칙 셋 — 셋 다 **미탐**(오염인데 경고 없음)을 만들던 축이다:
+///   ⓐ `\` 와 `/` 를 **둘 다** 구분자로 본다(`C:/Program Files/cys` 도 같은 경로다)
+///   ⓑ ASCII 대소문자를 접는다(`c:\program files\cys` 는 `C:\Program Files\cys` 다)
+///   ⓒ `.` 을 버리고 `..` 을 **어휘적으로** 되감는다(`…\other\..\cys\x` 는 `…\cys\x` 다)
+///
+/// 그 외 OS 는 `/` 만 구분자이고 **대소문자를 접지 않는다**. mac 도 실제로는 대소문자 무시
+/// 파일시스템이 흔하지만 그것은 **파일시스템의 성질**이라 경로 문자열만 보고 단정할 수 없다 —
+/// 접지 않는 쪽이 오탐을 만들지 않는다. `.`·`..` 정리는 OS 무관하게 한다(어휘 규칙이다).
+///
+/// ★`..` 되감기의 정직한 한계: 심볼릭 링크는 풀지 않으므로 링크를 관통하는 `..` 은 커널 해석과
+/// 다를 수 있다. `canonicalize` 를 부르지 않는 이유는 [`path_is_within`] 주석 그대로다(순수성
+/// 상실 + "존재하지 않는 경로는 판정 불가"라는 새 실패 모드). 되감지 **않던** 종전 동작은
+/// 미탐(`…/other/../cys`)과 오탐(`…/cys/../evil`)을 **둘 다** 만들었으므로 양방향으로 낫다.
+fn path_lexical_parts(p: &str, os: &str) -> (bool, Vec<String>) {
+    let win = os == "windows";
+    let is_sep = |c: char| c == '/' || (win && c == '\\');
+    // 드라이브 문자(`C:`)로 시작하는 Windows 경로도 절대경로다 — 선행 구분자가 없어도.
+    let drive_rooted = win && {
+        let mut it = p.chars();
+        matches!((it.next(), it.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+    };
+    let abs = p.starts_with(is_sep) || drive_rooted;
+    let mut out: Vec<String> = Vec::new();
+    for raw in p.split(is_sep) {
+        if raw.is_empty() || raw == "." {
+            continue;
+        }
+        if raw == ".." {
+            // 되감을 것이 없으면(루트 위 · 선행 `..`) **리터럴로 남긴다** — 조용히 삼키면
+            // 서로 다른 경로가 같아 보인다.
+            match out.last() {
+                Some(last) if last != ".." => {
+                    out.pop();
+                }
+                _ => out.push("..".to_string()),
+            }
+            continue;
+        }
+        out.push(if win { raw.to_ascii_lowercase() } else { raw.to_string() });
+    }
+    (abs, out)
+}
+
+/// `candidate` 가 `root` 아래(또는 root 자신)인가 — **OS 규칙을 인자로 받는** 순수 판정.
+/// [`path_lexical_parts`] 로 양쪽을 같은 규칙에 태운 뒤 **컴포넌트 단위**로 접두 비교한다.
+///
+/// 계약 넷(①~③은 [`path_is_within`] 에서 그대로 옮겨온 것이다):
+///   ① 빈 루트는 "모든 경로가 그 아래"가 아니다 — 스코프 소실 시 전면 경고를 막는다.
+///   ② 컴포넌트 단위라 `…/cys.app-old` 는 `…/cys.app` 아래가 아니다(형제 접두 음성 대조).
+///   ③ 루트 자신은 루트 아래로 본다.
+///   ④ 절대·상대 성질이 다르면 아래로 보지 않는다(정규화가 선행 `/` 를 지우므로 명시 비교).
+pub fn path_is_within_for(candidate: &str, root: &str, os: &str) -> bool {
+    let (root_abs, root_parts) = path_lexical_parts(root, os);
+    if root_parts.is_empty() {
+        return false; // ①
+    }
+    let (cand_abs, cand_parts) = path_lexical_parts(candidate, os);
+    cand_abs == root_abs && cand_parts.starts_with(&root_parts) // ②③④
+}
+
+/// 번들 오염 경고 문안(순수) — pane 첫 줄 고지와 preflight 가 **같은 문자열**을 쓴다.
+/// 문안을 두 벌 두면 한쪽만 고쳐져 사용자가 서로 다른 처방을 받는다.
+pub fn npm_prefix_bundle_warning(user_value: &str, scope_root: &Path) -> String {
+    format!(
+        "[cys] npm_config_prefix 가 설치본 안({})을 가리킵니다: {user_value}\n\
+         \u{2003}npm 전역 설치가 설치본을 변경하면 코드서명·봉인이 깨져 다음 실행이 차단될 수 \
+         있습니다(그래도 값은 덮지 않습니다 — 사용자 설정입니다).\n\
+         \u{2003}설치본 밖(예: {}) 으로 옮기시길 권합니다.",
+        scope_root.display(),
+        if cfg!(windows) {
+            "%LOCALAPPDATA%\\cys-npm"
+        } else {
+            "$HOME/.local"
+        }
+    )
+}
+
+/// 번들 오염 **1줄 고지**(pane 주입 전용 렌더). 문안의 단일 진실은 여전히
+/// [`npm_prefix_bundle_warning`] 하나이고 여기서는 **접기만** 한다 — 두 벌을 두면 한쪽만
+/// 고쳐져 사용자가 pane 과 preflight 에서 서로 다른 처방을 받는다.
+///
+/// 왜 1줄이어야 하는가: 좌석은 셸이라 텍스트 주입이 곧 '입력'이고 **개행은 곧 Enter** 다.
+/// 여러 줄을 넣으면 프롬프트에 미제출 잔재가 남아 사용자의 다음 Return 이 그것을 명령으로
+/// 실행한다(고지가 사고를 만든다). `#` 접두는 실행돼도 no-op 이고 scrollback 에는 남는다 —
+/// `announce_seat_takeover` 가 같은 이유로 같은 모양을 쓴다.
+pub fn npm_prefix_bundle_warning_line(user_value: &str, scope_root: &Path) -> String {
+    npm_prefix_bundle_warning_line_for(user_value, scope_root, POSIX_SHELL_FOR_NOTICE)
+}
+
+/// 고지 렌더의 **기준 셸** — 위 함수가 유지하는 종전 계약(`#` 접두)의 근거를 이름으로 못박는다.
+/// 이벤트 채널(`env.advisory`)도 이 표기를 쓴다: 이벤트는 셸이 아니라 GUI·저널이 읽으므로
+/// pane 마다 달라지면 안 되고, 사람이 눈으로 대조할 **정본 표기**가 하나 있어야 한다.
+pub const POSIX_SHELL_FOR_NOTICE: &str = "sh";
+
+/// 이 셸에서 **한 줄 주석**을 여는 접두(순수 · os 비의존).
+///
+/// ★왜 필요한가(codex R2 #2 · blocking): 고지는 pane 셸에 **입력으로** 들어가므로 접두가
+/// 그 셸의 주석이 아니면 고지가 곧 명령이 된다. 종전 코드는 그 위험을 `cfg!(unix)` 로 피했고
+/// (cmd.exe 가 `#` 를 오류로 뱉는다는 근거) 그 대가로 **Windows pane 은 아무 고지도 못 받았다**
+/// — 정작 봉인이 깨지는 사고는 Windows 에서 더 잦다. 접두를 셸별로 고르면 둘 다 지킬 수 있다.
+///
+/// ★`os` 가 아니라 **셸 이름**을 받는 이유: Windows pane 의 기본 셸은 `powershell.exe`
+/// (`cysd/state.rs` `default_shell`)이고 `#` 는 PowerShell 에서 **정상 주석**이다. 즉 위험한
+/// 것은 "Windows" 가 아니라 "cmd.exe" 하나다. 게다가 `CYS_SHELL` 로 어느 OS 에서든 셸이
+/// 바뀌므로 os 로 가르면 틀린다 — 판정 입력은 실제 셸이어야 한다(`windows_exec_flag` 와 동일 규율).
+///
+/// 인자를 받는 순수 함수라 mac CI 가 cmd.exe 분기를 **실제로 밟는다**
+/// (`npm_config_prefix_default_for` 가 `os` 를 받는 것과 같은 이유).
+pub fn shell_comment_prefix(shell: &str) -> &'static str {
+    // 경로·확장자를 떼고 베이스 이름만 소문자로 비교(`C:\Windows\System32\cmd.exe` → `cmd`).
+    // `cysd::state::windows_exec_flag` 와 **같은 정규화**다 — 한쪽만 고치면 갈린다.
+    let base = shell
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(shell)
+        .trim_end_matches(".exe")
+        .trim_end_matches(".EXE")
+        .to_ascii_lowercase();
+    // cmd.exe 만 `#` 를 모른다. `rem` 은 cmd 의 주석 명령이고 실행돼도 no-op 이다.
+    // (`::` 도 주석으로 쓰이지만 파이프·괄호 안에서 깨지는 알려진 함정이 있어 `rem` 을 쓴다.)
+    if base == "cmd" {
+        "rem "
+    } else {
+        "# "
+    }
+}
+
+/// [`npm_prefix_bundle_warning_line`] 의 **셸 주입판**. 문안의 단일 진실은 여전히
+/// [`npm_prefix_bundle_warning`] 하나이고, 여기서 바뀌는 것은 **주석 접두뿐**이다
+/// (한 글자도 버리지 않는다 — 요약이 아니라 렌더 변경이다).
+pub fn npm_prefix_bundle_warning_line_for(
+    user_value: &str,
+    scope_root: &Path,
+    shell: &str,
+) -> String {
+    let full = npm_prefix_bundle_warning(user_value, scope_root);
+    // 공백 런(개행·U+2003 들여쓰기 포함)을 ASCII 공백 1개로 접는다.
+    let folded = full.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{}{folded}", shell_comment_prefix(shell))
+}
+
+/// 번들이 오염됐는가 — **모든 소비자가 쓰는 단 하나의 술어**(codex R1 #2 수리).
+///
+/// 소비자마다 `matches!` 를 손으로 쓰면 한쪽만 고쳐져 "pane 에는 경고가 뜨는데 `org.status`
+/// 는 깨끗하다" 같은 진단 분열이 난다. 판정은 [`npm_config_prefix_verdict_for`] 하나, 그
+/// 판정의 해석도 여기 하나다.
+pub fn npm_prefix_polluted(v: &NpmPrefixVerdict) -> bool {
+    matches!(v, NpmPrefixVerdict::WarnBundlePolluted { .. })
+}
+
+/// 오염이면 pane 에 넣을 **1줄 고지**, 아니면 `None`.
+/// [`npm_prefix_polluted`] 와 같은 사실의 두 표현이며, 호출부가 판정을 다시 풀지 않게 한다.
+pub fn npm_prefix_pollution_notice(v: &NpmPrefixVerdict) -> Option<String> {
+    npm_prefix_pollution_notice_for(v, POSIX_SHELL_FOR_NOTICE)
+}
+
+/// 오염이면 **그 셸에 안전한** 1줄 고지, 아니면 `None`(codex R2 #2).
+/// pane 주입은 반드시 이쪽을 쓴다 — 실제로 그 셸이 읽을 문자열이어야 하기 때문이다.
+pub fn npm_prefix_pollution_notice_for(v: &NpmPrefixVerdict, shell: &str) -> Option<String> {
+    match v {
+        NpmPrefixVerdict::WarnBundlePolluted { user_value, scope_root } => {
+            Some(npm_prefix_bundle_warning_line_for(user_value, scope_root, shell))
+        }
+        _ => None,
+    }
+}
+
+/// `npm_config_prefix` 주입의 **순수 코어**. 불가침 계약은
+/// [`inject_claude_code_git_bash_path_for`] 와 **동형**이다:
+///   ① 사용자가 값을 가졌으면 절대 덮지 않는다(판정이 `Inject` 가 아닌 모든 경우).
+///   ② 이미 쌓인 쌍에 같은 키가 있으면 손대지 않는다(later-wins 뒤집기·중복 금지).
+///   ③ 기본값 좌표가 없으면 아무것도 얹지 않는다 — fail-open.
+///   ④ `master_off`(`CYS_BOOT_GATES=0`)면 주입하지 않는다 = 종전 동작 완전 복귀.
+///      이 축 전용 노브는 **만들지 않는다**(⑤ 주석의 규율 — 사고 순간에 사람은 노브를
+///      조합하지 못한다).
+pub fn inject_npm_config_prefix_for(
+    env_pairs: &mut Vec<(String, String)>,
+    verdict: &NpmPrefixVerdict,
+    master_off: bool,
+) {
+    if master_off {
+        return;
+    }
+    let NpmPrefixVerdict::Inject(p) = verdict else {
+        return;
+    };
+    if env_pairs.iter().any(|(k, _)| k == ENV_NPM_CONFIG_PREFIX) {
+        return;
+    }
+    env_pairs.push((
+        ENV_NPM_CONFIG_PREFIX.to_string(),
+        p.to_string_lossy().into_owned(),
+    ));
+}
+
+/// [`npm_config_prefix_verdict_for`] 를 **현재 프로세스 env** 로 계산한다(관측 층).
+///
+/// 경고 문안이 필요한 소비자(pane 첫 줄 고지·preflight 브리지)가 `spawn_env_pairs` 의
+/// 반환값(쌍 목록)에서는 판정을 되읽을 수 없으므로, 같은 판정을 **한 번 더** 부르는 이
+/// 접근자를 둔다. 판정은 순수 함수 하나뿐이라 두 호출이 갈릴 수 없다.
+pub fn npm_config_prefix_verdict_from_process(exe_dir: &Path) -> NpmPrefixVerdict {
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(home_dir);
+    let localappdata = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let user = std::env::var(ENV_NPM_CONFIG_PREFIX).ok();
+    npm_config_prefix_verdict_for(
+        std::env::consts::OS,
+        exe_dir,
+        Some(home.as_path()),
+        localappdata.as_deref(),
+        user.as_deref(),
+    )
+}
+
+/// [`npm_config_prefix_verdict_from_process`] 를 **현재 실행물의 디렉터리**로 부른다.
+///
+/// exe_dir 해소를 고지 호출부마다 복붙하지 않게 하는 얇은 층이다. 해소가 실패하면 빈 경로를
+/// 넘긴다 — 그러면 스코프 루트가 비어 [`path_is_within_for`] 계약 ①이 발동해 **경고하지
+/// 않는다**(스코프를 모르면 오염 여부도 모른다 · 없는 근거로 겁주지 않는다). 사용자 값이
+/// 없을 때의 기본값 산출은 exe_dir 에 의존하지 않으므로 그대로 유효하다.
+pub fn npm_config_prefix_verdict_from_exe() -> NpmPrefixVerdict {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    npm_config_prefix_verdict_from_process(&exe_dir)
 }
 
 /// ── P4-2: Windows 설치본 runtime 결손 검사(advisory 전용 · stat-only) ─────────────
@@ -1185,6 +1697,18 @@ pub fn spawn_env_pairs(
         std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH).is_some(),
         boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
     );
+    // ⑥ npm_config_prefix(B7 · F4 · 명세 §2-10 + 시뮬 T2-4): npm 전역 설치가 **설치본 안**에
+    //    쓰이면 코드서명 봉인이 깨진다(SEAL-1 이 .pyc 로 겪은 그 사고의 npm 판). 그래서 키가
+    //    **부재할 때만** 설치본 밖 기본값을 얹는다. 사용자 값이 이미 있으면 그것이 설치본
+    //    안이더라도 **덮지 않고 경고만** 한다(T2-4 — 의도적 설정을 말없이 무효화하지 않는다).
+    //    ⑤와 같이 조건부 쌍이다 — 조건 미충족 시 아무것도 얹지 않아 종전과 완전히 동일하다.
+    //    경고 문안이 필요한 소비자는 `npm_config_prefix_verdict_from_process` 로 같은 판정을
+    //    되읽는다(판정은 순수 함수 하나뿐이라 두 호출이 갈릴 수 없다).
+    inject_npm_config_prefix_for(
+        &mut env,
+        &npm_config_prefix_verdict_from_process(exe_dir),
+        boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
+    );
     env
 }
 
@@ -1267,13 +1791,32 @@ pub fn expand_windows_env(s: &str, lookup: impl Fn(&str) -> Option<String>) -> S
     out
 }
 
-/// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin` 와
-/// npm 전역 `%APPDATA%\npm`. 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
+/// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin`,
+/// npm 전역 `%APPDATA%\npm`, 그리고 ★B7 이 추가한 우리 기본 prefix `%LOCALAPPDATA%\cys-npm\bin`.
+/// 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
 /// (셸은 없는 PATH 항목을 무시·claude 설치 직후 재시작 없이 발견). OS 무관 컴파일(순수·테스트 가능).
-pub fn windows_user_bin_dirs(home: &Path, appdata: Option<&Path>) -> Vec<PathBuf> {
+///
+/// ★B7(명세 §2-10) 시그니처 확장 — `localappdata` 3번째 인자 추가. 이유: [`spawn_env_pairs`] ⑥이
+/// `npm_config_prefix` 를 `%LOCALAPPDATA%\cys-npm` 로 **얹기만 하고** 그 아래 `bin` 을 PATH 후보로
+/// 넣지 않으면, 사용자가 `npm i -g <도구>` 를 해도 그 도구를 **영원히 발견하지 못한다**(claude
+/// native 설치가 `~/.local/bin` 을 rc 에 안 넣어 겪은 그 결함과 동형). 주입과 발견은 한 쌍이다.
+///
+/// npm 은 Windows 에서 prefix **직하**에 `.cmd` 셈을 놓는 구현과 `prefix\bin` 을 쓰는 구현이
+/// 섞여 있어(설정·버전 의존) **둘 다** 후보로 넣는다 — is_dir 게이트가 없으므로 없는 쪽은
+/// 셸이 조용히 무시하고, 있는 쪽만 효력을 갖는다(과잉 후보의 대가 = 0).
+pub fn windows_user_bin_dirs(
+    home: &Path,
+    appdata: Option<&Path>,
+    localappdata: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut v = vec![home.join(".local").join("bin")];
     if let Some(a) = appdata {
         v.push(a.join("npm"));
+    }
+    if let Some(l) = localappdata.filter(|p| !p.as_os_str().is_empty()) {
+        let root = l.join(NPM_PREFIX_WIN_SUBDIR);
+        v.push(root.join("bin"));
+        v.push(root);
     }
     v
 }
@@ -3143,15 +3686,490 @@ mod tests {
     fn windows_user_bin_dirs_composition() {
         let home = Path::new(r"C:\Users\x");
         let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
-        let with = windows_user_bin_dirs(home, Some(&appdata));
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        let with = windows_user_bin_dirs(home, Some(&appdata), None);
         let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
         assert_eq!(got.len(), 2);
         assert!(got[0].contains(".local") && got[0].ends_with("bin"), "local/bin: {got:?}");
         assert!(got[1].ends_with("npm"), "appdata/npm: {got:?}");
         // APPDATA 부재 시 .local/bin 만.
-        let none = windows_user_bin_dirs(home, None);
+        let none = windows_user_bin_dirs(home, None, None);
         assert_eq!(none.len(), 1);
+
+        // ★B7(H-NPM-2 일부): %LOCALAPPDATA% 가 있으면 우리 기본 prefix 의 `bin` 과 루트가
+        //   **둘 다** 후보로 붙는다(npm 구현에 따라 `prefix\` 직하 또는 `prefix\bin`).
+        //   주입(⑥)만 하고 발견(PATH)을 빠뜨리면 `npm i -g` 산출물이 영원히 안 보인다.
+        let full = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
+        let fg: Vec<String> = full.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(fg.len(), 4, "후보 4종(.local/bin · appdata/npm · cys-npm/bin · cys-npm): {fg:?}");
+        assert!(
+            fg[2].contains(NPM_PREFIX_WIN_SUBDIR) && fg[2].ends_with("bin"),
+            "cys-npm/bin 누락: {fg:?}"
+        );
+        assert!(fg[3].ends_with(NPM_PREFIX_WIN_SUBDIR), "cys-npm 루트 누락: {fg:?}");
+        // 음성 대조 — 빈 %LOCALAPPDATA% 는 좌표가 아니다(빈 경로 후보를 PATH 에 흘리지 않는다).
+        let empty = windows_user_bin_dirs(home, Some(&appdata), Some(Path::new("")));
+        assert_eq!(empty.len(), 2, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
+    }
+
+    /// ★H-NPM-1(B7 · 명세 §2-10): `npm_config_prefix` 는 **키가 부재할 때만** 얹는다.
+    ///
+    /// 이 검체가 지키는 것은 네 불가침 계약이다(⑤ `inject_claude_code_git_bash_path_for` 동형):
+    /// ①사용자 값 불가침 ②이미 쌓인 쌍 불가침 ③좌표 부재 시 fail-open ④마스터 스위치 복귀.
+    /// 각 항마다 **음성 대조**를 함께 둔다 — 양성만 보면 "무조건 얹는" 구현도 초록이 된다.
+    /// ★H-ATOMIC-1(B4 T2-6 선분리 · 명세 v2.1 **A13**): `atomic_write_json` 의 **바이트 파리티**.
+    ///
+    /// 기대값은 추측이 아니라 **python 정본 실측**이다 — `javis_lock.atomic_write_json` 을
+    /// 인터프리터로 돌려 나온 바이트를 그대로 박았다. 세 계약이 **동시에** 맞아야 한다:
+    ///   ⓐ `indent=1`(공백 **한 칸** — serde 기본은 2칸이라 그냥 두면 갈린다)
+    ///   ⓑ `ensure_ascii=false`(한글이 `\uXXXX` 로 escape 되지 않는다)
+    ///   ⓒ **말미 개행**
+    /// 하나라도 갈리면 같은 상태를 두 구현이 서로 다른 파일로 낳고, boot-last 골든 대조가 깨진다.
+    #[test]
+    fn atomic_write_json_bytes_match_python_javis_lock() {
+        let td = std::env::temp_dir().join(format!("cys-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let write = |name: &str, v: serde_json::Value| -> String {
+            let p = td.join(name);
+            atomic_write_json(&p, &v).expect("원자 쓰기 실패");
+            std::fs::read_to_string(&p).expect("판독 실패")
+        };
+        // python 실측 5종(evidence/atomic-write-parity.txt).
+        assert_eq!(
+            write("a.json", serde_json::json!({"a": 1, "b": "x"})),
+            "{\n \"a\": 1,\n \"b\": \"x\"\n}\n",
+            "indent=1 또는 말미 개행이 python 과 갈렸다"
+        );
+        assert_eq!(
+            write("b.json", serde_json::json!({"mission": "릴리스 게이트를 통과시켜라", "source": "prompt"})),
+            "{\n \"mission\": \"릴리스 게이트를 통과시켜라\",\n \"source\": \"prompt\"\n}\n",
+            "ensure_ascii=false 파리티가 깨졌다 — 한글이 escape 됐다"
+        );
+        // ★중첩 + **키 순서** — 타입 구조체로 넘기면 serde 가 **필드 선언 순서**로 쓰므로
+        //   python 삽입 순서와 정확히 같아진다. 이것이 골든 대조가 성립하는 유일한 방식이다.
+        #[derive(serde::Serialize)]
+        struct Inner {
+            state: &'static str,
+            steps: [u8; 3],
+        }
+        #[derive(serde::Serialize)]
+        struct Outer {
+            result: Inner,
+            n: Option<u8>,
+            t: bool,
+        }
+        let p = td.join("c.json");
+        atomic_write_json(&p, &Outer { result: Inner { state: "ok", steps: [1, 2, 3] }, n: None, t: true })
+            .expect("원자 쓰기 실패");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "{\n \"result\": {\n  \"state\": \"ok\",\n  \"steps\": [\n   1,\n   2,\n   3\n  ]\n },\n \"n\": null,\n \"t\": true\n}\n",
+            "타입 구조체 경로가 python 과 갈렸다 — 골든 대조가 불가능해진다"
+        );
+
+        // ★음성 대조 — **같은 내용을 `Value` 로 넘기면 키가 알파벳순으로 정렬된다**.
+        //   `serde_json` 이 `preserve_order` 없이 빌드되기 때문이며, 이것을 모르고 boot-last
+        //   골든을 `Value` 로 쓰면 python 과 조용히 갈린다. 사실을 검체로 박아 둔다.
+        assert_eq!(
+            write("c-value.json", serde_json::json!({"result": {"state": "ok"}, "n": null, "t": true})),
+            "{\n \"n\": null,\n \"result\": {\n  \"state\": \"ok\"\n },\n \"t\": true\n}\n",
+            "Value 경로의 키 정렬 성질이 바뀌었다 — preserve_order 가 켜졌는지 확인하라"
+        );
+        assert_eq!(write("d.json", serde_json::json!({})), "{}\n", "빈 객체 표기가 갈렸다");
+        assert_eq!(
+            write("e.json", serde_json::json!({"xs": [{"k": "v"}, []]})),
+            "{\n \"xs\": [\n  {\n   \"k\": \"v\"\n  },\n  []\n ]\n}\n",
+            "배열·빈 배열 표기가 갈렸다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★H-ATOMIC-2(A13): tmp 규약 — **유일 이름 · 자기 것만 청소 · 재시도 0**.
+    ///
+    /// 재는 것 넷:
+    ///   ① 성공 경로에 **tmp 잔재가 없다**(rename 으로 사라진다)
+    ///   ② tmp 이름이 **호출마다 다르다** — 고정 이름이면 같은 pid 의 두 task 가 서로의 tmp 를
+    ///      파손한다(python 이 주석으로 못박은 지배 실패 모드). pid 는 이름에 **넣지 않는다**.
+    ///   ③ 실패 경로(부모가 파일)에서도 **남의 tmp 를 지우지 않는다**
+    ///   ④ 덮어쓰기가 원자적이다 — 기존 파일이 있어도 rename 이 교체한다(Windows
+    ///      MoveFileEx REPLACE_EXISTING 의미)
+    #[test]
+    fn atomic_write_leaves_no_tmp_and_never_reuses_a_fixed_name() {
+        let td = std::env::temp_dir().join(format!("cys-atomic2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let target = td.join("state.json");
+
+        // ④ 기존 파일을 덮어쓴다.
+        std::fs::write(&target, b"old").unwrap();
+        atomic_write_json(&target, &serde_json::json!({"v": 1})).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\n \"v\": 1\n}\n");
+        atomic_write_json(&target, &serde_json::json!({"v": 2})).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\n \"v\": 2\n}\n");
+
+        // ① 성공 경로 tmp 잔재 0.
+        let leftovers: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "성공 경로에 tmp 가 남았다: {leftovers:?}");
+
+        // ② 쓰기 경로가 **실제로 쓰는** 이름이 호출마다 다르다(고정 이름 금지).
+        //    ★`tmp_suffix()` 만 재면 "난수는 유일한데 경로가 그것을 안 쓰는" 변이를 놓친다
+        //      (mutation A-M3 이 그 사각을 드러냈다) — 구성 함수 자체를 박는다.
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..64 {
+            names.insert(tmp_path_for(&td, "state.json"));
+        }
+        assert_eq!(
+            names.len(),
+            64,
+            "tmp 경로가 반복된다 — 같은 pid 의 두 task 가 서로의 임시 파일을 파손한다"
+        );
+        let pid = std::process::id().to_string();
+        let one = tmp_path_for(&td, "state.json").file_name().unwrap().to_string_lossy().into_owned();
+        assert!(one.starts_with(".tmp-state.json-"), "tmp 이름 규약이 갈렸다: {one}");
+        assert!(
+            !one.contains(&pid),
+            "tmp 이름에 pid 가 그대로 들어갔다 — python mkstemp 규약(A13)과 다르다: {one}"
+        );
+
+        // ③ 실패 경로: **tmp 가 만들어진 뒤에** rename 이 실패해야 청소 코드가 실제로 돈다.
+        //    ★대상 자리가 **디렉터리**면 write 는 성공하고 rename 이 실패한다 — 부모가 파일인
+        //      경우(create_dir_all 단계 실패)로는 이 경로를 한 번도 밟지 못한다(A-M4 가 그
+        //      사각을 드러냈다).
+        let victim = td.join(".tmp-someone-else-cafe");
+        std::fs::write(&victim, b"not mine").unwrap();
+        let target_is_dir = td.join("iam-a-dir");
+        std::fs::create_dir_all(&target_is_dir).unwrap();
+        let r = atomic_write_json(&target_is_dir, &serde_json::json!({"x": 1}));
+        assert!(r.is_err(), "대상이 디렉터리인데 쓰기가 성공했다");
+        assert!(
+            victim.exists(),
+            "실패 경로가 **남의** tmp 를 지웠다 — 진행 중인 동시 쓰기를 파손한다"
+        );
+        // 내 tmp 는 치웠다 — 남은 `.tmp-` 는 victim 하나뿐이어야 한다.
+        let tmps: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tmp-"))
+            .collect();
+        assert_eq!(
+            tmps,
+            vec![".tmp-someone-else-cafe".to_string()],
+            "실패 경로가 자기 tmp 를 남겼거나 남의 것을 지웠다: {tmps:?}"
+        );
+
+        // 부모가 파일인 경우도 여전히 오류다(create_dir_all 단계).
+        let blocker = td.join("blocked");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        assert!(
+            atomic_write_json(&blocker.join("deep.json"), &serde_json::json!({"x": 1})).is_err(),
+            "부모가 파일인데 쓰기가 성공했다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    #[test]
+    fn npm_config_prefix_injects_only_when_absent() {
+        let exe_dir = Path::new("/nonexistent-exe-dir-for-pin");
+        let home = PathBuf::from("/Users/user");
+        let lad = PathBuf::from(r"C:\Users\x\AppData\Local");
+
+        // ── 기본값 산출(순수) ────────────────────────────────────────────────
+        assert_eq!(
+            npm_config_prefix_default_for("macos", Some(&home), None),
+            Some(PathBuf::from("/Users/user/.local")),
+            "unix 기본값은 $HOME/.local"
+        );
+        assert_eq!(
+            npm_config_prefix_default_for("linux", Some(&home), None),
+            Some(PathBuf::from("/Users/user/.local"))
+        );
+        let win = npm_config_prefix_default_for("windows", Some(&home), Some(&lad))
+            .expect("windows 기본값 부재");
+        assert!(
+            win.to_string_lossy().ends_with(NPM_PREFIX_WIN_SUBDIR),
+            "windows 기본값은 %LOCALAPPDATA%\\cys-npm: {win:?}"
+        );
+        // ③ 좌표 부재 → None(fail-open). windows 는 home 이 있어도 LOCALAPPDATA 가 없으면 없다.
+        assert_eq!(npm_config_prefix_default_for("windows", Some(&home), None), None);
+        assert_eq!(npm_config_prefix_default_for("macos", None, Some(&lad)), None);
+        assert_eq!(
+            npm_config_prefix_default_for("macos", Some(Path::new("")), None),
+            None,
+            "빈 HOME 은 좌표가 아니다"
+        );
+
+        // ── 판정(순수) ───────────────────────────────────────────────────────
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, None),
+            NpmPrefixVerdict::Inject(PathBuf::from("/Users/user/.local")),
+            "키 부재 → 주입"
+        );
+        // ① 사용자 값 불가침 — 설치본 밖이면 무접촉.
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, Some("/opt/mynpm")),
+            NpmPrefixVerdict::KeepUser
+        );
+        // 공백뿐인 값은 '값 없음'이다(npm 도 그렇게 읽는다) → 주입 대상.
+        assert!(matches!(
+            npm_config_prefix_verdict_for("linux", exe_dir, Some(&home), None, Some("   ")),
+            NpmPrefixVerdict::Inject(_)
+        ));
+        assert_eq!(
+            npm_config_prefix_verdict_for("linux", exe_dir, None, None, None),
+            NpmPrefixVerdict::NoDefault
+        );
+
+        // ── 주입 코어(순수) ─────────────────────────────────────────────────
+        let inject = NpmPrefixVerdict::Inject(PathBuf::from("/Users/user/.local"));
+        let mut env: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut env, &inject, false);
+        assert_eq!(
+            env.iter().find(|(k, _)| k == ENV_NPM_CONFIG_PREFIX).map(|(_, v)| v.as_str()),
+            Some("/Users/user/.local")
+        );
+        // ④ 마스터 스위치 — CYS_BOOT_GATES=0 이면 이 축은 통째로 종전(무주입)이다.
+        let mut off: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut off, &inject, true);
+        assert!(off.is_empty(), "master_off 인데 쌍이 나갔다: {off:?}");
+        // ② 이미 쌓인 쌍 불가침(later-wins 뒤집기·중복 금지).
+        let mut pre = vec![(ENV_NPM_CONFIG_PREFIX.to_string(), "/keep/me".to_string())];
+        inject_npm_config_prefix_for(&mut pre, &inject, false);
+        assert_eq!(pre.len(), 1, "중복 쌍이 생겼다: {pre:?}");
+        assert_eq!(pre[0].1, "/keep/me", "선행 쌍을 덮었다");
+        // ①③ 주입 판정이 아닌 모든 값은 쌍을 만들지 않는다.
+        for v in [
+            NpmPrefixVerdict::KeepUser,
+            NpmPrefixVerdict::NoDefault,
+            NpmPrefixVerdict::WarnBundlePolluted {
+                user_value: "/x".into(),
+                scope_root: PathBuf::from("/x"),
+            },
+        ] {
+            let mut e: Vec<(String, String)> = Vec::new();
+            inject_npm_config_prefix_for(&mut e, &v, false);
+            assert!(e.is_empty(), "{v:?} 인데 쌍이 나갔다");
+        }
+
+        // ── ★생산 배선 핀: `spawn_env_pairs` 가 실제로 ⑥을 부르는가 ─────────────
+        //   순수 코어 검체만으로는 호출부가 사라져도 초록이다. 그렇다고 프로세스 env 를
+        //   set_var 로 흔들면(테스트 병렬 실행) 다른 검체를 오염시킨다 — 그래서 **같은
+        //   판정자**를 이 자리에서 한 번 더 불러 결과와 쌍의 유무를 대조한다. 호출부를
+        //   지우면 Inject 분기에서 즉시 붉어진다.
+        let pairs = spawn_env_pairs(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None);
+        let got = pairs
+            .iter()
+            .find(|(k, _)| k == ENV_NPM_CONFIG_PREFIX)
+            .map(|(_, v)| v.clone());
+        let master_off = boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref());
+        match npm_config_prefix_verdict_from_process(exe_dir) {
+            NpmPrefixVerdict::Inject(p) if !master_off => assert_eq!(
+                got.as_deref(),
+                Some(p.to_string_lossy().as_ref()),
+                "⑥ 배선 소실 — spawn_env_pairs 가 npm_config_prefix 를 얹지 않았다"
+            ),
+            _ => assert_eq!(got, None, "주입 판정이 아닌데 쌍이 나갔다"),
+        }
+    }
+
+    /// ★H-NPM-2(B7 · 시뮬 **T2-4** — 명세 §2-10 을 뒤집은 반영분): 사용자 값이 설치본
+    /// **안**을 가리켜도 **덮지 않는다**. 경고만 한다.
+    ///
+    /// 왜 이 음성 대조가 검체의 본체인가: v2 명세 초안은 "기본값으로 **덮고** 고지"였다.
+    /// 그 구현도 "번들 오염을 막는다"는 목적에는 초록으로 보인다 — 그래서 `Inject` 가
+    /// 아님을 **명시적으로** 잠그지 않으면 설계 회귀가 조용히 통과한다.
+    #[test]
+    fn npm_prefix_inside_bundle_warns_but_never_overwrites() {
+        // mac: exe_dir = <root>/Contents/MacOS → 스코프는 번들 루트(.app)다.
+        let exe_dir = Path::new("/Applications/cys.app/Contents/MacOS");
+        assert_eq!(
+            install_scope_root_for(exe_dir, "macos"),
+            PathBuf::from("/Applications/cys.app"),
+            "mac 스코프는 exe_dir 이 아니라 .app 루트다(app_bundle::enclosing_bundle SOT 재사용)"
+        );
+        // 번들 레이아웃이 아니면 exe_dir 자신(개발 빌드·Windows 설치본).
+        assert_eq!(
+            install_scope_root_for(Path::new("/opt/cys"), "macos"),
+            PathBuf::from("/opt/cys")
+        );
+        assert_eq!(
+            install_scope_root_for(exe_dir, "windows"),
+            PathBuf::from("/Applications/cys.app/Contents/MacOS"),
+            "windows 는 exe_dir 이 곧 설치 디렉터리다"
+        );
+
+        // ── 오염 판정 + **무접촉** ───────────────────────────────────────────
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let v = npm_config_prefix_verdict_for(
+            "macos",
+            exe_dir,
+            Some(Path::new("/Users/user")),
+            None,
+            Some(polluted),
+        );
+        match &v {
+            NpmPrefixVerdict::WarnBundlePolluted { user_value, scope_root } => {
+                assert_eq!(user_value, polluted);
+                assert_eq!(scope_root, &PathBuf::from("/Applications/cys.app"));
+            }
+            other => panic!("번들 내부 값인데 판정이 {other:?} 다"),
+        }
+        // ★T2-4 의 심장: 덮지 않는다. `Inject` 가 아니고 쌍도 나가지 않는다.
+        assert!(!matches!(v, NpmPrefixVerdict::Inject(_)), "사용자 값을 덮었다(T2-4 위반)");
+        let mut env: Vec<(String, String)> = Vec::new();
+        inject_npm_config_prefix_for(&mut env, &v, false);
+        assert!(env.is_empty(), "번들 오염 경고 경로에서 쌍이 나갔다: {env:?}");
+
+        // ── 경고 문안은 사실을 담는다(pane·preflight 공용 SOT) ────────────────
+        let msg = npm_prefix_bundle_warning(polluted, Path::new("/Applications/cys.app"));
+        for needle in [polluted, "/Applications/cys.app", "npm_config_prefix"] {
+            assert!(msg.contains(needle), "경고 문안에 {needle} 이 없다: {msg}");
+        }
+
+        // ── 음성 대조 ①: 번들 **밖**은 오염이 아니다(과잉 경고 차단). ─────────
+        assert_eq!(
+            npm_config_prefix_verdict_for(
+                "macos",
+                exe_dir,
+                Some(Path::new("/Users/user")),
+                None,
+                Some("/Users/user/.local")
+            ),
+            NpmPrefixVerdict::KeepUser
+        );
+        // ── 음성 대조 ②: 컴포넌트 경계 — `/a/bc` 는 `/a/b` 아래가 아니다.
+        //    문자열 접두 비교였다면 여기서 거짓 양성이 났다.
+        assert!(!path_is_within(Path::new("/Applications/cys.app-old/x"), Path::new("/Applications/cys.app")));
+        assert!(path_is_within(Path::new("/Applications/cys.app"), Path::new("/Applications/cys.app")));
+        // ── 음성 대조 ③: 빈 루트는 "모든 경로가 그 아래" 가 아니다(스코프 소실 시 전면 경고 차단).
+        assert!(!path_is_within(Path::new("/anything"), Path::new("")));
+    }
+
+    /// ★H-NPM-2W(codex R1 #8 · major): **Windows 설치범위 판정의 경로 정규화.**
+    ///
+    /// 종전 판정은 `Path::starts_with` 하나였다. unix 빌드의 `Path` 는 `\` 를 구분자로 보지
+    /// 않으므로 `C:\Program Files\cys` 는 컴포넌트 **한 개**이고, 그래서 종전 검체(POSIX 경로만)
+    /// 로는 Windows 경로가 한 번도 시험되지 않았다 — 실기에서 대소문자만 달라도 **미탐**
+    /// (오염인데 경고 없음)이었다. 이 검체는 그 축을 mac CI 에서 실제로 밟는다.
+    ///
+    /// ★정직 고지: 여기서 증명되는 것은 **판정 규칙**뿐이다. 실기 Windows 에서 이 경고가 pane
+    /// 에 실제로 뜨는가는 windows-health 잡과 실기 재현의 몫이다(과장하지 않는다).
+    #[test]
+    fn npm_prefix_windows_scope_folds_case_slash_and_dotdot() {
+        let exe_dir = Path::new(r"C:\Program Files\cys");
+        assert_eq!(
+            install_scope_root_for(exe_dir, "windows"),
+            PathBuf::from(r"C:\Program Files\cys"),
+            "windows 는 exe_dir 이 곧 설치 디렉터리다"
+        );
+        let verdict = |uv: &str| {
+            npm_config_prefix_verdict_for(
+                "windows",
+                exe_dir,
+                Some(Path::new(r"C:\Users\x")),
+                Some(Path::new(r"C:\Users\x\AppData\Local")),
+                Some(uv),
+            )
+        };
+
+        // ── 양성: 넷 다 종전 구현이 **미탐**하던 모양이다 ────────────────────
+        for uv in [
+            r"C:\Program Files\cys\node_modules",          // ⓐ 그대로
+            r"c:\program files\CYS\node_modules",          // ⓑ 대소문자(드라이브 문자 포함)
+            r"C:/Program Files/cys/lib",                   // ⓒ 슬래시 혼용
+            r"C:\Program Files\other\..\cys\lib",          // ⓓ dot-dot 우회
+            r"C:\Program Files\.\cys\lib",                 // ⓔ 단일 점
+            r"C:\Program Files\cys",                       // ⓕ 루트 자신
+        ] {
+            assert!(
+                matches!(verdict(uv), NpmPrefixVerdict::WarnBundlePolluted { .. }),
+                "설치본 안({uv})인데 오염으로 보지 않았다 — 미탐(경고 0)이다: {:?}",
+                verdict(uv)
+            );
+        }
+
+        // ── 음성: 과잉 경고 차단(사용자 소유물을 오염으로 몰지 않는다) ────────
+        for uv in [
+            r"C:\Program Files\cys-extra\bin",             // ⓐ 형제 접두
+            r"C:\Users\x\AppData\Local\cys-npm",           // ⓑ 설치본 밖(우리 기본값 자리)
+            r"C:\Program Files\cys\..\evil",               // ⓒ dot-dot 로 **밖으로** 나감
+            r"D:\Program Files\cys\x",                     // ⓓ 다른 드라이브
+            r"Program Files\cys\x",                        // ⓔ 상대경로(절대 성질 불일치)
+        ] {
+            assert_eq!(
+                verdict(uv),
+                NpmPrefixVerdict::KeepUser,
+                "설치본 밖({uv})을 오염으로 경고했다 — 사용자 값을 잘못 나무란다"
+            );
+        }
+
+        // ── 같은 정규화가 POSIX 에서도 양방향으로 작동한다 ────────────────────
+        //    종전엔 ⓐ가 미탐, ⓑ가 오탐이었다(둘 다 `..` 를 되감지 않아서).
+        assert!(
+            path_is_within_for("/Applications/other/../cys.app/x", "/Applications/cys.app", "macos"),
+            "ⓐ dot-dot 우회 미탐"
+        );
+        assert!(
+            !path_is_within_for("/Applications/cys.app/../evil", "/Applications/cys.app", "macos"),
+            "ⓑ dot-dot 로 밖으로 나갔는데 안이라고 했다"
+        );
+        // 대소문자는 **접지 않는다**(mac 파일시스템 성질을 경로 문자열로 단정하지 않는다).
+        assert!(
+            !path_is_within_for("/Applications/CYS.app/x", "/Applications/cys.app", "macos"),
+            "비-windows 에서 대소문자를 접었다 — 오탐 창구다"
+        );
+        // 계약 ①③ 재확인 + 선행 `..` 는 삼키지 않는다(서로 다른 경로가 같아 보이면 안 된다).
+        assert!(!path_is_within_for("/anything", "", "macos"), "빈 루트가 전부를 삼켰다");
+        assert!(path_is_within_for("/a/b", "/a/b", "macos"), "루트 자신은 루트 아래다");
+        assert!(!path_is_within_for("../a/b", "/a/b", "macos"), "선행 .. 가 절대경로와 같아졌다");
+    }
+
+    /// ★H-NPM-3(codex R1 #2 · blocking 의 순수 절반): **경고에 소비자가 있다**의 전제 —
+    /// 판정 → 술어 → 1줄 문안이 한 사슬로 이어지고, 그 문안이 셸에 안전한 모양인가.
+    ///
+    /// pane 주입은 개행이 곧 Enter 라서 여러 줄이면 **고지가 사고를 만든다**(미제출 잔재를
+    /// 사용자의 다음 Return 이 명령으로 실행한다). 그래서 1줄·`#` 접두는 문서가 아니라 계약이다.
+    #[test]
+    fn npm_prefix_pollution_notice_is_one_shell_safe_line_from_the_same_verdict() {
+        let scope = Path::new("/Applications/cys.app");
+        let polluted = "/Applications/cys.app/Contents/Resources/runtime/node";
+        let v = NpmPrefixVerdict::WarnBundlePolluted {
+            user_value: polluted.to_string(),
+            scope_root: scope.to_path_buf(),
+        };
+        assert!(npm_prefix_polluted(&v), "오염 판정인데 술어가 false 다");
+        let line = npm_prefix_pollution_notice(&v).expect("오염이면 고지 문안이 있어야 한다");
+
+        // ① 셸 안전: 정확히 1줄이고 `#` 로 시작한다(실행돼도 no-op).
+        assert!(!line.contains('\n'), "고지가 여러 줄이다 — 개행이 Enter 가 된다: {line:?}");
+        assert!(!line.contains('\r'), "CR 이 섞였다: {line:?}");
+        assert!(line.starts_with("# "), "주석 접두가 없다 — 사용자의 다음 Return 이 실행한다");
+
+        // ② 사실 보존: 접기는 렌더 변경이지 요약이 아니다 — 세 사실이 모두 남는다.
+        for needle in [polluted, "/Applications/cys.app", "npm_config_prefix"] {
+            assert!(line.contains(needle), "고지에 {needle} 이 없다: {line}");
+        }
+        // ③ 문안 SOT 는 하나다 — 여러 줄 원문의 낱말이 1줄 렌더에 그대로 있다.
+        let full = npm_prefix_bundle_warning(polluted, scope);
+        for w in full.split_whitespace() {
+            assert!(line.contains(w), "1줄 렌더가 낱말 {w:?} 를 잃었다(문안 분열)");
+        }
+
+        // ④ 음성 대조: 오염이 아닌 세 판정은 **아무 말도 하지 않는다**(과잉 고지 차단).
+        for other in [
+            NpmPrefixVerdict::KeepUser,
+            NpmPrefixVerdict::NoDefault,
+            NpmPrefixVerdict::Inject(PathBuf::from("/home/u/.local")),
+        ] {
+            assert!(!npm_prefix_polluted(&other), "{other:?} 를 오염으로 봤다");
+            assert!(npm_prefix_pollution_notice(&other).is_none(), "{other:?} 에서 고지가 나갔다");
+        }
     }
 
     #[test]
