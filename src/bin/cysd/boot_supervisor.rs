@@ -98,7 +98,7 @@
 //! 여기서는 '성공'으로 접힌다. **부트 실패** 계급의 재실행 주체는 여전히 §0-A(P0-3) 가
 //! 유일하다 — 이 감독자가 그것을 대체한다고 서술하면 허위다(2차 성찰 P2-3 판정).
 
-use crate::state::{now_epoch, state_dir, BootRunActive, Daemon, FencedRun};
+use crate::state::{now_epoch, state_dir, BootAck, BootNonce, BootRunActive, Daemon, FencedRun};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1132,6 +1132,36 @@ fn close_unreadable(daemon: &Arc<Daemon>, dir: &Path, p: &Path, now: f64) -> boo
             );
             false
         }
+    }
+}
+
+/// (B5 · §2-8) 논스의 sha256 16진 문자열 — 데몬은 **해시만** 들고 원문을 저장하지 않는다.
+pub fn nonce_hash(nonce: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(nonce.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// (B5 · §2-8 · T1-7) 에코 판정용 **파생 토큰** — `sha256(nonce)[:8]`.
+///
+/// 디렉티브 본문에는 논스만 싣고 이 값은 **싣지 않는다**. 그래야 붙여넣기 에코만으로는 만들 수
+/// 없다 — T1-7 이 지적한 치명 결함(주입 에코가 그대로 ack 가 되는 것)을 원천에서 막는 형태다.
+pub fn echo_token(nonce: &str) -> String {
+    nonce_hash(nonce)[..8].to_string()
+}
+
+/// (B5 · §2-8 · T1-6) **ack 판정** — intent 일치 ∧ 해시 일치.
+///
+/// ## 왜 세대를 보지 않는가
+/// 명세 §2-8 원문은 `ack.generation == boot_nonce.generation` 이었으나 T1-6 이 그것을 고쳤다:
+/// Reconcile 이 같은 주입을 이월할 때 세대만 오르면 노드는 새 논스를 모르는데 ack 가 깨져
+/// **degraded** 가 된다. 논스는 **intent 단위 1개**이고 세대는 **fencing 전용**이다.
+pub fn ack_nonce_ok(nonce: Option<&BootNonce>, ack: Option<&BootAck>) -> bool {
+    match (nonce, ack) {
+        (Some(n), Some(a)) => a.intent == n.intent && a.nonce_hash == n.hash,
+        // arm 이 없으면 ack 는 판정 대상이 아니다(사전 ACK 봉인).
+        _ => false,
     }
 }
 
