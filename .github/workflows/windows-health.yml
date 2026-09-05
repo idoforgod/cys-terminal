@@ -205,6 +205,38 @@ jobs:
           set -euo pipefail
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys d5_env_injection -- --test-threads=1
 
+      # ── IG-31(★C4 선행 · master 배정 2026-09-05): cysd 검체가 **어느 CI 레인에서도 Windows 에서
+      #   돌지 않았다**(W-B 실측). windows-build=cargo test 0건 · 이 파일=factory_reset::/d5 둘만 ·
+      #   release.yml 의 --bin cysd 는 aarch64-apple-darwin 조건이라 macOS 전용. 그래서 R5 persist_epoch
+      #   의 Windows replace-safety, write_intent tmp+rename 이 **재는 대상은 Windows 인데 근거가
+      #   정적 판독 + macOS 실행뿐**이었다. 초록/적색 이전에 **아예 돌지 않는다**(무측정).
+      #   ★범위는 축 필터로 시작한다 — 감독자 원자쓰기·예약·해제. 전수 확대 금지이고,
+      #     초록 1사이클 뒤 넓히는 A10 승격 관행을 따른다(IG-31 처분).
+      #   ★보고를 실패 하류에 두지 않는다(W-C 52차 실증): `-e` 를 빼고 rc 를 잡은 뒤
+      #     **파싱보다 먼저** 로그 꼬리를 방출한다 — 파싱이 죽어도 판독 근거가 남는다.
+      - name: cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31)
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="$(mktemp)"
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon:: > "$LOG" 2>&1
+          rc=$?
+          cat "$LOG"
+          [ "$rc" -eq 0 ] && exit 0
+          echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
+          tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
+          summary="$(grep -E '^test result:' "$LOG" | tail -1 || true)"
+          failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || true)"
+          names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | tr '\n' ' ')"
+          if [ -z "$summary" ]; then
+            echo "::error title=cysd-win 측정 실패::rc=$rc 인데 'test result' 요약이 없다 — 컴파일 실패이거나 하네스가 요약 전에 죽었다. '실패한 테스트 없음' 이 아니다"
+          elif [ "${failed:-0}" -eq 0 ]; then
+            echo "::error title=cysd-win 측정 실패::rc=$rc 인데 failed=0 이다 — 개별 테스트 실패가 아니라 하네스 이상이다(101=러스트 패닉)"
+          else
+            echo "::error title=cysd-win 테스트 실패::failed=$failed — $names"
+          fi
+          exit "$rc"
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4
