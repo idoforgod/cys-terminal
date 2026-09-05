@@ -221,6 +221,17 @@ jobs:
         run: |
           set -uo pipefail
           LOG="$(mktemp)"
+          # ★절단 대비 트랩 — GitHub 는 타임아웃 시 스텝을 죽이기 전에 SIGINT/SIGTERM 을 보낸다.
+          #   그때 로그 꼬리를 ::error 로 뱉어 두면 **주석**에 남는다. 이것이 중요한 이유:
+          #   tee 는 러너 로그에만 남기는데 그 로그는 저장소 권한이 있어야 읽는다(익명 REST 실측:
+          #   로그 403 · 아티팩트 다운로드 401 · 주석만 200). 트랩이 없으면 절단 시 밖에서 보이는
+          #   것은 "timed out after N minutes" 한 줄뿐이라 **어느 검체에서 멈췄는지 영영 모른다.**
+          on_cut() {
+            echo "::error title=cysd-win 절단::타임아웃으로 잘렸다 — 아래가 로그 마지막 25줄이다(멈춘 검체명이 여기 있다)"
+            tail -25 "$LOG" 2>/dev/null | sed 's/^/::error title=cysd-win 꼬리::/'
+            exit 124
+          }
+          trap on_cut TERM INT
           # ★실시간 스트리밍(tee) — 종전에는 rc 를 잡은 뒤에야 꼬리를 뱉어서, 타임아웃으로
           #   죽으면 "왜 멈췄는지"가 하나도 안 남았다. tee 로 러너 로그에 흘리면 잘려도 마지막
           #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
