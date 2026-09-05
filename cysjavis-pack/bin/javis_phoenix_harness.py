@@ -46,6 +46,18 @@ import subprocess
 import sys
 import time
 
+# ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
+#   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**.
+#   unix/mac 은 스크립트 폴더가 이미 sys.path[0] 이라 이 블록은 무동작(멱등).
+#   ★append 인 이유: 발견이 목적이지 기존 항목의 precedence 를 강등하지 않는다(선례
+#   `javis_bootstrap.py:127-129` · `javis_orchestra.py:72-74`).
+#   계약(tests/test_import_guard.py): 가드를 건 뒤 형제 import 전까지 sys.path 를 건드리지 않는다.
+#   이 파일에 가드가 필요해진 계기: `guard_isolation()` 이 레인 경로 규약을 **사본 없이**
+#   쓰려고 `javis_lane` 을 import 한다(2026-09-04 원장 격리 수리).
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
 
 def _sha256(path):
     h = hashlib.sha256()
@@ -63,6 +75,16 @@ LIVE_SOCK = os.path.join(LIVE_STATE, "cys.sock")
 # --- 격리(하네스 전용) ---
 HARN_DIR = os.path.join(HOME, ".cys", "state-harness")
 HARN_SOCK = os.path.join(HARN_DIR, "cys.sock")
+# ★하네스 데몬의 **상태 디렉터리**(원장·표식). 소켓만 격리하면 여기가 라이브로 떨어진다 —
+#   2026-09-04 실사고의 정확한 경로다(아래 LIVE_LEDGER_ROOT 주석 참조).
+HARN_STATE = os.path.join(HARN_DIR, "state")
+# ★데몬이 `CYS_STATE_DIR` 미설정 시 원장·표식을 쓰는 실제 루트(`cysd delivery.rs
+#   default_state_root()` = `$HOME/.cys/state`). 아래 LIVE_STATE(`~/.local/state/cys`)는
+#   **소켓 자리**이지 원장 자리가 아니다 — 이 둘이 다르다는 것이 C5 가드의 사각이었다.
+LIVE_LEDGER_ROOT = os.path.join(HOME, ".cys", "state")
+RECORD_DIR = os.path.join(HARN_DIR, "cli_record")
+DAEMON_LOG = os.path.join(HARN_DIR, "daemon.log")
+EVIDENCE = os.path.join(HARN_DIR, "drill_evidence.json")
 RECORD_DIR = os.path.join(HARN_DIR, "cli_record")
 DAEMON_LOG = os.path.join(HARN_DIR, "daemon.log")
 EVIDENCE = os.path.join(HARN_DIR, "drill_evidence.json")
@@ -131,11 +153,52 @@ def guard_isolation():
             die("★C5/P1-10: 하네스가 라이브 상태(%s)/소켓을 타깃 — CYS_PHOENIX_ALLOW_LIVE=1 명시 opt-in "
                 "없으면 LIVE write 거부(격리가 기본)." % ls)
         log("★C5 경고: CYS_PHOENIX_ALLOW_LIVE=1 — 하네스의 라이브 상태 쓰기 허용(명시 opt-in·위험 작업).")
+    # ★원장·표식 축(2026-09-04 실사고 · 위 검사의 사각): 위 두 줄은 **소켓 자리**
+    #   (`~/.local/state/cys`)만 본다. 그런데 데몬이 원장·표식을 쓰는 곳은 `~/.cys/state` 이고,
+    #   `state-harness` 는 그것과 겹치지 않으므로 위 검사는 **언제나 통과**했다 — 그 사이로
+    #   `delivery-base.*` 오염이 지나갔다. 그래서 실제 기록 경로를 직접 잰다.
+    harn_state = os.path.realpath(HARN_STATE)
+    ledger_root = os.path.realpath(LIVE_LEDGER_ROOT)
+    ledger_paths = [os.path.join(harn_state, "delivery-<lane>.jsonl"),
+                    os.path.join(harn_state, "delivery-<lane>.epoch.json")]
+    try:
+        import javis_lane as _lane
+        _prev = os.environ.get("CYS_STATE_DIR")
+        os.environ["CYS_STATE_DIR"] = HARN_STATE
+        try:
+            ledger_paths = [os.path.realpath(_lane.lane_state_path("delivery", HARN_SOCK)),
+                            os.path.realpath(_lane.lane_state_path("delivery_epoch", HARN_SOCK))]
+        finally:
+            if _prev is None:
+                os.environ.pop("CYS_STATE_DIR", None)
+            else:
+                os.environ["CYS_STATE_DIR"] = _prev
+    except Exception as e:      # 레인 모듈 부재·스큐가 가드를 죽이지 않는다(경로 문자열로 강등)
+        log("★C5: lane_state_path 미사용(%s) — 디렉터리 대조로 강등" % e)
+    bad = [p for p in ledger_paths
+           if os.path.realpath(p) == ledger_root
+           or os.path.realpath(p).startswith(ledger_root + os.sep)]
+    if bad or harn_state == ledger_root or harn_state.startswith(ledger_root + os.sep):
+        if not allow_live:
+            die("★C5/원장: 하네스 원장·표식이 **라이브 원장 루트**(%s) 안을 가리킨다 — %r. "
+                "CYS_STATE_DIR 격리 없이 뜨면 본 레인 delivery-base.* 를 덮어쓴다"
+                "(2026-09-04 실사고). CYS_PHOENIX_ALLOW_LIVE=1 없으면 거부." % (ledger_root, bad))
+        log("★C5 경고: 원장 경로가 라이브 루트 안이다(명시 opt-in) — %r" % bad)
+
 
 
 def _daemon_env():
     env = dict(os.environ)
     env["CYS_SOCKET"] = HARN_SOCK       # ← 데몬 bind 경로 오버라이드(실측 확정)
+    # ★CYS_STATE_DIR 필수(2026-09-04 실사고 수리). 소켓만 격리하면 원장·표식은 격리되지 않는다:
+    #   데몬의 레인 판정(`socket_is_base`)은 **basename 만** 보므로 `state-harness/cys.sock` 도
+    #   레인 키가 `base` 이고, `CYS_STATE_DIR` 이 없으면 `$HOME/.cys/state` 로 떨어져
+    #   **본 레인의 `delivery-base.epoch.json` 을 정확히 덮어쓴다**. 그 결과
+    #   `javis_mission.py status` 가 데몬 재기동으로 오탐해 master 임무 게이트가 닫혔다.
+    #   ※ 이 격리는 W-B 의 `socket_is_base` 수리와 **무관하게** 필수다 — 하네스가 잡는 cysd 는
+    #     `PHOENIX_HARNESS_CYSD` 또는 설치본(구 규칙 바이너리)이라 수리가 나와도 구 규칙으로 돈다.
+    os.makedirs(HARN_STATE, exist_ok=True)
+    env["CYS_STATE_DIR"] = HARN_STATE
     # ★W2: 하네스 데몬은 phoenix 로직을 직접 테스트한다 — cysd 콜드부트 auto-restore(W6 --socket 이후 하네스
     #   소켓 대상)가 restore.lease 를 잡으면 드릴의 직접 restore 가 LEASE_HELD 로 경합한다. 기본 비활성화하되
     #   (드릴 결정론화·cysd auto-restore 는 E1 e2e_replacement 가 별도 검증), 호출자가 os.environ 으로 명시

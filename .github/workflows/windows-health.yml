@@ -34,9 +34,19 @@ name: windows-health (H-WIN 실기)
 #     이라 발행 전에 사람이 적색을 본다. '자동 차단'이 필요해지면 release-publish 쪽에
 #     체크 조회를 다는 것이 다음 단계인데, 그건 발행을 막는 힘이라 별도 승인 사안이다.
 #   롤백: 아래 `tags:` 두 줄 삭제 = 종전 동작(파일 1곳·부작용 0).
+#
+# ★fix/** 편입(2026-09-04 · master 판정 ⓐ — ci-branch `96502cc`·windows-build `153b1d1` 과 같은 형식).
+#   위 U-26 이 '태그에서 0회'를 닫았지만 **수리 레인(`fix/0.14.30-*`)에서는 여전히 0회**였다.
+#   Windows 부트스트랩 계약을 실제로 고치는 곳이 지금 그 수리 레인인데, 그 변경의 실기 판정이
+#   태그 시점에야 나오면 되돌리는 비용이 가장 비싼 자리에서 처음 드러난다 — windows-build 가
+#   같은 이유로 편입됐고(`153b1d1`), 첫 실발화가 곧바로 실회귀 1건을 잡았다(인코딩 → `16d2341`).
+#   ⚠ 비용: 위 U-26 의 '일상 push 빈도는 안 늘어난다' 는 이제 성립하지 않는다. `fix/**` push 마다
+#     이 잡이 돈다 — master 가 "C5-1 윈도우 실기 검증이 이 릴리스의 핵심 앵커라 레인 비용보다
+#     관측 공백 제거가 우선"으로 판정했다. 완화는 워커 측 규율이다(논리 단위 2~3개마다 묶어서 push).
+#   롤백: `branches` 에서 `'fix/**'` 한 항목 삭제 = 종전 동작.
 on:
   push:
-    branches: ['feat/**']
+    branches: ['feat/**', 'fix/**']
     tags: ['v*']
   workflow_dispatch: {}
 
@@ -107,22 +117,48 @@ jobs:
           #   실제 체크아웃 바이트를 LF 로 만드는지는 이 레인만이 실측할 수 있다.
           WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
-          python "$R" --only "$WIN_SPECIMENS"
-          python "$R" --only "$WIN_SPECIMENS" --json > win-health.json
-          python - <<'PY'
+          # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
+          #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은
+          #   정작 실패했을 때만 실행되지 않았다 — 진단이 필요 없을 때만 진단이 도는 구조다.
+          #   실측: 8d03bf4 런(33874334807)의 annotation 은 "exit code 1" 한 줄이 전부였다.
+          #   더구나 전 검체를 두 번 돌려 간헐 검체(H-CONC-3 등)는 두 판정이 갈릴 수 있었다.
+          #   ci-branch 가 이미 쓰는 검증된 형식(`--json > 파일 || rc=$?` → 판독 블록)으로 맞춘다.
+          rc=0
+          python "$R" --only "$WIN_SPECIMENS" --json > win-health.json || rc=$?
+          python - "$rc" <<'PY'
           import json, sys
-          d = json.load(open("win-health.json", encoding="utf-8"))
+          rc = int(sys.argv[1])
+          try:
+              d = json.load(open("win-health.json", encoding="utf-8"))
+          except Exception as e:                      # noqa: BLE001 — 파싱 실패도 관측 실패다
+              print("::error::건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. "
+                    "이 상태의 '문제 없음' 은 근거가 아니다(fail-closed)." % e, file=sys.stderr)
+              sys.exit(1)
           s = d["summary"]
           print("[win-health] verdict=%s pass=%s fail=%s skip=%s pending=%s"
                 % (s["verdict"], s["pass"], s["fail"], s["skip"], s["pending"]))
           for r in d["specimens"]:
               print("  %-6s %-12s %s" % (r["status"].upper(), r["id"], r.get("reason", r.get("detail", ""))[:160]))
+          # ★실패 검체는 annotation 채널로 올린다(2026-09-04). 이 저장소의 CI 로그는 토큰 없이
+          #   읽을 수 없어(익명 403) print 는 원인 추적에 쓸 수 없다 — check-runs 의 annotations
+          #   만이 익명으로 읽힌다. ci-branch 가 이미 쓰는 형식을 그대로 따른다(검증됨:
+          #   그 형식 덕에 H-CONC-3 을 로그 없이 특정했다).
+          for r in d["specimens"]:
+              if r["status"] == "fail":
+                  print("::error title=%s::%s"
+                        % (r["id"], (r.get("reason") or r.get("detail") or "")[:600]))
           # 측정 실패는 조용한 통과가 아니다 — 실기 목적이 skip 무더기로 무력화되면 잡을 세운다.
           if s["fail"]:
               sys.exit(1)
           if s["pass"] == 0:
               print("::error::Windows 실기에서 PASS 0건 — 검체가 전부 skip/pending 이면 이 잡은 "
                     "무검증 베이스라인을 재생산한다(fail-closed).", file=sys.stderr)
+              sys.exit(1)
+          # 러너가 0 이 아닌 rc 로 끝났는데 위 갈래가 아무것도 잡지 못했다면, 우리가 모르는
+          # 이유로 죽은 것이다 — 그 상태의 초록은 근거가 아니다(rc 포획의 존재 이유).
+          if rc != 0:
+              print("::error::건강성 러너가 rc=%d 로 끝났는데 실패 검체는 0건이다 — 판정 불가(fail-closed)."
+                    % rc, file=sys.stderr)
               sys.exit(1)
           PY
 

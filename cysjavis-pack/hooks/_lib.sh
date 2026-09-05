@@ -266,10 +266,64 @@ PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 8. 레인 가드 (#16 · 2026-09-04 W-A)
+# ─────────────────────────────────────────────────────────────────────────────
+# 문제: 훅은 settings.json 의 **절대경로**로 등록된다. 부서 레인 pane(CYS_PACK_DIR=
+# ~/.cys/pack-<부서>)에서 사용자 settings 가 본부 팩 훅을 가리키고 있으면, 본부 훅이 레인
+# 안에서 발화해 **다른 팩의 규약**(디렉티브·soul·상태 경로)을 주입한다. 프리루드 2단 폴백이
+# "팩 경로는 레인을 존중한다"고 선언한 것과 정반대 방향의 누수다.
+#
+# ★판별자는 **양쪽 대칭**이다(worker-4 실측 교정 · 이것이 없으면 사용자 오버레이가 죽는다):
+#   ① `$CYS_PACK_DIR/hooks/_lib.sh` 실재  = 레인 쪽이 진짜 팩인가
+#   ② `<훅 자기 루트>/hooks/_lib.sh` 실재 = 훅 쪽이 진짜 팩인가
+#   ③ 정규화(`pwd -P`) 후 두 루트가 상이
+# 셋이 모두 참일 때만 조기 종료한다. ②가 거짓이면 **판정 불능 → 통과**다 —
+# `~/.cys/local/hooks/<이벤트>.d/` 오버레이·테스트 스텁·배선 하네스는 팩이 아닌 트리에서
+# 돌면서 프리루드를 2단(팩 경로)으로 집는 **정당한 경로**이고(계약 ⓔ 실측), 그 디렉터리에는
+# `_lib.sh` 가 없다. 한쪽만 보면 그 전부가 전면 무발동한다(업데이트 불가침 확장점 파괴).
+# 막으려는 것은 '팩 밖 정당 실행'이 아니라 **다른 팩의 훅**이 레인에 끼어드는 경우다.
+#
+# 계약: POSIX sh · `set -u` 안전 · stdout 무출력 · 외부 명령 비의존(파라미터 확장 + cd/pwd
+# 빌트인만 — PATH 가 빈 훅 하네스에서도 오판하지 않는다) · opt-out `CYS_HOOK_LANE_GUARD=0`.
+cys_lane_guard() {
+  [ "${CYS_HOOK_LANE_GUARD:-1}" = "0" ] && return 0
+  [ -n "${CYS_PACK_DIR:-}" ] || return 0
+  [ -f "${CYS_PACK_DIR}/hooks/_lib.sh" ] || return 0        # ① 레인 쪽이 진짜 팩인가
+
+  # 훅 자기 루트: `$0` 의 디렉터리가 `hooks` 이거나 `hooks/<sub>` 일 때만 판정 가능.
+  _cys_lg_d="${0%/*}"
+  [ "$_cys_lg_d" = "${0:-}" ] && _cys_lg_d="."
+  _cys_lg_d="$(cd "$_cys_lg_d" 2>/dev/null && pwd -P)" || _cys_lg_d=""
+  [ -n "$_cys_lg_d" ] || return 0                            # 판정 불능 → 통과
+  _cys_lg_root=""
+  if [ "${_cys_lg_d##*/}" = "hooks" ]; then
+    _cys_lg_root="${_cys_lg_d%/*}"
+  else
+    _cys_lg_p="${_cys_lg_d%/*}"
+    [ "${_cys_lg_p##*/}" = "hooks" ] && _cys_lg_root="${_cys_lg_p%/*}"
+  fi
+  [ -n "$_cys_lg_root" ] || return 0                         # 판정 불능 → 통과
+  [ -f "${_cys_lg_root}/hooks/_lib.sh" ] || return 0         # ② 훅 쪽이 진짜 팩인가(대칭)
+
+  _cys_lg_lane="$(cd "${CYS_PACK_DIR}" 2>/dev/null && pwd -P)" || _cys_lg_lane=""
+  [ -n "$_cys_lg_lane" ] || return 0                         # 판정 불능 → 통과
+  [ "$_cys_lg_root" = "$_cys_lg_lane" ] && return 0          # ③ 같은 팩 → 통과
+
+  # ★고지의 가시성 한계(정직 기록): 훅의 프리루드 규약 문장은 `. "…/_lib.sh" 2>/dev/null` 이라
+  #   **source 명령 전체의 stderr 가 억제**된다 — 이 줄은 프리루드를 직접 로드하는 호출자
+  #   (하네스·수동 진단)에게만 보인다. 훅 경로에서 관측 가능한 계약은 '무발화·exit 0·stdout 0'
+  #   이며 검체 H-LANE-GUARD-1 이 두 사실을 각각 잰다(stderr 억제 자체는 이 변경 범위 밖이다).
+  echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+  exit 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :
 cys_fix_locale >/dev/null 2>&1 || :
+# ★레인 가드는 마지막이다 — 통과 판정이 나야 그 아래 훅 본체가 돈다(조기 종료는 exit 0).
+cys_lane_guard
 
 # ★반드시 0으로 끝난다(계약 ⓓ) — 비0이면 호출측 loud-skip이 오발동한다.
 :

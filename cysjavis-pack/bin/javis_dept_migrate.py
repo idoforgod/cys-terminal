@@ -26,10 +26,12 @@ exit: 0=성공(dry/fix) / 2=오류 존재(메인 팩에도 소스 부재 등).
 """
 import argparse
 import glob
+import contextlib
 import json
 import os
 import shutil
 import sys
+import tempfile
 
 HOME = os.path.expanduser("~")
 CYS_DIR = os.path.join(HOME, ".cys")
@@ -45,7 +47,12 @@ BOOTSTRAP_REL = os.path.join("bin", "javis_bootstrap.py")
 #   구 목록(훅+부트스트랩 2개)은 그 의존을 몰랐다 — 레거시 부서 팩이 정확히 그 상태로 남는다.
 PRELUDE_REL = os.path.join("hooks", "_lib.sh")
 DETECT_REL = os.path.join("bin", "javis_detect.py")
-REQUIRED_PACK_FILES = [HOOK_REL, PRELUDE_REL, BOOTSTRAP_REL, DETECT_REL]
+#   ★부트 v2 A2(2026-09-04): 훅이 **런처 + 본체** 2파일로 갈렸다. 등록되는 것은 런처
+#   (`role-bootstrap.sh`)뿐이지만 런처는 본체가 없으면 아무 일도 못 한다 — 본체가 빠진 부서
+#   레인에서는 매 선언이 '부트 본체 부재' 고지로 끝난다(위 구 목록이 몰랐던 이음매와 정확히
+#   같은 형상). 그래서 본체를 복제 목록에 **명시 등재**한다.
+LEGACY_REL = os.path.join("hooks", "role-bootstrap-legacy.sh")
+REQUIRED_PACK_FILES = [HOOK_REL, LEGACY_REL, PRELUDE_REL, BOOTSTRAP_REL, DETECT_REL]
 DIRECTIVE_REL = os.path.join("directives", "MASTER_DIRECTIVE.md")
 STALE_DOCTRINE_MARK = "[부서장 스코프 절대규칙]"   # 폐기 교리 heading(2026-07-11 구본)
 CURRENT_DOCTRINE_MARK = "④-c"                      # 현행 교리 분기(D1 옵션 1')
@@ -100,49 +107,110 @@ def _event_registered(settings_path, cmd):
     return False
 
 
+# ★번들 파이썬 경로 가드 — 형제 모듈 import 보장(선례 `javis_preflight.py:33-35`).
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# ★공용 락 소비(2026-09-04 P0 · master 지시 ②). 이 모듈은 settings.json 5 writer 중 하나이고
+#   `2559d4d` 로 고정 `.tmp` 는 이미 걷어냈지만 **직렬화가 없다** — 원자 발행은 파손을 막을 뿐
+#   lost update 는 막지 못한다(실측 6/6 시행 유실). preflight `_settings_rmw`·guard_register 와
+#   **같은 락 파일**(`<settings>.cys-lock`)을 잡아 단일 소유자를 경유시킨다.
+try:
+    import javis_lock as _lock
+except Exception:
+    _lock = None
+
+
+@contextlib.contextmanager
+def _file_lock(path, what="settings"):
+    """파일별 공용 락(`<path>.cys-lock`) — 획득 실패는 **열화**이지 중단이 아니다(백필을 포기하면
+    부서 훅이 영영 안 붙는다 · preflight 와 동일 판단).
+    ★대상이 settings.json 하나가 아니다(2026-09-05 · master 승인): `_migrate_directive` 도 같은
+      규약으로 MASTER_DIRECTIVE.md 를 교체하므로 락 소유자를 **파일별**로 일반화한다. 락 파일명
+      규약(`<대상>.cys-lock`)은 preflight `_settings_rmw`·guard_register 와 동일하다."""
+    lk = None
+    if _lock is not None:
+        try:
+            lk = _lock.FileLock(path + ".cys-lock", owner="dept-migrate",
+                                blocking=True, timeout=10.0, soft=True)
+            lk.acquire()
+            if lk.status != _lock.ACQUIRED:
+                sys.stderr.write("[dept-migrate] %s 락 미획득(%s) — 직렬화 없이 진행: %s\n"
+                                 % (what, lk.status, path))
+        except Exception as e:
+            sys.stderr.write("[dept-migrate] %s 락 사용 불가(%s) — 직렬화 없이 진행\n" % (what, e))
+            lk = None
+    try:
+        yield
+    finally:
+        if lk is not None:
+            try:
+                lk.release()
+            except Exception:
+                pass
+
+
 def _register_hook(settings_path, cmd, do_fix):
     """returns (action, detail). action ∈ ok|would|fixed|skip|error."""
-    if os.path.islink(settings_path):
-        return "skip", "symlink 거부: %s" % settings_path
-    if not os.path.isfile(settings_path):
-        return "skip", "settings.json 부재 — 부트 시 preflight가 생성(백필 대상 아님)"
-    if _event_registered(settings_path, cmd):
-        return "ok", "이미 등록됨(멱등)"
-    if not do_fix:
-        return "would", "UserPromptSubmit←role-bootstrap.sh 등록 예정(--fix)"
-    try:
-        with open(settings_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError) as e:
-        return "error", "기존 settings.json 파싱 실패 — 거부: %s" % e
-    if not isinstance(data, dict):
-        return "error", "settings.json 루트가 객체 아님 — 거부"
-    backup = settings_path + ".bak-migrate"
-    if not os.path.exists(backup):
-        shutil.copy2(settings_path, backup)
-    arr = data.setdefault("hooks", {}).setdefault(EVENT, [])
-    # 구/파손 우리-훅 엔트리 prune 후 재등록(preflight _prune_stale_hook_entries 동형)
-    kept, have = [], False
-    for entry in arr:
-        if not isinstance(entry, dict):
-            kept.append(entry)
-            continue
-        cmds = [h.get("command", "") for h in entry.get("hooks", []) if isinstance(h, dict)]
-        ours = any(SCRIPT_NAME in c and "hooks" in c for c in cmds)
-        if not ours:
-            kept.append(entry)
-        elif cmd in cmds:
-            kept.append(entry)
-            have = True
-        # else: 우리 훅이나 desired 불일치(구·파손) → 제거(교체 유도)
-    if not have:
-        kept.append({"hooks": [{"type": "command", "command": cmd}]})
-    arr[:] = kept
-    tmp = settings_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False, indent=2))
-    os.replace(tmp, settings_path)
-    return "fixed", "UserPromptSubmit←role-bootstrap.sh 등록(백업 .bak-migrate)"
+    with _file_lock(settings_path):   # ★읽기→쓰기 전 구간 직렬화(lost update 차단)
+        if os.path.islink(settings_path):
+            return "skip", "symlink 거부: %s" % settings_path
+        if not os.path.isfile(settings_path):
+            return "skip", "settings.json 부재 — 부트 시 preflight가 생성(백필 대상 아님)"
+        if _event_registered(settings_path, cmd):
+            return "ok", "이미 등록됨(멱등)"
+        if not do_fix:
+            return "would", "UserPromptSubmit←role-bootstrap.sh 등록 예정(--fix)"
+        try:
+            with open(settings_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            return "error", "기존 settings.json 파싱 실패 — 거부: %s" % e
+        if not isinstance(data, dict):
+            return "error", "settings.json 루트가 객체 아님 — 거부"
+        backup = settings_path + ".bak-migrate"
+        if not os.path.exists(backup):
+            shutil.copy2(settings_path, backup)
+        arr = data.setdefault("hooks", {}).setdefault(EVENT, [])
+        # 구/파손 우리-훅 엔트리 prune 후 재등록(preflight _prune_stale_hook_entries 동형)
+        kept, have = [], False
+        for entry in arr:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            cmds = [h.get("command", "") for h in entry.get("hooks", []) if isinstance(h, dict)]
+            ours = any(SCRIPT_NAME in c and "hooks" in c for c in cmds)
+            if not ours:
+                kept.append(entry)
+            elif cmd in cmds:
+                kept.append(entry)
+                have = True
+            # else: 우리 훅이나 desired 불일치(구·파손) → 제거(교체 유도)
+        if not have:
+            kept.append({"hooks": [{"type": "command", "command": cmd}]})
+        arr[:] = kept
+        # ★고정 `.tmp` 금지(2026-09-04 실측 재현). 종전 이 자리는 `settings_path + ".tmp"` 라
+        #   **모든 프로세스가 같은 스테이징 파일**을 열었다. `os.replace` 는 원자적이지만 그것은
+        #   **발행**만 원자적이라는 뜻이고, 스테이징을 공유하면 그 보장이 통째로 사라진다:
+        #     P1 이 큰 본문을 tmp 에 쓰는 도중 P2 가 **같은 tmp 를 truncate** 하고 짧게 써서 replace
+        #     하면, P1 의 fd 는 이미 발행된 파일을 계속 가리켜 자기 오프셋에 이어 쓴다 →
+        #     최종 settings.json = "완결 JSON + NUL 패딩 + 잔여 꼬리" = **JSONDecodeError: Extra data**.
+        #   실측 재현(6 writer 자연 부하로는 창이 좁아 안 나고, 큰 본문·청크 쓰기로 창을 넓히면 난다):
+        #     `{"theme":"dark","who":"SMALL"}` + NUL + `AAA…"}`  → Extra data: line 1 column 34.
+        #   이것이 H-CONC-3 이 preflight 에서 걷어낸 A8 지배 실패 모드(교차 파손)와 **같은 형상**이며,
+        #   그 검체의 구조 핀은 preflight 만 훑어 이 파일의 잔존 인스턴스를 못 봤다.
+        d = os.path.dirname(os.path.abspath(settings_path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-deptmig-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            os.replace(tmp, settings_path)
+        except BaseException:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        return "fixed", "UserPromptSubmit←role-bootstrap.sh 등록(백업 .bak-migrate)"
 
 
 def _ensure_pack_files(pack, do_fix):
@@ -188,8 +256,18 @@ def _strip_stale_block(content):
 
 
 def _migrate_directive(pack, do_fix):
-    """③ 스테일 교리 백필. returns (action, detail). action ∈ ok|would|fixed|skip|error."""
+    """③ 스테일 교리 백필. returns (action, detail). action ∈ ok|would|fixed|skip|error.
+
+    ★읽기→교체 전 구간을 파일별 공용 락으로 직렬화한다(2026-09-05 · master 승인). 종전엔 락이
+      없었고 스테이징도 고정 `.tmp` 여서 `_register_hook` 이 settings 에서 걷어낸 것과 **같은
+      계급**(공유 스테이징 = 교차 파손)이 이 경로에 남아 있었다."""
     path = os.path.join(pack, DIRECTIVE_REL)
+    with _file_lock(path, "directive"):
+        return _migrate_directive_locked(path, do_fix)
+
+
+def _migrate_directive_locked(path, do_fix):
+    """락을 잡은 채 수행하는 본체(락 획득은 `_migrate_directive` 가 소유한다)."""
     if os.path.islink(path):
         return "skip", "symlink 거부: %s" % path
     if not os.path.isfile(path):
@@ -217,11 +295,24 @@ def _migrate_directive(pack, do_fix):
     backup = path + ".bak-migrate"
     if not os.path.exists(backup):
         shutil.copy2(path, backup)
+    # ★고정 `.tmp` 금지(2026-09-05 · master 승인 · `2559d4d` 가 settings 에서 걷어낸 그 계급).
+    #   종전 이 자리는 `path + ".tmp"` 라 **모든 프로세스가 같은 스테이징 파일**을 열었다:
+    #   P1 이 큰 본문을 쓰는 도중 P2 가 같은 tmp 를 truncate 하고 짧게 써서 replace 하면 P1 의 fd 는
+    #   이미 발행된 파일을 계속 가리켜 자기 오프셋에 이어 쓴다 → 교리 문서가 "짧은 본문 + 잔여 꼬리".
+    #   `os.replace` 는 **발행**만 원자적이라는 뜻이고, 스테이징을 공유하면 그 보장이 사라진다.
+    d = os.path.dirname(os.path.abspath(path)) or "."
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(src)
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-deptdir-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(src)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError as e:
         return "error", "교체 실패: %s" % e
     return "fixed", "스테일 §3 교체 — 메인 팩 최신 본(④-c 포함) 동기화(백업 .bak-migrate)%s" % drift

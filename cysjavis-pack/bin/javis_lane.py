@@ -72,7 +72,22 @@ def socket_is_base(sock):
     for part in norm.split("/"):
         if part.startswith("cys-dept-"):
             return False
-    return os.path.basename(norm) in ("cys", "cys.sock")
+    # ★P0 수리(2026-09-04 실사고 · Rust `src/lane.rs::socket_is_base` 와 **같은 규칙**):
+    #   종전엔 **basename 만** 봤다 — 디렉터리를 무시했으므로 `~/.cys/state-harness/cys.sock` ·
+    #   `/var/folders/…/l1-new-*/cys.sock` 처럼 **관례적 파일명을 유지한 격리 소켓이 전부 base 로
+    #   접혔고**, 그 데몬들이 본 레인 `delivery-base.jsonl`·`.epoch.json` 에 썼다.
+    #   역설이 핵심이었다: `/tmp/whatever.sock` 처럼 **파일명이 다르면** 올바로 격리됐다 —
+    #   즉 **가장 흔한 격리 방식**(관례 파일명 유지 + 디렉터리 분리)만 조용히 실패했다.
+    #   수리: 기본 소켓은 `…/state/cys/cys.sock` 이므로 **부모 디렉터리 이름까지** 본다.
+    #   ★기계 독립 유지 — 실제 홈 경로와 비교하지 않고 **경로 모양**만 본다(그래야 Rust 와
+    #     공유하는 `fixtures/lane-key-corpus.json` 이 기계마다 같은 답을 낸다).
+    #   ★알려진 한계(숨기지 않는다): 부모 **이름**만 보므로 기본 트리를 미러한
+    #     `<임의>/cys/cys.sock`(예 `/tmp/cys/cys.sock`)은 여전히 base 로 접힌다. 그런 형태로
+    #     격리할 때는 `CYS_STATE_DIR` 를 함께 지정해야 안전하다(코퍼스에 known_limitation 으로 고정).
+    parts = norm.split("/")
+    if parts[-1] not in ("cys", "cys.sock"):
+        return False
+    return len(parts) >= 2 and parts[-2] == "cys"
 
 
 def sanitize_sock_key(sock):
@@ -183,6 +198,25 @@ def _self_test():
     assert socket_is_base("\\\\.\\pipe\\cys-dept-foo") is False, "win dept pipe"
     assert socket_is_base("/tmp/whatever.sock") is False, "커스텀 소켓은 비-base(과관용 금지)"
     assert socket_is_base("/Users/x/.local/state/cys/cys") is True, "basename cys(무확장)도 base"
+    # ★2언어 공유 코퍼스(P0 레인 격리 · 2026-09-04). Rust `cysd::delivery` 테스트가 **같은 파일**을
+    #   읽는다 — 한쪽만 고쳐지면 여기서 적색이 난다. 위 인라인 단언은 그대로 두고(조건 완화 0)
+    #   코퍼스를 **추가 축**으로 소비한다.
+    #   ★파일이 없으면 SKIP 이 아니라 **실패**다: 코퍼스는 파리티의 정본이라 조용히 빠지면
+    #     "두 언어가 같다"는 주장이 근거를 잃는다(배포 팩에도 fixtures 는 함께 실린다).
+    import json as _json          # 자기검증 전용 — 부트 상주 모듈의 로드 비용을 늘리지 않는다
+    _corpus = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "tests", "fixtures", "lane-key-corpus.json")
+    with open(_corpus, encoding="utf-8") as _f:
+        _cases = _json.load(_f)["cases"]
+    assert len(_cases) >= 15, "코퍼스가 비었거나 잘렸다(%d건) — 무측정 통과 방지" % len(_cases)
+    for _c in _cases:
+        _got = socket_is_base(_c["sock"])
+        assert _got is _c["is_base"], (
+            "코퍼스 불일치: sock=%r 기대=%s 실제=%s — %s" % (_c["sock"], _c["is_base"], _got, _c["why"]))
+        _lk = lane_key(_c["sock"])
+        assert (_lk == "base") is _c["is_base"], (
+            "lane_key 가 base 판정과 갈렸다: sock=%r base=%s lane_key=%r" % (_c["sock"], _c["is_base"], _lk))
+    n += len(_cases) * 2
     assert socket_is_base("/s/cys-dept-/cys.sock") is False, "빈 부서명이 base로 오판"
     n += 9
     # ⓑ 레인 키 — base 정규화·부서 유일·긴 경로 해시

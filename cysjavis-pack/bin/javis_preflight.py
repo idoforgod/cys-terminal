@@ -222,12 +222,15 @@ HARNESS_PIN = "98a36f4b9aee761f208aa559c2e1f7c755f7c9a6"
 HARNESS_KEY_FILES = ("emit_orchestrator.py", "validate_harness.py", "warrant.py",
                      "genome/soul.md")
 
-# NotebookLM SOT 도구(nlm) 핀 — 2026-06-12 감사 커밋(v0.7.3).
-# PyPI에 0.7.3+가 배포되면 "notebooklm-mcp-cli>=0.7.3" 핀으로 전환하라.
-# (PyPI 0.7.2 이하는 질의 짧은답 누락·auth 오판·silent failure 미수정 — 핀 하향 금지)
-NLM_MIN_VERSION = (0, 7, 3)
-NLM_PIN = ("notebooklm-mcp-cli @ git+https://github.com/jacob-bd/notebooklm-mcp-cli"
-           "@6d41c75e21dae89d7bf6f43a71e3095239a28281")
+# NotebookLM SOT 도구(nlm) 핀 — ★2026-09-03 PyPI 정식판으로 전환(PREP #12).
+# 종전 핀은 git 커밋 6d41c75(v0.7.3)였다. 그 리비전은 **구 호스트 전용**이라 `--fix` 가 그것을
+# 재설치하면 로그인이 되지 않는 버전이 깔린다(CSO 실측: 0.7.3 `nlm login` exit 1). 즉 자동 수리
+# 경로가 도구를 고장 난 상태로 되돌리는 형상이었다 — 핀은 '고정'이지 '옛것 유지'가 아니다.
+# 지금은 PyPI 에 정식 배포본이 있다(실측 2026-09-03: latest 0.10.0 · 총 128 릴리스 ·
+# `curl -s https://pypi.org/pypi/notebooklm-mcp-cli/json`). 이 머신 설치본도 `nlm version 0.10.0`.
+# 최소 버전은 0.9.3 — 그 이하는 구 호스트 인증 경로가 남아 있어 login 이 흔들린다(하향 금지).
+NLM_MIN_VERSION = (0, 9, 3)
+NLM_PIN = "notebooklm-mcp-cli==0.10.0"
 
 TODO_FILES = ["MASTER_TODO.md", "CSO_TODO.md", "WORKER_TODO.md", "REVIEWER_TODO.md"]
 
@@ -341,6 +344,34 @@ SELFCORR_HOOKS = [
     # 영속 경로 안내(additionalContext WARN — BLOCK 아님·자기발화 봉쇄 금지 경계 준수).
     ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
 ]
+
+# ★훅 **본체** — 실재 전용(등록 대상 아님 · 부트 v2 A2 분할 2026-09-04).
+#   `role-bootstrap.sh` 는 자기완결 **런처**이고 실제 부트 본체는 `role-bootstrap-legacy.sh` 다.
+#   본체가 없으면 런처는 고지 1줄을 내고 `exit 0` 한다 — 즉 **훅은 정상 종료하는데 부트만 안
+#   난다**. 종전에는 어떤 preflight 축도 본체 실재를 재지 않아 이 상태가 **무관측**이었다
+#   (부서 팩 복제 목록 결손·부분 배포에서 확정적으로 재현되는 갈래다).
+#   ★`SELFCORR_HOOKS` 에 넣으면 안 되는 이유: 그 목록은 C28 이 settings.json 에 **등록**하는
+#     집합이다. 본체를 등록하면 같은 이벤트에 훅이 둘(런처+본체) 달려 선언 1건이 두 번 처리되고,
+#     본체는 런처가 넘겨주던 `$1` 없이 직접 불려 stdin 계약으로 되돌아간다. 그래서 **실재만**
+#     요구하는 목록을 따로 둔다.
+#   티어: owner 가 각성 훅(`AWAKENING_SCRIPTS`)이면 **FAIL**(C08·각성 훅 미등록과 대칭) —
+#   본체 부재는 등록 결손과 **같은 결과**(부트 발화 0)를 낳으므로 보고 크기도 같아야 한다.
+HOOK_BODY_FILES = [
+    (os.path.join("hooks", "role-bootstrap-legacy.sh"), "role-bootstrap.sh"),
+]
+
+# ★npm_config_prefix **번들 오염** 처방 문안 — 정본은 Rust `npm_prefix_bundle_warning`
+#   (src/lib.rs)이고, 그 함수의 독스트링이 "pane 첫 줄 고지와 **preflight 가 같은 문자열**을
+#   쓴다 · 문안을 두 벌 두면 한쪽만 고쳐져 사용자가 서로 다른 처방을 받는다"를 계약으로 못박는다.
+#   python 에서 Rust 를 호출할 수단이 없으므로 문장을 **옮겨 두되**, 드리프트는 검체가 잡는다
+#   (`test_preflight_npm_prefix.py` ⑥ — Rust 원본이 이 레인에 들어오면 핵심 문장 대조가 켜진다).
+#   ★값을 덮지 않는다는 것이 계약이다(사용자 설정) — 그래서 이 축은 WARN 이고 처방도 '권함'이다.
+NPM_PREFIX_BUNDLE_WARNING = (
+    "npm_config_prefix 가 설치본 안을 가리킵니다 — npm 전역 설치가 설치본을 변경하면 "
+    "코드서명·봉인이 깨져 다음 실행이 차단될 수 있습니다(그래도 값은 덮지 않습니다 — "
+    "사용자 설정입니다). 설치본 밖(예: $HOME/.local · Windows 는 %LOCALAPPDATA%\\cys-npm)으로 "
+    "옮기시길 권합니다."
+)
 
 # ★소망상태 매니페스트의 파이썬 측 — **각성 티어**(awakening tier · A9 · W3).
 #   "없으면 부트 발화 자체가 사라지는" 훅 집합이다: SessionStart(=/clear 후 지침 재주입) +
@@ -3741,7 +3772,9 @@ class Preflight:
         cid = "C28.self-correction"
         if self.skipped(cid):
             return
-        fixed, warns = [], []
+        # ★`fails` 를 여기서 만든다 — (a) 실재 검사에서도 **각성 티어 FAIL** 이 나올 수 있다
+        #   (훅 본체 부재). 종전엔 (b) 등록 루프 직전에 만들어 (a)는 WARN 밖에 못 냈다.
+        fixed, warns, fails = [], [], []
         # (a) hook 스크립트 4종 + javis_reflect.py 존재·실행권한
         rels = [os.path.join("hooks", s) for s, _ in SELFCORR_HOOKS]
         rels.append(os.path.join("bin", "javis_reflect.py"))
@@ -3758,17 +3791,52 @@ class Preflight:
                 if not mode & stat.S_IXUSR and self.fix:
                     os.chmod(p, mode | 0o755)
                     fixed.append("%s 실행권한" % os.path.basename(p))
+        # (a-2) ★훅 **본체** 실재(부트 v2 A2 · 등록 대상 아님 — 위 HOOK_BODY_FILES 주석 참조)
+        for _rel, _owner in HOOK_BODY_FILES:
+            _p = os.path.join(pack_dir(), _rel)
+            if not os.path.isfile(_p):
+                if self.fix and self.repair_via_init_pack() and os.path.isfile(_p):
+                    pass
+                else:
+                    (fails if _owner in AWAKENING_SCRIPTS else warns).append(
+                        "%s 부재 — 훅 본체가 없으면 `%s`(런처)는 고지 1줄만 내고 **부트를 발화하지 "
+                        "않는다**(훅 자체는 exit 0 이라 무관측이었다). init-pack 재실행·pack-update "
+                        "로 복구하라" % (_rel, _owner))
+                    continue
+            if os.name == "posix":
+                _mode = os.stat(_p).st_mode
+                if not _mode & stat.S_IXUSR and self.fix:
+                    os.chmod(_p, _mode | 0o755)
+                    fixed.append("%s 실행권한" % os.path.basename(_p))
+
         # (b) 이벤트별 등록 (멱등 — 구 .config 경로는 미인정이라 패키지 경로로 신규 등록)
         # ★G1 sentinel: 격리(부서/임시) 팩은 글로벌 폴백 없이 등록 0 — 폴백은 resolve 가 소유한다.
         targets, forbidden = resolve_registration_targets()
         if forbidden and not targets:
-            self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
+            # ★"등록 대상이 없다"는 사실이 **파일 실재 사실을 지우지 않는다** — 두 축은 별개다.
+            #   종전엔 여기서 즉시 SKIP 해 (a)·(a-2)가 이미 찾은 결손(훅 스크립트·reflect 엔진·
+            #   훅 **본체** 부재)이 통째로 버려졌다. 격리 팩·부서 팩처럼 등록이 금지된 컨텍스트가
+            #   바로 팩 복제 결손이 실제로 발생하는 곳인데, 거기서 preflight 가 SKIP(초록에 가까움)
+            #   이었다 — 관측이 가장 필요한 자리에서 관측이 꺼져 있었다.
+            _note = "등록 대상 없음 — %s" % forbidden
+            _base = "자기교정·영속성 hook 파일 실재(등록은 이 컨텍스트에서 금지)"
+            if fails:
+                self.add(cid, FAIL,
+                         _base + " · ★각성 훅 본체/스크립트 결손(부트 발화 불가 — C08 대칭 FAIL): "
+                         + " | ".join(fails[:6])
+                         + (" · 기타: " + " | ".join(warns[:3]) if warns else "")
+                         + " · " + _note)
+            elif warns:
+                self.add(cid, WARN, _base + " · " + " | ".join(warns[:6]) + " · " + _note)
+            elif fixed:
+                self.add(cid, FIXED, _base + " · " + "; ".join(fixed[:6]) + " · " + _note)
+            else:
+                self.add(cid, SKIP, _note)
             return
         # ★A21(W3) 훅별 중요도 티어: **각성 훅**(role-bootstrap→UserPromptSubmit) 미등록은
         #   C08(session-start)과 **대칭으로 FAIL** 이다. 종전엔 C28 전체가 WARN 이라, 부트 발화의
         #   유일한 트리거가 빠져 있어도 preflight 가 초록에 가까웠다(C08=FAIL vs C28=WARN 비대칭 —
         #   재감사 A21 확증). 나머지 자기교정 훅(inject·save·reflect·nudge·pack-guard)은 종전대로 WARN.
-        fails = []
         for t in targets:
             for script_name, events in SELFCORR_HOOKS:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
@@ -3814,7 +3882,8 @@ class Preflight:
             detail += " · " + shown
         if fails:
             self.add(cid, FAIL,
-                     detail + " · ★각성 훅 미등록(부트 발화 불가 — C08 대칭 FAIL): "
+                     detail + " · ★각성 훅 결손(미등록 또는 **본체 부재** — 부트 발화 불가 · "
+                     "C08 대칭 FAIL): "
                      + " | ".join(fails[:6])
                      + (" · 기타: " + " | ".join(warns[:3]) if warns else ""))
         elif warns:
@@ -5376,6 +5445,50 @@ class Preflight:
         self.add(cid, PASS, "%s self-test OK (명명 대조·진위 게이트·쿨다운/차단기·seq/로테이션·"
                             "커서·close 시퀀스)" % p)
 
+    # ── C81 npm_config_prefix 번들 오염 — **데몬 판정의 소비자**(부트 v2 A6 · W-B #2 협업) ──
+    #
+    # ★이 검사에는 술어가 없다. 있는 것은 **판독과 문안**뿐이다. 판정 주체는 데몬이고
+    #   (`cys status --json` → `result.daemon.npm_prefix_polluted` · bool · 항상 존재 ·
+    #   호출마다 재평가), preflight 는 그 bool 을 소비만 한다. 같은 술어를 python 으로 다시
+    #   구현하면 경로 정규화·Windows 대소문자·형제 접두(`cys.app-old`) 같은 함정이 **두 벌**이
+    #   되고, 두 판정이 갈리는 순간 사용자는 pane 고지와 preflight 에서 **서로 다른 처방**을
+    #   받는다 — 정본 문안 함수가 독스트링으로 금지한 바로 그 상태다.
+    # ★티어 WARN: 데몬은 이 값을 **덮지 않는다**(사용자 설정이다). 부트를 막을 사안이 아니다.
+    # ★미측정 규약(이 파일의 계급 구분 그대로): 키가 없으면 SKIP 이다. 키 부재를 '깨끗함'으로
+    #   접으면 구 데몬 전 기계에서 이 축이 **거짓 초록**이 되고, FAIL 로 접으면 부트 v2 미배선
+    #   스큐가 부트를 막는다. 재지 못한 것은 결손도 통과도 아니다.
+    def c81_npm_prefix_polluted(self):
+        cid = "C81.npm-prefix-polluted"
+        if self.skipped(cid):
+            return
+        cys = shutil.which("cys")
+        if not cys:
+            self.add(cid, SKIP, "PATH 에 cys 없음 — 데몬 판정 조회 불가(C11 소관)")
+            return
+        try:
+            r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                               text=True, timeout=15, env=_utf8_env())
+        except Exception as e:  # noqa: BLE001
+            self.add(cid, SKIP, "cys status --json 실행 불가(%s) — 미측정" % e)
+            return
+        if r.returncode != 0:
+            self.add(cid, SKIP, "cys status --json rc=%d — 미측정(데몬 미가동 가능)" % r.returncode)
+            return
+        try:
+            payload = json.loads(r.stdout or "{}")
+        except Exception:  # noqa: BLE001
+            self.add(cid, SKIP, "cys status --json 판독 불가(JSON 아님) — 미측정")
+            return
+        daemon = (payload.get("result") or {}).get("daemon") or {}
+        if "npm_prefix_polluted" not in daemon:
+            self.add(cid, SKIP, "daemon.npm_prefix_polluted 키 부재 — 구 데몬·부트 v2 미배선(미측정). "
+                                "키 부재를 '깨끗함'으로 접지 않는다")
+            return
+        if daemon.get("npm_prefix_polluted") is True:
+            self.add(cid, WARN, NPM_PREFIX_BUNDLE_WARNING)
+        else:
+            self.add(cid, PASS, "npm_config_prefix 번들 오염 없음(데몬 판정)")
+
     # ── C79 cycle-verifier heartbeat (R6 W0-5) — 전 등급 WARN 티어(READY 미차단) ──
     # ★FAIL 금지 근거: 검증자 pane 은 전자동 사이클 **live** 단계의 전제(autopilot 게이트6)
     #   일 뿐, S0 shadow 단계 전에는 미필수다 — 부트 비치명. 부재·노화·수리 실패 전부
@@ -5536,6 +5649,9 @@ class Preflight:
             self.c78_radio,
             # C79(R6 W0-5) — cycle-verifier heartbeat 신선도. WARN-only(S0 shadow 전 미필수).
             self.c79_cycle_verifier_heartbeat,
+            # C81(부트 v2 A6 · W-B #2 협업) — 데몬이 판정한 npm_config_prefix 번들 오염 **소비**.
+            #   WARN-only(값을 덮지 않는 것이 계약 — 부트를 막지 않는다).
+            self.c81_npm_prefix_polluted,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,

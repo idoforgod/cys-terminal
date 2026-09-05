@@ -108,6 +108,41 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
     return sorted(dirs)
 
 
+# ★팩 경로 env 키 목록·순서 — 정본은 javis_preflight.PACK_DIR_ENV_KEYS(A11 · src/pack.rs 미러)이고
+#   여기는 같은 목록·같은 순서의 **미러**다(먼저 발견되는 비어있지 않은 값이 이긴다). 이 스크립트는
+#   형제 모듈을 import 하지 않는다 — 데몬 스케줄 잡이 팩 밖 cwd 에서 단독 실행하는 파일이라 import
+#   실패가 곧 세대 누락이다(그래서 사본이 아니라 미러이며, 정본이 바뀌면 이 줄도 함께 고친다).
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
+def project_round_dir(env=None, cwd=None):
+    """복원 SOT(SESSION_STATE.md · *_TODO.md)가 사는 round 디렉터리 해소 — 3단 폴백.
+
+    ★PREP #3(2026-09-03 · phoenix 세대 스냅샷 누락 3건 재발 · 연속 5세대+): phoenix-snapshot-6h 잡은
+      데몬 스케줄러가 **cwd `/` · JAVIS_ROOT 미설정**으로 이 스크립트를 부른다. 종전 산식
+      `os.environ.get("JAVIS_ROOT") or os.getcwd()` + "_round" 는 그 환경에서 `/_round` 가 되어
+      SESSION_STATE.md·노드 TODO 가 manifest 에서 매 세대 빠졌다(실측: 파일 50 · 누락 3건/세대).
+      데몬 잡이 반드시 갖는 env 는 팩 경로(CYS_PACK_DIR)이고, 부트 이후 SESSION_STATE/todo 의 실체는
+      `<pack>/round/` 에 산다(`cys todo-path` 실측 `~/.cys/pack/round/WORKER_2_TODO.md`).
+      ① JAVIS_ROOT 설정 → `<JAVIS_ROOT>/_round`  (종전 1순위 — 프로젝트 레인 거동 불변)
+      ② 팩 env 키 중 **첫 비어있지 않은 값**의 `<pack>/round` 가 디렉터리로 실재 → 그것
+         (키 순서·'첫 값이 이긴다' 계약은 PACK_DIR_ENV_KEYS 정본과 동일 — 뒤 키를 더 보지 않는다)
+      ③ 그 밖 → `<cwd>/_round`  (종전 폴백 그대로 — 사람이 프로젝트 루트에서 손으로 부르는 경우)
+    env/cwd 주입은 self-test·bin/tests/test_state_snapshot_root.py 밀폐용(기본=실환경)."""
+    env = os.environ if env is None else env
+    root = env.get("JAVIS_ROOT")
+    if root:
+        return os.path.join(root, "_round")
+    for key in PACK_DIR_ENV_KEYS:
+        pack = env.get(key)
+        if pack:
+            cand = os.path.join(pack, "round")
+            if os.path.isdir(cand):
+                return cand
+            break
+    return os.path.join(cwd or os.getcwd(), "_round")
+
+
 def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None):
     """세대 보관 소스를 동적 산출한다(정적 목록 대체). 메인 선언상태 + 루트 레지스트리 +
     ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0).
@@ -131,7 +166,9 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     #   SESSION_STATE.md 는 재부팅 복원의 단일 진실인데 세대 보관 대상에서 빠져 있었다.
     #   개인경로 하드코딩 금지(pack scan gate): 프로젝트는 $JAVIS_ROOT(env 또는 CWD),
     #   장기기억은 HOME glob 파생만(javis_wakeup.py 등과 동일 관례).
-    proj_round = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round")
+    # ★PREP #3: 해소는 project_round_dir() 한 곳 — 데몬 잡(cwd `/`·JAVIS_ROOT 없음)에서 `/_round`
+    #   로 떨어져 5세대+ 누락되던 경로를 `<pack>/round` 폴백으로 닫는다(사유·순서는 그 docstring).
+    proj_round = project_round_dir()
     srcs.append(os.path.join(proj_round, "SESSION_STATE.md"))
     srcs.extend(sorted(_glob.glob(os.path.join(proj_round, "*_TODO.md"))))
     srcs.extend(sorted(_glob.glob(os.path.join(

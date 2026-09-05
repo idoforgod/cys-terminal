@@ -171,7 +171,12 @@ def _spy_cmd_check():
     # 실측 양성 핀(화이트리스트): cmd_check 의 cys 호출은 'status'(관제 스냅샷 · cys_status)와
     # 'agent-detect'(어댑터 감지 단일 오라클 · javis_orchestra.py:225) 둘뿐이어야 한다.
     # observe 분류와 *별개 층위*라 셋째 verb 는 observe 로 분류되더라도 여기서 RED 다.
-    _EXPECTED_CHECK_VERBS = frozenset({"status", "agent-detect"})
+    #   ★`list` 추가(2026-09-04 부트 v2 W-A · R1 codex #1): 역할 **주소 레지스트리** 판정이
+    #     `cys list`(surface.list RPC)를 소비한다. `cys status`(프로세스 표 스냅샷)와 **다른
+    #     자료원**이어야 주소성 게이트가 공허해지지 않기 때문이다 — 같은 집합을 두 번 보면
+    #     불일치가 구조적으로 발생할 수 없다. `list` 는 순수 관찰 verb 라 이 화이트리스트의
+    #     목적(관찰 단계에서 mutate 금지)과 충돌하지 않는다.
+    _EXPECTED_CHECK_VERBS = frozenset({"status", "agent-detect", "list"})
     cys_calls = [c for c in spy.calls if _extract_verb(c) is not None]
     assert cys_calls, "cmd_check 가 cys status 조차 호출하지 않음(spy 미작동 의심)"
     assert all(_extract_verb(c) in _EXPECTED_CHECK_VERBS for c in cys_calls), \

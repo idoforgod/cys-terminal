@@ -44,6 +44,11 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
       (--dept 형식 위반 또는 base 레인 아님) / 64=EX_USAGE(미지 서브커맨드 — A14).
   ★2는 preflight가 아니다 — ①preflight는 비치명(FAIL이어도 경고 강등·계속)이라 전용 exit가
     없다. 구 헤더의 '2=preflight'는 낡은 계약이었다(G31).
+  ★러너 파리티(부트 v2 명세 §4 · BUILD_PLAN A4): 러너 `cys boot-run`(Rust)은 위 표와 **값 공간을
+    공유**한다 — 공유 값(완주·정당거부·자원 hard·세션 컨텍스트·skip)은 양쪽에서 뜻이 같아야 하고,
+    러너 전용 종료 aborted·completed_degraded·crashed 는 이 스크립트가 **내지 않는다**(값은 상수
+    RUNNER_EXIT_* 가 정본). 산문은 색인일 뿐이고 대조는 RUNNER_EXIT_TERMINAL + `--self-test`
+    파리티 배터리 + 검체 test_bootlast_golden_lock_parity.py 가 진다.
 안전밸브: CYS_BOOT_GATE=warn(assert-ready 실패를 경고로 강등)|off(게이트 무력).
         CYS_BOOT_LANE_LEGACY=1(U-24 이관 롤백 — 레인 경로 규약을 `javis_lane` 대신 이 파일의
         레거시 인라인 정의로 되돌린다. 기본값은 정본 소비이며 두 경로의 동치는 검체 H-LANE-1 이
@@ -343,6 +348,82 @@ EXIT_RESOURCE_HARD = 9
 EXIT_SESSION_CONTEXT = 10    # claim 왕복이 '정당거부가 아닌' 사유로 실패(A20)
 EXIT_SKIPPED_INFLIGHT = 11   # 싱글플라이트 패자 — 실패 아님(A7)
 EXIT_USAGE = 64              # EX_USAGE(sysexits.h) — 미지 서브커맨드·사용오류(A14)
+
+# ── 러너 `cys boot-run`(Rust) 종료 대수 — **파리티 선언**(부트 v2 명세 §4 · BUILD_PLAN A4) ──
+# ★이 세 값은 **이 스크립트가 내는 exit 가 아니다.** 러너(Rust)가 내는 값이고, 여기 사는 이유는
+#   단 하나 — 두 구현이 **같은 표를 본다**는 것을 기계가 확인하기 위해서다(`--self-test` 파리티
+#   배터리). 그래서 접두사가 `EXIT_` 가 아니라 `RUNNER_EXIT_` 다: `return RUNNER_EXIT_ABORTED`
+#   같은 코드는 존재해서는 안 되고(python 체인의 종료 공간은 위 EXIT_* 11종이 전부다), 접두사가
+#   다르면 그 오용이 grep 한 번에 드러난다. 검체 `test_bootlast_golden_lock_parity.py` 가
+#   '이 값들로 return 하는 경로 0건'을 소스에서 실측한다.
+RUNNER_EXIT_ABORTED = 13             # terminal.kind=aborted(§3-2)
+RUNNER_EXIT_COMPLETED_DEGRADED = 14  # terminal.kind=completed_degraded(리뷰어 ack 미확인 · [가정 A])
+RUNNER_EXIT_CRASHED = 15             # terminal.kind=crashed(러너 예외)
+
+# 러너 exit → `terminal.kind` 전표(명세 §4 ↔ §3-2). 파리티의 실체는 **공유 값**이다 —
+# 0·7·9·10·11 은 python 체인도 내는 값이므로 같은 숫자에 같은 의미가 붙어 있어야 하고,
+# 13·14·15 는 러너 전용이라 python 종료 공간과 **겹치면 안 된다**. 둘 다 self-test 가 잰다.
+# ★12 는 여기 없다(있으면 안 된다): orchestra check 의 `ack_pending`(명세 §2-9)이 쓰는 값이라
+#   러너가 같은 숫자를 다른 뜻으로 쓰면 소비부의 처방이 뒤집힌다.
+RUNNER_EXIT_TERMINAL = {
+    EXIT_OK: "completed",
+    EXIT_CLAIM_DENIED: "declined",
+    EXIT_RESOURCE_HARD: "aborted",            # §3-2 aborted reason enum 의 resource_hard
+    EXIT_SESSION_CONTEXT: "session_error",
+    EXIT_SKIPPED_INFLIGHT: "skipped_inflight",
+    RUNNER_EXIT_ABORTED: "aborted",
+    RUNNER_EXIT_COMPLETED_DEGRADED: "completed_degraded",
+    RUNNER_EXIT_CRASHED: "crashed",
+}
+
+# 부서 레인 python exec 전사표(시뮬레이션 §3 회전3 13번 행 · §2-7 마지막 줄) — 러너가 이 스크립트를
+# exec 했을 때 **python exit → (terminal.kind, reason)**. 위 러너 표에 없는 python 전용 exit 만
+# 여기 산다(공유 값은 전사가 아니라 동일 의미이므로 이 표에 넣으면 이중 진실이 된다).
+# ★미등재 exit(3 ping · 64 사용오류 · 2 issue-ticket 사용오류 · 1 uncaught)는 T2-5 폴백
+#   '미지 exit → crashed(reason=exit:<n>)' 가 받는다 — 표를 늘릴수록 폴백 범위가 줄어든다.
+#   명세·시뮬레이션이 그 넷의 매핑을 정하지 않았으므로 **여기서 지어내지 않는다**(미결 상신).
+DEPT_EXEC_TERMINAL = {
+    EXIT_BOOT: ("aborted", "boot_failed"),
+    EXIT_ASSERT_READY: ("aborted", "assert_ready"),
+    EXIT_CHECK: ("aborted", "check_failed"),
+    EXIT_LANE_PACK: ("aborted", "lane_pack"),
+}
+
+# ── 레인 락 **원시 계약**(시뮬레이션 T1-10 · T2-10 · 명세 §2-7) ────────────────────────────
+# ★왜 상수인가: "Rust 러너는 python 과 동일 파일·동일 바이트 범위·동일 모드로 잠근다"는 계약이
+#   지금까지 **산문에만** 있었다. 산문은 기계가 못 읽으므로 한쪽이 `fs2::lock_exclusive` 로
+#   바뀌어도 아무 검체가 울지 않는다 — 그리고 그 증상은 Windows 에서만, 중복 부트로 나타난다.
+#   이 dict 가 그 계약의 기계 판독면이고 fixture `boot-last-golden/lock-primitive.json` 이
+#   같은 값을 파일로 들고 있어 Rust 쪽(W-B)이 `include_str!` 로 같은 표를 볼 수 있다.
+# ★값의 출처는 전부 실측이다(javis_lock.FileLock._try_os_lock·_try_pidfile · javis_lane
+#   LANE_STATE_KINDS["lock"] · ALWAYS_LANE_SUFFIXED). 이 파일이 새 규약을 **만들지 않는다**.
+LANE_LOCK_PRIMITIVE = {
+    "kind": "lock",                       # javis_lane.LANE_STATE_KINDS 의 종류 키
+    "path_stem": "bootstrap",
+    "path_ext": ".lock",
+    "path_template": "<state_dir>/bootstrap-<lane>.lock",   # base 도 접미(어휘 동결)
+    "always_lane_suffixed": True,
+    "open_flags": ["O_CREAT", "O_RDWR"],
+    "create_mode": 0o644,
+    "create_mode_octal": "0644",          # JSON 에는 8진 리터럴이 없다 — fixture 독자용 병기
+    "mode": "exclusive-nonblocking",      # 대기 금지(부트 훅은 수렴 대기 금지 — 금지 방향 ⑨)
+    "byte_offset": 0,
+    "byte_length": 1,                     # 범위 = [0, 1)
+    "backends": {
+        "posix": "fcntl.flock(LOCK_EX|LOCK_NB)",
+        "windows": "msvcrt.locking(LK_NBLCK, 1)",
+        "fallback": "open(O_CREAT|O_EXCL|O_RDWR) pidfile",
+    },
+    "holder_blob_keys": ["pid", "started", "owner", "host"],
+    "holder_owner": "javis_bootstrap",
+    # ★정직 고지(범위 개념의 비대칭): posix `flock` 은 **범위 인자가 없는 파일 전체** advisory
+    #   락이라 [0,1) 을 포함한다. 범위가 실제 의미를 갖는 축은 windows 뿐이고, `msvcrt.locking`
+    #   은 **현재 파일 오프셋**에서 length 바이트를 잠근다 — `_try_os_lock` 은 os.open 직후
+    #   (오프셋 0)에 바로 호출하므로 실효 범위가 [0,1) 이다. Rust 가 LockFileEx 로 다른 범위를
+    #   잠그면 windows 에서만 상호 배제가 조용히 깨진다(T1-10 이 겨눈 바로 그 고장).
+    "range_is_windows_axis": True,
+    "posix_scope": "whole-file",
+}
 
 # ★(W4) `cys boot` 의 **busy 전용 종료코드**(EX_TEMPFAIL) — Rust 정본 `cys.rs::EXIT_BOOT_BUSY`.
 #   구계약에서 busy 는 0(성공)이었고, 그래서 ④가 **무스폰인데 CEO 티켓을 소각**했다(G11).
@@ -2815,6 +2896,35 @@ def _cmd_run_chain(log):
                  ("CEO 티켓 부재/만료 — base CEO 에 발급을 **요청**하고 유계 대기한다. 사유: %s"
                   % why))
         if not ok:
+            # ── ★#13(PREP #13) 결손 0이면 티켓 요청을 발사하지 않는다 ─────────────────────
+            # 실측(2026-09-03 09:28·10:04·13:10 3회): 부서장 재기동 때마다 **의무 역할 9좌석이
+            # 전원 생존**인데도 아래 요청 push 가 나가 CEO 큐에 소음이 쌓였다. 티켓의 용도는
+            # '팀 기동 권한'이고 결손 0 이면 기동할 것이 없으므로(④ 도 `if has_deficit:` 로
+            # 스폰 경로에 진입하지 않는다) 요청 자체가 무의미하다.
+            # ★판정은 ④ 와 **같은 술어**(_team_has_deficit — orchestra 정본 위임)로 한다. 신호
+            #   원천이 실패하면 그 함수가 보수적으로 True(결손 가정)를 돌려주므로, **측정 실패는
+            #   요청 생략의 근거가 되지 않는다**(측정 불능은 통과가 아니다 — 종전 동작 유지).
+            has_deficit_now, deficit_why_now = _team_has_deficit()
+            if not has_deficit_now:
+                note = ("CEO 티켓 부재이나 **결손 0** — 의무 역할 전원 생존이라 팀 기동이 불요하고, "
+                        "따라서 티켓 요청도 보내지 않았다(CEO 큐 소음 차단 · PREP #13). "
+                        "판정 근거: %s / 티켓 상태: %s" % (deficit_why_now, why))
+                log.step(STEP.CEO_TICKET_REQUEST, 1,
+                         "결손 0(의무 역할 전원 생존) — CEO 티켓 요청 생략(재기동 소음 차단 · "
+                         "PREP #13). %s" % deficit_why_now)
+                _progress(note)
+                summary = {"ok": True, "marker": "부서장 각성(팀 이미 완결 · CEO 티켓 불요)",
+                           # ★solo_awakening=False 가 사실이다 — 팀이 살아 있으므로 '단독 각성'이
+                           #   아니다. 거짓 플래그를 원장에 박지 않는다(A2 라벨 결함과 같은 계열).
+                           "solo_awakening": False, "team_complete": True, "dept": dept,
+                           "ticket_requested": False, "ticket_request_detail": deficit_why_now,
+                           "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
+                           "lane": log.lane, "boot_last": log.path}
+                log.result(ok=True, state="team_complete", solo_awakening=False,
+                           team_complete=True, reason=deficit_why_now,
+                           ticket_requested=False, exit=EXIT_OK)
+                print(json.dumps(summary, ensure_ascii=False))
+                return EXIT_OK
             # ★2026-08-22 결함 #2 봉합: 종전엔 여기서 안내문만 출력하고 끝나 부서장이 팀 없이
             #   대기했고, **오너가 추가 명령을 쳐야** CEO 에게 요청이 갔다(실측 06:20→06:26→06:29).
             #   오너 절대규칙은 "선언자는 새 부서장이 되며 팀이 기동돼야 한다"이므로 요청은
@@ -2967,10 +3077,32 @@ def _cmd_run_chain(log):
     code, out = 1, "orchestra 부재"
     unjudgeable = None      # 'daemon_gone' | 'interpreter_gone' | None — 즉시 이탈 확정 사유
     unjudgeable_seen = 0    # exit 2 를 '계속'으로 접은 횟수(ping 생존 재확인 성공 시에만 증가)
+    ack_pending = False     # ★(부트 v2 §2-9) check exit 12 를 0 으로 접었는가 — 마커에 정직 기록
+    # ★exit 12 상수는 정본(javis_orchestra)에서 가져온다 — 리터럴 사본을 두면 정본이 움직일 때
+    #   이 소비자만 옛 값을 보고 '미기동'으로 오접는다(구 팩 스큐에서만 리터럴 폴백 · 값 동일).
+    try:
+        import javis_orchestra as _orch_ck
+        CHECK_ACK_PENDING = getattr(_orch_ck, "CHECK_EXIT_ACK_PENDING", 12)
+    except Exception:
+        CHECK_ACK_PENDING = 12
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=check_timeout)
         log.step(STEP.CHECK, code, out, suffix="#%d" % attempt)
         if code == 0:
+            break
+        # ★(부트 v2 §2-9 소비자 매핑) exit 12 = ack_pending — **필수 4종은 전원 ready** 이고
+        #   리뷰어 각성 ACK 만 미확인이다. 부트 완주의 기준은 ready 축이므로 여기서는 0 으로
+        #   접고 라벨만 남긴다. 차단은 리뷰 게이트(review-prompt·round-init)가 소유한다 —
+        #   리뷰어 하나의 확률적 각성이 팀 전체 기동을 인질로 잡으면 안 된다([가정 A]).
+        #   ★재시도하지 않는 이유: 12 는 '아직 안 섰다'가 아니라 '섰는데 ACK 만 없다'라서
+        #     같은 창을 더 돌아도 바뀌는 것은 ACK 뿐이고, 그 대기는 러너 AckWait 의 몫이다.
+        if code == CHECK_ACK_PENDING:
+            ack_pending = True
+            log.step(STEP.CHECK, 0,
+                     "check exit %d(ack_pending — ready 전원 충족·각성 ACK 미확인) → **0 취급**. "
+                     "부트는 계속한다. 차단되는 것은 리뷰 게이트(review-prompt·round-init)뿐이다."
+                     "\n%s" % (code, out), suffix="#%d-ack" % attempt)
+            code = 0
             break
         # ★G32/H-EXIT-7 + W-A3 정밀 분기 — check exit 2 는 '노드 미기동'이 아니라 **판정 불가**다.
         #   그런데 exit 2 하나에 성질이 다른 사건들이 겹친다:
@@ -3058,6 +3190,11 @@ def _cmd_run_chain(log):
         "surface_ref": os.environ.get("CYS_SURFACE_ID", ""),
         "lane": lane_key(),
         "socket": os.environ.get("CYS_SOCKET", ""), "orchestra_check": "exit 0"}
+    # ★(부트 v2 §2-9) 12 를 0 으로 접었으면 **접었다는 사실**을 마커에 남긴다(additive 키 —
+    #   기존 `orchestra_check` 값·기존 핀 무변경). 접힘이 기록 없이 사라지면 나중에 "왜 리뷰
+    #   게이트만 막히나"를 추적할 수 없다(조용한 강등 금지).
+    if ack_pending:
+        _marker_payload["orchestra_check_ack_pending"] = True
     _marker_path = lane_state_path("marker")
     _atomic_write_json(_marker_path, _marker_payload)
     if _is_base_socket():
@@ -3354,6 +3491,77 @@ def cmd_self_test():
         # ⓔ 선언 순서 = 실행 순서: 보류 단계는 busy 뒤·Degrade 앞이다.
         assert (STEP_INDEX[STEP.BOOT_BUSY] < STEP_INDEX[STEP.BOOT_GATE_PENDING]
                 < STEP_INDEX[STEP.BOOT_DEGRADE]), "④ 보류 단계 선언 순서 이탈"
+
+        # ── t4′: 러너 `cys boot-run` exit 파리티(부트 v2 명세 §4 · BUILD_PLAN A4) ──
+        # ★무엇을 막는가: 명세가 러너 종료 대수에 13·14·15 를 새로 얹었는데 python 쪽에는 그
+        #   표가 **어디에도 없었다**. 표가 한쪽에만 있으면 다른 쪽이 조용히 갈리고, 그 증상은
+        #   '부트가 실패했는데 소비부가 성공으로 읽는다'(또는 그 반대)다 — busy(75)·
+        #   gate_pending(78)이 이미 겪은 형태의 재발이다.
+        _py_exits = {EXIT_OK, EXIT_PING, EXIT_BOOT, EXIT_ASSERT_READY, EXIT_CHECK,
+                     EXIT_CLAIM_DENIED, EXIT_LANE_PACK, EXIT_RESOURCE_HARD,
+                     EXIT_SESSION_CONTEXT, EXIT_SKIPPED_INFLIGHT, EXIT_USAGE}
+        # ⓐ 값 고정 — 러너 Rust 표와 대조되는 세 상수(명세 §4).
+        assert RUNNER_EXIT_ABORTED == 13, "러너 aborted exit 상수 이탈(Rust boot-run 파리티 깨짐)"
+        assert RUNNER_EXIT_COMPLETED_DEGRADED == 14, \
+            "러너 completed_degraded exit 상수 이탈(Rust boot-run 파리티 깨짐)"
+        assert RUNNER_EXIT_CRASHED == 15, "러너 crashed exit 상수 이탈(Rust boot-run 파리티 깨짐)"
+        # ⓑ 러너 전용 값은 python 종료 공간과 겹치지 않는다 — 겹치면 같은 숫자가 두 뜻을 가진다.
+        _runner_only = {RUNNER_EXIT_ABORTED, RUNNER_EXIT_COMPLETED_DEGRADED, RUNNER_EXIT_CRASHED}
+        assert not (_runner_only & _py_exits), \
+            "러너 전용 exit 가 python 종료 공간을 침범: %s" % sorted(_runner_only & _py_exits)
+        assert len(_runner_only) == 3, "러너 전용 exit 3종이 서로 같은 값(대수 붕괴)"
+        # ⓒ 표의 정의역 = 명세 §4 의 8종 정확히(빠짐도 잉여도 없다).
+        assert set(RUNNER_EXIT_TERMINAL) == ({EXIT_OK, EXIT_CLAIM_DENIED, EXIT_RESOURCE_HARD,
+                                              EXIT_SESSION_CONTEXT, EXIT_SKIPPED_INFLIGHT}
+                                             | _runner_only), \
+            "러너 exit 표가 명세 §4 종료 대수와 불일치: %s" % sorted(RUNNER_EXIT_TERMINAL)
+        # ⓓ **공유 값의 의미 일치** — 파리티의 실체가 여기다(같은 숫자 ↔ 같은 terminal.kind).
+        for _code, _kind in ((EXIT_OK, "completed"), (EXIT_CLAIM_DENIED, "declined"),
+                             (EXIT_SESSION_CONTEXT, "session_error"),
+                             (EXIT_SKIPPED_INFLIGHT, "skipped_inflight"),
+                             (EXIT_RESOURCE_HARD, "aborted")):
+            assert RUNNER_EXIT_TERMINAL[_code] == _kind, \
+                "공유 exit %d 의 terminal 의미가 갈렸다(%r ≠ %r)" % (
+                    _code, RUNNER_EXIT_TERMINAL[_code], _kind)
+        assert RUNNER_EXIT_TERMINAL[RUNNER_EXIT_ABORTED] == "aborted"
+        assert RUNNER_EXIT_TERMINAL[RUNNER_EXIT_COMPLETED_DEGRADED] == "completed_degraded"
+        assert RUNNER_EXIT_TERMINAL[RUNNER_EXIT_CRASHED] == "crashed"
+        # ⓔ 12 는 러너 값이 아니다 — orchestra check 의 ack_pending(명세 §2-9) 이름공간이다.
+        assert 12 not in RUNNER_EXIT_TERMINAL, \
+            "러너 exit 12 가 check 의 ack_pending 값과 충돌(같은 숫자·다른 뜻)"
+        # ⓕ 부서 exec 전사표: 키는 전부 실재 python exit 이고, 러너 표와 **겹치지 않는다**
+        #    (공유 값은 전사 대상이 아니라 동일 의미다 — 겹치면 이중 진실).
+        assert set(DEPT_EXEC_TERMINAL) <= _py_exits, \
+            "부서 전사표에 실재하지 않는 python exit: %s" % sorted(set(DEPT_EXEC_TERMINAL) - _py_exits)
+        assert not (set(DEPT_EXEC_TERMINAL) & set(RUNNER_EXIT_TERMINAL)), \
+            "부서 전사표가 러너 공유 값을 다시 전사한다(이중 진실): %s" % sorted(
+                set(DEPT_EXEC_TERMINAL) & set(RUNNER_EXIT_TERMINAL))
+        _kinds = set(RUNNER_EXIT_TERMINAL.values())
+        for _code, (_k, _reason) in DEPT_EXEC_TERMINAL.items():
+            assert _k in _kinds, "부서 전사 kind 가 러너 terminal 대수 밖: %r" % _k
+            assert isinstance(_reason, str) and _reason, "부서 전사 reason 결손(exit %d)" % _code
+        assert DEPT_EXEC_TERMINAL[EXIT_BOOT][1] == "boot_failed", "부서 전사 reason 이탈(④boot)"
+        assert DEPT_EXEC_TERMINAL[EXIT_ASSERT_READY][1] == "assert_ready", "부서 전사 reason 이탈(게이트)"
+        assert DEPT_EXEC_TERMINAL[EXIT_CHECK][1] == "check_failed", "부서 전사 reason 이탈(⑤check)"
+        assert DEPT_EXEC_TERMINAL[EXIT_LANE_PACK][1] == "lane_pack", "부서 전사 reason 이탈(레인↔팩)"
+
+        # ── t4″: 레인 락 원시 계약(T1-10 · T2-10) — 선언이 실제 경로 규약과 갈리지 않는가 ──
+        _lk_sock = "/Users/x/.local/state/cys/cys.sock"
+        _lk_path = lane_state_path(LANE_LOCK_PRIMITIVE["kind"], _lk_sock)
+        assert os.path.basename(_lk_path) == "%s-base%s" % (LANE_LOCK_PRIMITIVE["path_stem"],
+                                                            LANE_LOCK_PRIMITIVE["path_ext"]), \
+            "락 원시 선언(stem·ext)이 실제 경로와 갈렸다: %s" % _lk_path
+        assert LANE_LOCK_PRIMITIVE["always_lane_suffixed"] is True and \
+            LANE_LOCK_PRIMITIVE["kind"] in _ALWAYS_LANE_SUFFIXED, \
+            "락은 base 도 항상 레인 접미인데 선언이 그렇게 말하지 않는다"
+        assert (LANE_LOCK_PRIMITIVE["byte_offset"], LANE_LOCK_PRIMITIVE["byte_length"]) == (0, 1), \
+            "락 바이트 범위 선언 이탈([0,1) — windows msvcrt.locking 축)"
+        assert int(LANE_LOCK_PRIMITIVE["create_mode_octal"], 8) == LANE_LOCK_PRIMITIVE["create_mode"], \
+            "락 파일 생성 모드 8진 병기가 실제 값과 갈렸다(fixture 독자가 오독한다)"
+        assert LANE_LOCK_PRIMITIVE["mode"] == "exclusive-nonblocking", \
+            "락 모드 선언 이탈(비차단 배타 — 대기하면 부트 훅이 블록된다)"
+        assert LANE_LOCK_PRIMITIVE["posix_scope"] == "whole-file", \
+            "posix flock 은 파일 전체 advisory 다 — 범위 개념 비대칭 고지가 사라졌다"
         # ★결손 판정 ↔ check verdict 공유(H-PRED-1): 같은 status fixture 에서 판정이 갈리지 않는다.
         _healthy = {"surfaces": [
             {"role": "cso", "exited": False, "awakened_at": 1.0},
@@ -3680,7 +3888,10 @@ def cmd_self_test():
     except AssertionError as e:
         print("javis_bootstrap self-test FAIL: %s" % e, file=sys.stderr)
         return 1
-    print("javis_bootstrap self-test OK (★결함#2: CEO 티켓 자동 요청(명령 조립·base env 소켓 "
+    print("javis_bootstrap self-test OK (★부트v2 A4: 러너 exit 파리티 6축(값 고정 3·공간 비침범·"
+          "명세 §4 정의역·공유 값 의미 일치 5·12 비충돌·부서 전사표 4) + 레인 락 원시 계약 6축"
+          "(경로 stem·ext·항상접미·바이트범위·생성모드 8진 병기·비차단 배타·posix 범위 고지) · "
+          "★결함#2: CEO 티켓 자동 요청(명령 조립·base env 소켓 "
           "격리·멱등 TTL 4종·유계 대기 2종·단계 서수) · "
           "★중대③ 부서명 규약 단일화(수용 5·거부 7·불량명 요청 미발사) + ★중대⑥ cys-dept "
           "**동작 대조** 23종(수용 8·거부 10·★개행 축 5종 — 리터럴 대조 폐기 · "

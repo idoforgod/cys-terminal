@@ -289,6 +289,16 @@ def _shell_hooks():
     return sorted(out)
 
 
+# ★부트 v2 A2(2026-09-04): UserPromptSubmit 훅이 **런처 + 본체** 2파일로 갈렸다.
+#   · 등록·실행 진입점 = `role-bootstrap.sh`(자기완결 런처) — E2E 는 여전히 이 파일을 돌린다.
+#   · 판독 규칙·문안·note 블록이 사는 곳 = `role-bootstrap-legacy.sh`(본체).
+#   그래서 **내용 핀은 본체를**, **실행은 런처를** 본다. 둘을 섞으면 이 하네스가 조용히
+#   아무것도 재지 않게 된다(계측 무효화 — 이 파일이 반복해서 경계한 형상).
+#   구 커밋 대조(`_git_show`)는 분할 이전 트리를 읽으므로 경로가 그대로다(자기완결 구 훅).
+ROLE_HOOK = "role-bootstrap.sh"                 # 런처(등록·실행)
+ROLE_BODY = "role-bootstrap-legacy.sh"          # 본체(내용 핀)
+
+
 def _git_show(relpath, ref=None):
     """기준 커밋의 파일 내용(계측기 자기검증용). 레포가 아니거나 실패면 None.
 
@@ -296,7 +306,10 @@ def _git_show(relpath, ref=None):
       (G30·G31·G32·P3-A-FILLER 의 문구면)은 그 트리에서 이미 수리돼 있어 탐지기가 FIRE 하지
       않는다 — 그 경우 계측 대조는 **W0 이전 트리**(`PRE_W0_REF`)로 해야 유효하다. 잘못된 기준에서
       "구 코드가 안 잡힌다"는 결과는 탐지기 파손이 아니라 기준 선택 오류다(오보 방지)."""
-    if not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+    # ★`.git` 은 디렉터리가 아닐 수 있다 — **worktree 체크아웃에서는 파일**(gitdir 포인터)이다.
+    #   isdir 로 게이트하면 worktree 에서 전 검체의 계측 대조가 조용히 skip 되어, "구 코드가
+    #   결함을 재현하는가" 를 아무도 재지 않은 채 GREEN 이 난다(계측 타당성 무효화).
+    if not os.path.exists(os.path.join(REPO_DIR, ".git")):
         return None
     r = _run(["git", "-C", REPO_DIR, "show", "%s:%s" % (ref or CALIBRATION_REF, relpath)],
              timeout=30)
@@ -912,7 +925,7 @@ def h_detect_5():
     need(D.detect(inside)["fire"], "문자 200 경계 미발화(바이트 슬라이스 회귀)")
     need(not D.detect(outside)["fire"], "감지창 밖 선언이 발화(창 미적용)")
     # 셸 슬라이스 제거 확인(정적) — 훅에 cut -c·bashism 슬라이스가 남아 있으면 회귀다
-    hook = _code_lines(_read(_hook("role-bootstrap.sh")))
+    hook = _code_lines(_read(_hook(ROLE_BODY)))
     need("cut -c" not in hook, "훅에 `cut -c` 바이트 슬라이스가 남았다(G25 미수리)")
     need(not re.search(r"\$\{[A-Za-z_][A-Za-z0-9_]*:\d+:", hook), "훅에 bashism 슬라이스가 남았다")
     need("tr '\\n' ' '" not in hook, "훅에 개행 평탄화가 남았다(창 판정이 두 곳에 존재)")
@@ -1037,7 +1050,7 @@ def h_detect_8():
     # 계측 타당성: 프리루드에 데드라인 실행기가 존재하고 훅이 그것으로 감싼다
     need("cys_timeout_run()" in _read(os.path.join(HOOKS_DIR, "_lib.sh")),
          "프리루드에 데드라인 실행기(cys_timeout_run)가 없다")
-    need("cys_timeout_run" in _read(_hook("role-bootstrap.sh")),
+    need("cys_timeout_run" in _read(_hook(ROLE_BODY)),
          "훅이 surface-role 을 데드라인으로 감싸지 않는다")
     old = _git_show("cysjavis-pack/hooks/role-bootstrap.sh")
     calib = "skip(no-git)"
@@ -1275,9 +1288,11 @@ def h_mission_1():
         #    판정 보류보다 나쁘다. T1 블록의 '임무 대장 미기록' fail-closed 와도 정합).
         #    주입문은 '선언 아님'과 '판정 불가'를 융합하지 않고 미발화를 명시해야 한다.
         #    훅을 팩 밖으로 복사해 형제 해소(../bin)를 끊고, 감지기만 팩에 심어 감지는 살린다.
-        cur = _read(_hook("role-bootstrap.sh"))
-        curhook = os.path.join(tmp, "curhook-nomission", "role-bootstrap.sh")
-        _w(curhook, cur)
+        # ★A2 분할 이후: 팩 밖 사본은 **런처와 본체를 함께** 복사해야 돈다(런처 단독이면
+        #   '부트 본체 부재' 고지에서 끝나 이 검체가 재려는 경로에 도달하지 못한다).
+        curhook = os.path.join(tmp, "curhook-nomission", ROLE_HOOK)
+        _w(curhook, _read(_hook(ROLE_HOOK)))
+        _w(os.path.join(os.path.dirname(curhook), ROLE_BODY), _read(_hook(ROLE_BODY)))
         _w(os.path.join(os.path.dirname(curhook), "_lib.sh"),
            _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
         env3, _h3, pack3, _b3, _s3 = _rb_sandbox(os.path.join(tmp, "c"), mission=None)
@@ -1851,7 +1866,7 @@ def h_ident_1():
                  "BOOT_GATES=0 토큰 생략 · rc 계약 불변 · 경계 회귀 핀 존치")
 
     # ── L2 훅: 조상 체인이 온전한 시점(spawn 이전)의 선행 claim + env 판정 전달 ──
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     need("cys claim-role master" in hook,
          "훅이 선행 claim 을 하지 않는다 — 분리된 부트가 claim 하면 언제나 신원 미해석이다")
     need("export CYS_CLAIM_RC=" in hook, "훅이 claim 판정을 부트에 넘기지 않는다(env 계약 부재)")
@@ -2678,7 +2693,62 @@ def h_conc_3():
         body = code[i:code.find("\n    def ", i + 10)]
         need("_settings_rmw(" in body, "%s 가 단일 RMW 소유자를 경유하지 않는다" % fn)
     need("javis_lock" in code and "FileLock(" in code, "preflight 가 공용 락을 소비하지 않는다")
-    notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0")
+    # ★같은 금지를 **다른 writer 들까지** 넓힌다(2026-09-04 실측). 종전 이 핀은 javis_preflight.py
+    #   **하나만** 훑었다. 그런데 이 검체의 docstring 이 5 writer 중 하나로 직접 지목한
+    #   `javis_dept_migrate.py _register_hook(락 X · 고정 .tmp)` 에 그 패턴이 **그대로 살아 있었다** —
+    #   금지 문장은 있는데 대상 밖이라 무관측이었다(핀의 사각).
+    #   기제는 실측 재현됐다: 큰 본문을 쓰는 P1 과 같은 tmp 를 truncate 하는 P2 가 겹치면 최종
+    #   settings.json 이 "완결 JSON + NUL + 잔여 꼬리" 가 되어 `JSONDecodeError: Extra data` 를 낸다.
+    for _mod in ("javis_dept_migrate.py", "javis_guard_register.py", "javis_bootstrap.py"):
+        _mp = os.path.join(BIN_DIR, _mod)
+        if os.path.isfile(_mp):
+            need('settings_path + ".tmp"' not in _code_lines(_read(_mp)),
+                 "%s 에 고정 .tmp 재구현이 남아 있다(교차 파손 경로 · 발행만 원자적이고 "
+                 "스테이징을 공유하면 원자성이 사라진다)" % _mod)
+    # ★핀의 사각 닫기(2026-09-05 · master 승인). 위 핀은 문자열 `settings_path + ".tmp"`
+    #   **하나만** 훑는다. 그런데 같은 계급의 결함이 **변수 이름만 다른** `path + ".tmp"` 로
+    #   `javis_dept_migrate._migrate_directive` 에 살아 있었다(대상이 MASTER_DIRECTIVE.md 라
+    #   settings 가 아니었고, 그래서 핀의 시야 밖이었다). 금지의 근거는 파일 이름이 아니라
+    #   **스테이징 공유**다 — `os.replace` 는 발행만 원자적이므로 tmp 를 공유하면 그 보장이
+    #   사라진다. 그러니 이제 **패턴 전반**(`<식별자> + ".tmp"`)을 팩 발행 모듈 전수로 훑는다.
+    #   알려진 잔존 사이트는 **파일별 개수 census** 로 얼린다: 새 파일·개수 증가 = 적색,
+    #   감소 = 통과(수리 방향은 막지 않는다).
+    #   ★범위 고지(정직): `bin/*.py`(발행 모듈)만 본다. `bin/tests/` 는 격리 임시 디렉터리에만
+    #   쓰고 제품 경로가 아니라 제외했다 — 그쪽은 이 축에서 무관측이다.
+    _FIXED_TMP_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_.]*\s*\+\s*["\']\.tmp["\']')
+
+    def _fixed_tmp_count(_text):
+        _n = 0
+        for _ln in _code_lines(_text).splitlines():
+            if _FIXED_TMP_RE.search(_ln.split("#", 1)[0]):
+                _n += 1
+        return _n
+
+    # 2026-09-05 실측 census(커밋 트리 기준). `javis_dept_migrate.py` 는 이 라운드에서 유일 tmp 로
+    #   수리해 0건이므로 목록에 없다 — 되살아나면 그 자체로 적색이다.
+    _FIXED_TMP_CENSUS = {
+        "grill_gate.py": 1, "javis_cycle_autopilot.py": 3, "javis_fleet_report.py": 1,
+        "javis_formation.py": 1, "javis_hud_bridge.py": 1, "javis_learn.py": 4,
+        "javis_mission.py": 2, "javis_preflight.py": 3, "javis_rsi.py": 2,
+        "javis_serena_probe.py": 1,
+    }
+    _grew = {}
+    for _fn in sorted(f for f in os.listdir(BIN_DIR) if f.endswith(".py")):
+        _c = _fixed_tmp_count(_read(os.path.join(BIN_DIR, _fn)))
+        if _c > _FIXED_TMP_CENSUS.get(_fn, 0):
+            _grew[_fn] = "%d건(얼린 값 %d)" % (_c, _FIXED_TMP_CENSUS.get(_fn, 0))
+    need(not _grew,
+         "고정 `.tmp` 재구현이 새로 생겼다 — 공유 스테이징은 교차 파손 경로다(유일 tmp"
+         "(mkstemp)+os.replace 로 바꿔라): %r" % _grew)
+    # 계측 타당성(음성 대조군): 검출기가 실제 패턴을 잡고 주석은 잡지 않는다 —
+    #   검출력 없는 census 로 얻은 GREEN 은 아무것도 증명하지 않는다.
+    need(_fixed_tmp_count('    tmp = path + ".tmp"\n') == 1,
+         "계측 타당성 실패: 고정 tmp 검출기가 실제 패턴을 못 잡는다(핀이 공허하다)")
+    need(_fixed_tmp_count('# tmp = path + ".tmp"\n') == 0,
+         "계측 타당성 실패: 주석까지 잡는다(제거를 설명한 문서가 회귀로 보고된다)")
+    notes.append("고정 tmp census %d파일·%d건 이내(신규 0 · 검출기 음성 대조 2축 통과)"
+                 % (len(_FIXED_TMP_CENSUS), sum(_FIXED_TMP_CENSUS.values())))
+    notes.append("등록기 4종 단일 RMW 경유·고정 .tmp 0(preflight+dept_migrate+guard_register+bootstrap)")
     # ⓑ Rust 측 원자 쓰기(W2 A8rs) — 실측 5 writer 중 Rust 두 축
     pk = _repo_file(os.path.join("src", "pack.rs"))
     mi = pk.find("pub fn merge_desired_hooks(")
@@ -2720,7 +2790,24 @@ def h_conc_3():
         need(not fails, "경합 writer 실패: %r" % fails)
         # 파손 0: 파싱 성공 + 사용자 키 보존
         raw = _read(target)
-        data = json.loads(raw)          # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        # ★맨몸 `json.loads` 금지(2026-09-04): 종전 이 줄은 파손 시 **JSONDecodeError 로 크래시**해
+        #   검체가 FAIL 이 아니라 traceback 으로 죽었다 — 판정이 아니라 계측기 사망이라 원인 추적이
+        #   불가능했고(파일 내용이 사라진다), 재현 시도마다 '플레이크' 로 접힐 위험이 있었다.
+        #   파손은 **판정 결과**(FAIL)여야 하고, 그 증거(파일 원문)는 남아야 한다.
+        try:
+            data = json.loads(raw)      # 파싱 실패 = 교차 파손(원 결함의 지배 모드)
+        except ValueError as _je:
+            _ev = os.path.join(tempfile.gettempdir(),
+                               "h-conc-3-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_ev, "w", encoding="utf-8") as _f:
+                    _f.write(raw)
+            except OSError:
+                _ev = "(증거 보존 실패)"
+            need(False,
+                 "settings.json 교차 파손 — %s · %d바이트 · 머리 80=%r · 꼬리 80=%r · 증거=%s "
+                 "(‘Extra data’ 는 찢긴 쓰기의 서명이다: 완결 JSON 뒤에 남은 이전 본문의 꼬리)"
+                 % (_je, len(raw), raw[:80], raw[-80:], _ev))
         need(data.get("theme") == "dark", "경합이 사용자 키를 지웠다")
         # lost update 0: 모든 writer 의 모든 mark 가 남는다
         marks = data.get("marks") or []
@@ -2758,16 +2845,47 @@ def h_conc_3():
                    "    json.dump(d, open(p, 'w'))\n", 0o644)
         nprocs = [subprocess.Popen([PY, nchild, "n%d" % k, "6"],
                                    env=_base_env({"CYS_SETTINGS": naive}),
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                   for k in range(4)]
+        ndied = 0
         for pr in nprocs:
             pr.communicate(timeout=120)
-        nmarks = (json.loads(_read(naive) or "{}") or {}).get("marks") or []
-        need(len(nmarks) < 4 * 6,
-             "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
-             "(marks=%d) — 위 GREEN 은 검출력 미확인" % len(nmarks))
-        notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출"
-                     % (4 * 6 - len(nmarks), 4 * 6))
+            if pr.returncode != 0:
+                ndied += 1
+        # ★대조군의 파손은 **정상 결과**다 — 그것이 이 군을 두는 이유다(직렬화가 없다).
+        #   그런데 종전 이 줄은 맨몸 `json.loads` 라, 대조군이 자기 파일을 이어붙이면 검체가
+        #   **판정이 아니라 traceback 으로 죽었다**(CI 적색 `JSONDecodeError: Extra data:
+        #   line 1 column 52`). 위 ⓒ에서 같은 계급을 이미 한 번 고쳤는데 이 대조군 줄이 남아
+        #   **같은 결함의 두 번째 인스턴스**였다.
+        #   기제(생산 코드 아님 · 이 대조군 자식의 `json.dump(d, open(p,'w'))`):
+        #     `open(p,'w')` 의 truncate 는 **열 때** 일어나고 쓰기는 각자 offset 에서 난다 —
+        #     P1·P2 가 모두 연 뒤 P2 가 긴 본문(59B)을 쓰고 P1 이 짧은 본문(51B)을 offset 0 에
+        #     쓰면 0..51 만 덮이고 51..59 는 P2 의 꼬리로 남는다 →
+        #     `{"marks": [...5건...]}`(정확히 51B) + 꼬리 = **Extra data: line 1 column 52**.
+        #   ★이 서명은 settings.json 에서는 나올 수 없다: `_settings_rmw` 는 `indent=2` 로 써서
+        #     1행이 `{` 하나다(1행 52열에 완결 JSON 이 끝날 수 없다). 생산 writer 6종은 전부
+        #     고유 tmp+replace 다 — 즉 이 적색의 출처는 **대조군 파일**(`naive.json`)이다.
+        nraw = _read(naive)
+        try:
+            nmarks = (json.loads(nraw or "{}") or {}).get("marks") or []
+        except ValueError as _nje:
+            # 파손 = lost update 보다 **더 강한** 무직렬화 증거다. 검출로 센다(크래시 금지).
+            _nev = os.path.join(tempfile.gettempdir(),
+                                "h-conc-3-naive-corrupt-%d.json" % os.getpid())
+            try:
+                with open(_nev, "w", encoding="utf-8") as _f:
+                    _f.write(nraw)
+            except OSError:
+                _nev = "(증거 보존 실패)"
+            notes.append("음성 대조군: 무직렬화 RMW 가 **파일을 이어붙였다**(%s · %d바이트 · "
+                         "자식 비정상종료 %d/4 · 증거=%s) — lost update 보다 강한 검출"
+                         % (_nje, len(nraw), ndied, _nev))
+        else:
+            need(len(nmarks) < 4 * 6 or ndied > 0,
+                 "계측 타당성 실패: 직렬화 없는 RMW 에서도 mark 오라클이 lost update 를 못 잡았다"
+                 "(marks=%d · 자식 비정상종료 0) — 위 GREEN 은 검출력 미확인" % len(nmarks))
+            notes.append("음성 대조군: 무직렬화 RMW 에서 lost update %d/%d 검출(자식 비정상종료 %d/4)"
+                         % (4 * 6 - len(nmarks), 4 * 6, ndied))
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
     calib = "skip(no-git)"
     if old is not None:
@@ -5333,7 +5451,7 @@ def h_pred_5():
     need(not uncovered, "발권 role 이 소비처에서 미해소(B10): %r" % uncovered)
     # ③ 셸 훅 case 전수(G2/A3): session-start 는 전체 role 문자열을 받는다
     ss = _read(_hook("session-start.sh"))
-    rb = _read(_hook("role-bootstrap.sh"))
+    rb = _read(_hook(ROLE_BODY))
     need("reviewer-gemini" in ss or "reviewer-*" in ss or "reviewer*" in ss,
          "session-start role case 가 리뷰어 전체 이름을 커버하지 않는다(G2)")
     need("master|\"\"" in rb.replace(" ", "") or 'master|"")' in rb,
@@ -5382,19 +5500,62 @@ def h_pred_6():
         need(B._socket_is_base(sock) is want,
              "부서 판정 불일치: %s → %r(기대 %r)" % (sock, B._socket_is_base(sock), want))
     notes.append("부서 판정(셸↔python) 정합")
-    # ⓓ BUDGET 상수 파리티(H-TIME-1 과 짝) — Rust 블록 ↔ python leaf
-    csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
+    # ⓓ BUDGET 상수 파리티(H-TIME-1 과 짝) — Rust 블록 ↔ python SOT
+    #   ★확장(2026-09-05 · master 지시 · W-B 조율): 종전엔 `src/bin/cys.rs` 의 **u64 리터럴**만
+    #     훑어서 cysd 감독자 상수(f64·u32·usize)가 통째로 대조 밖이었다 — python 이 값을 바꿔도
+    #     아무도 모르는 무측정 계급이다. 이제 표가 (python 키 · 소스 · 타입)을 지고 감독자 파일도 훑는다.
     import javis_budget as BU
-    bad = []
-    for rust_name, py_name in BU.RUST_PARITY_CONSTS.items():
-        m = re.search(r"const %s: u64 = (\d+);" % re.escape(rust_name), csrc)
+    #   ★경로는 레지스트리가 소유한다(핀 이사 계약 U-2 · H-META-PIN ⓒ): 검체가 경로 리터럴을
+    #     직접 들면 그 파일이 이사할 때 이 핀만 조용히 죽는다. 논리 이름으로 묻는다.
+    _NUM = {"u64": r"\d+", "u32": r"\d+", "usize": r"\d+", "f64": r"\d+(?:\.\d+)?"}
+    _src_cache = {"cys": _scan_source("readiness"),
+                  "cysd_boot_supervisor": _scan_source("boot_supervisor")}
+    bad, pend = [], []
+    for rust_name, (py_name, src_key, kind) in BU.RUST_PARITY_CONSTS.items():
+        m = re.search(r"const %s: %s = (%s);" % (re.escape(rust_name), kind, _NUM[kind]),
+                      _src_cache[src_key])
         if not m:
-            bad.append("%s 상수 부재" % rust_name)
+            (pend if rust_name in BU.RUST_PARITY_PENDING else bad).append(
+                "%s 상수 부재(%s)" % (rust_name, src_key))
             continue
-        if int(m.group(1)) != int(BU.leaf(py_name)):
-            bad.append("%s=%s ≠ python %s=%s" % (rust_name, m.group(1), py_name, BU.leaf(py_name)))
+        if float(m.group(1)) != float(BU.parity_value(py_name)):
+            bad.append("%s=%s ≠ python %s=%s"
+                       % (rust_name, m.group(1), py_name, BU.parity_value(py_name)))
+    # 유도 상수는 값이 아니라 **유도식**을 핀한다 — python 에 값을 복제하면 그 복제가 새 드리프트면이
+    #   되기 때문이다(W-B 지적 수용). 누가 유도를 리터럴로 굳히면 여기서 잡힌다.
+    _dsrc = _src_cache["cysd_boot_supervisor"]
+    for rust_name, expr in BU.CYSD_DERIVED_PINS.items():
+        m = re.search(r"const %s: [a-z0-9]+ = (.+?);" % re.escape(rust_name), _dsrc)
+        if not m:
+            pend.append("%s 유도 상수 부재" % rust_name)
+        elif m.group(1).strip() != expr:
+            bad.append("%s 유도식 변경: %r(기대 %r) — 리터럴로 굳히면 SOT 가 둘이 된다"
+                       % (rust_name, m.group(1).strip(), expr))
     need(not bad, "BUDGET 상수 파리티 붕괴: %r" % bad)
-    notes.append("BUDGET 상수 %d종 rust↔python 파리티" % len(BU.RUST_PARITY_CONSTS))
+    # ★PEND 는 "아직 이 레인에 없다"이지 "안 잰다"가 아니다. 목록 밖 부재는 위에서 이미 적색이고,
+    #   통합 트리에서는 **PEND 0** 이 조건이다(C4 판독 · 그래야 무측정이 남지 않는다).
+    _allowed_pend = BU.RUST_PARITY_PENDING
+    _stray = [x for x in pend if x.split()[0] not in _allowed_pend]
+    need(not _stray, "PEND 목록 밖 상수 부재(무측정): %r" % _stray)
+    # ★사유 계약(2026-09-05 · master 승인): PEND 는 이름만으로 판독할 수 없다 — "다른 레인에 있어
+    #   병합으로 풀린다(merge)" 와 "어디에도 없어 누가 구현해야 한다(impl)" 는 조치가 정반대인데
+    #   화면에서 같아 보인다(원인 구별 불가 = 무측정의 변종). 그래서 ⓐ PEND 가 될 수 있는 모든 이름은
+    #   사유를 지녀야 하고 ⓑ 해소 경로 어휘는 둘로 닫혀 있어야 한다(자유 문장으로 흐르면 다시 못 읽는다).
+    _pend_names = BU.RUST_PARITY_PENDING | set(BU.CYSD_DERIVED_PINS)
+    _no_reason = sorted(n for n in _pend_names if n not in BU.RUST_PARITY_PENDING_REASON)
+    need(not _no_reason,
+         "사유 없는 PEND 항목(판독자가 '병합 대기'와 '구현 대기'를 구별할 수 없다): %r" % _no_reason)
+    _bad_kind = sorted(n for n, (k, _w) in BU.RUST_PARITY_PENDING_REASON.items()
+                       if k not in BU.PENDING_KINDS)
+    need(not _bad_kind,
+         "PEND 해소 경로 어휘 이탈(%r 만 허용): %r" % (list(BU.PENDING_KINDS), _bad_kind))
+    _pend_desc = "; ".join(BU.pending_note(x.split()[0]) for x in pend)
+    notes.append("BUDGET 상수 %d종 rust↔python 파리티(cys.rs %d · cysd 감독자 %d · 유도식 핀 %d) · PEND %d종%s"
+                 % (len(BU.RUST_PARITY_CONSTS),
+                    sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] == "cys"),
+                    sum(1 for v in BU.RUST_PARITY_CONSTS.values() if v[1] != "cys"),
+                    len(BU.CYSD_DERIVED_PINS), len(pend),
+                    (" — " + _pend_desc) if pend else ""))
     return " · ".join(notes)
 
 
@@ -6109,6 +6270,16 @@ def h_time_1():
     csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("BUDGET_HEARTBEAT_INTERVAL_SECS" in csrc, "cys boot 하트비트 상수가 없다")
     notes.append("하트비트 3지점(stderr)")
+    # ⓖ cysd 감독자 상수가 파리티 표에 **등재돼 있는가**(값 대조는 짝 검체 H-PRED-6 ⓓ 가 한다).
+    #   ★이 축의 이유(2026-09-05 · master 지시): 감독자 임계가 표 밖에 있으면 python 이 값을 바꿔도
+    #     조용히 드리프트한다 — 등재 자체가 무측정 방지의 첫 관문이다.
+    _cysd_reg = {k for k, v in BU.RUST_PARITY_CONSTS.items() if v[1] == "cysd_boot_supervisor"}
+    for _must in ("INTENT_MAX_AGE_SECS", "RETRY_COOLDOWN_SECS", "MAX_ATTEMPTS",
+                  "SUPERVISOR_INTERVAL_SECS", "HB_STALL_SECS", "PROGRESS_STALL_SECS"):
+        need(_must in _cysd_reg, "cysd 감독자 상수 %s 가 파리티 표에 없다(조용한 드리프트 면)" % _must)
+    need(set(BU.CYSD_DERIVED_PINS) == {"MAX_LIVE_BOOT_RUNS", "FENCED_REAP_AGE_SECS"},
+         "유도식 핀 목록이 바뀌었다 — 유도를 리터럴로 굳히는 변경은 표와 함께 와야 한다")
+    notes.append("cysd 감독자 상수 %d종 등재 + 유도식 핀 2종" % len(_cysd_reg))
     r = _run([PY, os.path.join(BIN_DIR, "javis_budget.py"), "--self-test"], timeout=60)
     need(r.returncode == 0, "javis_budget self-test 실패:\n%s" % r.stdout[-600:])
     return " · ".join(notes) + " · budget self-test PASS"
@@ -6123,7 +6294,7 @@ def h_time_2():
     import javis_budget as BU
     notes = []
     # ⓐ 훅 안내가 파생값을 주입한다(하드코딩 '120s' grep 0)
-    rb = _read(_hook("role-bootstrap.sh"))
+    rb = _read(_hook(ROLE_BODY))
     need("javis_budget.py\" --note-check-window" in rb or "--note-check-window" in rb,
          "훅 안내가 예산 파생값을 주입하지 않는다")
     need("생존확인(최대 120s)" not in rb, "훅 안내에 하드코딩 120s 잔존")
@@ -6243,6 +6414,10 @@ SCAN_TARGETS = {
     # ★(U-17) 프로필 인증 전제 판정기. 신설 파일 하나이며 `cys profile-auth` 배선이 CLI 로
     #   내려가면 **여기에 그 경로를 추가**한다(판정부는 이 파일에 남으므로 둘 다 유지).
     "profile_gate": (os.path.join("src", "profile_gate.rs"),),
+    # ★(2026-09-05) 부트 감독자 — 예산 파리티가 이 파일의 임계 상수를 핀한다(H-PRED-6 ⓓ).
+    #   등재하는 이유: 이 경로를 검체가 직접 들면 파일이 이사할 때 그 핀만 조용히 죽는다.
+    #   B3-3 이 fence·progress 상수를 더 넣을 자리이므로 독자가 늘기 전에 소유를 여기로 모은다.
+    "boot_supervisor": (os.path.join("src", "bin", "cysd", "boot_supervisor.rs"),),
 }
 
 # 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.
@@ -6266,6 +6441,10 @@ SCAN_TARGET_CONSUMERS = {
     "H-SAFE-2": "readiness",
     "H-TIME-3": "readiness",
     "H-OBS-2": "readiness",
+    # ★(2026-09-05) 예산 파리티 검체 — cys.rs 의 BUDGET 상수와 감독자 임계를 핀한다. 종전엔
+    #   경로를 직접 들어 동결 목록에 있었으나, cysd 감독자까지 넓히면서 두 경로를 레지스트리로
+    #   묻도록 이사했다(`readiness` + `boot_supervisor`). 선언은 1:1 규약대로 주 경로를 적는다.
+    "H-PRED-6": "readiness",
     # ★(U-17) 인증 전제 판정기 검체 — 판정부를 `profile_gate` 로 묻는다(직접 경로 0).
     "H-AUTH-PARSE": "profile_gate",
     # ★(U-18) create 게이트 검체 — 문안에 실리는 판정기 안정 문자열을 정본에서 뽑는다.
@@ -6278,7 +6457,7 @@ SCAN_TARGET_CONSUMERS = {
 # 새 직접 독자는 이사 때 함께 옮겨지지 않아 조용히 죽기 때문이다(H-META-PIN ⓓ 가 적색).
 SCAN_TARGET_DIRECT_LEGACY = frozenset({
     "H-CONC-2", "H-CONC-3", "H-EXIT-2", "H-EXIT-3", "H-EXIT-4", "H-IDENT-1",
-    "H-PRED-2", "H-PRED-6", "H-PRED-7", "H-SAFE-1", "H-SAFE-W",
+    "H-PRED-2", "H-PRED-7", "H-SAFE-1", "H-SAFE-W",   # H-PRED-6 은 2026-09-05 레지스트리 경유로 이사
     "H-SEED-1", "H-SEED-3", "H-SEED-6", "H-TIME-1",
 })
 
@@ -6368,7 +6547,7 @@ def h_doc_1():
     달랐다. 계약을 §0-A 단일 표로 모으고 나머지는 **포인터**로 만든 뒤, 그 정합을 기계로 못박는다.
     P3-A-TEMPLATE: 훅 없는 기계의 폴백 절차("스크립트 1회")가 보존돼야 한다 — 산문 체인 금지."""
     md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     notes = []
     # ① §0-A 조건부 단일 계약이 존재하고 두 분기를 명시하는가
     need("0-A" in md and "실행 주체 단일 계약" in md, "§0-A 단일 계약 절이 없다(A10 미착지)")
@@ -6474,7 +6653,7 @@ def h_doc_2():
     ★금지 방향 ②: 숫자를 맞추려고 `REQUIRED_ROLES` 에 master 를 넣으면 check 의 required 가 master 를
       요구하게 되고, 레거시 master 조합에서 **부트 전체가 사망**한다. master 는 안내에서만 +1 이다."""
     orch = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     # ① 파생 소스가 존재하고 master 는 required 밖이다
     need("def team_roster_note(" in orch, "팀 구성 안내 파생 함수 부재(리터럴 잔존 위험)")
     r = _run([PY, os.path.join(BIN_DIR, "javis_orchestra.py"), "--note-team-roster"])
@@ -6764,7 +6943,7 @@ def h_doc_11():
     1회·측정불능 금지를 **자기 문장으로** 서술한다(§0-A 는 정본 참조로만 남는다). 이 검체가
     그 자기완결성을 박제한다 — 포인터로 되돌아가면 배달 결손이 다시 침묵한다."""
     ss = _code_lines(_read(_hook("session-start.sh")))
-    rb = _code_lines(_read(_hook("role-bootstrap.sh")))
+    rb = _code_lines(_read(_hook(ROLE_BODY)))
     notes = []
     # ① 두 훅 모두 '1회'와 '재실행 금지' 양 분기를 자기 문장으로 갖는다(포인터만이면 실패).
     for rel, body in (("session-start.sh", ss), ("role-bootstrap.sh", rb)):
@@ -6894,7 +7073,7 @@ def h_doc_8():
          "정직 등재가 미적용의 **기제**(토큰 미상속·프런트도어 좌석 도출 실패)를 명시하지 "
          "않는다 — 결론만 있고 근거가 없으면 다음 수정자가 검증 없이 지운다")
     # ⑤ 진입점 전수: 훅·산문도 같은 체인을 가리킨다(산문이 개별 명령 재현을 지시하지 않는다)
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     need("javis_bootstrap.py" in hook, "훅이 체인을 발화하지 않는다")
     md = _repo_file(os.path.join("cysjavis-pack", "directives", "MASTER_DIRECTIVE.md"))
     need("javis_bootstrap.py" in md and ("수동 재현 금지" in md or "산문 체인" in md),
@@ -7040,6 +7219,16 @@ def _fake_pack_with_hooks(pack):
                       ("", "pack-guard.sh")):
         _w(os.path.join(pack, "hooks", script), "#!/bin/sh\nexit 0\n")
     _w(os.path.join(pack, "bin", "javis_reflect.py"), "import sys;sys.exit(0)\n", 0o644)
+    # ★훅 **본체**(부트 v2 A2 분할 · 2026-09-04): C28 은 등록 집합과 별개로 `HOOK_BODY_FILES`
+    #   실재를 잰다(본체가 없으면 런처가 exit 0 만 하고 부트가 안 난다). 이 픽스처의 의도는
+    #   "파일 요건은 충족된 팩 — **등록 판정만** 재자"이므로 본체도 있어야 한다. 목록은
+    #   preflight 정본에서 읽는다(사본을 두면 다음 본체가 늘 때 이 픽스처만 조용히 낡는다).
+    try:
+        _bodies = getattr(_preflight_mod(), "HOOK_BODY_FILES", [])
+    except Exception:
+        _bodies = [(os.path.join("hooks", "role-bootstrap-legacy.sh"), "role-bootstrap.sh")]
+    for _rel, _owner in _bodies:
+        _w(os.path.join(pack, _rel), "#!/bin/bash\nexit 0\n")
     return pack
 
 
@@ -8205,36 +8394,198 @@ def h_obs_2():
 
 
 
-@specimen("H-OBS-3", "W1a", "다중 세션 카운트가 comm=claude 프로세스를 계수", ["G33"])
+# ── A1(G34) 공용 목 하네스: ps 3형태 픽스처 + lsof AND/OR 분기 ─────────────────
+# 픽스처 8행 중 cwd==proj 는 6행(claude 3형태 + codex·zsh·python3)이고 그중 **claude 형태만**
+# 3행이다. 목 lsof 는 호출 형태로 갈린다 — `-p <csv>` 면 그 pid 의 cwd 만(신 훅 = AND),
+# `-c` 만이면 **전 프로세스 cwd**(구 훅 = OR 과대계수 재현). 그래서 같은 목 하나로 신·구를
+# 나란히 돌려 "정답 3 vs 과대계수 6" 을 실행 시점에 재현한다(MEMORY 계측 타당성 3칙).
+def _a1_mock_env(tmp):
+    """반환 (env, proj) — 목 ps/lsof 가 PATH 선두에 있는 격리 실행 환경."""
+    proj = os.path.join(tmp, "proj")
+    other = os.path.join(tmp, "other")
+    os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
+    os.makedirs(other, exist_ok=True)
+    _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
+    fx = os.path.join(tmp, "fixture.tsv")
+    rows = [
+        ("101", "claude", "claude --dangerously-skip-permissions", proj),          # ⓐ 런처(comm)
+        ("102", "/x/.local/bin/claude", "/x/.local/bin/claude --flag", proj),      # ⓐ 런처(경로)
+        ("103", "node", "node /x/lib/node_modules/@anthropic-ai/claude-code/cli.js", proj),  # ⓑ npm
+        ("104", "node", "node /x/.local/bin/codex --dangerously-bypass", proj),    # 음성: codex 도 node
+        ("105", "zsh", "-zsh", proj),                                              # 음성: cwd 만 일치
+        ("106", "python3", "python3 x.py", proj),                                  # 음성: cwd 만 일치
+        ("107", "/x/.local/share/", "/x/.local/share/claude/versions/2.1.259 -p", other),  # ⓒ 버전경로
+        ("108", "claude", "claude", other),                                        # 타 cwd
+    ]
+    with open(fx, "w", encoding="utf-8", newline="\n") as f:
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+    binp = os.path.join(tmp, "mockbin")
+    _w(os.path.join(binp, "ps"),
+       '#!/bin/sh\nawk -F"\\t" \'{printf "%5s %s %s\\n", $1, $2, $3}\' "' + fx + '"\n')
+    _w(os.path.join(binp, "lsof"),
+       '#!/bin/sh\n'
+       'mode=all; pids=""\n'
+       'while [ $# -gt 0 ]; do\n'
+       '  case "$1" in -p) mode=pids; pids="$2"; shift;; esac\n'
+       '  shift\n'
+       'done\n'
+       'if [ "$mode" = pids ]; then\n'
+       '  echo "$pids" | tr "," "\\n" | while read -r p; do\n'
+       '    awk -F"\\t" -v p="$p" \'$1==p {print "p" $1; print "n" $4}\' "' + fx + '"\n'
+       '  done\n'
+       'else\n'
+       '  awk -F"\\t" \'{print "p" $1; print "n" $4}\' "' + fx + '"\n'
+       'fi\n')
+    env = _base_env({"HOME": os.path.join(tmp, "home"),
+                     "CYS_PACK_DIR": os.path.join(tmp, "nopack"),
+                     "PATH": binp + os.pathsep + os.environ.get("PATH", "")})
+    return env, proj
+
+
+@specimen("H-OBS-3", "W1a",
+          "다중 세션 카운트가 ps 로 claude 3형태만 고르고 lsof -a -p 로 cwd 를 AND 판정", ["G33", "G34"])
 def h_obs_3():
     body = _read(os.path.join(HOOKS_DIR, "inject-context.sh"))
-    need("-c claude" in body, "lsof 계측이 claude 프로세스를 세지 않는다(계측기 타당성)")
+    need("lsof -a -p" in body,
+         "lsof 선택자 AND(`-a -p`)가 없다 — `-c … -d cwd` 는 OR 이라 cwd 만 맞으면 전부 센다")
+    need("lsof -c node -c claude" not in body, "구식 OR 선택자(`-c node -c claude`) 잔존")
+    need("ps -eo" in body, "pid 선택이 ps 로 넘어오지 않았다(네이티브 claude 는 lsof COMMAND 가 버전 문자열)")
     with tempfile.TemporaryDirectory() as tmp:
+        env, proj = _a1_mock_env(tmp)
+        payload = json.dumps({"source": "clear", "cwd": proj})
+        r = _run([BASH, _hook("inject-context.sh")], env=env, input=payload)
+        need(r.returncode == 0, "훅이 비0 종료(%d): %r" % (r.returncode, r.stderr[-300:]))
+        need("동시에 도는 claude 세션이 3개 감지됨" in r.stdout,
+             "claude 3형태(런처·npm node·버전경로)만 정확히 계수하지 못했다: %r" % r.stdout[-500:])
+        # ── 계측 타당성(음성 대조): 구 훅을 **같은 목**에 돌리면 과대계수가 나야 한다 ──
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh")
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r2 = _run([BASH, os.path.join(oldd, "inject-context.sh")], env=env, input=payload)
+            m = re.search(r"세션이 (\d+)개 감지됨", r2.stdout)
+            need(m is not None and int(m.group(1)) >= 5,
+                 "계측 타당성 실패: 구 훅이 같은 목에서 과대계수를 내지 않는다 — 목이 결함을 "
+                 "재현하지 못하므로 신 훅의 '3' 은 아무것도 증명하지 않는다: %r" % r2.stdout[-400:])
+            calib = "구 훅 과대계수 %s 재현" % m.group(1)
+    return "목 ps/lsof 로 claude 3형태만 계수(정답 3) · 계측검증=%s" % calib
+
+
+@specimen("H-SOUL-LANE-1", "W1a", "soul 해소가 레인 팩(CYS_PACK_DIR/soul.md)을 본부 soul 보다 앞세운다",
+          ["A4-15"])
+def h_soul_lane_1():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        lane = os.path.join(tmp, "lanepack")          # ★`pack-dept-` 접두 회피(부서 분기 무개입)
         proj = os.path.join(tmp, "proj")
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
-        binp = os.path.join(tmp, "bin")
-        # 목 lsof: `-c claude` 가 인자에 있을 때만 cwd 행 2개를 낸다(=네이티브 claude 2세션)
-        _w(os.path.join(binp, "lsof"),
-           '#!/bin/sh\nfor a in "$@"; do [ "$a" = claude ] && '
-           '{ printf "n%%s\\nn%%s\\n" "%s" "%s"; exit 0; }; done\nexit 0\n' % (proj, proj))
-        for tool in ("sed", "grep", "date", "wc", "tr", "awk", "head", "tail", "cat",
-                     "dirname", "basename", "ls", "rm", "mkdir", "python3", "sh", "bash"):
-            src = shutil.which(tool)
-            if src and not os.path.exists(os.path.join(binp, tool)):
-                os.symlink(src, os.path.join(binp, tool))
-        env = _base_env({"HOME": os.path.join(tmp, "home"), "PATH": binp,
-                         "CYS_PACK_DIR": os.path.join(tmp, "nopack")})
-        r = _run([BASH, _hook("inject-context.sh")], env=env,
-                 input=json.dumps({"source": "clear", "cwd": proj}))
-        need("동시에 도는 claude 세션이 2개 감지됨" in r.stdout,
-             "claude 세션 2개를 계수하지 못했다: %r" % r.stdout[-500:])
-    calib = "skip(no-git)"
-    old = _git_show("cysjavis-pack/hooks/inject-context.sh")
-    if old is not None:
-        need("-c claude" not in old, "계측 타당성 실패: 구 코드가 이미 claude 를 셌다")
-        calib = "구 코드 node 전용 계측 확인"
-    return "목 lsof 로 claude 2세션 계수 확인 · 계측검증=%s" % calib
+        _w(os.path.join(home, ".claude", "soul.md"),
+           "# hq\n## [HQ-ANCHOR]\nHQ-SOUL-MARKER\n", 0o644)
+        _w(os.path.join(lane, "soul.md"),
+           "# lane\n## [LANE-ANCHOR]\nLANE-SOUL-MARKER\n", 0o644)
+        payload = json.dumps({"source": "startup", "cwd": proj})
+        env = _base_env({"HOME": home, "CYS_PACK_DIR": lane})
+        r = _run([BASH, _hook("inject-context.sh")], env=env, input=payload)
+        need(r.returncode == 0, "훅이 비0 종료(%d)" % r.returncode)
+        need("LANE-SOUL-MARKER" in r.stdout, "레인 soul 이 주입되지 않았다: %r" % r.stdout[:400])
+        need("HQ-SOUL-MARKER" not in r.stdout,
+             "레인 pane 인데 **본부 soul** 이 주입됐다(레인 정체가 덮인다): %r" % r.stdout[:400])
+        # 회귀 0: 레인에 soul 이 없으면 종전대로 레거시 ~/.claude/soul.md 로 폴백한다
+        nosoul = os.path.join(tmp, "lanepack-nosoul")
+        os.makedirs(nosoul, exist_ok=True)
+        r2 = _run([BASH, _hook("inject-context.sh")],
+                  env=_base_env({"HOME": home, "CYS_PACK_DIR": nosoul}), input=payload)
+        need("HQ-SOUL-MARKER" in r2.stdout,
+             "레인 soul 부재 시 레거시 폴백이 끊겼다(회귀): %r" % r2.stdout[:400])
+        # 계측 타당성: 구 훅은 같은 조건에서 **본부 soul** 을 주입해야 한다(결함 재현)
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh")
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r3 = _run([BASH, os.path.join(oldd, "inject-context.sh")], env=env, input=payload)
+            need("HQ-SOUL-MARKER" in r3.stdout,
+                 "계측 타당성 실패: 구 훅이 같은 조건에서 본부 soul 을 주입하지 않는다 — "
+                 "결함 미재현: %r" % r3.stdout[:400])
+            calib = "구 훅 본부 soul 주입 재현"
+    return "레인 soul 우선 · 부재 시 레거시 폴백 보존 · 계측검증=%s" % calib
+
+
+@specimen("H-LANE-GUARD-1", "W1a",
+          "레인 가드가 **타 팩** 훅만 조기 종료하고 같은 팩·비-팩 레인·opt-out·사용자 오버레이는 통과",
+          ["A4-16"])
+def h_lane_guard_1():
+    lib = _read(os.path.join(HOOKS_DIR, "_lib.sh"))
+    need("cys_lane_guard" in lib, "레인 가드가 프리루드에 없다")
+    need("hooks/_lib.sh" in lib, "판별자가 양쪽 대칭(`<루트>/hooks/_lib.sh` 실재)으로 서술돼 있지 않다")
+    MSG = "타 레인 팩 훅 조기 종료"
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
+        _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
+        payload = json.dumps({"source": "clear", "cwd": proj})
+        hook = _hook("inject-context.sh")
+
+        def run(pack, extra=None, path=hook):
+            e = {"HOME": home, "CYS_PACK_DIR": pack}
+            if extra:
+                e.update(extra)
+            return _run([BASH, path], env=_base_env(e), input=payload)
+
+        # ① 양성 — 진짜 다른 팩(hooks/_lib.sh 실재) 레인에서 본부 훅이 발화 → 조기 종료
+        other = os.path.join(tmp, "otherpack")
+        _w(os.path.join(other, "hooks", "_lib.sh"), lib, 0o644)
+        r1 = run(other)
+        need(r1.returncode == 0, "조기 종료가 exit 0 이 아니다(%d)" % r1.returncode)
+        need(r1.stdout == "",
+             "타 레인 팩 훅인데 가드가 발화하지 않았다(주입 누수): %r" % r1.stdout[:300])
+        # ①' stderr 문구는 **프리루드를 직접 로드하는** 경로에서 잰다 — 훅의 규약 문장은
+        #    `. "…/_lib.sh" 2>/dev/null` 이라 source 명령 전체의 stderr 가 억제된다(그 억제는
+        #    이 커밋 범위 밖의 기존 계약이다). 문구가 실재한다는 사실 자체는 여기서 못박는다.
+        hookpack = os.path.join(tmp, "hookpack")      # 훅 쪽도 진짜 팩 형상이어야 판정이 선다
+        _w(os.path.join(hookpack, "hooks", "_lib.sh"), lib, 0o644)
+        probe = os.path.join(hookpack, "hooks", "probe.sh")
+        _w(probe, '#!/bin/sh\n. "$(dirname "$0")/_lib.sh"\necho REACHED >&2\n')
+        rp = _run(["sh", probe], env=_base_env({"HOME": home, "CYS_PACK_DIR": other}))
+        need(MSG in rp.stderr, "가드 stderr 문구가 없다: %r" % rp.stderr[:300])
+        need("REACHED" not in rp.stderr, "가드가 조기 종료시키지 않았다(호출측이 계속 돈다)")
+        # ② 음성 — 같은 팩(자기 레인). ★라이브 PACK_DIR 을 CYS_PACK_DIR 로 주지 않는다:
+        #    이 러너는 사용자 트리 무접촉이 계약인데(모듈 헤더), 라이브 팩을 레인으로 지목하면
+        #    그 env 를 물려받은 자식이 팩 치유·설치 경로를 건드릴 표면이 열린다(2026-09-04 실측:
+        #    워크트리 팩에 0.14.29 설치본 아티팩트 `.pristine`·`.merge-pending.json` 과 80건
+        #    모드 변경이 남았다). **팩 형상 사본**으로 같은 판정을 낸다.
+        selfpack = os.path.join(tmp, "selfpack")
+        _w(os.path.join(selfpack, "hooks", "_lib.sh"), lib, 0o644)
+        selfhook = os.path.join(selfpack, "hooks", "inject-context.sh")
+        _w(selfhook, _read(hook))
+        r2 = run(selfpack, path=selfhook)
+        need(MSG not in r2.stderr, "같은 팩인데 가드가 발화했다: %r" % r2.stderr[:300])
+        need(r2.stdout != "", "같은 팩에서 훅 본체가 죽었다")
+        # ③ 음성 — hooks/_lib.sh 가 없는 임시 팩(테스트 하네스·부분 팩 형상)
+        r3 = run(os.path.join(tmp, "nopack"))
+        need(MSG not in r3.stderr, "비-팩 레인에서 가드가 발화했다(판정 불능은 통과여야 한다)")
+        need(r3.stdout != "", "비-팩 레인에서 훅 본체가 죽었다")
+        # ④ 음성 — opt-out
+        r4 = run(other, {"CYS_HOOK_LANE_GUARD": "0"})
+        need(MSG not in r4.stderr, "opt-out(CYS_HOOK_LANE_GUARD=0)이 듣지 않는다")
+        need(r4.stdout != "", "opt-out 인데 훅 본체가 죽었다")
+        # ⑤ ★음성 — 사용자 로컬 오버레이 형상(`~/.cys/local/hooks/<이벤트>.d/`): 그 트리에는
+        #    `hooks/_lib.sh` 가 **없다**. 한쪽만 보는 판별자였다면 여기서 전면 무발동한다.
+        ov = os.path.join(tmp, "local", "hooks", "sub", "inject-context.sh")
+        _w(ov, _read(hook))
+        r5 = run(selfpack, path=ov)
+        need(r5.returncode == 0, "오버레이 훅이 비0 종료(%d)" % r5.returncode)
+        need(MSG not in r5.stderr,
+             "사용자 로컬 오버레이 훅을 가드가 죽였다 — 업데이트 불가침 확장점 파괴: %r"
+             % r5.stderr[:300])
+        need(r5.stdout != "", "오버레이 훅 본체가 죽었다(2단 프리루드 폴백 경로)")
+    return "양성 1(조기 종료·stdout 0) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -10498,7 +10849,17 @@ def _u22_violations(cli, daemon, sh):
     elif "set_var(cys::ENV_NO_AUTOSTART, cys::NO_AUTOSTART_ON)" not in rh:
         v.append("CLI: run_hook 이 CYS_NO_AUTOSTART 를 자기 강제하지 않는다 — 단명 훅이 데몬을 낳는다(R2)")
 
-    ru = _u22_fn_body(cli, "fn run_hook_user_prompt_submit()")
+    # ★앵커를 **열린 괄호까지만** 잡는다(2026-09-04 · W-B 규명 · master 지시).
+    #   종전 앵커는 빈 인자 리터럴 `…submit()` 이었는데 B2-b(`7d99300`)에서 그 함수에 `input`
+    #   인자가 생겨 시그니처가 `(input: Option<&std::path::Path>)` 로 바뀌었다. 함수는 **실재**
+    #   하는데 앵커만 낡아, 그 리비전 이후 이 축은 "정의를 찾지 못했다(계측 불능)"로 **적색**이
+    #   됐다 — 시끄럽되 **사실 검증은 0회**인 무측정 적색이다(종전 '무음 통과'의 반대 극이며
+    #   같은 계급의 거짓 신호다: 하나는 결함을 숨기고 하나는 결함이 아닌 것을 결함이라 외친다).
+    #   이 축은 U-22 배선(fail-open · 전용 데드라인 · NO_AUTOSTART 자기강제 · 데몬 핫패스 금지)을
+    #   재는 **유일한 축**이라 방치하면 그 4종이 통째로 무관측이 된다.
+    #   ★오포착 없음(음성 대조 실측): `fn run_hook_user_prompt_submit(` 는 두 리비전 모두
+    #     **정확히 1건**이고 `…submit<접미>(` 형태의 유사 함수는 **0건**이다.
+    ru = _u22_fn_body(cli, "fn run_hook_user_prompt_submit(")
     if ru is None:
         v.append("CLI: run_hook_user_prompt_submit 정의를 찾지 못했다(계측 불능)")
     else:
@@ -10672,7 +11033,7 @@ def _u22_violations(cli, daemon, sh):
 def h_hook_decide_1():
     cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
         raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
     need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
@@ -10728,7 +11089,7 @@ def h_hook_decide_1():
 def h_hook_decide_2():
     cli = _read(os.path.join(REPO_DIR, _U22_RS_CLI))
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
         raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
     # ① contract_version 3중 일치
@@ -10791,7 +11152,7 @@ def h_hook_decide_2():
           "U-22 구 경로 판정기 동적 시험 — 합성 표본 3종 참 · 음성대조 6종 거짓(스큐로 결함 삼킴 방지)",
           ["R2"])
 def h_hook_decide_3():
-    sh = _read(os.path.join(HOOKS_DIR, "role-bootstrap.sh"))
+    sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
     m = re.search(r"^_cys_hook_legacy_unavailable\(\)\s*\{.*?^\}", sh, re.S | re.M)
     need(m, "_cys_hook_legacy_unavailable 정의를 추출하지 못했다 — 판정기 부재")
@@ -11020,7 +11381,7 @@ def h_boot_intent_1():
         notes.append("claim rc6: frontdoor 미시도·폴백 spawn 1·정직 예보 보존")
 
     # ── 소스 핀(판독기 동형 3층 · R3-P2-3) — 훅은 팩에 항상 실재한다 ──
-    hook = _read(_hook("role-bootstrap.sh"))
+    hook = _read(_hook(ROLE_BODY))
     for tk in ("enqueued", "error", "legacy"):
         need(re.search(r'^\s*"\[cys-hook\] boot-intent: %s"[|)]' % tk, hook, re.M),
              "훅이 boot-intent 토큰 %r 를 **줄 단위 정확 일치**로 읽지 않는다(A3=B7 계열 위조 "
@@ -11523,7 +11884,11 @@ def h_ci_tag_1():
     blind = []
     for label, mutated in (
         ("태그 트리거 삭제", on.replace("tags: ['v*']", "")),
-        ("feat 브랜치 삭제", on.replace("branches: ['feat/**']", "")),
+        # ★변조는 **단언 대상 토큰**을 지운다 — 줄 전체를 리터럴로 지우면, 그 줄에 항목이
+        #   하나라도 추가되는 순간 replace 가 아무것도 못 바꿔 변조가 무효가 된다(그러면
+        #   이 검체는 '탐지기 고장'을 오신고한다 — 2026-09-04 실사고: `fix/**` 편입이 그 줄을
+        #   바꾸자 곧바로 재현됐다). 토큰만 지우면 줄 모양이 어떻게 바뀌어도 문다.
+        ("feat 브랜치 삭제", re.sub(r"['\"]feat/\*\*['\"]\s*,?\s*", "", on)),
         ("PR 트리거 추가", on + "\n  pull_request: {}\n"),
     ):
         hit = (re.search(r"tags:\s*\[?\s*['\"]v\*['\"]", mutated)

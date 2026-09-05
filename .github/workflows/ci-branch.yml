@@ -17,7 +17,12 @@ name: ci-branch
 
 on:
   push:
-    branches: ['feat/**']
+    # ★fix/** 편입(2026-09-04 · 부트 v2 D4 master 판정). 종전엔 feat/** 뿐이라 수리 레인
+    #   (fix/0.14.30-*)의 커밋이 **어느 CI 레인에서도 돌지 않았다** — 이 레인 자신이 잡으라고
+    #   만들어진 '브랜치 초록의 조기 경보'가 정작 수리 브랜치에 무발화였다는 뜻이다.
+    #   릴리스 직전 수리가 태그 레인(20분)에서야 검증되는 것을 막는다. 태그·발행 트리거는
+    #   여전히 없다(이 파일은 push 전용 경량 CI).
+    branches: ['feat/**', 'fix/**']
   workflow_dispatch: {}
 
 permissions:
@@ -505,7 +510,9 @@ jobs:
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
-                   test_preflight_c62_c68_ledger; do
+                   test_preflight_c62_c68_ledger \
+                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="

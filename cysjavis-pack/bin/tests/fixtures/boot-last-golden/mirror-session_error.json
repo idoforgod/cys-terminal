@@ -1,0 +1,12 @@
+{
+ "channel": "<channel>",
+ "state": "session_error",
+ "exit": 10,
+ "run_id": "<run_id>",
+ "surface": "7",
+ "lane": "base",
+ "boot_last": "<boot_last>",
+ "retry_eligible": true,
+ "retry_eligible_unknown": false,
+ "log_write_failures": 0
+}

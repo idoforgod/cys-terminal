@@ -1,0 +1,131 @@
+{
+  "$doc": [
+    "소켓 경로 → 레인 판정 공유 코퍼스 (P0 레인 격리 누출 수리 · 2026-09-04)",
+    "소비자 둘: Rust `cysd::delivery::{socket_is_base,lane_key}` · python `javis_lane.{socket_is_base,lane_key}`.",
+    "두 구현이 **같은 파일**을 판정표로 쓴다 — 한쪽만 고쳐지면 여기서 적색이 난다.",
+    "",
+    "★수리 전 결함: base 판정이 **basename 만** 봤다. 그래서 관례적 파일명(cys.sock)을 유지한 채",
+    "  디렉터리만 분리한 격리 소켓이 전부 base 로 접혀 본 레인 delivery-base.jsonl·epoch 을 오염시켰다.",
+    "  역설적으로 파일명이 다른 커스텀 소켓(/tmp/whatever.sock)은 올바로 격리됐다 —",
+    "  즉 **가장 흔한 격리 방식만** 조용히 실패했다.",
+    "",
+    "★수리 후 규칙: base ⟺ (소켓 미설정) 또는 (basename ∈ {cys, cys.sock} AND 부모 디렉터리 이름이",
+    "  **정확히** `cys` AND 경로에 `cys-dept-` 성분 없음). Windows 명명 파이프는 성분 분해가",
+    "  부적합하므로 basename 판정을 보존한다.",
+    "★기계 독립: 실제 홈 경로·파일 존재 여부와 무관하게 **경로 모양**만 본다(그래야 이 표가",
+    "  기계마다 같은 답을 낸다).",
+    "",
+    "lane_key = base 이면 \"base\", 아니면 sanitize_sock_key(경로).",
+    "sanitize_sock_key 값은 이 표에서 검증하지 않는다(별도 계약) — `is_base` 만 양 언어가 대조한다.",
+    "",
+    "★알려진 한계(숨기지 않는다 · master 조건 ① 2026-09-04):",
+    "  판정은 **부모 디렉터리 이름**만 보므로 `<임의>/cys/cys.sock` — 기본 트리를 다른 곳에",
+    "  그대로 미러한 경로(예: /tmp/cys/cys.sock) — 는 **여전히 base 로 접힌다.**",
+    "  절대경로 전체를 플랫폼 기본 경로와 비교하면 막을 수 있으나, 그러면 판정이 기계(홈 경로)에",
+    "  의존해 이 표가 기계마다 다른 답을 내고 2언어 파리티가 깨진다. 그래서 **기계 독립을 택하고",
+    "  한계를 명시**한다.",
+    "  → 그런 형태로 격리할 때는 **CYS_STATE_DIR 를 반드시 함께 지정**하라(상태 파일이 그 디렉터리",
+    "    안에만 생기므로 본 레인이 오염되지 않는다 — W-A 실기동 실측으로 확인된 축이다).",
+    "  → 가시화는 별건이다: 데몬이 'CYS_SOCKET 명시 + base 판정 + 기본 경로와 상이' 를 만나면",
+    "    경고 이벤트를 낸다(판정은 바꾸지 않는다 · master 조건 ②)."
+  ],
+  "cases": [
+    {
+      "sock": "",
+      "is_base": true,
+      "why": "소켓 미설정 = base(종전 동작 보존)"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys/cys.sock",
+      "is_base": true,
+      "why": "★진짜 기본 소켓 — 반드시 base 여야 기존 delivery-base.jsonl 이 유효하다"
+    },
+    {
+      "sock": "/home/x/.local/state/cys/cys.sock",
+      "is_base": true,
+      "why": "리눅스 기본 소켓 모양"
+    },
+    {
+      "sock": "/nonexistent/machine/.local/state/cys/cys.sock",
+      "is_base": true,
+      "why": "기계 독립 — 존재하지 않는 경로도 모양만 맞으면 base"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys/cys",
+      "is_base": true,
+      "why": "basename `cys`(확장자 없는 변형)도 허용 — 종전 계약 보존"
+    },
+    {
+      "sock": "/Users/x/.cys/state-harness/cys.sock",
+      "is_base": false,
+      "why": "★실사고 격리 소켓 ① — 수리 전에는 base 로 접혀 본 레인을 오염시켰다"
+    },
+    {
+      "sock": "/var/folders/ab/T/l1-new-1234/cys.sock",
+      "is_base": false,
+      "why": "★실사고 격리 소켓 ② — 동일"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys-harness/cys.sock",
+      "is_base": false,
+      "why": "부모가 `cys` 로 **시작**하지만 `cys` 가 아니다 — 접두 비교로 완화하면 여기서 적색"
+    },
+    {
+      "sock": "/Users/x/.local/state/cystest/cys.sock",
+      "is_base": false,
+      "why": "동일(접두 완화 탐지)"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys2/cys.sock",
+      "is_base": false,
+      "why": "동일(접두 완화 탐지)"
+    },
+    {
+      "sock": "/Users/x/.cys/cys.sock",
+      "is_base": false,
+      "why": "부모가 `.cys` — `cys` 가 아니다"
+    },
+    {
+      "sock": "/tmp/whatever.sock",
+      "is_base": false,
+      "why": "파일명이 다른 커스텀 소켓 — 수리 전후 모두 비-base(회귀 없음)"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys-dept-sales/cys.sock",
+      "is_base": false,
+      "why": "부서 레인 — `cys-dept-` 성분 가드(수리 전후 동일)"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys-dept-sales/sub/cys.sock",
+      "is_base": false,
+      "why": "경로 어디든 `cys-dept-` 성분이 있으면 비-base"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys",
+      "is_base": true,
+      "why": "Windows 기본 명명 파이프 — 성분 분해 부적합, basename 판정 보존"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys-harness",
+      "is_base": false,
+      "why": "Windows 비기본 파이프"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys-dept-sales",
+      "is_base": false,
+      "why": "Windows 부서 파이프"
+    },
+    {
+      "sock": "/tmp/cys/cys.sock",
+      "is_base": true,
+      "known_limitation": true,
+      "why": "★알려진 한계 — 기본 트리를 미러한 경로는 부모가 `cys` 라 base 로 접힌다. CYS_STATE_DIR 격리 필수(조건 ①)"
+    },
+    {
+      "sock": "/var/tmp/mirror/cys/cys.sock",
+      "is_base": true,
+      "known_limitation": true,
+      "why": "★알려진 한계 — 동일(깊은 경로여도 부모 이름만 본다)"
+    }
+  ]
+}

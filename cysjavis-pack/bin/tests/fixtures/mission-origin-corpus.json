@@ -1,0 +1,1242 @@
+{
+ "$doc": [
+  "mission-origin-corpus.json — 임무 대장 기계유래 판정(층0/층0-c/층1/층2)의 **판정표 단일 원본**(0.14.30 W-A A3 · 부트 v2 명세 §2-3).",
+  "스키마: {$constants:{…}, anomaly_codes:[…], harness_markers:{notify,context}, layer0:[{name,text,expect:{harness,residual?,blocks?,free_meaningful?},why}], layer0c:[{name,text,expect:{boot_command},why}], layer1:[{name,my_surface,now_epoch,ledger:{present,raw?,records:[{gen,surface,ts_offset_s|ts_offset_window_mult,body,origin,v?,units?,parts_capped?,part?,parent?}|{gen,raw}]},prompt,expect:{ledger_status,machine,label,anomalies},why}], layer2:[{name,text,expect:{label,head},why}]} — text/prompt/body 는 문자열 또는 {repeat:{unit,times}} 생성 지시자. 레코드의 sha256·chars·preview 는 **소비자가 자기 정규화·해시 함수로 만든다**(필드 사본 금지). why 는 사람용 근거이며 판정에 불참한다.",
+  "소비자: javis_mission.py --self-test(부재 시 내장 리터럴 폴백 · 존재하는데 불량이면 hard fail) · bin/tests/test_mission_origin_parity.py · (예정) Rust src/mission_gate.rs 의 include_str! 파리티.",
+  "불변식: 이 파일은 javis_mission.py 내장 MISSION_CORPUS_FALLBACK 의 상위집합이어야 하고(self-test 가 검사), anomaly_codes 는 ANOMALY_CODES 키 집합과 **정확히 같아야** 하며(확장 창구가 아니라 사본이다 — 코드 추가는 javis_mission.py 의 리터럴 발행 지점 + MASTER_DIRECTIVE §0-C 가 함께 움직일 때만), harness_markers 는 HARNESS_NOTIFY/CONTEXT_MARKERS 와 순서까지 같아야 한다.",
+  "확장 규칙: 새 케이스는 여기 먼저 넣는다. 기대값은 **판정 함수를 실제로 돌려 뽑은 값**이지 손으로 쓴 값이 아니다. 한국어 진단 산문은 계약면에 넣지 않는다(문구를 다듬는 순간 계측기가 거짓말을 시작한다 — parity_todo_decl.py:17-20). 층1 의 ⓐ전문 일치와 층2 라벨은 둘 다 이상징후를 발행하지 않으므로, 두 축(machine·label)과 ledger_status·anomalies 네 필드의 조합으로 구별된다 — 케이스를 추가할 때 이 구별이 유지되는지 확인하라.",
+  "digest_vectors(2026-09-04 R2 적대검증 MAJOR 반영): 정규화·해시 골든 벡터 10건. **왜 필요한가** — 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어지므로, python↔Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은 그 케이스들로 탐지되지 않는다. 명세 §2-3 이 층1 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized(delivery.rs:709 재사용)` 다. 종전에는 이 앵커가 python self-test **인라인 리터럴**에만 있어 include_str! 로 Rust 에 전달되지 않았고, B1 은 사본을 다시 쓸 수밖에 없었다(이 fixture 가 없애려던 바로 그것). `normalized`·`sha256` 은 실측값이다.",
+  "mission_extract(2026-09-04 · B1-5 대장 writer 파리티): `extract_mission` 골든 10건. **왜 필요한가** — 층0/층0-c/층1/층2 는 전부 대장의 **reader**(무엇을 기계유래로 볼 것인가)를 재고, 대장에 무엇이 **쓰이는가**(writer)는 어느 축도 재지 않았다. 임무 문자열이 갈리면 reader 가 아무리 정확해도 자율 착수 게이트가 다른 값을 본다. 기대값은 python `extract_mission` 실측이며(impl/W-B/evidence/b15-python-parity.txt 와 10/10 일치) Rust 측이 include_str! 로 **같은 값을** 소비한다. `expect.mission` 은 문자열·null 또는 {repeat:{unit,times}} 이며, **사유(reason) 산문은 계약면에 넣지 않는다** — 한국어 진단 문구를 다듬는 순간 계측기가 거짓말을 시작한다(위 확장 규칙과 같은 근거)."
+ ],
+ "$constants": {
+  "SCHEMA_VERSION": 1,
+  "MISSION_MIN_CHARS": 3,
+  "MISSION_MAX_CHARS": 400,
+  "HARNESS_SCAN_MAX_CHARS": 5000000,
+  "HARNESS_SCAN_PREFIX_CHARS": 200000,
+  "PREVIEW_CHARS": 64,
+  "PART_PREVIEW_CHARS": 24,
+  "DELIVERY_PART_MIN_CHARS": 24,
+  "DELIVERY_WITHIN_MIN_CHARS": 24,
+  "DELIVERY_SPAN_OCC_BUDGET": 100000,
+  "DELIVERY_CAPPED_FOLD_S": 600,
+  "DELIVERY_SCAN_LINES": 250000,
+  "LEDGER_MAX_READ_BYTES": 16777216,
+  "DELIVERY_WINDOW_S_DEFAULT": 21600,
+  "MISSION_TTL_S_DEFAULT": 43200
+ },
+ "anomaly_codes": [
+  "delivery_anchor_capped",
+  "delivery_concatenated",
+  "delivery_out_of_window",
+  "delivery_parts_capped",
+  "delivery_prompt_within_delivery",
+  "delivery_substring",
+  "env_above_cap",
+  "env_below_floor",
+  "env_not_int",
+  "ledger_absent",
+  "ledger_bad_lines",
+  "ledger_rotated",
+  "ledger_schema_skew"
+ ],
+ "harness_markers": {
+  "notify": [
+   "task-notification",
+   "system-reminder",
+   "local-command-caveat",
+   "local-command-stdout",
+   "local-command-stderr",
+   "command-name",
+   "command-message",
+   "command-args",
+   "bash-input",
+   "bash-stdout",
+   "bash-stderr",
+   "ide_selection"
+  ],
+  "context": [
+   "tool-use-id",
+   "output-file",
+   "summary",
+   "status",
+   "task-id"
+  ]
+ },
+ "layer0": [
+  {
+   "name": "L0-real-incident-task-notification",
+   "text": "<task-notification><task-id>abcdefgh</task-id><status>completed</status><summary>done</summary></task-notification>",
+   "expect": {
+    "harness": true,
+    "residual": "",
+    "blocks": 1,
+    "free_meaningful": 0
+   },
+   "why": "2026-08-22 실사고 형태 — 정형 task 알림 전문(이름 축 ⓐ)"
+  },
+  {
+   "name": "L0-system-reminder-only",
+   "text": "<system-reminder>hint</system-reminder>",
+   "expect": {
+    "harness": true,
+    "residual": "",
+    "blocks": 1,
+    "free_meaningful": 0
+   },
+   "why": "마커 블록 단독 — 잔여문 0자"
+  },
+  {
+   "name": "L0-context-marker-block-only",
+   "text": "<tool-use-id>abc</tool-use-id>",
+   "expect": {
+    "harness": true,
+    "residual": "",
+    "blocks": 1,
+    "free_meaningful": 0
+   },
+   "why": "HARNESS_CONTEXT_MARKERS 계열도 이름 축에 든다"
+  },
+  {
+   "name": "L0-marker-prefix-owner-tail",
+   "text": "<system-reminder>배경 설명</system-reminder>\n파싱 로직을 전면 재작성하고 릴리스해라",
+   "expect": {
+    "harness": false,
+    "residual": "파싱 로직을 전면 재작성하고 릴리스해라",
+    "blocks": 1,
+    "free_meaningful": 17
+   },
+   "why": "★오너 삼킴 음성 대조 — 선행 리마인더 뒤 오너 지시는 반드시 통과한다(실측 관통 3줄 중 1)"
+  },
+  {
+   "name": "L0-unclosed-leading-marker",
+   "text": "<command-name> 파싱하는 코드를 전면 재작성하고 배포해라",
+   "expect": {
+    "harness": false,
+    "residual": "파싱하는 코드를 전면 재작성하고 배포해라",
+    "blocks": 0,
+    "free_meaningful": 18
+   },
+   "why": "★절단 폴백 부재 계약 — 짝 없는 선두 태그는 태그만 지우고 뒤 본문을 남긴다"
+  },
+  {
+   "name": "L0-unclosed-marker-tag-owner-tail",
+   "text": "오너 문장 <task-notification> 뒤 본문",
+   "expect": {
+    "harness": false,
+    "residual": "오너 문장 뒤 본문",
+    "blocks": 0,
+    "free_meaningful": 7
+   },
+   "why": "★잔여문 정확 일치 핀 — 태그만 사라지고 앞뒤 본문은 남는다"
+  },
+  {
+   "name": "L0-generic-block-only",
+   "text": "<div><p></p></div>",
+   "expect": {
+    "harness": true,
+    "residual": "<div><p></p></div>",
+    "blocks": 1,
+    "free_meaningful": 0
+   },
+   "why": "구조 축 ⓑ — 목록에 없는 태그도 자유 텍스트 0자면 접는다"
+  },
+  {
+   "name": "L0-selfclosing-block-only",
+   "text": "<br/>",
+   "expect": {
+    "harness": true,
+    "residual": "<br/>",
+    "blocks": 1,
+    "free_meaningful": 0
+   },
+   "why": "구조 축 — 자기닫힘 태그도 블록으로 계상된다"
+  },
+  {
+   "name": "L0-generic-block-with-free-text",
+   "text": "<div><p>x</p></div> 고쳐",
+   "expect": {
+    "harness": false,
+    "residual": "<div><p>x</p></div> 고쳐",
+    "blocks": 1,
+    "free_meaningful": 2
+   },
+   "why": "★구조 축 발화조건 ==0 핀 — 자유 텍스트 2자짜리 오너 프롬프트를 접으면 안 된다(중대4)"
+  },
+  {
+   "name": "L0-generic-block-emoji-free-text",
+   "text": "<a>1</a> 👉🔥⚡️",
+   "expect": {
+    "harness": false,
+    "residual": "<a>1</a> 👉🔥⚡️",
+    "blocks": 1,
+    "free_meaningful": 4
+   },
+   "why": "자유 텍스트 계수는 문자 종류를 재단하지 않는다(이모지)"
+  },
+  {
+   "name": "L0-cjk-free-text",
+   "text": "<div>x</div> 漢字",
+   "expect": {
+    "harness": false,
+    "residual": "<div>x</div> 漢字",
+    "blocks": 1,
+    "free_meaningful": 2
+   },
+   "why": "한자도 자유 텍스트다"
+  },
+  {
+   "name": "L0-fence-masked-keeps-owner",
+   "text": "<div>y</div> ```<p>x</p>```",
+   "expect": {
+    "harness": false,
+    "residual": "<div>y</div> ```<p>x</p>```",
+    "blocks": 1,
+    "free_meaningful": 14
+   },
+   "why": "★펜스 마스킹은 **같은 길이의 비공백**으로 한다 — 공백으로 치환하면 자유 텍스트가 0자가 되어 이 오너 프롬프트가 접힌다(교차언어 파리티 핵심 판별자)"
+  },
+  {
+   "name": "L0-fence-masked-owner-tail",
+   "text": "```<task-notification>a</task-notification>``` 이거 설명해줘",
+   "expect": {
+    "harness": false,
+    "residual": "``` ``` 이거 설명해줘",
+    "blocks": 0,
+    "free_meaningful": 52
+   },
+   "why": "코드펜스 안의 마커는 태그로 세지 않는다(인라인 백틱 마스킹)"
+  },
+  {
+   "name": "L0-plain-owner-sentence",
+   "text": "윈도우 실사고 T1 근본수정 진행해",
+   "expect": {
+    "harness": false,
+    "residual": "윈도우 실사고 T1 근본수정 진행해",
+    "blocks": 0,
+    "free_meaningful": 15
+   },
+   "why": "평문 오너 지시 — 무접힘"
+  },
+  {
+   "name": "L0-empty",
+   "text": "",
+   "expect": {
+    "harness": false,
+    "residual": "",
+    "blocks": 0,
+    "free_meaningful": 0
+   },
+   "why": "빈 프롬프트 조기반환"
+  },
+  {
+   "name": "L0-whitespace-only",
+   "text": "   \n\t ",
+   "expect": {
+    "harness": false,
+    "residual": "",
+    "blocks": 0,
+    "free_meaningful": 0
+   },
+   "why": "공백 전용도 조기반환(오너 통과)"
+  },
+  {
+   "name": "L0-big-formed-notification-x2000",
+   "text": {
+    "repeat": {
+     "unit": "<task-notification><task-id>abcdefgh</task-id><status>completed</status><summary>done</summary></task-notification>\n",
+     "times": 2000
+    }
+   },
+   "expect": {
+    "harness": true,
+    "residual": "",
+    "blocks": 2000,
+    "free_meaningful": 0
+   },
+   "why": "★무제한 통과 게이트 봉합(치명3) — 232,000자 정형 알림도 접힌다"
+  },
+  {
+   "name": "L0-huge-over-scan-cap",
+   "text": {
+    "repeat": {
+     "unit": "<task-notification>a</task-notification>",
+     "times": 200000
+    }
+   },
+   "expect": {
+    "harness": true
+   },
+   "why": "★HARNESS_SCAN_MAX_CHARS(5MB) 초과 — 통과시키지 않고 앞 200,000자로 판정한다(프리픽스 판정). 8MB 전문에 대한 residual/free_meaningful 은 계약면에 두지 않는다(비용)"
+  }
+ ],
+ "layer0c": [
+  {
+   "name": "L0c-cys-launch-agent",
+   "text": "cys launch-agent --role master --agent claude",
+   "expect": {
+    "boot_command": true
+   },
+   "why": "2026-09-03 21:19:23 실사고 문자열 — 규칙 A(cys 서브커맨드 전체 일치)"
+  },
+  {
+   "name": "L0c-cys-boot",
+   "text": "cys boot",
+   "expect": {
+    "boot_command": true
+   },
+   "why": "규칙 A 최단형"
+  },
+  {
+   "name": "L0c-cli-claude-flag",
+   "text": "claude-launcher --dangerously-skip-permissions",
+   "expect": {
+    "boot_command": true
+   },
+   "why": "규칙 B(에이전트 CLI 기동 전체 일치 · `claude-<접미>` 분기). ★실제 런처 이름은 오너 계정 핸들을 포함하므로 **일부러 싣지 않는다** — 팩은 전 사용자에게 배포되고 발행 차단 게이트(secret-scan HANDLE)가 그 문자열을 적색으로 잡는다. 판정 축은 접미 유무이지 접미의 내용이 아니라서 합성 이름으로 같은 분기를 탄다."
+  },
+  {
+   "name": "L0c-cli-agy-bare",
+   "text": "agy",
+   "expect": {
+    "boot_command": true
+   },
+   "why": "규칙 B — 플래그 없는 실행 파일명 단독"
+  },
+  {
+   "name": "L0c-hangul-present",
+   "text": "cys boot 실행하고 결과 보고해",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "★조건② 한글 1자라도 있으면 오너 문장으로 통과(음성 대조)"
+  },
+  {
+   "name": "L0c-prose-tail-english",
+   "text": "run cys boot and report",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "★조건④ 전체 일치 아님 — 앞뒤 산문이 붙으면 통과"
+  },
+  {
+   "name": "L0c-multiline",
+   "text": "cys launch-agent --role master --agent claude\n그리고 상태를 알려줘",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "★조건① 원문 개행 — 여러 줄이면 대상 아님"
+  },
+  {
+   "name": "L0c-cys-send-not-covered",
+   "text": "cys send --to master hello",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "조회·발신 계열은 규칙 A 열거에서 **일부러 뺐다** — 그 문장을 임무로 주는 경우가 있다"
+  },
+  {
+   "name": "L0c-over-max-chars",
+   "text": "cys boot ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "★조건③ MISSION_MAX_CHARS(400) 초과는 대상 아님"
+  },
+  {
+   "name": "L0c-empty",
+   "text": "",
+   "expect": {
+    "boot_command": false
+   },
+   "why": "빈 프롬프트"
+  }
+ ],
+ "layer1": [
+  {
+   "name": "L1-exact-match",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "ⓐ 전문 일치 — 데몬이 이 pane 에 주입한 그 문장(이상징후 무발행)"
+  },
+  {
+   "name": "L1-exact-out-of-window",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_window_mult": -1.2,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_out_of_window"
+    ]
+   },
+   "why": "ⓑ 창 밖 전문 일치(R5 ①) — 접되 반드시 흔적을 남긴다. 시각은 창 배수라 env 오버라이드에도 유효"
+  },
+  {
+   "name": "L1-concat-two-deliveries",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     },
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "게이트 수렴 확인 후 보고",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수 게이트 수렴 확인 후 보고",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_concatenated"
+    ]
+   },
+   "why": "ⓒ 조각 연접(R5 ③) — 제출 전 버퍼에 배달 둘이 합쳐졌다"
+  },
+  {
+   "name": "L1-substring-long-delivery",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "이 문장은 스물네 글자 하한을 넘기기 위한 충분히 긴 기계 배달 본문이다",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "앞말 이 문장은 스물네 글자 하한을 넘기기 위한 충분히 긴 기계 배달 본문이다 뒷말",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_substring"
+    ]
+   },
+   "why": "ⓒ 부분 포함 — 하한 24자를 넘는 연속 구간이 배달로만 설명된다"
+  },
+  {
+   "name": "L1-short-repeat-full-cover-folds",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "가",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_concatenated"
+    ]
+   },
+   "why": "★전량 커버(①)에는 길이 하한이 없다 — 1자 배달의 반복이 프롬프트를 남김없이 덮으면 concat 으로 접힌다(오너 구분선 단독 입력이 접히는 잔여 위험 · THREAT-MODEL §4-2b). substr 하한(24자)은 ①이 성립하지 않을 때만 도는 규칙이다"
+  },
+  {
+   "name": "L1-short-repeat-with-owner-tail-not-folded",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "가",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "가가가가가가가가가가가가가가가가가가가가가가가가가가가가가가 오너 지시를 여기 덧붙인다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★R6 ③ 음성 대조 — 잔여 글자가 있어 전량 커버가 깨지면, 같은 1자 배달의 반복만으로는 substr 이 성립하지 않는다(서로 다른 sha 2건 ∨ 단일 레코드 24자 이상이라는 자격 요건). 이 핀이 죽으면 오너의 반복 어절 문장이 통째로 차단된다"
+  },
+  {
+   "name": "L1-prompt-within-delivery",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "첫째 줄 지시문 여기까지\n둘째 줄은 스물네자 하한을 넘는 충분히 긴 행이다",
+      "origin": "send",
+      "units": 2
+     }
+    ]
+   },
+   "prompt": "둘째 줄은 스물네자 하한을 넘는 충분히 긴 행이다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_prompt_within_delivery"
+    ]
+   },
+   "why": "ⓔ 역포함(구 데몬 스큐) — 멀티라인 push 가 행 단위로 쪼개져 제출된 정황(평문 preview 근거)"
+  },
+  {
+   "name": "L1-within-units-one-skipped",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "첫째 줄 지시문 여기까지\n둘째 줄은 스물네자 하한을 넘는 충분히 긴 행이다",
+      "origin": "send",
+      "units": 1
+     }
+    ]
+   },
+   "prompt": "둘째 줄은 스물네자 하한을 넘는 충분히 긴 행이다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★units==1 은 쪼개질 수 없으므로 역포함 대상이 아니다(음성 대조)"
+  },
+  {
+   "name": "L1-parts-capped-recent-folds",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -30.0,
+      "body": "다음 액션 착수",
+      "origin": "send",
+      "parts_capped": 3
+     }
+    ]
+   },
+   "prompt": "원장에 없는 무라벨 문장",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_parts_capped"
+    ]
+   },
+   "why": "ⓖ R7 — 상한 초과 배달 직후의 미매치 프롬프트는 접는다(fail-closed · 창 600s)"
+  },
+  {
+   "name": "L1-parts-capped-old-does-not-fold",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -1200.0,
+      "body": "다음 액션 착수",
+      "origin": "send",
+      "parts_capped": 3
+     }
+    ]
+   },
+   "prompt": "원장에 없는 무라벨 문장",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": [
+     "delivery_parts_capped"
+    ]
+   },
+   "why": "★R7 창 밖(600s 초과)이면 접지 않는다 — 무기한 규칙은 오너를 영구 차단한다(음성 대조)"
+  },
+  {
+   "name": "L1-anchor-budget-capped",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "a",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": {
+    "repeat": {
+     "unit": "a",
+     "times": 100002
+    }
+   },
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "delivery_anchor_capped"
+    ]
+   },
+   "why": "ⓕ 탐색 예산(100000) 소진 — 못 본 구간이 있으면 접는다(R6 ② fail-closed)"
+  },
+  {
+   "name": "L1-no-match-no-label",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "이건 오너가 직접 친 문장이다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★오너 프롬프트 무차단 — 원장 비일치 + 무라벨"
+  },
+  {
+   "name": "L1-no-match-with-label",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "[W-A] 보고합니다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": true,
+    "anomalies": []
+   },
+   "why": "층2 폴백 — 원장 비일치인데 라벨 선두"
+  },
+  {
+   "name": "L1-other-surface-not-mine",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "999999",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★surface 결박 — 남의 pane 배달은 내 층1 대조에 들지 않는다"
+  },
+  {
+   "name": "L1-rotated-generation-hit",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 1,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     },
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "회전 뒤 첫 배달",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "ledger_rotated"
+    ]
+   },
+   "why": "회전 세대(.1)까지 판독 — 회전 직후 배달이 판별에서 사라지면 fail-open ①"
+  },
+  {
+   "name": "L1-schema-skew-mixed",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     },
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "스큐 레코드",
+      "origin": "send",
+      "v": 999
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "ledger_schema_skew"
+    ]
+   },
+   "why": "혼재는 탐지(전용 코드), 전량 스큐는 차단 — 경계가 여기다"
+  },
+  {
+   "name": "L1-bad-line-mixed",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     },
+     {
+      "gen": 0,
+      "raw": "{깨진 줄"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": [
+     "ledger_bad_lines"
+    ]
+   },
+   "why": "부분쓰기·조작 정황 1줄 — 가용성을 위해 잠그지 않고 고지만"
+  },
+  {
+   "name": "L1-zero-bytes-unreadable",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "raw": ""
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "unreadable",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★0바이트 = 손상(fail-closed) — 기동 표식조차 없다. 판독 불가면 층1 을 아예 보지 않는다"
+  },
+  {
+   "name": "L1-zero-bytes-label-still-machine",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "raw": ""
+   },
+   "prompt": "[wakeup] 다음 액션",
+   "expect": {
+    "ledger_status": "unreadable",
+    "machine": true,
+    "label": true,
+    "anomalies": []
+   },
+   "why": "판독 불가여도 층2 라벨은 평가된다(층1 게이트 밖)"
+  },
+  {
+   "name": "L1-duplicate-sha-newer-wins",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_window_mult": -1.2,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     },
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "다음 액션 착수",
+      "origin": "send"
+     }
+    ]
+   },
+   "prompt": "다음 액션 착수",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "같은 sha 는 더 최근 ts 만 남는다 — 창 밖 레코드가 창 안 레코드를 덮으면 안 된다"
+  },
+  {
+   "name": "L1-boot-sentinel-harmless",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "7",
+      "ts_offset_s": -60.0,
+      "body": "",
+      "origin": "boot"
+     }
+    ]
+   },
+   "prompt": "오너가 친 문장 하나",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "기동 표식(chars=0)은 앵커 탐색에서 자동 배제된다"
+  },
+  {
+   "name": "L1-absent-ledger-with-label",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": false
+   },
+   "prompt": "[wakeup] 다음 액션",
+   "expect": {
+    "ledger_status": "absent",
+    "machine": true,
+    "label": true,
+    "anomalies": [
+     "ledger_absent"
+    ]
+   },
+   "why": "원장 부재(데몬 미기동) = 정상이되 근거 없음 — 층2 로만 판별한다는 사실을 고지한다"
+  },
+  {
+   "name": "L1-absent-ledger-no-label",
+   "my_surface": "7",
+   "now_epoch": 1700000000.0,
+   "ledger": {
+    "present": false
+   },
+   "prompt": "오너 지시문이다",
+   "expect": {
+    "ledger_status": "absent",
+    "machine": false,
+    "label": false,
+    "anomalies": [
+     "ledger_absent"
+    ]
+   },
+   "why": "★원장 부재 + 무라벨 = 오너 임무(부트스트랩 불가침) — 여기서 접으면 오너가 임무를 못 준다"
+  }
+ ],
+ "layer2": [
+  {
+   "name": "L2-plain-label",
+   "text": "[wakeup] 다음 액션 착수",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "CLAUDE.md 자기예약 wake 문안 그대로"
+  },
+  {
+   "name": "L2-fullwidth-bracket",
+   "text": "［wakeup］ 다음 액션 착수",
+   "expect": {
+    "label": true,
+    "head": "［"
+   },
+   "why": "우회 5종 ⑤ 전각 대괄호"
+  },
+  {
+   "name": "L2-zwsp-prefix",
+   "text": "​[wakeup] 다음 액션 착수",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "투명문자(Cf) 선행 — 벗기고 첫 글자를 본다"
+  },
+  {
+   "name": "L2-bidi-isolate-prefix",
+   "text": "⁦[W-A] 보고",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "bidi isolate 선행"
+  },
+  {
+   "name": "L2-leading-space",
+   "text": "   [W-A] 보고",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "선행 공백"
+  },
+  {
+   "name": "L2-nested-bracket",
+   "text": "[[wakeup]] 다음 액션",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "우회 5종 ① 중첩 대괄호"
+  },
+  {
+   "name": "L2-unclosed-label",
+   "text": "[열린 라벨 다음 액션",
+   "expect": {
+    "label": true,
+    "head": "["
+   },
+   "why": "★닫는 괄호를 요구하지 않는다 — 요구하면 '닫지 않는다'가 곧 우회다"
+  },
+  {
+   "name": "L2-owner-plain",
+   "text": "다음 액션 착수해줘",
+   "expect": {
+    "label": false,
+    "head": "다"
+   },
+   "why": "오너 평문 — 무라벨"
+  },
+  {
+   "name": "L2-bracket-not-head",
+   "text": "지시 [wakeup] 확인",
+   "expect": {
+    "label": false,
+    "head": "지"
+   },
+   "why": "선두가 아니면 라벨이 아니다"
+  },
+  {
+   "name": "L2-empty",
+   "text": "",
+   "expect": {
+    "label": false,
+    "head": ""
+   },
+   "why": "빈 프롬프트"
+  }
+ ],
+ "digest_vectors": [
+  {
+   "name": "N-fold-ws",
+   "text": "  a \t\n b  ",
+   "expect": {
+    "normalized": "a b",
+    "sha256": "c8687a08aa5d6ed2044328fa6a697ab8e96dc34291e8c2034ae8c38e6fcc6d65"
+   },
+   "why": "공백 접기 — 선행·후행 제거 + 내부 1칸(delivery.rs::normalize)"
+  },
+  {
+   "name": "N-unicode-space",
+   "text": "a　b",
+   "expect": {
+    "normalized": "a b",
+    "sha256": "c8687a08aa5d6ed2044328fa6a697ab8e96dc34291e8c2034ae8c38e6fcc6d65"
+   },
+   "why": "유니코드 전각 공백도 접는다 — 안 접으면 원장이 조용히 무력화된다"
+  },
+  {
+   "name": "N-trim",
+   "text": " x ",
+   "expect": {
+    "normalized": "x",
+    "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+   },
+   "why": "양끝 트림"
+  },
+  {
+   "name": "N-sha-vector",
+   "text": "abc",
+   "expect": {
+    "normalized": "abc",
+    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+   },
+   "why": "sha256 표준 벡터(대조 키가 진짜 sha256 인지)"
+  },
+  {
+   "name": "N-ko-plain",
+   "text": "다음 액션 착수",
+   "expect": {
+    "normalized": "다음 액션 착수",
+    "sha256": "0dbbf71c187bae19e14e6a5ed7492649adc817cf30b1112cf0aa99ca17b0eaa2"
+   },
+   "why": "한글 기본형"
+  },
+  {
+   "name": "N-ko-respaced",
+   "text": "  다음   액션\t착수 \n",
+   "expect": {
+    "normalized": "다음 액션 착수",
+    "sha256": "0dbbf71c187bae19e14e6a5ed7492649adc817cf30b1112cf0aa99ca17b0eaa2"
+   },
+   "why": "같은 문장의 공백 재배치 — N-ko-plain 과 **같은 해시**여야 한다(TUI 재배치 내성)"
+  },
+  {
+   "name": "N-empty",
+   "text": "",
+   "expect": {
+    "normalized": "",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "why": "빈 입력"
+  },
+  {
+   "name": "N-only-ws",
+   "text": " \t\n　 ",
+   "expect": {
+    "normalized": "",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "why": "공백뿐 — 정규화 결과는 빈 문자열"
+  },
+  {
+   "name": "N-crlf",
+   "text": "a\r\nb",
+   "expect": {
+    "normalized": "a b",
+    "sha256": "c8687a08aa5d6ed2044328fa6a697ab8e96dc34291e8c2034ae8c38e6fcc6d65"
+   },
+   "why": "CRLF 도 공백류로 접힌다"
+  },
+  {
+   "name": "N-multi-inner",
+   "text": "a     b     c",
+   "expect": {
+    "normalized": "a b c",
+    "sha256": "0e9f64031fcb2bc708b531c2a20441580425d151a38503f38592a7dd36019d3b"
+   },
+   "why": "내부 다중 공백 → 각 1칸"
+  }
+ ],
+ "mission_extract": [
+  {
+   "name": "ME-decl-only",
+   "text": "너는 마스터이다.",
+   "expect": {
+    "mission": null
+   },
+   "why": "선언절 자체는 임무가 아니다 — 제외 후 잔여 0자"
+  },
+  {
+   "name": "ME-question-only",
+   "text": "오늘 뭐부터 할까?",
+   "expect": {
+    "mission": null
+   },
+   "why": "질의절은 **보고 요구**지 임무가 아니다(자율 착수 게이트를 열면 안 된다)"
+  },
+  {
+   "name": "ME-ack-ko",
+   "text": "응",
+   "expect": {
+    "mission": null
+   },
+   "why": "ack 단독절 — 승인·수긍은 임무 지정이 아니다"
+  },
+  {
+   "name": "ME-ack-en-spaced",
+   "text": "  O K  ",
+   "expect": {
+    "mission": null
+   },
+   "why": "공백이 섞인 ok 도 ack 다 — 판정이 원문 공백에 의존하지 않는다"
+  },
+  {
+   "name": "ME-ack-ko-short",
+   "text": "ㅇㅋ",
+   "expect": {
+    "mission": null
+   },
+   "why": "한국어 축약 ack"
+  },
+  {
+   "name": "ME-ack-thanks",
+   "text": "감사합니다",
+   "expect": {
+    "mission": null
+   },
+   "why": "감사절도 임무가 아니다 — 잔여문이 남아도 ack 계열이면 제외"
+  },
+  {
+   "name": "ME-decl-plus-task",
+   "text": "너는 마스터이다. 릴리스 게이트를 통과시켜라.",
+   "expect": {
+    "mission": "릴리스 게이트를 통과시켜라."
+   },
+   "why": "★핵심 양성 — 선언 **뒤**의 임무는 추출된다(선언절만 제외하고 나머지를 살린다)"
+  },
+  {
+   "name": "ME-one-char",
+   "text": "ㄱ",
+   "expect": {
+    "mission": null
+   },
+   "why": "경계 하한 — 잔여 1자 < MISSION_MIN_CHARS(3). 제외 사유 없이도 짧으면 임무가 아니다"
+  },
+  {
+   "name": "ME-long-450",
+   "text": {
+    "repeat": {
+     "unit": "가",
+     "times": 450
+    }
+   },
+   "expect": {
+    "mission": {
+     "repeat": {
+      "unit": "가",
+      "times": 400
+     }
+    }
+   },
+   "why": "★상한 절단 — writer 가 400자로 자른다. 잘린 **길이**가 계약이므로 골든으로 박는다"
+  },
+  {
+   "name": "ME-bare-task",
+   "text": "릴리스 게이트를 통과시켜라.",
+   "expect": {
+    "mission": "릴리스 게이트를 통과시켜라."
+   },
+   "why": "선언이 없어도 임무는 임무다 — 선언 존재를 임무의 전제로 삼지 않는다"
+  }
+ ]
+}

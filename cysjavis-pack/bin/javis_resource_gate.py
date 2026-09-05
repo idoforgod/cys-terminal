@@ -5,7 +5,8 @@
 - Paperclip의 진짜 런어웨이 차단 = "새 run 시작 전 라이브 재계산해 초과면 착수 거부"(사전 게이트).
 - 승인 패턴은 **구독제(정액) 전용·종량제 과금 금지**다. 정액 구독엔 달러 예산이라는 브레이크가
   아예 없으므로(쓴 만큼 청구되는 축이 없다) metric을 달러가 아닌 자원으로 치환한다:
-    servers  = 로컬 dev/서버 프로세스 수         (자원 거버넌스 '서버 누적' 사고 이력)
+    servers  = 로컬 dev/서버 **논리** 개수(`cys ps` 원장 항목 · A3-b) — 원장 조회 실패 시에만
+               ps 패턴 체인 루트 계수로 폴백(자원 거버넌스 '서버 누적' 사고 이력)
     nodes    = claude/agy/codex 노드 프로세스 수
     load     = 1분 load average / CPU 코어 수 비율
     context  = 자기보고 컨텍스트 %               (60% /clear 규칙)
@@ -15,8 +16,11 @@
 
 기본 임계(우리 자원 거버넌스 실사고 기준):
   servers  soft 2  / hard 3     (watchdog '3개+' 규칙과 정합 — 사후 kill 전에 사전 차단)
-  nodes    soft 12 / hard 18(+동적: max(18, 12 + 활성 부서수*5) — 부서 소켓 존재 기준,
-           2026-07-06 CSO 위임 오탐 수정. --nodes-hard 명시 지정 시 그 값 그대로 우선)
+  nodes    soft 12 / hard 18(+동적: max(18, 12 + Σ활성 부서 좌석) — 활성 = 부서 데몬이
+           `cys status --json --socket <sock>` 에 응답한 부서 · 좌석 = 그 응답의 비-exited surfaces 수 ·
+           응답 실패 = measure_errors `dept(<이름>)` 로 soft 격상(계상 제외). 2026-07-06 CSO 위임
+           오탐 수정(부서당 +5)을 2026-09-03 A3(SURVEY A4·B6-2 · PREP #8)가 좌석 합산으로 치환.
+           --nodes-hard 명시 지정 시 그 값 그대로 우선)
   load     soft 1.0×ncpu / hard 2.0×ncpu
   context  soft 50 / hard 60    (60% 도달 전 저장 후 /clear 규칙)
 
@@ -36,7 +40,8 @@
   의 `_attempts_carry` 시도 원장 하나**이고, 곱셈 투영은 그 위에 얹는 선택 층이다.
   켜는 법: `CYS_FORMATION_BUDGET=<정수> ... check --formation-size <n>`.
 
-테스트/자동화 주입: --servers-override/--nodes-override/--load-override (라이브 측정 대체).
+테스트/자동화 주입: --servers-override/--nodes-override/--load-override/--dept-roster-override
+  (라이브 측정 대체 · 마지막은 부서 로스터 JSON {active,seats,errors,depts} — 잘못된 JSON=EX_USAGE 64).
 사용 예: python3 javis_resource_gate.py check --context 42 --json
 exit codes(A13 타입드 — 코드 상수와 기계 대조):
   0  EXIT_ALLOW     허용
@@ -49,9 +54,12 @@ exit codes(A13 타입드 — 코드 상수와 기계 대조):
 자체검증: python3 javis_resource_gate.py --self-test
 """
 import argparse
+import errno
+import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -87,16 +95,141 @@ NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
 # ★2026-07-06 CSO 위임(master 승인): nodes hard_block 오탐 수정 — A(정적상향)+B(동적 부서가산).
 # 부서 1개 상시 기동만으로도 정적 임계(구 12)를 넘어 오탐하던 문제. 부서 소켓 존재=활성 부서로
 # 세어 그만큼 임계를 완화한다(전면 동적화(C안)는 보류·백로그 — 이번은 A+B만 채택).
+# ★2026-09-03 A3(SURVEY A4·B6-2 · PREP #8 · dept-1 CSO 22:05 "자원 게이트 hard_block 진입 — 계수 결함"):
+#   STEP B 의 '부서당 +5' 는 실제 로스터를 과소평가했다 — dept-1 실측 좌석 9(본부 5 + 9 = nodes 14~17 ·
+#   hard 18 턱밑)라 2부서부터 hard 오탐 경로(SURVEY 좌석 스윕: 2부서 23 > 22). 규칙을
+#   max(18, 12 + Σ좌석)으로 치환한다. 활성 부서 = 소켓 파일 존재가 아니라 **부서 데몬이
+#   `cys status --json --socket <sock>` 에 응답한 부서**(기존 표면 재사용 · 신규 RPC/플래그 0),
+#   좌석 = 그 응답의 비-exited surfaces 수(agent_alive=false 라도 role 을 쥔 좌석은 점유 — PREP #19).
+#   응답 실패(비0·timeout·JSON 파싱·cys 부재·stale 소켓)는 measure_errors `dept(<이름>)` 로 합류해
+#   최소 soft 격상(조용한 계상 제외 금지 · P-ORCH-1) · 활성/좌석 미계상. Windows: named pipe 는
+#   파일이 아니라 glob 무매치 → depts 0(종전 동일) · 호출은 list argv(shell 0).
 NODES_HARD_DEFAULT = 18   # STEP A 정적 floor(구 12) — depts 0~1일 때도 이 완화는 유지
-NODES_HARD_BASE = 12      # STEP B 동적 가산 base — depts>=2부터 동적값이 floor를 추월
-NODES_HARD_PER_DEPT = 5
+NODES_HARD_BASE = 12      # STEP B 동적 base — 12 + Σ좌석 이 floor 18 을 넘으면 그 값이 hard
 DEPT_SOCKET_GLOB = "~/.local/state/cys-dept-*/cys.sock"
+DEPT_STATUS_TIMEOUT = 5   # 부서 데몬 응답 대기(초) — 초과 = 그 부서 dept(<이름>) 오류(계상 제외)
+LEDGER_TIMEOUT = 5        # ★A3-b: `cys ps` 원장 조회 대기(초) — 초과 = 원장 신뢰 불가(패턴 폴백)
 
 
 def _active_dept_count():
-    """부서 소켓(cys-dept-*/cys.sock) 존재 개수 = 활성 부서 수(소켓 파일 존재=기동중)."""
-    import glob
+    """호환 래퍼 — 부서 소켓(cys-dept-*/cys.sock) 파일 존재 개수(구 '활성 부서' 정의).
+    ★A3 이후 measure() 는 이 값을 쓰지 않는다(활성 = 데몬 응답 · _dept_roster). 외부 호출자 보존용."""
     return len(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB)))
+
+
+SOCKET_PROBE_TIMEOUT = 0.3   # ★A3-c: 리스너 유무만 보는 연결 프로브(로컬 unix 소켓 · 밀리초 단위)
+# 확실한 죽음으로 판정하는 errno 집합 — 그 밖은 '판정 불가'라 종전 경로(cys status 왕복)로 간다.
+_ERRNO_DEAD = (errno.ECONNREFUSED, errno.ENOENT, errno.ENOTSOCK)
+
+
+def _socket_listening(path):
+    """unix 소켓에 **리스너가 있는가**(스폰 0 · 밀리초). 판정 불가는 True(종전 경로로 진행).
+
+    ★왜 True 로 접는가: 이 프로브의 목적은 '확실히 죽은 소켓에서 5초를 태우지 않는 것' 하나다.
+      애매한 경우(Windows named pipe·AF_UNIX 미지원·권한 오류 등)까지 여기서 죽이면 프로브가
+      판정기가 되어 버린다 — 판정은 여전히 `cys status` 왕복이 한다(측정 불능은 통과가 아니라
+      **종전 경로로 진행**이다)."""
+    if os.name == "nt":
+        return True                      # named pipe — AF_UNIX 프로브 대상 아님(분기 보존)
+    af_unix = getattr(socket, "AF_UNIX", None)
+    if af_unix is None:
+        return True
+    s = None
+    try:
+        s = socket.socket(af_unix, socket.SOCK_STREAM)
+        s.settimeout(SOCKET_PROBE_TIMEOUT)
+        s.connect(path)
+        return True
+    except OSError as e:
+        # ★'확실한 죽음' 3종만 False 다(실측 2026-09-03): ECONNREFUSED = 소켓은 있으나 리스너
+        #   없음(데몬 비정상 종료 잔재의 전형) · ENOENT = 경로 소멸(glob 과 프로브 사이 레이스) ·
+        #   ENOTSOCK = 소켓이 아닌 일반 파일이 그 자리에 있다(errno 38 — 잔재·오생성). 그 밖의
+        #   OSError(권한·타임아웃·미지원)는 **판정 불가**이므로 True 로 접어 종전 경로로 보낸다.
+        if e.errno in (_ERRNO_DEAD):
+            return False
+        return True
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def _dept_roster(override=None):
+    """부서 로스터 — {"active": 응답 부서 수, "seats": Σ비-exited 좌석, "errors": ["dept(<이름>)", …],
+    "depts": [{"name", "seats"}, …]}. 소켓 glob 마다 `cys status --json --socket <sock>` 를 묻는다.
+    override(--dept-roster-override 로 파싱된 dict)가 있으면 라이브 조회를 전부 생략한다(테스트 주입 —
+    self-test 가 이 머신의 라이브 소켓에 오염되지 않게). 실패한 부서는 errors 에만 남고 활성/좌석에
+    들어가지 않는다(조용한 0 좌석 금지)."""
+    if override is not None:
+        return {"active": int(override.get("active", 0) or 0),
+                "seats": int(override.get("seats", 0) or 0),
+                "errors": list(override.get("errors") or []),
+                "depts": list(override.get("depts") or [])}
+    roster = {"active": 0, "seats": 0, "errors": [], "depts": []}
+    for sock in sorted(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB))):
+        name = os.path.basename(os.path.dirname(sock))
+        if name.startswith("cys-dept-"):
+            name = name[len("cys-dept-"):]
+        # ★A3-c(2026-09-03 23:1x 실측): 죽은 데몬이 남긴 **stale 소켓 파일** 하나당 이 루프가
+        #   DEPT_STATUS_TIMEOUT(5s)을 통째로 태운다(실측 5.11s). 이 게이트는 부트 ④′와 formation
+        #   심박(10분)이 부르는 경로라 그 지연이 그대로 부트에 얹힌다. 리스너 유무는 connect
+        #   프로브로 **밀리초 안에** 판정되므로 스폰 전에 먼저 묻는다 — 판정(오류 계상·soft 격상)은
+        #   종전과 동일하고 **시간만** 줄인다. 정상 teardown 은 상태 디렉터리를 cys-trash 로
+        #   격리해 glob 이 무매치이므로(cys-dept dept_tombstone) 이 형상은 비정상 종료 잔재다.
+        #   Windows: 부서 소켓은 named pipe 라 AF_UNIX 프로브 대상이 아니다 → 프로브를 건너뛰고
+        #   종전 경로(cys status 왕복)로 간다(분기 보존).
+        if not _socket_listening(sock):
+            roster["errors"].append("dept(%s)" % name)
+            continue
+        try:
+            p = subprocess.run(["cys", "status", "--json", "--socket", sock],
+                               capture_output=True, encoding="utf-8", errors="replace",
+                               timeout=DEPT_STATUS_TIMEOUT)
+            if p.returncode != 0:
+                raise ValueError("rc=%d" % p.returncode)
+            doc = json.loads(p.stdout)
+            surfaces = doc.get("surfaces") if isinstance(doc, dict) else None
+            if not isinstance(surfaces, list):
+                raise ValueError("surfaces 부재")
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # TimeoutExpired ⊂ SubprocessError · FileNotFoundError(cys 부재) ⊂ OSError ·
+            # JSONDecodeError ⊂ ValueError — 어느 실패든 '조용한 0 좌석' 이 아니라 오류로 신호한다.
+            roster["errors"].append("dept(%s)" % name)
+            continue
+        seats = sum(1 for s in surfaces if isinstance(s, dict) and not s.get("exited"))
+        roster["active"] += 1
+        roster["seats"] += seats
+        roster["depts"].append({"name": name, "seats": seats})
+    return roster
+
+
+def _ledger_override_arg(raw):
+    """--servers-ledger-override 의 argparse type — 형식 위반은 인자 오류(EX_USAGE 64)다
+    (_roster_override_arg 와 동일 원칙: 조용한 라이브 폴백·내부 예외 융합 금지)."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("servers-ledger-override JSON 파싱 실패: %s" % e)
+    if not isinstance(doc, dict):
+        raise argparse.ArgumentTypeError(
+            "servers-ledger-override 는 JSON 객체({lane,depts})여야 한다")
+    return doc
+
+
+def _roster_override_arg(raw):
+    """--dept-roster-override 의 argparse type — 잘못된 JSON·비객체는 인자 오류(EX_USAGE 64)다.
+    조용히 None 으로 접어 라이브 조회로 폴백하면 주입 의도(결정론)가 깨지고, 내부 예외(70)로
+    흘리면 '측정이 일어나지 않은 사용오류' 와 융합된다(A13 분리 원칙)."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("dept-roster-override JSON 파싱 실패: %s" % e)
+    if not isinstance(doc, dict):
+        raise argparse.ArgumentTypeError(
+            "dept-roster-override 는 JSON 객체({active,seats,errors,depts})여야 한다")
+    return doc
 
 
 def _ps_lines():
@@ -130,13 +263,24 @@ def measure(a):
     lines = _ps_lines() if need_ps else None
     ps_failed = need_ps and lines is None
 
+    # ★A3-b(dept-1 22:05 실측): servers 의 정본은 **프로세스 원장**(`cys ps`)이다 — 논리 서버 1개가
+    #   래퍼 체인(cys run → npm exec vite → node vite) 때문에 ps 패턴에서 3으로 세어져 hard(3)에
+    #   걸렸다. 원장은 `cys run` 1회당 항목 1개라 체인과 무관하다. 원장 조회가 실패할 때만 패턴으로
+    #   폴백하되, 그때도 **체인 루트만** 세고(_server_procs collapse) 그 사실을 measure_errors 로
+    #   신호한다(조용한 과대계수 금지). 임계(soft 2/hard 3)는 그대로다 — 근본은 계수였다.
     if a.servers_override is not None:
         servers = a.servers_override
-    elif ps_failed:
-        errors.append("servers(ps)")
-        servers = None
     else:
-        servers = _count_matching(lines, SERVER_PATTERNS, SERVER_EXCLUDE_PATTERNS)
+        led, led_errors = _ledger_servers(getattr(a, "servers_ledger_override", None))
+        errors.extend(led_errors)
+        if led is not None:
+            servers = led
+        elif ps_failed:
+            errors.append("servers(ps)")
+            servers = None
+        else:
+            roots = _server_procs(lines)          # 패턴 폴백(체인 루트 접기)
+            servers = len(roots)
 
     if a.nodes_override is not None:
         nodes = a.nodes_override
@@ -156,21 +300,26 @@ def measure(a):
             load1 = None
     ncpu = os.cpu_count() or 1
 
-    # STEP B: --nodes-hard가 argparse 기본값(NODES_HARD_DEFAULT)에서 명시적으로 바뀌지 않았으면
-    # 동적 계산 적용, 바뀌었으면(테스트 주입 등) 그 값 그대로 우선 — 동적계산 생략.
-    active_depts = _active_dept_count()
+    # STEP B(★A3 치환): 활성 부서·좌석은 부서 데몬 응답(_dept_roster)에서 — 소켓 파일 수
+    # (_active_dept_count)가 아니다. 응답 실패는 measure_errors 로 합류(→ evaluate 가 최소 soft 격상 ·
+    # 조용한 allow 금지). --nodes-hard가 argparse 기본값(NODES_HARD_DEFAULT)에서 명시적으로 바뀌지
+    # 않았으면 동적 계산 max(18, 12 + Σ좌석) 적용, 바뀌었으면(테스트 주입 등) 그 값 그대로 우선 —
+    # 동적계산 생략(종전 규약 유지).
+    roster = _dept_roster(getattr(a, "dept_roster_override", None))
+    active_depts = roster["active"]
+    errors.extend(roster["errors"])
     if a.nodes_hard != NODES_HARD_DEFAULT:
         nodes_hard_effective = a.nodes_hard
     else:
-        nodes_hard_effective = max(NODES_HARD_DEFAULT,
-                                    NODES_HARD_BASE + active_depts * NODES_HARD_PER_DEPT)
+        nodes_hard_effective = max(NODES_HARD_DEFAULT, NODES_HARD_BASE + roster["seats"])
 
     return {"servers": servers, "nodes": nodes,
             "load1": round(load1, 2) if load1 is not None else None,
             "ncpu": ncpu,
             "load_ratio": round(load1 / ncpu, 3) if load1 is not None else None,
             "context_pct": a.context, "measure_errors": errors,
-            "active_depts": active_depts, "nodes_hard_effective": nodes_hard_effective}
+            "active_depts": active_depts, "dept_seats": roster["seats"], "depts": roster["depts"],
+            "nodes_hard_effective": nodes_hard_effective}
 
 
 # ── ★opt-in rate 축(soft-only) — 구독제(정액) 5h rate 사용률 사전 경고 ──
@@ -325,9 +474,15 @@ def cmd_check(a):
         for c in checks:
             mark = {"ok": "·", "soft": "⚠", "hard": "✗"}[c["level"]]
             print(f"  {mark} {c['metric']}={c['value']} (soft {c['soft']} / hard {c['hard']})")
+        # ★A3: 부서 좌석 1줄 — nodes hard 가 어디서 왔는지(어느 부서·몇 좌석) 사람이 읽게.
+        dept_list = ", ".join("%s=%s" % (d.get("name"), d.get("seats")) for d in m.get("depts") or [])
+        how = ("--nodes-hard 명시" if a.nodes_hard != NODES_HARD_DEFAULT
+               else "max(%d, %d+Σ좌석)" % (NODES_HARD_DEFAULT, NODES_HARD_BASE))
+        print(f"  depts: active={m['active_depts']} seats={m['dept_seats']}"
+              f" [{dept_list or '-'}] → nodes hard {m['nodes_hard_effective']} ({how})")
         if m["measure_errors"]:
-            print("measure_error: 자원 측정 실패(ps/load) — 조용한 allow 금지, 최소 soft로 격상. "
-                  "측정 환경 확인 후 재시도.")
+            print("measure_error: 자원 측정 실패(ps/load/부서 데몬 dept(<이름>)) — 조용한 allow 금지, "
+                  "최소 soft로 격상. 측정 환경 확인 후 재시도(dept(…)=그 부서 데몬 무응답·stale 소켓).")
         if m["context_pct"] is None:
             print("context_unmeasured: --context 미제공 — 컨텍스트 60%/clear 규칙을 검사하지 못함. "
                   "check 시 --context <pct> 전달 권장.")
@@ -351,8 +506,13 @@ def cmd_classify(a):
 
 
 # ── ★G12(cokacdir 성찰 2026-07-04): hard_block '판정'과 분리돼 있던 '집행' ──
-def _server_procs(lines=None):
-    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함)."""
+def _server_procs(lines=None, collapse=True):
+    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함).
+
+    ★A3-b(2026-09-03 dept-1 실측): collapse=True 면 **체인 루트만** 남긴다 — 매칭된 프로세스의
+      조상이 이미 매칭돼 있으면 그것은 같은 논리 서버의 자식이다(`cys run -- npm exec vite` →
+      `npm exec vite` → `node …/vite` 3프로세스 = 서버 1개). kill 대상 집합은 바뀌지 않는다
+      (호출부가 roots ∪ _descendants(roots) 를 죽인다) — 바뀌는 것은 **계수**뿐이다."""
     lines = lines if lines is not None else (_ps_lines() or [])
     regs = [re.compile(p) for p in SERVER_PATTERNS]
     excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
@@ -366,7 +526,110 @@ def _server_procs(lines=None):
             continue
         if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
             out.append((pid, cmd))
-    return out
+    return _collapse_to_roots(out) if collapse else out
+
+
+def _ppid_map():
+    """pid → ppid. 조회 실패는 None(체인 접기 불가 — 호출부가 measure_errors 로 신호한다)."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    m = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            m[int(f[0])] = int(f[1])
+    return m
+
+
+def _collapse_to_roots(procs, ppid=None):
+    """매칭 프로세스 목록 → **체인 루트만**(조상이 이미 매칭이면 제외). ppid 조회 실패 시 원본 그대로.
+
+    ★왜 계수를 접는가(A3-b · dept-1 22:05 실측 근거 impl/live-evidence/dept1-queue-starvation-2205.txt:56):
+      논리 서버 1개가 래퍼 체인 때문에 3으로 세어져 servers hard(3)에 걸렸다 — '서버 누적'을 막는
+      임계가 **하나도 안 띄운 상태에서** 착수를 거부한 것이다. 임계는 그대로 두고(근본은 계수)
+      같은 트리에 속한 자식을 접는다."""
+    if not procs:
+        return procs
+    pm = _ppid_map() if ppid is None else ppid
+    if not pm:
+        return procs                       # 체인 판정 불가 — 종전 계수(보수적 과대) 유지
+    matched = {p for p, _c in procs}
+    roots = []
+    for pid, cmd in procs:
+        cur, depth, has_matched_ancestor = pm.get(pid), 0, False
+        while cur and cur > 1 and depth < 64:      # depth 상한 = 순환 방어
+            if cur in matched:
+                has_matched_ancestor = True
+                break
+            cur, depth = pm.get(cur), depth + 1
+        if not has_matched_ancestor:
+            roots.append((pid, cmd))
+    return roots
+
+
+def _ledger_servers(override=None, socket_path=None):
+    """`cys ps` **프로세스 원장** 기준 논리 서버 수 → (개수 or None, 오류 목록).
+
+    ★A3-b: 원장은 `cys run -- <명령>` 1회당 항목 1개다(래퍼 체인이 몇 프로세스든). 그래서 계수의
+      정본은 ps 패턴이 아니라 원장이다. 단 원장은 서버 전용이 아니므로(dept-1 실측: `cys events
+      --category … --reconnect` 가 등재돼 있다) **SERVER_PATTERNS 매칭 항목만** 센다.
+    범위: 현재 레인(`cys ps`) + 부서 소켓(`cys ps --socket <sock>`) 합집합 · pid 중복 제거.
+    실패: 현재 레인 조회 실패 → (None, ["servers(ledger)"]) 로 호출부가 **패턴 폴백**하게 한다.
+      부서 조회 실패는 그 부서만 제외하고 `servers-ledger(<이름>)` 오류로 남긴다(전면 폴백 아님).
+    출력 형식(실측): `pid=<p>\\tpgid=<g>\\tscoped=<b>\\tsurface=<id>\\t<cmd>` 또는 `(ledger empty)`.
+    override(--servers-ledger-override)는 {"lane": "<텍스트>", "depts": {"<sock>": "<텍스트>"}}."""
+    regs = [re.compile(p) for p in SERVER_PATTERNS]
+    excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
+    errors, seen = [], {}
+
+    def _consume(text):
+        for line in (text or "").splitlines():
+            if not line.startswith("pid="):
+                continue                    # "(ledger empty)" · 잡음 행
+            fields = line.split("\t")
+            try:
+                pid = int(fields[0][len("pid="):])
+            except (ValueError, IndexError):
+                continue
+            cmd = fields[-1] if len(fields) >= 5 else ""
+            if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
+                seen[pid] = cmd
+
+    def _run_ps(argv):
+        p = subprocess.run(argv, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=LEDGER_TIMEOUT)
+        if p.returncode != 0:
+            raise ValueError("rc=%d" % p.returncode)
+        return p.stdout
+
+    if override is not None:
+        _consume(override.get("lane") or "")
+        for _sock, text in (override.get("depts") or {}).items():
+            _consume(text)
+        return len(seen), errors
+
+    try:
+        _consume(_run_ps(["cys", "ps"]))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None, ["servers(ledger)"]     # 현재 레인 실패 = 원장 신뢰 불가 → 패턴 폴백
+    lane_sock = os.environ.get("CYS_SOCKET")
+    for sock in sorted(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB))):
+        if lane_sock and os.path.abspath(sock) == os.path.abspath(lane_sock):
+            continue                         # 현재 레인과 같은 소켓 — 이미 셌다
+        name = os.path.basename(os.path.dirname(sock))
+        if name.startswith("cys-dept-"):
+            name = name[len("cys-dept-"):]
+        if not _socket_listening(sock):      # A3-c 프로브 재사용(stale 소켓에서 대기 0)
+            errors.append("servers-ledger(%s)" % name)
+            continue
+        try:
+            _consume(_run_ps(["cys", "ps", "--socket", sock]))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            errors.append("servers-ledger(%s)" % name)
+    return len(seen), errors
 
 
 def _descendants(roots):
@@ -535,6 +798,15 @@ def main(argv=None):
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--load-override", type=float, default=None, help="테스트 주입")
+    c.add_argument("--servers-ledger-override", dest="servers_ledger_override",
+                   type=_ledger_override_arg, default=None,
+                   help="★A3-b 테스트 주입 — 원장 텍스트 JSON {\"lane\":\"<cys ps 출력>\","
+                        "\"depts\":{\"<sock>\":\"<출력>\"}}. 지정 시 라이브 `cys ps` 조회를 "
+                        "전부 생략한다(결정론). 잘못된 JSON=EX_USAGE 64")
+    c.add_argument("--dept-roster-override", dest="dept_roster_override", default=None,
+                   type=_roster_override_arg,
+                   help="테스트 주입 — 부서 로스터 JSON {active,seats,errors,depts}(라이브 "
+                        "`cys status --json --socket` 조회 전부 생략 · 잘못된 JSON=EX_USAGE 64)")
     c.add_argument("--rate-check", action="store_true",
                    help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
     c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
@@ -591,6 +863,9 @@ def self_test():
 
     import io
     import contextlib
+    # ★A3: 모든 check 호출에 고정 로스터를 주입 — 이 머신의 라이브 부서 소켓(dept-1 등)이 판정에
+    #   스며들면 self-test 가 비결정론이 된다(nodes hard 가 좌석 수에 따라 18·21·30… 으로 움직임).
+    ro = ["--dept-roster-override", '{"active":0,"seats":0,"errors":[],"depts":[]}']
     # ① 미지 서브커맨드 → EX_USAGE(64), EXIT_HARD(2) 와 분리
     with contextlib.redirect_stderr(io.StringIO()):
         rc = main(["definitely-not-a-subcommand"])
@@ -598,7 +873,7 @@ def self_test():
     chk(rc != EXIT_HARD, "사용오류가 hard_block(2)로 오독됨 — argparse↔EXIT_HARD 충돌 잔존")
     # ② 미지 플래그도 동일
     with contextlib.redirect_stderr(io.StringIO()):
-        rc = main(["check", "--no-such-flag"])
+        rc = main(["check", "--no-such-flag"] + ro)
     chk(rc == EXIT_USAGE, "미지 플래그가 EX_USAGE(64) 아님: rc=%r" % rc)
     # ③ 인자 없음(subparser required) → EX_USAGE
     with contextlib.redirect_stderr(io.StringIO()):
@@ -607,11 +882,11 @@ def self_test():
     # ④ 정상 판정 경로는 무회귀(override 주입으로 측정 대체 — 라이브 ps 무의존)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
-                   "--load-override", "0.0"])
+                   "--load-override", "0.0"] + ro)
     chk(rc == EXIT_ALLOW, "정상 allow 경로 회귀: rc=%r" % rc)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = main(["check", "--servers-override", "99", "--nodes-override", "0",
-                   "--load-override", "0.0"])
+                   "--load-override", "0.0"] + ro)
     chk(rc == EXIT_HARD, "servers hard 경로 회귀: rc=%r" % rc)
     # ⑤ 내부 예외 → EX_SOFTWARE(70), 'soft'(1) 오분류 아님
     import types
@@ -620,7 +895,7 @@ def self_test():
     try:
         _GateArgumentParser.parse_args = lambda self, argv=None: ns
         with contextlib.redirect_stderr(io.StringIO()):
-            rc = main(["check"])
+            rc = main(["check"] + ro)
     finally:
         _GateArgumentParser.parse_args = saved
     chk(rc == EXIT_INTERNAL, "내부 예외가 EX_SOFTWARE(70) 아님: rc=%r" % rc)
@@ -629,7 +904,7 @@ def self_test():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
         main(["check", "--json", "--servers-override", "0", "--nodes-override", "0",
-              "--load-override", "0.0"])
+              "--load-override", "0.0"] + ro)
     try:
         json.loads(buf.getvalue().strip())
     except ValueError as e:
@@ -638,7 +913,7 @@ def self_test():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = main(["check", "--json", "--require-context", "--servers-override", "0",
-                   "--nodes-override", "0", "--load-override", "0.0"])
+                   "--nodes-override", "0", "--load-override", "0.0"] + ro)
     chk(rc == EXIT_SOFT, "--require-context 미제공이 soft(1) 아님: rc=%r" % rc)
     try:
         doc = json.loads(buf.getvalue().strip())
@@ -650,23 +925,23 @@ def self_test():
     # ⑧ --require-context + context 제공 → 종전 판정 그대로(42=allow · 61=hard)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = main(["check", "--require-context", "--context", "42", "--servers-override", "0",
-                   "--nodes-override", "0", "--load-override", "0.0"])
+                   "--nodes-override", "0", "--load-override", "0.0"] + ro)
     chk(rc == EXIT_ALLOW, "--require-context+context 42 가 allow 아님: rc=%r" % rc)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = main(["check", "--require-context", "--context", "61", "--servers-override", "0",
-                   "--nodes-override", "0", "--load-override", "0.0"])
+                   "--nodes-override", "0", "--load-override", "0.0"] + ro)
     chk(rc == EXIT_HARD, "--require-context+context 61 이 hard(2) 아님: rc=%r" % rc)
     # ⑨ 플래그 없는 기존 호출 = 기본 동작 불변(context 미제공 = allow · 회귀 0)
     with contextlib.redirect_stdout(io.StringIO()):
         rc = main(["check", "--servers-override", "0", "--nodes-override", "0",
-                   "--load-override", "0.0"])
+                   "--load-override", "0.0"] + ro)
     chk(rc == EXIT_ALLOW, "플래그 없는 context 미제공이 allow 아님(기본 동작 회귀): rc=%r" % rc)
 
     # ⑩ ★T9(P3-1·R3-P03-1) 곱셈 편성 예산 축 4형상 — 발화는 (--formation-size ∧ env 정수) 둘 다일 때만.
     #    결정론 확보: --formation-size 0 이면 투영 = nodes_override + depts×0 = nodes_override 라
-    #    라이브 부서 소켓 수(_active_dept_count)와 무관하게 판정이 고정된다(밀폐).
+    #    부서 수와 무관하게 판정이 고정된다(밀폐) — A3 이후 ro 주입(active 0)으로 이중 밀폐.
     base_argv = ["check", "--servers-override", "0", "--nodes-override", "0",
-                 "--load-override", "0.0"]
+                 "--load-override", "0.0"] + ro
     saved_budget = os.environ.pop("CYS_FORMATION_BUDGET", None)
     try:
         # (a) 둘 다 + 예산 내(투영 0 ≤ 0) → allow
@@ -720,6 +995,125 @@ def self_test():
         else:
             os.environ["CYS_FORMATION_BUDGET"] = saved_budget
 
+    # ⑪ ★A3(SURVEY A4·B6-2 · PREP #8) 부서 로스터 축 — 활성=데몬 응답 · hard=max(18, 12+Σ좌석) · 실패=soft.
+    def _check_json(argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = main(argv)
+        try:
+            return rc, json.loads(buf.getvalue().strip())
+        except ValueError as e:
+            fails.append("A3 --json 파싱 실패(%r): %s" % (argv[-1], e))
+            return rc, {}
+
+    quiet = ["check", "--json", "--servers-override", "0", "--load-override", "0.0"]
+    # (a) 좌석 합 10(4+6 · 2부서) → hard 22 = 12+10 · measured 에 active_depts/dept_seats/depts 노출
+    r10 = ('{"active":2,"seats":10,"errors":[],'
+           '"depts":[{"name":"a","seats":4},{"name":"b","seats":6}]}')
+    rc, doc = _check_json(quiet + ["--nodes-override", "0", "--dept-roster-override", r10])
+    mm = doc.get("measured") or {}
+    chk(rc == EXIT_ALLOW and mm.get("nodes_hard_effective") == 22,
+        "좌석 10 로스터의 nodes hard 가 22(=12+10) 아님: rc=%r m=%r" % (rc, mm))
+    chk(mm.get("active_depts") == 2 and mm.get("dept_seats") == 10
+        and len(mm.get("depts") or []) == 2,
+        "measured 에 active_depts/dept_seats/depts 가 로스터대로 없음: %r" % mm)
+    # (b) 좌석 3(1부서) → 12+3=15 < floor 18 → 18 유지(floor 규약 불변 · 구 '+5/부서' 잔존이면 18 그대로라
+    #     이 핀만으로는 못 가르지만, (d) 의 9좌석 케이스가 가른다)
+    rc, doc = _check_json(quiet + ["--nodes-override", "0", "--dept-roster-override",
+                                   '{"active":1,"seats":3,"errors":[],"depts":[{"name":"a","seats":3}]}'])
+    chk((doc.get("measured") or {}).get("nodes_hard_effective") == NODES_HARD_DEFAULT,
+        "좌석 3 로스터가 floor 18 을 깎음: %r" % (doc.get("measured") or {}).get("nodes_hard_effective"))
+    # (c) 응답 실패 부서 → measure_errors 에 dept(x) · verdict soft(exit 1) · trips 는 비어 있음(트립 아님)
+    rerr = '{"active":0,"seats":0,"errors":["dept(x)"],"depts":[]}'
+    rc, doc = _check_json(quiet + ["--nodes-override", "0", "--dept-roster-override", rerr])
+    chk(rc == EXIT_SOFT and doc.get("verdict") == "soft_warn",
+        "부서 응답 실패가 soft(1) 아님(조용한 allow 회귀): rc=%r verdict=%r" % (rc, doc.get("verdict")))
+    chk("dept(x)" in ((doc.get("measured") or {}).get("measure_errors") or []),
+        "measure_errors 에 dept(x) 부재: %r" % (doc.get("measured") or {}).get("measure_errors"))
+    chk(doc.get("trips") == [] and "measure_error:dept(x)" in (doc.get("warnings") or []),
+        "부서 응답 실패가 trips 를 오염하거나 warnings 에 없음: trips=%r warnings=%r"
+        % (doc.get("trips"), doc.get("warnings")))
+    # (d) 실데이터 형상(SURVEY A4 · dept-1 CSO 22:05 · evidence G3-dept1-status-raw.json 좌석 9):
+    #     1부서 좌석 9 + nodes 15 → hard 21 = max(18, 12+9) · 15 ≥ soft 12 → soft(exit 1) · 15 < 21.
+    #     판별 지점: nodes 20 은 구 규칙(1부서 → 18)에서 hard(20≥18) / 신 규칙 soft(20<21).
+    #     음성 대조: 로스터 0(ro) + nodes 20 → floor 18 → hard(2) — 좌석이 판정을 바꿈을 실증.
+    r9 = '{"active":1,"seats":9,"errors":[],"depts":[{"name":"dept-1","seats":9}]}'
+    rc, doc = _check_json(quiet + ["--nodes-override", "15", "--dept-roster-override", r9])
+    node_c = next((c for c in doc.get("checks") or [] if c.get("metric") == "nodes"), {})
+    chk(rc == EXIT_SOFT and node_c.get("hard") == 21 and node_c.get("level") == "soft",
+        "1부서 9좌석+nodes 15 가 soft/hard 21 아님: rc=%r nodes=%r" % (rc, node_c))
+    rc, _doc = _check_json(quiet + ["--nodes-override", "20", "--dept-roster-override", r9])
+    chk(rc == EXIT_SOFT, "1부서 9좌석+nodes 20 이 soft(1) 아님(구 규칙 hard 18 잔존?): rc=%r" % rc)
+    rc, _doc = _check_json(quiet + ["--nodes-override", "20"] + ro)
+    chk(rc == EXIT_HARD, "로스터 0 + nodes 20 이 hard(2) 아님(floor 18 회귀 · 음성 대조): rc=%r" % rc)
+    rc, _doc = _check_json(quiet + ["--nodes-override", "21", "--dept-roster-override", r9])
+    chk(rc == EXIT_HARD, "1부서 9좌석+nodes 21 이 hard(2) 아님(21≥21): rc=%r" % rc)
+    # (e) --nodes-hard 명시는 로스터보다 우선(종전 규약 유지)
+    rc, doc = _check_json(quiet + ["--nodes-override", "0", "--nodes-hard", "7",
+                                   "--dept-roster-override", r10])
+    chk((doc.get("measured") or {}).get("nodes_hard_effective") == 7,
+        "--nodes-hard 명시가 로스터 동적값에 밀림: %r"
+        % (doc.get("measured") or {}).get("nodes_hard_effective"))
+    # (f) 잘못된 주입 JSON → EX_USAGE(64) — 조용한 라이브 폴백도, 내부 예외(70)도 아니다
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["check", "--dept-roster-override", "{not json"])
+    chk(rc == EXIT_USAGE, "잘못된 --dept-roster-override 가 EX_USAGE(64) 아님: rc=%r" % rc)
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = main(["check", "--dept-roster-override", "[1,2]"])
+    chk(rc == EXIT_USAGE, "비객체 --dept-roster-override 가 EX_USAGE(64) 아님: rc=%r" % rc)
+    # (g) 순수 함수: override 정규화(부분 dict) · 라이브 조회 0회(glob 에 소켓이 있어도 subprocess 무호출)
+    def _no_live(*_x, **_k):
+        raise AssertionError("override 단락 실패 — 라이브 cys 호출 발생")
+    saved_run, saved_glob = subprocess.run, glob.glob
+    try:
+        subprocess.run = _no_live
+        glob.glob = lambda *_x, **_k: ["/nonexistent/cys-dept-z/cys.sock"]
+        r = _dept_roster({"seats": 10})
+    finally:
+        subprocess.run, glob.glob = saved_run, saved_glob
+    chk(r == {"active": 0, "seats": 10, "errors": [], "depts": []}, "override 정규화 실패: %r" % r)
+    # (h) 라이브 경로 시뮬(subprocess 대역): a=응답(좌석 2 + exited 1) · b=rc 1 → active 1 · seats 2 ·
+    #     errors [dept(b)] · argv 는 기존 표면 `cys status --json --socket <sock>` 의 list 형(shell 0).
+    def _fake_run(argv, **kw):
+        chk(argv[:4] == ["cys", "status", "--json", "--socket"] and kw.get("shell") is not True
+            and kw.get("timeout") == DEPT_STATUS_TIMEOUT,
+            "부서 조회 argv 형상 이탈(list argv · shell 0 · timeout 계약): %r %r" % (argv, kw))
+        if argv[4].endswith("cys-dept-a/cys.sock"):
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+                {"surfaces": [{"exited": False}, {"exited": False}, {"exited": True}]}), stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="connect: refused")
+    # ★A3-c 축 분리: 리스너 프로브는 별도 축이다(전용 핀 = tests/test_resource_gate.py
+    #   TestSocketProbe · 실소켓 픽스처). 여기서 재는 것은 '데몬 응답 → 좌석 계상' 이므로
+    #   가짜 경로에서 프로브가 먼저 죽지 않게 통과로 고정한다(이 시뮬의 대상이 아니다).
+    _g = globals()
+    saved_run, saved_glob, saved_probe = subprocess.run, glob.glob, _g["_socket_listening"]
+    try:
+        subprocess.run = _fake_run
+        _g["_socket_listening"] = lambda _p: True
+        glob.glob = lambda *_x, **_k: ["/h/.local/state/cys-dept-b/cys.sock",
+                                       "/h/.local/state/cys-dept-a/cys.sock"]
+        r = _dept_roster()
+    finally:
+        subprocess.run, glob.glob = saved_run, saved_glob
+        _g["_socket_listening"] = saved_probe
+    chk(r == {"active": 1, "seats": 2, "errors": ["dept(b)"], "depts": [{"name": "a", "seats": 2}]},
+        "라이브 경로 시뮬 로스터 불일치: %r" % r)
+    # ★A3-c: 프로브가 죽었다고 판정하면 **스폰 0** 으로 그 부서를 오류 계상한다(5s 절감의 본체).
+    _spawned = []
+    saved_run2, saved_glob2, saved_probe2 = subprocess.run, glob.glob, _g["_socket_listening"]
+    try:
+        subprocess.run = lambda *a2, **k2: _spawned.append(a2) or subprocess.CompletedProcess(
+            a2[0] if a2 else [], 0, stdout="{}", stderr="")
+        _g["_socket_listening"] = lambda _p: False
+        glob.glob = lambda *_x, **_k: ["/h/.local/state/cys-dept-dead/cys.sock"]
+        r2 = _dept_roster()
+    finally:
+        subprocess.run, glob.glob = saved_run2, saved_glob2
+        _g["_socket_listening"] = saved_probe2
+    chk(r2 == {"active": 0, "seats": 0, "errors": ["dept(dead)"], "depts": []},
+        "프로브 죽음 판정이 오류 계상으로 이어지지 않음: %r" % r2)
+    chk(not _spawned, "프로브가 죽음으로 판정했는데 cys status 를 스폰했다(지연 절감 무효)")
+
     if fails:
         print("javis_resource_gate self-test FAIL:")
         for f in fails:
@@ -730,7 +1124,9 @@ def self_test():
           " + B1 --require-context 5종(미제공 soft·trips 비오염·context 제공 allow/hard·"
           "무플래그 기본 동작 불변)"
           " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
-          "비정수 env 가청화·nodes 미측정 무예외)")
+          "비정수 env 가청화·nodes 미측정 무예외)"
+          " + A3 부서 로스터 8종(좌석 합산 22·floor 유지·응답 실패 soft·실데이터 9좌석 soft/hard 판별+"
+          "음성 대조·--nodes-hard 우선·잘못된 주입 64·override 단락·라이브 경로 대역)")
     return 0
 
 

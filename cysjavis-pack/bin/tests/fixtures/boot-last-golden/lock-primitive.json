@@ -1,0 +1,40 @@
+{
+ "$doc": [
+  "레인 락 원시 계약(시뮬레이션 T1-10 · T2-10 · 명세 §2-7) — 소유자는 javis_bootstrap.LANE_LOCK_PRIMITIVE.",
+  "이 파일은 그 상수의 사본이며 Rust 러너(W-B B4)가 include_str! 로 읽어 같은 표를 보게 하는 것이 목적이다.",
+  "불변식: 같은 파일(path_template) · 같은 바이트 범위([byte_offset, byte_offset+byte_length)) · 같은 모드(mode).",
+  "posix flock 은 범위 인자가 없는 파일 전체 advisory 락이라 [0,1)을 포함한다 — 범위가 의미를 갖는 축은 windows 뿐이다.",
+  "확장 규칙: 필드는 추가만 한다(K3). 값을 바꾸면 python self-test 와 이 검체가 동시에 운다."
+ ],
+ "rust_parity_status": "not_tested: Rust boot-run 미착지(W-B B4) — 이 fixture 는 python 축만 실측으로 닫는다. Rust 가 착지하면 같은 파일을 읽어 교차 배제(python 보유 중 Rust 획득 실패 · 그 역)를 실증해야 계약이 닫힌다.",
+ "primitive": {
+  "kind": "lock",
+  "path_stem": "bootstrap",
+  "path_ext": ".lock",
+  "path_template": "<state_dir>/bootstrap-<lane>.lock",
+  "always_lane_suffixed": true,
+  "open_flags": [
+   "O_CREAT",
+   "O_RDWR"
+  ],
+  "create_mode": 420,
+  "create_mode_octal": "0644",
+  "mode": "exclusive-nonblocking",
+  "byte_offset": 0,
+  "byte_length": 1,
+  "backends": {
+   "posix": "fcntl.flock(LOCK_EX|LOCK_NB)",
+   "windows": "msvcrt.locking(LK_NBLCK, 1)",
+   "fallback": "open(O_CREAT|O_EXCL|O_RDWR) pidfile"
+  },
+  "holder_blob_keys": [
+   "pid",
+   "started",
+   "owner",
+   "host"
+  ],
+  "holder_owner": "javis_bootstrap",
+  "range_is_windows_axis": true,
+  "posix_scope": "whole-file"
+ }
+}

@@ -11,7 +11,8 @@
              (리뷰어 없는 부서는 라운드 루프 불능 → complete 오판 금지·Sim S2-5).
   partial  = 설치된 부분만 기동 + 부족 CLI 목록(설치 시 자동 승급).
   pending-cli = CLI 전무 → 빈 셸 유지(온보딩 보존·기능1).
-  pending-resource = 곱셈 자원 예산 초과(hard) — 대기·자동 재시도.
+  pending-resource = 자원 게이트 hard(servers/nodes/load_ratio/context_pct/formation_budget 중 하나 —
+             hard 로 판정된 축이 detail·상태파일 gate 키에 그대로 남는다) — 대기·자동 재시도.
 
 ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 · paused·판정 불능 모두
     편성 보류 종료) ②소켓키 싱글플라이트 락
@@ -32,6 +33,8 @@ ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 ·
   ★REQUIRED_ROLES 상수 자체는 무수정 — 제외는 호출 시점 파생값이라 env 를 지우면 즉시 원복된다.
 
 저장: <state>/formation/<socket-key>.json  (state = CYS_STATE_DIR or ~/.cys/state — 기존 관례).
+  선택 키(비어 있으면 생략 = 종전 레인 바이트 동일 규약): external_roles · attempts(시도 원장) ·
+  gate(pending-resource 때 게이트 JSON 축약 verdict/trips/warnings/measured) · held(시도 원장 보류 목록).
 
 CLI:
   python3 javis_formation.py ensure --socket <S> [--cwd D] [--json] [--force-surface]
@@ -470,7 +473,8 @@ def _installed_clis():
     return {c for c in REQUIRED_CLIS if javis_cli_probe.probe_cli(c)}
 
 
-# ── ④ 곱셈 자원 예산(W6 접점 — hard=pending-resource) ──
+# ── ④ 자원 게이트(javis_resource_gate.py check — hard=pending-resource · 축 servers/nodes/load_ratio/
+#      context_pct + opt-in formation_budget(W6 접점 · env CYS_FORMATION_BUDGET 없으면 무발화)) ──
 # 재시도(무플래그) 호출 timeout — 본 호출(30s)보다 짧게(R3-P03-1 권고 15s).
 RESOURCE_RETRY_TIMEOUT_S = 15
 
@@ -497,8 +501,25 @@ def _resource_branch(code):
     return "proceed"
 
 
-def _resource_ok(socket):
-    """javis_resource_gate.py check → 편성 착수 자원 여유(False=pending-resource).
+def _gate_json(out):
+    """게이트 stdout → JSON dict 또는 None(빈·파손·비dict — 라벨은 '축 미상' 으로 접힌다). 순수."""
+    try:
+        obj = json.loads(out or "")
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _resource_verdict(socket):
+    """javis_resource_gate.py check → (ok, gate). ok=False 는 pending-resource(hard) · gate 는 그 판정을
+    낸 호출의 stdout JSON dict(파싱 불가·게이트 부재·실행 실패면 None).
+
+    ★A2(SURVEY B2 · 2026-09-03): 종전 `_resource_ok` 는 `code, _out, err = _run(...)` 로 게이트 stdout
+    (JSON `trips` = 어느 metric 이 hard 인지)을 **버려서**, ensure ④ 가 고정 문구 "곱셈 자원 예산 hard"
+    를 상태파일·피드에 찍었다 — 곱셈 축은 env CYS_FORMATION_BUDGET 없이는 무발화라 기본 설치에서는
+    servers/nodes/load_ratio/context_pct 중 하나가 원인이고 그 문구는 항상 거짓 라벨이었다. 이 함수는
+    호출 형상·재시도·127 분기를 **한 줄도 바꾸지 않고** stdout 만 살려 돌려준다 — 판정(ok)은 종전과
+    동일하다(self-test 의 `_resource_ok` 핀 ①~⑤ 무수정 통과가 그 증거).
 
     ★W6 곱셈 편성 예산: --formation-size 로 이 레인 편성 크기를 전달 → 게이트가 투영
     (측정 노드+부서수×편성크기)을 CYS_FORMATION_BUDGET 과 대조해 초과 시 hard(exit 2).
@@ -512,31 +533,103 @@ def _resource_ok(socket):
     해소한다. 127 재시도는 원인(실행환경)이 동일해 무의미 — 무재시도."""
     gate = _gate_path()
     if gate is None:
-        return True
+        return True, None
     py = sys.executable or "python3"
-    code, _out, err = _run(
+    code, out, err = _run(
         [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], timeout=30)
     branch = _resource_branch(code)
     if branch == "block":
-        return False
+        return False, _gate_json(out)
     if branch == "retry":
         sys.stderr.write("[formation] 자원 게이트 측정 실패(exit %s — 스큐/내부오류) — "
                          "무플래그 1회 재시도\n" % code)
-        code2, _o2, _e2 = _run([py, gate, "check", "--json"],
-                               timeout=RESOURCE_RETRY_TIMEOUT_S)
+        code2, o2, _e2 = _run([py, gate, "check", "--json"],
+                              timeout=RESOURCE_RETRY_TIMEOUT_S)
         if code2 == 2:
-            return False
+            return False, _gate_json(o2)
         if code2 not in (0, 1):
             sys.stderr.write("[formation] 재시도도 측정 실패(exit %s) — loud 진행"
                              "(측정불능≠통과 원칙의 문서화된 절충: 게이트 결함이 편성을 "
                              "영구 봉쇄하지 않게)\n" % code2)
-        return True
+        return True, _gate_json(o2)
     if branch == "exec-fail":
         sys.stderr.write("[formation] 자원 게이트 실행 실패(exit 127 — 부재/타임아웃 단일 "
                          "버킷: %s) — 무재시도·loud 진행\n"
                          % ((err or "").strip().replace("\n", " ")[:120]))
-        return True
-    return True
+        return True, None
+    return True, _gate_json(out)
+
+
+# ensure ④ 라벨용 마지막 게이트 JSON(소켓키별 · 같은 프로세스 · 파생) — _resource_ok 가 쓰고 ensure 가 읽고 비운다.
+_RESOURCE_GATE_LAST = {}
+
+
+def _resource_ok(socket):
+    """편성 착수 자원 여유(bool · False=pending-resource) — ensure ④ 가 소비하는 **유일한** 자원 seam.
+
+    ★반환형은 bool 그대로다(self-test `is False/True` 핀 · test_formation._ensure_harness 의
+      `_resource_ok` 스텁 호환). 게이트 JSON 은 반환값이 아니라 _RESOURCE_GATE_LAST 슬롯으로 나른다 —
+      ensure 가 _resource_verdict 를 **직접** 부르면 harness 스텁이 무력화돼 테스트가 실 게이트
+      (ps·부서 소켓 glob·`cys status --socket`)를 두드린다(밀폐 파괴 — gate_check 의 _GateVerdict
+      주석 "ensure 가 소비하는 seam 을 하나로 유지" 와 같은 이유). bool 만 돌려주는 스텁 레인에서는
+      슬롯이 비어 라벨이 '축 미상(JSON 없음)' 으로 접힌다(측정 불능을 특정 축으로 위장하지 않음)."""
+    ok, gate = _resource_verdict(socket)
+    _RESOURCE_GATE_LAST[_sanitize_key(socket)] = gate
+    return ok
+
+
+def _resource_gate_last(socket):
+    """직전 _resource_ok(socket) 이 받은 게이트 JSON(없으면 None) — ensure ④ 라벨 전용 · 읽고 비운다
+    (stale 라벨 방지: 다음 호출이 스텁이어도 이전 실측 JSON 이 재사용되지 않는다)."""
+    return _RESOURCE_GATE_LAST.pop(_sanitize_key(socket), None)
+
+
+# ── ★A2 라벨 순수 함수(self-test·test_formation_gate_label 핀) — 게이트 JSON → detail/피드/상태파일 ──
+def _hard_trips(gate):
+    """게이트 JSON → level=='hard' 인 trips(순수 · 파손 항목 무시 · 게이트 순서 보존)."""
+    if not isinstance(gate, dict):
+        return []
+    trips = gate.get("trips")
+    if not isinstance(trips, list):
+        return []
+    return [t for t in trips
+            if isinstance(t, dict) and t.get("level") == "hard" and t.get("metric")]
+
+
+def _axes_text(gate):
+    """hard 축 표기 "nodes 44/42[ · servers 3/3]"(value/hard 는 게이트 값 그대로) — 없으면 ""."""
+    return " · ".join("%s %s/%s" % (t["metric"], t.get("value"), t.get("hard"))
+                      for t in _hard_trips(gate))
+
+
+def _resource_detail(gate):
+    """ensure ④ 상태파일 detail(순수) — 게이트가 hard 로 판정한 **실제 축**을 적는다:
+      "자원 게이트 hard — nodes 44/42 · 편성 대기"(복수 축은 " · " 연결)
+    JSON 부재(None)면 "축 미상(JSON 없음)", JSON 은 있으나 hard 트립이 없으면 "축 미상(hard trips 없음)"
+    — 측정 불능을 특정 축(종전 '곱셈')으로 위장하지 않는다(SURVEY B2 거짓 라벨의 정정)."""
+    axes = _axes_text(gate)
+    if axes:
+        return "자원 게이트 hard — %s · 편성 대기" % axes
+    return "자원 게이트 hard — 축 미상(%s) · 편성 대기" % (
+        "JSON 없음" if gate is None else "hard trips 없음")
+
+
+def _resource_feed_body(gate):
+    """pending-resource 피드 본문(순수) — detail 과 같은 축 표기. 축 미상이면 축 괄호 없이(종전 고정
+    문구 '곱셈 자원 예산 초과' 폐기)."""
+    axes = _axes_text(gate)
+    if axes:
+        return "자원 게이트 hard(%s) — 자원 정리 후 자동 재시도됩니다." % axes
+    return "자원 게이트 hard — 자원 정리 후 자동 재시도됩니다."
+
+
+def _gate_compact(gate):
+    """상태파일 `gate` 키용 축약(verdict·trips·warnings·measured — checks 는 trips 상위집합이라 제외).
+    dict 가 아니거나 네 키가 전부 없으면 None(= 키 생략 · 바이트 동일 규약)."""
+    if not isinstance(gate, dict):
+        return None
+    out = {k: gate[k] for k in ("verdict", "trips", "warnings", "measured") if k in gate}
+    return out or None
 
 
 # ── ★T9(P3-1): 역할별 시도 원장 — boot_supervisor 4중 유계 계약의 pack 측 동형 이식 ──
@@ -551,6 +644,11 @@ def _resource_ok(socket):
 FORMATION_MAX_ATTEMPTS = 3            # boot_supervisor MAX_ATTEMPTS 동형
 FORMATION_RETRY_COOLDOWN_S = 30.0     # boot_supervisor RETRY_COOLDOWN_SECS 동형(선형 백오프)
 FORMATION_ATTEMPT_RESET_S = 21600.0   # 소진 래치 수명(6h) — 만료 후 재시도 재개(영구 봉쇄 방지)
+# ★A2(SURVEY B3 Q2-①) 시도 원장 보류 feed 의 제목 — **유일 등재소**.
+#   이 축(원장 보류)은 상태 kind 전이 축(_feed_for_state)과 **다른 축**이다: 같은 kind 안에서도
+#   보류 목록이 바뀌면 발화하고, kind 가 바뀌어도 보류가 같으면 침묵한다. 두 축을 한 리스트로
+#   세는 소비자(테스트 하네스)는 이 제목으로 축을 가른다 — 문자열 사본을 만들면 드리프트한다.
+HELD_FEED_TITLE = "부서 팀 편성 보류(시도 원장)"
 
 
 def _attempts_carry(prev_obj, live, now=None):
@@ -656,7 +754,7 @@ def _ensure_master_seat(socket, cwd):
 
 
 # ── ⑦ 상태 파일 + feed 표면화(침묵 금지 C6) ──
-def _write_state(socket, state, detail, roles_booted, attempts=None):
+def _write_state(socket, state, detail, roles_booted, attempts=None, gate=None, held=None):
     root = _state_root()
     try:
         os.makedirs(root, exist_ok=True)
@@ -684,6 +782,14 @@ def _write_state(socket, state, detail, roles_booted, attempts=None):
     # 원장 무사용 레인의 상태파일 바이트 동일 보존).
     if attempts:
         obj["attempts"] = attempts
+    # ★A2(SURVEY B2·B3): pending-resource 의 게이트 JSON 축약(gate) · 시도 원장 보류 목록(held) — 같은
+    #   규약(비어 있으면 키 없음 = 종전 레인 바이트 동일). 게이트 JSON 이 파일에 남아야 "어느 축이 hard
+    #   였나"를 사후에 알 수 있고(종전엔 미영속 — 게이트를 손으로 재실행하는 것이 유일한 경로였다),
+    #   held 가 남아야 소진 보류가 stderr 1줄(심박 명령 꼬리 `|| true` 가 삼킴) 밖으로 나온다.
+    if gate:
+        obj["gate"] = gate
+    if held:
+        obj["held"] = list(held)
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
@@ -714,7 +820,7 @@ def _install_hint():
     return "`curl -fsSL https://claude.ai/install.sh | bash`"
 
 
-def _feed_for_state(state):
+def _feed_for_state(state, detail=None):
     kind = state_kind(state)
     fk = feed_kind_for_state(state)   # UI 배너 판정용 --kind(complete=소멸·partial=갱신)
     if kind == "pending-cli":
@@ -734,7 +840,9 @@ def _feed_for_state(state):
         _feed("부서 팀 부분 편성", "설치된 CLI 로 가능한 노드만 기동했습니다(%s). 나머지 CLI "
               "설치 시 자동으로 편성이 완결됩니다." % state, fk)
     elif kind == "pending-resource":
-        _feed("부서 팀 편성 대기(자원)", "곱셈 자원 예산 초과 — 자원 정리 후 자동 재시도됩니다.", fk)
+        # ★A2(SURVEY B2): 종전 고정 문구 "곱셈 자원 예산 초과" 는 거짓 라벨(곱셈 축은 env 없이 무발화) —
+        #   ensure ④ 가 게이트 축으로 만든 본문(detail)을 쓰고, 미제공(JSON 부재)이면 축 없는 일반 문구.
+        _feed("부서 팀 편성 대기(자원)", detail or _resource_feed_body(None), fk)
     elif kind == "complete":
         _feed("부서 팀 편성 완결", "master + 4종 의무 노드(cso·worker·reviewer-gemini·"
               "reviewer-codex) 전부 기동 완료.", fk)
@@ -773,7 +881,7 @@ def _emit_evt(evt_type, fields):
     _run(argv, timeout=10)
 
 
-def _surface(socket, prev_state, state, force=False):
+def _surface(socket, prev_state, state, force=False, detail=None):
     """상태 표면화 — (1) UI 배너 수명 신호(feed --kind) (2) 음성/HUD EVT. kind 전이 또는 최초
     관측 시에만 발화(심박 스팸 억제·'전이 시' 계약). 전부 best-effort·부트 무해(R10).
 
@@ -782,10 +890,11 @@ def _surface(socket, prev_state, state, force=False):
     상태 파일이 이미 complete 인 레인은 전이가 없어 formation-complete 를 다시 발행하지 않는다 →
     새 앱 세션에서 boot-warning 배너가 뜨면 소멸 신호가 영영 오지 않았다. 부트 1회만 강제 재발행해
     그 갭을 닫는다. ⚠주기 스케줄 잡(10분)에는 절대 붙이지 마라 — 매 틱 토스트 스팸이 되살아난다.
-    INV-1 불변: 강제 표면화는 상태를 계산·변경하지 않는다(발행 kind 는 호출자가 준 state 그대로)."""
+    INV-1 불변: 강제 표면화는 상태를 계산·변경하지 않는다(발행 kind 는 호출자가 준 state 그대로).
+    detail=피드 본문 override(A2 · pending-resource 의 게이트 축 문구) — None 이면 상태별 기본 본문."""
     if not force and prev_state is not None and state_kind(prev_state) == state_kind(state):
         return  # 상태 kind 무변화 → 재표면화 생략(배너 dismiss 는 멱등이나 스팸 억제)
-    _feed_for_state(state)
+    _feed_for_state(state, detail)
     evt = evt_type_for_state(state)
     if evt:
         _emit_evt(evt, {"socket": socket or "", "state": state, "kind": state_kind(state)})
@@ -849,11 +958,17 @@ def ensure(socket=None, cwd=None, force_surface=False):
 
         # ④ 자원 게이트(complete 가 **아닐 때만** — 실제로 노드를 스폰하는 경로에서만 예산을 본다)
         if not _resource_ok(socket):
+            gate_obj = _resource_gate_last(socket)   # ★A2: 게이트 JSON(축) — bool 스텁 레인이면 None
             live = live_now or set()   # ③′ 관측 재사용(cys list 중복 호출 0)
             state = "pending-resource"
-            detail = "곱셈 자원 예산 hard — 편성 대기" + _external_note()
-            _write_state(socket, state, detail, live, attempts=attempts)
-            _surface(socket, prev, state, force=force_surface)
+            # ★A2(SURVEY B2): 종전 고정 문구 "곱셈 자원 예산 hard" 는 거짓 라벨(곱셈 축은 env 없이 무발화)
+            #   — 게이트가 실제로 hard 로 판정한 축(nodes 44/42 …)을 detail·피드에 적고, JSON 축약을
+            #   상태파일 gate 키로 영속한다(종전엔 축이 어디에도 남지 않아 사후 진단 불능 · F-a 5).
+            detail = _resource_detail(gate_obj) + _external_note()
+            _write_state(socket, state, detail, live, attempts=attempts,
+                         gate=_gate_compact(gate_obj))
+            _surface(socket, prev, state, force=force_surface,
+                     detail=_resource_feed_body(gate_obj))
             return state, detail
 
         # CLI 전무 → pending-cli(빈 셸 유지·온보딩 보존)
@@ -902,11 +1017,19 @@ def ensure(socket=None, cwd=None, force_surface=False):
             ",".join(sorted(booted)) or "없음", ",".join(sorted(installed))) + _external_note()
         if held:
             detail += " · 시도원장 보류=%s" % ",".join(held)
-        _write_state(socket, state, detail, live, attempts=attempts)
+        _write_state(socket, state, detail, live, attempts=attempts, held=held)
         # ★주기 실행 스팸 차단(2026-07-26): 무조건 _feed_for_state 였던 자리를 _surface(전이 시에만
         # 표면화) 로 교체한다. 편성 ensure 가 스케줄 주기(10분)로 붙으면 매 틱마다 사용자에게 토스트가
         # 갔다. prev 는 ensure 진입부에서 읽은 직전 상태 — 동일 kind 면 _surface 계약대로 생략된다.
         _surface(socket, prev, state, force=force_surface)
+        # ★A2(SURVEY B3 Q2-①): 소진/쿨다운 보류는 종전 stderr 1줄뿐이라 심박 명령 꼬리의 `|| true` 가
+        #   삼켰다(어디에도 남지 않음). 상태파일 held 키(위) + 보류 목록이 **직전 상태파일과 달라졌을
+        #   때만** feed 1건 — 같은 보류가 유지되는 매 틱은 침묵(스팸 0) · 해소는 키 소멸로만 표기.
+        if held and held != (prev_obj.get("held") or []):
+            _feed(HELD_FEED_TITLE,
+                  "%s — 쿨다운/소진 원장에 따라 자동 재시도(소진 래치는 역할 생존 관측 또는 %.0fs 경과 시 "
+                  "리셋) · 상태파일 held 키 참조" % (", ".join(held), FORMATION_ATTEMPT_RESET_S),
+                  feed_kind_for_state(state))
         return state, detail
 
 
@@ -1105,8 +1228,43 @@ def self_test():
         calls = []
         g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (1, "", ""))
         ck(_resource_ok(None) is True and len(calls) == 1, "soft(1) 진행 회귀")
+        # ── ★A2(SURVEY B2) 게이트 JSON 보존 — _resource_verdict 는 판정은 그대로, stdout 만 살린다 ──
+        gate_json = json.dumps({"verdict": "hard_block",
+                                "trips": [{"metric": "nodes", "value": 44, "soft": 15,
+                                           "hard": 42, "level": "hard"}],
+                                "warnings": [], "measured": {"nodes": 44}})
+        calls = []
+        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, gate_json, ""))
+        ok2, gate2 = _resource_verdict(None)
+        ck(ok2 is False and isinstance(gate2, dict) and gate2.get("verdict") == "hard_block"
+           and len(calls) == 1, "rc=2 + JSON stdout 이 (False, dict) 아님 — 축 정보 유실")
+        calls = []
+        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, "not json {", ""))
+        ok3, gate3 = _resource_verdict(None)
+        ck(ok3 is False and gate3 is None and len(calls) == 1, "rc=2 + 파손 stdout 이 (False, None) 아님")
+        # 슬롯 경유(ensure ④ 소비 형상): _resource_ok 는 bool, JSON 은 _resource_gate_last 로 · 읽고 비움.
+        g["_run"] = lambda argv, timeout=30: (2, gate_json, "")
+        ck(_resource_ok("/x/a.sock") is False
+           and (_resource_gate_last("/x/a.sock") or {}).get("verdict") == "hard_block",
+           "_resource_ok 슬롯이 게이트 JSON 을 나르지 않음")
+        ck(_resource_gate_last("/x/a.sock") is None, "슬롯이 읽고 비워지지 않음(stale 라벨 위험)")
     finally:
         g["_run"], g["_gate_path"] = saved_run, saved_gp
+    # ── ★A2 라벨 순수 함수 핀 — hard 축만 · JSON 부재=축 미상 · 거짓 라벨(곱셈) 0 · gate 축약 규약 ──
+    _g = {"verdict": "hard_block",
+          "trips": [{"metric": "nodes", "value": 44, "soft": 15, "hard": 42, "level": "hard"},
+                    {"metric": "servers", "value": 2, "soft": 2, "hard": 3, "level": "soft"}],
+          "warnings": ["context_unmeasured"], "measured": {"nodes": 44}}
+    ck("nodes 44/42" in _resource_detail(_g) and "servers" not in _resource_detail(_g),
+       "hard 축(nodes 44/42)만 detail 에 적히지 않음")
+    ck("축 미상" in _resource_detail(None) and "JSON 없음" in _resource_detail(None),
+       "JSON 부재가 '축 미상(JSON 없음)' 아님")
+    ck("곱셈" not in _resource_detail(None) and "곱셈" not in _resource_feed_body(None),
+       "축 미상 문구에 거짓 라벨(곱셈) 잔존")
+    ck("nodes 44/42" in _resource_feed_body(_g), "피드 본문에 hard 축 부재")
+    ck(_gate_compact(_g) == {"verdict": "hard_block", "trips": _g["trips"],
+                             "warnings": _g["warnings"], "measured": _g["measured"]}
+       and _gate_compact(None) is None and _gate_compact({}) is None, "gate 축약 규약 위반")
     # ── ★T9 시도 원장 유계(P3-1 — boot_supervisor 동형) — 순수 함수 핀 ──
     at = {}
     t0 = 1000.0
@@ -1147,7 +1305,7 @@ def self_test():
         return 1
     print("javis_formation self-test OK (classify 5상태·락 키 유일성·plan_roster 동등성"
           "·external-roles 제외·gate fail-closed·T9 자원게이트 3분기+시도원장 유계"
-          "·INST-4 설치안내 분기)")
+          "·INST-4 설치안내 분기·A2 게이트 축 라벨(JSON 보존·gate 축약))")
     return 0
 
 

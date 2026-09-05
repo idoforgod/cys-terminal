@@ -294,17 +294,100 @@ def table():
 
 # ★Rust `src/bin/cys.rs` 의 BUDGET_* 상수와 1:1 대조되는 이름 표(H-TIME-1 grep 검체).
 #   Rust 는 python 을 import 할 수 없으므로 파리티는 **기계 대조**로만 보장한다.
-RUST_PARITY_CONSTS = {
-    "BUDGET_READINESS_FLOOR_SECS": "LAUNCH_READINESS_FLOOR_S",
-    "BUDGET_READINESS_MULT": "LAUNCH_READINESS_MULT",
-    "BUDGET_RESTORE_CAP_SECS": "LAUNCH_RESTORE_CAP_S",
-    "BUDGET_TICK_MS": "LAUNCH_TICK_MS",
-    "BUDGET_POST_MARKER_SETTLE_SECS": "LAUNCH_POST_MARKER_SETTLE_S",
-    "BUDGET_ACK_WAIT_SECS": "LAUNCH_ACK_WAIT_S",
-    "BUDGET_TRUST_SETTLE_SECS": "LAUNCH_TRUST_SETTLE_S",
-    "BUDGET_HEARTBEAT_INTERVAL_SECS": "HEARTBEAT_INTERVAL_S",
-    "BUDGET_LOCK_STALE_SECS": "LOCK_STALE_S",
+# ★cysd 감독자 SOT(2026-09-05 · master 지시 · W-B 조율). **LEAF_FLOORS 에 넣지 않는다** —
+#   그 표는 예산 역전 판정(Σ내부최악 ≤ 외부 상한)과 감액 clamp 의미를 지고 있어서, 성격이 다른
+#   감독자 임계를 섞으면 엉뚱한 축이 깨진다. 여기는 **값의 소유자**일 뿐이고 대조는 파리티가 한다.
+#   목적은 하나다: Rust 감독자 상수가 python SOT 와 갈리면 **기계가 잡는다**(조용한 드리프트 차단).
+CYSD_SUPERVISOR_SOT = {
+    # ★계보 정직 고지: 명세 §2-6 ⓐ 의 **리터럴**이다("hb 정지 > 90s"). BOOT_NODE_TOTAL_S 도 90 이라
+    #   숫자가 같지만 명세에 유도가 없어 **계보는 확인되지 않았다** — 없는 계보를 지어내면 나중에
+    #   그 leaf 를 바꾸는 사람이 fence 임계까지 함께 움직이는 줄 모른다(W-B 조율 2026-09-05).
+    "BOOT_HB_STALL_S": 90,
+    # ★두 계약을 진다(A17 개정 2026-09-05 · master 판정 · W-B 통지): 인텐트 **수명**이자
+    #   명세 §2-6 ⓒ 의 **절대 마감**이다. 별도 마감 기구를 두지 않는 이유는 명세가 지목했던
+    #   bootstrap_chain_worst_s 가 3020초라 수명(1800초) 안에서 **원리적으로 발효 불가**(죽은 코드)
+    #   였기 때문이다. 이 값을 늘리면 절대 마감도 같이 늘어난다 — 모르고 늘리지 마라.
+    "BOOT_INTENT_MAX_AGE_S": 1800,      # 인텐트 수명(초) + 절대 마감
+    "BOOT_RETRY_COOLDOWN_S": 30,        # 재시도 쿨다운(초)
+    "BOOT_MAX_ATTEMPTS": 3,             # 부트런 시도 상한(개수)
+    "SUPERVISOR_TICK_S": 3,             # 감독자 틱 간격(초)
 }
+
+# Rust 상수 ↔ python SOT 파리티 표. 값은 (python 키, 소스 키, Rust 타입)이다.
+#   ★소스 키를 갖는 이유(2026-09-05): 종전 이 표는 `src/bin/cys.rs` 만 대상이라 **cysd 감독자
+#     상수는 대조 밖**이었다 — python 이 값을 바꿔도 아무도 모르는 무측정 계급이다.
+#   ★타입을 갖는 이유: 감독자 상수는 `f64`(1800.0)·`u32`·`usize` 라 종전의 `u64` 전용 정규식으로는
+#     한 건도 못 잡는다(핀이 조용히 공허해진다).
+RUST_PARITY_CONSTS = {
+    "BUDGET_READINESS_FLOOR_SECS": ("LAUNCH_READINESS_FLOOR_S", "cys", "u64"),
+    "BUDGET_READINESS_MULT": ("LAUNCH_READINESS_MULT", "cys", "u64"),
+    "BUDGET_RESTORE_CAP_SECS": ("LAUNCH_RESTORE_CAP_S", "cys", "u64"),
+    "BUDGET_TICK_MS": ("LAUNCH_TICK_MS", "cys", "u64"),
+    "BUDGET_POST_MARKER_SETTLE_SECS": ("LAUNCH_POST_MARKER_SETTLE_S", "cys", "u64"),
+    "BUDGET_ACK_WAIT_SECS": ("LAUNCH_ACK_WAIT_S", "cys", "u64"),
+    "BUDGET_TRUST_SETTLE_SECS": ("LAUNCH_TRUST_SETTLE_S", "cys", "u64"),
+    "BUDGET_HEARTBEAT_INTERVAL_SECS": ("HEARTBEAT_INTERVAL_S", "cys", "u64"),
+    "BUDGET_LOCK_STALE_SECS": ("LOCK_STALE_S", "cys", "u64"),
+    # ── cysd 감독자(src/bin/cysd/boot_supervisor.rs) ─────────────────────────
+    "HB_STALL_SECS": ("BOOT_HB_STALL_S", "cysd_boot_supervisor", "f64"),
+    "INTENT_MAX_AGE_SECS": ("BOOT_INTENT_MAX_AGE_S", "cysd_boot_supervisor", "f64"),
+    "RETRY_COOLDOWN_SECS": ("BOOT_RETRY_COOLDOWN_S", "cysd_boot_supervisor", "f64"),
+    "MAX_ATTEMPTS": ("BOOT_MAX_ATTEMPTS", "cysd_boot_supervisor", "u32"),
+    "SUPERVISOR_INTERVAL_SECS": ("SUPERVISOR_TICK_S", "cysd_boot_supervisor", "u64"),
+    # ★선등재(2026-09-05 · W-B 확정값 · B3-3 에서 작성 예정): progress_step 정체 fence 임계.
+    #   아직 소스에 없으므로 PEND 이고, W-B 가 쓰는 순간 **자동으로 발효**한다 — 핀이 상수보다
+    #   먼저 있으면 그 상수는 태어날 때부터 대조를 받는다(드리프트가 생길 창 자체가 없다).
+    #   python 대응은 리터럴이 아니라 **파생값** boot_node_outer_s() 다: 한 노드가 자기 outer 예산을
+    #   꽉 써도 fence 되면 안 되므로 그 축의 상한을 쓴다(BOOT_NODE_TOTAL_S·inner 로 두면 경계에서
+    #   건강한 런을 자른다 · W-B 근거 수용). leaf 가 커지면 이 임계도 함께 커져야 한다.
+    "PROGRESS_STALL_SECS": ("BOOT_NODE_OUTER_S", "cysd_boot_supervisor", "f64"),
+}
+
+# 이 레인에 **아직 없어도 적색이 아닌** 항목(미발효 PEND). 소스에 나타나는 순간 자동으로 발효한다.
+#   ★목록을 정확히 고정하는 것이 요점이다 — 여기 없는 상수가 사라지면 그건 PEND 가 아니라
+#     적색이다(부재를 SKIP 으로 접는 무측정 방지).
+#   ★사유를 함께 지는 이유(2026-09-05 · master 승인 · W-C 지적): 이름만 찍히면 판독자가
+#     "아직 이 레인에 없다(병합으로 해소)" 와 "아직 아무도 안 썼다(구현 대기)" 를 **구별할 수 없다**.
+#     둘은 조치가 정반대인데 화면에서는 같아 보인다 — 무측정과 같은 계급(원인 구별 불가)이다.
+#   해소 경로 어휘는 둘뿐이다: `merge`(다른 레인에 실재 · C4 유입으로 발효) · `impl`(어느 레인에도
+#     없음 · 누군가 구현해야 발효). 사유 없는 PEND 는 **구조적으로 불가능**하다 — 아래 집합이
+#     이 표에서 파생되므로, 사유를 안 적으면 애초에 PEND 목록에 오르지 못하고 곧바로 적색이 된다.
+RUST_PARITY_PENDING_REASON = {
+    "HB_STALL_SECS": ("merge", "daemon boot_supervisor.rs 에 실재 — C4 유입 시 발효"),
+    "MAX_LIVE_BOOT_RUNS": ("merge", "daemon 유도 상수 — C4 유입 시 발효"),
+    "FENCED_REAP_AGE_SECS": ("merge", "daemon 유도 상수 — C4 유입 시 발효"),
+    "PROGRESS_STALL_SECS": ("impl", "B3-3 미구현 — 세 레인 어디에도 Rust 상수 없음(선등재 핀)"),
+}
+PENDING_KINDS = ("merge", "impl")
+RUST_PARITY_PENDING = frozenset(RUST_PARITY_PENDING_REASON)
+
+
+def pending_note(name):
+    """PEND 한 줄 서술 — 판독자가 조치를 바로 고를 수 있게 해소 경로를 함께 적는다."""
+    kind, why = RUST_PARITY_PENDING_REASON.get(name, ("?", "사유 미등재"))
+    return "%s: %s(%s)" % (name, why, kind)
+
+# 유도 상수는 **값을 python 에 복제하지 않는다**(복제 자체가 새 드리프트면 — W-B 지적 수용).
+#   대신 **유도식 자체를 핀**한다: 누가 유도를 리터럴로 굳히면 잡힌다.
+CYSD_DERIVED_PINS = {
+    "MAX_LIVE_BOOT_RUNS": "MAX_ATTEMPTS as usize + 1",
+    "FENCED_REAP_AGE_SECS": "INTENT_MAX_AGE_SECS",
+}
+
+
+# 파생 함수를 SOT 로 쓰는 파리티 항목 — 리터럴을 복제하지 않는다(leaf 가 커지면 함께 커진다).
+DERIVED_PARITY_SOURCES = {
+    "BOOT_NODE_OUTER_S": lambda: boot_node_outer_s(),
+}
+
+
+def parity_value(py_key):
+    """파리티 대조용 python 값 — leaf 예산 · cysd 감독자 SOT · 파생 함수 셋 중 하나에서 나온다."""
+    if py_key in DERIVED_PARITY_SOURCES:
+        return DERIVED_PARITY_SOURCES[py_key]()
+    if py_key in CYSD_SUPERVISOR_SOT:
+        return CYSD_SUPERVISOR_SOT[py_key]
+    return _leaf(py_key)
 
 
 def self_test():

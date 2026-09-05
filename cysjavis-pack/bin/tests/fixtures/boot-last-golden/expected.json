@@ -1,0 +1,145 @@
+{
+ "_contract": "골든 픽스처 = boot-last writer 의미론(명세 §3-1)의 SOT. python `_Log`(javis_bootstrap.py) 와 Rust 러너(`cys boot-run` · B4)가 **같은 상태 전이에서 같은 문서**를 써야 한다. 절차: 상태별로 writer 를 몰아 boot-last 를 만들고 → `_normalized` 규칙으로 휘발 필드를 치환한 뒤 → 이 디렉터리의 `state-<case>.json` 과 **문서 전체를 동일 비교**한다.",
+ "_contract_surface": "대조 대상은 정규화 후 **문서 전체**다(키 집합만이 아니다). 최상위 12필드 + 조건부 role_claimed·ended·exit·exc·log_write_failures, `result` 하위 전 필드, `steps[]` 의 step/exit/order, 최상위 `retry` 래치 맵이 전부 계약이다. 상태별 기대값(state·ok·exit)은 `cases` 가 들고 있으며 테스트 코드에 하드코딩하지 않는다.",
+ "_not_contract": "★사람이 읽는 한국어 진단 문구·타임스탬프·pid·절대 경로는 계약이 아니다. 그래서 `_normalized` 가 그것들을 치환한다 — 다시 실제 값으로 되돌리지 마라. 문구를 계약에 넣으면 문구를 다듬는 순간 파리티가 결함을 오보한다(todo-decl 픽스처와 같은 교리). `notify.channel` 도 런타임 가용성 파생이라 계약이 아니다.",
+ "_normalized": {
+  "started": "<ts>",
+  "ended": "<ts>",
+  "run_id": "<run_id>",
+  "pid": 0,
+  "boot_last_path": "<boot_last>",
+  "boot_last": "<boot_last>",
+  "detail": "<detail>",
+  "channel": "<channel>",
+  "last": "<prose>",
+  "at": 0,
+  "lock": "<lock>",
+  "record": "<record>",
+  "reason": "<prose>",
+  "self_check": "<prose>",
+  "surface_role": "<observed>",
+  "is_master": "<observed>"
+ },
+ "_aux_files": {
+  "expected.json": "이 파일(SOT).",
+  "mirror-session_error.json": "§3-1 stdout 미러 1줄 — session_error(exit 10) 전용 채널. 훅·MASTER_DIRECTIVE·CEO_TEMPLATE 가 키 이름을 문자열로 인용한다.",
+  "mirror-session_error-persist_failed.json": "디스크 쓰기가 전량 실패했을 때의 미러 — retry_eligible=false + retry_eligible_unknown=true(측정 불능은 재실행 허가가 아니다).",
+  "skip-verdict.json": "exit 11(skipped_inflight)의 `boot-skip-<lane>.json`. **boot-last 가 아니다** — 러너가 terminal 로 전사할 때 자리가 다르다.",
+  "lock-primitive.json": "레인 락 원시 계약(T1-10) — Rust 러너가 include_str! 로 같은 표를 본다."
+ },
+ "_state_note": "`skipped_inflight` 는 boot-last 의 state 가 아니라 별도 파일의 `verdict` 다(정찰 실측). 명세 §3-2 는 이것을 terminal.kind 목록에 넣었지만 boot-last 파일 안에는 자리가 없다.",
+ "cases": {
+  "running": {
+   "note": "선기록만 — 이 시점 이후 어떤 경로로 죽어도 '진행 중'이 남는다(A19)",
+   "golden": "state-running.json",
+   "state": "running",
+   "ok": null,
+   "exit": null
+  },
+  "completed": {
+   "note": "정상 완주(⑤check 통과 → ⑥마커 → ⑧요약 JSON)",
+   "golden": "state-completed.json",
+   "state": "completed",
+   "ok": true,
+   "exit": 0
+  },
+  "team_complete": {
+   "note": "부서 재기동 · 결손 0 → 팀 기동 불요(0.14.30 A4 #13 신설 · 명세 미등재 상태)",
+   "golden": "state-team_complete.json",
+   "state": "team_complete",
+   "ok": true,
+   "exit": 0
+  },
+  "solo_awakening": {
+   "note": "부서장 단독 각성(CEO 티켓 부재 — 실패 아님)",
+   "golden": "state-solo_awakening.json",
+   "state": "solo_awakening",
+   "ok": true,
+   "exit": 0
+  },
+  "dept_fallback": {
+   "note": "③ 정당거부 → 부서 자동 생성 폴백 성공(ok=None)",
+   "golden": "state-dept_fallback.json",
+   "state": "dept_fallback",
+   "ok": null,
+   "exit": 0
+  },
+  "failed-ping": {
+   "note": "②ping 실패 — fail() 경로(step + notify 동반)",
+   "golden": "state-failed-ping.json",
+   "state": "failed",
+   "ok": false,
+   "exit": 3
+  },
+  "failed-check": {
+   "note": "⑤check 최종 실패 — fail() 경로",
+   "golden": "state-failed-check.json",
+   "state": "failed",
+   "ok": false,
+   "exit": 6
+  },
+  "failed-lane-pack": {
+   "note": "레인↔팩 불일치 — result() 직접 경로(notify 없음)",
+   "golden": "state-failed-lane-pack.json",
+   "state": "failed",
+   "ok": false,
+   "exit": 8
+  },
+  "failed-resource-gate": {
+   "note": "자원 hard_block — result() 직접 경로",
+   "golden": "state-failed-resource-gate.json",
+   "state": "failed",
+   "ok": false,
+   "exit": 9
+  },
+  "declined": {
+   "note": "③ 정당거부(ok=None — 건강한 master 의 ok:true 를 덮지 않는다)",
+   "golden": "state-declined.json",
+   "state": "declined",
+   "ok": null,
+   "exit": 7
+  },
+  "session_error": {
+   "note": "③ 비거부 실패 — 래치 첫 기록(retry_eligible=true) + stdout 미러 1줄",
+   "golden": "state-session_error.json",
+   "state": "session_error",
+   "ok": null,
+   "exit": 10
+  },
+  "session_error_latched": {
+   "note": "같은 surface 연속 2회째 — 래치 소진(retry_eligible=false)",
+   "golden": "state-session_error_latched.json",
+   "state": "session_error",
+   "ok": null,
+   "exit": 10
+  },
+  "dept_fallback_failed": {
+   "note": "부서 자동 생성 실패",
+   "golden": "state-dept_fallback_failed.json",
+   "state": "dept_fallback_failed",
+   "ok": null,
+   "exit": 4
+  },
+  "dept_fallback_gate_pending": {
+   "note": "부서장 기동이 첫기동 관문에 갇힘(exit 78 수신)",
+   "golden": "state-dept_fallback_gate_pending.json",
+   "state": "dept_fallback_gate_pending",
+   "ok": null,
+   "exit": 4
+  },
+  "crashed": {
+   "note": "미포착 예외 — finish(exc) 가 running 을 crashed 로 전이",
+   "golden": "state-crashed.json",
+   "state": "crashed",
+   "ok": null,
+   "exit": 1
+  },
+  "aborted": {
+   "note": "result 없이 종결 — finish(exc 없음)가 running 을 aborted 로 전이. ★현행 체인은 모든 return 이 result 를 먼저 남기므로 **블랙박스 도달 불가**인 방어 분기다. 이 골든은 _Log 직접 구동으로만 만들어진다 — 그 사실을 숨기지 않는다",
+   "golden": "state-aborted.json",
+   "state": "aborted",
+   "ok": null,
+   "exit": 9
+  }
+ }
+}

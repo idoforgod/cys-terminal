@@ -1,0 +1,32 @@
+{
+ "started": "<ts>",
+ "run_id": "<run_id>",
+ "pid": 0,
+ "surface": "7",
+ "role": "master",
+ "lane": "base",
+ "boot_last_path": "<boot_last>",
+ "steps": [
+  {
+   "step": "④′resource-gate-notify",
+   "exit": 0,
+   "detail": "<detail>",
+   "order": 22
+  }
+ ],
+ "retry": {},
+ "socket": "",
+ "base_socket": true,
+ "result": {
+  "ok": false,
+  "state": "failed",
+  "failed_step": "resource-gate",
+  "exit": 9,
+  "run_id": "<run_id>",
+  "surface": "7",
+  "pid": 0
+ },
+ "role_claimed": "master",
+ "ended": "<ts>",
+ "exit": 9
+}

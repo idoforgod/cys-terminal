@@ -1,0 +1,16 @@
+{
+ "verdict": "skipped_inflight",
+ "ok": null,
+ "exit": 11,
+ "reason": "<prose>",
+ "run_id": "<run_id>",
+ "pid": 0,
+ "surface": "7",
+ "surface_role": "<observed>",
+ "is_master": "<observed>",
+ "self_check": "<prose>",
+ "lock": "<lock>",
+ "waited": false,
+ "boot_last_untouched": true,
+ "record": "<record>"
+}
