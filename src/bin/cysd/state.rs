@@ -388,8 +388,79 @@ struct IngestState {
     partial: String,
 }
 
+/// (B5 · §2-8) 좌석에 **arm 된 부트 논스**.
+///
+/// ★arm 경로는 이번 릴리스에서 **explicit 하나뿐**이다(A19-1 · master 판정): `boot.arm_nonce`
+/// RPC + lease CAS. 명세가 적은 "Inject 성공 직후 자동 arm" 은 주입 주체가 §2-7 러너인데 그
+/// 러너가 아직 없어서다 — **빠뜨린 것이 아니라 B4-R(러너 단위)로 미룬 것**이고, 그 사실을
+/// 여기 남기는 이유가 그 구분을 다음 사람이 할 수 있게 하기 위해서다(A19 조건 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootNonce {
+    pub intent: String,
+    /// lease 세대 — **판정 축이 아니다**(T1-6: 판정은 intent 일치, 세대는 fencing 전용).
+    pub generation: u32,
+    pub hash: String,
+    pub armed_at: f64,
+}
+
+/// (B5 · §2-8 · A19-2) ack **출처** — 허용목록이다. 판정 축이 아니라 표기다.
+///
+/// 네 상태를 **접지 않는다**: 목록 안 셋 · 목록 밖(기록은 하되 판정 무영향) · 결측.
+/// 결측을 유효값과 같게 두면 "출처를 안 밝힌 ack" 와 "hook 이 보낸 ack" 가 화면에서 같아진다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AckSource {
+    SetStatus,
+    Echo,
+    Hook,
+    /// 허용목록 밖 — 기록은 남기되 판정에 쓰지 않는다.
+    Unlisted(String),
+    /// 아예 오지 않았다 — 유효값과 다른 사실이다.
+    Missing,
+}
+
+impl AckSource {
+    pub fn parse(v: Option<&str>) -> Self {
+        match v {
+            None => AckSource::Missing,
+            Some("set-status") => AckSource::SetStatus,
+            Some("echo") => AckSource::Echo,
+            Some("hook") => AckSource::Hook,
+            Some(other) => AckSource::Unlisted(other.to_string()),
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        match self {
+            AckSource::SetStatus => "set-status",
+            AckSource::Echo => "echo",
+            AckSource::Hook => "hook",
+            AckSource::Unlisted(v) => v.as_str(),
+            AckSource::Missing => "(missing)",
+        }
+    }
+    /// 허용목록 안인가 — 표기 신뢰도이지 **판정 축이 아니다**.
+    pub fn is_listed(&self) -> bool {
+        matches!(self, AckSource::SetStatus | AckSource::Echo | AckSource::Hook)
+    }
+}
+
+/// (B5 · §2-8) 좌석이 받은 ack 1건.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BootAck {
+    pub at: f64,
+    pub source: AckSource,
+    /// **arm 된 시점의 intent** — 판정은 이것으로 한다(T1-6).
+    pub intent: String,
+    /// 제출된 논스의 sha256.
+    pub nonce_hash: String,
+    pub generation: u32,
+}
+
 pub struct Surface {
     pub id: u64,
+    /// (B5 · §2-8) 이 좌석에 arm 된 부트 논스 — arm 은 `boot.arm_nonce` RPC 로만 일어난다.
+    pub boot_nonce: Mutex<Option<BootNonce>>,
+    /// (B5 · §2-8) 이 좌석이 받은 ack — **arm 이전에 온 것은 기록하지 않는다**(사전 ACK 봉인).
+    pub boot_ack: Mutex<Option<BootAck>>,
     pub title: Mutex<String>,
     pub role: Mutex<Option<String>>,
     pub cmd: String,
@@ -3053,6 +3124,10 @@ impl Daemon {
             cwd: cwd_str,
             pid,
             created_at: now_epoch(),
+            // (B5 · §2-8) 부트 논스·ack — arm 전에는 둘 다 None 이고, arm 은 explicit RPC 로만
+            // 일어난다(A19-1 · 자동 arm 은 B4-R 러너와 함께 온다).
+            boot_nonce: Mutex::new(None),
+            boot_ack: Mutex::new(None),
             // RC-3 잔여(T2.1): env 주입 여부 기록(node-recover·in-seat 재연결의 Windows 안전 판정).
             // ★의미 주의(v0.14 D5 확장 이후 · 적대검증 2R): 이 플래그는 '**무엇이든** env 가
             //   실렸나'이지 '계정격리 키(CLAUDE_CONFIG_DIR)가 실렸나'가 아니다. D5 게이트가

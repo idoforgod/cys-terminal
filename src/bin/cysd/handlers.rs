@@ -2650,6 +2650,57 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"freed": freed})))
         }
 
+        // ★B5(§2-8 · A19-1) **explicit arm** — 이번 릴리스의 유일한 arm 경로다.
+        //   자동 arm-at-inject 는 주입 주체가 §2-7 러너인데 그 러너가 아직 없어 B4-R 로 미뤘다
+        //   (빠뜨린 것이 아니다 — A19 조건 1). lease CAS 로 소유권을 확인한 뒤에만 arm 한다.
+        //   ★arm 은 **ack 를 리셋**한다: 재사용 좌석에서 앞 intent 의 ack 가 새 intent 의
+        //   판정에 섞이면 안 된다(§2-8 '재사용 좌석은 새 intent 의 arm 이 ack 를 리셋').
+        "boot.arm_nonce" => {
+            if let Some(reply) = lease_gate(daemon, &params, &id, "boot.arm_nonce") {
+                return reply;
+            }
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let (Some(intent), Some(nonce_hash), Some(generation)) = (
+                param_str(&params, "intent"),
+                param_str(&params, "nonce_hash"),
+                params.get("generation").and_then(Value::as_u64),
+            ) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "boot.arm_nonce: intent·nonce_hash·generation 이 모두 필요하다",
+                ));
+            };
+            let Ok(generation) = u32::try_from(generation) else {
+                return Reply::Single(err_response(&id, "invalid_params", "generation 범위 초과"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(&id, "not_found", &format!("surface {sid} not found")));
+            };
+            if let Ok(mut g) = surface.boot_nonce.lock() {
+                *g = Some(crate::state::BootNonce {
+                    intent: intent.clone(),
+                    generation,
+                    hash: nonce_hash.clone(),
+                    armed_at: crate::state::now_epoch(),
+                });
+            }
+            // ★리셋 — 앞 intent 의 ack 를 새 arm 이 물려받지 않는다.
+            if let Ok(mut g) = surface.boot_ack.lock() {
+                *g = None;
+            }
+            daemon.bus.publish(
+                "boot_supervisor.nonce_armed",
+                "boot_supervisor",
+                Some(sid),
+                json!({"surface_id": sid, "intent": intent, "generation": generation,
+                       "note": "explicit arm(A19-1) — 자동 arm-at-inject 는 B4-R 러너와 함께 온다"}),
+            );
+            Reply::Single(ok_response(&id, json!({"armed": true})))
+        }
+
         "boot.enqueue" => {
             // ★(부트 v2 · 명세 §2-5) GUI 인가 — `operator_token` 이 **데몬 발급값과 일치할
             //   때만** surface_id 신고를 허용한다. 근거 계급은 feed.reply 면제와 같다: 토큰은
@@ -3166,6 +3217,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "awakened_at": *s.awakened_at.lock().unwrap(),
                         // ★(W2 · B14) 주입 검증 상태 — true=ack 확인 / false=창 만료 미확인 / null=미판정.
                         "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // (B5 · §2-8) 논스 ack 3필드 — 판정은 intent 일치 ∧ 해시 일치(T1-6)이고
+                        //   source 는 출처 표기다(A19-2). generation 은 fencing 전용이라 판정에
+                        //   쓰지 않지만, 어느 lease 에서 arm 됐는지는 보여야 한다.
+                        "ack_nonce_ok": crate::boot_supervisor::ack_nonce_ok(
+                            s.boot_nonce.lock().ok().as_deref().and_then(|g| g.as_ref()),
+                            s.boot_ack.lock().ok().as_deref().and_then(|g| g.as_ref()),
+                        ),
+                        "ack_source": s.boot_ack.lock().ok()
+                            .and_then(|g| g.as_ref().map(|a| a.source.as_str().to_string())),
+                        "boot_nonce_generation": s.boot_nonce.lock().ok()
+                            .and_then(|g| g.as_ref().map(|n| n.generation)),
                         // ★(W4 · D5) alternate screen 관측 — org.status 와 **같은 키·같은 의미**
                         // (동형성 핀). launch-agent 가 mac claude fullscreen WARN 판정에 소비한다.
                         "alt_screen": s.alt_screen.load(Ordering::Relaxed),
@@ -5474,6 +5536,50 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // ★B5(§2-8) **ack 기록** — `ack` 는 additive 형제 키다(훅 T1-8 이 이미 보내고 있다).
+            //   ★사전 ACK 봉인: arm 이전에 온 ack 는 **기록하지 않는다**. 기록해 두고 나중에
+            //   판정에서 거르면 '왔지만 무효' 와 '오지 않았다' 가 표에서 같아 보이고, 그러면
+            //   재사용 좌석에서 앞 intent 의 ack 가 새 판정에 섞이는 창이 생긴다.
+            if let Some(ack) = params.get("ack").and_then(Value::as_object) {
+                let submitted = ack.get("nonce").and_then(Value::as_str).unwrap_or_default();
+                let source = crate::state::AckSource::parse(
+                    ack.get("source").and_then(Value::as_str),
+                );
+                let armed = surface.boot_nonce.lock().ok().and_then(|g| g.clone());
+                match armed {
+                    None => {
+                        // arm 전 — 봉인. 조용하지 않게 남긴다(사전 ACK 시도는 그 자체가 신호다).
+                        daemon.bus.publish(
+                            "boot_supervisor.ack_ignored_before_arm",
+                            "boot_supervisor",
+                            Some(sid),
+                            json!({"surface_id": sid, "source": source.as_str(),
+                                   "note": "arm 이전에 도착한 ack — 기록하지 않는다(사전 ACK 봉인 · §2-8)"}),
+                        );
+                    }
+                    Some(n) => {
+                        let hash = crate::boot_supervisor::nonce_hash(submitted);
+                        if let Ok(mut g) = surface.boot_ack.lock() {
+                            *g = Some(crate::state::BootAck {
+                                at: crate::state::now_epoch(),
+                                source: source.clone(),
+                                intent: n.intent.clone(),
+                                nonce_hash: hash.clone(),
+                                generation: n.generation,
+                            });
+                        }
+                        daemon.bus.publish(
+                            "boot_supervisor.ack_recorded",
+                            "boot_supervisor",
+                            Some(sid),
+                            json!({"surface_id": sid, "intent": n.intent,
+                                   "source": source.as_str(), "listed": source.is_listed(),
+                                   "matched": hash == n.hash,
+                                   "note": "source 는 출처 표기이며 판정 축이 아니다(A19-2) — 판정은 intent 일치 ∧ 해시 일치(T1-6)"}),
+                        );
+                    }
+                }
+            }
             let state = param_str(&params, "state").unwrap_or_else(|| "working".into());
             // C0(§2.2): "quiescing" = master surface가 clear·복원·cycle-agent 진행 중이라
             // 채널 inbox 주입을 보류해야 하는 상태(자기보고). 채널 배달기가 이 값을 게이트로 읽는다.
@@ -6103,6 +6209,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // `cys status --json`). surface.list 와 **같은 키·같은 의미**를 노출한다.
                         "awakened_at": *s.awakened_at.lock().unwrap(),
                         "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // (B5 · §2-8) 논스 ack 3필드 — 판정은 intent 일치 ∧ 해시 일치(T1-6)이고
+                        //   source 는 출처 표기다(A19-2). generation 은 fencing 전용이라 판정에
+                        //   쓰지 않지만, 어느 lease 에서 arm 됐는지는 보여야 한다.
+                        "ack_nonce_ok": crate::boot_supervisor::ack_nonce_ok(
+                            s.boot_nonce.lock().ok().as_deref().and_then(|g| g.as_ref()),
+                            s.boot_ack.lock().ok().as_deref().and_then(|g| g.as_ref()),
+                        ),
+                        "ack_source": s.boot_ack.lock().ok()
+                            .and_then(|g| g.as_ref().map(|a| a.source.as_str().to_string())),
+                        "boot_nonce_generation": s.boot_nonce.lock().ok()
+                            .and_then(|g| g.as_ref().map(|n| n.generation)),
                         // ★(W4 · D5) alternate screen 관측 — surface.list 와 **같은 키·같은 의미**
                         // (동형성 핀). status --json(launch-agent·preflight·fleet digest)이 소비.
                         "alt_screen": s.alt_screen.load(Ordering::Relaxed),
@@ -8876,6 +8993,141 @@ mod tests {
         assert!(
             r["result"]["boot_v2_enabled"].is_boolean(),
             "org.status 가 boot_v2_enabled 를 노출하지 않는다 — 스위치 SOT 가 데몬이 아니게 된다 ({r})"
+        );
+    }
+
+    /// ★B5(§2-8) H-NONCE-1..5 — 논스 ack 저장 모델의 다섯 갈래를 한자리에서 잰다.
+    ///
+    /// ★arm 은 이번 릴리스에서 **explicit RPC 하나뿐**이다(A19-1). 자동 arm-at-inject 는 주입
+    /// 주체가 §2-7 러너인데 그 러너가 없어 B4-R 로 미뤘다 — **빠뜨린 것이 아니다**.
+    #[test]
+    fn boot_nonce_ack_model_holds_all_five_branches() {
+        let dir = std::env::temp_dir().join(format!("cys-nonce-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let pane = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("pane");
+        let sid = pane.id;
+        daemon.surfaces.lock().unwrap().insert(sid, pane.clone());
+        let call = |method: &str, params: Value| {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: method.into(), params },
+                None,
+            ) else {
+                panic!("expected single reply");
+            };
+            r
+        };
+        let hash_of = |n: &str| crate::boot_supervisor::nonce_hash(n);
+        let verdict = || {
+            crate::boot_supervisor::ack_nonce_ok(
+                pane.boot_nonce.lock().unwrap().as_ref(),
+                pane.boot_ack.lock().unwrap().as_ref(),
+            )
+        };
+
+        // ① H-NONCE-1 · 사전 ACK 봉인 — arm 전 ack 는 **기록조차 되지 않는다**.
+        //    기록해 두고 판정에서 거르면 '왔지만 무효' 와 '오지 않았다' 가 표에서 같아진다.
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N1", "source": "hook"}}));
+        assert!(
+            pane.boot_ack.lock().unwrap().is_none(),
+            "arm 전 ack 가 기록됐다 — 사전 ACK 봉인이 뚫렸다"
+        );
+        assert!(!verdict(), "arm 이 없는데 판정이 참이다");
+
+        // ② A19 조건 2 · **음성 대조** — explicit RPC 없이는 arm 되지 않는다.
+        //    'arm 되지 않음' 과 '필드 부재' 를 같은 값으로 접지 않는다: 여기서는 **부재**이고,
+        //    ③ 이후는 **arm 됨** 이며 ⑤ 는 **다른 intent 로 arm 됨** 이라 셋이 서로 다르다.
+        assert!(
+            pane.boot_nonce.lock().unwrap().is_none(),
+            "explicit arm 없이 논스가 arm 됐다 — 누군가 암묵 arm 을 배선했다"
+        );
+
+        // ③ H-NONCE-2 · arm 뒤의 ack 는 참이다.
+        call("boot.arm_nonce", json!({"surface_id": sid, "intent": "i1",
+                                      "generation": 1, "nonce_hash": hash_of("N1")}));
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N1", "source": "hook"}}));
+        assert!(verdict(), "arm 뒤 올바른 ack 가 참이 아니다");
+
+        // ④ A19-2 · source 는 **판정 축이 아니다**. 목록 밖 값도 기록되지만 판정은 그대로다.
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N1", "source": "bogus"}}));
+        {
+            let a = pane.boot_ack.lock().unwrap();
+            let a = a.as_ref().expect("ack 가 기록되지 않았다");
+            assert_eq!(a.source, crate::state::AckSource::Unlisted("bogus".into()));
+            assert!(!a.source.is_listed(), "목록 밖 값이 허용목록 안으로 읽혔다");
+        }
+        assert!(verdict(), "목록 밖 source 가 판정을 바꿨다 — source 는 표기이지 판정 축이 아니다");
+        // source 결측은 **유효값과 다른 사실**이다.
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N1"}}));
+        assert_eq!(
+            pane.boot_ack.lock().unwrap().as_ref().unwrap().source,
+            crate::state::AckSource::Missing,
+            "source 결측이 유효값과 같아졌다"
+        );
+        assert!(verdict(), "source 결측이 판정을 바꿨다");
+
+        // ⑤ H-NONCE-3 · 재사용 좌석 — **새 intent 의 arm 이 ack 를 리셋**한다.
+        call("boot.arm_nonce", json!({"surface_id": sid, "intent": "i2",
+                                      "generation": 2, "nonce_hash": hash_of("N2")}));
+        assert!(
+            pane.boot_ack.lock().unwrap().is_none(),
+            "재arm 이 앞 intent 의 ack 를 물려받았다 — 다른 부트의 ack 가 새 판정에 섞인다"
+        );
+        assert!(!verdict(), "리셋 직후인데 판정이 참이다");
+        // 틀린 논스는 참이 되지 않는다.
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N1", "source": "hook"}}));
+        assert!(!verdict(), "다른 intent 의 논스로 ack 가 통과했다");
+
+        // ⑥ T1-6 · **세대는 판정 축이 아니다** — ack 를 받은 뒤 fencing 으로 세대가 올라도
+        //    intent·해시가 맞으면 판정은 참으로 남는다. (Reconcile 이 같은 주입을 이월할 때
+        //    세대만 올라 ack 가 깨지면 노드는 새 논스를 모르는 채 degraded 가 된다.)
+        //    ★순서가 계약이다: **먼저 ack 를 기록하고 그 뒤에 세대를 올린다.** 반대로 하면
+        //      ack 가 오른 세대를 그대로 복사해 두 값이 같아지고, 그러면 이 갈래는 아무것도
+        //      재지 못한다(변이 W3 가 통과해서 실측으로 드러났다 — 검체가 초록인 것과 옳은
+        //      이유로 초록인 것은 다르다).
+        call("status.set", json!({"surface_id": sid, "ack": {"nonce": "N2", "source": "echo"}}));
+        assert!(verdict(), "올바른 ack 가 참이 아니다(전제)");
+        {
+            let mut g = pane.boot_nonce.lock().unwrap();
+            g.as_mut().unwrap().generation = 99; // fencing 으로 세대만 올랐다
+        }
+        assert_ne!(
+            pane.boot_ack.lock().unwrap().as_ref().unwrap().generation,
+            pane.boot_nonce.lock().unwrap().as_ref().unwrap().generation,
+            "검체 자기검증: 두 세대가 같으면 이 갈래는 아무것도 재지 못한다"
+        );
+        assert!(verdict(), "세대가 달라 ack 가 깨졌다 — T1-6 판정식 위반(fencing 축이 판정에 샜다)");
+
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pane.pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B5 소스핀(A19 조건 2) — 논스를 arm 하는 자리는 **정확히 한 곳**이다.
+    ///
+    /// 행위 검체는 '지금 암묵 arm 이 없다' 를 보이지만, 누군가 나중에 inject 경로에 arm 을
+    /// 붙이면 그 검체는 여전히 초록일 수 있다(그 경로를 안 타는 형상이면). 쓰기 지점 자체를
+    /// 닫힌 집합으로 못 박아 형상과 무관하게 잡는다.
+    #[test]
+    fn the_nonce_is_armed_at_exactly_one_place() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        // ★세는 것은 **쓰기**다. 접근 전부를 세면 행 노출 같은 순수 판독이 늘 때마다 이 핀이
+        //   이유 없이 깨지고, 그러면 다음 사람이 숫자를 올려 맞추다가 진짜 쓰기 유입을 놓친다.
+        assert_eq!(
+            prod.matches("crate::state::BootNonce {").count(),
+            1,
+            "논스를 **arm 하는(쓰는)** 자리가 정확히 1곳이 아니다 — 암묵 arm 이 배선됐다는 뜻이고, \
+             그러면 A19-1 이 explicit 로 좁혀 둔 경로가 조용히 넓어진다"
+        );
+        assert!(
+            prod.contains("\"boot.arm_nonce\" => {"),
+            "explicit arm RPC 가 사라졌다 — 이번 릴리스의 유일한 arm 경로다(A19-1)"
         );
     }
 
