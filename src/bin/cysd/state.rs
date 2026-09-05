@@ -1715,7 +1715,13 @@ pub struct Daemon {
     ///
     /// `Option` 하나인 이유는 계약이다: 레인당 실행은 **항상 ≤1**(G1). 여럿을 표현할 수 있게
     /// 두면 그 불변식이 자료구조에서 사라지고, 그때부터는 주석만 남는다.
-    pub boot_run_active: Mutex<Option<BootRunActive>>,
+    /// ★B4-1(A18 [2]) **레인별** 활성 런 표 — 키는 레인이다.
+    ///
+    /// 종전에는 `Option` 하나였고 등록이 무조건 덮어쓰기였다. 그러면 이미 활성인 런이 조용히
+    /// 표에서 지워져 **관측 밖 고아**가 된다(fence 도 admission 도 세지 못한다). G1 은 "레인당
+    /// 실행 ≤1" 이지 "전역 1" 이 아니므로, 레인을 키로 두면 그 불변식을 자료구조가 지고
+    /// 서로 다른 레인의 동시 진행도 정직하게 표현된다.
+    pub boot_run_active: Mutex<std::collections::HashMap<String, BootRunActive>>,
     /// (B3-2R ⑥·④ⓓ) fence 된 런의 원장 — **회수하지 못한 고아**의 목록이다(무kill 계약).
     /// 길이가 곧 admission 상한의 분모다. 유계는 감독자가 [`crate::boot_supervisor`] 에서 건다.
     pub boot_fenced: Mutex<Vec<FencedRun>>,
@@ -2443,7 +2449,7 @@ impl Daemon {
             auto_route_seen: Mutex::new(HashMap::new()),
             // (P2 · R3-P2-4) 기본 false — set 주체는 boot_supervisor::spawn 하나뿐이다.
             supervisor_alive: AtomicBool::new(false),
-            boot_run_active: Mutex::new(None),
+            boot_run_active: Mutex::new(std::collections::HashMap::new()),
             boot_fenced: Mutex::new(Vec::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.

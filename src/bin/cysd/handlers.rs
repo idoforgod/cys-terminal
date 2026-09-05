@@ -2399,12 +2399,18 @@ fn hook_decide_verdict(seat: Result<&str, &'static str>) -> (&'static str, &'sta
 /// 가장 나쁜 실패다 — 감독자 `admission_state` 의 fail-closed 와 같은 규율이다.
 fn lease_gate(daemon: &Arc<Daemon>, params: &Value, id: &Value, path: &str) -> Option<Reply> {
     let supplied = params.get("lease").and_then(Value::as_u64)?;
+    // ★B4-1: 활성 표가 레인 키 맵이 됐으므로, 실린 lease 와 **세대가 같은 활성 런**을 찾는다.
+    //   못 찾으면 그 러너는 소유권을 잃은 것이다(fence 로 세대가 올랐거나 이미 끝났다).
     let (ok, current) = match daemon.boot_run_active.lock() {
-        Ok(g) => (
-            crate::boot_supervisor::lease_ok(Some(supplied), g.as_ref()),
-            g.as_ref().map(|r| r.generation),
-        ),
-        Err(_) => (false, None),
+        Ok(g) => {
+            let matched = g.values().find(|r| u64::from(r.generation) == supplied);
+            (
+                crate::boot_supervisor::lease_ok(Some(supplied), matched),
+                g.values().map(|r| r.generation).collect::<Vec<_>>(),
+            )
+        }
+        // 표를 못 읽으면 소유권을 확인할 수 없다 — 확인 못 한 것을 통과시키지 않는다.
+        Err(_) => (false, Vec::new()),
     };
     if ok {
         return None;
@@ -2609,6 +2615,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   lane 도 지정할 수 없다(R3-P2-6): 인텐트는 항상 **수신 데몬 자신의 레인**(빈값 =
         //   자기 소켓)에 적힌다 — 호출자 lane 을 열면 데몬 A 의 팩을 레인 B 소켓으로 낳는
         //   레인↔팩 불일치 표면이 생긴다. 위반은 조용한 무시가 아니라 invalid_params 거절이다.
+        // ★B4-2(A18 [5]) **확인된 exit ACK** — 고아 원장과 활성 슬롯을 회수하는 **유일한 근거**다.
+        //   R5 [4]에서 나이 기반 삭제를 폐지하며 "원장에서 빼는 근거는 확인된 exit" 이라고
+        //   적었고, 그 주체가 이 RPC 다. 나이는 진단이고 이것이 근거다.
+        //   키는 (intent, epoch, generation) 으로 FencedRun::key·예약 증서와 **같은 모양**이다
+        //   (A18 ⓔ) — 분모와 분자가 다른 키를 쓰면 상한 계수가 조용히 갈린다.
+        "boot.exit_ack" => {
+            let (Some(intent), Some(epoch), Some(generation)) = (
+                param_str(&params, "intent"),
+                params.get("epoch").and_then(Value::as_u64),
+                params.get("generation").and_then(Value::as_u64),
+            ) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "boot.exit_ack: intent·epoch·generation 이 모두 필요하다(회수 키)",
+                ));
+            };
+            let Ok(generation) = u32::try_from(generation) else {
+                return Reply::Single(err_response(&id, "invalid_params", "generation 범위 초과"));
+            };
+            let freed = crate::boot_supervisor::release_confirmed_exit(
+                daemon,
+                (intent.as_str(), epoch, generation),
+            );
+            daemon.bus.publish(
+                "boot_supervisor.exit_ack",
+                "boot_supervisor",
+                None,
+                json!({"intent": intent, "epoch": epoch, "generation": generation,
+                       "freed": freed,
+                       "note": "확인된 exit 관측 — 이 키의 활성 슬롯과 고아 원장 항목을 회수했다"}),
+            );
+            Reply::Single(ok_response(&id, json!({"freed": freed})))
+        }
+
         "boot.enqueue" => {
             // ★(부트 v2 · 명세 §2-5) GUI 인가 — `operator_token` 이 **데몬 발급값과 일치할
             //   때만** surface_id 신고를 허용한다. 근거 계급은 feed.reply 면제와 같다: 토큰은
@@ -8725,7 +8766,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
         // 진행 중인 부트 런 — 세대 7 을 소유한다.
-        *daemon.boot_run_active.lock().unwrap() = Some(crate::state::BootRunActive {
+        daemon.boot_run_active.lock().unwrap().insert(String::new(), crate::state::BootRunActive {
             intent: "i".into(),
             generation: 7,
             roles: Vec::new(),

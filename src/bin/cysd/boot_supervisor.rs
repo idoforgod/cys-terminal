@@ -2020,9 +2020,111 @@ fn notify_no_spawn(
 /// 잠금 획득에 실패하면(Mutex poison 등) `None` 을 돌리고 호출부는 **상한에 걸린 것으로** 친다.
 /// 못 세는데 낳는 것이 이 축에서 가장 나쁜 실패다 — 세지 못하는 상태에서 프로세스를 늘리면
 /// 유계가 무너진 것을 아무도 모른다. 관측 불능은 통과가 아니다(이 세션의 규율 그대로).
+/// (B4-1 · A18 [2]) **admission 예약 증서** — 존재하면 그 레인의 활성 슬롯을 실제로 잡았다는 뜻.
+///
+/// 키는 `(intent, epoch, generation)` 이고 [`FencedRun::key`] 와 **같은 모양**이다(A18 ⓔ) —
+/// 분모(고아 원장)와 분자(활성 예약)가 다른 키를 쓰면 같은 런이 양쪽에 다르게 세어져 상한이
+/// **조용히** 어긋난다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionReservation {
+    lane: String,
+    key: (String, u64, u32),
+}
+
+impl AdmissionReservation {
+    pub fn key(&self) -> (&str, u64, u32) {
+        (self.key.0.as_str(), self.key.1, self.key.2)
+    }
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+}
+
+/// (B4-1 · codex R7 [2]) 레인의 활성 슬롯을 **원자로 예약**한다 — 잡았으면 증서, 이미 찼으면 `None`.
+///
+/// 종전 등록은 무조건 덮어쓰기였다. 이미 활성인 런이 있어도 표가 조용히 교체되고, 원래 런은
+/// **표에서 사라진 채 프로세스만 남는다**. 잠금을 한 번만 잡고 그 안에서 검사와 삽입을 함께
+/// 한다 — 나눠 잡으면 그 사이가 곧 이 함수가 막으려는 경주다.
+/// (B4-1 · master ⓔ) 예약이 거절된 **이유** — `Option` 으로 접으면 두 사실이 같아 보인다.
+///
+/// `Occupied`(그 레인이 이미 활성이다)와 `Unobservable`(표를 읽지 못했다)은 조치가 다르다.
+/// 앞은 정상적인 유계 동작이고, 뒤는 **관측 불능**이라 그 자체가 병리 신호다. 같은 값으로
+/// 접으면 사고 때 둘을 구별할 수 없다 — 이 세션이 반복해서 값을 치른 계급이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// 그 레인이 이미 활성이다(G1 · 정상 유계).
+    Occupied,
+    /// 활성 표를 읽지 못했다 — 관측 불능은 통과가 아니다.
+    Unobservable,
+}
+
+impl AdmissionRefusal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdmissionRefusal::Occupied => "occupied",
+            AdmissionRefusal::Unobservable => "unobservable",
+        }
+    }
+}
+
+pub fn reserve_admission(
+    daemon: &Arc<Daemon>,
+    lane: &str,
+    run: BootRunActive,
+) -> Result<AdmissionReservation, AdmissionRefusal> {
+    let key = (run.intent.clone(), run.epoch, run.generation);
+    let mut g = daemon
+        .boot_run_active
+        .lock()
+        .map_err(|_| AdmissionRefusal::Unobservable)?;
+    if g.contains_key(lane) {
+        return Err(AdmissionRefusal::Occupied); // **덮어쓰지 않는다**
+    }
+    g.insert(lane.to_string(), run);
+    Ok(AdmissionReservation { lane: lane.to_string(), key })
+}
+
+/// (B4-1) 예약 해제 — 슬롯을 놓는다. 반환은 실제로 놓았는가.
+///
+/// ## 해제 경로는 **넷**이다 — 하나라도 빠지면 그 레인이 영구 정지한다
+/// ①terminal ②fence ③**스폰 시도 실패**(master ⓒ 지적 — 예약 후 스폰이 실패하면 슬롯이
+/// 영구 점유된다) ④확인된 exit([`release_confirmed_exit`]). ③이 빠지면 첫 스폰 실패로
+/// 그 레인이 다시는 부트하지 못한다 — 예약을 넣으면서 해제를 빠뜨리는 것과 같은 계열이다.
+pub fn release_admission(daemon: &Arc<Daemon>, lane: &str) -> bool {
+    daemon
+        .boot_run_active
+        .lock()
+        .map(|mut g| g.remove(lane).is_some())
+        .unwrap_or(false)
+}
+
+/// (B4-2 · A18 [5]) **확인된 exit** 관측으로 회수한다 — 활성 슬롯과 고아 원장을 함께 정리한다.
+///
+/// R5 [4]에서 나이 기반 삭제를 폐지하며 "원장에서 빼는 유일한 근거는 확인된 exit" 이라고
+/// 적었고, 그 주체가 여기다. 나이는 진단이고 이것이 근거다.
+pub fn release_confirmed_exit(daemon: &Arc<Daemon>, key: (&str, u64, u32)) -> bool {
+    let mut freed = false;
+    if let Ok(mut hist) = daemon.boot_fenced.lock() {
+        let before = hist.len();
+        hist.retain(|f| f.key() != key);
+        freed |= hist.len() != before;
+    }
+    if let Ok(mut act) = daemon.boot_run_active.lock() {
+        let lane = act
+            .iter()
+            .find(|(_, r)| (r.intent.as_str(), r.epoch, r.generation) == key)
+            .map(|(l, _)| l.clone());
+        if let Some(l) = lane {
+            act.remove(&l);
+            freed = true;
+        }
+    }
+    freed
+}
+
 fn admission_state(daemon: &Arc<Daemon>) -> Option<(usize, usize)> {
     let orphans = daemon.boot_fenced.lock().ok()?.len();
-    let active = usize::from(daemon.boot_run_active.lock().ok()?.is_some());
+    let active = daemon.boot_run_active.lock().ok()?.len();
     Some((orphans, active))
 }
 
@@ -2333,8 +2435,8 @@ fn tick_in(
             notify_fence_disarmed_once(daemon, st);
         } else if it.state == IntentState::Running {
             let verdict = daemon.boot_run_active.lock().ok().and_then(|g| {
-                g.as_ref()
-                    .filter(|r| r.intent == it.id && r.generation == it.generation)
+                g.values()
+                    .find(|r| r.intent == it.id && r.generation == it.generation)
                     // ★B3-3: ⓑ 진행 정체는 ⓐ hb 정지 **위에 독립으로** 얹는다(동결된
                     //   `fence_verdict` 본문 무접촉). 먼저 잡히는 축이 사유가 되고, 둘 다
                     //   침묵하면 fence 하지 않는다.
@@ -2397,8 +2499,13 @@ fn tick_in(
                                     });
                                 }
                                 // 소유권을 잃은 런은 **활성이 아니다** — 표에서 뺀다(원자 이동).
-                                if act.as_ref().is_some_and(|r| r.intent == it.id) {
-                                    *act = None;
+                                //   ★해제 경로 ② fence(B4-1): 레인 키로 뺀다.
+                                let lane = act
+                                    .iter()
+                                    .find(|(_, r)| r.intent == it.id)
+                                    .map(|(l, _)| l.clone());
+                                if let Some(l) = lane {
+                                    act.remove(&l);
                                 }
                             }
                             // ★B3-2R ⑥ fence 된 시도는 **terminal 과 다른 칸**에 남긴다. terminal 은
@@ -2495,13 +2602,17 @@ fn tick_in(
                     );
                     continue;
                 }
-                dispatched += 1;
                 // ★B3(§3-3): 데몬 표 등록은 **스폰 전**이다 — 스폰 뒤에 등록하면 먼저 도착한
                 //   러너 RPC 가 CAS 할 표를 못 찾아 거절된다(경주에서 정상 부트가 진다).
                 //   `pid` 는 스폰 뒤에야 알 수 있으므로 여기서는 `None` 이고 성공 시 채운다.
                 //   `roles` 는 지금 비어 있다: 채우는 주체가 §2-7 러너(B4)다.
-                if let Ok(mut g) = daemon.boot_run_active.lock() {
-                    *g = Some(BootRunActive {
+                // ★B4-1: 등록은 **덮어쓰기가 아니라 예약**이다(codex R7 [2]). 이미 그 레인이
+                //   활성이면 낳지 않는다 — 덮어쓰면 원래 런이 표에서 사라져 관측 밖 고아가 된다.
+                let lane = it.lane.clone();
+                let reservation = reserve_admission(
+                    daemon,
+                    &lane,
+                    BootRunActive {
                         intent: it.id.clone(),
                         generation: persisted.generation,
                         roles: Vec::new(),
@@ -2514,8 +2625,28 @@ fn tick_in(
                         started: now,
                         pid: None,
                         epoch: st.epoch,
-                    });
-                }
+                    },
+                );
+                let reservation = match reservation {
+                    Ok(r) => r,
+                    Err(why) => {
+                        publish(
+                            daemon,
+                            "boot_supervisor.admission_reservation_failed",
+                            json!({"id": it.id, "lane": lane, "why": why.as_str(),
+                                   "generation": persisted.generation, "epoch": st.epoch,
+                                   "note": "예약 실패 — 덮어쓰지 않고 낳지 않는다(G1: 레인당 실행 ≤1). occupied 는 정상 유계이고 unobservable 은 관측 불능이라 조치가 다르다"}),
+                        );
+                        continue;
+                    }
+                };
+                debug_assert_eq!(
+                    reservation.key(),
+                    (it.id.as_str(), st.epoch, persisted.generation),
+                    "예약 키가 고아 원장 키와 다른 모양이다 — 상한 계수가 갈린다"
+                );
+                // ★예약에 성공한 뒤에야 디스패치로 센다 — 예약 실패는 디스패치가 아니다.
+                dispatched += 1;
                 // 러너에게는 **새 세대를 실은 인텐트**를 넘긴다(원장 줄의 attempts 도 실제로 실행된
                 // 값이 된다 — 종전엔 한 세대 낡은 값이 실렸다).
                 let outcome = dispatch_one(daemon, &persisted, action, runner);
@@ -2536,7 +2667,7 @@ fn tick_in(
                             .strip_prefix("pid=")
                             .and_then(|v| v.trim().parse::<u32>().ok());
                         if let Ok(mut g) = daemon.boot_run_active.lock() {
-                            if let Some(r) = g.as_mut() {
+                            if let Some(r) = g.get_mut(&lane) {
                                 if r.intent == it.id {
                                     r.pid = pid;
                                 }
@@ -2563,6 +2694,11 @@ fn tick_in(
                     //   MAX_DISPATCH_PER_TICK 이 이미 틱당 2건으로 유계라 별도 통보 예산을
                     //   두지 않는다(래치가 인텐트당 1회를 마저 집행한다).
                     Err(RunErr::Retire(why)) => {
+                        // ★해제 경로 ③ **스폰 시도 실패**(master ⓒ · B4-1): 예약해 놓고
+                        //   낳지 못했으면 슬롯을 즉시 놓는다. 놓지 않으면 그 레인이
+                        //   **다시는 부트하지 못한다** — 예약을 넣으면서 해제를 빠뜨리는
+                        //   것과 같은 계열이고, retry 가 상한(3회)까지 도는지가 실측이다.
+                        release_admission(daemon, &lane);
                         notify_no_spawn(daemon, st, it, why, &mut pane_notices);
                         if let Some(removed) =
                             remove_and_gate(st, remover, &intent_path(dir, &it.id), why)
@@ -2576,6 +2712,11 @@ fn tick_in(
                         }
                     }
                     Err(RunErr::Retry(why)) => {
+                        // ★해제 경로 ③ **스폰 시도 실패**(master ⓒ · B4-1): 예약해 놓고
+                        //   낳지 못했으면 슬롯을 즉시 놓는다. 놓지 않으면 그 레인이
+                        //   **다시는 부트하지 못한다** — 예약을 넣으면서 해제를 빠뜨리는
+                        //   것과 같은 계열이고, retry 가 상한(3회)까지 도는지가 실측이다.
+                        release_admission(daemon, &lane);
                         if next >= MAX_ATTEMPTS {
                             let _ = remover(&intent_path(dir, &it.id));
                         }
@@ -3123,12 +3264,30 @@ mod tests {
     fn dispatch_per_tick_is_capped() {
         let d = tmp_daemon("flood");
         let dir = tmp_spool("flood");
-        for i in 0..40 {
-            enqueue_in(&dir, &req(&format!("f{i:03}"), None), 0.0).unwrap();
+        // ★계약 정련(B4-1 · master ⓑ): 이 상수는 **틱당 전역 스캔·통보 예산**이고 G1 은
+        //   **레인당 실행 ≤1** 이라 서로 직교한다 — 서로 다른 레인에 각 1건이면 둘 다 만족한다.
+        //   ★종전 기대치는 **덮어쓰기 버그를 전제**했다: 한 레인에 40건을 넣고 2건이 나가는
+        //   것을 정상으로 고정했는데, 그 두 번째는 첫 번째를 표에서 지우고 자리를 차지한
+        //   것이었다(codex R7 [2]). 전제를 바꾼 것이지 기대를 약화한 것이 아니다.
+        for (i, lane) in ["l1", "l2", "l3"].iter().enumerate() {
+            for j in 0..4 {
+                let id = format!("f{i}{j:02}");
+                let mut r = req(&id, None);
+                r.lane = lane;
+                enqueue_in(&dir, &r, 0.0).unwrap();
+            }
         }
         let mut st = SupState::default();
         let n = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0);
         assert_eq!(n, MAX_DISPATCH_PER_TICK, "틱당 상한 위반 — 폭주 차단 실패");
+        // ★상한이 '레인이 하나뿐이라' 걸린 것이 아니라 **정말 예산에서** 걸렸는지 확인한다.
+        //   한 레인 1건 확인으로 끝내면 이 상수는 그 순간부터 무측정이다(master 조건).
+        assert_eq!(
+            d.boot_run_active.lock().unwrap().len(),
+            MAX_DISPATCH_PER_TICK,
+            "서로 다른 레인이 동시에 활성이어야 한다 — 1건이면 예산이 아니라 슬롯 제약이 \
+             걸린 것이고, 그러면 이 상수는 무측정이다"
+        );
     }
 
     /// ★B3(§2-6) 계약 개정: 성공하면 인텐트는 **사라지지 않고** `state=running` 으로 전이한다.
@@ -3681,7 +3840,7 @@ mod tests {
         // 러너가 한 번 보고한 것으로 만든다(그래야 fence 가 발효 조건을 통과한다).
         {
             let mut g = d.boot_run_active.lock().unwrap();
-            let r = g.as_mut().expect("스폰 전 표 등록이 없다");
+            let r = g.values_mut().next().expect("스폰 전 표 등록이 없다");
             assert_eq!(r.generation, 1, "표 세대가 인텐트와 어긋난다");
             r.hb = 10.0; // started(1.0) 보다 뒤 = 보고 1회
         }
@@ -3694,7 +3853,7 @@ mod tests {
         // ★R3 #4: 소유권을 잃은 런은 **활성이 아니다** — 표에서 빠지고 고아 원장으로 옮겨간다.
         //   종전엔 표의 세대만 올려 '활성인데 fence 된' 중간 상태가 남았다.
         assert!(
-            d.boot_run_active.lock().unwrap().is_none(),
+            d.boot_run_active.lock().unwrap().is_empty(),
             "fence 됐는데 활성 표에 남아 있다 — admission 분모가 이중 계상된다"
         );
         let hist = d.boot_fenced.lock().unwrap();
@@ -4069,6 +4228,99 @@ mod tests {
         );
     }
 
+    /// ★B4-1(A18 [2] · codex R7 [2]) — 활성 등록은 **덮어쓰기가 아니라 예약**이고, 거절 사유는
+    /// 접히지 않는다.
+    #[test]
+    fn admission_is_reserved_not_overwritten() {
+        let d = tmp_daemon("resv");
+        let mk = |intent: &str, gen: u32| BootRunActive {
+            intent: intent.into(),
+            generation: gen,
+            roles: Vec::new(),
+            hb: 1.0,
+            progress_step: String::new(),
+            progress_at: 1.0,
+            started: 1.0,
+            pid: None,
+            epoch: 7,
+        };
+        let first = reserve_admission(&d, "L", mk("a", 1)).expect("빈 슬롯을 잡지 못했다");
+        assert_eq!(first.key(), ("a", 7, 1), "예약 키가 (intent, epoch, generation) 이 아니다");
+        assert_eq!(first.lane(), "L");
+        // 같은 레인은 거절 — 그리고 원래 런이 그대로 남는다.
+        assert_eq!(
+            reserve_admission(&d, "L", mk("b", 2)).unwrap_err(),
+            AdmissionRefusal::Occupied,
+            "활성 슬롯이 찼는데 예약이 성공했다 — 덮어쓰기가 살아 있다"
+        );
+        assert_eq!(
+            d.boot_run_active.lock().unwrap().get("L").map(|r| r.intent.clone()),
+            Some("a".to_string()),
+            "거절했는데 표가 바뀌었다 — 원래 런이 관측 밖 고아가 된다"
+        );
+        // ★다른 레인은 잡힌다 — G1 은 레인당 ≤1 이지 전역 1 이 아니다.
+        reserve_admission(&d, "M", mk("c", 3)).expect("다른 레인을 잡지 못했다");
+        assert_eq!(d.boot_run_active.lock().unwrap().len(), 2);
+    }
+
+    /// ★B4-1 해제 경로 넷 중 ④ **확인된 exit** — 나이가 아니라 이것이 회수의 근거다(R5 [4]).
+    #[test]
+    fn confirmed_exit_frees_the_slot_and_the_orphan_ledger() {
+        let d = tmp_daemon("ack");
+        let run = BootRunActive {
+            intent: "a".into(),
+            generation: 1,
+            roles: Vec::new(),
+            hb: 1.0,
+            progress_step: String::new(),
+            progress_at: 1.0,
+            started: 1.0,
+            pid: None,
+            epoch: 7,
+        };
+        reserve_admission(&d, "L", run).expect("예약 실패");
+        d.boot_fenced.lock().unwrap().push(crate::state::FencedRun {
+            intent: "a".into(),
+            epoch: 7,
+            generation: 1,
+            pid: None,
+            why: "hb_stall",
+            at: 1.0,
+        });
+        // 다른 키의 ACK 는 아무것도 회수하지 않는다(키가 갈리면 안 된다).
+        assert!(!release_confirmed_exit(&d, ("a", 7, 2)), "다른 세대의 ACK 가 회수했다");
+        assert_eq!(d.boot_run_active.lock().unwrap().len(), 1);
+        // 같은 키의 ACK 는 활성 슬롯과 고아 원장을 **함께** 회수한다.
+        assert!(release_confirmed_exit(&d, ("a", 7, 1)), "확인된 exit 이 아무것도 회수하지 못했다");
+        assert!(d.boot_run_active.lock().unwrap().is_empty(), "활성 슬롯이 남았다");
+        assert!(d.boot_fenced.lock().unwrap().is_empty(), "고아 원장이 남았다");
+    }
+
+    /// ★B4-1 소스핀(master ⓔ) — **해제 경로 넷이 모두 배선돼 있다.**
+    ///
+    /// 하나라도 빠지면 그 레인이 영구 정지한다. 특히 ③ **스폰 시도 실패** 는 내가 처음에
+    /// 빠뜨린 경로다(master 지적) — 예약해 놓고 낳지 못했는데 놓지 않으면 그 레인은 다시는
+    /// 부트하지 못한다. 행위 검체(retry 가 상한까지 도는가)와 함께 소스로도 못 박는다.
+    #[test]
+    fn every_release_path_is_wired() {
+        let src = include_str!("boot_supervisor.rs");
+        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = strip_line_comments(raw);
+        // 정의 1 + 해제 호출들. 스폰 실패 갈래(Retire·Retry) 둘과 fence·확인된 exit 경로.
+        assert!(
+            prod.matches("release_admission(daemon, &lane)").count() >= 2,
+            "스폰 실패 해제가 두 갈래(Retire·Retry) 모두에 없다 — 그 레인이 영구 정지한다"
+        );
+        assert!(
+            prod.contains("fn release_confirmed_exit("),
+            "확인된 exit 회수 경로가 없다 — 나이를 폐지했는데 대체 근거가 없다"
+        );
+        assert!(
+            prod.contains("act.remove(&l)"),
+            "fence 해제(레인 키 제거)가 없다 — 소유권을 잃은 런이 슬롯을 계속 쥔다"
+        );
+    }
+
     /// ★R7 [1](codex R6 · master 심판 · IG-28) — **준비도 주장은 빌드를 앞지를 수 없다.**
     ///
     /// ## R6 판의 결함 — 무측정을 막는 핀이 그 자체로 무측정이었다
@@ -4223,6 +4475,17 @@ mod tests {
             "실재하는 배선(lease_ok — 정의는 감독자, 호출은 handlers)을 미배선으로 읽었다 \
              — 이 핀은 항상 적색이라 사문이다"
         );
+        // ★B4-1·B4-2 착지로 admission 예약과 확인된 exit 회수 배선이 **실재**하게 됐다.
+        //   핀이 그것을 배선으로 읽는지 확인한다 — IG-28 이 의도한 동작이다: 배선이 오면
+        //   그 칸의 주장이 비로소 가능해지고, 오기 전에는 불가능하다.
+        assert!(
+            wired("reserve_admission", &prod),
+            "B4-1 이 착지했는데 admission 예약을 미배선으로 읽었다 — 결박이 반대로 걸린다"
+        );
+        assert!(
+            wired("release_confirmed_exit", &prod),
+            "B4-2 가 착지했는데 확인된 exit 회수를 미배선으로 읽었다"
+        );
         // ③ ★핀 자신의 검출력 — codex 가 지목한 '빈 채 정의만' 을 실제로 잡는가.
         let empty_only = "fn reserve_admission() {}";
         assert!(
@@ -4258,14 +4521,15 @@ mod tests {
         // ④ 합성 준비도 — 배선 없는 칸을 뒤집으면 정확히 그 칸이 적발된다.
         //    ★칸을 이름이 아니라 **값으로** 뒤집는다(R8 ⓒ): 이름→필드 조회가 사라졌으므로
         //      표에 오타가 나도 엉뚱한 칸을 읽는 별칭이 구조적으로 불가능하다.
-        let flips: [(&str, fn(&mut RunnerReadiness)); 7] = [
+        // ★admission_reserved·confirmed_exit_observed 는 여기서 뺀다 — B4-1·B4-2 착지로
+        //   배선이 실재하므로 뒤집어도 결손이 아니다(lease_cas_closed 와 같은 자리).
+        //   위 ② 에서 **양성**으로 잰다.
+        let flips: [(&str, fn(&mut RunnerReadiness)); 5] = [
             ("atomic_handler", |r| r.atomic_handler = true),
             ("epoch_propagated", |r| r.epoch_propagated = true),
             ("self_terminate", |r| r.self_terminate = true),
             ("boot_last_writer", |r| r.boot_last_writer = true),
             ("durable_history", |r| r.durable_history = true),
-            ("admission_reserved", |r| r.admission_reserved = true),
-            ("confirmed_exit_observed", |r| r.confirmed_exit_observed = true),
         ];
         for (field, flip) in flips {
             let mut r = RUNNER_READINESS;
@@ -4402,7 +4666,7 @@ mod tests {
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         {
             let mut g = d.boot_run_active.lock().unwrap();
-            g.as_mut().unwrap().hb = 10.0;
+            g.values_mut().next().unwrap().hb = 10.0;
         }
         let t = 10.0 + HB_STALL_SECS + 1.0;
         let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, t);
@@ -4437,7 +4701,7 @@ mod tests {
         assert_eq!(tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0), 1);
         {
             let mut g = d.boot_run_active.lock().unwrap();
-            g.as_mut().unwrap().hb = 10.0; // 보고 1회 = hb 가드는 통과하는 상태
+            g.values_mut().next().unwrap().hb = 10.0; // 보고 1회 = hb 가드는 통과하는 상태
         }
         let before = d.bus.latest_seq();
         let _ = tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 10.0 + HB_STALL_SECS + 1.0);
@@ -4856,7 +5120,7 @@ mod tests {
         let mut st = SupState::default();
         assert_eq!(tick_in(&d, &dir, &mut st, pid_runner, remove_spool_file, 1.0), 1);
         assert_eq!(
-            d.boot_run_active.lock().unwrap().as_ref().unwrap().pid,
+            d.boot_run_active.lock().unwrap().values().next().unwrap().pid,
             Some(4242),
             "표에 pid 가 실리지 않았다 — 고아가 생겨도 찾아갈 수 없다"
         );
