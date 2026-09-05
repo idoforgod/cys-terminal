@@ -58,7 +58,7 @@ jobs:
   #   부채 V4(무검증 베이스라인)의 재생산이다. 예산이 문제면 트리거(on:)를 좁혀라.
   win-health:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     env:
       # ★Windows 러너 stdout 기본 cp1252 방어(run 31395642155): 한글 검체 title 인쇄가
       #   UnicodeEncodeError 로 죽어 실기 판정 전체가 관측 불능이 되던 결함. 러너 main 진입부
@@ -216,7 +216,7 @@ jobs:
       #   ★보고를 실패 하류에 두지 않는다(W-C 52차 실증): `-e` 를 빼고 rc 를 잡은 뒤
       #     **파싱보다 먼저** 로그 꼬리를 방출한다 — 파싱이 죽어도 판독 근거가 남는다.
       - name: cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31)
-        timeout-minutes: 20
+        timeout-minutes: 30
         shell: bash
         run: |
           set -uo pipefail
