@@ -122,6 +122,21 @@ jobs:
                                             # Authenticode 미서명(인증서 미보유) — SmartScreen 경고는 감수.
     runs-on: ${{ matrix.platform }}
 
+    # ★잡 레벨 UTF-8 강제 (v0.14.30 발행 실패 수리 · 2026-09-05)
+    #   왜: Windows 러너의 stdout 은 콘솔 코드페이지(cp1252)라, 비ASCII 를 print 하는 python
+    #   스텝이 UnicodeEncodeError 로 죽는다. 실사고: "Version SOT check (drift hard-gate)" 가
+    #   test_version_sot_mutation.py:117 의 print 에서 죽어 **version-check.sh 가 실행되지도
+    #   못한 채**(set -e) 잡이 적색 → 릴리스 미발행(자산 0).
+    #   ★스텝별로 붙이지 않고 **잡 레벨**에 두는 이유: 이 잡의 python 스텝 12개 중 8개가
+    #   미보유였고, 스텝별로 고치면 **다음에 스텝이 늘 때 또 빠진다.** 한 줄이 현재와 미래를
+    #   함께 덮는다. 이미 개별 지정된 3곳과 중복돼도 무해하다(같은 값).
+    #   ★이 저장소의 관행이 이 방식이다 — windows-build 7곳 · release 4곳 · windows-health 1곳.
+    #   (도구 자신을 고치는 `_widen_stdio` 는 여러 곳에서 불리는 스크립트 1개의 예외다.)
+    #   범위: Windows 에서 도는 잡은 이 build(matrix) 뿐이다 — windows-health-gate·pack-artifacts·
+    #   pack-release 전 잡은 ubuntu 라 기본 UTF-8 이고 이 조치가 불필요하다.
+    env:
+      PYTHONUTF8: "1"
+
     steps:
       - uses: actions/checkout@v4
 
