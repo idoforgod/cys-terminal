@@ -2723,6 +2723,28 @@ fn tick_in(
                                    "generation": running.generation, "pid": pid,
                                    "transition_error": transition_err}),
                         );
+                        // ★해제 경로 ④ **관측 주체가 없는 실행자**(codex BLOCK · 2026-09-05).
+                        //   python 체인은 데몬의 자식이지만 데몬은 그 exit 을 관측하지 않는다
+                        //   (`spawn` 갈래에서 `drop(child)` — 주석 자신이 명문화한다). 관측하지
+                        //   않는 런의 슬롯을 계속 쥐면 그 레인은 **같은 데몬 수명 동안 다시는
+                        //   부트하지 못한다**: 실측으로 2차 부트가 Occupied 로 거절됐고 6틱
+                        //   (t=2..202) 동안 회복되지 않았다. 기본 경로가 첫 부트 뒤 멎는다.
+                        //   ★예약의 의미는 '데몬이 exit 을 관측할 런' 이다. python 은 그 대상이
+                        //   아니므로 **즉시 놓는다**. 이 경로의 상호배제는 부트 스크립트가
+                        //   소유한다 — `javis_bootstrap.py` 의 싱글플라이트 락이 BUSY 면 패자가
+                        //   `exit 11` 로 접힌다(별 프로세스 실측: acquired/busy/해제 후 acquired).
+                        //   ★단 그 락은 **무조건이 아니다**: `javis_lock` 부재와 UNAVAILABLE 두
+                        //   갈래에서 직렬화 없이 진행한다(각각 경고 1줄). 그 갈래에서도 이 예약이
+                        //   상호배제를 준 적은 없다 — 영구 거절을 줬을 뿐이고, B4-1 이전 동작
+                        //   (덮어쓰기)과 같은 수준이다. 문서가 아니라 실행으로 확인한 사실이다.
+                        //   ★대가: python 런은 표에 남지 않아 **pid 관측을 잃는다**. pid 는 바로
+                        //   위 `dispatched` 이벤트에 그대로 실리므로 사라지지 않는다.
+                        //   ★정공법(자식 exit 을 비동기로 관측해 `release_confirmed_exit` 호출)은
+                        //   **다섯째 해제 경로**이고 프로세스 수명 관리를 건드리므로 B4-R 로
+                        //   이관했다 — 이 릴리스는 부트 v2 를 휴면으로 싣는다.
+                        if persisted.executor == EXECUTOR_PYTHON {
+                            release_admission(daemon, reservation.lane());
+                        }
                     }
                     // (P2 · R3-P2-5) 전제 붕괴(claim_stale) — 재시도가 아니라 **폐기**다.
                     // 좌석이 죽어 레지스트리에서 master 가 사라졌다면 남은 2회 재시도도 같은
@@ -3328,6 +3350,85 @@ mod tests {
         assert!(
             total <= MAX_ATTEMPTS as usize,
             "디스크 예산이 오르지 않는 상황에서 {total}회 디스패치 — 메모리측 유계가 없다(폭주)"
+        );
+    }
+
+    /// ★codex BLOCK 회귀(2026-09-05) — **같은 데몬 수명에서 2회 부트가 둘 다 나간다.**
+    ///
+    /// 이 검체가 결함을 실제로 잡은 실물이다(재현 프로브 승격). 수리 전 실측은
+    /// n1=1 / n2=0 이었고 2차 인텐트는 pending 인 채 6틱(t=2..202) 동안 한 번도 나가지 못했다 —
+    /// **기본 경로가 첫 부트 뒤 멎는다**는 뜻이다. 근인은 성공 갈래가 예약을 놓지 않는데
+    /// python 자식의 exit 을 관측할 주체가 없어 슬롯을 회수할 사람이 아무도 없었던 것이다
+    /// (해제 넷 중 어느 것도 이 경로에 닿지 않는다).
+    #[test]
+    fn two_boots_in_one_daemon_lifetime_both_dispatch() {
+        let d = tmp_daemon("twoboots");
+        let dir = tmp_spool("twoboots");
+        let mut st = SupState::default();
+        // 출하 기본값 — `CYS_BOOT_V2` 미설정(opt-in)이라 v2 는 꺼져 있다.
+        st.boot_v2_off = true;
+
+        // handlers 는 레인을 빈 문자열로 고정한다(레인 자기 고정) — **모든 제품 부트가 같은
+        // 레인**이라 이 충돌은 보편적이다.
+        let mut r1 = req("boot1", None);
+        r1.lane = "";
+        enqueue_in(&dir, &r1, 0.0).unwrap();
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0),
+            1,
+            "1차 부트가 나가지 않았다 — 전제가 무너졌으니 이 검체는 아무것도 재지 못한다"
+        );
+        // ★이 단언은 전제까지 함께 잰다: 슬롯이 비었다는 것은 성공 갈래가 실행 주체를
+        //   **python 으로 보고** 놓았다는 뜻이다(v2 가 꺼져 있으면 재스탬프가 그렇게 만든다).
+        //   재스탬프가 안 됐다면 슬롯이 남아 여기서 걸린다 — 엉뚱한 경로를 재고 초록이 되는 일이 없다.
+        assert!(
+            d.boot_run_active.lock().unwrap().is_empty(),
+            "python 런의 슬롯이 남았다 — 데몬이 그 자식의 exit 을 관측하지 않으므로 회수할 주체가 없다"
+        );
+
+        let mut r2 = req("boot2", None);
+        r2.lane = "";
+        enqueue_in(&dir, &r2, 0.0).unwrap();
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0),
+            1,
+            "같은 데몬 수명의 2차 부트가 나가지 않았다 — 사용자는 첫 부트 뒤 다시 부트할 수 없다"
+        );
+    }
+
+    /// ★음성 대조 — **러너 경로의 예약은 유지된다.** 놓을 것과 놓지 말 것을 가른다.
+    ///
+    /// 위 수리의 계약은 "관측 주체가 없으면 놓는다" 이지 **"항상 놓는다" 가 아니다.**
+    /// 러너(B4-R)는 `boot.exit_ack` 로 자기 종료를 신고하는 계약을 지므로 그 슬롯은 ACK 까지
+    /// 유지돼야 한다 — 미리 놓으면 레인당 실행 ≤1(G1)이 무너지고 덮어쓰기 회귀(codex R7 [2])가
+    /// 되돌아온다. 즉 러너 경로에서 2차가 거절되는 것은 결함이 아니라 **정상**이다.
+    #[test]
+    fn the_runner_path_keeps_its_reservation_until_exit_ack() {
+        let d = tmp_daemon("runnerkeep");
+        let dir = tmp_spool("runnerkeep");
+        let mut st = SupState::default();
+        st.boot_v2_off = false; // v2 켜짐 = 실행 주체가 러너다(재스탬프 없음)
+
+        let mut r1 = req("run1", None);
+        r1.lane = "";
+        enqueue_in(&dir, &r1, 0.0).unwrap();
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 1.0),
+            1,
+            "러너 경로 1차가 나가지 않았다 — 전제 붕괴"
+        );
+        assert_eq!(
+            d.boot_run_active.lock().unwrap().len(),
+            1,
+            "러너 런의 예약이 사라졌다 — exit ACK 로 회수할 슬롯을 미리 놓으면 레인당 실행 ≤1 이 무너진다"
+        );
+        let mut r2 = req("run2", None);
+        r2.lane = "";
+        enqueue_in(&dir, &r2, 0.0).unwrap();
+        assert_eq!(
+            tick_in(&d, &dir, &mut st, ok_runner, remove_spool_file, 2.0),
+            0,
+            "러너가 점유 중인 레인에 2차가 나갔다 — 덮어쓰기 회귀(codex R7 [2])다"
         );
     }
 
