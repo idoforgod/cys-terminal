@@ -714,6 +714,28 @@ mod tests {
         }
     }
 
+    /// ★(리뷰 R1) 라이브 2.1.261 그리드(입력 상자 아래 상태줄) — 주입 가드는 **부트 창 안**에서 readiness 와
+    /// 같은 함수로 본문 어휘를 보류하고(창 상수 · 재주입 생애 창의 완화는 readiness 축 ①' 몫), 창이 닫힌
+    /// 좌석에서는 스캔하지 않는다. 두 판정기의 어휘 함수가 하나임을 라이브 형상으로도 못 박는다.
+    #[test]
+    fn live_2_1_261_grid_shares_the_modal_vocabulary_with_readiness() {
+        let gs = gates();
+        let live = fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        // 어휘 없는 라이브 그리드 — 부트 창 안에서도 Send(건강한 프롬프트 · 라이브락 방향 회귀 없음).
+        assert_eq!(decide(&obs(live, &gs)), Decision::Send);
+        assert!(crate::readiness::modal_signature(live).is_none());
+        // 본문에 모달 어휘 + 라이브 프롬프트 — 부트 창 안(awakened=Some(false))에서는 보류(관문 축과 같은 상수 창).
+        let body_vocab = format!("  H-1: `Enter to confirm` ∧ `Esc to cancel`\n{live}");
+        assert!(matches!(decide(&obs(&body_vocab, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
+        // 각성한 좌석(창 닫힘)에서는 스캔 0 — 재주입 경로의 판정은 readiness(Site::Reinject)가 맡는다.
+        let mut o = obs(&body_vocab, &gs);
+        o.awakened = Some(true);
+        assert_eq!(decide(&o), Decision::Send);
+        // 전경 권한 프롬프트 + 상태줄 — 보류(readiness 검체 ②와 같은 판정).
+        let foreground = format!("{}\n{}", live.trim_end_matches('\n'), fixtures::LIVE_PERMISSION_PROMPT);
+        assert!(matches!(decide(&obs(&foreground, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
+    }
+
     /// allow 구멍은 **커서가 종료 선택지 위**에 있으면 닫힌다 — 2.1.261 폴더신뢰(기본 포커스 `No, exit`)에
     /// 종전 자동확인 Return 이 나가면 좌석이 죽는다(CONTRACTS B-7 · 재핀은 H-2 의 몫 · 이 벨트는 그 앞을 막는다).
     #[test]

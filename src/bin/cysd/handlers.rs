@@ -2430,6 +2430,28 @@ fn lease_gate(daemon: &Arc<Daemon>, params: &Value, id: &Value, path: &str) -> O
     )))
 }
 
+/// ★(0.14.31 · H-1 · 리뷰 R1) 화면 스냅샷과 **한 관측**을 이루는 `quiet_secs`(`surface.read_text`).
+///
+/// 호출 규약: 호출부가 스냅샷 **앞**에 읽은 출력 세대 `gen_before` 를 넘기고, 스냅샷 락을 놓은 뒤 부른다.
+/// 여기서 `last_output` 표본을 뜬 다음 세대를 다시 읽어 — 홀수(발행 중)였거나 달라졌으면(발행이 겹침)
+/// **0.0** 을 돌려준다(출력이 흐르는 중 · Boot Valve 는 닫힌다). 재시도·스핀은 하지 않는다 — 부트 폴링이
+/// 다음 틱에 다시 본다. 짝수·동일이면 스냅샷의 모든 바이트가 표본 스탬프 이전에 도착한 것이다(state.rs
+/// reader 의 [홀수 ← 스탬프 → 발행 → 짝수] 순서 · 소스 핀 `output_generation_bracket_source_pin`).
+fn quiet_secs_consistent(surface: &crate::state::Surface, gen_before: u64) -> f64 {
+    let elapsed = surface
+        .last_output
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .elapsed()
+        .as_secs_f64();
+    let gen_after = surface.output_gen.load(Ordering::Acquire);
+    if gen_before % 2 == 1 || gen_before != gen_after {
+        0.0
+    } else {
+        elapsed
+    }
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
@@ -3741,30 +3763,38 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   부트 폴링(`cys.rs boot_agent_on_surface` · 관문 보류 재관측)의 Boot Valve 가
             //   `idle_quiet = quiet_secs >= readiness::BOOT_VALVE_QUIET_SECS` 를 **생산**하는 유일한
             //   재료다. 폴링이 이미 매 틱 read_text 를 부르므로 별도 RPC 없이 응답에 실어 왕복 0 추가.
-            //   `last_output` 은 PTY 출력 시에만 갱신된다(state.rs reader) — 사람 입력·주입은 움직이지
-            //   않는다. 구 CLI 는 이 키를 읽지 않고, 구 데몬에 대해 신 CLI 는 `None`(미관측)으로 접어
-            //   밸브를 **닫는다**(fail-closed · 마커·시간 폴백 경로는 그대로).
-            //   락은 단독으로 잡고 즉시 놓는다(아래 scrollback 락과 중첩하지 않는다 — writer 도 단독).
-            let quiet_secs = surface
-                .last_output
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .elapsed()
-                .as_secs_f64();
+            //   `last_output` 은 reader 가 PTY 출력 청크를 받을 때 갱신된다(state.rs) — 사람 입력·주입
+            //   그 자체는 아니지만 그 **PTY 에코**는 출력이라 스탬프를 움직인다(리뷰 R1 · 보수 방향:
+            //   주입 직후 밸브가 더 기다린다). 구 CLI 는 이 키를 읽지 않고, 구 데몬에 대해 신 CLI 는
+            //   `None`(미관측)으로 접어 밸브를 **닫는다**(fail-closed · 마커·시간 폴백 경로는 그대로).
+            //
+            // ★(리뷰 R1 · codex BLOCK) 화면과 quiet 는 **한 관측**이어야 한다. 관측 순서:
+            //   세대 g1(짝수 확인) → 스냅샷(파서 또는 스크롤백 · 락은 스냅샷과 함께 놓는다) → `last_output`
+            //   표본 → 세대 g2. reader 는 [홀수 ← 스탬프 → 파서 반영 → ingest → 짝수] 순서로 발행하므로
+            //   g1==g2 ∧ 짝수이면 스냅샷·표본 사이에 발행이 시작·종료되지 않았고, 스냅샷의 모든 바이트는
+            //   표본이 가리키는 스탬프 **이전**에 도착한 것이다. 겹치면 `quiet_secs = 0.0`(출력이 흐르는
+            //   중 — 재시도·스핀 없음 · 다음 틱이 다시 본다). 종전(스탬프 먼저 · 스냅샷 나중)은 그 사이에
+            //   도착한 청크가 '새 화면 + 오래된 quiet' 로 밸브 창을 열 수 있었다.
+            let gen_before = surface.output_gen.load(Ordering::Acquire);
             // T3-14 델타 읽기: 단조 라인 커서 이후의 새 라인만 반환 (토큰 절약 모니터링)
             if let Some(since) = param_u64(&params, "since_line") {
                 let max_lines = param_u64(&params, "max_lines").unwrap_or(2000).min(10_000) as usize;
                 // ★레이스 차단: scrollback 락을 먼저 잡고 그 안에서 line_count를 읽는다.
                 // writer(state.rs)가 push(N)과 fetch_add(N)을 같은 락 아래에서 수행하므로,
                 // 락 보유 중 읽으면 (sb.len, total)이 항상 일관 — oldest/skip 오프셋 어긋남 차단.
-                let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
-                let total = surface.line_count.load(Ordering::Relaxed);
-                let oldest = total.saturating_sub(sb.len() as u64); // sb[0]의 라인 번호
-                let truncated = since < oldest; // 요청 구간 일부가 FIFO에서 퇴출됨
-                let start = since.max(oldest);
-                let skip = (start - oldest) as usize;
-                let lines: Vec<String> = sb.iter().skip(skip).take(max_lines).cloned().collect();
-                let next_cursor = start + lines.len() as u64;
+                // ★스냅샷 값만 꺼내고 락은 **이 블록에서 놓는다** — quiet 표본은 락 밖에서(중첩 0).
+                let (lines, start, next_cursor, total, truncated) = {
+                    let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                    let total = surface.line_count.load(Ordering::Relaxed);
+                    let oldest = total.saturating_sub(sb.len() as u64); // sb[0]의 라인 번호
+                    let truncated = since < oldest; // 요청 구간 일부가 FIFO에서 퇴출됨
+                    let start = since.max(oldest);
+                    let skip = (start - oldest) as usize;
+                    let lines: Vec<String> = sb.iter().skip(skip).take(max_lines).cloned().collect();
+                    let next_cursor = start + lines.len() as u64;
+                    (lines, start, next_cursor, total, truncated)
+                };
+                let quiet_secs = quiet_secs_consistent(&surface, gen_before);
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "surface_ref": surface_ref(sid),
@@ -3793,6 +3823,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .screen()
                     .contents()
             };
+            // 스냅샷 락은 위 식이 끝나며 놓였다 — quiet 표본은 스냅샷 **뒤**·세대 확인 **앞**.
+            let quiet_secs = quiet_secs_consistent(&surface, gen_before);
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "surface_ref": surface_ref(sid), "text": text,
@@ -7728,6 +7760,134 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(리뷰 R1 · codex BLOCK) `quiet_secs` 와 화면은 **한 관측**이다 — 결정론 검체(스케줄러 무의존).
+    ///
+    /// ① 발행 **진행 중**(세대 홀수)에는 세 분기 모두 `quiet_secs == 0.0` — 스탬프가 아무리 오래됐어도
+    ///    "정적" 을 주장하지 않는다(reader 가 스탬프와 파서 반영 사이에서 3s 넘게 멈춘 경우까지 덮는다).
+    /// ② 발행이 끝나면(짝수) 되감은 스탬프가 그대로 보인다(종전 검체와 같은 하한).
+    /// ③ 관측 **도중** 발행이 끼어들면(스냅샷 락을 test 가 쥔 채 dispatch 를 띄우고, 그 사이 세대 홀수 →
+    ///    스탬프 → 짝수 로 한 청크 발행을 재현한 뒤 락을 놓는다) 결과는 3s 미만이다 — dispatch 가 g1 을
+    ///    발행 전에 읽었으면 세대 불일치로 0.0, 발행 뒤에 읽었으면 갓 찍은 스탬프로 ≈0. 어느 스케줄이든
+    ///    '10s 정적' 이라는 종전의 거짓 관측은 나올 수 없다(종전 코드는 스탬프를 스냅샷 **앞**에 읽어 여기서
+    ///    ≈10s 를 냈다).
+    #[test]
+    fn read_text_quiet_secs_is_one_observation_with_the_screen() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-quietgen-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-quietgen".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let read = |daemon: &Arc<Daemon>, params: serde_json::Value| -> f64 {
+            let req = Request { id: json!(1), method: "surface.read_text".into(), params };
+            let Reply::Single(resp) = dispatch(daemon, req, None) else { panic!("single reply") };
+            assert_eq!(resp["ok"], json!(true), "read_text 실패: {resp}");
+            resp["result"]["quiet_secs"].as_f64().expect("quiet_secs f64")
+        };
+        let branches = [
+            json!({"surface_id": s.id}),
+            json!({"surface_id": s.id, "since_line": 0}),
+            json!({"surface_id": s.id, "lines": 5}),
+        ];
+        // 스탬프를 10초 전으로 되감는다(되감기 불가한 갓 부팅 환경이면 이 검체는 하한만 본다).
+        let rewound = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        let rewind = |s: &crate::state::Surface| {
+            if let Some(t) = rewound {
+                *s.last_output.lock().unwrap() = t;
+            }
+        };
+        // reader 가 살아 있으면(초기 셸 출력) 세대가 움직일 수 있다 — 짝수로 맞추고 잠시 안정화한다.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if s.output_gen.load(Ordering::Acquire) % 2 == 1 {
+            s.output_gen.fetch_add(1, Ordering::AcqRel);
+        }
+        // ① 발행 진행 중(홀수) — 세 분기 모두 0.0.
+        rewind(&s);
+        s.output_gen.fetch_add(1, Ordering::AcqRel);
+        for p in &branches {
+            assert_eq!(read(&daemon, p.clone()), 0.0, "발행 중인데 정적을 주장했다({p})");
+        }
+        // ② 발행 끝(짝수) — 되감은 스탬프가 보인다.
+        s.output_gen.fetch_add(1, Ordering::AcqRel);
+        rewind(&s);
+        for p in &branches {
+            let q = read(&daemon, p.clone());
+            if rewound.is_some() {
+                assert!(q >= 10.0 && q < 600.0, "되감은 스탬프가 반영되지 않았다({p}): {q}");
+            } else {
+                assert!(q >= 0.0);
+            }
+        }
+        // ③ 관측 도중 발행 — 파서 락(전체 화면 분기)과 스크롤백 락(since_line 분기) 각각.
+        if rewound.is_some() {
+            for (label, params, lock_parser) in [
+                ("parser", json!({"surface_id": s.id}), true),
+                ("scrollback", json!({"surface_id": s.id, "since_line": 0}), false),
+            ] {
+                rewind(&s);
+                let parser_guard = lock_parser.then(|| s.parser.lock().unwrap());
+                let sb_guard = (!lock_parser).then(|| s.scrollback.lock().unwrap());
+                let d2 = Arc::clone(&daemon);
+                let handle = std::thread::spawn(move || {
+                    let req = Request { id: json!(1), method: "surface.read_text".into(), params };
+                    let Reply::Single(resp) = dispatch(&d2, req, None) else { panic!("single reply") };
+                    resp["result"]["quiet_secs"].as_f64().expect("quiet_secs f64")
+                });
+                std::thread::sleep(std::time::Duration::from_millis(300)); // dispatch 가 락에 닿을 시간(충분조건 아님 — 어느 쪽이든 단언은 성립)
+                // reader 가 청크 하나를 발행하는 순서를 그대로 재현: 홀수 → 스탬프 → (발행) → 짝수.
+                s.output_gen.fetch_add(1, Ordering::AcqRel);
+                *s.last_output.lock().unwrap() = std::time::Instant::now();
+                s.output_gen.fetch_add(1, Ordering::AcqRel);
+                drop(parser_guard);
+                drop(sb_guard);
+                let q = handle.join().expect("dispatch thread");
+                assert!(q < 3.0, "[{label}] 발행이 겹친 관측이 정적({q}s)으로 보고됐다 — 밸브 창이 열린다");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(리뷰 R1) reader 의 [홀수 ← 스탬프 → 파서 반영 → ingest → 짝수] 순서와 `read_text` 의 [세대 → 스냅샷
+    /// → 표본 → 세대] 순서를 **소스로** 못 박는다 — 실행 검체는 결과만 보고, 순서가 뒤집혀도 타이밍이 좋으면
+    /// 지나갈 수 있기 때문이다(한 관측 계약의 구조 증명).
+    #[test]
+    fn output_generation_bracket_source_pin() {
+        let state = include_str!("state.rs");
+        let reader_start = state.find("let chunk = &buf[..n];").expect("reader 청크 지점");
+        let reader = &state[reader_start..];
+        let odd = reader.find("surf.output_gen.fetch_add(1, Ordering::AcqRel);").expect("세대 홀수 증가");
+        let stamp = reader.find("*surf.last_output.lock().unwrap() = Instant::now();").expect("스탬프");
+        let parser = reader.find("surf.parser.lock()").expect("파서 락");
+        let ingest = reader.find("daemon.ingest_output(&surf, chunk);").expect("ingest");
+        let even = reader[ingest..].find("surf.output_gen.fetch_add(1, Ordering::AcqRel);").expect("세대 짝수 증가") + ingest;
+        assert!(odd < stamp && stamp < parser && parser < ingest && ingest < even,
+            "reader 발행 순서가 [홀수 ← 스탬프 → 파서 → ingest → 짝수] 가 아니다: odd={odd} stamp={stamp} parser={parser} ingest={ingest} even={even}");
+        // 스탬프는 reader 루프 안에 **한 번**만 있다(파서 반영 뒤의 종전 스탬프가 되살아나면 두 번이 된다).
+        let loop_end = reader.find("surf.exited.store(true, Ordering::Relaxed);").expect("루프 끝");
+        assert_eq!(reader[..loop_end].matches("*surf.last_output.lock().unwrap() = Instant::now();").count(), 1);
+        let handlers = include_str!("handlers.rs");
+        let arm = handlers.find("\"surface.read_text\" => {").expect("read_text arm");
+        let arm_end = handlers[arm..].find("\"surface.resize\" => {").expect("다음 arm") + arm;
+        let body = &handlers[arm..arm_end];
+        let g1 = body.find("surface.output_gen.load(Ordering::Acquire)").expect("g1");
+        let sb = body.find("surface.scrollback.lock()").expect("스크롤백 스냅샷");
+        let pr = body.find("                    .parser\n").expect("파서 스냅샷");
+        assert!(g1 < sb && g1 < pr, "세대 g1 이 스냅샷보다 뒤에 읽힌다");
+        assert_eq!(body.matches("quiet_secs_consistent(&surface, gen_before)").count(), 2, "두 응답 분기 모두 한 관측 헬퍼를 지나야 한다");
+        assert!(!body.contains(".last_output"), "read_text arm 이 스탬프를 직접 읽는다 — 헬퍼(스냅샷 뒤·세대 앞) 밖의 표본은 찢어진 관측이다");
+        let helper = handlers.find("fn quiet_secs_consistent(").expect("헬퍼");
+        let helper_end = handlers[helper..].find("pub fn dispatch(").expect("헬퍼 다음 경계");
+        let hb = &handlers[helper..helper + helper_end];
+        let sample = hb.find(".last_output").expect("표본");
+        let g2 = hb.find("surface.output_gen.load(Ordering::Acquire)").expect("g2");
+        assert!(sample < g2, "헬퍼가 세대를 표본보다 먼저 읽는다");
     }
 
     // CYS_PACK_DIR는 프로세스 전역 env라 set/사용 윈도를 직렬화해야 cargo 병렬 러너에서

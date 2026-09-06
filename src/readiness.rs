@@ -468,9 +468,13 @@ fn marker_of<'a>(o: &Observed<'a>) -> Option<&'a str> {
 // 다른 줄로 갈라져도 걸린다. CRLF 는 `normalize` 가 공백으로 흡수한다(ConPTY 안전).
 //
 // 【생애 창】 부트(`Site::Boot`)에서는 **상수로 열려 있다**(관문 축과 같은 근거 — 미탐 = 관문에 주입).
-// 재주입(`Site::Reinject`)에서는 관문 축과 **같은 전경 판정**(`gate_block_left_behind` 의 축 ①·②)
-// 으로만 닫힌다: 마커 뒤에 아무 문면도 없고(그 마커는 대기 중인 입력 프롬프트다) 모달 문면 전량이
-// 그 마커보다 앞(역사)일 때. 마커 미정의(codex)·마커 부재는 **닫지 않는다**(fail-closed).
+// 재주입(`Site::Reinject`)에서는 **전경 판정**으로만 닫힌다: 축 ② 모달 문면 전량이 마커보다 앞(역사)
+// ∧ 축 ①' 마커의 마지막 출현 **줄**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고 그 아래 꼬리가
+// 입력 상자·상태줄 레이아웃이다([`waiting_prompt_with_harmless_trailer`] · 리뷰 R1). 관문 축
+// (`gate_block_left_behind`)의 축 ①은 "마커 뒤 화면 전체가 공백" 인데, 라이브 claude 2.1.261 그리드는
+// 입력 상자 **아래**에 상태줄을 그리므로(실측 2026-09-06 10:18) 그 축은 라이브 좌석에서 영영 닫히지
+// 않는다 — 관문 축은 needle ∧ 위젯이라 좁아 그대로 두고(P4-11 핀 · 백로그), needle 요구가 없어 훨씬
+// 넓은 이 축만 줄 단위로 재정의한다. 마커 미정의(codex)·마커 부재는 **닫지 않는다**(fail-closed).
 //
 // 【받아들인 잔여】 부트 창 안에서 좌석이 이 어휘를 **본문으로** 출력하면(감사표를 cat 하는 등)
 // 보류로 접힌다 — 코퍼스 `BODY_TEXT_SCREENS` 와 같은 부류이고 귀결이 파괴가 아니라 보류라 받는다.
@@ -504,6 +508,19 @@ pub const MODAL_CHOICE_LABELS: [&str; 5] = [
     "Yes, try it",
     "Not now",
 ];
+
+/// ★(리뷰 R1) 재주입 생애 창의 **꼬리 레이아웃 증거** — 대기 프롬프트 줄 아래에 실려도 무해한 상태줄 어휘.
+///
+/// 실측(2026-09-06 10:18:58 · claude 2.1.261 라이브 좌석 `cys read-screen` · 읽기 전용): 입력 상자는 `❯ ` 줄이
+/// 위아래 괘선(`────…`)으로 둘러싸이고, 그 아래 상태줄 `⏵⏵ bypass permissions on (shift+tab to cycle) ·
+/// ← for agents` 가 온다(사용자 statusLine 한 줄이 그 위에 더 올 수 있다). 2.1.241 검체(`LIVE_TUI_AT_PROMPT`)
+/// 는 `? for shortcuts`. 이 어휘는 **보류 근거가 아니라 창을 닫는 쪽의 양성 증거**이고, 관문 needle 이
+/// 아니다(H-READY-13 ⓑ — 상태줄 문면). 어휘 밖의 꼬리(사용자 statusLine 만 있는 경우 등)는 괘선이
+/// 첫 줄이면 통과하고, 그것도 없으면 **닫지 않는다**(= 종전과 같이 보류 · 조여지는 방향).
+pub const PROMPT_TRAILER_TOKENS: [&str; 3] = ["for shortcuts", "bypass permissions", "shift+tab"];
+/// 괘선 줄로 인정하는 박스 문자(U+2500..=U+259F) **연속 길이** 하한 — cys.rs `TUI_FRAME_RUN_MIN`(맨 셸 술어의
+/// 프레임 자)과 같은 값이어야 한다(파리티 핀 `prompt_trailer_rule_run_matches_tui_frame_run_min` · cys.rs 테스트).
+pub const PROMPT_TRAILER_RULE_MIN_RUN: usize = 8;
 
 /// 모달 서명의 관측 결과. 판정 재료는 "있는가" 하나이고 나머지는 진단·생애 창 재료다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,8 +674,17 @@ fn modal_window_closed(o: &Observed, sig: &ModalSignature) -> bool {
     }
 }
 
-/// 모달 문면이 화면의 **전경이 아님**을 잰다 — [`gate_block_left_behind`] 의 축 ①(마커 뒤 공백만)
-/// ∧ 축 ②(문면 전량이 마커보다 앞). **fail-closed**: 마커 미정의·부재·빈 마커는 창을 닫지 않는다.
+/// 모달 문면이 화면의 **전경이 아님**을 잰다 — 축 ②(문면 전량이 마커보다 앞) ∧ 축 ①'(마커 줄이 빈 대기
+/// 프롬프트 ∧ 꼬리가 입력 상자·상태줄 레이아웃 · [`waiting_prompt_with_harmless_trailer`]).
+/// **fail-closed**: 마커 미정의·부재·빈 마커는 창을 닫지 않는다.
+///
+/// ★(리뷰 R1) 종전 축 ①은 [`gate_block_left_behind`] 와 같은 "마커 뒤 **화면 전체**가 공백" 이었다.
+/// 라이브 claude 2.1.261 그리드는 입력 상자 아래에 괘선·상태줄을 그리므로 그 조건은 라이브 좌석에서
+/// 결코 참이 되지 않았고, 본문에 모달 어휘가 한 번 보이면(감사표 `cat` · 관문 좌석 `read-screen` 출력)
+/// 그 문면이 스크롤로 사라질 때까지 pack-update 재주입이 보류됐다(귀결은 보류라 안전했지만 영구 미주입
+/// 방향의 결함). 줄 단위 축 ①' 는 선택 커서(`❯ 1. Yes…` — 같은 줄에 라벨)와 대기 프롬프트(`❯ ` 뒤 공백만)를
+/// 정확히 가르고, 꼬리에는 **양성 레이아웃 증거**를 요구한다(codex 설계 검토: 빈 `❯` 줄 아래에 모달
+/// 본문이 이어지는 형상 — 부분 렌더·접힌 라벨·빈 텍스트 입력 필드 — 은 애매하므로 닫지 않는다).
 fn modal_left_behind(sig: &ModalSignature, screen: &str, marker: Option<&str>) -> bool {
     let Some(m) = marker else {
         return false;
@@ -671,12 +697,84 @@ fn modal_left_behind(sig: &ModalSignature, screen: &str, marker: Option<&str>) -
     let Some(marker_last) = rfind_chars(&fs, &fm) else {
         return false;
     };
-    // 축 ① — 마커 뒤에 문면이 남아 있으면 그 마커는 **선택 커서**다(대기 프롬프트가 아니다).
-    if marker_last + fm.len() < fs.len() {
+    // 축 ② — 모달 문면 전량이 그 마커보다 앞이다(역사). 마커 뒤에 모달 어휘가 있으면 전경이다.
+    if sig.flat_end > marker_last {
         return false;
     }
-    // 축 ② — 모달 문면 전량이 그 마커보다 앞이다(역사).
-    sig.flat_end <= marker_last
+    // 축 ①' — 마커의 마지막 출현 줄이 빈 대기 프롬프트이고, 그 아래 꼬리가 무해한 레이아웃이다.
+    waiting_prompt_with_harmless_trailer(screen, m)
+}
+
+/// 한 줄이 **괘선**(입력 상자 테두리)인가 — 박스 문자(U+2500..=U+259F)가 [`PROMPT_TRAILER_RULE_MIN_RUN`]
+/// 이상 **연달아** 있고, 그 밖의 비공백 문자가 없다(문장 속 `─` 한두 개는 괘선이 아니다).
+fn is_rule_line(line: &str) -> bool {
+    let (mut run, mut best) = (0usize, 0usize);
+    for c in line.chars() {
+        if ('\u{2500}'..='\u{259F}').contains(&c) {
+            run += 1;
+            best = best.max(run);
+        } else if c.is_whitespace() {
+            run = 0;
+        } else {
+            return false;
+        }
+    }
+    best >= PROMPT_TRAILER_RULE_MIN_RUN
+}
+
+/// 번호 붙은 선택지 행(`  2. Yes…` · `2.` 문말)인가 — 선택기의 항목 행 그 자체(커서 유무 무관).
+/// 규칙 ⓓ와 같은 번호 문법(1~2자리 · `.` · 뒤 공백/문말)이다.
+fn is_numbered_item_row(line: &str) -> bool {
+    let t = line.trim_start();
+    // 앞머리 숫자 길이(바이트 = 문자 · ASCII). 이터레이터 계수 어휘를 쓰지 않는다 — H-PRED-8 은 판정부
+    // 슬라이스에서 그 어휘 자체를 금지한다(마커 개수 비교 회귀 차단 핀 · 주석 포함 문자열 검사).
+    let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    if digits == 0 || digits > 2 {
+        return false;
+    }
+    let rest = &t[digits..];
+    rest.starts_with('.') && rest[1..].chars().next().is_none_or(|c| c == ' ')
+}
+
+/// 마커의 마지막 출현 **줄**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고, 그 아래 꼬리가 **입력
+/// 상자·상태줄 레이아웃**인가(리뷰 R1 · 축 ①').
+///
+/// 꼬리(마커 줄 아래의 비공백 줄들)의 판정:
+///   · 비어 있음 → 참(마커가 화면의 마지막 문면 — 종전 축 ①과 같은 화면).
+///   · 모달 형상 금지 — 꼬리 어느 줄에도 선택 커서 `❯` 나 번호 항목 행이 없어야 한다(부분 렌더 · 접힌 라벨).
+///   · 레이아웃 양성 증거 — 첫 줄이 괘선(입력 상자 아래 테두리 · 2.1.261) **또는** 어느 줄에
+///     [`PROMPT_TRAILER_TOKENS`] 상태줄 어휘가 있다(2.1.241 `? for shortcuts` · 2.1.261 `⏵⏵ bypass
+///     permissions on (shift+tab to cycle)`). 증거가 없으면 **닫지 않는다** — 빈 `❯` 줄 아래의 정체
+///     모를 본문은 모달의 일부일 수 있다(빈 텍스트 입력 필드 · 그리는 중인 프레임).
+/// 마커가 화면에 없거나 줄 단위로 찾을 수 없으면(마커가 줄을 넘어 접힘) 참을 주장하지 않는다.
+fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(li) = lines.iter().rposition(|l| l.contains(marker)) else {
+        return false;
+    };
+    let line = lines[li];
+    let Some(mi) = line.rfind(marker) else {
+        return false;
+    };
+    if !line[mi + marker.len()..].trim().is_empty() {
+        return false; // 같은 줄에 문면 — 선택 커서 행이거나 사람이 치던 초안이다(둘 다 닫지 않는다).
+    }
+    let trailer: Vec<&str> = lines[li + 1..]
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if trailer.is_empty() {
+        return true;
+    }
+    if trailer.iter().any(|l| l.contains('❯') || is_numbered_item_row(l)) {
+        return false;
+    }
+    let has_token = trailer.iter().any(|l| {
+        let norm = first_run_gates::normalize(l).to_lowercase();
+        PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
+    });
+    is_rule_line(trailer[0]) || has_token
 }
 
 /// 판정용 합성 — 롤백(`legacy_v1`)이면 축 자체가 없고, 생애 창이 닫혔으면 거부하지 않는다.
@@ -2019,6 +2117,83 @@ mod tests {
         // 모달 축이 관문 축의 P4-7 수리를 되돌리지 않았다.
         let passed_gate = format!("{}[boot] worker=claude surface=7 rc=0\n작업 로그\n❯ \n", fixtures::FEATURE_FULLSCREEN);
         assert_eq!(reinject(&passed_gate, Some("❯")), Verdict::Ready { evidence: Evidence::MarkerTail });
+    }
+
+    /// ★(리뷰 R1) 재주입 생애 창 — **라이브 2.1.261 그리드**(입력 상자 아래 괘선·상태줄 · 실측 2026-09-06
+    /// 10:18:58)에서 본문에 남은 모달 어휘는 역사다(창 닫힘 → 재주입). 종전 축 ①("마커 뒤 화면 전체 공백")은
+    /// 이 그리드에서 결코 참이 되지 않아 pack-update 재주입이 문면이 스크롤로 사라질 때까지 보류됐다.
+    /// 같은 그리드에서 **전경 모달**은 여전히 보류다 — 줄 단위 축 ①' 이 조여지는 방향으로만 갈린다.
+    #[test]
+    fn reinject_modal_window_closes_behind_a_live_2_1_261_prompt_with_status_line_below() {
+        let gates = first_run_gates::builtin();
+        let reinject = |screen: &str| -> Verdict {
+            let mut o = obs(screen, "", &gates);
+            o.site = Site::Reinject;
+            o.marker = Some("❯");
+            o.tail_is_shell_prompt = None;
+            o.bare_shell = None;
+            o.idle_quiet = Some(true);
+            judge(&o)
+        };
+        let live = fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        // ⓞ 모달 어휘 없는 라이브 그리드 자체 — 재주입 가능(대조군 · 모달 축 무관).
+        assert_eq!(reinject(live), Verdict::Ready { evidence: Evidence::MarkerTail });
+        // ① 본문에 모달 어휘(마스터가 감사 계획서를 `cat` 한 화면) + 그 아래 라이브 프롬프트·상태줄 → 역사 → 재주입.
+        let body_vocab = format!(
+            "❯ cat IMPLEMENTATION-PLAN.md\n  H-1: 화면에 `Enter to confirm` ∧ `Esc to cancel` 이면 GateHeld · \
+             `Yes, I trust this folder`/`Yes, I accept` 선택지 행\n{live}"
+        );
+        assert!(modal_signature(&body_vocab).is_some(), "검체 전제: 본문에 모달 어휘가 있어야 한다");
+        assert_eq!(
+            reinject(&body_vocab),
+            Verdict::Ready { evidence: Evidence::MarkerTail },
+            "라이브 그리드 아래의 본문 어휘가 창을 영구 보류로 접었다(종전 축 ① 결함 재발)"
+        );
+        // ①′ 2.1.241 레이아웃(`? for shortcuts` 가 프롬프트 **위**) 뒤에 마커가 마지막인 화면도 종전대로 닫힌다.
+        let old_layout = format!("{}\n{}", fixtures::LIVE_PERMISSION_PROMPT, fixtures::LIVE_TUI_AT_PROMPT);
+        assert_eq!(reinject(&old_layout), Verdict::Ready { evidence: Evidence::MarkerTail });
+        // ② 같은 그리드에서 **전경** 권한 프롬프트(커서 행에 라벨 · 푸터가 마커 뒤) → 보류.
+        let foreground = format!("{}\n{}", live.trim_end_matches('\n'), fixtures::LIVE_PERMISSION_PROMPT);
+        assert!(held_as(&reinject(&foreground), MODAL_UNKNOWN_ID), "전경 모달이 통과됐다: {:?}", reinject(&foreground));
+        // ③ 사람이 치던 초안(`❯ 작업 이어서`) — 마커 줄에 문면 → 닫지 않는다(보수).
+        let draft = body_vocab.replace("❯ \n", "❯ 작업 이어서\n");
+        assert!(held_as(&reinject(&draft), MODAL_UNKNOWN_ID));
+        // ④ 상태줄 **아래**에 모달 푸터가 다시 그려진 화면 — 축 ②(마커 뒤 어휘) → 보류.
+        let footer_below = format!("{body_vocab}Enter to confirm · Esc to cancel\n");
+        assert!(held_as(&reinject(&footer_below), MODAL_UNKNOWN_ID));
+        // ⑤ codex 설계 검토 반례 — 어휘 위 · 빈 `❯` 줄 · 그 아래 **정체 모를 모달 본문**(레이아웃 증거 0) → 보류.
+        let ambiguous = "Enter to confirm · Esc to cancel\n❯ \n  additional modal content\n";
+        assert!(held_as(&reinject(ambiguous), MODAL_UNKNOWN_ID), "빈 마커 줄만으로 창이 닫혔다(애매한 프레임 통과)");
+        // ⑥ 부분 렌더 — 빈 커서 줄 아래에 번호 항목 행이 그려지는 중 → 보류(모달 형상).
+        let partial = "Do you want to proceed?\n❯ \n  2. Yes, and don't ask again\nEnter to confirm · Esc to cancel\n";
+        assert!(held_as(&reinject(partial), MODAL_UNKNOWN_ID));
+        let partial2 = "Enter to confirm · Esc to cancel\n❯ \n  2. Yes, and don't ask again\n────────────────\n";
+        assert!(held_as(&reinject(partial2), MODAL_UNKNOWN_ID), "번호 항목 행이 괘선 증거를 이겼어야 한다");
+        // ⑦ 접힌 라벨 — 커서 줄이 비고 라벨이 다음 줄로 접힌 형상 + 상태줄 어휘 없음 → 보류.
+        let wrapped = "Enter to confirm · Esc to cancel\n❯\n  Yes, I trust this\n  folder\n";
+        assert!(held_as(&reinject(wrapped), MODAL_UNKNOWN_ID));
+        // ⑧ 확인 에코만 남은 통과 후 화면 + 2.1.261 상태줄 — 모달이 아니다(2026-07-29 역방향) → 재주입.
+        let echo_only = format!("  Yes, I trust this folder ✔\n{live}");
+        assert!(modal_signature(&echo_only).is_none());
+        assert_eq!(reinject(&echo_only), Verdict::Ready { evidence: Evidence::MarkerTail });
+        // ⑨ 부트 창은 상수 — 같은 '본문 어휘' 화면도 부트에서는 보류(관문 축과 같은 부호 · 받아들인 잔여).
+        assert!(held_as(&judge(&boot_all_open(&body_vocab, &gates)), MODAL_UNKNOWN_ID));
+        // ⑩ 롤백 — `legacy_v1` 이면 모달 축 자체가 없다(전경 모달도 종전대로 마커 꼬리로 Ready).
+        let mut rolled = obs(&foreground, "", &gates);
+        rolled.site = Site::Reinject;
+        rolled.marker = Some("❯");
+        rolled.legacy_v1 = true;
+        assert_eq!(judge(&rolled), Verdict::Ready { evidence: Evidence::MarkerTail });
+        // 보조 술어 — 괘선·번호 행 판정의 경계.
+        assert!(is_rule_line("────────"), "8연속 괘선");
+        assert!(!is_rule_line("───────"), "7연속은 괘선이 아니다(TUI_FRAME_RUN_MIN 파리티)");
+        assert!(!is_rule_line("── 제목 ──────────"), "문자가 섞인 줄은 괘선이 아니다");
+        assert!(is_rule_line("  ────────────  "));
+        assert!(is_numbered_item_row("  2. Yes, and don't ask again"));
+        assert!(is_numbered_item_row("12."));
+        assert!(!is_numbered_item_row("  2.5 hours"));
+        assert!(!is_numbered_item_row("  123. 너무 큰 번호"));
+        assert!(!is_numbered_item_row("  Opus 5 · CTX 35% · 5h 20% · 7d 33%"));
     }
 
     /// 어휘 파리티 — 모달 어휘는 코퍼스 `widget`·`confirm_echo` 집합의 **부분집합**이다(두 벌 드리프트 차단).

@@ -145,21 +145,147 @@ def _claude_project_component(cwd):
     return "".join(c if c.isascii() and (c.isalnum() or c == "-") else "-" for c in (cwd or ""))
 
 
-# ★F-1(0.14.31): CLI 와 같은 결정론 입력으로 fresh 예상만 판정(관측 아님·claude 한정).
+# ★F-1(0.14.31): Rust `cys::resolve_claude_config_dir` 와 같은 기본값 — `CYS_ACCOUNT_DIR`(비어 있지 않을 때)
+#   아니면 `~/.cys/claude`. `cys restore` 는 phoenix 의 자식이라 같은 env 를 본다(결정론 입력 동일).
+def _default_claude_config_dir():
+    env = os.environ.get("CYS_ACCOUNT_DIR") or ""
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".cys", "claude")
+
+
+# ★F-1(0.14.31): CLI 와 같은 결정론 입력으로 fresh **예상**만 판정(관측 아님·claude 한정).
+#   리뷰 R1(codex major): 결측 필드의 기본값 규칙을 CLI(`run_restore` → `resolve_resume_suffix`)와 **완전히**
+#   같게 둔다 — agent 부재는 CLI 가 스폰 자체를 건너뛰고(`agent 미상 — 건너뜀`), config dir 부재는
+#   `resolve_claude_config_dir()` 로, cwd 부재는 빈 문자열로 접는다. 경로 문자열도 Rust 의 format 그대로
+#   (`{cfg}/projects/{comp}/{sid}.jsonl`) 만든다 — 두 벌이 갈리면 성공한 fresh 각성이 'fork 의심' 으로 오보된다.
 def fresh_expected(entry):
-    agent = entry.get("agent") or "claude"
+    agent = entry.get("agent")
     if agent != "claude":
-        return False, ""
-    sid = (entry.get("session_id") or "").strip()
-    if not sid:
-        return True, "no_session"
+        return False, ""          # 타 어댑터(F-1 범위 밖) · agent 부재(CLI 가 스폰하지 않는다)
+    sid = entry.get("session_id")
+    if not isinstance(sid, str) or not sid.strip():
+        return True, "no_session"     # Rust: `.filter(|s| !s.trim().is_empty())` — 공백만이면 부재
+    # Rust 는 부재 검사에만 trim 을 쓰고 경로에는 **원문 id** 를 쓴다(`{cfg}/projects/{comp}/{id}.jsonl`).
     cfg = entry.get("claude_config_dir")
-    cwd = entry.get("cwd")
-    if not cfg or not cwd:
-        return False, ""
-    path = os.path.join(cfg, "projects", _claude_project_component(cwd), sid + ".jsonl")
-    missing = not os.path.isfile(path)
+    if not isinstance(cfg, str):
+        cfg = _default_claude_config_dir()   # None/부재 → 기본값 · 빈 문자열은 Rust `Some("")` 처럼 빈 접두 그대로
+    comp = _claude_project_component(entry.get("cwd") or "")
+    path = "%s/projects/%s/%s.jsonl" % (cfg, comp, sid)
+    missing = not os.path.exists(path)   # Rust `Path::exists` 와 동일(isfile 아님)
     return missing, "no_session_file" if missing else ""
+
+
+# ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): **예상(expectation)과 결과(outcome)를 가른다.**
+#   종전 HEAD(5d6efa4 · 미배포)는 fresh 예상을 `fresh_fallback=True`(독약 강등의 결과 플래그)에 실어, 관문에
+#   갇혀 디렉티브를 받지 못한 좌석도 surface 만 살아 있으면 verify 가 'fresh'(성공) 로 접었다 — 저널이 각성을
+#   거짓 보고하고 차단기를 리셋했다. 이제 예상은 `fresh_expected` 로만 기록하고, 'fresh' 결과는 아래 증거가
+#   **전부** 있을 때만 준다(없으면 unverified · verify done=False · 최종 enum UNVERIFIED → exit 3).
+F1_FRESH_REASONS = ("no_session", "no_session_file")
+#   이 기동에 귀속되는 주입 증거로 인정하는 reinject 종류. ack=각성 핑 ACK(가장 강함) · injected=ACK 없어 전문을
+#   **직접** 주입(관문 가드 `gate_guard_check` 를 통과했다 = 관문 없는 프롬프트 대기 좌석). queued(큐 전환=배달
+#   예약)·skip(빈 셸)·fail(관문 Hold 포함)·unknown 은 증거가 아니다. `awakened_at` 래치는 topology 에서 하이드
+#   레이션될 수 있어(역사 래치) 이 기동의 증거로 쓰지 않는다(codex 지적).
+F1_ACCEPTED_REINJECT_KINDS = ("ack", "injected")
+
+
+def classify_reinject_result(rc, stdout, stderr):
+    """`cys reinject --check` 결과 → 구조화 증거 종류(리뷰 R1). CLI 의 안정 토큰만 본다:
+    'ACK'(디렉티브 생존 확인 (ACK 수신)) · 'reinjected'(reinjected N bytes) · 'skip'(빈 셸 check reinject skip) ·
+    stderr '--queued'(타이핑 가드 큐 전환). rc≠0(관문 Hold 등)=fail · rc 0 인데 판독 불가=unknown(증거 아님)."""
+    out = stdout or ""
+    err = stderr or ""
+    if rc != 0:
+        return "fail"
+    if "ACK" in out:
+        return "ack"
+    if "reinjected" in out:
+        return "queued" if "--queued" in err else "injected"
+    if "skip" in out:
+        return "skip"
+    return "unknown"
+
+
+_REINJECT_KIND_RE = re.compile(r"\bkind=([a-z]+)")
+
+
+def _reinject_kind(evidence):
+    """stage_reinject 증거 문자열(`… kind=<k> …`)에서 종류를 꺼낸다. 표기 부재(구판 저널)=unknown."""
+    m = _REINJECT_KIND_RE.search(evidence or "")
+    return m.group(1) if m else "unknown"
+
+
+def _surface_status_row(socket, surface):
+    """`cys status --json`.surfaces 의 **원본 행**(surface_ref 대조). `_live_surfaces_raw` 는 판정 필드
+    (gate_pending·awakened_at·directive_verified)를 버리므로 F-1 verify 는 원본 행을 읽는다. 실패=None."""
+    st = _status_json(socket)
+    if st is None:
+        return None
+    for s in st.get("surfaces", []):
+        if s.get("surface_ref") == surface or ("surface:%s" % s.get("surface_id")) == surface:
+            return s
+    return None
+
+
+def f1_fresh_verify(rr, row):
+    """F-1 fresh **예상** 역할의 verify 판정(순수 함수) → (outcome, missing_reason_or_None, evidence).
+
+    'fresh' 는 (a) status 행이 있고 exited=false ∧ agent_alive=true ∧ **gate_pending 키가 있고 null**(관문 통과 —
+    키 부재(구 데몬)·객체(보류)·stale 표식 모두 미통과) ∧ (b) 이 기동의 주입 증거 reinject∈{ack, injected} 일 때만.
+    하나라도 빠지면 'unverified' 와 빠진 항목(사람이 읽는 사유). observed_sid 는 요구하지 않는다(usage 수집기
+    재핀 지연은 각성과 독립 — codex 지적) — 호출부가 사유에 병기만 한다."""
+    stages = (rr.get("stages") or {}) if isinstance(rr, dict) else {}
+    rj = stages.get("reinject") or {}
+    if not rj:
+        kind = "missing"
+    elif rj.get("done"):
+        kind = _reinject_kind(rj.get("evidence"))
+    else:
+        kind = "fail"
+    ev = {"reinject_kind": kind, "g2_ack": bool((stages.get("g2_ack") or {}).get("done")),
+          "gate_cleared": None, "agent_alive": None, "exited": None}
+    missing = []
+    if not isinstance(row, dict):
+        missing.append("status 행 부재(surface 미발견 또는 status --json 실패)")
+    else:
+        ev["exited"] = row.get("exited")
+        ev["agent_alive"] = row.get("agent_alive")
+        if row.get("exited") is not False:
+            missing.append("exited≠false")
+        if row.get("agent_alive") is not True:
+            missing.append("agent_alive≠true")
+        if "gate_pending" not in row:
+            missing.append("gate_pending 키 부재(구 데몬 · 관문 통과 판정 불가)")
+        elif row.get("gate_pending") is not None:
+            ev["gate_cleared"] = False
+            missing.append("gate_pending=%s(관문 보류 · 주입 0)"
+                           % json.dumps(row.get("gate_pending"), ensure_ascii=False)[:80])
+        else:
+            ev["gate_cleared"] = True
+    if kind not in F1_ACCEPTED_REINJECT_KINDS:
+        missing.append("이 기동의 주입 증거 미충족(reinject=%s · 인정=%s)" % (kind, "|".join(F1_ACCEPTED_REINJECT_KINDS)))
+    ev["missing"] = missing
+    if missing:
+        return "unverified", " · ".join(missing), ev
+    return "fresh", None, ev
+
+
+def migrate_f1_journal(j):
+    """미배포 HEAD(5d6efa4) 저널 형식 이관 — F-1 예상을 `fresh_fallback`(결과 플래그)에 실었던 레코드를
+    `fresh_expected` 로 옮기고, 증거 없이 done 된 verify 를 해제한다(재검증 대상). 독약(poison) 레코드는 무접촉.
+    반환: 이관된 역할 목록(호출부가 jevent 로 남긴다)."""
+    moved = []
+    for role, rr in (j.get("roles") or {}).items():
+        if not isinstance(rr, dict):
+            continue
+        if rr.get("fresh_reason") in F1_FRESH_REASONS and rr.get("fresh_fallback"):
+            rr.pop("fresh_fallback", None)
+            rr["fresh_expected"] = True
+            v = (rr.get("stages") or {}).get("verify")
+            if isinstance(v, dict) and v.get("done") and rr.get("fresh_evidence") is None:
+                v["done"] = False
+            moved.append(role)
+    return moved
 
 
 def _which(name):
@@ -1546,10 +1672,12 @@ def stage_reinject(socket, role, surface, stub):
     """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입).
     ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(zsh 오해석 에러 차단)."""
     if _surface_agent_present(socket, surface) is False:
-        return True, "reinject skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
+        return True, "reinject skip kind=skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
     r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "6",
             socket=socket, timeout=12)
-    return r.returncode == 0, "reinject rc=%s %s" % (r.returncode, (r.stdout or r.stderr or "").strip()[:120])
+    # ★F-1(리뷰 R1): 구조화 증거 종류를 증거 문자열에 박는다(`kind=`) — F-1 verify 가 ack|injected 만 인정한다.
+    kind = classify_reinject_result(r.returncode, r.stdout, getattr(r, "stderr", ""))
+    return r.returncode == 0, "reinject rc=%s kind=%s %s" % (r.returncode, kind, (r.stdout or r.stderr or "").strip()[:120])
 
 
 def stage_g2_ack(socket, role, surface, stub):
@@ -1793,6 +1921,11 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                    "alert": "정지 후 사람 승인 필요 — 자동 롤백/재부활을 실행하지 않는다."}
             print(json.dumps(out, ensure_ascii=False, indent=2))
             return out
+    # ★F-1(리뷰 R1): 구판(미배포 HEAD) 저널의 fresh 예상 레코드를 예상 필드로 이관하고 증거 없는 verify done 을
+    #   해제한다 — 이관하지 않으면 종전의 거짓 성공(fresh_fallback+no_session*)이 dedup 을 통해 살아남는다.
+    for _r in migrate_f1_journal(j):
+        jevent(j, _r, "verify", "revalidate",
+               "★F-1 리뷰 R1: 구판 저널의 fresh 예상(fresh_fallback+no_session*)을 fresh_expected 로 이관 — 증거 없는 verify done 해제(재검증)")
     # dedup(P4): 이 티켓 저널에서 이미 verify까지 done 인 역할은 skip
     pending = [r for r in target_roles if not stage_done(j, r, "verify")]
     log("티켓=%s · 대상역할=%s · 이번 진행=%s (완료 skip=%s)" % (
@@ -1848,14 +1981,15 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     role_surface[role] = ref
                     j["roles"].setdefault(role, {"stages": {}})["surface"] = ref
                     j["roles"][role]["expected_sid"] = entries.get(role, {}).get("session_id", "")
-                    # ★F-1(0.14.31): cys restore 입력상 fresh 예상 — 독약과 같은 마커·별도 사유로 정직 기록.
+                    # ★F-1(0.14.31 · 리뷰 R1): cys restore 입력상 fresh **예상** — 결과 플래그(fresh_fallback)가 아니라
+                    #   `fresh_expected` 에만 기록한다. 성공(outcome 'fresh')은 verify 가 각성 증거로 확정한다.
                     fe, why = fresh_expected(entries.get(role, {}))
                     if fe:
-                        j["roles"][role]["fresh_fallback"] = True
+                        j["roles"][role]["fresh_expected"] = True
                         j["roles"][role]["fresh_reason"] = why
-                        jevent(j, role, "spawn", "fresh_fallback",
-                               "★fresh 각성(F-1·%s): 이어받을 세션 없음 → 무 resume 재기동·전문 디렉티브+[RESTORE](cys restore)" % why)
-                        log("★F-1 fresh 예상(expected): role=%s reason=%s → %s (cys restore 결정론 입력 기준)" % (role, why, ref))
+                        jevent(j, role, "spawn", "fresh_expected",
+                               "★fresh 각성 예상(F-1·%s): 이어받을 세션 없음 → cys restore 는 무 resume·전문 디렉티브+[RESTORE] 로 기동 — 각성 확정은 verify 의 증거(관문 통과 ∧ 이 기동의 주입)로만" % why)
+                        log("★F-1 fresh 예상(expected · 결과 아님): role=%s reason=%s → %s" % (role, why, ref))
                     mark_stage(j, role, "spawn", True, "cys restore → %s (attempt %d)" % (ref, attempt))
                 else:
                     still.append(role)
@@ -1944,19 +2078,31 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         exp = j["roles"][role].get("expected_sid", "")
         obs = j["roles"][role].get("observed_sid", None)
         fresh_fb = j["roles"][role].get("fresh_fallback", False)
+        fresh_exp = j["roles"][role].get("fresh_expected", False)
         # ★Phase 11: fresh 강등(독약 세션)은 fork(오복원)가 아니라 '의도적 세션 폐기 후 재기동'이다.
         # 세션 보존 실패는 정직히 밝히되(verified 아님) 실패(unverified/failed)로 오분류하지 않는다 —
         # 별도 outcome 'fresh' 로 라벨링(원 세션 독약 → 무 resume 부활·디렉티브/원장 재주입).
         if fresh_fb:
             outcome = "fresh"
-            # ★F-1(0.14.31): 보존 대상 부재는 독약 세션 보존 실패와 다르다(옛 저널은 poison).
-            why = j["roles"][role].get("fresh_reason", "poison")
-            if why in ("no_session", "no_session_file"):
-                reason = ("★fresh 각성(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 %r · 전문 디렉티브+[RESTORE] 주입). "
-                          "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)" % (why, obs))
+            reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
+                      "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
+        elif fresh_exp:
+            # ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): 예상은 결과가 아니다 — 'fresh' 는 **이 기동의 각성 증거**
+            #   (관문 통과 gate_pending=null ∧ agent_alive ∧ reinject ack|injected)가 전부 있을 때만. 관문에 갇힌
+            #   좌석(주입 0)·주입 실패·큐 전환·구 데몬(gate_pending 키 부재)은 unverified(verify done=False)다.
+            why = j["roles"][role].get("fresh_reason", "no_session")
+            row = None if stub else _surface_status_row(socket, surface)
+            outcome, missing, fev = f1_fresh_verify(j["roles"][role], row)
+            j["roles"][role]["fresh_evidence"] = fev
+            if outcome == "fresh":
+                reason = ("★fresh 각성 확정(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 · 전문 디렉티브+[RESTORE]). "
+                          "증거: gate_pending=null ∧ agent_alive ∧ 이 기동의 주입 %s%s · 관측 세션=%r. "
+                          "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)"
+                          % (why, fev["reinject_kind"], "+g2 ack" if fev["g2_ack"] else "", obs))
             else:
-                reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
-                          "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
+                reason = ("★F-1 fresh 예상(%s)이나 각성 증거 미충족(transient · 정직 unverified): %s · 관측 세션=%r. "
+                          "자기채점 금지 — `cys status --json`(gate_pending·agent_alive)·`cys read-screen` 으로 확인"
+                          % (why, missing, obs))
         else:
             verified = bool(exp) and bool(obs) and (exp == obs)
             outcome = "verified" if verified else "unverified"
@@ -2054,8 +2200,15 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     "독약 세션이 무한 재시도로 roster 를 막지 않게 유한 강등했다(§15·DRILL_LIVE_4)." % poison_roles)
     # ★F-1(0.14.31): 세션 부재로 예상된 fresh 각성은 세션 보존 실패가 아니다.
     if f1_roles:
-        honesty += (" ★F-1 fresh 각성 역할=%s: 세션이 없어 fresh 로 각성했다(전문 디렉티브+[RESTORE]) "
-                    "— 세션 보존 실패가 아니라 보존 대상 없음." % f1_roles)
+        honesty += (" ★F-1 fresh 각성 역할=%s: 세션이 없어 fresh 로 각성했다(전문 디렉티브+[RESTORE] · 관문 통과·"
+                    "이 기동의 주입 증거 확인) — 세션 보존 실패가 아니라 보존 대상 없음." % f1_roles)
+    # ★F-1(리뷰 R1): 예상됐으나 증거로 확정하지 못한 역할은 성공으로 세지 않는다(정직 · UNVERIFIED 방향).
+    fresh_expected_roles = [r for r in target_roles if j["roles"].get(r, {}).get("fresh_expected")]
+    fresh_unverified_roles = [r for r in fresh_expected_roles if outcomes.get(r) != "fresh"]
+    if fresh_unverified_roles:
+        honesty += (" ★F-1 fresh 예상이나 **미확정** 역할=%s: 관문 보류·주입 증거 부재 등으로 각성을 확정하지 "
+                    "못했다(unverified · 침묵 성공 금지). `cys status --json` 의 gate_pending·agent_alive 와 "
+                    "`cys read-screen` 으로 확인하라." % fresh_unverified_roles)
 
     result = {
         "phoenix_restore": final,
@@ -2065,6 +2218,9 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시
         # ★F-1(0.14.31): fresh 사유를 역할별로 공개(기존 enum 유지).
         "fresh_reasons": fresh_reasons,
+        # ★F-1(리뷰 R1): 예상(입력)과 확정(증거)을 따로 공개 — 미확정은 per_role_outcome 에서 unverified 다.
+        "fresh_expected_roles": fresh_expected_roles,
+        "fresh_unverified_roles": fresh_unverified_roles,
         "ready_roles": ready_roles,
         "ticket": ticket,
         "boot_epoch": _ACTIVE_EPOCH,      # ★Phase6: 이 부활이 판정 기준으로 쓴 세대

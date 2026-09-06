@@ -501,6 +501,14 @@ pub struct Surface {
     ingest: Mutex<IngestState>,
     pub out_tx: broadcast::Sender<Vec<u8>>,
     pub last_output: Mutex<Instant>,
+    /// ★(0.14.31 · WP-1 H-1 · 리뷰 R1) **출력 세대** — reader 가 청크 하나를 발행하는 동안 홀수, 발행이 끝나면
+    /// 짝수(seqlock 부호). `surface.read_text` 의 `quiet_secs` 는 화면/스크롤백 스냅샷 앞뒤로 이 값을 읽어
+    /// 세대가 홀수였거나 달라졌으면 관측을 **버린다**(`quiet_secs = 0.0` — 출력이 흐르는 중). 스탬프
+    /// (`last_output`)·파서 반영·스크롤백 ingest 가 모두 홀수 창 안에서 일어나므로 "화면 X ∧ q초 정적" 이
+    /// 한 관측이 된다 — 종전에는 스탬프를 파서 반영 **뒤**에 찍고 핸들러가 스탬프를 먼저 읽어, 그 사이에
+    /// 도착한 청크가 '새 화면 + 오래된 quiet' 로 Boot Valve 를 열 수 있었다(codex BLOCK). 쓰기 주체는
+    /// surface 당 reader 스레드 하나다(홀/짝 불변의 전제).
+    pub output_gen: AtomicU64,
     pub idle_notified: AtomicBool,
     /// recall 영속용 직전 라인 (연속 중복 스킵 — TUI 리드로우 노이즈 억제)
     last_recall_line: Mutex<String>,
@@ -3178,6 +3186,7 @@ impl Daemon {
             }),
             out_tx,
             last_output: Mutex::new(Instant::now()),
+            output_gen: AtomicU64::new(0),
             idle_notified: AtomicBool::new(false),
             last_recall_line: Mutex::new(String::new()),
             pending_queue: Mutex::new(std::collections::VecDeque::new()),
@@ -3325,6 +3334,14 @@ impl Daemon {
                             eprintln!("[debug] surface {} read {n} bytes", surf.id);
                         }
                         let chunk = &buf[..n];
+                        // ★(0.14.31 · H-1 · 리뷰 R1) 출력 세대 **홀수** = 발행 시작. 스탬프(`last_output`)는
+                        //   파서 반영·스크롤백 ingest 보다 **앞**에 찍는다 — `surface.read_text` 는 스냅샷 뒤에
+                        //   스탬프를 읽고 세대가 이 창과 겹치면 관측을 버리므로, 스냅샷에 보이는 바이트는
+                        //   전부 그 스탬프 이전에 도착한 것이다(화면·quiet 한 관측). 발행 끝(짝수)은 아래
+                        //   `ingest_output` 뒤에서 올린다. 사람 입력·주입 자체는 여기 오지 않지만 그 **PTY
+                        //   에코**는 출력이라 스탬프를 움직인다(보수 방향 — 주입 직후 밸브가 더 기다린다).
+                        surf.output_gen.fetch_add(1, Ordering::AcqRel);
+                        *surf.last_output.lock().unwrap() = Instant::now();
                         // DSR cursor-position query: a real terminal must answer, or
                         // ConPTY(Windows)가 응답을 기다리며 입출력 펌프를 멈춘다.
                         // ★G5-④: 경계 분할 carry + 질의 '수' 계상은 순수 함수 단일 정의처
@@ -3402,7 +3419,7 @@ impl Daemon {
                             }
                         }
                         dsr_tail = new_tail;
-                        *surf.last_output.lock().unwrap() = Instant::now();
+                        // (스탬프는 청크 처리 **머리**로 이사했다 — 위 output_gen 주석 · 리뷰 R1.)
                         surf.idle_notified.store(false, Ordering::Relaxed);
                         // (B2-c) OSC 9/99/777 알림 스캔 — strip 전 raw chunk 사용. parser 락
                         // 임계영역(위 :876-902) 밖이라 attach 중복배달 불변식과 직교한다.
@@ -3438,6 +3455,8 @@ impl Daemon {
                             }
                         }
                         daemon.ingest_output(&surf, chunk);
+                        // ★(리뷰 R1) 출력 세대 **짝수** = 이 청크의 발행(파서·스크롤백) 끝.
+                        surf.output_gen.fetch_add(1, Ordering::AcqRel);
                     }
                 }
             }

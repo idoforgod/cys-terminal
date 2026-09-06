@@ -1815,12 +1815,38 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
 /// 처방에 면책 창의 기본 포커스를 **반드시** 적는다: 그 한 줄이 없으면 사람이 pane 을 보고
 /// Return 을 눌러 스스로 노드를 종료시킨다(rc 1) — 처방이 곧 킬 스텝이 된다(실측).
 fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) -> String {
+    // ★(0.14.31 · H-1 리뷰 R1) 코퍼스 밖 모달(`unknown-modal`)은 `human_only=false` 로 나오지만 "한 번
+    //   눌러 주면 진행" 이 아니고, 코퍼스 관문용 처방(아래 1회 · 숫자 `2`)도 **적용되지 않는다** — 잘린
+    //   면책 창에서 커서가 `No, exit` 위일 수 있어 그 문안이 곧 킬 스텝이 된다. 부트 처방
+    //   (`print_gate_pending_prescription`)과 같은 힌트로 가르고, 사람이 그 위젯을 직접 읽게 한다.
+    let unknown_modal = hit.id == cys::readiness::MODAL_UNKNOWN_ID;
+    let nature = if unknown_modal {
+        "★관문 코퍼스에 **없는 선택 위젯**(잘린 관문 · 벤더 신관문 · 권한 프롬프트)이다 — 어느 키가 \
+         무엇을 누르는지 기계가 모른다"
+    } else if hit.human_only {
+        "이 관문은 **사람이 1회** 해야 통과한다(로그인·OAuth는 기계가 대신할 수 없다)"
+    } else {
+        "이 관문은 사람이 한 번 눌러 주면 그대로 진행된다"
+    };
+    let action = if unknown_modal {
+        format!(
+            "사람 조치: `cys read-screen --surface {}` 로 화면을 읽고 **선택지를 직접 골라라** — \
+             방향키·숫자 처방은 코퍼스 관문에만 해당하니 이 위젯에는 쓰지 마라. 커서가 `No, exit` 위일 \
+             수 있으니 Return 전에 반드시 확인하라(그 Return 은 통과가 아니라 종료다).",
+            surface_ref(sid)
+        )
+    } else {
+        format!(
+            "사람 조치: `cys read-screen --surface {}` 로 확인 → ★면책(Bypass) 창의 기본 \
+             포커스는 `No, exit` 다(그대로 Return 하면 노드가 종료된다 — 아래 1회 뒤 Return 또는 숫자 `2`).",
+            surface_ref(sid)
+        )
+    };
     format!(
         "{} 관문 보류(gate={}) — {stage} 를 **보내지 않았다**(좌석 보존 · close 0 · kill 0). \
          화면에 '{}' 가 떠 있어 지금 붙여넣기·Return 을 보내면 그 키가 관문 위젯의 버튼을 누른다.\n\
-         \x20 · {}\n\
-         \x20 · 사람 조치: `cys read-screen --surface {}` 로 확인 → ★면책(Bypass) 창의 기본 \
-         포커스는 `No, exit` 다(그대로 Return 하면 노드가 종료된다 — 아래 1회 뒤 Return 또는 숫자 `2`).\n\
+         \x20 · {nature}\n\
+         \x20 · {action}\n\
          \x20 · 통과 뒤 같은 좌석을 그대로 쓴다 — 새 pane 을 만들지 마라.\n\
          \x20 · ★종전 동작으로 되돌리려면 **이 스위치 하나**: {}=0 \
          (이 캠페인이 추가한 판정 축 전부 복귀 · 축 하나만 끄는 {}=0 은 readiness 축이 남아 \
@@ -1828,12 +1854,6 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
         cys::inject_guard::HOLD_TOKEN,
         hit.id,
         hit.title,
-        if hit.human_only {
-            "이 관문은 **사람이 1회** 해야 통과한다(로그인·OAuth는 기계가 대신할 수 없다)"
-        } else {
-            "이 관문은 사람이 한 번 눌러 주면 그대로 진행된다"
-        },
-        surface_ref(sid),
         cys::ENV_BOOT_GATES,
         cys::inject_guard::ENV_GUARD_OFF,
     )
@@ -9779,8 +9799,14 @@ fn resolve_resume_suffix(
     cwd: Option<&str>,
     fallback: &str,
 ) -> Option<String> {
-    // 빈 문자열 id 는 부재와 같다(topology 구판의 `"session_id": ""`).
-    let session_id = session_id.filter(|s| !s.trim().is_empty());
+    // 빈 문자열 id 는 부재와 같다(topology 구판의 `"session_id": ""`) — **claude 한정**이다(리뷰 R1 · codex
+    //   major): 타 어댑터의 빈 id 는 종전 그대로 치환된다(codex `resume {session_id}` + `""` → `resume ` —
+    //   F-1 의 범위는 claude 어댑터만이고, 그 밖의 동작 변경은 이 WP 의 계약 밖이다).
+    let session_id = if agent == "claude" {
+        session_id.filter(|s| !s.trim().is_empty())
+    } else {
+        session_id
+    };
     // ★(F-1) claude 는 세션이 없으면 **어떤 resume 인자도** 붙이지 않는다 — placeholder 없는 사용자
     //   어댑터(`resume_arg: "--continue"`)도 같은 규칙이다(그 인자가 정확히 오염 경로다). 이 검사가
     //   placeholder 조기 반환보다 **앞**에 있어야 우회가 없다(codex 설계 검토 Q4).
@@ -10155,7 +10181,8 @@ fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str
     //   사람이 고르라" 이고, 커서가 종료 선택지 위일 수 있음을 먼저 경고한다(Return 이 곧 종료).
     let modal_hint = if gate == cys::readiness::MODAL_UNKNOWN_ID {
         "\n ★이 보류는 관문 코퍼스에 **없는 선택 위젯**(잘린 관문 · 벤더 신관문 · 권한 프롬프트)이다 — \
-         화면의 선택지를 사람이 직접 고르라. 커서가 `No, exit` 위일 수 있으니 Return 전에 반드시 확인하라."
+         화면의 선택지를 사람이 직접 고르라. 아래 2)의 방향키·숫자 처방은 **코퍼스 관문에만** 해당하니 이 \
+         위젯에는 쓰지 마라. 커서가 `No, exit` 위일 수 있으니 Return 전에 반드시 확인하라."
     } else {
         ""
     };
@@ -22349,6 +22376,38 @@ mod tests {
         assert!(msg.contains("No, exit"), "면책 창 기본 포커스 경고가 사라졌다");
     }
 
+    /// ★(리뷰 R1) 코퍼스 밖 모달(`unknown-modal`) 보류의 처방은 "한 번 눌러 주면 진행" 도, 코퍼스 관문용
+    /// 방향키·숫자 처방도 아니다 — 잘린 면책 창(커서=`No, exit`)에서 그 문안은 곧 킬 스텝이다. 두 처방 지점
+    /// (주입 가드 Hold · 부트 GatePending)이 같은 힌트를 낸다.
+    #[test]
+    fn unknown_modal_hold_prescription_tells_the_human_to_read_the_widget() {
+        let hit = cys::inject_guard::GateHit {
+            id: cys::readiness::MODAL_UNKNOWN_ID.to_string(),
+            title: "미등재 모달(cursor-on-exit+confirm-cancel-footer)".to_string(),
+            human_only: false,
+        };
+        let msg = gate_hold_message(7, &hit, "제출 Return");
+        assert!(msg.starts_with(cys::inject_guard::HOLD_TOKEN));
+        assert!(msg.contains("없는 선택 위젯"), "unknown-modal 힌트 부재: {msg}");
+        assert!(msg.contains("선택지를 직접 골라라"), "사람이 위젯을 직접 읽으라는 지시 부재");
+        assert!(!msg.contains("한 번 눌러 주면"), "코퍼스 밖 모달에 '한 번 눌러 주면 진행' 이 나갔다(킬 스텝 유도)");
+        assert!(!msg.contains("숫자 `2`)"), "코퍼스 관문용 숫자 처방이 미지 위젯에 그대로 나갔다");
+        assert!(msg.contains("No, exit") && msg.contains(&format!("{}=0", cys::ENV_BOOT_GATES)));
+        // 부트 처방도 같은 힌트를 낸다(소스 핀 — stderr 함수라 문자열로 못 박는다).
+        let src = include_str!("cys.rs");
+        let p = src.find("fn print_gate_pending_prescription(").expect("부트 처방");
+        let end = src[p..].find("fn boot_agent_on_surface(").expect("다음 함수 경계");
+        let pb = &src[p..p + end];
+        assert!(pb.contains("cys::readiness::MODAL_UNKNOWN_ID") && pb.contains("코퍼스 관문에만"));
+    }
+
+    /// ★(리뷰 R1) 재주입 생애 창의 괘선 자(`readiness::PROMPT_TRAILER_RULE_MIN_RUN`)는 맨 셸 술어의 프레임 자
+    /// (`TUI_FRAME_RUN_MIN`)와 같은 값이다 — 한쪽만 바뀌면 "괘선" 의 뜻이 두 판정기에서 갈린다.
+    #[test]
+    fn prompt_trailer_rule_run_matches_tui_frame_run_min() {
+        assert_eq!(TUI_FRAME_RUN_MIN, cys::readiness::PROMPT_TRAILER_RULE_MIN_RUN);
+    }
+
     /// ★(U-14) 주입·제출 가드의 **배선**을 소스로 못 박는다.
     ///
     /// 판정부(`cys::inject_guard`)가 아무리 옳아도 `inject_text` 가 그것을 안 부르면 그물이
@@ -23560,6 +23619,16 @@ mod tests {
             resolve_resume_suffix("codex", arg, None, Some("/nonexistent"), Some("/x"), "resume --last"),
             Some("resume --last".to_string())
         );
+        // ★(리뷰 R1 · codex major) 빈/공백 id 의 '부재 접기' 도 claude 한정이다 — codex 의 빈 id 는 종전
+        //   (bc01f43)과 **byte-identical** 하게 치환된다(`resume ` · 폴백 `resume --last` 로 승격되지 않는다).
+        //   그 동작이 좋은지는 F-1 의 질문이 아니다 — 범위 밖 동작 변경 0 이 계약이다.
+        for (empty_like, expect) in [(Some(""), "resume "), (Some("  "), "resume   ")] {
+            assert_eq!(
+                resolve_resume_suffix("codex", "resume {session_id}", empty_like, Some("/nonexistent"), Some("/x"), "resume --last"),
+                Some(expect.to_string()),
+                "codex 빈 id({empty_like:?})가 종전과 다르게 해소됐다 — F-1 범위 이탈"
+            );
+        }
         // gemini 는 placeholder 없는 `--continue` 를 선언한다(agents.json) — 종전 그대로 부착.
         assert_eq!(
             resolve_resume_suffix("gemini", "--continue", None, Some("/nonexistent"), Some("/x"), "--continue"),

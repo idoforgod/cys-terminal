@@ -1477,10 +1477,25 @@ pub mod fixtures {
     /// 어떤 needle 도 이 화면들에 **단독으로** 걸리지 않는다(`no_needle_alone_matches_a_non_gate_screen`).
     /// 뒤 조항 때문에 **needle 문면을 본문에 담은 화면은 이 표에 들어올 수 없다** — 그런 화면은
     /// [`BODY_TEXT_SCREENS`] 가 따로 받는다.
+    /// ★실측(2026-09-06 10:18:58 · claude **2.1.261** · 본부 라이브 좌석 `cys read-screen` · 읽기 전용) —
+    /// 유휴 프롬프트의 **입력 상자 아래**에 괘선·상태줄이 그려진다(2.1.241 검체 [`LIVE_TUI_AT_PROMPT`] 는
+    /// `? for shortcuts` 를 프롬프트 **위**에 둔다). 재주입 생애 창(readiness 축 ①')의 실측 근거이며,
+    /// 2.1.241 검체를 대체하지 않고 **추가**한다(§3-8). 본문·괘선 폭은 줄였고 문면은 실측 그대로다.
+    pub const LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT: &str = "\x20 현재 상태: 전 노드 무착수 대기. 이 pane 에 임무 한 줄을 직접 입력하시면 게이트가 열리고 즉시 이어갑니다.\n\
+        \n\
+        ✻ Churned for 3m 34s · done 오전 7:14\n\
+        \x20                                   new task? /clear to save 353.6k tokens\n\
+        ────────────────────────────────────────────────────────────\n\
+        ❯ \n\
+        ────────────────────────────────────────────────────────────\n\
+        \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n\
+        \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
+
     pub const NON_GATE_SCREENS: &[(&str, &str)] = &[
         ("ready-shell", READY_SHELL),
         ("healthy-welcome-box", HEALTHY_WELCOME_BOX),
         ("live-tui-at-prompt", LIVE_TUI_AT_PROMPT),
+        ("live-tui-2.1.261-status-below-prompt", LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT),
         ("foreign-cli-browser-login", FOREIGN_CLI_BROWSER_LOGIN),
         ("grep-output", GREP_OUTPUT_MENTIONING_OAUTH_ERROR),
         ("audit-log-line", AUDIT_LOG_LINE),
