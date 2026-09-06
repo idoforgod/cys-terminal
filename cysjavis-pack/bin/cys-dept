@@ -276,6 +276,7 @@ usage: cys-dept <verb> ...
   cys-dept promote-if-pending [--request-only]  보류 승격 해소(알림만=--request-only)
   cys-dept list                                 부서명 목록
   cys-dept sock <name>                          부서 소켓 경로 출력
+  cys-dept cwd <name>                           부서 좌석 cwd 출력(등재 cwd → $HOME · 절대·물리 · 읽기 전용 · 미등재 exit 3)
   cys-dept <name> -- <cmd>                      부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
 USAGE
 }
@@ -780,16 +781,26 @@ seed_trust_acct(){
 #   claude_project_key 와 같은 값. $HOME 폴백도 같은 규칙(실패 시 원문). CDPATH 는 서브셸에서 벗긴다(상대값 cd 가 CDPATH 로
 #   튀어 stdout 을 더럽히는 것 차단). 등재 cwd 조회(python 1회)는 명시값이 못 쓸 때만(rotate 핫패스 spawn 절약).
 _dept_cwd_canon(){ ( unset CDPATH; cd -P -- "$1" 2>/dev/null && pwd -P ) 2>/dev/null || true; }
+# ★R3(리뷰 codex): 루트 판정을 cys.rs sanitize_launch_cwd 와 같은 규칙으로 — 꼬리 `/`·`\` 를 전부 벗긴 뒤 비어 있거나
+#   드라이브 루트 `X:` 면 루트(종전 정확히 "/" 만). Git Bash 에서 `[ -d 'C:\' ]` 는 참이고 `pwd -P` 는 `/c` 를 내므로 그
+#   값이 시드 키가 되면 기동기(home 교정)·claude(getcwd) 어느 쪽과도 맞지 않는다. rc 0 = 루트.
+_dept_cwd_is_root(){
+  local t="$1"
+  while [ -n "$t" ] && { [ "${t%/}" != "$t" ] || [ "${t%\\}" != "$t" ]; }; do t="${t%/}"; t="${t%\\}"; done
+  [ -z "$t" ] && return 0
+  case "$t" in [A-Za-z]:) return 0 ;; esac
+  return 1
+}
 resolve_dept_cwd(){
   local explicit="$1" name="${2:-}" c r src
   for src in explicit registry; do
     if [ "$src" = explicit ]; then c="$explicit"
     else c="$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; fi
     [ -n "$c" ] || continue
-    [ "$c" = "/" ] && c="$HOME"
+    _dept_cwd_is_root "$c" && c="$HOME"
     if [ -d "$c" ]; then
       r="$(_dept_cwd_canon "$c")"
-      [ -n "$r" ] && [ "$r" != "/" ] && { printf '%s\n' "$r"; return 0; }
+      [ -n "$r" ] && ! _dept_cwd_is_root "$r" && { printf '%s\n' "$r"; return 0; }
     fi
   done
   r="$(_dept_cwd_canon "$HOME")"
@@ -1156,7 +1167,7 @@ dept_issue_ceo_ticket(){
   return 0
 }
 
-cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|list|sock <name> | <name> -- <cmd>}"
+cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|list|sock <name>|cwd <name> | <name> -- <cmd>}"
 # ★D3(i): cmd 위치 --help/-h만 usage(stdout·exit 0) — 읽기 전용이라 단일소유 가드(exit 7)보다 앞·역할
 #   무관. ★name 위치의 --help/-h는 usage가 아니라 검증 거부 exit 2다(`launch --help`가 '--help' 부서를
 #   등재→껍데기 CEO 승격까지 간 실사고의 재발 차단 — 가드(exit 7)는 name 검증보다는 선행 유지).
@@ -1801,6 +1812,25 @@ EOF
     if [ -n "$_dl_names" ]; then printf '%s\n' "$_dl_names"; fi
     dept_warn_unregistered_socks "$_dl_names"
     ;;
+  cwd)
+    # ★WP-2 R3(리뷰 · 심박 --cwd 공백 대비): 부서 좌석의 확정 cwd 를 **읽기 전용**으로 출력 — 시드·빈 셸·편성이 쓰는
+    #   resolve_dept_cwd 와 같은 값(등재 cwd → $HOME · 절대·물리 경로). 소비자 후보: formation-heartbeat 잡(schedule.rs ·
+    #   Rust 레인 · 통합 단계)이 `javis_formation.py ensure --cwd "$(cys-dept cwd "$d")"` 로 넘긴다.
+    #   읽기 전용 계약(codex R3): 레지스트리 파일이 없으면 만들지 않고(reg_init 경유 금지) exit 3 · 미등재 이름도 exit 3
+    #   (미지 부서에 $HOME 을 '행동 가능한 값' 으로 내주지 않는다) · 손상 레지스트리 exit 3 · stdout 은 성공 시 경로 1줄뿐.
+    name="${2:-}"
+    case "$name" in
+      ""|-*)
+        echo "[cys-dept] cwd: 부적격 이름('$name') — 빈 이름·'-' 선두 불가" >&2
+        echo "usage: cys-dept cwd <name>" >&2
+        exit 2 ;;
+    esac
+    [ -f "$REG" ] || { echo "[cys-dept] cwd: 레지스트리 부재($REG) — 미등재" >&2; exit 3; }
+    if ! reg_names 2>/dev/null | grep -Fxq -- "$name"; then
+      echo "[cys-dept] cwd: 미등재 부서 '$name'(또는 레지스트리 판독 불가)" >&2; exit 3
+    fi
+    resolve_dept_cwd "" "$name"
+    exit 0 ;;
   sock)
     name="${2:-}"
     # ★D3(i): sock은 read-only(방송 fan-out 루프 `sock "$d"` 호출부)라 기존 등재의 레거시 비정형명

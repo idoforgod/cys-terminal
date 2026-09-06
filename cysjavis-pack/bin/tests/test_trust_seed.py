@@ -15,8 +15,10 @@ cwd·레지스트리는 임시 디렉터리다(실 ~/.cys 계정 dir 은 절대 
   4) 동시 변경: 다른 프로세스가 잠금 보유 → REFUSE lock-busy · 읽기~쓰기 사이 파일 변경 → REFUSE concurrent-change
      (상대 내용 생존) · 잠금 기구 미가용 → REFUSE lock-unavailable · ★R1 교체 後 기록자 = 롤백 0(상대 내용 보존 · 플래그 보존이면
      OK · 아니면 REFUSE post-commit · 되읽기 실패 = ERROR 커밋 유지) · ★R2 대조~커밋 사이 기록자 = 원자 교환이 드러내 REFUSE
-     (상대 바이트 보존 · 종전 '알려진 한계' 핀 폐기) · 교환 기구 부재 폴백 한계는 별도 핀 · 부재 파일 = link/O_EXCL(경합 REFUSE)
-  4') ★R2 프로브는 기존 문서가 있을 때만(부재 파일 = 무프로브 · Windows 신규 부서 경로) · env 비노출 tail/less 는 형상 아님
+     (상대 바이트 보존 · 종전 '알려진 한계' 핀 폐기) · ★R3 교환 기구 부재 = REFUSE exchange-unavailable(강행 불가 · os.replace 0) ·
+     부재 파일 = link 만(경합 REFUSE · 하드링크 실패 = REFUSE link-failed · O_EXCL 폴백 0) · displaced 지문 청소 · lone surrogate
+  4') ★R2 프로브는 기존 문서가 있을 때만(부재 파일 = 무프로브 · Windows 신규 부서 경로) · env 비노출 tail/less 는 형상 아님 ·
+     ★R3 darwin 프로브 = ps 2회(argv 접두 대조로 env 경계 확정 · 구분자 없는 모드는 claude 형상에 검증된 0 을 주지 않는다)
   5) C58 레지스트리: 본부·부서 topology 쌍 판독(config 부재 항목 추정 귀속 0 · ★R1 agent=claude 만 · depts.json (account_dir,
      cwd) 쌍 · 절대경로만 · ★R2 entries 형상 이상 = 판독불가) · 워크스페이스 판정은 _trust_gap_workspaces 하나(마커 0 · 정확 키 ·
      ★R2 _is_cysjavis_workspace 삭제) · 갭 = 항목 부재·별칭 true 포함 ·
@@ -26,7 +28,9 @@ cwd·레지스트리는 임시 디렉터리다(실 ~/.cys 계정 dir 은 절대 
   6) cys-dept 배선: 3지점(launch/allocate/create)에서 seed_trust_acct 가 데몬 스폰·빈 셸 生成 앞 · 4 데몬 라인 env -u 접두 ·
      ★R1 resolve_dept_cwd 로 확정한 **같은 cwd** 가 시드·빈 셸·formation_ensure_async(--cwd) 에 전달 · launch 완주(Windows 목·
      재사용 경로)에서 fork 계정 dir 에 .claude.json 착지 + formation 스텁 argv 실측(호출자 cwd≠HOME · CYS_DEPT_CWD · 등재 cwd · "/")
-  7) codex(gpt-6-astra) 적대 반례(R2 · 워커가 전 행 검토 후 채택) + R1 재검토분
+  7) codex(gpt-6-astra) 적대 반례(R2 · 워커가 전 행 검토 후 채택) + R1 재검토분 + R3
+  ★R3 플랫폼 계약: 기존 문서의 성공 경로는 원자 교환이 있는 FS 에서만 실행된다(_require_exchange · 없으면 정직 skip) · 교환 부재
+     거부/오류/청소/판정 검체는 어디서나 실행(교환을 None/_ExchangeUnavailable 로 주입).
 
     CYS_PACK_DIR="$(mktemp -d)" JAVIS_ROOT="$(mktemp -d)" CYS_PROBE_RUNS="$JAVIS_ROOT/probe_runs.jsonl" \\
       python3 cysjavis-pack/bin/tests/test_trust_seed.py
@@ -34,6 +38,7 @@ cwd·레지스트리는 임시 디렉터리다(실 ~/.cys 계정 dir 은 절대 
 import builtins
 import copy
 import errno
+import hashlib
 import io
 import json
 import os
@@ -118,6 +123,45 @@ def _no_probe(d):
 
 def _verified_zero(d):
     return 0, "injected-zero"
+
+
+_EXCHANGE_OK = [None]
+
+
+def _exchange_supported():
+    """실물 교환 가능 여부(1회 캐시) — 픽스처와 같은 tmp FS 에서 두 파일을 실제로 맞바꿔 본다(codex R3: 함수 반환값만 믿지 않고
+    바이트가 실제로 바뀌었는지 확인 · 예외는 실패로 올린다)."""
+    if _EXCHANGE_OK[0] is None:
+        d = tempfile.mkdtemp(prefix="trustseed-xchg-")
+        a, b = os.path.join(d, "a"), os.path.join(d, "b")
+        _write(a, "A")
+        _write(b, "B")
+        r = pf._exchange_paths(a, b)
+        ok = r is True and _read_text(a) == "B" and _read_text(b) == "A"
+        if r is True and not ok:
+            raise AssertionError("_exchange_paths 가 True 를 돌려줬는데 바이트가 안 바뀌었다")
+        _EXCHANGE_OK[0] = ok
+    return _EXCHANGE_OK[0]
+
+
+def _require_exchange(tc):
+    """기존 문서 커밋(교환) 성공을 전제하는 검체의 정직 skip(Windows · 교환 미지원 FS). 거부/오류 검체엔 쓰지 않는다."""
+    if not _exchange_supported():
+        tc.skipTest("이 플랫폼/FS 엔 원자 교환 기구가 없다(기존 문서 커밋 = REFUSE exchange-unavailable 이 계약)")
+
+
+def _ps2(env_text):
+    """darwin 2회 ps 주입 러너(R3): -E 없는 호출엔 각 줄의 env 세그먼트를 벗긴 argv 줄(실 ps 의 접두 관계 재현)."""
+    def runner(cmd):
+        if "-E" in cmd:
+            return 0, env_text, ""
+        lines = []
+        for l in env_text.splitlines():
+            parts = l.split(None, 1)
+            if len(parts) == 2:
+                lines.append(parts[0] + " " + pf._PS_ENV_SPLIT_RE.split(parts[1])[0])
+        return 0, "\n".join(lines), ""
+    return runner
 
 
 class Base(unittest.TestCase):
@@ -246,6 +290,7 @@ class Partial(Base):
         os.makedirs(self.cfg)
 
     def test_2_partial_only_target_key_touched(self):
+        _require_exchange(self)
         base = {"hasCompletedOnboarding": False, "theme": "dark", "numStartups": 3,
                 "projects": {"/somewhere/else": {"hasTrustDialogAccepted": False, "allowedTools": []}}}
         _write(self.cfgfile, json.dumps(base, indent=2), 0o644)
@@ -264,6 +309,7 @@ class Partial(Base):
         self.assertFalse(os.path.exists(self.cfgfile + ".bak-preflight"), "시드 경로는 백업을 만들지 않는다")
 
     def test_2b_projects_absent_created(self):
+        _require_exchange(self)
         _write(self.cfgfile, '{"hasCompletedOnboarding": true}')
         rc, verdict, reason = self.seed()
         self.assertEqual(rc, 0, reason)
@@ -273,6 +319,7 @@ class Partial(Base):
 
     def test_2c_alias_key_untouched_exact_key_created(self):
         """★R1(codex): claude 는 projects[getcwd()] 정확 키만 읽는다 — 별칭(꼬리 슬래시) 항목은 신뢰 판정에 쓰지도 손대지도 않는다."""
+        _require_exchange(self)
         alias = self.key + "/"
         _write(self.cfgfile, json.dumps({"projects": {alias: {"hasTrustDialogAccepted": False, "k": 1}}}))
         rc, verdict, reason = self.seed()
@@ -283,6 +330,7 @@ class Partial(Base):
 
     def test_2c2_alias_true_exact_false_conflict_sets_exact(self):
         """codex R1 반례: {"/work/": true, "/work": false} — 종전 구현은 별칭을 골라 already-trusted 로 정확 키를 false 로 남겼다."""
+        _require_exchange(self)
         alias = self.key + "/"
         _write(self.cfgfile, json.dumps({"projects": {alias: {"hasTrustDialogAccepted": True},
                                                       self.key: {"hasTrustDialogAccepted": False}}}))
@@ -328,6 +376,7 @@ class Partial(Base):
 
     def test_2g_empty_existing_file_is_existing(self):
         """codex R1: 0B 기존 파일은 '부재' 가 아니다 — 비기본 권한 보존 · backup=True 면 0B 백업 · 삭제 0."""
+        _require_exchange(self)
         _write(self.cfgfile, "", 0o640)
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"), backup=True)
         self.assertEqual((rc, verdict), (0, "OK"), reason)
@@ -342,12 +391,13 @@ class Partial(Base):
         """CLI 경로 기존-문서 갱신 1건(darwin stub ps · 실 프로브 코드 경로 통과 · 결정론). 다른 플랫폼은 in-process 검체가 담당."""
         if sys.platform != "darwin":
             self.skipTest("stub ps 는 darwin 프로브에만 해당(linux=/proc · nt=powershell)")
+        _require_exchange(self)
         _write(self.cfgfile, '{"theme": "dark", "projects": {}}')
         rc, out, err = seed_cli(self.cfg, self.ws, "--json")
         self.assertEqual(rc, 0, out + err)
         j = json.loads(out)
         self.assertTrue(j["reason"].startswith("seeded("), j)
-        self.assertIn("probe=darwin: ps -E 1줄", j["reason"], "stub ps 가 아니라 호스트 ps 를 읽었다")
+        self.assertIn("probe=darwin: ps -E 1줄(argv 대조 1)", j["reason"], "stub ps 가 아니라 호스트 ps 를 읽었다(R3: 2회 호출 · argv 대조 계수)")
         self.assertEqual(_read_json(self.cfgfile), {"theme": "dark", "projects": {self.key: {"hasTrustDialogAccepted": True}}})
 
     def test_2i_fifo_at_claude_json_is_refused_before_open(self):
@@ -433,6 +483,7 @@ class LiveProcess(Base):
         return p
 
     def test_3_live_claude_refuses_then_ok_after_exit(self):
+        _require_exchange(self)
         if not _env_visible_for_python_child():
             self.skipTest("이 플랫폼/인터프리터에선 자식 env 가 ps 에 보이지 않는다(라이브 판정 실측 불가)")
         p = self._spawn("claude", self.cfg)          # argv basename 'claude' = claude 실행 형상
@@ -456,6 +507,7 @@ class LiveProcess(Base):
         self.assertIn("commit=", out)
 
     def test_3b_non_claude_child_with_same_env_not_counted(self):
+        _require_exchange(self)
         if not _env_visible_for_python_child():
             self.skipTest("자식 env 가 ps 에 보이지 않는다")
         self._spawn("mcp_server.py", self.cfg)       # 같은 env · claude 실행 형상 아님(MCP 자식 재현)
@@ -484,12 +536,14 @@ class LiveProcess(Base):
             self.skipTest("이 호스트는 tail 의 env 를 노출한다(재현 전제 불성립) — 순수 검체가 대신 판정")
         count, detail = pf.claude_procs_for_config(self.cfg)
         self.assertIsNotNone(count, "tail -f …/claude 가 unresolved 를 만들었다(R2 회귀): %s" % detail)
+        _require_exchange(self)
         self.untrusted_file('{"projects": {}}')
         rc, out, err = seed_cli(self.cfg, self.ws, stub_ps=False)
         self.assertEqual(rc, 0, out + err)
         self.assertIn("OK seeded(", out)
 
     def test_3c_unverified_refuses_unless_forced(self):
+        _require_exchange(self)
         self.untrusted_file('{"hasCompletedOnboarding": true}')   # ★R2: 기존 문서 → 프로브
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (None, "no-ps"))
         self.assertEqual((rc, verdict), (2, "REFUSE"))
@@ -532,7 +586,7 @@ class LiveProcess(Base):
 
     def test_3f_hidden_env_claude_shape_is_unresolved(self):
         """codex R1: env 세그먼트 없는 claude 형상 줄은 '검증된 0' 이 아니다 → None → REFUSE unverified(강행 시 통과) · 양성이 있으면 n."""
-        runner = lambda c: (0, "  7 /Users/o/.local/bin/claude --continue\n  8 python3 x.py\n", "")
+        runner = _ps2("  7 /Users/o/.local/bin/claude --continue\n  8 python3 x.py\n")
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=runner, os_name="posix", platform="darwin")
         self.assertIsNone(cnt, detail)
         self.assertIn("env 비노출", detail)
@@ -542,12 +596,25 @@ class LiveProcess(Base):
         self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
         self.assertIn("unverified", reason)
         # ★R2: env 비노출이라도 인자 속 claude(tail/less)는 형상 아님 → 검증된 0
-        benign = lambda c: (0, "  7 tail -f /x/logs/claude\n  8 less /Users/o/.local/bin/claude\n  9 zsh -lc export X=1; claude\n", "")
+        benign = _ps2("  7 tail -f /x/logs/claude\n  8 less /Users/o/.local/bin/claude\n  9 zsh -lc export X=1; claude\n")
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=benign, os_name="posix", platform="darwin")
         self.assertEqual(cnt, 0, detail)
-        pos = lambda c: (0, "  7 /Users/o/.local/bin/claude\n  9 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=%s\n" % self.cfg, "")
+        pos = _ps2("  7 /Users/o/.local/bin/claude\n  9 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=%s\n" % self.cfg)
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=pos, os_name="posix", platform="darwin")
         self.assertEqual(cnt, 1, detail)
+        # ★R3(codex major 재현): 인자 속 CLAUDE_CONFIG_DIR=/other 가 env 의 실제 값(우리 config)을 가리던 줄 → argv 대조로 양성
+        hide = _ps2("  7 claude -p CLAUDE_CONFIG_DIR=/other CLAUDE_CONFIG_DIR=%s HOME=/x\n" % self.cfg)
+        cnt, detail = pf.claude_procs_for_config(self.cfg, runner=hide, os_name="posix", platform="darwin")
+        self.assertEqual(cnt, 1, "인자 속 NAME= 가 env 를 가렸다(검증된 0): %s" % detail)
+        calls = []
+        def order(cmd):
+            calls.append(list(cmd))
+            return _ps2("  7 claude HOME=/x\n")(cmd)
+        pf.claude_procs_for_config(self.cfg, runner=order, os_name="posix", platform="darwin")
+        self.assertEqual([("-E" in c) for c in calls], [False, True], "argv 전용 ps 가 -E 앞에 오지 않았다: %s" % calls)
+        cnt, detail = pf.claude_procs_for_config(self.cfg, runner=lambda c: (1, "", "") if "-E" not in c else (0, "7 claude HOME=/x", ""),
+                                                 os_name="posix", platform="darwin")
+        self.assertIsNone(cnt, "argv ps 실패가 검증된 0 이 됐다: %s" % detail)
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, force_unverified=True, proc_counter=lambda d: (1, "x"))
         self.assertEqual((rc, verdict), (2, "REFUSE"), "양성 관측을 강행이 넘었다")
 
@@ -683,6 +750,7 @@ class Concurrent(Base):
 
     def test_4e_post_commit_writer_preserved_no_rollback(self):
         """★R1(codex): 교체 後 기록자 내용은 **보존**(롤백 0). 플래그 보존 → OK · 없음 → REFUSE post-commit · 판독 불가 → ERROR 커밋 유지."""
+        _require_exchange(self)
         _write(self.cfgfile, '{"theme": "dark", "projects": {}}')
         kept = json.dumps({"theme": "light", "projects": {self.key: {"hasTrustDialogAccepted": True, "z": 1}}}).encode()
         rc, verdict, reason = self._seed_with_post_replace_writer(kept)
@@ -709,6 +777,7 @@ class Concurrent(Base):
 
     def test_4f_readback_io_error_leaves_commit(self):
         """R2 반례 재검토(R1): 되읽기 IO 실패는 롤백이 아니라 ERROR + 커밋 유지(임시파일 검증 통과분)."""
+        _require_exchange(self)
         _write(self.cfgfile, '{"theme": "dark"}')
         real = pf._read_claude_json_bytes
         calls = []
@@ -740,10 +809,9 @@ class Concurrent(Base):
                     raise OSError("injected displaced read failure")
             return real(path)
 
+        _require_exchange(self)
         with patch.object(pf, "_read_claude_json_bytes", flaky):
             rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
-        if "commit=replace" in reason:
-            self.skipTest("이 플랫폼/FS 엔 교환 기구가 없다(os.replace 폴백) — displaced 검사 경로 없음")
         self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
         self.assertIn("concurrent-change", reason)
         self.assertEqual(_read_text(self.cfgfile), original, "되교환이 원본을 복원하지 않았다")
@@ -765,10 +833,9 @@ class Concurrent(Base):
                     f.write(late)
             return real_ex(a, b)
 
+        _require_exchange(self)
         with patch.object(pf, "_exchange_paths", exchange):
             rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
-        if len(calls) == 1 and "commit=replace" in reason:
-            self.skipTest("교환 기구 없는 플랫폼/FS — 폴백 한계는 test_4g2 가 핀")
         self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
         self.assertIn("concurrent-change", reason)
         self.assertEqual(len(calls), 2, "되교환이 없었다: %s" % calls)
@@ -810,23 +877,38 @@ class Concurrent(Base):
         self.assertEqual(_read_text(self.cfgfile), original)
         self.assertEqual([n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME], [])
 
-    def test_4g2_fallback_platform_known_limit_is_disclosed(self):
-        """교환 기구 부재(Windows · 미지원 FS) 폴백 = os.replace: 대조~교체 창은 **남는다**(파일 머리 고지) — 여기까지 온 것은 프로브가
-        라이브 claude 0 을 확인한 뒤라 남는 상대는 우리 도구뿐. 사유에 폴백 사실이 남아야 한다."""
+    def test_4g2_exchange_unavailable_refuses_without_rename_over(self):
+        """★R3 핀 전환(리뷰 codex BLOCK · 종전 '폴백 한계 고지' 핀 폐기): 교환 기구 부재(Windows · 미지원 FS)는 **REFUSE exchange-unavailable**
+        — os.replace 는 호출되지 않고(대조~교체 창 자체가 열리지 않는다) 기존 문서·끼어든 기록자 바이트 그대로 · 잔재 0 ·
+        --force-unverified 로도 열리지 않는다(귀속 불확실 감수 ≠ 알려진 손실 감수). None(구형 스텁)도 부재로 해석."""
         _write(self.cfgfile, '{"projects": {}}')
-        real_replace = os.replace
         late = b'{"projects": {"/late": {"hasTrustDialogAccepted": true}}}'
+        for unavailable, token in ((pf._ExchangeUnavailable("ENOTSUP"), "exchange-unavailable(ENOTSUP"),
+                                   (None, "exchange-unavailable(")):
+            for force in (False, True):
+                with self.subTest(unavailable=unavailable, force=force):
+                    _write(self.cfgfile, '{"projects": {}}')
 
-        def replace(src, dst):
-            with open(dst, "wb") as f:
-                f.write(late)
-            real_replace(src, dst)
+                    def unavailable_after_writer(a, b, _u=unavailable):
+                        with open(b, "wb") as f:                 # 대조 뒤·커밋 순간에 끼어든 기록자 — 폴백이 있었다면 덮였을 바이트
+                            f.write(late)
+                        return _u
 
-        with patch.object(pf, "_exchange_paths", lambda a, b: None), patch.object(pf.os, "replace", replace):
-            rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+                    with patch.object(pf, "_exchange_paths", unavailable_after_writer), \
+                            patch.object(pf.os, "replace", side_effect=AssertionError("rename-over 폴백이 호출됐다")):
+                        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"),
+                                                            force_unverified=force)
+                    self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+                    self.assertIn(token, reason)
+                    self.assertEqual(_read_bytes(self.cfgfile), late, "기록자 바이트가 덮였다")
+                    leftovers = [n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME]
+                    self.assertEqual(leftovers, [], leftovers)
+        # 부재 파일은 교환과 무관(os.link) — 기구 부재 플랫폼에서도 신규 부서 시드는 동작
+        os.unlink(self.cfgfile)
+        with patch.object(pf, "_exchange_paths", lambda a, b: pf._ExchangeUnavailable("platform:nt")):
+            rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=_no_probe)
         self.assertEqual((rc, verdict), (0, "OK"), reason)
-        self.assertIn("commit=replace(교환 기구 부재", reason)
-        self.assertEqual(_read_json(self.cfgfile), {"projects": {self.key: {"hasTrustDialogAccepted": True}}})
+        self.assertIn("commit=link", reason)
 
     def test_4h_absent_file_create_if_absent_refuses_when_writer_creates_first(self):
         """★R2: 부재 파일 커밋 = os.link(원자 create-if-absent) — 그 사이 다른 기록자가 만든 파일은 덮이지 않고 REFUSE."""
@@ -845,18 +927,31 @@ class Concurrent(Base):
         self.assertIn("생겨났다", reason)
         self.assertEqual(_read_bytes(self.cfgfile), theirs, "상대가 만든 파일이 덮였다")
         self.assertEqual([n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME], [])
-        # link 미지원 FS 폴백 = O_EXCL 배타 생성(덮기 0)
+        # ★R3(리뷰 codex major): 하드링크 실패(미지원 FS EPERM/EXDEV · ENOSPC/EIO)는 O_EXCL 배타 생성 폴백이 아니라 REFUSE link-failed
+        #   — 이름이 내용보다 먼저 공개되는 경로 0(잘린 .claude.json 이 영구 손상 문서로 남던 것) · cfg 미생성 · 잔재 0 · 쓰기 open 0
         os.unlink(self.cfgfile)
-        with patch.object(pf.os, "link", side_effect=OSError("EPERM: no hard links")):
-            rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=_no_probe)
-        self.assertEqual((rc, verdict), (0, "OK"), reason)
-        self.assertIn("commit=excl-create", reason)
-        self.assertEqual(_read_json(self.cfgfile), {"projects": {self.key: {"hasTrustDialogAccepted": True}}})
-        self.assertEqual(stat.S_IMODE(os.stat(self.cfgfile).st_mode), 0o600)
+        real_open = os.open
+        for err in (errno.EPERM, errno.EXDEV, errno.ENOSPC, errno.EIO):
+            with self.subTest(errno=errno.errorcode[err]):
+                opened = []
+
+                def opening(path, flags, *a, **kw):
+                    if os.fspath(path) == self.cfgfile:
+                        opened.append(flags)
+                    return real_open(path, flags, *a, **kw)
+
+                with patch.object(pf.os, "link", side_effect=OSError(err, "injected")), patch.object(pf.os, "open", opening):
+                    rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=_no_probe)
+                self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+                self.assertIn("link-failed(%s" % errno.errorcode[err], reason)
+                self.assertFalse(os.path.lexists(self.cfgfile), "link 실패인데 .claude.json 이 생겼다(부분 공개)")
+                self.assertEqual(opened, [], "cfg 경로를 직접 열었다(O_EXCL 폴백 잔존): %s" % opened)
+                self.assertEqual([n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME], [])
 
     def test_4i_crash_after_exchange_leaves_displaced_untouched_by_next_sweep(self):
         """★R2(codex): 교환 직후 죽으면 옛 inode 는 .claude.json.displaced-* 에 남는다 — 다음 시더의 잔재 청소(.seed-<8자>)가 그것을
         지우지 않고, 거기 든 낯선 데이터(기록자의 유일 사본일 수 있다)가 살아남는다."""
+        _require_exchange(self)
         _write(self.cfgfile, '{"projects": {}}')
         foreign = b'{"projects": {"/foreign": {"hasTrustDialogAccepted": true}}}'
         real_ex = pf._exchange_paths
@@ -880,6 +975,88 @@ class Concurrent(Base):
         self.assertIn("already-trusted", reason)
         self.assertFalse(os.path.exists(os.path.join(self.cfg, ".claude.json.seed-abcd1234")), "mkstemp 잔재가 남았다")
         self.assertEqual(_read_bytes(os.path.join(self.cfg, displaced[0])), foreign, "displaced 가 청소됐다(데이터 파괴)")
+
+
+    def test_4j_crash_before_exchange_leaves_payload_only_displaced_that_next_sweep_reclaims(self):
+        """★R3(리뷰): rename(tmp→displaced) 와 교환 사이에 죽으면 displaced 엔 **우리 payload 만** 있다 — 이름의 sha256 지문과 바이트가
+        같으므로 다음 시더의 잠금 아래 청소가 그것만 회수한다(반복 crash 에도 무한 누적 0). 지문이 다른 displaced(교환 뒤 옛 inode) ·
+        지문 없는 구형 이름 · conflict · 지문이 맞아도 심링크/FIFO 는 무접촉."""
+        _write(self.cfgfile, '{"projects": {}}')
+
+        def die_before_exchange(a, b):
+            raise KeyboardInterrupt("SIGINT before exchange")
+
+        with patch.object(pf, "_exchange_paths", die_before_exchange):
+            with self.assertRaises(KeyboardInterrupt):
+                pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        displaced = [n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_DISPLACED_PREFIX)]
+        self.assertEqual(len(displaced), 1, os.listdir(self.cfg))
+        payload = _read_bytes(os.path.join(self.cfg, displaced[0]))
+        self.assertEqual(json.loads(payload.decode("utf-8")), {"projects": {self.key: {"hasTrustDialogAccepted": True}}})
+        m = pf._SEED_DISPLACED_RE.match(displaced[0])
+        self.assertIsNotNone(m, displaced[0])
+        self.assertEqual(m.group(1), pf._payload_digest(payload), "이름의 지문이 payload sha256 이 아니다")
+        self.assertEqual(len(m.group(1)), 64)
+        # 보존돼야 하는 이웃들
+        foreign = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + m.group(1) + "-foreign")
+        _write(foreign, "foreign bytes that do not match the digest")
+        legacy = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + "20260906T000000Z-1")
+        with open(legacy, "wb") as f:
+            f.write(payload)
+        conflict = os.path.join(self.cfg, pf.SEED_TRUST_CONFLICT_PREFIX + m.group(1) + "-x")
+        with open(conflict, "wb") as f:
+            f.write(payload)
+        target = os.path.join(self.tmp, "link-target")
+        with open(target, "wb") as f:
+            f.write(payload)
+        link = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + m.group(1) + "-link")
+        os.symlink(target, link)
+        fifo = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + m.group(1) + "-fifo")
+        os.mkfifo(fifo)
+        _write(os.path.join(self.cfg, ".claude.json.seed-abcd1234"), "litter")
+        _require_exchange(self)
+        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        self.assertEqual((rc, verdict), (0, "OK"), reason)      # 원본은 crash 에 무접촉 → 이번엔 정상 커밋
+        self.assertIn("stale-tmp swept 2", reason)               # mkstemp 잔재 1 + payload displaced 1
+        self.assertIn("commit=exchange", reason)
+        self.assertFalse(os.path.lexists(os.path.join(self.cfg, displaced[0])), "우리 payload displaced 가 회수되지 않았다")
+        self.assertFalse(os.path.lexists(os.path.join(self.cfg, ".claude.json.seed-abcd1234")))
+        for keep in (foreign, legacy, conflict, link, fifo):
+            self.assertTrue(os.path.lexists(keep), "보존 대상이 지워졌다: %s" % keep)
+        self.assertEqual(_read_bytes(target), payload, "심링크 타깃이 지워졌다")
+        self.assertEqual(_read_json(self.cfgfile), {"projects": {self.key: {"hasTrustDialogAccepted": True}}})
+
+    def test_4k_lone_surrogate_document_is_seeded_without_traceback(self):
+        """★R3(리뷰 claude): 기존 문서의 고아 서로게이트 이스케이프(`"\\ud800"`)는 json.loads 는 받지만 utf-8 인코딩이 UnicodeEncodeError 를
+        냈다(try 밖 → C58 --fix 경유 시 preflight 전체 중단). 이제 ASCII 이스케이프로 재직렬화 → OK · 값 보존 · CLI 도 traceback 0."""
+        _require_exchange(self)
+        _write(self.cfgfile, '{"projects": {"/x": {"note": "\\ud800"}}, "theme": "d"}')
+        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        self.assertEqual((rc, verdict), (0, "OK"), reason)
+        self.assertIn("ascii-escaped", reason)
+        back = _read_json(self.cfgfile)
+        self.assertEqual(back["projects"]["/x"]["note"], "\ud800", "고아 서로게이트 값이 바뀌었다")
+        self.assertEqual(back["projects"][self.key], {"hasTrustDialogAccepted": True})
+        self.assertEqual(back["theme"], "d")
+        _write(self.cfgfile, '{"projects": {"/y": {"note": "\\udfff"}}}')
+        rc, out, err = seed_cli(self.cfg, self.ws)
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("OK seeded(", out)
+
+    def test_4l_post_commit_reasons_carry_commit_note(self):
+        """★R3(codex D9): post-commit REFUSE/ERROR 사유에도 commit=/probe= 진단이 남는다(성공 경로만 진단하던 것)."""
+        _require_exchange(self)
+        _write(self.cfgfile, '{"projects": {}}')
+        dropped = b'{"projects": {"/x": {"hasTrustDialogAccepted": true}}}'
+        rc, verdict, reason = self._seed_with_post_replace_writer(dropped)
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("commit=exchange", reason)
+        self.assertIn("probe=", reason)
+        _write(self.cfgfile, '{"projects": {}}')
+        rc, verdict, reason = self._seed_with_post_replace_writer(b"{broken")
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("commit=exchange", reason)
 
 
 class _IsoEnv(unittest.TestCase):
@@ -1088,6 +1265,84 @@ class RegistryC58(_IsoEnv):
         reg = pf.cysjavis_registry()
         self.assertNotIn(hub, reg["unreadable"])
         self.assertNotIn(hub, reg["sources"])          # 쌍 0 이라 출처 표기도 없다(종전 계약)
+
+    def test_5i_catalog_cwd_resolves_like_launcher_but_topology_is_preserved(self):
+        """★R3(리뷰 codex major): depts.json 카탈로그 cwd "/"·"///"·"C:\\"·부재 dir·루트 심링크 는 기동기(resolve_dept_cwd)처럼 $HOME 으로
+        해석돼 쌍이 된다(--fix 가 claude 가 결코 뜨지 않는"/" 를 시드하던 것) · 존재 dir 는 원값 · 상대값 제외 · topology 의 "/" 는
+        관측 쌍 그대로 보존(해석 0) · depts.json 파일 자체는 무변경."""
+        K, I = pf.claude_project_key, pf._path_identity
+        cfgD = os.path.join(self.home, ".cys", "claude-default-dept-3")
+        cfgE = os.path.join(self.home, ".cys", "claude-default-dept-4")
+        cfgF = os.path.join(self.home, ".cys", "claude-default-dept-5")
+        cfgG = os.path.join(self.home, ".cys", "claude-default-dept-6")
+        rootlink = os.path.join(self.home, "rootlink")
+        os.symlink("/", rootlink)
+        for d in (cfgD, cfgE, cfgF, cfgG):
+            os.makedirs(d)
+        depts = {"depts": {
+            "dept-3": {"socket": os.path.join(self.home, ".local", "state", "cys-dept-dept-3", "cys.sock"), "account_dir": cfgD, "cwd": "/"},
+            "dept-4": {"socket": os.path.join(self.home, ".local", "state", "cys-dept-dept-4", "cys.sock"), "account_dir": cfgE,
+                       "cwd": os.path.join(self.home, "vanished")},
+            "dept-5": {"socket": os.path.join(self.home, ".local", "state", "cys-dept-dept-5", "cys.sock"), "account_dir": cfgF,
+                       "cwd": rootlink},
+            "dept-6": {"socket": os.path.join(self.home, ".local", "state", "cys-dept-dept-6", "cys.sock"), "account_dir": cfgG,
+                       "cwd": "rel/ws"},
+            "dept-2": {"socket": os.path.join(self.home, ".local", "state", "cys-dept-dept-2", "cys.sock"), "account_dir": self.cfgC,
+                       "cwd": self.Z}}}
+        raw = json.dumps(depts).encode("utf-8")
+        with open(os.path.join(self.home, ".cys", "depts.json"), "wb") as f:
+            f.write(raw)
+        _write(os.path.join(self.home, ".local", "state", "cys", "topology.json"), json.dumps({"entries": [
+            {"role": "master", "agent": "claude", "claude_config_dir": self.cfgA, "cwd": "/"}]}))
+        for root_form in ("/", "///", "C:\\"):
+            with self.subTest(root_form=root_form):
+                depts["depts"]["dept-3"]["cwd"] = root_form
+                _write(os.path.join(self.home, ".cys", "depts.json"), json.dumps(depts))
+                reg = pf.cysjavis_registry()
+                self.assertEqual(reg["pairs"][I(cfgD)], {I(self.home): os.path.expanduser("~")}, reg["pairs"].get(I(cfgD)))
+        self.assertEqual(reg["pairs"][I(cfgE)], {I(self.home): os.path.expanduser("~")}, "부재 등재 dir → $HOME(기동기 폴백 미러)")
+        self.assertEqual(reg["pairs"][I(cfgF)], {I(self.home): os.path.expanduser("~")}, "루트 심링크 → $HOME(물리 경로 루트 거부 미러)")
+        self.assertNotIn(I(cfgG), reg["pairs"], "상대 카탈로그 cwd 가 쌍이 됐다")
+        self.assertEqual(reg["pairs"][I(self.cfgC)], {I(self.Z): self.Z}, "존재 dir 원값이 바뀌었다")
+        self.assertEqual(reg["pairs"][I(self.cfgA)], {I("/"): "/"}, "topology 의 관측 cwd '/' 가 해석됐다(관측 쌍 보존 위반)")
+        p = self._pf(fix=False)
+        self.assertEqual(p._trust_gap_workspaces(os.path.join(cfgD, ".claude.json")), [os.path.expanduser("~")])
+        self.assertEqual(p._trust_gap_workspaces(os.path.join(cfgE, ".claude.json")), [os.path.expanduser("~")])
+        for gaps in (p._trust_gap_workspaces(os.path.join(c, ".claude.json")) for c in (cfgD, cfgE, cfgF)):
+            self.assertNotIn("/", gaps)
+            self.assertTrue(all(os.path.isdir(g) for g in gaps), gaps)
+        # --fix 가 시드하는 키 = 기동기가 좌석을 띄우는 $HOME 의 정확 키
+        p2 = self._pf(fix=True)
+        with patch.object(pf, "claude_procs_for_config", lambda d, **k: (0, "t")):
+            r = self._c58(p2)
+        self.assertIn(K(self.home), _read_json(os.path.join(cfgD, ".claude.json"))["projects"])
+        self.assertNotIn("/", _read_json(os.path.join(cfgD, ".claude.json"))["projects"])
+        self.assertNotIn("%s / / (" % os.path.join(cfgD, ".claude.json"), r["detail"], "카탈로그 '/' 가 그대로 시드됐다")
+        self.assertIn("%s / / (" % os.path.join(self.cfgA, ".claude.json"), r["detail"], "topology 관측 쌍 '/' 은 보존·시드 대상")
+        depts["depts"]["dept-3"]["cwd"] = "C:\\"
+        self.assertEqual(_read_json(os.path.join(self.home, ".cys", "depts.json")), depts, "depts.json 이 수정됐다(등재 계약 불변)")
+
+    def test_5j_fix_seed_exception_is_one_warn_not_preflight_abort(self):
+        """★R3(리뷰 claude): --fix 의 seed_trust 예외(예: lone surrogate UnicodeEncodeError 였던 것)는 WARN 1줄로 접히고 다른 쌍의 수리는
+        계속된다 — run() 의 fut.result() 로 올라가 preflight 전체가 죽지 않는다."""
+        real = pf.seed_trust
+        calls = []
+
+        def flaky(config_dir, cwd, **kw):
+            calls.append((config_dir, cwd))
+            if pf._path_identity(config_dir) == pf._path_identity(self.cfgA):
+                raise RuntimeError("injected seed failure")
+            return real(config_dir, cwd, **kw)
+
+        p = self._pf(fix=True)
+        with patch.object(pf, "seed_trust", flaky), patch.object(pf, "claude_procs_for_config", lambda d, **k: (0, "t")):
+            r = self._c58(p)
+        self.assertEqual(r["status"], pf.WARN, r)
+        self.assertIn("예외 RuntimeError: injected seed failure", r["detail"])
+        self.assertIn("trust set:", r["detail"], "예외 뒤 다른 쌍의 수리가 멈췄다")
+        self.assertGreaterEqual(len(calls), 3, calls)
+        self.assertFalse(os.path.exists(os.path.join(self.cfgA, ".claude.json")))
+        self.assertIn(pf.claude_project_key(self.Y), _read_json(os.path.join(self.cfgB, ".claude.json"))["projects"])
 
     def test_5f_zero_pairs_is_skip_not_pass(self):
         """★R1: 판정할 쌍 0(출처 0 · 등재 0 · 판독불가) → SKIP. config 존재만으론 PASS 를 말하지 않는다."""
@@ -1334,7 +1589,8 @@ class DeptWiringStatic(unittest.TestCase):
         m2 = re.search(r"^resolve_dept_cwd\(\)\{\n.*?^\}$", self.src, re.M | re.S)
         self.assertIsNotNone(m2, "resolve_dept_cwd 부재")
         fn2 = m2.group(0)
-        self.assertIn('[ "$c" = "/" ] && c="$HOME"', fn2, "루트 cwd → $HOME 교정(cys.rs 와 동일) 부재")
+        self.assertIn('_dept_cwd_is_root "$c" && c="$HOME"', fn2, "루트 cwd → $HOME 교정(cys.rs sanitize_launch_cwd 미러 · R3) 부재")
+        self.assertIn('! _dept_cwd_is_root "$r"', fn2, "물리 경로 루트 거부 부재")
         self.assertIn('[ -d "$c" ]', fn2, "부재 dir 건너뛰기 부재(PTY 실패 = 좌석 0)")
         # ★R2 재핀: 채택 dir 는 절대·물리 경로(_dept_cwd_canon = cd -P && pwd -P · CDPATH 제거) · $HOME 폴백도 같은 규칙 · printf
         self.assertIn('r="$(_dept_cwd_canon "$c")"', fn2, "채택 dir 절대경로 확정 부재(CYS_DEPT_CWD=. 가 그대로 흐른다)")
@@ -1397,7 +1653,7 @@ class DeptWiringStatic(unittest.TestCase):
         body = ('REG=/dev/null\n'
                 'for c in "." "child" "%s" "%s" "/" "%s" ""; do printf "%%s\\n" "$(resolve_dept_cwd "$c" "n")"; done\n'
                 % (os.path.join(link, "child", ".."), link, os.path.join(d, "vanished")))
-        r, _ = self._run_fn(["reg_get_field", "_dept_cwd_canon", "resolve_dept_cwd"], body, env={"HOME": home, "CDPATH": "/tmp"},
+        r, _ = self._run_fn(["reg_get_field", "_dept_cwd_canon", "_dept_cwd_is_root", "resolve_dept_cwd"], body, env={"HOME": home, "CDPATH": "/tmp"},
                             cwd=real, path_prepend=stub)
         self.assertEqual(r.returncode, 0, r.stderr)
         got = r.stdout.splitlines()
@@ -1410,6 +1666,83 @@ class DeptWiringStatic(unittest.TestCase):
         self.assertEqual(calls, 2, "등재 조회는 명시값이 못 쓸 때만 python 을 띄운다(호출 %d)" % calls)
         for line in got:
             self.assertTrue(os.path.isabs(line) and line == R(line), "절대·물리 경로가 아니다: %s" % line)
+
+    def test_6f_root_forms_resolve_to_home_and_match_preflight_catalog_resolution(self):
+        """★R3(codex major): 루트 형("/" · "///" · "\\" · "C:\\" · 루트 심링크)과 부재 dir 는 $HOME(물리) — bash 기동기와 python
+        레지스트리 소비자(_resolve_catalog_cwd → claude_project_key)가 같은 입력에 같은 값을 낸다(패리티)."""
+        d = tempfile.mkdtemp(prefix="rootforms-")
+        home = os.path.join(d, "home")
+        ws = os.path.join(d, "ws")
+        os.makedirs(home)
+        os.makedirs(ws)
+        rootlink = os.path.join(d, "rootlink")
+        os.symlink("/", rootlink)
+        inputs = ["/", "///", "\\\\", "C:\\", "c:", rootlink, ws, ws + "/", os.path.join(d, "vanished")]
+        body = "REG=/dev/null\n" + "\n".join('printf "%%s\\n" "$(resolve_dept_cwd %s "")"' % shlex.quote(x) for x in inputs) + "\n"
+        r, _ = self._run_fn(["reg_get_field", "_dept_cwd_canon", "_dept_cwd_is_root", "resolve_dept_cwd"], body,
+                            env={"HOME": home, "CDPATH": "/tmp"}, cwd=ws)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = r.stdout.splitlines()
+        self.assertEqual(len(got), len(inputs), got)
+        R = os.path.realpath
+        for x, g in zip(inputs, got):
+            with self.subTest(input=x):
+                expect_py = pf.claude_project_key(pf._resolve_catalog_cwd(x, home=home)) if os.path.isabs(x) else R(home)
+                self.assertEqual(g, expect_py, "bash 기동기와 python 소비자가 갈린다")
+                self.assertNotEqual(g, "/", "루트가 그대로 나왔다")
+        self.assertEqual(got[:6], [R(home)] * 6, got)
+        self.assertEqual(got[6:8], [R(ws), R(ws)], got)
+        self.assertEqual(got[8], R(home))
+
+    def test_6g_cwd_verb_is_read_only_and_refuses_unknown(self):
+        """★R3(리뷰 claude 심박 --cwd 공백 · codex: 읽기 전용 계약): `cys-dept cwd <name>` — 레지스트리 부재 → exit 3 · 파일 미생성 ·
+        미등재/손상 → exit 3 · 부적격 이름 exit 2 · 등재 cwd 는 물리 경로 1줄 · "/" 등재 → $HOME · cys/cysd 스폰 0."""
+        d = tempfile.mkdtemp(prefix="cwdverb-")
+        home = os.path.join(d, "home")
+        ws = os.path.join(d, "ws")
+        bindir = os.path.join(d, "bin")
+        os.makedirs(home)
+        os.makedirs(ws)
+        os.makedirs(bindir)
+        calls = os.path.join(d, "calls")
+        for tool in ("cys", "cysd"):
+            _write(os.path.join(bindir, tool), '#!/bin/sh\necho "%s $@" >> "%s"\nexit 0\n' % (tool, calls), 0o755)
+        reg = os.path.join(home, ".cys", "depts.json")
+        env = dict(os.environ)
+        env.update({"HOME": home, "USERPROFILE": home, "CYS_DEPTS_JSON": reg, "PATH": bindir + os.pathsep + env.get("PATH", "")})
+        for k in ("CYS_ROLE", "CYS_SOCKET", "CYS_PACK_DIR", "CYS_DEPT_CWD", "CYS_SURFACE_ID"):
+            env.pop(k, None)
+
+        def verb(*args):
+            return subprocess.run(["bash", DEPT, "cwd", *args], capture_output=True, text=True, env=env, cwd=d, timeout=60)
+
+        r = verb("dept-1")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(r.stdout, "")
+        self.assertFalse(os.path.exists(reg), "읽기 전용 verb 가 레지스트리를 만들었다(reg_init 경유)")
+        os.makedirs(os.path.dirname(reg))
+        _write(reg, json.dumps({"depts": {"dept-1": {"socket": "/s/1/cys.sock", "cwd": ws},
+                                          "dept-2": {"socket": "/s/2/cys.sock", "cwd": "/"},
+                                          "dept-3": {"socket": "/s/3/cys.sock"}}}))
+        self.assertEqual(verb("dept-1").stdout.strip(), os.path.realpath(ws))
+        self.assertEqual(verb("dept-2").stdout.strip(), os.path.realpath(home), '"/" 등재 → $HOME')
+        self.assertEqual(verb("dept-3").stdout.strip(), os.path.realpath(home), "cwd 미기록 등재 → $HOME")
+        for bad in ("nope", ):
+            r = verb(bad)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertEqual(r.stdout, "")
+        for bad in ("", "-x"):
+            r = verb(bad)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertEqual(r.stdout, "")
+        before = _read_bytes(reg)
+        _write(reg, "{broken")
+        r = verb("dept-1")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertEqual(_read_bytes(reg), b"{broken", "손상 레지스트리를 건드렸다")
+        self.assertFalse(os.path.exists(calls), "verb 가 cys/cysd 를 스폰했다")
+        usage = subprocess.run(["bash", DEPT, "--help"], capture_output=True, text=True, env=env, cwd=d, timeout=60)
+        self.assertIn("cys-dept cwd <name>", usage.stdout + usage.stderr)
 
     def test_6c_daemon_lines_env_u_prefix(self):
         lines = [l for l in self.src.splitlines() if 'nohup "$CYSD"' in l]
@@ -1704,8 +2037,12 @@ class CodexCounterexamples(unittest.TestCase):
         target = os.path.join(self.tmp, "config=a=b")
         self.assertEqual(pf._count_claude_in_ps_lines(
             ["424242 claude CLAUDE_CONFIG_DIR=%s OTHER=x" % target], target), (1, 1, 0))
+        # ★R3 재핀: 구분자 없는 모드에서 claude 형상 + 대상 불일치는 0 이 아니라 unresolved(인자가 env 를 가릴 수 있다) · argv 경계를
+        #   주면 정확한 0
         self.assertEqual(pf._count_claude_in_ps_lines(
-            ["424242 claude XCLAUDE_CONFIG_DIR=%s" % target], target), (0, 1, 0))
+            ["424242 claude XCLAUDE_CONFIG_DIR=%s" % target], target), (0, 1, 1))
+        self.assertEqual(pf._count_claude_in_ps_lines(
+            ["424242 claude XCLAUDE_CONFIG_DIR=%s" % target], target, argv_lines=["424242 claude"]), (0, 1, 0))
         count, parsed, unresolved = pf._count_claude_in_ps_lines(
             ["424242 env CLAUDE_CONFIG_DIR=%s claude" % target], target)
         self.assertEqual(parsed, 1)
@@ -1980,9 +2317,14 @@ class CodexR1Counterexamples(unittest.TestCase):
             result = self.seed(backup=True, _pre_write_hook=hook)
         # ★R2 재핀(리뷰 codex BLOCK): 대조 뒤 백업 open 중 끼어든 기록자(late)는 교환이 드러낸다 → 되교환 → REFUSE · late 보존 ·
         #   백업은 캡처 바이트(원본) 그대로(1회 보존 계약) · 종전 핀은 'late 가 덮이고 OK' 였다(데이터 손실 핀 폐기).
+        # ★R3: 교환 기구 없는 플랫폼에선 REFUSE exchange-unavailable — 백업 배타·캡처 바이트·late 보존 단언은 그대로 실행(codex D8).
         self.assertEqual(result[:2], (2, "REFUSE"), result)
-        self.assertIn("concurrent-change", result[2])
-        self.assertEqual(events, ["hook", "backup", "exchange", "exchange"])
+        if _exchange_supported():
+            self.assertIn("concurrent-change", result[2])
+            self.assertEqual(events, ["hook", "backup", "exchange", "exchange"])
+        else:
+            self.assertIn("exchange-unavailable", result[2])
+            self.assertEqual(events, ["hook", "backup", "exchange"])
         self.assertEqual(self.read(self.file), late, "끼어든 기록자의 내용이 덮였다")
         self.assertEqual(self.read(self.bak), original)
         self.assertFalse(any(n.startswith((".claude.json.seed-", ".claude.json.displaced-")) and n != pf.SEED_TRUST_LOCK_NAME
@@ -2174,11 +2516,15 @@ class CodexR1Counterexamples(unittest.TestCase):
         lines = ["710001 claude HOME=" + self.root, "710002 claude --continue",
                  "710003 claude", "junk", "710004 python HOME=" + self.root]
         self.assertEqual(pf._count_claude_in_ps_lines(lines, alias, {"710003"}), (1, 4, 1))
-        self.assertEqual(pf._count_claude_in_ps_lines(lines, self.cfg, {"710003"}), (0, 4, 1))
+        # ★R3 재핀: 구분자 없는 모드의 claude+env(CLAUDE_CONFIG_DIR 없음)+비기본 대상은 0 이 아니라 unresolved → (0, 4, 2) ·
+        #   argv 경계를 주면 정확히 0 → (0, 4, 1)
+        self.assertEqual(pf._count_claude_in_ps_lines(lines, self.cfg, {"710003"}), (0, 4, 2))
+        argv = ["710001 claude", "710002 claude --continue", "710003 claude", "710004 python"]
+        self.assertEqual(pf._count_claude_in_ps_lines(lines, self.cfg, {"710003"}, argv_lines=argv), (0, 4, 1))
         with patch.object(pf.os, "getpid", return_value=710003), patch.object(pf.os, "getppid", return_value=710004):
             for cfg, expected in ((alias, 1), (self.cfg, None)):
                 count, detail = pf.claude_procs_for_config(cfg, os_name="posix", platform="darwin",
-                                                         runner=lambda cmd: (0, "\n".join(lines), ""))
+                                                         runner=_ps2("\n".join(lines)))
                 self.assertEqual(count, expected, detail)
 
     def test_15_procfs_unknown_uid_stays_unresolved_but_positive_wins(self):
@@ -2332,7 +2678,7 @@ class CodexR2Counterexamples(unittest.TestCase):
         self.assertEqual((a.read_bytes(), b.read_bytes()), (b'b', b'a'))
 
     def leftovers(self, prefix):
-        return sorted(self.cfg.glob('.claude.json.' + prefix + '-*'))
+        return sorted(p for p in self.cfg.glob('.claude.json.' + prefix + '-*') if p.name != pf.SEED_TRUST_LOCK_NAME)
 
     def test_01_probe_matrix_zero_bytes_and_exact_trust(self):
         for raw in (b'', b'{}', json.dumps({'projects': {self.key + '/':
@@ -2354,35 +2700,48 @@ class CodexR2Counterexamples(unittest.TestCase):
         self.assertEqual(self.file.stat().st_mtime_ns, before.st_mtime_ns)
         probe.assert_not_called()
 
-    def test_02_absent_link_and_exclusive_create_never_probe(self):
-        for failure, token in ((None, 'commit=link'), (errno.EPERM, 'commit=excl-create'),
-                               (errno.EXDEV, 'commit=excl-create')):
+    def test_02_absent_link_never_probes_and_link_failure_refuses(self):
+        """★R3 재핀(codex major): link 실패(EPERM/EXDEV)는 O_EXCL 배타 생성 폴백('commit=excl-create')이 아니라 REFUSE link-failed ·
+        cfg 미생성 · 프로브 0 유지."""
+        real = os.link
+        with patch.object(pf.os, 'link', side_effect=real):
+            got = self.seed(proc_counter=Mock(side_effect=AssertionError('absent probed')))
+        self.result(got, 0, 'commit=link')
+        self.assertIn('no-probe(', got[2])
+        self.assertEqual(stat.S_IMODE(self.file.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(self.file.read_bytes()), {'projects': {self.key: {'hasTrustDialogAccepted': True}}})
+        for failure in (errno.EPERM, errno.EXDEV):
             with self.subTest(failure=failure):
                 self.file.unlink(missing_ok=True)
-                real = os.link
-                with patch.object(pf.os, 'link', side_effect=real if failure is None else OSError(failure, 'injected')):
+                with patch.object(pf.os, 'link', side_effect=OSError(failure, 'injected')):
                     got = self.seed(proc_counter=Mock(side_effect=AssertionError('absent probed')))
-                self.result(got, 0, token)
+                self.result(got, 2, 'link-failed(%s' % errno.errorcode[failure])
                 self.assertIn('no-probe(', got[2])
-                self.assertEqual(stat.S_IMODE(self.file.stat().st_mode), 0o600)
-                self.assertEqual(json.loads(self.file.read_bytes()),
-                                 {'projects': {self.key: {'hasTrustDialogAccepted': True}}})
+                self.assertFalse(self.file.exists())
+                self.assertEqual(self.leftovers('seed'), [])
 
-    def test_03_exclusive_create_loses_race_without_truncating_winner(self):
+    def test_03_link_failure_never_opens_destination_for_writing(self):
+        """★R3 재핀(codex major): 종전 'O_EXCL 경합 승자 무절단' 검체를 대체 — link 실패 뒤 cfg 경로에 대한 **쓰기 open 이 0** 이어야 한다
+        (이름 선공개 경로 자체가 없다 · 승자 파일도 무접촉)."""
         real_open = os.open
         winner = b'creator\x00\xff'
         calls = []
+        writable = os.O_WRONLY | os.O_RDWR | os.O_CREAT
         def opening(path, flags, *args, **kw):
-            if os.fspath(path) == str(self.file):
+            if os.fspath(path) == str(self.file) and flags & writable:
                 calls.append(flags)
-                self.file.write_bytes(winner)
             return real_open(path, flags, *args, **kw)
         with patch.object(pf.os, 'link', side_effect=OSError(errno.EXDEV, 'injected')), \
                 patch.object(pf.os, 'open', side_effect=opening):
             got = self.seed(proc_counter=Mock(side_effect=AssertionError('absent probed')))
-        self.result(got, 2, 'concurrent-change')
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0] & os.O_EXCL)
+        self.result(got, 2, 'link-failed')
+        self.assertEqual(calls, [], 'cfg 경로를 열었다(O_EXCL 폴백 잔존)')
+        self.assertFalse(self.file.exists())
+        self.file.write_bytes(winner)
+        with patch.object(pf.os, 'link', side_effect=OSError(errno.EXDEV, 'injected')), \
+                patch.object(pf.os, 'open', side_effect=opening):
+            got = self.seed(proc_counter=lambda d: (0, 't'))
+        self.assertEqual(calls, [], calls)
         self.assertEqual(self.file.read_bytes(), winner)
 
     def test_04_exchange_uses_displaced_namespace_and_old_inode(self):
@@ -2393,7 +2752,7 @@ class CodexR2Counterexamples(unittest.TestCase):
         events = []
         def renaming(a, b):
             self.assertRegex(Path(a).name, r'^\.claude\.json\.seed-[A-Za-z0-9_]{8}$')
-            self.assertRegex(Path(b).name, r'^\.claude\.json\.displaced-\d{8}T\d{6}Z-\d+(?:-\d+)?$')
+            self.assertRegex(Path(b).name, r'^\.claude\.json\.displaced-[0-9a-f]{64}-\d{8}T\d{6}Z-\d+(?:-\d+)?$')   # ★R3: payload 지문
             events.append('rename')
             return rename(a, b)
         def swapping(a, b):
@@ -2499,23 +2858,35 @@ class CodexR2Counterexamples(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertIs(json.loads(conflicts[0].read_bytes())['projects'][self.key]['hasTrustDialogAccepted'], True)
 
-    def test_09_exchange_unavailable_is_not_exchange_error(self):
+    def test_09_exchange_unavailable_is_refusal_not_error_and_never_replaces(self):
+        """★R3 재핀(codex BLOCK): 기구 부재 = REFUSE(강행 무관 · os.replace 0 · 사유에 why) · 실 오류 = ERROR · 어느 쪽도 원본 무접촉."""
         self.file.write_bytes(b'{}')
-        with patch.object(pf, '_exchange_paths', return_value=None), \
-                patch.object(pf.os, 'replace', wraps=os.replace) as replace:
-            self.result(self.seed(), 0, 'commit=replace(교환 기구 부재')
-        self.assertEqual(replace.call_count, 1)
-        self.assertTrue(Path(replace.call_args.args[0]).name.startswith('.claude.json.displaced-'))
-        self.file.write_bytes(b'{}')
+        for unavailable, why in ((pf._ExchangeUnavailable('EXDEV'), 'EXDEV'), (None, '')):
+            for force in (False, True):
+                with self.subTest(unavailable=unavailable, force=force):
+                    with patch.object(pf, '_exchange_paths', return_value=unavailable), \
+                            patch.object(pf.os, 'replace', side_effect=AssertionError('rename-over fallback')):
+                        self.result(self.seed(force_unverified=force), 2, 'exchange-unavailable(' + why)
+                    self.assertEqual(self.file.read_bytes(), b'{}')
+                    self.assertEqual(self.leftovers('displaced'), [])
+                    self.assertEqual(self.leftovers('seed'), [])
         with patch.object(pf, '_exchange_paths', side_effect=OSError(errno.ENOENT, 'vanished')), \
                 patch.object(pf.os, 'replace', side_effect=AssertionError('error must not fall back')):
             self.result(self.seed(), 1, '쓰기 실패')
         self.assertEqual(self.file.read_bytes(), b'{}')
+        self.assertFalse(pf._ExchangeUnavailable('x'), 'ExchangeUnavailable 은 falsy 여야 한다')
+        self.assertIs(pf._exchange_paths.__globals__.get('_EXCHANGE_LAST_UNAVAILABLE'), None, '전역 가변 진단이 남아 있다')
 
     def test_10_sweep_exact_names_only_and_only_after_lock(self):
-        stale = ['.claude.json.seed-aB_019zX', '.claude.json.seed-________']
+        import hashlib
+        d_match = hashlib.sha256(b'precious').hexdigest()
+        stale = ['.claude.json.seed-aB_019zX', '.claude.json.seed-________',
+                 '.claude.json.displaced-%s-20260906T000000Z-1' % d_match]          # ★R3: 지문 일치 = payload 동등 잔재 회수
         kept = ['.claude.json.seed-lock', '.claude.json.seed-short', '.claude.json.seed-123456789',
                 '.claude.json.seed-abcd-123', '.claude.json.displaced-12345678',
+                '.claude.json.displaced-%s-20260906T000000Z-1' % ('0' * 64),          # 지문 불일치 = 낯선 inode 보존
+                '.claude.json.displaced-%s-20260906T000000Z-1' % d_match[:16],       # 16hex 구형 = 지문 없음
+                '.claude.json.conflict-%s-20260906T000000Z-1' % d_match,             # conflict 는 지문이 맞아도 무접촉
                 '.claude.json.conflict-12345678', '.claude.json.bak-preflight']
         for name in stale + kept:
             (self.cfg / name).write_bytes(b'precious')
@@ -2527,7 +2898,7 @@ class CodexR2Counterexamples(unittest.TestCase):
         with patch.object(pf, '_sweep_stale_seed_tmp', sweeping):
             self.result(self.seed(lock_fn=lambda f: False), 2, 'lock-busy')
             self.assertTrue(all((self.cfg / n).exists() for n in stale))
-            self.result(self.seed(lock_fn=lambda f: held.append(True) or True), 0, 'stale-tmp swept 2')
+            self.result(self.seed(lock_fn=lambda f: held.append(True) or True), 0, 'stale-tmp swept 3')
         self.assertTrue(all(not (self.cfg / n).exists() for n in stale))
         self.assertEqual([(self.cfg / n).read_bytes() for n in kept], [b'precious'] * len(kept))
 
@@ -2535,7 +2906,9 @@ class CodexR2Counterexamples(unittest.TestCase):
         cases = [(['node', '/x/claude-code/cli.mjs'], True),
                  (['/x/claude-code/cli.cjs'], True),
                  (['/x/claude/versions/2.1'], True), (['CLAUDE.EXE'], True),
-                 (['node', '--inspect', '/x/claude-code/cli.js'], False),
+                 (['node', '--inspect', '/x/claude-code/cli.js'], True),      # ★R3(codex): JS 런타임 뒤 어느 위치의 번들도 형상
+                 (['bun', 'run', '/x/claude-code/cli.js'], True),
+                 (['python3', 'x.py', '/x/claude-code/cli.js'], False),
                  (['tail', '/x/claude-code/debug.log'], False),
                  (['less', '/x/claude/versions/2.1'], False),
                  (['grep', 'claude.cmd'], False),
@@ -2547,7 +2920,7 @@ class CodexR2Counterexamples(unittest.TestCase):
         lines = ['1 tail /logs/claude', '2 tail /logs/claude CLAUDE_CONFIG_DIR=' + str(self.cfg),
                  '3 node --inspect /x/claude-code/cli.js', '4 node /x/claude-code/cli.mjs',
                  '5 claude.cmd', '6 claude', 'junk', '7', '']
-        self.assertEqual(pf._count_claude_in_ps_lines(lines, str(self.cfg), {'6'}), (1, 6, 2))
+        self.assertEqual(pf._count_claude_in_ps_lines(lines, str(self.cfg), {'6'}), (1, 6, 3))   # ★R3: node --inspect 도 unresolved
 
     def test_12_nonregular_and_linklike_rejected_before_open(self):
         directory = self.root / 'directory'
@@ -2618,7 +2991,7 @@ class CodexR2Counterexamples(unittest.TestCase):
     def shell(self, body, value='', home=None):
         source = Path(DEPT).read_text()
         parts = []
-        for name in ('reg_get_field', '_dept_cwd_canon', 'resolve_dept_cwd'):
+        for name in ('reg_get_field', '_dept_cwd_canon', '_dept_cwd_is_root', 'resolve_dept_cwd'):   # ★R3: 루트 판정 헬퍼 동반 추출
             m = (re.search(r'^%s\(\)\{[^\n]*\}[ \t]*$' % name, source, re.M)
                  or re.search(r'^%s\(\)\{.*?^\}$' % name, source, re.M | re.S))
             self.assertIsNotNone(m, name)
@@ -2672,6 +3045,412 @@ class CodexR2Counterexamples(unittest.TestCase):
         out, calls = self.shell('reg_get_field "department with spaces" account_dir', value='  /a\rb c  ')
         self.assertEqual(out, b'  /ab c  \n')  # bytes capture avoids universal-newline masking.
         self.assertEqual(calls, ['-', str(self.root / 'dummy-registry'), 'department with spaces', 'account_dir'])
+
+
+# ══ codex(gpt-6-astra) R3 적대 반례 — 워커가 전 행 검토 후 채택(초안 impl/codex/P1-WP2-trust-r3-tests-draft.py · 스크래치 사본에서 실행 25/27) ══
+# 채택 시 바뀐 것: T5 'python3 만' 단언 → cys/cysd 스폰 0 + coreutils 허용(위임 프롬프트의 과잉 명세) · T4 `C:\\` 실패는 스크래치 사본이
+#   _abs_str 앞 해석 수정(이 트리) 이전 스냅샷이라 여기서는 통과 · harness 참조 → 모듈 내 이름. 구현 결함 발견 0.
+class CodexR3Counterexamples(Base):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.root = Path(self.tmp)
+        # Base already isolates HOME, USERPROFILE, LOCALAPPDATA, XDG_STATE_HOME,
+        # CYS_DEPTS_JSON and JAVIS_ROOT. Keep pack/probe paths temporary as well.
+        os.environ.update(CYS_PACK_DIR=str(self.root / 'pack'),
+                          CYS_PROBE_RUNS=str(self.root / 'probes.jsonl'),
+                          PYTHONDONTWRITEBYTECODE='1')
+        self.src = Path(BIN, 'cys-dept').read_text()
+
+    def require_exchange(self):
+        a, b = self.root / 'exchange-a', self.root / 'exchange-b'
+        a.write_bytes(b'left'); b.write_bytes(b'right')
+        try:
+            try:
+                result = pf._exchange_paths(str(a), str(b))
+            except OSError as exc:
+                self.skipTest('real exchange unavailable: %s' % exc)
+            if not result:
+                self.skipTest('real exchange unavailable: %r' % result)
+            self.assertIs(result, True)
+            self.assertEqual((a.read_bytes(), b.read_bytes()), (b'right', b'left'))
+        finally:
+            a.unlink(missing_ok=True); b.unlink(missing_ok=True)
+
+    def assert_clean(self, existing):
+        expected = {pf.SEED_TRUST_LOCK_NAME}
+        if existing:
+            expected.add('.claude.json')
+        self.assertEqual(set(os.listdir(self.cfg)), expected)
+
+    def count(self, argv, envline, target='/target'):
+        return pf._count_claude_in_ps_lines([envline], target, argv_lines=argv)
+
+    def test_t1_argv_assignment_cannot_hide_real_env(self):
+        self.assertEqual(self.count(['71 claude -p CLAUDE_CONFIG_DIR=/other'],
+            '71 claude -p CLAUDE_CONFIG_DIR=/other CLAUDE_CONFIG_DIR=/target'), (1, 1, 0))
+
+    def test_t1_target_argument_is_not_env(self):
+        self.assertEqual(self.count(['71 claude -p CLAUDE_CONFIG_DIR=/target'],
+            '71 claude -p CLAUDE_CONFIG_DIR=/target CLAUDE_CONFIG_DIR=/other'), (0, 1, 0))
+
+    def test_t1_hidden_env_strict_shapes(self):
+        for command, unresolved in [('claude', 1), ('node --inspect /x/claude-code/cli.js', 1),
+                                    ('tail -f /x/logs/claude', 0),
+                                    ('python3 x.py /x/claude-code/cli.js', 0)]:
+            with self.subTest(command=command):
+                self.assertEqual(pf._is_claude_command(command.split(), strict=True), bool(unresolved))
+                line = '71 ' + command
+                self.assertEqual(self.count([line], line), (0, 1, unresolved))
+
+    def test_t1_unknown_mismatched_duplicate_argv_are_unresolved(self):
+        line = '71 claude -p changed CLAUDE_CONFIG_DIR=/other'
+        for argv in ([], ['72 claude'], ['71 claude -p old'],
+                     ['71 claude -p changed', '71 claude -p changed']):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.count(argv, line), (0, 1, 1))
+        self.assertEqual(pf._ps_argv_map(['71 claude', '71 claude', '71 claude',
+                                         '72 tail -f x', 'bad', 'xx claude']),
+                         {'71': None, '72': 'tail -f x'})
+
+    def test_t1_argv_prefix_requires_space_boundary(self):
+        # Using the default target makes a bogus env suffix produce a false positive.
+        self.assertEqual(self.count(['71 claude'], '71 claudeX HOME=/tmp',
+                                    pf._default_claude_config_dir()), (0, 1, 0))
+
+    def test_t1_delimiterless_cannot_verify_negative_claude(self):
+        cases = [('claude CLAUDE_CONFIG_DIR=/other', (0, 1, 1)),
+                 ('claude HOME=/tmp', (0, 1, 1)), ('claude', (0, 1, 1)),
+                 ('tail -f /x/logs/claude', (0, 1, 0)),
+                 ('sleep 5 CLAUDE_CONFIG_DIR=/target', (0, 1, 0)),
+                 ('claude CLAUDE_CONFIG_DIR=/other CLAUDE_CONFIG_DIR=/target', (1, 1, 0))]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(self.count(None, '71 ' + command), expected)
+
+    def test_t1_darwin_runner_order_and_failures(self):
+        argv_cmd = ['ps', '-ax', '-ww', '-o', 'pid=,command=']
+        env_cmd = ['ps', '-ax', '-ww', '-E', '-o', 'pid=,command=']
+        for fails in (False, True):
+            calls = []
+            def runner(cmd):
+                calls.append(cmd)
+                if cmd == argv_cmd:
+                    return (1, '', 'denied') if fails else (0, '987654 claude -p CLAUDE_CONFIG_DIR=/other', '')
+                self.assertEqual(cmd, env_cmd)
+                return 0, '987654 claude -p CLAUDE_CONFIG_DIR=/other CLAUDE_CONFIG_DIR=/target', ''
+            with self.subTest(argv_failure=fails):
+                n, _ = pf.claude_procs_for_config('/target', runner, 'posix', 'darwin')
+                self.assertEqual(n, None if fails else 1)
+                self.assertEqual(calls, [argv_cmd] if fails else [argv_cmd, env_cmd])
+        def forbidden(cmd):
+            self.fail('ambiguous target must be refused before ps: %r' % cmd)
+        self.assertIsNone(pf.claude_procs_for_config('/target X=y', forbidden, 'posix', 'darwin')[0])
+
+    def test_t1_env_value_assignment_never_verified_zero(self):
+        for argv in (None, ['71 claude']):
+            with self.subTest(argv=argv):
+                n, parsed, unresolved = self.count(argv,
+                    '71 claude CLAUDE_CONFIG_DIR=/other FOO=a CLAUDE_CONFIG_DIR=/target')
+                self.assertEqual(parsed, 1)
+                self.assertGreater(n + unresolved, 0)
+
+    def test_t2_unavailable_never_replace_even_forced(self):
+        self.untrusted_file('{"foreign":"keep exactly", "projects":{}}\n')
+        original = _read_bytes(self.cfgfile)
+        self.assertFalse(pf._ExchangeUnavailable('ENOTSUP'))
+        for unavailable in (pf._ExchangeUnavailable('ENOTSUP'), None):
+            for force in (False, True):
+                with self.subTest(unavailable=unavailable, force=force):
+                    with patch.object(pf, '_exchange_paths', return_value=unavailable) as swap, \
+                         patch.object(pf.os, 'replace', side_effect=AssertionError('lossy replacement')) as replace:
+                        rc, verdict, reason = self.seed(force_unverified=force)
+                    self.assertEqual((rc, verdict), (2, 'REFUSE'), reason)
+                    self.assertIn('exchange-unavailable(', reason)
+                    if unavailable is not None:
+                        self.assertIn('exchange-unavailable(ENOTSUP', reason)
+                    swap.assert_called_once(); replace.assert_not_called()
+                    self.assertEqual(_read_bytes(self.cfgfile), original)
+                    self.assert_clean(existing=True)
+
+    def test_t2_exchange_oserror_keeps_foreign_bytes(self):
+        self.untrusted_file('{"foreign":"keep"}')
+        original = _read_bytes(self.cfgfile)
+        with patch.object(pf, '_exchange_paths', side_effect=OSError(errno.EIO, 'r3-exchange-failed')), \
+             patch.object(pf.os, 'replace', side_effect=AssertionError('lossy replacement')):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, 'ERROR'), reason)
+        self.assertIn('r3-exchange-failed', reason)
+        self.assertEqual(_read_bytes(self.cfgfile), original)
+        self.assert_clean(existing=True)
+
+    def test_t2_link_errors_never_publish_or_open_writable(self):
+        real_open = os.open
+        for code in (errno.EPERM, errno.EXDEV, errno.ENOSPC, errno.EIO):
+            opens = []
+            def observe(path, flags, *args, **kwargs):
+                opens.append((os.fspath(path), flags))
+                if os.path.abspath(os.fspath(path)) == self.cfgfile:
+                    self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC),
+                                     'cfg opened for writing before atomic publication')
+                return real_open(path, flags, *args, **kwargs)
+            with self.subTest(errno=errno.errorcode[code]):
+                with patch.object(pf.os, 'link', side_effect=OSError(code, 'injected')) as link, \
+                     patch.object(pf.os, 'open', side_effect=observe):
+                    rc, verdict, reason = self.seed()
+                link.assert_called_once()
+                self.assertEqual((rc, verdict), (2, 'REFUSE'), reason)
+                self.assertIn('link-failed(' + errno.errorcode[code], reason)
+                self.assertTrue(any(Path(path).name == pf.SEED_TRUST_LOCK_NAME
+                                    for path, flags in opens), 'open spy did not observe lock')
+                self.assertFalse(os.path.lexists(self.cfgfile))
+                self.assert_clean(existing=False)
+
+    def test_t2_surrogate_preserved_and_cli_no_traceback(self):
+        self.require_exchange()
+        raw = r'{"projects":{"/x":{"note":"\ud800"}}}'
+        self.untrusted_file(raw)
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (0, 'OK'), reason)
+        self.assertIn('ascii-escaped', reason)
+        self.assertEqual(_read_json(self.cfgfile)['projects']['/x']['note'], '\ud800')
+        self.assertIs(_read_json(self.cfgfile)['projects'][self.key]['hasTrustDialogAccepted'], True)
+        self.untrusted_file(raw)  # CLI must serialize too, not just take already-trusted.
+        rc, out, err = seed_cli(self.cfg, self.ws)
+        self.assertEqual(rc, 0, (out, err))
+        self.assertNotIn('Traceback', err)
+        self.assertIn('ascii-escaped', out)
+        self.assertEqual(_read_json(self.cfgfile)['projects']['/x']['note'], '\ud800')
+        self.assertIs(_read_json(self.cfgfile)['projects'][self.key]['hasTrustDialogAccepted'], True)
+
+    def test_t2_post_commit_refuse_and_error_keep_commit_note(self):
+        real_link = os.link
+        for foreign, expected in [(b'{"foreign":42}', (2, 'REFUSE')), (b'{broken', (1, 'ERROR'))]:
+            with self.subTest(expected=expected):
+                Path(self.cfgfile).unlink(missing_ok=True)
+                def commit_then_foreign(src, dst):
+                    real_link(src, dst)
+                    Path(dst).write_bytes(foreign)
+                with patch.object(pf.os, 'link', side_effect=commit_then_foreign) as link:
+                    rc, verdict, reason = self.seed()
+                link.assert_called_once()
+                self.assertEqual((rc, verdict), expected, reason)
+                self.assertIn('commit=link', reason)
+                self.assertEqual(_read_bytes(self.cfgfile), foreign)
+
+    def test_t3_crash_before_exchange_is_swept_on_retry(self):
+        self.require_exchange()
+        self.untrusted_file('{"foreign":"original"}')
+        before = _read_bytes(self.cfgfile)
+        with patch.object(pf, '_exchange_paths', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        self.assertEqual(_read_bytes(self.cfgfile), before)
+        displaced = list(Path(self.cfg).glob('.claude.json.displaced-*'))
+        self.assertEqual(len(displaced), 1)
+        payload = displaced[0].read_bytes()
+        self.assertIs(json.loads(payload)['projects'][self.key]['hasTrustDialogAccepted'], True)
+        self.assertIn(hashlib.sha256(payload).hexdigest(), displaced[0].name)
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (0, 'OK'), reason)
+        self.assertIn('stale-tmp swept 1', reason)
+        self.assertIn('commit=exchange', reason)
+        self.assertFalse(displaced[0].exists())
+        self.assert_clean(existing=True)
+
+    def test_t3_digest_is_full_sha256(self):
+        payload = b'not a truncated digest\x00\xff'
+        expected = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(pf._payload_digest(payload), expected)
+        self.assertEqual(len(pf._payload_digest(payload)), 64)
+        self.assertIsNone(pf._SEED_DISPLACED_RE.match('.claude.json.displaced-' + expected[:16] + '-x'))
+        self.assertIsNotNone(pf._SEED_DISPLACED_RE.match('.claude.json.displaced-' + expected + '-x'))
+
+    def test_t3_sweep_preserves_foreign_legacy_symlink_fifo_conflict(self):
+        os.makedirs(self.cfg)
+        data = b'precious foreign bytes'
+        digest = hashlib.sha256(data).hexdigest()
+        prefix = '.claude.json.displaced-'
+        protected = {}
+        for name, content in [(prefix + digest + '-mismatch', b'different bytes'),
+                              (prefix + '20260906T000000Z-1', data),
+                              ('.claude.json.conflict-' + digest + '-x', data),
+                              (prefix + digest[:16] + '-short', data)]:
+            path = Path(self.cfg, name); path.write_bytes(content); protected[path] = content
+        target = self.root / 'symlink-target'; target.write_bytes(data)
+        symlink = Path(self.cfg, prefix + digest + '-symlink'); symlink.symlink_to(target)
+        fifo = Path(self.cfg, prefix + digest + '-fifo'); os.mkfifo(fifo)
+        good = Path(self.cfg, prefix + digest + '-good'); good.write_bytes(data)
+        # Run in a child with Python's portable timeout: a wrong FIFO open cannot hang the suite.
+        script = ('import sys; sys.path.insert(0, sys.argv[1]); import javis_preflight as pf; '
+                  'print(pf._sweep_stale_seed_tmp(sys.argv[2]))')
+        try:
+            r = subprocess.run([sys.executable, '-c', script, BIN, self.cfg],
+                               capture_output=True, text=True, env=dict(os.environ), timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail('sweep hung while encountering a FIFO')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, '1\n')
+        self.assertFalse(good.exists(), 'positive control was not swept')
+        for path, content in protected.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertTrue(symlink.is_symlink()); self.assertEqual(target.read_bytes(), data)
+        self.assertTrue(stat.S_ISFIFO(fifo.lstat().st_mode))
+
+    def registry(self, entries):
+        os.makedirs(self.cfg, exist_ok=True)
+        path = Path(os.environ['CYS_DEPTS_JSON']); path.parent.mkdir(parents=True, exist_ok=True)
+        _write(path, json.dumps({'depts': entries}))
+        # Match RegistryC58's full-scope fixture; all discovered paths are under HOME.
+        with patch.object(pf, '_discover_isolation_block', return_value=(None, None)):
+            return pf.cysjavis_registry()
+
+    def test_t4_catalog_roots_absent_and_physical_paths(self):
+        alias = self.root / 'root-alias'; alias.symlink_to('/')
+        for value in ('/', '///', str(self.root / 'absent'), str(alias), self.ws):
+            with self.subTest(cwd=value):
+                reg = self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': value}})
+                expected = self.key if value == self.ws else os.path.realpath(self.home)
+                self.assertEqual(set(reg['pairs'].get(pf._path_identity(self.cfg), {})), {expected})
+                p = _IsoEnv._pf(False); p._registry_cache = reg
+                gaps = p._trust_gap_workspaces(self.cfgfile)
+                self.assertEqual([pf.claude_project_key(x) for x in gaps], [expected])
+                self.assertNotIn('/', gaps)
+                self.assertTrue(all(os.path.isdir(x) for x in gaps))
+
+    def test_t4_catalog_windows_root_maps_to_home(self):
+        reg = self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': 'C:\\'}})
+        self.assertEqual(set(reg['pairs'].get(pf._path_identity(self.cfg), {})),
+                         {os.path.realpath(self.home)}, 'drive root must reach catalog resolver on POSIX too')
+
+    def test_t4_relative_catalog_excluded_topology_root_preserved(self):
+        hub = Path(pf._hub_state_dir()); hub.mkdir(parents=True)
+        _write(hub / 'topology.json', json.dumps({'entries': [
+            {'agent': 'claude', 'claude_config_dir': self.cfg, 'cwd': '/'}]}))
+        reg = self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': 'relative/work'}})
+        self.assertEqual(reg['pairs'][pf._path_identity(self.cfg)], {'/': '/'})
+        # Root filtering above is a catalog contract; observed topology is intentionally retained.
+
+    def shell_functions(self, body):
+        parts = []
+        for name in ('_dept_cwd_canon', '_dept_cwd_is_root', 'resolve_dept_cwd'):
+            m = (re.search(r'^%s\(\)\{[^\n]*\}[ \t]*$' % name, self.src, re.M)
+                 or re.search(r'^%s\(\)\{.*?^\}$' % name, self.src, re.M | re.S))
+            self.assertIsNotNone(m, name); parts.append(m.group())
+        driver = 'set -eu\nreg_get_field(){ :; }\n' + '\n'.join(parts) + '\n' + body
+        return subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', driver],
+                              capture_output=True, text=True, cwd=self.tmp, env=dict(os.environ), timeout=10)
+
+    def test_t4_bash_python_absolute_physical_parity(self):
+        for value in ('/', '///', 'C:\\', self.ws, self.ws + '/', str(self.root / 'missing')):
+            with self.subTest(cwd=value):
+                r = self.shell_functions('resolve_dept_cwd %s ""' % shlex.quote(value))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                expected = pf.claude_project_key(pf._resolve_catalog_cwd(value, home=self.home))
+                self.assertEqual(r.stdout, expected + '\n')
+                self.assertEqual(r.stderr, '')
+                self.assertTrue(os.path.isabs(expected))
+                root = self.shell_functions('_dept_cwd_is_root %s' % shlex.quote(value))
+                self.assertEqual(root.returncode, 0 if pf._is_root_cwd(value) else 1)
+
+    def dept(self, name):
+        stub = Path(self.home, '.local', 'bin'); stub.mkdir(parents=True, exist_ok=True)
+        calls = self.root / 'children'
+        # cys-dept prepends this HOME directory itself. Prevent host cys/cysd resolution.
+        for command in ('cys', 'cysd'):
+            _write(stub / command, '#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(command) +
+                   ' >> "$R3_CALLS"\nexit 97\n', 0o755)
+        for command in ('python3', 'grep', 'tr', 'tail'):
+            real = sys.executable if command == 'python3' else shutil.which(command)
+            self.assertIsNotNone(real)
+            _write(stub / command, '#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(command) +
+                   ' >> "$R3_CALLS"\nexec ' + shlex.quote(real) + ' "$@"\n', 0o755)
+        calls.unlink(missing_ok=True)
+        env = dict(os.environ, PATH=str(stub) + ':/usr/bin:/bin', R3_CALLS=str(calls))
+        r = subprocess.run(['/bin/bash', str(Path(BIN, 'cys-dept')), 'cwd', name],
+                           capture_output=True, text=True, cwd=self.tmp, env=env, timeout=10)
+        spawned = calls.read_text().splitlines() if calls.exists() else []
+        self.assertNotIn('cys', spawned); self.assertNotIn('cysd', spawned)
+        return r, spawned
+
+    def test_t5_absent_registry_stays_absent(self):
+        path = Path(os.environ['CYS_DEPTS_JSON'])
+        self.assertFalse(path.exists())
+        r, _ = self.dept('dept-1')
+        self.assertEqual(r.returncode, 3, r.stderr); self.assertEqual(r.stdout, '')
+        self.assertFalse(path.exists()); self.assertFalse(path.parent.exists())
+
+    def test_t5_unregistered_and_malformed_are_read_only(self):
+        path = Path(os.environ['CYS_DEPTS_JSON']); path.parent.mkdir(parents=True)
+        for raw in ('{"depts":{"someone-else":{}}}\n', '{malformed\n'):
+            with self.subTest(raw=raw):
+                _write(path, raw); before = path.read_bytes()
+                r, _ = self.dept('dept-1')
+                self.assertEqual(r.returncode, 3, r.stderr); self.assertEqual(r.stdout, '')
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_t5_unreadable_registry_is_read_only(self):
+        self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': self.ws}})
+        path = Path(os.environ['CYS_DEPTS_JSON'])
+        before = path.read_bytes()
+        path.chmod(0)
+        try:
+            if os.access(path, os.R_OK):
+                self.skipTest('effective user can read mode-000 files')
+            r, _ = self.dept('dept-1')
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertEqual(r.stdout, '')
+        finally:
+            path.chmod(0o600)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_t5_registered_root_and_real_directory(self):
+        alias = self.root / 'workspace-alias'; alias.symlink_to(self.ws)
+        for value, expected in [('/', os.path.realpath(self.home)), (self.ws, self.key), (str(alias), self.key)]:
+            with self.subTest(cwd=value):
+                self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': value}})
+                path = Path(os.environ['CYS_DEPTS_JSON']); before = path.read_bytes()
+                r, _ = self.dept('dept-1')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, expected + '\n')
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_t5_bad_names(self):
+        for name in ('', '-x'):
+            with self.subTest(name=name):
+                r, _ = self.dept(name)
+                self.assertEqual(r.returncode, 2, r.stderr); self.assertEqual(r.stdout, '')
+                self.assertFalse(Path(os.environ['CYS_DEPTS_JSON']).exists())
+
+    def test_t5_cwd_spawns_only_python3_and_coreutils(self):
+        # 워커 검토 수정: 위임 프롬프트의 'python3 만' 은 과잉 명세 — 읽기 전용 계약은 cys/cysd 스폰 0(dept() 가 단언)이고
+        #   reg_names/reg_get_field 파이프라인의 coreutils(grep/tr/tail)는 허용된다.
+        self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': self.ws}})
+        r, spawned = self.dept('dept-1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('python3', spawned, 'child-command spy positive control')
+        self.assertLessEqual(set(spawned), {'python3', 'grep', 'tr', 'tail'}, spawned)
+
+    def test_t6_c58_exception_warns_and_continues_success(self):
+        second = self.root / 'zz-second'; second.mkdir()
+        reg = self.registry({'dept-1': {'account_dir': self.cfg, 'cwd': self.ws},
+                             'dept-2': {'account_dir': self.cfg, 'cwd': str(second)}})
+        p = _IsoEnv._pf(True); p._registry_cache = reg
+        def seed(config, cwd, **kw):
+            self.assertEqual(config, self.cfg); self.assertTrue(kw['backup'])
+            if cwd == self.ws:
+                raise RuntimeError('r3-injected-failure')
+            self.assertEqual(cwd, str(second))
+            return 0, 'OK', 'seeded(r3-success)'
+        with patch.object(pf, 'seed_trust', side_effect=seed) as mock_seed:
+            p.c58_trust_harden()
+        self.assertEqual([call.args[1] for call in mock_seed.call_args_list], [self.ws, str(second)])
+        self.assertEqual(len(p.results), 1)
+        result = p.results[0]
+        self.assertEqual(result['id'], 'C58.trust-harden'); self.assertEqual(result['status'], pf.WARN)
+        self.assertIn('RuntimeError', result['detail']); self.assertIn('r3-injected-failure', result['detail'])
+        self.assertIn('trust set:', result['detail']); self.assertIn(str(second), result['detail'])
+        self.assertIn('seeded(r3-success)', result['detail'])
 
 
 if __name__ == "__main__":
