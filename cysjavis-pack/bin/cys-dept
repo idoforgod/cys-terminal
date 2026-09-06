@@ -573,7 +573,9 @@ PY
 # ★복원 규약(3순위): ①명시 env(CYS_ACCOUNT_DIR) ②레지스트리 `account_dir`(create·allocate 기록)
 #   ③부서 팩 agents.json 의 현재 CLAUDE_CONFIG_DIR. 유도값이 없으면 계정격리를 쓰지 않는 부서
 #   (구 launch 산출)이므로 **무동작**(회귀 0).
-reg_get_field(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY'
+# ★WP-2 R2(리뷰): `| tr -d '\r'` 를 정의 1지점에 — Windows 네이티브 python 은 \r\n 을 찍어 호출부의 `[ -d "$c" ]`·
+#   `[ -n ]` 비교가 조용히 어긋난다(reg_count/reg_names 는 이미 벗긴다 · 호출부 3곳 :631/:777/:1195 전부 이 한 곳으로 해결).
+reg_get_field(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY' | tr -d '\r'
 import json,sys
 p,n,f=sys.argv[1:4]
 try: d=json.load(open(p))
@@ -772,14 +774,26 @@ seed_trust_acct(){
 #   달랐다). 우선순위 ①명시(CYS_DEPT_CWD / create 카탈로그 cwd) ②레지스트리 등재 cwd(create 가 기록 · rotate/launch 복원)
 #   ③$HOME. 존재하지 않는 dir 는 건너뛴다(PTY 생성 실패 = 좌석 0 · 봉인표 ④ 방향 금지). "/" 는 $HOME 으로(cys.rs
 #   run_launch_agent_opts 루트 cwd 교정과 동일 — 시드 "/" 와 기동 $HOME 이 갈리지 않게). 출력 1줄 · 항상 rc 0.
+# ★R2(리뷰 codex): 채택한 dir 는 **절대·물리 경로**로 확정한다(`cd -P && pwd -P`) — `CYS_DEPT_CWD=.` 같은 상대값이 `[ -d ]` 를
+#   통과해 시드(절대경로만 · ERROR)와 편성(".") 이 갈리던 것. 물리 경로인 이유: `symlink/..` 를 논리 cd 는 사전식으로 접지만
+#   claude 의 chdir 은 커널이 물리적으로 푼다 → 시드 키(realpath)와 좌석 getcwd 가 갈릴 수 있다. pwd -P 는 POSIX 에서
+#   claude_project_key 와 같은 값. $HOME 폴백도 같은 규칙(실패 시 원문). CDPATH 는 서브셸에서 벗긴다(상대값 cd 가 CDPATH 로
+#   튀어 stdout 을 더럽히는 것 차단). 등재 cwd 조회(python 1회)는 명시값이 못 쓸 때만(rotate 핫패스 spawn 절약).
+_dept_cwd_canon(){ ( unset CDPATH; cd -P -- "$1" 2>/dev/null && pwd -P ) 2>/dev/null || true; }
 resolve_dept_cwd(){
-  local explicit="$1" name="${2:-}" c
-  for c in "$explicit" "$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; do
+  local explicit="$1" name="${2:-}" c r src
+  for src in explicit registry; do
+    if [ "$src" = explicit ]; then c="$explicit"
+    else c="$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; fi
     [ -n "$c" ] || continue
     [ "$c" = "/" ] && c="$HOME"
-    if [ -d "$c" ]; then echo "$c"; return 0; fi
+    if [ -d "$c" ]; then
+      r="$(_dept_cwd_canon "$c")"
+      [ -n "$r" ] && [ "$r" != "/" ] && { printf '%s\n' "$r"; return 0; }
+    fi
   done
-  echo "$HOME"; return 0
+  r="$(_dept_cwd_canon "$HOME")"
+  printf '%s\n' "${r:-$HOME}"; return 0
 }
 
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).

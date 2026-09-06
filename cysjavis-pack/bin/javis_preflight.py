@@ -15,6 +15,7 @@
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -4179,21 +4180,9 @@ class Preflight:
             self.__dict__["_registry_cache"] = cache
         return cache
 
-    def _is_cysjavis_workspace(self, path, config_dir=None):
-        """결정론 판정 — 이 워크스페이스가 cysjavis 레지스트리에 등재된 좌석 cwd 인가(config_dir 를 주면
-        그 config 와의 **쌍**으로 판정). 등재 외 항목·stale 경로(dir 부재)는 False(blanket 신뢰 차단 · 티켓 §②).
-        마커 파일 요구 없음 — 근거는 데몬이 기록한 topology 로스터다."""
-        try:
-            if not isinstance(path, str) or not path or not os.path.isdir(path):
-                return False
-        except (OSError, ValueError):
-            return False
-        pairs = self._registry()["pairs"]
-        ident = _path_identity(path)
-        if config_dir is None:
-            return any(ident in v for v in pairs.values())
-        return ident in pairs.get(_path_identity(config_dir), {})
-
+    # ★R2(리뷰): 종전 `_is_cysjavis_workspace`(0.14.30 의 _round/·CLAUDE.md 마커 판정 → R1 에서 레지스트리 동일성 판정으로
+    #   고쳐 둔 것)는 **삭제** — 생산 호출자 0 이었고 동일성(_path_identity) 판정이 아래 정확 키 판정과 갈릴 수 있었다.
+    #   워크스페이스 판정은 `_trust_gap_workspaces` 하나(등재 쌍 → 정확 키)다.
     def _trust_gap_workspaces(self, config_path):
         """읽기전용 탐지 — .claude.json 미변경. 그 config 에 등재된 좌석 cwd 중 projects[claude_project_key(cwd)] 의
         hasTrustDialogAccepted 가 True 가 아닌 것 — **항목 부재도 갭** · 별칭 키(꼬리 슬래시·심링크)의 true 는 인정하지 않는다
@@ -5850,14 +5839,26 @@ class Preflight:
 #     매번 'REFUSE live-claude' WARN 을 내던 것) ④쓰기가 필요할 때만 라이브 claude(그 CLAUDE_CONFIG_DIR) 0 확인 — 검증
 #     불가는 **거부**(--force-unverified 만 그 단계를 넘긴다 · 잠금·대조는 넘기지 못한다 · 양성 관측 n>0 은 강행으로도
 #     못 넘는다) ⑤비차단 파일 잠금(phoenix _try_lock_nb 동형 · fcntl 은 Windows ImportError) — 기구 미가용도 거부
-#   ⑥교체 **직전** 존재+바이트 대조(clobber 창 최소화) ⑦같은 dir mkstemp+fsync+교체 前 임시파일 되읽기+os.replace(원자)
+#   ⑥교체 **직전** 존재+바이트 대조(값싼 선검사) ⑦같은 dir mkstemp+fsync+교체 前 임시파일 되읽기 → **무손실 커밋(R2)**:
+#     기존 파일 = 원자 **교환**(darwin renamex_np RENAME_SWAP · linux renameat2 RENAME_EXCHANGE) 뒤 교환되어 나온 옛 inode
+#     (= 교환 순간 .claude.json 에 있던 것 그대로)를 읽어 캡처 바이트와 대조 — 같으면 폐기(우리 계획의 전제가 참이었다) ·
+#     다르면 **되교환**(상대 inode 를 그대로 복원) 후 REFUSE concurrent-change(되교환 뒤 우리 inode 에 제3의 쓰기가 앉았으면
+#     .conflict-<utc> 로 보존) · 부재 파일 = `os.link`(원자 create-if-absent · 생겨나 있으면 REFUSE) · 기구 부재(Windows ·
+#     교환 미지원 FS) = os.replace 폴백(대조~교체 마이크로초 창이 **남는다** — 아래 고지)
 #   ⑧교체 後 되읽기 — 불일치/판독 실패에도 **롤백하지 않는다**(R1 · codex: 잠금은 우리끼리의 advisory 라 그 사이 쓴 claude/
 #     C43/Rust 시더의 내용을 원본으로 되돌리면 그쪽 데이터를 파괴한다 · 임시파일 검증을 통과한 내용이 커밋됐으므로 남는
-#     쪽이 안전) ⑨.claude.json 심링크/정션 거부(모든 읽기 O_NOFOLLOW · 교체 직전 재검).
-# 정직한 한계(R1 · codex): 이 프로토콜은 **협조하지 않는 기록자**(claude 자신 · C43 _enable_mcp_server · Rust
-#   seed_first_run_gates_at)와의 경합을 원리적으로 닫지 못한다 — 대조~교체 사이 마이크로초 창, 프로브 뒤 claude 기동 창은
-#   남는다. 남는 창에서의 결과는 '우리 플래그 1개가 덮임'(= 종전 상태 · 2차 방어가 받는다) 또는 '상대 내용 보존·우리 REFUSE'
-#   이지 상대 데이터 파괴가 아니다(롤백 0 · 백업은 캡처한 바이트로 배타 생성).
+#     쪽이 안전) ⑨.claude.json 심링크/정션 거부(모든 읽기 O_NOFOLLOW · 교체 직전 재검 · 교환되어 나온 inode 도 재검)
+#   ⑩라이브 claude 프로브는 **기존 문서가 있을 때만**(R2 · 리뷰): 프로브가 지키는 것은 라이브 claude 가 메모리에 든 기존
+#     .claude.json 이다 — 파일이 없으면(fresh fork = cys-dept allocate/create 의 주경로) 지킬 것이 없고 최악은 '동시 기동한
+#     claude 의 첫 쓰기가 우리 플래그 1개를 덮음'(= 종전 상태 · 2차 방어). Windows 는 env 미노출로 config 귀속이 원리적으로
+#     불가해 종전엔 hub 좌석(node/claude 상존) 아래의 **모든** 시드가 REFUSE unverified 였다(WP-2 가 Windows 에서 inert) →
+#     이 규칙으로 신규 부서 경로는 Windows 에서도 기본값으로 동작 · 기존 문서+플래그 부재(0.14.30 이전 dir 의 rotate) 만 잔여
+#     degraded(WARN · --force-unverified 또는 수동 시드).
+#   ⑪잠금 아래에서 죽은 시더의 임시파일(.claude.json.seed-<8자>)을 청소(R2 · SIGKILL 잔재).
+# 정직한 한계: 프로브 뒤 claude 기동 창(우리 플래그 1개가 덮일 수 있음 = 종전 상태 · 2차 방어가 받는다)과 **교환 기구가 없는
+#   플랫폼**(Windows · 미지원 FS)의 대조~os.replace 마이크로초 창은 남는다 — 후자는 '상대 1회 쓰기가 우리 문서(직전 내용+플래그
+#   1)로 덮임'. 교환 기구가 있는 곳(darwin APFS/HFS+ · linux ≥3.15/glibc≥2.28)에서는 그 창이 **닫힌다**(R2 · 리뷰 codex BLOCK).
+#   어느 경로에도 상대 데이터 파괴는 없다(롤백 0 · 백업은 캡처한 바이트로 배타 생성 · 되교환은 상대 inode 그대로).
 # 실패 방향: 전부 REFUSE(rc 2)/ERROR(rc 1) — 부분 쓰기 0 · 좌석 접촉 0. 호출자(cys-dept)는 fail-open(WARN 1줄 + 계속):
 #   거부된 시드 = 종전과 같은 상태이고 2차 방어(restore 준비 판정의 관문 보류)가 뒤에 있다.
 # 키 정책(R1 · codex): claude 가 읽는 키는 process.cwd() = getcwd() **정확 문자열 하나**(POSIX 심링크 해소 물리 경로 =
@@ -5866,7 +5867,14 @@ class Preflight:
 #   정확 키를 false 로 남겼다). 파일시스템 동일성(_path_identity)은 **레지스트리 등재 판정·프로세스 env 대조** 전용.
 SEED_TRUST_OK, SEED_TRUST_ERROR, SEED_TRUST_REFUSE = 0, 1, 2
 SEED_TRUST_LOCK_NAME = ".claude.json.seed-lock"
+SEED_TRUST_TMP_PREFIX = ".claude.json.seed-"
+SEED_TRUST_DISPLACED_PREFIX = ".claude.json.displaced-"   # 교환 전에 옮겨 두는 이름 — 교환 뒤 옛 inode 가 여기 앉는다(청소 대상 아님)
+SEED_TRUST_CONFLICT_PREFIX = ".claude.json.conflict-"     # 되교환 창의 제3 쓰기 보존 — 자동 삭제 0
+_SEED_TMP_LITTER_RE = re.compile(r"^\.claude\.json\.seed-[A-Za-z0-9_]{8}$")   # mkstemp 접미 8자만(잠금 -lock · displaced · conflict 제외)
 _CLAUDE_EXE_NAMES = ("claude", "claude.exe", "claude.cmd")
+_CLAUDE_INSTALL_MARKER = "/claude/versions/"        # 공식 설치 레이아웃 ~/.local/share/claude/versions/<ver>(직접 exec 형상)
+_CLAUDE_NPM_MARKER = "/claude-code/"                # npm @anthropic-ai/claude-code/cli.js(node 인터프리터 형상)
+_JS_SUFFIXES = (".js", ".mjs", ".cjs")
 _PS_ENV_SPLIT_RE = re.compile(r"\s+(?=[A-Za-z_][A-Za-z0-9_]*=)")
 # Windows: Win32_Process 는 환경변수를 노출하지 않는다 → claude 실행 형상 전역 계수(자기·부모 제외). ★R1(codex): claude.exe/
 #   claude 는 **이름만으로** 센다(CommandLine 이 null/빈 프로세스가 사라져 '검증된 0' 이 되던 것) · node 는 CommandLine 에
@@ -5990,18 +5998,34 @@ def _run_capture(cmd, timeout=15):
         return 127, "", "runner error: %s" % e
 
 
-def _is_claude_command(tokens):
+def _is_claude_command(tokens, strict=False):
     """argv 토큰열이 claude 실행 형상인가 — **구조** 판정: 어느 토큰의 basename 이 claude/claude.exe/claude.cmd 이거나
     경로에 claude-code(npm cli.js)가 있을 때만. 인자 문자열 속 '.claude' 경로(예: --config …/claude-default-dept-3)로는
-    매칭되지 않는다(codex 6 — 검사기 자기매칭 차단)."""
-    for t in tokens:
+    매칭되지 않는다(codex 6 — 검사기 자기매칭 차단).
+    ★R2(리뷰 · Rust governance.rs argv[0] 승격 미러): strict=True 는 **argv[0] 의 basename** 이 claude 이름이거나 어느 토큰이
+    claude-code(npm cli.js) 경로일 때만 — `tail -f …/logs/claude`·`less ~/.local/bin/claude`·`grep … claude`·
+    `zsh -lc '…; claude'` 같은 **인자에 claude 가 실리는 비-에이전트**를 제외한다. env 가 안 보이는 줄(darwin ps -E 가 env 를
+    숨기는 Apple 플랫폼 바이너리 = 바로 그 tail/less/grep/zsh)은 strict 로만 unresolved 후보가 된다 — 종전엔 그런 프로세스
+    1개가 함대 전체의 시드를 REFUSE unverified 로 돌렸다(실측: `tail -f <dir>/logs/claude` 1건 → rc 2)."""
+    for i, t in enumerate(tokens):
         raw = t.strip("\"'")
         if not raw:
             continue
-        b = os.path.basename(raw.replace("\\", "/")).lower()
-        if b in _CLAUDE_EXE_NAMES:
+        norm = raw.replace("\\", "/")
+        low = norm.lower()
+        if strict:
+            # argv[0]: 실행파일 이름 또는 공식 설치 경로 · argv[0..1]: node 인터프리터 + claude-code 패키지의 .js 번들만
+            #   (`tail -f /x/claude-code/debug.log` 같은 인자 속 패키지 세그먼트는 형상 아님 · codex R2)
+            if i == 0 and (os.path.basename(norm).lower() in _CLAUDE_EXE_NAMES or _CLAUDE_INSTALL_MARKER in low):
+                return True
+            if i <= 1 and _CLAUDE_NPM_MARKER in low and low.endswith(_JS_SUFFIXES):
+                return True
+            if i >= 1:
+                break
+            continue
+        if "claude-code" in low or _CLAUDE_INSTALL_MARKER in low:
             return True
-        if "claude-code" in raw.lower().replace("\\", "/"):
+        if os.path.basename(norm).lower() in _CLAUDE_EXE_NAMES:
             return True
     return False
 
@@ -6030,10 +6054,12 @@ def _count_claude_in_ps_lines(lines, config_dir, self_pids=()):
             continue
         segs = _PS_ENV_SPLIT_RE.split(parts[1])
         cmd_tokens = segs[0].split()
-        if not _is_claude_command(cmd_tokens):
-            continue
         if len(segs) == 1:
-            unresolved += 1
+            # env 비노출 줄: argv[0]/claude-code 엄격 형상만 unresolved(R2) — 인자 속 claude 토큰(tail/less/grep)은 형상 아님
+            if _is_claude_command(cmd_tokens, strict=True):
+                unresolved += 1
+            continue
+        if not _is_claude_command(cmd_tokens):
             continue
         cfg_val = None
         for seg in segs[1:]:
@@ -6160,6 +6186,8 @@ def _read_claude_json_bytes(cfg):
         return False, b"", None
     if _is_link_like(cfg):
         raise ValueError("symlink 거부: %s" % cfg)
+    if not stat.S_ISREG(os.lstat(cfg).st_mode):
+        raise ValueError("정규 파일이 아니다(FIFO/장치/디렉터리) 거부: %s" % cfg)   # FIFO 는 open 에서 막힌다 — 열기 전에 거른다(R2)
     with os.fdopen(_open_nofollow(cfg, os.O_RDONLY), "rb") as f:
         raw = f.read()
         st = os.fstat(f.fileno())
@@ -6173,12 +6201,143 @@ def _parse_claude_json(existed, raw):
     return json.loads(raw.decode("utf-8-sig"))
 
 
+def _exchange_paths(a, b):
+    """두 경로의 **원자 교환**(a ↔ b) → True(교환됨) · None(기구 부재 — 호출자가 os.replace 로 폴백) · OSError(실 오류).
+    darwin: renamex_np(from, to, RENAME_SWAP=0x2)(macOS 10.12+ · APFS/HFS+) · linux: renameat2(AT_FDCWD, from, AT_FDCWD, to,
+    RENAME_EXCHANGE=2)(커널 3.15+ · glibc 2.28+ 심볼) · 그 외(Windows 포함) None. 미지원 FS(ENOTSUP/EOPNOTSUPP/EINVAL/ENOSYS/
+    EXDEV)도 None. ctypes 는 함수 안에서만 import(Windows 경로는 import 전에 None)."""
+    if os.name != "posix":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    except Exception:  # noqa: BLE001 — 기구 부재는 폴백이지 실패가 아니다
+        return None
+    if sys.platform == "darwin":
+        fn = getattr(libc, "renamex_np", None)
+        if fn is None:
+            return None
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(os.fsencode(a), os.fsencode(b), 0x2)
+    elif sys.platform.startswith("linux"):
+        fn = getattr(libc, "renameat2", None)
+        if fn is None:
+            return None
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(-100, os.fsencode(a), -100, os.fsencode(b), 2)     # AT_FDCWD = -100
+    else:
+        return None
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS, errno.EXDEV):
+        _EXCHANGE_LAST_UNAVAILABLE[0] = errno.errorcode.get(err, str(err))   # EINVAL 은 '미지원 플래그' 와 '인자 오류' 가 겹친다 — 진단용 기록
+        return None
+    raise OSError(err, "%s: exchange(%s <-> %s)" % (os.strerror(err), a, b))
+
+
+_EXCHANGE_LAST_UNAVAILABLE = [None]
+
+
+def _unlink_quiet(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _fsync_dir(path):
+    """디렉터리 fsync(rename/link 의 내구성 · POSIX 만 · 실패 무시 — 내구성은 부수 보장)."""
+    if os.name != "posix":
+        return
+    try:
+        dfd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def _exclusive_name(prefix):
+    """충돌 없는 보존 이름 — <prefix><utc>-<pid>[-<n>] · 이미 있으면 n 증가(기존 보존 파일을 덮지 않는다)."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = "%s%s-%d" % (prefix, stamp, os.getpid())
+    cand = base
+    n = 0
+    while os.path.lexists(cand):
+        n += 1
+        cand = "%s-%d" % (base, n)
+    return cand
+
+
+def _sweep_stale_seed_tmp(config_dir):
+    """잠금 보유 중에만 호출 — 죽은 시더(SIGKILL)의 mkstemp 잔재(.claude.json.seed-<8자>)를 치운다(R2). 잠금 파일·.bak-*·
+    .conflict-* 는 대상이 아니다. 실패는 무시(청소는 부수 효과)."""
+    swept = 0
+    try:
+        names = os.listdir(config_dir)
+    except OSError:
+        return 0
+    for n in names:
+        if _SEED_TMP_LITTER_RE.match(n) and n != SEED_TRUST_LOCK_NAME:
+            try:
+                os.unlink(os.path.join(config_dir, n))
+                swept += 1
+            except OSError:
+                pass
+    return swept
+
+
+def _restore_foreign(tmp, cfg, payload_b, note):
+    """교환으로 드러난 '낯선 inode'(교환 순간 .claude.json 에 있던 것이 우리가 읽은 원본이 아니다) 복원 → (rc, verdict, reason).
+    되교환으로 상대 inode 를 그대로 되돌린다(무손실). 되교환 뒤 tmp(우리 inode)가 우리 payload 그대로면 폐기 · 아니면(그 마이크로초
+    창에 제3의 쓰기가 우리 inode 에 앉았다) .claude.json.conflict-<utc>-<pid> 로 보존해 사유에 적는다. 되교환 자체가 실패하면 상대
+    inode 는 displaced 이름(tmp 인자)에 그대로 있다 — **지우지 않는다** · ERROR. 어느 경로에도 상대 데이터 파괴 0.
+    잔여(고지 · codex R2): 되교환 창(마이크로초)에 우리 inode 를 **쓰기용 fd 로 잡고 있던** 기록자의 in-place 쓰기는 대조 뒤·unlink 앞
+    에 앉으면 잃는다 — 알려진 기록자(claude 는 프로브가 배제 · C43 _enable_mcp_server · Rust write_atomic_mode)는 전부 tmp+rename
+    이라 이 형상이 아니다."""
+    R, E = SEED_TRUST_REFUSE, SEED_TRUST_ERROR
+    try:
+        back = _exchange_paths(tmp, cfg)
+    except OSError as e:
+        back = e
+    if back is not True:
+        # 상대 inode 는 displaced 이름(tmp)에 그대로 있다 — 지우지 않는다(이름 그대로 보존 · 수동 병합)
+        return E, "ERROR", ("되교환 실패(%s) — .claude.json 은 우리 문서, 상대 내용은 %s 에 보존(수동 병합)" % (back, tmp))
+    conflict = _exclusive_name(os.path.join(os.path.dirname(cfg), SEED_TRUST_CONFLICT_PREFIX))
+    try:
+        _e, mine, _s = _read_claude_json_bytes(tmp)
+        intact = _e and mine == payload_b
+    except (ValueError, OSError):
+        intact = False
+    if intact:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 무손실 복원 · 재시도 가능)%s"
+                             % ((" · " + " · ".join(note)) if note else ""))
+    try:
+        os.replace(tmp, conflict)
+    except OSError:
+        conflict = tmp
+    return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 복원 · 되교환 창의 제3 쓰기는 %s 에 보존 · "
+                         "수동 병합)" % conflict)
+
+
 def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backup=False,
                lock_fn=None, _pre_write_hook=None):
     """(config_dir, cwd) 한 쌍 신뢰 주입 → (rc, verdict, reason). rc: 0 OK(seeded|already-trusted) · 2 REFUSE
     (live-claude|unverified|lock-busy|lock-unavailable|concurrent-change) · 1 ERROR(usage|구조|IO|되읽기). 절차는 파일 머리
-    주석 ①~⑨. backup=True 면 기존 파일을 .bak-preflight 로 1회 보존(캡처 바이트 배타 생성 · C58 --fix 경로). proc_counter/
-    lock_fn/_pre_write_hook 은 테스트 주입점(기본 = 실물)."""
+    주석 ①~⑪. backup=True 면 기존 파일을 .bak-preflight 로 1회 보존(캡처 바이트 배타 생성 · C58 --fix 경로). proc_counter/
+    lock_fn/_pre_write_hook 은 테스트 주입점(기본 = 실물). ★R2: 프로브는 기존 문서가 있을 때만 · 커밋은 교환/link 무손실 CAS."""
     proc_counter = proc_counter or claude_procs_for_config
     lock_fn = lock_fn or _try_lock_nb
     E, R, OK_ = SEED_TRUST_ERROR, SEED_TRUST_REFUSE, SEED_TRUST_OK
@@ -6190,6 +6349,9 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         return E, "ERROR", ".pristine 은 무접촉(바이너리 임베드 재생성 영역)"
     if os.path.lexists(config_dir) and (_is_link_like(config_dir) or not os.path.isdir(config_dir)):
         return E, "ERROR", "config dir 이 실제 디렉터리가 아니다(심링크/파일): %s" % config_dir
+    if not os.path.isdir(cwd):
+        # ★R2(리뷰): 부재 cwd 에 키를 박지 않는다(C58 헤더 'stale 경로 무변경' 과 같은 규칙 · claude 는 그 폴더에서 뜰 수 없다).
+        return E, "ERROR", "cwd 가 존재하는 디렉터리가 아니다(stale 경로 무변경): %s" % cwd
     cfg = os.path.join(config_dir, ".claude.json")
     key = claude_project_key(cwd)
     lock_path = os.path.join(config_dir, SEED_TRUST_LOCK_NAME)
@@ -6228,48 +6390,47 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         return existed, raw, st, new, changed
 
     try:
-        state = None
-        dir_existed = os.path.isdir(config_dir)
-        if dir_existed:
-            # ② 이미 신뢰면 프로세스 프로브 없이 종료(R1) — 잠금 아래에서 읽어 계획한다.
-            err = _acquire()
-            if err:
-                return err
-            state = _read_plan()
-            if len(state) == 3:
-                return state
-            if not state[4]:
-                return OK_, "OK", "already-trusted(key=%s)" % key
-        # ③ 라이브 claude(그 CLAUDE_CONFIG_DIR) 0 확인 — makedirs **앞**(거부 경로는 디렉터리조차 만들지 않는다 · codex R2)
-        count, pdetail = proc_counter(config_dir)
-        note = []
-        if count is None:
-            if not force_unverified:
-                return R, "REFUSE", "unverified(%s) — --force-unverified 없이는 거부" % pdetail
-            note.append("force-unverified(%s)" % pdetail)
-        elif count > 0:
-            return R, "REFUSE", "live-claude(n=%d · %s)" % (count, pdetail)
-        if not dir_existed:
+        if not os.path.isdir(config_dir):
+            # 부재 dir = 부재 문서 = 지킬 기존 문서 없음(⑩) — 프로브 없이 만든다(cys-dept 는 어차피 mkdir -p 뒤에 부른다).
             try:
                 os.makedirs(config_dir, exist_ok=True)
             except OSError as e:
                 return E, "ERROR", "config dir 생성 실패: %s" % e
             if _is_link_like(config_dir) or not os.path.isdir(config_dir):
                 return E, "ERROR", "config dir 이 실제 디렉터리가 아니다(심링크/파일): %s" % config_dir
-            err = _acquire()
-            if err:
-                return err
-            state = _read_plan()
-            if len(state) == 3:
-                return state
-            if not state[4]:
-                return OK_, "OK", "already-trusted(key=%s)" % key
-        existed, raw, orig_st, new, _changed = state
-        # ⑦ 같은 dir mkstemp + fsync + 교체 前 임시파일 되읽기 → ⑥ 교체 직전 존재+바이트 대조 → 백업 → os.replace(원자)
+        # ② 잠금 → 읽기 → 계획 — 이미 신뢰면 프로세스 프로브 없이 종료(R1)
+        err = _acquire()
+        if err:
+            return err
+        swept = _sweep_stale_seed_tmp(config_dir)                                   # ⑪ 잠금 아래 잔재 청소
+        state = _read_plan()
+        if len(state) == 3:
+            return state
+        existed, raw, orig_st, new, changed = state
+        if not changed:
+            return OK_, "OK", "already-trusted(key=%s)" % key
+        note = []
+        if swept:
+            note.append("stale-tmp swept %d" % swept)
+        if existed:
+            # ③⑩ 라이브 claude(그 CLAUDE_CONFIG_DIR) 0 확인 — **기존 문서가 있을 때만**(프로브가 지키는 것이 그 문서다)
+            count, pdetail = proc_counter(config_dir)
+            if count is None:
+                if not force_unverified:
+                    return R, "REFUSE", "unverified(%s) — --force-unverified 없이는 거부" % pdetail
+                note.append("force-unverified(%s)" % pdetail)
+            elif count > 0:
+                return R, "REFUSE", "live-claude(n=%d · %s)" % (count, pdetail)
+            else:
+                note.append("probe=%s" % pdetail)          # 무엇이 0 을 검증했는지 사유에 남긴다(감사 · 스텁/실물 구분)
+        else:
+            note.append("no-probe(.claude.json 부재 — 보호할 기존 문서 없음)")
+        # ⑦ 같은 dir mkstemp + fsync + 교체 前 임시파일 되읽기 → ⑥ 교체 직전 존재+바이트 대조 → 백업 → 무손실 커밋
         payload = json.dumps(new, ensure_ascii=False, indent=2)
+        payload_b = payload.encode("utf-8")
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(prefix=".claude.json.seed-", dir=config_dir)
+            fd, tmp = tempfile.mkstemp(prefix=SEED_TRUST_TMP_PREFIX, dir=config_dir)
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 f.write(payload)
                 f.flush()
@@ -6277,14 +6438,15 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
             if orig_st is not None:
                 try:
                     os.chmod(tmp, stat.S_IMODE(orig_st.st_mode))   # 캡처한 권한(mutable 원본 재판독 금지 · 0B 파일도 보존)
-                except OSError:
-                    pass
+                except OSError as e:
+                    return E, "ERROR", "권한 보존 실패 — 커밋 안 함: %s" % e     # 권한을 잃은 문서를 공개하지 않는다(codex R2)
             with open(tmp, "rb") as f:
                 if json.loads(f.read().decode("utf-8")) != new:
                     return E, "ERROR", "임시파일 되읽기 불일치 — 커밋 안 함"
             if _pre_write_hook is not None:
                 _pre_write_hook()
-            # ⑥ 교체 직전 대조 — 존재+바이트(부재↔0B 구분 · codex R1). 심링크/정션 스왑도 여기서 거부.
+            # ⑥ 교체 직전 대조 — 존재+바이트(부재↔0B 구분 · codex R1). 심링크/정션 스왑도 여기서 거부. (값싼 선검사 — 진짜
+            #   무손실 보장은 아래 교환/link 가 한다)
             try:
                 cur_existed, cur, _cst = _read_claude_json_bytes(cfg)
             except ValueError as e:
@@ -6305,16 +6467,71 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 if bfd is not None:
                     with os.fdopen(bfd, "wb") as bf:  # 캡처한 바이트로(mutable 원본 copy2 금지 · codex R1)
                         bf.write(raw)
-            os.replace(tmp, cfg)
-            tmp = None
+            # ⑦ 무손실 커밋(R2)
+            if existed:
+                # 교환은 **displaced 이름** 아래에서만 한다(codex R2): 교환 뒤 옛 inode 가 앉는 이름이 mkstemp 잔재(.seed-<8자>)와
+                #   다른 네임스페이스여야 ⑪ 청소가 낯선 데이터를 지울 수 없고, 교환 직후 죽어도 상대 문서는 그 이름으로 남는다.
+                displaced = _exclusive_name(os.path.join(config_dir, SEED_TRUST_DISPLACED_PREFIX))
+                os.rename(tmp, displaced)                 # 같은 dir · 우리 payload 만 이동(아직 공개 전)
+                tmp = None
+                # ★displaced 는 finally 가 절대 치우지 않는다(교환 직후 인터럽트가 와도 옛 inode = 낯선 데이터일 수 있다 · codex R2).
+                #   치우는 곳은 '교환이 안 됐다' 가 확정된 자리(syscall 예외 · 폴백 실패)와 '옛 inode == 원본' 이 확정된 자리뿐.
+                try:
+                    swapped = _exchange_paths(displaced, cfg)
+                except OSError as e:                      # syscall -1 = 교환 안 됨 → displaced 는 우리 payload 그대로
+                    _unlink_quiet(displaced)
+                    return E, "ERROR", "쓰기 실패(교환): %s" % e
+                if swapped:
+                    # displaced 에는 교환 순간 .claude.json 에 있던 inode 가 그대로 있다 — 그것이 우리가 읽은 원본인가?
+                    try:
+                        p_existed, prev, _pst = _read_claude_json_bytes(displaced)
+                        foreign = (not p_existed) or prev != raw
+                    except (ValueError, OSError):
+                        foreign = True                    # 심링크/정션/비정규 파일이 끼어들었거나 판독 불가 = 낯선 것 → 복원
+                    if foreign:
+                        return _restore_foreign(displaced, cfg, payload_b, note)   # displaced 처분은 그 안에서 확정
+                    os.unlink(displaced)                  # 옛 원본(= 우리 계획의 전제 · 바이트 동일) 폐기
+                    _fsync_dir(config_dir)
+                    note.append("commit=exchange")
+                else:
+                    # 기구 부재(Windows · 미지원 FS): rename-over 폴백. 여기까지 온 것은 프로브가 그 config 의 라이브 claude 0 을
+                    #   확인한 뒤(Windows 는 전역 0)이므로 남는 경합 상대는 우리 도구(C43 · Rust 시더 = tmp+rename)뿐 — 대조~교체
+                    #   마이크로초 창은 **남는다**(파일 머리 고지 · REFUSE 로 바꾸면 Windows 기존 문서 경로가 영구 inert).
+                    try:
+                        os.replace(displaced, cfg)
+                    except OSError as e:                  # rename 실패 = 교체 안 됨 → displaced 는 우리 payload
+                        _unlink_quiet(displaced)
+                        return E, "ERROR", "쓰기 실패(교체): %s" % e
+                    _fsync_dir(config_dir)
+                    note.append("commit=replace(교환 기구 부재%s · 대조~교체 창 잔존)"
+                                % ((":" + _EXCHANGE_LAST_UNAVAILABLE[0]) if _EXCHANGE_LAST_UNAVAILABLE[0] else ""))
+            else:
+                try:
+                    os.link(tmp, cfg)                     # 원자 create-if-absent(완성된 내용을 한 번에 공개)
+                except FileExistsError:
+                    return R, "REFUSE", "concurrent-change(부재였던 .claude.json 이 교체 순간 생겨났다 — 상대 내용 보존 · 재시도 가능)"
+                except OSError:
+                    # 하드링크 미지원 FS: O_EXCL 배타 생성(존재는 원자 · 내용 공개는 비원자지만 새 inode 라 남의 데이터 접촉 0 ·
+                    #   codex R2: '알면서 덮는' rename 폴백 대신)
+                    try:
+                        xfd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    except FileExistsError:
+                        return R, "REFUSE", "concurrent-change(부재였던 .claude.json 이 교체 순간 생겨났다 — 상대 내용 보존 · 재시도 가능)"
+                    with os.fdopen(xfd, "wb") as xf:
+                        xf.write(payload_b)
+                        xf.flush()
+                        os.fsync(xf.fileno())
+                    note.append("commit=excl-create(link 미지원 FS)")
+                else:
+                    note.append("commit=link")
+                os.unlink(tmp)
+                tmp = None
+                _fsync_dir(config_dir)
         except (OSError, ValueError, UnicodeDecodeError) as e:
             return E, "ERROR", "쓰기 실패: %s" % e
         finally:
-            if tmp:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            if tmp:                                       # mkstemp 잔재만(displaced 는 여기서 손대지 않는다)
+                _unlink_quiet(tmp)
         # ⑧ 되읽기 — 형 검사 전수 · **롤백 0**(R1): 다른 기록자가 그 사이 썼다면 그 내용을 보존한다.
         try:
             b_existed, braw, _bst = _read_claude_json_bytes(cfg)
@@ -6395,11 +6612,17 @@ def _topology_pairs(topology_path, reg=None):
     아니다 · 키 부재(레거시)도 미지 = 제외. reg 를 주면 존재하나 판독 불가한 파일을 reg["unreadable"] 에 남긴다."""
     t = _read_json_tolerant(topology_path)
     out = []
-    if not isinstance(t, dict):
+    if isinstance(t, dict) and "entries" not in t:
+        entries = []                     # 키 부재 = 빈 로스터(판독은 됐다)
+    else:
+        entries = t.get("entries") if isinstance(t, dict) else None
+    if not isinstance(entries, list):
+        # ★R2(리뷰 codex): `{"entries": 1}` 같은 형상 이상은 TypeError 로 preflight 전체를 죽이는 게 아니라 판독불가 1건이다.
+        #   명시 `null`·수·문자열·객체도 형상 이상(키 부재만 빈 로스터).
         if reg is not None and os.path.isfile(topology_path):
             reg.setdefault("unreadable", []).append(topology_path)
         return out
-    for e in (t.get("entries") or []):
+    for e in entries:
         if not isinstance(e, dict):
             continue
         if e.get("agent") != _TOPOLOGY_CLAUDE_AGENT:
@@ -6676,25 +6899,65 @@ def _self_test():
     seed_src = inspect.getsource(seed_trust)
     check("seed_trust: 이미 신뢰(정확 키 true) 는 프로세스 프로브 **앞**에서 반환(R1 — 가동 중 부서 재사용 경로 WARN 0)",
           seed_src.index("already-trusted") < seed_src.index("proc_counter(config_dir)"))
-    check("seed_trust: 프로세스 확인이 makedirs 앞(거부 경로는 디렉터리도 만들지 않는다)",
-          seed_src.index("proc_counter(config_dir)") < seed_src.index("os.makedirs(config_dir"))
+    # ★R2 재핀(리뷰 · 이 WP 의 9a4cda4/2f4be59 핀만): 프로브 위치 = 기존 문서가 있을 때만(makedirs·잠금·계획 뒤 `if existed:`) ·
+    #   커밋 = 교환/link 무손실 CAS(os.replace 는 기구 부재 폴백에만).
+    check("seed_trust: 프로브는 **기존 문서가 있을 때만**(`if existed:` 분기 안 · makedirs·잠금·계획 뒤) · 부재 문서는 no-probe 고지(R2)",
+          seed_src.index("os.makedirs(config_dir") < seed_src.index("err = _acquire()") < seed_src.index("state = _read_plan()")
+          < seed_src.index("if existed:\n") < seed_src.index("proc_counter(config_dir)")
+          and "no-probe(.claude.json 부재" in seed_src)
     check("seed_trust: 잠금 기구 미가용(None)도 거부(무잠금 쓰기 금지)", "lock-unavailable" in seed_src)
-    check("seed_trust: 임시파일 되읽기 → 교체 직전 존재+바이트 대조 → 백업(캡처 바이트 · O_EXCL) → os.replace 순서",
+    check("seed_trust: 임시파일 되읽기 → 교체 직전 존재+바이트 대조 → 백업(캡처 바이트 · O_EXCL) → displaced 이름으로 교환 → 폴백 os.replace 순서 · 부재는 os.link",
           seed_src.index("임시파일 되읽기 불일치") < seed_src.index("cur_existed != existed or cur != raw")
-          < seed_src.index("os.O_EXCL") < seed_src.index("os.replace(tmp, cfg)"))
-    check("seed_trust: 교체 後 되읽기 불일치/실패에 롤백 0(다른 기록자 내용 보존 · R1 codex) · 백업은 copy2 로 원본을 다시 읽지 않는다",
-          "_rollback_file" not in seed_src and "shutil.copy2" not in seed_src and "커밋 상태로 둔다" in seed_src
-          and "_trusted_exact(back, key)" in seed_src)
+          < seed_src.index("os.O_EXCL") < seed_src.index("os.rename(tmp, displaced)") < seed_src.index("_exchange_paths(displaced, cfg)")
+          < seed_src.index("os.replace(displaced, cfg)") and "os.link(tmp, cfg)" in seed_src
+          and "os.replace(tmp, cfg)" not in seed_src)
+    check("seed_trust: 교환 뒤 옛 inode 가 원본과 다르면 되교환(_restore_foreign) · 교체 後 되읽기 불일치/실패에 롤백 0(R1) · copy2 0",
+          "_restore_foreign(displaced, cfg, payload_b, note)" in seed_src and "_rollback_file" not in seed_src
+          and "shutil.copy2" not in seed_src and "커밋 상태로 둔다" in seed_src and "_trusted_exact(back, key)" in seed_src)
+    rf_src = inspect.getsource(_restore_foreign)
+    check("_restore_foreign: 되교환 실패 시 displaced 를 지우지 않는다(unlink 는 되교환 성공+payload 동일 분기에만) · 제3 쓰기는 conflict 이름 보존",
+          rf_src.count("os.unlink(tmp)") == 1 and rf_src.index("back is not True") < rf_src.index("os.unlink(tmp)")
+          and "SEED_TRUST_CONFLICT_PREFIX" in rf_src and "_exclusive_name(" in rf_src)
+    ex_src = inspect.getsource(_exchange_paths)
+    check("_exchange_paths: darwin renamex_np(c_char_p,c_char_p,c_uint · 0x2) · linux renameat2(c_int,c_char_p,c_int,c_char_p,c_uint · AT_FDCWD -100 · 2) · 비-posix None · ctypes 지연 import",
+          "renamex_np" in ex_src and "0x2)" in ex_src and "renameat2" in ex_src and "-100, os.fsencode(a), -100" in ex_src
+          and ex_src.index('if os.name != "posix":') < ex_src.index("import ctypes")
+          and "errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS, errno.EXDEV" in ex_src)
+    check("잔재 청소: mkstemp 접미 8자만 · 잠금(-lock)·displaced·conflict 는 대상 아님(교환은 displaced 이름 아래에서만)",
+          _SEED_TMP_LITTER_RE.match(".claude.json.seed-abc12_xy") and not _SEED_TMP_LITTER_RE.match(SEED_TRUST_LOCK_NAME)
+          and not _SEED_TMP_LITTER_RE.match(".claude.json.displaced-20260906T000000Z-1")
+          and not _SEED_TMP_LITTER_RE.match(".claude.json.conflict-20260906T000000Z-1")
+          and not _SEED_TMP_LITTER_RE.match(".claude.json.seed-abc12_xy9"))
+    check("_read_claude_json_bytes: 심링크/정션 + 비정규 파일(FIFO 등) 거부(열기 전 lstat S_ISREG)",
+          "S_ISREG" in inspect.getsource(_read_claude_json_bytes))
+    check("_is_claude_command strict(env 비노출 줄): argv[0] 이름/설치 경로 · argv[0..1] claude-code .js 만 — tail/less/grep 인자 속 claude 제외(R2)",
+          not _is_claude_command(["tail", "-f", "/x/logs/claude"], strict=True)
+          and not _is_claude_command(["less", "/Users/o/.local/bin/claude"], strict=True)
+          and not _is_claude_command(["tail", "-f", "/x/claude-code/debug.log"], strict=True)
+          and not _is_claude_command(["python3", "x.py", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], strict=True)
+          and _is_claude_command(["/Users/o/.local/bin/claude", "--continue"], strict=True)
+          and _is_claude_command(["/Users/o/.local/share/claude/versions/2.1.263", "--effort"], strict=True)
+          and _is_claude_command(["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], strict=True)
+          and _is_claude_command(["tail", "-f", "/x/logs/claude"]))
+    check("ps -E 판정: env 비노출 tail/less 줄은 unresolved 가 아니다 · env 비노출 claude 줄은 unresolved(R2)",
+          _count_claude_in_ps_lines(["  7 tail -f /x/logs/claude", "  8 less /Users/o/.local/bin/claude"], "/w/cfg") == (0, 2, 0)
+          and _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude --continue"], "/w/cfg") == (0, 1, 1))
     seed_body = seed_src.split('"""', 2)[2]   # 시그니처·docstring 뒤 본문
-    check("seed_trust: --force-unverified 는 프로세스 확인 단계만 넘긴다(본문 참조 1회 · 프로브~makedirs 사이)",
+    check("seed_trust: --force-unverified 는 프로세스 확인 단계만 넘긴다(본문 참조 1회 · 프로브 뒤 · mkstemp 앞)",
           seed_body.count("force_unverified") == 1
           and seed_body.index("proc_counter(config_dir)") < seed_body.index("force_unverified")
-          < seed_body.index("os.makedirs(config_dir"))
-    check("seed_trust: 모든 .claude.json 읽기(초기·교체 직전·되읽기)는 _read_claude_json_bytes(O_NOFOLLOW·정션 거부) 경로",
-          seed_src.count("_read_claude_json_bytes(cfg)") == 3 and "open(cfg" not in seed_src)
-    ws_src = inspect.getsource(Preflight._is_cysjavis_workspace)
-    check("C58 _is_cysjavis_workspace: CLAUDE.md·_round 마커 요구 삭제(레지스트리 쌍 판정)",
-          "CLAUDE.md" not in ws_src and "_round" not in ws_src and "_registry()" in ws_src)
+          < seed_body.index("tempfile.mkstemp("))
+    check("seed_trust: cwd 부재(dir 아님) → ERROR(stale 경로 무변경 · R2) — 잠금·계획 앞",
+          "cwd 가 존재하는 디렉터리가 아니다" in seed_src
+          and seed_src.index("cwd 가 존재하는 디렉터리가 아니다") < seed_src.index("_acquire()"))
+    check("seed_trust: 모든 .claude.json **읽기**(초기·교체 직전·되읽기)는 _read_claude_json_bytes(O_NOFOLLOW·정션·비정규 거부) 경로 · 직접 read open 0(R2 재핀: O_EXCL 배타 생성은 쓰기)",
+          seed_src.count("_read_claude_json_bytes(cfg)") == 3 and "open(cfg, os.O_RDONLY" not in seed_src
+          and 'open(cfg, "r' not in seed_src and "open(cfg)" not in seed_src)
+    check("C58: 워크스페이스 판정은 _trust_gap_workspaces 하나(_is_cysjavis_workspace 삭제 · R2) · CLAUDE.md/_round 마커 요구 0",
+          not hasattr(Preflight, "_is_cysjavis_workspace")
+          and "CLAUDE.md" not in inspect.getsource(Preflight._trust_gap_workspaces)
+          and "_round" not in inspect.getsource(Preflight._trust_gap_workspaces)
+          and "_registry()" in inspect.getsource(Preflight._trust_gap_workspaces))
     gap_src = inspect.getsource(Preflight._trust_gap_workspaces)
     check("C58 갭 판정은 정확 키(claude_project_key) — 별칭 true 불인정(R1)",
           "claude_project_key(cwd)" in gap_src and "_path_identity(ws)" not in gap_src)
@@ -6716,6 +6979,8 @@ def _self_test():
     check("registry: topology 항목은 절대경로 문자열 쌍만(config 부재 추정 귀속 0 · 상대경로 0) · agent 정확히 'claude' 만(R1)",
           "_abs_str(c) and _abs_str(w)" in tp_src and 'e.get("agent") != _TOPOLOGY_CLAUDE_AGENT' in tp_src
           and _TOPOLOGY_CLAUDE_AGENT == "claude")
+    check("registry: topology entries 비-list(명시 null·수·객체)는 판독불가 1건 · 키 부재는 빈 로스터 · 예외 0(R2 codex)",
+          '"entries" not in t' in tp_src and "isinstance(entries, list)" in tp_src)
     full = {"pairs": {"a": {"x": "/x"}, "b": {"y": "/y"}}, "configs": {"a": "/A", "b": "/B"}, "sources": ["s"],
             "unreadable": [], "scope": "full"}
     sc = _scope_registry(full, "부서", ["/A/settings.json"]) if _path_identity("/A") == "a" else None
