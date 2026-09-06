@@ -2046,6 +2046,192 @@ mod tests {
         }
     }
 
+    /// ★(0.14.31 · WP-1 H-1 · 리뷰 R1b · W1) Boot Valve 창의 재료 `quiet_secs` 가 **전송층에서 도달 가능한가** —
+    /// 유휴 PTY(Windows 러너에서는 ConPTY)가 스스로 바이트를 내지 않는지를 **실행으로** 잰다. 리뷰 지적: 밸브는
+    /// `time_fallback ∧ quiet_secs ≥ 3` 을 요구하는데 ConPTY 의 유휴 출력 주기는 측정된 적이 없었다 — ConPTY 가
+    /// 유휴에 3s 미만 간격으로 바이트를 내면 밸브 단독 경로 좌석은 영영 GatePending(unidentified) 이다(보류 방향
+    /// 이지만 디렉티브 미주입 = 치명위험 ③ 형상). 이 검체는 windows-health.yml 의 **차단** 스텝
+    /// (`cargo test --lib readiness::`)에서 windows-latest 실기로 돈다(macOS 에서는 같은 코드가 /bin/sh 로 돌아
+    /// 컴파일·의미가 함께 검증된다).
+    ///
+    /// 측정 설계(codex 설계 검토 반영 · 가짜 정적을 정적으로 읽지 않는다):
+    ///   A 정착: 기동 바이트가 있고(펌프 생존 증명) 1.0s 무출력이면 정착 · 상한 12s(계속 그리면 실패).
+    ///   B 유휴 창 4.0s(> BOOT_VALVE_QUIET_SECS 3.0 + 여유): 바이트 0 이어야 한다 · EOF/읽기 오류/채널 단절/자식
+    ///     종료는 "정적" 이 아니라 실패다.
+    ///   C 전송층 생존 재증명: 창이 끝난 뒤 명령을 써 넣고 그 **출력**(입력 에코와 구분되는 토큰 조합)이 8s 안에
+    ///     오는지 본다 — ConPTY 가 DSR 응답을 기다리며 펌프를 멈춘 상태(cysd reader 가 답하는 이유)는 조용해
+    ///     보이지만 C 에서 드러난다. DSR(`ESC[6n`)은 청크 경계 carry 3바이트로 답한다(cysd 와 같은 규율).
+    /// 범위의 정직: 이것은 PTY/ConPTY **전송층**의 유휴 거동이지 ink(claude 렌더러)의 유휴 거동이 아니다. ink 의
+    /// 유휴 무재그림은 macOS 라이브 좌석 idle_secs 실측(602~6841s · 431~2595s)이 근거이고, "ink-on-Windows" 는
+    /// 릴리스 게이트의 격리 config dir 라이브 부트 1회 계측 항목으로 남는다(노트 참조).
+    #[test]
+    fn pty_idle_shell_emits_no_bytes_within_valve_quiet_window() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        #[cfg(windows)]
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = CommandBuilder::new("/bin/sh");
+            c.arg("-i");
+            c.env("PS1", "probe$ ");
+            c.env("ENV", ""); // 사용자 rc 파일 미판독(결정론 기동)
+            c
+        };
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn shell in pty");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let mut writer = pair.master.take_writer().expect("pty writer");
+        let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.send(Err("EOF".into()));
+                        break;
+                    }
+                    Ok(n) => {
+                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("read error: {e}")));
+                        break;
+                    }
+                }
+            }
+        });
+        // DSR(`ESC[6n`) 응답 — 청크 경계 carry 3바이트(cysd reader 와 같은 규율). 답하지 않으면 ConPTY 펌프가
+        // 멈춰 "조용해 보이는" 가짜 정적이 된다.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut answer_dsr = |chunk: &[u8], w: &mut Box<dyn Write + Send>| {
+            let mut joined = carry.clone();
+            joined.extend_from_slice(chunk);
+            let mut i = 0usize;
+            while i + 4 <= joined.len() {
+                if &joined[i..i + 4] == b"\x1b[6n" {
+                    let _ = w.write_all(b"\x1b[1;1R");
+                    i += 4;
+                } else {
+                    i += 1;
+                }
+            }
+            let _ = w.flush();
+            carry = joined[joined.len().saturating_sub(3)..].to_vec();
+        };
+        let settle = Duration::from_millis(1000);
+        let settle_cap = Duration::from_secs(12);
+        let window = Duration::from_millis(4000);
+        let outcome = (|| -> Result<(usize, usize, usize, Duration), String> {
+            // A — 정착.
+            let start = Instant::now();
+            let mut startup_bytes = 0usize;
+            let mut last_byte_at = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(chunk)) => {
+                        startup_bytes += chunk.len();
+                        last_byte_at = Instant::now();
+                        answer_dsr(&chunk, &mut writer);
+                    }
+                    Ok(Err(e)) => return Err(format!("기동 중 전송층 단절: {e}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if startup_bytes > 0 && last_byte_at.elapsed() >= settle {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                }
+                if start.elapsed() > settle_cap {
+                    return Err(format!(
+                        "셸이 {settle_cap:?} 안에 정착하지 않았다(기동 바이트 {startup_bytes}) — 유휴에도 계속 그린다"
+                    ));
+                }
+            }
+            // B — 유휴 창.
+            let t0 = Instant::now();
+            let mut idle_bytes = 0usize;
+            let mut idle_chunks = 0usize;
+            let mut max_gap = Duration::ZERO;
+            let mut last = t0;
+            while t0.elapsed() < window {
+                let remain = window.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
+                match rx.recv_timeout(remain) {
+                    Ok(Ok(chunk)) => {
+                        idle_bytes += chunk.len();
+                        idle_chunks += 1;
+                        let now = Instant::now();
+                        max_gap = max_gap.max(now - last);
+                        last = now;
+                        answer_dsr(&chunk, &mut writer);
+                    }
+                    Ok(Err(e)) => return Err(format!("유휴 창 중 전송층 단절: {e}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                }
+            }
+            max_gap = max_gap.max(Instant::now() - last);
+            if child.try_wait().map_err(|e| format!("try_wait: {e}"))?.is_some() {
+                return Err("셸이 유휴 창 중 종료됐다 — 정적이 아니라 사망이다".into());
+            }
+            // C — 전송층 생존 재증명(출력 토큰은 입력 에코와 다르게 조합된다).
+            #[cfg(windows)]
+            writer.write_all(b"echo PROBE_^OK\r\n").map_err(|e| e.to_string())?;
+            #[cfg(not(windows))]
+            writer.write_all(b"echo PROBE_\"OK\"\n").map_err(|e| e.to_string())?;
+            writer.flush().map_err(|e| e.to_string())?;
+            let t1 = Instant::now();
+            let mut seen: Vec<u8> = Vec::new();
+            loop {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Ok(chunk)) => {
+                        answer_dsr(&chunk, &mut writer);
+                        seen.extend_from_slice(&chunk);
+                        if String::from_utf8_lossy(&seen).contains("PROBE_OK") {
+                            break;
+                        }
+                    }
+                    Ok(Err(e)) => return Err(format!("응답 대기 중 전송층 단절: {e}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                }
+                if t1.elapsed() > Duration::from_secs(8) {
+                    return Err(format!(
+                        "유휴 창 뒤 명령 응답이 8s 안에 없다 — 펌프 정지(가짜 정적) 의심 · 수신 {}B",
+                        seen.len()
+                    ));
+                }
+            }
+            Ok((startup_bytes, idle_bytes, idle_chunks, max_gap))
+        })();
+        let _ = child.kill();
+        let (startup_bytes, idle_bytes, idle_chunks, max_gap) = outcome.expect("PTY 유휴 계측 실패");
+        eprintln!(
+            "[pty-idle-probe] os={} startup_bytes={startup_bytes} idle_window={:.1}s idle_bytes={idle_bytes} \
+             idle_chunks={idle_chunks} max_gap={:.2}s valve_quiet={BOOT_VALVE_QUIET_SECS}s",
+            std::env::consts::OS,
+            window.as_secs_f64(),
+            max_gap.as_secs_f64()
+        );
+        assert!(startup_bytes > 0, "기동 바이트 0 — 펌프 생존이 증명되지 않았다");
+        assert_eq!(
+            idle_bytes, 0,
+            "유휴 PTY 가 {window:?} 동안 {idle_bytes}B({idle_chunks} 청크)를 냈다 — quiet_secs 가 밸브 창 \
+             {BOOT_VALVE_QUIET_SECS}s 에 도달하지 못한다(밸브 단독 경로 영구 보류)"
+        );
+        assert!(window.as_secs_f64() > BOOT_VALVE_QUIET_SECS, "검체 전제: 유휴 창이 밸브 임계보다 길다");
+    }
+
     /// ★H-WIN 검체 5종 — ConPTY 전사 형상으로 **파생**한 모달 화면(주장된 캡처가 아니라 변형이다:
     /// CRLF 줄끝 · 콘솔 폭 우측 패딩 · 푸터 조각 분리 · 라벨 접힘+푸터 소실 · PowerShell 프롬프트
     /// 잔상 + 잘린 테마 하단). Windows 실측 근거: `HEALTHY_BANNER`(WIN-2) 의 PS 프롬프트 줄 ·
@@ -2184,6 +2370,21 @@ mod tests {
         rolled.marker = Some("❯");
         rolled.legacy_v1 = true;
         assert_eq!(judge(&rolled), Verdict::Ready { evidence: Evidence::MarkerTail });
+        // ⑪ ★(리뷰 R1b · 실측 12:13:56) 라이브 그리드의 **실제 바이트** — 대기 프롬프트 줄은 `❯` + U+00A0(NBSP).
+        //    ①' 의 "마커 뒤 공백만" 이 NBSP 를 공백으로 읽어야 라이브 좌석에서 창이 닫힌다(안 읽으면 ①' 은 라이브
+        //    그리드에서 결코 참이 되지 않아 R-E 결함이 그대로 남는다). 같은 그리드의 전경 모달·초안은 여전히 보류.
+        let nbsp = fixtures::LIVE_TUI_2_1_261_NBSP_PROMPT;
+        assert!(nbsp.contains("❯\u{a0}\n"), "검체 전제: 실측 NBSP 바이트");
+        assert!(waiting_prompt_with_harmless_trailer(nbsp, "❯"), "NBSP 대기 프롬프트를 빈 줄로 읽지 못했다");
+        assert_eq!(reinject(nbsp), Verdict::Ready { evidence: Evidence::MarkerTail });
+        let nbsp_vocab = body_vocab.replace(live, nbsp);
+        assert!(nbsp_vocab.contains(nbsp) && modal_signature(&nbsp_vocab).is_some());
+        assert_eq!(reinject(&nbsp_vocab), Verdict::Ready { evidence: Evidence::MarkerTail },
+                   "라이브 NBSP 그리드 아래 본문 어휘가 창을 영구 보류로 접었다");
+        let nbsp_fore = format!("{}\n{}", nbsp.trim_end_matches('\n'), fixtures::LIVE_PERMISSION_PROMPT);
+        assert!(held_as(&reinject(&nbsp_fore), MODAL_UNKNOWN_ID));
+        let nbsp_draft = nbsp_vocab.replace("❯\u{a0}\n", "❯\u{a0}작업 이어서\n");
+        assert!(held_as(&reinject(&nbsp_draft), MODAL_UNKNOWN_ID));
         // 보조 술어 — 괘선·번호 행 판정의 경계.
         assert!(is_rule_line("────────"), "8연속 괘선");
         assert!(!is_rule_line("───────"), "7연속은 괘선이 아니다(TUI_FRAME_RUN_MIN 파리티)");

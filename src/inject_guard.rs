@@ -734,6 +734,16 @@ mod tests {
         // 전경 권한 프롬프트 + 상태줄 — 보류(readiness 검체 ②와 같은 판정).
         let foreground = format!("{}\n{}", live.trim_end_matches('\n'), fixtures::LIVE_PERMISSION_PROMPT);
         assert!(matches!(decide(&obs(&foreground, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
+        // ★(리뷰 R1b) 실측 바이트 그대로의 그리드(`❯` + U+00A0) — 같은 세 판정(건강=Send · 본문 어휘=Hold ·
+        //   전경 모달=Hold). 두 판정기가 NBSP 를 공백으로 읽지 못하면 여기서 갈린다.
+        let nbsp = fixtures::LIVE_TUI_2_1_261_NBSP_PROMPT;
+        assert!(nbsp.contains("❯\u{a0}\n"), "검체 전제: 실측 NBSP 바이트");
+        assert_eq!(decide(&obs(nbsp, &gs)), Decision::Send);
+        assert!(crate::readiness::modal_signature(nbsp).is_none());
+        let nbsp_vocab = format!("  H-1: `Enter to confirm` ∧ `Esc to cancel`\n{nbsp}");
+        assert!(matches!(decide(&obs(&nbsp_vocab, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
+        let nbsp_fore = format!("{}\n{}", nbsp.trim_end_matches('\n'), fixtures::LIVE_PERMISSION_PROMPT);
+        assert!(matches!(decide(&obs(&nbsp_fore, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
     }
 
     /// allow 구멍은 **커서가 종료 선택지 위**에 있으면 닫힌다 — 2.1.261 폴더신뢰(기본 포커스 `No, exit`)에

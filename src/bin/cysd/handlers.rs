@@ -6257,6 +6257,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // `cys status --json`). surface.list 와 **같은 키·같은 의미**를 노출한다.
                         "awakened_at": *s.awakened_at.lock().unwrap(),
                         "directive_verified": *s.directive_verified.lock().unwrap(),
+                        // ★(0.14.31 · F-1 · 리뷰 R1b) **좌석에 결속된** 세션 신원 — SessionStart 훅이 자기 pane 에서
+                        //   `usage.register` 로 등록한 transcript 경로의 파일 stem(claude = session id). topology 의
+                        //   `session_id`(`agent_session_id`)는 usage 수집기가 프로젝트 디렉터리를 mtime 휴리스틱으로
+                        //   훑어 **1회 stash** 하는 값이라(is_none 게이트 · 같은 좌석 재기동은 stale 유지) 공유
+                        //   cwd 에서 타 좌석의 세션을 이 좌석에 귀속시킬 수 있다 — 소유 증거가 아니다. 등록 경로는
+                        //   훅이 그 프로세스 안에서 보낸 것이고 소유 게이트(발신 pane = 자기 surface)를 지났으며
+                        //   등록마다 덮어써 같은 좌석 재기동에도 신선하다. phoenix F-1 fresh 검증이 **이 키만**
+                        //   세션 소유 증거로 인정한다(부재 null = 훅 미발화·구 데몬 → 미확정 방향). 추가 키(가산)
+                        //   — 기존 키·의미 무변.
+                        "registered_session_id": s.registered_transcript.lock().unwrap().as_deref()
+                            .and_then(|p| std::path::Path::new(p).file_stem())
+                            .and_then(|st| st.to_str())
+                            .map(String::from),
                         // (B5 · §2-8) 논스 ack 3필드 — 판정은 intent 일치 ∧ 해시 일치(T1-6)이고
                         //   source 는 출처 표기다(A19-2). generation 은 fencing 전용이라 판정에
                         //   쓰지 않지만, 어느 lease 에서 arm 됐는지는 보여야 한다.
@@ -15009,6 +15022,44 @@ mod tests {
         };
         assert_eq!(surface_entry(&resp2, "surfaces", sid)["seat"], json!("empty"),
                    "빈 좌석 사실이 보류 표식에 가려졌다 — 진짜 결손이 부활되지 않는다(자가치유 마비)");
+    }
+
+    /// ★(0.14.31 · F-1 · 리뷰 R1b) `org.status` 행의 `registered_session_id` — SessionStart 훅이 등록한 transcript
+    /// 경로의 stem 이 **좌석 단위**로 노출되고, 등록 전엔 null 이며, 재등록(같은 좌석 재기동)은 최신값으로
+    /// 덮어쓴다(topology `session_id` 의 1회 stash 와 다른 부호). phoenix F-1 fresh 검증의 유일한 세션 소유 증거다.
+    #[test]
+    fn org_status_exposes_registered_session_id_bound_to_the_seat() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let status_row = |n: u64| -> Value {
+            let req = Request { id: json!(n), method: "org.status".into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            surface_entry(&resp, "surfaces", sid).clone()
+        };
+        // ⓐ 등록 전 — 키는 있고 값은 null(부재 ≠ 부정 · phoenix 는 미확정으로 읽는다).
+        let row = status_row(1);
+        assert!(row.get("registered_session_id").is_some(), "키 자체가 없다(구 데몬과 구분 불가): {row}");
+        assert!(row["registered_session_id"].is_null());
+        // ⓑ 등록 — 훅이 보낸 절대 .jsonl 경로의 stem 이 그대로 노출된다(claude session id = 파일 stem).
+        let path = if cfg!(windows) {
+            "C:\\Users\\x\\.cys\\claude\\projects\\C--Users-x\\11111111-2222-3333-4444-555555555555.jsonl"
+        } else {
+            "/home/x/.cys/claude/projects/-home-x/11111111-2222-3333-4444-555555555555.jsonl"
+        };
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            *surfaces[&sid].registered_transcript.lock().unwrap() = Some(path.to_string());
+        }
+        assert_eq!(status_row(2)["registered_session_id"], json!("11111111-2222-3333-4444-555555555555"));
+        // ⓒ 같은 좌석의 재등록(재기동한 새 세션) — 최신 stem 으로 바뀐다(stale 1회 stash 가 아니다).
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            *surfaces[&sid].registered_transcript.lock().unwrap() =
+                Some(path.replace("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        }
+        assert_eq!(status_row(3)["registered_session_id"], json!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
     }
 
     /// 발견(AB-BA 데드락 — 락 순서 역전): surface.create의 master/cso 특권역할 게이트가

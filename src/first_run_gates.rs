@@ -1491,7 +1491,22 @@ pub mod fixtures {
         \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n\
         \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
 
+    /// ★(0.14.31 · 리뷰 R1b · 실측 2026-09-06 12:13:56 · 본부 라이브 좌석 3개 `cys read-screen` 읽기 전용)
+    /// 2.1.261 유휴 그리드의 **실제 바이트**: 대기 프롬프트 줄은 `❯` 뒤에 ASCII 공백이 아니라 **U+00A0(NBSP)**
+    /// 하나다. 위 `LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT`(10:18:58 실측 · `❯ ` 로 옮겨 적음)와 같은 레이아웃이고,
+    /// 이 검체는 그 줄만 관측 바이트 그대로 둔다 — 판정부의 공백 판정(`trim`·`is_whitespace`)이 NBSP 를 공백으로
+    /// 읽는지를 실측 바이트로 못 박기 위함(대체 아님 · 추가).
+    pub const LIVE_TUI_2_1_261_NBSP_PROMPT: &str = "\n\
+        ✻ Churned for 3m 34s · done 오전 7:14\n\
+        \x20                                                                   new task? \n\
+        ──────────────────────────────────────────────────────────────────────────────\n\
+        ❯\u{a0}\n\
+        ──────────────────────────────────────────────────────────────────────────────\n\
+        \x20 Opus 5 · CTX 35% · 7d 33%                                                  \n\
+        \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
+
     pub const NON_GATE_SCREENS: &[(&str, &str)] = &[
+        ("live-tui-2.1.261-nbsp-prompt", LIVE_TUI_2_1_261_NBSP_PROMPT),
         ("ready-shell", READY_SHELL),
         ("healthy-welcome-box", HEALTHY_WELCOME_BOX),
         ("live-tui-at-prompt", LIVE_TUI_AT_PROMPT),

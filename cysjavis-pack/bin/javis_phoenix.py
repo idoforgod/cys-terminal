@@ -159,6 +159,16 @@ def _default_claude_config_dir():
 #   같게 둔다 — agent 부재는 CLI 가 스폰 자체를 건너뛰고(`agent 미상 — 건너뜀`), config dir 부재는
 #   `resolve_claude_config_dir()` 로, cwd 부재는 빈 문자열로 접는다. 경로 문자열도 Rust 의 format 그대로
 #   (`{cfg}/projects/{comp}/{sid}.jsonl`) 만든다 — 두 벌이 갈리면 성공한 fresh 각성이 'fork 의심' 으로 오보된다.
+def _session_project_dir(entry):
+    """topology entry → claude 세션 파일 디렉터리 `{cfg}/projects/{munge(cwd)}` (Rust format 그대로 · 정규화 0).
+    cfg None/부재 → 기본값 · 빈 문자열은 Rust `Some("")` 처럼 빈 접두 그대로 · cwd 부재 → 빈 munge(이중 슬래시)."""
+    cfg = entry.get("claude_config_dir")
+    if not isinstance(cfg, str):
+        cfg = _default_claude_config_dir()
+    comp = _claude_project_component(entry.get("cwd") or "")
+    return "%s/projects/%s" % (cfg, comp)
+
+
 def fresh_expected(entry):
     agent = entry.get("agent")
     if agent != "claude":
@@ -167,13 +177,27 @@ def fresh_expected(entry):
     if not isinstance(sid, str) or not sid.strip():
         return True, "no_session"     # Rust: `.filter(|s| !s.trim().is_empty())` — 공백만이면 부재
     # Rust 는 부재 검사에만 trim 을 쓰고 경로에는 **원문 id** 를 쓴다(`{cfg}/projects/{comp}/{id}.jsonl`).
-    cfg = entry.get("claude_config_dir")
-    if not isinstance(cfg, str):
-        cfg = _default_claude_config_dir()   # None/부재 → 기본값 · 빈 문자열은 Rust `Some("")` 처럼 빈 접두 그대로
-    comp = _claude_project_component(entry.get("cwd") or "")
-    path = "%s/projects/%s/%s.jsonl" % (cfg, comp, sid)
+    #   ★리뷰 R1b: CLI 는 이제 placeholder 없는 어댑터(`resume_arg: "--continue"`)에도 같은 파일 검사를 **앞**에서
+    #   한다(파일 없음 → 접미 0 · fresh) — 그래서 이 예상은 어댑터 설정을 모르고도 CLI 와 갈리지 않는다.
+    path = "%s/%s.jsonl" % (_session_project_dir(entry), sid)
     missing = not os.path.exists(path)   # Rust `Path::exists` 와 동일(isfile 아님)
     return missing, "no_session_file" if missing else ""
+
+
+# ★F-1(리뷰 R1b · codex major): fresh 는 **세션에 대한 주장**이라 세션 증거가 필요하다. 스폰 **전** 그 좌석의 프로젝트
+#   디렉터리에 이미 있던 세션 파일 stem 들을 재고로 찍어 두고, 관측된(좌석 결속) 세션이 그 재고에 **없고** 지금
+#   파일이 **있으면** 새 세션이다. 재고에 있으면 기존 대화 재개(fork · 타 역할 세션일 수 있음) 의심이다.
+def session_inventory(entry):
+    """스폰 전 세션 재고 → (project_dir, sorted stems | None). 디렉터리 부재 = [](재개할 파일이 없다) ·
+    그 밖의 OSError = None(재고 판정 불가 → verify 는 미확정 방향). stdlib os 만(Windows 안전)."""
+    d = _session_project_dir(entry)
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return d, []
+    except OSError:
+        return d, None
+    return d, sorted(n[:-len(".jsonl")] for n in names if n.endswith(".jsonl"))
 
 
 # ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): **예상(expectation)과 결과(outcome)를 가른다.**
@@ -187,31 +211,52 @@ F1_FRESH_REASONS = ("no_session", "no_session_file")
 #   예약)·skip(빈 셸)·fail(관문 Hold 포함)·unknown 은 증거가 아니다. `awakened_at` 래치는 topology 에서 하이드
 #   레이션될 수 있어(역사 래치) 이 기동의 증거로 쓰지 않는다(codex 지적).
 F1_ACCEPTED_REINJECT_KINDS = ("ack", "injected")
+#   좌석 결속 세션 신원(`cys status --json`.surfaces[].registered_session_id — SessionStart 훅이 자기 pane 에서 등록한
+#   transcript 의 stem)을 기다리는 폴링 횟수(1.5s 간격 · 상수 · 노브 아님). 훅은 기동 직후 발화하므로 보통 첫 시도에
+#   잡힌다 — 이것은 재핀 지연(usage 수집기 5s 백오프)을 기다리는 창이다.
+F1_REGISTERED_GRACE_TRIES = 6
+#   세션 id 는 파일명 한 조각이어야 한다(경로 구분자·공백 금지) — 화면·문자열 유래 값이 파일 경로로 승격되지 않게.
+F1_SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+# `cys reinject --check` 의 **줄 단위** 안정 문면(src/bin/cys.rs run_reinject · 검체가 소스 핀으로 대조).
+_REINJECT_ACK_LINE_RE = re.compile(r"(?m)^디렉티브 생존 확인 \(ACK 수신\)")
+_REINJECT_INJECTED_LINE_RE = re.compile(r"(?m)^reinjected \d+ bytes → surface:")
+_REINJECT_SKIP_LINE_RE = re.compile(r"(?m)check reinject skip")
+_REINJECT_NOACK_RE = re.compile(r"\[reinject\] ACK 없음")
 
 
 def classify_reinject_result(rc, stdout, stderr):
-    """`cys reinject --check` 결과 → 구조화 증거 종류(리뷰 R1). CLI 의 안정 토큰만 본다:
-    'ACK'(디렉티브 생존 확인 (ACK 수신)) · 'reinjected'(reinjected N bytes) · 'skip'(빈 셸 check reinject skip) ·
-    stderr '--queued'(타이핑 가드 큐 전환). rc≠0(관문 Hold 등)=fail · rc 0 인데 판독 불가=unknown(증거 아님)."""
+    """`cys reinject --check` 결과 → 구조화 증거 종류(리뷰 R1 · R1b 강화). 판독은 CLI 의 **줄 단위** 문면만 본다 —
+    부분 문자열(종전 `"ACK" in out`)은 role 이름(`… (BACKEND)`) 같은 임의 텍스트에 위조됐다(codex major).
+    순서(fail-closed): rc≠0=fail → stderr 의 큐 전환(`--queued`)은 **어느 양성 종류보다 먼저** queued(배달 예약은
+    증거 아님) → ack 줄 ∧ `ACK 없음` 동반(한 호출에서 상호배제 · 모순 출력) = unknown → ack → injected → skip → unknown."""
     out = stdout or ""
     err = stderr or ""
     if rc != 0:
         return "fail"
-    if "ACK" in out:
+    if "--queued" in err:
+        return "queued"
+    ack = _REINJECT_ACK_LINE_RE.search(out) is not None
+    if ack and _REINJECT_NOACK_RE.search(err):
+        return "unknown"   # 모순 출력은 성공 증거가 아니다
+    if ack:
         return "ack"
-    if "reinjected" in out:
-        return "queued" if "--queued" in err else "injected"
-    if "skip" in out:
+    if _REINJECT_INJECTED_LINE_RE.search(out):
+        return "injected"
+    if _REINJECT_SKIP_LINE_RE.search(out):
         return "skip"
     return "unknown"
 
 
-_REINJECT_KIND_RE = re.compile(r"\bkind=([a-z]+)")
+#   stage_reinject 가 쓰는 두 형식만 인정(`reinject rc=<n> kind=<k> …` · `reinject skip kind=skip: …`) · 종류 뒤에 경계 요구
+#   (`kind=ack_bad` 의 접두 `ack` 를 받지 않는다).
+_REINJECT_KIND_RE = re.compile(r"^reinject (?:rc=-?\d+|skip) kind=([a-z]+)(?![A-Za-z0-9_])")
 
 
 def _reinject_kind(evidence):
-    """stage_reinject 증거 문자열(`… kind=<k> …`)에서 종류를 꺼낸다. 표기 부재(구판 저널)=unknown."""
-    m = _REINJECT_KIND_RE.search(evidence or "")
+    """stage_reinject 증거 문자열(`reinject rc=N kind=<k> …`)에서 종류를 꺼낸다. 표기 부재·형식 이탈(구판 저널·
+    stdout 에 섞인 `kind=`)=unknown."""
+    m = _REINJECT_KIND_RE.match(evidence or "")
     return m.group(1) if m else "unknown"
 
 
@@ -227,13 +272,21 @@ def _surface_status_row(socket, surface):
     return None
 
 
-def f1_fresh_verify(rr, row):
+def f1_fresh_verify(rr, row, session_file_exists=None):
     """F-1 fresh **예상** 역할의 verify 판정(순수 함수) → (outcome, missing_reason_or_None, evidence).
 
-    'fresh' 는 (a) status 행이 있고 exited=false ∧ agent_alive=true ∧ **gate_pending 키가 있고 null**(관문 통과 —
-    키 부재(구 데몬)·객체(보류)·stale 표식 모두 미통과) ∧ (b) 이 기동의 주입 증거 reinject∈{ack, injected} 일 때만.
-    하나라도 빠지면 'unverified' 와 빠진 항목(사람이 읽는 사유). observed_sid 는 요구하지 않는다(usage 수집기
-    재핀 지연은 각성과 독립 — codex 지적) — 호출부가 사유에 병기만 한다."""
+    'fresh' 는 세 축이 **전부** 있을 때만:
+      (a) 좌석: status 행이 있고 exited=false ∧ agent_alive=true ∧ **gate_pending 키가 있고 null**(관문 통과 — 키 부재
+          (구 데몬)·객체(보류)·stale 표식 모두 미통과);
+      (b) 이 기동의 주입 증거 reinject∈{ack, injected};
+      (c) ★세션 소유·신선 증거(리뷰 R1b · codex major): `rr["observed_sid"]` 가 **좌석 결속 출처**(`observed_sid_source
+          == "registered"` — SessionStart 훅이 자기 pane 에서 등록한 transcript stem)이고, 파일명 한 조각이며, 스폰 전
+          재고 `rr["fresh_pre_sids"]` 에 **없고**, `<fresh_pre_dir>/<sid>.jsonl` 이 **지금 있다**.
+          재고에 있으면 provenance="pre_existing"(기존 대화 재개 의심 · 타 역할 세션이거나 stale 신원 — fork 의심으로
+          라벨하되 '증명된 타 세션' 이라 주장하지 않는다). 휴리스틱(topology mtime stash)·화면 유래 신원은 소유 증거가
+          아니라 미확정이다. 관측 전(None)은 transient.
+    하나라도 빠지면 'unverified' 와 빠진 항목(사람이 읽는 사유). `session_file_exists` 는 검체 주입용(기본 os.path.exists)."""
+    exists = session_file_exists or os.path.exists
     stages = (rr.get("stages") or {}) if isinstance(rr, dict) else {}
     rj = stages.get("reinject") or {}
     if not rj:
@@ -243,7 +296,9 @@ def f1_fresh_verify(rr, row):
     else:
         kind = "fail"
     ev = {"reinject_kind": kind, "g2_ack": bool((stages.get("g2_ack") or {}).get("done")),
-          "gate_cleared": None, "agent_alive": None, "exited": None}
+          "gate_cleared": None, "agent_alive": None, "exited": None,
+          "provenance": None, "observed_sid": rr.get("observed_sid") if isinstance(rr, dict) else None,
+          "observed_sid_source": rr.get("observed_sid_source") if isinstance(rr, dict) else None}
     missing = []
     if not isinstance(row, dict):
         missing.append("status 행 부재(surface 미발견 또는 status --json 실패)")
@@ -264,6 +319,31 @@ def f1_fresh_verify(rr, row):
             ev["gate_cleared"] = True
     if kind not in F1_ACCEPTED_REINJECT_KINDS:
         missing.append("이 기동의 주입 증거 미충족(reinject=%s · 인정=%s)" % (kind, "|".join(F1_ACCEPTED_REINJECT_KINDS)))
+    # (c) 세션 소유·신선 증거.
+    sid = rr.get("observed_sid") if isinstance(rr, dict) else None
+    src = rr.get("observed_sid_source") if isinstance(rr, dict) else None
+    pre = rr.get("fresh_pre_sids") if isinstance(rr, dict) else None
+    pre_dir = rr.get("fresh_pre_dir") if isinstance(rr, dict) else None
+    if not isinstance(pre, list) or not isinstance(pre_dir, str):
+        ev["provenance"] = "no_inventory"
+        missing.append("스폰 전 세션 재고 부재(구판 저널 또는 재고 판정 불가) — 새 세션인지 판정 불가")
+    elif not sid:
+        ev["provenance"] = "unobserved"
+        missing.append("좌석 결속 세션 미관측(transient · SessionStart 등록 전) — 새 세션인지 판정 불가")
+    elif src != "registered":
+        ev["provenance"] = "unbound"
+        missing.append("관측 세션 %r 의 출처가 좌석 결속이 아님(source=%s · 휴리스틱/화면 유래는 소유 증거 아님)" % (sid, src))
+    elif not F1_SID_RE.match(sid):
+        ev["provenance"] = "invalid_id"
+        missing.append("관측 세션 id 형식 이탈(%r · 파일명 한 조각이 아님)" % sid[:40])
+    elif sid in pre:
+        ev["provenance"] = "pre_existing"
+        missing.append("fork 의심: 관측 세션 %r 이 스폰 전 재고에 이미 있었다(기존 대화 재개 · 타 역할 세션 또는 stale 신원) — fresh 아님" % sid)
+    elif not exists(os.path.join(pre_dir, sid + ".jsonl")):
+        ev["provenance"] = "file_missing"
+        missing.append("관측 세션 %r 의 파일이 아직 없다(첫 메시지 미기록 또는 stale 신원) — 새 세션 확정 불가" % sid)
+    else:
+        ev["provenance"] = "new"
     ev["missing"] = missing
     if missing:
         return "unverified", " · ".join(missing), ev
@@ -285,6 +365,16 @@ def migrate_f1_journal(j):
             if isinstance(v, dict) and v.get("done") and rr.get("fresh_evidence") is None:
                 v["done"] = False
             moved.append(role)
+            continue
+        # ★리뷰 R1b: 직전 미배포 HEAD(dc3a158) 형식 — fresh 를 각성 증거만으로 확정(세션 소유·신선 증거 없음).
+        #   캐시된 '성공' 이 dedup 으로 살아남지 않게 verify done 을 해제한다(검증기만 바꾸면 캐시가 남는다 — codex).
+        if rr.get("fresh_expected") and rr.get("outcome") == "fresh":
+            fev = rr.get("fresh_evidence")
+            if not (isinstance(fev, dict) and fev.get("provenance") == "new"):
+                v = (rr.get("stages") or {}).get("verify")
+                if isinstance(v, dict) and v.get("done"):
+                    v["done"] = False
+                    moved.append(role)
     return moved
 
 
@@ -1650,6 +1740,29 @@ def stage_observe_session(socket, surface, stub, role=None):
     return None, last_txt.strip()[-200:]  # grace 소진·미관측 → transient(verify가 unverified 처리)
 
 
+def stage_observe_registered_session(socket, surface, tries=None):
+    """★F-1(리뷰 R1b): **좌석 결속** 세션 신원만 관측한다 — `cys status --json`.surfaces[].registered_session_id
+    (SessionStart 훅이 자기 pane 에서 `usage.register` 로 등록한 transcript stem · 등록마다 갱신 · 소유 게이트 통과).
+    topology 의 `session_id`(usage 수집기 mtime 휴리스틱 1회 stash · 같은 좌석 재기동은 stale 유지)와 화면 정규식은
+    공유 cwd 에서 타 좌석의 세션을 이 좌석에 귀속시킬 수 있어 fresh(세션에 대한 주장)의 증거로 쓰지 않는다.
+    grace 안에 등록이 없으면 (None, 사유) — verify 가 transient(unverified)로 다룬다. 구 데몬(키 부재)도 None."""
+    tries = max(1, F1_REGISTERED_GRACE_TRIES if tries is None else tries)
+    last = "status 행 부재"
+    for attempt in range(tries):
+        row = _surface_status_row(socket, surface)
+        if isinstance(row, dict):
+            if "registered_session_id" not in row:
+                last = "registered_session_id 키 부재(구 데몬 · 좌석 결속 신원 관측 불가)"
+            else:
+                sid = row.get("registered_session_id")
+                if isinstance(sid, str) and F1_SID_RE.match(sid):
+                    return sid, "registered(status.registered_session_id · attempt %d)" % (attempt + 1)
+                last = "registered_session_id=%r(등록 전 또는 형식 이탈)" % (sid,)
+        if attempt < tries - 1:
+            time.sleep(PHOENIX_SESSION_GRACE_SLEEP)
+    return None, "좌석 결속 세션 미관측(%d회 · %s)" % (tries, last)
+
+
 def _surface_agent_present(socket, surface):
     """★WP-11 각성핑 agent-gate: 대상 surface에 배정된 에이전트가 있는지 조회.
     True=agent 배정됨(재주입 대상)·False=agent=None 빈 셸(각성 핑 skip)·None=조회불가(보수적=진행).
@@ -1933,6 +2046,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
 
     # ── spawn 단계(공유): production=cys restore 1회 / surrogate=역할별 stub ──
     role_surface = {}
+    fresh_pre = {}   # ★F-1(리뷰 R1b): role → (reason, project_dir, pre_sids | None) — 스폰 전 세션 재고
     forced_sids = {}
     if stub_sids:
         try:
@@ -1968,6 +2082,15 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     jevent(j, role, "spawn", "retry" if attempt < SPAWN_RETRIES else "fail",
                            "%s (attempt %d)" % (msg, attempt))
         else:
+            # ★F-1(리뷰 R1b): fresh 가 예상되는 역할은 **스폰 전** 세션 재고를 찍는다(재시도 회차에 걸쳐 1회 —
+            #   앞 회차가 만든 세션은 관측 대상(살아 있는 좌석)이 아니므로 첫 회차 재고가 기준이다).
+            for role in need:
+                if role in fresh_pre:
+                    continue
+                fe, why = fresh_expected(entries.get(role, {}))
+                if fe:
+                    pre_dir, pre_sids = session_inventory(entries.get(role, {}))
+                    fresh_pre[role] = (why, pre_dir, pre_sids)
             res = spawn_production(socket, need, include_master=include_master)
             jevent(j, "*", "spawn", "ok" if res["rc"] == 0 else "fail",
                    "attempt %d · %s" % (attempt, json.dumps(res, ensure_ascii=False)))
@@ -1983,12 +2106,15 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     j["roles"][role]["expected_sid"] = entries.get(role, {}).get("session_id", "")
                     # ★F-1(0.14.31 · 리뷰 R1): cys restore 입력상 fresh **예상** — 결과 플래그(fresh_fallback)가 아니라
                     #   `fresh_expected` 에만 기록한다. 성공(outcome 'fresh')은 verify 가 각성 증거로 확정한다.
-                    fe, why = fresh_expected(entries.get(role, {}))
-                    if fe:
+                    if role in fresh_pre:
+                        why, pre_dir, pre_sids = fresh_pre[role]
                         j["roles"][role]["fresh_expected"] = True
                         j["roles"][role]["fresh_reason"] = why
+                        # ★리뷰 R1b: 스폰 전 재고 — verify 의 세션 소유·신선 증거 재료(None = 재고 판정 불가 → 미확정).
+                        j["roles"][role]["fresh_pre_dir"] = pre_dir
+                        j["roles"][role]["fresh_pre_sids"] = pre_sids
                         jevent(j, role, "spawn", "fresh_expected",
-                               "★fresh 각성 예상(F-1·%s): 이어받을 세션 없음 → cys restore 는 무 resume·전문 디렉티브+[RESTORE] 로 기동 — 각성 확정은 verify 의 증거(관문 통과 ∧ 이 기동의 주입)로만" % why)
+                               "★fresh 각성 예상(F-1·%s): 이어받을 세션 없음 → cys restore 는 무 resume·전문 디렉티브+[RESTORE] 로 기동 — 각성 확정은 verify 의 증거(관문 통과 ∧ 이 기동의 주입 ∧ 좌석 결속 새 세션)로만 · 스폰 전 재고=%s" % (why, "판정불가" if pre_sids is None else len(pre_sids)))
                         log("★F-1 fresh 예상(expected · 결과 아님): role=%s reason=%s → %s" % (role, why, ref))
                     mark_stage(j, role, "spawn", True, "cys restore → %s (attempt %d)" % (ref, attempt))
                 else:
@@ -2059,7 +2185,14 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
             save_journal(socket, ticket, j)
         # resume(observe session · ③ grace 폴링)
         if not stage_done(j, role, "resume"):
-            sid, ev = stage_observe_session(socket, surface, stub, role=role)
+            if (not stub) and j["roles"][role].get("fresh_expected"):
+                # ★F-1(리뷰 R1b): fresh 예상 역할은 **좌석 결속** 신원(registered_session_id)만 관측한다 — topology
+                #   재핀(휴리스틱 1회 stash)은 같은 좌석 재기동에서 죽은 세션의 id 를 그대로 돌려줘(stale) grace 를
+                #   즉시 끝내고, 공유 cwd 에서는 타 좌석 세션을 귀속시킬 수 있다(둘 다 fresh 의 증거가 아니다).
+                sid, ev = stage_observe_registered_session(socket, surface)
+                j["roles"][role]["observed_sid_source"] = "registered" if sid else None
+            else:
+                sid, ev = stage_observe_session(socket, surface, stub, role=role)
             j["roles"][role]["observed_sid"] = sid
             mark_stage(j, role, "resume", sid is not None, "observed_sid=%s | %s" % (sid, ev))
             jevent(j, role, "resume", "ok" if sid else "fail", "observed_sid=%s" % sid)
@@ -2096,13 +2229,18 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
             j["roles"][role]["fresh_evidence"] = fev
             if outcome == "fresh":
                 reason = ("★fresh 각성 확정(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 · 전문 디렉티브+[RESTORE]). "
-                          "증거: gate_pending=null ∧ agent_alive ∧ 이 기동의 주입 %s%s · 관측 세션=%r. "
+                          "증거: gate_pending=null ∧ agent_alive ∧ 이 기동의 주입 %s%s ∧ 좌석 결속 새 세션 %r(스폰 전 재고 %d개에 없음·파일 실재). "
                           "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)"
-                          % (why, fev["reinject_kind"], "+g2 ack" if fev["g2_ack"] else "", obs))
+                          % (why, fev["reinject_kind"], "+g2 ack" if fev["g2_ack"] else "", obs,
+                             len(j["roles"][role].get("fresh_pre_sids") or [])))
             else:
-                reason = ("★F-1 fresh 예상(%s)이나 각성 증거 미충족(transient · 정직 unverified): %s · 관측 세션=%r. "
-                          "자기채점 금지 — `cys status --json`(gate_pending·agent_alive)·`cys read-screen` 으로 확인"
-                          % (why, missing, obs))
+                label = "fork 의심" if fev.get("provenance") == "pre_existing" else "transient"
+                reason = ("★F-1 fresh 예상(%s)이나 증거 미충족(%s · 정직 unverified): %s · 관측 세션=%r. "
+                          "자기채점 금지 — `cys status --json`(gate_pending·agent_alive·registered_session_id)·`cys read-screen` 으로 확인"
+                          % (why, label, missing, obs))
+                # 관측 전(transient)이면 resume 단계를 되돌려 재실행 시 좌석 결속 신원을 다시 기다린다(게이트 완화 아님).
+                if fev.get("provenance") in ("unobserved", "file_missing") and not stub:
+                    mark_stage(j, role, "resume", False, "F-1 재관측 대상: %s" % fev.get("provenance"))
         else:
             verified = bool(exp) and bool(obs) and (exp == obs)
             outcome = "verified" if verified else "unverified"
@@ -2205,10 +2343,18 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     # ★F-1(리뷰 R1): 예상됐으나 증거로 확정하지 못한 역할은 성공으로 세지 않는다(정직 · UNVERIFIED 방향).
     fresh_expected_roles = [r for r in target_roles if j["roles"].get(r, {}).get("fresh_expected")]
     fresh_unverified_roles = [r for r in fresh_expected_roles if outcomes.get(r) != "fresh"]
+    # ★리뷰 R1b: 좌석 결속 세션이 스폰 전 재고에 있던 역할 — 기존 대화 재개(타 역할 세션·stale 신원) 의심. 증명된
+    #   타 세션이라 주장하지 않되 fresh 로도 세지 않는다.
+    fresh_fork_suspect_roles = [r for r in fresh_unverified_roles
+                                if (j["roles"].get(r, {}).get("fresh_evidence") or {}).get("provenance") == "pre_existing"]
     if fresh_unverified_roles:
-        honesty += (" ★F-1 fresh 예상이나 **미확정** 역할=%s: 관문 보류·주입 증거 부재 등으로 각성을 확정하지 "
-                    "못했다(unverified · 침묵 성공 금지). `cys status --json` 의 gate_pending·agent_alive 와 "
-                    "`cys read-screen` 으로 확인하라." % fresh_unverified_roles)
+        honesty += (" ★F-1 fresh 예상이나 **미확정** 역할=%s: 관문 보류·주입 증거 부재·좌석 결속 새 세션 미확인 등으로 "
+                    "각성을 확정하지 못했다(unverified · 침묵 성공 금지). `cys status --json` 의 gate_pending·agent_alive·"
+                    "registered_session_id 와 `cys read-screen` 으로 확인하라." % fresh_unverified_roles)
+    if fresh_fork_suspect_roles:
+        honesty += (" ★fork 의심 역할=%s: 관측된 좌석 결속 세션이 스폰 전에 이미 있던 파일이다 — fresh 가 아니라 기존 "
+                    "대화 재개(타 역할 세션이거나 stale 신원)일 수 있다. 그 좌석의 대화를 확인하고 필요하면 재기동하라."
+                    % fresh_fork_suspect_roles)
 
     result = {
         "phoenix_restore": final,
@@ -2221,6 +2367,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         # ★F-1(리뷰 R1): 예상(입력)과 확정(증거)을 따로 공개 — 미확정은 per_role_outcome 에서 unverified 다.
         "fresh_expected_roles": fresh_expected_roles,
         "fresh_unverified_roles": fresh_unverified_roles,
+        "fresh_fork_suspect_roles": fresh_fork_suspect_roles,   # ★리뷰 R1b: 스폰 전 재고에 있던 세션(fork 의심)
         "ready_roles": ready_roles,
         "ticket": ticket,
         "boot_epoch": _ACTIVE_EPOCH,      # ★Phase6: 이 부활이 판정 기준으로 쓴 세대

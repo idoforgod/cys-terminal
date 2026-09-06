@@ -184,7 +184,15 @@ jobs:
           #   `factory_reset::` 하나라 ConPTY 문면 검체(H-WIN 5종 · readiness::tests)가 Windows 에서
           #   한 번도 실행되지 않았다 — 녹색은 증거가 아니다(정본 §8). 순수 진리표라 PTY 불요.
           #   ⚠이 두 줄에 `if:`/continue-on-error 를 달지 마라(잡 머리말의 '돌지 않는 초록 금지').
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib readiness:: -- --test-threads=1
+          # ★(0.14.31 · 리뷰 R1b · W1) `readiness::` 필터에는 **실행 계측** 1건이 들어 있다 —
+          #   `pty_idle_shell_emits_no_bytes_within_valve_quiet_window`: 이 러너의 ConPTY 에 cmd.exe 를
+          #   띄워 정착 뒤 4.0s 유휴 바이트가 0 임(+ 창 뒤 명령 응답으로 펌프 생존 재증명)을 잰다. Boot
+          #   Valve 창(`quiet_secs ≥ 3`)이 Windows 전송층에서 도달 가능한지의 유일한 실기 근거다. 실패하면
+          #   밸브 단독 경로 좌석이 영구 보류(GatePending)라는 뜻이니 초록 여부가 아니라 스텝 로그의
+          #   `[pty-idle-probe] … idle_bytes=` 줄을 릴리스 노트에 병기하라(녹색은 증거가 아니다 · 정본 §8).
+          #   범위: PTY/ConPTY 전송층만이다 — ink(claude 렌더러)의 Windows 유휴 거동은 릴리스 게이트의
+          #   격리 config dir 라이브 부트 계측이 따로 본다.
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib readiness:: -- --test-threads=1 --nocapture
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib inject_guard:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).

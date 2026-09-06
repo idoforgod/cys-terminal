@@ -9791,6 +9791,9 @@ fn render_launch(cmd: &str, env: &[(String, String)]) -> (String, Vec<(String, S
 /// 적용하지 않는다**(사용자 agents.json 동결본 호환 — 키를 지우라고 요구하지 않는다).
 /// 범위는 claude 어댑터만이다: gemini 의 `--continue` 는 placeholder 가 없어 이 분기에 오지 않고,
 /// codex 의 `resume --last` 폴백은 세션 개념이 달라 종전대로 둔다(codex 검토 지적).
+///
+/// ★(리뷰 R1b) claude 의 세션 **파일** 검사는 placeholder 조기 반환보다 **앞**이다 — placeholder 없는
+/// 사용자 어댑터도 파일이 없으면 None(fresh). 파일이 있으면 그 인자를 그대로 붙인다(종전 호환).
 fn resolve_resume_suffix(
     agent: &str,
     arg: &str,
@@ -9817,29 +9820,43 @@ fn resolve_resume_suffix(
         );
         return None;
     }
+    // ★(0.14.31 · F-1 · 리뷰 R1b · codex major) claude 는 기록된 세션 **파일**이 없으면 placeholder 유무와
+    //   무관하게 어떤 접미도 붙이지 않는다. 종전엔 이 파일 검사가 아래 placeholder 조기 반환 **뒤**에 있어,
+    //   placeholder 없는 사용자 어댑터(`resume_arg: "--continue"`)는 세션 파일이 사라진 좌석에도 `--continue`
+    //   (config dir + cwd 의 역할 무관 최근 대화)를 붙였다 — 감사 에러 2 의 오염 경로 그대로이고, phoenix 는
+    //   같은 결정론 입력(cfg·cwd·id)으로 그 좌석을 fresh 로 예상하므로 예상과 실제가 갈렸다(fork 은폐).
+    //   파일이 **있으면** 사용자 어댑터의 인자는 종전대로 그대로 붙인다(하위호환 · `--continue` 를 골라 쓴
+    //   사용자의 명시 선택). 판정 입력은 결정론(cfg·cwd·id·파일시스템)뿐이다.
+    if agent == "claude" {
+        let Some(id) = session_id else {
+            return None; // 위에서 부재를 걸렀다 — 도달 불가(타입상 분기만 남긴다).
+        };
+        let cfg = config_dir
+            .map(String::from)
+            .unwrap_or_else(cys::resolve_claude_config_dir);
+        let comp = cys::claude_project_component(cwd.unwrap_or(""));
+        let jsonl = format!("{cfg}/projects/{comp}/{id}.jsonl");
+        if !std::path::Path::new(&jsonl).exists() {
+            eprintln!(
+                "[launch-agent] resume 생략: 세션 파일 미실재 ({jsonl}) — `{arg}` 를 붙이지 않고 새 세션으로 \
+                 기동(다른 대화 오염 방지 · placeholder 없는 어댑터도 동일)"
+            );
+            return None;
+        }
+        return Some(if arg.contains("{session_id}") {
+            arg.replace("{session_id}", id)
+        } else {
+            arg.to_string()
+        });
+    }
     if !arg.contains("{session_id}") {
         return Some(arg.to_string());
     }
     let Some(id) = session_id else {
         return Some(fallback.to_string());
     };
-    if agent != "claude" {
-        // 타 agent는 세션 파일 레이아웃을 검증할 수 없다 → 기존 정책 그대로(핀 부착).
-        return Some(arg.replace("{session_id}", id));
-    }
-    let cfg = config_dir
-        .map(String::from)
-        .unwrap_or_else(cys::resolve_claude_config_dir);
-    let comp = cys::claude_project_component(cwd.unwrap_or(""));
-    let jsonl = format!("{cfg}/projects/{comp}/{id}.jsonl");
-    if std::path::Path::new(&jsonl).exists() {
-        Some(arg.replace("{session_id}", id))
-    } else {
-        eprintln!(
-            "[launch-agent] resume 생략: 세션 파일 미실재 ({jsonl}) — 새 세션으로 기동(다른 대화 오염 방지)"
-        );
-        None
-    }
+    // 타 agent는 세션 파일 레이아웃을 검증할 수 없다 → 기존 정책 그대로(핀 부착).
+    Some(arg.replace("{session_id}", id))
 }
 
 /// (W1-4) restore 시 agents.json env 템플릿(`${CYS_ACCOUNT_DIR:-...}`) 대신 topology에 기록된 원
@@ -23634,11 +23651,62 @@ mod tests {
             resolve_resume_suffix("gemini", "--continue", None, Some("/nonexistent"), Some("/x"), "--continue"),
             Some("--continue".to_string())
         );
-        // placeholder 없는 arg + 세션 **있음**은 그대로(하위호환 · 사용자 어댑터 존중).
+        // ★(리뷰 R1b · codex major · **재핀** — 의도적 기본값 변경 · 정본 §4 F-1 "파일 없음이면 전문 디렉티브 +
+        //   [RESTORE]" 의 직접 귀결 · 오너 위임(CONTRACTS 머리말) 아래 마스터 결정 · 커밋 메시지 명기)
+        //   종전 핀(bc01f43): placeholder 없는 arg + 세션 id **있음** → `Some("--continue")` (파일 검사 없음).
+        //   그 핀은 세션 파일이 사라진 좌석에 `--continue`(역할 무관 최근 대화)를 붙였다 — 감사 에러 2 의
+        //   오염 경로이고 phoenix 의 fresh 예상과 갈려 fork 를 VERIFIED_FRESH 로 은폐했다. 이제 claude 는
+        //   placeholder 유무와 무관하게 **파일이 없으면 None** 이다. 파일이 있는 경우의 하위호환은 아래
+        //   `f1_placeholder_free_claude_adapter_follows_the_session_file` 이 핀한다.
         assert_eq!(
             resolve_resume_suffix("claude", "--continue", Some("s1"), Some("/nonexistent"), Some("/x"), "--continue"),
+            None,
+            "placeholder 없는 claude 어댑터가 세션 파일 없이 `--continue` 를 붙였다 — 역할 무관 최근 대화 fork(F-1 회귀)"
+        );
+        // 타 어댑터의 placeholder 없는 arg 는 파일과 무관하게 종전 그대로(F-1 범위 밖).
+        assert_eq!(
+            resolve_resume_suffix("codex", "resume --last", Some("s1"), Some("/nonexistent"), Some("/x"), "resume --last"),
+            Some("resume --last".to_string())
+        );
+    }
+
+    /// ★(0.14.31 · F-1 · 리뷰 R1b) placeholder 없는 사용자 claude 어댑터(`resume_arg: "--continue"`)는 **세션
+    /// 파일의 실재**를 따른다 — 없으면 None(fresh · 전문 디렉티브+[RESTORE]) · 있으면 인자를 그대로 붙인다
+    /// (사용자의 명시 선택 존중 · 종전 호환). 판정 입력은 결정론(cfg·cwd·id·파일시스템)뿐이라 phoenix 의
+    /// `fresh_expected`(같은 경로 규칙) 와 예상이 갈리지 않는다.
+    #[test]
+    fn f1_placeholder_free_claude_adapter_follows_the_session_file() {
+        let base = std::env::temp_dir().join(format!("cys-f1-pf-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd = "/home/x/Desktop/CYSjavis-wf";
+        let comp = cys::claude_project_component(cwd);
+        let sid = "ses-pf-777";
+        let cfg = base.join("acct").join(".cys").join("claude");
+        let proj = cfg.join("projects").join(&comp);
+        std::fs::create_dir_all(&proj).unwrap();
+        let cfg_str = cfg.to_string_lossy().into_owned();
+        // (1) 파일 부재 → None (placeholder 없는 인자도 붙이지 않는다).
+        assert_eq!(
+            resolve_resume_suffix("claude", "--continue", Some(sid), Some(&cfg_str), Some(cwd), "--continue"),
+            None
+        );
+        // (2) 파일 실재 → 인자 그대로(placeholder 없음 = 치환 없음).
+        std::fs::write(proj.join(format!("{sid}.jsonl")), "{}").unwrap();
+        assert_eq!(
+            resolve_resume_suffix("claude", "--continue", Some(sid), Some(&cfg_str), Some(cwd), "--continue"),
             Some("--continue".to_string())
         );
+        // (3) 같은 파일로 placeholder 인자는 치환 부착(종전) — 두 형태의 판정 입력이 같다.
+        assert_eq!(
+            resolve_resume_suffix("claude", "--resume {session_id}", Some(sid), Some(&cfg_str), Some(cwd), "--continue"),
+            Some(format!("--resume {sid}"))
+        );
+        // (4) 파일 실재 + 빈 id(부재) → 여전히 None(부재 검사가 파일 검사보다 앞).
+        assert_eq!(
+            resolve_resume_suffix("claude", "--continue", Some("  "), Some(&cfg_str), Some(cwd), "--continue"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ★(0.14.31 · WP-1 F-1) 디렉티브 선택의 근거가 **의도(`resume`)가 아니라 사실(`effective_resume`)**임을
@@ -23677,6 +23745,15 @@ mod tests {
         let claude_none = rbody.find("if agent == \"claude\" && session_id.is_none() {").expect("F-1 claude 부재 분기");
         let placeholder = rbody.find("if !arg.contains(\"{session_id}\") {").expect("placeholder 조기 반환");
         assert!(claude_none < placeholder, "F-1 검사가 placeholder 조기 반환 뒤에 있다 — `resume_arg: \"--continue\"` 어댑터가 우회한다");
+        // ★(리뷰 R1b) claude 의 세션 **파일** 검사 블록도 placeholder 조기 반환보다 앞이다 — 뒤에 있으면
+        //   placeholder 없는 어댑터가 파일 검사 없이 `--continue` 를 붙인다(fork 은폐 경로 재개봉).
+        // (첫 줄의 `let session_id = if agent == "claude" {` 접기 식과 구분 — 부재 분기 **뒤**에서 찾는다.)
+        let claude_file = claude_none
+            + rbody[claude_none..].find("\n    if agent == \"claude\" {\n").expect("F-1 claude 파일 검사 블록");
+        assert!(claude_none < claude_file && claude_file < placeholder,
+            "claude 세션 파일 검사가 placeholder 조기 반환 뒤에 있다 — placeholder 없는 어댑터가 파일 검사를 우회한다");
+        assert!(rbody[claude_file..placeholder].contains(".jsonl") && rbody[claude_file..placeholder].contains(".exists()"),
+            "claude 블록이 세션 파일 실재를 보지 않는다");
     }
 
     /// (W1-6b) restore 인라인 오버라이드: 기록된 원 config_dir이 launch 문자열에 리터럴로 실려야 한다.
