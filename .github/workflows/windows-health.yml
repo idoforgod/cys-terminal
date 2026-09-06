@@ -173,12 +173,19 @@ jobs:
       - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test --lib factory_reset (Windows 실기)
+      - name: cargo test --lib factory_reset + readiness + inject_guard (Windows 실기)
         shell: bash
         run: |
           set -euo pipefail
           # CYS_PACK_DIR 임시 격리 — W0-a 봉인(테스트가 라이브 ~/.cys/pack 접촉 금지) 충족.
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
+          # ★(0.14.31 · WP-1 H-1 · CONTRACTS B-8) 관문·모달 판정부(`readiness::`)와 주입 가드
+          #   (`inject_guard::`)의 검체를 Windows 실기에서 **차단 게이트**로 돈다. 종전엔 lib 필터가
+          #   `factory_reset::` 하나라 ConPTY 문면 검체(H-WIN 5종 · readiness::tests)가 Windows 에서
+          #   한 번도 실행되지 않았다 — 녹색은 증거가 아니다(정본 §8). 순수 진리표라 PTY 불요.
+          #   ⚠이 두 줄에 `if:`/continue-on-error 를 달지 마라(잡 머리말의 '돌지 않는 초록 금지').
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib readiness:: -- --test-threads=1
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib inject_guard:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
       #

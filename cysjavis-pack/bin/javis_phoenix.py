@@ -140,6 +140,28 @@ PHOENIX_PROTOCOL_VERSION = "1"
 
 # ------------------------------------------------------------------ 기반 유틸
 
+# ★F-1(0.14.31): Rust claude_project_component 와 같은 ASCII 경로 치환 — 세션 파일 대조용.
+def _claude_project_component(cwd):
+    return "".join(c if c.isascii() and (c.isalnum() or c == "-") else "-" for c in (cwd or ""))
+
+
+# ★F-1(0.14.31): CLI 와 같은 결정론 입력으로 fresh 예상만 판정(관측 아님·claude 한정).
+def fresh_expected(entry):
+    agent = entry.get("agent") or "claude"
+    if agent != "claude":
+        return False, ""
+    sid = (entry.get("session_id") or "").strip()
+    if not sid:
+        return True, "no_session"
+    cfg = entry.get("claude_config_dir")
+    cwd = entry.get("cwd")
+    if not cfg or not cwd:
+        return False, ""
+    path = os.path.join(cfg, "projects", _claude_project_component(cwd), sid + ".jsonl")
+    missing = not os.path.isfile(path)
+    return missing, "no_session_file" if missing else ""
+
+
 def _which(name):
     import shutil
     return shutil.which(name)
@@ -1826,6 +1848,14 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     role_surface[role] = ref
                     j["roles"].setdefault(role, {"stages": {}})["surface"] = ref
                     j["roles"][role]["expected_sid"] = entries.get(role, {}).get("session_id", "")
+                    # ★F-1(0.14.31): cys restore 입력상 fresh 예상 — 독약과 같은 마커·별도 사유로 정직 기록.
+                    fe, why = fresh_expected(entries.get(role, {}))
+                    if fe:
+                        j["roles"][role]["fresh_fallback"] = True
+                        j["roles"][role]["fresh_reason"] = why
+                        jevent(j, role, "spawn", "fresh_fallback",
+                               "★fresh 각성(F-1·%s): 이어받을 세션 없음 → 무 resume 재기동·전문 디렉티브+[RESTORE](cys restore)" % why)
+                        log("★F-1 fresh 예상(expected): role=%s reason=%s → %s (cys restore 결정론 입력 기준)" % (role, why, ref))
                     mark_stage(j, role, "spawn", True, "cys restore → %s (attempt %d)" % (ref, attempt))
                 else:
                     still.append(role)
@@ -1865,6 +1895,8 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                 rr["surface"] = ref
                 rr["expected_sid"] = exp            # 원 세션핀(독약) 보존 기록 — verify 에서 '보존 실패'로 정직 대조
                 rr["fresh_fallback"] = True          # ★정직: resumed→fresh 강등(세션 보존 포기·의도적 전환)
+                # ★F-1(0.14.31): 세션 부재 예상과 독약 강등을 구분한다.
+                rr["fresh_reason"] = "poison"
                 mark_stage(j, role, "spawn", True, "★fresh 강등(독약 세션): " + msg)
                 jevent(j, role, "spawn", "fresh_fallback",
                        "resume %d회 소진→fresh 강등(무 resume 재기동): %s" % (SPAWN_RETRIES, msg))
@@ -1917,8 +1949,14 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         # 별도 outcome 'fresh' 로 라벨링(원 세션 독약 → 무 resume 부활·디렉티브/원장 재주입).
         if fresh_fb:
             outcome = "fresh"
-            reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
-                      "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
+            # ★F-1(0.14.31): 보존 대상 부재는 독약 세션 보존 실패와 다르다(옛 저널은 poison).
+            why = j["roles"][role].get("fresh_reason", "poison")
+            if why in ("no_session", "no_session_file"):
+                reason = ("★fresh 각성(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 %r · 전문 디렉티브+[RESTORE] 주입). "
+                          "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)" % (why, obs))
+            else:
+                reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
+                          "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
         else:
             verified = bool(exp) and bool(obs) and (exp == obs)
             outcome = "verified" if verified else "unverified"
@@ -2006,10 +2044,18 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     "실행'해야 채워지는 상태이거나, agent 미상(claim-role 등록 pane)이라 무엇을 띄울지 "
                     "결정론으로 알 수 없는 상태다. 좌석 앞 큐 메시지는 배달 보류(보존)된다 — 침묵 성공 "
                     "아님." % manual_seats)
-    if fresh_fallback_roles:
+    # ★F-1(0.14.31): fresh 역할별 사유 공개 — 독약 강등과 보존 대상 부재를 따로 설명한다.
+    fresh_reasons = {r: j["roles"][r].get("fresh_reason", "poison") for r in fresh_fallback_roles}
+    poison_roles = [r for r in fresh_fallback_roles if fresh_reasons[r] == "poison"]
+    f1_roles = [r for r in fresh_fallback_roles if fresh_reasons[r] in ("no_session", "no_session_file")]
+    if poison_roles:
         honesty += (" ★fresh 강등 역할=%s: 원 세션이 독약(resume 불가)이라 무 resume 로 새 세션을 기동하고 "
                     "디렉티브/원장을 재주입했다(세션 보존 실패를 정직히 밝힘 — roster 는 부활 완료). "
-                    "독약 세션이 무한 재시도로 roster 를 막지 않게 유한 강등했다(§15·DRILL_LIVE_4)." % fresh_fallback_roles)
+                    "독약 세션이 무한 재시도로 roster 를 막지 않게 유한 강등했다(§15·DRILL_LIVE_4)." % poison_roles)
+    # ★F-1(0.14.31): 세션 부재로 예상된 fresh 각성은 세션 보존 실패가 아니다.
+    if f1_roles:
+        honesty += (" ★F-1 fresh 각성 역할=%s: 세션이 없어 fresh 로 각성했다(전문 디렉티브+[RESTORE]) "
+                    "— 세션 보존 실패가 아니라 보존 대상 없음." % f1_roles)
 
     result = {
         "phoenix_restore": final,
@@ -2017,6 +2063,8 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
         "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시
+        # ★F-1(0.14.31): fresh 사유를 역할별로 공개(기존 enum 유지).
+        "fresh_reasons": fresh_reasons,
         "ready_roles": ready_roles,
         "ticket": ticket,
         "boot_epoch": _ACTIVE_EPOCH,      # ★Phase6: 이 부활이 판정 기준으로 쓴 세대

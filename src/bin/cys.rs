@@ -1647,6 +1647,18 @@ fn gate_guard_screen(sid: u64) -> Option<String> {
         .and_then(|r| r["text"].as_str().map(|s| s.to_string()))
 }
 
+/// 화면 + 밸브 창 재료(`idle_quiet`)를 **한 왕복**으로 읽는다(0.14.31 · H-1 · CONTRACTS B-4).
+///
+/// 관문 보류 재관측(`gate_pending_reobserve`)의 관측 재료다 — 화면과 정적 회계를 두 왕복으로 따로
+/// 읽으면 그 사이에 값이 갈려 "화면은 프롬프트인데 정적은 옛 틱" 인 찢어진 관측이 판정에 실린다.
+/// `quiet_secs` 부재(구 데몬)는 `None`(미관측) 으로 접는다 — 환산의 소유자는 판정부 상수 하나다.
+/// 관측 실패(`None`)와 빈 화면을 타입으로 가르는 것은 [`gate_guard_screen`] 과 같은 계약이다.
+fn gate_guard_screen_with_quiet(sid: u64) -> Option<(String, Option<bool>)> {
+    let r = request("surface.read_text", json!({"surface_id": sid})).ok()?;
+    let text = r["text"].as_str()?.to_string();
+    Some((text, cys::readiness::idle_quiet_from(r["quiet_secs"].as_f64())))
+}
+
 /// 관측 실패를 **소리 내어** fail-open 으로 접는 단일 지점(P4-6).
 ///
 /// 진단 문안 전용 호출(보류 처방의 화면 꼬리)은 여기를 쓰지 않는다 — 그쪽은 판정이 아니라
@@ -8022,7 +8034,9 @@ mod seat_latch_negation_tests {
             tail_is_shell_prompt: Some(screen_tail_is_shell_prompt_on(screen, false)),
             bare_shell: Some(screen_is_bare_shell_on(screen, false)),
             time_fallback_reached: true,
-            idle_quiet: None,
+            // ★(0.14.31 · H-1 입력 보정) 재관측은 이제 같은 read_text 응답의 `quiet_secs` 로 밸브 창
+            //   재료를 **생산**한다(`gate_guard_screen_with_quiet`). 프로덕션 재료를 그대로 재현한다.
+            idle_quiet: Some(true),
             legacy_v1: false,
         };
         let recheck =
@@ -8052,6 +8066,24 @@ mod seat_latch_negation_tests {
         assert!(
             !matches!(recheck(passed, None), GateRecheck::StillHeld { .. }),
             "관문 부재 화면에서 관문 보류가 나왔다(판정 이원화)"
+        );
+        // ②′ ★(0.14.31 · H-1) 밸브 창 재료가 없으면(구 데몬 `quiet_secs` 부재 · 아직 출력 중) 통과 화면도
+        //    **채택하지 않는다** — 귀결은 NoEvidence(보류 유지 · 스폰 0 · 파괴 0)이지 StillHeld 도 Adopt 도 아니다.
+        for quiet in [None, Some(false)] {
+            let mut o = obs(passed, Some(true));
+            o.idle_quiet = quiet;
+            assert_eq!(
+                gate_pending_recheck(cys::readiness::judge(&o)),
+                GateRecheck::NoEvidence,
+                "quiet={quiet:?}: 창 재료 없이 밸브가 채택으로 갔다(아직 그리는 화면에 주입)"
+            );
+        }
+        // ②″ 잘린 면책 창(커서=No, exit · 코퍼스 식별 불가)은 재관측에서도 보류다 — 채택 Return 이 좌석을 죽인다.
+        let clipped_disclaimer: &'static str = "❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm · Esc to cancel\n";
+        assert!(cys::first_run_gates::identify(&gates, clipped_disclaimer).is_none(), "전제: 코퍼스가 식별 못 함");
+        assert!(
+            matches!(recheck(clipped_disclaimer, Some(true)), GateRecheck::StillHeld { ref gate_id, .. } if gate_id == cys::readiness::MODAL_UNKNOWN_ID),
+            "잘린 면책 창이 재관측에서 채택/미충족으로 갔다(H-1 회귀)"
         );
         // ④ 맨 셸(에이전트가 죽고 셸만 남음) — 채택하지 않는다(죽은 셸 주입 차단).
         assert_eq!(
@@ -8100,9 +8132,24 @@ mod seat_latch_negation_tests {
         );
         // ★재관측은 **스폰 0** 이다 — 기동 send 를 부르면 살아있는 입력창이 파괴된다(재난 ④).
         let reobserve = fn_body("gate_pending_reobserve");
+        // ★(0.14.31 · H-1 앵커 확장) 재관측의 화면 읽기는 `gate_guard_screen_with_quiet` 로 옮겨 갔다 —
+        //   같은 read_text 응답에서 화면과 밸브 창 재료(`quiet_secs`)를 **한 왕복**으로 읽기 위해서다.
+        //   앵커를 지우지 않고 더한다(재관측이 화면을 읽는다는 계약은 그대로다).
         assert!(
-            reobserve.contains("surface.read_text") || reobserve.contains("gate_guard_screen("),
+            reobserve.contains("surface.read_text")
+                || reobserve.contains("gate_guard_screen(")
+                || reobserve.contains("gate_guard_screen_with_quiet("),
             "재관측이 화면을 읽지 않는다 — 잴 것이 없다"
+        );
+        // 그리고 그 헬퍼가 실제로 화면 RPC 를 치고 밸브 창 재료를 함께 읽는다(H-1 배선).
+        let with_quiet = fn_body("gate_guard_screen_with_quiet");
+        assert!(
+            with_quiet.contains("surface.read_text") && with_quiet.contains("quiet_secs"),
+            "재관측 헬퍼가 화면 RPC 또는 quiet_secs 를 읽지 않는다 — 밸브가 재관측에서 영구 닫힌다"
+        );
+        assert!(
+            reobserve.contains("idle_quiet,"),
+            "재관측이 읽은 quiet 를 판정 입력에 싣지 않는다(밸브 창 미관측 = 영구 보류)"
         );
         for forbidden in ["surface.send_text", "surface.send_key", "surface.create"] {
             assert!(
@@ -9711,8 +9758,19 @@ fn render_launch(cmd: &str, env: &[(String, String)]) -> (String, Vec<(String, S
 
 /// (W1-5) resume 인자 해소 + claude 사전검증 게이트. `{session_id}` 정확 핀은 실제
 /// `<config_dir>/projects/<munge cwd>/<id>.jsonl`이 실재할 때만 부착하고, 미실재면 None을 반환해
-/// resume 자체를 생략한다(--continue 대체 금지 — 다른 대화 오염 방지). session_id 부재는 fallback,
-/// placeholder 없는 arg·타 agent(codex 등)는 무변경. 파일시스템만 접근하는 순수 함수라 단위 테스트 가능.
+/// resume 자체를 생략한다(--continue 대체 금지 — 다른 대화 오염 방지). placeholder 없는 arg·
+/// 타 agent(codex 등)는 무변경. 파일시스템만 접근하는 순수 함수라 단위 테스트 가능.
+///
+/// ★(0.14.31 · WP-1 F-1 · 에러 2) **claude 의 session_id 부재는 fallback(`--continue`)이 아니라
+/// `None`(접미 없음 = fresh)** 이다. 종전에는 `resume_arg_fallback`(기본 `--continue`)을 붙였고,
+/// `--continue` 는 config dir + cwd 의 **가장 최근 세션을 역할 무관하게** 이어받는다 — 재부팅 뒤
+/// worker 좌석이 master 의 대화를, cso 가 reviewer 의 대화를 물려받아 "에이전트가 바보가 되는"
+/// 자가치유 전멸(치명위험 ③)의 실측 경로였다(감사 2026-09-06 에러 2 · dept-1 external 35%).
+/// 세션이 없으면 fresh 로 정직하게 기동하고, 호출부는 `effective_resume=false` 로 **전문 디렉티브 +
+/// [RESTORE]** 를 주입한다(`boot_agent_on_surface`). `resume_arg_fallback` 키는 **읽되 claude 에는
+/// 적용하지 않는다**(사용자 agents.json 동결본 호환 — 키를 지우라고 요구하지 않는다).
+/// 범위는 claude 어댑터만이다: gemini 의 `--continue` 는 placeholder 가 없어 이 분기에 오지 않고,
+/// codex 의 `resume --last` 폴백은 세션 개념이 달라 종전대로 둔다(codex 검토 지적).
 fn resolve_resume_suffix(
     agent: &str,
     arg: &str,
@@ -9721,6 +9779,18 @@ fn resolve_resume_suffix(
     cwd: Option<&str>,
     fallback: &str,
 ) -> Option<String> {
+    // 빈 문자열 id 는 부재와 같다(topology 구판의 `"session_id": ""`).
+    let session_id = session_id.filter(|s| !s.trim().is_empty());
+    // ★(F-1) claude 는 세션이 없으면 **어떤 resume 인자도** 붙이지 않는다 — placeholder 없는 사용자
+    //   어댑터(`resume_arg: "--continue"`)도 같은 규칙이다(그 인자가 정확히 오염 경로다). 이 검사가
+    //   placeholder 조기 반환보다 **앞**에 있어야 우회가 없다(codex 설계 검토 Q4).
+    if agent == "claude" && session_id.is_none() {
+        eprintln!(
+            "[launch-agent] resume 생략: session_id 없음 — `{arg}`/`{fallback}` 어느 것도 붙이지 않고 \
+             fresh 로 기동한다(F-1 · `--continue` 는 역할 무관 최근 대화를 이어받아 자가치유를 오염시킨다)"
+        );
+        return None;
+    }
     if !arg.contains("{session_id}") {
         return Some(arg.to_string());
     }
@@ -10081,9 +10151,17 @@ fn gate_close_override_once() -> bool {
 /// 관문 순서와 **면책 창의 기본 포커스가 `No, exit`** 라는 것. 이 두 줄이 없으면 사용자는
 /// pane 을 보고 Return 을 눌러 스스로 노드를 종료시킨다(rc 1) — 처방이 곧 킬 스텝이 된다.
 fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str, tail: &str) {
+    // ★(0.14.31 · H-1) 코퍼스 밖 모달 보류는 처방이 다르다 — 관문 순서 안내가 아니라 "화면의 선택지를
+    //   사람이 고르라" 이고, 커서가 종료 선택지 위일 수 있음을 먼저 경고한다(Return 이 곧 종료).
+    let modal_hint = if gate == cys::readiness::MODAL_UNKNOWN_ID {
+        "\n ★이 보류는 관문 코퍼스에 **없는 선택 위젯**(잘린 관문 · 벤더 신관문 · 권한 프롬프트)이다 — \
+         화면의 선택지를 사람이 직접 고르라. 커서가 `No, exit` 위일 수 있으니 Return 전에 반드시 확인하라."
+    } else {
+        ""
+    };
     eprintln!(
         "[launch-agent] ★관문 보류(gate={gate}) — {} 을(를) **닫지 않았다**. \
-         데몬이 '{agent}' 프로세스 생존을 관측했다(role={role}).\n\
+         데몬이 '{agent}' 프로세스 생존을 관측했다(role={role}).{modal_hint}\n\
          사람이 1회 조치하면 이 좌석을 그대로 쓴다:\n\
          \x20 1) `cys read-screen --surface {}` 로 화면을 확인하라 — 첫기동 관문 순서는 \
          테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내다.\n\
@@ -10116,23 +10194,39 @@ fn boot_agent_on_surface(
     config_dir: Option<&str>,
 ) -> Result<BootVerdict, String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
-    if resume {
+    // ★(0.14.31 · WP-1 F-1) `requested_resume`(호출부의 의도) 와 `effective_resume`(접미가 **실제로**
+    //   붙었는가) 를 가른다. 종전엔 하나의 `resume` 가 둘을 겸해, 세션 파일이 없어 접미가 생략된
+    //   좌석(= 완전히 새 대화)에도 `[RESUME] 절대지침은 이미 보유 중이니…` 가 들어갔다 — 그 노드는
+    //   지침 없이 "재숙지만 하라" 는 말을 듣고 앉아 있는 **바보 좌석**이 된다(치명위험 ③ · 감사 에러 2).
+    //   디렉티브 선택의 근거는 의도가 아니라 **사실**(접미 부착)이어야 한다.
+    let requested_resume = resume;
+    let mut effective_resume = false;
+    if requested_resume {
         if let Some(arg) = spec["resume_arg"].as_str() {
-            // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --continue).
+            // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --resume <id>).
+            // `resume_arg_fallback` 은 읽되 claude 에는 적용되지 않는다(`resolve_resume_suffix` doc).
             let fallback = spec["resume_arg_fallback"].as_str().unwrap_or("--continue");
             if let Some(resolved) =
                 resolve_resume_suffix(agent, arg, session_id, config_dir, cwd, fallback)
             {
                 cmd.push(' ');
                 cmd.push_str(&resolved);
+                effective_resume = true;
             }
         }
+    }
+    if requested_resume && !effective_resume {
+        eprintln!(
+            "[launch-agent] fresh 각성(role={role} · agent={agent}): resume 이 요청됐으나 이어받을 \
+             세션이 없다 — 전문 디렉티브를 주입한다([RESTORE] 복원 지시는 호출부가 뒤에 붙인다)"
+        );
     }
     let delay = spec["inject_delay_secs"].as_u64().unwrap_or(12);
     // resume 복원 노드엔 전문 디렉티브를 재주입하지 않는다 — 직전 컨텍스트(.jsonl resume)에 이미
     // WORKER/REVIEWER_DIRECTIVE가 들어 있어, 전문 재주입은 토큰 2배·중복 지침 혼선 + 거대 주입으로
     // resume 직후 컨텍스트 임계(clear)를 유발한다(적대검증 serious). resume 시엔 짧은 복귀 가드만.
-    let directive = if resume {
+    // ★(F-1) 판단 근거는 `effective_resume` 다 — 접미가 실제로 붙은 좌석만 직전 컨텍스트를 가진다.
+    let directive = if effective_resume {
         format!(
             "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침은 이미 보유 중이니 \
              재숙지만 하고, _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
@@ -10404,7 +10498,10 @@ fn boot_agent_on_surface(
             //   프롬프트가 곧 `❯` 라서 꼬리 술어를 밸브에 쓰면 건강 pane 이 상시 차단된다.
             bare_shell: Some(screen_is_bare_shell(text)),
             time_fallback_reached: std::time::Instant::now() >= time_fallback_at,
-            idle_quiet: None,
+            // ★(0.14.31 · H-1 · CONTRACTS B-4) Boot Valve 의 창 재료 — 데몬이 같은 read_text 응답에
+            //   실어 준 `quiet_secs`(마지막 PTY 출력 이후 경과 초). 구 데몬(키 부재)은 `None`(미관측)
+            //   → 밸브 닫힘(마커·시간 폴백 경로는 그대로). 임계·환산은 판정부 상수 하나가 소유한다.
+            idle_quiet: cys::readiness::idle_quiet_from(screen["quiet_secs"].as_f64()),
             legacy_v1: readiness_v1,
         };
         match cys::readiness::judge(&obs) {
@@ -10717,7 +10814,7 @@ fn gate_pending_recheck(v: cys::readiness::Verdict) -> GateRecheck {
 /// 떠 있는 한 어느 쪽도 Ready 를 내지 못한다. 시간 폴백은 참으로 준다(이 좌석은 이미 준비
 /// 예산을 한 번 다 쓴 좌석이라 '아직 이르다' 가 성립하지 않는다).
 fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
-    let Some(screen) = gate_guard_screen(sid) else {
+    let Some((screen, idle_quiet)) = gate_guard_screen_with_quiet(sid) else {
         // 화면 관측 실패는 **판정 불가**다 — 보류 유지(fail-closed · P4-6 의 loud 규율).
         eprintln!(
             "[boot] 관문 보류 재관측: 화면을 읽지 못했다({}) — 보류 유지(스폰·회수·파괴 0)",
@@ -10739,7 +10836,9 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
         tail_is_shell_prompt: Some(screen_tail_is_shell_prompt(&screen)),
         bare_shell: Some(screen_is_bare_shell(&screen)),
         time_fallback_reached: true,
-        idle_quiet: None,
+        // ★(0.14.31 · H-1) 재관측도 밸브 창 재료를 **생산**한다 — 같은 read_text 응답의 `quiet_secs`.
+        //   `None` 이면 밸브가 닫혀 재관측은 마커 화면 폴백만 남는다(보류 유지 · 파괴 0).
+        idle_quiet,
         legacy_v1: cys::readiness::legacy_v1(),
     };
     gate_pending_recheck(cys::readiness::judge(&obs))
@@ -22075,8 +22174,11 @@ mod tests {
             tail_is_shell_prompt: Some(screen_tail_is_shell_prompt_on(screen, windows)),
             // ★(P3-0) 밸브의 AND 항은 이 축이다 — 꼬리 술어가 아니다.
             bare_shell: Some(screen_is_bare_shell_on(screen, windows)),
-            time_fallback_reached: false,
-            idle_quiet: None,
+            // ★(0.14.31 · H-1 입력 보정) 밸브 **창**(예산 소진 ∧ 출력 정적)은 열어 두고 잰다 — 이
+            //   헬퍼의 축은 커널 사실 × 맨 셸 판별이다. 창 자체의 진리표는 판정부 검체
+            //   `readiness::tests::boot_valve_requires_time_fallback_and_quiet_output` 이 소유한다.
+            time_fallback_reached: true,
+            idle_quiet: Some(true),
             legacy_v1: false,
         };
         matches!(
@@ -22125,15 +22227,29 @@ mod tests {
 
         // ③ ★밸브의 존재 이유는 살아있다(오부정 방지 축 — 이 항이 깨지면 수리가 과잉이다):
         //    델타에 `❯` 가 안 실리는 TUI 는 화면을 그리고 있으므로 꼬리가 셸 프롬프트가 아니다.
+        //    ★(0.14.31 · H-1 픽스처 이사) 종전 픽스처는 신기능 안내 **관문 화면**(질문 + 확인/취소
+        //    푸터)이었다 — 그 화면은 이제 공통 모달 거부가 **보류**한다(아래 ③″ 가 그 사실을 박제).
+        //    밸브의 시험 대상은 '관문 아닌 살아있는 TUI' 이므로 상태줄(`? for shortcuts`) 화면으로 옮긴다.
         let live_tui = "PS C:\\Users\\x> claude --dangerously-skip-permissions\n\
                         ─ Claude Code ─\n\
-                        Try the new fullscreen renderer?\n\
-                        Enter to confirm · Esc to cancel";
+                        \x20 Welcome back user!   Opus 5 (1M context) · Claude Max\n\
+                        ? for shortcuts";
         assert!(
             valve_fires(alive, live_tui, true),
             "살아있는 TUI 에서 밸브가 닫혔다 — readiness 영구 오부정 → 건강 pane 롤백 close 재발"
         );
         assert!(valve_fires(alive, live_tui, false));
+        // ③″ ★(0.14.31 · H-1) 종전 픽스처(관문 화면 · 코퍼스 미공급 = 코퍼스가 모르는 새 관문의 모사)는
+        //    커널 생존·맨 셸 아님·창 개방이 전부 참이어도 **보류**다 — 모달 어휘가 전경이면 밸브도 열지 않는다.
+        let live_modal = "PS C:\\Users\\x> claude --dangerously-skip-permissions\n\
+                        ─ Claude Code ─\n\
+                        ❯ 1. Yes, try it\n\
+                        \x20 2. Not now\n\
+                        Enter to confirm · Esc to cancel";
+        assert!(
+            !valve_fires(alive, live_modal, true) && !valve_fires(alive, live_modal, false),
+            "코퍼스가 모르는 선택 위젯 화면에 밸브가 열렸다 — 그 주입 Return 이 선택지를 누른다(H-1 회귀)"
+        );
         // ★(P3-0) ③′ **꼬리가 `❯` 인 살아있는 TUI** — 이 부류가 위 픽스처의 사각이었다.
         //   위 `live_tui` 는 꼬리가 `Enter to confirm · Esc to cancel` 이라 애초에 셸 프롬프트
         //   술어에 걸리지 않았고, 그래서 "건강 pane 의 꼬리가 곧 입력 캐럿" 이라는 **상시 상태**가
@@ -23422,16 +23538,76 @@ mod tests {
             resolve_resume_suffix("codex", arg, Some("s1"), Some("/nonexistent"), Some("/x"), "resume --last"),
             Some("--resume s1".to_string())
         );
-        // session_id 부재 → fallback.
+        // ★(0.14.31 · WP-1 F-1 · 의도적 기본값 변경 — 정본 §4 F-1 · 오너 위임 승인 2026-09-06)
+        //   claude 의 session_id 부재는 fallback(`--continue`)이 **아니라 None(fresh)** 이다. 종전 핀
+        //   (`Some("--continue")`)은 재부팅 뒤 좌석이 역할 무관 최근 대화를 물려받는 자가치유 전멸
+        //   (감사 에러 2 · dept-1 external 35%)의 원인이었다. 빈 문자열 id 도 부재다.
+        for none_like in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                resolve_resume_suffix("claude", arg, none_like, Some("/nonexistent"), Some("/x"), "--continue"),
+                None,
+                "claude 세션 부재({none_like:?})에 resume 인자가 붙었다 — `--continue` 오염 경로 재개봉"
+            );
+        }
+        // placeholder 없는 사용자 어댑터(`resume_arg: "--continue"`)도 claude 세션 부재면 붙이지 않는다
+        // (그 인자가 정확히 오염 경로다 — 검사가 placeholder 조기 반환보다 앞에 있어야 우회가 없다).
         assert_eq!(
-            resolve_resume_suffix("claude", arg, None, Some("/nonexistent"), Some("/x"), "--continue"),
+            resolve_resume_suffix("claude", "--continue", None, Some("/nonexistent"), Some("/x"), "--continue"),
+            None
+        );
+        // 범위는 claude 만이다 — codex 의 `resume --last` 폴백(세션 개념이 다름)은 종전 그대로.
+        assert_eq!(
+            resolve_resume_suffix("codex", arg, None, Some("/nonexistent"), Some("/x"), "resume --last"),
+            Some("resume --last".to_string())
+        );
+        // gemini 는 placeholder 없는 `--continue` 를 선언한다(agents.json) — 종전 그대로 부착.
+        assert_eq!(
+            resolve_resume_suffix("gemini", "--continue", None, Some("/nonexistent"), Some("/x"), "--continue"),
             Some("--continue".to_string())
         );
-        // placeholder 없는 arg는 그대로(하위호환).
+        // placeholder 없는 arg + 세션 **있음**은 그대로(하위호환 · 사용자 어댑터 존중).
         assert_eq!(
             resolve_resume_suffix("claude", "--continue", Some("s1"), Some("/nonexistent"), Some("/x"), "--continue"),
             Some("--continue".to_string())
         );
+    }
+
+    /// ★(0.14.31 · WP-1 F-1) 디렉티브 선택의 근거가 **의도(`resume`)가 아니라 사실(`effective_resume`)**임을
+    /// 소스로 못 박는다 — 접미가 붙지 않은 좌석(새 대화)에 `[RESUME] 절대지침은 이미 보유 중` 이 들어가면
+    /// 그 노드는 지침 없이 앉아 있는 바보 좌석이다(치명위험 ③ · 감사 에러 2).
+    #[test]
+    fn directive_choice_follows_effective_resume_source_pin() {
+        let src = include_str!("cys.rs");
+        let bi = src.find("fn boot_agent_on_surface(").expect("부트 공용 함수");
+        // 문자 경계 안전 슬라이스 — 본문이 한글이라 바이트 오프셋으로 자르면 패닉한다(형제 핀과 같은 규율).
+        let bend = src[bi..]
+            .find("\nfn inject_directive_after_ready(")
+            .map(|e| bi + e)
+            .unwrap_or(src.len());
+        let body = &src[bi..bend];
+        for anchor in [
+            "let requested_resume = resume;",
+            "let mut effective_resume = false;",
+            "effective_resume = true;",
+            "let directive = if effective_resume {",
+            "if requested_resume && !effective_resume {",
+        ] {
+            assert!(body.contains(anchor), "F-1 배선 결손: {anchor}");
+        }
+        assert!(
+            !body.contains("let directive = if resume {"),
+            "디렉티브 선택이 다시 의도(`resume`)를 근거로 삼는다 — 세션 없는 좌석에 [RESUME] 이 들어간다(F-1 회귀)"
+        );
+        // resolve_resume_suffix: claude 세션 부재 검사가 placeholder 조기 반환보다 **앞**에 있다.
+        let ri = src.find("fn resolve_resume_suffix(").expect("resume 해소 함수");
+        let rend = src[ri..]
+            .find("\nfn apply_config_dir_override(")
+            .map(|e| ri + e)
+            .unwrap_or(src.len());
+        let rbody = &src[ri..rend];
+        let claude_none = rbody.find("if agent == \"claude\" && session_id.is_none() {").expect("F-1 claude 부재 분기");
+        let placeholder = rbody.find("if !arg.contains(\"{session_id}\") {").expect("placeholder 조기 반환");
+        assert!(claude_none < placeholder, "F-1 검사가 placeholder 조기 반환 뒤에 있다 — `resume_arg: \"--continue\"` 어댑터가 우회한다");
     }
 
     /// (W1-6b) restore 인라인 오버라이드: 기록된 원 config_dir이 launch 문자열에 리터럴로 실려야 한다.

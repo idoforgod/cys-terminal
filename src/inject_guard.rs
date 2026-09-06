@@ -181,16 +181,34 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
     if o.awakened != Some(false) {
         return Decision::Send;
     }
-    let Some(g) = first_run_gates::identify(o.gates, o.screen) else {
-        return Decision::Send;
-    };
-    if allow_gate_id == Some(g.id.as_str()) {
-        return Decision::Send;
-    }
-    let hit = GateHit {
-        id: g.id.clone(),
-        title: g.title.clone(),
-        human_only: g.passability == Passability::HumanOnly,
+    // ★(0.14.31 · WP-1 H-1) 모달 어휘는 **readiness 와 같은 함수**로 본다(판정 분리 금지 — 두 판정기가
+    //   갈리면 "부트 폴링은 보류인데 주입 가드는 통과" 라는 반쪽 그물이 된다).
+    let modal = crate::readiness::modal_signature(o.screen);
+    let hit = match first_run_gates::identify(o.gates, o.screen) {
+        Some(g) => {
+            // 구멍은 **id 하나**다 — 그리고 그 관문이 떠 있어도 선택 커서가 **종료 선택지** 위에 있으면
+            // 구멍은 닫힌다(0.14.31): 그 Return 은 통과가 아니라 종료다(2.1.261 폴더신뢰의 기본 포커스가
+            // `No, exit` 로 실측됐다 — CONTRACTS B-7 · 종전 액션이면 좌석 사망). 조여지는 방향만.
+            let cursor_on_exit = modal.as_ref().is_some_and(|m| m.cursor_on_exit);
+            if allow_gate_id == Some(g.id.as_str()) && !cursor_on_exit {
+                return Decision::Send;
+            }
+            GateHit {
+                id: g.id.clone(),
+                title: g.title.clone(),
+                human_only: g.passability == Passability::HumanOnly,
+            }
+        }
+        // 코퍼스가 모르는 화면 — 모달 어휘가 있으면 `unknown-modal` 로 보류한다(잘린 관문·새 관문).
+        // allow 구멍은 여기 **적용되지 않는다**(지목한 관문이 화면에 없다).
+        None => match modal {
+            Some(m) => GateHit {
+                id: crate::readiness::MODAL_UNKNOWN_ID.to_string(),
+                title: m.title(),
+                human_only: false,
+            },
+            None => return Decision::Send,
+        },
     };
     if o.guard_off {
         Decision::SendObserved(hit)
@@ -349,8 +367,18 @@ mod tests {
     fn healthy_screen_never_holds() {
         let gs = gates();
         assert_eq!(decide(&obs(fixtures::READY_SHELL, &gs)), Decision::Send);
-        // 관문 코퍼스가 비면 축이 통째로 없다 = 종전 동작.
-        assert_eq!(decide(&obs(fixtures::FOLDER_TRUST, &[])), Decision::Send);
+        // 관문 코퍼스가 비어도 **건강한 화면**은 종전대로 통과한다.
+        assert_eq!(decide(&obs(fixtures::READY_SHELL, &[])), Decision::Send);
+        assert_eq!(decide(&obs(fixtures::LIVE_TUI_AT_PROMPT, &[])), Decision::Send);
+        // ★(0.14.31 · WP-1 H-1 재핀 · 정본 §4 H-1 · 오너 위임 승인 2026-09-06) 종전 핀은
+        //   "코퍼스가 비면 축이 통째로 없다 = 관문 화면도 Send" 였다. 모달 거부는 **코퍼스와 독립**인
+        //   두 번째 축이므로(코퍼스는 agents.json 봉투로 비워질 수 있고, 그 순간 관문 창에 Return 이
+        //   나가던 것이 정확히 이 축이 막는 결함이다) 빈 코퍼스라도 모달 어휘가 전경이면 보류다.
+        //   종전 동작으로 되돌리는 손잡이는 코퍼스 비우기가 아니라 롤백 스위치(가드 노브·마스터)다.
+        match decide(&obs(fixtures::FOLDER_TRUST, &[])) {
+            Decision::Hold(h) => assert_eq!(h.id, crate::readiness::MODAL_UNKNOWN_ID),
+            other => panic!("빈 코퍼스에서 관문 화면에 주입이 허용됐다(코퍼스 비우기 = 그물 해제): {other:?}"),
+        }
     }
 
     /// ★생애 창 상한 — 치명위험 ①. 각성한 노드가 관문 문면을 **본문으로** 출력해도
@@ -622,5 +650,113 @@ mod tests {
             gates().iter().any(|g| g.id == GATE_FOLDER_TRUST),
             "코퍼스에 {GATE_FOLDER_TRUST} 가 없다 — 자동확인 예외 구멍이 아무 관문도 가리키지 않는다"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★(0.14.31 · WP-1 H-1) 공통 모달 거부 — 가드도 **같은 함수**(`readiness::modal_signature`)를 소비한다
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 화면의 아래 n 줄(잘린 관문 — 질문 줄 소실). 관문 needle 사본을 만들지 않기 위한 변형 도우미.
+    fn clip_tail(screen: &str, n: usize) -> String {
+        let lines: Vec<&str> = screen.lines().collect();
+        let mut out = lines[lines.len().saturating_sub(n)..].join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// 실측 관문 화면에서 **커서만** 옮긴 화면(readiness 검체의 도우미와 같은 형태 · 문면 무변).
+    fn with_cursor_on(screen: &str, item: u8) -> String {
+        let want = format!("{item}.");
+        let mut out: String = screen
+            .lines()
+            .map(|l| {
+                let bare = l.trim_start_matches(['❯', ' ']);
+                if bare.starts_with(&want) {
+                    format!("❯ {bare}")
+                } else if l.starts_with('❯') {
+                    format!("  {bare}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push('\n');
+        out
+    }
+
+    /// ★본문 전송 후 Return 직전에 관문이 **잘린 채** 뜨는 경우 — 코퍼스는 식별 못 하지만 가드는 막는다.
+    #[test]
+    fn clipped_modal_between_paste_and_return_is_held_as_unknown_modal() {
+        let gs = gates();
+        let clipped = clip_tail(fixtures::TRUST_ECHO_THEN_DISCLAIMER, 3); // `❯ 1. No, exit` · `2. Yes, I accept` · 푸터
+        assert!(
+            first_run_gates::identify(&gs, &clipped).is_none(),
+            "전제 붕괴: 코퍼스가 잘린 면책 창을 식별한다면 이 검체는 모달 축을 재지 못한다"
+        );
+        match decide(&obs(&clipped, &gs)) {
+            Decision::Hold(h) => {
+                assert_eq!(h.id, crate::readiness::MODAL_UNKNOWN_ID);
+                assert!(!h.human_only);
+                assert!(h.title.contains("미등재 모달"), "{}", h.title);
+            }
+            other => panic!("잘린 면책 창(커서=No, exit)에 제출 Return 이 나간다(킬 스텝): {other:?}"),
+        }
+        // 롤백(가드 노브)은 관측 전용으로 강등한다 — 모달 폴백도 같은 스위치를 따른다(새 노브 0).
+        let mut o = obs(&clipped, &gs);
+        o.guard_off = true;
+        assert!(matches!(decide(&o), Decision::SendObserved(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
+        // 생애 창이 닫힌 뒤에는 스캔하지 않는다(치명위험 ① — 각성한 노드가 모달 어휘를 본문으로 출력해도 무관).
+        for awakened in [Some(true), None] {
+            let mut o = obs(&clipped, &gs);
+            o.awakened = awakened;
+            assert_eq!(decide(&o), Decision::Send);
+        }
+    }
+
+    /// allow 구멍은 **커서가 종료 선택지 위**에 있으면 닫힌다 — 2.1.261 폴더신뢰(기본 포커스 `No, exit`)에
+    /// 종전 자동확인 Return 이 나가면 좌석이 죽는다(CONTRACTS B-7 · 재핀은 H-2 의 몫 · 이 벨트는 그 앞을 막는다).
+    #[test]
+    fn allow_hole_closes_when_the_cursor_sits_on_the_exit_option() {
+        let gs = gates();
+        // 2.1.241 형(커서=Yes) — 구멍은 그대로 열린다(자동확인 기능 보존).
+        assert_eq!(decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        // 커서만 `No, exit` 로 옮긴 같은 관문 — 같은 id 인데 Return 은 통과가 아니라 종료다 → 보류.
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        let g = first_run_gates::identify(&gs, &on_exit).expect("커서 이동은 관문 식별을 바꾸지 않는다");
+        assert_eq!(g.id, GATE_FOLDER_TRUST);
+        match decide_allowing(&obs(&on_exit, &gs), Some(GATE_FOLDER_TRUST)) {
+            Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST, "보류 id 는 식별된 관문 그대로"),
+            other => panic!("커서가 No, exit 위인데 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}"),
+        }
+        // 전송 정책 조립도 같은 결론 — `other_gate`(=blocks) 가 참이면 `trust_send` 는 쏘지 않는다.
+        let blocked = decide_allowing(&obs(&on_exit, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+        assert!(!trust_send(&TrustObserved {
+            hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
+            other_gate: blocked, legacy_v1: false,
+        }));
+    }
+
+    /// 확인 에코·정상 프롬프트는 모달 폴백에도 걸리지 않는다(2026-07-29 킬체인 역방향 · 부트 창 안에서도).
+    #[test]
+    fn confirmation_echo_and_healthy_prompts_pass_the_modal_fallback() {
+        let gs = gates();
+        let echo_then_welcome = format!("Yes, I trust this folder ✔\n{}", fixtures::HEALTHY_WELCOME_BOX);
+        for screen in [
+            "Yes, I trust this folder ✔\n",
+            echo_then_welcome.as_str(),
+            fixtures::LIVE_TUI_AT_PROMPT,
+            fixtures::HEALTHY_WELCOME_BOX,
+            fixtures::READY_SHELL,
+            fixtures::CONFIG_THEME_SETTING,
+            fixtures::ACCOUNT_STATUS_PANEL,
+        ] {
+            assert_eq!(decide(&obs(screen, &gs)), Decision::Send, "정상 화면에서 주입이 막혔다: {screen:?}");
+        }
+        // 살아 있는 권한 프롬프트는 부트 창 안에서 **막힌다** — 디렉티브가 권한 선택지에 붙여넣어지면 안 된다.
+        assert!(decide(&obs(fixtures::LIVE_PERMISSION_PROMPT, &gs)).blocks());
+        // 그리고 그 판정은 readiness 와 **같은 함수**의 결과다(판정 분리 금지의 in-band 확인).
+        assert!(crate::readiness::modal_signature(fixtures::LIVE_PERMISSION_PROMPT).is_some());
+        assert!(crate::readiness::modal_signature("Yes, I trust this folder ✔\n").is_none());
     }
 }

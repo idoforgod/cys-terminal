@@ -3737,6 +3737,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &format!("surface {sid} not found"),
                 ));
             };
+            // ★(0.14.31 · WP-1 H-1 · CONTRACTS B-4) `quiet_secs` = 마지막 **PTY 출력** 이후 경과 초(f64).
+            //   부트 폴링(`cys.rs boot_agent_on_surface` · 관문 보류 재관측)의 Boot Valve 가
+            //   `idle_quiet = quiet_secs >= readiness::BOOT_VALVE_QUIET_SECS` 를 **생산**하는 유일한
+            //   재료다. 폴링이 이미 매 틱 read_text 를 부르므로 별도 RPC 없이 응답에 실어 왕복 0 추가.
+            //   `last_output` 은 PTY 출력 시에만 갱신된다(state.rs reader) — 사람 입력·주입은 움직이지
+            //   않는다. 구 CLI 는 이 키를 읽지 않고, 구 데몬에 대해 신 CLI 는 `None`(미관측)으로 접어
+            //   밸브를 **닫는다**(fail-closed · 마커·시간 폴백 경로는 그대로).
+            //   락은 단독으로 잡고 즉시 놓는다(아래 scrollback 락과 중첩하지 않는다 — writer 도 단독).
+            let quiet_secs = surface
+                .last_output
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                .as_secs_f64();
             // T3-14 델타 읽기: 단조 라인 커서 이후의 새 라인만 반환 (토큰 절약 모니터링)
             if let Some(since) = param_u64(&params, "since_line") {
                 let max_lines = param_u64(&params, "max_lines").unwrap_or(2000).min(10_000) as usize;
@@ -3756,7 +3770,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"surface_id": sid, "surface_ref": surface_ref(sid),
                            "text": lines.join("\n"), "line_count": lines.len(),
                            "since": start, "next_cursor": next_cursor,
-                           "latest_cursor": total, "truncated": truncated}),
+                           "latest_cursor": total, "truncated": truncated,
+                           "quiet_secs": quiet_secs}),
                 ));
             }
             let text = if let Some(lines) = param_u64(&params, "lines") {
@@ -3781,7 +3796,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "surface_ref": surface_ref(sid), "text": text,
-                       "latest_cursor": surface.line_count.load(Ordering::Relaxed)}),
+                       "latest_cursor": surface.line_count.load(Ordering::Relaxed),
+                       "quiet_secs": quiet_secs}),
             ))
         }
 
@@ -7660,6 +7676,57 @@ mod tests {
             "고유 name 폭주가 캡({MAX_HEALTH_RULES})을 넘었다: {len}"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.31 · WP-1 H-1 · CONTRACTS B-4) `surface.read_text` 응답에 `quiet_secs`(마지막 PTY 출력
+    /// 이후 경과 초 · f64) 가 **두 분기 모두**(전체 화면 · `since_line` 델타)에 실린다.
+    ///
+    /// 부트 폴링의 Boot Valve 는 이 값으로 `idle_quiet` 를 생산한다 — 키가 빠지면 CLI 는 `None`
+    /// (미관측)으로 접어 밸브가 **영구 닫힘**이다(fail-closed 방향이지만 밸브의 존재 이유인 영구
+    /// 오부정 차단이 사문화된다). 그래서 응답 스키마를 실행으로 못 박는다. `last_output` 을 5초 전으로
+    /// 되감아 값이 임계(3s) 위인지도 본다 — 되감기 불가(`checked_sub` None · 부팅 직후)면 하한만 본다.
+    #[test]
+    fn read_text_reports_quiet_secs_on_both_branches() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-quietsecs-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-quiet".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let rewound = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
+        if let Some(t) = rewound {
+            *s.last_output.lock().unwrap() = t;
+        }
+        for params in [
+            json!({"surface_id": s.id}),
+            json!({"surface_id": s.id, "since_line": 0}),
+        ] {
+            let req = Request {
+                id: json!(1),
+                method: "surface.read_text".into(),
+                params: params.clone(),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "read_text 실패: {resp}");
+            let q = resp["result"]["quiet_secs"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("quiet_secs 가 f64 로 실리지 않았다({params}): {resp}"));
+            assert!(q.is_finite() && q >= 0.0, "quiet_secs 비정상: {q}");
+            if rewound.is_some() {
+                assert!(
+                    q >= 5.0 && q < 600.0,
+                    "quiet_secs 가 되감은 last_output 을 반영하지 않는다({params}): {q}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
