@@ -103,8 +103,12 @@ dept_tombstone_remove(){
 # 착수 1줄(stderr). 미착수(모듈 부재)도 1줄 남긴다 — 주기 심박(base 스케줄 ⓑ)이 후속 수렴.
 # --force-surface 금지(주기 잡 스팸 계약 javis_formation.py _surface 주석) · CYS_STATE_DIR
 # 무재설정(싱글플라이트 락 불변식 — formation.py _state_root 주석).
+# ★WP-2 R1(리뷰): 3번째 인자 cwd — 시드한 (acctdir, cwd) 쌍과 **같은 cwd** 를 편성에 넘긴다(javis_formation ensure --cwd →
+#   _ensure_master_seat/_boot_node --cwd → cys launch-agent --cwd). 종전엔 --cwd 없이 불러 launch-agent 가 **호출자 cwd**
+#   (cys.rs run_launch_agent_opts: 미지정=호출 폴더)를 썼다 — 다른 프로젝트 폴더에서 cys-dept 를 부르면 시드는 $HOME,
+#   claude 는 그 폴더에서 떠 관문이 다시 열린다. cwd 빈값이면 종전 동작(미전달).
 formation_ensure_async(){
-  local name="$1" sock="$2" fm log logdir
+  local name="$1" sock="$2" cwd="${3:-}" fm log logdir
   fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
   if [ ! -f "$fm" ]; then
     echo "[cys-dept] WARN: $name 편성 ensure 생략(javis_formation.py 부재) — base 스케줄 심박이 후속 수렴" >&2
@@ -115,9 +119,13 @@ formation_ensure_async(){
   #   심박이 후속 수렴하므로 로그 소실은 저위험).
   logdir="$(dept_logdir "$name")"; log="$logdir/formation.log"
   mkdir -p "$logdir" 2>/dev/null || log=/dev/null
-  ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+  if [ -n "$cwd" ]; then
+    ( python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+  else
+    ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+  fi
   disown 2>/dev/null || true
-  echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open) — 로그: $log" >&2
+  echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open · cwd=${cwd:-호출자}) — 로그: $log" >&2
 }
 
 # ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
@@ -760,6 +768,20 @@ seed_trust_acct(){
   return 0
 }
 
+# ★WP-2 R1: 부서 좌석 cwd 를 **한 번** 확정해 시드·빈 셸·편성이 같은 값을 쓴다(리뷰: 시드한 cwd 와 claude 가 뜨는 cwd 가
+#   달랐다). 우선순위 ①명시(CYS_DEPT_CWD / create 카탈로그 cwd) ②레지스트리 등재 cwd(create 가 기록 · rotate/launch 복원)
+#   ③$HOME. 존재하지 않는 dir 는 건너뛴다(PTY 생성 실패 = 좌석 0 · 봉인표 ④ 방향 금지). "/" 는 $HOME 으로(cys.rs
+#   run_launch_agent_opts 루트 cwd 교정과 동일 — 시드 "/" 와 기동 $HOME 이 갈리지 않게). 출력 1줄 · 항상 rc 0.
+resolve_dept_cwd(){
+  local explicit="$1" name="${2:-}" c
+  for c in "$explicit" "$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; do
+    [ -n "$c" ] || continue
+    [ "$c" = "/" ] && c="$HOME"
+    if [ -d "$c" ]; then echo "$c"; return 0; fi
+  done
+  echo "$HOME"; return 0
+}
+
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).
 # ★NO_AUTOSTART(identify autostart 감사 2026-07-10): 읽기 프로브가 죽은 소켓에서 cysd를 되살리지 않게.
 dept_live_roles(){
@@ -1160,6 +1182,7 @@ case "$cmd" in
     #   않으면 **재기동 한 번으로 격리가 조용히 풀린다**(데몬 env 소실 → 자식 claude 가 오너 base
     #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
     acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)"
+    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")"   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
     if [ -n "$acctdir" ]; then
       mkdir -p "$acctdir" 2>/dev/null || true
       [ -d "$acctdir" ] || { echo "[cys-dept] ERROR: $name account dir 사용 불가($acctdir) — fail-closed(비격리 기동 금지)" >&2; exit 5; }
@@ -1174,8 +1197,9 @@ case "$cmd" in
         _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
         seed_credentials_win "$_credbase" "$acctdir"
       fi
-      # ★WP-2: 계정 dir 확정 직후·데몬(→claude) 기동 前 — 그 acctdir 과 부서 기본 cwd 한 쌍만(opt-in 무관).
-      seed_trust_acct "$acctdir" "${CYS_DEPT_CWD:-$HOME}"
+      # ★WP-2: 계정 dir 확정 직후·데몬(→claude) 기동 前 — 그 acctdir 과 부서 cwd(resolve_dept_cwd · 편성과 같은 값) 한 쌍만
+      #   (opt-in 무관).
+      seed_trust_acct "$acctdir" "$dept_cwd"
     fi
     _spawned=1   # ★⑦: 이번 호출에서 데몬을 실제로 스폰했는가(0=재사용) — 티켓 발급 로그 문면 구분용
     if ready "$sock"; then
@@ -1209,8 +1233,8 @@ case "$cmd" in
     #   ★⑦: 재사용 분기(_spawned=0)에서도 발급한다 — 근거는 dept_issue_ceo_ticket 함수 주석.
     dept_issue_ceo_ticket "$name" "$_spawned"
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
-    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
-    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none}). 부서 수=$(reg_count)"
+    formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
+    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none} cwd=$dept_cwd). 부서 수=$(reg_count)"
     ;;
   allocate)
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
@@ -1284,7 +1308,8 @@ PY
     # ★T11(P3-5): fork dir mkdir 직후 creds 시드(Windows·opt-in·copy-if-absent — 함수 계약 참조).
     #   원천은 위에서 해석된 바로 그 계정의 base(resolve_default_base 산출 — 다계정 경계 보존).
     seed_credentials_win "$base" "$acctdir"
-    seed_trust_acct "$acctdir" "${CYS_DEPT_CWD:-$HOME}"   # ★WP-2: fork dir 확정 직후 · 빈 셸 cwd(:new-surface --cwd)와 동일 쌍
+    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "")"   # ★WP-2 R1: 시드·빈 셸·편성 공통 cwd(명시 → $HOME · 미등재 부서)
+    seed_trust_acct "$acctdir" "$dept_cwd"   # ★WP-2: fork dir 확정 직후 · 빈 셸 cwd(:new-surface --cwd)·편성과 동일 쌍
     # ★G3(W3): account_dir 을 레지스트리에 **기록**한다 — rotate/launch 가 계정격리를 복원할 때
     #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
     #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
@@ -1326,14 +1351,14 @@ PY
       echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 master surface 존재 — 셸 생성 생략(멱등)" >&2
-    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "${CYS_DEPT_CWD:-$HOME}" >/dev/null 2>&1; then
-      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
+    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$dept_cwd" >/dev/null 2>&1; then
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=$dept_cwd)" >&2
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 번호 재사용으로 묘비명과 충돌 시 보호 재편입
-    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
-    echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir)" >&2
+    formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
+    echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir cwd=$dept_cwd)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
     ;;
   create)
@@ -1375,9 +1400,11 @@ PY
       seed_credentials_win "$_credbase" "$acctdir"
     fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
-    # ★WP-2: 계정 dir 확정 직후(포크·공유 양 분기 — 이 부서 좌석이 그 config 로 $cwd 에서 뜬다) · 카탈로그 cwd(:new-surface
-    #   --cwd "$cwd")와 동일 쌍. 공유 계정 dir 은 도구의 라이브 claude 확인이 지킨다(있으면 REFUSE → WARN·계속).
-    seed_trust_acct "$acctdir" "$cwd"
+    # ★WP-2: 계정 dir 확정 직후(포크·공유 양 분기 — 이 부서 좌석이 그 config 로 $dept_cwd 에서 뜬다) · 빈 셸·편성과 동일 쌍
+    #   (R1: 카탈로그 cwd 를 resolve_dept_cwd 로 확정 — 부재 dir/"/" 는 $HOME). 레지스트리엔 카탈로그 원값 $cwd 를 그대로
+    #   기록한다(등재 계약 불변). 공유 계정 dir 은 도구의 라이브 claude 확인이 지킨다(있으면 REFUSE → WARN·계속).
+    dept_cwd="$(resolve_dept_cwd "$cwd" "")"
+    seed_trust_acct "$acctdir" "$dept_cwd"
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
     #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
@@ -1500,14 +1527,14 @@ PY
     # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
     if dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
-    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$cwd" >/dev/null 2>&1; then
-      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (미션 파일: $MISS/$key.md)" >&2
+    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$dept_cwd" >/dev/null 2>&1; then
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=$dept_cwd · 미션 파일: $MISS/$key.md)" >&2
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 삭제→동명 재생성 시 보호 재편입
-    formation_ensure_async "$name" "$sock"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open)
-    echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock)" >&2
+    formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
+    echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock cwd=$dept_cwd)" >&2
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
