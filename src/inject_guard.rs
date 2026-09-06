@@ -62,7 +62,17 @@
 //! 둘 다 **엄격 비교**다(`== Some("0")` / `== Some("1")`) — 형제 게이트
 //! (`CYS_GATE_PENDING_CLOSE`·`CYS_READINESS_V1`)와 같은 규율로, 오타 하나로 안전장치가 조용히
 //! 뒤집히는 것을 막는다. env 를 읽는 지점은 축마다 **함수 하나**뿐이고 판정은 순수 코어에 있다.
-//! 두 스위치를 다 켜면 이 단위 착지 이전 동작으로 완전 복귀한다.
+//! 두 스위치를 다 켜면 이 단위 착지 이전의 **주입 정책**으로 복귀한다.
+//!
+//! ### ★롤백 예외 — 관문 **확인 허가**([`confirm_allowed`])는 어느 노브로도 열리지 않는다
+//!
+//! (0.14.31 · 리뷰 R2·R4 · codex) 위 두 노브와 `CYS_READINESS_V1` 은 전부 **보류를 푸는** 방향의
+//! 스위치다(관문을 봐도 보낸다 · 모달 축을 끈다 · 재전송을 되살린다). 그러나 자동확인이 쏘는 것은
+//! 본문이 아니라 **키 한 발**이고, 그 한 발의 오판 귀결은 `No, exit` 선택 = 좌석 rc 1 종료(비가역)다.
+//! 그래서 "커서가 액션 라벨 위에 있다" 는 **양성 증거**는 조여지는 방향의 벨트이고, 어떤 롤백도 그것을
+//! 면제하지 않는다(CONTRACTS B-7). 되돌릴 수 있는 것은 **몇 발 보내는가**(U-15 `CYS_TRUST_RETURN_V1`)
+//! 까지이며, **무엇을 보고 보내는가**는 아니다. 이 예외를 문서에 적어 두는 이유는, 노브를 켠 사람이
+//! "완전 복귀" 를 기대하다가 자동확인이 안 열리는 것을 결함으로 오독하지 않게 하기 위해서다.
 
 use crate::first_run_gates::{self, Gate, Passability};
 
@@ -254,9 +264,46 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
 /// 해소되지 않은 다른 선택 커서(잘린 종료 행 등)가 있으면 어느 쪽이 실제 선택인지 모르므로 거짓이다
 /// (`readiness::cursor_resolves_to_label` doc 의 경쟁 규칙).
 fn action_label_selected(gate: &Gate, screen: &str) -> bool {
+    // 활성 선택 블록의 시작은 **그 관문의 질문 문면**이 정한다(리뷰 R4) — 질문보다 앞의 커서(스크롤백
+    // 셸 프롬프트 `❯ claude` · p10k)는 이 관문의 선택지가 아니므로 모호로 세지 않는다.
+    let anchors: Vec<&str> = gate.needles.iter().map(|s| s.as_str()).collect();
     gate.action
         .as_ref()
-        .is_some_and(|a| crate::readiness::cursor_resolves_to_label(screen, &a.label))
+        .is_some_and(|a| crate::readiness::cursor_resolves_to_label(screen, &a.label, &anchors))
+}
+
+/// ★(0.14.31 · 리뷰 R4 · codex blocking) **관문 확인 키**를 지금 화면에 보내도 되는가 —
+/// 주입 허가([`decide_allowing`])와 **다른 술어**다.
+///
+/// 【왜 나누는가】 자동확인은 "텍스트를 보내도 되는가" 가 아니라 "이 화면의 **선택을 확정**해도 되는가" 를
+/// 묻는다. 두 질문의 접기 방향이 반대다:
+///   · 주입 허가는 **모르면 보낸다**(관문이 안 보이면 종전대로 — 그러지 않으면 정상 좌석이 영영 못 받는다).
+///   · 확인 허가는 **모르면 안 보낸다**(Return 한 발이 `No, exit` 을 눌러 좌석을 죽인다 · 비가역).
+/// R3 까지는 자동확인이 `decide_allowing(...).blocks()` 의 **부정**을 썼기 때문에, 코퍼스가 화면을 식별하지
+/// 못하고 모달 어휘도 못 본 잘린 렌더(부트 델타에는 질문이 있는데 화면은 `❯ No, exi` 뿐)에서 `Send` 가 나왔고
+/// 그 Return 이 부분 렌더된 종료 선택지를 눌렀다(codex R4 blocking). 그래서 확인은 **양성 증거만** 본다.
+///
+/// 【참이 되는 조건 — 전부 AND】 ① 코퍼스가 지금 화면을 **바로 그 id** 로 식별한다(미식별=거짓) ·
+/// ② 커서가 종료 라벨 위가 **아니다** · ③ 커서가 그 관문의 **액션 라벨 전문** 위에 있고 활성 선택 블록에
+/// 경쟁 커서가 없다([`action_label_selected`]).
+///
+/// 【롤백 노브로 열리지 않는다】 `CYS_READINESS_V1=1`(모달 축)·`CYS_INJECT_GATE_GUARD=0`(U-14 축)은
+/// **보류를 푸는** 노브다. 이 술어는 보류를 푸는 것이 아니라 **키를 쏘는 것을 허가**한다 — 조여지는 방향의
+/// 벨트이므로 어느 노브로도 열지 않는다(CONTRACTS B-7 · R2 에서 같은 결정을 이미 했다: 커서-종료 벨트는
+/// `guard_off` 로 열리지 않는다). 자동확인을 종전 정책으로 되돌리는 노브는 U-15 의 `CYS_TRUST_RETURN_V1`
+/// 이고, 그것은 **재전송 횟수**를 되돌릴 뿐 이 벨트를 열지 않는다(`trust_send` doc 의 같은 규율).
+///
+/// 【실패 방향】 거짓의 귀결은 `cys boot` 의 "관문 보류 · 사람 1회 조치"(가역). 참의 오판 귀결은 좌석 rc 1
+/// 종료(비가역). 그래서 모르면 거짓이다.
+pub fn confirm_allowed(o: &Observed, gate_id: &str) -> bool {
+    match first_run_gates::identify(o.gates, o.screen) {
+        Some(g) if g.id == gate_id => {
+            let on_exit = crate::readiness::modal_signature(o.screen)
+                .is_some_and(|m| m.cursor_on_exit);
+            !on_exit && action_label_selected(g, o.screen)
+        }
+        _ => false,
+    }
 }
 
 /// 관문 하나의 **질문형 needle** 만으로 화면을 판별한다(위젯 서명 AND 를 요구하지 않는다).
@@ -314,7 +361,8 @@ pub struct TrustObserved {
     pub sends: u32,
     /// 종전 재전송 상한(`BUDGET_TRUST_MAX_SENDS`).
     pub max_sends: u32,
-    /// ★U-14 축: 지금 화면에 폴더신뢰가 **아닌** 관문이 떠 있다.
+    /// ★U-14 축: 지금 화면이 이 관문의 **확인을 허가하지 않는다**([`confirm_allowed`] 의 부정).
+    /// 다른 관문이 떠 있는 경우가 원형이고, 0.14.31(리뷰 R4)부터 **미식별·모호·커서 부재**도 여기 든다.
     pub other_gate: bool,
     /// U-15 롤백 스위치 값.
     pub legacy_v1: bool,
@@ -346,6 +394,15 @@ pub struct TrustObserved {
 /// "화면에 다른 관문이 있으면 안 보낸다" 는 U-14 축이고, 그 축의 스위치는
 /// `CYS_INJECT_GATE_GUARD` 다. `legacy_v1` 로 이 항까지 열면 **하나의 스위치가 두 축을
 /// 되돌리게 되어**, 신뢰 감지 폭만 되살리려던 사람이 킬체인까지 함께 되살린다.
+///
+/// ★(0.14.31 · 리뷰 R4 · codex blocking) 이 항의 **생산자**가 바뀌었다. 종전엔
+/// `decide_allowing(..., Some(GATE_FOLDER_TRUST)).blocks()`(= 주입 허가의 부정)였는데, 그 술어는
+/// "코퍼스가 화면을 식별하지 못하고 모달 어휘도 없으면" 통과(Send)를 낸다 — 부트 델타에는 질문이
+/// 있는데 화면은 `❯ No, exi` 뿐인 잘린 렌더가 정확히 그 자리였고, 거기서 Return 이 부분 렌더된 종료
+/// 선택지를 눌렀다. 지금은 [`confirm_allowed`](양성 증거 전용)의 부정이 이 항을 채운다. 그러므로
+/// 이름은 `other_gate` 이되 의미는 **"지금 화면이 이 관문의 확인을 허가하지 않는다"** 로 넓어졌다
+/// (다른 관문 · 미식별 · 모달 부재 · 모호 · 커서 부재 전부 포함). 이름을 바꾸지 않은 이유는 이
+/// 진리표가 U-14/U-15 회귀의 핀이기 때문이다 — 필드명을 바꾸면 핀 전량이 함께 흔들린다.
 pub fn trust_send(o: &TrustObserved) -> bool {
     if !o.hit {
         return false;
@@ -371,6 +428,15 @@ mod tests {
 
     fn gates() -> Vec<Gate> {
         first_run_gates::builtin()
+    }
+
+    /// 폴더신뢰 관문의 **질문 문면**(코퍼스 소유 · 사본 0 — H-KILLCHAIN-1 ⓑ 가 이 파일의 리터럴을 금지한다).
+    fn trust_needle(gs: &[Gate]) -> String {
+        gs.iter()
+            .find(|g| g.id == GATE_FOLDER_TRUST)
+            .expect("코퍼스에 folder-trust")
+            .needles[0]
+            .clone()
     }
 
     fn obs<'a>(screen: &'a str, gs: &'a [Gate]) -> Observed<'a> {
@@ -607,7 +673,7 @@ mod tests {
         let screens = [fixtures::FOLDER_TRUST, fixtures::TRUST_ECHO_THEN_DISCLAIMER];
 
         // (guard_off, legacy_v1) → (Return 발수, 면책 창 접촉)
-        let run = |guard_off: bool, legacy_v1: bool| -> (u32, bool) {
+        let run = |guard_off: bool, legacy_v1: bool, legacy_producer: bool| -> (u32, bool) {
             // 누적 델타 — 화면이 넘어가도 질문이 그대로 남는다(since_line 이후 전량).
             let (mut delta, mut sends, mut seen_at) = (String::new(), 0u32, None::<u32>);
             let mut touched = false;
@@ -620,7 +686,13 @@ mod tests {
                 // 화면 재확인 축(U-14): 지금 떠 있는 관문이 folder-trust 가 아니면 막힌다.
                 let mut o = obs(screen, &gs);
                 o.guard_off = guard_off;
-                let other_gate = decide_allowing(&o, Some(GATE_FOLDER_TRUST)).blocks();
+                // ★(리뷰 R4) 프로덕션과 **같은 생산자**를 쓴다 — 확인 허가는 주입 허가의 부정이 아니다.
+                //   `legacy_producer` 는 구 배선(주입 허가의 부정)을 그대로 재현하는 계측 타당성 대조군용.
+                let other_gate = if legacy_producer {
+                    decide_allowing(&o, Some(GATE_FOLDER_TRUST)).blocks()
+                } else {
+                    !confirm_allowed(&o, GATE_FOLDER_TRUST)
+                };
                 let send = trust_send(&TrustObserved {
                     hit,
                     first: sends == 0,
@@ -647,16 +719,23 @@ mod tests {
             (true, false, "U-14 롤백 — U-15 의 1발 래치가 단독으로 막아야 한다"),
             (false, true, "U-15 롤백 — U-14 의 화면 재확인이 단독으로 막아야 한다"),
         ] {
-            let (sends, touched) = run(guard_off, legacy_v1);
+            let (sends, touched) = run(guard_off, legacy_v1, false);
             assert_eq!(sends, 1, "{why}: Return 이 {sends}발 나갔다(기대 1발)");
             assert!(!touched, "{why}: 면책 창에 Return 이 닿았다 — 좌석이 rc 1 로 죽는 경로");
         }
 
-        // ④ ★계측 타당성 대조군 — 두 축을 **모두** 되돌리면 결함이 재현된다(2발 · 면책 접촉).
-        //    재현되지 않으면 이 검체는 '원래 안 나는 일을 안 난다고 확인' 하는 공허한 검사다.
-        let (legacy_sends, legacy_touch) = run(true, true);
+        // ④ ★계측 타당성 대조군 — **구 배선**(주입 허가의 부정 = R3 까지의 생산자) + 두 축 롤백이면
+        //    결함이 재현된다(2발 · 면책 접촉). 재현되지 않으면 이 검체는 '원래 안 나는 일을 안 난다고
+        //    확인' 하는 공허한 검사다.
+        //    ★(리뷰 R4) 신 생산자(`confirm_allowed`)에서는 두 노브를 다 켜도 2발이 나지 않는다 —
+        //    확인 벨트는 롤백으로 열리지 않기 때문이다(모듈 doc '롤백 예외'). 그 사실 자체를 아래 ⑤가 잰다.
+        let (legacy_sends, legacy_touch) = run(true, true, true);
         assert_eq!(legacy_sends, 2, "구 정책이 2발을 쏘지 않는다 — 킬체인 서사가 틀렸다(계측 무효)");
         assert!(legacy_touch, "구 정책이 면책 창에 닿지 않는다 — 결함 재현 실패(계측 무효)");
+        // ⑤ ★(리뷰 R4 · codex) 확인 벨트는 롤백으로 열리지 않는다 — 두 노브를 다 켜도 1발·면책 미접촉.
+        let (both_knobs, both_touch) = run(true, true, false);
+        assert_eq!(both_knobs, 1, "롤백 두 개로 확인 벨트가 열려 {both_knobs}발이 나갔다");
+        assert!(!both_touch, "롤백 두 개로 면책 창에 Return 이 닿았다");
     }
 
     /// 정상 경로 회귀 0 — 관문이 없는 화면에서는 종전과 똑같이 주입·제출된다.
@@ -810,6 +889,122 @@ mod tests {
             hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
             other_gate: blocked, legacy_v1: false,
         }));
+    }
+
+    /// ★★(0.14.31 · 리뷰 R4 · codex blocking) **미식별 잘린 관문**에서 확인 키가 나가면 안 된다.
+    ///
+    /// 【재현한 결함】 누적 델타에는 폴더신뢰 질문이 있는데 **지금 화면**은 `❯ No, exi` 한 줄뿐이다(부분 렌더·
+    /// 스크롤). 코퍼스는 그 화면을 식별하지 못하고(`identify=None`) 모달 서명도 서지 않는다(완전한 종료 라벨
+    /// 없음 · 번호 행 없음 · 푸터 없음) → 종전 생산자(`decide_allowing(...).blocks()`)는 **Send**(=막지 않음)를
+    /// 냈고, 그 Return 이 부분 렌더된 `No, exit` 을 눌러 좌석이 rc 1 로 죽는다.
+    ///
+    /// 【무엇을 잰다】 ① 그 화면에서 `decide_allowing` 은 여전히 Send 다(전제가 살아 있어야 이 검체가 무언가를
+    /// 잰다) · ② `confirm_allowed` 는 거짓이다 · ③ 조립(`trust_send`)이 **0발**이다 · ④ 세 롤백 노브 조합
+    /// 어디에서도 0발이다(확인 벨트는 롤백으로 열리지 않는다).
+    #[test]
+    fn unidentified_clipped_screen_never_confirms_even_though_injection_is_permitted() {
+        let gs = gates();
+        // 잘린 화면 3종: 종료 라벨만 · 빈 화면 · 커서만.
+        // ★문면 리터럴 사본 금지(H-KILLCHAIN-1) — 질문 화면은 **코퍼스에서** 읽어 만든다.
+        let question_only = format!("{}\n", trust_needle(&gs));
+        for (label, screen) in [
+            ("종료 라벨 잘림", "❯ No, exi\n"),
+            ("빈 화면", ""),
+            ("커서만", "❯ \n"),
+            ("선택지 없이 질문만", question_only.as_str()),
+        ] {
+            assert!(
+                first_run_gates::identify(&gs, screen).is_none(),
+                "{label}: 전제 붕괴 — 코퍼스가 이 화면을 식별한다면 이 검체는 미식별 축을 재지 못한다\n{screen}"
+            );
+            for (guard_off, readiness_legacy) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut o = obs(screen, &gs);
+                o.guard_off = guard_off;
+                o.readiness_legacy = readiness_legacy;
+                assert!(
+                    !confirm_allowed(&o, GATE_FOLDER_TRUST),
+                    "{label}: 미식별 화면에서 확인 허가가 났다(guard_off={guard_off} legacy={readiness_legacy})\n{screen}"
+                );
+                for legacy_v1 in [false, true] {
+                    assert!(
+                        !trust_send(&TrustObserved {
+                            hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
+                            other_gate: !confirm_allowed(&o, GATE_FOLDER_TRUST), legacy_v1,
+                        }),
+                        "{label}: 조립이 미식별 화면에 Return 을 쐈다(좌석 사망 경로)"
+                    );
+                }
+            }
+        }
+        // ★계측 타당성 — **구 생산자**는 바로 이 화면에서 통과(Send)를 냈다(결함 재현). 재현되지 않으면
+        //   이 검체는 '원래 안 나는 일을 안 난다고 확인' 하는 공허한 검사다.
+        let clipped = "❯ No, exi\n";
+        assert_eq!(
+            decide_allowing(&obs(clipped, &gs), Some(GATE_FOLDER_TRUST)),
+            Decision::Send,
+            "구 생산자가 이 화면을 이미 막는다 — R4 blocking 서사가 틀렸다(계측 무효)"
+        );
+        assert!(crate::readiness::modal_signature(clipped).is_none(), "전제: 모달 서명도 서지 않는다");
+        // 주입 허가는 **바뀌지 않았다**(정상 좌석이 본문을 못 받는 회귀 0) — 두 술어의 접기 방향이 반대다.
+        assert_eq!(decide(&obs(fixtures::READY_SHELL, &gs)), Decision::Send);
+        assert_eq!(decide(&obs(clipped, &gs)), Decision::Send);
+        // 그러나 식별되는 정상 관문 화면에서는 확인이 정확히 열린다(자동확인 가용성 보존).
+        assert!(confirm_allowed(&obs(fixtures::FOLDER_TRUST, &gs), GATE_FOLDER_TRUST));
+        // 다른 관문 id 로는 열리지 않는다(구멍은 id 하나).
+        assert!(!confirm_allowed(&obs(fixtures::FOLDER_TRUST, &gs), "bypass-disclaimer"));
+        assert!(!confirm_allowed(&obs(fixtures::TRUST_ECHO_THEN_DISCLAIMER, &gs), GATE_FOLDER_TRUST));
+        // 각성 래치는 확인 술어를 **열지 않는다**(주입 허가의 조기 반환을 복사하지 않았다).
+        for awakened in [Some(true), None, Some(false)] {
+            let mut o = obs(clipped, &gs);
+            o.awakened = awakened;
+            assert!(!confirm_allowed(&o, GATE_FOLDER_TRUST), "awakened={awakened:?} 에서 확인이 열렸다");
+        }
+    }
+
+    /// ★(0.14.31 · 리뷰 R4 · codex blocking) 짧게 잘린 경쟁 커서·다음 줄로 접힌 선택지도 구멍을 연다 —
+    /// 어휘(라벨 앞머리)로 면제하던 자리 전량을 구조 규칙이 닫는지 관문 화면에서 직접 잰다.
+    #[test]
+    fn allow_hole_closes_for_every_short_or_wrapped_competing_cursor() {
+        let gs = gates();
+        for (label, replacement) in [
+            ("두 글자 잘림", "❯ No"),
+            ("쉼표까지 잘림", "❯ No,"),
+            ("한 글자", "❯ N"),
+            ("번호만", "❯ 2"),
+            ("다음 줄로 접힌 선택지", "❯\n  No"),
+        ] {
+            let screen = fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", replacement);
+            assert!(
+                first_run_gates::identify(&gs, &screen).is_some_and(|g| g.id == GATE_FOLDER_TRUST),
+                "{label}: 전제 붕괴 — 코퍼스가 이 화면을 폴더신뢰로 읽지 않는다\n{screen}"
+            );
+            assert!(
+                !crate::readiness::modal_signature(&screen).is_some_and(|m| m.cursor_on_exit),
+                "{label}: 전제 붕괴 — 부정 증거만으로 이미 닫혔다면 이 반례는 아무것도 재지 못한다"
+            );
+            assert!(
+                !confirm_allowed(&obs(&screen, &gs), GATE_FOLDER_TRUST),
+                "{label}: 잘린 경쟁 커서 화면에서 확인이 열렸다(그 Return 이 종료를 누른다)\n{screen}"
+            );
+            assert!(
+                decide_allowing(&obs(&screen, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
+                "{label}: 주입 가드의 allow 구멍도 열려 있다\n{screen}"
+            );
+        }
+        // 질문 재출현 잔상(codex R4 반례 ②) — 앞선 미해소 커서도 블록 안이다.
+        let ghost = format!("{}\n❯ No\n{}", trust_needle(&gs), fixtures::FOLDER_TRUST);
+        assert!(!confirm_allowed(&obs(&ghost, &gs), GATE_FOLDER_TRUST), "질문 잔상 앞 커서가 면제됐다\n{ghost}");
+        // 가용성 대조군 — 관문 문면 **이전**의 셸 잔상·꼬리 빈 프롬프트는 확인을 막지 않는다.
+        for (label, screen) in [
+            ("질문 앞 p10k 프롬프트", format!("~/work ╰─❯ ls -al\n{}", fixtures::FOLDER_TRUST)),
+            ("질문 앞 부트 명령줄", format!("❯ claude --dangerously-skip-permissions\n{}", fixtures::FOLDER_TRUST)),
+            ("꼬리 빈 입력 상자", format!("{}❯ \n", fixtures::FOLDER_TRUST)),
+        ] {
+            assert!(
+                confirm_allowed(&obs(&screen, &gs), GATE_FOLDER_TRUST),
+                "{label}: 자동확인이 닫혔다(가용성 붕괴)\n{screen}"
+            );
+        }
     }
 
     /// ★(리뷰 R2 · codex blocking) 접힌 종료 라벨(`No, ex⏎it` · CRLF)도 allow 구멍을 닫는다 — 코퍼스 식별

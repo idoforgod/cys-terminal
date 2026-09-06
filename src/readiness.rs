@@ -565,102 +565,157 @@ fn rfind_chars(hay: &[char], needle: &[char]) -> Option<usize> {
     find_all_chars(hay, needle).last().copied()
 }
 
-/// 화면 한 장의 **매칭 좌표계**(정규화 문자열 · norm→flat 접두 합 · 평탄화 문자열).
+/// 화면 한 장의 **매칭 좌표계 묶음** — 정규화(norm) · 평탄화(flat) · 원문(raw) 셋과 그 사이의 접두 합.
 ///
 /// ★(0.14.31 · 리뷰 R3) 세 벌을 함수마다 따로 만들면 소비처가 갈리는 순간 "두 판정기가 다른 공간을 본다" 는
 ///   R2 blocking 이 그대로 재발한다. 한 곳에서 만들어 [`modal_signature`]·[`cursor_resolves_to_label`] 이 공유한다.
-fn normalized_frame(screen: &str) -> (Vec<char>, Vec<usize>, Vec<char>) {
-    let norm: Vec<char> = first_run_gates::normalize(screen).chars().collect();
-    // norm 위치 → 평탄화 위치(그 앞의 비공백 문자 수) 접두 합. `normalize` 의 공백은 ' ' 하나뿐이다.
-    let mut pre: Vec<usize> = Vec::with_capacity(norm.len() + 1);
-    pre.push(0);
-    for c in &norm {
-        pre.push(pre[pre.len() - 1] + usize::from(*c != ' '));
-    }
-    let flat: Vec<char> = norm.iter().copied().filter(|c| *c != ' ').collect();
-    (norm, pre, flat)
+///
+/// ★(0.14.31 · 리뷰 R4 · codex blocking) 여기에 **원문(raw)** 축이 더해졌다. 정규화 공간은 개행까지 공백 하나로
+///   접기 때문에 **물리 행 경계가 없고**, 그래서 "이 커서 뒤에 같은 줄의 글자가 있는가" 를 물을 수 없었다.
+///   경쟁 커서 판정이 어휘(라벨 앞머리 n 자)에 의존하던 근본 이유가 그것이다 — 어휘로 재면 어휘 밖으로 잘린
+///   렌더(`❯ No` · `❯ 2`)가 전부 새어 나간다. 평탄화(flat) 열은 세 축이 **같은 하나**다(`flatten` = 모든 공백 제거).
+struct Frame {
+    norm: Vec<char>,
+    raw: Vec<char>,
+    /// raw 위치 → flat 위치 접두 합.
+    raw_pre: Vec<usize>,
+    flat: Vec<char>,
 }
 
-/// 선택 커서(`❯`) 한 행의 좌표 — 선택 번호(`N.`)의 평탄화 끝(있을 때)과 **라벨이 시작하는** 평탄화 위치.
+fn screen_frame(screen: &str) -> Frame {
+    let norm: Vec<char> = first_run_gates::normalize(screen).chars().collect();
+    let raw: Vec<char> = screen.chars().collect();
+    let mut raw_pre: Vec<usize> = Vec::with_capacity(raw.len() + 1);
+    raw_pre.push(0);
+    for c in &raw {
+        raw_pre.push(raw_pre[raw_pre.len() - 1] + usize::from(!c.is_whitespace()));
+    }
+    let flat: Vec<char> = raw.iter().copied().filter(|c| !c.is_whitespace()).collect();
+    Frame { norm, raw, raw_pre, flat }
+}
+
+/// 선택 커서(`❯`) 한 행의 좌표.
 struct CursorRow {
+    /// 커서 문자 자신의 평탄화 위치(= 그 앞의 비공백 문자 수). **위치 비교**의 기준이다.
+    cursor_flat: usize,
+    /// 선택 번호(`N.`)의 평탄화 끝(엄격 파서 · 뒤가 공백/문말일 때만).
     numbered_flat_end: Option<usize>,
+    /// 라벨이 시작하는 평탄화 위치(번호가 있으면 그 뒤 · 없으면 커서 뒤 첫 비공백).
+    /// **화면 끝까지 공백뿐이면 `flat.len()`** — 그것이 "라벨이 없다"(빈 입력 프롬프트)의 구조적 표지다.
     label_flat: usize,
 }
 
 /// 화면의 선택 커서 행 전량(등장 순). 규칙은 [`modal_signature`] ⓐⓓ 와 **같은 스캐너**다 —
 /// 판정 분리 금지(allow 구멍의 양성 증거와 모달 서명이 다른 스캐너를 쓰면 구멍이 생긴다).
-fn cursor_rows(norm: &[char], pre: &[usize]) -> Vec<CursorRow> {
+///
+/// ★스캔은 **원문**에서 한다(리뷰 R4). 커서 뒤 공백 건너뛰기는 개행도 건너뛰므로 접힌 라벨
+///   (`❯\n  1. Yes …`)은 종전 정규화 공간과 **같은 결과**를 낸다 — 바뀐 것은 물리 행 경계를
+///   함께 얻는다는 것뿐이다.
+fn cursor_rows(f: &Frame) -> Vec<CursorRow> {
+    let raw = &f.raw;
     let mut rows = Vec::new();
-    for (i, &c) in norm.iter().enumerate() {
+    for (i, &c) in raw.iter().enumerate() {
         if c != '❯' {
             continue;
         }
         let mut j = i + 1;
-        while j < norm.len() && norm[j] == ' ' {
+        while j < raw.len() && raw[j].is_whitespace() {
             j += 1;
         }
         // 선택 번호 `N.`(1~2자리) — 뒤가 공백이거나 문말이어야 번호다(`❯ 1.5 hours` 는 아니다).
         let mut k = j;
-        while k < norm.len() && norm[k].is_ascii_digit() && k - j < 2 {
+        while k < raw.len() && raw[k].is_ascii_digit() && k - j < 2 {
             k += 1;
         }
-        let numbered_end = (k > j && k < norm.len() && norm[k] == '.'
-            && (k + 1 == norm.len() || norm[k + 1] == ' '))
-            .then_some(k + 1);
+        let numbered_end = (k > j
+            && k < raw.len()
+            && raw[k] == '.'
+            && (k + 1 == raw.len() || raw[k + 1].is_whitespace()))
+        .then_some(k + 1);
         let mut label_start = j;
         if let Some(ne) = numbered_end {
             label_start = ne;
-            while label_start < norm.len() && norm[label_start] == ' ' {
+            while label_start < raw.len() && raw[label_start].is_whitespace() {
                 label_start += 1;
             }
         }
         rows.push(CursorRow {
-            numbered_flat_end: numbered_end.map(|ne| pre[ne]),
-            label_flat: pre[label_start],
+            cursor_flat: f.raw_pre[i],
+            numbered_flat_end: numbered_end.map(|ne| f.raw_pre[ne]),
+            label_flat: f.raw_pre[label_start],
         });
     }
     rows
 }
 
-/// 경쟁 선택지로 인정하는 **라벨 앞머리 길이**(평탄화 문자 수). 잘린 렌더(`No, exi` → 평탄화 `No,exi`)를
-/// 경쟁으로 세우려면 전문 일치를 요구할 수 없고, 그렇다고 1~2자로 재면 셸 잔상(`❯ Yesterday …`)까지 경쟁이
-/// 된다. 4자는 코퍼스 라벨 5종의 앞머리(`No,e` · `Yes,`)를 정확히 가르는 가장 짧은 길이다.
-const CHOICE_PREFIX_MIN: usize = 4;
-
-/// 이 커서 행이 **다른 선택지를 지목하는 것처럼 보이는가**(액션 라벨이 아닌 경쟁 커서).
+/// 이 커서 행이 **선택을 모호하게 만드는가**(해소된 행이 아닌 경쟁 커서).
 ///
-/// 판정 재료는 둘 — ⓐ 번호 붙은 커서 행(`❯ N.`)은 그 자체가 선택기의 행이다 · ⓑ 번호가 없어도 커서 뒤가
-/// 코퍼스 선택지 라벨의 앞머리([`CHOICE_PREFIX_MIN`] 자)로 시작하면 잘린 선택지 행이다. 둘 다 아니면
-/// 선택기의 행이 아니다(셸 프롬프트 잔상 `❯ ` · p10k `╰─❯` · 입력 상자) — 경쟁으로 세우지 않는다.
-fn cursor_row_competes(row: &CursorRow, flat: &[char]) -> bool {
+/// 【어휘를 버린 이유(리뷰 R4 · codex blocking)】 R3b 는 "코퍼스 라벨 앞머리 4자로 시작하면 경쟁" 이었다.
+/// 그 규칙은 어휘를 못 알아본 렌더를 **면제**한다 — `❯ No`(3자) · `❯ No,` 뒤에 푸터가 붙어 `No,E` 가 되는 렌더 ·
+/// 번호만 남은 `❯ 2` 가 전부 새어 나가고, 그때 allow 구멍이 열려 Return 이 종료 선택지를 누른다(좌석 사망).
+/// 그래서 판정 재료를 **구조**로 바꾼다:
+///   ⓐ 번호 붙은 커서 행(`❯ N.`)·점 뒤 공백 없는 번호 행(`❯ 2.No`)은 그 자체가 선택기의 행이다(위치 무관).
+///   ⓑ **선택 블록 안**(질문 문면이 처음 나타나는 자리 이후)의 커서는, 그 뒤에 글자가 하나라도 있으면 전부
+///      경쟁이다 — 어휘를 묻지 않는다.
+///
+/// 【면제는 둘뿐이고 둘 다 구조적이다】
+///   · **라벨이 아예 없다**(`label_flat == flat.len()`): 커서 뒤로 화면 끝까지 공백뿐이다 = 꼬리의 빈 입력
+///     프롬프트(`❯ ` · p10k `╰─❯ ` · 실측 NBSP 꼬리). 선택할 것이 없으므로 Return 이 선택지를 누를 수 없다.
+///     ★(리뷰 R4 · codex) **행 단위 공백**으로 재면 안 된다 — `❯⏎  No`(다음 줄로 접힌 선택지)가 빈 프롬프트로
+///     오인돼 구멍이 열린다. 그래서 "그 행의 나머지" 가 아니라 **화면 끝까지**를 본다.
+///   · **선택 블록보다 앞이다**: 그 관문의 질문이 나오기 **전**의 커서는 이 관문의 선택지가 아니다(부트 로그·
+///     스크롤백 셸 프롬프트 `❯ claude`). 블록 경계 자체를 어떻게 잡는지는 [`choice_block_start`] 참조 —
+///     **가장 이른** 질문 일치를 쓰는 것이 이 면제를 좁게 유지하는 장치다.
+fn cursor_row_competes(row: &CursorRow, flat: &[char], block_start: usize) -> bool {
     if row.numbered_flat_end.is_some() {
         return true;
     }
     // ⓐ' **점 뒤 공백이 없는** 번호 행(`❯ 2.No, exi`) — 엄격 파서(ⓓ)는 `N.` 뒤에 공백/문말을 요구해 이 렌더를
-    //    번호로 세지 않는다(`❯ 1.5 hours` 를 배제하려는 규칙이다 · codex 가 지적한 파서 경계). 경쟁 판정에서는
-    //    **글자가 이어지는 경우만** 번호로 본다 — `2.No` 는 선택지 행, `1.5` 는 아니다(숫자가 이어진다).
+    //    번호로 세지 않는다(`❯ 1.5 hours` 를 배제하려는 규칙이다). 경쟁 판정에서는 **글자가 이어지는 경우만**
+    //    번호로 본다 — `2.No` 는 선택지 행, `1.5` 는 아니다(숫자가 이어진다).
     let compact_numbered = {
         let mut k = row.label_flat;
         while k < flat.len() && flat[k].is_ascii_digit() && k - row.label_flat < 2 {
             k += 1;
         }
-        k > row.label_flat
-            && k + 1 < flat.len()
-            && flat[k] == '.'
-            && flat[k + 1].is_alphabetic()
+        k > row.label_flat && k + 1 < flat.len() && flat[k] == '.' && flat[k + 1].is_alphabetic()
     };
     if compact_numbered {
         return true;
     }
-    MODAL_CHOICE_LABELS.iter().any(|label| {
-        let cl: Vec<char> = first_run_gates::flatten(label).chars().collect();
-        let n = CHOICE_PREFIX_MIN.min(cl.len());
-        n > 0 && row.label_flat + n <= flat.len() && flat[row.label_flat..row.label_flat + n] == cl[..n]
-    })
+    if row.label_flat >= flat.len() {
+        return false; // 라벨 없음 = 빈 입력 프롬프트(선택기가 아니다)
+    }
+    row.cursor_flat >= block_start
+}
+
+/// 화면에서 **활성 선택 블록이 시작하는** 평탄화 위치 — 이 뒤의 커서는 전부 그 관문의 선택 후보로 본다.
+///
+/// 여러 anchor(그 관문의 질문형 needle) 중 **가장 이른 곳에서 시작하는** 것을 쓴다.
+///
+/// ★(리뷰 R4 · codex) 왜 "마지막 일치의 끝" 이 아니라 "가장 이른 일치의 시작" 인가: 재그리기 잔상이 섞인 화면
+///   (질문 조각 → `❯ No` → 같은 관문의 다른 질문 문면 → `❯ 1. Yes …`)에서 마지막 anchor 를 쓰면 잔상
+///   `❯ No` 가 질문보다 앞이 되어 면제된다. "질문보다 앞" 은 **셸이라는 증거가 아니다** — 가장 이른 질문을
+///   경계로 잡아야 그 관문의 문면이 시작된 뒤의 커서가 하나도 새지 않는다. 면제되는 것은 관문 문면이 아직
+///   한 글자도 나오지 않은 구간(부트 로그·셸 스크롤백)뿐이다.
+///
+/// 하나도 못 찾으면 `0` — 블록 경계를 모른다는 뜻이고, 그때는 **화면 전체가 블록**이다(fail-closed).
+fn choice_block_start(flat: &[char], anchors: &[&str]) -> usize {
+    let mut start: Option<usize> = None;
+    for a in anchors {
+        let af: Vec<char> = first_run_gates::flatten(a).chars().collect();
+        if af.is_empty() {
+            continue;
+        }
+        if let Some(p) = find_all_chars(flat, &af).first().copied() {
+            start = Some(start.map_or(p, |s: usize| s.min(p)));
+        }
+    }
+    start.unwrap_or(0)
 }
 
 /// ★(0.14.31 · 리뷰 R3 · codex blocking) 이 화면의 선택이 **모호함 없이 그 라벨로 해소되는가**
-/// (평탄화 공간 · 완전 일치 접두 · 경쟁 커서 0).
+/// (평탄화 공간 · 완전 일치 접두 · 활성 선택 블록 안의 경쟁 커서 0).
 ///
 /// 【왜 필요한가】 `inject_guard` 의 폴더신뢰 allow 구멍은 종전에 "종료 라벨 위가 **아니면** 연다"(부정 증거)였다.
 /// 잘린 렌더(`❯ 2. No, exi` · `❯ 2.No, exi` · 번호 없는 `❯ No, exi`)는 종료 확정이 아니므로 구멍이 열렸고, 그
@@ -668,30 +723,39 @@ fn cursor_row_competes(row: &CursorRow, flat: &[char]) -> bool {
 /// **양성 증거**로 뒤집는다: 커서가 코퍼스가 선언한 **액션 라벨 전문** 위에 있을 때만 연다. 잘림·미관측·모호는
 /// 전부 보류(= 좌석 보존 · 키 0 · 사람 처방)로 접힌다.
 ///
-/// 【모호는 양성을 이긴다(리뷰 R3b · codex)】 액션 라벨 위의 커서 하나로는 부족하다 — 같은 화면에 **해소되지 않은
-/// 다른 선택 커서**(`❯ 2. No, exi` 같은 잔상·부분 렌더)가 있으면 어느 쪽이 실제 선택인지 모른다. 그때는 양성
-/// 증거가 있어도 닫는다(`cursor_row_competes`). 셸 프롬프트 잔상처럼 선택기의 행이 아닌 커서는 경쟁이 아니다 —
-/// 그것까지 경쟁으로 세우면 p10k(`╰─❯`) 사용자에게 자동확인이 영영 열리지 않는다.
+/// 【모호는 양성을 이긴다(리뷰 R3b·R4 · codex)】 액션 라벨 위의 커서 하나로는 부족하다 — 같은 화면의 **질문 뒤**에
+/// 해소되지 않은 다른 선택 커서가 있으면 어느 쪽이 실제 선택인지 모른다. 그때는 양성 증거가 있어도 닫는다
+/// ([`cursor_row_competes`]). 면제는 **구조적 증거**로만 한다(질문보다 앞 · 뒤가 공백뿐인 커서) — 어휘로 면제하면
+/// 어휘 밖으로 잘린 렌더가 그대로 새어 나간다(R4 blocking 의 정확한 자리).
+///
+/// 【anchors】 그 관문의 질문형 needle 들. 활성 선택 블록의 시작을 여기서 잰다([`choice_block_start`]) —
+/// 관문 문면이 **한 글자도 나오기 전**의 커서(부트 로그·스크롤백 셸 프롬프트 `❯ claude` · p10k)만 면제되고,
+/// 그래서 자동확인 가용성이 살아 있다. 빈 목록·미발견이면 화면 전체를 블록으로 본다(가장 조이는 쪽).
 ///
 /// 【H-2 와의 결속】 WP-1 H-2 는 액션(아래 방향키 N발) **뒤에** 이 술어를 다시 재고 Return 을 보낸다 — 그때
 /// 화면은 `❯ … Yes, I trust this folder` 하나뿐이므로 구멍이 정확히 열린다(액션 경로는 막히지 않는다).
 ///
 /// 【받아들인 잔여】 커서가 화면에 **하나도 없는** 렌더는 이 술어로 판정할 수 없다 → 거짓(= 보류). 그 가용성
 /// 대가(`❯` 를 그리지 않는 렌더에서 자동확인이 열리지 않는다)는 좌석 사망보다 싸다(§3-3).
-pub fn cursor_resolves_to_label(screen: &str, label: &str) -> bool {
+pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> bool {
     let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
     if lf.is_empty() {
         return false;
     }
-    let (norm, pre, flat) = normalized_frame(screen);
-    let rows = cursor_rows(&norm, &pre);
+    let f = screen_frame(screen);
+    let block = choice_block_start(&f.flat, anchors);
+    let rows = cursor_rows(&f);
+    // 양성 증거도 **블록 안**에서만 인정한다 — 이전 화면의 `❯ … Yes …` 잔상이 새 질문 뒤의 잘린 선택을
+    // 승인하는 경로를 막는다(리뷰 R4 · codex).
     let starts_here = |r: &CursorRow| -> bool {
-        r.label_flat + lf.len() <= flat.len() && flat[r.label_flat..r.label_flat + lf.len()] == *lf
+        r.cursor_flat >= block
+            && r.label_flat + lf.len() <= f.flat.len()
+            && f.flat[r.label_flat..r.label_flat + lf.len()] == *lf
     };
     rows.iter().any(starts_here)
         && !rows
             .iter()
-            .any(|r| !starts_here(r) && cursor_row_competes(r, &flat))
+            .any(|r| !starts_here(r) && cursor_row_competes(r, &f.flat, block))
 }
 
 /// 화면에 **모달 어휘**가 있는가 — 코퍼스와 독립인 순수 술어(모듈 머리말 참조).
@@ -705,10 +769,12 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str) -> bool {
 ///                               테마·로그인 화면(질문 줄 소실 · 라벨은 코퍼스 어휘 밖)을 이것이 잡는다.
 /// 반환값의 `flat_end`·`cursor_on_exit` 는 소비처(생애 창 · allow 구멍)의 재료다.
 ///
-/// ★(0.14.31 · 리뷰 R3) 커서 행 스캐너는 [`cursor_rows`] 하나이고 좌표계는 [`normalized_frame`] 하나다 —
+/// ★(0.14.31 · 리뷰 R3) 커서 행 스캐너는 [`cursor_rows`] 하나이고 좌표계는 [`screen_frame`] 하나다 —
 ///   allow 구멍의 양성 증거([`cursor_resolves_to_label`])와 이 서명이 **같은 것을 본다**(판정 분리 금지).
+///   좌표계도 하나다([`screen_frame`] — 정규화·평탄화·원문 셋을 한 번에 만든다).
 pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
-    let (norm, pre, flat) = normalized_frame(screen);
+    let f = screen_frame(screen);
+    let (norm, flat) = (&f.norm, &f.flat);
     let mut sig = ModalSignature {
         kinds: Vec::new(),
         flat_end: 0,
@@ -730,7 +796,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
     };
 
     // ⓐ·ⓓ — 선택 커서 행(스캐너는 `cursor_rows` 하나 · allow 구멍의 양성 증거와 같은 것을 본다).
-    for row in cursor_rows(&norm, &pre) {
+    for row in cursor_rows(&f) {
         if let Some(ne) = row.numbered_flat_end {
             sig.note("cursor-on-numbered-item", ne);
         }
@@ -2067,13 +2133,96 @@ mod tests {
         assert!(sig.kinds == vec!["choice-row"] && !sig.cursor_on_exit, "{:?}", sig.kinds);
     }
 
-    /// ★(0.14.31 · 리뷰 R3 · codex blocking) 양성 증거 술어 — 커서가 **그 라벨 전문** 위에 있고 **경쟁 커서가
-    /// 없을 때만** 참. 잘린 라벨·번호 없는 잘림·점 뒤 공백 없는 렌더·커서 부재·모호(양성+미해소 커서 공존)는
-    /// 전부 거짓이어야 한다(구멍이 닫히는 방향).
+    /// ★(0.14.31 · 리뷰 R4) **두 스캐너의 좌표 파리티** — 렌더 변형 5종(LF · CRLF · NBSP · 단어 안 접힘 ·
+    /// 열 정렬 패딩) × 사례 3종(종료 커서 · 액션 커서 · 잘린 종료 커서)에서 `modal_signature` 의
+    /// `cursor_on_exit` 와 `cursor_resolves_to_label` 이 **같은 사실**을 낸다. 두 소비처가 갈리면 벨트에
+    /// 구멍이 생긴다(R2 blocking 의 그 자리) — 스캐너·좌표계가 하나라는 계약을 렌더 축으로 잰다.
+    ///
+    /// ★출처: codex gpt-6-astra 위임 산출(`impl/codex/R1-WP1-HF-r4-parity-tests.rs`) · 전행 검토 후 채택
+    ///   (프로덕션 무접촉 · stdlib 만 · 도우미 재사용 · 문면 사본 0 · 전제 붕괴를 단언 실패와 구별해 panic).
+    #[test]
+    fn modal_and_confirm_scanners_agree_across_render_variants() {
+        let anchors_owned = trust_anchors();
+        let anchors: Vec<&str> = anchors_owned.iter().map(String::as_str).collect();
+        let gates = first_run_gates::builtin();
+        let exit = MODAL_EXIT_LABEL;
+        let action = "Yes, I trust this folder";
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        let on_action = with_cursor_on(fixtures::FOLDER_TRUST, 1);
+        let clipped_exit = exit
+            .strip_suffix('t')
+            .unwrap_or_else(|| panic!("LF / 잘림 전제 붕괴: 종료 라벨 끝이 t가 아니다\n{on_exit}"));
+        let on_clipped_exit = on_exit.replace(exit, clipped_exit);
+
+        for variant in ["LF", "CRLF", "NBSP", "단어 안 접힘", "열 정렬 패딩"] {
+            // 커서를 먼저 옮긴다. with_cursor_on의 행 재조립이 CRLF를 지우지 않게 한다.
+            // 잘림도 렌더 변형 전에 적용해 접힌 종료 라벨까지 반드시 한 글자 자른다.
+            for (case, base, label, expected_exit, expected_resolution) in [
+                ("종료 커서", &on_exit, exit, true, true),
+                ("액션 커서", &on_action, action, false, true),
+                ("잘린 종료 커서", &on_clipped_exit, exit, false, false),
+            ] {
+                let screen = match variant {
+                    "LF" => base.clone(),
+                    "CRLF" => base.replace('\n', "\r\n"),
+                    "NBSP" => base.replace(". ", ".\u{a0}"),
+                    "단어 안 접힘" => base
+                        .replace("No, ex", "No, ex\n   ")
+                        .replace("Yes, I tru", "Yes, I tru\n   "),
+                    "열 정렬 패딩" => base.replace(". ", ".    "),
+                    _ => panic!("{variant} / {case}: 알 수 없는 렌더 변형\n{base}"),
+                };
+                if variant != "LF" {
+                    assert_ne!(
+                        &screen, base,
+                        "{variant} / {case}: 렌더 변형이 적용되지 않았다\n{screen}"
+                    );
+                }
+                let gate = first_run_gates::identify(&gates, &screen).unwrap_or_else(|| {
+                    panic!("{variant} / {case}: 전제 붕괴 — 코퍼스 식별 실패\n{screen}")
+                });
+                if gate.id != "folder-trust" {
+                    panic!(
+                        "{variant} / {case}: 전제 붕괴 — folder-trust 대신 {} 식별\n{screen}",
+                        gate.id
+                    );
+                }
+                let sig = modal_signature(&screen).unwrap_or_else(|| {
+                    panic!("{variant} / {case}: 전제 붕괴 — 모달 서명 없음\n{screen}")
+                });
+                assert_eq!(
+                    sig.cursor_on_exit, expected_exit,
+                    "{variant} / {case}: modal_signature의 종료 커서 판정 불일치\n{screen}"
+                );
+                assert_eq!(
+                    cursor_resolves_to_label(&screen, label, &anchors),
+                    expected_resolution,
+                    "{variant} / {case}: cursor_resolves_to_label({label:?}) 판정 불일치\n{screen}"
+                );
+            }
+        }
+    }
+
+
+    /// 폴더신뢰 관문의 질문 문면(코퍼스 소유 · 사본 0) — 검체가 쓰는 선택 블록 경계 재료.
+    fn trust_anchors() -> Vec<String> {
+        first_run_gates::builtin()
+            .into_iter()
+            .find(|g| g.id == "folder-trust")
+            .expect("코퍼스에 folder-trust")
+            .needles
+    }
+
+    /// ★(0.14.31 · 리뷰 R3·R4 · codex blocking) 양성 증거 술어 — 커서가 **그 라벨 전문** 위에 있고 **활성 선택
+    /// 블록에 경쟁 커서가 없을 때만** 참. 잘린 라벨·번호 없는 잘림·점 뒤 공백 없는 렌더·커서 부재·모호
+    /// (양성+미해소 커서 공존)는 전부 거짓이어야 한다(구멍이 닫히는 방향).
     #[test]
     fn cursor_resolution_needs_the_complete_label_and_no_competing_cursor() {
         let yes = "Yes, I trust this folder";
         let exit = MODAL_EXIT_LABEL;
+        let anchors_owned = trust_anchors();
+        let anchors: Vec<&str> = anchors_owned.iter().map(|s| s.as_str()).collect();
+        let resolves = |screen: &str, label: &str| cursor_resolves_to_label(screen, label, &anchors);
         // 양성: 실측 화면 · 접힌 라벨 · CRLF · 열 정렬 패딩 · 번호 없는 커서.
         for (label, screen) in [
             ("실측 폴더신뢰", fixtures::FOLDER_TRUST.to_string()),
@@ -2082,7 +2231,7 @@ mod tests {
             ("열 정렬 패딩", fixtures::FOLDER_TRUST.replace("Yes, I trust", "Yes,   I  trust")),
             ("번호 없는 커서", fixtures::FOLDER_TRUST.replace("❯ 1. Yes", "❯ Yes")),
         ] {
-            assert!(cursor_resolves_to_label(&screen, yes), "{label}: 액션 라벨 위 커서를 못 봤다\n{screen}");
+            assert!(resolves(&screen, yes), "{label}: 액션 라벨 위 커서를 못 봤다\n{screen}");
         }
         // 음성: 잘림 3종 · 커서 부재 · 다른 행 위 커서 · 빈 라벨.
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
@@ -2094,59 +2243,90 @@ mod tests {
             ("커서는 다른 행", fixtures::FOLDER_TRUST.to_string(), exit),
             ("잘린 액션 라벨", fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I trust this fold"), yes),
         ] {
-            assert!(!cursor_resolves_to_label(&screen, needle), "{label}: 불완전/무관한 라벨이 양성으로 읽혔다\n{screen}");
+            assert!(!resolves(&screen, needle), "{label}: 불완전/무관한 라벨이 양성으로 읽혔다\n{screen}");
         }
-        assert!(!cursor_resolves_to_label(fixtures::FOLDER_TRUST, ""), "빈 라벨이 양성이다");
-        assert!(!cursor_resolves_to_label(fixtures::FOLDER_TRUST, "   "), "공백 라벨이 양성이다");
+        assert!(!resolves(fixtures::FOLDER_TRUST, ""), "빈 라벨이 양성이다");
+        assert!(!resolves(fixtures::FOLDER_TRUST, "   "), "공백 라벨이 양성이다");
         // 커서 부재 화면(건강한 셸·에코)에서는 어떤 라벨도 양성이 아니다.
-        assert!(!cursor_resolves_to_label(fixtures::READY_SHELL, yes));
-        assert!(!cursor_resolves_to_label("Yes, I trust this folder ✔\n", yes), "확인 에코가 선택으로 읽혔다");
+        assert!(!resolves(fixtures::READY_SHELL, yes));
+        assert!(!resolves("Yes, I trust this folder ✔\n", yes), "확인 에코가 선택으로 읽혔다");
         // 종료 라벨 전문 위 커서는 `modal_signature` 의 `cursor_on_exit` 와 **같은 사실**이다(스캐너 1개).
-        assert!(cursor_resolves_to_label(&on_exit, exit) && modal_signature(&on_exit).unwrap().cursor_on_exit);
+        assert!(resolves(&on_exit, exit) && modal_signature(&on_exit).unwrap().cursor_on_exit);
 
-        // ── ★(리뷰 R3b · codex blocking) **모호는 양성을 이긴다** — 액션 라벨 위 커서가 있어도 해소되지 않은
-        //    다른 선택 커서가 같은 화면에 있으면 어느 쪽이 실제 선택인지 모른다(부분 렌더·잔상). 전부 거짓.
-        for (label, screen) in [
-            // codex 반례 그대로: 두 행 모두 커서 · 두 번째는 잘려 `cursor_on_exit` 도 못 세운다.
-            ("잘린 종료 커서 공존", fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. No, exi")),
-            ("번호 없는 잘린 종료 커서 공존", fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ No, exi")),
-            ("점 뒤 공백 없는 종료 커서 공존", fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2.No, exi")),
+        // ── ★(리뷰 R3b·R4 · codex blocking) **모호는 양성을 이긴다** — 액션 라벨 위 커서가 있어도 선택 블록 안에
+        //    해소되지 않은 다른 커서가 있으면 어느 쪽이 실제 선택인지 모른다(부분 렌더·잔상). 전부 거짓.
+        //    R4 가 더한 것: 어휘로 면제하던 짧은 잘림(`❯ No` · `❯ No,` · `❯ N`)과 **다음 줄로 접힌** 선택지
+        //    (`❯⏎  No` — 종전 규칙은 '행이 비었다' 로 읽어 면제했다), 그리고 질문 재출현 잔상.
+        let mut ambiguous: Vec<(String, String)> = vec![
+            // codex R3b 반례 그대로: 두 행 모두 커서 · 두 번째는 잘려 `cursor_on_exit` 도 못 세운다.
+            ("잘린 종료 커서 공존".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. No, exi")),
+            ("번호 없는 잘린 종료 커서 공존".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ No, exi")),
+            ("점 뒤 공백 없는 종료 커서 공존".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2.No, exi")),
             // 코퍼스 어휘 밖의 잘린 선택지라도 **번호 커서**면 경쟁이다(테마·새기능 화면의 부분 렌더).
-            ("번호 커서 + 미상 라벨", fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. Someth")),
-        ] {
+            ("번호 커서 + 미상 라벨".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. Someth")),
+            // ★(R4) 어휘 앞머리 4자에 못 미치는 잘림 — 종전 규칙이 전부 면제하던 자리.
+            ("두 글자 잘림".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ No")),
+            ("쉼표까지 잘림(뒤에 푸터)".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ No,")),
+            ("번호만 남음".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2")),
+            ("한 글자".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ N")),
+            // ★(R4 · codex) 다음 줄로 접힌 선택지 — 커서 **행**은 비었지만 화면에는 라벨이 이어진다.
+            ("다음 줄로 접힌 선택지".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯\n  No")),
+            // ★(R4 · codex) 재그리기 잔상: 질문 조각이 먼저 나오고 그 뒤에 미해소 커서, 다시 질문·해소 커서.
+            // ★문면 리터럴 사본 금지(H-READY-13) — 질문 조각은 **코퍼스에서** 읽는다.
+            ("질문 재출현 + 앞선 잔상 커서".into(),
+             format!("{}\n❯ No\n{}", anchors[0], fixtures::FOLDER_TRUST)),
+        ];
+        // 종료 라벨이 완전히 보이는 경쟁 행(부정 증거까지 서는 화면)도 당연히 거짓이다.
+        ambiguous.push(("종료 커서 공존(전문)".into(), fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. No, exit")));
+        for (label, screen) in &ambiguous {
             assert!(
-                !cursor_resolves_to_label(&screen, yes),
+                !resolves(screen, yes),
                 "{label}: 모호한 화면에서 구멍이 열렸다(그 Return 이 종료를 누를 수 있다)\n{screen}"
             );
         }
-        // 그러나 **선택기의 행이 아닌** 커서는 경쟁이 아니다 — p10k(`╰─❯`)·셸 잔상·빈 입력 상자까지 경쟁으로
-        // 세우면 그 사용자들에게 자동확인이 영영 열리지 않는다(가용성 붕괴 · 조이는 방향의 과잉).
+        // 그러나 **선택 블록 밖·라벨 없음** 커서는 경쟁이 아니다 — 관문 문면이 시작되기 전의 셸 잔상과
+        // 화면 꼬리의 빈 입력 프롬프트까지 경쟁으로 세우면 그 사용자들에게 자동확인이 영영 열리지 않는다.
         for (label, screen) in [
-            ("셸 프롬프트 잔상", format!("~/work ╰─❯ ls -al\n{}", fixtures::FOLDER_TRUST)),
+            ("질문 앞 셸 프롬프트 잔상", format!("~/work ╰─❯ ls -al\n{}", fixtures::FOLDER_TRUST)),
+            ("질문 앞 부트 로그 커서", format!("❯ claude --dangerously-skip-permissions\n{}", fixtures::FOLDER_TRUST)),
             ("빈 입력 상자 꼬리", format!("{}❯ \n", fixtures::FOLDER_TRUST)),
+            ("실측 NBSP 꼬리", format!("{}❯\u{a0}\n", fixtures::FOLDER_TRUST)),
         ] {
             assert!(
-                cursor_resolves_to_label(&screen, yes),
+                resolves(&screen, yes),
                 "{label}: 선택기가 아닌 커서를 경쟁으로 세워 자동확인이 닫혔다\n{screen}"
             );
         }
-        // 경쟁 판정의 순수 술어 직접 실행 — 번호 커서 · 라벨 앞머리 · 그 밖.
-        let probe = |line: &str| -> bool {
-            let (norm, pre, flat) = normalized_frame(line);
-            let rows = cursor_rows(&norm, &pre);
+        // ★anchor 를 못 찾으면 화면 전체가 블록이다(fail-closed) — 질문 없는 화면에서는 셸 잔상도 경쟁이다.
+        assert!(
+            !cursor_resolves_to_label(&format!("~/work ╰─❯ ls -al\n❯ 1. {yes}\n"), yes, &anchors),
+            "질문이 없는 화면에서 블록 경계를 임의로 넓혔다(fail-closed 위반)"
+        );
+        assert!(
+            !cursor_resolves_to_label(&format!("~/work ╰─❯ ls -al\n{}", fixtures::FOLDER_TRUST), yes, &[]),
+            "anchor 빈 목록에서 블록을 화면 전체로 보지 않았다(면제가 넓어졌다)"
+        );
+        // 경쟁 판정의 순수 술어 직접 실행 — 번호 커서 · 라벨 유무 · 블록 경계.
+        let probe = |line: &str, block: usize| -> bool {
+            let f = screen_frame(line);
+            let rows = cursor_rows(&f);
             assert_eq!(rows.len(), 1, "전제: 커서 1개\n{line}");
-            cursor_row_competes(&rows[0], &flat)
+            cursor_row_competes(&rows[0], &f.flat, block)
         };
-        assert!(probe("❯ 2. Anything at all"), "번호 커서가 경쟁이 아니다");
-        assert!(probe("❯ No, exi"), "잘린 종료 라벨이 경쟁이 아니다");
-        assert!(probe("❯ Yes, I acc"), "잘린 수락 라벨이 경쟁이 아니다");
-        assert!(!probe("❯ ls -al"), "셸 명령 잔상이 경쟁이다");
-        assert!(!probe("❯ "), "빈 입력 상자가 경쟁이다");
-        assert!(!probe("❯ Yesterday I ran the build"), "앞머리 4자를 넘겨 갈리는 문장이 경쟁이다");
+        assert!(probe("❯ 2. Anything at all", 0), "번호 커서가 경쟁이 아니다");
+        assert!(probe("❯ No, exi", 0), "잘린 종료 라벨이 경쟁이 아니다");
+        assert!(probe("❯ N", 0), "한 글자 잘림이 경쟁이 아니다");
+        assert!(probe("❯ ls -al", 0), "블록 안의 셸 명령 잔상이 경쟁이 아니다(어휘로 면제했다)");
+        assert!(!probe("❯ ls -al", 99), "블록보다 앞의 커서가 경쟁이다");
+        assert!(!probe("❯ ", 0), "라벨 없는 빈 입력 상자가 경쟁이다");
+        assert!(!probe("❯\u{a0}", 0), "NBSP 꼬리가 경쟁이다");
+        assert!(probe("❯\n  No", 0), "다음 줄로 접힌 선택지가 경쟁이 아니다");
         // 점 뒤 공백 없는 번호 행은 경쟁(ⓐ') · 소수는 아니다(엄격 파서의 `1.5 hours` 배제와 같은 방향).
-        assert!(probe("❯ 2.No, exi"), "점 뒤 공백 없는 번호 행이 경쟁이 아니다");
-        assert!(probe("❯ 12.Someth"), "두 자리 번호 행이 경쟁이 아니다");
-        assert!(!probe("❯ 1.5 hours"), "소수가 번호 행으로 읽혔다");
+        //   ★번호 축은 **위치 무관**이다(블록보다 앞이어도 선택기의 행이다).
+        assert!(probe("❯ 2.No, exi", 99), "점 뒤 공백 없는 번호 행이 경쟁이 아니다");
+        assert!(probe("❯ 12.Someth", 99), "두 자리 번호 행이 경쟁이 아니다");
+        assert!(probe("❯ 2. Dark mode", 99), "번호 커서가 블록 밖이라고 면제됐다");
+        assert!(!probe("❯ 1.5 hours", 99), "소수가 번호 행으로 읽혔다");
     }
 
     #[test]

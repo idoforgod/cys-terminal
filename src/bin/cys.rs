@@ -2903,17 +2903,76 @@ fn rpc_roundtrip<S: Read + Write>(
 }
 
 fn request(method: &str, params: Value) -> Result<Value, String> {
+    request_with_idle_cap(method, params, None)
+}
+
+/// `request` 의 일반형 — 무진행 상한에 **추가 상한**(`cap`)을 얹는다(작은 쪽이 이긴다).
+///
+/// ★상한은 **연결 성립 이후**의 왕복에만 건다. connect() 자체는 자기 유계 경로다
+///   (autostart 시 socket-ready 폴링 최대 4초 — `poll_socket_ready`). 절대 벽시계 예산이
+///   필요한 호출부는 이 함수가 아니라 [`request_before`] 를 쓴다(연결까지 예산 안에 가둔다).
+fn request_with_idle_cap(
+    method: &str,
+    params: Value,
+    cap: Option<std::time::Duration>,
+) -> Result<Value, String> {
     // ★선언 순서 = drop 순서의 역순. `deadline` 을 `stream` 뒤에 선언해야 감시자가 스트림보다
     //   먼저 정지·join 된다(닫힌 핸들에 CancelIoEx 금지). 아래 명시 drop 은 그 계약의 이중 보증.
-    // ★상한은 **연결 성립 이후**의 왕복에만 건다. connect() 자체는 이미 자기 유계 경로다
-    //   (autostart 시 socket-ready 폴링 최대 4초 — `poll_socket_ready`). 최악 총소요는 그 4초 +
-    //   본 상한이며, 두 축을 하나로 합치지 않는 이유는 실패 원인이 다르기 때문이다
+    // ★두 축을 하나로 합치지 않는 이유는 실패 원인이 다르기 때문이다
     //   ('데몬이 없다' vs '데몬이 응답하지 않는다' — 처방이 갈린다).
     let mut stream = connect()?;
-    let deadline = RpcDeadline::arm(&stream, rpc_idle_timeout(method, &params))?;
+    let idle = match (rpc_idle_timeout(method, &params), cap) {
+        (Some(d), Some(c)) => Some(d.min(c)),
+        (None, Some(c)) => Some(c), // 노브가 상한을 풀었어도 호출부의 예산은 예산이다
+        (d, None) => d,
+    };
+    let deadline = RpcDeadline::arm(&stream, idle)?;
     let out = rpc_roundtrip(&mut stream, &deadline, method, params);
     drop(deadline);
     out
+}
+
+/// ★(0.14.31 · 리뷰 R4 · codex major) **절대 벽시계 데드라인** 왕복 — 연결·쓰기·읽기·재연결 전부를
+/// 하나의 예산 안에 가둔다.
+///
+/// 【왜 무진행 상한으로는 부족한가】 `RpcDeadline` 이 거는 것은 **무진행(idle)** 상한이다: unix 는 커널
+/// 소켓 타임아웃이 매 read/write 마다 다시 돌고 Windows 감시자도 진행마다 `touch()` 한다. 즉 상대가
+/// 예산보다 짧은 간격으로 바이트를 흘리면 한 왕복이 **끝나지 않는다**. 게다가 `connect()` 는 상한 밖이라
+/// (autostart 폴링 최대 4초) 3초 예산을 그것만으로 넘긴다. "유계 미룸" 을 약속한 자리에서 그 약속이
+/// 지켜지지 않으면 상위 부트 타임아웃을 대신 물게 된다.
+///
+/// 【어떻게 가두는가】 왕복을 **별도 스레드**에서 돌리고 호출 스레드는 `recv_timeout(남은 예산)` 으로만
+/// 기다린다. 이 대기는 진행으로 **연장되지 않는다**(절대 데드라인). 만료하면 그 왕복을 **버린다**:
+///   · 버린 스레드는 자기 무진행 상한(위 `cap` = 처음 남았던 예산)으로 스스로 끝난다 — 영구 누수가 아니다.
+///   · 부트 1회당 최대 [`ADOPT_LIST_TRIES`] 개이고, 이 경로 밖에서는 쓰이지 않는다(폭주 없음 · 치명위험 ①).
+///   · 채택 경로는 **읽기 전용**(`surface.list`)이라 버려진 왕복이 늦게 끝나도 부작용이 0이다.
+/// 플랫폼 API 를 쓰지 않으므로 Windows 에서도 같은 코드로 유계다(std thread + mpsc).
+fn request_before(
+    method: &str,
+    params: Value,
+    deadline: std::time::Instant,
+) -> Result<Value, String> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err("벽시계 예산 소진 — 왕복을 시작하지 않는다".to_string());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let m = method.to_string();
+    // detach: join 하지 않는다(join 하면 그 대기가 다시 무제한이 된다 — 예산의 의미가 사라진다).
+    std::thread::spawn(move || {
+        let _ = tx.send(request_with_idle_cap(&m, params, Some(remaining)));
+    });
+    match rx.recv_timeout(remaining) {
+        Ok(r) => r,
+        // 만료와 **송신자 소멸**(왕복 스레드 패닉)을 섞지 않는다 — 처방이 다르다(기다리기 vs 버그 보고).
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "벽시계 예산 {}ms 안에 응답이 없다(연결·왕복 포함) — 이 왕복을 버린다",
+            remaining.as_millis()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("왕복 스레드가 결과 없이 사라졌다(패닉 의심) — 관측 실패로 접는다".to_string())
+        }
+    }
 }
 
 // ---------- commands ----------
@@ -8376,7 +8435,8 @@ mod seat_latch_negation_tests {
         };
         let adopt = fn_body("gate_pending_adopt");
         for anchor in [
-            "try_fetch_surfaces()",
+            "adopt_read_rows(",
+            "try_fetch_surfaces_before(d)",
             "ADOPT_LIST_TRIES",
             "gate_followup_malformed(",
             "GATE_ID_ADOPT_UNREAD",
@@ -8387,6 +8447,10 @@ mod seat_latch_negation_tests {
             !adopt.contains("let rows = fetch_surfaces();"),
             "채택이 실패를 빈 목록으로 접는 읽기를 쓴다 — [RESTORE] 소실 경로가 되살아났다"
         );
+        assert!(
+            !adopt.contains("try_fetch_surfaces()"),
+            "채택이 **예산 없는** 읽기를 쓴다 — 매달린 데몬에서 40s 를 그대로 문다(R4 major)"
+        );
         // 미룬 보류는 **표식을 다시 찍지 않는다**(데몬의 followup 보존을 흔들지 않는다).
         let unread = adopt
             .find("GATE_ID_ADOPT_UNREAD.to_string()")
@@ -8395,9 +8459,14 @@ mod seat_latch_negation_tests {
             !adopt[..unread].contains("settle_gate_pending(") && !adopt[..unread].contains("clear_gate_pending("),
             "채택을 미루면서 표식을 재기록·해제한다"
         );
-        // ③ 판정 가능한 읽기가 스키마 스큐를 삼키지 않는다.
-        let tf = fn_body("try_fetch_surfaces");
-        assert!(tf.contains("Err(") && !tf.contains("unwrap_or_default()"), "판정 가능한 읽기가 실패를 접는다");
+        // ③ 판정 가능한 읽기가 스키마 스큐를 삼키지 않는다 — **거동으로** 잰다(순수부가 분리됐다).
+        assert!(surfaces_from(Ok(json!({"surfaces": [{"surface_id": 1}]}))).is_ok());
+        for bad in [json!({}), json!({"surfaces": null}), json!({"surfaces": 3})] {
+            assert!(surfaces_from(Ok(bad.clone())).is_err(), "스키마 스큐({bad})를 빈 목록으로 접는다");
+        }
+        assert!(surfaces_from(Err("rpc down".into())).is_err(), "RPC 실패를 접는다");
+        let tf = fn_body("try_fetch_surfaces_before");
+        assert!(tf.contains("request_before("), "예산 있는 읽기가 절대 데드라인 왕복을 쓰지 않는다");
         // ④ ★(리뷰 R3b · codex) 호출부가 **미룸을 관문 재발과 구별**한다 — 처방이 갈린다(사람이 통과시킬
         //    관문이 없다). typed outcome 의 hint 와 recheck 문안이 그 구별을 싣는다.
         assert!(src.contains("adopt_unread = Some(tail.clone());"), "호출부가 미룬 보류를 식별하지 않는다");
@@ -8408,6 +8477,161 @@ mod seat_latch_negation_tests {
         assert!(
             src.contains("재관측=통과했으나 표식 판독 실패로 채택 미룸"),
             "recheck 문안이 미룸을 싣지 않는다"
+        );
+        // ★(리뷰 R4 · codex minor) 사람이 읽는 줄과 typed outcome 이 **서로 모순되지 않는다** —
+        //   미룸에는 "사람 1회 조치 필요" 가 나가지 않고, 구조화 사유가 하류 분기 재료로 실린다.
+        let boot = fn_body("run_boot");
+        let unread_line = boot
+            .find("첫기동 관문은 **이미 통과**")
+            .expect("미룸 전용 사람용 문안이 없다");
+        let held_line = boot
+            .find("첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요")
+            .expect("관문 보류 문안이 사라졌다");
+        assert!(unread_line < held_line, "미룸 분기가 관문 보류 문안 뒤에 있다(순서상 도달 불가)");
+        assert!(
+            boot.contains("let gate_reason = if adopt_unread.is_some() { GATE_ID_ADOPT_UNREAD } else { \"gate-held\" };"),
+            "구조화 사유(gate_reason)가 typed outcome 에 실리지 않는다 — 하류가 문안을 파싱해야 한다"
+        );
+        assert!(
+            boot.contains("\"human_action_required\": adopt_unread.is_none()"),
+            "사람 조치 여부가 기계 필드로 실리지 않는다"
+        );
+        // ⑤ ★(리뷰 R4 · 리뷰어1) 표식 해제 실패의 귀결 **크기**를 거동으로 고정한다.
+        //    종전 주석은 "전문 디렉티브는 `awakened_at` 래치가 막는다" 였는데, 그 래치는 **ack 전에는 서지
+        //    않는다** — 그래서 해제 실패 + 미ack 이면 다음 부트가 전문 + followup 을 통째로 한 번 더 싣는다.
+        //    (ack 뒤에는 AwakeConfirmed 로 접혀 이 분기에 다시 들어오지 않는다 = 중복은 유계.)
+        let pending = json!({"surface_id": 1, "exited": false, "agent_alive": true,
+                             "awakened_at": 0.0,
+                             "gate_pending": {"gate": "folder-trust", "since": 1.0,
+                                              "followup": "[RESTORE] x"}});
+        assert_eq!(
+            seat_liveness(&pending).0,
+            SeatLiveness::GatePending,
+            "ack 전 보류 좌석이 GatePending 이 아니다 — 해제 실패의 귀결 서사가 틀렸다"
+        );
+        let mut acked = pending.clone();
+        acked["awakened_at"] = json!(1.0);
+        assert_eq!(
+            seat_liveness(&acked).0,
+            SeatLiveness::AwakeConfirmed,
+            "ack 뒤에도 재채택 분기에 들어간다 — 중복이 유계가 아니다"
+        );
+        // 그 사실을 사람이 읽는 문안이 **정확히** 싣는다(과장하지 않는다).
+        let clear = fn_body("clear_gate_pending");
+        assert!(
+            clear.contains("노드 ack 전이면 다음 부트가 같은")
+                && clear.contains("전문 디렉티브 + 복원 지시"),
+            "해제 실패 문안이 귀결(전문 재주입 가능)을 축소해 말한다"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R4 · codex major + 리뷰어1) 채택 표식 읽기의 **재시도·예산 산술을 행위로 잰다.**
+    ///
+    /// R3 까지 이 산술은 소스 문자열 핀(`try_fetch_surfaces()`·`ADOPT_LIST_TRIES` 존재)으로만 지켜졌다 —
+    /// 산술을 바꾸면서 앵커만 남기면 전부 통과했다(리뷰어1). 여기서는 읽기와 잠을 주입해
+    /// ⓐ전 시도 실패 ⓑ매달린 읽기의 조기 중단 ⓒ2회째 성공 ⓓ예산 0 ⓔ늦게 도착한 성공을 **거동으로** 잰다.
+    #[test]
+    fn adopt_read_is_bounded_by_an_absolute_deadline_not_by_retry_count() {
+        use std::time::{Duration, Instant};
+        let sid = 7u64;
+        let row = json!([{"surface_id": 7, "gate_pending": {"gate": "g", "followup": "[RESTORE] x"}}]);
+        let rows_of = |v: &Value| v.as_array().cloned().unwrap_or_default();
+
+        // ⓐ 전 시도 실패 — 정확히 tries 회 시도하고, 간격만큼만 잔다(예산은 충분).
+        let mut slept: Vec<Duration> = Vec::new();
+        let mut seen: Vec<Duration> = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let r = adopt_read_rows(
+            sid, deadline, Duration::from_millis(5), 3,
+            &mut |d| { seen.push(d.saturating_duration_since(Instant::now())); Err("데몬 무응답".into()) },
+            &mut |g| slept.push(g),
+        );
+        assert_eq!(r.tries, 3, "재시도 횟수가 상한과 다르다");
+        assert_eq!(slept.len(), 2, "간격이 시도 사이에만 들어가지 않는다");
+        assert!(r.rows.is_empty() && r.err.contains("데몬 무응답"), "실패 사유가 전파되지 않는다: {}", r.err);
+        assert_eq!(seen.len(), 3, "읽기가 남은 예산을 받지 못한다");
+        assert!(seen.windows(2).all(|w| w[1] <= w[0]), "읽기에 넘긴 예산이 줄지 않는다: {seen:?}");
+
+        // ⓑ **매달린 읽기** — 한 번의 읽기가 예산을 통째로 먹으면 재시도하지 않는다(40s×3 노출 차단).
+        let mut calls = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let r = adopt_read_rows(
+            sid, deadline, Duration::from_millis(5), 3,
+            &mut |d| {
+                calls += 1;
+                std::thread::sleep(d.saturating_duration_since(Instant::now()) + Duration::from_millis(5));
+                Err("무진행".into())
+            },
+            &mut |_| panic!("예산이 소진됐는데 잠을 잤다"),
+        );
+        assert_eq!(calls, 1, "매달린 읽기 뒤에도 재시도했다({calls}회)");
+        assert_eq!(r.tries, 1);
+        assert!(r.err.contains("소진") || r.err.contains("무진행"), "{}", r.err);
+
+        // ⓒ 2회째 성공 — 그 뒤로는 읽지 않는다.
+        let mut calls = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(400);
+        let r = adopt_read_rows(
+            sid, deadline, Duration::from_millis(1), 3,
+            &mut |_| { calls += 1; if calls == 1 { Ok(Vec::new()) } else { Ok(rows_of(&row)) } },
+            &mut |_| {},
+        );
+        assert_eq!((calls, r.tries), (2, 2));
+        assert_eq!(r.rows.len(), 1, "성공한 읽기의 행이 버려졌다");
+        assert!(r.err.is_empty(), "성공인데 사유가 남았다: {}", r.err);
+        // 좌석 행이 없는 응답은 성공이 아니다(빈 목록으로 접지 않는다).
+        let r = adopt_read_rows(
+            sid, Instant::now() + Duration::from_millis(50), Duration::from_millis(1), 1,
+            &mut |_| Ok(rows_of(&json!([{"surface_id": 9}]))), &mut |_| {},
+        );
+        assert!(r.rows.is_empty() && r.err.contains("좌석 행 부재"), "{}", r.err);
+
+        // ⓓ 예산 0 — **시도조차 하지 않는다**(연결도 열지 않는다).
+        let mut calls = 0usize;
+        let r = adopt_read_rows(
+            sid, Instant::now(), Duration::from_millis(1), 3,
+            &mut |_| { calls += 1; Ok(rows_of(&row)) }, &mut |_| {},
+        );
+        assert_eq!((calls, r.tries), (0, 0), "예산이 0인데 왕복을 시작했다");
+        assert!(r.rows.is_empty() && r.err.contains("예산"), "{}", r.err);
+
+        // ⓔ **늦게 도착한 성공**은 성공이 아니다 — 유계 미룸 계약 밖이므로 미룬다(표식 보존 방향).
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let r = adopt_read_rows(
+            sid, deadline, Duration::from_millis(1), 3,
+            &mut |d| {
+                std::thread::sleep(d.saturating_duration_since(Instant::now()) + Duration::from_millis(10));
+                Ok(rows_of(&row))
+            },
+            &mut |_| {},
+        );
+        assert!(r.rows.is_empty(), "예산을 넘겨 도착한 성공을 채택 재료로 썼다");
+        assert!(r.err.contains("예산"), "{}", r.err);
+
+        // ⓕ 스키마 스큐는 삼키지 않는다(`surfaces_from` — 판정 가능한 읽기의 순수부).
+        assert!(surfaces_from(Ok(json!({"surfaces": []}))).is_ok());
+        for bad in [json!({}), json!({"surfaces": null}), json!({"surfaces": {"0": {}}}), json!(3)] {
+            assert!(surfaces_from(Ok(bad.clone())).is_err(), "스키마 스큐({bad})가 빈 목록으로 접혔다");
+        }
+        assert_eq!(surfaces_from(Err("boom".into())).err().as_deref(), Some("boom"));
+
+        // ⓖ 절대 데드라인 왕복의 **배선 핀** — 무진행 상한이 아니라 별도 스레드 + `recv_timeout` 이다.
+        //    (실 소켓 없이 유계성을 증명할 수 없는 자리라 배선만 박제한다 · 잔여는 노트에 기록.)
+        let src = include_str!("cys.rs");
+        let fn_body = |name: &str| -> &str {
+            let head = format!("\nfn {name}(");
+            let i = src.find(&head).unwrap_or_else(|| panic!("{name} 이 사라졌다"));
+            let rest = &src[i + 1..];
+            let end = rest.find("\n}\n").map(|e| e + 2).expect("함수 끝");
+            &rest[..end]
+        };
+        let rb = fn_body("request_before");
+        for anchor in ["recv_timeout(remaining)", "std::thread::spawn", "Some(remaining)"] {
+            assert!(rb.contains(anchor), "절대 데드라인 왕복 배선 결손: {anchor}");
+        }
+        assert!(
+            !rb.contains(".join()"),
+            "버린 왕복을 join 한다 — 그 대기가 다시 무제한이 되어 예산이 사라진다"
         );
     }
 
@@ -8618,12 +8842,91 @@ fn fetch_surfaces() -> Vec<Value> {
 /// 지시(`followup`)가 `None` → 주입 절반이 표식을 지우고 전문만 넣는다 → `[RESTORE]` 가 **영구 소실**된다.
 /// "읽지 못했다" 와 "읽었는데 없다" 는 다른 사실이고, 앞쪽의 접기 방향은 보류다(결측은 값이 아니다).
 fn try_fetch_surfaces() -> Result<Vec<Value>, String> {
-    let r = request("surface.list", json!({}))?;
-    match r["surfaces"].as_array() {
+    surfaces_from(request("surface.list", json!({})))
+}
+
+/// 위의 **절대 데드라인** 짝 — 연결까지 예산 안에서 끝낸다([`request_before`]).
+/// 채택 경로 전용이다(읽기 전용 RPC · 버려진 왕복의 부작용 0).
+fn try_fetch_surfaces_before(deadline: std::time::Instant) -> Result<Vec<Value>, String> {
+    surfaces_from(request_before("surface.list", json!({}), deadline))
+}
+
+/// `surface.list` 응답 → 행 목록. **스키마 스큐를 삼키지 않는다**(결측은 값이 아니다).
+fn surfaces_from(r: Result<Value, String>) -> Result<Vec<Value>, String> {
+    match r?["surfaces"].as_array() {
         Some(a) => Ok(a.clone()),
         // 응답은 왔는데 계약 필드가 배열이 아니다 — 관측 성공이 아니다(구 데몬은 이 자리를 배열로 낸다).
         None => Err("surface.list 응답에 배열 `surfaces` 가 없다(스키마 스큐)".to_string()),
     }
+}
+
+/// 채택 표식 읽기의 **결과**(순수 골격의 반환형).
+struct AdoptRead {
+    /// 읽어낸 surface 행(성공했을 때만 채워진다).
+    rows: Vec<Value>,
+    /// 마지막 실패 사유(성공이면 빈 문자열).
+    err: String,
+    /// 실제로 시도한 횟수.
+    tries: usize,
+}
+
+/// ★(0.14.31 · 리뷰 R4 · codex major) 채택 표식 읽기의 **유계 재시도 골격**(주입 가능 · 행위 검체 대상).
+///
+/// 【무엇을 보장하는가】 ⓐ 절대 데드라인을 **시도 전에** 재고, 남지 않았으면 시도하지 않는다 ·
+/// ⓑ 각 읽기에 그 데드라인을 넘겨 왕복 자체가 예산 안에서 끝나게 한다 · ⓒ 재시도 간격도 예산을
+/// 소비한다(간격이 데드라인을 넘기면 자지 않고 멈춘다) · ⓓ **데드라인을 넘겨 도착한 성공은 성공이
+/// 아니다** — 그때는 이미 상위 부트가 약속받은 창을 벗어났으므로 미룸으로 접는다(안전 방향: 표식
+/// 보존 · 다음 부트가 채택).
+///
+/// 【왜 주입형인가】 R3 까지 이 산술은 소스 문자열 핀으로만 지켜졌다(리뷰어1 지적). 읽기와 잠을
+/// 인자로 받으면 매달린 RPC·예산 소진·2회째 성공을 **행위로** 잴 수 있다.
+fn adopt_read_rows(
+    sid: u64,
+    deadline: std::time::Instant,
+    gap: std::time::Duration,
+    tries: usize,
+    read: &mut dyn FnMut(std::time::Instant) -> Result<Vec<Value>, String>,
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> AdoptRead {
+    let mut out = AdoptRead { rows: Vec::new(), err: String::new(), tries: 0 };
+    for attempt in 0..tries {
+        if std::time::Instant::now() >= deadline {
+            out.err = if out.err.is_empty() {
+                "벽시계 예산 소진(시도 0회)".to_string()
+            } else {
+                format!("{} · 재시도 예산 소진", out.err)
+            };
+            break;
+        }
+        out.tries = attempt + 1;
+        let r = read(deadline);
+        let late = std::time::Instant::now() >= deadline;
+        match r {
+            Ok(rows) if rows.iter().any(|s| s["surface_id"].as_u64() == Some(sid)) => {
+                if late {
+                    // 늦게 도착한 성공은 유계 미룸의 약속 밖이다 — 값을 쓰지 않고 미룬다.
+                    out.err = "표식을 읽었으나 벽시계 예산을 넘겨 도착했다(유계 미룸 계약 밖)".to_string();
+                    break;
+                }
+                out.rows = rows;
+                out.err.clear();
+                break;
+            }
+            Ok(_) => out.err = format!("좌석 행 부재(surface.list 에 surface_id={sid} 없음)"),
+            Err(e) => out.err = e,
+        }
+        if attempt + 1 >= tries {
+            break;
+        }
+        // 간격도 예산을 소비한다 — 남은 예산보다 길면 자지 않고 멈춘다.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left <= gap {
+            out.err = format!("{} · 재시도 예산 소진", out.err);
+            break;
+        }
+        sleep(gap);
+    }
+    out
 }
 
 /// 번들 안 npm 으로 전역 설치해 앱 봉인이 깨진 사용자를 위한 복구 1문장.
@@ -9195,9 +9498,20 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                 }
                 GateRecheck::NoEvidence => "재관측=증거 없음(화면 미관측·맨 셸 의심)".into(),
             };
-            println!(
-                "· {agent}: 역할 '{role}' 첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
-            );
+            // ★(0.14.31 · 리뷰 R4 · codex minor) 사람이 읽는 줄도 **사유를 따라간다.** 종전엔 채택 미룸에도
+            //   "사람 1회 조치 필요" 가 그대로 나가서, JSON hint("사람 조치 없음")와 정면으로 모순됐다 —
+            //   운영자는 이미 통과한 관문을 다시 통과시키라는 지시를 받았다.
+            if adopt_unread.is_some() {
+                println!(
+                    "· {agent}: 역할 '{role}' 첫기동 관문은 **이미 통과**({recheck_note}) — 표식을 읽지 못해 \
+채택만 미뤘다 · **사람 조치 없음**(데몬 응답 회복 후 재부트가 같은 좌석을 채택)\n                   확인: \
+`cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
+                );
+            } else {
+                println!(
+                    "· {agent}: 역할 '{role}' 첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
+                );
+            }
             // ★(리뷰 R3b · codex) 처방은 사유를 따라간다 — 관문이 아니라 **표식 판독 실패**로 미뤄졌으면
             //   사람이 관문을 통과시킬 것이 없다(이미 통과했다). 데몬 응답만 회복되면 다음 부트가 채택한다.
             let hint = if adopt_unread.is_some() {
@@ -9206,10 +9520,17 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             } else {
                 "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다(재부트가 스폰 없이 이 좌석을 채택한다)"
             };
+            // ★(리뷰 R4 · codex minor) 하류(javis_bootstrap 의 관문 처방)가 **문안 파싱 없이** 분기할 수 있도록
+            //   구조화 사유를 싣는다. 버킷(`outcome`)·exit 코드·좌석 취급은 종전 그대로다(계약 무변).
+            //   값: `gate-held`(관문이 실제로 떠 있다 · 사람 1회 조치) | `adopt-list-unread`(관문은 통과했고
+            //   표식 판독만 실패 · 사람 조치 없음).
+            let gate_reason = if adopt_unread.is_some() { GATE_ID_ADOPT_UNREAD } else { "gate-held" };
             outcomes.push(json!({"role": role, "agent": agent, "outcome": "gate_pending",
                                  "mandatory": mandatory, "surface_ref": sref,
                                  "liveness": "gate_pending", "reason": why,
                                  "recheck": recheck_note,
+                                 "gate_reason": gate_reason,
+                                 "human_action_required": adopt_unread.is_none(),
                                  "hint": hint}));
             continue;
         }
@@ -10554,17 +10875,23 @@ fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool,
 /// 관문을 통과시킨 뒤 그 좌석에 다시 붙는 경로(node-recover·restore in-seat·같은 좌석 재기동)가
 /// 표식을 지우지 않으면 좌석이 영구 미충족으로 남는다. 마지막 안전망은 데몬의 TTL 만료다.
 fn clear_gate_pending(sid: u64) {
-    // ★(0.14.31 · 리뷰 R3b · codex) 해제 실패는 **삼키지 않는다.** 실패의 귀결은 파괴가 아니라 중복이다 —
-    //   표식이 남아 다음 부트가 같은 좌석을 한 번 더 채택해 복원 연속 지시를 다시 싣는다(전문 디렉티브는
-    //   `awakened_at` 래치가 막는다). 그 중복을 사람이 원인과 함께 읽을 수 있어야 한다(정확히 한 번 배달은
-    //   이 함수가 줄 수 없는 보증이고, 그 계약 변경은 이 회차 밖이다 — 백로그).
+    // ★(0.14.31 · 리뷰 R3b·R4 · codex) 해제 실패는 **삼키지 않는다.** 실패의 귀결은 파괴가 아니라 중복이다.
+    //
+    // ★(리뷰 R4 · 리뷰어1) 중복의 **크기를 과장하지 않는다.** 종전 주석은 "전문 디렉티브는 `awakened_at`
+    //   래치가 막고 복원 지시만 다시 실린다" 였는데, 그 래치는 **노드가 ack 했을 때만** 선다
+    //   (`seat_liveness` ①). 해제 RPC 가 실패하는 상황은 같은 데몬을 읽는 ack 조회도 함께 실패하기 쉬우므로,
+    //   래치가 서지 않은 채 표식만 남으면 다음 부트가 `adoption_payload`(전문 + followup)를 **통째로**
+    //   다시 한 번 주입한다. 즉 보장은 "복원 지시만 중복" 이 아니라 **"부트당 최대 1회의 중복 채택"** 이다.
+    //   ack 가 선 뒤에는 래치가 `AwakeConfirmed` 로 접어 이 분기에 다시 들어오지 않는다(중복은 유계).
+    //   해제 실패가 **매 부트 반복**되고 ack 도 매번 실패하면 중복도 그만큼 반복된다 — 그것이 이 함수가
+    //   줄 수 없는 보증(정확히 한 번 배달)의 정확한 크기이고, 원자적 소유권 이전은 백로그다.
     if let Err(e) = request(
         "surface.gate_pending",
         json!({"surface_id": sid, "clear": true}),
     ) {
         eprintln!(
-            "[boot] 관문 보류 표식 해제 실패(surface:{sid}) — 표식이 남는다(다음 부트가 같은 좌석을 다시 \
-             채택할 수 있다 · 좌석·주입은 그대로): {e}"
+            "[boot] 관문 보류 표식 해제 실패(surface:{sid}) — 표식이 남는다(노드 ack 전이면 다음 부트가 같은 \
+             좌석을 한 번 더 채택해 **전문 디렉티브 + 복원 지시**를 다시 싣는다 · 좌석·이번 주입은 그대로): {e}"
         );
     }
 }
@@ -10850,7 +11177,13 @@ fn boot_agent_on_surface(
             &delta_flat,
             trust_v1,
         ) {
-            let other_gate = cys::inject_guard::decide_allowing(
+            // ★(0.14.31 · 리뷰 R4 · codex blocking) **확인 허가**는 주입 허가의 부정이 아니다.
+            //   종전 `decide_allowing(...).blocks()` 는 코퍼스가 화면을 식별하지 못하고 모달 어휘도 없으면
+            //   `Send`(=막지 않음)를 냈다 — 누적 델타에는 질문이 있는데 화면은 `❯ No, exi` 뿐인 잘린 렌더가
+            //   그 자리였고, 거기서 Return 이 부분 렌더된 종료 선택지를 눌러 좌석이 rc 1 로 죽는다.
+            //   `confirm_allowed` 는 **양성 증거만** 본다(그 id 로 식별 ∧ 커서가 종료 위 아님 ∧ 액션 라벨
+            //   전문 위 ∧ 경쟁 커서 0). 모르면 거짓 = 보내지 않는다.
+            let other_gate = !cys::inject_guard::confirm_allowed(
                 &cys::inject_guard::Observed {
                     screen: text,
                     gates: &gate_corpus.gates,
@@ -10858,9 +11191,8 @@ fn boot_agent_on_surface(
                     guard_off: cys::inject_guard::guard_off(),
                     readiness_legacy: readiness_v1, // 루프 밖 1회 판독값(판정 재료 일관성)
                 },
-                Some(cys::inject_guard::GATE_FOLDER_TRUST),
-            )
-            .blocks();
+                cys::inject_guard::GATE_FOLDER_TRUST,
+            );
             let first = trust_sends == 0;
             let persisted = trust_seen_at.map(|c| delta_cursor > c).unwrap_or(false);
             let send = cys::inject_guard::trust_send(&cys::inject_guard::TrustObserved {
@@ -10889,8 +11221,8 @@ fn boot_agent_on_surface(
             } else if other_gate && !trust_v1 && trust_sends > 0 {
                 // 실측 킬체인의 그 순간 — 여기서 보냈다면 면책 창의 `No, exit` 를 눌렀다.
                 eprintln!(
-                    "[launch-agent] folder-trust 잔상 재매칭 — 화면은 이미 다른 관문이라 Return 을 \
-                     보내지 않는다(킬 스텝 차단)"
+                    "[launch-agent] folder-trust 잔상 재매칭 — 지금 화면이 이 관문의 확인을 허가하지 \
+                     않는다(다른 관문·미식별·모호) → Return 을 보내지 않는다(킬 스텝 차단)"
                 );
             }
             // 1발 이후에는 더 보내지 않는다 — 반복 Return 이 신뢰창·면책창을 누르는 실측 경로 차단.
@@ -11312,32 +11644,19 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
     //   가 RPC 실패를 빈 목록으로 접어 `followup=None` 이 됐고, 그 뒤 RPC 는 성공할 수 있으므로 주입 절반이
     //   표식을 지우고 전문만 넣어 `[RESTORE]`/`[RECOVER]` 가 영구 소실됐다. 지금은 짧게 재시도하고, 그래도
     //   못 읽으면 **채택을 미룬다**(표식 무접촉 · 해제 0 · 주입 0 · 좌석 보존 — 다음 부트가 다시 채택한다).
-    let mut rows: Vec<Value> = Vec::new();
-    let mut read_err = String::new();
-    let started = std::time::Instant::now();
-    let mut tried = 0usize;
-    for attempt in 0..ADOPT_LIST_TRIES {
-        tried = attempt + 1;
-        match try_fetch_surfaces() {
-            Ok(r) if r.iter().any(|s| s["surface_id"].as_u64() == Some(sid)) => {
-                rows = r;
-                read_err.clear();
-                break;
-            }
-            Ok(_) => read_err = format!("좌석 행 부재(surface.list 에 surface_id={sid} 없음)"),
-            Err(e) => read_err = e,
-        }
-        // ★벽시계 예산(위 상수 doc) — 매달린 데몬에서 40s 왕복을 3번 물지 않는다.
-        if attempt + 1 < ADOPT_LIST_TRIES
-            && started.elapsed() + std::time::Duration::from_millis(ADOPT_LIST_GAP_MS)
-                < std::time::Duration::from_millis(ADOPT_LIST_BUDGET_MS)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(ADOPT_LIST_GAP_MS));
-        } else if attempt + 1 < ADOPT_LIST_TRIES {
-            read_err = format!("{read_err} · 재시도 예산 {ADOPT_LIST_BUDGET_MS}ms 소진");
-            break;
-        }
-    }
+    // ★(0.14.31 · 리뷰 R4 · codex major) 예산은 **절대 데드라인**이다 — 연결·왕복·재시도 간격이 전부
+    //   이 하나를 소비한다. R3 의 예산은 `request` 가 돌아온 **뒤에만** 비교돼, 매달린 데몬에서는
+    //   무진행 상한 40s 를 그대로 물었다(3s 약속이 지켜지지 않는 자리).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ADOPT_LIST_BUDGET_MS);
+    let read = adopt_read_rows(
+        sid,
+        deadline,
+        std::time::Duration::from_millis(ADOPT_LIST_GAP_MS),
+        ADOPT_LIST_TRIES,
+        &mut |d| try_fetch_surfaces_before(d),
+        &mut std::thread::sleep,
+    );
+    let (rows, read_err, tried) = (read.rows, read.err, read.tries);
     let row = rows.iter().find(|s| s["surface_id"].as_u64() == Some(sid));
     if row.is_none() || gate_followup_malformed(row.unwrap()) {
         let why = if row.is_none() {
@@ -23044,7 +23363,7 @@ mod tests {
         let re = trust_prompt_regex(&embed["claude"]);
         let screens = [fixtures::FOLDER_TRUST, fixtures::TRUST_ECHO_THEN_DISCLAIMER];
 
-        let run = |legacy_v1: bool, guard_off: bool| -> (u32, bool) {
+        let run = |legacy_v1: bool, guard_off: bool, legacy_producer: bool| -> (u32, bool) {
             let (mut delta, mut sends, mut seen_at) = (String::new(), 0u32, None::<u64>);
             let mut touched_disclaimer = false;
             for (tick, screen) in screens.iter().enumerate() {
@@ -23052,17 +23371,20 @@ mod tests {
                 let delta_flat: String = delta.chars().filter(|c| !c.is_whitespace()).collect();
                 let cursor = tick as u64 + 1;
                 if trust_prompt_hit(re.as_ref(), &gs, &delta, &delta_flat, legacy_v1) {
-                    let other_gate = cys::inject_guard::decide_allowing(
-                        &cys::inject_guard::Observed {
-                            screen,
-                            gates: &gs,
-                            awakened: Some(false),
-                            guard_off,
-                            readiness_legacy: false, // 이 검체는 U-14/U-15 두 축만 잰다(모달 축 무관 화면)
-                        },
-                        Some(cys::inject_guard::GATE_FOLDER_TRUST),
-                    )
-                    .blocks();
+                    // ★(리뷰 R4) 프로덕션과 **같은 생산자**(확인 허가의 부정). `legacy_producer` 는 R3 까지의
+                    //   구 배선(주입 허가의 부정)을 재현하는 계측 타당성 대조군용이다.
+                    let o = cys::inject_guard::Observed {
+                        screen,
+                        gates: &gs,
+                        awakened: Some(false),
+                        guard_off,
+                        readiness_legacy: false, // 이 검체는 U-14/U-15 두 축만 잰다(모달 축 무관 화면)
+                    };
+                    let other_gate = if legacy_producer {
+                        cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
+                    } else {
+                        !cys::inject_guard::confirm_allowed(&o, cys::inject_guard::GATE_FOLDER_TRUST)
+                    };
                     let send = cys::inject_guard::trust_send(&cys::inject_guard::TrustObserved {
                         hit: true,
                         first: sends == 0,
@@ -23090,16 +23412,20 @@ mod tests {
             (false, true, "U-14 롤백 — U-15 의 1발 래치가 단독으로 막아야 한다"),
             (true, false, "U-15 롤백 — U-14 의 화면 재확인이 단독으로 막아야 한다"),
         ] {
-            let (sends, touched) = run(legacy_v1, guard_off);
+            let (sends, touched) = run(legacy_v1, guard_off, false);
             assert_eq!(sends, 1, "{why}: 킬체인에서 Return 이 {sends}발 나갔다(기대 1발)");
             assert!(!touched, "{why}: 면책 창에 Return 이 닿았다 — 좌석이 rc 1 로 죽는 경로");
         }
 
         // ★계측 타당성 대조군: 두 롤백 스위치를 다 켜면 **결함이 재현된다**(2발 · 면책 접촉).
         //   재현되지 않으면 이 검체는 '원래 안 나는 일을 안 난다고 확인'하는 공허한 검사다.
-        let (legacy_sends, legacy_touched) = run(true, true);
+        let (legacy_sends, legacy_touched) = run(true, true, true);
         assert_eq!(legacy_sends, 2, "구 정책이 2발을 쏘지 않는다 — 킬체인 서사가 틀렸다(계측 무효)");
         assert!(legacy_touched, "구 정책이 면책 창에 닿지 않는다 — 결함 재현 실패(계측 무효)");
+        // ★(리뷰 R4) 신 생산자에서는 두 노브를 다 켜도 1발·면책 미접촉 — 확인 벨트는 롤백으로 열리지 않는다.
+        let (both_knobs, both_touched) = run(true, true, false);
+        assert_eq!(both_knobs, 1, "롤백 두 개로 확인 벨트가 열려 {both_knobs}발이 나갔다");
+        assert!(!both_touched, "롤백 두 개로 면책 창에 Return 이 닿았다");
     }
 
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) 신뢰 자동확인 조립(`trust_prompt_hit` → `decide_allowing` → `trust_send`)이
@@ -23123,24 +23449,26 @@ mod tests {
         let wrapped_exit = on_exit.replace("No, exit", "No, ex\n   it");
         assert!(wrapped_exit.contains("❯ 2. No, ex\n"), "전제: 접힌 종료 라벨 위 커서\n{wrapped_exit}");
         assert_eq!(cys::first_run_gates::identify(&gs, &wrapped_exit).map(|g| g.id.as_str()), Some("folder-trust"), "전제: 코퍼스 식별");
-        let run = |screens: &[&str], guard_off: bool| -> u32 {
+        let run = |screens: &[&str], guard_off: bool, legacy_producer: bool| -> u32 {
             let (mut delta, mut sends, mut seen_at) = (String::new(), 0u32, None::<u64>);
             for (tick, screen) in screens.iter().enumerate() {
                 delta.push_str(screen);
                 let delta_flat: String = delta.chars().filter(|c| !c.is_whitespace()).collect();
                 let cursor = tick as u64 + 1;
                 if trust_prompt_hit(re.as_ref(), &gs, &delta, &delta_flat, false) {
-                    let other_gate = cys::inject_guard::decide_allowing(
-                        &cys::inject_guard::Observed {
-                            screen,
-                            gates: &gs,
-                            awakened: Some(false),
-                            guard_off,
-                            readiness_legacy: false,
-                        },
-                        Some(cys::inject_guard::GATE_FOLDER_TRUST),
-                    )
-                    .blocks();
+                    let o = cys::inject_guard::Observed {
+                        screen,
+                        gates: &gs,
+                        awakened: Some(false),
+                        guard_off,
+                        readiness_legacy: false,
+                    };
+                    // ★(리뷰 R4) 프로덕션과 같은 생산자 — `legacy_producer` 만 구 배선을 재현한다.
+                    let other_gate = if legacy_producer {
+                        cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
+                    } else {
+                        !cys::inject_guard::confirm_allowed(&o, cys::inject_guard::GATE_FOLDER_TRUST)
+                    };
                     if cys::inject_guard::trust_send(&cys::inject_guard::TrustObserved {
                         hit: true,
                         first: sends == 0,
@@ -23158,14 +23486,49 @@ mod tests {
             sends
         };
         // ① 커서가 긍정 선택지 위(2.1.241 형) — 자동확인 1발(기능 보존).
-        assert_eq!(run(&[fixtures::FOLDER_TRUST], false), 1);
+        assert_eq!(run(&[fixtures::FOLDER_TRUST], false, false), 1);
         // ② 첫 Return 전에 커서가 접힌 `No, exit` 위 — **0발**(1발 래치가 아니라 벨트가 막는다).
-        assert_eq!(run(&[&wrapped_exit], false), 0, "접힌 종료 라벨 위 커서에 자동확인 Return 이 나갔다(좌석 사망)");
+        assert_eq!(run(&[&wrapped_exit], false, false), 0, "접힌 종료 라벨 위 커서에 자동확인 Return 이 나갔다(좌석 사망)");
         // ③ 통과 뒤 전환(긍정 → 접힌 종료) — 두 번째 Return 없음.
-        assert_eq!(run(&[fixtures::FOLDER_TRUST, &wrapped_exit], false), 1);
-        // ④ 대조군(계측 타당성): 마스터 롤백(guard_off)은 벨트를 관측 강등해 ② 에서 1발이 나간다 — 즉 ② 의 0발은
-        //    벨트의 작용이다(원래 안 나가는 일을 안 난다고 확인하는 공허한 검사가 아니다).
-        assert_eq!(run(&[&wrapped_exit], true), 1);
+        assert_eq!(run(&[fixtures::FOLDER_TRUST, &wrapped_exit], false, false), 1);
+        // ④ 대조군(계측 타당성): **구 생산자 + 마스터 롤백(guard_off)** 은 벨트를 관측 강등해 ② 에서 1발이
+        //    나간다 — 즉 ② 의 0발은 벨트의 작용이다(원래 안 나가는 일을 안 난다고 확인하는 공허한 검사가 아니다).
+        assert_eq!(run(&[&wrapped_exit], true, true), 1);
+        // ⑤ ★(0.14.31 · 리뷰 R4 · codex blocking) **미식별 잘린 화면**: 누적 델타에는 질문이 남아 감지는 되지만
+        //    지금 화면은 `❯ No, exi` 한 줄뿐이라 코퍼스가 식별하지 못한다. 종전 생산자는 여기서 Send 를 냈고
+        //    그 Return 이 부분 렌더된 종료 선택지를 눌렀다(좌석 rc 1). 노브와 무관하게 **0발**이어야 한다.
+        let clipped = "❯ No, exi\n";
+        // 질문만 실린 화면(선택지·푸터 없음) — 코퍼스는 이것도 관문으로 식별하지 않는다(위젯 AND).
+        //   델타에는 질문이 쌓여 **감지**는 되고, 지금 화면은 잘린 한 줄이다 = codex R4 blocking 의 그 형상.
+        //   ★문면 리터럴 사본 금지 — 질문은 **코퍼스에서** 읽는다(형제 검체와 같은 규율).
+        let question_only = format!(
+            "{}\n",
+            gs.iter()
+                .find(|g| g.id == cys::inject_guard::GATE_FOLDER_TRUST)
+                .expect("코퍼스에 folder-trust")
+                .needles[0]
+        );
+        let question_only = question_only.as_str();
+        assert!(cys::first_run_gates::identify(&gs, clipped).is_none(), "전제: 미식별 잘린 화면");
+        assert!(cys::first_run_gates::identify(&gs, question_only).is_none(), "전제: 질문만으로는 미식별");
+        for guard_off in [false, true] {
+            assert_eq!(
+                run(&[question_only, clipped], guard_off, false),
+                0,
+                "델타에만 질문이 있는 미식별 잘린 화면에 Return 이 나갔다(좌석 사망 · guard_off={guard_off})"
+            );
+            assert_eq!(
+                run(&[fixtures::FOLDER_TRUST, clipped], guard_off, false),
+                1,
+                "미식별 잘린 화면에서 2발째가 나갔다(guard_off={guard_off})"
+            );
+        }
+        // 계측 타당성 — 구 생산자는 바로 그 형상에서 1발을 쐈다(결함 재현).
+        assert_eq!(
+            run(&[question_only, clipped], false, true),
+            1,
+            "구 생산자가 미식별 화면을 이미 막는다 — R4 서사가 틀렸다(계측 무효)"
+        );
     }
 
     /// 정상 경로 회귀 0 — 관문이 없으면 종전대로 주입·제출된다(가드가 새 차단을 만들지 않는다).
@@ -26146,10 +26509,25 @@ mod tests {
             "request_on_timeout 이 공용 상한 기구를 쓰지 않는다"
         );
         // ③ request() 가 상한을 장전한다
+        //    ★(0.14.31 · 리뷰 R4) 장전 본체가 `request_with_idle_cap` 으로 **이사**했다(절대 데드라인
+        //      왕복 `request_before` 가 같은 본체에 상한 cap 을 얹어야 해서다). 핀의 **의미는 그대로**다 —
+        //      "request 계열의 모든 왕복이 상한을 장전한다" — 이사한 자리를 따라가되 위임 자체도 못 박는다.
+        //      (핀 완화 아님: 검사 대상이 하나에서 셋으로 늘었다. 재핀 근거는 커밋 메시지에 명기.)
         let rbody = item_body(src, "\nfn request(method: &str");
         assert!(
-            rbody.contains("RpcDeadline::arm") && rbody.contains("rpc_idle_timeout"),
-            "request() 에 상한 장전이 없다 — 데몬 wedge 시 CLI 영구 대기가 부활한다"
+            rbody.contains("request_with_idle_cap(method, params, None)"),
+            "request() 가 공용 장전 본체로 위임하지 않는다 — 상한 없는 두 번째 왕복 경로"
+        );
+        let cbody = item_body(src, "\nfn request_with_idle_cap(");
+        assert!(
+            cbody.contains("RpcDeadline::arm") && cbody.contains("rpc_idle_timeout"),
+            "공용 장전 본체에 상한 장전이 없다 — 데몬 wedge 시 CLI 영구 대기가 부활한다"
+        );
+        // ③' 절대 데드라인 왕복도 **같은 본체**를 탄다(예산은 상한을 낮출 뿐, 상한을 없애지 않는다).
+        let bbody = item_body(src, "\nfn request_before(");
+        assert!(
+            bbody.contains("request_with_idle_cap(&m, params, Some(remaining))"),
+            "절대 데드라인 왕복이 공용 장전 본체를 쓰지 않는다 — 상한 없는 왕복이 생긴다"
         );
         // ④ ★핀 이사(2026-08-24): **부서 fan-out 도** 같은 기구를 탄다.
         //    종전 `request_on` 은 전용 와이어 로직의 무상한 `read_line` 이라, 부서 데몬이

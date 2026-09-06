@@ -553,6 +553,50 @@ def main():
         check("capture raw stderr default", m._CapR().stderr_raw == "")
         check("capture raw stderr explicit", m._CapR(stderr_raw="x").stderr_raw == "x")
 
+        # N: ★리뷰 R4(codex major) — **진짜 cys() 예외 경로**로 잘린 멀티바이트를 흘린다.
+        #    종전 검체는 이미 디코드된 스텁을 m.cys 에 꽂아 프로덕션의 strict decode 를 한 번도 밟지 않았다.
+        #    여기서는 subprocess.run 을 몽키패치해 TimeoutExpired(바이트 캡처)를 던지게 하고, cys() 가
+        #    예외 없이 구조화 결과를 내는지 · 관측(fresh 각성 줄)이 보존되는지를 잰다.
+        fresh_bytes = fresh_line.encode("utf-8")
+        original_run = m.subprocess.run
+        original_win = m.IS_WINDOWS
+        try:
+            m.IS_WINDOWS = False  # 이 검체는 POSIX 분기(진짜 예외 경로)를 잰다 — Windows CI 에서도 같은 것을 잰다.
+            for name, out_b, err_b, want_fresh in (
+                ("cut stderr", b"", fresh_bytes + b"\n\xe2", True),          # 완전한 줄 + 잘린 멀티바이트
+                ("cut stdout", fresh_bytes + b"\n\xed\x95", b"", True),      # 양쪽 다 잘림 가능
+                ("both cut", fresh_bytes + b"\xe2", fresh_bytes + b"\n\xf0\x9f", True),
+                ("clean utf8", b"", fresh_bytes.decode().encode("utf-8") + b"\n", True),  # 대조군(정상)
+                ("str capture", "", fresh_line + "\n", True),                # text=True 경로(bytes 아님)
+                ("none capture", None, None, False),                          # 캡처 자체가 없음
+            ):
+                def _raise(*a, **kw):
+                    raise m.subprocess.TimeoutExpired(cmd=["cys"], timeout=90, output=out_b, stderr=err_b)
+                m.subprocess.run = _raise
+                try:
+                    r = m.cys("restore", "--role", "worker-1", timeout=90)
+                    ok = True
+                except Exception as exc:                                       # noqa: BLE001 — 이 검체의 대상
+                    r, ok = None, "raised %s" % type(exc).__name__
+                check("cys timeout no raise " + name, ok is True)
+                if ok is not True:
+                    continue
+                check("cys timeout rc " + name, r.returncode == 124)
+                check("cys timeout classifier " + name, r.stderr == "TIMEOUT 90s")
+                observed = m.cli_fresh_roles(getattr(r, "stderr_raw", "")) | m.cli_fresh_roles(r.stdout)
+                check("cys timeout keeps observation " + name,
+                      ("worker-1" in observed) == want_fresh)
+                # 손실은 대체문자로 흡수될 뿐, 예외도 잘림도 관측을 지우지 않는다.
+                check("cys timeout decoded str " + name,
+                      isinstance(r.stdout, str) and isinstance(getattr(r, "stderr_raw", ""), str))
+            # 순수부 직접 대조 — 바이트·문자열·None 세 형태.
+            check("decode captured replaces", m._decode_captured(b"ok\xe2").endswith("\ufffd"))
+            check("decode captured str passthrough", m._decode_captured("ok") == "ok")
+            check("decode captured none", m._decode_captured(None) == "" and m._decode_captured(b"") == "")
+        finally:
+            m.subprocess.run = original_run
+            m.IS_WINDOWS = original_win
+
         # K: 성공 fresh만 target 순서로 분할; 기본 사유는 구 저널의 poison.
         targets = ["f1", "pending", "poison", "verified"]
         outcomes = {"poison": "fresh", "verified": "verified", "pending": "unverified", "f1": "fresh"}

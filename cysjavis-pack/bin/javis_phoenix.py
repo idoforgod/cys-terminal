@@ -882,6 +882,22 @@ def _run_capture(cmd, env, timeout):
     return r
 
 
+def _decode_captured(b):
+    """타임아웃이 잘라 온 캡처 바이트를 **손실 없이·예외 없이** 문자열로 만든다.
+
+    ★리뷰 R4(codex major): 종전엔 `b.decode()`(strict UTF-8)였다. 타임아웃은 출력을 멀티바이트 문자
+    **한가운데서** 자를 수 있고(완전한 fresh 각성 줄 + 뒤에 `0xe2` 한 바이트), 그때 이 표현식이
+    `UnicodeDecodeError` 를 던져 `cys()` 밖으로 나가 `spawn_production()` 이 통째로 죽었다 —
+    관측을 보존하고 유계 실패를 보고하는 대신, 남은 복원 단계를 **버리는** 경로였다(치명위험 ③).
+    Windows 캡처 경로(`_run_capture`)는 이미 `("utf-8", "replace")` 로 읽고 있었다 — 대칭 회복이다.
+    바이트가 아닌 입력(str · None · 구 파이썬의 빈 값)은 그대로/빈 문자열로 접는다."""
+    if b is None:
+        return ""
+    if isinstance(b, bytes):
+        return b.decode("utf-8", "replace")
+    return b or ""
+
+
 def cys(*args, socket=None, timeout=25):
     cmd = [CYS]
     if socket:
@@ -898,12 +914,12 @@ def cys(*args, socket=None, timeout=25):
     except subprocess.TimeoutExpired as e:
         class _R:
             returncode = 124
-            stdout = (e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")) if e.stdout else ""
+            stdout = _decode_captured(e.stdout)
             stderr = "TIMEOUT %ss" % timeout
             # ★리뷰 R3b(codex major): 타임아웃 전까지 나온 stderr 원문을 **버리지 않는다**(Windows 경로는
             #   이미 보존한다 — 대칭). `stderr` 자리를 덮으면 분류기가 타임아웃을 ACK 로 읽을 수 있으므로
             #   별도 필드에 둔다: 관측 전용 소비처(`spawn_production` 의 fresh 각성 줄)만 읽는다.
-            stderr_raw = (e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")) if e.stderr else ""
+            stderr_raw = _decode_captured(e.stderr)
         return _R()
     except (FileNotFoundError, OSError) as e:
         # ★codex major: CYS 해석 후에도 파일이 사라지거나 실행 불가면 여기서 비구조화 exit 1 crash 가 났다.
