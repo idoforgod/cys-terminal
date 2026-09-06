@@ -730,6 +730,36 @@ seed_credentials_win(){
   return 0
 }
 
+# ★WP-2(0.14.31 감사 에러4 원천봉쇄): 계정 dir 확정 직후·claude 기동 **前** 폴더 신뢰 사전 주입.
+#   `javis_preflight.py --seed-trust --config <acctdir> --cwd <cwd>` — 그 (config_dir, cwd) **한 쌍만**
+#   `.claude.json` projects[cwd].hasTrustDialogAccepted=true (전 부서 cwd 합집합을 전 프로필에 뿌리지 않는다 ·
+#   hasCompletedOnboarding 무접촉). 도구 쪽이 라이브 claude(그 CLAUDE_CONFIG_DIR) 존재·검증 불가·잠금 경합·
+#   동시 변경을 전부 REFUSE(rc 2)로 접는다.
+# ★실패 방향 = fail-open(WARN 1줄 + 계속): 이 시드는 1차 방어이고 2차 방어(restore 준비 판정의 관문 보류)가
+#   뒤에 있다. 여기서 부트를 멈추면 '거부 1건 = 부서 전체 미기동(전 pane 0)'이 되어 봉인표 ④를 스스로 범한다.
+#   실 계정 dir 은 건드리지 않는 값이 없다 — 도구가 쓰는 파일은 그 acctdir 안의 .claude.json 하나.
+# 도구 위치: ${CYS_PACK_DIR:-$PACK_DEFAULT}/bin (dept_tombstone 의 phoenix 해석과 동형) → base 팩 폴백.
+#   CYS_SOCKET 은 벗긴다(도구는 소켓 무관 · 부서 컨텍스트 env 가 hub 판독을 오염시키지 않게).
+#   stdout 오염 금지(전 진단 >&2) — allocate/create 의 stdout 은 name 파서 계약이다.
+seed_trust_acct(){
+  local acct="$1" cwd="$2" pf out rc
+  [ -n "$acct" ] && [ -n "$cwd" ] || return 0
+  pf="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_preflight.py"
+  [ -f "$pf" ] || pf="$PACK_DEFAULT/bin/javis_preflight.py"
+  if [ ! -f "$pf" ]; then
+    echo "[cys-dept] WARN: javis_preflight.py 부재 — 신뢰 사전 주입 생략($acct ← $cwd · 관문 보류가 2차 방어)" >&2
+    return 0
+  fi
+  rc=0
+  out="$(env -u CYS_SOCKET python3 "$pf" --seed-trust --config "$acct" --cwd "$cwd" 2>&1)" || rc=$?
+  if [ "$rc" = 0 ]; then
+    echo "[cys-dept] ${out##*$'\n'}" >&2
+  else
+    echo "[cys-dept] WARN: 신뢰 사전 주입 보류(rc=$rc · $acct ← $cwd): ${out##*$'\n'} — 관문 보류가 2차 방어(fail-open)" >&2
+  fi
+  return 0
+}
+
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).
 # ★NO_AUTOSTART(identify autostart 감사 2026-07-10): 읽기 프로브가 죽은 소켓에서 cysd를 되살리지 않게.
 dept_live_roles(){
@@ -1144,6 +1174,8 @@ case "$cmd" in
         _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
         seed_credentials_win "$_credbase" "$acctdir"
       fi
+      # ★WP-2: 계정 dir 확정 직후·데몬(→claude) 기동 前 — 그 acctdir 과 부서 기본 cwd 한 쌍만(opt-in 무관).
+      seed_trust_acct "$acctdir" "${CYS_DEPT_CWD:-$HOME}"
     fi
     _spawned=1   # ★⑦: 이번 호출에서 데몬을 실제로 스폰했는가(0=재사용) — 티켓 발급 로그 문면 구분용
     if ready "$sock"; then
@@ -1151,10 +1183,12 @@ case "$cmd" in
       _spawned=0
     else
       if [ -n "$acctdir" ]; then
+        # ★WP-4 부수수정(0.14.31 실측: dept 데몬이 호출 좌석의 CYS_ROLE=cso 를 상속): 좌석 env 4종을 벗기고 스폰.
+        #   `VAR=.. env -u ..`: 접두 대입은 env 의 환경이 되어 자식(cysd)에 그대로 전달된다(Git Bash coreutils env ✓).
         CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-          nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
@@ -1250,6 +1284,7 @@ PY
     # ★T11(P3-5): fork dir mkdir 직후 creds 시드(Windows·opt-in·copy-if-absent — 함수 계약 참조).
     #   원천은 위에서 해석된 바로 그 계정의 base(resolve_default_base 산출 — 다계정 경계 보존).
     seed_credentials_win "$base" "$acctdir"
+    seed_trust_acct "$acctdir" "${CYS_DEPT_CWD:-$HOME}"   # ★WP-2: fork dir 확정 직후 · 빈 셸 cwd(:new-surface --cwd)와 동일 쌍
     # ★G3(W3): account_dir 을 레지스트리에 **기록**한다 — rotate/launch 가 계정격리를 복원할 때
     #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
     #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
@@ -1260,7 +1295,7 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
@@ -1340,6 +1375,9 @@ PY
       seed_credentials_win "$_credbase" "$acctdir"
     fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
+    # ★WP-2: 계정 dir 확정 직후(포크·공유 양 분기 — 이 부서 좌석이 그 config 로 $cwd 에서 뜬다) · 카탈로그 cwd(:new-surface
+    #   --cwd "$cwd")와 동일 쌍. 공유 계정 dir 은 도구의 라이브 claude 확인이 지킨다(있으면 REFUSE → WARN·계속).
+    seed_trust_acct "$acctdir" "$cwd"
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
     #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
@@ -1432,7 +1470,7 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
