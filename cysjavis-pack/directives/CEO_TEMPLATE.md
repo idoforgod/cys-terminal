@@ -611,6 +611,11 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   한 줄을 둔다 — 집계기는 파일명·경로·수정시각이 아니라 이 선언으로 귀속을 판정하므로(공유
   디렉터리에 남은 지난 시대 파일의 진행% 유입 차단), 레인·스테이지 종결 시 `status=retired`로
   갱신한다. 선언 없는 파일도 그대로 동작한다(하위호환).
+- **정체 종결의 백로그 인계(WP-6)**: `javis_orchestra.py round-status` 가 `stop_reason=stopped_stagnation`
+  을 내면 **stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계**한다 — 잔여 minor 를 이 절의 todo
+  영속본(`MASTER_TODO.md` 백로그 항목)으로 옮기고 라운드를 잇지 않는다. §7 (5-8) 의 종결 경로에 **더해지는
+  도구 판정**이며 종결 ≠ 합격이다(verdict·keep-or-discard 규칙 그대로) · 그 상태의 추가 `round-log` 는
+  도구가 거부하며 명시 재개는 `--override "<사유>"` 로 기록한다.
 
 ## 10. 자기개선 루프 (RSI — 기억·스킬로 실체화)
 - **기억 검색**: 과거 작업·결정·실패의 기억은 `cys recall "<검색어>" [--role --days]` —

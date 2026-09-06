@@ -139,7 +139,7 @@ CONTENT_PINS = {
         ("health_recent", "헬스 관측 필드 고유 핀 — 부재 명령 승계 차단"),
         ("javis_orchestra.py check", "좌석 생존 등급 판정 실재 명령"),
         ("javis_report_gate.py", "게이트 대장 조회 실재 명령"),
-        ("능동 점검", "주기 10분 능동 점검 의무(CSO 헌장 제3조)"),
+        ("능동 점검", "능동 점검 의무 — 이벤트 구동+정기 60분(CSO 헌장 제3조)"),
         ("CYS_IDLE_SECONDS", "idle 5분 임계 명시(계약 §2-5)"),
         ("--queued", "자동 Return 배달 인지(계약 §2-1)"),
         ("javis_resource_gate.py", "사전 자원 게이트 판정자(계약 §5-1)"),
