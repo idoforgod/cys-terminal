@@ -68,6 +68,11 @@ def scenario(name):
                 # the subsequent binding/verify sees new1 and triggers retry.
                 if name == "S4" and state["checks"] == 0:
                     sid = "old"
+                # ★리뷰 R3(codex major) S5: 등록이 **첫 주입 뒤에야** 잡힌다 — 관측 폴링은 전부 미등록을
+                # 보고, 각성 핑에는 (등록 전) 세션 A 가 답하며, 그 사이 B(new1)가 등록해 주입 **직후**
+                # 읽기는 B 를 준다. 직후만 보면 A 의 ACK 가 B 의 증거로 채택된다(재현 대상).
+                if name == "S5" and state["checks"] == 0:
+                    sid = None
                 rows = []
                 if state["alive"]:
                     rows = [{"surface_id": 7, "surface_ref": "surface:7", "role": "worker-1",
@@ -126,6 +131,10 @@ def scenario(name):
             desired = json.load(f)
         check(name + " real roster persisted", desired["roster"]["worker-1"] == entry)
         check(name + " no poison fallback", result["fresh_fallback_roles"] == [])
+        # ★리뷰 R3b: 실 run_restore 가 어댑터 resume 효력을 저널에 기록한다 — 이 하네스의 팩은 임시 디렉터리라
+        #   agents.json 이 없다(=unknown). 비-F1 축은 이 값이 unknown 이면 핀 일치를 verified 로 올리지 않는다.
+        check(name + " records resume mode", rr.get("resume_mode") == "unknown"
+              and m.legacy_verify_outcome("s1", "s1", rr.get("resume_mode"))[0] == "unverified")
         if name == "S1":
             check(name + " held gate stays unverified", result["phoenix_restore"] == "UNVERIFIED"
                   and result["per_role_outcome"] == {"worker-1": "unverified"}
@@ -144,16 +153,31 @@ def scenario(name):
             check(name + " bound new session", rr["observed_sid"] == rr["reinject_sid"] == sid
                   and rr["fresh_evidence"]["provenance"] == "new"
                   and rr["fresh_evidence"]["registered_now"] == rr["fresh_evidence"]["reinject_sid"] == sid)
-        if name in ("S3", "S4"):
-            check(name + " same-run reobserve", len(reobserve) == 1 and "changed" in reobserve[0]["msg"])
+        if name in ("S3", "S4", "S5"):
+            expected_prov = "unobserved" if name == "S5" else "changed"
+            check(name + " same-run reobserve", len(reobserve) == 1 and expected_prov in reobserve[0]["msg"])
             # Distinguish stage reinject from G2's own reinject --check call.
             check(name + " recollects injection and G2", sum(args[-1] == "6" for verb, args, socket, timeout in calls
                   if verb == "reinject") == 2 and verbs.count("reinject") == 4)
             retry = snapshots[2]["roles"]["worker-1"]
             check(name + " invalidated old evidence before retry", "reinject_sid" not in retry
+                  and "reinject_sid_before" not in retry
                   and retry["stages"]["reinject"]["done"] is False
                   and retry["stages"]["g2_ack"]["done"] is False
                   and retry["stages"]["verify"]["done"] is False)
+        if name == "S5":
+            # 1회차의 ACK 는 **어느 세션에도 귀속되지 않는다** — 주입 직전 결속이 미관측이었기 때문이다.
+            first = snapshots[1]["roles"]["worker-1"]
+            check(name + " unattributed ACK is not inherited", first.get("observed_sid") is None
+                  and first.get("reinject_sid") is None and first.get("reinject_sid_before") is None)
+            # 계측 타당성: 그 주입 **직후** 읽기는 실제로 B 를 준다(직후만 보면 A 의 ACK 가 B 로 귀속됐다).
+            check(name + " race actually happened", any(
+                rows and rows[0]["registered_session_id"] == "new1" for n, checks, rows in statuses if checks >= 1)
+                and all(not rows or rows[0]["registered_session_id"] is None
+                        for n, checks, rows in statuses if checks == 0))
+            # 2회차는 B 가 결속된 채 다시 주입해 증거를 모은다(직전=직후=관측).
+            check(name + " second pass binds the evidence", rr["reinject_sid_before"] == rr["reinject_sid"]
+                  == rr["observed_sid"] == "new1" and rr["fresh_evidence"]["provenance"] == "new")
         if name == "S3":
             first = snapshots[1]["roles"]["worker-1"]
             check(name + " A bound before verify switches to B", first["observed_sid"] == first["reinject_sid"] == "new1"
@@ -176,7 +200,7 @@ def main():
     if os.name == "nt":
         print("SKIP run_restore scenarios: Windows named-pipe state mapping is not a temp socket dirname")
         return 0
-    for name in ("S1", "S2", "S3", "S4"):
+    for name in ("S1", "S2", "S3", "S4", "S5"):
         scenario(name)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))

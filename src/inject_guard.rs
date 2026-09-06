@@ -196,7 +196,16 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
             // 구멍은 닫힌다(0.14.31): 그 Return 은 통과가 아니라 종료다(2.1.261 폴더신뢰의 기본 포커스가
             // `No, exit` 로 실측됐다 — CONTRACTS B-7 · 종전 액션이면 좌석 사망). 조여지는 방향만.
             let cursor_on_exit = modal.as_ref().is_some_and(|m| m.cursor_on_exit);
-            if allow_gate_id == Some(g.id.as_str()) && !cursor_on_exit {
+            // ★(0.14.31 · 리뷰 R3 · codex blocking) 그리고 그 부정 증거만으로는 **부족하다**: 잘린 종료 라벨
+            //   (`❯ 2. No, exi` · 번호 없는 `❯ No, exi` · 붙은 `❯ 2.No, exi`)은 `cursor_on_exit=false` 인데
+            //   코퍼스는 그 화면을 여전히 폴더신뢰로 식별한다 → 구멍이 열리고 그 Return 이 종료를 누른다
+            //   (좌석 사망 · R2 가 남긴 blocking). 그래서 구멍의 조건을 **양성 증거**로 뒤집는다 —
+            //   커서가 코퍼스 액션 라벨(`Yes, I trust this folder`) **전문** 위에 있을 때만 연다.
+            //   판정기는 readiness 하나다(`cursor_resolves_to_label` — 모달 서명과 같은 스캐너 · 판정 분리 금지).
+            if allow_gate_id == Some(g.id.as_str())
+                && !cursor_on_exit
+                && action_label_selected(g, o.screen)
+            {
                 return Decision::Send;
             }
             GateHit {
@@ -230,6 +239,24 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
     } else {
         Decision::Hold(hit)
     }
+}
+
+/// 이 관문의 **액션 라벨 위에 선택 커서가 있는가** — allow 구멍이 요구하는 양성 증거.
+///
+/// 【왜 라벨 전량이 아니라 이 관문의 액션 라벨인가(codex 리뷰 R3)】 `Not now`·`Yes, I accept` 를 알아본 것은
+/// "Return 이 폴더신뢰를 승인한다" 는 증거가 아니다. 구멍이 겨냥한 관문의 **통과 동작이 지목한 그 라벨**만
+/// 증거로 인정한다(문면 SOT 는 코퍼스 하나 · 사본 0).
+///
+/// 【액션 선언이 없으면】 `false`(= 구멍이 닫힌다). 통과 동작이 선언되지 않은 관문을 기계가 통과시킬 근거는
+/// 없고, 접기 방향은 보류다(좌석 보존 · 키 0).
+///
+/// 【모호하면 닫힌다(리뷰 R3b · codex)】 술어는 액션 라벨 위 커서 **하나**로 만족하지 않는다 — 같은 화면에
+/// 해소되지 않은 다른 선택 커서(잘린 종료 행 등)가 있으면 어느 쪽이 실제 선택인지 모르므로 거짓이다
+/// (`readiness::cursor_resolves_to_label` doc 의 경쟁 규칙).
+fn action_label_selected(gate: &Gate, screen: &str) -> bool {
+    gate.action
+        .as_ref()
+        .is_some_and(|a| crate::readiness::cursor_resolves_to_label(screen, &a.label))
 }
 
 /// 관문 하나의 **질문형 needle** 만으로 화면을 판별한다(위젯 서명 AND 를 요구하지 않는다).
@@ -810,6 +837,86 @@ mod tests {
         // 대조군: 커서가 Yes 위인 접힌 화면은 구멍이 열린다(자동확인 기능 보존 · 라이브락 방향 회귀 없음).
         let yes_wrapped = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
         assert_eq!(decide_allowing(&obs(&yes_wrapped, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+    }
+
+    /// ★(0.14.31 · 리뷰 R3 · codex blocking) allow 구멍은 **양성 증거**로만 열린다 — 커서가 코퍼스 액션 라벨
+    /// (`Yes, I trust this folder`) 전문 위에 있을 때만. R2 의 부정 증거(`!cursor_on_exit`)는 **잘린 종료 라벨**을
+    /// 통과시켰다: 화면이 여전히 폴더신뢰로 식별되므로 구멍이 열리고, 그 Return 이 종료 선택지를 눌러 좌석이
+    /// 죽는다(2.1.261 기본 포커스 = `No, exit`). 여기 반례 넷 전부 **보류**여야 한다.
+    #[test]
+    fn allow_hole_needs_the_cursor_on_the_gate_action_label() {
+        let gs = gates();
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        // ── 반례: 종료 라벨이 잘려 `cursor_on_exit=false` 인 렌더들(전부 코퍼스는 폴더신뢰로 읽는다) ──
+        let clipped_numbered = on_exit.replace("No, exit", "No, exi");
+        let compact = on_exit.replace("❯ 2. No, exit", "❯ 2.No, exi"); // 점 뒤 공백 없음 — ⓓ 도 안 걸린다
+        let unnumbered = on_exit.replace("❯ 2. No, exit", "❯ No, exi"); // 번호 소실 + 잘림
+        let no_cursor = on_exit.replace("❯ 2. No, exit", "  2. No, exit"); // 커서 행 자체가 소실
+        for (label, screen) in [
+            ("잘린 번호 종료 라벨", &clipped_numbered),
+            ("점 뒤 공백 없는 잘린 종료 라벨", &compact),
+            ("번호 없는 잘린 종료 라벨", &unnumbered),
+            ("커서 소실", &no_cursor),
+        ] {
+            let g = first_run_gates::identify(&gs, screen)
+                .unwrap_or_else(|| panic!("{label}: 전제 붕괴 — 코퍼스가 이 화면을 폴더신뢰로 읽지 않는다\n{screen}"));
+            assert_eq!(g.id, GATE_FOLDER_TRUST, "{label}");
+            assert!(
+                !crate::readiness::modal_signature(screen).is_some_and(|m| m.cursor_on_exit),
+                "{label}: 전제 붕괴 — 종전 부정 증거만으로 이미 닫혔다면 이 반례는 아무것도 재지 못한다"
+            );
+            match decide_allowing(&obs(screen, &gs), Some(GATE_FOLDER_TRUST)) {
+                Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST, "{label}"),
+                other => panic!("{label}: 잘린/미관측 선택 증거에 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}\n{screen}"),
+            }
+            // 조립도 같은 결론 — `other_gate`(=blocks) 가 참이면 `trust_send` 는 쏘지 않는다.
+            let blocked = decide_allowing(&obs(screen, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+            assert!(!trust_send(&TrustObserved {
+                hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
+                other_gate: blocked, legacy_v1: false,
+            }), "{label}: 조립이 Return 을 쐈다");
+        }
+        // ── ★(리뷰 R3b · codex blocking) 모호한 화면: 액션 라벨 위 커서가 **있어도** 해소되지 않은 다른
+        //    선택 커서가 함께 있으면 닫는다(잔상·부분 렌더 — 실제 선택이 종료 쪽일 수 있다) ──
+        let both_cursors = fixtures::FOLDER_TRUST.replace("\x20 2. No, exit", "❯ 2. No, exi");
+        assert!(
+            first_run_gates::identify(&gs, &both_cursors).is_some_and(|g| g.id == GATE_FOLDER_TRUST),
+            "전제 붕괴 — 코퍼스가 이 화면을 폴더신뢰로 읽지 않는다\n{both_cursors}"
+        );
+        assert!(
+            !crate::readiness::modal_signature(&both_cursors).is_some_and(|m| m.cursor_on_exit),
+            "전제 붕괴 — 종전 부정 증거만으로 이미 닫혔다면 이 반례는 아무것도 재지 못한다"
+        );
+        assert!(
+            decide_allowing(&obs(&both_cursors, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
+            "모호한 두 커서 화면에서 자동확인 Return 이 허용됐다(좌석 사망 경로)\n{both_cursors}"
+        );
+        // ── 양성 대조군: 액션 라벨 전문 위 커서면 구멍은 열린다(자동확인 기능 보존 · 라이브락 회귀 0) ──
+        assert_eq!(decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        // 접힌 액션 라벨(단어 안 줄바꿈)도 평탄화 공간에서 전문으로 읽힌다.
+        let wrapped_yes = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
+        assert_eq!(decide_allowing(&obs(&wrapped_yes, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        // ★H-2 결속: 2.1.261 형(기본 포커스 = 종료 · 액션 = 아래 1발) — 액션 **전**은 보류, 액션 **후**는 통과.
+        //   벨트가 액션 뒤 화면까지 막으면 H-2 의 통과 경로가 통째로 죽는다(그 회귀를 여기서 잡는다).
+        let v261_before = fixtures::FOLDER_TRUST
+            .replace("❯ 1. Yes, I trust this folder", "  2. Yes, I trust this folder")
+            .replace("\x20 2. No, exit", "❯ 1. No, exit")
+            .replace(" 2. No, exit", "❯ 1. No, exit");
+        assert!(v261_before.contains("❯ 1. No, exit"), "전제: 2.1.261 기본 포커스 재현\n{v261_before}");
+        assert!(decide_allowing(&obs(&v261_before, &gs), Some(GATE_FOLDER_TRUST)).blocks(), "2.1.261 기본 포커스에서 구멍이 열렸다");
+        let v261_after = v261_before
+            .replace("❯ 1. No, exit", "  1. No, exit")
+            .replace("  2. Yes, I trust this folder", "❯ 2. Yes, I trust this folder");
+        assert_eq!(
+            decide_allowing(&obs(&v261_after, &gs), Some(GATE_FOLDER_TRUST)),
+            Decision::Send,
+            "액션(아래 1발) 뒤 화면에서도 구멍이 닫혀 있다 — WP-1 H-2 의 통과 경로가 죽는다\n{v261_after}"
+        );
+        // 액션 선언이 없는 관문은 구멍이 열리지 않는다(순수 술어 직접 실행).
+        let mut no_action = gs.iter().find(|g| g.id == GATE_FOLDER_TRUST).cloned().expect("폴더신뢰");
+        assert!(action_label_selected(&no_action, fixtures::FOLDER_TRUST), "전제: 선언이 있으면 양성");
+        no_action.action = None;
+        assert!(!action_label_selected(&no_action, fixtures::FOLDER_TRUST), "액션 선언 부재인데 구멍이 열렸다");
     }
 
     /// ★(리뷰 R2 · codex minor) 롤백 노브는 **자기 축만** 끈다 — `CYS_READINESS_V1=1`(readiness_legacy)은 WP-1 의

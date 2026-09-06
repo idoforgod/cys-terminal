@@ -8318,8 +8318,15 @@ mod seat_latch_negation_tests {
         }
         assert!(
             adopt.find("gate_followup_from_row").unwrap() < adopt.find("inject_directive_after_ready(").unwrap(),
-            "채택이 표식을 **해제한 뒤** 읽는다(주입 절반이 맨 앞에서 표식을 지운다)"
+            "채택이 표식을 **해제한 뒤** 읽는다(주입 절반이 표식을 지운다)"
         );
+        // ★(리뷰 R3 · codex major) 표식 해제는 주입 절반의 **맨 앞이 아니라 제출 성공 뒤**다 —
+        //   해제와 제출 사이의 중단·비보류 에러가 데몬의 복원 연속 지시를 지우던 창을 없앤다.
+        let inj = fn_body("inject_directive_after_ready");
+        let clear_at = inj.find("\n    clear_gate_pending(sid);").expect("주입 절반의 표식 해제");
+        let inject_at = inj.find("inject_text(sid, &directive)").expect("제출 지점");
+        assert!(clear_at > inject_at, "표식 해제가 제출보다 앞이다 — 중단 시 [RESTORE] 가 소실된다");
+        assert_eq!(inj.matches("\n    clear_gate_pending(sid);").count(), 1, "표식 해제 지점이 1곳이 아니다");
         // 세 발신자가 지시를 넘긴다: restore in-seat · node-recover · restore 경유 launch-agent.
         assert!(fn_body("run_restore").contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
         assert!(fn_body("run_node_recover").contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
@@ -8330,6 +8337,78 @@ mod seat_latch_negation_tests {
         let inject = fn_body("inject_directive_after_ready");
         assert_eq!(inject.matches("gate_close_override, followup)").count() + inject.matches("gate_close_override,\n            followup,").count(), 2,
                    "주입 절반의 보류 지점 2곳이 followup 을 재표식에 싣지 않는다");
+    }
+
+    /// ★(0.14.31 · 리뷰 R3 · codex major) 관측 실패는 "지시 없음" 이 아니다 — `surface.list` 를 읽지 못했거나
+    /// 표식의 `followup` 이 문자열이 아니면 채택을 **미룬다**(해제 0 · 주입 0 · 표식 무접촉). 순수 술어와
+    /// 배선(재시도·보류 반환·해제 순서)을 함께 잰다.
+    #[test]
+    fn adoption_defers_when_the_mark_cannot_be_read_instead_of_dropping_the_followup() {
+        // ① 형태 판정 — 읽을 수 없는 followup 만 참. 키 부재·null·공백·구 데몬은 거짓(오늘의 거동).
+        assert!(!gate_followup_malformed(&json!({})));
+        assert!(!gate_followup_malformed(&json!({"gate_pending": null})));
+        assert!(!gate_followup_malformed(&json!({"gate_pending": {"gate": "g"}})));
+        assert!(!gate_followup_malformed(&json!({"gate_pending": {"gate": "g", "followup": null}})));
+        assert!(!gate_followup_malformed(&json!({"gate_pending": {"gate": "g", "followup": "  "}})));
+        assert!(!gate_followup_malformed(&json!({"gate_pending": {"gate": "g", "followup": "[RESTORE] x"}})));
+        for bad in [json!(3), json!(true), json!(["[RESTORE] x"]), json!({"t": "[RESTORE] x"})] {
+            assert!(
+                gate_followup_malformed(&json!({"gate_pending": {"gate": "g", "followup": bad}})),
+                "망가진 followup({bad})이 '지시 없음' 으로 접혔다"
+            );
+        }
+        // ★(리뷰 R3b · codex major) 표식 **봉투 자체**가 객체가 아닌 스키마 스큐도 '읽을 수 없음' 이다 —
+        //   종전엔 배열·문자열 봉투가 조용히 '표식 없음' 으로 접혀 그 안의 [RESTORE] 가 소실됐다.
+        for bad in [json!([{"followup": "[RESTORE] x"}]), json!("gate_pending"), json!(7), json!(false)] {
+            assert!(
+                gate_followup_malformed(&json!({"gate_pending": bad})),
+                "망가진 표식 봉투({bad})가 '표식 없음' 으로 접혔다"
+            );
+        }
+        // ② 배선 — 채택이 판정 가능한 읽기(`try_fetch_surfaces`)를 쓰고, 실패하면 미룬 보류를 낸다.
+        let src = include_str!("cys.rs");
+        let fn_body = |name: &str| -> &str {
+            let head = format!("\nfn {name}(");
+            let i = src.find(&head).unwrap_or_else(|| panic!("{name} 이 사라졌다"));
+            let rest = &src[i + 1..];
+            let end = rest.find("\n}\n").map(|e| e + 2).expect("함수 끝");
+            &rest[..end]
+        };
+        let adopt = fn_body("gate_pending_adopt");
+        for anchor in [
+            "try_fetch_surfaces()",
+            "ADOPT_LIST_TRIES",
+            "gate_followup_malformed(",
+            "GATE_ID_ADOPT_UNREAD",
+        ] {
+            assert!(adopt.contains(anchor), "채택의 관측 실패 처리 결손: {anchor}");
+        }
+        assert!(
+            !adopt.contains("let rows = fetch_surfaces();"),
+            "채택이 실패를 빈 목록으로 접는 읽기를 쓴다 — [RESTORE] 소실 경로가 되살아났다"
+        );
+        // 미룬 보류는 **표식을 다시 찍지 않는다**(데몬의 followup 보존을 흔들지 않는다).
+        let unread = adopt
+            .find("GATE_ID_ADOPT_UNREAD.to_string()")
+            .expect("미룬 보류 반환");
+        assert!(
+            !adopt[..unread].contains("settle_gate_pending(") && !adopt[..unread].contains("clear_gate_pending("),
+            "채택을 미루면서 표식을 재기록·해제한다"
+        );
+        // ③ 판정 가능한 읽기가 스키마 스큐를 삼키지 않는다.
+        let tf = fn_body("try_fetch_surfaces");
+        assert!(tf.contains("Err(") && !tf.contains("unwrap_or_default()"), "판정 가능한 읽기가 실패를 접는다");
+        // ④ ★(리뷰 R3b · codex) 호출부가 **미룸을 관문 재발과 구별**한다 — 처방이 갈린다(사람이 통과시킬
+        //    관문이 없다). typed outcome 의 hint 와 recheck 문안이 그 구별을 싣는다.
+        assert!(src.contains("adopt_unread = Some(tail.clone());"), "호출부가 미룬 보류를 식별하지 않는다");
+        assert!(
+            src.contains("관문은 이미 통과했다 — 표식(`surface.list`)을 읽지 못해 채택만 미뤘다"),
+            "미룬 보류의 처방이 '관문 통과 후 재부트' 로 접힌다(사람이 할 조치가 없는데 조치를 지시한다)"
+        );
+        assert!(
+            src.contains("재관측=통과했으나 표식 판독 실패로 채택 미룸"),
+            "recheck 문안이 미룸을 싣지 않는다"
+        );
     }
 
     /// ★★M2 배선 핀 — 보류 분기가 **탈출 경로를 실제로 부른다.**
@@ -8529,10 +8608,22 @@ fn find_seat_row<'a>(surfaces: &'a [Value], role: &str) -> Option<&'a Value> {
 }
 
 fn fetch_surfaces() -> Vec<Value> {
-    request("surface.list", json!({}))
-        .ok()
-        .and_then(|r| r["surfaces"].as_array().cloned())
-        .unwrap_or_default()
+    try_fetch_surfaces().unwrap_or_default()
+}
+
+/// ★(0.14.31 · 리뷰 R3 · codex major) 위의 **판정 가능한** 짝 — RPC 실패와 스키마 스큐를 `Err` 로 낸다.
+///
+/// 【왜 필요한가】 `fetch_surfaces()` 는 실패를 빈 목록으로 접는다. 그것은 대부분의 소비처에서 맞는 접기
+/// (관측 못 함 = 종전대로)지만, **관문 보류 채택**에서는 치명이다: 빈 목록 → 좌석 행 부재 → 표식의 복원 연속
+/// 지시(`followup`)가 `None` → 주입 절반이 표식을 지우고 전문만 넣는다 → `[RESTORE]` 가 **영구 소실**된다.
+/// "읽지 못했다" 와 "읽었는데 없다" 는 다른 사실이고, 앞쪽의 접기 방향은 보류다(결측은 값이 아니다).
+fn try_fetch_surfaces() -> Result<Vec<Value>, String> {
+    let r = request("surface.list", json!({}))?;
+    match r["surfaces"].as_array() {
+        Some(a) => Ok(a.clone()),
+        // 응답은 왔는데 계약 필드가 배열이 아니다 — 관측 성공이 아니다(구 데몬은 이 자리를 배열로 낸다).
+        None => Err("surface.list 응답에 배열 `surfaces` 가 없다(스키마 스큐)".to_string()),
+    }
 }
 
 /// 번들 안 npm 으로 전역 설치해 앱 봉인이 깨진 사용자를 위한 복구 1문장.
@@ -9049,6 +9140,9 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                 // surface_id 를 못 읽으면 재관측 대상이 없다 — 종전대로 보류.
                 None => GateRecheck::NoEvidence,
             };
+            // ★(0.14.31 · 리뷰 R3b · codex) 채택을 **표식 판독 실패로 미룬** 사실. 관문이 재발한 것과
+            //   달리 사람이 할 조치가 없으므로(관문은 이미 통과했다) 처방 문안이 달라야 한다.
+            let mut adopt_unread: Option<String> = None;
             if let (GateRecheck::Adopt(evidence), Some(sid)) = (&recheck, sid) {
                 println!(
                     "· {agent}: 역할 '{role}' 관문 통과 확인({}) — 좌석 재사용 · 디렉티브 주입(스폰 0)",
@@ -9064,9 +9158,23 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     }
                     // 재관측과 주입 사이에 **다음 관문**이 떴다(실측: 폴더신뢰 통과 → 면책 창).
                     // 귀결은 종전과 같은 보류다 — 표식은 주입 가드가 다시 찍었다.
+                    // ★(0.14.31 · 리뷰 R3) 두 번째 사유가 생겼다: 표식을 **읽지 못해** 채택을 미룬 경우
+                    //   (`GATE_ID_ADOPT_UNREAD`). 그때는 관문이 재발한 것이 아니라 관측이 실패한 것이고,
+                    //   표식·복원 연속 지시는 데몬에 그대로 있다(해제 0 · 주입 0). 사람이 조치를 고르려면
+                    //   둘이 구별돼야 한다.
                     Ok(other) => {
+                        if let BootVerdict::GatePending { gate, tail } = &other {
+                            if gate == GATE_ID_ADOPT_UNREAD {
+                                adopt_unread = Some(tail.clone());
+                            }
+                        }
+                        let why = if adopt_unread.is_some() {
+                            "표식 판독 실패로 채택 미룸(표식 보존 · 다음 부트가 다시 채택)"
+                        } else {
+                            "관문 재발"
+                        };
                         eprintln!(
-                            "[boot] role={role} 재관측 채택 중 관문 재발 — 보류 유지({other:?})"
+                            "[boot] role={role} 재관측 채택 중 {why} — 보류 유지({other:?})"
                         );
                     }
                     Err(e) => {
@@ -9077,7 +9185,11 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             // 재관측 결과를 사람이 읽는 줄과 typed outcome **양쪽**에 싣는다 — 보류가 왜
             // 계속되는지(관문 상주인가 · 증거 부재인가)를 모르면 사람이 조치를 고를 수 없다.
             let recheck_note: String = match &recheck {
-                GateRecheck::Adopt(_) => "재관측=통과했으나 채택 중 관문 재발/주입 실패".into(),
+                GateRecheck::Adopt(_) if adopt_unread.is_some() => format!(
+                    "재관측=통과했으나 표식 판독 실패로 채택 미룸({}) — 해제 0 · 주입 0 · 표식 보존",
+                    adopt_unread.clone().unwrap_or_default()
+                ),
+                GateRecheck::Adopt(_) => "재관측=통과했으나 채택 미완(관문 재발 · 주입 실패 — 좌석·표식 보존)".into(),
                 GateRecheck::StillHeld { gate_id, title } => {
                     format!("재관측=관문 상주({title} · id={gate_id})")
                 }
@@ -9086,11 +9198,19 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             println!(
                 "· {agent}: 역할 '{role}' 첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
             );
+            // ★(리뷰 R3b · codex) 처방은 사유를 따라간다 — 관문이 아니라 **표식 판독 실패**로 미뤄졌으면
+            //   사람이 관문을 통과시킬 것이 없다(이미 통과했다). 데몬 응답만 회복되면 다음 부트가 채택한다.
+            let hint = if adopt_unread.is_some() {
+                "관문은 이미 통과했다 — 표식(`surface.list`)을 읽지 못해 채택만 미뤘다. 사람 조치는 없고 \
+                 데몬 응답이 회복되면 다음 `cys boot` 이 같은 좌석을 채택한다(복원 지시는 표식에 그대로 있다)"
+            } else {
+                "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다(재부트가 스폰 없이 이 좌석을 채택한다)"
+            };
             outcomes.push(json!({"role": role, "agent": agent, "outcome": "gate_pending",
                                  "mandatory": mandatory, "surface_ref": sref,
                                  "liveness": "gate_pending", "reason": why,
                                  "recheck": recheck_note,
-                                 "hint": "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다(재부트가 스폰 없이 이 좌석을 채택한다)"}));
+                                 "hint": hint}));
             continue;
         }
         // ── ★죽음 **확정** 좌석: node-recover(비파괴) 우선 → reclaim 에스컬레이션 자동 체인 ──
@@ -10256,6 +10376,25 @@ enum BootVerdict {
 /// 구별되지 않는다. 그 구별이 사라진 것이 이 파일의 `gate=unknown` 결함 본체였다.
 const GATE_ID_UNIDENTIFIED: &str = "unknown";
 
+/// ★(0.14.31 · 리뷰 R3) 관문 보류 **채택을 미룬** 자리의 라벨. 관문이 떠 있어서가 아니라 **표식을 읽지
+/// 못해서** 보류가 유지된 것이라, 사람이 읽는 사유가 `unknown`(관문 미식별)과 달라야 한다.
+const GATE_ID_ADOPT_UNREAD: &str = "adopt-list-unread";
+
+/// 채택 직전 `surface.list` 재시도 횟수·간격·**총 예산**. BUDGET 파리티 블록이 아니다(python 쪽 leaf 가 없다).
+///
+/// 값의 근거: 이 왕복은 로컬 소켓 1회이고, 재시도가 실제로 이기는 실패는 **빠른** 실패다 —
+/// 데몬 재기동 순간의 connect 거부(즉시 반환)·짧은 스키마 스큐. 데몬이 **매달린** 경우의 실패는
+/// `request` 자신의 무진행 상한([`RPC_IDLE_TIMEOUT_SECS`] = 40s)이 지배하므로 재시도가 이득 없이
+/// 부트만 40s 씩 늘린다.
+///
+/// ★(0.14.31 · 리뷰 R3b · codex) 그래서 상한을 **횟수가 아니라 벽시계 예산**으로 건다: 다음 시도는
+/// 예산이 남아 있을 때만 간다. 결과적으로 ⓐ빠른 실패 → 최대 3회(≈0.6s) ⓑ매달린 데몬 → 1회로 끝나고
+/// 채택을 미룬다(표식 보존 · 다음 부트가 다시 채택). 어느 쪽도 종전 경로가 이미 지불하던 왕복 1회의
+/// 노출을 넘지 않는다 — 종전 `fetch_surfaces()` 도 같은 자리에서 같은 상한을 물었다.
+const ADOPT_LIST_TRIES: usize = 3;
+const ADOPT_LIST_GAP_MS: u64 = 300;
+const ADOPT_LIST_BUDGET_MS: u64 = 3_000;
+
 /// readiness **타임아웃**의 분류 — 순수 함수(진리표 테스트 대상 · 화면 문자열 비의존).
 ///
 /// | `alive`(데몬 관측) | 판정 | 근거 |
@@ -10415,10 +10554,19 @@ fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool,
 /// 관문을 통과시킨 뒤 그 좌석에 다시 붙는 경로(node-recover·restore in-seat·같은 좌석 재기동)가
 /// 표식을 지우지 않으면 좌석이 영구 미충족으로 남는다. 마지막 안전망은 데몬의 TTL 만료다.
 fn clear_gate_pending(sid: u64) {
-    let _ = request(
+    // ★(0.14.31 · 리뷰 R3b · codex) 해제 실패는 **삼키지 않는다.** 실패의 귀결은 파괴가 아니라 중복이다 —
+    //   표식이 남아 다음 부트가 같은 좌석을 한 번 더 채택해 복원 연속 지시를 다시 싣는다(전문 디렉티브는
+    //   `awakened_at` 래치가 막는다). 그 중복을 사람이 원인과 함께 읽을 수 있어야 한다(정확히 한 번 배달은
+    //   이 함수가 줄 수 없는 보증이고, 그 계약 변경은 이 회차 밖이다 — 백로그).
+    if let Err(e) = request(
         "surface.gate_pending",
         json!({"surface_id": sid, "clear": true}),
-    );
+    ) {
+        eprintln!(
+            "[boot] 관문 보류 표식 해제 실패(surface:{sid}) — 표식이 남는다(다음 부트가 같은 좌석을 다시 \
+             채택할 수 있다 · 좌석·주입은 그대로): {e}"
+        );
+    }
 }
 
 /// 롤백 킬스위치의 **유일한 env 판독 지점**(프로세스 수명 동안 1회).
@@ -10912,7 +11060,12 @@ fn inject_directive_after_ready(
     //   건너뛰므로(U-10), 사람이 관문을 통과시킨 뒤 이 좌석에 다시 붙는 경로(node-recover·
     //   restore in-seat·같은 좌석 재기동·★M2 재관측)가 표식을 지우지 않으면 좌석이 영구
     //   미충족으로 남는다.
-    clear_gate_pending(sid);
+    // ★(0.14.31 · 리뷰 R3 · codex major) 그 해제는 함수 **맨 앞이 아니라 제출 성공 직후**다.
+    //   종전 순서(해제 → settle sleep → 관측 → 주입)에는 창이 있었다: 해제와 제출 사이에 프로세스가
+    //   중단되거나 `inject_text` 가 보류 아닌 에러로 끝나면, 표식과 함께 그 표식이 나르던 복원 연속
+    //   지시(`[RESTORE]`/`[RECOVER]`)가 **데몬에서 사라진다**(지시는 이 프로세스의 지역 변수에만 남고
+    //   그대로 폐기된다). 지금은 제출이 성공했을 때만 지운다 — 실패·중단이면 표식이 그대로 남아
+    //   다음 부트의 채택이 같은 지시를 다시 싣는다(지시는 관문도 실패도 넘어 살아남는다).
     // marker 감지 직후 TUI 입력 활성화까지 약간의 여유
     std::thread::sleep(std::time::Duration::from_secs(BUDGET_POST_MARKER_SETTLE_SECS));
 
@@ -10978,6 +11131,8 @@ fn inject_directive_after_ready(
             followup,
         ));
     }
+    // ★제출이 성공한 지금이 표식 해제 지점이다(위 doc — 해제와 제출 사이에 창을 두지 않는다).
+    clear_gate_pending(sid);
 
     // ── 4) 주입 확인 — ★(W2 · B14/CS-3⑤) **신호의 질을 화면 문자열 → ack 계약으로 교체** ──
     //
@@ -11148,16 +11303,62 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
 
 /// 재관측이 Ready 를 냈을 때의 **채택** — 표식 해제 + 디렉티브 주입 1회.
 ///
-/// ★주입이 **1회**인 근거: `inject_directive_after_ready` 가 맨 앞에서 `clear_gate_pending` 을
-///   부르고, 그 뒤 `directive.verify` 까지 한 번에 끝난다. 재관측은 좌석당 부트 1회만 돌고,
+/// ★주입이 **1회**인 근거: `inject_directive_after_ready` 가 제출 성공 직후 `clear_gate_pending` 을
+///   부르고(리뷰 R3 — 해제는 맨 앞이 아니다), 그 뒤 `directive.verify` 까지 한 번에 끝난다. 재관측은 좌석당 부트 1회만 돌고,
 ///   채택한 좌석은 다음 부트에서 `awakened_at` 래치로 `AwakeConfirmed` = `already_alive` 가 되어
 ///   이 분기에 다시 들어오지 않는다(중복 주입 없음).
 fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, String> {
-    let rows = fetch_surfaces();
+    // ★(0.14.31 · 리뷰 R3 · codex major) 채택은 **표식을 읽지 못하면 시작하지 않는다.** 종전엔 `fetch_surfaces()`
+    //   가 RPC 실패를 빈 목록으로 접어 `followup=None` 이 됐고, 그 뒤 RPC 는 성공할 수 있으므로 주입 절반이
+    //   표식을 지우고 전문만 넣어 `[RESTORE]`/`[RECOVER]` 가 영구 소실됐다. 지금은 짧게 재시도하고, 그래도
+    //   못 읽으면 **채택을 미룬다**(표식 무접촉 · 해제 0 · 주입 0 · 좌석 보존 — 다음 부트가 다시 채택한다).
+    let mut rows: Vec<Value> = Vec::new();
+    let mut read_err = String::new();
+    let started = std::time::Instant::now();
+    let mut tried = 0usize;
+    for attempt in 0..ADOPT_LIST_TRIES {
+        tried = attempt + 1;
+        match try_fetch_surfaces() {
+            Ok(r) if r.iter().any(|s| s["surface_id"].as_u64() == Some(sid)) => {
+                rows = r;
+                read_err.clear();
+                break;
+            }
+            Ok(_) => read_err = format!("좌석 행 부재(surface.list 에 surface_id={sid} 없음)"),
+            Err(e) => read_err = e,
+        }
+        // ★벽시계 예산(위 상수 doc) — 매달린 데몬에서 40s 왕복을 3번 물지 않는다.
+        if attempt + 1 < ADOPT_LIST_TRIES
+            && started.elapsed() + std::time::Duration::from_millis(ADOPT_LIST_GAP_MS)
+                < std::time::Duration::from_millis(ADOPT_LIST_BUDGET_MS)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ADOPT_LIST_GAP_MS));
+        } else if attempt + 1 < ADOPT_LIST_TRIES {
+            read_err = format!("{read_err} · 재시도 예산 {ADOPT_LIST_BUDGET_MS}ms 소진");
+            break;
+        }
+    }
     let row = rows.iter().find(|s| s["surface_id"].as_u64() == Some(sid));
-    // ★(0.14.31 · 리뷰 R2 · codex major) 표식에 실린 복원 연속 지시를 **해제 전에** 읽는다(아래 주입 절반이 맨 앞에서
-    //   표식을 지운다). 전문 디렉티브 뒤에 **한 제출**로 잇는다 — 전문은 들어갔는데 [RESTORE] 만 잃는 창(두 번째
-    //   제출 실패·프로세스 중단)을 없앤다. 표식이 없거나(구 데몬·직접 기동) followup 이 없으면 종전대로 전문만.
+    if row.is_none() || gate_followup_malformed(row.unwrap()) {
+        let why = if row.is_none() {
+            read_err.clone()
+        } else {
+            "표식(gate_pending)이 읽을 수 없는 형태다 — 봉투가 객체가 아니거나 followup 이 문자열이 아니다(스키마 스큐)"
+                .to_string()
+        };
+        eprintln!(
+            "[boot] role={role} 관문 보류 채택 보류 — 표식을 읽지 못했다({why} · {tried}회 시도 · 예산 \
+             {ADOPT_LIST_BUDGET_MS}ms). 표식·복원 연속 지시를 그대로 두고 다음 부트가 다시 채택한다\
+             (해제 0 · 주입 0 · 좌석 보존)"
+        );
+        return Ok(BootVerdict::GatePending {
+            gate: GATE_ID_ADOPT_UNREAD.to_string(),
+            tail: why,
+        });
+    }
+    // ★(0.14.31 · 리뷰 R2 · codex major) 표식에 실린 복원 연속 지시를 **해제 전에** 읽는다(주입 절반이 주입
+    //   성공 뒤에 표식을 지운다). 전문 디렉티브 뒤에 **한 제출**로 잇는다 — 전문은 들어갔는데 [RESTORE] 만
+    //   잃는 창(두 번째 제출 실패·프로세스 중단)을 없앤다. followup 이 없으면 종전대로 전문만.
     let followup = row.and_then(gate_followup_from_row);
     let directive = adoption_payload(&compose_directive(role)?, followup.as_deref());
     if followup.is_some() {
@@ -11188,6 +11389,29 @@ fn gate_followup_from_row(row: &Value) -> Option<String> {
         .as_str()
         .filter(|f| !f.trim().is_empty())
         .map(String::from)
+}
+
+/// ★(0.14.31 · 리뷰 R3 · codex major) 그 행의 표식이 **읽을 수 없는 형태**인가 — 참이면 "지시가 없다" 고
+/// 결론지을 수 없으므로 채택을 미룬다. 성공한 RPC 라도 값이 망가졌으면 그것은 부재의 증거가 아니다
+/// (결측은 값이 아니다).
+///
+/// 두 자리를 본다:
+///   · `gate_pending` 자체가 **객체도 null 도 아닐 때**(문자열·배열·수 — 스키마 스큐 · 리뷰 R3b · codex).
+///     종전엔 `!is_object() → false` 라 `gate_pending: [{"followup": "[RESTORE] …"}]` 같은 봉투가
+///     "표식 없음" 으로 접혀 지시가 소실됐다.
+///   · 표식은 객체인데 `followup` 키가 **문자열도 null 도 아닐 때**.
+///
+/// 키 부재·null·공백 문자열은 **거짓**이다(구 데몬·지시 없는 표식 = 오늘의 거동 그대로).
+fn gate_followup_malformed(row: &Value) -> bool {
+    let gp = &row["gate_pending"];
+    if gp.is_null() {
+        return false; // 표식 자체가 없다(TTL 만료·구 데몬) — 보존할 지시도 없다.
+    }
+    if !gp.is_object() {
+        return true; // 표식 자리가 객체가 아니다 — '없음' 이 아니라 '읽을 수 없음'.
+    }
+    let f = &gp["followup"];
+    !(f.is_null() || f.is_string())
 }
 
 /// ★(0.14.31 · 리뷰 R2) 채택 페이로드 — 전문 디렉티브 뒤에 복원 연속 지시를 **한 제출**로 잇는다. 직접 Ready

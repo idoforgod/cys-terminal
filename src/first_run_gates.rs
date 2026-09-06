@@ -111,7 +111,10 @@ pub enum Passability {
 pub struct GateAction {
     /// 선택할 항목(1-based · 화면에 보이는 번호).
     pub select_index: u8,
-    /// 그 항목의 라벨(사람 확인용 · 판정 근거 아님).
+    /// 그 항목의 라벨. ★(0.14.31 · 리뷰 R3) 종전엔 "사람 확인용 · 판정 근거 아님" 이었으나, 지금은
+    /// **자동확인 allow 구멍의 양성 증거**다 — `inject_guard::decide_allowing` 은 커서가 이 라벨 전문
+    /// 위에 있고 **경쟁 커서가 없을 때만**(`readiness::cursor_resolves_to_label`) 그 관문의 Return 을 허용한다. 그러므로 이 값은
+    /// 화면 실측 문면과 **글자 그대로** 같아야 하고, 틀리면 구멍이 닫히는 쪽(보류)으로 틀린다.
     pub label: String,
     /// 등가 리터럴 입력(예: `"2"`). 없으면 방향키+Return 만.
     pub literal: Option<String>,

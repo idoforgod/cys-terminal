@@ -4,7 +4,7 @@
 실행: python3 cysjavis-pack/bin/tests/test_phoenix_fresh_honest.py (0=전건 PASS)
 """
 import copy
-import importlib.util, os, shutil, sys, tempfile
+import importlib.util, json, os, shutil, sys, tempfile
 
 # 기존 시나리오 하네스처럼 모듈만 적재(바이트코드 파일 생성 방지).
 sys.dont_write_bytecode = True
@@ -145,7 +145,9 @@ def main():
         # E: 매 케이스는 독립 복사로 단 하나의 증거 조건만 바꾼다.
         rr = {"stages": {"reinject": {"done": True, "evidence": "reinject rc=0 kind=ack …"},
                          "g2_ack": {"done": False}},
-              "observed_sid": "new1", "observed_sid_source": "registered", "reinject_sid": "new1",
+              "observed_sid": "new1", "observed_sid_source": "registered",
+              # ★리뷰 R3: 증거는 주입 **직전·직후** 모두 그 세션이 결속돼 있을 때만 귀속된다.
+              "reinject_sid": "new1", "reinject_sid_before": "new1",
               "fresh_pre_sids": ["old"], "fresh_pre_dir": td}
         session_file_exists = lambda p: p.endswith("new1.jsonl")
         row = {"exited": False, "agent_alive": True, "gate_pending": None, "registered_session_id": "new1"}
@@ -154,7 +156,8 @@ def main():
               and ev["gate_cleared"] is True and ev["reinject_kind"] == "ack" and ev["g2_ack"] is False
               and ev["provenance"] == "new" and ev["observed_sid"] == "new1"
               and ev["observed_sid_source"] == "registered"
-              and ev["registered_now"] == "new1" and ev["reinject_sid"] == "new1")
+              and ev["registered_now"] == "new1" and ev["reinject_sid"] == "new1"
+              and ev["reinject_sid_before"] == "new1")
         for kind in ("injected", "queued", "skip", "unknown"):
             candidate = copy.deepcopy(rr)
             candidate["stages"]["reinject"]["evidence"] = "reinject rc=0 kind=" + kind
@@ -223,6 +226,10 @@ def main():
             ("changed beats pre_existing", {"fresh_pre_sids": ["new1"]}, dict(row, registered_session_id="other"), "changed"),
             ("pre_existing beats evidence_unbound", {"fresh_pre_sids": ["new1"], "reinject_sid": None}, row, "pre_existing"),
             ("evidence_unbound beats file_missing", {"reinject_sid": None}, row, "evidence_unbound"),
+            # ★리뷰 R3(codex major): 주입 **직전** 결속이 미관측/다름이면 그 ACK 는 어느 세션의 것도 아니다.
+            #   "before absent" 가 정확히 44713ff 저널 형식이다(등록 전 주입 → 다른 세션 등록 경쟁의 산물).
+            ("before None", {"reinject_sid_before": None}, row, "evidence_unbound"),
+            ("before other", {"reinject_sid_before": "other"}, row, "evidence_unbound"),
         ):
             candidate = copy.deepcopy(rr)
             candidate.update(rr_changes)
@@ -234,6 +241,12 @@ def main():
                   and ev["reinject_sid"] == candidate.get("reinject_sid")
                   and (current_row is None or ev["gate_cleared"] is True)
                   and (provenance != "changed" or ("new1" in missing and "other" in missing)))
+        # ★리뷰 R3: 키 자체가 없는 구(44713ff) 레코드도 귀속 미확정이다 — 검증기만 고치면 캐시가 살아남는다.
+        legacy_bound = copy.deepcopy(rr)
+        legacy_bound.pop("reinject_sid_before")
+        outcome, missing, ev = m.f1_fresh_verify(legacy_bound, row, lambda p: False)
+        check("verify R2 before absent", outcome == "unverified" and ev["provenance"] == "evidence_unbound"
+              and ev["reinject_sid_before"] is None and "주입 직전 결속" in (missing or ""))
         outcome, missing, ev = m.f1_fresh_verify(rr, row, lambda p: False)
         check("verify provenance file missing", outcome == "unverified" and bool(missing)
               and ev["provenance"] == "file_missing")
@@ -279,7 +292,7 @@ def main():
             "legacy": {"fresh_expected": True, "outcome": "fresh",
                        "fresh_evidence": {"gate_cleared": True}, "stages": {"verify": {"done": True}}},
             "proven": {"fresh_expected": True, "outcome": "fresh",
-                       "observed_sid": "new1", "reinject_sid": "new1",
+                       "observed_sid": "new1", "reinject_sid": "new1", "reinject_sid_before": "new1",
                        "fresh_evidence": {"provenance": "new"}, "stages": {"verify": {"done": True}}},
             "unverified": {"fresh_expected": True, "outcome": "unverified",
                            "stages": {"verify": {"done": True}}},
@@ -301,9 +314,19 @@ def main():
             journal = {"roles": {"cached": cached}}
             check("migration ef1d3e4 reinject " + name, m.migrate_f1_journal(journal) == ["cached"]
                   and cached["stages"]["verify"]["done"] is False)
+        # ★리뷰 R3(codex major): 44713ff 형식(직전 결속 없음/다름)도 캐시 성공을 무효화한다 — 그 레코드는
+        #   지금 고치는 경쟁(등록 전 주입 → 다른 세션 등록)의 산물일 수 있다. 귀결은 재검증(스폰·파괴 0).
+        for name, changes in (("absent", {}), ("None", {"reinject_sid_before": None}),
+                              ("different", {"reinject_sid_before": "other"})):
+            cached = copy.deepcopy(before["roles"]["proven"])
+            cached.pop("reinject_sid_before")
+            cached.update(changes)
+            journal = {"roles": {"cached": cached}}
+            check("migration 44713ff before " + name, m.migrate_f1_journal(journal) == ["cached"]
+                  and cached["stages"]["verify"]["done"] is False)
 
         # G: 명시적 계약 상수.
-        check("fresh reasons", m.F1_FRESH_REASONS == ("no_session", "no_session_file"))
+        check("fresh reasons", m.F1_FRESH_REASONS == ("no_session", "no_session_file", "no_resume_arg", "cli_fresh"))
         check("accepted reinject kinds", set(m.F1_ACCEPTED_REINJECT_KINDS) == {"ack", "injected"})
         check("registered grace tries", m.F1_REGISTERED_GRACE_TRIES >= 3)
         check("reverify passes", m.F1_REVERIFY_PASSES == 2)
@@ -391,7 +414,9 @@ def main():
         for relative, literals in (
             (os.path.join("src", "bin", "cys.rs"), (
                 "디렉티브 생존 확인 (ACK 수신)", "reinjected {} bytes → surface:{sid}",
-                "check reinject skip", "[reinject] ACK 없음")),
+                "check reinject skip", "[reinject] ACK 없음",
+                # ★리뷰 R3: 실제 기동 모드가 phoenix 에 닿는 유일한 문면(`cli_fresh_roles` 가 파싱한다).
+                "[launch-agent] fresh 각성(role={role} · agent={agent})")),
             (os.path.join("src", "bin", "cysd", "handlers.rs"), ('"registered_session_id"',)),
         ):
             try:
@@ -402,6 +427,131 @@ def main():
             else:
                 for literal in literals:
                     check("source pin " + literal, literal in source)
+
+        # L: ★리뷰 R3(codex major) — 어댑터의 resume_arg 효력(예상)과 CLI 관측 줄(실제 기동 모드).
+        #    Rust `fill_missing_fields` 가 계층으로 채우는 키는 ready_marker·approval_patterns·first_run_gates
+        #    셋뿐이라 `resume_arg` 는 디스크 선언이 전부다 — 부재/공백/비문자열은 전부 fresh 기동이다.
+        pack = os.path.join(td, "packL")
+        os.makedirs(pack)
+        original_pack_env = {k: os.environ.get(k) for k in m.PACK_DIR_ENV_KEYS}
+        try:
+            for k in m.PACK_DIR_ENV_KEYS:
+                os.environ.pop(k, None)
+            os.environ["CYS_PACK_DIR"] = pack
+            agents_path = os.path.join(pack, "agents.json")
+            def write_agents(obj, stamp):
+                with open(agents_path, "w", encoding="utf-8") as f:
+                    json.dump(obj, f)
+                # 캐시 키는 (경로, mtime_ns, 크기) — 같은 크기로 덮어써도 갈리도록 mtime 을 벌린다.
+                os.utime(agents_path, (stamp, stamp))
+            check("pack dir env precedence", m._pack_dir() == pack)
+            check("resume effect agents absent", m.resume_arg_effect("claude") == ("unknown", "agents_unreadable"))
+            for i, (name, spec, expected) in enumerate((
+                ("real arg", {"cmd": "claude", "resume_arg": "--resume {session_id}"}, ("effective", "")),
+                ("absent", {"cmd": "claude"}, ("no_effect", "resume_arg_absent")),
+                ("empty", {"cmd": "claude", "resume_arg": ""}, ("no_effect", "resume_arg_blank")),
+                ("whitespace", {"cmd": "claude", "resume_arg": " \t "}, ("no_effect", "resume_arg_blank")),
+                ("null", {"cmd": "claude", "resume_arg": None}, ("no_effect", "resume_arg_blank")),
+                ("non-string", {"cmd": "claude", "resume_arg": ["--resume"]}, ("no_effect", "resume_arg_blank")),
+                ("adapter absent", {}, ("unknown", "adapter_absent")),
+            )):
+                payload = {"claude": spec} if spec else {"gemini": {"cmd": "gemini"}}
+                write_agents(payload, 1_600_000_000 + i * 60)
+                check("resume effect " + name, m.resume_arg_effect("claude") == expected)
+            # fresh_expected 는 세션 파일이 **있어도** 효력 없는 접미면 fresh 를 예상한다(거짓 verified 차단).
+            cfg = os.path.join(td, "acctL")
+            proj = os.path.join(cfg, "projects", m._claude_project_component("/tmp/L"))
+            os.makedirs(proj)
+            with open(os.path.join(proj, "s1.jsonl"), "w", encoding="utf-8") as f:
+                f.write("{}\n")
+            e = {"agent": "claude", "session_id": "s1", "claude_config_dir": cfg, "cwd": "/tmp/L"}
+            write_agents({"claude": {"cmd": "claude", "resume_arg": ""}}, 1_700_000_000)
+            check("fresh_expected empty resume arg", m.fresh_expected(e) == (True, "no_resume_arg"))
+            write_agents({"claude": {"cmd": "claude"}}, 1_700_000_060)
+            check("fresh_expected absent resume arg", m.fresh_expected(e) == (True, "no_resume_arg"))
+            write_agents({"claude": {"cmd": "claude", "resume_arg": "--resume {session_id}"}}, 1_700_000_120)
+            check("fresh_expected real resume arg", m.fresh_expected(e) == (False, ""))
+            # 다른 어댑터는 F-1 범위 밖 — 어떤 선언이어도 예상은 False.
+            check("fresh_expected other adapter", m.fresh_expected(dict(e, agent="codex")) == (False, ""))
+            os.remove(agents_path)
+            check("fresh_expected unknown keeps prediction", m.fresh_expected(e) == (False, ""))
+        finally:
+            for k, v in original_pack_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        # 출하 팩의 claude 어댑터가 실 `resume_arg` 를 선언한다 — "어댑터 부재 → 임베드 통본" 접기의 전제.
+        shipped = os.path.join(os.path.abspath(os.path.join(HERE, "..", "..")), "agents.json")
+        try:
+            with open(shipped, encoding="utf-8") as f:
+                declared = (json.load(f).get("claude") or {}).get("resume_arg")
+        except (OSError, ValueError):
+            print("SKIP shipped adapter pin (pack agents.json absent)")
+        else:
+            check("shipped claude adapter declares a non-empty resume_arg",
+                  isinstance(declared, str) and bool(declared.strip()))
+        # CLI 관측 줄 — 역할만 뽑고, 다른 줄·부분 문자열에 위조되지 않는다.
+        observed = m.cli_fresh_roles(
+            "[launch-agent] fresh 각성(role=worker-1 · agent=claude): resume 이 요청됐으나 …\n"
+            "  [launch-agent] fresh 각성(role=indented · agent=claude)\n"        # 줄머리 아님 → 무시
+            "[launch-agent] resume 생략: session_id 없음 — fresh 로 기동한다\n"  # 다른 줄 → 무시
+            "[launch-agent] fresh 각성(role=cso · agent=claude): …\n")
+        check("cli fresh roles line anchored", observed == {"worker-1", "cso"})
+        check("cli fresh roles empty", m.cli_fresh_roles("") == set() and m.cli_fresh_roles(None) == set())
+
+        # M: ★리뷰 R3b — resume 미상은 핀 일치로 자기채점하지 않고, 타임아웃 원문은 관측만 살린다.
+        # M1: 비-F1 topology 진리표 — outcome과 사유를 함께 고정한다(미상은 일치만 강등).
+        for name, exp, obs, mode, expected, fragment in (
+            ("match default", "s1", "s1", None, "verified", "세션 일치"),
+            ("match effective", "s1", "s1", "effective", "verified", "세션 일치"),
+            ("match no_effect", "s1", "s1", "no_effect", "verified", "세션 일치"),
+            ("match empty mode", "s1", "s1", "", "verified", "세션 일치"),
+            ("match unknown", "s1", "s1", "unknown", "unverified", "resume 모드 미상"),
+            ("unobserved unknown", "s1", None, "unknown", "unverified", "transient"),
+            ("empty observed unknown", "s1", "", "unknown", "unverified", "transient"),
+            ("fork", "s1", "s2", None, "unverified", "fork"),
+            ("fork unknown", "s1", "s2", "unknown", "unverified", "fork"),
+            ("pin absent", "", "s1", None, "unverified", "핀 부재"),
+            ("both absent", None, None, None, "unverified", "transient"),
+        ):
+            outcome, reason = m.legacy_verify_outcome(exp, obs, mode)
+            check("legacy verify " + name, outcome == expected and fragment in reason
+                  and (name != "match unknown" or obs in reason))
+        check("legacy verify unknown preserves fork",
+              m.legacy_verify_outcome("s1", "s2", "unknown") == m.legacy_verify_outcome("s1", "s2"))
+
+        # M2: 실제 cys 호출 없이 세 스트림을 각각 관측한다 — 분류용 TIMEOUT 문안은 그대로다.
+        fresh_line = "[launch-agent] fresh 각성(role=worker-1 · agent=claude): resume 이 요청됐으나 …"
+        class CaptureStub:
+            returncode = 124
+            stdout = ""
+            stderr = "TIMEOUT 90s"
+        original_cys = m.cys
+        try:
+            result = CaptureStub()
+            result.stderr_raw = fresh_line + "\n관측과 무관한 진단 줄\n"
+            m.cys = lambda *args, **kwargs: result
+            spawned = m.spawn_production("test-socket", ["worker-1"])
+            check("spawn timeout rc", spawned["rc"] == 124)
+            check("spawn timeout classifier out unchanged", spawned["out"] == "TIMEOUT 90s")
+            check("spawn timeout raw fresh observed", spawned["fresh_observed"] == ["worker-1"])
+            # 구 반환형은 속성 자체가 없다 — getattr 기본값으로 관측 없음, 예외 없음.
+            result = CaptureStub()
+            spawned = m.spawn_production("test-socket", ["worker-1"])
+            check("spawn old capture shape", not hasattr(result, "stderr_raw")
+                  and spawned["fresh_observed"] == [])
+            for stream in ("stdout", "stderr"):
+                result = CaptureStub()
+                setattr(result, stream, fresh_line)
+                spawned = m.spawn_production("test-socket", ["worker-1"])
+                check("spawn fresh only in " + stream, spawned["fresh_observed"] == ["worker-1"])
+        finally:
+            m.cys = original_cys
+
+        # M3: Windows 캡처 대역도 같은 원문 필드를 가진다 — 플랫폼 분기·파일 쓰기 불요.
+        check("capture raw stderr default", m._CapR().stderr_raw == "")
+        check("capture raw stderr explicit", m._CapR(stderr_raw="x").stderr_raw == "x")
 
         # K: 성공 fresh만 target 순서로 분할; 기본 사유는 구 저널의 poison.
         targets = ["f1", "pending", "poison", "verified"]
