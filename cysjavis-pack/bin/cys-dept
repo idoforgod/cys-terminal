@@ -1339,6 +1339,12 @@ PY
     #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
     #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
     reg_set_field "$name" account_dir "$acctdir" || true
+    # ★WP-2 R4(리뷰 minor · create 와 비대칭 교정): 확정 cwd 도 등재한다 — 이후 `cys-dept launch dept-N`(CYS_DEPT_CWD
+    #   없음)·rotate 가 resolve_dept_cwd 의 ②등재 cwd 로 **같은 좌석 폴더**를 복원한다(종전엔 등재값이 없어 $HOME 으로
+    #   이주 = 시드 쌍과 기동 쌍이 호출 간에 갈렸다 · 신뢰는 양쪽 다 시드돼 관문은 안 열리지만 좌석이 다른 폴더에 뜬다).
+    #   create 는 카탈로그 **원값**을 등재하지만 allocate 의 원값 소스는 CYS_DEPT_CWD 뿐이라 **확정 물리 경로**를 등재한다
+    #   (`.` 같은 상대값을 그대로 두면 재기동 호출자의 cwd 에 좌우된다 · codex R4). 실패는 fail-open + WARN 1줄.
+    reg_set_field "$name" cwd "$dept_cwd" || echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용) — 티켓 발급 로그 문면 구분용
