@@ -101,6 +101,115 @@ pub struct QueueEntry {
     /// enqueue 경로 태그: "send" | "send-key" | "governance-approval" (+ WAL 복원 합성값).
     #[serde(default)]
     pub origin: String,
+    // ─── ★(0.14.31 · WP-5 M) TTL·만료 회계 — 전부 `serde(default)`(WAL 신→구→신 왕복 무손실) ───
+    /// TTL(초). `None` = 데몬 기본(`CYS_QUEUE_TTL_SECS` · 기본 6h). `Some(0)` = 이 항목은 만료
+    /// 없음(명시 opt-out). 구 데몬이 WAL 을 다시 쓰면 이 키가 사라지고 → 재기동 시 `None`(기본)
+    /// 으로 되돌아와 만료가 **보존된 enqueued_at 기준으로 재계산**된다(정본 M: 무손실).
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// pause(kill-switch `daemon.paused` · 헬스 조치 `queue_paused_until`) 동안 이 항목이 기다린
+    /// 누적 초 — TTL 나이에서 **제외**한다(정지 중 흐른 시간은 항목의 잘못이 아니다).
+    #[serde(default)]
+    pub paused_total_secs: f64,
+    /// 만료 시각(epoch). `Some` 이면 이 항목은 `Surface::expired_queue` 소속이며 활성 큐
+    /// (`pending_queue`)에 있어서는 안 된다(§8 "만료 항목을 활성 큐 머리에 두지 않는다").
+    #[serde(default)]
+    pub expired_at: Option<f64>,
+    /// 마지막 `queue.revive` 시각(epoch) — TTL 시계의 기준점을 이 시각으로 옮긴다. 원
+    /// `enqueued_at` 은 보존한다(원장 `enqueued_at`·`wait_secs` 는 발신 시각 기준 사실이다).
+    #[serde(default)]
+    pub revived_at: Option<f64>,
+    /// 만료 통지(발신 surface 로 1줄)를 이미 했는가 — 재기동 후 WAL 복원분에 같은 통지가 다시
+    /// 나가지 않게 하는 항목 id 단위 멱등 표식.
+    #[serde(default)]
+    pub expired_notified: bool,
+}
+
+/// ★(0.14.31 · WP-5 M) 큐 항목 TTL 기본(초) = 6h. env `CYS_QUEUE_TTL_SECS` 가 덮는다
+/// (`queue_ttl_default_secs`). 0 = 만료 비활성(롤백 스위치 · 기본 켬).
+pub const QUEUE_TTL_DEFAULT_SECS: u64 = 6 * 3600;
+
+/// 데몬 기본 TTL 노브(`CYS_QUEUE_TTL_SECS` · 기본 [`QUEUE_TTL_DEFAULT_SECS`]). 큐 틱마다 1회 읽는다.
+pub fn queue_ttl_default_secs() -> u64 {
+    std::env::var("CYS_QUEUE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(QUEUE_TTL_DEFAULT_SECS)
+}
+
+/// ★(0.14.31 · WP-5 M) WAL 행(Value) → `QueueEntry` 되살림 — rehome 의 되살림 규칙과 같은 값
+/// (id=mid 폴백 · origin 부재 "wal-legacy" · TTL 5키 serde default). `queue.revive`/`queue.drop` 이
+/// 살아있는 surface 없는 복원분을 다룰 때 쓴다(원장 묘비·응답 재료).
+pub fn queue_entry_from_row(it: &Value) -> QueueEntry {
+    QueueEntry {
+        id: it
+            .get("id")
+            .and_then(|v| v.as_str())
+            .or_else(|| it.get("mid").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
+        text: it.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        enqueued_at: it
+            .get("enqueued_at")
+            .and_then(|v| v.as_f64())
+            .unwrap_or_else(now_epoch),
+        from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
+        origin: it
+            .get("origin")
+            .and_then(|v| v.as_str())
+            .unwrap_or("wal-legacy")
+            .to_string(),
+        ttl_secs: it.get("ttl_secs").and_then(|v| v.as_u64()),
+        paused_total_secs: it
+            .get("paused_total_secs")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
+        expired_at: it.get("expired_at").and_then(|v| v.as_f64()),
+        revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
+        expired_notified: it
+            .get("expired_notified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+impl QueueEntry {
+    /// **순서 키** — 활성 큐 정렬 병합(`queue_merge_insert_pos` · rehome)의 시각 축. 재활성
+    /// (`revived_at`)된 항목은 재활성 시각이 순서 키다: 원 `enqueued_at` 로 정렬하면 재기동 rehome 이
+    /// 되살린 항목을 그 사이 들어온 신규 작업 **앞**으로 되돌린다(codex 설계 검토 Q6).
+    pub fn order_at(&self) -> f64 {
+        match self.revived_at {
+            Some(r) if r > self.enqueued_at => r,
+            _ => self.enqueued_at,
+        }
+    }
+}
+
+/// 항목의 실효 TTL(초) — 항목 명시값 우선, 없으면 데몬 기본. 0 = 만료 없음.
+pub fn queue_entry_ttl_secs(e: &QueueEntry, default_ttl: u64) -> u64 {
+    e.ttl_secs.unwrap_or(default_ttl)
+}
+
+/// 항목의 **TTL 나이**(초) — 기준점 `max(enqueued_at, revived_at)` 이후 경과에서 pause 누적을
+/// 뺀 값. 역행(시계 스큐)은 0 클램프(측정 불능은 만료 방향으로 열리지 않는다 — fail-closed 는
+/// 여기서 "만료시키지 않음"이다: 만료는 배달 기회를 빼앗는 쪽이므로).
+pub fn queue_entry_ttl_age_secs(e: &QueueEntry, now: f64) -> f64 {
+    let anchor = match e.revived_at {
+        Some(r) if r > e.enqueued_at => r,
+        _ => e.enqueued_at,
+    };
+    (now - anchor - e.paused_total_secs.max(0.0)).max(0.0)
+}
+
+/// 순수 만료 판정 — 이미 만료 표식이 있는 항목은 다시 만료되지 않고, TTL 0 은 영원히 살며,
+/// 그 외는 TTL 나이가 TTL 이상일 때 만료다.
+pub fn queue_entry_expired(e: &QueueEntry, now: f64, default_ttl: u64) -> bool {
+    if e.expired_at.is_some() {
+        return false;
+    }
+    let ttl = queue_entry_ttl_secs(e, default_ttl);
+    ttl > 0 && queue_entry_ttl_age_secs(e, now) >= ttl as f64
 }
 
 // ─── ★G1(W2-B): 큐 이벤트 payload 단일 빌더 3종 ───────────────────────────────
@@ -306,6 +415,83 @@ pub fn queue_reordered_payload(
     })
 }
 
+/// ★(0.14.31 · WP-5 M) queue.expired hint 문구 계약 — `QUEUE_STARVED_HINT` 와 같은 이유로
+/// **운영자(사람) 판단 전제 · LLM 자동 반응 금지**를 문면에 박는다: 이 이벤트·통지의 실소비자는
+/// LLM 에이전트이고, "만료됐으니 revive 해라"로 읽히면 만료→반사적 revive→재만료 폭주 회로가
+/// 열린다(부트 체인 ①폭주). 문면은 아래 payload 핀 테스트가 고정한다.
+pub const QUEUE_EXPIRED_HINT: &str = "큐 항목이 TTL 을 넘겨 만료됐다(활성 큐에서 제외 · 보존 중). \
+     운영자(사람) 판단 하에 cys queue revive <id> 로 재활성 또는 cys queue drop <id> 로 폐기. LLM \
+     에이전트는 이 통지에 자동 반응(revive·drop·재전송) 금지";
+
+/// queue.expired payload — 항목이 TTL 을 넘겨 활성 큐(`pending_queue`)에서 `expired_queue` 로
+/// 이동한 사실(신규 이벤트 · WP-5 M). `queue_entry_id` 가 `cys queue revive|drop` 의 조준점이다.
+/// `ttl_age_secs` 는 pause 누적을 뺀 TTL 나이(만료 판정에 실제로 쓰인 값), `wait_secs` 는 발신
+/// 이후 벽시계 경과(원장 `wait_secs` 와 같은 정의).
+pub fn queue_expired_payload(
+    surface_ref: &str,
+    role: Option<String>,
+    e: &QueueEntry,
+    now: f64,
+    default_ttl: u64,
+) -> Value {
+    json!({
+        "surface_ref": surface_ref,
+        "role": role,
+        "queue_entry_id": e.id,
+        "seq": e.seq,
+        "from": e.from,
+        "origin": e.origin,
+        "bytes": e.text.len(),
+        "preview": e.text.chars().take(80).collect::<String>(),
+        "enqueued_at": e.enqueued_at,
+        "expired_at": e.expired_at.unwrap_or(now),
+        "ttl_secs": queue_entry_ttl_secs(e, default_ttl),
+        "ttl_age_secs": queue_entry_ttl_age_secs(e, now) as u64,
+        "paused_total_secs": e.paused_total_secs as u64,
+        "wait_secs": (now - e.enqueued_at).max(0.0) as u64,
+        "hint": QUEUE_EXPIRED_HINT,
+    })
+}
+
+/// ★(0.14.31 · WP-5 M) queue.revived payload — 운영자 `queue.revive` 로 만료 항목이 활성 큐 **꼬리**로
+/// 되돌아간 사실(TTL 시계 재시작 · pause 크레딧 0). `already_active` 는 멱등 호출(이미 활성)이었음.
+pub fn queue_revived_payload(
+    surface_ref: Option<&str>,
+    e: &QueueEntry,
+    depth: usize,
+    already_active: bool,
+    by_surface: Option<u64>,
+) -> Value {
+    json!({
+        "surface_ref": surface_ref,
+        "queue_entry_id": e.id,
+        "seq": e.seq,
+        "revived_at": e.revived_at,
+        "enqueued_at": e.enqueued_at,
+        "depth": depth,
+        "already_active": already_active,
+        "by_surface": by_surface,
+    })
+}
+
+/// ★(0.14.31 · WP-5 B-2②) queue.input_pending_reset payload — 데몬이 센 미제출 입력 바이트
+/// (`pending_input_bytes`)가 화면 사실(커서행 빈 프롬프트 · 출력 정적 · 모달 없음)과 충분히
+/// 오래 모순돼 **stale 로 판정되어 0 으로 리셋**된 사실. 리셋 자체는 배달이 아니며(같은 틱에
+/// 배달하지 않는다), 이 이벤트는 그 리셋이 얼마나 자주 일어나는지 재는 관측 축이다.
+pub fn queue_input_pending_reset_payload(
+    surface_ref: &str,
+    role: Option<String>,
+    stale_bytes: u64,
+    stale_secs: u64,
+) -> Value {
+    json!({
+        "surface_ref": surface_ref,
+        "role": role,
+        "stale_bytes": stale_bytes,
+        "stale_secs": stale_secs,
+    })
+}
+
 /// (enqueued_at, seq) 기준 stable merge 삽입 위치 — 대상 큐에서 새 항목 `(at, seq)`보다
 /// **뒤(더 신규)인 첫 인덱스**를 반환한다(순수 판정자·G1 W2-C).
 /// - 동률은 기존/선삽입 항목 승(= stable — 같은 키의 복원 항목은 파일·seq 순서를 유지).
@@ -314,7 +500,8 @@ pub fn queue_reordered_payload(
 /// 반환값 == q.len()이면 순수 append(재정렬 없음), < q.len()이면 기존 항목이 뒤로 밀린다.
 pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64) -> usize {
     for (i, e) in q.iter().enumerate() {
-        let existing_is_newer = match e.enqueued_at.partial_cmp(&at) {
+        // ★(0.14.31 · WP-5) 기존 항목의 시각 축은 순서 키(`order_at` = revived_at ∨ enqueued_at).
+        let existing_is_newer = match e.order_at().partial_cmp(&at) {
             Some(std::cmp::Ordering::Greater) => true,
             Some(std::cmp::Ordering::Equal) => e.seq > seq,
             _ => false, // Less 또는 NaN — 기존 항목이 앞선다(보수적)
@@ -529,6 +716,10 @@ pub struct Surface {
     /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     pub pending_input_bytes: AtomicU64,
+    /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **변이 세대** — 모든 쓰기(`set_pending_input`)
+    /// 마다 +1. stale 리셋 판정이 "같은 바이트 수" 가 아니라 "같은 세대" 를 본다: 옛 초안을 제출하고
+    /// 같은 길이의 새 초안을 친 ABA 를 바이트 수는 구분하지 못한다(codex 설계 검토 Q4).
+    pub input_gen: AtomicU64,
     /// ★R1-blocking-2 입력줄 게이트 — **직접 write 경로와 큐 Inject 경로의 상호배제**.
     ///
     /// 왜 필요한가(codex 감사 실측): `surface.send_text` 는 writer 에 Program 을 넣은 **뒤**
@@ -547,6 +738,22 @@ pub struct Surface {
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
     pub queue_paused_until: Mutex<Option<Instant>>,
+    /// ★(0.14.31 · WP-5 M) **만료 큐** — TTL 을 넘긴 항목의 보존소. 활성 큐(`pending_queue`)와
+    /// 별개의 VecDeque 라 (a) 만료 항목이 활성 큐 머리를 막지 않고(§8) (b) enqueue 상한 100
+    /// (`pending_queue.len()`) 회계에서 제외된다. 상한 `governance::QUEUE_EXPIRED_CAP` 초과분은
+    /// 가장 오래된 것부터 원장 기록(`expired_evicted`) 후 폐기한다. 소비: `queue.list
+    /// include_expired` · `queue.revive`(→ pending 꼬리) · `queue.drop` · 종료 drain(원장 `expired`).
+    /// 락 순서: `pending_queue` → `expired_queue`(둘 다 잡을 때만 · leaf 취급).
+    pub expired_queue: Mutex<std::collections::VecDeque<QueueEntry>>,
+    /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
+    /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
+    /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
+    pub last_queue_delivery_at: Mutex<Option<Instant>>,
+    /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` **stale 관측** — (그때 본 바이트 수, 그때의
+    /// `input_gen`, 처음 모순을 본 시각). 화면은 커서행 빈 프롬프트·출력 정적·모달 없음인데 계수만
+    /// >0 인 상태가 **같은 세대**로 임계 이상 지속되면 계수를 stale 로 보고 0 으로 리셋한다(dept-1
+    /// cso 75분 `input_pending` 고착의 수리). 세대가 바뀌면 관측을 다시 시작한다(in-flight 입력 보호).
+    pub pending_input_stale: Mutex<Option<(u64, u64, Instant)>>,
     /// T4-17 에코 제외: 마지막 원격 주입 시각 (주입 직후 에코 라인은 룰 매칭 제외)
     pub last_injected: Mutex<Option<Instant>>,
     /// ★좌석 점유 캐시(SEAT-1): watchdog 틱이 커널 사실(자손 프로세스 유무)로 갱신하는 단일 SOT.
@@ -700,6 +907,15 @@ pub struct GatePending {
 }
 
 impl Surface {
+    /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **유일한 쓰기 API** — 값을 쓰고 변이 세대
+    /// (`input_gen`)를 올린다. 직접 `store` 하면 세대가 멈춰 stale 리셋이 ABA 를 놓친다(테스트 픽스처
+    /// 조립은 예외). 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
+    /// governance 배달 임계영역 · stale 리셋).
+    pub fn set_pending_input(&self, bytes: u64) {
+        self.pending_input_bytes.store(bytes, Ordering::Relaxed);
+        self.input_gen.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// ★(U-10) `gate_pending` 축의 **유일한 직렬화 지점**. `surface.list`·`org.status`·
     /// `persist_topology` 셋이 이 함수만 부른다 — 세 곳이 각자 `json!` 하면 그 순간
     /// 키·형·킬스위치가 갈린다(이 저장소가 반복해서 맞은 사본 드리프트).
@@ -1736,6 +1952,14 @@ pub struct Daemon {
     ///   ③ rehome — rehome_restored_queue의 Value→QueueEntry 되살림(필드 관통)
     ///   ④ queue.list restored 노출 — handlers.rs "queue.list"의 restored 행(신규 열 결손 방지)
     pub restored_queue: Mutex<Vec<serde_json::Value>>,
+    /// ★(0.14.31 · WP-5 M) **만료 복원분** — `queue-expired.json`(활성 WAL 과 **다른 파일**)에서
+    /// 살아난 만료 항목(Value 통짜). 왜 파일을 가르는가: 만료 항목을 `queue-state.json` 에 함께
+    /// 두면 **구 데몬(롤백)** 이 `expired_at` 을 모른 채 활성 큐로 rehome 해 배달한다(codex 설계
+    /// 검토 #11 — 신 데몬이 만료시킨 항목을 구 데몬이 되살려 배달하는 경로). 구 데몬은 이 파일을
+    /// 읽지 않으므로 만료 항목은 그에게 보이지 않는다. rehome 은 같은 role 의 살아있는 surface
+    /// `expired_queue` 로 옮긴다(활성 큐 금지 · §8). `queue.revive`/`queue.drop` 은 여기 남은
+    /// 항목도 id 로 조준할 수 있다(살아있는 surface 없이도 관리 가능).
+    pub restored_expired: Mutex<Vec<serde_json::Value>>,
     /// ★G1(W2-A): QueueEntry.seq 발급 카운터 — boot 내 단조. 시드 = WAL(load_queue_state)
     /// 복원 항목들의 max(seq)+1(WAL 부재 시 1). 발급 단일 지점 = next_queue_entry.
     /// EventBus seq와 분리 — 이벤트 발행과 enqueue는 1:1이 아니고, '살아있는 항목 대비 단조'는
@@ -1745,6 +1969,10 @@ pub struct Daemon {
     /// tokio 핸들러가 동시에 호출할 수 있는데 write_json_atomic의 tmp 이름이 고정이라 동시 쓰기가
     /// 파일을 파손할 수 있다 — G1 이후 WAL은 queue_seq 시드·entry id의 근거라 손상 대가가 크다.
     pub queue_persist_lock: Mutex<()>,
+    /// ★(0.14.31 · WP-5 M) 직전 큐 틱(`governance::queue_expiry_pass`) 시각(epoch) — pause 누적
+    /// (`QueueEntry::paused_total_secs`)의 델타 시계. `None` = 아직 틱 없음(첫 틱 델타 0). 틱 간
+    /// 실제 경과로 재므로 틱 주기가 바뀌거나 늘어져도 누적이 틀어지지 않는다.
+    pub queue_tick_at: Mutex<Option<f64>>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -2335,10 +2563,16 @@ fn queue_mid(sid: u64, text: &str) -> String {
 /// ★비타입 감사 지점 ①(§Daemon::restored_queue) — QueueEntry 스키마 변경 시 여기의
 /// 레거시 합성이 전 항목에 신 필드를 보장해야 하류(rehome·queue.list)가 결손 없이 읽는다.
 fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    load_queue_file(dir, "queue-state.json")
+}
+
+/// ★(0.14.31 · WP-5 M) 큐 WAL 파일 판독 본체 — 활성(`queue-state.json`)·만료(`queue-expired.json`)
+/// 두 파일이 같은 합성·dedup 규칙을 탄다(규칙 세목은 `load_queue_state` doc).
+fn load_queue_file(dir: &std::path::Path, name: &str) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let restored_at = now_epoch();
-    if let Ok(content) = std::fs::read_to_string(dir.join("queue-state.json")) {
+    if let Ok(content) = std::fs::read_to_string(dir.join(name)) {
         if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
             for (pos, mut it) in arr.into_iter().enumerate() {
                 let mid = it.get("mid").and_then(|v| v.as_str()).map(str::to_string);
@@ -2462,8 +2696,12 @@ impl Daemon {
         // 하므로 struct init 전에 먼저 로드한다 — 시드 = max(seq)+1(WAL 부재 시 1)로
         // 재기동 후 발급 seq가 살아있는 복원 항목과 절대 겹치지 않는다.
         let restored_qentries = load_queue_state(&dir);
+        // ★(0.14.31 · WP-5 M) 만료 복원분은 별 파일(queue-expired.json · 구 데몬 비가시). 시드는
+        //   두 집합의 max(seq)+1 — 만료 항목 id 와도 겹치지 않아야 revive 후 pop-by-id 가 안전하다.
+        let restored_expired = load_queue_file(&dir, "queue-expired.json");
         let queue_seq_seed = restored_qentries
             .iter()
+            .chain(restored_expired.iter())
             .filter_map(|it| it.get("seq").and_then(|v| v.as_u64()))
             .max()
             .map(|m| m.saturating_add(1))
@@ -2516,8 +2754,10 @@ impl Daemon {
             operator_token,
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
+            restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),
             queue_persist_lock: Mutex::new(()),
+            queue_tick_at: Mutex::new(None),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -2768,6 +3008,12 @@ impl Daemon {
             enqueued_at: now_epoch(),
             from,
             origin: origin.to_string(),
+            // ★(0.14.31 · WP-5 M) 신규 항목은 데몬 기본 TTL·pause 0·미만료·미통지로 출발.
+            ttl_secs: None,
+            paused_total_secs: 0.0,
+            expired_at: None,
+            revived_at: None,
+            expired_notified: false,
         }
     }
 
@@ -2785,7 +3031,24 @@ impl Daemon {
         let _guard = self.queue_persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = state_dir(&self.socket_path);
         let mut entries: Vec<serde_json::Value> = Vec::new();
+        // ★(0.14.31 · WP-5 M) 만료 항목은 **다른 파일**(queue-expired.json)로 — 구 데몬(롤백)이
+        //   활성 WAL 만 읽고 만료분을 활성 큐로 되살려 배달하는 경로를 파일 경계로 차단한다.
+        let mut expired_entries: Vec<serde_json::Value> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let row = |s: &Surface, role: &Option<String>, e: &QueueEntry| {
+            json!({
+                "mid": queue_mid(s.id, &e.text), "id": e.id, "seq": e.seq,
+                "surface_id": s.id, "role": role, "text": e.text,
+                "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
+                // ★(0.14.31 · WP-5 M) TTL 회계 5키 — additive. 구 데몬은 모르는 키를 버리고
+                //   다시 쓰므로(→ 신 데몬 재기동 시 serde default 로 복원) 활성 항목의 만료는
+                //   enqueued_at 기준 재계산으로 무손실이다(왕복 테스트 핀 · 항목별 TTL·revive·
+                //   pause 크레딧·통지 표식은 그 왕복에서 기본값으로 되돌아온다 — 문서화된 잔여).
+                "ttl_secs": e.ttl_secs, "paused_total_secs": e.paused_total_secs,
+                "expired_at": e.expired_at, "revived_at": e.revived_at,
+                "expired_notified": e.expired_notified,
+            })
+        };
         {
             let surfaces = self.surfaces.lock().unwrap();
             for s in surfaces.values() {
@@ -2793,14 +3056,17 @@ impl Daemon {
                 // 소멸하므로(재사용 없음), WAL 생존 메시지를 재기동 후 같은 role의 새 surface로
                 // 배달하려면 role 앵커가 필요하다.
                 let role = s.role.lock().unwrap().clone();
+                // 락 순서 pending → expired.
                 let q = s.pending_queue.lock().unwrap();
+                let x = s.expired_queue.lock().unwrap();
                 for e in q.iter() {
                     if seen.insert(e.id.clone()) {
-                        entries.push(json!({
-                            "mid": queue_mid(s.id, &e.text), "id": e.id, "seq": e.seq,
-                            "surface_id": s.id, "role": role, "text": e.text,
-                            "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
-                        }));
+                        entries.push(row(s, &role, e));
+                    }
+                }
+                for e in x.iter() {
+                    if seen.insert(e.id.clone()) {
+                        expired_entries.push(row(s, &role, e));
                     }
                 }
             }
@@ -2819,8 +3085,22 @@ impl Daemon {
                 }
             }
         }
+        for it in self.restored_expired.lock().unwrap().iter() {
+            let key = it
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| it.get("mid").and_then(|v| v.as_str()));
+            if let Some(k) = key {
+                if seen.insert(k.to_string()) {
+                    expired_entries.push(it.clone());
+                }
+            }
+        }
         if let Ok(content) = serde_json::to_string(&entries) {
             let _ = crate::governance::write_json_atomic(&dir, "queue-state.json", &content);
+        }
+        if let Ok(content) = serde_json::to_string(&expired_entries) {
+            let _ = crate::governance::write_json_atomic(&dir, "queue-expired.json", &content);
         }
     }
 
@@ -2839,9 +3119,13 @@ impl Daemon {
         // (target_sid, role, 병합 삽입 순서의 항목들, reordered) — 락 밖 발행용 수집.
         let mut rehomed_events: Vec<(u64, String, Vec<QueueEntry>, bool)> = Vec::new();
         let mut rehomed = 0usize;
+        // ★(0.14.31 · WP-5 M) 복원 시점 만료 분류의 재료 — 틱 노브 1회 읽기.
+        let now = now_epoch();
+        let default_ttl = queue_ttl_default_secs();
         {
             let mut restored = self.restored_queue.lock().unwrap();
-            if restored.is_empty() {
+            let mut restored_expired = self.restored_expired.lock().unwrap();
+            if restored.is_empty() && restored_expired.is_empty() {
                 return 0;
             }
             // role → 살아있는(미exit) surface 매핑
@@ -2860,14 +3144,24 @@ impl Daemon {
             // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
             // 복원 경유 사실은 관측 가능하게 남긴다.
             let mut batches: Vec<(String, Vec<QueueEntry>)> = Vec::new();
-            restored.retain(|it| {
+            // ★(0.14.31 · WP-5 M) 만료 배치 — expired_queue 행선(활성 큐 금지 · §8). 세 출처:
+            //   ⓐ queue-expired.json 복원분(expired_at 보유) ⓑ 활성 복원분 중 복원 시점에 이미
+            //   TTL 을 넘긴 것(구 데몬이 다시 쓴 WAL 은 회계 키가 없어 enqueued_at 기준 재계산 —
+            //   정본 M "재기동 시 보존 시각 기준 재계산") ⓒ 활성 복원분에 expired_at 이 남은 것
+            //   (방어적 — 정상 경로에서는 나오지 않는다).
+            let mut expired_batches: Vec<(String, Vec<QueueEntry>)> = Vec::new();
+            let mut keep_or_take = |it: &serde_json::Value,
+                                    batches: &mut Vec<(String, Vec<QueueEntry>)>,
+                                    expired_batches: &mut Vec<(String, Vec<QueueEntry>)>,
+                                    force_expired: bool|
+             -> bool {
                 let Some(role) = it.get("role").and_then(|v| v.as_str()) else {
                     return true; // role 미기록 — 보존(정직)
                 };
                 if !role_surface.contains_key(role) {
                     return true; // role 무매칭 — 보존(재기동 더 기다림)
                 }
-                let entry = QueueEntry {
+                let mut entry = QueueEntry {
                     id: it
                         .get("id")
                         .and_then(|v| v.as_str())
@@ -2886,20 +3180,51 @@ impl Daemon {
                         .and_then(|v| v.as_str())
                         .unwrap_or("wal-legacy")
                         .to_string(),
+                    // ★(0.14.31 · WP-5 M) TTL 회계 5키 관통 — 키 부재(구 데몬이 다시 쓴 WAL·레거시)는
+                    //   serde default 와 같은 값으로 되살린다. 없는 정보를 지어내지 않는다.
+                    ttl_secs: it.get("ttl_secs").and_then(|v| v.as_u64()),
+                    paused_total_secs: it
+                        .get("paused_total_secs")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    expired_at: it.get("expired_at").and_then(|v| v.as_f64()),
+                    revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
+                    expired_notified: it
+                        .get("expired_notified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 };
+                let expired_now = entry.expired_at.is_none()
+                    && queue_entry_expired(&entry, now, default_ttl);
+                if force_expired || entry.expired_at.is_some() || expired_now {
+                    if entry.expired_at.is_none() {
+                        entry.expired_at = Some(now); // 복원 시점 만료 — 활성 큐에 들어가지 않는다
+                    }
+                    match expired_batches.iter_mut().find(|(r, _)| r == role) {
+                        Some((_, v)) => v.push(entry),
+                        None => expired_batches.push((role.to_string(), vec![entry])),
+                    }
+                    rehomed += 1;
+                    return false;
+                }
                 match batches.iter_mut().find(|(r, _)| r == role) {
                     Some((_, v)) => v.push(entry),
                     None => batches.push((role.to_string(), vec![entry])),
                 }
                 rehomed += 1;
                 false // restored_queue에서 제거(pending_queue로 이관)
-            });
-            // 2단: 배치를 (enqueued_at, seq) 오름차순 정렬 후 대상 큐에 stable merge 삽입.
+            };
+            restored.retain(|it| keep_or_take(it, &mut batches, &mut expired_batches, false));
+            restored_expired
+                .retain(|it| keep_or_take(it, &mut batches, &mut expired_batches, true));
+            // 2단: 배치를 (order_at, seq) 오름차순 정렬 후 대상 큐에 stable merge 삽입.
             // 배치 내 정렬은 stable — 동률 키는 WAL 파일 등장순(=push 순서)을 유지한다.
+            // ★(0.14.31 · WP-5) 시각 축은 순서 키(`order_at` = revived_at ∨ enqueued_at) — 재활성
+            //   항목이 재기동 rehome 으로 그 사이 들어온 신규 작업 앞에 되돌아가지 않는다(codex Q6).
             for (role, mut batch) in batches {
                 batch.sort_by(|a, b| {
-                    a.enqueued_at
-                        .partial_cmp(&b.enqueued_at)
+                    a.order_at()
+                        .partial_cmp(&b.order_at())
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.seq.cmp(&b.seq))
                 });
@@ -2908,7 +3233,7 @@ impl Daemon {
                 {
                     let mut q = surf.pending_queue.lock().unwrap();
                     for entry in &batch {
-                        let pos = queue_merge_insert_pos(&q, entry.enqueued_at, entry.seq);
+                        let pos = queue_merge_insert_pos(&q, entry.order_at(), entry.seq);
                         if pos < q.len() {
                             reordered = true; // 기존 항목이 복원 항목 뒤로 밀림
                         }
@@ -2916,6 +3241,17 @@ impl Daemon {
                     }
                 }
                 rehomed_events.push((surf.id, role, batch, reordered));
+            }
+            // ★(0.14.31 · WP-5 M) 만료 복원분 → 대상 surface 의 expired_queue(등장순 · id 중복 배제).
+            //   상한 초과 회계(묘비·폐기)는 governance::queue_expiry_pass 가 같은 틱에서 집행한다.
+            for (role, batch) in expired_batches {
+                let surf = &role_surface[&role];
+                let mut x = surf.expired_queue.lock().unwrap();
+                for entry in batch {
+                    if !x.iter().any(|e| e.id == entry.id) {
+                        x.push_back(entry);
+                    }
+                }
             }
         }
         // 발행은 restored_queue·pending_queue 락 전부 해제 후(락 밖 I/O 관례 — bus는 leaf지만
@@ -3212,10 +3548,15 @@ impl Daemon {
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             pending_input_bytes: AtomicU64::new(0),
+            input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
             queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
+            // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.
+            expired_queue: Mutex::new(std::collections::VecDeque::new()),
+            last_queue_delivery_at: Mutex::new(None),
+            pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
@@ -3493,6 +3834,9 @@ impl Daemon {
                     queue_dropped_payload("process_exited", &dropped, None),
                 );
             }
+            // ★(0.14.31 · WP-5 M) 만료 큐 drain — "삭제 없음" 약속은 **원장 기록**으로 정의한다:
+            //   항목마다 원장에 `expired` 사유 레코드를 남긴 뒤 폐기(queue.dropped reason "expired").
+            crate::governance::discard_expired_queue(&daemon, &surf, "expired");
             // ★B3 #19: 자력 종료(셸 EOF)한 좌석이 **역할을 쥐고 있었다는 사실**을 이 시점에
             //   싣는다(additive — 기존 키 불변). 종전 페이로드에는 role 이 없어 "어느 역할
             //   좌석이 죽었나" 를 여기서 알 수 없었고, 그 사실은 **60초 뒤** reap 의
@@ -6989,6 +7333,11 @@ mod tests {
             enqueued_at,
             from: None,
             origin: "send".to_string(),
+            ttl_secs: None,
+            paused_total_secs: 0.0,
+            expired_at: None,
+            revived_at: None,
+            expired_notified: false,
         }
     }
 
@@ -7023,8 +7372,11 @@ mod tests {
         let dir = queue_wal_dir("w2c-merge");
         std::fs::write(
             dir.join("queue-state.json"),
-            r#"[{"id":"qold.2","seq":2,"surface_id":9,"role":"w2c-merge","text":"재기동 전 2","enqueued_at":200.0,"origin":"send"},
-                {"id":"qold.1","seq":1,"surface_id":9,"role":"w2c-merge","text":"재기동 전 1","enqueued_at":100.0,"origin":"send"}]"#,
+            // ★(0.14.31 · WP-5 M) 픽스처 보정: enqueued_at 100/200(1970년)은 기본 TTL 6h 로는 복원
+            //   시점에 만료돼 만료 큐로 간다(정본 M "재기동 시 보존 시각 기준 재계산"). 이 핀은
+            //   정렬 병합만 재므로 항목별 `ttl_secs:0`(만료 없음 · 명시 opt-out)으로 고정한다.
+            r#"[{"id":"qold.2","seq":2,"surface_id":9,"role":"w2c-merge","text":"재기동 전 2","enqueued_at":200.0,"origin":"send","ttl_secs":0},
+                {"id":"qold.1","seq":1,"surface_id":9,"role":"w2c-merge","text":"재기동 전 1","enqueued_at":100.0,"origin":"send","ttl_secs":0}]"#,
         )
         .unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
@@ -7082,8 +7434,10 @@ mod tests {
         let dir = queue_wal_dir("w2c-empty");
         std::fs::write(
             dir.join("queue-state.json"),
-            r#"[{"id":"qe.2","seq":2,"surface_id":9,"role":"w2c-empty","text":"둘","enqueued_at":200.0,"origin":"send"},
-                {"id":"qe.1","seq":1,"surface_id":9,"role":"w2c-empty","text":"하나","enqueued_at":100.0,"origin":"send"}]"#,
+            // ★(0.14.31 · WP-5 M) 픽스처 보정: 1970년 enqueued_at 은 기본 TTL 로 복원 시점 만료 —
+            //   정렬 핀이므로 `ttl_secs:0`(명시 opt-out)으로 만료 축을 끈다(위 merge 핀과 동일).
+            r#"[{"id":"qe.2","seq":2,"surface_id":9,"role":"w2c-empty","text":"둘","enqueued_at":200.0,"origin":"send","ttl_secs":0},
+                {"id":"qe.1","seq":1,"surface_id":9,"role":"w2c-empty","text":"하나","enqueued_at":100.0,"origin":"send","ttl_secs":0}]"#,
         )
         .unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
@@ -7161,6 +7515,11 @@ mod tests {
             enqueued_at,
             from: Some("surface:1".to_string()),
             origin: "send".to_string(),
+            ttl_secs: None,
+            paused_total_secs: 0.0,
+            expired_at: None,
+            revived_at: None,
+            expired_notified: false,
         }
     }
 
@@ -7306,5 +7665,376 @@ mod tests {
         // role 없는 맨 셸 = null (depth_high 의 role 직렬화 관례와 동형).
         let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)");
         assert_eq!(p2["role"], json!(null));
+    }
+
+    // ═══════════ ★(0.14.31 · WP-5) TTL 순수 규칙·WAL 왕복·만료 파일 분리·순서 키 검체(wp5_*) ═══════════
+
+    /// ★WP-5: TTL 경계·pause·revive·시계 역행을 잘못 합치면 만료 면제 항목까지 폐기된다.
+    #[test]
+    fn wp5_queue_entry_expired_pure_rules() {
+        assert_eq!(QUEUE_TTL_DEFAULT_SECS, 21600, "기본 TTL은 6시간");
+        let mut e = w2c_entry("wp5-pure", 1, 100.0);
+        assert_eq!(
+            queue_entry_ttl_secs(&e, QUEUE_TTL_DEFAULT_SECS),
+            21600,
+            "None은 기본 TTL 승계"
+        );
+        assert!(
+            !queue_entry_expired(&e, 21699.0, 21600),
+            "TTL 직전에는 살아 있다"
+        );
+        assert!(queue_entry_expired(&e, 21700.0, 21600), "TTL 경계부터 만료");
+        e.ttl_secs = Some(0);
+        assert_eq!(
+            queue_entry_ttl_secs(&e, 21600),
+            0,
+            "명시 0을 기본값으로 치환하지 않는다"
+        );
+        assert!(
+            !queue_entry_expired(&e, 1_000_000.0, 21600),
+            "명시 0은 만료 면제"
+        );
+        e.ttl_secs = Some(10);
+        e.paused_total_secs = 5.0;
+        assert_eq!(
+            queue_entry_ttl_age_secs(&e, 114.0),
+            9.0,
+            "pause 5초는 TTL 나이에서 제외"
+        );
+        assert!(
+            !queue_entry_expired(&e, 114.0, 21600),
+            "실제 대기 14초여도 TTL 나이는 9초"
+        );
+        assert!(
+            queue_entry_expired(&e, 115.0, 21600),
+            "pause를 뺀 10초 경계는 만료"
+        );
+        e.paused_total_secs = 0.0;
+        e.revived_at = Some(200.0);
+        assert_eq!(e.enqueued_at, 100.0, "revive는 원 발신 시각을 보존");
+        assert_eq!(
+            queue_entry_ttl_age_secs(&e, 209.0),
+            9.0,
+            "revived_at으로 TTL 기준 이동"
+        );
+        assert!(
+            !queue_entry_expired(&e, 209.0, 21600),
+            "원 발신 시각으로 재만료시키지 않는다"
+        );
+        assert!(
+            queue_entry_expired(&e, 210.0, 21600),
+            "revive 이후에도 TTL 경계는 적용"
+        );
+        e.expired_at = Some(210.0);
+        assert!(
+            !queue_entry_expired(&e, 999.0, 21600),
+            "이미 만료된 항목에 중복 만료 금지"
+        );
+        e.expired_at = None;
+        e.revived_at = None;
+        assert_eq!(
+            queue_entry_ttl_age_secs(&e, 99.0),
+            0.0,
+            "시계 역행은 0으로 클램프"
+        );
+        assert!(
+            !queue_entry_expired(&e, 99.0, 21600),
+            "미래 발신 시각을 만료로 해석하지 않는다"
+        );
+    }
+
+    /// ★WP-5: 구 데몬이 신규 5키를 지워도 보존된 발신 시각으로 7시간 항목을 만료시켜야 한다.
+    #[test]
+    fn wp5_wal_roundtrip_new_old_new_recomputes_expiry() {
+        assert_eq!(
+            queue_ttl_default_secs(),
+            21600,
+            "이 검체는 CYS_QUEUE_TTL_SECS 미설정/21600에서 실행"
+        );
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-wal-roundtrip");
+        let dir = queue_wal_dir("wp5-roundtrip");
+        let daemon_a = Daemon::new(dir.join("cysd.sock"));
+        let a = daemon_a
+            .create_surface(
+                None,
+                Some("sleep 30".into()),
+                None,
+                Some("r".into()),
+                24,
+                80,
+            )
+            .expect("A surface 생성");
+        daemon_a.surfaces.lock().unwrap().insert(a.id, a.clone());
+        let now = now_epoch();
+        let old = w2c_entry("wp5-old", 41, now - 7.0 * 3600.0);
+        let fresh = w2c_entry("wp5-fresh", 42, now);
+        a.pending_queue
+            .lock()
+            .unwrap()
+            .extend([old.clone(), fresh.clone()]);
+        daemon_a.persist_queue_state();
+        let path = dir.join("queue-state.json");
+        let mut rows: Value = serde_json::from_slice(&std::fs::read(&path).expect("신 WAL 읽기"))
+            .expect("신 WAL 배열 파싱");
+        assert_eq!(
+            rows.as_array().expect("WAL 배열").len(),
+            2,
+            "활성 2건을 먼저 기록"
+        );
+        for row in rows.as_array_mut().expect("WAL 배열") {
+            let obj = row.as_object_mut().expect("WAL 객체");
+            for key in [
+                "ttl_secs",
+                "paused_total_secs",
+                "expired_at",
+                "revived_at",
+                "expired_notified",
+            ] {
+                assert!(obj.contains_key(key), "신 WAL 필드 누락: {key}");
+                obj.remove(key);
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&rows).expect("구 WAL 직렬화"))
+            .expect("구 데몬 재기록 모사");
+        let expired_path = dir.join("queue-expired.json");
+        if expired_path.exists() {
+            std::fs::remove_file(expired_path).expect("구 데몬은 만료 WAL을 보존하지 않음");
+        }
+        let daemon_b = Daemon::new(dir.join("cysd.sock"));
+        assert!(
+            daemon_b.queue_seq.load(Ordering::SeqCst) > old.seq.max(fresh.seq),
+            "복원 시드가 두 seq보다 커야 한다"
+        );
+        let b = daemon_b
+            .create_surface(
+                None,
+                Some("sleep 30".into()),
+                None,
+                Some("r".into()),
+                24,
+                80,
+            )
+            .expect("B surface 생성");
+        daemon_b.surfaces.lock().unwrap().insert(b.id, b.clone());
+        daemon_b.rehome_restored_queue();
+        let active = b.pending_queue.lock().unwrap().clone();
+        let expired = b.expired_queue.lock().unwrap().clone();
+        for s in [&a, &b] {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            active.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec![fresh.id.as_str()],
+            "구 WAL 왕복 후 오래된 항목이 활성 큐에 유입되면 안 된다"
+        );
+        assert_eq!(expired.len(), 1, "7시간 항목만 만료 복원");
+        assert_eq!(expired[0].id, old.id, "만료된 항목의 안정 ID 보존");
+        assert!(
+            expired[0].expired_at.is_some(),
+            "신규 키가 사라졌어도 만료 시각 재계산"
+        );
+        assert_eq!(
+            expired[0].enqueued_at, old.enqueued_at,
+            "원 발신 시각을 복원 시각으로 덮지 않는다"
+        );
+        assert_eq!(
+            expired[0].ttl_secs, None,
+            "구 WAL의 TTL 키 부재는 기본값 승계"
+        );
+    }
+
+    /// ★WP-5: 만료 행을 활성 WAL에 섞으면 롤백한 구 데몬이 폐기 대기 본문을 다시 배달한다.
+    #[test]
+    fn wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-expired-wal");
+        let dir = queue_wal_dir("wp5-expired");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(
+                None,
+                Some("sleep 30".into()),
+                None,
+                Some("r".into()),
+                24,
+                80,
+            )
+            .expect("surface 생성");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let mut e = w2c_entry("wp5-expired-only", 73, now_epoch());
+        e.expired_at = Some(e.enqueued_at + 1.0);
+        e.expired_notified = true;
+        s.expired_queue.lock().unwrap().push_back(e.clone());
+        daemon.persist_queue_state();
+        let active: Value = serde_json::from_slice(
+            &std::fs::read(dir.join("queue-state.json")).expect("활성 WAL 읽기"),
+        )
+        .expect("활성 JSON");
+        let expired: Value = serde_json::from_slice(
+            &std::fs::read(dir.join("queue-expired.json")).expect("만료 WAL 읽기"),
+        )
+        .expect("만료 JSON");
+        assert_eq!(active, json!([]), "만료 항목은 활성 WAL에서 완전히 제외");
+        assert_eq!(
+            expired.as_array().expect("만료 배열").len(),
+            1,
+            "별도 WAL에 만료 1건"
+        );
+        assert_eq!(expired[0]["id"], json!(e.id), "만료 WAL에 원 ID 보존");
+        assert_eq!(
+            expired[0]["expired_at"],
+            json!(e.expired_at),
+            "만료 표식 영속화"
+        );
+        assert!(
+            load_queue_state(&dir).is_empty(),
+            "구 데몬 reader는 만료 파일을 읽지 않는다"
+        );
+        let restored = Daemon::new(dir.join("cysd.sock"));
+        assert_eq!(
+            restored.restored_expired.lock().unwrap().len(),
+            1,
+            "신 데몬은 별도 만료 WAL 복원"
+        );
+        let target = restored
+            .create_surface(
+                None,
+                Some("sleep 30".into()),
+                None,
+                Some("r".into()),
+                24,
+                80,
+            )
+            .expect("복원 surface 생성");
+        restored
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(target.id, target.clone());
+        restored.rehome_restored_queue();
+        let q = target.pending_queue.lock().unwrap().clone();
+        let x = target.expired_queue.lock().unwrap().clone();
+        for surface in [&s, &target] {
+            let mut child = surface.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(q.is_empty(), "만료 복원분의 활성 큐 재진입 금지");
+        assert_eq!(x.len(), 1, "만료 큐에 정확히 1건 이관");
+        assert_eq!(x[0].id, e.id, "원 ID 이관");
+        assert_eq!(x[0].expired_at, e.expired_at, "원 만료 시각 승계");
+        assert!(
+            x[0].expired_notified,
+            "재기동 후 중복 통지를 막는 표식 승계"
+        );
+        assert!(
+            restored.restored_expired.lock().unwrap().is_empty(),
+            "이관한 행은 복원 대기에서 제거"
+        );
+    }
+
+    /// ★WP-5: revive 시각을 무시한 rehome은 되살린 A를 신규 C 앞에 끼워 넣어 순서를 역전한다.
+    #[test]
+    fn wp5_rehome_orders_revived_entry_by_revived_at() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-rehome-order");
+        let dir = queue_wal_dir("wp5-order");
+        let now = now_epoch();
+        // epoch 200인 B가 기본 TTL로 만료되지 않도록 순서 검체는 명시적 TTL 면제.
+        let rows = json!([
+            {"id":"A", "seq":1, "role":"r", "surface_id":999, "text":"A", "enqueued_at":100.0, "revived_at":now-1.0, "ttl_secs":0},
+            {"id":"B", "seq":2, "role":"r", "surface_id":999, "text":"B", "enqueued_at":200.0, "ttl_secs":0}
+        ]);
+        std::fs::write(
+            dir.join("queue-state.json"),
+            serde_json::to_vec(&rows).expect("정렬 WAL 직렬화"),
+        )
+        .expect("정렬 WAL 기록");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(
+                None,
+                Some("sleep 30".into()),
+                None,
+                Some("r".into()),
+                24,
+                80,
+            )
+            .expect("surface 생성");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let mut c = w2c_entry("C", 3, now - 5.0);
+        c.ttl_secs = Some(0);
+        s.pending_queue.lock().unwrap().push_back(c);
+        daemon.rehome_restored_queue();
+        let q = s.pending_queue.lock().unwrap().clone();
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            q.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["B", "C", "A"],
+            "order_at: B(200) < C(now-5) < A(now-1)"
+        );
+        assert_eq!(
+            q[2].enqueued_at, 100.0,
+            "순서 보정을 위해 원 발신 시각을 덮지 않는다"
+        );
+        assert_eq!(
+            q[2].order_at(),
+            now - 1.0,
+            "A의 정렬 기준은 마지막 revive 시각"
+        );
+    }
+
+    /// ★WP-5: 만료 이벤트의 사람 판단·자동 반응 금지 힌트나 회계 키 누락은 소비자의 오판을 부른다.
+    #[test]
+    fn wp5_expired_payload_pins_hint_and_keys() {
+        let text = "가".repeat(81);
+        let mut e = w2b_entry("wp5-payload", 9, &text, 100.0);
+        e.from = Some("surface:2".into());
+        e.origin = "send".into();
+        e.ttl_secs = Some(10);
+        e.paused_total_secs = 5.0;
+        e.revived_at = Some(150.0);
+        e.expired_at = Some(165.0);
+        let p = queue_expired_payload("surface:7", Some("worker".into()), &e, 170.0, 21600);
+        let expected = json!({
+            "surface_ref":"surface:7", "role":"worker", "queue_entry_id":"wp5-payload", "seq":9,
+            "from":"surface:2", "origin":"send", "bytes":243, "preview":"가".repeat(80),
+            "enqueued_at":100.0, "expired_at":165.0, "ttl_secs":10, "ttl_age_secs":15,
+            "paused_total_secs":5, "wait_secs":70, "hint":QUEUE_EXPIRED_HINT
+        });
+        for (key, value) in expected.as_object().expect("기대 payload 객체") {
+            assert_eq!(p.get(key), Some(value), "만료 payload 키/값 계약: {key}");
+        }
+        for phrase in ["운영자(사람) 판단", "자동 반응", "금지"] {
+            assert!(
+                QUEUE_EXPIRED_HINT.contains(phrase),
+                "운영자 전용 경고 필수 문구 누락: {phrase}"
+            );
+        }
+        e.expired_at = None;
+        e.ttl_secs = None;
+        let fallback = queue_expired_payload("surface:7", None, &e, 170.0, 21600);
+        assert_eq!(
+            fallback["expired_at"],
+            json!(170.0),
+            "표식 부재 시 이벤트 시각 사용"
+        );
+        assert_eq!(
+            fallback["ttl_secs"],
+            json!(21600),
+            "명시 TTL 부재 시 기본값 노출"
+        );
+        assert_eq!(
+            fallback.get("role"),
+            Some(&Value::Null),
+            "역할 미상도 키는 보존"
+        );
     }
 }

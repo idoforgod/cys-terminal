@@ -3536,7 +3536,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         text.as_bytes(),
                     )
                 };
-                surface.pending_input_bytes.store(next, Ordering::Relaxed);
+                // ★(0.14.31 · WP-5) 세대 동반 쓰기 — stale 리셋(governance)이 세대로 ABA 를 가른다.
+                surface.set_pending_input(next);
             }
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             if !human_verified {
@@ -3729,19 +3730,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
             };
-            if let Some(err) = try_write(&surface, write_req, &id) {
-                return Reply::Single(err);
-            }
-            // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
-            //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
-            //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
-            surface.pending_input_bytes.store(
-                crate::governance::pending_input_after(
+            // ★(0.14.31 · WP-5 · codex Q4) send_text 와 같은 임계영역 규약 — writer 인계와 계수
+            //   갱신을 `input_gate` 하나로 묶는다(종전엔 락 없이 갱신해 큐 배달의 0 쓰기와 교차하면
+            //   lost update 가 났다). 락 순서 계약: 여기서는 input_gate 만 잡는다.
+            {
+                let _gate = surface.input_gate.lock().unwrap();
+                if let Some(err) = try_write(&surface, write_req, &id) {
+                    return Reply::Single(err);
+                }
+                // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
+                //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
+                //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
+                surface.set_pending_input(crate::governance::pending_input_after(
                     surface.pending_input_bytes.load(Ordering::Relaxed),
                     &key_bytes,
-                ),
-                Ordering::Relaxed,
-            );
+                ));
+            }
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "key": key, "sent": true}),
@@ -6864,6 +6868,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   opt-in 으로 두는 이유: 큐에는 수천 자 본문이 쌓일 수 있고, 목록 조회가 그것을
             //   기본으로 실어 나르면 관측이 부하가 된다.
             let full = params.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+            // ★(0.14.31 · WP-5 M) 만료 항목은 **opt-in**(`include_expired`) — 기본 응답은 활성 큐만
+            //   이라 행 계약·depth 해석·팩 파서(javis_boot_node 의 preview 잔존 판정)가 불변이다.
+            let include_expired = params
+                .get("include_expired")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // ★락 순서 계약(큐 계열): 전역 순서는 **restored_queue → surfaces → pending_queue** 다
             //   (Daemon::rehome_restored_queue 가 이 순서로 잡는다 — state.rs). 종전 이 핸들러는
             //   surfaces 가드를 **쥔 채** 아래에서 restored_queue 를 잡아 rehome 과 정면 역전(AB-BA)
@@ -6904,6 +6914,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                     out.push(row);
                 }
+                drop(q);
+                if include_expired {
+                    let x = s.expired_queue.lock().unwrap();
+                    for e in x.iter() {
+                        let mut row = json!({
+                            "surface_id": s.id, "surface_ref": surface_ref(s.id),
+                            "index": Value::Null, "expired": true, "bytes": e.text.len(),
+                            "preview": e.text.chars().take(80).collect::<String>(),
+                            "id": e.id, "seq": e.seq, "enqueued_at": e.enqueued_at,
+                            "age_secs": (now - e.enqueued_at).max(0.0) as u64,
+                            "from": e.from, "origin": e.origin,
+                            "expired_at": e.expired_at, "ttl_secs": e.ttl_secs,
+                            "paused_total_secs": e.paused_total_secs as u64,
+                            "revived_at": e.revived_at,
+                            "blocked_by": Value::Null, "blocked_since": Value::Null,
+                        });
+                        if full {
+                            row["text"] = json!(e.text);
+                        }
+                        out.push(row);
+                    }
+                }
             }
             // P7 큐 WAL: 재기동을 넘어 생존한 미배달 큐도 함께 노출(restored=true).
             // ★G1(W2-C) 비타입 감사 지점 ④(§state::restored_queue): 라이브 행과 동일한 신규 열
@@ -6941,7 +6973,159 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 out.push(row);
             }
+            // ★(0.14.31 · WP-5 M) 만료 복원분(queue-expired.json · 살아있는 surface 없음) — opt-in.
+            if include_expired {
+                let now = crate::state::now_epoch();
+                for it in daemon.restored_expired.lock().unwrap().iter() {
+                    let sid_v = it.get("surface_id").cloned().unwrap_or(Value::Null);
+                    if let Some(f) = filter_sid {
+                        if sid_v.as_u64() != Some(f) {
+                            continue;
+                        }
+                    }
+                    let text = it.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    let mut row = json!({
+                        "surface_id": sid_v, "restored": true, "expired": true,
+                        "mid": it.get("mid").cloned().unwrap_or(Value::Null),
+                        "bytes": text.len(),
+                        "preview": text.chars().take(80).collect::<String>(),
+                        "id": it.get("id").cloned().unwrap_or(Value::Null),
+                        "seq": it.get("seq").cloned().unwrap_or(Value::Null),
+                        "enqueued_at": it.get("enqueued_at").cloned().unwrap_or(Value::Null),
+                        "age_secs": it
+                            .get("enqueued_at")
+                            .and_then(|v| v.as_f64())
+                            .map(|at| json!((now - at).max(0.0) as u64))
+                            .unwrap_or(Value::Null),
+                        "from": it.get("from").cloned().unwrap_or(Value::Null),
+                        "origin": it.get("origin").cloned().unwrap_or(Value::Null),
+                        "expired_at": it.get("expired_at").cloned().unwrap_or(Value::Null),
+                        "ttl_secs": it.get("ttl_secs").cloned().unwrap_or(Value::Null),
+                    });
+                    if full {
+                        row["text"] = json!(text);
+                    }
+                    out.push(row);
+                }
+            }
             Reply::Single(ok_response(&id, json!({"entries": out})))
+        }
+
+        // ─── ★(0.14.31 · WP-5 M) 운영자 조준 조작 — queue.revive / queue.drop ───
+        // ACL(queue.clear 관례): 익명 발신(데몬 내부·pane 밖 CLI · caller_pid None 또는 pane 미해석)
+        // 통과 · 자기 surface 통과 · 타 surface 는 권위 role(master/cso) 만. 활성 항목 drop 은 살아있는
+        // 타 surface 에서 **exited 일 때만**(살아있는 타 노드 큐 인멸 금지 — queue.clear 위협모델 동형).
+        // 만료 항목 revive/drop 은 권위 role 이면 대상 생사 무관(만료 항목은 이미 활성 큐 밖이다).
+        "queue.revive" | "queue.drop" => {
+            let method = req.method.as_str();
+            let is_revive = method == "queue.revive";
+            let Some(entry_id) = param_str(&params, "entry_id") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing entry_id"));
+            };
+            let hint = resolve_surface_id(&params);
+            let Some(home) = crate::governance::locate_queue_entry(daemon, &entry_id, hint) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    "entry_id not in any queue (queue list --expired 로 확인)",
+                ));
+            };
+            let deny_code = if is_revive { "revive_denied" } else { "drop_denied" };
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                // 복원분(살아있는 surface 없음)은 '자기 큐' 가 아니다 — 권위 role 만 다룬다.
+                let own = !home.restored && home.surface_id == Some(cs);
+                if !own {
+                    let caller_role = daemon
+                        .get_surface(cs)
+                        .and_then(|s| s.role.lock().unwrap().clone());
+                    let privileged = caller_role.as_deref().is_some_and(privileged_role);
+                    if !privileged {
+                        return Reply::Single(err_response(
+                            &id,
+                            deny_code,
+                            &format!(
+                                "{method} denied: caller (surface {cs}) may only target its own \
+                                 queue; other surfaces require master/cso"
+                            ),
+                        ));
+                    }
+                    if !is_revive && home.active {
+                        let target_alive = home
+                            .surface
+                            .as_ref()
+                            .is_some_and(|s| !s.exited.load(Ordering::Relaxed));
+                        if target_alive {
+                            daemon.bus.publish(
+                                "queue.clear_denied",
+                                "queue",
+                                home.surface_id,
+                                json!({"requested_surface": home.surface_id, "entry_id": entry_id,
+                                       "caller_surface": cs, "caller_pid": caller_pid,
+                                       "via": "queue.drop"}),
+                            );
+                            return Reply::Single(err_response(
+                                &id,
+                                deny_code,
+                                "queue.drop denied: active entry on a live other surface — \
+                                 살아있는 타 노드 큐 인멸 금지(exited 좌석만)",
+                            ));
+                        }
+                    }
+                }
+            }
+            let now = crate::state::now_epoch();
+            if is_revive {
+                match crate::governance::revive_queue_entry(daemon, &entry_id, hint, now) {
+                    Ok((e, depth, already_active, sid)) => {
+                        // 멱등 호출(이미 활성)은 상태 변화가 없다 — 이벤트·WAL 갱신 없음(소음 금지).
+                        if !already_active {
+                            daemon.bus.publish(
+                                "queue.revived",
+                                "queue",
+                                sid,
+                                crate::state::queue_revived_payload(
+                                    sid.map(surface_ref).as_deref(),
+                                    &e,
+                                    depth,
+                                    already_active,
+                                    caller_sid,
+                                ),
+                            );
+                            daemon.persist_queue_state();
+                        }
+                        Reply::Single(ok_response(
+                            &id,
+                            json!({"queue_entry_id": e.id, "seq": e.seq, "surface_id": sid,
+                                   "revived": !already_active, "already_active": already_active,
+                                   "depth": depth, "revived_at": e.revived_at}),
+                        ))
+                    }
+                    Err(d) => Reply::Single(err_response(&id, d.code(), &d.message())),
+                }
+            } else {
+                match crate::governance::drop_queue_entry(daemon, &entry_id, hint, now) {
+                    Ok((e, was_active, sid)) => {
+                        daemon.bus.publish(
+                            "queue.dropped",
+                            "queue",
+                            sid,
+                            crate::state::queue_dropped_payload(
+                                "dropped",
+                                std::slice::from_ref(&e),
+                                caller_sid.map(|cs| (cs, "queue.drop")),
+                            ),
+                        );
+                        daemon.persist_queue_state();
+                        Reply::Single(ok_response(
+                            &id,
+                            json!({"queue_entry_id": e.id, "seq": e.seq, "surface_id": sid,
+                                   "dropped": true, "was_active": was_active}),
+                        ))
+                    }
+                    Err(d) => Reply::Single(err_response(&id, d.code(), &d.message())),
+                }
+            }
         }
 
         "queue.clear" => {
@@ -7910,7 +8094,9 @@ mod tests {
 
     // CYS_PACK_DIR는 프로세스 전역 env라 set/사용 윈도를 직렬화해야 cargo 병렬 러너에서
     // 다른 ACL 테스트와 충돌하지 않는다 (pack.rs PACK_ENV_LOCK과 동일 패턴).
-    static ACL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // ★(0.14.31 · WP-5) governance 큐 검체와 **같은 락**(CYS_PACK_DIR 는 프로세스 전역 env 다 —
+    //   다른 락 두 개는 서로를 직렬화하지 못해 전수 실행에서 acl.json 소실 → 37건 연쇄 실패).
+    use crate::governance::PACK_ENV_LOCK as ACL_ENV_LOCK;
 
     /// 격리된 임시 디렉터리에 acl.json을 깔고 그 안에 소켓 경로를 둔 Daemon을 만든다.
     /// 반환된 _guard가 살아있는 동안 CYS_PACK_DIR가 이 디렉터리를 가리킨다.
@@ -14366,6 +14552,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(900));
         *s.last_output.lock().unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(2);
+        // ★(0.14.31 · WP-5) surface 당 배달 최소 간격(10s)은 강제 경로도 같은 시계 — 이 핀은
+        //   조준·재정렬 관통을 재므로 직전 배달 시각을 11s 전으로 옮겨 간격을 경과시킨다(게이트
+        //   자체의 핀은 wp5_* 검체). 노브를 끄지 않는다(끄면 이 핀이 새 불변을 숨긴다).
+        *s.last_queue_delivery_at.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
         let resp2 = queue_deliver_rpc(
             &daemon,
             json!({"surface_id": s.id, "entry_id": e3.id, "allow_reorder": true}),
@@ -17137,5 +17328,516 @@ mod tests {
         // TTL 을 넘기면 재관측 — 이제 부재다.
         assert_eq!(config_json_mtime_memo(&d, now + 60.0), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ═══════════ ★(0.14.31 · WP-5) queue.list/revive/drop RPC 검체(wp5_* · codex 초안 검토 반영) ═══════════
+
+    /// ★WP-5: 만료 큐를 기본 목록에 섞으면 운영자가 배달 가능한 항목으로 오해한다.
+    #[test]
+    fn wp5_queue_list_hides_expired_unless_requested() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-list");
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let s = daemon.get_surface(sid).expect("surface 조회");
+        let active = daemon.next_queue_entry("활성".into(), None, "send");
+        let mut expired = daemon.next_queue_entry("만료".into(), None, "send");
+        expired.expired_at = Some(crate::state::now_epoch());
+        expired.ttl_secs = Some(10);
+        s.pending_queue.lock().unwrap().push_back(active.clone());
+        s.expired_queue.lock().unwrap().push_back(expired.clone());
+        for (params, expected_len) in [(json!({}), 1), (json!({"include_expired":true}), 2)] {
+            let Reply::Single(resp) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(1),
+                    method: "queue.list".into(),
+                    params,
+                },
+                None,
+            ) else {
+                panic!("queue.list는 단일 응답");
+            };
+            assert_eq!(resp["ok"], json!(true), "목록 조회 성공: {resp}");
+            let rows = resp["result"]["entries"].as_array().expect("entries 배열");
+            assert_eq!(
+                rows.len(),
+                expected_len,
+                "include_expired가 없으면 활성만 노출"
+            );
+            let live = rows
+                .iter()
+                .find(|r| r["id"] == active.id)
+                .expect("활성 행 존재");
+            assert!(
+                live.get("expired").is_none() || live["expired"] == false,
+                "활성 행에 만료 표식 금지"
+            );
+            assert_eq!(live["index"], json!(0), "활성 큐 인덱스 유지");
+            if expected_len == 2 {
+                let row = rows
+                    .iter()
+                    .find(|r| r["id"] == expired.id)
+                    .expect("요청 시 만료 행 존재");
+                assert_eq!(row["expired"], json!(true), "만료 행 표식 필수");
+                assert_eq!(
+                    row.get("index"),
+                    Some(&Value::Null),
+                    "만료 행은 index 키가 명시적 null"
+                );
+                assert_eq!(
+                    row["expired_at"],
+                    json!(expired.expired_at),
+                    "만료 시각 노출"
+                );
+                assert_eq!(row["ttl_secs"], json!(10), "만료 행 TTL 노출");
+            }
+        }
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+    }
+
+    /// ★WP-5: revive는 꼬리 이동·TTL 재시작을 한 번만 수행하며 재호출은 큐와 이벤트를 중복시키지 않는다.
+    #[test]
+    fn wp5_queue_revive_moves_to_tail_and_is_idempotent() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-revive");
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let s = daemon.get_surface(sid).expect("surface 조회");
+        let live = daemon.next_queue_entry("먼저 대기".into(), None, "send");
+        let mut e = daemon.next_queue_entry("되살릴 항목".into(), None, "send");
+        e.enqueued_at -= 3600.0;
+        e.expired_at = Some(crate::state::now_epoch());
+        e.paused_total_secs = 123.0;
+        e.expired_notified = true;
+        s.pending_queue.lock().unwrap().push_back(live.clone());
+        s.expired_queue.lock().unwrap().push_back(e.clone());
+        let mut first_at = Value::Null;
+        for attempt in 0..2 {
+            let Reply::Single(resp) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(attempt),
+                    method: "queue.revive".into(),
+                    params: json!({"entry_id":e.id}),
+                },
+                None,
+            ) else {
+                panic!("queue.revive는 단일 응답");
+            };
+            assert_eq!(resp["ok"], json!(true), "익명 운영자 revive 허용: {resp}");
+            let result = &resp["result"];
+            assert_eq!(result["queue_entry_id"], json!(e.id), "원 ID 응답");
+            assert_eq!(result["seq"], json!(e.seq), "원 seq 응답");
+            assert_eq!(result["surface_id"], json!(sid), "행선 surface 응답");
+            assert_eq!(
+                result["revived"],
+                json!(attempt == 0),
+                "실제 이동은 첫 호출만"
+            );
+            assert_eq!(
+                result["already_active"],
+                json!(attempt == 1),
+                "재호출은 이미 활성"
+            );
+            assert_eq!(result["depth"], json!(2), "재호출로 큐 깊이가 늘면 안 된다");
+            assert!(result["revived_at"].as_f64().is_some(), "revive 시각 필수");
+            if attempt == 0 {
+                first_at = result["revived_at"].clone();
+            }
+            assert_eq!(
+                result["revived_at"], first_at,
+                "멱등 호출이 TTL 시계를 다시 밀지 않는다"
+            );
+        }
+        let q = s.pending_queue.lock().unwrap().clone();
+        let empty_expired = s.expired_queue.lock().unwrap().is_empty();
+        let events: Vec<_> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.revived" && ev["payload"]["queue_entry_id"] == e.id)
+            .collect();
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+        assert!(empty_expired, "revive 후 만료 큐에서 제거");
+        assert_eq!(
+            q.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec![live.id.as_str(), e.id.as_str()],
+            "기존 항목 뒤에 정확히 1건"
+        );
+        assert_eq!(q[1].enqueued_at, e.enqueued_at, "발신 시각 보존");
+        assert_eq!(
+            json!(q[1].revived_at),
+            first_at,
+            "응답과 큐의 revive 시각 일치"
+        );
+        assert_eq!(q[1].expired_at, None, "만료 표식 해제");
+        assert_eq!(q[1].paused_total_secs, 0.0, "이전 pause 크레딧 초기화");
+        assert!(!q[1].expired_notified, "다음 만료 통지 표식 초기화");
+        // 현 구현은 멱등 호출에도 이벤트를 발행한다. 요구된 once 계약을 낮추지 않는 회귀 핀.
+        assert_eq!(events.len(), 1, "queue.revived는 실제 이동 1회만 발행");
+        assert_eq!(
+            events[0]["payload"]["already_active"],
+            json!(false),
+            "유일한 이벤트는 실제 revive"
+        );
+    }
+
+    /// ★WP-5: 활성 100건 상한에서 revive가 만료 항목을 먼저 빼면 실패 응답과 함께 본문이 유실된다.
+    #[test]
+    fn wp5_queue_revive_refuses_when_active_queue_full() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-full");
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let s = daemon.get_surface(sid).expect("surface 조회");
+        for n in 0..100 {
+            s.pending_queue
+                .lock()
+                .unwrap()
+                .push_back(daemon.next_queue_entry(format!("대기 {n}"), None, "send"));
+        }
+        let before: Vec<_> = s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let mut e = daemon.next_queue_entry("상한 너머".into(), None, "send");
+        e.expired_at = Some(crate::state::now_epoch());
+        s.expired_queue.lock().unwrap().push_back(e.clone());
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "queue.revive".into(),
+                params: json!({"entry_id":e.id}),
+            },
+            None,
+        ) else {
+            panic!("queue.revive는 단일 응답");
+        };
+        let q = s.pending_queue.lock().unwrap().clone();
+        let x = s.expired_queue.lock().unwrap().clone();
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+        assert_eq!(resp["ok"], json!(false), "상한 revive는 오류 응답");
+        assert_eq!(
+            resp["error"]["code"],
+            json!("queue_full"),
+            "상한은 queue_full 게이트"
+        );
+        assert_eq!(
+            q.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            before,
+            "실패 후 활성 순서/깊이 보존"
+        );
+        assert_eq!(x.len(), 1, "실패 후 만료 항목 보존");
+        assert_eq!(x[0].id, e.id, "상한 실패로 대상 유실 금지");
+        assert_eq!(x[0].expired_at, e.expired_at, "실패 시 만료 표식 유지");
+        assert_eq!(x[0].revived_at, None, "실패 시 revive 시각을 찍지 않는다");
+    }
+
+    /// ★WP-5: 원장 쓰기 실패 시 항목을 보존하고 성공 시 본문 해시와 다른 묘비를 남긴 뒤 제거한다.
+    #[test]
+    fn wp5_queue_drop_writes_tombstone_before_removal() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-drop-ledger");
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let s = daemon.get_surface(sid).expect("surface 조회");
+        let mut e = daemon.next_queue_entry(
+            "묘비에 preview로 복제하면 안 되는 본문".into(),
+            None,
+            "send",
+        );
+        e.expired_at = Some(crate::state::now_epoch());
+        s.expired_queue.lock().unwrap().push_back(e.clone());
+        let path = crate::delivery::ledger_path(&daemon.socket_path);
+        // 파일 자리에 디렉터리를 놓아 권한/실행 사용자와 무관하게 append 실패를 유도한다.
+        assert!(!path.exists(), "격리된 원장 경로는 비어 있어야 한다");
+        std::fs::create_dir_all(&path).expect("원장 파일 경로 차단");
+        let Reply::Single(failed) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "queue.drop".into(),
+                params: json!({"entry_id":e.id}),
+            },
+            None,
+        ) else {
+            panic!("queue.drop는 단일 응답");
+        };
+        assert_eq!(
+            failed["ok"],
+            json!(false),
+            "원장 실패는 성공으로 숨기지 않는다"
+        );
+        assert_eq!(
+            failed["error"]["code"],
+            json!("ledger_failed"),
+            "원장 실패 사유 보존"
+        );
+        assert_eq!(
+            s.expired_queue
+                .lock()
+                .unwrap()
+                .front()
+                .map(|x| x.id.clone()),
+            Some(e.id.clone()),
+            "묘비 기록 실패 전에 큐를 제거하면 안 된다"
+        );
+        assert!(
+            !daemon
+                .bus
+                .replay_after(0)
+                .iter()
+                .any(|ev| ev["name"] == "queue.dropped"),
+            "실패를 폐기 완료 이벤트로 발행하지 않는다"
+        );
+        std::fs::remove_dir(&path).expect("원장 경로 차단 해제");
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "queue.drop".into(),
+                params: json!({"entry_id":e.id}),
+            },
+            None,
+        ) else {
+            panic!("queue.drop는 단일 응답");
+        };
+        let body = std::fs::read_to_string(&path).expect("폐기 성공 후 원장 존재");
+        let records: Vec<Value> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("원장 NDJSON 행"))
+            .collect();
+        let tombstones: Vec<_> = records
+            .iter()
+            .filter(|r| r["origin"] == "queue_tombstone" && r["queue_entry_id"] == e.id)
+            .collect();
+        let empty = s.expired_queue.lock().unwrap().is_empty();
+        let events: Vec<_> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.dropped")
+            .collect();
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+        assert_eq!(
+            resp["ok"],
+            json!(true),
+            "원장 기록 가능하면 drop 성공: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["queue_entry_id"],
+            json!(e.id),
+            "폐기 ID 응답"
+        );
+        assert_eq!(resp["result"]["dropped"], json!(true), "폐기 완료 응답");
+        assert_eq!(
+            resp["result"]["was_active"],
+            json!(false),
+            "대상은 만료 큐 항목"
+        );
+        assert!(empty, "원장 성공 후 대상 제거");
+        assert_eq!(tombstones.len(), 1, "재시도 성공의 묘비는 1건");
+        let row = tombstones[0];
+        assert_eq!(row["reason"], json!("dropped"), "묘비 사유 고정");
+        assert_eq!(
+            row["text_sha256"],
+            json!(crate::delivery::digest_text(&e.text)),
+            "본문 해시는 별도 회계 키"
+        );
+        assert!(row["sha256"].as_str().is_some(), "묘비 해시는 문자열 필수");
+        assert_ne!(
+            row["sha256"],
+            json!(crate::delivery::digest_text(&e.text)),
+            "묘비를 본문 배달 해시로 오인시키지 않는다"
+        );
+        assert!(
+            row.get("preview").is_none(),
+            "묘비에 preview 키 자체가 없어야 한다"
+        );
+        assert_eq!(events.len(), 1, "성공한 폐기만 1회 발행");
+        assert_eq!(
+            events[0]["payload"]["reason"],
+            json!("dropped"),
+            "queue.dropped 사유 고정"
+        );
+        assert_eq!(
+            events[0]["payload"]["queue_entry_ids"],
+            json!([e.id]),
+            "이벤트의 폐기 ID 일치"
+        );
+    }
+
+    /// ★WP-5: CSO 권한도 살아있는 타 좌석의 활성 큐 인멸을 허용하지 않으며 일반 워커는 만료 큐도 못 지운다.
+    #[test]
+    fn wp5_queue_drop_acl_matches_clear_threat_model() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-drop-acl");
+        let daemon = isolated_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let worker = make_surface(&daemon, Some("worker"));
+        let other = make_surface(&daemon, Some("worker-other"));
+        let target = daemon.get_surface(worker).expect("대상 조회");
+        let cso_pid = 995_751;
+        let other_pid = 995_752;
+        bind_caller(&daemon, cso_pid, cso);
+        bind_caller(&daemon, other_pid, other);
+        assert!(
+            !target.exited.load(Ordering::Relaxed),
+            "위협모델 검체는 살아있는 워커"
+        );
+        let active = daemon.next_queue_entry("활성 보호".into(), None, "send");
+        let mut expired = daemon.next_queue_entry("만료 CSO 폐기".into(), None, "send");
+        expired.expired_at = Some(crate::state::now_epoch());
+        let mut protected = daemon.next_queue_entry("만료 타 워커 접근 금지".into(), None, "send");
+        protected.expired_at = expired.expired_at;
+        target
+            .pending_queue
+            .lock()
+            .unwrap()
+            .push_back(active.clone());
+        target
+            .expired_queue
+            .lock()
+            .unwrap()
+            .extend([expired.clone(), protected.clone()]);
+        for (pid, entry_id, allowed) in [
+            (cso_pid, &active.id, false),
+            (cso_pid, &expired.id, true),
+            (other_pid, &protected.id, false),
+        ] {
+            let Reply::Single(resp) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(1),
+                    method: "queue.drop".into(),
+                    params: json!({"entry_id":entry_id, "surface_id":worker}),
+                },
+                Some(pid),
+            ) else {
+                panic!("queue.drop는 단일 응답");
+            };
+            assert_eq!(
+                resp["ok"],
+                json!(allowed),
+                "pane ACL 분기: pid={pid}, entry={entry_id}, 응답={resp}"
+            );
+            if !allowed {
+                assert_eq!(
+                    resp["error"]["code"],
+                    json!("drop_denied"),
+                    "ACL 거부 코드는 drop_denied"
+                );
+            }
+        }
+        let active_ids: Vec<_> = target
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let expired_ids: Vec<_> = target
+            .expired_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let events: Vec<_> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.dropped")
+            .collect();
+        for sid in [cso, worker, other] {
+            let surface = daemon.get_surface(sid).expect("정리 대상 조회");
+            let mut child = surface.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+        assert_eq!(
+            active_ids,
+            vec![active.id],
+            "CSO도 살아있는 타 워커 활성 항목을 지울 수 없다"
+        );
+        assert_eq!(
+            expired_ids,
+            vec![protected.id],
+            "CSO 폐기만 반영하고 타 워커 거부 대상은 보존"
+        );
+        assert_eq!(events.len(), 1, "ACL 허용된 1건만 폐기 이벤트");
+        assert_eq!(
+            events[0]["payload"]["queue_entry_ids"],
+            json!([expired.id]),
+            "허용 대상만 폐기"
+        );
+        assert_eq!(
+            events[0]["payload"]["cleared_by"],
+            json!(cso),
+            "pane caller 감사 정보"
+        );
+        assert_eq!(
+            events[0]["payload"]["via"],
+            json!("queue.drop"),
+            "폐기 RPC 경로 감사 정보"
+        );
+    }
+
+    /// ★WP-5: 없는 ID는 게이트 거부로 위장하지 않고 CLI exit 1로 분류할 not_found 오류를 돌려준다.
+    #[test]
+    fn wp5_queue_revive_not_found_is_error_1_class() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-not-found");
+        let daemon = isolated_daemon();
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "queue.revive".into(),
+                params: json!({"entry_id":"wp5-never-enqueued"}),
+            },
+            None,
+        ) else {
+            panic!("queue.revive는 단일 응답");
+        };
+        let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "없는 ID를 성공/멱등으로 숨기지 않는다"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("not_found"),
+            "CLI의 일반 오류(exit 1) 분류 입력"
+        );
+        assert!(
+            !daemon
+                .bus
+                .replay_after(0)
+                .iter()
+                .any(|ev| ev["name"] == "queue.revived"),
+            "없는 항목에 revive 이벤트 금지"
+        );
     }
 }

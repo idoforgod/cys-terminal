@@ -223,6 +223,19 @@ pub enum Origin {
     /// `SeatTakeover` 와 같은 성격이다: 사용자에게 **보여 주려고** pane 에 밀어 넣는 기계
     /// 문장이므로 원장에 근거가 있어야 한다. 없으면 임무 게이트가 이 주석을 오너 임무로 읽는다.
     EnvAdvisory,
+    /// ★(0.14.31 · WP-5 L) 큐 배달 **영수증** — 선기록(`Queue`) 뒤 writer `try_send` 성공 시각을
+    /// 남기는 **별도 줄**. `sha256` 은 본문 해시가 **아니라** `queue-receipt:<id>` 의 해시다:
+    /// 판독자(javis_mission)가 sha 로 색인하므로 본문 해시를 다시 쓰면 선기록 레코드(조각·
+    /// `parts_capped` 포함)를 이 줄이 덮어 조각 상한 경고를 지운다(codex 설계 검토 Q8). origin 도
+    /// `queue` 와 다르게 두어 origin 별 계수(javis_snapshot)가 배달을 이중 계수하지 않는다.
+    QueueReceipt,
+    /// ★(0.14.31 · WP-5 M) 큐 항목 **묘비** — 만료 drain(`expired`)·만료 큐 상한 축출
+    /// (`expired_evicted`)·운영자 폐기(`dropped`)로 항목이 **배달 없이** 큐에서 사라지는 사실.
+    /// "삭제 없음" 약속은 이 기록으로 정의된다: append 가 실패하면 항목은 폐기되지 않는다.
+    /// `sha256` 은 본문 해시가 아니라 `queue-tombstone:<id>:<reason>` 의 해시다 — 본문 해시를 쓰면
+    /// 배달된 적 없는 문장이 원장 대조에서 '기계 배달' 로 읽혀 오너 임무를 가린다. 본문 조각
+    /// (preview) 도 싣지 않는다(`text_sha256`·`chars` 만 — 감사용).
+    QueueTombstone,
 }
 
 impl Origin {
@@ -238,6 +251,135 @@ impl Origin {
             Origin::GuiAuto => "gui_auto",
             Origin::Supervisor => "supervisor",
             Origin::EnvAdvisory => "env_advisory",
+            Origin::QueueReceipt => "queue_receipt",
+            Origin::QueueTombstone => "queue_tombstone",
+        }
+    }
+}
+
+/// ★(0.14.31 · WP-5 L) 큐 배달 영수증 줄 — `deliver_head_locked` 가 writer 인계(`try_send`)에
+/// **성공한 직후** 남긴다. 선기록(origin=queue · `ts_epoch`=기록 시각)과 이 줄(`delivered_at`=
+/// 인계 시각)이 **분리**돼 있어 "기록됐으나 인계되지 못한" 배달(다음 틱 재시도)과 실제 인계를
+/// 원장만으로 가른다. 인계 뒤 이 줄을 쓰기 전에 데몬이 죽으면 그 배달은 '인계 불명' 으로 남는다
+/// (정직한 결손 — 사후 재구성하지 않는다).
+///
+/// 판독자 호환: `v`=1 · `surface`·`ts_epoch`·`sha256` 필수 키 보유(javis_mission 은 sha 로 색인하나
+/// 이 sha 는 어떤 프롬프트와도 일치하지 않는다) · origin `queue_receipt`(계수 분리).
+/// 실패는 `delivery.record_failed` 로 드러낸다(배달은 이미 일어났으므로 되돌릴 수 없다).
+pub fn record_queue_receipt(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    queue_entry_id: &str,
+    queue_seq: u64,
+    body_sha256: &str,
+    recorded_at: f64,
+    delivered_at: f64,
+    from_surface: Option<u64>,
+    extra: &Value,
+) -> bool {
+    let mut rec = json!({
+        "v": LEDGER_SCHEMA,
+        "surface": surface_id.to_string(),
+        "ts_epoch": delivered_at,
+        "ts": iso_utc(delivered_at),
+        "sha256": digest_normalized(&format!("queue-receipt:{queue_entry_id}")),
+        "origin": Origin::QueueReceipt.as_str(),
+        "from": from_surface.map(|s| s.to_string()),
+        "kind": "receipt",
+        "queue_entry_id": queue_entry_id,
+        "queue_seq": queue_seq,
+        "body_sha256": body_sha256,
+        "recorded_at": recorded_at,
+        "delivered_at": delivered_at,
+    });
+    if let (Some(add), Some(dst)) = (extra.as_object(), rec.as_object_mut()) {
+        for (k, v) in add {
+            dst.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    append_side_record(daemon, surface_id, Origin::QueueReceipt, &rec)
+}
+
+/// ★(0.14.31 · WP-5 M) 큐 항목 묘비 줄 — 만료·축출·폐기로 항목이 배달 없이 큐를 떠나기 **직전**
+/// 남긴다. 반환 `false` 면 호출자는 항목을 **폐기하지 않는다**(원장 없는 삭제 금지).
+/// 본문 해시는 `text_sha256`(감사용 · 색인 키 아님)에만 싣고 본문 조각은 싣지 않는다.
+pub fn record_queue_tombstone(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    entry: &crate::state::QueueEntry,
+    reason: &str,
+    at: f64,
+) -> bool {
+    let (from_surface, from_label) = split_queue_from(entry.from.as_deref());
+    let rec = json!({
+        "v": LEDGER_SCHEMA,
+        "surface": surface_id.to_string(),
+        "ts_epoch": at,
+        "ts": iso_utc(at),
+        "sha256": digest_normalized(&format!("queue-tombstone:{}:{reason}", entry.id)),
+        "origin": Origin::QueueTombstone.as_str(),
+        "from": from_surface.map(|s| s.to_string()),
+        "from_label": from_label,
+        "kind": "tombstone",
+        "reason": reason,
+        "queue_entry_id": entry.id,
+        "queue_seq": entry.seq,
+        "queue_origin": entry.origin,
+        "enqueued_at": entry.enqueued_at,
+        "expired_at": entry.expired_at,
+        "revived_at": entry.revived_at,
+        "paused_total_secs": entry.paused_total_secs,
+        "wait_secs": (at - entry.enqueued_at).max(0.0),
+        "chars": entry.text.chars().count(),
+        "text_sha256": digest_text(&entry.text),
+        "units": 0,
+    });
+    append_side_record(daemon, surface_id, Origin::QueueTombstone, &rec)
+}
+
+/// `QueueEntry.from` 분해 — surface ref 계약(`surface:N`)이면 `from`(정수 문자열) 로, 그 밖의
+/// 임의 문자열은 `from_label` 로(§8 "원장 `from` 에 임의 문자열을 넣지 않는다").
+pub fn split_queue_from(from: Option<&str>) -> (Option<u64>, Option<String>) {
+    match from {
+        None => (None, None),
+        Some(s) => match cys::parse_surface_ref(s) {
+            Some(n) => (Some(n), None),
+            None => (None, Some(s.to_string())),
+        },
+    }
+}
+
+/// 영수증·묘비 공용 append — 회전 검사 + 1줄 append + 실패 시 `delivery.record_failed` 발행.
+fn append_side_record(
+    daemon: &crate::state::Daemon,
+    surface_id: u64,
+    origin: Origin,
+    rec: &Value,
+) -> bool {
+    let p = ledger_path(&daemon.socket_path);
+    if let Some(d) = p.parent() {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            daemon.bus.publish(
+                "delivery.record_failed",
+                "system",
+                Some(surface_id),
+                json!({"origin": origin.as_str(), "path": p.display().to_string(),
+                       "error": format!("상태 디렉터리 생성 실패: {e}")}),
+            );
+            return false;
+        }
+    }
+    rotate_if_needed(&p);
+    match append_line(&p, rec) {
+        Outcome::Recorded | Outcome::Blank => true,
+        Outcome::Failed(why) => {
+            daemon.bus.publish(
+                "delivery.record_failed",
+                "system",
+                Some(surface_id),
+                json!({"origin": origin.as_str(), "path": p.display().to_string(), "error": why}),
+            );
+            false
         }
     }
 }

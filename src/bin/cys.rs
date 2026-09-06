@@ -790,9 +790,33 @@ enum QueueAction {
         /// 블록으로 찍고(6열 행 계약 불변), --json 이면 각 entry 에 `text` 키가 실린다.
         #[arg(long)]
         full: bool,
+        /// ★(0.14.31 · WP-5 M) 만료 큐(TTL 초과 · 활성 큐 밖 · 보존 중) 항목도 함께 표시
+        /// (opt-in — 기본 목록은 활성 큐만이라 depth 해석·행 계약이 불변). 만료 행은 `--json`
+        /// 에 `expired:true`, 텍스트 행은 age 열이 `exp:<age>s` 다.
+        #[arg(long)]
+        expired: bool,
     },
     /// Drop all undelivered queued messages for a surface
     Clear { surface: String },
+    /// ★(0.14.31 · WP-5 M) 만료 항목 재활성 — 활성 큐 **꼬리**로 되돌린다(TTL 시계 재시작). 이미
+    /// 활성이면 멱등. 운영자(사람) 판단 전제 — LLM 에이전트의 자동 반응(queue.expired 통지에 대한
+    /// 반사적 revive) 금지. exit: 0=재활성 · 7=거부(ACL·상한·원장) · 1=오류(없음·통신).
+    Revive {
+        /// 큐 항목 id (`cys queue list --expired` 의 id 열)
+        id: String,
+        /// 조준 범위를 한 surface 로 좁힌다(생략 시 전수 탐색 — id 는 전역 유일)
+        #[arg(long)]
+        surface: Option<String>,
+    },
+    /// ★(0.14.31 · WP-5 M) 항목 폐기(활성·만료 어디에 있든) — 원장 묘비(`dropped`) 기록 후에만
+    /// 제거된다(원장 없는 삭제 금지). 살아있는 타 노드의 활성 항목은 폐기 불가(exited 좌석만 ·
+    /// queue clear 와 같은 위협모델). exit: 0=폐기 · 7=거부 · 1=오류.
+    Drop {
+        /// 큐 항목 id
+        id: String,
+        #[arg(long)]
+        surface: Option<String>,
+    },
     /// ★G1(W2-E) 운영자 강제 배달 — **단건 전용**(--all 드레인 없음: 반복 강제는 틱당 1건
     /// 페이싱을 뚫는 유일 경로라 v1 제외 — 성찰 BLOCKER). 강제 = quiet 대기 생략만이며
     /// 안전 게이트(kill-switch pause·ACL·빈 좌석·사람 입력·헬스 pause·출력 quiet 1s 하한)는
@@ -821,14 +845,31 @@ const EXIT_QUEUE_GATE_REFUSED: i32 = 7;
 /// 목록 밖(대상/항목 없음·경합·통신 오류)은 전부 일반 오류(1)다(fail-closed 아님: 거부는
 /// 데몬이 이미 확정했고 여기는 표기 층 분류만 한다).
 fn queue_deliver_exit_code(err: &str) -> i32 {
-    const GATE_CODES: [&str; 6] = [
+    // ★(0.14.31 · WP-5) +prompt_gate(초안·모달·승인·전체화면·작업 중 — 틱 배달과 같은 판정)
+    //   +delivery_interval(surface 당 최소 간격 · 강제 경로도 같은 시계).
+    const GATE_CODES: [&str; 8] = [
         "paused",
         "acl_denied",
         "empty_seat",
         "typing_guard",
         "queue_paused",
         "output_busy",
+        "prompt_gate",
+        "delivery_interval",
     ];
+    if GATE_CODES.iter().any(|c| err.starts_with(&format!("{c}:"))) {
+        EXIT_QUEUE_GATE_REFUSED
+    } else {
+        1
+    }
+}
+
+/// ★(0.14.31 · WP-5 M) queue.revive / queue.drop 거부 exit 판정(순수) — `queue_deliver_exit_code`
+/// 관례 동형: ACL 거부(revive_denied/drop_denied)·상한(queue_full)·원장(ledger_failed)·kill-switch
+/// (paused)는 exit 7(게이트 거부), 그 밖(not_found·통신)은 1.
+fn queue_op_exit_code(err: &str) -> i32 {
+    const GATE_CODES: [&str; 5] =
+        ["paused", "revive_denied", "drop_denied", "queue_full", "ledger_failed"];
     if GATE_CODES.iter().any(|c| err.starts_with(&format!("{c}:"))) {
         EXIT_QUEUE_GATE_REFUSED
     } else {
@@ -897,10 +938,12 @@ fn queue_list_row(e: &Value) -> String {
         .map(|c| if c == '\t' || c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
     let id = e["id"].as_str().unwrap_or("-");
+    // ★(0.14.31 · WP-5 M) 만료 행은 age 열에 `exp:` 접두 — 열 개수·위치 불변(6열 · cols[5]).
+    let expired = e["expired"].as_bool().unwrap_or(false);
     let age = e["age_secs"]
         .as_u64()
-        .map(|a| format!("{a}s"))
-        .unwrap_or_else(|| "-".to_string());
+        .map(|a| if expired { format!("exp:{a}s") } else { format!("{a}s") })
+        .unwrap_or_else(|| if expired { "exp:-".to_string() } else { "-".to_string() });
     format!(
         "{}\t[{}]\t{}B\t{}\t{}\t{}",
         e["surface_ref"].as_str().unwrap_or("?"),
@@ -1023,6 +1066,66 @@ mod queue_list_row_tests {
         assert_eq!(cols[3], "복원", "cols[3]=preview 는 결손 항목에서도 불변");
         assert_eq!(cols[4], "-");
         assert_eq!(cols[5], "-");
+    }
+
+    /// ★WP-5: 만료 표시는 age 열만 바꾸며 preview 위치나 6열 계약을 깨뜨리지 않는다.
+    #[test]
+    fn wp5_queue_list_row_marks_expired_in_age_column_only() {
+        let mut e = serde_json::json!({
+            "surface_ref":"surface:7", "index":null, "bytes":12, "preview":"보고 본문",
+            "id":"wp5-row", "age_secs":45, "expired":true
+        });
+        let expired_row = queue_list_row(&e);
+        let expired_cols: Vec<_> = expired_row.split('\t').collect();
+        assert_eq!(expired_cols.len(), 6, "만료 행도 정확히 6열");
+        assert_eq!(expired_cols[5], "exp:45s", "만료 표시는 age 열 접두");
+        assert_eq!(expired_cols[3], "보고 본문", "preview 열 위치와 내용 유지");
+        e["expired"] = serde_json::json!(false);
+        let active_row = queue_list_row(&e);
+        let active_cols: Vec<_> = active_row.split('\t').collect();
+        assert_eq!(active_cols.len(), 6, "활성 행도 정확히 6열");
+        assert_eq!(active_cols[5], "45s", "활성 행은 기존 age 표시");
+        assert_eq!(
+            &expired_cols[..5],
+            &active_cols[..5],
+            "만료 표식이 앞 5열을 바꾸면 안 된다"
+        );
+    }
+
+    /// ★WP-5: 운영 게이트는 exit 7, 조회 실패·통신 오류는 exit 1로 남겨 자동화의 재시도 분기를 지킨다.
+    #[test]
+    fn wp5_queue_op_exit_codes() {
+        for err in [
+            "paused: x",
+            "revive_denied: x",
+            "drop_denied: x",
+            "queue_full: x",
+            "ledger_failed: x",
+        ] {
+            assert_eq!(queue_op_exit_code(err), 7, "운영 게이트는 exit 7: {err}");
+        }
+        for err in [
+            "not_found: x",
+            "connect: y",
+            "x queue_full: y",
+            "queue_fullness: y",
+        ] {
+            assert_eq!(
+                queue_op_exit_code(err),
+                1,
+                "정확한 게이트 접두 외에는 exit 1: {err}"
+            );
+        }
+        assert_eq!(
+            queue_deliver_exit_code("prompt_gate: modal"),
+            7,
+            "프롬프트 모달 거부는 배달 게이트"
+        );
+        assert_eq!(
+            queue_deliver_exit_code("delivery_interval: 3s<10s"),
+            7,
+            "배달 간격 거부는 배달 게이트"
+        );
     }
 }
 
@@ -3168,8 +3271,13 @@ fn run(command: Command) -> i32 {
 
         Command::Queue { action } => {
             return match action {
-                QueueAction::List { surface, json: as_json, full } => parse_explicit_surface(&surface)
-                    .and_then(|sid| request("queue.list", json!({"surface_id": sid, "full": full})))
+                QueueAction::List { surface, json: as_json, full, expired } => parse_explicit_surface(&surface)
+                    .and_then(|sid| {
+                        request(
+                            "queue.list",
+                            json!({"surface_id": sid, "full": full, "include_expired": expired}),
+                        )
+                    })
                     .map(|r| {
                         let entries = r["entries"].as_array().cloned().unwrap_or_default();
                         // --json: RPC entries 원문 — 텍스트 열 계약과 무관한 기계 소비 경로.
@@ -3245,6 +3353,60 @@ fn run(command: Command) -> i32 {
                             queue_deliver_exit_code(&e)
                         })
                 }
+                // ★(0.14.31 · WP-5 M) 만료 항목 재활성 / 항목 폐기 — 단건 · id 조준.
+                QueueAction::Revive { id: entry_id, surface } => parse_explicit_surface(&surface)
+                    .and_then(|sid| {
+                        let mut p = json!({"entry_id": entry_id});
+                        if let Some(sid) = sid {
+                            p["surface_id"] = json!(sid);
+                        }
+                        request("queue.revive", p)
+                    })
+                    .map(|r| {
+                        if r["already_active"].as_bool().unwrap_or(false) {
+                            println!(
+                                "already active {} (seq {}, depth {})",
+                                r["queue_entry_id"].as_str().unwrap_or("?"),
+                                r["seq"],
+                                r["depth"]
+                            );
+                        } else {
+                            println!(
+                                "revived {} (seq {}, surface {}, depth {})",
+                                r["queue_entry_id"].as_str().unwrap_or("?"),
+                                r["seq"],
+                                r["surface_id"],
+                                r["depth"]
+                            );
+                        }
+                        0
+                    })
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        queue_op_exit_code(&e)
+                    }),
+                QueueAction::Drop { id: entry_id, surface } => parse_explicit_surface(&surface)
+                    .and_then(|sid| {
+                        let mut p = json!({"entry_id": entry_id});
+                        if let Some(sid) = sid {
+                            p["surface_id"] = json!(sid);
+                        }
+                        request("queue.drop", p)
+                    })
+                    .map(|r| {
+                        println!(
+                            "dropped {} (seq {}, surface {}, was_active {})",
+                            r["queue_entry_id"].as_str().unwrap_or("?"),
+                            r["seq"],
+                            r["surface_id"],
+                            r["was_active"]
+                        );
+                        0
+                    })
+                    .unwrap_or_else(|e| {
+                        eprintln!("error: {e}");
+                        queue_op_exit_code(&e)
+                    }),
             };
         }
 

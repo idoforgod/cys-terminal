@@ -682,6 +682,34 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
     (!sig.kinds.is_empty()).then_some(sig)
 }
 
+/// ★(0.14.31 · WP-5 · CONTRACTS B-1 "판정 분리 금지") 큐 배달 게이트(`cysd::governance`)가 **공유**하는
+/// 전경 모달 술어 — 화면에 모달 어휘가 있고 그것이 **역사가 아닐 때**(마커 뒤에 있거나 · 마커의 마지막
+/// 줄이 빈 대기 프롬프트가 아니거나 · 꼬리에 레이아웃 양성 증거가 없을 때) `Some`. 마커 미정의·부재는
+/// **닫지 않는다**(fail-closed = 모달 어휘가 있으면 전경으로 본다). 재주입 창([`modal_window_closed`])과
+/// 같은 판정기다 — 두 소비처가 각자 판정하면 벨트에 구멍이 난다.
+pub fn modal_foreground(screen: &str, marker: Option<&str>) -> Option<ModalSignature> {
+    let sig = modal_signature(screen)?;
+    if modal_left_behind(&sig, screen, marker) {
+        None
+    } else {
+        Some(sig)
+    }
+}
+
+/// ★(0.14.31 · WP-5) 큐 배달 게이트가 공유하는 **대기 프롬프트 레이아웃** 술어 — 마커의 마지막 출현 줄이
+/// 빈 대기 프롬프트이고 그 아래 꼬리가 입력 상자·상태줄 레이아웃인가([`waiting_prompt_with_harmless_trailer`]).
+/// alt-screen 좌석에서 "커서행 마커 + 빈 입력줄" 만으로는 전체화면 프로그램의 우연한 `❯ ` 행과 composer 를
+/// 가르지 못한다 — 이 양성 증거가 있어야 배달 자격이다(codex 설계 검토 Q2).
+pub fn waiting_prompt_layout(screen: &str, marker: &str) -> bool {
+    waiting_prompt_with_harmless_trailer(screen, marker)
+}
+
+/// ★(0.14.31 · WP-5) 큐 배달 게이트가 공유하는 **번호 선택지 행** 술어([`is_numbered_item_row`]) — 커서행이
+/// `N. …` 이면 그 행은 composer 가 아니라 선택기다(codex `› 1. Yes, continue` · claude `❯ 1. Yes`).
+pub fn numbered_item_row(line: &str) -> bool {
+    is_numbered_item_row(line)
+}
+
 /// 모달 거부의 생애 창 — [`gate_axis_window_closed`] 와 **같은 부호**(부트 상수 개방 · 재주입은
 /// 전경 판정으로만 닫힘). `true` = 이 모달 문면은 역사다(창 닫힘 · 거부하지 않는다).
 fn modal_window_closed(o: &Observed, sig: &ModalSignature) -> bool {
