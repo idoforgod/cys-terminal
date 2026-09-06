@@ -5914,6 +5914,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             let gate = param_str(&params, "gate").unwrap_or_else(|| "unknown".to_string());
             let evidence = param_str(&params, "evidence");
+            // ★(0.14.31 · 리뷰 R2) 복원 연속 지시 — 있으면 교체, 없으면 기존 값 보존(병합). 만료된 표식의 재시작에서도
+            //   보존한다(좌석이 복원 좌석이라는 사실은 시간이 지나도 변하지 않는다).
+            let followup = param_str(&params, "followup").filter(|f| !f.trim().is_empty());
             let now = crate::state::now_epoch();
             let first = {
                 let mut slot = surface.gate_pending.lock().unwrap();
@@ -5926,10 +5929,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .filter(|s| cys::gate_pending_fresh(*s, now, cys::GATE_PENDING_TTL_SECS))
                     .unwrap_or(now);
                 let first = slot.is_none();
+                let kept_followup = slot.as_ref().and_then(|g| g.followup.clone());
                 *slot = Some(crate::state::GatePending {
                     gate: gate.clone(),
                     since,
                     evidence: evidence.clone(),
+                    followup: followup.or(kept_followup),
                 });
                 first
             };
@@ -14626,6 +14631,7 @@ mod tests {
                 gate: "disclaimer".into(),
                 since: gate_since,
                 evidence: None,
+                followup: None,
             });
         }
 
@@ -14832,6 +14838,7 @@ mod tests {
             gate: "disclaimer".into(),
             since: now,
             evidence: Some("tail".into()),
+            followup: None,
         });
         assert!(s.gate_pending_wire().is_object(), "갓 찍은 표식이 보이지 않는다");
 
@@ -14957,6 +14964,54 @@ mod tests {
         assert_eq!(resp2["ok"], json!(true), "타 좌석 관측 기록이 막혔다(생산자 소멸): {resp2}");
     }
 
+    /// ★(0.14.31 · 리뷰 R2 · codex major) 복원 연속 지시(`followup`)는 **첫 표식**에 실리고 재표식(다음 관문 ·
+    /// `followup` 부재)에도 살아남으며, 만료(stale) 표식도 그것을 공급하고, 해제만이 지운다. wire 술어("object 인가")는
+    /// 그대로다(additive).
+    #[test]
+    fn gate_pending_followup_rides_the_first_mark_and_survives_remarks() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker-1"));
+        let call = |params: serde_json::Value| -> serde_json::Value {
+            let req = Request { id: json!(1), method: "surface.gate_pending".into(), params };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else { panic!("expected single reply") };
+            resp
+        };
+        let wire = || daemon.surfaces.lock().unwrap()[&sid].gate_pending_wire();
+        // ① 첫 표식(restore 경유 launch-agent 의 readiness 타임아웃)이 지시를 싣는다.
+        let r = call(json!({"surface_id": sid, "gate": "folder-trust", "evidence": "tail", "followup": "[RESTORE] 대기"}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let w = wire();
+        assert!(w.is_object() && cys::gate_pending_from_wire_with(true, &w), "술어(object) 회귀: {w}");
+        assert_eq!(w["followup"], json!("[RESTORE] 대기"));
+        // ② 재표식(다음 관문 · `followup` 부재 = settle_gate_pending 재호출) — 지시 **보존** · since 유지.
+        let since = w["since"].as_f64().unwrap();
+        call(json!({"surface_id": sid, "gate": "disclaimer", "evidence": "tail2"}));
+        let w = wire();
+        assert_eq!(w["gate"], json!("disclaimer"));
+        assert_eq!(w["followup"], json!("[RESTORE] 대기"), "재표식이 복원 지시를 지웠다 — 채택 시 [RESTORE] 유실");
+        assert_eq!(w["since"].as_f64(), Some(since));
+        // ③ 지시 교체(명시) · 공백은 부재로 접는다(기존 값 보존).
+        call(json!({"surface_id": sid, "gate": "disclaimer", "followup": "[RECOVER] x"}));
+        assert_eq!(wire()["followup"], json!("[RECOVER] x"));
+        call(json!({"surface_id": sid, "gate": "disclaimer", "followup": "   "}));
+        assert_eq!(wire()["followup"], json!("[RECOVER] x"));
+        // ④ 만료(stale) 표식도 지시를 공급한다(since 원본 보존 · gate 라벨만 stale).
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            surfaces[&sid].gate_pending.lock().unwrap().as_mut().unwrap().since =
+                crate::state::now_epoch() - cys::GATE_PENDING_TTL_SECS - 1.0;
+        }
+        let stale = wire();
+        assert_eq!(stale["gate"].as_str(), Some(cys::GATE_PENDING_STALE_GATE));
+        assert_eq!(stale["followup"], json!("[RECOVER] x"), "만료 표식이 지시를 잃었다");
+        // ⑤ 해제가 전부 지운다 · 지시 없는 새 표식은 키 자체가 없다(additive · 구 소비자 무영향).
+        call(json!({"surface_id": sid, "clear": true}));
+        assert!(wire().is_null());
+        call(json!({"surface_id": sid, "gate": "unknown-modal", "evidence": "t"}));
+        let w = wire();
+        assert!(w.is_object() && w.get("followup").is_none(), "지시 없는 표식에 followup 키가 생겼다: {w}");
+    }
+
     /// ★(U-11) **치명위험 ③(자가치유 전멸)·①(폭주) 실증** — 보류 좌석이 phoenix 부활 대상이
     /// 되는가.
     ///
@@ -14990,6 +15045,7 @@ mod tests {
                 gate: "unknown".into(),
                 since: crate::state::now_epoch(),
                 evidence: None,
+                followup: None,
             });
         }
         let req = Request { id: json!(1), method: "org.status".into(), params: json!({}) };

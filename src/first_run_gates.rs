@@ -2300,6 +2300,7 @@ mod tests {
                 gates: &gs,
                 awakened,
                 guard_off: false,
+                readiness_legacy: false,
             };
             // 부트 창 안(첫 각성 ack 이전)에서는 막는다 — 그 자리에서는 그것이 옳다.
             assert!(

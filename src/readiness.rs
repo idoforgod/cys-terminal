@@ -73,7 +73,7 @@
 //! | 스위치 | 값 | 되돌아가는 범위 |
 //! |---|---|---|
 //! | **`CYS_BOOT_GATES`** | `0` | ★이 캠페인이 추가한 판정 축 **전부**(readiness·주입 가드·신뢰 정책·보류 귀결) |
-//! | `CYS_READINESS_V1` | `1` | 이 파일의 관문 AND 항 하나만 |
+//! | `CYS_READINESS_V1` | `1` | 이 파일의 관문 AND 항 + (0.14.31 WP-1) 모달 축·밸브 창 + 주입 가드의 **코퍼스 밖 모달 폴백**(`inject_guard::Observed.readiness_legacy`) — 종전 코퍼스 가드·커서-종료 벨트는 제외 |
 //!
 //! ★(BLOCK-3 · 2026-08-24) 축 노브 **단독으로는 종전 동작이 돌아오지 않는다** — `V1=1` 로
 //! ready 가 나도 부트 사전 가드와 `inject_text` 가드가 다시 잡아 rc 78 · 미주입이 유지된다.
@@ -462,10 +462,12 @@ fn marker_of<'a>(o: &Observed<'a>) -> Option<&'a str> {
 // **통과한 뒤** 남는 에코다. 규칙 ⓒ는 라벨 앞에 `N.`(선택지 번호)이 있을 때만 걸리므로 에코 한 줄은
 // 걸리지 않는다 — 통과 직후 화면을 보류로 접으면 그것이 곧 부트 라이브락이다.
 //
-// 【매칭 공간】 라벨·커서 규칙은 **공백 정규화 공간**(줄바꿈·들여쓰기 → 1칸)에서 본다 — TUI 폭에
-// 따라 라벨이 단어 경계에서 접혀도(`Yes, I trust this\nfolder`) 걸린다. 푸터 규칙은 **평탄화
-// 공간**(공백 전부 제거)에서 화면 단위 AND 다 — `Enter to confirm ·\r\n Esc to cancel` 처럼 조각이
-// 다른 줄로 갈라져도 걸린다. CRLF 는 `normalize` 가 공백으로 흡수한다(ConPTY 안전).
+// 【매칭 공간】 라벨 대조(ⓐ 종료 라벨 · ⓒ 선택지 라벨 · ⓑ 푸터)는 전부 **평탄화 공간**(공백 전부 제거)에서
+// 한다 — 코퍼스 식별(`first_run_gates::identify`)과 **같은 공간**이다. 단어 안에서 접힌 렌더(`No, ex⏎it` ·
+// `Yes, I tru⏎st this folder`)를 정규화 공간(줄바꿈 → 1칸)으로 보면 `No, ex it` 가 되어 벨트를 지나치는데,
+// 코퍼스는 그 화면을 여전히 폴더신뢰로 식별하므로 allow 구멍이 열린다(리뷰 R2 · codex blocking). 커서·
+// 번호 경계(`❯` · `N.` 앞 경계)만 **정규화 공간**에서 본다 — 평탄화하면 앞 라벨의 꼬리가 번호에 붙어 경계가
+// 사라진다. 두 공간은 `pre[]`(norm→flat)·`flat_to_norm[]` 로 잇는다. CRLF 는 두 공간 모두 흡수한다(ConPTY 안전).
 //
 // 【생애 창】 부트(`Site::Boot`)에서는 **상수로 열려 있다**(관문 축과 같은 근거 — 미탐 = 관문에 주입).
 // 재주입(`Site::Reinject`)에서는 **전경 판정**으로만 닫힌다: 축 ② 모달 문면 전량이 마커보다 앞(역사)
@@ -587,10 +589,20 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
         flat_end: 0,
         cursor_on_exit: false,
     };
-    let starts_at = |at: usize, label: &[char]| -> bool {
-        at + label.len() <= norm.len() && norm[at..at + label.len()] == *label
+    // ★(리뷰 R2 · codex blocking) 라벨 대조는 **평탄화 공간**에서 한다 — 접힌 렌더(`No, ex⏎it` · CRLF 동일)는
+    //   정규화 공간에서 `No, ex it` 가 되어 종전 ⓐ 를 지나쳤고, 코퍼스 식별(`identify` · 평탄화)은 그 화면을
+    //   여전히 폴더신뢰로 읽어 allow 구멍이 열렸다(자동확인 Return = 종료 선택 = 좌석 사망). 두 판정기가 같은
+    //   공간을 봐야 벨트에 구멍이 없다. norm→flat 은 `pre[]`, flat→norm 은 `flat_to_norm[]` 이 잇는다.
+    let flat_to_norm: Vec<usize> = norm
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c != ' ')
+        .map(|(i, _)| i)
+        .collect();
+    let exit_flat: Vec<char> = first_run_gates::flatten(MODAL_EXIT_LABEL).chars().collect();
+    let starts_at_flat = |fl: usize, label: &[char]| -> bool {
+        fl + label.len() <= flat.len() && flat[fl..fl + label.len()] == *label
     };
-    let exit: Vec<char> = first_run_gates::normalize(MODAL_EXIT_LABEL).chars().collect();
 
     // ⓐ·ⓓ — 선택 커서 행.
     for (i, &c) in norm.iter().enumerate() {
@@ -617,16 +629,21 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
                 label_start += 1;
             }
         }
-        if starts_at(label_start, &exit) {
+        // 커서 뒤 첫 비공백 문자부터 평탄화 공간에서 `No,exit` — 단어 안 줄바꿈·CRLF·열 정렬 전부 흡수.
+        let fl = pre[label_start];
+        if starts_at_flat(fl, &exit_flat) {
             sig.cursor_on_exit = true;
-            sig.note("cursor-on-exit", pre[label_start + exit.len()]);
+            sig.note("cursor-on-exit", fl + exit_flat.len());
         }
     }
 
-    // ⓒ — 번호 붙은 선택지 행(커서 유무 무관 · 접힌 라벨 포함).
+    // ⓒ — 번호 붙은 선택지 행(커서 유무 무관 · 접힌 라벨 포함). 라벨 검색은 평탄화 공간(단어 안 줄바꿈까지
+    //   흡수 · 리뷰 R2), 앞 경계(`N.`)는 정규화 공간에서 본다(평탄화하면 앞 라벨 꼬리가 번호에 붙는다).
     for label in MODAL_CHOICE_LABELS {
-        let l: Vec<char> = first_run_gates::normalize(label).chars().collect();
-        for p in find_all_chars(&norm, &l) {
+        let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
+        for fp in find_all_chars(&flat, &lf) {
+            let p = flat_to_norm[fp];
+            let label_end_flat = fp + lf.len();
             // 라벨 바로 앞: [경계][N]{1,2}[.][ ]? — 경계 = 문두 · 공백 · `❯`.
             let mut q = p;
             if q > 0 && norm[q - 1] == ' ' {
@@ -645,7 +662,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
             }
             let boundary_ok = d == 0 || norm[d - 1] == ' ' || norm[d - 1] == '❯';
             if boundary_ok {
-                sig.note("choice-row", pre[p + l.len()]);
+                sig.note("choice-row", label_end_flat);
             }
         }
     }
@@ -1866,6 +1883,53 @@ mod tests {
         assert!(sig.kinds.contains(&"choice-row"), "{:?}", sig.kinds);
         // ⑥ 소수점은 선택 번호가 아니다.
         assert!(modal_signature("❯ 1.5 hours left\n").is_none());
+    }
+
+    /// ★(리뷰 R2 · codex blocking) 접힌 종료 라벨(`No, ex⏎it` · CRLF)도 커서-종료 벨트에 걸린다 — 코퍼스
+    /// 식별은 평탄화라 그 화면을 여전히 폴더신뢰로 읽으므로, 벨트가 정규화 공간에 남아 있으면 allow 구멍이
+    /// 열려 자동확인 Return 이 종료를 고른다(좌석 사망). 두 판정기의 매칭 공간이 같음을 못 박는다.
+    #[test]
+    fn wrapped_exit_label_keeps_the_cursor_on_exit_belt() {
+        let gs = first_run_gates::builtin();
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        assert!(on_exit.contains("❯ 2. No, exit"), "전제: 커서가 No, exit 위\n{on_exit}");
+        for (label, wrapped) in [
+            ("LF 단어 안 접힘", on_exit.replace("No, exit", "No, ex\n   it")),
+            ("CRLF 단어 안 접힘", on_exit.replace('\n', "\r\n").replace("No, exit", "No, ex\r\n   it")),
+            ("쉼표 뒤 접힘", on_exit.replace("No, exit", "No,\n      exit")),
+            ("열 정렬 패딩", on_exit.replace("No, exit", "No,   exit")),
+        ] {
+            let g = first_run_gates::identify(&gs, &wrapped)
+                .unwrap_or_else(|| panic!("{label}: 전제 붕괴 — 코퍼스가 접힌 폴더신뢰를 식별하지 못한다\n{wrapped}"));
+            assert_eq!(g.id, "folder-trust", "{label}");
+            let sig = modal_signature(&wrapped).unwrap_or_else(|| panic!("{label}: 모달 어휘를 못 봤다"));
+            assert!(
+                sig.cursor_on_exit,
+                "{label}: 접힌 종료 라벨이 벨트를 지나쳤다 — 자동확인 Return 이 종료를 고른다\n{wrapped}"
+            );
+            assert!(sig.kinds.contains(&"cursor-on-exit"), "{label}: {:?}", sig.kinds);
+            assert!(sig.kinds.contains(&"choice-row"), "{label}: 접힌 라벨이 선택지 행으로 안 읽혔다 {:?}", sig.kinds);
+        }
+        // 단어 안에서 접힌 긍정 라벨도 선택지 행이다(평탄화 검색 · 앞 경계는 정규화 공간).
+        let wrapped_yes = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
+        assert!(wrapped_yes.contains("tru\n   st"), "전제: 접힘");
+        let sig = modal_signature(&wrapped_yes).expect("접힌 긍정 라벨");
+        assert!(sig.kinds.contains(&"choice-row"), "{:?}", sig.kinds);
+        assert!(!sig.cursor_on_exit, "커서는 Yes 위");
+        // 반례: 라벨이 잘려 `No, exi` 로 끝나면 종료 확정은 아니다 — 커서 행 자체는 ⓓ 가 잡아 보류 방향.
+        let cut = on_exit.replace("No, exit", "No, exi");
+        let sig = modal_signature(&cut).expect("커서 행");
+        assert!(!sig.cursor_on_exit && sig.kinds.contains(&"cursor-on-numbered-item"), "{:?}", sig.kinds);
+        // 좌표: 종료 라벨·푸터의 끝은 평탄화 좌표다(생애 창 재료) — 푸터가 마지막 줄이라 화면 끝과 같다.
+        let sig = modal_signature(&on_exit.replace("No, exit", "No, ex\r\n   it")).expect("접힌 종료");
+        assert_eq!(sig.flat_end, first_run_gates::flatten(&on_exit).chars().count(), "flat_end 가 평탄화 좌표가 아니다");
+        // 반례: 평탄화가 본문의 우연한 토큰을 종료 라벨로 오독하지 않는다 — 앞에 `N.` 경계·커서가 없다.
+        assert!(modal_signature("$ grep -c No,exit log.txt\n0\n❯ \n").is_none());
+        // ★받아들인 잔여(codex 설계 검토): `2.No,exit-code …` 처럼 번호 경계 뒤에 라벨이 붙은 본문은 선택지 행으로
+        //   읽혀 **보류**된다 — 비대칭 원칙(오탐의 귀결은 보류)상 허용하며, 보류를 풀려고 뒤 경계를 요구하면 접힌
+        //   라벨(`No, ex⏎it`)을 다시 놓친다. 여기 박제해 두어 누가 "완화" 하면 검체가 말하게 한다.
+        let sig = modal_signature("nothing to commit\n  2.No,exit-code is not a flag\n").expect("받아들인 잔여");
+        assert!(sig.kinds == vec!["choice-row"] && !sig.cursor_on_exit, "{:?}", sig.kinds);
     }
 
     #[test]

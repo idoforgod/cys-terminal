@@ -145,15 +145,16 @@ def main():
         # E: 매 케이스는 독립 복사로 단 하나의 증거 조건만 바꾼다.
         rr = {"stages": {"reinject": {"done": True, "evidence": "reinject rc=0 kind=ack …"},
                          "g2_ack": {"done": False}},
-              "observed_sid": "new1", "observed_sid_source": "registered",
+              "observed_sid": "new1", "observed_sid_source": "registered", "reinject_sid": "new1",
               "fresh_pre_sids": ["old"], "fresh_pre_dir": td}
         session_file_exists = lambda p: p.endswith("new1.jsonl")
-        row = {"exited": False, "agent_alive": True, "gate_pending": None}
+        row = {"exited": False, "agent_alive": True, "gate_pending": None, "registered_session_id": "new1"}
         outcome, missing, ev = m.f1_fresh_verify(rr, row, session_file_exists)
         check("verify full ACK evidence", outcome == "fresh" and missing is None
               and ev["gate_cleared"] is True and ev["reinject_kind"] == "ack" and ev["g2_ack"] is False
               and ev["provenance"] == "new" and ev["observed_sid"] == "new1"
-              and ev["observed_sid_source"] == "registered")
+              and ev["observed_sid_source"] == "registered"
+              and ev["registered_now"] == "new1" and ev["reinject_sid"] == "new1")
         for kind in ("injected", "queued", "skip", "unknown"):
             candidate = copy.deepcopy(rr)
             candidate["stages"]["reinject"]["evidence"] = "reinject rc=0 kind=" + kind
@@ -213,6 +214,26 @@ def main():
                   and ev["observed_sid"] == candidate["observed_sid"]
                   and ev["observed_sid_source"] == candidate["observed_sid_source"]
                   and (provenance != "pre_existing" or "fork 의심" in missing))
+        for name, rr_changes, current_row, provenance in (
+            ("registration key absent", {}, {k: v for k, v in row.items() if k != "registered_session_id"}, "unbound_now"),
+            ("row not dict", {}, None, "unbound_now"),
+            ("registration changed", {}, dict(row, registered_session_id="other"), "changed"),
+            ("reinject None", {"reinject_sid": None}, row, "evidence_unbound"),
+            ("reinject other", {"reinject_sid": "other"}, row, "evidence_unbound"),
+            ("changed beats pre_existing", {"fresh_pre_sids": ["new1"]}, dict(row, registered_session_id="other"), "changed"),
+            ("pre_existing beats evidence_unbound", {"fresh_pre_sids": ["new1"], "reinject_sid": None}, row, "pre_existing"),
+            ("evidence_unbound beats file_missing", {"reinject_sid": None}, row, "evidence_unbound"),
+        ):
+            candidate = copy.deepcopy(rr)
+            candidate.update(rr_changes)
+            paths = []
+            outcome, missing, ev = m.f1_fresh_verify(candidate, current_row, lambda p: paths.append(p) or False)
+            check("verify R2 " + name, outcome == "unverified" and bool(missing)
+                  and ev["provenance"] == provenance and paths == []
+                  and ev["registered_now"] == (current_row.get("registered_session_id") if current_row else None)
+                  and ev["reinject_sid"] == candidate.get("reinject_sid")
+                  and (current_row is None or ev["gate_cleared"] is True)
+                  and (provenance != "changed" or ("new1" in missing and "other" in missing)))
         outcome, missing, ev = m.f1_fresh_verify(rr, row, lambda p: False)
         check("verify provenance file missing", outcome == "unverified" and bool(missing)
               and ev["provenance"] == "file_missing")
@@ -258,6 +279,7 @@ def main():
             "legacy": {"fresh_expected": True, "outcome": "fresh",
                        "fresh_evidence": {"gate_cleared": True}, "stages": {"verify": {"done": True}}},
             "proven": {"fresh_expected": True, "outcome": "fresh",
+                       "observed_sid": "new1", "reinject_sid": "new1",
                        "fresh_evidence": {"provenance": "new"}, "stages": {"verify": {"done": True}}},
             "unverified": {"fresh_expected": True, "outcome": "unverified",
                            "stages": {"verify": {"done": True}}},
@@ -271,10 +293,22 @@ def main():
         check("migration dc3a158 preserves unverified", "unverified" not in moved
               and j["roles"]["unverified"] == before["roles"]["unverified"])
 
+        for name, changes in (("absent", {}), ("None", {"reinject_sid": None}),
+                              ("different", {"reinject_sid": "other"})):
+            cached = copy.deepcopy(before["roles"]["proven"])
+            cached.pop("reinject_sid")
+            cached.update(changes)
+            journal = {"roles": {"cached": cached}}
+            check("migration ef1d3e4 reinject " + name, m.migrate_f1_journal(journal) == ["cached"]
+                  and cached["stages"]["verify"]["done"] is False)
+
         # G: 명시적 계약 상수.
         check("fresh reasons", m.F1_FRESH_REASONS == ("no_session", "no_session_file"))
         check("accepted reinject kinds", set(m.F1_ACCEPTED_REINJECT_KINDS) == {"ack", "injected"})
         check("registered grace tries", m.F1_REGISTERED_GRACE_TRIES >= 3)
+        check("reverify passes", m.F1_REVERIFY_PASSES == 2)
+        check("reobservable provenance", m.F1_REOBSERVABLE ==
+              ("unobserved", "file_missing", "unbound_now", "changed", "evidence_unbound", "pre_existing"))
         uuid = "11111111-2222-3333-4444-555555555555"
         for name, sid, accepted in (
             ("uuid", uuid, True), ("empty", "", False), ("separator", "a/b", False),
@@ -326,13 +360,17 @@ def main():
         # I: 등록 신원 관측과 grace(데몬 호출·실제 sleep 없음).
         original_status_row, original_sleep = m._surface_status_row, m.time.sleep
         try:
-            for name, rows, tries, expected_sid, fragment, expected_calls, expected_sleeps in (
-                ("row absent", [None], 2, None, "미관측", 2, 1),
-                ("old daemon", [{}], 2, None, "구 데몬", 2, 1),
-                ("registration pending", [{"registered_session_id": None}], 2, None, "미관측", 2, 1),
-                ("valid uuid", [{"registered_session_id": uuid}], 2, uuid, "registered(", 1, 0),
-                ("invalid separator", [{"registered_session_id": "a/b"}], 2, None, "미관측", 2, 1),
-                ("grace second attempt", [None, {"registered_session_id": uuid}], 3, uuid, "registered(", 2, 1),
+            for name, rows, tries, expected_sid, fragment, expected_calls, expected_sleeps, pre_sids in (
+                ("row absent", [None], 2, None, "미관측", 2, 1, None),
+                ("old daemon", [{}], 2, None, "구 데몬", 2, 1, None),
+                ("registration pending", [{"registered_session_id": None}], 2, None, "미관측", 2, 1, None),
+                ("valid uuid", [{"registered_session_id": uuid}], 2, uuid, "registered(", 1, 0, None),
+                ("invalid separator", [{"registered_session_id": "a/b"}], 2, None, "미관측", 2, 1, None),
+                ("grace second attempt", [None, {"registered_session_id": uuid}], 3, uuid, "registered(", 2, 1, None),
+                ("stale then new", [{"registered_session_id": "A"}, {"registered_session_id": "A"},
+                                    {"registered_session_id": "B"}], 3, "B", "registered(", 3, 2, ["A"]),
+                ("stale through grace", [{"registered_session_id": "A"}], 2, "A", "스폰 전 재고", 2, 1, ["A"]),
+                ("pre_sids None", [{"registered_session_id": "A"}], 3, "A", "attempt 1", 1, 0, None),
             ):
                 calls, sleeps = [], []
                 def status_row(socket, surface):
@@ -340,7 +378,7 @@ def main():
                     return rows[min(len(calls) - 1, len(rows) - 1)]
                 m._surface_status_row = status_row
                 m.time.sleep = lambda seconds: sleeps.append(seconds)
-                sid, evidence = m.stage_observe_registered_session("test-socket", "surface:3", tries=tries)
+                sid, evidence = m.stage_observe_registered_session("test-socket", "surface:3", tries=tries, pre_sids=pre_sids)
                 check("observe registered " + name, sid == expected_sid and fragment in evidence
                       and (expected_sid is None or evidence.startswith("registered("))
                       and calls == [("test-socket", "surface:3")] * expected_calls
@@ -364,6 +402,14 @@ def main():
             else:
                 for literal in literals:
                     check("source pin " + literal, literal in source)
+
+        # K: 성공 fresh만 target 순서로 분할; 기본 사유는 구 저널의 poison.
+        targets = ["f1", "pending", "poison", "verified"]
+        outcomes = {"poison": "fresh", "verified": "verified", "pending": "unverified", "f1": "fresh"}
+        roles = {"poison": {}, "f1": {"fresh_reason": "no_session_file"},
+                 "pending": {"fresh_reason": "no_session"}, "verified": {}}
+        check("result partition exact target order", m.f1_result_partition(targets, outcomes, roles) ==
+              (["f1", "poison"], {"f1": "no_session_file", "poison": "poison"}, ["poison"], ["f1"]))
     finally:
         shutil.rmtree(td)
     npass = sum(1 for c in _results if c)

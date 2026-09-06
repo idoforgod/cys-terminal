@@ -1763,6 +1763,7 @@ fn gate_guard_decide_in_boot(
         gates,
         awakened: Some(false), // 부트 창은 상수다(위 doc 참조)
         guard_off: cys::inject_guard::guard_off(),
+        readiness_legacy: cys::readiness::legacy_v1(),
     })
 }
 
@@ -1791,6 +1792,7 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
         gates: &gates,
         awakened,
         guard_off: cys::inject_guard::guard_off(),
+        readiness_legacy: cys::readiness::legacy_v1(),
     });
     match decision {
         cys::inject_guard::Decision::Send => Ok(()),
@@ -8113,6 +8115,61 @@ mod seat_latch_negation_tests {
         );
     }
 
+    /// ★(0.14.31 · 리뷰 R2 · codex major) 관문 보류 채택이 복원 연속 지시([RESTORE]/[RECOVER])를 잃지 않는다 —
+    /// 지시는 **첫 표식**에 실리고(`mark_gate_pending` 의 `followup`), 채택은 해제 전에 표식에서 읽어 전문 뒤에
+    /// **한 제출**로 잇는다. 순수 함수는 직접 실행하고, 배선(세 호출부가 지시를 넘기는가 · 채택이 읽는가)은 소스로 잰다.
+    #[test]
+    fn gate_pending_adoption_carries_the_restore_followup_from_the_first_mark() {
+        // ① 표식 행 파싱 — 구 데몬(키 부재)·null·공백은 None(전문만 = 오늘의 거동).
+        assert_eq!(gate_followup_from_row(&json!({"gate_pending": null})), None);
+        assert_eq!(gate_followup_from_row(&json!({})), None);
+        assert_eq!(gate_followup_from_row(&json!({"gate_pending": {"gate": "unknown-modal"}})), None);
+        assert_eq!(gate_followup_from_row(&json!({"gate_pending": {"gate": "unknown-modal", "followup": "  "}})), None);
+        assert_eq!(
+            gate_followup_from_row(&json!({"gate_pending": {"gate": "gate_pending_stale", "followup": "[RESTORE] x"}})).as_deref(),
+            Some("[RESTORE] x"),
+            "만료(stale) 표식도 지시를 공급한다(좌석이 복원 좌석이라는 사실은 시간이 지나도 변하지 않는다)"
+        );
+        // ② 채택 페이로드 — 전문 뒤 한 제출. 지시가 없으면 전문 그대로(byte-identical).
+        let full = "# WORKER 절대지침\n…\n[안전핵 재선언]\n\n";
+        assert_eq!(adoption_payload(full, None), full);
+        let payload = adoption_payload(full, Some(restore_directive("worker-1")));
+        assert!(payload.starts_with("# WORKER 절대지침"), "{payload}");
+        assert!(payload.ends_with(restore_directive("worker-1")), "복원 지시가 페이로드 끝에 없다:\n{payload}");
+        assert!(payload.contains("master의 지시를 기다려라"), "비-master 복원 지시(대기)가 빠졌다");
+        assert_eq!(payload.matches("[RESTORE]").count(), 1);
+        let recover = adoption_payload(full, Some(recover_directive()));
+        assert!(recover.ends_with(recover_directive()) && recover.contains("[RECOVER]"));
+        // ③ 배선 — 열 0 정의부 슬라이스(형제 핀과 같은 방식).
+        let src = include_str!("cys.rs");
+        let fn_body = |name: &str| -> &str {
+            let head = format!("\nfn {name}(");
+            let i = src.find(&head).unwrap_or_else(|| panic!("{name} 이 사라졌다"));
+            let rest = &src[i + 1..];
+            let end = rest.find("\n}\n").map(|e| e + 2).expect("함수 끝");
+            &rest[..end]
+        };
+        assert!(fn_body("mark_gate_pending").contains("params[\"followup\"] = json!(f);"), "표식에 지시를 싣지 않는다");
+        let adopt = fn_body("gate_pending_adopt");
+        for anchor in ["gate_followup_from_row", "adoption_payload(", "inject_directive_after_ready(", "followup.as_deref(),"] {
+            assert!(adopt.contains(anchor), "채택 경로 배선 결손: {anchor}");
+        }
+        assert!(
+            adopt.find("gate_followup_from_row").unwrap() < adopt.find("inject_directive_after_ready(").unwrap(),
+            "채택이 표식을 **해제한 뒤** 읽는다(주입 절반이 맨 앞에서 표식을 지운다)"
+        );
+        // 세 발신자가 지시를 넘긴다: restore in-seat · node-recover · restore 경유 launch-agent.
+        assert!(fn_body("run_restore").contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
+        assert!(fn_body("run_node_recover").contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
+        assert!(fn_body("run_node_recover").contains("inject_text(sid, recover_directive())"), "node-recover Ready 경로가 사본 문자열을 쓴다");
+        assert!(fn_body("run_launch_agent_opts").contains("if restore { Some(restore_directive(role)) } else { None },"),
+                "restore 경유 launch-agent 가 지시를 넘기지 않는다");
+        // 주입 절반의 두 보류 지점이 지시를 재표식에 다시 싣는다(다음 관문이 지시를 지우지 않게).
+        let inject = fn_body("inject_directive_after_ready");
+        assert_eq!(inject.matches("gate_close_override, followup)").count() + inject.matches("gate_close_override,\n            followup,").count(), 2,
+                   "주입 절반의 보류 지점 2곳이 followup 을 재표식에 싣지 않는다");
+    }
+
     /// ★★M2 배선 핀 — 보류 분기가 **탈출 경로를 실제로 부른다.**
     /// 판정만 고치고 `run_boot` 이 종전처럼 `continue` 만 하면 이 단위는 통째로 무력화된다.
     #[test]
@@ -9859,6 +9916,41 @@ fn resolve_resume_suffix(
     Some(arg.replace("{session_id}", id))
 }
 
+/// ★(0.14.31 · F-1 · 리뷰 R2 · codex major) 해소된 resume 접미를 기동 명령에 붙이고 **효력**을 돌려준다.
+///
+/// 효력(`true`)은 "접미가 `Some` 이었다" 가 아니라 "**비공백 접미가 실제로 붙었다**" 다. `resume_arg: ""`(또는
+/// 공백)인 어댑터는 세션 id·파일이 있어도 `Some("")` 로 해소되는데, 그것을 효력으로 읽으면 좌석은 새 대화로
+/// 뜨면서 `[RESUME] 직전 컨텍스트가 복원됐다` 를 듣는다 — 지침 없이 앉는 바보 좌석(치명위험 ③ · 감사 에러 2).
+/// 명령 문자열 자체는 종전과 **byte-identical** 하게 유지한다(`' ' + 접미` · 꼬리 공백은 셸에 무해 · 전 어댑터
+/// 무회귀) — 바뀌는 것은 디렉티브 선택의 근거뿐이다.
+fn apply_resume_suffix(cmd: &mut String, resolved: Option<&str>) -> bool {
+    let Some(suffix) = resolved else {
+        return false;
+    };
+    cmd.push(' ');
+    cmd.push_str(suffix);
+    !suffix.trim().is_empty()
+}
+
+/// ★(0.14.31 · F-1) 기동 디렉티브 선택의 **단일 함수** — 근거는 의도(`resume` 요청)가 아니라 사실
+/// (`effective_resume` = 접미가 실제로 붙었는가)이다.
+///
+/// resume 복원 노드엔 전문 디렉티브를 재주입하지 않는다 — 직전 컨텍스트(.jsonl resume)에 이미
+/// WORKER/REVIEWER_DIRECTIVE가 들어 있어, 전문 재주입은 토큰 2배·중복 지침 혼선 + 거대 주입으로
+/// resume 직후 컨텍스트 임계(clear)를 유발한다(적대검증 serious). resume 시엔 짧은 복귀 가드만.
+/// 접미가 붙지 않은 좌석(세션 없음·파일 없음·빈 인자)은 완전히 새 대화라 **전문**(`compose_directive`)이다 —
+/// `[RESTORE]`/`[RECOVER]` 연속 지시는 호출부가 뒤에 붙인다(보류 좌석은 데몬 표식의 `followup` 으로 이월).
+fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, String> {
+    if effective_resume {
+        Ok(format!(
+            "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침은 이미 보유 중이니 \
+             재숙지만 하고, _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
+        ))
+    } else {
+        compose_directive(role)
+    }
+}
+
 /// (W1-4) restore 시 agents.json env 템플릿(`${CYS_ACCOUNT_DIR:-...}`) 대신 topology에 기록된 원
 /// config_dir을 launch 문자열에 리터럴 인라인 오버라이드한다 — 데몬 env가 바뀌어도 원 계정 dir로 정확히
 /// 재개. 신규 기동(restore=false)·config_dir 부재는 무변경(mac 무회귀·byte-identical 유지). spec env에
@@ -10112,13 +10204,19 @@ fn surface_agent_alive_in(surfaces: &[Value], sid: u64) -> Option<bool> {
 ///
 /// 실패해도 부트를 막지 않는다(구 데몬은 `method_not_found`) — 표식이 없으면 좌석은 종전
 /// 등급으로 읽힐 뿐이고, 그것이 이 축의 fail-open 방향("오늘보다 나빠지지 않는다")이다.
-fn mark_gate_pending(sid: u64, gate: &str, tail: &str) {
+fn mark_gate_pending(sid: u64, gate: &str, tail: &str, followup: Option<&str>) {
     // 근거 발췌는 topology 에도 실린다 — 화면 전문을 넣으면 스냅샷이 부풀고 사람이 못 읽는다.
     let evidence: String = tail.chars().take(400).collect();
-    if let Err(e) = request(
-        "surface.gate_pending",
-        json!({"surface_id": sid, "gate": gate, "evidence": evidence}),
-    ) {
+    let mut params = json!({"surface_id": sid, "gate": gate, "evidence": evidence});
+    // ★(0.14.31 · 리뷰 R2 · codex major) 복원 연속 지시([RESTORE]/[RECOVER])는 **첫 표식과 함께** 싣는다 — 보류
+    //   좌석은 이 프로세스가 끝난 뒤 `cys boot` 의 재관측(`gate_pending_adopt`)이 채택하므로, 지시가 표식 밖에
+    //   있으면 채택 시점에 잃는다(F-1 계약: 전문 디렉티브 + [RESTORE] · 비-master 는 master 지시 대기). 뒤늦은
+    //   별도 RPC 로 붙이지 않는다 — 그 사이 다른 부트가 채택·해제하면 채택된 좌석에 표식이 되살아난다(codex 설계
+    //   검토). 구 데몬은 키를 무시한다(오늘과 같은 거동). 데몬은 `followup` 부재 재표식에서 기존 값을 보존한다.
+    if let Some(f) = followup {
+        params["followup"] = json!(f);
+    }
+    if let Err(e) = request("surface.gate_pending", params) {
         eprintln!(
             "[launch-agent] 관문 보류 상태 기록 실패(구 데몬?): {e} — 좌석은 그대로 보존된다"
         );
@@ -10132,7 +10230,7 @@ fn mark_gate_pending(sid: u64, gate: &str, tail: &str) {
 ///   를 스스로 부르면 **롤백 킬스위치 판독이 3지점**이 되고, 한 곳만 빠져도 "되돌렸다"가
 ///   거짓말이 된다(U-11 이 세운 계약 · H-SEAT-4AXIS ⑦ 이 기계 집행). 그래서 강등은 여전히
 ///   판정 반환 지점 **한 곳**이고, env 판독은 부트 1회다(호출부가 값을 넘긴다).
-fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool) -> BootVerdict {
+fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool, followup: Option<&str>) -> BootVerdict {
     let verdict = boot_verdict_effective(
         BootVerdict::GatePending {
             gate: gate.to_string(),
@@ -10144,7 +10242,7 @@ fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool)
         // 좌석 등급을 기록한다(U-10 이 만든 자리의 유일한 생산자). 이것이 없으면 보류 좌석이
         // `agent_alive` 하나로 `AlivePresumed` → **"이미 가동 중"** 으로 접혀, 관문에 갇힌
         // 팀 전체가 '정상 가동 중' 으로 집계된다 — 지금보다 나빠진다.
-        mark_gate_pending(sid, gate, tail);
+        mark_gate_pending(sid, gate, tail, followup);
     }
     verdict
 }
@@ -10236,6 +10334,9 @@ fn boot_agent_on_surface(
     // config_dir=None이면 게이트가 cys::resolve_claude_config_dir()로 best-effort 해소한다.
     cwd: Option<&str>,
     config_dir: Option<&str>,
+    // ★(0.14.31 · 리뷰 R2) 복원 연속 지시([RESTORE]/[RECOVER]) — Ready 면 호출부가 종전대로 뒤에 주입하고,
+    //   보류(GatePending)면 첫 표식과 함께 데몬에 실려 `cys boot` 의 채택이 전문 디렉티브 뒤에 잇는다.
+    followup: Option<&str>,
 ) -> Result<BootVerdict, String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
     // ★(0.14.31 · WP-1 F-1) `requested_resume`(호출부의 의도) 와 `effective_resume`(접미가 **실제로**
@@ -10250,13 +10351,9 @@ fn boot_agent_on_surface(
             // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --resume <id>).
             // `resume_arg_fallback` 은 읽되 claude 에는 적용되지 않는다(`resolve_resume_suffix` doc).
             let fallback = spec["resume_arg_fallback"].as_str().unwrap_or("--continue");
-            if let Some(resolved) =
-                resolve_resume_suffix(agent, arg, session_id, config_dir, cwd, fallback)
-            {
-                cmd.push(' ');
-                cmd.push_str(&resolved);
-                effective_resume = true;
-            }
+            let resolved = resolve_resume_suffix(agent, arg, session_id, config_dir, cwd, fallback);
+            // ★(리뷰 R2 · codex major) 효력은 `Some` 이 아니라 **비공백 접미**다(`apply_resume_suffix` doc).
+            effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref());
         }
     }
     if requested_resume && !effective_resume {
@@ -10270,14 +10367,8 @@ fn boot_agent_on_surface(
     // WORKER/REVIEWER_DIRECTIVE가 들어 있어, 전문 재주입은 토큰 2배·중복 지침 혼선 + 거대 주입으로
     // resume 직후 컨텍스트 임계(clear)를 유발한다(적대검증 serious). resume 시엔 짧은 복귀 가드만.
     // ★(F-1) 판단 근거는 `effective_resume` 다 — 접미가 실제로 붙은 좌석만 직전 컨텍스트를 가진다.
-    let directive = if effective_resume {
-        format!(
-            "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침은 이미 보유 중이니 \
-             재숙지만 하고, _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
-        )
-    } else {
-        compose_directive(role)?
-    };
+    //   선택 자체는 순수 함수 `boot_directive_for` 가 한다(프로덕션 경로를 검체가 직접 실행 — 리뷰 R2).
+    let directive = boot_directive_for(role, effective_resume)?;
 
     // 1) 에이전트 기동 (authoritative: launch-agent의 모든 시스템 주입은 타이핑 가드 면제)
     // RC-3(B′): OS-aware 렌더 — unix는 `KEY="val" cmd` 인라인(기존 byte-identical·셸 전개),
@@ -10455,6 +10546,7 @@ fn boot_agent_on_surface(
                     gates: &gate_corpus.gates,
                     awakened: Some(false), // 부트 창은 상수다(구 데몬에서 꺼지면 안 된다)
                     guard_off: cys::inject_guard::guard_off(),
+                    readiness_legacy: readiness_v1, // 루프 밖 1회 판독값(판정 재료 일관성)
                 },
                 Some(cys::inject_guard::GATE_FOLDER_TRUST),
             )
@@ -10612,7 +10704,7 @@ fn boot_agent_on_surface(
             // 좌석 등급을 기록한다(U-10 이 만든 자리의 유일한 생산자). 이것이 없으면 보류 좌석이
             // `agent_alive` 하나로 `AlivePresumed` → **"이미 가동 중"** 으로 접혀, 관문에 갇힌
             // 팀 전체가 '정상 가동 중' 으로 집계된다 — 지금보다 나빠진다.
-            mark_gate_pending(sid, gate, &tail);
+            mark_gate_pending(sid, gate, &tail, followup);
         }
         return Ok(verdict);
     }
@@ -10627,6 +10719,7 @@ fn boot_agent_on_surface(
         &gate_corpus.gates,
         gate_close_override,
         since_line,
+        followup,
     )
 }
 
@@ -10650,6 +10743,8 @@ fn inject_directive_after_ready(
     gates: &[cys::first_run_gates::Gate],
     gate_close_override: bool,
     since_line: u64,
+    // ★(리뷰 R2) 이 주입이 보류로 접히면 재표식에 다시 싣는 복원 연속 지시(다음 관문의 재표식이 지시를 지우지 않게).
+    followup: Option<&str>,
 ) -> Result<BootVerdict, String> {
     // ★(U-11) 준비 확정 = 보류 표식의 **해제** 지점. 보류 좌석은 `cys boot` 이 관측만 하고
     //   건너뛰므로(U-10), 사람이 관문을 통과시킨 뒤 이 좌석에 다시 붙는 경로(node-recover·
@@ -10698,7 +10793,7 @@ fn inject_directive_after_ready(
             hit.title,
             directive.len()
         );
-        return Ok(settle_gate_pending(sid, &hit.id, tail, gate_close_override));
+        return Ok(settle_gate_pending(sid, &hit.id, tail, gate_close_override, followup));
     }
     // ★가드에 걸린 실패는 `Err` 로 올라오지만 **파괴 근거가 아니다**(머리표가 그 계약이다).
     //   `?` 로 흘리면 호출부 3곳이 그것을 close·kill·좌석증식으로 번역한다 — 정확히 U-11 이
@@ -10718,6 +10813,7 @@ fn inject_directive_after_ready(
             GATE_ID_UNIDENTIFIED,
             tail,
             gate_close_override,
+            followup,
         ));
     }
 
@@ -10895,13 +10991,18 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
 ///   채택한 좌석은 다음 부트에서 `awakened_at` 래치로 `AwakeConfirmed` = `already_alive` 가 되어
 ///   이 분기에 다시 들어오지 않는다(중복 주입 없음).
 fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, String> {
-    let directive = compose_directive(role)?;
+    let rows = fetch_surfaces();
+    let row = rows.iter().find(|s| s["surface_id"].as_u64() == Some(sid));
+    // ★(0.14.31 · 리뷰 R2 · codex major) 표식에 실린 복원 연속 지시를 **해제 전에** 읽는다(아래 주입 절반이 맨 앞에서
+    //   표식을 지운다). 전문 디렉티브 뒤에 **한 제출**로 잇는다 — 전문은 들어갔는데 [RESTORE] 만 잃는 창(두 번째
+    //   제출 실패·프로세스 중단)을 없앤다. 표식이 없거나(구 데몬·직접 기동) followup 이 없으면 종전대로 전문만.
+    let followup = row.and_then(gate_followup_from_row);
+    let directive = adoption_payload(&compose_directive(role)?, followup.as_deref());
+    if followup.is_some() {
+        eprintln!("[boot] role={role} 채택 페이로드에 표식의 복원 연속 지시를 동봉한다(전문 뒤 · 한 제출)");
+    }
     let corpus = resolve_gate_corpus(agent);
-    let since_line = fetch_surfaces()
-        .iter()
-        .find(|s| s["surface_id"].as_u64() == Some(sid))
-        .and_then(|s| s["line_count"].as_u64())
-        .unwrap_or(0);
+    let since_line = row.and_then(|s| s["line_count"].as_u64()).unwrap_or(0);
     inject_directive_after_ready(
         sid,
         agent,
@@ -10913,7 +11014,27 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
         //   클래스. 판정을 완화한 것이 아니라 **판독을 합친 것**이다(기준은 그대로).
         gate_close_override_once(),
         since_line,
+        // 채택 중 다음 관문이 뜨면 재표식에 같은 지시를 다시 싣는다(지시는 관문을 넘어 살아남는다).
+        followup.as_deref(),
     )
+}
+
+/// ★(0.14.31 · 리뷰 R2) 좌석 행(`surface.list` · `gate_pending` object)에서 복원 연속 지시를 꺼낸다 — 구 데몬·
+/// 키 부재·null·공백은 `None`(전문만 주입 = 오늘의 거동). 술어("object 인가")에는 쓰지 않는다(진단·채택 재료).
+fn gate_followup_from_row(row: &Value) -> Option<String> {
+    row["gate_pending"]["followup"]
+        .as_str()
+        .filter(|f| !f.trim().is_empty())
+        .map(String::from)
+}
+
+/// ★(0.14.31 · 리뷰 R2) 채택 페이로드 — 전문 디렉티브 뒤에 복원 연속 지시를 **한 제출**로 잇는다. 직접 Ready
+/// 경로(restore in-seat · node-recover · restore fresh)는 종전대로 두 제출(N7 · 유실은 stderr 로 정직 보고)이다.
+fn adoption_payload(directive: &str, followup: Option<&str>) -> String {
+    match followup {
+        Some(f) if !f.trim().is_empty() => format!("{}\n\n{}", directive.trim_end(), f.trim()),
+        _ => directive.to_string(),
+    }
 }
 
 /// 에이전트 기동 + 역할 지침 자동 주입 (어댑터: agents.json).
@@ -12544,6 +12665,8 @@ fn run_launch_agent_opts(
             restore,
             cwd.as_deref(),
             recorded_cfg.as_deref(),
+            // ★(리뷰 R2) restore 경유 기동은 보류 표식에 [RESTORE] 를 싣는다(Ready 면 run_restore 가 종전대로 주입).
+            if restore { Some(restore_directive(role)) } else { None },
         )?;
         // ★(W4 · B5) stdout 계약: **보류에서도** 생성한 surface ref 를 낸다. GUI(start_master)와
         //   `javis_bootstrap` 이 이 값으로 ③claim-role 을 그 pane 에 귀속시키므로, 보류를 침묵으로
@@ -13340,6 +13463,7 @@ fn gate_guard_check_on(
         gates: &gates,
         awakened,
         guard_off: cys::inject_guard::guard_off(),
+        readiness_legacy: cys::readiness::legacy_v1(),
     }) {
         cys::inject_guard::Decision::Send => Ok(()),
         cys::inject_guard::Decision::SendObserved(hit) => {
@@ -14399,10 +14523,11 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             false,
             rec_cwd.as_deref(),
             rec_cfg.as_deref(),
+            Some(recover_directive()),
         )?;
         match &verdict {
             BootVerdict::Ready => {
-                inject_text(sid, "[RECOVER] 너는 방금 재기동되었다. _round/SESSION_STATE.md와 자기 TODO 파일을 읽어 작업 기억을 복원한 뒤 master에게 복귀를 1줄 push로 보고하라. 작업 재개는 master 지시를 따른다.")?;
+                inject_text(sid, recover_directive())?;
                 println!("recovered surface:{sid} ({agent})");
             }
             // ★(U-11) 이 호출부의 귀결은 launch 와 **다르다** — 여기엔 닫을 새 surface 가 없다.
@@ -14447,6 +14572,12 @@ fn restore_directive(role: &str) -> &'static str {
     } else {
         "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라."
     }
+}
+
+/// node-recover 의 복원 연속 지시 — Ready 면 즉시 주입하고, 보류면 표식 `followup` 으로 이월된다(리뷰 R2 ·
+/// `restore_directive` 와 같은 이유로 함수 하나에 둔다: 인라인 사본은 한쪽만 고쳐지는 드리프트).
+fn recover_directive() -> &'static str {
+    "[RECOVER] 너는 방금 재기동되었다. _round/SESSION_STATE.md와 자기 TODO 파일을 읽어 작업 기억을 복원한 뒤 master에게 복귀를 1줄 push로 보고하라. 작업 재개는 master 지시를 따른다."
 }
 
 /// T2-6 조직 복원: 토폴로지 스냅샷 기준으로 죽은 역할 일괄 재기동 (작업 재개는 master 판단)
@@ -14565,6 +14696,7 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                     false,
                     seat_cwd.as_deref(),
                     cfg.as_deref(),
+                    Some(restore_directive(role)),
                 ) {
                     Ok(BootVerdict::Ready) => {
                         ok += 1;
@@ -22540,6 +22672,7 @@ mod tests {
                             gates: &gs,
                             awakened: Some(false),
                             guard_off,
+                            readiness_legacy: false, // 이 검체는 U-14/U-15 두 축만 잰다(모달 축 무관 화면)
                         },
                         Some(cys::inject_guard::GATE_FOLDER_TRUST),
                     )
@@ -22583,6 +22716,72 @@ mod tests {
         assert!(legacy_touched, "구 정책이 면책 창에 닿지 않는다 — 결함 재현 실패(계측 무효)");
     }
 
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) 신뢰 자동확인 조립(`trust_prompt_hit` → `decide_allowing` → `trust_send`)이
+    /// **접힌 종료 라벨 위 커서**에 Return 을 쏘지 않는다 — 첫 Return 전(0발)이 벨트를 직접 재고, 통과 뒤 전환(1발)과
+    /// 대조군(마스터 롤백 = 벨트 관측 강등 → 1발)이 계측 타당성을 준다.
+    #[test]
+    fn trust_flow_composition_never_returns_on_a_wrapped_exit_cursor() {
+        use cys::first_run_gates::fixtures;
+        let gs = cys::first_run_gates::builtin();
+        let embed = embedded_agents_json().expect("임베드 agents.json");
+        let re = trust_prompt_regex(&embed["claude"]);
+        let on_exit = fixtures::FOLDER_TRUST
+            .lines()
+            .map(|l| {
+                let bare = l.trim_start_matches(['❯', ' ']);
+                if bare.starts_with("2.") { format!("❯ {bare}") } else if l.starts_with('❯') { format!("  {bare}") } else { l.to_string() }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let wrapped_exit = on_exit.replace("No, exit", "No, ex\n   it");
+        assert!(wrapped_exit.contains("❯ 2. No, ex\n"), "전제: 접힌 종료 라벨 위 커서\n{wrapped_exit}");
+        assert_eq!(cys::first_run_gates::identify(&gs, &wrapped_exit).map(|g| g.id.as_str()), Some("folder-trust"), "전제: 코퍼스 식별");
+        let run = |screens: &[&str], guard_off: bool| -> u32 {
+            let (mut delta, mut sends, mut seen_at) = (String::new(), 0u32, None::<u64>);
+            for (tick, screen) in screens.iter().enumerate() {
+                delta.push_str(screen);
+                let delta_flat: String = delta.chars().filter(|c| !c.is_whitespace()).collect();
+                let cursor = tick as u64 + 1;
+                if trust_prompt_hit(re.as_ref(), &gs, &delta, &delta_flat, false) {
+                    let other_gate = cys::inject_guard::decide_allowing(
+                        &cys::inject_guard::Observed {
+                            screen,
+                            gates: &gs,
+                            awakened: Some(false),
+                            guard_off,
+                            readiness_legacy: false,
+                        },
+                        Some(cys::inject_guard::GATE_FOLDER_TRUST),
+                    )
+                    .blocks();
+                    if cys::inject_guard::trust_send(&cys::inject_guard::TrustObserved {
+                        hit: true,
+                        first: sends == 0,
+                        persisted: seen_at.map(|c| cursor > c).unwrap_or(false),
+                        sends,
+                        max_sends: BUDGET_TRUST_MAX_SENDS,
+                        other_gate,
+                        legacy_v1: false,
+                    }) {
+                        sends += 1;
+                        seen_at = Some(cursor);
+                    }
+                }
+            }
+            sends
+        };
+        // ① 커서가 긍정 선택지 위(2.1.241 형) — 자동확인 1발(기능 보존).
+        assert_eq!(run(&[fixtures::FOLDER_TRUST], false), 1);
+        // ② 첫 Return 전에 커서가 접힌 `No, exit` 위 — **0발**(1발 래치가 아니라 벨트가 막는다).
+        assert_eq!(run(&[&wrapped_exit], false), 0, "접힌 종료 라벨 위 커서에 자동확인 Return 이 나갔다(좌석 사망)");
+        // ③ 통과 뒤 전환(긍정 → 접힌 종료) — 두 번째 Return 없음.
+        assert_eq!(run(&[fixtures::FOLDER_TRUST, &wrapped_exit], false), 1);
+        // ④ 대조군(계측 타당성): 마스터 롤백(guard_off)은 벨트를 관측 강등해 ② 에서 1발이 나간다 — 즉 ② 의 0발은
+        //    벨트의 작용이다(원래 안 나가는 일을 안 난다고 확인하는 공허한 검사가 아니다).
+        assert_eq!(run(&[&wrapped_exit], true), 1);
+    }
+
     /// 정상 경로 회귀 0 — 관문이 없으면 종전대로 주입·제출된다(가드가 새 차단을 만들지 않는다).
     #[test]
     fn inject_guard_does_not_block_normal_screens() {
@@ -22595,6 +22794,7 @@ mod tests {
                     gates: &gs,
                     awakened,
                     guard_off: false,
+                    readiness_legacy: false,
                 });
                 assert!(!d.blocks(), "정상 화면에서 주입이 막혔다: {screen:?}");
             }
@@ -23722,18 +23922,21 @@ mod tests {
             .map(|e| bi + e)
             .unwrap_or(src.len());
         let body = &src[bi..bend];
+        // ★(리뷰 R2) 접미 부착·디렉티브 선택은 순수 함수(`apply_resume_suffix`·`boot_directive_for`)가 하고
+        //   검체가 그 함수를 **직접 실행**한다(`resume_suffix_effect_and_directive_choice_run_the_production_functions`).
+        //   여기서는 부트 본체가 그 둘을 실제로 부르는지(사본으로 갈라지지 않았는지)만 본다.
         for anchor in [
             "let requested_resume = resume;",
             "let mut effective_resume = false;",
-            "effective_resume = true;",
-            "let directive = if effective_resume {",
+            "effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref());",
+            "let directive = boot_directive_for(role, effective_resume)?;",
             "if requested_resume && !effective_resume {",
         ] {
             assert!(body.contains(anchor), "F-1 배선 결손: {anchor}");
         }
         assert!(
-            !body.contains("let directive = if resume {"),
-            "디렉티브 선택이 다시 의도(`resume`)를 근거로 삼는다 — 세션 없는 좌석에 [RESUME] 이 들어간다(F-1 회귀)"
+            !body.contains("let directive = if resume {") && !body.contains("effective_resume = true;"),
+            "디렉티브 선택이 다시 의도(`resume`)·`Some` 여부를 근거로 삼는다 — 세션 없는 좌석에 [RESUME] 이 들어간다(F-1 회귀)"
         );
         // resolve_resume_suffix: claude 세션 부재 검사가 placeholder 조기 반환보다 **앞**에 있다.
         let ri = src.find("fn resolve_resume_suffix(").expect("resume 해소 함수");
@@ -23754,6 +23957,72 @@ mod tests {
             "claude 세션 파일 검사가 placeholder 조기 반환 뒤에 있다 — placeholder 없는 어댑터가 파일 검사를 우회한다");
         assert!(rbody[claude_file..placeholder].contains(".jsonl") && rbody[claude_file..placeholder].contains(".exists()"),
             "claude 블록이 세션 파일 실재를 보지 않는다");
+    }
+
+    /// ★(0.14.31 · F-1 · 리뷰 R2 · codex major) 접미 효력·디렉티브 선택을 **프로덕션 함수로 직접** 실행한다 —
+    /// `resume_arg: ""`(공백·CRLF)인 어댑터는 세션 파일이 있어도 `Some("")` 로 해소되는데, 그것을 효력으로 읽으면
+    /// 새 대화에 `[RESUME]` 이 들어간다(바보 좌석). 명령 문자열은 종전과 byte-identical 이어야 한다(전 어댑터 무회귀).
+    #[test]
+    fn resume_suffix_effect_and_directive_choice_run_the_production_functions() {
+        // ① 효력 = 비공백 접미. 명령 문자열은 `' ' + 접미` 그대로(꼬리 공백 포함 · 셸에 무해).
+        let mut cmd = String::from("claude --dangerously-skip-permissions");
+        assert!(!apply_resume_suffix(&mut cmd, None));
+        assert_eq!(cmd, "claude --dangerously-skip-permissions", "None 은 명령을 건드리지 않는다");
+        for empty in ["", "  ", "\t", "\r\n"] {
+            let mut c = String::from("claude");
+            assert!(!apply_resume_suffix(&mut c, Some(empty)), "빈 접미({empty:?})가 효력으로 읽혔다 — 새 대화에 [RESUME]");
+            assert_eq!(c, format!("claude {empty}"), "명령 문자열이 종전(byte-identical)과 다르다");
+        }
+        for real in ["--resume s1", "--continue", "resume --last", " resume s9 "] {
+            let mut c = String::from("codex");
+            assert!(apply_resume_suffix(&mut c, Some(real)), "실제 접미({real:?})가 비효력으로 읽혔다");
+            assert_eq!(c, format!("codex {real}"));
+        }
+        // ② 선택: 효력 true → [RESUME] 짧은 가드 · false → 전문(팩 디렉티브 본문 포함 · [RESUME] 아님).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-r2-directive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("directives")).unwrap();
+        std::fs::write(td.join("directives/CSO_DIRECTIVE.md"), "# CSO 절대지침 R2-MARK\n").unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+        let full = boot_directive_for("cso", false);
+        let short = boot_directive_for("cso", true);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+        let full = full.expect("전문 디렉티브");
+        assert!(full.contains("R2-MARK") && !full.starts_with("[RESUME]"), "접미 없는 좌석에 전문이 아니다:\n{full}");
+        let short = short.expect("[RESUME] 가드");
+        assert!(short.starts_with("[RESUME]") && short.contains("역할=cso") && !short.contains("R2-MARK"), "{short}");
+        // ③ 조립(리뷰어 시나리오): claude + `resume_arg: ""` + 세션 id + 세션 파일 실재 → 접미는 Some("") · 효력 없음
+        //    → 전문. 명령은 `claude ` (종전과 같다).
+        let base = std::env::temp_dir().join(format!("cys-r2-empty-arg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cwd = "/home/x/proj";
+        let comp = cys::claude_project_component(cwd);
+        let sid = "ses-r2-1";
+        let cfg = base.join("claude");
+        let proj = cfg.join("projects").join(&comp);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(format!("{sid}.jsonl")), "{}").unwrap();
+        let cfg_str = cfg.to_string_lossy().into_owned();
+        for arg in ["", "  ", "\r\n"] {
+            let resolved = resolve_resume_suffix("claude", arg, Some(sid), Some(&cfg_str), Some(cwd), "--continue");
+            assert_eq!(resolved.as_deref(), Some(arg), "전제: 빈 인자는 그대로 Some 으로 해소된다(종전 그대로)");
+            let mut c = String::from("claude");
+            let effective = apply_resume_suffix(&mut c, resolved.as_deref());
+            assert!(!effective, "빈 인자({arg:?}) 어댑터가 효력 resume 으로 읽혔다 — [RESUME] 이 새 대화에 들어간다");
+            assert_eq!(c, format!("claude {arg}"));
+        }
+        // 대조군: 같은 파일·placeholder 인자 → 효력 true(정상 resume 경로 무회귀).
+        let resolved = resolve_resume_suffix("claude", "--resume {session_id}", Some(sid), Some(&cfg_str), Some(cwd), "--continue");
+        let mut c = String::from("claude");
+        assert!(apply_resume_suffix(&mut c, resolved.as_deref()));
+        assert_eq!(c, format!("claude --resume {sid}"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// (W1-6b) restore 인라인 오버라이드: 기록된 원 config_dir이 launch 문자열에 리터럴로 실려야 한다.
@@ -25320,6 +25589,86 @@ mod tests {
         assert!(err.contains("처방 ①"), "처방 문안이 없다: {err}");
         let _ = keep.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.31 · 리뷰 R2 · codex minor-13) **프로덕션 주입 경로**를 가짜 데몬(스크립트 응답)으로 실제로 돈다 —
+    /// `inject_text_on` 이 붙여넣기(guard ①) 뒤 제출 Return 직전(guard ②)에 화면을 **다시** 보고, 그 사이 뜬 잘린 모달
+    /// (코퍼스 밖)에 Return 을 보내지 않는다. 미러 검체와 달리 프로덕션에서 guard ② 를 지우면 여기서 적색이다.
+    #[cfg(unix)]
+    #[test]
+    fn inject_text_on_production_path_holds_the_return_when_a_modal_appears_between_paste_and_return() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let run = |screens: Vec<&'static str>| -> (Result<(), String>, Vec<String>) {
+            let dir = std::env::temp_dir().join(format!(
+                "cys-r2-inject-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("fake.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let screens: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(screens));
+            let (calls2, screens2) = (calls.clone(), screens.clone());
+            let server = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => break });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                        continue;
+                    }
+                    let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    calls2.lock().unwrap().push(method.clone());
+                    let result = match method.as_str() {
+                        "surface.list" => json!({"surfaces": [{
+                            "surface_id": 7, "surface_ref": "surface:7", "awakened_at": null,
+                            "agent": "claude", "agent_alive": true, "exited": false, "gate_pending": null}]}),
+                        "surface.read_text" => {
+                            let mut s = screens2.lock().unwrap();
+                            let text = if s.len() > 1 { s.remove(0) } else { s[0] };
+                            json!({"text": text, "quiet_secs": 5.0, "line_count": 40})
+                        }
+                        _ => json!({"ok": true}),
+                    };
+                    let resp = json!({"id": req["id"], "ok": true, "result": result});
+                    let mut w = stream;
+                    let _ = writeln!(w, "{resp}");
+                    if method == "__stop" {
+                        break;
+                    }
+                }
+            });
+            let r = inject_text_on(&sock, 7, "DIRECTIVE BODY", Duration::from_secs(3));
+            // 서버 정지(연결 1회 + 정지 요청).
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_dir_all(&dir);
+            let calls = calls.lock().unwrap().clone();
+            (r, calls.into_iter().filter(|m| m != "__stop").collect())
+        };
+        let healthy = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT;
+        // 코퍼스가 식별 못 하는 잘린 면책 창(커서=No, exit) — 붙여넣기 뒤 800ms 안에 떴다.
+        let clipped: &'static str = "❯ 1. No, exit\n  2. Yes, I accept\nEnter to confirm · Esc to cancel\n";
+        assert!(cys::first_run_gates::identify(&cys::first_run_gates::builtin(), clipped).is_none(), "전제: 코퍼스 밖");
+        let (r, calls) = run(vec![healthy, clipped]);
+        let err = r.expect_err("붙여넣기와 Return 사이에 뜬 모달에 제출 Return 이 나갔다(킬 스텝)");
+        assert!(cys::inject_guard::is_hold_error(&err), "보류 머리표가 아니다(파괴 근거로 번역된다): {err}");
+        assert!(err.contains(cys::readiness::MODAL_UNKNOWN_ID), "{err}");
+        assert!(calls.contains(&"surface.send_text".to_string()), "본문은 들어갔어야 한다(guard ① 통과): {calls:?}");
+        assert!(!calls.contains(&"surface.send_key".to_string()), "제출 Return 이 나갔다: {calls:?}");
+        assert_eq!(calls.iter().filter(|m| *m == "surface.read_text").count(), 2, "guard ①·② 가 화면을 두 번 보지 않았다: {calls:?}");
+        // 대조군(계측 타당성): 두 관측 모두 건강한 프롬프트면 붙여넣기 뒤 Return 이 나간다(정상 경로 무회귀).
+        let (ok, calls) = run(vec![healthy, healthy]);
+        assert!(ok.is_ok(), "정상 화면에서 주입이 막혔다: {ok:?}");
+        let pos = |m: &str| calls.iter().position(|c| c == m).unwrap_or_else(|| panic!("{m} 부재: {calls:?}"));
+        assert!(pos("surface.send_text") < pos("surface.send_key"), "순서: 붙여넣기 → Return");
+        assert_eq!(calls.iter().filter(|m| *m == "surface.read_text").count(), 2);
     }
 
     /// ★계측 타당성(negation): **상한을 끄면 같은 목에서 유계 종료하지 않는다.**

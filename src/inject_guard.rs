@@ -134,6 +134,12 @@ pub struct Observed<'a> {
     pub awakened: Option<bool>,
     /// 롤백 스위치 값(호출부가 [`guard_off`] 로 1회 읽어 넘긴다).
     pub guard_off: bool,
+    /// ★(0.14.31 · 리뷰 R2) readiness 롤백 노브 값(`CYS_READINESS_V1=1` — 호출부가 [`crate::readiness::legacy_v1`]
+    /// 로 읽어 넘긴다). WP-1 이 더한 **코퍼스 밖 모달 폴백**(`unknown-modal` 보류)은 readiness 의 모달 축과
+    /// 같은 축이라 같은 노브로 꺼진다 — "종전 판정 복귀" 가 반쪽(부트 폴링은 종전인데 주입 가드는 신판)이 되지
+    /// 않게. 종전부터 있던 코퍼스 가드(U-14 축 · [`guard_off`])와 커서-종료 벨트(조여지는 방향만)는 이 값과
+    /// 무관하다. 마스터 `CYS_BOOT_GATES=0` 은 두 값 모두 켠다(전 축 종전).
+    pub readiness_legacy: bool,
 }
 
 /// 가드의 결론.
@@ -201,14 +207,23 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
         }
         // 코퍼스가 모르는 화면 — 모달 어휘가 있으면 `unknown-modal` 로 보류한다(잘린 관문·새 관문).
         // allow 구멍은 여기 **적용되지 않는다**(지목한 관문이 화면에 없다).
-        None => match modal {
-            Some(m) => GateHit {
-                id: crate::readiness::MODAL_UNKNOWN_ID.to_string(),
-                title: m.title(),
-                human_only: false,
-            },
-            None => return Decision::Send,
-        },
+        // ★(리뷰 R2 · codex minor) 롤백 정합: 이 폴백은 WP-1 이 readiness 에 더한 모달 축의 **주입 가드 쪽 절반**
+        //   이다. `CYS_READINESS_V1=1` 이 readiness 의 모달 축(`modal_on_screen`)을 끄면 여기도 함께 종전(Send)이어야
+        //   "종전 판정 복귀" 가 반쪽이 아니다. 종전부터 있던 코퍼스 가드(위 Some 분기)는 U-14 축(`guard_off`)이
+        //   소유하고, 커서-종료 벨트는 조여지는 방향(보류)만이라 이 노브로 열지 않는다(CONTRACTS B-7 · H-2 재핀까지).
+        None => {
+            if o.readiness_legacy {
+                return Decision::Send;
+            }
+            match modal {
+                Some(m) => GateHit {
+                    id: crate::readiness::MODAL_UNKNOWN_ID.to_string(),
+                    title: m.title(),
+                    human_only: false,
+                },
+                None => return Decision::Send,
+            }
+        }
     };
     if o.guard_off {
         Decision::SendObserved(hit)
@@ -337,6 +352,7 @@ mod tests {
             gates: gs,
             awakened: Some(false),
             guard_off: false,
+            readiness_legacy: false,
         }
     }
 
@@ -767,6 +783,71 @@ mod tests {
             hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
             other_gate: blocked, legacy_v1: false,
         }));
+    }
+
+    /// ★(리뷰 R2 · codex blocking) 접힌 종료 라벨(`No, ex⏎it` · CRLF)도 allow 구멍을 닫는다 — 코퍼스 식별
+    /// (평탄화)은 그 화면을 폴더신뢰로 읽으므로, 벨트가 접힘을 못 읽으면 `trust_send` 가 종료 위에 Return 을 쏜다.
+    #[test]
+    fn allow_hole_stays_closed_when_the_exit_label_is_wrapped() {
+        let gs = gates();
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        for wrapped in [
+            on_exit.replace("No, exit", "No, ex\n   it"),
+            on_exit.replace('\n', "\r\n").replace("No, exit", "No, ex\r\n   it"),
+        ] {
+            let g = first_run_gates::identify(&gs, &wrapped).expect("전제: 코퍼스가 접힌 폴더신뢰를 식별한다");
+            assert_eq!(g.id, GATE_FOLDER_TRUST);
+            match decide_allowing(&obs(&wrapped, &gs), Some(GATE_FOLDER_TRUST)) {
+                Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST),
+                other => panic!("접힌 `No, exit` 위 커서에 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}\n{wrapped}"),
+            }
+            let blocked = decide_allowing(&obs(&wrapped, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+            assert!(!trust_send(&TrustObserved {
+                hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
+                other_gate: blocked, legacy_v1: false,
+            }));
+        }
+        // 대조군: 커서가 Yes 위인 접힌 화면은 구멍이 열린다(자동확인 기능 보존 · 라이브락 방향 회귀 없음).
+        let yes_wrapped = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
+        assert_eq!(decide_allowing(&obs(&yes_wrapped, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+    }
+
+    /// ★(리뷰 R2 · codex minor) 롤백 노브는 **자기 축만** 끈다 — `CYS_READINESS_V1=1`(readiness_legacy)은 WP-1 의
+    /// 코퍼스 밖 모달 폴백만 종전(Send)으로 되돌리고, 종전부터 있던 코퍼스 가드는 U-14 노브(guard_off)가, 둘 다는
+    /// 마스터가 되돌린다. 커서-종료 벨트는 readiness 노브에 열리지 않는다(조여지는 방향만).
+    #[test]
+    fn readiness_v1_switches_off_only_the_unidentified_modal_fallback() {
+        let gs = gates();
+        let clipped = clip_tail(fixtures::TRUST_ECHO_THEN_DISCLAIMER, 3);
+        assert!(first_run_gates::identify(&gs, &clipped).is_none(), "전제: 코퍼스 밖 모달");
+        let corpus_gate = fixtures::OAUTH_CODE;
+        let corpus_id = first_run_gates::identify(&gs, corpus_gate).expect("전제: 코퍼스 관문").id.clone();
+        let mk = |screen: &str, v1: bool, off: bool| -> Decision {
+            decide(&Observed { screen, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1 })
+        };
+        let unknown = crate::readiness::MODAL_UNKNOWN_ID;
+        // 기본(두 노브 0): 둘 다 보류.
+        assert!(matches!(mk(&clipped, false, false), Decision::Hold(h) if h.id == unknown));
+        assert!(matches!(mk(corpus_gate, false, false), Decision::Hold(h) if h.id == corpus_id));
+        // V1 단독: 모달 폴백만 종전(Send · 관측도 없다 = 축 자체가 없던 판정) · 코퍼스 가드는 그대로 보류.
+        assert_eq!(mk(&clipped, true, false), Decision::Send, "V1 이 WP-1 모달 폴백을 되돌리지 못한다(반쪽 롤백)");
+        assert!(matches!(mk(corpus_gate, true, false), Decision::Hold(h) if h.id == corpus_id),
+                "V1 이 종전 코퍼스 가드까지 껐다 — 리뷰어 4칸 진리표(lib.rs BLOCK-3 핀)와 모순");
+        // guard_off 단독: 둘 다 관측 강등(SendObserved) — U-14 축의 종전 규약.
+        assert!(matches!(mk(&clipped, false, true), Decision::SendObserved(h) if h.id == unknown));
+        assert!(matches!(mk(corpus_gate, false, true), Decision::SendObserved(h) if h.id == corpus_id));
+        // 마스터(둘 다): 모달 폴백은 Send(축 없음) · 코퍼스 가드는 SendObserved(종전 롤백 형태 그대로).
+        assert_eq!(mk(&clipped, true, true), Decision::Send);
+        assert!(matches!(mk(corpus_gate, true, true), Decision::SendObserved(_)));
+        // 벨트: V1 에는 열리지 않고(보류) 마스터(guard_off)에서만 관측 강등된다.
+        let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
+        let belt = |v1: bool, off: bool| decide_allowing(
+            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1 },
+            Some(GATE_FOLDER_TRUST),
+        );
+        assert!(belt(true, false).blocks(), "readiness 롤백이 커서-종료 벨트를 열었다(2.1.261 좌석 사망 경로)");
+        assert!(!belt(true, true).blocks(), "마스터 롤백이 벨트를 종전(관측 강등)으로 되돌리지 못한다");
+        assert!(matches!(belt(false, true), Decision::SendObserved(_)));
     }
 
     /// 확인 에코·정상 프롬프트는 모달 폴백에도 걸리지 않는다(2026-07-29 킬체인 역방향 · 부트 창 안에서도).

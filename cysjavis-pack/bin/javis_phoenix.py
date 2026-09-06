@@ -147,6 +147,9 @@ def _claude_project_component(cwd):
 
 # ★F-1(0.14.31): Rust `cys::resolve_claude_config_dir` 와 같은 기본값 — `CYS_ACCOUNT_DIR`(비어 있지 않을 때)
 #   아니면 `~/.cys/claude`. `cys restore` 는 phoenix 의 자식이라 같은 env 를 본다(결정론 입력 동일).
+# ★리뷰 R2(minor-4 · 정직): 아래 예상은 CLI `resolve_resume_suffix` 의 **규칙**을 미러하지만 env 는 **phoenix 자기 프로세스**의
+#   `CYS_ACCOUNT_DIR` 로 푼다. 새 surface 기동에서 CLI 는 데몬이 surface.create 시점에 자기 env 로 푼 `recorded_cfg` 를 쓰므로
+#   phoenix env ≠ 데몬 env 면 예상과 실제가 갈릴 수 있다 — 갈림의 귀결은 verify 의 unverified/fork 의심(거짓 fresh 0)이다.
 def _default_claude_config_dir():
     env = os.environ.get("CYS_ACCOUNT_DIR") or ""
     if env:
@@ -215,6 +218,10 @@ F1_ACCEPTED_REINJECT_KINDS = ("ack", "injected")
 #   transcript 의 stem)을 기다리는 폴링 횟수(1.5s 간격 · 상수 · 노브 아님). 훅은 기동 직후 발화하므로 보통 첫 시도에
 #   잡힌다 — 이것은 재핀 지연(usage 수집기 5s 백오프)을 기다리는 창이다.
 F1_REGISTERED_GRACE_TRIES = 6
+#   ★리뷰 R2: F-1 verify 가 재관측 대상(아래 F1_REOBSERVABLE)으로 끝나면 같은 restore 실행 안에서 되돌린 단계를 다시 도는
+#   횟수 상한(총 pass 수 · 2 = 1회 재시도). 살아 있는 역할은 다음 restore 의 target 이 아니므로 이 실행이 유일한 기회다.
+F1_REVERIFY_PASSES = 2
+F1_REOBSERVABLE = ("unobserved", "file_missing", "unbound_now", "changed", "evidence_unbound", "pre_existing")
 #   세션 id 는 파일명 한 조각이어야 한다(경로 구분자·공백 금지) — 화면·문자열 유래 값이 파일 경로로 승격되지 않게.
 F1_SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -285,6 +292,10 @@ def f1_fresh_verify(rr, row, session_file_exists=None):
           재고에 있으면 provenance="pre_existing"(기존 대화 재개 의심 · 타 역할 세션이거나 stale 신원 — fork 의심으로
           라벨하되 '증명된 타 세션' 이라 주장하지 않는다). 휴리스틱(topology mtime stash)·화면 유래 신원은 소유 증거가
           아니라 미확정이다. 관측 전(None)은 transient.
+          ★리뷰 R2(codex major): 캐시된 관측만으로는 부족하다 — **지금** `row["registered_session_id"]` 가 그 세션이어야
+          하고(키 부재="unbound_now" · 다름="changed"), 주입 증거도 그 세션이 결속된 채 수집됐어야 한다
+          (`rr["reinject_sid"]` == 관측 세션 · 아니면 "evidence_unbound"). 관측 뒤 다른 세션 B 가 등록되면 A 의 파일이
+          남아 있어도 fresh 가 아니다(B 의 대화를 A 라고 보고하는 경로 차단).
     하나라도 빠지면 'unverified' 와 빠진 항목(사람이 읽는 사유). `session_file_exists` 는 검체 주입용(기본 os.path.exists)."""
     exists = session_file_exists or os.path.exists
     stages = (rr.get("stages") or {}) if isinstance(rr, dict) else {}
@@ -298,7 +309,10 @@ def f1_fresh_verify(rr, row, session_file_exists=None):
     ev = {"reinject_kind": kind, "g2_ack": bool((stages.get("g2_ack") or {}).get("done")),
           "gate_cleared": None, "agent_alive": None, "exited": None,
           "provenance": None, "observed_sid": rr.get("observed_sid") if isinstance(rr, dict) else None,
-          "observed_sid_source": rr.get("observed_sid_source") if isinstance(rr, dict) else None}
+          "observed_sid_source": rr.get("observed_sid_source") if isinstance(rr, dict) else None,
+          # ★리뷰 R2: 지금 좌석에 결속된 신원 · 주입 직후 결속 신원(증거 귀속) — 둘 다 관측 세션과 같아야 fresh.
+          "registered_now": row.get("registered_session_id") if isinstance(row, dict) else None,
+          "reinject_sid": rr.get("reinject_sid") if isinstance(rr, dict) else None}
     missing = []
     if not isinstance(row, dict):
         missing.append("status 행 부재(surface 미발견 또는 status --json 실패)")
@@ -336,9 +350,21 @@ def f1_fresh_verify(rr, row, session_file_exists=None):
     elif not F1_SID_RE.match(sid):
         ev["provenance"] = "invalid_id"
         missing.append("관측 세션 id 형식 이탈(%r · 파일명 한 조각이 아님)" % sid[:40])
+    elif not isinstance(row, dict) or "registered_session_id" not in row:
+        # ★리뷰 R2(codex major): 캐시된 관측이 아니라 **지금** 좌석에 결속된 신원이 그 세션이어야 한다.
+        ev["provenance"] = "unbound_now"
+        missing.append("지금 좌석 결속 신원을 읽지 못했다(status 행/registered_session_id 키 부재) — 관측 세션 %r 의 현재 결속 미확인" % sid)
+    elif row.get("registered_session_id") != sid:
+        ev["provenance"] = "changed"
+        missing.append("좌석 결속 세션이 관측 뒤 바뀌었다(관측 %r → 지금 %r) — 캐시된 관측·주입 증거는 그 세션의 것이 아니다 · 재관측 대상"
+                       % (sid, row.get("registered_session_id")))
     elif sid in pre:
         ev["provenance"] = "pre_existing"
         missing.append("fork 의심: 관측 세션 %r 이 스폰 전 재고에 이미 있었다(기존 대화 재개 · 타 역할 세션 또는 stale 신원) — fresh 아님" % sid)
+    elif rr.get("reinject_sid") != sid:
+        # ★리뷰 R2(codex): 주입 증거는 **그 세션이 결속된 채** 수집됐어야 한다(주입 직후 결속 신원 = 관측 세션).
+        ev["provenance"] = "evidence_unbound"
+        missing.append("주입 증거가 관측 세션 %r 에 귀속되지 않았다(주입 직후 결속=%r) — 재주입·재검증 대상" % (sid, rr.get("reinject_sid")))
     elif not exists(os.path.join(pre_dir, sid + ".jsonl")):
         ev["provenance"] = "file_missing"
         missing.append("관측 세션 %r 의 파일이 아직 없다(첫 메시지 미기록 또는 stale 신원) — 새 세션 확정 불가" % sid)
@@ -348,6 +374,18 @@ def f1_fresh_verify(rr, row, session_file_exists=None):
     if missing:
         return "unverified", " · ".join(missing), ev
     return "fresh", None, ev
+
+
+def f1_result_partition(target_roles, outcomes, roles):
+    """★리뷰 R2(minor-3): restore 결과의 fresh 분할(순수 함수) → (fresh_roles, fresh_reasons, fresh_fallback_roles, f1_roles).
+    fresh_roles = outcome 'fresh' 전부 · fresh_reasons = 그 역할들의 fresh_reason(부재=poison · 구 저널) ·
+    fresh_fallback_roles = 그중 독약 강등(Phase11 의 본래 뜻 · 하네스 `poison_downgraded_to_fresh` 등식 대조 키) ·
+    f1_roles = 그중 F-1 세션 부재(no_session*). unverified 역할은 어느 목록에도 들지 않는다."""
+    fresh_roles = [r for r in target_roles if outcomes.get(r) == "fresh"]
+    fresh_reasons = {r: (roles.get(r) or {}).get("fresh_reason", "poison") for r in fresh_roles}
+    fresh_fallback_roles = [r for r in fresh_roles if fresh_reasons[r] == "poison"]
+    f1_roles = [r for r in fresh_roles if fresh_reasons[r] in F1_FRESH_REASONS]
+    return fresh_roles, fresh_reasons, fresh_fallback_roles, f1_roles
 
 
 def migrate_f1_journal(j):
@@ -370,7 +408,9 @@ def migrate_f1_journal(j):
         #   캐시된 '성공' 이 dedup 으로 살아남지 않게 verify done 을 해제한다(검증기만 바꾸면 캐시가 남는다 — codex).
         if rr.get("fresh_expected") and rr.get("outcome") == "fresh":
             fev = rr.get("fresh_evidence")
-            if not (isinstance(fev, dict) and fev.get("provenance") == "new"):
+            # ★리뷰 R2: ef1d3e4 형식(주입 증거의 세션 귀속 `reinject_sid` 없음)도 캐시 성공을 무효화한다.
+            bound = rr.get("reinject_sid") is not None and rr.get("reinject_sid") == rr.get("observed_sid")
+            if not (isinstance(fev, dict) and fev.get("provenance") == "new" and bound):
                 v = (rr.get("stages") or {}).get("verify")
                 if isinstance(v, dict) and v.get("done"):
                     v["done"] = False
@@ -1740,14 +1780,19 @@ def stage_observe_session(socket, surface, stub, role=None):
     return None, last_txt.strip()[-200:]  # grace 소진·미관측 → transient(verify가 unverified 처리)
 
 
-def stage_observe_registered_session(socket, surface, tries=None):
+def stage_observe_registered_session(socket, surface, tries=None, pre_sids=None):
     """★F-1(리뷰 R1b): **좌석 결속** 세션 신원만 관측한다 — `cys status --json`.surfaces[].registered_session_id
     (SessionStart 훅이 자기 pane 에서 `usage.register` 로 등록한 transcript stem · 등록마다 갱신 · 소유 게이트 통과).
     topology 의 `session_id`(usage 수집기 mtime 휴리스틱 1회 stash · 같은 좌석 재기동은 stale 유지)와 화면 정규식은
     공유 cwd 에서 타 좌석의 세션을 이 좌석에 귀속시킬 수 있어 fresh(세션에 대한 주장)의 증거로 쓰지 않는다.
-    grace 안에 등록이 없으면 (None, 사유) — verify 가 transient(unverified)로 다룬다. 구 데몬(키 부재)도 None."""
+    grace 안에 등록이 없으면 (None, 사유) — verify 가 transient(unverified)로 다룬다. 구 데몬(키 부재)도 None.
+    ★리뷰 R2(minor-11): 데몬은 agent 종료에 등록을 지우지 않으므로 **같은 pane 의 이전 점유자** stem 이 새 훅이 갱신할
+    때까지 남는다(in-seat 재연결). `pre_sids`(스폰 전 재고)에 있는 stem 은 stale 등록 의심으로 보고 grace 를 계속 쓴다 —
+    grace 끝까지 그대로면 그 값을 돌려주고 verify 가 pre_existing(fork 의심 · 재관측 대상)으로 라벨한다. 재고 자체는
+    바꾸지 않는다(스폰 후 스냅샷으로 대체 금지 — 새 세션이 재고에 들어가면 fresh 를 영영 확정 못 한다)."""
     tries = max(1, F1_REGISTERED_GRACE_TRIES if tries is None else tries)
     last = "status 행 부재"
+    stale = None   # (sid, attempt) — 스폰 전 재고에 있는 stem(이전 점유자 stale 등록 의심)
     for attempt in range(tries):
         row = _surface_status_row(socket, surface)
         if isinstance(row, dict):
@@ -1756,10 +1801,18 @@ def stage_observe_registered_session(socket, surface, tries=None):
             else:
                 sid = row.get("registered_session_id")
                 if isinstance(sid, str) and F1_SID_RE.match(sid):
-                    return sid, "registered(status.registered_session_id · attempt %d)" % (attempt + 1)
-                last = "registered_session_id=%r(등록 전 또는 형식 이탈)" % (sid,)
+                    if isinstance(pre_sids, list) and sid in pre_sids:
+                        stale = (sid, attempt + 1)
+                        last = "registered_session_id=%r 는 스폰 전 재고에 있음(이전 점유자 stale 등록 의심 · 갱신 대기)" % (sid,)
+                    else:
+                        return sid, "registered(status.registered_session_id · attempt %d)" % (attempt + 1)
+                else:
+                    last = "registered_session_id=%r(등록 전 또는 형식 이탈)" % (sid,)
         if attempt < tries - 1:
             time.sleep(PHOENIX_SESSION_GRACE_SLEEP)
+    if stale is not None:
+        return stale[0], ("registered(status.registered_session_id · attempt %d · 스폰 전 재고에 있는 stem 이 grace %d회 "
+                          "내내 유지 — 이전 점유자 stale 등록이거나 기존 대화 재개 의심)" % (stale[1], tries))
     return None, "좌석 결속 세션 미관측(%d회 · %s)" % (tries, last)
 
 
@@ -2178,97 +2231,133 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         if not surface:
             jevent(j, role, "ready", "fail", "surface 없음 — 하위 단계 skip")
             continue
-        # ready
-        if not stage_done(j, role, "ready"):
-            ok, ev = stage_ready(socket, role, surface, stub)
-            mark_stage(j, role, "ready", ok, ev); jevent(j, role, "ready", "ok" if ok else "fail", ev)
-            save_journal(socket, ticket, j)
-        # resume(observe session · ③ grace 폴링)
-        if not stage_done(j, role, "resume"):
-            if (not stub) and j["roles"][role].get("fresh_expected"):
-                # ★F-1(리뷰 R1b): fresh 예상 역할은 **좌석 결속** 신원(registered_session_id)만 관측한다 — topology
-                #   재핀(휴리스틱 1회 stash)은 같은 좌석 재기동에서 죽은 세션의 id 를 그대로 돌려줘(stale) grace 를
-                #   즉시 끝내고, 공유 cwd 에서는 타 좌석 세션을 귀속시킬 수 있다(둘 다 fresh 의 증거가 아니다).
-                sid, ev = stage_observe_registered_session(socket, surface)
-                j["roles"][role]["observed_sid_source"] = "registered" if sid else None
-            else:
-                sid, ev = stage_observe_session(socket, surface, stub, role=role)
-            j["roles"][role]["observed_sid"] = sid
-            mark_stage(j, role, "resume", sid is not None, "observed_sid=%s | %s" % (sid, ev))
-            jevent(j, role, "resume", "ok" if sid else "fail", "observed_sid=%s" % sid)
-            save_journal(socket, ticket, j)
-        # reinject
-        if not stage_done(j, role, "reinject"):
-            ok, ev = stage_reinject(socket, role, surface, stub)
-            mark_stage(j, role, "reinject", ok, ev); jevent(j, role, "reinject", "ok" if ok else "warn", ev)
-            save_journal(socket, ticket, j)
-        # g2_ack (best-effort; 실패해도 전진하되 verify에서 정직 라벨)
-        if not stage_done(j, role, "g2_ack"):
-            ok, ev = stage_g2_ack(socket, role, surface, stub)
-            mark_stage(j, role, "g2_ack", ok, ev); jevent(j, role, "g2_ack", "ok" if ok else "degraded", ev)
-            save_journal(socket, ticket, j)
-        # verify (M9 핵심): observed_sid == expected_sid 이며 비어있지 않아야 VERIFIED
-        exp = j["roles"][role].get("expected_sid", "")
-        obs = j["roles"][role].get("observed_sid", None)
-        fresh_fb = j["roles"][role].get("fresh_fallback", False)
-        fresh_exp = j["roles"][role].get("fresh_expected", False)
-        # ★Phase 11: fresh 강등(독약 세션)은 fork(오복원)가 아니라 '의도적 세션 폐기 후 재기동'이다.
-        # 세션 보존 실패는 정직히 밝히되(verified 아님) 실패(unverified/failed)로 오분류하지 않는다 —
-        # 별도 outcome 'fresh' 로 라벨링(원 세션 독약 → 무 resume 부활·디렉티브/원장 재주입).
-        if fresh_fb:
-            outcome = "fresh"
-            reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
-                      "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
-        elif fresh_exp:
-            # ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): 예상은 결과가 아니다 — 'fresh' 는 **이 기동의 각성 증거**
-            #   (관문 통과 gate_pending=null ∧ agent_alive ∧ reinject ack|injected)가 전부 있을 때만. 관문에 갇힌
-            #   좌석(주입 0)·주입 실패·큐 전환·구 데몬(gate_pending 키 부재)은 unverified(verify done=False)다.
-            why = j["roles"][role].get("fresh_reason", "no_session")
-            row = None if stub else _surface_status_row(socket, surface)
-            outcome, missing, fev = f1_fresh_verify(j["roles"][role], row)
-            j["roles"][role]["fresh_evidence"] = fev
-            if outcome == "fresh":
-                reason = ("★fresh 각성 확정(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 · 전문 디렉티브+[RESTORE]). "
-                          "증거: gate_pending=null ∧ agent_alive ∧ 이 기동의 주입 %s%s ∧ 좌석 결속 새 세션 %r(스폰 전 재고 %d개에 없음·파일 실재). "
-                          "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)"
-                          % (why, fev["reinject_kind"], "+g2 ack" if fev["g2_ack"] else "", obs,
-                             len(j["roles"][role].get("fresh_pre_sids") or [])))
-            else:
-                label = "fork 의심" if fev.get("provenance") == "pre_existing" else "transient"
-                reason = ("★F-1 fresh 예상(%s)이나 증거 미충족(%s · 정직 unverified): %s · 관측 세션=%r. "
-                          "자기채점 금지 — `cys status --json`(gate_pending·agent_alive·registered_session_id)·`cys read-screen` 으로 확인"
-                          % (why, label, missing, obs))
-                # 관측 전(transient)이면 resume 단계를 되돌려 재실행 시 좌석 결속 신원을 다시 기다린다(게이트 완화 아님).
-                if fev.get("provenance") in ("unobserved", "file_missing") and not stub:
-                    mark_stage(j, role, "resume", False, "F-1 재관측 대상: %s" % fev.get("provenance"))
-        else:
-            verified = bool(exp) and bool(obs) and (exp == obs)
-            outcome = "verified" if verified else "unverified"
-            # ★Phase 5 ③: transient(재핀 전·미관측)와 fork(진짜 오복원·상이 세션)를 구분해 라벨링.
-            # 둘 다 unverified(정직성 불변)지만 사유를 남겨 라이브 grace 캘리브레이션·진단을 돕는다.
-            if not verified:
-                if not obs:
-                    reason = "transient(세션 재핀 전 — grace 소진·미관측)"
-                elif exp and obs != exp:
-                    reason = "fork(관측 세션≠핀 — 진짜 오복원 의심)"
+        # ★리뷰 R2: F-1 fresh 예상 역할은 좌석 결속 신원이 관측 뒤 바뀌었거나(changed) 증거가 귀속되지 않았거나
+        #   (evidence_unbound) 재고에 있던 stem(pre_existing · 이전 점유자 stale 등록)이면 되돌린 단계를 같은 실행에서
+        #   1회 다시 돈다 — 살아 있는 역할은 다음 restore 의 target 이 아니라 재실행이 재검증 기회가 아니기 때문이다.
+        for f1_pass in range(F1_REVERIFY_PASSES):
+            f1_retry = None
+            # ready
+            if not stage_done(j, role, "ready"):
+                ok, ev = stage_ready(socket, role, surface, stub)
+                mark_stage(j, role, "ready", ok, ev); jevent(j, role, "ready", "ok" if ok else "fail", ev)
+                save_journal(socket, ticket, j)
+            # resume(observe session · ③ grace 폴링)
+            if not stage_done(j, role, "resume"):
+                if (not stub) and j["roles"][role].get("fresh_expected"):
+                    # ★F-1(리뷰 R1b): fresh 예상 역할은 **좌석 결속** 신원(registered_session_id)만 관측한다 — topology
+                    #   재핀(휴리스틱 1회 stash)은 같은 좌석 재기동에서 죽은 세션의 id 를 그대로 돌려줘(stale) grace 를
+                    #   즉시 끝내고, 공유 cwd 에서는 타 좌석 세션을 귀속시킬 수 있다(둘 다 fresh 의 증거가 아니다).
+                    sid, ev = stage_observe_registered_session(socket, surface,
+                                                               pre_sids=j["roles"][role].get("fresh_pre_sids"))
+                    j["roles"][role]["observed_sid_source"] = "registered" if sid else None
                 else:
-                    reason = "핀 부재(expected 미기록)"
+                    sid, ev = stage_observe_session(socket, surface, stub, role=role)
+                j["roles"][role]["observed_sid"] = sid
+                mark_stage(j, role, "resume", sid is not None, "observed_sid=%s | %s" % (sid, ev))
+                jevent(j, role, "resume", "ok" if sid else "fail", "observed_sid=%s" % sid)
+                save_journal(socket, ticket, j)
+            # reinject
+            if not stage_done(j, role, "reinject"):
+                ok, ev = stage_reinject(socket, role, surface, stub)
+                mark_stage(j, role, "reinject", ok, ev); jevent(j, role, "reinject", "ok" if ok else "warn", ev)
+                # ★리뷰 R2(codex): 주입 증거를 **그 순간 좌석에 결속된 세션**에 귀속시킨다 — verify 는 관측 세션·지금 결속·
+                #   주입 직후 결속 셋이 같을 때만 fresh 다(세션이 바뀌면 이전 세션의 ACK 로 새 세션을 확정하지 않는다).
+                if (not stub) and j["roles"][role].get("fresh_expected"):
+                    row_now = _surface_status_row(socket, surface)
+                    j["roles"][role]["reinject_sid"] = (row_now.get("registered_session_id")
+                                                        if isinstance(row_now, dict) and "registered_session_id" in row_now else None)
+                save_journal(socket, ticket, j)
+            # g2_ack (best-effort; 실패해도 전진하되 verify에서 정직 라벨)
+            if not stage_done(j, role, "g2_ack"):
+                ok, ev = stage_g2_ack(socket, role, surface, stub)
+                mark_stage(j, role, "g2_ack", ok, ev); jevent(j, role, "g2_ack", "ok" if ok else "degraded", ev)
+                save_journal(socket, ticket, j)
+            # verify (M9 핵심): observed_sid == expected_sid 이며 비어있지 않아야 VERIFIED
+            exp = j["roles"][role].get("expected_sid", "")
+            obs = j["roles"][role].get("observed_sid", None)
+            fresh_fb = j["roles"][role].get("fresh_fallback", False)
+            fresh_exp = j["roles"][role].get("fresh_expected", False)
+            # ★Phase 11: fresh 강등(독약 세션)은 fork(오복원)가 아니라 '의도적 세션 폐기 후 재기동'이다.
+            # 세션 보존 실패는 정직히 밝히되(verified 아님) 실패(unverified/failed)로 오분류하지 않는다 —
+            # 별도 outcome 'fresh' 로 라벨링(원 세션 독약 → 무 resume 부활·디렉티브/원장 재주입).
+            if fresh_fb:
+                outcome = "fresh"
+                reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
+                          "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
+            elif fresh_exp:
+                # ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): 예상은 결과가 아니다 — 'fresh' 는 **이 기동의 각성 증거**
+                #   (관문 통과 gate_pending=null ∧ agent_alive ∧ reinject ack|injected)가 전부 있을 때만. 관문에 갇힌
+                #   좌석(주입 0)·주입 실패·큐 전환·구 데몬(gate_pending 키 부재)은 unverified(verify done=False)다.
+                why = j["roles"][role].get("fresh_reason", "no_session")
+                row = None if stub else _surface_status_row(socket, surface)
+                outcome, missing, fev = f1_fresh_verify(j["roles"][role], row)
+                j["roles"][role]["fresh_evidence"] = fev
+                if outcome == "fresh":
+                    reason = ("★fresh 각성 확정(F-1·%s: 이어받을 세션 없음 → 무 resume 새 세션 · 전문 디렉티브+[RESTORE]). "
+                              "증거: gate_pending=null ∧ agent_alive ∧ 이 기동의 주입 %s%s ∧ 좌석 결속 새 세션 %r(스폰 전 재고 %d개에 없음·파일 실재). "
+                              "정직: 세션 보존 대상 자체가 없었다(fork/오복원 아님 · roster 부활 완료)"
+                              % (why, fev["reinject_kind"], "+g2 ack" if fev["g2_ack"] else "", obs,
+                                 len(j["roles"][role].get("fresh_pre_sids") or [])))
+                else:
+                    label = "fork 의심" if fev.get("provenance") == "pre_existing" else "transient"
+                    reason = ("★F-1 fresh 예상(%s)이나 증거 미충족(%s · 정직 unverified): %s · 관측 세션=%r. "
+                              "자기채점 금지 — `cys status --json`(gate_pending·agent_alive·registered_session_id)·`cys read-screen` 으로 확인"
+                              % (why, label, missing, obs))
+                    # 관측 전(transient)이면 resume 단계를 되돌려 재실행 시 좌석 결속 신원을 다시 기다린다(게이트 완화 아님).
+                    # ★리뷰 R2(codex): 신원이 바뀌었거나(changed) 증거가 귀속되지 않았거나(evidence_unbound) 재고에 있던 stem
+                    #   (pre_existing · 이전 점유자 stale 가능)이면 resume 뿐 아니라 reinject·g2_ack 도 되돌린다 — 이전 세션의
+                    #   ACK 가 다음 실행에서 새 세션의 증거로 재사용되지 않게. spawn 완료·스폰 전 재고는 보존한다.
+                    prov = fev.get("provenance")
+                    if prov in F1_REOBSERVABLE and not stub:
+                        mark_stage(j, role, "resume", False, "F-1 재관측 대상: %s" % prov)
+                    #   주입 시점에 결속 신원이 없었으면(reinject_sid None) 증거는 어느 세션에도 귀속되지 않은 것이라 함께 되돌린다.
+                    if (prov in ("changed", "evidence_unbound", "pre_existing")
+                            or (prov in F1_REOBSERVABLE and j["roles"][role].get("reinject_sid") is None)) and not stub:
+                        for st in ("reinject", "g2_ack"):
+                            mark_stage(j, role, st, False, "F-1 증거 무효화(%s · 이전 세션 귀속 증거 재사용 금지)" % prov)
+                        j["roles"][role].pop("reinject_sid", None)
+                    # ★리뷰 R2: 살아 있는 역할은 다음 restore 의 target 이 아니므로(선재 의미론) 재관측 기회는 **이 실행 안**에
+                    #   있어야 한다 — 되돌린 단계를 같은 실행에서 1회(F1_REVERIFY_PASSES) 다시 돈다(무한 루프 0 · 게이트 완화 0).
+                    if prov in F1_REOBSERVABLE and not stub:
+                        f1_retry = prov
             else:
-                reason = "세션 일치"
-        j["roles"][role]["outcome"] = outcome
-        j["roles"][role]["verify_reason"] = reason
-        # ★P2-3: verify done 은 outcome 이 verified/fresh(성공 부활)일 때만 True. unverified(transient/fork)는
-        #   done=False 로 남겨 다음 restore 사이클이 재검증한다 — 과거처럼 unconditional done=True 로 마킹하면
-        #   같은 부트 세대 내내 UNVERIFIED 가 고착(재검증 영구 skip)됐다. dedup(pending)이 이 done 을 본다.
-        verify_done = outcome in ("verified", "fresh")
-        mark_stage(j, role, "verify", verify_done,
-                   "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
-        jevent(j, role, "verify", outcome, "expected=%r observed=%r [%s]" % (exp, obs, reason))
-        save_journal(socket, ticket, j)
+                verified = bool(exp) and bool(obs) and (exp == obs)
+                outcome = "verified" if verified else "unverified"
+                # ★Phase 5 ③: transient(재핀 전·미관측)와 fork(진짜 오복원·상이 세션)를 구분해 라벨링.
+                # 둘 다 unverified(정직성 불변)지만 사유를 남겨 라이브 grace 캘리브레이션·진단을 돕는다.
+                if not verified:
+                    if not obs:
+                        reason = "transient(세션 재핀 전 — grace 소진·미관측)"
+                    elif exp and obs != exp:
+                        reason = "fork(관측 세션≠핀 — 진짜 오복원 의심)"
+                    else:
+                        reason = "핀 부재(expected 미기록)"
+                else:
+                    reason = "세션 일치"
+            j["roles"][role]["outcome"] = outcome
+            j["roles"][role]["verify_reason"] = reason
+            # ★P2-3: verify done 은 outcome 이 verified/fresh(성공 부활)일 때만 True. unverified(transient/fork)는
+            #   done=False 로 남겨 다음 restore 사이클이 재검증한다 — 과거처럼 unconditional done=True 로 마킹하면
+            #   같은 부트 세대 내내 UNVERIFIED 가 고착(재검증 영구 skip)됐다. dedup(pending)이 이 done 을 본다.
+            verify_done = outcome in ("verified", "fresh")
+            mark_stage(j, role, "verify", verify_done,
+                       "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
+            jevent(j, role, "verify", outcome, "expected=%r observed=%r [%s]" % (exp, obs, reason))
+            save_journal(socket, ticket, j)
+            if f1_retry and f1_pass + 1 < F1_REVERIFY_PASSES:
+                jevent(j, role, "verify", "reobserve",
+                       "★F-1 리뷰 R2: 좌석 결속 신원 변경/미귀속/stale(%s) — 같은 실행 안에서 1회 재관측·재주입·재검증(pass %d→%d)"
+                       % (f1_retry, f1_pass + 1, f1_pass + 2))
+                save_journal(socket, ticket, j)
+                continue
+            break
 
     # ── M9 정직한 최종 enum ──
     outcomes = {r: j["roles"].get(r, {}).get("outcome", "failed") for r in target_roles}
-    fresh_fallback_roles = [r for r in target_roles if outcomes.get(r) == "fresh"]  # ★Phase11 정직 명시
+    # ★리뷰 R2(minor-3): 결과 분할(순수 함수 `f1_result_partition`) — `fresh_roles`(outcome fresh 전부) ⊃
+    #   `fresh_fallback_roles`(독약 강등 · Phase11 의 본래 뜻 · 하네스 `poison_downgraded_to_fresh` 가 poison 집합과 등식 대조)
+    #   ∪ `f1_roles`(F-1 세션 부재 fresh). unverified 역할은 어느 성공 목록에도 들지 않는다.
+    fresh_roles, fresh_reasons, fresh_fallback_roles, f1_roles = f1_result_partition(target_roles, outcomes, j["roles"])
     all_verified = target_roles and all(outcomes.get(r) == "verified" for r in target_roles)
     # ★Phase11: 전원이 verified 또는 fresh(독약→fresh 강등)면 roster 는 부활했다. 단 일부 세션은 보존 못 했으므로
     #   VERIFIED 로 뭉뚱그리지 않고 VERIFIED_FRESH 로 정직히 구분한다(세션 보존 실패를 숨기지 않는다).
@@ -2329,9 +2418,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                     "결정론으로 알 수 없는 상태다. 좌석 앞 큐 메시지는 배달 보류(보존)된다 — 침묵 성공 "
                     "아님." % manual_seats)
     # ★F-1(0.14.31): fresh 역할별 사유 공개 — 독약 강등과 보존 대상 부재를 따로 설명한다.
-    fresh_reasons = {r: j["roles"][r].get("fresh_reason", "poison") for r in fresh_fallback_roles}
-    poison_roles = [r for r in fresh_fallback_roles if fresh_reasons[r] == "poison"]
-    f1_roles = [r for r in fresh_fallback_roles if fresh_reasons[r] in ("no_session", "no_session_file")]
+    poison_roles = fresh_fallback_roles
     if poison_roles:
         honesty += (" ★fresh 강등 역할=%s: 원 세션이 독약(resume 불가)이라 무 resume 로 새 세션을 기동하고 "
                     "디렉티브/원장을 재주입했다(세션 보존 실패를 정직히 밝힘 — roster 는 부활 완료). "
@@ -2361,8 +2448,9 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
-        "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시
-        # ★F-1(0.14.31): fresh 사유를 역할별로 공개(기존 enum 유지).
+        "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시(독약만 · 리뷰 R2)
+        # ★F-1(0.14.31): fresh 사유를 역할별로 공개(기존 enum 유지). `fresh_roles` = outcome fresh 전부(독약 ∪ F-1).
+        "fresh_roles": fresh_roles,
         "fresh_reasons": fresh_reasons,
         # ★F-1(리뷰 R1): 예상(입력)과 확정(증거)을 따로 공개 — 미확정은 per_role_outcome 에서 unverified 다.
         "fresh_expected_roles": fresh_expected_roles,

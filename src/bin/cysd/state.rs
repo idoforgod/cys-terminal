@@ -691,6 +691,12 @@ pub struct GatePending {
     /// 화면 꼬리 근거 발췌(사람이 읽는 진단 전용 — **판정에 쓰지 않는다**).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// ★(0.14.31 · 리뷰 R2) 채택 시 전문 디렉티브 뒤에 이어 보낼 **복원 연속 지시**([RESTORE]/[RECOVER]). 보류를
+    /// 만든 발신자(restore·node-recover 경유 기동)가 첫 표식과 함께 싣고, `cys boot` 의 재관측 채택
+    /// (`cys.rs::gate_pending_adopt`)이 해제 전에 읽는다. `followup` 없는 재표식(다음 관문)은 기존 값을 **보존**
+    /// 한다. 판정에 쓰지 않는다(additive · wire 술어는 여전히 "object 인가").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup: Option<String>,
 }
 
 impl Surface {
