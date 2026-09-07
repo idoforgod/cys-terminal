@@ -511,6 +511,16 @@ pub const MODAL_CHOICE_LABELS: [&str; 5] = [
     "Not now",
 ];
 
+/// ★(0.14.31 · triage R1-WP1-HF · C-B1) **확인 에코의 확인 마크.** 접힌 렌더에서 잘림 거부를
+/// 면제하는 유일한 양성 증거다([`tail_completes_a_label`]).
+///
+/// 실측은 `✔`(U+2714) 하나다 — `first_run_gates` 의 실측 전사 `Yes, I trust this folder ✔` ·
+/// `❯ 2. Dark mode ✔`. 근사 글리프 `✓`(U+2713)·`✅`(U+2705)를 함께 받는 이유는 **가용성**이다:
+/// 폰트·버전 변주로 마크 글리프가 하나 어긋나면 그 좌석의 접힌 에코가 영구 보류가 되는데
+/// (치명위험 ③), 그 대가가 이 세 글자의 폭보다 비싸다. 어느 쪽이든 종전(접두 일치 = 무제한 면제)
+/// 보다는 **엄격하게 좁은** 집합이므로 방향은 조이는 쪽 하나다.
+pub const MODAL_CONFIRM_MARKS: [char; 3] = ['✔', '✓', '✅'];
+
 /// ★(리뷰 R1) 재주입 생애 창의 **꼬리 레이아웃 증거** — 대기 프롬프트 줄 아래에 실려도 무해한 상태줄 어휘.
 ///
 /// 실측(2026-09-06 10:18:58 · claude 2.1.261 라이브 좌석 `cys read-screen` · 읽기 전용): 입력 상자는 `❯ ` 줄이
@@ -874,6 +884,38 @@ fn strip_choice_number(tail: &[char]) -> &[char] {
     }
 }
 
+/// ★(0.14.31 · triage R1-WP1-HF · C-B1 ⓑ) 이 꼬리가 라벨을 **실제로 완결했는가** — [`clipped_choice_cursor`]
+/// 의 잘림 거부를 면제하는 유일한 증거(접힌 확인 에코 보호 · 2026-07-29 킬체인의 역방향 회귀 차단).
+///
+/// 【무엇이 틀렸었나】 R7 은 이것을 **접두 일치**로 셌다(`body[..lf.len()] == lf`). 그러면 잘린 선택기
+/// 아래에 우연히 다른 라벨을 *단어 안에서* 완성하는 문면이 오는 것만으로 면제가 선다 —
+/// `❯ Yes, I ⏎acceptance tests pending` 은 `Yes, I accept` 를 완성한 것처럼 보이지만 실제 화면의
+/// 선택기는 `Yes, I trust this folder` 의 잘린 렌더다(판정자 반례 ⓑ). 면제가 서면 서명 0 = 본문 +
+/// Return 이 부분 렌더된 선택기로 나간다.
+///
+/// 【장치】 면제를 접두가 아니라 **양성 에코 증거**로 세운다: 라벨이 끝난 **바로 그 자리**에
+/// 확인 마크([`MODAL_CONFIRM_MARKS`])가 와야 완결로 인정한다. 마크 뒤의 문면은 자유다
+/// (`… folder ✔ Welcome back` — 기존 전수 접힘 핀 보존). 단어 경계(`뒤가 영숫자가 아니면 완결`)로는
+/// 부족하다는 것이 codex 설계 검토의 반례다: `❯ Yes, I ⏎accept, then continue` 는 쉼표 때문에
+/// 면제되고, 평탄화 공간에는 공백이 없어 그것은 애초에 단어 경계도 아니다.
+///
+/// 【왜 확인 마크가 근거인가】 실측이다 — `first_run_gates` 코퍼스의 확인 에코 전사가
+/// `Yes, I trust this folder ✔` · `❯ 2. Dark mode ✔` 이고(fixtures `TRUST_ECHO_THEN_DISCLAIMER`),
+/// **살아 있는** 선택 행은 라벨 뒤에 마크를 달지 않는다. 즉 마크는 "이 라벨은 이미 눌렸다" 의
+/// 양성 증거이고, 그것이 없는 완결은 완결된 **선택지 행**일 수 있다(그 화면은 보류가 옳다).
+///
+/// 【남는 잔여(정직)】 확인 마크를 쓰지 않는 렌더의 접힌 에코는 이제 보류로 접힌다(가용성 대가).
+/// 방향은 조이는 쪽이고(면제 집합이 줄었을 뿐 늘지 않았다), 실측 어휘가 넓어지면 상수만 넓히면 된다.
+fn tail_completes_a_label(body: &[char]) -> bool {
+    MODAL_CHOICE_LABELS.iter().any(|label| {
+        let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
+        !lf.is_empty()
+            && body.len() >= lf.len()
+            && body[..lf.len()] == lf[..]
+            && body.get(lf.len()).is_some_and(|c| MODAL_CONFIRM_MARKS.contains(c))
+    })
+}
+
 fn clipped_choice_cursor(
     flat: &[char],
     label_flat: usize,
@@ -913,10 +955,38 @@ fn clipped_choice_cursor(
     //   R7 반례: 접힌 에코 `❯ Yes, I⏎accept ✔`의 첫 행 `Yes,I` 는 *다른* 라벨(`Yes, I trust this folder`)의
     //   진부분접두라, 그 라벨의 완결만 보면 면제가 서지 않아 **완결된 에코가 관문으로 오탐**된다 =
     //   2026-07-29 킬체인의 역방향 회귀). 좌표계는 화면 끝이 아니라 **이 블록의 꼬리**다(claude major).
-    let completed = MODAL_CHOICE_LABELS.iter().any(|label| {
+    let completed = tail_completes_a_label(body);
+    // ★(0.14.31 · triage R1-WP1-HF · C-B1 ⓐ) **숫자 전용 거부를 물리 행에도 건다.** 위의 이른 거부는
+    //   `tail`(블록 전량)만 봤다 — 그래서 `❯ 2` 아래에 평범한 한 줄이 이어지기만 하면 블록이 2자를
+    //   넘겨 거부가 통째로 사라졌다(물리 행은 여전히 `2` 뿐인데도). 그 프레임에 본문 + Return 이
+    //   나가면 커서는 부분 렌더된 선택기 위다(판정자 반례 ⓐ · 좌석 사망 계급).
+    //   면제는 부분 라벨 규칙과 **같은 완결 증거**를 쓴다(같은 사실에 두 벌의 예외를 두지 않는다).
+    //   재는 것은 **원본 행**(`row`)이다(번호를 벗긴 `row_body` 가 아니다 — codex 설계 검토):
+    //   `❯ 12` 는 숫자 두 자리로 잡히고, `❯ 2.` 는 번호를 벗기면 남는 것이 없어 잡히며,
+    //   `❯ 1.5` 는 번호 파서가 소수를 벗기지 않으므로 이 규칙에 걸리지 않는다(기존 경계 보존).
+    if !completed
+        && !row.is_empty()
+        && (row_body.is_empty() || (row.len() <= 2 && row.iter().all(|c| c.is_ascii_digit())))
+    {
+        return Some(("clipped-choice-row", end));
+    }
+    // 완전 라벨은 **꼬리 전량과 같을 때만** 센다(뒤에 다른 글자가 이어지면 아니다). `starts_with`
+    // 로 넓히면 좁은 pane 에서 접힌 **확인 에코**(`❯ Yes, I trust this fol⏎der ✔⏎Welcome back`)의
+    // 꼬리가 라벨로 시작해 통과 후 화면이 관문으로 오탐된다 — 2026-07-29 킬체인의 역방향 회귀다
+    // (codex R5 반례). 종료 라벨의 '커서가 종료 위' 축(ⓐ)은 종전대로 접두로 본다(용도가 다르다).
+    // ★(0.14.31 · triage R1-WP1-HF · C-B1) 이 검사는 잘림 규칙보다 **먼저** 돈다. 종전에는 라벨마다
+    //   [잘림 → 전량일치] 순으로 돌았고, 접두 기반 `completed` 가 전량일치를 함께 면제해 주었기
+    //   때문에 순서가 드러나지 않았다. 면제를 확인 마크로 좁힌 지금은 순서가 판정을 가른다 —
+    //   `❯ No, exi⏎  t`(접힌 종료 **전문**)의 행은 다른 라벨의 진부분접두이기도 하므로, 잘림이
+    //   먼저 돌면 종료 전문이 `clipped-choice-row` 로 접혀 `cursor-on-choice-label` 축이 사라진다
+    //   (핀 `r5_clipped_choices_do_not_widen_cursor_on_exit`). 두 규칙 다 보류이므로 안전 방향은
+    //   같고, 갈리는 것은 **어느 사실을 기록하는가**다 — 완결이 관측됐으면 그것을 기록한다.
+    for label in MODAL_CHOICE_LABELS {
         let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
-        !lf.is_empty() && body.len() >= lf.len() && body[..lf.len()] == lf[..]
-    });
+        if !lf.is_empty() && *body == lf[..] {
+            return Some(("cursor-on-choice-label", label_flat + lf.len()));
+        }
+    }
     for label in MODAL_CHOICE_LABELS {
         let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
         if lf.is_empty() {
@@ -925,13 +995,6 @@ fn clipped_choice_cursor(
         if !completed && !row_body.is_empty() && row_body.len() < lf.len() && *row_body == lf[..row_body.len()]
         {
             return Some(("clipped-choice-row", end));
-        }
-        // 완전 라벨은 **꼬리 전량과 같을 때만** 센다(뒤에 다른 글자가 이어지면 아니다). `starts_with`
-        // 로 넓히면 좁은 pane 에서 접힌 **확인 에코**(`❯ Yes, I trust this fol⏎der ✔⏎Welcome back`)의
-        // 꼬리가 라벨로 시작해 통과 후 화면이 관문으로 오탐된다 — 2026-07-29 킬체인의 역방향 회귀다
-        // (codex R5 반례). 종료 라벨의 '커서가 종료 위' 축(ⓐ)은 종전대로 접두로 본다(용도가 다르다).
-        if *body == lf[..] {
-            return Some(("cursor-on-choice-label", label_flat + lf.len()));
         }
     }
     None
@@ -2482,8 +2545,6 @@ mod tests {
             ("whitespace-to-end", "❯ \n \t\r\n"),
             ("confirmation-echo", echo.as_str()),
             ("wrapped-confirmation-echo", wrapped_echo.as_str()),
-            ("numeric-shell-history", "❯ 2\ncommand completed\n❯ "),
-            ("numeric-history-without-prompt", "❯ 2\ncommand completed"),
             ("decimal-history", "❯ 1.5 hours later"),
             ("shell-list", "❯ ls -al"),
             ("shell-launch", "❯ claude --dangerously-skip-permissions"),
@@ -2491,6 +2552,40 @@ mod tests {
         ]) {
             for (render, candidate) in [("raw", screen.to_owned()), ("crlf", crlf(screen))] {
                 assert_eq!(modal_signature(&candidate), None, "{name}/{render}: 정상 화면을 모달로 오탐: {candidate:?}");
+            }
+        }
+        // ★(0.14.31 · triage R1-WP1-HF · C-B1 · **의도적 재핀** · 오너 위임 승인 2026-09-06)
+        //   `❯ <숫자 1~2자>` 행 **아래에 무엇이 이어지든** 보류다. 종전 두 검체
+        //   (`numeric-shell-history` = `❯ 2⏎command completed⏎❯ ` · `numeric-history-without-prompt`)
+        //   는 여기 가용성 목록에 있었다 — "렌더가 그 자리에서 멎었다" 를 *뒤에 아무것도 없음*으로
+        //   증명했기 때문이다. 그 증명이 틀렸다(독립 판정 C-B1 blocking): 부분 재도색은 잘린 선택 행
+        //   아래에 **직전 프레임의 잔여 셀**을 남기고, 그러면 숫자 전용 거부가 통째로 취소돼
+        //   `❯ 2`(= `2. No, exit` 의 잘린 렌더) 위에서 서명 0 · `judge=Ready` 가 되고 본문 + Return
+        //   이 종료 선택지를 누른다(좌석 사망 · 2026-08-23 킬체인의 형태).
+        //   두 관측(셸 이력 / 잘린 선택기)은 화면 문자열로 갈리지 않으므로 **한쪽으로 정해야 하고**,
+        //   정본 §3-3 이 정한 방향은 보류다(오탐의 귀결 = 주입 0 · 키 0 · 큐 보존 · 사람 안내).
+        //   가용성 대가는 정직하게 적는다: 커서 행이 **정확히 1~2자리 숫자**인 화면(셸에서 `2` 를
+        //   친 이력 · composer 에 숫자만 남은 프레임)은 이제 관문 보류로 접힌다. `❯ 1.5`(소수) ·
+        //   `❯ 123`(3자리) · `❯ 2commandcompleted`(한 행에 이어짐)는 종전대로 통과한다 — 아래 대조군.
+        for (name, screen) in [
+            ("numeric-shell-history", "❯ 2\ncommand completed\n❯ "),
+            ("numeric-history-without-prompt", "❯ 2\ncommand completed"),
+            ("numeric-two-digit-row", "❯ 12\n잔여 셀 한 줄"),
+        ] {
+            for (render, candidate) in [("raw", screen.to_owned()), ("crlf", crlf(screen))] {
+                let sig = modal_signature(&candidate)
+                    .unwrap_or_else(|| panic!("{name}/{render}: 숫자 전용 커서 행의 거부가 꼬리 한 줄에 취소됐다: {candidate:?}"));
+                assert!(sig.kinds.contains(&"clipped-choice-row"), "{name}/{render}: {:?}", sig.kinds);
+            }
+        }
+        // 음성 대조 — 재핀이 **숫자 전용 행**에서 멈추는지(이 축이 넓어지면 여기서 적색이 된다).
+        for (name, screen) in [
+            ("three-digit-row", "❯ 123\ncommand completed"),
+            ("decimal-row", "❯ 1.5\ncommand completed"),
+            ("digit-then-text-same-row", "❯ 2 command completed\n다음 줄"),
+        ] {
+            for (render, candidate) in [("raw", screen.to_owned()), ("crlf", crlf(screen))] {
+                assert_eq!(modal_signature(&candidate), None, "{name}/{render}: 재핀이 숫자 전용 행 밖으로 넓어졌다: {candidate:?}");
             }
         }
     }
@@ -2838,6 +2933,76 @@ mod tests {
             !composer_edit_region_empty(codex_idle, "›", None),
             "플레이스홀더 선언 없이 열리면 이 축은 어떤 문면이든 통과시킨다"
         );
+    }
+
+    /// ★(triage R1-WP1-HF · codex blocking B1) **꼬리 한 줄이 잘린 선택기 거부를 여전히 취소한다.**
+    ///
+    /// 두 반례 모두 `clipped_choice_cursor` 가 **블록 전체**(`tail`)를 판정 재료로 쓰는 데서 온다:
+    ///   ⓐ 숫자만 남은 꼬리 규칙(`tail.len() <= 2`)이 블록에만 걸려 있어, `❯ 2` 아래 평범한 한 줄이
+    ///      이어지면 블록이 2자를 넘겨 거부가 사라진다(물리 행은 여전히 `2` 뿐이다).
+    ///   ⓑ 완결 증거(`completed`)가 **접두 일치**라, 잘린 `❯ Yes, I` 뒤에 우연히 다른 라벨을 완성하는
+    ///      문면(`acceptance …` → `Yes,Iaccept…`)이 오면 확인 에코로 오인돼 면제가 선다. 화면의 실제
+    ///      선택기는 `Yes, I trust this folder` 의 잘린 렌더인데도 서명이 0 이 된다.
+    /// 둘 다 모달 서명이 서지 않으므로 `judge` 가 Ready 를 내고 본문 + Return 이 선택기로 나간다.
+    #[test]
+    fn triage_r1wp1hf_trailing_rows_defeat_numeric_row_and_prefix_completion() {
+        let gates = first_run_gates::builtin();
+        let trust = MODAL_CHOICE_LABELS[0]; // "Yes, I trust this folder"
+        let accept = MODAL_CHOICE_LABELS[1]; // "Yes, I accept"
+        // 잘린 렌더: 두 라벨의 **공통 접두**까지만 그려졌다(어느 쪽인지 화면으로는 모른다).
+        let shared: String = trust
+            .chars()
+            .zip(accept.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a)
+            .collect();
+        assert!(
+            !shared.trim().is_empty() && shared.chars().count() < accept.chars().count(),
+            "검체 전제: 두 라벨의 공통 접두가 비지 않고 짧은 라벨보다 짧다"
+        );
+        // 꼬리가 **짧은 라벨을 완성**한다(그러나 그 꼬리는 이 선택기의 라벨이 아니라 다음 줄 문면이다).
+        let completing: String = accept.chars().skip(shared.chars().count()).collect();
+        let cases = [
+            ("숫자 행 + 평문 꼬리", format!("❯ 2\n  이어지는 출력 한 줄\n")),
+            (
+                "공통 접두 + 다른 라벨을 완성하는 꼬리",
+                format!("❯ {shared}\n{completing}ance tests pending\n"),
+            ),
+        ];
+        let mut missed: Vec<String> = Vec::new();
+        for (name, base) in &cases {
+            for (render, screen) in [("raw", base.clone()), ("crlf", crlf(base))] {
+                assert!(
+                    first_run_gates::identify(&gates, &screen).is_none(),
+                    "{name}/{render}: 전제 붕괴 — 코퍼스가 식별하면 미등재 모달 축을 재지 못한다"
+                );
+                let Some(sig) = modal_signature(&screen) else {
+                    // 판정까지 함께 남긴다 — 서명 0 의 **귀결**이 Ready(주입 허가)임을 같은 줄에서 본다.
+                    missed.push(format!(
+                        "{name}/{render}: 서명 0 · judge={:?} — 꼬리 한 줄에 잘린 선택기 거부가 \
+                         취소됐다({screen:?})",
+                        judge(&boot_all_open(&screen, &gates))
+                    ));
+                    continue;
+                };
+                assert!(
+                    sig.kinds.contains(&"clipped-choice-row"),
+                    "{name}/{render}: 다른 규칙이 잡았다(계측 무효): {:?}",
+                    sig.kinds
+                );
+                assert!(
+                    held_as(&judge(&boot_all_open(&screen, &gates)), MODAL_UNKNOWN_ID),
+                    "{name}/{render}: 부트 판정이 보류가 아니다 — 본문 + Return 이 선택기로 나간다"
+                );
+            }
+        }
+        assert!(missed.is_empty(), "잘린 선택기 거부가 취소된 프레임 {}건:\n{}", missed.len(), missed.join("\n"));
+        // 가용성 대조(이 검체가 조이는 방향만 재는지) — 꼬리가 **같은 블록 안에서 접힌 실제 에코**면
+        // 종전대로 모달이 아니다.
+        let head: String = trust.chars().take(trust.chars().count() - 3).collect();
+        let rest: String = trust.chars().skip(trust.chars().count() - 3).collect();
+        let echo = format!("❯ {head}\n{rest} ✔\n");
+        assert_eq!(modal_signature(&echo), None, "접힌 확인 에코가 관문으로 오탐됐다: {echo:?}");
     }
 
     #[test]
