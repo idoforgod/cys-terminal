@@ -478,6 +478,41 @@ _GATE_PENDING_PRESCRIPTION = (
     "하지 마라** — 재부트가 스폰 없이 그 좌석을 채택한다."
 )
 
+# ★(0.14.31 · 리뷰 R5 · codex minor) **사유별 처방** — 생산자(`cys.rs`)가 typed outcome 에 싣는
+#   구조화 사유(`gate_reason`)로 고른다. 종전엔 outcome=gate_pending **전건**에 위 문안(관문을
+#   1회 통과시켜라)이 나갔고, 그래서 "관문은 이미 통과했는데 표식만 못 읽은" 좌석에도 사람이
+#   이미 통과한 관문을 다시 통과시키라는 지시가 갔다(생산자가 R4 에서 고친 모순의 하류 절반).
+#   ★문안을 파싱하지 않는다 — 필드만 본다. 필드가 없으면(구 CLI) 종전 문안으로 폴백한다.
+GATE_REASON_ADOPT_UNREAD = "adopt-list-unread"
+GATE_REASON_RECHECK_UNOBSERVED = "recheck-unobserved"
+_GATE_REASON_PRESCRIPTION = {
+    GATE_REASON_ADOPT_UNREAD: (
+        "→ 그 좌석의 첫기동 관문은 **이미 통과**했다 — 데몬이 표식(`surface.list`)을 돌려주지 "
+        "못해 채택만 미뤄졌다. **사람 조치 없음**: 데몬 응답이 회복되면 다음 부트가 스폰 없이 "
+        "같은 좌석을 채택한다(복원 연속 지시는 표식에 그대로 있다). 회수·재기동·kill 은 하지 마라."
+    ),
+    GATE_REASON_RECHECK_UNOBSERVED: (
+        "→ 관문이 아직 떠 있는지 **관측하지 못했다**(화면 읽기 실패). 먼저 `cys read-screen "
+        "--surface <ref>` 로 화면을 1회 확인하라 — 관문이 있으면 통과시키고(★면책 창의 기본 "
+        "포커스는 `No, exit` 이므로 아래 방향키 1회 뒤 Return), 없으면 재부트가 스폰 없이 그 "
+        "좌석을 채택한다. 좌석과 프로세스는 살아 있으므로 회수·재기동·kill 은 하지 마라."
+    ),
+}
+
+
+def _gate_pending_prescriptions(gated):
+    """보류 역할 목록 → **사유별 처방 문장들**(등장 순 · 중복 제거).
+
+    ★왜 역할별인가: 한 부트에 '진짜 관문 상주' 와 '채택 미룸' 이 섞일 수 있고, 그때 한 문장만
+      내면 둘 중 하나는 반드시 거짓 지시가 된다. 구 CLI(필드 없음)는 종전 문안 하나로 접힌다."""
+    out = []
+    for r in gated:
+        reason = r.get("gate_reason") if isinstance(r, dict) else None
+        line = _GATE_REASON_PRESCRIPTION.get(reason, _GATE_PENDING_PRESCRIPTION)
+        if line not in out:
+            out.append(line)
+    return out or [_GATE_PENDING_PRESCRIPTION]
+
 # claim 출력이 **정당거부**임을 확정하는 마커(데몬 문구 — hooks/session-start.sh 의 self-demote
 # 대조 지점과 동일 어휘. 종전 주석은 `session-start.sh:101` 을 가리켰으나 실제 대조는 그 아래
 # `$CLAIM_OUT` grep 이다 — 낡은 라인 참조를 지운다).
@@ -2339,9 +2374,16 @@ def _boot_gate_pending_verdict(code, out):
     who = ", ".join("%s=%s%s" % (r.get("role"), r.get("outcome"),
                                  (" [" + r["reason"] + "]") if r.get("reason") else "")
                     for r in gated) or "(--json 소비 불가 — exit %s 로 판정)" % code
-    return ("의무 역할 첫기동 관문 보류(exit %s): %s\n"
+    # ★(리뷰 R5 · codex minor) 처방은 **역할별 구조화 사유**를 따라간다(문안 파싱 0 · 구 CLI 폴백 유지).
+    #   `human_action_required` 가 전부 False 면 사람에게 시킬 것이 없다는 사실 자체를 머리줄에 적는다.
+    presc = "\n  ".join(_gate_pending_prescriptions(gated))
+    acts = [r.get("human_action_required") for r in gated if isinstance(r, dict)]
+    no_action = bool(acts) and all(a is False for a in acts)
+    head = ("의무 역할 첫기동 관문 보류(exit %s)%s: %s" %
+            (code, " · **사람 조치 없음**(전건 채택 미룸·관측 실패)" if no_action else "", who))
+    return ("%s\n"
             "  ★좌석과 에이전트 프로세스는 **살아 있다** — 실패가 아니므로 회수·파괴하지 않는다.\n"
-            "  %s\n%s" % (code, who, _GATE_PENDING_PRESCRIPTION, out))
+            "  %s\n%s" % (head, presc, out))
 
 
 def _fatal_detail(bad, out):

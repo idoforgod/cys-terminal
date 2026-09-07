@@ -4680,21 +4680,47 @@ pub(crate) struct PromptObs {
     pub(crate) selector_row: bool,
     /// 커서행 ±[`PROMPT_BUSY_ROWS`] 행에 작업 중 어휘([`PROMPT_BUSY_TOKENS`])가 있다.
     pub(crate) busy_near_cursor: bool,
-    /// 스냅샷 시점의 출력 세대(`Surface::output_gen`).
+    /// 스냅샷 시점의 출력 세대(`Surface::output_gen`) — 스냅샷 **앞**에서 읽은 값.
     pub(crate) output_gen: u64,
+    /// 스냅샷·quiet 표본을 **뜬 뒤** 다시 읽은 출력 세대. `output_gen` 과 다르면 그 사이에 청크가
+    /// 흘렀다는 뜻이고, 이 관측은 한 프레임의 사실이 아니다.
+    pub(crate) output_gen_after: u64,
+    /// ★(0.14.31 · 리뷰 R5 · codex major) 이 관측과 **한 몸**인 출력 정적 초. 종전에는 호출부가
+    /// 화면 관측 **앞**에서 따로 표본을 떠서, "5초 조용했다" 와 "지금 이 화면" 이 다른 시각의
+    /// 사실이 될 수 있었다(새 청크가 그 사이에 도착하면 낡은 quiet 가 새 프레임과 짝지어진다).
+    pub(crate) quiet_secs: u64,
+    /// 스냅샷 시점의 대체화면 여부 — 화면과 **같은 관측**에서 읽는다(종전에는 판정 조립부가 따로
+    /// 읽어, alt-screen 시절 화면을 비-alt 분기로 고르는 합성이 가능했다 · codex R5).
+    pub(crate) alt_screen: bool,
+}
+
+impl PromptObs {
+    /// 이 프레임이 **발행 완료**인가(세대 짝수). 홀수 = reader 가 청크를 반영하는 중이다.
+    pub(crate) fn frame_published(&self) -> bool {
+        self.output_gen % 2 == 0
+    }
+    /// 화면·quiet·세대가 **한 관측**인가 — 발행 완료 ∧ 관측 창 동안 세대 불변.
+    /// (`handlers::quiet_secs_consistent` 와 같은 규칙 · 판정 분리 금지.)
+    pub(crate) fn frame_consistent(&self) -> bool {
+        self.frame_published() && self.output_gen == self.output_gen_after
+    }
 }
 
 fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
-    let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
-    // 세대는 파서 락 안에서 읽는다 — reader 는 같은 락 안에서 청크를 반영하고 락 밖에서 세대를
-    // 짝수로 닫으므로, 여기서 읽은 홀수 세대는 "반영 중" 이고 배달 직전 재확인에서 반드시 어긋난다.
+    // ★(0.14.31 · 리뷰 R5 · codex major) 세대는 파서 락 **밖·앞**에서 읽는다. 락 안에서 읽으면
+    //   "락을 기다리는 동안 reader 가 새 청크를 반영했다" 는 창이 관측에 흡수돼 보이지 않는다 —
+    //   밖에서 읽으면 그 변화까지 세대 불일치로 **거부**되므로 엄밀히 더 보수적이다. 발행 중(홀수)도
+    //   여기서 그대로 드러난다. quiet 표본·대체화면도 이 창 안에서 함께 뜬다(한 관측 · 합성 금지).
     let output_gen = s.output_gen.load(Ordering::Acquire);
+    let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
     let screen = p.screen();
     let (rows, cols) = screen.size();
     let (cr, cc) = screen.cursor_position();
     let contents = screen.contents();
     let marker_seen = contents.contains(marker);
     if cr >= rows {
+        drop(p);
+        let (quiet_secs, alt_screen, output_gen_after) = observe_tail(s);
         return PromptObs {
             marker_seen,
             line: None,
@@ -4702,6 +4728,9 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
             selector_row: false,
             busy_near_cursor: false,
             output_gen,
+            output_gen_after,
+            quiet_secs,
+            alt_screen,
         };
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
@@ -4725,6 +4754,8 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
     let hi = (cr + PROMPT_BUSY_ROWS).min(rows.saturating_sub(1));
     let near = screen.contents_between(lo, 0, hi, cols).to_lowercase();
     let busy_near_cursor = PROMPT_BUSY_TOKENS.iter().any(|t| near.contains(t));
+    drop(p);
+    let (quiet_secs, alt_screen, output_gen_after) = observe_tail(s);
     PromptObs {
         marker_seen,
         line,
@@ -4732,7 +4763,24 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
         selector_row,
         busy_near_cursor,
         output_gen,
+        output_gen_after,
+        quiet_secs,
+        alt_screen,
     }
+}
+
+/// 화면 스냅샷과 **같은 관측 창**의 꼬리 — (출력 정적 초, 대체화면, 후행 출력 세대).
+/// 파서 락을 놓은 **직후** 부른다(호출 규약). `handlers::quiet_secs_consistent` 와 같은 형태이며,
+/// 여기서는 0.0 으로 접지 않고 세대를 그대로 돌려준다 — 판정부가 사유를 갈라 라벨링하기 때문이다.
+fn observe_tail(s: &Arc<crate::state::Surface>) -> (u64, bool, u64) {
+    let quiet = s
+        .last_output
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .elapsed()
+        .as_secs();
+    let alt = s.alt_screen.load(Ordering::Relaxed);
+    (quiet, alt, s.output_gen.load(Ordering::Acquire))
 }
 
 /// ★(0.14.31 · WP-5 · CONTRACTS B-1) 프롬프트 게이트 **순수 판정자** — 틱 배달(`deliver_queued`)과
@@ -4762,6 +4810,11 @@ pub(crate) struct PromptGateInput {
     pub(crate) layout_ok: bool,
     pub(crate) quiet_for: u64,
     pub(crate) quiet: u64,
+    /// ★(0.14.31 · 리뷰 R5 · codex major) 이 판정이 본 프레임이 **발행 완료**인가(세대 짝수).
+    /// 거짓이면 reader 가 청크를 반영하는 **도중**의 화면이다 — 어느 경로에서도 판정 재료가 아니다.
+    pub(crate) frame_published: bool,
+    /// 화면·quiet·세대가 **한 관측**인가. 정적(quiet) 기반 판정만 이것을 요구한다(아래 doc).
+    pub(crate) frame_consistent: bool,
 }
 
 /// 프롬프트 게이트 결과 — 통과 또는 (사유 라벨) 보류. 라벨은 `queue.list blocked_by` 어휘다.
@@ -4781,6 +4834,13 @@ pub(crate) const BLOCKED_ALT_SCREEN: &str = "alt_screen(전체화면 · 프롬�
 pub(crate) const BLOCKED_INTERVAL: &str = "delivery_interval(배달 최소 간격)";
 
 pub(crate) fn prompt_gate_verdict(i: &PromptGateInput) -> PromptGate {
+    // ★(0.14.31 · 리뷰 R5 · codex major) **발행 중 프레임은 어느 경로에서도 판정 재료가 아니다.**
+    //   reader 는 [세대 홀수 → `last_output` 스탬프 → 파서 반영 → 세대 짝수] 순으로 돈다 — 홀수는
+    //   "이 화면에 아직 안 들어온 바이트가 이미 도착해 있다" 는 뜻이다. 이 축은 관측 창(수십 µs)의
+    //   무결성만 요구하므로 연속 출력 노드의 기아(#1)를 되살리지 않는다.
+    if !i.frame_published {
+        return PromptGate::Blocked(BLOCKED_BUSY);
+    }
     if i.approval_pending {
         return PromptGate::Blocked(BLOCKED_APPROVAL);
     }
@@ -4813,6 +4873,12 @@ pub(crate) fn prompt_gate_verdict(i: &PromptGateInput) -> PromptGate {
     if !i.layout_ok {
         return PromptGate::Blocked(BLOCKED_ALT_SCREEN);
     }
+    // ★(리뷰 R5 · codex major) alt-screen 통과는 **정적 기반**이다 — "조용하다" 와 "이 화면" 이 같은
+    //   관측이어야 한다. 종전에는 quiet 표본을 화면보다 **앞**에서 떠서, 그 사이 도착한 청크가 낡은
+    //   quiet 를 새 프레임에 짝지을 수 있었다(그 반대도 성립). 관측 창에서 세대가 바뀌었으면 보류다.
+    if !i.frame_consistent {
+        return PromptGate::Blocked(BLOCKED_BUSY);
+    }
     if i.quiet_for < i.quiet {
         return PromptGate::Blocked(BLOCKED_BUSY);
     }
@@ -4832,7 +4898,6 @@ fn prompt_gate_input(
     s: &Arc<crate::state::Surface>,
     marker: &str,
     obs: &PromptObs,
-    quiet_for: u64,
 ) -> PromptGateInput {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let input = input_line_state(
@@ -4842,7 +4907,8 @@ fn prompt_gate_input(
             at_or_after_cursor: a,
         }),
     );
-    let alt_screen = s.alt_screen.load(Ordering::Relaxed);
+    // ★(리뷰 R5) 화면과 **같은 관측**의 값이다(따로 읽지 않는다 — 합성 금지).
+    let alt_screen = obs.alt_screen;
     PromptGateInput {
         marker_seen: obs.marker_seen,
         input,
@@ -4852,8 +4918,10 @@ fn prompt_gate_input(
         selector_row: obs.selector_row,
         busy_near_cursor: obs.busy_near_cursor,
         layout_ok: alt_screen && cys::readiness::waiting_prompt_layout(&obs.screen, marker),
-        quiet_for,
+        quiet_for: obs.quiet_secs,
         quiet: queue_quiet_secs(),
+        frame_published: obs.frame_published(),
+        frame_consistent: obs.frame_consistent(),
     }
 }
 
@@ -5181,8 +5249,12 @@ pub(crate) fn deliver_head_locked(
             }
         }
         if let Some(gen) = expect_output_gen {
-            if s.output_gen.load(Ordering::Acquire) != gen {
-                break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력) — 정적 판정 무효
+            let now_gen = s.output_gen.load(Ordering::Acquire);
+            // ★(0.14.31 · 리뷰 R5 · codex major) **홀수도 거부**한다. 동일 비교만으로는 "판정도
+            //   인계도 발행 **중**(홀수)이라 값만 같다" 를 통과시킨다 — 그때 화면에는 아직 반영되지
+            //   않은 바이트가 이미 도착해 있다(`handlers::quiet_secs_consistent` 와 같은 규칙).
+            if now_gen % 2 == 1 || now_gen != gen {
+                break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력·발행 중) — 정적 판정 무효
             }
         }
         if min_interval > 0 {
@@ -5199,8 +5271,13 @@ pub(crate) fn deliver_head_locked(
             break 'tx None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
         if crate::state::queue_entry_expired(&entry, now, default_ttl) {
-            // ★(0.14.31 · WP-5 M · §8) 만료 머리는 배달하지 않는다 — 활성 큐에서 빼 만료 큐로.
-            let mut e = q.pop_front().expect("front checked");
+            // ★(0.14.31 · WP-5 M · §8) 만료 머리는 배달하지 않는다 — 만료 큐로 옮긴다.
+            // ★(리뷰 R5 · codex major) **복사 먼저 · 제거 나중**: 종전엔 여기서 `pop_front` 한 뒤
+            //   락 밖에서 만료 큐에 넣었다 — 그 사이에 `persist_queue_state` 가 스냅샷을 뜨면 항목이
+            //   **두 큐 어디에도 없는** 상태가 파일에 박히고, 그 직후 크래시는 그것을 지운다.
+            //   지금은 만료 큐가 그것을 **가진 뒤에** 활성 큐에서 뺀다(중간 스냅샷은 중복 · 유실 0 ·
+            //   읽는 쪽 dedup 은 활성 우선 + 복원 시점 TTL 재분류가 처리한다).
+            let mut e = entry.clone();
             e.expired_at = Some(now);
             expired_head = Some(e);
             break 'tx None;
@@ -5314,7 +5391,15 @@ pub(crate) fn deliver_head_locked(
         Some(Delivered { entry, remaining: q.len(), merged_ids, body })
     };
     if let Some(e) = expired_head {
+        let moved_id = e.id.clone();
         expire_entries(daemon, s, vec![e], now, default_ttl);
+        // 만료 큐가 가진 **뒤에** 활성 큐에서 뺀다(머리가 그대로일 때만 — 그 사이 경합이면 다음 틱).
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            if q.front().is_some_and(|f| f.id == moved_id) {
+                q.pop_front();
+            }
+        }
         daemon.persist_queue_state();
         return None;
     }
@@ -5518,20 +5603,27 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
                 }
                 changed |= !q.is_empty();
             }
-            q.retain(|e| {
+            // ★(리뷰 R5 · codex major) **복사 먼저** — 여기서는 지우지 않는다(아래 참조).
+            for e in q.iter() {
                 if crate::state::queue_entry_expired(e, now, default_ttl) {
                     let mut x = e.clone();
                     x.expired_at = Some(now);
                     newly.push(x);
-                    false
-                } else {
-                    true
                 }
-            });
+            }
         }
         if !newly.is_empty() {
             changed = true;
-            expire_entries(daemon, s, newly, now, default_ttl);
+            // ★(리뷰 R5 · codex major) 이동의 **논리 원자성**: 종전 순서(활성에서 제거 → 락 해제 →
+            //   만료 큐 삽입)에는 항목이 **두 큐 어디에도 없는** 창이 있었고, 그 창에 뜬
+            //   `persist_queue_state` 스냅샷 + 크래시는 항목을 지운다(파일 순서를 고쳐도 남는 구멍).
+            //   지금은 만료 큐가 먼저 갖고, 그 **뒤에** 활성 큐에서 뺀다 — 중간 스냅샷은 중복(복구
+            //   가능)이지 유실이 아니다. 두 락을 동시에 쥐지 않으므로 락 순서 계약도 그대로다.
+            expire_entries(daemon, s, newly.clone(), now, default_ttl);
+            let moved: std::collections::HashSet<&str> =
+                newly.iter().map(|e| e.id.as_str()).collect();
+            let mut q = s.pending_queue.lock().unwrap();
+            q.retain(|e| !moved.contains(e.id.as_str()));
         }
         // ③ 통지 — 만료 큐의 미통지 항목.
         let role = s.role.lock().unwrap().clone();
@@ -6033,12 +6125,12 @@ pub(crate) fn force_deliver_entry(
         }
     }
     // 게이트 ⑦ 프롬프트 게이트 — 틱 배달과 같은 판정(마커 좌석) / 안전 게이트 + quiet 하한(그 외).
-    let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
     let adapters = load_adapter_defs();
     let (expect_pending, expect_gen) = match surface_prompt_marker(s, &adapters) {
         Some(marker) => {
+            // ★(리뷰 R5) 틱과 **같은 관측 규약** — quiet 는 화면과 한 창에서 뜬다.
             let obs = observe_prompt(s, &marker);
-            let input = prompt_gate_input(daemon, s, &marker, &obs, quiet_for);
+            let input = prompt_gate_input(daemon, s, &marker, &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 return Err(ForceDeliverDenied::PromptGate(why));
             }
@@ -6052,7 +6144,15 @@ pub(crate) fn force_deliver_entry(
             }
             // [성찰 BLOCKER] forced 에도 overdue_quiet(기본 1s·하한 1s) — '출력 중 주입 금지'
             // 의미론은 운영자 강제로도 불변이다(queue_quiet_verdict 의 overdue 하한과 동일 값).
+            // ★(리뷰 R5) 틱과 같은 한 관측(세대 → quiet → 세대)으로 잰다.
             let need = queue_overdue_quiet_secs().max(1);
+            let gen0 = s.output_gen.load(Ordering::Acquire);
+            let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
+            if gen0 % 2 == 1 || s.output_gen.load(Ordering::Acquire) != gen0 {
+                // 관측 창에 출력이 흘렀다 = 그 quiet 는 이 프레임의 사실이 아니다. 사유는 '출력 중'
+                // 이고 실측치는 **0 이 아니라 모른다** 이므로 0 으로 보고한다(하한 미달과 같은 취급).
+                return Err(ForceDeliverDenied::OutputBusy { quiet_for: 0, need });
+            }
             if quiet_for < need {
                 return Err(ForceDeliverDenied::OutputBusy { quiet_for, need });
             }
@@ -6230,21 +6330,21 @@ fn deliver_queued(
             let defs = adapters.get_or_insert_with(load_adapter_defs);
             surface_prompt_marker(&s, defs)
         };
-        let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
         // ★R1-blocking-2: 준비 판정이 **본** 입력줄 점유량. 배달 직전 임계영역에서 이 값이
         //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
         //   마커 없는 quiet 폴백 경로도 같은 값을 쓴다(그 경로도 같은 writer 로 들어간다).
         let pending_at_verdict = s.pending_input_bytes.load(Ordering::Relaxed);
         let (overdue, expect_gen) = if let Some(marker) = marker.as_deref() {
+            // ★(리뷰 R5 · codex major) quiet 표본은 관측 **안**에서 뜬다(종전엔 관측 앞에서 따로 떴다).
             let obs = observe_prompt(&s, marker);
             // ★(0.14.31 · B-2②) input_pending 고착 수리 — 화면은 빈 프롬프트·정적·모달 없음인데
             //   데몬 계수만 >0 인 상태가 **같은 세대**로 quiet 임계 이상 지속되면 stale 로 리셋.
             //   리셋 틱에는 배달하지 않는다(다음 틱이 다시 관측한다).
-            if maybe_reset_stale_pending_input(daemon, &s, &obs, quiet_for, quiet) {
+            if maybe_reset_stale_pending_input(daemon, &s, &obs, quiet) {
                 block(BLOCKED_INPUT_PENDING);
                 continue;
             }
-            let input = prompt_gate_input(daemon, &s, marker, &obs, quiet_for);
+            let input = prompt_gate_input(daemon, &s, marker, &obs);
             match prompt_gate_verdict(&input) {
                 PromptGate::Blocked(why) => {
                     // 사유를 갈라 기록한다 — 손잡이가 다르다(입력줄 점유는 사람이 비워야 풀리고,
@@ -6262,7 +6362,14 @@ fn deliver_queued(
                 block(why);
                 continue;
             }
+            // ★(리뷰 R5 · codex major) 마커 없는 경로도 **정적(quiet) 기반**이다 — 세대·quiet 를 한
+            //   관측으로 묶는다(세대 → quiet → 세대). 홀수(발행 중)·변화는 배달하지 않는다.
             let gen = s.output_gen.load(Ordering::Acquire);
+            let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
+            if gen % 2 == 1 || s.output_gen.load(Ordering::Acquire) != gen {
+                block(BLOCKED_BUSY);
+                continue;
+            }
             match queue_quiet_verdict(head_wait, quiet_for, quiet, max_wait, overdue_quiet) {
                 QuietVerdict::WaitBusy => {
                     block(BLOCKED_BUSY);
@@ -6317,16 +6424,19 @@ fn maybe_reset_stale_pending_input(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     obs: &PromptObs,
-    quiet_for: u64,
     quiet: u64,
 ) -> bool {
+    let quiet_for = obs.quiet_secs;
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let gen = s.input_gen.load(Ordering::Acquire);
     let screen_empty = obs
         .line
         .as_ref()
         .is_some_and(|(before, _)| before.trim().is_empty());
+    // ★(0.14.31 · 리뷰 R5 · codex major) 관측이 **한 프레임의 사실**일 때만 모순으로 센다 —
+    //   발행 중이거나 관측 창에서 세대가 바뀐 화면은 "빈 입력줄" 의 근거가 되지 못한다.
     let contradiction = pending > 0
+        && obs.frame_consistent()
         && screen_empty
         && quiet_for >= quiet
         && !obs.selector_row
@@ -6354,7 +6464,11 @@ fn maybe_reset_stale_pending_input(
     drop(slot);
     {
         let _gate = s.input_gate.lock().unwrap();
-        if s.input_gen.load(Ordering::Acquire) != gen
+        // ★(리뷰 R5 · codex major) **상태 변경 시점에도** 관측의 유효성을 재확인한다 — 입력 세대·
+        //   바이트 수만 보면 "일관된 빈 화면을 본 뒤 reader 가 실제 초안·선택기를 그렸는데 입력
+        //   세대는 그대로" 인 인터리빙에서 낡은 관측으로 계수를 0 으로 만든다.
+        if s.output_gen.load(Ordering::Acquire) != obs.output_gen
+            || s.input_gen.load(Ordering::Acquire) != gen
             || s.pending_input_bytes.load(Ordering::Relaxed) != pending
         {
             return false;
@@ -9789,6 +9903,118 @@ mod tests {
         assert!(s.pending_queue.lock().unwrap().is_empty(), "다음 틱 재관측 후 배달");
     }
 
+    /// ★(0.14.31 · 리뷰 R5 · codex major) **화면·quiet·세대는 한 관측이다** — 인터리빙을 손으로 만들어
+    /// 잰다(정적 진리표 입력으로는 드러나지 않는 축이다 · codex R5).
+    ///
+    /// ⓐ 유휴 좌석의 관측은 일관되고 배달된다(가용성 대조군 — 축이 상시 닫히면 기아다).
+    /// ⓑ 관측 **직전** 세대가 홀수(reader 가 청크를 반영하는 중)면 어느 경로에서도 배달하지 않는다 —
+    ///    그 화면에는 이미 도착한 바이트가 아직 안 들어와 있다(codex 가 든 그 인터리빙).
+    /// ⓒ 판정과 인계 **사이**에 세대가 움직이면 정적(alt) 배달은 무효다.
+    #[test]
+    fn wp5_r5_frame_quiet_and_generation_are_one_observation() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("frame");
+        let (daemon, s) = wp5_seat("wp5-frame", "claude");
+        let e = daemon.next_queue_entry("[보고] 프레임".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        paint_claude_idle_alt(&s);
+        quiet_since(&s, 30);
+        // ⓐ 한 관측 — 발행 완료 ∧ 창 안에서 세대 불변 ∧ quiet 가 화면과 같은 시각의 사실이다.
+        let obs = super::observe_prompt(&s, "❯");
+        assert!(obs.frame_published(), "유휴 좌석의 프레임이 발행 중으로 읽힌다");
+        assert!(obs.frame_consistent(), "유휴 좌석의 관측이 불일치로 읽힌다(상시 기아)");
+        assert!(obs.quiet_secs >= 30, "quiet 표본이 관측 안에서 뜨지 않았다: {}", obs.quiet_secs);
+        assert!(obs.alt_screen, "대체화면도 같은 관측에서 읽어야 한다");
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 0, "일관된 유휴 관측에서 배달되지 않았다");
+        // ⓑ 발행 중(홀수) — reader 의 [홀수 → 스탬프 → 반영 → 짝수] 창 한가운데를 재현한다.
+        let e2 = daemon.next_queue_entry("[보고] 발행 중".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e2);
+        s.set_pending_input(0); // ⓐ 배달이 남긴 입력줄 회계 — 이 검체가 재는 축이 아니다
+        paint_claude_idle_alt(&s);
+        quiet_since(&s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None; // 배달 간격 게이트가 이 축을 가리지 않게
+        s.output_gen.fetch_add(1, AtomicOrdering::AcqRel); // 홀수 = 반영 중
+        let mid = super::observe_prompt(&s, "❯");
+        assert!(!mid.frame_published(), "홀수 세대가 발행 완료로 읽힌다");
+        assert!(!mid.frame_consistent());
+        tick(&daemon);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "발행 중 프레임으로 배달했다 — 화면에 없는 바이트가 이미 도착해 있다"
+        );
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY);
+        // 계측 타당성 — 세대를 짝수로 닫으면 **같은 화면**이 곧바로 배달된다(축이 영구히 닫히지 않는다).
+        s.output_gen.fetch_add(1, AtomicOrdering::AcqRel); // 짝수로 닫는다(발행 끝)
+        paint_claude_idle_alt(&s); // 앞선 배달의 PTY 에코가 화면을 바꿨을 수 있다(검체 재료 복원)
+        quiet_since(&s, 30);
+        s.set_pending_input(0);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        tick(&daemon);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            0,
+            "발행이 끝났는데도 배달되지 않는다(기아 — 축이 상시 닫혔다 · 사유={})",
+            blocked_reason(&s)
+        );
+        // ⓒ 판정 → (세대 이동) → 인계: 정적 경로의 인계 재확인이 그 사이 출력을 잡는다.
+        let gen = s.output_gen.load(AtomicOrdering::Acquire);
+        s.output_gen.fetch_add(2, AtomicOrdering::AcqRel); // 청크 하나가 완전히 흘렀다
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen)).is_none(),
+            "판정이 본 프레임이 아닌데 배달했다"
+        );
+        // 같은 값이어도 **홀수**면 거부한다(동일 비교만으로는 발행 중이 통과한다).
+        s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        let odd = s.output_gen.load(AtomicOrdering::Acquire);
+        assert_eq!(odd % 2, 1, "전제 붕괴: 홀수를 만들지 못했다");
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd)).is_none(),
+            "홀수 세대가 동일 비교만으로 통과했다"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R5 · codex major) **큐 이동의 논리 원자성** — 활성 큐에서 빼는 것이 만료 큐에
+    /// 넣는 것보다 **뒤**여야 한다. 종전 순서(제거 → 락 해제 → 삽입)에는 항목이 두 큐 어디에도 없는
+    /// 창이 있었고, 그 창에 뜬 `persist_queue_state` 스냅샷 + 크래시는 파일 순서를 고쳐도 그것을 지운다.
+    /// 배달 경로(`deliver_head_locked` 의 만료 머리)와 틱 스윕(`queue_expiry_pass`) 둘 다 잰다.
+    #[test]
+    fn wp5_r5_queue_move_copies_into_expired_before_removing_from_active() {
+        let src = include_str!("governance.rs");
+        let body = |head: &str| -> String {
+            let i = src.find(head).unwrap_or_else(|| panic!("{head} 이 사라졌다"));
+            let rest = &src[i..];
+            let end = rest.find("\n}\n").expect("함수 끝");
+            rest[..end].to_string()
+        };
+        // ① 틱 스윕: `expire_entries(` 호출이 활성 큐 `retain(` 보다 앞에 있어야 한다.
+        let pass = body("pub(crate) fn queue_expiry_pass(");
+        let insert = pass.find("expire_entries(daemon, s, newly.clone()").expect("만료 큐 삽입");
+        let remove = pass
+            .find("q.retain(|e| !moved.contains(")
+            .expect("활성 큐 제거(id 기준)");
+        assert!(insert < remove, "활성 큐에서 먼저 빼고 나중에 만료 큐에 넣는다(유실 창 재발)");
+        assert!(
+            !pass.contains("newly.push(x);\n                    false"),
+            "retain 안에서 제거까지 하던 종전 형태가 남아 있다"
+        );
+        // ② 배달 경로: 임계영역에서 `pop_front` 하지 않고 복제한다(만료 큐가 가진 뒤에 뺀다).
+        let deliver = body("pub(crate) fn deliver_head_locked(");
+        let clone_at = deliver
+            .find("let mut e = entry.clone();")
+            .expect("만료 머리를 복제하지 않는다");
+        let pop_at = deliver
+            .find("if q.front().is_some_and(|f| f.id == moved_id)")
+            .expect("만료 이동 뒤 활성 큐 제거가 없다");
+        assert!(clone_at < pop_at, "만료 머리를 만료 큐에 넣기 전에 활성 큐에서 뺀다");
+        assert!(
+            !deliver.contains("let mut e = q.pop_front().expect(\"front checked\");"),
+            "임계영역에서 곧바로 pop 하던 종전 형태가 남아 있다"
+        );
+    }
+
+
     /// TTL 스윕: 7h 전 항목은 만료 큐로, `queue.expired`(hint 계약) 발행, 발신 surface 큐에 통지 1줄
     /// (origin=queue-expired-notice · id 포함) — 두 번째 틱에 중복 통지 없음. 통지 항목은 만료돼도 재통지 없음.
     #[test]
@@ -10031,9 +10257,37 @@ mod tests {
             layout_ok: alt,
             quiet_for: 5,
             quiet: 3,
+            frame_published: true,
+            frame_consistent: true,
         };
         assert_eq!(prompt_gate_verdict(&base(true)), PromptGate::Ready);
         assert_eq!(prompt_gate_verdict(&base(false)), PromptGate::Ready);
+        // ★(0.14.31 · 리뷰 R5 · codex major) 프레임 축 — **발행 중(홀수)** 은 어느 경로에서도 배달하지
+        //   않고, **관측 창에서 세대가 바뀐** 화면은 정적(alt) 경로에서만 거부한다(비-alt 스트리밍
+        //   경로는 B1 계약대로 출력 중 주입을 허용한다 — 기아 #1 회귀 금지).
+        for alt in [true, false] {
+            let mut i = base(alt);
+            i.frame_published = false;
+            assert_eq!(
+                prompt_gate_verdict(&i),
+                PromptGate::Blocked(BLOCKED_BUSY),
+                "alt={alt}: 발행 중 프레임으로 배달 판정이 났다"
+            );
+        }
+        let mut i = base(true);
+        i.frame_consistent = false;
+        assert_eq!(
+            prompt_gate_verdict(&i),
+            PromptGate::Blocked(BLOCKED_BUSY),
+            "정적(alt) 판정이 화면과 다른 시각의 quiet 로 통과했다"
+        );
+        let mut i = base(false);
+        i.frame_consistent = false;
+        assert_eq!(
+            prompt_gate_verdict(&i),
+            PromptGate::Ready,
+            "비-alt 스트리밍 경로에 프레임 불변을 요구하면 연속 도구 실행 노드가 다시 기아가 된다"
+        );
         let mut i = base(true);
         i.quiet_for = 2;
         assert_eq!(prompt_gate_verdict(&i), PromptGate::Blocked(BLOCKED_BUSY));

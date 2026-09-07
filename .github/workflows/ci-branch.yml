@@ -124,12 +124,13 @@ jobs:
           ALLOWED = {
               "test_phoenix_": (
                   {"release"},
-                  "release 전용(`test_phoenix_*.py` 글롭 · 실측 13종 · 2026-07-29). "
+                  "release 전용(`test_phoenix_*.py` 글롭 · 실측 15종 · 2026-09-07 09:0x 계수 "
+                  "— 0.14.31 audit 브랜치가 fresh_honest·f1_production_path 2종을 더해 13→15). "
                   "**팩 배송과 무관해서가 아니다** — 대상 javis_phoenix.py 는 팩에 실려 나간다. "
                   "실제 이유는 하네스 의존이다: release.yml build 잡은 `cargo build --bin cys "
                   "--bin cysd` 로 실 데몬을 만들고 PHOENIX_HARNESS_CYSD 로 kill→재기동 host-level "
                   "e2e 를 돌린다. 팩-only 레인은 manifest emit 용 `cys` 만 빌드해 cysd 가 없고, "
-                  "ci-branch 는 그 예산(수 분)을 안 쓴다. 13종 중 cysd 를 실제로 요구하는 것은 3종"
+                  "ci-branch 는 그 예산(수 분)을 안 쓴다. 15종 중 cysd 를 실제로 요구하는 것은 3종"
                   "(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 나머지는 원리상 이식 "
                   "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
                   "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다.",

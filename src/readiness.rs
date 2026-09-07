@@ -758,6 +758,83 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> 
             .any(|r| !starts_here(r) && cursor_row_competes(r, &f.flat, block))
 }
 
+/// ★(0.14.31 · 리뷰 R5 · codex blocking) **잘린/번호 없는 선택기 커서 행**인가 —
+/// 커서 뒤 꼬리(평탄화 · **화면 끝까지**)로 판정한다. `Some((규칙 라벨, flat 끝))` 이면 모달이다.
+///
+/// 【무엇이 열려 있었나(R4 잔여 blocking)】 R4 는 **확인(Return) 허가**만 좁혔다. 주입 허가
+/// ([`crate::inject_guard::decide_allowing`])와 부트 준비 판정([`judge`])은 그대로였고, 그래서
+/// 화면이 `❯ No, exi`(질문·번호·푸터 없음)뿐인 잘린 렌더에서 코퍼스 식별도 모달 서명도 서지 않아
+/// **Ready{MarkerDelta} → 디렉티브 붙여넣기 + Return** 이 부분 렌더된 종료 선택지로 나갔다.
+/// 자동확인만 막고 정상 주입 경로를 열어 두면 킬체인은 그대로다 — 그래서 거부를 **공용 서명**에 둔다.
+///
+/// 【판정 재료가 왜 "화면 끝까지의 꼬리" 인가】 물리 행 끝으로 자르면 좁은 pane 에서 접힌 **확인 에코**
+/// (`❯ Yes, I trust this fol⏎der ✔`)의 첫 행이 진부분접두가 되어 통과 후 화면을 관문으로 오탐한다
+/// (2026-07-29 킬체인의 **역방향** 회귀 · 정본 요구). 화면 끝까지 보면 그 꼬리는 라벨보다 **길어져**
+/// 접두가 아니다. 동시에 "커서 뒤로 화면이 끝난다" 가 자동으로 요구되므로, 스크롤백 중간의
+/// `❯ 2`·`❯ No` 는 뒤에 다른 글자가 이어져 걸리지 않는다(과잉 보류 억제).
+///
+/// 【규칙】 꼬리에서 선택 번호(`N.`/`NN.` — 뒤가 글자이거나 문말일 때만 · `1.5` 배제)를 벗긴 뒤:
+///   · 비어 있지 않은 **진부분접두**([`MODAL_CHOICE_LABELS`] 중 하나보다 짧고 그 앞부분과 일치)
+///     → `clipped-choice-row`(렌더가 라벨 도중에 멎었다).
+///   · **완전 라벨로 시작**(번호가 없어 ⓒ 가 못 잡고, 종료 라벨이 아니어서 ⓐ 도 못 잡는
+///     `❯ Yes, try it` · `❯ Not now`) → `cursor-on-choice-label`.
+///   · 번호를 벗긴 나머지가 비었거나 꼬리가 **숫자 1~2자뿐**(`❯ 2`) → `clipped-choice-row`.
+/// 라벨이 아예 없는 커서(`❯ ` 뒤로 화면 끝까지 공백)는 **빈 composer** 이므로 걸리지 않는다.
+///
+/// 【어휘를 다시 쓰는 것이 R4 의 결정을 뒤집는가 — 아니다】 R4 가 지운 어휘 규칙은
+/// [`cursor_row_competes`] 의 **면제**(fail-open)였다: 어휘를 못 알아본 렌더가 경쟁에서 빠져 구멍이
+/// 열렸다. 여기 어휘는 **거부**(fail-closed)다 — 못 알아본 렌더는 종전과 똑같이 흐르고, 알아본
+/// 렌더만 보류로 접힌다. 방향이 반대이므로 같은 실패 모드가 아니다.
+///
+/// 【남는 것(정직 · 노트 §14-3)】 커서만 그려지고 라벨이 **아직 한 글자도 오지 않은** 프레임
+/// (`❯ ` 뒤 화면 끝)은 정상 빈 composer 와 **같은 관측**이라 이 술어로 가를 수 없다. 그 창은
+/// 부트 폴링의 관문 증거 이월(`cys.rs` 의 `gate_evidence_seen`)이 좁히고, 폴링 틱 사이에만
+/// 존재했다 사라진 프레임은 화면·시간만으로는 판정 불가다(codex R5 · 종료 조건 없음).
+fn clipped_choice_cursor(flat: &[char], label_flat: usize) -> Option<(&'static str, usize)> {
+    if label_flat >= flat.len() {
+        return None; // 라벨 없음 = 빈 입력 프롬프트(선택기가 아니다)
+    }
+    let tail = &flat[label_flat..];
+    // 숫자만 남은 꼬리(`❯ 2`) — 렌더가 번호에서 멎었다.
+    if tail.len() <= 2 && tail.iter().all(|c| c.is_ascii_digit()) {
+        return Some(("clipped-choice-row", flat.len()));
+    }
+    // 선택 번호 벗기기 — `N.`/`NN.` 뒤가 글자이거나 문말일 때만(`1.5 hours` 는 번호가 아니다).
+    let mut d = 0usize;
+    while d < tail.len() && d < 2 && tail[d].is_ascii_digit() {
+        d += 1;
+    }
+    let body = if d > 0
+        && d < tail.len()
+        && tail[d] == '.'
+        && (d + 1 == tail.len() || tail[d + 1].is_alphabetic())
+    {
+        &tail[d + 1..]
+    } else {
+        tail
+    };
+    if body.is_empty() {
+        return Some(("clipped-choice-row", flat.len())); // `❯ 2.` — 번호만 그려졌다
+    }
+    for label in MODAL_CHOICE_LABELS {
+        let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
+        if lf.is_empty() {
+            continue;
+        }
+        if body.len() < lf.len() && *body == lf[..body.len()] {
+            return Some(("clipped-choice-row", flat.len()));
+        }
+        // 완전 라벨은 **꼬리 전량과 같을 때만** 센다(뒤에 다른 글자가 이어지면 아니다). `starts_with`
+        // 로 넓히면 좁은 pane 에서 접힌 **확인 에코**(`❯ Yes, I trust this fol⏎der ✔⏎Welcome back`)의
+        // 꼬리가 라벨로 시작해 통과 후 화면이 관문으로 오탐된다 — 2026-07-29 킬체인의 역방향 회귀다
+        // (codex R5 반례). 종료 라벨의 '커서가 종료 위' 축(ⓐ)은 종전대로 접두로 본다(용도가 다르다).
+        if *body == lf[..] {
+            return Some(("cursor-on-choice-label", label_flat + lf.len()));
+        }
+    }
+    None
+}
+
 /// 화면에 **모달 어휘**가 있는가 — 코퍼스와 독립인 순수 술어(모듈 머리말 참조).
 ///
 /// 규칙(하나라도 걸리면 `Some`):
@@ -795,7 +872,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
         fl + label.len() <= flat.len() && flat[fl..fl + label.len()] == *label
     };
 
-    // ⓐ·ⓓ — 선택 커서 행(스캐너는 `cursor_rows` 하나 · allow 구멍의 양성 증거와 같은 것을 본다).
+    // ⓐ·ⓓ·ⓔ·ⓕ — 선택 커서 행(스캐너는 `cursor_rows` 하나 · allow 구멍의 양성 증거와 같은 것을 본다).
     for row in cursor_rows(&f) {
         if let Some(ne) = row.numbered_flat_end {
             sig.note("cursor-on-numbered-item", ne);
@@ -805,6 +882,9 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
         if starts_at_flat(fl, &exit_flat) {
             sig.cursor_on_exit = true;
             sig.note("cursor-on-exit", fl + exit_flat.len());
+        }
+        if let Some((kind, end)) = clipped_choice_cursor(&f.flat, fl) {
+            sig.note(kind, end);
         }
     }
 
@@ -964,6 +1044,24 @@ fn is_numbered_item_row(line: &str) -> bool {
 ///     모를 본문은 모달의 일부일 수 있다(빈 텍스트 입력 필드 · 그리는 중인 프레임).
 /// 마커가 화면에 없거나 줄 단위로 찾을 수 없으면(마커가 줄을 넘어 접힘) 참을 주장하지 않는다.
 fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
+    waiting_prompt_trailer(screen, marker, true)
+}
+
+/// ★(0.14.31 · 리뷰 R5 · codex blocking) 같은 스캐너의 **엄격판** — 마커 줄 아래 꼬리가 **비어 있으면
+/// 거짓**이다(입력 상자 괘선·상태줄 같은 양성 증거를 요구한다).
+///
+/// 【왜 두 판이 필요한가 — 비용 부호가 반대다】
+///   · 재주입 생애 창·큐 배달의 관대판(`empty_trailer_ok = true`)은 "모달이 역사인가" 를 묻는다.
+///     거기서 꼬리가 비었다는 것은 **모달 본문이 더 없다**는 뜻이라 창을 닫아도 안전하다.
+///   · 부트의 **관문 증거 이월**은 "지금 이 `❯` 가 composer 인가, 아직 라벨이 안 그려진 선택기인가" 를
+///     묻는다. 꼬리가 비어 있는 `❯ ` 는 **정확히 두 경우가 구별되지 않는 프레임**이므로, 거기서 참을
+///     주면 이월 장치가 통째로 무의미해진다(codex R5 의 그 반례).
+/// 스캐너는 하나이고 갈리는 것은 이 한 축뿐이다(판정 분리 금지).
+pub fn waiting_prompt_layout_positive(screen: &str, marker: &str) -> bool {
+    waiting_prompt_trailer(screen, marker, false)
+}
+
+fn waiting_prompt_trailer(screen: &str, marker: &str, empty_trailer_ok: bool) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
     let Some(li) = lines.iter().rposition(|l| l.contains(marker)) else {
         return false;
@@ -981,7 +1079,7 @@ fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
         .filter(|l| !l.trim().is_empty())
         .collect();
     if trailer.is_empty() {
-        return true;
+        return empty_trailer_ok;
     }
     if trailer.iter().any(|l| l.contains('❯') || is_numbered_item_row(l)) {
         return false;
@@ -2027,6 +2125,170 @@ mod tests {
 
     fn held_as(v: &Verdict, id: &str) -> bool {
         matches!(v, Verdict::GateHeld { gate_id, .. } if gate_id == id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★(0.14.31 · 리뷰 R5) codex(gpt-6-astra) 위임 산출 — **전행 검토 후 채택**.
+    //   수정 1건: `❯ 2.` 의 기대 규칙을 ⓓ(`cursor-on-numbered-item`)로 정정(위 주석 참조).
+    //   그 밖은 무수정. 문면 리터럴 사본 0(라벨은 `MODAL_CHOICE_LABELS` 에서 잘라 조립한다).
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// 잘린 선택기와 번호 없는 완전 라벨이 네 양성 증거 모두를 보류하는지 잰다.
+    /// 새 규칙의 실제 검출과 거부된 증거 종류를 함께 고정해 다른 규칙에 기대는 공허한 통과를 막는다.
+    #[test]
+    fn r5_clipped_choices_hold_each_positive_evidence() {
+        let gates = first_run_gates::builtin();
+        let exit = MODAL_CHOICE_LABELS[2];
+        let accept = MODAL_CHOICE_LABELS[1];
+        if exit != MODAL_EXIT_LABEL || exit.chars().count() != 8 || accept.chars().count() != 13 {
+            panic!("전제 붕괴: 종료/수락 라벨의 위치 또는 절단 길이가 달라졌다");
+        }
+        let cut: String = exit.chars().take(7).collect();
+        let cases = [
+            ("exit-cut", format!("❯ {cut}"), "clipped-choice-row", true),
+            ("exit-comma", format!("❯ {}", exit.chars().take(3).collect::<String>()), "clipped-choice-row", true),
+            ("exit-two-chars", format!("❯ {}", exit.chars().take(2).collect::<String>()), "clipped-choice-row", true),
+            ("exit-one-char", format!("❯ {}", exit.chars().take(1).collect::<String>()), "clipped-choice-row", true),
+            ("number-only", "❯ 2".to_owned(), "clipped-choice-row", true),
+            // `❯ 2.` 는 **종전 규칙 ⓓ**(`cursor-on-numbered-item`)가 이미 잡는다 — 새 규칙이 아니라도
+            // 보류 요구는 충족된다(엄격 파서가 번호로 읽어 라벨 시작이 화면 끝이 되기 때문). 검사 대상은
+            // "이 화면이 보류되는가" 이므로 기대 규칙을 그 자리로 정정한다(리뷰: 전행 검토).
+            ("number-dot-only", "❯ 2.".to_owned(), "cursor-on-numbered-item", true),
+            ("number-no-space", format!("❯ 2.{cut}"), "clipped-choice-row", true),
+            ("number-space", format!("❯ 2. {cut}"), "clipped-choice-row", false),
+            ("try-complete", format!("❯ {}", MODAL_CHOICE_LABELS[3]), "cursor-on-choice-label", true),
+            ("defer-complete", format!("❯ {}", MODAL_CHOICE_LABELS[4]), "cursor-on-choice-label", true),
+            ("accept-cut", format!("❯ {}", accept.chars().take(11).collect::<String>()), "clipped-choice-row", true),
+            ("exit-next-line", format!("❯\n  {cut}"), "clipped-choice-row", true),
+        ];
+        for (name, base, expected_kind, only_new_rule) in cases {
+            // CRLF 판본은 단일 행에도 실제 줄끝을 추가해 LF 검체와 바이트가 다르게 한다.
+            for (render, screen) in [("raw", base.clone()), ("crlf", crlf(&format!("{base}\n")))] {
+                if first_run_gates::identify(&gates, &screen).is_some() {
+                    panic!("전제 붕괴: {name}/{render}를 코퍼스가 식별하여 미등재 모달 축을 잴 수 없다");
+                }
+                let sig = modal_signature(&screen)
+                    .unwrap_or_else(|| panic!("{name}/{render}: 선택기 서명 누락: {screen:?}"));
+                assert!(sig.kinds.contains(&expected_kind), "{name}/{render}: 새 규칙 누락: {:?}", sig.kinds);
+                if only_new_rule {
+                    assert_eq!(sig.kinds, vec![expected_kind], "{name}/{render}: 단독 규칙 계측");
+                }
+                assert!(!sig.cursor_on_exit, "{name}/{render}: 종료 전문 없는 커서가 종료 축을 오염시켰다");
+
+                let mut valve = boot_all_open(&screen, &gates);
+                valve.delta = "";
+                valve.marker = None;
+                let mut delta = obs(&screen, &screen, &gates);
+                delta.agent_alive = Some(false);
+                let mut marker_screen = obs(&screen, "", &gates);
+                marker_screen.agent_alive = Some(false);
+                marker_screen.time_fallback_reached = true;
+                let mut time = marker_screen.clone();
+                time.marker = None;
+                for (o, expected_evidence) in [
+                    (valve, Evidence::Valve),
+                    (delta, Evidence::MarkerDelta),
+                    (marker_screen, Evidence::MarkerScreen),
+                    (time, Evidence::TimeFallback),
+                ] {
+                    if positive_evidence(&o) != Some(expected_evidence) {
+                        panic!("전제 붕괴: {name}/{render}: {expected_evidence:?} 증거가 열리지 않았다");
+                    }
+                    match judge(&o) {
+                        Verdict::GateHeld { gate_id, vetoed, .. } => {
+                            assert_eq!(gate_id, MODAL_UNKNOWN_ID, "{name}/{render}/{expected_evidence:?}");
+                            assert_eq!(vetoed, Some(expected_evidence), "{name}/{render}: 거부된 증거");
+                        }
+                        other => panic!("{name}/{render}/{expected_evidence:?}: 미등재 모달 보류 대신 {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// 빈 입력창·정상 실측 화면·셸 이력은 선택기 거부로 가용성을 잃으면 안 된다.
+    /// 특히 접힌 확인 에코와 숫자 이력은 물리 행이 아니라 화면 끝까지 읽는 경계를 잰다.
+    #[test]
+    fn r5_clipped_choices_preserve_healthy_screen_availability() {
+        let trust = MODAL_CHOICE_LABELS[0];
+        if trust.chars().count() != 24 {
+            panic!("전제 붕괴: 신뢰 라벨 길이가 달라져 좁은 pane 절단 위치를 재검토해야 한다");
+        }
+        let head: String = trust.chars().take(21).collect();
+        let rest: String = trust.chars().skip(21).collect();
+        let echo = format!("{trust} ✔");
+        let wrapped_echo = format!("❯ {head}\n{rest} ✔\nWelcome back\n❯ ");
+        let live = [
+            ("status-below", fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT),
+            ("at-prompt", fixtures::LIVE_TUI_AT_PROMPT),
+            ("nbsp-prompt", fixtures::LIVE_TUI_2_1_261_NBSP_PROMPT),
+        ];
+        for (name, screen) in live {
+            if !screen.lines().any(|line| line.trim() == "❯") {
+                panic!("전제 붕괴: {name} 실측 화면에 빈 입력 프롬프트가 없다");
+            }
+        }
+        if !fixtures::LIVE_TUI_2_1_261_NBSP_PROMPT.contains("❯\u{a0}") {
+            panic!("전제 붕괴: NBSP 실측 화면의 입력 공백이 달라졌다");
+        }
+        for (name, screen) in live.into_iter().chain([
+            ("empty-composer", "❯ "),
+            ("whitespace-to-end", "❯ \n \t\r\n"),
+            ("confirmation-echo", echo.as_str()),
+            ("wrapped-confirmation-echo", wrapped_echo.as_str()),
+            ("numeric-shell-history", "❯ 2\ncommand completed\n❯ "),
+            ("numeric-history-without-prompt", "❯ 2\ncommand completed"),
+            ("decimal-history", "❯ 1.5 hours later"),
+            ("shell-list", "❯ ls -al"),
+            ("shell-launch", "❯ claude --dangerously-skip-permissions"),
+            ("ready-shell", fixtures::READY_SHELL),
+        ]) {
+            for (render, candidate) in [("raw", screen.to_owned()), ("crlf", crlf(screen))] {
+                assert_eq!(modal_signature(&candidate), None, "{name}/{render}: 정상 화면을 모달로 오탐: {candidate:?}");
+            }
+        }
+    }
+
+    /// 종료 라벨의 모든 진부분접두는 보류하되 종료 커서 비트를 켜지 않아야 한다.
+    /// 전문과 접힌 전문은 같은 종료 사실이므로 기존 종료 축을 계속 켜야 한다.
+    #[test]
+    fn r5_clipped_choices_do_not_widen_cursor_on_exit() {
+        let exit = MODAL_CHOICE_LABELS[2];
+        if exit != MODAL_EXIT_LABEL || exit.chars().count() < 2 {
+            panic!("전제 붕괴: 종료 라벨 상수의 대응 또는 길이가 달라졌다");
+        }
+        for n in 1..exit.chars().count() {
+            let prefix: String = exit.chars().take(n).collect();
+            let screen = format!("❯ {prefix}");
+            let sig = modal_signature(&screen).unwrap_or_else(|| panic!("길이 {n}: 잘린 종료 서명 누락"));
+            assert_eq!(sig.kinds, vec!["clipped-choice-row"], "길이 {n}");
+            assert!(!sig.cursor_on_exit, "길이 {n}: 진부분접두가 종료 전문으로 승격됐다");
+        }
+        let n = exit.chars().count() - 1;
+        let head: String = exit.chars().take(n).collect();
+        let rest: String = exit.chars().skip(n).collect();
+        for screen in [format!("❯ {exit}"), format!("❯ 2. {exit}"), format!("❯ {head}\n  {rest}")] {
+            for candidate in [screen.clone(), crlf(&format!("{screen}\n"))] {
+                let sig = modal_signature(&candidate).unwrap_or_else(|| panic!("종료 전문 서명 누락: {candidate:?}"));
+                assert!(sig.cursor_on_exit, "종료 전문의 기존 경계가 사라졌다: {candidate:?}");
+                assert!(sig.kinds.contains(&"cursor-on-exit"));
+                assert!(sig.kinds.contains(&"cursor-on-choice-label"));
+            }
+        }
+    }
+
+    /// 순수 술어의 한두 자리 번호 경계와 반환 끝 좌표를 직접 잰다.
+    /// 소비 스캐너가 번호를 먼저 벗겨 규칙이 사라지는 경우를 술어 자체의 실패와 구분한다.
+    #[test]
+    fn r5_clipped_choice_cursor_number_and_empty_tail_boundaries() {
+        for tail in ["2", "12", "2.", "12."] {
+            let flat: Vec<char> = format!("❯{tail}").chars().collect();
+            assert_eq!(clipped_choice_cursor(&flat, 1), Some(("clipped-choice-row", flat.len())), "{tail}");
+        }
+        for tail in ["", "123", "123.", "1.5hourslater", "2commandcompleted"] {
+            let flat: Vec<char> = format!("❯{tail}").chars().collect();
+            assert_eq!(clipped_choice_cursor(&flat, 1), None, "{tail}");
+        }
     }
 
     #[test]

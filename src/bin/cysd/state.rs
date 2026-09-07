@@ -1969,6 +1969,16 @@ pub struct Daemon {
     /// tokio 핸들러가 동시에 호출할 수 있는데 write_json_atomic의 tmp 이름이 고정이라 동시 쓰기가
     /// 파일을 파손할 수 있다 — G1 이후 WAL은 queue_seq 시드·entry id의 근거라 손상 대가가 크다.
     pub queue_persist_lock: Mutex<()>,
+    /// ★(0.14.31 · 리뷰 R5 · codex major) **직전에 `queue-expired.json` 에 실제로 쓴 id 집합.**
+    ///
+    /// 두 파일을 각각 원자 치환하는 것만으로는 **두 치환 사이의 크래시**가 항목을 지운다 —
+    /// 활성→만료 이동에서 활성 파일이 먼저 그것을 잃고 만료 파일이 아직 그것을 얻지 못한 창이다.
+    /// 수리는 **목적지 먼저**다([`Daemon::persist_queue_state`]): 만료 파일을 먼저 쓰고 활성 파일을
+    /// 나중에 쓴다. 그러면 반대 방향(만료→활성 `queue revive`)이 같은 이유로 깨지므로, 만료 파일을
+    /// 쓸 때 **이번에 활성으로 돌아간 항목을 한 벌 남겨 둔다**(중복은 복구 가능 · 유실은 아니다).
+    /// 그 "남길 대상" 을 알려면 **직전에 만료 파일에 무엇이 있었는지**를 알아야 하고, 이 집합이
+    /// 그 기억이다(시작 시 디스크 만료 파일에서 시드).
+    pub queue_expired_persisted: Mutex<std::collections::HashSet<String>>,
     /// ★(0.14.31 · WP-5 M) 직전 큐 틱(`governance::queue_expiry_pass`) 시각(epoch) — pause 누적
     /// (`QueueEntry::paused_total_secs`)의 델타 시계. `None` = 아직 틱 없음(첫 틱 델타 0). 틱 간
     /// 실제 경과로 재므로 틱 주기가 바뀌거나 늘어져도 누적이 틀어지지 않는다.
@@ -2698,7 +2708,32 @@ impl Daemon {
         let restored_qentries = load_queue_state(&dir);
         // ★(0.14.31 · WP-5 M) 만료 복원분은 별 파일(queue-expired.json · 구 데몬 비가시). 시드는
         //   두 집합의 max(seq)+1 — 만료 항목 id 와도 겹치지 않아야 revive 후 pop-by-id 가 안전하다.
-        let restored_expired = load_queue_file(&dir, "queue-expired.json");
+        let mut restored_expired = load_queue_file(&dir, "queue-expired.json");
+        // ★(0.14.31 · 리뷰 R5 · codex major) **파일 간 dedup — 활성이 이긴다.**
+        //   목적지-먼저 쓰기(아래 `persist_queue_state`)는 두 치환 사이의 크래시에서 같은 id 가
+        //   **두 파일에 다 있는** 상태를 남긴다(유실 대신 중복 — 의도된 안전 방향). 그때 두 벌을
+        //   그대로 살리면 같은 항목이 활성 큐와 만료 큐에 동시에 들어간다.
+        //   활성을 이기게 두는 근거: ⓐ 만료→활성(revive) 창의 중복은 **활성이 정답**이다.
+        //   ⓑ 활성→만료 창의 중복도 활성으로 살아나지만, `rehome_restored_queue` 가 복원 시점에
+        //     TTL 을 **재계산**해 이미 만료된 항목을 만료 큐로 되돌린다(§8 "만료 항목을 활성 큐 머리에
+        //     두지 않는다" 는 그 재분류가 집행한다) — 즉 어느 방향이든 유실 0 · 오배달 0 이다.
+        // 만료 파일의 **디스크 현재 내용**이 목적지-먼저 쓰기의 기억이다(dedup **전** 집합이어야
+        // 다음 persist 가 "직전에 만료 파일에 무엇을 남겼는지" 를 정확히 안다).
+        let expired_persisted_seed: std::collections::HashSet<String> = restored_expired
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        {
+            let live: std::collections::HashSet<&str> = restored_qentries
+                .iter()
+                .filter_map(|it| it.get("id").and_then(|v| v.as_str()))
+                .collect();
+            restored_expired.retain(|it| {
+                !it.get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| live.contains(id))
+            });
+        }
         let queue_seq_seed = restored_qentries
             .iter()
             .chain(restored_expired.iter())
@@ -2757,6 +2792,7 @@ impl Daemon {
             restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),
             queue_persist_lock: Mutex::new(()),
+            queue_expired_persisted: Mutex::new(expired_persisted_seed),
             queue_tick_at: Mutex::new(None),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
@@ -3096,12 +3132,68 @@ impl Daemon {
                 }
             }
         }
+        // ── ★(0.14.31 · 리뷰 R5 · codex major) **목적지 먼저 · 원본 나중** ─────────────────
+        //
+        // 【무엇이 틀렸었나】 두 파일을 각각 원자 치환하는 것은 **한 파일의** 원자성일 뿐 두 파일
+        //   **사이**의 원자성이 아니다. 종전 순서(활성 → 만료)에서 활성→만료 이동은
+        //   ① 활성 파일이 항목을 잃고 ② 만료 파일이 그것을 얻는다 — ①과 ② 사이에 데몬이 죽으면
+        //   그 항목은 **어느 파일에도 없다**(만료 통지도 본문도 남기지 않으므로 revive·replay 로
+        //   되살릴 수 없다 · codex R5 major).
+        //
+        // 【수리】 순서를 뒤집어 **목적지(만료 파일)를 먼저** 쓴다. 그러면 활성→만료 창의 크래시는
+        //   항목을 **두 파일 모두**에 남긴다(중복은 복구 가능 · 유실이 아니다 — 부트체인 규율 §3-3).
+        //   뒤집으면 반대 방향(만료→활성 `queue revive`)이 같은 이유로 깨지므로, 만료 파일을 쓸 때
+        //   **이번에 활성으로 돌아간 항목**([`Daemon::queue_expired_persisted`] ∩ 지금 활성)을 한 벌
+        //   더 실어 둔다(carry). 활성 파일이 그것을 얻은 뒤에야(③) 만료 파일에서 지운다.
+        //   carry 가 비면 ③ 은 ① 과 같은 내용이므로 **쓰지 않는다**(정상 경로의 I/O 는 종전과 같은 2회).
+        //
+        // 【읽는 쪽의 계약】 두 파일에 같은 id 가 있으면 **활성이 이긴다**(`Daemon::new` 의 파일 간
+        //   dedup). 활성→만료 창의 중복은 그때 활성으로 살아나지만 `rehome_restored_queue` 가 복원
+        //   시점 TTL 재계산으로 만료 큐에 되돌린다(§8 준수). 만료→활성 창의 중복은 활성이 정답이다.
+        //
+        // 【남는 것(정직)】 이 순서는 **크래시 1회**의 이동 유실을 닫는다. 쓰기 실패를 호출부로 올리는
+        //   계약(현행: `let _ =` 로 버림)·디렉터리 fsync·전원 단절 내구성·enqueue 응답 시점은 종전
+        //   그대로이며 이 단위에서 바꾸지 않는다(노트 §14-2 잔여 · 백로그 ⑪).
+        let carry: Vec<serde_json::Value> = {
+            let persisted = self.queue_expired_persisted.lock().unwrap_or_else(|e| e.into_inner());
+            if persisted.is_empty() {
+                Vec::new()
+            } else {
+                entries
+                    .iter()
+                    .filter(|it| {
+                        it.get("id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| persisted.contains(id))
+                    })
+                    .cloned()
+                    .collect()
+            }
+        };
+        let write_expired = |rows: &Vec<serde_json::Value>| {
+            if let Ok(content) = serde_json::to_string(rows) {
+                let _ = crate::governance::write_json_atomic(&dir, "queue-expired.json", &content);
+            }
+        };
+        // ① 목적지 먼저(+ revive carry).
+        let mut first = expired_entries.clone();
+        first.extend(carry.iter().cloned());
+        write_expired(&first);
+        // ② 활성 파일.
         if let Ok(content) = serde_json::to_string(&entries) {
             let _ = crate::governance::write_json_atomic(&dir, "queue-state.json", &content);
         }
-        if let Ok(content) = serde_json::to_string(&expired_entries) {
-            let _ = crate::governance::write_json_atomic(&dir, "queue-expired.json", &content);
+        // ③ carry 정리(활성 파일이 이미 그것을 가졌다).
+        if !carry.is_empty() {
+            write_expired(&expired_entries);
         }
+        *self
+            .queue_expired_persisted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = expired_entries
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
     }
 
     /// ★Phase 5 ①c: 큐 재배달 갭 수리. WAL로 살아난 restored_queue 항목을 **같은 role의 살아있는
@@ -7843,6 +7935,120 @@ mod tests {
         assert_eq!(
             expired[0].ttl_secs, None,
             "구 WAL의 TTL 키 부재는 기본값 승계"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R5 · codex major) **두 파일 커밋 사이의 크래시가 항목을 지우지 않는다.**
+    ///
+    /// 【무엇을 재는가】 종전 순서(활성 → 만료)에서 활성→만료 이동은 ① 활성 파일이 항목을 잃고
+    /// ② 만료 파일이 그것을 얻는다 — ①과 ② 사이의 크래시는 **어느 파일에도 없는** 상태를 남겼다.
+    /// 지금은 **목적지 먼저**라 그 창의 디스크 상태가 "두 파일 모두" 이고, 읽는 쪽은 활성 우선
+    /// dedup + 복원 시점 TTL 재분류로 그것을 정확히 한 벌로 되살린다.
+    #[test]
+    fn wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry() {
+        // ── ⓐ 쓰기 순서: 만료 파일이 활성 파일보다 **먼저** 치환된다(소스 핀 · 이동 방향 무관).
+        let src = include_str!("state.rs");
+        let body = {
+            let i = src.find("pub fn persist_queue_state(&self)").expect("persist 본체");
+            let rest = &src[i..];
+            let end = rest.find("\n    }\n").expect("persist 본체 끝");
+            &rest[..end]
+        };
+        let first_expired = body
+            .find("write_expired(&first)")
+            .expect("만료 파일 선행 쓰기가 사라졌다");
+        let then_active = body
+            .find("\"queue-state.json\", &content")
+            .expect("활성 파일 쓰기가 사라졌다");
+        assert!(
+            first_expired < then_active,
+            "활성 파일이 만료 파일보다 먼저 치환된다 — 활성→만료 이동의 유실 창이 되돌아왔다"
+        );
+        // ── ⓑ 크래시 잔상(두 파일 모두에 같은 id)에서 유실 0 · 중복 0.
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-r5-crash-wal");
+        let dir = queue_wal_dir("wp5-r5-crash");
+        let live = w2c_entry("wp5-r5-inflight", 91, now_epoch()); // 아직 TTL 안 지남
+        let row = |e: &QueueEntry, expired_at: Option<f64>| {
+            json!({"mid": queue_mid(1, &e.text), "id": e.id, "seq": e.seq, "surface_id": 1,
+                   "role": "r", "text": e.text, "enqueued_at": e.enqueued_at,
+                   "from": e.from, "origin": e.origin, "ttl_secs": e.ttl_secs,
+                   "paused_total_secs": 0.0, "expired_at": expired_at,
+                   "revived_at": null, "expired_notified": false})
+        };
+        std::fs::write(
+            dir.join("queue-state.json"),
+            serde_json::to_string(&json!([row(&live, None)])).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("queue-expired.json"),
+            serde_json::to_string(&json!([row(&live, Some(live.enqueued_at + 1.0))])).unwrap(),
+        )
+        .unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let act = daemon.restored_queue.lock().unwrap().len();
+        let exp = daemon.restored_expired.lock().unwrap().len();
+        assert_eq!(
+            (act, exp),
+            (1, 0),
+            "크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — 활성 우선 dedup 결손"
+        );
+        // ── ⓒ 계측 타당성: **종전 순서**의 크래시 잔상(두 파일 모두 비어 있음)은 그대로 유실이다.
+        //     이 대조군이 없으면 위 단언은 '원래 안 나는 일' 을 확인하는 공허한 검사가 된다.
+        let dir2 = queue_wal_dir("wp5-r5-crash-old");
+        std::fs::write(dir2.join("queue-state.json"), "[]").unwrap();
+        std::fs::write(dir2.join("queue-expired.json"), "[]").unwrap();
+        let lost = Daemon::new(dir2.join("cysd.sock"));
+        assert_eq!(
+            (
+                lost.restored_queue.lock().unwrap().len(),
+                lost.restored_expired.lock().unwrap().len()
+            ),
+            (0, 0),
+            "대조군 전제 붕괴"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R5 · codex major) **revive(만료→활성) 방향도 목적지 먼저다.**
+    ///
+    /// 목적지-먼저 순서를 그냥 뒤집으면 반대 방향이 같은 이유로 깨진다 — 그래서 만료 파일을 쓸 때
+    /// "직전에 만료 파일에 있었는데 지금은 활성인" 항목을 한 벌 남기고(carry), 활성 파일이 그것을
+    /// 얻은 **뒤에** 만료 파일에서 지운다. 최종 상태에 중복이 남지 않는 것까지 잰다.
+    #[test]
+    fn wp5_r5_revive_keeps_a_copy_until_the_active_file_has_it() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-r5-revive-wal");
+        let dir = queue_wal_dir("wp5-r5-revive");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("r".into()), 24, 80)
+            .expect("surface 생성");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        // 직전 persist 가 만료 파일에 남긴 것으로 가정한다(= carry 대상 판정의 기억).
+        let e = w2c_entry("wp5-r5-revived", 92, now_epoch());
+        daemon
+            .queue_expired_persisted
+            .lock()
+            .unwrap()
+            .insert(e.id.clone());
+        s.pending_queue.lock().unwrap().push_back(e.clone()); // revive 완료 상태(활성)
+        daemon.persist_queue_state();
+        let active: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("queue-state.json")).unwrap()).unwrap();
+        let expired: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("queue-expired.json")).unwrap()).unwrap();
+        assert_eq!(active.as_array().unwrap().len(), 1, "활성 파일이 재활성 항목을 못 받았다");
+        assert_eq!(
+            expired,
+            json!([]),
+            "carry 정리(③)가 안 돼 만료 파일에 사본이 영구히 남는다"
+        );
+        assert!(
+            !daemon
+                .queue_expired_persisted
+                .lock()
+                .unwrap()
+                .contains(&e.id),
+            "다음 persist 의 기억이 갱신되지 않았다(carry 가 매번 되살아난다)"
         );
     }
 

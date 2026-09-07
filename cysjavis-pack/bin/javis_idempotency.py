@@ -449,7 +449,10 @@ def _invariants():
     assert classify_cys_verb(["cys", "queue", "purge"]) == "unknown", "미지 서브동사가 분류됨(default-deny)"
     assert MUTATE_SUBVERBS & OBSERVE_SUBVERBS == frozenset(), "서브동사 분류 충돌"
     # Windows Git Bash 형상 — `cys.exe`·`cys.cmd`·백슬래시 경로도 cys 호출이다.
-    assert is_observe_only(["C:\\Users\\me\\.local\\bin\\cys.exe", "queue", "list"]), "cys.exe queue list 가 observe 가 아님"
+    # ★(리뷰 R5) 경로는 **개인 프로필이 아닌** 더미로 쓴다 — `C:\Users\<이름>` 형상은 H-SECRET-1
+    #   (산 트리 개인정보 스캔 · 발행 fail-closed)이 잡는다. 재는 것은 백슬래시·`.exe` 처리이지
+    #   프로필 경로가 아니다(WP-5 가 남긴 적색 1건 · 이 레인 소유 파일이라 여기서 닫는다).
+    assert is_observe_only(["D:\\opt\\cys\\bin\\cys.exe", "queue", "list"]), "cys.exe queue list 가 observe 가 아님"
     assert classify_cys_verb(["cys.cmd", "queue", "drop", "q1.2"]) == "mutate", "cys.cmd queue drop 가 mutate 가 아님"
     assert classify_cys_verb(["cys", "reclaim-role", "--auto"]) == "mutate", "reclaim-role 이 mutate 가 아님"
     # 면제 상한(계약 형해화 차단).

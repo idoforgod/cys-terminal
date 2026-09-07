@@ -12572,7 +12572,32 @@ def h_boot_gate_78():
     need(B._boot_gate_pending_verdict(1, failed) is None, "진짜 실패를 보류로 오판(실패 은닉)")
     need(B._boot_fatal_verdict(1, failed) is not None,
          "의무 역할 failed 가 Fatal 로 승격되지 않음(보류 도입이 실패 판정을 삼켰다)")
-    notes.append("행위 8축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0)")
+    # ★(0.14.31 · 리뷰 R5 · codex minor) **처방은 구조화 사유를 따라간다** — 생산자(cys.rs)가 실은
+    #   gate_reason/human_action_required 를 소비부가 무시하면, 관문을 **이미 통과한** 좌석에도
+    #   "그 pane 에서 관문을 1회 통과시켜라" 가 나간다(생산자가 R4 에서 고친 모순의 하류 절반).
+    unread = json.dumps({"roles": [{"role": "cso", "agent": "claude", "outcome": "gate_pending",
+                                    "mandatory": True, "gate_reason": "adopt-list-unread",
+                                    "human_action_required": False}]})
+    w = B._boot_gate_pending_verdict(1, unread)
+    need(w is not None, "채택 미룸이 보류로 잡히지 않는다")
+    need("이미 통과" in w and "사람 조치 없음" in w, "채택 미룸에 '이미 통과·사람 조치 없음' 처방이 없다")
+    need("1회 통과시켜라" not in w, "채택 미룸에 관문 통과 지시가 나간다(m1 이 고친 모순의 하류 절반)")
+    unobs = json.dumps({"roles": [{"role": "cso", "outcome": "gate_pending", "mandatory": True,
+                                   "gate_reason": "recheck-unobserved",
+                                   "human_action_required": True}]})
+    w = B._boot_gate_pending_verdict(1, unobs)
+    need("관측하지 못했다" in w, "재관측 미관측에 '관측 못 함' 처방이 없다(관문 상주로 단정)")
+    mixed = json.dumps({"roles": [
+        {"role": "cso", "outcome": "gate_pending", "mandatory": True,
+         "gate_reason": "adopt-list-unread", "human_action_required": False},
+        {"role": "master", "outcome": "gate_pending", "mandatory": True,
+         "gate_reason": "gate-held", "human_action_required": True}]})
+    w = B._boot_gate_pending_verdict(1, mixed)
+    need("이미 통과" in w and "1회 통과시켜라" in w,
+         "혼합(진짜 관문 + 채택 미룸)에서 한 처방만 나간다 — 둘 중 하나는 반드시 거짓 지시다")
+    need("사람 조치 없음**(전건" not in w, "혼합인데 '전건 사람 조치 없음' 이 나간다")
+    # 구 CLI(필드 없음)는 종전 문안으로 폴백한다(위 gp 검사가 그것을 이미 잰다).
+    notes.append("행위 12축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0·사유별 처방 3종+폴백)")
     # ⓔ 계측 타당성 — 캠페인 베이스(PRE_U24_REF)에는 제3 분기가 없었다(진짜 변화를 보고 있다).
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"), PRE_U24_REF)
     calib = "skip(no-git)"

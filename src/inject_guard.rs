@@ -296,13 +296,65 @@ fn action_label_selected(gate: &Gate, screen: &str) -> bool {
 /// 【실패 방향】 거짓의 귀결은 `cys boot` 의 "관문 보류 · 사람 1회 조치"(가역). 참의 오판 귀결은 좌석 rc 1
 /// 종료(비가역). 그래서 모르면 거짓이다.
 pub fn confirm_allowed(o: &Observed, gate_id: &str) -> bool {
-    match first_run_gates::identify(o.gates, o.screen) {
-        Some(g) if g.id == gate_id => {
-            let on_exit = crate::readiness::modal_signature(o.screen)
-                .is_some_and(|m| m.cursor_on_exit);
-            !on_exit && action_label_selected(g, o.screen)
+    confirm_denied(o, gate_id).is_none()
+}
+
+/// 확인 허가가 **왜** 닫혔는가 — 진단 전용(판정 재료가 아니다 · 판정은 [`confirm_allowed`] 하나).
+///
+/// ★(0.14.31 · 리뷰 R5 · claude 적대) 왜 사유가 필요한가: R4 가 생산자를 `!confirm_allowed(..)` 로 바꾸면서
+///   **첫 발**(미식별·모호·커서 종료 위)이 흔한 경우가 됐는데 그 분기는 stderr 를 한 줄도 내지 않았다.
+///   운영자와 릴리스 게이트 실측자는 그때 "감지 실패(관문을 못 봤다)" 와 "확인 거부(봤지만 안 쏜다)" 를
+///   가르지 못한다 — 두 상태의 처방이 다르다(전자는 감지 폭, 후자는 렌더 실측). 사유는 **문안이 아니라
+///   타입**으로 낸다(하류가 문자열을 파싱하지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmDenied {
+    /// 코퍼스가 지금 화면을 **어떤 관문으로도** 식별하지 못한다(잘린 렌더 · 새 관문 · 이미 지나갔다).
+    Unidentified,
+    /// 다른 관문이 떠 있다 — 구멍은 id 하나다(신뢰창인 줄 알고 눌렀는데 면책창이던 실측 킬체인).
+    OtherGate(String),
+    /// 커서가 **종료 선택지** 위다 — 그 Return 은 통과가 아니라 종료다(좌석 사망 · 비가역).
+    CursorOnExit,
+    /// 코퍼스에 그 관문의 **통과 동작(action)** 선언이 없다 — 기계가 통과시킬 근거가 없다.
+    NoAction,
+    /// 커서가 액션 라벨 **전문** 위가 아니거나, 활성 선택 블록에 **경쟁 커서**가 있다(모호).
+    LabelUnresolved,
+}
+
+impl ConfirmDenied {
+    /// 사람이 읽는 한 마디(stderr 진단 전용).
+    pub fn label(&self) -> String {
+        match self {
+            ConfirmDenied::Unidentified => {
+                "지금 화면이 코퍼스의 어떤 관문으로도 식별되지 않는다(잘린 렌더·새 관문·이미 지나감)".into()
+            }
+            ConfirmDenied::OtherGate(id) => format!("지금 화면은 다른 관문이다(id={id})"),
+            ConfirmDenied::CursorOnExit => "선택 커서가 종료 선택지 위다(그 Return 은 좌석 종료)".into(),
+            ConfirmDenied::NoAction => "코퍼스에 이 관문의 통과 동작(action)이 선언돼 있지 않다".into(),
+            ConfirmDenied::LabelUnresolved => {
+                "커서가 액션 라벨 전문 위가 아니거나 활성 선택 블록에 경쟁 커서가 있다(모호)".into()
+            }
         }
-        _ => false,
+    }
+}
+
+/// [`confirm_allowed`] 의 사유형. `None` = 허가.
+pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
+    let g = match first_run_gates::identify(o.gates, o.screen) {
+        None => return Some(ConfirmDenied::Unidentified),
+        Some(g) if g.id != gate_id => return Some(ConfirmDenied::OtherGate(g.id.clone())),
+        Some(g) => g,
+    };
+    if crate::readiness::modal_signature(o.screen).is_some_and(|m| m.cursor_on_exit) {
+        return Some(ConfirmDenied::CursorOnExit);
+    }
+    if g.action.is_none() {
+        return Some(ConfirmDenied::NoAction);
+    }
+    // 술어는 `decide_allowing` 의 allow 구멍과 **같은 하나**다(사본 0 — 두 자리가 갈리면 구멍이 생긴다).
+    if action_label_selected(g, o.screen) {
+        None
+    } else {
+        Some(ConfirmDenied::LabelUnresolved)
     }
 }
 
@@ -936,18 +988,39 @@ mod tests {
                 }
             }
         }
-        // ★계측 타당성 — **구 생산자**는 바로 이 화면에서 통과(Send)를 냈다(결함 재현). 재현되지 않으면
-        //   이 검체는 '원래 안 나는 일을 안 난다고 확인' 하는 공허한 검사다.
+        // ★(0.14.31 · 리뷰 R5 · codex blocking) **잘린 선택기는 이제 주입도 막는다.** R4 는 확인만
+        //   좁혔고 그때 이 자리에는 `Decision::Send` 가 핀돼 있었다 — 그 Send 가 디렉티브 붙여넣기와
+        //   Return 을 부분 렌더된 종료 선택지로 내보내던 잔여 킬체인이다(확인 격리만으로는 안 닫힌다).
         let clipped = "❯ No, exi\n";
-        assert_eq!(
-            decide_allowing(&obs(clipped, &gs), Some(GATE_FOLDER_TRUST)),
-            Decision::Send,
-            "구 생산자가 이 화면을 이미 막는다 — R4 blocking 서사가 틀렸다(계측 무효)"
+        // 계측 타당성 ①: 이 화면을 잡는 것은 **새 규칙 하나뿐**이다(ⓐ 종료 라벨 전문·ⓑ 푸터·ⓒⓓ 번호
+        //   어느 것도 서지 않는다). 다른 규칙이 이미 잡고 있었다면 이 검체는 공허한 검사다.
+        let sig = crate::readiness::modal_signature(clipped).expect("잘린 선택기가 모달로 안 잡힌다");
+        assert_eq!(sig.kinds, vec!["clipped-choice-row"], "다른 규칙이 이미 이 화면을 잡고 있었다(계측 무효)");
+        assert!(!sig.cursor_on_exit, "전제: 종료 라벨 **전문** 위가 아니다(부정 증거만으로는 안 닫힌다)");
+        // 계측 타당성 ②: 롤백(`readiness_legacy`)으로 새 축을 끄면 **구 판정(Send)** 이 그대로 재현된다
+        //   — 결함 서사가 사실이었다는 증거이자, 롤백 경로가 반쪽이 아니라는 증거다.
+        let mut legacy = obs(clipped, &gs);
+        legacy.readiness_legacy = true;
+        assert_eq!(decide(&legacy), Decision::Send, "구 판정이 재현되지 않는다(계측 무효 · 롤백 반쪽)");
+        // 킬체인 전량: 주입 가드 · allow 구멍 · 확인 · 준비 판정 넷이 **모두** 닫힌다.
+        assert!(decide(&obs(clipped, &gs)).blocks(), "잘린 선택기 화면에 본문이 주입된다");
+        assert!(
+            decide_allowing(&obs(clipped, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
+            "allow 구멍이 미식별 잘린 선택기에서 열렸다"
         );
-        assert!(crate::readiness::modal_signature(clipped).is_none(), "전제: 모달 서명도 서지 않는다");
-        // 주입 허가는 **바뀌지 않았다**(정상 좌석이 본문을 못 받는 회귀 0) — 두 술어의 접기 방향이 반대다.
+        // 정상 좌석 회귀 0 — 건강한 화면·확인 에코·빈 composer 는 그대로 통과한다.
         assert_eq!(decide(&obs(fixtures::READY_SHELL, &gs)), Decision::Send);
-        assert_eq!(decide(&obs(clipped, &gs)), Decision::Send);
+        assert_eq!(decide(&obs("❯ \n", &gs)), Decision::Send, "빈 composer 가 막혔다(가용성 붕괴)");
+        assert_eq!(
+            decide(&obs(fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT, &gs)),
+            Decision::Send,
+            "라이브 2.1.261 프롬프트가 막혔다(부트 영구 보류)"
+        );
+        assert_eq!(
+            decide(&obs("Yes, I trust this folder ✔\n", &gs)),
+            Decision::Send,
+            "확인 에코가 모달로 잡혔다(2026-07-29 킬체인 역방향 회귀)"
+        );
         // 그러나 식별되는 정상 관문 화면에서는 확인이 정확히 열린다(자동확인 가용성 보존).
         assert!(confirm_allowed(&obs(fixtures::FOLDER_TRUST, &gs), GATE_FOLDER_TRUST));
         // 다른 관문 id 로는 열리지 않는다(구멍은 id 하나).
