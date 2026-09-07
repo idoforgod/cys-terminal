@@ -6397,6 +6397,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .into()
             };
             let pause_info = daemon.pause_info.lock().unwrap().clone();
+            // ★(0.14.31 · WP-3 B) alert 라우팅 관측(CONTRACTS §C: 최상위 키 `alert_route` ·
+            //   정확히 enabled/routed_1h/suppressed_1h/pending 4키). 팩 preflight 의 A 게이트
+            //   등록 조건 ①이 이 키의 존재로 "데몬이 alert 라우팅을 지원한다"를 판정한다.
+            //   ★락 규율: surfaces 가드는 위에서 이미 drop 됐다 — 전용 락은 그 뒤에만 잡는다
+            //   (alert_route 락은 큐 계열 락 순서 규약 밖의 독립 락이다).
+            let alert_route = daemon
+                .alert_route
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot(now);
             // W3.6 형해화 back-pressure: 발행자별 (요청, 거부) 카운터를 노출한다(임계 함께).
             let back_pressure: Value = {
                 let threshold = approval_backpressure_threshold();
@@ -6443,6 +6453,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "health_recent": health_recent,
                     "health_suppressed": health_suppressed,
                     "todo": todo,
+                    "alert_route": alert_route,
                 }),
             ))
         }
@@ -9458,6 +9469,42 @@ mod tests {
             r["result"]["boot_v2_enabled"].is_boolean(),
             "org.status 가 boot_v2_enabled 를 노출하지 않는다 — 스위치 SOT 가 데몬이 아니게 된다 ({r})"
         );
+    }
+
+    /// ★(0.14.31 · WP-3 B · CONTRACTS §C) `cys status --json` 최상위 키 `alert_route` —
+    /// **정확히 4키**(`enabled`·`routed_1h`·`suppressed_1h`·`pending`)다.
+    ///
+    /// 왜 키 집합까지 잠그는가: 팩 preflight 의 능력 게이트(A) **등록 조건 ①**이 이 키로
+    /// "이 데몬이 alert 라우팅을 지원한다"를 판정한다. 키 이름이 흔들리면 구 데몬으로 오판해
+    /// 게이트가 영영 등록되지 않거나(WARN 침묵), 반대로 미지원 데몬에 게이트가 붙는다.
+    #[test]
+    fn status_exposes_alert_route_contract_keys() {
+        let dir = std::env::temp_dir().join(format!("cysd-alertroute-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        let ar = &r["result"]["alert_route"];
+        let obj = ar.as_object().expect("alert_route 가 오브젝트가 아니다 — 등록 조건 ① 판정 불가");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["enabled", "pending", "routed_1h", "suppressed_1h"],
+            "계약 키 집합이 바뀌었다(팩 preflight 등록 조건 ①이 깨진다): {ar}"
+        );
+        // 태스크를 띄우지 않은 데몬은 **켜졌다고 말하지 않는다**(음성 대조 — 제품이 자기 자신에
+        // 대해 거짓을 말하지 않는다). 나머지 셋은 정수 0에서 출발한다.
+        assert_eq!(ar["enabled"], json!(false), "spawn 전인데 enabled=true 면 거짓 보고다");
+        assert_eq!(ar["routed_1h"], json!(0));
+        assert_eq!(ar["suppressed_1h"], json!(0));
+        assert_eq!(ar["pending"], json!(0));
     }
 
     // CYS_BOOT_V2 는 프로세스 전역 env 라 판독 윈도를 직렬화한다(ACL_ENV_LOCK 과 같은 패턴).

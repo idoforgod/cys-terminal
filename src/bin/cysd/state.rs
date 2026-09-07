@@ -2380,6 +2380,13 @@ pub struct Daemon {
     /// 실행 ≤1" 이지 "전역 1" 이 아니므로, 레인을 키로 두면 그 불변식을 자료구조가 지고
     /// 서로 다른 레인의 동시 진행도 정직하게 표현된다.
     pub boot_run_active: Mutex<std::collections::HashMap<String, BootRunActive>>,
+    /// ★(0.14.31 · WP-3 B) 데몬 alert → CSO inbox 라우터의 상태(쿨다운·시간당 상한·미해결 집합).
+    ///
+    /// **전용 락이다** — 큐 계열 락 순서 규약(restored_queue → surfaces → pending_queue) **밖**에
+    /// 있고, 이 락을 쥔 채 다른 락을 잡지 않는다(그래서 어떤 락쌍도 만들지 않는다). 반대 방향도
+    /// 금지: pending_queue·surfaces 가드를 쥔 채 이 락을 잡지 마라(`org.status` 는 surfaces 가드를
+    /// 놓은 뒤에 잡는다). 자세한 계약은 [`crate::alert_route`] 모듈 주석.
+    pub alert_route: Mutex<crate::alert_route::RouteState>,
     /// (B3-2R ⑥·④ⓓ) fence 된 런의 원장 — **회수하지 못한 고아**의 목록이다(무kill 계약).
     /// 길이가 곧 admission 상한의 분모다. 유계는 감독자가 [`crate::boot_supervisor`] 에서 건다.
     pub boot_fenced: Mutex<Vec<FencedRun>>,
@@ -3148,6 +3155,8 @@ impl Daemon {
             supervisor_alive: AtomicBool::new(false),
             boot_run_active: Mutex::new(std::collections::HashMap::new()),
             boot_fenced: Mutex::new(Vec::new()),
+            // ★(0.14.31 · WP-3 B) enabled 는 alert_route::spawn 이 실제로 태스크를 열 때만 true.
+            alert_route: Mutex::new(Default::default()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
