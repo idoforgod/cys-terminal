@@ -10,7 +10,7 @@ stale). 데몬 조회 우선." — 그런데 팩의 파이썬 도구들은 각�
   · `javis_snapshot.py is_master()` — BOOT_SNAPSHOT 생산 게이트
   · `javis_completion_guard.py _role()` — 이벤트 `agent` 귀속 라벨
 이 모듈이 그 **한 곳**이다. 훅 셸의 짝은 `hooks/_lib.sh` 의 `cys_resolve_role()` 이며
-**같은 캐시 파일 형식**(`"<epoch> <역할|->"` 1줄)을 공유한다 — 두 층이 갈리면
+**같은 캐시 디렉터리·같은 레코드 문법**을 공유한다 — 두 층이 갈리면
 tests/test_role_authority.py 가 멈춘다.
 
 ────────────────────────────────────────────────────────────────────────────
@@ -18,14 +18,27 @@ tests/test_role_authority.py 가 멈춘다.
   ⓐ rc=0 + 역할 문자열 → **권위 있는 역할**
   ⓑ rc=0 + 빈 줄       → **권위 있는 '역할 없음'**(내 surface 가 데몬 목록에 없을 때도 이것 ·
                           `CYS_SURFACE_ID` 부재/파싱 불가면 조회 없이 이것)
-  ⓒ 그 밖(rc≠0·타임아웃·바이너리 부재) → **판정 불가**. '역할 없음'이 아니다.
+  ⓒ 그 밖(rc≠0·타임아웃·바이너리 부재·**표현 불가한 역할 문자열**) → **판정 불가**.
+     '역할 없음'이 아니다.
 ⓑ와 ⓒ를 뭉개면 데몬 사망이 '무역할'로 읽힌다 — Rust 가 그 둘을 rc 로 갈라 놓았으므로
 여기서도 절대 합치지 않는다.
 
-★신원 전제(이 모듈이 데몬에 묻는 조건): `CYS_SURFACE_ID`(구 `AITERM_SURFACE_ID`)가 있고
-  `^(surface:)?[0-9]+$` 로 파싱될 때만 묻는다(Rust `parse_surface_ref` src/lib.rs:2263 과
-  같은 규칙). 없으면 조회 자체를 하지 않고 env 로 답한다. 이유: surface 없는 실행(일반
-  터미널 · `CYS_ROLE=cso python3 javis_org.py apply …` 같은 정식 위임 경로 · 검체 하네스)에서
+★신원 전제(R1 교정 — 이 모듈이 데몬에 묻는 조건): Rust 가 **실제로 읽는 그 값 전체**를
+  검사한다. 종전 초안은 첫 줄만 떼어 검사하고 원본을 그대로 CLI 에 물려줬다 —
+  `CYS_SURFACE_ID="7\njunk"` 는 여기선 신원 7 로 통과하는데 Rust `parse_surface_ref` 는
+  파싱에 실패해 **조회 없이 rc0+빈 줄**(=권위 있는 무역할)을 낸다. 그러면 해소기가
+  **유효한 surface 7 아래에 '권위 있는 무역할'을 캐시**해 이후 정상 CSO 호출이 거짓 거부된다
+  (reviewer-codex R1). 그래서 지금은 값 **전체**를 다음 규칙으로 판정한다:
+    ① 키 선택: `CYS_SURFACE_ID` → `JAVIS_SURFACE_ID` → `AITERM_SURFACE_ID` 중 **비어 있지 않은**
+       첫 값(Rust `env_compat` src/lib.rs:351 의 `filter(|v| !v.is_empty())` 와 같다 —
+       공백만 있는 값도 '비어 있지 않음'이라 다음 키로 **넘어가지 않는다**)
+    ② 64자 초과면 즉시 '주소 없음'
+    ③ ASCII 공백 트림(Rust `str::trim` 의 **부분집합** — 유니코드 공백은 트림하지 않는다)
+    ④ 선두 `surface:` 1회 제거(Rust 와 같은 순서 — 제거 후 재트림 없음)
+    ⑤ `^[0-9]{1,19}$` 만 수용. **Rust 가 받는 `+7` 은 일부러 거절한다**(더 엄격한 쪽) —
+       거절의 귀결은 조회 없음 → env 폴백 = **이 WP 이전 동작**이라 새 허용이 없다.
+  주소가 없으면 조회 자체를 하지 않는다. 이유: surface 없는 실행(일반 터미널 ·
+  `CYS_ROLE=cso python3 javis_org.py apply …` 같은 정식 위임 경로 · 검체 하네스)에서
   Rust 는 ⓑ(빈 줄·rc 0)를 내는데, 그것을 '권위 있는 무역할'로 채택하면 **주소가 없다는
   사실이 역할이 없다는 판정으로 승격**된다. 그 승격은 정상 경로를 죽인다.
 
@@ -34,16 +47,37 @@ tests/test_role_authority.py 가 멈춘다.
 
 ★비용(부트체인 ④ '전 pane 사망' 회피): `_role()` 은 한 런에 20+회 불린다
   (javis_completion_guard.py :534 :626 :962 :1368 …). 그래서
-    ① **프로세스 메모** — 한 프로세스에서 조회는 최대 1회
+    ① **프로세스 메모** — 신원(surface·socket)마다 하나 · **만료 있음**(아래)
     ② **디스크 캐시 60s** — 훅이 초당 여러 번 떠도 왕복은 분당 1회
     ③ **실패 백오프 30s** — 데몬이 죽어 있을 때 매 호출 2s 정지가 전 pane 에 걸리지 않게
-  세 겹으로 막는다. 승계 반영 지연 ≤60s 는 **명시적으로 수용**한다(승계는 로컬에서 감지할
-  수 없다 · role-capability-gate.sh 의 TTL 15s 는 그 훅이 **능력 게이트**라 더 짧게 잡은
-  것이고, 여기 소비처는 게이트가 아니거나(라벨) 기동 시 1회 판정(게이트)이다).
+  세 겹으로 막는다. 승계 반영 지연 ≤60s 는 **명시적으로 수용**한다.
+
+★메모의 만료(R1 교정 · reviewer-codex): 종전 메모는 **영구**였다 — 오래 사는 임포터가
+  승계·데몬 재기동 뒤에도 옛 답을 무한히 재사용했다. 지금은
+    · 키 = (surface env 원값, socket env 원값) — 매 호출 env 로 재계산(I/O 0)
+    · 만료 = 권위 답이면 **그 답의 만료 시각**(데몬 답이면 now+60, 디스크 캐시 히트면
+      **그 레코드의 ts+60** — 다 된 캐시를 다시 60초 살려 지연 상한을 두 배로 만들지 않는다
+      · codex R1 지적) · 판정 불가/폴백이면 now+30(=실패 백오프와 같은 창)
+  이라 승계 반영 상한은 디스크 캐시와 **같은 60s** 로 유지된다.
 
 ★자식에게 `CYS_NO_AUTOSTART=1` 을 건다: 소켓 파일이 없으면 `cys` 는 autostart 경로를 탄다
   (src/bin/cys.rs:2258). **역할을 묻는 행위가 데몬을 낳아서는 안 된다** — 특히 `cys-dept`
   가드에서 부르는 경로는 아직 데몬이 없을 때 도는 경로다.
+
+★캐시 기질(R1 전면 교체 — 두 리뷰어의 심링크·FIFO·별칭·고아 지적 일괄 봉인):
+  ⓐ **전용 디렉터리** `<tmpbase>/cys-role-authority.d`(0700 · 소유자 자신 · group/other 쓰기 0).
+     검증에 실패하면 **캐시를 통째로 끈다**(데몬에 매번 묻는다) — 남의 디렉터리를 신뢰하느니
+     왕복 한 번이 낫다. tmp 루트에 파일을 흩뿌리지 않으므로 '예측 가능한 경로에 심어 둔
+     심링크·FIFO' 부류가 구조적으로 닫힌다.
+  ⓑ **유계 레코드 문법** `"<ts> <role> <epoch> <sockid>"` 1줄(판독 상한 4KB).
+     ts=선두 0 없는 1~12자리(셸 산술이 8진수·오버플로로 죽던 길 차단) · role/epoch=`-` 또는
+     `[A-Za-z0-9._:+-]{1,64}`(**공백 불가** — 같은 바이트가 두 층에서 `cso`/`cso ` 로 갈리던 길
+     차단) · sockid=줄 나머지(정확 일치 비교).
+  ⓒ boot-epoch 는 **파일명에서 레코드로** 옮겼다 — 재기동마다 고아 파일이 생기던 것을 없애고
+     (파일은 (surface, socket 슬러그)당 정확히 하나), 슬러그 충돌은 **캐시 미스**로 강등된다
+     (종전엔 다른 데몬의 역할이 권위로 읽힐 수 있었다 · reviewer-codex).
+  ⓓ 모든 판독은 `O_NOFOLLOW|O_NONBLOCK` 로 연 뒤 fd 를 `fstat` 해 정규 파일·소유자 확인
+     (FIFO 가 열기에서 훅을 영원히 붙잡던 길 차단 — 종전엔 검사 **전에** 블로킹 open 이었다).
 
 stdlib 만 사용. import 부작용 0(파일 생성·env 변경·프로세스 스폰 전무 — 첫 `resolve_role()`
 호출에서만 조회가 일어난다).
@@ -58,17 +92,31 @@ import sys
 import tempfile
 import time
 
-__all__ = ["resolve_role", "resolve_role_detail", "reset_cache",
+__all__ = ["resolve_role", "resolve_role_detail", "reset_cache", "surface_id",
            "is_authoritative", "is_authoritative_none",
            "QUERY_TIMEOUT_S", "CACHE_TTL_S", "FAIL_BACKOFF_S"]
 
+# ★상수는 **고정**이다(R1 교정): 종전 셸 짝은 `CYS_ROLE_CACHE_TTL` 류 env 로 덮을 수 있었고
+#   파이썬은 못 덮어서 "두 층 규칙 동일"이 거짓이었다(reviewer-claude). 노브를 없애는 쪽으로
+#   통일한다 — 정본 §3-4 "게이트를 끄는 노브 없음"과도 같은 방향이다.
 QUERY_TIMEOUT_S = 2.0      # 초 · 자식 `cys surface-role` 데드라인(Rust 내장 10s 보다 짧게)
 CACHE_TTL_S = 60           # 초 · 디스크 캐시 수명(= 승계 반영 지연 상한 · 명시적 수용)
 FAIL_BACKOFF_S = 30        # 초 · 조회 실패 후 재조회 유예(데몬 사망 시 폭주·정지 차단)
-ROLE_MAX_LEN = 64          # 역할 문자열 상한(다중행·거대값 오염 차단)
 
-# Rust `parse_surface_ref`(src/lib.rs:2263)와 **같은 규칙**: "surface:31" | "31".
-_SURFACE_RE = re.compile(r"^(?:surface:)?([0-9]+)$")
+CACHE_DIR_NAME = "cys-role-authority.d"
+CACHE_READ_CAP = 4096      # 바이트 · 캐시 판독 상한
+IDENT_MAX = 64             # surface env 원값 상한(그 이상은 신원이 아니다)
+SOCKID_MAX = 512           # 소켓 신원 문자열 상한
+SLUG_MAX = 80              # 파일명 성분 상한
+
+# 레코드 토큰 문법 — 셸 짝 `cys_role_token_ok` 와 **글자 그대로 같은 집합**.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9._:+-]{1,64}$")
+# 타임스탬프 — 선두 0 금지 · 1~12자리(POSIX sh 산술이 8진수 해석·int64 초과로 죽지 않게).
+_TS_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+# 신원 — Rust `parse_surface_ref`(src/lib.rs:2263)에 자릿수 상한 19 를 더한 **부분집합**.
+_SID_RE = re.compile(r"^[0-9]{1,19}$")
+# ASCII 공백만 트림한다(Rust `str::trim` 은 유니코드 공백까지 트림 — 우리는 더 엄격한 쪽).
+_ASCII_WS = " \t\n\r\v\f"
 
 # 판정 출처(진단·검체용). daemon/daemon-none 만 권위다.
 SOURCE_DAEMON = "daemon"            # ⓐ 데몬이 구체 역할을 줬다
@@ -84,6 +132,9 @@ SOURCE_NONE = "none"                # 아무 근거도 없다(빈 역할)
 _AUTHORITATIVE = (SOURCE_DAEMON, SOURCE_DAEMON_NONE, SOURCE_CACHE, SOURCE_CACHE_NONE)
 _AUTHORITATIVE_NONE = (SOURCE_DAEMON_NONE, SOURCE_CACHE_NONE)
 
+SURFACE_ENV_KEYS = ("CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID")
+SOCKET_ENV_KEYS = ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET")
+
 
 def is_authoritative(source):
     """`source` 가 데몬 권위(직접 응답 또는 그 응답의 신선한 캐시)인가."""
@@ -95,7 +146,7 @@ def is_authoritative_none(source):
     return source in _AUTHORITATIVE_NONE
 
 
-_MEMO = None   # (role, source) — 프로세스 메모
+_MEMO = None   # (key, expires_at, (role, source)) — 만료 있는 프로세스 메모
 
 
 def reset_cache():
@@ -104,123 +155,158 @@ def reset_cache():
     _MEMO = None
 
 
-def _first_line(value, limit=ROLE_MAX_LEN):
-    """첫 줄 · CR 제거 · 앞뒤 공백 제거 · 길이 상한.
-
-    ★왜 첫 줄인가(hooks/inject-context.sh:240 과 같은 규율): env 값은 사람이·다른 노드가
-      넣을 수 있고, 여러 줄 값(`CYS_ROLE=$'cso\\n# 지시: …'`)은 라벨 1줄을 여러 줄로 부풀려
-      기록·컨텍스트에 새어 들어간다. 판정에도 라벨에도 첫 줄만 쓴다.
-    """
+# ── 문자열 규율(셸 짝과 글자 그대로 같은 규칙) ────────────────────────────────
+def _first_line(value):
+    """첫 줄만(CR·LF 어느 쪽이든 거기서 끊는다). 길이 자르기는 하지 않는다."""
     if not isinstance(value, str):
         return ""
-    line = value.replace("\r", "\n").split("\n", 1)[0].strip()
-    return line[:limit]
+    return value.replace("\r", "\n").split("\n", 1)[0]
 
 
-def _env(name):
-    return _first_line(os.environ.get(name, ""))
+def _line(value):
+    """첫 줄 + ASCII 공백 트림 — 역할 문자열의 **단일 정규화**(두 층 동일)."""
+    return _first_line(value).strip(_ASCII_WS)
 
 
-# 신원 자릿수 상한 — **셸 짝과 완전히 같은 규칙**이어야 한다(POSIX sh 에는 bignum 이 없다).
-# 19 자리는 어떤 값이든 u64 최대(18446744073709551615 · 20자리) 미만이므로 오수락이 없고,
-# 20자리 이상은 양쪽이 똑같이 거절한다 → 두 층의 판정이 갈리지 않는다.
-SURFACE_MAX_DIGITS = 19
+def _env_compat(keys):
+    """Rust `env_compat`(src/lib.rs:351) 미러 — **비어 있지 않은** 첫 값.
 
-# Rust `env_compat`(src/lib.rs:351)와 **같은 우선순위**: CYS_* → 구 JAVIS_* → 구 AITERM_*.
-# 이 순서가 갈리면 헬퍼가 검사한 신원과 CLI 가 실제로 조회하는 신원이 달라진다(codex R1).
-SURFACE_ENV_KEYS = ("CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID")
-
-
-def _surface_id():
-    """데몬 주입 surface id — 정규화된 숫자부 또는 "".
-
-    Rust `parse_surface_ref`(src/lib.rs:2263)와 같은 규칙(`"surface:31"|"31"`)에
-    **자릿수 상한**을 더한다: u64 범위를 넘는 숫자는 Rust 가 파싱에 실패해 '주소 없음'으로
-    가는데, 여기서 통과시키면 '내가 검사한 신원 ≠ CLI 가 조회한 신원'이 된다(codex R1).
+    ★공백만 있는 값도 '비어 있지 않음'이라 다음 키로 넘어가지 않는다(Rust 와 동일).
     """
-    raw = ""
-    for k in SURFACE_ENV_KEYS:
-        raw = _first_line(os.environ.get(k, ""), limit=40)
-        if raw:
-            break
-    m = _SURFACE_RE.match(raw)
-    if not m:
-        return ""
-    digits = m.group(1)
-    if len(digits) > SURFACE_MAX_DIGITS:
-        return ""
-    return digits
-
-
-def _slug(s):
-    """캐시 파일명 성분 — `hooks/_lib.sh` `cys_role_slug` 와 **같은 치환**(tr -c 'A-Za-z0-9._-')."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", s or "")
-
-
-# Rust `env_compat` 와 같은 우선순위(소켓도 CYS_ → JAVIS_ → AITERM_ · src/lib.rs:379).
-SOCKET_ENV_KEYS = ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET")
-
-
-def _socket_key():
-    for k in SOCKET_ENV_KEYS:
-        v = _first_line(os.environ.get(k, ""), limit=4096)
+    for k in keys:
+        v = os.environ.get(k)
         if v:
             return v
     return ""
 
 
-def _boot_epoch():
-    """`dirname($CYS_SOCKET)/boot-epoch` 첫 줄 — 데몬이 부트마다 bump(boot_supervisor.rs:856).
+def _token_ok(s):
+    return bool(_TOKEN_RE.match(s or ""))
 
-    캐시 키에 넣어 **데몬 재기동 = 캐시 무효**로 만든다(재기동 후 stale 역할 재사용 차단).
 
-    ★정직한 한계(codex R1 · 과장 금지): 이것은 **권위가 아니라 캐시 키의 소금**이다.
-      ⓐ Windows 의 소켓은 named pipe(`\\\\.\\pipe\\cys`)라 `dirname` 이 상태 디렉터리가 아니다 →
-        epoch 는 빈 문자열이 된다. ⓑ 감독자 비활성·쓰기 실패면 파일이 없거나 옛 값이 남는다.
-      그 경우 캐시 무효화는 **TTL 60s 하나만** 남는다 — 없어도 안전 방향이 바뀌지 않게(캐시는
-      권위가 아니고 60초 사본일 뿐) 설계했고, 셸 짝도 **같은 규칙**을 써서 두 층이 같은 키를 만든다.
+def surface_id():
+    """Rust 가 조회할 신원의 **정규화된 숫자부** 또는 ""(주소 없음).
+
+    파일 헤더 ★신원 전제의 ①~⑤ 를 그대로 집행한다. 반환값은 선두 0 을 제거한 10진수라
+    캐시 키가 `007`/`7` 로 갈리지 않는다(셸 짝도 같은 정규화를 한다).
     """
-    sock = _socket_key()
-    if not sock:
+    raw = _env_compat(SURFACE_ENV_KEYS)
+    if not raw or len(raw) > IDENT_MAX:
         return ""
+    t = raw.strip(_ASCII_WS)
+    if t.startswith("surface:"):
+        t = t[len("surface:"):]
+    if not _SID_RE.match(t):
+        return ""
+    return t.lstrip("0") or "0"
+
+
+def _sock_id():
+    """데몬 신원 문자열 — 캐시 **레코드에 그대로 실려** 정확 비교된다.
+
+    ★왜 슬러그가 아니라 원문인가(reviewer-codex R1): `tr -c` 슬러그는 손실 치환이라
+      `/tmp/a/b.sock` 과 `/tmp/a_b.sock` 이 **같은 파일명**을 만들었다 — 그러면 A 데몬의
+      역할·실패표식이 B 데몬의 권위가 된다. 지금은 파일명이 겹쳐도 레코드의 sockid 가
+      다르면 **캐시 미스**다(권위가 넘어가지 않는다).
+    ★소켓 지정이 없을 때: Rust 기본 소켓은 상태 디렉터리에서 유도된다(src/lib.rs:379) →
+      `default:<XDG_STATE_HOME>:<HOME>` 로 문맥을 구분한다(다른 HOME 이 키를 공유하지 않게).
+    """
+    v = _env_compat(SOCKET_ENV_KEYS)
+    if not v:
+        v = "default:%s:%s" % (os.environ.get("XDG_STATE_HOME", ""),
+                               os.environ.get("HOME", ""))
+    return v[:SOCKID_MAX]
+
+
+def _slug(s):
+    """파일명 성분 — 셸 짝 `tr -c 'A-Za-z0-9._-' '_'` 와 **바이트 단위로** 같다.
+
+    ★유니코드를 코드포인트로 치환하면 셸(`tr`=바이트)과 파일명이 갈린다(reviewer-codex R1).
+    """
+    out = []
+    for c in (s or "").encode("utf-8", "replace"):
+        if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122) or c in (46, 95, 45):
+            out.append(chr(c))
+        else:
+            out.append("_")
+    return "".join(out)[:SLUG_MAX]
+
+
+# ── 캐시 기질 ────────────────────────────────────────────────────────────────
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # Windows 에는 없다(0 = 무효과)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)   # FIFO 에서 open 이 매달리지 않게
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _euid():
+    f = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
+    return f() if f is not None else None
+
+
+def _cache_dir():
+    """0700 전용 디렉터리 경로 또는 ""(캐시 사용 불가).
+
+    셸 짝과 **같은 규칙**: `TMPDIR` → `TEMP` → `TMP` 중 비어 있지 않은 첫 값(없으면
+    파이썬은 `tempfile.gettempdir()`, 셸은 `/tmp`) 아래의 `cys-role-authority.d`.
+    ★정직한 한계: 네이티브 Windows 파이썬은 `TEMP`(예 `C:\\…\\Temp`)를 집고 Git Bash 셸은
+      MSYS `/tmp` 를 집을 수 있다 — 그 플랫폼에서 두 층은 **캐시를 공유하지 못한다**.
+      비용은 데몬 왕복이 층마다 한 번씩 더 도는 것뿐이고(권위는 캐시가 아니라 데몬),
+      각 층의 캐시는 자기 안에서 정합하다. 검체는 이 해소 규칙 자체를 잰다.
+    """
+    base = ""
+    for k in ("TMPDIR", "TEMP", "TMP"):
+        v = os.environ.get(k)
+        if v:
+            base = v
+            break
+    if not base or not os.path.isdir(base):
+        try:
+            base = tempfile.gettempdir()
+        except Exception:
+            return ""
+    d = os.path.join(base, CACHE_DIR_NAME)
     try:
-        with open(os.path.join(os.path.dirname(sock), "boot-epoch"),
-                  encoding="utf-8", errors="replace") as f:
-            return _first_line(f.readline(), limit=40)
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
     except Exception:
         return ""
+    import stat as _stat
+    try:
+        st = os.lstat(d)
+    except Exception:
+        return ""
+    if not _stat.S_ISDIR(st.st_mode):
+        return ""                       # 심링크·정규 파일 등 = 신뢰 불가
+    uid = _euid()
+    if uid is not None:
+        if st.st_uid != uid:
+            return ""
+        if st.st_mode & 0o022:          # group/other 쓰기 가능 = 신뢰 불가
+            return ""
+    return d
 
 
 def _cache_path(sid):
-    # ★TMPDIR 우선(셸 짝 `_lib.sh` 가 `${TMPDIR:-/tmp}` 로 같은 파일을 집는다) · 부재 시
-    #   `tempfile.gettempdir()`(네이티브 Windows 는 TMPDIR 대신 TEMP/TMP 라 "/tmp" 로 붕괴한다).
-    base = os.environ.get("TMPDIR") or tempfile.gettempdir()
-    name = "cys-role-authority-%s-%s-%s" % (
-        _slug(sid or "none"),
-        _slug(_socket_key() or "none"),
-        _slug(_boot_epoch()))
-    return os.path.join(base, name)
-
-
-CACHE_READ_CAP = 4096      # 바이트 · 캐시 판독 상한(거대·FIFO 파일로 훅을 붙잡지 못하게)
-
-_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)   # Windows 에는 없다(0 = 무효과)
-_O_BINARY = getattr(os, "O_BINARY", 0)
+    """(surface, socket 슬러그)당 정확히 하나. 캐시 불가면 ""."""
+    d = _cache_dir()
+    if not d:
+        return ""
+    return os.path.join(d, "role-%s-%s" % (_slug(sid or "none"), _slug(_sock_id())))
 
 
 def _open_trusted(path):
     """캐시 파일을 **연 뒤** 그 fd 로 검증한다 — 검사 후 교체(TOCTOU)를 닫는다.
 
-    ⓐ `O_NOFOLLOW` 로 심링크는 열리지 않는다(POSIX). ⓑ 연 fd 를 `fstat` 해 정규 파일·
-    소유자 자신을 확인한다 — `lstat` 후 `open` 하는 순서였다면 그 사이에 바꿔치기가 된다.
-    ⓒ 검사에 실패하면 **신뢰하지 않는다**(캐시 없음으로 읽는 쪽이 안전하다).
-    ★Windows: `O_NOFOLLOW`·`st_uid` 가 없거나 무의미하다 → 그 축만 비고, TMPDIR 이 사용자별이라는
-      OS 계약에 기댄다. 캐시는 **권한 증명이 아니다**(같은 사용자 프로세스는 어차피 쓸 수 있다) —
-      권위는 데몬 응답이고 캐시는 그 응답의 60초 사본일 뿐이다.
+    ⓐ `O_NOFOLLOW` 로 심링크는 열리지 않는다(POSIX). ⓑ `O_NONBLOCK` 이라 FIFO 여도 open 이
+    매달리지 않는다(R1 교정: 종전엔 **검사 전에** 블로킹 open 이라 훅이 영원히 멈출 수 있었다).
+    ⓒ 연 fd 를 `fstat` 해 정규 파일·소유자 자신을 확인한다. ⓓ 실패하면 신뢰하지 않는다.
+    ★Windows: `O_NOFOLLOW`·`st_uid` 가 없거나 무의미하다 → 그 축만 비고, 전용 디렉터리와
+      TMPDIR 이 사용자별이라는 OS 계약에 기댄다. 캐시는 **권한 증명이 아니다**.
     """
     import stat as _stat
     try:
-        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_BINARY)
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_BINARY)
     except Exception:
         return None
     try:
@@ -228,8 +314,8 @@ def _open_trusted(path):
         if not _stat.S_ISREG(st.st_mode):
             os.close(fd)
             return None
-        getuid = getattr(os, "geteuid", None) or getattr(os, "getuid", None)
-        if getuid is not None and st.st_uid != getuid():
+        uid = _euid()
+        if uid is not None and st.st_uid != uid:
             os.close(fd)
             return None
         return fd
@@ -242,7 +328,9 @@ def _open_trusted(path):
 
 
 def _read_first_line(path):
-    """신뢰 가능한 캐시 파일의 첫 줄(상한 4KB). 못 읽으면 None."""
+    """신뢰 가능한 파일의 첫 줄(상한 4KB). 못 읽으면 None."""
+    if not path:
+        return None
     fd = _open_trusted(path)
     if fd is None:
         return None
@@ -259,39 +347,62 @@ def _read_first_line(path):
         text = raw.decode("utf-8", "replace")
     except Exception:
         return None
-    return text.replace("\r", "\n").split("\n", 1)[0]
+    return _first_line(text)
 
 
-def _cache_read(path, now):
-    """(role, is_none, fresh) — 형식 `"<epoch> <역할|->"` 1줄.
+def _boot_epoch():
+    """`dirname($CYS_SOCKET)/boot-epoch` 첫 줄 토큰 또는 `-`(모름).
 
-    시계 역행(미래 타임스탬프)은 신선이 아니다 — 그러면 캐시가 무기한 유효해진다.
+    데몬이 부트마다 bump 한다(boot_supervisor.rs:856). 캐시 **레코드**에 넣어
+    '데몬 재기동 = 캐시 무효'로 만든다(파일명에 넣던 종전 방식은 재기동마다 고아를 남겼다).
+
+    ★정직한 한계(과장 금지): 이것은 **권위가 아니라 캐시의 세대 표식**이다.
+      ⓐ Windows 의 소켓은 named pipe 라 `dirname` 이 상태 디렉터리가 아니다 → `-`.
+      ⓑ 소켓 지정이 없거나 감독자 비활성·쓰기 실패면 → `-`.
+      그 경우 무효화는 **TTL 60s 하나만** 남는다. 셸 짝도 같은 규칙이라 두 층이 갈리지 않는다.
     """
-    line = _read_first_line(path)
-    if line is None:
-        return "", False, False
-    parts = line.split(" ", 1)
-    if len(parts) != 2:
-        return "", False, False          # 구형·손상 형식은 무시
+    sock = _env_compat(SOCKET_ENV_KEYS)
+    if not sock:
+        return "-"
     try:
-        ts = int(parts[0])
-    except ValueError:
-        return "", False, False
-    role = _first_line(parts[1])
-    fresh = (ts > 0 and ts <= now and (now - ts) < CACHE_TTL_S)
-    if role == "-":
-        return "", True, fresh
-    if not role:
-        return "", False, False
-    return role, False, fresh
+        line = _read_first_line(os.path.join(os.path.dirname(sock), "boot-epoch"))
+    except Exception:
+        return "-"
+    if line is None:
+        return "-"
+    t = line.strip(_ASCII_WS)
+    return t if _token_ok(t) else "-"
 
 
-def _cache_write(path, now, value):
+def _record(now, role, epoch, sockid):
+    return "%d %s %s %s\n" % (now, role if role else "-", epoch or "-", sockid)
+
+
+def _parse_record(line, sockid, epoch):
+    """(ts, role) 또는 None. 문법 위반·신원 불일치·세대 불일치는 전부 '캐시 없음'이다."""
+    if not line:
+        return None
+    parts = line.split(" ", 3)
+    if len(parts) != 4:
+        return None
+    ts_s, role, ep, sk = parts
+    if not _TS_RE.match(ts_s):
+        return None
+    if not _token_ok(role) or not _token_ok(ep):
+        return None
+    if sk != sockid or ep != epoch:
+        return None
+    return int(ts_s), role
+
+
+def _cache_write(path, text):
     """0600 · 같은 디렉터리 원자 교체. 실패는 조용히 무시한다(캐시는 최적화지 사실이 아니다).
 
     ★`O_CREAT|O_EXCL` 로 임시 이름을 **새로** 만든다 — 기존 파일에 바로 쓰면 그 자리에 심어 둔
       심링크의 목적지를 truncate 하는 길이 된다. 최종 배치는 `os.replace`(원자 교체)다.
     """
+    if not path:
+        return
     tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
         try:
@@ -300,7 +411,7 @@ def _cache_write(path, now, value):
             pass
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
         try:
-            os.write(fd, ("%d %s\n" % (now, value)).encode("utf-8"))
+            os.write(fd, text.encode("utf-8"))
         finally:
             os.close(fd)
         os.replace(tmp, path)
@@ -311,25 +422,15 @@ def _cache_write(path, now, value):
             pass
 
 
-def _fail_fresh(path, now):
-    """조회 실패 표식이 백오프 창 안인가(형식은 캐시와 동일 `"<epoch> -"` — 첫 토큰만 읽는다)."""
-    line = _read_first_line(path)
-    if line is None:
-        return False
-    try:
-        ts = int(line.split(" ", 1)[0])
-    except ValueError:
-        return False
-    return ts > 0 and ts <= now and (now - ts) < FAIL_BACKOFF_S
-
-
 def _query_daemon():
     """(role, ok) — ok=False 는 **판정 불가**(ⓒ)다. role="" + ok=True 는 권위 있는 무역할(ⓑ).
 
     ★자식 env: `CYS_NO_AUTOSTART=1` 강제(역할 조회가 데몬을 낳지 않게) ·
       `PYTHONDONTWRITEBYTECODE`/`PYTHONUTF8` 은 부모 값을 그대로 상속한다.
+    ★표현 불가한 역할(공백 포함·64자 초과·문법 밖)은 **판정 불가**로 낸다 — 잘라 쓰면 없는
+      역할을 지어내는 것이고, 그 자리에서 캐시 문법도 깨진다. 판정 불가의 귀결은 종전 동작이다.
     """
-    exe = _first_line(os.environ.get("CYS_BIN", ""), limit=4096) or "cys"
+    exe = _line(os.environ.get("CYS_BIN", "")) or "cys"
     env = dict(os.environ)
     env["CYS_NO_AUTOSTART"] = "1"
     try:
@@ -341,7 +442,71 @@ def _query_daemon():
         return "", False
     if p.returncode != 0:
         return "", False
-    return _first_line(p.stdout), True
+    role = _line(p.stdout)
+    if role and not _token_ok(role):
+        return "", False
+    return role, True
+
+
+def _env_fallback():
+    """폴백은 **`CYS_ROLE` 하나뿐**이다 — 현행 결정 지점들이 읽는 바로 그 키.
+
+    ★`CYS_SURFACE_ROLE` 을 일반 폴백에 넣지 않는 이유(codex R1): 그 변수는
+      `role-capability-gate.sh` 가 **해소 결과로 export 하는 산출물**이지 신원 입력이 아니다.
+      폴백에 넣으면 `CYS_SURFACE_ROLE=cso` + `CYS_ROLE=worker` 에서 **현행이 거부하던 것을
+      새로 허용**하게 된다 — "판정 불가면 현행 그대로"라는 이 WP 의 실패 방향 약속이 거짓이 된다.
+      그 두 키를 함께 보는 소비처(`hooks/inject-context.sh`)는 자기 계약으로 직접 본다.
+    """
+    v = _line(os.environ.get("CYS_ROLE", ""))
+    if v:
+        return v, SOURCE_ENV_ROLE
+    return "", SOURCE_NONE
+
+
+def _resolve_uncached(now):
+    """(role, source, expires_at) — 만료 시각은 프로세스 메모의 상한이 된다."""
+    fb_exp = now + FAIL_BACKOFF_S
+    sid = surface_id()
+    if not sid:
+        # 주소가 없다 = 데몬에게 '나'를 물을 수 없다. 무역할이라는 **판정이 아니다**.
+        role, src = _env_fallback()
+        return role, src, fb_exp
+    sockid = _sock_id()
+    epoch = _boot_epoch()
+    # 레코드는 1줄 문법이다 — 소켓 신원에 개행이 있으면 디스크 캐시를 쓰지 않는다(메모만).
+    cpath = "" if ("\n" in sockid or "\r" in sockid) else _cache_path(sid)
+    if cpath:
+        rec = _parse_record(_read_first_line(cpath), sockid, epoch)
+        if rec:
+            ts, role = rec
+            if 0 < ts <= now and (now - ts) < CACHE_TTL_S:
+                exp = ts + CACHE_TTL_S      # ★다 된 캐시를 메모가 되살리지 않는다(codex R1)
+                if role == "-":
+                    return "", SOURCE_CACHE_NONE, exp
+                return role, SOURCE_CACHE, exp
+    fpath = (cpath + ".fail") if cpath else ""
+    skip = False
+    if fpath:
+        rec = _parse_record(_read_first_line(fpath), sockid, epoch)
+        if rec:
+            ts, _r = rec
+            skip = (0 < ts <= now and (now - ts) < FAIL_BACKOFF_S)
+    if not skip:
+        role, ok = _query_daemon()
+        if ok:
+            _cache_write(cpath, _record(now, role, epoch, sockid))
+            if fpath:
+                try:
+                    os.unlink(fpath)
+                except Exception:
+                    pass
+            if role:
+                return role, SOURCE_DAEMON, now + CACHE_TTL_S
+            return "", SOURCE_DAEMON_NONE, now + CACHE_TTL_S
+        _cache_write(fpath, _record(now, "-", epoch, sockid))   # 실패 표식(형식 공유)
+    # ⓒ 판정 불가 — 신선하지 않은 캐시는 쓰지 않는다(옛 역할이 무기한 사는 길). env 폴백.
+    role, src = _env_fallback()
+    return role, src, fb_exp
 
 
 def resolve_role_detail():
@@ -351,54 +516,22 @@ def resolve_role_detail():
     을 구분할 수 있다 — `cys-dept` 단일소유 가드가 그 구분을 쓴다.
     """
     global _MEMO
-    if _MEMO is not None:
-        return _MEMO
     try:
-        _MEMO = _resolve_uncached()
+        now = int(time.time())
+        key = (_env_compat(SURFACE_ENV_KEYS), _env_compat(SOCKET_ENV_KEYS))
+        if _MEMO is not None and _MEMO[0] == key and now < _MEMO[1]:
+            return _MEMO[2]
+        role, src, exp = _resolve_uncached(now)
+        if exp <= now:
+            exp = now + 1     # 최소 1초 — 한 훅 런의 20+회 호출이 왕복 20+회가 되지 않게
+        _MEMO = (key, exp, (role, src))
+        return role, src
     except Exception:
         # 이 모듈이 소비처를 죽이는 경로는 없다(§3-3) — 최악이 현행(env) 동작이다.
-        _MEMO = _env_fallback()
-    return _MEMO
-
-
-def _env_fallback():
-    """폴백은 **`CYS_ROLE` 하나뿐**이다 — 현행 결정 지점들이 읽는 바로 그 키.
-
-    ★`CYS_SURFACE_ROLE` 을 일반 폴백에 넣지 않는 이유(codex R1): 그 변수는
-      `role-capability-gate.sh` 가 **해소 결과로 export 하는 산출물**이지 신원 입력이 아니다.
-      폴백에 넣으면 `CYS_SURFACE_ROLE=cso` + `CYS_ROLE=worker` 조합에서 **현행이 거부하던 것을
-      새로 허용**하게 된다 — "판정 불가면 현행 그대로"라는 이 WP 의 실패 방향 약속이 거짓이 된다.
-      그 두 키를 함께 보는 소비처(`hooks/inject-context.sh`)는 자기 계약으로 직접 본다.
-    """
-    v = _env("CYS_ROLE")
-    if v:
-        return v, SOURCE_ENV_ROLE
-    return "", SOURCE_NONE
-
-
-def _resolve_uncached():
-    sid = _surface_id()
-    if not sid:
-        # 주소가 없다 = 데몬에게 '나'를 물을 수 없다. 무역할이라는 **판정이 아니다**.
-        return _env_fallback()
-    now = int(time.time())
-    cpath = _cache_path(sid)
-    c_role, c_none, c_fresh = _cache_read(cpath, now)
-    if c_fresh:
-        return (c_role, SOURCE_CACHE) if c_role else ("", SOURCE_CACHE_NONE)
-    fpath = cpath + ".fail"
-    if not _fail_fresh(fpath, now):
-        role, ok = _query_daemon()
-        if ok:
-            _cache_write(cpath, now, role if role else "-")
-            try:
-                os.unlink(fpath)
-            except Exception:
-                pass
-            return (role, SOURCE_DAEMON) if role else ("", SOURCE_DAEMON_NONE)
-        _cache_write(fpath, now, "-")   # 실패 표식(형식 공유 · 값은 안 읽는다)
-    # ⓒ 판정 불가 — 신선하지 않은 캐시는 쓰지 않는다(옛 역할이 무기한 사는 길). env 폴백.
-    return _env_fallback()
+        try:
+            return _env_fallback()
+        except Exception:
+            return "", SOURCE_NONE
 
 
 def resolve_role(default=""):
@@ -421,8 +554,9 @@ def _self_test():
         if not cond:
             fails.append(name)
 
-    keys = ("CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_ROLE", "CYS_SURFACE_ROLE",
-            "CYS_SOCKET", "CYS_BIN", "TMPDIR")
+    keys = ("CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_ROLE",
+            "CYS_SURFACE_ROLE", "CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET",
+            "CYS_BIN", "TMPDIR", "TEMP", "TMP")
     saved = {k: os.environ.get(k) for k in keys}
     td = tempfile.mkdtemp(prefix="javis-role-st-")
     n = [0]
@@ -475,6 +609,11 @@ def _self_test():
         fresh(CYS_ROLE="cso")
         stub(0, "")
         check("surface 없음 -> 조회 없이 env(주소 부재는 무역할 판정이 아니다)",
+              resolve_role_detail() == ("cso", SOURCE_ENV_ROLE), repr(resolve_role_detail()))
+
+        fresh(CYS_SURFACE_ID="7\njunk", CYS_ROLE="cso")
+        stub(0, "")
+        check("★여러 줄 신원은 Rust 도 거절한다 -> 조회 없이 env(권위 무역할 캐시 오염 차단)",
               resolve_role_detail() == ("cso", SOURCE_ENV_ROLE), repr(resolve_role_detail()))
 
         fresh(CYS_SURFACE_ID="7", CYS_ROLE="master")

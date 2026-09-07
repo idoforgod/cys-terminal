@@ -111,8 +111,21 @@ shutil.rmtree(tmp)
 src = open(DEPT, encoding="utf-8").read()
 check("W1 launch 배선", src.count("dept_tombstone_remove \"$name\"") >= 3,
       "count=%d(launch/allocate/create)" % src.count("dept_tombstone_remove \"$name\""))
-check("W2 rotate 가드(export)", "CYS_DEPT_ROTATE=1 bash \"$0\" launch" in src)
-check("W3 helper rotate 가드", '[ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0' in src)
+# ★재핀(0.14.31 P6 R1 · 기전 변경): rotate 재귀 표식이 **상속되는 env → 비상속 argv** 로 바뀌었다.
+#   핀의 의도("rotate 재귀에서 묘비를 건드리지 않는 배선이 소실되지 않았는가")는 그대로이고
+#   그 배선의 **표현**만 갈아탄다. 근거(라이브 실측 2026-09-08 05:2x): dept-2 cysd(pid 2634)와
+#   그 좌석 3기(4147/5087/7981)가 `CYS_DEPT_ROTATE=1` 을 상속하고 있어서, 종전 표식은 그 부서의
+#   모든 pane 에서 이 가드와 단일소유 게이트를 **영구히 껐다**(정본 §3-4 "게이트를 끄는 노브 없음").
+check("W2 rotate 가드(argv 표식)", 'bash "$0" launch "$name" --rotate' in src)
+check("W3 helper rotate 가드", '[ "${_CYS_ROTATE_SELF:-}" = "1" ] && return 0' in src)
+# ★반례(신설): 상속되는 표식으로 되돌아가면 즉시 적색.
+check("W3b ★상속 env 표식 부활 금지", "CYS_DEPT_ROTATE=1 bash" not in src)
+check("W3c ★게이트가 상속 env 를 다시 읽지 않는다",
+      '[ "${CYS_DEPT_ROTATE:-}" = "1" ]' not in src)
+# ★이미 샌 라이브 값 회수 — 네 곳의 cysd 스폰 전부가 그 변수를 벗긴다.
+check("W3d ★cysd 스폰 4곳 모두 CYS_DEPT_ROTATE 를 벗긴다",
+      src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE") == 4,
+      "count=%d" % src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE"))
 check("W4 helper --remove", "--dept --remove" in src)
 check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
 # ★D-IMPL-2 대칭 핀: phoenix 묘비와 데몬 묘비는 set/remove가 항상 쌍으로 — 한쪽만 있으면

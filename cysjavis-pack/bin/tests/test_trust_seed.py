@@ -1987,7 +1987,12 @@ class DeptWiringStatic(unittest.TestCase):
         lines = [l for l in self.src.splitlines() if 'nohup "$CYSD"' in l]
         self.assertEqual(len(lines), 4, lines)
         for l in lines:
-            self.assertIn("env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup", l, l)
+            # ★재핀(0.14.31 P6 R1 · 항목 추가): 핀의 의도("좌석 env 를 벗기고 데몬을 스폰한다")는
+            #   그대로이고 벗기는 **목록이 늘었다**. `CYS_DEPT_ROTATE` 는 rotate 재귀 표식으로
+            #   자식 cysd → 그 좌석 전부에 상속돼 부서 단일소유 게이트를 영구히 껐다(2026-09-08
+            #   라이브 실측: dept-2 cysd pid 2634 · 좌석 4147/5087/7981). 이미 샌 값은 재기동으로 회수된다.
+            self.assertIn("env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF"
+                          " -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup", l, l)
             self.assertNotIn("CYS_SOCKET=", l.split("env -u", 1)[1], "env -u 뒤에 대입이 남아 있다")
 
 

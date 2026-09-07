@@ -506,6 +506,12 @@ def _st_env(extra=None):
     import tempfile as _tf
     if _ST_SEAL[0] is None:
         _ST_SEAL[0] = _tf.mkdtemp(prefix="snapshot-st-seal-")
+        # ★R1(리뷰어 minor): 이 디렉터리는 종전에 **한 번도 지워지지 않았다** —
+        #   `javis_snapshot --self-test`(= `javis_preflight --self-test` 가 구동한다)를
+        #   돌릴 때마다 tmp 에 한 개씩 쌓였다. 프로세스 종료 시 정리한다.
+        import atexit as _ax
+        import shutil as _sh
+        _ax.register(_sh.rmtree, _ST_SEAL[0], True)
     env = dict(os.environ)
     for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SURFACE_ID",
               "CYS_SURFACE_ROLE", "CYS_MISSION",

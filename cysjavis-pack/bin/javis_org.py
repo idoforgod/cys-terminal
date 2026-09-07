@@ -553,6 +553,23 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     r = subprocess.run(down_cmd, capture_output=True, text=True,
                        env={**os.environ, "CYS_TRASH_STAMP": ts})
     actions.append(("down", r.returncode))
+    # ★0.14.31 P6 R1 (두 리뷰어 blocking): **거부(=부서 생존)** 는 부분 실패가 아니라 무효 조작이다.
+    #   `cys-dept down` 이 아래 rc 로 끝나면 teardown 은 **한 글자도 일어나지 않았다** —
+    #     7 = 단일소유 강제 거부(env 절 또는 데몬 권위 절 · cys-dept 가드)
+    #     2 = 인자 검증 거부(미지 플래그·인자 과다·이름 없음 — 전부 teardown **이전**)
+    #   그런데도 아래 3)4)가 pack/workdir 을 격리하면 **살아 있는 부서의 팩·작업 폴더를 옮기는**
+    #   반파괴(half-op)가 된다. 부모(require_cso)와 자식(cysd_role_gate)은 이제 각자 시각에
+    #   데몬에 묻기 때문에 '부모 허용 + 자식 거부' 조합이 실제로 생길 수 있다(워크디렉터리
+    #   tar.gz 가 60s 를 넘으면 캐시 TTL 을 가로지른다). 그래서 **격리 이전에 멈춘다**.
+    #   ★스냅샷(tar.gz)은 이미 만들어졌을 수 있으나 그것은 비파괴 백업이라 되돌릴 것이 없다.
+    #   ★그 밖의 비0(예: 3 = teardown 은 끝났고 state 격리만 실패)은 종전 계약대로
+    #   best-effort 격리를 계속한다(사용자 회수 표면 최대화 · 기존 핀 불변).
+    if r.returncode in (2, 7):
+        sys.stderr.write(
+            "[destroy] %s: cys-dept down 이 조작을 **거부**했다(rc=%d) — 부서는 살아 있다. "
+            "pack/workdir 격리를 하지 않고 중단한다(반파괴 방지). %s\n"
+            % (name, r.returncode, (r.stderr or "").strip()[:300]))
+        return actions
     # ★F1(reviewer1): down 실패(특히 --purge-state의 state 격리 실패=exit 3)를 삼키지 않는다 —
     #   사유를 stderr로 정직 보고하고 최종 exit는 cmd_destroy가 비0으로 판정한다. 부분 실패라도
     #   pack/workdir 격리는 best-effort로 진행(사용자 회수 표면 최대화).

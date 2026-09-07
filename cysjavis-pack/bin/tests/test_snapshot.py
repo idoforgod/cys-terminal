@@ -25,6 +25,8 @@ import json
 import os
 import subprocess
 import sys
+import atexit
+import shutil
 import tempfile
 import time
 
@@ -57,6 +59,8 @@ def _assert_no_new(start):
 #   종전 env 판정) ⓑ 전용 `TMPDIR`(= 라이브 역할 캐시가 폴백에 끼어들지 않게).
 #   단언은 한 줄도 바꾸지 않는다.
 _SEAL_TMP = tempfile.mkdtemp(prefix="snapshot-seal-")
+# ★R1(리뷰어 minor): 검체 1회당 tmp 디렉터리 1개가 영구히 남던 것을 종료 시 정리한다.
+atexit.register(shutil.rmtree, _SEAL_TMP, True)
 _ABSENT_CYS = os.path.join(_SEAL_TMP, "cys-absent-in-test")
 
 

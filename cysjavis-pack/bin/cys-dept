@@ -77,10 +77,15 @@ dept_tombstone(){
 # ★재생성 묘비 해소(BOOTSTRAP_HARDENING WP-3·R6ⓒ): 삭제된 동명 부서를 다시 만들면 묘비를 해제해야
 # 새 부서가 피닉스 보호집합에 재편입된다(미해소=삭제→재생성 부서가 보호 영구 제외되는 역전 결함).
 # 성공 경로 말미에서만 호출(예약 직후 해소는 생성 실패 시 유령 보호 재편입 위험). rotate는 호출 금지
-# (rotate=묘비 불변 계약 — CYS_DEPT_ROTATE 가드). best-effort(|| true — 생성 흐름 불파괴).
+# (rotate=묘비 불변 계약 — **비상속 내부 표식** `_CYS_ROTATE_SELF` 가드).
+# ★0.14.31 P6 R1(실측 교정): 종전 가드는 상속되는 env `CYS_DEPT_ROTATE` 였다. rotate 가 그것을
+#   자식 cysd 에 물려주고 cysd 가 다시 좌석에 물려주면(2026-09-08 실측: dept-2 cysd pid 2634 및
+#   그 좌석 4147/5087/7981 전부 `CYS_DEPT_ROTATE=1`), 그 부서에서는 이 함수가 **영구 no-op** 이
+#   된다 — 삭제→동명 재생성 부서가 묘비를 못 벗어 피닉스 보호에서 영구 제외됐다.
+#   argv 로 전달되는 표식은 상속되지 않으므로 그 길이 구조적으로 닫힌다.
 dept_tombstone_remove(){
   [ -n "${1:-}" ] || return 0
-  [ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0
+  [ "${_CYS_ROTATE_SELF:-}" = "1" ] && return 0
   # ★D-IMPL-2: 데몬 묘비도 함께 해소 — 이게 없으면 삭제→동명/동번호 재생성 부서를
   # spawn_org_restore가 묘비로 오판해 reap(재생성-살해). phoenix와 쌍 유지.
   # ★R11(적대검증 A2): 해소 실패는 무음 금지 — 잔존 묘비=재생성 부서 reap이므로 WARN 가시화
@@ -1172,6 +1177,17 @@ cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|prom
 #   무관. ★name 위치의 --help/-h는 usage가 아니라 검증 거부 exit 2다(`launch --help`가 '--help' 부서를
 #   등재→껍데기 CEO 승격까지 간 실사고의 재발 차단 — 가드(exit 7)는 name 검증보다는 선행 유지).
 case "$cmd" in --help|-h) usage; exit 0 ;; esac
+# ★0.14.31 P6 R1 — rotate 재귀 표식은 **argv** 다(상속 env 아님).
+#   왜: `CYS_DEPT_ROTATE=1` 은 rotate 가 띄운 cysd → 그 cysd 가 띄운 모든 좌석으로 상속돼
+#   그 부서에서 아래 `cysd_role_gate` 와 `dept_tombstone_remove` 를 **영구히 껐다**(라이브 실측).
+#   정본 §3-4 "게이트를 끄는 노브 없음" 위반이므로 상속되지 않는 표식으로 갈아탄다.
+#   ★추가 조임: 표식은 `launch` 에서만·**부서 소켓이 없을 때만** 인정한다. 진짜 rotate 는
+#   직전에 소켓을 `rm -f` 한 상태(:1740 부근)라 항상 참이고, 살아 있는 부서를 상대로 표식을
+#   흉내내도 면제가 서지 않는다. (Windows 는 named pipe 라 `-e` 가 늘 거짓 → 면제 유지.)
+_CYS_ROTATE_SELF=0
+if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ]; then
+  if [ -n "${2:-}" ] && [ ! -e "$(dept_sock "${2:-}")" ]; then _CYS_ROTATE_SELF=1; fi
+fi
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
@@ -1205,10 +1221,11 @@ cysd_resolved_role() {   # stdout: "<역할>\t<출처>" · 실패해도 항상 r
 }
 
 cysd_role_gate() {   # $1=안내 문구 접두. 데몬이 권위 있게 '비-cso' 라고 말할 때만 exit 7.
-  # ★rotate 재귀 재기동(CYS_DEPT_ROTATE=1)은 면제한다: 그 시점은 이미 데몬을 죽인 뒤라
-  #   여기서 거절하면 '데몬은 죽고 등재만 남는' 반파괴가 된다 — 이 파일이 validate_dept_name 을
-  #   kill **이전**에 두는 것과 같은 규율(:1197 주석). 판정 주체도 rotate 진입부와 동일하다.
-  [ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0
+  # ★rotate 재귀 재기동(`launch <name> --rotate` · 소켓 부재)은 면제한다: 그 시점은 이미 데몬을
+  #   죽인 뒤라 여기서 거절하면 '데몬은 죽고 등재만 남는' 반파괴가 된다 — 이 파일이
+  #   validate_dept_name 을 kill **이전**에 두는 것과 같은 규율. 표식은 argv 라 상속되지 않는다
+  #   (종전 상속 env 판은 rotate 된 부서의 모든 좌석에서 이 게이트를 영구 무력화했다 · 실측).
+  [ "${_CYS_ROTATE_SELF:-}" = "1" ] && return 0
   _cdrg_out="$(cysd_resolved_role)" || _cdrg_out=""
   # `$( )` 가 말미 개행을 이미 지운다 — 남는 것은 "<역할>\t<출처>" 한 줄뿐이다.
   _cdrg_role="${_cdrg_out%%	*}"
@@ -1250,7 +1267,7 @@ case "$cmd" in
   launch)
     name="${2:-}"
     # ★D3(i): name 확보 직후·일체 부작용(dept_sock 산출·mkdir·reg_upsert) 이전 검증 — 빈/미지정 포함
-    #   전부 exit 2. CYS_DEPT_ROTATE=1(rotate 재귀)에도 검증 유지(rotate 진입부 사전 검증과 이중 방어).
+    #   전부 exit 2. rotate 재귀(`--rotate`)에도 검증 유지(rotate 진입부 사전 검증과 이중 방어).
     #   slug 충돌도 부작용 이전 조기 거부(reg_upsert 진입부 검사와 공통 헬퍼 — 기존명 재-launch는 자기
     #   제외로 통과).
     validate_dept_name "$name" "launch <name>"
@@ -1288,12 +1305,15 @@ case "$cmd" in
       _spawned=0
     else
       if [ -n "$acctdir" ]; then
-        # ★WP-4 부수수정(0.14.31 실측: dept 데몬이 호출 좌석의 CYS_ROLE=cso 를 상속): 좌석 env 4종을 벗기고 스폰.
+        # ★WP-4 부수수정(0.14.31 실측: dept 데몬이 호출 좌석의 CYS_ROLE=cso 를 상속): 좌석 env 5종을 벗기고 스폰.
+        #   ★P6 R1: `CYS_DEPT_ROTATE` 를 더한다 — 2026-09-08 실측에서 dept-2 cysd(pid 2634)와 그 좌석
+        #   3기가 전부 그 값을 물고 있었고, 그것이 이 도구의 단일소유 게이트를 그 부서에서 영구히
+        #   껐다. 재기동 한 번으로 이미 샌 값이 회수된다.
         #   `VAR=.. env -u ..`: 접두 대입은 env 의 환경이 되어 자식(cysd)에 그대로 전달된다(Git Bash coreutils env ✓).
         CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
@@ -1407,7 +1427,7 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
@@ -1584,7 +1604,7 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
       ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
     fi
@@ -1746,8 +1766,10 @@ PY
     fi
     # launch 재귀 호출: 소켓이 죽었으니 새 바이너리로 재spawn. CYS_ROLE 그대로 상속(게이트 통과 주체 동일).
     # launch stdout은 로그로 흘리고, 아래서 새 버전을 확정 출력한다.
-    # CYS_DEPT_ROTATE=1: launch의 dept_tombstone_remove를 no-op으로 — rotate=묘비 불변 계약(WP-3).
-    CYS_DEPT_ROTATE=1 bash "$0" launch "$name" || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
+    # `--rotate`(argv · 비상속): launch의 dept_tombstone_remove를 no-op으로 — rotate=묘비 불변
+    # 계약(WP-3). ★0.14.31 P6 R1: 종전 `CYS_DEPT_ROTATE=1` env 는 자식 cysd·그 좌석 전부에
+    # 상속돼 그 부서의 단일소유 게이트와 묘비 해소를 영구히 껐다(라이브 실측). argv 는 안 샌다.
+    bash "$0" launch "$name" --rotate || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
     newver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
     # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
     echo "rotated $name: v${oldver:-?}→v${newver:-?}"
