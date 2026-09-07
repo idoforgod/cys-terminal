@@ -36,9 +36,11 @@ cwd·레지스트리는 임시 디렉터리다(실 ~/.cys 계정 dir 은 절대 
       python3 cysjavis-pack/bin/tests/test_trust_seed.py
 """
 import builtins
+import contextlib
 import copy
 import errno
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -49,6 +51,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -112,7 +115,10 @@ def seed_cli(config, cwd, *extra, env=None, stub_ps=True):
         e["PATH"] = _stub_ps_dir() + os.pathsep + e.get("PATH", "")
     if env:
         e.update(env)
-    r = subprocess.run([PY, PF, "--seed-trust", "--config", config, "--cwd", cwd, *extra],
+    # ★R5(리뷰 codex minor): 자식 파이썬은 전부 `-B` 로 봉인한다(SEAL-1) — 부모의 -B 는 상속되지 않고,
+    #   R4 에서 봉인 env 대입을 지우며 이 헬퍼가 물려받던 봉인이 함께 사라졌다(그 변수명을 여기 적지 않는 이유는
+    #   봉인 census ⓑ 의 참조 파일 집합을 늘리지 않기 위해서다 — 검증은 `R5TestChildSeal` 이 행위로 한다).
+    r = subprocess.run([PY, "-B", PF, "--seed-trust", "--config", config, "--cwd", cwd, *extra],
                        capture_output=True, text=True, encoding="utf-8", env=e, timeout=60)
     return r.returncode, r.stdout, r.stderr
 
@@ -221,7 +227,7 @@ class Absent(Base):
         self.assertEqual(rc, 1)
         self.assertIn("ERROR", out)
         self.assertFalse(os.path.exists(self.cfgfile))
-        r = subprocess.run([PY, PF, "--seed-trust", "--config", self.cfg],
+        r = subprocess.run([PY, "-B", PF, "--seed-trust", "--config", self.cfg],
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 1, "usage 오류는 rc 1(REFUSE=2 와 충돌 금지)")
 
@@ -424,7 +430,7 @@ class ProjectKeyOracle(Base):
     claude_project_key 가 같아야 한다 — 생산 함수가 자기 기대값을 만드는 순환을 끊는다. node 가 있으면 process.cwd() 도 대조."""
 
     def _oracle_py(self, cwd):
-        r = subprocess.run([PY, "-c", "import os,sys; os.chdir(sys.argv[1]); print(os.getcwd())", cwd],
+        r = subprocess.run([PY, "-B", "-c", "import os,sys; os.chdir(sys.argv[1]); print(os.getcwd())", cwd],
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.rstrip("\r\n")
@@ -469,7 +475,7 @@ def _env_visible_for_python_child():
         return True
     if sys.platform != "darwin":
         return False
-    probe = subprocess.Popen([PY, "-c", "import time; time.sleep(20)"],
+    probe = subprocess.Popen([PY, "-B", "-c", "import time; time.sleep(20)"],
                              env=dict(os.environ, CLAUDE_CONFIG_DIR="/probe/visible"))
     try:
         time.sleep(0.3)
@@ -485,7 +491,7 @@ class LiveProcess(Base):
     def _spawn(self, script_name, env_cfg):
         path = os.path.join(self.tmp, script_name)
         _write(path, "import time\ntime.sleep(30)\n")
-        p = subprocess.Popen([PY, path], env=dict(os.environ, CLAUDE_CONFIG_DIR=env_cfg))
+        p = subprocess.Popen([PY, "-B", path], env=dict(os.environ, CLAUDE_CONFIG_DIR=env_cfg))
         self.addCleanup(lambda: (p.kill(), p.wait()))
         time.sleep(0.4)
         return p
@@ -644,11 +650,21 @@ class LiveProcess(Base):
                 raise PermissionError("denied")
             return real_open(path, *a, **k)
 
-        with patch("builtins.open", denied_open), patch.object(pf.os, "stat", lambda p, **k: type("S", (), {"st_uid": me})()):
+        real_stat = os.stat
+
+        def owner_stat(uid):
+            """★R5: uid **만** 덧씌우고 나머지 필드는 실제 stat 그대로 — 종전 부분 페이크(st_uid 뿐)는 동일성 판정
+            (_same_dir 의 st_dev/st_ino)이 들어오자 AttributeError 로 러너를 깨뜨렸다(하네스 결함 · 계약 무변경)."""
+            def _stat(path, **k):
+                st = real_stat(path, **k)      # 부재 경로는 여기서 그대로 OSError — '부재' 판정이 살아 있어야 한다
+                return type("S", (), {"st_uid": uid, "st_dev": st.st_dev, "st_ino": st.st_ino})()
+            return _stat
+
+        with patch("builtins.open", denied_open), patch.object(pf.os, "stat", owner_stat(me)):
             cnt, detail = pf._count_claude_procfs(self.cfg, root)
         self.assertIsNone(cnt, detail)
         self.assertIn("미해결", detail)
-        with patch("builtins.open", denied_open), patch.object(pf.os, "stat", lambda p, **k: type("S", (), {"st_uid": me + 1})()):
+        with patch("builtins.open", denied_open), patch.object(pf.os, "stat", owner_stat(me + 1)):
             cnt, detail = pf._count_claude_procfs(self.cfg, root)
         self.assertEqual(cnt, 0, detail)
         cnt, detail = pf._count_claude_procfs(self.cfg, root)
@@ -687,8 +703,14 @@ class Concurrent(Base):
         self.assertEqual(_read_text(self.cfgfile), other, "상대의 쓰기가 clobber 됐다")
         leftovers = [n for n in os.listdir(self.cfg) if n.startswith(".claude.json.seed-") and n != pf.SEED_TRUST_LOCK_NAME]
         self.assertEqual(leftovers, [], "임시 파일 잔재: %s" % leftovers)
-        # 재시도는 상대 내용을 보존하며 한 키만 더한다
+        # 재시도 — ★R5(리뷰 codex major): 성공은 **원자 교환이 있는 FS 에서만** 계약이다(Windows 는 기존 문서 커밋을
+        #   반드시 거부한다). 능력으로 분기하되 거부 쪽에서도 '상대 바이트 불변' 은 그대로 단언한다.
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        if not _exchange_supported():
+            self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+            self.assertIn("exchange-unavailable(", reason)
+            self.assertEqual(_read_text(self.cfgfile), other, "거부인데 상대 바이트가 바뀌었다")
+            return
         self.assertEqual(rc, 0, reason)
         got = _read_json(self.cfgfile)
         self.assertEqual(got["liveWrote"], 1)
@@ -976,8 +998,22 @@ class Concurrent(Base):
         displaced = [n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_DISPLACED_PREFIX)]
         self.assertEqual(len(displaced), 1, os.listdir(self.cfg))
         self.assertEqual(_read_bytes(os.path.join(self.cfg, displaced[0])), foreign, "낯선 데이터가 displaced 에 없다")
-        # mkstemp 잔재는 청소 · displaced 는 보존
+        # ★R5 재핀(리뷰 codex major D4 · 이 WP 의 R2 자기 핀): 종전 계약은 다음 실행이 `already-trusted` 로 **조용히 OK**
+        #   를 내는 것이었다 — 그 순간 상대의 더 새 문서는 displaced 에 고립된 채 아무도 모른다. 이제 교환 직전에 남긴
+        #   의도 저널이 그 창을 표시하고, 다음 실행은 두 파일을 무접촉으로 두고 **REFUSE interrupted-transaction** 한다
+        #   (호출자는 fail-open WARN · 좌석은 죽지 않는다 · 관문 보류가 2차 방어). 보존 단언은 그대로 유지한다.
+        journals = [n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_INTENT_PREFIX)]
+        self.assertEqual(len(journals), 1, os.listdir(self.cfg))
         _write(os.path.join(self.cfg, ".claude.json.seed-abcd1234"), "litter")
+        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("interrupted-transaction", reason)
+        self.assertIn(displaced[0], reason, "거부 사유가 고립된 문서의 이름을 대지 않는다")
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, displaced[0])), foreign, "displaced 가 청소됐다(데이터 파괴)")
+        self.assertTrue(os.path.exists(os.path.join(self.cfg, ".claude.json.seed-abcd1234")),
+                        "거부 경로가 잔재 청소보다 앞이어야 한다(회수 판정 前 상태 변경 0)")
+        # 사람이 병합·정리하면(저널 삭제) 다음 실행은 종전대로 진행한다 — 영구 잠김이 아니다
+        os.unlink(os.path.join(self.cfg, journals[0]))
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
         self.assertEqual(rc, 0, reason)   # 현 .claude.json(우리 문서)은 이미 신뢰
         self.assertIn("already-trusted", reason)
@@ -1583,6 +1619,33 @@ class DeptWiringStatic(unittest.TestCase):
                          "launch: 신뢰 시드가 creds opt-in 블록 안에 갇혔다(기본 off = 시드 0)")
         self.assertIn('resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name"', launch, "launch: 등재 cwd 복원 인자 부재")
         self.assertIn('resolve_dept_cwd "$cwd" ""', _block(self.src, "create", "down"), "create: 카탈로그 cwd 확정")
+
+    def test_6c_allocate_records_the_resolved_cwd(self):
+        """★R5(리뷰 minor): allocate 의 `reg_set_field cwd` 를 어떤 검체도 덮지 않았다(지워도 전수 통과) — 여기서 못 박는다.
+        계약: ⓐ account_dir 등재 **뒤**, 데몬 스폰 **앞** ⓑ 값은 확정 물리 경로 `$dept_cwd`(allocate 의 원값 소스는
+        `CYS_DEPT_CWD` 뿐이라 상대값이 재기동 호출자의 cwd 에 좌우되는 것을 막는다) ⓒ 실패는 fail-open WARN 1줄."""
+        body = _block(self.src, "allocate", "create")
+        i_acct = body.find('reg_set_field "$name" account_dir "$acctdir"')
+        i_cwd = body.find('reg_set_field "$name" cwd "$dept_cwd"')
+        i_daemon = body.find('nohup "$CYSD"')
+        self.assertGreater(i_acct, 0, "allocate: account_dir 등재 부재")
+        self.assertGreater(i_cwd, 0, "allocate: 확정 cwd 등재 부재(launch/rotate 가 좌석을 $HOME 으로 이주시킨다)")
+        self.assertLess(i_acct, i_cwd)
+        self.assertLess(i_cwd, i_daemon, "allocate: cwd 등재가 데몬 스폰 뒤")
+        self.assertIn('|| echo "[cys-dept] WARN: $name cwd 등재 실패', body, "등재 실패가 fail-open WARN 이 아니다")
+        self.assertNotIn('exit', body[i_cwd:body.find("\n", i_cwd)], "등재 실패가 부서 부트를 죽인다")
+
+    def test_6d_allocate_and_create_cwd_are_read_the_same_way(self):
+        """★R5(리뷰 minor · 의미 이종화 고지): create 는 카탈로그 **원값**을, allocate 는 **확정 물리 경로**를 같은
+        `depts.json.depts[].cwd` 키에 쓴다. 소비자(preflight `_resolve_catalog_cwd` · 기동기 `resolve_dept_cwd`)는
+        **존재하는 절대 dir 원값을 그대로** 두므로 두 표기의 해석이 갈리지 않는다 — 이 등가가 깨지면 여기서 잡힌다."""
+        home = os.path.join(self.tmp_home, "home") if hasattr(self, "tmp_home") else tempfile.mkdtemp(prefix="deptcwd-")
+        physical = tempfile.mkdtemp(prefix="deptcwd-real-")
+        self.addCleanup(shutil.rmtree, physical, True)
+        self.assertEqual(pf._resolve_catalog_cwd(physical, home=home), physical,
+                         "확정 물리 경로가 카탈로그 해석에서 다른 값이 됐다(allocate 등재값의 의미가 갈린다)")
+        self.assertEqual(pf.claude_project_key(pf._resolve_catalog_cwd(physical, home=home)),
+                         pf.claude_project_key(physical))
 
     def test_6b_helper_contract(self):
         m = re.search(r"^seed_trust_acct\(\)\{\n.*?^\}$", self.src, re.M | re.S)
@@ -2690,12 +2753,19 @@ class CodexR2Counterexamples(unittest.TestCase):
         return sorted(p for p in self.cfg.glob('.claude.json.' + prefix + '-*') if p.name != pf.SEED_TRUST_LOCK_NAME)
 
     def test_01_probe_matrix_zero_bytes_and_exact_trust(self):
+        # ★R5(리뷰 codex major): 강행(unverified)이 넘는 것은 **프로브 단계뿐**이다 — 기존 문서의 커밋은 원자 교환이
+        #   있어야 하고, Windows·미지원 FS 는 그 자리에서 REFUSE exchange-unavailable 이 계약이다(강행 무관 · R3).
+        #   종전 이 표는 그 커밋을 무조건 성공으로 단언해 Windows 에서 반드시 실패했다 → 능력으로 분기하되,
+        #   거부 쪽에서도 '프로브는 정확히 1회' 와 '바이트 불변' 을 그대로 단언한다.
+        exchange = _exchange_supported()
         for raw in (b'', b'{}', json.dumps({'projects': {self.key + '/':
                                       {'hasTrustDialogAccepted': True}}}).encode()):
             for count, force, rc, token in ((None, False, 2, 'unverified'),
                                            (None, True, 0, 'force-unverified'),
                                            (2, True, 2, 'live-claude')):
-                with self.subTest(raw=raw, count=count, force=force):
+                if not exchange and (rc, token) == (0, 'force-unverified'):
+                    rc, token = 2, 'exchange-unavailable('
+                with self.subTest(raw=raw, count=count, force=force, exchange=exchange):
                     self.file.write_bytes(raw)
                     probe = Mock(return_value=(count, 't'))
                     self.result(self.seed(proc_counter=probe, force_unverified=force), rc, token)
@@ -2825,6 +2895,15 @@ class CodexR2Counterexamples(unittest.TestCase):
                 self.assertIs(json.loads(self.file.read_bytes())['projects'][self.key]['hasTrustDialogAccepted'], True)
                 pf._sweep_stale_seed_tmp(str(self.cfg))
                 self.assertEqual(Path(calls[0]).read_bytes(), b'foreign unique bytes')
+                # ★R5(리뷰 codex D4 · 이 WP 자기 핀 확장): 되교환 실패는 **해결되지 않은 트랜잭션**이다 — 의도 저널이
+                #   남아 다음 실행이 조용히 진행하지 못하게 막고(REFUSE), 두 파일은 무접촉이다. 사람이 병합하고 저널을
+                #   지우기 전에는 계속 거부다(자가 치유 아님 = 데이터가 걸려 있다는 뜻).
+                journals = self.leftovers('seed-intent')
+                self.assertEqual(len(journals), 1, self.leftovers('seed-intent'))
+                self.result(self.seed(), 2, 'interrupted-transaction')
+                self.assertEqual(Path(calls[0]).read_bytes(), b'foreign unique bytes')
+                journals[0].unlink()                       # 사람이 병합·정리한 자리
+                Path(calls[0]).unlink()
 
     def test_07_foreign_symlink_is_restored_without_following_target(self):
         self.exchange_supported()
@@ -3904,6 +3983,589 @@ class R4SeedDeadline(Base):
         rc, out, err = seed_cli(self.cfg, self.ws, env={pf._SEED_TRUST_TIMEOUT_ENV: "0"})   # 감시 끔(롤백 노브)
         self.assertEqual(rc, 0, out + err)
         self.assertIn("already-trusted(", out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════════
+# R5 리뷰(Claude 적대 + codex gpt-6-astra 감사) 반례 — 표기 오라클 · 값 후보 동일성 · 의도 저널 · 마감 감시
+# ══════════════════════════════════════════════════════════════════════════════════════════════════════
+class R5Identity(Base):
+    """D1: 표기(spelling)와 동일성(identity)과 '판정 불가' 를 가른다."""
+
+    def _case_insensitive(self, d):
+        """이 FS 가 대소문자를 접는가 — 접지 않으면 별칭 검체는 성립하지 않는다(정직 skip)."""
+        probe = os.path.join(d, "CaseProbe")
+        os.makedirs(probe, exist_ok=True)
+        return os.path.isdir(os.path.join(d, "caseprobe"))
+
+    def test_r5_case_alias_is_same_directory_not_a_mismatch(self):
+        """리뷰 codex major: `os.path.samefile()==True` 인 별칭이 `_path_identity` 로는 다른 값이었다 → 3값 동일성."""
+        real = os.path.join(self.tmp, "CYSjavis-ws")
+        os.makedirs(real)
+        alias = os.path.join(self.tmp, "cysjavis-ws")
+        if not self._case_insensitive(self.tmp):
+            self.skipTest("대소문자 구분 FS — 별칭 표기 검체 불가")
+        self.assertTrue(os.path.samefile(real, alias))
+        self.assertIs(pf._same_dir(alias, real), True, "같은 디렉터리를 다르다고 봤다")
+        line = "71 claude CLAUDE_CONFIG_DIR=%s HOME=/x" % alias
+        self.assertEqual(pf._count_claude_in_ps_lines([line], real, argv_lines=["71 claude"]), (1, 1, 0),
+                         "별칭 표기로 도는 라이브 claude 가 '검증된 0' 이 됐다(라이브 config 에 쓴다)")
+
+    def test_r5_stat_failure_is_unresolved_never_verified_zero(self):
+        """리뷰 codex: 조회 실패(EACCES/ESTALE)를 '다름' 으로 접으면 안 된다 — 부재(ENOENT)만 증명된 다름이다."""
+        other = os.path.join(self.tmp, "other-cfg")
+        os.makedirs(other)
+        line = "71 claude CLAUDE_CONFIG_DIR=%s HOME=/x" % other
+        self.assertEqual(pf._count_claude_in_ps_lines([line], self.cfg, argv_lines=["71 claude"]), (0, 1, 0),
+                         "정상 불일치는 검증된 0 이어야 한다(사라지면 WP-2 가 inert)")
+        real_stat = os.stat
+
+        def flaky(path, **k):
+            if isinstance(path, str) and path == other:
+                raise PermissionError(errno.EACCES, "denied")
+            return real_stat(path, **k)
+
+        with patch.object(pf.os, "stat", flaky):
+            self.assertIsNone(pf._same_dir(other, self.cfg))
+            self.assertEqual(pf._count_claude_in_ps_lines([line], self.cfg, argv_lines=["71 claude"]), (0, 1, 1))
+        for e, expected in ((errno.ENOENT, False), (errno.ENOTDIR, False), (errno.ENAMETOOLONG, False),
+                            (errno.ELOOP, False), (errno.ESTALE, None), (errno.EIO, None)):
+            with self.subTest(errno=e):
+                def raiser(path, _e=e, **k):
+                    if isinstance(path, str) and path == other:
+                        raise OSError(_e, "injected")
+                    return real_stat(path, **k)
+                with patch.object(pf.os, "stat", raiser):
+                    self.assertIs(pf._same_dir(other, self.cfg), expected)
+
+    def test_r5_identity_lookups_go_through_the_injection_point(self):
+        """판정부는 파일시스템 동일성 조회를 **주입점 하나**로만 한다 — os.stat 직접 호출 0(codex D1 순수성 지적)."""
+        seen = []
+
+        def pure(a, b):
+            seen.append((a, b))
+            return a == b
+
+        with patch.object(pf.os, "stat", side_effect=AssertionError("판정부가 os.stat 을 직접 불렀다")):
+            got = pf._count_claude_in_ps_lines(["71 claude CLAUDE_CONFIG_DIR=/w/other HOME=/x"], "/w/cfg",
+                                               argv_lines=["71 claude"], same_dir=pure)
+        self.assertEqual(got, (0, 1, 0))
+        self.assertTrue(seen, "주입점이 호출되지 않았다")
+
+    def test_r5_pristine_guard_survives_identity_change(self):
+        """codex D1: 동일성 표현을 바꾸면서 `.pristine` 경로 가드가 무력화되면 안 된다(경로 성분 검사는 별도)."""
+        pristine = os.path.join(self.tmp, "pack", ".pristine", "acct")
+        os.makedirs(pristine)
+        rc, verdict, reason = pf.seed_trust(pristine, self.ws, proc_counter=_no_probe)
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn(".pristine", reason)
+        self.assertFalse(os.path.exists(os.path.join(pristine, ".claude.json")))
+
+
+class R5ProjectKey(Base):
+    """D1 후반: 우리가 박는 키 == 자식의 getcwd()(claude 가 읽는 키)."""
+
+    def _oracle(self, cwd):
+        r = subprocess.run([PY, "-B", "-c", "import os;print(os.getcwd())"], cwd=cwd,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.rstrip("\r\n")
+
+    def test_r5_case_alias_key_equals_child_getcwd(self):
+        """리뷰 codex major: 별칭 표기의 cwd 에서 realpath 키는 자식 getcwd 와 갈렸다(시드가 조용히 무효)."""
+        real = os.path.join(self.tmp, "WorkSpace")
+        os.makedirs(real)
+        alias = os.path.join(self.tmp, "workspace")
+        if not os.path.isdir(alias):
+            self.skipTest("대소문자 구분 FS — 별칭 표기 검체 불가")
+        oracle = self._oracle(alias)
+        self.assertEqual(pf.claude_project_key(alias), oracle,
+                         "claude 가 읽지 않는 키를 시드한다(관문이 다시 뜬다)")
+        rc, verdict, reason = pf.seed_trust(self.cfg, alias, proc_counter=_no_probe)
+        self.assertEqual(rc, 0, reason)
+        self.assertIn(oracle, _read_json(self.cfgfile)["projects"])
+
+    def test_r5_unicode_normalization_key_equals_child_getcwd(self):
+        """정규화는 우리가 하지 않는다 — 저장된 형태를 그대로 돌려받아야 한다(NFC/NFD 양방향)."""
+        import unicodedata
+        for created, requested in ((unicodedata.normalize("NFC", "café-a"), unicodedata.normalize("NFD", "café-a")),
+                                   (unicodedata.normalize("NFD", "café-b"), unicodedata.normalize("NFC", "café-b"))):
+            with self.subTest(created=created):
+                d = os.path.join(self.tmp, created)
+                try:
+                    os.makedirs(d)
+                except (OSError, UnicodeError):
+                    self.skipTest("이 FS 에 유니코드 디렉터리를 만들 수 없다")
+                req = os.path.join(self.tmp, requested)
+                if not os.path.isdir(req):
+                    continue          # 정규화를 접지 않는 FS — 두 이름은 서로 다른 디렉터리다(검체 대상 아님)
+                self.assertEqual(pf.claude_project_key(req), self._oracle(req))
+
+    def test_r5_key_shape_is_never_restructured(self):
+        """오라클이 **구조가 다른** 경로를 주면 채택하지 않는다(펌링크·마운트 별칭 방벽 · codex D1)."""
+        with patch.object(pf, "_fgetpath", lambda p: "/System/Volumes/Data" + p):
+            self.assertEqual(pf.claude_project_key(self.ws), os.path.realpath(self.ws))
+        with patch.object(pf, "_fgetpath", lambda p: "relative/not/absolute"):
+            self.assertEqual(pf.claude_project_key(self.ws), os.path.realpath(self.ws))
+        with patch.object(pf, "_fgetpath", lambda p: None):
+            self.assertEqual(pf.claude_project_key(self.ws), os.path.realpath(self.ws))
+        # 구조가 같아도 **다른 디렉터리**면(samestat 불일치) 채택하지 않는다
+        other = os.path.join(self.tmp, "OtherWs")
+        os.makedirs(other)
+        with patch.object(pf, "_fgetpath", lambda p: other):
+            self.assertEqual(pf.claude_project_key(self.ws), os.path.realpath(self.ws))
+
+
+class R5EnvBoundary(Base):
+    """D2: env 값의 끝은 확정 불가 — 후보 전부 × 동일성으로 닫는다."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = os.path.join(self.tmp, "target-cfg")
+        os.makedirs(self.target)
+
+    def line(self, value_tail):
+        return "71 claude CLAUDE_CONFIG_DIR=%s" % value_tail
+
+    def test_r5_non_shell_variable_names_do_not_defeat_detection(self):
+        """리뷰 codex major: `BAD-NAME=`·`BASH_FUNC_f%%=` 는 분할기가 경계로 보지 못해 양성·모호 판정이 함께 무너졌다."""
+        for tail in ("%s BAD-NAME=x HOME=/h" % self.target,
+                     "%s BASH_FUNC_f%%%%=() { :; } HOME=/h" % self.target,
+                     "%s 987654=x HOME=/h" % self.target):
+            with self.subTest(tail=tail):
+                self.assertEqual(pf._count_claude_in_ps_lines([self.line(tail)], self.target,
+                                                              argv_lines=["71 claude"]), (1, 1, 0),
+                                 "비-식별자 변수명이 라이브 claude 관측을 지웠다")
+
+    def test_r5_alias_with_inner_assignment_is_never_verified_zero(self):
+        """codex 반례: `/alias X=y` 가 대상의 심링크면 판독기는 `/alias` 로 잘라 '불일치' 를 만든다."""
+        alias = os.path.join(self.tmp, "alias X=y")
+        os.symlink(self.target, alias)
+        got = pf._count_claude_in_ps_lines([self.line("%s HOME=/h" % alias)], self.target, argv_lines=["71 claude"])
+        self.assertEqual(got, (1, 1, 0), "별칭+내부 대입 형상이 '검증된 0' 이 됐다")
+
+    def test_r5_conservative_positive_is_documented(self):
+        """완화한 경계는 **보수적 양성**을 만든다 — 정직하게 핀으로 남긴다(안전 방향 · 가용성 손해)."""
+        got = pf._count_claude_in_ps_lines([self.line("%s archive HOME=/h" % self.target)], self.target,
+                                           argv_lines=["71 claude"])
+        self.assertEqual(got, (1, 1, 0))
+
+    def test_r5_long_alias_beyond_the_candidate_window_is_not_verified_zero(self):
+        """★codex 위임 반례(FAILS-NOW 였다): 공백 30개짜리 심링크 별칭은 참값이 후보 창 밖으로 밀려 '검증된 0' 이 됐다.
+        열거는 **경로 길이 상한까지 소진**해야 하고, 개수 상한에서 잘렸다면 그 불일치는 증명이 아니다(미해결)."""
+        alias = os.path.join(self.tmp, "alias " * 30 + "end")
+        os.symlink(self.target, alias)
+        self.assertTrue(os.path.samefile(alias, self.target))
+        text = "CLAUDE_CONFIG_DIR=%s HOME=/isolated" % alias
+        self.assertIn(alias, pf._ps_env_value_candidates(text), "길이 상한 안인데 후보에서 빠졌다")
+        self.assertFalse(pf._ps_env_candidates_truncated(text))
+        got = pf._count_claude_in_ps_lines([self.line("%s HOME=/isolated" % alias)], self.target,
+                                           argv_lines=["71 claude"])
+        self.assertEqual(got, (1, 1, 0), "긴 별칭이 '검증된 0' 이 됐다(라이브 config 에 쓴다)")
+        # 개수 상한에 실제로 걸리면(비정상적으로 긴 env) 그 줄은 미해결이어야 한다
+        many = " ".join("t%d=x" % i for i in range(pf._PS_VALUE_CANDIDATE_MAX + 20))
+        self.assertTrue(pf._ps_env_candidates_truncated("CLAUDE_CONFIG_DIR=/w/other " + many))
+        got = pf._count_claude_in_ps_lines(["71 claude CLAUDE_CONFIG_DIR=/w/other " + many], self.target,
+                                           argv_lines=["71 claude"])
+        self.assertEqual(got, (0, 1, 1))
+
+    def test_r5_ordinary_mismatch_still_verified_zero(self):
+        """주경로 보존: 보통 대상 + 다른 config = 검증된 0(사라지면 부서 부트마다 REFUSE)."""
+        other = os.path.join(self.tmp, "other-cfg")
+        os.makedirs(other)
+        lines = [self.line("%s HOME=/h" % other), "72 python3 x.py", "73 /bin/sh -c true"]
+        self.assertEqual(pf._count_claude_in_ps_lines(lines, self.target,
+                                                      argv_lines=["71 claude", "72 python3 x.py", "73 /bin/sh -c true"]),
+                         (0, 3, 0))
+
+    def test_r5_default_config_target_apparent_assignment_is_unresolved(self):
+        """codex D2(정보 이론): `OTHER="x CLAUDE_CONFIG_DIR=/other"` 와 실제 지정은 직렬화가 같다 — 기본 config 대상에서
+        겉보기 지정을 '그 프로세스는 기본이 아니다' 의 증거로 쓰지 않는다."""
+        default = pf._default_claude_config_dir()
+        got = pf._count_claude_in_ps_lines([self.line("/w/other HOME=/h")], default, argv_lines=["71 claude"])
+        self.assertEqual(got, (0, 1, 1))
+        self.assertEqual(pf._count_claude_in_ps_lines(["71 claude HOME=/h"], default, argv_lines=["71 claude"]),
+                         (1, 1, 0), "지정이 없는 claude 는 기본 config 사용 = 양성")
+
+    def test_r5_value_candidates_are_pure_and_bounded(self):
+        c = pf._ps_env_value_candidates("CLAUDE_CONFIG_DIR=/a b c HOME=/h")
+        self.assertEqual(c[:3], ["/a", "/a b", "/a b c"])
+        self.assertLessEqual(len(pf._ps_env_value_candidates("CLAUDE_CONFIG_DIR=" + " ".join("x" * 3 for _ in range(200)))),
+                             pf._PS_VALUE_CANDIDATE_MAX)
+        self.assertEqual(pf._ps_env_value_candidates("XCLAUDE_CONFIG_DIR=/a"), [])
+        self.assertEqual(pf._ps_env_value_candidates(None), [])
+        # 상한 초과 길이는 syscall 없이 '부재'(값 후보 열거가 만드는 긴 문자열 · 실측 ENAMETOOLONG)
+        self.assertEqual(pf._stat_ident("/" + "a" * (pf._MAX_PATH_PROBE + 10)), (None, "absent"))
+
+
+class R5Procfs(Base):
+    """D3: /proc 은 파일시스템 바이트를 보존해 대조한다(replace 디코드 금지)."""
+
+    def _proc(self, entries):
+        root = os.path.join(self.tmp, "proc")
+        for pid, env_b, cmd_b in entries:
+            d = os.path.join(root, pid)
+            os.makedirs(d)
+            with open(os.path.join(d, "environ"), "wb") as f:
+                f.write(env_b)
+            with open(os.path.join(d, "cmdline"), "wb") as f:
+                f.write(cmd_b)
+        return root
+
+    # 주의: APFS 는 비-UTF8 파일명을 거부한다(EILSEQ) — 디렉터리를 만들지 않고 **디코드 계약**만 본다. `_same_dir` 는
+    #   문자열이 정확히 같으면 stat 없이 True 이고, 다르면 부재/부재 → False 다. 그래서 두 검체는 플랫폼과 무관하게
+    #   '바이트가 보존되는가' 하나만 묻는다(리눅스 실기에서도 같은 결론 · /proc 픽스처는 주입이다).
+    def test_r5_surrogate_bytes_are_not_replaced(self):
+        """리뷰 codex major: `\\xff` 가 U+FFFD 로 바뀌어 살아 있는 config 가 '불일치' 가 됐다."""
+        raw = os.path.join(self.tmp, "cfg-").encode() + b"\xff"
+        cfg = os.fsdecode(raw)
+        root = self._proc([("100", b"CLAUDE_CONFIG_DIR=" + raw + b"\0HOME=/x\0", b"/usr/bin/claude\0")])
+        cnt, detail = pf._count_claude_procfs(cfg, root)
+        self.assertEqual(cnt, 1, detail)
+
+    def test_r5_replacement_char_directory_is_not_conflated(self):
+        """`\\xff` 디렉터리와 U+FFFD 이름 디렉터리는 **다른** 디렉터리다(디코드가 둘을 섞으면 안 된다)."""
+        raw = os.path.join(self.tmp, "conf-").encode() + b"\xff"
+        a = os.fsdecode(raw)
+        b = os.path.join(self.tmp, "conf-�")
+        self.assertNotEqual(a, b)
+        root = self._proc([("100", b"CLAUDE_CONFIG_DIR=" + raw + b"\0", b"/usr/bin/claude\0")])
+        self.assertEqual(pf._count_claude_procfs(b, root)[0], 0)
+        self.assertEqual(pf._count_claude_procfs(a, root)[0], 1)
+
+    def test_r5_argv_bytes_are_filesystem_decoded(self):
+        raw_cmd = (os.path.join(self.tmp, "install-").encode() + b"\xff" + b"/claude")
+        cfg = os.path.join(self.tmp, "cfg-argv")
+        os.makedirs(cfg)
+        root = self._proc([("100", b"CLAUDE_CONFIG_DIR=" + cfg.encode() + b"\0", raw_cmd + b"\0")])
+        self.assertEqual(pf._count_claude_procfs(cfg, root)[0], 1)
+
+    def test_r5_identity_lookup_failure_is_unresolved(self):
+        other = os.path.join(self.tmp, "other-cfg")
+        os.makedirs(other)
+        cfg = os.path.join(self.tmp, "mine-cfg")
+        os.makedirs(cfg)
+        root = self._proc([("100", b"CLAUDE_CONFIG_DIR=" + other.encode() + b"\0", b"/usr/bin/claude\0")])
+        self.assertEqual(pf._count_claude_procfs(cfg, root)[0], 0)
+        real_stat = os.stat
+
+        def flaky(path, **k):
+            if isinstance(path, str) and path == other:
+                raise PermissionError(errno.EACCES, "denied")
+            return real_stat(path, **k)
+
+        with patch.object(pf.os, "stat", flaky):
+            cnt, detail = pf._count_claude_procfs(cfg, root)
+        self.assertIsNone(cnt, detail)
+
+
+class R5InterruptedTransaction(Base):
+    """D4: 교환~검증 창을 의도 저널로 표시하고, 회수는 **두 파일의 바이트**로 판정한다."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.cfg)
+        _require_exchange(self)
+
+    def journals(self):
+        return sorted(n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_INTENT_PREFIX))
+
+    def displaced(self):
+        return sorted(n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_DISPLACED_PREFIX))
+
+    def crash_after_exchange(self, foreign=b'{"foreign":"newer"}'):
+        """교환은 성립시키고 그 직후 죽인다(마감 감시 os._exit 와 같은 상태 집합)."""
+        real = pf._exchange_paths
+
+        def exchange_then_die(a, b):
+            _write(self.cfgfile, foreign.decode())
+            r = real(a, b)
+            raise KeyboardInterrupt("killed right after exchange")
+
+        with patch.object(pf, "_exchange_paths", exchange_then_die):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+
+    def test_r5_stranded_foreign_document_is_refused_not_silently_ok(self):
+        """리뷰 codex major: 종전엔 다음 실행이 `already-trusted` 로 OK 를 내 고립된 사용자 문서가 영영 묻혔다."""
+        self.untrusted_file('{"projects": {}, "user": "original"}')
+        foreign = b'{"projects": {}, "user": "newest"}'
+        self.crash_after_exchange(foreign)
+        self.assertEqual(len(self.journals()), 1, os.listdir(self.cfg))
+        self.assertEqual(len(self.displaced()), 1, os.listdir(self.cfg))
+        d = os.path.join(self.cfg, self.displaced()[0])
+        self.assertEqual(_read_bytes(d), foreign)
+        for _ in range(2):                      # 멱등: 몇 번을 돌려도 같은 거부, 상태 무변경
+            rc, verdict, reason = self.seed()
+            self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+            self.assertIn("interrupted-transaction", reason)
+            self.assertEqual(_read_bytes(d), foreign)
+            self.assertEqual(len(self.journals()), 1)
+        # 활성 문서가 그 사이 더 새로 바뀌어도 양쪽 다 보존한다
+        _write(self.cfgfile, '{"projects": {}, "user": "even-newer"}')
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 2, reason)
+        self.assertEqual(_read_bytes(d), foreign)
+        self.assertEqual(_read_json(self.cfgfile)["user"], "even-newer")
+
+    def test_r5_crash_before_exchange_is_not_labelled_foreign(self):
+        """codex D4 표: 저널은 있는데 displaced 가 **우리 payload** 면 낯선 데이터가 아니다 — 거부하지 않는다."""
+        self.untrusted_file('{"projects": {}}')
+        with patch.object(pf, "_exchange_paths", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        self.assertEqual(len(self.journals()), 1, os.listdir(self.cfg))
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertIn("stale-tmp swept", reason)
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(self.displaced(), [])
+        self.assertIs(_read_json(self.cfgfile)["projects"][self.key]["hasTrustDialogAccepted"], True)
+
+    def test_r5_crash_after_validation_reclaims_the_captured_document(self):
+        """검증까지 끝나고 청소 전에 죽으면 displaced 는 **우리가 읽은 원본**이다 — 활성 문서가 유효하면 회수한다."""
+        original = '{"projects": {}, "user": "original"}'
+        self.untrusted_file(original)
+        real_unlink = os.unlink
+
+        def die_before_cleanup(path, *a, **k):
+            if os.path.basename(path).startswith(pf.SEED_TRUST_DISPLACED_PREFIX):
+                raise KeyboardInterrupt("killed before displaced cleanup")
+            return real_unlink(path, *a, **k)
+
+        with patch.object(pf.os, "unlink", die_before_cleanup):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        d = os.path.join(self.cfg, self.displaced()[0])
+        self.assertEqual(_read_text(d), original)
+        self.assertEqual(len(self.journals()), 1)
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertIn("already-trusted", reason)
+        self.assertFalse(os.path.exists(d), "원본과 바이트가 같은 displaced 가 회수되지 않았다")
+        self.assertEqual(self.journals(), [])
+
+    def test_r5_captured_displaced_is_kept_when_active_is_broken(self):
+        """codex D4: 지문 동등만으로 삭제를 인가하지 않는다 — 활성이 깨졌으면 displaced 가 유일한 유효 사본일 수 있다."""
+        original = '{"projects": {}, "user": "original"}'
+        self.untrusted_file(original)
+        real_unlink = os.unlink
+
+        def die_before_cleanup(path, *a, **k):
+            if os.path.basename(path).startswith(pf.SEED_TRUST_DISPLACED_PREFIX):
+                raise KeyboardInterrupt("killed")
+            return real_unlink(path, *a, **k)
+
+        with patch.object(pf.os, "unlink", die_before_cleanup):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        d = os.path.join(self.cfg, self.displaced()[0])
+        _write(self.cfgfile, "{broken")                       # 활성 문서가 손상됐다
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("interrupted-transaction", reason)
+        self.assertEqual(_read_text(d), original, "유일할 수 있는 유효 사본을 지웠다")
+
+    def crash_before_exchange(self, original='{"projects": {}, "precious": "original"}'):
+        """교환 **직전**(저널은 쓰였고 displaced 엔 우리 payload = 원본+플래그)에서 죽는다."""
+        self.untrusted_file(original)
+        with patch.object(pf, "_exchange_paths", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        self.assertEqual(len(self.journals()), 1, os.listdir(self.cfg))
+        d = os.path.join(self.cfg, self.displaced()[0])
+        self.assertEqual(_read_json(d)["precious"], "original")
+        return d
+
+    def test_r5_payload_leftover_is_kept_when_active_is_broken(self):
+        """★codex 위임 반례(FAILS-NOW 였다): 그 잔재는 '우리 payload' 지만 내용은 **원본 + 플래그** 다 — 활성이 깨진
+        뒤 저널만 지우면 곧바로 지문 청소가 삭제해 사용자 필드까지 잃었다."""
+        d = self.crash_before_exchange()
+        payload = _read_bytes(d)
+        _write(self.cfgfile, "{broken")                      # 다른 기록자가 중간에 죽었다
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("interrupted-transaction", reason)
+        self.assertTrue(os.path.exists(d), "유일한 완전한 문서를 지웠다")
+        self.assertEqual(_read_bytes(d), payload)
+
+    def test_r5_payload_leftover_is_kept_when_active_vanishes(self):
+        """같은 결함의 다른 형: 활성 이름이 사라진 뒤 재시작하면 종전엔 새 최소 문서를 시드하고 원본 필드를 잃었다."""
+        d = self.crash_before_exchange()
+        os.unlink(self.cfgfile)
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertTrue(os.path.exists(d))
+        self.assertEqual(_read_json(d)["precious"], "original")
+
+    def test_r5_missing_displaced_with_healthy_active_recovers(self):
+        self.untrusted_file('{"projects": {}}')
+        self.crash_after_exchange()
+        d = os.path.join(self.cfg, self.displaced()[0])
+        os.unlink(d)                                          # 외부에서 옮겨졌다/치워졌다
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertEqual(self.journals(), [])
+
+    def test_r5_malformed_journal_refuses_and_touches_nothing(self):
+        """저널이 손상·심링크·FIFO·경로 탈출·잘림이면 '모른다' 이고 무접촉 거부다."""
+        self.untrusted_file('{"projects": {}}')
+        before = _read_bytes(self.cfgfile)
+        victim = os.path.join(self.tmp, "victim.json")
+        _write(victim, "precious")
+        good = pf.SEED_TRUST_DISPLACED_PREFIX + "a" * 64 + "-x"
+        cases = {
+            "truncated": '{"v":1,"displaced":',
+            "escape": json.dumps({"v": 1, "displaced": "../victim.json",
+                                  "captured_sha256": "a" * 64, "payload_sha256": "b" * 64}),
+            "badname": json.dumps({"v": 1, "displaced": "other-file",
+                                   "captured_sha256": "a" * 64, "payload_sha256": "b" * 64}),
+            "baddigest": json.dumps({"v": 1, "displaced": good,
+                                     "captured_sha256": "zz", "payload_sha256": "b" * 64}),
+            "notdict": '["x"]',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                j = os.path.join(self.cfg, pf.SEED_TRUST_INTENT_PREFIX + "case")
+                _write(j, body)
+                rc, verdict, reason = self.seed()
+                self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+                self.assertIn("interrupted-transaction", reason)
+                self.assertEqual(_read_bytes(self.cfgfile), before)
+                self.assertEqual(_read_text(victim), "precious")
+                os.unlink(j)
+        if hasattr(os, "mkfifo"):
+            j = os.path.join(self.cfg, pf.SEED_TRUST_INTENT_PREFIX + "fifo")
+            os.mkfifo(j)
+            rc, verdict, reason = self.seed()
+            self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+            os.unlink(j)
+
+    def test_r5_journal_write_failure_prevents_exchange(self):
+        """저널을 못 쓰면 창을 열지 않는다 — 교환 0 · 문서 무변경 · 잔재 0."""
+        original = '{"projects": {}}'
+        self.untrusted_file(original)
+        with patch.object(pf, "_write_seed_intent", side_effect=OSError(errno.ENOSPC, "no space")), \
+                patch.object(pf, "_exchange_paths", side_effect=AssertionError("저널 없이 교환했다")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("의도 저널", reason)
+        self.assertEqual(_read_text(self.cfgfile), original)
+        self.assertEqual(self.displaced(), [])
+        self.assertEqual(self.journals(), [])
+
+    def test_r5_absent_document_path_writes_no_journal(self):
+        """부재 문서(link 커밋)와 교환 기구 부재는 교환 창이 없다 — 저널도 남기지 않는다(Windows 경로 포함)."""
+        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=_no_probe)
+        self.assertEqual(rc, 0, reason)
+        self.assertEqual(self.journals(), [])
+        _write(self.cfgfile, '{"projects": {}}')
+        with patch.object(pf, "_exchange_paths", lambda a, b: pf._ExchangeUnavailable("ENOTSUP")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("exchange-unavailable", reason)
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(self.displaced(), [])
+
+
+class R5Watchdog(Base):
+    """D5: 마감 감시의 완료 판정·유한값·종료 보장."""
+
+    def test_r5_timeout_table_covers_non_finite_and_overflow(self):
+        env = pf._SEED_TRUST_TIMEOUT_ENV
+        cases = {"": 20.0, "1.5": 1.5, "0": None, "-1": None, "0.5": 0.5,
+                 "nan": 20.0, "inf": 20.0, "-inf": 20.0, "1e309": 20.0, "zzz": 20.0,
+                 "1e300": threading.TIMEOUT_MAX}
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(pf._seed_trust_timeout_secs({env: raw} if raw else {}), expected)
+
+    def test_r5_cancel_wins_the_race_after_return(self):
+        """리뷰 minor: 커밋 뒤 취소 직전에 타이머가 들어와도 성공을 timeout 으로 뒤집지 않는다(먼저 잡은 쪽만 이긴다)."""
+        fired = []
+        cancel = pf._start_seed_deadline(0.05, lambda: fired.append(1))
+        self.assertIsNotNone(cancel)
+        cancel()
+        time.sleep(0.25)
+        self.assertEqual(fired, [], "취소 뒤에도 감시가 발화했다")
+
+    def test_r5_watchdog_start_failure_refuses_without_seeding(self):
+        """감시 스레드를 못 띄우면 시간 상한 없이 부트 경로를 붙잡지 않는다 — 무쓰기 REFUSE."""
+        with patch.object(pf, "_start_seed_deadline", lambda secs, emit: None), \
+                patch.object(pf, "seed_trust", side_effect=AssertionError("감시 없이 시드했다")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = pf._seed_trust_main(["--seed-trust", "--config", self.cfg, "--cwd", self.ws])
+        self.assertEqual(rc, 2)
+        self.assertIn("watchdog-unavailable", buf.getvalue())
+        self.assertFalse(os.path.exists(self.cfgfile))
+
+    def test_r5_blocked_emit_still_terminates_even_if_hard_timer_fails(self):
+        """★codex 위임 반례(FAILS-NOW 였다): `emit()` 이 영원히 막히는데 하드 종료 타이머 기동까지 실패하면 자식이
+        영원히 살아 부트 호출자를 붙잡았다 — 종료 보증이 없으면 **진단을 포기**하고 즉시 끝낸다."""
+        code = ("import threading, time\n"
+                "import javis_preflight as pf\n"
+                "real = threading.Timer\n"
+                "made = []\n"
+                "class Dead:\n"
+                "    daemon = True\n"
+                "    def start(self):\n"
+                "        raise RuntimeError('no thread')\n"
+                "    def cancel(self):\n"
+                "        pass\n"
+                "def timer(interval, fn):\n"
+                "    made.append(1)\n"
+                "    return real(interval, fn) if len(made) == 1 else Dead()\n"
+                "threading.Timer = timer\n"
+                "def blocked():\n"
+                "    sys.stdout.write('EMIT\\n'); sys.stdout.flush(); time.sleep(600)\n"
+                "pf._start_seed_deadline(0.05, blocked)\n"
+                "time.sleep(600)\n")
+        try:
+            r = _child(code, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("하드 타이머 기동 실패 시 자식이 끝나지 않았다(부트 호출자가 영원히 붙잡힌다)")
+        self.assertEqual(r.returncode, pf.SEED_TRUST_REFUSE, (r.stdout, r.stderr))
+        self.assertNotIn("EMIT", r.stdout, "종료 보증이 없는데 막히는 진단을 먼저 시도했다")
+
+    def test_r5_timeout_line_does_not_claim_no_write(self):
+        """codex D5: '공개 전이면 무쓰기' 단정은 거짓일 수 있다 — 문면이 커밋 여부를 단정하지 않는다."""
+        src = inspect.getsource(pf._seed_trust_main)
+        self.assertIn("커밋 여부는", src)
+        self.assertIn("의도 저널", src)
+        fire = inspect.getsource(pf._start_seed_deadline)
+        self.assertIn("_SEED_TRUST_EXIT_GRACE", fire, "emit 이 막혀도 종료를 보장하는 backstop 이 없다")
+
+
+class R5TestChildSeal(unittest.TestCase):
+    """리뷰 codex minor: 이 파일이 띄우는 파이썬 자식은 전부 `-B` 로 봉인돼야 한다(SEAL-1 · 부모 -B 는 상속되지 않는다)."""
+
+    def test_r5_every_python_child_is_sealed(self):
+        src = _read_text(os.path.abspath(__file__))
+        # 음성 대조군(-B 없는 자식)은 아래 검체가 **일부러** 띄운다 — 그 본문만 빼고 전수 검열한다.
+        src = src.replace(inspect.getsource(R5TestChildSeal.test_r5_child_reports_sealed_interpreter), "")
+        spawns = re.findall(r"subprocess\.(?:run|Popen)\(\[(PY|sys\.executable)([^\]]*)\]", src)
+        self.assertGreaterEqual(len(spawns), 5, "스폰 지점 탐지 자체가 깨졌다(정규식 회귀)")
+        for head, tail in spawns:
+            with self.subTest(spawn=(head + tail)[:60]):
+                self.assertTrue(tail.lstrip().startswith(', "-B"') or tail.lstrip().startswith(", '-B'"),
+                                "봉인되지 않은 파이썬 자식: %s%s" % (head, tail[:60]))
+
+    def test_r5_child_reports_sealed_interpreter(self):
+        """봉인은 **행위**로 검증한다 — 자식이 import 한 모듈의 바이트코드 캐시가 생기는가. 플래그 이름을 이 파일에
+        적지 않는 것은 의도적이다: 봉인 census(`test_pyseal_census.py` ⓑ)의 참조 파일 집합을 늘리지 않는다."""
+        d = tempfile.mkdtemp(prefix="sealprobe-")
+        self.addCleanup(shutil.rmtree, d, True)
+        _write(os.path.join(d, "sealprobe.py"), "VALUE = 1\n")
+        cache = os.path.join(d, "__pycache__")
+        sealed = subprocess.run([PY, "-B", "-c", "import sealprobe"], cwd=d,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(sealed.returncode, 0, sealed.stderr)
+        self.assertFalse(os.path.isdir(cache), "봉인된 자식이 캐시를 썼다")
+        unsealed = subprocess.run([PY, "-c", "import sealprobe"], cwd=d,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(unsealed.returncode, 0, unsealed.stderr)
+        if not os.path.isdir(cache):
+            self.skipTest("이 실행 환경은 자식 파이썬을 이미 봉인한다 — 음성 대조군 성립 불가(양성 단언은 통과)")
 
 
 if __name__ == "__main__":

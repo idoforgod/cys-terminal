@@ -32,6 +32,15 @@ REQUIRED_CLAUSE_TOKENS = (
     "cys send --queued --to master", "last_fired",
     "Skill 도구", "재등록·재기동은 §1-1 게이트 안", "데몬 재시작까지",
     "생존 확인 불가", "구독에는 예외가 없다",
+    # ★R5(리뷰 major): 게이트가 **아직 없는 상태**(WP-3 A/B 미배포)에서 "게이트가 deny 한다" 는 단언은 거짓이었다.
+    #   문면은 이제 ①규율이 먼저 ②등록 조건(alert_route ∧ 신판 표지) ③미등록도 경계는 유효 를 말해야 한다.
+    "등록 조건(정본 · preflight 가 판정한다)", "도구가 막지 않았다는 사실을 허가로 읽지 마라",
+    "전이 상태 고지", "감시\n  **하한**",
+)
+# 음성 대조: 장치의 존재를 무조건 단언하는 옛 문면이 되살아나면 실패한다(§3-1 '문장은 장치의 설명').
+UNCONDITIONAL_GATE_CLAIMS = (
+    "PreToolUse)가 deny 한다",
+    "`hooks/role-capability-gate.sh`)가 deny\n  한다",
 )
 # plan §4 WP-3 B 리터럴 — Rust 레인 alert_route 와의 패리티 상수는 통합 항목이다(바뀌면 여기와 지침 §1 갱신).
 ALERT_EVENTS = (
@@ -229,6 +238,29 @@ class CsoDirectiveRevision(unittest.TestCase):
         self.assertNotIn("셋 중 먼저 온 것", master)
         self.assertIn("넷 중 먼저 온 것", master)
         self.assertIn("넷째는 §9", master)
+
+    def test_gate_enforcement_claims_are_conditional_on_registration(self):
+        """★R5(리뷰 major): 지침이 존재하지 않을 수 있는 집행 장치를 무조건 단언하면 안 된다 — 등록 조건과
+        '미등록에서도 경계는 유효' 가 함께 있어야 하고, 옛 무조건 단언은 사라져야 한다."""
+        for claim in UNCONDITIONAL_GATE_CLAIMS:
+            with self.subTest(claim=claim[:24]):
+                self.assertNotIn(claim, normalize(self.body).replace(" ", ""),
+                                 "무조건 집행 단언이 남아 있다")
+        gate_section = section_body(self.cso, "## 1. 임무 — 터미널 거버넌스 기능의 운영자")
+        self.assertIn("alert_route", gate_section)
+        self.assertIn("미등록", gate_section)
+        # 음성 대조군: 조건 문장을 지우면 이 판정이 뒤집혀야 한다(핀이 문자열 존재만 보는 게 아님을 증명)
+        stripped = gate_section.replace("미등록", "")
+        self.assertNotIn("미등록", stripped)
+
+    def test_wp6_clause_declares_tool_dormancy(self):
+        """★R5(리뷰 minor): WP-6 문안은 도구보다 먼저 배포된다 — 도구가 그 축을 내지 않으면 **휴면**임을 명시해야 한다."""
+        for name in ("MASTER_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md"):
+            with self.subTest(directive=name):
+                raw = self.raw[name]
+                self.assertIn("휴면", raw, "도구 부재 시 휴면 고지 부재")
+                self.assertIn(SYNC, raw)
+        self.assertIn("round-status --help", self.raw["MASTER_DIRECTIVE.md"])
 
     def test_master_subscription_backlog_guard(self):
         """master 구독은 의도적 백로그이며 이번 CSO 개정에서 수정할 대상이 아니다."""

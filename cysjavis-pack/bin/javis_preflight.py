@@ -18,6 +18,7 @@ import contextlib
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 
 # ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
 #   ._pth 는 표준 경로 계산을 우회해 스크립트 폴더를 sys.path 에 넣지 않는다(javis_bootstrap.py:94
@@ -2691,10 +2693,12 @@ class Preflight:
 
     @staticmethod
     def _mcp_enabled(config_path, project_root, name):
-        """(enabled_bool, trust_bool) — 노드 .claude.json의 project별 활성화·신뢰 상태."""
-        try:
-            d = json.load(open(config_path, encoding="utf-8"))
-        except (OSError, ValueError):
+        """(enabled_bool, trust_bool) — 노드 .claude.json의 project별 활성화·신뢰 상태.
+        ★R5(리뷰 minor): 판독은 `_read_json_tolerant`(O_NONBLOCK + fstat 정규 재확인) — 종전 무가드 `open` 은
+        `.claude.json` 이 writer 없는 FIFO 면 preflight 를 영구 정지시켰다(`isfile` 선검사가 있어도 그 사이 교체되면
+        TOCTOU). 판독 실패는 종전과 같은 (False, False)."""
+        d = _read_json_tolerant(config_path)
+        if not isinstance(d, dict):
             return (False, False)
         pe = (d.get("projects", {}) or {}).get(project_root, {}) or {}
         en = (name in (pe.get("enabledMcpjsonServers", []) or [])) \
@@ -2746,10 +2750,12 @@ class Preflight:
             if got is not True:
                 return ("시드 잠금 %s — 쓰기 보류(%s · 다른 시더가 이 .claude.json 을 커밋 중)"
                         % ("경합" if got is False else "기구 미가용", lock_path))
-            try:
-                data = json.load(open(config_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return "파싱 실패 — 거부: %s" % e
+            # ★R5(리뷰 minor): 이 판독은 **시드 잠금을 쥔 채** 일어난다 — 무가드 `open` 이 FIFO 에서 막히면
+            #   preflight --fix 가 잠금을 든 채로 영구 정지한다(같은 라운드가 시더에서 닫은 결함과 같은 계급).
+            #   `_read_json_tolerant` 는 O_NONBLOCK + fstat 정규 재확인이라 막히지 않고, 판독 실패는 무쓰기 사유다.
+            data = _read_json_tolerant(config_path)
+            if not isinstance(data, dict):
+                return "판독/파싱 실패 — 거부(비정규 파일·손상·IO): %s" % config_path
             pr = data.setdefault("projects", {}).setdefault(project_root, {})
             ml = pr.setdefault("enabledMcpjsonServers", [])
             changed = False
@@ -4222,16 +4228,15 @@ class Preflight:
         registered = self._registry()["pairs"].get(_path_identity(config_dir), {})
         if not registered:
             return []
-        # ★R4(리뷰 codex major): 시더와 **같은 가드**로 읽는다(O_NOFOLLOW|O_NONBLOCK + fstat 정규 재확인). 종전
-        #   `_read_json_tolerant` 의 무가드 open 은 writer 없는 FIFO `.claude.json` 에서 영구 블록했다 — 0.14.30 의
-        #   대상 선정은 `isfile` 이 FIFO 를 걸렀지만 레지스트리 스코프는 config **dir** 만 본다(report·fix 양쪽이
-        #   시더의 비정규 가드에 닿기 전에 멈춘다). 판독 불가(심링크·비정규·손상·IO)의 판정은 종전 None 과 같다:
-        #   projects 를 못 봤으므로 등재 cwd 전부가 갭 → --fix 는 seed_trust 가 같은 이유로 REFUSE/ERROR 1줄(WARN).
-        try:
-            _existed, _raw, _st = _read_claude_json_bytes(config_path)
-            data = _parse_claude_json(_existed, _raw)
-        except (OSError, ValueError, UnicodeDecodeError):
-            data = None
+        # 판독은 **막히지 않는 관용 판독**(`_read_json_tolerant` = O_NONBLOCK + fstat 정규 재확인)이다. R4 에서
+        #   codex major(writer 없는 FIFO `.claude.json` 이 preflight 를 영구 정지)를 닫으려고 시더 가드
+        #   (`_read_claude_json_bytes`)로 바꿨으나, 그것은 **심링크를 거부**한다 → ★R5(리뷰 minor): `.claude.json` 을
+        #   심링크로 둔 설치는 대상 문서에 플래그가 이미 있어도 data=None 이 되어 등재 cwd 전부가 **영구 거짓 갭**
+        #   이 되고, `--fix` 는 시더가 같은 이유로 REFUSE 해 매 실행 WARN 이 반복됐다(자가 치유 불가). 탐지는 읽기
+        #   전용이므로 심링크를 따라가고(FIFO 정지 차단은 그대로), **쓰기 정책은 시더가 따로 판정**한다 — 심링크
+        #   문서에 진짜 갭이 있으면 그때 seed_trust 가 REFUSE 1줄을 남긴다(사람이 관문에서 1회 신뢰).
+        #   판독 불가(비정규·손상·IO)의 판정은 종전 None 과 같다: projects 를 못 봤으므로 등재 cwd 전부가 갭.
+        data = _read_json_tolerant(config_path)
         projs = data.get("projects") if isinstance(data, dict) else None
         if not isinstance(projs, dict):
             projs = {}
@@ -5916,22 +5921,43 @@ class Preflight:
 #     없애 강행에 문을 열어 뒀다 · 삭제) ⓑ대상이 그런 모호 형상이거나(`_ps_target_ambiguous`) 출력에 레코드 아닌 조각이
 #     있으면(`_ps_lines_torn` — env 값 속 줄바꿈이 레코드를 쪼갠 것) claude 형상 줄의 **불일치를 '검증된 0' 으로 삼지 않는다**.
 #     보통 대상 + 정상 ps 출력의 판정은 종전과 완전히 같다(검증된 0 보존 = WP-2 의 주경로).
+#     ★R5(리뷰 codex major): env 값의 **끝은 원리적으로 확정 불가**다(구분자가 없다) — 이름이 셸 식별자가 아니면
+#     (`BAD-NAME=`·`BASH_FUNC_f%%=`) 값이 길게 잡히고, 값 안에 ' X=y' 가 있으면 짧게 잡힌다. 그래서 판정을 값 하나가
+#     아니라 **값 후보 전부**(`_ps_env_value_candidates` = `CLAUDE_CONFIG_DIR=` 뒤의 공백으로 끝나는 모든 접두)로 하고,
+#     대조는 표기가 아니라 **파일시스템 동일성 3값**(`_same_dir` — True/False/None)으로 한다: 하나라도 True 면 양성 ·
+#     하나라도 None(조회 불가 = EACCES/ESTALE)이면 미해결 · 전부 False 라야 검증된 0. 대소문자·유니코드 별칭도 여기서
+#     닫힌다(macOS 는 대소문자·정규화 보존이라 `realpath` 표기 비교로는 같은 디렉터리가 '다름' 이 됐다). 대상이 기본
+#     config(~/.claude)인데 그 줄에 겉보기 지정이 있으면 미해결이다 — 같은 직렬화가 `OTHER="x CLAUDE_CONFIG_DIR=…"`
+#     에서도 나오므로 지정의 존재가 증거가 아니다(codex).
+# ⑬시더가 **중단된 교환**을 남길 수 있다(마감 감시 `os._exit`·SIGKILL): 교환은 성립했는데 검증 전에 끊기면 상대의 더
+#   새 문서가 displaced 이름에 남고 우리 payload 가 활성이 된다. 종전엔 다음 실행이 `already-trusted` 로 조용히 OK 를
+#   내 그 문서가 영영 고립됐다(★R5 리뷰 codex major). 이제 교환 **직전**에 의도 저널(`.claude.json.seed-intent-*` ·
+#   displaced 이름 + 원본/payload sha256 · fsync + dir fsync)을 남기고, 다음 실행이 잠금 아래 **가장 먼저** 두 파일의
+#   바이트로 판정한다: 우리 payload 뿐이면 저널만 회수 · 원본과 같으면(활성 문서가 유효할 때만) 폐기 · **낯선 바이트면
+#   무접촉 REFUSE `interrupted-transaction`**. 자동 재시드는 하지 않는다(활성 쪽이 더 새로울 수도 있어 이름만으로 선후를
+#   알 수 없다). 저널을 못 쓰면 교환하지 않는다.
 # 정직한 한계: 프로브 뒤 claude 기동 창(우리 플래그 1개가 덮일 수 있음 = 종전 상태 · 2차 방어가 받는다)은 남는다.
-#   ★R4 프로브 잔여(codex 명시 · 이번 라운드에 못 닫은 것): 라이브 claude **쪽** 의 `CLAUDE_CONFIG_DIR` 값이 우리 대상과
-#   다른 철자인데 같은 디렉터리를 가리키고(유니코드 정규화 차이 등) 동시에 그 값이 판독기에 손실되는 형상이면, 그 줄은
-#   불일치로 보여 '검증된 0' 에 흡수될 수 있다(대상만 보는 모호 판정으로는 탐지 불가). 레코드 조각도 우연히 숫자로 시작하면
-#   레코드로 보인다. 두 경우의 결과는 '종전 상태'(claude 첫 쓰기가 우리 플래그 1개를 덮음)이고 2차 방어(관문 보류)가 받는다. 교환
+#   ★R5: R4 가 고지했던 '라이브 claude 쪽 값이 손실 형상' 잔여는 값 후보 × 파일시스템 동일성으로 **닫았다**(별칭 표기·
+#   비식별자 변수명·값 속 ' NAME=' 전부). 대신 새 한계가 있다(정직): 후보 대조는 **보수적 양성**이라 다른 변수 값의
+#   일부가 우연히 우리 대상 디렉터리를 가리키면 과잉 거부가 된다(가용성 손해 · 안전 방향). 레코드 조각도 우연히 숫자로
+#   시작하면 레코드로 보인다. `--force-unverified` 는 여전히 '미해결' 을 넘긴다(양성은 못 넘는다) — 그 플래그는 사람이
+#   명시적으로 감수하는 예외이고 cys-dept 는 쓰지 않는다. 두 경우의 결과는 '종전 상태'(claude 첫 쓰기가 우리 플래그 1개를 덮음)이고 2차 방어(관문 보류)가 받는다. 교환
 #   기구가 없는 플랫폼(Windows · 미지원 FS)의 기존 문서는 **항상 거부**된다(R3 · 강행 플래그도 열지 않는다 — 우회 경로 0).
 #   어느 경로에도 상대 데이터 파괴는 없다(롤백 0 · 백업은 캡처한 바이트로 배타 생성 · 되교환은 상대 inode 그대로 · os.replace
-#   폴백 0). ★R4 시간 상한: CLI(`--seed-trust`)는 `CYS_SEED_TRUST_TIMEOUT`(기본 20초 · 0 이하면 끔)의 마감 감시로 부트
-#   호출자가 I/O 에 무한정 잡히지 않는다 — 초과는 REFUSE timeout(rc 2)이고, 공개(link/교환) 전이면 무쓰기, 뒤면 이미 커밋된
-#   상태다(잠금은 프로세스 종료로 OS 가 푼다).
+#   폴백 0). ★R4 시간 상한: CLI(`--seed-trust`)는 `CYS_SEED_TRUST_TIMEOUT`(기본 20초 · 0 이하면 끔 · 비유한값·상한 초과는
+#   기본/상한으로 접는다)의 마감 감시로 부트 호출자가 I/O 에 무한정 잡히지 않는다 — 초과는 REFUSE timeout(rc 2). ★R5 정정:
+#   그 1줄은 **커밋 여부를 단정하지 않는다**(공개 전이면 무쓰기지만, 교환 뒤 검증 전이면 커밋은 성립했다) — 판정은 다음
+#   실행의 의도 저널(⑬)이 한다. 잠금은 프로세스 종료로 OS 가 푼다.
 # 실패 방향: 전부 REFUSE(rc 2)/ERROR(rc 1) — 부분 쓰기 0 · 좌석 접촉 0. 호출자(cys-dept)는 fail-open(WARN 1줄 + 계속):
 #   거부된 시드 = 종전과 같은 상태이고 2차 방어(restore 준비 판정의 관문 보류)가 뒤에 있다.
 # 키 정책(R1 · codex): claude 가 읽는 키는 process.cwd() = getcwd() **정확 문자열 하나**(POSIX 심링크 해소 물리 경로 =
 #   realpath · Windows abspath) = claude_project_key(cwd). 꼬리 슬래시·심링크 별칭 키는 claude 가 읽지 않으므로 '이미
 #   신뢰' 판정에도 쓰지 않고 손대지도 않는다(종전 '동일성 같은 기존 키 재사용' 은 claude 가 안 읽는 키를 true 로 만들고
-#   정확 키를 false 로 남겼다). 파일시스템 동일성(_path_identity)은 **레지스트리 등재 판정·프로세스 env 대조** 전용.
+#   정확 키를 false 로 남겼다). 파일시스템 동일성(_path_identity·_same_dir)은 **레지스트리 등재 판정·프로세스 env 대조**
+#   전용. ★R5(리뷰 codex major): macOS 의 `realpath` 는 **저장된 표기**를 돌려주지 않는다(대소문자 별칭 · 유니코드 정규화
+#   차) — 그런 cwd 로 좌석을 띄우면 자식의 getcwd()(= claude 의 키)와 우리 키가 갈려 시드가 조용히 무효였다. darwin 은
+#   `fcntl(F_GETPATH)` 로 저장 표기를 되살리되 **구조가 같을 때만** 채택한다(펌링크·마운트 별칭은 종전 realpath 유지 ·
+#   정규화는 우리가 하지 않는다). 실측 오라클: 자식 getcwd()/node process.cwd() 와 4형 전수 일치(2026-09-07).
 SEED_TRUST_OK, SEED_TRUST_ERROR, SEED_TRUST_REFUSE = 0, 1, 2
 SEED_TRUST_LOCK_NAME = ".claude.json.seed-lock"
 SEED_TRUST_TMP_PREFIX = ".claude.json.seed-"
@@ -5942,6 +5968,11 @@ _SEED_TMP_LITTER_RE = re.compile(r"^\.claude\.json\.seed-[A-Za-z0-9_]{8}$")   # 
 #   때만** = 'payload 와 바이트 동등한 잔재' 의 회수(소유·출처 증명이 아니다 · 지문이 다른 낯선 inode 는 무접촉). conflict-* 와
 #   지문 없는 구형 displaced 이름은 청소 대상이 아니다.
 _SEED_DISPLACED_RE = re.compile(r"^\.claude\.json\.displaced-([0-9a-f]{64})-")
+# ★R5(리뷰 codex major · 중단된 트랜잭션): 교환 **직전**에 기록하고 처분이 끝나면 지우는 의도 저널. 이름은 mkstemp 잔재
+#   정규식(`_SEED_TMP_LITTER_RE` = seed-<8자>)과 겹치지 않아 잔재 청소가 지우지 못한다.
+SEED_TRUST_INTENT_PREFIX = ".claude.json.seed-intent-"
+_SEED_INTENT_MAX_BYTES = 8192
+_SEED_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _SEED_DISPLACED_DIGEST_LEN = 64
 _CLAUDE_EXE_NAMES = ("claude", "claude.exe", "claude.cmd")
 _CLAUDE_INSTALL_MARKER = "/claude/versions/"        # 공식 설치 레이아웃 ~/.local/share/claude/versions/<ver>(직접 exec 형상)
@@ -5975,11 +6006,134 @@ def _path_identity(p):
     return stripped or r
 
 
+def _stat_ident(path):
+    """(동일성 키|None, 상태) — 상태 ∈ {"ok","absent","unknown"}. 심링크는 따라간다(가리키는 **디렉터리**의 동일성).
+    ★R5(리뷰 codex D1): 조회 실패를 '다르다' 로 읽지 않기 위해 **부재**(ENOENT·ENOTDIR·ENAMETOOLONG·ELOOP = 그 경로로
+    도달하는 디렉터리가 없다 = 증명된 다름)와 **판정 불가**(EACCES·ESTALE·EIO…)를 나눈다."""
+    if not isinstance(path, str) or not path:
+        return None, "unknown"
+    if len(path) > _MAX_PATH_PROBE:
+        return None, "absent"       # 어떤 파일시스템도 이 길이의 이름을 갖지 않는다(값 후보 열거가 만드는 긴 문자열)
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, "absent"
+    except ValueError:
+        return None, "absent"       # 널 바이트 등 — 경로가 될 수 없는 문자열
+    except OSError as e:
+        # 이름이 너무 길다/심링크 루프 = 그 경로로 도달하는 디렉터리가 없다(증명된 다름) · 권한·ESTALE·IO 는 판정 불가
+        if e.errno in (getattr(errno, "ENAMETOOLONG", None), getattr(errno, "ELOOP", None)):
+            return None, "absent"
+        return None, "unknown"
+    return (st.st_dev, st.st_ino), "ok"
+
+
+def _same_dir(a, b):
+    """두 경로 문자열이 **같은 디렉터리**인가 → True · False · **None(판정 불가)**.
+    ★R5(리뷰 codex major D1): 종전엔 `_path_identity(a) == _path_identity(b)` 하나로 봤다 — macOS 는 대소문자 보존·무시
+    (그리고 유니코드 정규화 보존)라 `realpath` 가 표기를 고치지 못해 **같은 디렉터리의 별칭 표기**가 '다름' 이 됐고, 그
+    별칭으로 도는 라이브 claude 가 '검증된 0' 이 되어 라이브 config 에 썼다. 이제 표기 비교가 실패하면 **파일시스템
+    동일성**(st_dev, st_ino)으로 본다. 그리고 codex D1 의 핵심: 조회가 **실패**하면(권한·ESTALE) 결코 '다르다' 로 접지
+    않는다 — None 을 내고 호출자가 미해결로 처리한다(강행 플래그도 미해결을 넘지 못하는 것이 계약의 목표).
+    순수하지 않다(stat) — 순수 판정부(`_count_claude_in_ps_lines`)는 이 함수를 **주입점**으로 받는다.
+    조회 실패의 분류는 `_stat_ident` 가 한다: 부재류(ENOENT·ENOTDIR·ENAMETOOLONG·ELOOP)는 **증명된 다름**이고
+    나머지(EACCES·ESTALE·EIO…)만 None 이다(★R5 · codex 위임 반례가 지적한 문서-코드 불일치 정정)."""
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return None
+    if a == b:
+        return True
+    # 순서 주의(성능): 값 후보 대조는 한 줄에 수백 번 돈다 — 값싼 `stat` 2회를 **먼저** 보고, 비싼 표기 정규화
+    #   (`realpath` = 구성요소마다 lstat)는 **둘 다 부재**일 때만 한다(그때만 표기 동치가 판단 근거다).
+    ka, sa = _stat_ident(a)
+    kb, sb = _stat_ident(b)
+    if ka is not None and kb is not None:
+        return ka == kb
+    if sa == "absent" and sb == "absent":
+        return _path_identity(a) == _path_identity(b)
+    if (ka is not None and sb == "absent") or (kb is not None and sa == "absent"):
+        return False               # 한쪽은 실재하고 한쪽은 부재 = 증명된 다름
+    return None                    # 판정 불가(권한·ESTALE·IO) — '검증된 0' 으로 흡수 금지
+
+
+_MAX_PATH_PROBE = 4096            # 값 후보 stat 의 상한(PATH_MAX 상한선) — 이보다 길면 syscall 없이 '부재'
+_F_GETPATH_DARWIN = 50            # darwin fcntl.h: F_GETPATH — 열린 fd 의 전체 경로(커널이 기억하는 저장 표기)
+_MAXPATHLEN = 1024
+
+
+def _fgetpath(path):
+    """darwin 전용 **저장 표기 오라클** — `fcntl(fd, F_GETPATH)` 은 `getcwd(3)`/libuv `uv_cwd`(= node `process.cwd()`)
+    와 같은 출처(vnode 이름)를 돌려준다. 실패·미지원·비-darwin 은 None(호출자는 종전 realpath 유지).
+    실측(2026-09-07 · macOS 27 · APFS): `/Users/cys/Desktop/cysjavis` → `/Users/cys/Desktop/CYSjavis`(자식 getcwd 와 일치 ·
+    realpath 는 별칭 표기를 그대로 둔다) · NFC/NFD 로 만든 디렉터리를 반대 형태로 열어도 자식 getcwd 와 일치(realpath 는 4형
+    중 2형에서 불일치). 정규화는 **우리가 하지 않는다**(APFS 는 정규화 보존 · codex D1)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        buf = fcntl.fcntl(fd, _F_GETPATH_DARWIN, b"\0" * _MAXPATHLEN)
+    except (OSError, ValueError, OverflowError, AttributeError):
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        got = os.fsdecode(buf.split(b"\0", 1)[0])
+    except (ValueError, UnicodeError):
+        return None
+    return got or None
+
+
+def _same_path_shape(a, b):
+    """두 절대경로가 **같은 구조**(구성요소 수 동일 · 각 구성요소가 대소문자·유니코드 정규화만 다름)인가 — 순수.
+    저장 표기 오라클의 결과를 '표기만 고친 것' 으로 한정해 채택하기 위한 방벽이다(펌링크·마운트 별칭처럼 **구조가
+    다른** 경로는 채택하지 않는다 · codex D1)."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    pa, pb = a.split(os.sep), b.split(os.sep)
+    if len(pa) != len(pb):
+        return False
+    for x, y in zip(pa, pb):
+        if x == y:
+            continue
+        try:
+            if unicodedata.normalize("NFC", x).casefold() != unicodedata.normalize("NFC", y).casefold():
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def claude_project_key(cwd):
-    """claude 가 .claude.json projects 에 쓰는 정확한 키 — getcwd() 규약: POSIX realpath · Windows abspath."""
+    """claude 가 .claude.json projects 에 쓰는 정확한 키 — getcwd() 규약: POSIX realpath · Windows abspath.
+    ★R5(리뷰 codex major D1): macOS 에서 `realpath` 는 **저장된 표기**를 돌려주지 않는다(대소문자 별칭·유니코드 정규화 차)
+    — 그런 cwd 로 좌석을 띄우면 자식의 `getcwd()`(= claude 가 쓰는 키)는 저장 표기라서 우리가 박은 키를 **claude 가 읽지
+    않았다**(기능이 조용히 inert · 관문이 다시 뜬다). darwin 은 `F_GETPATH` 오라클로 표기를 되살리되, **구조가 같을 때만**
+    채택한다(`_same_path_shape` + samestat 재확인) — 오라클이 없거나 구조가 다르면 종전 realpath 그대로다(거부가 아니라
+    종전 동작 유지: 여기서 거부하면 좌석이 관문 앞에 서는 것이 기본값이 된다).
+    알려진 한계(★R5 · codex 위임 반례): **실행 전용 디렉터리**(mode 0111)는 자식의 chdir/getcwd 는 되지만 우리의 읽기
+    전용 open 이 EACCES 라 오라클을 못 얻는다 → 그 별칭에서는 종전 표기로 시드한다(claude 가 안 읽는 키 = 관문이 다시
+    뜬다 = **거부 방향**이지 좌석 사망이 아니다). 그런 워크스페이스에서는 claude 자신도 파일을 못 읽는다."""
     if os.name == "nt":
         return os.path.abspath(cwd)
-    return os.path.realpath(cwd)
+    physical = os.path.realpath(cwd)
+    got = _fgetpath(physical)
+    if not got or not os.path.isabs(got) or got == physical or not _same_path_shape(got, physical):
+        return physical
+    try:
+        if not os.path.samestat(os.stat(got), os.stat(physical)):
+            return physical
+    except (OSError, ValueError):
+        return physical
+    return got
 
 
 def _default_claude_config_dir():
@@ -6131,7 +6285,11 @@ def _ps_env_value_present(text, name, value):
     값 속 ' NAME=' 에서 값을 자른다 — 그래서 **양성**은 분할 결과가 아니라 원문에서 찾는다. 그래야 꼬리 공백·내부
     ' NAME=' 대상에서도 관측이 살아 있고 `--force-unverified` 가 관측된 라이브 claude 를 넘지 못한다.
     경계: 앞은 문자열 머리 또는 공백(needle 이 `NAME=` 로 시작하므로 그 자리는 분할기도 나눈다) · 뒤는 문자열 끝 또는
-    다음 ' NAME=' 분할점. 순수 함수 — I/O·정규화 0(동일성 비교는 호출자가 따로 한다)."""
+    **아무 공백**. ★R5(리뷰 codex major): 종전엔 뒤 경계를 '다음 `NAME=` 분할점' 으로 요구해서, 뒤따르는 변수 이름이
+    셸 식별자가 아니면(`CLAUDE_CONFIG_DIR=/target BAD-NAME=x`, `BASH_FUNC_f%%=…`) **양성 관측 자체가 사라졌다**(→
+    검증된 0 → 라이브 config 에 쓰기). 참값은 언제나 공백으로 끝나는 접두이므로 '공백이면 경계' 가 필요조건으로 옳다.
+    대가는 보수적 과잉 양성(값이 `/target archive` 인데 대상이 `/target` 이면 양성 = 거부 방향 · 정직하게 고지).
+    순수 함수 — I/O·정규화 0(동일성 비교는 호출자가 따로 한다)."""
     if not isinstance(text, str) or not isinstance(value, str) or not value:
         return False
     needle = name + "=" + value
@@ -6139,10 +6297,50 @@ def _ps_env_value_present(text, name, value):
     while i >= 0:
         if i == 0 or text[i - 1].isspace():
             j = i + len(needle)
-            if j == len(text) or _PS_ENV_SPLIT_RE.match(text, j):
+            if j == len(text) or text[j].isspace():
                 return True
         i = text.find(needle, i + 1)
     return False
+
+
+_PS_VALUE_CANDIDATE_MAX = 512   # 개수 상한(길이 상한이 먼저 걸리는 것이 정상 · 개수로 잘리면 미해결)
+
+
+def _ps_env_candidates_truncated(text, name="CLAUDE_CONFIG_DIR", limit=_PS_VALUE_CANDIDATE_MAX):
+    """값 후보 열거가 **상한에서 잘렸는가**(★R5 · codex 위임 반례): 별칭 경로에 공백이 30개면 참값이 상한 밖으로 밀려
+    후보가 '전부 불일치' 로 보였다 — 잘린 열거의 불일치는 증명이 아니므로 '검증된 0' 이 될 수 없다(미해결)."""
+    return len(_ps_env_value_candidates(text, name, limit + 1)) > limit
+
+
+def _ps_env_value_candidates(text, name="CLAUDE_CONFIG_DIR", limit=_PS_VALUE_CANDIDATE_MAX):
+    """`NAME=` 가 세그먼트 머리에 실린 자리마다 그 뒤의 **공백으로 끝나는 모든 접두**를 값 후보로 낸다(순수 · 중복 제거 ·
+    상한 24).
+    왜 접두 전부인가(★R5 · 리뷰 codex D2): `ps -E` 한 줄에는 env 구분자가 없어 값의 끝을 **원리적으로** 알 수 없다 —
+    종전 판독기(`_PS_ENV_SPLIT_RE`)는 다음 `NAME=` 를 경계로 삼는데, ⓐ 이름이 셸 식별자가 아니면(`BAD-NAME=`,
+    `BASH_FUNC_f%%=`) 경계를 못 보고 값이 **길게** 잡히고, ⓑ 값 안에 ` X=y` 가 있으면 값이 **짧게** 잡힌다. 둘 다
+    같은 디렉터리를 가리키는 라이브 claude 를 '불일치' 로 만들어 '검증된 0' 을 냈다. 후보 전체를 파일시스템 동일성
+    (`_same_dir`)으로 대조하면 두 방향이 함께 닫힌다(맞는 후보 하나면 양성 = 거부 방향).
+    한계(정직): 후보 대조는 '이 줄이 그 디렉터리를 쓸 수 있다' 는 **보수적 양성**이지 정확 귀속의 증명이 아니다 —
+    다른 변수 값의 일부가 우연히 우리 대상과 같은 디렉터리를 가리키면 과잉 거부가 된다(가용성 손해 · 안전 방향)."""
+    out = []
+    if not isinstance(text, str) or not isinstance(name, str):
+        return out
+    seen = set()
+    needle = name + "="
+    i = text.find(needle)
+    while i >= 0 and len(out) < limit:
+        if i == 0 or text[i - 1].isspace():
+            rest = text[i + len(needle):]
+            for j in range(len(rest) + 1):
+                if len(out) >= limit or j > _MAX_PATH_PROBE:
+                    break          # 길이 상한은 **소진**이다(그보다 긴 접두는 어떤 FS 에도 없다) — 절단이 아니다
+                if j == len(rest) or rest[j].isspace():
+                    c = rest[:j]
+                    if c and c not in seen:
+                        seen.add(c)
+                        out.append(c)
+        i = text.find(needle, i + 1)
+    return out
 
 
 def _ps_lines_torn(lines, name="CLAUDE_CONFIG_DIR"):
@@ -6188,7 +6386,7 @@ def _ps_target_ambiguous(config_dir):
     return False
 
 
-def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None):
+def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None, same_dir=None):
     """darwin `ps -ww -E -o pid=,command=` 출력 순수 판정 — (count, parsed_lines, unresolved). 각 줄 = pid + [argv…] +
     [NAME=value …]. self_pids(자기·부모)는 제외.
     ★R3(리뷰 codex major): `ps -E` 한 줄엔 argv 와 env 사이 구분자가 없어 **인자 속** `CLAUDE_CONFIG_DIR=/other` 가 env 값을
@@ -6206,19 +6404,49 @@ def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None):
        내부 ' NAME=' 대상에서도 관측이 살아 있어야 `--force-unverified` 가 관측된 라이브 claude 를 넘지 못한다.
        ②대상이 모호 형상(`_ps_target_ambiguous`)이거나 출력에 레코드 아닌 조각이 있으면(`_ps_lines_torn` — env 값 속
        줄바꿈이 레코드를 쪼갠 것) claude 형상 줄의 **불일치를 '검증된 0' 으로 삼지 않는다**(모드① 도 동일).
-       보통 대상 + 정상 출력에서는 종전 판정 그대로다(검증된 0 보존 — 그것이 WP-2 의 주경로)."""
+       보통 대상 + 정상 출력에서는 종전 판정 그대로다(검증된 0 보존 — 그것이 WP-2 의 주경로).
+    ★R5(리뷰 codex major D1·D2): 값의 끝을 판독기로 확정할 수 없다는 사실을 판정에 반영한다 — 값 **후보 전부**
+       (`_ps_env_value_candidates`)를 파일시스템 동일성 3값 판정(`same_dir` 주입점 · 기본 `_same_dir`)으로 대조한다:
+       하나라도 True 면 양성 · 하나라도 None(조회 불가)이면 미해결 · 전부 False 라야 그 줄이 '검증된 0' 에 든다.
+       대소문자/유니코드 별칭·비식별자 변수명·값 속 ' NAME=' 이 이 한 규칙으로 함께 닫힌다. 대상이 기본 config
+       (~/.claude)인데 그 줄에 겉보기 지정이 있으면 **미해결**이다 — 그 지정이 다른 변수 값의 일부일 수 있어
+       (직렬화가 같다) 그 프로세스가 실제로 기본 config 를 쓸 가능성을 배제할 수 없다(codex D2).
+       판정 로직 자체는 순수하고, 파일시스템 조회는 `same_dir` 주입점 하나로 모인다."""
     lines = list(lines)
+    same_dir = same_dir or _same_dir
     ident = _path_identity(config_dir)
-    default_target = ident == _path_identity(_default_claude_config_dir())
+    default_verdict = same_dir(config_dir, _default_claude_config_dir())
     ambiguous = _ps_target_ambiguous(config_dir) or _ps_lines_torn(lines)
     argv_map = _ps_argv_map(argv_lines) if argv_lines is not None else None
     n = 0
     parsed = 0
     unresolved = 0
     def _carries(text):
-        """이 줄이 **우리 대상**을 env 값으로 달고 있는가(원문 바이트 · 세그먼트 경계)."""
+        """이 줄이 **우리 대상**을 env 값으로 달고 있는가(원문 바이트 · 세그먼트 경계 · 순수)."""
         return (_ps_env_value_present(text, "CLAUDE_CONFIG_DIR", config_dir)
                 or _ps_env_value_present(text, "CLAUDE_CONFIG_DIR", ident))
+
+    def _attribute(text):
+        """claude 형상 줄의 귀속 → True(우리 대상 · 양성) · False(검증된 음성) · None(판정 불가 · 미해결)."""
+        if _carries(text):
+            return True
+        cands = _ps_env_value_candidates(text)
+        if not cands:
+            # 지정이 안 보인다 = 기본 config 사용(양성/음성은 대상이 기본인가로 갈린다). 단 **찢긴 출력·모호 대상**
+            # 에서는 값이 다른 조각에 있을 수 있어 '안 보인다' 를 근거로 쓰지 않는다(R4 핀 보존).
+            if ambiguous:
+                return None
+            return True if default_verdict is True else (False if default_verdict is False else None)
+        unknown = _ps_env_candidates_truncated(text)   # ★R5(codex 위임 반례): 잘린 열거의 불일치는 증명이 아니다
+        for c in cands:
+            v = same_dir(c, config_dir)
+            if v is True:
+                return True
+            if v is None:
+                unknown = True
+        if unknown or ambiguous or default_verdict is not False:
+            return None
+        return False
     for line in lines:
         s_ = line.lstrip()          # ★R4(codex 위임 반례): rstrip 금지 — 줄 끝 공백은 **마지막 env 값의 바이트**일 수 있다
         if not s_:
@@ -6255,13 +6483,11 @@ def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None):
                 continue
             if not _is_claude_command(cmd_tokens):
                 continue
-            vals = [e[len("CLAUDE_CONFIG_DIR="):].strip() for e in env_segs if e.startswith("CLAUDE_CONFIG_DIR=")]
-            if (_ps_env_value_present(env_str, "CLAUDE_CONFIG_DIR", config_dir)          # ★R4: 원문 바이트 대조(분할 前)
-                    or _ps_env_value_present(env_str, "CLAUDE_CONFIG_DIR", ident)
-                    or any(_path_identity(v) == ident for v in vals) or (not vals and default_target)):
+            verdict = _attribute(env_str)         # ★R5: 원문 대조 → 값 후보 × 파일시스템 동일성(3값)
+            if verdict is True:
                 n += 1
-            elif ambiguous:
-                unresolved += 1        # ★R4: 모호 대상/찢긴 출력 — 값이 잘려 '불일치' 로 보였을 수 있다(검증된 0 금지)
+            elif verdict is None:
+                unresolved += 1        # 모호 대상/찢긴 출력/별칭 조회 불가 — '검증된 0' 으로 흡수 금지
             continue
         segs = _PS_ENV_SPLIT_RE.split(rest)
         cmd_tokens = segs[0].split()
@@ -6272,10 +6498,7 @@ def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None):
             continue
         if not _is_claude_command(cmd_tokens):
             continue
-        vals = [seg[len("CLAUDE_CONFIG_DIR="):].strip() for seg in segs[1:] if seg.startswith("CLAUDE_CONFIG_DIR=")]
-        if (_ps_env_value_present(rest, "CLAUDE_CONFIG_DIR", config_dir)                 # ★R4: 원문 바이트 대조(분할 前)
-                or _ps_env_value_present(rest, "CLAUDE_CONFIG_DIR", ident)
-                or any(_path_identity(v) == ident for v in vals) or (not vals and default_target)):
+        if _attribute(rest) is True:
             n += 1
         else:
             unresolved += 1                # 구분자 없는 모드의 claude 형상은 검증된 0 이 될 수 없다(R3 codex)
@@ -6287,8 +6510,9 @@ def _count_claude_procfs(config_dir, proc_root="/proc"):
     같은 uid 인데 못 읽으면(비덤프 프로세스) 미해결 · 다른 uid 는 범위 외(cys-dept 와 claude 는 같은 사용자) · uid 판정 불가도
     미해결. 스캔 중 종료(ENOENT)=무시 · 그 외 판독 실패=미해결. ★양성 관측 n>0 은 미해결보다 먼저 반환한다(--force-unverified 가
     관측된 라이브 claude 를 넘지 못하게)."""
-    ident = _path_identity(config_dir)
-    default_target = ident == _path_identity(_default_claude_config_dir())
+    # ★R5(리뷰 codex D1): 표기 비교 하나가 아니라 3값 파일시스템 동일성(_same_dir) — 조회 불가(EACCES/ESTALE)는
+    #   '다름' 이 아니라 **미해결**이다(검증된 0 금지). /proc 은 값 경계가 NUL 로 확정돼 있어 후보 열거는 필요 없다.
+    default_verdict = _same_dir(config_dir, _default_claude_config_dir())
     try:
         names = os.listdir(proc_root)
     except OSError as e:
@@ -6320,18 +6544,28 @@ def _count_claude_procfs(config_dir, proc_root="/proc"):
             unresolved += 1
             continue
         scanned += 1
-        if not _is_claude_command([t.decode("utf-8", "replace") for t in cmd.split(b"\0") if t]):
+        # ★R5(리뷰 codex major): 디코드는 **파일시스템 규약**(os.fsdecode = surrogateescape)이어야 한다. 종전
+        #   `decode("utf-8","replace")` 는 비-UTF8 바이트를 U+FFFD 로 바꿔, 같은 디렉터리를 가리키는 라이브 claude 가
+        #   불일치로 보이고 '검증된 0'(→ 라이브 config 에 쓰기)이 됐다 — 파이썬 경로 문자열은 그 바이트를 서로게이트로
+        #   보존하므로 양쪽 표기가 갈렸다. fsdecode 는 왕복 보존이라 대상 문자열과 바이트 단위로 대조된다.
+        if not _is_claude_command([os.fsdecode(t) for t in cmd.split(b"\0") if t]):
             continue
         cfg_val = None
         for e in env.split(b"\0"):
             if e.startswith(b"CLAUDE_CONFIG_DIR="):
-                cfg_val = e[len(b"CLAUDE_CONFIG_DIR="):].decode("utf-8", "replace")
+                cfg_val = os.fsdecode(e[len(b"CLAUDE_CONFIG_DIR="):])
                 break
         if cfg_val is not None:
-            if _path_identity(cfg_val) == ident:
+            v = _same_dir(cfg_val, config_dir)
+            if v is True:
                 n += 1
-        elif default_target:
+            elif v is None:
+                unresolved += 1        # 별칭 조회 불가(EACCES/ESTALE) → 검증된 0 금지. /proc 은 NUL 경계라 값 자체는
+                #                        확정이다 — ps 의 '겉보기 지정' 모호(codex D2)는 여기서 발생하지 않는다.
+        elif default_verdict is True:
             n += 1
+        elif default_verdict is None:
+            unresolved += 1
     if n > 0:
         return n, "linux: /proc %d건(미해결 %d)" % (scanned, unresolved)
     if unresolved:
@@ -6407,8 +6641,11 @@ def _open_unblocking_ro(path, nofollow=False):
     TOCTOU 까지 닫는다. 비정규(FIFO·장치·디렉터리)는 ValueError.
     한계(정직): 이것이 닫는 것은 **FIFO open 대기**다 — 응답 없는 원격 FS(NFS)의 조회·read 지연 같은 '무한정 느림' 은
     닫지 못한다(그 층의 상한은 `--seed-trust` CLI 의 마감 감시 `CYS_SEED_TRUST_TIMEOUT`). Windows 는 O_NONBLOCK/
-    O_NOFOLLOW 가 없어 getattr 0 — 명명 파이프는 열리더라도 fstat 이 정규가 아니라 거부된다."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    O_NOFOLLOW 가 없어 getattr 0 — 명명 파이프는 열리더라도 fstat 이 정규가 아니라 거부된다.
+    ★R5(리뷰 minor): `os.open` 은 Windows 에서 `O_BINARY` 를 주지 않으면 CRT 기본이 텍스트 모드다(CRLF 변환 · 0x1A
+    EOF 절단) — 종전 `open(path,"rb")` 에서 이 함수로 옮기며 바이트 정확성을 잃었다(sha256/CAS 계약과 같은 계층).
+    getattr 0 이라 POSIX 는 무영향."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     if nofollow:
         flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
@@ -6579,6 +6816,145 @@ def _sweep_stale_seed_tmp(config_dir):
     return swept
 
 
+def _digest_of_regular(path):
+    """정규 파일(무추종)의 sha256 → 64hex · 판독 불가/비정규/심링크는 None. 잠금 아래 호출."""
+    try:
+        if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        fd, _st = _open_unblocking_ro(path, nofollow=True)
+        with os.fdopen(fd, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_digest):
+    """교환 **전** 의도 저널을 내구적으로 공개 → 저널 경로. 실패는 OSError(호출자는 교환하지 않는다).
+    ★R5(리뷰 codex major): 교환~검증 창에서 시더가 죽으면(마감 감시 `os._exit`·SIGKILL) 상대의 **더 새 문서**가
+    displaced 이름에 남고 우리 payload 가 활성이 된다 — 다음 실행은 플래그가 이미 있으니 `already-trusted` 로 조용히
+    OK 를 냈다(고립된 사용자 문서 · 아무도 모른다). 저널이 그 창을 **내구적으로** 표시한다.
+    담는 것: displaced 이름(basename) · 우리가 읽은 원본 바이트의 sha256 · payload sha256 · pid/utc(진단).
+    지문 하나로는 트랜잭션 단계를 증명할 수 없으므로(codex D4) 회수는 **두 파일의 증거**로 판정한다."""
+    payload = json.dumps({"v": 1, "displaced": displaced_name, "captured_sha256": captured_digest,
+                          "payload_sha256": payload_digest, "pid": os.getpid(),
+                          "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+                         ensure_ascii=True).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=SEED_TRUST_TMP_PREFIX, dir=config_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())          # 내구성 실패는 여기서 예외 = 교환 안 함(codex D4)
+        path = _exclusive_name(os.path.join(config_dir, SEED_TRUST_INTENT_PREFIX))
+        os.link(tmp, path)                # 완성된 내용을 한 번에 공개(부분 저널 0)
+    except BaseException:
+        _unlink_quiet(tmp)
+        raise
+    _unlink_quiet(tmp)
+    _fsync_dir(config_dir)                # 저널의 **이름**이 교환보다 먼저 내구적이어야 한다
+    return path
+
+
+def _read_seed_intent(path):
+    """저널 판독 → dict(검증 통과) 또는 None(부재·비정규·심링크·손상·형식 위반). 관대하지 않다 — 형식이 어긋나면
+    '모른다' 이고 호출자는 **보존 + 거부** 로 간다."""
+    try:
+        if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        fd, st_ = _open_unblocking_ro(path, nofollow=True)
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(_SEED_INTENT_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if len(raw) > _SEED_INTENT_MAX_BYTES:
+        return None
+    try:
+        rec = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    d = rec.get("displaced")
+    if not isinstance(d, str) or os.path.basename(d) != d or not _SEED_DISPLACED_RE.match(d):
+        return None                        # 경로 탈출(`../victim`)·타 네임스페이스 참조 금지(codex D4)
+    for k in ("captured_sha256", "payload_sha256"):
+        v = rec.get(k)
+        if not isinstance(v, str) or not _SEED_HEX64_RE.match(v):
+            return None
+    return rec
+
+
+def _active_document_healthy(cfg):
+    """활성 `.claude.json` 이 **유효한 문서**인가(존재 + 파싱). displaced 를 지워도 되는지의 전제다 — 활성이 없거나
+    깨졌으면 displaced 가 유일한 유효 사본일 수 있다(codex D4: 지문 동등만으로 삭제를 인가하지 않는다)."""
+    try:
+        existed, raw, _st = _read_claude_json_bytes(cfg)
+        if not existed:
+            return False
+        return isinstance(_parse_claude_json(existed, raw), dict)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
+def _recover_interrupted_seed(config_dir, cfg):
+    """잠금 아래 · 잔재 청소와 'already-trusted' **앞**에서 중단된 교환 트랜잭션을 판정한다 → None(계속) 또는
+    (rc, verdict, reason). 판정은 저널 + **두 파일의 바이트**로 한다(codex D4):
+      ⓐ 저널이 가리키는 displaced 부재 → 활성 문서가 유효하면 저널만 회수(교환 전 사망이거나 처분까지 끝난 뒤) ·
+        활성이 없거나 깨졌으면 **거부**(무엇이 사라졌는지 모른다)
+      ⓑ displaced 바이트 == payload → 우리 payload 뿐(교환 전 사망 · 되교환 뒤) = 낯선 데이터 아님 → 저널 회수
+        (파일 자체는 지문 청소가 회수)
+      ⓒ displaced 바이트 == 우리가 읽은 원본 → 교환은 성립했고 그것은 우리 계획의 전제였던 문서다 → 활성 문서가
+        유효할 때만 폐기하고 저널 회수(활성이 깨졌으면 거부·보존)
+      ⓓ 그 밖(낯선 바이트) → **REFUSE interrupted-transaction** · 두 파일 무접촉 · 사람이 병합한다
+      ⓔ 저널 자체가 판독 불가/형식 위반 → REFUSE(무접촉)
+    자동 재시드(displaced 를 새 원본으로 삼아 다시 커밋)는 **하지 않는다** — 활성 쪽이 더 새로울 수도 있어 이름만으로
+    선후를 알 수 없다(codex D4)."""
+    R = SEED_TRUST_REFUSE
+    try:
+        names = sorted(n for n in os.listdir(config_dir) if n.startswith(SEED_TRUST_INTENT_PREFIX))
+    except OSError:
+        return None
+    for n in names:
+        jpath = os.path.join(config_dir, n)
+        rec = _read_seed_intent(jpath)
+        if rec is None:
+            return (R, "REFUSE", "interrupted-transaction(저널 %s 판독 불가/형식 위반 — 중단된 교환의 흔적이다 · "
+                                 "이 디렉터리의 .claude.json* 를 사람이 확인·병합한 뒤 저널을 지운다)" % n)
+        dpath = os.path.join(config_dir, rec["displaced"])
+        if not os.path.lexists(dpath):
+            if _active_document_healthy(cfg):
+                _unlink_quiet(jpath)
+                continue
+            return (R, "REFUSE", "interrupted-transaction(저널 %s 가 가리키는 %s 가 없고 활성 .claude.json 도 유효하지 "
+                                 "않다 — 사람이 확인)" % (n, rec["displaced"]))
+        d = _digest_of_regular(dpath)
+        if d is None:
+            return (R, "REFUSE", "interrupted-transaction(%s 판독 불가 — 무접촉 · 사람이 확인)" % rec["displaced"])
+        if d == rec["payload_sha256"]:
+            # ★R5(codex 위임 반례 · 데이터 손실): 이 잔재는 '우리 payload' 지만 그 내용은 **원본 + 플래그** 다 —
+            #   활성 문서가 그 사이 사라지거나 깨졌다면 이것이 **유일한 완전한 문서**다. 저널을 지우면 곧바로
+            #   지문 청소(⑪)가 삭제해 원본 필드까지 잃는다 → 활성이 유효할 때만 회수 대상으로 넘긴다.
+            if not _active_document_healthy(cfg):
+                return (R, "REFUSE", "interrupted-transaction(활성 .claude.json 이 유효하지 않고 %s 가 유일한 완전한 "
+                                     "문서일 수 있다 — 무접촉 · 사람이 확인)" % rec["displaced"])
+            _unlink_quiet(jpath)                 # 우리 payload 뿐 — 파일은 지문 청소(⑪)가 회수한다
+            continue
+        if d == rec["captured_sha256"]:
+            if not _active_document_healthy(cfg):
+                return (R, "REFUSE", "interrupted-transaction(교환 뒤 활성 .claude.json 이 유효하지 않다 — %s 가 유일한 "
+                                     "유효 사본일 수 있어 지우지 않는다 · 사람이 확인)" % rec["displaced"])
+            try:
+                os.unlink(dpath)
+            except OSError:
+                continue                          # 저널을 남겨 다음 실행이 다시 시도한다
+            _unlink_quiet(jpath)
+            continue
+        return (R, "REFUSE", "interrupted-transaction(교환 뒤 검증 전에 중단됐다 — 상대의 더 새 문서가 %s 에 있고 활성 "
+                             ".claude.json 은 우리 문서다 · 어느 쪽이 최신인지 도구가 판정하지 않는다 · 사람이 병합한 뒤 "
+                             "%s 를 지운다)" % (rec["displaced"], n))
+    return None
+
+
 def _restore_foreign(tmp, cfg, payload_b, note):
     """교환으로 드러난 '낯선 inode'(교환 순간 .claude.json 에 있던 것이 우리가 읽은 원본이 아니다) 복원 → (rc, verdict, reason).
     되교환으로 상대 inode 를 그대로 되돌린다(무손실). 되교환 뒤 tmp(우리 inode)가 우리 payload 그대로면 폐기 · 아니면(그 마이크로초
@@ -6688,6 +7064,9 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         err = _acquire()
         if err:
             return err
+        broken = _recover_interrupted_seed(config_dir, cfg)     # ⑬ ★R5: 중단된 교환 트랜잭션 — 청소·판정보다 **먼저**
+        if broken:
+            return broken
         swept = _sweep_stale_seed_tmp(config_dir)                                   # ⑪ 잠금 아래 잔재 청소
         state = _read_plan()
         if len(state) == 3:
@@ -6713,6 +7092,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
             note.append("no-probe(.claude.json 부재 — 보호할 기존 문서 없음)")
         # ⑦ 같은 dir mkstemp + fsync + 교체 前 임시파일 되읽기 → ⑥ 교체 직전 존재+바이트 대조 → 백업 → 무손실 커밋
         tmp = None
+        intent = None
         try:
             # ★R3(리뷰): 직렬화·인코딩도 try 안 — 기존 문서의 고아 서로게이트 이스케이프(`"\ud800"`)는 json.loads 는 받지만
             #   ensure_ascii=False 출력의 utf-8 인코딩이 UnicodeEncodeError 를 낸다(종전: try 밖 → C58 --fix 경유 시 preflight
@@ -6770,12 +7150,21 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 displaced = _exclusive_name(os.path.join(config_dir, SEED_TRUST_DISPLACED_PREFIX + _payload_digest(payload_b) + "-"))
                 os.rename(tmp, displaced)                 # 같은 dir · 우리 payload 만 이동(아직 공개 전)
                 tmp = None
+                # ⑬ ★R5(리뷰 codex major): 교환~검증 창을 **내구적으로** 표시한다. 저널을 못 쓰면 교환하지 않는다
+                #   (표시 없는 창을 열지 않는다 = 고립된 사용자 문서 0).
+                try:
+                    intent = _write_seed_intent(config_dir, os.path.basename(displaced),
+                                                _payload_digest(raw), _payload_digest(payload_b))
+                except OSError as e:
+                    _unlink_quiet(displaced)              # 아직 공개 전 = 우리 payload 뿐
+                    return E, "ERROR", "의도 저널 기록 실패 — 교환하지 않는다(무변경): %s" % e
                 # ★displaced 는 finally 가 절대 치우지 않는다(교환 직후 인터럽트가 와도 옛 inode = 낯선 데이터일 수 있다 · codex R2).
                 #   치우는 곳은 '교환이 안 됐다' 가 확정된 자리(syscall 예외 · 기구 부재 · 폴백 실패)와 '옛 inode == 원본' 이 확정된 자리뿐.
                 try:
                     swapped = _exchange_paths(displaced, cfg)
                 except OSError as e:                      # syscall -1 = 교환 안 됨 → displaced 는 우리 payload 그대로
                     _unlink_quiet(displaced)
+                    _unlink_quiet(intent)                 # 창이 열리지 않았다(무변경) — 표시도 남기지 않는다
                     return E, "ERROR", "쓰기 실패(교환): %s" % e
                 if swapped:
                     # displaced 에는 교환 순간 .claude.json 에 있던 inode 가 그대로 있다 — 그것이 우리가 읽은 원본인가?
@@ -6785,12 +7174,16 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     except (ValueError, OSError):
                         foreign = True                    # 심링크/정션/비정규 파일이 끼어들었거나 판독 불가 = 낯선 것 → 복원
                     if foreign:
-                        return _restore_foreign(displaced, cfg, payload_b, note)   # displaced 처분은 그 안에서 확정
+                        got = _restore_foreign(displaced, cfg, payload_b, note)    # displaced 처분은 그 안에서 확정
+                        if got[0] != E:
+                            _unlink_quiet(intent)         # 되교환까지 끝나 창이 닫혔다(실패면 저널을 남겨 증거로 둔다)
+                        return got
                     note.append("commit=exchange")            # ★R4: 커밋은 교환으로 이미 성립 — 아래 청소 실패가 이 사실을 못 뒤집는다
                     try:
                         os.unlink(displaced)                  # 옛 원본(= 우리 계획의 전제 · 바이트 동일) 폐기
+                        _unlink_quiet(intent)                 # 처분 완료 뒤에만 표시를 지운다(순서 고정 · codex D4)
                     except OSError as e:                      # 잔재는 남지만 커밋은 성공(리뷰 minor: 종전엔 ERROR 로 보고했다)
-                        note.append("displaced-left(%s · 지문이 payload 와 달라 자동 회수 대상이 아니다 · 수동 삭제)"
+                        note.append("displaced-left(%s · 저널이 남아 다음 실행이 회수한다)"
                                     % (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
                     _fsync_dir(config_dir)
                 else:
@@ -6799,6 +7192,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     #   무손실 계약을 만족하지 못한다. 강행 플래그로도 열지 않는다(귀속 불확실을 감수하는 것과 알려진 손실을
                     #   감수하는 것은 다른 예외 · codex R3) — 사람이 관문에서 1회 신뢰하면 claude 가 스스로 플래그를 쓴다(2차 방어).
                     _unlink_quiet(displaced)              # 아직 공개 전 = 우리 payload 뿐
+                    _unlink_quiet(intent)                 # 창이 열리지 않았다 — 표시 회수
                     return R, "REFUSE", ("exchange-unavailable(%s — 원자 교환 없이는 대조~교체 창을 닫을 수 없다 · 기존 문서 무접촉 · "
                                          "관문에서 1회 수동 신뢰 뒤 already-trusted)%s"
                                          % (getattr(swapped, "why", None) or "기구 부재", (" · " + " · ".join(note)) if note else ""))
@@ -6852,11 +7246,15 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
 
 _SEED_TRUST_TIMEOUT_ENV = "CYS_SEED_TRUST_TIMEOUT"
 _SEED_TRUST_TIMEOUT_DEFAULT = 20.0
+_SEED_TRUST_EXIT_GRACE = 2.0      # 마감 감시 발화 뒤 '진단 출력' 에 허용하는 시간 — 지나면 무조건 종료(codex D5)
 
 
 def _seed_trust_timeout_secs(env=None):
     """마감 감시 상한(초) — 미설정 = 기본 20 · 0 이하 = 끔(None) · 비수치 = 기본(파싱 실패로 감시를 잃지 않는다).
-    롤백 노브지 게이트 노브가 아니다(끄면 종전 동작 = 무한 대기)."""
+    롤백 노브지 게이트 노브가 아니다(끄면 종전 동작 = 무한 대기).
+    ★R5(리뷰 codex minor): **비유한값**(`nan`·`inf`·`1e309`)은 계약("0 이하면 끔") 밖인데 종전엔 nan → None(감시
+    상실) · inf → `threading.Timer(inf)`(사실상 감시 상실 · 내부 오버플로로 타이머 스레드가 죽을 수도) 였다 →
+    `math.isfinite` 아니면 **기본값**으로 되돌린다(감시를 잃지 않는 방향)."""
     raw = (os.environ if env is None else env).get(_SEED_TRUST_TIMEOUT_ENV, "")
     if not raw:
         return _SEED_TRUST_TIMEOUT_DEFAULT
@@ -6864,28 +7262,67 @@ def _seed_trust_timeout_secs(env=None):
         v = float(raw)
     except (TypeError, ValueError):
         return _SEED_TRUST_TIMEOUT_DEFAULT
-    return v if v > 0 else None
+    if not math.isfinite(v):
+        return _SEED_TRUST_TIMEOUT_DEFAULT
+    if v <= 0:
+        return None
+    # ★R5(리뷰 codex D5): 유한이어도 `threading.TIMEOUT_MAX` 를 넘으면 타이머 스레드가 OverflowError 로 죽어 감시가
+    #   조용히 사라진다(`1e300`) → 상한으로 접는다(그 값은 사실상 '끄기' 지만 예외 없이 그렇게 된다).
+    return min(v, threading.TIMEOUT_MAX)
 
 
 def _start_seed_deadline(secs, emit):
     """★R4(codex 잔여 지적): 부트 호출자(cys-dept launch/allocate/create · rotate 는 **데몬을 내린 뒤** 여기 온다)가
     시드 I/O 에 무한정 잡히지 않게 하는 마감 감시 → 취소 함수. 데몬 스레드 타이머(Windows 안전 · SIGALRM 미사용) ·
     초과하면 emit() 로 REFUSE 1줄을 찍고 `os._exit(2)`(블로킹 syscall 안에서는 그것만 통한다).
-    안전성: 종료 시점의 상태 집합은 SIGKILL 과 같다 — 공개(link/교환) 전이면 `.claude.json` 미생성/무변경이고, 뒤면
-    이미 커밋된 상태다 · 잠금은 프로세스 종료로 OS 가 푼다 · mkstemp/displaced 잔재는 다음 시더의 지문 청소가 회수 ·
-    호출자는 fail-open(WARN 1줄 + 계속)이라 좌석은 죽지 않는다(2차 방어 = 관문 보류)."""
+    안전성: 종료 시점의 상태 집합은 SIGKILL 과 같다 — 공개(link/교환) 전이면 `.claude.json` 미생성/무변경이고,
+    뒤면 **교환은 성립했으나 검증·청소가 끝나지 않았을 수 있다**(★R5 정정: 종전 주석의 "뒤면 이미 커밋된 상태다" 는
+    거짓이었다 — 교환~검증 창에서 죽으면 상대의 더 새 문서가 displaced 에 남는다). 그 창은 이제 **의도 저널**
+    (`.claude.json.seed-intent-*`)이 표시하고 다음 실행이 회수하거나 REFUSE 한다(seed_trust ⑬) · 잠금은 프로세스
+    종료로 OS 가 푼다 · 호출자는 fail-open(WARN 1줄 + 계속)이라 좌석은 죽지 않는다(2차 방어 = 관문 보류).
+    ★R5(리뷰 minor · 취소 경쟁): `seed_trust` 가 **반환한 뒤** `cancel()` 전에 타이머가 `_fire` 에 들어가면
+    `Timer.cancel()` 은 무효라 커밋된 실행이 `REFUSE timeout`(rc 2)으로 뒤집혔다 — 이제 `_fire` 와 취소는 같은
+    잠금 아래 `done` 플래그를 보고, 먼저 잡은 쪽만 이긴다(취소가 이기면 `_fire` 는 조용히 반환)."""
     if not secs:
         return lambda: None
-    import threading
+    state = {"done": False}
+    guard = threading.Lock()
+
+    def _claim():
+        """취소/발화 중 **먼저 온 하나**만 True — 반환 뒤 취소 사이의 창(리뷰 R5)을 닫는다."""
+        with guard:
+            if state["done"]:
+                return False
+            state["done"] = True
+            return True
+
     def _fire():
+        if not _claim():
+            return                      # 정상 경로가 이미 끝났다 — 커밋된 실행을 timeout 으로 뒤집지 않는다
+        # ★R5(리뷰 codex D5): `emit()` 이 막힌 stdout 에 걸리면 `finally` 는 실행되지 않는다(예외가 아니라 '돌아오지
+        #   않음') → 종료 자체를 별도 타이머로 보증한다(진단 1줄은 최선 노력 · 종료는 보장).
+        hard = threading.Timer(_SEED_TRUST_EXIT_GRACE, lambda: os._exit(SEED_TRUST_REFUSE))
+        hard.daemon = True
+        try:
+            hard.start()
+        except RuntimeError:
+            os._exit(SEED_TRUST_REFUSE)   # ★R5(codex 위임 반례): 종료 보증이 없으면 진단을 포기한다 — emit 이 막히면
+            #                               부트 호출자가 영원히 붙잡힌다(이 층의 계약은 '반드시 끝난다' 다)
         try:
             emit()
         finally:
             os._exit(SEED_TRUST_REFUSE)
     t = threading.Timer(secs, _fire)
     t.daemon = True
-    t.start()
-    return t.cancel
+    try:
+        t.start()
+    except RuntimeError:
+        return None                     # 감시 스레드를 못 띄웠다 — 호출자는 시드를 시작하지 않는다(codex D5)
+
+    def cancel():
+        _claim()                        # 발화가 이미 시작됐으면 False — 그쪽이 os._exit 한다(취소 불가가 정상)
+        t.cancel()
+    return cancel
 
 
 def _seed_trust_emit(json_mode, rc, verdict, reason, config, cwd):
@@ -6925,8 +7362,17 @@ def _seed_trust_main(argv):
     secs = _seed_trust_timeout_secs()
     cancel = _start_seed_deadline(secs, lambda: _seed_trust_emit(
         args.json, SEED_TRUST_REFUSE, "REFUSE",
-        "timeout(%gs 안에 끝나지 않았다 — 응답 없는 파일시스템/판독 대기 · 부트 호출자를 붙잡지 않으려 중단 · 공개 전이면 "
-        "무쓰기 · 재시도 가능 · 상한은 %s)" % (secs, _SEED_TRUST_TIMEOUT_ENV), args.config, args.cwd))
+        # ★R5(리뷰 codex D5): 종전 문면의 '공개 전이면 무쓰기' 는 **거짓일 수 있다** — 교환 뒤 검증 전에 끊기면 커밋은
+        #   성립했고 상대 문서가 displaced 에 남는다. 결과를 단정하지 않고, 그 판정은 다음 실행의 의도 저널이 한다.
+        "timeout(%gs 안에 끝나지 않았다 — 응답 없는 파일시스템/판독 대기 · 부트 호출자를 붙잡지 않으려 중단 · **커밋 여부는 "
+        "이 줄로 단정하지 않는다**: 중단된 교환은 다음 실행이 의도 저널로 판정한다 · 상한은 %s)"
+        % (secs, _SEED_TRUST_TIMEOUT_ENV), args.config, args.cwd))
+    if cancel is None:
+        _seed_trust_emit(args.json, SEED_TRUST_REFUSE, "REFUSE",
+                         "watchdog-unavailable(마감 감시 스레드를 띄우지 못했다 — 시간 상한 없이 부트 경로를 붙잡지 "
+                         "않는다 · 무쓰기 · %s=0 으로 감시를 끄면 종전 동작)" % _SEED_TRUST_TIMEOUT_ENV,
+                         args.config, args.cwd)
+        return SEED_TRUST_REFUSE
     try:
         rc, verdict, reason = seed_trust(args.config, args.cwd, force_unverified=args.force_unverified)
     finally:
@@ -7274,7 +7720,10 @@ def _self_test():
              "9 /bin/sh /x/claude", "10 claude"]
     check("ps -E 판정(R3): argv 목록으로 경계 확정 — 인자 속 CLAUDE_CONFIG_DIR= 는 env 가 아니다(7 양성 · 8 은 기본 config) · env 비노출 sh 0 · 경계만 있는 claude(10) unresolved",
           _count_claude_in_ps_lines(env_l, "/w/cfg", argv_lines=argv_l) == (1, 4, 1)
-          and _count_claude_in_ps_lines(env_l, _default_claude_config_dir(), argv_lines=argv_l) == (1, 4, 1)
+          # ★R5 재핀(리뷰 codex D2 · 이 WP 의 R3 자기 핀): 대상이 **기본 config** 일 때, 겉보기 `CLAUDE_CONFIG_DIR=` 가
+          #   있는 claude 줄은 '검증된 음성' 이 될 수 없다 — 같은 직렬화가 `OTHER="x CLAUDE_CONFIG_DIR=/other"`(그 프로세스는
+          #   기본 config 사용)에서도 나오므로 지정의 존재 자체가 증거가 아니다. 7 번이 음성 → 미해결로 바뀐다(1,4,1 → 1,4,2).
+          and _count_claude_in_ps_lines(env_l, _default_claude_config_dir(), argv_lines=argv_l) == (1, 4, 2)
           and _count_claude_in_ps_lines(["11 claude HOME=/x"], "/w/cfg", argv_lines=argv_l) == (0, 1, 1)
           and _count_claude_in_ps_lines(["8 claude --new HOME=/x"], "/w/cfg", argv_lines=argv_l) == (0, 1, 1)
           and _count_claude_in_ps_lines(["8 claude -p CLAUDE_CONFIG_DIR=/w/cfg2 HOME=/x"], "/w/cfg", argv_lines=argv_l) == (0, 1, 1)
@@ -7467,8 +7916,12 @@ def _self_test():
     mcp_src = inspect.getsource(Preflight._enable_mcp_server)
     check("C43(R4 리뷰 minor): _enable_mcp_server 는 시더와 같은 잠금(.claude.json.seed-lock) 아래에서만 읽기~쓰기 — 못 잡으면 무쓰기 사유 반환",
           "SEED_TRUST_LOCK_NAME" in mcp_src and "_try_lock_nb(lf)" in mcp_src and "_open_nofollow(lock_path" in mcp_src
-          and mcp_src.index("_try_lock_nb(lf)") < mcp_src.index("json.load(open(config_path")
+          and mcp_src.index("_try_lock_nb(lf)") < mcp_src.index("_read_json_tolerant(config_path)")
           and mcp_src.index("_try_lock_nb(lf)") < mcp_src.index("os.replace(tmp, config_path)")
+          # ★R5(리뷰 minor · 이 WP 의 R4 자기 핀 재핀): 잠금 아래 판독도 막히지 않는 가드 경유(무가드 open 0) —
+          #   FIFO 에서 막히면 preflight --fix 가 **시드 잠금을 쥔 채** 영구 정지한다.
+          and "json.load(open(" not in mcp_src and "_read_json_tolerant(config_path)" in mcp_src
+          and "json.load(open(" not in inspect.getsource(Preflight._mcp_enabled)
           and "쓰기 보류" in mcp_src
           and "self._enable_mcp_server(path, SERENA_PROJECT" in inspect.getsource(Preflight.c43_serena)
           and "활성화 보류 — " in inspect.getsource(Preflight.c43_serena))
@@ -7477,6 +7930,33 @@ def _self_test():
           and _seed_trust_timeout_secs({_SEED_TRUST_TIMEOUT_ENV: "0"}) is None
           and _seed_trust_timeout_secs({_SEED_TRUST_TIMEOUT_ENV: "-3"}) is None
           and _seed_trust_timeout_secs({_SEED_TRUST_TIMEOUT_ENV: "zzz"}) == 20.0)
+    check("_same_dir(★R5 codex major D1): 표기가 아니라 파일시스템 동일성 3값 — 같은 문자열/실재 동일성 True · 부재류는 "
+          "증명된 다름 False · 조회 불가는 None(검증된 0 흡수 금지)",
+          _same_dir("/w/a", "/w/a") is True and _same_dir(os.getcwd(), os.path.join(os.getcwd(), ".")) is True
+          and _same_dir("/w/a", "/w/b") is False and _same_dir(None, "/w/a") is None
+          and _same_dir("/" + "z" * 5000, os.getcwd()) is False)
+    check("claude_project_key(★R5 codex major D1): darwin 저장 표기 오라클(F_GETPATH) — 구조가 같을 때만 채택 · "
+          "오라클 부재/구조 불일치/samestat 불일치는 종전 realpath",
+          "_fgetpath(physical)" in inspect.getsource(claude_project_key)
+          and "_same_path_shape(got, physical)" in inspect.getsource(claude_project_key)
+          and "samestat" in inspect.getsource(claude_project_key)
+          and _same_path_shape("/a/CYSjavis/x", "/a/cysjavis/x") and not _same_path_shape("/a/b", "/a/b/c")
+          and not _same_path_shape("/a/other", "/a/b"))
+    check("값 후보(★R5 codex major D2): `NAME=` 뒤 공백으로 끝나는 접두 전부 · 길이 상한까지 **소진**(절단 아님) · 개수 "
+          "상한에 걸리면 절단(미해결)",
+          _ps_env_value_candidates("CLAUDE_CONFIG_DIR=/a b HOME=/h") == ["/a", "/a b", "/a b HOME=/h"]
+          and not _ps_env_candidates_truncated("CLAUDE_CONFIG_DIR=/a b HOME=/h")
+          and _ps_env_candidates_truncated("CLAUDE_CONFIG_DIR=" + " ".join("t%d=x" % i for i in range(_PS_VALUE_CANDIDATE_MAX + 5)))
+          and _ps_env_value_candidates("XCLAUDE_CONFIG_DIR=/a") == [])
+    check("중단된 트랜잭션(★R5 codex major D4): 의도 저널은 교환 **직전**에 내구적으로 공개되고(못 쓰면 교환 0) 회수는 "
+          "잠금 아래 **청소·already-trusted 앞** · 자동 재시드 0",
+          seed_src.index("_recover_interrupted_seed(config_dir, cfg)") < seed_src.index("_sweep_stale_seed_tmp(config_dir)")
+          < seed_src.index('"already-trusted(key=%s)" % key')     # 본문 반환 지점(머리 주석 언급이 아니라)
+          and seed_src.index("_write_seed_intent(config_dir") < seed_src.index("_exchange_paths(displaced, cfg)")
+          and "의도 저널 기록 실패" in seed_src
+          and "seed_trust(" not in inspect.getsource(_recover_interrupted_seed)
+          and "os.link(tmp, path)" in inspect.getsource(_write_seed_intent)
+          and "_fsync_dir(config_dir)" in inspect.getsource(_write_seed_intent))
     dl_src = inspect.getsource(_start_seed_deadline)
     main_seed_src = inspect.getsource(_seed_trust_main)
     check("--seed-trust 마감 감시(R4): 데몬 타이머(SIGALRM 0 · Windows 안전) · 초과는 REFUSE 1줄 뒤 os._exit(2) · 정상 경로는 취소",
@@ -7485,9 +7965,10 @@ def _self_test():
           and "_start_seed_deadline(secs" in main_seed_src and "cancel()" in main_seed_src
           and main_seed_src.index("_start_seed_deadline(secs") < main_seed_src.index("seed_trust(args.config"))
     gapread_src = inspect.getsource(Preflight._trust_gap_workspaces)
-    check("C58(R4 codex major): 갭 탐지의 .claude.json 판독도 시더 가드(_read_claude_json_bytes) — _read_json_tolerant 경유 0(FIFO 정지 0)",
-          "_read_claude_json_bytes(config_path)" in gapread_src and "_read_json_tolerant(" not in gapread_src
-          and "_parse_claude_json" in gapread_src)
+    check("C58 갭 탐지 판독(★R5 재핀 · 이 WP 의 R4 자기 핀): 막히지 않는 관용 판독(_read_json_tolerant) — FIFO 정지 0 이면서 "
+          "심링크는 따라간다(시더 가드는 심링크를 거부해 영구 거짓 갭을 만들었다) · 쓰기 정책은 시더가 따로 판정",
+          "_read_json_tolerant(config_path)" in gapread_src and "_read_claude_json_bytes(" not in gapread_src
+          and "open(" not in gapread_src)
     check("_is_claude_command strict(env 비노출 줄): argv[0] 이름/설치 경로 · argv[0..1] claude-code .js 만 — tail/less/grep 인자 속 claude 제외(R2)",
           not _is_claude_command(["tail", "-f", "/x/logs/claude"], strict=True)
           and not _is_claude_command(["less", "/Users/o/.local/bin/claude"], strict=True)

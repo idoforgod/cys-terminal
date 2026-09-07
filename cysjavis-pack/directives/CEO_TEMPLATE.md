@@ -616,7 +616,10 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   을 내면 **stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계**한다 — 잔여 minor 를 이 절의 todo
   영속본(`MASTER_TODO.md` 백로그 항목)으로 옮기고 라운드를 잇지 않는다. §7 (5-8) 의 종결 경로에 **더해지는
   도구 판정**이며 종결 ≠ 합격이다(verdict·keep-or-discard 규칙 그대로) · 그 상태의 추가 `round-log` 는
-  도구가 거부하며 명시 재개는 `--override "<사유>"` 로 기록한다.
+  도구가 거부하며 명시 재개는 `--override "<사유>"` 로 기록한다. **도구 선행 확인**: 이 조항은 그 축을 내는
+  도구가 있을 때만 발동한다 — `javis_orchestra.py round-status --help` 에 `stop_reason`(그리고 `round-log`
+  에 `--override`)이 없는 버전이면 이 절은 **휴면**이고 종결은 (5-8) 의 ⓐ~ⓒ 로만 한다. 없는 기능을 있다고
+  가정해 종결을 선언하지 마라.
 
 ## 10. 자기개선 루프 (RSI — 기억·스킬로 실체화)
 - **기억 검색**: 과거 작업·결정·실패의 기억은 `cys recall "<검색어>" [--role --days]` —
