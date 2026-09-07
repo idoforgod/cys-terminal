@@ -200,8 +200,52 @@ WRITE_SHELL_CMDS = {
 }
 # 패키지/빌드 설치자(상태 변형) — 대표만. git은 서브커맨드로 별도 판정(읽기 전용 다수).
 WRITE_SHELL_INSTALLERS = {"npm", "pip", "pip3", "make", "apt", "brew"}
-# cargo/go는 build/test 등 빌드 변형이 흔하나 reviewer는 빌드도 금지(산출물 변형) — 변형으로.
+# cargo/go 는 하위 명령으로 가른다(0.14.31 완화 — 아래 계약을 정확히 읽어라).
 WRITE_SHELL_BUILDERS = {"cargo", "go"}
+# ★reviewer 검증 실행 완화(0.14.31 · 별 커밋) — **완화의 뜻을 정직하게 적는다**:
+#   이것은 "쓰기 없음 보장" 이 **아니다**. `cargo test` 는 `target/` 산출물·캐시를 쓰고,
+#   `build.rs`·proc-macro·테스트 본문은 사용자 권한으로 **임의 파일을 쓸 수 있다**(go 도 같다).
+#   `--locked` 는 Cargo.lock 변경을 제한하는 옵션이지 파일시스템 샌드박스가 아니다.
+#   여기서 집행하는 것은 **명령 수준의 변형 금지**뿐이다 — 즉 `publish`·`install`·`add`·`update`
+#   처럼 그 명령 자체가 상태를 바꾸는 하위 명령을 막고, 검증용 하위 명령은 통과시킨다.
+#   진짜 소스 불변성은 "검증 대상은 읽기 전용, 산출물·캐시·HOME 은 분리된 쓰기 공간" 인 실행
+#   경계가 있어야 집행된다(Git Bash·기본 셸은 그런 격리가 아니다). 그 경계가 생기기 전까지
+#   reviewer 의 빌드·테스트는 **신뢰 실행**이고, 사후 diff 는 탐지 수단이지 예방 장치가 아니다.
+#   완화하지 않으면 reviewer 분기가 처음 활성화되는 이번 릴리스에서 `cargo test` 같은 **정당한
+#   검증 명령이 전부 막힌다**(그 오탐의 귀결은 '리뷰 불가' = 산출자≠평가자 규율의 무력화다).
+CARGO_VERIFY_SUBS = {"test", "build", "check", "clippy", "bench", "tree", "metadata", "doc", "nextest"}
+GO_VERIFY_SUBS = {"test", "build", "vet", "list", "version", "env"}
+BUILDER_VERIFY_SUBS = {"cargo": CARGO_VERIFY_SUBS, "go": GO_VERIFY_SUBS}
+# 빌드 산출물을 **임의 경로로 내보내는** 옵션은 리다이렉트와 같은 부류다(대상이 허용 경로여야 한다).
+BUILDER_OUT_OPTS = ("-o", "--out-dir", "--output", "--target-dir")
+
+
+def builder_is_write(base, tokens, i):
+    """cargo/go 세그먼트가 **명령 수준 변형**인가. 해석 불가·목록 밖 하위 명령은 True(거부 방향)."""
+    subs = BUILDER_VERIFY_SUBS.get(base)
+    if subs is None:
+        return True
+    sub = None
+    n = len(tokens)
+    j = i + 1
+    while j < n:
+        t = tokens[j]
+        if is_separator(t) or _is_redirect_op(t):
+            break
+        # ★산출물 내보내기 옵션은 **세그먼트 전체**에서 찾는다 — `go build -o <path>` 처럼
+        #   하위 명령 **뒤에** 오는 것이 보통이라, 하위 명령을 만나면 멈추는 스캔은 놓친다.
+        if any(t == o or t.startswith(o + "=") for o in BUILDER_OUT_OPTS):
+            val = t.split("=", 1)[1] if "=" in t else (tokens[j + 1] if j + 1 < n else "")
+            if not path_is_allowed(val):
+                return True              # 산출물을 검증 대상 트리로 내보낸다
+            j += 2 if "=" not in t else 1
+            continue
+        if sub is None and not (t.startswith("-") or t.startswith("+")):
+            sub = t
+        j += 1
+    if sub is None or sub not in subs:
+        return True
+    return False
 # git 변형 서브커맨드(읽기 전용 status/log/diff/show/grep 등은 허용).
 GIT_WRITE_SUBS = {"commit", "push", "add", "reset", "rebase", "merge", "checkout",
                   "restore", "clean", "stash", "rm", "mv", "apply", "cherry-pick",
@@ -453,7 +497,13 @@ def bash_has_write(command):
                 i += 1
                 continue
             base = os.path.basename(tok)
-            if base in WRITE_SHELL_CMDS or base in WRITE_SHELL_INSTALLERS or base in WRITE_SHELL_BUILDERS:
+            if base in WRITE_SHELL_BUILDERS:
+                if builder_is_write(base, tokens, i):
+                    return True
+                cmd_pos = False
+                i += 1
+                continue
+            if base in WRITE_SHELL_CMDS or base in WRITE_SHELL_INSTALLERS:
                 return True
             if base == "git":
                 # ★값을 먹는 전역 옵션은 **값까지** 건너뛴다 — 그러지 않으면 `git -C /repo reset`
@@ -1197,6 +1247,16 @@ def self_test():
         # ★0.14.31 반례 추가(재핀 아님): 값을 먹는 git 전역 옵션 뒤의 write 서브커맨드.
         ("reviewer-codex", "Bash", {"command": "git -C /repo reset --hard"}),
         ("reviewer-codex", "Bash", {"command": "git -c user.name=x commit -m y"}),
+        # 완화가 **넓히지 않는 것**: 명령 자체가 상태를 바꾸는 하위 명령과 산출물 내보내기.
+        ("reviewer-codex", "Bash", {"command": "cargo publish"}),
+        ("reviewer-codex", "Bash", {"command": "cargo install cargo-nextest"}),
+        ("reviewer-codex", "Bash", {"command": "cargo add serde"}),
+        ("reviewer-codex", "Bash", {"command": "cargo update"}),
+        ("reviewer-codex", "Bash", {"command": "cargo fmt"}),
+        ("reviewer-codex", "Bash", {"command": "go get example.com/x"}),
+        ("reviewer-codex", "Bash", {"command": "go mod tidy"}),
+        ("reviewer-codex", "Bash", {"command": "cargo"}),          # 하위 명령 없음 = 해석 불가
+        ("reviewer-codex", "Bash", {"command": "go build -o /w/repo/bin/app ./cmd"}),
         # ★게이트 제어 상태는 reviewer 의 tmp 예외에서도 빠진다.
         ("reviewer-codex", "Write", {"file_path": "/tmp/cys-capgate-role-3-x-y"}),
     ]
@@ -1216,6 +1276,16 @@ def self_test():
         ("reviewer-codex", "Write", {"file_path": "/tmp/review-notes.md"}),
         ("reviewer-codex", "Edit", {"file_path": "/Users/x/.cys/scratch.txt"}),
         ("reviewer-codex", "Bash", {"command": "echo hi > /tmp/out.log"}),
+        # ★0.14.31 완화(별 커밋 · 반례 추가): reviewer 의 정당한 **검증 실행**.
+        #   완화의 뜻은 '명령 수준 변형 없음' 이지 '파일 쓰기 없음' 이 아니다(위 주석 참조).
+        ("reviewer-codex", "Bash", {"command": "cargo test --locked --offline"}),
+        ("reviewer-codex", "Bash", {"command": "cargo build"}),
+        ("reviewer-codex", "Bash", {"command": "cargo +nightly clippy -- -D warnings"}),
+        ("reviewer-codex", "Bash", {"command": "cargo test --lib readiness:: 2>&1 | tail -3"}),
+        ("reviewer-gemini", "Bash", {"command": "go test ./..."}),
+        ("reviewer-codex", "Bash", {"command": "go vet ./..."}),
+        ("reviewer-codex", "Bash", {"command": "python3 -m pytest -q"}),
+        ("reviewer-codex", "Bash", {"command": "cargo build --target-dir /tmp/rv"}),
     ]
     for role, tool, ti in cases_block:
         b, _ = decide(tool, ti, role)
