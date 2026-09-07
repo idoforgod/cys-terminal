@@ -43,6 +43,7 @@ import hashlib
 import inspect
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -3179,19 +3180,33 @@ class CodexR2Counterexamples(unittest.TestCase):
         sweep = pf._sweep_stale_seed_tmp
         held = []
         def sweeping(d):
-            self.assertEqual(held, [True], 'sweep ran before lock acquisition')
+            self.assertTrue(held, 'sweep ran before lock acquisition')
             return sweep(d)
+        def lock_ok(f):
+            held.append(True)
+            return True
+        displaced = self.cfg / stale[-1]
         with patch.object(pf, '_sweep_stale_seed_tmp', sweeping):
             self.result(self.seed(lock_fn=lambda f: False), 2, 'lock-busy')
             self.assertTrue(all((self.cfg / n).exists() for n in stale))
-            # ★R6 재핀(리뷰 codex '추가로 놓친 것' ②): 활성 문서가 **유효하지 않으면**(여기선 부재) displaced 지문
-            #   청소를 하지 않는다 — 그 잔재의 내용은 '원본 + 플래그' 라 활성이 없거나 잘렸으면 그것이 유일한
-            #   완전한 문서일 수 있다. 종전 기대 'swept 3' 은 그 손실을 통과시켰다 → mkstemp 잔재 2건만.
-            self.result(self.seed(lock_fn=lambda f: held.append(True) or True), 0, 'stale-tmp swept 2')
-        displaced = self.cfg / stale[-1]
+            # ★R7 재핀(리뷰 codex major · plan §8 '의도적 기본값 변경만 재핀'): 활성 문서가 유효하지 않은데 저널 없는
+            #   보존 사본이 있으면 **대체 문서를 만들지 않는다**. R6 는 사본을 남기고 계속 가서 '플래그만 든 새 문서'
+            #   를 만들었고(rc 0), 그러면 다음 실행이 그 새 문서를 '건강' 으로 읽어 사본을 청소했다 — 두 번의
+            #   성공적인 재시도가 사용자 필드를 영구히 지웠다. 이제 사본은 **자동 삭제되지 않는 이름**으로 옮겨지고
+            #   이 실행은 REFUSE 다(다음 실행에는 사본이 없으므로 1회로 끝난다).
+            self.result(self.seed(lock_fn=lock_ok), 2, 'unresolved-recovery')
+            self.assertFalse(self.file.exists(), '거부인데 대체 문서를 만들었다')
+            self.assertTrue(all((self.cfg / n).exists() for n in stale[:2]), '거부 경로가 잔재를 청소했다(무접촉 위반)')
+            self.assertFalse(displaced.exists(), '보존 사본이 청소 네임스페이스에 그대로 남았다(보호가 1회용이다)')
+            saved = [n for n in self.leftovers('conflict') if n.name not in kept]
+            self.assertEqual(len(saved), 1, [p.name for p in self.leftovers('conflict')])
+            self.assertEqual(saved[0].read_bytes(), b'precious', '보존이 바이트를 바꿨다')
+            # 재시도 2회차: 사본이 보호 네임스페이스로 빠졌으므로 이제 정상 시드다(잔재 청소는 mkstemp 2건만)
+            self.result(self.seed(lock_fn=lock_ok), 0, 'stale-tmp swept 2')
         self.assertTrue(all(not (self.cfg / n).exists() for n in stale[:2]), 'mkstemp 잔재가 남았다')
-        self.assertTrue(displaced.exists(), '활성 문서가 없는데 displaced 를 지웠다(유일한 완전한 사본일 수 있다)')
-        # 양성 대조: 이 시드가 만든 활성 문서는 유효하다 → 같은 잔재가 정상적으로 회수된다(청소 계약 보존)
+        self.assertEqual(saved[0].read_bytes(), b'precious', '보존 사본이 다음 실행에서 청소됐다')
+        # 양성 대조: 활성 문서가 유효하면 같은 지문의 잔재는 정상적으로 회수된다(청소 계약 보존)
+        displaced.write_bytes(b'precious')
         self.assertEqual(pf._sweep_stale_seed_tmp(str(self.cfg)), 1)
         self.assertFalse(displaced.exists(), '활성 문서가 유효한데도 displaced 를 남겼다(청소가 죽었다)')
         # 음성 대조: 활성 문서를 0바이트로 잘라 두면 다시 무접촉이다(`_parse_claude_json` 의 '빈 파일 → {}' 관용이
@@ -4955,6 +4970,245 @@ class R6RecoveryHealth(Base):
         self.assertTrue(os.path.exists(dpath))
 
 
+class R7OrphanRecovery(Base):
+    """★R7 — 리뷰 codex major('재시도가 보호된 회수 사본을 지워도 되는 잔재로 바꾼다') + 그 설계 비평이 든 두 구멍.
+    계약: ①의도 저널은 payload rename **보다 먼저** 공개된다 ②저널 없는 지문 일치 사본 + 불건강 활성 = **대체 문서를
+    만들지 않는다**(사본을 자동 삭제되지 않는 이름으로 옮기고 1회 REFUSE) ③교환이 성립하지 않은 자리의 사본 삭제는
+    활성 문서가 유효할 때만 ④회수 ⓑ 는 '건강' 이 아니라 **바이트 증명**으로만 사본을 지운다.
+    전부 보존 방향이고, 거부는 한 번으로 끝난다(다음 실행에는 사본이 보호 네임스페이스에 있다)."""
+
+    ORIGINAL = '{"user": "ONLY-COPY", "projects": {}}'
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.cfg)
+
+    def names(self, prefix):
+        return sorted(n for n in os.listdir(self.cfg) if n.startswith(prefix))
+
+    def payload_bytes(self, original=None):
+        """시더가 만들었을 payload(원본 + 플래그) 바이트 — 직렬화 형식까지 시더와 같게."""
+        new, _changed, _k = pf.trust_plan(json.loads(original or self.ORIGINAL), self.key)
+        return json.dumps(new, ensure_ascii=False, indent=2).encode("utf-8")
+
+    def assert_only_copy_survives(self):
+        """★codex 위임 반례 채택: 어느 파일에서든 `user` 가 살아 있는가 — 사본 이름·경로가 아니라 **데이터**로 본다."""
+        survivors = []
+        for root, _dirs, files in os.walk(self.tmp):
+            for name in files:
+                try:
+                    doc = json.loads(_read_bytes(os.path.join(root, name)))
+                except (ValueError, UnicodeDecodeError, OSError):
+                    continue
+                if isinstance(doc, dict) and doc.get("user") == "ONLY-COPY":
+                    survivors.append(os.path.join(root, name))
+        self.assertTrue(survivors, "유일한 사용자 필드가 모든 파일에서 사라졌다")
+
+    def plant_orphan(self, payload):
+        """저널 **없는** 지문 일치 보존 사본 — 종전 순서(rename → 저널)가 중단됐을 때 남던 바로 그 잔재."""
+        name = pf.SEED_TRUST_DISPLACED_PREFIX + pf._payload_digest(payload) + "-20260907T000000Z-1"
+        _write_bytes(os.path.join(self.cfg, name), payload)
+        return name
+
+    def test_r7_two_retries_after_interruption_before_journal_keep_the_only_copy(self):
+        """리뷰 codex major 회귀: 저널 공개 전 중단 + 활성 소실 뒤 **연속 두 번**의 재시도가 사용자 필드를 지웠다 —
+        1회차가 '플래그만 든 새 문서' 를 만들어 OK 를 냈고 2회차가 그 새 문서를 '건강' 으로 읽어 사본을 청소했다."""
+        payload = self.payload_bytes()
+        self.plant_orphan(payload)
+        rc, verdict, reason = self.seed()                       # 재시도 1
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("unresolved-recovery", reason)
+        self.assertFalse(os.path.exists(self.cfgfile), "거부인데 대체 문서를 만들었다")
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertIn(kept[0], reason, "거부 사유가 보존한 파일 이름을 대지 않는다")
+        self.assertEqual(self.names(pf.SEED_TRUST_DISPLACED_PREFIX), [], "사본이 청소 네임스페이스에 남았다")
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, kept[0])), payload)
+        self.assert_only_copy_survives()
+        rc, verdict, reason = self.seed()                       # 재시도 2 — 이제 정상 시드다(거부는 1회)
+        self.assertEqual(rc, 0, reason)
+        self.assertIs(_read_json(self.cfgfile)["projects"][self.key]["hasTrustDialogAccepted"], True)
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), kept, "재시도가 보존 사본을 지웠다")
+        self.assertEqual(json.loads(_read_bytes(os.path.join(self.cfg, kept[0])))["user"], "ONLY-COPY",
+                         "사용자 필드가 모든 파일에서 사라졌다(리뷰가 지적한 그 손실)")
+        self.assert_only_copy_survives()
+
+    def test_r7_journal_is_published_before_the_payload_rename(self):
+        """순서를 **행위로** 못 박는다: 저널을 못 쓰면 payload 는 아직 mkstemp 이름에 있고 보존 이름으로 옮겨진 적이
+        없다(종전 순서에서는 rename 이 먼저라 '저널 없는 사본' 이 잠시 존재했다)."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        renames, observed = [], []
+        real_rename = os.rename
+
+        def watched(a, b, *r, **k):
+            renames.append((a, b))
+            return real_rename(a, b, *r, **k)
+
+        def fail_intent(*a, **k):
+            observed.append(self.names(pf.SEED_TRUST_DISPLACED_PREFIX))   # ★codex: **그 순간**의 상태
+            raise OSError(errno.ENOSPC, "no space")
+
+        with patch.object(pf.os, "rename", watched), \
+                patch.object(pf, "_write_seed_intent", side_effect=fail_intent), \
+                patch.object(pf, "_exchange_paths", side_effect=AssertionError("저널 없이 교환했다")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual(observed, [[]], "저널 공개 시도 시점에 payload 가 이미 보존 이름에 있었다(창이 열렸다)")
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("의도 저널", reason)
+        self.assertEqual([b for _a, b in renames
+                          if os.path.basename(b).startswith(pf.SEED_TRUST_DISPLACED_PREFIX)], [],
+                         "저널 실패 전에 payload 를 보존 이름으로 옮겼다(창이 열렸다)")
+        self.assertEqual(_read_bytes(self.cfgfile), before)
+        self.assertEqual(self.names(pf.SEED_TRUST_DISPLACED_PREFIX), [])
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [])
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [])
+
+    def test_r7_exchange_failure_after_the_active_vanishes_preserves_our_copy(self):
+        """리뷰 codex 설계 비평 ②: '교환 안 됨 = 사본을 지워도 안전' 은 거짓이다 — 교환이 ENOENT 로 실패하는 바로 그
+        형상(외부가 활성을 지웠다)에서 그 사본이 유일한 완전한 문서다."""
+        self.untrusted_file(self.ORIGINAL)
+
+        def vanish_then_fail(a, b):
+            os.unlink(b)                                        # 외부 기록자가 활성 문서를 지웠다
+            raise OSError(errno.ENOENT, "injected ENOENT")
+
+        with patch.object(pf, "_exchange_paths", vanish_then_fail):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("사본 보존", reason)
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertEqual(json.loads(_read_bytes(os.path.join(self.cfg, kept[0])))["user"], "ONLY-COPY")
+        self.assertEqual(self.names(pf.SEED_TRUST_DISPLACED_PREFIX), [])
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [], "처분이 끝났는데 저널이 남았다")
+
+    def test_r7_exchange_failure_with_a_healthy_active_leaves_no_litter(self):
+        """음성 대조(주경로 보존): 활성 문서가 그대로면 우리 사본은 낡은 스냅샷이므로 지운다 — conflict 잔재 0.
+        (여기서 바이트 동등까지 요구하면 Windows 의 기존 문서 경로마다 conflict 가 쌓인다)"""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        with patch.object(pf, "_exchange_paths", side_effect=OSError(errno.EIO, "injected")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertNotIn("사본 보존", reason)
+        self.assertEqual(_read_bytes(self.cfgfile), before)
+        for prefix in (pf.SEED_TRUST_CONFLICT_PREFIX, pf.SEED_TRUST_DISPLACED_PREFIX, pf.SEED_TRUST_INTENT_PREFIX):
+            self.assertEqual(self.names(prefix), [], prefix)
+
+    def test_r7_recovery_preserves_when_the_active_was_recreated_empty(self):
+        """리뷰 codex 설계 비평 ①: 중단 뒤 외부가 활성을 `{}` 로 재생성하면 '건강' 판정이 통과한다 — 종전엔 저널을
+        지우고 지문 청소가 유일한 사용자 사본을 삭제했다. 이제 바이트 증명이 없으면 보존 이름으로 옮긴다."""
+        self.untrusted_file(self.ORIGINAL)
+        with patch.object(pf, "_exchange_paths", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        self.assertEqual(len(self.names(pf.SEED_TRUST_INTENT_PREFIX)), 1, os.listdir(self.cfg))
+        self.assertEqual(len(self.names(pf.SEED_TRUST_DISPLACED_PREFIX)), 1, os.listdir(self.cfg))
+        _write(self.cfgfile, "{}")                              # 외부가 새 빈 문서를 만들었다
+        before = _read_bytes(self.cfgfile)
+        r = self.seed()
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertEqual(json.loads(_read_bytes(os.path.join(self.cfg, kept[0])))["user"], "ONLY-COPY",
+                         "유일한 사용자 사본을 지웠다")
+        self.assertEqual(self.names(pf.SEED_TRUST_DISPLACED_PREFIX), [])
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [], "처분이 끝났는데 저널이 남았다")
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return                                              # Windows 계약(사본 보존은 위에서 이미 단언했다)
+        self.assertEqual(r[0], 0, r)
+        self.assertIn("recovery-preserved", r[2], "보존 사실을 사유에 남기지 않았다")
+
+    def test_r7_guard_ignores_copies_that_no_sweep_can_delete(self):
+        """가드는 **지문 청소가 지울 수 있는 것**만 막는다 — 지문 불일치 displaced(낯선 문서)는 이미 안전하므로 막지
+        않는다(막으면 사람이 손대기 전까지 매번 거부한다 = 1회 계약 위반)."""
+        foreign = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + ("0" * 64) + "-20260907T000000Z-1")
+        _write_bytes(foreign, b'{"foreign": "document"}')
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertEqual(_read_bytes(foreign), b'{"foreign": "document"}', "낯선 문서를 건드렸다")
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [], "안전한 파일을 옮겼다")
+
+    def test_r7_unknown_existence_never_becomes_a_rename_target(self):
+        """리뷰 claude minor: `os.path.lexists` 는 EACCES/EIO/ESTALE 를 '없다' 로 접는다 — 그 접힘은 곧 `os.rename`
+        의 말없는 덮어쓰기(사람이 병합해야 할 낯선 문서 파괴)다. 조회가 실패한 이름은 쓰지 않고, 상한까지 확정하지
+        못하면 **아무것도 옮기지 않는다**(무변경 ERROR)."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        real_lstat = os.lstat
+
+        def blind(path, *a, **k):
+            if isinstance(path, (str, bytes)) and os.path.basename(path).startswith(pf.SEED_TRUST_DISPLACED_PREFIX):
+                raise OSError(errno.EACCES, "injected")         # '없다' 가 아니라 '모른다'
+            return real_lstat(path, *a, **k)
+
+        with patch.object(pf.os, "lstat", blind), \
+                patch.object(pf.os, "rename", side_effect=AssertionError("조회 불가 이름으로 옮겼다")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("보존 이름 확정 실패", reason)
+        self.assertEqual(_read_bytes(self.cfgfile), before)
+        for prefix in (pf.SEED_TRUST_DISPLACED_PREFIX, pf.SEED_TRUST_INTENT_PREFIX, pf.SEED_TRUST_CONFLICT_PREFIX):
+            self.assertEqual(self.names(prefix), [], prefix)
+
+    def test_r7_guard_scan_failure_is_refuse_not_silence(self):
+        """가드의 열거 실패는 '사본 없음' 이 아니다(결측은 값이 아니다) — 저널 열거와 같은 규율."""
+        payload = self.payload_bytes()
+        self.plant_orphan(payload)
+        real_listdir = os.listdir
+        seen = []
+
+        def blind(path, *a, **k):
+            if isinstance(path, str) and os.path.abspath(path) == os.path.abspath(self.cfg):
+                seen.append(path)
+                if len(seen) == 2:                              # 1회차 = 저널 열거(정상) · 2회차 = 가드 열거
+                    raise OSError(errno.EACCES, "injected")
+            return real_listdir(path, *a, **k)
+
+        with patch.object(pf.os, "listdir", blind), \
+                patch.object(pf, "_sweep_stale_seed_tmp", side_effect=AssertionError("열거 실패인데 청소했다")):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("orphan-scan-failed", reason)
+        self.assertIn("EACCES", reason)
+        self.assertFalse(os.path.exists(self.cfgfile), "거부인데 대체 문서를 만들었다")
+
+
+class R7ExclusiveName(unittest.TestCase):
+    """★R7 — 보존 이름 생성기의 3값 규율(★codex 위임 반례에서 채택 · 워커가 전 행 검토). 순수 함수라 격리 env 불요."""
+
+    def test_r7_unknown_existence_exhausts_the_cap_and_raises(self):
+        probe = Mock(return_value=None)                          # 조회 실패만 — '없다' 가 아니다
+        with self.assertRaises(OSError):
+            pf._exclusive_name("/nowhere/copy-", lexists=probe)
+        self.assertEqual(probe.call_count, pf._EXCLUSIVE_NAME_MAX_TRIES)
+        self.assertEqual(len({c.args[0] for c in probe.call_args_list}), pf._EXCLUSIVE_NAME_MAX_TRIES,
+                         "같은 후보를 다시 물었다(무한 루프의 다른 형)")
+
+    def test_r7_existing_name_moves_to_the_next_candidate(self):
+        probe = Mock(side_effect=[True, False])
+        with patch.object(pf.time, "strftime", return_value="20260907T000000Z"), \
+                patch.object(pf.os, "getpid", return_value=123):
+            got = pf._exclusive_name("/nowhere/copy-", lexists=probe)
+        base = "/nowhere/copy-20260907T000000Z-123"
+        self.assertEqual(got, base + "-1")
+        self.assertEqual([c.args[0] for c in probe.call_args_list], [base, base + "-1"])
+
+    def test_r7_proven_absence_uses_the_first_name(self):
+        probe = Mock(return_value=False)
+        with patch.object(pf.time, "strftime", return_value="20260907T000000Z"), \
+                patch.object(pf.os, "getpid", return_value=123):
+            got = pf._exclusive_name("/nowhere/copy-", lexists=probe)
+        self.assertEqual(got, "/nowhere/copy-20260907T000000Z-123")
+        probe.assert_called_once_with(got)
+
+    def test_r7_default_probe_is_the_strict_one(self):
+        with patch.object(pf, "_lexists_strict", return_value=None) as strict:
+            with self.assertRaises(OSError):
+                pf._exclusive_name("/nowhere/copy-")
+        self.assertEqual(strict.call_count, pf._EXCLUSIVE_NAME_MAX_TRIES)
+
+
 class R5Watchdog(Base):
     """D5: 마감 감시의 완료 판정·유한값·종료 보장."""
 
@@ -5086,6 +5340,29 @@ class R6WindowsAxisSweep(unittest.TestCase):
     재귀 방지: 자식에는 `CYS_TRUST_WIN_AXIS=1` 을 넣고, 그 env 가 있으면 이 검체 자신은 skip 한다."""
 
     AXIS_ENV = "CYS_TRUST_WIN_AXIS"
+    BUDGET_ENV = "CYS_TRUST_WIN_AXIS_TIMEOUT"
+    BUDGET_DEFAULT = 900.0        # ★R7(리뷰 claude minor): 종전 420s. 로컬 실측(2026-09-07 15:5x)은 부모 전체 21s ·
+                                  #   축 자식 4~6s 라 여유율은 이미 크지만, CI 3레인(특히 windows-health 러너)이 겹치면
+                                  #   **코드 회귀가 아닌 시간**으로 적색이 될 수 있다 → 상한을 올리고 env 로 연다.
+                                  #   상한은 감시이지 성능 핀이 아니다(초과의 대가는 '자식이 영원히 붙잡히지 않는다' 하나).
+
+    @classmethod
+    def budget(cls, env=None):
+        """축 상한(초) — 미설정/비수치/비유한/0 이하는 기본값(감시를 잃지 않는 방향 · _seed_trust_timeout_secs 와 같은 규율)."""
+        raw = (os.environ if env is None else env).get(cls.BUDGET_ENV, "")
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return cls.BUDGET_DEFAULT
+        return v if (math.isfinite(v) and v > 0) else cls.BUDGET_DEFAULT
+
+    def test_r7_axis_budget_is_overridable_and_never_lost(self):
+        """상한 파싱 표 — 잘못된 값이 감시를 지우지 않는다."""
+        for raw, want in (("", 900.0), ("abc", 900.0), ("0", 900.0), ("-5", 900.0), ("nan", 900.0),
+                          ("inf", 900.0), ("120", 120.0), ("1800.5", 1800.5)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.budget({self.BUDGET_ENV: raw}), want)
+        self.assertEqual(self.budget({}), 900.0)
 
     def test_r6_no_test_requires_the_exchange_unconditionally(self):
         if os.environ.get(self.AXIS_ENV):
@@ -5124,21 +5401,26 @@ class R6WindowsAxisSweep(unittest.TestCase):
             "print('IDS:' + '|'.join(sorted(c.id() for c, _ in list(res.failures) + list(res.errors))))\n")
         env = dict(os.environ)
         env[self.AXIS_ENV] = "1"
+        budget = self.budget()
+        t0 = time.monotonic()
         try:
             r = subprocess.run([sys.executable, "-B", "-c", code, BIN],      # -B: 저장소 트리에 __pycache__ 0(SEAL-1)
-                               capture_output=True, text=True, env=env, timeout=420)
+                               capture_output=True, text=True, env=env, timeout=budget)
         except subprocess.TimeoutExpired:
-            self.fail("교환 강제 비활성 축이 시간 안에 끝나지 않았다")
+            self.fail("교환 강제 비활성 축이 %.0fs 안에 끝나지 않았다(로컬 실측은 한 자릿수 초다 — 부하로 느려진 것이라면 "
+                      "%s 로 상한을 올린다 · 이 실패는 능력 분기 회귀가 아닐 수 있다)" % (budget, self.BUDGET_ENV))
+        elapsed = time.monotonic() - t0
         ids = [line for line in r.stdout.splitlines() if line.startswith("IDS:")]
         picked = [line for line in r.stdout.splitlines() if line.startswith("PICKED:")]
         self.assertEqual(len(ids), 1, r.stdout[-4000:] + r.stderr[-4000:])
         chosen = [x for x in picked[0][7:].split("|") if x] if picked else []
         # 능력 분기를 넣은 다섯 클래스가 축에 **실제로** 들어 있어야 한다(선택기가 조용히 비어 축이 항진명제가 되는 것 차단)
         for required in ("CodexCounterexamples", "CodexR1Counterexamples", "RegistryC58",
-                         "DeptContextC58", "R6RecoveryHealth"):
+                         "DeptContextC58", "R6RecoveryHealth", "R7OrphanRecovery"):
             self.assertIn(required, chosen, "축이 %s 를 고르지 않았다(선택기 회귀)" % required)
         failed = [x for x in ids[0][4:].split("|") if x]
-        self.assertEqual(failed, [], "교환 기구 없는 플랫폼에서 실패하는 검체(능력 분기 누락): %s" % failed)
+        self.assertEqual(failed, [], "교환 기구 없는 플랫폼에서 실패하는 검체(능력 분기 누락 · 축 %.1fs): %s"
+                         % (elapsed, failed))
 
 
 class R5TestChildSeal(unittest.TestCase):
