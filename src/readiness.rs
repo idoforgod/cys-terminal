@@ -1303,12 +1303,38 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
     {
         return None;
     }
-    let has_token = trailer.iter().copied().any(has_status_token);
+    // ★(0.14.31 · 리뷰 R2 · codex blocking) **첫 비공백 줄**이 경계여야 강한 증거다. 종전에는
+    //   꼬리 **어느 줄이든** 상태줄 어휘가 있으면 강한 증거였다 — 그러면 멀티라인 초안
+    //   (`❯ `⏎`  둘째 행 초안`⏎괘선⏎`⏵⏵ bypass permissions on`)이 "빈 대기 composer" 로 읽힌다
+    //   (커서를 Home 으로 옮긴 상태의 실측 형상 · codex 반례). 마커 줄 바로 아래가 입력 상자
+    //   테두리이거나 상태줄이라는 것은 **편집 영역이 비었다**는 구조적 사실이고, 그 밖의 문면은
+    //   초안 이어짐일 수 있으므로 증거로 접지 않는다(조여지는 방향 · 실측 2.1.263 은 괘선이라 불변).
     Some(ComposerScan {
         trailer_empty: false,
-        strong: is_rule_line(trailer[0]) || has_token,
+        strong: is_rule_line(trailer[0]) || has_status_token(trailer[0]),
         weak: placeholder_ok,
     })
+}
+
+/// ★(0.14.31 · 리뷰 R2 · codex blocking) **composer 편집 영역이 비어 있는가** — 커서 한 행이
+/// 아니라 화면 구조로 묻는다.
+///
+/// 【무엇이 틀렸었나】 stale `pending_input_bytes` 리셋은 `PromptObs.line`(커서가 있는 **그 한 행**)
+/// 만 보고 "빈 입력줄" 을 판정했다. 그래서 멀티라인 초안의 첫 행(`❯ `)에 커서를 올려 두면
+/// (Home·Ctrl-A) 둘째 행의 **실초안**을 못 보고 계수를 0 으로 지웠고, 다음 틱이 큐 본문을 그
+/// 초안과 한 줄로 합쳐 제출했다(fail-closed 였던 것이 fail-open 으로 뒤집힘 · §3-3 위반).
+///
+/// 【규칙】 [`scan_composer`] 를 그대로 쓴다(판정 분리 금지). 참인 경우는 셋뿐이다.
+///   ⓐ 마커 줄 아래에 비공백 줄이 없다(`trailer_empty` — vt100 후행 개행 절단 포함)
+///   ⓑ 마커 줄 **바로 아래**가 입력 상자 괘선·상태줄이다(`strong` — 편집 영역이 한 줄이라는 구조)
+///   ⓒ 마커 줄의 나머지가 어댑터 플레이스홀더와 완전히 같다(`weak` 의 플레이스홀더 갈래 —
+///      플레이스홀더는 **비어 있는** composer 에만 그려진다)
+/// 마커 줄에 문면이 있거나(초안·선택 커서 행) 마커 아래 첫 비공백 줄이 정체 모를 문면이면 거짓이다.
+/// 거짓의 귀결은 **리셋 안 함**(= 종전 0.14.30 의 보류)이고, 참을 잘못 주는 것의 귀결은 **초안 소거**
+/// 라 비대칭이 분명하다 — 그래서 미관측·모호는 전부 거짓으로 접는다.
+pub fn composer_edit_region_empty(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+    matches!(scan_composer(screen, marker, placeholder),
+             Some(sc) if sc.trailer_empty || sc.strong || sc.weak)
 }
 
 /// 판정용 합성 — 롤백(`legacy_v1`)이면 축 자체가 없고, 생애 창이 닫혔으면 거부하지 않는다.
@@ -2774,6 +2800,44 @@ mod tests {
         // 꼬리에 선택기 형상이 있으면 어떤 증거로도 열리지 않는다(모달 형상 배제는 그대로).
         let with_selector = format!("{codex_idle}› 1. Yes, continue\n");
         assert!(!composer_layout_static_ok(&with_selector, "›", ph, Some(true)));
+    }
+
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) **강한 증거는 마커 바로 아래 한 줄이다.**
+    ///
+    /// 종전 `strong` 은 꼬리 **어느 줄이든** 상태줄 어휘가 있으면 참이었다 — 그래서 멀티라인 초안
+    /// (`❯ ` / `  둘째 행 초안` / 괘선 / 상태줄)이 "빈 대기 composer" 로 읽혔고, 그 위에서 stale
+    /// 리셋이 계수를 0 으로 만들면 다음 배달이 사람 초안과 한 줄로 합쳐진다.
+    /// 실측 문면(claude 2.1.263 은 마커 아래가 괘선)은 그대로 통과해야 한다 — 가용성 대조군.
+    #[test]
+    fn r2_strong_evidence_is_the_first_nonblank_row_below_the_marker() {
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        // ⓐ 실측 유휴(마커 아래 괘선 → 상태줄) — 강한 증거 · 편집 영역 비어 있음.
+        let idle = format!("  이전 출력\n{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on\n");
+        assert!(composer_layout_positive(&idle, "❯", None), "실측 유휴 그리드가 막혔다(기아)");
+        assert!(composer_edit_region_empty(&idle, "❯", None));
+        // ⓑ 멀티라인 초안 — 첫 비공백 줄이 초안이므로 증거가 아니고 편집 영역도 비지 않았다.
+        let drafted =
+            format!("  이전 출력\n{rule}\n❯ \n  둘째 행에 남은 실초안\n{rule}\n  ⏵⏵ bypass permissions on\n");
+        assert!(
+            !composer_layout_positive(&drafted, "❯", None),
+            "초안 아래 상태줄만으로 '빈 composer' 가 됐다"
+        );
+        assert!(
+            !composer_edit_region_empty(&drafted, "❯", None),
+            "멀티라인 초안이 '빈 편집 영역' 으로 읽힌다 — stale 리셋이 그것을 지운다"
+        );
+        // ⓒ 마커 줄에 문면이 있으면(커서 뒤 초안·선택 커서 행) 어느 축도 열리지 않는다.
+        let typed = format!("{rule}\n❯ 진행해줘\n{rule}\n");
+        assert!(!composer_edit_region_empty(&typed, "❯", None));
+        // ⓓ 꼬리가 아예 없으면(vt100 후행 절단) 편집 영역은 비어 있다 — 종전 축 그대로.
+        assert!(composer_edit_region_empty("  출력\n❯ ", "❯", None));
+        // ⓔ 플레이스홀더는 '비어 있는 composer' 의 증거다(codex 실측 문면).
+        let codex_idle = "  출력\n› Ask Codex to do anything\n\n  gpt-6-astra medium · ~\n";
+        assert!(composer_edit_region_empty(codex_idle, "›", Some("Ask Codex to do anything")));
+        assert!(
+            !composer_edit_region_empty(codex_idle, "›", None),
+            "플레이스홀더 선언 없이 열리면 이 축은 어떤 문면이든 통과시킨다"
+        );
     }
 
     #[test]

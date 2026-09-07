@@ -3694,10 +3694,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 );
                 // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
                 daemon.persist_queue_state();
+                // ★(0.14.31 · 리뷰 R2 · codex major) `durable` 은 send_text queued 응답에만 있었다 —
+                //   같은 계약의 send-key queued 도 사실을 실어야 클라이언트가 내구 실패를 안다.
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id}),
+                           "queue_entry_id": entry.id, "durable": daemon.queue_wal_durable()}),
                 ));
             }
             // 권위 주입(send_text와 동일 근거)은 타이핑 가드를 면제 — launch-agent/reinject가
@@ -7209,9 +7211,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유.
             // (★G4 W4-C: exited_reclaim 예외 경유 시에만 cleared_by/via additive — 감사 원장에
             //  '누가 죽은 좌석의 큐를 비웠는지'가 남아 포렌식 가치 소실을 명시 행위로 기록한다.)
+            // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중 항목은 남긴다 — 그것을 여기서 비우면
+            //   "폐기 통지 후 실제 주입" 이 된다(운영자가 비웠다고 믿는 문장이 pane 에 들어간다).
             let dropped: Vec<crate::state::QueueEntry> =
-                surface.pending_queue.lock().unwrap().drain(..).collect();
+                crate::governance::drain_active_except_inflight(&surface);
             if !dropped.is_empty() {
+                // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치) — 운영자가
+                //   명시로 비운 것이라 항목을 보존하지는 않지만, 원장에 흔적 없이 사라지지도 않는다.
+                crate::governance::record_active_drain(daemon, sid, &dropped, "cleared");
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
@@ -8150,7 +8157,7 @@ mod tests {
     /// 커널 peer pid 기반 ACL을 우회하는 신호로 쓰여선 안 된다 — 이 분기점을 박제한다.
     #[test]
     fn send_text_human_flag_does_not_bypass_acl() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -8245,7 +8252,7 @@ mod tests {
     /// `caller_is_owner` doc · 참칭의 가시화는 `acl.owner_granted` 감사 이벤트).
     #[test]
     fn owner_grade_needs_matching_token_and_no_pane_binding() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("owner-grade", r#"{"default":"allow","rules":[]}"#);
         let tok = daemon
             .operator_token
@@ -8301,7 +8308,7 @@ mod tests {
     /// 부서 자율성 보호가 함께 죽으므로, 수리는 오너를 external 과 **구별**하는 것이다.
     #[test]
     fn owner_token_passes_dept_acl_while_external_still_denied() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // cysjavis-pack/bin/cys-dept seed_acl() 시드와 동형 — `owner` 가 **맨 앞**(첫 매칭 승리).
         let dept_acl = r#"{
             "default": "allow",
@@ -8405,7 +8412,7 @@ mod tests {
     /// `non_owner_acl_verdict_and_payload_are_byte_identical` 이 이어받는다.
     #[test]
     fn owner_is_allowed_when_acl_has_no_explicit_owner_rule() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 마이그레이션 **전** 부서 팩 그대로 — owner 규칙이 아직 없다.
         let no_owner_acl = r#"{
             "default": "allow",
@@ -8472,7 +8479,7 @@ mod tests {
     /// 종전대로 글롭 매칭된다는 것.
     #[test]
     fn non_owner_acl_verdict_and_payload_are_byte_identical() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -8607,7 +8614,7 @@ mod tests {
     /// 셋이 한 계약의 앞뒷면이다: **오너를 막는 유일한 길은 `from:"owner"` 명시 deny 뿐이다.**
     #[test]
     fn only_explicit_owner_rule_can_deny_owner() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let run = |tag: &'static str, acl: &str, gui_pid: u32| -> Value {
             let (daemon, dir) = daemon_with_acl(tag, acl);
@@ -8783,7 +8790,7 @@ mod tests {
     /// external send 와 구별되지 않는다).
     #[test]
     fn owner_promotion_that_flips_verdict_is_audited() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // owner 규칙이 **없는** ACL — 기본 허용으로 승격되며, 승격이 없었다면 external→worker deny.
         let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
         let (daemon, dir) = daemon_with_acl("owner-audit", acl);
@@ -8954,7 +8961,7 @@ mod tests {
     /// 없는 승격**(= 감사가치가 가장 높은 부류)이 60초에 한 건만 남게 했다.
     #[test]
     fn unresolved_caller_pid_owner_grants_are_never_suppressed() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
         let (daemon, dir) = daemon_with_acl("owner-audit-nopid", acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
@@ -9079,7 +9086,7 @@ mod tests {
     /// 억제 예외다). 그 상황이 정확히 '원장이 필요한 상황'이므로 상한이 있어야 한다.
     #[test]
     fn owner_grant_audit_ledger_rotates_one_generation_over_cap() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("owner-audit-rotate", r#"{"default":"allow"}"#);
         let p = owner_grant_audit_path(&daemon);
         let rotated = p.with_extension("jsonl.1");
@@ -9134,7 +9141,7 @@ mod tests {
     #[test]
     fn suppression_hot_path_does_not_scan_the_whole_map() {
         use std::sync::atomic::Ordering;
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 다른 테스트와 겹치지 않는 조합 + 합성 시계(실시간 아님).
         let (pid, target) = (991_303_u32, 991_303_u64);
         let t0 = 1_000_000.0_f64;
@@ -9189,7 +9196,7 @@ mod tests {
     /// `operator_token`(원장·승인 면제 근거)은 사람 실키에만 붙는다.
     #[test]
     fn owner_token_closes_machine_origin_gap_without_widening_ledger_exemption() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 부서 팩 시드 동형(owner 규칙 존재) — 갭이 ACL 때문이 아니라 **등급 미부여** 때문임을 분리.
         let dept_acl = r#"{
             "default": "allow",
@@ -9780,7 +9787,7 @@ mod tests {
     /// 가 그 pane 에게 그대로 열려 '워커 직접 조향 차단'이 무력화된다(claim_role·create 대칭).
     #[test]
     fn role_owner_is_reserved_on_claim_and_create() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("owner-reserved", r#"{"default":"allow","rules":[]}"#);
 
         let pane = daemon
@@ -9878,7 +9885,7 @@ mod tests {
     /// Return`(launch-agent 의 실제 주입 쌍)이 통과해야 한다.
     #[test]
     fn creator_can_inject_into_the_seat_it_just_created() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // cysjavis-pack/bin/cys-dept seed_acl() 시드와 동형 — 결함이 재현되던 그 규칙표.
         let dept_acl = r#"{
             "default": "allow",
@@ -9967,7 +9974,7 @@ mod tests {
     /// `acl_denied` + 문면 `external → worker-…` 다. 이것이 부서 자율성 보호의 본체다.
     #[test]
     fn creator_grade_does_not_leak_to_seats_it_did_not_create() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dept_acl = r#"{
             "default": "allow",
             "rules": [
@@ -10127,7 +10134,7 @@ mod tests {
     /// (ACL default 는 allow 라 external 이었다면 통과했을 상황 = 창작자 분기가 실제로 판정했다.)
     #[test]
     fn explicit_creator_deny_rule_blocks_the_creator() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -10193,7 +10200,7 @@ mod tests {
     /// 두지 않으면 (a)/(b)/(d) 와 키가 겹쳐 실행 순서에 따라 이 테스트의 이벤트가 억제된다.
     #[test]
     fn creator_promotion_that_flips_verdict_is_audited() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -10334,7 +10341,7 @@ mod tests {
     /// 열린다(owner 예약어 핀과 대칭 · claim_role·surface.create 두 입구 모두 봉인).
     #[test]
     fn role_creator_is_reserved_on_claim_and_create() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("creator-reserved", r#"{"default":"allow","rules":[]}"#);
 
         let pane = daemon
@@ -10417,7 +10424,7 @@ mod tests {
     /// 창작자 등급의 '창' 의미론은 좌석의 생애를 넘지 않는다.
     #[test]
     fn closing_a_seat_drops_its_creator_ledger_entry() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("creator-close", r#"{"default":"allow","rules":[]}"#);
         let boot_pid = std::process::id();
         daemon
@@ -10468,7 +10475,7 @@ mod tests {
     /// 늦게 도착해 수신자가 집행을 정지했다). 재정렬은 하지 않는다(직접 send 는 의도된 steer).
     #[test]
     fn b1_order_inverted_is_observed_when_same_sender_has_pending_queue() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, _dir) = daemon_with_acl("b1-order", r#"{"default":"allow","rules":[]}"#);
         let target = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
@@ -10529,7 +10536,7 @@ mod tests {
     /// 무기록이다. 아래 ②/③ 대조가 그 분기점이며, ③(인계 ③ 불변식)이 깨지면 온보딩이 사망한다.
     #[test]
     fn send_text_ledger_records_unless_operator_token_verifies_human() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ★R5-B: 상태 디렉터리 격리는 `daemon_with_acl` 이 스레드 로컬로 건다(종전의 손수
         // 짠 `CYS_STATE_DIR` 저장/복원 + 전역 뮤텍스는 제거 — 프로세스 전역 env 라 병렬 러너에서
         // 서로를 덮었고, `ACL_ENV_LOCK` 과 획득 순서가 갈려 교착 위험도 있었다).
@@ -10691,7 +10698,7 @@ mod tests {
     /// 수정: last_human_input 기록을 check_send_acl 통과 *이후*로 옮긴다. 이 분기점을 박제한다.
     #[test]
     fn send_text_denied_human_flag_does_not_touch_typing_guard() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -10770,7 +10777,7 @@ mod tests {
     /// **비순수(혼합·paste 래퍼·일반 텍스트)=갱신**(판정 SOT = cys::mousereport, TS 동형).
     #[test]
     fn send_text_pure_mouse_report_does_not_touch_typing_guard() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("mouse-human-exempt", r#"{ "default": "allow", "rules": [] }"#);
 
@@ -10851,7 +10858,7 @@ mod tests {
     ///       **사람 글자 = 가드 갱신 → 직후 제출 Return 거부**(대조군이 있어야 계약이 성립).
     #[test]
     fn terminal_autoreply_does_not_block_node_submit_return() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("autoreply-guard", r#"{ "default": "allow", "rules": [] }"#);
 
@@ -11056,7 +11063,7 @@ mod tests {
     /// 하는 두 경로인 **간격 무장(3000) / 비활성(0)** 으로 축을 바로잡았다.
     #[test]
     fn send_key_return_delegates_the_gap_to_the_writer_not_the_handler() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("cr-gap-nonblocking", r#"{ "default": "allow", "rules": [] }"#);
 
@@ -11111,7 +11118,7 @@ mod tests {
     /// authoritative 없는 send는 가드로 차단되어야 대조가 성립한다 (ACL은 둘 다 그대로 집행).
     #[test]
     fn authoritative_send_bypasses_typing_guard() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{ "default": "allow", "rules": [] }"#;
         let (daemon, dir) = daemon_with_acl("auth-guard", acl);
 
@@ -11243,7 +11250,7 @@ mod tests {
     /// 수정이 정상 경로를 막지 않았음을 박제 (UI=external·허용 발신 회귀 방지).
     #[test]
     fn send_text_allowed_path_still_passes() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -12001,7 +12008,7 @@ mod tests {
     /// Ctrl-U 의미가 TUI별 상이하므로 agent_meta 없는 pane엔 거부, 있으면 통과.
     #[test]
     fn send_text_clear_first_requires_agent_pane() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("clearfirst-gate", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
@@ -12051,7 +12058,7 @@ mod tests {
     /// 결합 불가(clear_first + queued는 invalid_params).
     #[test]
     fn send_text_clear_first_rejects_queued_combo() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("clearfirst-combo", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
@@ -12921,7 +12928,7 @@ mod tests {
     /// (세션 분리·재부모화로 끊긴 조상 체인)을 관통하는 수리의 데몬면 박제.
     #[test]
     fn claim_role_seat_token_authorizes_orphan_caller() {
-        let _g = ACL_ENV_LOCK.lock().unwrap(); // 롤백 검체의 CYS_BOOT_GATES 변이와 직렬화
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // 롤백 검체의 CYS_BOOT_GATES 변이와 직렬화
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let s = make_surface(&daemon, None);
@@ -12944,7 +12951,7 @@ mod tests {
     /// 벡터를 닫는 핀.
     #[test]
     fn claim_role_seat_token_chain_conflict_is_vetoed() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let a = make_surface(&daemon, None);
@@ -12974,7 +12981,7 @@ mod tests {
     /// 캐시 항목을 무효화하고 신선 재해석 1회의 결과로만 기각한다.
     #[test]
     fn claim_role_seat_token_veto_uses_fresh_walk_over_stale_cache() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let a = make_surface(&daemon, None);
@@ -12996,7 +13003,7 @@ mod tests {
     /// 위험 명기 — incarnation 전환 e2e 는 phoenix 하네스 몫).
     #[test]
     fn claim_role_stale_generation_token_is_treated_as_absent() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let s = make_surface(&daemon, None);
@@ -13028,7 +13035,7 @@ mod tests {
     /// 등록층 fail-closed). 전세대 방향의 폴백 반쪽은 P4 핀이 관통한다.
     #[test]
     fn claim_role_same_generation_token_mismatch_is_rejected_loudly() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let a = make_surface(&daemon, None);
@@ -13055,7 +13062,7 @@ mod tests {
     /// 봉인한다(조립 지점 추가 회귀 검출 — R3-P1-4).
     #[test]
     fn seat_token_never_persisted_or_listed() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = isolated_daemon();
         let s = make_surface(&daemon, Some("worker-1"));
@@ -13085,7 +13092,7 @@ mod tests {
     /// (claim+hook 한정)가 조용히 붕괴한다 — probe/record 분리(R3-P1-5 선행 조건)의 존재 이유.
     #[test]
     fn seat_token_path_never_records_caller_cache() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let s = make_surface(&daemon, None);
@@ -13117,7 +13124,7 @@ mod tests {
     /// 무변경 — 바뀐 것은 좌석 '해석'뿐이다.
     #[test]
     fn hook_decide_seat_token_resolution_and_conflict_undecided() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _bg = BootGatesAmbientGuard::neutralize(); // ambient CYS_BOOT_GATES=0 오진 차단
         let daemon = claim_daemon();
         let m = make_surface(&daemon, Some("master"));
@@ -13159,7 +13166,7 @@ mod tests {
     /// 사고 순간의 손잡이는 마스터 스위치 하나다(노브 규율).
     #[test]
     fn seat_token_disabled_by_boot_gates_master_switch() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 가드가 drop 시 ambient 원값을 복원한다 — 패닉 경로 포함(종전의 수동 remove_var 는
         // 패닉 시 미복원 + ambient 값이 있던 환경에서는 그 값을 지워버리는 부수 결함).
         let _bg = BootGatesAmbientGuard::neutralize();
@@ -14499,7 +14506,7 @@ mod tests {
     /// 페이싱을 교란할 수 없다(설계 risks 명시 완화책의 실행 경로 핀).
     #[test]
     fn queue_deliver_denied_by_send_acl() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{
             "default": "allow",
             "rules": [
@@ -14539,7 +14546,7 @@ mod tests {
     /// dispatch 경유로 검증(단건 전용 — 한 호출 = 한 건).
     #[test]
     fn queue_deliver_rpc_delivers_single_and_plumbs_params() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("w2e-deliver-ok", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
@@ -15554,7 +15561,7 @@ mod tests {
     /// 승계-윈도우 usurper가 합법 master 승계 직후 위험명령을 서명하는 것을 막는다.
     #[test]
     fn approval_sign_denied_when_master_just_claimed() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("vec9-just-claimed", r#"{"default":"allow","rules":[]}"#);
         let caller = 992_001_u32;
@@ -15580,7 +15587,7 @@ mod tests {
     /// 기존 caller=master 검증이 정상 통과함을 확인한다.
     #[test]
     fn approval_sign_allowed_when_master_stable() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("vec9-stable", r#"{"default":"allow","rules":[]}"#);
         // 서명 부작용(secret·approvals.json)을 임시 HOME으로 격리 — 실제 ~/.cys 오염 방지.
@@ -15615,7 +15622,7 @@ mod tests {
     /// caller=master 검증과 별개로, 승계 추적이 비어 있으면 명시적으로 동결한다(비대칭 보정).
     #[test]
     fn approval_sign_denied_when_no_master() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("vec9-no-master", r#"{"default":"allow","rules":[]}"#);
         let caller = 992_003_u32;
@@ -15641,7 +15648,7 @@ mod tests {
     /// 쿨다운 강화가 기존 1차 인가(caller=master)를 무손상 보존하는지 확인한다.
     #[test]
     fn approval_sign_denied_when_caller_not_master() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("vec9-not-master", r#"{"default":"allow","rules":[]}"#);
         // worker 역할 surface가 발신 — master가 아니므로 forbidden(쿨다운 검사 이전 단계).
@@ -15924,7 +15931,7 @@ mod tests {
     /// feed.auto_routed·approval.stalled 미발동, 항목은 pending 유지.
     #[test]
     fn w3_off_no_auto_route() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 임계 1로 좁혀, 게이트가 없으면 단 1건에도 backpressure가 터지게 만든다(C-4 진짜 증명).
         std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "1");
         let (daemon, dir) = daemon_auto("w3-off", false);
@@ -15969,7 +15976,7 @@ mod tests {
     /// ⑧ HumanOnly(사람 단계·TCC): flag ON → CEO 이행 불가 → 즉시 오너 escalation(human_only).
     #[test]
     fn w3_human_only_escalates() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-human", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(
@@ -15996,7 +16003,7 @@ mod tests {
     /// 유발하지 않는다(AutoEligible과 동일 게이트).
     #[test]
     fn w3_human_only_idempotent() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-human-idem", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "h1", "★사람 단계 필수: TCC 재부여", "동일", None), None);
@@ -16016,7 +16023,7 @@ mod tests {
     /// (W4-A: 발행자는 pane 귀속이어야 auto_route 성립 — synthetic 귀속으로 발행.)
     #[test]
     fn w3_ceo_seat_empty_escalates() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-empty", true);
         seed_caller(&daemon, 900_001, 55);
         let mut rx = daemon.bus.subscribe();
@@ -16038,7 +16045,7 @@ mod tests {
     /// ⑥ tier 스푸핑: tier=a여도 denylist 서술(삭제)이면 auto로 안 샌다(risk=high·라우팅 없음).
     #[test]
     fn w3_tier_spoof_denylist_stays_human() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-spoof", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "s1", "백업본 삭제", "정리", Some("a")), None);
@@ -16055,7 +16062,7 @@ mod tests {
     /// kind 위조: kind=notification이어도 denylist title이면 risk=high(kind는 판정 입력 아님).
     #[test]
     fn w3_kind_forgery_ignored() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-kind", true);
         let mut rx = daemon.bus.subscribe();
         let req = Request {
@@ -16078,7 +16085,7 @@ mod tests {
     /// (W4-A: 같은 귀속 발행자 pid로 두 번 발행 — 의미 키의 publisher_surface도 동일해진다.)
     #[test]
     fn w3_idempotent_semantic_key() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-idem", true);
         seed_caller(&daemon, 900_002, 56);
         let mut rx = daemon.bus.subscribe();
@@ -16100,7 +16107,7 @@ mod tests {
     /// + escalation 없음.
     #[test]
     fn w3_ceo_delivered_when_seat_occupied() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w3-deliver", true);
         // CEO 좌석: 살아있는 에이전트 pane + 점유 좌석.
         let ceo = daemon
@@ -16131,7 +16138,7 @@ mod tests {
     /// W3.5 감사: reply(allow, --reason) → approval_audit.jsonl에 req_id·decision·reason·risk 기록.
     #[test]
     fn w3_audit_record_written() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 감사는 flag ON일 때만 기록된다(C-4 게이트). 따라서 ON으로 데몬 생성.
         let (daemon, dir) = daemon_auto("w3-audit", true);
         let _ = dispatch(&daemon, w3_push(1, "a1", "[RSI 학습 추천]", "확인", None), None);
@@ -16185,7 +16192,7 @@ mod tests {
     /// W3.6 back-pressure: 임계 초과 시 approval.backpressure 이벤트 + org.status 노출 + deny 카운터.
     #[test]
     fn w3_back_pressure_counts_and_event() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // back-pressure는 flag ON일 때만 작동(C-4 게이트) — ON으로 생성.
         // 임계는 record_approval_request가 매 호출 env를 재조회하므로 push 시점까지 유지한다.
         std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "2");
@@ -16208,7 +16215,7 @@ mod tests {
     /// (approval.stalled)을 발행해 아래 0건 단언이 반드시 깨진다.
     #[test]
     fn w3_auto_route_requires_publisher_attribution() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w4-anon", true);
         let mut rx = daemon.bus.subscribe();
         // caller_pid는 있으나 어떤 surface에도 귀속 불가(실재하지 않는 pid → 조상 추적 실패).
@@ -16247,7 +16254,7 @@ mod tests {
     /// escalation 0건·pending 유지(사람 결재 경로).
     #[test]
     fn w3_cycle_verify_not_auto_routed() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_auto("w4-cycle", true);
         // CEO 좌석 점유 — auto 로 새면 실제 배달(feed.auto_routed)이 일어나는 환경을 구성한다.
         let ceo = daemon
@@ -16305,7 +16312,7 @@ mod tests {
     /// 두 필드 None 유지(비-pane 해소는 무주체가 사실).
     #[test]
     fn feed_reply_imprints_resolver_three_sides() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 감사 append는 flag ON에서만(C-4) — 감사면까지 검증하려고 ON 데몬.
         let (daemon, dir) = daemon_auto("w4-resolver", true);
         // 발행자(surface 61)·승인자(surface 62)를 서로 다른 pane에 귀속.
@@ -16789,7 +16796,7 @@ mod tests {
     /// 경로(b)만이 면제를 부여함을 증명한다(hop0: self 를 root 로 등록하고 self 를 caller 로).
     #[test]
     fn authoritative_restore_root_descendant_bypasses_both_send_paths() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("restore-root-p1", r#"{"default":"allow","rules":[]}"#);
 
@@ -16854,7 +16861,7 @@ mod tests {
     /// "subtree 밖 발신자는 복원 중에도 deny"가 그 성질의 충실한 결정론 핀이다.
     #[test]
     fn authoritative_non_restore_root_denied_during_active_restore() {
-        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) =
             daemon_with_acl("restore-root-a3", r#"{"default":"allow","rules":[]}"#);
 

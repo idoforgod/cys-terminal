@@ -2633,7 +2633,26 @@ async fn handle_connection_capped(
             }
         };
 
-        match handlers::dispatch(&daemon, req, caller_pid) {
+        // ★(0.14.31 · 리뷰 R2 · claude minor) dispatch 는 **동기**다 — 파일 I/O·락·그리고 이제는
+        //   큐 배달의 인계 결판 대기(최대 800ms)까지 그 안에서 돈다. 커넥션 태스크에서 그대로
+        //   부르면 그 시간만큼 tokio 워커 하나가 통째로 묶인다(운영자 `queue.deliver` 1회가
+        //   0.8s). `spawn_blocking` 은 그 일을 블로킹 풀로 옮긴다 — 이 커넥션 안의 순서는
+        //   `await` 로 그대로 직렬이고(요청 하나씩), 다른 커넥션·이벤트 스트림은 막히지 않는다.
+        let dispatched = {
+            let d = daemon.clone();
+            match tokio::task::spawn_blocking(move || handlers::dispatch(&d, req, caller_pid)).await
+            {
+                Ok(r) => r,
+                // 블로킹 태스크 패닉 — 커넥션을 조용히 끊지 않고 사실을 답한다(종전에는 프로세스
+                // 전체가 그 패닉을 안았다 · 이 변경으로 나빠지지 않는다).
+                Err(e) => handlers::Reply::Single(cys::err_response(
+                    &serde_json::Value::Null,
+                    "internal_error",
+                    &format!("dispatch task failed: {e}"),
+                )),
+            }
+        };
+        match dispatched {
             Reply::Single(resp) => {
                 if write_line(&mut write_half, &resp).await.is_err() {
                     return;

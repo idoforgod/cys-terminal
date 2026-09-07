@@ -568,48 +568,126 @@ pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64
 /// 【한계 — 정직】 `claimed` 는 "writer 가 쓰기로 결정했다" 이지 "PTY 에 다 나갔다" 가 아니다.
 /// 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는 종전
 /// (`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
-#[derive(Debug)]
+/// ★(0.14.31 · 리뷰 R2 · codex blocking) 가드가 보는 **승인·관문 사실**의 탐침. writer 스레드가
+/// 첫 바이트 앞에서 호출한다. `Weak<Daemon>` 를 담아 만들므로 순환 참조가 없고(채널에 실린 요청이
+/// 데몬을 살려 두지 않는다), 데몬이 이미 소멸했으면 **보수적으로 "대기 중"**(=중단)을 답한다.
+///
+/// 왜 세대 카운터가 아니라 탐침인가: 승인·관문 pending 은 `feed_items` 여러 지점에서 바뀌고,
+/// 단조 카운터를 심으려면 그 전 지점을 빠짐없이 계측해야 한다(하나라도 빠지면 가드가 조용히
+/// 거짓 안심을 준다). 탐침은 **판정과 같은 함수**(`governance::approval_or_gate_pending`)를 그대로
+/// 부르므로 판정 분리가 생기지 않는다.
+pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) 큐 배달의 **인계 가드** — "판정이 본 화면"과 "실제로
+/// 바이트가 나가는 순간" 사이를 잇는 유일한 축.
+///
+/// 【무엇이 틀렸었나】 `deliver_head_locked` 는 판정 뒤 원장 선기록(파일 append · 회전 · 느릴 수
+/// 있다)을 하고 나서 `try_send(Inject)` 했고, writer 는 세대를 보지 않았다. 그래서 원장 I/O 가
+/// 막히는 동안 모달이 다 그려져도 그 승인으로 본문+CR 이 나갔다(codex 리뷰 blocking).
+///
+/// 【두 축】 (0.14.31 · 리뷰 R2 · codex blocking B2)
+///   · **출력 세대**(`expect_gen`) — 정적(quiet) 기반 판정 경로만 요구한다. 비-alt(B1) 경로는
+///     `None` 이다: 그 계약이 스트리밍 중 배달을 허용하고, 불변을 요구하면 연속 출력 노드가
+///     영구 기아다(기아 #1).
+///   · **승인·관문 pending**(`expect_approval` + [`ApprovalProbe`]) — **모든 경로**가 요구한다.
+///     §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다"). 종전 가드에는 이 축이 없어서,
+///     writer 가 적체된 800ms 사이에 승인 feed 가 늘어도(출력 세대는 그대로) 본문이 나갔다.
+///
+/// 【핸드셰이크】 상태는 넷이다: 0 pending · 1 claimed(writer 가 쓰기로 정했다) · 2 aborted
+/// (아무도 쓰지 않는다) · 3 acked(호출부가 claimed 를 **수확**했다 = 되돌릴 수 없다).
+///   · writer: ⓐ 두 축을 읽어 하나라도 움직였으면 CAS(0→2)로 중단하고 **한 바이트도 쓰지 않는다**
+///     ⓑ 같으면 CAS(0→1)로 소유권을 집고 ⓒ **집은 뒤 다시 한 번** 두 축을 읽는다 — 그 사이에
+///     움직였으면 CAS(1→2)('늦은 중단')를 시도한다. 이것이 codex 지적("세대 load 와 CAS 는 한
+///     원자 연산이 아니다")에 대한 답이다: 남는 창은 ⓑ와 ⓒ 사이 수 ns 이고, 그 창조차 호출부가
+///     아직 수확하지 않았으면 늦은 중단이 잡는다.
+///   · 호출부: 인계 뒤 락을 놓고 유계 대기([`INJECT_GUARD_WAIT_MS`])로 결판을 본다. `CLAIMED` 를
+///     보면 CAS(1→3)로 **수확**하고 그 뒤부터 늦은 중단은 성립하지 않는다(수확한 배달은 반드시
+///     쓰인다 = 보고된 배달이 사라지지 않는다). 아직 pending 이면 스스로 CAS(0→2)로 중단시킨다 —
+///     마감에서 커밋(강제 주입)하지 않는 이유는 "writer 가 적체된 동안 모달이 떠도 결국 꽂는다"
+///     는 정확한 반례 때문이다(codex 리뷰). 오탐의 귀결은 **보류**여야 한다(§3-3).
+///
+/// 【한계 — 정직】 `claimed`(수확됨)는 "writer 가 쓰기로 결정했다" 이지 "PTY 에 다 나갔다" 가
+/// 아니다. 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는
+/// 종전(`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
 pub struct InjectGuard {
-    /// 판정이 본 출력 세대(짝수 = 발행 완료).
-    pub expect_gen: u64,
+    /// 판정이 본 출력 세대(짝수 = 발행 완료). `None` = 이 경로는 출력 세대 불변을 요구하지 않는다.
+    pub expect_gen: Option<u64>,
     /// 그 surface 의 `output_gen`(공유 카운터).
     pub output_gen: Arc<AtomicU64>,
-    /// 0 = pending · 1 = claimed(writer 가 쓴다) · 2 = aborted(아무도 쓰지 않았다).
+    /// 판정이 본 승인·관문 pending 사실.
+    pub expect_approval: bool,
+    /// 지금의 승인·관문 pending 을 다시 읽는 탐침(`None` = 검체 전용 · 축 없음).
+    pub approval: Option<ApprovalProbe>,
+    /// 0 = pending · 1 = claimed · 2 = aborted · 3 = acked(호출부가 claimed 를 수확했다).
     pub state: AtomicU8,
+}
+
+impl std::fmt::Debug for InjectGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InjectGuard")
+            .field("expect_gen", &self.expect_gen)
+            .field("expect_approval", &self.expect_approval)
+            .field("state", &self.state.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// 가드 상태 상수 — 숫자를 코드 여기저기에 흩지 않는다.
 pub const INJECT_PENDING: u8 = 0;
 pub const INJECT_CLAIMED: u8 = 1;
 pub const INJECT_ABORTED: u8 = 2;
+/// 호출부가 `CLAIMED` 를 수확했다 — 이 뒤로 writer 의 늦은 중단은 성립하지 않는다.
+pub const INJECT_ACKED: u8 = 3;
 
 /// 호출부가 writer 의 결판을 기다리는 상한(ms). writer 는 큐 배달 좌석에서 사실상 항상 유휴
 /// (배달 최소 간격 10s)라 평시 수십 µs 안에 결판난다. 값을 800 으로 둔 이유: writer 가 **직전
 /// 주입**을 처리 중이면 그 arm 은 본문 → `cr_delay_ms`(400) → CR 로 최대 ~0.5s 를 쓴다. 그보다
 /// 짧으면 정상적인 연속 쓰기마다 배달이 한 틱씩 미뤄진다(불필요한 지연). 그보다 길면 watchdog
-/// 틱이 surface 하나에 그만큼 묶인다 — 이 대기는 **배달이 실제로 인계된 경우에만** 발생하고
-/// 그 빈도는 배달 최소 간격(10s)이 상한을 이룬다.
+/// 틱이 surface 하나에 그만큼 묶인다 — 그래서 **틱 전체의 결판 예산**을 따로 둔다
+/// (`governance::QUEUE_TICK_SETTLE_BUDGET_MS` · 리뷰 R2 codex major).
 pub const INJECT_GUARD_WAIT_MS: u64 = 800;
 
 impl InjectGuard {
-    pub fn new(expect_gen: u64, output_gen: Arc<AtomicU64>) -> Self {
-        Self { expect_gen, output_gen, state: AtomicU8::new(INJECT_PENDING) }
+    pub fn new(
+        expect_gen: Option<u64>,
+        output_gen: Arc<AtomicU64>,
+        expect_approval: bool,
+        approval: Option<ApprovalProbe>,
+    ) -> Self {
+        Self {
+            expect_gen,
+            output_gen,
+            expect_approval,
+            approval,
+            state: AtomicU8::new(INJECT_PENDING),
+        }
+    }
+    /// 출력 세대가 판정 시점과 달라졌는가(락 없는 원자 읽기 — 호출부 대기 루프가 쓴다).
+    fn output_moved(&self) -> bool {
+        self.expect_gen.is_some_and(|g| self.output_gen.load(Ordering::Acquire) != g)
+    }
+    /// 두 축 중 하나라도 움직였는가(승인 탐침 포함 — writer 만 쓴다).
+    fn axes_moved(&self) -> bool {
+        if self.output_moved() {
+            return true;
+        }
+        match &self.approval {
+            Some(p) => p() != self.expect_approval,
+            None => false,
+        }
     }
     /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
-    ///
-    /// `CLAIMED` 는 "누군가 쓰기로 결정했다" 는 뜻이고 그 결정은 되돌리지 않는다: 호출부가 먼저
-    /// `CLAIMED` 로 정했다면(그 배달은 이미 '배달됨' 으로 보고됐다) 세대가 흘렀더라도 **쓴다** —
-    /// 그러지 않으면 보고된 배달이 실제로는 나가지 않아 메시지가 사라진다(유실 > 오주입).
     pub fn claim_for_write(&self) -> bool {
-        if self.output_gen.load(Ordering::Acquire) != self.expect_gen {
+        if self.axes_moved() {
             return match self.state.compare_exchange(
                 INJECT_PENDING,
                 INJECT_ABORTED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => false,                     // 내가 중단시켰다 — 쓰지 않는다
-                Err(cur) => cur == INJECT_CLAIMED,  // 호출부의 결정을 따른다
+                Ok(_) => false, // 내가 중단시켰다 — 쓰지 않는다
+                // 호출부가 이미 결판냈다 — 그 결정을 따른다(수확된 CLAIMED 는 반드시 쓴다).
+                Err(cur) => cur == INJECT_CLAIMED || cur == INJECT_ACKED,
             };
         }
         match self.state.compare_exchange(
@@ -618,15 +696,60 @@ impl InjectGuard {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
+            Ok(_) => {
+                // ★소유권을 집은 **뒤** 마지막 재확인 — load 와 CAS 사이의 창(수 ns)을 닫는다.
+                //   호출부가 아직 수확하지 않았을 때만 늦은 중단이 성립한다(수확 뒤엔 쓴다).
+                if self.axes_moved() {
+                    return !matches!(
+                        self.state.compare_exchange(
+                            INJECT_CLAIMED,
+                            INJECT_ABORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ),
+                        Ok(_)
+                    );
+                }
+                true
+            }
+            Err(cur) => cur == INJECT_CLAIMED || cur == INJECT_ACKED,
+        }
+    }
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) **처분자의 취소** — 아직 아무도 결판내지 않았으면
+    /// 중단으로 확정한다. 반환 true = "이 인계는 한 바이트도 쓰지 않는다"(그러므로 항목을 처분해도
+    /// 된다). false = writer 가 이미 쓰기로 확정했다 → 그 항목은 **배달 중**이므로 처분하지 않는다
+    /// (폐기 통지 뒤 실제 주입 = 승인·빈 좌석 사고로 이어지는 방향이라 그쪽을 택하지 않는다).
+    pub fn abort_if_pending(&self) -> bool {
+        match self.state.compare_exchange(
+            INJECT_PENDING,
+            INJECT_ABORTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => true,
-            Err(cur) => cur == INJECT_CLAIMED,
+            Err(cur) => cur == INJECT_ABORTED,
+        }
+    }
+    /// `CLAIMED` 를 **수확**한다 — 성공하면 `INJECT_CLAIMED`, 그 사이 writer 가 늦게 중단했으면
+    /// 그 값(`INJECT_ABORTED`)을 돌려준다.
+    fn ack(&self) -> u8 {
+        match self.state.compare_exchange(
+            INJECT_CLAIMED,
+            INJECT_ACKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => INJECT_CLAIMED,
+            Err(cur) => cur,
         }
     }
     /// 호출부의 결판 대기 — 반환값은 `INJECT_CLAIMED`(writer 가 쓴다) 또는 `INJECT_ABORTED`.
     ///
     /// 두 가지 방식으로 끝난다.
     ///   ① **빠른 중단**: 기다리는 동안 출력 세대가 움직이면 그 판정은 이미 무효다 — 더 기다리지
-    ///      않고 중단시킨다(writer 가 아직 요청을 집지도 않았을 수 있다).
+    ///      않고 중단시킨다(writer 가 아직 요청을 집지도 않았을 수 있다). 승인 축은 여기서 보지
+    ///      않는다 — 그 축의 권위 판정은 **writer 가 첫 바이트 앞에서** 하고(락이 필요하다),
+    ///      이 루프는 락 없는 원자 읽기만 한다.
     ///   ② **마감 중단**: writer 가 선행 요청(예: 다른 주입의 cr_delay 400ms)으로 늦으면 마감에서
     ///      중단시킨다. 커밋하지 **않는** 이유: 그때 쓰기는 수백 ms 뒤에 일어나고 그 사이 화면이
     ///      바뀌어도 아무도 다시 보지 않는다(codex 리뷰의 정확한 반례). 항목은 큐에 남아 다음 틱에
@@ -634,11 +757,14 @@ impl InjectGuard {
     pub fn settle(&self, wait_ms: u64) -> u8 {
         let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
         loop {
-            let st = self.state.load(Ordering::Acquire);
-            if st != INJECT_PENDING {
-                return st;
+            match self.state.load(Ordering::Acquire) {
+                INJECT_PENDING => {}
+                INJECT_CLAIMED => return self.ack(),
+                // 이미 수확된 결판을 다시 물으면 같은 답을 준다(멱등 — 반환 계약은 두 값뿐이다).
+                INJECT_ACKED => return INJECT_CLAIMED,
+                other => return other,
             }
-            if self.output_gen.load(Ordering::Acquire) != self.expect_gen {
+            if self.output_moved() {
                 break; // ① 판정이 본 프레임이 아니게 됐다 — 기다릴 이유가 없다
             }
             if Instant::now() >= deadline {
@@ -653,9 +779,21 @@ impl InjectGuard {
             Ordering::Acquire,
         ) {
             Ok(_) => INJECT_ABORTED,
-            Err(cur) => cur,
+            Err(INJECT_CLAIMED) => self.ack(),
+            Err(INJECT_ACKED) => INJECT_CLAIMED,
+            Err(other) => other,
         }
     }
+}
+
+/// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계의 **공유 예약**. 항목은 아직 활성
+/// 큐에 있고(persist·`queue.list` 가 그대로 본다), 이 레코드가 "그 항목들은 지금 인계 중" 을 알린다.
+#[derive(Debug)]
+pub struct InjectReservation {
+    /// 이번 인계에 실린 항목 id 들(병합분 포함).
+    pub ids: Vec<String>,
+    /// 그 인계의 가드 — 처분자가 이것으로 인계를 취소한다.
+    pub guard: Arc<InjectGuard>,
 }
 
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
@@ -900,6 +1038,17 @@ pub struct Surface {
     /// include_expired` · `queue.revive`(→ pending 꼬리) · `queue.drop` · 종료 drain(원장 `expired`).
     /// 락 순서: `pending_queue` → `expired_queue`(둘 다 잡을 때만 · leaf 취급).
     pub expired_queue: Mutex<std::collections::VecDeque<QueueEntry>>,
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) **인계 예약** — 인계 가드(`InjectGuard`)가 붙은 배달은
+    /// writer 의 결판(`settle`)이 날 때까지 항목을 큐에 **그대로 둔다**(종전에는 미리 pop 해서
+    /// persist·close·`queue.list` 어디에도 없는 창이 생겼다 = 그 창의 크래시는 유실).
+    ///
+    /// 그래서 그 창 동안 **다른 처분자**(`queue.clear`·좌석 종료 drain·TTL 스윕·`queue.drop`)가 같은
+    /// 항목을 가져갈 수 있다 — 그러면 "폐기 통지 후 실제 주입" 이 된다(codex 반례). 예약은 그 조정
+    /// 지점이다: 처분자는 [`Surface::cancel_inject_reservation`] 으로 **먼저 인계를 취소**하고,
+    /// 취소에 실패한(=writer 가 이미 쓰기로 확정한) 항목만 처분 대상에서 뺀다.
+    /// 같은 좌석의 이중 인계도 이것이 막는다(`pending_queue` 락 안에서 검사·설정).
+    /// 락 순서: `pending_queue` → (`input_gate`) → `inject_reservation`(leaf).
+    pub inject_reservation: Mutex<Option<InjectReservation>>,
     /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
     /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
     /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
@@ -1062,6 +1211,27 @@ pub struct GatePending {
 }
 
 impl Surface {
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계를 **취소**한다(처분자 전용).
+    ///
+    /// 반환 = **취소하지 못한** 항목 id 들(= writer 가 이미 쓰기로 확정 = 지금 배달 중). 호출부는
+    /// 그 id 를 처분 대상에서 빼고 나머지만 drain/폐기/이동한다. 취소에 성공하면 배달 경로가
+    /// `ABORTED` 를 보고 스스로 롤백하며 예약을 해제한다(여기서 해제하지 않는 이유 — 그 사이 새
+    /// 인계가 시작되면 롤백이 남의 상태를 되돌린다).
+    ///
+    /// 호출 규약: `pending_queue` 락을 쥔 채 부른다(예약 생성이 그 락 안이라 창이 없다).
+    pub fn cancel_inject_reservation(&self) -> Vec<String> {
+        let slot = self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            None => Vec::new(),
+            Some(r) if r.guard.abort_if_pending() => Vec::new(),
+            Some(r) => r.ids.clone(),
+        }
+    }
+
+    /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
+    pub fn inject_reserved(&self) -> bool {
+        self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **유일한 쓰기 API** — 값을 쓰고 변이 세대
     /// (`input_gen`)를 올린다. 직접 `store` 하면 세대가 멈춰 stale 리셋이 ABA 를 놓친다(테스트 픽스처
     /// 조립은 예외). 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
@@ -3058,9 +3228,11 @@ impl Daemon {
     /// 사라졌을 때 stale 일괄 종결용. 락 해제 후 resolve_feed_item을 개별 호출한다
     /// (데몬 재시작으로 in-memory 추적을 잃은 고아 pending도 이 경로로 청소된다).
     pub fn pending_daemon_approvals(&self, surface_id: u64) -> Vec<String> {
+        // ★(0.14.31 · 리뷰 R2) poison 관용 — 인계 가드 탐침이 **writer 스레드**에서 부른다(위 doc
+        //   `pending_gate_items` 와 같은 근거 · 읽기 전용 순회).
         self.feed_items
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|i| {
                 i.status == "pending"
@@ -3890,6 +4062,7 @@ impl Daemon {
             queue_paused_until: Mutex::new(None),
             // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.
             expired_queue: Mutex::new(std::collections::VecDeque::new()),
+            inject_reservation: Mutex::new(None),
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
@@ -4160,8 +4333,16 @@ impl Daemon {
             }
             // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
             // (★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유).
-            let dropped: Vec<QueueEntry> = surf.pending_queue.lock().unwrap().drain(..).collect();
+            // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중 항목은 남긴다(폐기 통지 뒤 주입 금지).
+            let dropped: Vec<QueueEntry> = crate::governance::drain_active_except_inflight(&surf);
             if !dropped.is_empty() {
+                // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치).
+                crate::governance::record_active_drain(
+                    &daemon,
+                    surf.id,
+                    &dropped,
+                    "process_exited",
+                );
                 daemon.bus.publish(
                     "queue.dropped",
                     "queue",
@@ -8326,7 +8507,7 @@ mod tests {
         }
         // ⓐ 세대가 흘렀다 → writer 가 중단시키고 **한 바이트도** 쓰지 않는다.
         let gen = Arc::new(AtomicU64::new(4));
-        let guard = Arc::new(InjectGuard::new(4, gen.clone()));
+        let guard = Arc::new(InjectGuard::new(Some(4), gen.clone(), false, None));
         let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = sync_channel::<WriteReq>(2);
         let stop = Arc::new(AtomicBool::new(false));
@@ -8352,7 +8533,7 @@ mod tests {
 
         // ⓑ 호출부가 먼저 커밋했다(그 배달은 이미 '배달됨' 으로 보고됐다) → 세대가 흘렀어도 쓴다.
         let gen2 = Arc::new(AtomicU64::new(10));
-        let g2 = Arc::new(InjectGuard::new(10, gen2.clone()));
+        let g2 = Arc::new(InjectGuard::new(Some(10), gen2.clone(), false, None));
         assert!(g2
             .state
             .compare_exchange(INJECT_PENDING, INJECT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
@@ -8380,7 +8561,7 @@ mod tests {
 
         // ⓒ 세대가 그대로면 종전과 똑같이 나간다(가드가 상시 닫히면 기아다).
         let gen3 = Arc::new(AtomicU64::new(2));
-        let g3 = Arc::new(InjectGuard::new(2, gen3.clone()));
+        let g3 = Arc::new(InjectGuard::new(Some(2), gen3.clone(), false, None));
         let buf3: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx3, rx3) = sync_channel::<WriteReq>(2);
         let stop3 = Arc::new(AtomicBool::new(false));
@@ -8412,7 +8593,7 @@ mod tests {
 
         for terminal in [INJECT_CLAIMED, INJECT_ABORTED] {
             let generation = Arc::new(AtomicU64::new(4));
-            let guard = InjectGuard::new(4, Arc::clone(&generation));
+            let guard = InjectGuard::new(Some(4), Arc::clone(&generation), false, None);
             assert_eq!(
                 guard.state.compare_exchange(
                     INJECT_PENDING,
@@ -8423,14 +8604,112 @@ mod tests {
                 Ok(INJECT_PENDING),
                 "새 가드가 pending이 아니어서 단일 결판 검체를 구성할 수 없다"
             );
+            // ★(0.14.31 · 리뷰 R2 · codex blocking B2) `CLAIMED` 를 호출부가 **수확**하면 저장 상태는
+            //   `INJECT_ACKED` 가 된다(그 뒤 writer 의 늦은 중단은 성립하지 않는다 = 보고된 배달은
+            //   반드시 쓰인다). 반환값 계약은 불변이다 — settle 은 계속 `CLAIMED`/`ABORTED` 만 준다.
+            let stored = if terminal == INJECT_CLAIMED { super::INJECT_ACKED } else { INJECT_ABORTED };
             for next_generation in [4, 6, 8] {
                 generation.store(next_generation, Ordering::Release);
                 assert_eq!(
                     (guard.settle(0), guard.state.load(Ordering::Acquire)),
-                    (terminal, terminal),
+                    (terminal, stored),
                     "반복 settle 또는 세대 변경이 이미 확정된 결판을 뒤집었다"
                 );
             }
+        }
+    }
+
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking B2) **가드는 승인·관문 대기도 지고, 그 축은 경로를
+    /// 가리지 않는다.**
+    ///
+    /// 종전 가드 필드는 `expect_gen`/`output_gen`/`state` 뿐이었다 — writer 가 적체된 800ms 사이에
+    /// 승인 feed 가 늘어도(출력 세대는 그대로) 본문이 그대로 나갔다. 게다가 가드는 **정적 경로에만**
+    /// 붙어서 비-alt 요청은 애초에 아무 재확인도 없었다(codex 반례 ①③).
+    /// 지금은 ⓐ 승인 축이 별도 세대 카운터가 아니라 **판정과 같은 술어를 다시 읽는 탐침**이고
+    /// ⓑ 출력 세대는 `Option`(비-alt 는 `None`)이라 **모든 경로가 승인 축을 진다**.
+    #[test]
+    fn wp5_r2_inject_guard_carries_the_approval_axis_on_every_path() {
+        use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+        // 승인 pending 을 흉내내는 탐침 — 판정 시점 false, 그 뒤 true 로 바뀐다.
+        let flipped = Arc::new(AtomicBool::new(false));
+        let probe = {
+            let f = flipped.clone();
+            Arc::new(move || f.load(Ordering::Acquire)) as super::ApprovalProbe
+        };
+        // ⓐ 비-alt 경로(expect_gen=None · 출력 세대 불변을 요구하지 않는다)도 승인이 뜨면 중단한다.
+        let gen = Arc::new(AtomicU64::new(7)); // 홀짝·값 무관 — 이 경로는 세대를 보지 않는다
+        let g = InjectGuard::new(None, gen.clone(), false, Some(probe.clone()));
+        flipped.store(true, Ordering::Release);
+        assert!(!g.claim_for_write(), "비-alt 인계가 승인 대기를 통과했다(§8 면제 없음)");
+        assert_eq!(g.state.load(Ordering::Acquire), INJECT_ABORTED);
+        // ⓑ 같은 경로에서 승인이 그대로면 정상적으로 쓴다(축이 상시 닫히지 않는다).
+        flipped.store(false, Ordering::Release);
+        let g2 = InjectGuard::new(None, gen.clone(), false, Some(probe.clone()));
+        assert!(g2.claim_for_write(), "승인이 없는데 비-alt 인계가 막혔다(기아)");
+        assert_eq!(g2.settle(0), INJECT_CLAIMED);
+        // ⓒ 판정이 '승인 있음' 을 본 상태에서 승인이 **사라지는** 것도 변화다 — 그 판정도 무효다.
+        flipped.store(true, Ordering::Release);
+        let g3 = InjectGuard::new(Some(4), Arc::new(AtomicU64::new(4)), true, Some(probe.clone()));
+        flipped.store(false, Ordering::Release);
+        assert!(!g3.claim_for_write(), "판정 재료가 바뀌었는데 그대로 썼다");
+        // ⓓ 출력 세대 축은 종전대로 — alt 경로는 세대가 흐르면 중단한다.
+        let gen4 = Arc::new(AtomicU64::new(4));
+        let g4 = InjectGuard::new(Some(4), gen4.clone(), false, Some(probe.clone()));
+        gen4.store(6, Ordering::Release);
+        assert!(!g4.claim_for_write(), "정적 판정 경로가 흐른 세대로 썼다");
+    }
+
+    /// ★(0.14.31 · 리뷰 R2 · codex B6ⓒ) **신 데이터 → 구 판독기.** 종전 검체는 구 데이터를 손으로
+    /// 만들어 신 판독기에 먹였다(방향이 반대다). 여기서는 **0.14.31 이 실제로 쓴 두 파일**을 두고
+    /// 0.14.30 이 하던 일(활성 WAL 만 읽고 모르는 키는 버린다)을 그대로 흉내내, 만료 항목이 구
+    /// 데몬의 활성 큐로 **되살아나지 않음**을 본다(파일 분리의 존재 이유).
+    /// 구 바이너리 실행 자체는 이번 라운드 범위 밖이다(별 리비전 빌드 필요 · 노트 not-tested).
+    #[test]
+    fn wp5_r2_new_wal_is_safe_for_an_old_reader() {
+        let td = std::env::temp_dir().join(format!(
+            "cys-wp5r2-oldreader-{}-{}",
+            std::process::id(),
+            now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&td).expect("temp");
+        let sock = td.join("cys.sock");
+        let daemon = Daemon::new(sock.clone());
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let active = daemon.next_queue_entry("활성 본문".into(), None, "test");
+        let active_id = active.id.clone();
+        s.pending_queue.lock().unwrap().push_back(active);
+        let mut expired = daemon.next_queue_entry("만료 본문".into(), None, "test");
+        expired.expired_at = Some(now_epoch());
+        let expired_id = expired.id.clone();
+        s.expired_queue.lock().unwrap().push_back(expired);
+        daemon.persist_queue_state();
+        let dir = state_dir(&sock);
+        // 구 판독기: `queue-state.json` 하나만 읽고, 모르는 키(ttl_secs·expired_at…)는 무시한다.
+        let raw = std::fs::read_to_string(dir.join("queue-state.json")).expect("활성 WAL");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("JSON 배열");
+        let ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(ids.iter().any(|i| i == &active_id), "구 판독기가 활성 항목을 잃었다");
+        assert!(
+            !ids.iter().any(|i| i == &expired_id),
+            "만료 항목이 활성 WAL 에 실렸다 — 구 데몬(롤백)이 그것을 되살려 배달한다"
+        );
+        assert!(
+            dir.join("queue-expired.json").exists(),
+            "만료 사이드카가 없다 — 만료 항목이 어디에도 남지 않았다(유실)"
+        );
+        // 구 판독기가 필수로 보던 키는 전부 그대로다(스키마 파괴 없음).
+        for k in ["id", "text", "surface_id", "enqueued_at", "seq", "origin"] {
+            assert!(rows[0].get(k).is_some(), "구 판독기 필수 키 {k} 가 사라졌다");
         }
     }
 
@@ -8443,7 +8722,7 @@ mod tests {
         };
 
         let generation = Arc::new(AtomicU64::new(4));
-        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        let guard = InjectGuard::new(Some(4), Arc::clone(&generation), false, None);
         generation.store(6, Ordering::Release);
         let writes = guard.claim_for_write();
         assert_eq!(
@@ -8458,7 +8737,7 @@ mod tests {
         use super::{InjectGuard, INJECT_ABORTED};
         use std::sync::{atomic::AtomicU64, Arc};
 
-        let guard = InjectGuard::new(4, Arc::new(AtomicU64::new(4)));
+        let guard = InjectGuard::new(Some(4), Arc::new(AtomicU64::new(4)), false, None);
         // 0ms는 마감 분기를 즉시 선택한다. 경과 시간이나 스레드 스케줄링을 재지 않는다.
         let settled = guard.settle(0);
         let writes = guard.claim_for_write();
@@ -8478,7 +8757,7 @@ mod tests {
         };
 
         let generation = Arc::new(AtomicU64::new(4));
-        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        let guard = InjectGuard::new(Some(4), Arc::clone(&generation), false, None);
         // 현재 settle은 커밋하지 않는다. 이미 보고된 claimed 상태를 CAS로 구성한다.
         assert_eq!(
             guard.state.compare_exchange(
@@ -8506,7 +8785,7 @@ mod tests {
         };
 
         let generation = Arc::new(AtomicU64::new(4));
-        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        let guard = InjectGuard::new(Some(4), Arc::clone(&generation), false, None);
         generation.store(6, Ordering::Release);
         // 긴 유한 마감을 주되 시간 단언은 하지 않는다. 진입 전에 세대 변경을 확정한다.
         assert_eq!(
@@ -8524,7 +8803,7 @@ mod tests {
         // 반복마다 실제 두 스레드가 경쟁한다. 특정 승자나 양쪽 승자의 출현 횟수는 요구하지 않는다.
         // 버퍼와 큐는 호출 계약의 모형이며 실제 PTY 쓰기나 rollback 구현을 검증하지 않는다.
         for round in 0..128 {
-            let guard = Arc::new(InjectGuard::new(4, Arc::new(AtomicU64::new(4))));
+            let guard = Arc::new(InjectGuard::new(Some(4), Arc::new(AtomicU64::new(4)), false, None));
             let start = Arc::new(Barrier::new(2));
             let writer_guard = Arc::clone(&guard);
             let writer_start = Arc::clone(&start);

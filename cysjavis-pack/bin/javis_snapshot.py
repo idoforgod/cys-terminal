@@ -260,23 +260,33 @@ def _section_delivery():
     if status == jm.LEDGER_ABSENT:
         lines.append("- 원장 부재(기계 배달 이력 없음 — 정상일 수 있음)")
         return lines
-    stale = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("stale"))
+    # ★(0.14.31 · 리뷰 R2 · 양 리뷰어) 층1 대조 계수에서도 **회계 줄을 뺀다.** `_delivery_records`
+    # 는 걸렀는데 같은 줄에 찍히는 `len(matches)` 는 `javis_mission.read_delivery` 가 준 sha 색인
+    # 그대로였다 — 1배달 = 3줄(선기록+영수증+묘비)이라 "내 pane 앞 배달: 3건 · 24h 전 레인: 1건"
+    # 이라는 자기모순이 남았다. 색인 자체는 건드리지 않는다(임무 게이트의 권위 · 합성 sha 는 제출
+    # 프롬프트와 결코 일치하지 않아 판정에 무해하다) — 보고 계수만 같은 기준으로 맞춘다.
+    deliveries = {k: m for k, m in matches.items()
+                  if not (isinstance(m, dict)
+                          and str(m.get("origin") or "") in LEDGER_BOOKKEEPING_ORIGINS)}
+    book1 = len(matches) - len(deliveries)
+    stale = sum(1 for m in deliveries.values() if isinstance(m, dict) and m.get("stale"))
     recs, meta, err = _delivery_records(jm, now)
     if recs is None:
-        lines.append("- 표시용 열람 실패(%s) · 층1 대조(내 pane 앞): %d건" % (err, len(matches)))
+        lines.append("- 표시용 열람 실패(%s) · 층1 대조(내 pane 앞): %d건" % (err, len(deliveries)))
         return lines
     by_origin = {}
     for r in recs:
         k = str(r.get("origin") or "-")
         by_origin[k] = by_origin.get(k, 0) + 1
     lines.append("- 층1 대조(내 pane 앞 배달): %d건(창 밖 %d) · 24h 전 레인: %d건"
-                 % (len(matches), stale, len(recs)))
+                 % (len(deliveries), stale, len(recs)))
     lines.append("- origin별: %s" % (" · ".join("%s=%d" % (k, by_origin[k])
                                                 for k in sorted(by_origin)) or "없음"))
-    if meta:
+    if meta or book1:
         # 배달 계수 밖의 회계 줄(0.14.31+) — 영수증=인계 확인, 묘비=배달 없이 큐를 떠난 항목.
-        lines.append("- 회계 줄(배달 아님): %s"
-                     % " · ".join("%s=%d" % (k, meta[k]) for k in sorted(meta)))
+        # `내 pane 앞 N건` 은 층1 색인에서 뺀 회계 줄 수다(두 계수가 같은 기준임을 보이는 값).
+        lines.append("- 회계 줄(배달 아님): %s · 내 pane 앞 %d건"
+                     % (" · ".join("%s=%d" % (k, meta[k]) for k in sorted(meta)) or "없음", book1))
     for r in recs[-5:]:
         lines.append("- %s surface=%s origin=%s from=%s \"%s\""
                      % (_fmt_epoch(r.get("ts_epoch")), _clip(r.get("surface"), 12),

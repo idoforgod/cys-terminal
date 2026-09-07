@@ -212,6 +212,36 @@ def test_bookkeeping_origins_are_not_deliveries():
     _assert_no_new(_s)
 
 
+def test_layer1_count_excludes_bookkeeping():
+    """★(0.14.31 · WP-5 리뷰 R2 · 양 리뷰어) **층1 대조 계수도** 회계 줄을 세지 않는다.
+
+    R1 은 `_delivery_records`(전 레인 표시용)만 걸렀고, 같은 보고 줄의 `len(matches)` 는
+    `javis_mission.read_delivery` 가 준 sha 색인 그대로였다. 1배달 = 3줄(선기록+영수증+묘비)이라
+    "내 pane 앞 배달: 3건 · 24h 전 레인: 1건" 이라는 **자기모순**이 그대로 남았다.
+    여기서는 세 줄을 전부 **내 pane(surface=1)** 앞으로 두고 두 계수가 같은 1건인지 본다."""
+    _s = len(fails)
+    with tempfile.TemporaryDirectory() as td:
+        _ws, rd, state = make_ws(td)
+        with open(os.path.join(state, "delivery-base.jsonl"), "w", encoding="utf-8") as f:
+            f.write(drec("내 pane 큐 배달 본문", surface="1", origin="queue", frm="2"))
+            f.write(drec("queue-receipt:q9", surface="1", origin="queue_receipt", frm="2",
+                         kind="receipt", queue_entry_id="q9"))
+            f.write(drec("queue-tombstone:q8:dropped", surface="1", origin="queue_tombstone",
+                         frm="2", kind="tombstone", reason="dropped", queue_entry_id="q8"))
+        env = {"CYS_ROLE": "master", "CYS_STATE_DIR": state, "CYS_SURFACE_ID": "1"}
+        rc, _o, _e = run(["generate", "--round-dir", rd], env)
+        body = open(os.path.join(rd, "BOOT_SNAPSHOT.md"), encoding="utf-8").read()
+        check("층1[rc=0]", rc == 0, "rc=%s" % rc)
+        check("층1[내 pane 앞 배달 1건]", "내 pane 앞 배달): 1건" in body, body[:400])
+        check("층1[3건으로 부풀지 않음]", "내 pane 앞 배달): 3건" not in body, body[:400])
+        check("층1[두 계수가 같은 기준]", "24h 전 레인: 1건" in body, body[:400])
+        check("층1[회계 줄은 별도로 보고]",
+              "회계 줄(배달 아님)" in body and "queue_receipt=1" in body
+              and "queue_tombstone=1" in body, body[:400])
+        check("층1[층1 색인에서 뺀 회계 줄 수도 보고]", "내 pane 앞 2건" in body, body[:400])
+    _assert_no_new(_s)
+
+
 def test_readonly():
     """읽기 전용 — 관측이 원장·티켓·큐를 1바이트도 바꾸지 않는다(자기인가 벡터 차단)."""
     _s = len(fails)
@@ -359,6 +389,7 @@ def test_ascii_stdout():
 def main():
     for fn in (test_gate, test_cap, test_atomic_idempotent, test_ledger_fixture,
                test_bookkeeping_origins_are_not_deliveries,
+               test_layer1_count_excludes_bookkeeping,
                test_readonly, test_sanitize, test_sanitize_bypass, test_stale_tmp_sweep,
                test_symbol_pins, test_ascii_stdout):
         try:

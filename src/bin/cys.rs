@@ -1676,6 +1676,31 @@ fn read_send_body(
 /// "보냈는데 왜 조용하지"로 오해한다. `cys status` 와 같은 RPC(org.status)를 쓴다.
 /// best-effort: 조회 실패는 침묵한다 — 폴백 자체는 이미 성공했고 여기서 exit 코드를 바꾸지
 /// 않는다(경고 채널이 주 경로를 망치면 안 된다).
+/// ★(0.14.31 · 리뷰 R2 · codex major) enqueue 응답의 **내구 표식**을 사람이 읽는 줄에 싣는다.
+///
+/// 【무엇이 틀렸었나】 데몬은 큐 WAL 저장 실패를 `durable:false` 로 사실대로 답하는데(리뷰 R1),
+/// 주 소비 경로인 CLI 는 `depth` 만 찍고 그 사실을 버렸다. 그래서 `cys send --queued` 는 WAL 이
+/// 안 써졌어도 `QUEUED` + exit 0 이었고, 그것을 subprocess 성공으로 받는 상위 도구
+/// (`javis_wakeup.py`)는 다음 틱 재시도 전 크래시에서 메시지를 잃고도 성공으로 기록했다.
+///
+/// 【exit 코드를 바꾸지 않는 이유】 항목은 **메모리 큐에 접수됐고** 다음 틱(≤5s)이 WAL 을 다시
+/// 쓴다. 여기서 비0을 돌려주면 클라이언트가 재전송하고, 큐에는 멱등 키가 없으므로 그것은 **중복
+/// 배달**이다(§R1-2 9 와 같은 근거). 사실을 감추지 않되 실패로 단정하지도 않는다 — 표식은
+/// stdout 한 조각(`· durable=false`)과 stderr 경고 한 줄이다.
+/// 구 데몬(키 부재)은 표식 없음 = 종전 문면 그대로다(스큐에 침묵).
+fn queue_durable_suffix(r: &serde_json::Value) -> &'static str {
+    match r.get("durable").and_then(|v| v.as_bool()) {
+        Some(false) => {
+            eprintln!(
+                "[queue] 경고: 데몬이 큐 WAL 저장에 실패했다(durable=false) — 항목은 메모리 큐에 \
+                 있고 다음 틱이 재시도한다. 그 전에 데몬이 죽으면 이 메시지는 유실된다."
+            );
+            " · durable=false"
+        }
+        _ => "",
+    }
+}
+
 fn warn_if_daemon_paused() {
     if let Ok(r) = request("org.status", json!({})) {
         if r["paused"].as_bool() == Some(true) {
@@ -3110,13 +3135,13 @@ fn run(command: Command) -> i32 {
                                 surface_ref(sid)
                             );
                             warn_if_daemon_paused();
-                            println!("QUEUED (depth {depth}){tag}");
+                            println!("QUEUED (depth {depth}){}{tag}", queue_durable_suffix(&r2));
                             continue;
                         }
                         Err(e) => return Err(e),
                     };
                     if queued {
-                        println!("QUEUED (depth {}){tag}", r["depth"]);
+                        println!("QUEUED (depth {}){}{tag}", r["depth"], queue_durable_suffix(&r));
                     } else {
                         println!("OK{tag}");
                     }
@@ -3165,7 +3190,7 @@ fn run(command: Command) -> i32 {
                                     surface_ref(sid)
                                 );
                                 warn_if_daemon_paused();
-                                println!("QUEUED (depth {depth})");
+                                println!("QUEUED (depth {depth}){}", queue_durable_suffix(&r2));
                                 sid_fallback = true;
                                 any_fallback = true;
                                 continue;
@@ -3174,7 +3199,9 @@ fn run(command: Command) -> i32 {
                         };
                         if queued {
                             match r["depth"].as_u64() {
-                                Some(d) => println!("QUEUED (depth {d})"),
+                                Some(d) => {
+                                    println!("QUEUED (depth {d}){}", queue_durable_suffix(&r))
+                                }
                                 // 구 데몬은 queued 파라미터를 모르고 즉시 주입한다 —
                                 // "QUEUED"로 오표시하지 않는다(skew의 결정론 신호).
                                 None => eprintln!(
@@ -8507,7 +8534,21 @@ mod seat_latch_negation_tests {
         // ④''' 임베드 어댑터 정본이 두 신 키를 실제로 들고 있는가(계층이 전달할 값이 없으면 무의미).
         let embed = embedded_agents_json().expect("임베드 agents.json");
         assert_eq!(composer_marker_of(&embed["codex"]).as_deref(), Some("›"));
-        assert_eq!(composer_marker_of(&embed["gemini"]).as_deref(), Some(">"));
+        // ★(0.14.31 · 리뷰 R2 · claude major) gemini 는 **실측 프레임이 0건**이라 마커를 켜지 않는다
+        //   (1글자 `>` 는 셸 PS2·인용 행과 겹쳐 fail-open 이 된다 — 오탐 방향이 반대다 · §3-3).
+        //   기구가 죽은 것이 아니라 데이터를 켜지 않은 것이다: 디스크 선언은 그대로 먹는다.
+        assert!(embed["gemini"].get("prompt_marker").is_none(), "실측 없는 gemini 마커가 켜졌다");
+        assert_eq!(
+            composer_marker_of(&embed["gemini"]).as_deref(),
+            Some("? for shortcuts"),
+            "해소는 ready_marker 폴백으로 떨어져야 한다(그 문면은 composer 행에 없다 = prompt_unknown 보류)"
+        );
+        assert_eq!(
+            composer_marker_of(&json!({"ready_marker": "? for shortcuts", "prompt_marker": ">"}))
+                .as_deref(),
+            Some(">"),
+            "디스크 선언 해소 기구까지 죽었다"
+        );
         assert!(composer_placeholder_of(&embed["codex"]).is_some(), "codex 플레이스홀더 정본이 없다");
         // ⑤ 배선 핀 — 부트 폴링이 관문(GateHeld)에서 래치를 세우고 Ready 에서 이 술어를 본다.
         let src = include_str!("cys.rs");
@@ -19318,6 +19359,24 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(0.14.31 · 리뷰 R2 · codex major) **`durable:false` 는 CLI 출력까지 간다.**
+    ///
+    /// 데몬은 큐 WAL 저장 실패를 사실대로 답하는데(R1) CLI 는 `depth` 만 찍고 버렸다 — `cys send
+    /// --queued` 가 `QUEUED` + exit 0 이라, 그것을 subprocess 성공으로 받는 상위 도구
+    /// (`javis_wakeup.py`)는 다음 틱 재시도 전 크래시로 메시지를 잃고도 성공으로 기록했다.
+    /// exit 코드는 **바꾸지 않는다**: 항목은 메모리 큐에 접수됐고 다음 틱이 다시 쓴다. 여기서
+    /// 비0 을 주면 클라이언트가 재전송하는데 큐에 멱등 키가 없어 그것은 중복 배달이다(§R1-2 9).
+    #[test]
+    fn wp5_r2_queue_durable_false_is_surfaced_to_the_operator() {
+        assert_eq!(queue_durable_suffix(&json!({"depth": 3, "durable": true})), "");
+        assert_eq!(queue_durable_suffix(&json!({"depth": 3})), "", "구 데몬(키 부재)은 종전 문면");
+        assert_eq!(
+            queue_durable_suffix(&json!({"depth": 3, "durable": false})),
+            " · durable=false",
+            "내구 실패가 사람이 읽는 줄에서 사라졌다"
+        );
+    }
 
     /// ★A12 승격 가드 단위 테스트(v4 · W4): 승격 중(.pre-ceo 존재) base MASTER 를 덮는
     /// 두 동사(take-new·rollback)만 거부 — keep-mine 경로·타 파일·비승격 상태·--force-vendor
