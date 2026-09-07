@@ -348,6 +348,72 @@ SELFCORR_HOOKS = [
     ("pack-guard.sh", [("PostToolUse", "Write|Edit|MultiEdit")]),
 ]
 
+# ★WP-3 A(0.14.31) 능력 게이트 — **조건부** 등록 훅. `SELFCORR_HOOKS` 에 합치지 않는 이유는
+#   그 목록이 "항상 등록" 집합이기 때문이다. 이 훅은 두 조건이 **둘 다 참일 때만** 등록한다
+#   (CONTRACTS §C): ①그 데몬이 경보 라우팅을 지원(`cys status --json` 의 `alert_route.enabled`)
+#   ②설치본 CSO_DIRECTIVE 가 신판 표지를 달고 있다. 하나라도 아니면 WARN 1줄 + 등록 보류다 —
+#   ★부분 배포(A만 등록·B 미배포)는 CSO 가 경보를 못 받는 채로 능력만 잃는 상태이고, 그것이
+#   봉인표 ③(자가치유 전멸)의 실현이다. 실재(파일·실행권한) 검사는 조건과 무관하게 항상 한다.
+CAPGATE_HOOK = ("role-capability-gate.sh", [("PreToolUse", None)])
+CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
+CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있어야 한다(P3 와 공유하는 계약)
+
+
+def _read_text_tolerant(path):
+    """막히지 않는 텍스트 판독(FIFO·심링크 함정에서 preflight 가 정지하지 않게)."""
+    try:
+        fd = _open_unblocking_ro(path)
+    except (OSError, ValueError):
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+
+
+def capgate_marker_ok(text, marker=CSO_DIRECTIVE_REV_MARKER,
+                      max_line=CSO_DIRECTIVE_MARKER_MAX_LINE):
+    """설치본 지침이 신판 표지를 첫 `max_line` 행 안에 **정확 행 등가**로 달고 있는가.
+
+    부분 문자열이 아니라 행 등가로 재는 이유: 표지를 인용한 산문(`… 표지 <!-- … --> 를 확인`)이
+    표지 자체로 오독되면 구판 지침이 신판으로 판정된다(막는 쪽으로만 틀린다).
+    """
+    if not isinstance(text, str):
+        return False
+    for i, line in enumerate(text.splitlines()[:max_line], start=1):
+        if line.strip() == marker:
+            return True
+    return False
+
+
+def capgate_alert_route_enabled(status_obj):
+    """`cys status --json` 의 `alert_route.enabled` 가 **정확히 True** 인가.
+
+    결측·비-bool·비-object 는 전부 '미지원'이다 — 결측은 값이 아니고, 여기서 관대하면
+    구 데몬에 게이트를 등록해 CSO 가 경보 없이 능력만 잃는다.
+    """
+    if not isinstance(status_obj, dict):
+        return False
+    ar = status_obj.get("alert_route")
+    if not isinstance(ar, dict):
+        return False
+    return ar.get("enabled") is True
+
+
+def capgate_registration_verdict(status_obj, directive_text):
+    """(ok: bool, reason: str) — 등록 조건 둘의 순수 판정기(검체가 직접 부른다)."""
+    a = capgate_alert_route_enabled(status_obj)
+    b = capgate_marker_ok(directive_text)
+    if a and b:
+        return True, "alert_route.enabled=true · CSO_DIRECTIVE 신판 표지 확인"
+    missing = []
+    if not a:
+        missing.append("데몬 alert_route 미지원(`cys status --json` 에 alert_route.enabled=true 없음)")
+    if not b:
+        missing.append("설치본 CSO_DIRECTIVE 에 신판 표지(%s) 없음" % CSO_DIRECTIVE_REV_MARKER)
+    return False, " · ".join(missing)
+
 # ★훅 **본체** — 실재 전용(등록 대상 아님 · 부트 v2 A2 분할 2026-09-04).
 #   `role-bootstrap.sh` 는 자기완결 **런처**이고 실제 부트 본체는 `role-bootstrap-legacy.sh` 다.
 #   본체가 없으면 런처는 고지 1줄을 내고 `exit 0` 한다 — 즉 **훅은 정상 종료하는데 부트만 안
@@ -403,6 +469,11 @@ NPM_PREFIX_BUNDLE_WARNING = (
 HOOK_TIMEOUT_PLATFORM_DEFAULT_UPS_S = 30
 HOOK_TIMEOUT_S = {
     ("role-bootstrap.sh", "UserPromptSubmit"): 600,
+    # ★WP-3 A(0.14.31): 능력 게이트는 전 도구 호출에 붙는다 — 내부 데드라인(역할 조회 2s +
+    #   TTL 승인 확인 5s)의 **바깥 겹**을 15s 로 선언한다. 하네스 timeout 은 차단 보증이 아니라
+    #   (초과 시 출력이 폐기되고 도구는 정상 권한 흐름으로 간다) 훅이 좌석을 붙잡지 않게 하는
+    #   상한이다 — 그래서 넉넉하되 무한이 아니어야 한다.
+    ("role-capability-gate.sh", "PreToolUse"): 15,
 }
 
 # ★U-21 롤백 스위치(축 1지점) — Rust `pack::hook_timeout_axis_legacy_from` 의 파이썬 미러.
@@ -3806,6 +3877,32 @@ class Preflight:
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
 
+    def _capgate_gate(self):
+        """(ok, why) — 능력 게이트 등록 조건 둘(CONTRACTS §C). 읽기 전용·부작용 0.
+
+        ★이 판정의 **한계를 정직히 적는다**: 두 조건은 "그 데몬이 경보 라우팅 기능을 가졌고
+          그 팩의 지침이 신판이다" 를 증명할 뿐, 경보가 실제로 CSO inbox 에 배달되는 것을
+          증명하지 않는다(배달 실측은 WP-3 B 의 드릴 소관이다). 그래서 조건 충족은 '등록해도
+          된다' 이지 '라우팅이 살아 있다' 가 아니다.
+        """
+        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
+        status = None
+        if cys:
+            try:
+                r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                                   text=True, timeout=15)
+                if r.returncode == 0:
+                    status = json.loads(r.stdout or "{}")
+            except (OSError, ValueError, subprocess.SubprocessError):
+                status = None
+        else:
+            return False, "cys 바이너리 미발견 — 데몬 alert_route 판정 불가(판정 불능은 미등록이다)"
+        d = os.path.join(pack_dir(), "directives", "CSO_DIRECTIVE.md")
+        text = _read_text_tolerant(d)
+        if text is None:
+            return False, "설치본 CSO_DIRECTIVE 판독 불가(%s)" % d
+        return capgate_registration_verdict(status, text)
+
     def c28_self_correction(self):
         cid = "C28.self-correction"
         if self.skipped(cid):
@@ -3815,6 +3912,9 @@ class Preflight:
         fixed, warns, fails = [], [], []
         # (a) hook 스크립트 4종 + javis_reflect.py 존재·실행권한
         rels = [os.path.join("hooks", s) for s, _ in SELFCORR_HOOKS]
+        # ★WP-3 A: 능력 게이트 훅의 **실재**는 등록 조건과 무관하게 잰다(조건이 거짓이라
+        #   등록을 보류하는 것과 파일이 없는 것은 다른 사실이다).
+        rels.append(os.path.join("hooks", CAPGATE_HOOK[0]))
         rels.append(os.path.join("bin", "javis_reflect.py"))
         for rel in rels:
             p = os.path.join(pack_dir(), rel)
@@ -3875,8 +3975,15 @@ class Preflight:
         #   C08(session-start)과 **대칭으로 FAIL** 이다. 종전엔 C28 전체가 WARN 이라, 부트 발화의
         #   유일한 트리거가 빠져 있어도 preflight 가 초록에 가까웠다(C08=FAIL vs C28=WARN 비대칭 —
         #   재감사 A21 확증). 나머지 자기교정 훅(inject·save·reflect·nudge·pack-guard)은 종전대로 WARN.
+        # ★WP-3 A 등록 게이트(CONTRACTS §C) — 두 조건이 **둘 다** 참일 때만 PreToolUse 에 올린다.
+        _cap_ok, _cap_why = self._capgate_gate()
+        _reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])
+        if not _cap_ok:
+            warns.append("능력 게이트(%s) 등록 보류 — %s. 미등록 상태에서도 "
+                         "CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다(침묵은 판정이 아니다)"
+                         % (CAPGATE_HOOK[0], _cap_why))
         for t in targets:
-            for script_name, events in SELFCORR_HOOKS:
+            for script_name, events in _reg_hooks:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
                     continue
                 tier_fatal = script_name in AWAKENING_SCRIPTS
@@ -3914,7 +4021,9 @@ class Preflight:
                         (fails if tier_fatal else warns).append(
                             "%s %s(%s) 미등록%s" % (os.path.basename(t), script_name, event,
                                                    "(--fix로 등록)" if tier_fatal else "(--fix)"))
-        detail = "자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) 6종 + reflect 엔진"
+        detail = ("자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) "
+                  "6종 + reflect 엔진 · 능력 게이트 %s"
+                  % ("등록(조건 충족)" if _cap_ok else "보류"))
         if fixed:
             shown = "; ".join(fixed[:6]) + (" …+%d" % (len(fixed) - 6) if len(fixed) > 6 else "")
             detail += " · " + shown
@@ -4616,6 +4725,73 @@ class Preflight:
     #  kept-drift로 제자리 보존·기한 검사 제외는 C68 참조.)
     # 체크 목록 '마지막' 고정: 같은 런의 --fix(repair_via_init_pack)가 남긴 신규 원장까지
     # 이 런에서 보여야 한다. 읽기 전용(report 병렬 안전)·WARN(READY 미차단).
+    def c82_gate_corpus_drift(self):
+        """C82(WP-1 H-2 · CONTRACTS §C) — 첫기동 관문 코퍼스가 **어느 claude 에서 실측됐는지**와
+        지금 설치된 claude 버전의 어긋남을 드러낸다. WARN-only(부트 비치명).
+
+        판정 3갈래를 **섞지 않는다**:
+          · 동사 부재(구 바이너리) → SKIP. '드리프트 없음'이 아니라 **잴 수 없음**이다.
+          · `measured_on` == `claude --version` → PASS.
+          · 다름 → WARN(핀을 자동으로 올리지 않는다 — 재핀은 6관문 실측 뒤 사람의 결정이다).
+        측정 시각을 detail 에 함께 적는다(계수·sha 는 언제 잰 것인지 없으면 현재로 오독된다).
+        """
+        cid = "C82.gate-corpus-drift"
+        if self.skipped(cid):
+            return
+        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
+        if not cys:
+            self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가")
+            return
+        try:
+            r = subprocess.run([cys, "gate-corpus", "--json"], capture_output=True,
+                               text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.add(cid, SKIP, "cys gate-corpus 호출 불가(%s)" % e)
+            return
+        blob = (r.stdout or "") + (r.stderr or "")
+        if r.returncode != 0:
+            # clap 은 미지 서브커맨드에 rc≠0 + usage 를 낸다 — 구 바이너리의 서명이다.
+            self.add(cid, SKIP,
+                     "`cys gate-corpus` 동사 부재(구 바이너리 · rc=%d) — 코퍼스 드리프트를 "
+                     "잴 수 없다(SKIP 은 '드리프트 없음'이 아니다)" % r.returncode)
+            return
+        try:
+            doc = json.loads(r.stdout or "{}")
+        except ValueError:
+            self.add(cid, WARN, "cys gate-corpus --json 응답이 JSON 이 아니다: %s" % blob[:160])
+            return
+        measured = doc.get("measured_on") if isinstance(doc, dict) else None
+        gates = doc.get("gates") if isinstance(doc, dict) else None
+        n_gates = len(gates) if isinstance(gates, list) else 0
+        if not isinstance(measured, str) or not measured.strip():
+            self.add(cid, WARN, "gate-corpus 응답에 measured_on 이 없다(관문 %d) — 판정 불가" % n_gates)
+            return
+        live = None
+        claude = shutil.which("claude")
+        if claude:
+            try:
+                v = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=20)
+                if v.returncode == 0:
+                    m = re.search(r"\d+\.\d+\.\d+", v.stdout or "")
+                    live = m.group(0) if m else (v.stdout or "").strip()
+            except (OSError, subprocess.SubprocessError):
+                live = None
+        now = time.strftime("%Y-%m-%d %H:%M:%S%z")
+        if live is None:
+            self.add(cid, SKIP,
+                     "claude --version 조회 불가 — 코퍼스 measured_on=%s (관문 %d · 측정 %s)"
+                     % (measured, n_gates, now))
+            return
+        if live == measured.strip():
+            self.add(cid, PASS,
+                     "관문 코퍼스 실측 버전 일치(measured_on=%s · claude=%s · 관문 %d · 측정 %s)"
+                     % (measured, live, n_gates, now))
+            return
+        self.add(cid, WARN,
+                 "관문 코퍼스 드리프트 — measured_on=%s 인데 설치된 claude=%s (관문 %d · 측정 %s). "
+                 "위젯 서명으로 핀을 우회하지 마라(§8): 6관문을 실측한 뒤에만 재핀한다"
+                 % (measured, live, n_gates, now))
+
     def c62_pack_heal_ledger(self):
         cid = "C62.pack-heal-ledger"
         if self.skipped(cid):
@@ -5899,6 +6075,9 @@ class Preflight:
             # Windows 에는 코드서명 봉인(C76)이 없어 이 체크가 유일한 변조 탐지다.
             # 번호 규율: C63·C64 는 결번 재사용 금지라 다음 자유 번호는 C80(§5-4).
             self.c80_runtime_seal,
+            # C82(0.14.31 WP-1 H-2 · Pack 레인 소유) — 관문 코퍼스 실측 버전 드리프트.
+            # WARN-only · 마지막 고정 슬롯(C62·C68) **앞**(§5-4 배선 규율).
+            self.c82_gate_corpus_drift,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
@@ -8507,6 +8686,65 @@ def _self_test():
         check("state dir: unix 소켓은 dirname 그대로(부모 부재에도 폴백 0) · 미기록 = ~/.local/state/cys-dept-<name>(cys-dept 규약)",
               _dept_state_dir("d", "/nonexistent/parent/cys.sock", os_name="posix") == "/nonexistent/parent"
               and _dept_state_dir("d", None, os_name="posix").endswith(os.path.join(".local", "state", "cys-dept-d")))
+        # ── WP-3 A(0.14.31) 능력 게이트 등록 · C82 — 순수 판정·정적 계약 핀 ──
+        print("-- WP-3 A capgate --")
+        _mk = CSO_DIRECTIVE_REV_MARKER
+        check("표지 판정은 **정확 행 등가**다 — 첫 20행 안의 단독 행만 신판(산문 인용·21행째·부재는 아니다)",
+              capgate_marker_ok("# t\n%s\n본문" % _mk)
+              and capgate_marker_ok("  %s  " % _mk)
+              and not capgate_marker_ok("표지 %s 를 확인하라" % _mk)
+              and not capgate_marker_ok("\n" * 20 + _mk)
+              and not capgate_marker_ok("# t\n본문") and not capgate_marker_ok(None))
+        check("alert_route 판정은 **정확히 True** 만 — 결측·false·비-bool·비-object 는 전부 미지원",
+              capgate_alert_route_enabled({"alert_route": {"enabled": True}})
+              and not capgate_alert_route_enabled({"alert_route": {"enabled": False}})
+              and not capgate_alert_route_enabled({"alert_route": {"enabled": 1}})
+              and not capgate_alert_route_enabled({"alert_route": {}})
+              and not capgate_alert_route_enabled({"alert_route": True})
+              and not capgate_alert_route_enabled({}) and not capgate_alert_route_enabled(None))
+        _good = {"alert_route": {"enabled": True, "routed_1h": 0, "suppressed_1h": 0, "pending": 0}}
+        _ok, _why = capgate_registration_verdict(_good, "# t\n%s\n" % _mk)
+        check("등록 조건 둘 다 참 → 등록", _ok)
+        _ok2, _why2 = capgate_registration_verdict({}, "# t\n%s\n" % _mk)
+        _ok3, _why3 = capgate_registration_verdict(_good, "# t\n구판\n")
+        _ok4, _why4 = capgate_registration_verdict({}, "# t\n구판\n")
+        check("조건 하나라도 거짓 → 등록 보류 + 사유에 **어느 조건인지** 적는다(구 데몬/구 지침 구분)",
+              not _ok2 and "alert_route" in _why2 and "표지" not in _why2
+              and not _ok3 and "표지" in _why3 and "alert_route" not in _why3
+              and not _ok4 and "alert_route" in _why4 and "표지" in _why4)
+        c28_src = _pin_src(Preflight.c28_self_correction)
+        check("capgate 는 SELFCORR_HOOKS(항상 등록)에 **없다** — 조건부 목록으로만 등록된다",
+              CAPGATE_HOOK[0] not in [n for n, _ in SELFCORR_HOOKS]
+              and CAPGATE_HOOK == ("role-capability-gate.sh", [("PreToolUse", None)]))
+        check("실재 검사는 조건과 무관(파일 결손은 언제나 사실) · 등록 루프만 조건부",
+              "rels.append(os.path.join(\"hooks\", CAPGATE_HOOK[0]))" in c28_src
+              and "_reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])" in c28_src
+              and "for script_name, events in _reg_hooks:" in c28_src
+              and "for script_name, events in SELFCORR_HOOKS:" not in c28_src)
+        check("조건 미충족은 **WARN 1줄**이지 침묵이 아니다(WARN 부재를 '등록됨' 으로 읽지 못하게)",
+              "등록 보류" in c28_src and "warns.append" in c28_src.split("_cap_ok, _cap_why")[1][:400])
+        gate_src = _pin_src(Preflight._capgate_gate)
+        check("_capgate_gate 는 읽기 전용(status --json 조회 + 지침 판독) · self.fix 분기 0",
+              "self.fix" not in gate_src and '"status", "--json"' in gate_src
+              and "_read_text_tolerant(" in gate_src)
+        check("_capgate_gate: cys 부재·판독 불가는 **미등록**(판정 불능을 등록으로 접지 않는다)",
+              "판정 불가(판정 불능은 미등록이다)" in gate_src and "판독 불가" in gate_src)
+        check("능력 게이트 훅 선언 timeout(전 도구 훅의 바깥 겹)",
+              HOOK_TIMEOUT_S.get(("role-capability-gate.sh", "PreToolUse")) == 15)
+        c82_src = _pin_src(Preflight.c82_gate_corpus_drift)
+        check("C82 는 FAIL 을 내지 않는다(WARN-only · 부트 비치명)", "self.add(cid, FAIL" not in c82_src)
+        check("C82 동사 부재(rc≠0)·claude 조회 불가는 SKIP 이고 그 SKIP 이 '드리프트 없음'이 아님을 문면에 적는다",
+              "구 바이너리" in c82_src and "'드리프트 없음'이 아니다" in c82_src
+              and "self.add(cid, SKIP" in c82_src)
+        check("C82 는 재핀하지 않는다 — 드리프트는 WARN 이고 §8(위젯 서명 우회 금지)을 문면에 싣는다",
+              "재핀한다" in c82_src and "우회하지 마라" in c82_src)
+        check("C82 detail 에 **측정 시각**을 병기한다(계수·sha 측정 시각 규율)",
+              'time.strftime(' in c82_src and "측정 %s" in c82_src)
+        check("C82 는 읽기 전용(자동 수리 0)", "--fix" not in c82_src and "self.repair" not in c82_src)
+        run_src2 = _pin_src(Preflight.run)
+        check("C82 run() 배선(마지막 고정 슬롯 C62 앞)",
+              "c82_gate_corpus_drift" in run_src2
+              and run_src2.index("c82_gate_corpus_drift") < run_src2.index("c62_pack_heal_ledger"))
     except Exception as e:
         # ★R7(리뷰 claude minor): 핀 표현식 하나가 예외로 죽어도 **결과 줄은 반드시 낸다** — 종전엔 트레이스백이
         #   self-test 전체를 삼켜 나머지 핀의 상태가 가려졌다(회귀 진단이 트레이스백 1개로 축소).

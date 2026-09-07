@@ -103,12 +103,33 @@ HOOKS = {
         "timeout": 20,
         "why": "brief-lint-warn(PostToolUse) — 인세션 위임 브리프 경고 주입(fail-open)",
     },
+    # ★WP-3 A(0.14.31) 역할 능력 게이트. matcher 는 **없다**(전 도구) — 도구 이름 deny 목록
+    #   (CronCreate·Monitor·Agent·WebSearch·mcp__computer-use__* …)과 `tool_calls` 예산이
+    #   Bash 밖 도구까지 봐야 하기 때문이다. 역할 판정은 훅 자신이 데몬 권위(`cys surface-role`)로
+    #   하므로 **프로필 경계로 대상을 좁히지 않는다**(전 프로필 eligibility=allow): 공용 프로필
+    #   `~/.cys/claude` 하나를 CSO·워커·리뷰어가 함께 쓰는 실측 형상에서 프로필 단위 배제는
+    #   격리가 아니라 누락이 된다(hook-targets 표 _README (c) 참조).
+    "capgate": {
+        "event": "PreToolUse",
+        "script": "hooks/role-capability-gate.sh",
+        "master_allowed": True,
+        "timeout": 15,        # javis_preflight.HOOK_TIMEOUT_S 와 같은 값(축 1지점)
+        "why": "role-capability-gate(PreToolUse) — 역할 능력 경계 집행(CSO §1-1 · reviewer producer≠evaluator)",
+    },
 }
 MASTER_PROFILE_BASENAMES = (".claude",)   # ★폴백 전용 — 표 부재 시에만 쓰인다(E3-1)
 
 # 훅 키 → 대상표 eligibility 필드. 두 집합은 **다르다**(계약 §2): 파일을 합치는 것과 판정을
 # 합치는 것은 다르고, 합치면 master pane 의 Stop 체인에 검증 블록이 걸린다(D5 경고).
-HOOK_ELIGIBILITY_KEY = {"stop": "guard_stop", "brief-warn": "brief_warn"}
+HOOK_ELIGIBILITY_KEY = {"stop": "guard_stop", "brief-warn": "brief_warn",
+                        "capgate": "capgate"}
+# ★표 스키마의 **필수** eligibility 키는 legacy 둘로 고정한다(0.14.31).
+#   이유: 검증기가 `HOOK_ELIGIBILITY_KEY.values()` 전부를 요구하면, 운영자가 이미 설치한
+#   `hook-targets.json`(capgate 키 없음)이 통째로 **손상** 판정이 되어 exit 2 · 쓰기 0 이 되고
+#   stop·brief-warn 등록까지 함께 죽는다. 새 키는 **선택**이고 부재는 아래 기본값으로 읽는다 —
+#   표를 늘리는 일이 기존 배선을 깨뜨리지 않게 하는 것이 이 분리의 전부다.
+REQUIRED_ELIGIBILITY_KEYS = ("guard_stop", "brief_warn")
+ELIGIBILITY_DEFAULT = {"capgate": "allow"}
 TARGETS_REL = os.path.join("state", "hook-targets.json")
 TARGETS_EXAMPLE_SUFFIX = ".example"   # ★E4-1: 배포 실물 = <표>.example (폴백 표)
 
@@ -174,11 +195,15 @@ def _load_targets(path):
         elig = ent.get("eligibility")
         if not isinstance(elig, dict):
             return None, "%s: eligibility 누락/형식 오류" % ent.get("basename")
-        for k in HOOK_ELIGIBILITY_KEY.values():
+        for k in REQUIRED_ELIGIBILITY_KEYS:
             v = elig.get(k)
             if v not in ("allow", "deny"):
                 return None, "%s: eligibility.%s=%r (allow|deny 기대)" % (
                     ent.get("basename"), k, v)
+        for k, _dflt in ELIGIBILITY_DEFAULT.items():
+            if k in elig and elig[k] not in ("allow", "deny"):
+                return None, "%s: eligibility.%s=%r (allow|deny 기대)" % (
+                    ent.get("basename"), k, elig[k])
         if ent["basename"] in index:
             return None, "basename 중복: %s(판정이 둘로 갈린다)" % ent["basename"]
         index[ent["basename"]] = ent
@@ -209,7 +234,11 @@ def _decide(table, base, hook_key, spec, force_master, force_unknown):
                            "--force-unknown" % (base, table["path"]))
         return True, ("표 밖 프로필 — %s" % ("--force-unknown 우회"
                                              if force_unknown else "policy=allow"))
-    verdict = ent["eligibility"][HOOK_ELIGIBILITY_KEY[hook_key]]
+    _ekey = HOOK_ELIGIBILITY_KEY[hook_key]
+    verdict = ent["eligibility"].get(_ekey, ELIGIBILITY_DEFAULT.get(_ekey))
+    if verdict is None:
+        return False, ("역할 경계: %s 의 대상표 항목에 eligibility.%s 가 없고 기본값도 없다"
+                       % (base, _ekey))
     if verdict == "deny" and not force_master:
         return False, ("역할 경계: %s 는 대상표에서 %s=deny 다 — 역할 %s · 근거 %s. "
                        "의도했다면 --force-master"
@@ -224,7 +253,7 @@ def _table_eligible(table, hook_key):
     """표에서 이 훅이 allow 인 프로필 항목 목록(사전순 — 파생표 3개의 공용 파생원)."""
     key = HOOK_ELIGIBILITY_KEY[hook_key]
     return [e for _b, e in sorted(table["index"].items())
-            if e["eligibility"][key] == "allow"]
+            if e["eligibility"].get(key, ELIGIBILITY_DEFAULT.get(key)) == "allow"]
 
 
 def _now_tag():
@@ -1035,6 +1064,38 @@ def self_test():
         rc, rows, _c, _s = process([live3], "stop", True, False, pack, out=buf)
         chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
             "⑱ 운영 표 존재 시에도 손상 예시표가 판정을 오염시킴: rc=%s" % rc)
+        # ── ⑲ WP-3 A capgate(0.14.31): 전 프로필 등록 · 구 표 하위호환 · matcher 없음 ──
+        mktable(tbl_doc)          # capgate 키가 **없는** 종전 표(운영자 설치본 형상)
+        buf = io.StringIO()
+        rc, rows, cmd, spec = process([live3, wdir], "capgate", False, False, pack, out=buf)
+        chk(rc == EXIT_OK and all(r["action"] != "REFUSED" for r in rows),
+            "⑲ capgate 키 없는 구 표가 손상/거부로 판정됨: rc=%s rows=%s"
+            % (rc, [r["action"] for r in rows]))
+        chk(spec["event"] == "PreToolUse" and "matcher" not in spec,
+            "⑲ capgate 는 PreToolUse · matcher 없음(전 도구)이어야 한다: %r" % spec)
+        chk(spec.get("timeout") == 15, "⑲ capgate timeout 선언 15 아님: %r" % spec.get("timeout"))
+        chk("role-capability-gate.sh" in cmd, "⑲ capgate command 문자열에 훅 실물이 없다: %s" % cmd)
+        # master 프로필(.claude-3)도 대상이다 — 역할 판정은 훅 자신이 데몬 권위로 한다.
+        chk(any(r["profile"] == ".claude-3" and r["action"] != "REFUSED" for r in rows),
+            "⑲ master 프로필이 capgate 대상에서 빠짐: %s" % rows)
+        # 표에 capgate=deny 를 명시하면 그것은 존중한다(기본값은 부재일 때만).
+        denydoc = json.loads(json.dumps(tbl_doc))
+        for e in denydoc["profiles"]:
+            if e["basename"] == ".claude-3":
+                e["eligibility"]["capgate"] = "deny"
+        mktable(denydoc)
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf)
+        chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
+            "⑲ 표의 명시 capgate=deny 가 무시됨: rc=%s %s" % (rc, rows))
+        # 잘못된 값은 손상이다(선택 키라도 형식은 검사한다).
+        baddoc = json.loads(json.dumps(tbl_doc))
+        baddoc["profiles"][0]["eligibility"]["capgate"] = "maybe"
+        mktable(baddoc)
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "stop", False, False, pack, out=buf)
+        chk(rc == EXIT_ARGS and rows == [], "⑲ capgate 값 오류가 손상으로 잡히지 않음: rc=%s" % rc)
+        mktable(tbl_doc)
         os.remove(expath)
 
     if fails:
@@ -1052,7 +1113,9 @@ def self_test():
           "--from-table 파생·CLI 경로 재확인"
           " · E4-1(R-04 배포 기본값) 예시표 폴백: `.example` 만 있는 install 직후 상태에서 "
           ".claude-3+stop REFUSED(기계 방어 생존)·폴백 출처+cp 설치 안내 고지·워커 프로필 "
-          "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선")
+          "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선"
+          " · ⑲ capgate(0.14.31): 구 표 하위호환(키 부재=allow)·전 프로필(master 포함)·"
+          "PreToolUse matcher 없음·timeout 15·명시 deny 존중·값 오류는 손상")
     return 0
 
 

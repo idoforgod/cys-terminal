@@ -24,6 +24,10 @@
   "     (deny-by-default — 새 프로필이 조용히 대상이 되는 경로를 닫는다).",
   "  3) C73(guard 훅 무결성)·C74(경고 훅 배선) 판정 대상도 이 표에서 파생한다 —",
   "     세 표가 다시 갈라지지 않게 **파생원을 하나로** 만든다.",
+  "  4) ★0.14.31 신설 `capgate`(role-capability-gate · PreToolUse): eligibility 키는 **선택**이고",
+  "     부재 시 기본 allow 다 — 이 키가 없는 기존 운영 표를 손상으로 만들지 않기 위해서다",
+  "     (그렇게 하면 stop·brief-warn 등록까지 함께 죽는다). 전 프로필 allow 인 이유는 역할 판정을",
+  "     훅 자신이 데몬 권위로 하기 때문이다 — 프로필 단위 배제는 공용 프로필(c)에서 격리가 아니라 누락이다.",
   "되돌리는 법: 이 파일을 지우면 종전(코드 하드코딩) 판정으로 돌아간다.",
   "손상 시: 도구는 폴백하지 않고 exit 2 + 쓰기 0 으로 멈춘다(침묵 폴백 금지 · 계약 §5).",
   "",
@@ -60,7 +64,7 @@
    "basename": ".claude",
    "path": "~/.claude",
    "role": "master(기본 dotdir — 전용 dotdir 없이 ~/.claude 사용)",
-   "eligibility": {"guard_stop": "deny", "brief_warn": "allow"},
+   "eligibility": {"guard_stop": "deny", "brief_warn": "allow", "capgate": "allow"},
    "why": "위임을 만드는 쪽이라 경고 훅은 필요하지만, Stop 검증 블록이 걸리면 master 회신이 막힌다(조건 24② 비워커 반려 대상).",
    "measured": "hook-census §1-1 · Stop 3단(save-state→reflect-scan→grill-stop)"
   },
@@ -68,7 +72,7 @@
    "basename": ".claude-3",
    "path": "~/.claude-3",
    "role": "master(★라이브 실측 — 현재 master 세션의 실제 CLAUDE_CONFIG_DIR)",
-   "eligibility": {"guard_stop": "deny", "brief_warn": "allow"},
+   "eligibility": {"guard_stop": "deny", "brief_warn": "allow", "capgate": "allow"},
    "why": "★R-04(a)(b) 핵심 행. 종전 하드코딩은 이 프로필을 몰라서 guard 등록을 거부하지 못했고(오인 등록 시 실제 master Stop 체인에 블록), 경고 훅 대상에서도 빠져 조건 11 흡수가 실제 master 에 도달하지 못했다.",
    "measured": "hook-census §0-2 ps 실측(pid 27739·45789·50421) · §1-3 Stop 4단(+state-staleness)"
   },
@@ -76,7 +80,7 @@
    "basename": ".claude-worker",
    "path": "~/.claude-worker",
    "role": "worker(수동 프로필 — 워커 별칭 · 발행 제네릭화 basename)",
-   "eligibility": {"guard_stop": "allow", "brief_warn": "allow"},
+   "eligibility": {"guard_stop": "allow", "brief_warn": "allow", "capgate": "allow"},
    "why": "워커 전용 프로필. guard 1차 카나리아 대상.",
    "measured": "hook-census §1-2 · Stop 4단(+state-staleness) · pid 50627"
   },
@@ -84,7 +88,7 @@
    "basename": "claude",
    "path": "~/.cys/claude",
    "role": "worker(★cys 함대 공용 — launch-agent 로 뜨는 **모든** claude 노드가 공유)",
-   "eligibility": {"guard_stop": "allow", "brief_warn": "allow"},
+   "eligibility": {"guard_stop": "allow", "brief_warn": "allow", "capgate": "allow"},
    "why": "★R-04(c). '워커 2프로필'이라는 문면과 달리 이 파일 1개를 CSO·워커·리뷰어 노드가 **전부 공유**한다. 따라서 프로필 등록은 격리가 아니며, 실제 격리는 pane 단위 env(CYS_COMPLETION_GUARD=1)뿐이다(조건 37). OT-2 승인문은 '워커 2프로필'이 아니라 '워커 수동 프로필 + cys 함대 공용 프로필(전 역할 동거)'로 읽혀야 한다 — 오너가 승인하는 대상이 달라진다.",
    "measured": "hook-census §0-2 agents.json env 주입 · §1-6 · pid 39432·39616·40202",
    "basename_note": "dotdir 가 아니라 `~/.cys/claude` 이므로 basename 은 'claude' 다(선행 점 없음) — basename 문자열 일치 판정 시 `.claude` 와 혼동 금지."
@@ -93,7 +97,7 @@
    "basename": ".claude-2",
    "path": "~/.claude-2",
    "role": "unclear(도달 경로 모호 — zsh alias 가 함수보다 먼저 전개돼 실제로는 ~/.claude-worker 로 감)",
-   "eligibility": {"guard_stop": "deny", "brief_warn": "deny"},
+   "eligibility": {"guard_stop": "deny", "brief_warn": "deny", "capgate": "allow"},
    "why": "누가 어떤 역할로 쓰는지 실측으로 확정되지 않았다. 모호한 대상은 등록하지 않는다(deny-by-default).",
    "measured": "hook-census §0-3 충돌 · §1-4"
   },
@@ -101,7 +105,7 @@
    "basename": ".claude-dept",
    "path": "~/.claude-dept",
    "role": "dept 발행 전용",
-   "eligibility": {"guard_stop": "deny", "brief_warn": "deny"},
+   "eligibility": {"guard_stop": "deny", "brief_warn": "deny", "capgate": "allow"},
    "why": "Phase 1 범위(워커 검증·위임 경고) 밖. statusLine 이 다른 팩(pack-dept-dept-1)을 가리키는 특수 프로필이라 부작용 표면이 다르다.",
    "measured": "hook-census §1-5"
   }
