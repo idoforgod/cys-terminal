@@ -3921,6 +3921,16 @@ class Preflight:
         """
         cys = shutil.which("cys") or os.environ.get("CYS_BIN")
         status = None
+        # ★데몬이 **실재할 때만** 묻는다(R1 · H-SEED-2 크래시 실측): 이 축은 실제 `cys` 를 띄우고,
+        #   그 바이너리는 자기 HOME 아래에 팩·상태를 부트스트랩한다. HOME 이 임시 디렉터리인
+        #   문맥(검체·격리 실행)에서는 그 부수효과가 남의 임시 트리를 채우며 정리와 **경합**한다
+        #   (`Directory not empty: <tmp>/home/.cys/pack/skills`). 소켓이 없으면 물을 데도 없으므로
+        #   '판정 불능 = 미등록' 이다 — 이 축을 위해 데몬을 **깨우지 않는다**(preflight 는 관측이다).
+        _sock = os.environ.get("CYS_SOCKET") or (
+            None if os.name == "nt" else os.path.join(_hub_state_dir() or "", "cys.sock"))
+        if _sock and not os.path.exists(_sock):
+            return False, ("데몬 소켓 미실재(%s) — alert_route 판정 불가"
+                           "(판정 불능은 미등록이다 · 이 축은 데몬을 깨우지 않는다)" % _sock)
         if cys:
             try:
                 # ★부트 창 예산(R1 minor): 이 축은 WARN-only 이고 데몬이 기동 중이면 상한까지
@@ -8818,6 +8828,10 @@ def _self_test():
               and "_read_text_tolerant(" in gate_src)
         check("_capgate_gate: cys 부재·판독 불가는 **미등록**(판정 불능을 등록으로 접지 않는다)",
               "판정 불가(판정 불능은 미등록이다)" in gate_src and "판독 불가" in gate_src)
+        check("_capgate_gate 는 데몬을 **깨우지 않는다** — 소켓 미실재면 조회 전에 미등록(R1 · "
+              "임시 HOME 문맥에서 팩 부트스트랩 부수효과가 정리와 경합하던 것)",
+              "소켓 미실재" in gate_src and "os.path.exists(_sock)" in gate_src
+              and gate_src.index("_sock") < gate_src.index('"status", "--json"'))
         check("능력 게이트 훅 선언 timeout(전 도구 훅의 바깥 겹)",
               HOOK_TIMEOUT_S.get(("role-capability-gate.sh", "PreToolUse")) == 15)
         c82_src = _pin_src(Preflight.c82_gate_corpus_drift)

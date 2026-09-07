@@ -217,6 +217,23 @@ class HookRoleResolution(_HookEnv):
         self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
         self.assertIn("surface-role", self.calls_log(), "만료 캐시를 그대로 썼다")
 
+    def test_failed_query_backs_off(self):
+        """★조회 실패는 **짧게 기억**한다 — 데몬 무응답이 도구 호출마다 데드라인을 무는
+        전 좌석 폭풍(봉인표 ④ 방향)이 되지 않게."""
+        self.fake_cys(role="", rc=3)          # 조회 실패
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        n1 = len(self.calls_log().splitlines())
+        self.assertGreaterEqual(n1, 1, "첫 호출은 조회해야 한다")
+        for _ in range(3):
+            self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        self.assertEqual(len(self.calls_log().splitlines()), n1,
+                         "실패 백오프 창 안에서 재조회했다(폭주): %s" % self.calls_log())
+        # 백오프 표시를 지우면 다시 조회한다(영구 차단이 아니다).
+        (self.cache_path().parent / (self.cache_path().name + ".fail")).unlink()
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        self.assertGreater(len(self.calls_log().splitlines()), n1,
+                           "백오프 표시 제거 뒤에도 조회하지 않는다(영구 정지)")
+
     def test_ambiguous_candidates_intersect(self):
         """★조회 실패 + 캐시(reviewer)와 env(cso) 불일치 → **두 정책 모두** 적용한다."""
         self.fake_cys(role="", rc=3)          # 조회 실패
@@ -364,6 +381,25 @@ class NegativeControls(unittest.TestCase):
         ("주석 제거(단어 시작 `#`)",
          '        if ch == "#" and at_word_start:',
          '        if ch == "#" and at_word_start and False:'),
+        # ★R1-2(codex 위임 검체에서 나온 실증 우회) — 셸이 실행하는 것과 판정기가 보는 것의 차이
+        ("줄 이어붙이기(`\\`+개행) 제거",
+         '            if ch in ("\\n", "\\r"):\n'
+         '                if out and out[-1] == "\\\\":\n'
+         "                    out.pop()\n"
+         "                esc = False\n"
+         "                i += 1\n"
+         "                continue\n",
+         ""),
+        ("영폭 문자 거부", "    if has_invisible(command):\n        return None\n", ""),
+        ("변수 확장 게이트",
+         '        if "$" in str(t) and _resolve_pack_token(t, ctx) is None:',
+         "        if False:"),
+        ("중괄호 확장 게이트",
+         '            if "," in inner and not inner.strip().startswith(\'"\'):',
+         "            if False:"),
+        ("옵션 종료 `--` 처리",
+         '    args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args',
+         "    args = raw_args"),
     ]
 
     @NEED_SH

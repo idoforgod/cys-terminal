@@ -82,6 +82,7 @@
 capgate_slug() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || printf 'x'; }
 
 CAPGATE_CACHE_TTL="${CAPGATE_CACHE_TTL:-15}"   # 초 · 승계 반영 지연의 상한(명시적 수용)
+CAPGATE_QUERY_BACKOFF="${CAPGATE_QUERY_BACKOFF:-5}"   # 초 · 조회 실패 후 재조회 유예(폭주 차단)
 
 capgate_cache_write() {   # `<epoch> <역할|->` 1줄 · 0600 · 같은 디렉터리 원자 교체
   [ -n "${CYS_SURFACE_ID:-}" ] || return 0
@@ -146,24 +147,47 @@ capgate_resolve_role() {
      && { [ "$_cg_cached_none" = "1" ] || [ -n "$_cg_cached" ]; } \
      && ! capgate_gated_role "$_cg_cached"; then
     CYS_SURFACE_ROLE_RESOLVED="$_cg_cached"
-    CAPGATE_ROLE_SOURCE="cache"
+    if [ "$_cg_cached_none" = "1" ]; then
+      # 캐시된 **권위 있는 '역할 없음'** — env 의 옛 값이 살아남지 않게 출처를 남긴다
+      # (그러지 않으면 역할이 풀린 뒤에도 env 잔재가 게이트를 계속 건다).
+      CAPGATE_ROLE_SOURCE="cache-none"
+    else
+      CAPGATE_ROLE_SOURCE="cache"
+    fi
     return 0
   fi
   # ②데몬 권위 조회(데드라인 2s — `cys_timeout_run` 3단: timeout→gtimeout→CYS_PY 프로세스그룹).
-  if command -v cys >/dev/null 2>&1; then
+  #   ★조회 실패 백오프(R1): 데몬이 죽거나 응답이 없으면 **모든 좌석이 도구 호출마다** 2s 를
+  #     내는 폭풍이 된다(리뷰어 실측 우려 · 봉인표 ④ 방향). 실패를 짧게 기억해 그 창 동안은
+  #     곧장 폴백으로 간다 — 폴백의 답은 어차피 그 조회가 줄 답과 같다(정지만 없앤다).
+  _cg_failmark="$CAPGATE_CACHE.fail"
+  _cg_skip_query=0
+  if [ -f "$_cg_failmark" ]; then
+    _cg_fts="$(head -n1 "$_cg_failmark" 2>/dev/null)"
+    case "$_cg_fts" in ''|*[!0-9]*) _cg_fts=0 ;; esac
+    if [ "$_cg_now" -gt 0 ] && [ "$_cg_fts" -gt 0 ] && [ "$_cg_fts" -le "$_cg_now" ] \
+       && [ $(( _cg_now - _cg_fts )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
+      _cg_skip_query=1
+    fi
+  fi
+  if [ "$_cg_skip_query" = "0" ] && command -v cys >/dev/null 2>&1; then
     _cg_out="$(cys_timeout_run 2 cys surface-role 2>/dev/null)"; _cg_rc=$?
     _cg_role="$(printf '%s' "$_cg_out" | head -n1 | tr -d '\r')"
     if [ "$_cg_rc" -eq 0 ] && [ -n "$_cg_role" ]; then
       CYS_SURFACE_ROLE_RESOLVED="$_cg_role"; CAPGATE_ROLE_SOURCE="daemon"
       capgate_cache_write "$_cg_now" "$_cg_role"
+      rm -f "$_cg_failmark" 2>/dev/null || :
       return 0
     fi
     # ★권위 있는 **역할 없음**(rc 0 · 빈 줄)도 사실이다 — `-` 로 캐시한다(옛 대상 캐시는 덮인다).
     if [ "$_cg_rc" -eq 0 ] && [ -z "$_cg_role" ]; then
       capgate_cache_write "$_cg_now" "-"
+      rm -f "$_cg_failmark" 2>/dev/null || :
       CAPGATE_ROLE_SOURCE="daemon-none"
       return 0
     fi
+    # 조회 실패 — 백오프 표시(같은 창의 다음 호출은 곧장 폴백으로 간다)
+    ( umask 077; printf '%s\n' "$_cg_now" > "$_cg_failmark" ) 2>/dev/null || :
   fi
   # ③조회 실패 — 후보가 **갈리면 둘 다** 적용한다(정책 교집합 · codex R1).
   #   "게이트 대상을 먼저" 는 틀린 규칙이다: reviewer 와 CSO 의 허용 집합은 포함 관계가 아니라
@@ -222,7 +246,7 @@ else
     capgate_resolve_role
     if [ -n "$CYS_SURFACE_ROLE_RESOLVED" ]; then
       CYS_SURFACE_ROLE="$CYS_SURFACE_ROLE_RESOLVED"
-    elif [ "$CAPGATE_ROLE_SOURCE" = "daemon-none" ]; then
+    elif [ "$CAPGATE_ROLE_SOURCE" = "daemon-none" ] || [ "$CAPGATE_ROLE_SOURCE" = "cache-none" ]; then
       CYS_SURFACE_ROLE=""
     fi
   fi
@@ -622,6 +646,15 @@ def split_unquoted_newlines(command):
     while i < n:
         ch = command[i]
         if esc:
+            # ★줄 이어붙이기: `\`+개행은 셸이 **둘 다 지운다**(단어가 이어붙는다).
+            #   그대로 흘리면 판정기는 `--f⏎ix` 를 두 조각으로 보고 bash 는 `--fix` 를 실행한다
+            #   (codex R1 반례: `--f\⏎ix` 로 승인 없는 변이 플래그가 통과했다).
+            if ch in ("\n", "\r"):
+                if out and out[-1] == "\\":
+                    out.pop()
+                esc = False
+                i += 1
+                continue
             out.append(ch)
             esc = False
             at_word_start = False
@@ -665,10 +698,24 @@ def split_unquoted_newlines(command):
     return "".join(out)
 
 
+ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad")
+
+
+def has_invisible(command):
+    """영폭·비가시 문자를 포함하는가."""
+    return any(z in (command or "") for z in ZERO_WIDTH_CHARS)
+
+
 def _tokenize(command):
-    """셸 토큰 목록. 파싱 실패는 None(호출측이 fail-closed 로 읽는다)."""
-    for zw in ("\u200b", "\u200c", "\u200d", "\ufeff"):
-        command = command.replace(zw, "")
+    """셸 토큰 목록. 파싱 실패는 None(호출측이 fail-closed 로 읽는다).
+
+    ★영폭 문자를 **지우지 않는다**(R1 · codex 실증): 지우면 판정기가 보는 명령과 셸이 실행하는
+      명령이 달라진다 — `mast<U+200B>er` 를 지워 `master` 로 읽으면 수신자 경계가 무너지고,
+      `/w/pa<U+200B>ck/bin/x.py` 를 설치 팩으로 인정하면 동명 사본이 판정 도구가 된다.
+      해석이 갈리는 입력은 **거부**다(아는 것만 통과).
+    """
+    if has_invisible(command):
+        return None
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -951,7 +998,7 @@ def todo_cap_verdict(tool, ti, path, ctx):
 
 
 # ── CSO Bash 접두 판정(allowlist) ────────────────────────────────────────────
-def cso_split(command):
+def cso_split(command, ctx=None):
     """(segments, redirect_targets, err). err 가 있으면 deny 사유다.
 
     허용 구두점은 세그먼트 경계(`;` `&&` `||` `|` `(` `)`)와 출력 리다이렉트뿐이다.
@@ -962,9 +1009,30 @@ def cso_split(command):
         if m in command:
             return None, None, ("명령 치환·프로세스 치환(%s)은 게이트가 안을 볼 수 없다 — "
                                 "값을 먼저 구해 인자로 넣어라" % m)
+    ctx = Ctx() if ctx is None else ctx      # 변수 표기 해소에 문맥이 필요하다
+    if has_invisible(command):
+        return None, None, ("영폭·비가시 문자가 들어 있다 — 판정기가 보는 명령과 셸이 실행하는 "
+                            "명령이 달라질 수 있어 거부한다(지워서 읽지 않는다)")
     tokens = _tokenize(split_unquoted_newlines(command))
     if tokens is None:
         return None, None, "셸 파싱 불가(따옴표 불일치 등) — 해석 불가는 거부다"
+    # ★변수 확장은 **지침이 쓰는 유한한 표기**만 통과한다(R1 · codex 실증):
+    #   `${IFS}` 는 단어를 쪼개 새 인자를 만들고(`cys send --to master ${IFS}--surface${IFS}7`),
+    #   경로 안의 확장은 보호 파일명 검사를 통째로 비껴간다(`.../state/${IFS}mission.json`).
+    #   명령 치환과 같은 이유다: 값을 모르면 효과를 판정할 수 없다.
+    for t in tokens:
+        if "$" in str(t) and _resolve_pack_token(t, ctx) is None:
+            return None, None, ("변수 확장 `%s` 는 게이트가 값을 알 수 없다 — 허용 표기는 "
+                                "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` "
+                                "뿐이다(값을 먼저 구해 인자로 넣어라)" % t)
+    # 중괄호 확장은 **하나의 토큰이 여러 인자로 늘어난다** — 늘어난 인자를 판정하지 못한다.
+    for t in tokens:
+        st = str(t)
+        if "{" in st and "}" in st and "," in st and st.index("{") < st.rindex("}"):
+            inner = st[st.index("{") + 1:st.rindex("}")]
+            if "," in inner and not inner.strip().startswith('"'):
+                return None, None, ("중괄호 확장 `%s` 은 한 토큰이 여러 인자로 늘어난다 — "
+                                    "늘어난 인자를 판정할 수 없으므로 거부한다(풀어서 적어라)" % st)
     segs, cur, redirects = [], [], []
     i, n = 0, len(tokens)
     while i < n:
@@ -1080,10 +1148,14 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
       전체 raw_command 를 승인 검사에 넘겨, 접두 승인 의미론에서 `cys kill 12 ; cys kill 13`
       의 뒤 명령까지 첫 명령의 승인으로 통과했다.
     """
-    verb = next((t for t in tokens[1:] if not t.startswith("-")), None)
+    # ★`--` 뒤는 옵션이 아니라 **본문**이다(R1 · codex): 그것을 옵션으로 읽으면
+    #   `cys send --to master -- "--clear-first"` 같은 정상 보고가 막히고(오탐), 반대로
+    #   `cys send -- "--to=master"` 를 수신자 지정으로 오인한다(수신자 없는 send 통과).
+    raw_args = tokens[1:]
+    args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args
+    verb = next((t for t in args if not t.startswith("-")), None)
     if verb is None:
-        return False, "`cys` 동사 없음", False
-    args = tokens[1:]
+        return False, "`cys` 동사 없음(옵션 종료 `--` 뒤는 본문이다)", False
     if verb in CSO_CYS_DENY_VERBS:
         return False, ("`cys %s` 는 종결 없는 스트림이라 어떤 플래그로도 접두 밖이다"
                        "(TTL 승인 대상도 아니다 — 구독에는 예외가 없다)" % verb), False
@@ -1221,7 +1293,7 @@ def cso_bash_verdict(command, ti, ctx):
     if ctx.background or ti.get("run_in_background"):
         return True, ("백그라운드 실행(`run_in_background`)은 CSO 경계 밖이다 — "
                       "종결 없는 관측을 도구 필드로 요청하는 경로다"), False
-    segs, redirects, err = cso_split(command)
+    segs, redirects, err = cso_split(command, ctx)
     if err:
         return True, err, False
     for op, target in redirects:
@@ -2162,6 +2234,94 @@ def self_test_r1(fails):
         b, r = decide("Bash", {"command": cmd}, "reviewer-codex")
         if b:
             fails.append("R1[reviewer 오탐]: 정당한 검증 `%s` 가 막혔다 (%s)" % (cmd, r))
+
+    # ⑰ codex(gpt-6-astra) 적대 검체 — **셸이 실행하는 것과 판정기가 보는 것의 차이**.
+    #   초안은 codex 가 냈고(위임 · impl/codex/P2-WP3A-capgate-r1-tests.md) 워커가 전 행을 검토해
+    #   기대값을 확인한 뒤 채택했다. 이 12건은 채택 시점에 **실제로 뚫렸던** 것들이다.
+    codex_cases = [
+        # 줄 이어붙이기(`\`+개행)는 셸이 둘 다 지운다 — 조각으로 보면 금지 플래그가 사라진다.
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --f\\\nix"},
+         "줄 이어붙이기 뒤 --fix"),
+        ("deny", "Bash", {"command": "cys send --to master --clear-\\\nfirst x"},
+         "줄 이어붙이기 뒤 --clear-first"),
+        ("allow", "Bash", {"command": "cys queue cl\\\near 77"},
+         "줄 이어붙이기 뒤 queue clear 는 정상 청소"),
+        # 중괄호 확장은 한 토큰이 여러 인자로 늘어난다.
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --{fix,seed-trust}"},
+         "중괄호 확장"),
+        # 변수 확장은 값을 모르면 효과를 모른다(`${IFS}` 는 단어를 쪼갠다).
+        ("deny", "Bash", {"command": "cys send --to master ${IFS}--surface${IFS}7 x"},
+         "${IFS} 단어 분리로 만든 --surface"),
+        ("deny", "Bash", {"command": "cys status > /w/home/.cys/state/${IFS}mission.json"},
+         "${IFS} 로 보호 파일명 검사 우회"),
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py $'--f\\x69x'"},
+         "ANSI-C 인용으로 감춘 --fix"),
+        # 영폭 문자는 지우지 않고 거부한다(지우면 다른 명령을 판정하게 된다).
+        ("deny", "Bash", {"command": "cys send --to mast\u200ber x"}, "영폭 문자 수신자"),
+        ("deny", "Bash", {"command": "python3 /w/pa\u200bck/bin/javis_orchestra.py check"},
+         "영폭 문자 팩 경로"),
+        ("deny", "Bash", {"command": "cys status > /w/t\u200bmp/a"}, "영폭 문자 tmp 동형"),
+        # `--` 뒤는 본문이다(옵션으로 읽으면 오탐과 우회가 함께 생긴다).
+        ("deny", "Bash", {"command": "cys send -- '--to=master'"}, "옵션 종료 뒤 본문을 수신자로 오인"),
+        ("allow", "Bash", {"command": "cys send --to master -- '--to=worker'"},
+         "옵션 종료 뒤 본문은 수신자가 아니다"),
+        ("allow", "Bash", {"command": "cys send --to master -- '--clear-first'"},
+         "옵션 종료 뒤 본문의 금지 철자"),
+        # 리다이렉트 연산자 종류·경로 정규화.
+        ("deny", "Bash", {"command": "cys status 2>&1 > /w/repo/a"},
+         "앞선 fd 복제가 뒤의 파일 쓰기를 면제하지 않는다"),
+        ("allow", "Bash", {"command": "cys status 1>&2"}, "정상 fd 복제"),
+        ("deny", "Bash", {"command": "cys status &> /w/repo/a"}, "&> 동시 출력"),
+        ("deny", "Bash", {"command": "cys status >| /w/repo/a"}, "noclobber 우회 연산자"),
+        ("deny", "Bash", {"command": "cys status 3<> /w/repo/a"}, "읽기쓰기 open"),
+        ("deny", "Bash", {"command": "cys status > /w/tmp/../repo/a"}, "tmp 접두 뒤 .. 탈출"),
+        ("deny", "Bash", {"command": "cys status >> /w/pack/round/SESSION_STATE.audit"},
+         "상태 파일 접두 이름에 셸 append"),
+        # 경로 별칭·형제 디렉터리·설치 팩 경계.
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/../../tmp/javis_orchestra.py check"},
+         "정규화 뒤 설치 팩 밖"),
+        ("deny", "Write", {"file_path": "/w/pack/round-shadow/CSO_TODO.md", "content": "x"},
+         "round 의 형제 디렉터리"),
+        ("deny", "Write", {"file_path": "/w/home/.cys/state/cso/../MiSsIoN.json", "content": "{}"},
+         "점 경로 + 대소문자 별칭으로 mission 보호 이탈"),
+        ("deny", "Write", {"file_path": "/w/home/.cys/state/FoRmAtIoN/seat.json", "content": "{}"},
+         "formation 대소문자 별칭"),
+        ("deny", "Write", {"file_path": "/w/tmp/CYS-CAPGATE-role-seat-cache", "content": "0 master"},
+         "대문자 역할 캐시 파일명"),
+        ("allow", "Write", {"file_path": "/w/home/.cys/state/cso/../cso/audit.md", "content": "x"},
+         "정규화 뒤 자기 작업 영역"),
+        # cys 인자 계약.
+        ("deny", "Bash", {"command": "cys approval sign --prefix 'cys kill 77' --ttl 30"},
+         "승인 발급은 master 발신만"),
+        ("deny", "Bash", {"command": "cys schedule add --role master --every 1m"},
+         "schedule 은 list 만"),
+        ("deny", "Bash", {"command": "cys status | cys close-surface 77"},
+         "승인 대상은 복합 실행 금지"),
+        ("deny", "Bash", {"command": "cys send --to 'master ' x"}, "후행 공백 주소"),
+        ("deny", "Bash", {"command": "cys send --to 'master\nworker' x"}, "인용 안 개행 주소"),
+        ("allow", "Bash", {"command": "cys send --to master '상태\n# 본문\ncys kill 77'"},
+         "인용 안 개행·주석은 본문이다(경계가 아니다)"),
+        # python 옵션.
+        ("deny", "Bash", {"command": "python3 -IBcpass /w/pack/bin/javis_orchestra.py check"},
+         "허용 옵션을 앞세운 결합 -c"),
+        ("deny", "Bash", {"command": "python3 -W ignore /w/pack/bin/javis_orchestra.py check"},
+         "값을 먹는 -W"),
+        ("allow", "Bash", {"command": "python3 -I -B /w/pack/bin/javis_orchestra.py channel-health"},
+         "정확 토큰 옵션 + 관측 하위 명령"),
+        ("deny", "Bash", {"command": "python3 - /w/pack/bin/javis_cycle_autopilot.py tick"},
+         "stdin 스크립트 실행"),
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --allow-irr"},
+         "불가역 허용 플래그의 접두 축약"),
+        ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_state_snapshot.py verify --pr"},
+         "관측 하위 명령 뒤의 prune 접두 축약"),
+    ]
+    for exp, tool, ti, label in codex_cases:
+        want(exp == "deny", tool, ti, "codex: " + label)
+    # reviewer 경로도 같은 규칙이다 — 영폭 문자를 **지우던** 종전 코드는 `r<U+200B>m -rf` 를
+    # `rm` 으로 되살려 잡았지만, 지우기를 그만두면서 검사 없이는 그 토큰이 그냥 미지 명령이 된다.
+    b, _r = decide("Bash", {"command": "r\u200bm -rf /w/x"}, "reviewer-codex")
+    if not b:
+        fails.append("R1[reviewer 영폭]: 영폭 문자로 감춘 write-shell 이 통과했다")
 
     # ⑯ 카운터: 손상·저장 실패는 **계수 불능**(None)이고 0 도 초과도 아니다
     if bump_tool_calls("k", os.path.join("/w", "no-such-root", "x\0bad")) is not None:

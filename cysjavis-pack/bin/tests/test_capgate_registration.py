@@ -81,6 +81,12 @@ class _CapgateEnv(unittest.TestCase):
         (self.bin / "python3").symlink_to(sys.executable)
         (self.bin / "bash").symlink_to("/bin/bash")
         (self.bin / "dirname").symlink_to("/usr/bin/dirname")
+        # ★데몬 소켓 실물(빈 파일로 충분 — preflight 는 실재만 본다): 없으면 `_capgate_gate` 는
+        #   데몬을 **깨우지 않고** 미등록을 낸다(H-SEED-2 경합의 원인 제거). 아래 대부분의
+        #   케이스는 "데몬은 있는데 응답이 이러할 때" 를 재므로 소켓을 먼저 놓는다.
+        self.sock = self.home / ".local" / "state" / "cys" / "cys.sock"
+        self.sock.parent.mkdir(parents=True, exist_ok=True)
+        self.sock.write_text("", encoding="utf-8")
         self.good_status = {"alert_route": {"enabled": True}}
         self.new_directive = "# CSO\n%s\n본문\n" % pf.CSO_DIRECTIVE_REV_MARKER
         self.directive = self.pack / "directives" / "CSO_DIRECTIVE.md"
@@ -299,6 +305,20 @@ class CapgateUndecidable(_CapgateEnv):
         ok, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
         self.assertIs(ok, False, "지침 판독 불가인데 등록을 허용했다: %s" % why)
         self.assertIn("판독 불가", why, "판독 불가를 '구판' 으로 접으면 안 된다")
+
+    def test_missing_socket_defers_without_waking_daemon(self):
+        """★소켓이 없으면 **데몬을 깨우지 않고** 미등록이다(R1).
+
+        종전에는 이 축이 실제 `cys` 를 띄웠고, 그 바이너리는 자기 HOME 아래에 팩·상태를
+        부트스트랩한다 — HOME 이 임시 디렉터리인 문맥에서 그 부수효과가 정리와 경합해
+        부트 헬스 검체(H-SEED-2)가 `Directory not empty` 로 크래시했다. preflight 는 관측이다.
+        """
+        self._status_stub(self.good_status)
+        self.sock.unlink()
+        ok, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
+        self.assertIs(ok, False, "소켓이 없는데 등록을 허용했다: %s" % why)
+        self.assertIn("소켓 미실재", why)
+        self._assert_calls([])          # ★호출 0 — 데몬을 깨우지 않았다
 
     def test_marker_rejects_non_string(self):
         # 판독 실패(None)를 빈 문자열로 흡수하면 예외 대신 조용한 오답이 된다.
