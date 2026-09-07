@@ -47,11 +47,19 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 exit: 0=출력 / 2=phases 비었거나 역할명 위반.
   round-init   --task T                       라운드 장부 생성
   round-log    --task T --round N --evaluator E [--verdict V | --from-cmd CMD | --verdict-json J]
+                                [--override "<사유>"]
                                 라운드 기록 append. --from-cmd는 기계검증 명령을 직접 실행해
                                 exit code로 verdict 자동 기록(machine 평가자 규약 — 전사 금지).
                                 exit: 0=기록(검증 통과 포함) / 1=기록됨·기계검증 실패
-                                (기록 성공≠검증 통과 — 판정의 단일 진실은 gate-status).
-  round-status --task T                       현재 라운드·10R 도달·최근 기록값 결정론 판정
+                                (기록 성공≠검증 통과 — 판정의 단일 진실은 gate-status)
+                                / 2=거부(전사·스키마) / **3=정체 종결(stopped_stagnation) 후
+                                새 라운드 거부 — `--override "<사유>"` 로만 재개(기록됨)**.
+  round-status --task T [--verdict-json N:평가자:경로 …]
+                                현재 라운드·10R 도달·최근 기록값 + **종료 사유** 결정론 판정:
+                                stop_reason ∈ accepted | stopped_budget | stopped_stagnation |
+                                needs_investigation | open. stopped_stagnation = 최근 2R 연속
+                                gemini·codex·machine 전원 ACCEPT 이고 리뷰어 이슈가 전부 minor
+                                (verdict JSON 결속 필수 — Markdown 장부만으로는 판정하지 않는다).
   gate-status  --task T [--round N]           자율주행(앵커6 축1) 게이트 4자 수렴 결정론 판정:
                                 해당 라운드에 gemini·codex·master·machine 4평가자의 승인
                                 (PASS/수렴/approve/ok/green 접두) 기록이 전부 있어야 CONVERGED.
@@ -71,6 +79,7 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -2075,10 +2084,81 @@ def _cell(s):
     return str(s).replace("|", "/").replace("\n", " ").strip()
 
 
+def stagnation_gate(args, path):
+    """`round-log` 의 WP-6 정체 종결 게이트 — 진행이면 None, 막으면 exit code.
+
+    ★위치가 계약이다(codex 적대 검토 major-5): 이 검사는 `--from-cmd` **실행 전**에 돈다.
+      뒤에 두면 종결된 뒤에도 빌드·테스트를 최대 1800s 돌린 다음 결과를 버리고 exit 3 을 내며,
+      기계검증 실패의 exit 1 까지 3 으로 가려진다(진단이 사라진다).
+    ★막는 것은 **새 라운드 발행**뿐이다. 정체를 부른 라운드에 행을 더 붙이는 길(그 라운드의
+      완결·재평가)은 열려 있다 — 안 그러면 도구가 스스로 교착을 만든다. 대신 종결 사실은
+      사이드카에 남아 **끈끈**하고(stagnation_block_round), 재개 권한은 override 까지 유지된다.
+    """
+    rows = parse_rounds(path)
+    last = max((r["round"] for r in rows), default=0)
+    events = read_round_events(args.task)
+    blocked_round = stagnation_block_round(events)
+    if not (args.round > last or (blocked_round is not None and args.round > blocked_round)):
+        return None
+    reason, why = "open", []
+    if rows:
+        evidence, notes = load_verdict_evidence(
+            args.task, stagnation_target_rounds(last), (), events=events)
+        for n in notes:
+            print("[round-log] %s" % n, file=sys.stderr)
+        reason, why = round_stop_reason(rows, evidence)
+    if blocked_round is None and reason != "stopped_stagnation":
+        return None
+    stop_round = blocked_round if blocked_round is not None else last
+    raw = getattr(args, "override", None)
+    override = _audit_text(raw or "")
+    if not override:
+        if blocked_round is None:      # 첫 거부에서만 종결을 못박는다(중복 기록 없음)
+            append_round_event(args.task, {"event": "stagnation_stop", "round": stop_round,
+                                           "requested_round": args.round,
+                                           "reason": [_audit_text(w) for w in why]})
+        # 사유 표기는 **정직해야** 한다: 종결 이후 같은 라운드에 행이 더 붙어 지금 계산된
+        # stop_reason 이 달라졌을 수 있다. 그 사실을 감추지 않고 둘 다 적는다.
+        if blocked_round is not None and reason != "stopped_stagnation":
+            print("[round-log] 거부(exit %d): 라운드 %d 에서 **정체 종결이 기록**됐다"
+                  "(사이드카 stagnation_stop). 그 뒤 기록으로 지금 계산된 stop_reason=%s 이지만, "
+                  "재개 권한은 명시 override 까지 유지된다(종결 ≠ 합격)."
+                  % (ROUND_LOG_EXIT_STAGNATION, stop_round, reason), file=sys.stderr)
+        else:
+            print("[round-log] 거부(exit %d): stop_reason=stopped_stagnation — 라운드 %d 에서 "
+                  "종결됐다. stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계한다"
+                  "(종결 ≠ 합격)." % (ROUND_LOG_EXIT_STAGNATION, stop_round), file=sys.stderr)
+        for w in why:
+            print("  · %s" % w, file=sys.stderr)
+        if raw is not None:
+            print("  · `--override` 가 **빈 사유**다 — 재개는 사유 없이 기록되지 않는다.",
+                  file=sys.stderr)
+        print("  · 명시 재개: `--override \"<사유>\"` (장부·사이드카에 기록된다). "
+              "그 라운드를 완결하는 추가 기록(라운드 %d 이하)은 막히지 않는다." % stop_round,
+              file=sys.stderr)
+        return ROUND_LOG_EXIT_STAGNATION
+    append_round_event(args.task, {"event": "override", "round": args.round,
+                                   "stop_round": stop_round, "reason": override})
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n> [override] %s · 라운드 %d 재개(정체 종결 라운드 %d) — 사유: %s\n\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), args.round, stop_round, override))
+    except OSError as e:
+        print("[round-log] 경고: override 표시줄 기록 실패(%s) — 정본 기록은 사이드카다" % e,
+              file=sys.stderr)
+    print("[round-log] override 기록: 정체 종결(라운드 %d) 이후 라운드 %d 재개 — 사유: %s"
+          % (stop_round, args.round, override), file=sys.stderr)
+    return None
+
+
 def cmd_round_log(args):
     p = round_path(args.task)
     if not os.path.exists(p):
         cmd_round_init(args, gate=False)     # 내부 장부 생성 — 게이트 대상 아님(위 주석)
+    # ★WP-6 정체 종결 게이트 — 어떤 부수효과(--from-cmd 실행·기록)보다 **먼저** 본다.
+    _sg = stagnation_gate(args, p)
+    if _sg is not None:
+        return _sg
     # ★전환 게이트 §9-7-2 부수 1: --score 플래그를 제거했다(§6-4 점수 금지).
     #   기록값 칸의 기본은 "-" 이며, --from-cmd 경로에서만 기계검증 출력 꼬리를 담는다
     #   (등급이 아니라 증거 발췌다 — 평균·다수결 affordance 없음).
@@ -2143,6 +2223,13 @@ def cmd_round_log(args):
         # 기록 verdict = 검증기 출력 enum 그대로(R2 강등 반영). justification 산문은 셀에
         # 넣지 않는다(부정 어휘가 REJECT_MARKERS 게이트를 오작동). score 금지 계약 → "-".
         verdict, score = verdict_out, "-"
+        # ★WP-6 증거 결속: 이 행이 **어느 파일로** 판정됐는지를 sha256 과 함께 사이드카에
+        #   남긴다. 정체 판정은 이 결속을 통해서만 verdict JSON 을 읽는다 — 결속 없이 정본
+        #   경로만 훑으면 나중에 덮인 낡은 파일이 새 행과 결합해 거짓 종결을 만든다.
+        append_round_event(args.task, {
+            "event": "verdict_src", "round": args.round,
+            "evaluator": _audit_text(args.evaluator), "verdict": verdict_out,
+            "path": os.path.abspath(vj), "sha256": sha256_file(vj)})
     with open(p, "a", encoding="utf-8") as f:
         f.write("| %d | %s | %s | %s |\n"
                 % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
@@ -2167,6 +2254,13 @@ def parse_rounds(p):
 
 
 def cmd_round_status(args):
+    """라운드 현황 + **종료 사유(stop_reason)** 결정론 판정(WP-6).
+
+    ★진행 지시는 stop_reason 으로 갈린다(codex 적대 검토 major-9): 종전 문면은 상한 미도달이면
+      무조건 "다음 라운드 진행 가능"을 냈다 — 종결 상태에서도 그 줄이 함께 나오면 지침 소비자가
+      상반된 지시를 받는다. 현황 필드(라운드 수·최근 기록)는 그대로 두고 **지시만** 분기한다.
+    ★읽기 전용: 이 명령은 장부·사이드카에 아무것도 쓰지 않는다(감사 기록은 round-log 의 몫).
+    """
     p = round_path(args.task)
     if not os.path.exists(p):
         print("라운드 장부 없음: %s — `round-init`로 생성" % p)
@@ -2179,12 +2273,36 @@ def cmd_round_status(args):
         r = rows[-1]
         print("  최근: 라운드 %d · 평가자 %s · 기록값 %s · 판정 %s"
               % (r["round"], r["evaluator"], r["score"], r["verdict"]))
-    if last >= MAX_ROUNDS:
+    events = read_round_events(args.task)
+    evidence, notes = load_verdict_evidence(
+        args.task, stagnation_target_rounds(last),
+        getattr(args, "verdict_json", None) or (), events=events)
+    for n in notes:
+        print("[round-status] %s" % n, file=sys.stderr)
+    reason, why = round_stop_reason(rows, evidence)
+    print("  stop_reason=%s" % reason)
+    for l in why:
+        print("    · %s" % l)
+    blocked = stagnation_block_round(events)
+    if blocked is not None:
+        print("    · 정체 종결 기록됨(라운드 %d) — 새 라운드는 `round-log --override \"<사유>\"` "
+              "없이 거부된다(exit %d)." % (blocked, ROUND_LOG_EXIT_STAGNATION))
+    if reason == "accepted":
+        print("  → 합격(4자 수렴). 다음 단계는 `gate-status`(임무 게이트 포함)로 확인하라 — "
+              "라운드를 더 돌 이유가 없다.")
+    elif reason == "stopped_budget":
         print("  → %dR 상한 도달: 무한 루프 금지. 잠근 합격 기준에 미달이면 주인님께 "
               "격차를 보고하고 추가 라운드 여부를 여쭈어라(운영계약 §6-5)." % MAX_ROUNDS)
-        return 0
-    print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
-          "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
+    elif reason == "stopped_stagnation":
+        print("  → **종결(정체)**: stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계한다. "
+              "라운드를 잇지 마라 — 추가 기록은 `--override \"<사유>\"` 로만 재개된다. "
+              "종결 ≠ 합격(verdict 는 그대로다).")
+    elif reason == "needs_investigation":
+        print("  → 조사 필요: 판정이 INVESTIGATE/ESCALATE 다(승인 아님). 라운드를 더 도는 것이 "
+              "아니라 근거를 규명하거나 오너에게 상신하라.")
+    else:
+        print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
+              "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
     return 0
 
 
@@ -2397,6 +2515,352 @@ def gate_verdicts(rows, rnd):
             sr = skip_reason(r["verdict"])
             out[std] = Skip(sr) if sr is not None else verdict_approved(r["verdict"])
     return out
+
+
+# ── WP-6 라운드 종료 사유(stop_reason) — "중단"과 "합격"은 다른 상태다 ──────────────
+# ★왜 이 축이 필요한가(정본 §4 WP-6 · 근거 REVIEWER_DIRECTIVE 신설 근거 주석의 실측): SURVEY 는
+#   R1~R7 7라운드를 돌았지만 실질 규명은 R1~R2 에서 끝났고 R3~R7 은 문구 극성·서술 미세조정에
+#   소모됐다. 종전 도구의 어휘는 "미수렴/수렴" 둘뿐이라, 리뷰어가 계속 ACCEPT 를 내면서 minor 만
+#   덧붙이는 상태를 **종결로 읽을 말이 없었다**. stop_reason 이 그 말이다.
+# ★안전 방향(설계 원칙 3·6): 이 축은 **종결=정지**를 만든다. 그러므로 증거가 없거나 모호하면
+#   `stopped_stagnation` 을 선언하지 않고 `open`(라운드 계속)으로 접는다 — 오탐의 귀결이
+#   "라운드 한 번 더"여야지 "미완인데 종결"이면 안 된다. BLOCK·REVISE·FAIL 은 어떤 경로로도
+#   ACCEPT 로 재작성되지 않으며 `javis_verdict.py` 는 무접촉이다(§8).
+STOP_REASONS = ("accepted", "stopped_budget", "stopped_stagnation",
+                "needs_investigation", "open")
+# 정체 판정의 게이트 평가자 — 정본 §4 WP-6 이 지정한 3축. master 는 산출 이해당사자(전사)라
+# 정체 '선언'의 근거로 삼지 않는다. 다만 master 가 **반려**한 라운드에서는 정체를 선언하지
+# 않는다(계약보다 엄격 = 라운드 계속 방향 = 안전).
+STAGNATION_EVALUATORS = ("gemini", "codex", "machine")
+# verdict JSON 이 존재하는 축(리뷰어) — machine 은 `--from-cmd` 결정론 기록이라 JSON 이 없다.
+STAGNATION_REVIEWERS = ("gemini", "codex")
+STAGNATION_ROUNDS = 2                 # "최근 2라운드 연속"
+MINOR_SEVERITY = "minor"              # javis_verdict.SEVERITY_ENUM 의 최하 등급
+ROUND_LOG_EXIT_STAGNATION = 3         # round-log 의 미사용 exit 코드(2=거부 · 1=machine_fail)
+# 조사 필요로 읽는 판정 접두 — INVESTIGATE 는 javis_verdict R2 강등 결과(승인 아님), ESCALATE 는
+# 리뷰어 enum 의 오너 상신이다. 둘 다 "라운드를 한 번 더" 로 풀리지 않는다.
+INVESTIGATE_PREFIXES = ("investigate", "escalate")
+_VJ_EXPLICIT_RE = re.compile(r"^(\d+):([^:]+):(.+)$")
+_AUDIT_MAX = 400
+
+
+def _audit_text(s):
+    """감사 문자열 새니타이즈 — CR/LF 를 공백으로 접고(장부에 가짜 표 행 주입 차단) 길이를 자른다.
+
+    `_cell` 은 LF 만 지우고 CR 을 남긴다 — Windows 에서 붙여넣은 사유가 `\\r| 9 | … |` 로
+    끝나면 CR 뒤가 새 줄로 읽힐 수 있다. 파이프까지 접는 이유는 `parse_rounds` 가 `re.match`
+    (줄 앞 고정)라 `> [override] …` 줄이 행으로 **파싱되지는** 않지만, 사람이 훑을 때 승인 행처럼
+    보이는 문자열을 남기는 것 자체가 감사 기록의 신뢰를 갉기 때문이다(정직한 표기).
+    """
+    t = re.sub(r"[\r\n\t]+", " ", str(s or "")).replace("|", "/")
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t[:_AUDIT_MAX]
+
+
+# ── 증거 결속 사이드카(WP-6) — 장부 행과 verdict JSON 을 sha256 으로 묶는 append-only 원장 ──
+# ★왜 사이드카인가(codex 적대 검토 blocking-1·3): Markdown 장부는 4칸(라운드·평가자·기록값·판정)
+#   뿐이라 **어느 파일로 그 판정을 냈는지**를 기록하지 못한다. 그래서 (a) 정본 경로의 파일이
+#   나중에 다른 내용으로 덮이면 낡은 minor 파일과 새 ACCEPT 행이 결합해 **거짓 종결**이 나고,
+#   (b) `round-status` 가 `--verdict-json` 으로 본 증거를 `round-log` 는 다시 못 봐서 두 명령의
+#   판정이 갈린다. 결속을 파일에 남기면 둘 다 닫힌다. 표 안에 주석을 끼우면 표가 갈라지므로
+#   사이드카 JSONL 로 둔다(장부 자체는 종전과 byte 호환 — 구 소비자 무영향).
+# ★구 장부(마커 없음)는 정체를 **절대 선언하지 않는다** — 지침의 "도구 선행 확인·휴면" 과 같다.
+WP6_EVENTS_SUFFIX = ".wp6.jsonl"
+
+
+def round_events_path(task):
+    """라운드 감사 사이드카 경로 — `<팩>/round/ORCHESTRATION-<slug>.wp6.jsonl`."""
+    p = round_path(task)
+    return (p[:-3] if p.endswith(".md") else p) + WP6_EVENTS_SUFFIX
+
+
+def append_round_event(task, rec):
+    """감사 이벤트 1건 append(best-effort). 실패는 판정을 바꾸지 않는다(증거 부재 = 정체 선언 불가)."""
+    rec = dict(rec)
+    rec.setdefault("ts", time.time())
+    rec.setdefault("task", task)
+    try:
+        p = round_events_path(task)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def read_round_events(task):
+    """사이드카 이벤트 목록(기록 순서). 깨진 줄은 건너뛴다 — 부재는 빈 목록."""
+    out = []
+    try:
+        with open(round_events_path(task), encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def sha256_file(path):
+    """파일 sha256(hex) — 부재·읽기 실패는 None."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def verdict_facts(obj):
+    """verdict JSON 객체 → 사실 dict(순수). 판정기는 `javis_verdict.validate_verdict` **하나**다.
+
+    반환 {ok, verdict, severities, why}. `ok=False` = 증거로 쓸 수 없음(fail-closed):
+    모듈 부재·검증기 예외·스키마 미통과가 전부 여기로 접힌다. `verdict` 는 검증기 출력
+    (`verdict_out` — R2 강등 반영)이며 이 함수는 어떤 값도 **재작성하지 않는다**(§8).
+    """
+    if not isinstance(obj, dict):
+        return {"ok": False, "verdict": None, "severities": [], "why": "최상위가 객체(dict) 아님"}
+    try:
+        import javis_verdict
+        schema_errors, _lint, verdict_out = javis_verdict.validate_verdict(obj)
+    except Exception as e:      # 모듈 부재·검증기 예외 전부 거부(fail-closed)
+        return {"ok": False, "verdict": None, "severities": [], "why": "검증 불가(%s)" % e}
+    if schema_errors:
+        return {"ok": False, "verdict": None, "severities": [],
+                "why": "스키마 미통과: %s" % "; ".join(schema_errors[:3])}
+    sev = []
+    for it in obj.get("issues") or []:
+        sev.append(str(it.get("severity") or "").strip().lower()
+                   if isinstance(it, dict) else "형태불명")
+    return {"ok": True, "verdict": verdict_out, "severities": sev, "why": ""}
+
+
+def read_verdict_facts(path, expect_sha=None):
+    """파일 → verdict_facts(+sha 결속 검사). 부재·깨짐·sha 불일치는 전부 '증거 없음'."""
+    got = sha256_file(path)
+    if got is None:
+        return {"ok": False, "verdict": None, "severities": [], "path": path,
+                "why": "파일 부재·읽기 실패"}
+    if expect_sha and got != expect_sha:
+        return {"ok": False, "verdict": None, "severities": [], "path": path, "sha256": got,
+                "why": "sha256 불일치(기록 %s… ≠ 실물 %s…) — 기록 이후 파일이 바뀌었다"
+                       % (expect_sha[:12], got[:12])}
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, ValueError) as e:
+        return {"ok": False, "verdict": None, "severities": [], "path": path,
+                "sha256": got, "why": "읽기/파싱 실패(%s)" % e}
+    facts = verdict_facts(obj)
+    facts["path"] = path
+    facts["sha256"] = got
+    return facts
+
+
+def parse_verdict_json_arg(spec):
+    """`--verdict-json` 인자 1건 → (round|None, evaluator|None, path, why).
+
+    형태는 **명시형** `<라운드>:<평가자>:<경로>` 하나다. 첫 토큰이 숫자일 때만 인정하므로
+    Windows 절대경로(`C:\\x\\y.json` — 드라이브 문자는 영문)와 섞이지 않는다. 파일명 추측
+    파싱은 하지 않는다: 정본 파일명의 평가자 토큰에는 `reviewer1|reviewer2`(어느 리뷰어인지
+    알 수 없는 앵커 역할명)가 들어갈 수 있어 귀속을 **추측**하게 되기 때문이다.
+    """
+    s = (spec or "").strip()
+    if not s:
+        return None, None, s, "빈 인자"
+    m = _VJ_EXPLICIT_RE.match(s)
+    if m:
+        return int(m.group(1)), m.group(2).strip(), m.group(3).strip(), ""
+    return None, None, s, ("형태 불명 — `<라운드>:<평가자>:<경로>` 로 귀속을 명시하라"
+                           "(예: 3:codex:/path/to/verdict.json)")
+
+
+def stagnation_target_rounds(last_round, rounds=STAGNATION_ROUNDS):
+    """정체 판정이 보는 라운드 번호(오름차순) — 최근 `rounds` 개. 0 이하는 제외한다
+    (compete 의 R0 기록은 라운드 루프가 아니며 `verdict_json_path` 도 R0→r1 로 접는다)."""
+    return [r for r in range(last_round - rounds + 1, last_round + 1) if r > 0]
+
+
+def verdict_bindings(events, task):
+    """사이드카 → {(라운드, 표준평가자): 결속}. 같은 키의 뒤 기록이 이긴다(재평가 = 마지막 승 ·
+    `gate_verdicts` 와 같은 규칙). 반환 (bindings, foreign_tasks)."""
+    out, foreign = {}, set()
+    for e in events:
+        if e.get("event") != "verdict_src":
+            continue
+        if e.get("task") != task:
+            foreign.add(str(e.get("task")))
+            continue
+        std = evaluator_std(str(e.get("evaluator") or ""))
+        try:
+            rnd = int(e.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if std is None:
+            continue
+        out[(rnd, std)] = e
+    return out, foreign
+
+
+def load_verdict_evidence(task, rounds, specs=(), events=None):
+    """(라운드, 표준평가자) → verdict 사실. 반환 (evidence, notes).
+
+    증거의 정본은 **사이드카 결속**(round-log 가 기록한 path+sha256)이다. `--verdict-json` 은
+    파일이 옮겨졌을 때 **같은 sha 의 파일**을 다시 가리키는 수단이며, 결속이 없는 (라운드,
+    평가자)에는 증거를 만들지 못한다 — 임의 파일을 들이밀어 종결을 살 수 없다.
+    """
+    events = read_round_events(task) if events is None else events
+    bindings, foreign = verdict_bindings(events, task)
+    notes = []
+    if foreign:
+        notes.append("사이드카에 다른 task 기록 존재(%s) — 슬러그 충돌 의심"
+                     % ", ".join(sorted(foreign)[:3]))
+    explicit = {}
+    for spec in specs or ():
+        rnd, evl, path, why = parse_verdict_json_arg(spec)
+        if rnd is None:
+            notes.append("--verdict-json 미귀속: %s — %s" % (spec, why))
+            continue
+        std = evaluator_std(evl)
+        if std is None:
+            notes.append("--verdict-json 미귀속: %s — 표준 평가자로 접히지 않는 표기 %r" % (spec, evl))
+            continue
+        explicit[(rnd, std)] = path
+    evidence = {}
+    for rnd in rounds:
+        for std in STAGNATION_REVIEWERS:
+            b = bindings.get((rnd, std))
+            if not b:
+                continue
+            path = explicit.get((rnd, std)) or b.get("path")
+            if not path:
+                continue
+            evidence[(rnd, std)] = read_verdict_facts(path, expect_sha=b.get("sha256"))
+    return evidence, notes
+
+
+def stagnation_state(rows, evidence, last_round, rounds=STAGNATION_ROUNDS):
+    """최근 `rounds` 라운드 연속 '게이트 전원 ACCEPT + 이슈 전부 minor' 인가 — 순수 함수.
+
+    반환 (bool, [사유줄]). 참이 되는 조건은 전부 **양성 증거**다:
+      ① 대상 라운드가 연속으로 실재(빈 라운드가 끼면 거짓)
+      ② 각 라운드에서 gemini·codex·machine 이 **정확히 True**(SKIP·미기록·미승인은 전부 거짓)
+      ③ 각 라운드에서 표준 평가자 중 **미승인(False)이 하나도 없다** — master 반려도 막는다
+      ④ gemini·codex 는 그 라운드의 **verdict JSON 결속**(round-log 가 남긴 path+sha256)이 있고
+         재검증 결과가 `ACCEPT` 이며 `issues[].severity` 가 전부 `minor`
+    ④가 정본의 "Markdown 장부만으로 판정 금지"다 — 장부 행만으로는 어떤 경우에도 참이 되지 않는다.
+    ★"새 이슈가 전부 minor" 를 **그 라운드 이슈 전부 minor** 로 읽는다: 직전 라운드에서 넘어온
+      major 가 아직 열려 있으면 그것은 '정체'가 아니라 **미완**이고, 답은 종결이 아니라 해소다
+      (엄격한 쪽 = 라운드 계속 = 안전 방향).
+    """
+    if last_round < rounds:
+        return False, ["정체 판정 불가: 기록 라운드 %d < 연속 요건 %dR" % (last_round, rounds)]
+    recorded = {r["round"] for r in rows}
+    reasons = []
+    for rnd in stagnation_target_rounds(last_round, rounds):
+        if rnd not in recorded:
+            return False, ["정체 아님: 라운드 %d 기록 없음(연속 %dR 미충족)" % (rnd, rounds)]
+        gv = gate_verdicts(rows, rnd)
+        for e in GATE_EVALUATORS:
+            if gv.get(e) is False:
+                return False, ["정체 아님: 라운드 %d %s 미승인 — 라운드를 계속하라" % (rnd, e)]
+        for e in STAGNATION_EVALUATORS:
+            v = gv.get(e)
+            if v is not True:
+                lab = ("SKIP(%s)" % v.reason) if isinstance(v, Skip) else \
+                      ("기록 없음" if v is None else "미승인")
+                return False, ["정체 아님: 라운드 %d %s %s" % (rnd, e, lab)]
+        for e in STAGNATION_REVIEWERS:
+            f = evidence.get((rnd, e))
+            if not f:
+                return False, ["정체 판정 불가: 라운드 %d %s verdict JSON 결속 없음 — 장부만으로는 "
+                               "정체를 선언하지 않는다(round-log 가 결속을 기록한 뒤부터 판정 가능)"
+                               % (rnd, e)]
+            if not f.get("ok"):
+                return False, ["정체 판정 불가: 라운드 %d %s verdict JSON 무효 — %s"
+                               % (rnd, e, f.get("why"))]
+            if f.get("verdict") != "ACCEPT":
+                return False, ["정체 아님: 라운드 %d %s verdict=%s(≠ACCEPT)"
+                               % (rnd, e, f.get("verdict"))]
+            bad = sorted({s for s in f.get("severities") or [] if s != MINOR_SEVERITY})
+            if bad:
+                return False, ["정체 아님: 라운드 %d %s 이슈 severity %s — minor 만이 정체다"
+                               % (rnd, e, ", ".join(bad))]
+        reasons.append("라운드 %d: %s 전원 ACCEPT · 리뷰어 이슈 전부 minor"
+                       % (rnd, "·".join(STAGNATION_EVALUATORS)))
+    return True, reasons
+
+
+def investigate_rows(rows, rnd):
+    """해당 라운드의 INVESTIGATE·ESCALATE 행(조사 필요 — 승인 아님)."""
+    out = []
+    for r in rows:
+        if r["round"] != rnd:
+            continue
+        v = (r.get("verdict") or "").strip().lower()
+        if any(v.startswith(p) for p in INVESTIGATE_PREFIXES):
+            out.append(r)
+    return out
+
+
+def round_stop_reason(rows, evidence, max_rounds=MAX_ROUNDS, rounds=STAGNATION_ROUNDS):
+    """라운드 종료 사유 — 순수 함수. 반환 (stop_reason, [사유줄]).
+
+    우선순위는 정본이 열거한 순서다: accepted > stopped_budget > stopped_stagnation >
+    needs_investigation > open. 합격이 가장 강하고(4자 수렴 = 기존 gate-status 계약),
+    그 다음이 헌장의 하드 상한(10R)이다.
+    """
+    last = max((r["round"] for r in rows), default=0)
+    if last <= 0:
+        return "open", ["기록된 라운드 없음 — 라운드 1부터 기록하라"]
+    gv = gate_verdicts(rows, last)
+    if all(gv.get(e) is True for e in GATE_EVALUATORS):
+        return "accepted", ["라운드 %d: 게이트 4자(%s) 전원 승인"
+                            % (last, "·".join(GATE_EVALUATORS))]
+    if last >= max_rounds:
+        return "stopped_budget", ["%dR 상한 도달(기록 라운드 %d) — 무한 루프 금지(운영계약 §6-5)"
+                                  % (max_rounds, last)]
+    stag, why = stagnation_state(rows, evidence, last, rounds)
+    if stag:
+        return "stopped_stagnation", why
+    inv = investigate_rows(rows, last)
+    if inv:
+        return "needs_investigation", [
+            "라운드 %d: 평가자 %s 판정 %s — 조사 필요(승인 아님)"
+            % (last, r["evaluator"].strip(), r["verdict"].strip()) for r in inv]
+    return "open", why
+
+
+def stagnation_block_round(events):
+    """사이드카에서 **끈끈한 정체 종결** 상태를 읽는다 — 반환 (막힌 정체 라운드|None).
+
+    ★왜 끈끈해야 하는가(codex 적대 검토 major-4): 정체로 거부된 뒤 **같은 라운드에** 행 하나를
+      더 붙이면(예: master 행) 종결 계산이 흔들려 다음 라운드가 override 없이 열린다. 종결
+      이후의 증거 추가는 막지 않되(그 라운드를 완결할 길은 열려 있어야 한다), **재개 권한**은
+      명시 override 까지 유지한다. override 가 기록되면 그 시점부터 다시 열린다.
+    """
+    blocked = None
+    for e in events:
+        ev = e.get("event")
+        try:
+            rnd = int(e.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if ev == "stagnation_stop":
+            blocked = rnd
+        elif ev == "override" and blocked is not None:
+            blocked = None
+    return blocked
 
 
 # gate-status exit 계약(결정론 환원 — 소비자는 이 코드만 본다):
@@ -3025,6 +3489,82 @@ def cmd_self_test(args):
         assert evaluator_std("agy") == "gemini" and evaluator_std("agy:r2") == "gemini", \
             "agy 별칭 매핑 실패"
         assert evaluator_std("agycorp") is None, "'agycorp' 오탐"
+        # ★WP-6 종료 사유(stop_reason) 순수 배터리 — 정본 §4 WP-6 의 5값과 판정 규칙을 박제한다.
+        assert STOP_REASONS == ("accepted", "stopped_budget", "stopped_stagnation",
+                                "needs_investigation", "open"), "stop_reason enum 변형"
+        assert ROUND_LOG_EXIT_STAGNATION == 3, "round-log 정체 거부 exit 코드는 3(미사용 값)이다"
+        assert STAGNATION_EVALUATORS == ("gemini", "codex", "machine") and STAGNATION_ROUNDS == 2, \
+            "정체 판정 축·연속 요건 변형"
+        assert stagnation_target_rounds(2) == [1, 2] and stagnation_target_rounds(1) == [1] \
+            and stagnation_target_rounds(0) == [], "정체 대상 라운드 산출 오류(R0 유입 금지)"
+
+        def _wp6_rows(rounds, gem="ACCEPT", cod="ACCEPT", mach="PASS(exit 0)", master=None):
+            out = []
+            for _r in rounds:
+                for _e, _v in (("gemini", gem), ("codex", cod), ("machine", mach),
+                               ("master", master)):
+                    if _v is not None:
+                        out.append({"round": _r, "evaluator": _e, "score": "-", "verdict": _v})
+            return out
+
+        def _wp6_ev(rounds, verdict="ACCEPT", sev=("minor",), evs=STAGNATION_REVIEWERS):
+            return {(_r, _e): {"ok": True, "verdict": verdict, "severities": list(sev), "why": ""}
+                    for _r in rounds for _e in evs}
+
+        _r12 = _wp6_rows([1, 2])
+        _ev12 = _wp6_ev([1, 2])
+        assert round_stop_reason(_r12, _ev12)[0] == "stopped_stagnation", \
+            "2R 연속 minor-only ACCEPT 인데 정체 미판정"
+        # ★장부만으로는 절대 종결되지 않는다(정본: Markdown 장부만으로 판정 금지)
+        assert round_stop_reason(_r12, {})[0] == "open", "증거 없이 장부만으로 정체를 선언했다"
+        assert round_stop_reason(_r12, _wp6_ev([1]))[0] == "open", "한 라운드 증거만으로 정체 선언"
+        # major 이슈가 하나라도 있으면 정체가 아니다(미완이지 정체가 아니다)
+        assert round_stop_reason(_r12, _wp6_ev([1, 2], sev=("minor", "major")))[0] == "open", \
+            "major 이슈가 열려 있는데 정체 종결"
+        # 리뷰어 verdict 가 ACCEPT 가 아니면 정체가 아니다(강등 INVESTIGATE 포함)
+        assert round_stop_reason(_r12, _wp6_ev([1, 2], verdict="INVESTIGATE"))[0] != \
+            "stopped_stagnation", "ACCEPT 아닌 verdict 로 정체 선언"
+        # reviewer1 BLOCK / reviewer2 ACCEPT → open (BLOCK 보존)
+        _blk = _wp6_rows([1, 2], gem="BLOCK")
+        assert round_stop_reason(_blk, _ev12)[0] == "open", "BLOCK 이 있는데 정체·합격 판정"
+        assert gate_verdicts(_blk, 2)["gemini"] is False, "BLOCK 이 미승인으로 안 잡힌다"
+        # machine FAIL / 리뷰 ACCEPT → open
+        assert round_stop_reason(_wp6_rows([1, 2], mach="FAIL(exit 1)"), _ev12)[0] == "open", \
+            "machine FAIL 인데 종결"
+        # SKIP 은 승인이 아니다(3-state 보존)
+        assert round_stop_reason(_wp6_rows([1, 2], mach="SKIPPED: 호스트 다운"), _ev12)[0] == "open", \
+            "정직한 SKIP 이 정체 종결로 삼켜졌다"
+        # master 반려는 정체 선언을 막는다(계약보다 엄격 = 라운드 계속 방향)
+        assert round_stop_reason(_wp6_rows([1, 2], master="반려"), _ev12)[0] == "open", \
+            "master 반려인데 정체 종결"
+        # 4자 전원 승인 = accepted (합격이 가장 강하다)
+        assert round_stop_reason(_wp6_rows([1, 2], master="approve"), _ev12)[0] == "accepted", \
+            "4자 수렴인데 accepted 아님"
+        # 10R 상한 = stopped_budget · 조사 필요 = needs_investigation
+        assert round_stop_reason(_wp6_rows([9, 10]), {})[0] == "stopped_budget", "10R 상한 미판정"
+        assert round_stop_reason(_wp6_rows([1], gem="INVESTIGATE"), {})[0] == "needs_investigation", \
+            "INVESTIGATE 행이 open 으로 접힘"
+        assert round_stop_reason(_wp6_rows([1], gem="ESCALATE"), {})[0] == "needs_investigation", \
+            "ESCALATE 행이 open 으로 접힘"
+        assert round_stop_reason([], {})[0] == "open", "빈 장부가 open 이 아님"
+        # verdict_facts — 판정기는 javis_verdict 하나(ACCEPT+major 는 스키마 통과지만 정체 아님)
+        _f = verdict_facts({"verdict": "ACCEPT", "justification": "j",
+                            "evidence": [{"claim": "c", "ref": "f.py:1", "verified": True}],
+                            "issues": [{"severity": "major", "where": "w", "what": "x", "fix": "y"}]})
+        assert _f["ok"] and _f["verdict"] == "ACCEPT" and _f["severities"] == ["major"], _f
+        assert verdict_facts({"verdict": "ACCEPT", "score": 90})["ok"] is False, \
+            "점수 보유 verdict 가 증거로 통과(§1 reward-hack)"
+        assert verdict_facts("문자열")["ok"] is False, "객체 아닌 입력이 증거로 통과"
+        # --verdict-json 인자 파싱: 명시형만 인정(Windows 드라이브 콜론 보존)
+        assert parse_verdict_json_arg("3:codex:C:\\x\\y.json")[:3] == (3, "codex", "C:\\x\\y.json"), \
+            "명시형 파싱이 Windows 절대경로를 깬다"
+        assert parse_verdict_json_arg("/tmp/T-r2-codex.json")[0] is None, \
+            "파일명 추측으로 귀속을 만들었다(reviewer1/2 모호성)"
+        # 끈끈한 정체 종결: stop 뒤 override 가 오면 풀린다(그 전엔 유지)
+        assert stagnation_block_round([{"event": "stagnation_stop", "round": 2}]) == 2
+        assert stagnation_block_round([{"event": "stagnation_stop", "round": 2},
+                                       {"event": "override", "round": 3}]) is None
+        assert stagnation_block_round([{"event": "verdict_src", "round": 2}]) is None
         # 자율주행(앵커6) — extract_next_action 순수 배터리
         ss = ("# S\n## 다음 액션 큐\n1. (없음)\n\n## 기타\n- x\n")
         assert extract_next_action(ss) is None, "'(없음)' 빈 큐 오탐"
@@ -3754,8 +4294,25 @@ def main():
                          "(machine 평가자 권장 — 전사 없는 producer≠evaluator 경로)")
     rl.add_argument("--verdict-json", dest="verdict_json", default=None,
                     help="★G8 리뷰어(gemini/agy/codex) 행 필수 — javis_verdict 스키마 통과 "
-                         "verdict JSON 경로(미통과·부재 시 기록 거부, SKIP 행만 예외)")
-    rs = sub.add_parser("round-status"); rs.add_argument("--task", required=True)
+                         "verdict JSON 경로(미통과·부재 시 기록 거부, SKIP 행만 예외). "
+                         "기록 시 path+sha256 이 사이드카에 결속된다(WP-6 정체 판정 증거)")
+    rl.add_argument("--override", default=None,
+                    help="★WP-6 stop_reason=stopped_stagnation(정체 종결) 이후의 **명시 재개** — "
+                         "사유 문자열 필수. 없으면 새 라운드 기록은 exit %d 로 거부된다. "
+                         "재개는 장부(표시줄)와 사이드카(정본)에 기록된다"
+                         % ROUND_LOG_EXIT_STAGNATION)
+    rs = sub.add_parser("round-status",
+                        help="라운드 현황 + 종료 사유(stop_reason) 결정론 판정",
+                        description="라운드 현황과 **종료 사유**를 낸다 — "
+                                    "stop_reason ∈ accepted | stopped_budget | "
+                                    "stopped_stagnation | needs_investigation | open. "
+                                    "stopped_stagnation 은 종결이며 minor 는 백로그로 인계한다"
+                                    "(종결 ≠ 합격). 읽기 전용 — 장부·사이드카에 쓰지 않는다.")
+    rs.add_argument("--task", required=True)
+    rs.add_argument("--verdict-json", dest="verdict_json", action="append", default=None,
+                    help="정체(stop_reason) 판정 증거 파일 재지정 — `<라운드>:<평가자>:<경로>` "
+                         "형태로 반복 지정. round-log 가 남긴 결속(sha256)과 **같은 파일**일 때만 "
+                         "쓰인다(임의 파일로 종결을 살 수 없다). 미지정 시 결속에 기록된 경로를 읽는다")
 
     gs = sub.add_parser("gate-status", help="자율주행 축1 — 4자 수렴 결정론 판정")
     gs.add_argument("--task", required=True)

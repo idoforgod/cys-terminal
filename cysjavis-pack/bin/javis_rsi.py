@@ -19,6 +19,13 @@ soul/CLAUDE의 ★eval-driven 원칙(producer≠evaluator·측정실패 hard fai
       --execute: 먼저 `rsi-abandoned-<id>-<ts>` 브랜치에 현재 HEAD를 박제(retention — 비가역 삭제 차단)
       한 뒤에만 `git reset --hard <ckpt>`. 더티 트리·ckpt가 조상 아님 → --force 없이는 거부.
   status [--json]
+      현재 라운드·시도수(attempts)·flat 연속·stop_reason 요약.
+
+★WP-6 라운드 예산: `state["rounds"][id]["attempts"]` 는 checkpoint·progress 를 함께 세며
+  재checkpoint·재시작·ledger 라인 삭제를 넘어 영속한다(state 와 ledger 의 큰 값). 상한
+  `CYS_RSI_MAX_ROUNDS`(기본 3) 초과 = `stop_reason=stopped_budget`, flat 연속
+  `CYS_RSI_CEILING_FLATS`(기본 3) = `stopped_stagnation`. 사유는 **기록·고지**이며 exit code 는
+  바꾸지 않는다(소비자 학습 루프를 세우지 않는다 — 하드 상한은 javis_learn 층에 이미 있다).
 
 ★불변: 점수 자체 생성 금지(주입만)·rollback은 백업 ref 없이는 절대 reset 안 함·--execute 없으면 무실행.
 사용: python3 javis_rsi.py <cmd> ... · 의존성: 표준 라이브러리 + PATH의 git.
@@ -50,6 +57,61 @@ def _git(args, cwd=None, check=True):
 
 
 # ───────────────────────── 순수 로직(테스트 핀) ─────────────────────────
+
+# ── WP-6: RSI 라운드 예산·정체 종료 사유 ──────────────────────────────────────
+# ★왜(정본 §4 WP-6): 종전엔 라운드가 몇 번째 시도인지 도구가 몰랐다. `cmd_checkpoint` 가
+#   `state["rounds"][id]` 를 **통째로 덮어써서** 재기록·재시작이 이력을 지웠기 때문이다
+#   (같은 라운드를 무한히 다시 시작해도 카운터가 늘 1). `attempts` 가 그 이력이다.
+# ★attempt 의 정의(codex 적대 검토 blocking-6): "평가 시도 1회" = 이 도구에 **점수가 들어온
+#   기록 1건** — 즉 checkpoint(기준선) 와 progress(개선분) 를 함께 센다. checkpoint 만 세면
+#   javis_learn 의 정상 호출(첫 회 checkpoint + 이후 progress 반복)에서 상한이 무력해진다.
+# ★영속(선례 javis_learn `_ledger_evaluate_count` :625): state 와 **append-only ledger** 의
+#   큰 값을 쓴다 — state.json 재기록/삭제도, ledger 라인 삭제도 단독으로는 카운터를 되돌리지
+#   못한다. (한계: 잠금은 없다. 동시 호출은 state 증가분을 잃을 수 있으나 ledger 재계수가
+#   다음 호출에서 복구한다. Windows 는 fcntl 이 없어 잠금 도입은 이 WP 범위 밖이다.)
+RSI_STOP_REASONS = ("open", "stopped_budget", "stopped_stagnation")
+RSI_ATTEMPT_EVENTS = ("checkpoint", "progress")
+
+
+def _as_int(v, default=0):
+    """느슨한 정수 해석 — 손상된 state 값이 판정을 죽이지 않게(결측은 값이 아니다)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(key, default):
+    """양의 정수 env 노브 — 미설정·비정수·0 이하는 기본값(게이트를 끄는 노브 없음)."""
+    n = _as_int(os.environ.get(key), 0)
+    return n if n > 0 else default
+
+
+def rsi_max_rounds():
+    """라운드 예산 — `CYS_RSI_MAX_ROUNDS` 기본 3(정본 §4 WP-6)."""
+    return _env_int("CYS_RSI_MAX_ROUNDS", 3)
+
+
+def rsi_ceiling_flats():
+    """정체(ceiling) 판정 — flat 연속 `CYS_RSI_CEILING_FLATS` 기본 3."""
+    return _env_int("CYS_RSI_CEILING_FLATS", 3)
+
+
+def rsi_stop_reason(attempts, flat_streak, max_rounds, ceiling):
+    """RSI 라운드 종료 사유 — 순수 함수. 예산 초과가 정체보다 강하다(정본 열거 순서).
+
+    ★이 값은 **보고**다: 도구는 exit 0 을 유지하고 기록만 한다. 하드 실패로 올리면
+      `javis_learn.py:766` 이 rc≠0 을 fail(12) 로 올려 학습 루프 자체가 서 버린다(§7 위험
+      ③ 자가치유 전멸 방향). 반복 평가의 **하드 상한**은 이미 소비자 층에 있다
+      (`javis_learn.EVALUATE_ATTEMPT_CAP=3` → 4회째 fail(9)). 여기서는 그 상한과 같은 값을
+      기본으로 두고, 사유를 구조화해 소비자·지침이 읽게 한다.
+    """
+    if attempts > max_rounds:
+        return "stopped_budget"
+    if flat_streak >= ceiling:
+        return "stopped_stagnation"
+    return "open"
+
 
 def verdict(delta, eps=EPS):
     """score delta → 판정. eps 이내는 flat(노이즈)."""
@@ -159,6 +221,32 @@ def _append_ledger(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _ledger_attempt_count(rid):
+    """라운드별 평가 시도 수 — ledger.jsonl 계수(append-only 진실 · 선례 javis_learn :625).
+    state.json 을 지우거나 되돌려도 이 값이 남아 상한을 되살린다."""
+    n = 0
+    try:
+        with open(os.path.join(rsi_dir(), "ledger.jsonl"), encoding="utf-8") as f:
+            for ln in f:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("event") in RSI_ATTEMPT_EVENTS \
+                        and e.get("round") == rid:
+                    n += 1
+    except OSError:
+        pass
+    return n
+
+
+def _next_attempt(state, rid):
+    """이번 호출의 시도 번호 — max(state, ledger) + 1(양쪽 되돌리기 방어)."""
+    prev = state.get("rounds", {}).get(rid)
+    prev = prev if isinstance(prev, dict) else {}
+    return max(_as_int(prev.get("attempts"), 0), _ledger_attempt_count(rid)) + 1, prev
+
+
 # ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
 # ★오너 승인 개정(2026-09-04 전면 감사): 자동 트리거(라운드 종료·eval ceiling)는 더 이상
 #   `cys feed push --kind learn_proposal` 로 **건별 승인 요청**을 발행하지 않는다. 승인권은
@@ -207,18 +295,41 @@ def cmd_checkpoint(a):
     ref = f"refs/rsi/ckpt/{a.round}"
     _git(["update-ref", ref, head])  # 복구 anchor (비파괴)
     state = _load_state()
-    state["rounds"][a.round] = {
+    # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
+    #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
+    #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
+    attempts, prev = _next_attempt(state, a.round)
+    flat = _as_int(prev.get("flat_streak"), 0)
+    stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
+    state.setdefault("rounds", {})[a.round] = {
         "round": a.round, "checkpoint_sha": head, "ref": ref,
         "baseline_score": a.score, "started_at": ts, "note": a.note or "",
-        "progress": [],
+        "progress": [], "attempts": attempts, "flat_streak": flat,
+        "stop_reason": stop_reason,
+        "ceiling_recommended": bool(prev.get("ceiling_recommended")),
     }
     state["current_round"] = a.round
     _save_state(state)
     entry = {"event": "checkpoint", "round": a.round, "sha": head[:12],
-             "score": a.score, "ts": ts, "ref": ref}
+             "score": a.score, "ts": ts, "ref": ref,
+             "attempts": attempts, "max_rounds": rsi_max_rounds(),
+             "stop_reason": stop_reason}
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
+    _warn_stop(stop_reason, a.round, attempts)
     return 0
+
+
+def _warn_stop(stop_reason, rid, attempts):
+    """종료 사유 고지(stderr) — exit code 는 바꾸지 않는다(소비자 루프를 세우지 않는다)."""
+    if stop_reason == "stopped_budget":
+        print("[rsi] stop_reason=stopped_budget — 라운드 '%s' 시도 %d회 > 상한 %d "
+              "(CYS_RSI_MAX_ROUNDS). 라운드를 잇지 말고 격차를 보고하라(기록은 남았다)."
+              % (rid, attempts, rsi_max_rounds()), file=sys.stderr)
+    elif stop_reason == "stopped_stagnation":
+        print("[rsi] stop_reason=stopped_stagnation — flat 연속 %d회 이상(ceiling). 같은 방법의 "
+              "반복은 점수를 올리지 못한다: 방법을 바꾸거나 종결하라." % rsi_ceiling_flats(),
+              file=sys.stderr)
 
 
 def cmd_progress(a):
@@ -243,13 +354,27 @@ def cmd_progress(a):
         rec["tokens_saved"] = a.tokens_saved
     r["progress"].append(rec)
     # (RSI 자율추천 iii) ceiling — flat N연속 = 점수 정체 → 학습 추천(추천만·사람 승인).
-    r["flat_streak"] = (r.get("flat_streak", 0) + 1) if v == "flat" else 0
+    r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
+    # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
+    #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
+    attempts, _prev = _next_attempt(state, a.round)
+    r["attempts"] = attempts
+    stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
+                                  rsi_ceiling_flats())
+    r["stop_reason"] = stop_reason
     _save_state(state)
-    entry = {"event": "progress", "round": a.round, **rec}
+    entry = {"event": "progress", "round": a.round, **rec,
+             "attempts": attempts, "max_rounds": rsi_max_rounds(),
+             "stop_reason": stop_reason}
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
-    if r["flat_streak"] >= int(os.environ.get("CYS_RSI_CEILING_FLATS", "3")):
+    _warn_stop(stop_reason, a.round, attempts)
+    # 추천은 **라운드당 1회**다(다이제스트 1줄 계약). 종전엔 ceiling 이상인 매 progress 마다
+    # 적재해 같은 사유가 큐에 쌓였다 — 배달 채널은 그대로(feed 0 · 주간 다이제스트).
+    if r["flat_streak"] >= rsi_ceiling_flats() and not r.get("ceiling_recommended"):
         _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round)
+        r["ceiling_recommended"] = True
+        _save_state(state)
     return 0
 
 
@@ -326,6 +451,9 @@ def cmd_status(a):
         return 0
     r = state["rounds"].get(cur, {})
     print(f"현재 라운드: {cur} · checkpoint {r.get('checkpoint_sha','?')[:12]} · 기준점수 {r.get('baseline_score')}")
+    print(f"  시도 {_as_int(r.get('attempts'), 0)}/{rsi_max_rounds()} · "
+          f"flat 연속 {_as_int(r.get('flat_streak'), 0)}/{rsi_ceiling_flats()} · "
+          f"stop_reason={r.get('stop_reason') or 'open'}")
     for p in r.get("progress", []):
         print(f"  score {p['score']} (Δ{p['delta']:+}) → {p['verdict']}")
     return 0
