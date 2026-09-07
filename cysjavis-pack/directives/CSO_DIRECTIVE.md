@@ -112,11 +112,14 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 너의 본연은 **좌석 건강·자원 게이트·컨텍스트 사이클**이다. 그 밖은 승인 없는 한 범위 이탈이다. 이 경계는
 **네 규율로 먼저** 지키고, 능력 게이트(`hooks/role-capability-gate.sh` · PreToolUse)가 배선된 설치에서는
 **도구가 집행**한다 — 게이트를 우회하거나 끄지 마라.
-**등록 조건(정본 · preflight 가 판정한다)**: ① 그 데몬이 경보 라우팅을 지원하고(`cys status --json` 의
+**등록 조건(정본)**: ① 그 데몬이 경보 라우팅을 지원하고(`cys status --json` 의
 `alert_route`) ② 이 지침이 신판 표지를 달고 있을 때만 PreToolUse 에 등록된다. 하나라도 아니면 게이트는
-**미등록**이고 preflight 가 WARN 으로 드러낸다 — 그 상태에서도 아래 경계는 **문자 그대로 유효**하다.
-등록 여부는 preflight 출력으로 확인하고, **도구가 막지 않았다는 사실을 허가로 읽지 마라**(장치의 부재는
-권한의 확대가 아니다). 목록 밖 행동이 필요하면 미등록 상태에서도 master 의 TTL 승인을 받는다.
+**미등록**이고, 그 상태에서도 아래 경계는 **문자 그대로 유효**하다.
+**판정 도구는 이 조항과 같은 릴리스에서 온다**: 그 점검이 preflight 에 아직 없으면 이 조항은 **미배선**이고
+그때의 기본값은 '미등록' 이다 — **WARN 이 없다는 사실을 '등록됨' 으로 읽지 마라**(침묵은 판정이 아니다).
+등록 여부는 네 설치의 `settings.json` PreToolUse 항목을 직접 읽어 확인한다.
+**도구가 막지 않았다는 사실을 허가로 읽지 마라**(장치의 부재는 권한의 확대가 아니다).
+목록 밖 행동이 필요하면 미등록 상태에서도 master 의 TTL 승인을 받는다.
 **게이트 deny 는 고장이 아니라 승인 요청 신호다**: 보류하고 master 에 사유 1줄을 상신하며 기록한다.
 - **deny 목록**: CronCreate·CronDelete·CronList·Monitor·TaskOutput·Agent·WebSearch·WebFetch·
   `mcp__computer-use__*`·Skill(허용: hallucination-guard) · 허용 경로 밖 Write/Edit/NotebookEdit

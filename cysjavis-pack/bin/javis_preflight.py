@@ -4249,6 +4249,46 @@ class Preflight:
                 gaps.append(cwd)
         return sorted(set(gaps))
 
+    def _seed_journals(self, cfg_dir):
+        """읽기 전용 — 그 config dir 의 미해결 교환 저널(`.claude.json.seed-intent-*`) 이름들 → (names, err).
+        열거 실패는 ([], errno 이름) 이고 그것은 **'저널 없음' 이 아니다**(★R6 codex: PASS·갭 없음으로 접지 않는다)."""
+        try:
+            return sorted(n for n in os.listdir(cfg_dir) if n.startswith(SEED_TRUST_INTENT_PREFIX)), None
+        except OSError as e:
+            return [], (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else str(e))
+
+    def _seed_pair(self, cfg_dir, ws):
+        """C58 의 **유일한 쓰기 진입점** → (rc, verdict, reason) 또는 None(report 모드).
+        `self.fix` 가드를 이 한 자리에 둔다 — 호출 지점이 둘(갭 수리 · 저널 판정)로 늘어도 report 모드 읽기 전용이
+        호출자 수만큼 흩어지지 않는다(★R6). 예외는 WARN 1줄로 접는다: run() 의 fut.result() 로 올라가면 preflight
+        전체가 죽는다(R3 · lone surrogate UnicodeEncodeError 재현)."""
+        if not self.fix:
+            return None
+        try:
+            return seed_trust(cfg_dir, ws, backup=True)
+        except Exception as e:  # noqa: BLE001 — 수리 1건의 예외가 점검 전체를 멈추면 안 된다
+            return SEED_TRUST_ERROR, "ERROR", "예외 %s: %s" % (type(e).__name__, e)
+
+    def _survey_journals(self, reg, previous=None):
+        """스코프 안 모든 config dir 의 저널 상태를 **읽기 전용**으로 훑는다 → {identity: {dir, names, err, verdict}}.
+        `previous` 를 주면 그 판정(verdict)을 이어받는다 — 수리 **뒤** 재열거용.
+        ★R6(codex 위임 반례 ②): 수리가 **새 저널을 남길 수도** 있다(교환은 성립했는데 청소가 실패한 정상 결과).
+        수리 전 스냅샷에 그 config 가 없었다는 이유로 재열거를 건너뛰면 FIXED 를 내며 잔존을 감춘다 — 그래서
+        재열거는 스냅샷 유무와 무관하게 **전 대상**을 다시 훑는다."""
+        out = {}
+        for k, cfg_dir in sorted(reg["configs"].items(), key=lambda kv: kv[1]):
+            if k in out or not os.path.isdir(cfg_dir):
+                continue
+            names, err = self._seed_journals(cfg_dir)
+            prev = (previous or {}).get(k) or {}
+            if names or err or prev.get("verdict") is not None:
+                out[k] = {"dir": cfg_dir, "names": names, "err": err, "verdict": prev.get("verdict")}
+        return out
+
+    def _existing_registered_cwd(self, reg, key):
+        """그 config 에 등재된 cwd 중 **실재하는** 첫 것(정렬 고정) 또는 None — 저널 판정의 호출 인자."""
+        return next((w for w in sorted(reg["pairs"].get(key, {}).values()) if os.path.isdir(w)), None)
+
     def c58_trust_harden(self):
         cid = "C58.trust-harden"
         if self.skipped(cid):
@@ -4258,10 +4298,21 @@ class Preflight:
         unreadable = reg.get("unreadable") or []
         stats = "출처 %d · config %d · 쌍 %d · 판독불가 %d · scope=%s" % (
             len(reg["sources"]), len(reg["configs"]), n_pairs, len(unreadable), reg.get("scope", "?"))
+        # ★R6(리뷰 codex major): 중단된 교환은 **신뢰 플래그가 이미 활성**이라 갭이 0 이다 — 갭만 보는 판정은
+        #   미해결 저널(상대의 더 새 문서가 displaced 에 고립된 상태)을 안고 PASS 를 냈고 `--fix` 에서도
+        #   seed_trust 가 아예 불리지 않아 저널 판정이 돌지 않았다. 저널 점검은 갭과 **독립**이며 쌍 0(SKIP)
+        #   보다도 **앞**이다(등재 cwd 가 없는 config 의 저널도 보여야 한다 · codex R6). 열거는 읽기 전용이다.
+        journals = self._survey_journals(reg)
         if n_pairs == 0:
             # ★R1(codex): 판정할 쌍이 0 이면 PASS 가 아니라 SKIP — config 가 있다는 사실은 워크스페이스 신뢰에 대해 아무것도
             #   증명하지 않는다. 출처 0(판독 없음)·임시 팩·계정 미상 부서·판독불가 파일 전부 이 경로.
             tail = (" · 판독불가: " + " | ".join(unreadable)) if unreadable else ""
+            residual, _resolved = _journal_lines(journals)
+            if residual:
+                # 쌍이 0 이어도 미해결 저널은 **관측된 사실**이다 — SKIP(판정 불가)로 덮지 않는다.
+                self.add(cid, WARN, "cysjavis 레지스트리 쌍 0(%s · 트러스트 판정 불가) · %s%s"
+                         % (stats, " | ".join(residual), tail))
+                return
             self.add(cid, SKIP, "cysjavis 레지스트리에 판정할 (config, cwd) 쌍 0(%s) — 트러스트 판정 불가(PASS 아님 · 데몬이 "
                      "claude 좌석을 기록한 뒤 재판정)%s" % (stats, tail))
             return
@@ -4284,18 +4335,22 @@ class Preflight:
         set_lines = []
         gap_lines = list(missing_cfg)
         for cfg in targets:
+            key = _path_identity(os.path.dirname(cfg))
             gaps = self._trust_gap_workspaces(cfg)
             if not gaps:
+                # 갭 0 인데 저널이 있으면 --fix 는 **기존 단일 경로**(seed_trust ⑬ 회수)를 한 번 돌린다. 갭이 있는
+                #   config 는 아래 수리 호출이 같은 회수를 하므로 여기서 중복 호출하지 않는다(codex R6).
+                entry = journals.get(key)
+                if entry and entry["names"] and self.fix:
+                    ws = self._existing_registered_cwd(reg, key)
+                    if ws:
+                        entry["verdict"] = self._seed_pair(entry["dir"], ws)
                 continue
             if self.fix:
                 for ws in gaps:
                     # ★쓰기는 --seed-trust 와 같은 경로 — 라이브 claude(그 config) 존재·검증 불가·잠금 경합·동시 변경은
-                    #   전부 보류로 접힌다(막는 쪽으로만 틀린다). ★R3: 예상 못 한 예외도 WARN 1줄로 접는다 — run() 의
-                    #   fut.result() 로 올라가면 preflight 전체가 죽는다(리뷰: lone surrogate UnicodeEncodeError 재현).
-                    try:
-                        rc, verdict, reason = seed_trust(os.path.dirname(cfg), ws, backup=True)
-                    except Exception as e:  # noqa: BLE001 — 수리 1건의 예외가 점검 전체를 멈추면 안 된다
-                        rc, verdict, reason = SEED_TRUST_ERROR, "ERROR", "예외 %s: %s" % (type(e).__name__, e)
+                    #   전부 보류로 접힌다(막는 쪽으로만 틀린다).
+                    rc, verdict, reason = self._seed_pair(os.path.dirname(cfg), ws)
                     if rc == SEED_TRUST_OK:
                         set_lines.append("trust set: %s / %s (%s)" % (cfg, ws, reason))
                     else:
@@ -4303,6 +4358,12 @@ class Preflight:
             else:
                 for ws in gaps:
                     gap_lines.append("trust gap: %s / %s (--fix로 세팅)" % (cfg, ws))
+        if self.fix:
+            # rc 만으로 '정리 완료' 를 단정하지 않는다 — 수리 뒤 **재열거**가 잔존의 정본이다(codex R6 · 위임 반례 ②).
+            journals = self._survey_journals(reg, journals)
+        residual, resolved = _journal_lines(journals)
+        gap_lines.extend(residual)
+        set_lines.extend(resolved)
         if unreadable:
             gap_lines.append("판독불가 레지스트리 파일: " + " | ".join(unreadable))
         if set_lines:
@@ -5963,7 +6024,10 @@ SEED_TRUST_LOCK_NAME = ".claude.json.seed-lock"
 SEED_TRUST_TMP_PREFIX = ".claude.json.seed-"
 SEED_TRUST_DISPLACED_PREFIX = ".claude.json.displaced-"   # 교환 전에 옮겨 두는 이름 — 교환 뒤 옛 inode 가 여기 앉는다
 SEED_TRUST_CONFLICT_PREFIX = ".claude.json.conflict-"     # 되교환 창의 제3 쓰기 보존 — 자동 삭제 0
-_SEED_TMP_LITTER_RE = re.compile(r"^\.claude\.json\.seed-[A-Za-z0-9_]{8}$")   # mkstemp 접미 8자만(잠금 -lock · displaced · conflict 제외)
+# ★R6(codex 위임 반례 ①): 파이썬 정규식 `$` 는 **문자열 끝 개행 앞**에도 일치한다 — 파일 이름과 sha256 필드는
+#   개행을 담을 수 있으므로(POSIX 파일명은 개행 허용) 전부 `\Z`(진짜 끝)로 못 박는다. 종전엔 `<64hex>\n` 이
+#   '유효한 지문' 으로 통과해 형식 위반 저널이 회수 경로로 들어갔다.
+_SEED_TMP_LITTER_RE = re.compile(r"^\.claude\.json\.seed-[A-Za-z0-9_]{8}\Z")   # mkstemp 접미 8자만(잠금 -lock · displaced · conflict 제외)
 # ★R3: displaced 이름 = <prefix><payload sha256 64hex>-<utc>-<pid>[-n]. 청소는 파일 바이트의 sha256 이 이름의 지문과 **같을
 #   때만** = 'payload 와 바이트 동등한 잔재' 의 회수(소유·출처 증명이 아니다 · 지문이 다른 낯선 inode 는 무접촉). conflict-* 와
 #   지문 없는 구형 displaced 이름은 청소 대상이 아니다.
@@ -5972,7 +6036,7 @@ _SEED_DISPLACED_RE = re.compile(r"^\.claude\.json\.displaced-([0-9a-f]{64})-")
 #   정규식(`_SEED_TMP_LITTER_RE` = seed-<8자>)과 겹치지 않아 잔재 청소가 지우지 못한다.
 SEED_TRUST_INTENT_PREFIX = ".claude.json.seed-intent-"
 _SEED_INTENT_MAX_BYTES = 8192
-_SEED_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_SEED_HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _SEED_DISPLACED_DIGEST_LEN = 64
 _CLAUDE_EXE_NAMES = ("claude", "claude.exe", "claude.cmd")
 _CLAUDE_INSTALL_MARKER = "/claude/versions/"        # 공식 설치 레이아웃 ~/.local/share/claude/versions/<ver>(직접 exec 형상)
@@ -6314,7 +6378,9 @@ def _ps_env_candidates_truncated(text, name="CLAUDE_CONFIG_DIR", limit=_PS_VALUE
 
 def _ps_env_value_candidates(text, name="CLAUDE_CONFIG_DIR", limit=_PS_VALUE_CANDIDATE_MAX):
     """`NAME=` 가 세그먼트 머리에 실린 자리마다 그 뒤의 **공백으로 끝나는 모든 접두**를 값 후보로 낸다(순수 · 중복 제거 ·
-    상한 24).
+    개수 상한 `_PS_VALUE_CANDIDATE_MAX`=512 · 길이 상한 `_MAX_PATH_PROBE`=4096. ★R6(리뷰 minor): 종전 docstring 의
+    '상한 24' 는 R5 에서 512 로 올린 뒤 남은 사문이었다 — 이 상한은 '검증된 0' 과 '미해결' 을 가르는 안전 파라미터
+    (`_ps_env_candidates_truncated`)라 오독이 곧 판정 오독이다).
     왜 접두 전부인가(★R5 · 리뷰 codex D2): `ps -E` 한 줄에는 env 구분자가 없어 값의 끝을 **원리적으로** 알 수 없다 —
     종전 판독기(`_PS_ENV_SPLIT_RE`)는 다음 `NAME=` 를 경계로 삼는데, ⓐ 이름이 셸 식별자가 아니면(`BAD-NAME=`,
     `BASH_FUNC_f%%=`) 경계를 못 보고 값이 **길게** 잡히고, ⓑ 값 안에 ` X=y` 가 있으면 값이 **짧게** 잡힌다. 둘 다
@@ -6740,20 +6806,52 @@ def _unlink_quiet(path):
         pass
 
 
-def _fsync_dir(path):
-    """디렉터리 fsync(rename/link 의 내구성 · POSIX 만 · 실패 무시 — 내구성은 부수 보장)."""
+# 디렉터리 fsync 가 **원리적으로 없는** 플랫폼/FS 의 errno — 이것만 strict 에서 통과시킨다(EIO·ENOSPC 는 통과 못 한다).
+_DIR_FSYNC_UNSUPPORTED = tuple(e for e in (getattr(errno, "EINVAL", None), getattr(errno, "ENOTSUP", None),
+                                           getattr(errno, "EOPNOTSUPP", None), getattr(errno, "ENOSYS", None))
+                               if e is not None)
+
+
+def _fsync_dir(path, strict=False):
+    """디렉터리 fsync(rename/link 의 내구성 · POSIX 만).
+    기본(strict=False)은 **부수 보장**이라 실패를 무시한다 — 커밋이 이미 성립한 뒤의 내구성 강화용.
+    ★R6(리뷰 codex major): 의도 저널은 '이름이 교환보다 먼저 내구적' 이어야 하는 **의무**다 — 거기서 이 함수가
+    EIO 까지 삼키면 저널 없이 교환을 여는 것과 같아진다. `strict=True` 는 **open 실패를 언제나 전파**하고
+    (codex R6: open 단계의 EINVAL 은 'fsync 미지원' 의 증거가 아니다), fsync 단계만 `_DIR_FSYNC_UNSUPPORTED`
+    를 통과시킨다. 그 통과의 대가는 정직하게 고지한다 — 디렉터리 fsync 가 없는 FS 에서 전원 장애까지의 저널
+    내구성은 보장되지 않는다(프로세스 사망까지는 보장된다: 이름은 이미 보인다).
+    Windows(os.name != posix)는 종전대로 무동작이다 — 여기서 예외를 올리면 `exchange-unavailable` REFUSE 에
+    닿기도 전에 ERROR 로 끝나 계약이 바뀐다(codex R6)."""
     if os.name != "posix":
         return
     try:
         dfd = os.open(path, os.O_RDONLY)
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(dfd)
-    except OSError:
-        pass
+    except OSError as e:
+        if strict and e.errno not in _DIR_FSYNC_UNSUPPORTED:
+            raise
     finally:
         os.close(dfd)
+
+
+def _lexists_strict(path):
+    """`os.lstat` 로 확정하는 존재 여부 → True(있다) · False(**증명된** 부재) · None(조회 실패 = 모른다).
+    ★R6(리뷰 codex): `os.path.lexists` 는 EACCES/EIO/ESTALE 를 '없다' 로 접는다 — 회수 판정에서 그 접힘은 곧
+    '지워도 된다' 가 된다(결측은 값이 아니다). 부재류 분류는 `_stat_ident` 와 같은 집합이다."""
+    try:
+        os.lstat(path)
+        return True
+    except OSError as e:
+        absent = (getattr(errno, "ENOENT", None), getattr(errno, "ENOTDIR", None),
+                  getattr(errno, "ELOOP", None), getattr(errno, "ENAMETOOLONG", None))
+        return False if e.errno in absent else None
+    except ValueError:
+        return False                 # 널 바이트 등 — 경로가 될 수 없는 문자열
 
 
 def _exclusive_name(prefix):
@@ -6786,6 +6884,11 @@ def _sweep_stale_seed_tmp(config_dir):
         names = os.listdir(config_dir)
     except OSError:
         return 0
+    # ★R6(리뷰 codex '추가로 놓친 것' ②): displaced 지문 청소는 **활성 문서가 유효할 때만** 한다. payload 를
+    #   displaced 로 rename 한 뒤 저널 공개 전에 죽으면 저널 없는 payload 잔재가 남는데, 그 내용은 '원본 + 플래그'
+    #   라 그 사이 활성이 잘렸다면 그것이 유일한 완전한 문서다(회수 ⓑ 와 같은 손실). mkstemp 잔재(.seed-<8자>)는
+    #   공개된 적 없는 순수 임시파일이라 이 조건과 무관하게 치운다.
+    healthy = None                     # 지연 판정 — displaced 후보가 없으면 판독하지 않는다
     for n in names:
         path = os.path.join(config_dir, n)
         if _SEED_TMP_LITTER_RE.match(n) and n != SEED_TRUST_LOCK_NAME:
@@ -6798,6 +6901,10 @@ def _sweep_stale_seed_tmp(config_dir):
         m = _SEED_DISPLACED_RE.match(n)
         if not m:
             continue
+        if healthy is None:
+            healthy = _active_document_healthy(os.path.join(config_dir, ".claude.json"))
+        if not healthy:
+            continue                                       # 유일한 완전한 사본일 수 있다 — 무접촉(사람이 병합)
         try:
             if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
                 continue
@@ -6851,7 +6958,11 @@ def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_dige
         _unlink_quiet(tmp)
         raise
     _unlink_quiet(tmp)
-    _fsync_dir(config_dir)                # 저널의 **이름**이 교환보다 먼저 내구적이어야 한다
+    try:
+        _fsync_dir(config_dir, strict=True)   # 저널의 **이름**이 교환보다 먼저 내구적이어야 한다(★R6: 실패를 삼키지 않는다)
+    except OSError:
+        _unlink_quiet(path)                   # 내구성을 못 세웠다 = 창을 열지 않는다 — 표시도 남기지 않는다
+        raise
     return path
 
 
@@ -6885,15 +6996,42 @@ def _read_seed_intent(path):
 
 
 def _active_document_healthy(cfg):
-    """활성 `.claude.json` 이 **유효한 문서**인가(존재 + 파싱). displaced 를 지워도 되는지의 전제다 — 활성이 없거나
-    깨졌으면 displaced 가 유일한 유효 사본일 수 있다(codex D4: 지문 동등만으로 삭제를 인가하지 않는다)."""
+    """활성 `.claude.json` 이 **유효한 문서**인가(존재 + 실제로 파싱된 JSON 객체). displaced 를 지워도 되는지의
+    전제다 — 활성이 없거나 깨졌으면 displaced 가 유일한 유효 사본일 수 있다(codex D4: 지문 동등만으로 삭제를
+    인가하지 않는다).
+    ★R6(리뷰 codex major): 종전엔 `_parse_claude_json` 을 썼다 — 그것은 **0바이트/공백을 `{}` 로** 바꾼다(시더의
+    '빈 문서에도 시드한다' 관용). 그 관용을 **보존 사본 삭제의 근거**로 쓰면 중단 뒤 잘린 활성 문서가 '건강' 이
+    되어 유일한 완전한 사본을 지운다. 여기서는 빈 바이트·공백·비객체 JSON 전부 **불건강**이다(거부 방향).
+    판독 실패(권한·IO·심링크·비정규)도 불건강 — '못 봤다' 를 '건강하다' 로 읽지 않는다.
+    `utf-8-sig` 디코딩은 시더와 같게 유지한다(BOM 있는 실 문서를 불건강으로 오판하지 않는다 · codex R6)."""
     try:
         existed, raw, _st = _read_claude_json_bytes(cfg)
-        if not existed:
-            return False
-        return isinstance(_parse_claude_json(existed, raw), dict)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError):
         return False
+    if not existed or not raw.strip():
+        return False
+    try:
+        return isinstance(json.loads(raw.decode("utf-8-sig")), dict)
+    except (ValueError, UnicodeDecodeError):
+        return False
+
+
+def _journal_lines(journals):
+    """C58 저널 점검의 사람이 읽는 줄 → (잔존, 회수됨). 잔존·판독 불가·회수 완료를 **다른 문장**으로 낸다 —
+    침묵도 뭉뚱그림도 없다(★R6 리뷰 codex major: 미해결 트랜잭션을 안고 PASS 를 내던 자리)."""
+    residual, resolved = [], []
+    for entry in sorted(journals.values(), key=lambda e: e["dir"]):
+        got = entry.get("verdict")
+        tail = (" — 판정 %s %s" % (got[1], got[2])) if got is not None else ""
+        if entry["err"]:
+            residual.append("%s: 교환 저널 상태 판독 불가(%s — '저널 없음' 이 아니다)%s" % (entry["dir"], entry["err"], tail))
+        elif entry["names"]:
+            more = (" 외 %d" % (len(entry["names"]) - 1)) if len(entry["names"]) > 1 else ""
+            residual.append("%s: 미해결 교환 저널 %d건(%s%s — 중단된 신뢰 교환 · 사람이 .claude.json* 을 병합한 뒤 저널을 "
+                            "지운다)%s" % (entry["dir"], len(entry["names"]), entry["names"][0], more, tail))
+        elif got is not None:
+            resolved.append("중단된 교환 저널 회수: %s (%s %s)" % (entry["dir"], got[1], got[2]))
+    return residual, resolved
 
 
 def _recover_interrupted_seed(config_dir, cfg):
@@ -6912,8 +7050,12 @@ def _recover_interrupted_seed(config_dir, cfg):
     R = SEED_TRUST_REFUSE
     try:
         names = sorted(n for n in os.listdir(config_dir) if n.startswith(SEED_TRUST_INTENT_PREFIX))
-    except OSError:
-        return None
+    except OSError as e:
+        # ★R6(리뷰 codex major): 종전엔 `return None`(계속)이라 열거가 막힌 dir 에서 미해결 저널이 **무시**됐고
+        #   그 실행이 `already-trusted OK` 를 냈다. 이 자리는 config dir 생성·잠금 획득 **뒤**라 ENOENT 조차
+        #   '정상적인 초기 부재' 가 아니라 '그 사이 사라졌다' 는 뜻이다(codex R6) — 전부 거부한다.
+        return (R, "REFUSE", "journal-scan-failed(%s — 중단된 교환의 흔적을 관측할 수 없다 · 무접촉 · 사람이 확인)"
+                % (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
     for n in names:
         jpath = os.path.join(config_dir, n)
         rec = _read_seed_intent(jpath)
@@ -6921,7 +7063,11 @@ def _recover_interrupted_seed(config_dir, cfg):
             return (R, "REFUSE", "interrupted-transaction(저널 %s 판독 불가/형식 위반 — 중단된 교환의 흔적이다 · "
                                  "이 디렉터리의 .claude.json* 를 사람이 확인·병합한 뒤 저널을 지운다)" % n)
         dpath = os.path.join(config_dir, rec["displaced"])
-        if not os.path.lexists(dpath):
+        here = _lexists_strict(dpath)         # ★R6(codex): 조회 실패를 '부재' 로 접지 않는다 — 그 접힘은 '지워도 된다' 가 된다
+        if here is None:
+            return (R, "REFUSE", "interrupted-transaction(저널 %s 가 가리키는 %s 의 존재를 조회할 수 없다 — 무접촉 · "
+                                 "사람이 확인)" % (n, rec["displaced"]))
+        if here is False:
             if _active_document_healthy(cfg):
                 _unlink_quiet(jpath)
                 continue
@@ -6946,7 +7092,11 @@ def _recover_interrupted_seed(config_dir, cfg):
             try:
                 os.unlink(dpath)
             except OSError:
-                continue                          # 저널을 남겨 다음 실행이 다시 시도한다
+                # ★R6(codex): 데이터 판정은 끝났지만(활성 = 우리 문서 · displaced = 바이트 동일한 옛 원본) **정리는
+                #   못 했다**. 저널을 남겨 다음 실행이 다시 시도하고 C58 이 그 잔존을 WARN 으로 드러낸다 —
+                #   '회수 성공 = 저널 0' 을 단정하지 않는다. 여기서 REFUSE 로 올리지 않는 이유: 데이터는 안전하고
+                #   FS 일시 오류로 부트 경로를 매번 막는 것이 더 나쁘다(치명위험 ④ 방향).
+                continue
             _unlink_quiet(jpath)
             continue
         return (R, "REFUSE", "interrupted-transaction(교환 뒤 검증 전에 중단됐다 — 상대의 더 새 문서가 %s 에 있고 활성 "
@@ -7870,6 +8020,17 @@ def _self_test():
           and _ps_target_ambiguous("/w/a\r") and _ps_target_ambiguous("/w/cfg\t") and _ps_target_ambiguous("/w/a X=y")
           and not _ps_target_ambiguous("/w/cfg") and not _ps_target_ambiguous("/w/my cfg")
           and not _ps_target_ambiguous("/w/a=b") and not _ps_target_ambiguous("/w/a\tb"))
+    check("_open_unblocking_ro(R5 minor · R6 핀): Windows 텍스트 모드(CRLF 변환·0x1A EOF 절단) 회귀 금지 — flags 에 O_BINARY "
+          "를 싣는다(POSIX 는 getattr 0 이라 무영향 · macOS 에서 행위로는 관측 불가하므로 소스 핀이 유일한 회귀 장치)",
+          'getattr(os, "O_BINARY", 0)' in inspect.getsource(_open_unblocking_ro)
+          and inspect.getsource(_open_unblocking_ro).index("flags = os.O_RDONLY")
+          < inspect.getsource(_open_unblocking_ro).index('getattr(os, "O_BINARY", 0)')
+          < inspect.getsource(_open_unblocking_ro).index("fd = os.open(path, flags)"))
+    check("_ps_env_value_present(R5 codex major · R6 핀): 뒤 경계는 **아무 공백**이다 — 뒤따르는 변수 이름이 셸 식별자가 "
+          "아니어도(BAD-NAME= · BASH_FUNC_f%%=) 양성 관측이 살아 있어야 --force-unverified 가 라이브 claude 를 못 넘는다",
+          _ps_env_value_present("CLAUDE_CONFIG_DIR=/w/a BAD-NAME=x", "CLAUDE_CONFIG_DIR", "/w/a")
+          and _ps_env_value_present("CLAUDE_CONFIG_DIR=/w/a BASH_FUNC_f%%=() {", "CLAUDE_CONFIG_DIR", "/w/a")
+          and _ps_env_value_present("CLAUDE_CONFIG_DIR=/w/a 1BAD=x", "CLAUDE_CONFIG_DIR", "/w/a"))
     check("_ps_env_value_present(R4 codex major): 분할 前 원문 대조 — 꼬리 공백·값 속 ' NAME=' 도 양성 · 경계 밖 부분일치는 음성",
           _ps_env_value_present("CLAUDE_CONFIG_DIR=/w/account  HOME=/x", "CLAUDE_CONFIG_DIR", "/w/account ")
           and _ps_env_value_present("CLAUDE_CONFIG_DIR=/w/a X=y HOME=/x", "CLAUDE_CONFIG_DIR", "/w/a X=y")
@@ -7956,7 +8117,40 @@ def _self_test():
           and "의도 저널 기록 실패" in seed_src
           and "seed_trust(" not in inspect.getsource(_recover_interrupted_seed)
           and "os.link(tmp, path)" in inspect.getsource(_write_seed_intent)
-          and "_fsync_dir(config_dir)" in inspect.getsource(_write_seed_intent))
+          # ★R6 재핀(리뷰 codex major M3): 종전 핀은 `_fsync_dir(config_dir)` 문자열만 봤다 — 그 헬퍼는 open/fsync
+          #   실패를 **전부 삼켜서**(EIO 포함) '이름이 먼저 내구적' 이라는 의무를 세우지 못한 채 성공을 돌려줬다.
+          #   이제 strict 를 요구하고, 내구성 실패 시 공개한 저널 이름을 회수하는지까지 본다.
+          and "_fsync_dir(config_dir, strict=True)" in inspect.getsource(_write_seed_intent)
+          and "_unlink_quiet(path)" in inspect.getsource(_write_seed_intent))
+    fs_src = inspect.getsource(_fsync_dir)
+    check("_fsync_dir(R6 리뷰 codex major): strict 는 **open 실패를 언제나 전파**하고(open 단계 EINVAL 은 fsync 미지원의 "
+          "증거가 아니다) fsync 단계만 미지원 errno 를 통과 · Windows(비-posix)는 종전대로 무동작",
+          'if os.name != "posix":' in fs_src and fs_src.index('if os.name != "posix":') < fs_src.index("os.open(")
+          and "if strict:\n            raise" in fs_src
+          and "e.errno not in _DIR_FSYNC_UNSUPPORTED" in fs_src
+          and getattr(errno, "EIO", None) not in _DIR_FSYNC_UNSUPPORTED
+          and getattr(errno, "ENOSPC", None) not in _DIR_FSYNC_UNSUPPORTED
+          and getattr(errno, "EACCES", None) not in _DIR_FSYNC_UNSUPPORTED)
+    check("_lexists_strict(R6 리뷰 codex): 조회 실패는 '부재' 가 아니다 — 부재류만 False · 나머지 OSError 는 None",
+          _lexists_strict(os.path.join(os.path.dirname(os.path.abspath(__file__)), "\x00nope")) is False
+          and _lexists_strict(os.path.abspath(__file__)) is True
+          and _lexists_strict(os.path.join(os.path.abspath(__file__), "under-a-file")) is False
+          and "os.lstat(path)" in inspect.getsource(_lexists_strict)
+          and "os.path.lexists" not in inspect.getsource(_recover_interrupted_seed))
+    check("_active_document_healthy(R6 리뷰 codex major): 잘린 활성 문서는 **건강이 아니다** — 보존 사본 삭제의 근거로 "
+          "`_parse_claude_json` 의 '빈 파일 → {}' 관용을 쓰지 않는다",
+          "_parse_claude_json(" not in inspect.getsource(_active_document_healthy)   # 호출 0(주석의 이름 언급은 무관)
+          and "raw.strip()" in inspect.getsource(_active_document_healthy)
+          and "utf-8-sig" in inspect.getsource(_active_document_healthy))
+    check("_sweep_stale_seed_tmp(R6 리뷰 codex): displaced 지문 청소는 활성 문서가 유효할 때만(저널 없는 payload 잔재가 "
+          "유일한 완전한 사본일 수 있다) · mkstemp 잔재는 무관하게 청소",
+          "_active_document_healthy(" in inspect.getsource(_sweep_stale_seed_tmp)
+          and inspect.getsource(_sweep_stale_seed_tmp).index("_SEED_TMP_LITTER_RE.match(n)")
+          < inspect.getsource(_sweep_stale_seed_tmp).index("_active_document_healthy("))
+    check("_recover_interrupted_seed(R6 리뷰 codex major): 저널 열거 실패는 '저널 없음' 이 아니라 REFUSE",
+          "journal-scan-failed" in inspect.getsource(_recover_interrupted_seed)
+          # 문(statement)으로서의 `return None` 이 열거 앞에 0(주석 속 이름 언급은 무관)
+          and "\n        return None" not in inspect.getsource(_recover_interrupted_seed).split("for n in names:")[0])
     dl_src = inspect.getsource(_start_seed_deadline)
     main_seed_src = inspect.getsource(_seed_trust_main)
     check("--seed-trust 마감 감시(R4): 데몬 타이머(SIGALRM 0 · Windows 안전) · 초과는 REFUSE 1줄 뒤 os._exit(2) · 정상 경로는 취소",
@@ -8001,18 +8195,33 @@ def _self_test():
     check("C58 갭 판정은 정확 키(claude_project_key) — 별칭 true 불인정(R1)",
           "claude_project_key(cwd)" in gap_src and "_path_identity(ws)" not in gap_src)
     c58_src = inspect.getsource(Preflight.c58_trust_harden)
-    check("C58 --fix 쓰기는 seed_trust 경로(fix 분기 안 · backup=True)",
-          "seed_trust(" in c58_src and c58_src.index("if self.fix:") < c58_src.index("seed_trust(")
-          and "backup=True" in c58_src)
-    check("C58 report 모드는 읽기 전용(seed_trust 는 fix 분기에서만)",
-          c58_src.count("seed_trust(") == 1)
+    pair_src = inspect.getsource(Preflight._seed_pair)
+    # ★R6 재핀(리뷰 codex major M4 · 계약 §B-(f) '되핀은 사유를 밝힌다'): 저널 판정 호출이 생겨 C58 안의
+    #   `seed_trust(` **개수**로 읽기 전용을 재던 종전 핀은 더 못 쓴다. 대신 **구조로** 더 강하게 못 박는다 —
+    #   쓰기 진입점은 `_seed_pair` 하나이고 `self.fix` 가드가 그 안에 있다(호출자 수와 무관하게 read-only 보존).
+    check("C58 쓰기 진입점은 _seed_pair 하나 — c58 본문에 직접 seed_trust 호출 0(R6 재핀)",
+          "seed_trust(" not in c58_src and "self._seed_pair(" in c58_src)
+    check("C58 report 모드는 읽기 전용 — _seed_pair 가 self.fix 가드를 **먼저** 통과해야 seed_trust 에 닿는다(R6 재핀)",
+          "if not self.fix:" in pair_src and pair_src.index("if not self.fix:") < pair_src.index("seed_trust(")
+          and "backup=True" in pair_src and pair_src.count("seed_trust(") == 1)
+    check("C58(R3): --fix 의 seed_trust 예외는 WARN 1줄로 접힌다(preflight 전체 중단 0)",
+          pair_src.index("try:") < pair_src.index("seed_trust(") < pair_src.index("except Exception"))
     check("C58: 판정할 쌍 0 → SKIP(PASS 아님 · 판정 정직성 R1) · hook 배선 프로필 루프(스코프 ①) 제거",
           "self.add(cid, SKIP" in c58_src and c58_src.index("self.add(cid, SKIP") < c58_src.index("targets = []")
           and "discover_claude_settings" not in c58_src and "_hook_registered" not in c58_src)
     check("C58: 등재 쌍이 있는데 config dir 부재 → 침묵 통과 아님(WARN 줄 · 되살리기 0)",
-          "config dir 부재" in c58_src and c58_src.index("config dir 부재") < c58_src.index("seed_trust("))
-    check("C58(R3): --fix 의 seed_trust 예외는 WARN 1줄로 접힌다(preflight 전체 중단 0)",
-          c58_src.index("try:") < c58_src.index("seed_trust(") < c58_src.index("except Exception"))
+          "config dir 부재" in c58_src and c58_src.index("config dir 부재") < c58_src.index("self._seed_pair("))
+    check("C58(R6 리뷰 codex major): 미해결 교환 저널 점검은 갭과 **독립**이고 쌍 0(SKIP)보다 앞이다 — 읽기 전용 열거",
+          c58_src.index("journals = self._survey_journals(reg)") < c58_src.index("self.add(cid, SKIP")
+          and "self._seed_journals(cfg_dir)" in inspect.getsource(Preflight._survey_journals)
+          and "os.listdir" in inspect.getsource(Preflight._seed_journals)
+          and "seed_trust" not in inspect.getsource(Preflight._seed_journals))
+    check("C58(R6 · codex 위임 반례 ②): 저널 잔존 판정의 정본은 수리 뒤 **전 대상 재열거**다 — rc 로도, 수리 전 "
+          "스냅샷 유무로도 단정하지 않는다(수리가 새 저널을 남기는 정상 결과가 있다)",
+          c58_src.count("self._survey_journals(reg") == 2
+          and c58_src.index("journals = self._survey_journals(reg, journals)") > c58_src.index("for cfg in targets:")
+          and c58_src.index("journals = self._survey_journals(reg, journals)") < c58_src.rindex("_journal_lines(journals)")
+          and "previous" in inspect.getsource(Preflight._survey_journals))
     check("registry(R3 codex): depts.json 카탈로그 cwd 만 기동기 규칙으로 해석 — 루트('/' · '///' · '\\\\' · 'C:\\') → home · 부재 dir → home · 존재 dir 원값 · topology 는 무해석(관측 쌍 보존)",
           _resolve_catalog_cwd("/", home="/h") == "/h" and _resolve_catalog_cwd("///", home="/h") == "/h"
           and _resolve_catalog_cwd("\\\\", home="/h") == "/h" and _resolve_catalog_cwd("C:\\", home="/h") == "/h"

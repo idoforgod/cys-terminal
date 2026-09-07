@@ -34,14 +34,27 @@ REQUIRED_CLAUSE_TOKENS = (
     "생존 확인 불가", "구독에는 예외가 없다",
     # ★R5(리뷰 major): 게이트가 **아직 없는 상태**(WP-3 A/B 미배포)에서 "게이트가 deny 한다" 는 단언은 거짓이었다.
     #   문면은 이제 ①규율이 먼저 ②등록 조건(alert_route ∧ 신판 표지) ③미등록도 경계는 유효 를 말해야 한다.
-    "등록 조건(정본 · preflight 가 판정한다)", "도구가 막지 않았다는 사실을 허가로 읽지 마라",
+    "등록 조건(정본)", "도구가 막지 않았다는 사실을 허가로 읽지 마라",
     "전이 상태 고지", "감시\n  **하한**",
+    # ★R6(리뷰 minor): 이 레인엔 preflight 판정이 없다(WP-3 A = Pack P2). 지침이 "preflight 가 판정한다/WARN 으로
+    #   드러낸다" 고 단언하면 **WARN 부재를 '등록됨' 으로 오독**한다 → 미배선 고지와 확인 수단(settings.json)을 못 박는다.
+    "판정 도구는 이 조항과 같은 릴리스에서 온다", "미배선",
+    "WARN 이 없다는 사실을 '등록됨' 으로 읽지 마라",
+    "`settings.json` PreToolUse 항목을 직접 읽어",
 )
 # 음성 대조: 장치의 존재를 무조건 단언하는 옛 문면이 되살아나면 실패한다(§3-1 '문장은 장치의 설명').
+#   ★R6(리뷰 major): 이 목록은 `unconditional_gate_claims_present` 가 **양쪽을 같은 규칙으로 접어** 대조한다 —
+#   종전엔 haystack 만 공백을 지우고 needle 은 공백·개행을 그대로 둬 어떤 항목도 매치될 수 없었다(회귀 방지 0).
 UNCONDITIONAL_GATE_CLAIMS = (
     "PreToolUse)가 deny 한다",
     "`hooks/role-capability-gate.sh`)가 deny\n  한다",
+    # WP-3 A 미배포 상태에서 preflight 가 판정한다고 말하는 옛 문면(R6)
+    "등록 조건(정본 · preflight 가 판정한다)",
+    "preflight 가 WARN 으로 드러낸다",
+    "등록 여부는 preflight 출력으로 확인하고",
 )
+# 등록 조건 문면이 **함께** 있어야 §1-1 이 조건부다 — 하나만 지워도 판정이 뒤집히는지 검체가 확인한다(항진명제 금지).
+REGISTRATION_CONDITION_TOKENS = ("alert_route", "미등록", "등록 조건")
 # plan §4 WP-3 B 리터럴 — Rust 레인 alert_route 와의 패리티 상수는 통합 항목이다(바뀌면 여기와 지침 §1 갱신).
 ALERT_EVENTS = (
     "health.alert", "watchdog.*", "surface.exited", "context.threshold",
@@ -92,6 +105,23 @@ def strip_html_comments(text: str) -> str:
 def normalize(text: str) -> str:
     """강조 표식을 걷고 공백 연쇄(줄바꿈 포함)를 한 칸으로 접는다 — 줄바꿈 위치와 무관한 접두 대조용."""
     return re.sub(r"\s+", " ", text.replace("**", ""))
+
+
+def squash(text: str) -> str:
+    """강조 표식과 **모든 공백**(줄바꿈 포함)을 걷어낸 대조형. 문면 대조의 **양쪽 피연산자에 같이** 적용한다 —
+    한쪽만 접으면 needle 이 영원히 매치되지 않는다(★R6 리뷰 major 가 실측한 공허한 음성 대조)."""
+    return re.sub(r"\s+", "", text.replace("**", ""))
+
+
+def unconditional_gate_claims_present(body: str) -> list[str]:
+    """본문에 살아 있는 무조건 집행 단언의 목록(빈 목록이 합격). 줄바꿈 위치·강조 표식과 무관하다."""
+    folded = squash(body)
+    return [claim for claim in UNCONDITIONAL_GATE_CLAIMS if squash(claim) in folded]
+
+
+def registration_conditions_present(section: str) -> bool:
+    """등록 조건 문면(경보 라우팅 키 · '미등록' 상태 · '등록 조건' 표제)이 **전부** 있는가."""
+    return all(token in section for token in REGISTRATION_CONDITION_TOKENS)
 
 
 def marker_line_index(text: str, marker: str) -> int | None:
@@ -242,16 +272,27 @@ class CsoDirectiveRevision(unittest.TestCase):
     def test_gate_enforcement_claims_are_conditional_on_registration(self):
         """★R5(리뷰 major): 지침이 존재하지 않을 수 있는 집행 장치를 무조건 단언하면 안 된다 — 등록 조건과
         '미등록에서도 경계는 유효' 가 함께 있어야 하고, 옛 무조건 단언은 사라져야 한다."""
-        for claim in UNCONDITIONAL_GATE_CLAIMS:
-            with self.subTest(claim=claim[:24]):
-                self.assertNotIn(claim, normalize(self.body).replace(" ", ""),
-                                 "무조건 집행 단언이 남아 있다")
+        self.assertEqual(unconditional_gate_claims_present(self.body), [], "무조건 집행 단언이 남아 있다")
         gate_section = section_body(self.cso, "## 1. 임무 — 터미널 거버넌스 기능의 운영자")
-        self.assertIn("alert_route", gate_section)
-        self.assertIn("미등록", gate_section)
-        # 음성 대조군: 조건 문장을 지우면 이 판정이 뒤집혀야 한다(핀이 문자열 존재만 보는 게 아님을 증명)
-        stripped = gate_section.replace("미등록", "")
-        self.assertNotIn("미등록", stripped)
+        self.assertTrue(registration_conditions_present(gate_section), "등록 조건 문면이 §1 에 없다")
+
+    def test_unconditional_gate_claim_detector_actually_fires(self):
+        """★R6(리뷰 major · 음성 대조군의 실효성): 금지 문면을 **메모리 사본에 주입**하면 판정기가 실제로 잡아야 한다.
+        종전 단언은 haystack 만 공백을 지워 어떤 금지 문면도 매치될 수 없었다 — 무조건 게이트 단언을 되살려도 통과했다.
+        조건 토큰을 하나씩 지우면 등록 조건 판정도 뒤집혀야 한다(문자열 존재만 보는 항진명제가 아님의 증명)."""
+        for claim in UNCONDITIONAL_GATE_CLAIMS:
+            with self.subTest(injected=claim[:28]):
+                self.assertEqual(unconditional_gate_claims_present(self.body + "\n" + claim), [claim],
+                                 "주입한 무조건 단언을 판정기가 보지 못한다(핀이 공허하다)")
+        # 줄바꿈·강조 표식이 끼어들어도 같은 판정이어야 한다(실 지침의 접힘 형태 재현)
+        folded = "능력 게이트(`hooks/role-capability-gate.sh`)가 deny\n  **한다**"
+        self.assertEqual(unconditional_gate_claims_present(self.body + "\n" + folded),
+                         ["`hooks/role-capability-gate.sh`)가 deny\n  한다"])
+        gate_section = section_body(self.cso, "## 1. 임무 — 터미널 거버넌스 기능의 운영자")
+        for token in REGISTRATION_CONDITION_TOKENS:
+            with self.subTest(removed=token):
+                self.assertFalse(registration_conditions_present(gate_section.replace(token, "")),
+                                 "%r 를 지워도 등록 조건 판정이 참이다" % token)
 
     def test_wp6_clause_declares_tool_dormancy(self):
         """★R5(리뷰 minor): WP-6 문안은 도구보다 먼저 배포된다 — 도구가 그 축을 내지 않으면 **휴면**임을 명시해야 한다."""
