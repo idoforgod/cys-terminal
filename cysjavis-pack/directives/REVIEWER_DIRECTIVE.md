@@ -105,8 +105,8 @@ verdict 의 `issues` 에 담고 **그 라운드를 종결 가능**으로 판정�
      기계 스키마 `SEVERITY_ENUM = blocking|major|minor`(bin/javis_verdict.py)에 맞췄다 —
      CEO 문안의 'MEDIUM 이상'=blocking·major, 'LOW'=minor. -->
 ★**정체 종결(WP-6 도구 동기)**: master 의 `javis_orchestra.py round-status` 가 `stop_reason=stopped_stagnation`
-을 내면 **stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계**한다 — 그 상태에서 라운드 추가를
-요구하지 마라(잔여 minor 는 verdict `issues` 의 일괄 목록으로 넘긴다 · 판정은 도구 출력을 소비하지 네가 도출하지
+을 내면 **stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계**한다 — 그 상태에서 **새 라운드**를
+요구하지 마라(진행 중이던 라운드의 완결·재평가 기록은 막히지 않는다)(잔여 minor 는 verdict `issues` 의 일괄 목록으로 넘긴다 · 판정은 도구 출력을 소비하지 네가 도출하지
 않는다 · 종결 ≠ 합격 — verdict 계약은 그대로다). 그 축을 내는 도구가 없는 버전이면 이 조항은 **휴면**이다 —
 도구 출력 없이 "정체 종결" 을 주장하거나 요구하지 마라(결측은 값이 아니다).
 ★**반증된 축 재제기 금지(오너 직접 지시 2026-09-05)**: 네 지적이 **실측으로 반증**되면(의뢰자가

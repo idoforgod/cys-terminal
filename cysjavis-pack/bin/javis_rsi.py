@@ -266,25 +266,111 @@ def learn_digest_queue_path():
     return os.path.join(_learn_state_dir(), LEARN_DIGEST_QUEUE)
 
 
-def enqueue_learn_digest(reason, topic, source):
-    """추천 1건을 다이제스트 큐에 적재(best-effort). feed 는 **쏘지 않는다**. 반환: 적재 여부."""
+class _best_effort_lock(object):
+    """`os.mkdir` 원자성만 쓰는 최선노력 상호배제 — fcntl·msvcrt 무의존(Windows 안전).
+
+    ★javis_orchestra.py 의 동명 클래스와 **의도적 중복**이다: `javis_rsi` 는 독립 실행 도구라
+      orchestra(대형 모듈)를 import 하지 않는다. 여기서도 정합의 근거가 아니라 **완충**이며,
+      대기 상한(5s) 뒤에는 그냥 진행한다 — 무한대기는 부트체인 ④ 방향이다. 중복 방지의 정본은
+      큐에 남는 **멱등키**다(잠금이 실패해도 키 검사가 다음 호출에서 잡는다).
+    """
+
+    def __init__(self, path, wait=5.0, stale=300.0):
+        self.path, self.wait, self.stale, self.held = path + ".lock", wait, stale, False
+
+    def __enter__(self):
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                os.mkdir(self.path)
+                self.held = True
+                return self
+            except FileExistsError:
+                pass
+            except OSError:
+                return self
+            if time.time() >= deadline:
+                return self
+            try:
+                if time.time() - os.path.getmtime(self.path) > self.stale:
+                    os.rmdir(self.path)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.rmdir(self.path)
+            except OSError:
+                pass
+            self.held = False
+        return False
+
+
+def digest_queue_has_key(path, key):
+    """다이제스트 큐에 같은 **멱등키**가 이미 있는가(javis_orchestra 동명 함수와 동형)."""
+    if not key:
+        return False
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return False
+    for chunk in raw.split(b"\n"):
+        if not chunk.strip():
+            continue
+        try:
+            rec = json.loads(chunk.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(rec, dict) and rec.get("key") == key:
+            return True
+    return False
+
+
+def enqueue_learn_digest(reason, topic, source, key=None):
+    """추천 1건을 다이제스트 큐에 적재(best-effort). feed 는 **쏘지 않는다**. 반환: 적재 여부.
+    `key` 를 주면 검사+적재를 한 잠금 안에서 하고 같은 키가 있으면 적재하지 않는다(멱등)."""
     try:
         path = learn_digest_queue_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         rec = {"ts": time.time(), "reason": reason, "topic": topic, "source": source,
-               "status": "queued_for_weekly_digest"}
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+               "status": "queued_for_weekly_digest", "key": key or ""}
+        with _best_effort_lock(path):
+            if key and digest_queue_has_key(path, key):
+                return False
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return True
     except Exception:
         return False
 
 
-def _recommend_learn(reason, topic):
-    """RSI 학습 자율추천(best-effort) — **다이제스트 큐 적재**만 한다(feed 발행 0).
+def _ledger_has_event(kind, rid):
+    """append-only ledger 에 그 라운드의 이벤트가 있는가 — 래치의 두 번째 내구 근거.
+    (큐가 주간 다이제스트로 **소비·정리**된 뒤에도 남는다. `RSI_ATTEMPT_EVENTS` 밖의 종류라
+     시도 계수에는 잡히지 않는다.)"""
+    try:
+        with open(os.path.join(rsi_dir(), "ledger.jsonl"), encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("event") == kind and e.get("round") == rid:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _recommend_learn(reason, topic, key=None):
+    """RSI 학습 자율추천(best-effort) — **다이제스트 큐 적재**만 한다(feed 발행 0). 반환 적재 여부.
     추천까지만 자율·착수는 사람 승인이라는 directive §4 계약은 그대로이고, 바뀐 것은 **배달
     채널**뿐이다. 오류는 무시한다(추천은 비핵심 부가 신호 — 핵심 판정 불간섭)."""
-    enqueue_learn_digest(reason, topic, "rsi.ceiling")
+    return enqueue_learn_digest(reason, topic, "rsi.ceiling", key)
 
 
 # ───────────────────────── 명령 ─────────────────────────
@@ -371,10 +457,21 @@ def cmd_progress(a):
     _warn_stop(stop_reason, a.round, attempts)
     # 추천은 **라운드당 1회**다(다이제스트 1줄 계약). 종전엔 ceiling 이상인 매 progress 마다
     # 적재해 같은 사유가 큐에 쌓였다 — 배달 채널은 그대로(feed 0 · 주간 다이제스트).
+    # ★래치는 state.json 밖에도 있어야 한다(codex R1 major-10): state 를 지우거나 되돌리면
+    #   같은 라운드의 같은 사유가 두 번 적재됐다. 그래서 **라운드별 멱등키**를 ①큐 레코드와
+    #   ②append-only ledger 양쪽에서 조회한다(큐가 소비돼도 ledger 가 남고, ledger 를 잃어도
+    #   큐가 남는다). 적재 실패면 래치를 걸지 않는다 — 추천을 영구히 잃지 않기 위해서다.
+    key = "rsi.ceiling:%s" % a.round
     if r["flat_streak"] >= rsi_ceiling_flats() and not r.get("ceiling_recommended"):
-        _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round)
-        r["ceiling_recommended"] = True
-        _save_state(state)
+        if digest_queue_has_key(learn_digest_queue_path(), key) or \
+                _ledger_has_event("ceiling_recommend", a.round):
+            r["ceiling_recommended"] = True   # 이미 추천됨(다른 경로에서) — 래치만 복원
+            _save_state(state)
+        elif _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round, key):
+            _append_ledger({"event": "ceiling_recommend", "round": a.round,
+                            "key": key, "ts": time.time()})
+            r["ceiling_recommended"] = True
+            _save_state(state)
     return 0
 
 
