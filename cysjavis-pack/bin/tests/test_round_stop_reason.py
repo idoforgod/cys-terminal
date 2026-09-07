@@ -252,7 +252,66 @@ class RoundStopReason(unittest.TestCase):
                               if ln.startswith("| 2 | master")]), 0, text)
         self.assertIn("stop_reason=open", self.status().stdout)   # 위조 승인이 서지 않았다
 
-    # ── ⑥ round-status 는 읽기 전용 ───────────────────────────────────────
+    # ── ⑥ 결속의 귀속·내구성 ─────────────────────────────────────────────
+    def test_non_consecutive_rounds_are_not_stagnation(self):
+        """라운드 1·3 처럼 **끊긴** 기록은 '2R 연속'이 아니다(빈 라운드를 연속으로 세지 않는다)."""
+        for rnd in (1, 3):
+            self.log_reviewer(rnd, "gemini")
+            self.log_reviewer(rnd, "codex")
+            self.log_machine(rnd)
+        self.assertIn("stop_reason=open", self.status().stdout)
+
+    def test_evaluator_aliases_bind_to_standard_axis(self):
+        """`agy`(표기 이주)·`machine:cargo`(구분자 변형)도 표준 축으로 접힌다 — 결속·판정 정합."""
+        for rnd in (1, 2):
+            self.log_reviewer(rnd, "agy")          # → gemini 축
+            self.log_reviewer(rnd, "codex")
+            r = self.orc("round-log", "--task", TASK, "--round", str(rnd),
+                         "--evaluator", "machine:cargo", "--from-cmd", "exit 0")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stop_reason=stopped_stagnation", self.status().stdout)
+
+    def test_last_binding_wins_on_reevaluation(self):
+        """같은 (라운드,평가자) 재기록은 **마지막 결속이 이긴다**(gate_verdicts 와 같은 규칙) —
+        재평가에서 major 가 나오면 종결이 풀린다."""
+        self.seed_two_minor_rounds()
+        self.assertIn("stop_reason=stopped_stagnation", self.status().stdout)
+        r = self.log_reviewer(2, "codex", ("major",))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = self.status().stdout
+        self.assertIn("stop_reason=open", out)
+        self.assertIn("severity major", out)
+
+    def test_corrupt_sidecar_is_fail_closed(self):
+        """사이드카가 통째로 깨지면 결속이 사라진다 — 종결이 아니라 open(휴면)."""
+        self.seed_two_minor_rounds()
+        with open(self.sidecar, "w", encoding="utf-8") as f:
+            f.write("garbage\n")
+        self.assertIn("stop_reason=open", self.status().stdout)
+
+    def test_missing_verdict_file_is_not_evidence(self):
+        """결속은 있는데 파일이 사라지면 증거가 아니다(경로만 남은 종결 금지)."""
+        self.seed_two_minor_rounds()
+        os.remove(os.path.join(self.pack, "round", "_reviews", "WP6_정체-r1-gemini.json"))
+        out = self.status().stdout
+        self.assertIn("stop_reason=open", out)
+        self.assertIn("파일 부재", out)
+
+    def test_slug_collision_does_not_inherit_foreign_stop(self):
+        """슬러그가 충돌하는 다른 task 의 **종결을 물려받지 않는다** — 장부·사이드카는 공유되지만
+        끈끈한 종결은 task 귀속으로 걸러진다(codex 위임 검체 발견)."""
+        self.seed_two_minor_rounds()
+        self.assertEqual(self.log_reviewer(3, "gemini").returncode, 3)   # 종결 기록됨
+        stops = [e for e in self.events() if e.get("event") == "stagnation_stop"]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0]["task"], TASK)
+        twin = "WP6/정체"          # 같은 슬러그(WP6_정체) → 같은 장부·사이드카
+        r = subprocess.run([PY, ORC, "round-log", "--task", twin, "--round", "9",
+                            "--evaluator", "master", "--verdict", "approve"],
+                           capture_output=True, text=True, timeout=120, env=self.env)
+        self.assertEqual(r.returncode, 0, (r.returncode, r.stderr))
+
+    # ── ⑧ round-status 는 읽기 전용 ───────────────────────────────────────
     def test_status_is_read_only(self):
         self.seed_two_minor_rounds()
         before = (open(self.ledger, "rb").read(), open(self.sidecar, "rb").read())

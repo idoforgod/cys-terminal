@@ -2097,7 +2097,7 @@ def stagnation_gate(args, path):
     rows = parse_rounds(path)
     last = max((r["round"] for r in rows), default=0)
     events = read_round_events(args.task)
-    blocked_round = stagnation_block_round(events)
+    blocked_round = stagnation_block_round(events, args.task)
     if not (args.round > last or (blocked_round is not None and args.round > blocked_round)):
         return None
     reason, why = "open", []
@@ -2283,7 +2283,7 @@ def cmd_round_status(args):
     print("  stop_reason=%s" % reason)
     for l in why:
         print("    · %s" % l)
-    blocked = stagnation_block_round(events)
+    blocked = stagnation_block_round(events, args.task)
     if blocked is not None:
         print("    · 정체 종결 기록됨(라운드 %d) — 새 라운드는 `round-log --override \"<사유>\"` "
               "없이 거부된다(exit %d)." % (blocked, ROUND_LOG_EXIT_STAGNATION))
@@ -2841,17 +2841,23 @@ def round_stop_reason(rows, evidence, max_rounds=MAX_ROUNDS, rounds=STAGNATION_R
     return "open", why
 
 
-def stagnation_block_round(events):
+def stagnation_block_round(events, task=None):
     """사이드카에서 **끈끈한 정체 종결** 상태를 읽는다 — 반환 (막힌 정체 라운드|None).
 
     ★왜 끈끈해야 하는가(codex 적대 검토 major-4): 정체로 거부된 뒤 **같은 라운드에** 행 하나를
       더 붙이면(예: master 행) 종결 계산이 흔들려 다음 라운드가 override 없이 열린다. 종결
       이후의 증거 추가는 막지 않되(그 라운드를 완결할 길은 열려 있어야 한다), **재개 권한**은
       명시 override 까지 유지한다. override 가 기록되면 그 시점부터 다시 열린다.
+    ★`task` 를 주면 **그 task 의 기록만** 본다(codex 위임 검체 발견): 슬러그가 충돌하는 서로
+      다른 task 는 장부·사이드카를 공유하므로, 필터가 없으면 남의 종결을 물려받아 자기 라운드가
+      막힌다. 귀속이 없는 구 기록(task 키 부재)은 **호환을 위해 수용**한다 — 그 시절엔 파일이
+      곧 귀속이었다.
     """
     blocked = None
     for e in events:
         ev = e.get("event")
+        if task is not None and e.get("task") is not None and e.get("task") != task:
+            continue
         try:
             rnd = int(e.get("round"))
         except (TypeError, ValueError):
