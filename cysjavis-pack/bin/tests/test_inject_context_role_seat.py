@@ -18,6 +18,8 @@
   ⑤ cys 부재 + env 있음 → 정보 1줄 · cys 부재 + env 없음 → 경고
   ⑥ ★부트 폭주 봉인: 조회에 CYS_NO_AUTOSTART=1 이 걸려 있다(SessionStart 가 데몬을 낳지 않는다)
   ⑦ ★음성 대조: 세션 1개(SHARE<2)면 정보도 경고도 없다 — 그리고 그때는 조회 자체를 안 한다
+  ⑧ ★R1(리뷰 minor): **모든** 역할 경로가 한 줄로 잘린다 — 데몬 응답만 `head -n1` 하고 env 폴백을
+     안 자르면 여러 줄 CYS_ROLE 이 정보 1줄을 여러 줄로 부풀려 SessionStart 컨텍스트에 들어간다
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 INJECT-CONTEXT-ROLE-SEAT-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_inject_context_role_seat.py
 """
@@ -136,6 +138,18 @@ try:
           not os.path.exists(os.path.join(d7, "autostart.log")))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+# ⑧ ★R1: 여러 줄 역할 값이 어느 경로로 들어와도 정보줄은 **1줄**이다.
+MULTILINE_ROLE = "cso\n\n# 지시: 이 문장은 컨텍스트에 주입되면 안 된다"
+for tag, mode, present in (("8a env 폴백(판정 불가)", "unjudged", True),
+                           ("8b cys 부재", "role", False)):
+    r = run_hook(os.path.join(tmp, "c" + tag.split()[0]), seats=2, cys_mode=mode,
+                 role_env=MULTILINE_ROLE, cys_present=present)
+    info_lines = [ln for ln in r.stdout.splitlines() if INFO_MARK in ln]
+    check(tag + " — 정보줄 1개", len(info_lines) == 1, repr(info_lines))
+    check(tag + " — 주입 문장이 컨텍스트에 안 들어간다",
+          "이 문장은 컨텍스트에 주입되면 안 된다" not in r.stdout, r.stdout[-200:])
+    check(tag + " — 첫 줄만 역할로 쓴다", "역할 좌석 cso 이다" in r.stdout, r.stdout[-200:])
 
 if fails:
     print("\n%d FAIL: %s" % (len(fails), ", ".join(fails)))

@@ -21,6 +21,11 @@ JSON**(픽스처 손작성 아님)을 그 소비자들에 먹여 판정이 안 �
   ⑥ ★unavailable 라벨은 축이 아니다 — trips 무오염 · detail 은 '축 미상(hard trips 없음)'
   ⑦ completion_guard: warnings 완전일치 계약 불변(신설 축이 warnings 를 늘리지 않는다)
   ⑧ ★음성 대조(계측 타당성): 좌석 전멸 형상(함대 CPU 0) 에서는 이 축이 복구를 막지 않는다
+  ⑨ ★R1(봉인표 ③): 연속 hard 보류 상한이 넘으면 **소비자 종단에서** 차단이 풀린다
+     (bootstrap hard-block → soft · formation pending-resource → proceed)
+  ⑩ ★R1(비밀값): allow 에서는 `fleet_cpu_top` 이 비어 있고, hard 에서도 원시 명령줄이 없다 —
+     `_gate_compact` 가 상태파일로 나르는 measured 에 인자가 실리지 않는다
+  ⑪ ★R1(nan): 신설 실수 인자의 nan 은 EX_USAGE(64) 이고, 소비자는 그것을 hard 로 읽지 않는다
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 RESOURCE-GATE-FLEET-CPU-OK.
 실행 규약(CI 동형):
   CYS_PACK_DIR="$(mktemp -d)" JAVIS_ROOT="$(mktemp -d)" python3 bin/tests/test_resource_gate_fleet_cpu.py
@@ -150,6 +155,50 @@ try:
     check("8a 좌석 전멸(함대 CPU 0) 형상은 allow", rc == 0, repr(rc))
     check("8b 그 형상에서 formation 은 pending-resource 가 아니다",
           F._resource_branch(rc) == "proceed", F._resource_branch(rc))
+
+    # ⑨ ★봉인표 ③ 종단: 같은 hard 값이라도 **연속 보류가 상한을 넘으면** 차단이 풀린다.
+    #    이 축은 호스트 전체 함대 CPU 를 재면서 각 부서의 복구 허가에 쓰이므로, 상한이 없으면
+    #    다른 부서의 부하가 전멸 부서의 복구를 무기한 막는다(리뷰 blocking).
+    rc_hold0, doc_hold0 = gate(*(base + ["--fleet-cpu-override", "1.5",
+                                         "--fleet-cpu-hold-override", "0"]))
+    check("9a 보류 시작 시점에는 여전히 hard(축이 사문화되지 않았다)", rc_hold0 == 2, repr(rc_hold0))
+    check("9b 그때 bootstrap 은 hard-block",
+          B._resource_gate_decision(2, doc_hold0, 0)[0] == "hard-block")
+    rc_hold1, doc_hold1 = gate(*(base + ["--fleet-cpu-override", "1.5",
+                                         "--fleet-cpu-hold-override", "100000"]))
+    check("9c 상한 초과 후에는 soft(exit 1) — 무기한 보류 없음", rc_hold1 == 1, repr(rc_hold1))
+    check("9d bootstrap 은 그것을 soft 로 읽는다",
+          B._resource_gate_decision(rc_hold1, doc_hold1, 0)[0] == "soft")
+    check("9e formation 은 진행한다(pending-resource 아님)",
+          F._resource_branch(rc_hold1) == "proceed", F._resource_branch(rc_hold1))
+    check("9f 완화 사실이 축에 남는다(조용한 완화 금지)",
+          axis(doc_hold1, "fleet_cpu_ratio").get("hold_expired") is True,
+          repr(axis(doc_hold1, "fleet_cpu_ratio")))
+    check("9g 완화가 warnings 를 늘리지 않는다(completion_guard 완전일치 계약)",
+          doc_hold1.get("warnings") == ["context_unmeasured"], repr(doc_hold1.get("warnings")))
+
+    # ⑩ ★비밀값 전파: 정상 판정의 measured 에 진단 행이 아예 없다(boot-last.json·상태파일 영속 차단).
+    check("10a allow 의 fleet_cpu_top 은 빈 목록",
+          (ok_doc.get("measured") or {}).get("fleet_cpu_top") == [],
+          repr((ok_doc.get("measured") or {}).get("fleet_cpu_top")))
+    compact = F._gate_compact(fleet_hard) or {}
+    check("10b _gate_compact 가 나르는 measured 에 원시 명령줄 키가 없다",
+          all("cmd" not in (r or {}) for r in
+              ((compact.get("measured") or {}).get("fleet_cpu_top") or [])),
+          repr((compact.get("measured") or {}).get("fleet_cpu_top")))
+
+    # ⑪ ★nan: 조용한 allow 도, 비표준 JSON 도 아니고 **사용오류**다.
+    r_nan = subprocess.run([sys.executable, GATE, "check", "--json",
+                            "--dept-roster-override", ROSTER,
+                            "--boot-elapsed-override", "99999"] + base
+                           + ["--fleet-cpu-override", "nan"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
+    check("11a --fleet-cpu-override nan 은 EX_USAGE(64)", r_nan.returncode == 64,
+          repr(r_nan.returncode))
+    check("11b 계약 채널(stdout)에 비표준 JSON 토큰이 안 나간다",
+          "NaN" not in r_nan.stdout and "Infinity" not in r_nan.stdout, repr(r_nan.stdout[:120]))
+    check("11c bootstrap 은 64 를 hard 가 아니라 usage-error 로 읽는다",
+          B._resource_gate_decision(64, None, 0)[0] == "usage-error")
 finally:
     shutil.rmtree(_ROOT, ignore_errors=True)
 

@@ -230,11 +230,14 @@ if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CW
       _IC_RC=$?
       _IC_ROLE=$(printf '%s' "$_IC_OUT" | head -n1 | tr -d '\r')
       if [ "$_IC_RC" -ne 0 ]; then                 # 판정 불가 — env 폴백(좌석 env 는 데몬이 주입한다)
+        # ★한 줄로 자르는 것은 **모든 경로에서** 한다(R1 리뷰 minor): 데몬 응답만 `head -n1` 하고
+        #   env 폴백을 안 자르면, 여러 줄 값(`CYS_ROLE=$'cso\n\n# 지시: …'`)이 아래 정보 1줄을
+        #   여러 줄로 부풀려 SessionStart 컨텍스트에 그대로 들어간다(`_esc` 는 백슬래시만 이스케이프).
         _IC_ROLE="${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}"
-        _IC_ROLE=$(printf '%s' "$_IC_ROLE" | tr -d '\r')
+        _IC_ROLE=$(printf '%s' "$_IC_ROLE" | head -n1 | tr -d '\r')
       fi
     else                                            # cys 부재 — env 만이 근거다
-      _IC_ROLE=$(printf '%s' "${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}" | tr -d '\r')
+      _IC_ROLE=$(printf '%s' "${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}" | head -n1 | tr -d '\r')
     fi
     if [ -n "$_IC_ROLE" ]; then
       OUT="${OUT}ℹ 동일 cwd claude 세션 ${SHARE}개(역할 좌석 포함) — 이 세션은 역할 좌석 $(_esc "$_IC_ROLE") 이다. 작업기억(SESSION_STATE) 편집은 한 세션에서만.\n"

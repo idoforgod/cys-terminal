@@ -11,8 +11,12 @@
     load     = 1분 load average / CPU 코어 수 비율   (★0.14.31~ **soft 전용** — 호스트 전체 부하에는
                우리가 회수할 수 없는 성분(예: macOS mediaanalysisd)이 섞이므로 착수 거부 근거가 아니다)
     fleet_cpu= ★0.14.31 신설 — **우리 프로세스들**(claude/agy/codex/gemini + cysd + serena)의
-               `ps -axo pcpu,command` %CPU 합 / 100 / ncpu(분율). soft 0.5 · hard 1.0.
-               차단은 '우리가 실제로 회수할 수 있는 자원'에만 건다. 계측 한계는 FLEET_CPU_PATTERNS 주석.
+               `ps -axo pid,pcpu,command` %CPU 합 / 100 / ncpu(분율). soft 0.5 · hard 1.0.
+               차단은 '우리가 실제로 회수할 수 있는 자원'에만 건다. 계측 한계는 `_fleet_owner` 주석.
+               ★소유권은 **argv0(실행 주체)** 로 판정한다 — 명령줄 아무 데나 든 이름이 아니다.
+               ★자기 제외는 **PID**(os.getpid())로 한다 — 명령줄 부분문자열이 아니다.
+               ★hard 는 **연속 900초**를 넘겨 유지되지 않는다(봉인표 ③ — 다른 부서의 부하가 전멸
+                 부서의 복구를 무기한 막지 않게). 넘으면 그 포화가 끝날 때까지 soft(권고)다.
     context  = 자기보고 컨텍스트 %               (60% /clear 규칙)
 - soft/hard 2단(Paperclip warnPercent 사상): soft=경고 후 진행 허용, hard=착수 거부.
 - 판정은 결정론: exit code 0=allow · 1=soft warn · 2=hard block. (LLM 자연어 판단 제거)
@@ -50,6 +54,9 @@
   켜는 법: `CYS_FORMATION_BUDGET=<정수> ... check --formation-size <n>`.
 
 테스트/자동화 주입: --servers-override/--nodes-override/--load-override/--dept-roster-override
+  /--fleet-cpu-override/--fleet-cpu-hold-override/--boot-elapsed-override
+  (신설 실수 인자는 전부 **유한성 검사**를 거친다 — nan/inf 는 EX_USAGE 64. nan 은 모든 비교를
+   거짓으로 만들어 조용한 allow 를 내고, json.dumps 는 비표준 NaN/Infinity 를 계약 채널로 흘린다)
   (라이브 측정 대체 · 마지막은 부서 로스터 JSON {active,seats,errors,depts} — 잘못된 JSON=EX_USAGE 64).
 사용 예: python3 javis_resource_gate.py check --context 42 --json
 exit codes(A13 타입드 — 코드 상수와 기계 대조):
@@ -65,6 +72,7 @@ exit codes(A13 타입드 — 코드 상수와 기계 대조):
 import argparse
 import errno
 import glob
+import hashlib
 import json
 import math
 import os
@@ -126,19 +134,99 @@ NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
 #     '다른 살아 있는 함대 프로세스가 전 코어를 계속 태우고 있다'는 사실이 참이어야 한다. 그때
 #     스폰을 더 하지 않는 것이 이 축의 목적이다. 회수 대상을 사람이 곧장 짚도록 hard 시 상위
 #     기여자를 `fleet_cpu_top` 으로 남긴다(원인 미상의 영구 보류를 만들지 않는다).
+# ★R1(리뷰 반영 2026-09-08) — **소유권 판정을 명령줄 부분문자열에서 실행 주체로 바꿨다.**
+#   종전 판본은 `NODE_PATTERNS`(명령줄 전체 정규식 검색)를 그대로 빌려 썼고, 그 성질을 "기존
+#   nodes 축과 같으니 여기서만 고치지 않는다"는 이유로 핀까지 박아 뒀다. 리뷰 2명이 독립적으로
+#   **그 상속이 신설 hard 축의 정확성을 보증하지 않는다**고 지적했고, 그 지적이 옳다:
+#     · `python3 /tmp/agy/report.py`(우리와 무관한 다중 스레드 작업) → `\bagy\b` 매칭 → ratio 1.0 → hard.
+#       그러면 이 WP 가 고치려던 사고(B2 = **우리 소관 아닌 부하로 조직 기동 거부**)가 그대로 재발한다.
+#     · `grep claude` 도 같다(인자에만 든 이름).
+#     · 반대로 `/opt/codex --output /tmp/javis_resource_gate.log` 는 자기 제외의 부분문자열 검사에
+#       걸려 **진짜 함대 프로세스가 0으로 누락**됐고, 네이티브 claude 의 버전 경로 실행
+#       (`~/.local/share/claude/versions/2.1.261`)은 `claude(\s|$)` 가 놓쳤다.
+#   그래서 이 축은 **자기 축 전용 소유권 규칙**을 갖는다(`_fleet_owner`): 명령줄의 아무 토큰이 아니라
+#   **실행 주체**(argv0, 인터프리터/런처면 그것이 실행하는 스크립트)의 basename·경로 세그먼트만 본다.
+#   자기 제외도 명령줄이 아니라 **PID**(`os.getpid()`)로 한다.
+#   ★nodes 축은 **무수정**이다(정본: 기존 오류·계수 경로 현행 유지) — 두 축이 다른 모집단을 세는 것은
+#     의도된 분기이고, 그 사실은 노트(§패턴 정밀도)와 아래 상수 주석에 남긴다. 계수 축(nodes)의
+#     과대계상은 종전부터 `hard-overcount` 밸브가 받아 주지만, CPU 축에는 그 밸브가 없어서
+#     오탐 하나가 곧바로 조직 기동 거부다 — 정밀도 요구가 애초에 다르다.
+#   ★틀리는 방향: 이 정밀화는 **과소계상**(모르는 실행 형상을 함대로 안 셈) 쪽으로 틀릴 수 있다.
+#     그 방향의 귀결은 '차단하지 않음' = 0.14.31 이전과 동일한 상태다. 반대로 과대계상의 귀결은
+#     조직 기동 거부(B2 재발)라 되돌리기가 훨씬 비싸다.
+# ★하위호환 보존용(이 축은 **더 이상 이 패턴으로 판정하지 않는다** — `_fleet_owner` 가 판정한다).
+#   외부 임포터가 있을 수 있어 상수는 남기되, 여기 이름을 고쳐도 축의 판정은 바뀌지 않는다.
 FLEET_CPU_PATTERNS = NODE_PATTERNS + [r"(^|/)cysd(\s|$)", r"\bserena\b"]
-# ★상속되는 계측 한계(codex R2 · 위임 검체 1~3 — 숨기지 않는다): 이 패턴들은 기존 `nodes` 축의
-#   `NODE_PATTERNS` 를 그대로 쓰고 매칭도 `_count_matching` 과 같은 '명령줄 전체 검색'이다. 그래서
-#   `python3 /tmp/agy/report.py` · `grep claude` 처럼 **에이전트가 아닌 프로세스**도 걸린다(과대계상 =
-#   차단 방향). 자기 제외(`"javis_resource_gate" in cmd`)도 같은 이유로 출력 파일명에 이 이름을 넣은
-#   진짜 함대 프로세스를 뺄 수 있다(과소계상). 둘 다 **기존 nodes 축과 동일한 성질**이라 여기서만
-#   고치면 두 축이 다른 모집단을 세게 된다 — 패턴 정밀화는 두 축을 함께 다루는 별 백로그다.
+# ── 실행 주체 → 함대 소유자(진단 라벨). 판정에 쓰는 것은 '있다/없다' 하나다. ──
+# ★규칙의 출처: `javis_preflight._is_claude_command(strict=True)` 와 그 상수(`_CLAUDE_EXE_NAMES` ·
+#   `_CLAUDE_INSTALL_MARKER="/claude/versions/"` · `_CLAUDE_NPM_MARKER="/claude-code/"` ·
+#   `_JS_RUNTIME_NAMES`). 저장소에 이미 실측으로 다듬어진 '실행 형상' 판정기가 있는데 새로 지어내면
+#   두 곳이 다른 사실을 말하게 된다 — 같은 사실 위에 둔다.
+# ★대소문자를 **구분**한다: 우리 CLI 이름은 전부 소문자다. 소문자로 접으면 macOS **GUI 앱 번들**
+#   (`/Applications/Claude.app/Contents/MacOS/Claude` · Helper 프로세스 다수)이 전부 함대로 잡힌다 —
+#   실측 2026-09-08 02:1x 이 기계에서 `Claude`/`Claude Helper` 행 10+개(최대 4.2%). 그것은 우리가
+#   좌석 스폰을 위해 회수할 수 있는 프로세스가 아니다(B2 형 오탐). 번들 경로도 따로 배제한다.
+FLEET_EXE_NAMES = {"claude": "claude", "codex": "codex", "agy": "agy",
+                   "gemini": "gemini", "cysd": "cysd", "serena": "serena"}
+FLEET_EXE_SUFFIXES = (".exe", ".cmd")          # 제거 후 비교(판정기는 플랫폼과 무관하게 순수하게 둔다)
+_APP_BUNDLE_MARKER = ".app/contents/"          # macOS GUI 앱 번들 — CLI 함대가 아니다(실측 반례)
+# argv0 자체가 우리 설치 레이아웃인 형상(basename 이 버전 문자열이라 이름이 안 남는다)
+#   ★실측(2026-09-08 02:28 이 기계)으로 넣은 것: codex 는 wrapper 아래에 vendor 네이티브를 여러 개
+#     띄우고 그 basename 이 `codex` 가 아닌 것도 있다 —
+#     `…/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host`.
+#     그래서 `/@openai/codex/` 패키지 경로를 argv0 마커로 둔다(그 아래에 남의 프로그램이 살 일은 없다).
+FLEET_ARGV0_MARKERS = (("/claude/versions/", "claude"),   # ~/.local/share/claude/versions/<ver>
+                       ("/.codex/bin/", "codex"),         # codex vendor native(설치 레이아웃 A)
+                       ("/@openai/codex/", "codex"))      # codex vendor native(npm 레이아웃 · 실측)
+# JS 번들 형상 — **`.js` 번들 경로일 때만** 소유권을 인정한다(preflight strict 와 동형):
+#   `tail -f /x/claude-code/debug.log` 처럼 인자에 패키지 세그먼트가 실린 비-에이전트를 배제한다.
+FLEET_JS_BUNDLE_MARKERS = (("/claude-code/", "claude"), ("/@openai/codex/", "codex"),
+                           ("/gemini-cli/", "gemini"))
+_JS_SUFFIXES = (".js", ".mjs", ".cjs")
+FLEET_JS_RUNTIMES = frozenset(("node", "bun", "deno"))
+FLEET_PY_RUNTIMES = frozenset(("python", "py", "pypy"))
+# 온디맨드 런처 — 이 자리의 positional 은 **정의상 실행할 프로그램 이름**이다.
+#   실형상(javis_preflight.SERENA_STDIO_ARGS): `uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server …`
+FLEET_RUNNERS = frozenset(("uv", "uvx", "npx", "bunx", "pipx", "npm", "pnpm", "yarn"))
+FLEET_RUNNER_PROGRAMS = {
+    "claude": "claude", "@anthropic-ai/claude-code": "claude",
+    "codex": "codex", "@openai/codex": "codex",
+    "gemini": "gemini", "gemini-cli": "gemini", "@google/gemini-cli": "gemini",
+    "serena": "serena", "serena-agent": "serena",
+}
+FLEET_RUNNER_SUBCMDS = frozenset(("run", "exec", "tool", "x"))   # `uv run serena` 형상
+FLEET_RUNNER_SCAN_MAX = 40       # 인자 스캔 상한(비용 상한 — 12 는 `node --flag`×12 형상에서 짧았다)
+# 런타임이 **코드 문자열**을 받는 모드. 이때는 뒤 토큰이 실행 대상이 아니므로 아예 언랩하지 않는다
+# (`python3 -c 'print(1)' /tmp/serena` 가 serena 로 오인되던 길 · codex 위임 검체 4).
+FLEET_CODE_MODE_FLAGS = frozenset(("-c", "-e", "--eval", "-p", "--print", "-m"))
+_PY_VERSIONED_RE = re.compile(r"^python\d+(\.\d+)?$")
+# ★쉘(`sh`/`bash`/`zsh`)·`env` 는 **언랩하지 않는다**: 데몬은 로그인셸 우산으로 좌석을 띄우지만
+#   그 셸이 exec/spawn 한 실제 좌석은 **자기 ps 행**을 따로 갖는다(셸을 세면 이중계상이고, 셸의
+#   명령줄 문자열에 든 'claude' 는 소유권 근거가 아니다 — 실측: `sh -c S=/tmp/claude-501/…` 행).
 # ★여기에 NODE_EXCLUDE_PATTERNS 를 걸지 않는다: 그 제외(codex vendor native)는 **계수 인플레이션**
 #   (codex 1노드 = wrapper + native 2프로세스)의 교정이다. CPU **합**에서는 vendor native 가 codex 가
 #   실제로 태운 CPU 의 본체라, 빼면 함대 소비를 체계적으로 과소평가한다(축이 목적을 못 재는 방향).
 FLEET_CPU_SOFT_DEFAULT = 0.5     # 함대가 전 코어의 50% 상당을 평균 점유 — 경고
 FLEET_CPU_HARD_DEFAULT = 1.0     # 전 코어 100% 상당 — 착수 거부
 FLEET_CPU_TOP_N = 3              # hard 시 남기는 상위 기여자 수(회수 대상 지목 — 봉인표 ③)
+# ★R1(봉인표 ③ 직접 방어) — **hard 보류 상한**. 이 축의 hard 는 연속 15분을 넘겨 유지되지 않는다.
+#   왜 필요한가(리뷰 blocking): 이 축은 **호스트 전체 함대 CPU** 를 재는데, 그 판정을 각 부서의
+#   복구 허가에 그대로 적용한다. 그래서 '부서 A 전멸 · 부서 B 가 계속 바쁨' 형상에서 A 의 복구가
+#   **무기한** 보류될 수 있다(A 의 죽은 좌석이 CPU 0 인 것은 B 의 기여를 지우지 않는다). Linux 의
+#   `ps` %CPU 는 수명 평균이라 그 보류가 더 끈끈하다.
+#   규칙: 이 축이 **연속으로** hard 인 시간이 이 상한을 넘으면 그 뒤로는 hard 를 soft 로 내린다
+#   (`hold_expired`). 축이 hard 가 아닌 판정이 한 번이라도 나오면 래치는 지워지고 시계는 0 이다.
+#   ★만료 뒤 래치를 **재무장하지 않는다**: 재무장하면 만료 창을 어느 호출자(완료 검증 게이트 등)가
+#     먼저 소비해 버리고, 정작 복구가 필요한 편성 호출은 다시 hard 를 만난다 — 유계가 특정 호출자에게
+#     보장되지 않는다. 만료는 '포화가 끝날 때까지 이 축은 권고(soft)' 라는 상태이고, 그것이 모든
+#     호출자에게 동일하게 보인다.
+#   ★따라서 이 축의 계약은 "포화 1회당 최대 15분 차단, 그 뒤 권고" 다 — 무기한 차단은 없다.
+FLEET_CPU_HARD_MAX_HOLD_SECS = 900.0
+FLEET_CPU_HOLD_BASENAME = "fleet-cpu-hard-since"
+FLEET_HOLD_FUTURE_SLACK_S = 2.0   # 이만큼까지의 '미래' 저장값은 시계 역행이 아니라 반올림으로 본다
+# 래치 저장 루트는 **팩 관례**(`CYS_STATE_DIR` ‖ `~/.cys/state`)다 — 데몬 상태 디렉터리
+# (`~/.local/state/cys`)에는 쓰지 않는다(그쪽은 바이너리 소유). 테스트는 `CYS_STATE_DIR` 로 격리한다.
+CYS_DIR_DEFAULT = "~/.cys"
 # `--load-hard-ratio` 의 종전 기본값. 이제 load 축은 soft 전용이라 이 플래그는 **무동작**이다 —
 # 계약 호환(구 호출자의 EX_USAGE 64 회귀 방지)을 위해 받기만 하고, 기본값과 다르면 stderr 로 고지한다.
 LOAD_HARD_RATIO_DEFAULT = 2.0
@@ -316,77 +404,256 @@ def _count_matching(lines, patterns, exclude_patterns=()):
 
 
 # ── ★WP-7 N: 함대 CPU 측정(별 ps 스폰 · 기존 `_ps_lines` 오류 경로 무접촉) ──
-def _ps_cpu_lines():
-    """`ps -axo pcpu,command` 의 **헤더 제외** 줄들 → `(lines|None, reason|None)`.
+def _is_windows_host():
+    """이 셸이 **Windows 호스트** 위인가 — 인터프리터의 `os.name` 하나로 판정하지 않는다.
 
-    reason ∈ None(성공) · "absent"(`ps` 실행파일 자체가 없다) · "failed"(있는데 조회가 실패).
-    ★이 둘을 가르는 것이 이 함수의 존재 이유다(codex R1 #4): 정본의 Windows 예외는 **`ps` 부재**에
-      주어진 것이지 '조회 실패'에 주어진 게 아니다. 하나로 뭉개면 POSIX 에서 ps 조회가 깨졌는데도
-      축이 조용히 사라져 exit 0(조용한 allow)이 난다 — P-ORCH-1 위반.
+    ★R1(리뷰 minor): 종전 판정은 `os.name != "nt"` 였다. 그러면 Git Bash 에서 MSYS/Cygwin 파이썬
+      (`os.name == "posix"`)이 CYS_PY 로 잡히고 PATH 앞에 MSYS `ps.exe`(=`-axo` 미지원)가 있는
+      흔한 조합에서, 매 호출이 `measure_errors: fleet_cpu(ps)` → 최소 soft 가 된다. 그 결과
+      `javis_completion_guard._soft_kind` 가 proceed_unmeasured → skip_soft 로 바뀌어 **완료 검증이
+      영구 skip** 된다. 정본의 Windows 예외는 '이 플랫폼엔 이 축이 없다'는 뜻이지 인터프리터 종류가
+      아니다."""
+    if os.name == "nt":
+        return True
+    if sys.platform in ("msys", "cygwin"):
+        return True
+    return bool(os.environ.get("MSYSTEM"))
+
+
+# ps 가 **플래그를 거부**한 형상(구현이 `-axo` 를 모른다)의 관용 문구. 이것은 '측정 실패'가 아니라
+# '이 ps 로는 이 축을 못 잰다'는 플랫폼 능력 사실이라, 어느 플랫폼에서든 `unsupported` 로 접는다.
+_PS_FLAG_REJECT_RE = re.compile(
+    r"(unknown|invalid|illegal|unrecognized)\s+(option|argument|flag)|\bbad\s+option\b", re.I)
+# `usage:` 하나만으로는 접지 않는다(codex R1-2): 진짜 호출 결함도 usage 를 낸다. Windows 호스트에서만
+# 보조 신호로 인정한다 — 그 플랫폼에서는 어차피 이 축이 없는 것과 같고(exit 계약 불변) 다른
+# 플랫폼에서는 '측정 실패' 로 남아 최소 soft 로 신호된다.
+_PS_USAGE_RE = re.compile(r"^\s*usage:", re.I | re.M)
+
+
+def _ps_cpu_lines():
+    """`ps -axo pid,pcpu,command` 의 **헤더 제외** 줄들 → `(lines|None, reason|None)`.
+
+    reason ∈ None(성공) · "absent"(`ps` 실행파일 자체가 없다) · "unsupported"(있는데 이 플래그를
+    모른다 — MSYS/BusyBox) · "failed"(있고 플래그도 아는데 조회가 실패).
+    ★이 셋을 가르는 것이 이 함수의 존재 이유다(codex R1 #4 · R1 리뷰 minor): 정본의 Windows 예외는
+      **축이 없는 플랫폼**에 주어진 것이지 '조회 실패'에 주어진 게 아니다. 하나로 뭉개면 POSIX 에서
+      ps 조회가 깨졌는데도 축이 조용히 사라져 exit 0(조용한 allow)이 난다 — P-ORCH-1 위반. 반대로
+      셋을 다 '측정 실패'로 보면 MSYS 설치가 상시 soft 가 되어 exit 계약이 바뀐다.
     ★왜 `_ps_lines` 를 재활용하지 않는가: 그쪽은 `pid,command` 계약이고 `_count_matching` ·
       `_server_procs` · `_ledger_servers` 가 그 열 형상을 전제한다. 열을 바꾸면 그 셋이 전부 pcpu 를
       명령줄의 일부로 읽는다 — 축 하나를 얻자고 기존 세 축의 계수를 흔드는 거래는 나쁘다.
-      정본(§4 WP-7)도 `ps -axo pcpu,command` 라고 못박았다.
-    ★`_ps_lines` 와 달리 **rc 를 본다**: `-axo` 를 모르는 구현(MSYS/BusyBox ps)은 예외를 던지지 않고
-      rc≠0 + 빈 stdout 을 내는데, 그것을 `[]` 로 접으면 '함대 CPU 0%' 라는 **거짓 측정**이 된다.
-      (기존 `_ps_lines` 의 같은 성질은 이 WP 의 범위가 아니다 — 정본: 기존 오류 경로 현행 유지.)"""
+    ★열이 `pid,pcpu,command` 인 이유(정본 §4 WP-7 의 `pcpu,command` 에서 **의도적 이탈** · 노트 기록):
+      자기 제외를 명령줄 부분문자열이 아니라 **PID** 로 하려면 pid 열이 있어야 한다. 종전 판본의
+      부분문자열 제외는 출력 파일명에 이 모듈 이름이 들어간 진짜 함대 프로세스를 통째로 뺐다
+      (`/opt/codex --output /tmp/javis_resource_gate.log` → 정상 측정값 0 · 리뷰 blocking).
+    ★`_ps_lines` 와 달리 **rc 를 본다**: `-axo` 를 모르는 구현은 예외를 던지지 않고 rc≠0 + 빈 stdout 을
+      내는데, 그것을 `[]` 로 접으면 '함대 CPU 0%' 라는 **거짓 측정**이 된다."""
     try:
-        p = subprocess.run(["ps", "-axo", "pcpu,command"], capture_output=True,
+        p = subprocess.run(["ps", "-axo", "pid,pcpu,command"], capture_output=True,
                            text=True, timeout=10)
     except FileNotFoundError:
         return None, "absent"            # Windows 기본 — 이 플랫폼엔 이 축이 없다
     except (subprocess.SubprocessError, OSError):
         return None, "failed"            # 타임아웃·권한 등 — 측정 실패다
     if p.returncode != 0:
-        return None, "failed"            # 플래그 미지원 구현 — '0%' 로 위장하지 않는다
+        diag = (p.stderr or "") + "\n" + (p.stdout or "")
+        if _PS_FLAG_REJECT_RE.search(diag) or (_is_windows_host() and _PS_USAGE_RE.search(diag)):
+            return None, "unsupported"   # 이 ps 는 `-axo` 를 모른다 = 축 부재와 같은 사실
+        return None, "failed"
     lines = (p.stdout or "").splitlines()[1:]
     if not lines:
         return None, "failed"            # 헤더뿐 = 아무 프로세스도 못 봤다(형상 이상)
     return lines, None
 
 
-def _fleet_cpu_percent(lines):
-    """FLEET_CPU_PATTERNS 에 걸리는 줄들의 %CPU 합 → `(total|None, reason|None)`.
+def _fleet_exe_name(token):
+    """ps 토큰 → `(슬래시 정규화 경로, basename(.exe/.cmd 제거))`. **대소문자 보존**. 순수."""
+    raw = (token or "").strip("\"'").replace("\\", "/")
+    base = raw.rsplit("/", 1)[-1]
+    for suf in FLEET_EXE_SUFFIXES:
+        if base.lower().endswith(suf):
+            base = base[: -len(suf)]
+            break
+    return raw, base
+
+
+def _fleet_runner_key(token):
+    """런처 positional → 프로그램 이름(버전 지정 분리). 순수.
+    `@openai/codex@1.2.3` → `@openai/codex` · `serena-agent==1.5.3` → `serena-agent` ·
+    `/usr/bin/serena` → `serena` (codex 위임 검체 8)."""
+    t = (token or "").strip("\"'")
+    t = t.split("==", 1)[0]
+    at = t.rfind("@")
+    if at > 0:
+        t = t[:at]
+    return t if t.startswith("@") else _fleet_exe_name(t)[1]
+
+
+def _fleet_owner(cmd):
+    """명령줄 → 함대 소유자 이름 | None. **argv0 앵커** 판정(순수 · 스폰 0).
+
+    왜 이렇게 좁은가(리뷰 blocking 2 "무관한 작업을 함대 소유로 오인" 의 수리): 종전 판본은 명령줄
+    **전체**를 정규식으로 훑어 `python3 /tmp/agy/report.py`(디렉터리 이름) · `grep claude`(인자)까지
+    함대로 셌다. 그 오탐 하나가 곧바로 조직 기동 거부(B2 재발)다. 그래서 소유권 근거를 **실행 주체**
+    하나로 좁힌다:
+      ① argv0 의 basename 이 우리 CLI 이름(대소문자 구분) → 그 소유자.
+      ② argv0 경로가 우리 설치 레이아웃(`/claude/versions/` · `/.codex/bin/`) → 그 소유자.
+      ③ argv0 가 그 자체로 우리 npm 번들(`…/claude-code/cli.js` shebang exec) → 그 소유자.
+      ④ argv0 가 JS 런타임(node/bun/deno) → 인자 중 **패키지 경로이면서 `.js` 계열**인 토큰만 인정
+         (preflight strict 와 동형 — `tail -f /x/claude-code/debug.log` 는 형상이 아니다).
+      ⑤ argv0 가 파이썬 런타임 → 인자 중 **경로 토큰**의 basename 이 우리 이름일 때만
+         (`python3 -c codex` 처럼 경로가 아닌 코드 문자열은 실행 대상이 아니다).
+      ⑥ argv0 가 온디맨드 런처(uvx/npx/uv…) → 인자 중 첫 **프로그램 이름**이 우리 것일 때만
+         (`uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server …` → serena).
+      ⑦ 그 밖의 argv0(`grep`·`tail`·`sh`·`zsh`·`env`…)이면 **인자는 보지 않는다**.
+    ★남는 오차(정직 고지): (a) 이름이 같은 **남의** codex/claude 도 우리 것으로 센다 — '도구 종류'
+      판별이지 '우리 편성이 띄웠다'의 증명이 아니다(그 증명에는 pgid·env 결합이 필요하고, 그것은
+      이 축의 범위 밖이다). (b) 우리가 모르는 실행 형상은 **미계상**된다 → 차단 안 함 = 0.14.31
+      이전과 같은 상태. 두 방향 중 (b) 쪽이 되돌리기 싸다."""
+    toks = (cmd or "").split()
+    if not toks:
+        return None
+    norm0, base0 = _fleet_exe_name(toks[0])
+    low0 = norm0.lower()
+    # ★순서가 중요하다(실측 2026-09-08): **정확한 이름 매칭이 앱 번들 배제보다 앞선다.**
+    #   우리 데몬은 이 기계에서 `/Applications/cys.app/Contents/MacOS/cysd`(5.7~11.0%)로 뜬다 —
+    #   번들 배제를 먼저 걸면 **우리 데몬 본체를 통째로 놓친다**(과소계상). 반대로
+    #   `/Applications/Claude.app/Contents/MacOS/Claude` 는 basename 이 대문자 `Claude` 라
+    #   정확 매칭에 안 걸리고 번들 배제로 떨어진다 — 두 사실이 이 순서에서만 동시에 성립한다.
+    owner = FLEET_EXE_NAMES.get(base0)
+    if owner:
+        return owner
+    if _APP_BUNDLE_MARKER in low0:
+        return None                                   # macOS GUI 앱 번들(Claude.app 등)
+    for marker, name in FLEET_ARGV0_MARKERS:
+        if marker in low0:
+            return name
+    for marker, name in FLEET_JS_BUNDLE_MARKERS:
+        if marker in low0 and low0.endswith(_JS_SUFFIXES):
+            return name
+    rest = toks[1:1 + FLEET_RUNNER_SCAN_MAX]
+    if base0 in FLEET_JS_RUNTIMES or base0 in FLEET_PY_RUNTIMES \
+            or _PY_VERSIONED_RE.match(base0):
+        js = base0 in FLEET_JS_RUNTIMES
+        # ★**첫 경로 토큰 하나만** 본다(codex 위임 검체 4): 계속 훑으면
+        #   `node /tmp/report.js /tmp/codex` 처럼 **데이터 인자**가 실행 주체로 승격된다 —
+        #   그것이 바로 이 라운드가 없앤 B2 오탐이다. 대가는 `node --require x.js /x/codex` 형상의
+        #   미계상(=차단 안 함=종전 상태)이고, 그 방향을 택한다.
+        for t in rest:
+            # ★코드 문자열 모드가 **경로 토큰보다 먼저** 나오면 언랩하지 않는다: `-c`/`-e`/`-m` 뒤의
+            #   토큰은 실행 파일이 아니다(`python3 -c print(1) /tmp/serena`). 순서를 봐야 한다 —
+            #   실측 `node /…/bin/codex exec -m gpt-6-astra …` 처럼 **대상 프로그램의 인자**에
+            #   같은 글자가 오는 형상이 흔하다(그때는 이미 실행 주체를 정한 뒤다).
+            if t in FLEET_CODE_MODE_FLAGS:
+                return None
+            if "/" not in t and "\\" not in t:
+                continue
+            norm, base = _fleet_exe_name(t)
+            low = norm.lower()
+            owner = FLEET_EXE_NAMES.get(base)
+            if owner and _APP_BUNDLE_MARKER not in low:
+                return owner                          # 실측: `node /Users/u/.local/bin/codex …`
+            if js:
+                for marker, name in FLEET_JS_BUNDLE_MARKERS:
+                    if marker in low and low.endswith(_JS_SUFFIXES):
+                        return name                   # `node …/claude-code/cli.js`
+            return None                               # 첫 경로 토큰이 아니면 실행 주체가 아니다
+        return None
+    if base0 in FLEET_RUNNERS:
+        # ★런처는 **첫 프로그램 위치 토큰 하나만** 본다(codex 위임 검체 5):
+        #   `npm --prefix codex test` · `npm uninstall codex` · `npx prettier codex` 가 전부
+        #   codex 로 오인되던 길을 닫는다. 긴 옵션(`--x`)은 값을 가질 수 있으니 다음 토큰까지
+        #   건너뛰고(`--python 3.13` · `--from serena-agent==1.5.3`), 짧은 옵션(`-y`)은 값이 없다고
+        #   본다(`npx -y @google/gemini-cli`). 하위 명령(`uv run …`)은 1회 건너뛴다.
+        #   ★중첩 런처도 건너뛴다 — 실측 형상 `/…/bin/uv tool uvx --python 3.13 --from
+        #     serena-agent==1.5.3 serena start-mcp-server`(uv → tool → uvx → serena).
+        skip_next = False
+        for t in rest:
+            if skip_next:
+                skip_next = False
+                continue
+            if t.startswith("--"):
+                skip_next = "=" not in t
+                continue
+            if t.startswith("-"):
+                continue
+            low = t.lower()
+            if low in FLEET_RUNNER_SUBCMDS or _fleet_exe_name(t)[1].lower() in FLEET_RUNNERS:
+                continue                              # 하위 명령·중첩 런처
+            return FLEET_RUNNER_PROGRAMS.get(_fleet_runner_key(t))
+        return None
+    return None
+
+
+def _fleet_rows(lines, self_pid=None):
+    """ps 줄들 → `(rows|None, reason|None)`. row = `{"pid","pcpu","owner","exe"}`(함대 행만).
 
     ★'매칭 0건'과 '측정 불능'을 섞지 않는다(codex R1 #6):
-      - 첫 열을 수치로 읽은 줄이 하나라도 있고 매칭이 0건 = **함대가 안 떠 있다**는 정직한 사실 → 0.0.
-      - 첫 열을 한 줄도 수치로 못 읽음(`shape`) = 열 형상이 `pcpu,command` 가 아니다 → None.
-        ★이 검사는 '수치가 아님'만 잡는다: ps 가 조용히 `pid,command` 를 냈다면 pid 가 수치라
-        통과하고 합이 터무니없이 커진다 → hard. 즉 그 오형상의 귀결은 **차단 방향**이지 조용한
-        allow 가 아니다(우리가 감수하는 오차 방향).
-      - **매칭된 줄**의 pcpu 가 안 읽히거나(`row_unparsed`) 유한하지 않거나 음수(`row_nonfinite`)
+      - pcpu 를 수치로 읽은 줄이 하나라도 있고 매칭이 0건 = **함대가 안 떠 있다**는 정직한 사실 → [].
+      - 한 줄도 `pid pcpu command` 로 못 읽음(`shape`) = 열 형상이 계약과 다르다 → None.
+        ★열이 셋이라 오형상은 여기서 대부분 잡힌다(pid 는 정수, pcpu 는 실수여야 한다) — 종전
+        2열 판본은 ps 가 조용히 `pid,command` 를 냈을 때 pid 를 CPU 로 읽어 합을 폭증시켰다.
+      - **함대 행**의 pcpu 가 안 읽히거나(`row_unparsed`) 유한하지 않거나 음수(`row_nonfinite`)
         = 함대의 일부를 못 읽었다 → None. 그 줄만 조용히 건너뛰면 합이 과소계상된다.
-    ★`float("nan")` 은 예외 없이 성공하고 이후 모든 비교가 False 라, NaN 이 섞이면 합이 NaN 이 되어
-      `NaN >= hard` 가 거짓 → **조용한 allow** 가 된다. 유한성 검사가 그 길을 막는다."""
-    regs = [re.compile(pat) for pat in FLEET_CPU_PATTERNS]
-    total = 0.0
+    ★자기 제외는 **PID** 다(`os.getpid()`): 명령줄 부분문자열 제외는 출력 파일명에 이 모듈 이름을
+      넣은 진짜 함대 프로세스를 통째로 뺐다(리뷰 blocking 1)."""
+    if self_pid is None:
+        self_pid = os.getpid()
+    rows = []
     parsed = 0
     for line in lines or []:
         s = line.strip()
         if not s:
             continue
-        parts = s.split(None, 1)
-        if len(parts) < 2:
+        parts = s.split(None, 2)
+        if len(parts) < 3:
             continue
-        head, cmd = parts[0], parts[1]
-        if "javis_resource_gate" in cmd:
-            continue                     # 자기 자신은 세지 않는다(_count_matching 과 동형)
-        hit = any(r.search(cmd) for r in regs)
+        pid_s, head, cmd = parts
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            # 헤더 잔재·2열 출력이면 그냥 넘긴다. 그러나 **함대 행**이면 조용히 버리지 않는다 —
+            # 그 줄만 빠지면 합이 과소계상되고 그것이 '측정 성공'으로 나간다(codex 위임 검체 9).
+            if _fleet_owner(cmd) is not None:
+                return None, "row_unparsed"
+            continue
+        if pid <= 0:
+            if _fleet_owner(cmd) is not None:
+                return None, "row_unparsed"
+            continue                     # 유효 PID 가 아니다(열 순서가 뒤바뀐 형상 방어)
+        owner = _fleet_owner(cmd)
+        mine = owner is not None and pid != self_pid
         try:
             pcpu = float(head)
         except ValueError:
-            if hit:
+            if mine:
                 return None, "row_unparsed"
             continue
         if not math.isfinite(pcpu) or pcpu < 0:
-            if hit:
+            if mine:
                 return None, "row_nonfinite"
             continue
         parsed += 1
-        if hit:
-            total += pcpu
+        if mine:
+            rows.append({"pid": pid, "pcpu": pcpu, "owner": owner,
+                         "exe": _fleet_exe_name((cmd.split() or [""])[0])[1][:64]})
     if parsed == 0:
         return None, "shape"
+    return rows, None
+
+
+def _fleet_cpu_percent(lines, self_pid=None):
+    """함대 행들의 %CPU 합 → `(total|None, reason|None)`.
+
+    ★`float("nan")` 은 예외 없이 성공하고 이후 모든 비교가 False 라, NaN 이 섞이면 합이 NaN 이 되어
+      `NaN >= hard` 가 거짓 → **조용한 allow** 가 된다. `_fleet_rows` 의 유한성 검사가 그 길을 막는다."""
+    rows, why = _fleet_rows(lines, self_pid)
+    if rows is None:
+        return None, why
+    try:
+        total = sum(r["pcpu"] for r in rows)
+    except OverflowError:                # 보수적 합산 경로가 예외를 올릴 수도 있다(fsum 계열)
+        return None, "sum_overflow"
     if not math.isfinite(total):
         # 각 항이 유한해도 **합**은 넘칠 수 있다(1e308+1e308). inf 는 `inf >= hard` 로 hard 를 내지만
         # JSON 으로 나가면 `Infinity` — 표준 JSON 이 아니라 엄격한 소비자에서 깨진다. 판정을
@@ -395,33 +662,125 @@ def _fleet_cpu_percent(lines):
     return total, None
 
 
-def _fleet_cpu_top(lines, top_n=FLEET_CPU_TOP_N):
-    """상위 기여 프로세스 [{pcpu, cmd}] — hard 판정의 **회수 대상 지목**(봉인표 ③).
+def _fleet_cpu_top(lines, top_n=FLEET_CPU_TOP_N, self_pid=None):
+    """상위 기여 프로세스 `[{pid, exe, owner, pcpu}]` — hard 판정의 **회수 대상 지목**(봉인표 ③).
 
+    ★명령줄(인자)을 담지 않는다(리뷰 major): 종전 판본은 명령줄 앞 120자를 마스킹 없이 실었고,
+      그 값이 `measured` 를 타고 `boot-last.json`·편성 상태파일로 **영속**됐다
+      (`… --api-key secret123` 같은 인자가 정상 판정에서도 디스크에 남는다). 회수에 필요한 것은
+      PID·실행 주체·CPU 셋이고, 그 셋에는 인자가 필요 없다.
     실패는 조용한 빈 목록이다: 이것은 판정 입력이 아니라 사람이 읽을 증거이므로, 여기서 나는 오류가
     판정을 흔들면 안 된다(판정 입력은 `_fleet_cpu_percent` 하나).
     ★그 격리를 **말로만 두지 않는다**(codex R2 · 위임 검체 5): 종전 판본은 이 약속을 주석에만 두고
       예외를 그대로 흘려, 진단 보조 하나가 정상 측정을 exit 70(EX_SOFTWARE)으로 만들 수 있었다."""
     try:
-        regs = [re.compile(pat) for pat in FLEET_CPU_PATTERNS]
-        rows = []
-        for line in lines or []:
-            s = line.strip()
-            parts = s.split(None, 1) if s else []
-            if len(parts) < 2 or "javis_resource_gate" in parts[1]:
-                continue
-            try:
-                pcpu = float(parts[0])
-            except ValueError:
-                continue
-            if not math.isfinite(pcpu) or pcpu < 0:
-                continue
-            if any(r.search(parts[1]) for r in regs):
-                rows.append({"pcpu": pcpu, "cmd": parts[1][:120]})
+        rows, _why = _fleet_rows(lines, self_pid)
+        rows = list(rows or [])
         rows.sort(key=lambda r: r["pcpu"], reverse=True)
         return rows[:top_n]
     except Exception:                    # noqa: BLE001 — 진단이 판정을 죽이지 않는다는 계약
         return []
+
+
+# ── ★R1(봉인표 ③): fleet_cpu hard 의 **연속 보류 상한** ──
+def _pack_state_dir():
+    """팩 관례 상태 루트 — `CYS_STATE_DIR` ‖ `~/.cys/state`(javis_bootstrap._state_root 와 동형).
+    데몬 상태 디렉터리(`~/.local/state/cys`)에는 쓰지 않는다 — 그쪽은 바이너리 소유다."""
+    return os.environ.get("CYS_STATE_DIR") or os.path.join(
+        os.path.expanduser(CYS_DIR_DEFAULT), "state")
+
+
+def _fleet_hold_path():
+    """레인별 래치 경로. 레인 키는 `CYS_SOCKET` 의 디렉터리 이름(부서 레인은 자기 것을 본다)."""
+    sock = os.environ.get("CYS_SOCKET")
+    key = "default"
+    if sock:
+        # ★디렉터리 **이름**만 쓰면 `/a/team/cys.sock` 와 `/b/team/cys.sock` 이 같은 래치를 공유해
+        #   한 레인의 below 가 다른 레인의 연속 보류 기록을 지운다(codex 위임 검체 14).
+        #   읽을 수 있는 이름 + 전체 경로 해시 8자로 레인을 가른다.
+        full = os.path.dirname(os.path.abspath(os.path.expanduser(sock)))
+        key = "%s-%s" % (os.path.basename(full) or "lane",
+                         hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()[:8])
+    key = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:80]
+    return os.path.join(_pack_state_dir(), "resource-gate",
+                        "%s-%s" % (FLEET_CPU_HOLD_BASENAME, key))
+
+
+def _fleet_hold_write(path, value):
+    """래치 원자 기록 → 성공 여부. 실패는 예외가 아니라 False(판정을 죽이지 않는다)."""
+    tmp = None
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        # ★임시 이름은 **호출마다** 다르다(codex 위임 검체 R2 · 스레드 경합): pid 만 쓰면 같은
+        #   프로세스의 두 호출이 같은 tmp 를 쓰다가 한쪽 `os.replace` 가 ENOENT 로 실패하고,
+        #   그 실패가 `unbounded_io`(=만료 취급)로 번져 보류가 근거 없이 풀린다.
+        tmp = "%s.%d.%s.tmp" % (path, os.getpid(), os.urandom(4).hex())
+        with open(tmp, "w", encoding="utf-8") as f:
+            # ★repr 정밀도로 쓴다(codex 위임 검체 13): `%.3f` 는 올림 때문에 저장값이 `now` 보다
+            #   커질 수 있고, 그러면 다음 호출이 그것을 '미래' 로 읽어 시계를 0으로 되돌린다.
+            f.write("%r\n" % float(value))
+        os.replace(tmp, path)            # Windows 에서도 원자 교체
+        return True
+    except OSError:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def _fleet_hard_hold(state, override=None, now=None):
+    """이 축이 **연속 hard 로 머문 초** → `(hold|None, reason, expired)`.
+
+    state ∈ "hard"(임계 이상) · "below"(쟀는데 임계 미만) · "unmeasured"(값이 없다 — 축 부재·측정 실패).
+    reason ∈ "override" · "armed"(방금 무장) · "held" · "expired" · "cleared" · "unmeasured" ·
+             "unbounded_io".
+    계약(봉인표 ③): `expired=True` 면 소비자(evaluate)가 hard 를 soft 로 내린다.
+      · below            → 래치 삭제(연속만 센다) · expired False
+      · unmeasured       → 래치 **무접촉**(codex R1-2): 값을 못 잰 호출이 남의 연속 hard 시계를 0으로
+                          되돌리면, 간헐적 ps 실패만으로 상한이 영원히 안 찬다(유계가 사라진다)
+      · 래치 없음/파손   → 지금으로 무장 · expired False (쓰기 실패면 **unbounded_io + expired True**:
+                          유계를 증명할 수 없는 상태에서 무기한 차단을 열어 두지 않는다 — ③ 방향)
+      · 미래 값(시계 역행) → 다시 무장(같은 취급)
+      · hold < 상한      → 유지
+      · hold >= 상한     → expired True. **재무장하지 않는다** — 만료는 '이 포화가 끝날 때까지 권고'
+                          라는 상태이고, 재무장하면 만료 창을 다른 호출자가 소비해 정작 복구가
+                          필요한 편성 호출이 다시 hard 를 만난다(유계가 호출자별로 안 보장된다).
+    ★부작용 경계: `override` 가 주어지면 파일을 **읽지도 쓰지도 않는다**(self-test·검체 밀폐)."""
+    if override is not None:
+        return override, "override", bool(state == "hard"
+                                          and override >= FLEET_CPU_HARD_MAX_HOLD_SECS)
+    if state == "unmeasured":
+        return None, "unmeasured", False
+    now = time.time() if now is None else now
+    path = _fleet_hold_path()
+    if state != "hard":
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # 지우지 못했으면 그렇게 적는다 — 다음 hard 가 남은 래치 때문에 **더 일찍** 만료된다
+            # (방향은 ③ 안전이지만 '연속 보류' 의 의미가 달라지므로 침묵하지 않는다).
+            return None, "clear_failed", False
+        return None, "cleared", False
+    since = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            since = float((f.read() or "").strip())
+    except (OSError, ValueError):
+        since = None
+    # 미래 판정에 작은 허용오차를 둔다(부동소수 왕복·파일시스템 시계 오차가 재무장을 낳지 않게).
+    if since is None or not math.isfinite(since) or since > now + FLEET_HOLD_FUTURE_SLACK_S:
+        ok = _fleet_hold_write(path, now)
+        return (0.0 if ok else None), ("armed" if ok else "unbounded_io"), (not ok)
+    # 허용오차 안의 '미래' 저장값은 음수 경과를 만든다 — 0 으로 죈다(음수 보류초는 뜻이 없다).
+    hold = max(0.0, now - since)
+    return hold, ("expired" if hold >= FLEET_CPU_HARD_MAX_HOLD_SECS else "held"), \
+        hold >= FLEET_CPU_HARD_MAX_HOLD_SECS
 
 
 def _boot_epoch_path():
@@ -509,14 +868,17 @@ def measure(a):
     ncpu = os.cpu_count() or 1
 
     # ★WP-7 N: 함대 CPU 축.
-    #   ⓐ `ps` **부재**(Windows 기본)는 측정 실패가 아니라 '이 플랫폼엔 이 축이 없다'는 사실이다 →
-    #      `measure_errors` 에 넣지 않는다(정본 §4 WP-7 · Windows exit 계약 불변). `checks` 에는
-    #      level="unavailable" 로 남겨 침묵하지 않는다.
-    #   ⓑ ps 는 있는데 조회·형상이 깨진 것은 **측정 실패**다 → `measure_errors`(최소 soft 격상).
-    #      그러지 않으면 POSIX 에서 CPU 조회만 깨졌을 때 exit 0 = 조용한 allow 가 열린다(codex R1 #4).
-    #      단 Windows 에서는 '있으나 -axo 를 모르는 ps'(MSYS)가 흔해 실질적으로 축 부재와 같으므로
-    #      ⓐ 로 접는다 — 그러지 않으면 전 Windows 설치가 상시 soft 가 되어 exit 계약이 바뀐다.
+    #   ⓐ `ps` **부재**(Windows 기본)·**플래그 미지원**(MSYS/BusyBox `-axo`)은 측정 실패가 아니라
+    #      '이 플랫폼엔 이 축이 없다'는 사실이다 → `measure_errors` 에 넣지 않는다(정본 §4 WP-7 ·
+    #      Windows exit 계약 불변). `checks` 에는 level="unavailable" 로 남겨 침묵하지 않는다.
+    #   ⓑ ps 도 있고 플래그도 아는데 조회·형상이 깨진 것은 **측정 실패**다 → `measure_errors`
+    #      (최소 soft 격상). 그러지 않으면 POSIX 에서 CPU 조회만 깨졌을 때 exit 0 = 조용한 allow 가
+    #      열린다(codex R1 #4).
+    #   ⓒ Windows 호스트(`_is_windows_host` — MSYS/Cygwin 파이썬·Git Bash 포함)에서는 ⓑ 도 ⓐ 로
+    #      접는다: 그 플랫폼에서 상시 soft 가 되면 `completion_guard._soft_kind` 가 skip_soft 로
+    #      바뀌어 완료 검증이 영구 skip 된다(exit 계약 변경).
     fleet_cpu_top = []
+    fleet_lines = None       # 판정에 쓴 **그 ps 스냅샷**(진단도 같은 스냅샷에서 뽑는다)
     _fleet_ovr = getattr(a, "fleet_cpu_override", None)   # 신설 플래그 — 구 네임스페이스 안전
     if _fleet_ovr is not None:
         fleet_cpu_ratio, fleet_reason = _fleet_ovr, "override"
@@ -533,16 +895,44 @@ def measure(a):
                 #   0.9996 이 1.0 이 되어 명시 임계보다 낮은 자리에서 hard 가 난다. 반올림은 사람이
                 #   읽는 출력에서만 한다.
                 fleet_cpu_ratio, fleet_reason = fleet_pct / 100.0 / ncpu, "ok"
-                # ★진단 수집은 판정 **바깥**이다: 여기서 나는 어떤 예외도 측정을 무효로 만들지
-                #   않는다(최상위 경계가 그것을 exit 70='측정 실패'로 접기 때문 · codex R2 검체 5).
-                #   함수 안에도 같은 격리가 있지만, 격리를 **호출 지점에서 선언**해 두어야 그 함수를
-                #   갈아끼우거나 다시 써도 계약이 남는다.
-                try:
-                    fleet_cpu_top = _fleet_cpu_top(cpu_lines)
-                except Exception:        # noqa: BLE001 — 진단이 판정을 죽이지 않는다는 계약
-                    fleet_cpu_top = []
-    if fleet_reason not in ("ok", "override", "absent") and os.name != "nt":
+                fleet_lines = cpu_lines
+    if fleet_reason not in ("ok", "override", "absent", "unsupported") and not _is_windows_host():
         errors.append("fleet_cpu(ps)")
+
+    # ★R1(봉인표 ③): 이 축이 **연속으로** hard 인 시간을 재고 상한(15분)을 넘으면 hard 를 내린다.
+    #   여기서 재는 이유: `evaluate` 는 순수 함수라 파일 I/O 를 두지 않는다(테스트가 손으로 만든
+    #   measured 로 그대로 부른다). 임계 비교는 evaluate 와 **같은 규칙**(value >= hard)을 쓴다.
+    _fleet_hard_thr = getattr(a, "fleet_cpu_hard", FLEET_CPU_HARD_DEFAULT)
+    if fleet_cpu_ratio is None or _fleet_hard_thr is None:
+        _fleet_state = "unmeasured"
+    elif fleet_cpu_ratio >= _fleet_hard_thr:
+        _fleet_state = "hard"
+    else:
+        _fleet_state = "below"
+    _would_hard = _fleet_state == "hard"
+    _hold_ovr = getattr(a, "fleet_cpu_hold_override", None)
+    if _hold_ovr is None and _fleet_ovr is not None:
+        # 값 자체가 주입된 호출(self-test·검체)은 래치 파일을 **읽지도 쓰지도 않는다**(밀폐).
+        fleet_hold, fleet_hold_reason, fleet_hold_expired = None, "axis_override", False
+    else:
+        fleet_hold, fleet_hold_reason, fleet_hold_expired = _fleet_hard_hold(_fleet_state, _hold_ovr)
+
+    # ★R1(리뷰 major — 비밀값 전파): 진단(top)은 **hard 일 때만** 모은다. 종전엔 allow 에서도 모아
+    #   `measured` 에 실렸고, 그것이 `boot-last.json`(bootstrap log.step)·편성 상태파일
+    #   (`_gate_compact` 의 measured 보존)로 영속됐다. 회수 대상 지목이 필요한 것은 hard 뿐이다.
+    fleet_cpu_procs = None
+    if _would_hard and fleet_lines is not None:
+        # ★진단 수집은 판정 **바깥**이다: 여기서 나는 어떤 예외도 측정을 무효로 만들지 않는다
+        #   (최상위 경계가 그것을 exit 70='측정 실패'로 접기 때문 · codex R2 검체 5). 함수 안에도
+        #   같은 격리가 있지만, 격리를 **호출 지점에서 선언**해 두어야 그 함수를 갈아끼워도 계약이 남는다.
+        # ★수집 기준은 **원시값이 hard 임계 이상인가** 다 — 최종 verdict 가 아니다(codex R1-2 Q4).
+        #   부트 유예·보류 상한으로 soft 가 된 순간에도 '왜 완화했나'를 설명할 기여자가 남아야 한다.
+        try:
+            fleet_cpu_top = _fleet_cpu_top(fleet_lines)
+            _rows_all, _ = _fleet_rows(fleet_lines)
+            fleet_cpu_procs = len(_rows_all) if _rows_all is not None else None
+        except Exception:            # noqa: BLE001 — 진단이 판정을 죽이지 않는다는 계약
+            fleet_cpu_top = []
 
     # ★부트 유예 — CPU 축 hard→soft 창(300s). 근거 없음(None)은 유예 없음이다(_boot_elapsed).
     boot_elapsed, boot_reason = _boot_elapsed(getattr(a, "boot_elapsed_override", None))
@@ -569,6 +959,10 @@ def measure(a):
             "fleet_cpu_ratio": fleet_cpu_ratio,
             "fleet_cpu_reason": fleet_reason,
             "fleet_cpu_top": fleet_cpu_top,
+            "fleet_cpu_procs": fleet_cpu_procs,      # 상위 N 이 전체 합을 설명하지 못할 수 있다
+            "fleet_cpu_hold": (round(fleet_hold, 1) if fleet_hold is not None else None),
+            "fleet_cpu_hold_reason": fleet_hold_reason,
+            "fleet_cpu_hold_expired": fleet_hold_expired,
             "boot_elapsed": (round(boot_elapsed, 1) if boot_elapsed is not None else None),
             "boot_grace": boot_grace, "boot_grace_reason": boot_reason,
             "context_pct": a.context, "measure_errors": errors,
@@ -664,13 +1058,19 @@ def evaluate(m, a):
     checks = []
     grace = bool(m.get("boot_grace"))
 
+    hold_expired = bool(m.get("fleet_cpu_hold_expired"))
+
     def add(metric, value, soft, hard):
-        """★WP-7 N 로 두 갈래가 늘었다.
+        """★WP-7 N 로 두 갈래가 늘었고, R1 에서 셋째가 늘었다.
           ① `hard is None` = **soft 전용 축**(hard 판정 자체가 없다). `load_ratio` 가 이쪽으로 간다 —
              호스트 부하에는 우리가 회수할 수 없는 성분이 섞이므로 그것으로 착수를 거부하지 않는다.
           ② 부트 유예: CPU 축(CPU_GRACE_AXES)의 hard 는 부트 후 300초 창에서 soft 로 내려간다.
              내려간 사실은 `boot_grace: true` 로 그 check 에 **남긴다**(조용한 완화 금지 — 사후에
-             '왜 hard 가 아니었나' 를 판독할 수 있어야 한다)."""
+             '왜 hard 가 아니었나' 를 판독할 수 있어야 한다).
+          ③ ★보류 상한(봉인표 ③): `fleet_cpu_ratio` 가 **연속 15분** hard 였으면 그 뒤로는 soft 다
+             (`hold_expired: true`). 이 축은 호스트 전체 함대 CPU 를 재면서 각 부서의 복구 허가에
+             쓰이므로, 상한이 없으면 다른 부서의 부하가 전멸 부서의 복구를 무기한 막는다.
+             ★이 함수는 순수하다 — 만료 판정 자체는 `measure()` 가 재서 `m` 으로 실어 온다."""
         if value is None:
             return
         if hard is None:
@@ -681,6 +1081,9 @@ def evaluate(m, a):
         if level == "hard" and grace and metric in CPU_GRACE_AXES:
             c["level"] = "soft"
             c["boot_grace"] = True
+        if c["level"] == "hard" and hold_expired and metric == "fleet_cpu_ratio":
+            c["level"] = "soft"
+            c["hold_expired"] = True
         checks.append(c)
 
     add("servers", m["servers"], a.servers_soft, a.servers_hard)
@@ -749,7 +1152,7 @@ def cmd_check(a):
     #     · 축 부재/사유  → `checks[].level=="unavailable"` + `measured.fleet_cpu_reason`
     #     · 부트 유예     → `checks[].boot_grace` + `measured.boot_grace/boot_elapsed/boot_grace_reason`
     #     · 무동작 플래그 → **stderr**(진단 채널 — 계약 채널 stdout 은 오염시키지 않는다)
-    if getattr(a, "load_hard_ratio", LOAD_HARD_RATIO_DEFAULT) != LOAD_HARD_RATIO_DEFAULT:
+    if getattr(a, "load_hard_ratio", None) is not None:
         sys.stderr.write("[resource-gate] --load-hard-ratio=%s 는 무동작이다 — load_ratio 는 "
                          "0.14.31 부터 soft 전용(호스트 부하로 착수를 거부하지 않는다). "
                          "함대 CPU 차단은 --fleet-cpu-hard 소관.\n" % a.load_hard_ratio)
@@ -792,6 +1195,11 @@ def cmd_check(a):
             print("context_unmeasured: --context 미제공 — 컨텍스트 60%/clear 규칙을 검사하지 못함. "
                   "check 시 --context <pct> 전달 권장.")
         # ★WP-7 N: 부트 유예가 실제로 판정을 바꿨으면 그 사실을 사람에게도 남긴다(조용한 완화 금지).
+        if any(c.get("hold_expired") for c in checks):
+            print("fleet_cpu_hold_expired: 이 축이 연속 %ss(>=%ds) hard 였다 — 상한을 넘겨 soft 로 "
+                  "내렸다(봉인표 ③: 다른 부서의 부하가 전멸 부서의 복구를 무기한 막지 않게). "
+                  "포화가 끝나면 래치가 지워지고 이 축은 다시 hard 를 낼 수 있다."
+                  % (m.get("fleet_cpu_hold"), int(FLEET_CPU_HARD_MAX_HOLD_SECS)))
         if m.get("boot_grace") and any(c.get("boot_grace") for c in checks):
             print("boot_grace: 데몬 부트 후 %ss(<%ds) — CPU 축 hard 를 soft 로 내렸다. "
                   "유예 밖이면 같은 값이 hard_block 이다."
@@ -804,7 +1212,10 @@ def cmd_check(a):
             if any(c["metric"] == "fleet_cpu_ratio" and c["level"] == "hard" for c in checks):
                 top = m.get("fleet_cpu_top") or []
                 for row in top:
-                    print("  ↳ fleet_cpu 기여 %.1f%% %s" % (row.get("pcpu", 0.0), row.get("cmd", "")))
+                    # ★인자는 싣지 않는다(비밀값 전파 차단) — 회수에 필요한 것은 PID·실행 주체·CPU 다.
+                    print("  ↳ fleet_cpu 기여 %.1f%% pid=%s %s(%s)"
+                          % (row.get("pcpu", 0.0), row.get("pid"), row.get("exe", "?"),
+                             row.get("owner", "?")))
                 print("  ↳ fleet_cpu 는 우리 프로세스만 센다 — %s 회수하면 풀린다"
                       "(죽은 좌석은 CPU 를 먹지 않으므로 이 축이 좌석 복구 자체를 막지는 않는다)."
                       % ("위 프로세스를" if top else "`ps -axo pcpu,command` 상위 함대 프로세스를"))
@@ -1079,6 +1490,36 @@ class _UsageExit(Exception):
     """argparse 의 SystemExit(2) 를 가로채 EX_USAGE(64) 로 remap 하기 위한 내부 신호."""
 
 
+def _finite_float(text):
+    """argparse 실수 타입 — **유한한 수만** 받는다(nan·inf 거부 → EX_USAGE 64).
+
+    ★R1(리뷰 blocking): `type=float` 는 `nan`·`inf` 를 정상 입력으로 받는다. NaN 은 이후 모든 비교가
+      거짓이라 `--fleet-cpu-override nan` 이 **조용한 allow**(exit 0)를 만들고, `json.dumps` 는
+      비표준 토큰 `NaN`/`Infinity` 를 계약 채널(stdout)로 흘려 엄격한 소비자를 깨뜨린다. 임계에
+      NaN 을 주면 실제 ratio 가 1.0 이어도 `1.0 >= nan` 이 거짓이라 hard 가 사라진다.
+    ★임계에 `inf`(축 무력화 관용)도 받지 않는다: 이 도구에는 축을 끄는 관용이 원래 없고
+      (있었다면 `--fleet-cpu-hard inf` 를 쓰는 호출자가 있어야 하는데 저장소에 0건), 축을 끄는
+      길을 '비표준 JSON 을 흘리는 입력'으로 열어 주는 것은 나쁜 거래다. 축을 사실상 끄려면
+      유한한 큰 수(예: 1e9)를 준다 — 그 값은 JSON 으로 안전히 나간다."""
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("실수가 아니다: %r" % (text,))
+    if not math.isfinite(v):
+        raise argparse.ArgumentTypeError(
+            "유한한 실수가 아니다(nan·inf 금지 — 조용한 allow·비표준 JSON 차단): %r" % (text,))
+    return v
+
+
+def _nonneg_float(text):
+    """유한 + **음수 아님**. 분율(비율) 인자 전용 — 음수 분율은 뜻이 없고, 임계에 음수가 들어가면
+    모든 값이 hard 가 된다(반대 방향의 조용한 사고). 유한성 검사만으로는 유효한 설정이 되지 않는다."""
+    v = _finite_float(text)
+    if v < 0:
+        raise argparse.ArgumentTypeError("음수 분율은 받지 않는다: %r" % (text,))
+    return v
+
+
 class _GateArgumentParser(argparse.ArgumentParser):
     """★A13: argparse 의 사용오류 종료를 exit 2(=EXIT_HARD) 로 흘려보내지 않는다.
 
@@ -1104,34 +1545,42 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("check")
-    c.add_argument("--context", type=float, default=None, help="자기보고 컨텍스트 %%")
+    c.add_argument("--context", type=_finite_float, default=None, help="자기보고 컨텍스트 %%")
     c.add_argument("--json", action="store_true")
     c.add_argument("--servers-soft", type=int, default=2)
     c.add_argument("--servers-hard", type=int, default=3)
     c.add_argument("--nodes-soft", type=int, default=12)
     c.add_argument("--nodes-hard", type=int, default=NODES_HARD_DEFAULT)
-    c.add_argument("--load-soft-ratio", type=float, default=1.0)
+    c.add_argument("--load-soft-ratio", type=_finite_float, default=1.0)
     # ★WP-7 N: load 축은 soft 전용이 됐다 — 이 플래그는 **무동작**이다. 삭제하지 않는 이유는
     #   구 호출자가 넘기면 argparse 가 EX_USAGE(64)를 내고 소비부가 그것을 '측정 실패'로 loud 처리하기
     #   때문이다(회귀 방향이 더 나쁘다). 기본값과 다르게 주면 stderr 로 무동작임을 고지한다.
-    c.add_argument("--load-hard-ratio", type=float, default=LOAD_HARD_RATIO_DEFAULT,
-                   help="[무동작·0.14.31~] load_ratio 는 soft 전용. 함대 CPU 차단은 --fleet-cpu-hard")
-    c.add_argument("--fleet-cpu-soft", dest="fleet_cpu_soft", type=float,
+    #   ★R1(리뷰 minor): 판별을 '기본값과 다른가' 가 아니라 **명시 여부**로 한다 — 구 기본값을
+    #     그대로 명시한 호출자(`--load-hard-ratio 2.0`)도 축이 사라진 사실을 통보받아야 한다.
+    c.add_argument("--load-hard-ratio", type=_finite_float, default=None,
+                   help="[무동작·0.14.31~] load_ratio 는 soft 전용. 함대 CPU 차단은 --fleet-cpu-hard "
+                        "(종전 기본값 %s — 지금은 주든 안 주든 판정이 같다)" % LOAD_HARD_RATIO_DEFAULT)
+    c.add_argument("--fleet-cpu-soft", dest="fleet_cpu_soft", type=_nonneg_float,
                    default=FLEET_CPU_SOFT_DEFAULT,
                    help="함대 %%CPU 합/100/ncpu 분율 soft 임계(기본 0.5 = 전 코어의 50%% 상당)")
-    c.add_argument("--fleet-cpu-hard", dest="fleet_cpu_hard", type=float,
+    c.add_argument("--fleet-cpu-hard", dest="fleet_cpu_hard", type=_nonneg_float,
                    default=FLEET_CPU_HARD_DEFAULT,
                    help="같은 분율의 hard 임계(기본 1.0 = 전 코어 100%% 상당)")
-    c.add_argument("--fleet-cpu-override", dest="fleet_cpu_override", type=float, default=None,
+    c.add_argument("--fleet-cpu-override", dest="fleet_cpu_override", type=_nonneg_float,
+                   default=None,
                    help="테스트 주입 — fleet_cpu_ratio(분율)를 직접 주입하고 ps 조회를 생략")
-    c.add_argument("--boot-elapsed-override", dest="boot_elapsed_override", type=float,
+    c.add_argument("--fleet-cpu-hold-override", dest="fleet_cpu_hold_override",
+                   type=_finite_float, default=None,
+                   help="테스트 주입 — 이 축이 연속 hard 로 머문 초(보류 상한 %ds 판정용 · "
+                        "래치 파일 무접촉)" % int(FLEET_CPU_HARD_MAX_HOLD_SECS))
+    c.add_argument("--boot-elapsed-override", dest="boot_elapsed_override", type=_finite_float,
                    default=None,
                    help="테스트 주입 — 데몬 부트 후 경과초(부트 유예 창 판정용 · boot-epoch mtime 대체)")
-    c.add_argument("--context-soft", type=float, default=50.0)
-    c.add_argument("--context-hard", type=float, default=60.0)
+    c.add_argument("--context-soft", type=_finite_float, default=50.0)
+    c.add_argument("--context-hard", type=_finite_float, default=60.0)
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
-    c.add_argument("--load-override", type=float, default=None, help="테스트 주입")
+    c.add_argument("--load-override", type=_finite_float, default=None, help="테스트 주입")
     c.add_argument("--servers-ledger-override", dest="servers_ledger_override",
                    type=_ledger_override_arg, default=None,
                    help="★A3-b 테스트 주입 — 원장 텍스트 JSON {\"lane\":\"<cys ps 출력>\","
@@ -1143,7 +1592,7 @@ def main(argv=None):
                         "`cys status --json --socket` 조회 전부 생략 · 잘못된 JSON=EX_USAGE 64)")
     c.add_argument("--rate-check", action="store_true",
                    help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
-    c.add_argument("--rate-soft", type=float, default=80.0, help="rate 5h used_pct soft 임계")
+    c.add_argument("--rate-soft", type=_finite_float, default=80.0, help="rate 5h used_pct soft 임계")
     c.add_argument("--rate-override", default=None,
                    help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
     c.add_argument("--require-context", dest="require_context", action="store_true",
@@ -1188,8 +1637,28 @@ def main(argv=None):
 
 
 def self_test():
-    """A13 타입드 exit 회귀 배터리 — 측정 없이 결정론(부작용 0)."""
+    """A13 타입드 exit 회귀 배터리 — 측정 없이 결정론(부작용 0).
+
+    ★부작용 0 을 **강제**한다(R1 · codex 지적): 0.14.31 에서 이 모듈은 hard 보류 래치를
+      `CYS_STATE_DIR ‖ ~/.cys/state` 아래에 쓴다. self-test 가 그 경로를 건드리면 '부작용 0' 이
+      말뿐인 약속이 된다 — 실행 동안 `CYS_STATE_DIR` 을 임시 디렉터리로 고정하고 원복한다."""
     fails = []
+    import shutil as _sh0
+    import tempfile as _tf0
+    _st_tmp = _tf0.mkdtemp(prefix="gate-selftest-")
+    _st_saved = os.environ.get("CYS_STATE_DIR")
+    os.environ["CYS_STATE_DIR"] = _st_tmp
+    try:
+        return _self_test_body(fails)
+    finally:
+        if _st_saved is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = _st_saved
+        _sh0.rmtree(_st_tmp, ignore_errors=True)
+
+
+def _self_test_body(fails):
 
     def chk(cond, msg):
         if not cond:
@@ -1546,26 +2015,91 @@ def self_test():
             "POSIX 에서 ps 조회 실패가 조용한 allow 로 접혔다: rc=%r m=%r"
             % (rc, (doc.get("measured") or {}).get("measure_errors")))
     # (g) `_fleet_cpu_percent` 순수 핀 — 합산·무매칭 0.0·형상 불일치·함대 행 파손·NaN
-    L = [" 10.5 /usr/local/bin/cysd --socket /x",
-         "  4.5 /Users/u/.local/bin/claude --foo",
-         "  1.0 /usr/bin/mediaanalysisd",
-         "  2.0 /opt/serena-mcp-server",
-         "  9.9 python3 /w/bin/javis_resource_gate.py check"]
-    tot, why = _fleet_cpu_percent(L)
+    #     ★열 계약이 `pid pcpu command` 로 바뀌었다(자기 제외를 PID 로 하기 위해 · R1 blocking 1).
+    L = ["  101  10.5 /usr/local/bin/cysd --socket /x",
+         "  102   4.5 /Users/u/.local/bin/claude --foo",
+         "  103   1.0 /usr/bin/mediaanalysisd",
+         "  104   2.0 /opt/serena --transport stdio",
+         "  105   9.9 python3 /w/bin/javis_resource_gate.py check"]
+    tot, why = _fleet_cpu_percent(L, self_pid=999999)
     chk(abs((tot or 0) - 17.0) < 1e-9 and why is None,
         "함대 %%CPU 합이 17.0(cysd10.5+claude4.5+serena2.0) 아님: %r/%r" % (tot, why))
-    tot, why = _fleet_cpu_percent(["  1.0 /usr/bin/mediaanalysisd", "  0.0 /sbin/init"])
+    tot, why = _fleet_cpu_percent(["  1   1.0 /usr/bin/mediaanalysisd", "  2   0.0 /sbin/init"])
     chk(tot == 0.0 and why is None,
         "매칭 0건(깨끗한 기계)이 측정 불능으로 오분류: %r/%r" % (tot, why))
     tot, why = _fleet_cpu_percent(["root /sbin/init", "daemon /usr/sbin/cupsd"])
     chk(tot is None and why == "shape",
-        "첫 열이 수치가 아닌 형상이 '0%%'로 위장됨: %r/%r" % (tot, why))
-    tot, why = _fleet_cpu_percent(["  0.0 /sbin/init", "BROKEN /usr/bin/codex"])
+        "열 형상이 계약과 다른데 '0%%'로 위장됨: %r/%r" % (tot, why))
+    tot, why = _fleet_cpu_percent(["  10.5 /usr/local/bin/cysd", "  4.5 /usr/bin/claude"])
+    chk(tot is None and why == "shape",
+        "구 2열 출력(pcpu,command)이 3열 계약으로 통과해 pid 를 CPU 로 읽었다: %r/%r" % (tot, why))
+    tot, why = _fleet_cpu_percent(["  1   0.0 /sbin/init", "  2 BROKEN /usr/bin/codex"])
     chk(tot is None and why == "row_unparsed",
         "**함대 행** 파싱 실패가 조용히 건너뛰어 과소계상됨: %r/%r" % (tot, why))
-    tot, why = _fleet_cpu_percent(["  0.0 /sbin/init", "nan /usr/local/bin/cysd"])
+    tot, why = _fleet_cpu_percent(["  1   0.0 /sbin/init", "  2 nan /usr/local/bin/cysd"])
     chk(tot is None and why == "row_nonfinite",
         "NaN 이 합에 섞여 모든 비교를 거짓으로 만들었다(조용한 allow): %r/%r" % (tot, why))
+    # ★codex 위임 검체 9 — pid 열이 깨진 **함대 행**도 조용히 버리지 않는다(과소계상이 '성공'으로 나감)
+    tot, why = _fleet_cpu_percent(["  1   2.0 tail -f x", "bad 90 /usr/bin/codex"], self_pid=999999)
+    chk(tot is None and why == "row_unparsed",
+        "pid 가 깨진 함대 행이 0 으로 접혔다: %r/%r" % (tot, why))
+    # (g2) ★R1 blocking 1 — 자기 제외는 **PID** 다. 출력 파일명에 이 모듈 이름이 든 진짜 함대
+    #      프로세스가 종전엔 통째로 빠졌다(정상 측정값 0 · 조용한 과소계상).
+    tot, why = _fleet_cpu_percent(
+        ["  1   0.0 /sbin/init",
+         " 42  25.0 /opt/codex --output /tmp/javis_resource_gate.log"], self_pid=999999)
+    chk((tot, why) == (25.0, None),
+        "자기 제외가 여전히 명령줄 부분문자열이다(진짜 codex 를 뺐다): %r/%r" % (tot, why))
+    tot, why = _fleet_cpu_percent(["  1   0.0 /sbin/init", " 42  25.0 /opt/codex"], self_pid=42)
+    chk((tot, why) == (0.0, None), "PID 자기 제외가 동작하지 않는다: %r/%r" % (tot, why))
+    # (g3) ★R1 blocking 2 — 소유권은 argv0(실행 주체)다. 아래는 **전부 비매칭**이어야 한다.
+    for cmd_, tag in ((" 7  99.0 python3 /tmp/agy/report.py", "디렉터리 이름 agy"),
+                      (" 7  99.0 grep claude", "인자에만 든 claude"),
+                      (" 7  99.0 tail -f /x/claude-code/debug.log", "패키지 세그먼트가 인자(.js 아님)"),
+                      (" 7  99.0 sh -c S=/tmp/claude-501/x; echo", "셸 명령 문자열 속 claude"),
+                      (" 7  99.0 python3 -c codex", "코드 문자열 codex"),
+                      (" 7  99.0 /Applications/Claude.app/Contents/MacOS/Claude", "macOS GUI 앱 번들"),
+                      (" 7  99.0 /opt/codex-report --x", "codex- 접두 남의 프로그램"),
+                      (" 7  99.0 python3 /home/u/.codex/report.py", "인자 속 .codex 경로"),
+                      # ★codex 위임 검체(R1 R2)가 찾아낸 오탐 — 데이터 인자·런처 옵션값·하위 명령
+                      (" 7  99.0 node /tmp/report.js /tmp/codex", "데이터 인자를 실행 주체로 승격"),
+                      (" 7  99.0 python3 -c print(1) /tmp/serena", "코드 문자열 모드 뒤 경로"),
+                      (" 7  99.0 npm --prefix codex test", "긴 옵션의 값이 프로그램으로 승격"),
+                      (" 7  99.0 npm uninstall codex", "런처 하위 명령의 인자"),
+                      (" 7  99.0 npx prettier codex", "런처가 실행하는 것은 첫 프로그램뿐"),
+                      (" 7  99.0 python3 -m codex_like_thing", "-m 모듈 이름")):
+        got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
+        chk(got == (0.0, None), "B2 오탐 재발(%s): %r → %r" % (tag, cmd_, got))
+    # (g4) ★진짜 함대 형상은 **전부 매칭**이어야 한다(과소계상 반대 방향의 음성 대조).
+    for cmd_, tag in ((" 8  10.0 /Users/u/.local/share/claude/versions/2.1.261 -p", "버전 경로 직접 exec"),
+                      (" 8  10.0 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                       "npm 번들 node 형상"),
+                      (" 8  10.0 /Users/u/.codex/bin/codex-darwin-arm64 --child", "codex vendor native"),
+                      (" 8  10.0 uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server",
+                       "uvx 온디맨드 serena"),
+                      (" 8  10.0 /usr/local/bin/cysd --socket /x", "데몬"),
+                      # ★실측 형상(2026-09-08 이 기계) — 셋 다 R1 초안에서 **놓쳤던** 것들이다.
+                      (" 8  10.0 /Applications/cys.app/Contents/MacOS/cysd",
+                       "앱 번들 안의 우리 데몬(정확 이름이 번들 배제보다 우선)"),
+                      (" 8  10.0 node /Users/u/.local/bin/codex "
+                       "--dangerously-bypass-approvals-and-sandbox resume --last",
+                       "node 래퍼가 실행하는 codex(비 .js 경로)"),
+                      (" 8  10.0 /Users/u/.local/lib/node_modules/@openai/codex/node_modules/"
+                       "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
+                       "codex vendor native(basename 이 codex 가 아니다)"),
+                      (" 8  10.0 claude --dangerously-skip-permissions", "맨 claude"),
+                      (" 8  10.0 npx -y @google/gemini-cli", "짧은 옵션은 값이 없다"),
+                      (" 8  10.0 npx @openai/codex@1.2.3", "버전 지정 런처 스펙"),
+                      (" 8  10.0 uv run serena start-mcp-server", "런처 하위 명령 1회 건너뛰기"),
+                      (" 8  10.0 uvx --from serena-agent==1.5.3 serena", "긴 옵션 값 건너뛰기"),
+                      # ★실측 2차(2026-09-08) — R1 1차 조임이 **놓쳤던** 두 형상
+                      (" 8  10.0 node /Users/u/.local/bin/codex exec -m gpt-6-astra -s read-only",
+                       "대상 프로그램의 인자에 -m 이 있는 형상(코드모드 판정은 순서를 본다)"),
+                      (" 8  10.0 /Users/u/.local/bin/uv tool uvx --python 3.13 "
+                       "--from serena-agent==1.5.3 serena start-mcp-server",
+                       "중첩 런처(uv → tool → uvx → serena)")):
+        got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
+        chk(got == (10.0, None), "진짜 함대 형상을 놓쳤다(%s): %r → %r" % (tag, cmd_, got))
     # (h) `_boot_elapsed` 순수 핀 — 부재·미래 mtime·정상. 근거 없음은 **유예 없음**이다.
     import shutil as _sh
     import tempfile as _tf
@@ -1593,50 +2127,207 @@ def self_test():
         else:
             os.environ["CYS_SOCKET"] = saved_sock
         _sh.rmtree(_bd, ignore_errors=True)
+    # (h2) ★R1 minor — 프로덕션 **기본 경로**(CYS_SOCKET 미설정)를 핀한다. 상수를 바꾸면 유예가
+    #      조용히 `epoch_missing` 으로 사라진다(방향은 안전하나 봉인표 ③ 완화 장치가 없어진다).
+    saved_sock = os.environ.pop("CYS_SOCKET", None)
+    saved_home = os.environ.get("HOME")
+    try:
+        os.environ["HOME"] = "/nonexistent-home-for-pin"
+        chk(_boot_epoch_path() == "/nonexistent-home-for-pin/.local/state/cys/boot-epoch",
+            "boot-epoch 기본 경로(DEFAULT_STATE_DIR)가 바뀌었다: %r" % _boot_epoch_path())
+    finally:
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
+        if saved_sock is not None:
+            os.environ["CYS_SOCKET"] = saved_sock
     # (i) ★계측 타당성 음성 대조: 신설 축이 **없던** 코드에서는 이 판정이 성립할 수 없다.
     #     load 축 hard 키가 None 이라는 사실 자체가 'soft 전용 강등'의 유일한 기계 증거다.
     chk(_axis(_cj(q + det_boot + ["--fleet-cpu-override", "0.0"], "shape")[1],
               "load_ratio").get("hard") is None,
         "load_ratio 에 hard 임계가 남아 있다(강등 미적용)")
 
-    # ⑬ ★codex 위임 검체(R2)에서 살아남은 반례 — 두 개는 실결함이었고 셋은 '상속된 성질' 이다.
-    #    상속된 것도 **핀으로 박아** 다음 사람이 모르고 바꾸지 못하게 한다(사실의 기록).
+    # ⑬ ★codex 위임 검체(R2)에서 살아남은 반례 + R1 리뷰 반영 반례.
     # (a) 합계 오버플로: 각 항이 유한해도 합이 inf 면 측정 실패다(JSON 에 Infinity 를 흘리지 않는다)
-    tot, why = _fleet_cpu_percent(["1e308 /opt/codex", "1e308 /opt/claude"])
+    tot, why = _fleet_cpu_percent([" 1 1e308 /opt/codex", " 2 1e308 /opt/claude"], self_pid=999999)
     chk(tot is None and why == "sum_overflow",
         "유한한 항들의 합이 inf 인데 측정 성공으로 나갔다(비표준 JSON): %r/%r" % (tot, why))
     # (b) 진단 함수는 판정을 죽이지 않는다 — `_fleet_cpu_top` 이 터져도 exit 70 이 되면 안 된다
+    #     (top 수집은 이제 **hard 일 때만** 이라 hard 값을 내는 대역을 쓴다)
     saved_top = _g["_fleet_cpu_top"]
     saved_cpu2 = _g["_ps_cpu_lines"]
     try:
-        _g["_ps_cpu_lines"] = lambda: (["50.0 /usr/local/bin/cysd"], None)
+        _g["_ps_cpu_lines"] = lambda: ([" 4242 99999.0 /usr/local/bin/cysd"], None)
         _g["_fleet_cpu_top"] = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom"))
         rc, doc = _cj(["check", "--json", "--servers-override", "0", "--nodes-override", "0",
-                       "--load-override", "0.0"] + roster_only + det_boot, "top-raise")
+                       "--load-override", "0.0", "--fleet-cpu-hold-override", "0"]
+                      + roster_only + det_boot, "top-raise")
     finally:
         _g["_fleet_cpu_top"] = saved_top
         _g["_ps_cpu_lines"] = saved_cpu2
     chk(rc != EXIT_INTERNAL and (doc.get("measured") or {}).get("fleet_cpu_ratio") is not None,
         "진단용 top 의 예외가 정상 측정을 exit 70 으로 만들었다: rc=%r" % rc)
-    # (c) 상속 핀 — 명령줄 전체 검색이라 '에이전트가 아닌 프로세스'도 걸린다(과대계상=차단 방향).
-    #     기존 `nodes` 축과 **같은 성질**이다: 고치려면 두 축을 함께 고쳐야 한다(별 백로그).
-    chk(_fleet_cpu_percent(["25 /usr/bin/python3 /tmp/agy/report.py"]) == (25.0, None),
-        "상속 핀 이탈: NODE_PATTERNS 의 명령줄 전체 검색 성질이 바뀌었다(nodes 축과 분기?)")
-    chk(_fleet_cpu_percent(["25 grep claude"]) == (25.0, None),
-        "상속 핀 이탈: 인자에만 든 `claude` 매칭 성질이 바뀌었다(nodes 축과 분기?)")
-    # (d) 상속 핀 — 자기 제외도 `_count_matching` 과 같은 부분문자열 검사다(과소계상 방향).
-    chk(_fleet_cpu_percent(["0 /sbin/init",
-                            "25 /opt/codex --output /tmp/javis_resource_gate.log"]) == (0.0, None),
-        "상속 핀 이탈: 자기 제외의 부분문자열 성질이 바뀌었다(nodes 축과 분기?)")
-    # (e) 밀폐 확인: fleet override 를 주면 CPU 조회 스폰이 0 이다
+    # (c) ★R1 major — 진단에 **명령줄 인자를 싣지 않는다**(비밀값이 measured 로 영속되던 길).
+    top = _fleet_cpu_top([" 9 50.0 /opt/codex --api-key secret123 --output /x"], self_pid=999999)
+    chk(top and top[0].get("pid") == 9 and top[0].get("exe") == "codex"
+        and top[0].get("owner") == "codex" and "cmd" not in top[0]
+        and not any("secret123" in str(v) for v in top[0].values()),
+        "진단 행에 원시 명령줄(비밀값)이 남아 있다: %r" % (top,))
+    # (d) ★R1 major — allow 판정에서는 top 자체를 모으지 않는다(정상 부트마다 argv 가 남지 않게)
+    _, doc = _cj(q + det_boot + ["--fleet-cpu-override", "0.1"], "top-not-on-allow")
+    chk((doc.get("measured") or {}).get("fleet_cpu_top") == [],
+        "allow 인데 fleet_cpu_top 이 채워져 boot-last.json 으로 영속된다: %r"
+        % ((doc.get("measured") or {}).get("fleet_cpu_top"),))
+    # (e) 밀폐 확인: fleet override 를 주면 CPU 조회 스폰이 0 이고 **래치 파일도 안 건드린다**
     _spawn2 = []
     saved_cpu3 = _g["_ps_cpu_lines"]
+    saved_hold = _g["_fleet_hard_hold"]
+    _hold_calls = []
     try:
         _g["_ps_cpu_lines"] = lambda: _spawn2.append(1) or (None, "absent")
+        _g["_fleet_hard_hold"] = lambda *_a, **_k: _hold_calls.append(1) or (None, "x", False)
         _cj(base_argv + ["--json"], "override-no-spawn")
     finally:
         _g["_ps_cpu_lines"] = saved_cpu3
+        _g["_fleet_hard_hold"] = saved_hold
     chk(not _spawn2, "--fleet-cpu-override 를 줬는데 ps 조회가 일어났다(밀폐 파괴): %r" % _spawn2)
+    chk(not _hold_calls, "--fleet-cpu-override 를 줬는데 래치 경로를 건드렸다(밀폐 파괴)")
+    # (f) ★R1 blocking 3(봉인표 ③) — hard 보류 상한. 연속 hard 가 상한을 넘으면 soft 로 내려간다.
+    for hold, want_rc, want_exp in ((0.0, EXIT_HARD, False),
+                                    (FLEET_CPU_HARD_MAX_HOLD_SECS - 1, EXIT_HARD, False),
+                                    (FLEET_CPU_HARD_MAX_HOLD_SECS, EXIT_SOFT, True),
+                                    (FLEET_CPU_HARD_MAX_HOLD_SECS * 4, EXIT_SOFT, True)):
+        rc, doc = _cj(q + det_boot + ["--fleet-cpu-override", "1.5",
+                                      "--fleet-cpu-hold-override", str(hold)], "hold=%s" % hold)
+        ax = _axis(doc, "fleet_cpu_ratio")
+        chk(rc == want_rc and bool(ax.get("hold_expired")) is want_exp,
+            "보류 상한 판정 이탈(hold=%s): rc=%r(기대 %r) axis=%r" % (hold, rc, want_rc, ax))
+    # (f2) 상한 만료가 **다른 축의 hard 는 건드리지 않는다**(강등은 이 축 하나다)
+    rc, doc = _cj(["check", "--json", "--servers-override", "99", "--nodes-override", "0",
+                   "--load-override", "0.0", "--fleet-cpu-override", "1.5",
+                   "--fleet-cpu-hold-override", str(FLEET_CPU_HARD_MAX_HOLD_SECS)]
+                  + roster_only + det_boot, "hold-other-axis")
+    chk(rc == EXIT_HARD and _axis(doc, "servers").get("level") == "hard",
+        "보류 상한 만료가 CPU 아닌 축(servers)의 hard 까지 내렸다: rc=%r" % rc)
+    # (f3) 만료 사실은 **warnings 가 아니라** check 에 남는다(completion_guard 완전일치 계약 보존)
+    rc, doc = _cj(q + det_boot + ["--fleet-cpu-override", "1.5", "--fleet-cpu-hold-override",
+                                  str(FLEET_CPU_HARD_MAX_HOLD_SECS)], "hold-warnings")
+    chk(doc.get("warnings") == ["context_unmeasured"],
+        "보류 상한 만료가 warnings 를 늘렸다(_soft_kind 분기 파손): %r" % doc.get("warnings"))
+    # (f4) `_fleet_hard_hold` 순수/파일 핀 — 무장→유지→만료(재무장 없음)·below 는 삭제·
+    #      unmeasured 는 **무접촉**(간헐 실패가 연속 시계를 0으로 되돌리지 않는다)
+    _hd = _tf.mkdtemp()
+    saved_state = os.environ.get("CYS_STATE_DIR")
+    saved_sock2 = os.environ.pop("CYS_SOCKET", None)
+    try:
+        os.environ["CYS_STATE_DIR"] = _hd
+        t0 = time.time()
+        h, why, exp = _fleet_hard_hold("hard", now=t0)
+        chk((h, why, exp) == (0.0, "armed", False), "첫 hard 가 무장이 아님: %r/%r/%r" % (h, why, exp))
+        chk(os.path.exists(_fleet_hold_path()), "래치 파일이 안 생겼다: %s" % _fleet_hold_path())
+        h, why, exp = _fleet_hard_hold("hard", now=t0 + 100)
+        chk(abs(h - 100) < 2 and why == "held" and not exp, "연속 hard 100s 가 유지가 아님: %r" % (why,))
+        h, why, exp = _fleet_hard_hold("unmeasured", now=t0 + 200)
+        chk((h, why, exp) == (None, "unmeasured", False), "unmeasured 가 무접촉이 아님: %r" % (why,))
+        h, why, exp = _fleet_hard_hold("hard", now=t0 + 300)
+        chk(abs(h - 300) < 2 and why == "held",
+            "측정 실패 한 번이 연속 시계를 되돌렸다(유계 소실): %r/%r" % (h, why))
+        h, why, exp = _fleet_hard_hold("hard", now=t0 + FLEET_CPU_HARD_MAX_HOLD_SECS + 1)
+        chk(exp and why == "expired", "상한 초과가 만료로 안 잡힘: %r/%r" % (h, why))
+        h2, why2, exp2 = _fleet_hard_hold("hard", now=t0 + FLEET_CPU_HARD_MAX_HOLD_SECS + 2)
+        chk(exp2 and why2 == "expired",
+            "만료 뒤 래치가 재무장돼 다음 호출이 다시 hard 를 만난다(창 소모 반례): %r/%r" % (h2, why2))
+        _fleet_hard_hold("below", now=t0 + FLEET_CPU_HARD_MAX_HOLD_SECS + 3)
+        chk(not os.path.exists(_fleet_hold_path()), "포화가 끝났는데 래치가 안 지워졌다")
+        h, why, exp = _fleet_hard_hold("hard", now=t0 + FLEET_CPU_HARD_MAX_HOLD_SECS + 4)
+        chk((h, why, exp) == (0.0, "armed", False), "포화 재개 시 시계가 0에서 다시 시작하지 않는다")
+        # ★codex 위임 검체(R2) — 임시 파일 이름이 호출마다 달라야 한다(같은 프로세스 두 호출이
+        #   서로의 tmp 를 지우면 한쪽이 unbounded_io=만료로 번진다).
+        _tmps = []
+        _saved_replace = os.replace
+        try:
+            os.replace = lambda a, b: (_tmps.append(a), _saved_replace(a, b))[1]
+            _fleet_hold_write(_fleet_hold_path(), 1.0)
+            _fleet_hold_write(_fleet_hold_path(), 2.0)
+        finally:
+            os.replace = _saved_replace
+        chk(len(_tmps) == 2 and _tmps[0] != _tmps[1],
+            "래치 임시 이름이 호출마다 같다(같은 프로세스 경합에서 만료로 번진다): %r" % (_tmps,))
+        # ★허용오차 안의 미래 저장값이 **음수 보류초**를 만들지 않는다
+        with open(_fleet_hold_path(), "w", encoding="utf-8") as f:
+            f.write("%r\n" % (t0 + 1.0))
+        h, why, exp = _fleet_hard_hold("hard", now=t0)
+        chk(h == 0.0 and why == "held" and not exp,
+            "허용오차 안의 미래 저장값이 음수 보류초를 냈다: %r/%r" % (h, why))
+        # 파손 래치(비수치·NaN)는 '지금 무장' 으로 접는다 — 만료 비교가 영원히 거짓이 되지 않게
+        with open(_fleet_hold_path(), "w", encoding="utf-8") as f:
+            f.write("nan\n")
+        h, why, exp = _fleet_hard_hold("hard", now=t0 + 500)
+        chk((h, why, exp) == (0.0, "armed", False), "NaN 래치가 만료 비교를 영원히 막았다: %r" % (why,))
+    finally:
+        if saved_state is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = saved_state
+        if saved_sock2 is not None:
+            os.environ["CYS_SOCKET"] = saved_sock2
+        _sh.rmtree(_hd, ignore_errors=True)
+    # (g5) ★R1 blocking 4 — 신설 실수 인자의 nan/inf 는 EX_USAGE(64)다(조용한 allow·비표준 JSON 차단)
+    for bad in (["--fleet-cpu-override", "nan"], ["--fleet-cpu-soft", "nan"],
+                ["--fleet-cpu-hard", "nan"], ["--fleet-cpu-hard", "inf"],
+                ["--fleet-cpu-override", "-1"], ["--boot-elapsed-override", "nan"],
+                ["--context", "nan"], ["--load-override", "inf"]):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            rc = main(q + det_boot + bad)
+        chk(rc == EXIT_USAGE, "%r 가 EX_USAGE(64) 로 거부되지 않았다: rc=%r" % (bad, rc))
+    # (g6) 음성 대조: 같은 자리에 **유한한** 값이면 정상 판정이다(검증이 정상 입력을 막지 않는다)
+    rc, _doc = _cj(q + det_boot + ["--fleet-cpu-override", "0.0"], "finite-ok")
+    chk(rc == EXIT_ALLOW, "유한한 override 가 거부됐다: rc=%r" % rc)
+    # (h3) ★R1 minor — Windows 판별이 인터프리터 os.name 하나가 아니다(MSYS python + MSYS ps 조합)
+    saved_msys = os.environ.get("MSYSTEM")
+    saved_cpu4 = _g2["_ps_cpu_lines"]
+    try:
+        os.environ["MSYSTEM"] = "MINGW64"
+        _g2["_ps_cpu_lines"] = lambda: (None, "failed")
+        rc, doc = _cj(q + det_boot, "msys-ps-failed")
+    finally:
+        _g2["_ps_cpu_lines"] = saved_cpu4
+        if saved_msys is None:
+            os.environ.pop("MSYSTEM", None)
+        else:
+            os.environ["MSYSTEM"] = saved_msys
+    chk(rc == EXIT_ALLOW and not [e for e in ((doc.get("measured") or {})
+                                              .get("measure_errors") or []) if "fleet" in e],
+        "Git Bash(MSYS) 에서 ps 실패가 상시 soft 로 굳어 완료 검증이 영구 skip 된다: rc=%r m=%r"
+        % (rc, (doc.get("measured") or {}).get("measure_errors")))
+    # (h4) 음성 대조: MSYS 가 아니면 같은 실패가 여전히 측정 실패(최소 soft)다
+    saved_cpu5 = _g2["_ps_cpu_lines"]
+    try:
+        _g2["_ps_cpu_lines"] = lambda: (None, "failed")
+        rc2, doc2 = _cj(q + det_boot, "posix-ps-failed")
+    finally:
+        _g2["_ps_cpu_lines"] = saved_cpu5
+    if not _is_windows_host():
+        chk(rc2 == EXIT_SOFT, "POSIX 에서 ps 조회 실패가 조용한 allow 로 접혔다: rc=%r" % rc2)
+    # (h5) `unsupported`(플래그 미지원)는 **어느 플랫폼에서도** 축 부재와 같다(exit 계약 불변)
+    saved_cpu6 = _g2["_ps_cpu_lines"]
+    try:
+        _g2["_ps_cpu_lines"] = lambda: (None, "unsupported")
+        rc3, doc3 = _cj(q + det_boot, "ps-unsupported")
+    finally:
+        _g2["_ps_cpu_lines"] = saved_cpu6
+    chk(rc3 == EXIT_ALLOW and _axis(doc3, "fleet_cpu_ratio").get("level") == "unavailable",
+        "`-axo` 미지원 ps 가 측정 실패로 분류돼 상시 soft 가 된다: rc=%r" % rc3)
+    # (i2) ★R1 minor — `--load-hard-ratio` 무동작 고지는 **명시 여부**로 낸다(구 기본값 명시 포함)
+    for given, want in (("2.0", True), ("3.0", True)):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(buf):
+            main(q + det_boot + ["--fleet-cpu-override", "0.0", "--load-hard-ratio", given])
+        chk(("무동작" in buf.getvalue()) is want,
+            "--load-hard-ratio %s 고지 이탈: %r" % (given, buf.getvalue()[:120]))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(buf):
+        main(q + det_boot + ["--fleet-cpu-override", "0.0"])
+    chk("무동작" not in buf.getvalue(), "플래그를 안 줬는데 무동작 고지가 나갔다")
 
     if fails:
         print("javis_resource_gate self-test FAIL:")
@@ -1649,9 +2340,13 @@ def self_test():
           "무플래그 기본 동작 불변)"
           " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
           "비정수 env 가청화·nodes 미측정 무예외)"
-          " + WP-7 codex 위임 반례 6종(합계 오버플로·진단 예외 격리·상속 3핀·override 밀폐)"
-          " + WP-7 함대CPU/부트유예 21종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
-          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 5종·boot-epoch 3종)"
+          " + WP-7 codex 위임 반례 4종(합계 오버플로·진단 예외 격리·override 밀폐 2)"
+          " + WP-7 함대CPU/부트유예 23종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
+          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 6종·boot-epoch 3종+기본경로 1)"
+          " + ★R1 리뷰 반영 33종(argv0 소유권: B2 오탐 14 반례 + 진짜 형상 15 음성대조(실측 5 포함) ·"
+          " PID 자기제외 2 · 보류 상한 4점+타축 불변+warnings 불변+래치 순수 10 ·"
+          " nan/inf EX_USAGE 8+유한 정상 1 · MSYS/unsupported 3 · 무동작 고지 3 ·"
+          " 진단 비밀값 0/allow 무수집 2)"
           " + A3 부서 로스터 8종(좌석 합산 22·floor 유지·응답 실패 soft·실데이터 9좌석 soft/hard 판별+"
           "음성 대조·--nodes-hard 우선·잘못된 주입 64·override 단락·라이브 경로 대역)")
     return 0
