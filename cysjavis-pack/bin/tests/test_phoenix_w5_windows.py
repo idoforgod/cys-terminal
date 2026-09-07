@@ -54,6 +54,44 @@ def main():
     check("D2 restore lease 해제 후 재획득 → True", ok3 is True, "ok3=%s" % ok3)
     m._release_lease(h3)
 
+    # ── ★(0.14.31 · WP-4 R2 · 리뷰 minor) lease 경합은 **유계 재시도** 뒤에 skip 한다 ──
+    #   0.14.31 부터 이 lease 를 다투는 것이 restore 프로세스만이 아니다: 일상적인 SessionStart
+    #   훅의 역할 재결합이 커밋 동안 같은 파일을 수십 ms 잡는다. 한 번 실패에 회차를 통째로
+    #   버리면 콜드부트 자가치유가 그 짧은 창 때문에 통째로 건너뛴다.
+    #   결정론 검증: 락 시도를 가로채 처음 두 번은 경합(False), 세 번째에 성공하게 만들고
+    #   `time.sleep` 을 세어, **재시도가 실제로 일어나고 획득에 성공**하는지 잰다.
+    _orig_try = m._try_lock_nb
+    _orig_sleep = m.time.sleep
+    calls = {"n": 0, "slept": []}
+    def _flaky(f):
+        calls["n"] += 1
+        return True if calls["n"] >= 3 else False
+    m._try_lock_nb = _flaky
+    m.time.sleep = lambda d: calls["slept"].append(d)
+    try:
+        okr, hr = m._acquire_restore_lease(sock)
+    finally:
+        m._try_lock_nb = _orig_try
+        m.time.sleep = _orig_sleep
+    check("R2 lease 경합은 유계 재시도 후 획득한다(회차 통째 skip 금지)",
+          okr is True and calls["n"] == 3, "시도=%s ok=%s" % (calls["n"], okr))
+    check("R2 재시도 대기가 유계다(총 1.5초 이하)",
+          0 < sum(calls["slept"]) <= 1.5, "sleep=%s" % calls["slept"])
+    if hr is not None:
+        m._release_lease(hr)
+    # 음성 대조: 끝까지 경합하면 종전 계약대로 skip 한다(배타 자체는 넓히지 않았다).
+    calls2 = {"n": 0, "slept": []}
+    m._try_lock_nb = lambda f: False
+    m.time.sleep = lambda d: calls2["slept"].append(d)
+    try:
+        okn, _hn = m._acquire_restore_lease(sock)
+    finally:
+        m._try_lock_nb = _orig_try
+        m.time.sleep = _orig_sleep
+    check("R2 끝까지 경합하면 종전대로 skip(False)", okn is False, "ok=%s" % okn)
+    check("R2 무한 재시도가 아니다(시도 횟수 유계)", len(calls2["slept"]) <= 4,
+          "sleep 횟수=%s" % len(calls2["slept"]))
+
     # ── D2 roster/dept 락: 통합 헬퍼 경유(P1-8 Windows fail-open 제거) ──
     hl = m._acquire_roster_lock(sock, "roster")
     check("D2 roster lock 획득(핸들 반환)", hl is not None)

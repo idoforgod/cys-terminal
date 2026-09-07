@@ -7,7 +7,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
 import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
-import { pickLaunchedAgentSid, transferTrees, type SurfaceRow } from "./transfer";
+import { destinationLooksAwake, pickLaunchedAgentSid, transferTrees, type SurfaceRow } from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -2753,6 +2753,10 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     "reviewer-codex": "cys launch-agent --role reviewer-codex --agent codex",
   };
   const launchCmd = LAUNCH_BY_ROLE[srcRole] ?? `cys launch-agent --role ${srcRole} --agent claude`;
+  // ★(R2 · codex blocking) 목적지 확정에는 **시킨 agent 종류**도 쓴다 — 종전엔 역할만 봐서
+  //   같은 시간대에 뜬 다른 종류의 유일 후보가 목적지가 될 수 있었다. 명령 문자열 하나가
+  //   진실원이므로 여기서 파싱한다(표를 두 벌로 만들지 않는다).
+  const wantAgent = launchCmd.match(/--agent\s+([a-z0-9-]+)/)?.[1] ?? "claude";
   const ok = await confirmModal(
     "부서 간 전출",
     isAgent
@@ -2819,6 +2823,8 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     // 목적지 **에이전트** 좌석(런처 셸과 다르다). 확정 전에는 null 이고, 확정 전에 원본을
     // 닫는 경로는 없다.
     let agentSid: number | null = null;
+    // 기동 명령을 실제로 보냈는가 — 실패 롤백이 **런처 셸을 죽여도 되는지**의 유일한 근거다.
+    let launchSent = false;
     destWs.tree = destWs.tree
       ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
       : { type: "pane", sid: newSid };
@@ -2838,6 +2844,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         ).map((x) => x.surface_id);
         const launchedAt = Date.now() / 1000; // surface.created_at 은 epoch 초다
         // ④ 에이전트 기동(노드 재기동 처방과 동일 명령) — UI 가 조립한 명령이므로 machineOrigin
+        launchSent = true;
         await invoke("send_input", {
           socket: destWs.socket,
           surfaceId: newSid,
@@ -2854,7 +2861,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
             surfaces: SurfaceRow[];
           } | null;
           const picked = pickLaunchedAgentSid(
-            beforeIds, newSid, rr?.surfaces ?? [], srcRole, launchedAt,
+            beforeIds, newSid, rr?.surfaces ?? [], srcRole, wantAgent, launchedAt,
           );
           if (picked != null) {
             agentSid = picked;
@@ -2877,28 +2884,62 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
           // "UI 가 만든 문안"이라는 사실이 유지된다(누락 재발 방지 규칙: UI 조립 = 표식).
           machineOrigin: true,
         });
-        // 런처 셸은 소임을 다했다(에이전트는 별 surface 다) — 빈 좌석을 남기지 않는다.
-        // 실패는 무해하므로 삼킨다(원본 정리는 아래에서 별도로 판정한다).
+        // ★(R2 · codex blocking) **런처 셸을 닫지 않는다.** `close_surface` 는 그 셸의 자손을
+        //   전부 kill 하는데(governance), 그 자손에는 아직 돌고 있을 수 있는 `cys launch-agent`
+        //   가 있다 — 그것을 기동 도중에 죽이면 **지침이 주입되지 않은 역할 좌석**이 남는다
+        //   (치명위험 ③). 데몬은 "그 명령이 끝났는가"를 UI 에 말해 주지 않으므로, 우리가 알 수
+        //   없는 것을 근거로 죽이지 않는다. 셸 하나가 남는 대가는 사람이 1초에 닫을 수 있다.
+        stickyToast("transfer", "feed", "전출 진행 중", "목적지 각성 확인 대기…");
+        // ★그리고 **각성 래치**가 설 때까지 기다린 뒤에만 원본을 닫는다: 프로세스가 살아 있어도
+        //   신뢰 관문에 앉아 있으면 인계를 아무도 읽지 않는다(생존 관측 ≠ 인계 수신 가능).
+        const awakeBy = Date.now() + 90_000;
+        let awake = false;
+        while (Date.now() < awakeBy) {
+          const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+            surfaces: SurfaceRow[];
+          } | null;
+          if (destinationLooksAwake(rr?.surfaces?.find((x) => x.surface_id === agentSid))) {
+            awake = true;
+            break;
+          }
+          await new Promise((res) => setTimeout(res, 3000));
+        }
+        if (!awake) {
+          // 목적지는 살아 있고 인계도 적재됐지만 **각성 증거가 없다** — 원본은 그대로 둔다.
+          // (살아있는 타 노드 종료는 승인 경계이므로 목적지도 닫지 않는다.)
+          toast(
+            "watchdog",
+            "전출 보류",
+            `목적지 surface:${agentSid} 가 아직 각성을 신고하지 않았습니다(90초) — 인계는 적재됐고 원본 pane 은 보존했습니다. 목적지를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${newSid} 도 남아 있습니다.`,
+          );
+          dismissToast("transfer");
+          render();
+          return;
+        }
+      }
+      // ⑤ 목적지 확정 + 인계 적재 + **각성 확인** 후에만 원본 정리
+      await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    } catch (e) {
+      // 보상 롤백: 런처 셸은 **기동 명령을 보내지 않았을 때만** 회수한다.
+      // ★(R2 · codex blocking) 종전에는 실패 경로에서 무조건 런처 셸을 닫았는데, 그 close 는
+      //   자손을 전부 kill 한다 — 준비 대기가 60초를 넘겨 여기 온 경우 그 자손에는 아직 돌고
+      //   있는 `cys launch-agent` 가 있고, 그것을 죽이면 **지침 없는 역할 좌석**이 남는다
+      //   (성공 경로만 고쳤다면 같은 치명 경로가 catch 로 이사했을 뿐이다).
+      //   런치를 보낸 뒤에는 셸을 남기고 사람에게 알린다 — 우리가 모르는 것을 죽이지 않는다.
+      if (!launchSent) {
         await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
         destroyPaneRuntime(newSid, destWs.socket);
         if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
       }
-      // ⑤ 목적지 확정 + 인계 적재 성공 후에만 원본 정리
-      await invoke("close_surface", { socket: srcSock, surfaceId: sid });
-    } catch (e) {
-      // 보상 롤백: **런처 셸만** 회수한다. 이미 확정된 에이전트 좌석(agentSid)이 있으면 그것은
-      // 살아 있는 노드이므로 닫지 않는다 — 살아있는 타 노드 종료는 승인 경계다. 사람이 볼 수
-      // 있게 토스트에 남긴다(원본은 어느 경우에도 보존된다).
-      await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
-      destroyPaneRuntime(newSid, destWs.socket);
-      if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
       render();
       toast(
         "watchdog",
         "전출 실패",
-        agentSid == null
+        !launchSent
           ? `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`
-          : `${e} — 원본 pane은 보존됩니다. 목적지에 기동된 surface:${agentSid} 는 살아 있으니 확인 후 정리하세요`,
+          : agentSid == null
+            ? `${e} — 원본 pane은 보존됩니다. 목적지 런처 셸 surface:${newSid} 는 기동이 진행 중일 수 있어 남겨 두었습니다(확인 후 정리하세요)`
+            : `${e} — 원본 pane은 보존됩니다. 목적지에 기동된 surface:${agentSid} 와 런처 셸 surface:${newSid} 는 살아 있으니 확인 후 정리하세요`,
       );
       return;
     }
@@ -2909,7 +2950,9 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     toast(
       "feed",
       "부서 전출 완료",
-      `→ ${destWs.name || UNTITLED} (surface:${agentSid ?? newSid})`,
+      agentSid == null
+        ? `→ ${destWs.name || UNTITLED} (surface:${newSid})`
+        : `→ ${destWs.name || UNTITLED} (surface:${agentSid}) · 런처 셸 surface:${newSid} 는 남아 있습니다(기동 완료 후 닫으세요)`,
     );
   } catch (e) {
     toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);

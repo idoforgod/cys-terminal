@@ -2043,11 +2043,21 @@ def _acquire_restore_lease(socket):
         f = open(lease_path, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
     except Exception:
         return True, None  # 락 파일 생성 실패 = 게이트 없이 진행(가용성 우선 fail-open)
-    r = _try_lock_nb(f)
-    if r is False:
-        f.close()
-        return False, None  # 다른 restore 보유 중 — 중복 인지 skip
-    return True, f          # True(획득) 또는 None(락 기구 미가용=fail-open) → 핸들 보유하고 진행
+    # ★(0.14.31 · WP-4 R2 · 리뷰 minor) **유계 재시도** — 종전에는 한 번 실패하면 그 회차를
+    #   통째로 건너뛰었다. 종전에 이 lease 를 다투는 것은 restore 프로세스뿐이었지만(회차 skip
+    #   이 곧 '다른 restore 가 하고 있다' 였다), 0.14.31 부터는 **일상적인 SessionStart 훅**의
+    #   역할 재결합(`role.reclaim_auto`)이 커밋 동안 같은 lease 를 수십 ms 잡는다. 그 짧은 창에
+    #   콜드부트 자가치유가 걸리면 부활 한 회차가 통째로 사라진다(치명위험 ③ 축의 새 진입점).
+    #   그래서 **짧게 몇 번 더 본다**: 총 대기 상한이 있고(1.5초) 그 뒤에는 종전과 똑같이
+    #   skip 한다 — 가용성 방향으로만 넓히고 배타 자체는 그대로다.
+    for _attempt in range(4):
+        r = _try_lock_nb(f)
+        if r is not False:
+            return True, f  # True(획득) 또는 None(락 기구 미가용=fail-open) → 핸들 보유하고 진행
+        if _attempt < 3:
+            time.sleep(0.5)
+    f.close()
+    return False, None      # 다른 restore 가 계속 보유 중 — 중복 인지 skip(종전 계약)
 
 
 def _release_lease(handle):

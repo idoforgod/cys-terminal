@@ -538,10 +538,31 @@ fn random_32() -> Option<Vec<u8>> {
 
 // ── 레코드 영속 (JSON 0600, atomic tmp+rename) ────────────────────────────────
 
-/// 저장 포맷: `{"records":[...]}` 또는 bare 배열 둘 다 디코드(cmux 하위호환).
-pub fn load_records() -> Vec<ApprovalRecord> {
-    let path = records_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+/// ★(0.14.31 · WP-4 R2 · codex major) **TTL 레코드 전용 저장소** — `~/.cys/approvals-ttl.json`.
+///
+/// 【무엇을 고치는가】 승인 저장소는 `$HOME` 아래 **공유 파일**이고, 기준 커밋(0.14.30)의
+/// `ApprovalRecord` 에는 `expires_at` 이 없다. 구 데몬은 파일 전체를 typed 레코드로 읽고 다시
+/// 직렬화하므로(모르는 필드는 조용히 버린다), 같은 HOME 에서 신·구 데몬이 함께 돌 때 구 데몬이
+/// **다른** 승인 하나를 정상 사용하기만 해도 TTL 레코드의 `expires_at` 이 사라진다. 그 값은
+/// 서명 페이로드에 들어가 있으므로 신 데몬은 그 뒤로 그 레코드를 **서명 불일치로 영구 거부**한다
+/// — 만료 전 승인이 되살릴 수 없이 망가진다(codex 적대검증 R2 major).
+///
+/// 【어떻게 고치는가】 TTL 이 있는 레코드는 **구 데몬이 존재조차 모르는 파일**에만 쓴다.
+///   · 파괴 불가 — 구 writer 는 이 파일을 열지 않는다.
+///   · 그리고 **구 데몬이 TTL 승인을 통과시키지도 못한다**(그 데몬은 `expires_at` 을 무시하므로
+///     종전 배치에서는 만료된 승인을 무기한으로 오독했다). 못 보는 것이 오독보다 안전하다.
+/// 병합은 읽을 때 한 번(`load_records`), 분리는 쓸 때 한 번(`save_records`) 일어나므로 호출부는
+/// 종전 그대로다.
+fn ttl_records_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cys")
+        .join("approvals-ttl.json")
+}
+
+/// 한 파일에서 레코드 목록 디코드: `{"records":[...]}` 또는 bare 배열 둘 다(cmux 하위호환).
+fn load_records_from(path: &PathBuf) -> Vec<ApprovalRecord> {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     // ① {"records":[...]} 형태
@@ -556,9 +577,25 @@ pub fn load_records() -> Vec<ApprovalRecord> {
     serde_json::from_str::<Vec<ApprovalRecord>>(&content).unwrap_or_default()
 }
 
+/// 저장 포맷: `{"records":[...]}` 또는 bare 배열 둘 다 디코드(cmux 하위호환).
+///
+/// ★(R2) 두 저장소(공용 `approvals.json` + TTL 전용 `approvals-ttl.json`)를 **병합**해 돌려준다.
+/// 같은 `id` 가 양쪽에 있으면 **TTL 쪽이 이긴다**: 그 상태는 분리 저장 중 중단(TTL 먼저 쓰고
+/// 공용을 쓰기 전에 죽음)에서만 생기고, 그때 살아 있는 사실은 만료를 포함한 TTL 판이다.
+pub fn load_records() -> Vec<ApprovalRecord> {
+    let ttl = load_records_from(&ttl_records_path());
+    let main = load_records_from(&records_path());
+    let ttl_ids: std::collections::HashSet<&str> = ttl.iter().map(|r| r.id.as_str()).collect();
+    let mut out: Vec<ApprovalRecord> = main
+        .into_iter()
+        .filter(|r| !ttl_ids.contains(r.id.as_str()))
+        .collect();
+    out.extend(ttl);
+    out
+}
+
 /// atomic write: tmp 작성·0600 부여 후 rename. 디렉토리 자동 생성.
-pub fn save_records(records: &[ApprovalRecord]) -> Result<(), String> {
-    let path = records_path();
+fn save_records_to(path: &PathBuf, records: &[&ApprovalRecord]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -567,9 +604,42 @@ pub fn save_records(records: &[ApprovalRecord]) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
     set_owner_only(&tmp);
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    set_owner_only(&path);
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    set_owner_only(path);
     Ok(())
+}
+
+/// atomic write: tmp 작성·0600 부여 후 rename. 디렉토리 자동 생성.
+///
+/// ★(R2) `expires_at` 유무로 **두 파일에 나눠** 쓴다(§ttl_records_path). 순서는 **TTL 먼저**다:
+/// 중간에 죽으면 TTL 판이 두 파일에 겹쳐 남는데, 그 상태를 `load_records` 가 TTL 우선으로 접어
+/// 손실 없이 복구한다(반대 순서면 만료 필드가 없는 판이 살아남아 서명이 깨진다).
+/// 공용 파일에 `expires_at` 을 가진 레코드가 있으면 이 쓰기가 **자동 이주**시킨다.
+pub fn save_records(records: &[ApprovalRecord]) -> Result<(), String> {
+    let (ttl, plain): (Vec<&ApprovalRecord>, Vec<&ApprovalRecord>) =
+        records.iter().partition(|r| r.expires_at.is_some());
+    save_records_to(&ttl_records_path(), &ttl)?;
+    save_records_to(&records_path(), &plain)
+}
+
+/// ★(R2 · codex major) 승인 저장소의 **읽기-변경-쓰기 트랜잭션**.
+///
+/// 【무엇을 고치는가】 호출부는 종전에 `load_records()` 로 스냅샷을 뜨고, 한참 뒤 그 스냅샷
+/// 전체를 `save_records()` 로 되썼다. 그 사이 다른 요청이 승인을 하나 추가하면 **그 승인이
+/// 사라진다**(갱신 손실). 종전엔 파일이 하나라 같은 클래스의 사고였지만, 저장소가 둘이 되면
+/// 일반 승인 검사 하나가 TTL 파일까지 덮으므로 폭발 반경이 커진다.
+///
+/// 【계약】 이 함수 **안에서** 다시 읽고, 변경하고, 쓴다. 프로세스 안의 모든 변경은 이 뮤텍스로
+/// 직렬화된다. 프로세스 **밖**(같은 HOME 의 다른 데몬)은 여전히 경쟁할 수 있다 — 그것은 이
+/// 저장소가 처음부터 안고 있던 성질이고(파일 락 없음), 이 커밋의 범위 밖이다.
+pub fn mutate_records<R>(f: impl FnOnce(&mut Vec<ApprovalRecord>) -> R) -> (R, Result<(), String>) {
+    static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // poison 되어도 승인 저장은 계속돼야 한다(잠금 목적은 순서 직렬화뿐 — 불변식 보호가 아니다).
+    let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut records = load_records();
+    let out = f(&mut records);
+    let saved = save_records(&records);
+    (out, saved)
 }
 
 /// 신규 레코드 id 생성: epoch초 + 프로세스 카운터(동일 초 충돌 차단).
@@ -1030,4 +1100,374 @@ mod tests {
         assert_eq!(b64_encode(b"foobar"), "Zm9vYmFy");
         assert_eq!(b64_decode("Zm9vYmFy").unwrap(), b"foobar");
     }
+
+    // ── ★(0.14.31 · WP-4 R2 · codex major) TTL 저장소 분리의 **호환성 검체** ──────────────
+    // 위임 작성: codex(gpt-6-astra) · 전 줄 검토 후 채택(R4-WP4-r2-tests-prompt.md).
+    // 이 두 검체가 재는 사실은 하나다: **구 데몬은 TTL 레코드를 파괴할 수 없다.** 공용 파일에
+    // TTL 이 남아 있던 종전 배치에서는 구 데몬이 다른 승인 하나를 정상 사용하기만 해도
+    // `expires_at` 이 사라지고, 서명에 그 값이 묶여 있으므로 그 승인은 **영구 거부**된다.
+    // (음성 대조가 그 사고를 같은 파일에서 실제로 재현한다 — 수리를 지우면 검체가 빨강이 된다.)
+    // ★HOME 을 프로세스 전역으로 바꾸므로 두 검체는 하나의 잠금으로 직렬화한다. 같은 파일의
+    //   다른 검체는 HOME 을 만지지 않는다(handlers.rs 의 승인 RPC 검체는 자기 HOME 을 쓰는
+    //   기존 관례를 따르며, 그 관례의 프로세스 전역 경합은 이 커밋의 범위 밖이다).
+    // approval.rs의 mod tests 안에 그대로 삽입한다. 외부 crate나 기존 테스트 헬퍼는 필요 없다.
+    // 함수별 static은 서로 다른 잠금이므로 두 테스트가 공유할 static 하나를 둔다.
+    static TTL_STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn ttl_record_survives_an_old_daemon_rewriting_the_shared_store() {
+        // HOME과 secret은 프로세스 전역이다. 두 테스트가 반드시 같은 잠금을 사용한다.
+        // 다른 HOME/env 접근 테스트까지 보호하려면 그 테스트도 이 잠금을 공유하거나
+        // 테스트 실행기를 --test-threads=1로 실행해야 한다.
+        let _lock = TTL_STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 잠금보다 나중에 선언하므로 환경 복원/정리가 끝난 뒤 잠금이 해제된다.
+        // OsString으로 보관하여 비유니코드 값과 원래 미설정 상태까지 보존한다.
+        struct RestoreHome {
+            home: Option<std::ffi::OsString>,
+            secret: Option<std::ffi::OsString>,
+            temporary: std::path::PathBuf,
+        }
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                for (key, old) in [
+                    ("HOME", &self.home),
+                    ("CYS_APPROVAL_SECRET_B64", &self.secret),
+                ] {
+                    match old {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                let result = std::fs::remove_dir_all(&self.temporary);
+                // 이미 실패하여 unwind 중이면 이중 panic으로 프로세스를 종료하지 않는다.
+                if !std::thread::panicking() {
+                    result.expect("테스트 종료 후 임시 HOME을 삭제하지 못했습니다");
+                }
+            }
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "cys-ttl-old-writer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("고유 임시 HOME 이름을 만들 시스템 시각이 잘못되었습니다")
+                .as_nanos()
+        ));
+        // create_dir은 기존 경로를 재사용하지 않으므로 타인의 파일을 정리하지 않는다.
+        std::fs::create_dir(&temporary).expect("격리된 임시 HOME을 만들지 못했습니다");
+        let restore = RestoreHome {
+            home: std::env::var_os("HOME"),
+            secret: std::env::var_os("CYS_APPROVAL_SECRET_B64"),
+            temporary,
+        };
+        let secret: &[u8] = b"ttl-store-compatibility-secret-32-bytes";
+        std::env::set_var("HOME", &restore.temporary);
+        std::env::set_var("CYS_APPROVAL_SECRET_B64", b64_encode(secret));
+        let shared_path = restore.temporary.join(".cys/approvals.json");
+        let ttl_path = restore.temporary.join(".cys/approvals-ttl.json");
+
+        let mut legacy = ApprovalRecord {
+            version: 1,
+            id: "L".into(),
+            command_prefix: vec!["git".into(), "status".into()],
+            cwd: None,
+            environment: vec![("CI".into(), "1".into())],
+            created_at: 1000.0,
+            updated_at: 1000.0,
+            expires_at: None,
+            signature: String::new(),
+        };
+        legacy.sign(secret);
+        let mut ttl = ApprovalRecord {
+            id: "T".into(),
+            expires_at: Some(4_000_000_000.0),
+            ..legacy.clone()
+        };
+        ttl.sign(secret);
+
+        // 구 데몬의 모르는 필드 유실을 JSON 값 편집으로 재현한다.
+        // 두 경로 중 공용 파일만 접근하며, 정상/음성 대조 모두 같은 writer를 쓴다.
+        let old_daemon_rewrite = || {
+            let mut value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&shared_path).expect("구 데몬이 읽을 공용 승인 파일이 없습니다"),
+            )
+            .expect("공용 승인 파일이 올바른 JSON이 아닙니다");
+            for record in value["records"]
+                .as_array_mut()
+                .expect("공용 파일에 records 배열이 없습니다")
+            {
+                record
+                    .as_object_mut()
+                    .expect("승인 레코드가 JSON 객체가 아닙니다")
+                    .remove("expires_at");
+            }
+            std::fs::write(
+                &shared_path,
+                serde_json::to_vec(&value).expect("구 데몬 재저장 JSON 생성 실패"),
+            )
+            .expect("구 데몬이 공용 승인 파일을 덮어쓰지 못했습니다");
+        };
+        // 반환형이 ()인 배경 API와 Result인 현재 구현 모두에서 파일 내용으로 저장을 검증한다.
+        let _ = save_records(&[legacy.clone(), ttl.clone()]);
+        let ttl_before = std::fs::read(&ttl_path).expect("TTL 승인은 전용 파일에 저장되어야 합니다");
+        old_daemon_rewrite();
+        assert_eq!(
+            std::fs::read(&ttl_path).expect("TTL 전용 파일이 사라졌습니다"),
+            ttl_before,
+            "구 데몬의 공용 파일 재저장이 TTL 전용 파일을 변경했습니다"
+        );
+        let loaded = load_records();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "구 데몬 재저장 후 L과 T가 모두 남아야 합니다"
+        );
+        for expected in [&legacy, &ttl] {
+            let actual = loaded
+                .iter()
+                .find(|r| r.id == expected.id)
+                .expect("구 데몬 재저장 후 기존 승인 id가 사라졌습니다");
+            assert_eq!(
+                actual.expires_at, expected.expires_at,
+                "승인 {}의 만료 시각이 구 데몬 재저장으로 변경되었습니다",
+                expected.id
+            );
+            assert!(
+                actual.has_valid_signature(secret),
+                "승인 {}의 서명이 구 데몬 재저장으로 손상되었습니다",
+                expected.id
+            );
+            assert_eq!(
+                actual.signature, expected.signature,
+                "승인 {}의 기존 서명이 보존되지 않았습니다",
+                expected.id
+            );
+        }
+
+        // 음성 대조: 분리 전처럼 동일한 서명 검체 T를 공용 파일에 강제로 넣는다.
+        // load_records()는 정상 TTL 판을 우선하므로 손상본을 공용 파일에서 직접 읽는다.
+        assert!(
+            ttl.has_valid_signature(secret),
+            "음성 대조의 원본 T부터 서명이 무효라면 유실 사고를 입증할 수 없습니다"
+        );
+        std::fs::write(
+            &shared_path,
+            serde_json::to_vec(&serde_json::json!({
+                "records": [&legacy, &ttl]
+            }))
+            .expect("음성 대조 JSON 생성 실패"),
+        )
+        .expect("음성 대조를 공용 파일에 쓰지 못했습니다");
+        old_daemon_rewrite();
+        let damaged: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&shared_path).expect("음성 대조 공용 파일 읽기 실패"),
+        )
+        .expect("음성 대조 공용 파일 JSON 해석 실패");
+        let damaged: Vec<ApprovalRecord> = serde_json::from_value(damaged["records"].clone())
+            .expect("구 데몬 재저장 결과를 승인 레코드로 읽지 못했습니다");
+        assert_eq!(
+            damaged.len(),
+            2,
+            "음성 대조에서 필드 제거가 레코드 삭제로 바뀌었습니다"
+        );
+        let damaged_ttl = damaged
+            .iter()
+            .find(|r| r.id == "T")
+            .expect("음성 대조에서 T 자체가 사라졌습니다");
+        assert_eq!(
+            damaged_ttl.expires_at, None,
+            "구 데몬 재저장 흉내가 T의 expires_at을 제거하지 않았습니다"
+        );
+        assert_eq!(
+            damaged_ttl.signature, ttl.signature,
+            "음성 대조는 서명 자체를 바꾸지 않고 만료 필드만 제거해야 합니다"
+        );
+        assert!(!damaged_ttl.has_valid_signature(secret),
+            "공용 파일의 T가 만료 필드를 잃고도 서명 검증을 통과했습니다: 분리 전 사고가 재현되지 않았습니다");
+        let intact_legacy = damaged
+            .iter()
+            .find(|r| r.id == "L")
+            .expect("음성 대조에서 L이 사라졌습니다");
+        assert!(
+            intact_legacy.has_valid_signature(secret),
+            "무기한 L까지 손상되었다면 TTL 필드 유실만을 재현한 검체가 아닙니다"
+        );
+    }
+
+    #[test]
+    fn saving_migrates_ttl_records_out_of_the_shared_store() {
+        // HOME과 secret은 프로세스 전역이다. 두 테스트가 반드시 같은 잠금을 사용한다.
+        // 다른 HOME/env 접근 테스트까지 보호하려면 그 테스트도 이 잠금을 공유하거나
+        // 테스트 실행기를 --test-threads=1로 실행해야 한다.
+        let _lock = TTL_STORE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 잠금보다 나중에 선언하므로 환경 복원/정리가 끝난 뒤 잠금이 해제된다.
+        // OsString으로 보관하여 비유니코드 값과 원래 미설정 상태까지 보존한다.
+        struct RestoreHome {
+            home: Option<std::ffi::OsString>,
+            secret: Option<std::ffi::OsString>,
+            temporary: std::path::PathBuf,
+        }
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                for (key, old) in [
+                    ("HOME", &self.home),
+                    ("CYS_APPROVAL_SECRET_B64", &self.secret),
+                ] {
+                    match old {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                let result = std::fs::remove_dir_all(&self.temporary);
+                // 이미 실패하여 unwind 중이면 이중 panic으로 프로세스를 종료하지 않는다.
+                if !std::thread::panicking() {
+                    result.expect("테스트 종료 후 임시 HOME을 삭제하지 못했습니다");
+                }
+            }
+        }
+        let temporary = std::env::temp_dir().join(format!(
+            "cys-ttl-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("고유 임시 HOME 이름을 만들 시스템 시각이 잘못되었습니다")
+                .as_nanos()
+        ));
+        // create_dir은 기존 경로를 재사용하지 않으므로 타인의 파일을 정리하지 않는다.
+        std::fs::create_dir(&temporary).expect("격리된 임시 HOME을 만들지 못했습니다");
+        let restore = RestoreHome {
+            home: std::env::var_os("HOME"),
+            secret: std::env::var_os("CYS_APPROVAL_SECRET_B64"),
+            temporary,
+        };
+        let secret: &[u8] = b"ttl-store-compatibility-secret-32-bytes";
+        std::env::set_var("HOME", &restore.temporary);
+        std::env::set_var("CYS_APPROVAL_SECRET_B64", b64_encode(secret));
+        let shared_path = restore.temporary.join(".cys/approvals.json");
+        let ttl_path = restore.temporary.join(".cys/approvals-ttl.json");
+
+        let mut legacy = ApprovalRecord {
+            version: 1,
+            id: "L".into(),
+            command_prefix: vec!["git".into(), "status".into()],
+            cwd: None,
+            environment: vec![("CI".into(), "1".into())],
+            created_at: 1000.0,
+            updated_at: 1000.0,
+            expires_at: None,
+            signature: String::new(),
+        };
+        legacy.sign(secret);
+        let mut ttl = ApprovalRecord {
+            id: "T".into(),
+            expires_at: Some(4_000_000_000.0),
+            ..legacy.clone()
+        };
+        ttl.sign(secret);
+
+        // 분리 저장 이전 배치: 공용 파일 하나에 L, T 순서로 유효한 승인을 둔다.
+        std::fs::create_dir_all(
+            shared_path
+                .parent()
+                .expect("공용 파일의 상위 경로가 없습니다"),
+        )
+        .expect("임시 HOME 안에 승인 디렉터리를 만들지 못했습니다");
+        std::fs::write(
+            &shared_path,
+            serde_json::to_vec(&serde_json::json!({
+                "records": [&legacy, &ttl]
+            }))
+            .expect("이전 배치 JSON 생성 실패"),
+        )
+        .expect("이전 배치 공용 파일 생성 실패");
+        assert!(
+            !ttl_path.exists(),
+            "이전 배치 검체에는 TTL 전용 파일이 없어야 합니다"
+        );
+        let loaded = load_records();
+        assert_eq!(
+            loaded.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["L", "T"],
+            "분리 전 공용 파일을 읽을 때 승인 id 또는 L, T 순서가 바뀌었습니다"
+        );
+        for record in &loaded {
+            assert!(
+                record.has_valid_signature(secret),
+                "마이그레이션 전 승인 {}의 서명이 무효입니다",
+                record.id
+            );
+        }
+        let before = serde_json::to_value(&loaded).expect("마이그레이션 전 검체 스냅샷 생성 실패");
+        let _ = save_records(&loaded);
+
+        let shared: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&shared_path).expect("마이그레이션 후 공용 파일이 없습니다"),
+        )
+        .expect("마이그레이션 후 공용 파일 JSON 해석 실패");
+        let shared_records = shared["records"]
+            .as_array()
+            .expect("공용 파일에 records 배열이 없습니다");
+        assert_eq!(
+            shared_records
+                .iter()
+                .filter(|r| r.get("expires_at").is_some())
+                .count(),
+            0,
+            "공용 파일에 expires_at 키가 남아 있어 구 데몬 재저장으로 TTL 승인이 손상될 수 있습니다"
+        );
+        assert_eq!(
+            shared_records.len(),
+            1,
+            "마이그레이션 후 공용 파일에는 무기한 L 하나만 있어야 합니다"
+        );
+        assert_eq!(
+            shared_records[0]["id"], "L",
+            "공용 파일에서 무기한 L이 사라지거나 T가 남았습니다"
+        );
+        let dedicated: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&ttl_path).expect("마이그레이션이 TTL 전용 파일을 만들지 않았습니다"),
+        )
+        .expect("TTL 전용 파일 JSON 해석 실패");
+        let dedicated: Vec<ApprovalRecord> = serde_json::from_value(dedicated["records"].clone())
+            .expect("TTL 전용 파일의 records를 승인 목록으로 읽지 못했습니다");
+        assert_eq!(
+            dedicated.len(),
+            1,
+            "TTL 전용 파일에는 T 하나만 있어야 합니다"
+        );
+        assert_eq!(
+            dedicated[0].id, "T",
+            "마이그레이션 후 TTL 전용 파일에 T가 없습니다"
+        );
+        assert_eq!(
+            dedicated[0].expires_at, ttl.expires_at,
+            "TTL 전용 파일에서 T의 만료 시각이 변경되었습니다"
+        );
+        assert!(
+            dedicated[0].has_valid_signature(secret),
+            "TTL 전용 파일의 T 서명이 마이그레이션 중 손상되었습니다"
+        );
+        let reloaded = load_records();
+        assert_eq!(
+            reloaded.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["L", "T"],
+            "분리 저장 후 다시 읽을 때 승인 id 또는 L, T 순서가 보존되지 않았습니다"
+        );
+        for record in &reloaded {
+            assert!(
+                record.has_valid_signature(secret),
+                "분리 저장 후 승인 {}의 서명이 무효입니다",
+                record.id
+            );
+        }
+        // 재서명 등 우연한 복구로 검사를 통과하지 못하게 모든 필드와 기존 서명도 비교한다.
+        assert_eq!(
+            serde_json::to_value(&reloaded).expect("마이그레이션 후 스냅샷 생성 실패"),
+            before,
+            "마이그레이션은 저장 위치만 바꿔야 하는데 승인 내용, 서명 또는 순서가 변경되었습니다"
+        );
+    }
+
 }

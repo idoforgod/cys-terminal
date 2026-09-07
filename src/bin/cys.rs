@@ -724,12 +724,22 @@ enum Command {
         /// 지정하는 경로는 `cys claim-role` 이고, 이 명령이 그것을 대신하지 않는다.
         #[arg(long)]
         auto: bool,
-        /// 이 pane 의 실제 `CLAUDE_CONFIG_DIR`(훅이 전달). 후보 대조 축 — 없으면 무결합.
+        /// 이 pane 의 실제 `CLAUDE_CONFIG_DIR`(훅이 전달) — **진단 전용**(R2).
+        /// 계정 dir 축은 데몬이 좌석 생성 시 스스로 해소해 기록한 값으로 판정한다: unix pane
+        /// env 에는 이 변수가 없어 신고값이 사실상 항상 비고, 사용자가 자기 값을 export 하면
+        /// pane 이 아니라 그 셸의 사실이 된다 — 어느 쪽도 이 좌석의 증거가 아니다.
         #[arg(long)]
         config: Option<String>,
-        /// 이 pane 의 실제 `$PWD`(훅이 전달). 후보 대조 축 — 없으면 무결합.
+        /// 이 pane 의 실제 `$PWD`(훅이 전달) — **좁히기 전용**(R2). 데몬이 아는 좌석 디렉터리와
+        /// AND 로 걸린다(신고로 후보를 넓히지는 못한다).
         #[arg(long)]
         cwd: Option<String>,
+        /// ★특권 역할(master·cso)의 빈 좌석까지 후보로 연다 — **사람이 명시할 때만**.
+        /// `system.claim_role` 의 `takeover_empty_seat` 와 같은 문이고, 훅은 절대 넘기지 않는다:
+        /// 자동 경로가 특권 주소·caps·큐를 부수효과로 옮기면 종전에 명시 요청이 필요했던 전이가
+        /// SessionStart 한 번으로 일어난다(정본 §8 "기존 게이트 면제 금지").
+        #[arg(long = "takeover-empty-seat")]
+        takeover_empty_seat: bool,
         /// 이 pane 의 현재 `CYS_ROLE`(훅이 전달) — **결합 판정에는 쓰이지 않는다**(env 는
         /// 권위가 아니다). 데몬이 "그 역할을 지금 누가 쥐고 있는가"를 답해 주고, 훅은 그
         /// 답이 `other_live` 일 때만 stale 각성을 강등한다.
@@ -3908,8 +3918,8 @@ fn run(command: Command) -> i32 {
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
-        Command::ReclaimRole { auto, config, cwd, env_role } => {
-            return run_reclaim_role(auto, config, cwd, env_role)
+        Command::ReclaimRole { auto, config, cwd, takeover_empty_seat, env_role } => {
+            return run_reclaim_role(auto, config, cwd, takeover_empty_seat, env_role)
         }
 
         Command::Hook { event } => return run_hook(event),
@@ -12584,10 +12594,64 @@ fn run_claim_role(
 ///
 /// 구 데몬(RPC 미지원)·데몬 미응답·타임아웃 — 전부 `role=` + 안내 stderr. 훅은 그 결과를
 /// '역할 없음'으로 읽어 종전 경로(무역할 안내)로 흐른다(fail-open 방향이 곧 무회귀).
+/// 하나의 **단조 총예산** 안에서 도는 왕복 — 연결(Windows named pipe 의 busy 재시도 포함)·
+/// 쓰기·읽기가 전부 이 예산 안이다.
+///
+/// ★왜 `request_on_timeout` 만으로는 부족한가(codex 적대검증 R2 major): 그것이 거는 것은
+/// **무진행(idle)** 상한이고, 그 상한은 **연결이 끝난 뒤에** 장전된다. Windows 는 파이프가
+/// busy 면 별도 예산(≈5s)으로 재시도하므로 "연결 4s + 무진행 7.5s" 가 합쳐져 훅의 외곽
+/// 데드라인(12s)을 넘긴다 — 그러면 **데몬은 결합했는데 훅은 그 답을 못 받은** 상태가 된다
+/// (치명위험 ③). 그래서 호출자는 `recv_timeout` 으로만 기다리고(진행으로 연장되지 않는다),
+/// 만료하면 그 왕복을 버린다. 버려진 스레드는 자기 무진행 상한에서 스스로 끝난다.
+/// (`request_before` 와 같은 기구다 — 그쪽은 `socket_path()` 고정·autostart 경로라 훅에서
+/// 쓸 수 없어 같은 규율의 소켓 지정판을 여기 둔다.)
+fn request_on_before(
+    socket: &std::path::Path,
+    method: &str,
+    params: Value,
+    deadline: std::time::Instant,
+) -> Result<Value, String> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err("budget_exhausted: 예산 소진 — 왕복을 시작하지 않는다".to_string());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = socket.to_path_buf();
+    let m = method.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(request_on_timeout(&sock, &m, params, remaining));
+    });
+    match rx.recv_timeout(remaining) {
+        Ok(r) => r,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "rpc_budget: 총예산 {}ms 안에 응답이 없다(연결·왕복 포함) — 이 왕복을 버린다",
+            remaining.as_millis()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("왕복 스레드가 결과 없이 사라졌다(패닉 의심) — 관측 실패로 접는다".to_string())
+        }
+    }
+}
+
+/// 이 시도의 고유 식별자 — 서버가 '버려진 요청'을 펜싱할 수 있게 한다(취소 원장 키).
+/// 단일 머신·단일 사용자라 pid + 단조 나노초로 충분하다(암호 강도 불필요 · 위조 이득 0:
+/// 남의 id 를 취소해도 그 시도는 어차피 그 클라이언트가 포기한 것이다).
+fn reclaim_attempt_id() -> String {
+    format!(
+        "rc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
 fn run_reclaim_role(
     auto: bool,
     config: Option<String>,
     cwd: Option<String>,
+    takeover_empty_seat: bool,
     env_role: Option<String>,
 ) -> i32 {
     if !auto {
@@ -12601,12 +12665,15 @@ fn run_reclaim_role(
         return 0;
     }
     // 훅은 프롬프트 **앞**에 서 있다 — 데드라인은 BUDGET 파생(하드코딩 금지).
-    // ★두 왕복의 **합**이 훅 외곽 데드라인(12s)보다 작아야 한다(codex 적대검증 R1 major):
-    //   1차 3틱(7.5s) + 조정 재조회 1틱(2.5s) = 10s < 12s. 종전처럼 1차에 4틱을 주고 조정에
-    //   또 예산을 주면 밖에서 먼저 죽어 **권위 답을 못 받은 채** 끝난다(그 상태에서 훅이
-    //   역할을 내리면 살아 있는 좌석이 지침을 잃는다).
-    let timeout = std::time::Duration::from_millis(BUDGET_TICK_MS * 3);
-    let reconcile_timeout = std::time::Duration::from_millis(BUDGET_TICK_MS);
+    // ★(R2) 예산은 **총량 하나**이고 그 안에서 조정 몫을 **미리 떼어 둔다**: 총 10s(<훅 외곽
+    //   12s) 중 조정(reconcile) 2.5s 를 예약하고 1차 왕복에 7.5s 를 준다. 예약하지 않으면
+    //   1차가 예산을 다 쓰고 조정이 시작조차 못 하는데, 조정은 "데몬이 결국 결합했는가"를
+    //   확인하는 **유일한** 경로다(그것이 없으면 커밋된 승계를 아무도 모른다 — 치명위험 ③).
+    let total_budget = std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+    let reconcile_reserve = std::time::Duration::from_millis(BUDGET_TICK_MS);
+    let started = std::time::Instant::now();
+    let total_deadline = started + total_budget;
+    let first_deadline = total_deadline - reconcile_reserve;
     let socket = cys::socket_path();
     // ★소켓 실존 프리체크는 **unix 한정**이다(적대검증 R1 major). Windows 의 기본 종단은
     //   named pipe(`\\.\pipe\cys`)이고, 파이프는 파일시스템 메타데이터로 존재를 잴 수 없다
@@ -12622,6 +12689,8 @@ fn run_reclaim_role(
         eprintln!("[reclaim-role] 데몬 소켓 부재({}) — 무결합.", socket.display());
         return 0;
     }
+    let attempt_id = reclaim_attempt_id();
+    let allow_privileged_optin = takeover_empty_seat;
     let params = json!({
         "config": config.clone().unwrap_or_default(),
         "cwd": cwd.clone().unwrap_or_default(),
@@ -12629,17 +12698,32 @@ fn run_reclaim_role(
         //   조용히 결합하는 것을 막는다(밖에서 죽이는 것만으로는 서버 작업이 취소되지 않는다).
         //   상대 예산으로 보내면 요청이 디스패치 큐에서 기다린 시간이 예산에서 빠지지 않아,
         //   클라이언트가 이미 죽은 뒤에도 서버 예산이 온전히 남는다 — 그래서 절대 시각이다.
-        //   같은 호스트의 같은 벽시계이며, 시계 점프의 귀결은 '무결합'(안전 방향)이다.
         "deadline_epoch": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
-            + timeout.as_secs_f64(),
+            + first_deadline.saturating_duration_since(started).as_secs_f64(),
+        // ★그리고 **총예산 자체**를 함께 보낸다(R2 · codex major): 벽시계가 요청 도중 뒤로
+        //   점프하면 서버가 계산하는 `deadline - now` 가 원래 예산보다 커진다. 우리가 그보다
+        //   오래 기다리지 않는다는 사실이 그 상한이다.
+        "budget_secs": first_deadline.saturating_duration_since(started).as_secs_f64(),
+        // 이 시도의 식별자 — 포기할 때 조정 조회에 실어 **펜싱**한다.
+        "attempt_id": attempt_id,
+        // 특권 빈좌석 승계 opt-in(훅은 넘기지 않는다 — 사람이 명시한 경우만 true).
+        // ★키 이름은 `system.claim_role` 과 **같다**(같은 문·같은 뜻). 값 표현식만 다른 지역
+        //   이름(`allow_privileged_optin`)을 쓰는 이유:
+        //   `claim_role_keeps_its_two_pinned_facts_inside_the_function_body` 가 claim 페이로드의
+        //   **사본 금지**를 "키와 동명 변수를 잇는 그 한 줄이 코드 영역에 정확히 하나"로 잰다.
+        //   여기서 같은 형태를 쓰면 계수가 2가 되어 그 핀이 **다른 RPC 때문에** 적색이 되고,
+        //   claim 의 계약을 더는 재지 못한다. 핀을 고치지 않고 앵커를 비켜 간다 — 핀의 뜻은
+        //   그대로 살아 있고, 이 줄이 claim 의 사본이 아니라는 사실도 이름으로 드러난다.
+        //   (그 앵커 문자열은 이 주석에도 적지 않는다 — 주석도 계수 대상이다. 실측 2026-09-08.)
+        "takeover_empty_seat": allow_privileged_optin,
         // 훅이 신고하는 현재 env 역할 — 강등 증거(`env_role_state`) 조회용이며 결합 판정에는
         // 쓰이지 않는다(`CYS_ROLE` 은 권위가 아니다 · 정본 §8).
         "env_role": env_role.clone().unwrap_or_default(),
     });
-    match request_on_timeout(&socket, "role.reclaim_auto", params, timeout) {
+    match request_on_before(&socket, "role.reclaim_auto", params, first_deadline) {
         Ok(r) => {
             let role = r["role"].as_str().unwrap_or("");
             let reason = r["reason"].as_str().unwrap_or("");
@@ -12650,21 +12734,25 @@ fn run_reclaim_role(
             println!("reason={reason}");
             println!("env_role={}", r["env_role_state"].as_str().unwrap_or("unknown"));
             if role.is_empty() {
-                // 사유는 **stderr 한 줄**. 훅은 stdout 의 정해진 줄(1·3)만 읽으므로 여기 무엇을
+                // 사유는 **stderr 한 줄**. 훅은 stdout 의 정해진 줄(1·2·3)만 읽으므로 여기 무엇을
                 // 써도 파싱은 안전하다.
                 let hint = match reason {
                     "caller_unresolved" => {
                         "발신 pane 을 좌석으로 해석하지 못했다(pane 밖 실행·세션 분리)"
                     }
-                    "caller_env_missing" => {
-                        "--config/--cwd 가 비었다 — 대조 축이 없으면 후보를 고르지 않는다"
+                    "caller_axes_unknown" => {
+                        "데몬이 이 좌석의 계정 dir(신뢰 출처)·작업 디렉터리를 확정하지 못했다 \
+                         — 축 없이 역할을 옮기지 않는다"
                     }
-                    "caller_env_mismatch" => {
-                        "신고한 --config 가 데몬이 이 좌석에 대해 아는 계정 dir 과 다르다 \
-                         (자기신고로 남의 계정 좌석을 가져가지 못한다)"
+                    "privileged_needs_optin" => {
+                        "빈 좌석이 특권 역할(master·cso)이다 — 자동 경로는 그 문을 열지 않는다. \
+                         사람이 `cys reclaim-role --auto --takeover-empty-seat` 로 명시하라"
                     }
                     "deadline_exceeded" => {
                         "예산 안에 커밋 지점에 닿지 못했다 — 늦은 승계를 만들지 않으려고 취소했다"
+                    }
+                    "attempt_cancelled" => {
+                        "이 시도는 클라이언트가 이미 포기한 것이다 — 아무도 기다리지 않는 승계를 만들지 않았다"
                     }
                     "restore_lease_held" => {
                         "phoenix 부활이 진행 중(restore lease 보유) — 다음 세션 시작에 다시 시도한다"
@@ -12715,14 +12803,16 @@ fn run_reclaim_role(
             //   서버측 커밋 데드라인이 늦은 커밋을 막지만, 우리가 죽기 **직전에** 커밋이
             //   성사됐을 수도 있다 — 그 결과를 모른 채 `role=` 을 내면 훅이 무역할 지침을
             //   주입하고 데몬은 역할·큐를 옮긴 상태가 된다(아무도 모르는 승계).
-            //   그래서 **읽기 전용 조정 조회 1회**로 권위 답을 확인한다: 상태를 바꾸지 않으므로
-            //   재시도가 두 번째 결합이 되지 않는다. 예산은 짧게(틱 2회분) — 훅은 사람의
-            //   프롬프트 앞이고, 이 조회마저 실패하면 종전대로 '판정 못 받음'이다.
-            let recon = request_on_timeout(
+            //   그래서 **읽기 전용 조정 조회 1회**로 권위 답을 확인하면서, 같은 요청에
+            //   **이 시도의 취소**를 실어 보낸다(펜싱): 서버는 취소를 먼저 기록한 뒤 역할을
+            //   읽으므로, 답이 '없음'이면 그 뒤의 커밋도 일어나지 않는다(선형화).
+            //   예산은 위에서 **미리 떼어 둔** 몫이라 1차가 아무리 오래 끌어도 남아 있다.
+            let recon = request_on_before(
                 &socket,
                 "role.reclaim_auto",
-                json!({"reconcile": true, "env_role": env_role.clone().unwrap_or_default()}),
-                reconcile_timeout,
+                json!({"reconcile": true, "cancel_attempt": attempt_id,
+                       "env_role": env_role.clone().unwrap_or_default()}),
+                total_deadline,
             );
             match recon {
                 Ok(rr) => {
@@ -12746,7 +12836,9 @@ fn run_reclaim_role(
                     println!("env_role=unknown");
                     eprintln!(
                         "[reclaim-role] 무결합(데몬 왕복 실패: {e} · 조정 조회도 실패: {e2}) — \
-                         판정을 받지 못했다. 현재 역할을 바꾸지 마라."
+                         판정을 받지 못했다. 현재 역할을 바꾸지 마라. \
+                         ★데몬이 이미 결합했을 가능성은 남는다(응답만 유실) — 다음 SessionStart 가 \
+                         그 역할을 권위로 알려 준다."
                     );
                 }
             }
@@ -26065,16 +26157,63 @@ mod tests {
         ])
         .expect("훅 호출이 파싱되지 않는다");
         match c.command {
-            Command::ReclaimRole { auto, config, cwd, env_role } => {
+            Command::ReclaimRole { auto, config, cwd, takeover_empty_seat, env_role } => {
                 assert!(auto);
                 assert_eq!(config.as_deref(), Some("/Users/x/.cys/claude"));
                 assert_eq!(cwd.as_deref(), Some("/Users/x/dev/p"));
                 assert_eq!(env_role.as_deref(), Some("reviewer-codex"));
+                // ★(R2) 훅 호출에는 특권 opt-in 이 **없다** — 기본이 false 여야 자동 경로가
+                //   master·cso 를 부수효과로 옮기지 않는다(정본 §8 게이트 보존).
+                assert!(!takeover_empty_seat, "훅 호출이 특권 승계를 기본으로 연다");
             }
             _ => panic!("reclaim-role 로 파싱되지 않았다"),
         }
         // `--env-role` 은 선택이다(구 훅 호환).
         assert!(Cli::try_parse_from(["cys", "reclaim-role", "--auto"]).is_ok());
+        // 사람이 명시할 때만 특권 후보가 열린다.
+        match Cli::try_parse_from(["cys", "reclaim-role", "--auto", "--takeover-empty-seat"])
+            .expect("opt-in 플래그가 파싱되지 않는다")
+            .command
+        {
+            Command::ReclaimRole { takeover_empty_seat, .. } => assert!(takeover_empty_seat),
+            _ => panic!("reclaim-role 로 파싱되지 않았다"),
+        }
+    }
+
+    /// ★(R2 · codex major) **조정(reconcile) 예산은 미리 떼어 둔다.**
+    ///
+    /// 1차 왕복이 예산을 다 쓰면 조정이 시작조차 못 하는데, 조정은 "데몬이 결국 결합했는가"를
+    /// 확인하는 **유일한** 경로다(그것이 없으면 커밋된 승계를 아무도 모른다 — 치명위험 ③).
+    /// 그리고 두 예산의 합은 훅의 외곽 데드라인(12s)보다 **작아야** 한다: 밖에서 먼저 죽이면
+    /// 같은 상태가 된다. 이 검체는 그 산술을 소스가 아니라 **값으로** 못박는다.
+    #[test]
+    fn reclaim_budget_reserves_the_reconcile_leg_and_fits_the_hook_deadline() {
+        let total = std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+        let reserve = std::time::Duration::from_millis(BUDGET_TICK_MS);
+        let first = total - reserve;
+        assert!(reserve > std::time::Duration::ZERO, "조정 몫이 0 이면 예약이 아니다");
+        assert!(first > reserve, "1차 왕복 몫이 조정 몫보다 작다(주 경로가 굶는다)");
+        assert!(
+            total <= std::time::Duration::from_secs(11),
+            "총예산이 훅 외곽 데드라인(12s)에 붙어 있다 — 밖에서 먼저 죽는다: {total:?}"
+        );
+        // 그리고 `run_reclaim_role` 이 그 산술을 실제로 쓰는지 소스로 대조한다(값만 맞고
+        // 코드가 다른 예산을 쓰면 이 검체는 아무것도 재지 못한다).
+        let src = include_str!("cys.rs");
+        let body = item_body(src, "\nfn run_reclaim_role(");
+        assert!(
+            body.contains("let first_deadline = total_deadline - reconcile_reserve;"),
+            "조정 예산 예약이 사라졌다 — 1차가 전 예산을 쓰면 조정이 시작도 못 한다"
+        );
+        assert!(
+            body.contains("request_on_before(&socket, \"role.reclaim_auto\", params, first_deadline)")
+                && body.contains("total_deadline,"),
+            "두 왕복이 하나의 **단조** 총예산 안에서 돌지 않는다(연결 대기가 예산 밖으로 샌다)"
+        );
+        assert!(
+            body.contains("\"cancel_attempt\": attempt_id"),
+            "포기 시 취소 펜싱을 보내지 않는다 — 버려진 요청이 나중에 조용히 커밋한다"
+        );
     }
 
     #[test]

@@ -67,6 +67,18 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
         "bogus":       ("exit 0", _rc("cso; rm -rf /", "bound", "unknown")),
         "taken":       ("exit 0", _rc("", "no_candidate", "other_live")),
         "mine":        ("exit 0", _rc("worker", "already_roled", "self")),
+        # ★(R2) 데몬이 **결합을 커밋**했는데 env 는 다른 값 — 훅은 데몬 답을 채택해야 한다.
+        "bound_other":  ("exit 0", _rc("cso", "bound", "vacant")),
+        # ★(R2) worker 중복제거 실전형: 이 좌석은 정당하게 worker-2 를 쥐었고 env 는 stale
+        #   `worker` 이며, 그 `worker` 는 **다른 산 좌석**이 쥐었다(other_live).
+        #   종전 규칙은 이 좌석을 **강등**해 지침 0 으로 만들었다(두 리뷰어 공통 blocking).
+        "dedup_live":   ("exit 0", _rc("worker-2", "already_roled", "other_live")),
+        # ★(R2) 특권 빈 좌석이 있으나 자동 경로는 열지 않는다 — 처방을 고지해야 한다.
+        "priv_optin":   ("exit 0", _rc("", "privileged_needs_optin", "unknown")),
+        # ★(R2) 데몬이 이 좌석의 축을 모른다 — 무결합 + 처방 고지.
+        "axes_unknown": ("exit 0", _rc("", "caller_axes_unknown", "unknown")),
+        # ★(R2) 데몬이 **판정해서** 무역할이라고 답했고 env 역할은 주인이 없다(미등록).
+        "unregistered":  ("exit 0", _rc("", "no_candidate", "vacant")),
     }[reclaim_mode]
     with open(os.path.join(bindir, "cys"), "w", encoding="utf-8", newline="\n") as f:
         f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
@@ -238,6 +250,65 @@ check("11c 역할 보유 시 --env-role 로 현재 역할을 신고", "--env-rol
       _c.strip().replace("\n", " | "))
 shutil.rmtree(tmp)
 
+# ── 11x. ★(R2 재핀 · 두 리뷰어 공통 blocking) **데몬의 답이 이긴다** ──
+#   종전 규칙은 `role=` 을 `CYS_ROLE` 이 **빌 때만** 채택했다. 그 규칙에서는
+#     ① 데몬이 `role=cso/bound` 로 이미 결합을 커밋했는데 훅이 그 답을 버리고 stale env 의
+#        worker 지침을 주입했고(데몬과 세션이 서로 다른 역할을 믿는다),
+#     ② worker 중복제거로 이 좌석이 정당하게 `worker-2` 를 쥔 경우 `env_role=other_live` 만
+#        보고 **강등**해 살아 있는 역할 좌석을 지침 0 으로 만들었다(치명위험 ③).
+#   이제 규칙은 하나다: `role=` 이 비어 있지 않으면 그것이 이 좌석의 역할이다.
+tmp = tempfile.mkdtemp(prefix="hook-t11x-")
+env = setup(tmp, "ok", reclaim_mode="bound_other")
+code, out, _ = run_hook(env, role="worker")
+check("11x-a ①커밋된 권위 역할을 채택한다(stale env 를 이긴다)", "DIRECTIVE-BODY-CSO" in out)
+check("11x-b ①stale env 지침은 주입하지 않는다", "DIRECTIVE-BODY-WORKER" not in out)
+check("11x-c ①교정 사실을 고지한다", "역할 교정" in out and "cso" in out)
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t11y-")
+env = setup(tmp, "ok", reclaim_mode="dedup_live")
+code, out, _ = run_hook(env, role="worker")
+check("11y-a ②정당한 worker-2 좌석이 강등되지 않는다", "역할 주소 상실" not in out)
+check("11y-b ②권위 역할(worker-2)의 지침을 받는다", "DIRECTIVE-BODY-WORKER" in out)
+check("11y-c ②exit 0", code == 0)
+shutil.rmtree(tmp)
+
+# ── 11z. ★(R2 · codex minor) 처방이 있는 무결합 사유는 **세션에 보인다** ──
+#   종전에는 둘째 줄(`reason=`)을 읽지 않고 stderr 도 버려서 "왜 안 붙었는지"도
+#   "무엇을 하면 되는지"도 어디에도 남지 않았다.
+tmp = tempfile.mkdtemp(prefix="hook-t11z-")
+env = setup(tmp, "ok", reclaim_mode="priv_optin")
+code, out, _ = run_hook(env)
+check("11z-a 특권 opt-in 처방 고지", "--takeover-empty-seat" in out)
+check("11z-b 자동 경로가 특권을 옮기지 않는다는 사실 명시", "특권 역할" in out)
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t11w-")
+env = setup(tmp, "ok", reclaim_mode="axes_unknown")
+code, out, _ = run_hook(env)
+check("11w-a 축 미확정 고지 + 수동 처방", "cys claim-role" in out and "확정하지 못" in out)
+shutil.rmtree(tmp)
+
+# ── 11v. ★(R2 · codex major) 판정된 '무역할' + 주인 없는 env 역할 → 지침은 주되 **미등록 고지** ──
+#   지침을 끊으면 지침 없는 좌석을 새로 만든다(치명위험 ③). 그러나 등록되지 않았다는 사실을
+#   숨기면 그 좌석은 자기 `cys` 명령이 왜 거부되는지 모른 채 역할처럼 행동한다.
+tmp = tempfile.mkdtemp(prefix="hook-t11v-")
+env = setup(tmp, "ok", reclaim_mode="unregistered")
+code, out, _ = run_hook(env, role="worker")
+check("11v-a 미등록 고지가 뜬다", "역할 등록이 없다" in out)
+check("11v-b 처방(claim-role)이 붙는다", "cys claim-role worker" in out)
+check("11v-c 지침은 그대로 주입한다(지침 없는 좌석을 만들지 않는다)", "DIRECTIVE-BODY-WORKER" in out)
+check("11v-d 강등이 아니다", "역할 주소 상실" not in out)
+shutil.rmtree(tmp)
+
+# ── 11u. ★음성 대조: master|cso 는 아래 재대조가 그 자리에서 등록하므로 이 고지 대상이 아니다 ──
+tmp = tempfile.mkdtemp(prefix="hook-t11u-")
+env = setup(tmp, "ok", reclaim_mode="unregistered")
+code, out, _ = run_hook(env, role="cso")
+check("11u-a cso 에는 미등록 고지 없음(재대조가 등록한다)", "역할 등록이 없다" not in out)
+check("11u-b cso 지침 주입 유지", "DIRECTIVE-BODY-CSO" in out)
+shutil.rmtree(tmp)
+
 # ── 13. ★강등: `env_role=other_live` — 그 역할을 지금 다른 산 좌석이 쥐었다 ──
 tmp = tempfile.mkdtemp(prefix="hook-t13-")
 env = setup(tmp, "ok", reclaim_mode="taken")
@@ -245,6 +316,8 @@ code, out, _ = run_hook(env, role="reviewer-codex")
 check("13a 강등: 역할 지침 미주입", "DIRECTIVE-BODY-REVIEWER" not in out)
 check("13b 강등: 인계 안내", "역할 주소 상실" in out and "reviewer-codex" in out)
 check("13c 강등: 복구 경로 명시(claim-role)", "cys claim-role reviewer-codex" in out)
+check("13e 강등은 `role=` 이 빈 경우에만(권위 역할이 오면 채택이 이긴다 — 11y 가 반례)",
+      "역할 교정" not in out)
 check("13d 강등: exit 0(좌석을 죽이지 않는다)", code == 0)
 shutil.rmtree(tmp)
 

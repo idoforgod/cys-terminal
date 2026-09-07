@@ -1100,6 +1100,21 @@ pub struct Surface {
     /// 정확히 재개한다. discover 스캔은 ~/.cys/claude를 못 보므로 config_dir 권위는 오직 이 결정론 기록이다.
     /// restore로 재생성될 땐 topology 원값을 그대로 주입(재해소 금지 — 데몬 env 변동 시 오염 방지).
     pub claude_config_dir: Mutex<Option<String>>,
+    /// ★(0.14.31 · WP-4 R2 · codex blocking) 위 `claude_config_dir` 의 **출처가 데몬인가**.
+    ///
+    /// `true` = 이 좌석의 값은 데몬이 자기 env 로 결정론 해소한 것이고(`resolve_claude_config_dir`)
+    /// 호출자 env 가 그 값을 덮지 않았다 → **실제 실행 환경과 같다고 말할 수 있다**.
+    /// `false` = `surface.create` 가 `claude_config_dir` 을 지정했거나(restore 경로) 호출자 env 가
+    /// `CLAUDE_CONFIG_DIR` 를 **다른 값으로** 실었다 → 기록과 실행이 갈릴 수 있다.
+    ///
+    /// **왜 필요한가**: `role.reclaim_auto` 는 "이 좌석의 계정 dir"을 인증 축으로 쓴다. 그런데
+    /// 기록값을 호출자가 정할 수 있으면(`{claude_config_dir:A, env:{CLAUDE_CONFIG_DIR:B}}`)
+    /// **A 로 기록되고 B 로 도는 좌석**을 만들어 A 의 역할·큐를 가져갈 수 있다 — 데몬 안에
+    /// 있다는 것만으로는 인증 근거가 못 된다(codex 적대검증 R2). reclaim 은 이 표식이 `false` 인
+    /// 좌석을 **호출자로 인정하지 않는다**(축 미확정 → 무결합). 후보 쪽에는 요구하지 않는다:
+    /// restore 로 태어난 좌석(정당한 override)이 죽었을 때 그 역할을 영영 못 되찾게 되고,
+    /// 그것이 바로 이 WP 가 고치려는 상태이기 때문이다.
+    pub config_dir_trusted: bool,
     /// ⑪ pack-reinject 추적 마커 — 마지막 주입 pack_version·directive_hash. 단일 write path는
     /// `reinject.mark` RPC(주입 성공 직후 컨트롤러만 호출). topology 영속·restore 복원으로
     /// 재기동을 견딘다. None=미주입(첫 pack-update에서 1회 주입). agent_session_id와 동일 위치 init.
@@ -2184,6 +2199,19 @@ pub struct Daemon {
     /// 되살릴 의미가 없고, topology 스키마를 넓히면 조작 표면만 늘어난다. TTL은 create 재시도
     /// 창과 동일한 CREATE_IDEM_TTL_SECS를 재사용하고 만료분은 insert 시 lazy GC 한다.
     pub create_owner: Mutex<HashMap<u64, (u64, f64)>>,
+    /// ★(0.14.31 · WP-4 R2 · codex major) **재결합 시도 취소 원장** — `attempt_id` → 취소 epoch.
+    ///
+    /// 왜 필요한가: `role.reclaim_auto` 의 왕복이 클라이언트 예산 안에 끝나지 않으면 CLI 는
+    /// 읽기 전용 `reconcile` 로 권위 답을 확인하고 **무결합으로 끝난다**. 그런데 디스패치는
+    /// 취소되지 않으므로 그 뒤 원 요청이 재개해 커밋할 수 있다 — 벽시계가 뒤로 점프하면
+    /// `deadline_epoch` 검사마저 통과한다(리뷰 R2). 그때 훅은 이미 "역할 없음"으로 진행했고
+    /// 데몬만 역할·큐를 옮긴다(치명위험 ③ 그 자체).
+    ///
+    /// 그래서 CLI 는 요청마다 고유 `attempt_id` 를 붙이고, 포기할 때 `reconcile` 에
+    /// `cancel_attempt` 로 그 id 를 실어 보낸다. `reclaim_commit` 은 **임계영역 안에서** 이
+    /// 집합을 보고 취소된 시도면 아무것도 바꾸지 않는다(펜싱). 유계 유지는 insert 시 lazy GC
+    /// (`CREATE_IDEM_TTL_SECS` 재사용 — 어떤 시도도 그보다 오래 살지 않는다).
+    pub reclaim_cancelled: Mutex<HashMap<String, f64>>,
     /// ★결함8(2026-08-22 부트 실사고) **창작자 원장** — 새 surface_id →
     /// (`surface.create` 를 호출한 **프로세스** pid, 그 시점 pid 의 start_time, 기록 epoch초).
     ///
@@ -3111,6 +3139,7 @@ impl Daemon {
             caller_gen: AtomicU64::new(0),
             create_idem: Mutex::new(HashMap::new()),
             create_owner: Mutex::new(HashMap::new()),
+            reclaim_cancelled: Mutex::new(HashMap::new()),
             create_caller: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
@@ -3821,6 +3850,23 @@ impl Daemon {
         claude_config_dir_override: Option<String>,
     ) -> Result<Arc<Surface>, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // ★(0.14.31 · WP-4 R2 · codex blocking) 계정 dir 의 **값과 그 출처**를 함께 확정한다.
+        //   데몬이 스스로 해소했고(오버라이드 없음) 호출자 env 가 그 값을 다른 값으로 덮지
+        //   않았을 때만 "기록 = 실제 실행"이라고 말할 수 있다. 그 표식이 없으면 reclaim 의
+        //   인증 축이 **호출자가 정한 문자열**이 된다(§Surface.config_dir_trusted).
+        let daemon_resolved = cys::resolve_claude_config_dir();
+        let env_config_dir = env
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.clone());
+        let resolved_config_dir = claude_config_dir_override
+            .clone()
+            .unwrap_or_else(|| daemon_resolved.clone());
+        let config_dir_trusted = claude_config_dir_override.is_none()
+            && env_config_dir
+                .as_deref()
+                .map(|v| v == daemon_resolved)
+                .unwrap_or(true);
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -4086,10 +4132,8 @@ impl Daemon {
             agent_session_id: Mutex::new(None),
             // (W1) restore가 넘긴 원값이 있으면 그대로 고정(재해소 금지 — 데몬 env 변동 시 오염 방지),
             // 없으면(신규 기동) 이 데몬 프로세스 env로 결정론 해소(pane 셸이 실제 해소할 값과 일치).
-            claude_config_dir: Mutex::new(Some(
-                claude_config_dir_override
-                    .unwrap_or_else(cys::resolve_claude_config_dir),
-            )),
+            claude_config_dir: Mutex::new(Some(resolved_config_dir)),
+            config_dir_trusted,
             pack_reinject: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,

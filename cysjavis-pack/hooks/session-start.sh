@@ -55,13 +55,17 @@ BOOT_CMD="$(cys_shquote "${CYS_PY:-python3}") $(cys_shquote "$(cys_native_path "
 #   ② `cys reclaim-role --auto` — **데몬이 발신 pid 로 인증한** 좌석 기준의 판정이다. stdout 3줄:
 #      `role=<name|>` · `reason=<code>` · `env_role=<self|other_live|other_exited|vacant|unknown>`.
 #
-# 채택 규칙(둘 다 **좁은 쪽**이 기본):
-#   ⓐ **복구**: `CYS_ROLE` 이 비어 있고 `role=<name>` 이 오면 그 역할로 각성한다.
-#   ⓑ **강등**: `CYS_ROLE` 이 있는데 `env_role=other_live` — 즉 데몬이 "그 역할은 **지금 다른
-#      살아있는 좌석**이 쥐고 있다"고 답하면, 이 세션은 그 역할이 아니다. 지침을 주입하지 않고
-#      인계 안내 후 종료한다(master|cso 재대조의 self-demote 와 같은 문안 규약).
-#      ★`other_live` **하나에서만** 내린다. "호출자에게 역할이 없다"로 내리면 경합 한 번에
-#        살아 있는 좌석이 지침을 잃는다(치명위험 ③) — 강등은 **모순의 증거**가 있을 때만이다.
+# 채택 규칙(★R2 개정 — **데몬의 답이 이긴다**):
+#   ⓐ **채택**: `role=<name>` 이 오면 `CYS_ROLE` 의 유무·값과 **무관하게** 그 역할로 각성한다
+#      (비었으면 복구 · 다르면 교정). 종전처럼 `CYS_ROLE` 이 빈 경우로 한정하면, 데몬이 이미
+#      결합을 커밋했거나(reason=bound) 이 좌석이 정당하게 다른 이름(worker-2)을 쥔 경우에
+#      **stale env 가 권위를 이긴다** — 정본 §8("CYS_ROLE 을 권위로 쓰지 않는다") 위반이고
+#      두 리뷰어가 실행으로 재현한 blocking 이다.
+#   ⓑ **강등**: `role=` 이 **비어 있고**(데몬이 이 좌석을 무역할로 판정했고) 그와 동시에
+#      `env_role=other_live` — 즉 신고한 `CYS_ROLE` 을 **지금 다른 살아있는 좌석**이 쥐고 있을
+#      때만. 지침을 주입하지 않고 인계 안내 후 종료한다(master|cso 재대조의 self-demote 와 같은
+#      문안 규약). ★두 조건을 AND 로 묶는다 — 어느 한쪽만으로 내리면 경합 한 번에 살아 있는
+#      좌석이 지침을 잃는다(치명위험 ③). 강등은 **모순의 증거**가 둘 다 있을 때만이다.
 #
 # 실패는 전부 한 방향이다 — **무결합 · 무강등 · 종전 경로**. 구 데몬·미응답·타임아웃·후보 모호는
 # 모두 `role=` + `env_role=unknown` 이고, 그러면 이 블록은 아무 것도 하지 않은 것과 같다(무회귀).
@@ -88,10 +92,15 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       --cwd "$(cys_native_path "$PWD")" \
       --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null | tr -d '\r')"
     CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"
+    CYS_RC_L2="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 2p)"
     CYS_RC_L3="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 3p)"
     case "$CYS_RC_L1" in
       role=*) CYS_RECLAIMED="${CYS_RC_L1#role=}" ;;
       *)      CYS_RECLAIMED="" ;;
+    esac
+    case "$CYS_RC_L2" in
+      reason=*) CYS_RC_REASON="${CYS_RC_L2#reason=}" ;;
+      *)        CYS_RC_REASON="" ;;
     esac
     case "$CYS_RC_L3" in
       env_role=*) CYS_ENV_ROLE_STATE="${CYS_RC_L3#env_role=}" ;;
@@ -102,16 +111,76 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     case "$CYS_RECLAIMED" in
       ''|*[!a-zA-Z0-9_-]*) CYS_RECLAIMED="" ;;
     esac
-    if [ -z "$CYS_ROLE" ] && [ -n "$CYS_RECLAIMED" ]; then
-      CYS_ROLE="$CYS_RECLAIMED"
-      export CYS_ROLE
-      echo "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
-      echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
+    # ── ★(0.14.31 · 리뷰 R2 · blocking ×2) 채택 규칙: **데몬의 답이 이긴다** ──────────────
+    # 종전 규칙은 `role=` 을 `CYS_ROLE` 이 **비어 있을 때만** 채택하고, 그렇지 않으면
+    # `env_role=other_live` 하나만 보고 강등했다. 두 리뷰어가 각각 그 규칙의 반례를 실행으로
+    # 재현했다(2026-09-08):
+    #   ① 데몬이 `role=cso/reason=bound` 로 **결합을 커밋**했는데(그 커밋은 `CYS_ROLE` 을 보지
+    #      않는다 — `reclaim_commit`), 훅은 `CYS_ROLE=worker` 가 비어 있지 않다는 이유로 그 답을
+    #      버리고 **worker 지침**을 주입했다. 데몬과 세션이 서로 다른 역할을 믿는다.
+    #   ② worker 중복제거로 이 좌석이 정당하게 `worker-2` 를 쥐고 있고(`CYS_ROLE=worker` 는
+    #      stale), 데몬이 `role=worker-2/env_role=other_live` 로 답했는데, 훅은 그 답을 버리고
+    #      `other_live` 만 보고 **강등**했다 — 살아 있는 역할 좌석이 지침 0(치명위험 ③).
+    # 그래서 규칙을 하나로 접는다: **`role=` 이 비어 있지 않으면 그것이 이 좌석의 역할이다.**
+    #   ⓐ 채택 — `CYS_ROLE` 이 비었으면 복구, 값이 다르면 **교정**(둘 다 데몬 권위 채택이다).
+    #   ⓑ 강등 — `role=` 이 **비어 있고**(데몬이 "이 좌석은 무역할"이라고 답했고) 신고한
+    #      `CYS_ROLE` 을 **다른 살아있는 좌석**이 쥐었을 때(`env_role=other_live`)만.
+    #      두 조건을 AND 로 묶는 이유: 어느 한쪽만으로 내리면 경합 한 번에 정당한 좌석이
+    #      지침을 잃는다(적대검증 R1 에서 이미 확인한 방향).
+    # 실패는 여전히 한 방향이다 — 판정을 못 받으면(`role=` 빈 값 + `env_role=unknown`) 아무
+    # 것도 하지 않는다.
+    if [ -n "$CYS_RECLAIMED" ]; then
+      if [ -z "$CYS_ROLE" ]; then
+        CYS_ROLE="$CYS_RECLAIMED"
+        export CYS_ROLE
+        echo "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
+        echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
+      elif [ "$CYS_RECLAIMED" != "$CYS_ROLE" ]; then
+        echo "■ 고지: 역할 교정 — env CYS_ROLE 은 '$CYS_ROLE' 이지만 데몬 권위 역할은 '$CYS_RECLAIMED' 이다."
+        echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다(env 는 승계·중복제거 뒤 갱신되지 않는다)."
+        echo "  아래 지침은 '$CYS_RECLAIMED' 의 것이다 — env 값이 아니라 이 값으로 행동하라."
+        CYS_ROLE="$CYS_RECLAIMED"
+        export CYS_ROLE
+      fi
     elif [ -n "$CYS_ROLE" ] && [ "$CYS_ENV_ROLE_STATE" = "other_live" ]; then
       # 강등은 **디렉티브 선택 앞**에서 결정하고, 실제 문안은 아래 매핑 뒤에서 낸다
       # (역할군을 알아야 인계 안내가 정확하다).
       CYS_DEMOTE_ROLE="$CYS_ROLE"
     fi
+    # ── ★(R2 · codex minor) 무결합 사유 중 **사람이 할 일이 있는 것**만 한 줄로 옮긴다 ──
+    # 종전에는 둘째 줄(`reason=`)을 읽지 않고 stderr 도 버려서, "왜 역할이 안 붙었는지"와
+    # "무엇을 하면 되는지"가 세션 어디에도 남지 않았다. 사유 전부를 떠드는 것이 아니라
+    # **처방이 있는 둘**만 옮긴다(나머지는 조용한 무결합이 정답이다 — 잡음은 지침을 밀어낸다).
+    # ★(R2 · codex major) 데몬이 **판정을 해서** "이 좌석은 무역할"이라고 답했는데 env 에는
+    #   역할이 남아 있고 그 역할의 주인이 없는 경우(vacant·other_exited): 종전대로 지침은
+    #   주입하되(지침 없는 좌석을 새로 만들지 않는다 — 치명위험 ③) **등록되지 않았다는 사실**을
+    #   숨기지 않는다. 이 좌석의 `cys` 명령들은 역할 권한을 못 받는다.
+    #   ★master|cso 는 아래 재대조(`cys claim-role`)가 그 자리에서 등록하므로 제외한다.
+    if [ -z "$CYS_RECLAIMED" ] && [ -n "$CYS_ROLE" ] && [ -n "$CYS_RC_REASON" ]; then
+      case "$CYS_ENV_ROLE_STATE" in
+        vacant|other_exited)
+          case "$CYS_ROLE" in
+            master|cso) ;;
+            *)
+              echo "■ 고지: 데몬 레지스트리에 이 좌석의 역할 등록이 없다(env CYS_ROLE=$CYS_ROLE · 그 역할은 비어 있다)."
+              echo "  지침은 아래에 주입하지만, 역할 권한·역할 배달은 등록 전까지 이 좌석에 오지 않는다 —"
+              echo "  역할로 행동하려면 \`cys claim-role $CYS_ROLE\` 로 등록하라."
+              ;;
+          esac
+          ;;
+      esac
+    fi
+    case "$CYS_RC_REASON" in
+      privileged_needs_optin)
+        echo "■ 고지: 같은 계정·같은 폴더에 **특권 역할(master·cso)의 빈 좌석**이 있다."
+        echo "  자동 복구는 특권 역할을 옮기지 않는다(사람의 명시가 필요하다)."
+        echo "  이 좌석이 그 역할을 이어받아야 한다면: \`cys reclaim-role --auto --takeover-empty-seat\`"
+        ;;
+      caller_axes_unknown)
+        echo "■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다."
+        echo "  역할이 필요하면 \`cys claim-role <역할>\` 로 직접 등록하라."
+        ;;
+    esac
   fi
 fi
 

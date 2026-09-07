@@ -485,6 +485,21 @@ fn reclaim_live_snapshot(
         .collect()
 }
 
+/// 두 경로가 **파일시스템에서 같은 디렉터리**인가 — 심링크·상대표기 차이를 여기서만 접는다.
+///
+/// 문자열 정규화(`reclaim::norm_path`)는 표기를 **넓게 접지 않는다**(다른 디렉터리를 같다고
+/// 말하지 않기 위해서다). 그러나 같은 디렉터리가 두 이름을 갖는 경우가 실제로 있다:
+/// macOS 의 `/tmp` → `/private/tmp`, 사용자 홈이 심링크인 설치 등. 데몬은 좌석 생성 표기를
+/// 기록하고 프로세스는 해소된 표기를 보고하므로, 그 둘을 문자열로만 비교하면 **같은 pane 의
+/// 두 표기**가 어긋난다. 판정 자체는 순수 함수가 갖고, 이 함수는 **좁히기 값을 고를 때만**
+/// 쓰인다(락 밖 · 실패하면 접지 않는다 = 안전 방향).
+fn same_dir_on_disk(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// 호출 좌석의 **데몬 권위** 역할 — `surface.role` 과 `roles[role] == sid` 가 **둘 다** 맞을 때만
 /// 역할로 인정한다.
 ///
@@ -571,13 +586,20 @@ fn finalize_agent_meta_after_role_change(
 ///      좌석을 가리킨다). 자동 경로가 그 문을 쓰면 새 신호로 기존 게이트를 면제하는 셈이 된다.
 /// 그래서 **승계 마무리는 claim_role 과 같은 규약으로 여기서 수행하되**, 프로브·재검증 술어는
 /// governance 의 공용 함수(`seat_claimable_now`·`seat_takeover_recheck`)를 그대로 쓴다.
+#[allow(clippy::too_many_arguments)]
 fn reclaim_commit(
     daemon: &Arc<Daemon>,
     caller_sid: u64,
     role: &str,
     from_surface: u64,
-    caller_cfg: &str,
-    caller_cwd: &str,
+    // ★(R2) 재검증 축은 **데몬 지식**이다(신고값은 좁히기만 — `reclaim::is_candidate` doc).
+    axes: &crate::reclaim::CallerAxes<'_>,
+    allow_privileged: bool,
+    // ★(R2 · codex major) 클라이언트가 포기하며 남긴 취소 표식. 임계영역 안에서 본다.
+    attempt_id: Option<&str>,
+    // ★(R2 · codex major) **단조** 커밋 데드라인 — 서버가 수신 시각에 남은 예산을
+    //   `Instant` 로 환산한 값. 벽시계가 뒤로 점프해도 예산이 되살아나지 않는다.
+    mono_deadline: Option<std::time::Instant>,
     // ★서버측 커밋 데드라인(적대검증 R1 major·blocking). 클라이언트가 포기한 뒤면
     //   **아무것도 바꾸지 않는다**: 훅은 그 시점에 이미 `role=`(역할 없음)을 채택했고,
     //   그 뒤에 데몬이 역할과 큐를 옮기면 **그 사실을 아무도 모르는 승계**가 된다.
@@ -588,9 +610,14 @@ fn reclaim_commit(
     //   `None` = 예산 미지정(구 CLI) → 종전대로 검사 없음.
     deadline_epoch: Option<f64>,
 ) -> Result<String, &'static str> {
-    let expired =
-        |d: &Option<f64>| d.is_some_and(|t| crate::state::now_epoch() >= t);
-    if expired(&deadline_epoch) {
+    // ★만료 판정은 **두 시계의 OR** 다(적대검증 R2 · codex major): 벽시계 절대 데드라인은
+    //   앞으로 점프한 시계를 잡고, 단조 예산은 **뒤로 점프한** 시계를 잡는다. 어느 하나라도
+    //   지났으면 커밋하지 않는다 — 늦은 승계는 아무도 모르는 승계다.
+    let expired = |d: &Option<f64>, m: &Option<std::time::Instant>| {
+        d.is_some_and(|t| crate::state::now_epoch() >= t)
+            || m.is_some_and(|t| std::time::Instant::now() >= t)
+    };
+    if expired(&deadline_epoch, &mono_deadline) {
         return Err("deadline_exceeded");
     }
     // ★락 밖 프로브(전 프로세스 표 refresh) — claim_role 과 동일 규율. 락을 쥔 채 수십 ms 를
@@ -627,7 +654,7 @@ fn reclaim_commit(
         let fresh = reclaim_live_snapshot(&surfaces);
         let hits: Vec<&crate::reclaim::LiveEntry> = fresh
             .iter()
-            .filter(|e| crate::reclaim::is_candidate(e, caller_sid, caller_cfg, caller_cwd, now))
+            .filter(|e| crate::reclaim::is_candidate(e, axes, now, allow_privileged))
             .collect();
         if hits.len() != 1 || hits[0].surface_id != from_surface || hits[0].role != role {
             return Err("raced_candidate_changed");
@@ -657,8 +684,17 @@ fn reclaim_commit(
         }
         // ★재검증 ⑤: **데드라인**. 락을 얻기까지의 대기까지 포함해 예산을 다시 잰다 —
         //   여기를 지나면 첫 변경이 일어나므로, '늦은 커밋'을 막을 수 있는 마지막 지점이다.
-        if expired(&deadline_epoch) {
+        if expired(&deadline_epoch, &mono_deadline) {
             return Err("deadline_exceeded");
+        }
+        // ★재검증 ⑥: **취소 펜싱**(적대검증 R2 · codex major). 클라이언트가 예산 만료로
+        //   포기하면서 `reconcile{cancel_attempt}` 로 이 시도를 취소했을 수 있다. 데드라인
+        //   검사만으로는 시계 이상·디스패치 지연의 조합을 전부 막지 못하므로, "그 클라이언트가
+        //   더 이상 이 결과를 기다리지 않는다"는 **명시 사실**을 마지막 관문으로 둔다.
+        if let Some(aid) = attempt_id {
+            if daemon.reclaim_cancelled.lock().unwrap().contains_key(aid) {
+                return Err("attempt_cancelled");
+            }
         }
         // ── 커밋(claim_role 승계 마무리와 동형) ────────────────────────────────
         // 역할명은 **후보의 그것 그대로** 쓴다(worker dedup 없음): 우리는 새 역할을 만드는 게
@@ -766,30 +802,84 @@ fn reclaim_auto(
     // ★(R1) **읽기 전용 조정 모드**: 왕복이 실패한 클라이언트가 "데몬이 결국 결합했는가"를
     //   확인하는 유일한 안전 경로다. 어떤 상태도 바꾸지 않고 권위 역할만 돌려준다 — 재시도가
     //   그 자체로 두 번째 결합이 되는 것을 막는다.
+    //   ★(R2) 여기서 `cancel_attempt` 를 함께 받는다: 클라이언트가 포기했다는 **사실**은
+    //   상태가 아니라 **펜싱 표식**이고, 그것을 남기지 않으면 버려진 요청이 나중에 조용히
+    //   커밋한다(codex 적대검증 R2). 원장은 유계(TTL·lazy GC)이며 역할·큐를 건드리지 않으므로
+    //   이 arm 은 여전히 "역할 상태 무변경"이다.
     if params.get("reconcile").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let cancelled = param_str(params, "cancel_attempt")
+            .filter(|v| !v.trim().is_empty() && v.len() <= 128);
+        if let Some(aid) = cancelled.clone() {
+            let now = crate::state::now_epoch();
+            let mut g = daemon.reclaim_cancelled.lock().unwrap();
+            g.retain(|_, ts| now - *ts < crate::state::CREATE_IDEM_TTL_SECS);
+            g.insert(aid, now);
+        }
+        // ★취소 기록 **뒤에** 권위 역할을 다시 읽는다(codex 적대검증 R2 blocking — 선형화).
+        //   순서를 뒤집으면 이런 교차가 성립한다: reconcile 이 "역할 없음"을 읽음 → 원 요청이
+        //   커밋 → reconcile 이 취소를 기록하고 **낡은 '없음'** 을 답한다 → 훅은 무역할로
+        //   진행하는데 데몬에는 역할이 있다(치명위험 ③).
+        //   지금 순서에서는 두 경우뿐이다: ⓐ 취소가 커밋의 펜스 검사(임계영역 안)보다 먼저면
+        //   커밋이 취소되고 우리는 '없음'을 답한다(참) ⓑ 펜스 검사가 먼저면 커밋은 roles 락을
+        //   **쥔 채** 역할을 넣으므로, 그 락을 요구하는 아래 재조회는 반드시 그 뒤에 일어나
+        //   새 역할을 본다(참). 어느 쪽도 거짓말하지 않는다.
+        let role_after_cancel = caller_sid.and_then(|sid| reclaim_authoritative_role(daemon, sid));
         return Reply::Single(ok_response(
             id,
-            json!({"role": caller_role, "reason": "reconciled", "surface_id": caller_sid,
+            json!({"role": role_after_cancel, "reason": "reconciled", "surface_id": caller_sid,
+                   "cancelled_attempt": cancelled,
                    "env_role_state": reclaim_env_role_state(daemon, caller_sid, &env_role)}),
         ));
     }
     // 클라이언트가 정한 **절대** 데드라인(epoch 초). 서버는 이것을 커밋 데드라인으로 쓴다.
     // (상대 예산이면 디스패치 대기 시간이 예산에서 빠지지 않아 '늦은 커밋'을 못 막는다.)
     let deadline_epoch = params.get("deadline_epoch").and_then(|v| v.as_f64()).filter(|t| *t > 0.0);
-    // ★신고 축 인증의 대조값 — 데몬이 **호출 좌석에 대해 스스로 아는** 두 값.
-    //   좌석이 자칭할 수 없다(근거는 `reclaim::decide` 의 게이트 주석).
+    // ★(R2) 같은 예산을 **단조 시계로도** 잡아 둔다: 벽시계가 뒤로 점프하면 위 절대 데드라인은
+    //   되살아나지만(그 창에서 '늦은 커밋'이 성립한다 — codex 적대검증 R2), 이 값은 수신
+    //   시각에 고정된 `Instant` 라 되살아나지 않는다. 둘 중 하나라도 지나면 커밋하지 않는다.
+    // ★상한은 **클라이언트가 선언한 총예산**으로 자른다(codex 적대검증 R2 major): 벽시계가
+    //   *수신 전에* 뒤로 점프하면 `deadline - now` 가 원래 예산보다 커져서, 환산만으로는 예산이
+    //   되살아난다. 클라이언트가 어차피 그보다 오래 기다리지 않으므로 그 값이 상한이다.
+    let client_budget = params
+        .get("budget_secs")
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0);
+    let mono_deadline = deadline_epoch.map(|t| {
+        let mut remaining = (t - crate::state::now_epoch()).max(0.0);
+        if let Some(b) = client_budget {
+            remaining = remaining.min(b);
+        }
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(remaining)
+    });
+    // 시도 식별자 — 클라이언트가 포기하며 취소할 대상. 없으면 펜싱 없이 종전대로 동작한다.
+    let attempt_id = param_str(params, "attempt_id").filter(|v| !v.trim().is_empty() && v.len() <= 128);
+    // ★(R2 · claude major) 특권 역할(master·cso) 빈좌석 승계의 **명시 opt-in**. `claim_role` 의
+    //   `takeover_empty_seat` 와 **같은 이름·같은 뜻**이고, 훅은 이것을 절대 넘기지 않는다
+    //   (자동 경로가 특권 전이를 부수효과로 일으키지 않는다 — 정본 §8).
+    let allow_privileged = params
+        .get("takeover_empty_seat")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // ★인증 축 — 데몬이 **호출 좌석에 대해 스스로 아는** 두 값. 좌석이 자칭할 수 없다
+    //   (근거는 `reclaim::is_candidate` 의 doc).
     //   · config dir: surface.create 가 해소해 기록한 값.
     //   · cwd: 좌석 셸 pid 의 **실제 작업 디렉터리**(`surface.list` 의 `live_cwd` 와 같은 관측 —
-    //     OS 가 답한 사실이라 `cd` 를 따라간다). 못 읽는 기계(Windows 등)에서는 좌석 생성 cwd 로
-    //     접힌다. 조회는 블로킹 syscall 이라 **어떤 락도 쥐지 않은 지점**에서 한다(surface.list
-    //     와 같은 규율).
+    //     OS 가 답한 사실이라 `cd` 를 따라간다) + 좌석 생성 cwd. 못 읽는 기계(Windows 등)에서는
+    //     생성 cwd 하나로 접힌다. 조회는 블로킹 syscall 이라 **어떤 락도 쥐지 않은 지점**에서
+    //     한다(surface.list 와 같은 규율).
     let caller_seat = caller_sid.and_then(|sid| daemon.get_surface(sid));
-    let caller_known_cfg =
-        caller_seat.as_ref().and_then(|s| s.claude_config_dir.lock().unwrap().clone());
-    // 대조 집합은 **둘**이다: 좌석 셸의 지금 cwd(cd 추적)와 좌석 생성 cwd. 둘 다 데몬이 아는
-    // 사실이고 공격자가 고를 수 없으므로 인증 강도는 같으면서, 사람이 pane 을 띄운 뒤
-    // 프로젝트로 `cd` 한 정상 시나리오를 죽이지 않는다(근거는 `reclaim::decide` 게이트 주석).
-    let caller_known_cwds: Vec<String> = caller_seat
+    // 계정 dir 은 **출처가 데몬일 때만** 축이 된다(§Surface.config_dir_trusted). 신뢰할 수 없는
+    // 좌석은 축 미확정으로 접혀 `caller_axes_unknown` 무결합이 된다(fail-closed).
+    let caller_known_cfg = caller_seat.as_ref().and_then(|s| {
+        s.config_dir_trusted
+            .then(|| s.claude_config_dir.lock().unwrap().clone())
+            .flatten()
+    });
+    // ★(R2 · codex blocking) cwd 는 **집합이 아니라 우선순위**다: 지금의 cwd 를 읽을 수 있으면
+    //   그것 하나이고, 못 읽는 기계(ConPTY·권한 제약)에서만 좌석 생성 cwd 로 접힌다. 집합으로
+    //   받으면 `/proj/A` 에서 태어나 `cd /proj/B` 한 pane 이 A 의 빈 좌석을 가져간다(사람은 B 에
+    //   있는데 A 의 역할·큐가 온다).
+    let (caller_known_cwds, caller_live_cwd): (Vec<String>, Option<String>) = caller_seat
         .as_ref()
         .map(|s| {
             let pid = sysinfo::Pid::from_u32(s.pid);
@@ -802,18 +892,77 @@ fn reclaim_auto(
             let live = sys
                 .process(pid)
                 .and_then(|p| p.cwd())
-                .map(|p| p.display().to_string());
-            let mut v = vec![s.cwd.clone()];
-            if let Some(l) = live {
+                .map(|p| p.display().to_string())
+                .filter(|c| !c.trim().is_empty());
+            let mut known = vec![s.cwd.clone()];
+            if let Some(l) = live.clone() {
                 if l != s.cwd {
-                    v.push(l);
+                    known.push(l);
                 }
             }
-            v
+            known.retain(|c| !c.trim().is_empty());
+            (known, live)
         })
         .unwrap_or_default();
-    let cfg = param_str(params, "claude_config_dir").or_else(|| param_str(params, "config"));
-    let cwd = param_str(params, "cwd");
+    // ★신고 축은 **진단**이다(판정 입력 아님 — R2). 훅이 넘긴 값과 데몬이 아는 값이 어긋나는
+    //   것 자체는 정상일 수 있다(사용자가 자기 `CLAUDE_CONFIG_DIR` 을 export 한 경우 등).
+    //   그 사실을 응답에 실어 운영자가 볼 수 있게만 한다 — 그것으로 결합을 막으면 기본 설치의
+    //   주 경로가 통째로 죽는다(claude 적대검증 R2 major).
+    let reported_cfg = param_str(params, "claude_config_dir").or_else(|| param_str(params, "config"));
+    let reported_cwd = param_str(params, "cwd").filter(|v| !v.trim().is_empty());
+    // ★좁히기 값(§CallerAxes.narrow_cwd) — 후보는 **반드시** 이 값과 같아야 한다. 우선순위는
+    //   ①훅이 신고한 `$PWD`(사람이 지금 있는 프로젝트) ②좌석 셸의 실제 cwd ③좌석 생성 cwd.
+    //   신고가 없어도 넓어지지 않는다: 다음 순위가 그 자리를 채운다(fail-closed).
+    let created_cwd = caller_seat.as_ref().map(|s| s.cwd.as_str()).filter(|c| !c.trim().is_empty());
+    let (narrow_cwd, cwd_source): (Option<&str>, &'static str) =
+        match (reported_cwd.as_deref(), caller_live_cwd.as_deref(), created_cwd) {
+            (Some(r), _, _) => (Some(r), "reported"),
+            // ★같은 디렉터리의 **다른 표기**를 '다른 디렉터리'로 읽지 않는다(실측: macOS 의
+            //   `/tmp` → `/private/tmp` 심링크. 데몬은 생성 표기를, 프로세스는 해소된 표기를
+            //   보고한다). 파일시스템에 직접 물어 같은 곳이면 **기록 표기**를 쓴다 — 좌석들의
+            //   `cwd` 가 그 표기로 적혀 있기 때문이다. 정말 다른 곳이면(사람이 `cd` 했다) 지금
+            //   값을 써서 **좁힌다**(codex 적대검증 R2 blocking). 이 두 syscall 은 어떤 락도
+            //   쥐지 않은 지점에서 돈다.
+            (None, Some(l), Some(c)) if same_dir_on_disk(l, c) => (Some(c), "created"),
+            (None, Some(l), _) => (Some(l), "live"),
+            (None, None, Some(c)) => (Some(c), "created"),
+            _ => (None, "unknown"),
+        };
+    let axis_state = |reported: Option<&str>, known: &[String]| -> &'static str {
+        match reported.map(|r| r.trim()).filter(|r| !r.is_empty()) {
+            None => "absent",
+            Some(r) => {
+                if known.iter().any(|k| {
+                    !k.trim().is_empty() && crate::reclaim::norm_path(k) == crate::reclaim::norm_path(r)
+                }) {
+                    "match"
+                } else {
+                    "differ"
+                }
+            }
+        }
+    };
+    // 진단의 config 축은 **기록값과** 대조한다(신뢰 여부와 무관하게 "무엇이 적혀 있는가"를
+    // 말해야 한다). 신뢰 여부는 별도 키로 싣는다 — 둘을 섞으면 값이 같은데 `differ` 로 보인다.
+    let caller_recorded_cfg =
+        caller_seat.as_ref().and_then(|s| s.claude_config_dir.lock().unwrap().clone());
+    let reported_axes = json!({
+        "config": axis_state(
+            reported_cfg.as_deref(),
+            caller_recorded_cfg.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
+        ),
+        "config_trusted": caller_seat.as_ref().map(|s| s.config_dir_trusted),
+        "cwd": axis_state(reported_cwd.as_deref(), &caller_known_cwds),
+        "cwd_source": cwd_source,
+    });
+    // 인증 축 묶음 — 호출 좌석을 해석하지 못했으면 축 자체가 없다(`CallerUnresolved`).
+    let axes = caller_sid.map(|sid| crate::reclaim::CallerAxes {
+        sid,
+        cfg: caller_known_cfg.as_deref(),
+        known_cwds: &caller_known_cwds,
+        narrow_cwd,
+        cwd_source,
+    });
     let snapshot_now = |daemon: &Arc<Daemon>| {
         let surfaces = daemon.surfaces.lock().unwrap();
         reclaim_live_snapshot(&surfaces)
@@ -821,24 +970,24 @@ fn reclaim_auto(
     // ── 1차 판정: **lease 를 잡지 않고** 후보만 본다 ─────────────────────────────
     // 이 pane 이 애초에 결합 후보가 없으면(대부분의 호출) phoenix 의 부활 lease 를 단 한 순간도
     // 건드리지 않는다 — 우리가 잡고 있는 찰나에 phoenix 가 들어오면 그쪽은 '다른 restore 진행'
-    // 으로 읽고 그 회차를 건너뛴다(가용성 대가). 그 대가는 **정말 결합할 때만** 지불한다.
+    // 으로 읽고 그 회차를 유계 재시도 뒤 건너뛴다(가용성 대가). 그 대가는 **정말 결합할 때만**
+    // 지불한다.
     let first = crate::reclaim::decide(
-        caller_sid,
         caller_role.as_deref(),
-        caller_known_cfg.as_deref(),
-        &caller_known_cwds,
-        cfg.as_deref(),
-        cwd.as_deref(),
+        axes.as_ref(),
         crate::state::now_epoch(),
         crate::reclaim::LeaseState::Free,
         &snapshot_now(daemon),
+        allow_privileged,
     );
     if !matches!(first, crate::reclaim::Decision::Bind { .. }) {
         let candidates = match &first {
             crate::reclaim::Decision::Ambiguous(roles) => Some(roles.clone()),
             _ => None,
         };
-        return no_bind_reply(daemon, id, caller_sid, first.reason(), candidates, &env_role);
+        return no_bind_reply(
+            daemon, id, caller_sid, first.reason(), candidates, &env_role, &reported_axes,
+        );
     }
     // ── 2차 판정: lease 를 **확보한 뒤 다시** 판정한다(이것이 최종 판정이다) ────────
     // 가드는 이 함수가 끝날 때까지 살아 있다 = 판정부터 커밋까지 phoenix 의 부활과 상호배제된다.
@@ -852,28 +1001,37 @@ fn reclaim_auto(
     //   역할을 얻었을 수 있고, 그때의 정답은 멱등 응답이지 결합이 아니다.
     let caller_role2 = caller_sid.and_then(|sid| reclaim_authoritative_role(daemon, sid));
     let decision = crate::reclaim::decide(
-        caller_sid,
         caller_role2.as_deref(),
-        caller_known_cfg.as_deref(),
-        &caller_known_cwds,
-        cfg.as_deref(),
-        cwd.as_deref(),
+        axes.as_ref(),
         crate::state::now_epoch(),
         lease_state,
         &snapshot_now(daemon),
+        allow_privileged,
     );
     let reason = decision.reason();
     match decision {
         crate::reclaim::Decision::Bind { role, from_surface } => {
-            // `caller_sid`·`cfg`·`cwd` 는 Bind 판정이 성립한 시점에 전부 Some 이다.
-            let (Some(sid), Some(c), Some(w)) = (caller_sid, cfg.as_deref(), cwd.as_deref()) else {
-                return no_bind_reply(daemon, id, caller_sid, "caller_env_missing", None, &env_role);
+            // `caller_sid`·`axes` 는 Bind 판정이 성립한 시점에 둘 다 Some 이다.
+            let (Some(sid), Some(ax)) = (caller_sid, axes.as_ref()) else {
+                return no_bind_reply(
+                    daemon, id, caller_sid, "caller_unresolved", None, &env_role, &reported_axes,
+                );
             };
-            match reclaim_commit(daemon, sid, &role, from_surface, c, w, deadline_epoch) {
+            match reclaim_commit(
+                daemon,
+                sid,
+                &role,
+                from_surface,
+                ax,
+                allow_privileged,
+                attempt_id.as_deref(),
+                mono_deadline,
+                deadline_epoch,
+            ) {
                 Ok(bound) => Reply::Single(ok_response(
                     id,
                     json!({"role": bound, "reason": "bound", "surface_id": sid,
-                           "prev_surface": from_surface,
+                           "prev_surface": from_surface, "reported_axes": reported_axes,
                            "env_role_state": reclaim_env_role_state(daemon, caller_sid, &env_role)}),
                 )),
                 Err(why) => {
@@ -884,14 +1042,14 @@ fn reclaim_auto(
                         Some(sid),
                         json!({"role": role, "candidate_surface": from_surface, "reason": why}),
                     );
-                    no_bind_reply(daemon, id, caller_sid, why, None, &env_role)
+                    no_bind_reply(daemon, id, caller_sid, why, None, &env_role, &reported_axes)
                 }
             }
         }
         crate::reclaim::Decision::Ambiguous(roles) => {
-            no_bind_reply(daemon, id, caller_sid, reason, Some(roles), &env_role)
+            no_bind_reply(daemon, id, caller_sid, reason, Some(roles), &env_role, &reported_axes)
         }
-        _ => no_bind_reply(daemon, id, caller_sid, reason, None, &env_role),
+        _ => no_bind_reply(daemon, id, caller_sid, reason, None, &env_role, &reported_axes),
     }
 }
 
@@ -900,8 +1058,12 @@ fn reclaim_auto(
 /// ★왜 다시 읽는가(codex 적대검증 R1 blocking): 판정 시점의 "역할 없음"은 응답이 훅에 닿을
 /// 때까지 참이라는 보장이 없다. 그 사이 호출 좌석이 역할을 얻었는데 우리가 낡은 `role=`(없음)을
 /// 내면, 훅은 살아 있는 역할 좌석에 지침을 주지 않는다(치명위험 ③). 창을 0 으로 만들 수는
-/// 없지만, **응답을 만드는 마지막 순간**까지 좁힌다. 강등 판정 자체는 이 값이 아니라
-/// `env_role_state`(다른 산 좌석이 쥐었는가)가 지므로, 이 재조회는 '보수적 보강'이다.
+/// 없지만, **응답을 만드는 마지막 순간**까지 좁힌다.
+///
+/// ★(R2 · claude minor) 그러나 **사유는 덮지 않는다**. 종전에는 역할이 보이면 `reason` 을
+/// 무조건 `already_roled` 로 바꿔서, `deadline_exceeded`·`raced_holder_changed` 로 **취소된
+/// 사실**이 운영자 대면 문안에서 사라졌다(감사 이벤트에만 남았다). 역할은 최신값으로, 사유는
+/// 있었던 그대로 — 둘은 다른 축이다.
 fn no_bind_reply(
     daemon: &Arc<Daemon>,
     id: &Value,
@@ -909,14 +1071,16 @@ fn no_bind_reply(
     reason: &str,
     candidates: Option<Vec<String>>,
     env_role: &str,
+    reported_axes: &Value,
 ) -> Reply {
     let now_role = caller_sid.and_then(|sid| reclaim_authoritative_role(daemon, sid));
     let env_state = reclaim_env_role_state(daemon, caller_sid, env_role);
     let mut body = json!({
         "role": now_role.clone(),
-        "reason": if now_role.is_some() { "already_roled" } else { reason },
+        "reason": reason,
         "surface_id": caller_sid,
         "env_role_state": env_state,
+        "reported_axes": reported_axes.clone(),
     });
     if let (Some(c), None) = (candidates, now_role) {
         body["candidates"] = json!(c);
@@ -3666,6 +3830,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 false,
                 sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
             );
+            // ★생성자 원장 스냅샷은 **surfaces 락을 잡기 전에** 뜬다 — `create_owner` 는 리프
+            //   락이고 그 규약은 "surfaces/roles 를 쥔 채 잡지 않는다"이다(§creator_rollback_ok).
+            //   락 순서 계약을 조회 편의로 어기지 않는다(AB-BA 는 한 번 생기면 무음으로 굳는다).
+            let create_owners = daemon.create_owner.lock().unwrap().clone();
             let surfaces = daemon.surfaces.lock().unwrap();
             let mut list: Vec<Value> = surfaces
                 .values()
@@ -3707,6 +3875,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         )
                         .as_str(),
                         "env_injected": s.env_injected, // RC-3 잔여(T2.1): node-recover 안전판정용
+                        // ★(0.14.31 · WP-4 R2 · codex blocking) **생성자 좌석** — 이 좌석을 만든
+                        // `surface.create` 의 호출자가 어느 pane 이었나(데몬이 발신 pid 로 도출해
+                        // `create_owner` 원장에 기록한 값 · 호출자가 신고할 수 없다 · TTL 120s
+                        // 뒤 null). GUI 부서 전출이 "내가 방금 보낸 `cys launch-agent` 가 만든
+                        // 좌석"을 **증명**하는 유일한 축이다: 종전에는 "런치 뒤에 나타난 같은
+                        // 역할 좌석"만 봤는데, 그것은 그 전출의 결과라는 증거가 아니라서 동시에
+                        // 다른 경로가 띄운 좌석에 인계를 적재하고 원본을 닫을 수 있었다.
+                        // 부재(null)는 '모름'이지 '아님'이 아니다 — 소비자는 null 에서 확정하지
+                        // 않는다(fail-closed).
+                        "created_by": create_owners
+                            .get(&s.id)
+                            .filter(|(_, ts)| {
+                                crate::state::now_epoch() - *ts
+                                    < crate::state::CREATE_IDEM_TTL_SECS
+                            })
+                            .map(|(creator, _)| *creator),
                         "claude_config_dir": s.claude_config_dir.lock().unwrap().clone(), // (W1) node-recover resume 게이트용
                         "agent": agent,
                         "agent_alive": agent_alive,
@@ -7871,32 +8055,38 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"approved": false, "ttl_enforced": require_ttl}),
                 ));
             };
-            let mut records = crate::approval::load_records();
             let now_check_ttl = crate::state::now_epoch();
+            // ★(0.14.31 · R2 · codex major) 읽기-변경-쓰기를 **한 트랜잭션**으로 묶는다. 종전엔
+            //   스냅샷을 뜨고 한참 뒤 그 스냅샷 전체를 되써서, 그 사이 추가된 승인이 사라졌다
+            //   (갱신 손실 · 저장소가 둘로 나뉜 뒤에는 일반 검사가 TTL 파일까지 덮는다).
             // ★(0.14.31 · codex 적대검증) 갱신 대상은 **검증한 그 자리(인덱스)** 다. 종전처럼
             //   `id` 로 다시 찾으면, 같은 id 를 가진 **서명 무효 위조 레코드**를 앞에 끼워 넣은
             //   공격자가 검증받은 적 없는 그 레코드를 데몬 손으로 정당 서명시킬 수 있다(서명 세탁).
-            let hit = crate::approval::best_match_index_at(
-                &records,
-                &secret,
-                &command,
-                cwd.as_deref(),
-                &env,
-                now_check_ttl,
-                require_ttl,
-            )
-            .map(|i| {
-                (i, records[i].id.clone(), records[i].command_prefix.clone(), records[i].expires_at)
-            });
-            match hit {
-                Some((matched_idx, matched_id, matched_prefix, matched_expires_at)) => {
-                    // updated_at(lastUsed) 갱신 후 재서명·persist — 최장매칭 동률 tie-break 유지.
-                    // ★`expires_at` 은 손대지 않는다: 사용할 때마다 만료가 밀리면 TTL 이 아니다.
-                    if let Some(r) = records.get_mut(matched_idx) {
+            let (hit, _saved) = crate::approval::mutate_records(|records| {
+                let hit = crate::approval::best_match_index_at(
+                    records,
+                    &secret,
+                    &command,
+                    cwd.as_deref(),
+                    &env,
+                    now_check_ttl,
+                    require_ttl,
+                )
+                .map(|i| {
+                    (i, records[i].id.clone(), records[i].command_prefix.clone(), records[i].expires_at)
+                });
+                // updated_at(lastUsed) 갱신 후 재서명·persist — 최장매칭 동률 tie-break 유지.
+                // ★`expires_at` 은 손대지 않는다: 사용할 때마다 만료가 밀리면 TTL 이 아니다.
+                if let Some((matched_idx, _, _, _)) = &hit {
+                    if let Some(r) = records.get_mut(*matched_idx) {
                         r.updated_at = crate::state::now_epoch();
                         r.sign(&secret);
                     }
-                    let _ = crate::approval::save_records(&records);
+                }
+                hit
+            });
+            match hit {
+                Some((_matched_idx, matched_id, matched_prefix, matched_expires_at)) => {
                     daemon.bus.publish(
                         "autopilot.approval_checked",
                         "autopilot",
@@ -8052,9 +8242,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             rec.sign(&secret);
             let new_id = rec.id.clone();
             let new_expires_at = rec.expires_at;
-            let mut records = crate::approval::load_records();
-            records.push(rec);
-            if let Err(e) = crate::approval::save_records(&records) {
+            // ★(R2) 추가도 같은 트랜잭션을 탄다 — 다른 요청의 검사가 이 승인을 덮어쓰지 못한다.
+            let ((), saved) = crate::approval::mutate_records(move |records| {
+                records.push(rec);
+            });
+            if let Err(e) = saved {
                 return Reply::Single(err_response(&id, "persist_failed", &e));
             }
             // 감사: 서명 추적용으로 서명자 surface와 master 승계 시각을 함께 발행(벡터-9).
@@ -18440,8 +18632,30 @@ mod tests {
     // 빼앗아 라우팅·감시·큐를 끊는다(되돌릴 수 없는 조직 손상).
     // ══════════════════════════════════════════════════════════════════════════
 
+    /// **다른 계정** dir(음성 대조 전용) — 이 값으로 만든 좌석은 호출자와 계정 축이 갈린다.
     const RC_CFG: &str = "/tmp/cys-test-account-hub";
     const RC_CWD: &str = "/tmp/cys-test-proj";
+
+    /// ★(R2) 호출 좌석의 **신뢰 계정 dir** — 데몬이 자기 env 로 해소하는 그 값이다.
+    /// 이 값이 아니면 `Surface.config_dir_trusted=false` 라 reclaim 이 호출자로 인정하지 않는다
+    /// (기록을 호출자가 정할 수 있으면 인증이 아니다 — codex 적대검증 R2 blocking).
+    fn rc_cfg() -> String {
+        cys::resolve_claude_config_dir()
+    }
+
+    /// 데몬이 호출 좌석에 대해 아는 축(테스트 대역) — `reclaim_commit` 재검증에 그대로 넘긴다.
+    fn rc_axes(sid: u64) -> crate::reclaim::CallerAxes<'static> {
+        // 테스트 수명 동안만 사는 값이 필요해 leak 한다(검체 프로세스 종료로 회수).
+        let cfg: &'static str = Box::leak(rc_cfg().into_boxed_str());
+        static KNOWN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        crate::reclaim::CallerAxes {
+            sid,
+            cfg: Some(cfg),
+            known_cwds: KNOWN.get_or_init(|| vec![RC_CWD.to_string()]),
+            narrow_cwd: Some(RC_CWD),
+            cwd_source: "reported",
+        }
+    }
 
     /// 락 밖 프로브와 임계영역 사이에 경합을 주입한 채 `body` 를 돌린다(이음매는
     /// `reclaim::race_seam` — 그 파일에 있는 이유는 그 함수의 doc 참조).
@@ -18516,13 +18730,18 @@ mod tests {
     }
 
     /// 역할을 쥔 **빈 좌석**을 만든다(seat_cache=Empty · agent_meta 없음).
+    /// 역할을 쥔 **빈 좌석**을 만든다. `cfg=None` = 데몬이 스스로 해소한 계정 dir(호출자와 같은
+    /// 계정) · `Some(_)` = 명시 오버라이드(다른 계정 · 음성 대조용).
+    /// ★cwd 는 **실제로 만든다** — 데몬은 좌석 셸의 *실제* cwd 를 축으로 쓰므로(R2), 존재하지
+    ///   않는 디렉터리로 스폰하면 그 축이 셸 폴백값이 되어 검체가 사실을 재지 못한다.
     fn reclaim_seat(
         daemon: &Arc<Daemon>,
         role: &str,
         cwd: &str,
-        cfg: &str,
+        cfg: Option<&str>,
         env_injected: bool,
     ) -> u64 {
+        let _ = std::fs::create_dir_all(cwd);
         let env: Vec<(String, String)> = if env_injected {
             vec![("CYS_TEST_ENV".to_string(), "1".to_string())]
         } else {
@@ -18537,7 +18756,7 @@ mod tests {
                 24,
                 80,
                 &env,
-                Some(cfg.to_string()),
+                cfg.map(|c| c.to_string()),
             )
             .expect("create seat");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
@@ -18548,7 +18767,14 @@ mod tests {
     }
 
     /// 무역할 호출 좌석(사람이 손으로 띄운 pane 대역) + caller pid 바인딩.
-    fn reclaim_caller(daemon: &Arc<Daemon>, cwd: &str, cfg: &str, pid: u32) -> u64 {
+    /// ★계정 dir 은 **오버라이드하지 않는다** — 손으로 띄운 pane 이 그렇듯 데몬이 해소한 값이고,
+    ///   그래야 `config_dir_trusted` 가 서고 reclaim 이 이 좌석을 호출자로 인정한다(R2).
+    fn reclaim_caller(daemon: &Arc<Daemon>, cwd: &str, pid: u32) -> u64 {
+        // ★신생 좌석 유예를 이 스레드에서 0 으로 둔다 — 핸들러 검체는 **방금 만든** 좌석을
+        //   후보로 써야 하는데 `created_at` 은 뒤로 밀 수 없다(§reclaim::grace_secs).
+        //   유예 자체는 `reclaim_auto_excludes_freshly_spawned_seat` 가 **실제 값으로** 잰다.
+        crate::reclaim::tests::set_grace_secs(0.0);
+        let _ = std::fs::create_dir_all(cwd);
         let s = daemon
             .create_surface_with_env(
                 Some(cwd.to_string()),
@@ -18558,7 +18784,7 @@ mod tests {
                 24,
                 80,
                 &[],
-                Some(cfg.to_string()),
+                None,
             )
             .expect("create caller");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
@@ -18583,9 +18809,9 @@ mod tests {
     #[test]
     fn reclaim_auto_binds_single_candidate_and_demotes_old_seat() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_101_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         let resp = reclaim_ok(&daemon, pid);
         assert_eq!(resp["ok"], json!(true), "응답: {resp}");
         assert_eq!(resp["result"]["role"], json!("worker-2"), "응답: {resp}");
@@ -18620,10 +18846,10 @@ mod tests {
     #[test]
     fn reclaim_auto_ignores_other_account_dir_and_other_cwd() {
         let daemon = isolated_daemon();
-        reclaim_seat(&daemon, "cso", RC_CWD, "/tmp/cys-test-account-dept2", false);
-        reclaim_seat(&daemon, "reviewer-codex", "/tmp/cys-test-other-proj", RC_CFG, false);
+        reclaim_seat(&daemon, "cso", RC_CWD, Some("/tmp/cys-test-account-dept2"), false);
+        reclaim_seat(&daemon, "reviewer-codex", "/tmp/cys-test-other-proj", None, false);
         let pid = 970_102_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         let resp = reclaim_ok(&daemon, pid);
         assert_eq!(resp["result"]["role"], json!(null), "응답: {resp}");
         assert_eq!(resp["result"]["reason"], json!("no_candidate"));
@@ -18635,10 +18861,10 @@ mod tests {
     #[test]
     fn reclaim_auto_refuses_when_two_candidates() {
         let daemon = isolated_daemon();
-        let a = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
-        let b = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, RC_CFG, false);
+        let a = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
+        let b = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
         let pid = 970_103_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         let resp = reclaim_ok(&daemon, pid);
         assert_eq!(resp["result"]["role"], json!(null), "응답: {resp}");
         assert_eq!(resp["result"]["reason"], json!("ambiguous"));
@@ -18647,36 +18873,38 @@ mod tests {
         assert!(daemon.get_surface(me).unwrap().role.lock().unwrap().is_none());
     }
 
-    /// `env_injected=true` 인 갓 스폰된 좌석(=데몬이 방금 launch-agent 로 띄운 좌석)은 후보가
-    /// 아니다 — 에이전트가 아직 안 붙었을 뿐 빈 좌석이 아니다(기동 중 좌석 탈취 차단).
+    /// 갓 스폰된 좌석(=데몬이 방금 launch-agent 로 띄운 좌석)은 후보가 아니다 —
+    /// 에이전트가 아직 안 붙었을 뿐 빈 좌석이 아니다(기동 중 좌석 탈취 차단).
+    ///
+    /// ★(R2 재핀 · codex major) 종전 이름은 `..._env_injected_seat` 였고 유예도 `env_injected`
+    /// 좌석에만 걸렸다. 그 조건은 **unix launch 경로를 통째로 비껴간다**: `render_launch` 는
+    /// 환경을 인라인 명령에 넣고 `surface.create` 의 env 목록을 비워 보내므로 그 좌석은
+    /// `env_injected=false` 다 — 즉 실전에서 유예가 걸리는 좌석이 사실상 없었다. 이제 나이
+    /// 하나로 판정하므로 **두 값 모두**를 이 경로로 관통시킨다(핀을 넓혔다 = 안전 방향).
     #[test]
-    fn reclaim_auto_excludes_freshly_spawned_env_injected_seat() {
-        let daemon = isolated_daemon();
-        let fresh = reclaim_seat(&daemon, "cso", RC_CWD, RC_CFG, true);
-        let pid = 970_104_u32;
-        reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
-        let resp = reclaim_ok(&daemon, pid);
-        assert_eq!(resp["result"]["reason"], json!("no_candidate"), "응답: {resp}");
-        assert_eq!(daemon.roles.lock().unwrap().get("cso").copied(), Some(fresh));
-        // 유예를 넘긴 뒤에는 후보가 된다(created_at 을 과거로 밀어 같은 좌석을 재판정).
-        {
-            let surfaces = daemon.surfaces.lock().unwrap();
-            let s = surfaces.get(&fresh).unwrap();
-            // created_at 은 불변 필드가 아니라 생성 시각이므로 직접 못 바꾼다 — 대신 판정
-            // 순수함수로 같은 사실을 확인한다(핸들러 경로는 위에서 이미 통과).
-            let e = crate::reclaim::LiveEntry {
-                role: "cso".into(),
-                surface_id: s.id,
-                seat: "empty".into(),
-                env_injected: true,
-                created_at: crate::state::now_epoch() - crate::reclaim::NEW_SEAT_GRACE_SECS - 1.0,
-                cwd: Some(RC_CWD.into()),
-                claude_config_dir: Some(RC_CFG.into()),
-                exited: false,
-            };
-            assert!(
-                crate::reclaim::is_candidate(&e, 999, RC_CFG, RC_CWD, crate::state::now_epoch()),
-                "유예를 넘긴 env_injected 좌석이 영구 제외됐다"
+    fn reclaim_auto_excludes_freshly_spawned_seat() {
+        for injected in [true, false] {
+            let daemon = isolated_daemon();
+            let fresh = reclaim_seat(&daemon, "worker-2", RC_CWD, None, injected);
+            let pid = 970_104_u32 + u32::from(injected);
+            reclaim_caller(&daemon, RC_CWD, pid);
+            // ★유예를 **실제 값**으로 되돌린다(reclaim_caller 가 0 으로 두는 이음매를 여기서만
+            //   끈다) — 이 검체의 주제가 바로 그 유예다.
+            crate::reclaim::tests::set_grace_secs(crate::reclaim::NEW_SEAT_GRACE_SECS);
+            let resp = reclaim_ok(&daemon, pid);
+            assert_eq!(
+                resp["result"]["reason"],
+                json!("no_candidate"),
+                "유예 안 좌석이 후보가 됐다(env_injected={injected}): {resp}"
+            );
+            assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(fresh));
+            // 유예를 넘기면 같은 좌석이 후보가 된다(같은 경로·같은 좌석 · 시간만 흐른 것).
+            crate::reclaim::tests::set_grace_secs(0.0);
+            let resp2 = reclaim_ok(&daemon, pid);
+            assert_eq!(
+                resp2["result"]["reason"],
+                json!("bound"),
+                "유예를 넘긴 좌석이 영구 제외됐다(env_injected={injected}): {resp2}"
             );
         }
     }
@@ -18686,9 +18914,9 @@ mod tests {
     #[test]
     fn reclaim_auto_defers_while_restore_lease_is_held() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_105_u32;
-        reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        reclaim_caller(&daemon, RC_CWD, pid);
         // phoenix 대역: 같은 파일을 비차단 배타 락으로 잡고 놓지 않는다.
         let (st, guard) =
             crate::reclaim::try_hold_restore_lease(&crate::state::state_dir(&daemon.socket_path));
@@ -18708,9 +18936,9 @@ mod tests {
     #[test]
     fn reclaim_auto_is_idempotent_for_already_roled_caller() {
         let daemon = isolated_daemon();
-        let other = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let other = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_106_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         *daemon.get_surface(me).unwrap().role.lock().unwrap() = Some("cso".into());
         daemon.roles.lock().unwrap().insert("cso".into(), me);
         let resp = reclaim_ok(&daemon, pid);
@@ -18730,8 +18958,8 @@ mod tests {
     fn stale_surface_role_is_not_authoritative() {
         let daemon = isolated_daemon();
         let pid = 970_107_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
-        let winner = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, RC_CFG, false);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
+        let winner = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
         // 나에게만 stale 하게 남은 role 필드(맵은 winner 를 가리킨다)
         *daemon.get_surface(me).unwrap().role.lock().unwrap() = Some("reviewer-codex".into());
         assert_eq!(reclaim_authoritative_role(&daemon, me), None, "stale role 을 권위로 읽었다");
@@ -18741,29 +18969,56 @@ mod tests {
         );
     }
 
-    /// `--config`/`--cwd` 결측·빈 문자열은 대조 축 부재 → 무결합(fail-closed).
-    /// ★결측은 값이 아니다: 후보의 축도 없고 호출자의 축도 없을 때 `None == None` 으로
-    ///   일치 판정되면 아무 좌석이나 재결합된다.
+    /// ★(R2) 인증 축은 **데몬 지식**이다 — 신고가 비어 있어도 결합하고(unix 기본 설치의 주
+    /// 경로다: pane env 에 `CLAUDE_CONFIG_DIR` 가 없어 신고는 늘 빈 문자열이다), 데몬이 그
+    /// 좌석의 축을 모르면(계정 dir 출처가 신뢰되지 않음) **결합하지 않는다**(fail-closed).
+    ///
+    /// ★재핀 근거(종전 `reclaim_auto_requires_both_axes` 는 신고 결측을 무결합으로 못박았다):
+    /// 그 핀은 이 기능이 **기본 설치에서 절대 발화하지 않는다**는 사실을 박제하고 있었다
+    /// (claude 적대검증 R2 major). 핀의 뜻 — "축 없이 역할을 옮기지 않는다" — 는 그대로이고,
+    /// 축의 출처가 자기신고에서 데몬 지식으로 바뀐 것이다.
     #[test]
-    fn reclaim_auto_requires_both_axes() {
+    fn reclaim_auto_uses_daemon_known_axes_not_reported_ones() {
         let daemon = isolated_daemon();
-        reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_108_u32;
-        reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
-        for p in [
-            json!({}),
-            json!({"config": RC_CFG}),
-            json!({"cwd": RC_CWD}),
-            json!({"config": "", "cwd": RC_CWD}),
-            json!({"config": RC_CFG, "cwd": "   "}),
-        ] {
-            let resp = reclaim_rpc(&daemon, Some(pid), p.clone());
-            assert_eq!(
-                resp["result"]["reason"],
-                json!("caller_env_missing"),
-                "축 결측({p})인데 결합 판정이 진행됐다: {resp}"
-            );
-        }
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
+        // ⓐ 신고가 **아예 없어도** 결합한다(데몬이 양쪽 축을 안다).
+        let resp = reclaim_rpc(&daemon, Some(pid), json!({}));
+        assert_eq!(resp["result"]["role"], json!("worker-2"), "신고 없는 정상 경로가 죽었다: {resp}");
+        assert_eq!(resp["result"]["reported_axes"]["config"], json!("absent"));
+        assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(me));
+
+        // ⓑ 계정 dir 출처가 신뢰되지 않는 좌석(호출자가 `surface.create` 로 지정)은 **호출자
+        //    자격이 없다** — 기록을 호출자가 정할 수 있으면 그것은 인증이 아니다.
+        let daemon2 = isolated_daemon();
+        reclaim_seat(&daemon2, "worker-2", RC_CWD, None, false);
+        let pid2 = 970_109_u32;
+        let forged = daemon2
+            .create_surface_with_env(
+                Some(RC_CWD.to_string()),
+                Some("sleep 30".into()),
+                None,
+                None,
+                24,
+                80,
+                &[],
+                Some(rc_cfg()), // 값은 같지만 **출처가 호출자**다
+            )
+            .expect("create forged caller");
+        daemon2.surfaces.lock().unwrap().insert(forged.id, forged.clone());
+        bind_caller(&daemon2, pid2, forged.id);
+        crate::reclaim::tests::set_grace_secs(0.0);
+        let r2 = reclaim_rpc(&daemon2, Some(pid2), json!({"config": rc_cfg(), "cwd": RC_CWD}));
+        assert_eq!(r2["result"]["role"], json!(null), "출처 미신뢰 좌석이 결합했다: {r2}");
+        assert_eq!(r2["result"]["reason"], json!("caller_axes_unknown"));
+        // 진단은 사실을 그대로 말한다: **값은 같지만 출처가 신뢰되지 않는다**(둘을 섞어
+        // `differ` 로 뭉개면 운영자가 "경로가 틀렸나?"를 쫓게 된다).
+        assert_eq!(r2["result"]["reported_axes"]["config"], json!("match"));
+        assert_eq!(r2["result"]["reported_axes"]["config_trusted"], json!(false));
+        assert!(forged.role.lock().unwrap().is_none());
+        assert_ne!(daemon2.roles.lock().unwrap().get("worker-2").copied(), Some(forged.id));
+        drop(old);
     }
 
     /// 신원: 자기신고 `surface_id` 는 **받지 않는다**(조용히 무시도 아니다 — 계약 위반은 거절).
@@ -18771,9 +19026,9 @@ mod tests {
     #[test]
     fn reclaim_auto_rejects_self_declared_surface_and_unresolved_caller() {
         let daemon = isolated_daemon();
-        reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_109_u32;
-        reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        reclaim_caller(&daemon, RC_CWD, pid);
         let resp = reclaim_rpc(
             &daemon,
             Some(pid),
@@ -18800,9 +19055,9 @@ mod tests {
     #[test]
     fn reclaim_commit_aborts_on_every_race_without_partial_effect() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_110_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         // 구 좌석에 **큐를 적재**한다 — 취소가 `migrate_seat_queue` 를 부르지 않았음을 재려면
         // 옮길 것이 실제로 있어야 한다(빈 큐끼리의 동치는 아무것도 증명하지 않는다).
         {
@@ -18815,7 +19070,7 @@ mod tests {
         // ① 보유자가 바뀌었다(그 사이 다른 좌석이 그 역할을 가져갔다).
         //    새 보유자는 **점유 좌석**으로 둔다 — 그래야 '후보가 둘'이 아니라 '보유자 교체'
         //    라는 이 셀만 발화한다(각 취소 사유를 서로 오염 없이 재는 것이 이 검체의 요점).
-        let usurper = reclaim_seat(&daemon, "tmp-role", RC_CWD, RC_CFG, false);
+        let usurper = reclaim_seat(&daemon, "tmp-role", RC_CWD, None, false);
         daemon
             .get_surface(usurper)
             .unwrap()
@@ -18824,7 +19079,7 @@ mod tests {
         daemon.roles.lock().unwrap().insert("worker-2".into(), usurper);
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Err("raced_holder_changed")
         );
         assert_eq!(reclaim_state(&daemon), base, "raced_holder_changed 에서 상태가 바뀌었다");
@@ -18837,7 +19092,7 @@ mod tests {
         daemon.roles.lock().unwrap().insert("cso".into(), me);
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Err("raced_caller_roled")
         );
         assert_eq!(reclaim_state(&daemon), base, "raced_caller_roled 에서 상태가 바뀌었다");
@@ -18845,10 +19100,10 @@ mod tests {
         *daemon.get_surface(me).unwrap().role.lock().unwrap() = None;
 
         // ③ 후보가 하나 더 생겼다(모호) — 유일성은 커밋 시점에도 성립해야 한다
-        let extra = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, RC_CFG, false);
+        let extra = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Err("raced_candidate_changed")
         );
         assert_eq!(reclaim_state(&daemon), base, "raced_candidate_changed 에서 상태가 바뀌었다");
@@ -18867,7 +19122,7 @@ mod tests {
                     *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
                 }
             },
-            || reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            || reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
         );
         assert_eq!(got, Err("raced_seat_refilled"), "임계영역 재검증이 경합을 놓쳤다");
         assert_eq!(reclaim_state(&daemon), base, "raced_seat_refilled 에서 상태가 바뀌었다");
@@ -18880,7 +19135,7 @@ mod tests {
         }
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Err("seat_not_claimable"),
             "살아있는 agent_meta 좌석을 승계했다"
         );
@@ -18891,7 +19146,7 @@ mod tests {
         daemon.tombstones.lock().unwrap().insert("worker-2".into());
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Err("role_tombstoned")
         );
         assert_eq!(reclaim_state(&daemon), base, "role_tombstoned 에서 상태가 바뀌었다");
@@ -18900,7 +19155,7 @@ mod tests {
         // ⑦ **데드라인 초과** — 클라이언트가 이미 포기한 뒤라면 아무것도 바꾸지 않는다.
         let base = reclaim_state(&daemon);
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD,
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None,
                            Some(crate::state::now_epoch() - 1.0)),
             Err("deadline_exceeded"),
             "예산이 지난 요청이 커밋했다 — 아무도 모르는 승계가 된다"
@@ -18911,7 +19166,7 @@ mod tests {
         // (취소가 '옮기지 않았다'를 재려면 성공이 '옮긴다'를 실제로 보여야 한다).
         assert!(daemon.get_surface(me).unwrap().pending_queue.lock().unwrap().is_empty());
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD,
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None,
                            Some(crate::state::now_epoch() + 60.0)),
             Ok("worker-2".to_string())
         );
@@ -18942,15 +19197,15 @@ mod tests {
     #[test]
     fn stale_role_field_does_not_block_reclaim() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_112_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
         // 나는 예전에 reviewer-codex 였으나 맵은 이미 남(old)을 가리킨다 = 나는 그 역할이 아니다.
         *daemon.get_surface(me).unwrap().role.lock().unwrap() = Some("reviewer-codex".into());
         daemon.roles.lock().unwrap().insert("reviewer-codex".into(), old);
         assert_eq!(reclaim_authoritative_role(&daemon, me), None, "stale 필드를 권위로 읽었다");
         assert_eq!(
-            reclaim_commit(&daemon, me, "worker-2", old, RC_CFG, RC_CWD, None),
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, None, None, None),
             Ok("worker-2".to_string()),
             "stale 필드 때문에 재결합이 영구 거부됐다"
         );
@@ -18961,28 +19216,103 @@ mod tests {
         );
     }
 
-    /// ★신고 축 인증을 **RPC 로** 관통시킨다(적대검증 R1 blocking): 무역할 pane 이 남의 계정
-    /// dir·남의 프로젝트를 신고해도 결합하지 않는다. 데몬이 그 좌석에 대해 아는 값과 대조하기
-    /// 때문이다(`caller_env_mismatch`). 이것이 없으면 자기신고만으로 남의 역할을 가져갈 수 있다.
+    /// ★(R2 · codex blocking) **취소 펜싱** — 클라이언트가 예산 만료로 포기하며 `reconcile` 에
+    /// `cancel_attempt` 를 실어 보내면, 그 뒤에 재개한 원 요청은 **아무것도 바꾸지 않는다**.
+    ///
+    /// 왜 데드라인만으로 부족한가: 데드라인은 시계에 기댄다(수신 전 벽시계 역행 · 디스패치
+    /// 지연). 반면 "그 클라이언트가 더 이상 이 결과를 기다리지 않는다"는 **사실**이고, 그
+    /// 사실이 있으면 승계는 어느 시점에도 정당하지 않다(아무도 모르는 승계 = 치명위험 ③).
+    #[test]
+    fn a_cancelled_attempt_never_commits() {
+        let daemon = isolated_daemon();
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
+        let pid = 970_124_u32;
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
+        let attempt = "rc-test-1";
+        // 클라이언트가 포기한다 — 읽기 전용 조정 조회에 취소를 실어 보낸다.
+        let rec = reclaim_rpc(
+            &daemon,
+            Some(pid),
+            json!({"reconcile": true, "cancel_attempt": attempt}),
+        );
+        assert_eq!(rec["result"]["role"], json!(null), "{rec}");
+        assert_eq!(rec["result"]["cancelled_attempt"], json!(attempt));
+        // 그 뒤 원 요청이 재개해도 커밋하지 않는다(데드라인은 넉넉히 남아 있다).
+        let late = reclaim_rpc(
+            &daemon,
+            Some(pid),
+            json!({"config": RC_CFG, "cwd": RC_CWD, "attempt_id": attempt,
+                   "deadline_epoch": crate::state::now_epoch() + 600.0}),
+        );
+        assert_eq!(late["result"]["role"], json!(null), "취소된 시도가 커밋했다: {late}");
+        assert_eq!(late["result"]["reason"], json!("attempt_cancelled"));
+        assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(old));
+        assert!(daemon.get_surface(me).unwrap().role.lock().unwrap().is_none());
+        // **다른** 시도 식별자는 영향을 받지 않는다(취소는 그 시도 하나만 접는다).
+        let ok = reclaim_rpc(
+            &daemon,
+            Some(pid),
+            json!({"config": RC_CFG, "cwd": RC_CWD, "attempt_id": "rc-test-2",
+                   "deadline_epoch": crate::state::now_epoch() + 600.0}),
+        );
+        assert_eq!(ok["result"]["role"], json!("worker-2"), "무관한 시도까지 접혔다: {ok}");
+    }
+
+    /// ★(R2 · codex blocking) **조정 응답의 선형화** — 취소를 기록한 **뒤에** 권위 역할을 읽는다.
+    ///
+    /// 순서가 뒤집히면 이런 교차가 성립한다: 조정이 "역할 없음"을 읽음 → 원 요청이 커밋 →
+    /// 조정이 취소를 기록하고 **낡은 '없음'** 을 답한다 → 훅은 무역할로 진행하는데 데몬에는
+    /// 역할이 있다. 이 검체는 "취소 기록과 커밋 사이"에 커밋을 밀어 넣고, 조정 응답이 그
+    /// 커밋을 **본다**는 것을 잰다(둘 중 어느 쪽이 이기든 답은 참이어야 한다).
+    #[test]
+    fn reconcile_reports_a_commit_that_landed_before_the_cancel() {
+        let daemon = isolated_daemon();
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
+        let pid = 970_125_u32;
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
+        // 원 요청이 **먼저** 커밋했다(취소가 도착하기 전).
+        assert_eq!(
+            reclaim_commit(&daemon, me, "worker-2", old, &rc_axes(me), false, Some("rc-x"), None, None),
+            Ok("worker-2".to_string())
+        );
+        // 그 뒤 도착한 조정 조회는 **그 사실을 본다**(취소를 기록하더라도 답은 최신 권위다).
+        let rec = reclaim_rpc(
+            &daemon,
+            Some(pid),
+            json!({"reconcile": true, "cancel_attempt": "rc-x"}),
+        );
+        assert_eq!(
+            rec["result"]["role"],
+            json!("worker-2"),
+            "이미 커밋된 역할을 조정 조회가 '없음'으로 답했다(훅이 지침 없이 앉는다): {rec}"
+        );
+    }
+
+    /// ★신고 축은 **좁히기만 한다**(R1 blocking → R2 재정의). 무역할 pane 이 남의 계정 dir·남의
+    /// 프로젝트를 신고해도 결합하지 않는다 — 신고는 후보를 **넓히지 못하기** 때문이다. 그리고
+    /// 신고한 `$PWD` 가 그 좌석의 실제 프로젝트와 다르면 **좁혀서** 무결합이 된다(사람이 다른
+    /// 곳에 있는데 이 프로젝트의 역할을 주지 않는다 — codex 적대검증 R2 blocking).
     #[test]
     fn reclaim_auto_refuses_self_reported_axes_that_are_not_this_seats() {
         let daemon = isolated_daemon();
         const OTHER_CFG: &str = "/tmp/cys-test-account-dept3";
         const OTHER_CWD: &str = "/tmp/cys-test-other-proj";
         // 남의 계정 dir·남의 프로젝트에 있는 빈 좌석(정상적으로는 그 계정 pane 만 이어받는다).
-        let victim_cfg = reclaim_seat(&daemon, "worker-2", RC_CWD, OTHER_CFG, false);
-        let victim_cwd = reclaim_seat(&daemon, "reviewer-codex", OTHER_CWD, RC_CFG, false);
+        let victim_cfg = reclaim_seat(&daemon, "worker-2", RC_CWD, Some(OTHER_CFG), false);
+        let victim_cwd = reclaim_seat(&daemon, "reviewer-codex", OTHER_CWD, None, false);
         let pid = 970_120_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
 
-        // ⓐ 계정 dir 공격
+        // ⓐ 계정 dir 공격: 남의 계정 값을 신고해도 판정은 데몬 기록끼리 하므로 후보가 없다.
         let r1 = reclaim_rpc(&daemon, Some(pid), json!({"config": OTHER_CFG, "cwd": RC_CWD}));
         assert_eq!(r1["result"]["role"], json!(null), "타 계정 dir 신고로 결합했다: {r1}");
-        assert_eq!(r1["result"]["reason"], json!("caller_env_mismatch"));
-        // ⓑ 프로젝트 공격
-        let r2 = reclaim_rpc(&daemon, Some(pid), json!({"config": RC_CFG, "cwd": OTHER_CWD}));
+        assert_eq!(r1["result"]["reason"], json!("no_candidate"));
+        assert_eq!(r1["result"]["reported_axes"]["config"], json!("differ"), "진단이 사실을 감췄다");
+        // ⓑ 프로젝트 공격: 남의 프로젝트를 신고하면 **좁혀서** 아무 것도 고르지 않는다.
+        let r2 = reclaim_rpc(&daemon, Some(pid), json!({"config": rc_cfg(), "cwd": OTHER_CWD}));
         assert_eq!(r2["result"]["role"], json!(null), "타 프로젝트 신고로 결합했다: {r2}");
-        assert_eq!(r2["result"]["reason"], json!("caller_env_mismatch"));
+        assert_eq!(r2["result"]["reason"], json!("no_candidate"));
+        assert_eq!(r2["result"]["reported_axes"]["cwd"], json!("differ"));
         // 두 피해 좌석 모두 역할을 그대로 쥐고 있다(부분 적용 0).
         assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(victim_cfg));
         assert_eq!(daemon.roles.lock().unwrap().get("reviewer-codex").copied(), Some(victim_cwd));
@@ -18994,9 +19324,9 @@ mod tests {
     #[test]
     fn reclaim_reconcile_is_readonly_and_returns_authoritative_role() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_121_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
 
         // 결합 조건이 완비된 상태에서도 reconcile 은 결합하지 않는다.
         let r = reclaim_rpc(&daemon, Some(pid), json!({"reconcile": true}));
@@ -19018,9 +19348,9 @@ mod tests {
     #[test]
     fn env_role_state_reports_who_actually_holds_the_role() {
         let daemon = isolated_daemon();
-        let holder = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, RC_CFG, false);
+        let holder = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
         let pid = 970_122_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
 
         let ask = |role: &str| -> String {
             let r = reclaim_rpc(
@@ -19055,9 +19385,9 @@ mod tests {
     #[test]
     fn reclaim_auto_refuses_to_commit_past_the_client_deadline() {
         let daemon = isolated_daemon();
-        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, RC_CFG, false);
+        let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_123_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
 
         let past = crate::state::now_epoch() - 1.0;
         let r = reclaim_rpc(
@@ -19082,15 +19412,29 @@ mod tests {
 
     /// master 재결합은 **서명 쿨다운(벡터-9)을 다시 건다** — 이 경로만 갱신을 빠뜨리면
     /// 자동 재결합이 '승계 직후 approval.sign 동결'을 우회하는 문이 된다.
+    ///
+    /// ★(R2) 그리고 master 는 **자동 경로로 승계되지 않는다**: 사람이 `--takeover-empty-seat`
+    /// 를 명시해야만 후보가 된다(claim_role 의 특권 빈좌석 승계와 같은 문 · claude 적대검증
+    /// R2 major). 이 검체는 그 두 사실을 한 자리에서 잰다.
     #[test]
     fn reclaim_master_rearms_the_sign_cooldown() {
         let daemon = isolated_daemon();
-        reclaim_seat(&daemon, "master", RC_CWD, RC_CFG, false);
+        let holder = reclaim_seat(&daemon, "master", RC_CWD, None, false);
         // 오래 전에 claim 된 안정 master 로 만든다(쿨다운 해제 상태).
         *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch() - 10_000.0);
         let pid = 970_111_u32;
-        let me = reclaim_caller(&daemon, RC_CWD, RC_CFG, pid);
-        let resp = reclaim_ok(&daemon, pid);
+        let me = reclaim_caller(&daemon, RC_CWD, pid);
+        // ⓐ opt-in 없는 자동 경로(훅이 부르는 그대로) — **승계하지 않는다**.
+        let auto = reclaim_ok(&daemon, pid);
+        assert_eq!(auto["result"]["role"], json!(null), "master 가 자동으로 승계됐다: {auto}");
+        assert_eq!(auto["result"]["reason"], json!("privileged_needs_optin"));
+        assert_eq!(daemon.roles.lock().unwrap().get("master").copied(), Some(holder));
+        // ⓑ 사람이 명시하면 종전대로 승계하고 쿨다운을 다시 건다.
+        let resp = reclaim_rpc(
+            &daemon,
+            Some(pid),
+            json!({"config": RC_CFG, "cwd": RC_CWD, "takeover_empty_seat": true}),
+        );
         assert_eq!(resp["result"]["role"], json!("master"), "응답: {resp}");
         let claimed = daemon.master_claimed_at.lock().unwrap().expect("master_claimed_at");
         assert!(

@@ -15,13 +15,15 @@
 //! 언제나 **"결합하지 않는다 + 안내한다"** 여야 한다. 잘못 결합하면 남의 역할 주소를 빼앗아
 //! 라우팅·감시·큐를 끊는다(되돌릴 수 없는 조직 손상). 그래서:
 //!   · 후보가 0 이거나 2 이상이면 **아무것도 하지 않는다**(모호함은 결합의 근거가 아니다).
-//!   · 호출자의 `CLAUDE_CONFIG_DIR`·`PWD` 를 **인자로 받아** 후보와 대조한다 — 계정·프로젝트가
-//!     다른 좌석의 역할을 가져오는 것이 이 장치의 최악 오작동이므로, 그 두 축이 **둘 다 있고
-//!     둘 다 같을 때만** 후보가 된다(결측은 값이 아니다 — `None == None` 은 일치가 아니다).
-//!   · ★그 두 축은 **자기신고이므로 먼저 인증한다**(R1): 데몬이 호출 좌석에 대해 스스로 아는
-//!     `claude_config_dir` 과 그 좌석 셸의 실제 cwd(+생성 cwd)와 대조해, 어긋나면 후보를 아예
-//!     고르지 않는다. 그렇지 않으면 무역할 pane 이 남의 계정·남의 프로젝트를 신고해 그 역할을
-//!     가져갈 수 있다 — 같은 파일이 자기신고 `surface_id` 를 거절하는 것과 같은 이유다.
+//!   · 계정 dir·프로젝트 디렉터리 두 축이 **둘 다 있고 둘 다 같을 때만** 후보가 된다
+//!     (결측은 값이 아니다 — `None == None` 은 일치가 아니다). 계정·프로젝트가 다른 좌석의
+//!     역할을 가져오는 것이 이 장치의 최악 오작동이기 때문이다.
+//!   · ★그 두 축의 값은 **전부 데몬이 스스로 아는 것**이다(R2). 훅이 넘긴 `--config`·`--cwd`
+//!     는 판정에 들어가지 않는다 — 자기신고는 (ⓐ)호출자가 고를 수 있어 인증이 되지 못하고
+//!     (ⓑ)unix pane env 에 `CLAUDE_CONFIG_DIR` 가 없어 사실상 항상 비어 있다. 신고값은
+//!     응답의 진단(`reported_axes`)으로만 남는다.
+//!   · ★특권 역할(master·cso)은 자동 경로의 후보가 **아니다**. `system.claim_role` 의 빈좌석
+//!     승계와 같은 `takeover_empty_seat` opt-in 을 사람이 명시해야 열린다.
 //!   · 경로 비교는 **플랫폼 표기까지 접는다**(R1): Windows 에서 데몬은 네이티브 `C:\…` 를
 //!     기록하고 Git Bash 훅은 MSYS `/c/…` 를 넘긴다 — 접지 않으면 두 축이 영원히 안 만나
 //!     이 수리가 그 플랫폼에 배포되지 않는다. 단 **공백·본문 대소문자는 절대 접지 않는다**
@@ -61,11 +63,13 @@ pub enum Decision {
     CallerUnresolved,
     /// 호출자가 이미 **데몬 권위** 역할을 갖고 있다 — 결합 없이 그 역할을 돌려준다(멱등).
     AlreadyRoled(String),
-    /// `--config`/`--cwd` 가 비었다. 대조 축이 없으면 후보를 고를 수 없다(fail-closed).
-    EnvMissing,
-    /// 신고된 `--config` 가 **데몬이 그 호출 좌석에 대해 아는 값**과 다르다 — 무결합.
-    /// 자기신고 축으로 **남의 계정 dir 좌석**을 가져가는 경로를 닫는다(적대검증 R1 major).
-    EnvMismatch,
+    /// **데몬이** 호출 좌석의 대조 축(계정 dir·디렉터리)을 모른다 — 축 없는 승계를 만들지
+    /// 않으려고 무결합(fail-closed). ★종전의 `EnvMissing`(호출자가 신고를 안 했다)과 다르다:
+    /// 신고는 이제 판정 입력이 아니다([`is_candidate`] doc).
+    AxesUnknown,
+    /// 조건을 만족하는 빈 좌석이 **특권 역할(master·cso)뿐**이다 — 자동 경로는 그 문을 열지
+    /// 않는다. 사람이 `--takeover-empty-seat` 로 명시해야 후보가 된다(정본 §8 게이트 보존).
+    PrivilegedNeedsOptIn,
     /// phoenix restore lease 보유 중(또는 락 기구 불능) — 보류. 다음 세션 시작에 다시 묻는다.
     Defer(&'static str),
     /// 조건을 만족하는 빈 좌석이 없다.
@@ -82,8 +86,8 @@ impl Decision {
         match self {
             Decision::CallerUnresolved => "caller_unresolved",
             Decision::AlreadyRoled(_) => "already_roled",
-            Decision::EnvMissing => "caller_env_missing",
-            Decision::EnvMismatch => "caller_env_mismatch",
+            Decision::AxesUnknown => "caller_axes_unknown",
+            Decision::PrivilegedNeedsOptIn => "privileged_needs_optin",
             Decision::Defer(r) => r,
             Decision::NoCandidate => "no_candidate",
             Decision::Ambiguous(_) => "ambiguous",
@@ -194,50 +198,134 @@ fn same_path(a: Option<&str>, b: Option<&str>) -> bool {
     }
 }
 
+/// 호출 좌석의 **인증 축 묶음** — 전부 데몬이 스스로 아는 값이거나(권위), 좁히기 전용이다.
+///
+/// ★왜 구조체인가: 이 네 값은 **함께 성립해야 뜻이 있다**. 하나만 빠뜨리고 호출해도 컴파일되는
+/// 위치 인자 나열은, 인증 축이 조용히 하나 빠지는 사고를 정확히 그만큼 쉽게 만든다.
+#[derive(Debug, Clone, Copy)]
+pub struct CallerAxes<'a> {
+    pub sid: u64,
+    /// 데몬이 이 좌석에 대해 기록한 계정 dir — **출처가 신뢰될 때만** `Some`.
+    ///
+    /// ★(R2 · codex blocking) "데몬 안에 기록돼 있다"는 것만으로는 인증 근거가 못 된다:
+    /// `surface.create{claude_config_dir: A, env:{CLAUDE_CONFIG_DIR: B}}` 는 **기록은 A, 실제
+    /// 실행은 B** 인 좌석을 만들 수 있다. 그래서 좌석 생성 시 "데몬이 스스로 해소했고 호출자
+    /// env 가 그 값을 덮지 않았다"를 표식(`Surface.config_dir_trusted`)으로 남기고, 그렇지 않은
+    /// 좌석은 이 축을 **미확정(None)** 으로 접는다 → 무결합(fail-closed).
+    pub cfg: Option<&'a str>,
+    /// 데몬이 이 좌석에 대해 아는 디렉터리 **표기들**(좌석 생성 cwd + 좌석 셸 pid 의 실제 cwd).
+    ///
+    /// 집합인 이유는 "여러 디렉터리를 허용"하기 위해서가 아니라 **같은 디렉터리의 다른 표기**를
+    /// 놓치지 않기 위해서다: macOS 의 `/tmp` → `/private/tmp` 처럼 심링크가 끼면 생성 표기와
+    /// 프로세스가 보고하는 표기가 문자열로 다르다(실측). 이 집합만으로는 codex 가 지적한
+    /// 넓힘(`/proj/A` 에서 태어나 `cd /proj/B` 한 좌석이 A 의 역할을 가져감)이 남으므로,
+    /// **아래 `narrow_cwd` 와 AND** 로만 쓴다.
+    pub known_cwds: &'a [String],
+    /// 좁히기 값 — 후보는 이 값과도 **반드시** 같아야 한다. 우선순위:
+    /// ①훅이 신고한 `$PWD`(사람이 지금 있는 프로젝트) ②좌석 셸의 실제 cwd ③좌석 생성 cwd.
+    /// 자기신고에 줄 수 있는 유일하게 안전한 권한이 '좁히기'다(넓히지 못하므로 위조 이득 0).
+    pub narrow_cwd: Option<&'a str>,
+    /// `narrow_cwd` 가 어디서 왔는가(`reported|live|created|unknown`) — 진단·검체용.
+    pub cwd_source: &'static str,
+}
+
 /// 이 항목이 재결합 후보인가 — **순수 술어**(판정 이원화 금지: 핸들러의 락 안 재검증도 이 함수를 쓴다).
+///
+/// ★(R2) 대조 축은 **데몬이 스스로 아는 값**이다. 종전에는 훅이 넘긴 `--config`·`--cwd`
+/// (자기신고)를 후보와 대조했는데, 두 리뷰어가 각각 그 축의 반대편 결함을 잡았다:
+///   · (codex blocking) 인증의 신뢰값 자체를 호출자가 `surface.create` 로 정할 수 있다.
+///   · (claude major) unix pane env 에는 `CLAUDE_CONFIG_DIR` 가 아예 없어 훅의 `--config` 가
+///     **빈 문자열**이고, 사용자가 자기 값을 export 하면 어긋난다 → 수용 기준의 주 경로가
+///     기본 설치에서 영구 무결합.
+/// 그래서 자기신고는 **권위에서 빼고 좁히기로만** 남겼다(정본 §8 "env 를 권위로 쓰지 않는다"의
+/// 일반형). 계정 dir 축은 신고를 아예 보지 않는다 — unix 에서 그 값은 pane 에 대한 증거가 아니라
+/// 사용자 셸의 값이라, 대조하면 정상 설치가 통째로 무결합이 된다.
 pub fn is_candidate(
     e: &LiveEntry,
-    caller_sid: u64,
-    caller_cfg: &str,
-    caller_cwd: &str,
+    axes: &CallerAxes<'_>,
     now: f64,
+    // 특권 역할(master·cso) 후보를 여는 **명시 opt-in**. 훅 자동 경로는 항상 false 다.
+    allow_privileged: bool,
 ) -> bool {
-    if e.surface_id == caller_sid || e.exited || e.role.trim().is_empty() {
+    if e.surface_id == axes.sid || e.exited || e.role.trim().is_empty() {
         return false;
     }
     // ★예약 식별 등급은 좌석이 자칭할 수 없고(claim_role 게이트) 자동 승계 대상도 아니다.
     if e.role == "owner" || e.role == "creator" {
         return false;
     }
+    // ★(R2 · claude major) **특권 역할은 자동 경로의 대상이 아니다.** `system.claim_role` 의
+    //   빈좌석 승계는 호출자가 `takeover_empty_seat: true` 를 명시해야만 열린다(claim 게이트).
+    //   그런데 종전 reclaim 은 그 술어만 재사용하고 **문은 쓰지 않아**, 사람이 아무 명령도
+    //   내리지 않았는데 SessionStart 한 번으로 master 주소·caps·큐가 이사했다 — 종전에 명시
+    //   요청이 필요했던 특권 전이가 훅 **부수효과**로 바뀐 것이고, 정본 §8 "기존 게이트를
+    //   면제하지 않는다"에 걸린다. 그래서 같은 opt-in 을 요구한다: 훅은 넘기지 않고, 사람이
+    //   `cys reclaim-role --auto --takeover-empty-seat` 로만 연다.
+    if !allow_privileged && is_privileged_role(&e.role) {
+        return false;
+    }
     if e.seat != "empty" {
         return false; // occupied·unknown 둘 다 거부(판정 불가는 빈 좌석이 아니다)
     }
-    // 데몬이 env 를 실어 스폰한 좌석은 **유예 뒤에만** 후보다(기동 중 좌석 탈취 차단).
-    if e.env_injected && now - e.created_at < NEW_SEAT_GRACE_SECS {
+    // ★(R2 · codex major) 유예는 **`env_injected` 와 무관하게** 걸린다. 종전 조건
+    //   (`env_injected && 신생`)은 unix launch 경로를 통째로 비껴갔다: `render_launch` 가
+    //   환경을 인라인 명령에 넣고 `surface.create` 의 env 목록을 **비워** 보내기 때문에
+    //   그 좌석은 `env_injected=false` 다. 그래서 기동 중(에이전트 명령 전송 전) 좌석이
+    //   watchdog 에 `empty` 로 보이는 순간 재결합이 그 역할을 가져갔고, 원 런처가 재개하면
+    //   **이미 역할을 잃은 좌석에** 에이전트를 띄웠다. 역할을 쥔 신생 좌석은 그 출생 경로가
+    //   무엇이든 "아직 붙는 중"일 수 있다 — 나이 하나로 판정한다(넓은 쪽 = 안전 방향).
+    if now - e.created_at < grace_secs() {
         return false;
     }
-    same_path(e.cwd.as_deref(), Some(caller_cwd))
-        && same_path(e.claude_config_dir.as_deref(), Some(caller_cfg))
+    // 계정 dir 축: 양쪽 다 **데몬 기록**(호출 쪽은 출처 신뢰까지). 결측은 값이 아니다.
+    if !same_path(e.claude_config_dir.as_deref(), axes.cfg) {
+        return false;
+    }
+    // cwd 축 ①: 데몬이 아는 표기들 중 하나와 같아야 한다(같은 디렉터리의 다른 표기 수용).
+    if !axes.known_cwds.iter().any(|k| same_path(e.cwd.as_deref(), Some(k))) {
+        return false;
+    }
+    // cwd 축 ②: **좁히기 값과도** 같아야 한다 — 이 AND 가 "생성 cwd 로 우회해 다른 프로젝트에
+    // 결합"(codex 적대검증 R2)을 닫는다. 값이 없으면 후보를 고르지 않는다(fail-closed).
+    same_path(e.cwd.as_deref(), axes.narrow_cwd)
+}
+
+/// 실효 유예(초) — 릴리스에서는 [`NEW_SEAT_GRACE_SECS`] 상수 그대로다.
+///
+/// ★검체 이음매인 이유: 핸들러 경로 검체는 **방금 만든** 좌석을 후보로 써야 하는데,
+/// `Surface.created_at` 은 생성 시각으로 고정된 불변 필드라 뒤로 밀 수 없다(Arc 공유). 유예
+/// 자체는 순수 검체(`new_seat_is_excluded_until_grace_regardless_of_env_injected`)와 핸들러
+/// 검체(`reclaim_auto_excludes_freshly_spawned_seat`)가 **실제 값으로** 재고, 그 밖의 검체는
+/// 이 이음매로 0 을 두어 자기 주제(경합·축·특권)만 재게 한다. 릴리스 빌드에는 이 분기가 없다.
+#[cfg(not(test))]
+#[inline(always)]
+fn grace_secs() -> f64 {
+    NEW_SEAT_GRACE_SECS
+}
+
+#[cfg(test)]
+fn grace_secs() -> f64 {
+    tests::GRACE_SEAM.with(|g| g.get())
+}
+
+/// 특권 역할(빈좌석 승계에 `takeover_empty_seat` opt-in 을 요구하는 등급) — `handlers` 의
+/// `privileged_role` 과 **같은 집합**이어야 한다(두 곳이 갈리면 한쪽만 열린 문이 생긴다).
+/// 여기서는 `cso-1` 같은 변형까지 접두로 받는다: 자동 경로가 특권 쪽으로 **넓게 닫히는** 것은
+/// 안전 방향이고, 좁게 닫히면 변형 이름 하나로 이 게이트가 통째로 우회된다.
+pub fn is_privileged_role(role: &str) -> bool {
+    role == "master" || role == "cso" || role.starts_with("cso-")
 }
 
 /// 재결합 판정 — 순수. 부작용 0 · 시각과 lease 보유 여부까지 **주입**받는다(테스트 결정론).
-#[allow(clippy::too_many_arguments)]
 pub fn decide(
-    caller_sid: Option<u64>,
     caller_role: Option<&str>,
-    // ★데몬이 **호출 좌석에 대해 스스로 아는** 두 축. `caller_known_cfg` 는 surface.create 가
-    //   해소해 기록한 `claude_config_dir`, `caller_known_cwds` 는 그 좌석에 대해 데몬이 아는
-    //   **디렉터리들**(좌석 셸 pid 의 실제 cwd — sysinfo · cd 추적 — 과 좌석 생성 cwd)이다.
-    //   신고값이 이것들과 어긋나면 결합하지 않는다 — 아래 게이트 참조.
-    caller_known_cfg: Option<&str>,
-    caller_known_cwds: &[String],
-    caller_cfg: Option<&str>,
-    caller_cwd: Option<&str>,
+    axes: Option<&CallerAxes<'_>>,
     now: f64,
     lease: LeaseState,
     entries: &[LiveEntry],
+    allow_privileged: bool,
 ) -> Decision {
-    let Some(caller_sid) = caller_sid else {
+    let Some(axes) = axes else {
         return Decision::CallerUnresolved;
     };
     // 이미 역할이 있으면 결합하지 않는다(멱등). ★이 값은 호출자가 **데몬 권위로 대조한**
@@ -245,32 +333,16 @@ pub fn decide(
     if let Some(r) = caller_role.filter(|r| !r.trim().is_empty()) {
         return Decision::AlreadyRoled(r.to_string());
     }
-    let (Some(cfg), Some(cwd)) = (
-        caller_cfg.filter(|v| !v.trim().is_empty()),
-        caller_cwd.filter(|v| !v.trim().is_empty()),
-    ) else {
-        return Decision::EnvMissing;
-    };
-    // ★신고 축의 **인증**(codex·claude 공통 R1 major): 종전에는 `--config`·`--cwd` 가 전부
-    //   호출자 자기신고였고, 데몬은 그 문자열을 **후보와만** 대조했다. 그래서 무역할 pane 이
-    //   `--config <남의 계정 dir> --cwd <그 좌석 cwd>` 로 남의 역할을 가져갈 수 있었다 — 이 모듈이
-    //   서두에서 "이 장치의 최악 오작동"이라 부른 바로 그 경로이고, 같은 파일이 자기신고
-    //   `surface_id` 를 '위조 가능'하다며 거절하는 것과도 모순이었다.
-    //   데몬은 호출 좌석의 `claude_config_dir` 을 **스스로 해소해 기록**해 둔다(surface.create).
-    //   그 값과 신고값이 다르면 무결합이다(결측도 불일치 — `same_path` 계약).
-    //   ★cwd 도 같이 인증한다(codex 적대검증 R1 blocking). 처음엔 "계정 dir 만 고정하면 남는
-    //     노출은 `cys claim-role <role>` 로 이미 가능한 행위"라고 적었는데 **그 논거가 틀렸다**:
-    //     `claim_role` 은 worker 계열 이름 충돌 시 **dedup**(worker-2 → worker-3)을 하므로
-    //     "특정 좌석의 역할·caps·큐를 그 자리째 가져오는" 이 경로와 동등하지 않다. 그래서 같은
-    //     계정 안 **다른 프로젝트**의 빈 좌석을 자기신고로 가져가는 문이 실제로 남아 있었다.
-    //     대조 집합이 **둘**인 이유: 좌석 셸의 **지금 cwd**(OS 가 답한 사실 · cd 추적)와 좌석
-    //     **생성 cwd** 는 둘 다 데몬이 아는 사실이라 공격자가 고를 수 없고, 사람이 pane 을 띄운
-    //     뒤 프로젝트로 `cd` 했는지에 따라 훅의 `$PWD` 는 그중 하나다 — 인증 강도는 같으면서
-    //     정상 시나리오를 죽이지 않는다(프로세스 cwd 를 못 읽는 기계에서는 생성 cwd 하나만 남고,
-    //     그때 어긋나면 무결합이다 — 안전 방향).
-    let cwd_ok = caller_known_cwds.iter().any(|k| same_path(Some(k), Some(cwd)));
-    if !same_path(caller_known_cfg, Some(cfg)) || !cwd_ok {
-        return Decision::EnvMismatch;
+    // ★대조 축을 **데몬이 모르거나 믿을 수 없으면** 결합하지 않는다(fail-closed). 종전의
+    //   `caller_env_missing` 은 "호출자가 신고를 안 했다"였는데, 그 술어는 unix 기본 설치에서
+    //   **항상 참**이라 기능 전체를 죽였다(claude 적대검증 major). 지금 이 자리의 뜻은
+    //   "데몬이 이 좌석의 계정 dir(신뢰 출처)·디렉터리를 모른다"이고, 그때 후보를 고르면
+    //   축 없는 승계가 된다.
+    if axes.cfg.map(|c| c.trim().is_empty()).unwrap_or(true)
+        || axes.narrow_cwd.map(|c| c.trim().is_empty()).unwrap_or(true)
+        || axes.known_cwds.iter().all(|c| c.trim().is_empty())
+    {
+        return Decision::AxesUnknown;
     }
     // ★lease 는 후보 계산 **앞**이다: 부활이 도는 중이면 무엇을 고르든 그 결정은 낡았다.
     match lease {
@@ -280,10 +352,22 @@ pub fn decide(
     }
     let mut hits: Vec<&LiveEntry> = entries
         .iter()
-        .filter(|e| is_candidate(e, caller_sid, cfg, cwd, now))
+        .filter(|e| is_candidate(e, axes, now, allow_privileged))
         .collect();
     match hits.len() {
-        0 => Decision::NoCandidate,
+        0 => {
+            // ★무결합의 **이유를 좁혀서** 돌려준다: 특권 후보만 있는 경우는 "없다"가 아니라
+            //   "이 경로로는 열리지 않는다"이고, 운영자에게 줄 처방이 완전히 다르다
+            //   (`--takeover-empty-seat` 를 사람이 명시하라).
+            if !allow_privileged
+                && entries
+                    .iter()
+                    .any(|e| is_privileged_role(&e.role) && is_candidate(e, axes, now, true))
+            {
+                return Decision::PrivilegedNeedsOptIn;
+            }
+            Decision::NoCandidate
+        }
         1 => Decision::Bind {
             role: hits[0].role.clone(),
             from_surface: hits[0].surface_id,
@@ -473,6 +557,14 @@ pub(crate) mod tests {
         /// (`handlers.rs` 의 검체가 `set_race_hook` 으로 심는다).
         pub(super) static RECLAIM_RACE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
             const { std::cell::RefCell::new(None) };
+        /// 이 스레드에서 쓸 유예(초) — 기본은 실제 값이다(이음매를 켜지 않으면 프로덕션과 같다).
+        pub(super) static GRACE_SEAM: std::cell::Cell<f64> =
+            const { std::cell::Cell::new(NEW_SEAT_GRACE_SECS) };
+    }
+
+    /// 이 스레드의 유예를 바꾼다 — `handlers.rs` 검체 전용(§grace_secs).
+    pub(crate) fn set_grace_secs(v: f64) {
+        GRACE_SEAM.with(|g| g.set(v));
     }
 
     /// 훅을 심고/지운다 — `handlers.rs` 의 경합 검체 전용.
@@ -495,13 +587,18 @@ pub(crate) mod tests {
 
     const CFG: &str = "/Users/cys/.cys/claude";
     const CWD: &str = "/Users/cys/dev/proj";
-    /// 데몬이 호출 좌석에 대해 아는 디렉터리 집합(실제 프로세스 cwd + 좌석 생성 cwd 대역).
-    fn known_cwds() -> Vec<String> {
-        vec![CWD.to_string()]
+
+    /// 데몬이 호출 좌석(sid 9)에 대해 아는 축 — 신뢰 출처 계정 dir + 지금의 cwd.
+    fn known() -> &'static [String] {
+        static K: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        K.get_or_init(|| vec![CWD.to_string()])
+    }
+    fn axes() -> CallerAxes<'static> {
+        CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" }
     }
 
     fn decide_one(entries: &[LiveEntry]) -> Decision {
-        decide(Some(9), None, Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0, LeaseState::Free, entries)
+        decide(None, Some(&axes()), 10_000.0, LeaseState::Free, entries, false)
     }
 
     /// 후보 1 → 결합.
@@ -539,19 +636,125 @@ pub(crate) mod tests {
         }
     }
 
-    /// `env_injected=true` 인 갓 스폰된 좌석은 유예(120s) 안에는 후보가 아니다 —
-    /// 기동 중(에이전트 미부착) 좌석의 역할을 빼앗는 경로를 닫는다. 유예 후에는 후보다.
+    /// 갓 스폰된 좌석은 유예(120s) 안에는 후보가 아니다 — 기동 중(에이전트 미부착) 좌석의
+    /// 역할을 빼앗는 경로를 닫는다. 유예 후에는 후보다.
+    ///
+    /// ★(R2 재핀 · codex major) 종전 핀은 `env_injected=true` **일 때만** 유예를 요구했다.
+    /// 그 조건은 unix `launch-agent` 경로를 통째로 비껴간다: `render_launch` 가 환경을 인라인
+    /// 명령에 넣고 `surface.create` 의 env 목록을 **비워** 보내므로 그 좌석은
+    /// `env_injected=false` 다 — 즉 실전에서 유예가 걸리는 좌석이 사실상 없었다. 이제 나이
+    /// 하나로 판정하므로 **두 값 모두**에서 유예가 성립해야 한다(핀을 넓힌 것 = 안전 방향).
     #[test]
-    fn env_injected_new_seat_excluded_until_grace() {
-        let mut e = ent("cso", 3, "empty", CFG, CWD);
-        e.env_injected = true;
-        e.created_at = 10_000.0 - (NEW_SEAT_GRACE_SECS - 1.0);
-        assert_eq!(decide_one(&[e.clone()]), Decision::NoCandidate, "유예 안 좌석이 후보가 됐다");
-        e.created_at = 10_000.0 - (NEW_SEAT_GRACE_SECS + 1.0);
+    fn new_seat_is_excluded_until_grace_regardless_of_env_injected() {
+        for injected in [true, false] {
+            let mut e = ent("worker-2", 3, "empty", CFG, CWD);
+            e.env_injected = injected;
+            e.created_at = 10_000.0 - (NEW_SEAT_GRACE_SECS - 1.0);
+            assert_eq!(
+                decide_one(&[e.clone()]),
+                Decision::NoCandidate,
+                "유예 안 좌석이 후보가 됐다(env_injected={injected})"
+            );
+            e.created_at = 10_000.0 - (NEW_SEAT_GRACE_SECS + 1.0);
+            assert_eq!(
+                decide_one(&[e]),
+                Decision::Bind { role: "worker-2".into(), from_surface: 3 },
+                "유예를 넘긴 좌석이 후보에서 빠졌다(env_injected={injected})"
+            );
+        }
+    }
+
+    /// ★(R2 · claude major) **특권 역할(master·cso)은 자동 경로의 후보가 아니다.**
+    /// `takeover_empty_seat` opt-in 이 있어야만 열리고, 그때만 결합한다. 자동 경로에서는
+    /// "없다"가 아니라 **`privileged_needs_optin`** 으로 답해 운영자에게 처방을 준다.
+    #[test]
+    fn privileged_seats_need_an_explicit_optin() {
+        for role in ["master", "cso", "cso-1"] {
+            let e = [ent(role, 3, "empty", CFG, CWD)];
+            assert_eq!(
+                decide(None, Some(&axes()), 10_000.0, LeaseState::Free, &e, false),
+                Decision::PrivilegedNeedsOptIn,
+                "{role} 이 자동 경로로 승계됐다(또는 사유가 뭉개졌다)"
+            );
+            assert_eq!(
+                decide(None, Some(&axes()), 10_000.0, LeaseState::Free, &e, true),
+                Decision::Bind { role: role.into(), from_surface: 3 },
+                "{role} 이 명시 opt-in 에서도 열리지 않는다"
+            );
+        }
+        // 비특권 역할은 opt-in 없이 종전대로.
         assert_eq!(
-            decide_one(&[e]),
-            Decision::Bind { role: "cso".into(), from_surface: 3 },
-            "유예를 넘긴 좌석이 후보에서 빠졌다"
+            decide_one(&[ent("reviewer-codex", 3, "empty", CFG, CWD)]),
+            Decision::Bind { role: "reviewer-codex".into(), from_surface: 3 }
+        );
+    }
+
+    /// ★특권 집합은 `handlers::privileged_role`(claim_role 의 빈좌석 승계 게이트가 쓰는 집합)을
+    /// **포함**해야 한다. 좁으면 이름 하나로 이 게이트가 우회되고, 넓은 쪽은 안전 방향이다
+    /// (자동 경로가 더 많이 닫힌다 = 사람이 명시해야 한다).
+    #[test]
+    fn privileged_set_contains_the_claim_gate_set() {
+        for r in ["master", "cso"] {
+            assert!(is_privileged_role(r), "{r} 가 자동 경로의 특권 집합에서 빠졌다");
+        }
+        // 변형까지 넓게 닫는다(cso-1 같은 부서 변형).
+        assert!(is_privileged_role("cso-1"));
+        // 비특권은 그대로 열려 있어야 한다(이 게이트가 기능 전체를 닫으면 안 된다).
+        for r in ["worker", "worker-2", "reviewer-codex", "reviewer-gemini", "planner"] {
+            assert!(!is_privileged_role(r), "{r} 까지 특권으로 닫혔다 — 자동 복구가 죽는다");
+        }
+        // handlers 의 정의처가 바뀌면 여기서 드러나게 소스로도 대조한다(집합 이원화 방지).
+        let h = include_str!("handlers.rs");
+        let body = h[h.find("fn privileged_role(r: &str) -> bool {").expect("정의처 소실")..]
+            .split('}')
+            .next()
+            .unwrap_or("");
+        assert!(
+            body.contains("\"master\"") && body.contains("\"cso\""),
+            "claim 게이트의 특권 집합이 바뀌었다 — reclaim 쪽을 함께 갱신하라: {body}"
+        );
+    }
+
+    /// ★(R2 · codex blocking) 신고 `$PWD` 는 **좁히기 전용**이다 — 데몬이 아는 축과 AND 로
+    /// 걸리고, 신고로 후보를 **넓히지는 못한다**(위조 이득 0).
+    #[test]
+    fn reported_cwd_only_narrows_never_widens() {
+        let here = [ent("worker-2", 3, "empty", CFG, CWD)];
+        // ⓐ 일치 신고 → 종전대로 결합.
+        let mut ax = axes();
+        ax.narrow_cwd = Some(CWD);
+        ax.cwd_source = "reported";
+        assert_eq!(
+            decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
+            Decision::Bind { role: "worker-2".into(), from_surface: 3 }
+        );
+        // ⓑ 다른 값 신고 → **좁혀서** 무결합(데몬 축은 맞지만 사람은 다른 곳에 있다).
+        ax.narrow_cwd = Some("/Users/cys/dev/elsewhere");
+        assert_eq!(
+            decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
+            Decision::NoCandidate
+        );
+        // ⓒ 신고로 **넓히지 못한다**: 데몬이 아는 cwd 와 다른 좌석은 신고를 맞춰도 후보가 아니다.
+        let elsewhere = [ent("worker-2", 3, "empty", CFG, "/Users/cys/dev/elsewhere")];
+        assert_eq!(
+            decide(None, Some(&ax), 10_000.0, LeaseState::Free, &elsewhere, false),
+            Decision::NoCandidate,
+            "자기신고 cwd 로 다른 프로젝트 좌석을 후보로 만들었다"
+        );
+        // ⓓ 신고가 없으면 좁히기 값은 **데몬이 아는 실제 cwd** 로 접힌다(훅이 `$PWD` 를 못
+        //    넘긴 경우에도 기능이 살지만, 넓어지지는 않는다).
+        ax.narrow_cwd = Some(CWD);
+        ax.cwd_source = "live";
+        assert_eq!(
+            decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
+            Decision::Bind { role: "worker-2".into(), from_surface: 3 }
+        );
+        // ⓔ 좁히기 값이 아예 없으면 후보를 고르지 않는다(fail-closed).
+        ax.narrow_cwd = None;
+        ax.cwd_source = "unknown";
+        assert_eq!(
+            decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
+            Decision::AxesUnknown
         );
     }
 
@@ -563,7 +766,7 @@ pub(crate) mod tests {
             (LeaseState::Held, "restore_lease_held"),
             (LeaseState::Unavailable, "restore_lease_unavailable"),
         ] {
-            let d = decide(Some(9), None, Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0, st, &e);
+            let d = decide(None, Some(&axes()), 10_000.0, st, &e, false);
             assert_eq!(d, Decision::Defer(want), "lease {st:?} 인데 보류가 아니다");
         }
     }
@@ -586,15 +789,17 @@ pub(crate) mod tests {
         let mut e = ent("cso", 3, "empty", CFG, CWD);
         e.cwd = None;
         e.claude_config_dir = None;
-        // 호출자 축도 없는 경우 → EnvMissing(후보 계산 자체를 하지 않는다)
+        // 데몬이 호출 좌석의 축을 모르면 후보 계산 자체를 하지 않는다(AxesUnknown).
+        let blind = CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" };
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), None, None, 10_000.0, LeaseState::Free, &[e.clone()]),
-            Decision::EnvMissing
+            decide(None, Some(&blind), 10_000.0, LeaseState::Free, &[e.clone()], false),
+            Decision::AxesUnknown
         );
+        let blank = CallerAxes { sid: 9, cfg: Some(""), known_cwds: known(), narrow_cwd: Some("   "), cwd_source: "live" };
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), Some(""), Some("   "), 10_000.0, LeaseState::Free, &[e.clone()]),
-            Decision::EnvMissing,
-            "빈 문자열 인자가 '지정됨'으로 취급됐다"
+            decide(None, Some(&blank), 10_000.0, LeaseState::Free, &[e.clone()], false),
+            Decision::AxesUnknown,
+            "빈 문자열 축이 '알고 있음'으로 취급됐다"
         );
         // 호출자 축이 있어도 후보의 결측은 일치가 아니다
         assert_eq!(decide_one(&[e]), Decision::NoCandidate);
@@ -605,7 +810,7 @@ pub(crate) mod tests {
     fn already_roled_returns_role_without_binding() {
         let e = [ent("worker-2", 3, "empty", CFG, CWD)];
         assert_eq!(
-            decide(Some(9), Some("cso"), Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0, LeaseState::Free, &e),
+            decide(Some("cso"), Some(&axes()), 10_000.0, LeaseState::Free, &e, false),
             Decision::AlreadyRoled("cso".into())
         );
     }
@@ -615,7 +820,7 @@ pub(crate) mod tests {
     fn caller_unresolved_binds_nothing() {
         let e = [ent("worker-2", 3, "empty", CFG, CWD)];
         assert_eq!(
-            decide(None, None, Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0, LeaseState::Free, &e),
+            decide(None, None, 10_000.0, LeaseState::Free, &e, false),
             Decision::CallerUnresolved
         );
     }
@@ -667,8 +872,10 @@ pub(crate) mod tests {
         assert!(!same_path(Some("/tmp/proj"), Some(" /tmp/proj")), "선행 공백이 지워졌다");
         // 후보 술어까지 관통시킨다(문자열 함수만 고치고 술어를 놓치는 회귀 차단).
         let e = LiveEntry { cwd: Some("/tmp/proj ".into()), ..ent("worker-2", 3, "empty", CFG, CWD) };
+        let narrow = vec!["/tmp/proj".to_string()];
+        let ax = CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &narrow, narrow_cwd: Some("/tmp/proj"), cwd_source: "live" };
         assert!(
-            !is_candidate(&e, 9, CFG, "/tmp/proj", 10_000.0),
+            !is_candidate(&e, &ax, 10_000.0, false),
             "후행 공백만 다른 cwd 좌석이 후보가 됐다"
         );
     }
@@ -742,46 +949,50 @@ pub(crate) mod tests {
         );
     }
 
-    /// ★신고 축 인증(적대검증 R1 major·blocking): 데몬이 호출 좌석에 대해 **스스로 아는**
-    /// `claude_config_dir`·실제 cwd 와 신고된 `--config`·`--cwd` 가 다르면 **결합하지 않는다**.
-    /// 이것이 없으면 무역할 pane 이 남의 계정 dir·남의 프로젝트 좌석을 신고해 그 역할을
-    /// 가져갈 수 있다(`claim-role` 은 worker 이름을 dedup 하므로 동등한 행위가 아니다).
+    /// ★인증 축은 **데몬 지식**이다(R1 major·blocking → R2 재정의). 종전 판은 훅이 신고한
+    /// `--config`·`--cwd` 를 데몬이 아는 값과 대조했는데, 그 대조는 두 방향으로 틀렸다:
+    ///   ⓐ (codex R2) 인증의 신뢰값 자체를 호출자가 `surface.create` 로 정할 수 있어서, 대조는
+    ///      "내가 쓴 값과 내가 신고한 값이 같다"는 동어반복이 될 수 있었다 →
+    ///      `CallerAxes.cfg` 는 **출처가 데몬일 때만** 채워진다(`Surface.config_dir_trusted`).
+    ///   ⓑ (claude R2) unix pane env 에는 `CLAUDE_CONFIG_DIR` 가 없어 신고가 사실상 항상 비고,
+    ///      사용자가 자기 값을 export 하면 어긋난다 → 정상 설치가 통째로 무결합이었다.
+    /// 그래서 판정은 **양쪽 다 데몬 기록**으로 하고, 신고는 좁히기로만 쓴다
+    /// (`reported_cwd_only_narrows_never_widens`).
     #[test]
-    fn reported_axes_must_match_the_seat_the_daemon_knows() {
+    fn authentication_axes_come_from_the_daemon_not_from_the_caller() {
         const OTHER_CFG: &str = "/Users/cys/.cys/claude-dept-3";
         const OTHER_CWD: &str = "/Users/cys/dev/other-proj";
-        // ⓐ 계정 dir 공격: 후보(남의 계정)와 일치하는 값을 신고 — 데몬이 아는 내 값은 CFG 다.
+        // ⓐ 타 계정 dir 좌석은 후보가 아니다 — 신고로 뒤집을 수 있는 축이 아예 없다.
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), Some(OTHER_CFG), Some(CWD), 10_000.0,
-                   LeaseState::Free, &[ent("worker-2", 3, "empty", OTHER_CFG, CWD)]),
-            Decision::EnvMismatch,
-            "타 계정 dir 신고로 남의 역할을 가져갔다"
+            decide(None, Some(&axes()), 10_000.0, LeaseState::Free,
+                   &[ent("worker-2", 3, "empty", OTHER_CFG, CWD)], false),
+            Decision::NoCandidate,
+            "타 계정 dir 좌석이 후보가 됐다"
         );
-        // ⓑ 프로젝트 공격: 같은 계정 안 **다른 cwd** 좌석을 신고로 가져간다.
+        // ⓑ 같은 계정 안 **다른 프로젝트** 좌석도 후보가 아니다.
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), Some(CFG), Some(OTHER_CWD), 10_000.0,
-                   LeaseState::Free, &[ent("worker-2", 3, "empty", CFG, OTHER_CWD)]),
-            Decision::EnvMismatch,
-            "타 프로젝트 좌석을 자기신고 cwd 로 가져갔다"
+            decide(None, Some(&axes()), 10_000.0, LeaseState::Free,
+                   &[ent("worker-2", 3, "empty", CFG, OTHER_CWD)], false),
+            Decision::NoCandidate,
+            "타 프로젝트 좌석이 후보가 됐다"
         );
-        // ⓒ 결측도 불일치다(결측은 값이 아니다) — 데몬이 그 좌석의 축을 모르면 무결합.
-        let no_cwds: Vec<String> = Vec::new();
-        for (kc, kw) in [
-            (None, &known_cwds()[..]),
-            (Some(CFG), &no_cwds[..]),
-            (None, &no_cwds[..]),
+        // ⓒ 축 결측(신뢰 못 하는 계정 dir·읽지 못한 cwd)은 **무결합**이다 — 결측은 값이 아니다.
+        for ax in [
+            CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" },
+            CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &[], narrow_cwd: None, cwd_source: "unknown" },
+            CallerAxes { sid: 9, cfg: None, known_cwds: &[], narrow_cwd: None, cwd_source: "unknown" },
         ] {
             assert_eq!(
-                decide(Some(9), None, kc, kw, Some(CFG), Some(CWD), 10_000.0, LeaseState::Free,
-                       &[ent("worker-2", 3, "empty", CFG, CWD)]),
-                Decision::EnvMismatch,
-                "데몬이 모르는 좌석이 자기신고만으로 결합했다"
+                decide(None, Some(&ax), 10_000.0, LeaseState::Free,
+                       &[ent("worker-2", 3, "empty", CFG, CWD)], false),
+                Decision::AxesUnknown,
+                "축을 모르는데 결합했다"
             );
         }
-        // ⓓ 정직한 신고는 종전대로 결합한다(이 게이트가 장치를 죽이지 않는다).
+        // ⓓ 축이 다 맞으면 **신고가 없어도** 결합한다(이것이 unix 기본 설치의 주 경로다).
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0,
-                   LeaseState::Free, &[ent("worker-2", 3, "empty", CFG, CWD)]),
+            decide(None, Some(&axes()), 10_000.0, LeaseState::Free,
+                   &[ent("worker-2", 3, "empty", CFG, CWD)], false),
             Decision::Bind { role: "worker-2".into(), from_surface: 3 }
         );
     }
@@ -857,8 +1068,8 @@ pub(crate) mod tests {
         assert_eq!(st, LeaseState::Unavailable, "락 기구 불능이 Free 로 접혔다");
         assert!(g.is_none());
         assert_eq!(
-            decide(Some(9), None, Some(CFG), &known_cwds(), Some(CFG), Some(CWD), 10_000.0, st,
-                   &[ent("worker-2", 3, "empty", CFG, CWD)]),
+            decide(None, Some(&axes()), 10_000.0, st,
+                   &[ent("worker-2", 3, "empty", CFG, CWD)], false),
             Decision::Defer("restore_lease_unavailable"),
             "판정 불능인데 결합했다"
         );

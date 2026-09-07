@@ -43,7 +43,7 @@ export function transferTrees(
   return { src: removeSid(src, sid), dest: appendPane(dest, sid) };
 }
 
-// ── ★(0.14.31 · WP-4 R1) 전출 목적지 좌석 식별 ─────────────────────────────────
+// ── ★(0.14.31 · WP-4 R2) 전출 목적지 좌석 식별 ─────────────────────────────────
 //
 // 무엇을 고치는가: 크로스 부서 전출은 목적지에 **셸 pane** 을 만들고 그 셸에
 // `cys launch-agent …` 를 주입한다. 그런데 `launch-agent` 는 그 셸 안에서 에이전트를 띄우는
@@ -51,25 +51,33 @@ export function transferTrees(
 // 목적지로 삼아, 준비 폴링·핸드오프 큐잉을 **전부 빈 셸에** 하고 원본을 닫았다 — 리뷰어는
 // 핸드오프를 못 받고 작업 세션은 사라진다(리뷰어 blocking).
 //
-// 어떻게 고치는가: 런치 **전** surface id 집합을 스냅샷하고, 그 뒤 나타난 좌석 중
-//   · 런처 셸이 아니고 · 종료되지 않았고 · **역할이 정확히 우리가 시킨 그 역할**이고
-//   · 데몬이 에이전트를 **실제로 관측**했고(`agent` 비어 있지 않음)
-//   · 런치 시각 이후에 생겼고(`created_at`)
-// 그런 좌석이 **정확히 하나**일 때만 그것을 목적지로 확정한다.
-//
-// 왜 이렇게 좁은가(codex 적대검증 R1 blocking 2종):
-//   ⓐ "새로 생겼고 역할이 같다"만으로는 **그 전출의 결과라는 증거가 아니다** — 같은 시간대에
-//      다른 경로가 같은 역할 좌석을 하나 더 띄우면 무관한 좌석에 핸드오프하고 원본을 닫는다.
-//      그래서 후보가 2 이상이면 **확정하지 않는다**(모호는 승계의 근거가 아니다 — reclaim 과 같은 규율).
-//   ⓑ 역할 등록만으로는 각성 증거가 아니다(신뢰 관문 보류 상태로 앉아 있을 수 있다).
-//      `agent` 관측까지 요구해 "CLI 가 실제로 돈다"를 최소한으로 확인한다.
+// R1 은 "런치 뒤에 나타난 같은 역할 좌석이 유일하면 그것"으로 좁혔지만, 그 조건은 **그 전출의
+// 결과라는 증거가 아니다**(codex 적대검증 R2 blocking):
+//   ⓐ `!!s.agent` 는 메타데이터 이름이 등록됐다는 뜻일 뿐 **생존 관측이 아니다** —
+//      `launch-agent` 는 준비 판정 **전에** 메타를 세우고 `agent_seen=false` 로 출발한다.
+//      즉 즉사한 CLI 도, 아직 뜨지도 않은 CLI 도 이 검사를 통과했다.
+//   ⓑ 같은 시간대에 다른 경로가 같은 역할 좌석을 하나 띄우면 **무관한 좌석**이 목적지가 된다.
+//   ⓒ agent 종류(claude/codex/gemini)를 보지 않아 다른 종류의 유일 후보도 선택됐다.
+// 그래서 R2 는 **데몬이 기록한 생성자**(`created_by` — `surface.create` 호출자의 pane id를
+// 데몬이 발신 pid 로 도출해 원장에 적은 값 · 호출자가 신고할 수 없다)를 축으로 삼는다:
+//   · `created_by === 런처 셸 sid` — 이 좌석이 **내가 보낸 그 명령**의 산물이라는 증거
+//   · `agent_alive === true` — 데몬 watchdog 이 그 프로세스를 **실제로 관측**했다(3값 축:
+//     `null` 은 '말할 것이 없음'이고 `false` 는 '종료 통지됨'이다 — 둘 다 확정 근거가 아니다)
+//   · `agent === <--agent 인자>` — 시킨 종류가 떴는가
+//   · 역할 일치 · 미종료 · 런치 이후 생성 · 런치 전 집합에 없음 · **정확히 하나**
 // 확정하지 못하면 **원본을 닫지 않는다**(보상 롤백) — 실패 방향은 언제나 '전출 안 함'이다.
 export type SurfaceRow = {
   surface_id: number;
   role?: string | null;
   agent?: string | null;
+  /** 3값 생존 관측(true=관측됨 · false=종료 통지 · null=말할 것 없음). `agent` 이름과 다르다. */
+  agent_alive?: boolean | null;
   exited?: boolean | null;
   created_at?: number | null;
+  /** 데몬이 기록한 **생성자 pane** — 호출자가 신고할 수 없는 값(surface.list `created_by`). */
+  created_by?: number | null;
+  /** 각성 래치(첫 자기보고 시각) — null 은 '아직 각성 증거 없음'. */
+  awakened_at?: number | null;
 };
 
 export function pickLaunchedAgentSid(
@@ -77,6 +85,7 @@ export function pickLaunchedAgentSid(
   launcherSid: number,
   after: SurfaceRow[],
   wantRole: string,
+  wantAgent: string,
   launchedAt?: number,
 ): number | null {
   const known = new Set(before);
@@ -87,8 +96,25 @@ export function pickLaunchedAgentSid(
       !s.exited &&
       !!s.role &&
       s.role === wantRole &&
+      // ★생성자 증거 — 이 좌석이 그 런처 셸에서 태어났는가(부재=모름이지 아님이 아니다 →
+      //   확정하지 않는다: fail-closed).
+      s.created_by === launcherSid &&
+      // ★생존 **관측**(메타 등록이 아니다). `=== true` 로 3값을 좁힌다.
+      s.agent_alive === true &&
+      // ★시킨 종류가 떴는가(다른 CLI 의 유일 후보를 목적지로 삼지 않는다).
       !!s.agent &&
+      s.agent === wantAgent &&
       (launchedAt == null || s.created_at == null || s.created_at >= launchedAt),
   );
   return hits.length === 1 ? hits[0].surface_id : null;
+}
+
+/** 목적지가 **인계를 받을 수 있는 상태**인가 — 각성 래치(첫 자기보고)가 섰는가.
+ *
+ * ★왜 생존 관측만으로 부족한가(codex 적대검증 R2 blocking): 프로세스가 살아 있어도 신뢰
+ * 관문·인증 화면에 앉아 있을 수 있다. 그 상태에서 원본을 닫으면 인계는 아무도 읽지 않는다.
+ * 래치는 "노드가 지침을 읽고 스스로 신고했다"는 데몬의 단방향 사실이다(status.set 이 유일
+ * write path). 서지 않으면 **원본을 닫지 않는다** — 목적지는 살아 있으니 사람이 판단한다. */
+export function destinationLooksAwake(row: SurfaceRow | undefined): boolean {
+  return !!row && !row.exited && row.awakened_at != null;
 }
