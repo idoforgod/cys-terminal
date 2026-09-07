@@ -3350,9 +3350,16 @@ mod tests {
         let echo_then_live = format!("{echo}{}", fixtures::LIVE_TUI_AT_PROMPT);
         assert!(modal_signature(&echo_then_live).is_none());
         // 건강한 화면 전량 — 관문이 아닌 화면 표에서 **진짜 모달·본문 표**를 뺀 나머지.
-        for &(id, screen) in fixtures::NON_GATE_SCREENS {
-            // ★(0.14.31 · WP-1 H-2) 실측 벤더 모달(2.1.261 커스텀 API 키 확인창)이 셋째 항목이다 —
-            //   그 화면은 코퍼스 밖이지만 `Enter to confirm` ∧ `Esc to cancel` 푸터가 전경이라 모달이다.
+        // ★(0.14.31 · 리뷰 R1) 두 표를 **이어서** 돈다: `NON_GATE_SCREENS`(프로덕션 수리기의 입력 =
+        //   그 화면에서 주입이 옳은 화면)와 `MEASURED_NON_CORPUS_MODALS`(검체 전용 = 코퍼스 밖 모달).
+        //   표를 가른 뒤에도 **모달 판정의 기대표는 하나**여야 한다 — 갈라 두면 어느 한쪽의 회귀가
+        //   조용히 통과한다.
+        for &(id, screen) in fixtures::NON_GATE_SCREENS
+            .iter()
+            .chain(fixtures::MEASURED_NON_CORPUS_MODALS)
+        {
+            // ★(0.14.31 · WP-1 H-2) 실측 벤더 모달(2.1.261 커스텀 API 키 확인창)은 코퍼스 밖이지만
+            //   `Enter to confirm` ∧ `Esc to cancel` 푸터가 전경이라 모달이다.
             let expect_modal = matches!(
                 id,
                 "audit-log-line" | "live-permission-prompt" | "custom-api-key-modal-2.1.261"
@@ -3937,7 +3944,11 @@ mod tests {
     #[test]
     fn non_gate_screens_through_judge_hold_only_true_modals() {
         let gates = first_run_gates::builtin();
-        for &(id, screen) in fixtures::NON_GATE_SCREENS {
+        // ★(0.14.31 · 리뷰 R1) 두 표를 이어서 돈다 — 위 `modal_signature` 기대표와 같은 이유.
+        for &(id, screen) in fixtures::NON_GATE_SCREENS
+            .iter()
+            .chain(fixtures::MEASURED_NON_CORPUS_MODALS)
+        {
             let v = judge(&boot_all_open(screen, &gates));
             match id {
                 // ★(0.14.31 · WP-1 H-2) 실측 벤더 모달(2.1.261 커스텀 API 키 확인창)은 코퍼스 밖이지만

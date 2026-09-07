@@ -702,9 +702,14 @@ enum Command {
     GateCorpus {
         /// 기계 판독 JSON:
         /// `{"measured_on","effective_measured_on","mixed_versions","source","source_detail",
-        ///   "agent","detected_version","notes",
-        ///   "gates":[{"id","title","passability","measured_on","origin","absence_cost",
-        ///             "default_index","action","down_presses","absence_is_fatal"}]}`
+        ///   "override_envelope","policy_enforcement","agent","detected_version","notes",
+        ///   "gates":[{"id","title","needles","widget","confirm_echo","human_reason",
+        ///             "passability","measured_on","absence_cost","default_index","action",
+        ///             "origin","down_presses","absence_is_fatal"}]}`
+        ///
+        /// ★`source` 는 **출처**(어떻게 만들어진 코퍼스인가)이지 봉투의 모드가 아니다.
+        ///   되먹이려면 `override_envelope` 를 통째로 `agents.json` 의 `first_run_gates` 에 넣어라.
+        /// ★`policy_enforcement.enforced=false` — `policy` 열은 진단이지 집행이 아니다.
         #[arg(long)]
         json: bool,
         /// 어댑터 이름 — 코드 정본 코퍼스는 **claude 실측**이다(`MEASURED_ON` 도 claude 버전).
@@ -1926,7 +1931,12 @@ fn resolve_gate_corpus(agent: &str) -> cys::first_run_gates::Resolved {
             cys::first_run_gates::Resolved {
                 gates: cys::first_run_gates::builtin(),
                 notes: vec![format!("어댑터 스펙 판독 실패({e}) — 코드 정본 폴백")],
-                source: cys::first_run_gates::Source::Builtin,
+                // ★(0.14.31 · 리뷰 R1) `Builtin` 으로 접지 않는다 — '덮을 봉투가 없다'(정상)와
+                //   '봉투가 도달하지 못했다'(고장)는 다른 사실이고, 하류(preflight C82 등)가
+                //   그 차이를 알려면 한국어 산문 note 를 되파싱해야 했다. 되파싱은 다음 판에 깨진다.
+                source: cys::first_run_gates::Source::SpecUnreadable {
+                    reason: e.to_string(),
+                },
             }
         }
     };
@@ -1981,8 +1991,23 @@ fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
         report["effective_measured_on"].as_str().unwrap_or("(혼합)"),
         report["gates"].as_array().map(|a| a.len()).unwrap_or(0),
     );
+    // ★(0.14.31 · 리뷰 R1) 판독 실패는 '봉투 없음' 과 다른 사실이다 — 사람용 출력에서도 접지 않는다.
+    if let Some(reason) = report["source_detail"]["reason"].as_str() {
+        println!(
+            "  ⚠ agents.json 어댑터 스펙을 읽지 못했다({reason}) — override 봉투는 이 \
+             보고서에 도달하지 않았다(코드 정본만)"
+        );
+    }
     if let Some(v) = detected {
         println!("detected_version={v}");
+        // ★(0.14.31 · 리뷰 R1) 아래 policy 열은 **진단이지 집행이 아니다.** 이 한 줄이 없으면
+        //   운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는다 — 거짓이다.
+        if !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED {
+            println!(
+                "  ★policy 는 진단이다 — 자동확인 조립은 버전을 보지 않는다(커서 벨트만 본 뒤 \
+                 Return 1발). held_* 를 '키가 안 나간다' 로 읽지 말 것"
+            );
+        }
     }
     for g in report["gates"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let down = g["down_presses"]
@@ -23755,17 +23780,6 @@ mod tests {
         }
     }
 
-    /// ★소스 핀(결함 3·4) — 관문 코퍼스의 **단일 소스**와 관측 실패의 **가시성**.
-    ///
-    /// 【결함 3(P4-4)】 종전엔 소스가 두 벌이었다: 부트 폴링·`adapter_ready` 는
-    /// `resolve_from_spec`(=`agents.json` override 봉투가 도달), **주입 직전 그물**과 부서 소켓
-    /// 판은 `builtin()`. 그래서 벤더 드리프트로 빌트인 관문이 오탐하면 운영자가 문서대로 봉투로
-    /// 고쳐도 그물은 계속 막았다 — BLOCK-3("문서화된 탈출구가 듣지 않았다")과 같은 형태다.
-    /// **소스가 두 벌인 한 override 는 거짓말이다.**
-    ///
-    /// 【결함 4(P4-6)】 화면 관측 실패가 `""` 로 접혀 '관문 없음' 과 구별되지 않았고 **로그가
-    /// 0** 이었다. fail-open 은 선택일 수 있어도 fail-silent 는 아니다 — 그물이 없는 것과 그물이
-    /// 눈을 감은 것은 밖에서 구별되지 않고, 그래서 아무도 고치지 않는다.
     /// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) `cys gate-corpus` 는 **관측 동사**다 — 소스 핀.
     ///
     /// 【왜 소스로 박제하는가】 이 동사의 계약은 "출력이 맞다" 가 아니라 **"아무것도 건드리지
@@ -23784,22 +23798,34 @@ mod tests {
         let i = prod
             .find("fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {")
             .expect("gate-corpus 동사 본체가 사라졌다(CONTRACTS §C)");
-        let end = prod[i..]
-            .find("\n/// ★U-14 주입")
-            .map(|e| i + e)
-            .unwrap_or_else(|| (i + 4000).min(prod.len()));
+        // ★(0.14.31 · 리뷰 R1) 본문 경계는 **함수의 닫는 중괄호**로 잡는다. 종전 경계는 뒤따르는
+        //   doc 주석 문면(`\n/// ★U-14 주입`)이었고, 그 주석이 한 글자만 바뀌면 4,000자 폴백으로
+        //   조용히 넘어가 **다른 함수까지 본문으로 읽었다**(핀이 무엇을 쟀는지 알 수 없어진다).
+        //   최상위 함수의 `\n}` 는 위치가 문면에 의존하지 않는다.
+        let end = i + prod[i..]
+            .find("\n}\n")
+            .expect("gate-corpus 동사 본문의 끝(최상위 `}`)을 찾지 못했다")
+            + 2;
         let body = &prod[i..end];
         assert!(body.contains("resolve_gate_corpus("), "관문 코퍼스 단일 소스를 지나지 않는다");
         assert!(
             !body.contains("cys::first_run_gates::builtin()"),
             "보고서가 코드 정본을 직접 집는다 — override 봉투가 이 경로에만 도달하지 않는다"
         );
+        // ★(0.14.31 · 리뷰 R1) 금지 토큰은 **접두 `request`** 하나로 본다. 종전 목록의
+        //   `"request("` 는 실제 RPC 헬퍼 `request_on(`(:14863) · `request_before(`(:3119) ·
+        //   `request_with_idle_cap(`(:3078) · `request_on_before(`(:12695) 을 부분문자열로 잡지
+        //   못했다 — 그 중 한 줄만 들어와도 핀은 초록이고 idempotency OBSERVE 등재만 거짓이 된다.
+        //   헬퍼가 또 늘어나도 접두는 그대로다(등재 목록을 사람이 따라가지 않아도 된다).
         for forbidden in [
-            "request(",            // 데몬 RPC
+            "request",               // 데몬 RPC — request( · request_on( · request_before( · …
             "std::process::Command", // 서브프로세스(= 스스로 버전을 재는 것)
+            "Command::new",
             "send_key",
             "inject_text",
             "std::fs::write",
+            "fs::write",
+            "OpenOptions",
         ] {
             assert!(
                 !body.contains(forbidden),
@@ -23814,6 +23840,67 @@ mod tests {
         );
     }
 
+    /// ★(0.14.31 · 리뷰 R1) 버전 핀 판정은 **CLI 키 경로 어디에도 배선돼 있지 않다** — 소스 핀.
+    ///
+    /// 【무엇을 막는가】 `cys gate-corpus --detected-version <v>` 는 관문마다 `policy` 를 인쇄한다.
+    /// 운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽지만, 폴더신뢰 자동확인
+    /// 조립(`trust_prompt_hit → confirm_denied → trust_send → Return`)은 **버전을 보지 않고**
+    /// 커서 벨트(`confirm_allowed`)만 본 뒤 Return 1발을 보낸다. 즉 인쇄된 판정과 실제 키 경로가
+    /// 다르다. 그래서 보고서가 `policy_enforcement.enforced=false` 를 함께 싣고, 이 핀이 그 값이
+    /// **거짓말이 아님**(= 실제로 배선 0)을 실행으로 확인한다.
+    ///
+    /// 【범위 — 정직하게】 이 핀이 재는 것은 **이 파일(CLI)** 뿐이다. 그래서 보고서도 범위를
+    /// `scope:"cli-auto-confirm"` 으로 명시한다. 데몬(`cysd`)까지의 전역 주장은 하지 않는다
+    /// (2026-09-08 실측 `grep -rn "action_policy\|ActionPolicy\|down_presses" src/ ui/src` 는
+    ///  `first_run_gates.rs` 밖 호출자 0 이었으나, 그 grep 은 검체가 아니라 관측이다).
+    ///
+    /// 【배선하는 사람에게】 여기서 적색이 나면 상수 한 줄을 올리는 것으로 끝내지 말 것 —
+    /// **키 전송 경로의 집행 검체**(버전 미상·불일치·산출 불가 각각에서 전송 0)를 먼저 넣고,
+    /// 이 핀의 범위를 다시 정한 뒤 `ACTION_POLICY_IS_ENFORCED` 를 올려라.
+    #[test]
+    fn action_policy_is_not_wired_into_any_cli_key_path_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        for token in ["action_policy(", "ActionPolicy", "down_presses()"] {
+            assert_eq!(
+                prod.matches(token).count(),
+                0,
+                "`{token}` 가 CLI 프로덕션에 나타났다 — 버전 핀이 배선됐다면 보고서의 \
+                 policy_enforcement.enforced 가 거짓말이 된다. 상수만 올리지 말고 전송 경로의 \
+                 집행 검체(버전 미상·불일치·산출 불가에서 전송 0)를 먼저 넣고 이 핀의 범위를 \
+                 다시 정하라"
+            );
+        }
+        assert!(
+            !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED,
+            "배선 0인데 상수가 '집행 중' 이라고 말한다(반대 방향의 거짓말)"
+        );
+        // 그리고 그 사실이 **산출물에 실린다**(사람이 코드를 읽지 않아도 된다).
+        let r = cys::first_run_gates::resolve_with(None, true);
+        let report = cys::first_run_gates::report_json(&r, "claude", Some("2.1.263"));
+        assert_eq!(report["policy_enforcement"]["enforced"].as_bool(), Some(false));
+        assert_eq!(
+            report["policy_enforcement"]["scope"].as_str(),
+            Some("cli-auto-confirm"),
+            "집행 범위 표기가 사라졌다 — 범위 없는 '미집행' 은 데몬까지의 전역 주장으로 오독된다"
+        );
+    }
+
+    /// ★소스 핀(결함 3·4) — 관문 코퍼스의 **단일 소스**와 관측 실패의 **가시성**.
+    ///
+    /// 【결함 3(P4-4)】 종전엔 소스가 두 벌이었다: 부트 폴링·`adapter_ready` 는
+    /// `resolve_from_spec`(=`agents.json` override 봉투가 도달), **주입 직전 그물**과 부서 소켓
+    /// 판은 `builtin()`. 그래서 벤더 드리프트로 빌트인 관문이 오탐하면 운영자가 문서대로 봉투로
+    /// 고쳐도 그물은 계속 막았다 — BLOCK-3("문서화된 탈출구가 듣지 않았다")과 같은 형태다.
+    /// **소스가 두 벌인 한 override 는 거짓말이다.**
+    ///
+    /// 【결함 4(P4-6)】 화면 관측 실패가 `""` 로 접혀 '관문 없음' 과 구별되지 않았고 **로그가
+    /// 0** 이었다. fail-open 은 선택일 수 있어도 fail-silent 는 아니다 — 그물이 없는 것과 그물이
+    /// 눈을 감은 것은 밖에서 구별되지 않고, 그래서 아무도 고치지 않는다.
+    ///
+    /// ★(0.14.31 · 리뷰 R1) 이 doc 은 **이 검체의 것**이다. WP-1 H-2 가 바로 위에 신설 검체를
+    ///   끼워 넣으면서 이 블록이 그쪽으로 옮겨 붙어 있었다 — 신설 검체는 BLOCK-3(결함 3·4)를
+    ///   재지 않는다. 근거 기록의 소유자를 되돌린다(정본 §3-8·§8 "기존 핀 일괄 수정 금지" 의 취지).
     #[test]
     fn gate_corpus_has_a_single_production_source_and_observation_failure_is_loud_source_pin() {
         let src = include_str!("cys.rs");

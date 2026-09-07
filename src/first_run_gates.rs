@@ -159,7 +159,10 @@ pub struct Gate {
     /// 안 된다(불변식 검체가 집행 — 2026-07-29 킬체인의 형태).
     pub confirm_echo: Vec<String>,
     pub passability: Passability,
-    /// 실측 기본 포커스(1-based). Return 만 눌렀을 때 선택되는 항목.
+    /// 실측 기본 포커스 — Return 만 눌렀을 때 선택되는 항목. 좌표계는 [`GateAction::select_index`]
+    /// 와 **같다**(화면에 보이는 번호). 벤더가 0 부터 세는 메뉴를 그리면 `0` 도 정당한 값이다
+    /// (정본 §4 H-2: 2.1.261 폴더신뢰는 `0="No, exit"` · `1="Yes, I trust this folder"`).
+    /// `None` = **미측정** → [`Gate::down_presses`] 가 `None` 을 내어 액션이 보류된다(fail-closed).
     /// ★면책 창은 이 값이 `1`(=`No, exit`)이라서 Return 한 발이 좌석을 죽인다.
     pub default_index: Option<u8>,
     pub action: Option<GateAction>,
@@ -666,6 +669,27 @@ impl ActionPolicy {
     }
 }
 
+/// ★(0.14.31 · 리뷰 R1) [`action_policy`] 판정이 **키 경로에 배선돼 있는가**.
+///
+/// 【왜 상수인가 — 무엇을 막는가】 이 판정은 지금 **진단일 뿐**이다. 실측(2026-09-08 · `grep -rn
+/// "action_policy\|ActionPolicy\|down_presses" src/ ui/src`): 이 모듈 **밖에서 호출자가 0**이고,
+/// 폴더신뢰 자동확인 조립(`cys.rs` `trust_prompt_hit → confirm_denied → trust_send → Return`)은
+/// 버전을 보지 않으며 `down_presses()` 를 소비하지 않고 Return 을 **1발**만 보낸다. 그런데
+/// [`report_json`] 이 관문마다 `policy` 를 인쇄하므로, 그것을 읽는 운영자는 `held_version_drift`
+/// 를 "이 버전에선 키가 안 나간다" 로 읽는다 — **거짓이다**(커서 벨트만 통과하면 Return 은 나간다).
+/// 반대로 재핀 뒤의 `allowed` 도 "이 down 이 집행된다" 는 뜻이 아니다.
+///
+/// 그래서 보고서는 이 상수를 함께 싣고(`policy_enforcement.enforced` + `scope`), 소스 핀
+/// (`cys.rs` `action_policy_is_not_wired_into_any_cli_key_path_source_pin`)이 **배선 0** 을 못박는다.
+/// 배선하는 사람은 그 핀이 적색으로 막아서므로 이 상수를 함께 올리게 된다(상수만 남는 거짓
+/// 안심이 구조적으로 불가능하다).
+///
+/// ★핀의 범위는 **CLI 한 파일**이다(그래서 보고서도 `scope:"cli-auto-confirm"` 을 함께 싣는다).
+///   모듈 밖 호출자 0 은 재실측 **2026-09-08 05:41** 의 관측이고 — `first_run_gates.rs` 밖 히트
+///   7건 전부가 JSON 키 문자열·doc·그 핀 자신·"호출하지 않는다"는 cysd 주석이었다 — 관측은
+///   검체가 아니다. 데몬까지의 전역 주장은 하지 않는다(codex 설계 검토 R1).
+pub const ACTION_POLICY_IS_ENFORCED: bool = false;
+
 /// ★버전 핀 게이트. 보류의 귀결은 언제나 '아무 키도 보내지 않음' 이므로 이 게이트는
 /// **오살 방향으로 열리지 않는다** — 잘못 보류하면 사람이 한 번 눌러 주면 되고,
 /// 잘못 집행하면 좌석이 죽는다(면책 창 rc 1). 비대칭이 이 fail-closed 를 정당화한다.
@@ -745,6 +769,14 @@ pub enum Source {
     Replaced { count: usize },
     /// 롤백 스위치로 override 파싱이 꺼져 있다.
     OverrideDisabled,
+    /// ★(0.14.31 · 리뷰 R1) 어댑터 스펙(`agents.json`)을 **읽지 못해서** 코드 정본으로 되돌아왔다.
+    ///
+    /// [`Builtin`](Source::Builtin) 과 **다른 사실**이다: `Builtin` 은 "덮을 봉투가 없다"(정상)이고
+    /// 이것은 "봉투가 있었을지도 모르는데 도달하지 못했다"(고장)이다. 두 사실을 한 값으로 접으면
+    /// 하류(preflight C82 등)가 "봉투가 도달했나" 를 알려면 한국어 산문 note 를 되파싱해야 하고,
+    /// 되파싱은 다음 판에 반드시 깨진다. 이 변이는 [`resolve_raw`] 가 만들지 않는다 — 스펙을 읽는
+    /// 것은 호출부(`cys.rs resolve_gate_corpus`)이고, 이 모듈은 이미 읽힌 봉투만 받는다.
+    SpecUnreadable { reason: String },
 }
 
 /// 코퍼스 해소 결과. `notes` 는 사람용 진단이며 **판정 재료가 아니다**(호출부가 원할 때 표출).
@@ -761,6 +793,24 @@ pub struct Resolved {
 /// 소유한 것은 이 모듈이다. 문자열을 CLI 에서 다시 지으면 override 봉투가 읽는 어휘
 /// ([`parse_passability`]·[`parse_absence_cost`])와 **두 벌**이 되고, 그 순간 보고서는 봉투로
 /// 되먹일 수 없는 방언이 된다. 그래서 산출 문자열은 봉투 파서가 **되읽을 수 있는 값**과 같다.
+///
+/// 【되먹임은 `override_envelope` 로 한다 — 0.14.31 리뷰 R1】 종전 보고서는 `needles`·`widget`·
+/// `confirm_echo`·`human_reason` 을 싣지 않았고, 최상위 `source`(출처: `replaced`)가 봉투의
+/// **모드** 어휘(`replace`)와 이름만 같고 값이 달랐다. 그래서 보고서를 그대로 `agents.json` 에
+/// 붙여 넣으면 ⓐ replace 가 미지 값 → **builtin 병합으로 강등**되고 ⓑ 사용자 신설 관문은 needle
+/// 결손으로 [`parse_new_gate`] 가 거부해 **소멸**했다 — 문서화된 탈출구가 운영자의 관문을 지웠다.
+///
+/// 수리는 어휘를 섞는 쪽이 아니라 **나누는** 쪽이다:
+///   · `source`/`source_detail` — **출처**(이 코퍼스가 어떻게 만들어졌나). 봉투에 넣는 값이 아니다.
+///   · `override_envelope` — 그대로 붙여 넣으면 **같은 코퍼스를 재현**하는 봉투. 모드(`source`)를
+///     스스로 싣고 선언 축을 전량 싣는다. 되먹임의 유일한 정당 경로다.
+///   · [`envelope_mode`] 는 보고서 출처 어휘를 모드로 **읽지 않고**(별칭은 새 권한을 연다 —
+///     codex 설계 검토 R1) 병합에 착지시킨 뒤 `override_envelope` 를 이름으로 지목한다.
+///
+/// 무손실의 범위는 **식별 가능한 관문**(needle ≥ 1)의 선언 축 전량이다. 자기규칙 수리로 needle 이
+/// 0개가 된 관문은 재파싱에서 거부되는데, 그 관문은 이미 어떤 화면도 식별하지 못하는 불활성
+/// 선언이라 사라져도 판정이 한 톨도 바뀌지 않는다. 집행은 검체
+/// `gate_corpus_override_envelope_round_trips_builtin_merged_and_replaced_corpora`.
 ///
 /// 【`measured_on` 두 필드의 의미 분리(codex 설계 검토 Q4)】
 ///   · `measured_on` — **언제나 코드 내장 상수**([`MEASURED_ON`]). 상태에 따라 뜻이 바뀌지 않는
@@ -787,35 +837,51 @@ pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> 
     } else {
         None
     };
+    // 관문 하나의 **선언 축**(= override 봉투가 읽는 것 전부). 보고서 gates[] 와
+    // `override_envelope.gates[]` 가 이 한 벌을 공유한다 — 두 벌로 지으면 되먹임이 다음 판에 깨진다.
+    let declaration = |g: &Gate| -> serde_json::Map<String, Value> {
+        let mut o = serde_json::Map::new();
+        o.insert("id".into(), Value::from(g.id.as_str()));
+        o.insert("title".into(), Value::from(g.title.as_str()));
+        // ★식별 축(0.14.31 · 리뷰 R1) — 이것이 없으면 보고서는 **되먹일 수 없다**:
+        //   `parse_new_gate` 가 needle 결손 선언을 거부하므로 사용자 신설 관문이 소멸한다.
+        o.insert("needles".into(), Value::from(g.needles.clone()));
+        o.insert("widget".into(), Value::from(g.widget.clone()));
+        o.insert("confirm_echo".into(), Value::from(g.confirm_echo.clone()));
+        o.insert(
+            "human_reason".into(),
+            g.human_reason.as_deref().map(Value::from).unwrap_or(Value::Null),
+        );
+        o.insert("passability".into(), Value::from(passability_str(g.passability)));
+        o.insert("measured_on".into(), Value::from(g.measured_on.as_str()));
+        o.insert(
+            "absence_cost".into(),
+            Value::from(absence_cost_str(g.absence_cost)),
+        );
+        o.insert(
+            "default_index".into(),
+            g.default_index.map(Value::from).unwrap_or(Value::Null),
+        );
+        o.insert(
+            "action".into(),
+            match g.action.as_ref() {
+                None => Value::Null,
+                Some(a) => serde_json::json!({
+                    "select_index": a.select_index,
+                    "label": a.label,
+                    "literal": a.literal,
+                }),
+            },
+        );
+        o
+    };
     let gates: Vec<Value> = resolved
         .gates
         .iter()
         .map(|g| {
-            let mut o = serde_json::Map::new();
-            o.insert("id".into(), Value::from(g.id.as_str()));
-            o.insert("title".into(), Value::from(g.title.as_str()));
-            o.insert("passability".into(), Value::from(passability_str(g.passability)));
-            o.insert("measured_on".into(), Value::from(g.measured_on.as_str()));
+            let mut o = declaration(g);
+            // ── 아래는 **파생**이다(선언이 아니다). 봉투는 이 축들을 읽지 않는다.
             o.insert("origin".into(), Value::from(origin_str(g.origin)));
-            o.insert(
-                "absence_cost".into(),
-                Value::from(absence_cost_str(g.absence_cost)),
-            );
-            o.insert(
-                "default_index".into(),
-                g.default_index.map(Value::from).unwrap_or(Value::Null),
-            );
-            o.insert(
-                "action".into(),
-                match g.action.as_ref() {
-                    None => Value::Null,
-                    Some(a) => serde_json::json!({
-                        "select_index": a.select_index,
-                        "label": a.label,
-                        "literal": a.literal,
-                    }),
-                },
-            );
             o.insert(
                 "down_presses".into(),
                 g.down_presses().map(Value::from).unwrap_or(Value::Null),
@@ -827,10 +893,40 @@ pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> 
             Value::Object(o)
         })
         .collect();
+    // ★붙여 넣을 수 있는 봉투(0.14.31 · 리뷰 R1). 보고서의 `source` 는 **출처**라 봉투의 **모드**가
+    //   아니고, 그 둘을 이름이 같다는 이유로 섞으면 replace 가 병합으로 뒤집힌다([`envelope_mode`]).
+    //   그래서 되먹임용 봉투를 따로, 모드를 스스로 싣게 해서 낸다.
+    let envelope_gates: Vec<Value> = resolved
+        .gates
+        .iter()
+        .map(|g| Value::Object(declaration(g)))
+        .collect();
     serde_json::json!({
         "agent": agent,
         "source": source_kind(&resolved.source),
         "source_detail": source_detail(&resolved.source),
+        "override_envelope": {
+            "source": if matches!(resolved.source, Source::Replaced { .. }) { "replace" } else { "builtin" },
+            "measured_on": MEASURED_ON,
+            "gates": envelope_gates,
+        },
+        // ★(0.14.31 · 리뷰 R1) `policy` 는 **진단이지 집행이 아니다** — 이 사실을 산출물이 스스로
+        //   싣는다. 없으면 운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는데,
+        //   실제 키 경로(CLI 자동확인 조립)는 버전을 보지 않는다([`ACTION_POLICY_IS_ENFORCED`] doc).
+        "policy_enforcement": {
+            "enforced": ACTION_POLICY_IS_ENFORCED,
+            "scope": "cli-auto-confirm",
+            "note": if ACTION_POLICY_IS_ENFORCED {
+                "action_policy 가 키 경로에 배선돼 있다 — policy 는 집행 판정이다"
+            } else {
+                concat!(
+                    "action_policy 는 CLI 자동확인 조립 어느 지점에도 배선돼 있지 않다(실측 ",
+                    "2026-09-08). policy 는 **진단**이며, 그 조립은 버전을 보지 않고 커서 벨트",
+                    "(confirm_allowed)만 본 뒤 Return 1발을 보낸다. held_* 를 '이 버전에선 키가 ",
+                    "안 나간다' 로, allowed 를 'down 이 집행된다' 로 읽지 말 것"
+                )
+            },
+        },
         "measured_on": MEASURED_ON,
         "effective_measured_on": effective,
         "mixed_versions": versions.len() > 1,
@@ -873,6 +969,7 @@ fn source_kind(s: &Source) -> &'static str {
         Source::Merged { .. } => "merged",
         Source::Replaced { .. } => "replaced",
         Source::OverrideDisabled => "override_disabled",
+        Source::SpecUnreadable { .. } => "spec_unreadable",
     }
 }
 
@@ -883,6 +980,7 @@ fn source_detail(s: &Source) -> Value {
             serde_json::json!({"overridden": overridden, "added": added})
         }
         Source::Replaced { count } => serde_json::json!({"count": count}),
+        Source::SpecUnreadable { reason } => serde_json::json!({"reason": reason}),
     }
 }
 
@@ -927,13 +1025,15 @@ pub fn resolve_from_spec(spec: &Value) -> Resolved {
 ///
 /// 봉투 형식:
 /// ```json
-/// { "source": "builtin" | "replace",
+/// { "source": "builtin" | "replace",     // 보고서 출처 어휘는 모드가 아니다 — envelope_mode
 ///   "measured_on": "2.1.241",
 ///   "gates": [ { "id": "...", "needles": [...], ... } ] }
 /// ```
 /// 규칙 — ① 손상된 선언은 **그 항목만** 버리고 코드 정본을 유지한다(부트를 멈추지 않는다).
 /// ② `HumanOnly` 로 실측된 관문은 override 로 **기계 통과로 승격되지 않는다**(로그인은 우회
 /// 불가라는 것이 측정 결과이지 정책이 아니다). 반대 방향(Machine→HumanOnly)은 조이는 쪽이라 허용.
+/// ★두 경로 모두 막는다(0.14.31 · 리뷰 R1): 병합은 [`apply_patch`], 교체는
+/// [`restore_human_only_builtin_floor`] — 종전엔 교체 경로에 이 거부가 없었다.
 /// ③ `replace` 인데 **파싱 가능한 선언이 0건**이면 코드 정본으로 되돌린다 — 빈 코퍼스는
 /// '관문 없음'이 아니라 '눈을 감음'이고, 뒤 단위가 '관문 0매칭'을 ready 의 AND 항으로 쓰는
 /// 순간 허위 ready 가 된다. ★이 폴백은 **`resolve_raw` 안에서만** 산다: 사용자가 유효하게
@@ -951,6 +1051,8 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
     //   [`enforce_absence_cost`] 는 '집행 전후 대조' 라 replace 모드에서는 눈이 멀어 있다 —
     //   그 모드의 `pre` 는 사용자 목록이라 빌트인 Fatal 관문이 **순회 대상에 애초에 없다**.
     let gates = restore_fatal_builtin_floor(gates, &mut notes);
+    // ★그리고 **사람 1회** 바닥(0.14.31 · 리뷰 R1 · codex 지적). Fatal 바닥과 같은 자리·같은 이유.
+    let gates = restore_human_only_builtin_floor(gates, &mut notes);
     // ★집행 전 코퍼스를 남긴다 — 아래 [`enforce_absence_cost`] 가 "집행이 부재의 비용을
     //   넘지 않았는가" 를 **대조로** 판정하려면 전후 두 벌이 있어야 한다.
     let pre = gates.clone();
@@ -1005,6 +1107,45 @@ fn restore_fatal_builtin_floor(mut gates: Vec<Gate>, notes: &mut Vec<String>) ->
                 ));
                 gates.push(b);
             }
+        }
+    }
+    gates
+}
+
+/// ★사람 1회 바닥 — [`Passability::HumanOnly`] 로 **실측된** 빌트인 관문은 어떤 해소 모드에서도
+/// 기계 통과로 승격되지 않는다(0.14.31 · 리뷰 R1 · codex 설계 검토 지적).
+///
+/// 【무엇이 뚫려 있었는가】 병합 경로의 [`apply_patch`] 는 `human_only → machine` 승격을 이미
+/// 거부한다. 그런데 **replace 경로**는 [`parse_new_gate`] 를 지나고 그 함수에는 같은 거부가 없다.
+/// 그래서 `{"source":"replace","gates":[{"id":"login-method","passability":"machine",
+/// "action":{...},"needles":[...]}]}` 한 줄이면 OAuth 화면에 키가 나간다 — 좌석은 브라우저 대기에
+/// 갇힌 채 **살아 있고**, 생존만 보는 판정이 그것을 영원히 '준비됨' 으로 읽는다(허위 READY 영구화).
+/// 로그인이 사람 1회를 요구하는 것은 **정책이 아니라 측정 결과**이므로(자격증명 경로해시 봉인 ·
+/// OAuth 무한 루프) 선언으로 뒤집게 두면 거짓 전제 위에서 키를 쏘게 된다(정본 §8).
+///
+/// 【무엇을 하지 않는가】 사용자 선언을 지우지 않는다 — id 를 가로챈 선언은 코퍼스에 그대로 남고
+/// **통과 가능성 축과 액션만** 실측값으로 되돌린다(Fatal 바닥의 비용 축과 같은 비대칭).
+/// 반대 방향(`machine → human_only`)은 조이는 쪽이라 건드리지 않는다.
+fn restore_human_only_builtin_floor(mut gates: Vec<Gate>, notes: &mut Vec<String>) -> Vec<Gate> {
+    for b in builtin()
+        .into_iter()
+        .filter(|b| b.passability == Passability::HumanOnly)
+    {
+        let Some(g) = gates.iter_mut().find(|g| g.id == b.id) else {
+            continue; // 부재는 Fatal 바닥이 이미 다뤘다(그쪽이 복원 주체다).
+        };
+        if g.passability == Passability::HumanOnly && g.action.is_none() {
+            continue;
+        }
+        notes.push(format!(
+            "{}: 선언이 **사람 1회**로 실측된 관문을 기계 통과로 승격시켰다 — 실측값(human_only · \
+             액션 없음)으로 되돌린다(기계 통과 불가는 정책이 아니라 측정이다)",
+            g.id
+        ));
+        g.passability = Passability::HumanOnly;
+        g.action = None;
+        if g.human_reason.is_none() {
+            g.human_reason = b.human_reason.clone();
         }
     }
     gates
@@ -1155,6 +1296,59 @@ fn enforce_absence_cost(pre: &[Gate], kept: &mut Vec<Gate>, notes: &mut Vec<Stri
     }
 }
 
+/// 봉투 `source` 필드가 지시하는 **해소 모드**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeMode {
+    /// 선언된 것만이 코퍼스다(사용자 주권 · 빈 선언이면 정본 폴백).
+    Replace,
+    /// 코드 정본 위에 덮는다(기본값 · 미지 값의 안전한 착지점).
+    Merge,
+}
+
+/// [`report_json`] 이 인쇄하는 **출처 어휘** — 봉투 모드가 아니다([`envelope_mode`] 참조).
+const REPORT_SOURCE_WORDS: &[&str] = &["builtin", "merged", "replaced", "override_disabled", "spec_unreadable"];
+
+/// ★(0.14.31 · 리뷰 R1) 봉투 `source` 를 모드로 옮긴다 — 그리고 **보고서 어휘를 모드로 읽지
+/// 않는다**(같은 이름의 두 어휘를 구별해 크게 말한다).
+///
+/// 【무엇이 틀렸었는가】 보고서는 **출처**를 `builtin|merged|replaced|override_disabled` 로
+/// 인쇄하고 봉투는 **모드**를 `builtin|replace` 로 읽는다. 이름이 같아서, `cys gate-corpus --json`
+/// 산출을 그대로 `agents.json` 에 붙여 넣으면 `"replaced"` 가 미지 값으로 접혀 **replace 가 병합으로
+/// 조용히 뒤집혔다**. 게다가 종전 보고서는 needle 을 싣지 않아 사용자 신설 관문이 재파싱에서
+/// 거부돼 **소멸**했다 — 문서화된 탈출구가 운영자의 관문을 지우는 경로였다(BLOCK-3 형태).
+///
+/// 【왜 별칭(`replaced`→replace)으로 고치지 않는가 — codex 설계 검토 R1 채택】 별칭은 **새 권한**을
+/// 연다: 같은 입력이 병합에서 교체로 바뀌면 ⓐ 편집 중 빠뜨린 Recoverable 관문이 사라지고,
+/// ⓑ [`parse_new_gate`] 는 [`apply_patch`] 와 달리 `human_only → machine` 승격을 거부하지 않으므로
+/// 편집된 보고서가 로그인 관문을 기계 통과로 선언할 수 있다. 그래서 모드는 **넓히지 않는다** —
+/// 보고서 어휘는 종전대로 [`EnvelopeMode::Merge`](빌트인 6관문이 남는 쪽 = 안전 방향)에 착지하되,
+/// 조용히가 아니라 **무엇을 붙여 넣어야 하는지 이름으로 지목**한다: `report_json` 의
+/// `override_envelope` 축이 곧 그 자리에 붙여 넣을 봉투다(그 봉투는 모드를 스스로 싣는다).
+///
+/// ★승격 거부의 빈틈 자체는 [`restore_human_only_builtin_floor`] 가 replace 경로에서도 닫는다.
+fn envelope_mode(raw: Option<&str>, notes: &mut Vec<String>) -> EnvelopeMode {
+    let raw = raw.map(str::trim).unwrap_or("builtin");
+    match raw {
+        "replace" => EnvelopeMode::Replace,
+        "builtin" => EnvelopeMode::Merge,
+        other => {
+            if REPORT_SOURCE_WORDS.contains(&other) {
+                notes.push(format!(
+                    "{ADAPTER_KEY}.source={other:?} 는 `cys gate-corpus` 보고서의 **출처** 어휘이지 \
+                     봉투의 **모드**(`builtin`|`replace`)가 아니다 — builtin 병합으로 취급했다. \
+                     보고서를 되먹이려면 보고서의 `override_envelope` 축을 그대로 붙여 넣어라 \
+                     (그 봉투는 모드와 선언 축 전량을 스스로 싣는다)"
+                ));
+            } else {
+                notes.push(format!(
+                    "{ADAPTER_KEY}.source={other:?} 는 미지 값 — builtin 병합으로 취급한다"
+                ));
+            }
+            EnvelopeMode::Merge
+        }
+    }
+}
+
 /// 위 [`resolve_with`] 의 해소 본체(자기규칙 집행 **전**의 코퍼스를 만든다).
 fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
     let base = builtin();
@@ -1193,7 +1387,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             source: Source::Builtin,
         };
     };
-    let mode = obj.get("source").and_then(|v| v.as_str()).unwrap_or("builtin");
+    let mode = envelope_mode(obj.get("source").and_then(|v| v.as_str()), &mut notes);
     let default_measured = obj
         .get("measured_on")
         .and_then(|v| v.as_str())
@@ -1205,7 +1399,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
         .map(|a| a.iter().collect())
         .unwrap_or_default();
 
-    if mode == "replace" {
+    if mode == EnvelopeMode::Replace {
         let mut out: Vec<Gate> = Vec::new();
         for d in &decls {
             match parse_new_gate(d, &default_measured) {
@@ -1232,12 +1426,6 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             source: Source::Replaced { count },
         };
     }
-    if mode != "builtin" {
-        notes.push(format!(
-            "{ADAPTER_KEY}.source={mode:?} 는 미지 값 — builtin 병합으로 취급한다"
-        ));
-    }
-
     let mut gates = base;
     let (mut overridden, mut added) = (0usize, 0usize);
     for d in &decls {
@@ -1355,10 +1543,11 @@ fn parse_new_gate(v: &Value, default_measured: &str) -> Result<Gate, String> {
         widget: str_vec(o.get("widget")).unwrap_or_default(),
         confirm_echo: str_vec(o.get("confirm_echo")).unwrap_or_default(),
         passability,
+        // ★0 도 값이다(0.14.31 · 리뷰 R1) — 아래 [`apply_patch`] 의 같은 축 참조.
         default_index: o
             .get("default_index")
             .and_then(|x| x.as_u64())
-            .filter(|n| *n > 0 && *n <= u8::MAX as u64)
+            .filter(|n| *n <= u8::MAX as u64)
             .map(|n| n as u8),
         action: if passability == Passability::HumanOnly {
             None
@@ -1402,12 +1591,41 @@ fn apply_patch(
     if let Some(e) = str_vec(d.get("confirm_echo")) {
         g.confirm_echo = e;
     }
-    if let Some(i) = d
-        .get("default_index")
-        .and_then(|v| v.as_u64())
-        .filter(|n| *n > 0 && *n <= u8::MAX as u64)
-    {
-        g.default_index = Some(i as u8);
+    // ★기본 포커스 축 — **0 도 값이고, 명시 `null` 은 지운다**(0.14.31 · 리뷰 R1).
+    //
+    // 【무엇이 틀렸었는가】 종전 필터는 `n > 0` 이라 `0` 을 조용히 버렸고, 그러면 빌트인 값이
+    // 그대로 남아 봉투는 "고쳤다고 생각하는데 안 고쳐진" 상태가 된다. 그런데 정본 §4 H-2 가
+    // 기입하라고 지시한 값이 바로 그것이다 — 2.1.261 폴더신뢰는 `default_index: Some(0)`
+    // (`0="No, exit"` · `1="Yes, I trust this folder"`) + `action:(1,…)` → `down = 1`. 즉 **문서화된
+    // 탈출구가 정본이 요구하는 정정을 표현하지 못했다.**
+    //
+    // 【`null` = 지움이 왜 안전한가】 `default_index: None` 이면 [`Gate::down_presses`] 가 `None`
+    // 을 내고 그 관문의 액션은 보류된다(fail-closed). 즉 지움은 **조이는 방향**이며, 기본 포커스를
+    // 실측하지 못한 운영자가 "모른다" 를 정직하게 선언할 수 있는 유일한 자리다.
+    //
+    // 【`select_index` 는 왜 0 을 받지 않는가 — 의도된 비대칭】 `default_index` 는 화면을 읽은
+    // **관측**이고 `select_index` 는 키를 쏘는 **지시**다(1-based 화면 번호 계약 · `parse_action`).
+    // 0-based 메뉴의 0번을 액션으로 지목할 수 없다는 표현 불능이 남지만, 그 불능의 귀결은
+    // `action = None` → `HeldNoAction` = **보류**라 실패 방향이 옳다(§3-3).
+    if d.contains_key("default_index") {
+        match d.get("default_index") {
+            Some(v) if v.is_null() => {
+                g.default_index = None;
+                notes.push(format!(
+                    "{}: default_index 를 명시 null 로 지웠다 — 이 관문의 아래키 수는 이제 \
+                     산출되지 않는다(보류)",
+                    g.id
+                ));
+            }
+            Some(v) => match v.as_u64().filter(|n| *n <= u8::MAX as u64) {
+                Some(i) => g.default_index = Some(i as u8),
+                None => notes.push(format!(
+                    "{}: default_index 선언이 손상({v}) — 종전 기본 포커스 유지",
+                    g.id
+                )),
+            },
+            None => {}
+        }
     }
     match parse_passability(d.get("passability")) {
         // ★조이는 방향만 허용. 로그인·OAuth 가 사람 1회를 요구하는 것은 정책이 아니라 측정
@@ -1663,13 +1881,25 @@ pub mod fixtures {
     // ── ★2026-09-08 실측(WP-1 H-2 · claude 2.1.261/2.1.263 · 격리 CLAUDE_CONFIG_DIR) ──────
     //
     // 【무엇을 쟀나】 버려 쓰는 `CLAUDE_CONFIG_DIR` 로 claude 2.1.261 을 격리 데몬의 PTY 좌석에
-    // 띄우고 화면만 읽었다. 본 관문은 **theme · login-method 둘뿐**이다 — 그 다음은
+    // 띄워 화면을 읽었다. 본 관문은 **theme · login-method 둘뿐**이다 — 그 다음은
     // `login-method`(HumanOnly · action 없음)의 벽이라 기계가 넘을 키가 없다. 그래서
     // 폴더신뢰·면책·fullscreen 은 **못 봤고**, [`MEASURED_ON`] 도 folder-trust 선언도
     // 이 회차에서 움직이지 않는다(정본 §4 H-2 "부분 실측이면 핀을 올리지 않는다").
     //
     // 【왜 더하기만 하는가】 2.1.241 픽스처는 그 버전의 **역사적 관측**이다. 덮어쓰면 그때의
     // 증거가 사라지고, 두 버전 사이의 드리프트를 다시는 대조할 수 없다(§3-8).
+    //
+    // 【★계약 이탈 고지 — 이 검체들은 "키 0" 으로 얻어진 것이 **아니다**】(0.14.31 · 리뷰 R1)
+    // 정본 §4 H-2 의 계측 문면은 "관측만 하고 **키는 보내지 않는다**" 이다. 실제로는 theme 관문에서
+    // `Return` 을 **3발**(2026-09-08 04:31:43 · 04:33:30 · 04:35:1x · 좌석 3개) 보냈다 — 화면의 기본
+    // 포커스(`❯ 2. Dark mode ✔`)를 먼저 읽어 코퍼스 선언(`default_index=Some(2)` · `action=(2,"Dark
+    // mode")` → `down_presses()==Some(0)`)과 대조한 뒤, "Return 이 곧 선언된 통과 액션" 인 자리에서만
+    // 눌렀다. 그럼에도 **집행 층위에서는 보류였다**: `action_policy(theme, Some("2.1.261"))` 는
+    // 코퍼스 실측본이 2.1.241 이라 [`ActionPolicy::HeldVersionDrift`] 다. 즉 "버전 핀을 통과한 키만
+    // 보냈다" 고 말할 수 없다. 귀결은 버려 쓰는 config dir 의 테마 1개(가역)이고 라이브 설치본은
+    // 무접촉(계측 전후 `~/.claude.json`·`~/.claude` mtime 동일)이었으나, 문면과 행위가 다르다는
+    // 사실은 남는다 — 다음 회차 계측 지시는 "키 0" 인지 "선언 액션 1발 허용" 인지 **명문화**할 것.
+    // (`impl/R5-WP1-H2-corpus-notes.md` §1-3 이 전량 기록 · 그 밖의 키는 0발.)
 
     /// ★실측(2026-09-08 04:31 · claude **2.1.261** · 격리 CLAUDE_CONFIG_DIR · 120x40 PTY).
     /// 인사 배너(ASCII 아트 15줄)는 한 줄로 접고, 미리보기 괘선은 폭만 40 으로 줄였다
@@ -1716,6 +1946,13 @@ pub mod fixtures {
         ";
 
     /// ★실측(2026-09-08 04:34 · claude 2.1.261) — **코퍼스에 없는** 벤더 모달.
+    ///
+    /// ★키 자리 마스킹 규약(0.14.31 · 리뷰 R1). 화면에 찍힌 것은 프로브가 넣은 더미 값의 벤더
+    ///   절단본이었다. 이 모듈은 `cfg(test)` 가 아니라 **출하 바이너리에 실리는** `pub mod` 이므로
+    ///   (`strings target/debug/cys` 에 그대로 잡힌다) 리포 관례대로 `sk-ant-…(마스킹)` 으로 봉한다
+    ///   (`scripts/fake_agent.py:193` 과 같은 문면). `<cwd>` 자리표시자와 같은 규약이며 **판정에는
+    ///   쓰이지 않는다** — 이 화면의 판정 축은 needle(질문 문면) 부재와 푸터(`Enter to confirm` ∧
+    ///   `Esc to cancel`) 둘뿐이고, 어느 축도 이 줄을 보지 않는다.
     pub const CUSTOM_API_KEY_MODAL_2_1_261: &str = "\
         Welcome to Claude Code v2.1.261\n\
         \x20…배너…\n\
@@ -1724,7 +1961,7 @@ pub mod fixtures {
         ────────────────────────────────────────\n\
         \x20 Detected a custom API key in your environment\n\
         \n\
-        \x20 ANTHROPIC_API_KEY: sk-ant-...alid-local-tui-probe\n\
+        \x20 ANTHROPIC_API_KEY: sk-ant-…(마스킹)\n\
         \n\
         \x20 Do you want to use this API key?\n\
         \n\
@@ -1760,12 +1997,26 @@ pub mod fixtures {
         \x20 Syntax theme: Monokai Extended (ctrl+t to disable)\n\
         ";
 
+    /// ★**관문이 아닌 화면** 표 — 그리고 이것은 테스트 자료가 아니라 **프로덕션 입력**이다.
+    ///
+    /// 소비 경로: [`super::needle_non_gate_hits`] → [`super::gate_rule_violations`] →
+    /// [`super::repair_gate`]. 즉 여기 실린 화면에 걸리는 needle 은 **런타임에 제거되거나 정본으로
+    /// 복원된다**. 그래서 이 표에 무엇을 넣는가는 "검체 커버리지" 문제가 아니라 **어떤 문면을
+    /// 관문의 근거로 쓸 수 없게 만드는가** 의 문제다.
+    ///
+    /// ## 등재 기준 (0.14.31 · 리뷰 R1 — codex 지적 채택)
+    ///
+    /// **그 화면에서 주입이 옳은 화면만 넣는다.** 정상 프롬프트·라이브 세션 화면·문서/로그 본문이
+    /// 그것이다(`live-permission-prompt`·`audit-log-line` 은 모달 어휘를 갖지만 **첫기동 관문이
+    /// 아니라 라이브 세션의 화면**이라 남는다 — 첫기동 관문 코퍼스가 그 문면으로 성립하면 그것은
+    /// 정의상 오탐이고, 귀결은 영구 부트 라이브락이다).
+    ///
+    /// **첫기동에 뜨는 코퍼스 밖 모달은 넣지 않는다** → [`MEASURED_NON_CORPUS_MODALS`].
+    /// 넣으면 그 문면을 needle 로 선언한 **사용자 신설 관문의 needle 이 제거되어**(`repair_gate`
+    /// 의 사용자 관문 팔) 관문이 식별 불능이 된다. 그것은 문서화된 탈출구(agents.json 봉투)를
+    /// 그 화면에 한해 영구히 닫는 것이고, `CYS_READINESS_V1=1`(모달 폴백 off)에서는 보류가
+    /// **주입 허용**으로 뒤집힌다 — 실패 방향의 역전이다(정본 §3-3).
     pub const NON_GATE_SCREENS: &[(&str, &str)] = &[
-        // ★실측 벤더 모달(2026-09-08 · 2.1.261) — 코퍼스 **밖**이다. 여기 등재하는 이유는
-        //   "어떤 needle 도 이 화면에 단독으로 걸리지 않는다" 를 전수로 집행받기 위해서다.
-        //   판정 기대값은 Ready 가 아니라 `unknown-modal` 보류이며, 그 예외는 readiness
-        //   `non_gate_screens_through_judge_hold_only_true_modals` 의 모달 팔이 소유한다.
-        ("custom-api-key-modal-2.1.261", CUSTOM_API_KEY_MODAL_2_1_261),
         ("live-tui-2.1.261-nbsp-prompt", LIVE_TUI_2_1_261_NBSP_PROMPT),
         ("ready-shell", READY_SHELL),
         ("healthy-welcome-box", HEALTHY_WELCOME_BOX),
@@ -1778,6 +2029,23 @@ pub mod fixtures {
         ("config-theme-setting", CONFIG_THEME_SETTING),
         ("account-status-panel", ACCOUNT_STATUS_PANEL),
         ("doc-mentioning-oauth-url", DOC_MENTIONING_OAUTH_URL),
+    ];
+
+    /// ★코퍼스 **밖**의 첫기동 벤더 모달(실측) — [`NON_GATE_SCREENS`] 와 **다른 표**다.
+    ///
+    /// 【두 표가 왜 갈라져 있는가】 위 표는 프로덕션 수리기의 입력이고(그 화면에 걸리는 needle 은
+    /// 제거된다), 이 표는 **검체 전용**이다. 여기 실린 화면은 "정상 화면" 이 아니라 **코퍼스가
+    /// 아직 모르는 모달**이며, 그 화면에서 옳은 귀결은 주입이 아니라 **보류**다. 그러므로
+    ///   ⓐ [`super::needle_non_gate_hits`] 는 이 표를 **보지 않는다**(보면 그 문면으로 관문을
+    ///      선언한 운영자의 needle 이 조용히 지워진다 — 리뷰 R1 codex 지적).
+    ///   ⓑ 대신 검체가 "어떤 **빌트인** needle 도 이 화면에 단독으로 걸리지 않는다"(오탐 0)와
+    ///      "판정은 `unknown-modal` 보류"(미탐 0)를 **직접** 집행한다
+    ///      (`builtin_needles_never_hit_an_out_of_corpus_modal` ·
+    ///       readiness `non_gate_screens_through_judge_hold_only_true_modals`).
+    ///
+    /// 두 표의 id 는 겹치지 않는다(`the_two_screen_tables_are_disjoint` 가 집행).
+    pub const MEASURED_NON_CORPUS_MODALS: &[(&str, &str)] = &[
+        ("custom-api-key-modal-2.1.261", CUSTOM_API_KEY_MODAL_2_1_261),
     ];
 
     /// ★정본 소스 열람 — needle 이 **본문으로** 실린 화면(`cat src/first_run_gates.rs`).
@@ -1984,6 +2252,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// ★두 화면 표는 **겹치지 않는다** — 그리고 코퍼스 밖 모달은 프로덕션 수리기의 입력이 아니다.
+    ///
+    /// 【무엇을 막는가 — 0.14.31 리뷰 R1 · codex 지적】 [`fixtures::NON_GATE_SCREENS`] 는 검체
+    /// 자료가 아니라 [`needle_non_gate_hits`] → [`gate_rule_violations`] → [`repair_gate`] 로
+    /// 이어지는 **운영 입력**이다. 첫기동에 뜨는 코퍼스 밖 모달을 거기 등재하면, 그 화면 문면을
+    /// needle 로 선언한 운영자의 관문이 런타임에 **needle 을 잃고 식별 불능**이 된다 — 문서화된
+    /// 탈출구(agents.json 봉투)가 그 화면에 한해 영구히 닫히고, `CYS_READINESS_V1=1`(모달 폴백
+    /// off)에서는 보류가 **주입 허용**으로 뒤집힌다. 실패 방향의 역전이다(정본 §3-3).
+    #[test]
+    fn out_of_corpus_modals_are_not_production_repair_input() {
+        // ⓐ 두 표는 id 가 겹치지 않는다.
+        for &(mid, _) in fixtures::MEASURED_NON_CORPUS_MODALS {
+            assert!(
+                !fixtures::NON_GATE_SCREENS.iter().any(|&(sid, _)| sid == mid),
+                "{mid}: 코퍼스 밖 모달이 '관문이 아닌 화면' 표에도 있다 — 그 문면으로 선언한 \
+                 사용자 관문의 needle 이 조용히 제거된다"
+            );
+        }
+        // ⓑ 수리기의 판정 핵이 모달 표를 **보지 않는다**(그 문면은 needle 위반이 아니다).
+        for &(mid, screen) in fixtures::MEASURED_NON_CORPUS_MODALS {
+            for line in screen.lines().map(str::trim).filter(|l| l.ends_with('?')) {
+                assert!(
+                    needle_non_gate_hits(line).is_empty(),
+                    "{mid}: 모달의 질문 문면 {line:?} 이 '정상 화면에 걸린다' 로 판정된다"
+                );
+            }
+        }
+        // ⓒ 그래도 **빌트인** needle 은 그 화면에 걸리지 않는다(오탐 0 — 등재의 원래 목적).
+        for g in builtin() {
+            for n in &g.needles {
+                for &(mid, screen) in fixtures::MEASURED_NON_CORPUS_MODALS {
+                    let (norm, flat) = (normalize(screen), flatten(screen));
+                    assert!(
+                        !norm.contains(&normalize(n)) && !flat.contains(&flatten(n)),
+                        "{}: needle {n:?} 이 코퍼스 밖 모달 {mid} 에 걸린다",
+                        g.id
+                    );
+                }
+            }
+        }
+        // ⓓ 그리고 코퍼스는 그 화면을 **관문으로 식별하지 않는다**(미탐이 아니라 '모르는 화면').
+        for &(mid, screen) in fixtures::MEASURED_NON_CORPUS_MODALS {
+            assert!(identify(&builtin(), screen).is_none(), "{mid}: 코퍼스 밖 모달을 오탐했다");
+        }
+    }
+
+    /// ★반례 — 운영자가 **그 모달을 관문으로 선언하면 그것은 살아남는다**(0.14.31 · 리뷰 R1).
+    ///
+    /// 위 표 분리가 실제로 무엇을 되살렸는지를 재는 검체다. 분리 전에는 이 선언의 needle 이
+    /// `repair_gate` 의 사용자 관문 팔에서 제거돼(남은 needle 0건) 관문이 아무 화면도 식별하지
+    /// 못했다 — 선언은 코퍼스에 남는데 이빨이 없는, 가장 나쁜 종류의 조용한 무력화다.
+    #[test]
+    fn an_operator_can_declare_the_out_of_corpus_modal_as_a_gate() {
+        let question = "Do you want to use this API key?";
+        let env = serde_json::json!({"gates": [{
+            "id": "custom-api-key",
+            "title": "커스텀 API 키 확인",
+            "needles": [question],
+            "widget": ["No (recommended)", "Yes"],
+            "passability": "human_only",
+            "human_reason": "자격증명 판단은 사람 몫이다",
+            "absence_cost": "fatal",
+        }]});
+        let r = resolve_with(Some(&env), true);
+        let g = r.gates.iter().find(|g| g.id == "custom-api-key").expect("선언이 사라졌다");
+        assert_eq!(g.needles, vec![question.to_string()], "운영자 needle 이 제거됐다(조용한 무력화)");
+        assert_eq!(
+            identify(&r.gates, fixtures::CUSTOM_API_KEY_MODAL_2_1_261).map(|g| g.id.as_str()),
+            Some("custom-api-key"),
+            "선언은 남았는데 실측 화면을 식별하지 못한다 — 이빨 없는 관문이다"
+        );
+        assert_eq!(g.passability, Passability::HumanOnly);
+        assert!(g.action.is_none());
     }
 
     /// 위와 같은 축을 **판정 경로 그대로**(needle ∧ 위젯) 확인한다.
@@ -2783,6 +3126,37 @@ mod tests {
         assert_eq!(login["action"], Value::Null);
         assert_eq!(login["down_presses"], Value::Null, "액션 없는 관문에 아래키가 생겼다");
         assert_eq!(login["absence_is_fatal"].as_bool(), Some(true));
+        assert!(login["human_reason"].as_str().is_some_and(|s| s.contains("OAuth")));
+
+        // ★(0.14.31 · 리뷰 R1) **식별 축**이 실린다 — 없으면 보고서를 되먹일 수 없다.
+        for (i, gv) in gates.iter().enumerate() {
+            let want = &builtin()[i];
+            assert_eq!(
+                gv["needles"].as_array().map(|a| a.len()),
+                Some(want.needles.len()),
+                "{}: needles 축이 보고서에 없다(되먹이면 관문이 소멸한다)",
+                want.id
+            );
+            assert_eq!(gv["widget"].as_array().map(|a| a.len()), Some(want.widget.len()));
+            assert_eq!(
+                gv["confirm_echo"].as_array().map(|a| a.len()),
+                Some(want.confirm_echo.len())
+            );
+        }
+        // ★그리고 `policy` 열이 **집행이 아니라는 사실**을 보고서 자신이 싣는다.
+        assert_eq!(v["policy_enforcement"]["enforced"].as_bool(), Some(ACTION_POLICY_IS_ENFORCED));
+        assert_eq!(v["policy_enforcement"]["scope"].as_str(), Some("cli-auto-confirm"));
+        assert!(v["policy_enforcement"]["note"].as_str().is_some_and(|s| !s.is_empty()));
+        // ★되먹임 재료는 `source`(출처)가 아니라 `override_envelope`(모드를 스스로 싣는 봉투)다.
+        assert_eq!(v["override_envelope"]["source"].as_str(), Some("builtin"));
+        assert_eq!(
+            v["override_envelope"]["gates"].as_array().map(|a| a.len()),
+            Some(builtin().len())
+        );
+        assert!(
+            v["override_envelope"]["gates"][0].get("origin").is_none(),
+            "봉투에 파생 축(origin)이 섞였다 — 봉투는 선언 축만 싣는다"
+        );
     }
 
     /// 혼합 버전은 **추측하지 않는다** — 유효 버전은 `null`, 내장 핀은 그대로.
@@ -2803,9 +3177,27 @@ mod tests {
         assert_eq!(theme["measured_on"].as_str(), Some("9.9.9"));
         assert_eq!(theme["origin"].as_str(), Some("overridden"));
         // 전 관문을 같은 버전으로 덮으면 다시 하나로 접힌다(대조군).
-        let all = serde_json::json!({"measured_on": "9.9.9", "source": "builtin", "gates": []});
+        // ★(0.14.31 · 리뷰 R1) 종전 대조군은 `gates: []` 였다 — 봉투 최상위 `measured_on` 은
+        //   **선언된 관문의 기본값**일 뿐이라(`resolve_raw`) 선언이 비면 아무 관문도 덮이지 않는다.
+        //   그러면 `mixed_versions == false` 는 "같은 버전으로 덮으면 접힌다" 가 아니라 "아무것도
+        //   안 바뀌었다" 를 확인할 뿐이다(공허한 초록). 6관문 **전부**를 선언에 넣어 실제로 덮는다.
+        let decls: Vec<Value> = builtin()
+            .iter()
+            .map(|g| serde_json::json!({"id": g.id}))
+            .collect();
+        let all = serde_json::json!({"measured_on": "9.9.9", "source": "builtin", "gates": decls});
         let r2 = resolve_with(Some(&all), true);
-        assert_eq!(report_json(&r2, "claude", None)["mixed_versions"].as_bool(), Some(false));
+        let v2 = report_json(&r2, "claude", None);
+        assert_eq!(v2["mixed_versions"].as_bool(), Some(false));
+        assert_eq!(
+            v2["effective_measured_on"].as_str(),
+            Some("9.9.9"),
+            "전 관문을 덮었는데 유효 버전이 접히지 않았다(대조군이 실제로 덮지 못했다)"
+        );
+        for gv in v2["gates"].as_array().unwrap() {
+            assert_eq!(gv["measured_on"].as_str(), Some("9.9.9"), "{}: 덮이지 않았다", gv["id"]);
+        }
+        assert_eq!(v2["measured_on"].as_str(), Some(MEASURED_ON), "내장 핀이 봉투를 따라갔다");
     }
 
     /// 버전 정책은 **물었을 때만** 답한다 — 그리고 그 답은 [`ActionPolicy`] 타입 그대로다.
@@ -2839,101 +3231,286 @@ mod tests {
         }
     }
 
-    /// ★(codex gpt-6-astra 위임 산출 · 전행 검토 후 채택 — `impl/codex/R5-WP1-H2-roundtrip.md`)
-    /// 보고서는 운영자가 코퍼스를 읽고 수정할 때 쓰는 같은 어휘를 제공해야 한다.
-    /// 보고서가 코퍼스 어휘의 방언이면 운영자가 본 값과 고치는 값이 달라진다.
-    /// 그 순간 `cys gate-corpus`는 진단이 아니라 소문이 된다.
-    /// 선언 축을 그대로 되먹여도 코퍼스 전체가 보존되는지 검증해 이 계약을 지킨다.
+    /// ★(0.14.31 · 리뷰 R1) 보고서의 `override_envelope` 를 그대로 되먹이면 **같은 코퍼스**가 선다 —
+    /// 빌트인 · 병합(사용자 신설 관문 포함) · 교체 **세 형상 전부**.
+    ///
+    /// 【종전 검체가 못 보던 것】 첫 판은 보고서 최상위 `source`(출처 어휘)를 봉투 모드로 그대로
+    /// 넣고 `Source::Builtin` 한 형상만 돌렸다. `"builtin"` 은 우연히 두 어휘에 모두 있어 초록이었고,
+    /// `"replaced"` 는 미지 값 → 병합 강등, 게다가 보고서가 needle 을 안 실어 사용자 관문이 소멸하는
+    /// 경로를 **한 번도 지나지 않았다**. 그리고 base 를 언제나 빌트인 위에 세워서 "무시된 축이 늘 같아
+    /// 보이는" 착시가 있었다(needles·widget·confirm_echo·human_reason 축 주장이 공허했다).
+    /// 여기서는 ⓐ 되먹임 재료를 `override_envelope` 로 바꾸고 ⓑ base 를 세 형상으로 갈라
+    /// **빌트인과 다른 값**(사용자 needle·위젯·에코·사유)을 실제로 통과시킨다.
     #[test]
-    fn gate_corpus_report_is_lossless_for_the_declared_axes_round_trip() {
-        let base = resolve_with(None, true);
-        let report = report_json(&base, "claude", None);
-        let reported = report["gates"]
-            .as_array()
-            .expect("전체 관문: 보고서 gates 축이 배열이 아니다");
-        let declarations: Vec<Value> = reported
-            .iter()
-            .enumerate()
-            .map(|(index, gate)| {
-                let id = gate.get("id").and_then(Value::as_str).unwrap_or_else(|| {
-                    panic!("보고서 {index}번째 관문: id 축이 없거나 문자열이 아니다")
-                });
-                let field = |axis: &str| {
-                    gate.get(axis).unwrap_or_else(|| {
-                        panic!("관문 {id}: 보고서의 {axis} 선언 축이 없다")
-                    })
-                };
-                let action = field("action");
-                let action = if action.is_null() {
-                    Value::Null
-                } else {
-                    let action_field = |axis: &str| {
-                        action.get(axis).unwrap_or_else(|| {
-                            panic!("관문 {id}: 보고서의 action.{axis} 선언 축이 없다")
-                        })
-                    };
-                    serde_json::json!({
-                        "select_index": action_field("select_index"),
-                        "label": action_field("label"),
-                        "literal": action_field("literal"),
-                    })
-                };
-                serde_json::json!({
-                    "id": field("id"),
-                    "passability": field("passability"),
-                    "default_index": field("default_index"),
-                    "action": action,
-                    "absence_cost": field("absence_cost"),
-                    "measured_on": field("measured_on"),
-                })
+    fn gate_corpus_override_envelope_round_trips_builtin_merged_and_replaced_corpora() {
+        // 사용자 신설 관문 — 모든 선언 축이 빌트인과 **다르다**(무시된 축이 초록으로 보이지 않게).
+        let user_gate = || {
+            serde_json::json!({
+                "id": "only",
+                "title": "(운영자 선언 관문)",
+                "needles": ["Do you want to hand over the wheel?"],
+                "widget": ["Hand over", "Keep driving"],
+                "confirm_echo": ["Hand over ✔"],
+                "human_reason": "운영자가 적어 둔 사유",
+                "passability": "human_only",
+                "absence_cost": "fatal",
+                "measured_on": "9.9.9",
             })
-            .collect();
-        let env: Value = serde_json::json!({
-            "source": report.get("source")
-                .expect("전체 관문: 보고서 source 축이 없다"),
-            "gates": declarations,
-        });
-        let round_trip = resolve_with(Some(&env), true);
+        };
+        let merged_env = serde_json::json!({"source": "builtin", "gates": [user_gate()]});
+        let replaced_env = serde_json::json!({"source": "replace", "gates": [user_gate()]});
 
-        assert_eq!(
-            round_trip.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
-            base.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
-            "전체 관문: id 목록 축이 달라졌다(관문 누락·추가·순서 변경)"
-        );
-        for (actual, expected) in round_trip.gates.iter().zip(&base.gates) {
-            macro_rules! same_axis {
-                ($axis:ident) => {
-                    assert_eq!(
-                        actual.$axis, expected.$axis,
-                        "관문 {}: {} 축이 되먹임 전후 달라졌다",
-                        expected.id, stringify!($axis)
-                    );
-                };
-            }
-            same_axis!(id);
-            same_axis!(title);
-            same_axis!(needles);
-            same_axis!(widget);
-            same_axis!(confirm_echo);
-            same_axis!(passability);
-            same_axis!(default_index);
-            same_axis!(human_reason);
-            same_axis!(absence_cost);
-            same_axis!(measured_on);
-            match (&actual.action, &expected.action) {
-                (Some(actual), Some(wanted)) => {
-                    assert_eq!(actual.select_index, wanted.select_index,
-                        "관문 {}: action.select_index 축이 달라졌다", expected.id);
-                    assert_eq!(actual.label, wanted.label,
-                        "관문 {}: action.label 축이 달라졌다", expected.id);
-                    assert_eq!(actual.literal, wanted.literal,
-                        "관문 {}: action.literal 축이 달라졌다", expected.id);
+        for (shape, base) in [
+            ("builtin", resolve_with(None, true)),
+            ("merged", resolve_with(Some(&merged_env), true)),
+            ("replaced", resolve_with(Some(&replaced_env), true)),
+        ] {
+            let report = report_json(&base, "claude", None);
+            let env = report
+                .get("override_envelope")
+                .unwrap_or_else(|| panic!("{shape}: 붙여 넣을 봉투 축이 없다"))
+                .clone();
+            // 봉투는 **모드를 스스로 싣는다** — 보고서 출처 어휘를 되먹이는 것이 아니다.
+            assert_eq!(
+                env["source"].as_str(),
+                Some(if shape == "replaced" { "replace" } else { "builtin" }),
+                "{shape}: 봉투가 자기 모드를 잘못 싣는다"
+            );
+            let round = resolve_with(Some(&env), true);
+            assert_eq!(
+                round.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+                base.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+                "{shape}: 관문 id 목록이 되먹임 전후 달라졌다(누락·추가·순서 변경)"
+            );
+            for (actual, expected) in round.gates.iter().zip(&base.gates) {
+                macro_rules! same_axis {
+                    ($axis:ident) => {
+                        assert_eq!(
+                            actual.$axis, expected.$axis,
+                            "{}: 관문 {} 의 {} 축이 되먹임 전후 달라졌다",
+                            shape, expected.id, stringify!($axis)
+                        );
+                    };
                 }
-                (None, None) => {}
-                _ => panic!("관문 {}: action 존재 여부 축이 달라졌다", expected.id),
+                same_axis!(id);
+                same_axis!(title);
+                same_axis!(needles);
+                same_axis!(widget);
+                same_axis!(confirm_echo);
+                same_axis!(passability);
+                same_axis!(default_index);
+                same_axis!(human_reason);
+                same_axis!(absence_cost);
+                same_axis!(measured_on);
+                same_axis!(action);
+                // `origin` 은 해소 경로의 기록이라 되먹임에서 바뀐다(선언 축이 아니다) — 제외.
             }
-            // 병합으로 origin은 Builtin에서 Overridden이 되므로 이 필드만 비교에서 제외한다.
         }
+
+        // ★그리고 **운영자의 관문이 살아남았다** — 이것이 리뷰가 지목한 소멸 경로의 반례다.
+        let replaced = resolve_with(Some(&replaced_env), true);
+        let report = report_json(&replaced, "claude", None);
+        let round = resolve_with(Some(&report["override_envelope"]), true);
+        let only = round
+            .gates
+            .iter()
+            .find(|g| g.id == "only")
+            .expect("되먹임 뒤 운영자 관문이 사라졌다(BLOCK-3 형태)");
+        assert_eq!(only.needles, vec!["Do you want to hand over the wheel?".to_string()]);
+        assert_eq!(only.passability, Passability::HumanOnly);
+        assert_eq!(only.measured_on, "9.9.9");
+    }
+
+    /// ★보고서 **출처** 어휘를 봉투 **모드**로 읽지 않는다 — 그리고 조용히 접지도 않는다.
+    ///
+    /// 종전엔 `"replaced"` 가 미지 값으로 접혀 replace 가 병합으로 뒤집혔다(운영자는 무엇이
+    /// 일어났는지 알 길이 없었다). 별칭으로 고치면 **새 권한**이 열린다(codex 설계 검토 R1):
+    /// 같은 입력이 교체가 되면 편집 중 빠뜨린 관문이 사라지고, [`parse_new_gate`] 는
+    /// [`apply_patch`] 와 달리 `human_only → machine` 승격을 스스로 막지 않는다. 그래서 모드는
+    /// 넓히지 않고 **병합에 착지시킨 뒤 붙여 넣을 자리를 이름으로 지목**한다.
+    #[test]
+    fn report_source_words_land_on_merge_and_name_the_envelope_to_paste() {
+        for word in ["replaced", "merged", "override_disabled", "spec_unreadable"] {
+            let env = serde_json::json!({
+                "source": word,
+                "gates": [{"id": "x-gate", "needles": ["Do you want to keep going?"],
+                           "widget": ["Keep going", "Stop here"]}],
+            });
+            let r = resolve_with(Some(&env), true);
+            assert!(
+                r.gates.iter().any(|g| g.id == "theme"),
+                "{word}: 보고서 어휘가 교체로 읽혀 빌트인 관문이 사라졌다"
+            );
+            assert!(r.gates.iter().any(|g| g.id == "x-gate"), "{word}: 선언이 도달하지 않았다");
+            assert!(
+                r.notes.iter().any(|n| n.contains("override_envelope")),
+                "{word}: 무엇을 붙여 넣어야 하는지 말하지 않는다(조용한 강등): {:?}",
+                r.notes
+            );
+        }
+        // 진짜 미지 값은 종전 문면 그대로다(보고서 어휘와 구별한다).
+        let unknown = serde_json::json!({"source": "wat", "gates": []});
+        let r = resolve_with(Some(&unknown), true);
+        assert!(r.notes.iter().any(|n| n.contains("미지 값")), "{:?}", r.notes);
+        assert!(!r.notes.iter().any(|n| n.contains("override_envelope")));
+    }
+
+    /// ★[`envelope_mode`] 전수 — **교체를 내는 입력은 정확히 하나**이고, **조용한 강등이 없다**.
+    ///
+    /// (codex gpt-6-astra 위임 산출 · 전행 검토 후 채택 — `impl/codex/R5-WP1-H2-r1-envelope-mode-test.md`.
+    ///  중복 단언 2개는 걷어냈다.)
+    ///
+    /// 위 검체가 재는 것은 "보고서 어휘가 병합에 착지한다" 는 **몇 가지 사례**다. 이것은 그 위의
+    /// 성질을 전수로 못박는다 — 새 어휘를 어느 표에 넣든 ⓐ 교체로 새는 입력이 `replace` 말고 하나도
+    /// 없고(교체는 선언되지 않은 관문을 지울 수 있는 유일한 모드다) ⓑ 뜻을 정확히 아는 입력
+    /// (`replace`·`builtin`·부재)이 아니면 **반드시 사유가 남는다**(운영자가 강등을 모르고 지나가지
+    /// 않는다). 그리고 진단은 **덧붙기만** 한다(앞선 사유를 지우면 먼저 난 문제가 묻힌다).
+    #[test]
+    fn envelope_mode_is_a_total_function_that_only_widens_toward_merge() {
+        let mut inputs = vec![
+            None,
+            Some(""),
+            Some("   "),
+            Some("replace"),
+            Some(" replace "),
+            Some("Replace"), // 대문자 변형은 교체가 아니다(정확 일치만)
+            Some("builtin"),
+        ];
+        inputs.extend(REPORT_SOURCE_WORDS.iter().copied().map(Some));
+        inputs.extend([Some("unknown"), Some("merge")]);
+
+        let mut notes = vec![String::from("기존 진단")];
+        for input in inputs {
+            let normalized = input.map(str::trim).unwrap_or("builtin");
+            let is_replace = normalized == "replace";
+            let is_known = matches!(normalized, "replace" | "builtin");
+            let previous_notes = notes.clone();
+            let before = notes.len();
+            let mode = envelope_mode(input, &mut notes);
+
+            assert_eq!(
+                mode,
+                if is_replace { EnvelopeMode::Replace } else { EnvelopeMode::Merge },
+                "입력 {input:?}: 공백 제거 후 정확한 `replace` 만 교체여야 한다 — 그 밖의 입력이 \
+                 교체로 새면 선언하지 않은 관문이 사라진다"
+            );
+            assert!(
+                notes.starts_with(&previous_notes),
+                "입력 {input:?}: 기존 진단을 지우거나 바꾼다 — 먼저 난 문제가 묻힌다"
+            );
+            let delta = notes.len() - before;
+            assert_eq!(
+                delta,
+                usize::from(!is_known),
+                "입력 {input:?}: 진단 증분이 예상과 다르다 — 0 이면 조용한 강등, 2 이상이면 중복 경고"
+            );
+            if !is_known {
+                let note = &notes[before];
+                let is_report_word = REPORT_SOURCE_WORDS.contains(&normalized);
+                assert_eq!(
+                    note.contains("override_envelope"),
+                    is_report_word,
+                    "입력 {input:?}: 보고서 어휘라면 붙여 넣을 축을 이름으로 지목해야 한다"
+                );
+                assert_eq!(
+                    note.contains("미지 값"),
+                    !is_report_word,
+                    "입력 {input:?}: 보고서 어휘와 진짜 미지 값의 처방이 뒤섞였다"
+                );
+            }
+        }
+    }
+
+    /// ★`source=replace` 도 **사람 1회 관문을 기계 통과로 승격시킬 수 없다**(0.14.31 · 리뷰 R1).
+    ///
+    /// 병합 경로([`apply_patch`])는 이 승격을 거부해 왔지만 교체 경로([`parse_new_gate`])에는 그
+    /// 거부가 없었다. 그래서 봉투 한 줄이면 OAuth 화면에 키가 나갔다 — 좌석은 브라우저 대기에
+    /// 갇힌 채 **살아 있어서** 생존만 보는 판정이 그것을 영원히 '준비됨' 으로 읽는다(비가역).
+    #[test]
+    fn replace_mode_cannot_promote_a_human_only_gate_to_machine() {
+        let env = serde_json::json!({"source": "replace", "gates": [{
+            "id": "login-method",
+            "needles": ["Select login method"],
+            "widget": ["Claude account with subscription", "Anthropic Console account"],
+            "passability": "machine",
+            "default_index": 1,
+            "action": {"select_index": 1, "label": "Claude account with subscription"},
+        }]});
+        let r = resolve_with(Some(&env), true);
+        let g = r.gates.iter().find(|g| g.id == "login-method").expect("관문이 사라졌다");
+        assert_eq!(g.passability, Passability::HumanOnly, "승격이 통과했다(§8 위반 경로)");
+        assert!(g.action.is_none(), "사람 1회 관문에 기계 액션이 남았다");
+        assert!(g.human_reason.is_some(), "사람에게 보여줄 사유가 비었다");
+        assert!(
+            matches!(action_policy(g, Some(MEASURED_ON)), ActionPolicy::HumanRequired { .. }),
+            "정책이 여전히 기계 통과를 낸다"
+        );
+        assert!(r.notes.iter().any(|n| n.contains("사람 1회")), "조용히 되돌렸다: {:?}", r.notes);
+        // 병합 경로의 종전 거부도 그대로다(두 경로의 대칭).
+        let merge = serde_json::json!({"gates": [{"id": "login-method", "passability": "machine"}]});
+        let m = resolve_with(Some(&merge), true);
+        let mg = m.gates.iter().find(|g| g.id == "login-method").unwrap();
+        assert_eq!(mg.passability, Passability::HumanOnly);
+    }
+
+    /// ★기본 포커스 `0` 은 **값이다** — 그리고 명시 `null` 은 지운다(0.14.31 · 리뷰 R1).
+    ///
+    /// 정본 §4 H-2 는 2.1.261 폴더신뢰를 `default_index: Some(0)` + `action:(1,…)` = **down 1** 로
+    /// 기입하라고 지시한다. 종전 봉투 파서는 `n > 0` 필터로 `0` 을 조용히 버려 그 정정을 표현하지
+    /// 못했다 — 문서화된 탈출구가 정본이 요구하는 값을 못 쓴 것이다.
+    #[test]
+    fn envelope_can_express_default_index_zero_and_can_clear_it() {
+        let zero = serde_json::json!({"gates": [{"id": "folder-trust", "default_index": 0}]});
+        let r = resolve_with(Some(&zero), true);
+        let g = r.gates.iter().find(|g| g.id == "folder-trust").unwrap();
+        assert_eq!(g.default_index, Some(0), "0 이 조용히 버려졌다(빌트인 값 잔존)");
+        assert_eq!(g.down_presses(), Some(1), "정본 §4 H-2 가 기입하라는 down 이 나오지 않는다");
+
+        // 명시 null = "기본 포커스를 모른다" → 아래키 수 산출 불가 = 보류(fail-closed).
+        let cleared = serde_json::json!({"gates": [{"id": "folder-trust", "default_index": null}]});
+        let r2 = resolve_with(Some(&cleared), true);
+        let g2 = r2.gates.iter().find(|g| g.id == "folder-trust").unwrap();
+        assert_eq!(g2.default_index, None);
+        assert_eq!(g2.down_presses(), None, "미측정이 통과로 접혔다");
+        assert!(matches!(action_policy(g2, Some(MEASURED_ON)), ActionPolicy::HeldNoAction));
+
+        // 키를 **쏘는** 축(select_index)은 넓히지 않는다 — 0 은 여전히 손상 선언이다(의도된 비대칭).
+        // ★codex 설계 검토 R1 이 지목한 반례: 손상된 action 은 **종전 액션을 유지**하므로
+        //   `default_index: 0` 과 함께 오면 유지된 목표로 양수 down 이 산출된다. 유지되는 것이
+        //   실측 빌트인 액션이라 값 자체는 옳지만(정본 §4 H-2 의 down=1 과 같다), "손상 선언이
+        //   조용히 무시된다" 는 사실은 여기 박제해 둔다 — 다음 사람이 이 조합을 우연으로 만나지
+        //   않게 한다. (`down_presses()` 를 소비하는 프로덕션 호출자는 아직 0 이다.)
+        let corrupt = serde_json::json!({"gates": [{
+            "id": "folder-trust", "default_index": 0, "action": {"select_index": 0},
+        }]});
+        let r3 = resolve_with(Some(&corrupt), true);
+        let g3 = r3.gates.iter().find(|g| g.id == "folder-trust").unwrap();
+        assert_eq!(g3.action.as_ref().map(|a| a.select_index), Some(1), "빌트인 액션이 유지되지 않았다");
+        assert_eq!(g3.down_presses(), Some(1));
+        assert!(r3.notes.iter().any(|n| n.contains("action 선언이 손상")), "{:?}", r3.notes);
+    }
+
+    /// ★'봉투 없음' 과 'agents.json 판독 실패' 는 보고서에서 **다른 값**이다(0.14.31 · 리뷰 R1).
+    ///
+    /// 종전엔 둘 다 `source:"builtin"` · `source_detail:null` 이었고 실패 사실은 한국어 산문
+    /// `notes[0]` 에만 있었다. 하류(preflight C82 등)가 "봉투가 도달했나" 를 알려면 산문을
+    /// 되파싱해야 했는데, 되파싱은 다음 판에 반드시 깨진다.
+    #[test]
+    fn report_separates_no_envelope_from_unreadable_adapter_spec() {
+        let normal = report_json(&resolve_with(None, true), "claude", None);
+        assert_eq!(normal["source"].as_str(), Some("builtin"));
+        assert_eq!(normal["source_detail"], Value::Null);
+
+        let broken = Resolved {
+            gates: builtin(),
+            notes: vec!["어댑터 스펙 판독 실패(no such file) — 코드 정본 폴백".to_string()],
+            source: Source::SpecUnreadable { reason: "no such file".to_string() },
+        };
+        let v = report_json(&broken, "claude", None);
+        assert_eq!(v["source"].as_str(), Some("spec_unreadable"), "고장이 정상과 같은 값으로 접혔다");
+        assert_eq!(v["source_detail"]["reason"].as_str(), Some("no such file"));
+        // 그리고 그 값은 봉투 모드가 아니다 — 되먹여도 병합에 착지한다(위 검체와 같은 규율).
+        assert_eq!(v["override_envelope"]["source"].as_str(), Some("builtin"));
     }
 
     // ── 버전 핀 ────────────────────────────────────────────────────────────

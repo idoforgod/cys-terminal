@@ -444,6 +444,14 @@ def _invariants():
         "미등록 verb 가 관찰 경로 통과(default-deny 위반)"
     assert is_observe_only(["cys", "status", "--json"]), "status 가 observe 가 아님"
     assert not is_observe_only(["cys", "launch-agent"]), "launch-agent 가 거부 안 됨"
+    # ★(0.14.31 · 리뷰 R1) CONTRACTS §C 등재 동사는 **직접** 단언한다.
+    #   표면 커버리지(아래)는 이 등재를 집행하지 못한다: 등재를 지우면 그 동사는 uncovered 로
+    #   옮겨 가 "COVERED with drift" 로 **통과**하기 때문이다(fail-closed 라 안전하되 회귀는 무성).
+    #   계약으로 약속한 분류는 계약이 깨질 때 붉어져야 한다.
+    assert classify_cys_verb(["cys", "gate-corpus", "--json"]) == "observe", \
+        "gate-corpus 가 observe 가 아님(CONTRACTS §C · preflight C82 의 관찰 경로 호출이 막힌다)"
+    assert is_observe_only(["cys", "gate-corpus", "--detected-version", "2.1.263"]), \
+        "gate-corpus 가 관찰 경로를 통과하지 못함"
     assert _extract_verb(["yt-dlp", "--dump-json"]) is None, "cys 아닌 호출이 verb 로 추출됨"
     # ★(0.14.31 · WP-5 · B-6) 서브동사 세분 — queue list 만 observe, revive/drop/clear/deliver 는 mutate.
     assert is_observe_only(["cys", "queue", "list", "--surface", "surface:3"]), "queue list 가 observe 가 아님"
