@@ -362,7 +362,7 @@ CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있�
 def _read_text_tolerant(path):
     """막히지 않는 텍스트 판독(FIFO·심링크 함정에서 preflight 가 정지하지 않게)."""
     try:
-        fd = _open_unblocking_ro(path)
+        fd, _st = _open_unblocking_ro(path)     # (fd, st) 튜플 — fd 만 쓴다
     except (OSError, ValueError):
         return None
     try:

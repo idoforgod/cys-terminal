@@ -738,8 +738,12 @@ def cso_split(command):
             if tok == "&":
                 return None, None, "백그라운드 실행(`&`)은 CSO 경계 밖이다(종결 없는 관측)"
             return None, None, "해석 불가 셸 연산자 `%s` — 아는 문법만 통과한다" % tok
-        if set(tok) & set("<") and tok.strip("<") == "":
-            return None, None, "입력 리다이렉트·here-doc(`%s`)은 CSO 경계 밖이다" % tok
+        # 위에서 처리하지 못한 **순수 구두점** 토큰은 전부 모르는 문법이다: `<`·`<<`·`<<<`·
+        # `<>`(읽기쓰기 open)·`>(`·`&`(위에서 걸림) 등. 하나라도 인자처럼 흘려보내면 그 효과를
+        # 판정하지 않은 채 통과시키는 것이다.
+        if tok and set(tok) <= set("<>&|;()"):
+            return None, None, ("해석 불가 셸 연산자 `%s` — 아는 문법(`;` `&&` `||` `|` `(` `)` "
+                                "출력 리다이렉트)만 통과한다" % tok)
         cur.append(tok)
         i += 1
     if cur:
@@ -1207,18 +1211,24 @@ def main():
     tool = data.get("tool_name") or data.get("tool") or ""
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
     ctx = None
+    warn_msg = None
     if is_cso(role):
         root = state_root()
         key = session_key(data.get("session_id"))
+        # ★deny 된 호출도 센다 — 그것도 도구 호출이고, 세지 않으면 막힌 시도를 반복하는 세션이
+        #   예산을 영원히 넘지 않아 사이클 신호가 오지 않는다.
         count = bump_tool_calls(key, root)
         ctx = Ctx(tool_calls=count)
         if count is not None and BUDGET_WARN <= count < BUDGET_DENY and warn_once(key, root):
-            msg = ("[CSO 예산 경고] tool_calls=%d (경고 %d · 비필수 deny %d). 지금 "
-                   "SESSION_STATE·CSO_TODO 를 저장하고 §2 절차대로 사이클을 준비하라 — "
-                   "예산 소진은 고장이 아니라 사이클 신호다." % (count, BUDGET_WARN, BUDGET_DENY))
-            sys.stdout.write(context_payload(msg) + "\n")
-            print("role-capability-gate: " + msg, file=sys.stderr)
+            warn_msg = ("[CSO 예산 경고] tool_calls=%d (경고 %d · 비필수 deny %d). 지금 "
+                        "SESSION_STATE·CSO_TODO 를 저장하고 §2 절차대로 사이클을 준비하라 — "
+                        "예산 소진은 고장이 아니라 사이클 신호다." % (count, BUDGET_WARN, BUDGET_DENY))
+            print("role-capability-gate: " + warn_msg, file=sys.stderr)
     block, reason = decide(tool, tool_input, role, ctx)
+    # ★stdout 에는 **판정 JSON 하나만** 싣는다 — deny 와 경고를 함께 내면 하네스가 두 객체를
+    #   받는다. 차단이면 경고는 stderr 에만 남는다(그 자리에 차단 사유가 더 급하다).
+    if warn_msg and not block:
+        sys.stdout.write(context_payload(warn_msg) + "\n")
     if block:
         # 진단은 stderr(transcript), 차단 판정은 modern JSON permission-decision(stdout)+exit 0.
         print("role-capability-gate DENY: %s [role=%s tool=%s src=%s]"
@@ -1427,6 +1437,9 @@ def self_test_contracts(fails):
     want(True, "Bash", {"command": 'cys send --to master "결과: $(cys events)"'}, "명령 치환")
     want(True, "Bash", {"command": "cat `cys status`"}, "백틱 치환")
     want(True, "Bash", {"command": "cat <(cys status)"}, "프로세스 치환")
+    want(True, "Bash", {"command": "cat < /w/x"}, "입력 리다이렉트")
+    want(True, "Bash", {"command": "cat <> /w/pack/round/CSO_TODO.md"}, "읽기쓰기 open `<>`")
+    want(True, "Bash", {"command": "cat <<< hi"}, "here-string")
     want(True, "Bash", {"command": "tail -f /w/x.log"}, "tail -f 스트림")
     want(True, "Bash", {"command": "cys status &"}, "백그라운드 `&`")
     want(True, "Bash", {"command": "tail -n 5 /w/x.log", "run_in_background": True},
