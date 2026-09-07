@@ -672,9 +672,14 @@ impl ActionPolicy {
 /// ★(0.14.31 · 리뷰 R1) [`action_policy`] 판정이 **키 경로에 배선돼 있는가**.
 ///
 /// 【왜 상수인가 — 무엇을 막는가】 이 판정은 지금 **진단일 뿐**이다. 실측(2026-09-08 · `grep -rn
-/// "action_policy\|ActionPolicy\|down_presses" src/ ui/src`): 이 모듈 **밖에서 호출자가 0**이고,
+/// "action_policy\|ActionPolicy" src/ ui/src`): 이 모듈 **밖에서 호출자가 0**이고,
 /// 폴더신뢰 자동확인 조립(`cys.rs` `trust_prompt_hit → confirm_denied → trust_send → Return`)은
-/// 버전을 보지 않으며 `down_presses()` 를 소비하지 않고 Return 을 **1발**만 보낸다. 그런데
+/// 버전을 보지 않고 Return 을 **1발**만 보낸다. 그런데
+///
+/// ★(0.14.31 · 리뷰 R2) [`Gate::down_presses`] 는 **배선됐다** — [`crate::inject_guard::confirm_denied`]
+///   가 `Some(0)`(= Return 한 발)이 아닌 선언을 보류한다. 그것은 이 조립의 **능력**과 선언을 맞춘
+///   것이지 버전 핀의 집행이 아니다: `Allowed{down}` 이 기술하는 다발 전송도, 좌석이 실제로 실행한
+///   바이너리의 버전 대조도 여전히 어디에도 없다. 그래서 이 상수는 `false` 로 남는다.
 /// [`report_json`] 이 관문마다 `policy` 를 인쇄하므로, 그것을 읽는 운영자는 `held_version_drift`
 /// 를 "이 버전에선 키가 안 나간다" 로 읽는다 — **거짓이다**(커서 벨트만 통과하면 Return 은 나간다).
 /// 반대로 재핀 뒤의 `allowed` 도 "이 down 이 집행된다" 는 뜻이 아니다.
@@ -827,7 +832,12 @@ pub struct Resolved {
 /// 않은 것**이다(관측하지 않은 것을 관측 결과로 인쇄하지 않는다).
 ///
 /// 【이 함수는 순수하다】 파일·데몬·서브프로세스 접촉 0. 버전은 **호출부가 재서 넣는다**.
-pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> Value {
+pub fn report_json(
+    resolved: &Resolved,
+    agent: &str,
+    detected: Option<&str>,
+    observed_at: Option<&str>,
+) -> Value {
     let versions: std::collections::BTreeSet<&str> =
         resolved.gates.iter().map(|g| g.measured_on.as_str()).collect();
     // 유효 버전은 **전 관문이 한 값을 주장할 때만** 잡힌다. 0개(도달 불가 — 해소기가 빈 코퍼스를
@@ -896,19 +906,46 @@ pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> 
     // ★붙여 넣을 수 있는 봉투(0.14.31 · 리뷰 R1). 보고서의 `source` 는 **출처**라 봉투의 **모드**가
     //   아니고, 그 둘을 이름이 같다는 이유로 섞으면 replace 가 병합으로 뒤집힌다([`envelope_mode`]).
     //   그래서 되먹임용 봉투를 따로, 모드를 스스로 싣게 해서 낸다.
-    let envelope_gates: Vec<Value> = resolved
-        .gates
-        .iter()
-        .map(|g| Value::Object(declaration(g)))
-        .collect();
-    serde_json::json!({
-        "agent": agent,
-        "source": source_kind(&resolved.source),
-        "source_detail": source_detail(&resolved.source),
-        "override_envelope": {
+    //
+    // ★(0.14.31 · 리뷰 R2 · claude 적대) **판독 실패면 봉투를 내지 않는다.** `source=spec_unreadable`
+    //   은 "agents.json 을 읽지 못해 코드 정본으로 되돌아왔다" 는 뜻이라, 그 코퍼스는 **운영자의
+    //   선언을 반영하지 않는다**. 그런데도 R1 은 빌트인 6관문을 실은 붙여넣기용 봉투를 함께 냈다 —
+    //   문서가 시키는 대로 붙여 넣으면 원 선언이 빌트인으로 **덮인다**. 그래서 판독 실패에서는
+    //   `override_envelope` 를 `null` 로 두고, 왜 재료를 주지 않는지를 `override_envelope_status`
+    //   가 말한다. ★`paste_safe` 는 파서가 집행하는 제약이 아니다(codex 설계 검토 ⑨) — 이 필드는
+    //   "이 산출물을 복사해 쓰지 말라" 는 **표식**이지, 붙여 넣어도 안전하다는 보증이 아니다.
+    let paste_safe = !matches!(resolved.source, Source::SpecUnreadable { .. });
+    let envelope = if paste_safe {
+        let envelope_gates: Vec<Value> = resolved
+            .gates
+            .iter()
+            .map(|g| Value::Object(declaration(g)))
+            .collect();
+        serde_json::json!({
             "source": if matches!(resolved.source, Source::Replaced { .. }) { "replace" } else { "builtin" },
             "measured_on": MEASURED_ON,
             "gates": envelope_gates,
+        })
+    } else {
+        Value::Null
+    };
+    serde_json::json!({
+        "agent": agent,
+        // ★(0.14.31 · 리뷰 R2 · codex minor) **이 보고서를 언제 찍었는가.** `measured_on` 은 벤더
+        //   버전(무엇에 대고 실측했는가)이고 이것은 **관측 시각**이다 — 두 축을 한 값으로 접으면
+        //   운영자가 `agents.json` 을 고치기 전후로 뜬 두 보고서를 시간으로 가를 수 없다.
+        //   호출부가 재서 넣는다(이 함수는 순수하다 · 시계 접촉 0).
+        "observed_at": observed_at,
+        "source": source_kind(&resolved.source),
+        "source_detail": source_detail(&resolved.source),
+        "override_envelope": envelope,
+        "override_envelope_status": {
+            "paste_safe": paste_safe,
+            "reason": if paste_safe { Value::Null } else { Value::from(
+                "agents.json 어댑터 스펙을 읽지 못해 코드 정본으로 되돌아온 코퍼스라, 이 보고서는 \
+                 운영자의 선언을 반영하지 않는다(붙여 넣으면 원 선언이 빌트인으로 덮인다). \
+                 먼저 판독 실패를 고칠 것"
+            ) },
         },
         // ★(0.14.31 · 리뷰 R1) `policy` 는 **진단이지 집행이 아니다** — 이 사실을 산출물이 스스로
         //   싣는다. 없으면 운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는데,
@@ -920,10 +957,13 @@ pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> 
                 "action_policy 가 키 경로에 배선돼 있다 — policy 는 집행 판정이다"
             } else {
                 concat!(
-                    "action_policy 는 CLI 자동확인 조립 어느 지점에도 배선돼 있지 않다(실측 ",
-                    "2026-09-08). policy 는 **진단**이며, 그 조립은 버전을 보지 않고 커서 벨트",
-                    "(confirm_allowed)만 본 뒤 Return 1발을 보낸다. held_* 를 '이 버전에선 키가 ",
-                    "안 나간다' 로, allowed 를 'down 이 집행된다' 로 읽지 말 것"
+                    "action_policy(버전 핀)는 CLI 자동확인 조립 어느 지점에도 배선돼 있지 않다",
+                    "(실측 2026-09-08). policy 는 **진단**이며, 그 조립이 보는 것은 ⓪ 정본 사람 1회 ",
+                    "관문이 화면에 서지 않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 ",
+                    "아닐 것 ③ 선언 시퀀스가 Return 한 발일 것(down_presses==Some(0)) ④ 커서가 액션 ",
+                    "라벨 전문 위일 것 — 넷뿐이고 **버전은 그중에 없다**. held_version_* 를 '이 ",
+                    "버전에선 키가 안 나간다' 로, allowed 를 'down 이 집행된다' 로 읽지 말 것",
+                    "(0.14.31 리뷰 R2: ③은 새로 배선됐고 버전 축은 여전히 미배선이다)"
                 )
             },
         },
@@ -1087,26 +1127,30 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
 /// merge 경로의 [`apply_patch`] 가 이미 같은 완화를 거부한다(두 경로의 대칭).
 fn restore_fatal_builtin_floor(mut gates: Vec<Gate>, notes: &mut Vec<String>) -> Vec<Gate> {
     for b in builtin().into_iter().filter(|b| b.absence_is_fatal()) {
-        match gates.iter_mut().find(|g| g.id == b.id) {
-            Some(g) => {
-                if g.absence_cost != AbsenceCost::Fatal {
-                    notes.push(format!(
-                        "{}: 선언이 부재의 비용을 낮췄다 — 실측값(fatal)으로 되돌린다(부재의 \
-                         귀결은 선언이 아니라 측정이다)",
-                        g.id
-                    ));
-                    g.absence_cost = AbsenceCost::Fatal;
-                }
-            }
-            None => {
+        // ★(0.14.31 · 리뷰 R2) **id 가 같은 항목 전량**을 본다(종전: `find` = 첫 항목 하나).
+        //   replace 봉투는 같은 id 를 몇 번이든 선언할 수 있고, `identify` 는 **화면에 먼저
+        //   매칭되는** 항목을 돌려주므로 "첫 항목만 고친다" 는 화면 층위에서 아무것도 보장하지
+        //   못한다(같은 결함의 human_only 판이 codex major 로 지목됐다 — 아래 바닥 참조).
+        let mut hit = false;
+        for g in gates.iter_mut().filter(|g| g.id == b.id) {
+            hit = true;
+            if g.absence_cost != AbsenceCost::Fatal {
                 notes.push(format!(
-                    "{}: ★해소본에 **부재의 비용이 비가역인** 빌트인 관문이 없다 — 코드 정본을 \
-                     강제 **복원**했다(선언은 그대로 두고 덧붙이기만 한다). 이 관문의 부재는 \
-                     좌석 rc 1 종료·허위 READY 영구화·관측 전제 파괴 중 하나로 귀결한다",
-                    b.id
+                    "{}: 선언이 부재의 비용을 낮췄다 — 실측값(fatal)으로 되돌린다(부재의 \
+                     귀결은 선언이 아니라 측정이다)",
+                    g.id
                 ));
-                gates.push(b);
+                g.absence_cost = AbsenceCost::Fatal;
             }
+        }
+        if !hit {
+            notes.push(format!(
+                "{}: ★해소본에 **부재의 비용이 비가역인** 빌트인 관문이 없다 — 코드 정본을 \
+                 강제 **복원**했다(선언은 그대로 두고 덧붙이기만 한다). 이 관문의 부재는 \
+                 좌석 rc 1 종료·허위 READY 영구화·관측 전제 파괴 중 하나로 귀결한다",
+                b.id
+            ));
+            gates.push(b);
         }
     }
     gates
@@ -1131,24 +1175,70 @@ fn restore_human_only_builtin_floor(mut gates: Vec<Gate>, notes: &mut Vec<String
         .into_iter()
         .filter(|b| b.passability == Passability::HumanOnly)
     {
-        let Some(g) = gates.iter_mut().find(|g| g.id == b.id) else {
-            continue; // 부재는 Fatal 바닥이 이미 다뤘다(그쪽이 복원 주체다).
-        };
-        if g.passability == Passability::HumanOnly && g.action.is_none() {
-            continue;
-        }
-        notes.push(format!(
-            "{}: 선언이 **사람 1회**로 실측된 관문을 기계 통과로 승격시켰다 — 실측값(human_only · \
-             액션 없음)으로 되돌린다(기계 통과 불가는 정책이 아니라 측정이다)",
-            g.id
-        ));
-        g.passability = Passability::HumanOnly;
-        g.action = None;
-        if g.human_reason.is_none() {
-            g.human_reason = b.human_reason.clone();
+        // ★(0.14.31 · 리뷰 R2) 봉인 대상은 **id 하나**가 아니라 "그 화면을 자기 것이라 주장하는
+        //   선언 전량" 이다. 아래 두 우회가 R1 의 id 단일 매칭을 그대로 통과했다:
+        //     ⓐ 중복 id(codex major) — `{"source":"replace","gates":[{"id":"login-method",
+        //        "needles":["Do you want a decoy?"]…},{"id":"login-method", <진짜 로그인 needle>,
+        //        "passability":"machine","action":{…}}]}`. `find` 는 **미끼**를 고치고, 로그인
+        //        화면에서 `identify` 가 돌려주는 것은 고쳐지지 않은 두 번째 항목이다.
+        //     ⓑ 별칭 id(claude 적대) — `{"id":"login-alias","needles":["Select login method"],
+        //        "passability":"machine","action":{…}}` 한 줄이면 id 가 안 겹쳐 바닥이 아예 돌지
+        //        않고, 그 선언이 복원된 `login-method` **앞**에 서서 첫 매치를 가져간다.
+        //   두 경우의 귀결은 같다: 코퍼스가 로그인 화면을 **기계 통과 가능**으로 분류한다.
+        for g in gates
+            .iter_mut()
+            .filter(|g| g.id == b.id || claims_same_screen(g, &b))
+        {
+            if g.passability == Passability::HumanOnly && g.action.is_none() {
+                continue;
+            }
+            let by_alias = g.id != b.id;
+            notes.push(format!(
+                "{}: 선언이 **사람 1회**로 실측된 관문{}을 기계 통과로 승격시켰다 — 실측값\
+                 (human_only · 액션 없음)으로 되돌린다(기계 통과 불가는 정책이 아니라 측정이다)",
+                g.id,
+                if by_alias { format!("({} 의 화면을 같은 문면으로 주장한다)", b.id) } else { String::new() }
+            ));
+            g.passability = Passability::HumanOnly;
+            g.action = None;
+            if g.human_reason.is_none() {
+                g.human_reason = b.human_reason.clone();
+            }
         }
     }
     gates
+}
+
+/// 이 선언이 저 관문의 **화면을 자기 것이라 주장하는가** — id 가 아니라 식별 문면으로 본다.
+///
+/// 판정: `g` 의 needle 하나와 `b` 의 needle 하나가 **서로 포함**(정규화본 또는 공백 제거본 ·
+/// 어느 방향이든)이면 참. 두 방향 모두 참으로 세는 이유 —
+///   · `g ⊆ b`(g 의 문면이 더 짧다): g 는 b 보다 **넓은** 화면 집합에 걸린다 → 로그인 화면에도
+///     반드시 걸린다.
+///   · `g ⊇ b`(g 의 문면이 더 길다): 좁지만 벤더가 그 긴 문면을 그리는 순간 같은 화면이다.
+/// 어느 쪽도 "그 화면에 설 수 있다" 는 사실이라 봉인 대상이다.
+///
+/// ★위젯 서명은 보지 않는다(의도적 과잉 포섭). [`Gate::matches`] 는 위젯 AND 를 요구하지만
+///   감지 경로([`crate::inject_guard::needle_hit`])는 needle 만 보고, 무엇보다 오탐의 귀결이
+///   **보류**(사람 1회)라서 넓은 쪽이 안전하다. 좁게 잡았다가 놓친 것의 귀결은 OAuth 화면에
+///   키가 나가는 것이다(허위 READY 영구화 · 비가역) — 비대칭이 방향을 정한다(§3-3).
+///
+/// ★빌트인 코퍼스는 이 술어로 서로 겹치지 않는다(검체
+///   `human_only_floor_seals_duplicate_ids_and_alias_declarations` 가 전수 대조).
+fn claims_same_screen(g: &Gate, b: &Gate) -> bool {
+    g.needles.iter().any(|n| {
+        let (nn, nf) = (normalize(n), flatten(n));
+        if nn.is_empty() || nf.is_empty() {
+            return false;
+        }
+        b.needles.iter().any(|m| {
+            let (mn, mf) = (normalize(m), flatten(m));
+            if mn.is_empty() || mf.is_empty() {
+                return false;
+            }
+            nn.contains(&mn) || mn.contains(&nn) || nf.contains(&mf) || mf.contains(&nf)
+        })
+    })
 }
 
 /// ★자기규칙 집행 — 위반 관문은 **버리고** `notes` 에 사유를 남긴다(P4-3 · 2026-08-24).
@@ -1327,10 +1417,24 @@ const REPORT_SOURCE_WORDS: &[&str] = &["builtin", "merged", "replaced", "overrid
 ///
 /// ★승격 거부의 빈틈 자체는 [`restore_human_only_builtin_floor`] 가 replace 경로에서도 닫는다.
 fn envelope_mode(raw: Option<&str>, notes: &mut Vec<String>) -> EnvelopeMode {
-    let raw = raw.map(str::trim).unwrap_or("builtin");
+    // ★(0.14.31 · 리뷰 R2 · claude 적대) **공백을 흡수하지 않는다.** R1 은 `raw.map(str::trim)` 으로
+    //   `" replace "` 까지 교체로 받았는데, 교체는 **선언되지 않은 관문을 지울 수 있는 유일한 모드**다
+    //   (실측: `"source":" replace "` → theme 소실 · base cdba8e8 은 같은 입력에서 병합 + 미지 값 note).
+    //   관용을 베푸는 방향이 하필 파괴적인 쪽이면 §3-3("막는 쪽으로만 틀린다")에 역행한다. 그래서
+    //   교체는 **정확히 `"replace"`** 하나이고, 공백이 섞인 변형은 병합에 착지하되 조용히가 아니라
+    //   "정확히 쓰라" 고 사유를 남긴다(관용의 부재를 운영자가 모르고 지나가지 않는다).
+    let raw = raw.unwrap_or("builtin");
     match raw {
         "replace" => EnvelopeMode::Replace,
         "builtin" => EnvelopeMode::Merge,
+        other if other.trim() == "replace" || other.trim() == "builtin" => {
+            notes.push(format!(
+                "{ADAPTER_KEY}.source={other:?} 에 공백이 섞여 있다 — 모드 어휘는 **정확 일치**이므로 \
+                 builtin 병합으로 취급했다(교체는 선언되지 않은 관문을 지울 수 있는 유일한 모드라 \
+                 공백까지 받아 주지 않는다). 교체를 원하면 정확히 \"replace\" 로 쓸 것"
+            ));
+            EnvelopeMode::Merge
+        }
         other => {
             if REPORT_SOURCE_WORDS.contains(&other) {
                 notes.push(format!(
@@ -1418,6 +1522,32 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
                 notes,
                 source: Source::Builtin,
             };
+        }
+        // ★(0.14.31 · 리뷰 R2 · codex major) **중복 id 를 시끄럽게 만든다.** 버리지는 않는다 —
+        //   이 모듈의 집행 수단은 '수리이지 제거가 아니다'(`repair_gate` doc · P4-10)이고, 제거는
+        //   `보류 → 주입` 으로 귀결을 뒤집는 유일한 방향이다. 대신 두 사실을 함께 둔다:
+        //   ⓐ 두 바닥이 이제 **같은 id 전량**을 고치므로 중복으로 바닥을 우회할 수 없고,
+        //   ⓑ 그럼에도 중복은 위험 신호다 — id 로 찾는 코드(`apply_patch`)와 화면으로 찾는 코드
+        //      (`identify`)가 **다른 항목**을 가리키기 때문이다. 그 어긋남을 운영자가 알아야 한다.
+        let mut seen: std::collections::BTreeMap<&str, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, g) in out.iter().enumerate() {
+            seen.entry(g.id.as_str()).or_default().push(i);
+        }
+        // 선언 **위치**까지 적는다(codex 설계 검토 ②) — 개수만으로는 어느 줄을 고쳐야 할지 모른다.
+        let dups: Vec<String> = seen
+            .iter()
+            .filter(|(_, at)| at.len() > 1)
+            .map(|(id, at)| format!("{id}@gates{at:?}"))
+            .collect();
+        if !dups.is_empty() {
+            notes.push(format!(
+                "source=replace 선언에 **중복 id** 가 있다({}) — 선언은 그대로 두지만, id 로 찾는 \
+                 경로(패치·바닥)와 화면으로 찾는 경로(identify)가 서로 다른 항목을 가리킬 수 있다. \
+                 실측 바닥(fatal·human_only)은 같은 id 전량에 적용되지만, 중복은 의도한 선언이 \
+                 아닐 가능성이 높다",
+                dups.join(", ")
+            ));
         }
         let count = out.len();
         return Resolved {
@@ -1575,6 +1705,11 @@ fn apply_patch(
     default_measured: &str,
 ) -> Vec<String> {
     let mut notes = Vec::new();
+    // ★(0.14.31 · 리뷰 R2 · codex 설계 검토 ⑧) 무변화 판정의 기준은 **패치 진입 시점의 값**이다.
+    //   패치 도중 값(예: `passability:"human_only"` 가 먼저 지운 action)과 비교하면 **실제로 일어난
+    //   변경**까지 무변화로 오인해 조용해진다.
+    let entry_default_index = g.default_index;
+    let entry_action = g.action.clone();
     if let Some(t) = d.get("title").and_then(|v| v.as_str()) {
         g.title = t.to_string();
     }
@@ -1607,15 +1742,24 @@ fn apply_patch(
     // **관측**이고 `select_index` 는 키를 쏘는 **지시**다(1-based 화면 번호 계약 · `parse_action`).
     // 0-based 메뉴의 0번을 액션으로 지목할 수 없다는 표현 불능이 남지만, 그 불능의 귀결은
     // `action = None` → `HeldNoAction` = **보류**라 실패 방향이 옳다(§3-3).
+    //
+    // ★(0.14.31 · 리뷰 R2 · claude 적대) **값이 안 바뀌면 사유를 남기지 않는다.** `report_json` 이
+    // 권하는 되먹임 봉투는 선언 축을 전량 싣기 때문에 `default_index: null`(원래 None 인 관문) ·
+    // `action: null`(human_only 관문)이 매 해소마다 들어온다. 그 무변화 입력에 note 를 남기면
+    // `cysd [gate-corpus]` 와 `cys [inject-guard]` 로 **프로세스마다** 오해성 3줄이 나가고,
+    // 이 리포 자신의 규율("진짜 신호가 묻힌다")을 스스로 어긴다. 실제 변경·실제 무시는 그대로
+    // 시끄럽게 남는다 — 억제되는 것은 **아무 일도 일어나지 않은 경우** 하나뿐이다.
     if d.contains_key("default_index") {
         match d.get("default_index") {
             Some(v) if v.is_null() => {
                 g.default_index = None;
-                notes.push(format!(
-                    "{}: default_index 를 명시 null 로 지웠다 — 이 관문의 아래키 수는 이제 \
-                     산출되지 않는다(보류)",
-                    g.id
-                ));
+                if entry_default_index.is_some() {
+                    notes.push(format!(
+                        "{}: default_index 를 명시 null 로 지웠다 — 이 관문의 아래키 수는 이제 \
+                         산출되지 않는다(보류: 자동확인도 이 관문에서 닫힌다)",
+                        g.id
+                    ));
+                }
             }
             Some(v) => match v.as_u64().filter(|n| *n <= u8::MAX as u64) {
                 Some(i) => g.default_index = Some(i as u8),
@@ -1647,7 +1791,11 @@ fn apply_patch(
     }
     if d.contains_key("action") {
         if g.passability == Passability::HumanOnly {
-            notes.push(format!("{}: human_only 관문의 action 선언 무시", g.id));
+            // 무변화(선언도 null · **진입 시** 액션도 None)면 조용하다 — 위 note 억제와 같은 규율.
+            if !(d.get("action").is_some_and(|v| v.is_null()) && entry_action.is_none()) {
+                notes.push(format!("{}: human_only 관문의 action 선언 무시", g.id));
+            }
+            g.action = None;
         } else if d.get("action").is_some_and(|v| v.is_null()) {
             g.action = None;
         } else {
@@ -3088,7 +3236,7 @@ mod tests {
     #[test]
     fn gate_corpus_report_speaks_the_corpus_vocabulary_and_carries_the_contract_keys() {
         let r = resolve_with(None, true);
-        let v = report_json(&r, "claude", None);
+        let v = report_json(&r, "claude", None, None);
 
         // CONTRACTS §C 최소 계약: 최상위 measured_on · gates[].{id,passability}
         assert_eq!(v["measured_on"].as_str(), Some(MEASURED_ON));
@@ -3169,7 +3317,7 @@ mod tests {
             "gates": [{"id": "theme", "measured_on": "9.9.9"}]
         });
         let r = resolve_with(Some(&env), true);
-        let v = report_json(&r, "claude", None);
+        let v = report_json(&r, "claude", None, None);
         assert_eq!(v["measured_on"].as_str(), Some(MEASURED_ON), "내장 핀은 상태에 따라 흔들리지 않는다");
         assert_eq!(v["effective_measured_on"], Value::Null);
         assert_eq!(v["mixed_versions"].as_bool(), Some(true));
@@ -3187,7 +3335,7 @@ mod tests {
             .collect();
         let all = serde_json::json!({"measured_on": "9.9.9", "source": "builtin", "gates": decls});
         let r2 = resolve_with(Some(&all), true);
-        let v2 = report_json(&r2, "claude", None);
+        let v2 = report_json(&r2, "claude", None, None);
         assert_eq!(v2["mixed_versions"].as_bool(), Some(false));
         assert_eq!(
             v2["effective_measured_on"].as_str(),
@@ -3208,7 +3356,7 @@ mod tests {
             v["gates"].as_array().unwrap().iter().find(|g| g["id"] == id).unwrap().clone()
         };
 
-        let same = report_json(&r, "claude", Some(MEASURED_ON));
+        let same = report_json(&r, "claude", Some(MEASURED_ON), None);
         assert_eq!(same["detected_version"].as_str(), Some(MEASURED_ON));
         assert_eq!(pick(&same, "theme")["policy"]["kind"].as_str(), Some("allowed"));
         assert_eq!(pick(&same, "theme")["policy"]["down"].as_u64(), Some(0));
@@ -3216,7 +3364,7 @@ mod tests {
         assert_eq!(pick(&same, "login-method")["policy"]["kind"].as_str(), Some("human_required"));
 
         // ★이 기계의 현행 설치본(2.1.263)에서 코퍼스가 서는 자리 — 액션은 전부 보류다.
-        let drift = report_json(&r, "claude", Some("2.1.263"));
+        let drift = report_json(&r, "claude", Some("2.1.263"), None);
         let t = pick(&drift, "theme");
         assert_eq!(t["policy"]["kind"].as_str(), Some("held_version_drift"));
         assert_eq!(t["policy"]["measured_on"].as_str(), Some(MEASURED_ON));
@@ -3265,7 +3413,7 @@ mod tests {
             ("merged", resolve_with(Some(&merged_env), true)),
             ("replaced", resolve_with(Some(&replaced_env), true)),
         ] {
-            let report = report_json(&base, "claude", None);
+            let report = report_json(&base, "claude", None, None);
             let env = report
                 .get("override_envelope")
                 .unwrap_or_else(|| panic!("{shape}: 붙여 넣을 봉투 축이 없다"))
@@ -3309,7 +3457,7 @@ mod tests {
 
         // ★그리고 **운영자의 관문이 살아남았다** — 이것이 리뷰가 지목한 소멸 경로의 반례다.
         let replaced = resolve_with(Some(&replaced_env), true);
-        let report = report_json(&replaced, "claude", None);
+        let report = report_json(&replaced, "claude", None, None);
         let round = resolve_with(Some(&report["override_envelope"]), true);
         let only = round
             .gates
@@ -3372,7 +3520,11 @@ mod tests {
             Some(""),
             Some("   "),
             Some("replace"),
+            // ★(리뷰 R2) 공백 변형은 **교체가 아니다** — 관용은 파괴적인 쪽으로 베풀지 않는다.
             Some(" replace "),
+            Some("replace "),
+            Some("\treplace"),
+            Some(" builtin "),
             Some("Replace"), // 대문자 변형은 교체가 아니다(정확 일치만)
             Some("builtin"),
         ];
@@ -3381,9 +3533,12 @@ mod tests {
 
         let mut notes = vec![String::from("기존 진단")];
         for input in inputs {
-            let normalized = input.map(str::trim).unwrap_or("builtin");
-            let is_replace = normalized == "replace";
-            let is_known = matches!(normalized, "replace" | "builtin");
+            // ★모드 어휘는 **정확 일치**다(공백 흡수 없음 · 리뷰 R2). 부재만 기본값 builtin 이다.
+            let raw = input.unwrap_or("builtin");
+            let is_replace = raw == "replace";
+            let is_known = matches!(raw, "replace" | "builtin");
+            let is_whitespace_variant =
+                !is_known && matches!(raw.trim(), "replace" | "builtin");
             let previous_notes = notes.clone();
             let before = notes.len();
             let mode = envelope_mode(input, &mut notes);
@@ -3391,8 +3546,8 @@ mod tests {
             assert_eq!(
                 mode,
                 if is_replace { EnvelopeMode::Replace } else { EnvelopeMode::Merge },
-                "입력 {input:?}: 공백 제거 후 정확한 `replace` 만 교체여야 한다 — 그 밖의 입력이 \
-                 교체로 새면 선언하지 않은 관문이 사라진다"
+                "입력 {input:?}: **정확히** `replace` 만 교체여야 한다 — 그 밖의 입력이 교체로 새면 \
+                 선언하지 않은 관문이 사라진다(공백 변형 포함 · 리뷰 R2)"
             );
             assert!(
                 notes.starts_with(&previous_notes),
@@ -3406,15 +3561,20 @@ mod tests {
             );
             if !is_known {
                 let note = &notes[before];
-                let is_report_word = REPORT_SOURCE_WORDS.contains(&normalized);
+                let is_report_word = REPORT_SOURCE_WORDS.contains(&raw);
+                assert_eq!(
+                    note.contains("공백이 섞여"),
+                    is_whitespace_variant,
+                    "입력 {input:?}: 공백 변형과 그 밖의 강등이 같은 문면으로 접혔다(처방이 다르다)"
+                );
                 assert_eq!(
                     note.contains("override_envelope"),
-                    is_report_word,
+                    is_report_word && !is_whitespace_variant,
                     "입력 {input:?}: 보고서 어휘라면 붙여 넣을 축을 이름으로 지목해야 한다"
                 );
                 assert_eq!(
                     note.contains("미지 값"),
-                    !is_report_word,
+                    !is_report_word && !is_whitespace_variant,
                     "입력 {input:?}: 보고서 어휘와 진짜 미지 값의 처방이 뒤섞였다"
                 );
             }
@@ -3451,6 +3611,267 @@ mod tests {
         let m = resolve_with(Some(&merge), true);
         let mg = m.gates.iter().find(|g| g.id == "login-method").unwrap();
         assert_eq!(mg.passability, Passability::HumanOnly);
+    }
+
+    /// ★(0.14.31 · WP-1 H-2 · 리뷰 R2) 권장 봉투의 무변화 되먹임은 조용하고, 실제 변경·거부는 남는다.
+    ///
+    /// 【무엇이 틀렸었는가】 보고서는 선언 축을 전량 싣는데, R1 은 원래 없는 기본 포커스의
+    /// `default_index: null` 과 사람 전용 관문의 `action: null` 에도 매 왕복마다 오해성 3줄을 냈다.
+    /// 그래서 권장 경로 그대로 두 번 되먹여 진단 0건과 관문 목록 보존을 값으로 잰다.
+    ///
+    /// 【왜 양성 대조군도 세는가】 진단을 통째로 없애도 무소음만 재는 검체는 초록이다. 실제 지움·
+    /// 액션 무시·승격 거부·손상은 사유가 정확히 1건이어야 한다(누락과 중복 모두 결함).
+    /// 특히 기계 관문을 사람 전용으로 바꾸면서 액션을 null 로 지우면, 패치 도중에는 이미 액션이
+    /// 없어도 진입 시점에는 있었다. 이 반례가 비교 기준을 패치 진입 시점에 묶는다.
+    /// (codex gpt-6-astra 위임 산출 · 전행 검토 후 채택 — `impl/codex/r2-tests/suppression_test.rs`.
+    ///  전제 단언 한 줄만 문면을 고쳤다: 실패 메시지가 "빌트인 관문이 없다" 였는데 `expect` 는
+    ///  **찾았을 때**의 값을 쓰므로 뜻이 뒤집혀 있었다.)
+    #[test]
+    fn feeding_the_recommended_envelope_back_is_silent_but_real_changes_are_not() {
+        let base = resolve_with(None, true);
+        assert_eq!(base.source, Source::Builtin, "전제: 코드 정본에서 출발해야 한다");
+        let report = report_json(&base, "claude", None, None);
+        assert!(report["override_envelope"].is_object(), "권장 되먹임 봉투가 없다");
+        let first = resolve_with(Some(&report["override_envelope"]), true);
+        assert!(
+            first.notes.is_empty(),
+            "무변화 권장 봉투가 오해성 진단을 냈다: {:?}",
+            first.notes
+        );
+        assert_eq!(
+            first.source,
+            Source::Merged { overridden: base.gates.len(), added: 0 },
+            "봉투를 실제로 병합하지 않고 무소음으로 보였다"
+        );
+        assert_eq!(
+            first.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            base.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            "첫 되먹임이 정본 관문 목록을 바꿨다"
+        );
+
+        let second_report = report_json(&first, "claude", None, None);
+        assert!(second_report["override_envelope"].is_object(), "두 번째 되먹임 봉투가 없다");
+        let second = resolve_with(Some(&second_report["override_envelope"]), true);
+        assert!(
+            second.notes.is_empty(),
+            "두 번째 무변화 되먹임이 다시 진단을 냈다: {:?}",
+            second.notes
+        );
+        assert_eq!(second.source, first.source, "두 번째 되먹임의 병합 출처가 달라졌다");
+        assert_eq!(
+            second.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            first.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            "두 번째 되먹임이 관문 id 목록을 바꿨다(누락·추가·순서 변경)"
+        );
+
+        // 각 선언은 정본에 따로 적용한다 — 앞 반례의 변경이 뒤 반례의 전제를 지우지 않게 한다.
+        for (case, id, patch, reason, passability, clear_default, clear_action) in [
+            (
+                "실제 기본 포커스 지움", "folder-trust",
+                serde_json::json!({"id": "folder-trust", "default_index": null}),
+                "명시 null", Passability::Machine, true, false,
+            ),
+            (
+                "사람 전용 관문의 비-null 액션 무시", "login-method",
+                serde_json::json!({"id": "login-method", "action": {
+                    "select_index": 1, "label": "Claude account with subscription"
+                }}),
+                "action 선언 무시", Passability::HumanOnly, false, true,
+            ),
+            (
+                "사람 전용 관문의 기계 통과 승격 거부", "oauth-code",
+                serde_json::json!({"id": "oauth-code", "passability": "machine"}),
+                "승격 선언 거부", Passability::HumanOnly, false, true,
+            ),
+            (
+                "손상된 액션 선언", "folder-trust",
+                serde_json::json!({"id": "folder-trust", "action": {"select_index": 0}}),
+                "action 선언이 손상", Passability::Machine, false, false,
+            ),
+            (
+                "사람 전용 변경과 액션 지움의 동시 선언", "theme",
+                serde_json::json!({"id": "theme", "passability": "human_only", "action": null}),
+                "action 선언 무시", Passability::HumanOnly, false, true,
+            ),
+        ] {
+            let before = base.gates.iter().find(|g| g.id == id).expect("전제: 빌트인 관문을 찾지 못했다");
+            if id == "folder-trust" || id == "theme" {
+                assert_eq!(before.passability, Passability::Machine, "{case}: 전제인 기계 관문이 아니다");
+                assert!(before.default_index.is_some(), "{case}: 전제인 기본 포커스 값이 없다");
+                assert!(before.action.is_some(), "{case}: 전제인 종전 액션이 없다");
+            } else {
+                assert_eq!(before.passability, Passability::HumanOnly, "{case}: 전제인 사람 전용 관문이 아니다");
+                assert_eq!(before.action, None, "{case}: 사람 전용 관문에 이미 액션이 있다");
+            }
+            let envelope = serde_json::json!({"gates": [patch]});
+            let changed = resolve_with(Some(&envelope), true);
+            assert_eq!(
+                changed.notes.iter().filter(|note| note.contains(id) && note.contains(reason)).count(),
+                1,
+                "{case}: 실제 변경·거부 사유가 누락되거나 중복됐다: {:?}",
+                changed.notes
+            );
+            let after = changed.gates.iter().find(|g| g.id == id).expect("선언 뒤 관문이 사라졌다");
+            assert_eq!(after.passability, passability, "{case}: 통과 가능성의 적용·거부가 틀렸다");
+            assert_eq!(
+                after.default_index,
+                if clear_default { None } else { before.default_index },
+                "{case}: 기본 포커스의 지움·유지가 틀렸다"
+            );
+            assert_eq!(
+                after.action.as_ref(),
+                if clear_action { None } else { before.action.as_ref() },
+                "{case}: 액션의 제거·유지가 틀렸다"
+            );
+        }
+    }
+
+    /// ★사람 1회 바닥은 **id 하나**가 아니라 "그 화면을 주장하는 선언 전량"을 봉한다(리뷰 R2).
+    ///
+    /// 【무엇이 뚫려 있었는가】 R1 의 바닥은 `gates.iter_mut().find(|g| g.id == b.id)` — **첫 항목
+    /// 하나**만 고쳤다. 그래서 두 우회가 그대로 통과했다:
+    ///   ⓐ **중복 id**(codex major): 미끼 선언 #1 이 고쳐지고, 로그인 화면에서 `identify` 가
+    ///      돌려주는 것은 고쳐지지 않은 #2(진짜 로그인 needle · machine · action)다.
+    ///   ⓑ **별칭 id**(claude 적대): id 가 안 겹치면 바닥이 아예 돌지 않고, 그 선언이 복원된
+    ///      `login-method` **앞**에 서서 첫 매치를 가져간다.
+    /// 두 경우의 귀결은 같다 — 코퍼스가 로그인 화면을 **기계 통과 가능**으로 분류한다.
+    ///
+    /// 【이 검체가 재지 **못하는** 것 — 정직】 needle 포함 판정은 화면 동일성의 충분조건도
+    /// 필요조건도 아니다(codex 설계 검토 ①). 정본 needle 과 포함관계가 **없는** 다른 문면
+    /// (예: 로그인 화면의 `3rd-party platform …` 줄)을 needle 로 쓰면 이 층위를 빠져나간다 —
+    /// 아래 마지막 절이 그 사실을 박제하고, 그 구멍은 **화면 층위**에서 닫힌다
+    /// (`inject_guard::confirm_denied` 의 `HumanOnlyScreen` · 검체
+    ///  `human_only_screen_seals_confirmation_whatever_the_corpus_declares`).
+    #[test]
+    fn human_only_floor_seals_duplicate_ids_and_alias_declarations() {
+        // ── ⓐ 중복 id — 미끼 #1 + 진짜 로그인 #2(codex 재현 그대로)
+        let dup = serde_json::json!({"source": "replace", "gates": [
+            {"id": "login-method", "needles": ["Do you want a decoy?"],
+             "widget": ["Decoy", "Not a decoy"], "passability": "machine",
+             "default_index": 1, "action": {"select_index": 1, "label": "Decoy"}},
+            {"id": "login-method", "needles": ["Select login method"],
+             "widget": ["Claude account with subscription", "Anthropic Console account"],
+             "passability": "machine", "default_index": 1,
+             "action": {"select_index": 1, "label": "Claude account with subscription"}},
+        ]});
+        let r = resolve_with(Some(&dup), true);
+        let hits: Vec<&Gate> = r.gates.iter().filter(|g| g.id == "login-method").collect();
+        assert_eq!(hits.len(), 2, "선언이 버려졌다 — 이 모듈의 집행 수단은 수리이지 제거가 아니다");
+        for (i, g) in hits.iter().enumerate() {
+            assert_eq!(
+                g.passability,
+                Passability::HumanOnly,
+                "중복 #{i} 가 기계 통과로 남았다(첫 항목만 고치는 바닥의 재발)"
+            );
+            assert!(g.action.is_none(), "중복 #{i} 에 기계 액션이 남았다");
+        }
+        // ★화면 층위 — `identify` 가 돌려주는 그 항목이 사람 1회여야 한다(id 회계가 아니라 이것이 축이다).
+        let picked = identify(&r.gates, fixtures::LOGIN_METHOD_2_1_261).expect("로그인 화면 미식별");
+        assert_eq!(picked.passability, Passability::HumanOnly, "로그인 화면이 기계 통과로 분류된다");
+        assert!(
+            matches!(action_policy(picked, Some(MEASURED_ON)), ActionPolicy::HumanRequired { .. }),
+            "정책이 로그인 화면에 기계 통과를 낸다"
+        );
+        // 중복은 조용히 넘어가지 않는다 — **위치까지** 적는다(codex 설계 검토 ②).
+        assert!(
+            r.notes.iter().any(|n| n.contains("중복 id") && n.contains("login-method@gates[0, 1]")),
+            "중복 id 진단이 없다: {:?}",
+            r.notes
+        );
+        // ★(codex 설계 검토 ⑫) 무변화 note 억제와 **공존**해도 강등 사유는 남는다.
+        assert_eq!(
+            r.notes.iter().filter(|n| n.contains("사람 1회")).count(),
+            2,
+            "강등이 조용해졌다(공격 봉투 + note 억제의 결합): {:?}",
+            r.notes
+        );
+
+        // ── ⓑ 별칭 id — 정본 needle 과 **포함관계가 있는** 문면은 코퍼스 층위에서 봉해진다.
+        let alias = serde_json::json!({"source": "replace", "gates": [{
+            "id": "login-alias", "needles": ["Select login method"],
+            "widget": ["Claude account with subscription", "Anthropic Console account"],
+            "passability": "machine", "default_index": 1,
+            "action": {"select_index": 1, "label": "Claude account with subscription"},
+        }]});
+        let ra = resolve_with(Some(&alias), true);
+        let a = ra.gates.iter().find(|g| g.id == "login-alias").expect("별칭 선언이 버려졌다");
+        assert_eq!(a.passability, Passability::HumanOnly, "별칭 id 로 바닥을 우회했다");
+        assert!(a.action.is_none());
+        assert!(
+            ra.notes.iter().any(|n| n.contains("화면을 같은 문면으로 주장")),
+            "별칭 강등을 이름으로 말하지 않는다: {:?}",
+            ra.notes
+        );
+        let picked = identify(&ra.gates, fixtures::LOGIN_METHOD_2_1_261).expect("로그인 화면 미식별");
+        assert_eq!(picked.passability, Passability::HumanOnly);
+
+        // ── ⓒ 빌트인 코퍼스는 이 술어로 서로를 잡아먹지 않는다(과잉 포섭의 상한 확인).
+        let bs = builtin();
+        for a in &bs {
+            for b in bs.iter().filter(|b| b.passability == Passability::HumanOnly) {
+                if a.id == b.id {
+                    continue;
+                }
+                assert!(
+                    !claims_same_screen(a, b),
+                    "빌트인 {} 이 {} 의 화면을 주장한다고 판정된다 — 정본이 스스로 강등된다",
+                    a.id,
+                    b.id
+                );
+            }
+        }
+
+        // ── ⓓ ★잔여(정직): 포함관계가 **없는** 문면은 이 층위를 빠져나간다.
+        let escape = serde_json::json!({"source": "replace", "gates": [{
+            "id": "login-escape",
+            "needles": ["3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI"],
+            "widget": ["Claude account with subscription"],
+            "passability": "machine", "default_index": 1,
+            "action": {"select_index": 1, "label": "Claude account with subscription"},
+        }]});
+        let re = resolve_with(Some(&escape), true);
+        let e = re.gates.iter().find(|g| g.id == "login-escape").unwrap();
+        assert_eq!(
+            e.passability,
+            Passability::Machine,
+            "이 검체는 **구멍이 남아 있음**을 박제한다 — 여기가 초록으로 바뀌었다면 코퍼스 층위가 \
+             넓어진 것이니 과잉 포섭(정상 관문 몰살)을 함께 재고, 화면 층위 봉인은 그대로 둘 것"
+        );
+        assert!(
+            identify(&re.gates, fixtures::LOGIN_METHOD_2_1_261).is_some_and(|g| g.id == "login-escape"),
+            "구멍의 형상이 바뀌었다 — 화면 층위 검체(inject_guard)의 전제를 다시 볼 것"
+        );
+    }
+
+    /// ★교체 경로도 기본 포커스 `0` 을 **값으로** 받는다(0.14.31 · 리뷰 R2).
+    ///
+    /// R1 은 `parse_new_gate` 의 필터를 `n <= u8::MAX` 로 넓혔지만 검체는 `source` 미지정 =
+    /// **병합**(`apply_patch`) 경로만 탔다 — 필터를 종전 `n > 0` 으로 되돌려도 전 스위트가 초록이었다.
+    /// 정본 §4 H-2 가 기입하라는 값(folder-trust `default_index:0` + action(1,…) = down 1)을 다음
+    /// 회차가 **replace 봉투로** 쓰면 조용히 `None`(보류)로 접힌다 — 실패 방향은 안전하나 원 결함
+    /// (문서화된 탈출구가 못 쓴다) 그대로다.
+    #[test]
+    fn replace_mode_also_accepts_default_index_zero() {
+        let env = serde_json::json!({"source": "replace", "gates": [{
+            "id": "folder-trust-2-1-261",
+            "title": "작업 폴더 신뢰 확인(2.1.261 실측판)",
+            "needles": ["Is this a project you created or one you trust?"],
+            "widget": ["Enter to confirm", "Esc to cancel"],
+            "passability": "machine",
+            // 2.1.261 실측 형상: 0 = "No, exit" 가 기본 포커스, 1 = 신뢰.
+            "default_index": 0,
+            "action": {"select_index": 1, "label": "Yes, I trust this folder"},
+        }]});
+        let r = resolve_with(Some(&env), true);
+        let g = r.gates.iter().find(|g| g.id == "folder-trust-2-1-261").expect("교체 선언이 사라졌다");
+        assert_eq!(g.default_index, Some(0), "교체 경로가 0 을 조용히 버렸다(보류로 접힘)");
+        assert_eq!(
+            g.down_presses(),
+            Some(1),
+            "정본 §4 H-2 가 기입하라는 down 이 교체 봉투에서 나오지 않는다"
+        );
+        // 그리고 그 선언은 **Return 한 발 조립과 합의하지 못한다**(down != 0) — 확인 경계가 닫는다.
+        assert!(matches!(action_policy(g, Some(MEASURED_ON)), ActionPolicy::Allowed { down: 1, .. }));
     }
 
     /// ★기본 포커스 `0` 은 **값이다** — 그리고 명시 `null` 은 지운다(0.14.31 · 리뷰 R1).
@@ -3497,7 +3918,7 @@ mod tests {
     /// 되파싱해야 했는데, 되파싱은 다음 판에 반드시 깨진다.
     #[test]
     fn report_separates_no_envelope_from_unreadable_adapter_spec() {
-        let normal = report_json(&resolve_with(None, true), "claude", None);
+        let normal = report_json(&resolve_with(None, true), "claude", None, None);
         assert_eq!(normal["source"].as_str(), Some("builtin"));
         assert_eq!(normal["source_detail"], Value::Null);
 
@@ -3506,11 +3927,46 @@ mod tests {
             notes: vec!["어댑터 스펙 판독 실패(no such file) — 코드 정본 폴백".to_string()],
             source: Source::SpecUnreadable { reason: "no such file".to_string() },
         };
-        let v = report_json(&broken, "claude", None);
+        let v = report_json(&broken, "claude", None, None);
         assert_eq!(v["source"].as_str(), Some("spec_unreadable"), "고장이 정상과 같은 값으로 접혔다");
         assert_eq!(v["source_detail"]["reason"].as_str(), Some("no such file"));
-        // 그리고 그 값은 봉투 모드가 아니다 — 되먹여도 병합에 착지한다(위 검체와 같은 규율).
-        assert_eq!(v["override_envelope"]["source"].as_str(), Some("builtin"));
+
+        // ★(0.14.31 · 리뷰 R2 · claude 적대) 그리고 **되먹임 재료를 내지 않는다.** R1 은 판독 실패
+        //   에서도 빌트인 6관문을 실은 붙여넣기용 봉투를 함께 냈는데, 그 봉투는 운영자의 선언을
+        //   반영하지 않는다(읽지 못했다) — 문서대로 붙여 넣으면 원 선언이 빌트인으로 덮인다.
+        assert_eq!(v["override_envelope"], Value::Null, "판독 실패인데 붙여넣기 재료를 내준다");
+        assert_eq!(v["override_envelope_status"]["paste_safe"].as_bool(), Some(false));
+        assert!(
+            v["override_envelope_status"]["reason"].as_str().is_some_and(|r| r.contains("판독")
+                || r.contains("읽지 못")),
+            "왜 재료를 주지 않는지 말하지 않는다: {:?}",
+            v["override_envelope_status"]
+        );
+        // 정상 경로는 종전대로 재료를 내고 스스로 안전 표식을 단다.
+        assert_eq!(normal["override_envelope"]["source"].as_str(), Some("builtin"));
+        assert_eq!(normal["override_envelope_status"]["paste_safe"].as_bool(), Some(true));
+        assert_eq!(normal["override_envelope_status"]["reason"], Value::Null);
+    }
+
+    /// ★보고서는 **자기가 언제 찍혔는지** 싣는다(0.14.31 · 리뷰 R2 · codex minor).
+    ///
+    /// `measured_on` 은 **벤더 버전**(무엇에 대고 실측했는가)이라 운영자가 `agents.json` 을 고치기
+    /// 전후로 뜬 두 보고서에서 **같은 값**이다. 시각이 없으면 하류(사람·preflight)는 어느 쪽이
+    /// 지금의 코퍼스인지 가릴 수 없다 — 계수와 sha 에 측정 시각을 병기하라는 것과 같은 규율이다.
+    ///
+    /// 시계는 **호출부가** 읽는다(이 함수는 순수하다). 그래서 검체가 고정 시각을 넣어 재현한다.
+    #[test]
+    fn report_carries_the_observation_time_supplied_by_the_caller() {
+        let r = resolve_with(None, true);
+        let at = "2026-09-08T06:30:00+0900";
+        let v = report_json(&r, "claude", None, Some(at));
+        assert_eq!(v["observed_at"].as_str(), Some(at), "관측 시각이 실리지 않는다");
+        // 벤더 측정 출처와 **다른 축**이다 — 한 값으로 접히지 않았는지 확인한다.
+        assert_eq!(v["measured_on"].as_str(), Some(MEASURED_ON));
+        assert_ne!(v["observed_at"], v["measured_on"]);
+        // 주지 않으면 **지어내지 않는다**(순수 함수 · 관측하지 않은 것을 인쇄하지 않는다).
+        let none = report_json(&r, "claude", None, None);
+        assert_eq!(none["observed_at"], Value::Null);
     }
 
     // ── 버전 핀 ────────────────────────────────────────────────────────────

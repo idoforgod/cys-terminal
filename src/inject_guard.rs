@@ -283,9 +283,21 @@ fn action_label_selected(gate: &Gate, screen: &str) -> bool {
 /// 못하고 모달 어휘도 못 본 잘린 렌더(부트 델타에는 질문이 있는데 화면은 `❯ No, exi` 뿐)에서 `Send` 가 나왔고
 /// 그 Return 이 부분 렌더된 종료 선택지를 눌렀다(codex R4 blocking). 그래서 확인은 **양성 증거만** 본다.
 ///
-/// 【참이 되는 조건 — 전부 AND】 ① 코퍼스가 지금 화면을 **바로 그 id** 로 식별한다(미식별=거짓) ·
-/// ② 커서가 종료 라벨 위가 **아니다** · ③ 커서가 그 관문의 **액션 라벨 전문** 위에 있고 활성 선택 블록에
+/// 【참이 되는 조건 — 전부 AND】 ⓪ **코드 정본**의 사람 1회 관문(로그인·OAuth)이 지금 화면에 서지
+/// **않는다**(코퍼스 선언과 무관한 화면 층위 봉인 · 0.14.31 리뷰 R2) · ① 코퍼스가 지금 화면을 **바로 그
+/// id** 로 식별한다(미식별=거짓) · ② 커서가 종료 라벨 위가 **아니다** · ③ 코퍼스에 통과 동작이 선언돼
+/// 있고 그 **키 시퀀스가 Return 한 발**이다(`down_presses() == Some(0)` — 이 조립은 Down 을 보내지
+/// 않는다 · 0.14.31 리뷰 R2) · ④ 커서가 그 관문의 **액션 라벨 전문** 위에 있고 활성 선택 블록에
 /// 경쟁 커서가 없다([`action_label_selected`]).
+///
+/// ★⓪·③ 은 **조이는 항**이다. ⓪ 은 봉투가 별칭 id·중복 id 로 코퍼스 층위의 바닥을 빠져나가도 화면
+///   층위에서 닫고(codex 설계 검토 ①), ③ 은 운영자가 `default_index: null` 로 선언한 무지가 실제로
+///   키를 막게 한다(종전엔 보고서만 '보류' 라 인쇄하고 Return 은 그대로 나갔다 — codex major).
+///   ★그럼에도 **버전 핀([`first_run_gates::action_policy`])은 여기에 배선돼 있지 않다** — 그 판정은
+///   `Allowed{down}` 이 기술하는 **다발 전송**을 전제하는데 이 조립은 Return 1발이고, 좌석이 실제로
+///   실행한 바이너리의 버전을 이 자리에서 알 방법이 아직 없다(PATH 조회는 그 바이너리가 아니다).
+///   그 배선은 4조건(첫 Down 전 버전 일치 · 탐색 전용 허가 · 전송 후 재관측 · 멱등 래치)과 함께
+///   다음 회차로 남아 있다(노트 §4-2).
 ///
 /// 【롤백 노브로 열리지 않는다】 `CYS_READINESS_V1=1`(모달 축)·`CYS_INJECT_GATE_GUARD=0`(U-14 축)은
 /// **보류를 푸는** 노브다. 이 술어는 보류를 푸는 것이 아니라 **키를 쏘는 것을 허가**한다 — 조여지는 방향의
@@ -314,8 +326,15 @@ pub enum ConfirmDenied {
     OtherGate(String),
     /// 커서가 **종료 선택지** 위다 — 그 Return 은 통과가 아니라 종료다(좌석 사망 · 비가역).
     CursorOnExit,
+    /// ★(0.14.31 · 리뷰 R2) 지금 화면이 **코드 정본이 사람 1회로 실측한 관문**이다 —
+    /// 코퍼스의 선언 순서·id·통과 가능성과 **무관하게** 닫는다(화면 층위 봉인).
+    HumanOnlyScreen(String),
     /// 코퍼스에 그 관문의 **통과 동작(action)** 선언이 없다 — 기계가 통과시킬 근거가 없다.
     NoAction,
+    /// ★(0.14.31 · 리뷰 R2 · codex major) 코퍼스가 선언한 통과 키 시퀀스가 **Return 한 발이 아니다**.
+    /// `None` = 산출 불가(기본 포커스 미상 · 목표가 기본 포커스보다 위) · `Some(n>0)` = 아래키 n회 필요.
+    /// 이 조립은 Return 만 보낸다 — 선언이 다른 것을 요구하면 둘은 합의하지 못했다(보류).
+    SequenceNotBareReturn { down: Option<u8> },
     /// 커서가 액션 라벨 **전문** 위가 아니거나, 활성 선택 블록에 **경쟁 커서**가 있다(모호).
     LabelUnresolved,
 }
@@ -329,7 +348,20 @@ impl ConfirmDenied {
             }
             ConfirmDenied::OtherGate(id) => format!("지금 화면은 다른 관문이다(id={id})"),
             ConfirmDenied::CursorOnExit => "선택 커서가 종료 선택지 위다(그 Return 은 좌석 종료)".into(),
+            ConfirmDenied::HumanOnlyScreen(id) => format!(
+                "지금 화면은 코드 정본이 **사람 1회**로 실측한 관문이다(id={id}) — 코퍼스가 무엇을 \
+                 선언했든 기계가 넘지 않는다"
+            ),
             ConfirmDenied::NoAction => "코퍼스에 이 관문의 통과 동작(action)이 선언돼 있지 않다".into(),
+            ConfirmDenied::SequenceNotBareReturn { down } => match down {
+                None => "코퍼스가 이 관문의 아래키 수를 산출하지 못한다(기본 포커스 미상 또는 역방향) \
+                         — 이 조립은 Return 만 보내므로 보류한다"
+                    .into(),
+                Some(n) => format!(
+                    "코퍼스가 선언한 통과 시퀀스는 아래키 {n}회 + Return 인데 이 조립은 Return 만 \
+                     보낸다 — 합의하지 못한 시퀀스로 키를 쏘지 않는다"
+                ),
+            },
             ConfirmDenied::LabelUnresolved => {
                 "커서가 액션 라벨 전문 위가 아니거나 활성 선택 블록에 경쟁 커서가 있다(모호)".into()
             }
@@ -339,6 +371,19 @@ impl ConfirmDenied {
 
 /// [`confirm_allowed`] 의 사유형. `None` = 허가.
 pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
+    // ★(0.14.31 · 리뷰 R2 · codex 설계 검토 ①) **화면 층위 봉인이 먼저다.** 코퍼스 층위의 바닥
+    //   (`first_run_gates::restore_human_only_builtin_floor`)은 id 와 needle 포함으로 봉하는데,
+    //   그 둘 중 어느 것도 "이 화면이 로그인 화면인가" 의 충분조건이 아니다 — 별칭 선언이 정본과
+    //   포함관계가 없는 다른 문면(예: 로그인 화면의 `3rd-party platform` 줄)을 needle 로 쓰면
+    //   코퍼스 층위를 빠져나간다. 그래서 **코드 정본**(봉투가 손대지 못하는 것)이 지금 화면을
+    //   사람 1회 관문으로 식별하면, 코퍼스가 무엇을 선언했든 확인은 열리지 않는다.
+    //   실패 방향: 이 항의 오탐 귀결은 보류(사람 1회 · 좌석 보존 · 키 0)다.
+    if let Some(b) = first_run_gates::builtin()
+        .into_iter()
+        .find(|b| b.passability == Passability::HumanOnly && b.matches(o.screen))
+    {
+        return Some(ConfirmDenied::HumanOnlyScreen(b.id));
+    }
     let g = match first_run_gates::identify(o.gates, o.screen) {
         None => return Some(ConfirmDenied::Unidentified),
         Some(g) if g.id != gate_id => return Some(ConfirmDenied::OtherGate(g.id.clone())),
@@ -349,6 +394,19 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
     }
     if g.action.is_none() {
         return Some(ConfirmDenied::NoAction);
+    }
+    // ★(0.14.31 · 리뷰 R2 · codex major) **선언된 시퀀스가 Return 한 발일 때만** 확인이 열린다.
+    //   R1 은 봉투의 `default_index: null`(= "기본 포커스를 모른다")을 보고서에서 '보류' 라고
+    //   인쇄하면서 정작 이 경계에서는 아무것도 하지 않았다 — 운영자가 선언한 무지가 키를 막지
+    //   못했다. `Some(0)` 을 요구하는 것은 이 조립의 **실제 능력**과 선언을 맞추는 것이다:
+    //   여기는 Down 을 보내지 않으므로 `down > 0` 선언과는 애초에 합의가 없다.
+    //   ★오늘의 빌트인 folder-trust 는 `default_index:Some(1)` + `action:(1,…)` → `Some(0)` 이라
+    //     기본 경로는 한 글자도 바뀌지 않는다(이 항은 코퍼스가 스스로 모호해질 때만 문다).
+    //   ★이 항을 "Down 을 보내도 된다" 는 허가로 확대하지 말 것(codex 설계 검토 ⑤) — 전송 후
+    //     재관측 없는 다발 전송은 이 벨트가 서 있는 전제(지금 화면의 커서)를 스스로 무너뜨린다.
+    match g.down_presses() {
+        Some(0) => {}
+        down => return Some(ConfirmDenied::SequenceNotBareReturn { down }),
     }
     // 술어는 `decide_allowing` 의 allow 구멍과 **같은 하나**다(사본 0 — 두 자리가 갈리면 구멍이 생긴다).
     if action_label_selected(g, o.screen) {
@@ -1263,6 +1321,140 @@ mod tests {
         // 그리고 그 판정은 readiness 와 **같은 함수**의 결과다(판정 분리 금지의 in-band 확인).
         assert!(crate::readiness::modal_signature(fixtures::LIVE_PERMISSION_PROMPT).is_some());
         assert!(crate::readiness::modal_signature("Yes, I trust this folder ✔\n").is_none());
+    }
+
+    /// ★확인은 **선언된 키 시퀀스가 Return 한 발일 때만** 열린다(0.14.31 · 리뷰 R2 · codex major).
+    ///
+    /// 【무엇이 뚫려 있었는가】 R1 은 봉투의 `default_index: null`(= 운영자가 "기본 포커스를 모른다"
+    /// 고 선언한 자리)을 보고서에 `down_presses: null` · `held_no_action` = **보류**라고 인쇄하면서,
+    /// 정작 이 경계에서는 아무것도 하지 않았다 — 커서만 라벨 위면 Return 이 그대로 나갔다.
+    /// 인쇄한 판정과 실제 키 경로가 다르면 그 인쇄는 운영자를 속인다.
+    ///
+    /// 【왜 `Some(0)` 인가】 이 조립(`cys.rs` 폴더신뢰 자동확인)은 **Down 을 보내지 않는다**.
+    /// 그러므로 `down > 0` 선언과는 애초에 합의가 없고, 산출 불가(`None` — 미상 또는 목표가 기본
+    /// 포커스보다 **위**)와도 합의가 없다. 이 항을 "Down 을 보내도 된다" 는 허가로 확대하면
+    /// 이 벨트가 서 있는 전제(지금 화면의 커서)를 스스로 무너뜨린다(codex 설계 검토 ⑤).
+    ///
+    /// 【기본 경로 무영향】 빌트인 folder-trust 는 `default_index:Some(1)` + `action:(1,…)` →
+    /// `Some(0)` 이다. 이 항은 **코퍼스가 스스로 모호해질 때만** 문다.
+    #[test]
+    fn confirm_needs_the_declared_sequence_to_be_a_bare_return() {
+        let screen = fixtures::FOLDER_TRUST;
+        // ① 정본(down=0) — 종전과 한 글자도 다르지 않다.
+        let base = gates();
+        assert_eq!(
+            base.iter().find(|g| g.id == GATE_FOLDER_TRUST).unwrap().down_presses(),
+            Some(0),
+            "빌트인 전제가 바뀌었다 — 이 검체의 '기본 경로 무영향' 주장이 함께 무너진다"
+        );
+        assert!(confirm_allowed(&obs(screen, &base), GATE_FOLDER_TRUST));
+
+        // ② 운영자가 "모른다"를 선언한다(`default_index: null`) → 보류. 그리고 **전송도 0**이다.
+        let cleared = first_run_gates::resolve_with(
+            Some(&serde_json::json!({"gates": [{"id": GATE_FOLDER_TRUST, "default_index": null}]})),
+            true,
+        )
+        .gates;
+        assert_eq!(
+            confirm_denied(&obs(screen, &cleared), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::SequenceNotBareReturn { down: None }),
+            "선언된 무지가 확인을 막지 못한다(보고서만 '보류' 라고 인쇄하던 그 상태)"
+        );
+
+        // ③ 아래키가 필요한 선언(2.1.261 실측 형상 · default 0 · 목표 1) → 보류.
+        let down1 = first_run_gates::resolve_with(
+            Some(&serde_json::json!({"gates": [{"id": GATE_FOLDER_TRUST, "default_index": 0}]})),
+            true,
+        )
+        .gates;
+        assert_eq!(
+            confirm_denied(&obs(screen, &down1), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::SequenceNotBareReturn { down: Some(1) }),
+            "Return 만 보내는 조립이 아래키 1회 선언과 합의했다고 판정한다"
+        );
+
+        // ④ 역방향(목표가 기본 포커스보다 위) → `checked_sub` 가 None → 같은 보류.
+        let upward = first_run_gates::resolve_with(
+            Some(&serde_json::json!({"gates": [
+                {"id": GATE_FOLDER_TRUST, "default_index": 9},
+            ]})),
+            true,
+        )
+        .gates;
+        assert_eq!(
+            confirm_denied(&obs(screen, &upward), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::SequenceNotBareReturn { down: None })
+        );
+
+        // ⑤ ★전송 관측 — 판정이 아니라 **조립의 산출**로 확인한다(진리표 소비자까지 닫혔는가).
+        for (label, gs) in [("cleared", &cleared), ("down1", &down1), ("upward", &upward)] {
+            let other_gate = !confirm_allowed(&obs(screen, gs), GATE_FOLDER_TRUST);
+            for legacy_v1 in [false, true] {
+                assert!(
+                    !trust_send(&TrustObserved {
+                        hit: true,
+                        first: true,
+                        persisted: false,
+                        sends: 0,
+                        max_sends: 2,
+                        other_gate,
+                        legacy_v1,
+                    }),
+                    "{label}: 합의하지 못한 시퀀스에 Return 이 나갔다(legacy_v1={legacy_v1})"
+                );
+            }
+        }
+    }
+
+    /// ★화면이 **코드 정본의 사람 1회 관문**이면 코퍼스가 무엇을 선언했든 확인이 열리지 않는다.
+    ///
+    /// (0.14.31 · 리뷰 R2 — claude 적대 minor + codex 설계 검토 ①)
+    ///
+    /// 코퍼스 층위의 바닥(`first_run_gates::restore_human_only_builtin_floor`)은 id 와 needle 포함
+    /// 으로 봉하지만, 그 둘 중 어느 것도 "이 화면이 로그인 화면인가" 의 충분조건이 아니다 —
+    /// 정본 needle 과 포함관계가 **없는** 다른 문면(로그인 화면의 `3rd-party platform …` 줄)을
+    /// needle 로 쓰면 코퍼스 층위를 빠져나간다(그 사실은 `first_run_gates` 쪽 검체가 박제한다).
+    /// 그래서 마지막 그물은 **봉투가 손대지 못하는 코드 정본**으로 화면을 다시 보는 것이다.
+    #[test]
+    fn human_only_screen_seals_confirmation_whatever_the_corpus_declares() {
+        let screen = fixtures::LOGIN_METHOD_2_1_261;
+        // 코퍼스 층위를 빠져나가는 별칭 — 기계 통과 · 액션 라벨이 **화면 커서 위**(`❯ 1. Claude …`).
+        let escape = serde_json::json!({"source": "replace", "gates": [{
+            "id": "login-escape",
+            "needles": ["3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI"],
+            "widget": ["Claude account with subscription"],
+            "passability": "machine", "default_index": 1,
+            "action": {"select_index": 1, "label": "Claude account with subscription"},
+        }]});
+        let gs = first_run_gates::resolve_with(Some(&escape), true).gates;
+        let hijacker = first_run_gates::identify(&gs, screen).expect("전제: 별칭이 화면을 가져간다");
+        assert_eq!(hijacker.id, "login-escape", "전제가 깨졌다 — 코퍼스 층위 검체를 함께 볼 것");
+        assert_eq!(hijacker.passability, Passability::Machine, "전제: 코퍼스 층위는 이것을 못 막았다");
+
+        // 화면 층위 봉인이 그 자리를 닫는다 — **어느 id 를 물어도**.
+        for asked in ["login-escape", GATE_FOLDER_TRUST, "login-method"] {
+            assert_eq!(
+                confirm_denied(&obs(screen, &gs), asked),
+                Some(ConfirmDenied::HumanOnlyScreen("login-method".to_string())),
+                "로그인 화면에서 확인이 열렸다(asked={asked})"
+            );
+        }
+        // 롤백 노브로도 열리지 않는다(조이는 벨트는 어느 노브로도 열지 않는다).
+        for (guard_off, readiness_legacy) in [(true, false), (false, true), (true, true)] {
+            let o = Observed { screen, gates: &gs, awakened: Some(false), guard_off, readiness_legacy };
+            assert!(
+                !confirm_allowed(&o, "login-escape"),
+                "노브({guard_off},{readiness_legacy})가 사람 1회 화면의 확인을 열었다"
+            );
+        }
+        // 그리고 조립은 **0발**이다.
+        assert!(!trust_send(&TrustObserved {
+            hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
+            other_gate: !confirm_allowed(&obs(screen, &gs), GATE_FOLDER_TRUST), legacy_v1: false,
+        }));
+        // ★정상 관문(폴더신뢰)은 종전대로 열린다 — 봉인이 자동확인 자체를 죽이지 않았다.
+        let base = gates();
+        assert!(confirm_allowed(&obs(fixtures::FOLDER_TRUST, &base), GATE_FOLDER_TRUST));
     }
 
     /// ★(0.14.31 · WP-1 H-2 · **실측**) 2026-09-08 격리 계측에서 claude 2.1.261 이 실제로 그린

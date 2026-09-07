@@ -1979,18 +1979,31 @@ fn gate_corpus_for_seat(agent: Option<&str>) -> Vec<cys::first_run_gates::Gate> 
 /// 갈리고, 그 순간 보고서는 진단이 아니라 소문이 된다(BLOCK-3 형태).
 fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
     let resolved = resolve_gate_corpus(agent);
-    let report = cys::first_run_gates::report_json(&resolved, agent, detected);
+    // ★(0.14.31 · 리뷰 R2 · codex minor) **관측 시각을 함께 낸다.** 시계는 여기서 **한 번만** 읽고
+    //   순수 함수(`report_json`)에 넘긴다 — 그래야 검체가 고정 시각을 넣어 재현할 수 있다.
+    //   `measured_on`(벤더 버전)과 다른 축이다: 운영자가 `agents.json` 을 고치기 전후로 뜬 두
+    //   보고서는 벤더 버전이 같아서, 시각이 없으면 어느 쪽이 지금의 코퍼스인지 가릴 수 없다.
+    let observed_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
+    let report =
+        cys::first_run_gates::report_json(&resolved, agent, detected, Some(&observed_at));
     if as_json {
         println!("{report}");
         return 0;
     }
     println!(
-        "gate-corpus  agent={agent}  source={}  measured_on={}  effective={}  gates={}",
+        "gate-corpus  agent={agent}  source={}  measured_on={}  effective={}  gates={}  observed_at={observed_at}",
         report["source"].as_str().unwrap_or("?"),
         report["measured_on"].as_str().unwrap_or("?"),
         report["effective_measured_on"].as_str().unwrap_or("(혼합)"),
         report["gates"].as_array().map(|a| a.len()).unwrap_or(0),
     );
+    // ★(0.14.31 · 리뷰 R2) 되먹임 재료를 **주지 않는** 경우를 사람용 출력에서도 말한다.
+    if report["override_envelope_status"]["paste_safe"].as_bool() == Some(false) {
+        println!(
+            "  ⚠ 이 보고서는 붙여넣기용 봉투(override_envelope)를 내지 않는다 — {}",
+            report["override_envelope_status"]["reason"].as_str().unwrap_or("?")
+        );
+    }
     // ★(0.14.31 · 리뷰 R1) 판독 실패는 '봉투 없음' 과 다른 사실이다 — 사람용 출력에서도 접지 않는다.
     if let Some(reason) = report["source_detail"]["reason"].as_str() {
         println!(
@@ -2004,8 +2017,9 @@ fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
         //   운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는다 — 거짓이다.
         if !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED {
             println!(
-                "  ★policy 는 진단이다 — 자동확인 조립은 버전을 보지 않는다(커서 벨트만 본 뒤 \
-                 Return 1발). held_* 를 '키가 안 나간다' 로 읽지 말 것"
+                "  ★policy 는 진단이다 — 자동확인 조립은 **버전을 보지 않는다**. 그 조립이 보는 \
+                 것은 화면 층위 봉인(정본 사람 1회 관문) · 커서 벨트 · 선언 시퀀스가 Return \
+                 한 발인가(down=0) 셋이고, held_version_* 를 '키가 안 나간다' 로 읽지 말 것"
             );
         }
     }
@@ -23840,6 +23854,61 @@ mod tests {
         );
     }
 
+    /// ★(0.14.31 · 리뷰 R2) 어댑터 스펙 **판독 실패**가 프로덕션 경로에서 실제로
+    /// `Source::SpecUnreadable` 로 도달한다 — 소스 핀이 아니라 **실행 검체**다.
+    ///
+    /// 【무엇이 뚫려 있었는가】 R1 은 `resolve_gate_corpus` 의 Err 팔을 `Source::Builtin` →
+    /// `Source::SpecUnreadable{reason}` 으로 바꿨는데, 그 배선에 검체가 **0**이었다. 되돌려도
+    /// 전 스위트가 초록이었고(격리 사본 실측: `cargo test --bin cys` 258 passed), 유일한 검체는
+    /// `Resolved{source: SpecUnreadable{..}}` 를 **손으로 지어** 넣어 생산자를 한 번도 지나지
+    /// 않았다. 그러면 minor ⑨('봉투 없음' ≠ '판독 실패')는 무성으로 회귀한다.
+    ///
+    /// 【왜 이 자리인가】 `load_agent_spec` 은 팩 디렉터리에 `agents.json` 이 없으면 반드시 Err 다.
+    /// 그래서 **격리 팩 디렉터리 + 이 검체 전용 어댑터명**(해소 캐시가 어댑터명 키라 다른 검체와
+    /// 섞이지 않는다)이면 실패 분기가 결정론으로 재현된다.
+    #[test]
+    fn unreadable_adapter_spec_reaches_the_report_as_spec_unreadable() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-gatecorpus-unreadable-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        let _ = std::fs::remove_file(td.join("agents.json")); // 판독 실패를 **만든다**(부재)
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        let agent = "cys-r2-unreadable-adapter-probe";
+        let resolved = resolve_gate_corpus(agent);
+
+        // 원상복구를 단언보다 **먼저** 한다(적색이 다음 검체를 오염시키지 않게).
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+
+        match &resolved.source {
+            cys::first_run_gates::Source::SpecUnreadable { reason } => assert!(
+                reason.contains("agents.json"),
+                "판독 실패 사유가 무엇을 못 읽었는지 말하지 않는다: {reason}"
+            ),
+            other => panic!(
+                "판독 실패가 '{other:?}' 로 접혔다 — '덮을 봉투가 없다'(정상)와 '봉투가 도달하지 \
+                 못했다'(고장)가 한 값이 되면 하류는 한국어 산문을 되파싱해야 한다"
+            ),
+        }
+        // ★그리고 코퍼스는 **비지 않는다**(빈 코퍼스 = 관문 축 소멸 = 관문 화면에 주입).
+        assert_eq!(
+            format!("{:?}", resolved.gates),
+            format!("{:?}", cys::first_run_gates::builtin()),
+            "판독 실패 폴백이 코드 정본과 다른 코퍼스를 냈다"
+        );
+        // 보고서까지 그 사실이 실린다 — 그리고 되먹임 재료는 **주지 않는다**(리뷰 R2 · G).
+        let report = cys::first_run_gates::report_json(&resolved, agent, None, Some("2026-09-08T06:30:00+0900"));
+        assert_eq!(report["source"].as_str(), Some("spec_unreadable"));
+        assert!(report["source_detail"]["reason"].as_str().is_some());
+        assert_eq!(report["override_envelope"], serde_json::Value::Null);
+        assert_eq!(report["override_envelope_status"]["paste_safe"].as_bool(), Some(false));
+        assert_eq!(report["observed_at"].as_str(), Some("2026-09-08T06:30:00+0900"));
+    }
+
     /// ★(0.14.31 · 리뷰 R1) 버전 핀 판정은 **CLI 키 경로 어디에도 배선돼 있지 않다** — 소스 핀.
     ///
     /// 【무엇을 막는가】 `cys gate-corpus --detected-version <v>` 는 관문마다 `policy` 를 인쇄한다.
@@ -23871,13 +23940,39 @@ mod tests {
                  다시 정하라"
             );
         }
+        // ★(0.14.31 · 리뷰 R2 · codex 설계 검토 ⑫) 이 핀이 **CLI 한 파일만** 보면 확인 경계
+        //   (`inject_guard`)에 들어온 배선을 놓친다 — 거기가 실제로 키를 여는 자리다. 그래서
+        //   버전 축(`action_policy`·`ActionPolicy`)의 부재를 **그 파일에서도** 못박는다.
+        let guard = include_str!("../inject_guard.rs");
+        let guard_prod = &guard[..guard
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("inject_guard 테스트 모듈 경계")];
+        for token in ["action_policy(", "ActionPolicy"] {
+            assert_eq!(
+                guard_prod.matches(token).count(),
+                0,
+                "`{token}` 가 확인 경계(inject_guard)에 배선됐다 — 버전 핀이 집행된다면 보고서의 \
+                 policy_enforcement.enforced 가 거짓말이 된다"
+            );
+        }
+        // ★그리고 **시퀀스 축은 배선돼 있다**(같은 리뷰의 codex major). 두 축을 한 상수로 접지
+        //   않기 위해 여기서 그 차이를 못박는다 — `down_presses` 는 확인 경계가 소비하고,
+        //   `action_policy`(버전)는 어디에서도 소비하지 않는다.
+        //   ★doc 문면이 아니라 **코드 한 줄**을 본다(주석에 같은 토큰이 있어 `contains("down_presses()")`
+        //     만으로는 소비가 사라져도 초록이었다 — 변이검증 M9 에서 실제로 그랬다).
+        assert!(
+            guard_prod.contains("match g.down_presses() {"),
+            "확인 경계가 선언 시퀀스를 더는 소비하지 않는다 — `default_index: null` 이 다시 '보류라고 \
+             인쇄만 하고 Return 은 나가는' 상태로 돌아갔다(리뷰 R2 codex major 회귀). 판정 자체의 \
+             집행은 `inject_guard::tests::confirm_needs_the_declared_sequence_to_be_a_bare_return`"
+        );
         assert!(
             !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED,
             "배선 0인데 상수가 '집행 중' 이라고 말한다(반대 방향의 거짓말)"
         );
         // 그리고 그 사실이 **산출물에 실린다**(사람이 코드를 읽지 않아도 된다).
         let r = cys::first_run_gates::resolve_with(None, true);
-        let report = cys::first_run_gates::report_json(&r, "claude", Some("2.1.263"));
+        let report = cys::first_run_gates::report_json(&r, "claude", Some("2.1.263"), Some("2026-09-08T00:00:00+0900"));
         assert_eq!(report["policy_enforcement"]["enforced"].as_bool(), Some(false));
         assert_eq!(
             report["policy_enforcement"]["scope"].as_str(),
