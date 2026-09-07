@@ -71,10 +71,12 @@ import argparse
 import copy
 import datetime
 import hashlib
+import inspect
 import contextlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -132,6 +134,50 @@ REQUIRED_ELIGIBILITY_KEYS = ("guard_stop", "brief_warn")
 ELIGIBILITY_DEFAULT = {"capgate": "allow"}
 TARGETS_REL = os.path.join("state", "hook-targets.json")
 TARGETS_EXAMPLE_SUFFIX = ".example"   # ★E4-1: 배포 실물 = <표>.example (폴백 표)
+
+
+# ★WP-3 A(0.14.31 R1) 능력 게이트 등록 자격 — **preflight 와 같은 두 조건**(CONTRACTS §C).
+#   이 경로에 판정이 없으면 조건부 등록이 우회된다: 구 데몬·구 지침에서도 guard-register 로
+#   훅을 올릴 수 있었다(부분 배포 = CSO 가 경보 없이 능력만 잃는 상태 = 봉인표 ③).
+#   판정의 **정본은 preflight** 이고 여기서는 같은 두 사실을 다시 재서 **막는다**(중복이 아니라
+#   같은 계약의 두 집행 지점 — 우회 가능한 등록기가 하나라도 있으면 조건은 조건이 아니다).
+CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
+CSO_DIRECTIVE_MARKER_MAX_LINE = 20
+
+
+def _capgate_eligibility(pack, timeout=6):
+    """(ok, why) — ①데몬 `alert_route.enabled is True` ②설치본 지침 신판 표지(첫 20행 행 등가).
+
+    판정 불능(cys 부재·호출 실패·지침 판독 실패)은 **미자격**이다 — 결측은 값이 아니고,
+    여기서 관대하면 구 데몬에 게이트를 등록하게 된다.
+    """
+    missing = []
+    cys = os.environ.get("CYS_BIN") or shutil.which("cys")
+    ok_alert = False
+    if not cys:
+        missing.append("cys 바이너리 미발견 — alert_route 판정 불가(판정 불능은 미자격이다)")
+    else:
+        try:
+            r = subprocess.run([cys, "status", "--json"], capture_output=True, text=True,
+                               timeout=timeout)
+            doc = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+            ar = doc.get("alert_route") if isinstance(doc, dict) else None
+            ok_alert = isinstance(ar, dict) and ar.get("enabled") is True
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            missing.append("cys status --json 조회 실패(%s)" % e)
+        if not ok_alert and not missing:
+            missing.append("데몬 alert_route 미지원(status --json 에 alert_route.enabled=true 없음)")
+    d = os.path.join(pack, "directives", "CSO_DIRECTIVE.md")
+    try:
+        with open(d, encoding="utf-8", errors="replace") as f:
+            head = [next(f, "") for _ in range(CSO_DIRECTIVE_MARKER_MAX_LINE)]
+        if not any(ln.strip() == CSO_DIRECTIVE_REV_MARKER for ln in head):
+            missing.append("설치본 CSO_DIRECTIVE 에 신판 표지 없음(%s)" % d)
+    except OSError as e:
+        missing.append("설치본 CSO_DIRECTIVE 판독 불가(%s: %s)" % (d, e))
+    if missing:
+        return False, " · ".join(missing)
+    return True, "alert_route.enabled=true · CSO_DIRECTIVE 신판 표지 확인"
 
 
 def _targets_path(pack, override=None):
@@ -470,7 +516,7 @@ def _sha(data):
 # ── 처리 ────────────────────────────────────────────────────────────────────
 def process(profiles, hook_key, apply_, force_master, pack, out=None,
             repair_timeout=False, force_unknown=False, targets_path=None, table=None,
-            table_source=None):
+            table_source=None, force_ineligible=False, eligibility=None):
     # out 기본값을 def 시점에 sys.stdout 으로 **묶지 않는다** — 묶으면 호출자의
     # redirect_stdout 이 무효가 되고(자기검증 하네스가 출력을 회수하지 못한다) 그 무능이
     # "검증했다"로 오독된다(계측 타당성).
@@ -521,6 +567,25 @@ def process(profiles, hook_key, apply_, force_master, pack, out=None,
                   "살아 있다). 운영 표를 확정하려면: cp %s%s %s (설치 후 measured_at 갱신)"
                   % (_targets_path(pack, targets_path), _targets_path(pack, targets_path),
                      TARGETS_EXAMPLE_SUFFIX, _targets_path(pack, targets_path)), file=out)
+    if hook_key == "capgate":
+        # `eligibility` 는 **검체 주입 이음매**다(기본은 실제 판정기) — 스텁 바이너리를 만들지
+        # 않고도 자격 참/거짓 두 갈래를 결정론으로 잴 수 있게 한다(Windows 이식성).
+        _elig_ok, _elig_why = (eligibility or _capgate_eligibility)(pack)
+        if _elig_ok:
+            print("등록 조건(CONTRACTS §C): 충족 — %s" % _elig_why, file=out)
+        elif force_ineligible:
+            print("경고: 능력 게이트 등록 조건 미충족인데 --force-ineligible 로 진행한다 — %s"
+                  % _elig_why, file=out)
+            print("        ※ 부분 배포(A만 등록)는 CSO 가 경보를 못 받는 채로 능력만 잃는 "
+                  "상태다(봉인표 ③). 조건을 복구한 뒤 등록하는 것이 정상 경로다.", file=out)
+        else:
+            print("등록 조건(CONTRACTS §C) 미충족 — %s" % _elig_why, file=out)
+            print("→ 등록 중단(쓰기 0). 조건은 ①데몬 alert_route 지원 ②설치본 CSO_DIRECTIVE "
+                  "신판 표지 둘 다이며, 하나라도 아니면 게이트는 **미등록**이 정본이다"
+                  "(그 상태에서도 CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다). "
+                  "판정의 정본은 preflight C28 이고, 의도적으로 밀어붙이려면 "
+                  "--force-ineligible 을 명시하라.", file=out)
+            return EXIT_TARGET, [], command, spec
     print("모드: %s" % ("APPLY(쓰기)" if apply_ else "DRY-RUN(기본 — 쓰기 0)"), file=out)
     if not os.path.isfile(hook_path):
         print("경고: 훅 실물 부재 — %s (등록해도 래퍼가 없으면 무발동)" % hook_path, file=out)
@@ -1067,7 +1132,8 @@ def self_test():
         # ── ⑲ WP-3 A capgate(0.14.31): 전 프로필 등록 · 구 표 하위호환 · matcher 없음 ──
         mktable(tbl_doc)          # capgate 키가 **없는** 종전 표(운영자 설치본 형상)
         buf = io.StringIO()
-        rc, rows, cmd, spec = process([live3, wdir], "capgate", False, False, pack, out=buf)
+        rc, rows, cmd, spec = process([live3, wdir], "capgate", False, False, pack, out=buf,
+                                      force_ineligible=True)
         chk(rc == EXIT_OK and all(r["action"] != "REFUSED" for r in rows),
             "⑲ capgate 키 없는 구 표가 손상/거부로 판정됨: rc=%s rows=%s"
             % (rc, [r["action"] for r in rows]))
@@ -1085,9 +1151,59 @@ def self_test():
                 e["eligibility"]["capgate"] = "deny"
         mktable(denydoc)
         buf = io.StringIO()
-        rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf)
+        rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                   force_ineligible=True)
         chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
             "⑲ 표의 명시 capgate=deny 가 무시됨: rc=%s %s" % (rc, rows))
+        # ── ⑳ R1: 등록 자격(§C 두 조건)은 **이 경로에서도** 검사한다 ──
+        #   판정의 정본은 preflight 지만, 우회 가능한 등록기가 하나라도 있으면 조건은 조건이 아니다.
+        #   ★결정론: `CYS_BIN` 을 없는 경로로 고정해 **라이브 데몬 상태와 무관**하게 만든다.
+        mktable(tbl_doc)
+        _saved_bin = os.environ.get("CYS_BIN")
+        os.environ["CYS_BIN"] = os.path.join(pack, "no-such-cys")
+        try:
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", True, False, pack, out=buf)
+            chk(rc == EXIT_TARGET and rows == [] and "등록 조건" in buf.getvalue()
+                and "등록 중단(쓰기 0)" in buf.getvalue(),
+                "⑳ 자격 미충족(구 데몬·구 지침)인데 등록이 진행됨: rc=%s rows=%s" % (rc, rows))
+            _e_ok, _e_why = _capgate_eligibility(pack)
+            chk(_e_ok is False and "CSO_DIRECTIVE" in _e_why and "cys" in _e_why,
+                "⑳ 두 조건의 결손이 모두 사유에 적히지 않음: %r" % _e_why)
+            _dd = os.path.join(pack, "directives")
+            os.makedirs(_dd, exist_ok=True)
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n%s\n본문\n" % CSO_DIRECTIVE_REV_MARKER)
+            _e_ok2, _e_why2 = _capgate_eligibility(pack)
+            chk(_e_ok2 is False and "CSO_DIRECTIVE" not in _e_why2,
+                "⑳ 조건 하나(지침)만 참인데 자격이 났다/사유가 낡았다: %r %r" % (_e_ok2, _e_why2))
+            # 표지를 인용한 산문은 표지가 아니다(첫 20행 **행 등가** — preflight 와 같은 규칙).
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n표지 %s 를 확인하라\n" % CSO_DIRECTIVE_REV_MARKER)
+            _e_ok3, _e_why3 = _capgate_eligibility(pack)
+            chk(_e_ok3 is False and "신판 표지 없음" in _e_why3,
+                "⑳ 표지를 **인용한 산문**이 신판으로 오독됨: %r" % _e_why3)
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n%s\n본문\n" % CSO_DIRECTIVE_REV_MARKER)
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                       force_ineligible=True)
+            chk(rc == EXIT_OK and "--force-ineligible" in buf.getvalue(),
+                "⑳ --force-ineligible 경고가 없거나 진행되지 않음: rc=%s" % rc)
+            # 자격이 **참**이면 우회 플래그 없이 진행한다(게이트가 영구 차단이 아니어야 한다).
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                       eligibility=lambda _p: (True, "검체 주입: 조건 충족"))
+            chk(rc == EXIT_OK and rows and all(r["action"] != "REFUSED" for r in rows)
+                and "등록 조건(CONTRACTS §C): 충족" in buf.getvalue(),
+                "⑳ 자격 충족인데 등록이 막힘: rc=%s rows=%s" % (rc, [r["action"] for r in rows]))
+            chk("_capgate_eligibility)(pack)" in inspect.getsource(process),
+                "⑳ 기본 판정기가 배선에서 빠졌다(이음매만 남으면 실경로가 무검사다)")
+        finally:
+            if _saved_bin is None:
+                os.environ.pop("CYS_BIN", None)
+            else:
+                os.environ["CYS_BIN"] = _saved_bin
         # 잘못된 값은 손상이다(선택 키라도 형식은 검사한다).
         baddoc = json.loads(json.dumps(tbl_doc))
         baddoc["profiles"][0]["eligibility"]["capgate"] = "maybe"
@@ -1114,6 +1230,7 @@ def self_test():
           " · E4-1(R-04 배포 기본값) 예시표 폴백: `.example` 만 있는 install 직후 상태에서 "
           ".claude-3+stop REFUSED(기계 방어 생존)·폴백 출처+cp 설치 안내 고지·워커 프로필 "
           "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선"
+          " · ⑳ capgate 등록 자격(§C 두 조건)을 이 경로에서도 집행(--force-ineligible 만 우회)"
           " · ⑲ capgate(0.14.31): 구 표 하위호환(키 부재=allow)·전 프로필(master 포함)·"
           "PreToolUse matcher 없음·timeout 15·명시 deny 존중·값 오류는 손상")
     return 0
@@ -1132,6 +1249,9 @@ def main(argv=None):
                     help="역할 경계 우회(대상표 deny 프로필에 등록) — 의도 명시용")
     ap.add_argument("--force-unknown", action="store_true",
                     help="대상표에 없는 미지 프로필 등록 우회(E3-1 · deny-by-default 해제)")
+    ap.add_argument("--force-ineligible", action="store_true",
+                    help="capgate 등록 조건(데몬 alert_route · 지침 신판 표지) 미충족에도 진행 — "
+                         "의도 명시용(부분 배포는 봉인표 ③ 방향이다)")
     ap.add_argument("--hook-targets", metavar="PATH", default=None,
                     help="대상표 경로 override(기본 <pack>/state/hook-targets.json)")
     ap.add_argument("--from-table", action="store_true",
@@ -1181,7 +1301,8 @@ def main(argv=None):
                                      repair_timeout=a.repair_timeout,
                                      force_unknown=a.force_unknown,
                                      targets_path=a.hook_targets, table=table,
-                                     table_source=tsource)
+                                     table_source=tsource,
+                                     force_ineligible=a.force_ineligible)
     if a.emit_expected:
         emit_expected(profiles, a.hook, pack, a.emit_expected, a.apply, table=table)
     if a.emit_warn_targets:

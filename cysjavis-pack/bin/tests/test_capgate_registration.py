@@ -344,5 +344,111 @@ class CapgateUndecidable(_CapgateEnv):
         self.assertIn("self-test OK:", result.stdout, "강등 종료가 아니라 내장 검체 완주가 필요하다")
 
 
+class CapgateDeregistration(_CapgateEnv):
+    """★R1: 조건이 **거짓이 되면** 등록을 되돌린다 — 목록에서 빼는 것과 지우는 것은 다르다.
+
+    종전 결함(두 리뷰어 동시 지적): 조건이 거짓이면 `_reg_hooks` 에서 빼기만 해서, 이미
+    settings.json 에 실린 훅은 계속 발화하는데 C28 은 '등록 보류' 라고 보고했다 —
+    판정문이 사실과 반대였다(§8 검증 결과 재작성 금지 · 부분 배포 = 봉인표 ③).
+    """
+
+    def _profile_with_capgate(self, extra_user_hook=True):
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        cmd = pf._cys_hook_cmd(pf.CAPGATE_HOOK[0])
+        blocks = [{"hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]
+        if extra_user_hook:
+            blocks.append({"hooks": [{"type": "command", "command": "echo user-own-hook"}]})
+        sp.write_text(json.dumps({"hooks": {"PreToolUse": blocks,
+                                            "Stop": [{"hooks": [{"type": "command",
+                                                                 "command": "echo keep-me"}]}]}},
+                                 indent=2), encoding="utf-8")
+        return sp
+
+    def test_unregister_removes_only_our_hook(self):
+        sp = self._profile_with_capgate()
+        p = pf.Preflight(fix=True, skips=[])
+        self.assertTrue(p._event_hook_registered(str(sp), "PreToolUse", pf.CAPGATE_HOOK[0]),
+                        "선행 조건: 능력 게이트가 등록돼 있어야 한다")
+        err = p._unregister_event_hook(str(sp), "PreToolUse", pf.CAPGATE_HOOK[0])
+        self.assertIsNone(err, "해제 실패: %s" % err)
+        self.assertFalse(p._event_hook_registered(str(sp), "PreToolUse", pf.CAPGATE_HOOK[0]),
+                         "해제 후에도 등록으로 판정된다(훅이 계속 발화한다)")
+        data = json.loads(sp.read_text(encoding="utf-8"))
+        cmds = [h["command"] for b in data["hooks"]["PreToolUse"] for h in b["hooks"]]
+        self.assertEqual(cmds, ["echo user-own-hook"], "사용자 자신의 훅까지 지웠다: %s" % cmds)
+        self.assertEqual(len(data["hooks"]["Stop"]), 1, "다른 이벤트를 건드렸다")
+
+    def test_unregister_drops_empty_block(self):
+        sp = self._profile_with_capgate(extra_user_hook=False)
+        p = pf.Preflight(fix=True, skips=[])
+        self.assertIsNone(p._unregister_event_hook(str(sp), "PreToolUse", pf.CAPGATE_HOOK[0]))
+        data = json.loads(sp.read_text(encoding="utf-8"))
+        self.assertEqual(data["hooks"]["PreToolUse"], [],
+                         "빈 훅 블록이 남았다(하네스가 읽는 잡음): %s" % data["hooks"]["PreToolUse"])
+
+    def test_unregister_is_noop_when_absent(self):
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        sp.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"hooks": [{"type": "command", "command": "echo other"}]}]}}), encoding="utf-8")
+        p = pf.Preflight(fix=True, skips=[])
+        self.assertIsNone(p._unregister_event_hook(str(sp), "PreToolUse", pf.CAPGATE_HOOK[0]))
+        data = json.loads(sp.read_text(encoding="utf-8"))
+        self.assertEqual([h["command"] for b in data["hooks"]["PreToolUse"] for h in b["hooks"]],
+                         ["echo other"], "없는 훅을 지우려다 남의 것을 건드렸다")
+
+    def test_c28_reports_live_registration_when_conditions_false(self):
+        # 조건 거짓 + **이미 등록됨** 은 '보류' 가 아니다 — 문면이 사실과 같아야 한다.
+        import inspect
+        src = inspect.getsource(pf.Preflight.c28_self_correction)
+        self.assertIn("_unregister_event_hook", src, "해제 경로가 C28 에 배선되지 않았다")
+        self.assertIn("이미 등록되어 있다", src, "조건 거짓+등록 잔존을 사실대로 보고하지 않는다")
+        self.assertIn("if _cap_live and self.fix:", src, "--fix 해제 분기가 없다")
+
+
+class CapgateRegistrarEligibility(_CapgateEnv):
+    """★R1: 두 번째 등록 경로(javis_guard_register)도 **같은** 자격 판정을 통과해야 한다."""
+
+    def _run(self, **kw):
+        import io as _io
+        buf = _io.StringIO()
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        (prof / "settings.json").write_text("{}", encoding="utf-8")
+        rc, rows, _cmd, _spec = gr.process([str(prof)], "capgate", True, False,
+                                           str(self.pack), out=buf, **kw)
+        return rc, rows, buf.getvalue(), (prof / "settings.json").read_text(encoding="utf-8")
+
+    def test_ineligible_registration_is_refused_with_zero_writes(self):
+        # `cys` 부재(구 데몬) — 자격 판정 불능은 미자격이고, 그때 쓰기는 0이어야 한다.
+        rc, rows, out, settings = self._run()
+        self.assertEqual(rc, gr.EXIT_TARGET, "자격 미충족인데 rc=%s: %s" % (rc, out))
+        self.assertEqual(rows, [], "자격 미충족인데 프로필 행이 생겼다")
+        self.assertIn("등록 중단(쓰기 0)", out)
+        self.assertEqual(json.loads(settings), {}, "쓰기 0 계약 위반: %s" % settings)
+
+    def test_force_flag_is_the_only_bypass(self):
+        rc, _rows, out, _s = self._run(force_ineligible=True)
+        self.assertNotIn("등록 중단(쓰기 0)", out, "--force-ineligible 이 막혔다")
+        self.assertIn("--force-ineligible", out, "우회 사실을 문면에 남겨야 한다")
+
+    def test_eligible_registration_proceeds(self):
+        rc, rows, out, _s = self._run(eligibility=lambda _p: (True, "검체: 조건 충족"))
+        self.assertIn("등록 조건(CONTRACTS §C): 충족", out)
+        self.assertNotIn("등록 중단(쓰기 0)", out)
+        self.assertTrue(rows, "자격 충족인데 등록 행이 없다: %s" % out)
+
+    def test_eligibility_requires_both_conditions(self):
+        # 지침 표지만 참이면 자격이 아니다(데몬 조건이 사라지는 회귀).
+        ok, why = gr._capgate_eligibility(str(self.pack))
+        self.assertIs(ok, False, "cys 부재인데 자격이 났다: %s" % why)
+        self.assertIn("cys", why)
+        self.assertEqual(gr.CSO_DIRECTIVE_REV_MARKER, pf.CSO_DIRECTIVE_REV_MARKER,
+                         "두 등록 경로의 표지 문자열이 갈라졌다(§C 계약은 하나다)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

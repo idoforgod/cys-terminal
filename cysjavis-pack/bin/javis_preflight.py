@@ -3797,6 +3797,40 @@ class Preflight:
 
         return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
 
+    def _unregister_event_hook(self, settings_path, event, script_name):
+        """event 에서 **우리 팩의** script_name 훅을 제거한다. 성공=None(제거 0건도 성공) / 실패=사유.
+
+        ★왜 필요한가(R1 major · 두 리뷰어): 조건부 등록은 조건이 거짓이 되면 **되돌려야** 한다.
+          종전엔 등록 목록에서 빼기만 해서, 이미 settings.json 에 실린 훅은 계속 발화하는데
+          preflight 는 '등록 보류' 라고 보고했다 — 판정문이 사실과 반대였다(§8: 검증 결과를
+          재작성하지 않는다). 조건 철회(바이너리 롤백·지침 되돌림)가 바로 봉인표 ③의 상태다.
+        """
+        prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
+
+        def _mutate(data):
+            arr = data.get("hooks", {}).get(event)
+            if not isinstance(arr, list):
+                return None
+            out = []
+            for entry in arr:
+                if not isinstance(entry, dict):
+                    out.append(entry)
+                    continue
+                hooks = [h for h in entry.get("hooks", [])
+                         if not (isinstance(h, dict)
+                                 and _hook_entry_is_ours(h.get("command", ""),
+                                                         script_name, prefix))]
+                if len(hooks) == len(entry.get("hooks", [])):
+                    out.append(entry)
+                elif hooks:
+                    e2 = dict(entry)
+                    e2["hooks"] = hooks
+                    out.append(e2)
+                # hooks 가 비면 블록 자체를 버린다(빈 블록은 하네스가 읽는 잡음이다)
+            data["hooks"][event] = out
+
+        return _settings_rmw(settings_path, _mutate)
+
     def c27_appbuild(self):
         cid = "C27.appbuild"
         if self.skipped(cid):
@@ -3889,8 +3923,10 @@ class Preflight:
         status = None
         if cys:
             try:
+                # ★부트 창 예산(R1 minor): 이 축은 WARN-only 이고 데몬이 기동 중이면 상한까지
+                #   끌려간다 — 판정 품질을 떨어뜨리지 않는 선에서 짧게 잡는다(15s→6s).
                 r = subprocess.run([cys, "status", "--json"], capture_output=True,
-                                   text=True, timeout=15)
+                                   text=True, timeout=6)
                 if r.returncode == 0:
                     status = json.loads(r.stdout or "{}")
             except (OSError, ValueError, subprocess.SubprocessError):
@@ -3978,10 +4014,37 @@ class Preflight:
         # ★WP-3 A 등록 게이트(CONTRACTS §C) — 두 조건이 **둘 다** 참일 때만 PreToolUse 에 올린다.
         _cap_ok, _cap_why = self._capgate_gate()
         _reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])
+        _cap_live = []          # 조건이 거짓인데 **이미 실려 있는** 프로필
         if not _cap_ok:
-            warns.append("능력 게이트(%s) 등록 보류 — %s. 미등록 상태에서도 "
-                         "CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다(침묵은 판정이 아니다)"
-                         % (CAPGATE_HOOK[0], _cap_why))
+            for t in targets:
+                for _ev, _m in CAPGATE_HOOK[1]:
+                    if self._event_hook_registered(t, _ev, CAPGATE_HOOK[0]):
+                        _cap_live.append((t, _ev))
+            if _cap_live and self.fix:
+                _un_ok, _un_err = [], []
+                for t, _ev in _cap_live:
+                    err = self._unregister_event_hook(t, _ev, CAPGATE_HOOK[0])
+                    (_un_err if err else _un_ok).append(
+                        "%s/%s%s" % (os.path.basename(t), _ev, (": " + err) if err else ""))
+                if _un_ok:
+                    fixed.append("능력 게이트 등록 해제(%s)" % "; ".join(_un_ok[:4]))
+                if _un_err:
+                    warns.append("능력 게이트 등록 해제 실패 — %s" % "; ".join(_un_err[:4]))
+                _cap_live = [x for x in _cap_live
+                             if self._event_hook_registered(x[0], x[1], CAPGATE_HOOK[0])]
+            if _cap_live:
+                # ★사실대로 보고한다: 조건은 거짓인데 훅은 **살아 있다**. 이것을 '보류' 라고
+                #   쓰면 판정문이 사실과 반대가 된다(부분 배포 = 봉인표 ③).
+                warns.append("능력 게이트(%s)가 조건 거짓인데 **이미 등록되어 있다**(%s) — %s. "
+                             "훅은 계속 실행된다: `--fix` 로 해제하거나 조건(데몬 alert_route·"
+                             "지침 신판 표지)을 복구하라"
+                             % (CAPGATE_HOOK[0],
+                                ", ".join("%s/%s" % (os.path.basename(t), e)
+                                          for t, e in _cap_live[:4]), _cap_why))
+            else:
+                warns.append("능력 게이트(%s) 등록 보류 — %s. 미등록 상태에서도 "
+                             "CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다(침묵은 판정이 아니다)"
+                             % (CAPGATE_HOOK[0], _cap_why))
         for t in targets:
             for script_name, events in _reg_hooks:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
@@ -4023,7 +4086,8 @@ class Preflight:
                                                    "(--fix로 등록)" if tier_fatal else "(--fix)"))
         detail = ("자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) "
                   "6종 + reflect 엔진 · 능력 게이트 %s"
-                  % ("등록(조건 충족)" if _cap_ok else "보류"))
+                  % ("등록(조건 충족)" if _cap_ok
+                     else ("조건 거짓인데 **등록 잔존**" if _cap_live else "보류")))
         if fixed:
             shown = "; ".join(fixed[:6]) + (" …+%d" % (len(fixed) - 6) if len(fixed) > 6 else "")
             detail += " · " + shown
@@ -4743,22 +4807,36 @@ class Preflight:
             self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가")
             return
         try:
+            # WARN-only 축이라 부트 창에서 오래 붙잡지 않는다(15s→6s · R1 minor).
             r = subprocess.run([cys, "gate-corpus", "--json"], capture_output=True,
-                               text=True, timeout=15)
+                               text=True, timeout=6)
         except (OSError, subprocess.SubprocessError) as e:
             self.add(cid, SKIP, "cys gate-corpus 호출 불가(%s)" % e)
             return
         blob = (r.stdout or "") + (r.stderr or "")
+        _now0 = time.strftime("%Y-%m-%d %H:%M:%S%z")
         if r.returncode != 0:
-            # clap 은 미지 서브커맨드에 rc≠0 + usage 를 낸다 — 구 바이너리의 서명이다.
-            self.add(cid, SKIP,
-                     "`cys gate-corpus` 동사 부재(구 바이너리 · rc=%d) — 코퍼스 드리프트를 "
-                     "잴 수 없다(SKIP 은 '드리프트 없음'이 아니다)" % r.returncode)
+            # ★'동사 부재'와 '실행 실패'는 다른 사실이다(R1 minor · codex): clap 의 미지
+            #   서브커맨드 서명(usage/unrecognized/unknown)이 **보일 때만** 구 바이너리로
+            #   분류하고, 나머지(권한 거부·패닉·rc=1)는 원인과 측정 시각을 실은 WARN 이다.
+            _sig = re.search(r"(?i)(unrecognized subcommand|unknown command|invalid subcommand"
+                             r"|usage:|USAGE:|error: unrecognized)", blob)
+            if _sig:
+                self.add(cid, SKIP,
+                         "`cys gate-corpus` 동사 부재(구 바이너리 · rc=%d · 서명 %r · 측정 %s) — "
+                         "코퍼스 드리프트를 잴 수 없다(SKIP 은 '드리프트 없음'이 아니다)"
+                         % (r.returncode, _sig.group(0)[:40], _now0))
+            else:
+                self.add(cid, WARN,
+                         "`cys gate-corpus` 비정상 종료(rc=%d · 측정 %s) — 동사 부재의 서명이 "
+                         "없다(구 바이너리로 분류하지 않는다). 출력: %s"
+                         % (r.returncode, _now0, (blob.strip()[:160] or "(없음)")))
             return
         try:
             doc = json.loads(r.stdout or "{}")
         except ValueError:
-            self.add(cid, WARN, "cys gate-corpus --json 응답이 JSON 이 아니다: %s" % blob[:160])
+            self.add(cid, WARN, "cys gate-corpus --json 응답이 JSON 이 아니다(측정 %s): %s"
+                     % (_now0, blob[:160]))
             return
         measured = doc.get("measured_on") if isinstance(doc, dict) else None
         gates = doc.get("gates") if isinstance(doc, dict) else None
@@ -4770,7 +4848,7 @@ class Preflight:
         claude = shutil.which("claude")
         if claude:
             try:
-                v = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=20)
+                v = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=8)
                 if v.returncode == 0:
                     m = re.search(r"\d+\.\d+\.\d+", v.stdout or "")
                     live = m.group(0) if m else (v.stdout or "").strip()
@@ -8721,8 +8799,19 @@ def _self_test():
               and "_reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])" in c28_src
               and "for script_name, events in _reg_hooks:" in c28_src
               and "for script_name, events in SELFCORR_HOOKS:" not in c28_src)
-        check("조건 미충족은 **WARN 1줄**이지 침묵이 아니다(WARN 부재를 '등록됨' 으로 읽지 못하게)",
-              "등록 보류" in c28_src and "warns.append" in c28_src.split("_cap_ok, _cap_why")[1][:400])
+        # ★R1 재핀(강화): 종전 핀은 "조건 거짓 → WARN 1줄" 까지만 요구했다. 그 계약으로는
+        #   **이미 등록된 훅이 살아 있는데 '보류' 라고 보고하는** 상태가 통과한다(판정문이 사실과
+        #   반대 · 부분 배포 = 봉인표 ③). 해제 경로와 사실 보고를 함께 요구하도록 좁힌다.
+        _cap_tail = c28_src.split("_cap_ok, _cap_why")[1][:2600]
+        check("조건 미충족: WARN 1줄 + **이미 실린 등록은 --fix 로 해제** · 살아 있으면 '보류'라 "
+              "쓰지 않는다(R1 재핀 — 판정문이 사실과 반대이던 것)",
+              "등록 보류" in c28_src and "warns.append" in _cap_tail
+              and "_unregister_event_hook" in _cap_tail
+              and "이미 등록되어 있다" in _cap_tail
+              and "if _cap_live and self.fix:" in _cap_tail)
+        _un_src = _pin_src(Preflight._unregister_event_hook)
+        check("등록 해제기는 **우리 팩의 그 훅만** 지우고 빈 블록을 남기지 않는다(사용자 훅 보존)",
+              "_hook_entry_is_ours(" in _un_src and "_settings_rmw(" in _un_src)
         gate_src = _pin_src(Preflight._capgate_gate)
         check("_capgate_gate 는 읽기 전용(status --json 조회 + 지침 판독) · self.fix 분기 0",
               "self.fix" not in gate_src and '"status", "--json"' in gate_src

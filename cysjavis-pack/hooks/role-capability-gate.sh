@@ -2054,16 +2054,27 @@ def self_test_r1(fails):
          c=ctx(approver=appr))
 
     # ⑥ 숫자 리다이렉트 대상 = 파일(양 리뷰어 blocking)
-    want(True, "Bash", {"command": "cat /w/big > 123"}, "`> 123` 은 cwd 파일 생성")
-    want(True, "Bash", {"command": "cys status > 1"}, "`> 1` 은 fd 복제가 아니다")
-    want(False, "Bash", {"command": "cys status 2>&1"}, "`2>&1` 은 fd 복제")
-    want(False, "Bash", {"command": "cys status >& /dev/null"}, "`>&` + /dev/null")
-    b, _r = decide("Bash", {"command": "echo pwn > 1"}, "reviewer-codex")
-    if not b:
-        fails.append("R1[reviewer `> 1`]: 숫자 파일명을 fd 로 접었다")
-    b, _r = decide("Bash", {"command": "grep x /w/f > /tmp/o 2>&1"}, "reviewer-codex")
-    if b:
-        fails.append("R1[reviewer 2>&1]: 정당한 fd 복제를 막았다")
+    #   ★상대 대상(`> 123`)의 판정은 **cwd** 에 달렸다(정상 동작이다 — 허용 뿌리 안의 cwd 라면
+    #     파일 생성도 허용이다). 검체는 그 우연에 기대면 안 되므로 허용 뿌리 **밖**(파일시스템
+    #     루트)으로 옮겨 재고 원래 cwd 로 되돌린다.
+    _cwd0 = os.getcwd()
+    try:
+        os.chdir(os.path.abspath(os.sep))
+        want(True, "Bash", {"command": "cat /w/big > 123"}, "`> 123` 은 cwd 파일 생성")
+        want(True, "Bash", {"command": "cys status > 1"}, "`> 1` 은 fd 복제가 아니다")
+        want(False, "Bash", {"command": "cys status 2>&1"}, "`2>&1` 은 fd 복제")
+        want(False, "Bash", {"command": "cys status >& /dev/null"}, "`>&` + /dev/null")
+        b, _r = decide("Bash", {"command": "echo pwn > 1"}, "reviewer-codex")
+        if not b:
+            fails.append("R1[reviewer `> 1`]: 숫자 파일명을 fd 로 접었다")
+        b, _r = decide("Bash", {"command": "grep x /w/f > /tmp/o 2>&1"}, "reviewer-codex")
+        if b:
+            fails.append("R1[reviewer 2>&1]: 정당한 fd 복제를 막았다")
+    finally:
+        try:
+            os.chdir(_cwd0)
+        except OSError:
+            pass
 
     # ⑦ 대소문자·링크 별칭(codex blocking)
     want(True, "Write", {"file_path": STATE + "/CAPGATE/abc.calls", "content": "0"},
