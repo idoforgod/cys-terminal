@@ -2742,9 +2742,15 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
   // 역할 승계: 원 역할 그대로 재기동(무음 worker 강등 금지). 데몬 유래 값이지만 명령 조합에
   // 들어가므로 형식 가드([a-z0-9-]) — 벗어나면 worker 폴백. 리뷰어는 전용 CLI 처방(RESTART와 동일).
   const srcRole = me.role && /^[a-z0-9-]{1,32}$/.test(me.role) ? me.role : "worker";
+  // ★(0.14.31 · WP-4) 리뷰어 재기동도 **launch-agent 경유**다. 종전엔 CLI 를 pane 에 직접
+  // 주입해서(`agy …`·`codex …`) 그 좌석이 **역할 미등록·env 미주입**으로 떴다 — 데몬 roles 맵에
+  // 없으니 `--to reviewer-*` 라우팅·deadman 감시·지침 주입이 전부 그 좌석을 비껴갔고, 사람은
+  // 화면에 리뷰어가 떠 있으니 '살아 있다'고 읽었다(감사 에러 2 의 GUI 쪽 얼굴).
+  // `--agent` 값은 **agents.json 어댑터 키**다(`gemini` — 그 어댑터의 cmd 가 `agy …` 다).
+  // `agy` 를 키로 쓰면 `load_agent_spec` 이 못 찾아 기동 자체가 실패한다(cys boot 의 표와 동일).
   const LAUNCH_BY_ROLE: Record<string, string> = {
-    "reviewer-gemini": "agy --dangerously-skip-permissions",
-    "reviewer-codex": "codex --dangerously-bypass-approvals-and-sandbox",
+    "reviewer-gemini": "cys launch-agent --role reviewer-gemini --agent gemini",
+    "reviewer-codex": "cys launch-agent --role reviewer-codex --agent codex",
   };
   const launchCmd = LAUNCH_BY_ROLE[srcRole] ?? `cys launch-agent --role ${srcRole} --agent claude`;
   const ok = await confirmModal(
@@ -5426,11 +5432,13 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   }
 
   // ── (3) 노드 재기동(명령 주입) — role별 처방. 파괴적이므로 confirm. ──
+  // ★(0.14.31 · WP-4) 리뷰어도 cso·worker 와 **같은 처방**(launch-agent 경유)으로 통일한다 —
+  // 직접 CLI 주입은 역할 미등록·env 미주입 좌석을 만든다(위 LAUNCH_BY_ROLE 주석과 같은 근거).
   const RESTART: Record<string, string> = {
     cso: "cys launch-agent --role cso --agent claude",
     worker: "cys launch-agent --role worker --agent claude",
-    "reviewer-gemini": "agy --dangerously-skip-permissions",
-    "reviewer-codex": "codex --dangerously-bypass-approvals-and-sandbox",
+    "reviewer-gemini": "cys launch-agent --role reviewer-gemini --agent gemini",
+    "reviewer-codex": "cys launch-agent --role reviewer-codex --agent codex",
   };
   for (const [role, cmd] of Object.entries(RESTART)) {
     items.push({

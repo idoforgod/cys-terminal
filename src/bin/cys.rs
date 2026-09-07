@@ -705,6 +705,27 @@ enum Command {
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
     SurfaceRole,
+    /// ★(0.14.31 · WP-4) 빈 좌석이 쥔 역할을 이 pane 으로 **자동 재결합**한다(session-start 훅 전용).
+    ///
+    /// 데몬 재시작·손 기동 뒤 역할 주소는 '있는데' 그 자리에 아무도 없는 상태(죽은 에이전트의 빈
+    /// 셸이 역할을 쥠)를 푼다. 데몬이 ①이 pane 이 무역할이고 ②같은 계정 dir·같은 cwd 의 빈 좌석이
+    /// **정확히 하나**이고 ③phoenix 부활이 돌고 있지 않을 때만 결합한다.
+    ///
+    /// 출력 계약(계약 C): stdout **첫 줄** `role=<name>` 또는 `role=`(없음) · **항상 exit 0**.
+    /// 사유·안내는 stderr. 구 데몬(RPC 미지원)도 `role=` + 안내 stderr 로 끝난다.
+    #[command(name = "reclaim-role")]
+    ReclaimRole {
+        /// 자동 판정 모드(현재 유일한 모드). 생략하면 아무 것도 하지 않는다 — 손으로 역할을
+        /// 지정하는 경로는 `cys claim-role` 이고, 이 명령이 그것을 대신하지 않는다.
+        #[arg(long)]
+        auto: bool,
+        /// 이 pane 의 실제 `CLAUDE_CONFIG_DIR`(훅이 전달). 후보 대조 축 — 없으면 무결합.
+        #[arg(long)]
+        config: Option<String>,
+        /// 이 pane 의 실제 `$PWD`(훅이 전달). 후보 대조 축 — 없으면 무결합.
+        #[arg(long)]
+        cwd: Option<String>,
+    },
     /// HMAC signed-prefix 승인 — 위험명령 prefix를 1회 서명하면 이후 자동 통과(guard.sh 연동)
     Approval {
         #[command(subcommand)]
@@ -1159,6 +1180,11 @@ enum ApprovalAction {
         /// 명령 실행 cwd (생략 시 미지정 — 레코드가 cwd 무관이면 매칭)
         #[arg(long)]
         cwd: Option<String>,
+        /// ★(0.14.31 · CONTRACTS B-3) **만료되지 않은 TTL 승인**만 통과시킨다.
+        /// TTL 없는(무기한) 구 레코드는 이 모드에서 실패한다. 데몬이 이 요구를 집행했다는
+        /// 증거(`ttl_enforced`)가 응답에 없으면 — 구 데몬 — **deny**(exit 2)로 접는다.
+        #[arg(long = "require-ttl")]
+        require_ttl: bool,
     },
     /// 위험명령 prefix를 서명·영속 (master role surface에서만 허용 — 위조 서명 차단)
     Sign {
@@ -1168,6 +1194,11 @@ enum ApprovalAction {
         /// 승인 범위를 고정할 cwd (생략 시 cwd 무관 승인)
         #[arg(long)]
         cwd: Option<String>,
+        /// ★(0.14.31 · CONTRACTS B-3) 승인 수명(초). 지정하면 레코드에 `expires_at`(epoch)이
+        /// 서명과 함께 박히고, 그 시각 이후에는 어떤 경로로도 매칭되지 않는다.
+        /// 생략 = 무기한(종전 계약). 1..=2,592,000(30일) 밖은 데몬이 거부한다.
+        #[arg(long)]
+        ttl: Option<u64>,
     },
 }
 
@@ -3608,15 +3639,25 @@ fn run(command: Command) -> i32 {
         Command::Approval { action } => {
             return match action {
                 // exit 0 = 서명됨(통과) / 비0 = 미서명·차단. cysd 미가용 시 fail-closed(비0).
-                ApprovalAction::Check { command, cwd } => {
+                ApprovalAction::Check { command, cwd, require_ttl } => {
                     let cwd = cwd.or_else(|| {
                         std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
                     });
                     match request(
                         "approval.check",
-                        json!({"command": command, "cwd": cwd}),
+                        json!({"command": command, "cwd": cwd, "require_ttl": require_ttl}),
                     ) {
                         Ok(r) => {
+                            // ★(B-3) 스큐 안전: `--require-ttl` 을 줬는데 데몬이 그 요구를
+                            //   집행했다는 증거(`ttl_enforced=true`)를 내지 않으면 구 데몬이다.
+                            //   구 데몬은 `require_ttl` 을 **무시**하고 무기한 승인도 통과시키므로,
+                            //   그 통과를 신뢰하면 TTL 게이트가 조용히 사라진다 → deny(exit 2).
+                            if require_ttl && r["ttl_enforced"].as_bool() != Some(true) {
+                                eprintln!(
+                                    "[approval] --require-ttl 미지원 데몬(응답에 ttl_enforced 없음)                                      — 차단 유지(exit 2). 데몬을 0.14.31 이상으로 갱신하라."
+                                );
+                                return 2;
+                            }
                             if r["approved"].as_bool() == Some(true) {
                                 0 // 서명된 prefix — guard.sh가 우회 통과
                             } else {
@@ -3630,7 +3671,7 @@ fn run(command: Command) -> i32 {
                         }
                     }
                 }
-                ApprovalAction::Sign { prefix, cwd } => {
+                ApprovalAction::Sign { prefix, cwd, ttl } => {
                     let tokens: Vec<String> =
                         prefix.split_whitespace().map(|s| s.to_string()).collect();
                     if tokens.is_empty() {
@@ -3642,10 +3683,26 @@ fn run(command: Command) -> i32 {
                     });
                     match request(
                         "approval.sign",
-                        json!({"command_prefix": tokens, "cwd": cwd}),
+                        json!({"command_prefix": tokens, "cwd": cwd, "ttl_secs": ttl}),
                     ) {
                         Ok(r) => {
-                            println!("signed: {}", r["id"].as_str().unwrap_or("?"));
+                            // ★(B-3) `--ttl` 을 줬는데 응답에 `expires_at` 이 없으면 구 데몬이
+                            //   TTL 을 버리고 **무기한** 승인을 만든 것이다. 성공으로 보고하면
+                            //   운영자는 있지도 않은 만료를 믿는다 — 실패로 접고 그 사실을 말한다.
+                            if ttl.is_some() && r["expires_at"].as_f64().is_none() {
+                                eprintln!(
+                                    "error: --ttl 미지원 데몬 — 만료 없는(무기한) 승인이 생성됐을 수                                      있다. `cys approval check --require-ttl` 은 이 레코드를 통과시키지                                      않는다. 데몬을 0.14.31 이상으로 갱신한 뒤 다시 서명하라."
+                                );
+                                return 1;
+                            }
+                            match r["expires_at"].as_f64() {
+                                Some(exp) => println!(
+                                    "signed: {} (expires_at={})",
+                                    r["id"].as_str().unwrap_or("?"),
+                                    exp as u64
+                                ),
+                                None => println!("signed: {}", r["id"].as_str().unwrap_or("?")),
+                            }
                             0
                         }
                         Err(e) => {
@@ -3806,6 +3863,7 @@ fn run(command: Command) -> i32 {
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
+        Command::ReclaimRole { auto, config, cwd } => return run_reclaim_role(auto, config, cwd),
 
         Command::Hook { event } => return run_hook(event),
         Command::BootIntent => return run_boot_intent(),
@@ -12465,6 +12523,101 @@ fn run_claim_role(
                 );
                 3
             }
+        }
+    }
+}
+
+/// ★(0.14.31 · WP-4 · 계약 C) `cys reclaim-role --auto --config <dir> --cwd <dir>`.
+///
+/// **출력 계약이 이 함수의 전부다**: stdout 첫 줄은 언제나 `role=<name>` 또는 `role=` 이고
+/// **exit 는 언제나 0** 이다. 왜 실패를 exit 로 말하지 않는가 — 이 명령의 유일한 소비자는
+/// `session-start.sh` 의 **한 줄 파싱**이고, 그 훅은 사람의 프롬프트 앞에 서 있다. 여기서 비0 을
+/// 내면 `set -e` 계열 훅·상위 래퍼가 세션 시작 자체를 접을 수 있고, 그것은 "역할을 못 찾았다"가
+/// **"좌석이 안 뜬다"** 로 번역되는 길이다(치명위험 ④). 사유는 stderr 로만 말한다.
+///
+/// 구 데몬(RPC 미지원)·데몬 미응답·타임아웃 — 전부 `role=` + 안내 stderr. 훅은 그 결과를
+/// '역할 없음'으로 읽어 종전 경로(무역할 안내)로 흐른다(fail-open 방향이 곧 무회귀).
+fn run_reclaim_role(auto: bool, config: Option<String>, cwd: Option<String>) -> i32 {
+    if !auto {
+        println!("role=");
+        eprintln!(
+            "[reclaim-role] --auto 가 필요하다(현재 유일한 모드). 손으로 역할을 지정하려면 \
+             `cys claim-role <role>` 을 쓰라 — 이 명령은 그것을 대신하지 않는다."
+        );
+        return 0;
+    }
+    // 훅은 프롬프트 **앞**에 서 있다 — surface-role 과 같은 크기의 데드라인(BUDGET 파생).
+    let timeout = std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+    let socket = cys::socket_path();
+    // 소켓 파일이 아예 없으면 데몬이 내려간 것이다(autostart 허용 경로는 여기선 쓰지 않는다 —
+    // 훅 안에서 데몬을 새로 띄우는 것은 이 명령의 계약이 아니다).
+    if !socket.exists() {
+        println!("role=");
+        eprintln!("[reclaim-role] 데몬 소켓 부재({}) — 무결합.", socket.display());
+        return 0;
+    }
+    let params = json!({
+        "config": config.unwrap_or_default(),
+        "cwd": cwd.unwrap_or_default(),
+    });
+    match request_on_timeout(&socket, "role.reclaim_auto", params, timeout) {
+        Ok(r) => {
+            let role = r["role"].as_str().unwrap_or("");
+            let reason = r["reason"].as_str().unwrap_or("");
+            println!("role={role}");
+            if role.is_empty() {
+                // 사유는 **stderr 한 줄**. 훅이 stdout 첫 줄만 읽으므로 여기 무엇을 써도 파싱은 안전하다.
+                let hint = match reason {
+                    "caller_unresolved" => {
+                        "발신 pane 을 좌석으로 해석하지 못했다(pane 밖 실행·세션 분리)"
+                    }
+                    "caller_env_missing" => {
+                        "--config/--cwd 가 비었다 — 대조 축이 없으면 후보를 고르지 않는다"
+                    }
+                    "restore_lease_held" => {
+                        "phoenix 부활이 진행 중(restore lease 보유) — 다음 세션 시작에 다시 시도한다"
+                    }
+                    "restore_lease_unavailable" => {
+                        "restore lease 를 판정하지 못했다(락 기구·경로 불능) — 모를 때는 결합하지 않는다"
+                    }
+                    "no_candidate" => "조건에 맞는 빈 좌석이 없다",
+                    "ambiguous" => "후보가 둘 이상이다 — 어느 쪽도 자동으로 고르지 않는다",
+                    "role_tombstoned" => "그 역할은 의도적으로 닫힌(묘비) 역할이다",
+                    r if r.starts_with("raced") => {
+                        "판정과 결합 사이에 좌석 상태가 바뀌었다(경합) — 결합하지 않았다"
+                    }
+                    _ => "무결합",
+                };
+                eprintln!("[reclaim-role] role= (reason={reason}: {hint})");
+                if reason == "ambiguous" {
+                    if let Some(c) = r["candidates"].as_array() {
+                        let names: Vec<&str> = c.iter().filter_map(|v| v.as_str()).collect();
+                        eprintln!(
+                            "[reclaim-role] 후보: {} — `cys claim-role <role>` 로 직접 지정하라.",
+                            names.join(", ")
+                        );
+                    }
+                }
+            } else if reason == "bound" {
+                eprintln!(
+                    "[reclaim-role] 역할 재결합: {role} (구 좌석 surface:{} 에서 승계)",
+                    r["prev_surface"].as_u64().unwrap_or(0)
+                );
+            }
+            0
+        }
+        Err(e) => {
+            println!("role=");
+            if e.starts_with("method_not_found") {
+                eprintln!(
+                    "[reclaim-role] 이 데몬은 역할 자동 복구(role.reclaim_auto)를 모른다(구 데몬). \
+                     무결합으로 끝낸다 — 역할이 필요하면 `cys claim-role <role>` 로 직접 등록하거나 \
+                     데몬을 0.14.31 이상으로 갱신하라."
+                );
+            } else {
+                eprintln!("[reclaim-role] 무결합(데몬 왕복 실패: {e}).");
+            }
+            0
         }
     }
 }

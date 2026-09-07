@@ -24,6 +24,7 @@ mod governance;
 mod handlers;
 mod hwmon;
 mod recall;
+mod reclaim;
 mod schedule;
 mod severity;
 mod skillrun;

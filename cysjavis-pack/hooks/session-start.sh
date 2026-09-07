@@ -39,6 +39,54 @@ fi
 BOOT_PY="$JARVIS_DIR/bin/javis_bootstrap.py"
 BOOT_CMD="$(cys_shquote "${CYS_PY:-python3}") $(cys_shquote "$(cys_native_path "$BOOT_PY")")"
 
+# ── ★(0.14.31 · WP-4 · 감사 에러 2) 무역할 좌석의 **역할 자동 복구** ───────────────────────
+# 데몬을 재시작하거나 사람이 손으로 pane 을 띄우면, 죽은 에이전트의 **빈 셸 좌석**이 역할 주소를
+# 그대로 쥔 채 남는다. 역할은 '있는데' 그 자리에 아무도 없고, 새 pane 은 지침 없이 앉는다
+# (치명위험 ③ 바보 좌석 · `--to <role>` 배달은 빈 셸로 사라진다).
+#
+# 그래서 무역할 안내 분기 **앞**에서 데몬에게 두 번 묻는다:
+#   ① `cys surface-role` — **판정 가능성** 프로브다. exit 2 = 데몬 미응답·응답 파손(판정 불가)이고,
+#      그때는 복구를 시도하지 않는다(모르는 상태에서 역할을 옮기지 않는다). 이 명령의 *출력*은
+#      채택하지 않는다 — 그 값은 자기신고 `CYS_SURFACE_ID` 로 고른 항목이라 신원 증거가 아니다.
+#   ② `cys reclaim-role --auto` — **데몬이 발신 pid 로 인증한** 좌석 기준의 판정이다. 이미 역할이
+#      있으면 그 역할을 그대로 돌려주고(멱등), 조건을 만족하는 빈 좌석이 **정확히 하나**일 때만
+#      결합한다. 출력 계약은 stdout 첫 줄 `role=<name>` 또는 `role=` · 항상 exit 0.
+#
+# 실패는 전부 한 방향이다 — **무결합 + 종전 경로**(아래 무역할 안내). 구 데몬·미응답·타임아웃·
+# 후보 모호는 모두 `role=` 이고, 그러면 이 블록은 아무 것도 하지 않은 것과 같다(무회귀).
+# Windows(Git Bash): `ps`·`flock` 없음 · `timeout` 은 System32 함정이 있어 `cys_timeout_run`
+# (GNU 판별 후 python 폴백)만 쓴다. 데드라인은 CLI 내부 RPC 상한(10s)보다 **크게** 잡는다 —
+# 밖에서 먼저 죽이면 "데몬은 결합했는데 훅은 그 사실을 못 들은" 상태가 된다.
+if [ -z "$CYS_ROLE" ] && [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] \
+   && command -v cys >/dev/null 2>&1; then
+  cys_timeout_run 5 cys surface-role </dev/null >/dev/null 2>&1
+  CYS_SR_RC=$?
+  # rc 2 = 판정 불가(데몬 미응답·응답 파손) · rc 124 = 데드라인 초과(hang). 둘 다 "모른다"이므로
+  # 복구를 시도하지 않는다 — 모르는 상태에서 역할을 옮기지 않고, 두 번째 왕복으로 훅을 또
+  # 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
+  if [ "$CYS_SR_RC" -eq 2 ] || [ "$CYS_SR_RC" -eq 124 ]; then
+    echo "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
+  else
+    CYS_RECLAIM_OUT="$(cys_timeout_run 12 cys reclaim-role --auto \
+      --config "${CLAUDE_CONFIG_DIR:-}" --cwd "$PWD" </dev/null 2>/dev/null | head -1 | tr -d '\r')"
+    case "$CYS_RECLAIM_OUT" in
+      role=*) CYS_RECLAIMED="${CYS_RECLAIM_OUT#role=}" ;;
+      *)      CYS_RECLAIMED="" ;;
+    esac
+    # 형식 가드: 데몬 유래 값이지만 이 뒤로 `case` 매칭·파일 경로 조립에 들어가므로 역할명
+    # 문자집합([a-z0-9-] 계열)을 벗어나면 채택하지 않는다(GUI 의 srcRole 가드와 같은 규율).
+    case "$CYS_RECLAIMED" in
+      ''|*[!a-zA-Z0-9_-]*) CYS_RECLAIMED="" ;;
+    esac
+    if [ -n "$CYS_RECLAIMED" ]; then
+      CYS_ROLE="$CYS_RECLAIMED"
+      export CYS_ROLE
+      echo "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
+      echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
+    fi
+  fi
+fi
+
 if [ -z "$CYS_ROLE" ]; then
   # ── ★A안 채택(2026-08-01 ONBOARDING_REFUSAL_FIX §4-1 [A]·§7-2 + A-1~A-6) ───────────────
   # 구 문안은 신규 사용자(빈 홈·프로젝트 CLAUDE.md 0바이트)의 모델에게 **프롬프트 인젝션으로
@@ -176,11 +224,11 @@ esac
 case "$CYS_ROLE" in
   master|cso)
     if command -v cys >/dev/null 2>&1; then
-      if command -v timeout >/dev/null 2>&1; then
-        CLAIM_OUT=$(timeout 2 cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
-      else
-        CLAIM_OUT=$(cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
-      fi
+      # ★(0.14.31 · WP-4) 검증된 실행기로 교체 — 종전 `command -v timeout` 분기는 Windows
+      #   PortableGit 에서 **System32 timeout.exe**(인자를 받으면 즉시 rc=1)를 해소해, 재대조가
+      #   실행조차 되지 않은 채 '데몬 미응답'으로 접혔다(MEMORY cys-01411 #3).
+      #   `cys_timeout_run` 은 GNU 판별 후 gtimeout·python 그룹킬로 폴백한다(macOS 무 timeout 포함).
+      CLAIM_OUT=$(cys_timeout_run 2 cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
       # ★rc 6 = 발신 신원 미확정(2026-08-16 코드 분리): 데몬은 응답했지만 이 프로세스를 발신
       #   pane 에 붙이지 못한 경우다(pane 밖·세션 분리 실행). 아래 self-demote 조건(거부 마커)에는
       #   걸리지 않아 **동작은 이미 안전**하지만, 마지막 fail-open 문안이 "데몬 미응답"이라고

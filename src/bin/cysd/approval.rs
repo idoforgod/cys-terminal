@@ -24,6 +24,15 @@ pub struct ApprovalRecord {
     pub environment: Vec<(String, String)>, // 정렬·민감키 drop 후
     pub created_at: f64,
     pub updated_at: f64,
+    /// ★(0.14.31 · CONTRACTS B-3) TTL 만료 시각(epoch초). `None` = 무기한(구 레코드 포함).
+    ///
+    /// **서명 페이로드에 들어간다** — 그러나 `Some` 일 때만 줄이 덧붙는다(아래 `signing_payload`).
+    /// 그래서 TTL 없는 구 레코드의 페이로드는 **바이트 동일**이고 기존 서명이 그대로 유효하다
+    /// (승인 전수 무효화 = 자율주행 정지 사고를 만들지 않는다). 반대로 만료 시각을 떼거나
+    /// 늘리려는 편집은 페이로드를 바꾸므로 서명 불일치로 hard-reject 된다.
+    /// `skip_serializing_if` 로 None 은 키 자체를 쓰지 않는다 — 구 데몬이 읽어도 형상 무변화.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<f64>,
     pub signature: String, // base64(HMAC-SHA256(payload))
 }
 
@@ -176,7 +185,7 @@ impl ApprovalRecord {
             .map(|(k, v)| format!("{}={}", b64_encode(k.as_bytes()), b64_encode(v.as_bytes())))
             .collect::<Vec<_>>()
             .join(",");
-        let fields = [
+        let mut fields = vec![
             format!("version={}", self.version),
             format!("id={}", self.id),
             format!("commandPrefix={prefix}"),
@@ -191,6 +200,14 @@ impl ApprovalRecord {
             format!("createdAt={}", self.created_at),
             format!("updatedAt={}", self.updated_at),
         ];
+        // ★(0.14.31 · B-3) TTL 은 **조건부 말미 추가**다 — `None` 이면 한 글자도 붙지 않는다.
+        //   이 비대칭이 계약의 전부다: 구 레코드(무TTL)의 페이로드가 종전과 바이트 동일해야
+        //   기존 서명이 살아남고(무효화 0), TTL 이 있는 레코드는 그 값까지 서명에 묶여
+        //   만료 연장·제거가 위조로 판정된다. 순서를 바꾸거나 무조건 추가로 바꾸지 마라 —
+        //   그 순간 설치된 모든 승인이 한 번에 무효가 된다(자율주행 전면 정지).
+        if let Some(exp) = self.expires_at {
+            fields.push(format!("expiresAt={exp}"));
+        }
         fields.join("\n").into_bytes()
     }
 
@@ -202,6 +219,12 @@ impl ApprovalRecord {
     pub fn has_valid_signature(&self, secret: &[u8]) -> bool {
         let expect = b64_encode(&hmac_sha256(secret, &self.signing_payload()));
         constant_time_eq(self.signature.as_bytes(), expect.as_bytes())
+    }
+
+    /// ★(0.14.31 · B-3) 이 레코드가 `now` 기준 만료됐는가. TTL 없는 레코드는 만료되지 않는다
+    /// (무기한 — 종전 계약 보존). 경계는 `expires_at <= now` = 만료(만료 시각 그 순간은 이미 죽었다).
+    pub fn is_expired(&self, now: f64) -> bool {
+        self.expires_at.is_some_and(|e| e <= now)
     }
 
     /// 명령이 이 레코드 prefix에 매칭하는가: prefix가 명령 토큰의 정확한 접두 + cwd 완전일치
@@ -234,6 +257,10 @@ impl ApprovalRecord {
 }
 
 /// 서명 유효 + 매칭 레코드 중 최장 prefix(동률은 updated_at 최신) 선택.
+///
+/// ★(0.14.31 · B-3) 시각·TTL 축은 [`best_match_at`] 이 소유한다. 이 얇은 래퍼는 "지금"과
+/// `require_ttl=false`(TTL 요구 없음)로 위임할 뿐이다 — **만료 레코드는 여기서도 매칭되지
+/// 않는다**(만료는 요구 여부와 무관한 사실이다).
 pub fn best_match<'a>(
     records: &'a [ApprovalRecord],
     secret: &[u8],
@@ -241,11 +268,52 @@ pub fn best_match<'a>(
     cwd: Option<&str>,
     env: &[(String, String)],
 ) -> Option<&'a ApprovalRecord> {
+    best_match_at(records, secret, command, cwd, env, crate::state::now_epoch(), false)
+}
+
+/// [`best_match`] + 시각 주입(순수 테스트용) + `require_ttl`.
+///
+/// · `require_ttl=false`: 무기한 레코드도 통과(종전 계약) · 만료된 TTL 레코드는 **거부**.
+/// · `require_ttl=true` : `expires_at` 이 **있고** 아직 만료되지 않은 레코드만 통과.
+///   TTL 없는 구 레코드는 거부된다(계약 B-3 — '무기한 승인으로 TTL 게이트를 통과' 차단).
+pub fn best_match_at<'a>(
+    records: &'a [ApprovalRecord],
+    secret: &[u8],
+    command: &str,
+    cwd: Option<&str>,
+    env: &[(String, String)],
+    now: f64,
+    require_ttl: bool,
+) -> Option<&'a ApprovalRecord> {
+    best_match_index_at(records, secret, command, cwd, env, now, require_ttl).map(|i| &records[i])
+}
+
+/// [`best_match_at`] 과 **같은 선택**의 인덱스 판(호출부가 그 레코드를 갱신해야 할 때).
+///
+/// ★왜 id 가 아니라 인덱스인가(codex 적대검증 major): `approval.check` 는 매칭 레코드의
+/// `updated_at` 을 갱신하고 **재서명**한다. 그 대상을 `id` 로 다시 찾으면, 승인 파일에 **같은 id
+/// 를 가진 위조 레코드**(서명 무효)를 앞에 끼워 넣은 공격자가 검증받은 적 없는 그 레코드를
+/// 데몬의 손으로 정당 서명시킬 수 있다(서명 세탁 — 다음 check 부터 공격자가 정한 범위·만료가
+/// 유효해진다). 검증한 **그 자리**를 갱신하면 그 경로가 원리상 닫힌다.
+pub fn best_match_index_at(
+    records: &[ApprovalRecord],
+    secret: &[u8],
+    command: &str,
+    cwd: Option<&str>,
+    env: &[(String, String)],
+    now: f64,
+    require_ttl: bool,
+) -> Option<usize> {
     records
         .iter()
-        .filter(|r| r.has_valid_signature(secret)) // 서명 유효만
-        .filter(|r| r.matches(command, cwd, env))
-        .max_by(|a, b| {
+        .enumerate()
+        .filter(|(_, r)| {
+            r.has_valid_signature(secret)
+                && !r.is_expired(now)
+                && (!require_ttl || r.expires_at.is_some())
+                && r.matches(command, cwd, env)
+        })
+        .max_by(|(_, a), (_, b)| {
             a.command_prefix
                 .len()
                 .cmp(&b.command_prefix.len())
@@ -255,6 +323,7 @@ pub fn best_match<'a>(
                         .unwrap_or(std::cmp::Ordering::Equal),
                 )
         })
+        .map(|(i, _)| i)
 }
 
 // ── 토큰화 / 정규화 / 민감 env ─────────────────────────────────────────────────
@@ -549,8 +618,16 @@ mod tests {
             ),
             created_at: 1000.0,
             updated_at: 1000.0,
+            expires_at: None,
             signature: String::new(),
         }
+    }
+
+    /// TTL 있는 레코드(만료 시각 지정) — B-3 검체 전용.
+    fn rec_ttl(prefix: &[&str], cwd: Option<&str>, expires_at: f64) -> ApprovalRecord {
+        let mut r = rec(prefix, cwd, &[]);
+        r.expires_at = Some(expires_at);
+        r
     }
 
     #[test]
@@ -701,6 +778,221 @@ mod tests {
             expected3,
             "RFC 4231 TC3 KAT 실패(키 축약)"
         );
+    }
+
+    // ── ★(0.14.31 · CONTRACTS B-3) 승인 TTL ────────────────────────────────────
+    //
+    // 계약: `sign --ttl <secs>` 가 `expires_at`(epoch)을 **서명 페이로드에 포함**하고,
+    // `check --require-ttl` 은 만료되지 않은 TTL 레코드가 있을 때만 통과한다. TTL 없는
+    // 구 레코드는 `--require-ttl` 에서 실패한다. 실패 방향은 전부 **거부(deny)** 다.
+
+    /// ★무TTL 레코드의 서명 페이로드는 종전과 **바이트 동일**이어야 한다 — 아니면 이 릴리스가
+    /// 설치된 모든 승인 레코드를 한 번에 무효화한다(자율주행 전면 정지 · 가용성 사고).
+    /// 마지막 줄이 `updatedAt=` 이고 `expiresAt` 이 **없다**는 사실로 그것을 잰다.
+    #[test]
+    fn ttl_absent_payload_is_byte_identical_to_legacy() {
+        let r = rec(&["git", "push"], Some("/x"), &[("CI", "1")]);
+        let payload = String::from_utf8(r.signing_payload()).unwrap();
+        assert!(!payload.contains("expiresAt"), "무TTL 레코드에 expiresAt 줄이 붙었다(구 서명 전멸)");
+        assert!(
+            payload.lines().last().unwrap().starts_with("updatedAt="),
+            "무TTL 페이로드의 마지막 줄이 updatedAt 이 아니다(구 서명 전멸): {payload}"
+        );
+        // TTL 이 붙으면 줄이 정확히 하나 늘고 그 줄이 말미다.
+        let mut t = r.clone();
+        t.expires_at = Some(4242.0);
+        let p2 = String::from_utf8(t.signing_payload()).unwrap();
+        assert_eq!(p2.lines().count(), payload.lines().count() + 1);
+        assert_eq!(p2.lines().last().unwrap(), "expiresAt=4242");
+    }
+
+    /// TTL 은 서명에 묶인다 — 만료 연장(값 변경)·제거·주입 전부 서명 불일치로 거부.
+    #[test]
+    fn ttl_tamper_rejected() {
+        let mut r = rec_ttl(&["git", "push"], Some("/x"), 2000.0);
+        r.sign(SECRET);
+        assert!(r.has_valid_signature(SECRET));
+
+        let mut extend = r.clone();
+        extend.expires_at = Some(9_999_999.0);
+        assert!(!extend.has_valid_signature(SECRET), "만료 연장이 서명을 통과했다");
+
+        let mut strip = r.clone();
+        strip.expires_at = None;
+        assert!(!strip.has_valid_signature(SECRET), "만료 제거(무기한 승격)가 서명을 통과했다");
+
+        // 반대 방향: 무기한 레코드에 만료를 주입해도(=축소) 서명 불일치.
+        let mut base = rec(&["git", "push"], Some("/x"), &[]);
+        base.sign(SECRET);
+        let mut inject = base.clone();
+        inject.expires_at = Some(1.0);
+        assert!(!inject.has_valid_signature(SECRET), "만료 주입이 서명을 통과했다");
+    }
+
+    /// 신선한 TTL 레코드는 `--require-ttl` 유무와 무관하게 매칭된다.
+    #[test]
+    fn ttl_fresh_matches_both_modes() {
+        let mut r = rec_ttl(&["git", "push"], Some("/x"), 2000.0);
+        r.sign(SECRET);
+        let recs = vec![r];
+        let now = 1500.0;
+        assert!(
+            best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, false)
+                .is_some(),
+            "신선한 TTL 레코드가 일반 check 에서 탈락"
+        );
+        assert!(
+            best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, true)
+                .is_some(),
+            "신선한 TTL 레코드가 --require-ttl 에서 탈락"
+        );
+    }
+
+    /// ★만료 레코드는 **요구 여부와 무관하게** 매칭되지 않는다(만료는 사실이지 옵션이 아니다).
+    /// 경계 포함: `now == expires_at` 도 만료다.
+    #[test]
+    fn ttl_expired_never_matches() {
+        let mut r = rec_ttl(&["git", "push"], Some("/x"), 2000.0);
+        r.sign(SECRET);
+        let recs = vec![r];
+        for (now, label) in [(2000.0_f64, "경계(now==expires_at)"), (2000.1, "만료 후")] {
+            assert!(
+                best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, false)
+                    .is_none(),
+                "{label}: 만료 레코드가 일반 check 를 통과했다"
+            );
+            assert!(
+                best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, true)
+                    .is_none(),
+                "{label}: 만료 레코드가 --require-ttl 을 통과했다"
+            );
+        }
+    }
+
+    /// ★음성 대조(결측은 값이 아니다): TTL **없는** 레코드는 `--require-ttl` 에서 실패하고,
+    /// 그 실패가 '일반 check 도 못 쓴다'로 번지지 않는다(무기한 승인의 종전 계약 보존).
+    #[test]
+    fn ttl_missing_record_fails_require_ttl_but_keeps_legacy_check() {
+        let mut r = rec(&["git", "push"], Some("/x"), &[]);
+        r.sign(SECRET);
+        let recs = vec![r];
+        let now = 5000.0;
+        assert!(
+            best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, true)
+                .is_none(),
+            "TTL 없는 레코드가 --require-ttl 을 통과했다(계약 B-3 위반)"
+        );
+        assert!(
+            best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], now, false)
+                .is_some(),
+            "TTL 없는 레코드의 종전 check 통과가 깨졌다(구 승인 전멸)"
+        );
+    }
+
+    /// 만료 레코드가 섞여 있어도 **살아있는 짧은 prefix** 를 가리지 않는다 — 만료분을 먼저
+    /// 걸러내지 않고 최장 prefix 를 고르면 "가장 잘 맞는 승인이 죽었다"가 곧 전면 거부가 된다.
+    #[test]
+    fn expired_longest_prefix_does_not_shadow_live_shorter() {
+        let mut dead = rec_ttl(&["git", "push", "origin"], Some("/x"), 1000.0);
+        dead.id = "ap-dead".into();
+        dead.sign(SECRET);
+        let mut live = rec(&["git", "push"], Some("/x"), &[]);
+        live.id = "ap-live".into();
+        live.sign(SECRET);
+        let recs = vec![dead, live];
+        let best =
+            best_match_at(&recs, SECRET, "git push origin main", Some("/x"), &[], 5000.0, false)
+                .expect("살아있는 짧은 prefix 가 선택돼야");
+        assert_eq!(best.id, "ap-live", "만료된 최장 prefix 가 살아있는 승인을 가렸다");
+    }
+
+    // ── ★서명 세탁·만료 연장 (codex gpt-6-astra 위임 작성 · 전 줄 검토 후 채택) ──
+    // 채택 시 수정 1건: T2 의 마지막 단언 문안이 "TTL 필수 여부와 무관하게"라고 말하면서 실제로는
+    // `require_ttl=false` 만 재고 있었다 — 말과 측정이 어긋나면 그 문장이 다음 사람을 속인다.
+    // 두 모드를 **둘 다 재도록** 고쳐서 문안을 사실로 만들었다.
+
+    /// 같은 id의 위조본을 앞에 삽입하면 id 재검색으로 재서명 대상을 바꿀 수 있다.
+    /// 더 긴 prefix와 먼 만료 시각을 가진 위조본도 검증된 인덱스를 대신해서는 안 된다.
+    /// 이 검사가 실패하면 approval.check의 재서명이 위조본을 유효한 승인으로 세탁할 수 있다.
+    #[test]
+    fn duplicate_id_forgery_is_never_the_selected_index() {
+        let forged = rec_ttl(&["git", "push", "origin"], None, 1_000_000_000.0);
+        let mut valid = rec_ttl(&["git", "push"], None, 2000.0);
+        valid.sign(SECRET);
+
+        assert_eq!(forged.id, "ap-test-1", "위조본의 id가 대조 조건과 다릅니다");
+        assert_eq!(forged.id, valid.id, "두 검체의 id가 같아야 공격을 재현합니다");
+        assert!(!forged.has_valid_signature(SECRET), "위조본은 서명이 무효여야 합니다");
+        let records = vec![forged, valid];
+
+        for require_ttl in [false, true] {
+            let selected = best_match_index_at(
+                &records, SECRET, "git push origin main", None, &[], 1500.0, require_ttl,
+            );
+            assert_eq!(
+                selected,
+                Some(1),
+                "검증된 두 번째 레코드를 선택해야 합니다: TTL 필수={require_ttl}"
+            );
+            let idx = selected.expect("유효한 레코드의 인덱스가 누락되었습니다");
+            assert!(
+                records[idx].has_valid_signature(SECRET),
+                "선택된 레코드의 서명이 무효입니다: TTL 필수={require_ttl}"
+            );
+            assert_eq!(
+                records[idx].command_prefix,
+                vec!["git".to_string(), "push".to_string()],
+                "선택된 prefix가 유효본과 다릅니다: TTL 필수={require_ttl}"
+            );
+            assert_eq!(
+                best_match_index_at(
+                    &records[..1], SECRET, "git push origin main", None, &[], 1500.0, require_ttl,
+                ),
+                None,
+                "위조본만 남아도 무효 서명을 선택해서는 안 됩니다: TTL 필수={require_ttl}",
+            );
+        }
+    }
+
+    /// 승인 사용 시 updated_at 갱신과 재서명이 절대 만료 시각을 연장해서는 안 된다.
+    /// 만료 직전 사용을 반복하는 공격자가 승인을 계속 살려 둘 수 있는지 검사한다.
+    /// 이 검사가 실패하면 처음 정한 TTL 이후에도 같은 승인이 재사용될 수 있다.
+    #[test]
+    fn resigning_updated_at_preserves_absolute_expiry() {
+        let mut record = rec_ttl(&["git", "push"], None, 2000.0);
+        let initial_expiry = record.expires_at;
+        record.sign(SECRET);
+        assert!(record.has_valid_signature(SECRET), "초기 TTL 레코드의 서명이 무효입니다");
+        assert_eq!(record.expires_at, initial_expiry, "초기 서명이 만료 시각을 변경했습니다");
+
+        for updated_at in [1200.0, 1600.0, 1999.0] {
+            record.updated_at = updated_at;
+            record.sign(SECRET);
+            assert!(
+                record.has_valid_signature(SECRET),
+                "updated_at={updated_at} 갱신 후 재서명이 무효입니다"
+            );
+            assert_eq!(
+                record.expires_at, initial_expiry,
+                "updated_at={updated_at} 갱신 후 절대 만료 시각이 변경되었습니다"
+            );
+        }
+
+        let records = [record];
+        assert_eq!(
+            best_match_index_at(&records, SECRET, "git push origin main", None, &[], 1999.0, false),
+            Some(0),
+            "재서명된 승인은 초기 만료 시각 전에는 선택되어야 합니다",
+        );
+        for require_ttl in [false, true] {
+            assert_eq!(
+                best_match_index_at(
+                    &records, SECRET, "git push origin main", None, &[], 2001.0, require_ttl,
+                ),
+                None,
+                "재서명을 반복해도 초기 만료 시각 이후에는 거부해야 합니다: TTL 필수={require_ttl}",
+            );
+        }
     }
 
     #[test]
