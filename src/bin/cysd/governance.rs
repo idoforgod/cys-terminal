@@ -4673,7 +4673,7 @@ pub(crate) struct PromptObs {
     /// (프롬프트가 포커스를 잃었거나 다른 화면) `None` — 호출부는 `Unknown` 으로 받아 배달하지
     /// 않는다(fail-closed).
     pub(crate) line: Option<(String, String)>,
-    /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`waiting_prompt_layout`).
+    /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`waiting_prompt_layout_positive`).
     pub(crate) screen: String,
     /// 커서 행이 마커 뒤 `N. …` 번호 선택지 행이다(codex `› 1. Yes, continue` · claude `❯ 1. Yes`) —
     /// composer 가 아니라 선택기다(codex 설계 검토 Q5 반례).
@@ -4695,9 +4695,17 @@ pub(crate) struct PromptObs {
 }
 
 impl PromptObs {
-    /// 이 프레임이 **발행 완료**인가(세대 짝수). 홀수 = reader 가 청크를 반영하는 중이다.
+    /// 이 프레임이 **발행 완료**인가 — 관측 창의 **양 끝점**이 모두 짝수다.
+    ///
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · codex major) 종전에는 관측 **앞**에서 읽은 세대 하나만 봤다.
+    /// 그래서 "짝수 20 에서 관측을 시작했는데 그 창 안에서 reader 가 21 로 올려 모달을 발행하기
+    /// 시작한" 프레임이 발행 완료로 읽혔고, 비-alt 경로는 `frame_consistent` 를 요구하지 않으며
+    /// 인계에도 세대를 넘기지 않아 그 홀수가 **어디서도 거부되지 않았다**(codex R6 의 그 인터리빙).
+    /// 뒤 끝점까지 짝수를 요구해도 **세대 불변은 여전히 요구하지 않는다** — 요구하면 연속 출력
+    /// 노드가 영구 기아가 된다(기아 #1 의 본체 · dept-1 실측 idle 0s 953s 지속). 즉 이 축이 막는
+    /// 것은 "관측 창 안에서 발행이 **진행 중**" 뿐이고, 그 창은 파서 락 보유 시간(수백 µs)이다.
     pub(crate) fn frame_published(&self) -> bool {
-        self.output_gen % 2 == 0
+        self.output_gen % 2 == 0 && self.output_gen_after % 2 == 0
     }
     /// 화면·quiet·세대가 **한 관측**인가 — 발행 완료 ∧ 관측 창 동안 세대 불변.
     /// (`handlers::quiet_secs_consistent` 와 같은 규칙 · 판정 분리 금지.)
@@ -4795,8 +4803,10 @@ fn observe_tail(s: &Arc<crate::state::Surface>) -> (u64, bool, u64) {
 ///      비어 있음. 출력 quiet 는 요구하지 않는다(B1 — 벤더 문서상 처리 중 제출은 큐잉).
 ///   ⑤ `alt_screen` → 종전엔 무조건 거부였다(0.14.30 라이브 회귀 — claude 2.1.26x 는 alt-screen 에
 ///      상주한다). 이제 **양성 유휴 프롬프트 관측**이 있을 때만 통과한다: 마커 보임 ∧ 커서행 마커
-///      (input≠Unknown) ∧ 입력줄 비어 있음 ∧ 레이아웃 양성 증거(`layout_ok` — 마커 줄 아래가 입력
-///      상자 괘선/상태줄) ∧ 출력 정적(`quiet_for ≥ quiet` · overdue 완화 없음 — 정적은 스케줄이
+///      (input≠Unknown) ∧ 입력줄 비어 있음 ∧ 레이아웃 양성 증거(`layout_ok` = `readiness::
+///      waiting_prompt_layout_positive` — 마커 줄 아래가 입력 상자 괘선/상태줄이거나, 꼬리가 비었으면
+///      마커 **위**에 상태줄이 있다. 빈 `❯ ` 한 장은 증거가 아니다 — 리뷰 R6) ∧ 출력 정적
+///      (`quiet_for ≥ quiet` · overdue 완화 없음 — 정적은 스케줄이
 ///      아니라 증거다). 하나라도 빠지면 종전과 같은 거부다 — 새 신호가 게이트를 면제하는 것이
 ///      아니라 게이트의 판정 입력을 정확하게 만든 것이다(§8-3 과 구분 · CONTRACTS B-1).
 pub(crate) struct PromptGateInput {
@@ -4917,7 +4927,12 @@ fn prompt_gate_input(
         modal_foreground: cys::readiness::modal_foreground(&obs.screen, Some(marker)).is_some(),
         selector_row: obs.selector_row,
         busy_near_cursor: obs.busy_near_cursor,
-        layout_ok: alt_screen && cys::readiness::waiting_prompt_layout(&obs.screen, marker),
+        // ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) **엄격판**이다(관대판 아님). vt100 화면은 후행
+        //   개행이 잘려 마커 행이 마지막이면 꼬리가 **항상 비고**, 관대판은 그때 무조건 참이라
+        //   `prompt_gate_verdict` ⑤가 약속한 "레이아웃 양성 증거" 가 사실상 부재했다(빈 `❯ ` 한 장이
+        //   alt-screen 배달 자격을 얻었다 = BLOCKED_ALT_SCREEN 미발화). 이제 입력 상자 괘선·상태줄이
+        //   **실제로 있을 때만** 참이다 — 부트의 관문 증거 이월(`cys.rs::gate_carry_ok`)과 같은 술어.
+        layout_ok: alt_screen && cys::readiness::waiting_prompt_layout_positive(&obs.screen, marker),
         quiet_for: obs.quiet_secs,
         quiet: queue_quiet_secs(),
         frame_published: obs.frame_published(),
@@ -5248,13 +5263,26 @@ pub(crate) fn deliver_head_locked(
                 break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
             }
         }
+        // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) **발행 중(홀수) 거부는 무조건이다** — 판정이
+        //   세대를 넘겼는지와 무관하다. 종전에는 `expect_output_gen` 이 `Some` 일 때만 홀수를 봤고,
+        //   비-alt(B1) 경로와 마커 없는 강제 배달은 `None` 을 넘겨 **인계 시점에 발행 중이어도**
+        //   본문이 나갔다.
+        //   【계약의 한계 — 정직】 reader 는 `input_gate` 를 공유하지 않으므로 이 검사는 **원자적이지
+        //   않다**: 검사 뒤 `try_send` 전에 새 청크가 도착할 수 있다(codex R6 ⓐ). 이 축이 보장하는
+        //   것은 "검사 순간 발행 중이 아니다" 뿐이고, 창을 더 줄이려 검사를 인계 직전으로 옮겨도
+        //   원자성 증명은 되지 않는다(그러려면 reader 를 직렬화해야 한다 — 백로그 ⑭).
+        //   【기아 부담】 홀수 체류는 청크 1건의 파서 반영 + DSR 응답 **유계 대기(≤250ms)** + ingest
+        //   까지다(codex R6 ⓑ). 즉 수십 µs 가 아니라 최악 수백 ms 이고, 그 구간에 걸린 틱은 다음
+        //   틱(≈1s)에 재시도한다 — 영구 보류가 아니며 `queue.starved`(머리 나이)가 만성 상태를
+        //   드러낸다. 프레임 **불변**을 요구하지 않는 이유는 종전과 같다(연속 출력 노드의 기아 #1).
+        let now_gen = s.output_gen.load(Ordering::Acquire);
+        if now_gen % 2 == 1 {
+            break 'tx None; // reader 가 청크를 반영하는 중 — 화면에 없는 바이트가 이미 도착해 있다
+        }
         if let Some(gen) = expect_output_gen {
-            let now_gen = s.output_gen.load(Ordering::Acquire);
-            // ★(0.14.31 · 리뷰 R5 · codex major) **홀수도 거부**한다. 동일 비교만으로는 "판정도
-            //   인계도 발행 **중**(홀수)이라 값만 같다" 를 통과시킨다 — 그때 화면에는 아직 반영되지
-            //   않은 바이트가 이미 도착해 있다(`handlers::quiet_secs_consistent` 와 같은 규칙).
-            if now_gen % 2 == 1 || now_gen != gen {
-                break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력·발행 중) — 정적 판정 무효
+            // ★(0.14.31 · 리뷰 R5 · codex major) 정적(quiet) 기반 판정은 **그 프레임**이어야 한다.
+            if now_gen != gen {
+                break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
             }
         }
         if min_interval > 0 {
@@ -6139,14 +6167,15 @@ pub(crate) fn force_deliver_entry(
             (Some(s.pending_input_bytes.load(Ordering::Relaxed)), gen)
         }
         None => {
+            // [성찰 BLOCKER] forced 에도 overdue_quiet(기본 1s·하한 1s) — '출력 중 주입 금지'
+            // 의미론은 운영자 강제로도 불변이다(queue_quiet_verdict 의 overdue 하한과 동일 값).
+            // ★(리뷰 R5 / R6 · codex ⓒ) 틱과 같은 한 관측(세대 → 안전 게이트 → quiet → 세대)으로
+            //   잰다 — 세대를 게이트 **뒤**에 읽으면 게이트가 본 화면과 quiet 가 다른 프레임이다.
+            let need = queue_overdue_quiet_secs().max(1);
+            let gen0 = s.output_gen.load(Ordering::Acquire);
             if let Some(why) = no_marker_gate(s) {
                 return Err(ForceDeliverDenied::PromptGate(why));
             }
-            // [성찰 BLOCKER] forced 에도 overdue_quiet(기본 1s·하한 1s) — '출력 중 주입 금지'
-            // 의미론은 운영자 강제로도 불변이다(queue_quiet_verdict 의 overdue 하한과 동일 값).
-            // ★(리뷰 R5) 틱과 같은 한 관측(세대 → quiet → 세대)으로 잰다.
-            let need = queue_overdue_quiet_secs().max(1);
-            let gen0 = s.output_gen.load(Ordering::Acquire);
             let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
             if gen0 % 2 == 1 || s.output_gen.load(Ordering::Acquire) != gen0 {
                 // 관측 창에 출력이 흘렀다 = 그 quiet 는 이 프레임의 사실이 아니다. 사유는 '출력 중'
@@ -6156,7 +6185,10 @@ pub(crate) fn force_deliver_entry(
             if quiet_for < need {
                 return Err(ForceDeliverDenied::OutputBusy { quiet_for, need });
             }
-            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), None)
+            // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) 이 판정도 **정적 기반**이다 — 종전에는
+            //   여기서 gen0 을 버려(`None`), quiet 표본 뒤에 도착한 출력이 인계 재확인을 통과했다.
+            //   틱의 마커 없는 경로(`deliver_queued`)와 같은 값을 넘긴다(경로별 판정 분리 금지).
+            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), Some(gen0))
         }
     };
     // 조준 해석(+ 필요 시 머리 끌어올림) — pending_queue 락 한 임계영역에서 원자 수행.
@@ -6357,14 +6389,16 @@ fn deliver_queued(
                 PromptGate::Ready => (false, input.alt_screen.then_some(obs.output_gen)),
             }
         } else {
+            // ★(리뷰 R5 · codex major / R6 · codex) 마커 없는 경로도 **정적(quiet) 기반**이고, 그
+            //   관측 창은 **안전 게이트부터** 시작한다. 종전에는 `no_marker_gate` 를 먼저 통과시키고
+            //   그 **뒤**에 세대를 읽어서, 게이트가 본 화면과 quiet 를 잰 화면이 다른 프레임일 수
+            //   있었다(그 사이에 모달·alt-screen 이 반영되면 배달이 그것을 못 본다 · codex R6 ⓒ).
+            let gen = s.output_gen.load(Ordering::Acquire);
             // ★(0.14.31) 마커 없는 좌석의 안전 게이트(대체화면·모달 어휘·미제출 바이트) — quiet 앞.
             if let Some(why) = no_marker_gate(&s) {
                 block(why);
                 continue;
             }
-            // ★(리뷰 R5 · codex major) 마커 없는 경로도 **정적(quiet) 기반**이다 — 세대·quiet 를 한
-            //   관측으로 묶는다(세대 → quiet → 세대). 홀수(발행 중)·변화는 배달하지 않는다.
-            let gen = s.output_gen.load(Ordering::Acquire);
             let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
             if gen % 2 == 1 || s.output_gen.load(Ordering::Acquire) != gen {
                 block(BLOCKED_BUSY);
@@ -9959,12 +9993,24 @@ mod tests {
             blocked_reason(&s)
         );
         // ⓒ 판정 → (세대 이동) → 인계: 정적 경로의 인계 재확인이 그 사이 출력을 잡는다.
+        // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) **큐를 다시 채운다.** 종전에는 앞선 배달로
+        //   큐가 빈 상태에서 이 단언들이 돌아, 세대 가드가 없어도 `q.front()` 가 None 이라 전부
+        //   통과했다(공허한 검사 — 지적 그대로). 이제 매 단언 앞에 머리를 세우고, 마지막에
+        //   **가용성 대조군**(같은 조건에서 세대가 맞으면 배달된다)으로 축이 상시 닫히지 않음을 잰다.
+        let refill = |tag: &str| {
+            let e = daemon.next_queue_entry(format!("[보고] {tag}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+            *s.last_queue_delivery_at.lock().unwrap() = None;
+            s.set_pending_input(0);
+        };
+        refill("세대 이동");
         let gen = s.output_gen.load(AtomicOrdering::Acquire);
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel); // 청크 하나가 완전히 흘렀다
         assert!(
             deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen)).is_none(),
             "판정이 본 프레임이 아닌데 배달했다"
         );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "전제: 머리가 있어야 검사가 유효하다");
         // 같은 값이어도 **홀수**면 거부한다(동일 비교만으로는 발행 중이 통과한다).
         s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
         let odd = s.output_gen.load(AtomicOrdering::Acquire);
@@ -9972,6 +10018,50 @@ mod tests {
         assert!(
             deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd)).is_none(),
             "홀수 세대가 동일 비교만으로 통과했다"
+        );
+        // ★(리뷰 R1(R6회차) · codex major) 판정이 세대를 **넘기지 않는 경로**(비-alt B1 · 마커 없는
+        //   강제 배달)도 인계 시점에 발행 중이면 배달하지 않는다 — 종전에는 `None` 이면 홀수 검사
+        //   자체가 없었다.
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None).is_none(),
+            "expect_output_gen=None 경로가 발행 중(홀수) 인계를 통과시켰다"
+        );
+        // 가용성 대조군 — 짝수로 닫고 같은 값을 넘기면 **곧바로** 배달된다(축이 상시 닫히지 않는다).
+        s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        let even = s.output_gen.load(AtomicOrdering::Acquire);
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even)).is_some(),
+            "발행이 끝난 프레임인데 인계가 거부했다(기아 — 축이 상시 닫혔다)"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) **alt-screen 배달 자격은 '레이아웃 양성 증거' 다.**
+    /// vt100 화면은 후행 개행이 잘리므로 마커 행이 마지막 비공백 행이면 꼬리는 항상 빈 벡터다 —
+    /// R5 의 관대판(`empty_trailer_ok=true`)은 그때 무조건 참이라 `BLOCKED_ALT_SCREEN` 이 사실상
+    /// 발화하지 않았다(빈 `❯ ` 한 장이 배달 자격을 얻었다 = 부트 이월이 막는 바로 그 프레임).
+    #[test]
+    fn r6_alt_screen_delivery_requires_positive_prompt_layout() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("r6-layout");
+        let (daemon, s) = wp5_seat("wp5-r6-layout", "claude");
+        let e = daemon.next_queue_entry("[보고] 레이아웃".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        // ① 꼬리 없는 빈 `❯ ` 한 장(라벨 미도색 선택기와 구별되지 않는 프레임) → 거부.
+        paint_screen(&s, &[RULE, "❯ "], 1, 2, true);
+        quiet_since(&s, 30);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "레이아웃 증거 0 인 alt 프레임에 배달했다");
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN, "사유가 레이아웃 미확인이 아니다");
+        // ② 같은 좌석에 입력 상자 괘선·상태줄이 그려지면 **곧바로** 배달된다(가용성 대조군).
+        paint_claude_idle_alt(&s);
+        quiet_since(&s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        s.set_pending_input(0);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "라이브 2.1.26x 그리드가 막혔다(기아 — 0.14.30 라이브 회귀 재발): {}",
+            blocked_reason(&s)
         );
     }
 

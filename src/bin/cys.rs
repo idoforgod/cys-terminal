@@ -8341,6 +8341,70 @@ mod seat_latch_negation_tests {
         );
     }
 
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · 리뷰어 2인 공통 · codex blocking) **재부트 채택도 관문 증거
+    /// 이월을 받는다.** 이 경로의 좌석은 `gate_pending` 표식이 디스크에 남은 = 관문을 확실히 본
+    /// 좌석인데, 종전에는 `judge` 의 Ready 를 그대로 채택으로 접어 **같은 프레임이 부트 폴링에서는
+    /// 보류·재부트에서는 주입**이었다(장치가 한쪽에만 배선됐다).
+    #[test]
+    fn reboot_adoption_requires_the_same_carry_evidence_as_boot_polling() {
+        let live = cys::first_run_gates::fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        let ev = cys::readiness::Evidence::Valve;
+        // ① 라벨이 아직 안 그려진 프레임(괘선 + 빈 커서 행) — Ready 라도 **채택하지 않는다**.
+        //    이것이 리뷰어 두 명이 각각 든 그 프레임이다(`screen_is_bare_shell` 는 렌더 증거가 있어
+        //    거짓 → 밸브 발화 → Ready → 종전에는 붙여넣기 + Return).
+        let repainting = "────────────────────────────────────────\n❯ \n";
+        assert!(
+            cys::readiness::modal_signature(repainting).is_none(),
+            "전제 붕괴: 모달 서명이 이미 잡는 화면이면 이 검체는 이월 축을 재지 못한다"
+        );
+        assert_eq!(
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), Some("❯"), repainting, Some(true)),
+            GateRecheck::CarryUnproven,
+            "재도색 중 프레임이 재부트 채택으로 흘렀다(주입 + Return 이 선택지로 나간다)"
+        );
+        // ② 사람이 통과시킨 라이브 프롬프트는 그대로 채택된다(가용성 — 영구 보류 금지).
+        assert_eq!(
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), Some("❯"), live, Some(true)),
+            GateRecheck::Adopt(ev),
+            "관문 통과 뒤 라이브 그리드에서도 채택이 막힌다(디렉티브 영구 미주입 = 치명위험 ③)"
+        );
+        // ②' 2.1.241 레이아웃(상태줄이 프롬프트 **위**)도 채택된다 — codex R6 의 '영구 보류 반례'.
+        assert_eq!(
+            gate_recheck_with_carry(
+                GateRecheck::Adopt(ev),
+                Some("❯"),
+                cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                Some(true)
+            ),
+            GateRecheck::Adopt(ev),
+            "상태줄이 프롬프트 위에 오는 레이아웃이 영구 보류가 된다(그 좌석은 채택 자체가 불가능해진다)"
+        );
+        // ③ Ready 가 아닌 판정은 이월과 무관하게 그대로다(새 규약을 만들지 않는다).
+        for v in [
+            GateRecheck::StillHeld { gate_id: "folder-trust".into(), title: "t".into() },
+            GateRecheck::NoEvidence,
+            GateRecheck::Unobserved,
+        ] {
+            assert_eq!(
+                gate_recheck_with_carry(v.clone(), Some("❯"), repainting, Some(true)),
+                v,
+                "이월이 다른 판정을 덮어썼다"
+            );
+        }
+        // ④ 배선 핀 — 재관측이 그 술어를 **실제로** 태운다(순수 함수만 있고 호출이 없으면 무의미).
+        let src = include_str!("cys.rs");
+        let head = format!("\nfn {}(", "gate_pending_reobserve");
+        let i = src.find(&head).expect("재관측 함수");
+        let mut end = (i + 4_000).min(src.len());
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        assert!(
+            src[i..end].contains("gate_recheck_with_carry("),
+            "재관측이 이월 술어를 태우지 않는다(장치 미배선)"
+        );
+    }
+
     /// ★(0.14.31 · 리뷰 R5 · codex blocking) **관문 증거 이월** — 관문을 본 부트의 Ready 는 양성
     /// 프롬프트 증거를 함께 요구한다. 재도색 중 라벨이 사라진 프레임(`❯ ` 한 줄)이 마커 델타로
     /// Ready 가 되던 창을 닫는 장치이고, **관문을 본 적 없는 건강한 부트는 한 글자도 바뀌지 않는다**.
@@ -8378,7 +8442,12 @@ mod seat_latch_negation_tests {
         //   리터럴을 그대로 두면 정의보다 앞선 이 자리가 잡혀 하네스가 적색이 된다(R5 실측).
         let head = format!("\nfn {}(", "boot_agent_on_surface");
         let i = src.find(&head).expect("부트 폴링");
-        let body = &src[i..(i + 60_000).min(src.len())];
+        // 슬라이스 끝은 **문자 경계**로 내린다(본문에 한글이 섞여 있어 고정 오프셋은 경계가 아니다).
+        let mut end = (i + 60_000).min(src.len());
+        while !src.is_char_boundary(end) {
+            end -= 1;
+        }
+        let body = &src[i..end];
         body.find("gate_evidence_seen = true;").expect("관문(GateHeld)에서 래치를 세우지 않는다");
         let used = body.find("let carry_ok = gate_carry_ok(").expect("Ready 가 이월을 보지 않는다");
         let hold = body.find("if !carry_ok {").expect("이월 미충족 분기가 없다");
@@ -8544,11 +8613,12 @@ mod seat_latch_negation_tests {
             .find("첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요")
             .expect("관문 보류 문안이 사라졌다");
         assert!(unread_line < held_line, "미룸 분기가 관문 보류 문안 뒤에 있다(순서상 도달 불가)");
-        // ★(리뷰 R5) 구조화 사유는 **세 값**이다 — 자리가 3분기로 늘었으므로 핀도 셋을 요구한다(완화 0).
+        // ★(리뷰 R5 → R6) 구조화 사유는 **네 값**이다 — 자리가 4분기로 늘었으므로 핀도 넷을 요구한다(완화 0).
         for anchor in [
             "let gate_reason = if adopt_unread.is_some() {",
             "GATE_ID_ADOPT_UNREAD",
             "GATE_REASON_RECHECK_UNOBSERVED",
+            "GATE_REASON_CARRY_UNPROVEN",
             "\"gate-held\"",
         ] {
             assert!(
@@ -8559,7 +8629,14 @@ mod seat_latch_negation_tests {
         // 관측 실패는 '관문 상주' 와 다른 문안을 받는다(모순 차단 · m1 과 같은 계급).
         // (소스는 줄 이음으로 쪼개져 있으므로 **이어진 조각**으로 대조한다 — 문안 전체가 아니라
         //  분기가 존재하는지가 대상이다.)
-        for anchor in ["**확인하지 못했다**", "관측하지 못했다**(화면 읽기 실패)", "unobserved {"] {
+        for anchor in [
+            "**확인하지 못했다**",
+            "관측하지 못했다**(화면 읽기 실패)",
+            "unobserved {",
+            // ★(리뷰 R6) 이월 미충족도 자기 문안·자기 분기를 갖는다(‘관문 상주’ 로 접히지 않는다).
+            "carry_unproven {",
+            "**미확정**(입력 상자 레이아웃 증거 없음)",
+        ] {
             assert!(
                 boot.contains(anchor),
                 "관측 실패에도 '관문이 떠 있다' 는 처방이 나간다(재관측 미관측 분기 결손): {anchor}"
@@ -9570,12 +9647,16 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     format!("재관측=관문 상주({title} · id={gate_id})")
                 }
                 GateRecheck::NoEvidence => "재관측=화면은 읽었으나 양성 증거 0(맨 셸 의심)".into(),
+                GateRecheck::CarryUnproven => "재관측=입력 증거는 있으나 **대기 프롬프트 레이아웃 미확인**(재도색 중 라벨이 사라진 선택기와 구별 불가) — 채택 보류".into(),
                 GateRecheck::Unobserved => {
                     "재관측=화면을 읽지 못함(데몬 무응답·surface 미상) — 관문 상주 여부 **미확인**".into()
                 }
             };
             // ★(0.14.31 · 리뷰 R5 · claude 적대) 관측 실패는 '관문이 떠 있다' 가 아니다 — 문안·구조화 사유를 가른다.
             let unobserved = matches!(recheck, GateRecheck::Unobserved) && adopt_unread.is_none();
+            // ★(0.14.31 · 리뷰 R1(R6회차)) 이월 미충족은 '관문 상주 확인' 도 '화면 미관측' 도 아니다 —
+            //   화면은 읽었고 관문 서명은 없었지만, 그 화면이 composer 라는 **양성 증거**가 없다.
+            let carry_unproven = matches!(recheck, GateRecheck::CarryUnproven) && adopt_unread.is_none();
             // ★(0.14.31 · 리뷰 R4 · codex minor) 사람이 읽는 줄도 **사유를 따라간다.** 종전엔 채택 미룸에도
             //   "사람 1회 조치 필요" 가 그대로 나가서, JSON hint("사람 조치 없음")와 정면으로 모순됐다 —
             //   운영자는 이미 통과한 관문을 다시 통과시키라는 지시를 받았다.
@@ -9590,6 +9671,11 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     "· {agent}: 역할 '{role}' 첫기동 관문 표식 유지({why} · {recheck_note}) — 관문이 아직 떠 있는지 \
 **확인하지 못했다** · 사람이 화면을 1회 확인\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
                 );
+            } else if carry_unproven {
+                println!(
+                    "· {agent}: 역할 '{role}' 첫기동 관문 표식 유지({why} · {recheck_note}) — 관문 통과 여부 \
+**미확정**(입력 상자 레이아웃 증거 없음) · 사람이 화면을 1회 확인\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
+                );
             } else {
                 println!(
                     "· {agent}: 역할 '{role}' 첫기동 관문 보류({why} · {recheck_note}) — 사람 1회 조치 필요\n                   확인: `cys read-screen --surface {sref}` (스폰·회수·파괴 모두 하지 않음)"
@@ -9603,6 +9689,11 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             } else if unobserved {
                 "관문이 아직 떠 있는지 **관측하지 못했다**(화면 읽기 실패) — 먼저 `cys read-screen` 으로 화면을 \
                  1회 확인하라. 관문이 없으면 다음 `cys boot` 이 스폰 없이 이 좌석을 채택한다"
+            } else if carry_unproven {
+                "화면은 읽었고 관문 서명도 없었지만 **입력 상자(대기 프롬프트) 레이아웃 증거가 없다** — 재도색 \
+                 중이라 선택지 라벨이 아직 안 그려진 관문일 수 있어 주입 0 · 키 0 으로 보류했다. \
+                 `cys read-screen` 으로 화면을 1회 확인하라(관문이면 통과시키고, 정상 입력창이면 다음 \
+                 `cys boot` 이 스폰 없이 채택한다)"
             } else {
                 "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다(재부트가 스폰 없이 이 좌석을 채택한다)"
             };
@@ -9610,11 +9701,14 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             //   구조화 사유를 싣는다. 버킷(`outcome`)·exit 코드·좌석 취급은 종전 그대로다(계약 무변).
             //   값: `gate-held`(관문이 실제로 떠 있다 · 사람 1회 조치) | `adopt-list-unread`(관문은 통과했고
             //   표식 판독만 실패 · 사람 조치 없음) | `recheck-unobserved`(화면을 읽지 못해 관문 상주 여부
-            //   **미확인** · 사람은 화면 확인 1회 — 리뷰 R5).
+            //   **미확인** · 사람은 화면 확인 1회 — 리뷰 R5) | `carry-unproven`(화면은 읽었으나 대기
+            //   프롬프트 레이아웃 증거가 없어 채택 보류 · 사람은 화면 확인 1회 — 리뷰 R6).
             let gate_reason = if adopt_unread.is_some() {
                 GATE_ID_ADOPT_UNREAD
             } else if unobserved {
                 GATE_REASON_RECHECK_UNOBSERVED
+            } else if carry_unproven {
+                GATE_REASON_CARRY_UNPROVEN
             } else {
                 "gate-held"
             };
@@ -10800,6 +10894,14 @@ const GATE_ID_ADOPT_UNREAD: &str = "adopt-list-unread";
 /// 종전 그대로이고, 갈라지는 것은 처방 문안과 이 필드뿐이다.
 const GATE_REASON_RECHECK_UNOBSERVED: &str = "recheck-unobserved";
 
+/// ★(0.14.31 · 리뷰 R1(R6회차) · 리뷰어 2인 공통) 재관측이 **Ready 를 냈지만 관문 증거 이월을 충족하지
+/// 못한** 자리의 구조화 사유. 이 경로의 좌석은 정의상 `gate_pending` 표식이 디스크에 남은 = 관문을
+/// **확실히 본** 좌석이므로, 부트 폴링과 같은 요구(양성 프롬프트 레이아웃 · [`gate_carry_ok`])를 받는다.
+/// `gate-held`(관문 상주 확인)와 섞으면 사람 처방이 "관문을 1회 통과시켜라" 로 접히는데, 여기서 참인
+/// 것은 "관문이 아직 떠 있는지 **확정하지 못했다**(입력 레이아웃 증거가 없다)" 뿐이다 —
+/// `recheck-unobserved`(화면을 아예 못 읽음)와도 다른 사실이다(화면은 읽었다).
+const GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven";
+
 /// 채택 직전 `surface.list` 재시도 횟수·간격·**총 예산**. BUDGET 파리티 블록이 아니다(python 쪽 leaf 가 없다).
 ///
 /// 값의 근거: 이 왕복은 로컬 소켓 1회이고, 재시도가 실제로 이기는 실패는 **빠른** 실패다 —
@@ -11219,7 +11321,7 @@ fn boot_agent_on_surface(
     //   (codex R5: "청크 처리 완료 ≠ 위젯 렌더 완료").
     //
     //   【장치】 이 부트에서 관문·모달을 **한 번이라도** 본 좌석은, 그 뒤의 Ready 에 **양성 프롬프트
-    //   증거**를 더 요구한다: 마커 좌석은 대기 프롬프트 레이아웃(`waiting_prompt_layout` — 입력 상자
+    //   증거**를 더 요구한다: 마커 좌석은 대기 프롬프트 레이아웃(`waiting_prompt_layout_positive` — 입력 상자
     //   괘선·상태줄이 마커 줄 아래에 있다 · WP-5 가 alt-screen 배달에 쓰는 그 술어), 마커 미정의
     //   어댑터는 출력 정적(`idle_quiet`). 둘 다 **코퍼스 밖 양성 증거**라 "라벨이 아직 안 그려진
     //   프레임" 과 "정상 composer" 를 가른다.
@@ -11227,8 +11329,10 @@ fn boot_agent_on_surface(
     //   【가용성이 0 이 되지 않는 이유】 래치는 **관문을 실제로 본 부트에서만** 선다(건강한 재부트는
     //   종전과 한 글자도 다르지 않다). 서 있는 동안의 실패 귀결은 종전 관문 보류와 **같은 등급**
     //   (gate_pending + 사람 1회 조치 · 좌석 보존 · 키 0)이고, 사람이 관문을 통과시키면 그 화면이
-    //   곧 레이아웃 양성이라 같은 폴링 안에서 풀린다. 재부트 채택 경로(`gate_pending_reobserve`)는
-    //   이 래치를 쓰지 않는다 — 폴링 이력이 없는 자리에 이력 기반 조건을 쓰면 영구 보류가 된다.
+    //   곧 레이아웃 양성이라 같은 폴링 안에서 풀린다. ★(리뷰 R1(R6회차)) 재부트 채택 경로
+    //   (`gate_pending_reobserve`)도 **같은 요구를 받는다** — 그 자리의 좌석은 표식(gate_pending)이
+    //   디스크에 남은 = 관문을 확실히 본 좌석이므로 래치가 이미 서 있는 것과 같다(이력이 없는 것이
+    //   아니라 **기록으로 있다**). 두 소비처가 같은 술어를 쓴다.
     //
     //   【남는 것(정직)】 관문 프레임이 **폴링 틱 사이에만** 존재했다 사라지면 래치가 서지 않는다.
     //   화면·시간만으로는 그 창을 닫을 수 없다(codex R5 · 노트 §14-3 잔여).
@@ -11755,6 +11859,12 @@ enum GateRecheck {
     StillHeld { gate_id: String, title: String },
     /// 증거 없음(맨 셸 의심 · 화면은 읽었으나 양성 증거 0) — 보류 유지. **파괴로 승격하지 않는다.**
     NoEvidence,
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · 리뷰어 2인 공통) 화면은 읽었고 `judge` 는 Ready 를 냈지만,
+    /// **관문 증거 이월**([`gate_carry_ok`])이 요구하는 양성 프롬프트 증거가 없다 — 재도색 중이라
+    /// 라벨이 아직 안 그려진 선택기와 정상 composer 가 구별되지 않는 프레임이다. 이 경로의 좌석은
+    /// 표식(`gate_pending`)이 디스크에 남은 = 관문을 **확실히 본** 좌석이므로 부트 폴링과 같은
+    /// 요구를 받는다(같은 술어 · 판정 분리 금지). 귀결은 보류(표식 유지 · 주입 0 · 키 0)다.
+    CarryUnproven,
     /// ★(0.14.31 · 리뷰 R5 · claude 적대) **화면을 읽지 못했다**(데몬 무응답 · surface_id 미상).
     /// 종전에는 이것이 [`GateRecheck::NoEvidence`] 에 접혀 있었고, 그 결과 "관문이 아직 떠 있다" 와
     /// "관문 여부를 관측조차 못 했다" 가 같은 처방("사람 1회 조치 필요")을 받았다 — m1(채택 미룸)이
@@ -11814,7 +11924,35 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
         idle_quiet,
         legacy_v1: cys::readiness::legacy_v1(),
     };
-    gate_pending_recheck(cys::readiness::judge(&obs))
+    gate_recheck_with_carry(
+        gate_pending_recheck(cys::readiness::judge(&obs)),
+        marker.as_deref(),
+        &screen,
+        idle_quiet,
+    )
+}
+
+/// ★(0.14.31 · 리뷰 R1(R6회차) · 리뷰어 2인 공통 · codex blocking) **관문 증거 이월은 재부트 채택
+/// 경로에도 적용된다**(순수 · 진리표 대상).
+///
+/// 부트 폴링은 래치(`gate_evidence_seen`)가 선 좌석의 Ready 에 양성 프롬프트 증거를 더 요구한다
+/// ([`gate_carry_ok`]). 이 자리는 **표식(`gate_pending`)이 디스크에 남아 있다는 사실 자체가 그
+/// 래치**다 — 관문을 봤다는 기록이 없으면 애초에 이 경로에 오지 않는다. 종전에는 이월을 보지 않아
+/// 같은 프레임(`<괘선>⏎❯ ` — 선택지 라벨 미도색)이 부트 폴링에서는 보류인데 재부트 채택에서는
+/// **붙여넣기 + Return** 이었다(리뷰어 2인이 각각 같은 자리를 짚었다). 두 소비처가 같은 술어를
+/// 쓴다(판정 분리 금지). Ready 가 아닌 판정은 그대로 통과한다.
+fn gate_recheck_with_carry(
+    verdict: GateRecheck,
+    marker: Option<&str>,
+    screen: &str,
+    idle_quiet: Option<bool>,
+) -> GateRecheck {
+    match verdict {
+        GateRecheck::Adopt(_) if !gate_carry_ok(true, marker, screen, idle_quiet) => {
+            GateRecheck::CarryUnproven
+        }
+        other => other,
+    }
 }
 
 /// 재관측이 Ready 를 냈을 때의 **채택** — 표식 해제 + 디렉티브 주입 1회.

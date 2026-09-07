@@ -12587,6 +12587,20 @@ def h_boot_gate_78():
                                    "human_action_required": True}]})
     w = B._boot_gate_pending_verdict(1, unobs)
     need("관측하지 못했다" in w, "재관측 미관측에 '관측 못 함' 처방이 없다(관문 상주로 단정)")
+    # ★(0.14.31 · 리뷰 R6) 네 번째 사유 — 화면은 **읽었고** 관문 문면도 없었지만 입력창이라는
+    #   양성 증거가 없어 채택을 보류한 자리. '관문 상주' 로도 '읽지 못함' 으로도 접히면 거짓이다.
+    carry = json.dumps({"roles": [{"role": "cso", "outcome": "gate_pending", "mandatory": True,
+                                   "gate_reason": "carry-unproven",
+                                   "human_action_required": True}]})
+    w = B._boot_gate_pending_verdict(1, carry)
+    need("미확정" in w and "양성 증거가 없다" in w,
+         "이월 미충족에 '통과 여부 미확정·입력창 증거 없음' 처방이 없다")
+    need("관측하지 못했다" not in w, "이월 미충족이 '화면을 읽지 못했다' 로 접힌다(사실 재작성)")
+    need(B.GATE_REASON_CARRY_UNPROVEN == "carry-unproven", "python 쪽 사유 상수 이탈(생산자와 파리티)")
+    rsrc = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
+    if os.path.isfile(rsrc):
+        need('GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven"' in _read(rsrc),
+             "Rust 생산자 상수와 python 소비자 상수가 갈렸다(gate_reason 파리티)")
     mixed = json.dumps({"roles": [
         {"role": "cso", "outcome": "gate_pending", "mandatory": True,
          "gate_reason": "adopt-list-unread", "human_action_required": False},
@@ -12597,7 +12611,7 @@ def h_boot_gate_78():
          "혼합(진짜 관문 + 채택 미룸)에서 한 처방만 나간다 — 둘 중 하나는 반드시 거짓 지시다")
     need("사람 조치 없음**(전건" not in w, "혼합인데 '전건 사람 조치 없음' 이 나간다")
     # 구 CLI(필드 없음)는 종전 문안으로 폴백한다(위 gp 검사가 그것을 이미 잰다).
-    notes.append("행위 12축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0·사유별 처방 3종+폴백)")
+    notes.append("행위 14축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0·사유별 처방 4종+폴백·rust 파리티)")
     # ⓔ 계측 타당성 — 캠페인 베이스(PRE_U24_REF)에는 제3 분기가 없었다(진짜 변화를 보고 있다).
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"), PRE_U24_REF)
     calib = "skip(no-git)"

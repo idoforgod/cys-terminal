@@ -1032,6 +1032,23 @@ mod tests {
             o.awakened = awakened;
             assert!(!confirm_allowed(&o, GATE_FOLDER_TRUST), "awakened={awakened:?} 에서 확인이 열렸다");
         }
+        // ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) **꼬리에 무관한 줄이 이어져도** 킬체인은 닫힌다.
+        //   R5 는 판정 재료를 화면 끝까지로 잡아, 아래 괘선 한 줄이 서명을 통째로 지웠다(그 프레임에서
+        //   주입 가드도 allow 구멍도 다시 열렸다 — 확인만 격리해서는 안 닫힌다는 R5 의 교훈 그대로).
+        let trailing = "❯ No, exi\n────────────────\n";
+        let sig = crate::readiness::modal_signature(trailing)
+            .expect("괘선이 이어진 잘린 선택기가 모달로 잡히지 않는다(꼬리 경계 회귀)");
+        assert_eq!(sig.kinds, vec!["clipped-choice-row"], "다른 규칙이 이미 잡고 있었다(계측 무효)");
+        assert!(!sig.cursor_on_exit, "전제: 종료 라벨 전문 위가 아니다");
+        assert!(decide(&obs(trailing, &gs)).blocks(), "꼬리가 이어진 잘린 선택기 화면에 본문이 주입된다");
+        assert!(
+            decide_allowing(&obs(trailing, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
+            "allow 구멍이 꼬리 이어진 잘린 선택기에서 열렸다"
+        );
+        assert!(!confirm_allowed(&obs(trailing, &gs), GATE_FOLDER_TRUST));
+        let mut trailing_legacy = obs(trailing, &gs);
+        trailing_legacy.readiness_legacy = true;
+        assert_eq!(decide(&trailing_legacy), Decision::Send, "롤백이 구 판정을 재현하지 않는다(반쪽 롤백)");
     }
 
     /// ★(0.14.31 · 리뷰 R4 · codex blocking) 짧게 잘린 경쟁 커서·다음 줄로 접힌 선택지도 구멍을 연다 —

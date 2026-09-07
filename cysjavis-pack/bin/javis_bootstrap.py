@@ -485,6 +485,11 @@ _GATE_PENDING_PRESCRIPTION = (
 #   ★문안을 파싱하지 않는다 — 필드만 본다. 필드가 없으면(구 CLI) 종전 문안으로 폴백한다.
 GATE_REASON_ADOPT_UNREAD = "adopt-list-unread"
 GATE_REASON_RECHECK_UNOBSERVED = "recheck-unobserved"
+# ★(0.14.31 · 리뷰 R6) 네 번째 값 — 화면은 읽었고 관문 서명도 없었지만 **대기 프롬프트 레이아웃
+#   증거가 없어** 채택을 보류한 자리(생산자: cys.rs `GATE_REASON_CARRY_UNPROVEN`). '관문 상주 확인'
+#   과 섞으면 "이미 통과했을 수도 있는 관문을 다시 통과시켜라" 가 나가고, '화면 미관측' 과 섞으면
+#   "읽지 못했다" 는 거짓이 된다 — 사실이 다르면 처방도 다르다.
+GATE_REASON_CARRY_UNPROVEN = "carry-unproven"
 _GATE_REASON_PRESCRIPTION = {
     GATE_REASON_ADOPT_UNREAD: (
         "→ 그 좌석의 첫기동 관문은 **이미 통과**했다 — 데몬이 표식(`surface.list`)을 돌려주지 "
@@ -496,6 +501,14 @@ _GATE_REASON_PRESCRIPTION = {
         "--surface <ref>` 로 화면을 1회 확인하라 — 관문이 있으면 통과시키고(★면책 창의 기본 "
         "포커스는 `No, exit` 이므로 아래 방향키 1회 뒤 Return), 없으면 재부트가 스폰 없이 그 "
         "좌석을 채택한다. 좌석과 프로세스는 살아 있으므로 회수·재기동·kill 은 하지 마라."
+    ),
+    GATE_REASON_CARRY_UNPROVEN: (
+        "→ 관문 통과 여부가 **미확정**이다: 화면은 읽었고 관문 문면도 없었지만, 그 화면이 입력창"
+        "(입력 상자 괘선·상태줄)이라는 **양성 증거가 없다** — 선택지 라벨이 아직 안 그려진 관문일 "
+        "수 있어 주입 0 · 키 0 으로 보류했다. `cys read-screen --surface <ref>` 로 화면을 1회 "
+        "확인하라 — 관문이면 통과시키고(★면책 창의 기본 포커스는 `No, exit` 이므로 아래 방향키 "
+        "1회 뒤 Return), 정상 입력창이면 재부트가 스폰 없이 그 좌석을 채택한다. 좌석과 프로세스는 "
+        "살아 있으므로 회수·재기동·kill 은 하지 마라."
     ),
 }
 

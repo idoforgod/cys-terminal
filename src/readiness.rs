@@ -603,6 +603,57 @@ struct CursorRow {
     /// 라벨이 시작하는 평탄화 위치(번호가 있으면 그 뒤 · 없으면 커서 뒤 첫 비공백).
     /// **화면 끝까지 공백뿐이면 `flat.len()`** — 그것이 "라벨이 없다"(빈 입력 프롬프트)의 구조적 표지다.
     label_flat: usize,
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) 이 커서 행이 이루는 **선택 행 블록의 끝**(평탄화).
+    /// 커서 행부터 시작해 다음 줄이 [`is_choice_tail_boundary`](빈 줄 · 괘선 · 번호 항목 행 · 다른 선택
+    /// 커서 행)가 아닌 동안 이어붙인다 — 즉 **줄바꿈 접힘은 흡수하고, 무관한 아래 문면은 자른다**.
+    tail_end_flat: usize,
+}
+
+/// ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) 선택 행 꼬리가 **여기서 끝난다**는 경계 줄인가.
+///
+/// 【왜 필요한가】 R5 는 잘린 선택기 판정의 재료를 "커서 뒤 **화면 끝까지**" 로 잡았다. 접힌 확인
+/// 에코(`❯ Yes, I trust this fol⏎der ✔`)의 첫 행이 진부분접두가 되어 통과 후 화면을 관문으로 오탐하는
+/// **역방향 회귀**(2026-07-29 킬체인)를 막기 위해서였다. 그러나 그 대가로 **꼬리에 무관한 줄이 하나만
+/// 이어져도 거부가 통째로 취소된다** — codex 가 든 첫 프레임 `❯ No, exi` + 아래 괘선이 정확히 그것이고,
+/// 그 화면에 본문 + Return 이 나가면 커서는 종료 선택지 위다(좌석 사망).
+///
+/// 【장치】 판정 재료를 **선택 행 블록**으로 좁힌다: 줄바꿈으로 접힌 라벨은 계속 이어 붙이되(에코 보호
+/// 유지), 아래 줄이 **다른 시각 요소**이면 거기서 끊는다. 경계는 넷 — 빈 줄 · 괘선(입력 상자 테두리) ·
+/// 번호 항목 행 · 다른 선택 커서 행 · 상태줄([`PROMPT_TRAILER_TOKENS`]). 다섯 다 "접힌 라벨의 이어짐"
+/// 으로 볼 수 없는 형상이다(상태줄 어휘는 `waiting_prompt_trailer` 의 양성 증거와 **같은 코퍼스**다 —
+/// 그 줄이 나왔다는 것은 입력 상자 블록이 끝났다는 뜻이다).
+fn is_choice_tail_boundary(line: &str) -> bool {
+    if line.trim().is_empty() || is_rule_line(line) || is_numbered_item_row(line) || line.contains('❯') {
+        return true;
+    }
+    let norm = first_run_gates::normalize(line).to_lowercase();
+    PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
+}
+
+/// 커서 행에서 시작하는 선택 행 블록의 **원문 끝 위치**([`is_choice_tail_boundary`] 앞에서 멎는다).
+fn choice_tail_end(raw: &[char], cursor: usize) -> usize {
+    let line_end = |from: usize| -> usize {
+        let mut j = from;
+        while j < raw.len() && raw[j] != '\n' {
+            j += 1;
+        }
+        j
+    };
+    let mut end = line_end(cursor);
+    while end < raw.len() {
+        let start = end + 1; // '\n' 다음 줄
+        let next_end = line_end(start);
+        let line: String = raw[start.min(raw.len())..next_end].iter().collect();
+        // ★CRLF: 줄 끝 `\r` 을 벗긴다(`str::lines()` 와 같은 규율). 벗기지 않으면 번호 항목 행
+        //   판정(`is_numbered_item_row` — `N.` 뒤가 공백/문말)이 `\r` 때문에 거짓이 되어 Windows·
+        //   ConPTY 전사에서만 경계를 놓친다(codex 위임 검체가 실제로 이 결함을 잡았다).
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+        if is_choice_tail_boundary(line) {
+            return end;
+        }
+        end = next_end;
+    }
+    raw.len()
 }
 
 /// 화면의 선택 커서 행 전량(등장 순). 규칙은 [`modal_signature`] ⓐⓓ 와 **같은 스캐너**다 —
@@ -643,6 +694,9 @@ fn cursor_rows(f: &Frame) -> Vec<CursorRow> {
             cursor_flat: f.raw_pre[i],
             numbered_flat_end: numbered_end.map(|ne| f.raw_pre[ne]),
             label_flat: f.raw_pre[label_start],
+            // 꼬리 경계는 **커서 행**에서 잰다(라벨 시작 행이 아니다 — 라벨 탐색은 개행을 건너뛰므로
+            // 경계 너머의 글자를 라벨로 집을 수 있고, 그 경우 `label_flat >= tail_end_flat` 로 걸린다).
+            tail_end_flat: f.raw_pre[choice_tail_end(raw, i)],
         });
     }
     rows
@@ -767,11 +821,14 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> 
 /// **Ready{MarkerDelta} → 디렉티브 붙여넣기 + Return** 이 부분 렌더된 종료 선택지로 나갔다.
 /// 자동확인만 막고 정상 주입 경로를 열어 두면 킬체인은 그대로다 — 그래서 거부를 **공용 서명**에 둔다.
 ///
-/// 【판정 재료가 왜 "화면 끝까지의 꼬리" 인가】 물리 행 끝으로 자르면 좁은 pane 에서 접힌 **확인 에코**
-/// (`❯ Yes, I trust this fol⏎der ✔`)의 첫 행이 진부분접두가 되어 통과 후 화면을 관문으로 오탐한다
-/// (2026-07-29 킬체인의 **역방향** 회귀 · 정본 요구). 화면 끝까지 보면 그 꼬리는 라벨보다 **길어져**
-/// 접두가 아니다. 동시에 "커서 뒤로 화면이 끝난다" 가 자동으로 요구되므로, 스크롤백 중간의
-/// `❯ 2`·`❯ No` 는 뒤에 다른 글자가 이어져 걸리지 않는다(과잉 보류 억제).
+/// 【판정 재료가 왜 "선택 행 블록의 꼬리" 인가 — R5 의 '화면 끝까지' 를 좁힌다】 물리 행 끝으로 자르면
+/// 좁은 pane 에서 접힌 **확인 에코**(`❯ Yes, I trust this fol⏎der ✔`)의 첫 행이 진부분접두가 되어 통과 후
+/// 화면을 관문으로 오탐한다(2026-07-29 킬체인의 **역방향** 회귀 · 정본 요구). 그래서 R5 는 꼬리를 화면
+/// 끝까지 봤는데, 그러면 **꼬리에 무관한 줄이 하나만 이어져도 거부가 통째로 취소된다** — codex 가 든
+/// 첫 프레임 `❯ No, exi` + 아래 괘선이 정확히 그 구멍이다(그 화면에 본문 + Return 이 나가면 커서는
+/// 종료 선택지 위다). 지금은 **선택 행 블록**([`choice_tail_end`])까지만 본다: 접힌 라벨은 계속 이어
+/// 붙이고(에코 보호 유지), 괘선·빈 줄·번호 항목 행·다른 커서 행에서 끊는다(무관한 꼬리로 취소 불가).
+/// 잘려 보이지만 화면 끝까지의 꼬리에서 **라벨이 완결된** 경우(접힌 에코)는 아래 '완결 증거' 가 면제한다.
 ///
 /// 【규칙】 꼬리에서 선택 번호(`N.`/`NN.` — 뒤가 글자이거나 문말일 때만 · `1.5` 배제)를 벗긴 뒤:
 ///   · 비어 있지 않은 **진부분접두**([`MODAL_CHOICE_LABELS`] 중 하나보다 짧고 그 앞부분과 일치)
@@ -790,39 +847,51 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> 
 /// (`❯ ` 뒤 화면 끝)은 정상 빈 composer 와 **같은 관측**이라 이 술어로 가를 수 없다. 그 창은
 /// 부트 폴링의 관문 증거 이월(`cys.rs` 의 `gate_evidence_seen`)이 좁히고, 폴링 틱 사이에만
 /// 존재했다 사라진 프레임은 화면·시간만으로는 판정 불가다(codex R5 · 종료 조건 없음).
-fn clipped_choice_cursor(flat: &[char], label_flat: usize) -> Option<(&'static str, usize)> {
-    if label_flat >= flat.len() {
-        return None; // 라벨 없음 = 빈 입력 프롬프트(선택기가 아니다)
-    }
-    let tail = &flat[label_flat..];
-    // 숫자만 남은 꼬리(`❯ 2`) — 렌더가 번호에서 멎었다.
-    if tail.len() <= 2 && tail.iter().all(|c| c.is_ascii_digit()) {
-        return Some(("clipped-choice-row", flat.len()));
-    }
-    // 선택 번호 벗기기 — `N.`/`NN.` 뒤가 글자이거나 문말일 때만(`1.5 hours` 는 번호가 아니다).
+/// 선택 번호(`N.`/`NN.`)를 벗긴 나머지 — 뒤가 글자이거나 문말일 때만 번호로 본다(`1.5 hours` 배제).
+fn strip_choice_number(tail: &[char]) -> &[char] {
     let mut d = 0usize;
     while d < tail.len() && d < 2 && tail[d].is_ascii_digit() {
         d += 1;
     }
-    let body = if d > 0
-        && d < tail.len()
-        && tail[d] == '.'
-        && (d + 1 == tail.len() || tail[d + 1].is_alphabetic())
-    {
+    if d > 0 && d < tail.len() && tail[d] == '.' && (d + 1 == tail.len() || tail[d + 1].is_alphabetic()) {
         &tail[d + 1..]
     } else {
         tail
-    };
-    if body.is_empty() {
-        return Some(("clipped-choice-row", flat.len())); // `❯ 2.` — 번호만 그려졌다
     }
+}
+
+fn clipped_choice_cursor(flat: &[char], label_flat: usize, tail_end: usize) -> Option<(&'static str, usize)> {
+    let end = tail_end.min(flat.len());
+    if label_flat >= end {
+        // 라벨 없음 = 빈 입력 프롬프트 · 또는 라벨이 **블록 경계 너머**다(커서 행 아래의 괘선·다른 요소를
+        // 라벨로 집은 경우 — 그것은 이 커서의 선택지가 아니다).
+        return None;
+    }
+    let tail = &flat[label_flat..end];
+    // 숫자만 남은 꼬리(`❯ 2`) — 렌더가 번호에서 멎었다.
+    if tail.len() <= 2 && tail.iter().all(|c| c.is_ascii_digit()) {
+        return Some(("clipped-choice-row", end));
+    }
+    let body = strip_choice_number(tail);
+    if body.is_empty() {
+        return Some(("clipped-choice-row", end)); // `❯ 2.` — 번호만 그려졌다
+    }
+    // ★완결 증거(리뷰 R1(R6회차) · codex "exempt positively recognized completed confirmation echoes"):
+    //   **화면 끝까지의** 꼬리가 완전 라벨로 시작하고 그보다 길면, 그 라벨은 이미 다 그려졌다(접힌 확인
+    //   에코). 블록 경계에서 잘려 보이는 것은 렌더가 멎은 것이 아니라 우리가 자른 것이므로 ⓔ 를 적용하지
+    //   않는다 — 2026-07-29 킬체인의 역방향 회귀를 여는 유일한 경로가 여기이므로 면제를 명시한다.
+    let full = strip_choice_number(&flat[label_flat..]);
+    let completed = MODAL_CHOICE_LABELS.iter().any(|label| {
+        let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
+        !lf.is_empty() && full.len() > lf.len() && full[..lf.len()] == lf[..]
+    });
     for label in MODAL_CHOICE_LABELS {
         let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
         if lf.is_empty() {
             continue;
         }
-        if body.len() < lf.len() && *body == lf[..body.len()] {
-            return Some(("clipped-choice-row", flat.len()));
+        if !completed && body.len() < lf.len() && *body == lf[..body.len()] {
+            return Some(("clipped-choice-row", end));
         }
         // 완전 라벨은 **꼬리 전량과 같을 때만** 센다(뒤에 다른 글자가 이어지면 아니다). `starts_with`
         // 로 넓히면 좁은 pane 에서 접힌 **확인 에코**(`❯ Yes, I trust this fol⏎der ✔⏎Welcome back`)의
@@ -883,7 +952,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
             sig.cursor_on_exit = true;
             sig.note("cursor-on-exit", fl + exit_flat.len());
         }
-        if let Some((kind, end)) = clipped_choice_cursor(&f.flat, fl) {
+        if let Some((kind, end)) = clipped_choice_cursor(&f.flat, fl, row.tail_end_flat) {
             sig.note(kind, end);
         }
     }
@@ -945,14 +1014,6 @@ pub fn modal_foreground(screen: &str, marker: Option<&str>) -> Option<ModalSigna
     } else {
         Some(sig)
     }
-}
-
-/// ★(0.14.31 · WP-5) 큐 배달 게이트가 공유하는 **대기 프롬프트 레이아웃** 술어 — 마커의 마지막 출현 줄이
-/// 빈 대기 프롬프트이고 그 아래 꼬리가 입력 상자·상태줄 레이아웃인가([`waiting_prompt_with_harmless_trailer`]).
-/// alt-screen 좌석에서 "커서행 마커 + 빈 입력줄" 만으로는 전체화면 프로그램의 우연한 `❯ ` 행과 composer 를
-/// 가르지 못한다 — 이 양성 증거가 있어야 배달 자격이다(codex 설계 검토 Q2).
-pub fn waiting_prompt_layout(screen: &str, marker: &str) -> bool {
-    waiting_prompt_with_harmless_trailer(screen, marker)
 }
 
 /// ★(0.14.31 · WP-5) 큐 배달 게이트가 공유하는 **번호 선택지 행** 술어([`is_numbered_item_row`]) — 커서행이
@@ -1050,13 +1111,23 @@ fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
 /// ★(0.14.31 · 리뷰 R5 · codex blocking) 같은 스캐너의 **엄격판** — 마커 줄 아래 꼬리가 **비어 있으면
 /// 거짓**이다(입력 상자 괘선·상태줄 같은 양성 증거를 요구한다).
 ///
-/// 【왜 두 판이 필요한가 — 비용 부호가 반대다】
-///   · 재주입 생애 창·큐 배달의 관대판(`empty_trailer_ok = true`)은 "모달이 역사인가" 를 묻는다.
-///     거기서 꼬리가 비었다는 것은 **모달 본문이 더 없다**는 뜻이라 창을 닫아도 안전하다.
-///   · 부트의 **관문 증거 이월**은 "지금 이 `❯` 가 composer 인가, 아직 라벨이 안 그려진 선택기인가" 를
-///     묻는다. 꼬리가 비어 있는 `❯ ` 는 **정확히 두 경우가 구별되지 않는 프레임**이므로, 거기서 참을
-///     주면 이월 장치가 통째로 무의미해진다(codex R5 의 그 반례).
+/// 【왜 두 판이 필요한가 — 묻는 것이 다르다】
+///   · 재주입 생애 창의 관대판(`empty_trailer_ok = true` · [`waiting_prompt_with_harmless_trailer`])은
+///     "모달이 **역사**인가" 를 묻는다. 거기서 꼬리가 비었다는 것은 **모달 본문이 더 없다**는 뜻이라
+///     창을 닫아도 안전하다.
+///   · "지금 이 `❯` 가 composer 인가, 아직 라벨이 안 그려진 선택기인가" 를 묻는 두 소비처는 **엄격판**을
+///     쓴다: 부트의 **관문 증거 이월**(`cys.rs::gate_carry_ok`)과 **큐 배달의 alt-screen 자격**
+///     (`cysd::governance::prompt_gate_input` 의 `layout_ok`). 꼬리가 비어 있는 `❯ ` 는 **정확히 두 경우가
+///     구별되지 않는 프레임**이므로, 거기서 참을 주면 두 장치가 통째로 무의미해진다.
+///   ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) 배달 게이트는 R5 에서 관대판을 쓰고 있었다 — vt100
+///     `Grid::write_contents` 가 후행 개행을 잘라 내므로 마커 행이 마지막 비공백 행이면 꼬리는 **항상**
+///     빈 벡터이고, 그러면 `layout_ok` 가 무조건 참이 되어 `prompt_gate_verdict` 문서가 약속한
+///     "레이아웃 양성 증거" 가 사실상 없었다(BLOCKED_ALT_SCREEN 이 나지 않았다).
 /// 스캐너는 하나이고 갈리는 것은 이 한 축뿐이다(판정 분리 금지).
+///   ★(리뷰 R6 · codex "영구 보류 반례") 꼬리가 빈 경우의 **예외 하나**: 마커 **위**에 상태줄 어휘가
+///     있으면 양성이다(2.1.241 레이아웃 — `? for shortcuts` 가 프롬프트 위 · 실측 `LIVE_TUI_AT_PROMPT`).
+///     그것이 없으면 그 좌석은 관문을 한 번 본 뒤 **채택 자체가 불가능**해져 디렉티브가 영영 주입되지
+///     않는다(치명위험 ③). 괘선은 위쪽에서도 증거가 아니다 — `────⏎❯ ` 가 정확히 그 위험 프레임이다.
 pub fn waiting_prompt_layout_positive(screen: &str, marker: &str) -> bool {
     waiting_prompt_trailer(screen, marker, false)
 }
@@ -1073,21 +1144,35 @@ fn waiting_prompt_trailer(screen: &str, marker: &str, empty_trailer_ok: bool) ->
     if !line[mi + marker.len()..].trim().is_empty() {
         return false; // 같은 줄에 문면 — 선택 커서 행이거나 사람이 치던 초안이다(둘 다 닫지 않는다).
     }
+    let has_status_token = |l: &str| -> bool {
+        let norm = first_run_gates::normalize(l).to_lowercase();
+        PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
+    };
     let trailer: Vec<&str> = lines[li + 1..]
         .iter()
         .copied()
         .filter(|l| !l.trim().is_empty())
         .collect();
     if trailer.is_empty() {
-        return empty_trailer_ok;
+        // ★(0.14.31 · 리뷰 R1(R6회차) · codex "영구 보류 반례") 엄격판이 **마커 아래**만 보면
+        //   2.1.241 레이아웃(`? for shortcuts` 가 프롬프트 **위** · 실측 검체 `LIVE_TUI_AT_PROMPT`)의
+        //   정상 composer 가 영구히 거짓이 된다 — 그 좌석은 관문을 한 번 본 뒤 **채택 자체가 불가능**
+        //   해지고(부트 이월·재부트 채택 둘 다), 그것이 곧 치명위험 ③(디렉티브 미주입)이다.
+        //   그래서 꼬리가 비었을 때는 **마커 위**의 상태줄 어휘를 양성 증거로 받는다. codex 가 든
+        //   위험 프레임(`────\n❯ ` — 라벨 미도색 선택기)은 상태줄 어휘가 없어 여전히 거짓이고,
+        //   괘선은 어느 쪽에서도 증거가 아니다(그 프레임이 정확히 반례이므로).
+        return empty_trailer_ok || lines[..li].iter().any(|l| has_status_token(l));
     }
-    if trailer.iter().any(|l| l.contains('❯') || is_numbered_item_row(l)) {
+    // ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) 선택 커서 배제는 리터럴 `❯` 하나로 고정돼 있었다 —
+    //   `prompt_marker` 가 `›`(codex)·`>`(gemini)인 어댑터에서는 꼬리의 선택기 행이 걸러지지 않았다.
+    //   **어댑터 마커도 함께** 본다(조여지는 방향 · claude 는 두 값이 같아 거동 불변).
+    if trailer
+        .iter()
+        .any(|l| l.contains('❯') || l.contains(marker) || is_numbered_item_row(l))
+    {
         return false;
     }
-    let has_token = trailer.iter().any(|l| {
-        let norm = first_run_gates::normalize(l).to_lowercase();
-        PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
-    });
+    let has_token = trailer.iter().copied().any(has_status_token);
     is_rule_line(trailer[0]) || has_token
 }
 
@@ -2283,12 +2368,203 @@ mod tests {
     fn r5_clipped_choice_cursor_number_and_empty_tail_boundaries() {
         for tail in ["2", "12", "2.", "12."] {
             let flat: Vec<char> = format!("❯{tail}").chars().collect();
-            assert_eq!(clipped_choice_cursor(&flat, 1), Some(("clipped-choice-row", flat.len())), "{tail}");
+            let n = flat.len();
+            assert_eq!(clipped_choice_cursor(&flat, 1, n), Some(("clipped-choice-row", n)), "{tail}");
         }
         for tail in ["", "123", "123.", "1.5hourslater", "2commandcompleted"] {
             let flat: Vec<char> = format!("❯{tail}").chars().collect();
-            assert_eq!(clipped_choice_cursor(&flat, 1), None, "{tail}");
+            let n = flat.len();
+            assert_eq!(clipped_choice_cursor(&flat, 1, n), None, "{tail}");
         }
+        // ★(0.14.31 · 리뷰 R1(R6회차)) 꼬리 끝(블록 경계)이 술어의 **입력**이다 — 경계 뒤 문면은
+        //   판정에 들어오지 않고(무관한 꼬리로 거부를 취소할 수 없다), 경계 앞이 비면 라벨이 없는
+        //   것과 같다(빈 composer). 반환 끝 좌표도 그 경계다(생애 창 축 ②의 재료).
+        // 좌표계는 **평탄화**다(공백 0) — 라벨도 그 공간에서 자른다.
+        let exit_flat = first_run_gates::flatten(MODAL_EXIT_LABEL);
+        let exit_cut: String = exit_flat.chars().take(exit_flat.chars().count() - 1).collect();
+        let flat: Vec<char> = format!("❯{exit_cut}────────").chars().collect();
+        let cut_end = 1 + exit_cut.chars().count();
+        assert_eq!(
+            clipped_choice_cursor(&flat, 1, cut_end),
+            Some(("clipped-choice-row", cut_end)),
+            "블록 경계 뒤의 괘선이 잘린 선택기 거부를 취소했다"
+        );
+        assert_eq!(clipped_choice_cursor(&flat, 1, flat.len()), None, "전제: R5 의 화면 끝 꼬리는 놓친다");
+        // 완결 증거 면제 — 경계로 잘려 보여도 화면 끝까지에서 라벨이 **완결**돼 있으면 잘림이 아니다.
+        let trust = first_run_gates::flatten(MODAL_CHOICE_LABELS[0]);
+        let full: Vec<char> = format!("❯{trust}✔Welcomeback").chars().collect();
+        let head = 1 + trust.chars().count() - 3;
+        assert_eq!(clipped_choice_cursor(&full, 1, head), None, "접힌 확인 에코가 관문으로 오탐됐다");
+    }
+
+    /// ★(0.14.31 · 리뷰 R6) codex(gpt-6-astra) 위임 산출 — **전행 검토 후 채택**.
+    ///   꼬리 경계 술어와 끝 좌표를 **직접** 잰다(소비 스캐너를 통하지 않으므로, 규칙이 사라진 것과
+    ///   소비부에서 가려진 것을 구분한다). CRLF 판본은 같은 flat 끝을 요구한다.
+    #[test]
+    fn r6_choice_tail_boundary_and_end_are_exact() {
+        let trust = MODAL_CHOICE_LABELS[0];
+        let split = trust.char_indices().rev().nth(2).expect("접을 라벨은 세 문자 이상이어야 한다").0;
+        let (head, rest) = trust.split_at(split);
+        let folded_tail = format!("{rest} ✔");
+        let partial_label = format!("  {}", trust.rsplit_once(' ').expect("라벨에 단어 경계가 필요하다").0);
+        let exit = MODAL_CHOICE_LABELS[2];
+        let cut_at = exit.char_indices().last().expect("종료 라벨은 비어 있지 않아야 한다").0;
+        let clipped = &exit[..cut_at];
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        let mut boundaries = vec![
+            ("빈 줄".to_string(), String::new()),
+            ("공백만 있는 줄".to_string(), " \t\r\u{2003}".to_string()),
+            ("괘선".to_string(), format!("  {rule}  ")),
+            ("번호 항목".to_string(), "  2. 다른 항목".to_string()),
+            ("번호만 있는 항목".to_string(), "12.".to_string()),
+            ("다른 선택 커서".to_string(), "  다음 ❯ 항목".to_string()),
+        ];
+        for token in PROMPT_TRAILER_TOKENS {
+            boundaries.push((format!("상태줄 {token}"), format!("  ? {}  ", token.to_uppercase())));
+            boundaries.push((
+                format!("정규화 상태줄 {token}"),
+                format!("  ? {}  ", token.to_uppercase().replace(' ', "\t  ")),
+            ));
+        }
+        for (name, line) in &boundaries {
+            assert!(is_choice_tail_boundary(line), "{name}: 경계 줄을 놓쳤다: {line:?}");
+        }
+        for line in [folded_tail.as_str(), partial_label.as_str(), "Welcome back", "  일반 출력 한 줄", "문장 속 ─ 기호"] {
+            assert!(!is_choice_tail_boundary(line), "평문 또는 접힌 라벨 조각을 경계로 오인했다: {line:?}");
+        }
+
+        // find는 바이트 위치이므로 반드시 문자 수로 변환한다. 한글 머리말과 ❯가 혼동을 드러낸다.
+        let check = |name: &str, screen: &str, end_byte: usize| {
+            let expected_prefix = &screen[..end_byte];
+            let expected_flat = expected_prefix.chars().filter(|c| !c.is_whitespace()).count();
+            let mut lf_flat = None;
+            for (render, text) in [("LF", screen.to_string()), ("CRLF", screen.replace('\n', "\r\n"))] {
+                let raw: Vec<char> = text.chars().collect();
+                let cursor = text.find('❯').map(|byte| text[..byte].chars().count()).unwrap_or(raw.len());
+                let mut rendered_prefix = if render == "CRLF" {
+                    expected_prefix.replace('\n', "\r\n")
+                } else {
+                    expected_prefix.to_string()
+                };
+                // 경계 직전 LF는 제외하지만 CRLF의 CR은 커서 블록 마지막 줄에 남는다.
+                if render == "CRLF" && screen[end_byte..].starts_with('\n') {
+                    rendered_prefix.push('\r');
+                }
+                let expected_end = rendered_prefix.chars().count();
+                let actual_end = choice_tail_end(&raw, cursor);
+                assert_eq!(actual_end, expected_end, "{name}/{render}: 원문 끝 인덱스가 틀렸다: {text:?}");
+                let actual_flat = raw[..actual_end].iter().filter(|c| !c.is_whitespace()).count();
+                assert_eq!(actual_flat, expected_flat, "{name}/{render}: 끝까지의 비공백 문자 수가 틀렸다");
+                if let Some(lf) = lf_flat {
+                    assert_eq!(actual_flat, lf, "{name}: LF와 CRLF의 flat 끝 위치가 다르다");
+                } else {
+                    lf_flat = Some(actual_flat);
+                }
+            }
+        };
+
+        for (name, boundary) in &boundaries {
+            // 커서 행은 무조건 포함하고 바로 다음 경계는 포함하지 않는다.
+            let row = format!("앞선 기록 한 줄\n  ❯ {clipped}");
+            let screen = format!("{row}\n{boundary}\n무관한 후속 출력");
+            let stop = screen[row.len()..].find('\n').expect("커서 행 다음 구분자가 필요하다") + row.len();
+            check(&format!("커서 행에서 종료/{name}"), &screen, stop);
+
+            // 접힌 완성 라벨과 체크 표시를 포함한 뒤에만 경계에서 멎어야 한다.
+            let block = format!("앞선 기록 한 줄\n  ❯ {head}\n{folded_tail}");
+            let screen = format!("{block}\n{boundary}\n무관한 후속 출력");
+            check(&format!("접힌 확인 에코/{name}"), &screen, block.len());
+        }
+
+        let screen = format!("기록\n❯ {clipped}\nWelcome back\n  일반 출력 한 줄\n{rule}\n후속 출력");
+        let stop = screen.find(&format!("\n{rule}")).expect("평문 뒤 괘선이 필요하다");
+        check("여러 평문 줄을 지나 경계 앞 종료", &screen, stop);
+        let screen = format!("기록\n❯ {head}\n{folded_tail}");
+        check("접힌 라벨이 개행 없이 화면 끝에 도달", &screen, screen.len());
+        let screen = format!("기록\n❯ {clipped}");
+        check("커서 행이 개행 없이 종료", &screen, screen.len());
+        let screen = format!("❯ {clipped}\n");
+        check("마지막 개행 다음 빈 줄", &screen, screen.find('\n').expect("마지막 개행이 필요하다"));
+        let screen = format!("❯ {rule}\nWelcome back");
+        check("커서 행 자체의 경계 형상은 중단하지 않음", &screen, screen.len());
+        let screen = "한글 기록\n❯";
+        check("커서가 화면 마지막 문자", screen, screen.len());
+        check("커서만 있는 화면", "❯", "❯".len());
+        check("빈 화면의 cursor=0", "", "".len());
+
+        let raw: Vec<char> = "한글 기록".chars().collect();
+        assert_eq!(choice_tail_end(&raw, raw.len()), raw.len(), "cursor가 원문 끝이면 원문 길이를 반환해야 한다");
+    }
+
+    /// ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) **꼬리에 이어지는 무관한 줄이 잘린 선택기 거부를
+    /// 취소하지 못한다.** R5 는 판정 재료를 "커서 뒤 화면 끝까지" 로 잡아 접힌 확인 에코 오탐은 막았지만,
+    /// 그 대가로 아래에 괘선 한 줄만 그려져도(`❯ No, exi` + `────`) 서명이 통째로 사라졌다 — 그 프레임에서
+    /// 준비 판정은 Ready{MarkerDelta} 였고 본문 + Return 이 **부분 렌더된 종료 선택지**로 나갔다.
+    /// 지금은 선택 행 블록까지만 보고([`choice_tail_end`]), 완결된 라벨만 면제한다.
+    #[test]
+    fn r6_trailing_rows_do_not_cancel_the_clipped_choice_veto() {
+        let gates = first_run_gates::builtin();
+        let exit_cut: String = MODAL_EXIT_LABEL.chars().take(7).collect();
+        // ⓐ codex 가 든 첫 프레임과 그 변주 — 경계 넷(괘선·빈 줄·번호 항목 행·다른 커서 행) 전부.
+        let below = [
+            ("괘선", "────────────────".to_string()),
+            ("빈 줄 + 본문", format!("\n  이어지는 출력 한 줄")),
+            ("번호 항목 행", "  2. 다른 항목".to_string()),
+            ("다른 커서 행", "❯ ".to_string()),
+            ("상태줄", " ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string()),
+        ];
+        for (name, tail) in &below {
+            let base = format!("❯ {exit_cut}\n{tail}\n");
+            for (render, screen) in [("raw", base.clone()), ("crlf", crlf(&base))] {
+                if first_run_gates::identify(&gates, &screen).is_some() {
+                    panic!("{name}/{render}: 전제 붕괴 — 코퍼스가 식별하면 미등재 모달 축을 재지 못한다");
+                }
+                let sig = modal_signature(&screen)
+                    .unwrap_or_else(|| panic!("{name}/{render}: 꼬리 한 줄에 거부가 취소됐다: {screen:?}"));
+                assert!(
+                    sig.kinds.contains(&"clipped-choice-row"),
+                    "{name}/{render}: 잘린 선택기 규칙이 아니라 다른 규칙이 잡았다(계측 무효): {:?}",
+                    sig.kinds
+                );
+                // 네 양성 증거 전부에서 보류다(증거 종류와 무관한 공통 거부).
+                let v = judge(&boot_all_open(&screen, &gates));
+                assert!(held_as(&v, MODAL_UNKNOWN_ID), "{name}/{render}: 보류가 아니다: {v:?}");
+                let mut delta = obs(&screen, &screen, &gates);
+                delta.agent_alive = Some(false);
+                assert!(held_as(&judge(&delta), MODAL_UNKNOWN_ID), "{name}/{render}: 마커 델타 경로");
+            }
+        }
+        // ⓑ 서명의 끝 좌표는 **블록 경계**다 — 화면 끝이 아니다. 스크롤백에 남은 잘린 선택기가
+        //    라이브 프롬프트 아래에서 영구 전경으로 읽히면 큐 배달이 상시 기아가 된다(생애 창 축 ②).
+        let live = fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        let history = format!("❯ {exit_cut}\n────────────────\n{live}");
+        let sig = modal_signature(&history).expect("스크롤백 잔상이 서명되지 않았다");
+        let flat_len = first_run_gates::flatten(&history).chars().count();
+        assert!(sig.flat_end < flat_len, "서명 끝이 화면 끝으로 고정돼 있다(역사 판정 불가)");
+        let mut reinject = obs(&history, "", &gates);
+        reinject.site = Site::Reinject;
+        reinject.marker = Some("❯");
+        reinject.tail_is_shell_prompt = None;
+        reinject.bare_shell = None;
+        reinject.idle_quiet = Some(true);
+        assert_eq!(
+            judge(&reinject),
+            Verdict::Ready { evidence: Evidence::MarkerTail },
+            "라이브 프롬프트 아래에 있는 **역사**가 재주입을 영구 보류시켰다(기아 방향 회귀)"
+        );
+        // 같은 문면이 **부트**에서는 보류다(부트 창은 상수 개방 — 관문 축과 같은 부호).
+        assert!(held_as(&judge(&boot_all_open(&history, &gates)), MODAL_UNKNOWN_ID));
+        // ⓒ 가용성 — 접힌 확인 에코는 아래에 무엇이 오든 모달이 아니다(2026-07-29 역방향 회귀).
+        let trust = MODAL_CHOICE_LABELS[0];
+        let head: String = trust.chars().take(21).collect();
+        let rest: String = trust.chars().skip(21).collect();
+        for tail in ["────────────────", "", "  2. 다른 항목"] {
+            let echo = format!("❯ {head}\n{rest} ✔\n{tail}\n");
+            assert_eq!(modal_signature(&echo), None, "접힌 확인 에코가 관문으로 오탐됐다: {echo:?}");
+        }
+        // ⓓ 받아들인 잔여(정직) — 꼬리에 **평문**이 곧바로 이어지는 잘린 선택기는 접힌 라벨과
+        //    구별되지 않으므로 여전히 열려 있다(경계가 아니면 이어 붙인다 · 노트 §15-3).
+        assert_eq!(modal_signature(&format!("❯ {exit_cut}\n  이어지는 출력\n")), None);
     }
 
     #[test]
@@ -2787,6 +3063,9 @@ mod tests {
     /// 범위의 정직: 이것은 PTY/ConPTY **전송층**의 유휴 거동이지 ink(claude 렌더러)의 유휴 거동이 아니다. ink 의
     /// 유휴 무재그림은 macOS 라이브 좌석 idle_secs 실측(602~6841s · 431~2595s)이 근거이고, "ink-on-Windows" 는
     /// 릴리스 게이트의 격리 config dir 라이브 부트 1회 계측 항목으로 남는다(노트 참조).
+    /// 유휴 계측 창(초) — 밸브 임계 `BOOT_VALVE_QUIET_SECS`(3.0)보다 길어야 한다(전제 단언).
+    const WINDOW_SECS: f64 = 4.0;
+
     #[test]
     fn pty_idle_shell_emits_no_bytes_within_valve_quiet_window() {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -2794,165 +3073,190 @@ mod tests {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
+        // ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) **부하 위양성 1회로 릴리스 게이트를 막지 않는다.**
+        //   이 검체는 windows-health.yml 의 차단 스텝(`if:`·continue-on-error 금지)에서 돌고 실 PTY 를
+        //   13s 동안 잰다 — 러너 부하가 높으면 정착 직후 지연 청크가 유휴 창에 도착해 적색이 될 수 있고,
+        //   같은 트리에서 다른 라이브 검체의 부하 위양성이 이미 실측됐다(노트 §14-8: 부하 126 → 55 fail,
+        //   단독 실행 PASS). 그래서 **측정을 최대 2회 시도**하고, 두 번 다 실패했을 때만 적색이다.
+        //   완화가 아니라 **측정의 신뢰도**를 올리는 것이다: 판정 기준(유휴 창 바이트 0)은 그대로이고,
+        //   실패한 시도의 실측값도 전부 로그로 남긴다(무엇이 왜 실패했는지 밖에서 보인다).
+        let probe = |attempt: usize| -> Result<(), String> {
         let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
-            .expect("openpty");
-        #[cfg(windows)]
-        let mut cmd = CommandBuilder::new("cmd.exe");
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = CommandBuilder::new("/bin/sh");
-            c.arg("-i");
-            c.env("PS1", "probe$ ");
-            c.env("ENV", ""); // 사용자 rc 파일 미판독(결정론 기동)
-            c
-        };
-        cmd.env("TERM", "xterm-256color");
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn shell in pty");
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().expect("pty reader");
-        let mut writer = pair.master.take_writer().expect("pty writer");
-        let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = tx.send(Err("EOF".into()));
-                        break;
-                    }
-                    Ok(n) => {
-                        if tx.send(Ok(buf[..n].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(format!("read error: {e}")));
-                        break;
-                    }
-                }
-            }
-        });
-        // DSR(`ESC[6n`) 응답 — 청크 경계 carry 3바이트(cysd reader 와 같은 규율). 답하지 않으면 ConPTY 펌프가
-        // 멈춰 "조용해 보이는" 가짜 정적이 된다.
-        let mut carry: Vec<u8> = Vec::new();
-        let mut answer_dsr = |chunk: &[u8], w: &mut Box<dyn Write + Send>| {
-            let mut joined = carry.clone();
-            joined.extend_from_slice(chunk);
-            let mut i = 0usize;
-            while i + 4 <= joined.len() {
-                if &joined[i..i + 4] == b"\x1b[6n" {
-                    let _ = w.write_all(b"\x1b[1;1R");
-                    i += 4;
-                } else {
-                    i += 1;
-                }
-            }
-            let _ = w.flush();
-            carry = joined[joined.len().saturating_sub(3)..].to_vec();
-        };
-        let settle = Duration::from_millis(1000);
-        let settle_cap = Duration::from_secs(12);
-        let window = Duration::from_millis(4000);
-        let outcome = (|| -> Result<(usize, usize, usize, Duration), String> {
-            // A — 정착.
-            let start = Instant::now();
-            let mut startup_bytes = 0usize;
-            let mut last_byte_at = Instant::now();
-            loop {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(chunk)) => {
-                        startup_bytes += chunk.len();
-                        last_byte_at = Instant::now();
-                        answer_dsr(&chunk, &mut writer);
-                    }
-                    Ok(Err(e)) => return Err(format!("기동 중 전송층 단절: {e}")),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if startup_bytes > 0 && last_byte_at.elapsed() >= settle {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
-                }
-                if start.elapsed() > settle_cap {
-                    return Err(format!(
-                        "셸이 {settle_cap:?} 안에 정착하지 않았다(기동 바이트 {startup_bytes}) — 유휴에도 계속 그린다"
-                    ));
-                }
-            }
-            // B — 유휴 창.
-            let t0 = Instant::now();
-            let mut idle_bytes = 0usize;
-            let mut idle_chunks = 0usize;
-            let mut max_gap = Duration::ZERO;
-            let mut last = t0;
-            while t0.elapsed() < window {
-                let remain = window.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
-                match rx.recv_timeout(remain) {
-                    Ok(Ok(chunk)) => {
-                        idle_bytes += chunk.len();
-                        idle_chunks += 1;
-                        let now = Instant::now();
-                        max_gap = max_gap.max(now - last);
-                        last = now;
-                        answer_dsr(&chunk, &mut writer);
-                    }
-                    Ok(Err(e)) => return Err(format!("유휴 창 중 전송층 단절: {e}")),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
-                }
-            }
-            max_gap = max_gap.max(Instant::now() - last);
-            if child.try_wait().map_err(|e| format!("try_wait: {e}"))?.is_some() {
-                return Err("셸이 유휴 창 중 종료됐다 — 정적이 아니라 사망이다".into());
-            }
-            // C — 전송층 생존 재증명(출력 토큰은 입력 에코와 다르게 조합된다).
+            let pair = pty
+                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .expect("openpty");
             #[cfg(windows)]
-            writer.write_all(b"echo PROBE_^OK\r\n").map_err(|e| e.to_string())?;
+            let mut cmd = CommandBuilder::new("cmd.exe");
             #[cfg(not(windows))]
-            writer.write_all(b"echo PROBE_\"OK\"\n").map_err(|e| e.to_string())?;
-            writer.flush().map_err(|e| e.to_string())?;
-            let t1 = Instant::now();
-            let mut seen: Vec<u8> = Vec::new();
-            loop {
-                match rx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Ok(chunk)) => {
-                        answer_dsr(&chunk, &mut writer);
-                        seen.extend_from_slice(&chunk);
-                        if String::from_utf8_lossy(&seen).contains("PROBE_OK") {
+            let mut cmd = {
+                let mut c = CommandBuilder::new("/bin/sh");
+                c.arg("-i");
+                c.env("PS1", "probe$ ");
+                c.env("ENV", ""); // 사용자 rc 파일 미판독(결정론 기동)
+                c
+            };
+            cmd.env("TERM", "xterm-256color");
+            let mut child = pair.slave.spawn_command(cmd).expect("spawn shell in pty");
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().expect("pty reader");
+            let mut writer = pair.master.take_writer().expect("pty writer");
+            let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            let _ = tx.send(Err("EOF".into()));
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!("read error: {e}")));
                             break;
                         }
                     }
-                    Ok(Err(e)) => return Err(format!("응답 대기 중 전송층 단절: {e}")),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
                 }
-                if t1.elapsed() > Duration::from_secs(8) {
-                    return Err(format!(
-                        "유휴 창 뒤 명령 응답이 8s 안에 없다 — 펌프 정지(가짜 정적) 의심 · 수신 {}B",
-                        seen.len()
-                    ));
+            });
+            // DSR(`ESC[6n`) 응답 — 청크 경계 carry 3바이트(cysd reader 와 같은 규율). 답하지 않으면 ConPTY 펌프가
+            // 멈춰 "조용해 보이는" 가짜 정적이 된다.
+            let mut carry: Vec<u8> = Vec::new();
+            let mut answer_dsr = |chunk: &[u8], w: &mut Box<dyn Write + Send>| {
+                let mut joined = carry.clone();
+                joined.extend_from_slice(chunk);
+                let mut i = 0usize;
+                while i + 4 <= joined.len() {
+                    if &joined[i..i + 4] == b"\x1b[6n" {
+                        let _ = w.write_all(b"\x1b[1;1R");
+                        i += 4;
+                    } else {
+                        i += 1;
+                    }
                 }
-            }
-            Ok((startup_bytes, idle_bytes, idle_chunks, max_gap))
-        })();
+                let _ = w.flush();
+                carry = joined[joined.len().saturating_sub(3)..].to_vec();
+            };
+            let settle = Duration::from_millis(1000);
+            let settle_cap = Duration::from_secs(12);
+            let window = Duration::from_millis((WINDOW_SECS * 1000.0) as u64);
+            let outcome = (|| -> Result<(usize, usize, usize, Duration), String> {
+                // A — 정착.
+                let start = Instant::now();
+                let mut startup_bytes = 0usize;
+                let mut last_byte_at = Instant::now();
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(Ok(chunk)) => {
+                            startup_bytes += chunk.len();
+                            last_byte_at = Instant::now();
+                            answer_dsr(&chunk, &mut writer);
+                        }
+                        Ok(Err(e)) => return Err(format!("기동 중 전송층 단절: {e}")),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if startup_bytes > 0 && last_byte_at.elapsed() >= settle {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                    }
+                    if start.elapsed() > settle_cap {
+                        return Err(format!(
+                            "셸이 {settle_cap:?} 안에 정착하지 않았다(기동 바이트 {startup_bytes}) — 유휴에도 계속 그린다"
+                        ));
+                    }
+                }
+                // B — 유휴 창.
+                let t0 = Instant::now();
+                let mut idle_bytes = 0usize;
+                let mut idle_chunks = 0usize;
+                let mut max_gap = Duration::ZERO;
+                let mut last = t0;
+                while t0.elapsed() < window {
+                    let remain = window.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
+                    match rx.recv_timeout(remain) {
+                        Ok(Ok(chunk)) => {
+                            idle_bytes += chunk.len();
+                            idle_chunks += 1;
+                            let now = Instant::now();
+                            max_gap = max_gap.max(now - last);
+                            last = now;
+                            answer_dsr(&chunk, &mut writer);
+                        }
+                        Ok(Err(e)) => return Err(format!("유휴 창 중 전송층 단절: {e}")),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                    }
+                }
+                max_gap = max_gap.max(Instant::now() - last);
+                if child.try_wait().map_err(|e| format!("try_wait: {e}"))?.is_some() {
+                    return Err("셸이 유휴 창 중 종료됐다 — 정적이 아니라 사망이다".into());
+                }
+                // C — 전송층 생존 재증명(출력 토큰은 입력 에코와 다르게 조합된다).
+                #[cfg(windows)]
+                writer.write_all(b"echo PROBE_^OK\r\n").map_err(|e| e.to_string())?;
+                #[cfg(not(windows))]
+                writer.write_all(b"echo PROBE_\"OK\"\n").map_err(|e| e.to_string())?;
+                writer.flush().map_err(|e| e.to_string())?;
+                let t1 = Instant::now();
+                let mut seen: Vec<u8> = Vec::new();
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(Ok(chunk)) => {
+                            answer_dsr(&chunk, &mut writer);
+                            seen.extend_from_slice(&chunk);
+                            if String::from_utf8_lossy(&seen).contains("PROBE_OK") {
+                                break;
+                            }
+                        }
+                        Ok(Err(e)) => return Err(format!("응답 대기 중 전송층 단절: {e}")),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return Err("reader 스레드 소실".into()),
+                    }
+                    if t1.elapsed() > Duration::from_secs(8) {
+                        return Err(format!(
+                            "유휴 창 뒤 명령 응답이 8s 안에 없다 — 펌프 정지(가짜 정적) 의심 · 수신 {}B",
+                            seen.len()
+                        ));
+                    }
+                }
+                Ok((startup_bytes, idle_bytes, idle_chunks, max_gap))
+            })();
         let _ = child.kill();
-        let (startup_bytes, idle_bytes, idle_chunks, max_gap) = outcome.expect("PTY 유휴 계측 실패");
+        let (startup_bytes, idle_bytes, idle_chunks, max_gap) = outcome?;
         eprintln!(
-            "[pty-idle-probe] os={} startup_bytes={startup_bytes} idle_window={:.1}s idle_bytes={idle_bytes} \
-             idle_chunks={idle_chunks} max_gap={:.2}s valve_quiet={BOOT_VALVE_QUIET_SECS}s",
+            "[pty-idle-probe] attempt={attempt} os={} startup_bytes={startup_bytes} idle_window={:.1}s \
+             idle_bytes={idle_bytes} idle_chunks={idle_chunks} max_gap={:.2}s valve_quiet={BOOT_VALVE_QUIET_SECS}s",
             std::env::consts::OS,
             window.as_secs_f64(),
             max_gap.as_secs_f64()
         );
-        assert!(startup_bytes > 0, "기동 바이트 0 — 펌프 생존이 증명되지 않았다");
-        assert_eq!(
-            idle_bytes, 0,
-            "유휴 PTY 가 {window:?} 동안 {idle_bytes}B({idle_chunks} 청크)를 냈다 — quiet_secs 가 밸브 창 \
-             {BOOT_VALVE_QUIET_SECS}s 에 도달하지 못한다(밸브 단독 경로 영구 보류)"
-        );
-        assert!(window.as_secs_f64() > BOOT_VALVE_QUIET_SECS, "검체 전제: 유휴 창이 밸브 임계보다 길다");
+        if startup_bytes == 0 {
+            return Err("기동 바이트 0 — 펌프 생존이 증명되지 않았다".to_string());
+        }
+        if idle_bytes != 0 {
+            return Err(format!(
+                "유휴 PTY 가 {window:?} 동안 {idle_bytes}B({idle_chunks} 청크)를 냈다 — quiet_secs 가 밸브 창 \
+                 {BOOT_VALVE_QUIET_SECS}s 에 도달하지 못한다(밸브 단독 경로 영구 보류)"
+            ));
+        }
+        Ok(())
+        };
+        assert!(WINDOW_SECS > BOOT_VALVE_QUIET_SECS, "검체 전제: 유휴 창이 밸브 임계보다 길다");
+        let attempts = 2usize;
+        let mut last = String::new();
+        for attempt in 1..=attempts {
+            match probe(attempt) {
+                Ok(()) => return,
+                Err(e) => {
+                    eprintln!("[pty-idle-probe] attempt={attempt}/{attempts} 실패 — {e}");
+                    last = e;
+                }
+            }
+        }
+        panic!("PTY 유휴 계측이 {attempts}회 연속 실패 — 마지막 사유: {last}");
     }
 
     /// ★H-WIN 검체 5종 — ConPTY 전사 형상으로 **파생**한 모달 화면(주장된 캡처가 아니라 변형이다:
