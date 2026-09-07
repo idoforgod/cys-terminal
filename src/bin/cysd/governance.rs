@@ -4334,11 +4334,21 @@ fn pop_delivered_ids(
 
 /// queued 배달의 '조용함' 임계(초) — 기본 3초. 출력이 잦은 pane(master 등)에는 큐가
 /// 오래 막힐 수 있어 환경별 조정을 허용한다(CYS_QUEUE_QUIET_SECS).
+///
+/// ★(0.14.31 · triage R1-WP1-HF · C-B2 값싼 절반) **하한 1초.** 종전에는 하한이 없어
+/// `CYS_QUEUE_QUIET_SECS=0` 이 "출력 중에도 배달" 을 뜻했고, 그러면 **완화 경로**(overdue ·
+/// `queue_overdue_quiet_secs().max(1)`)가 정상 경로보다 엄한 역전이 생긴다. '출력 중 주입 금지'
+/// 의미론은 운영자 강제로도 불변이라는 것이 그 자리의 결정이고(`force_deliver_entry` 의 성찰
+/// BLOCKER 주석 · 같은 값 1), 이 노브만 그 봉인 밖에 있을 이유가 없다. 노브는 **언제 배달할지**를
+/// 조정할 뿐 '출력이 멎었다' 라는 사실 자체를 없앨 수는 없다.
+/// (판정부 상수 [`cys::readiness::BOOT_VALVE_QUIET_SECS`]=3.0 은 별개 축이다 — 그것은 **레이아웃
+///  약한 증거**의 AND 항이고 노브에 의존하지 않는다 · A-M1.)
 fn queue_quiet_secs() -> u64 {
     std::env::var("CYS_QUEUE_QUIET_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3)
+        .max(1)
 }
 
 /// 큐 적체 경보 임계 — 배달 못 한 채 depth가 이 값 이상이면 `queue.depth_high` 이벤트
@@ -5025,12 +5035,22 @@ fn prompt_gate_input_with_approval(
         //   정적**과 AND 다 — 그 프레임들은 정상 composer 와 문자열이 같아 화면만으로 갈리지 않는다.
         //   alt 분기는 아래에서 `quiet_for >= quiet` 를 어차피 요구하므로 같은 조건의 선반영이고,
         //   이 축이 없으면 claude 문면이 없는 어댑터(codex)는 alt-screen 에서 영구 보류다.
+        // ★(0.14.31 · triage R1-WP1-HF · A-M1) **정적 판정은 배달 노브가 아니라 판정부 상수다.**
+        //   종전엔 `Some(obs.quiet_secs >= queue_quiet_secs())` 였다 — `CYS_QUEUE_QUIET_SECS=0`
+        //   이면 항상 `Some(true)` 라 약한 증거의 안전 AND 가 통째로 꺼졌고(출력이 지금 흐르는
+        //   프레임에 본문 + Return), 그 노브는 데몬 자신이 적체 경보 처방으로 권한다
+        //   (`alert_queue_depth_if_high` 의 `queue.depth_high` 힌트). 노브는 **언제 배달할지**를
+        //   조정할 뿐 **무엇을 증거로 볼지**를 바꿀 수 없어야 한다 — 그래서 부트 밸브·이월 가드
+        //   (`cys.rs::gate_carry_ok`)와 **같은 변환기**([`cys::readiness::idle_quiet_from`] ·
+        //   `BOOT_VALVE_QUIET_SECS` = 3.0 · CONTRACTS B-4)를 쓴다(판정 분리 금지). 배달 스케줄은
+        //   아래 `quiet_for`/`quiet` 가 종전대로 노브로 잰다 — 노브를 **올린** 운영자는 배달이
+        //   더 조여지고(하류 `quiet_for < quiet`), 판정 의미는 소비처 전체에서 하나로 남는다.
         layout_ok: alt_screen
             && cys::readiness::composer_layout_static_ok(
                 &obs.screen,
                 marker,
                 placeholder,
-                Some(obs.quiet_secs >= quiet),
+                cys::readiness::idle_quiet_from(Some(obs.quiet_secs as f64)),
             ),
         quiet_for: obs.quiet_secs,
         quiet,
@@ -11009,6 +11029,137 @@ mod tests {
         tick(&daemon);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "초안이 그려진 composer 에 배달했다");
         assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+    }
+
+    /// ★(triage R1-WP1-HF · codex major M3 **반증 대조군**) alt-screen 인계에도 승인 재확인이 있다.
+    ///
+    /// codex 는 "`ScreenRecheck` 를 프로덕션 호출부 둘이 **비-alt 화면에만** 만든다" 고 했다. HEAD
+    /// (`56c9133`)에서는 거짓이다 — `force_deliver_entry`(마커/무마커 두 분기)와 `deliver_queued`
+    /// (마커/무마커 두 분기)가 **무조건** `Some(recheck)` 를 넘기고, `handoff_gate_ok` 의 승인 재확인은
+    /// `match rc.marker` 보다 **앞**이라 alt·비-alt·세대 변화와 무관하게 돈다.
+    /// 이 검체는 그 사실을 alt-screen 좌석에서 **런타임으로** 확인한다(HEAD 에서 초록 = 반증).
+    #[test]
+    fn triage_r1wp1hf_alt_screen_handoff_rereads_approval_control() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("altapproval");
+        let (daemon, s) = wp5_seat("wp5-altapproval", "claude");
+        let idle = ["  이전 출력", "", RULE, "❯ ", RULE, STATUS1, STATUS2];
+        let refill = |tag: &str| {
+            let e = daemon.next_queue_entry(format!("[보고] {tag}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+            s.set_pending_input(0);
+            *s.last_queue_delivery_at.lock().unwrap() = None;
+        };
+        paint_screen(&s, &idle, 3, 2, true); // ★alt-screen
+        quiet_since(&s, 10);
+        let gen = s.output_gen.load(AtomicOrdering::Acquire);
+        let rc = |approval: bool| super::ScreenRecheck {
+            marker: Some("❯".to_string()),
+            placeholder: None,
+            gen_at_verdict: gen,
+            approval_pending: approval,
+        };
+        // ⓐ 대조 — 같은 프레임·같은 승인 상태면 alt 유휴 composer 는 배달된다(전제 성립).
+        refill("alt 유휴");
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), Some(&rc(false)))
+                .is_some(),
+            "전제 붕괴: alt 유휴 프레임이 애초에 배달 자격이 아니면 승인 축을 재지 못한다"
+        );
+        // ⓑ 본계약 — 세대가 그대로여도(alt 경로의 `expect_output_gen` 통과) 판정 시점 승인값과
+        //    지금 feed 가 다르면 배달하지 않는다.
+        refill("승인이 그 사이 떴다");
+        paint_screen(&s, &idle, 3, 2, true);
+        quiet_since(&s, 10);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        let gen2 = s.output_gen.load(AtomicOrdering::Acquire);
+        let rc2 = super::ScreenRecheck {
+            marker: Some("❯".to_string()),
+            placeholder: None,
+            gen_at_verdict: gen2,
+            approval_pending: true,
+        };
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen2), Some(&rc2))
+                .is_none(),
+            "alt-screen 인계가 승인·관문 feed 를 다시 읽지 않는다(codex M3 가 사실이라면 여기서 배달된다)"
+        );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부인데 항목이 사라졌다(유실)");
+    }
+
+    /// ★(triage R1-WP1-HF · claude major) **약한 레이아웃 증거의 '출력 정적' AND 가 운영 노브
+    /// `CYS_QUEUE_QUIET_SECS=0` 으로 통째로 무효가 된다** — 그 노브는 데몬 자신이 적체 경보의
+    /// 처방으로 권한다(`alert_queue_depth_if_high` 의 "임계 조정은 CYS_QUEUE_QUIET_SECS").
+    ///
+    /// `prompt_gate_input_with_approval` 은 약한 증거의 AND 항으로 판정부 상수
+    /// (`readiness::BOOT_VALVE_QUIET_SECS`)가 아니라 **큐 배달 임계**(`queue_quiet_secs()`)를 넘긴다:
+    ///   `Some(obs.quiet_secs >= quiet)` → `quiet == 0` 이면 항상 `Some(true)`.
+    /// 그러면 "재도색 중 프레임은 정적일 수 없다" 는 유일한 판별 사실이 사라지고, 라벨이 아직 안
+    /// 그려진 선택기(=플레이스홀더 잔여 셀)와 정상 유휴 composer 가 다시 구별되지 않는다.
+    /// 출력이 **지금 흐르는 중**(quiet_secs=0)인 codex alt-screen 프레임에 본문 + Return 이 나간다.
+    ///
+    /// 기대(조이는 방향): 노브는 **배달 스케줄**을 조정할 뿐 약한 증거의 안전 AND 를 끄지 못한다.
+    #[test]
+    fn triage_r1wp1hf_weak_layout_static_and_survives_the_queue_quiet_knob() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("quietknob");
+        // 운영자가 적체 처방대로 임계를 0 으로 낮췄다(데몬이 가리킨 그 손잡이).
+        let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "0")]);
+        let (daemon, s) = wp5_seat("wp5-quietknob", "codex");
+        let idle = [
+            "  이전 출력 한 줄",
+            "",
+            RULE,
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-6-astra medium · ~/dev/cys-t1/src",
+        ];
+        let e = daemon.next_queue_entry("[리뷰 의뢰] 출력 중".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        s.set_pending_input(0);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        paint_screen(&s, &idle, 4, 2, true);
+        quiet_since(&s, 0); // 출력이 방금 흘렀다 — 약한 증거는 이 프레임을 열 수 없어야 한다
+        tick(&daemon);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "노브 하나로 약한 증거의 정적 AND 가 꺼져 재도색 가능 프레임에 배달했다(사유: {})",
+            blocked_reason(&s)
+        );
+        assert_eq!(
+            blocked_reason(&s),
+            BLOCKED_ALT_SCREEN,
+            "사유가 레이아웃 미확인이 아니다 — 다른 축이 우연히 막은 것이면 이 검체는 무효다"
+        );
+    }
+
+    /// ★(0.14.31 · triage R1-WP1-HF · C-B2 값싼 절반) **배달 quiet 노브에는 하한 1초가 있다.**
+    ///
+    /// 완화 경로(overdue)는 이미 `queue_overdue_quiet_secs().max(1)` 로 '출력 중 주입 금지' 를 봉인해
+    /// 두었는데(`force_deliver_entry` 의 성찰 BLOCKER 주석), 정상 경로의 노브만 하한이 없어
+    /// `CYS_QUEUE_QUIET_SECS=0` 이 완화 경로보다 **더 느슨한** 역전을 만들었다. 노브는 언제 배달할지를
+    /// 조정할 뿐 '출력이 멎었다' 라는 사실 자체를 없앨 수 없다.
+    ///
+    /// 음성 대조(이 핀이 하한만 재는지): 1 이상은 그대로 통과한다 — 하한이 임계로 승격하면 적색이다.
+    #[test]
+    fn triage_r1wp1hf_queue_quiet_knob_cannot_go_below_one_second() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _k = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "0")]);
+            assert_eq!(
+                super::queue_quiet_secs(),
+                1,
+                "0 초 강제 주입 봉인이 정상 배달 경로에는 없다(완화 경로보다 느슨한 역전)"
+            );
+        }
+        for (v, want) in [("1", 1u64), ("3", 3), ("30", 30)] {
+            let _k = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", v)]);
+            assert_eq!(super::queue_quiet_secs(), want, "하한이 임계로 승격했다: {v}");
+        }
+        let _k = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "")]);
+        assert_eq!(super::queue_quiet_secs(), 3, "파싱 불가 값의 기본이 바뀌었다");
     }
 
     /// ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) **완결된(짝수→짝수) 화면 변화도 인계에서 걸린다.**
