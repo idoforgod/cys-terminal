@@ -45,6 +45,15 @@ SECTION_MARKER = "\n…(섹션 캡)"
 SECTION_CAPS = {"tasks": 700, "wakeups": 700, "delivery": 1800, "gate": 300}
 
 
+def _role_mod():
+    """javis_role import(역할 해소 단일 소유자 · 0.14.31 P6). 부재는 종전 env 판정으로 강등."""
+    try:
+        import javis_role
+        return javis_role
+    except Exception:
+        return None
+
+
 def _mission_mod():
     """javis_mission import(판독 규칙 단일 소유자). 부재는 관측 생략(graceful)."""
     try:
@@ -155,7 +164,23 @@ def is_master():
 
     env CYS_ROLE=="master" OR (surface id 비어있지 않고 임무 대장 레코드 surface 와 일치).
     surface 판독은 javis_mission._surface(신·구 env 통일 규약), 대장 판독은 read_ledger
-    재사용. 대장 부재·판독 불가 = 불통과(fail-quiet)."""
+    재사용. 대장 부재·판독 불가 = 불통과(fail-quiet).
+
+    ★0.14.31 P6 — 데몬 권위 선행(**단조 거부**): 데몬이 이 좌석의 역할을 **권위 있게 다른
+      역할로** 답하면 env 절도 대장 절도 보지 않고 즉시 불통과다. 종전에는 승계로 role 이 옮겨간
+      뒤에도 stale `CYS_ROLE=master` 하나로 스냅샷 생산이 계속됐고, 설령 그 절을 고쳐도
+      **대장 일치 절이 다시 master 를 허용**했다(codex R1 반례). 실패 방향은 '생산 skip(exit 0)' —
+      좌석 사망이 아니라 관측 1건의 보류다(§3-3).
+      판정 불가·주소 없음·'역할 없음' 은 종전 경로 그대로다(새 거부를 만들지 않는다)."""
+    _rm = _role_mod()
+    if _rm is not None:
+        try:
+            _role, _src = _rm.resolve_role_detail()
+            if _rm.is_authoritative(_src) and not _rm.is_authoritative_none(_src) \
+               and _role.strip().lower() != "master":
+                return False, "daemon role is not master"
+        except Exception:
+            pass          # 해소 실패는 이 게이트를 열지도 닫지도 않는다
     if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
         return True, "env CYS_ROLE=master"
     jm = _mission_mod()
@@ -468,12 +493,26 @@ def cmd_is_master(argv):
     return 0 if ok else 1
 
 
+_ST_SEAL = [None]
+
+
 def _st_env(extra=None):
-    """self-test 밀폐 env — ambient 역할·surface·레인·상태 경로를 전부 걷어낸다."""
+    """self-test 밀폐 env — ambient 역할·surface·레인·상태 경로를 전부 걷어낸다.
+
+    ★0.14.31 P6: `is_master()` 가 역할을 데몬에 묻게 됐다 — 하네스가 그대로면 **라이브 데몬**에
+      물어 비결정이 된다. `CYS_BIN` 을 없는 절대경로로(조회 판정 불가 → 종전 env 판정) ·
+      전용 `TMPDIR`(라이브 역할 캐시 차단). 단언은 바뀌지 않는다.
+    """
+    import tempfile as _tf
+    if _ST_SEAL[0] is None:
+        _ST_SEAL[0] = _tf.mkdtemp(prefix="snapshot-st-seal-")
     env = dict(os.environ)
-    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_MISSION",
+    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SURFACE_ID",
+              "CYS_SURFACE_ROLE", "CYS_MISSION",
               "CYS_SOCKET", "JAVIS_ROOT", "CYS_STATE_DIR"):
         env.pop(k, None)
+    env["CYS_BIN"] = os.path.join(_ST_SEAL[0], "cys-absent-in-test")
+    env["TMPDIR"] = _ST_SEAL[0]
     if extra:
         env.update(extra)
     return env

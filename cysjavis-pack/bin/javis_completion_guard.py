@@ -319,8 +319,31 @@ def _surface_id():
 
 
 def _role():
-    """emit agent 필드 — env 파생(CYS_ROLE·데몬 주입 — javis_bootstrap :502 관례)."""
-    return os.environ.get("CYS_ROLE") or ("surface:%s" % (_surface_id() or "unknown"))
+    """emit `agent` 귀속 라벨 — **데몬 권위 우선**, env 폴백(0.14.31 P6 · 감사 codex E).
+
+    종전에는 `CYS_ROLE` env 만 읽었다. 승계(claim-role·takeover) 뒤 그 env 는 낡은 채로 남으므로
+    이벤트가 **옛 신원으로 귀속**됐다(원장·라운드 판독이 그 라벨로 행위자를 센다).
+    해소는 `javis_role`(디스크 캐시 60s · 프로세스 메모 1회 · 실패 백오프 30s)이 하므로 이 훅의
+    한 런에서 데몬 왕복은 **최대 1회 · 최대 2초**다(Stop 자체 데드라인 50s 안에서 유계).
+
+    ★실패 방향: 해소가 어떤 이유로든 답을 못 주면 종전 순서(`CYS_ROLE` → `surface:<id>`)로
+      내려간다. **빈 라벨은 만들지 않는다** — 진단 식별자가 사라지면 이벤트가 누구 것인지
+      말할 수 없게 된다(codex R1). 예외는 여기서 삼킨다: 라벨 하나 때문에 Stop 판정이
+      fail-open 으로 끝나면 그것이 더 큰 손실이다.
+    """
+    _fallback = "surface:%s" % (_surface_id() or "unknown")
+    try:
+        import javis_role as _rm
+        role, src = _rm.resolve_role_detail()
+        if role:
+            return role
+        if _rm.is_authoritative_none(src):
+            # 데몬이 '역할 없음'을 확정했다 — 그 자리에 stale env 를 되살리면 이 함수가 고치려는
+            # 바로 그 오귀속이 남는다. 주소로 귀속한다(라벨은 비지 않는다).
+            return _fallback
+    except Exception:
+        pass
+    return os.environ.get("CYS_ROLE") or _fallback
 
 
 def _esc_n():

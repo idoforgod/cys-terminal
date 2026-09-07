@@ -51,11 +51,23 @@ def _assert_no_new(start):
     assert not new, "이 테스트에서 %d건 실패: %s" % (len(new), new)
 
 
+# ★0.14.31 P6 밀폐 보강: is_master() 가 역할을 **데몬에 묻는다**(javis_role). 하네스가 그대로면
+#   개발 기계의 **라이브 데몬**에 물어보게 되어 검체가 비결정이 된다(그리고 좌석 형상에 따라
+#   판정이 갈린다). 두 축을 함께 막는다 — ⓐ `CYS_BIN` 을 없는 절대경로로(= 조회 판정 불가 →
+#   종전 env 판정) ⓑ 전용 `TMPDIR`(= 라이브 역할 캐시가 폴백에 끼어들지 않게).
+#   단언은 한 줄도 바꾸지 않는다.
+_SEAL_TMP = tempfile.mkdtemp(prefix="snapshot-seal-")
+_ABSENT_CYS = os.path.join(_SEAL_TMP, "cys-absent-in-test")
+
+
 def run(args, extra=None):
     env = dict(os.environ)
-    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_MISSION",
+    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SURFACE_ID",
+              "CYS_SURFACE_ROLE", "CYS_MISSION",
               "CYS_SOCKET", "JAVIS_ROOT", "CYS_STATE_DIR"):
         env.pop(k, None)
+    env["CYS_BIN"] = _ABSENT_CYS
+    env["TMPDIR"] = _SEAL_TMP
     if extra:
         env.update(extra)
     r = subprocess.run([sys.executable, MOD] + args, capture_output=True, text=True,

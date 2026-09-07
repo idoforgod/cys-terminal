@@ -318,6 +318,176 @@ cys_lane_guard() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 9. 좌석 역할 해소 — 데몬 권위 (0.14.31 P6 · 감사 codex E)
+# ─────────────────────────────────────────────────────────────────────────────
+# 정본 §8: "`CYS_ROLE` env 를 권위로 쓰지 않는다(승계 후 stale). 데몬 조회 우선."
+# 승계(claim-role·takeover)는 데몬 roles 맵만 바꾸고 pane 의 env 는 **낡은 채로 남긴다** —
+# 그 env 로 내리는 결정은 옛 신원의 결정이다. 파이썬 짝은 `bin/javis_role.py` 이며
+# **같은 캐시 파일·같은 형식**(`"<epoch> <역할|->"` 1줄)을 공유한다(tests/test_role_authority.py 가 결박).
+#
+# ★`role-capability-gate.sh` 는 이 함수를 쓰지 않는다 — 그 훅은 **능력 게이트**라
+#   ⓐTTL 15s ⓑ'게이트 대상 캐시는 fast-path 아님' ⓒ후보가 갈리면 둘 다 적용(정책 교집합)
+#   이라는 **더 엄격한 캐시 권위 경계**를 의도적으로 갖는다(그 파일 :43-60 주석). 여기 60s
+#   일반 해소기로 갈아끼우면 그 경계가 조용히 헐거워진다. 두 해소기의 공존은 의도다.
+#
+# 계약(전 소비처 공통):
+#   ⓐ rc 항상 0 · stdout 무출력(프리루드 계약 ⓑ) · `set -u` 안전 · POSIX sh
+#   ⓑ 산출은 변수 두 개: `CYS_RESOLVED_ROLE`(역할 또는 빈 문자열) ·
+#      `CYS_RESOLVED_ROLE_SOURCE` ∈ daemon|daemon-none|cache|cache-none|env-cys-role|none
+#      (앞의 넷이 **권위 있는 답** · 뒤의 둘은 판정 불가 후의 현행 env 판정)
+#   ⓒ **판정 불가(ⓒ상)와 권위 있는 무역할(ⓑ상)은 다른 사실이다** — 소비처가 source 로 가른다.
+#      `cys surface-role`(src/bin/cys.rs:10940)이 rc 0=사실 / rc≠0=판정 불가로 이미 갈라 둔다.
+CYS_ROLE_CACHE_TTL="${CYS_ROLE_CACHE_TTL:-60}"        # 초 · 승계 반영 지연 상한(명시적 수용)
+CYS_ROLE_QUERY_BACKOFF="${CYS_ROLE_QUERY_BACKOFF:-30}" # 초 · 조회 실패 후 재조회 유예
+CYS_ROLE_QUERY_TIMEOUT="${CYS_ROLE_QUERY_TIMEOUT:-2}"  # 초 · 자식 데드라인(cys_timeout_run)
+
+cys_role_slug() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || printf 'x'; }
+
+# 첫 줄 · CR 제거 · 64자 상한. 여러 줄 env(`CYS_ROLE=$'cso\n# 지시: …'`)가 판정·라벨을
+# 부풀리는 길을 닫는다(inject-context.sh:240 과 같은 규율).
+# ★강등 방향(정직 기록): `head`/`tr`/`cut` 이 PATH 에 없는 훅 하네스에서는 이 함수가 빈 값을
+#   낸다 → 신원도 env 폴백도 비어 `source=none` 이 되고, 유일한 소비처(`cys-dept`)는 그때
+#   **종전 env 판정만** 쓴다(그 판정은 이 함수를 거치지 않는 raw `$CYS_ROLE` 비교다). 즉
+#   coreutils 부재의 귀결은 회귀가 아니라 '이 WP 이전 상태'다 — 새 거부도 새 허용도 없다.
+cys_role_line() {
+  printf '%s' "${1:-}" | head -n1 2>/dev/null | tr -d '\r' 2>/dev/null | cut -c1-64 2>/dev/null
+  return 0
+}
+
+# 캐시 파일 경로(파이썬 짝과 동일 규칙). surface 는 **정규화된 숫자부**를 쓴다
+# (Rust `parse_surface_ref` src/lib.rs:2263 = "surface:31"|"31").
+# 소켓 키 — Rust `env_compat`(src/lib.rs:379)와 같은 우선순위 CYS_ → JAVIS_ → AITERM_.
+cys_role_socket_key() {
+  printf '%s' "${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOCKET:-}}}"
+  return 0
+}
+
+# ★boot-epoch 는 **권위가 아니라 캐시 키의 소금**이다(codex R1 · 과장 금지): Windows 의
+#   named pipe 는 dirname 이 상태 디렉터리가 아니고, 감독자 비활성·쓰기 실패면 파일이 없다.
+#   그때는 무효화가 TTL 하나만 남는다 — 파이썬 짝도 **같은 규칙**을 써서 두 층이 같은 키를 만든다.
+cys_role_cache_path() {
+  _cys_rr_sock="$(cys_role_socket_key)"
+  _cys_rr_ep=""
+  if [ -n "$_cys_rr_sock" ]; then
+    _cys_rr_epf="$(dirname "$_cys_rr_sock" 2>/dev/null)/boot-epoch"
+    [ -f "$_cys_rr_epf" ] && _cys_rr_ep="$(head -n1 "$_cys_rr_epf" 2>/dev/null | tr -d '\r')"
+  fi
+  printf '%s/cys-role-authority-%s-%s-%s' "${TMPDIR:-/tmp}" \
+    "$(cys_role_slug "${1:-none}")" \
+    "$(cys_role_slug "${_cys_rr_sock:-none}")" \
+    "$(cys_role_slug "$_cys_rr_ep")"
+  return 0
+}
+
+# `<epoch> <값>` 1줄 · 0600 · 같은 디렉터리 원자 교체. 실패는 무시(캐시는 최적화지 사실이 아니다).
+cys_role_cache_write() {
+  _cys_rr_tmp="$1.$$"
+  ( umask 077; printf '%s %s\n' "$2" "$3" > "$_cys_rr_tmp" ) 2>/dev/null || {
+    rm -f "$_cys_rr_tmp" 2>/dev/null; return 0; }
+  mv -f "$_cys_rr_tmp" "$1" 2>/dev/null || rm -f "$_cys_rr_tmp" 2>/dev/null
+  return 0
+}
+
+# 정규 파일·비심링크·소유자 자신일 때만 판독 대상. 못 재면 **신뢰하지 않는다**.
+# (Windows Git Bash 의 `-O` 는 대개 참을 낸다 — TMPDIR 이 사용자별이라는 OS 계약에 기댄다.)
+cys_role_cache_ts() {
+  [ -f "${1:-}" ] && [ ! -L "$1" ] && [ -O "$1" ] || return 1
+  _cys_rr_l="$(head -n1 "$1" 2>/dev/null | tr -d '\r')"
+  _cys_rr_ts="${_cys_rr_l%% *}"
+  [ "$_cys_rr_ts" = "$_cys_rr_l" ] && return 1          # 구형·손상 형식(공백 없음)은 무시
+  case "$_cys_rr_ts" in ''|*[!0-9]*) return 1 ;; esac
+  CYS_ROLE_CACHE_TS="$_cys_rr_ts"
+  CYS_ROLE_CACHE_VAL="${_cys_rr_l#* }"
+  return 0
+}
+
+# ★폴백은 `CYS_ROLE` **하나뿐**이다(codex R1): `CYS_SURFACE_ROLE` 은
+#   `role-capability-gate.sh` 가 해소 결과로 export 하는 **산출물**이지 신원 입력이 아니다.
+#   일반 폴백에 넣으면 `CYS_SURFACE_ROLE=cso` + `CYS_ROLE=worker` 에서 **현행이 거부하던 것을
+#   새로 허용**하게 된다 — "판정 불가면 현행 그대로"라는 약속이 거짓이 된다. 두 키를 함께 보는
+#   소비처(`inject-context.sh`)는 자기 계약으로 직접 본다.
+cys_role_env_fallback() {
+  _cys_rr_v="$(cys_role_line "${CYS_ROLE:-}")"
+  if [ -n "$_cys_rr_v" ]; then
+    CYS_RESOLVED_ROLE="$_cys_rr_v"; CYS_RESOLVED_ROLE_SOURCE="env-cys-role"; return 0
+  fi
+  CYS_RESOLVED_ROLE=""; CYS_RESOLVED_ROLE_SOURCE="none"
+  return 0
+}
+
+cys_resolve_role() {
+  CYS_RESOLVED_ROLE=""
+  CYS_RESOLVED_ROLE_SOURCE="none"
+  # ★신원 전제: 숫자 surface id 가 없으면 데몬에게 '나'를 물을 수 없다. 그때 Rust 는
+  #   rc 0 + 빈 줄을 내는데, 그것을 '권위 있는 무역할'로 채택하면 **주소가 없다는 사실이
+  #   역할이 없다는 판정으로 승격**된다(정상 위임 경로·하네스가 죽는다). 조회 자체를 안 한다.
+  #   신원 키 순서는 Rust `env_compat`(src/lib.rs:351) 그대로 CYS_ → JAVIS_ → AITERM_ 다 —
+  #   갈리면 "내가 검사한 신원 ≠ CLI 가 조회한 신원"이 된다.
+  _cys_rr_sid="$(cys_role_line "${CYS_SURFACE_ID:-${JAVIS_SURFACE_ID:-${AITERM_SURFACE_ID:-}}}")"
+  _cys_rr_sid="${_cys_rr_sid#surface:}"
+  case "$_cys_rr_sid" in ''|*[!0-9]*) cys_role_env_fallback; return 0 ;; esac
+  # 자릿수 상한 19 — u64 범위를 넘는 숫자는 Rust 가 파싱에 실패해 '주소 없음'으로 간다.
+  # 19 는 어떤 값이든 u64 최대 미만이라 오수락이 없고, **파이썬 짝과 글자 그대로 같은 규칙**이다
+  # (POSIX sh 에는 bignum 이 없어 값 비교로는 두 층의 판정이 갈린다).
+  [ "${#_cys_rr_sid}" -gt 19 ] && { cys_role_env_fallback; return 0; }
+
+  _cys_rr_now="$(date +%s 2>/dev/null || printf '0')"
+  case "$_cys_rr_now" in ''|*[!0-9]*) _cys_rr_now=0 ;; esac
+  _cys_rr_cache="$(cys_role_cache_path "$_cys_rr_sid")"
+
+  # ① 신선 캐시 — 미래 시각(시계 역행)은 신선이 아니다(그러면 캐시가 무기한 유효해진다).
+  CYS_ROLE_CACHE_TS=""; CYS_ROLE_CACHE_VAL=""
+  if cys_role_cache_ts "$_cys_rr_cache" && [ "$_cys_rr_now" -gt 0 ] \
+     && [ "$CYS_ROLE_CACHE_TS" -le "$_cys_rr_now" ] \
+     && [ $(( _cys_rr_now - CYS_ROLE_CACHE_TS )) -lt "$CYS_ROLE_CACHE_TTL" ]; then
+    if [ "$CYS_ROLE_CACHE_VAL" = "-" ]; then
+      CYS_RESOLVED_ROLE=""; CYS_RESOLVED_ROLE_SOURCE="cache-none"; return 0
+    fi
+    if [ -n "$CYS_ROLE_CACHE_VAL" ]; then
+      CYS_RESOLVED_ROLE="$CYS_ROLE_CACHE_VAL"; CYS_RESOLVED_ROLE_SOURCE="cache"; return 0
+    fi
+  fi
+
+  # ② 데몬 조회 — 실패 백오프 창 안이면 곧장 폴백(데몬 사망 시 매 호출 2s 정지가 전 pane 에
+  #    걸리는 것이 봉인표 ④ 방향이다).
+  _cys_rr_fail="$_cys_rr_cache.fail"
+  _cys_rr_skip=0
+  CYS_ROLE_CACHE_TS=""
+  if cys_role_cache_ts "$_cys_rr_fail" && [ "$_cys_rr_now" -gt 0 ] \
+     && [ "$CYS_ROLE_CACHE_TS" -le "$_cys_rr_now" ] \
+     && [ $(( _cys_rr_now - CYS_ROLE_CACHE_TS )) -lt "$CYS_ROLE_QUERY_BACKOFF" ]; then
+    _cys_rr_skip=1
+  fi
+  if [ "$_cys_rr_skip" = "0" ] && command -v "${CYS_BIN:-cys}" >/dev/null 2>&1; then
+    # ★`CYS_NO_AUTOSTART=1`: 소켓이 없으면 `cys` 는 autostart 경로를 탄다(src/bin/cys.rs:2258).
+    #   **역할을 묻는 행위가 데몬을 낳아서는 안 된다** — 특히 `cys-dept` 가드는 데몬이 아직
+    #   없을 때 도는 경로다.
+    #   (★함수 앞 `VAR=1 func` 은 셸마다 '호출 후에도 남는가/자식에게 export 되는가'가 갈린다 —
+    #    서브셸 안에서 **명시적으로 export** 해 두 모호성을 한꺼번에 없앤다.)
+    _cys_rr_out="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+                    cys_timeout_run "$CYS_ROLE_QUERY_TIMEOUT" \
+                      "${CYS_BIN:-cys}" surface-role 2>/dev/null )"
+    _cys_rr_rc=$?
+    _cys_rr_role="$(cys_role_line "$_cys_rr_out")"
+    if [ "$_cys_rr_rc" -eq 0 ]; then
+      if [ -n "$_cys_rr_role" ]; then
+        cys_role_cache_write "$_cys_rr_cache" "$_cys_rr_now" "$_cys_rr_role"
+        rm -f "$_cys_rr_fail" 2>/dev/null || :
+        CYS_RESOLVED_ROLE="$_cys_rr_role"; CYS_RESOLVED_ROLE_SOURCE="daemon"; return 0
+      fi
+      # 권위 있는 '역할 없음' — 옛 역할 캐시를 덮는다.
+      cys_role_cache_write "$_cys_rr_cache" "$_cys_rr_now" "-"
+      rm -f "$_cys_rr_fail" 2>/dev/null || :
+      CYS_RESOLVED_ROLE=""; CYS_RESOLVED_ROLE_SOURCE="daemon-none"; return 0
+    fi
+    cys_role_cache_write "$_cys_rr_fail" "$_cys_rr_now" "-"
+  fi
+  # ③ 판정 불가 — 낡은 캐시는 쓰지 않는다(옛 역할이 무기한 사는 길). env 폴백 = 현행 동작.
+  cys_role_env_fallback
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :

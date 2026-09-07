@@ -1176,19 +1176,75 @@ case "$cmd" in --help|-h) usage; exit 0 ;; esac
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
 # 거버넌스 영역이나, 정상 다중 노드 churn은 차단). 읽기 전용(list/sock/<name> --)은 무제한.
+# ★0.14.31 P6(감사 codex E) — 위 env 판정에 **데몬 권위 거부 1절을 덧댄다**(정본 §8:
+#   "`CYS_ROLE` env 를 권위로 쓰지 않는다 — 승계 후 stale"). 합성은 **단조 거부**다:
+#   종전이 막던 것은 그대로 막고, 종전이 허용하던 것 중 **데몬이 아니라고 말하는 것만** 더 막는다.
+#   새 허용 경로는 만들지 않는다 — 여기서 새로 허용하면 상위 `javis_org.destroy_dept` 가 통과한 뒤
+#   이 프리미티브가 거부하는(또는 그 반대) 어긋남이 늘고, 그 어긋남의 귀결이 **살아 있는 부서의
+#   팩·작업 폴더 격리**라는 반파괴다(javis_org.py:511-524 는 down 실패에도 격리를 계속한다).
+# 판정은 `hooks/_lib.sh` 의 `cys_resolve_role`(팩 단일 소유 · 파이썬 짝 `bin/javis_role.py` 와
+#   같은 캐시·같은 규칙)에 위임한다. 다만 이 도구는 **프리루드를 자기 셸에 들이지 않는다** —
+#   `_lib.sh` 는 로드 시 `CYS_STATE_DIR`·`CYS_PY`·로케일을 export 하고 마지막에 레인 가드가
+#   `exit 0` 까지 할 수 있는데, 이 셸은 그 env 를 **자식 cysd·claude 에 그대로 상속**시키는
+#   자리라 한 줄의 오염이 부서 상태 경로를 갈아치운다(codex R1). 그래서 서브셸 안에서만 로드하고
+#   결과 두 낱말만 stdout 으로 회수한다.
+cysd_resolved_role() {   # stdout: "<역할>\t<출처>" · 실패해도 항상 rc 0 · 빈 줄이면 판정 없음
+  _cdrr_lib="${CYS_PACK_DIR:-$PACK_DEFAULT}/hooks/_lib.sh"
+  [ -f "$_cdrr_lib" ] || { printf '\t\n'; return 0; }
+  (
+    set +e +u
+    set +o pipefail 2>/dev/null || :
+    . "$_cdrr_lib" >/dev/null 2>&1 || exit 0
+    # ★source 성공 ≠ 함수 존재: `CYS_LIB_SH_LOADED` 를 물려받았거나 구 팩의 프리루드면
+    #   파일은 읽히고도 이 함수가 없다(codex R1). 있을 때만 부른다.
+    command -v cys_resolve_role >/dev/null 2>&1 || exit 0
+    cys_resolve_role >/dev/null 2>&1 || :
+    printf '%s\t%s\n' "${CYS_RESOLVED_ROLE:-}" "${CYS_RESOLVED_ROLE_SOURCE:-}"
+  ) 2>/dev/null
+  return 0
+}
+
+cysd_role_gate() {   # $1=안내 문구 접두. 데몬이 권위 있게 '비-cso' 라고 말할 때만 exit 7.
+  # ★rotate 재귀 재기동(CYS_DEPT_ROTATE=1)은 면제한다: 그 시점은 이미 데몬을 죽인 뒤라
+  #   여기서 거절하면 '데몬은 죽고 등재만 남는' 반파괴가 된다 — 이 파일이 validate_dept_name 을
+  #   kill **이전**에 두는 것과 같은 규율(:1197 주석). 판정 주체도 rotate 진입부와 동일하다.
+  [ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0
+  _cdrg_out="$(cysd_resolved_role)" || _cdrg_out=""
+  # `$( )` 가 말미 개행을 이미 지운다 — 남는 것은 "<역할>\t<출처>" 한 줄뿐이다.
+  _cdrg_role="${_cdrg_out%%	*}"
+  _cdrg_src="${_cdrg_out#*	}"
+  case "$_cdrg_src" in
+    daemon|cache)
+      [ "$_cdrg_role" = "cso" ] && return 0
+      echo "[cys-dept] ★단일소유 강제: $1 — 데몬 권위 역할=$_cdrg_role (env 가 아니라 데몬이 신원의 정본이다·plan §8). CSO에 요청하라." >&2
+      exit 7 ;;
+    daemon-none|cache-none)
+      # 여기까지 왔다 = 위 env 절을 통과했다 = env 가 비었거나 cso 다. env 가 비었으면
+      # GUI·오너 직접 실행(종전 면제 그대로)이고, env 가 cso 인데 데몬이 '역할 없음'이라고
+      # 답했으면 그 cso 주장은 stale 이다 — 그때만 막는다.
+      [ -z "${CYS_ROLE:-}" ] && return 0
+      echo "[cys-dept] ★단일소유 강제: $1 — 데몬이 이 좌석의 역할을 모른다(CYS_ROLE=$CYS_ROLE 는 stale). \`cys claim-role cso\` 로 역할을 되찾은 뒤 재시도하라." >&2
+      exit 7 ;;
+    *) return 0 ;;   # 판정 불가·주소 없음·프리루드 부재 → 종전 env 판정만(회귀 0)
+  esac
+}
+
 case "$cmd" in
   launch|allocate|create|down|down-sock|rotate|reap|promote-ceo)
     if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       echo "[cys-dept] ★단일소유 강제: 부서 lifecycle mutation은 CSO/GUI 전용(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
       exit 7
-    fi ;;
+    fi
+    cysd_role_gate "부서 lifecycle mutation은 CSO/GUI 전용" ;;
   promote-if-pending)
     # --request-only는 무변조(조건 확인+알림 재발행뿐)라 가드 면제 — 부트 스크립트 ⑦(master 세션)이
     # 호출한다. 대기형(실제 승격)은 여타 mutation과 동일하게 CSO/GUI 전용.
     if [ "${2:-}" != "--request-only" ] && [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       echo "[cys-dept] ★단일소유 강제: promote-if-pending(대기형)은 CSO/GUI 전용 — master 세션은 --request-only만 허용." >&2
       exit 7
-    fi ;;
+    fi
+    [ "${2:-}" != "--request-only" ] && cysd_role_gate "promote-if-pending(대기형)은 CSO/GUI 전용"
+    : ;;
 esac
 case "$cmd" in
   launch)

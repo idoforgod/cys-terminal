@@ -22,6 +22,20 @@ except ImportError:  # Windows
         except OSError:
             pass
 
+# ★형제 모듈 경로 가드(tests/test_import_guard.py 계약 · 선례 javis_bootstrap.py:127):
+#   Windows 번들 파이썬(embeddable)은 스크립트 폴더를 sys.path 에 넣지 않는다.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# 역할 해소 단일 소유(0.14.31 P6). import 실패는 이 도구를 죽이지 않는다 — 구 팩·부서 팩에
+# 아직 이 모듈이 없을 수 있고(`build.rs` 는 git 추적 파일만 임베드), 그때는 **종전 env 판정**만
+# 남는다(강등의 방향이 '더 허용'이 아니라 '현행 유지'라는 것이 이 배선의 요점이다).
+try:
+    import javis_role as _role_mod
+except Exception:
+    _role_mod = None
+
 HOME = os.path.expanduser("~")
 CATALOG = os.environ.get("CYS_DEPT_CATALOG", f"{HOME}/.cys/dept-catalog.json")
 DEPTS = os.environ.get("CYS_DEPTS_JSON", f"{HOME}/.cys/depts.json")
@@ -43,8 +57,32 @@ def sha256_file(path):
     with open(path, "rb") as f: return hashlib.sha256(f.read()).hexdigest()
 
 def require_cso():
-    if os.environ.get("CYS_ROLE") != "cso":
-        sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). CSO에 위임하라.\n")
+    """부서 mutation 단일소유 게이트 — **단조 거부**(monotone deny) 합성(0.14.31 P6).
+
+    ★왜 '데몬 답으로 갈아끼우기'가 아니라 '거부만 추가'인가(codex R1 적대 검토 반영):
+      이 함수가 허용한 뒤 하위 프리미티브 `cys-dept down` 이 **자기 env 판정으로 거부**하면,
+      `destroy_dept` 는 그 실패를 삼키지 않으면서도 pack/workdir 격리는 best-effort 로
+      **계속 진행한다**(:511-524). 즉 '부모 허용 + 자식 거부' = 살아 있는 부서의 팩·작업 폴더가
+      이동되는 **반파괴(half-op)** 다. 그래서 이 층은 종전보다 **더 허용하지 않는다**:
+        ⓐ 데몬이 권위 있게 비-cso 역할을 말하면 → 거부(승계 후 stale env 로 mutation 하던 길을 닫는다)
+        ⓑ 데몬이 권위 있게 '역할 없음'을 말하는데 env 가 역할을 주장하면 → 거부(같은 이유)
+        ⓒ 판정 불가·주소 없음 → **종전 그대로** `CYS_ROLE == "cso"` 만 본다
+      새 허용 경로가 없으므로 '부모 허용 + 자식 거부' 조합은 이 변경으로 늘지 않는다.
+    """
+    why = ""
+    if _role_mod is not None:
+        try:
+            role, src = _role_mod.resolve_role_detail()
+            if _role_mod.is_authoritative_none(src):
+                if (os.environ.get("CYS_ROLE") or "").strip():
+                    why = ("데몬이 이 좌석에 역할이 없다고 답했다(env CYS_ROLE=%s 는 stale). "
+                           % (os.environ.get("CYS_ROLE") or "").strip()[:32])
+            elif _role_mod.is_authoritative(src) and role != "cso":
+                why = "데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). " % role[:32]
+        except Exception:
+            why = ""      # 해소 실패가 이 게이트를 **열지도 닫지도** 않는다 — 아래 종전 판정으로.
+    if why or os.environ.get("CYS_ROLE") != "cso":
+        sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). %sCSO에 위임하라.\n" % why)
         sys.exit(3)
 
 def v_schema(m):
