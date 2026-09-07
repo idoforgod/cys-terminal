@@ -523,6 +523,10 @@ pub const PROMPT_TRAILER_TOKENS: [&str; 3] = ["for shortcuts", "bypass permissio
 /// 괘선 줄로 인정하는 박스 문자(U+2500..=U+259F) **연속 길이** 하한 — cys.rs `TUI_FRAME_RUN_MIN`(맨 셸 술어의
 /// 프레임 자)과 같은 값이어야 한다(파리티 핀 `prompt_trailer_rule_run_matches_tui_frame_run_min` · cys.rs 테스트).
 pub const PROMPT_TRAILER_RULE_MIN_RUN: usize = 8;
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) 꼬리가 빈 분기에서 상태줄을 **이 composer 의 것**으로
+/// 인정하는 최대 거리(행). 실측 2.1.241 레이아웃은 2행(`? for shortcuts` → `…43% context left` → `❯ `)이고,
+/// 사용자 statusLine 한 줄이 더 낄 수 있어 여유를 둔다. 그보다 멀면 스크롤백의 역사로 본다(조여지는 방향).
+pub const PROMPT_STATUS_ABOVE_MAX_ROWS: usize = 4;
 
 /// 모달 서명의 관측 결과. 판정 재료는 "있는가" 하나이고 나머지는 진단·생애 창 재료다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,6 +611,10 @@ struct CursorRow {
     /// 커서 행부터 시작해 다음 줄이 [`is_choice_tail_boundary`](빈 줄 · 괘선 · 번호 항목 행 · 다른 선택
     /// 커서 행)가 아닌 동안 이어붙인다 — 즉 **줄바꿈 접힘은 흡수하고, 무관한 아래 문면은 자른다**.
     tail_end_flat: usize,
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B1) 라벨이 시작하는 **물리 행**의 끝(평탄화).
+    /// 잘린 렌더의 판정 재료는 이 한 행이고([`clipped_choice_cursor`] 규칙 ①), 블록의 나머지는
+    /// **완결 증거**(접힌 라벨의 이어짐)로만 쓴다 — 그래야 무관한 꼬리 한 줄이 거부를 취소하지 못한다.
+    row_end_flat: usize,
 }
 
 /// ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) 선택 행 꼬리가 **여기서 끝난다**는 경계 줄인가.
@@ -620,7 +628,7 @@ struct CursorRow {
 /// 【장치】 판정 재료를 **선택 행 블록**으로 좁힌다: 줄바꿈으로 접힌 라벨은 계속 이어 붙이되(에코 보호
 /// 유지), 아래 줄이 **다른 시각 요소**이면 거기서 끊는다. 경계는 넷 — 빈 줄 · 괘선(입력 상자 테두리) ·
 /// 번호 항목 행 · 다른 선택 커서 행 · 상태줄([`PROMPT_TRAILER_TOKENS`]). 다섯 다 "접힌 라벨의 이어짐"
-/// 으로 볼 수 없는 형상이다(상태줄 어휘는 `waiting_prompt_trailer` 의 양성 증거와 **같은 코퍼스**다 —
+/// 으로 볼 수 없는 형상이다(상태줄 어휘는 [`scan_composer`] 의 양성 증거와 **같은 코퍼스**다 —
 /// 그 줄이 나왔다는 것은 입력 상자 블록이 끝났다는 뜻이다).
 fn is_choice_tail_boundary(line: &str) -> bool {
     if line.trim().is_empty() || is_rule_line(line) || is_numbered_item_row(line) || line.contains('❯') {
@@ -630,15 +638,18 @@ fn is_choice_tail_boundary(line: &str) -> bool {
     PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
 }
 
+/// `from` 이 속한 **물리 행의 끝**(개행 앞 · 원문 좌표). `from` 이 원문 끝이면 원문 길이.
+fn line_end_of(raw: &[char], from: usize) -> usize {
+    let mut j = from;
+    while j < raw.len() && raw[j] != '\n' {
+        j += 1;
+    }
+    j
+}
+
 /// 커서 행에서 시작하는 선택 행 블록의 **원문 끝 위치**([`is_choice_tail_boundary`] 앞에서 멎는다).
 fn choice_tail_end(raw: &[char], cursor: usize) -> usize {
-    let line_end = |from: usize| -> usize {
-        let mut j = from;
-        while j < raw.len() && raw[j] != '\n' {
-            j += 1;
-        }
-        j
-    };
+    let line_end = |from: usize| -> usize { line_end_of(raw, from) };
     let mut end = line_end(cursor);
     while end < raw.len() {
         let start = end + 1; // '\n' 다음 줄
@@ -697,6 +708,9 @@ fn cursor_rows(f: &Frame) -> Vec<CursorRow> {
             // 꼬리 경계는 **커서 행**에서 잰다(라벨 시작 행이 아니다 — 라벨 탐색은 개행을 건너뛰므로
             // 경계 너머의 글자를 라벨로 집을 수 있고, 그 경우 `label_flat >= tail_end_flat` 로 걸린다).
             tail_end_flat: f.raw_pre[choice_tail_end(raw, i)],
+            // 행 끝은 **라벨이 시작하는 행**에서 잰다(커서 행이 아니다 — `❯⏎  1. Yes …` 처럼 라벨이
+            // 다음 줄로 접힌 렌더에서 커서 행 끝을 쓰면 '라벨 한 글자도 없음' 이 되어 규칙 ①이 죽는다).
+            row_end_flat: f.raw_pre[line_end_of(raw, label_start)],
         });
     }
     rows
@@ -860,7 +874,12 @@ fn strip_choice_number(tail: &[char]) -> &[char] {
     }
 }
 
-fn clipped_choice_cursor(flat: &[char], label_flat: usize, tail_end: usize) -> Option<(&'static str, usize)> {
+fn clipped_choice_cursor(
+    flat: &[char],
+    label_flat: usize,
+    row_end: usize,
+    tail_end: usize,
+) -> Option<(&'static str, usize)> {
     let end = tail_end.min(flat.len());
     if label_flat >= end {
         // 라벨 없음 = 빈 입력 프롬프트 · 또는 라벨이 **블록 경계 너머**다(커서 행 아래의 괘선·다른 요소를
@@ -876,21 +895,35 @@ fn clipped_choice_cursor(flat: &[char], label_flat: usize, tail_end: usize) -> O
     if body.is_empty() {
         return Some(("clipped-choice-row", end)); // `❯ 2.` — 번호만 그려졌다
     }
-    // ★완결 증거(리뷰 R1(R6회차) · codex "exempt positively recognized completed confirmation echoes"):
-    //   **화면 끝까지의** 꼬리가 완전 라벨로 시작하고 그보다 길면, 그 라벨은 이미 다 그려졌다(접힌 확인
-    //   에코). 블록 경계에서 잘려 보이는 것은 렌더가 멎은 것이 아니라 우리가 자른 것이므로 ⓔ 를 적용하지
-    //   않는다 — 2026-07-29 킬체인의 역방향 회귀를 여는 유일한 경로가 여기이므로 면제를 명시한다.
-    let full = strip_choice_number(&flat[label_flat..]);
+    // ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B1 + claude major) **부분 라벨은 행에서 재고,
+    //   완결 증거는 블록 안에서만 센다.**
+    //
+    //   R6 은 판정 재료를 선택 행 블록으로 좁히고 면제(완결 증거)를 **화면 끝까지**로 뒀다. 두 좌표계가
+    //   어긋나서 두 구멍이 남았다:
+    //     ⓐ 블록이 경계 없이 이어지는 꼬리(평범한 다음 줄)가 그대로 `body` 에 붙어 진부분접두가 깨졌다
+    //        → `❯ No, exi⏎  이어지는 출력` 이 서명 0(= 본문 + Return 이 종료 선택지로 나간다).
+    //     ⓑ 블록 **경계 너머**의 글자가 라벨을 완성해 면제를 발동시켰다
+    //        → `❯ No, exi⏎⏎to continue press enter` 가 서명 0.
+    //   지금은 **라벨이 시작한 물리 행**(`row`)이 진부분접두인지를 묻고, 면제는 **같은 블록 안에서**
+    //   그 라벨이 실제로 완성됐는지로만 준다(접힌 확인 에코 보호는 그대로 — 접힘은 경계가 아니라 블록
+    //   안에서 이어진다). 무관한 문면은 어느 쪽에서도 **완결의 증거가 아니다**.
+    let row = &flat[label_flat..row_end.clamp(label_flat, end)];
+    let row_body = strip_choice_number(row);
+    // ★완결 증거는 **라벨 전체 집합에 대해 한 번** 센다(라벨마다 따로 세면 안 된다 — codex 설계 검토
+    //   R7 반례: 접힌 에코 `❯ Yes, I⏎accept ✔`의 첫 행 `Yes,I` 는 *다른* 라벨(`Yes, I trust this folder`)의
+    //   진부분접두라, 그 라벨의 완결만 보면 면제가 서지 않아 **완결된 에코가 관문으로 오탐**된다 =
+    //   2026-07-29 킬체인의 역방향 회귀). 좌표계는 화면 끝이 아니라 **이 블록의 꼬리**다(claude major).
     let completed = MODAL_CHOICE_LABELS.iter().any(|label| {
         let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
-        !lf.is_empty() && full.len() > lf.len() && full[..lf.len()] == lf[..]
+        !lf.is_empty() && body.len() >= lf.len() && body[..lf.len()] == lf[..]
     });
     for label in MODAL_CHOICE_LABELS {
         let lf: Vec<char> = first_run_gates::flatten(label).chars().collect();
         if lf.is_empty() {
             continue;
         }
-        if !completed && body.len() < lf.len() && *body == lf[..body.len()] {
+        if !completed && !row_body.is_empty() && row_body.len() < lf.len() && *row_body == lf[..row_body.len()]
+        {
             return Some(("clipped-choice-row", end));
         }
         // 완전 라벨은 **꼬리 전량과 같을 때만** 센다(뒤에 다른 글자가 이어지면 아니다). `starts_with`
@@ -952,7 +985,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
             sig.cursor_on_exit = true;
             sig.note("cursor-on-exit", fl + exit_flat.len());
         }
-        if let Some((kind, end)) = clipped_choice_cursor(&f.flat, fl, row.tail_end_flat) {
+        if let Some((kind, end)) = clipped_choice_cursor(&f.flat, fl, row.row_end_flat, row.tail_end_flat) {
             sig.note(kind, end);
         }
     }
@@ -1105,16 +1138,18 @@ fn is_numbered_item_row(line: &str) -> bool {
 ///     모를 본문은 모달의 일부일 수 있다(빈 텍스트 입력 필드 · 그리는 중인 프레임).
 /// 마커가 화면에 없거나 줄 단위로 찾을 수 없으면(마커가 줄을 넘어 접힘) 참을 주장하지 않는다.
 fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
-    waiting_prompt_trailer(screen, marker, true)
+    match scan_composer(screen, marker, None) {
+        Some(sc) => sc.trailer_empty || sc.strong,
+        None => false,
+    }
 }
 
-/// ★(0.14.31 · 리뷰 R5 · codex blocking) 같은 스캐너의 **엄격판** — 마커 줄 아래 꼬리가 **비어 있으면
-/// 거짓**이다(입력 상자 괘선·상태줄 같은 양성 증거를 요구한다).
+/// ★(0.14.31 · 리뷰 R5 · codex blocking / 리뷰 R2(R7회차)) 같은 스캐너의 **엄격판(강한 증거)** — 마커 줄
+/// **아래**에 입력 상자 괘선·상태줄이 실제로 있을 때만 참이다(꼬리가 비면 거짓).
 ///
 /// 【왜 두 판이 필요한가 — 묻는 것이 다르다】
-///   · 재주입 생애 창의 관대판(`empty_trailer_ok = true` · [`waiting_prompt_with_harmless_trailer`])은
-///     "모달이 **역사**인가" 를 묻는다. 거기서 꼬리가 비었다는 것은 **모달 본문이 더 없다**는 뜻이라
-///     창을 닫아도 안전하다.
+///   · 재주입 생애 창의 관대판([`waiting_prompt_with_harmless_trailer`])은 "모달이 **역사**인가" 를
+///     묻는다. 거기서 꼬리가 비었다는 것은 **모달 본문이 더 없다**는 뜻이라 창을 닫아도 안전하다.
 ///   · "지금 이 `❯` 가 composer 인가, 아직 라벨이 안 그려진 선택기인가" 를 묻는 두 소비처는 **엄격판**을
 ///     쓴다: 부트의 **관문 증거 이월**(`cys.rs::gate_carry_ok`)과 **큐 배달의 alt-screen 자격**
 ///     (`cysd::governance::prompt_gate_input` 의 `layout_ok`). 꼬리가 비어 있는 `❯ ` 는 **정확히 두 경우가
@@ -1123,26 +1158,115 @@ fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
 ///     `Grid::write_contents` 가 후행 개행을 잘라 내므로 마커 행이 마지막 비공백 행이면 꼬리는 **항상**
 ///     빈 벡터이고, 그러면 `layout_ok` 가 무조건 참이 되어 `prompt_gate_verdict` 문서가 약속한
 ///     "레이아웃 양성 증거" 가 사실상 없었다(BLOCKED_ALT_SCREEN 이 나지 않았다).
-/// 스캐너는 하나이고 갈리는 것은 이 한 축뿐이다(판정 분리 금지).
-///   ★(리뷰 R6 · codex "영구 보류 반례") 꼬리가 빈 경우의 **예외 하나**: 마커 **위**에 상태줄 어휘가
-///     있으면 양성이다(2.1.241 레이아웃 — `? for shortcuts` 가 프롬프트 위 · 실측 `LIVE_TUI_AT_PROMPT`).
-///     그것이 없으면 그 좌석은 관문을 한 번 본 뒤 **채택 자체가 불가능**해져 디렉티브가 영영 주입되지
-///     않는다(치명위험 ③). 괘선은 위쪽에서도 증거가 아니다 — `────⏎❯ ` 가 정확히 그 위험 프레임이다.
-pub fn waiting_prompt_layout_positive(screen: &str, marker: &str) -> bool {
-    waiting_prompt_trailer(screen, marker, false)
+/// 스캐너는 하나이고 갈리는 것은 **증거 등급**뿐이다(판정 분리 금지).
+///   ★(리뷰 R2(R7회차)) R6 이 여기 넣었던 "마커 **위** 상태줄" 예외는 이 함수에서 **빠졌다** — 그것은
+///     [`composer_layout_static_ok`] 의 **약한 증거**이고 출력 정적과 AND 여야 한다(codex R7 D2 반례:
+///     역사적 상태줄 · 라벨 미도색 선택기가 같은 문자열을 만든다). 인자 없는 구 이름
+///     (`waiting_prompt_layout_positive`)은 **삭제했다** — 남겨 두면 그 이름을 부르는 소비처가
+///     '약한 증거까지 포함' 으로 오해할 수 있고, 오용 경로를 지우는 것이 R6 이 관대판에 한 처분과 같다.
+///
+/// 【왜 필요한가 — 치명위험 ③】 R6 은 이 술어를 두 소비처(부트 관문 증거 이월 · 큐 alt-screen 배달 자격)에
+/// 걸었는데, 그 증거 어휘(`PROMPT_TRAILER_TOKENS` · 괘선)는 **claude 문면**이다. codex-cli 0.153.4 의 유휴
+/// composer 는 `› Ask Codex to do anything` + 상태줄 `gpt-6-astra medium · ~…` 라서 괘선도 상태줄 어휘도
+/// 없고, 게다가 마커 줄 뒤에 **플레이스홀더 문면이 있다** — 그래서 두 축이 **영원히 거짓**이었다
+/// (관문을 한 번 본 codex 좌석은 `carry-unproven` 영구 보류 = 디렉티브 미주입 · alt-screen 이면 큐 배달도
+/// 영구 `BLOCKED_ALT_SCREEN`). 리뷰어 2인이 각각 같은 자리를 짚었다.
+///
+/// 【장치】 플레이스홀더는 **비어 있고 포커스된 composer 에만** 그려지는 문면이다(입력이 한 글자라도
+/// 들어오면 사라진다 — agents.json codex 어댑터 주석의 실측 근거). 그래서 마커 줄의 나머지가 그
+/// 플레이스홀더와 **평탄화 공간에서 완전히 같으면** ⓐ그 줄은 '빈 입력줄' 이고 ⓑ그 자체가 레이아웃
+/// 양성 증거다. 잘려 그려진 플레이스홀더(부분 일치)는 **인정하지 않는다**(fail-closed — 부분 일치를 받으면
+/// 짧은 접두가 선택지 라벨과 겹칠 수 있다).
+/// 꼬리의 모달 형상 배제(`❯`·어댑터 마커·번호 항목 행)는 플레이스홀더가 있어도 그대로 적용한다.
+pub fn composer_layout_positive(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+    matches!(scan_composer(screen, marker, placeholder), Some(sc) if sc.strong)
 }
 
-fn waiting_prompt_trailer(screen: &str, marker: &str, empty_trailer_ok: bool) -> bool {
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2·D3) **약한 증거는 출력 정적과 AND 다.**
+///
+/// 【무엇이 남았나】 순수 화면 함수로는 끝내 가를 수 없는 두 프레임이 있다: 정상 유휴 composer
+/// (`? for shortcuts⏎ …43% context left⏎❯ `)와, **같은 화면에서 선택지 라벨만 아직 안 그려진**
+/// 관문. 문자열이 같으므로 어떤 구조 규칙도 이 둘을 가르지 못한다(codex R7 D2 반례 · 노트 잔여표).
+/// 플레이스홀더도 같은 계급이다 — "빈 composer 에만 그려진다" 와 "지금 캡처된 그 셀이 현재 포커스를
+/// 증명한다" 는 다른 명제이고, 잔여 셀·부분 재도색에서 후자는 성립하지 않는다(codex R7 D3 반례).
+///
+/// 【그래서 화면 밖의 축을 AND 한다】 재도색 중 프레임은 **정적일 수 없다** — 라벨이 사라진 창은
+/// 청크 하나의 반영 시간이고, 그 사이 출력이 흐른다. 그래서 약한 증거(마커 위 상태줄 · 플레이스홀더)는
+/// `idle_quiet`([`BOOT_VALVE_QUIET_SECS`] 이상 출력 없음)과 함께일 때만 참으로 센다. 강한 증거
+/// (마커 **아래**의 입력 상자 괘선·상태줄)는 종전대로 단독이다 — 그 레이아웃은 위젯이 다 그려졌다는
+/// 사실 자체다. 미관측(`None`)은 참으로 접지 않는다('부재 ≠ 부정').
+pub fn composer_layout_static_ok(
+    screen: &str,
+    marker: &str,
+    placeholder: Option<&str>,
+    idle_quiet: Option<bool>,
+) -> bool {
+    match scan_composer(screen, marker, placeholder) {
+        Some(sc) if sc.strong => true,
+        Some(sc) if sc.weak => idle_quiet == Some(true),
+        _ => false,
+    }
+}
+
+/// 마커 줄 **바로 위**에 있는 상태줄이 이 composer 의 것인가 — 꼬리가 빈 분기의 양성 증거.
+///
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) R6 은 "마커 위 **어디든** 상태줄 어휘"였다. 그러면
+/// 스크롤백에 남은 **역사적** 상태줄 한 줄이 이월 가드를 통째로 무력화한다 — codex 반례
+/// `? for shortcuts⏎────────────────⏎❯ `(라벨이 아직 안 그려진 선택기)가 정확히 그 문면이다.
+/// 지금은 **구조적 결속**을 요구한다: 마커 줄 바로 위의 **연속 비공백 블록** 안이어야 하고(빈 줄에서
+/// 끊긴다 = 그 위는 다른 위젯·스크롤백), 그 사이에 **괘선이 없어야 하며**(괘선은 입력 상자의 테두리이고,
+/// 상자 레이아웃의 상태줄은 상자 **아래**에 온다 — 위쪽 괘선 뒤의 상태줄은 이 composer 의 것이 아니다),
+/// 마커로부터 [`PROMPT_STATUS_ABOVE_MAX_ROWS`] 행 안이어야 한다.
+/// 실측 2.1.241 레이아웃(`? for shortcuts` / `…43% context left` / `❯ `)은 2행 위라 그대로 통과한다.
+fn status_row_bound_to_composer(lines: &[&str], li: usize) -> bool {
+    let mut looked = 0usize;
+    for k in (0..li).rev() {
+        let l = lines[k];
+        if l.trim().is_empty() {
+            return false; // 연속 블록의 끝 — 그 위는 이 composer 의 위젯이 아니다
+        }
+        if is_rule_line(l) {
+            return false; // 입력 상자 테두리 — 상태줄은 상자 아래에 온다
+        }
+        let norm = first_run_gates::normalize(l).to_lowercase();
+        if PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t)) {
+            return true;
+        }
+        looked += 1;
+        if looked >= PROMPT_STATUS_ABOVE_MAX_ROWS {
+            return false;
+        }
+    }
+    false
+}
+
+/// 한 화면의 composer 레이아웃 관측(판정은 소비처가 한다). `None` = 마커 부재 · 마커 줄에 문면 ·
+/// 꼬리에 모달 형상(= 이 화면은 대기 프롬프트가 아니다).
+struct ComposerScan {
+    /// 마커 줄 아래에 비공백 줄이 하나도 없다(vt100 후행 개행 절단 포함).
+    trailer_empty: bool,
+    /// **강한 증거** — 마커 아래의 입력 상자 괘선·상태줄(위젯이 다 그려졌다는 사실 자체).
+    strong: bool,
+    /// **약한 증거** — 마커 위 상태줄(2.1.241) · 어댑터 플레이스홀더. 정적(idle_quiet)과 AND 여야 한다.
+    weak: bool,
+}
+
+fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Option<ComposerScan> {
     let lines: Vec<&str> = screen.lines().collect();
-    let Some(li) = lines.iter().rposition(|l| l.contains(marker)) else {
-        return false;
-    };
+    let li = lines.iter().rposition(|l| l.contains(marker))?;
     let line = lines[li];
-    let Some(mi) = line.rfind(marker) else {
-        return false;
-    };
-    if !line[mi + marker.len()..].trim().is_empty() {
-        return false; // 같은 줄에 문면 — 선택 커서 행이거나 사람이 치던 초안이다(둘 다 닫지 않는다).
+    let mi = line.rfind(marker)?;
+    let rest = &line[mi + marker.len()..];
+    // ★(리뷰 R2(R7회차)) 어댑터 플레이스홀더는 '빈 입력줄' 이고 **약한** 레이아웃 증거다.
+    let placeholder_ok = placeholder
+        .map(|ph| {
+            let a = first_run_gates::flatten(rest);
+            let b = first_run_gates::flatten(ph);
+            !b.is_empty() && a == b
+        })
+        .unwrap_or(false);
+    if !placeholder_ok && !rest.trim().is_empty() {
+        return None; // 같은 줄에 문면 — 선택 커서 행이거나 사람이 치던 초안이다(둘 다 닫지 않는다).
     }
     let has_status_token = |l: &str| -> bool {
         let norm = first_run_gates::normalize(l).to_lowercase();
@@ -1158,10 +1282,17 @@ fn waiting_prompt_trailer(screen: &str, marker: &str, empty_trailer_ok: bool) ->
         //   2.1.241 레이아웃(`? for shortcuts` 가 프롬프트 **위** · 실측 검체 `LIVE_TUI_AT_PROMPT`)의
         //   정상 composer 가 영구히 거짓이 된다 — 그 좌석은 관문을 한 번 본 뒤 **채택 자체가 불가능**
         //   해지고(부트 이월·재부트 채택 둘 다), 그것이 곧 치명위험 ③(디렉티브 미주입)이다.
-        //   그래서 꼬리가 비었을 때는 **마커 위**의 상태줄 어휘를 양성 증거로 받는다. codex 가 든
-        //   위험 프레임(`────\n❯ ` — 라벨 미도색 선택기)은 상태줄 어휘가 없어 여전히 거짓이고,
-        //   괘선은 어느 쪽에서도 증거가 아니다(그 프레임이 정확히 반례이므로).
-        return empty_trailer_ok || lines[..li].iter().any(|l| has_status_token(l));
+        //   그래서 꼬리가 비었을 때는 **마커 위**의 상태줄 어휘를 증거로 받는다.
+        // ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) 단 그 증거는 **약한 증거**다: 결속을
+        //   구조로 좁혀도([`status_row_bound_to_composer`]) '정상 유휴 composer' 와 '같은 화면에서
+        //   라벨만 아직 안 그려진 선택기' 는 **문자열이 같다**. 그래서 소비처가 출력 정적과 AND 한다
+        //   ([`composer_layout_static_ok`]) — 재도색 중 프레임은 정적일 수 없다는 것이 화면 밖의
+        //   유일한 판별 사실이다. 플레이스홀더도 같은 등급이다(잔여 셀이 포커스를 증명하지 않는다).
+        return Some(ComposerScan {
+            trailer_empty: true,
+            strong: false,
+            weak: placeholder_ok || status_row_bound_to_composer(&lines, li),
+        });
     }
     // ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) 선택 커서 배제는 리터럴 `❯` 하나로 고정돼 있었다 —
     //   `prompt_marker` 가 `›`(codex)·`>`(gemini)인 어댑터에서는 꼬리의 선택기 행이 걸러지지 않았다.
@@ -1170,10 +1301,14 @@ fn waiting_prompt_trailer(screen: &str, marker: &str, empty_trailer_ok: bool) ->
         .iter()
         .any(|l| l.contains('❯') || l.contains(marker) || is_numbered_item_row(l))
     {
-        return false;
+        return None;
     }
     let has_token = trailer.iter().copied().any(has_status_token);
-    is_rule_line(trailer[0]) || has_token
+    Some(ComposerScan {
+        trailer_empty: false,
+        strong: is_rule_line(trailer[0]) || has_token,
+        weak: placeholder_ok,
+    })
 }
 
 /// 판정용 합성 — 롤백(`legacy_v1`)이면 축 자체가 없고, 생애 창이 닫혔으면 거부하지 않는다.
@@ -2369,12 +2504,12 @@ mod tests {
         for tail in ["2", "12", "2.", "12."] {
             let flat: Vec<char> = format!("❯{tail}").chars().collect();
             let n = flat.len();
-            assert_eq!(clipped_choice_cursor(&flat, 1, n), Some(("clipped-choice-row", n)), "{tail}");
+            assert_eq!(clipped_choice_cursor(&flat, 1, n, n), Some(("clipped-choice-row", n)), "{tail}");
         }
         for tail in ["", "123", "123.", "1.5hourslater", "2commandcompleted"] {
             let flat: Vec<char> = format!("❯{tail}").chars().collect();
             let n = flat.len();
-            assert_eq!(clipped_choice_cursor(&flat, 1, n), None, "{tail}");
+            assert_eq!(clipped_choice_cursor(&flat, 1, n, n), None, "{tail}");
         }
         // ★(0.14.31 · 리뷰 R1(R6회차)) 꼬리 끝(블록 경계)이 술어의 **입력**이다 — 경계 뒤 문면은
         //   판정에 들어오지 않고(무관한 꼬리로 거부를 취소할 수 없다), 경계 앞이 비면 라벨이 없는
@@ -2385,21 +2520,262 @@ mod tests {
         let flat: Vec<char> = format!("❯{exit_cut}────────").chars().collect();
         let cut_end = 1 + exit_cut.chars().count();
         assert_eq!(
-            clipped_choice_cursor(&flat, 1, cut_end),
+            clipped_choice_cursor(&flat, 1, cut_end, cut_end),
             Some(("clipped-choice-row", cut_end)),
             "블록 경계 뒤의 괘선이 잘린 선택기 거부를 취소했다"
         );
-        assert_eq!(clipped_choice_cursor(&flat, 1, flat.len()), None, "전제: R5 의 화면 끝 꼬리는 놓친다");
-        // 완결 증거 면제 — 경계로 잘려 보여도 화면 끝까지에서 라벨이 **완결**돼 있으면 잘림이 아니다.
+        // ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B1) **재핀(조여지는 방향).** R6 은 여기서 `None` 을
+        //   못 박아 "블록이 경계 없이 이어지면 거부가 사라진다" 는 잔여를 검체로 승인하고 있었다. 지금은
+        //   부분 라벨을 **행**에서 재므로, 블록이 화면 끝까지 이어져도(무관한 꼬리) 거부가 유지된다.
+        assert_eq!(
+            clipped_choice_cursor(&flat, 1, cut_end, flat.len()),
+            Some(("clipped-choice-row", flat.len())),
+            "무관한 꼬리가 이어졌다는 이유로 잘린 선택기 거부가 취소됐다(B1 재발)"
+        );
+        // 완결 증거 면제 — 행은 잘려 보여도 **같은 블록 안에서** 라벨이 완결됐으면 접힌 에코다.
         let trust = first_run_gates::flatten(MODAL_CHOICE_LABELS[0]);
         let full: Vec<char> = format!("❯{trust}✔Welcomeback").chars().collect();
         let head = 1 + trust.chars().count() - 3;
-        assert_eq!(clipped_choice_cursor(&full, 1, head), None, "접힌 확인 에코가 관문으로 오탐됐다");
+        assert_eq!(
+            clipped_choice_cursor(&full, 1, head, full.len()),
+            None,
+            "접힌 확인 에코가 관문으로 오탐됐다"
+        );
+        // ★(리뷰 R2(R7회차) · claude major) 완결 증거는 **블록 안에서만** 센다 — 블록이 라벨 도중에
+        //   끊겼는데 경계 너머의 글자가 라벨을 완성하는 경우는 면제가 아니다(거부 유지).
+        assert_eq!(
+            clipped_choice_cursor(&full, 1, head, head),
+            Some(("clipped-choice-row", head)),
+            "블록 경계 너머의 글자가 완결 증거로 세어져 거부가 취소됐다"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R7) codex(gpt-6-astra) 위임 산출 — **전행 검토 후 무수정 채택**.
+    ///   순수 술어(`clipped_choice_cursor`)와 소비 스캐너(`modal_signature`)를 **함께** 재고,
+    ///   라벨 리터럴을 하나도 적지 않는다(문면 SOT = 코퍼스 하나). 계약 셋을 라벨·접기 지점
+    ///   **전수**로 돈다: ⓐ완결된 확인 에코는 관문이 아니다(서로 다른 라벨의 **공통 접두**가
+    ///   실제로 실행됐는지 `shared_prefix_exercised` 가 자기검사한다) ⓑ무관한 꼬리는 완결 증거가
+    ///   아니다 ⓒ블록 경계 너머의 글자도 완결 증거가 아니다. raw·CRLF 두 판본.
+    #[test]
+    fn r7_clipped_contract_echo_and_partial_rows() {
+        let mut shared_prefix_exercised = false;
+        for label in MODAL_CHOICE_LABELS {
+            for (cut, _) in label.char_indices().skip(1) {
+                let (head, rest) = label.split_at(cut);
+                let hf = first_run_gates::flatten(head);
+                if hf.is_empty() || hf == first_run_gates::flatten(label) {
+                    continue;
+                }
+                let row = format!("❯ {head}");
+                let row_end = first_run_gates::flatten(&row).chars().count();
+                if label != MODAL_EXIT_LABEL {
+                    shared_prefix_exercised |= MODAL_CHOICE_LABELS.iter().any(|other| {
+                        let of = first_run_gates::flatten(other);
+                        *other != label && of.starts_with(&hf) && hf.chars().count() < of.chars().count()
+                    });
+                    let echo = format!("{row}\n{rest} ✔\nWelcome back");
+                    for (render, screen) in [("raw", echo.clone()), ("CRLF", crlf(&echo))] {
+                        let flat: Vec<char> = first_run_gates::flatten(&screen).chars().collect();
+                        assert_eq!(clipped_choice_cursor(&flat, 1, row_end, flat.len()), None,
+                            "{render}/{label}/{cut}: 라벨 집합 전체의 완결 증거를 놓쳐 공통 접두를 포함한 확인 에코를 잘림으로 오인하면 실패한다.");
+                        assert_eq!(modal_signature(&screen), None,
+                            "{render}/{label}/{cut}: 소비 스캐너가 접힌 완결 확인 에코를 관문으로 오인하면 실패한다.");
+                    }
+                }
+                for (case, screen, bounded) in [
+                    ("무관한 꼬리", format!("{row}\n무관한 출력"), false),
+                    ("빈 줄 너머 완성", format!("{row}\n\n{rest} ✔\nWelcome back"), true),
+                ] {
+                    for (render, screen) in [("raw", screen.clone()), ("CRLF", crlf(&screen))] {
+                        let flat: Vec<char> = first_run_gates::flatten(&screen).chars().collect();
+                        let end = if bounded { row_end } else { flat.len() };
+                        assert_eq!(clipped_choice_cursor(&flat, 1, row_end, end), Some(("clipped-choice-row", end)),
+                            "{render}/{label}/{cut}/{case}: 무관한 꼬리나 블록 밖 글자를 완결 증거로 세거나 블록 끝 좌표를 틀리면 실패한다.");
+                        assert!(modal_signature(&screen).as_ref().is_some_and(|s| s.kinds.contains(&"clipped-choice-row")),
+                            "{render}/{label}/{cut}/{case}: 소비 스캐너가 물리 행의 진부분접두 서명을 잃으면 종료 규칙의 유무와 무관하게 실패한다.");
+                    }
+                }
+            }
+        }
+        assert!(shared_prefix_exercised,
+            "서로 다른 라벨의 공통 진부분접두를 사용하는 확인 에코가 한 번도 실행되지 않으면 실패한다.");
+    }
+
+    #[test]
+    fn r7_clipped_contract_boundaries_and_exact_tails() {
+        for label in MODAL_CHOICE_LABELS {
+            let cut = label.char_indices().last().expect("라벨은 비어 있지 않아야 한다").0;
+            let (head, rest) = label.split_at(cut);
+            let row = format!("❯ {head}");
+            let row_end = first_run_gates::flatten(&row).chars().count();
+            for boundary in ["", "        ", "────────", "  2. 다른 항목", "  2.",
+                "다른 ❯ 출력", "for shortcuts", "bypass permissions", "shift+tab"] {
+                let screen = format!("{row}\n{boundary}\n{rest} ✔\nWelcome back");
+                for (render, screen) in [("raw", screen.clone()), ("CRLF", crlf(&screen))] {
+                    let sig = modal_signature(&screen);
+                    assert!(sig.as_ref().is_some_and(|s| s.kinds.contains(&"clipped-choice-row")),
+                        "{render}/{label}/{boundary:?}: 빈 줄·괘선·번호 항목·다른 커서·상태줄 경계를 놓쳐 잘린 선택 행의 서명이 사라지면 실패한다.");
+                    // 다른 서명은 끝 좌표를 늘릴 수 있으므로 빈 경계에서만 소비부 좌표를 잰다.
+                    if boundary.is_empty() && label != MODAL_EXIT_LABEL {
+                        assert_eq!(sig.as_ref().map(|s| s.flat_end), Some(row_end),
+                            "{render}/{label}: 소비 스캐너가 빈 줄 너머를 선택 행 블록 끝으로 반환하면 실패한다.");
+                    }
+                }
+            }
+            let screen = format!("❯ {label}\n");
+            for (render, screen) in [("raw", screen.clone()), ("CRLF", crlf(&screen))] {
+                let flat: Vec<char> = first_run_gates::flatten(&screen).chars().collect();
+                assert_eq!(clipped_choice_cursor(&flat, 1, usize::MAX, usize::MAX), Some(("cursor-on-choice-label", flat.len())),
+                    "{render}/{label}: 정확한 라벨 꼬리의 종류·끝 좌표 또는 범위 상한 보정이 깨지면 실패한다.");
+            }
+        }
+        for tail in ["2", "2."] {
+            let screen = format!("❯ {tail}\n");
+            for (render, screen) in [("raw", screen.clone()), ("CRLF", crlf(&screen))] {
+                let flat: Vec<char> = first_run_gates::flatten(&screen).chars().collect();
+                assert_eq!(clipped_choice_cursor(&flat, 1, flat.len(), flat.len()), Some(("clipped-choice-row", flat.len())),
+                    "{render}/{tail}: 숫자만 또는 번호만 남은 꼬리를 잘린 선택 행으로 반환하지 않으면 실패한다.");
+                assert!(modal_signature(&screen).is_some(),
+                    "{render}/{tail}: 소비 스캐너가 숫자만 또는 번호만 남은 선택 행의 관문 서명을 잃으면 실패한다.");
+            }
+        }
     }
 
     /// ★(0.14.31 · 리뷰 R6) codex(gpt-6-astra) 위임 산출 — **전행 검토 후 채택**.
     ///   꼬리 경계 술어와 끝 좌표를 **직접** 잰다(소비 스캐너를 통하지 않으므로, 규칙이 사라진 것과
     ///   소비부에서 가려진 것을 구분한다). CRLF 판본은 같은 flat 끝을 요구한다.
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · claude minor) **생애 창 축 ②의 받아들인 잔여를 기계로 못 박는다.**
+    ///
+    /// [`ModalSignature::flat_end`] 는 R6 부터 **선택 행 블록의 끝**이다. 그래서 잘린 선택기가 마커의
+    /// 마지막 출현보다 **앞**에 있으면 `Site::Reinject`·큐 배달에서 '역사' 로 분류된다. 그 판정은 두
+    /// 화면을 **같은 관측**으로 본다:
+    ///   ⓐ 무해(스크롤백 잔상 + 아래에 라이브 프롬프트) — 닫아야 한다. 안 닫으면 `❯ Yes` 한 줄에
+    ///      큐 배달이 **영구 기아**다(치명위험 ①의 반대편).
+    ///   ⓑ 위험(재도색 중 잘린 모달 + 아래에 살아 있는 composer) — 닫으면 안 된다.
+    /// 화면 문자열로는 둘이 구별되지 않으므로 **ⓐ를 택했다**(노트 §16-2·§16-3). 이 검체는 그 선택을
+    /// 양방향으로 고정한다 — ⓑ가 언젠가 실측되면 여기가 붉어져야 하고, ⓐ를 잃으면 기아가 재발한다.
+    /// **`Site::Boot` 는 두 화면 모두 보류다**(창 상수 개방) — 부트 주입은 이 잔여의 영향을 받지 않는다.
+    #[test]
+    fn r7_lifetime_window_axis_two_residual_is_pinned_in_both_directions() {
+        let gates = first_run_gates::builtin();
+        let exit_flat = first_run_gates::flatten(MODAL_EXIT_LABEL);
+        let cut: String = exit_flat.chars().take(exit_flat.chars().count() - 1).collect();
+        let live = fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        let screen = format!("❯ {cut}\n────────────────\n{live}");
+        // 전제: 잘린 선택기 서명은 **선다**(그것이 이 축의 입력이다).
+        let sig = modal_signature(&screen).expect("잘린 선택기 서명이 서지 않는다(전제 붕괴)");
+        assert!(sig.kinds.contains(&"clipped-choice-row"));
+        // ⓐ·ⓑ 공통 — 재주입·배달 소비처는 '역사' 로 본다(받아들인 잔여 · 기아 회피 방향).
+        assert!(
+            modal_foreground(&screen, Some("❯")).is_none(),
+            "잔여가 바뀌었다: 블록 끝 서명이 라이브 프롬프트 아래에서 전경으로 읽힌다(큐 배달 영구 기아)"
+        );
+        // 부트는 영향 없음 — 같은 화면이 보류다(주입 0 · 키 0).
+        assert!(held_as(&judge(&boot_all_open(&screen, &gates)), MODAL_UNKNOWN_ID));
+        // 반대 방향 — 잘린 선택기가 마커 **뒤**(아래)면 전경이다(축 ②가 살아 있다).
+        let foreground = format!("{live}❯ {cut}\n");
+        assert!(
+            modal_foreground(&foreground, Some("❯")).is_some(),
+            "마커 뒤의 잘린 선택기까지 역사로 접힌다 — 축 ②가 죽었다"
+        );
+    }
+
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · codex 설계 검토 D1 반례) **다른 라벨의 공통 접두**가 완결된
+    /// 확인 에코를 다시 관문으로 오탐하지 않는다.
+    ///
+    /// `❯ Yes, I⏎accept ✔⏎Welcome back` 의 첫 행 `Yes,I` 는 `Yes, I accept` 의 접두이자
+    /// **`Yes, I trust this folder` 의 진부분접두**이기도 하다. 완결 증거를 '같은 라벨' 로만 세면
+    /// 뒤 라벨에서 잘림 판정이 서고, 그 화면은 2026-07-29 킬체인의 **역방향 회귀**(확인 에코를
+    /// 관문으로 읽어 다음 Return 이 종료를 누른다)의 입구다. 완결은 **라벨 집합 전체**에 대해 센다.
+    #[test]
+    fn r7_completed_echo_of_another_label_is_not_a_clipped_choice() {
+        let gates = first_run_gates::builtin();
+        // ★종료 라벨(`No, exit`)은 **제외**한다 — 그 라벨의 에코는 규칙 ⓐ(`cursor-on-exit`)가
+        //   의도적으로 접두로 잡는다(그 화면에 Return 을 보내면 좌석이 죽으므로 에코라도 보류가
+        //   옳다 · R6 검체 ⓒ 와 같은 규약). 여기서 재는 것은 **잘림 규칙**의 완결 면제다.
+        for label in MODAL_CHOICE_LABELS.iter().filter(|l| **l != MODAL_EXIT_LABEL) {
+            // 접힘 지점을 라벨 안에서 옮겨 가며(2..len-1) 전수로 돈다 — 특정 접두 하나에만 맞춘
+            // 수리를 배제한다(계측 타당성).
+            let n = label.chars().count();
+            for cut in 2..n {
+                let head: String = label.chars().take(cut).collect();
+                let rest: String = label.chars().skip(cut).collect();
+                let screen = format!("❯ {head}\n{rest} ✔\nWelcome back\n");
+                for (render, screen) in [("raw", screen.clone()), ("crlf", crlf(&screen))] {
+                    assert_eq!(
+                        modal_signature(&screen),
+                        None,
+                        "{render}/{label}/{cut}: 완결된 확인 에코가 관문으로 오탐됐다(역방향 회귀)"
+                    );
+                    let v = judge(&boot_all_open(&screen, &gates));
+                    assert!(
+                        !held_as(&v, MODAL_UNKNOWN_ID),
+                        "{render}/{label}/{cut}: 판정이 미등재 모달로 접혔다: {v:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2 + 리뷰어 2인 blocking) composer 레이아웃
+    /// 증거의 **등급**과 어댑터 해소.
+    ///
+    /// ⓐ 강한 증거(마커 **아래**의 괘선·상태줄)는 단독으로 참이다.
+    /// ⓑ 약한 증거(마커 **위** 상태줄 · 어댑터 플레이스홀더)는 **출력 정적**과 AND 여야 한다 —
+    ///    그 프레임들은 '라벨이 아직 안 그려진 선택기' 와 문자열이 같아 화면만으로 갈리지 않는다.
+    /// ⓒ 역사적 상태줄(빈 줄·괘선으로 끊긴 위쪽 · 4행 초과)은 이 composer 의 것이 아니다.
+    /// ⓓ 마커가 `ready_marker`(`? for shortcuts`)면 codex·gemini 유휴 화면이 영원히 거짓이다.
+    #[test]
+    fn r7_composer_layout_evidence_is_graded_and_adapter_resolved() {
+        let live261 = fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        let live241 = fixtures::LIVE_TUI_AT_PROMPT;
+        // ⓐ 강한 증거 — 정적 미관측(None)에서도 참.
+        assert!(composer_layout_positive(live261, "❯", None));
+        assert!(composer_layout_static_ok(live261, "❯", None, None));
+        // ⓑ 2.1.241(상태줄이 프롬프트 위) = 약한 증거 — 정적일 때만 참.
+        assert!(!composer_layout_positive(live241, "❯", None), "약한 증거가 강한 증거로 세어졌다");
+        assert!(composer_layout_static_ok(live241, "❯", None, Some(true)));
+        for q in [None, Some(false)] {
+            assert!(!composer_layout_static_ok(live241, "❯", None, q), "재도색 중에도 열렸다: {q:?}");
+        }
+        // ⓒ 역사적 상태줄 — 괘선·빈 줄·거리로 끊긴다(codex R7 B2 반례 + 변주).
+        for (name, screen) in [
+            ("괘선이 끼어 있다", "? for shortcuts\n────────────────────────\n❯ \n"),
+            ("빈 줄로 끊긴다", "? for shortcuts\n\n❯ \n"),
+            ("거리 초과", "? for shortcuts\na\nb\nc\nd\ne\n❯ \n"),
+        ] {
+            assert!(
+                !composer_layout_static_ok(screen, "❯", None, Some(true)),
+                "{name}: 역사적 상태줄이 이 composer 의 증거로 세어졌다"
+            );
+        }
+        // ⓓ 어댑터 — codex 유휴 composer 는 `prompt_marker`(›) + 플레이스홀더로만 열린다.
+        let codex_idle = "• DIRECTIVE-ACK-11137\n\n────────────────────────\n\n\n› Ask Codex to do anything\n\n  gpt-6-astra medium · ~/dev/cys-t1/src\n";
+        let ph = Some("Ask Codex to do anything");
+        assert!(composer_layout_static_ok(codex_idle, "›", ph, Some(true)), "codex 유휴가 영구 거짓이다");
+        assert!(!composer_layout_static_ok(codex_idle, "›", ph, Some(false)), "플레이스홀더가 정적 없이 열렸다");
+        assert!(!composer_layout_static_ok(codex_idle, "›", None, Some(true)), "플레이스홀더 없이 열렸다");
+        assert!(
+            !composer_layout_static_ok(codex_idle, "? for shortcuts", None, Some(true)),
+            "전제 붕괴: ready_marker 로도 참이면 이 검체는 마커 해소를 재지 못한다"
+        );
+        // 플레이스홀더는 **완전 일치**만 인정한다(잘린 렌더는 fail-closed).
+        assert!(
+            !composer_layout_static_ok(codex_idle, "›", Some("Ask Codex to do anything now"), Some(true)),
+            "플레이스홀더 부분 일치가 열렸다"
+        );
+        // gemini 유휴(괘선이 아래) = 강한 증거 — `>` 로 열리고 `? for shortcuts` 로는 아니다.
+        let gemini_idle = "  각성 확인 완료.\n────────────────────────\n>\n────────────────────────\n? for shortcuts                     Gemini 3.8 Flash · hig\n";
+        assert!(composer_layout_positive(gemini_idle, ">", None));
+        assert!(
+            !composer_layout_positive(gemini_idle, "? for shortcuts", None),
+            "전제 붕괴: ready_marker 로도 참이면 이 검체는 마커 해소를 재지 못한다"
+        );
+        // 꼬리에 선택기 형상이 있으면 어떤 증거로도 열리지 않는다(모달 형상 배제는 그대로).
+        let with_selector = format!("{codex_idle}› 1. Yes, continue\n");
+        assert!(!composer_layout_static_ok(&with_selector, "›", ph, Some(true)));
+    }
+
     #[test]
     fn r6_choice_tail_boundary_and_end_are_exact() {
         let trust = MODAL_CHOICE_LABELS[0];
@@ -2562,9 +2938,42 @@ mod tests {
             let echo = format!("❯ {head}\n{rest} ✔\n{tail}\n");
             assert_eq!(modal_signature(&echo), None, "접힌 확인 에코가 관문으로 오탐됐다: {echo:?}");
         }
-        // ⓓ 받아들인 잔여(정직) — 꼬리에 **평문**이 곧바로 이어지는 잘린 선택기는 접힌 라벨과
-        //    구별되지 않으므로 여전히 열려 있다(경계가 아니면 이어 붙인다 · 노트 §15-3).
-        assert_eq!(modal_signature(&format!("❯ {exit_cut}\n  이어지는 출력\n")), None);
+        // ⓓ ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B1) **재핀(조여지는 방향)** — R6 은 여기서
+        //    `None` 을 못 박아 "꼬리에 평문이 이어지면 거부가 사라진다" 를 잔여로 승인하고 있었다.
+        //    그 프레임에 본문 + Return 이 나가면 커서는 **부분 렌더된 종료 선택지** 위다(좌석 사망).
+        //    지금은 부분 라벨을 **행**에서 재고 완결 증거는 **블록 안**에서만 세므로 거부가 유지된다.
+        //    ★꼬리가 우연히 라벨을 **완성**하는 경우(`No, exi` + `to continue …` = `No,exito…`)는
+        //      종료 라벨 축(ⓐ `cursor-on-exit`)이 잡는다 — 거부는 유지되고 규칙만 다르다.
+        for (tail, clipped_rule) in [
+            ("  이어지는 출력", true),
+            ("  다른 pane 의 로그 한 줄", true),
+            ("to continue press enter", false),
+        ] {
+            let screen = format!("❯ {exit_cut}\n{tail}\n");
+            for (render, screen) in [("raw", screen.clone()), ("crlf", crlf(&screen))] {
+                let sig = modal_signature(&screen)
+                    .unwrap_or_else(|| panic!("{render}/{tail:?}: 평문 꼬리 한 줄에 거부가 취소됐다"));
+                if clipped_rule {
+                    assert!(sig.kinds.contains(&"clipped-choice-row"), "{render}/{tail:?}: {:?}", sig.kinds);
+                }
+                assert!(
+                    held_as(&judge(&boot_all_open(&screen, &gates)), MODAL_UNKNOWN_ID),
+                    "{render}/{tail:?}: 판정이 보류가 아니다"
+                );
+            }
+        }
+        // ⓔ ★(리뷰 R2(R7회차) · claude major) 완결 증거의 좌표계도 **블록**이다 — 블록 경계 너머의
+        //    글자가 라벨을 완성해도 면제가 아니다(`❯ No, exi⏎⏎to continue press enter`).
+        for (name, label) in [("exit", MODAL_EXIT_LABEL), ("trust", MODAL_CHOICE_LABELS[0])] {
+            let flat = first_run_gates::flatten(label);
+            let n = flat.chars().count();
+            let head: String = label.chars().take(label.chars().count() - 3).collect();
+            let rest: String = flat.chars().skip(n - 3).collect();
+            let screen = format!("❯ {head}\n\n{rest} 이어지는 문장\n");
+            let sig = modal_signature(&screen)
+                .unwrap_or_else(|| panic!("{name}: 경계 너머 글자가 완결 증거로 세어졌다: {screen:?}"));
+            assert!(sig.kinds.contains(&"clipped-choice-row"), "{name}: {:?}", sig.kinds);
+        }
     }
 
     #[test]

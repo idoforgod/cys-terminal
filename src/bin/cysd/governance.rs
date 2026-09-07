@@ -4673,7 +4673,7 @@ pub(crate) struct PromptObs {
     /// (프롬프트가 포커스를 잃었거나 다른 화면) `None` — 호출부는 `Unknown` 으로 받아 배달하지
     /// 않는다(fail-closed).
     pub(crate) line: Option<(String, String)>,
-    /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`waiting_prompt_layout_positive`).
+    /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`composer_layout_static_ok`).
     pub(crate) screen: String,
     /// 커서 행이 마커 뒤 `N. …` 번호 선택지 행이다(codex `› 1. Yes, continue` · claude `❯ 1. Yes`) —
     /// composer 가 아니라 선택기다(codex 설계 검토 Q5 반례).
@@ -4804,8 +4804,9 @@ fn observe_tail(s: &Arc<crate::state::Surface>) -> (u64, bool, u64) {
 ///   ⑤ `alt_screen` → 종전엔 무조건 거부였다(0.14.30 라이브 회귀 — claude 2.1.26x 는 alt-screen 에
 ///      상주한다). 이제 **양성 유휴 프롬프트 관측**이 있을 때만 통과한다: 마커 보임 ∧ 커서행 마커
 ///      (input≠Unknown) ∧ 입력줄 비어 있음 ∧ 레이아웃 양성 증거(`layout_ok` = `readiness::
-///      waiting_prompt_layout_positive` — 마커 줄 아래가 입력 상자 괘선/상태줄이거나, 꼬리가 비었으면
-///      마커 **위**에 상태줄이 있다. 빈 `❯ ` 한 장은 증거가 아니다 — 리뷰 R6) ∧ 출력 정적
+///      composer_layout_static_ok` — **강한 증거**는 마커 줄 아래의 입력 상자 괘선/상태줄이고,
+///      **약한 증거**(마커 위 상태줄 · 어댑터 `composer_placeholder`)는 출력 정적과 AND 다. 빈 `❯ `
+///      한 장은 증거가 아니다 — 리뷰 R6·R7) ∧ 출력 정적
 ///      (`quiet_for ≥ quiet` · overdue 완화 없음 — 정적은 스케줄이
 ///      아니라 증거다). 하나라도 빠지면 종전과 같은 거부다 — 새 신호가 게이트를 면제하는 것이
 ///      아니라 게이트의 판정 입력을 정확하게 만든 것이다(§8-3 과 구분 · CONTRACTS B-1).
@@ -4907,7 +4908,27 @@ fn prompt_gate_input(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     marker: &str,
+    placeholder: Option<&str>,
     obs: &PromptObs,
+) -> PromptGateInput {
+    prompt_gate_input_with_approval(
+        s,
+        marker,
+        placeholder,
+        obs,
+        approval_or_gate_pending(daemon, s.id),
+    )
+}
+
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) 승인 축을 **호출부가 넘기는** 판(같은 조립부).
+/// 인계 시점 재평가는 데몬 락을 임계영역(`pending_queue` → `input_gate`) 안에서 새로 잡지 않기
+/// 위해 판정 시점 값을 그대로 쓰고, 승인 축은 인계 직전에 **별도로** 다시 읽는다(호출부 참조).
+fn prompt_gate_input_with_approval(
+    s: &Arc<crate::state::Surface>,
+    marker: &str,
+    placeholder: Option<&str>,
+    obs: &PromptObs,
+    approval_pending: bool,
 ) -> PromptGateInput {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let input = input_line_state(
@@ -4919,11 +4940,12 @@ fn prompt_gate_input(
     );
     // ★(리뷰 R5) 화면과 **같은 관측**의 값이다(따로 읽지 않는다 — 합성 금지).
     let alt_screen = obs.alt_screen;
+    let quiet = queue_quiet_secs();
     PromptGateInput {
         marker_seen: obs.marker_seen,
         input,
         alt_screen,
-        approval_pending: approval_or_gate_pending(daemon, s.id),
+        approval_pending,
         modal_foreground: cys::readiness::modal_foreground(&obs.screen, Some(marker)).is_some(),
         selector_row: obs.selector_row,
         busy_near_cursor: obs.busy_near_cursor,
@@ -4932,9 +4954,19 @@ fn prompt_gate_input(
         //   `prompt_gate_verdict` ⑤가 약속한 "레이아웃 양성 증거" 가 사실상 부재했다(빈 `❯ ` 한 장이
         //   alt-screen 배달 자격을 얻었다 = BLOCKED_ALT_SCREEN 미발화). 이제 입력 상자 괘선·상태줄이
         //   **실제로 있을 때만** 참이다 — 부트의 관문 증거 이월(`cys.rs::gate_carry_ok`)과 같은 술어.
-        layout_ok: alt_screen && cys::readiness::waiting_prompt_layout_positive(&obs.screen, marker),
+        // ★(리뷰 R2(R7회차) · 리뷰어 2인) 약한 증거(어댑터 플레이스홀더 · 마커 위 상태줄)는 **출력
+        //   정적**과 AND 다 — 그 프레임들은 정상 composer 와 문자열이 같아 화면만으로 갈리지 않는다.
+        //   alt 분기는 아래에서 `quiet_for >= quiet` 를 어차피 요구하므로 같은 조건의 선반영이고,
+        //   이 축이 없으면 claude 문면이 없는 어댑터(codex)는 alt-screen 에서 영구 보류다.
+        layout_ok: alt_screen
+            && cys::readiness::composer_layout_static_ok(
+                &obs.screen,
+                marker,
+                placeholder,
+                Some(obs.quiet_secs >= quiet),
+            ),
         quiet_for: obs.quiet_secs,
-        quiet: queue_quiet_secs(),
+        quiet,
         frame_published: obs.frame_published(),
         frame_consistent: obs.frame_consistent(),
     }
@@ -5238,6 +5270,21 @@ pub(crate) struct Delivered {
 ///   None. 바깥 판정만 두면 틱과 RPC 가 둘 다 통과한 뒤 연달아 배달한다(codex Q9).
 /// - **만료 재확인** — 머리가 TTL 을 넘겼으면 만료 큐로 옮기고 배달하지 않는다(틱 머리 스윕과
 ///   배달 사이·강제 배달 경로 · codex #12). 병합 후보(같은 발신자 연속분)도 만료분은 뺀다.
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) **인계 시점 화면 재평가**의 재료.
+///
+/// 비-alt(B1) 경로는 세대 불변을 요구하지 않는다 — 그 계약이 스트리밍 중 배달을 허용하고, 요구하면
+/// 연속 출력 노드가 영구 기아다(기아 #1). 그러나 그 때문에 판정(짝수 20) 이후 인계 전에 화면이
+/// **완결된 채로** 바뀌어도(짝수 22 — 모달을 다 그렸거나 alt 로 전환) 20 의 승인으로 본문이 나갔다.
+/// 이 구조체를 넘긴 경로는 세대가 바뀐 순간 [`prompt_gate_verdict`] 를 **현재 프레임**에 다시 돌린다.
+pub(crate) struct ScreenRecheck {
+    pub(crate) marker: String,
+    pub(crate) placeholder: Option<String>,
+    /// 판정이 본 출력 세대. 인계 시점에 이 값이 그대로면 재평가하지 않는다(같은 프레임).
+    pub(crate) gen_at_verdict: u64,
+    /// 판정 시점의 승인·관문 feed. 인계 시점에 **다시 읽어** 이 값과 다르면 배달하지 않는다.
+    pub(crate) approval_pending: bool,
+}
+
 pub(crate) fn deliver_head_locked(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
@@ -5246,6 +5293,7 @@ pub(crate) fn deliver_head_locked(
     expect_head_id: Option<&str>,
     expect_pending: Option<u64>,
     expect_output_gen: Option<u64>,
+    recheck: Option<&ScreenRecheck>,
 ) -> Option<Delivered> {
     let now = now_epoch();
     let default_ttl = crate::state::queue_ttl_default_secs();
@@ -5283,6 +5331,38 @@ pub(crate) fn deliver_head_locked(
             // ★(0.14.31 · 리뷰 R5 · codex major) 정적(quiet) 기반 판정은 **그 프레임**이어야 한다.
             if now_gen != gen {
                 break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
+            }
+        }
+        // ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) 세대 불변을 **요구하지 않는** 경로(비-alt B1)의
+        //   안전축 재평가. 종전에는 여기서 홀수만 봤으므로, 판정(짝수 20) 이후 인계 전에 화면이
+        //   **완결된 채로** 바뀌어(짝수 22) 모달이 다 그려지거나 alt 로 전환돼도 20 의 승인으로
+        //   본문이 나갔다(codex 반례). 지금은 그때 **같은 순수 판정자**를 현재 프레임에 다시 돌린다.
+        //   ⓐ 새 quiet 임계를 만들지 않는다 — 비-alt 계약("프롬프트 박스가 열려 있으면 출력 중이라도
+        //     주입")은 그대로다. 재평가 결과가 alt 이면 alt 축(레이아웃·정적·일관성)이 그대로 걸린다.
+        //   ⓑ 재평가 관측 자체는 **한 프레임의 사실**이어야 한다(`frame_consistent`) — 화면 복사와
+        //     세대 읽기 사이에 reader 가 다른 화면을 발행하면 그 재평가가 합성이다(codex R7 D5).
+        //   ⓒ 승인 feed 는 화면 세대와 무관하게 바뀔 수 있으므로 **세대 변화와 무관하게** 다시 읽는다.
+        //   【한계 — 정직】 이 검사 뒤 `try_send` 전에 새 청크가 도착하는 창은 여전히 남는다
+        //   (reader 는 `input_gate` 를 공유하지 않는다 — 백로그 ⑭).
+        if let Some(rc) = recheck {
+            if approval_or_gate_pending(daemon, s.id) != rc.approval_pending {
+                break 'tx None; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
+            }
+            if now_gen != rc.gen_at_verdict {
+                let obs = observe_prompt(s, &rc.marker);
+                if !obs.frame_consistent() {
+                    break 'tx None; // 재평가 관측이 한 프레임의 사실이 아니다
+                }
+                let again = prompt_gate_input_with_approval(
+                    s,
+                    &rc.marker,
+                    rc.placeholder.as_deref(),
+                    &obs,
+                    rc.approval_pending,
+                );
+                if matches!(prompt_gate_verdict(&again), PromptGate::Blocked(_)) {
+                    break 'tx None; // 지금 화면은 배달 자격이 없다 — 메시지 보존(다음 틱 재시도)
+                }
             }
         }
         if min_interval > 0 {
@@ -6060,16 +6140,45 @@ fn load_adapter_defs() -> (serde_json::Value, serde_json::Value) {
     (disk, embed)
 }
 
-/// 이 좌석의 커서행 프롬프트 마커(어댑터 미등록 좌석·마커 미정의 어댑터는 None = quiet 폴백).
+/// ★(0.14.31 · 리뷰 R2(R7회차)) 이 어댑터의 **빈 composer 플레이스홀더**(codex `Ask Codex to do
+/// anything`). 디스크 우선 · 임베드 폴백(`merged_prompt_marker` 와 같은 규약).
+///
+/// 【왜 필요한가】 레이아웃 양성 증거(`PROMPT_TRAILER_TOKENS`·괘선)는 **claude 문면**이다. codex 유휴
+/// composer 에는 둘 다 없고 마커 뒤에 플레이스홀더가 있어, alt-screen 좌석이면 `BLOCKED_ALT_SCREEN`
+/// 영구 보류였다(WP-5 기아 계급 · 리뷰 R7 minor). 플레이스홀더는 **약한 증거**이므로 판정부가
+/// 출력 정적과 AND 한다(`readiness::composer_layout_static_ok`).
+fn merged_composer_placeholder(
+    disk: &serde_json::Value,
+    embed: &serde_json::Value,
+    agent: &str,
+) -> Option<String> {
+    for v in [disk, embed] {
+        if let Some(m) = v
+            .get(agent)
+            .and_then(|a| a.get("composer_placeholder"))
+            .and_then(|m| m.as_str())
+            .filter(|m| !m.trim().is_empty())
+        {
+            return Some(m.to_string());
+        }
+    }
+    None
+}
+
+/// 이 좌석의 커서행 프롬프트 마커(어댑터 미등록 좌석·마커 미정의 어댑터는 None = quiet 폴백)와
+/// 빈 composer 플레이스홀더.
 fn surface_prompt_marker(
     s: &Arc<crate::state::Surface>,
     adapters: &(serde_json::Value, serde_json::Value),
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     s.agent_meta
         .lock()
         .unwrap()
         .clone()
-        .and_then(|(agent, _)| merged_prompt_marker(&adapters.0, &adapters.1, &agent))
+        .and_then(|(agent, _)| {
+            merged_prompt_marker(&adapters.0, &adapters.1, &agent)
+                .map(|m| (m, merged_composer_placeholder(&adapters.0, &adapters.1, &agent)))
+        })
 }
 
 /// ★(0.14.31 · WP-5) 마커 없는 좌석(맨 셸·마커 미선언 어댑터)의 **안전 게이트** — quiet 폴백은
@@ -6154,16 +6263,27 @@ pub(crate) fn force_deliver_entry(
     }
     // 게이트 ⑦ 프롬프트 게이트 — 틱 배달과 같은 판정(마커 좌석) / 안전 게이트 + quiet 하한(그 외).
     let adapters = load_adapter_defs();
+    let mut recheck: Option<ScreenRecheck> = None;
     let (expect_pending, expect_gen) = match surface_prompt_marker(s, &adapters) {
-        Some(marker) => {
+        Some((marker, placeholder)) => {
             // ★(리뷰 R5) 틱과 **같은 관측 규약** — quiet 는 화면과 한 창에서 뜬다.
             let obs = observe_prompt(s, &marker);
-            let input = prompt_gate_input(daemon, s, &marker, &obs);
+            let input = prompt_gate_input(daemon, s, &marker, placeholder.as_deref(), &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 return Err(ForceDeliverDenied::PromptGate(why));
             }
             // alt-screen 양성 유휴는 정적 기반 판정 — 프레임 신선도를 임계영역에서 재확인.
             let gen = input.alt_screen.then_some(obs.output_gen);
+            // ★(리뷰 R2(R7회차) · codex major M4) 세대를 넘기지 않는 경로(비-alt)는 인계 시점에
+            //   **화면 안전축을 다시 판정**한다(같은 순수 판정자 · 새 quiet 임계 0).
+            if gen.is_none() {
+                recheck = Some(ScreenRecheck {
+                    marker,
+                    placeholder,
+                    gen_at_verdict: obs.output_gen,
+                    approval_pending: input.approval_pending,
+                });
+            }
             (Some(s.pending_input_bytes.load(Ordering::Relaxed)), gen)
         }
         None => {
@@ -6235,7 +6355,16 @@ pub(crate) fn force_deliver_entry(
     // expect_head_id: 게이트·조준과 실배달 사이 창에서 틱이 먼저 배달했거나 clear 가 drain
     // 했으면 무부작용 None → Raced(조준 아닌 다음 항목을 forced 로 오배달하지 않는다).
     // ★(0.14.31) expect_pending: 판정이 본 입력줄 점유량을 임계영역에서 재확인(틱과 동일).
-    deliver_head_locked(daemon, s, true, false, Some(&target.id), expect_pending, expect_gen)
+    deliver_head_locked(
+        daemon,
+        s,
+        true,
+        false,
+        Some(&target.id),
+        expect_pending,
+        expect_gen,
+        recheck.as_ref(),
+    )
         .ok_or(ForceDeliverDenied::Raced)
 }
 
@@ -6366,7 +6495,9 @@ fn deliver_queued(
         //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
         //   마커 없는 quiet 폴백 경로도 같은 값을 쓴다(그 경로도 같은 writer 로 들어간다).
         let pending_at_verdict = s.pending_input_bytes.load(Ordering::Relaxed);
-        let (overdue, expect_gen) = if let Some(marker) = marker.as_deref() {
+        let mut recheck: Option<ScreenRecheck> = None;
+        let (overdue, expect_gen) = if let Some((marker, placeholder)) = marker.as_ref() {
+            let (marker, placeholder) = (marker.as_str(), placeholder.as_deref());
             // ★(리뷰 R5 · codex major) quiet 표본은 관측 **안**에서 뜬다(종전엔 관측 앞에서 따로 떴다).
             let obs = observe_prompt(&s, marker);
             // ★(0.14.31 · B-2②) input_pending 고착 수리 — 화면은 빈 프롬프트·정적·모달 없음인데
@@ -6376,7 +6507,7 @@ fn deliver_queued(
                 block(BLOCKED_INPUT_PENDING);
                 continue;
             }
-            let input = prompt_gate_input(daemon, &s, marker, &obs);
+            let input = prompt_gate_input(daemon, &s, marker, placeholder, &obs);
             match prompt_gate_verdict(&input) {
                 PromptGate::Blocked(why) => {
                     // 사유를 갈라 기록한다 — 손잡이가 다르다(입력줄 점유는 사람이 비워야 풀리고,
@@ -6386,7 +6517,23 @@ fn deliver_queued(
                 }
                 // 프롬프트 경계 배달은 quiet 대기를 거치지 않는다 — overdue(제한 배달) 표식도 아니다.
                 // alt-screen 양성 유휴는 정적 기반이라 프레임 신선도를 임계영역에서 재확인한다.
-                PromptGate::Ready => (false, input.alt_screen.then_some(obs.output_gen)),
+                PromptGate::Ready => {
+                    let gen = input.alt_screen.then_some(obs.output_gen);
+                    // ★(리뷰 R2(R7회차) · codex major M4) 비-alt 경로는 세대를 넘기지 않는다(그 계약이
+                    //   스트리밍 중 배달을 허용한다). 그러나 "판정 뒤 인계 전에 **완결된 채로** 바뀐
+                    //   화면"(짝수 20 → 짝수 22)은 종전에 아무 데서도 걸리지 않았다 — 그 사이 모달이
+                    //   다 그려지거나 alt 로 전환돼도 20 의 승인으로 본문이 나갔다. 지금은 그때
+                    //   **같은 순수 판정자**를 현재 프레임에 다시 돌린다(새 quiet 임계 0).
+                    if gen.is_none() {
+                        recheck = Some(ScreenRecheck {
+                            marker: marker.to_string(),
+                            placeholder: placeholder.map(str::to_string),
+                            gen_at_verdict: obs.output_gen,
+                            approval_pending: input.approval_pending,
+                        });
+                    }
+                    (false, gen)
+                }
             }
         } else {
             // ★(리뷰 R5 · codex major / R6 · codex) 마커 없는 경로도 **정적(quiet) 기반**이고, 그
@@ -6436,6 +6583,7 @@ fn deliver_queued(
             None,
             Some(pending_at_verdict),
             expect_gen,
+            recheck.as_ref(),
         )
         .is_some()
         {
@@ -9830,6 +9978,131 @@ mod tests {
         assert!(s.pending_queue.lock().unwrap().is_empty(), "gemini composer 는 배달 자격: {}", blocked_reason(&s));
     }
 
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · claude minor) **codex alt-screen 좌석이 영구 보류가 아니다.**
+    ///
+    /// R6 의 엄격 레이아웃 술어는 증거 어휘가 claude 문면(괘선 · `for shortcuts`/`bypass permissions`/
+    /// `shift+tab`)뿐이라, codex 유휴 화면(`› Ask Codex to do anything` + `gpt-6-astra medium · ~`)은
+    /// 어느 축도 서지 않아 alt-screen 이면 `BLOCKED_ALT_SCREEN` 영구 보류였다(WP-5 기아 계급).
+    /// 어댑터 `composer_placeholder` 가 그 자리의 양성 증거이고, **약한 증거**이므로 정적과 AND 다.
+    #[test]
+    fn r7_codex_alt_screen_idle_composer_delivers_via_placeholder() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("codex-alt");
+        let (daemon, s) = wp5_seat("wp5-codex-alt", "codex");
+        let idle = [
+            "  이전 출력 한 줄",
+            "",
+            RULE,
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-6-astra medium · ~/dev/cys-t1/src",
+        ];
+        // ⓐ 정적 + 플레이스홀더 = 배달 자격(영구 보류 해소).
+        let e = daemon.next_queue_entry("[리뷰 의뢰] codex alt".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        paint_screen(&s, &idle, 4, 2, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "codex alt-screen 유휴 composer 가 영구 보류다: {}",
+            blocked_reason(&s)
+        );
+        // ⓑ 정적이 아니면(약한 증거 단독) 종전과 같은 거부다 — 재도색 중 프레임을 열지 않는다.
+        let e2 = daemon.next_queue_entry("[리뷰 의뢰] 출력 중".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e2);
+        s.set_pending_input(0);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        paint_screen(&s, &idle, 4, 2, true);
+        quiet_since(&s, 0);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "약한 증거가 정적 없이 배달 자격을 얻었다");
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN, "사유가 레이아웃 미확인이 아니다");
+        // ⓒ 플레이스홀더가 아닌 문면(사람이 치던 초안)은 어떤 정적에서도 거부다.
+        let mut drafted = idle;
+        drafted[4] = "› 진행해줘";
+        paint_screen(&s, &drafted, 4, 2, true);
+        quiet_since(&s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "초안이 그려진 composer 에 배달했다");
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+    }
+
+    /// ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) **완결된(짝수→짝수) 화면 변화도 인계에서 걸린다.**
+    ///
+    /// 비-alt(B1) 경로는 세대를 넘기지 않는다 — 그 계약이 스트리밍 중 배달을 허용한다. 그래서 R6 까지
+    /// 는 판정(짝수 20) 이후 인계 전에 화면이 **다 그려진 채로** 모달로 바뀌어도(짝수 22) 20 의 승인으로
+    /// 본문이 나갔다. 지금은 그때 같은 순수 판정자를 현재 프레임에 다시 돌린다.
+    #[test]
+    fn r7_completed_frame_change_revalidates_screen_safety_at_handoff() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("handoff");
+        let (daemon, s) = wp5_seat("wp5-handoff", "claude");
+        let idle = ["  이전 출력", "", RULE, "❯ ", RULE, STATUS1, STATUS2];
+        let modal = [
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. No, exit",
+            "Enter to confirm · Esc to cancel",
+        ];
+        let refill = |tag: &str| {
+            let e = daemon.next_queue_entry(format!("[보고] {tag}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+            s.set_pending_input(0);
+            *s.last_queue_delivery_at.lock().unwrap() = None;
+        };
+        // 판정 시점: 비-alt 유휴 composer(세대 짝수).
+        paint_screen(&s, &idle, 3, 2, false);
+        quiet_since(&s, 10);
+        let gen0 = s.output_gen.load(AtomicOrdering::Acquire);
+        let rc = |gen: u64, approval: bool| super::ScreenRecheck {
+            marker: "❯".to_string(),
+            placeholder: None,
+            gen_at_verdict: gen,
+            approval_pending: approval,
+        };
+        // ⓐ 인계 전에 화면이 **완결된 채로** 모달이 됐다(짝수 → 짝수 · 홀수 축은 이것을 못 본다).
+        refill("모달로 바뀜");
+        paint_screen(&s, &modal, 1, 2, false);
+        s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
+        let now_gen = s.output_gen.load(AtomicOrdering::Acquire);
+        assert_eq!(now_gen % 2, 0, "전제 붕괴: 발행 중(홀수)이면 종전 축이 이미 잡는다");
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)))
+                .is_none(),
+            "판정 이후 다 그려진 모달에 본문을 배달했다"
+        );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부인데 항목이 사라졌다(유실)");
+        // ⓑ 적색 증명(in-band) — 재평가를 넘기지 않으면 **같은 프레임에서 배달된다**(R6 의 그 구멍).
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_some(),
+            "계측 무효: 재평가가 없어도 막힌다면 이 검체는 M4 를 재지 못한다"
+        );
+        // ⓒ 가용성 — 화면이 그대로면 세대가 바뀌어도 배달된다(스트리밍 노드의 기아를 만들지 않는다).
+        refill("스트리밍 중");
+        paint_screen(&s, &idle, 3, 2, false);
+        quiet_since(&s, 10);
+        s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
+        let gen2 = s.output_gen.load(AtomicOrdering::Acquire);
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen2 - 2, false)))
+                .is_some(),
+            "세대가 바뀌었다는 이유만으로 정상 composer 배달이 막혔다(기아 #1 방향 회귀)"
+        );
+        // ⓓ 승인 feed 는 세대와 무관하게 바뀔 수 있다 — 판정 시점 값과 다르면 배달하지 않는다.
+        refill("승인 축");
+        paint_screen(&s, &idle, 3, 2, false);
+        quiet_since(&s, 10);
+        let gen3 = s.output_gen.load(AtomicOrdering::Acquire);
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen3, true)))
+                .is_none(),
+            "판정 이후 승인·관문 feed 가 바뀌었는데 그 승인으로 배달했다"
+        );
+    }
+
     /// surface 당 배달 최소 간격 10s — 두 번째 배달은 다음 간격까지 보류(사유 delivery_interval),
     /// 시계를 11s 전으로 옮기면 배달된다. 노브를 끄지 않는다.
     #[test]
@@ -10007,7 +10280,7 @@ mod tests {
         let gen = s.output_gen.load(AtomicOrdering::Acquire);
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel); // 청크 하나가 완전히 흘렀다
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen)).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), None).is_none(),
             "판정이 본 프레임이 아닌데 배달했다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "전제: 머리가 있어야 검사가 유효하다");
@@ -10016,21 +10289,21 @@ mod tests {
         let odd = s.output_gen.load(AtomicOrdering::Acquire);
         assert_eq!(odd % 2, 1, "전제 붕괴: 홀수를 만들지 못했다");
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd)).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd), None).is_none(),
             "홀수 세대가 동일 비교만으로 통과했다"
         );
         // ★(리뷰 R1(R6회차) · codex major) 판정이 세대를 **넘기지 않는 경로**(비-alt B1 · 마커 없는
         //   강제 배달)도 인계 시점에 발행 중이면 배달하지 않는다 — 종전에는 `None` 이면 홀수 검사
         //   자체가 없었다.
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
             "expect_output_gen=None 경로가 발행 중(홀수) 인계를 통과시켰다"
         );
         // 가용성 대조군 — 짝수로 닫고 같은 값을 넘기면 **곧바로** 배달된다(축이 상시 닫히지 않는다).
         s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
         let even = s.output_gen.load(AtomicOrdering::Acquire);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even)).is_some(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), None).is_some(),
             "발행이 끝난 프레임인데 인계가 거부했다(기아 — 축이 상시 닫혔다)"
         );
     }
@@ -10185,7 +10458,7 @@ mod tests {
         e.enqueued_at = now_epoch() - 7.0 * 3600.0;
         let id = e.id.clone();
         s.pending_queue.lock().unwrap().push_back(e);
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
         assert!(s.pending_queue.lock().unwrap().is_empty());
         assert!(s.expired_queue.lock().unwrap().iter().any(|x| x.id == id));
         assert!(
@@ -10465,7 +10738,7 @@ mod tests {
         // ⓐ 판정이 본 값(0) 과 배달 시점 값(직접 send 가 끼어들어 12)이 다르면 **배달하지 않는다**.
         s.pending_input_bytes.store(12, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_none(),
             "판정 이후 직접 send 가 입력줄을 점유했는데 큐를 밀어 넣었다 — 두 본문이 한 제출로 합쳐진다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미배달분은 보존돼야 한다");
@@ -10473,7 +10746,7 @@ mod tests {
         // ⓑ 음성 대조: 값이 그대로면 정상 배달된다(무조건 거부 구현 차단).
         s.pending_input_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None).is_some(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_some(),
             "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다"
         );
     }
@@ -11053,7 +11326,7 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         // 빈 큐 = None + 이벤트 0(부작용 없음).
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
         assert_eq!(
             daemon
                 .bus
@@ -11071,7 +11344,7 @@ mod tests {
             q.push_back(e1);
             q.push_back(e2);
         }
-        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None).expect("머리 배달");
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None).expect("머리 배달");
         assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
         assert_eq!(d.remaining, 1);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
@@ -11115,7 +11388,7 @@ mod tests {
         let e1 = daemon.next_queue_entry("현재 머리".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e1.clone());
         // 조준(다른 id)과 머리 불일치 → 배달·pop·이벤트 전무.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None, None).is_none());
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "불일치 시 pop 금지");
         assert_eq!(
             daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.delivered").count(),
@@ -11123,7 +11396,7 @@ mod tests {
             "불일치 시 배달 영수증도 없다(무부작용)"
         );
         // 대조군: 일치하면 정상 배달.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None).is_some());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None, None).is_some());
         assert!(s.pending_queue.lock().unwrap().is_empty());
     }
 

@@ -8357,39 +8357,91 @@ mod seat_latch_negation_tests {
             cys::readiness::modal_signature(repainting).is_none(),
             "전제 붕괴: 모달 서명이 이미 잡는 화면이면 이 검체는 이월 축을 재지 못한다"
         );
+        let carry = |v: GateRecheck, screen: &str| {
+            gate_recheck_with_carry(v, true, false, Some("❯"), None, screen, Some(true))
+        };
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), Some("❯"), repainting, Some(true)),
+            carry(GateRecheck::Adopt(ev), repainting),
             GateRecheck::CarryUnproven,
             "재도색 중 프레임이 재부트 채택으로 흘렀다(주입 + Return 이 선택지로 나간다)"
         );
         // ② 사람이 통과시킨 라이브 프롬프트는 그대로 채택된다(가용성 — 영구 보류 금지).
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), Some("❯"), live, Some(true)),
+            carry(GateRecheck::Adopt(ev), live),
             GateRecheck::Adopt(ev),
             "관문 통과 뒤 라이브 그리드에서도 채택이 막힌다(디렉티브 영구 미주입 = 치명위험 ③)"
         );
         // ②' 2.1.241 레이아웃(상태줄이 프롬프트 **위**)도 채택된다 — codex R6 의 '영구 보류 반례'.
         assert_eq!(
-            gate_recheck_with_carry(
-                GateRecheck::Adopt(ev),
-                Some("❯"),
-                cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
-                Some(true)
-            ),
+            carry(GateRecheck::Adopt(ev), cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             GateRecheck::Adopt(ev),
             "상태줄이 프롬프트 위에 오는 레이아웃이 영구 보류가 된다(그 좌석은 채택 자체가 불가능해진다)"
         );
+        // ②'' ★(리뷰 R2(R7회차) · codex blocking B2) 그 예외는 **이 composer 의 상태줄**에만 준다 —
+        //      스크롤백에 남은 역사적 상태줄 위에 괘선이 끼면 거짓이다(라벨 미도색 선택기 반례).
+        assert_eq!(
+            carry(GateRecheck::Adopt(ev), "? for shortcuts\n────────────────────────\n❯ \n"),
+            GateRecheck::CarryUnproven,
+            "역사적 상태줄 한 줄이 이월 가드를 통째로 무력화한다(B2 재발)"
+        );
+        // ②''' ★(리뷰 R2(R7회차) · 리뷰어 2인 blocking) codex 레이아웃 — `prompt_marker`(›)와
+        //       플레이스홀더가 있어야 채택된다. `ready_marker`(`? for shortcuts`)로는 영원히 거짓이다.
+        let codex_idle = "• DIRECTIVE-ACK-11137\n\n────────────────────────\n\n\n                          › Ask Codex to do anything\n\n  gpt-6-astra medium · ~/dev/cys-t1/src\n";
+        let codex_idle = codex_idle.replace("                          ", "");
+        assert_eq!(
+            gate_recheck_with_carry(
+                GateRecheck::Adopt(ev),
+                true,
+                false,
+                Some("›"),
+                Some("Ask Codex to do anything"),
+                &codex_idle,
+                Some(true)
+            ),
+            GateRecheck::Adopt(ev),
+            "codex 유휴 composer 가 영구 보류다(carry-unproven 에 탈출 경로가 없다 = 치명위험 ③)"
+        );
+        assert_eq!(
+            gate_recheck_with_carry(
+                GateRecheck::Adopt(ev),
+                true,
+                false,
+                Some("? for shortcuts"),
+                None,
+                &codex_idle,
+                Some(true)
+            ),
+            GateRecheck::CarryUnproven,
+            "전제 붕괴: ready_marker 로도 통과하면 이 검체는 마커 해소를 재지 못한다"
+        );
+        // ②'''' 롤백 계약 — `legacy_v1` 이면 이 축 자체가 없다(정본 §4 WP-1).
+        assert_eq!(
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), true, true, Some("❯"), None, repainting, Some(true)),
+            GateRecheck::Adopt(ev),
+            "롤백 스위치가 이 축을 끄지 못한다(되돌릴 수 없는 보류)"
+        );
+        // ②''''' ★(리뷰 R2(R7회차) · claude major) 표식이 **관문을 못 본** 타임아웃 산물이면
+        //         부트 폴링과 같은 요구(이월 없음)를 받는다.
+        assert!(!gate_mark_saw_a_gate(None) && !gate_mark_saw_a_gate(Some(GATE_ID_UNIDENTIFIED)));
+        assert!(gate_mark_saw_a_gate(Some("folder-trust")) && gate_mark_saw_a_gate(Some("unknown-modal")));
+        assert_eq!(
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), false, false, Some("❯"), None, repainting, Some(true)),
+            GateRecheck::Adopt(ev),
+            "관문을 본 적 없는 표식(readiness 타임아웃)이 재관측에서만 더 엄한 요구를 받는다(판정 분리)"
+        );
+        assert_eq!(
+            gate_mark_id(Some(&json!({"gate_pending": {"gate": "folder-trust"}}))).as_deref(),
+            Some("folder-trust")
+        );
+        assert_eq!(gate_mark_id(Some(&json!({"gate_pending": null}))), None);
+        assert_eq!(gate_mark_id(None), None);
         // ③ Ready 가 아닌 판정은 이월과 무관하게 그대로다(새 규약을 만들지 않는다).
         for v in [
             GateRecheck::StillHeld { gate_id: "folder-trust".into(), title: "t".into() },
             GateRecheck::NoEvidence,
             GateRecheck::Unobserved,
         ] {
-            assert_eq!(
-                gate_recheck_with_carry(v.clone(), Some("❯"), repainting, Some(true)),
-                v,
-                "이월이 다른 판정을 덮어썼다"
-            );
+            assert_eq!(carry(v.clone(), repainting), v, "이월이 다른 판정을 덮어썼다");
         }
         // ④ 배선 핀 — 재관측이 그 술어를 **실제로** 태운다(순수 함수만 있고 호출이 없으면 무의미).
         let src = include_str!("cys.rs");
@@ -8414,27 +8466,49 @@ mod seat_latch_negation_tests {
         // ① 관문을 본 적 없다 = 종전 그대로(어떤 화면이든 Ready 를 막지 않는다).
         for screen in ["❯ \n", live, ""] {
             assert!(
-                gate_carry_ok(false, Some("❯"), screen, None),
+                gate_carry_ok(false, false, Some("❯"), None, screen, None),
                 "건강한 부트에 이월이 걸렸다(회귀): {screen:?}"
             );
         }
         // ② 관문을 봤다 + 라벨이 사라진 프레임 = **보류**(그 틈이 R5 blocking 의 자리다).
         for screen in ["❯ \n", "❯ ", "\n"] {
             assert!(
-                !gate_carry_ok(true, Some("❯"), screen, Some(true)),
+                !gate_carry_ok(true, false, Some("❯"), None, screen, Some(true)),
                 "재도색 중 프레임에 주입이 열렸다: {screen:?}"
             );
         }
         // ③ 관문을 봤어도 **대기 프롬프트 레이아웃**이 관측되면 열린다(가용성 — 사람이 통과시킨 뒤).
         assert!(
-            gate_carry_ok(true, Some("❯"), live, None),
+            gate_carry_ok(true, false, Some("❯"), None, live, None),
             "관문 통과 뒤 라이브 프롬프트에서도 이월이 안 풀린다(영구 보류)"
         );
         // ④ 마커 미정의 어댑터는 출력 정적으로 대신한다 — 미관측(None)은 참으로 접지 않는다.
-        assert!(gate_carry_ok(true, None, "…", Some(true)));
+        assert!(gate_carry_ok(true, false, None, None, "…", Some(true)));
         for q in [None, Some(false)] {
-            assert!(!gate_carry_ok(true, None, "…", q), "미관측/출력 중에 열렸다: {q:?}");
+            assert!(!gate_carry_ok(true, false, None, None, "…", q), "미관측/출력 중에 열렸다: {q:?}");
         }
+        // ④' ★(리뷰 R2(R7회차)) 롤백(`legacy_v1`)이면 축 자체가 없다 — 어떤 화면·어떤 마커에서도 참.
+        for screen in ["❯ \n", "", "────\n❯ "] {
+            assert!(
+                gate_carry_ok(true, true, Some("❯"), None, screen, Some(false)),
+                "롤백 스위치가 이 축을 끄지 못한다: {screen:?}"
+            );
+        }
+        // ④'' 어댑터 키 해소 — `prompt_marker` 가 있으면 그것이 composer 마커다(부트 judge 의
+        //      `ready_marker` 와 다른 값 · 리뷰어 2인 blocking).
+        let codex = json!({"ready_marker": "? for shortcuts", "prompt_marker": "›",
+                           "composer_placeholder": "Ask Codex to do anything"});
+        assert_eq!(composer_marker_of(&codex).as_deref(), Some("›"));
+        assert_eq!(composer_placeholder_of(&codex).as_deref(), Some("Ask Codex to do anything"));
+        let claude = json!({"ready_marker": "❯"});
+        assert_eq!(composer_marker_of(&claude).as_deref(), Some("❯"), "claude 는 종전과 같은 값이어야 한다");
+        assert_eq!(composer_placeholder_of(&claude), None);
+        assert_eq!(composer_marker_of(&json!({"ready_marker": "", "prompt_marker": ""})), None, "빈 문자열 = 미정의");
+        // ④''' 임베드 어댑터 정본이 두 신 키를 실제로 들고 있는가(계층이 전달할 값이 없으면 무의미).
+        let embed = embedded_agents_json().expect("임베드 agents.json");
+        assert_eq!(composer_marker_of(&embed["codex"]).as_deref(), Some("›"));
+        assert_eq!(composer_marker_of(&embed["gemini"]).as_deref(), Some(">"));
+        assert!(composer_placeholder_of(&embed["codex"]).is_some(), "codex 플레이스홀더 정본이 없다");
         // ⑤ 배선 핀 — 부트 폴링이 관문(GateHeld)에서 래치를 세우고 Ready 에서 이 술어를 본다.
         let src = include_str!("cys.rs");
         // ★문자열을 **조립**한다 — 이 파일을 스캔하는 하네스(H-PRED-8·H-SEAT-4AXIS)가
@@ -8807,8 +8881,11 @@ mod seat_latch_negation_tests {
         };
         let body = fn_body("run_boot");
         for anchor in [
-            // 스폰 0 의 재관측을 부른다.
-            "gate_pending_reobserve(sid, agent)",
+            // 스폰 0 의 재관측을 부른다. ★(리뷰 R2(R7회차)) 표식이 기록한 관문 id 를 함께 넘긴다 —
+            //   '관문을 본 적 없는 타임아웃 산물' 이 재관측에서만 더 엄한 요구를 받지 않게(claude major).
+            "gate_pending_reobserve(sid, agent, marked_gate.as_deref())",
+            // 표식의 관문 id 를 읽는 지점 자체도 앵커다(읽지 않으면 래치가 상수로 굳는다).
+            "let marked_gate = gate_mark_id(seat.as_ref());",
             // Ready 면 표식 해제 + 디렉티브 주입(판정 이후 절반 재사용).
             "gate_pending_adopt(sid, role, agent)",
         ] {
@@ -9587,12 +9664,23 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                 .unwrap_or("")
                 .to_string();
             let sid = seat.as_ref().and_then(|r| r["surface_id"].as_u64());
+            let marked_gate = gate_mark_id(seat.as_ref());
             // ── ★(M2) 비파괴 재관측: `read_text` 1회 + `readiness::judge` 1회. 스폰 0 ──
             let recheck = match sid {
-                Some(sid) => gate_pending_reobserve(sid, agent),
+                Some(sid) => gate_pending_reobserve(sid, agent, marked_gate.as_deref()),
                 // surface_id 를 못 읽으면 재관측 **대상 자체를 모른다** — 관측 실패 등급(보류는 종전과 동일).
                 None => GateRecheck::Unobserved,
             };
+            // ★(0.14.31 · 리뷰 R2(R7회차) · codex major D4) 재관측이 **관문 상주**를 봤는데 표식에는
+            //   그 사실이 없으면(타임아웃 산물의 `unknown`), 그 관측을 **영속화**한다. 안 하면 다음
+            //   부트의 라벨 미도색 프레임에서 이월 래치가 서지 않아 무방비로 채택된다 — 이번 회차가
+            //   래치를 표식의 관문 id 로 옮겼기 때문에 생기는 인접 구멍이고, 같은 회차에서 닫는다.
+            //   `followup=None` 이므로 데몬은 기존 복원 연속 지시를 **보존**한다(지시 소실 0).
+            if let (GateRecheck::StillHeld { gate_id, .. }, Some(sid)) = (&recheck, sid) {
+                if !gate_mark_saw_a_gate(marked_gate.as_deref()) && gate_mark_saw_a_gate(Some(gate_id)) {
+                    mark_gate_pending(sid, gate_id, "재관측이 관문 상주를 확인했다(관측 이력 영속화)", None);
+                }
+            }
             // ★(0.14.31 · 리뷰 R3b · codex) 채택을 **표식 판독 실패로 미룬** 사실. 관문이 재발한 것과
             //   달리 사람이 할 조치가 없으므로(관문은 이미 통과했다) 처방 문안이 달라야 한다.
             let mut adopt_unread: Option<String> = None;
@@ -9690,10 +9778,12 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                 "관문이 아직 떠 있는지 **관측하지 못했다**(화면 읽기 실패) — 먼저 `cys read-screen` 으로 화면을 \
                  1회 확인하라. 관문이 없으면 다음 `cys boot` 이 스폰 없이 이 좌석을 채택한다"
             } else if carry_unproven {
-                "화면은 읽었고 관문 서명도 없었지만 **입력 상자(대기 프롬프트) 레이아웃 증거가 없다** — 재도색 \
-                 중이라 선택지 라벨이 아직 안 그려진 관문일 수 있어 주입 0 · 키 0 으로 보류했다. \
-                 `cys read-screen` 으로 화면을 1회 확인하라(관문이면 통과시키고, 정상 입력창이면 다음 \
-                 `cys boot` 이 스폰 없이 채택한다)"
+                // ★(0.14.31 · 리뷰 R2(R7회차) · codex major M3) 종전 문안은 "정상 입력창이면 다음 부트가
+                //   채택한다" 고만 말했다. 그 좌석의 레이아웃이 이 술어의 양성 어휘 밖이면 **다음 부트도
+                //   같은 판정**이라 그 약속이 거짓이다(듣지 않는 손잡이). 그래서 처방이 **실제로 구현된**
+                //   회복 동작 둘을 지목한다: ⓐ화면 1회 확인(관문이면 통과) ⓑ그래도 같은 판정이면
+                //   마스터 롤백 스위치로 이 축을 끄고 1회 채택(종전 동작 · `gate_carry_ok` 의 `legacy_v1`).
+                CARRY_UNPROVEN_HINT
             } else {
                 "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다(재부트가 스폰 없이 이 좌석을 채택한다)"
             };
@@ -10038,10 +10128,16 @@ fn fill_missing_fields(resolved: &mut Value, embedded: Option<&Value>) {
     // ★(U-12 · K-1) `first_run_gates` 추가 — 이 키는 **기존 설치 기계의 디스크 파일에 없다**.
     //   그래서 계층이 채우고, 그 결과 첫기동 관문 정책이 **결함이 있는 바로 그 기계들에도
     //   도달한다**(값 수정 경로로는 영원히 도달하지 못한다 — 아래 무접촉 규칙 때문이다).
-    const LAYERED_KEYS: [&str; 3] = [
+    // ★(0.14.31 · 리뷰 R2(R7회차)) `prompt_marker`·`composer_placeholder` 도 같은 이유로 계층 대상이다 —
+    //   둘 다 **신규 키**라 기존 설치본 디스크 파일에 없고(사용자 소유라 vendor 갱신이 도달하지 않는다),
+    //   관문 증거 이월(`gate_carry_ok`)이 그 값으로 composer 를 식별한다. 못 받으면 codex·gemini 좌석이
+    //   `carry-unproven` 영구 보류가 된다(치명위험 ③).
+    const LAYERED_KEYS: [&str; 5] = [
         "ready_marker",
         "approval_patterns",
         cys::first_run_gates::ADAPTER_KEY,
+        "prompt_marker",
+        "composer_placeholder",
     ];
     // 보강 사실을 사람에게 알릴 키. `first_run_gates` 는 제외한다 —
     //   ① 이 키는 **모든 기존 기계에서 매번** 결손이라 매 launch 마다 같은 줄이 나간다(순수 소음).
@@ -10902,6 +10998,19 @@ const GATE_REASON_RECHECK_UNOBSERVED: &str = "recheck-unobserved";
 /// `recheck-unobserved`(화면을 아예 못 읽음)와도 다른 사실이다(화면은 읽었다).
 const GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven";
 
+/// `carry-unproven` 의 사람 처방 — **구현된 회복 동작만** 지목한다(리뷰 R2(R7회차) · codex major).
+/// 롤백 스위치 이름은 [`cys::ENV_BOOT_GATES`] 하나이고, 그 값이 이 축을 실제로 끈다([`gate_carry_ok`]).
+const CARRY_UNPROVEN_HINT: &str = "화면은 읽었고 관문 서명도 없었지만 **입력 상자(대기 프롬프트) 레이아웃 증거가 없다** — 재도색 중이라 선택지 라벨이 아직 안 그려진 관문일 수 있어 주입 0 · 키 0 으로 보류했다. ⓐ먼저 `cys read-screen` 으로 화면을 1회 확인하라(관문이면 사람이 통과시킨다). ⓑ화면이 **정상 입력창인데도** 다음 `cys boot` 이 같은 판정을 내면 그 레이아웃은 이 축의 양성 어휘 밖이다 — `CYS_BOOT_GATES=0 cys boot` 으로 이 축을 끄고 1회 채택하라(종전 판정 복귀 · 그 부트에서만 유효).";
+
+/// ★(0.14.31 · 리뷰 R2(R7회차) · codex major D4) **주입 도중 가드가 걸린** 보류의 관문 id.
+///
+/// 종전에는 이 자리도 [`GATE_ID_UNIDENTIFIED`] 를 찍었다. 그러면 "관문을 한 번도 못 본 readiness
+/// 타임아웃" 과 "관문·모달을 **실제로 보고** 주입을 멈춘 좌석" 이 표식에서 구별되지 않는다 —
+/// 재부트 채택의 이월 래치([`gate_mark_saw_a_gate`])가 그 구별을 읽으므로, 섞이면 실제 관측 이력이
+/// 소실되어 다음 부트의 **라벨 미도색 프레임**이 무방비로 채택된다(codex 반례). 사람이 읽는
+/// 사유로도 정확하다(가드가 무엇을 봤는지는 화면 꼬리가 근거다).
+const GATE_ID_INJECT_HELD: &str = "inject-guard-held";
+
 /// 채택 직전 `surface.list` 재시도 횟수·간격·**총 예산**. BUDGET 파리티 블록이 아니다(python 쪽 leaf 가 없다).
 ///
 /// 값의 근거: 이 왕복은 로컬 소켓 1회이고, 재시도가 실제로 이기는 실패는 **빠른** 실패다 —
@@ -11276,6 +11385,10 @@ fn boot_agent_on_surface(
 
     // 2) 준비 감지 폴링: 폴더 신뢰 프롬프트는 자동 확인, ready_marker가 보이면 주입 단계로
     let ready_marker = spec["ready_marker"].as_str().map(|s| s.to_string());
+    // ★(0.14.31 · 리뷰 R2(R7회차)) 관문 증거 이월 전용 — composer 행의 프롬프트 글리프와 플레이스홀더.
+    //   `judge` 의 마커(`ready_marker`)와 **다른 값**이다(부트 판정 폭 불변 · `gate_carry_ok` doc ⓐ).
+    let composer_marker = composer_marker_of(&spec);
+    let composer_placeholder = composer_placeholder_of(&spec);
     // ★Phase 5 ①b: restore 모드에선 역할별 readiness 대기를 짧게 캡한다(타임아웃+continue). 한
     // 역할이 readiness에서 stall해도 run_restore가 실패로 처리해 다음 역할로 진행하게 해, 한 노드
     // stall이 로스터 전체를 멈추는 것을 막는다(DRILL_LIVE_1: worker spawn 후 중단처럼 보인 근원).
@@ -11321,8 +11434,9 @@ fn boot_agent_on_surface(
     //   (codex R5: "청크 처리 완료 ≠ 위젯 렌더 완료").
     //
     //   【장치】 이 부트에서 관문·모달을 **한 번이라도** 본 좌석은, 그 뒤의 Ready 에 **양성 프롬프트
-    //   증거**를 더 요구한다: 마커 좌석은 대기 프롬프트 레이아웃(`waiting_prompt_layout_positive` — 입력 상자
-    //   괘선·상태줄이 마커 줄 아래에 있다 · WP-5 가 alt-screen 배달에 쓰는 그 술어), 마커 미정의
+    //   증거**를 더 요구한다: composer 마커 좌석은 대기 프롬프트 레이아웃(`composer_layout_static_ok` —
+    //   입력 상자 괘선·상태줄이 마커 줄 아래에 있거나, 약한 증거(마커 위 상태줄·어댑터 플레이스홀더)가
+    //   **출력 정적**과 함께 있다 · WP-5 가 alt-screen 배달에 쓰는 그 술어), 마커 미정의
     //   어댑터는 출력 정적(`idle_quiet`). 둘 다 **코퍼스 밖 양성 증거**라 "라벨이 아직 안 그려진
     //   프레임" 과 "정상 composer" 를 가른다.
     //
@@ -11524,7 +11638,9 @@ fn boot_agent_on_surface(
                 // ★(리뷰 R5) 관문 증거 이월 — 위 `gate_evidence_seen` 주석 참조.
                 let carry_ok = gate_carry_ok(
                     gate_evidence_seen,
-                    ready_marker.as_deref(),
+                    readiness_v1,
+                    composer_marker.as_deref(),
+                    composer_placeholder.as_deref(),
                     text,
                     obs.idle_quiet,
                 );
@@ -11707,11 +11823,13 @@ fn inject_directive_after_ready(
         eprintln!("[launch-agent] {e}");
         // 진단 문안 전용 — 판정이 아니라 에러 본문이라 관측 실패의 빈 문자열이 정확하다.
         let tail = screen_tail_lines(&gate_guard_screen(sid).unwrap_or_default(), 5);
-        // 사전 판정을 통과한 뒤 뜬 관문이므로 id 를 특정하지 않는다 — 화면 꼬리가 근거다
-        // (`readiness_timeout_verdict` 의 `"unknown"` 과 같은 규약).
+        // 사전 판정을 통과한 뒤 뜬 관문이므로 **어느 관문인지는** 특정하지 않는다 — 화면 꼬리가 근거다.
+        // ★(0.14.31 · 리뷰 R2(R7회차) · codex major D4) 그러나 `"unknown"`(= 관문을 **한 번도 못 봤다**)
+        //   과 섞지 않는다. 이 자리의 사실은 "가드가 관문·모달을 **보고** 주입을 멈췄다" 이고, 그 사실이
+        //   표식에서 지워지면 다음 부트의 이월 래치가 서지 않아 라벨 미도색 프레임이 채택된다.
         return Ok(settle_gate_pending(
             sid,
-            GATE_ID_UNIDENTIFIED,
+            GATE_ID_INJECT_HELD,
             tail,
             gate_close_override,
             followup,
@@ -11827,27 +11945,62 @@ fn inject_directive_after_ready(
 /// (`boot_agent_on_surface` 의 `gate_evidence_seen`) 주석에 있다.
 ///
 /// 참(=주입 진행)이 되는 경우:
+///   · **롤백**(`legacy_v1` = `CYS_READINESS_V1=1` ∨ `CYS_BOOT_GATES=0`) — 이 축 자체가 없다.
 ///   · 이 부트에서 관문을 **본 적이 없다**(건강한 부트 — 종전과 한 글자도 다르지 않다).
-///   · 마커 좌석: 지금 화면이 **대기 프롬프트 레이아웃**이다(마커 줄이 빈 입력줄이고 그 아래에
-///     입력 상자 괘선·상태줄이 **실제로 있다** — `waiting_prompt_layout_positive` · WP-5 가 alt-screen
-///     배달 자격에 쓰는 스캐너의 엄격판. 꼬리가 빈 `❯ ` 한 줄은 양성이 아니다).
+///   · composer 마커 좌석: 지금 화면이 **대기 프롬프트 레이아웃**이다(마커 줄이 빈 입력줄 — 어댑터
+///     플레이스홀더도 빈 입력줄이다 — 이고, 그 아래·위에 입력 상자 괘선·상태줄이 **실제로 있다** —
+///     `composer_layout_positive` · WP-5 가 alt-screen 배달 자격에 쓰는 스캐너와 **같은 술어**).
 ///   · 마커 미정의 어댑터: 출력이 **정적**이다(`idle_quiet == Some(true)`). 미관측(`None`)은 참으로
 ///     접지 않는다('부재 ≠ 부정' — 조여지는 방향).
+///
+/// ★(0.14.31 · 리뷰 R2(R7회차) · 리뷰어 2인 공통 blocking) 두 가지가 틀려 있었다:
+///   ⓐ 마커로 **`ready_marker`** 를 넣었다. 그 키는 부트 readiness 가 보는 **화면 꼬리 토큰**이고
+///     (codex·gemini = `? for shortcuts`), composer 행의 프롬프트 글리프는 `prompt_marker` 다
+///     (`cysd::governance::merged_prompt_marker` 의 doc). 그래서 codex·gemini 좌석은 이 술어가
+///     **영원히 거짓** → 관문을 한 번 본 뒤 `carry-unproven` 영구 보류 = 디렉티브 미주입(치명위험 ③).
+///     지금은 [`composer_marker_of`] 가 `prompt_marker → ready_marker` 순서로 해소한다(부트 `judge` 가
+///     보는 마커는 **그대로 `ready_marker`** — 부트 판정 폭은 한 글자도 넓히지 않는다).
+///   ⓑ 롤백 스위치를 보지 않았다. 정본 §4 WP-1 의 롤백 계약은 "노브 하나로 종전 판정 복귀" 인데,
+///     이 축만 스위치 밖에 있어 **되돌릴 수 없는 보류**가 남았다. 지금은 `legacy_v1` 이면 축이 없다.
 fn gate_carry_ok(
     gate_evidence_seen: bool,
+    legacy_v1: bool,
     marker: Option<&str>,
+    placeholder: Option<&str>,
     screen: &str,
     idle_quiet: Option<bool>,
 ) -> bool {
-    if !gate_evidence_seen {
+    if legacy_v1 || !gate_evidence_seen {
         return true;
     }
     match marker {
         // **엄격판**을 쓴다 — 꼬리가 빈 `❯ ` 한 줄은 정상 composer 와 "아직 라벨이 안 그려진 선택기" 가
         // 구별되지 않는 프레임이라, 그것을 양성으로 세면 이 장치가 통째로 무의미해진다(codex R5).
-        Some(m) => cys::readiness::waiting_prompt_layout_positive(screen, m),
+        // ★(리뷰 R2(R7회차) · codex R7 D2·D3) **약한 증거**(마커 위 상태줄 · 어댑터 플레이스홀더)는
+        //   출력 정적과 AND 다 — 그 두 프레임은 문자열이 같아 화면만으로는 갈리지 않고, 갈라 주는
+        //   유일한 사실이 "재도색 중은 정적일 수 없다" 이기 때문이다(근거 전문은 판정부 doc).
+        Some(m) => cys::readiness::composer_layout_static_ok(screen, m, placeholder, idle_quiet),
         None => idle_quiet == Some(true),
     }
+}
+
+/// 이 어댑터의 **composer 행 프롬프트 글리프** — `prompt_marker` → `ready_marker` 순서.
+///
+/// ★`cysd::governance::merged_prompt_marker` 와 **같은 규약**이다(디스크/임베드 계층은 이미
+/// [`load_agent_spec`] 의 `fill_missing_fields` 가 해소해 넘겨준다 — 그래서 여기서는 키 순서만 본다).
+/// 빈 문자열은 미정의와 같다(`readiness::marker_of` 규약).
+fn composer_marker_of(spec: &Value) -> Option<String> {
+    ["prompt_marker", "ready_marker"]
+        .iter()
+        .find_map(|k| spec[*k].as_str().filter(|m| !m.is_empty()).map(String::from))
+}
+
+/// 이 어댑터의 **빈 composer 플레이스홀더**(codex `Ask Codex to do anything`). 없으면 `None`.
+fn composer_placeholder_of(spec: &Value) -> Option<String> {
+    spec["composer_placeholder"]
+        .as_str()
+        .filter(|m| !m.trim().is_empty())
+        .map(String::from)
 }
 
 /// 보류 좌석 재관측의 **판정**(순수 · 진리표 대상). 입력은 `readiness::judge` 의 산출 하나다.
@@ -11896,7 +12049,7 @@ fn gate_pending_recheck(v: cys::readiness::Verdict) -> GateRecheck {
 /// **화면 마커 + 시간 폴백**뿐이다 — 둘 다 `gate_on_screen` 의 AND 항 뒤에 있으므로, 관문이
 /// 떠 있는 한 어느 쪽도 Ready 를 내지 못한다. 시간 폴백은 참으로 준다(이 좌석은 이미 준비
 /// 예산을 한 번 다 쓴 좌석이라 '아직 이르다' 가 성립하지 않는다).
-fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
+fn gate_pending_reobserve(sid: u64, agent: &str, marked_gate: Option<&str>) -> GateRecheck {
     let Some((screen, idle_quiet)) = gate_guard_screen_with_quiet(sid) else {
         // 화면 관측 실패는 **판정 불가**다 — 보류 유지(fail-closed · P4-6 의 loud 규율).
         eprintln!(
@@ -11905,9 +12058,13 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
         );
         return GateRecheck::Unobserved;
     };
-    let marker = load_agent_spec(agent)
-        .ok()
+    let spec = load_agent_spec(agent).ok();
+    let marker = spec
+        .as_ref()
         .and_then(|s| s["ready_marker"].as_str().map(|m| m.to_string()));
+    // ★(0.14.31 · 리뷰 R2(R7회차)) 이월 축은 **composer 마커**로 잰다(`judge` 의 마커와 다른 값).
+    let composer_marker = spec.as_ref().and_then(composer_marker_of);
+    let composer_placeholder = spec.as_ref().and_then(composer_placeholder_of);
     let corpus = resolve_gate_corpus(agent);
     let obs = cys::readiness::Observed {
         site: cys::readiness::Site::Boot,
@@ -11926,29 +12083,63 @@ fn gate_pending_reobserve(sid: u64, agent: &str) -> GateRecheck {
     };
     gate_recheck_with_carry(
         gate_pending_recheck(cys::readiness::judge(&obs)),
-        marker.as_deref(),
+        gate_mark_saw_a_gate(marked_gate),
+        cys::readiness::legacy_v1(),
+        composer_marker.as_deref(),
+        composer_placeholder.as_deref(),
         &screen,
         idle_quiet,
     )
+}
+
+/// ★(0.14.31 · 리뷰 R2(R7회차) · claude major) 이 표식이 **실제로 관측된 관문**을 기록하고 있는가.
+///
+/// 【고치는 결함】 R6 은 재관측 경로에서 이월 래치를 **무조건 참**으로 넘겼다("표식이 디스크에 남은 =
+/// 관문을 확실히 본 좌석"). 그 전제가 거짓이다 — [`readiness_timeout_verdict`] 는 `alive != Some(false)`
+/// 이면 **관문을 한 번도 못 본** 좌석에도 `GatePending{gate: GATE_ID_UNIDENTIFIED}` 를 찍는다
+/// (`settle_gate_pending` doc 의 생산자 3종 중 'readiness 타임아웃'). 그 좌석은 부트 폴링에서
+/// `gate_evidence_seen` 을 세운 적이 없으므로, 재관측에서만 더 엄한 요구를 받는 것은 **판정 분리**다
+/// (그리고 미지 레이아웃 좌석에서 그 비대칭이 곧 영구 보류였다 · 치명위험 ③).
+///
+/// 규칙: 표식의 `gate` 가 있고 [`GATE_ID_UNIDENTIFIED`] 가 아니면 참(코퍼스가 그 관문을 식별했다) ·
+/// 미상·부재는 거짓(부트 폴링과 **같은 요구** = 이월 없음). `unknown-modal`(공용 모달 서명이 잡은
+/// 미등재 모달)은 **관측된 관문**이므로 참이다 — 그 좌석은 실제로 모달을 봤다.
+fn gate_mark_saw_a_gate(marked_gate: Option<&str>) -> bool {
+    marked_gate.is_some_and(|g| !g.trim().is_empty() && g != GATE_ID_UNIDENTIFIED)
 }
 
 /// ★(0.14.31 · 리뷰 R1(R6회차) · 리뷰어 2인 공통 · codex blocking) **관문 증거 이월은 재부트 채택
 /// 경로에도 적용된다**(순수 · 진리표 대상).
 ///
 /// 부트 폴링은 래치(`gate_evidence_seen`)가 선 좌석의 Ready 에 양성 프롬프트 증거를 더 요구한다
-/// ([`gate_carry_ok`]). 이 자리는 **표식(`gate_pending`)이 디스크에 남아 있다는 사실 자체가 그
-/// 래치**다 — 관문을 봤다는 기록이 없으면 애초에 이 경로에 오지 않는다. 종전에는 이월을 보지 않아
-/// 같은 프레임(`<괘선>⏎❯ ` — 선택지 라벨 미도색)이 부트 폴링에서는 보류인데 재부트 채택에서는
-/// **붙여넣기 + Return** 이었다(리뷰어 2인이 각각 같은 자리를 짚었다). 두 소비처가 같은 술어를
-/// 쓴다(판정 분리 금지). Ready 가 아닌 판정은 그대로 통과한다.
+/// ([`gate_carry_ok`]). 종전에는 이월을 보지 않아 같은 프레임(`<괘선>⏎❯ ` — 선택지 라벨 미도색)이
+/// 부트 폴링에서는 보류인데 재부트 채택에서는 **붙여넣기 + Return** 이었다(리뷰어 2인이 각각 같은
+/// 자리를 짚었다). 두 소비처가 같은 술어를 쓴다(판정 분리 금지). Ready 가 아닌 판정은 그대로 통과한다.
+///
+/// ★(0.14.31 · 리뷰 R2(R7회차) · claude major) 래치는 **표식이 있다는 사실**이 아니라 표식이 기록한
+/// **관문 id** 다([`gate_mark_saw_a_gate`]). R6 은 여기에 `true` 를 상수로 넣었는데, `gate_pending` 은
+/// 관문을 한 번도 못 본 readiness 타임아웃에서도 찍히므로(그때 id 는 `unknown`) 그 좌석이 부트 폴링보다
+/// **더 엄한 요구**를 받고 영구 보류에 갇혔다. 롤백(`legacy_v1`)도 이 자리에서 함께 존중한다.
 fn gate_recheck_with_carry(
     verdict: GateRecheck,
+    gate_evidence_seen: bool,
+    legacy_v1: bool,
     marker: Option<&str>,
+    placeholder: Option<&str>,
     screen: &str,
     idle_quiet: Option<bool>,
 ) -> GateRecheck {
     match verdict {
-        GateRecheck::Adopt(_) if !gate_carry_ok(true, marker, screen, idle_quiet) => {
+        GateRecheck::Adopt(_)
+            if !gate_carry_ok(
+                gate_evidence_seen,
+                legacy_v1,
+                marker,
+                placeholder,
+                screen,
+                idle_quiet,
+            ) =>
+        {
             GateRecheck::CarryUnproven
         }
         other => other,
@@ -12021,6 +12212,15 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
         // 채택 중 다음 관문이 뜨면 재표식에 같은 지시를 다시 싣는다(지시는 관문을 넘어 살아남는다).
         followup.as_deref(),
     )
+}
+
+/// ★(0.14.31 · 리뷰 R2(R7회차)) 좌석 행의 표식이 기록한 **관문 id**. 부재·null·비문자열은 `None`.
+/// [`gate_mark_saw_a_gate`] 가 이월 래치를 세울지 판단하는 유일한 재료다.
+fn gate_mark_id(row: Option<&Value>) -> Option<String> {
+    row?["gate_pending"]["gate"]
+        .as_str()
+        .filter(|g| !g.trim().is_empty())
+        .map(String::from)
 }
 
 /// ★(0.14.31 · 리뷰 R2) 좌석 행(`surface.list` · `gate_pending` object)에서 복원 연속 지시를 꺼낸다 — 구 데몬·

@@ -5803,7 +5803,14 @@ def h_pred_9():
     #   와 **개수**를 잰다. 종전 2키 조건은 위에서 그대로 유지된다(항 삭제 0).
     need("cys::first_run_gates::ADAPTER_KEY" in seg,
          "계층 대상에 first_run_gates 신규 키 미편입 — 관문 코퍼스가 기존 기계에 도달하지 않는다(K-1)")
-    need("LAYERED_KEYS: [&str; 3]" in seg, "계층 대상 개수가 3이 아니다")
+    # ★(0.14.31 · 리뷰 R7) 3키 → **5키**. `prompt_marker`·`composer_placeholder` 는 같은 이유로 계층
+    #   대상이다 — 둘 다 **신규 키**라 기존 설치본 디스크 파일에 없고(사용자 소유라 vendor 갱신이
+    #   도달하지 않는다), 관문 증거 이월(`gate_carry_ok`)이 그 값으로 composer 를 식별한다. 못 받으면
+    #   codex·gemini 좌석이 `carry-unproven` 영구 보류다(치명위험 ③). 개수 핀은 **조여지는 방향**으로
+    #   갱신한다(항 삭제 0 — 위 3키 조건은 그대로 남아 있다).
+    for k in ("prompt_marker", "composer_placeholder"):
+        need('"%s"' % k in seg, "계층 대상에 %s 누락 — 신 키가 기존 설치본에 도달하지 않는다" % k)
+    need("LAYERED_KEYS: [&str; 5]" in seg, "계층 대상 개수가 5가 아니다")
     need("resolved.get(k).is_some()" in seg,
          "디스크 선언(명시 null 포함) 존중 규칙 부재 — 사용자 주권 침해")
     # 고지 규율: 신규 키는 **조용히** 채운다. 매 기존 기계에서 매번 결손이라 안내가 소음이 되고,
@@ -5948,7 +5955,8 @@ def h_deliver_1():
     # ⓑ 배달 배선 — 계층 대상에 신규 키가 편입돼 있다(값 수정 경로가 아니라 **신규 키** 경로).
     need("cys::first_run_gates::ADAPTER_KEY" in cli,
          "LAYERED_KEYS 에 신규 키가 없다 — 봉투가 구 기계에 도달하지 않는다")
-    need("LAYERED_KEYS: [&str; 3]" in cli, "계층 대상이 3키가 아니다")
+    # ★(0.14.31 · 리뷰 R7) 3키 → 5키(`prompt_marker`·`composer_placeholder` 편입 — H-PRED-9 와 같은 근거).
+    need("LAYERED_KEYS: [&str; 5]" in cli, "계층 대상이 5키가 아니다")
 
     # ⓒ 봉투가 임베드 팩에 실재하고 **코퍼스 사본이 아니다**(S-1 재발 차단).
     aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))
@@ -12596,11 +12604,25 @@ def h_boot_gate_78():
     need("미확정" in w and "양성 증거가 없다" in w,
          "이월 미충족에 '통과 여부 미확정·입력창 증거 없음' 처방이 없다")
     need("관측하지 못했다" not in w, "이월 미충족이 '화면을 읽지 못했다' 로 접힌다(사실 재작성)")
+    # ★(0.14.31 · 리뷰 R7 · codex major M3) 처방은 **구현된 회복 동작**을 지목해야 한다. 화면을 봐도
+    #   그 레이아웃이 양성 어휘 밖이면 다음 부트도 같은 판정이라, '재부트하면 채택된다' 만 적으면
+    #   듣지 않는 손잡이가 된다(BLOCK-2 계열). 마스터 롤백 스위치가 그 축을 실제로 끈다.
+    need("CYS_BOOT_GATES=0" in w,
+         "이월 미확정 처방에 실제로 듣는 회복 동작(마스터 롤백 스위치)이 없다 — 미지 레이아웃 좌석이 "
+         "영구 보류인데 처방은 '재부트하면 된다' 만 말한다(치명위험 ③)")
     need(B.GATE_REASON_CARRY_UNPROVEN == "carry-unproven", "python 쪽 사유 상수 이탈(생산자와 파리티)")
     rsrc = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
     if os.path.isfile(rsrc):
-        need('GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven"' in _read(rsrc),
+        rs = _read(rsrc)
+        need('GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven"' in rs,
              "Rust 생산자 상수와 python 소비자 상수가 갈렸다(gate_reason 파리티)")
+        # ★(리뷰 R7) 두 처방이 **같은 스위치**를 지목한다(한쪽만 고치면 채널마다 다른 지시가 나간다).
+        need("CYS_BOOT_GATES=0 cys boot" in rs,
+             "Rust 쪽 이월 처방이 롤백 스위치를 지목하지 않는다(처방 파리티 붕괴)")
+        # ★(리뷰 R7 · codex major D4) '관문을 못 봤다(unknown)' 와 '가드가 보고 멈췄다' 를 표식에서
+        #   가른다 — 섞이면 재부트 채택의 이월 래치가 실제 관측 이력을 잃는다.
+        need('GATE_ID_INJECT_HELD: &str = "inject-guard-held"' in rs,
+             "주입 도중 가드 보류가 여전히 '관문 미관측(unknown)' 으로 기록된다(관측 이력 소실)")
     mixed = json.dumps({"roles": [
         {"role": "cso", "outcome": "gate_pending", "mandatory": True,
          "gate_reason": "adopt-list-unread", "human_action_required": False},
@@ -12611,7 +12633,8 @@ def h_boot_gate_78():
          "혼합(진짜 관문 + 채택 미룸)에서 한 처방만 나간다 — 둘 중 하나는 반드시 거짓 지시다")
     need("사람 조치 없음**(전건" not in w, "혼합인데 '전건 사람 조치 없음' 이 나간다")
     # 구 CLI(필드 없음)는 종전 문안으로 폴백한다(위 gp 검사가 그것을 이미 잰다).
-    notes.append("행위 14축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0·사유별 처방 4종+폴백·rust 파리티)")
+    notes.append("행위 17축 실측(Fatal 비오판·busy 비오판·반드시 적발·처방 4문·두 축 OR·과잉 발화 0·"
+                 "사유별 처방 4종+폴백·rust 파리티·이월 처방의 롤백 스위치·표식 id 분리)")
     # ⓔ 계측 타당성 — 캠페인 베이스(PRE_U24_REF)에는 제3 분기가 없었다(진짜 변화를 보고 있다).
     old = _git_show(os.path.join("cysjavis-pack", "bin", "javis_bootstrap.py"), PRE_U24_REF)
     calib = "skip(no-git)"
