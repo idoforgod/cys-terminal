@@ -397,7 +397,8 @@ class _best_effort_lock(object):
 
     def __exit__(self, *exc):
         if self.held:
-            if self._owner() == self.token:
+            # 토큰이 비어 있으면(owner 쓰기 실패) 우리가 만든 것 — 반납하지 않으면 아무도 못 푼다.
+            if self._owner() in (self.token, b""):
                 try:
                     os.unlink(self._owner_file())
                 except OSError:

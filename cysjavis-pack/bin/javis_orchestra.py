@@ -3106,7 +3106,9 @@ class _best_effort_lock(object):
         if self.held:
             # ★**내 잠금일 때만** 지운다(codex R2 major-6): 느린 소유자가 고아로 오인돼 회수된
             #   뒤 그대로 rmdir 하면 **다음 소유자의 잠금**을 지워 둘이 동시에 임계구간에 든다.
-            if self._owner() == self.token:
+            # 토큰이 **비어 있으면**(owner 파일 쓰기 실패) 우리가 만든 것이므로 반납한다 —
+            # 아니면 아무도 못 푸는 잠금이 300초 남아 모든 기록을 막는다(부트체인 ④ 방향).
+            if self._owner() in (self.token, b""):
                 try:
                     os.unlink(self._owner_file())
                 except OSError:
