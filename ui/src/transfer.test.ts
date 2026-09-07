@@ -39,3 +39,51 @@ describe("appendPane", () => {
     expect(appendPane(null, 5)).toEqual({ type: "pane", sid: 5 });
   });
 });
+
+// ── ★(0.14.31 · WP-4 R1) 전출 목적지 좌석 식별 ──
+import { pickLaunchedAgentSid, type SurfaceRow } from "./transfer";
+
+const row = (o: Partial<SurfaceRow> & { surface_id: number }): SurfaceRow => ({
+  role: null,
+  agent: null,
+  exited: false,
+  created_at: 100,
+  ...o,
+});
+
+describe("pickLaunchedAgentSid", () => {
+  test("런치 후 새로 생긴 그 역할 좌석 하나를 고른다(런처 셸이 아니라)", () => {
+    const after = [row({ surface_id: 7 }), row({ surface_id: 8, role: "reviewer-codex", agent: "codex" })];
+    expect(pickLaunchedAgentSid([1, 2], 7, after, "reviewer-codex", 50)).toBe(8);
+  });
+  test("런처 셸(역할·에이전트 없음)은 절대 목적지가 아니다", () => {
+    const after = [row({ surface_id: 7 })];
+    expect(pickLaunchedAgentSid([1, 2], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+  test("역할만 붙고 에이전트 미관측이면 확정하지 않는다(각성 증거 요구)", () => {
+    const after = [row({ surface_id: 8, role: "reviewer-codex", agent: null })];
+    expect(pickLaunchedAgentSid([1], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+  test("같은 역할 좌석이 둘이면 확정하지 않는다(모호는 승계 근거 아님)", () => {
+    const after = [
+      row({ surface_id: 8, role: "reviewer-codex", agent: "codex" }),
+      row({ surface_id: 9, role: "reviewer-codex", agent: "codex" }),
+    ];
+    expect(pickLaunchedAgentSid([1], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+  test("런치 전부터 있던 같은 역할 좌석은 후보가 아니다", () => {
+    const after = [row({ surface_id: 8, role: "reviewer-codex", agent: "codex" })];
+    expect(pickLaunchedAgentSid([1, 8], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+  test("런치 시각보다 먼저 생긴 좌석은 그 전출의 결과가 아니다", () => {
+    const after = [row({ surface_id: 8, role: "reviewer-codex", agent: "codex", created_at: 10 })];
+    expect(pickLaunchedAgentSid([1], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+  test("다른 역할·종료 좌석은 후보가 아니다", () => {
+    const after = [
+      row({ surface_id: 8, role: "worker", agent: "claude" }),
+      row({ surface_id: 9, role: "reviewer-codex", agent: "codex", exited: true }),
+    ];
+    expect(pickLaunchedAgentSid([1], 7, after, "reviewer-codex", 50)).toBeNull();
+  });
+});

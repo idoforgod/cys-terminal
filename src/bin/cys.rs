@@ -713,6 +713,11 @@ enum Command {
     ///
     /// 출력 계약(계약 C): stdout **첫 줄** `role=<name>` 또는 `role=`(없음) · **항상 exit 0**.
     /// 사유·안내는 stderr. 구 데몬(RPC 미지원)도 `role=` + 안내 stderr 로 끝난다.
+    ///
+    /// ★둘째·셋째 줄은 **추가**다(계약 C 는 첫 줄만 규정한다):
+    ///   `reason=<code>` — 판정 사유. 훅이 "데몬이 판정했다"와 "판정을 못 받았다"를 가른다.
+    ///   `env_role=<self|other_live|other_exited|vacant|unknown>` — `--env-role` 로 신고한 역할을
+    ///     지금 **누가 쥐고 있는가**. 훅의 강등은 `other_live` **하나에서만** 일어난다.
     #[command(name = "reclaim-role")]
     ReclaimRole {
         /// 자동 판정 모드(현재 유일한 모드). 생략하면 아무 것도 하지 않는다 — 손으로 역할을
@@ -725,6 +730,11 @@ enum Command {
         /// 이 pane 의 실제 `$PWD`(훅이 전달). 후보 대조 축 — 없으면 무결합.
         #[arg(long)]
         cwd: Option<String>,
+        /// 이 pane 의 현재 `CYS_ROLE`(훅이 전달) — **결합 판정에는 쓰이지 않는다**(env 는
+        /// 권위가 아니다). 데몬이 "그 역할을 지금 누가 쥐고 있는가"를 답해 주고, 훅은 그
+        /// 답이 `other_live` 일 때만 stale 각성을 강등한다.
+        #[arg(long = "env-role")]
+        env_role: Option<String>,
     },
     /// HMAC signed-prefix 승인 — 위험명령 prefix를 1회 서명하면 이후 자동 통과(guard.sh 연동)
     Approval {
@@ -1174,8 +1184,12 @@ enum AttestAction {
 enum ApprovalAction {
     /// 명령이 서명된 prefix에 매칭하는지 확인 (exit 0=서명됨/통과, 비0=미서명/차단). guard.sh가 호출.
     Check {
-        /// 검사할 전체 명령 문자열
-        #[arg(long)]
+        /// 검사할 전체 명령 문자열.
+        /// ★`--prefix` 는 **같은 인자의 별칭**이다(CONTRACTS §B-3 이 적은 호출 문자열이
+        ///   `approval check --prefix "<명령>" --require-ttl` 이었는데 파서가 `--command` 만
+        ///   받아 exit 2 로 죽었다 — 계약대로 부른 소비자가 유효한 승인을 쓸 수 없었다).
+        ///   의미는 하나다: **검사할 전체 명령 문자열**(서명된 prefix 와 매칭한다).
+        #[arg(long, alias = "prefix")]
         command: String,
         /// 명령 실행 cwd (생략 시 미지정 — 레코드가 cwd 무관이면 매칭)
         #[arg(long)]
@@ -3654,7 +3668,8 @@ fn run(command: Command) -> i32 {
                             //   그 통과를 신뢰하면 TTL 게이트가 조용히 사라진다 → deny(exit 2).
                             if require_ttl && r["ttl_enforced"].as_bool() != Some(true) {
                                 eprintln!(
-                                    "[approval] --require-ttl 미지원 데몬(응답에 ttl_enforced 없음)                                      — 차단 유지(exit 2). 데몬을 0.14.31 이상으로 갱신하라."
+                                    "[approval] --require-ttl 미지원 데몬(응답에 ttl_enforced 없음) \
+                                     — 차단 유지(exit 2). 데몬을 0.14.31 이상으로 갱신하라."
                                 );
                                 return 2;
                             }
@@ -3681,6 +3696,30 @@ fn run(command: Command) -> i32 {
                     let cwd = cwd.or_else(|| {
                         std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
                     });
+                    // ★(R1 · 적대검증 major) 능력 판정은 **변경 앞**이다. 종전에는 서명 RPC 를
+                    //   먼저 보내고 응답에 `expires_at` 이 없으면 실패로 접었는데, 그때 구 데몬은
+                    //   `ttl_secs` 를 무시한 채 **무기한 승인을 이미 영속**시킨 뒤였다 — CLI 는
+                    //   exit 1 을 내지만 그 레코드는 남아서 이후 모든 일반 check 를 통과시킨다
+                    //   (되돌릴 수 없는 부작용 + 거짓 실패 보고). `approval.capabilities` 는
+                    //   비변경 조회이고 구 데몬은 `method_not_found` 로 답하므로, 그 자체가
+                    //   판정이다. 실패 방향은 **서명하지 않음**(fail-closed).
+                    if ttl.is_some() {
+                        let cap = request("approval.capabilities", json!({}));
+                        let supported = cap
+                            .as_ref()
+                            .ok()
+                            .and_then(|c| c["ttl_secs"].as_bool())
+                            .unwrap_or(false);
+                        if !supported {
+                            eprintln!(
+                                "error: --ttl 미지원 데몬 — **아무 승인도 만들지 않았다**. \
+                                 이 데몬은 ttl_secs 를 버리고 무기한 승인을 만들었을 것이므로 \
+                                 서명 전에 멈춘다. 데몬을 0.14.31 이상으로 갱신한 뒤 다시 \
+                                 서명하라(무기한 승인이 정말 필요하면 --ttl 을 생략하라)."
+                            );
+                            return 1;
+                        }
+                    }
                     match request(
                         "approval.sign",
                         json!({"command_prefix": tokens, "cwd": cwd, "ttl_secs": ttl}),
@@ -3690,8 +3729,14 @@ fn run(command: Command) -> i32 {
                             //   TTL 을 버리고 **무기한** 승인을 만든 것이다. 성공으로 보고하면
                             //   운영자는 있지도 않은 만료를 믿는다 — 실패로 접고 그 사실을 말한다.
                             if ttl.is_some() && r["expires_at"].as_f64().is_none() {
+                                // 프로브를 통과했는데도 만료가 없다 = 데몬이 계약을 어겼다(스큐·
+                                // 경합 중 강등). 2층 방어로 남긴다 — 여기 도달하면 레코드는 이미
+                                // 생겼으므로 그 사실을 **정확히** 말한다.
                                 eprintln!(
-                                    "error: --ttl 미지원 데몬 — 만료 없는(무기한) 승인이 생성됐을 수                                      있다. `cys approval check --require-ttl` 은 이 레코드를 통과시키지                                      않는다. 데몬을 0.14.31 이상으로 갱신한 뒤 다시 서명하라."
+                                    "error: 데몬이 --ttl 을 받고도 expires_at 을 내지 않았다 — \
+                                     만료 없는(무기한) 승인이 생성됐을 수 있다. \
+                                     `cys approval check --require-ttl` 은 이 레코드를 통과시키지 \
+                                     않는다. `cys approval` 기록을 점검하고 데몬을 갱신하라."
                                 );
                                 return 1;
                             }
@@ -3863,7 +3908,9 @@ fn run(command: Command) -> i32 {
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
-        Command::ReclaimRole { auto, config, cwd } => return run_reclaim_role(auto, config, cwd),
+        Command::ReclaimRole { auto, config, cwd, env_role } => {
+            return run_reclaim_role(auto, config, cwd, env_role)
+        }
 
         Command::Hook { event } => return run_hook(event),
         Command::BootIntent => return run_boot_intent(),
@@ -12537,42 +12584,87 @@ fn run_claim_role(
 ///
 /// 구 데몬(RPC 미지원)·데몬 미응답·타임아웃 — 전부 `role=` + 안내 stderr. 훅은 그 결과를
 /// '역할 없음'으로 읽어 종전 경로(무역할 안내)로 흐른다(fail-open 방향이 곧 무회귀).
-fn run_reclaim_role(auto: bool, config: Option<String>, cwd: Option<String>) -> i32 {
+fn run_reclaim_role(
+    auto: bool,
+    config: Option<String>,
+    cwd: Option<String>,
+    env_role: Option<String>,
+) -> i32 {
     if !auto {
         println!("role=");
+        println!("reason=usage");
+        println!("env_role=unknown");
         eprintln!(
             "[reclaim-role] --auto 가 필요하다(현재 유일한 모드). 손으로 역할을 지정하려면 \
              `cys claim-role <role>` 을 쓰라 — 이 명령은 그것을 대신하지 않는다."
         );
         return 0;
     }
-    // 훅은 프롬프트 **앞**에 서 있다 — surface-role 과 같은 크기의 데드라인(BUDGET 파생).
-    let timeout = std::time::Duration::from_millis(BUDGET_TICK_MS * 4);
+    // 훅은 프롬프트 **앞**에 서 있다 — 데드라인은 BUDGET 파생(하드코딩 금지).
+    // ★두 왕복의 **합**이 훅 외곽 데드라인(12s)보다 작아야 한다(codex 적대검증 R1 major):
+    //   1차 3틱(7.5s) + 조정 재조회 1틱(2.5s) = 10s < 12s. 종전처럼 1차에 4틱을 주고 조정에
+    //   또 예산을 주면 밖에서 먼저 죽어 **권위 답을 못 받은 채** 끝난다(그 상태에서 훅이
+    //   역할을 내리면 살아 있는 좌석이 지침을 잃는다).
+    let timeout = std::time::Duration::from_millis(BUDGET_TICK_MS * 3);
+    let reconcile_timeout = std::time::Duration::from_millis(BUDGET_TICK_MS);
     let socket = cys::socket_path();
-    // 소켓 파일이 아예 없으면 데몬이 내려간 것이다(autostart 허용 경로는 여기선 쓰지 않는다 —
-    // 훅 안에서 데몬을 새로 띄우는 것은 이 명령의 계약이 아니다).
+    // ★소켓 실존 프리체크는 **unix 한정**이다(적대검증 R1 major). Windows 의 기본 종단은
+    //   named pipe(`\\.\pipe\cys`)이고, 파이프는 파일시스템 메타데이터로 존재를 잴 수 없다
+    //   (`Path::exists` 가 쓰는 파일정보 API 는 파이프 핸들을 보지 못한다). 그 프리체크를
+    //   전 플랫폼에 걸면 **살아 있는 Windows 데몬**에도 "소켓 부재"라고 답하고 RPC 를 아예
+    //   시도하지 않는다 = 이 기능이 Windows 에서 죽는다. unix 에서만 값싼 조기 종료로 쓰고,
+    //   Windows 는 아래 유계 연결을 그대로 시도한다(실패해도 방향은 같다 — `role=`).
+    #[cfg(unix)]
     if !socket.exists() {
         println!("role=");
+        println!("reason=daemon_unreachable");
+        println!("env_role=unknown");
         eprintln!("[reclaim-role] 데몬 소켓 부재({}) — 무결합.", socket.display());
         return 0;
     }
     let params = json!({
-        "config": config.unwrap_or_default(),
-        "cwd": cwd.unwrap_or_default(),
+        "config": config.clone().unwrap_or_default(),
+        "cwd": cwd.clone().unwrap_or_default(),
+        // ★서버측 커밋 **절대** 데드라인(적대검증 R1 blocking): 우리가 포기한 뒤에 데몬이
+        //   조용히 결합하는 것을 막는다(밖에서 죽이는 것만으로는 서버 작업이 취소되지 않는다).
+        //   상대 예산으로 보내면 요청이 디스패치 큐에서 기다린 시간이 예산에서 빠지지 않아,
+        //   클라이언트가 이미 죽은 뒤에도 서버 예산이 온전히 남는다 — 그래서 절대 시각이다.
+        //   같은 호스트의 같은 벽시계이며, 시계 점프의 귀결은 '무결합'(안전 방향)이다.
+        "deadline_epoch": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+            + timeout.as_secs_f64(),
+        // 훅이 신고하는 현재 env 역할 — 강등 증거(`env_role_state`) 조회용이며 결합 판정에는
+        // 쓰이지 않는다(`CYS_ROLE` 은 권위가 아니다 · 정본 §8).
+        "env_role": env_role.clone().unwrap_or_default(),
     });
     match request_on_timeout(&socket, "role.reclaim_auto", params, timeout) {
         Ok(r) => {
             let role = r["role"].as_str().unwrap_or("");
             let reason = r["reason"].as_str().unwrap_or("");
             println!("role={role}");
+            // ★둘째 줄 `reason=` (계약 C 는 **첫 줄**만 규정한다 — 이 줄은 추가다).
+            //   훅은 이 값으로 **"데몬이 판정했다"와 "판정을 못 받았다"를 가른다**: 전자만
+            //   권위이고, 후자에서 역할을 내리면 살아 있는 좌석이 지침을 잃는다(치명위험 ③).
+            println!("reason={reason}");
+            println!("env_role={}", r["env_role_state"].as_str().unwrap_or("unknown"));
             if role.is_empty() {
-                // 사유는 **stderr 한 줄**. 훅이 stdout 첫 줄만 읽으므로 여기 무엇을 써도 파싱은 안전하다.
+                // 사유는 **stderr 한 줄**. 훅은 stdout 의 정해진 줄(1·3)만 읽으므로 여기 무엇을
+                // 써도 파싱은 안전하다.
                 let hint = match reason {
                     "caller_unresolved" => {
                         "발신 pane 을 좌석으로 해석하지 못했다(pane 밖 실행·세션 분리)"
                     }
                     "caller_env_missing" => {
                         "--config/--cwd 가 비었다 — 대조 축이 없으면 후보를 고르지 않는다"
+                    }
+                    "caller_env_mismatch" => {
+                        "신고한 --config 가 데몬이 이 좌석에 대해 아는 계정 dir 과 다르다 \
+                         (자기신고로 남의 계정 좌석을 가져가지 못한다)"
+                    }
+                    "deadline_exceeded" => {
+                        "예산 안에 커밋 지점에 닿지 못했다 — 늦은 승계를 만들지 않으려고 취소했다"
                     }
                     "restore_lease_held" => {
                         "phoenix 부활이 진행 중(restore lease 보유) — 다음 세션 시작에 다시 시도한다"
@@ -12607,15 +12699,56 @@ fn run_reclaim_role(auto: bool, config: Option<String>, cwd: Option<String>) -> 
             0
         }
         Err(e) => {
-            println!("role=");
             if e.starts_with("method_not_found") {
+                println!("role=");
+                println!("reason=old_daemon");
+                println!("env_role=unknown");
                 eprintln!(
                     "[reclaim-role] 이 데몬은 역할 자동 복구(role.reclaim_auto)를 모른다(구 데몬). \
                      무결합으로 끝낸다 — 역할이 필요하면 `cys claim-role <role>` 로 직접 등록하거나 \
                      데몬을 0.14.31 이상으로 갱신하라."
                 );
-            } else {
-                eprintln!("[reclaim-role] 무결합(데몬 왕복 실패: {e}).");
+                return 0;
+            }
+            // ★왕복 실패는 "결합하지 않았다"가 **아니다**(적대검증 R1 major). 디스패치는
+            //   취소되지 않는 블로킹 작업이라, 우리가 포기한 뒤에도 서버는 판정 중일 수 있다.
+            //   서버측 커밋 데드라인이 늦은 커밋을 막지만, 우리가 죽기 **직전에** 커밋이
+            //   성사됐을 수도 있다 — 그 결과를 모른 채 `role=` 을 내면 훅이 무역할 지침을
+            //   주입하고 데몬은 역할·큐를 옮긴 상태가 된다(아무도 모르는 승계).
+            //   그래서 **읽기 전용 조정 조회 1회**로 권위 답을 확인한다: 상태를 바꾸지 않으므로
+            //   재시도가 두 번째 결합이 되지 않는다. 예산은 짧게(틱 2회분) — 훅은 사람의
+            //   프롬프트 앞이고, 이 조회마저 실패하면 종전대로 '판정 못 받음'이다.
+            let recon = request_on_timeout(
+                &socket,
+                "role.reclaim_auto",
+                json!({"reconcile": true, "env_role": env_role.clone().unwrap_or_default()}),
+                reconcile_timeout,
+            );
+            match recon {
+                Ok(rr) => {
+                    let role = rr["role"].as_str().unwrap_or("");
+                    println!("role={role}");
+                    println!("reason=reconciled");
+                    println!("env_role={}", rr["env_role_state"].as_str().unwrap_or("unknown"));
+                    if role.is_empty() {
+                        eprintln!(
+                            "[reclaim-role] 왕복 실패({e}) 후 조정 조회: 이 좌석은 역할이 없다(무결합)."
+                        );
+                    } else {
+                        eprintln!(
+                            "[reclaim-role] 왕복 실패({e}) 후 조정 조회: 데몬 권위 역할은 {role} 이다."
+                        );
+                    }
+                }
+                Err(e2) => {
+                    println!("role=");
+                    println!("reason=rpc_failed");
+                    println!("env_role=unknown");
+                    eprintln!(
+                        "[reclaim-role] 무결합(데몬 왕복 실패: {e} · 조정 조회도 실패: {e2}) — \
+                         판정을 받지 못했다. 현재 역할을 바꾸지 마라."
+                    );
+                }
             }
             0
         }
@@ -25884,6 +26017,66 @@ mod tests {
 
     /// 무회귀 증명: `cys drain`(기존 3 호출자 invocation)은 verify=false로 파싱돼 plain drain 경로로
     /// 라우팅된다(거동 diff 0). `--verify`만 신규 경로로 분기.
+    /// ★계약 §B-3 의 **그 호출 문자열 그대로** 파싱되는가(codex 적대검증 R1 major).
+    /// 계약은 `approval check --prefix "<명령>" --require-ttl` 이었는데 파서는 `--command` 만
+    /// 받아 exit 2 로 죽었다 — 계약대로 부른 소비자가 유효한 승인을 쓸 수 없었다.
+    /// `--command` 는 그대로 남고 `--prefix` 는 **같은 인자의 별칭**이다(둘은 같은 값을 채운다).
+    #[test]
+    fn approval_check_accepts_the_contracted_prefix_flag() {
+        use clap::Parser;
+        let contract = Cli::try_parse_from([
+            "cys", "approval", "check", "--prefix", "git push origin main", "--require-ttl",
+        ])
+        .expect("CONTRACTS §B-3 의 호출이 파싱되지 않는다");
+        match contract.command {
+            Command::Approval { action: ApprovalAction::Check { command, require_ttl, .. } } => {
+                assert_eq!(command, "git push origin main");
+                assert!(require_ttl, "--require-ttl 이 소실됐다");
+            }
+            _ => panic!("approval check 로 파싱되지 않았다"),
+        }
+        // 종전 문자열(`--command`)도 그대로 살아 있다 — 별칭 추가는 계약 확장이지 교체가 아니다.
+        let legacy = Cli::try_parse_from(["cys", "approval", "check", "--command", "ls -la"])
+            .expect("--command 가 깨졌다");
+        match legacy.command {
+            Command::Approval { action: ApprovalAction::Check { command, require_ttl, .. } } => {
+                assert_eq!(command, "ls -la");
+                assert!(!require_ttl);
+            }
+            _ => panic!("approval check 로 파싱되지 않았다"),
+        }
+        // 둘 다 주면 같은 인자를 두 번 준 것이므로 거부된다(모호를 통과시키지 않는다).
+        assert!(
+            Cli::try_parse_from(["cys", "approval", "check", "--command", "a", "--prefix", "b"])
+                .is_err(),
+            "같은 인자를 두 번 준 호출이 조용히 통과했다"
+        );
+    }
+
+    /// `cys reclaim-role --auto` 는 계약 인자 3종(+`--env-role`)을 받는다. 훅이 넘기는 그 형태로 핀.
+    #[test]
+    fn reclaim_role_parses_the_hook_invocation() {
+        use clap::Parser;
+        let c = Cli::try_parse_from([
+            "cys", "reclaim-role", "--auto",
+            "--config", "/Users/x/.cys/claude",
+            "--cwd", "/Users/x/dev/p",
+            "--env-role", "reviewer-codex",
+        ])
+        .expect("훅 호출이 파싱되지 않는다");
+        match c.command {
+            Command::ReclaimRole { auto, config, cwd, env_role } => {
+                assert!(auto);
+                assert_eq!(config.as_deref(), Some("/Users/x/.cys/claude"));
+                assert_eq!(cwd.as_deref(), Some("/Users/x/dev/p"));
+                assert_eq!(env_role.as_deref(), Some("reviewer-codex"));
+            }
+            _ => panic!("reclaim-role 로 파싱되지 않았다"),
+        }
+        // `--env-role` 은 선택이다(구 훅 호환).
+        assert!(Cli::try_parse_from(["cys", "reclaim-role", "--auto"]).is_ok());
+    }
+
     #[test]
     fn drain_flag_parsing_defaults_to_plain() {
         use clap::Parser;

@@ -788,22 +788,38 @@ mod tests {
 
     /// ★무TTL 레코드의 서명 페이로드는 종전과 **바이트 동일**이어야 한다 — 아니면 이 릴리스가
     /// 설치된 모든 승인 레코드를 한 번에 무효화한다(자율주행 전면 정지 · 가용성 사고).
-    /// 마지막 줄이 `updatedAt=` 이고 `expiresAt` 이 **없다**는 사실로 그것을 잰다.
+    ///
+    /// ★R1 에서 고친 것(codex 적대검증 major): 종전 검체는 "마지막 줄이 `updatedAt=` 이고
+    /// `expiresAt` 이 없다"는 **모양**만 봤다 — `createdAt` 의 포맷을 바꾸거나 `commandPrefix`
+    /// 의 구분자를 바꿔도 초록이었다(그러면 설치된 서명이 전부 죽는데도). 그래서 여기서는
+    /// **0.14.30 이 실제로 서명하던 그 바이트열과 그 서명**을 냉동 검체로 박는다. 이 두 상수는
+    /// 코드에서 파생되지 않는다 — 밖에서 계산한 값이므로 페이로드 조립이 한 글자라도 달라지면
+    /// 즉시 빨강이다.
+    const FROZEN_LEGACY_PAYLOAD: &str = "version=1\nid=ap-test-1\ncommandPrefix=Z2l0,cHVzaA==\ncwd=L3g=\nenvironment=Q0k==MQ==\ncreatedAt=1000\nupdatedAt=1000";
+    const FROZEN_LEGACY_SIG: &str = "2i7Ob8Rdqy1HDkUYBMGWbk9tiZ45iMSmWptf6GwXdVA=";
+
     #[test]
     fn ttl_absent_payload_is_byte_identical_to_legacy() {
         let r = rec(&["git", "push"], Some("/x"), &[("CI", "1")]);
         let payload = String::from_utf8(r.signing_payload()).unwrap();
-        assert!(!payload.contains("expiresAt"), "무TTL 레코드에 expiresAt 줄이 붙었다(구 서명 전멸)");
-        assert!(
-            payload.lines().last().unwrap().starts_with("updatedAt="),
-            "무TTL 페이로드의 마지막 줄이 updatedAt 이 아니다(구 서명 전멸): {payload}"
+        assert_eq!(
+            payload, FROZEN_LEGACY_PAYLOAD,
+            "무TTL 페이로드가 0.14.30 의 바이트열과 다르다 — 설치된 모든 승인 서명이 죽는다"
         );
-        // TTL 이 붙으면 줄이 정확히 하나 늘고 그 줄이 말미다.
-        let mut t = r.clone();
+        // 그 시절 서명이 **지금 코드에서도** 유효해야 한다(레코드 무효화 0의 진짜 정의).
+        let mut legacy = r.clone();
+        legacy.signature = FROZEN_LEGACY_SIG.to_string();
+        assert!(
+            legacy.has_valid_signature(SECRET),
+            "구 릴리스가 만든 서명이 이 릴리스에서 거부됐다(승인 전멸 = 자율주행 정지)"
+        );
+        assert!(!payload.contains("expiresAt"), "무TTL 레코드에 expiresAt 줄이 붙었다");
+        // TTL 이 붙으면 줄이 정확히 하나 늘고 그 줄이 말미다 — 그리고 구 서명은 그 순간 무효다.
+        let mut t = legacy.clone();
         t.expires_at = Some(4242.0);
         let p2 = String::from_utf8(t.signing_payload()).unwrap();
-        assert_eq!(p2.lines().count(), payload.lines().count() + 1);
-        assert_eq!(p2.lines().last().unwrap(), "expiresAt=4242");
+        assert_eq!(p2, format!("{FROZEN_LEGACY_PAYLOAD}\nexpiresAt=4242"));
+        assert!(!t.has_valid_signature(SECRET), "만료 주입이 구 서명을 통과했다");
     }
 
     /// TTL 은 서명에 묶인다 — 만료 연장(값 변경)·제거·주입 전부 서명 불일치로 거부.

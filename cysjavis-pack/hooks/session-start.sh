@@ -39,50 +39,78 @@ fi
 BOOT_PY="$JARVIS_DIR/bin/javis_bootstrap.py"
 BOOT_CMD="$(cys_shquote "${CYS_PY:-python3}") $(cys_shquote "$(cys_native_path "$BOOT_PY")")"
 
-# ── ★(0.14.31 · WP-4 · 감사 에러 2) 무역할 좌석의 **역할 자동 복구** ───────────────────────
+# ── ★(0.14.31 · WP-4 · 감사 에러 2) 데몬 권위 역할 조회 — 자동 복구 + stale 각성 강등 ───────
 # 데몬을 재시작하거나 사람이 손으로 pane 을 띄우면, 죽은 에이전트의 **빈 셸 좌석**이 역할 주소를
 # 그대로 쥔 채 남는다. 역할은 '있는데' 그 자리에 아무도 없고, 새 pane 은 지침 없이 앉는다
 # (치명위험 ③ 바보 좌석 · `--to <role>` 배달은 빈 셸로 사라진다).
+# 반대 방향의 짝도 있다: 그 승계가 **일어난 뒤** 전임자 셸에는 `CYS_ROLE` 이 그대로 남아 있어,
+# 그 pane 에서 claude 를 다시 띄우면 같은 역할 지침이 또 주입된다 — 두 세션이 같은 역할이라고
+# 믿는다(적대검증 R1 major).
 #
-# 그래서 무역할 안내 분기 **앞**에서 데몬에게 두 번 묻는다:
+# 그래서 디렉티브 선택 **앞**에서 데몬에게 두 번 묻는다 — `CYS_ROLE` 이 비어 있든 아니든:
 #   ① `cys surface-role` — **판정 가능성** 프로브다. exit 2 = 데몬 미응답·응답 파손(판정 불가)이고,
-#      그때는 복구를 시도하지 않는다(모르는 상태에서 역할을 옮기지 않는다). 이 명령의 *출력*은
-#      채택하지 않는다 — 그 값은 자기신고 `CYS_SURFACE_ID` 로 고른 항목이라 신원 증거가 아니다.
-#   ② `cys reclaim-role --auto` — **데몬이 발신 pid 로 인증한** 좌석 기준의 판정이다. 이미 역할이
-#      있으면 그 역할을 그대로 돌려주고(멱등), 조건을 만족하는 빈 좌석이 **정확히 하나**일 때만
-#      결합한다. 출력 계약은 stdout 첫 줄 `role=<name>` 또는 `role=` · 항상 exit 0.
+#      그때는 아무 것도 하지 않는다(모르는 상태에서 역할을 옮기지도, 내리지도 않는다). 이 명령의
+#      *출력*은 채택하지 않는다 — 그 값은 자기신고 `CYS_SURFACE_ID` 로 고른 항목이라 신원 증거가
+#      아니다.
+#   ② `cys reclaim-role --auto` — **데몬이 발신 pid 로 인증한** 좌석 기준의 판정이다. stdout 3줄:
+#      `role=<name|>` · `reason=<code>` · `env_role=<self|other_live|other_exited|vacant|unknown>`.
 #
-# 실패는 전부 한 방향이다 — **무결합 + 종전 경로**(아래 무역할 안내). 구 데몬·미응답·타임아웃·
-# 후보 모호는 모두 `role=` 이고, 그러면 이 블록은 아무 것도 하지 않은 것과 같다(무회귀).
+# 채택 규칙(둘 다 **좁은 쪽**이 기본):
+#   ⓐ **복구**: `CYS_ROLE` 이 비어 있고 `role=<name>` 이 오면 그 역할로 각성한다.
+#   ⓑ **강등**: `CYS_ROLE` 이 있는데 `env_role=other_live` — 즉 데몬이 "그 역할은 **지금 다른
+#      살아있는 좌석**이 쥐고 있다"고 답하면, 이 세션은 그 역할이 아니다. 지침을 주입하지 않고
+#      인계 안내 후 종료한다(master|cso 재대조의 self-demote 와 같은 문안 규약).
+#      ★`other_live` **하나에서만** 내린다. "호출자에게 역할이 없다"로 내리면 경합 한 번에
+#        살아 있는 좌석이 지침을 잃는다(치명위험 ③) — 강등은 **모순의 증거**가 있을 때만이다.
+#
+# 실패는 전부 한 방향이다 — **무결합 · 무강등 · 종전 경로**. 구 데몬·미응답·타임아웃·후보 모호는
+# 모두 `role=` + `env_role=unknown` 이고, 그러면 이 블록은 아무 것도 하지 않은 것과 같다(무회귀).
 # Windows(Git Bash): `ps`·`flock` 없음 · `timeout` 은 System32 함정이 있어 `cys_timeout_run`
-# (GNU 판별 후 python 폴백)만 쓴다. 데드라인은 CLI 내부 RPC 상한(10s)보다 **크게** 잡는다 —
+# (GNU 판별 후 python 폴백)만 쓴다. 데드라인은 CLI 내부 두 왕복 합(10s)보다 **크게** 잡는다 —
 # 밖에서 먼저 죽이면 "데몬은 결합했는데 훅은 그 사실을 못 들은" 상태가 된다.
-if [ -z "$CYS_ROLE" ] && [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] \
-   && command -v cys >/dev/null 2>&1; then
+# ★경로 표기: `$PWD`·`$CLAUDE_CONFIG_DIR` 은 Git Bash 에서 MSYS 표기(`/c/…`)인데 데몬은 네이티브
+#   (`C:\…`)를 기록한다 — 원문 그대로 넘기면 두 축이 **항상** 어긋나 Windows 의 모든 호출이
+#   무결합이 된다(WP-4 가 그 플랫폼에 배포되지 않는다). 팩이 이미 쓰는 `cys_native_path`
+#   (cygpath 가드 · unix 는 무변환)로 접어서 넘긴다(`_lib.sh` 의 CYS_STATE_DIR 과 같은 이유).
+CYS_DEMOTE_ROLE=""
+if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/null 2>&1; then
   cys_timeout_run 5 cys surface-role </dev/null >/dev/null 2>&1
   CYS_SR_RC=$?
   # rc 2 = 판정 불가(데몬 미응답·응답 파손) · rc 124 = 데드라인 초과(hang). 둘 다 "모른다"이므로
-  # 복구를 시도하지 않는다 — 모르는 상태에서 역할을 옮기지 않고, 두 번째 왕복으로 훅을 또
-  # 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
+  # 조회를 시도하지 않는다 — 두 번째 왕복으로 훅을 또 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
   if [ "$CYS_SR_RC" -eq 2 ] || [ "$CYS_SR_RC" -eq 124 ]; then
-    echo "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
+    if [ -z "$CYS_ROLE" ]; then
+      echo "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
+    fi
   else
     CYS_RECLAIM_OUT="$(cys_timeout_run 12 cys reclaim-role --auto \
-      --config "${CLAUDE_CONFIG_DIR:-}" --cwd "$PWD" </dev/null 2>/dev/null | head -1 | tr -d '\r')"
-    case "$CYS_RECLAIM_OUT" in
-      role=*) CYS_RECLAIMED="${CYS_RECLAIM_OUT#role=}" ;;
+      --config "$(cys_native_path "${CLAUDE_CONFIG_DIR:-}")" \
+      --cwd "$(cys_native_path "$PWD")" \
+      --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null | tr -d '\r')"
+    CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"
+    CYS_RC_L3="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 3p)"
+    case "$CYS_RC_L1" in
+      role=*) CYS_RECLAIMED="${CYS_RC_L1#role=}" ;;
       *)      CYS_RECLAIMED="" ;;
+    esac
+    case "$CYS_RC_L3" in
+      env_role=*) CYS_ENV_ROLE_STATE="${CYS_RC_L3#env_role=}" ;;
+      *)          CYS_ENV_ROLE_STATE="unknown" ;;
     esac
     # 형식 가드: 데몬 유래 값이지만 이 뒤로 `case` 매칭·파일 경로 조립에 들어가므로 역할명
     # 문자집합([a-z0-9-] 계열)을 벗어나면 채택하지 않는다(GUI 의 srcRole 가드와 같은 규율).
     case "$CYS_RECLAIMED" in
       ''|*[!a-zA-Z0-9_-]*) CYS_RECLAIMED="" ;;
     esac
-    if [ -n "$CYS_RECLAIMED" ]; then
+    if [ -z "$CYS_ROLE" ] && [ -n "$CYS_RECLAIMED" ]; then
       CYS_ROLE="$CYS_RECLAIMED"
       export CYS_ROLE
       echo "■ 고지: 역할 자동 복구 — 이 좌석의 데몬 권위 역할은 '$CYS_ROLE' 이다(env 유실 복구)."
       echo "  근거: cysd 가 발신 pid 로 이 pane 을 확인했다. 아래 지침은 그 역할의 것이다."
+    elif [ -n "$CYS_ROLE" ] && [ "$CYS_ENV_ROLE_STATE" = "other_live" ]; then
+      # 강등은 **디렉티브 선택 앞**에서 결정하고, 실제 문안은 아래 매핑 뒤에서 낸다
+      # (역할군을 알아야 인계 안내가 정확하다).
+      CYS_DEMOTE_ROLE="$CYS_ROLE"
     fi
   fi
 fi
@@ -211,6 +239,18 @@ case "$CYS_ROLE" in
   *) exit 0 ;;
 esac
 [ -f "$D" ] || exit 0
+# ── ★(0.14.31 · WP-4 R1) stale 각성 강등 — 데몬이 "그 역할은 지금 **다른 산 좌석**이 쥐었다"고
+#    답한 경우에만 여기 온다(`env_role=other_live`). 승계는 데몬 상태만 바꿀 뿐 전임자 셸의
+#    `CYS_ROLE` 을 지울 수 없어서, 이 문이 없으면 두 세션이 같은 역할로 행동한다(적대검증 major).
+#    문안은 master|cso 재대조의 self-demote 와 같은 규약이고, **지침은 주입하지 않는다**.
+if [ -n "$CYS_DEMOTE_ROLE" ]; then
+echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_DEMOTE_ROLE — 데몬 레지스트리의 살아있는 보유자가 우위)"
+echo "이 surface는 더 이상 $CYS_DEMOTE_ROLE 역할이 아니다. 역할 지휘·역할 행동을 중단하고,"
+echo "레지스트리의 $CYS_DEMOTE_ROLE 노드에 인계하라(\`cys send --to $CYS_DEMOTE_ROLE\`). 이 세션은 일반 세션으로 동작한다."
+echo "(이 판정의 근거: cysd 가 발신 pid 로 이 pane 을 확인했고, 그 역할은 **다른 살아있는 좌석**이 쥐고 있다."
+echo " 이 좌석이 정말 그 역할이어야 한다면 \`cys claim-role $CYS_DEMOTE_ROLE\` 로 명시 등록하라.)"
+exit 0
+fi
 # ── ★권한 role 재대조(유령 master 차단 — BOOTSTRAP_HARDENING WP-1·적대검증 D1) ──
 # 재시작·/clear 후 CYS_ROLE env는 남는데 레지스트리 role이 다른 surface로 이동한 드리프트를
 # 매 세션 시작마다 조정한다(레지스트리가 항상 우위). 3상태:

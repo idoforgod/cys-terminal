@@ -7,7 +7,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
 import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
-import { transferTrees } from "./transfer";
+import { pickLaunchedAgentSid, transferTrees, type SurfaceRow } from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -2816,56 +2816,101 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     // ③ 대상 부서에 새 surface 생성 + 트리 편입(같은 경로에서 시작 — 루트류 cwd는 승계하지
     //    않고 데몬 기본값(home)으로: 루트 cwd pane 재생산 차단)
     const newSid = await newSurface(rootish ? null : cwd, destWs.socket);
+    // 목적지 **에이전트** 좌석(런처 셸과 다르다). 확정 전에는 null 이고, 확정 전에 원본을
+    // 닫는 경로는 없다.
+    let agentSid: number | null = null;
     destWs.tree = destWs.tree
       ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
       : { type: "pane", sid: newSid };
     // ③ 이후 실패는 보상 트랜잭션 — 새 pane 회수+트리 복원으로 "원본 보존"을 거짓말이 아니게 한다.
     try {
       if (isAgent) {
-        // ④ 에이전트 재기동(노드 재기동 처방과 동일 명령) — UI 가 조립한 명령이므로 machineOrigin
+        // ★(0.14.31 · WP-4 R1) `cys launch-agent` 는 **이 셸 안에서** 에이전트를 띄우지 않는다 —
+        //   데몬에 **새 surface** 를 만든다(cys.rs `run_launch_agent_opts` → surface.create).
+        //   종전 코드는 그 사실을 모른 채 런처 셸(newSid)을 계속 목적지로 삼아 준비 폴링과
+        //   핸드오프 큐잉을 **빈 셸에** 하고 원본을 닫았다 — 리뷰어는 인계를 못 받고 작업
+        //   세션은 사라졌다(리뷰어 blocking). 이제 런치 **전** id 집합을 스냅샷하고, 뒤에
+        //   나타난 **그 역할·에이전트 관측된 새 좌석이 정확히 하나**일 때만 목적지로 확정한다.
+        const beforeIds = (
+          ((await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+            surfaces: SurfaceRow[];
+          } | null)?.surfaces ?? []
+        ).map((x) => x.surface_id);
+        const launchedAt = Date.now() / 1000; // surface.created_at 은 epoch 초다
+        // ④ 에이전트 기동(노드 재기동 처방과 동일 명령) — UI 가 조립한 명령이므로 machineOrigin
         await invoke("send_input", {
           socket: destWs.socket,
           surfaceId: newSid,
           data: `${launchCmd}\r`,
           machineOrigin: true,
         });
-        // agent-ready 폴링(최대 60초): agent_meta 등록을 확인한 뒤 복원 지시를 보낸다 —
-        // queued(조용 시점 배달)만으로는 부팅 중 quiet 순간에 떨어져 유실될 수 있다(이중 안전).
-        stickyToast("transfer", "feed", "전출 진행 중", "새 워커 기동 대기…");
+        // 목적지 좌석 확정 폴링(최대 60초). **에이전트 관측**까지 요구한다 — 역할 등록만으로는
+        // 신뢰 관문에 걸려 각성하지 못한 좌석을 '완료'로 읽을 수 있다(codex 적대검증 blocking).
+        stickyToast("transfer", "feed", "전출 진행 중", "새 노드 기동·좌석 확정 대기…");
         const readyBy = Date.now() + 60_000;
         while (Date.now() < readyBy) {
           await new Promise((res) => setTimeout(res, 3000));
           const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
-            surfaces: { surface_id: number; role?: string | null; agent?: string | null }[];
+            surfaces: SurfaceRow[];
           } | null;
-          const ns = rr?.surfaces.find((s) => s.surface_id === newSid);
-          if (ns?.agent || ns?.role) break; // 등록 확인 — 미확인이어도 queued가 2차 안전망
+          const picked = pickLaunchedAgentSid(
+            beforeIds, newSid, rr?.surfaces ?? [], srcRole, launchedAt,
+          );
+          if (picked != null) {
+            agentSid = picked;
+            break;
+          }
+        }
+        if (agentSid == null) {
+          // 확정 실패 = 목적지를 모른다. 여기서 원본을 닫으면 **아무도 받지 않는 인계**가 된다.
+          // 실패 방향은 언제나 '전출 안 함'이다 — 아래 catch 의 보상 롤백으로 보낸다.
+          throw new Error(
+            "전출 목적지 좌석을 확정하지 못했습니다(기동 실패·역할 미등록·같은 역할 좌석 다중)",
+          );
         }
         await invoke("send_input", {
           socket: destWs.socket,
-          surfaceId: newSid,
-          data: `너는 전출된 워커다. ${handoffPath} 를 읽고 작업을 이어가라.`,
+          surfaceId: agentSid,
+          data: `너는 전출된 ${srcRole} 다. ${handoffPath} 를 읽고 작업을 이어가라.`,
           queued: true,
           // queued 는 배달자(Origin::Queue)가 별도로 기록하지만, 표식을 붙여 두면 경로가 바뀌어도
           // "UI 가 만든 문안"이라는 사실이 유지된다(누락 재발 방지 규칙: UI 조립 = 표식).
           machineOrigin: true,
         });
+        // 런처 셸은 소임을 다했다(에이전트는 별 surface 다) — 빈 좌석을 남기지 않는다.
+        // 실패는 무해하므로 삼킨다(원본 정리는 아래에서 별도로 판정한다).
+        await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
+        destroyPaneRuntime(newSid, destWs.socket);
+        if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
       }
-      // ⑤ 재기동 성공 후에만 원본 정리
+      // ⑤ 목적지 확정 + 인계 적재 성공 후에만 원본 정리
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
+      // 보상 롤백: **런처 셸만** 회수한다. 이미 확정된 에이전트 좌석(agentSid)이 있으면 그것은
+      // 살아 있는 노드이므로 닫지 않는다 — 살아있는 타 노드 종료는 승인 경계다. 사람이 볼 수
+      // 있게 토스트에 남긴다(원본은 어느 경우에도 보존된다).
       await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
       destroyPaneRuntime(newSid, destWs.socket);
       if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
       render();
-      toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`);
+      toast(
+        "watchdog",
+        "전출 실패",
+        agentSid == null
+          ? `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`
+          : `${e} — 원본 pane은 보존됩니다. 목적지에 기동된 surface:${agentSid} 는 살아 있으니 확인 후 정리하세요`,
+      );
       return;
     }
     destroyPaneRuntime(sid, srcSock);
     if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
     if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
     render();
-    toast("feed", "부서 전출 완료", `→ ${destWs.name || UNTITLED} (surface:${newSid})`);
+    toast(
+      "feed",
+      "부서 전출 완료",
+      `→ ${destWs.name || UNTITLED} (surface:${agentSid ?? newSid})`,
+    );
   } catch (e) {
     toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);
   } finally {
