@@ -399,9 +399,13 @@ cys_role_token_ok() {
   return 0
 }
 
-# 파일명 성분 — 파이썬 `_slug` 와 **바이트 단위로** 같다(`tr` 는 바이트, 파이썬도 UTF-8 바이트).
+# 파일명 성분 — 파이썬 `_slug` 와 **글자 그대로** 같다.
+# ★R2(codex 위임 차분 프로브 실측): `tr -c` 만 쓰면 macOS `tr` 는 멀티바이트를 한 글자로 세고
+#   파이썬은 UTF-8 바이트로 세어 **같은 소켓이 두 파일**이 됐다(R1 의 '바이트 단위로 같다'는
+#   틀린 주장이었다). `-s`(연속 치환 접기)를 더하면 허용 집합이 순수 ASCII 라 두 층이 언제나
+#   같은 구간을 접어 결과가 동일해지고, 결과가 ASCII 라 80자 절단의 단위 문제도 사라진다.
 cys_role_slug() {
-  _cys_sl="$(printf '%s' "${1-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null)" || _cys_sl=""
+  _cys_sl="$(printf '%s' "${1-}" | tr -cs 'A-Za-z0-9._-' '_' 2>/dev/null)" || _cys_sl=""
   while [ "${#_cys_sl}" -gt 80 ]; do _cys_sl="${_cys_sl%?}"; done
   printf '%s' "$_cys_sl"
   return 0
@@ -414,15 +418,34 @@ cys_role_socket_env()  { printf '%s' "${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOC
 # 데몬 신원 문자열 — 캐시 **레코드에 그대로 실려** 정확 비교된다(손실 슬러그가 서로 다른
 # 소켓을 같은 키로 뭉개던 길 차단 · reviewer-codex R1). 지정이 없으면 상태 디렉터리·HOME 으로
 # 문맥을 구분한다(Rust 기본 소켓이 그 둘에서 유도된다 · src/lib.rs:379).
-cys_role_sock_id() {
-  _cys_si="$(cys_role_socket_env)"
-  [ -n "$_cys_si" ] || _cys_si="default:${XDG_STATE_HOME:-}:${HOME:-}"
-  # 병적으로 긴 값은 외부 명령 1회로 한 번에 줄이고(루프 비용 상한), 나머지는 빌트인으로.
-  [ "${#_cys_si}" -gt 4096 ] && _cys_si="$(printf '%s' "$_cys_si" | cut -c1-512 2>/dev/null)"
-  while [ "${#_cys_si}" -gt 512 ]; do _cys_si="${_cys_si%?}"; done
-  printf '%s' "$_cys_si"
+#
+# ★R2(major · reviewer-codex) — 두 가지를 한꺼번에 고친다.
+#  ⓐ **명령 치환으로 회수하지 않는다.** `$(cys_role_sock_id)` 는 말미 개행을 먹어서
+#     `CYS_SOCKET=/tmp/a.sock<LF>` 이 여기선 `/tmp/a.sock`(=다른 종단점의 신원)으로 접혔다 —
+#     그러면 셸이 **남의 종단점 이름표를 단 레코드**를 쓰고 파이썬이 그것을 권위로 읽는다.
+#     그래서 현재 셸에서 파라미터 확장만으로 계산해 `CYS_ROLE_SOCK_ID` 에 담는다.
+#  ⓑ **자르지 않는다. 표현할 수 없으면 빈 값**(= 디스크 캐시 끔 · 매번 데몬 조회)이다:
+#     절대 경로가 아닌 소켓(상대 경로·`C:foo`·named pipe — cwd·드라이브에 따라 다른 종단점) ·
+#     `:` 가 든 XDG/HOME(접두 인코딩이 단사가 아니게 된다) · 512 초과 · LF/CR 포함.
+#     파이썬 짝 `javis_role._sock_id` 와 **같은 규칙**이다(어긋나면 test_role_authority 가 멈춘다).
+cys_role_sock_id_init() {
+  cys_role_ws_init
+  CYS_ROLE_SOCK_ID=""
+  _cys_si="${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOCKET:-}}}"
+  if [ -n "$_cys_si" ]; then
+    case "$_cys_si" in /*) : ;; *) return 0 ;; esac        # ⓐ 절대 경로가 아니면 신원 미지
+  else
+    case "${XDG_STATE_HOME:-}${HOME:-}" in *:*) return 0 ;; esac   # ⓑ 단사 아님
+    _cys_si="default:${XDG_STATE_HOME:-}:${HOME:-}"
+  fi
+  [ "${#_cys_si}" -le 512 ] || return 0
+  case "$_cys_si" in *"$CYS_ROLE_NL"*|*"$CYS_ROLE_CR"*) return 0 ;; esac
+  CYS_ROLE_SOCK_ID="$_cys_si"
   return 0
 }
+
+# 호환 표기(진단·검체용) — 계산은 위 함수가 하고 여기서는 값만 낸다.
+cys_role_sock_id() { cys_role_sock_id_init; printf '%s' "$CYS_ROLE_SOCK_ID"; return 0; }
 
 # 신원 — 파이썬 `surface_id()` 와 **같은 규칙**(값 전체 검사 · 선두 0 정규화 · 자릿수 19).
 # 종전에는 첫 줄만 떼어 검사하고 원본을 CLI 에 넘겼다 → `"7\n junk"` 가 여기선 7 로 통과하는데
@@ -462,6 +485,8 @@ cys_role_cache_dir() {
   _cys_ls="$(ls -ldn "$_cys_cd" 2>/dev/null)" || _cys_ls=""
   [ -n "$_cys_ls" ] || return 1
   case "$_cys_ls" in d????-??-?*) : ;; *) return 1 ;; esac   # group/other 쓰기 0
+  # (평시에는 `cys_resolve_role` 이 현재 셸에서 이미 세워 둔다 — 여기는 직접 호출용 폴백이고,
+  #  서브셸에서 세운 값은 밖으로 나가지 않는다는 사실을 이 주석이 명시한다 · R2)
   [ -n "${CYS_ROLE_UID:-}" ] || CYS_ROLE_UID="$(id -u 2>/dev/null || printf '')"
   [ -n "$CYS_ROLE_UID" ] || return 1
   # ★필드 분해는 **noglob 안에서** 한다 — `ls -ldn` 마지막 필드는 경로이고, TMPDIR 에 `*`·`?`
@@ -476,11 +501,33 @@ cys_role_cache_dir() {
 }
 
 # (surface, socket 슬러그)당 정확히 하나. boot-epoch 는 **레코드**에 있으므로 재기동 고아가 없다.
+# ★신원이 빈 값(표현 불가)이면 경로 자체를 내지 않는다 — 호출측이 디스크 캐시를 끈다.
 cys_role_cache_path() {
+  [ -n "${CYS_ROLE_SOCK_ID:-}" ] || return 1
   _cys_cdp="$(cys_role_cache_dir)" || return 1
   printf '%s/role-%s-%s' "$_cys_cdp" "$(cys_role_slug "${1:-none}")" \
-    "$(cys_role_slug "$(cys_role_sock_id)")"
+    "$(cys_role_slug "$CYS_ROLE_SOCK_ID")"
   return 0
+}
+
+# ★유계 판독(R2 major · reviewer-codex): 종전 `IFS= read -r x < "$f"` 는 **줄 전체를 다 읽은
+#   뒤에** 길이를 쟀다 — 4KB 상한이 판독 뒤에 적용되니 상한이 아니었고, 자라는 파일은 판독을
+#   붙잡았다. 지금은 `dd bs=4096 count=1`(POSIX · Git Bash 포함)로 **읽는 순간** 바이트를 묶고,
+#   그 판독마저 `cys_timeout_run` 데드라인 안에서 돈다(`-f` 검사 뒤 FIFO 로 바꿔치기하는
+#   경합에서 열기가 매달리는 것까지 유계로 만든다).
+#   ★`dd` 가 없으면 **폴백하지 않고 판독 실패**로 낸다 — 무계 빌트인 판독으로 되돌아가면 이
+#   수정이 그대로 원상복구된다(codex R2). 실패의 귀결은 캐시 미스(데몬 조회 1회)다.
+#   ★정직한 비대칭: 셸 변수는 NUL 을 담지 못해 `c<NUL>so` 가 셸에선 `cso` 로 읽힌다(파이썬은
+#     거절). 레코드를 쓸 수 있는 자는 NUL 없이도 같은 줄을 쓸 수 있으므로 공격력은 늘지 않고,
+#     남는 것은 **두 층 판정이 갈릴 수 있다**는 파리티 한계다(노트 '알려진 비대칭'에 기록).
+CYS_ROLE_READ_CAP=4096
+cys_role_read_bounded() {   # $1=경로 · stdout: 선두 최대 4KB · rc≠0 = 판독 불가(캐시 미스)
+  [ -n "${1:-}" ] || return 1
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  command -v dd >/dev/null 2>&1 || return 1
+  cys_timeout_run "$CYS_ROLE_QUERY_TIMEOUT" \
+    dd "if=$1" "bs=$CYS_ROLE_READ_CAP" count=1 2>/dev/null
+  return $?
 }
 
 # boot-epoch 토큰 또는 `-`(모름). 파이썬 `_boot_epoch` 와 같은 규칙(권위가 아니라 세대 표식).
@@ -488,9 +535,7 @@ cys_role_epoch() {
   _cys_ep_s="$(cys_role_socket_env)"
   if [ -n "$_cys_ep_s" ]; then
     _cys_ep_f="$(dirname "$_cys_ep_s" 2>/dev/null)/boot-epoch"
-    if [ -f "$_cys_ep_f" ] && [ ! -L "$_cys_ep_f" ]; then
-      _cys_ep_l=""
-      IFS= read -r _cys_ep_l < "$_cys_ep_f" 2>/dev/null || :
+    if _cys_ep_l="$(cys_role_read_bounded "$_cys_ep_f")"; then
       _cys_ep_l="$(cys_role_line "${_cys_ep_l:-}")"
       if cys_role_token_ok "$_cys_ep_l"; then printf '%s' "$_cys_ep_l"; return 0; fi
     fi
@@ -500,13 +545,12 @@ cys_role_epoch() {
 }
 
 # 레코드 문법 `"<ts> <role> <epoch> <sockid>"` 판독 — 파이썬 `_parse_record` 와 같은 규칙.
-# 성공 시 CYS_ROLE_REC_TS / CYS_ROLE_REC_VAL 설정. 파일은 우리 0700 디렉터리 안이라
-# `-f`(FIFO 배제) + `! -L` 로 충분하다(그 디렉터리에는 남이 아무것도 만들 수 없다).
+# 성공 시 CYS_ROLE_REC_TS / CYS_ROLE_REC_VAL 설정. 파일 종류 검사(`-f`·`! -L`)와 4KB 상한은
+# `cys_role_read_bounded` 가 **판독 시점에** 집행한다(R2 — 종전엔 다 읽은 뒤에 길이를 쟀다).
 cys_role_record() {   # $1=path $2=sockid $3=epoch
   [ -n "${1:-}" ] || return 1
-  [ -f "$1" ] && [ ! -L "$1" ] || return 1
-  _cys_rl=""
-  IFS= read -r _cys_rl < "$1" 2>/dev/null || :
+  [ -n "${2:-}" ] || return 1          # 신원 미지 = 캐시 없음(빈 sockid 로 매칭되지 않게)
+  _cys_rl="$(cys_role_read_bounded "$1")" || return 1
   _cys_rl="$(cys_role_first_line "${_cys_rl:-}")"
   [ -n "$_cys_rl" ] || return 1
   [ "${#_cys_rl}" -le 4096 ] || return 1
@@ -530,21 +574,33 @@ cys_role_record() {   # $1=path $2=sockid $3=epoch
 }
 
 # 0600 · 같은 디렉터리 원자 교체. 실패는 무시(캐시는 최적화지 사실이 아니다).
-# ★`set -C`(noclobber = O_EXCL) 로 임시 이름을 **새로** 만든다 — 평범한 `>` 는 그 자리에 심어 둔
-#   심링크의 목적지를 truncate 한다(reviewer 공통 지적). 잔재 임시 파일은 정규·비심링크일 때만
-#   치우고 한 번 재시도한다.
+# ★R2(major · reviewer-codex): 종전 `( set -C; … > "$1.$$.tmp" )` 는 안전하지 않았다 —
+#   bash 의 noclobber 는 **정규 파일**만 거절하고 FIFO 는 그대로 연다. 그 자리에 읽는 쪽 없는
+#   FIFO 를 심어 두면 `printf` 가 열기에서 영원히 멈추고, 이 쓰기는 데몬 조회의 2s 데드라인
+#   **밖**이라 `cys-dept` 가 무한정 붙잡힌다.
+#   지금은 **새 전용 디렉터리를 배타 생성**해 그 안에만 쓴다: 갓 만든 디렉터리에는 남이 심어 둔
+#   것이 있을 수 없으므로 열기가 매달릴 대상 자체가 없다. `mktemp -d` 가 있으면 예측 불가한
+#   이름을(선점 방지), 없으면 `mkdir -m 700`(원자·배타)로 만들고, **만들기에 실패하면 쓰지
+#   않는다**(귀결은 데몬 조회 1회 더 · 오판이 아니다).
+#   ★최종 배치 전에 대상이 디렉터리가 아님을 확인한다 — `mv` 는 디렉터리(그리고 디렉터리로 가는
+#     심링크)를 **컨테이너로 취급**해 그 안으로 넣는다(파이썬 `os.replace` 와 다른 지점 · codex R2).
 cys_role_cache_write() {   # $1=path $2=한 줄 내용(개행 없이)
   [ -n "${1:-}" ] || return 0
-  _cys_rr_tmp="$1.$$.tmp"
-  if ! ( set -C; umask 077; printf '%s\n' "${2-}" > "$_cys_rr_tmp" ) 2>/dev/null; then
-    if [ -f "$_cys_rr_tmp" ] && [ ! -L "$_cys_rr_tmp" ]; then
-      rm -f "$_cys_rr_tmp" 2>/dev/null || :
-      ( set -C; umask 077; printf '%s\n' "${2-}" > "$_cys_rr_tmp" ) 2>/dev/null || return 0
-    else
-      return 0
-    fi
+  [ ! -d "$1" ] || return 0
+  _cys_rr_td=""
+  if command -v mktemp >/dev/null 2>&1; then
+    _cys_rr_td="$(mktemp -d "$1.XXXXXX" 2>/dev/null)" || _cys_rr_td=""
   fi
-  mv -f "$_cys_rr_tmp" "$1" 2>/dev/null || rm -f "$_cys_rr_tmp" 2>/dev/null || :
+  if [ -z "$_cys_rr_td" ]; then
+    _cys_rr_td="$1.$$.d"
+    mkdir -m 700 "$_cys_rr_td" 2>/dev/null || return 0
+  fi
+  if ( umask 077; printf '%s\n' "${2-}" > "$_cys_rr_td/r" ) 2>/dev/null && [ ! -d "$1" ]; then
+    mv -f "$_cys_rr_td/r" "$1" 2>/dev/null || rm -f "$_cys_rr_td/r" 2>/dev/null || :
+  else
+    rm -f "$_cys_rr_td/r" 2>/dev/null || :
+  fi
+  rmdir "$_cys_rr_td" 2>/dev/null || :
   return 0
 }
 
@@ -578,14 +634,19 @@ cys_resolve_role() {
   case "$_cys_rr_now" in ''|0*|*[!0-9]*) _cys_rr_now=0 ;; esac
   [ "${#_cys_rr_now}" -le 12 ] || _cys_rr_now=0
 
-  _cys_rr_sock="$(cys_role_sock_id)"
+  # ★신원은 **현재 셸에서** 계산한다(명령 치환이 말미 개행을 먹어 다른 종단점의 이름표를
+  #   달던 길 차단 · R2). 빈 값 = 표현 불가 = 디스크 캐시 끔(데몬에 매번 묻는다).
+  cys_role_sock_id_init
+  _cys_rr_sock="$CYS_ROLE_SOCK_ID"
   _cys_rr_ep="$(cys_role_epoch)"
-  # 레코드는 1줄 문법이다 — 소켓 신원에 개행이 있으면 디스크 캐시를 쓰지 않는다.
+  # ★`id -u` 1회는 **여기서** 한다(R2 minor · reviewer-claude): 종전에는 두 겹 서브셸
+  #   (`$(cys_role_cache_path …)` → `$(cys_role_cache_dir)`) 안에서 세워서 서브셸이 끝나면
+  #   사라졌고, 주석이 약속한 '최초 1회'와 달리 **해소마다** 포크가 하나 더 들었다.
+  [ -n "${CYS_ROLE_UID:-}" ] || CYS_ROLE_UID="$(id -u 2>/dev/null || printf '')"
   _cys_rr_cache=""
-  case "$_cys_rr_sock" in
-    *"$CYS_ROLE_NL"*) : ;;
-    *) _cys_rr_cache="$(cys_role_cache_path "$_cys_rr_sid")" || _cys_rr_cache="" ;;
-  esac
+  if [ -n "$_cys_rr_sock" ]; then
+    _cys_rr_cache="$(cys_role_cache_path "$_cys_rr_sid")" || _cys_rr_cache=""
+  fi
 
   # ① 신선 캐시 — 미래 시각(시계 역행)은 신선이 아니다(그러면 캐시가 무기한 유효해진다).
   CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""

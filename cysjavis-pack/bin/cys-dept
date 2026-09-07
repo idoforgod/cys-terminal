@@ -1184,9 +1184,25 @@ case "$cmd" in --help|-h) usage; exit 0 ;; esac
 #   ★추가 조임: 표식은 `launch` 에서만·**부서 소켓이 없을 때만** 인정한다. 진짜 rotate 는
 #   직전에 소켓을 `rm -f` 한 상태(:1740 부근)라 항상 참이고, 살아 있는 부서를 상대로 표식을
 #   흉내내도 면제가 서지 않는다. (Windows 는 named pipe 라 `-e` 가 늘 거짓 → 면제 유지.)
+#   ★R2 조임(minor · reviewer-claude): 종전 조건(`launch` + `--rotate` + 소켓 부재)은 **아직 없는
+#   부서명 전부**에 대해 누구에게나 성립했다 — stale `CYS_ROLE=cso` 로도 데몬 절을 건너뛰고
+#   등재·데몬 스폰·CEO 승격까지 갈 수 있었다(면제가 '비파괴'라던 종전 노트 표현은 과했다).
+#   진짜 rotate 는 kill 이전에 **등재 여부를 먼저 확인**하므로(:1737 `reg_names | grep -Fxq`),
+#   면제도 그 사실을 같이 요구한다: 미등재 이름에는 면제가 서지 않는다(신규 생성 경로 봉쇄).
+#   레지스트리가 아직 없으면(첫 기동) 면제도 없다 — `[ -f "$REG" ]` 가 reg_init 의 파일 생성
+#   부작용까지 막는다(읽기만 한다).
+#   ★단, **판독 불가는 미등재가 아니다**(codex R2): 재귀 launch 에서 레지스트리 판독이 일시적으로
+#   실패했다고 kill 뒤의 재기동을 새로 거절하면, 이 파일이 :1739 에서 일부러 피하는 '데몬은 죽고
+#   등재만 남는' 반파괴가 된다. 그때는 종전 조건(소켓 부재)만으로 면제를 유지한다.
 _CYS_ROTATE_SELF=0
-if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ]; then
-  if [ -n "${2:-}" ] && [ ! -e "$(dept_sock "${2:-}")" ]; then _CYS_ROTATE_SELF=1; fi
+if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ] && [ -n "${2:-}" ]; then
+  if [ ! -e "$(dept_sock "${2:-}")" ] && [ -f "$REG" ]; then
+    if _cys_rot_names="$(reg_names 2>/dev/null)"; then
+      if printf '%s\n' "$_cys_rot_names" | grep -Fxq -- "${2:-}"; then _CYS_ROTATE_SELF=1; fi
+    else
+      _CYS_ROTATE_SELF=1
+    fi
+  fi
 fi
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
@@ -1941,7 +1957,22 @@ EOF
       validate_dept_name "$name" "<name> -- <cmd>" "비실존 부서 — verb 오타 의심. 신규 생성은 launch/create, 목록은 list."
       export CYS_NO_AUTOSTART=1
     fi
-    export CYS_SOCKET="$(dept_sock "$name")" CYS_PACK_DIR="$(dept_pack "$name")"
+    # ★0.14.31 P6 R2(major · reviewer-claude): 소켓만 갈고 **호출 좌석의 surface 신원**을 그대로
+    #   물려주면, 자식의 `cys surface-role` 이 그 숫자를 **다른 데몬**의 surface.list 와 대조한다 —
+    #   surface id 는 데몬마다 별개다. ⓐ그 데몬에 없으면 rc0+빈 줄 = **권위 있는 무역할**이 되어
+    #   require_cso(exit 3)·부서 게이트(exit 7)가 60초 캐시와 함께 정상 요청을 거짓 거부하고,
+    #   ⓑ우연히 같은 숫자가 있으면 **권위 있는 틀린 역할**이 되어 남의 데몬 역할이 이 좌석의
+    #   판정·이벤트 라벨이 된다(P6 이 고치려던 오귀속의 재발). 데몬이 바뀌면 신원을 벗긴다 —
+    #   벗긴 뒤의 귀결은 '주소 없음 = 조회 안 함 = 종전 env 판정'이라 새 허용이 0 이다.
+    #   (같은 소켓이면 신원과 데몬이 정합하므로 그대로 둔다.)
+    _pt_sock="$(dept_sock "$name")"
+    # 비교는 **실효 소켓**으로 한다(구 별칭 포함 · Rust `env_compat` src/lib.rs:351 과 같은 순서) —
+    # `JAVIS_SOCKET` 만으로 같은 부서에서 부른 호출자의 정당한 좌석을 잃지 않게(codex R2).
+    _pt_cur="${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOCKET:-}}}"
+    if [ "$_pt_cur" != "$_pt_sock" ]; then
+      unset CYS_SURFACE_ID JAVIS_SURFACE_ID AITERM_SURFACE_ID CYS_SURFACE_REF
+    fi
+    export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")"
     # ★G3 축1: 부서 컨텍스트 실행에 계정 dir 동반 주입(유도 3순위 resolve_lane_acctdir 재사용) —
     # 부서 스코프 config 시드 표적은 ${CYS_ACCOUNT_DIR}(실소비 SOT · 폴백 dir 없음)이라, 이 주입이
     # 없으면 컨텍스트 CLI(init-pack 등)의 훅 시드가 생략(loud WARN)으로 접힌다. 유도 실패 = 계정격리

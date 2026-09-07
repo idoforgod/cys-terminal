@@ -537,6 +537,16 @@ ALLOW_PATH_SUBSTRS = ("/.cys/", "/logs/", "/log/", "/_round/")
 #   그 둘을 일반 규칙으로 두면 **집행 대상이 자기 집행 상태를 고쳐 게이트를 연다**.
 GATE_STATE_DIRNAME = "capgate"
 GATE_STATE_FILE_PREFIX = "cys-capgate-"
+# ★0.14.31 P6 R2(blocking · reviewer-codex): 좌석 **역할 권위 캐시**도 게이트 제어 상태다.
+#   `bin/javis_role.py`(CACHE_DIR_NAME)와 `hooks/_lib.sh`(CYS_ROLE_CACHE_DIRNAME)가 이 이름의
+#   0700 디렉터리에 `"<ts> <역할|-> <세대> <소켓신원>"` 레코드를 쓰고, `cys-dept` 단일소유
+#   게이트·`javis_org.require_cso`·`javis_snapshot.is_master` 가 그 레코드를 **권위**로 읽는다.
+#   그런데 그 디렉터리는 tmp 아래라 종전 `path_is_allowed` 의 tmp 예외로 **reviewer·CSO 가 쓸 수
+#   있었다** — 신선하고 키가 맞는 `-`(무역할) 레코드 한 줄이면 해소기가 데몬을 묻지 않고
+#   `cache-none` 을 내고, require_cso 는 exit 3, 부서 게이트는 exit 7 이 된다(집행 대상이 자기
+#   집행 상태를 고쳐 **복구 동작을 잠근다** · 0700 은 같은 OS 사용자의 에이전트를 가르지 못한다).
+#   그래서 예산 카운터·역할 캐시와 **같은 층**으로 접어 넣는다(실패·임시 파일 포함 · 하위 전부).
+ROLE_CACHE_DIRNAME = "cys-role-authority.d"
 
 # ── CSO 정책(0.14.31 WP-3 A) — 정본은 directives/CSO_DIRECTIVE.md §1-1 ────────
 # ★도구 이름 deny: 명령 접두로 표현되지 않으므로 **TTL 승인으로 열리지 않는다**(§1-1 말미).
@@ -725,7 +735,11 @@ def _is_gate_state_path(p):
     base = ap.rsplit("/", 1)[-1]
     if base.startswith(_fold(GATE_STATE_FILE_PREFIX)):
         return True
-    return ("/" + _fold(GATE_STATE_DIRNAME) + "/") in ap + "/"
+    if ("/" + _fold(GATE_STATE_DIRNAME) + "/") in ap + "/":
+        return True
+    # 역할 권위 캐시: 디렉터리 자신과 그 아래 **전부**(레코드·`.fail` 실패표식·`.tmp`/`.XXXXXX`
+    # 임시 파일·전용 임시 디렉터리). 접미가 붙은 형제(`cys-role-authority.d.bak`)는 대상이 아니다.
+    return ("/" + _fold(ROLE_CACHE_DIRNAME) + "/") in ap + "/"
 
 
 # ★집행 대상이 고쳐선 안 되는 **데몬 소유 상태**: `~/.cys/state/` 는 지침이 명시한 허용
@@ -2282,6 +2296,17 @@ def self_test():
         ("reviewer-codex", "Bash", {"command": "go build -o /w/repo/bin/app ./cmd"}),
         # ★게이트 제어 상태는 reviewer 의 tmp 예외에서도 빠진다.
         ("reviewer-codex", "Write", {"file_path": "/tmp/cys-capgate-role-3-x-y"}),
+        # ★R2(blocking · codex): **역할 권위 캐시**도 같은 층이다 — 신선하고 키가 맞는 `-`
+        #   레코드 한 줄이면 해소기가 데몬을 묻지 않고 `cache-none` 을 내서 require_cso(exit 3)·
+        #   부서 게이트(exit 7)를 잠근다. 레코드·실패표식·임시 파일·전용 임시 디렉터리 전부.
+        ("reviewer-codex", "Write", {"file_path": "/tmp/cys-role-authority.d/role-3-default"}),
+        ("reviewer-codex", "Edit", {"file_path": "/tmp/cys-role-authority.d/role-3-default"}),
+        ("reviewer-codex", "Write",
+         {"file_path": "/tmp/cys-role-authority.d/role-3-default.fail"}),
+        ("reviewer-codex", "Write",
+         {"file_path": "/tmp/cys-role-authority.d/role-3-default.A1b2C3/r"}),
+        ("reviewer-codex", "Write", {"file_path": "/private/tmp/cys-role-authority.d/x"}),
+        ("reviewer-gemini", "Write", {"file_path": "/tmp/cys-role-authority.d/role-9-x"}),
     ]
     cases_allow = [
         ("worker", "Edit", {"file_path": "/x/a.rs"}),
@@ -2497,6 +2522,20 @@ def self_test_contracts(fails):
          "예산 카운터 직접 쓰기")
     want(True, "Bash", {"command": "echo 0 > /w/home/.cys/state/capgate/abc.count"},
          "예산 카운터 리다이렉트")
+    # ★R2(blocking · codex): 역할 권위 캐시 — CSO 는 /tmp 를 쓸 수 있지만 이 디렉터리만은 아니다.
+    want(True, "Write", {"file_path": "/tmp/cys-role-authority.d/role-3-default", "content": "x"},
+         "역할 권위 캐시 직접 쓰기")
+    want(True, "Edit", {"file_path": "/tmp/cys-role-authority.d/role-3-default",
+                        "old_string": "a", "new_string": "b"},
+         "역할 권위 캐시 Edit")
+    want(True, "Write", {"file_path": "/tmp/cys-role-authority.d/role-3-default.fail",
+                         "content": "x"},
+         "역할 권위 캐시 실패표식")
+    want(True, "Bash", {"command": "echo x > /tmp/cys-role-authority.d/role-3-default"},
+         "역할 권위 캐시 리다이렉트")
+    # 양성 대조: 같은 tmp 뿌리의 평범한 파일은 종전대로 허용(과도차단 아님).
+    want(False, "Write", {"file_path": "/tmp/cso-role-notes.md", "content": "x"},
+         "tmp 평범한 파일은 여전히 허용")
     want(True, "Bash", {"command": "cat /w/big > /w/pack/round/CSO_TODO.md"},
          "상태 파일 리다이렉트(상한 우회)")
     want(False, "Bash", {"command": "cys status > /dev/null"}, "/dev/null 싱크")

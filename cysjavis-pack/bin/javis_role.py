@@ -146,7 +146,9 @@ def is_authoritative_none(source):
     return source in _AUTHORITATIVE_NONE
 
 
-_MEMO = None   # (key, expires_at, (role, source)) — 만료 있는 프로세스 메모
+# (key, mono_expiry, wall_created, wall_expiry, (role, source)) — 두 시계로 만료하는 메모.
+# 단조시계는 벽시계 조작에, 벽시계는 서스펜드를 세지 않는 단조시계에 각각 면역이다(R2).
+_MEMO = None
 
 
 def reset_cache():
@@ -201,33 +203,72 @@ def surface_id():
     return t.lstrip("0") or "0"
 
 
-def _sock_id():
-    """데몬 신원 문자열 — 캐시 **레코드에 그대로 실려** 정확 비교된다.
+def _has_break(*vals):
+    """어느 값에든 LF·CR 이 있는가 — 레코드는 1줄 문법이라 그 순간 신원이 표현 불가다."""
+    for v in vals:
+        if "\n" in (v or "") or "\r" in (v or ""):
+            return True
+    return False
 
+
+def _sock_id():
+    """데몬 신원 문자열 또는 **""(표현 불가 → 디스크 캐시 끔)**.
+
+    캐시 **레코드에 그대로 실려** 정확 비교된다.
     ★왜 슬러그가 아니라 원문인가(reviewer-codex R1): `tr -c` 슬러그는 손실 치환이라
       `/tmp/a/b.sock` 과 `/tmp/a_b.sock` 이 **같은 파일명**을 만들었다 — 그러면 A 데몬의
       역할·실패표식이 B 데몬의 권위가 된다. 지금은 파일명이 겹쳐도 레코드의 sockid 가
       다르면 **캐시 미스**다(권위가 넘어가지 않는다).
     ★소켓 지정이 없을 때: Rust 기본 소켓은 상태 디렉터리에서 유도된다(src/lib.rs:379) →
       `default:<XDG_STATE_HOME>:<HOME>` 로 문맥을 구분한다(다른 HOME 이 키를 공유하지 않게).
+
+    ★R2(major · reviewer-codex) — **자르지 않는다. 표현할 수 없으면 캐시를 끈다.**
+      종전 규칙은 서로 다른 종단점을 하나의 신원으로 접었다:
+        ⓐ 상대 경로(`CYS_SOCKET=cys.sock`)는 cwd 마다 다른 유닉스 소켓인데 같은 신원이었다.
+           cwd 를 붙이는 방법은 두 층 파리티를 깨뜨린다(셸 `$(pwd -P)` 는 말미 개행을 먹고,
+           Windows 의 `/foo`·`C:foo` 는 드라이브별 cwd 에 매달리며, 파이썬 `C:\\work` 와
+           Git Bash `/c/work` 는 같은 자리를 다른 바이트로 적는다 · codex R2). 그래서
+           **절대 경로가 아니면 신원 미지**로 간주하고 디스크 캐시를 끈다(데몬에 매번 묻는다).
+        ⓑ `default:<XDG>:<HOME>` 은 값에 `:` 가 있으면 서로 다른 문맥을 같은 문자열로 접는다
+           (`XDG=/x:state,HOME=/h` 와 `XDG=/x,HOME=state:/h`) → 그때도 신원 미지다.
+        ⓒ 512 초과 절단은 서로 다른 긴 경로를 같은 신원으로 만들었다 → 절단 대신 신원 미지.
+      "신원 미지"의 귀결은 **디스크 캐시 없음 = 매번 데몬 조회**이고, 조회가 실패하면 이 WP
+      이전 동작(env 폴백)이다 — 새 허용은 0 이지만 캐시가 실어 나르던 *거부*도 함께 사라진다는
+      점은 정직하게 적어 둔다(코덱스 R2 지적 · 그 상태는 P6 이전 기준선과 같다).
     """
     v = _env_compat(SOCKET_ENV_KEYS)
-    if not v:
-        v = "default:%s:%s" % (os.environ.get("XDG_STATE_HOME", ""),
-                               os.environ.get("HOME", ""))
-    return v[:SOCKID_MAX]
+    if v:
+        if not v.startswith("/"):
+            return ""                       # ⓐ 상대·드라이브 상대·named pipe = 신원 미지
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME", "")
+        home = os.environ.get("HOME", "")
+        if ":" in xdg or ":" in home:
+            return ""                       # ⓑ 접두 인코딩이 단사가 아니게 되는 값
+        v = "default:%s:%s" % (xdg, home)
+    if len(v) > SOCKID_MAX or _has_break(v):
+        return ""                           # ⓒ 절단하지 않는다
+    return v
 
 
 def _slug(s):
-    """파일명 성분 — 셸 짝 `tr -c 'A-Za-z0-9._-' '_'` 와 **바이트 단위로** 같다.
+    """파일명 성분 — 셸 짝 `tr -cs 'A-Za-z0-9._-' '_'` 와 **글자 그대로** 같다.
 
-    ★유니코드를 코드포인트로 치환하면 셸(`tr`=바이트)과 파일명이 갈린다(reviewer-codex R1).
+    ★R2(codex 위임 차분 프로브 실측): R1 의 "파이썬도 UTF-8 바이트로 치환하니 셸(`tr`=바이트)과
+      갈리지 않는다"는 **틀린 주장이었다**. macOS `tr` 는 `env -i`(로케일 없음)에서도 멀티바이트를
+      **한 글자로** 세어 `/tmp/한글/소켓.sock` 을 `_tmp______.sock`(밑줄 6)로, 파이썬은
+      `_tmp______________.sock`(밑줄 14)로 만들었다 — 두 층이 **다른 파일**을 쓴다.
+      귀결은 권위 오판이 아니라 캐시 미스지만(레코드의 sockid 를 원문 대조하므로), 두 층이
+      캐시를 공유한다는 계약 자체가 거짓이 된다.
+    ★수정: **연속된 치환은 하나로 접는다**(`-s`). 허용 문자 집합이 순수 ASCII 라 두 층은 언제나
+      **같은 구간**을 치환하고 길이만 달랐다 — 접고 나면 어떤 입력에서도 결과가 같아지며,
+      결과가 ASCII 라 80자 절단의 단위(코드포인트/바이트) 문제도 함께 사라진다.
     """
     out = []
     for c in (s or "").encode("utf-8", "replace"):
         if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122) or c in (46, 95, 45):
             out.append(chr(c))
-        else:
+        elif not out or out[-1] != "_":
             out.append("_")
     return "".join(out)[:SLUG_MAX]
 
@@ -288,7 +329,15 @@ def _cache_dir():
 
 
 def _cache_path(sid):
-    """(surface, socket 슬러그)당 정확히 하나. 캐시 불가면 ""."""
+    """(surface, socket 슬러그)당 정확히 하나. 캐시 불가면 "".
+
+    ★R2(codex 위임 차분 프로브 실측): 종전에는 **신원 미지(`_sock_id()==""`)에서도 경로를 만들어**
+      `role-<sid>-` 를 냈다 — 셸 짝 `cys_role_cache_path` 는 같은 상황에서 rc 1(경로 없음)이라
+      두 층이 갈렸다. 호출측(`_resolve_uncached`)이 막고 있어 실동작은 옳았지만, 규칙을 이 함수가
+      스스로 지키게 한다(다음 호출자·검체가 같은 함정에 빠지지 않게).
+    """
+    if not _sock_id():
+        return ""
     d = _cache_dir()
     if not d:
         return ""
@@ -473,8 +522,9 @@ def _resolve_uncached(now):
         return role, src, fb_exp
     sockid = _sock_id()
     epoch = _boot_epoch()
-    # 레코드는 1줄 문법이다 — 소켓 신원에 개행이 있으면 디스크 캐시를 쓰지 않는다(메모만).
-    cpath = "" if ("\n" in sockid or "\r" in sockid) else _cache_path(sid)
+    # 신원을 표현할 수 없으면(상대 경로·모호한 기본 인코딩·512 초과) 디스크 캐시를 쓰지 않는다
+    # — 자르거나 뭉개서 **남의 데몬 역할을 권위로 읽는 것**보다 왕복 한 번이 낫다(R2).
+    cpath = _cache_path(sid) if sockid else ""
     if cpath:
         rec = _parse_record(_read_first_line(cpath), sockid, epoch)
         if rec:
@@ -509,22 +559,57 @@ def _resolve_uncached(now):
     return role, src, fb_exp
 
 
+def _memo_key():
+    """프로세스 메모의 신원 키 — **표현 불가한 신원도 문맥을 잃지 않는다**(R2 · codex).
+
+    `_sock_id()` 는 상대 경로에서 ""(신원 미지)를 내는데, 그 하나로 키를 잡으면 cwd 만 바꾼
+    **다른 소켓**이 같은 메모를 재사용한다. 그래서 원값 두 개에 더해, 소켓 값이 절대 경로가
+    아닐 때만 cwd 를 키에 싣는다(절대 경로에서는 cwd 가 판정에 영향을 주지 않으므로 부르지도
+    않는다 — 호출당 getcwd 1회를 아낀다).
+    """
+    raw_s = _env_compat(SURFACE_ENV_KEYS)
+    raw_k = _env_compat(SOCKET_ENV_KEYS)
+    cwd = ""
+    if raw_k and not raw_k.startswith("/"):
+        try:
+            cwd = os.getcwd()
+        except Exception:
+            cwd = "\x00unknown"      # 알 수 없는 cwd 는 어떤 실제 cwd 와도 같지 않다
+    return (raw_s, raw_k, cwd)
+
+
 def resolve_role_detail():
     """(role, source) — 데몬 권위 우선 · 캐시 · env 폴백. **예외를 내지 않는다**.
 
     소비처는 `source` 로 '권위 있는 무역할'(daemon-none/cache-none)과 '판정 불가 후 env 폴백'
     을 구분할 수 있다 — `cys-dept` 단일소유 가드가 그 구분을 쓴다.
+
+    ★프로세스 메모의 수명(R2 · reviewer-codex): 종전은 벽시계 하나였다 — 시계를 되돌리면
+      `now < expires_at` 이 계속 참이라 권위 있는 옛 답이 60초를 훌쩍 넘겨 살아남았다.
+      지금은 **두 시계를 동시에** 만족해야 재사용한다:
+        ⓐ `time.monotonic()` 이 만료 전(벽시계 조작에 면역)
+        ⓑ 벽시계가 생성 시각 이후이고(역행 검출) 벽시계 만료 전(단조시계가 서스펜드를 세지
+           않는 플랫폼 — macOS 가 그렇다 — 에서 절전 1시간 뒤 메모가 살아남던 길 차단)
+      수명은 **답의 나이에 앵커**한다: 디스크 캐시 히트는 `레코드ts+60`, 데몬 답은 `now+60`,
+      폴백은 `now+30`. 두 시계 모두 해소 **시작 시각**에 고정하므로 해소가 오래 걸려도 수명이
+      늘어나지 않는다. 남은 수명이 0 이하면 **메모하지 않는다**(종전의 `now+1` 갱신은 만료된
+      답을 1초 되살리는 길이었다 — 삭제).
     """
     global _MEMO
     try:
         now = int(time.time())
-        key = (_env_compat(SURFACE_ENV_KEYS), _env_compat(SOCKET_ENV_KEYS))
-        if _MEMO is not None and _MEMO[0] == key and now < _MEMO[1]:
-            return _MEMO[2]
+        mono = time.monotonic()
+        key = _memo_key()
+        if _MEMO is not None and _MEMO[0] == key:
+            _mexp, _wcreated, _wexp, _val = _MEMO[1], _MEMO[2], _MEMO[3], _MEMO[4]
+            if mono < _mexp and _wcreated <= now < _wexp:
+                return _val
         role, src, exp = _resolve_uncached(now)
-        if exp <= now:
-            exp = now + 1     # 최소 1초 — 한 훅 런의 20+회 호출이 왕복 20+회가 되지 않게
-        _MEMO = (key, exp, (role, src))
+        remaining = exp - now
+        if remaining > 0:
+            _MEMO = (key, mono + remaining, now, exp, (role, src))
+        else:
+            _MEMO = None
         return role, src
     except Exception:
         # 이 모듈이 소비처를 죽이는 경로는 없다(§3-3) — 최악이 현행(env) 동작이다.

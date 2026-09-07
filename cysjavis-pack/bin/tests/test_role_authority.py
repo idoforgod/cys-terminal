@@ -110,6 +110,57 @@ def sh_resolve(env, interp="sh"):
     return (r.stdout or "").strip("\n")
 
 
+def _identity(env, sid):
+    """주어진 env 에서 (캐시 경로, sockid, epoch) — **해소기 자신의 규칙**으로 계산한다.
+
+    검체가 규칙을 다시 구현하면 규칙이 바뀔 때 검체가 조용히 빗나간다(그래서 재구현하지 않는다).
+    """
+    old_env = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        JR.reset_cache()
+        return JR._cache_path(sid), JR._sock_id(), JR._boot_epoch()
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        JR.reset_cache()
+
+
+def JR_cache_path_of(env, sid):
+    """해소기 규칙으로 계산한 캐시 파일 경로(디렉터리 생성 포함)."""
+    return _identity(env, sid)[0]
+
+
+def _seed_record(env, sid, role, ts=None, epoch=None, sockid=None, mode="file", path=None):
+    """**문법적으로 유효한 4필드 레코드**를 캐시 자리에 심는다.
+
+    ★R2(major · reviewer-codex): 종전 6a/6c 는 두 필드짜리 옛 레코드를 심어서 **문법 거절**이
+      먼저 걸렸다 — 미래 시각·심링크 방어를 통째로 지워도 검체가 녹색이었다(공허한 단언).
+      여기서는 '그 한 가지 결함만 있는' 레코드를 심고, 같은 레코드의 정상판이 실제로 캐시
+      히트가 되는 **양성 대조**를 함께 둔다.
+    """
+    cpath, sk, ep = _identity(env, sid)
+    if path is None:
+        path = cpath
+    line = "%d %s %s %s\n" % (int(time.time()) if ts is None else ts, role,
+                              ep if epoch is None else epoch,
+                              sk if sockid is None else sockid)
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    if mode == "file":
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(line)
+        os.chmod(path, 0o600)
+    else:
+        target = path + ".target"
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(line)
+        os.symlink(target, path)
+    return path, line
+
+
 # ── ① 3상 + ② ⓑ/ⓒ 구분 + ③ 주소 부재 ────────────────────────────────────────
 def test_three_states():
     got = resolve(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "cso\n")))
@@ -178,6 +229,9 @@ def test_cache_and_backoff():
           n == 1, "조회 %d회" % n)
 
     # 프로세스 메모: 한 프로세스에서 두 번 물어도 조회는 1회
+    # ★R2(major · reviewer-codex): 종전 4e 는 **디스크 캐시로도 통과**했다(메모 만료 검사를
+    #   지워도 녹색). 그래서 아래 memo_* 검체는 캐시 디렉터리를 신뢰 불가로 만들어
+    #   **디스크 캐시를 끈 상태**에서 재고, 시각은 가짜 시계로 통제한다(sleep 0).
     log3 = os.path.join(_tmproot, "memo.log")
     e = base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(0, "cso\n", log=log3))
     code = ("import sys; sys.path.insert(0, %r); import javis_role as R;"
@@ -188,38 +242,133 @@ def test_cache_and_backoff():
     check("4e 프로세스 메모 — 3회 질의에 조회 1회", n == 1, "조회 %d회" % n)
 
 
+def _no_disk_cache(env):
+    """캐시 디렉터리 자리에 **정규 파일**을 놓아 디스크 캐시를 끈다(두 층 공통 규칙).
+
+    메모만 남기므로 '메모가 실제로 왕복을 아끼는가'를 디스크 캐시의 도움 없이 잴 수 있다.
+    """
+    with open(os.path.join(env["TMPDIR"], "cys-role-authority.d"), "w") as f:
+        f.write("not a directory\n")
+    return env
+
+
+_MEMO_DRIVER = """
+import json, sys
+sys.path.insert(0, %r)
+import javis_role as R
+
+
+class Clock(object):
+    def __init__(self):
+        self.w = 1000000.0
+        self.m = 500.0
+
+    def time(self):
+        return self.w
+
+    def monotonic(self):
+        return self.m
+
+
+C = Clock()
+R.time = C
+out = []
+for step in json.loads(sys.argv[1]):
+    C.w += step[0]
+    C.m += step[1]
+    out.append(list(R.resolve_role_detail()))
+print(json.dumps(out))
+"""
+
+
+def _memo_run(env, steps):
+    """가짜 시계로 (벽시계 증분, 단조시계 증분) 열을 따라 해소를 반복한다."""
+    r = subprocess.run([sys.executable, "-c", _MEMO_DRIVER % BIN, json.dumps(steps)],
+                       capture_output=True, text=True, encoding="utf-8", timeout=60,
+                       env=env, cwd=BIN)
+    try:
+        return json.loads(r.stdout or "[]"), (r.stderr or "")
+    except Exception:
+        return [], (r.stdout or "") + (r.stderr or "")
+
+
+def test_memo_lifetime():
+    """★R2: 메모의 **수명**을 잰다 — 종전 검체는 키만 재고 수명은 재지 않아, 만료 항을 지워도
+    (=R1 이전의 영구 메모로 되돌려도) 전건 녹색이었다(reviewer-claude 실증)."""
+    log = os.path.join(_tmproot, "memo-ttl.log")
+    e = _no_disk_cache(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                CYS_BIN=stub_dir(0, "cso\n", log=log)))
+    got, err = _memo_run(e, [[0, 0], [30, 30], [29, 29], [2, 2]])
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("4f ★메모는 60초에 만료한다(+59s 재사용 · +61s 재해소)",
+          [x[1] for x in got] == ["daemon", "daemon", "daemon", "daemon"] and n == 2,
+          "src=%s 조회 %d회 %s" % ([x[1] for x in got], n, err[:120]))
+
+    # 시계 역행: 단조시계는 1초만 흘렀는데 벽시계를 500초 되돌린다 → 메모를 버려야 한다.
+    log = os.path.join(_tmproot, "memo-rollback.log")
+    e = _no_disk_cache(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                CYS_BIN=stub_dir(0, "cso\n", log=log)))
+    got, err = _memo_run(e, [[0, 0], [-500, 1]])
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("4g ★벽시계 역행은 메모를 무효화한다(옛 권위가 560초 더 사는 길 차단)",
+          n == 2, "조회 %d회 %s" % (n, err[:120]))
+
+    # 서스펜드: 벽시계만 1시간 흐르고 단조시계는 멈춘 플랫폼(macOS) → 메모를 버려야 한다.
+    log = os.path.join(_tmproot, "memo-suspend.log")
+    e = _no_disk_cache(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                CYS_BIN=stub_dir(0, "cso\n", log=log)))
+    got, err = _memo_run(e, [[0, 0], [3600, 0]])
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("4h ★단조시계가 서스펜드를 세지 않아도 벽시계 만료가 메모를 끊는다",
+          n == 2, "조회 %d회 %s" % (n, err[:120]))
+
+    # 59초 된 디스크 레코드를 메모가 60초 더 살리지 않는다(승계 반영 상한 119s 회귀 차단).
+    log = os.path.join(_tmproot, "memo-cachecap.log")
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "worker\n", log=log))
+    _seed_record(e, "7", "cso", ts=1000000 - 59)
+    got, err = _memo_run(e, [[0, 0], [1, 1]])
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("4i ★59초 된 캐시 히트의 메모는 1초짜리다(다 된 캐시를 60초 되살리지 않는다)",
+          [x[1] for x in got] == ["cache", "daemon"] and n == 1,
+          "src=%s 조회 %d회 %s" % ([x[1] for x in got], n, err[:120]))
+
+
 # ── ⑥ 캐시 위생 ──────────────────────────────────────────────────────────────
 def test_cache_hygiene():
-    def seeded(line, mode="file"):
-        e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
-        env2 = dict(os.environ); env2.update(e)
-        old = dict(os.environ)
-        try:
-            os.environ.clear(); os.environ.update(e)
-            JR.reset_cache()
-            path = JR._cache_path("7")
-        finally:
-            os.environ.clear(); os.environ.update(old)
-            JR.reset_cache()
-        if mode == "file":
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(line)
-            os.chmod(path, 0o600)
-        else:
-            target = path + ".target"
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(line)
-            os.symlink(target, path)
-        return e
-
     now = int(time.time())
-    for label, line, mode in (("6a 미래 시각 캐시는 신선이 아니다", "%d cso\n" % (now + 9999), "file"),
-                              ("6b 손상 형식(공백 없음) 캐시는 무시", "noSpaceLine\n", "file"),
-                              ("6c ★심링크 캐시는 판독하지 않는다", "%d cso\n" % now, "symlink")):
-        e = seeded(line, mode)
-        e["CYS_BIN"] = stub_dir(2, "")
-        got = resolve(e)
-        check(label, got == "master\tenv-cys-role", got)
+
+    # ★양성 대조 먼저: **아무 결함도 없는** 4필드 레코드는 실제로 캐시 히트다. 이 줄이 없으면
+    #   아래 세 음성 대조는 '문법이 거절해서' 통과하는 공허한 단언이 될 수 있다(R2 · codex).
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
+    _seed_record(e, "7", "cso", ts=now)
+    e["CYS_BIN"] = stub_dir(2, "")
+    check("6-pos 양성 대조: 유효한 4필드 레코드는 캐시 히트다", resolve(e) == "cso\tcache")
+
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
+    _seed_record(e, "7", "cso", ts=now + 9999)          # 유일한 결함 = 미래 시각
+    e["CYS_BIN"] = stub_dir(2, "")
+    check("6a 미래 시각 캐시는 신선이 아니다(그 한 가지만 어긋난 유효 레코드)",
+          resolve(e) == "master\tenv-cys-role")
+
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
+    _identity(e, "7")                                    # 캐시 디렉터리 생성
+    with open(JR_cache_path_of(e, "7"), "w", encoding="utf-8") as f:
+        f.write("noSpaceLine\n")
+    e["CYS_BIN"] = stub_dir(2, "")
+    check("6b 손상 형식(공백 없음) 캐시는 무시", resolve(e) == "master\tenv-cys-role")
+
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
+    _seed_record(e, "7", "cso", ts=now, mode="symlink")  # 유일한 결함 = 심링크
+    e["CYS_BIN"] = stub_dir(2, "")
+    check("6c ★심링크 캐시는 판독하지 않는다(내용은 유효한 레코드다)",
+          resolve(e) == "master\tenv-cys-role")
+
+    # 소유자가 다른 캐시 파일은 신뢰하지 않는다 — root 아니면 만들 수 없으므로 건너뛴다.
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master")
+    _seed_record(e, "7", "cso", ts=now, sockid="/other/daemon.sock")
+    e["CYS_BIN"] = stub_dir(2, "")
+    check("6d 다른 데몬 신원의 레코드는 이 좌석의 권위가 아니다",
+          resolve(e) == "master\tenv-cys-role")
 
 
 # ── ⑤ 셸 짝과의 캐시 파리티 ──────────────────────────────────────────────────
@@ -327,8 +476,25 @@ def test_snapshot_gate():
     rc, out = _snapshot_rc(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
                                     CYS_BIN=stub_dir(2, "")), state)
     check("8h snapshot: 판정 불가 → 종전 env 절 그대로 통과", rc == 0, "rc=%s" % rc)
+    # ★R2 재핀(blocking · reviewer-codex · 의도적 기본값 변경): 종전 8i 는 **권위 있는 무역할**
+    #   앞에서 대장 절이 master 를 되살리는 것을 '종전 거부 없음'이라며 핀했다. 그것이 정본 §8
+    #   ("`CYS_ROLE` env 를 권위로 쓰지 않는다 — 승계 후 stale")의 표적 그 자체다: 데몬이
+    #   **확정적으로** '이 좌석에 역할이 없다'고 답한 것은 판정 불가가 아니라 사실이다.
+    #   실패 방향은 여전히 생산 skip(exit 0)이지 좌석 사망이 아니다(§3-3).
+    rc, out = _snapshot_rc(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                    CYS_BIN=stub_dir(0, "\n")), nostate)
+    check("8i-1 ★권위 무역할은 stale env master 를 끊는다(대장 없음)",
+          rc == 1 and "daemon knows no role" in out, "rc=%s out=%r" % (rc, out.strip()))
     rc, out = _snapshot_rc(base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(0, "\n")), state)
-    check("8i snapshot: 권위 무역할이어도 대장 일치 절은 살아 있다(종전 거부 없음)",
+    check("8i-2 ★권위 무역할은 stale 대장 일치도 끊는다(env 없음)",
+          rc == 1 and "daemon knows no role" in out, "rc=%s out=%r" % (rc, out.strip()))
+    rc, out = _snapshot_rc(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                    CYS_BIN=stub_dir(0, "\n")), state)
+    check("8i-3 ★두 신호가 함께여도 권위 무역할이 앞선다",
+          rc == 1 and "daemon knows no role" in out, "rc=%s out=%r" % (rc, out.strip()))
+    # 양성 대조 — 이 거부가 '권위 있는 답'에만 걸린다는 증거(판정 불가는 종전 그대로 통과).
+    rc, out = _snapshot_rc(base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(2, "")), state)
+    check("8i-4 판정 불가는 여전히 대장 절을 살린다(새 거부를 만들지 않는다)",
           rc == 0, "rc=%s out=%r" % (rc, out.strip()))
 
 
@@ -511,8 +677,6 @@ def test_cache_substrate():
 
 
 def test_record_grammar_parity():
-    import re
-
     # ★데몬 판정 불가(rc=2) 고정 — env 와 다른 답은 같은 바이트의 캐시 히트뿐이다.
     cases = (("신선 캐시", b"%s cso - %s\n", "cso\tcache"),
              ("권위 있는 무역할", b"%s - - %s\n", "\tcache-none"),
@@ -524,14 +688,12 @@ def test_record_grammar_parity():
              ("CRLF 줄 끝", b"%s cso - %s\r\n", "cso\tcache"),
              ("첫 줄만 판독", b"%s cso - %s\nSECOND LINE\n", "cso\tcache"),
              ("역할 64자 초과", b"%s " + b"r" * 65 + b" - %s\n", "master\tenv-cys-role"))
-    slug = lambda value: re.sub(rb"[^A-Za-z0-9._-]", b"_", value.encode()).decode()[:80]
     disagreed = []
     for i, (label, line, expected) in enumerate(cases, 1):
         e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(2, ""))
-        d = os.path.join(e["TMPDIR"], "cys-role-authority.d")
-        os.makedirs(d, mode=0o700)
-        sockid = ("default:%s:%s" % (e.get("XDG_STATE_HOME", ""), e.get("HOME", "")))[:512]
-        cpath = os.path.join(d, "role-%s-%s" % (slug(e["CYS_SURFACE_ID"]), slug(sockid)))
+        # ★경로·신원은 **해소기 자신의 규칙**으로 얻는다(검체가 슬러그를 재구현하면 규칙이 바뀔 때
+        #   조용히 빗나간다 — R2 에서 `tr -cs` 로 접기를 넣자 지역 람다가 즉시 어긋났다).
+        cpath, sockid, _ep = _identity(e, "7")
         with open(cpath, "wb") as f:
             f.write(line % (str(int(time.time())).encode(), sockid.encode()))
         got = resolve(e)
@@ -579,12 +741,141 @@ def test_slug_collision_and_memo_key():
           "%r %s" % ((r.stdout or "").strip(), (r.stderr or "").strip()[:120]))
 
 
+# ── ⑮ R2: 종단점 신원 — 자르지도 접지도 않는다(codex R2 major) ───────────────
+def _cache_files(env):
+    d = os.path.join(env["TMPDIR"], "cys-role-authority.d")
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def test_endpoint_identity():
+    """소켓 신원이 **다른 종단점을 같은 이름으로 접던** 세 길을 각각 막았는지 잰다.
+
+    실패 방향은 전부 '디스크 캐시 끔 = 매번 데몬 조회'다(오판이 아니라 왕복 1회).
+    """
+    # ⓐ 상대 경로 — cwd 마다 다른 소켓이다. 신원 미지 → 캐시 파일 0 · 매번 조회.
+    log = os.path.join(_tmproot, "relsock.log")
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET="cys.sock",
+                 CYS_BIN=stub_dir(0, "cso\n", log=log))
+    got1, got2 = resolve(e), resolve(e)
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("15a ★상대 소켓 경로는 신원이 아니다 — 디스크 캐시 끔(파일 0·매번 조회)",
+          got1 == "cso\tdaemon" and got2 == "cso\tdaemon" and n == 2 and _cache_files(e) == [],
+          "%s/%s 조회 %d회 files=%s" % (got1, got2, n, _cache_files(e)))
+
+    # ⓑ 한 프로세스 안에서 cwd 만 바꿔도 **메모가 넘어가지 않는다**(codex R2: 메모 키에 문맥).
+    log = os.path.join(_tmproot, "relsock-memo.log")
+    d1 = os.path.join(_tmproot, "cwd1"); d2 = os.path.join(_tmproot, "cwd2")
+    os.makedirs(d1, exist_ok=True); os.makedirs(d2, exist_ok=True)
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET="cys.sock",
+                 CYS_BIN=stub_dir(0, "cso\n", log=log))
+    code = ("import os, sys; sys.path.insert(0, %r); import javis_role as R;"
+            "os.chdir(%r); a=R.resolve_role();"
+            "os.chdir(%r); b=R.resolve_role();"
+            "os.chdir(%r); c=R.resolve_role();"
+            "print(a, b, c)" % (BIN, d1, d2, d1))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       timeout=60, env=e, cwd=BIN)
+    n = len(open(log, encoding="utf-8").read().strip().split("\n")) if os.path.exists(log) else 0
+    check("15b ★상대 소켓에서 cwd 가 바뀌면 메모를 재사용하지 않는다(다른 종단점이다)",
+          (r.stdout or "").strip() == "cso cso cso" and n == 3,
+          "%r 조회 %d회 %s" % ((r.stdout or "").strip(), n, (r.stderr or "")[:120]))
+
+    # ⓒ 말미 개행 — 셸이 `$( )` 로 개행을 먹고 **다른 종단점의 이름표**를 달던 길(codex R2).
+    sock = os.path.join(_tmproot, "nl.sock")
+    e_nl = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET=sock + "\n",
+                    CYS_BIN=stub_dir(0, "cso\n"))
+    sh_got = sh_resolve(e_nl)
+    e_plain = dict(e_nl); e_plain["CYS_SOCKET"] = sock; e_plain["CYS_BIN"] = stub_dir(2, "")
+    py_got = resolve(e_plain)
+    # (같은 TMPDIR 을 공유하므로 개행 **없는** 쪽의 정당한 실패표식 `.fail` 은 남는다 —
+    #  금지되는 것은 개행 있는 쪽이 남기는 **역할 레코드**다.)
+    _recs = [f for f in _cache_files(e_nl) if not f.endswith(".fail")]
+    check("15c ★말미 개행 소켓의 답이 개행 없는 종단점의 권위가 되지 않는다(두 층 공통)",
+          sh_got == "cso\tdaemon" and py_got == "master\tenv-cys-role" and _recs == [],
+          "sh=%r py=%r recs=%s" % (sh_got, py_got, _recs))
+
+    # ⓓ 512 초과 — 자르면 서로 다른 긴 경로가 한 신원이 된다. 자르지 않고 캐시를 끈다.
+    longsock = "/" + ("a" * 600) + "/cys.sock"
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET=longsock,
+                 CYS_BIN=stub_dir(0, "cso\n"))
+    py_got = resolve(e)
+    sh_got = sh_resolve(e)
+    check("15d ★512 초과 신원은 절단이 아니라 캐시 끔(두 층 동형)",
+          py_got == "cso\tdaemon" and sh_got == "cso\tdaemon" and _cache_files(e) == [],
+          "py=%r sh=%r files=%s" % (py_got, sh_got, _cache_files(e)))
+
+    # ⓔ `default:<XDG>:<HOME>` 은 값에 `:` 가 있으면 단사가 아니다 → 그때도 신원 미지.
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "cso\n"))
+    e["HOME"] = "/h:x"
+    py_got = resolve(e)
+    sh_got = sh_resolve(e)
+    check("15e ★모호한 기본 신원 인코딩(`:` 포함)은 캐시를 끈다(두 층 동형)",
+          py_got == "cso\tdaemon" and sh_got == "cso\tdaemon" and _cache_files(e) == [],
+          "py=%r sh=%r files=%s" % (py_got, sh_got, _cache_files(e)))
+
+
+def test_slug_parity_nonascii():
+    """★R2(codex 위임 차분 프로브가 잡은 결함): 비-ASCII 소켓 경로에서 **두 층이 같은 파일**을 쓴다.
+
+    종전 슬러그는 파이썬이 UTF-8 **바이트**를, macOS `tr` 가 **글자**를 세어 같은 소켓이 두 파일이
+    됐다(밑줄 14 vs 6) — '두 층이 캐시를 공유한다'는 계약이 거짓이었다. 지금은 연속 치환을 접어
+    (`tr -cs`) 어떤 입력에서도 결과가 같다.
+    """
+    sock = os.path.join(_tmproot, "한글", "소켓.sock")
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET=sock,
+                 CYS_BIN=stub_dir(0, "cso\n"))
+    sh_got = sh_resolve(e)
+    e2 = dict(e); e2["CYS_BIN"] = stub_dir(2, "")
+    py_got = resolve(e2)
+    check("15f ★비-ASCII 소켓 경로에서도 파이썬이 셸의 캐시를 읽는다(같은 파일명)",
+          sh_got == "cso\tdaemon" and py_got == "cso\tcache" and len(_cache_files(e)) == 1,
+          "sh=%r py=%r files=%s" % (sh_got, py_got, _cache_files(e)))
+
+    # 신원 미지에서는 **함수 스스로** 경로를 내지 않는다(셸 짝 rc 1 과 동형).
+    e = base_env(CYS_SURFACE_ID="7", CYS_SOCKET="relative.sock")
+    check("15g ★신원 미지면 `_cache_path` 자체가 빈 값이다(호출측 방어에만 기대지 않는다)",
+          _identity(e, "7")[0] == "", repr(_identity(e, "7")[0]))
+
+
+def test_concurrent_writers():
+    """★R2(codex): 동시 기록자 — 원자 교체라 **찢긴 레코드가 관측되지 않는다**.
+
+    두 층(파이썬 8 · 셸 4)을 같은 캐시 자리에 동시에 붙인다. 각 판정은 `daemon`(첫 기록자) 또는
+    `cache`(뒤이은 기록자) 중 하나여야 하고, 최종 파일은 **완결된 4필드 레코드 1줄**이어야 한다.
+    (임시 파일에 쓰고 rename 하는 대신 대상 파일에 직접 쓰면 반쯤 쓰인 줄이 읽힌다.)
+    """
+    import threading
+    e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "cso\n"))
+    outs, lock = [], threading.Lock()
+
+    def worker(shell):
+        got = sh_resolve(e) if shell else resolve(e)
+        with lock:
+            outs.append(got)
+
+    threads = [threading.Thread(target=worker, args=(i % 3 == 0,)) for i in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = all(x in ("cso\tdaemon", "cso\tcache") for x in outs)
+    path, sk, ep = _identity(e, "7")
+    line = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+    parts = line.rstrip("\n").split(" ", 3)
+    check("16a ★동시 기록자 12 — 찢긴 레코드 0 · 판정은 daemon|cache 뿐",
+          ok and len(parts) == 4 and parts[1] == "cso" and parts[3] == sk and parts[2] == ep,
+          "outs=%s line=%r" % (sorted(set(outs)), line))
+    leftovers = [f for f in _cache_files(e) if ".tmp" in f or f.endswith(".d")]
+    check("16b 임시 잔재 0(전용 디렉터리는 매번 치운다)", leftovers == [], str(leftovers))
+
+
 def main():
     try:
         test_three_states()
         test_env_compat_keys()
         test_fallback_is_cys_role_only()
         test_cache_and_backoff()
+        test_memo_lifetime()
         test_cache_hygiene()
         test_cross_layer_cache()
         test_no_autostart_and_env_purity()
@@ -596,6 +887,9 @@ def main():
         test_cache_substrate()
         test_record_grammar_parity()
         test_slug_collision_and_memo_key()
+        test_endpoint_identity()
+        test_slug_parity_nonascii()
+        test_concurrent_writers()
     finally:
         shutil.rmtree(_tmproot, ignore_errors=True)
     if fails:

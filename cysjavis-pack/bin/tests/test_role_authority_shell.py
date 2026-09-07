@@ -33,6 +33,7 @@ LIB = PACK / "hooks" / "_lib.sh"
 DEPT = PACK / "bin" / "cys-dept"
 STUB = '''#!/bin/sh
 printf '%s\\t%s\\n' "${CYS_NO_AUTOSTART-unset}" "$*" >> "$STUB_LOG"
+if [ -n "${STUB_SLEEP-}" ]; then sleep "$STUB_SLEEP"; fi
 printf '%s\\n' "${STUB_OUT-}"
 exit "${STUB_RC:-0}"
 '''
@@ -90,6 +91,13 @@ class Sandbox:
             env={}, cwd=self.home, capture_output=True, text=True, timeout=20,
         )
 
+    def run_script(self, script, shell="sh", args=()):
+        """임의 프로브를 밀폐 env 로 돌린다(파일을 심고 해소하는 케이스용)."""
+        interpreter = shutil.which(shell, path="/usr/bin:/bin")
+        if not interpreter:
+            raise AssertionError(f"필수 인터프리터 부재: {shell}")
+        return self.run([interpreter, "-c", script, "probe", str(LIB), *args])
+
     def calls(self):
         return self.log.read_text(encoding="utf-8").splitlines()
 
@@ -106,12 +114,25 @@ class Sandbox:
         equal((self.home / "resolver.stdout").read_bytes(), b"", "resolver stdout")
 
     def sock_id(self):
-        """레코드에 실리는 데몬 신원 — `_lib.sh cys_role_sock_id` / `javis_role._sock_id` 와 동형."""
+        """레코드에 실리는 데몬 신원 — `_lib.sh cys_role_sock_id` / `javis_role._sock_id` 와 동형.
+
+        ★R2: **절단하지 않는다** — 절대 경로가 아니거나 `:` 로 모호하거나 512 를 넘거나 개행이
+        들어 있으면 신원 미지("")이고, 그때 두 층은 디스크 캐시를 통째로 끈다.
+        """
         socket = self.env.get("CYS_SOCKET", "")
         if socket:
-            return socket[:512]
-        return ("default:%s:%s" % (self.env.get("XDG_STATE_HOME", ""),
-                                   self.env.get("HOME", "")))[:512]
+            if not socket.startswith("/"):
+                return ""
+            value = socket
+        else:
+            xdg = self.env.get("XDG_STATE_HOME", "")
+            home = self.env.get("HOME", "")
+            if ":" in xdg or ":" in home:
+                return ""
+            value = "default:%s:%s" % (xdg, home)
+        if len(value) > 512 or "\n" in value or "\r" in value:
+            return ""
+        return value
 
     def epoch(self):
         socket = self.env.get("CYS_SOCKET", "")
@@ -128,7 +149,9 @@ class Sandbox:
 
     def cache(self, surface="12"):
         def slug(value):
-            return re.sub(rb"[^A-Za-z0-9._-]", b"_", value.encode("utf-8")).decode()[:80]
+            # ★R2: 연속 치환은 하나로 접는다(`tr -cs` / 파이썬 `_slug` 와 동형) — 접지 않으면
+            #   멀티바이트 경로에서 셸(`tr`=글자)과 파이썬(=UTF-8 바이트)이 다른 파일을 쓴다.
+            return re.sub(rb"[^A-Za-z0-9._-]+", b"_", value.encode("utf-8")).decode()[:80]
         return self.cache_dir() / f"role-{slug(surface)}-{slug(self.sock_id())}"
 
     def record(self, value="cso", age=0, epoch=None, sock=None, ts=None):
@@ -385,9 +408,33 @@ dept_case("K3 --rotate is launch-only (down still denied)",
 # rc 하나로 면제 여부가 읽힌다.
 dept_case("K4 launch denied at the gate before name validation",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1, args=("launch", "bad name"))
+def _register_bad_name(box):
+    """`bad name` 을 레지스트리에 심는다 — R2 부터 면제는 **등재된 부서**에만 선다."""
+    box.registry.write_text('{"depts":{"bad name":{}}}', encoding="utf-8")
+
+
 dept_case("K5 ★argv --rotate exempts launch (falls through to name validation rc=2)",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0,
-          args=("launch", "bad name", "--rotate"), rc=2)
+          args=("launch", "bad name", "--rotate"), rc=2, prepare=_register_bad_name)
+# ★R2(minor · reviewer-claude): 종전 면제 조건은 **아직 없는 부서명 전부**에 성립해서, stale
+#   `CYS_ROLE=cso` 로도 데몬 절을 건너뛰고 신규 등재·데몬 스폰까지 갈 수 있었다. 진짜 rotate 는
+#   kill 이전에 등재를 확인하므로 면제도 그 사실을 함께 요구한다.
+dept_case("K7 ★--rotate does not exempt an unregistered department (new-creation path)",
+          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1,
+          args=("launch", "bad name", "--rotate"))
+
+
+def _unreadable_registry(box):
+    """레지스트리 판독 자체가 실패하는 상태 — '미등재' 와 구분되어야 한다."""
+    box.registry.write_text("{ not json", encoding="utf-8")
+
+
+# ★codex R2: 재귀 launch 에서 레지스트리 판독이 일시적으로 실패했다고 **kill 뒤에** 재기동을
+#   새로 거절하면, 이 파일이 :1739 에서 일부러 피하는 '데몬은 죽고 등재만 남는' 반파괴가 된다.
+#   판독 불가는 미등재가 아니다 — 그때는 종전 조건(소켓 부재)만으로 면제를 유지한다.
+dept_case("K8 ★unreadable registry keeps the rotate exemption (no post-kill half-op)",
+          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0,
+          args=("launch", "bad name", "--rotate"), rc=2, prepare=_unreadable_registry)
 
 
 def _plant_socket(box):
@@ -399,6 +446,177 @@ def _plant_socket(box):
 dept_case("K6 ★--rotate is not honored while the dept socket still exists",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1,
           args=("launch", "bad name", "--rotate"), prepare=_plant_socket)
+
+
+# ── L: 캐시 쓰기·판독의 기질(R2 · codex major 2건) ───────────────────────────
+_FIFO_PROBE = """set -u
+. "$1"
+cys_role_ws_init
+cys_role_sock_id_init
+CYS_ROLE_UID="$(id -u 2>/dev/null || printf '')"
+p="$(cys_role_cache_path "$CYS_SURFACE_ID")" || p=""
+if [ -z "$p" ]; then printf 'NOPATH\n'; exit 1; fi
+case "$2" in
+  legacy-tmp) f="$p.$$.tmp" ;;
+  fallback-dir) f="$p.$$.d" ;;
+  *) f="" ;;
+esac
+if [ -n "$f" ]; then mkfifo "$f" 2>/dev/null || printf 'NOFIFO\n'; fi
+cys_resolve_role
+printf '%s\t%s\t%s\n' "$CYS_RESOLVED_ROLE" "$CYS_RESOLVED_ROLE_SOURCE" \
+  "$([ -f "$p" ] && printf 'record' || printf 'norecord')"
+"""
+
+
+@case("L1 ★FIFO planted at the legacy temp name can no longer block the write")
+def fifo_legacy_tmp(box):
+    # 종전 판은 `"$1.$$.tmp"` 에 `set -C`(noclobber)로 썼는데, noclobber 는 **정규 파일**만
+    # 거절하고 FIFO 는 그대로 연다 — 읽는 쪽이 없으면 `printf` 가 열기에서 영원히 멈추고
+    # 그 쓰기는 데몬 조회의 2s 데드라인 **밖**이다(codex R2 major). 지금은 그 이름을 아예
+    # 쓰지 않는다. 외부 데드라인 = `Sandbox.run` 의 20s 타임아웃(초과 시 이 케이스가 적색).
+    result = box.run_script(_FIFO_PROBE, args=("legacy-tmp",))
+    equal(result.returncode, 0, f"probe rc; stderr={result.stderr!r}")
+    equal(result.stdout, "cso\tdaemon\trecord\n", "FIFO 무매달림·레코드 기록")
+
+
+def _no_mktemp(box):
+    """`mktemp` 를 '있지만 실패하는' 상태로 만들어 폴백(`mkdir -m 700`) 경로를 강제한다."""
+    stub = box.home / ".local" / "bin" / "mktemp"
+    stub.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    stub.chmod(0o700)
+
+
+@case("L2 fallback mkdir path still writes the record")
+def fallback_write(box):
+    _no_mktemp(box)
+    result = box.run_script(_FIFO_PROBE, args=("none",))
+    equal(result.returncode, 0, f"probe rc; stderr={result.stderr!r}")
+    equal(result.stdout.split("\t")[:2], ["cso", "daemon"], "폴백 경로 해소")
+    equal(result.stdout.endswith("record\n"), True, f"폴백 기록: {result.stdout!r}")
+
+
+@case("L3 ★FIFO at the fallback temp directory name does not block either")
+def fifo_fallback_dir(box):
+    _no_mktemp(box)
+    result = box.run_script(_FIFO_PROBE, args=("fallback-dir",))
+    equal(result.returncode, 0, f"probe rc; stderr={result.stderr!r}")
+    # 배타 생성(mkdir)이 실패하므로 **쓰지 않는다** — 매달리지도, 남의 자리에 쓰지도 않는다.
+    equal(result.stdout, "cso\tdaemon\tnorecord\n", "배타 생성 실패 = 쓰기 포기")
+
+
+@case("L4 oversized first line is rejected (bounded read)")
+def oversized_record(box):
+    box.cache_dir().mkdir(mode=0o700, exist_ok=True)
+    box.cache().write_text("x" * 8192 + "\n", encoding="utf-8")
+    box.resolve("cso", "daemon")
+    equal(box.calls(), ["1\tsurface-role"], "거대 첫 줄 = 캐시 미스")
+
+
+@case("L5 ★the 4KB bound is applied at the read, not after it")
+def bounded_read_deadline(box):
+    # ★거대한 첫 줄을 **다 읽고 나서** 길이를 재던 종전 판은 파일 크기에 비례해 느려졌다
+    #   (실측: 32MB 한 줄 = 1.09s · `dd bs=4096 count=1` = 0.005s). 판정은 양쪽 다 '캐시 미스'라
+    #   같으므로, 구분되는 관측은 **시간**뿐이다. 같은 케이스 안에서 작은 파일 기준선을 재고
+    #   64MB 파일과의 차이를 본다(느린 러너에서도 회귀는 더 크게 벌어지므로 안전 방향).
+    box.cache_dir().mkdir(mode=0o700, exist_ok=True)
+    box.cache().write_text("noSpaceLine\n", encoding="utf-8")
+    t0 = time.monotonic()
+    box.resolve("cso", "daemon")
+    small = time.monotonic() - t0
+    box.log.write_text("", encoding="utf-8")
+    with box.cache().open("w", encoding="utf-8") as handle:
+        for _ in range(64):
+            handle.write("x" * (1024 * 1024))
+        handle.write("\n")
+    t0 = time.monotonic()
+    box.resolve("cso", "daemon")
+    big = time.monotonic() - t0
+    equal(big - small < 1.0, True,
+          f"64MB 한 줄 판독이 유계가 아니다: small={small:.3f}s big={big:.3f}s")
+
+
+@case("L6 static: the unbounded builtin read is gone from both readers")
+def bounded_read_wiring(box):
+    src = LIB.read_text(encoding="utf-8")
+    equal("cys_role_read_bounded" in src, True, "유계 판독 헬퍼 소실")
+    equal('dd "if=$1"' in src, True, "dd 유계 판독 배선 소실")
+    equal('IFS= read -r _cys_rl < "$1"' not in src, True, "레코드 무계 판독 부활")
+    equal('IFS= read -r _cys_ep_l < "$_cys_ep_f"' not in src, True, "boot-epoch 무계 판독 부활")
+
+
+# ── M: 게이트를 끄는 env 노브가 없다(정본 §3-4 · R2 minor · reviewer-claude) ──
+@case("M1 ★CYS_ROLE_CACHE_TTL cannot extend the 60s cache")
+def knob_ttl(box):
+    box.seed("worker", age=61)
+    box.configure(CYS_ROLE_CACHE_TTL=999999)
+    box.resolve("cso", "daemon")
+    equal(box.calls(), ["1\tsurface-role"], "TTL 노브가 만료를 늘리지 못한다")
+
+
+@case("M2 ★CYS_ROLE_QUERY_BACKOFF cannot extend the 30s backoff")
+def knob_backoff(box):
+    box.cache_dir().mkdir(mode=0o700, exist_ok=True)
+    Path(str(box.cache()) + ".fail").write_text(box.record("-", age=31), encoding="utf-8")
+    box.configure(CYS_ROLE_QUERY_BACKOFF=999999)
+    box.resolve("cso", "daemon")
+    equal(box.calls(), ["1\tsurface-role"], "백오프 노브가 유예를 늘리지 못한다")
+
+
+@case("M3 ★CYS_ROLE_QUERY_TIMEOUT cannot extend the 2s deadline")
+def knob_timeout(box):
+    # 노브가 살아 있으면 30s 를 기다려 `cso/daemon` 이 나온다. 고정 2s 면 데드라인에 걸려
+    # **판정 불가 → env 폴백** 이다(판정이 갈리므로 시간 측정에 기대지 않는다).
+    box.configure(CYS_ROLE_QUERY_TIMEOUT=30, STUB_SLEEP=6, CYS_ROLE="master")
+    started = time.monotonic()
+    box.resolve("master", "env-cys-role")
+    elapsed = time.monotonic() - started
+    equal(elapsed < 5.0, True, f"2s 데드라인이 아니다: {elapsed:.2f}s")
+
+
+# ── N: 교차 데몬 실행이 좌석 신원을 물려주지 않는다(R2 major · reviewer-claude) ──
+def _passthrough_env(box, name="d1"):
+    """`cys-dept <name> -- env` 의 자식 env 를 파싱한다(부작용 0: 데몬 스폰·등재 없음)."""
+    result = box.run(["/bin/bash", str(DEPT), name, "--", "/usr/bin/env"])
+    equal(result.returncode, 0, f"passthrough rc; stderr={result.stderr!r}")
+    out = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+@case("N1 ★passthrough to another daemon strips the caller's surface identity")
+def passthrough_strips_identity(box):
+    # `run_surface_role`(src/bin/cys.rs:10985)은 이 숫자를 **CYS_SOCKET 데몬의** surface.list 와
+    # 대조한다 — id 는 데몬마다 별개다. 부재면 rc0+빈 줄(권위 무역할)로 정상 요청이 거짓 거부되고,
+    # 우연히 겹치면 **권위 있는 틀린 역할**이 된다. 데몬이 바뀌면 신원을 벗긴다.
+    box.configure(CYS_SURFACE_REF="surface:12", JAVIS_SURFACE_ID="9",
+                  AITERM_SURFACE_ID="8", CYS_ROLE="cso")
+    env = _passthrough_env(box)
+    equal([k for k in ("CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID",
+                       "CYS_SURFACE_REF") if k in env], [], f"신원 잔존: {env!r}")
+    equal(env.get("CYS_SOCKET", "").endswith("/cys-dept-d1/cys.sock"), True,
+          f"부서 소켓: {env.get('CYS_SOCKET')!r}")
+
+
+@case("N2 same-endpoint passthrough keeps the legitimate seat identity")
+def passthrough_keeps_identity(box):
+    # 소켓이 그대로면 신원과 데몬이 정합하다 — 벗기면 정당한 좌석을 잃는다(codex R2).
+    sock = str(box.home / ".local" / "state" / "cys-dept-d1" / "cys.sock")
+    box.configure(CYS_SOCKET=sock, CYS_ROLE="cso")
+    env = _passthrough_env(box)
+    equal(env.get("CYS_SURFACE_ID"), "12", f"같은 데몬에서는 보존: {env.get('CYS_SURFACE_ID')!r}")
+
+
+@case("N3 legacy JAVIS_SOCKET pointing at the same daemon also keeps the identity")
+def passthrough_legacy_alias(box):
+    # 실효 소켓을 구 별칭까지 보고 비교하지 않으면, `JAVIS_SOCKET` 만 쓰는 같은 부서 호출자가
+    # 정당한 좌석 신원을 잃는다(codex R2).
+    sock = str(box.home / ".local" / "state" / "cys-dept-d1" / "cys.sock")
+    box.configure(CYS_SOCKET=None, JAVIS_SOCKET=sock, CYS_ROLE="cso")
+    env = _passthrough_env(box)
+    equal(env.get("CYS_SURFACE_ID"), "12", f"구 별칭 동일 종단점: {env.get('CYS_SURFACE_ID')!r}")
 
 
 def main():

@@ -171,13 +171,21 @@ def is_master():
       뒤에도 stale `CYS_ROLE=master` 하나로 스냅샷 생산이 계속됐고, 설령 그 절을 고쳐도
       **대장 일치 절이 다시 master 를 허용**했다(codex R1 반례). 실패 방향은 '생산 skip(exit 0)' —
       좌석 사망이 아니라 관측 1건의 보류다(§3-3).
-      판정 불가·주소 없음·'역할 없음' 은 종전 경로 그대로다(새 거부를 만들지 않는다)."""
+      판정 불가·주소 없음은 종전 경로 그대로다(새 거부를 만들지 않는다).
+
+    ★R2(blocking · reviewer-codex): 종전에는 **권위 있는 '역할 없음'** 을 데몬 절에서 일부러
+      빼 놓고 그 아래 `CYS_ROLE=master` 절과 대장 절이 통과시켰다 — 정본 §8("`CYS_ROLE` env 를
+      권위로 쓰지 않는다 — 승계 후 stale")의 표적 그 자체가 살아 있었다는 뜻이다. 데몬이
+      **확정적으로** '이 좌석에는 역할이 없다'고 답한 것은 판정 불가가 아니라 사실이므로,
+      그 답 앞에서는 stale env 도 stale 대장도 마스터 권한을 되살리지 못한다. 실패 방향은
+      여전히 '생산 skip(exit 0)' 이다(§3-3 · 좌석 사망이 아니다). 검체 8i-1~8i-4."""
     _rm = _role_mod()
     if _rm is not None:
         try:
             _role, _src = _rm.resolve_role_detail()
-            if _rm.is_authoritative(_src) and not _rm.is_authoritative_none(_src) \
-               and _role.strip().lower() != "master":
+            if _rm.is_authoritative_none(_src):
+                return False, "daemon knows no role for this seat"
+            if _rm.is_authoritative(_src) and _role.strip().lower() != "master":
                 return False, "daemon role is not master"
         except Exception:
             pass          # 해소 실패는 이 게이트를 열지도 닫지도 않는다
