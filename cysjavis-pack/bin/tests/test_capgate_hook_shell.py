@@ -337,6 +337,99 @@ class HookBudgetCounter(_HookEnv):
                          "동시 증가가 유실됐다(원자 증가 아님)")
 
 
+class HookInputHandoff(_HookEnv):
+    """★R2: 셸→파이썬 **입력 인계**의 실패 양식(Windows Git Bash 경로 변환).
+
+    종전: 셸이 stdin 을 임시 파일에 쓰고 `cys_native_path` 로 변환해 넘겼는데, 파이썬이 그 파일을
+    열지 못하면 입력이 빈 문자열로 강등되어 `json.loads("")` 가 터졌다 — reviewer/planner 는
+    **모든 도구 호출마다** exit 2 로 벽돌이 됐다(cygpath 부재·변환 어긋남). 기준 커밋의 훅은
+    env 만 읽어 이 의존이 없었으므로 **이번 변경이 새로 만든 실패 양식**이다.
+    """
+
+    def _break_cygpath(self):
+        """PATH 에 **어긋난 변환**을 내는 cygpath 를 심는다(Git Bash 실패 형상의 재현).
+
+        이 형상에서는 변환 경로가 열리지 않아도 **POSIX 원본**이 남아 있다 — 판정기는 두 경로를
+        차례로 열어 보므로 판정이 계속되어야 한다.
+        """
+        p = self.fakebin / "cygpath"
+        p.write_text("#!/bin/sh\nprintf '%s\\n' '/nonexistent/converted/path'\n",
+                     encoding="utf-8")
+        p.chmod(0o755)
+        return p
+
+    def _destroy_input(self):
+        """변환도 어긋나고 **원본도 사라진** 최악 형상(파일 인계 전면 실패)."""
+        p = self.fakebin / "cygpath"
+        p.write_text("#!/bin/sh\nrm -f \"$2\" 2>/dev/null\n"
+                     "printf '%s\\n' '/nonexistent/converted/path'\n", encoding="utf-8")
+        p.chmod(0o755)
+        return p
+
+    def test_broken_native_path_does_not_brick_reviewer(self):
+        """★인계 실패에서도 reviewer 는 **판정을 수행**한다 — 벽돌이 되지 않는다.
+
+        종전: 변환 경로 open 실패 → 입력이 빈 문자열 → `json.loads("")` → **매 도구 호출마다**
+        exit 2. 기준 커밋의 훅은 env 만 읽어 이 의존이 없었으므로 이번 변경이 만든 실패 양식이다.
+        """
+        self._break_cygpath()
+        r = self.run_hook("Edit", {"file_path": "/nonexistent-repo/a.rs"},
+                          CYS_SURFACE_ROLE="reviewer-codex")
+        self.assertEqual(r.rc, 0, "인계 실패가 reviewer 좌석을 exit 2 로 죽였다: %s" % r.err)
+        self.assertTrue(r.denied, "판정이 수행되지 않았다(집행 0): %r / %r" % (r.out, r.err))
+
+    def test_broken_native_path_still_judges_cso(self):
+        self._break_cygpath()
+        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        self.assertEqual(r.rc, 0)
+        self.assertTrue(r.denied, "인계 실패로 CSO 게이트가 조용히 꺼졌다: %r / %r"
+                        % (r.out, r.err))
+
+    def test_broken_native_path_allows_normal_call(self):
+        self._break_cygpath()
+        r = self.run_hook("Bash", {"command": "cys status --json"}, CYS_SURFACE_ROLE="cso")
+        self.assertEqual(r.rc, 0)
+        self.assertFalse(r.denied, "정상 호출이 인계 실패로 막혔다: %s" % r.reason)
+
+    def test_destroyed_input_small_payload_uses_env_fallback(self):
+        """원본까지 사라져도 **소용량은 env 로도 실려 있다** — 판정이 계속된다."""
+        self._destroy_input()
+        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        self.assertEqual(r.rc, 0)
+        self.assertTrue(r.denied, "env 폴백이 동작하지 않아 게이트가 꺼졌다: %r / %r"
+                        % (r.out, r.err))
+
+    def test_destroyed_input_large_payload_fails_closed_for_reviewer(self):
+        """★대용량(>64KB)은 env 로 못 싣는다 — 그때 통과시키면 **배관 실패가 권한 확대**가 된다.
+
+        codex R2 반례: reviewer 의 70KB Write 가 무검사로 나가면 producer≠evaluator 의 기계
+        집행이 사라진다. 그래서 이 갈래는 종전 계약(reviewer fail-closed)을 그대로 지킨다.
+        """
+        self._destroy_input()
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
+                                    "content": "x" * 70000},
+                          CYS_SURFACE_ROLE="reviewer-codex")
+        self.assertEqual(r.rc, 2, "판독 불능인데 대형 Write 가 통과했다: rc=%s %r"
+                         % (r.rc, r.out))
+
+    def test_destroyed_input_large_payload_degrades_for_cso(self):
+        """CSO 는 같은 상황에서 **강등**이다(전 도구 차단 = 좌석 사망 금지 · 비대칭 유지)."""
+        self._destroy_input()
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
+                                    "content": "x" * 70000},
+                          CYS_SURFACE_ROLE="cso")
+        self.assertEqual(r.rc, 0, "CSO 좌석이 판독 불능으로 죽었다: %s" % r.err)
+        self.assertIn("게이트 강등", r.err)
+
+    def test_no_temp_file_leftover_on_broken_conversion(self):
+        """★`exec` 뒤에는 셸 trap 이 돌지 않는다 — 판정기가 **두 경로를 다** 지워야 한다."""
+        self._break_cygpath()
+        self.run_hook("Bash", {"command": "cys status"}, CYS_SURFACE_ROLE="cso")
+        leftovers = [p.name for p in self.tmpdir.iterdir()
+                     if p.name.startswith("cys-capgate-in.")]
+        self.assertEqual(leftovers, [], "임시 입력 파일이 남았다: %s" % leftovers)
+
+
 class NegativeControls(unittest.TestCase):
     """★음성 대조 — 안전 검사를 **지우면** 내장 self-test 가 실패해야 한다.
 
@@ -383,20 +476,62 @@ class NegativeControls(unittest.TestCase):
          '        if ch == "#" and at_word_start and False:'),
         # ★R1-2(codex 위임 검체에서 나온 실증 우회) — 셸이 실행하는 것과 판정기가 보는 것의 차이
         ("줄 이어붙이기(`\\`+개행) 제거",
-         '            if ch in ("\\n", "\\r"):\n'
+         '            if ch == "\\n":\n'
          '                if out and out[-1] == "\\\\":\n'
          "                    out.pop()\n"
+         "                    mask.pop()\n"
          "                esc = False\n"
          "                i += 1\n"
          "                continue\n",
          ""),
         ("영폭 문자 거부", "    if has_invisible(command):\n        return None\n", ""),
         ("변수 확장 게이트",
-         '        if "$" in str(t) and _resolve_pack_token(t, ctx) is None:',
+         '        if ("$" in st or _has_sentinel(st)) and _resolve_token(t, ctx) is None:',
          "        if False:"),
-        ("중괄호 확장 게이트",
-         '            if "," in inner and not inner.strip().startswith(\'"\'):',
+        ("중괄호 확장 게이트(쉼표·범위)",
+         "            if has_comma or has_range:",
          "            if False:"),
+        # ★R2 — 리뷰 2차가 실증한 우회·오탐의 짝. 검사를 지우면 위 self_test_r2 가 실패해야 한다.
+        ("리터럴 `$`·`~` 센티널(인용 인지)",
+         '        if m in ("s", "e") and ch == "$":\n'
+         "            out.append(SENT_DOLLAR)\n"
+         '        elif m in ("s", "e") and ch == "~":\n'
+         "            out.append(SENT_TILDE)\n",
+         "        if False:\n            pass\n"),
+        ("인용 밖 변수 확장 거부", '        if ch == "$":', "        if False:"),
+        ("글롭 거부", "        if ch in GLOB_CHARS:", "        if False:"),
+        ("변수 이름 경계", "_VAR_PACK_RE = re.compile(r\"\\$CYS_PACK_DIR(?![A-Za-z0-9_])\")",
+         "_VAR_PACK_RE = re.compile(r\"\\$CYS_PACK_DIR\")"),
+        ("심링크 해소(realpath)", "        ap = os.path.realpath(ap)\n", ""),
+        ("승인의 세그먼트 범위",
+         "        seg_command = _seg_command(seg)", "        seg_command = command"),
+        ("승인 대상 복합 실행 금지",
+         "            ok, why, ess = _cys_segment_verdict(seg, ctx, seg_command, n_segs)",
+         "            ok, why, ess = _cys_segment_verdict(seg, ctx, seg_command, 1)"),
+        ("`cys` 하위 명령은 동사 바로 뒤",
+         "        sub = rest[0] if rest else None",
+         "        sub = next((a for a in rest if not a.startswith(\"-\")), None)"),
+        ("읽기 명령의 **명령별** 값 옵션",
+         "        VALUE_OPTS = CSO_TARGET_VALUE_OPTS.get(base, CSO_TARGET_VALUE_OPTS_DEFAULT)",
+         '        VALUE_OPTS = ("-a", "-n", "-c", "--algorithm", "--lines", "--bytes")'),
+        ("카운터 내용 검증",
+         '    if len(body) > COUNTER_MAX_BYTES or body.strip(b"\\x01"):',
+         "    if False:"),
+        ("git 파일 출력 옵션",
+         "    if _opt_hit(sub_args, GIT_FILE_OUT_OPTS):", "    if False:"),
+        # ※`ch == "\\n"`(CR 은 개행이 아니다)은 **이중 방어**라 단독 변이가 판정을 바꾸지 않는다 —
+        #   CR 이 든 명령은 아래 `DIVERGENT_CHARS` 가 먼저 거부한다. 공허한 변이를 넣지 않는다.
+        ("CR 거부(판정·실행 갈림)",
+         'DIVERGENT_CHARS = ZERO_WIDTH_CHARS + ("\\r",)',
+         "DIVERGENT_CHARS = ZERO_WIDTH_CHARS"),
+        ("cargo --config 키 allowlist",
+         '            if base == "cargo" and t == "--config":',
+         "            if False:"),
+        ("선행 환경 할당 거부",
+         '        _eqh = raw_head.split("=", 1)[0]', "        _eqh = \"\""),
+        ("빌드 임의 실행·소스 대체 옵션",
+         '        if any(t == d or t.startswith(d + "=") for d in BUILDER_DENY_OPTS):',
+         "        if False:"),
         ("옵션 종료 `--` 처리",
          '    args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args',
          "    args = raw_args"),

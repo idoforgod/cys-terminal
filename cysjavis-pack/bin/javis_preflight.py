@@ -401,8 +401,45 @@ def capgate_alert_route_enabled(status_obj):
     return ar.get("enabled") is True
 
 
+# ★등록 게이트는 **3값**이다(R2 blocking · 두 리뷰어): `on`(등록) · `off`(해제) · `unknown`(둘 다
+#   안 함). 종전엔 2값이라 "잴 수 없다"(소켓 미실재·rc≠0·timeout·지침 판독 실패)가 `False` 로
+#   접혔고, C28 이 그 `False` 하나로 **이미 등록된 훅을 settings.json 에서 제거**했다.
+#   등록 쪽에서 '판정 불능=미등록' 은 안전 방향이지만 **해제 쪽에서는 정반대**다: 콜드 부트
+#   (데몬 미기동·스테일 소켓)마다 게이트가 조용히 꺼지고, 그 뒤 `cys boot` 가 CSO·reviewer
+#   좌석을 **무게이트**로 띄운다(감사 에러 1·3 의 재현 경로 · 봉인표 ③).
+CAPGATE_ON, CAPGATE_OFF, CAPGATE_UNKNOWN = "on", "off", "unknown"
+# `cys status --json` 이 **진짜 상태 문서**인지의 표지(0.14.30 실측 최상위 키).
+#   빈 객체 `{}` 나 다른 도구의 JSON 을 '구 데몬' 으로 읽으면 **살아 있는 게이트를 지운다**
+#   (codex R2: 부분 응답은 미지원의 증거가 아니다).
+CAPGATE_STATUS_SENTINEL_KEYS = ("daemon", "surfaces", "paused", "alert_route")
+
+
+def capgate_status_is_measured(status_obj):
+    """응답이 `cys status --json` 문서로 **식별되는가**(그래야 alert_route 부재가 사실이 된다)."""
+    return (isinstance(status_obj, dict)
+            and any(k in status_obj for k in CAPGATE_STATUS_SENTINEL_KEYS))
+
+
+def capgate_registration_state(alert_ok, marker_ok):
+    """3값 판정 — 각 축은 True(참)·False(양성으로 거짓)·None(판정 불능)이다.
+
+    · 한 축이라도 **양성으로 거짓**이면 조건은 확정적으로 거짓이다 → `off`(해제해도 된다).
+    · 그렇지 않은데 **판정 불능**이 있으면 `unknown` → 등록도 해제도 하지 않는다.
+    · 둘 다 참이어야 `on`.
+    """
+    if alert_ok is False or marker_ok is False:
+        return CAPGATE_OFF
+    if alert_ok is None or marker_ok is None:
+        return CAPGATE_UNKNOWN
+    return CAPGATE_ON
+
+
 def capgate_registration_verdict(status_obj, directive_text):
-    """(ok: bool, reason: str) — 등록 조건 둘의 순수 판정기(검체가 직접 부른다)."""
+    """(ok: bool, reason: str) — **둘 다 잰** 문맥의 2값 요약(순수 · 검체가 직접 부른다).
+
+    `status_obj is None`(조회 실패)은 여기서 '미지원' 이 아니라 **판정 불능**이므로 ok=False 지만
+    3값 문맥에서는 `unknown` 이다 — 해제 판정은 `capgate_registration_state` 만 내린다.
+    """
     a = capgate_alert_route_enabled(status_obj)
     b = capgate_marker_ok(directive_text)
     if a and b:
@@ -413,6 +450,41 @@ def capgate_registration_verdict(status_obj, directive_text):
     if not b:
         missing.append("설치본 CSO_DIRECTIVE 에 신판 표지(%s) 없음" % CSO_DIRECTIVE_REV_MARKER)
     return False, " · ".join(missing)
+
+
+def capgate_table_denied_basenames(pack, reader=None):
+    """(deny 집합, err|None) — 대상표(`state/hook-targets.json` → `.example`)가 **명시적으로**
+    `eligibility.capgate == "deny"` 라고 선언한 프로필 basename 들.
+
+    ★왜 preflight 도 표를 읽는가(R2 · 두 리뷰어): C28 은 `resolve_registration_targets()` 가 준
+      **모든** 프로필에 게이트를 등록했고, 표를 읽는 것은 수동 도구 `javis_guard_register` 뿐이었다
+      — 표가 deny 로 선언한 `.claude-2`(역할 모호)·`.claude-dept`(범위 밖 팩)에도 부팅 경로가
+      훅을 올렸다. 두 등록기가 같은 표를 봐야 표가 표다.
+    ★미지 프로필은 **deny 가 아니다**(guard_register 와 다른 점 · 의도적): 배포되는 예시표의
+      basename 은 발행 제네릭화된 더미라서 실기 프로필은 대부분 '미지' 다 — 미지를 deny 로 읽으면
+      게이트가 어느 기기에서도 등록되지 않는다. 부팅 경로는 표의 **명시 deny** 만 집행하고,
+      미지 프로필의 반려는 수동 등록기(`--force-unknown` 이 있는 쪽)가 계속 소유한다.
+    """
+    base = os.path.join(pack, "state", "hook-targets.json")
+    for path in (base, base + ".example"):
+        raw = (reader or _read_text_tolerant)(path)
+        if raw is None:
+            continue
+        try:
+            doc = json.loads(raw)
+        except ValueError as e:
+            return set(), "대상표 손상(%s): %s" % (path, e)
+        if not isinstance(doc, dict) or not isinstance(doc.get("profiles"), list):
+            return set(), "대상표 스키마 이상(%s): profiles 배열 없음" % path
+        deny = set()
+        for ent in doc["profiles"]:
+            if not isinstance(ent, dict):
+                return set(), "대상표 스키마 이상(%s): profiles 항목이 객체가 아니다" % path
+            elig = ent.get("eligibility")
+            if isinstance(elig, dict) and elig.get("capgate") == "deny":
+                deny.add(str(ent.get("basename") or ""))
+        return deny, None
+    return set(), None                    # 표 부재 = 종전 동작(전 프로필 등록)
 
 # ★훅 **본체** — 실재 전용(등록 대상 아님 · 부트 v2 A2 분할 2026-09-04).
 #   `role-bootstrap.sh` 는 자기완결 **런처**이고 실제 부트 본체는 `role-bootstrap-legacy.sh` 다.
@@ -3760,6 +3832,32 @@ class Preflight:
                     return True
         return False
 
+    @staticmethod
+    def _event_hook_present_any(settings_path, event, script_name):
+        """**표기와 무관하게** 우리 팩의 script_name 훅이 그 이벤트에 실려 있나.
+
+        ★왜 `_event_hook_registered` 와 다른가(R2 blocking · codex 실증): 그쪽은 `command` 가
+          우리가 만드는 문자열과 **바이트 동등**일 때만 참이다. 기존 등록이 따옴표 표기가 다르면
+          (`sh "/opt/cys/pack/hooks/role-capability-gate.sh"`) 거짓이 되어 ①해제 대상에서 빠지고
+          ②'미등록' 으로 **거짓 보고**된다 — 그 사이 훅은 계속 실행된다. 해제·잔존 판정은
+          `_unregister_event_hook` 이 실제로 지우는 것과 **같은 소유 술어**로 재야 한다.
+        """
+        try:
+            data = json.load(open(settings_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
+        for entry in data.get("hooks", {}).get(event, []):
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks", []):
+                if isinstance(h, dict) and _hook_entry_is_ours(h.get("command", ""),
+                                                               script_name, prefix):
+                    return True
+        return False
+
     def _register_event_hook(self, settings_path, event, script_name, matcher=None,
                              timeout=None):
         """event 에 pack/hooks/script_name 등록. 성공=None, 실패=사유. 멱등은 호출부.
@@ -3911,43 +4009,96 @@ class Preflight:
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
 
+    # ★데몬 **실재**의 증거(R2 · codex+claude): 소켓 파일은 unix 전용 신호다. Windows 는
+    #   명명 파이프라 `exists()` 로 잴 수 없어 종전 코드가 가드를 **통째로 건너뛰었고**,
+    #   그 결과 H-SEED-2 가 잡아낸 '이 축이 데몬·팩을 깨운다'는 부수효과가 Windows 에만 남았다.
+    #   플랫폼 공통의 증거로 **허브 상태 디렉터리 + 데몬이 남기는 표지**를 쓴다.
+    HUB_LIVE_MARKERS = ("cys.sock", "boot-epoch", "cysd.log", "queue-state.json",
+                        "topology.json")
+
+    def _capgate_daemon_present(self):
+        """(present: bool, why: str) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가."""
+        sock = os.environ.get("CYS_SOCKET")
+        if sock:
+            # 한 번만 잰다 — 두 번 재면 판정과 사유가 갈릴 수 있다(측정은 한 시점의 사실이다).
+            ok = os.path.exists(sock)
+            return ok, ("CYS_SOCKET 실재(%s)" % sock if ok
+                        else "데몬 소켓 미실재(%s)" % sock)
+        sd = _hub_state_dir()
+        if not sd or not os.path.isdir(sd):
+            return False, ("허브 상태 디렉터리 미실재(%s) — 데몬이 기동한 적이 없다"
+                           % (sd or "미해소"))
+        found = [m for m in self.HUB_LIVE_MARKERS if os.path.exists(os.path.join(sd, m))]
+        if not found:
+            return False, "허브 상태 디렉터리(%s)에 데몬 표지 0건" % sd
+        return True, "데몬 표지 %s" % ",".join(found[:3])
+
+    def _capgate_alert_axis(self):
+        """(True|False|None, why) — 조건 ① 데몬 alert_route 지원."""
+        # ★`CYS_BIN` 우선(R2 minor): 명시 오버라이드가 PATH 발견보다 뒤에 오면 오버라이드가
+        #   무효다. guard_register·훅의 승인 조회와 **같은 순서**로 맞춘다(축 1지점).
+        cys = os.environ.get("CYS_BIN") or shutil.which("cys")
+        if not cys:
+            return None, "cys 바이너리 미발견 — alert_route 판정 불가(판정 불능은 등록도 해제도 아니다)"
+        present, why = self._capgate_daemon_present()
+        if not present:
+            # ★이 축은 실제 `cys` 를 띄우고, 그 바이너리는 자기 HOME 아래에 팩·상태를
+            #   부트스트랩한다. HOME 이 임시 디렉터리인 문맥(검체·격리 실행)에서 그 부수효과가
+            #   남의 임시 트리를 채우며 정리와 **경합**한다(H-SEED-2: `Directory not empty`).
+            #   물을 데가 없으면 **판정 불능**이다 — preflight 는 관측이고 데몬을 깨우지 않는다.
+            return None, "%s — alert_route 판정 불가(데몬을 깨우지 않는다)" % why
+        try:
+            # ★부트 창 예산(R1 minor): 이 축은 WARN-only 이고 데몬이 기동 중이면 상한까지
+            #   끌려간다 — 판정 품질을 떨어뜨리지 않는 선에서 짧게 잡는다(15s→6s).
+            r = subprocess.run([cys, "status", "--json"], capture_output=True,
+                               text=True, timeout=6)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, "`cys status --json` 조회 실패(%s) — 판정 불능" % e
+        if r.returncode != 0:
+            return None, "`cys status --json` rc=%s — 판정 불능(응답이 없으면 미지원의 증거가 아니다)" % r.returncode
+        try:
+            status = json.loads(r.stdout or "{}")
+        except ValueError as e:
+            return None, "`cys status --json` 이 JSON 이 아니다(%s) — 판정 불능" % e
+        if not capgate_status_is_measured(status):
+            return None, ("`cys status --json` 응답이 상태 문서로 식별되지 않는다"
+                          "(표지 키 %s 없음) — 부분 응답은 미지원의 증거가 아니다"
+                          % "|".join(CAPGATE_STATUS_SENTINEL_KEYS))
+        if capgate_alert_route_enabled(status):
+            return True, "alert_route.enabled=true"
+        return False, "데몬 alert_route 미지원(status --json 에 alert_route.enabled=true 없음)"
+
+    def _capgate_marker_axis(self):
+        """(True|False|None, why) — 조건 ② 설치본 CSO_DIRECTIVE 신판 표지."""
+        d = os.path.join(pack_dir(), "directives", "CSO_DIRECTIVE.md")
+        text = _read_text_tolerant(d)
+        if text is None:
+            return None, "설치본 CSO_DIRECTIVE 판독 불가(%s) — 판정 불능" % d
+        if not text.strip():
+            # ★설치·병합이 제자리에서 갱신하는 **찰나의 0바이트**를 '구판' 으로 읽으면
+            #   정상 게이트를 지운다(codex R2). 읽었지만 내용이 없는 것은 결측이다.
+            return None, "설치본 CSO_DIRECTIVE 가 비어 있다(%s) — 갱신 중일 수 있다(판정 불능)" % d
+        if capgate_marker_ok(text):
+            return True, "CSO_DIRECTIVE 신판 표지 확인"
+        return False, "설치본 CSO_DIRECTIVE 에 신판 표지(%s) 없음" % CSO_DIRECTIVE_REV_MARKER
+
     def _capgate_gate(self):
-        """(ok, why) — 능력 게이트 등록 조건 둘(CONTRACTS §C). 읽기 전용·부작용 0.
+        """(state, why) — 능력 게이트 등록 조건 둘(CONTRACTS §C). 읽기 전용·부작용 0.
+
+        state ∈ {"on","off","unknown"} — **판정 불능은 해제 사유가 아니다**(R2 blocking).
 
         ★이 판정의 **한계를 정직히 적는다**: 두 조건은 "그 데몬이 경보 라우팅 기능을 가졌고
           그 팩의 지침이 신판이다" 를 증명할 뿐, 경보가 실제로 CSO inbox 에 배달되는 것을
           증명하지 않는다(배달 실측은 WP-3 B 의 드릴 소관이다). 그래서 조건 충족은 '등록해도
           된다' 이지 '라우팅이 살아 있다' 가 아니다.
         """
-        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
-        status = None
-        # ★데몬이 **실재할 때만** 묻는다(R1 · H-SEED-2 크래시 실측): 이 축은 실제 `cys` 를 띄우고,
-        #   그 바이너리는 자기 HOME 아래에 팩·상태를 부트스트랩한다. HOME 이 임시 디렉터리인
-        #   문맥(검체·격리 실행)에서는 그 부수효과가 남의 임시 트리를 채우며 정리와 **경합**한다
-        #   (`Directory not empty: <tmp>/home/.cys/pack/skills`). 소켓이 없으면 물을 데도 없으므로
-        #   '판정 불능 = 미등록' 이다 — 이 축을 위해 데몬을 **깨우지 않는다**(preflight 는 관측이다).
-        _sock = os.environ.get("CYS_SOCKET") or (
-            None if os.name == "nt" else os.path.join(_hub_state_dir() or "", "cys.sock"))
-        if _sock and not os.path.exists(_sock):
-            return False, ("데몬 소켓 미실재(%s) — alert_route 판정 불가"
-                           "(판정 불능은 미등록이다 · 이 축은 데몬을 깨우지 않는다)" % _sock)
-        if cys:
-            try:
-                # ★부트 창 예산(R1 minor): 이 축은 WARN-only 이고 데몬이 기동 중이면 상한까지
-                #   끌려간다 — 판정 품질을 떨어뜨리지 않는 선에서 짧게 잡는다(15s→6s).
-                r = subprocess.run([cys, "status", "--json"], capture_output=True,
-                                   text=True, timeout=6)
-                if r.returncode == 0:
-                    status = json.loads(r.stdout or "{}")
-            except (OSError, ValueError, subprocess.SubprocessError):
-                status = None
-        else:
-            return False, "cys 바이너리 미발견 — 데몬 alert_route 판정 불가(판정 불능은 미등록이다)"
-        d = os.path.join(pack_dir(), "directives", "CSO_DIRECTIVE.md")
-        text = _read_text_tolerant(d)
-        if text is None:
-            return False, "설치본 CSO_DIRECTIVE 판독 불가(%s)" % d
-        return capgate_registration_verdict(status, text)
+        a, a_why = self._capgate_alert_axis()
+        b, b_why = self._capgate_marker_axis()
+        state = capgate_registration_state(a, b)
+        if state == CAPGATE_ON:
+            return state, "%s · %s" % (a_why, b_why)
+        parts = [w for ok, w in ((a, a_why), (b, b_why)) if ok is not True]
+        return state, " · ".join(parts)
 
     def c28_self_correction(self):
         cid = "C28.self-correction"
@@ -4022,39 +4173,97 @@ class Preflight:
         #   유일한 트리거가 빠져 있어도 preflight 가 초록에 가까웠다(C08=FAIL vs C28=WARN 비대칭 —
         #   재감사 A21 확증). 나머지 자기교정 훅(inject·save·reflect·nudge·pack-guard)은 종전대로 WARN.
         # ★WP-3 A 등록 게이트(CONTRACTS §C) — 두 조건이 **둘 다** 참일 때만 PreToolUse 에 올린다.
-        _cap_ok, _cap_why = self._capgate_gate()
-        _reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])
-        _cap_live = []          # 조건이 거짓인데 **이미 실려 있는** 프로필
-        if not _cap_ok:
-            for t in targets:
-                for _ev, _m in CAPGATE_HOOK[1]:
-                    if self._event_hook_registered(t, _ev, CAPGATE_HOOK[0]):
-                        _cap_live.append((t, _ev))
-            if _cap_live and self.fix:
-                _un_ok, _un_err = [], []
-                for t, _ev in _cap_live:
-                    err = self._unregister_event_hook(t, _ev, CAPGATE_HOOK[0])
-                    (_un_err if err else _un_ok).append(
-                        "%s/%s%s" % (os.path.basename(t), _ev, (": " + err) if err else ""))
-                if _un_ok:
-                    fixed.append("능력 게이트 등록 해제(%s)" % "; ".join(_un_ok[:4]))
-                if _un_err:
-                    warns.append("능력 게이트 등록 해제 실패 — %s" % "; ".join(_un_err[:4]))
-                _cap_live = [x for x in _cap_live
-                             if self._event_hook_registered(x[0], x[1], CAPGATE_HOOK[0])]
-            if _cap_live:
-                # ★사실대로 보고한다: 조건은 거짓인데 훅은 **살아 있다**. 이것을 '보류' 라고
-                #   쓰면 판정문이 사실과 반대가 된다(부분 배포 = 봉인표 ③).
-                warns.append("능력 게이트(%s)가 조건 거짓인데 **이미 등록되어 있다**(%s) — %s. "
-                             "훅은 계속 실행된다: `--fix` 로 해제하거나 조건(데몬 alert_route·"
-                             "지침 신판 표지)을 복구하라"
-                             % (CAPGATE_HOOK[0],
-                                ", ".join("%s/%s" % (os.path.basename(t), e)
-                                          for t, e in _cap_live[:4]), _cap_why))
+        _cap_state, _cap_why = self._capgate_gate()
+        _reg_hooks = list(SELFCORR_HOOKS)   # 능력 게이트는 **별도 루프**(대상 집합·판정이 다르다)
+        # ★대상표(`state/hook-targets.json`)의 명시 deny 를 부팅 경로도 집행한다(R2 · 두 리뷰어):
+        #   종전엔 표를 읽는 것이 수동 도구뿐이라 표가 deny 로 선언한 프로필(.claude-2 역할 모호 ·
+        #   .claude-dept 범위 밖 팩)에도 preflight --fix 가 훅을 올렸다.
+        _cap_deny_bases, _cap_tbl_err = capgate_table_denied_basenames(pack_dir())
+        if _cap_tbl_err:
+            warns.append("능력 게이트 대상표 판독 실패 — %s. 등록은 보류한다(손상된 표를 "
+                         "하드코딩으로 조용히 대체하지 않는다)" % _cap_tbl_err)
+            _cap_state = CAPGATE_UNKNOWN
+        _cap_body = os.path.isfile(os.path.join(pack_dir(), "hooks", CAPGATE_HOOK[0]))
+
+        def _cap_base(_t):
+            return os.path.basename(os.path.dirname(os.path.abspath(_t)))
+
+        _cap_allow_targets = [t for t in targets if _cap_base(t) not in _cap_deny_bases]
+        _cap_table_off = [t for t in targets if _cap_base(t) in _cap_deny_bases]
+        # 표기와 무관한 소유 술어로 **살아 있는** 등록을 센다(따옴표·경로 표기 차이 흡수).
+        _cap_live = [(t, ev) for t in targets for ev, _m in CAPGATE_HOOK[1]
+                     if self._event_hook_present_any(t, ev, CAPGATE_HOOK[0])]
+        _cap_removed, _cap_added = [], []
+
+        def _cap_unregister(pairs, why_note):
+            _ok, _err = [], []
+            for _t, _ev in pairs:
+                e = self._unregister_event_hook(_t, _ev, CAPGATE_HOOK[0])
+                (_err if e else _ok).append(
+                    "%s/%s%s" % (os.path.basename(_t), _ev, (": " + e) if e else ""))
+            if _ok:
+                fixed.append("능력 게이트 등록 해제(%s · %s)" % ("; ".join(_ok[:4]), why_note))
+                _cap_removed.extend(_ok)
+            if _err:
+                warns.append("능력 게이트 등록 해제 실패 — %s" % "; ".join(_err[:4]))
+
+        # ⓐ 표가 **명시적으로** deny 한 프로필의 잔존 등록은 데몬 상태와 무관하게 해제한다.
+        _cap_table_live = [(t, ev) for (t, ev) in _cap_live if t in _cap_table_off]
+        if _cap_table_live:
+            if self.fix:
+                _cap_unregister(_cap_table_live, "대상표 capgate=deny")
             else:
-                warns.append("능력 게이트(%s) 등록 보류 — %s. 미등록 상태에서도 "
-                             "CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다(침묵은 판정이 아니다)"
-                             % (CAPGATE_HOOK[0], _cap_why))
+                warns.append("능력 게이트가 대상표 deny 프로필(%s)에 등록돼 있다(--fix 로 해제)"
+                             % ", ".join(sorted({os.path.basename(t) for t, _e in _cap_table_live})))
+        # ⓑ 조건이 **양성으로 거짓**일 때만 나머지 등록을 되돌린다.
+        #   판정 불능(unknown)은 해제 사유가 아니다 — 콜드 부트마다 게이트가 꺼지는 경로다.
+        _cap_cond_live = [(t, ev) for (t, ev) in _cap_live if t not in _cap_table_off]
+        if _cap_state == CAPGATE_OFF and _cap_cond_live and self.fix:
+            _cap_unregister(_cap_cond_live, "등록 조건 거짓")
+        # ⓒ 조건 충족이면 표가 허용한 프로필에 등록한다.
+        if _cap_state == CAPGATE_ON and _cap_body:
+            for t in _cap_allow_targets:
+                for _ev, _m in CAPGATE_HOOK[1]:
+                    _cto = hook_timeout_for(CAPGATE_HOOK[0], _ev)
+                    if self._event_hook_registered(t, _ev, CAPGATE_HOOK[0], _cto):
+                        continue
+                    if self.fix:
+                        err = self._register_event_hook(t, _ev, CAPGATE_HOOK[0], _m,
+                                                        timeout=_cto)
+                        if err:
+                            warns.append("%s/%s 능력 게이트 등록 실패: %s"
+                                         % (os.path.basename(t), _ev, err))
+                        else:
+                            fixed.append("%s←%s(%s)" % (os.path.basename(t),
+                                                        CAPGATE_HOOK[0], _ev))
+                            _cap_added.append(os.path.basename(t))
+                    else:
+                        warns.append("%s 능력 게이트(%s) 미등록(--fix)"
+                                     % (os.path.basename(t), _ev))
+        # ⓓ 사실 그대로 보고한다(§8: 검증 결과를 재작성하지 않는다).
+        _cap_still = [(t, ev) for t in targets for ev, _m in CAPGATE_HOOK[1]
+                      if self._event_hook_present_any(t, ev, CAPGATE_HOOK[0])]
+        if _cap_state == CAPGATE_OFF and _cap_still:
+            warns.append("능력 게이트(%s)가 조건 **거짓**인데 등록되어 있다(%s) — %s. 훅은 계속 "
+                         "실행된다: `--fix` 로 해제하거나 조건(데몬 alert_route·지침 신판 표지)을 "
+                         "복구하라"
+                         % (CAPGATE_HOOK[0],
+                            ", ".join("%s/%s" % (os.path.basename(t), e) for t, e in _cap_still[:4]),
+                            _cap_why))
+        elif _cap_state == CAPGATE_OFF:
+            warns.append("능력 게이트(%s) 등록 보류(조건 거짓) — %s. 미등록 상태에서도 "
+                         "CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다(침묵은 판정이 아니다)"
+                         % (CAPGATE_HOOK[0], _cap_why))
+        elif _cap_state == CAPGATE_UNKNOWN:
+            # ★판정 불능은 **해제도 등록도 아니다**: 기존 등록을 유지한 채 사실을 적는다.
+            warns.append("능력 게이트(%s) 등록 조건 **판정 불능** — %s. 등록도 해제도 하지 않는다"
+                         "(현재 %s). 판정 불능을 '조건 거짓' 으로 접으면 콜드 부트마다 게이트가 "
+                         "꺼진다(봉인표 ③)"
+                         % (CAPGATE_HOOK[0], _cap_why,
+                            "등록 %d건 유지" % len(_cap_still) if _cap_still else "미등록"))
+        elif not _cap_body:
+            warns.append("능력 게이트(%s) 조건은 충족인데 훅 **본체가 없다** — init-pack 재실행"
+                         % CAPGATE_HOOK[0])
         for t in targets:
             for script_name, events in _reg_hooks:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
@@ -4094,10 +4303,15 @@ class Preflight:
                         (fails if tier_fatal else warns).append(
                             "%s %s(%s) 미등록%s" % (os.path.basename(t), script_name, event,
                                                    "(--fix로 등록)" if tier_fatal else "(--fix)"))
+        _cap_word = {
+            CAPGATE_ON: "등록(조건 충족)",
+            CAPGATE_OFF: ("조건 거짓 — 해제 %d건" % len(_cap_removed)) if _cap_removed
+                         else ("조건 거짓인데 **등록 잔존**" if _cap_still else "보류(조건 거짓)"),
+            CAPGATE_UNKNOWN: ("판정 불능 — 등록 %d건 **유지**" % len(_cap_still)) if _cap_still
+                             else "판정 불능 — 미등록 유지",
+        }[_cap_state]
         detail = ("자기교정·영속성 hook(inject·save·reflect-scan·commit-nudge·role-bootstrap·pack-guard) "
-                  "6종 + reflect 엔진 · 능력 게이트 %s"
-                  % ("등록(조건 충족)" if _cap_ok
-                     else ("조건 거짓인데 **등록 잔존**" if _cap_live else "보류")))
+                  "6종 + reflect 엔진 · 능력 게이트 %s" % _cap_word)
         if fixed:
             shown = "; ".join(fixed[:6]) + (" …+%d" % (len(fixed) - 6) if len(fixed) > 6 else "")
             detail += " · " + shown
@@ -8800,38 +9014,80 @@ def _self_test():
               not _ok2 and "alert_route" in _why2 and "표지" not in _why2
               and not _ok3 and "표지" in _why3 and "alert_route" not in _why3
               and not _ok4 and "alert_route" in _why4 and "표지" in _why4)
+        # ── R2 재핀(강화 방향 · §8 준수 고지) ────────────────────────────────
+        #   종전 핀은 등록 게이트가 **2값**임을 전제로 `_cap_ok` 라는 이름과 `_reg_hooks` 합류를
+        #   요구했다. 그 계약 아래에서는 "잴 수 없다"(소켓 미실재·rc≠0·timeout·지침 판독 실패)가
+        #   `False` 로 접히고 C28 이 그 False 로 **살아 있는 등록을 지웠다** — 콜드 부트마다
+        #   게이트가 꺼지는 경로(봉인표 ③). 새 핀은 3값과 '판정 불능은 해제 사유가 아님'을
+        #   요구한다. 종전 단언 중 지운 것은 **이름·형태에 관한 것뿐**이고, 요구는 좁아졌다.
+        check("등록 게이트는 3값이다 — 양성 거짓만 off · 판정 불능은 unknown(해제 사유 아님)",
+              capgate_registration_state(True, True) == CAPGATE_ON
+              and capgate_registration_state(False, True) == CAPGATE_OFF
+              and capgate_registration_state(True, False) == CAPGATE_OFF
+              and capgate_registration_state(False, None) == CAPGATE_OFF
+              and capgate_registration_state(None, True) == CAPGATE_UNKNOWN
+              and capgate_registration_state(True, None) == CAPGATE_UNKNOWN
+              and capgate_registration_state(None, None) == CAPGATE_UNKNOWN)
+        check("status 응답은 **상태 문서로 식별**돼야 alert_route 부재가 사실이 된다(부분 응답 ≠ 미지원)",
+              capgate_status_is_measured({"daemon": {}, "surfaces": []})
+              and capgate_status_is_measured({"paused": False})
+              and capgate_status_is_measured({"alert_route": {"enabled": True}})
+              and not capgate_status_is_measured({}) and not capgate_status_is_measured(None)
+              and not capgate_status_is_measured({"ok": True}) and not capgate_status_is_measured([]))
         c28_src = _pin_src(Preflight.c28_self_correction)
-        check("capgate 는 SELFCORR_HOOKS(항상 등록)에 **없다** — 조건부 목록으로만 등록된다",
+        check("capgate 는 SELFCORR_HOOKS(항상 등록)에 **없다** — 조건부 등록 루프로만 올라간다",
               CAPGATE_HOOK[0] not in [n for n, _ in SELFCORR_HOOKS]
-              and CAPGATE_HOOK == ("role-capability-gate.sh", [("PreToolUse", None)]))
+              and CAPGATE_HOOK == ("role-capability-gate.sh", [("PreToolUse", None)])
+              and "_reg_hooks = list(SELFCORR_HOOKS)   #" in c28_src)
         check("실재 검사는 조건과 무관(파일 결손은 언제나 사실) · 등록 루프만 조건부",
               "rels.append(os.path.join(\"hooks\", CAPGATE_HOOK[0]))" in c28_src
-              and "_reg_hooks = list(SELFCORR_HOOKS) + ([CAPGATE_HOOK] if _cap_ok else [])" in c28_src
               and "for script_name, events in _reg_hooks:" in c28_src
               and "for script_name, events in SELFCORR_HOOKS:" not in c28_src)
-        # ★R1 재핀(강화): 종전 핀은 "조건 거짓 → WARN 1줄" 까지만 요구했다. 그 계약으로는
-        #   **이미 등록된 훅이 살아 있는데 '보류' 라고 보고하는** 상태가 통과한다(판정문이 사실과
-        #   반대 · 부분 배포 = 봉인표 ③). 해제 경로와 사실 보고를 함께 요구하도록 좁힌다.
-        _cap_tail = c28_src.split("_cap_ok, _cap_why")[1][:2600]
-        check("조건 미충족: WARN 1줄 + **이미 실린 등록은 --fix 로 해제** · 살아 있으면 '보류'라 "
-              "쓰지 않는다(R1 재핀 — 판정문이 사실과 반대이던 것)",
-              "등록 보류" in c28_src and "warns.append" in _cap_tail
-              and "_unregister_event_hook" in _cap_tail
-              and "이미 등록되어 있다" in _cap_tail
-              and "if _cap_live and self.fix:" in _cap_tail)
+        _cap_tail = c28_src.split("_cap_state, _cap_why")[1]
+        check("R2 blocking: **양성 거짓일 때만** 해제한다 — unknown 분기에 해제 호출 0",
+              "if _cap_state == CAPGATE_OFF and _cap_cond_live and self.fix:" in _cap_tail
+              and "_cap_unregister" in _cap_tail
+              and "등록도 해제도 하지 않는다" in _cap_tail
+              and _cap_tail.index("CAPGATE_UNKNOWN:") > _cap_tail.index("_cap_unregister(_cap_cond_live"))
+        check("R2 blocking: 잔존 등록은 **표기 무관 소유 술어**로 센다(따옴표가 다른 정상 등록을 "
+              "'미등록'으로 오보고하던 것)",
+              "_event_hook_present_any(" in _cap_tail
+              and "_event_hook_registered(t, _ev, CAPGATE_HOOK[0])" not in _cap_tail)
+        check("R2 blocking: 대상표 `capgate=deny` 를 **부팅 경로도** 집행한다(두 등록기 같은 표)",
+              "capgate_table_denied_basenames(" in c28_src and "_cap_allow_targets" in _cap_tail
+              and "대상표 capgate=deny" in _cap_tail)
+        _pa_src = _pin_src(Preflight._event_hook_present_any)
+        check("소유 술어는 해제기와 **같은** `_hook_entry_is_ours` 를 쓴다(지우는 것과 세는 것이 같다)",
+              "_hook_entry_is_ours(" in _pa_src)
         _un_src = _pin_src(Preflight._unregister_event_hook)
         check("등록 해제기는 **우리 팩의 그 훅만** 지우고 빈 블록을 남기지 않는다(사용자 훅 보존)",
               "_hook_entry_is_ours(" in _un_src and "_settings_rmw(" in _un_src)
-        gate_src = _pin_src(Preflight._capgate_gate)
+        gate_src = (_pin_src(Preflight._capgate_gate) + _pin_src(Preflight._capgate_alert_axis)
+                    + _pin_src(Preflight._capgate_marker_axis)
+                    + _pin_src(Preflight._capgate_daemon_present))
         check("_capgate_gate 는 읽기 전용(status --json 조회 + 지침 판독) · self.fix 분기 0",
               "self.fix" not in gate_src and '"status", "--json"' in gate_src
               and "_read_text_tolerant(" in gate_src)
-        check("_capgate_gate: cys 부재·판독 불가는 **미등록**(판정 불능을 등록으로 접지 않는다)",
-              "판정 불가(판정 불능은 미등록이다)" in gate_src and "판독 불가" in gate_src)
-        check("_capgate_gate 는 데몬을 **깨우지 않는다** — 소켓 미실재면 조회 전에 미등록(R1 · "
-              "임시 HOME 문맥에서 팩 부트스트랩 부수효과가 정리와 경합하던 것)",
-              "소켓 미실재" in gate_src and "os.path.exists(_sock)" in gate_src
-              and gate_src.index("_sock") < gate_src.index('"status", "--json"'))
+        check("판정 불능은 None 이다 — cys 부재·rc≠0·JSON 아님·지침 판독 불가·빈 지침 전부",
+              gate_src.count("return None,") >= 6 and "판정 불능" in gate_src
+              and "비어 있다" in gate_src)
+        check("_capgate_gate 는 데몬을 **깨우지 않는다** — 실재 증거 없이는 조회 전에 판정 불능 "
+              "(R1 · 임시 HOME 문맥에서 팩 부트스트랩 부수효과가 정리와 경합하던 것). "
+              "★R2: Windows 도 같은 가드를 받는다(소켓 exists 대신 허브 상태 표지)",
+              "_capgate_daemon_present(" in _pin_src(Preflight._capgate_alert_axis)
+              and (_pin_src(Preflight._capgate_alert_axis).index("_capgate_daemon_present(")
+                   < _pin_src(Preflight._capgate_alert_axis).index('"status", "--json"'))
+              and 'os.name == "nt"' not in _pin_src(Preflight._capgate_daemon_present)
+              and "HUB_LIVE_MARKERS" in _pin_src(Preflight._capgate_daemon_present))
+        check("바이너리 해소는 `CYS_BIN` **우선**(명시 오버라이드가 PATH 발견보다 앞 · 축 1지점)",
+              'os.environ.get("CYS_BIN") or shutil.which("cys")'
+              in _pin_src(Preflight._capgate_alert_axis))
+        check("대상표 판독기: 명시 deny 만 집행 · 미지 프로필은 deny 가 아니다 · 손상은 폴백 없이 err",
+              capgate_table_denied_basenames("/nonexistent/pack") == (set(), None)
+              and capgate_table_denied_basenames(
+                  "/x", reader=lambda _p: '{"profiles":[{"basename":".claude-2",'
+                  '"eligibility":{"capgate":"deny"}},{"basename":".claude"}]}') == ({".claude-2"}, None)
+              and capgate_table_denied_basenames("/x", reader=lambda _p: "{")[1] is not None)
         check("능력 게이트 훅 선언 timeout(전 도구 훅의 바깥 겹)",
               HOOK_TIMEOUT_S.get(("role-capability-gate.sh", "PreToolUse")) == 15)
         c82_src = _pin_src(Preflight.c82_gate_corpus_drift)

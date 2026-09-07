@@ -112,22 +112,25 @@ class _CapgateEnv(unittest.TestCase):
                          "예정한 스텁 명령만 정확히 호출해야 한다")
 
     def _assert_registration(self, status, text, expected, missing=(), present=(), rc=0):
+        """★expected 는 **3값**이다(R2): "on"|"off"|"unknown".
+
+        판정 불능(unknown)과 조건 거짓(off)은 다른 사실이다 — 전자는 해제 사유가 아니다.
+        """
         self._status_stub(status, rc)
         self.directive.write_text(text, encoding="utf-8")
-        # 설치본 판독이 예외를 내더라도 순수 판정의 검증 결과는 별도로 남긴다.
-        checks = [("순수 판정", lambda: pf.capgate_registration_verdict(
-            status if rc == 0 else None, text)),
-                  ("설치본 판정", pf.Preflight(fix=False, skips=[])._capgate_gate)]
-        for source, check in checks:
-            with self.subTest(source=source):
-                ok, why = check()
-                self.assertIs(ok, expected, "%s: 등록 허용은 %r 기대, 사유=%s"
-                              % (source, expected, why))
-                self.assertIsInstance(why, str, "판정 사유는 문자열이어야 한다")
-                for condition in missing:
-                    self.assertIn(condition, why, "미충족 조건 %r을 사유에 밝혀야 한다" % condition)
-                for condition in present:
-                    self.assertNotIn(condition, why, "충족 조건 %r을 결핍으로 보고하면 안 된다" % condition)
+        state, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
+        self.assertEqual(state, expected, "등록 상태는 %r 기대, 실제 %r · 사유=%s"
+                         % (expected, state, why))
+        self.assertIsInstance(why, str, "판정 사유는 문자열이어야 한다")
+        for condition in missing:
+            self.assertIn(condition, why, "미충족 조건 %r을 사유에 밝혀야 한다" % condition)
+        for condition in present:
+            self.assertNotIn(condition, why, "충족 조건 %r을 결핍으로 보고하면 안 된다" % condition)
+        if rc == 0:
+            # 순수 판정기는 **둘 다 잰** 문맥의 2값 요약 — 상태와 어긋나면 안 된다.
+            ok, _pw = pf.capgate_registration_verdict(status, text)
+            self.assertIs(ok, expected == pf.CAPGATE_ON,
+                          "순수 판정과 설치본 판정이 갈렸다(%s vs %s)" % (ok, expected))
         self._assert_calls(["cys status --json"])
 
     def _c82(self):
@@ -148,43 +151,63 @@ class CapgateRegistration(_CapgateEnv):
                       "JSON boolean true는 경보 라우팅 지원이어야 한다")
         self.assertIs(pf.capgate_marker_ok(self.new_directive), True,
                       "첫 20행 내 독립 표지는 신판이어야 한다")
-        self._assert_registration(self.good_status, self.new_directive, True)
+        self._assert_registration(self.good_status, self.new_directive, pf.CAPGATE_ON)
 
 
     def test_only_daemon_support_missing(self):
         # 지침은 준비됐어도 데몬 미지원이면 경보 없는 능력 제한을 등록하면 안 된다.
         self._assert_registration({"alert_route": {"enabled": False}}, self.new_directive,
-                                  False, ("데몬 alert_route 미지원",), ("신판 표지",))
+                                  pf.CAPGATE_OFF, ("데몬 alert_route 미지원",), ("신판 표지",))
 
 
     def test_only_directive_marker_missing(self):
         # 데몬만 배포된 상태를 준비 완료로 접는 OR 조건 회귀를 잡는다.
-        self._assert_registration(self.good_status, "# CSO\n구판 지침\n", False,
+        self._assert_registration(self.good_status, "# CSO\n구판 지침\n", pf.CAPGATE_OFF,
                                   ("설치본 CSO_DIRECTIVE", "신판 표지"), ("데몬 alert_route",))
 
 
     def test_both_conditions_missing(self):
         # 둘 다 빠졌을 때 한 조건만 보고하면 부분 배포 원인을 놓친다.
-        self._assert_registration({"alert_route": {"enabled": False}}, "# 구판\n", False,
+        self._assert_registration({"alert_route": {"enabled": False}}, "# 구판\n", pf.CAPGATE_OFF,
                                   ("데몬 alert_route 미지원", "설치본 CSO_DIRECTIVE", "신판 표지"))
 
 
     def test_old_status_nonzero_defers_registration(self):
         # 성공 JSON이 stdout에 있어도 실패 종료를 지원 증거로 사용하면 안 된다.
-        self._assert_registration(self.good_status, self.new_directive, False,
-                                  ("데몬 alert_route 미지원",), rc=2)
+        # ★R2: rc≠0 은 **판정 불능**이지 '미지원' 이 아니다 — 해제 사유가 되면 안 된다.
+        self._assert_registration(self.good_status, self.new_directive, pf.CAPGATE_UNKNOWN,
+                                  ("rc=2", "판정 불능"), rc=2)
 
 
     def test_old_status_without_alert_route_defers_registration(self):
         # 구 status 스키마의 결측을 기본 true로 보정하는 회귀를 잡는다.
-        self._assert_registration({}, self.new_directive, False, ("데몬 alert_route 미지원",))
+        # ★R2: '구 데몬' 은 **상태 문서로 식별되는** 응답에 alert_route 가 없을 때다.
+        self._assert_registration({"daemon": {"version": "0.14.30"}, "surfaces": []},
+                                  self.new_directive, pf.CAPGATE_OFF,
+                                  ("데몬 alert_route 미지원",))
+
+
+    def test_unidentifiable_status_is_undecidable_not_unsupported(self):
+        """★R2 blocking(codex): 빈 객체·다른 도구의 JSON 은 **미지원의 증거가 아니다**.
+
+        이것을 '조건 거짓' 으로 읽으면 부분 응답 한 번이 살아 있는 게이트를 지운다.
+        """
+        self._assert_registration({}, self.new_directive, pf.CAPGATE_UNKNOWN,
+                                  ("상태 문서로 식별되지 않는다",))
+
+
+    def test_empty_directive_is_undecidable_not_old(self):
+        """★R2 blocking(codex): 설치·병합이 제자리 갱신하는 **찰나의 0바이트**를 '구판' 으로
+        읽으면 정상 게이트를 지운다. 읽었지만 내용이 없는 것은 결측이다."""
+        self._assert_registration(self.good_status, "   \n", pf.CAPGATE_UNKNOWN,
+                                  ("비어 있다",))
 
 
     def test_prose_quotation_is_not_a_revision_marker(self):
         # substring 검사로 바뀌면 표지를 설명하는 구판 산문까지 신판이 된다.
         text = "# CSO\n표지 %s 를 확인하라.\n" % pf.CSO_DIRECTIVE_REV_MARKER
         self.assertIs(pf.capgate_marker_ok(text), False, "산문에 인용된 표지는 신판이 아니다")
-        self._assert_registration(self.good_status, text, False, ("신판 표지",))
+        self._assert_registration(self.good_status, text, pf.CAPGATE_OFF, ("신판 표지",))
 
 
     def test_marker_line_boundary(self):
@@ -200,14 +223,16 @@ class CapgateRegistration(_CapgateEnv):
         # Python의 1 == True 때문에 동등 비교로 느슨해지는 회귀를 잡는다.
         status = {"alert_route": {"enabled": 1}}
         self.assertIs(pf.capgate_alert_route_enabled(status), False, "정수 1은 boolean true가 아니다")
-        self._assert_registration(status, self.new_directive, False, ("데몬 alert_route 미지원",))
+        self._assert_registration(status, self.new_directive, pf.CAPGATE_OFF,
+                                  ("데몬 alert_route 미지원",))
 
 
     def test_string_enabled_is_unsupported(self):
         # 비어 있지 않은 문자열의 truthiness를 지원 여부로 읽으면 안 된다.
         status = {"alert_route": {"enabled": "true"}}
         self.assertIs(pf.capgate_alert_route_enabled(status), False, "문자열 true는 boolean true가 아니다")
-        self._assert_registration(status, self.new_directive, False, ("데몬 alert_route 미지원",))
+        self._assert_registration(status, self.new_directive, pf.CAPGATE_OFF,
+                                  ("데몬 alert_route 미지원",))
 
 
     def test_old_binary_gate_corpus_is_skip(self):
@@ -293,8 +318,8 @@ class CapgateUndecidable(_CapgateEnv):
 
     def test_missing_cys_binary_defers_registration(self):
         # PATH 에 cys 가 없으면 데몬 지원 여부를 **알 수 없다** — 그것은 등록 근거가 아니다.
-        ok, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
-        self.assertIs(ok, False, "cys 부재인데 등록을 허용했다: %s" % why)
+        state, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
+        self.assertEqual(state, pf.CAPGATE_UNKNOWN, "cys 부재는 판정 불능이다: %s" % why)
         self.assertIn("cys 바이너리 미발견", why, "판정 불능 사유를 밝혀야 한다")
         self._assert_calls([])
 
@@ -302,8 +327,8 @@ class CapgateUndecidable(_CapgateEnv):
         # 지침을 못 읽는 것과 구판인 것은 다른 사실이고, 둘 다 등록 근거는 아니다.
         self._status_stub(self.good_status)
         self.directive.unlink()
-        ok, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
-        self.assertIs(ok, False, "지침 판독 불가인데 등록을 허용했다: %s" % why)
+        state, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
+        self.assertEqual(state, pf.CAPGATE_UNKNOWN, "지침 판독 불가는 판정 불능이다: %s" % why)
         self.assertIn("판독 불가", why, "판독 불가를 '구판' 으로 접으면 안 된다")
 
     def test_missing_socket_defers_without_waking_daemon(self):
@@ -315,9 +340,9 @@ class CapgateUndecidable(_CapgateEnv):
         """
         self._status_stub(self.good_status)
         self.sock.unlink()
-        ok, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
-        self.assertIs(ok, False, "소켓이 없는데 등록을 허용했다: %s" % why)
-        self.assertIn("소켓 미실재", why)
+        state, why = pf.Preflight(fix=False, skips=[])._capgate_gate()
+        self.assertEqual(state, pf.CAPGATE_UNKNOWN, "소켓 부재는 판정 불능이다: %s" % why)
+        self.assertIn("표지 0건", why)
         self._assert_calls([])          # ★호출 0 — 데몬을 깨우지 않았다
 
     def test_marker_rejects_non_string(self):
@@ -420,13 +445,146 @@ class CapgateDeregistration(_CapgateEnv):
         self.assertEqual([h["command"] for b in data["hooks"]["PreToolUse"] for h in b["hooks"]],
                          ["echo other"], "없는 훅을 지우려다 남의 것을 건드렸다")
 
-    def test_c28_reports_live_registration_when_conditions_false(self):
-        # 조건 거짓 + **이미 등록됨** 은 '보류' 가 아니다 — 문면이 사실과 같아야 한다.
-        import inspect
-        src = inspect.getsource(pf.Preflight.c28_self_correction)
-        self.assertIn("_unregister_event_hook", src, "해제 경로가 C28 에 배선되지 않았다")
-        self.assertIn("이미 등록되어 있다", src, "조건 거짓+등록 잔존을 사실대로 보고하지 않는다")
-        self.assertIn("if _cap_live and self.fix:", src, "--fix 해제 분기가 없다")
+    # ── ★R2: C28 을 **실제로 실행**해서 잰다(codex: 소스 문자열 검사는 집행의 증거가 아니다) ──
+    def _run_c28(self, settings_path, fix=True, status=None, rc=0, directive=None,
+                 sock=True, table=None):
+        """C28 을 격리 상태에서 1회 실행하고 (결과 dict, settings 본문) 을 돌려준다."""
+        hooks = self.pack / "hooks"
+        hooks.mkdir(exist_ok=True)
+        (hooks / pf.CAPGATE_HOOK[0]).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        if directive is not None:
+            self.directive.write_text(directive, encoding="utf-8")
+        if table is not None:
+            tdir = self.pack / "state"
+            tdir.mkdir(exist_ok=True)
+            (tdir / "hook-targets.json").write_text(json.dumps(table), encoding="utf-8")
+        if status is None:
+            self._stub("cys", {})
+        else:
+            self._status_stub(status, rc)
+        if not sock and self.sock.exists():
+            self.sock.unlink()
+        p = pf.Preflight(fix=fix, skips=[])
+        with mock.patch.object(pf, "resolve_registration_targets",
+                               return_value=([str(settings_path)], None)):
+            p.c28_self_correction()
+        res = [r for r in p.results if r["id"] == "C28.self-correction"]
+        self.assertEqual(len(res), 1, "C28 결과는 한 건이어야 한다: %s" % p.results)
+        return res[0], json.loads(settings_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _capgate_cmds(doc):
+        return [h.get("command", "") for b in doc.get("hooks", {}).get("PreToolUse", [])
+                for h in b.get("hooks", [])
+                if pf.CAPGATE_HOOK[0] in h.get("command", "")]
+
+    def test_undecidable_keeps_live_registration(self):
+        """★R2 blocking: 판정 불능(소켓 미실재)이 **살아 있는 게이트를 해제하면 안 된다**.
+
+        리뷰어 PoC: 콜드 부트(데몬 미기동)에서 `preflight --fix` 가 PreToolUse 배열을 `[]` 로
+        만들었고, 그 뒤 `cys boot` 가 CSO·reviewer 좌석을 무게이트로 띄웠다(감사 에러 1·3 재현).
+        """
+        sp = self._profile_with_capgate()
+        res, doc = self._run_c28(sp, fix=True, status=None, sock=False)
+        self.assertEqual(len(self._capgate_cmds(doc)), 1,
+                         "판정 불능인데 등록이 해제됐다(콜드 부트마다 게이트가 꺼진다): %s" % doc)
+        self.assertIn("판정 불능", res["detail"], "문면이 사실과 달라졌다: %s" % res["detail"])
+        self.assertIn("유지", res["detail"], "유지했다는 사실을 적어야 한다: %s" % res["detail"])
+
+    def test_undecidable_status_rc_keeps_live_registration(self):
+        """★R2 blocking PoC ⓐ: 소켓은 실재하는데 `cys status` rc≠0 → 해제 금지."""
+        sp = self._profile_with_capgate()
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status, rc=1)
+        self.assertEqual(len(self._capgate_cmds(doc)), 1,
+                         "rc≠0(판정 불능)인데 등록이 해제됐다: %s" % doc)
+        self.assertIn("판정 불능", res["detail"])
+
+    def test_positively_false_condition_unregisters(self):
+        """조건이 **양성으로 거짓**(상태 문서에 alert_route 없음)이면 해제한다."""
+        sp = self._profile_with_capgate()
+        res, doc = self._run_c28(sp, fix=True,
+                                 status={"daemon": {"version": "0.14.30"}, "surfaces": []})
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "조건 거짓인데 등록이 남았다: %s" % doc)
+        self.assertEqual([h["command"] for b in doc["hooks"]["PreToolUse"] for h in b["hooks"]],
+                         ["echo user-own-hook"], "사용자 훅까지 지웠다: %s" % doc)
+        self.assertIn("해제", res["detail"], "해제 사실을 문면에 적어야 한다: %s" % res["detail"])
+
+    def test_differently_quoted_registration_is_seen_and_removed(self):
+        """★R2 blocking(codex): 따옴표 표기가 다른 **정상 등록**을 '미등록'으로 오보고하지 않는다."""
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        quoted = 'sh "%s"' % os.path.join(pf.pack_dir(), "hooks", pf.CAPGATE_HOOK[0])
+        sp.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"hooks": [{"type": "command", "command": quoted, "timeout": 15}]}]}}),
+            encoding="utf-8")
+        self.assertFalse(pf.Preflight._event_hook_registered(str(sp), "PreToolUse",
+                                                             pf.CAPGATE_HOOK[0]),
+                         "선행 조건: 바이트 동등 술어는 이 표기를 못 본다")
+        self.assertTrue(pf.Preflight._event_hook_present_any(str(sp), "PreToolUse",
+                                                             pf.CAPGATE_HOOK[0]),
+                        "소유 술어가 표기 차이를 흡수하지 못한다")
+        res, doc = self._run_c28(sp, fix=True,
+                                 status={"daemon": {}, "surfaces": []})
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "표기가 다른 등록이 해제되지 않았다: %s" % doc)
+        self.assertIn("능력 게이트 조건 거짓 — 해제", res["detail"],
+                      "살아 있던 등록을 보지 못하고 '보류'로 보고했다: %s" % res["detail"])
+
+    def test_conditions_met_registers(self):
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        sp.write_text("{}", encoding="utf-8")
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive)
+        self.assertEqual(len(self._capgate_cmds(doc)), 1,
+                         "조건 충족인데 등록되지 않았다: %s · %s" % (doc, res["detail"]))
+
+    def test_table_deny_profile_is_not_registered(self):
+        """★R2 blocking: 대상표가 `capgate: deny` 라고 선언한 프로필은 **부팅 경로도** 제외한다."""
+        prof = self.home / ".claude-2"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        sp.write_text("{}", encoding="utf-8")
+        table = {"schema_version": 1, "policy": {"unknown_profile": "deny"},
+                 "profiles": [{"basename": ".claude-2",
+                               "eligibility": {"guard_stop": "deny", "brief_warn": "deny",
+                                               "capgate": "deny"}}]}
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive, table=table)
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "표가 deny 한 프로필에 등록했다: %s" % doc)
+
+    def test_table_deny_profile_is_unregistered_even_when_conditions_hold(self):
+        sp = self._profile_with_capgate()
+        # `.claude` 를 deny 로 선언한 표
+        table = {"schema_version": 1, "policy": {"unknown_profile": "deny"},
+                 "profiles": [{"basename": ".claude",
+                               "eligibility": {"guard_stop": "deny", "brief_warn": "allow",
+                                               "capgate": "deny"}}]}
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive, table=table)
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "표 deny 프로필의 잔존 등록이 해제되지 않았다: %s" % doc)
+
+    def test_corrupt_table_defers_registration(self):
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        sp.write_text("{}", encoding="utf-8")
+        tdir = self.pack / "state"
+        tdir.mkdir(exist_ok=True)
+        (tdir / "hook-targets.json").write_text("{", encoding="utf-8")
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive)
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "손상 표에서 등록했다(하드코딩 폴백 금지): %s" % doc)
+        self.assertIn("능력 게이트 판정 불능", res["detail"],
+                      "손상 표를 조용히 무시했다: %s" % res["detail"])
+        self.assertIsNotNone(pf.capgate_table_denied_basenames(str(self.pack))[1],
+                             "손상 표가 err 없이 통과했다")
 
 
 class CapgateRegistrarEligibility(_CapgateEnv):

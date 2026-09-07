@@ -145,11 +145,56 @@ CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
 CSO_DIRECTIVE_MARKER_MAX_LINE = 20
 
 
+# ★데몬 **실재** 가드 — preflight `Preflight._capgate_daemon_present` 의 미러(R2 minor · 두 리뷰어).
+#   이 판정도 실제 `cys` 를 띄우고, 그 바이너리는 자기 HOME 아래에 팩·상태를 부트스트랩한다.
+#   임시 HOME 문맥(검체·격리 실행)에서 그 부수효과가 정리와 경합해 부트 헬스 검체가 크래시했다
+#   (H-SEED-2). preflight 만 고치고 여기를 두면 같은 원인이 두 번째 경로로 남는다.
+HUB_LIVE_MARKERS = ("cys.sock", "boot-epoch", "cysd.log", "queue-state.json", "topology.json")
+
+
+def _hub_state_dir():
+    """본부 데몬 state dir(플랫폼 규약) 또는 None — `javis_preflight._hub_state_dir` 미러.
+
+    ★darwin 은 `XDG_STATE_HOME` 을 **보지 않는다**(Rust `dirs::state_dir` 이 None 을 돌려
+      home 폴백이 된다) — 두 도구가 다른 위치를 보면 같은 조건을 다르게 재게 된다.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        return os.path.join(base, "cys") if base else None
+    root = None
+    if sys.platform.startswith("linux"):
+        xdg = os.environ.get("XDG_STATE_HOME")
+        if xdg and os.path.isabs(xdg):
+            root = xdg
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(root, "cys")
+
+
+def _daemon_present():
+    """(present, why) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가(파일 실재만 본다)."""
+    sock = os.environ.get("CYS_SOCKET")
+    if sock:
+        return os.path.exists(sock), ("CYS_SOCKET 실재(%s)" % sock if os.path.exists(sock)
+                                      else "데몬 소켓 미실재(%s)" % sock)
+    sd = _hub_state_dir()
+    if not sd or not os.path.isdir(sd):
+        return False, "허브 상태 디렉터리 미실재(%s) — 데몬이 기동한 적이 없다" % (sd or "미해소")
+    found = [m for m in HUB_LIVE_MARKERS if os.path.exists(os.path.join(sd, m))]
+    if not found:
+        return False, "허브 상태 디렉터리(%s)에 데몬 표지 0건" % sd
+    return True, "데몬 표지 %s" % ",".join(found[:3])
+
+
 def _capgate_eligibility(pack, timeout=6):
     """(ok, why) — ①데몬 `alert_route.enabled is True` ②설치본 지침 신판 표지(첫 20행 행 등가).
 
-    판정 불능(cys 부재·호출 실패·지침 판독 실패)은 **미자격**이다 — 결측은 값이 아니고,
-    여기서 관대하면 구 데몬에 게이트를 등록하게 된다.
+    판정 불능(cys 부재·데몬 미실재·호출 실패·지침 판독 실패)은 **미자격**이다 — 결측은 값이
+    아니고, 여기서 관대하면 구 데몬에 게이트를 등록하게 된다.
+
+    ★preflight 와 다른 점 하나(의도적): preflight 는 3값(`on`/`off`/`unknown`)이다. 이 도구는
+      **등록만** 하고 해제하지 않으므로 '판정 불능=미자격'(등록 안 함)이 곧 안전 방향이고,
+      두 값으로 접어도 잃는 판정이 없다. 해제 판정의 정본은 preflight C28 이다.
     """
     missing = []
     cys = os.environ.get("CYS_BIN") or shutil.which("cys")
@@ -157,16 +202,20 @@ def _capgate_eligibility(pack, timeout=6):
     if not cys:
         missing.append("cys 바이너리 미발견 — alert_route 판정 불가(판정 불능은 미자격이다)")
     else:
-        try:
-            r = subprocess.run([cys, "status", "--json"], capture_output=True, text=True,
-                               timeout=timeout)
-            doc = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
-            ar = doc.get("alert_route") if isinstance(doc, dict) else None
-            ok_alert = isinstance(ar, dict) and ar.get("enabled") is True
-        except (OSError, ValueError, subprocess.SubprocessError) as e:
-            missing.append("cys status --json 조회 실패(%s)" % e)
-        if not ok_alert and not missing:
-            missing.append("데몬 alert_route 미지원(status --json 에 alert_route.enabled=true 없음)")
+        _present, _why = _daemon_present()
+        if not _present:
+            missing.append("%s — alert_route 판정 불가(이 축은 데몬을 깨우지 않는다)" % _why)
+        else:
+            try:
+                r = subprocess.run([cys, "status", "--json"], capture_output=True, text=True,
+                                   timeout=timeout)
+                doc = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+                ar = doc.get("alert_route") if isinstance(doc, dict) else None
+                ok_alert = isinstance(ar, dict) and ar.get("enabled") is True
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                missing.append("cys status --json 조회 실패(%s)" % e)
+            if not ok_alert and not missing:
+                missing.append("데몬 alert_route 미지원(status --json 에 alert_route.enabled=true 없음)")
     d = os.path.join(pack, "directives", "CSO_DIRECTIVE.md")
     try:
         with open(d, encoding="utf-8", errors="replace") as f:
@@ -316,8 +365,19 @@ def _pack_dir():
 
 
 def _command_str(spec, pack):
-    """등록될 command 문자열 — 훅 실물 절대경로. 팩 경로가 바뀌면 문자열도 바뀐다(의도)."""
-    return "sh %s" % os.path.join(pack, spec["script"])
+    r"""등록될 command 문자열 — 훅 실물 절대경로. 팩 경로가 바뀌면 문자열도 바뀐다(의도).
+
+    ★Windows 규칙은 preflight `_cys_hook_cmd` 와 **같아야 한다**(R2 blocking · codex 실증):
+      종전 `"sh %s" % os.path.join(...)` 는 Windows 에서 `sh C:\Users\A B\.cys\pack\hooks/…` 를
+      만들고, 실제 Bash 는 그 역슬래시를 escape 로 먹어 `C:UsersA` 처럼 **경로를 파괴**한다 —
+      자격 검사는 통과하고 '등록됨' 을 보고하는데 훅은 실행되지 않는다(게이트 소실).
+      정슬래시 + 따옴표가 유일하게 안전한 형태이고, 두 등록기가 같은 문자열을 내야 서로의
+      멱등·해제 판정이 성립한다.
+    """
+    script = os.path.join(pack, spec["script"])
+    if os.name == "nt":
+        return 'bash "%s"' % script.replace("\\", "/")
+    return "sh %s" % script
 
 
 def _resolve_settings(profile):

@@ -230,12 +230,29 @@ else
   [ -n "$CAPGATE_TMP_IN" ] && trap 'rm -f "$CAPGATE_TMP_IN" 2>/dev/null' EXIT INT TERM HUP
   if [ -n "$CAPGATE_TMP_IN" ]; then
     cat > "$CAPGATE_TMP_IN" || { echo "role-capability-gate: cannot read stdin" >&2; exit 0; }
+    # ★인계 실패의 **폴백**(R2 major · claude 리뷰어): `cygpath` 가 없거나(Git Bash 최소 설치)
+    #   변환이 어긋나 네이티브 python 이 이 파일을 열지 못하면, 종전에는 입력이 빈 문자열로
+    #   강등되어 reviewer/planner 가 **매 도구 호출마다** exit 2 로 벽돌이 됐다(§3-3 위반 —
+    #   오탐의 귀결이 좌석 사망). 소용량 입력은 env 로도 함께 내보내 그 실패를 흡수한다.
+    #   (대용량은 env 상한 때문에 못 싣는다 — 그때는 종전 계약대로 reviewer fail-closed 다:
+    #    배관 실패가 **권한 확대**가 되면 producer≠evaluator 의 기계 집행이 사라진다 · codex R2.)
+    #   ★순서 주의: 변환·정리보다 **먼저** 뜬다(그 뒤 단계가 파일을 건드릴 수 있다).
+    _cg_insz="$(wc -c < "$CAPGATE_TMP_IN" 2>/dev/null | tr -dc '0-9')"
+    case "$_cg_insz" in ''|*[!0-9]*) _cg_insz=0 ;; esac
+    if [ "$_cg_insz" -gt 0 ] && [ "$_cg_insz" -le 65536 ]; then
+      CAPGATE_INPUT="$(cat "$CAPGATE_TMP_IN" 2>/dev/null)" && export CAPGATE_INPUT
+    fi
     # ★Git Bash: 네이티브 Python 은 POSIX 경로(`/tmp/...`)를 열지 못한다 — 열지 못하면 입력이
     #   **빈 문자열**로 강등되어(=판정 없음) CSO 는 전 통과, reviewer 는 매 호출 exit 2 가 된다.
     #   `_lib.sh` 가 상태 경로에 쓰는 변환을 입력 파일에도 적용한다(unix 는 무변환 계약).
     CAPGATE_INPUT_FILE="$(cys_native_path "$CAPGATE_TMP_IN")"
     [ -n "$CAPGATE_INPUT_FILE" ] || CAPGATE_INPUT_FILE="$CAPGATE_TMP_IN"
     export CAPGATE_INPUT_FILE
+    # ★POSIX 원본 경로도 넘긴다: ⓐ변환된 경로를 못 열 때의 **두 번째 시도** ⓑ정리 대상.
+    #   아래 `exec` 는 이 셸을 **치환**하므로 trap 은 그 뒤에 돌지 않는다 — 정리는 판정기가 한다
+    #   (종전엔 변환이 어긋나면 판정기가 **엉뚱한 경로**를 지워 본문 파일이 남았다).
+    CAPGATE_INPUT_TMP="$CAPGATE_TMP_IN"
+    export CAPGATE_INPUT_TMP
   else
     CAPGATE_INPUT="$(cat)" || { echo "role-capability-gate: cannot read stdin" >&2; exit 0; }
     export CAPGATE_INPUT
@@ -321,12 +338,32 @@ BUILDER_VERIFY_SUBS = {"cargo": CARGO_VERIFY_SUBS, "go": GO_VERIFY_SUBS}
 BUILDER_VALUE_OPTS = {
     "cargo": {"--config", "--manifest-path", "--color", "--target", "--features", "-j",
               "--jobs", "-Z", "--message-format", "--profile", "--explain"},
-    "go": {"-C"},
+    "go": {"-C", "-mod", "-toolexec", "-exec", "-overlay", "-modfile", "-pkgdir"},
 }
+# ★그 자체로 **임의 실행·소스 재작성**인 빌드 옵션(R2 · codex 실증):
+#   `go build -toolexec=/tmp/rewrite` 는 빌드 도구 대신 임의 실행 파일을 부르고,
+#   `go build -mod=mod` 는 `go.mod`·`go.sum` 을 고친다(`-overlay`·`-modfile` 도 소스 대체다).
+BUILDER_DENY_OPTS = ("-toolexec", "-exec", "-overlay", "-modfile", "-pkgdir")
+# ★`cargo --config <k=v>` 는 **임의 프로그램 실행 설정**을 넣을 수 있다(R2 · codex 실증:
+#   `cargo --config target.<t>.runner=["…/runner.sh"] test` 로 그 스크립트가 실제로 실행됐다).
+#   키를 열거로 안전하게 가려낼 수 없으므로 **아는 키만** 통과시킨다(allowlist 의 뜻).
+#   정직: `cargo test` 자체가 테스트 본문·build.rs 로 임의 코드를 돌린다(이 완화는 샌드박스가
+#   아니다 · 위 머리말). 여기서 닫는 것은 **검증 명령의 얼굴을 한 실행기 주입**이다.
+CARGO_CONFIG_SAFE_KEYS = ("build.jobs", "build.target-dir", "build.incremental",
+                          "net.offline", "net.retry", "term.")
+BUILDER_DENY_OPT_VALUES = {"-mod": ("mod",)}
+# 산출물 폐기 장치는 플랫폼마다 다르다 — unix 에서 `NUL` 은 **일반 파일**이고
+# `/dev/stdout`·`/dev/tty` 는 null sink 가 아니다(리다이렉트의 NULL_SINKS 와 뜻이 다르다).
+BUILDER_NULL_SINKS = ("NUL", "nul") if os.name == "nt" else ("/dev/null",)
 # ★명령 **자체가** 상태를 바꾸는 하위-옵션(R1 minor): `go env -w/-u` 는 GOENV 파일을 영속
 #   변경한다 — 조회 하위 명령의 얼굴을 한 설정 변경이다. `cargo fmt` 는 소스를 다시 쓴다
 #   (`--check` 는 쓰지 않고 종료 코드만 낸다).
-BUILDER_SUB_WRITE_OPTS = {("go", "env"): ("-w", "-u")}
+#   ★`cargo clippy --fix` 는 `cargo fix` 와 **같은 소스 재작성기**다(machine-applicable lint 를
+#     작업 트리에 적용한다). `cargo fix` 는 하위 명령 목록 밖이라 막히는데 `clippy --fix` 가
+#     열려 있으면 producer≠evaluator 를 집행하는 바로 그 분기가 그 우회를 여는 것이다
+#     (R2 major · claude 리뷰어 실증: `cargo clippy --fix --allow-dirty --allow-staged` ALLOW).
+BUILDER_SUB_WRITE_OPTS = {("go", "env"): ("-w", "-u"),
+                          ("cargo", "clippy"): ("--fix",)}
 BUILDER_SUB_REQUIRE_OPTS = {("cargo", "fmt"): ("--check",)}
 # 빌드 산출물을 **임의 경로로 내보내는** 옵션은 리다이렉트와 같은 부류다(대상이 허용 경로여야 한다).
 BUILDER_OUT_OPTS = ("-o", "--out-dir", "--output", "--target-dir")
@@ -346,7 +383,19 @@ def builder_is_write(base, tokens, i):
         t = tokens[j]
         if is_separator(t) or _is_redirect_op(t):
             break
+        if any(t == d or t.startswith(d + "=") for d in BUILDER_DENY_OPTS):
+            return True                  # 임의 실행·소스 대체 옵션
+        _dv = next((v for o, v in BUILDER_DENY_OPT_VALUES.items()
+                    if t == o or t.startswith(o + "=")), None)
+        if _dv is not None:
+            _val = t.split("=", 1)[1] if "=" in t else (tokens[j + 1] if j + 1 < n else "")
+            if _val in _dv:
+                return True              # `go build -mod=mod` 는 go.mod 를 고친다
         if t in value_opts:
+            if base == "cargo" and t == "--config":
+                _cv = (tokens[j + 1] if j + 1 < n else "").lstrip("'\"")
+                if not any(_cv.startswith(k) for k in CARGO_CONFIG_SAFE_KEYS):
+                    return True          # 실행기·래퍼 주입 경로(아는 키만 통과)
             seg_opts.append(t)
             j += 2                       # 옵션 **값**은 하위 명령이 아니다
             continue
@@ -354,7 +403,10 @@ def builder_is_write(base, tokens, i):
         #   하위 명령 **뒤에** 오는 것이 보통이라, 하위 명령을 만나면 멈추는 스캔은 놓친다.
         if any(t == o or t.startswith(o + "=") for o in BUILDER_OUT_OPTS):
             val = t.split("=", 1)[1] if "=" in t else (tokens[j + 1] if j + 1 < n else "")
-            if not path_is_allowed(val):
+            # ★산출물 폐기 장치만 허용한다(R2 · claude 리뷰어 오탐 + codex 반례를 함께 닫는다):
+            #   `go build -o /dev/null ./...` 는 컴파일 검증의 표준 관용구지만, 공용
+            #   `NULL_SINKS` 를 그대로 쓰면 unix 에서 `-o NUL` 이 저장소에 바이너리를 쓴다.
+            if val not in BUILDER_NULL_SINKS and not path_is_allowed(val):
                 return True              # 산출물을 검증 대상 트리로 내보낸다
             j += 2 if "=" not in t else 1
             continue
@@ -383,6 +435,96 @@ GIT_WRITE_SUBS = {"commit", "push", "add", "reset", "rebase", "merge", "checkout
 #   에서 `/repo` 를 서브커맨드로 오인해 **write 판정이 통째로 새어 나간다**(codex 실증 · 종전 결함).
 GIT_GLOBAL_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                          "--config-env", "--exec-path", "--super-prefix"}
+# ★변형 서브커맨드에도 **읽기 전용 하위 모드**가 있다(R2 minor · claude 리뷰어 실측):
+#   R1 에서 worktree·submodule·config·stash·notes·sparse-checkout·branch·tag 를 변형 집합에
+#   통째로 넣어 `git worktree list`·`git config --get user.name`·`git branch --list`·`git tag -l`·
+#   `git submodule status`·`git stash list` 가 전부 deny 됐다. 실패 방향은 안전(보류)이지만
+#   plan §4 WP-3 A 가 요구한 "리뷰어의 정당한 검증 명령이 막히지 않는가" 에 해당하는 오탐이고,
+#   reviewer 분기가 **처음 실활성화**되는 이번 릴리스에서 즉시 드러난다.
+#   여는 방식은 allowlist 다: 조회임이 **명시적으로 보일 때만** 읽기로 본다(모호하면 변형).
+GIT_SUB_READ_VERBS = {
+    "worktree": ("list",),
+    "submodule": ("status", "summary"),
+    "stash": ("list", "show"),
+    "notes": ("list", "show"),
+    "sparse-checkout": ("list",),
+}
+# ★파일 출력 옵션은 서브커맨드가 조회여도 **파일을 쓴다**(R2 · codex 실증:
+#   `git stash list --output=src/a.rs` · `git diff --output=…`). 종전엔 reviewer 경로에서
+#   `log|show|diff` 가 변형 집합 밖이라 이 옵션이 통째로 무검사였다 — 선행 구멍도 함께 닫는다.
+GIT_FILE_OUT_OPTS = ("--output", "--output-directory", "-o")
+GIT_CONFIG_VALUE_OPTS = ("--file", "-f", "--blob", "--type", "-t", "--default")
+GIT_CONFIG_READ_ACTIONS = ("--get", "--get-all", "--get-regexp", "--get-urlmatch",
+                           "--list", "-l")
+GIT_CONFIG_READ_SUBVERBS = ("get", "list", "get-all", "get-regexp", "get-urlmatch")
+GIT_CONFIG_WRITE_FLAGS = ("--unset", "--unset-all", "--add", "--replace-all", "--edit", "-e",
+                          "--rename-section", "--remove-section")
+# 목록 모드를 **강제하는** 표지 — 이것이 있으면 피연산자가 있어도 조회다(`git branch --list main`).
+GIT_LIST_MODE_FLAGS = ("--list", "-l", "--contains", "--no-contains", "--merged", "--no-merged",
+                       "--points-at", "--show-current")
+GIT_BAREREAD_WRITE_FLAGS = {
+    # 목록 표지가 없으면 **피연산자 0 + 쓰기 플래그 0** 일 때만 조회다(`git branch` · `git tag`).
+    "branch": ("-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-u",
+               "--set-upstream-to", "--unset-upstream", "--edit-description", "-f", "--force",
+               "--create-reflog", "--track", "--no-track"),
+    "tag": ("-d", "--delete", "-a", "--annotate", "-s", "--sign", "-m", "--message", "-F",
+            "--file", "-f", "--force", "--create-reflog", "-u", "--local-user", "--cleanup"),
+}
+
+
+def _opt_hit(args, flags):
+    return any(a == f or a.startswith(f + "=") for a in args for f in flags)
+
+
+def _git_config_is_write(sub_args):
+    """`git config` 는 **값을 먹는 옵션**을 건너뛴 뒤에 액션을 봐야 한다(R2 · codex 실증).
+
+    `git config --file --get section.key value` 에서 `--get` 은 `--file` 의 **값**이다 —
+    "읽기 플래그 문자열이 어디든 있다" 는 조회의 증거가 아니고, 실제로는 `--get` 이라는 이름의
+    파일에 설정을 **쓴다**.
+    """
+    opts, operands, skip = [], [], False
+    for a in sub_args:
+        if skip:
+            skip = False
+            continue
+        if a.startswith("-"):
+            if a in GIT_CONFIG_VALUE_OPTS:
+                skip = True
+            opts.append(a)
+            continue
+        operands.append(a)
+    if _opt_hit(opts, GIT_CONFIG_WRITE_FLAGS):
+        return True
+    read_flag = _opt_hit(opts, GIT_CONFIG_READ_ACTIONS)
+    read_verb = bool(operands) and operands[0] in GIT_CONFIG_READ_SUBVERBS
+    if not (read_flag or read_verb):
+        return True                       # 액션이 안 보이면 `git config a.b v`(쓰기)다
+    limit = 2 if _opt_hit(opts, ("--get-urlmatch",)) or (read_verb and operands[0] == "get-urlmatch") else 1
+    return len(operands) > (limit + (1 if read_verb else 0))
+
+
+def git_sub_is_write(sub, sub_args):
+    """`git <sub> <args…>` 가 변형인가. **모호하면 변형**(아는 조회 모드만 통과)."""
+    if _opt_hit(sub_args, GIT_FILE_OUT_OPTS):
+        return True                       # 조회 서브커맨드여도 파일을 만든다
+    if sub not in GIT_WRITE_SUBS:
+        return False
+    read_verbs = GIT_SUB_READ_VERBS.get(sub)
+    if read_verbs is not None:
+        first = next((a for a in sub_args if not a.startswith("-")), None)
+        return first not in read_verbs
+    if sub == "config":
+        return _git_config_is_write(sub_args)
+    bare = GIT_BAREREAD_WRITE_FLAGS.get(sub)
+    if bare is not None:
+        if _opt_hit(sub_args, bare):
+            return True                   # 생성·삭제·이동·상류 설정 플래그
+        if _opt_hit(sub_args, GIT_LIST_MODE_FLAGS):
+            return False                  # 목록 모드가 강제된다(피연산자는 패턴이다)
+        return any(not a.startswith("-") for a in sub_args)   # 이름 인자 = 생성
+    return True
+
 
 WRAPPERS = {"command", "exec", "env", "sudo", "nohup", "time", "xargs"}
 
@@ -433,8 +575,20 @@ CSO_CYS_SUBVERBS = {
     # 발신만 허용되므로(§1-2 ③-1) CSO 에게는 deny 다.
     "approval": {"check"},
 }
+# ★예산 **면제**는 관측·저장·상신에만 준다(R2 minor · claude 리뷰어). `queue clear` 는 큐 항목을
+#   **파기**하는 변이이고 사이클 절차의 선행 조건이 아니다 — 예산 소진 뒤에도 무제한 반복되면
+#   봉인표 ①(폭주) 쪽 여지가 남는다. 허용(접두)과 면제(예산)는 다른 축이다.
+#   `feed push` 는 면제로 **남긴다**: 정본 §4 가 이미 `send --to master` 를 면제하고 있고,
+#   `feed push` 는 master 무응답 교착에서의 **같은 종류의 상신**(§1-2 ⑤ 오너 채널)이다 —
+#   막으면 'master hang ∧ 예산 소진' 교차에서 CSO 의 출구가 0 이 된다(봉인표 ②·③).
+CSO_CYS_SUBVERB_ESSENTIAL = {("queue", "list"), ("feed", "list"), ("feed", "push"),
+                             ("schedule", "list"), ("approval", "check")}
 CSO_CYS_TTL_VERBS = {"kill", "close-surface", "pause", "resume", "tombstone", "launch-agent"}
 CSO_CYS_DENY_VERBS = {"events"}          # 종결 없는 스트림 — TTL 승인 대상도 아니다(§1-1)
+# ★**대상 데몬을 바꾸는** 옵션은 어느 자리에 있어도 deny 다(R2 blocking · codex 실증):
+#   `cys --socket status kill 7` 은 동사를 가리고, `cys cycle-agent --socket /other.sock …` 은
+#   판정 문맥(자기 데몬)과 실행 대상을 갈라 놓는다 — 승인·예산·역할이 다른 데몬에 걸린다.
+CSO_CYS_TARGET_OPTS = ("--socket", "-S")
 # 허용 동사라도 **효과가 다른 옵션**은 따로 막는다(접두 허용 ≠ 인자 허용 · codex P0).
 CSO_CYS_OPT_DENY = {
     # 효과가 **다른** 옵션(검증 생략·임의 clear 명령·수신자 우회)만 여기 남긴다.
@@ -492,6 +646,9 @@ def _arg_hits_deny(arg, bad):
     # `--fi` 는 `--fix` 의 접두다. 한 글자(`-`)·비-long 옵션은 축약 대상이 아니다.
     return (head.startswith("--") and len(head) > 2 and bad.startswith("--")
             and bad.startswith(head))
+# 값을 먹는 옵션(그 다음 토큰은 하위 명령이 아니다). 하위 명령을 **받지 않는** 도구에서도
+# 필요하다 — `--skip <ID>` 의 ID 가 '허용 밖 하위 명령'으로 읽히면 정상 진단이 거부된다.
+CSO_PY_VALUE_OPTS = {"javis_preflight.py": ("--skip",)}
 CSO_ESSENTIAL_PY_TOOLS = {"javis_cycle_autopilot.py"}
 
 # 읽기 전용 셸(인자 규칙이 없는 것들). `sed` 는 **정본 §10-1 에서 의도적으로 뺐다** —
@@ -503,6 +660,18 @@ CSO_RO_CMDS = {"ps", "grep", "rg", "cat", "head", "tail", "wc", "ls", "stat",
 #   `cksum`·`md5sum` 은 R1 에서 뺐다: §1-1 이 요구하는 증거는 sha256 이고, 근거 없는 확대는
 #   확대다(좁히는 방향으로만 정본과 어긋난다).
 CSO_DIGEST_CMDS = {"shasum", "sha256sum"}
+# 읽기 명령의 **값을 먹는 옵션**(그 다음 토큰은 대상 파일이 아니다). 명령마다 다르다 —
+# 하나의 표로 뭉치면 `wc -c <파일>` 의 파일이 사라지거나 `stat -f %z` 의 포맷이 파일이 된다.
+CSO_TARGET_VALUE_OPTS = {
+    "stat": ("-f", "-c", "--format", "--printf", "-t"),      # BSD `-f` · GNU `-c/--format`
+    "shasum": ("-a", "--algorithm"),
+    "sha256sum": (),
+    "head": ("-n", "-c", "--lines", "--bytes"),
+    "tail": ("-n", "-c", "--lines", "--bytes"),
+    "cat": (),
+    "wc": (),
+}
+CSO_TARGET_VALUE_OPTS_DEFAULT = ()
 CSO_GIT_READ_SUBS = {"status", "log", "diff", "show"}
 # git 조회 하위 명령이 **셸 리다이렉트 없이** 파일을 쓰거나 외부 프로그램을 돌리는 옵션들.
 CSO_GIT_OPT_DENY = ("--output", "-o", "--ext-diff", "--exec", "--textconv", "--pager",
@@ -559,26 +728,47 @@ def _is_gate_state_path(p):
     return ("/" + _fold(GATE_STATE_DIRNAME) + "/") in ap + "/"
 
 
-# ★집행 대상이 고쳐선 안 되는 **데몬 소유 상태**(R1 major): `~/.cys/state/` 는 지침이 명시한
-#   허용 뿌리지만 그 안에는 배달 **원장**(delivery-*.jsonl · v/from 계약 · §8)·부트 상태
-#   (boot-last*·bootstrap-*.lock)·mission·formation 이 함께 있다. 허용 뿌리라는 사실이
-#   '원장을 고쳐도 된다' 는 뜻이 될 수는 없다(codex P0: 집행 대상은 자기 집행 상태를 고치지
-#   못한다 — 자가치유 상태(③)와 원장에 같게 적용한다).
-PROTECTED_STATE_PREFIXES = ("delivery-", "boot-last", "bootstrap-", "mission", "role-bootstrap")
-PROTECTED_STATE_DIRS = ("formation", "report_gate", "dept-boot-tickets", "dept-ticket-requests")
+# ★집행 대상이 고쳐선 안 되는 **데몬 소유 상태**: `~/.cys/state/` 는 지침이 명시한 허용
+#   뿌리지만 그 안에는 배달 **원장**(delivery-*.jsonl · v/from 계약 · §8)·부트 상태
+#   (boot-last*·bootstrap-*.lock)·mission·formation·부서 티켓·학습·집행 지문이 함께 있다.
+#   허용 뿌리라는 사실이 '원장을 고쳐도 된다' 는 뜻이 될 수는 없다(codex P0: 집행 대상은
+#   자기 집행 상태를 고치지 못한다 — 자가치유 상태(③)와 원장에 같게 적용한다).
+#
+# ★R2 major(claude 리뷰어 실증): 종전은 **금지 목록**이었고 디렉터리 비교가 정확 이름이라
+#   실기(`ls ~/.cys/state`)에 있는 레인 접미 디렉터리 `report_gate-dept-1`·`report_gate-dept-3`,
+#   후발 디렉터리 `learn/`·`chrome-automation/`, 집행 지문 `preflight-c03-fingerprint.json`,
+#   `selfdiag-*` 를 **전부 놓쳤다**(Write 종단 실행에서 ALLOW 실측). 금지를 세는 방식은 상태
+#   디렉터리가 늘 때마다 구멍이 생긴다 — 그래서 **허용 목록으로 뒤집는다**: `<state>` 아래에서
+#   CSO 가 쓸 수 있는 것은 ⓐ자기 작업 하위 트리(`<state>/cso/**`) ⓑ 바로 아래의 자기 소유
+#   상태 파일(`CSO_*`·`SESSION_STATE*`) 둘뿐이다. 지침 §1-1 자신이 "목록과 조항이 어긋나면
+#   **좁은 쪽이 이긴다**" 고 못박았으므로 이 축소는 정본 위반이 아니다.
+CSO_STATE_WRITE_DIRS = ("cso",)
 
 
 def _is_protected_state_path(p, ctx):
-    """`<state>` 아래의 원장·부트·미션 상태인가(쓰기 금지 · 읽기는 자유)."""
+    """`<state>` 아래인데 **CSO 소유가 아닌** 경로인가(쓰기 금지 · 읽기는 자유)."""
     ap = _fold(_norm(p))
     roots = [_fold(_norm(ctx.state)),
              _fold(_norm(os.path.join(ctx.home, ".cys", "state")))]
-    if not any(ap == r or ap.startswith(r.rstrip("/") + "/") for r in roots if r):
-        return False
-    base = ap.rsplit("/", 1)[-1]
-    if any(base.startswith(_fold(x)) for x in PROTECTED_STATE_PREFIXES):
-        return True
-    return any(("/" + _fold(d) + "/") in ap + "/" for d in PROTECTED_STATE_DIRS)
+    root = None
+    for r in roots:
+        if not r:
+            continue
+        rr = r.rstrip("/")
+        if ap == rr or ap.startswith(rr + "/"):
+            root = rr
+            break
+    if root is None:
+        return False                      # `<state>` 밖 — 이 축의 판정 대상이 아니다
+    rel = ap[len(root) + 1:] if ap != root else ""
+    if not rel:
+        return True                       # `<state>` 자신을 대상으로 쓰는 것은 허용이 아니다
+    head = rel.split("/", 1)[0]
+    if head in CSO_STATE_WRITE_DIRS:
+        return False                      # ⓐ 자기 작업 하위 트리
+    if "/" not in rel and is_cso_state_file(ap):
+        return False                      # ⓑ `<state>` 바로 아래의 자기 소유 상태 파일
+    return True
 
 
 def path_is_allowed(p):
@@ -623,13 +813,13 @@ def _is_redirect_op(tok):
     return False
 
 
-def split_unquoted_newlines(command):
-    """인용 **밖**의 주석을 지우고, 인용 **밖**의 개행만 `;` 로 바꾼다.
+def scan_shell(command):
+    """(cleaned, mask) — 인용 밖 주석 제거 · 인용 밖 개행→`;` · **문자별 인용 상태 마스크**.
 
-    ★왜 필요한가(codex 실증): 개행을 공백으로 흘리면 `cys status\\ncys kill 123` 이
+    ★왜 필요한가(codex 실증): 개행을 공백으로 흘리면 `cys status\ncys kill 123` 이
       `['cys','status','cys','kill','123']` 한 세그먼트가 되어 뒤 명령이 **인자로 위장**된다.
       반대로 개행을 통째로 `;` 로 바꾸면(reviewer 경로의 종전 방식) 인용된 여러 줄 **보고 본문**
-      까지 명령 경계로 변형된다 — `cys send --queued --to master "1줄\\n2줄"` 이 그렇다.
+      까지 명령 경계로 변형된다 — `cys send --queued --to master "1줄\n2줄"` 이 그렇다.
       그래서 인용 상태를 세면서 **밖의 개행만** 경계로 만든다.
 
     ★주석은 **여기서** 지운다(R1 blocking · codex 실증): 개행을 `;` 로 바꾼 뒤 shlex 의 기본
@@ -637,8 +827,18 @@ def split_unquoted_newlines(command):
       `cat /dev/null # audit⏎printf X` 의 둘째 줄이 검사에서 사라진다(실제 bash 는 실행한다).
       그래서 ⓐ인용 밖에서 **단어 시작 위치의 `#`** 만 그 줄 끝까지 지우고(bash 규칙 — `a#b` 는
       주석이 아니다) ⓑ`_tokenize` 는 `commenters=""` 로 shlex 의 주석 처리를 끈다.
+
+    ★마스크(R2 blocking · codex 실증): shlex 는 따옴표를 **벗겨서** 돌려주므로 토큰만 보면
+      `'$CYS_PACK_DIR/bin/x.py'`(리터럴)와 `"$CYS_PACK_DIR/bin/x.py"`(확장)가 구별되지 않는다 —
+      판정기는 설치 팩으로 해소하고 실제 셸은 상대경로를 넘겼다(허용 scratchpad 에 써 둔 임의
+      파이썬이 판정 도구로 실행되는 경로). 글롭(`*` `?` `[`)·중괄호 **범위**(`{s..s}`)도 같은
+      부류다: 토큰 하나가 셸에서는 **다른 문자열·여러 인자**가 된다. 그래서 문자마다 인용
+      상태를 남겨 `cso_expansion_hazard` 가 그 셋을 잰다.
+      마스크 문자: `u`=인용 밖 · `s`=작은따옴표 안 · `d`=큰따옴표 안 · `e`=백슬래시로 이스케이프된
+      문자(셸이 **리터럴**로 읽는다) · `q`=따옴표 문자 자신.
     """
     out = []
+    mask = []
     quote = None
     esc = False
     at_word_start = True
@@ -649,19 +849,26 @@ def split_unquoted_newlines(command):
             # ★줄 이어붙이기: `\`+개행은 셸이 **둘 다 지운다**(단어가 이어붙는다).
             #   그대로 흘리면 판정기는 `--f⏎ix` 를 두 조각으로 보고 bash 는 `--fix` 를 실행한다
             #   (codex R1 반례: `--f\⏎ix` 로 승인 없는 변이 플래그가 통과했다).
-            if ch in ("\n", "\r"):
+            # ★**LF 에서만** 이어붙인다(R2 · codex 실증): bash 에서 CR 은 개행이 아니라 평범한
+            #   문자다. `\`+CR 을 이어붙이면 판정기는 `javis_preflight.py`(설치 팩 도구)를 보고
+            #   셸은 `javis_pre<CR>flight.py`(같은 이름의 **다른 파일**)를 실행한다 — 실측으로
+            #   그 사본이 돌았다. 아래 CR 거부와 짝이다.
+            if ch == "\n":
                 if out and out[-1] == "\\":
                     out.pop()
+                    mask.pop()
                 esc = False
                 i += 1
                 continue
             out.append(ch)
+            mask.append("e")
             esc = False
             at_word_start = False
             i += 1
             continue
         if quote is None and ch == "\\":
             out.append(ch)
+            mask.append("u")
             esc = True
             at_word_start = False
             i += 1
@@ -669,41 +876,170 @@ def split_unquoted_newlines(command):
         if quote is None and ch in ("'", '"'):
             quote = ch
             out.append(ch)
+            mask.append("q")
             at_word_start = False
             i += 1
             continue
         if quote is not None:
             if ch == quote:
                 quote = None
-            elif quote == '"' and ch == "\\":
                 out.append(ch)
+                mask.append("q")
+                i += 1
+                continue
+            if quote == '"' and ch == "\\":
+                out.append(ch)
+                mask.append("d")
                 esc = True
                 i += 1
                 continue
             out.append(ch)
+            mask.append("s" if quote == "'" else "d")
             i += 1
             continue
         if ch == "#" and at_word_start:
             while i < n and command[i] not in ("\n", "\r"):
                 i += 1
             continue                      # 개행은 다음 회차에서 `;` 가 된다
-        if ch in ("\n", "\r"):
+        if ch == "\n":
             out.append(";")
+            mask.append("u")
             at_word_start = True
             i += 1
             continue
         out.append(ch)
+        mask.append("u")
         at_word_start = ch.isspace() or ch in ";&|()<>"
         i += 1
-    return "".join(out)
+    return "".join(out), "".join(mask)
+
+
+def split_unquoted_newlines(command):
+    """`scan_shell` 의 정리된 명령 문자열만(마스크는 버린다)."""
+    return scan_shell(command)[0]
+
+
+# 인용 밖에서 셸이 **다른 문자열·여러 인자**로 바꿔 버리는 문자들.
+GLOB_CHARS = ("*", "?", "[")
+WORD_BREAK = " \t;&|()<>"
+
+# ★리터럴 표기의 **센티널**(R2 · codex 실증): 셸이 확장하지 **않는** `$`·`~`(작은따옴표 안·
+#   백슬래시 이스케이프)를 토큰화 전에 제어문자로 바꿔 둔다. 그러지 않으면 shlex 가 따옴표를
+#   벗긴 뒤 판정기가 `'$CYS_PACK_DIR/bin/x.py'`·`'~/.cys/pack/bin/x.py'` 를 **확장**해서
+#   설치 팩 판정 도구로 오인한다(실제 bash 는 리터럴 상대경로를 넘긴다 — 동명 사본 실행).
+#   센티널은 `_resolve_pack_token` 의 어떤 패턴과도 일치하지 않으므로 확장이 일어나지 않고,
+#   사람이 보는 문자열로 되돌릴 때만 `_txt` 로 복원한다.
+SENT_DOLLAR = "\x01"
+SENT_TILDE = "\x02"
+SENTINELS = (SENT_DOLLAR, SENT_TILDE)
+
+
+def _txt(tok):
+    """센티널을 원래 문자로 되돌린 **사람이 보는·셸이 넘기는** 문자열."""
+    return str(tok).replace(SENT_DOLLAR, "$").replace(SENT_TILDE, "~")
+
+
+def _has_sentinel(tok):
+    return any(x in str(tok) for x in SENTINELS)
+
+
+def cso_prepare(command):
+    """(prepared|None, err|None) — 토큰화 직전 문자열. 리터럴 `$`·`~` 를 센티널로 바꾼다."""
+    if any(x in (command or "") for x in SENTINELS):
+        return None, ("제어문자(U+0001·U+0002)가 들어 있다 — 판정기의 내부 표기와 충돌하므로 "
+                      "거부한다")
+    cleaned, mask = scan_shell(command)
+    out = []
+    for i, ch in enumerate(cleaned):
+        m = mask[i]
+        if m in ("s", "e") and ch == "$":
+            out.append(SENT_DOLLAR)
+        elif m in ("s", "e") and ch == "~":
+            out.append(SENT_TILDE)
+        else:
+            out.append(ch)
+    return "".join(out), None
+
+
+def _resolve_token(tok, ctx):
+    """확장 **가능한** 표기만 푼다. 리터럴 `$`·`~` 는 그대로 두고 복원한다.
+
+    혼합 토큰(리터럴 + 확장이 한 단어에 섞임)은 효과를 한 값으로 말할 수 없으므로 None 이다.
+    """
+    st = str(tok)
+    if _has_sentinel(st):
+        if "$" in st or st.startswith("~"):
+            return None                   # 혼합 표기 — 판정 불가
+        return _txt(st)
+    return _resolve_pack_token(st, ctx)
+
+
+def cso_expansion_hazard(command):
+    """(err|None) — 판정기가 보는 명령과 셸이 실행하는 명령이 **갈리는** 표기를 잡는다.
+
+    셋 다 같은 이유다(§1-1 '아는 것만 통과'): 값이나 개수를 모르면 효과를 판정할 수 없다.
+      ⓐ **리터럴 `$`**(작은따옴표 안·백슬래시 이스케이프) — 셸은 확장하지 **않는데** 판정기의
+        `_resolve_pack_token` 은 확장한다. 그 갈림이 인터프리터 + `'$CYS_PACK_DIR/bin/x.py'` 를
+        설치 팩 판정 도구로 오인하게 만들었다(codex 실증 · 동명 사본 실행 차단 붕괴).
+      ⓑ **글롭**(`*` `?` `[`) — 셸이 실존 파일 이름으로 바꾼다. `deliver[y]-base.jsonl` 이
+        실제로는 보호 대상 원장 `delivery-base.jsonl` 로 확장됐다(codex 실증).
+      ⓒ **중괄호 확장**(`{a,b}` · `{a..b}`) — 한 토큰이 여러 인자로 늘어난다. 종전 검사는
+        쉼표만 봐서 **범위**(`--{s..s}urface`)를 놓쳤다(codex 실증 · 무승인 사이클).
+      ⓓ **`~+`·`~-`·`~user`** — 판정기가 모르는 틸드 확장(값이 cwd·OLDPWD·타 사용자 홈이다).
+    """
+    cleaned, mask = scan_shell(command)
+    n = len(cleaned)
+    for i, ch in enumerate(cleaned):
+        m = mask[i]
+        if m != "u":
+            continue
+        if ch == "$":
+            # ★확장은 **큰따옴표 안에서만** 인정한다(R2 · codex 실증): 인용 밖 `$VAR` 는 확장
+            #   뒤에 **단어 분리·파일명 확장**을 더 받는다 — 값에 공백이 있으면 판정기가 본
+            #   한 인자가 셸에서는 두 인자가 된다(`CYS_PACK_DIR="/tmp/evil --ignored"`).
+            #   큰따옴표 안에서는 그 두 단계가 일어나지 않으므로 값 하나로 판정할 수 있다.
+            return ("인용 밖 변수 확장 `$…` 는 값이 **단어 분리·파일명 확장**을 더 받는다 — "
+                    "한 인자로 판정할 수 없다. 큰따옴표로 감싸라(`\"$CYS_PACK_DIR/…\"`)")
+        if ch in GLOB_CHARS:
+            return ("글롭 문자 `%s` 는 셸이 **실존 파일 이름으로 바꾼다** — 확장 결과를 판정할 수 "
+                    "없다(보호 대상 파일로 확장될 수 있다). 이름을 그대로 적거나 인용하라" % ch)
+        if ch == "~":
+            prev = cleaned[i - 1] if i else ""
+            nxt = cleaned[i + 1] if i + 1 < n else ""
+            if (not prev or prev in WORD_BREAK) and nxt and nxt not in ("/",) + tuple(WORD_BREAK):
+                return ("틸드 확장 `~%s…` 는 게이트가 값을 알 수 없다(허용 표기는 `~/…` 뿐이다)"
+                        % nxt)
+    # 중괄호 확장: 인용 밖 `{` … `}` 사이에 인용 밖 `,` 또는 `..` 가 있으면 인자가 늘어난다.
+    depth_start = None
+    for i, ch in enumerate(cleaned):
+        if mask[i] != "u":
+            continue
+        if ch == "{":
+            depth_start = i
+        elif ch == "}" and depth_start is not None:
+            inner = cleaned[depth_start + 1:i]
+            inner_mask = mask[depth_start + 1:i]
+            has_comma = any(c == "," and inner_mask[j] == "u" for j, c in enumerate(inner))
+            has_range = any(inner[j:j + 2] == ".." and inner_mask[j:j + 2] == "uu"
+                            for j in range(len(inner) - 1))
+            if has_comma or has_range:
+                return ("중괄호 확장 `{%s}` 은 한 토큰이 여러 인자로 늘어난다 — 늘어난 인자를 "
+                        "판정할 수 없으므로 거부한다(풀어서 적어라)" % inner)
+            depth_start = None
+    return None
 
 
 ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad")
+# ★캐리지 리턴(R2 · codex 실증): bash 에서 CR 은 개행도 구분자도 아닌 **평범한 문자**다.
+#   그래서 `"…/javis_pre\<CR>flight.py"` 는 셸에게 같은 이름의 **다른 파일**이고, 판정기가 그것을
+#   개행처럼 다루면(이어붙이기·경계) 서로 다른 명령을 판정하게 된다 — 실측으로 사본이 실행됐다.
+#   지우지 않고 **거부**한다(영폭 문자와 같은 규칙: 해석이 갈리는 입력은 판정이 아니다).
+DIVERGENT_CHARS = ZERO_WIDTH_CHARS + ("\r",)
 
 
 def has_invisible(command):
-    """영폭·비가시 문자를 포함하는가."""
-    return any(z in (command or "") for z in ZERO_WIDTH_CHARS)
+    """판정과 실행이 갈릴 수 있는 문자(영폭·비가시·CR)를 포함하는가."""
+    return any(z in (command or "") for z in DIVERGENT_CHARS)
 
 
 def _tokenize(command):
@@ -775,6 +1111,7 @@ def bash_has_write(command):
                 # ★값을 먹는 전역 옵션은 **값까지** 건너뛴다 — 그러지 않으면 `git -C /repo reset`
                 #   에서 `/repo` 를 서브커맨드로 보고 검사를 끝낸다(종전 결함 · codex 실증).
                 j = i + 1
+                sub = None
                 while j < n:
                     t = tokens[j]
                     if is_separator(t) or _is_redirect_op(t):
@@ -785,9 +1122,16 @@ def bash_has_write(command):
                     if t.startswith("-"):
                         j += 1
                         continue
-                    if t in GIT_WRITE_SUBS:
-                        return True
+                    sub = t
+                    j += 1
                     break  # 첫 서브커맨드만 본다(읽기 전용이면 통과)
+                if sub is not None:
+                    sub_args = []
+                    while j < n and not is_separator(tokens[j]) and not _is_redirect_op(tokens[j]):
+                        sub_args.append(tokens[j])
+                        j += 1
+                    if git_sub_is_write(sub, sub_args):
+                        return True
             cmd_pos = False
         i += 1
     return False
@@ -795,11 +1139,16 @@ def bash_has_write(command):
 
 # ── CSO 문맥 · 경로 ──────────────────────────────────────────────────────────
 def _norm(p):
-    """비교용 정규화: 절대경로 + 백슬래시→슬래시. Windows 드라이브 문자는 대문자로 접는다.
+    """비교용 정규화: 절대경로 → **realpath**(심링크·junction 해소) + 백슬래시→슬래시.
+    Windows 드라이브 문자는 대문자로 접는다.
 
-    ★한계(정직): symlink·junction 을 따라가지 않는다(realpath 는 없는 파일에서 의미가 흔들리고
-      훅 핫패스에 stat 왕복을 더한다). 같은 uid 로 임의 코드를 돌릴 수 있는 상대에게 파일 기반
-      제어 상태의 무결성을 보장하지 못한다는 근본한계와 같은 층의 한계다.
+    ★심링크를 **따라간다**(R1 blocking · codex 실증 · R2 minor 로 문서 정정): 허용 뿌리 안의
+      링크가 밖을 가리키면 경계가 이름뿐이기 때문이다. 종전 docstring 은 "따라가지 않는다" 고
+      적혀 있었고 본문은 realpath 를 부르고 있었다 — 같은 함수가 정반대 두 계약을 문서화하면
+      다음 독자가 어느 쪽을 불변으로 읽을지 갈린다.
+    ★남는 한계(정직): realpath 는 **판정 시점**의 링크만 해소한다(검사와 사용 사이의 교체는
+      막지 못한다). 같은 uid 로 임의 코드를 돌릴 수 있는 상대에게 파일 기반 제어 상태의
+      무결성을 보장하지 못한다는 근본한계와 같은 층이다.
     """
     if p is None:
         return ""
@@ -924,8 +1273,11 @@ def cso_path_allowed(path, ctx):
     if _is_gate_state_path(path):
         return False, "게이트 제어 상태(예산 카운터·역할 캐시)는 쓰기 대상이 아니다"
     if _is_protected_state_path(path, ctx):
-        return False, ("데몬 소유 상태(배달 원장·부트·미션·게이트 대장)는 허용 뿌리 안이라도 "
-                       "쓰기 대상이 아니다 — 집행 대상은 자기 집행 상태를 고치지 않는다")
+        return False, ("`~/.cys/state/` 아래에서 CSO 가 쓸 수 있는 것은 자기 작업 트리"
+                       "(`<state>/cso/**`)와 `<state>` 바로 아래의 자기 소유 상태 파일"
+                       "(`CSO_*`·`SESSION_STATE*`)뿐이다 — 나머지(원장·부트·미션·formation·"
+                       "report_gate*·부서 티켓·learn·집행 지문)는 데몬·도구 소유이고 집행 대상은 "
+                       "자기 집행 상태를 고치지 않는다")
     round_root = os.path.join(ctx.pack, "round")
     if _under(path, round_root):
         if is_cso_state_file(path):
@@ -1011,28 +1363,34 @@ def cso_split(command, ctx=None):
                                 "값을 먼저 구해 인자로 넣어라" % m)
     ctx = Ctx() if ctx is None else ctx      # 변수 표기 해소에 문맥이 필요하다
     if has_invisible(command):
-        return None, None, ("영폭·비가시 문자가 들어 있다 — 판정기가 보는 명령과 셸이 실행하는 "
-                            "명령이 달라질 수 있어 거부한다(지워서 읽지 않는다)")
-    tokens = _tokenize(split_unquoted_newlines(command))
+        return None, None, ("영폭·비가시 문자 또는 캐리지 리턴(CR)이 들어 있다 — 판정기가 보는 "
+                            "명령과 셸이 실행하는 명령이 달라질 수 있어 거부한다"
+                            "(지워서 읽지 않는다 · CR 은 bash 에서 개행이 아니라 평범한 문자다)")
+    # ★셸 확장 위험(R2 blocking · codex 실증): 리터럴 `$`·글롭·중괄호 확장·틸드 확장은
+    #   **토큰화 뒤에는 보이지 않는다**(shlex 가 따옴표를 벗기고, 글롭·중괄호는 셸이 나중에 편다).
+    #   그래서 인용 상태를 아는 스캐너로 **토큰화 전에** 잰다.
+    _hz = cso_expansion_hazard(command)
+    if _hz:
+        return None, None, _hz
+    prepared, _perr = cso_prepare(command)
+    if _perr:
+        return None, None, _perr
+    tokens = _tokenize(prepared)
     if tokens is None:
         return None, None, "셸 파싱 불가(따옴표 불일치 등) — 해석 불가는 거부다"
     # ★변수 확장은 **지침이 쓰는 유한한 표기**만 통과한다(R1 · codex 실증):
     #   `${IFS}` 는 단어를 쪼개 새 인자를 만들고(`cys send --to master ${IFS}--surface${IFS}7`),
     #   경로 안의 확장은 보호 파일명 검사를 통째로 비껴간다(`.../state/${IFS}mission.json`).
     #   명령 치환과 같은 이유다: 값을 모르면 효과를 판정할 수 없다.
-    for t in tokens:
-        if "$" in str(t) and _resolve_pack_token(t, ctx) is None:
-            return None, None, ("변수 확장 `%s` 는 게이트가 값을 알 수 없다 — 허용 표기는 "
-                                "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` "
-                                "뿐이다(값을 먼저 구해 인자로 넣어라)" % t)
-    # 중괄호 확장은 **하나의 토큰이 여러 인자로 늘어난다** — 늘어난 인자를 판정하지 못한다.
+    #   ★리터럴 표기(센티널)는 확장 대상이 아니므로 **본문으로 통과**한다 — `cys send --to master
+    #     '설정에서 $HOME 을 확인했다'` 같은 정상 보고를 막지 않는다(R2 · codex 오탐 지적).
     for t in tokens:
         st = str(t)
-        if "{" in st and "}" in st and "," in st and st.index("{") < st.rindex("}"):
-            inner = st[st.index("{") + 1:st.rindex("}")]
-            if "," in inner and not inner.strip().startswith('"'):
-                return None, None, ("중괄호 확장 `%s` 은 한 토큰이 여러 인자로 늘어난다 — "
-                                    "늘어난 인자를 판정할 수 없으므로 거부한다(풀어서 적어라)" % st)
+        if ("$" in st or _has_sentinel(st)) and _resolve_token(t, ctx) is None:
+            return None, None, ("변수 표기 `%s` 는 게이트가 값을 알 수 없다 — 허용 표기는 "
+                                "`\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"`·`\"$CYS_PACK_DIR\"`·"
+                                "`\"$HOME\"`·`~/…` 뿐이다(리터럴과 확장을 한 단어에 섞지 마라)"
+                                % _txt(st))
     segs, cur, redirects = [], [], []
     i, n = 0, len(tokens)
     while i < n:
@@ -1071,6 +1429,10 @@ def cso_split(command, ctx=None):
     return segs, redirects, None
 
 
+_VAR_PACK_RE = re.compile(r"\$CYS_PACK_DIR(?![A-Za-z0-9_])")
+_VAR_HOME_RE = re.compile(r"\$HOME(?![A-Za-z0-9_])")
+
+
 def _resolve_pack_token(tok, ctx):
     """지침이 쓰는 **유한한** 변수 표기만 결정론으로 푼다(셸 확장 실행 0).
 
@@ -1080,8 +1442,13 @@ def _resolve_pack_token(tok, ctx):
     s = str(tok or "")
     s = s.replace("${CYS_PACK_DIR:-$HOME/.cys/pack}", ctx.pack)
     s = s.replace("${CYS_PACK_DIR:-${HOME}/.cys/pack}", ctx.pack)
-    s = s.replace("${CYS_PACK_DIR}", ctx.pack).replace("$CYS_PACK_DIR", ctx.pack)
-    s = s.replace("${HOME}", ctx.home).replace("$HOME", ctx.home)
+    s = s.replace("${CYS_PACK_DIR}", ctx.pack)
+    s = s.replace("${HOME}", ctx.home)
+    # ★변수 이름은 **경계까지** 대조한다(R2 · codex 실증): 종전 `replace("$CYS_PACK_DIR", …)` 는
+    #   `$CYS_PACK_DIR_SUFFIX` 의 **접두**까지 바꿔 판정기를 설치 팩으로 정규화시켰다 —
+    #   실제 셸은 전혀 다른 변수를 확장한다(임의 사본 실행). 뒤에 이름 문자가 오면 다른 변수다.
+    s = _VAR_PACK_RE.sub(lambda _m: ctx.pack, s)
+    s = _VAR_HOME_RE.sub(lambda _m: ctx.home, s)
     if s.startswith("~/") or s == "~":
         s = ctx.home + s[1:]
     if "$" in s:
@@ -1111,7 +1478,7 @@ def _py_segment_verdict(tokens, ctx):
         break
     if script is None:
         return False, "실행할 스크립트가 없다(대화형 python 은 경계 밖)", False
-    resolved = _resolve_pack_token(script, ctx)
+    resolved = _resolve_token(script, ctx)
     if resolved is None:
         return False, ("스크립트 경로의 변수를 해소할 수 없다 — 허용 표기는 "
                        "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` 뿐이다"), False
@@ -1130,7 +1497,25 @@ def _py_segment_verdict(tokens, ctx):
             return False, ("`%s %s` 는 변이 경로다 — 조회 모드만 허용(argparse 접두 축약도 "
                            "같은 플래그다)" % (base, bad)), False
     allowed_subs = CSO_PY_TOOLS[base]
-    sub = next((a for a in args if not a.startswith("-")), None)
+    # ★값을 먹는 옵션의 **값**은 하위 명령이 아니다(R2 major · codex 실증):
+    #   `javis_preflight.py --skip C12.daemon` 은 정상 읽기 전용 호출인데 `C12.daemon` 을
+    #   하위 명령으로 읽어 deny 했다(예산과 무관한 상시 오탐). 변이 플래그 검사(`_arg_hits_deny`)는
+    #   **값 건너뛰기 전에** 전 인자를 이미 훑었으므로 `--skip --fix` 같은 위장은 여전히 막힌다.
+    _vo = CSO_PY_VALUE_OPTS.get(base, ())
+    sub, _skip_next = None, False
+    for a in args:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if a.startswith("-"):
+            # ★argparse 는 **접두 축약**을 받는다(`--sk` = `--skip` · codex 실측). 정확 철자만
+            #   값 옵션으로 보면 축약형에서 그 값이 하위 명령으로 오인돼 정상 진단이 거부된다.
+            #   축약 판정은 변이 플래그 검사와 **같은 술어**를 쓴다(축 1지점).
+            if any(_arg_hits_deny(a, o) for o in _vo):
+                _skip_next = "=" not in a
+            continue
+        sub = a
+        break
     if allowed_subs is not None:
         if sub is None and not allowed_subs:
             pass                          # 하위 명령을 받지 않는 도구 — 플래그만 검사한다
@@ -1153,7 +1538,23 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
     #   `cys send -- "--to=master"` 를 수신자 지정으로 오인한다(수신자 없는 send 통과).
     raw_args = tokens[1:]
     args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args
-    verb = next((t for t in args if not t.startswith("-")), None)
+    # ★동사 **앞**의 옵션은 전역 옵션이고, 값을 먹는 전역 옵션은 그 **값**이 동사로 오인된다
+    #   (R2 blocking · codex 실증: `cys --socket status kill 7` 이 `cys status` 로 읽혀
+    #   무승인·예산 면제로 통과했다 — 실제 동사는 `kill` 이다). git 전역 옵션과 **같은 규칙**으로
+    #   CSO 경로에서는 전역 옵션 자체를 거부한다(동사를 먼저 적으면 되므로 좁혀도 잃는 것이 없다).
+    for a in args:
+        if any(a == t or a.startswith(t + "=") for t in CSO_CYS_TARGET_OPTS):
+            return False, ("`cys %s` 는 대상 데몬을 바꾼다 — 판정 문맥(자기 데몬)과 실행 대상이 "
+                           "갈리면 역할·승인·예산이 다른 데몬에 걸린다(어느 자리에 있어도 deny)"
+                           % a), False
+    verb = None
+    for a in args:
+        if a.startswith("-"):
+            return False, ("`cys` 는 동사가 **바로 뒤에** 와야 한다 — 전역 옵션 `%s` 는 값을 먹을 수 "
+                           "있어 그 값이 동사로 오인된다(`cys --socket status kill 7`). "
+                           "동사를 먼저 적어라" % a), False
+        verb = a
+        break
     if verb is None:
         return False, "`cys` 동사 없음(옵션 종료 `--` 뒤는 본문이다)", False
     if verb in CSO_CYS_DENY_VERBS:
@@ -1177,9 +1578,9 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
         tos = []
         for j, a in enumerate(args):
             if a == "--to":
-                tos.append(args[j + 1] if j + 1 < len(args) else "")
+                tos.append(_txt(args[j + 1]) if j + 1 < len(args) else "")
             elif a.startswith("--to="):
-                tos.append(a[5:])
+                tos.append(_txt(a[5:]))
         if not tos:
             return False, "`cys send` 는 수신자를 명시해야 한다(`--to master`)", False
         if any(t != "master" for t in tos):
@@ -1195,10 +1596,19 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
                                                "read-screen", "todo-path")
     if verb in CSO_CYS_SUBVERBS:
         rest = args[args.index(verb) + 1:]
-        sub = next((a for a in rest if not a.startswith("-")), None)
+        # ★하위 명령은 동사 **바로 뒤에** 와야 한다(R2 blocking · codex 실증):
+        #   `cys queue --socket list deliver 7` 은 `--socket` 의 **값**이 `list` 라서 실제
+        #   하위 명령은 `deliver` 인데 판정기는 `queue list` 로 읽었다. 값을 먹는 옵션의
+        #   목록을 완전히 알 수 없으므로 옵션이 끼어들면 판정하지 않는다(아는 것만 통과).
+        sub = rest[0] if rest else None
+        if sub is not None and sub.startswith("-"):
+            return False, ("`cys %s` 의 하위 명령은 동사 **바로 뒤에** 와야 한다 — 옵션이 먼저 "
+                           "오면 그 값이 하위 명령으로 오인된다(`cys queue --socket list deliver`)"
+                           % verb), False
         if sub in CSO_CYS_SUBVERBS[verb]:
             # 관측(queue/feed list)과 오너 채널 상신(feed push)은 사이클 절차의 일부다.
-            return True, "cys %s %s" % (verb, sub), True
+            # `queue clear` 는 허용이지만 **면제는 아니다**(변이 · 위 표 참조).
+            return True, "cys %s %s" % (verb, sub), (verb, sub) in CSO_CYS_SUBVERB_ESSENTIAL
         return False, ("`cys %s %s` 는 허용 서브동사가 아니다 — 허용: %s"
                        % (verb, sub, "|".join(sorted(CSO_CYS_SUBVERBS[verb])))), False
     if verb in CSO_CYS_TTL_VERBS:
@@ -1257,7 +1667,11 @@ def _ro_segment_verdict(tokens, ctx):
         #   ⓐ`shasum -a 256 <path>` 의 `256` 은 옵션 **값**이지 대상이 아니다 → 옵션 값을 건너뛴다.
         #   ⓑ`cat <state> notes.txt` 의 상대 파일도 대상이다 → '슬래시가 있는 것만' 이라는
         #     종전 규칙은 무관한 파일을 면제에 태웠다. 이제 **모든** 비-옵션 인자를 본다.
-        VALUE_OPTS = ("-a", "-n", "-c", "--algorithm", "--lines", "--bytes")
+        # ★값을 먹는 옵션은 **명령마다 다르다**(R2 blocking · codex 실증): `stat -f %z <파일>`
+        #   의 `%z` 는 포맷 옵션 값인데 종전 표에 `-f` 가 없어 **무관한 대상 파일**로 세어졌고,
+        #   그래서 macOS 의 정상 최신성·크기 검증이 예산 소진 뒤 전부 deny 됐다(봉인표 ②:
+        #   독립 검증이 불가능하면 올바른 CSO 는 clear 를 보류한다).
+        VALUE_OPTS = CSO_TARGET_VALUE_OPTS.get(base, CSO_TARGET_VALUE_OPTS_DEFAULT)
         paths, skip = [], False
         for a in args:
             if skip:
@@ -1269,7 +1683,7 @@ def _ro_segment_verdict(tokens, ctx):
                 continue
             paths.append(a)
         if paths:
-            essential = all(is_cycle_evidence_file(_resolve_pack_token(q, ctx) or q, ctx)
+            essential = all(is_cycle_evidence_file(_resolve_token(q, ctx) or _txt(q), ctx)
                             for q in paths)
         else:
             # 인자 없음 = **파이프 입력**(`cys read-screen … | shasum -a 256`). 증거 해시 계산은
@@ -1281,9 +1695,9 @@ def _ro_segment_verdict(tokens, ctx):
 def _seg_command(seg):
     """세그먼트 토큰을 다시 명령 문자열로. 승인 조회의 대상은 **그 세그먼트**여야 한다."""
     try:
-        return " ".join(shlex.quote(str(t)) for t in seg)
+        return " ".join(shlex.quote(_txt(t)) for t in seg)
     except (TypeError, ValueError):
-        return " ".join(str(t) for t in seg)
+        return " ".join(_txt(t) for t in seg)
 
 
 def cso_bash_verdict(command, ti, ctx):
@@ -1301,6 +1715,7 @@ def cso_bash_verdict(command, ti, ctx):
             continue
         if target.isdigit() and _is_fd_dup_op(op):
             continue      # `2>&1` 류 fd 복제만 숫자 대상을 허용한다(`> 1` 은 파일이다)
+        target = _txt(target)
         ok, why = cso_path_allowed(target, ctx)
         if not ok:
             return True, "출력 리다이렉트 대상 %r: %s" % (target, why), False
@@ -1313,10 +1728,18 @@ def cso_bash_verdict(command, ti, ctx):
     reasons = []
     n_segs = len(segs)
     for seg in segs:
-        raw_head = str(seg[0])
+        raw_head = _txt(seg[0])
         # ★이름으로 부른다(R1 · codex): 판정이 basename 으로 접두를 고르므로 `/tmp/cys status`·
         #   `./git status`·`/w/tmp/python3 <pack-script>` 처럼 **다른 실행 파일**이 허용 목록의
         #   이름만 빌려 통과할 수 있었다. 경로 지정 실행은 접두 목록 밖이다(PATH 해소만 허용).
+        # ★선행 환경 할당(`VAR=값 명령`)은 **도구가 보는 문맥**을 바꾼다 — `CYS_PACK_DIR=/tmp/evil
+        #   <인터프리터> <pack>/bin/x.py` 처럼 판정기가 신뢰한 팩과 도구가 읽는 팩을 갈라 놓는다.
+        #   종전에도 결과는 deny 였지만(값에 `/` 가 있어 '경로 지정 실행'으로 걸렸다) 사유가
+        #   사실과 달랐고, 값에 `/` 가 없으면(`CYS_ROLE=master cys status`) 새어 나갔다.
+        _eqh = raw_head.split("=", 1)[0]
+        if "=" in raw_head and _eqh and _eqh.replace("_", "").isalnum() and not _eqh[0].isdigit():
+            return True, ("선행 환경 할당 `%s` 은 명령이 보는 문맥(팩·역할·소켓)을 바꾼다 — "
+                          "CSO 경계 밖이다(값을 바꾸려면 승인을 받아라)" % raw_head), False
         if "/" in raw_head or "\\" in raw_head:
             return True, ("경로 지정 실행 `%s` 는 접두 목록 밖이다 — 명령은 **이름으로** 부른다"
                           "(같은 이름의 사본은 그 명령이 아니다)" % raw_head), False
@@ -1426,19 +1849,79 @@ def bump_tool_calls(key, root):
     p = os.path.join(d, key + ".calls")
     try:
         os.makedirs(d, exist_ok=True)
-        with open(p, "ab") as f:
-            f.write(b"\x01")
-        n = os.path.getsize(p)
     except OSError:
         return None
-    if not isinstance(n, int) or n <= 0:
+    # ★심링크는 **열기 전에** 끊는다(R2 · codex 실증): `<key>.calls → /repo/src/a.rs` 인 상태에서
+    #   append 하면 보호 대상 파일에 `\x01` 을 쓴 뒤에야 손상을 알아챈다. POSIX 는 `O_NOFOLLOW`
+    #   로 커널이 거부하게 하고(경합 없음), 그 플래그가 없는 플랫폼은 사전 검사로 강등한다.
+    try:
+        if os.path.islink(p):
+            _quarantine_counter(p)
+            return None
+    except OSError:
+        return None
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        fd = os.open(p, flags, 0o600)
+    except OSError:
+        return None
+    # ★같은 fd 에서 쓰고 읽는다(R2 · codex 경합 지적): 경로를 다시 열면 그 사이의 격리·재생성으로
+    #   **다른 파일**의 크기를 읽는다. `O_APPEND` 는 쓰기에만 걸리므로 읽기 오프셋은 자유롭다.
+    try:
+        os.write(fd, b"\x01")
+        os.lseek(fd, 0, os.SEEK_SET)
+        body = b""
+        while len(body) <= COUNTER_MAX_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            body += chunk
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    # ★크기만 읽으면 **내용이 계수인지** 모른다(R2 blocking · codex 실증: `X`*1999 로 손상된
+    #   파일이 2000 을 돌려줘 경고 선행 없이 즉시 예산 deny 가 났다). 형식은 `\x01` 의 반복이고,
+    #   그 밖의 바이트가 하나라도 있으면 그것은 **계수가 아니다** — 결측은 값이 아니므로
+    #   `None`(예산 판정 없음)이다. 손상 파일은 지우지 않고 **옆으로 치운다**(증거 보존).
+    if len(body) > COUNTER_MAX_BYTES or body.strip(b"\x01"):
+        _quarantine_counter(p)
+        return None
+    n = len(body)
+    if n <= 0:
         return None
     if n == 1:
         _gc_stale_counters(d)     # 새 세션이 열릴 때만 — 핫패스에 listdir 을 얹지 않는다
     return n
 
 
+def _quarantine_counter(p):
+    """손상·링크 카운터를 `<이름>.corrupt` 로 치운다(삭제가 아니라 격리 — 증거를 남긴다).
+
+    ★정직한 한계: 격리는 그 세션의 계수를 0 으로 되돌린다(과소 계수 = 통과 방향). 매 호출마다
+      손상을 다시 만들 수 있는 상대는 예산을 영원히 '계수 불능'에 묶을 수 있다 — 파일 기반
+      제어 상태의 근본한계와 같은 층이다(게이트는 이 경로를 CSO·reviewer 쓰기에서 이미 막는다).
+    """
+    try:
+        os.replace(p, p + ".corrupt")
+    except OSError:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
 COUNTER_GC_AGE_S = 7 * 24 * 3600
+# 계수 파일의 형식 상한 — 이 이상이면 형식 위반이다(정상 세션은 수천 바이트다).
+COUNTER_MAX_BYTES = 1 << 20
 
 
 def _gc_stale_counters(d):
@@ -1450,7 +1933,7 @@ def _gc_stale_counters(d):
         now = time.time()
         for name in os.listdir(d):
             if not (name.endswith(".calls") or name.endswith(".warned")
-                    or name.endswith(".count")):
+                    or name.endswith(".count") or name.endswith(".corrupt")):
                 continue
             fp = os.path.join(d, name)
             try:
@@ -1655,39 +2138,75 @@ def emit_deny(reason):
 
 
 def _read_hook_input():
-    """훅 stdin 전문. **파일 경로 우선**(큰 Write 본문이 env 크기 상한에 걸려 판정 코드에
-    도달조차 못 하는 경로를 없앤다 — codex: 64KB 검사가 큰 쓰기 때문에 시작하지 못했다)."""
-    p = os.environ.get("CAPGATE_INPUT_FILE")
-    if p:
+    """(전문, 출처) — 훅 stdin. **파일 경로 우선**(큰 Write 본문이 env 크기 상한에 걸려 판정
+    코드에 도달조차 못 하는 경로를 없앤다 — codex: 64KB 검사가 큰 쓰기 때문에 시작하지 못했다).
+
+    ★출처를 함께 돌려준다(R2 major · claude 리뷰어): 종전에는 파일 open 실패가 빈 문자열로
+      강등돼 `json.loads("")` ValueError → **reviewer/planner 가 매 도구 호출마다 exit 2** 였다.
+      그 실패는 하네스의 악의 입력이 아니라 **우리 배관**(cygpath 부재·경로 변환 어긋남)의
+      실패다 — 두 사실을 같은 판정으로 접으면 오탐의 귀결이 좌석 사망이 된다(§3-3).
+      `"none"` 은 '판독 불능'이고 `"file"`/`"env"` 는 '읽었다' 다. 결측은 값이 아니다.
+    """
+    paths = [q for q in (os.environ.get("CAPGATE_INPUT_FILE"),
+                         os.environ.get("CAPGATE_INPUT_TMP")) if q]
+    text = None
+    for q in paths:                 # 변환 경로 → POSIX 원본 순으로 **두 번** 시도한다
         try:
-            with open(p, "r", encoding="utf-8", errors="surrogateescape") as f:
-                return f.read()
+            with open(q, "r", encoding="utf-8", errors="surrogateescape") as f:
+                text = f.read()
+            break
         except OSError:
-            return ""
-        finally:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-    return os.environ.get("CAPGATE_INPUT", "")
+            continue
+    for q in paths:                 # ★어느 쪽을 읽었든 **둘 다** 지운다(`exec` 뒤 trap 은 없다)
+        try:
+            os.unlink(q)
+        except OSError:
+            pass
+    if text is not None:
+        return text, "file"
+    env = os.environ.get("CAPGATE_INPUT")
+    if env:
+        return env, "env"           # 셸이 소용량 입력을 env 로도 실어 준다(인계 실패 흡수)
+    if paths:
+        return "", "none"           # 파일 인계가 있었는데 열지 못했다 = 판독 불능
+    return "", "none"
 
 
 def main():
-    raw = _read_hook_input()
+    raw, src = _read_hook_input()
     role = os.environ.get("CYS_SURFACE_ROLE", "")
+    # ★판독 불능의 갈래를 **문면으로** 가른다(R2 · 두 리뷰어):
+    #   ⓐ`none` = 우리 배관 실패(임시파일 인계 실패 · env 폴백도 없음). Windows 에서 cygpath 가
+    #     없을 때 재현되며, 종전에는 reviewer 가 **매 도구 호출마다** exit 2 로 벽돌이 됐다.
+    #     이제 셸이 소용량(≤64KB) 입력을 env 로도 실어 주므로 이 갈래는 **대용량 입력**에서만
+    #     남는다 — 그때 통과시키면 reviewer 의 대형 Write 가 무검사로 나간다(codex: 배관 실패가
+    #     권한 확대가 되면 안 된다). 그래서 판정 불능의 종전 계약을 **그대로** 지킨다:
+    #     reviewer/planner 는 fail-closed(exit 2) · CSO 는 강등(exit 0 · 좌석 사망 금지).
+    #   ⓑ스키마 오류(비-object · `tool_name` 결측)도 판정 불능이다 — '도구 없음 = 허용' 으로
+    #     접으면 결측을 값으로 읽는 것이다(codex).
+    def _undecidable(why, hard=True):
+        if hard and is_reviewer_or_planner(role):
+            print("role-capability-gate: %s — failing closed (reviewer/planner)" % why,
+                  file=sys.stderr)
+            sys.exit(2)
+        print("role-capability-gate: %s — 게이트 강등(집행 0)" % why, file=sys.stderr)
+        sys.exit(0)
+
+    if src == "none":
+        _undecidable("훅 입력 인계 실패(임시파일·env 둘 다 판독 불가 — TMPDIR·cygpath 확인)")
     try:
         data = json.loads(raw)
     except ValueError:
-        # JSON 파싱 실패 — reviewer면 fail-closed. CSO 는 강등(전 도구 차단 = 좌석 사망).
-        if is_reviewer_or_planner(role):
-            print("role-capability-gate: malformed hook JSON — failing closed (reviewer)", file=sys.stderr)
-            sys.exit(2)
-        if is_cso(role):
-            print("role-capability-gate: 훅 입력 판독 불가 — CSO 게이트 강등(집행 0)", file=sys.stderr)
-        sys.exit(0)
+        _undecidable("훅 입력 JSON 파싱 실패")
+    # ★스키마 갈래는 **강등**이다(hard=False): 이 페이로드는 하네스가 만든다(에이전트가 아니다).
+    #   필드 이름이 바뀐 하네스 버전에서 reviewer 를 매 호출 exit 2 로 죽이면 그것이 봉인표 ④다.
+    #   그렇다고 조용히 통과시키지도 않는다 — 결측을 '도구 없음=허용' 으로 접지 않고 loud 하게
+    #   알린 뒤 집행 0 으로 내려간다(codex R2 와 §3-3 을 함께 지키는 유일한 지점).
     if not isinstance(data, dict):
-        sys.exit(0)
+        _undecidable("훅 입력이 객체가 아니다", hard=False)
     tool = data.get("tool_name") or data.get("tool") or ""
+    if not isinstance(tool, str) or not tool.strip():
+        _undecidable("훅 입력에 `tool_name` 이 없다(하네스 스키마 불일치)", hard=False)
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
     # 역할 후보 — 데몬 조회가 실패해 캐시와 env 가 갈리면 셸이 둘을 넘긴다(교집합 판정).
     alt = (os.environ.get("CAPGATE_ROLE_ALT", "") or "").strip()
@@ -2331,10 +2850,273 @@ def self_test_r1(fails):
     return fails
 
 
+def self_test_r2(fails):
+    """★R2(리뷰 반영 2차) 반례 배터리 — 리뷰어 둘이 **실증**한 우회·오탐을 하나씩 고정한다."""
+    PACK, HOME, STATE = "/w/pack", "/w/home", "/w/home/.cys/state"
+    FILES = {
+        PACK + "/round/CSO_TODO.md": "x" * 60000,
+        PACK + "/round/SESSION_STATE.md": "s",
+        PACK + "/round/MASTER_TODO.md": "m",
+    }
+
+    def reader(p):
+        return FILES.get(_norm(p))
+
+    def ctx(tool_calls=None, approver=lambda c: False):
+        return Ctx(pack=PACK, state=STATE, home=HOME, tool_calls=tool_calls,
+                   approver=approver, reader=reader, tempdir="/w/tmp")
+
+    def want(deny, tool, ti, label, c=None, role="cso"):
+        b, r = decide(tool, ti, role, c if c is not None else ctx())
+        if b != deny:
+            fails.append("R2[%s]: 기대 %s 인데 %s (%s)"
+                         % (label, "deny" if deny else "allow", "deny" if b else "allow", r))
+
+    def rv(deny, cmd, label, role="reviewer-codex"):
+        b, r = decide("Bash", {"command": cmd}, role)
+        if b != deny:
+            fails.append("R2[%s]: `%s` 기대 %s 인데 %s (%s)"
+                         % (label, cmd, "deny" if deny else "allow", "deny" if b else "allow", r))
+
+    # ① 중괄호 **범위** 확장(codex blocking — 종전 검사는 쉼표만 봤다)
+    want(True, "Bash", {"command": "cys cycle-agent --{s..s}urface 7"}, "중괄호 범위 --surface")
+    want(True, "Bash", {"command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/'
+                                   'javis_preflight.py" --{f..f}ix'}, "중괄호 범위 --fix")
+    want(False, "Bash", {"command": "cys send --to master 'a{b..c}d 는 본문이다'"},
+         "인용 안 중괄호는 확장이 아니다")
+
+    # ② 글롭(codex blocking — `deliver[y]-base.jsonl` 이 실존 원장으로 확장됐다)
+    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/deliver[y]-base.jsonl"},
+         "글롭 `[` 로 원장 절단")
+    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/deliver?-base.jsonl"},
+         "글롭 `?`")
+    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/*.jsonl"}, "글롭 `*`")
+    want(False, "Bash", {"command": "rg --glob='*.json' pat /w/home/.cys/state"},
+         "인용된 글롭은 도구 자신의 문법이다")
+    want(False, "Bash", {"command": "grep -rn pat ."}, "글롭 문자가 없는 재귀 검색")
+    # ★글롭 검사만이 막는 자리(다른 검사가 대신 막으면 음성 대조가 공허해진다)
+    want(True, "Bash", {"command": "cat /w/pack/round/*.md"}, "허용 명령·허용 경로의 글롭 인자")
+    want(True, "Bash", {"command": "cys status > /w/tmp/o*.log"}, "허용 뿌리 안의 글롭 대상")
+
+    # ③ 리터럴 `$`·`~`(codex blocking — 판정기만 확장해 동명 사본을 판정 도구로 오인했다)
+    want(True, "Bash", {"command": "python3 '$CYS_PACK_DIR/bin/javis_preflight.py' --self-test"},
+         "작은따옴표 안 리터럴 `$` 경로")
+    want(True, "Bash", {"command": "python3 '~/.cys/pack/bin/javis_orchestra.py' check"},
+         "작은따옴표 안 리터럴 `~` 경로")
+    want(True, "Bash", {"command": "python3 \\~/.cys/pack/bin/javis_orchestra.py check"},
+         "백슬래시 이스케이프된 `~`")
+    want(False, "Bash", {"command": "cys send --to master '설정에서 $HOME 을 확인했다'"},
+         "리터럴 `$` 는 **본문**이다(오탐 금지)")
+    want(False, "Bash", {"command": "grep -n '^ctx$' /w/log"}, "정규식 안의 `$`")
+
+    # ④ 변수 이름 경계 · 인용 밖 확장(codex blocking)
+    want(True, "Bash", {"command": 'python3 "$CYS_PACK_DIR_SUFFIX/../pack/bin/'
+                                   'javis_orchestra.py" check'}, "변수 이름 접두 치환")
+    want(True, "Bash", {"command": "python3 $CYS_PACK_DIR/bin/javis_orchestra.py check"},
+         "인용 밖 확장(단어 분리)")
+    want(False, "Bash", {"command": 'python3 "$CYS_PACK_DIR/bin/javis_orchestra.py" check'},
+         "큰따옴표 안 확장은 한 인자다")
+    # ★큰따옴표 안이라 확장 하자드는 통과하고 **토큰 해소**만이 막는 자리(R1 ${IFS} 의 인용판)
+    want(True, "Bash", {"command": 'cys status > "/w/home/.cys/state/${IFS}mission.json"'},
+         "인용 안 미지 변수는 값 미상")
+    want(True, "Bash", {"command": 'cys send --to master "${IFS}--surface 7"'},
+         "인용 안 미지 변수 본문")
+
+    # ⑤ `cys` 전역 옵션·대상 소켓(codex blocking — 동사 오인 · 대상 데몬 교체)
+    want(True, "Bash", {"command": "cys --socket status kill 7"}, "전역 옵션이 동사를 가린다")
+    want(True, "Bash", {"command": "cys queue --socket list deliver 7"},
+         "하위 명령 앞 옵션이 하위 명령을 가린다")
+    want(True, "Bash", {"command": "cys cycle-agent --socket /w/tmp/o.sock --role master"},
+         "대상 데몬 교체")
+    want(False, "Bash", {"command": "cys queue list"}, "정상 하위 명령")
+    # ★`--socket` 이 아닌 옵션이라 대상 옵션 규칙이 아니라 **자리 규칙**만이 막는다
+    want(True, "Bash", {"command": "cys queue --json list"}, "하위 명령 앞 임의 옵션")
+
+    # ⑥ `stat` 포맷 옵션(codex blocking — macOS 정상 검증이 예산 소진 뒤 막혔다)
+    over = ctx(tool_calls=BUDGET_DENY)
+    want(False, "Bash", {"command": "stat -f %z /w/pack/round/MASTER_TODO.md"},
+         "BSD stat -f 는 포맷 값이다", c=over)
+    want(False, "Bash", {"command": "stat -f %m /w/pack/round/MASTER_TODO.md"},
+         "BSD stat -f %m", c=over)
+    want(False, "Bash", {"command": "stat -c %s /w/pack/round/MASTER_TODO.md"},
+         "GNU stat -c", c=over)
+    want(False, "Bash", {"command": "stat --format=%s /w/pack/round/MASTER_TODO.md"},
+         "GNU --format=", c=over)
+    want(True, "Bash", {"command": "stat -f %z /w/other/x"}, "무관한 파일은 면제 아님", c=over)
+
+    # ⑦ 팩 도구의 **값 옵션**(codex major — 정상 진단이 하위 명령 오인으로 거부됐다)
+    want(False, "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --skip C12.daemon"},
+         "--skip 의 값은 하위 명령이 아니다")
+    want(False, "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --skip=C12.daemon"},
+         "--skip= 형태")
+    want(True, "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --skip --fix"},
+         "값 자리에 숨긴 변이 플래그")
+    want(False, "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --sk C12.daemon"},
+         "argparse 접두 축약 값 옵션(`--sk` = `--skip`)")
+    want(True, "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --sk --fi"},
+         "축약 값 옵션 뒤에 숨긴 축약 변이 플래그")
+
+    # ⑧ `<state>` 는 **허용 목록**이다(claude major — 레인 접미·후발 디렉터리를 놓쳤다)
+    for rel, label in ((("report_gate-dept-1/x.json"), "레인 접미 report_gate"),
+                       ("report_gate/x.json", "report_gate"),
+                       ("learn/x.json", "learn"),
+                       ("preflight-c03-fingerprint.json", "집행 지문"),
+                       ("chrome-automation/x.json", "chrome-automation"),
+                       ("selfdiag-0.14.30/x.json", "selfdiag")):
+        want(True, "Write", {"file_path": STATE + "/" + rel, "content": "{}"},
+             "state 허용목록: " + label)
+    want(False, "Write", {"file_path": STATE + "/cso/notes.md", "content": "x"},
+         "state 자기 작업 트리")
+    want(False, "Write", {"file_path": STATE + "/CSO_SCRATCH.md", "content": "x"},
+         "state 바로 아래 자기 소유 상태 파일")
+    want(True, "Bash", {"command": "cat /w/x > /w/home/.cys/state/learn/a.json"},
+         "state 허용목록: 셸 리다이렉트도 같은 판정")
+
+    # ⑨ 변이 서브동사는 예산 **면제**가 아니다(claude minor)
+    want(False, "Bash", {"command": "cys queue clear 12"}, "queue clear 는 예산 안에서 허용")
+    want(True, "Bash", {"command": "cys queue clear 12"}, "queue clear 는 예산 면제가 아니다",
+         c=over)
+    want(False, "Bash", {"command": "cys feed push --title t --body b"},
+         "feed push 는 교착 출구라 면제다(§1-2 ⑤)", c=over)
+
+    # ⑩ 승인의 **세그먼트 범위**와 복합 실행 금지(음성 대조가 실제로 잡도록 짝을 만든다)
+    want(False, "Bash", {"command": "cys close-surface 17 > /w/tmp/o.log"},
+         "승인 대상은 리다이렉트를 뺀 **그 세그먼트**다",
+         c=ctx(approver=lambda c: c == "cys close-surface 17"))
+    want(True, "Bash", {"command": "cys kill 12 ; cys kill 13"},
+         "전부 승인돼도 복합 실행은 금지다", c=ctx(approver=lambda c: True))
+
+    # ⑩-1 CR·cargo --config 실행기 주입(codex 실측 — 실제로 사본·스크립트가 돌았다)
+    _cr = "python3 \"/w/pack/bin/javis_pre\\" + "\r" + "flight.py\" --self-test"
+    want(True, "Bash", {"command": _cr}, "CR 이어붙이기로 설치 팩 도구 위장")
+    want(True, "Bash", {"command": "cys status\rcys kill 1"}, "인용 밖 생 CR")
+    want(False, "Bash", {"command": 'cys send --to master "1줄\n2줄"'}, "LF 본문은 그대로 통과")
+    for _c, _exp in (("cargo --config target.x.runner=['/tmp/r.sh'] test --offline", True),
+                     ("cargo --config build.jobs=2 test", False),
+                     ("cargo --config net.offline=true test", False),
+                     ("cargo --config build.rustc-wrapper='/tmp/w' test", True)):
+        _b, _r = decide("Bash", {"command": _c}, "reviewer-codex")
+        if _b != _exp:
+            fails.append("R2[cargo --config]: `%s` 기대 %s 인데 %s (%s)"
+                         % (_c, "deny" if _exp else "allow", "deny" if _b else "allow", _r))
+    _b, _r = decide("Bash", {"command": "r\rm -rf /w/x"}, "reviewer-codex")
+    if not _b:
+        fails.append("R2[reviewer CR]: CR 로 감춘 write-shell 이 통과했다")
+
+    # ⑩-2 선행 환경 할당은 도구가 보는 문맥을 바꾼다(워커 자체 발견 · 값에 `/` 가 없으면 새어 나갔다)
+    #   ★사유까지 잰다: 다른 검사(경로 지정 실행·목록 밖 명령)도 이 명령을 막지만 **사유가
+    #     사실과 달랐다**. 판정문이 사실과 같아야 다음 독자가 경계를 바르게 읽는다(§8).
+    for _c in ("CYS_ROLE=master cys status",
+               "CYS_PACK_DIR=/w/tmp python3 /w/pack/bin/javis_orchestra.py check"):
+        _b, _r = decide("Bash", {"command": _c}, "cso", ctx())
+        if not _b or "선행 환경 할당" not in _r:
+            fails.append("R2[선행 env 할당]: `%s` → %s (%s)"
+                         % (_c, "allow" if not _b else "deny", _r[:80]))
+    want(False, "Bash", {"command": "cys send --to master 'a=b 는 본문이다'"},
+         "인용 안 `=` 는 본문이다")
+
+    # ⑪ `_norm` 은 심링크를 따라간다(문서·코드가 갈리던 자리 · 음성 대조의 짝)
+    _d = None
+    try:
+        _d = tempfile.mkdtemp(prefix="capgate-rp-")
+        _t = os.path.join(_d, "real")
+        os.mkdir(_t)
+        _l = os.path.join(_d, "link")
+        os.symlink(_t, _l)
+        if _norm(os.path.join(_l, "f.json")) != _norm(os.path.join(_t, "f.json")):
+            fails.append("R2[realpath]: `_norm` 이 심링크를 따라가지 않는다 — 허용 뿌리 안의 "
+                         "링크가 밖을 가리키면 경계가 이름뿐이다")
+    except (OSError, NotImplementedError, AttributeError):
+        pass                              # 심링크 미지원(Windows 비관리자) — 이 축은 재지 못한다
+    finally:
+        if _d:
+            for _n in ("link", "real"):
+                try:
+                    (os.unlink if _n == "link" else os.rmdir)(os.path.join(_d, _n))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(_d)
+            except OSError:
+                pass
+
+    # ⑫ 카운터: 손상·심링크는 **계수 불능**이고 보호 파일을 건드리지 않는다(codex blocking)
+    _c = None
+    try:
+        _c = tempfile.mkdtemp(prefix="capgate-cnt-")
+        os.mkdir(os.path.join(_c, "capgate"))
+        _k = session_key("s-corrupt")
+        _p = os.path.join(_c, "capgate", _k + ".calls")
+        with open(_p, "wb") as f:
+            f.write(b"X" * 1999)
+        if bump_tool_calls(_k, _c) is not None:
+            fails.append("R2[카운터]: 손상 파일 길이를 유효 호출 수로 읽었다(경고 없는 즉시 deny)")
+        if not os.path.exists(_p + ".corrupt"):
+            fails.append("R2[카운터]: 손상 파일을 격리하지 않았다(증거 소실)")
+        _v = os.path.join(_c, "victim.rs")
+        with open(_v, "w", encoding="utf-8") as f:
+            f.write("fn main(){}")
+        _k2 = session_key("s-link")
+        try:
+            os.symlink(_v, os.path.join(_c, "capgate", _k2 + ".calls"))
+            if bump_tool_calls(_k2, _c) is not None:
+                fails.append("R2[카운터]: 심링크 카운터를 숫자로 읽었다")
+            with open(_v, "rb") as f:
+                if f.read() != b"fn main(){}":
+                    fails.append("R2[카운터]: 심링크를 따라가 **보호 파일에 썼다**")
+        except (OSError, NotImplementedError, AttributeError):
+            pass
+    except OSError:
+        pass
+    finally:
+        if _c:
+            try:
+                for _n in os.listdir(os.path.join(_c, "capgate")):
+                    os.unlink(os.path.join(_c, "capgate", _n))
+                os.rmdir(os.path.join(_c, "capgate"))
+                for _n in os.listdir(_c):
+                    os.unlink(os.path.join(_c, _n))
+                os.rmdir(_c)
+            except OSError:
+                pass
+
+    # ⑬ reviewer: 조회 하위 모드는 열고, 파일 출력·임의 실행·소스 재작성은 막는다
+    for cmd in ("git worktree list", "git worktree list --porcelain", "git submodule status",
+                "git submodule status --recursive", "git stash list", "git stash show --stat",
+                "git notes list", "git notes show HEAD", "git sparse-checkout list",
+                "git config --get user.name", "git config --list", "git config get core.editor",
+                "git config list", "git branch", "git branch --list", "git branch --list main",
+                "git branch --contains HEAD", "git tag", "git tag -l", "git tag --list v",
+                "go build -o /dev/null ./..."):
+        rv(False, cmd, "reviewer 조회 오탐")
+    for cmd in ("cargo clippy --fix", "cargo clippy --fix --allow-dirty --allow-staged",
+                "git config --file --get section.key value", "git config user.name x",
+                "git config --unset user.name", "git stash list --output=/w/repo/a",
+                "git diff --output=/w/repo/a.patch", "git branch --unset-upstream",
+                "git branch --edit-description", "git branch main", "git tag v1",
+                "git worktree add /w/x", "git submodule update --init", "git stash push",
+                "go build -o /dev/null -mod=mod .",
+                "go build -o /dev/null -toolexec=/tmp/rewrite .",
+                "go build -o /dev/null -toolexec /tmp/rewrite ."):
+        rv(True, cmd, "reviewer 변형 우회")
+    _cwd0 = os.getcwd()
+    try:
+        os.chdir(os.path.abspath(os.sep))
+        # unix 에서 `NUL` 은 일반 파일이다 — 공용 NULL_SINKS 를 빌려 쓰면 저장소에 바이너리를 쓴다.
+        rv(os.name != "nt", "go build -o NUL .", "플랫폼별 산출물 폐기 장치")
+    finally:
+        try:
+            os.chdir(_cwd0)
+        except OSError:
+            pass
+    return fails
+
+
 def run_self_test():
     fails, n_block, n_allow, cso_allow, cso_deny = self_test()
     self_test_contracts(fails)
     self_test_r1(fails)
+    self_test_r2(fails)
 
     # ★API 계약 검증: deny 경로는 permissionDecision==deny JSON을 내는가 / 허용은 무출력인가.
     emitted = deny_payload("reviewer-codex surface는 producer 산출물 수정 금지 (producer != evaluator)")
