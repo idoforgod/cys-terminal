@@ -32,7 +32,15 @@
 유효하니 cys 대응 명령으로 치환한다 (`send`→`cys send`, `send-key`→`cys send-key`,
 `identify`→`cys identify`, `list-workspaces`→`cys list`, `new-split`→
 `cys new-surface`/`cys launch-agent`, `notify`→`cys send --to master`, 화면 폴링→
-`cys events` 구독).
+**역할별 수신 경로**).
+
+★화면 폴링의 치환 대상은 역할마다 다르다 — 정본은 각 `*_DIRECTIVE.md` 다. **CSO 는 데몬 inbox 수신이며
+`cys events`·Monitor 도구·백그라운드 tail 로 직접 구독하지 않는다**(CSO_DIRECTIVE §1). 전 역할 공통
+보조 관측은 `cys status --json` 스냅샷이다. **현재 좌석이 CSO 이면 아래 'master 전용' 블록은 실행
+대상이 아니다** — 주석은 차단 장치가 아니므로, 블록째 복사해 실행하지 마라.
+> 이 고지는 **이 문서(팩 템플릿과 그 저장소 사본)** 에만 적용된다. 기존 `<config>/CLAUDE.md` 는 자동
+> 갱신되지 않으므로(존재하면 덮지 않는 시드) 기존 설치에서 구독 지시가 사라졌음을 보장하지 않는다 —
+> 기존 설치는 역할별 수신 규칙 반영과 CSO 구독 차단을 별도로 확인해야 한다.
 
 ```bash
 cys boot                                        # 4종 의무 노드 부트(CSO·worker·agy·codex+grok 선택)
@@ -46,10 +54,15 @@ python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py"   # 진행% 결�
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_route.py" --request "<요청>"  # 3단 사고 라우팅 (slow>deliberate>fast)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_memory.py" add --type <t> --name <slug> --desc "..." --body "..."  # 장기기억 증류 (원자적·색인 동기 — MEMORY.md 손편집 금지)
 cys feed push --wait --title "..." --body "..." # 승인 요청 (0=allow 2=deny 3=timeout)
-cys events --reconnect                          # push 구독 (폴링 금지)
 cys run -- <서버명령>                           # 서버는 반드시 이 형태로 (run은 항상 scoped — 종료 시 그룹 강제 종료)
 cys read-screen --surface <ref>                 # 보조 확인 수단 (상시 폴링 금지)
 cys set-status --state working --context <pct>  # 컨텍스트 자기보고 — 60% 도달 시 데몬이 결정론 통보
+```
+
+★master 전용 (CSO·워커·리뷰어는 실행 대상이 아니다 — CSO 는 CSO_DIRECTIVE §1 의 데몬 inbox 수신이 정본):
+
+```bash
+cys events --reconnect                          # push 구독 — ★master 전용 · CSO 금지
 ```
 
 ## 4대 행동 지침

@@ -62,7 +62,7 @@ r"""javis_mission — **임무 게이트**의 단일 소유자 (2026-08-01 윈�
 그래서 대장을 "훅이 본 모든 프롬프트"로 열면 자기인가 루프가 **채널만 바꿔** 되살아난다.
 검증자가 실증한 결정적 우회로 2종:
   ① 자기 예약 wake — `cys schedule add --text "[wakeup] 다음 액션 착수" --to master`
-     (문안은 `CLAUDE.md.template:44` 에 그대로 실존). 시간이 지나면 master 자신이 예약한
+     (문안은 `CLAUDE.md.template:52` 에 그대로 실존). 시간이 지나면 master 자신이 예약한
      문장이 stdin 으로 돌아와 임무로 기록 → exit 3 이 0 으로 뒤집힌다.
   ② 워커 완료 push — `cys send --to master "[worker-1 완료] … 다음 지시 주세요"`
      (프로젝트 CLAUDE.md §7 정상 규약). 첫 위임 사이클 직후 게이트가 항구 개방된다.
@@ -99,7 +99,7 @@ r"""javis_mission — **임무 게이트**의 단일 소유자 (2026-08-01 윈�
 `^\s*\[[^\[\]\n]{1,80}\]` 이 뚫렸던 우회 5종(중첩 대괄호·라벨 내 개행·80자 초과·선두
 비공백·전각)을 전부 덮는다. **80자 상한은 폐기**했다(상한 자체가 공격 표적이었다).
 실물 생산자: `javis_wakeup.py` `[wakeup <W-id>]`·`[wakeup digest <N>건]` ·
-`hooks/role-bootstrap.sh` `_notify_bg` · `CLAUDE.md.template:44` · 프로젝트 CLAUDE.md §7.
+`hooks/role-bootstrap.sh` `_notify_bg` · `CLAUDE.md.template:52` · 프로젝트 CLAUDE.md §7.
 심층 방어로 데몬이 schedule push 발화 시 라벨을 **강제 부착**한다(schedule.rs::ensure_machine_label).
 
 ### 층0 — harness·도구 내부 알림 (병렬 축 · 2026-08-22 부서 임무 대장 오염 실사고)
@@ -2884,7 +2884,7 @@ def cmd_self_test():
         return machine_origin(p, {}, LEDGER_ABSENT)
 
     for p in (
-        # 우회로 ① 자기 예약 wake — CLAUDE.md.template:44 의 문안 그대로
+        # 우회로 ① 자기 예약 wake — CLAUDE.md.template:52 의 문안 그대로
         "[wakeup] 다음 액션 착수",
         # 우회로 ② 워커 완료 push — 프로젝트 CLAUDE.md §7 정상 규약
         "[worker-1 완료] T1 구현 끝냈습니다. 다음 지시 주세요",

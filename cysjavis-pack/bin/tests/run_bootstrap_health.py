@@ -1355,7 +1355,7 @@ def h_mission_1():
         notes.append("모듈 부재: 판정 불가=무스폰(fail-closed) · 판정불가 명시 주입문")
     # ⓒ 검증자가 실증한 **자기인가 우회로 2종**을 그 문안 그대로 재투입 → 대장 미기록
     with tempfile.TemporaryDirectory() as tmp:
-        for prompt, why in (("[wakeup] 다음 액션 착수", "자기 예약 wake(CLAUDE.md.template:44)"),
+        for prompt, why in (("[wakeup] 다음 액션 착수", "자기 예약 wake(CLAUDE.md.template:52)"),
                             ("[worker-1 완료] T1 끝났습니다. 다음 지시 주세요",
                              "워커 완료 push(CLAUDE.md §7)")):
             sb = os.path.join(tmp, re.sub(r"\W+", "_", why)[:20])
