@@ -91,6 +91,43 @@ EXIT_ALLOW, EXIT_SOFT, EXIT_HARD = 0, 1, 2
 EXIT_USAGE = 64          # EX_USAGE — 미지 서브커맨드·인자 오류(측정 자체가 일어나지 않음)
 EXIT_INTERNAL = 70       # EX_SOFTWARE — 게이트 내부 예외(측정 실패 ≠ soft_warn)
 
+# ── ★R2(리뷰 blocking): '실행 형상' 상수의 **정본은 preflight 하나**다 ──
+# R1 노트는 "preflight 의 상수를 그대로 가져왔다"고 적었지만 코드는 값을 **복사**해 다시 정의했다
+# (리뷰 지적 그대로다 — 정본을 고쳐도 이 축에 반영되지 않는다). 이제 실제로 import 한다.
+# ★가져오는 것은 **상수(사실)** 이고, 판정기(`_is_claude_command`)는 공유하지 않는다.
+#   근거(실측 2026-09-08): preflight 의 strict 판정기는 argv0 basename 을 **소문자로 접어**
+#   `_CLAUDE_EXE_NAMES` 와 비교한다(javis_preflight.py:6798) → `/Applications/Claude.app/Contents/
+#   MacOS/Claude` 와 `Claude Helper (Renderer)` 계열 10+행이 전부 claude 로 인정된다. 그 판정기를
+#   그대로 쓰면 macOS GUI 앱 전체가 **함대 CPU 합**에 실려 B2형 오탐(조직 기동 거부)이 재발한다.
+#   preflight 쪽에서는 그 관대함이 옳다(그 축은 '신뢰 시드를 미룰 claude 후보'를 **놓치지 않는** 것이
+#   목적이라 과대계상이 안전 방향이다). 두 축의 안전 방향이 반대라 판정 규칙은 갈라지고, 갈라지는
+#   지점을 여기 명시한다 — 상수(무엇이 우리 이름·마커·확장자인가)는 하나, 규칙(무엇을 소유로
+#   인정하는가)은 축마다. self-test (d1) 이 상수 동일성을, (d2) 가 규칙 분기를 각각 핀한다.
+# ★D1 경로 가드(형태 규약 = javis_radio.py:64-66 · javis_wakeup.py:47-57 과 동일):
+#   팩 `bin/` 스크립트를 **다른 cwd 에서** 부르면 형제 모듈이 sys.path 에 없다. append + 중복 검사
+#   (insert(0) 금지 — 목적은 발견이지 stdlib precedence 강등이 아니다). bin/tests/test_import_guard.py 가 검증한다.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+try:
+    import javis_preflight as _PF            # 같은 팩 bin/ — 순환 import 없음(preflight 는 이 모듈을 안 쓴다)
+except Exception:                            # noqa: BLE001 — import 실패가 게이트를 죽이면 안 된다
+    _PF = None                               # (죽으면 exit 1 → formation 이 'proceed' 로 읽어 축이 통째로 사문)
+
+
+def _pf_const(name, fallback):
+    """preflight 상수 우선 · 부재 시 리터럴 폴백. 폴백이 정본과 어긋나면 self-test (d1) 이 잡는다."""
+    v = getattr(_PF, name, None) if _PF is not None else None
+    return fallback if v is None else v
+
+
+_CLAUDE_EXE_NAMES = _pf_const("_CLAUDE_EXE_NAMES", ("claude", "claude.exe", "claude.cmd"))
+_CLAUDE_INSTALL_MARKER = _pf_const("_CLAUDE_INSTALL_MARKER", "/claude/versions/")
+_CLAUDE_NPM_MARKER = _pf_const("_CLAUDE_NPM_MARKER", "/claude-code/")
+_JS_SUFFIXES = _pf_const("_JS_SUFFIXES", (".js", ".mjs", ".cjs"))
+_PF_JS_RUNTIME_NAMES = _pf_const("_JS_RUNTIME_NAMES", ("node", "node.exe", "bun", "bun.exe"))
+
 SERVER_PATTERNS = [
     r"bun .*server", r"node .*server", r"vite(\s|$)", r"next dev", r"uvicorn",
     # ★G12 실측 교정(2026-07-04): macOS 프레임워크 파이썬은 ps에
@@ -168,22 +205,33 @@ FLEET_CPU_PATTERNS = NODE_PATTERNS + [r"(^|/)cysd(\s|$)", r"\bserena\b"]
 #   좌석 스폰을 위해 회수할 수 있는 프로세스가 아니다(B2 형 오탐). 번들 경로도 따로 배제한다.
 FLEET_EXE_NAMES = {"claude": "claude", "codex": "codex", "agy": "agy",
                    "gemini": "gemini", "cysd": "cysd", "serena": "serena"}
-FLEET_EXE_SUFFIXES = (".exe", ".cmd")          # 제거 후 비교(판정기는 플랫폼과 무관하게 순수하게 둔다)
+# 제거 후 비교(판정기는 플랫폼과 무관하게 순수하게 둔다). ★R2: 확장자 목록의 정본은
+# preflight `_CLAUDE_EXE_NAMES` = ("claude","claude.exe","claude.cmd") 다 — 거기서 파생한다.
+FLEET_EXE_SUFFIXES = tuple(sorted({os.path.splitext(n)[1].lower()
+                                   for n in _CLAUDE_EXE_NAMES if os.path.splitext(n)[1]})) \
+    or (".exe", ".cmd")
 _APP_BUNDLE_MARKER = ".app/contents/"          # macOS GUI 앱 번들 — CLI 함대가 아니다(실측 반례)
 # argv0 자체가 우리 설치 레이아웃인 형상(basename 이 버전 문자열이라 이름이 안 남는다)
 #   ★실측(2026-09-08 02:28 이 기계)으로 넣은 것: codex 는 wrapper 아래에 vendor 네이티브를 여러 개
 #     띄우고 그 basename 이 `codex` 가 아닌 것도 있다 —
 #     `…/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host`.
 #     그래서 `/@openai/codex/` 패키지 경로를 argv0 마커로 둔다(그 아래에 남의 프로그램이 살 일은 없다).
-FLEET_ARGV0_MARKERS = (("/claude/versions/", "claude"),   # ~/.local/share/claude/versions/<ver>
+# ★R2: 첫 마커는 preflight `_CLAUDE_INSTALL_MARKER` 파생(값 복사 금지 — 정본 하나).
+FLEET_ARGV0_MARKERS = ((_CLAUDE_INSTALL_MARKER, "claude"),  # ~/.local/share/claude/versions/<ver>
                        ("/.codex/bin/", "codex"),         # codex vendor native(설치 레이아웃 A)
                        ("/@openai/codex/", "codex"))      # codex vendor native(npm 레이아웃 · 실측)
 # JS 번들 형상 — **`.js` 번들 경로일 때만** 소유권을 인정한다(preflight strict 와 동형):
 #   `tail -f /x/claude-code/debug.log` 처럼 인자에 패키지 세그먼트가 실린 비-에이전트를 배제한다.
-FLEET_JS_BUNDLE_MARKERS = (("/claude-code/", "claude"), ("/@openai/codex/", "codex"),
+# ★R2: claude 마커는 preflight `_CLAUDE_NPM_MARKER` 파생 · `_JS_SUFFIXES` 는 위에서 import 했다.
+FLEET_JS_BUNDLE_MARKERS = ((_CLAUDE_NPM_MARKER, "claude"), ("/@openai/codex/", "codex"),
                            ("/gemini-cli/", "gemini"))
-_JS_SUFFIXES = (".js", ".mjs", ".cjs")
-FLEET_JS_RUNTIMES = frozenset(("node", "bun", "deno"))
+# ★R2: 런타임 이름도 preflight `_JS_RUNTIME_NAMES`(node/node.exe/bun/bun.exe) 파생 + `deno`.
+#   deno 를 **더하는** 이유: preflight 의 그 목록은 'claude 번들을 실행할 수 있는 argv0' 이라는
+#   좁은 목적의 것이고, 이 축은 우리 CLI 전체(codex·gemini 포함)의 런타임 형상을 본다. 더하는
+#   방향의 귀결은 언랩을 한 번 더 시도하는 것뿐이고, 언랩 자체가 R2 에서 '첫 비옵션 토큰 하나'
+#   로 좁혀졌다(아래 `_fleet_owner`) — 오탐이 늘지 않는다.
+FLEET_JS_RUNTIMES = frozenset([os.path.splitext(n)[0].lower() for n in _PF_JS_RUNTIME_NAMES]) \
+    | frozenset(("deno",))
 FLEET_PY_RUNTIMES = frozenset(("python", "py", "pypy"))
 # 온디맨드 런처 — 이 자리의 positional 은 **정의상 실행할 프로그램 이름**이다.
 #   실형상(javis_preflight.SERENA_STDIO_ARGS): `uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server …`
@@ -194,11 +242,53 @@ FLEET_RUNNER_PROGRAMS = {
     "gemini": "gemini", "gemini-cli": "gemini", "@google/gemini-cli": "gemini",
     "serena": "serena", "serena-agent": "serena",
 }
-FLEET_RUNNER_SUBCMDS = frozenset(("run", "exec", "tool", "x"))   # `uv run serena` 형상
+# ★R2(리뷰 minor · B2 재발 계열): 하위 명령은 **런처마다 다르다**. 종전엔 `run` 을 무조건
+#   건너뛰어 `npm run codex`(= package.json 스크립트 이름이 우리 CLI 와 같은 저장소)와
+#   `yarn codex` 가 codex 로 계상됐다 — 실행된 것은 우리 CLI 가 아니라 그 저장소의 스크립트다.
+#   값 = (허용 하위 명령 집합, 하위 명령 **필수** 여부).
+#   npm/pnpm/yarn 의 맨 positional 은 정의상 **스크립트 이름**이라 `exec`/`dlx` 를 거친 형상만
+#   프로그램 실행으로 인정한다(틀리는 방향 = 미계상 = 차단 안 함).
+#   ★codex 위임 검체 D4: `uv`/`pipx` 도 **하위 명령 필수**다 — `uv codex`·`pipx codex` 는 실행
+#     형상이 아닌데(그 런처에 그런 호출 규약이 없다) 종전 표는 codex 로 셌다(과대계상).
+FLEET_RUNNER_RULES = {
+    "uv":   (frozenset(("run", "tool", "x")), True),    # `uv run serena` · `uv tool uvx …`(실측)
+    "uvx":  (frozenset(), False),
+    "npx":  (frozenset(), False),
+    "bunx": (frozenset(), False),
+    "pipx": (frozenset(("run",)), True),
+    "npm":  (frozenset(("exec",)), True),
+    "pnpm": (frozenset(("exec", "dlx")), True),
+    "yarn": (frozenset(("exec", "dlx")), True),
+}
+# ★codex 위임 검체 D7: 런처의 긴 옵션은 **기본이 불리언**이고, 값을 먹는 것만 열거한다.
+#   종전엔 모든 긴 옵션이 다음 토큰을 먹어 `npx --yes codex`(=`npx -y` 의 긴 형)가 미계상됐다.
+#   두 방향 모두 오차는 대체로 **미계상**이지만(값 토큰이 우리 프로그램 이름과 같아야 오탐),
+#   실재하는 형상을 잡는 쪽을 택한다.
+FLEET_RUNNER_VALUE_OPTS = frozenset((
+    "--from", "--with", "--python", "--prefix", "--package", "--index", "--index-url",
+    "--directory", "--cwd", "--registry", "--project", "--spec"))
+# 하위호환 상수(외부 임포터 보존) — 판정은 위 규칙표가 한다.
+FLEET_RUNNER_SUBCMDS = frozenset().union(*[r[0] for r in FLEET_RUNNER_RULES.values()])
 FLEET_RUNNER_SCAN_MAX = 40       # 인자 스캔 상한(비용 상한 — 12 는 `node --flag`×12 형상에서 짧았다)
 # 런타임이 **코드 문자열**을 받는 모드. 이때는 뒤 토큰이 실행 대상이 아니므로 아예 언랩하지 않는다
 # (`python3 -c 'print(1)' /tmp/serena` 가 serena 로 오인되던 길 · codex 위임 검체 4).
 FLEET_CODE_MODE_FLAGS = frozenset(("-c", "-e", "--eval", "-p", "--print", "-m"))
+# ★R2(리뷰 major): 값이 **붙은** 짧은 옵션(`-cprint(1)`)·클러스터(`-uc`)도 코드 모드다. 종전엔
+#   그 토큰이 '그냥 옵션' 으로 건너뛰어져 뒤의 **데이터 인자**가 실행 주체로 승격됐다
+#   (`python3 -cprint(1) /tmp/serena` → serena). 문자 집합은 런타임별로 가른다:
+#   python 은 `-c`(명령)·`-m`(모듈), node/bun/deno 는 `-e`(eval)·`-p`(print).
+_PY_CODE_MODE_LETTERS = "cm"
+_JS_CODE_MODE_LETTERS = "ep"
+_LONG_CODE_MODE_FLAGS = frozenset(("--eval", "--print", "--command", "--module"))
+# ★R2(codex C1): **값을 먹는** 런타임 옵션. 값이 실행 대상보다 먼저 오는 실형상
+#   (`node --require preload.js /x/@openai/codex/bin/codex.js` · `python3 -W ignore /x/bin/serena` ·
+#   `python3 -X dev …`)에서 그 값을 실행 대상으로 오인하면 **진짜 함대를 놓친다**(미계상).
+#   모르는 옵션의 값은 여전히 못 가리므로 그때는 미계상으로 접는다(정밀도 우선 원칙).
+_PY_VALUE_SHORT = "WX"          # `-W ignore` · `-X dev` (붙여 쓰면 값이 클러스터 안에 있다)
+_JS_VALUE_SHORT = "rC"          # `-r preload.js` · `-C condition`
+_PY_VALUE_LONG = frozenset(("--check-hash-based-pycs",))
+_JS_VALUE_LONG = frozenset(("--require", "--import", "--loader", "--experimental-loader",
+                            "--conditions", "--max-old-space-size", "--inspect-port"))
 _PY_VERSIONED_RE = re.compile(r"^python\d+(\.\d+)?$")
 # ★쉘(`sh`/`bash`/`zsh`)·`env` 는 **언랩하지 않는다**: 데몬은 로그인셸 우산으로 좌석을 띄우지만
 #   그 셸이 exec/spawn 한 실제 좌석은 **자기 ps 행**을 따로 갖는다(셸을 세면 이중계상이고, 셸의
@@ -220,8 +310,17 @@ FLEET_CPU_TOP_N = 3              # hard 시 남기는 상위 기여자 수(회�
 #     먼저 소비해 버리고, 정작 복구가 필요한 편성 호출은 다시 hard 를 만난다 — 유계가 특정 호출자에게
 #     보장되지 않는다. 만료는 '포화가 끝날 때까지 이 축은 권고(soft)' 라는 상태이고, 그것이 모든
 #     호출자에게 동일하게 보인다.
-#   ★따라서 이 축의 계약은 "포화 1회당 최대 15분 차단, 그 뒤 권고" 다 — 무기한 차단은 없다.
+#   ★계약 문면 정정(R2 리뷰 minor — 종전 문면 "포화 1회당 최대 15분 차단"은 장치보다 강했다):
+#     이 장치가 실제로 보장하는 것은 **"이 축의 hard 는 첫 hard 관측 시각으로부터 벽시계
+#     `FLEET_CPU_HARD_MAX_HOLD_SECS` 안에서만 유지된다"** 하나다. 게이트 호출 사이의 공백도 그
+#     벽시계에 들어가므로, 관측 공백이 상한보다 크면 **그 포화는 처음부터 만료 상태로 관측된다**
+#     (= 한 번도 차단하지 않는다 · 축의 사문화). 그 사실을 사유 `held_stale`/`expired_stale` 로
+#     표기해 침묵시키지 않는다.
+#     그 방향(덜 막음)을 **의도적으로 택했다**: 공백 뒤 재무장을 허용하면 첫 관측 기준의 절대
+#     벽시계 상한이 사라져(재무장 시각부터 다시 900초) 봉인표 ③(전멸 부서의 복구 보류)의 유계가
+#     약해진다 — codex R2 B1 의 반례 시각열이 그것이다. 유계 보존 > 축 실효.
 FLEET_CPU_HARD_MAX_HOLD_SECS = 900.0
+FLEET_HOLD_RECORD_V = 1           # 래치 레코드 스키마 판(구 형식 = bare float 도 읽는다)
 FLEET_CPU_HOLD_BASENAME = "fleet-cpu-hard-since"
 FLEET_HOLD_FUTURE_SLACK_S = 2.0   # 이만큼까지의 '미래' 저장값은 시계 역행이 아니라 반올림으로 본다
 # 래치 저장 루트는 **팩 관례**(`CYS_STATE_DIR` ‖ `~/.cys/state`)다 — 데몬 상태 디렉터리
@@ -412,12 +511,25 @@ def _is_windows_host():
       흔한 조합에서, 매 호출이 `measure_errors: fleet_cpu(ps)` → 최소 soft 가 된다. 그 결과
       `javis_completion_guard._soft_kind` 가 proceed_unmeasured → skip_soft 로 바뀌어 **완료 검증이
       영구 skip** 된다. 정본의 Windows 예외는 '이 플랫폼엔 이 축이 없다'는 뜻이지 인터프리터 종류가
-      아니다."""
+      아니다.
+
+    ★R2(리뷰 major · R1 반박 기각): R1 노트는 "`MSYSTEM` 하나로 판정하지 않는다"고 적었지만 코드는
+      **그것 하나로** True 를 냈다. 그러면 POSIX 기계에 `MSYSTEM=MINGW64` 가 (상속·오설정으로) 떠
+      있기만 해도 `ps` 조회 실패가 `measure_errors` 를 못 타고 **조용한 allow(exit 0)** 가 된다 —
+      P-ORCH-1 위반이고, 이 축이 통째로 사라진 것을 아무도 모른다. `MSYSTEM` 은 상속되는 문자열일
+      뿐 플랫폼 증명이 아니므로 **혼자서는 판정하지 못하게** 한다: Windows 커널 위임을 말해 주는
+      독립 신호(`WINDIR`/`SYSTEMROOT`/`OS=Windows_NT` — Git Bash 는 Windows 환경을 상속하므로 전부
+      있고, 순정 POSIX 에는 없다)가 **함께** 있어야 Windows 호스트로 접는다.
+      틀리는 방향: 이 조임은 'Windows 인데 POSIX 로 봄'(=측정 실패가 loud soft) 쪽으로 틀릴 수 있고
+      그 귀결은 완료 검증 skip 이다 — 반대(조용한 allow)보다 낫다."""
     if os.name == "nt":
         return True
     if sys.platform in ("msys", "cygwin"):
         return True
-    return bool(os.environ.get("MSYSTEM"))
+    if not os.environ.get("MSYSTEM"):
+        return False
+    return any(os.environ.get(k) for k in ("WINDIR", "SYSTEMROOT")) \
+        or os.environ.get("OS", "").lower() == "windows_nt"
 
 
 # ps 가 **플래그를 거부**한 형상(구현이 `-axo` 를 모른다)의 관용 문구. 이것은 '측정 실패'가 아니라
@@ -449,11 +561,17 @@ def _ps_cpu_lines():
     ★`_ps_lines` 와 달리 **rc 를 본다**: `-axo` 를 모르는 구현은 예외를 던지지 않고 rc≠0 + 빈 stdout 을
       내는데, 그것을 `[]` 로 접으면 '함대 CPU 0%' 라는 **거짓 측정**이 된다."""
     try:
+        # ★R2(리뷰 major): `errors="replace"` 가 없으면 디코딩 불가 바이트 하나가
+        #   `UnicodeDecodeError`(=ValueError)를 올리고, 그것이 아래 except 두 개에 안 잡혀
+        #   **최상위 경계까지 올라가 exit 70** 이 된다 — Windows 분류(unavailable)에 닿지도 못하고
+        #   stdout 이 아예 없어서 소비자는 '내부 오류'로 읽는다(formation 은 재시도 후 자원 판정
+        #   없이 진행). ps 출력의 pid·pcpu 열은 ASCII 라 대체문자가 파싱을 바꾸지 않는다.
         p = subprocess.run(["ps", "-axo", "pid,pcpu,command"], capture_output=True,
-                           text=True, timeout=10)
+                           text=True, errors="replace", timeout=10)
     except FileNotFoundError:
         return None, "absent"            # Windows 기본 — 이 플랫폼엔 이 축이 없다
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
+        # ValueError = 디코딩 실패 계열(`errors="replace"` 로 막았지만 대역·구현 차이의 잔여 경로).
         return None, "failed"            # 타임아웃·권한 등 — 측정 실패다
     if p.returncode != 0:
         diag = (p.stderr or "") + "\n" + (p.stdout or "")
@@ -475,6 +593,50 @@ def _fleet_exe_name(token):
             base = base[: -len(suf)]
             break
     return raw, base
+
+
+def _fleet_code_mode(tok, js):
+    """이 토큰이 런타임의 **코드 문자열/모듈 모드** 스위치인가 — 순수.
+
+    참이면 뒤 토큰은 실행 파일이 아니므로 언랩을 중단한다. 붙은 값(`-cprint(1)`)과
+    클러스터(`-uc`)까지 본다(R2 리뷰 major — 종전엔 그 둘이 '평범한 옵션' 으로 건너뛰어져
+    **데이터 인자**가 실행 주체로 승격됐다)."""
+    if tok in FLEET_CODE_MODE_FLAGS:
+        return True
+    if tok.startswith("--"):
+        return tok.split("=", 1)[0] in _LONG_CODE_MODE_FLAGS
+    if tok.startswith("-") and len(tok) > 1:
+        # ★codex 위임 검체 D3: 클러스터를 **왼쪽부터** 훑되 값을 먹는 문자에서 **멈춘다** —
+        #   그 뒤는 옵션 문자가 아니라 그 옵션의 **값**이다. 통째로 `any()` 하면
+        #   `-Wmodule` 의 m · `-rpreload.js` 의 p · `-Cdevelopment` 의 e 가 코드모드로 읽혀
+        #   **진짜 함대를 놓친다**(미계상).
+        code = _JS_CODE_MODE_LETTERS if js else _PY_CODE_MODE_LETTERS
+        val = _JS_VALUE_SHORT if js else _PY_VALUE_SHORT
+        for ch in tok[1:]:
+            if ch in code:
+                return True
+            if ch in val:
+                return False                  # 여기부터는 값이다
+    return False
+
+
+def _fleet_opt_takes_value(tok, js):
+    """이 런타임 옵션 토큰이 **다음 토큰을 값으로 먹는가** — 순수(codex R2 C1).
+    긴 옵션은 `=` 가 있으면 자족적이고, 짧은 클러스터는 값 문자가 **마지막**일 때만 다음을 먹는다
+    (`-Wignore` 는 값이 붙어 있다)."""
+    if tok.startswith("--"):
+        if "=" in tok:
+            return False
+        return tok in (_JS_VALUE_LONG if js else _PY_VALUE_LONG)
+    letters = _JS_VALUE_SHORT if js else _PY_VALUE_SHORT
+    code = _JS_CODE_MODE_LETTERS if js else _PY_CODE_MODE_LETTERS
+    body = tok[1:]
+    for i, ch in enumerate(body):
+        if ch in code:
+            return False                      # 코드모드는 위에서 이미 잘렸다
+        if ch in letters:
+            return i == len(body) - 1         # 붙은 값이 없으면 다음 토큰이 값이다
+    return False
 
 
 def _fleet_runner_key(token):
@@ -539,15 +701,28 @@ def _fleet_owner(cmd):
         #   `node /tmp/report.js /tmp/codex` 처럼 **데이터 인자**가 실행 주체로 승격된다 —
         #   그것이 바로 이 라운드가 없앤 B2 오탐이다. 대가는 `node --require x.js /x/codex` 형상의
         #   미계상(=차단 안 함=종전 상태)이고, 그 방향을 택한다.
+        skip_next = False
         for t in rest:
+            if skip_next:
+                skip_next = False
+                continue                              # 앞 옵션이 먹은 **값** — 실행 대상이 아니다
             # ★코드 문자열 모드가 **경로 토큰보다 먼저** 나오면 언랩하지 않는다: `-c`/`-e`/`-m` 뒤의
             #   토큰은 실행 파일이 아니다(`python3 -c print(1) /tmp/serena`). 순서를 봐야 한다 —
             #   실측 `node /…/bin/codex exec -m gpt-6-astra …` 처럼 **대상 프로그램의 인자**에
             #   같은 글자가 오는 형상이 흔하다(그때는 이미 실행 주체를 정한 뒤다).
-            if t in FLEET_CODE_MODE_FLAGS:
+            if _fleet_code_mode(t, js):
                 return None
+            if t == "-":
+                return None                           # stdin 스크립트 — 뒤는 그 스크립트의 인자다
+            if t.startswith("-"):
+                skip_next = _fleet_opt_takes_value(t, js)
+                continue                              # 런타임 옵션 — 실행 대상이 아니다
+            # ★R2(리뷰 major): 여기서 멈춘다 — 첫 **비옵션** 토큰이 실행 대상(스크립트·모듈)이고,
+            #   그 뒤는 전부 그 프로그램의 **데이터 인자**다. 종전 판본은 '슬래시 있는 첫 토큰' 을
+            #   찾느라 상대경로 스크립트를 건너뛰어 `python3 report.py /tmp/serena` ·
+            #   `node report.js /tmp/codex` 의 데이터 인자를 실행 주체로 승격시켰다(B2 재발).
             if "/" not in t and "\\" not in t:
-                continue
+                return None                           # 상대 스크립트 — 경로 근거 없음 · 미계상
             norm, base = _fleet_exe_name(t)
             low = norm.lower()
             owner = FLEET_EXE_NAMES.get(base)
@@ -567,19 +742,35 @@ def _fleet_owner(cmd):
         #   본다(`npx -y @google/gemini-cli`). 하위 명령(`uv run …`)은 1회 건너뛴다.
         #   ★중첩 런처도 건너뛴다 — 실측 형상 `/…/bin/uv tool uvx --python 3.13 --from
         #     serena-agent==1.5.3 serena start-mcp-server`(uv → tool → uvx → serena).
+        #   ★R2: 허용 하위 명령은 **런처별**이고, npm/pnpm/yarn 은 그것이 **필수**다
+        #     (`npm run codex`·`yarn codex` 의 positional 은 프로그램이 아니라 스크립트 이름).
+        allowed, need_sub = FLEET_RUNNER_RULES.get(base0, (frozenset(), False))
+        seen_sub = False
         skip_next = False
         for t in rest:
             if skip_next:
                 skip_next = False
                 continue
+            if t == "--":
+                continue                              # 옵션 끝(codex D6: `npm exec -- codex`)
             if t.startswith("--"):
-                skip_next = "=" not in t
+                skip_next = ("=" not in t) and (t in FLEET_RUNNER_VALUE_OPTS)
                 continue
             if t.startswith("-"):
                 continue
             low = t.lower()
-            if low in FLEET_RUNNER_SUBCMDS or _fleet_exe_name(t)[1].lower() in FLEET_RUNNERS:
-                continue                              # 하위 명령·중첩 런처
+            if low in allowed:
+                seen_sub = True
+                continue                              # 하위 명령
+            # ★codex D5: 필수 하위 명령 검사가 **중첩 런처 전환보다 먼저**다 — 아니면
+            #   `yarn npx codex` 처럼 스크립트 이름 자리의 토큰이 런처로 승격한다.
+            if need_sub and not seen_sub:
+                return None                           # 스크립트 이름 자리 — 실행 주체가 아니다
+            nested = _fleet_exe_name(t)[1].lower()
+            if nested in FLEET_RUNNERS:               # 중첩 런처 — 규칙도 그쪽으로 갈아탄다
+                allowed, need_sub = FLEET_RUNNER_RULES.get(nested, (frozenset(), False))
+                seen_sub = False
+                continue
             return FLEET_RUNNER_PROGRAMS.get(_fleet_runner_key(t))
         return None
     return None
@@ -690,14 +881,68 @@ def _pack_state_dir():
         os.path.expanduser(CYS_DIR_DEFAULT), "state")
 
 
-def _fleet_hold_path():
-    """레인별 래치 경로. 레인 키는 `CYS_SOCKET` 의 디렉터리 이름(부서 레인은 자기 것을 본다)."""
-    sock = os.environ.get("CYS_SOCKET")
+def _lane_socket():
+    """이 호출이 **판정 대상으로 삼는 레인**의 소켓 경로 — `CYS_GATE_LANE_SOCKET` > `CYS_SOCKET`.
+
+    ★R2(리뷰 major · codex A1): 편성(`javis_formation._resource_verdict`)은 `--socket <s>` 로 받은
+      레인을 게이트에 전혀 알리지 않았고, 실제 호출자가 base 데몬의 심박 셸 루프라 **부서 레인의
+      편성이 항상 base 의 boot-epoch·래치를 봤다**(부서 재시작 직후 = ③ 복구 구간에 유예 0).
+    ★그런데 그 값을 `CYS_SOCKET` 이라는 이름으로 넘기면 안 된다: 그 변수는 `cys` CLI 자체가 읽는
+      값이라, 게이트 안의 원장 조회(`_ledger_servers` 의 `cys ps`)가 부서 데몬을 보게 되고 **base
+      원장이 통째로 집계에서 빠진다**(servers 3 → 0 이 가능 · codex R2 A1). 그래서 레인 판정
+      **전용** 변수를 따로 나른다 — 구 게이트는 이 변수를 모르므로 그냥 무시하고 종전대로 돈다
+      (플래그와 달리 EX_USAGE 스큐가 없다)."""
+    return os.environ.get("CYS_GATE_LANE_SOCKET") or os.environ.get("CYS_SOCKET")
+
+
+def _fleet_hold_thr_key(thr):
+    """hard 임계 → 파일명 조각. **파싱된 float 의 정규 표현**을 쓴다(codex R2 B2):
+    `1`·`1.0`·`1e0` 은 같은 래치여야 하고 `-0.0` 은 `0.0` 과 같아야 한다."""
+    if thr is None:
+        return "any"
+    try:
+        v = float(thr)
+    except (TypeError, ValueError):
+        return "any"
+    if not math.isfinite(v):
+        return "any"
+    if v == 0:
+        v = 0.0                                     # ±0 통일
+    return re.sub(r"[^A-Za-z0-9._-]", "_", repr(v))
+
+
+def _fleet_hold_path(thr=None):
+    """레인·임계별 래치 경로.
+
+    ★R2 두 가지를 고쳤다.
+      ① 레인 키의 **해시가 잘려 사라지던 길**(리뷰 minor): 종전은 `name + "-" + sha8` 을 만든 뒤
+         전체를 80자로 잘라, 디렉터리 이름이 긴 두 레인(`/a/<x×90>/cys.sock`·`/b/<x×90>/cys.sock`)이
+         같은 경로를 냈다. 이제 **이름 쪽을 먼저 40자로 줄이고** 해시를 뒤에 붙인다(해시 불멸).
+         해시 입력도 dirname 이 아니라 **소켓 전체 경로**다 — 한 디렉터리에 소켓이 둘이면
+         dirname 해시는 여전히 충돌한다(codex R2 B2).
+      ② 파일명에 **hard 임계**를 넣는다(리뷰 major · codex R2 B2 동의): 종전엔 임계가 다른 호출
+         (`--fleet-cpu-hard 2`)이 '이 임계로는 below' 를 관측하고 **남의 래치를 지웠다** — 기본
+         임계 호출자의 연속 시계가 매번 0으로 돌아가 상한이 영영 안 차는 길이었다. 래치가 뜻하는
+         것은 '이 임계에서의 연속 포화' 이므로 임계마다 자리를 가진다."""
+    sock = _lane_socket()
     key = "default"
     if sock:
-        # ★디렉터리 **이름**만 쓰면 `/a/team/cys.sock` 와 `/b/team/cys.sock` 이 같은 래치를 공유해
-        #   한 레인의 below 가 다른 레인의 연속 보류 기록을 지운다(codex 위임 검체 14).
-        #   읽을 수 있는 이름 + 전체 경로 해시 8자로 레인을 가른다.
+        full = os.path.abspath(os.path.expanduser(sock))
+        name = re.sub(r"[^A-Za-z0-9._-]", "_",
+                      os.path.basename(os.path.dirname(full)) or "lane")[:40]
+        key = "%s-%s" % (name, hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()[:8])
+    return os.path.join(_pack_state_dir(), "resource-gate",
+                        "%s-%s-h%s" % (FLEET_CPU_HOLD_BASENAME, key, _fleet_hold_thr_key(thr)))
+
+
+def _fleet_hold_legacy_path():
+    """R1 판(임계 접미가 없던) 래치 이름 — **더 읽지 않는다**. `below` 때 잔재만 치운다.
+    ★이름을 재현해서 지우는 이유: 새 이름으로 옮겨 가면 구 파일이 영원히 남는다. 그렇다고 레인
+      접두로 싹 지우면 **다른 임계의 래치까지** 지워져 R2 가 고친 결함이 되살아난다(임계 X 에서의
+      below 는 임계 Y<X 에서의 below 가 아니다)."""
+    sock = _lane_socket()
+    key = "default"
+    if sock:
         full = os.path.dirname(os.path.abspath(os.path.expanduser(sock)))
         key = "%s-%s" % (os.path.basename(full) or "lane",
                          hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()[:8])
@@ -706,8 +951,80 @@ def _fleet_hold_path():
                         "%s-%s" % (FLEET_CPU_HOLD_BASENAME, key))
 
 
-def _fleet_hold_write(path, value):
-    """래치 원자 기록 → 성공 여부. 실패는 예외가 아니라 False(판정을 죽이지 않는다)."""
+def _fleet_hold_read(path):
+    """래치 → `(rec|None, reason)`. rec = `{"since","last","expired"}` (전부 유한 float / bool).
+
+    reason ∈ None(정상) · "missing"(정상 부재) · "unreadable"(있는데 못 읽음) · "corrupt"(내용 파손).
+    ★셋을 가르는 이유(codex R2 B3): '정상 부재' 는 **지금 무장**(상한이 지금부터 다시 유계)이지만,
+      '읽기 불능' 은 유계를 증명할 수 없는 상태라 쓰기 실패와 같은 통(만료)에 넣어야 한다. 종전엔
+      둘을 뭉개 권한 오류가 매 호출 재무장이 되어 상한이 영원히 안 찼다.
+    ★구 형식(bare float)도 읽는다 — R1 래치와의 호환."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = (f.read() or "").strip()
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unreadable"
+    except ValueError:
+        # ★codex 위임 검체 D9: 디코딩 불가 바이트(UnicodeDecodeError = ValueError)가 이 함수를
+        #   빠져나가면 최상위 경계가 그것을 exit 70('내부 오류')으로 접는다 — 래치 파일 한 줄이
+        #   게이트 전체를 죽이는 길이다. 그것은 '내용 파손' 이다.
+        return None, "corrupt"
+    if not raw:
+        return None, "corrupt"
+    obj = None
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        obj = None
+    if isinstance(obj, dict):
+        since, last = obj.get("since"), obj.get("last", obj.get("since"))
+        if not (isinstance(since, (int, float)) and isinstance(last, (int, float))) \
+                or isinstance(since, bool) or isinstance(last, bool):
+            return None, "corrupt"
+        try:
+            # ★codex 위임 검체 D10: JSON 파싱은 성공해도 `float(거대 정수)` 는 OverflowError 다
+            #   (유한성 검사에 닿기 전에 예외로 탈출 → exit 70).
+            since, last = float(since), float(last)
+        except (OverflowError, ValueError, TypeError):
+            return None, "corrupt"
+        if not (math.isfinite(since) and math.isfinite(last)):
+            return None, "corrupt"
+        return {"since": since, "last": last, "expired": obj.get("expired") is True}, None
+    try:
+        v = float(raw)                       # 구 형식(R1 · bare float)
+    except ValueError:
+        return None, "corrupt"
+    if not math.isfinite(v):
+        return None, "corrupt"
+    return {"since": v, "last": v, "expired": False}, None
+
+
+def _fleet_hold_write(path, value, merge=False):
+    """래치 원자 기록 → 성공 여부. 실패는 예외가 아니라 False(판정을 죽이지 않는다).
+    value 는 레코드 dict 또는 (구 호출 호환) 저장 시각 float.
+
+    ★merge=True 면 **교체 직전에 현재 레코드를 다시 읽어 단조 병합**한다(codex 위임 검체 D2):
+      `since` 는 더 이른 값, `last` 는 더 늦은 값, `expired` 는 **논리합**. 두 게이트 프로세스의
+      읽기→판정→쓰기가 겹칠 때 늦은 쓰기가 남의 `expired=True` 를 되돌리면 이미 공개된 완화가
+      취소돼 차단이 되살아난다(봉인표 ③ 역행).
+    ★정직 표기: 이것은 **완화**이지 직렬화가 아니다 — 재읽기와 replace 사이에도 창은 남는다.
+      다만 `since` 는 arm 경로에서만 앞으로 움직이므로, 잃어버린 갱신의 손해는 '한 호출이 다시
+      hard 를 본다' 로 유계이고 다음 호출이 `now-since` 로 스스로 회복한다. 잠금(javis_lock)을
+      들이지 않은 이유: 게이트는 부트 체인에서 죽으면 안 되는 경로라 새 실패 모드(잠금 획득 실패·
+      Windows 백엔드 차이)를 늘리는 값이 이 이득보다 비싸다."""
+    if not isinstance(value, dict):
+        value = {"since": float(value), "last": float(value), "expired": False}
+    rec = {"v": FLEET_HOLD_RECORD_V, "since": float(value["since"]),
+           "last": float(value.get("last", value["since"])),
+           "expired": bool(value.get("expired"))}
+    if merge:
+        cur, _why = _fleet_hold_read(path)
+        if cur is not None:
+            rec["since"] = min(rec["since"], cur["since"])
+            rec["last"] = max(rec["last"], cur["last"])
+            rec["expired"] = bool(rec["expired"] or cur["expired"])
     tmp = None
     try:
         d = os.path.dirname(path)
@@ -720,10 +1037,10 @@ def _fleet_hold_write(path, value):
         with open(tmp, "w", encoding="utf-8") as f:
             # ★repr 정밀도로 쓴다(codex 위임 검체 13): `%.3f` 는 올림 때문에 저장값이 `now` 보다
             #   커질 수 있고, 그러면 다음 호출이 그것을 '미래' 로 읽어 시계를 0으로 되돌린다.
-            f.write("%r\n" % float(value))
+            f.write(json.dumps(rec) + "\n")
         os.replace(tmp, path)            # Windows 에서도 원자 교체
         return True
-    except OSError:
+    except (OSError, ValueError, TypeError):
         if tmp:
             try:
                 os.remove(tmp)
@@ -732,23 +1049,29 @@ def _fleet_hold_write(path, value):
         return False
 
 
-def _fleet_hard_hold(state, override=None, now=None):
-    """이 축이 **연속 hard 로 머문 초** → `(hold|None, reason, expired)`.
+def _fleet_hard_hold(state, override=None, now=None, thr=None):
+    """이 축이 **첫 hard 관측 이후** 머문 초 → `(hold|None, reason, expired)`.
 
     state ∈ "hard"(임계 이상) · "below"(쟀는데 임계 미만) · "unmeasured"(값이 없다 — 축 부재·측정 실패).
-    reason ∈ "override" · "armed"(방금 무장) · "held" · "expired" · "cleared" · "unmeasured" ·
-             "unbounded_io".
+    reason ∈ "override" · "armed" · "held" · "held_stale" · "expired" · "expired_stale" ·
+             "cleared" · "clear_failed" · "unmeasured" · "unbounded_io".
     계약(봉인표 ③): `expired=True` 면 소비자(evaluate)가 hard 를 soft 로 내린다.
       · below            → 래치 삭제(연속만 센다) · expired False
       · unmeasured       → 래치 **무접촉**(codex R1-2): 값을 못 잰 호출이 남의 연속 hard 시계를 0으로
                           되돌리면, 간헐적 ps 실패만으로 상한이 영원히 안 찬다(유계가 사라진다)
-      · 래치 없음/파손   → 지금으로 무장 · expired False (쓰기 실패면 **unbounded_io + expired True**:
-                          유계를 증명할 수 없는 상태에서 무기한 차단을 열어 두지 않는다 — ③ 방향)
+      · 래치 부재/파손   → 지금으로 무장(상한이 지금부터 다시 유계) · 쓰기 실패면 **unbounded_io +
+                          expired**(유계를 증명할 수 없는 상태에서 무기한 차단을 열지 않는다)
+      · 래치 **읽기 불능** → 같은 이유로 unbounded_io + expired (R2 · codex B3)
       · 미래 값(시계 역행) → 다시 무장(같은 취급)
       · hold < 상한      → 유지
       · hold >= 상한     → expired True. **재무장하지 않는다** — 만료는 '이 포화가 끝날 때까지 권고'
                           라는 상태이고, 재무장하면 만료 창을 다른 호출자가 소비해 정작 복구가
                           필요한 편성 호출이 다시 hard 를 만난다(유계가 호출자별로 안 보장된다).
+      · ★만료는 **저장된 상태**다(R2 리뷰 major · codex B1 ①): 종전은 매 호출 `now - since` 로
+        재계산해서, 시계가 2초만 뒤로 가도 만료가 풀리고 차단이 되살아났다(저장값 1000·now=1901 →
+        만료 / now=1899 → 다시 차단). 이제 한 번 만료하면 `below` 관측 전까지 만료다.
+      · ★관측 공백(`now - last > 상한`)은 사유에 `_stale` 로 남긴다 — 그 구간에 실제로 막힌 호출은
+        없으므로 `hold` 수치를 '차단한 시간' 으로 읽으면 안 된다(R2 리뷰 minor · 정직 표기).
     ★부작용 경계: `override` 가 주어지면 파일을 **읽지도 쓰지도 않는다**(self-test·검체 밀폐)."""
     if override is not None:
         return override, "override", bool(state == "hard"
@@ -756,8 +1079,9 @@ def _fleet_hard_hold(state, override=None, now=None):
     if state == "unmeasured":
         return None, "unmeasured", False
     now = time.time() if now is None else now
-    path = _fleet_hold_path()
+    path = _fleet_hold_path(thr)
     if state != "hard":
+        ok = True
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -765,27 +1089,44 @@ def _fleet_hard_hold(state, override=None, now=None):
         except OSError:
             # 지우지 못했으면 그렇게 적는다 — 다음 hard 가 남은 래치 때문에 **더 일찍** 만료된다
             # (방향은 ③ 안전이지만 '연속 보류' 의 의미가 달라지므로 침묵하지 않는다).
-            return None, "clear_failed", False
-        return None, "cleared", False
-    since = None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            since = float((f.read() or "").strip())
-    except (OSError, ValueError):
-        since = None
-    # 미래 판정에 작은 허용오차를 둔다(부동소수 왕복·파일시스템 시계 오차가 재무장을 낳지 않게).
-    if since is None or not math.isfinite(since) or since > now + FLEET_HOLD_FUTURE_SLACK_S:
-        ok = _fleet_hold_write(path, now)
+            ok = False
+        try:
+            os.remove(_fleet_hold_legacy_path())     # R1 잔재 청소(best-effort · 판정 무관)
+        except OSError:
+            pass
+        return (None, "cleared", False) if ok else (None, "clear_failed", False)
+    rec, why = _fleet_hold_read(path)
+    if why == "unreadable":
+        return None, "unbounded_io", True
+    # ★저장된 만료는 **시계 역행보다 먼저** 판정한다(codex 위임 검체 D1): 순서를 뒤집으면 큰
+    #   역행(저장 since 가 now+2s 보다 미래)이 `below` 없이 재무장을 일으켜 **이미 공개된 만료가
+    #   취소되고 차단이 되살아난다** — 만료를 저장한 목적 그 자체가 무너진다.
+    if rec is not None and rec["expired"]:
+        hold = max(0.0, now - rec["since"])
+        stale = (now - rec["last"]) > FLEET_CPU_HARD_MAX_HOLD_SECS
+        _fleet_hold_write(path, {"since": rec["since"], "last": now, "expired": True}, merge=True)
+        return hold, ("expired_stale" if stale else "expired"), True
+    if rec is None or rec["since"] > now + FLEET_HOLD_FUTURE_SLACK_S:
+        # 부재·파손·미래 저장값(시계 역행) → 지금 무장. 쓰기 실패는 유계 증명 불능이다.
+        ok = _fleet_hold_write(path, {"since": now, "last": now, "expired": False})
         return (0.0 if ok else None), ("armed" if ok else "unbounded_io"), (not ok)
     # 허용오차 안의 '미래' 저장값은 음수 경과를 만든다 — 0 으로 죈다(음수 보류초는 뜻이 없다).
-    hold = max(0.0, now - since)
-    return hold, ("expired" if hold >= FLEET_CPU_HARD_MAX_HOLD_SECS else "held"), \
-        hold >= FLEET_CPU_HARD_MAX_HOLD_SECS
+    hold = max(0.0, now - rec["since"])
+    stale = (now - rec["last"]) > FLEET_CPU_HARD_MAX_HOLD_SECS
+    expired = hold >= FLEET_CPU_HARD_MAX_HOLD_SECS
+    ok = _fleet_hold_write(path, {"since": rec["since"], "last": now, "expired": expired},
+                           merge=True)
+    if not ok:
+        return hold, "unbounded_io", True
+    if expired:
+        return hold, ("expired_stale" if stale else "expired"), True
+    return hold, ("held_stale" if stale else "held"), False
 
 
 def _boot_epoch_path():
-    """이 레인 데몬의 `boot-epoch` 경로 — `dirname($CYS_SOCKET)` 우선(부서 레인은 부서 것을 본다)."""
-    sock = os.environ.get("CYS_SOCKET")
+    """이 레인 데몬의 `boot-epoch` 경로 — `dirname(레인 소켓)` 우선(부서 레인은 부서 것을 본다).
+    레인 소켓은 `_lane_socket()`(= `CYS_GATE_LANE_SOCKET` > `CYS_SOCKET`) — R2 리뷰 major 참조."""
+    sock = _lane_socket()
     if sock:
         return os.path.join(os.path.dirname(os.path.abspath(os.path.expanduser(sock))),
                             BOOT_EPOCH_BASENAME)
@@ -915,7 +1256,9 @@ def measure(a):
         # 값 자체가 주입된 호출(self-test·검체)은 래치 파일을 **읽지도 쓰지도 않는다**(밀폐).
         fleet_hold, fleet_hold_reason, fleet_hold_expired = None, "axis_override", False
     else:
-        fleet_hold, fleet_hold_reason, fleet_hold_expired = _fleet_hard_hold(_fleet_state, _hold_ovr)
+        # ★R2: 래치는 **이 호출의 hard 임계별**이다 — 다른 임계 호출이 남의 연속 시계를 못 지운다.
+        fleet_hold, fleet_hold_reason, fleet_hold_expired = _fleet_hard_hold(
+            _fleet_state, _hold_ovr, thr=_fleet_hard_thr)
 
     # ★R1(리뷰 major — 비밀값 전파): 진단(top)은 **hard 일 때만** 모은다. 종전엔 allow 에서도 모아
     #   `measured` 에 실렸고, 그것이 `boot-last.json`(bootstrap log.step)·편성 상태파일
@@ -1196,10 +1539,14 @@ def cmd_check(a):
                   "check 시 --context <pct> 전달 권장.")
         # ★WP-7 N: 부트 유예가 실제로 판정을 바꿨으면 그 사실을 사람에게도 남긴다(조용한 완화 금지).
         if any(c.get("hold_expired") for c in checks):
-            print("fleet_cpu_hold_expired: 이 축이 연속 %ss(>=%ds) hard 였다 — 상한을 넘겨 soft 로 "
+            _stale = str(m.get("fleet_cpu_hold_reason") or "").endswith("_stale")
+            print("fleet_cpu_hold_expired: 첫 hard 관측 이후 %ss(>=%ds) — 상한을 넘겨 soft 로 "
                   "내렸다(봉인표 ③: 다른 부서의 부하가 전멸 부서의 복구를 무기한 막지 않게). "
-                  "포화가 끝나면 래치가 지워지고 이 축은 다시 hard 를 낼 수 있다."
-                  % (m.get("fleet_cpu_hold"), int(FLEET_CPU_HARD_MAX_HOLD_SECS)))
+                  "포화가 끝나면 래치가 지워지고 이 축은 다시 hard 를 낼 수 있다.%s"
+                  % (m.get("fleet_cpu_hold"), int(FLEET_CPU_HARD_MAX_HOLD_SECS),
+                     (" ★그 구간에 **관측 공백**이 있었다(사유 %s) — 이 수치는 '차단한 시간'이 "
+                      "아니라 첫 관측 이후의 벽시계다."
+                      % m.get("fleet_cpu_hold_reason")) if _stale else ""))
         if m.get("boot_grace") and any(c.get("boot_grace") for c in checks):
             print("boot_grace: 데몬 부트 후 %ss(<%ds) — CPU 축 hard 를 soft 로 내렸다. "
                   "유예 밖이면 같은 값이 hard_block 이다."
@@ -1545,19 +1892,23 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("check")
-    c.add_argument("--context", type=_finite_float, default=None, help="자기보고 컨텍스트 %%")
+    c.add_argument("--context", type=_nonneg_float, default=None, help="자기보고 컨텍스트 %%")
     c.add_argument("--json", action="store_true")
     c.add_argument("--servers-soft", type=int, default=2)
     c.add_argument("--servers-hard", type=int, default=3)
     c.add_argument("--nodes-soft", type=int, default=12)
     c.add_argument("--nodes-hard", type=int, default=NODES_HARD_DEFAULT)
-    c.add_argument("--load-soft-ratio", type=_finite_float, default=1.0)
+    # ★R2(리뷰 minor · R1-1 B4 문면 이행): **분율·백분율 인자는 음수도 거부**한다. 종전엔 이 축만
+    #   `_finite_float` 라 `--load-soft-ratio -1` 이 통과했고, 그러면 **모든** load_ratio 가 soft 라
+    #   게이트가 상시 exit 1 이 된다(반대 방향의 조용한 사고 — 임계에 음수가 들어가면 모든 값이
+    #   트립이다). 같은 부류인 context/rate 백분율도 함께 조인다.
+    c.add_argument("--load-soft-ratio", type=_nonneg_float, default=1.0)
     # ★WP-7 N: load 축은 soft 전용이 됐다 — 이 플래그는 **무동작**이다. 삭제하지 않는 이유는
     #   구 호출자가 넘기면 argparse 가 EX_USAGE(64)를 내고 소비부가 그것을 '측정 실패'로 loud 처리하기
     #   때문이다(회귀 방향이 더 나쁘다). 기본값과 다르게 주면 stderr 로 무동작임을 고지한다.
     #   ★R1(리뷰 minor): 판별을 '기본값과 다른가' 가 아니라 **명시 여부**로 한다 — 구 기본값을
     #     그대로 명시한 호출자(`--load-hard-ratio 2.0`)도 축이 사라진 사실을 통보받아야 한다.
-    c.add_argument("--load-hard-ratio", type=_finite_float, default=None,
+    c.add_argument("--load-hard-ratio", type=_nonneg_float, default=None,
                    help="[무동작·0.14.31~] load_ratio 는 soft 전용. 함대 CPU 차단은 --fleet-cpu-hard "
                         "(종전 기본값 %s — 지금은 주든 안 주든 판정이 같다)" % LOAD_HARD_RATIO_DEFAULT)
     c.add_argument("--fleet-cpu-soft", dest="fleet_cpu_soft", type=_nonneg_float,
@@ -1576,11 +1927,12 @@ def main(argv=None):
     c.add_argument("--boot-elapsed-override", dest="boot_elapsed_override", type=_finite_float,
                    default=None,
                    help="테스트 주입 — 데몬 부트 후 경과초(부트 유예 창 판정용 · boot-epoch mtime 대체)")
-    c.add_argument("--context-soft", type=_finite_float, default=50.0)
-    c.add_argument("--context-hard", type=_finite_float, default=60.0)
+    c.add_argument("--context-soft", type=_nonneg_float, default=50.0)
+    c.add_argument("--context-hard", type=_nonneg_float, default=60.0)
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
     c.add_argument("--nodes-override", type=int, default=None, help="테스트 주입")
-    c.add_argument("--load-override", type=_finite_float, default=None, help="테스트 주입")
+    c.add_argument("--load-override", type=_nonneg_float, default=None,
+                   help="테스트 주입 — 1분 부하는 음수일 수 없다")
     c.add_argument("--servers-ledger-override", dest="servers_ledger_override",
                    type=_ledger_override_arg, default=None,
                    help="★A3-b 테스트 주입 — 원장 텍스트 JSON {\"lane\":\"<cys ps 출력>\","
@@ -1592,7 +1944,7 @@ def main(argv=None):
                         "`cys status --json --socket` 조회 전부 생략 · 잘못된 JSON=EX_USAGE 64)")
     c.add_argument("--rate-check", action="store_true",
                    help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
-    c.add_argument("--rate-soft", type=_finite_float, default=80.0, help="rate 5h used_pct soft 임계")
+    c.add_argument("--rate-soft", type=_nonneg_float, default=80.0, help="rate 5h used_pct soft 임계")
     c.add_argument("--rate-override", default=None,
                    help="테스트 주입 — usage-accounts JSON(accounts 배열) 직접 주입")
     c.add_argument("--require-context", dest="require_context", action="store_true",
@@ -1976,10 +2328,16 @@ def _self_test_body(fails):
     # (d') ★07:07 스냅샷 재생(정본 §4 WP-7 수용 기준) — 그날 hard_block 을 낸 입력은 load1=59 하나다.
     #      그때의 함대 CPU 는 **기록이 없다** — 그래서 0.0 으로 고정해 '호스트 부하 축 단독'의 판정만
     #      재생한다(현재 기계 값을 넣으면 그것은 재생이 아니라 합성이다 · codex R1 #11).
+    #      ★R2(리뷰 minor · codex): 종전엔 `--load-override 59` 를 **그대로** 넣었는데 이 축의 판정
+    #      입력은 load1 이 아니라 `load1/ncpu` 다 — 64코어 러너에서는 59/64=0.92 로 soft 에도 못 미쳐
+    #      이 핀이 **기계에 따라 거짓 실패**했다. 그날의 사실은 "16코어에서 load1=59"(비율 3.6875)이므로
+    #      비율을 보존해 재생한다(같은 판정을 어느 코어 수에서도 낸다).
+    _replay_ratio = 59.0 / 16.0
     rc, doc = _cj(["check", "--json", "--servers-override", "0", "--nodes-override", "0",
-                   "--load-override", "59"] + ro, "0707-replay")
+                   "--load-override", repr(_replay_ratio * ncpu_local)] + ro, "0707-replay")
     chk(rc == EXIT_SOFT and _axis(doc, "load_ratio").get("level") == "soft",
-        "07:07 스냅샷(load1=59) 재생이 soft 아님: rc=%r axis=%r" % (rc, _axis(doc, "load_ratio")))
+        "07:07 스냅샷(load1/ncpu=3.6875) 재생이 soft 아님: rc=%r axis=%r"
+        % (rc, _axis(doc, "load_ratio")))
     chk(not [c for c in (doc.get("checks") or []) if c.get("level") == "hard"],
         "07:07 재생에 hard 축이 남아 있다: %r" % (doc.get("trips"),))
     # (e) ★Windows 형상(ps 부재) — checks 에 unavailable 라벨 · measure_errors 무접촉 · exit 계약 불변
@@ -2007,7 +2365,9 @@ def _self_test_body(fails):
         rc, doc = _cj(q + det_boot, "ps-failed")
     finally:
         _g2["_ps_cpu_lines"] = saved_cpu
-    if os.name == "nt":
+    # ★R2(리뷰 minor): 기대값 분기도 프로덕션과 **같은 판정기**를 쓴다(`os.name` 하나가 아니다) —
+    #   MSYS 파이썬(os.name=="posix")에서 이 핀이 거짓 실패하던 길.
+    if _is_windows_host():
         chk(rc == EXIT_ALLOW, "Windows 에서 ps 조회 실패가 exit 를 바꿨다: rc=%r" % rc)
     else:
         chk(rc == EXIT_SOFT and "fleet_cpu(ps)" in ((doc.get("measured") or {})
@@ -2129,17 +2489,23 @@ def _self_test_body(fails):
         _sh.rmtree(_bd, ignore_errors=True)
     # (h2) ★R1 minor — 프로덕션 **기본 경로**(CYS_SOCKET 미설정)를 핀한다. 상수를 바꾸면 유예가
     #      조용히 `epoch_missing` 으로 사라진다(방향은 안전하나 봉인표 ③ 완화 장치가 없어진다).
+    #      ★R2(리뷰 minor): 종전 핀은 `HOME` 을 덮어써 POSIX 문자열을 기대했다 — Windows 의
+    #      `expanduser` 는 `USERPROFILE` 을 보므로 그 기계에서 거짓 실패한다. 핀의 대상은
+    #      **상수의 모양**(`~/.local/state/cys` + basename)이므로 홈 확장은 양쪽 다 같은 함수로 하고
+    #      세그먼트만 핀한다.
     saved_sock = os.environ.pop("CYS_SOCKET", None)
-    saved_home = os.environ.get("HOME")
+    saved_lane = os.environ.pop("CYS_GATE_LANE_SOCKET", None)
     try:
-        os.environ["HOME"] = "/nonexistent-home-for-pin"
-        chk(_boot_epoch_path() == "/nonexistent-home-for-pin/.local/state/cys/boot-epoch",
-            "boot-epoch 기본 경로(DEFAULT_STATE_DIR)가 바뀌었다: %r" % _boot_epoch_path())
+        want = os.path.join(os.path.expanduser("~"), ".local", "state", "cys",
+                            BOOT_EPOCH_BASENAME)
+        chk(_boot_epoch_path() == want,
+            "boot-epoch 기본 경로(DEFAULT_STATE_DIR)가 바뀌었다: %r(기대 %r)"
+            % (_boot_epoch_path(), want))
     finally:
-        if saved_home is not None:
-            os.environ["HOME"] = saved_home
         if saved_sock is not None:
             os.environ["CYS_SOCKET"] = saved_sock
+        if saved_lane is not None:
+            os.environ["CYS_GATE_LANE_SOCKET"] = saved_lane
     # (i) ★계측 타당성 음성 대조: 신설 축이 **없던** 코드에서는 이 판정이 성립할 수 없다.
     #     load 축 hard 키가 None 이라는 사실 자체가 'soft 전용 강등'의 유일한 기계 증거다.
     chk(_axis(_cj(q + det_boot + ["--fleet-cpu-override", "0.0"], "shape")[1],
@@ -2283,18 +2649,24 @@ def _self_test_body(fails):
     rc, _doc = _cj(q + det_boot + ["--fleet-cpu-override", "0.0"], "finite-ok")
     chk(rc == EXIT_ALLOW, "유한한 override 가 거부됐다: rc=%r" % rc)
     # (h3) ★R1 minor — Windows 판별이 인터프리터 os.name 하나가 아니다(MSYS python + MSYS ps 조합)
+    #      ★R2: Git Bash 형상은 `MSYSTEM` **하나가 아니라** Windows 환경 상속(WINDIR 등)과 **함께**
+    #      온다 — 그 조합을 재현한다. `MSYSTEM` 단독이 Windows 로 접히면 안 된다는 반대 방향은
+    #      아래 (r3) 이 따로 핀한다(POSIX 측정 실패의 조용한 allow 차단).
     saved_msys = os.environ.get("MSYSTEM")
+    saved_windir = os.environ.get("WINDIR")
     saved_cpu4 = _g2["_ps_cpu_lines"]
     try:
         os.environ["MSYSTEM"] = "MINGW64"
+        os.environ["WINDIR"] = "C:\\Windows"
         _g2["_ps_cpu_lines"] = lambda: (None, "failed")
         rc, doc = _cj(q + det_boot, "msys-ps-failed")
     finally:
         _g2["_ps_cpu_lines"] = saved_cpu4
-        if saved_msys is None:
-            os.environ.pop("MSYSTEM", None)
-        else:
-            os.environ["MSYSTEM"] = saved_msys
+        for _k, _v in (("MSYSTEM", saved_msys), ("WINDIR", saved_windir)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
     chk(rc == EXIT_ALLOW and not [e for e in ((doc.get("measured") or {})
                                               .get("measure_errors") or []) if "fleet" in e],
         "Git Bash(MSYS) 에서 ps 실패가 상시 soft 로 굳어 완료 검증이 영구 skip 된다: rc=%r m=%r"
@@ -2329,6 +2701,216 @@ def _self_test_body(fails):
         main(q + det_boot + ["--fleet-cpu-override", "0.0"])
     chk("무동작" not in buf.getvalue(), "플래그를 안 줬는데 무동작 고지가 나갔다")
 
+    # ══ ★R2 리뷰 반영 핀 ══════════════════════════════════════════════════════
+    # (r1) blocking — '실행 형상' 상수의 정본은 preflight 하나다. 값 복사를 금지한다.
+    chk(_PF is not None, "javis_preflight 를 import 하지 못했다 — 상수 정본이 폴백으로 굳었다")
+    if _PF is not None:
+        for _name, _got in (("_CLAUDE_EXE_NAMES", _CLAUDE_EXE_NAMES),
+                            ("_CLAUDE_INSTALL_MARKER", _CLAUDE_INSTALL_MARKER),
+                            ("_CLAUDE_NPM_MARKER", _CLAUDE_NPM_MARKER),
+                            ("_JS_SUFFIXES", _JS_SUFFIXES),
+                            ("_JS_RUNTIME_NAMES", _PF_JS_RUNTIME_NAMES)):
+            chk(getattr(_PF, _name) == _got,
+                "preflight 정본과 게이트 상수가 갈라졌다(%s): %r ≠ %r"
+                % (_name, getattr(_PF, _name), _got))
+        chk(FLEET_ARGV0_MARKERS[0][0] == _PF._CLAUDE_INSTALL_MARKER
+            and FLEET_JS_BUNDLE_MARKERS[0][0] == _PF._CLAUDE_NPM_MARKER
+            and set(FLEET_EXE_SUFFIXES) == {".exe", ".cmd"}
+            and FLEET_JS_RUNTIMES >= {"node", "bun"},
+            "게이트 표가 preflight 상수에서 파생되지 않았다(값 복사 잔존)")
+        # (r2) ★판정 **규칙**은 일부러 다르다 — 그 차이를 목록으로 못박는다(codex R2 D1 최소 보완).
+        #      preflight strict 는 argv0 basename 을 **소문자로 접어** 비교하므로 macOS GUI 앱
+        #      번들(`/Applications/Claude.app/Contents/MacOS/Claude`)을 claude 로 인정한다 — 그 축은
+        #      '놓치지 않는 것'이 안전 방향이라 옳지만, CPU **합**에 그것이 실리면 조직 기동 거부
+        #      (B2 재발)다. 반대로 이 축은 실행 대상을 첫 비옵션 토큰 하나로 좁혀 데이터 인자를
+        #      승격시키지 않는다. 아래 표가 바뀌면(= preflight 파서가 바뀌면) 이 핀이 먼저 운다.
+        import shlex as _shlex
+        _diff_want = {
+            # cmd: (gate 가 claude 로 보나, preflight strict 가 claude 로 보나)
+            "/Applications/Claude.app/Contents/MacOS/Claude": (False, True),
+            "node /usr/local/bin/claude": (True, False),
+            "node /tmp/report.js /x/claude-code/cli.js": (False, True),
+            "claude --dangerously-skip-permissions": (True, True),
+            "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js": (True, True),
+            "tail -f /x/claude-code/debug.log": (False, False),
+        }
+        for _cmd, _want in _diff_want.items():
+            try:
+                _toks = _shlex.split(_cmd)
+            except ValueError:
+                _toks = _cmd.split()
+            _got = (_fleet_owner(_cmd) == "claude", bool(_PF._is_claude_command(_toks, strict=True)))
+            chk(_got == _want,
+                "게이트↔preflight 의도된 차이표 이탈(%s): %r ≠ 기대 %r" % (_cmd, _got, _want))
+    # (r3) MSYSTEM **단독**은 Windows 증명이 아니다(R1 반박 기각 · 조용한 allow 차단)
+    _wenv = {k: os.environ.get(k) for k in ("MSYSTEM", "WINDIR", "SYSTEMROOT", "OS")}
+    try:
+        for k in ("WINDIR", "SYSTEMROOT", "OS"):
+            os.environ.pop(k, None)
+        os.environ["MSYSTEM"] = "MINGW64"
+        if os.name != "nt" and sys.platform not in ("msys", "cygwin"):
+            chk(_is_windows_host() is False,
+                "MSYSTEM 하나로 Windows 판정 — POSIX 측정 실패가 조용한 allow 가 된다")
+            os.environ["WINDIR"] = "C:\\Windows"
+            chk(_is_windows_host() is True, "MSYSTEM+WINDIR 조합이 Windows 로 안 잡힌다")
+    finally:
+        for k, v in _wenv.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # (r4) ps 디코딩 실패(UnicodeDecodeError)가 exit 70 으로 새지 않는다 — Windows 분류에 닿는다
+    _saved_run = subprocess.run
+
+    def _decode_boom(*_a, **_k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+    try:
+        subprocess.run = _decode_boom
+        _lines, _why = _ps_cpu_lines()
+    finally:
+        subprocess.run = _saved_run
+    chk((_lines, _why) == (None, "failed"),
+        "ps 디코딩 실패가 '측정 실패' 로 분류되지 않는다(최상위 경계로 새어 exit 70): %r/%r"
+        % (_lines, _why))
+    # (r5) 소유권 — R2 가 닫은 오탐과, 새로 잡게 된 진짜 형상
+    for _cmd, _want, _tag in (
+            ("python3 report.py /tmp/serena", None, "상대 스크립트 뒤 데이터 인자"),
+            ("node report.js /tmp/codex", None, "상대 스크립트 뒤 데이터 인자(JS)"),
+            ("python3 -cprint(1) /tmp/serena", None, "값이 붙은 코드모드 클러스터"),
+            ("python3 - /tmp/serena", None, "stdin 스크립트"),
+            ("npm run codex", None, "npm 스크립트 이름"),
+            ("yarn codex", None, "yarn 스크립트 이름"),
+            ("pnpm run gemini", None, "pnpm 스크립트 이름"),
+            ("npm exec codex", "codex", "npm exec 는 프로그램 실행이다"),
+            ("node --require preload.js /opt/node_modules/@openai/codex/bin/codex.js",
+             "codex", "값을 먹는 긴 옵션 뒤의 진짜 대상"),
+            ("python3 -W ignore /opt/venv/bin/serena start-mcp-server",
+             "serena", "값을 먹는 짧은 옵션 뒤의 진짜 대상"),
+            ("python3 -Wignore /opt/venv/bin/serena", "serena", "붙은 값은 다음 토큰을 안 먹는다"),
+            ("node --max-old-space-size=4096 /x/bin/codex", "codex", "= 형 긴 옵션"),
+            # ★codex 위임 검체(R2) 가 찾아낸 것들 — D3~D7
+            ("python3 -Wmodule /tmp/serena", "serena", "값 안의 m 을 모듈 모드로 오독(D3)"),
+            ("node -rpreload.js /tmp/codex", "codex", "값 안의 p 를 print 모드로 오독(D3)"),
+            ("node -Cdevelopment /tmp/codex", "codex", "값 안의 e 를 eval 모드로 오독(D3)"),
+            ("uv codex", None, "uv 는 하위 명령 없이 프로그램을 실행하지 않는다(D4)"),
+            ("pipx codex", None, "pipx 도 동일(D4)"),
+            ("yarn npx codex", None, "스크립트 이름 자리의 토큰이 런처로 승격(D5)"),
+            ("uvx npm run codex", None, "중첩 런처가 규칙을 갈아탄 뒤의 스크립트 이름(D5 음성)"),
+            ("npm exec -- codex", "codex", "옵션 끝 표시가 실행 대상을 삼킴(D6)"),
+            ("npx --yes codex", "codex", "불리언 긴 옵션이 대상을 값으로 먹음(D7)"),
+            ("pipx run serena", "serena", "pipx run 은 정상 형상(D4 음성 대조)")):
+        chk(_fleet_owner(_cmd) == _want,
+            "소유권 R2 규칙 이탈(%s): %r → %r(기대 %r)" % (_tag, _cmd, _fleet_owner(_cmd), _want))
+    # (r6) 래치 — 레인 전용 변수 · 임계 격리 · 만료 영속 · 읽기 불능 · 관측 공백 표기 · 해시 불멸
+    _hd2 = _tf.mkdtemp()
+    _st2 = os.environ.get("CYS_STATE_DIR")
+    _sk2 = os.environ.pop("CYS_SOCKET", None)
+    _ln2 = os.environ.pop("CYS_GATE_LANE_SOCKET", None)
+    try:
+        os.environ["CYS_STATE_DIR"] = _hd2
+        t1 = 1_000_000.0
+        chk(_fleet_hard_hold("hard", now=t1, thr=1.0)[1] == "armed", "임계별 무장 실패")
+        chk(_fleet_hard_hold("below", now=t1 + 10, thr=2.0)[1] == "cleared",
+            "다른 임계의 below 가 cleared 로 안 나옴")
+        h, why, exp = _fleet_hard_hold("hard", now=t1 + 20, thr=1.0)
+        chk(abs(h - 20) < 1e-6 and why == "held",
+            "다른 임계 호출이 기본 임계 래치를 지웠다(상한이 영영 안 찬다): %r/%r" % (h, why))
+        h, why, exp = _fleet_hard_hold("hard", now=t1 + FLEET_CPU_HARD_MAX_HOLD_SECS + 1, thr=1.0)
+        chk(exp and why == "expired", "상한 초과가 만료로 안 잡힘: %r" % (why,))
+        h2, why2, exp2 = _fleet_hard_hold("hard", now=t1 + FLEET_CPU_HARD_MAX_HOLD_SECS - 1,
+                                          thr=1.0)
+        chk(exp2 and why2 == "expired",
+            "시계를 되돌리자 만료가 풀려 차단이 되살아났다(만료가 상태가 아니다): %r/%r" % (h2, why2))
+        _fleet_hard_hold("below", now=t1 + 2000, thr=1.0)
+        _fleet_hold_write(_fleet_hold_path(1.0), {"since": t1, "last": t1, "expired": False})
+        h3, why3, exp3 = _fleet_hard_hold("hard", now=t1 + 7200, thr=1.0)
+        chk(exp3 and why3 == "expired_stale",
+            "관측 공백이 있는 만료가 '연속 포화' 로 표기됐다(수치 오독 유발): %r/%r" % (h3, why3))
+        # 읽기 불능 = 유계 증명 불능 → 만료(무기한 차단을 열지 않는다).
+        # ★대역 없이 재현한다: 래치 자리에 **디렉터리**를 두면 `open()` 이 OSError 를 낸다
+        #   (IsADirectory/Permission — 어느 쪽이든 FileNotFoundError 가 아니다). 모듈 전역·builtins
+        #   을 건드리지 않는 방식이라 import 가드(정적 증명 가능 형태)와도 어긋나지 않는다.
+        _dirlatch = _fleet_hold_path(1.0)
+        try:
+            os.remove(_dirlatch)
+        except OSError:
+            pass
+        os.makedirs(_dirlatch, exist_ok=True)
+        h4, why4, exp4 = _fleet_hard_hold("hard", now=t1 + 7300, thr=1.0)
+        _sh.rmtree(_dirlatch, ignore_errors=True)
+        chk((h4, why4, exp4) == (None, "unbounded_io", True),
+            "래치 읽기 불능이 '지금 무장' 으로 접혀 상한이 매번 초기화된다: %r/%r/%r"
+            % (h4, why4, exp4))
+        # ★codex 위임 검체 D1 — 저장된 만료는 **큰 시계 역행**에도 취소되지 않는다
+        _fleet_hard_hold("below", now=t1 + 8000, thr=1.0)
+        chk(_fleet_hard_hold("hard", now=1000.0, thr=1.0)[1] == "armed", "D1 준비 무장 실패")
+        chk(_fleet_hard_hold("hard", now=1900.0, thr=1.0)[2] is True, "D1 준비 만료 실패")
+        _h, _w, _e = _fleet_hard_hold("hard", now=997.0, thr=1.0)
+        chk(_e is True and _w == "expired",
+            "큰 시계 역행이 만료를 취소하고 차단을 되살렸다(만료 판정이 역행 검사 뒤에 있다): %r/%r"
+            % (_w, _e))
+        # ★codex 위임 검체 D2 — 늦은 쓰기가 남의 만료를 되돌리지 않는다(단조 병합)
+        _fleet_hold_write(_fleet_hold_path(1.0), {"since": 1000.0, "last": 1900.0,
+                                                  "expired": True})
+        _fleet_hold_write(_fleet_hold_path(1.0), {"since": 1000.0, "last": 1800.0,
+                                                  "expired": False}, merge=True)
+        _rec, _ = _fleet_hold_read(_fleet_hold_path(1.0))
+        chk(_rec and _rec["expired"] is True and _rec["last"] == 1900.0,
+            "병합 쓰기가 이미 공개된 만료를 되돌렸다(동시 호출에서 차단이 되살아난다): %r" % (_rec,))
+        # ★codex 위임 검체 D9·D10 — 파손 래치가 예외로 게이트를 죽이지 않는다
+        _cp = _fleet_hold_path(1.0)
+        with open(_cp, "wb") as _f:
+            _f.write(b"\xff\xfe not utf-8")
+        chk(_fleet_hold_read(_cp) == (None, "corrupt"),
+            "디코딩 불가 래치가 예외로 새어 exit 70 이 된다: %r" % (_fleet_hold_read(_cp),))
+        with open(_cp, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps({"since": int("9" * 400), "last": 1}))
+        chk(_fleet_hold_read(_cp) == (None, "corrupt"),
+            "유한 float 로 못 바꾸는 저장 시각이 OverflowError 로 새어 exit 70 이 된다: %r"
+            % (_fleet_hold_read(_cp),))
+        os.remove(_cp)
+        # 레인 키 — 긴 이름에서도 해시가 살아 있고, 같은 디렉터리의 두 소켓이 갈린다
+        os.environ["CYS_GATE_LANE_SOCKET"] = "/a/" + ("x" * 90) + "/cys.sock"
+        _p1 = _fleet_hold_path(1.0)
+        os.environ["CYS_GATE_LANE_SOCKET"] = "/b/" + ("x" * 90) + "/cys.sock"
+        _p2 = _fleet_hold_path(1.0)
+        chk(_p1 != _p2, "긴 레인 이름에서 충돌 방지 해시가 잘려 두 레인이 래치를 공유한다: %r" % _p1)
+        os.environ["CYS_GATE_LANE_SOCKET"] = "/d/lane/a.sock"
+        _p3 = _fleet_hold_path(1.0)
+        os.environ["CYS_GATE_LANE_SOCKET"] = "/d/lane/b.sock"
+        chk(_p3 != _fleet_hold_path(1.0),
+            "같은 디렉터리의 두 소켓이 같은 래치를 쓴다(레인 해시가 dirname 기준)")
+        # 임계 키 정규화 — 1 · 1.0 · 1e0 은 같은 래치, ±0 도 하나
+        chk(len({_fleet_hold_path(1), _fleet_hold_path(1.0), _fleet_hold_path(float("1e0"))}) == 1
+            and _fleet_hold_path(-0.0) == _fleet_hold_path(0.0),
+            "임계 키가 문자열 표기에 따라 갈린다(같은 임계가 두 래치를 쓴다)")
+        # 레인 전용 변수가 CYS_SOCKET 보다 우선한다(부수 호출 오염 없이 레인만 바꾼다)
+        os.environ["CYS_SOCKET"] = "/main/cys.sock"
+        os.environ["CYS_GATE_LANE_SOCKET"] = "/dept/cys.sock"
+        chk(_boot_epoch_path() == os.path.join("/dept", BOOT_EPOCH_BASENAME),
+            "레인 전용 변수가 boot-epoch 레인을 못 바꾼다: %r" % _boot_epoch_path())
+        os.environ.pop("CYS_GATE_LANE_SOCKET")
+        chk(_boot_epoch_path() == os.path.join("/main", BOOT_EPOCH_BASENAME),
+            "레인 전용 변수 부재 시 CYS_SOCKET 폴백이 깨졌다: %r" % _boot_epoch_path())
+    finally:
+        if _st2 is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = _st2
+        for _k, _v in (("CYS_SOCKET", _sk2), ("CYS_GATE_LANE_SOCKET", _ln2)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        _sh.rmtree(_hd2, ignore_errors=True)
+    # (r7) 분율·백분율 인자는 **음수도** 거부한다(R1-1 B4 문면 이행 · 반대 방향의 조용한 사고 차단)
+    for bad in (["--load-soft-ratio", "-1"], ["--context-hard", "-1"],
+                ["--context-soft", "-1"], ["--rate-soft", "-5"], ["--load-override", "-2"],
+                ["--load-hard-ratio", "-1"], ["--context", "-1"]):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            rc = main(q + det_boot + ["--fleet-cpu-override", "0.0"] + bad)
+        chk(rc == EXIT_USAGE, "%r 가 EX_USAGE(64) 로 거부되지 않았다: rc=%r" % (bad, rc))
+
     if fails:
         print("javis_resource_gate self-test FAIL:")
         for f in fails:
@@ -2347,6 +2929,10 @@ def _self_test_body(fails):
           " PID 자기제외 2 · 보류 상한 4점+타축 불변+warnings 불변+래치 순수 10 ·"
           " nan/inf EX_USAGE 8+유한 정상 1 · MSYS/unsupported 3 · 무동작 고지 3 ·"
           " 진단 비밀값 0/allow 무수집 2)"
+          " + ★R2 리뷰 반영 47종(preflight 상수 정본화 6 + 판정기 의도된 차이표 6 ·"
+          " MSYSTEM 단독 부정 2 · ps 디코딩 실패 1 · 소유권 오탐/정례 12 ·"
+          " 래치(임계 격리 3·만료 영속 2·읽기불능 1·관측공백 표기 1·레인 해시 3·임계 키 1·레인 변수 2) ·"
+          " 음수 분율 EX_USAGE 7 · codex 위임 검체 D1/D2/D3~D7/D9/D10 16)"
           " + A3 부서 로스터 8종(좌석 합산 22·floor 유지·응답 실패 soft·실데이터 9좌석 soft/hard 판별+"
           "음성 대조·--nodes-hard 우선·잘못된 주입 64·override 단락·라이브 경로 대역)")
     return 0

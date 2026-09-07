@@ -186,6 +186,45 @@ try:
           all("cmd" not in (r or {}) for r in
               ((compact.get("measured") or {}).get("fleet_cpu_top") or [])),
           repr((compact.get("measured") or {}).get("fleet_cpu_top")))
+    # ⑩-2 ★R2(리뷰 minor): 위 10b 는 `fleet_hard` 가 **CPU override** 로 만들어져 실제 ps 행이 없다 —
+    #     `all(... for r in [])` 라 누출 구현을 넣어도 통과하는 공허한 단언이었다(리뷰 실측: top=[]).
+    #     여기서는 **진짜 ps 경로**를 태운다: PATH 앞에 비밀값이 든 행을 내는 `ps` 스텁을 두고
+    #     override 없이 게이트를 부른 뒤, 영속 경로(measured → `_gate_compact`)에 인자가 없는지 본다.
+    if os.name == "nt":
+        print("SKIP 10c ps 스텁(POSIX 전용)")
+    else:
+        SECRET = "sk-DO-NOT-PERSIST-9f3a"
+        stub = os.path.join(_ROOT, "stubbin")
+        os.makedirs(stub, exist_ok=True)
+        with open(os.path.join(stub, "ps"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/bin/sh\n"
+                    "printf '%s\\n' '  PID %CPU COMMAND'\n"
+                    "printf '%s\\n' ' 4242 87.5 /usr/local/bin/codex --api-key " + SECRET + " --x'\n"
+                    "printf '%s\\n' ' 4243  1.5 /usr/local/bin/cysd --socket /tmp/" + SECRET + "'\n")
+        os.chmod(os.path.join(stub, "ps"), 0o755)
+        env = dict(os.environ, PATH=stub + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run([sys.executable, GATE, "check", "--json",
+                            "--dept-roster-override", ROSTER,
+                            "--boot-elapsed-override", "99999",
+                            "--servers-override", "0", "--nodes-override", "0",
+                            "--load-override", "0.0",
+                            # 임계를 낮춰 **어느 코어 수에서도** hard 가 되게 한다(진단 수집 조건).
+                            "--fleet-cpu-hard", "0.000001", "--fleet-cpu-soft", "0.0000001"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=60, env=env)
+        try:
+            doc = json.loads(r.stdout.strip())
+        except ValueError as e:
+            doc = {}
+            fails.append("10c 게이트 JSON 파싱 실패: %s / %s" % (e, r.stderr[-300:]))
+        top = ((doc.get("measured") or {}).get("fleet_cpu_top") or [])
+        check("10c 계측 타당성 — 스텁 ps 행이 실제로 수집됐다(공허한 단언 아님)",
+              len(top) >= 1 and any(t.get("pid") == 4242 for t in top), repr(top))
+        check("10d 진단 행에 인자가 없다(키는 pid/exe/owner/pcpu 뿐)",
+              all(set(t or {}) <= {"pid", "exe", "owner", "pcpu"} for t in top), repr(top))
+        cmp2 = F._gate_compact(doc) or {}
+        check("10e 영속 경로(_gate_compact measured)에 비밀값이 없다",
+              SECRET not in json.dumps(cmp2, ensure_ascii=False), json.dumps(cmp2)[:200])
+        check("10f 사람 출력에도 비밀값이 없다", SECRET not in (r.stdout + r.stderr))
 
     # ⑪ ★nan: 조용한 allow 도, 비표준 JSON 도 아니고 **사용오류**다.
     r_nan = subprocess.run([sys.executable, GATE, "check", "--json",

@@ -24,7 +24,11 @@ import types
 import unittest
 from unittest import mock
 
-BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+# ★R2(리뷰 major): 이 파일은 종전 `cysjavis-pack/tests/` 에 있었고 **어느 CI 레인에서도 실행되지
+#   않았다**(3레인은 `cysjavis-pack/bin/tests/` 만 이름으로 열거한다 · 글롭·pytest 없음).
+#   480235d 가 깬 스위트가 바로 이것이라, 그 회귀는 다음에 또 나도 CI 가 녹색이었다.
+#   `bin/tests/` 로 옮겨 3레인 등재 대상에 넣는다(등재 자체는 CONTRACTS §B-9 통합 단계 소관).
+BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 

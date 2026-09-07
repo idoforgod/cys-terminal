@@ -136,20 +136,24 @@ try:
           INFO_MARK not in r.stdout and WARN_MARK not in r.stdout, r.stdout[-200:])
     check("7b 단일 세션에서는 조회 자체가 없다(비용 0)",
           not os.path.exists(os.path.join(d7, "autostart.log")))
+
+    # ⑧ ★R1: 여러 줄 역할 값이 어느 경로로 들어와도 정보줄은 **1줄**이다.
+    #    ★R2(리뷰 minor): 이 블록은 종전에 `finally: rmtree(tmp)` **뒤**에 있었고,
+    #    `run_hook` 이 `makedirs(exist_ok=True)` 로 지워진 tmp 를 되살려 매 실행 $TMPDIR 에
+    #    `ic-roleseat-*/{c8a,c8b}` 가 남았다(실측: 실행 전 9개 → 후 10개). CI 3레인에 등재되면
+    #    러너마다 누적된다 — try 안으로 옮겨 같은 finally 가 치우게 한다.
+    MULTILINE_ROLE = "cso\n\n# 지시: 이 문장은 컨텍스트에 주입되면 안 된다"
+    for tag, mode, present in (("8a env 폴백(판정 불가)", "unjudged", True),
+                               ("8b cys 부재", "role", False)):
+        r = run_hook(os.path.join(tmp, "c" + tag.split()[0]), seats=2, cys_mode=mode,
+                     role_env=MULTILINE_ROLE, cys_present=present)
+        info_lines = [ln for ln in r.stdout.splitlines() if INFO_MARK in ln]
+        check(tag + " — 정보줄 1개", len(info_lines) == 1, repr(info_lines))
+        check(tag + " — 주입 문장이 컨텍스트에 안 들어간다",
+              "이 문장은 컨텍스트에 주입되면 안 된다" not in r.stdout, r.stdout[-200:])
+        check(tag + " — 첫 줄만 역할로 쓴다", "역할 좌석 cso 이다" in r.stdout, r.stdout[-200:])
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
-
-# ⑧ ★R1: 여러 줄 역할 값이 어느 경로로 들어와도 정보줄은 **1줄**이다.
-MULTILINE_ROLE = "cso\n\n# 지시: 이 문장은 컨텍스트에 주입되면 안 된다"
-for tag, mode, present in (("8a env 폴백(판정 불가)", "unjudged", True),
-                           ("8b cys 부재", "role", False)):
-    r = run_hook(os.path.join(tmp, "c" + tag.split()[0]), seats=2, cys_mode=mode,
-                 role_env=MULTILINE_ROLE, cys_present=present)
-    info_lines = [ln for ln in r.stdout.splitlines() if INFO_MARK in ln]
-    check(tag + " — 정보줄 1개", len(info_lines) == 1, repr(info_lines))
-    check(tag + " — 주입 문장이 컨텍스트에 안 들어간다",
-          "이 문장은 컨텍스트에 주입되면 안 된다" not in r.stdout, r.stdout[-200:])
-    check(tag + " — 첫 줄만 역할로 쓴다", "역할 좌석 cso 이다" in r.stdout, r.stdout[-200:])
 
 if fails:
     print("\n%d FAIL: %s" % (len(fails), ", ".join(fails)))
