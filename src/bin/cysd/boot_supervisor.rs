@@ -2042,6 +2042,7 @@ fn notify_no_spawn(
                     text,
                     cr_delay_ms: 120,
                     clear_first: false,
+                    guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
                 });
             }
         }

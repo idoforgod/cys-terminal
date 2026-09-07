@@ -1465,6 +1465,7 @@ fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
             text: envelope.to_string(),
             cr_delay_ms: 500,
             clear_first: false,
+            guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
         })
         .is_ok()
 }

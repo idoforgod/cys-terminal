@@ -4206,6 +4206,16 @@ pub enum CloseCause {
 /// Close a surface: kill the entire descendant process tree, then the shell itself.
 /// 고아 서버 누적(load 폭주의 원인)을 원천 차단하는 지점.
 pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result<(), String> {
+    // ★(0.14.31 · 리뷰 R1 · codex blocking) 만료 큐 처분은 **맵에서 빼기 전에** 한다.
+    //   종전에는 제거 뒤에 묘비를 시도했고, 실패분은 분리된 Surface 안에만 남아 다음 스냅샷에서
+    //   사라졌다(원장도 없고 항목도 없다 = 조용한 유실). 제거 전이면 그 사이의 persist 도 항목을
+    //   본다. 묘비(원장 fsync) → 실패분을 데몬 보존소로 이관(목적지 먼저) 순서다.
+    if let Some(pre) = daemon.get_surface(id) {
+        discard_expired_queue(daemon, &pre, "expired");
+        if park_expired_to_restored(daemon, &pre) > 0 {
+            daemon.persist_queue_state();
+        }
+    }
     // 멤버십 제거 + 역할 정리를 surfaces 락 아래 한 임계영역에서 —
     // claim_role과 동일한 락 순서(surfaces → roles → surface.role)로 AB-BA 데드락 차단.
     let surface = {
@@ -4271,8 +4281,12 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
             crate::state::queue_dropped_payload("surface_closed", &dropped, None),
         );
     }
-    // ★(0.14.31 · WP-5 M) 만료 큐 drain — 원장 묘비(`expired`) 기록 후 폐기(삭제 없음 약속).
+    // ★(0.14.31 · WP-5 M) 만료 큐는 위(맵 제거 **전**)에서 이미 처분했다. 그 사이에 새로 만료된
+    //   항목이 있을 수 있으므로 한 번 더 — 이 시점의 실패분은 보존소로 간다(도달 가능 유지).
     discard_expired_queue(daemon, &surface, "expired");
+    if park_expired_to_restored(daemon, &surface) > 0 {
+        daemon.persist_queue_state();
+    }
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -4385,6 +4399,10 @@ fn queue_min_interval_secs() -> u64 {
 /// ★(0.14.31 · WP-5 M) 만료 큐(`Surface::expired_queue`) 상한 — 초과분은 가장 오래된 것부터
 /// 원장 묘비(`expired_evicted`) 기록 후 폐기한다(기록 실패 시 폐기하지 않는다).
 pub(crate) const QUEUE_EXPIRED_CAP: usize = 100;
+
+/// ★(0.14.31 · 리뷰 R1 · codex) 한 틱에 축출하는 만료 항목 수 상한 — 묘비 append 가 fsync 를
+/// 동반하므로(내구성 수리) 무제한 축출은 watchdog 을 원장 I/O 에 묶는다. 초과분은 다음 틱.
+pub(crate) const QUEUE_EXPIRED_EVICT_PER_TICK: usize = 20;
 
 /// ★(0.14.31 · WP-5) 커서행 근방에서 **작업 중** 을 뜻하는 어휘 — 이 어휘가 커서행 ±3행 안에
 /// 보이면 출력이 잠시 멎었어도 턴이 끝난 것이 아니다(claude `✻ Thinking… (esc to interrupt)`).
@@ -5252,6 +5270,152 @@ pub(crate) struct Delivered {
 ///   하지 않고** None — RPC 강제 배달이 게이트 통과·조준 해석과 실배달 사이 창에서 틱·clear 와
 ///   경합해도 '조준한 항목이 아닌 다음 항목'을 forced 로 오배달하지 않는다(pop-by-id 와 같은
 ///   belt-and-suspenders 층). watchdog 틱은 None 을 넘긴다('그 시점 머리'가 곧 조준 — 현행 동일).
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) **인계 자격 재판정**(순수 관측 · I/O 0) — `deliver_head_locked`
+/// 이 두 번 부른다: ① 원장 선기록 **앞**(보류할 배달을 원장에 남기지 않기 위해) ② `try_send`
+/// **직전**(원장 append·회전이 도는 동안 화면·승인이 바뀌었을 수 있으므로).
+///
+/// 종전에는 ①만 있었고 그 사이에 원장 I/O 가 있었다 — 디스크가 느리면 그 창에 모달이 다 그려져도
+/// 낡은 승인으로 본문+CR 이 나갔다(codex 리뷰 blocking). 판정 재료는 전부 메모리·파서 락 읽기라
+/// 두 번 돌아도 비용이 없다.
+///
+/// 반환 false = 지금은 배달 자격이 없다(호출부는 메시지를 보존하고 다음 틱에 재시도).
+fn handoff_gate_ok(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    expect_output_gen: Option<u64>,
+    recheck: Option<&ScreenRecheck>,
+) -> bool {
+    let now_gen = s.output_gen.load(Ordering::Acquire);
+    if now_gen % 2 == 1 {
+        return false; // reader 가 청크를 반영하는 중 — 화면에 없는 바이트가 이미 도착해 있다
+    }
+    if let Some(gen) = expect_output_gen {
+        // ★(0.14.31 · 리뷰 R5 · codex major) 정적(quiet) 기반 판정은 **그 프레임**이어야 한다.
+        if now_gen != gen {
+            return false; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
+        }
+    }
+    // ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) 세대 불변을 **요구하지 않는** 경로(비-alt B1)의
+    //   안전축 재평가. 종전에는 여기서 홀수만 봤으므로, 판정(짝수 20) 이후 인계 전에 화면이
+    //   **완결된 채로** 바뀌어(짝수 22) 모달이 다 그려지거나 alt 로 전환돼도 20 의 승인으로
+    //   본문이 나갔다(codex 반례). 지금은 그때 **같은 순수 판정자**를 현재 프레임에 다시 돌린다.
+    //   ⓐ 새 quiet 임계를 만들지 않는다 — 비-alt 계약("프롬프트 박스가 열려 있으면 출력 중이라도
+    //     주입")은 그대로다. 재평가 결과가 alt 이면 alt 축(레이아웃·정적·일관성)이 그대로 걸린다.
+    //   ⓑ 재평가 관측 자체는 **한 프레임의 사실**이어야 한다(`frame_consistent`) — 화면 복사와
+    //     세대 읽기 사이에 reader 가 다른 화면을 발행하면 그 재평가가 합성이다(codex R7 D5).
+    //   ⓒ 승인 feed 는 화면 세대와 무관하게 바뀔 수 있으므로 **세대 변화와 무관하게** 다시 읽는다.
+    //   【한계 — 정직】 이 검사 뒤 `try_send` 전에 새 청크가 도착하는 창은 여전히 남는다
+    //   (reader 는 `input_gate` 를 공유하지 않는다 — 백로그 ⑭).
+    if let Some(rc) = recheck {
+        // ★(0.14.31 · 리뷰 R1 · codex) 승인·관문 feed 는 **모든 경로에서** 다시 읽는다. 종전에는
+        //   이 재확인이 `recheck` 가 있는 경로(비-alt)에만 걸려서, alt-screen 양성 유휴 배달은
+        //   판정 이후 승인이 떠도 `output_gen` 만 같으면 그대로 나갔다(승인 feed 는 화면 세대
+        //   없이 바뀐다 — §8 "승인 대기 게이트는 어떤 경로에서도 면제되지 않는다").
+        if approval_or_gate_pending(daemon, s.id) != rc.approval_pending {
+            return false; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
+        }
+        match rc.marker.as_deref() {
+            Some(marker) if now_gen != rc.gen_at_verdict => {
+                let obs = observe_prompt(s, marker);
+                if !obs.frame_consistent() {
+                    return false; // 재평가 관측이 한 프레임의 사실이 아니다
+                }
+                let again = prompt_gate_input_with_approval(
+                    s,
+                    marker,
+                    rc.placeholder.as_deref(),
+                    &obs,
+                    rc.approval_pending,
+                );
+                if matches!(prompt_gate_verdict(&again), PromptGate::Blocked(_)) {
+                    return false; // 지금 화면은 배달 자격이 없다 — 메시지 보존(다음 틱 재시도)
+                }
+            }
+            // 마커 없는 좌석: 순수 판정자가 없으므로 같은 안전 게이트를 인계 직전에 다시 돌린다.
+            None => {
+                if no_marker_gate(daemon, s).is_some() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) 인계 가드가 걸린 배달의 **롤백 재료** — writer 가 쓰기를
+/// 포기했을 때(화면 세대가 흘렀다) 되돌릴 것들. 락 밖에서 결판을 기다려야 하므로(대기 중 큐 락을
+/// 쥐고 있으면 `queue.list`·enqueue·persist 가 막힌다) 임계영역에서 미리 떠 둔다.
+struct InflightInject {
+    guard: Option<std::sync::Arc<crate::state::InjectGuard>>,
+    /// 인계 직전의 `last_queue_delivery_at`(배달 최소 간격 시계).
+    prev_delivery_at: Option<std::time::Instant>,
+    /// 인계로 찍은 시각 — 되돌리기 전에 **이 값 그대로인지** 확인한다(그 사이 다른 배달이
+    /// 찍었으면 그것이 사실이다 · codex 리뷰 A2-iv).
+    set_delivery_at: Option<std::time::Instant>,
+    /// 인계 직전의 `pending_input_bytes`(0 으로 지우기 전 값).
+    prev_pending: u64,
+    /// `set_pending_input(0)` 직후의 입력 세대 — 되돌리기 전에 이 값 그대로여야 한다(그 사이
+    /// 사람이 쳤거나 다른 주입이 있었으면 **그 사실을 덮지 않는다**).
+    pending_gen: u64,
+    /// 이번 인계에 실린 항목 전부(병합분 포함) — 순서대로 활성 큐 **머리**로 되돌린다.
+    entries: Vec<crate::state::QueueEntry>,
+}
+
+/// 인계 가드가 **중단**으로 결판났을 때의 되돌림 — 화면에는 한 바이트도 나가지 않았다.
+///   ① 항목을 활성 큐 머리로 순서 그대로 복원(id 중복은 넣지 않는다 — 그 사이 다른 경로가
+///      되살렸을 수 있다). §8("만료 항목을 활성 큐 머리에 두지 않는다")은 지켜진다: 이 항목들은
+///      인계 직전 임계영역에서 만료 아님으로 확인된 것들이고, 그 뒤 만료되면 다음 틱 스윕이 뺀다.
+///   ② `pending_input_bytes`·`last_queue_delivery_at` 을 인계 직전 값으로 되돌린다(쓰이지 않은
+///      배달이 입력줄 계수와 간격 시계를 움직여선 안 된다).
+///   ③ `queue.inject_aborted` 발행 — 침묵 금지(운영자·재측정이 이 사건을 사유별로 센다).
+///      원장에는 **선기록만** 남고 영수증이 없다 = "인계 불명 배달" 로 이미 관측 가능하다.
+fn rollback_aborted_inject(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    f: &InflightInject,
+    delivered: &Delivered,
+) {
+    {
+        let mut q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        for e in f.entries.iter().rev() {
+            if !q.iter().any(|x| x.id == e.id) {
+                q.push_front(e.clone());
+            }
+        }
+        // ★(리뷰 R1 · codex A2-iv) 되돌림은 **내가 쓴 값이 그대로일 때만** — 결판을 기다리는
+        //   동안 사람이 치거나 다른 주입이 있었다면 그 사실이 최신이고, 옛 값으로 덮으면 그것이
+        //   곧 새 오류다(입력줄 점유를 잘못 알면 큐 본문이 사람 문장과 합쳐진다).
+        if s.input_gen.load(Ordering::Acquire) == f.pending_gen
+            && s.pending_input_bytes.load(Ordering::Relaxed) == 0
+        {
+            s.set_pending_input(f.prev_pending);
+        }
+    }
+    {
+        let mut t = s.last_queue_delivery_at.lock().unwrap();
+        if *t == f.set_delivery_at {
+            *t = f.prev_delivery_at;
+        }
+    }
+    daemon.bus.publish(
+        "queue.inject_aborted",
+        "queue",
+        Some(s.id),
+        json!({
+            "surface_ref": cys::surface_ref(s.id),
+            "queue_entry_id": delivered.entry.id,
+            "merged_ids": delivered.merged_ids,
+            "restored": f.entries.len(),
+            "why": "output_gen_moved(판정이 본 프레임이 아니다 — writer 가 쓰기 전에 화면이 바뀌었다)",
+            "hint": "주입 0 · 항목은 큐 머리에 그대로 있다(다음 틱 재시도). 잦으면 그 좌석의 \
+                     출력이 판정 창 안에서 계속 흐른다는 뜻이다",
+        }),
+    );
+    daemon.persist_queue_state();
+}
+
 /// `expect_pending`: 준비 판정이 **본** `pending_input_bytes` 값. `Some(v)` 이면 배달 직전
 /// 임계영역에서 그 값이 그대로인지 재확인하고, 달라졌으면 배달하지 않는다(메시지 보존).
 ///
@@ -5277,7 +5441,10 @@ pub(crate) struct Delivered {
 /// **완결된 채로** 바뀌어도(짝수 22 — 모달을 다 그렸거나 alt 로 전환) 20 의 승인으로 본문이 나갔다.
 /// 이 구조체를 넘긴 경로는 세대가 바뀐 순간 [`prompt_gate_verdict`] 를 **현재 프레임**에 다시 돌린다.
 pub(crate) struct ScreenRecheck {
-    pub(crate) marker: String,
+    /// 이 좌석의 프롬프트 마커. `None` = 마커 없는 좌석(맨 셸·마커 미선언 어댑터) — 인계 시점
+    /// 재판정은 순수 판정자 대신 [`no_marker_gate`](대체화면·모달·미제출 바이트·승인 대기)를
+    /// 다시 돌린다. ★(리뷰 R1 · codex) 재판정 없는 경로가 있으면 그 경로가 곧 구멍이다.
+    pub(crate) marker: Option<String>,
     pub(crate) placeholder: Option<String>,
     /// 판정이 본 출력 세대. 인계 시점에 이 값이 그대로면 재평가하지 않는다(같은 프레임).
     pub(crate) gen_at_verdict: u64,
@@ -5302,6 +5469,8 @@ pub(crate) fn deliver_head_locked(
     let mut expired_head: Option<crate::state::QueueEntry> = None;
     // (영수증 재료) 선기록 시각 · 본문 sha · 발신 surface — try_send 성공 뒤 락 밖에서 기록.
     let mut receipt: Option<(f64, String, Option<u64>, Value)> = None;
+    // (인계 가드 재료) 결판 대기·롤백은 락 **밖**에서 한다(대기 중 queue.list·enqueue 가 막히면 안 된다).
+    let mut inflight: Option<InflightInject> = None;
     let delivered = 'tx: {
         let mut q = s.pending_queue.lock().unwrap();
         // 락 순서 계약: pending_queue → input_gate (state.rs Surface::input_gate doc).
@@ -5323,54 +5492,16 @@ pub(crate) fn deliver_head_locked(
         //   까지다(codex R6 ⓑ). 즉 수십 µs 가 아니라 최악 수백 ms 이고, 그 구간에 걸린 틱은 다음
         //   틱(≈1s)에 재시도한다 — 영구 보류가 아니며 `queue.starved`(머리 나이)가 만성 상태를
         //   드러낸다. 프레임 **불변**을 요구하지 않는 이유는 종전과 같다(연속 출력 노드의 기아 #1).
-        let now_gen = s.output_gen.load(Ordering::Acquire);
-        if now_gen % 2 == 1 {
-            break 'tx None; // reader 가 청크를 반영하는 중 — 화면에 없는 바이트가 이미 도착해 있다
-        }
-        if let Some(gen) = expect_output_gen {
-            // ★(0.14.31 · 리뷰 R5 · codex major) 정적(quiet) 기반 판정은 **그 프레임**이어야 한다.
-            if now_gen != gen {
-                break 'tx None; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
-            }
-        }
-        // ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) 세대 불변을 **요구하지 않는** 경로(비-alt B1)의
-        //   안전축 재평가. 종전에는 여기서 홀수만 봤으므로, 판정(짝수 20) 이후 인계 전에 화면이
-        //   **완결된 채로** 바뀌어(짝수 22) 모달이 다 그려지거나 alt 로 전환돼도 20 의 승인으로
-        //   본문이 나갔다(codex 반례). 지금은 그때 **같은 순수 판정자**를 현재 프레임에 다시 돌린다.
-        //   ⓐ 새 quiet 임계를 만들지 않는다 — 비-alt 계약("프롬프트 박스가 열려 있으면 출력 중이라도
-        //     주입")은 그대로다. 재평가 결과가 alt 이면 alt 축(레이아웃·정적·일관성)이 그대로 걸린다.
-        //   ⓑ 재평가 관측 자체는 **한 프레임의 사실**이어야 한다(`frame_consistent`) — 화면 복사와
-        //     세대 읽기 사이에 reader 가 다른 화면을 발행하면 그 재평가가 합성이다(codex R7 D5).
-        //   ⓒ 승인 feed 는 화면 세대와 무관하게 바뀔 수 있으므로 **세대 변화와 무관하게** 다시 읽는다.
-        //   【한계 — 정직】 이 검사 뒤 `try_send` 전에 새 청크가 도착하는 창은 여전히 남는다
-        //   (reader 는 `input_gate` 를 공유하지 않는다 — 백로그 ⑭).
-        if let Some(rc) = recheck {
-            if approval_or_gate_pending(daemon, s.id) != rc.approval_pending {
-                break 'tx None; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
-            }
-            if now_gen != rc.gen_at_verdict {
-                let obs = observe_prompt(s, &rc.marker);
-                if !obs.frame_consistent() {
-                    break 'tx None; // 재평가 관측이 한 프레임의 사실이 아니다
-                }
-                let again = prompt_gate_input_with_approval(
-                    s,
-                    &rc.marker,
-                    rc.placeholder.as_deref(),
-                    &obs,
-                    rc.approval_pending,
-                );
-                if matches!(prompt_gate_verdict(&again), PromptGate::Blocked(_)) {
-                    break 'tx None; // 지금 화면은 배달 자격이 없다 — 메시지 보존(다음 틱 재시도)
-                }
-            }
-        }
         if min_interval > 0 {
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
                 if t.elapsed().as_secs() < min_interval {
                     break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
                 }
             }
+        }
+        // ① 판정 — 보류할 배달을 원장에 선기록하지 않기 위해 **머리를 집기 전에** 한 번(codex 리뷰).
+        if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
+            break 'tx None;
         }
         let Some(entry) = q.front().cloned() else {
             break 'tx None;
@@ -5464,20 +5595,48 @@ pub(crate) fn deliver_head_locked(
             from_surface,
             &extra,
         );
+        // ② 인계 직전 재판정 — 이 줄과 `try_send` 사이에는 어떤 I/O 도 없다.
+        if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
+            break 'tx None;
+        }
+        // ★(0.14.31 · 리뷰 R1 · codex blocking) **인계 가드** — 정적(quiet) 기반 판정 경로만.
+        //   그 경로는 이미 "판정이 본 세대가 그대로일 것"을 요구하므로, writer 가 첫 바이트 앞에서
+        //   같은 조건을 한 번 더 본다(판정↔쓰기 사이에 writer 가 선행 요청으로 자고 있는 창).
+        //   비-alt(B1) 경로는 세대 불변을 요구하지 않는 계약이라 가드를 걸지 않는다 — 걸면 연속
+        //   출력 노드가 영구 기아다(기아 #1 재발).
+        let guard = expect_output_gen
+            .map(|g| std::sync::Arc::new(crate::state::InjectGuard::new(g, s.output_gen.clone())));
         let req = crate::state::WriteReq::Inject {
             text: body.clone(),
             cr_delay_ms: 400,
             clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
+            guard: guard.clone(),
         };
         if s.write_tx.try_send(req).is_err() {
             break 'tx None; // 인계 실패 — 메시지 보존, 다음 틱 재시도
         }
         let delivered_at = now_epoch();
+        // ★(0.14.31 · 리뷰 R1) 가드가 중단을 결판내면 아래 두 표식을 **직전 값으로 되돌린다**
+        //   (쓰이지 않은 배달이 시계·계수를 움직여선 안 된다).
+        let prev_delivery_at = *s.last_queue_delivery_at.lock().unwrap();
+        let prev_pending = s.pending_input_bytes.load(Ordering::Relaxed);
         // ★(0.14.31 · WP-5) 같은 시계 — 어느 경로든 인계 성공 순간이 간격 시계의 기준이다.
-        *s.last_queue_delivery_at.lock().unwrap() = Some(std::time::Instant::now());
+        let set_delivery_at = Some(std::time::Instant::now());
+        *s.last_queue_delivery_at.lock().unwrap() = set_delivery_at;
         // ★B1(0.14.30): Inject 는 본문+CR 을 원자로 보내 줄을 제출한다 → 미제출 계수 0.
         // ★(0.14.31 · codex Q4) input_gate **안**에서 세대와 함께 갱신한다(락 밖 갱신 = lost update).
         s.set_pending_input(0);
+        // ★(0.14.31 · 리뷰 R1) 가드가 중단을 결판내면 위 두 표식을 **내가 쓴 값 그대로일 때만**
+        //   되돌린다(쓰이지 않은 배달이 시계·계수를 움직여선 안 되지만, 그 사이의 사실을 덮어서도
+        //   안 된다).
+        inflight = Some(InflightInject {
+            guard,
+            prev_delivery_at,
+            set_delivery_at,
+            prev_pending,
+            pending_gen: s.input_gen.load(Ordering::Acquire),
+            entries: merged.clone(),
+        });
         // ★G1(W2-A)+B1: pop 판정은 방금 인계한 항목의 **id 집합** — 동일 텍스트 중복 항목
         //   오삼킴을 차단하면서 병합분 전체를 한 번에 제거한다(단건이면 종전과 동일 동작).
         pop_delivered_ids(&mut q, &merged_ids);
@@ -5499,19 +5658,40 @@ pub(crate) fn deliver_head_locked(
         Some(Delivered { entry, remaining: q.len(), merged_ids, body })
     };
     if let Some(e) = expired_head {
-        let moved_id = e.id.clone();
-        expire_entries(daemon, s, vec![e], now, default_ttl);
-        // 만료 큐가 가진 **뒤에** 활성 큐에서 뺀다(머리가 그대로일 때만 — 그 사이 경합이면 다음 틱).
+        // ★(0.14.31 · 리뷰 R1 · codex major) 이동은 **두 락을 동시에 쥔 한 임계영역**에서 끝낸다.
+        //   종전(R5)에는 만료 큐에 먼저 넣고 락을 놓았다가 다시 활성 큐를 잡아 뺐다 — 그 창에
+        //   `queue.drop` 이 지운 항목이 복사본으로 부활하거나, `queue.revive` 가 되살린 항목을
+        //   낡은 패스가 다시 뺐다. persist 도 surface 마다 pending → expired 를 동시에 쥐므로
+        //   (state.rs) 이 순서면 중간 상태가 파일에 박히지 않는다 = R5 가 막으려던 유실도 그대로 막힌다.
         {
             let mut q = s.pending_queue.lock().unwrap();
-            if q.front().is_some_and(|f| f.id == moved_id) {
-                q.pop_front();
+            let mut x = s.expired_queue.lock().unwrap();
+            if q.front().is_some_and(|f| {
+                f.id == e.id && crate::state::queue_entry_expired(f, now, default_ttl)
+            }) {
+                let mut moved = q.pop_front().expect("front checked");
+                moved.expired_at = Some(now);
+                if !x.iter().any(|o| o.id == moved.id) {
+                    x.push_back(moved);
+                }
             }
         }
+        enforce_expired_cap(daemon, s, now);
         daemon.persist_queue_state();
         return None;
     }
     let delivered = delivered?;
+    // ★(0.14.31 · 리뷰 R1 · codex blocking) 가드 결판 — 락을 전부 놓은 뒤 유계 대기.
+    //   ABORTED = writer 가 **한 바이트도 쓰지 않았다** → 항목을 큐로 되돌리고(유실 0 · §3-3)
+    //   `queue.delivered`·영수증·에코 제외 창 어느 것도 만들지 않는다(없던 배달을 보고하지 않는다).
+    if let Some(f) = inflight {
+        if let Some(g) = f.guard.as_ref() {
+            if g.settle(crate::state::INJECT_GUARD_WAIT_MS) == crate::state::INJECT_ABORTED {
+                rollback_aborted_inject(daemon, s, &f, &delivered);
+                return None;
+            }
+        }
+    }
     // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
     *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
     // ★(0.14.31 · WP-5 L) 영수증 — 인계 성공 시각(선기록 시각과 분리 · 별 줄 · 본문 sha 아님).
@@ -5567,6 +5747,14 @@ pub(crate) fn deliver_head_locked(
 /// (`QUEUE_EXPIRED_CAP`) 초과분은 가장 오래된 것부터 원장 묘비(`expired_evicted`) 기록 후
 /// 폐기한다 — 기록 실패면 폐기하지 않는다(원장 없는 삭제 금지). `queue.expired` 는 여기서 발행하지
 /// 않고 `notify_expired` 가 통지와 한 묶음으로 발행한다(항목 id 멱등 · 재기동 중복 통지 차단).
+/// (검체 준비 전용) 항목들을 만료 큐로 넣고 상한을 집행한다. 생산 경로는 `queue_expiry_pass`·
+/// `deliver_head_locked` 가 **두 락을 동시에 쥔 채** 직접 옮긴다(리뷰 R1 · codex G — 이동의
+/// 원자성이 이 헬퍼로는 성립하지 않는다).
+///
+/// 테스트 전용 cfg 가 아니라 `cfg_attr` 인 이유: 이 파일의 소스핀 검체가 "첫 테스트 cfg 속성 앞"
+/// 을 프로덕션 구간으로 잘라 읽는다 — 프로덕션 구간에 그 속성을 쓰면 핀이 배달자를 못 찾는다
+/// (관례 · `queue_delivery_single_helper_shared_by_tick_and_rpc`).
+#[cfg_attr(not(test), allow(dead_code))]
 fn expire_entries(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
@@ -5574,10 +5762,6 @@ fn expire_entries(
     now: f64,
     _default_ttl: u64,
 ) {
-    if entries.is_empty() {
-        return;
-    }
-    let mut evicted: Vec<crate::state::QueueEntry> = Vec::new();
     {
         let mut x = s.expired_queue.lock().unwrap();
         for mut e in entries {
@@ -5589,27 +5773,118 @@ fn expire_entries(
             }
             x.push_back(e);
         }
-        while x.len() > QUEUE_EXPIRED_CAP {
-            let Some(oldest) = x.front().cloned() else {
-                break;
-            };
-            if crate::delivery::record_queue_tombstone(daemon, s.id, &oldest, "expired_evicted", now)
-            {
-                x.pop_front();
-                evicted.push(oldest);
-            } else {
-                break; // 원장 기록 실패 — 폐기하지 않는다(상한 초과 상태로 보존 · 다음 틱 재시도)
-            }
+    }
+    enforce_expired_cap(daemon, s, now);
+}
+
+/// ★(0.14.31 · 리뷰 R1 · 양 리뷰어 major) 만료 큐 **상한 집행** — 신규 만료가 있든 없든 매 틱
+/// 모든 surface 에서 돈다.
+///
+/// 【무엇이 틀렸었나】 상한 루프가 `expire_entries` 안에만 있었고 그 함수는 "이번 틱에 새로 만료된
+/// 항목"이 있을 때만 불렸다. 그래서 ⓐ 6h+ 정지 뒤 재기동해 `rehome` 이 150건을 만료 큐로 복원한
+/// 직후처럼 **새 만료가 없는** 상태에서는 상한이 영원히 집행되지 않았고(만료 큐 150 무기한 ·
+/// 매 persist 마다 `queue-expired.json` 에 150행), ⓑ 원장 실패로 축출이 미뤄진 뒤에도 "다음 틱
+/// 재시도" 라는 약속이 지켜지지 않았다.
+///
+/// 【원장 I/O 는 락 밖】 후보를 락 안에서 **복사**만 하고, 묘비 append(+회전+fsync)는 락을 놓은
+/// 뒤에 한다. 기록에 성공한 것만 다시 락을 잡아 제거한다 — 이 저장소의 '락 밖 I/O' 관례
+/// (`persist_queue_state`·`queue_expiry_pass`)와 같은 규율이다. 그 창에서 `queue.revive` 가
+/// 후보를 활성 큐로 옮겼으면 제거 대상이 없으므로 아무것도 지우지 않는다(원장에는 축출 묘비가
+/// 남고 항목은 살아 있다 — 드문 유령 묘비이며, 같은 항목의 `queue.revived` 가 그 순서를 증언한다).
+/// 반환 true = 만료 큐가 실제로 줄었다(호출부가 WAL 을 갱신).
+fn enforce_expired_cap(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, now: f64) -> bool {
+    let candidates: Vec<crate::state::QueueEntry> = {
+        let x = s.expired_queue.lock().unwrap();
+        if x.len() <= QUEUE_EXPIRED_CAP {
+            return false;
+        }
+        // ★(리뷰 R1 · codex D) **틱당 축출 상한** — 묘비는 이제 fsync 를 동반한다(내구성 수리).
+        //   150건 복원 백로그를 한 틱에 전부 축출하면 watchdog 이 그만큼 원장 I/O 에 묶인다.
+        //   상한을 두면 몇 틱에 걸쳐 수렴하고(유계 · 5s 간격), 그동안 만료 큐는 상한 초과 상태로
+        //   **보존**된다(유실 아님).
+        let over = x.len() - QUEUE_EXPIRED_CAP;
+        x.iter().take(over.min(QUEUE_EXPIRED_EVICT_PER_TICK)).cloned().collect()
+    };
+    let mut evicted: Vec<crate::state::QueueEntry> = Vec::new();
+    for e in candidates {
+        if crate::delivery::record_queue_tombstone(daemon, s.id, &e, "expired_evicted", now) {
+            evicted.push(e);
+        } else {
+            break; // 원장 기록 실패 — 폐기하지 않는다(상한 초과 상태로 보존 · 다음 틱 재시도)
         }
     }
-    if !evicted.is_empty() {
-        daemon.bus.publish(
-            "queue.dropped",
-            "queue",
-            Some(s.id),
-            crate::state::queue_dropped_payload("expired_evicted", &evicted, None),
-        );
+    if evicted.is_empty() {
+        return false;
     }
+    {
+        let mut x = s.expired_queue.lock().unwrap();
+        x.retain(|e| !evicted.iter().any(|d| d.id == e.id));
+    }
+    daemon.bus.publish(
+        "queue.dropped",
+        "queue",
+        Some(s.id),
+        crate::state::queue_dropped_payload("expired_evicted", &evicted, None),
+    );
+    true
+}
+
+/// ★(0.14.31 · 리뷰 R1 · codex D) **복원 만료분의 상한 집행** — 살아있는 surface 가 없어
+/// `Daemon::restored_expired`(=`queue-expired.json`)에만 존재하는 만료 항목도 유계여야 한다.
+///
+/// 종전 상한은 `Surface::expired_queue` 에만 걸려서, 그 role 의 좌석이 아직 없으면(재기동 직후·
+/// 역할 미복구) 복원 만료분이 상한 밖에서 무한정 쌓이고 매 persist 마다 그 전량이 파일에 쓰였다.
+/// surface_id 별로 [`QUEUE_EXPIRED_CAP`] 을 넘는 **가장 오래된**(파일 등장순) 항목부터 묘비를 남기고
+/// 뺀다. 틱당 [`QUEUE_EXPIRED_EVICT_PER_TICK`] 개로 유계(묘비는 fsync 를 동반한다).
+fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64) -> bool {
+    let candidates: Vec<(u64, crate::state::QueueEntry)> = {
+        let rx = daemon.restored_expired.lock().unwrap();
+        if rx.len() <= QUEUE_EXPIRED_CAP {
+            return false; // 총량이 상한 이하면 어떤 그룹도 넘지 않는다(값싼 조기 반환)
+        }
+        let mut per: HashMap<Option<u64>, usize> = HashMap::new();
+        let mut out: Vec<(u64, crate::state::QueueEntry)> = Vec::new();
+        for it in rx.iter() {
+            let sid = it.get("surface_id").and_then(|v| v.as_u64());
+            let c = per.entry(sid).or_insert(0);
+            *c += 1;
+            if *c > QUEUE_EXPIRED_CAP {
+                out.push((sid.unwrap_or(0), crate::state::queue_entry_from_row(it)));
+            }
+            if out.len() >= QUEUE_EXPIRED_EVICT_PER_TICK {
+                break;
+            }
+        }
+        out
+    };
+    if candidates.is_empty() {
+        return false;
+    }
+    let mut evicted: Vec<crate::state::QueueEntry> = Vec::new();
+    for (sid, e) in candidates {
+        if crate::delivery::record_queue_tombstone(daemon, sid, &e, "expired_evicted", now) {
+            evicted.push(e);
+        } else {
+            break; // 원장 실패 — 폐기하지 않는다(다음 틱 재시도)
+        }
+    }
+    if evicted.is_empty() {
+        return false;
+    }
+    {
+        let mut rx = daemon.restored_expired.lock().unwrap();
+        rx.retain(|it| {
+            let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            !evicted.iter().any(|d| d.id == id)
+        });
+    }
+    daemon.bus.publish(
+        "queue.dropped",
+        "queue",
+        None,
+        crate::state::queue_dropped_payload("expired_evicted", &evicted, None),
+    );
+    true
 }
 
 /// ★(0.14.31 · WP-5 M) 만료 큐 drain — 원장 묘비(사유 `reason`)를 남긴 항목만 폐기한다. surface
@@ -5621,21 +5896,25 @@ pub(crate) fn discard_expired_queue(
     reason: &str,
 ) -> usize {
     let now = now_epoch();
+    // ★(0.14.31 · 리뷰 R1 · minor) 원장 append(+fsync)는 **락 밖**에서 한다 — 종전에는 만료 큐
+    //   락을 쥔 채 최대 100회 append 를 돌아 그 동안 `queue.list`·persist·revive/drop 이 막혔다.
+    let all: Vec<crate::state::QueueEntry> =
+        { s.expired_queue.lock().unwrap().iter().cloned().collect() };
+    if all.is_empty() {
+        return 0;
+    }
     let mut dropped: Vec<crate::state::QueueEntry> = Vec::new();
-    {
-        let mut x = s.expired_queue.lock().unwrap();
-        let mut keep: std::collections::VecDeque<crate::state::QueueEntry> =
-            std::collections::VecDeque::new();
-        for e in x.drain(..) {
-            if crate::delivery::record_queue_tombstone(daemon, s.id, &e, reason, now) {
-                dropped.push(e);
-            } else {
-                keep.push_back(e);
-            }
+    for e in all {
+        if crate::delivery::record_queue_tombstone(daemon, s.id, &e, reason, now) {
+            dropped.push(e);
         }
-        *x = keep;
+        // 기록 실패분은 만료 큐에 남는다(삭제 없음 약속 = 원장 기록 · `delivery.record_failed` 발행).
     }
     if !dropped.is_empty() {
+        {
+            let mut x = s.expired_queue.lock().unwrap();
+            x.retain(|e| !dropped.iter().any(|d| d.id == e.id));
+        }
         daemon.bus.publish(
             "queue.dropped",
             "queue",
@@ -5644,6 +5923,55 @@ pub(crate) fn discard_expired_queue(
         );
     }
     dropped.len()
+}
+
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) 묘비 기록에 **실패한** 만료 항목을 데몬 소유 보존소
+/// (`restored_expired`)로 옮긴다 — surface 가 맵에서 빠지기 **전**에 부르는 것이 계약이다.
+///
+/// 【무엇이 틀렸었나】 `close_surface` 는 surfaces 맵에서 surface 를 꺼낸 **뒤** 묘비를 시도했고,
+/// 실패분은 그 분리된 Surface 안에만 남았다 — `persist_queue_state` 는 맵을 순회하므로 그 항목은
+/// 다음 스냅샷에서 사라지고(디스크에서도 소멸) `queue list --expired`·`revive`·`drop` 어디로도
+/// 도달할 수 없었다. 원장이 없는데 항목도 없다 = 조용한 유실(§3-3 위반).
+pub(crate) fn park_expired_to_restored(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> usize {
+    // ★(리뷰 R1 · codex K) **목적지 먼저 · 원본 나중**. 종전 초안은 surface 큐를 먼저 비우고
+    //   보존소에 넣었다 — 그 사이의 `persist_queue_state` 스냅샷은 항목을 **어느 쪽에도** 담지
+    //   않는다(그 파일 + 크래시 = 유실). 지금은 보존소가 먼저 갖고, 그 뒤에 surface 큐에서 뺀다:
+    //   중간 스냅샷은 중복이고 읽는 쪽 dedup(id)이 접는다.
+    let left: Vec<crate::state::QueueEntry> =
+        { s.expired_queue.lock().unwrap().iter().cloned().collect() };
+    if left.is_empty() {
+        return 0;
+    }
+    let role = s.role.lock().unwrap().clone();
+    {
+        let mut rx = daemon.restored_expired.lock().unwrap();
+        for e in &left {
+            if rx
+                .iter()
+                .any(|it| it.get("id").and_then(|v| v.as_str()) == Some(e.id.as_str()))
+            {
+                continue;
+            }
+            rx.push(crate::state::queue_entry_row(s.id, &role, e));
+        }
+    }
+    {
+        let mut x = s.expired_queue.lock().unwrap();
+        x.retain(|e| !left.iter().any(|d| d.id == e.id));
+    }
+    daemon.bus.publish(
+        "queue.expired_parked",
+        "queue",
+        Some(s.id),
+        json!({
+            "surface_ref": cys::surface_ref(s.id),
+            "parked": left.len(),
+            "ids": left.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            "hint": "묘비 기록에 실패한 만료 항목을 데몬 보존소로 옮겼다(유실 아님) — \
+                     `cys queue list --expired` 로 보이고 revive/drop 으로 처분한다",
+        }),
+    );
+    left.len()
 }
 
 /// 만료 통지 본문 — 발신 surface 의 큐로 들어가는 1줄(한 틱·한 발신자 단위로 병합). 문면은
@@ -5687,10 +6015,16 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
     let surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
     let mut changed = false;
-    // (발신 surface id, 대상 surface ref, 만료 항목 id 들) — 락 밖 통지 조립용.
-    let mut notices: HashMap<u64, (String, Vec<String>)> = HashMap::new();
+    // (발신 surface id, 대상 surface id) → (대상 ref, 만료 항목 id 들) — 락 밖 통지 조립용.
+    // ★(0.14.31 · 리뷰 R1 · minor) 키가 발신자뿐이면 한 발신자가 **여러 대상**에 만료 항목을 가질 때
+    //   `or_insert_with` 가 첫 대상의 ref 를 고정하고 다른 대상의 id 들이 그 벡터에 붙어, 통지 문면이
+    //   "…건 만료(대상 <첫 대상>)" 로 **틀린 좌석**을 가리켰다(운영자가 revive/drop 조준을 오독).
+    let mut notices: HashMap<(u64, u64), (String, Vec<String>)> = HashMap::new();
     let mut expired_events: Vec<(u64, Value)> = Vec::new();
     for s in &surfaces {
+        // ★(리뷰 R1 · codex D) 상한 집행은 **exited 조기 continue 앞**이다 — 종료 좌석도 reap
+        //   (close_surface) 전까지 맵에 남아 그 만료 큐가 매 persist 마다 파일에 쓰인다.
+        changed |= enforce_expired_cap(daemon, s, now);
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
@@ -5701,9 +6035,19 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
             .map(|t| t > std::time::Instant::now())
             .unwrap_or(false);
         let paused = daemon_paused || surface_paused;
+        // ① pause 크레딧 + ② 만료 스윕 — **한 임계영역**(pending → expired 두 락 동시 보유).
+        //
+        // ★(0.14.31 · 리뷰 R1 · codex major) 종전에는 활성 큐에서 후보를 **복사**해 락을 놓고
+        //   만료 큐에 넣은 뒤 다시 활성 큐를 잡아 id 로 지웠다(R5 의 '목적지 먼저' 수리). 그 창에서
+        //   ⓐ `queue.drop` 이 지운 항목이 복사본으로 **부활**하고 ⓑ 그 사이 `queue.revive` 로 활성에
+        //   돌아온 항목을 낡은 패스가 다시 **제거**했다. 두 락을 같은 순서로 동시에 쥐면 이동이
+        //   메모리에서 원자이고, `persist_queue_state` 도 surface 마다 같은 순서로 두 락을 쥐므로
+        //   (state.rs) 중간 상태가 파일에 박히지 않는다 — R5 가 막으려던 유실 창도 함께 닫힌다.
+        //   락 순서 계약(restored_queue → surfaces → pending_queue → expired_queue)은 그대로다.
         let mut newly: Vec<crate::state::QueueEntry> = Vec::new();
         {
             let mut q = s.pending_queue.lock().unwrap();
+            let mut x = s.expired_queue.lock().unwrap();
             if paused && delta > 0.0 {
                 for e in q.iter_mut() {
                     let alive_for = (now - e.order_at()).max(0.0);
@@ -5711,42 +6055,52 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
                 }
                 changed |= !q.is_empty();
             }
-            // ★(리뷰 R5 · codex major) **복사 먼저** — 여기서는 지우지 않는다(아래 참조).
-            for e in q.iter() {
-                if crate::state::queue_entry_expired(e, now, default_ttl) {
-                    let mut x = e.clone();
-                    x.expired_at = Some(now);
-                    newly.push(x);
+            let mut i = 0;
+            while i < q.len() {
+                if crate::state::queue_entry_expired(&q[i], now, default_ttl) {
+                    let mut e = q.remove(i).expect("index checked");
+                    e.expired_at = Some(now);
+                    if !x.iter().any(|o| o.id == e.id) {
+                        x.push_back(e.clone());
+                    }
+                    newly.push(e);
+                } else {
+                    i += 1;
                 }
             }
         }
+        changed |= !newly.is_empty();
+        // ③ 이번 틱에 새로 만료된 것이 있으면 상한을 다시 본다(위 머리 집행 + 여기 = 유계 수렴).
         if !newly.is_empty() {
-            changed = true;
-            // ★(리뷰 R5 · codex major) 이동의 **논리 원자성**: 종전 순서(활성에서 제거 → 락 해제 →
-            //   만료 큐 삽입)에는 항목이 **두 큐 어디에도 없는** 창이 있었고, 그 창에 뜬
-            //   `persist_queue_state` 스냅샷 + 크래시는 항목을 지운다(파일 순서를 고쳐도 남는 구멍).
-            //   지금은 만료 큐가 먼저 갖고, 그 **뒤에** 활성 큐에서 뺀다 — 중간 스냅샷은 중복(복구
-            //   가능)이지 유실이 아니다. 두 락을 동시에 쥐지 않으므로 락 순서 계약도 그대로다.
-            expire_entries(daemon, s, newly.clone(), now, default_ttl);
-            let moved: std::collections::HashSet<&str> =
-                newly.iter().map(|e| e.id.as_str()).collect();
-            let mut q = s.pending_queue.lock().unwrap();
-            q.retain(|e| !moved.contains(e.id.as_str()));
+            changed |= enforce_expired_cap(daemon, s, now);
         }
-        // ③ 통지 — 만료 큐의 미통지 항목.
+        // ④ 이벤트·통지 — 만료 큐의 미발행/미통지 항목.
         let role = s.role.lock().unwrap().clone();
         let target_ref = cys::surface_ref(s.id);
         let mut x = s.expired_queue.lock().unwrap();
         for e in x.iter_mut() {
+            // ★(0.14.31 · 리뷰 R1 · major) 이벤트 래치는 통지 표식과 **별개**다. 종전에는 통지
+            //   enqueue 가 성공해야 표식이 서서, 발신 큐가 만석이면 같은 항목의 `queue.expired` 가
+            //   매 틱(5s) 재발행됐다(만료 100건이면 20 events/s — 적체 상태에서 정확히 발화해
+            //   관측을 스스로 오염시킨다). 이벤트는 사실이라 항목당 1회, 재시도 대상은 통지뿐이다.
+            if !e.expired_event_sent {
+                let mut payload = crate::state::queue_expired_payload(
+                    &target_ref,
+                    role.clone(),
+                    e,
+                    now,
+                    default_ttl,
+                );
+                // ★W-id 에코(`entry_ids` · queue.delivered 와 같은 계약) — javis_wakeup/report_gate 가
+                //   만료를 **종결**로 읽을 수 있게 한다(없으면 critical-tier 가 TTL 마다 재enqueue).
+                payload["entry_ids"] = json!(wakeup_entry_ids(&e.text));
+                expired_events.push((s.id, payload));
+                e.expired_event_sent = true;
+                changed = true;
+            }
             if e.expired_notified {
                 continue;
             }
-            // ★W-id 에코(`entry_ids` · queue.delivered 와 같은 계약) — javis_wakeup/report_gate 가 만료를
-            //   **종결**로 읽을 수 있게 한다(없으면 critical-tier 가 TTL 마다 재enqueue · codex #13).
-            let mut payload =
-                crate::state::queue_expired_payload(&target_ref, role.clone(), e, now, default_ttl);
-            payload["entry_ids"] = json!(wakeup_entry_ids(&e.text));
-            expired_events.push((s.id, payload));
             // 발신 surface 통지 대상: `surface:N` 발신 ∧ 통지 항목이 아님 ∧ 자기 자신이 아님.
             let sender = crate::delivery::split_queue_from(e.from.as_deref())
                 .0
@@ -5754,7 +6108,7 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
             match sender {
                 Some(n) => {
                     notices
-                        .entry(n)
+                        .entry((n, s.id))
                         .or_insert_with(|| (target_ref.clone(), Vec::new()))
                         .1
                         .push(e.id.clone());
@@ -5767,39 +6121,71 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
             }
         }
     }
+    // ★(리뷰 R1 · codex D) 살아있는 좌석이 없는 복원 만료분도 상한 안에 둔다(surface 순회 밖).
+    changed |= enforce_restored_expired_cap(daemon, now);
     for (sid, payload) in expired_events {
         daemon.bus.publish("queue.expired", "queue", Some(sid), payload);
     }
     // 발신 surface 큐로 1줄 — 살아 있고 상한 여유가 있을 때만. 성공한 항목만 표식.
-    for (sender_sid, (target_ref, ids)) in notices {
+    let mut notified_ids: Vec<String> = Vec::new();
+    for ((sender_sid, _target_sid), (target_ref, ids)) in notices {
         let Some(sender) = daemon.get_surface(sender_sid) else {
             // 발신자 소멸 — 통지 불가. 표식을 남겨 매 틱 재시도를 끊는다(이벤트는 이미 나갔다).
-            mark_expired_notified(&surfaces, &ids);
-            changed = true;
+            notified_ids.extend(ids);
             continue;
         };
         if sender.exited.load(Ordering::Relaxed) {
-            mark_expired_notified(&surfaces, &ids);
-            changed = true;
+            notified_ids.extend(ids);
             continue;
         }
         let text = render_expired_notice(&target_ref, &ids);
+        // ★(0.14.31 · 리뷰 R1 · codex major) 통지 항목 id 는 **결정적**이다 — 재기동 재시도가 같은
+        //   id 를 만들어 "이미 큐에 있으면 넣지 않는다"(멱등)가 성립한다.
+        let notice_id = expired_notice_id(sender_sid, &target_ref, &ids);
         let enqueued = {
             let mut q = sender.pending_queue.lock().unwrap();
-            if q.len() >= 100 {
+            if q.iter().any(|e| e.id == notice_id) {
+                true // 이미 이 통지가 큐에 있다(크래시 뒤 재시도) — 표식만 세우면 된다
+            } else if q.len() >= 100 {
                 false // 발신 큐 가득 — 표식 없이 다음 틱 재시도(유계 · 무부작용)
             } else {
-                let entry = daemon.next_queue_entry(text, None, QUEUE_NOTICE_ORIGIN);
+                let mut entry = daemon.next_queue_entry(text, None, QUEUE_NOTICE_ORIGIN);
+                entry.id = notice_id;
                 q.push_back(entry);
                 true
             }
         };
         if enqueued {
-            mark_expired_notified(&surfaces, &ids);
-            changed = true;
+            notified_ids.extend(ids);
         }
     }
+    if !notified_ids.is_empty() {
+        // ★(0.14.31 · 리뷰 R1 · codex major) **통지가 먼저 디스크에 있어야 표식을 세운다.**
+        //   종전에는 표식과 통지가 "같은 persist 한 번" 으로 원자라고 적혀 있었으나, 그 persist 는
+        //   두 파일(만료 → 활성)을 순서대로 쓴다 — 만료 파일만 쓰이고 크래시하면 `expired_notified`
+        //   만 살아남고 통지는 사라져 **영원히 재시도되지 않았다**. 지금은 통지가 활성 파일에 들어간
+        //   뒤에 표식을 세우고, 그 사이 크래시는 "통지는 있고 표식은 없다" = 재시작 후 같은 결정적
+        //   id 로 재시도 → 이미 있으면 표식만(중복 0 · 유실 0).
+        daemon.persist_queue_state();
+        // ★(리뷰 R1 · codex F) persist 가 실패했으면(디스크 오류) 표식을 세우지 않는다 — 통지가
+        //   디스크에 없는데 표식만 서면 재시작이 그것을 영영 재시도하지 않는다. 실패 시엔 통지가
+        //   메모리 큐에 남아 있고 다음 틱이 같은 결정적 id 로 다시 시도한다(멱등).
+        if daemon.queue_wal_durable() {
+            mark_expired_notified(&surfaces, &notified_ids);
+        }
+        changed = true;
+    }
     changed
+}
+
+/// 만료 통지 항목의 **결정적 id** — (발신자, 대상, 정렬된 만료 id 집합)의 함수. 재기동 재시도가
+/// 같은 id 를 만들어 발신 큐에서 멱등하게 걸러진다(중복 통지 차단). `q…` 산식(boot 시각+seq)과
+/// 충돌하지 않는 접두 `qexp.` 를 쓴다.
+pub(crate) fn expired_notice_id(sender_sid: u64, target_ref: &str, ids: &[String]) -> String {
+    let mut sorted: Vec<&str> = ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let sha = crate::delivery::digest_text(&sorted.join(","));
+    format!("qexp.{sender_sid}.{}.{}", target_ref.replace(':', "-"), &sha[..16])
 }
 
 /// 만료 큐에서 id 집합의 `expired_notified` 를 세운다(통지 enqueue 성공 뒤 · 같은 persist 로 영속).
@@ -5894,6 +6280,9 @@ pub(crate) fn locate_queue_entry(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueOpDenied {
     NotFound,
+    /// ★(0.14.31 · 리뷰 R1) 인가는 **만료 항목**에 대해 났는데 삭제 임계영역에서 보니 그 항목이
+    /// 살아있는 타 좌석의 **활성** 큐에 있다(그 사이 `queue.revive`) — 거부한다.
+    ActiveProtected,
     /// revive 대상 활성 큐가 상한(100)에 닿아 있다 — 재활성은 enqueue 와 같은 회계를 탄다.
     QueueFull,
     /// 묘비 기록 실패 — 원장 없는 삭제 금지(항목 보존).
@@ -5904,6 +6293,7 @@ impl QueueOpDenied {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             QueueOpDenied::NotFound => "not_found",
+            QueueOpDenied::ActiveProtected => "drop_denied",
             QueueOpDenied::QueueFull => "queue_full",
             QueueOpDenied::LedgerFailed => "ledger_failed",
         }
@@ -5912,6 +6302,11 @@ impl QueueOpDenied {
         match self {
             QueueOpDenied::NotFound => {
                 "entry_id not in any queue (already delivered/dropped? — queue list --expired 확인)"
+                    .into()
+            }
+            QueueOpDenied::ActiveProtected => {
+                "queue.drop denied: entry is now ACTIVE on a live other surface (revived \
+                 concurrently) — 살아있는 타 노드의 활성 큐는 인멸하지 않는다"
                     .into()
             }
             QueueOpDenied::QueueFull => {
@@ -5954,7 +6349,10 @@ pub(crate) fn revive_queue_entry(
         e.expired_at = None;
         e.revived_at = Some(now);
         e.paused_total_secs = 0.0;
+        // ★(리뷰 R1 · codex E) 통지 표식과 **이벤트 래치를 모두** 리셋한다 — 되살린 항목이 다시
+        //   만료되면 그것은 새 사건이고, 이벤트도 통지도 다시 나가야 한다.
         e.expired_notified = false;
+        e.expired_event_sent = false;
         q.push_back(e.clone());
         let depth = q.len();
         return Ok((e, depth, false, Some(s.id)));
@@ -5982,6 +6380,7 @@ pub(crate) fn revive_queue_entry(
         o.insert("revived_at".into(), json!(now));
         o.insert("paused_total_secs".into(), json!(0.0));
         o.insert("expired_notified".into(), json!(false));
+        o.insert("expired_event_sent".into(), json!(false));
     }
     let e = crate::state::queue_entry_from_row(&row);
     ra.push(row);
@@ -5995,12 +6394,22 @@ pub(crate) fn drop_queue_entry(
     entry_id: &str,
     surface_hint: Option<u64>,
     now: f64,
+    deny_active: bool,
 ) -> Result<(crate::state::QueueEntry, bool, Option<u64>), QueueOpDenied> {
     let home = locate_queue_entry(daemon, entry_id, surface_hint).ok_or(QueueOpDenied::NotFound)?;
     if let Some(s) = &home.surface {
         let mut q = s.pending_queue.lock().unwrap();
         let mut x = s.expired_queue.lock().unwrap();
         if let Some(pos) = q.iter().position(|e| e.id == entry_id) {
+            // ★(0.14.31 · 리뷰 R1 · codex blocking) **인가는 지금 있는 그 상태에 대해서만 유효하다.**
+            //   핸들러는 `locate_queue_entry` 로 본 상태(만료)로 ACL 을 통과시키고, 이 함수는 삭제
+            //   임계영역에서 항목을 **다시** 찾아 지금 있는 곳에서 지웠다. 그 사이 대상 좌석이
+            //   `queue.revive` 로 그것을 활성 큐에 돌려놓으면, "살아있는 타 좌석의 활성 항목은 지울
+            //   수 없다"(queue.clear 위협모델)가 경합으로 뚫린다. 인가 조건을 인자로 받아 **같은
+            //   락 안에서** 다시 집행한다(막는 방향으로만 틀린다).
+            if deny_active {
+                return Err(QueueOpDenied::ActiveProtected);
+            }
             let e = q[pos].clone();
             if !crate::delivery::record_queue_tombstone(daemon, s.id, &e, "dropped", now) {
                 return Err(QueueOpDenied::LedgerFailed);
@@ -6185,7 +6594,16 @@ fn surface_prompt_marker(
 /// 화면을 보지 않았다: 조용한 `less`·전체화면 프로그램·모달 어휘 화면에도 주입됐다(codex 설계
 /// 검토 #10). 대체화면(alt_screen)·모달 어휘(마커가 없어 생애 창을 닫을 수 없다 — 어휘가 있으면
 /// 전경으로 본다)·미제출 입력 바이트 중 하나라도 있으면 보류. 종전 quiet 규칙은 그 뒤에 온다.
-fn no_marker_gate(s: &Arc<crate::state::Surface>) -> Option<&'static str> {
+fn no_marker_gate(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<&'static str> {
+    // ★(0.14.31 · 리뷰 R1 · codex blocking · §8) **승인·관문 대기는 어떤 경로에서도 면제되지
+    //   않는다.** 종전 이 게이트는 대체화면·미제출 바이트·모달 **서명**만 봤다. 그런데 무번호
+    //   승인 문면(`Allow execution` — agents.json 이 approval_patterns 로 알아보는 그 화면)은
+    //   모달 서명 어휘에 걸리지 않을 수 있고, 그때 마커 없는 좌석의 quiet 폴백이 큐 본문 + Return
+    //   을 승인 대기 창에 꽂았다(= 승인 버튼을 누른다 · 정본 §8 위반). 마커 좌석의
+    //   `prompt_gate_verdict` 와 **같은 승인 판정**(`approval_or_gate_pending`)을 여기서도 쓴다.
+    if approval_or_gate_pending(daemon, s.id) {
+        return Some(BLOCKED_APPROVAL);
+    }
     if s.alt_screen.load(Ordering::Relaxed) {
         return Some(BLOCKED_ALT_SCREEN);
     }
@@ -6263,8 +6681,7 @@ pub(crate) fn force_deliver_entry(
     }
     // 게이트 ⑦ 프롬프트 게이트 — 틱 배달과 같은 판정(마커 좌석) / 안전 게이트 + quiet 하한(그 외).
     let adapters = load_adapter_defs();
-    let mut recheck: Option<ScreenRecheck> = None;
-    let (expect_pending, expect_gen) = match surface_prompt_marker(s, &adapters) {
+    let (expect_pending, expect_gen, recheck) = match surface_prompt_marker(s, &adapters) {
         Some((marker, placeholder)) => {
             // ★(리뷰 R5) 틱과 **같은 관측 규약** — quiet 는 화면과 한 창에서 뜬다.
             let obs = observe_prompt(s, &marker);
@@ -6276,15 +6693,15 @@ pub(crate) fn force_deliver_entry(
             let gen = input.alt_screen.then_some(obs.output_gen);
             // ★(리뷰 R2(R7회차) · codex major M4) 세대를 넘기지 않는 경로(비-alt)는 인계 시점에
             //   **화면 안전축을 다시 판정**한다(같은 순수 판정자 · 새 quiet 임계 0).
-            if gen.is_none() {
-                recheck = Some(ScreenRecheck {
-                    marker,
-                    placeholder,
-                    gen_at_verdict: obs.output_gen,
-                    approval_pending: input.approval_pending,
-                });
-            }
-            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), gen)
+            // ★(리뷰 R1 · codex) alt 경로에서도 **승인 feed 재확인**은 필요하므로 항상 넘긴다 —
+            //   화면 재판정만 세대가 바뀐 비-alt 경로에서 도는 것이고, 승인은 경로 무관이다.
+            let recheck = ScreenRecheck {
+                marker: Some(marker),
+                placeholder,
+                gen_at_verdict: obs.output_gen,
+                approval_pending: input.approval_pending,
+            };
+            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), gen, Some(recheck))
         }
         None => {
             // [성찰 BLOCKER] forced 에도 overdue_quiet(기본 1s·하한 1s) — '출력 중 주입 금지'
@@ -6293,7 +6710,7 @@ pub(crate) fn force_deliver_entry(
             //   잰다 — 세대를 게이트 **뒤**에 읽으면 게이트가 본 화면과 quiet 가 다른 프레임이다.
             let need = queue_overdue_quiet_secs().max(1);
             let gen0 = s.output_gen.load(Ordering::Acquire);
-            if let Some(why) = no_marker_gate(s) {
+            if let Some(why) = no_marker_gate(daemon, s) {
                 return Err(ForceDeliverDenied::PromptGate(why));
             }
             let quiet_for = s.last_output.lock().unwrap().elapsed().as_secs();
@@ -6308,7 +6725,15 @@ pub(crate) fn force_deliver_entry(
             // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) 이 판정도 **정적 기반**이다 — 종전에는
             //   여기서 gen0 을 버려(`None`), quiet 표본 뒤에 도착한 출력이 인계 재확인을 통과했다.
             //   틱의 마커 없는 경로(`deliver_queued`)와 같은 값을 넘긴다(경로별 판정 분리 금지).
-            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), Some(gen0))
+            // ★(리뷰 R1 · codex blocking) 마커 없는 좌석도 인계 직전에 **같은 안전 게이트**를 다시
+            //   돌린다(원장 I/O 뒤 · 승인·모달·대체화면이 그 사이 떴을 수 있다).
+            let recheck = ScreenRecheck {
+                marker: None,
+                placeholder: None,
+                gen_at_verdict: gen0,
+                approval_pending: approval_or_gate_pending(daemon, s.id),
+            };
+            (Some(s.pending_input_bytes.load(Ordering::Relaxed)), Some(gen0), Some(recheck))
         }
     };
     // 조준 해석(+ 필요 시 머리 끌어올림) — pending_queue 락 한 임계영역에서 원자 수행.
@@ -6393,6 +6818,11 @@ fn deliver_queued(
     let mut persist = daemon.rehome_restored_queue() > 0;
     // ★(0.14.31 · WP-5 M) TTL 스윕·pause 크레딧·만료 통지 — 배달 전, 재홈 뒤(복원분도 분류).
     persist |= queue_expiry_pass(daemon);
+    // ★(0.14.31 · 리뷰 R1 · codex blocking) **미영속 재시도** — 직전 persist 가 어느 단계에서든
+    //   실패했으면 큐 변경이 없어도 다시 쓴다. 종전에는 enqueue 가 `queued:true` 를 돌려준 뒤
+    //   persist 가 실패하고 그 뒤 큐 변경이 없으면 재시도 기회가 영영 오지 않아, 데몬이 죽으면
+    //   승인된 메시지가 조용히 사라졌다(디스크 일시 오류만으로).
+    persist |= !daemon.queue_wal_durable();
     if persist {
         daemon.persist_queue_state();
     }
@@ -6476,7 +6906,12 @@ fn deliver_queued(
                 .map(|t| t.elapsed().as_secs() < min_interval)
                 .unwrap_or(false);
             if recent {
-                block(BLOCKED_INTERVAL);
+                // ★(0.14.31 · 리뷰 R1 · minor) 이 보류는 **몇 초 뒤 스스로 풀린다** — 기아 경보
+                //   (`queue.starved`)의 사유로 나가면 만성 기아의 원인으로 기록돼 운영자와
+                //   재측정(§4 '사유별 분리 집계')을 오도한다. 사유 기록과 적체(depth) 경보는
+                //   그대로 태우고 기아 집계에서만 뺀다.
+                mark_queue_blocked(&s, BLOCKED_INTERVAL);
+                alert_queue_depth_if_high(daemon, &s, depth_alerted, BLOCKED_INTERVAL);
                 continue;
             }
         }
@@ -6495,8 +6930,7 @@ fn deliver_queued(
         //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
         //   마커 없는 quiet 폴백 경로도 같은 값을 쓴다(그 경로도 같은 writer 로 들어간다).
         let pending_at_verdict = s.pending_input_bytes.load(Ordering::Relaxed);
-        let mut recheck: Option<ScreenRecheck> = None;
-        let (overdue, expect_gen) = if let Some((marker, placeholder)) = marker.as_ref() {
+        let (overdue, expect_gen, recheck) = if let Some((marker, placeholder)) = marker.as_ref() {
             let (marker, placeholder) = (marker.as_str(), placeholder.as_deref());
             // ★(리뷰 R5 · codex major) quiet 표본은 관측 **안**에서 뜬다(종전엔 관측 앞에서 따로 떴다).
             let obs = observe_prompt(&s, marker);
@@ -6524,15 +6958,14 @@ fn deliver_queued(
                     //   화면"(짝수 20 → 짝수 22)은 종전에 아무 데서도 걸리지 않았다 — 그 사이 모달이
                     //   다 그려지거나 alt 로 전환돼도 20 의 승인으로 본문이 나갔다. 지금은 그때
                     //   **같은 순수 판정자**를 현재 프레임에 다시 돌린다(새 quiet 임계 0).
-                    if gen.is_none() {
-                        recheck = Some(ScreenRecheck {
-                            marker: marker.to_string(),
-                            placeholder: placeholder.map(str::to_string),
-                            gen_at_verdict: obs.output_gen,
-                            approval_pending: input.approval_pending,
-                        });
-                    }
-                    (false, gen)
+                    // ★(리뷰 R1 · codex) 승인 feed 재확인은 경로 무관이므로 **항상** 넘긴다.
+                    let recheck = ScreenRecheck {
+                        marker: Some(marker.to_string()),
+                        placeholder: placeholder.map(str::to_string),
+                        gen_at_verdict: obs.output_gen,
+                        approval_pending: input.approval_pending,
+                    };
+                    (false, gen, Some(recheck))
                 }
             }
         } else {
@@ -6542,7 +6975,7 @@ fn deliver_queued(
             //   있었다(그 사이에 모달·alt-screen 이 반영되면 배달이 그것을 못 본다 · codex R6 ⓒ).
             let gen = s.output_gen.load(Ordering::Acquire);
             // ★(0.14.31) 마커 없는 좌석의 안전 게이트(대체화면·모달 어휘·미제출 바이트) — quiet 앞.
-            if let Some(why) = no_marker_gate(&s) {
+            if let Some(why) = no_marker_gate(daemon, &s) {
                 block(why);
                 continue;
             }
@@ -6556,7 +6989,16 @@ fn deliver_queued(
                     block(BLOCKED_BUSY);
                     continue;
                 }
-                QuietVerdict::Deliver { overdue } => (overdue, Some(gen)),
+                QuietVerdict::Deliver { overdue } => {
+                    // ★(리뷰 R1 · codex blocking) 인계 직전 게이트 재실행(원장 I/O 뒤 · 승인 포함).
+                    let recheck = ScreenRecheck {
+                        marker: None,
+                        placeholder: None,
+                        gen_at_verdict: gen,
+                        approval_pending: approval_or_gate_pending(daemon, s.id),
+                    };
+                    (overdue, Some(gen), Some(recheck))
+                }
             }
         };
         // 사람 입력 흔적이 식기 전 배달 금지 — 미완성 입력에 이어붙기/제출 차단(R1 MED-2).
@@ -6611,10 +7053,19 @@ fn maybe_reset_stale_pending_input(
     let quiet_for = obs.quiet_secs;
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let gen = s.input_gen.load(Ordering::Acquire);
+    // ★(0.14.31 · 리뷰 R1 · 양 리뷰어 blocking) **줄 전체**가 비어 있어야 한다 — 커서 앞만 보면
+    //   Home/Ctrl-A 로 커서를 줄 머리로 옮긴 **실초안**이 "빈 입력줄" 로 읽힌다(출력도 없고 입력
+    //   세대도 안 움직이므로 3s 뒤 계수가 0 으로 리셋되고, 다음 틱에 큐 본문이 그 초안과 한 줄로
+    //   합쳐져 제출된다 — 종전의 영구 보류(fail-closed)가 배달(fail-open)로 뒤집혔다 · §3-3 위반).
+    //   커서 뒤 텍스트는 **배달 게이트**(`input_line_state`)에서는 여전히 판정에 쓰지 않는다(고스트
+    //   제안이 그 자리에 살고, 그것을 판정에 넣으면 2h10m 영구 보류 사고가 재현된다). 여기서만
+    //   AND 하는 이유: 이 함수는 '계수를 0 으로 지우는' **상태 변경**이라 오탐의 귀결이 반대다 —
+    //   고스트 때문에 리셋이 안 걸리면 종전(0.14.30)처럼 보류가 이어질 뿐이고, 초안을 지우면
+    //   사람이 쓰던 문장이 기계 배달과 합쳐진다.
     let screen_empty = obs
         .line
         .as_ref()
-        .is_some_and(|(before, _)| before.trim().is_empty());
+        .is_some_and(|(before, after)| before.trim().is_empty() && after.trim().is_empty());
     // ★(0.14.31 · 리뷰 R5 · codex major) 관측이 **한 프레임의 사실**일 때만 모순으로 센다 —
     //   발행 중이거나 관측 창에서 세대가 바뀐 화면은 "빈 입력줄" 의 근거가 되지 못한다.
     let contradiction = pending > 0
@@ -9248,6 +9699,7 @@ mod tests {
             expired_at: None,
             revived_at: None,
             expired_notified: false,
+            expired_event_sent: false,
         }
     }
 
@@ -9713,8 +10165,9 @@ mod tests {
     use super::{
         discard_expired_queue, expire_entries, force_deliver_entry as wp5_force, prompt_gate_verdict,
         queue_expiry_pass, ForceDeliverDenied as Wp5Denied, PromptGate, PromptGateInput,
-        BLOCKED_ALT_SCREEN, BLOCKED_BUSY, BLOCKED_INPUT_PENDING, BLOCKED_INTERVAL, BLOCKED_MODAL,
-        BLOCKED_PROMPT_UNKNOWN, QUEUE_EXPIRED_CAP, QUEUE_NOTICE_ORIGIN,
+        QueueOpDenied, BLOCKED_ALT_SCREEN, BLOCKED_APPROVAL, BLOCKED_BUSY, BLOCKED_INPUT_PENDING,
+        BLOCKED_INTERVAL, BLOCKED_MODAL, BLOCKED_PROMPT_UNKNOWN, QUEUE_EXPIRED_CAP,
+        QUEUE_NOTICE_ORIGIN,
     };
 
     /// 화면 전체를 그린다(alt-screen 전환 포함) — `lines` 를 1행부터 차례로, 커서는 `(row, col)`(0 기준).
@@ -9957,6 +10410,68 @@ mod tests {
         assert!(s.pending_queue.lock().unwrap().is_empty(), "codex composer 는 배달 자격: {}", blocked_reason(&s));
     }
 
+    /// ★(0.14.31 · 리뷰 R1 · claude minor 7) **codex 작업 중 프레임은 배달 자격이 아니다** —
+    /// 2026-09-07 19:08 로컬 PTY 실측(codex-cli 0.153.4 · `impl/R2-WP5-queue-codex-busy-frame-1908.txt`).
+    ///
+    /// 실측 문면: 스피너 줄 `• Starting MCP servers (0/2): … (0s • esc to interrupt)` **바로 아래**가
+    /// composer 마커 행(`› Ask Codex to do anything`)이다 = 커서행 ±1(`PROMPT_BUSY_ROWS`=3 안).
+    /// 어휘는 **소문자** `esc to interrupt` 로 렌더되고 판정부가 화면을 소문자화해 대조하므로
+    /// claude 와 같은 1종 토큰으로 잡힌다. 종전 검체는 codex **유휴** 프레임뿐이라 이 축이 codex
+    /// 렌더에서 실제로 걸리는지 한 번도 재지 않았다(리뷰 지적 그대로).
+    #[test]
+    fn wp5_r1_codex_busy_frame_is_refused_measured_20260907() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("codex-busy");
+        let (daemon, s) = wp5_seat("wp5-codex-busy", "codex");
+        let e = daemon.next_queue_entry("[리뷰 의뢰] codex 작업 중".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        paint_screen(
+            &s,
+            &[
+                "  anything you've been meaning to build. See where it takes you.",
+                "",
+                "• Starting MCP servers (0/2): codex_apps, gemini-notebook-mcp",
+                "  (0s • esc to interrupt)",
+                "› Ask Codex to do anything",
+                "  gpt-6-astra medium · ~/dev/cys-t1/src",
+            ],
+            4,
+            2,
+            false,
+        );
+        quiet_since(&s, 30); // 정적이어도(스피너가 멈춘 프레임) 작업 중 어휘가 이긴다
+        tick(&daemon);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "codex 작업 중 프레임에 큐 본문을 꽂았다 — 턴 한복판 주입: {}",
+            blocked_reason(&s)
+        );
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "사유가 '작업 중' 이 아니다");
+        // 가용성 대조군 — 스피너 줄이 사라지면 같은 좌석이 곧바로 배달된다(축이 상시 닫히지 않는다).
+        paint_screen(
+            &s,
+            &[
+                "  1 부터 50 까지 소수를 구하는 함수를 썼습니다.",
+                "",
+                "› Ask Codex to do anything",
+                "  gpt-6-astra medium · ~/dev/cys-t1/src",
+            ],
+            2,
+            2,
+            false,
+        );
+        quiet_since(&s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        s.set_pending_input(0);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "작업이 끝난 codex composer 가 막혔다(기아): {}",
+            blocked_reason(&s)
+        );
+    }
+
     /// agy(gemini) 유휴 composer(`>` 행 · `? for shortcuts` 는 상태줄) — prompt_marker `>` 로 배달 자격.
     /// 종전 ready_marker 커서행 규칙으로는 prompt_unknown 영구 보류였다.
     #[test]
@@ -10058,7 +10573,7 @@ mod tests {
         quiet_since(&s, 10);
         let gen0 = s.output_gen.load(AtomicOrdering::Acquire);
         let rc = |gen: u64, approval: bool| super::ScreenRecheck {
-            marker: "❯".to_string(),
+            marker: Some("❯".to_string()),
             placeholder: None,
             gen_at_verdict: gen,
             approval_pending: approval,
@@ -10338,45 +10853,683 @@ mod tests {
         );
     }
 
-    /// ★(0.14.31 · 리뷰 R5 · codex major) **큐 이동의 논리 원자성** — 활성 큐에서 빼는 것이 만료 큐에
-    /// 넣는 것보다 **뒤**여야 한다. 종전 순서(제거 → 락 해제 → 삽입)에는 항목이 두 큐 어디에도 없는
-    /// 창이 있었고, 그 창에 뜬 `persist_queue_state` 스냅샷 + 크래시는 파일 순서를 고쳐도 그것을 지운다.
-    /// 배달 경로(`deliver_head_locked` 의 만료 머리)와 틱 스윕(`queue_expiry_pass`) 둘 다 잰다.
+    /// ★(0.14.31 · 리뷰 R1 · codex major) **큐 이동의 원자성 — 실인터리빙으로 잰다.**
+    ///
+    /// 종전 검체는 소스 문자열의 **등장 순서**(삽입 호출이 제거 호출보다 앞인가)를 봤다. 그것은
+    /// "복사 먼저" 라는 그때의 구현을 박제할 뿐 경합을 재지 못한다(codex 리뷰: "concurrency claims
+    /// are checked by source ordering"). 지금 구현은 두 락(pending → expired)을 **동시에 쥔 채**
+    /// 옮기므로, 재야 할 것은 다음 두 불변이다.
+    ///   ⓐ **유실 0 · 중복 0**: 어느 순간에도 항목은 활성·만료 중 정확히 한 곳에 있거나, 묘비를
+    ///      남기고 사라졌다(두 곳 동시 존재 = 중복 배달, 두 곳 부재 = 유실).
+    ///   ⓑ **부활 0**: `queue.drop` 이 Ok 를 돌려준 항목은 만료 스윕의 낡은 복사본으로 되살아나지
+    ///      않는다(종전 copy-first 창의 정확한 결함).
+    /// 두 스레드를 배리어로 같은 순간에 출발시키고 30회 반복한다.
     #[test]
-    fn wp5_r5_queue_move_copies_into_expired_before_removing_from_active() {
-        let src = include_str!("governance.rs");
-        let body = |head: &str| -> String {
-            let i = src.find(head).unwrap_or_else(|| panic!("{head} 이 사라졌다"));
-            let rest = &src[i..];
-            let end = rest.find("\n}\n").expect("함수 끝");
-            rest[..end].to_string()
-        };
-        // ① 틱 스윕: `expire_entries(` 호출이 활성 큐 `retain(` 보다 앞에 있어야 한다.
-        let pass = body("pub(crate) fn queue_expiry_pass(");
-        let insert = pass.find("expire_entries(daemon, s, newly.clone()").expect("만료 큐 삽입");
-        let remove = pass
-            .find("q.retain(|e| !moved.contains(")
-            .expect("활성 큐 제거(id 기준)");
-        assert!(insert < remove, "활성 큐에서 먼저 빼고 나중에 만료 큐에 넣는다(유실 창 재발)");
-        assert!(
-            !pass.contains("newly.push(x);\n                    false"),
-            "retain 안에서 제거까지 하던 종전 형태가 남아 있다"
+    fn wp5_r1_expiry_move_is_atomic_against_concurrent_drop() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("atomic-drop");
+        let (daemon, s) = wp5_seat("wp5-atomic-drop", "claude");
+        let now = now_epoch();
+        for round in 0..30 {
+            let mut e = daemon.next_queue_entry(format!("[보고] 경합 {round}"), None, "test");
+            e.enqueued_at = now - 8.0 * 3600.0; // TTL(6h) 초과 = 이번 스윕의 만료 후보
+            let id = e.id.clone();
+            s.pending_queue.lock().unwrap().push_back(e);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (d1, b1) = (daemon.clone(), barrier.clone());
+            let sweeper = std::thread::spawn(move || {
+                b1.wait();
+                super::queue_expiry_pass(&d1);
+            });
+            let (d2, b2, drop_id) = (daemon.clone(), barrier.clone(), id.clone());
+            let dropper = std::thread::spawn(move || {
+                b2.wait();
+                super::drop_queue_entry(&d2, &drop_id, None, now_epoch(), false).is_ok()
+            });
+            sweeper.join().expect("스윕 스레드");
+            let dropped = dropper.join().expect("폐기 스레드");
+            let in_active = s.pending_queue.lock().unwrap().iter().any(|x| x.id == id);
+            let in_expired = s.expired_queue.lock().unwrap().iter().any(|x| x.id == id);
+            if dropped {
+                // ⓑ 폐기 성공 = 묘비가 원장에 있다 → 어느 큐에도 되살아나면 안 된다.
+                assert!(
+                    !in_active && !in_expired,
+                    "폐기된 항목이 만료 스윕의 낡은 복사본으로 부활했다(round {round})"
+                );
+            } else {
+                // ⓐ 폐기 실패면 항목은 정확히 한 곳에 있어야 한다(유실 0 · 중복 0).
+                assert!(
+                    in_active ^ in_expired,
+                    "항목이 두 큐에 동시에 있거나 어디에도 없다(round {round} · \
+                     active={in_active} expired={in_expired})"
+                );
+                // 정리 — 다음 회차가 깨끗한 상태에서 시작한다.
+                s.pending_queue.lock().unwrap().retain(|x| x.id != id);
+                s.expired_queue.lock().unwrap().retain(|x| x.id != id);
+            }
+        }
+    }
+
+    /// ★(0.14.31 · 리뷰 R1 · codex major) **되살림(revive) 과 만료 스윕의 경합** — 되살린 항목이
+    /// 낡은 스윕 패스에 다시 끌려가 사라지지 않는다. revive 는 TTL 시계를 재시작하므로(revived_at)
+    /// 되살린 직후의 스윕은 그 항목을 다시 만료시키지 않아야 한다.
+    #[test]
+    fn wp5_r1_revive_is_atomic_against_concurrent_expiry_sweep() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("atomic-revive");
+        let (daemon, s) = wp5_seat("wp5-atomic-revive", "claude");
+        for round in 0..30 {
+            let now = now_epoch();
+            let mut e = daemon.next_queue_entry(format!("[보고] 되살림 {round}"), None, "test");
+            e.enqueued_at = now - 8.0 * 3600.0;
+            e.expired_at = Some(now - 10.0);
+            let id = e.id.clone();
+            s.expired_queue.lock().unwrap().push_back(e);
+            // 활성 큐에도 만료 후보를 하나 둬 스윕이 실제로 이동 작업을 하게 만든다.
+            let mut other = daemon.next_queue_entry(format!("[보고] 곁 {round}"), None, "test");
+            other.enqueued_at = now - 9.0 * 3600.0;
+            let other_id = other.id.clone();
+            s.pending_queue.lock().unwrap().push_back(other);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let (d1, b1) = (daemon.clone(), barrier.clone());
+            let sweeper = std::thread::spawn(move || {
+                b1.wait();
+                super::queue_expiry_pass(&d1);
+            });
+            let (d2, b2, rid) = (daemon.clone(), barrier.clone(), id.clone());
+            let reviver = std::thread::spawn(move || {
+                b2.wait();
+                super::revive_queue_entry(&d2, &rid, None, now_epoch()).is_ok()
+            });
+            sweeper.join().expect("스윕 스레드");
+            let revived = reviver.join().expect("되살림 스레드");
+            assert!(revived, "되살림이 경합으로 실패했다(round {round})");
+            let in_active = s.pending_queue.lock().unwrap().iter().any(|x| x.id == id);
+            let in_expired = s.expired_queue.lock().unwrap().iter().any(|x| x.id == id);
+            assert!(
+                in_active && !in_expired,
+                "되살린 항목이 낡은 스윕에 다시 끌려갔거나 사라졌다(round {round} · \
+                 active={in_active} expired={in_expired})"
+            );
+            s.pending_queue.lock().unwrap().retain(|x| x.id != id && x.id != other_id);
+            s.expired_queue.lock().unwrap().retain(|x| x.id != id && x.id != other_id);
+        }
+    }
+
+
+    // ─── ★(0.14.31 · 리뷰 R1) 리뷰 반영 검체 ─────────────────────────────────────────────
+
+    /// ★(리뷰 R1 · 양 리뷰어 blocking) **Home 초안은 지워지지 않는다.**
+    ///
+    /// 사람이 데몬이 쓴 미제출 초안 앞으로 커서를 옮기면(Home/Ctrl-A) 커서 **앞**은 공백이 된다.
+    /// 종전 리셋 판정은 그것만 보고 "화면상 빈 입력줄" 로 읽어 3s 뒤 `pending_input_bytes` 를 0 으로
+    /// 만들었고, 다음 틱에 큐 본문이 그 초안과 한 줄로 합쳐져 제출됐다(fail-closed → fail-open 역전).
+    /// 지금은 커서 **뒤**도 비어 있어야 리셋한다. 대조군: 줄이 정말 비면 종전대로 리셋된다.
+    #[test]
+    fn wp5_r1_draft_after_cursor_survives_the_stale_pending_reset() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("home-draft");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = wp5_seat("wp5-home-draft", "claude");
+        let e = daemon.next_queue_entry("[보고] 큐 본문".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        s.set_pending_input(12); // 데몬이 쓴 미제출 초안 12바이트
+        paint_prompt(&s, "", "리뷰 초안 문장"); // 커서는 마커 바로 뒤(Home) · 초안은 커서 뒤
+        quiet_since(&s, 10);
+        tick(&daemon); // 첫 틱 — 종전이라면 여기서 스탬프
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        quiet_since(&s, 10);
+        tick(&daemon); // 창 경과 — 그래도 리셋하지 않는다
+        assert_eq!(
+            s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+            12,
+            "커서 뒤 초안이 있는데 계수를 지웠다 — 다음 배달이 그 문장과 합쳐진다"
         );
-        // ② 배달 경로: 임계영역에서 `pop_front` 하지 않고 복제한다(만료 큐가 가진 뒤에 뺀다).
-        let deliver = body("pub(crate) fn deliver_head_locked(");
-        let clone_at = deliver
-            .find("let mut e = entry.clone();")
-            .expect("만료 머리를 복제하지 않는다");
-        let pop_at = deliver
-            .find("if q.front().is_some_and(|f| f.id == moved_id)")
-            .expect("만료 이동 뒤 활성 큐 제거가 없다");
-        assert!(clone_at < pop_at, "만료 머리를 만료 큐에 넣기 전에 활성 큐에서 뺀다");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "초안 위로 배달했다");
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
         assert!(
-            !deliver.contains("let mut e = q.pop_front().expect(\"front checked\");"),
-            "임계영역에서 곧바로 pop 하던 종전 형태가 남아 있다"
+            !daemon
+                .bus
+                .tail(40)
+                .into_iter()
+                .any(|ev| ev["name"] == "queue.input_pending_reset"),
+            "초안이 있는 줄에서 리셋 이벤트가 나갔다"
+        );
+        // 대조군 — 줄 전체가 비면(초안 제출·취소) 종전대로 리셋되고 그 다음 틱에 배달된다.
+        paint_prompt(&s, "", "");
+        quiet_since(&s, 10);
+        tick(&daemon); // 스탬프
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        quiet_since(&s, 10);
+        tick(&daemon); // 리셋(배달 없음)
+        assert_eq!(
+            s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+            0,
+            "정말 빈 줄에서도 리셋이 안 되면 고착 수리가 죽는다(가용성 대조군)"
         );
     }
 
+    /// ★(리뷰 R1 · codex blocking · §8) **마커 없는 좌석의 quiet 폴백도 승인 대기를 우회하지 않는다.**
+    /// 무번호 승인 문면(`Allow execution` — 모달 어휘 서명에 안 걸릴 수 있다)이 떠 있어도 종전
+    /// 게이트는 대체화면·미제출 바이트·모달 서명만 봐서 본문 + Return 이 승인 창으로 나갔다.
+    #[test]
+    fn wp5_r1_no_marker_quiet_fallback_refuses_pending_approval() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("bare-approval");
+        let daemon = drill_daemon("wp5-bare-approval");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .unwrap();
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let e = daemon.next_queue_entry("echo hi".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        // 승인 대기(데몬 발행) — 화면 어휘가 아니라 feed 사실이다.
+        daemon.feed_items.lock().unwrap().push(crate::state::FeedItem {
+            request_id: format!("{}approval-1", crate::state::DAEMON_REQ_PREFIX),
+            kind: "approval".into(),
+            title: "Allow execution".into(),
+            body: "Allow execution of `rm -rf`?".into(),
+            surface_id: Some(s.id),
+            status: "pending".into(),
+            decision: None,
+            created_at: now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: None,
+            risk_class: None,
+            auto_route: false,
+            resolver_surface: None,
+            resolver_pid: None,
+        });
+        paint_screen(&s, &["Allow execution of `rm -rf`?", "cys@host ~ % "], 1, 13, false);
+        quiet_since(&s, 30);
+        tick(&daemon);
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "승인 대기 중인 마커 없는 좌석에 큐 본문 + Return 을 꽂았다(§8 위반)"
+        );
+        assert_eq!(blocked_reason(&s), BLOCKED_APPROVAL);
+        // 강제 배달(운영자)도 같은 판정을 쓴다 — 면제 없음.
+        assert!(
+            matches!(
+                wp5_force(&daemon, &s, None, false),
+                Err(Wp5Denied::PromptGate(w)) if w == BLOCKED_APPROVAL
+            ),
+            "강제 경로가 승인 대기를 면제했다"
+        );
+        // 승인이 해소되면 종전 quiet 규칙대로 배달된다(가용성 대조군).
+        daemon.feed_items.lock().unwrap().clear();
+        paint_screen(&s, &["cys@host ~ % "], 0, 13, false);
+        quiet_since(&s, 30);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "승인 해소 뒤에도 막혔다(기아): {}",
+            blocked_reason(&s)
+        );
+    }
+
+    /// ★(리뷰 R1 · 양 리뷰어 major) **만료 큐 상한은 새 만료가 없어도 집행된다.**
+    /// 6h+ 정지 뒤 재기동해 `rehome` 이 만료분 125건을 복원한 상태를 그대로 만든다(활성 큐는 비어
+    /// 있어 이번 틱에 새로 만료되는 항목이 **없다**). 종전에는 상한 루프가 `expire_entries` 안에만
+    /// 있었고 그 함수는 신규 만료가 있을 때만 불려, 만료 큐가 125 로 무기한 유지됐다.
+    #[test]
+    fn wp5_r1_expired_cap_is_enforced_without_any_new_expiry() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("cap-restore");
+        let (daemon, s) = wp5_seat("wp5-cap-restore", "claude");
+        let now = now_epoch();
+        let over = 25usize;
+        let mut oldest = String::new();
+        for i in 0..(QUEUE_EXPIRED_CAP + over) {
+            let mut e = daemon.next_queue_entry(format!("[보고] 복원 {i}"), None, "wal-legacy");
+            e.enqueued_at = now - 9.0 * 3600.0;
+            e.expired_at = Some(now - 3600.0);
+            if i == 0 {
+                oldest = e.id.clone();
+            }
+            s.expired_queue.lock().unwrap().push_back(e);
+        }
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "전제: 신규 만료 후보가 없다");
+        // 틱당 축출은 유계(QUEUE_EXPIRED_EVICT_PER_TICK)라 몇 틱에 걸쳐 수렴한다.
+        for _ in 0..5 {
+            tick(&daemon);
+            if s.expired_queue.lock().unwrap().len() <= QUEUE_EXPIRED_CAP {
+                break;
+            }
+        }
+        assert_eq!(
+            s.expired_queue.lock().unwrap().len(),
+            QUEUE_EXPIRED_CAP,
+            "신규 만료가 없으면 상한이 영원히 집행되지 않는다(복원 백로그 무기한 잔존)"
+        );
+        assert!(
+            !s.expired_queue.lock().unwrap().iter().any(|e| e.id == oldest),
+            "가장 오래된 것부터 축출해야 한다"
+        );
+        // 회계 — 축출 전량이 원장 묘비로 남았다(이벤트만 보고 지운 것이 아니다).
+        let body =
+            std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).unwrap();
+        let tombs = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["origin"] == "queue_tombstone" && r["reason"] == "expired_evicted")
+            .count();
+        assert_eq!(tombs, over, "묘비 없이 폐기된 항목이 있다(원장 없는 삭제 금지)");
+    }
+
+    /// ★(리뷰 R1 · claude major) **통지 enqueue 가 막혀도 `queue.expired` 는 항목당 1회다.**
+    /// 발신 surface 의 활성 큐가 상한(100)이면 통지는 다음 틱으로 미뤄지는데, 종전에는 표식이 통지
+    /// 성공에만 세워져 같은 항목의 이벤트가 **매 틱** 재발행됐다(적체 상태에서 관측을 오염시킨다).
+    #[test]
+    fn wp5_r1_expired_event_is_published_once_even_when_notice_cannot_be_queued() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("event-latch");
+        let (daemon, target) = wp5_seat("wp5-event-latch", "claude");
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .unwrap();
+        daemon.surfaces.lock().unwrap().insert(sender.id, sender.clone());
+        // 발신 좌석의 활성 큐를 상한까지 채운다(통지 enqueue 불가).
+        for i in 0..100 {
+            let e = daemon.next_queue_entry(format!("filler {i}"), None, "test");
+            sender.pending_queue.lock().unwrap().push_back(e);
+        }
+        let mut e = daemon.next_queue_entry(
+            "[보고] 만료 대상".into(),
+            Some(cys::surface_ref(sender.id)),
+            "send",
+        );
+        e.enqueued_at = now_epoch() - 9.0 * 3600.0;
+        let id = e.id.clone();
+        target.pending_queue.lock().unwrap().push_back(e);
+        let count_expired = |d: &Arc<Daemon>| {
+            d.bus
+                .tail(200)
+                .into_iter()
+                .filter(|ev| {
+                    ev["name"] == "queue.expired"
+                        && ev["payload"]["queue_entry_id"] == serde_json::json!(id)
+                })
+                .count()
+        };
+        tick(&daemon);
+        assert_eq!(count_expired(&daemon), 1, "만료 이벤트가 안 나갔다");
+        tick(&daemon);
+        tick(&daemon);
+        assert_eq!(
+            count_expired(&daemon),
+            1,
+            "통지가 막혔다는 이유로 같은 항목의 만료 이벤트가 매 틱 재발행됐다"
+        );
+        assert!(
+            !target.expired_queue.lock().unwrap().iter().any(|x| x.expired_notified),
+            "통지는 아직 성공하지 않았다 — 표식이 서면 안 된다(재시도 소실)"
+        );
+        // 발신 큐가 비면 통지가 나간다(재시도가 살아 있다).
+        sender.pending_queue.lock().unwrap().clear();
+        tick(&daemon);
+        let q = sender.pending_queue.lock().unwrap();
+        assert!(
+            q.iter().any(|x| x.origin == QUEUE_NOTICE_ORIGIN && x.text.contains(&id)),
+            "발신 큐가 비었는데도 통지가 재시도되지 않았다"
+        );
+    }
+
+    /// ★(리뷰 R1 · claude minor) 한 발신자가 **여러 대상**에 만료 항목을 가지면 통지 문면의 대상이
+    /// 대상별로 갈린다(종전에는 첫 대상 ref 가 고정돼 두 번째 좌석의 id 들이 남의 소속으로 보고됐다).
+    #[test]
+    fn wp5_r1_expired_notice_names_the_right_target_per_surface() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("notice-target");
+        let (daemon, a) = wp5_seat("wp5-notice-a", "claude");
+        let b = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .unwrap();
+        daemon.surfaces.lock().unwrap().insert(b.id, b.clone());
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .unwrap();
+        daemon.surfaces.lock().unwrap().insert(sender.id, sender.clone());
+        let from = Some(cys::surface_ref(sender.id));
+        let mk = |seat: &Arc<crate::state::Surface>, tag: &str| -> String {
+            let mut e = daemon.next_queue_entry(format!("[보고] {tag}"), from.clone(), "send");
+            e.enqueued_at = now_epoch() - 9.0 * 3600.0;
+            let id = e.id.clone();
+            seat.pending_queue.lock().unwrap().push_back(e);
+            id
+        };
+        let ida = mk(&a, "대상 A");
+        let idb = mk(&b, "대상 B");
+        tick(&daemon);
+        let notices: Vec<String> = sender
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|x| x.origin == QUEUE_NOTICE_ORIGIN)
+            .map(|x| x.text.clone())
+            .collect();
+        let line_for = |id: &str| -> String {
+            notices
+                .iter()
+                .find(|t| t.contains(id))
+                .unwrap_or_else(|| panic!("{id} 통지 줄이 없다: {notices:?}"))
+                .clone()
+        };
+        assert!(
+            line_for(&ida).contains(&cys::surface_ref(a.id)),
+            "A 소속 id 의 통지가 A 를 가리키지 않는다: {}",
+            line_for(&ida)
+        );
+        assert!(
+            line_for(&idb).contains(&cys::surface_ref(b.id)),
+            "B 소속 id 의 통지가 첫 대상(A)으로 보고됐다 — 운영자가 조준을 오독한다: {}",
+            line_for(&idb)
+        );
+    }
+
+    /// ★(리뷰 R1 · codex blocking) **drop 인가는 삭제 임계영역에서 다시 집행된다.**
+    /// 핸들러가 '만료 항목' 으로 인가한 뒤 대상 좌석이 그것을 되살리면(revive) 살아있는 타 노드의
+    /// **활성** 항목이 지워졌다(queue.clear 위협모델 우회). 인가 조건을 인자로 넘겨 락 안에서 다시 본다.
+    #[test]
+    fn wp5_r1_drop_refuses_entry_that_became_active_under_the_lock() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("drop-race");
+        let (daemon, s) = wp5_seat("wp5-drop-race", "claude");
+        let e = daemon.next_queue_entry("[보고] 되살아난 항목".into(), None, "send");
+        let id = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e); // 지금은 **활성**
+        let denied = super::drop_queue_entry(&daemon, &id, None, now_epoch(), true);
+        assert!(
+            matches!(denied, Err(QueueOpDenied::ActiveProtected)),
+            "살아있는 타 좌석의 활성 항목을 지웠다: {denied:?}"
+        );
+        assert!(
+            s.pending_queue.lock().unwrap().iter().any(|x| x.id == id),
+            "거부했는데 항목이 사라졌다"
+        );
+        // 같은 항목이 만료 큐에 있으면(인가가 난 그 상태) 폐기된다 — 과잉 거부가 아니다.
+        s.pending_queue.lock().unwrap().clear();
+        let mut x = daemon.next_queue_entry("[보고] 만료 항목".into(), None, "send");
+        x.expired_at = Some(now_epoch());
+        let xid = x.id.clone();
+        s.expired_queue.lock().unwrap().push_back(x);
+        assert!(
+            super::drop_queue_entry(&daemon, &xid, None, now_epoch(), true).is_ok(),
+            "만료 항목 폐기까지 막으면 운영자 손잡이가 죽는다"
+        );
+    }
+
+    /// ★(리뷰 R1 · codex blocking) **좌석을 닫을 때 묘비 실패분이 도달 불능이 되지 않는다.**
+    /// 원장 경로를 디렉터리로 막아 묘비를 실패시키고 좌석을 닫는다. 종전에는 그 항목이 맵에서
+    /// 빠진 Surface 안에만 남아 다음 스냅샷에서 사라졌다(원장도 없고 항목도 없다 = 조용한 유실).
+    #[test]
+    fn wp5_r1_close_surface_parks_expired_when_the_tombstone_fails() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("park");
+        let (daemon, s) = wp5_seat("wp5-park", "claude");
+        let mut e = daemon.next_queue_entry("[보고] 도달 가능해야 한다".into(), None, "send");
+        e.expired_at = Some(now_epoch());
+        let id = e.id.clone();
+        s.expired_queue.lock().unwrap().push_back(e);
+        // 원장 append 실패 주입 — 경로를 디렉터리로(POSIX·Windows 공통 실패).
+        let ledger = crate::delivery::ledger_path(&daemon.socket_path);
+        let _ = std::fs::remove_file(&ledger);
+        if let Some(p) = ledger.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::create_dir_all(&ledger).expect("실패 주입용 디렉터리");
+        let sid = s.id;
+        super::close_surface(&daemon, sid, super::CloseCause::OwnerClose).expect("close");
+        let parked: Vec<String> = daemon
+            .restored_expired
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            parked.contains(&id),
+            "묘비 실패분이 데몬 보존소로 옮겨지지 않았다 — 그 항목은 어디에서도 도달할 수 없다"
+        );
+        let row = daemon.restored_expired.lock().unwrap()[0].clone();
+        assert_eq!(row["surface_id"], serde_json::json!(sid), "출처 좌석을 잃었다");
+        assert!(row.get("text").is_some(), "본문 없이 옮겼다(복원 불가)");
+        let _ = std::fs::remove_dir_all(&ledger);
+    }
+
+
+    /// ★(리뷰 R1 · codex blocking) **미영속 enqueue 는 틱이 스스로 재시도한다.**
+    ///
+    /// 종전: `persist_queue_state` 안에서 `queue-expired.json` 치환이 실패하면 활성 파일을 **쓰지
+    /// 않고** 조용히 돌아왔고, enqueue 는 이미 `queued:true` 를 반환한 뒤였다. 그 뒤 큐 변경이 없으면
+    /// 재시도 기회가 오지 않아 데몬이 죽으면 승인된 메시지가 사라졌다.
+    /// 지금: 실패는 `durable=false` 로 드러나고, watchdog 틱이 **큐 변경 없이도** 다시 쓴다.
+    /// (검체는 재시도를 손으로 부르지 않는다 — 공개 틱 경로만 돌린다.)
+    #[test]
+    fn wp5_r1_failed_queue_persist_is_retried_by_the_tick_without_new_mutations() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("persist-retry");
+        let (daemon, s) = wp5_seat("wp5-persist-retry", "claude");
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let blocked = dir.join("queue-expired.json");
+        let _ = std::fs::remove_file(&blocked);
+        std::fs::create_dir_all(&blocked).expect("실패 주입용 디렉터리(원자 치환 실패)");
+        let e = daemon.next_queue_entry("[보고] 내구성".into(), None, "send");
+        let id = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e);
+        daemon.persist_queue_state(); // enqueue 핸들러가 하는 그 호출
+        assert!(
+            !daemon.queue_wal_durable(),
+            "치환이 실패했는데 내구 표식이 서 있다 — 응답이 거짓을 말한다(durable:true)"
+        );
+        let active = dir.join("queue-state.json");
+        let has_entry = |p: &std::path::Path| -> bool {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| {
+                    v.as_array().is_some_and(|a| {
+                        a.iter().any(|it| it["id"].as_str() == Some(id.as_str()))
+                    })
+                })
+        };
+        assert!(!has_entry(&active), "전제: 실패 회차에서는 활성 파일이 항목을 갖지 못한다");
+        // 디스크가 회복된다. **큐를 건드리지 않고** 틱만 돈다 — 종전에는 여기서 아무 일도 없었다.
+        std::fs::remove_dir_all(&blocked).expect("실패 주입 해제");
+        paint_claude_idle_alt(&s);
+        *s.queue_paused_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60)); // 배달은 막고 회계만
+        tick(&daemon);
+        assert!(
+            daemon.queue_wal_durable(),
+            "회복 뒤에도 표식이 서 있다(재시도가 없었다)"
+        );
+        assert!(
+            has_entry(&active),
+            "틱이 미영속 스냅샷을 다시 쓰지 않았다 — 승인된 메시지가 크래시 한 번에 사라진다"
+        );
+    }
+
+
+    /// ★(리뷰 R1 · codex major) **통지가 디스크에 있기 전에는 표식을 세우지 않는다.**
+    ///
+    /// 종전 주석은 "통지 enqueue 와 표식은 같은 persist 한 번으로 원자" 라고 적었으나, 그 persist 는
+    /// 두 파일(만료 → 활성)을 순서대로 쓴다 — 만료 파일만 쓰이고 크래시하면 `expired_notified` 만
+    /// 살아남고 통지는 사라져 **영원히 재시도되지 않았다**. 지금은 통지를 활성 파일에 넣는 persist 가
+    /// 성공했을 때만 표식을 세우고, 재시도는 **결정적 id** 로 멱등하다(중복 통지 0).
+    #[test]
+    fn wp5_r1_expired_notice_is_persisted_before_the_flag_and_retried_idempotently() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("notice-durable");
+        let (daemon, target) = wp5_seat("wp5-notice-durable", "claude");
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .unwrap();
+        daemon.surfaces.lock().unwrap().insert(sender.id, sender.clone());
+        let mut e = daemon.next_queue_entry(
+            "[보고] 통지 대상".into(),
+            Some(cys::surface_ref(sender.id)),
+            "send",
+        );
+        e.enqueued_at = now_epoch() - 9.0 * 3600.0;
+        let id = e.id.clone();
+        target.pending_queue.lock().unwrap().push_back(e);
+        // WAL 치환 실패 주입 — 통지는 메모리 큐에 들어가지만 디스크에는 없다.
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let blocked = dir.join("queue-expired.json");
+        let _ = std::fs::remove_file(&blocked);
+        std::fs::create_dir_all(&blocked).expect("실패 주입용 디렉터리");
+        tick(&daemon);
+        let notice_ids = |s: &Arc<crate::state::Surface>| -> Vec<String> {
+            s.pending_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|x| x.origin == QUEUE_NOTICE_ORIGIN)
+                .map(|x| x.id.clone())
+                .collect()
+        };
+        let first = notice_ids(&sender);
+        assert_eq!(first.len(), 1, "통지가 발신 큐에 들어가지 않았다");
+        assert!(
+            !target.expired_queue.lock().unwrap().iter().any(|x| x.expired_notified),
+            "영속에 실패했는데 통지 표식을 세웠다 — 재시작이 그 통지를 영영 재시도하지 않는다"
+        );
+        // 크래시 모사: 통지 항목이 디스크에 없다는 사실을 그대로 두고, 회복 후 다음 틱이 재시도한다.
+        std::fs::remove_dir_all(&blocked).expect("실패 주입 해제");
+        tick(&daemon);
+        let second = notice_ids(&sender);
+        assert_eq!(
+            second, first,
+            "재시도가 **새 id** 로 통지를 하나 더 만들었다(결정적 id 멱등이 깨졌다): {second:?}"
+        );
+        assert!(
+            target.expired_queue.lock().unwrap().iter().all(|x| x.expired_notified),
+            "영속에 성공했는데도 표식이 서지 않았다(매 틱 재시도 무한)"
+        );
+        // 표식이 선 뒤에는 더 만들지 않는다.
+        tick(&daemon);
+        assert_eq!(notice_ids(&sender).len(), 1, "표식이 선 항목을 다시 통지했다");
+        assert!(
+            sender
+                .pending_queue
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|x| x.origin == QUEUE_NOTICE_ORIGIN && x.text.contains(&id)),
+            "통지 문면이 대상 항목 id 를 잃었다"
+        );
+    }
+
+    // ─── ★(리뷰 R1) codex(gpt-6-astra) 위임 검체 — 초안 `impl/codex/R2-WP5-queue-r1fix-tests.md`
+    //     를 한 줄씩 검토해 통합했다(수정 0 · 통합 위치만 지정). 대상은 순수 함수
+    //     `expired_notice_id` 의 **멱등 키 성질** 5종 + 빈 집합 결정성 1종.
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_is_order_independent() {
+        use super::expired_notice_id;
+
+        let ids = ["qabc.1", "qabc.2", "qdef.3"].map(String::from);
+        let expected = expired_notice_id(7, "surface:12", &ids);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            // 매번 새 문자열을 만들어 객체 재사용 없이도 같은 키가 나오는지 확인한다.
+            let permuted = order.map(|i| ids[i].as_str().to_owned());
+            assert_eq!(
+                expired_notice_id(7, "surface:12", &permuted),
+                expected,
+                "동일한 만료 id 집합의 순서만 바뀌었는데 멱등 키가 달라졌다: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_distinguishes_id_sets() {
+        use super::expired_notice_id;
+
+        let sets: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["qabc.1".into()],
+            vec!["qabc.2".into()],
+            vec!["qabc.1".into(), "qabc.2".into()],
+            vec!["qabc.1".into(), "qabc.3".into()],
+        ];
+        for (i, left) in sets.iter().enumerate() {
+            for right in &sets[i + 1..] {
+                assert_ne!(
+                    expired_notice_id(7, "surface:12", left),
+                    expired_notice_id(7, "surface:12", right),
+                    "서로 다른 만료 id 집합이 같은 통지 키를 만들었다: {left:?}, {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_distinguishes_senders() {
+        use super::expired_notice_id;
+
+        let ids = [String::from("qabc.1")];
+        assert_ne!(
+            expired_notice_id(7, "surface:12", &ids),
+            expired_notice_id(8, "surface:12", &ids),
+            "발신자만 바뀌었는데 통지 키가 같아 서로의 통지가 중복으로 제거된다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_distinguishes_targets() {
+        use super::expired_notice_id;
+
+        let ids = [String::from("qabc.1")];
+        assert_ne!(
+            expired_notice_id(7, "surface:12", &ids),
+            expired_notice_id(7, "surface:13", &ids),
+            "대상만 바뀌었는데 통지 키가 같아 다른 대상의 통지가 제거된다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_has_disjoint_queue_prefix() {
+        use super::expired_notice_id;
+
+        let id = expired_notice_id(7, "surface:12", &[String::from("qabc.1")]);
+        // q{hex}.{seq}의 첫 점 앞에는 q와 16진수만 올 수 있다.
+        // qexp의 x와 p는 16진수가 아니므로 이 접두는 일반 큐 id와 겹치지 않는다.
+        assert_eq!(
+            id.split('.').next(),
+            Some("qexp"),
+            "만료 통지의 전용 접두가 깨져 일반 큐 id와의 비충돌 계약을 보장할 수 없다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_expired_notice_accepts_empty_set() {
+        use super::expired_notice_id;
+
+        // 빈 문자열 SHA-256의 앞 16자리까지 고정하여 빈 입력의 반환값도 검증한다.
+        assert_eq!(
+            expired_notice_id(7, "surface:12", &[]),
+            "qexp.7.surface-12.e3b0c44298fc1c14",
+            "빈 만료 집합의 통지 키가 정해진 빈 입력 해시와 달라졌다"
+        );
+    }
 
     /// TTL 스윕: 7h 전 항목은 만료 큐로, `queue.expired`(hint 계약) 발행, 발신 surface 큐에 통지 1줄
     /// (origin=queue-expired-notice · id 포함) — 두 번째 틱에 중복 통지 없음. 통지 항목은 만료돼도 재통지 없음.

@@ -180,6 +180,38 @@ def test_ledger_fixture():
     _assert_no_new(_s)
 
 
+def test_bookkeeping_origins_are_not_deliveries():
+    """★(0.14.31 · WP-5 리뷰 R1 · codex major) 회계 줄(영수증·묘비)은 **배달이 아니다.**
+
+    0.14.31 데몬은 큐 배달마다 영수증(`queue_receipt`)을, 배달 없이 큐를 떠난 항목마다 묘비
+    (`queue_tombstone`)를 같은 원장에 남긴다. 종전 판독은 sentinel·조각만 걸러 이 두 줄을
+    **배달로 셌다** — 배달 1건 + 그 영수증 + 폐기 1건이 '3배달' 로 보고되고 `from` 별 발신 계수와
+    최근 이력까지 오염된다. 계수에서 빼되 사실은 버리지 않는다(별도 줄로 보고)."""
+    _s = len(fails)
+    with tempfile.TemporaryDirectory() as td:
+        _ws, rd, state = make_ws(td)
+        with open(os.path.join(state, "delivery-base.jsonl"), "w", encoding="utf-8") as f:
+            f.write(drec("큐 배달 본문", surface="2", origin="queue", frm="1"))
+            f.write(drec("queue-receipt:q1", surface="2", origin="queue_receipt", frm="1",
+                         kind="receipt", queue_entry_id="q1"))
+            f.write(drec("queue-tombstone:q2:expired", surface="2", origin="queue_tombstone",
+                         frm="1", kind="tombstone", reason="expired", queue_entry_id="q2"))
+        env = {"CYS_ROLE": "master", "CYS_STATE_DIR": state, "CYS_SURFACE_ID": "1"}
+        rc, _o, _e = run(["generate", "--round-dir", rd], env)
+        body = open(os.path.join(rd, "BOOT_SNAPSHOT.md"), encoding="utf-8").read()
+        check("회계[rc=0]", rc == 0, "rc=%s" % rc)
+        check("회계[배달 1건만 계수]", "24h 전 레인: 1건" in body, body[:200])
+        check("회계[origin 표에 회계 줄 없음]",
+              "queue_receipt=" not in body.split("- 회계 줄")[0]
+              and "queue_tombstone=" not in body.split("- 회계 줄")[0], body[:240])
+        check("회계[별도 줄로 보고]",
+              "회계 줄(배달 아님)" in body and "queue_receipt=1" in body
+              and "queue_tombstone=1" in body, body[:240])
+        check("회계[내 발신 계수 오염 없음]", "내 발신(from=1): 1건" in body, body[:240])
+        check("회계[origin 표 queue=1]", "queue=1" in body, body[:200])
+    _assert_no_new(_s)
+
+
 def test_readonly():
     """읽기 전용 — 관측이 원장·티켓·큐를 1바이트도 바꾸지 않는다(자기인가 벡터 차단)."""
     _s = len(fails)
@@ -326,6 +358,7 @@ def test_ascii_stdout():
 
 def main():
     for fn in (test_gate, test_cap, test_atomic_idempotent, test_ledger_fixture,
+               test_bookkeeping_origins_are_not_deliveries,
                test_readonly, test_sanitize, test_sanitize_bypass, test_stale_tmp_sweep,
                test_symbol_pins, test_ascii_stdout):
         try:
@@ -339,6 +372,7 @@ def main():
             print("  -", f)
         sys.exit(1)
     print("PASS: 게이트 4상 + 캡/마커 + 원자성·멱등 + 원장 fixture(정규화 동일) 판독 + "
+          "회계 줄(영수증·묘비) 배달 미계수 + "
           "읽기 전용 + 위생(격리·마스킹) + 우회 벡터 4종(NFD·ZWSP·개행·영문) 격리 + "
           "스테일 tmp 스윕 + 심볼 핀 + ASCII stdout 전건 통과")
 

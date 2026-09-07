@@ -435,6 +435,7 @@ fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path:
         text,
         cr_delay_ms: 120,
         clear_first: false,
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
     });
 }
 
@@ -608,7 +609,7 @@ fn npm_prefix_pane_notice_req(
     shell: &str,
 ) -> Option<crate::state::WriteReq> {
     let text = cys::npm_prefix_pollution_notice_for(verdict, shell)?;
-    Some(crate::state::WriteReq::Inject { text, cr_delay_ms: 120, clear_first: false })
+    Some(crate::state::WriteReq::Inject { text, cr_delay_ms: 120, clear_first: false, guard: None })
 }
 
 /// `org.status` 의 `daemon.npm_prefix_polluted` 필드 — **판정 주입판**(codex R2 #8).
@@ -1422,6 +1423,7 @@ fn send_text_write_req(
             text: text.to_string(),
             cr_delay_ms: 400,
             clear_first: true,
+            guard: None, // 직접 send(권위 전달) — 인계 가드 없음(종전 동작)
         }
     } else if human_verified {
         crate::state::WriteReq::Data(text.as_bytes().to_vec())
@@ -1907,6 +1909,7 @@ fn deliver_to_ceo(
         text,
         cr_delay_ms: 500,
         clear_first: false,
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
     };
     if surface.write_tx.try_send(req).is_err() {
         return CeoDelivery::SeatEmpty; // writer 채널 불능 → escalation
@@ -3408,12 +3411,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 );
                 // P7 큐 WAL: enqueue를 디스크에 확정 — 데몬 재기동에도 미배달 큐 생존.
                 daemon.persist_queue_state();
+                // ★(0.14.31 · 리뷰 R1 · codex blocking) **내구성을 사실대로 싣는다** — WAL 치환이
+                //   실패했으면 이 항목은 아직 메모리에만 있다(데몬이 죽으면 사라진다). 종전에는
+                //   그 실패가 응답에 전혀 드러나지 않아 발신자가 '보존됨' 으로 읽었다. 표식이 서면
+                //   watchdog 틱(≤5s)이 큐 변경 없이도 재시도한다. 키는 additive(기존 키 불변).
+                let durable = daemon.queue_wal_durable();
                 // ★G1(W2-B): 응답에 queue_entry_id 가산(queued/depth 불변) — 발신자가
                 // 이후 queue.list·배달/폐기 이벤트를 조인하는 조준점.
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id}),
+                           "queue_entry_id": entry.id, "durable": durable}),
                 ));
             }
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
@@ -7032,10 +7040,27 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             let deny_code = if is_revive { "revive_denied" } else { "drop_denied" };
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // ★(0.14.31 · 리뷰 R1 · codex blocking) 이 호출자가 "살아있는 타 좌석의 **활성** 항목"
+            //   을 지울 권한이 있는가 — 아래 ACL 과 같은 규칙을 항목 상태와 **무관하게** 계산해
+            //   `drop_queue_entry` 에 넘긴다. 인가는 `locate_queue_entry` 가 본 스냅샷(만료)으로
+            //   나는데 실제 삭제는 그 뒤에 다시 찾은 위치에서 일어나므로, 그 사이 revive 가 끼면
+            //   활성 항목이 지워졌다(경합). 판정을 삭제 임계영역 안에서 다시 집행하게 만든다.
+            let mut deny_active = false;
             if let Some(cs) = caller_sid {
                 // 복원분(살아있는 surface 없음)은 '자기 큐' 가 아니다 — 권위 role 만 다룬다.
                 let own = !home.restored && home.surface_id == Some(cs);
                 if !own {
+                    // 타 좌석: 그 좌석이 **살아 있지 않다고 확인된 경우에만** 활성 항목 drop 을
+                    // 허용한다(계약: exited 좌석의 잔여 큐는 권위 role 이 정리할 수 있다).
+                    // ★(리뷰 R1 · codex H) 복원분(살아있는 surface 없음)은 `rehome` 이 이 검사와
+                    //   삭제 사이에 그것을 **살아있는 좌석의 활성 큐**로 옮길 수 있으므로 보수적으로
+                    //   금지한다 — 그 경우 삭제 임계영역이 `drop_denied` 로 거부한다(과잉 거부는
+                    //   안전 방향 · 만료 항목 drop 은 영향받지 않는다).
+                    let target_exited = home
+                        .surface
+                        .as_ref()
+                        .is_some_and(|s| s.exited.load(Ordering::Relaxed));
+                    deny_active = !is_revive && !target_exited;
                     let caller_role = daemon
                         .get_surface(cs)
                         .and_then(|s| s.role.lock().unwrap().clone());
@@ -7104,7 +7129,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Err(d) => Reply::Single(err_response(&id, d.code(), &d.message())),
                 }
             } else {
-                match crate::governance::drop_queue_entry(daemon, &entry_id, hint, now) {
+                match crate::governance::drop_queue_entry(daemon, &entry_id, hint, now, deny_active)
+                {
                     Ok((e, was_active, sid)) => {
                         daemon.bus.publish(
                             "queue.dropped",
@@ -11000,7 +11026,7 @@ mod tests {
         // ③ clear_first 는 human 여부와 무관하게 원자 Inject(종전 동작 불변 · cr_delay 400).
         for human_verified in [false, true] {
             match send_text_write_req("hi", true, human_verified) {
-                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
                     assert_eq!(text, "hi");
                     assert_eq!(cr_delay_ms, 400, "큐/원자 주입의 CR 지연 규약이 바뀌었다");
                     assert!(clear_first);
@@ -11596,7 +11622,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("셸 {shell:?} 에서 고지가 만들어지지 않았다"));
             tx.try_send(req).expect("채널 전송 실패");
             match rx.try_recv().expect("pane 이 고지를 못 받았다 — Windows 무음 회귀") {
-                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
                     assert!(
                         text.starts_with(want_prefix),
                         "셸 {shell:?} 에 안전하지 않은 접두로 주입됐다: {text:?}"
@@ -11686,10 +11712,11 @@ mod tests {
                 text: seat_takeover_notice("worker", shell),
                 cr_delay_ms: 120,
                 clear_first: false,
+                guard: None,
             })
             .expect("채널 전송 실패");
             match rx.try_recv().expect("pane 이 승계 고지를 못 받았다 — Windows 무음 회귀") {
-                WriteReq::Inject { text, cr_delay_ms, clear_first } => {
+                WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
                     assert!(text.starts_with(want), "셸 {shell:?} 접두 오류: {text:?}");
                     assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
                     assert!(!clear_first, "승계 고지가 화면을 지웠다 — 사용자 작업 파괴");

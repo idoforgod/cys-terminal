@@ -398,6 +398,11 @@ def last_ledger(state_dir):
 # **severity 상승은 TTL 우회**: key 자체에 severity 를 포함하므로 상위 severity 는 별도 키가
 # 되어 하위 seen 에 억제되지 않는다(gemini ISSUE-4 수용의 구조적 구현).
 SEEN_STATE_CLAIMED, SEEN_STATE_INFLIGHT, SEEN_STATE_DELIVERED = "claimed", "inflight", "delivered"
+# ★(0.14.31 · WP-5 리뷰 R1 · codex major) 데몬이 그 항목을 **TTL 만료**로 큐에서 뺐다
+# (`queue.expired`). 배달이 아니므로 delivered 로 세지 않지만, 종결이므로 inflight 로도
+# 남기지 않는다 — 종전에는 만료된 critical wakeup 이 inflight 로 영원히 남아 seen TTL 마다
+# 재enqueue 됐고, 그 재enqueue 가 또 만료되며 만료 통지까지 반복 생산했다(적체 자기증식).
+SEEN_STATE_EXPIRED = "expired"
 
 
 def _safe_key(key):
@@ -1724,7 +1729,8 @@ class Gate:
             return
         try:
             ok, events, latest = fn(self._load_cursor(),
-                                    ["queue.delivered", "master.deadman", "master.idle"])
+                                    ["queue.delivered", "queue.expired",
+                                     "master.deadman", "master.idle"])
         except Exception:                       # noqa: BLE001 — 관측 실패가 판정을 죽이지 않는다
             return
         self._ack_ok = bool(ok)
@@ -1752,17 +1758,27 @@ class Gate:
                 if r.get("state") == SEEN_STATE_INFLIGHT and r.get("wakeup_id")]
         if not pend or not self._ack_ok:
             return
-        acked = set()
+        acked, expired = set(), set()
         for ev in self._events:
-            if ev.get("name") != "queue.delivered":
+            name = ev.get("name")
+            if name not in ("queue.delivered", "queue.expired"):
                 continue
             payload = ev.get("payload") or {}
             for i in payload.get("entry_ids") or []:
-                acked.add(i)
+                (acked if name == "queue.delivered" else expired).add(i)
         for rec in pend:
-            if rec.get("wakeup_id") in acked:
+            wid = rec.get("wakeup_id")
+            if wid in acked:
                 seen_mark(self.state_dir, rec["key"], now_epoch,
                           state=SEEN_STATE_DELIVERED)
+                edge_fire(counters, "push_edge", rec["key"], now_epoch)
+            elif wid in expired:
+                # ★(0.14.31 · WP-5 리뷰 R1 · codex major) 데몬이 TTL 로 그 항목을 뺐다 —
+                #   **배달이 아니다**(delivered 계수 불변). 그러나 종결이므로 inflight 를 풀어
+                #   같은 사건이 seen TTL 마다 다시 enqueue 되는 고리를 끊는다. 조건이 여전하면
+                #   다음 주기의 **새 관측**이 새 wakeup 을 만든다(관측이 사실을 다시 말한다).
+                seen_mark(self.state_dir, rec["key"], now_epoch,
+                          state=SEEN_STATE_EXPIRED)
                 edge_fire(counters, "push_edge", rec["key"], now_epoch)
 
     def _judge_and_route(self, shadow, counters):

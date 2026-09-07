@@ -185,22 +185,32 @@ def _fmt_epoch(ts):
         return "-"
 
 
+# ★(0.14.31 · WP-5 리뷰 R1 · codex major) **배달이 아닌 회계 줄**의 origin.
+# 0.14.31 데몬은 큐 배달마다 영수증(`queue_receipt`)을, 배달 없이 큐를 떠난 항목마다 묘비
+# (`queue_tombstone`)를 같은 원장에 남긴다. 이것들을 배달로 세면 "1배달 + 영수증 + 폐기 1건" 이
+# **3배달**로 보고되고 `from` 별 발신 계수와 최근 이력까지 오염된다(codex 리뷰). 계수에서 빼되
+# 사실은 버리지 않는다 — 아래 `_section_delivery` 가 별도 줄로 보고한다.
+LEDGER_BOOKKEEPING_ORIGINS = ("queue_receipt", "queue_tombstone")
+
+
 def _delivery_records(jm, now):
-    """(recs|None, err) — 원장 '표시용' 열람(24h 창). 파일 판독 규칙(크기 상한·손상 판정)은
+    """(recs|None, meta, err) — 원장 '표시용' 열람(24h 창). 파일 판독 규칙(크기 상한·손상 판정)은
     javis_mission._read_ledger_lines, 경로는 delivery_ledger_path, 스키마 필터는
     SCHEMA_VERSION 을 **재사용**한다. 기계/오너 '판정'은 여기서 하지 않는다(read_delivery
-    소유) — 이 함수는 레코드를 접거나 버리는 판정 없이 사실을 나열만 한다."""
+    소유) — 이 함수는 레코드를 접거나 버리는 판정 없이 사실을 나열만 한다.
+
+    `meta` = 배달이 아닌 회계 줄(영수증·묘비)의 origin별 계수(별도 보고용)."""
     p = jm.delivery_ledger_path()
     if not p:
-        return None, "ledger path unavailable"
+        return None, {}, "ledger path unavailable"
     lines = []
     for cand in (p + ".1", p):           # 회전 세대(.1) → 본 파일 순(read_delivery 동일 규약)
         if os.path.exists(cand) and not os.path.isdir(cand):
             ls, err = jm._read_ledger_lines(cand)
             if err:
-                return None, "unreadable"
+                return None, {}, "unreadable"
             lines.extend(ls or [])
-    out = []
+    out, meta = [], {}
     for ln in lines:
         ln = ln.strip()
         if not ln:
@@ -221,9 +231,13 @@ def _delivery_records(jm, now):
             continue
         if now - ts > DIGEST_WINDOW_S:
             continue
+        origin = str(rec.get("origin") or "-")
+        if origin in LEDGER_BOOKKEEPING_ORIGINS:
+            meta[origin] = meta.get(origin, 0) + 1
+            continue                     # 회계 줄 — 배달이 아니다(위 상수 doc)
         out.append(rec)
     out.sort(key=lambda r: (r.get("ts_epoch") or 0))
-    return out, None
+    return out, meta, None
 
 
 def _section_delivery():
@@ -247,7 +261,7 @@ def _section_delivery():
         lines.append("- 원장 부재(기계 배달 이력 없음 — 정상일 수 있음)")
         return lines
     stale = sum(1 for m in matches.values() if isinstance(m, dict) and m.get("stale"))
-    recs, err = _delivery_records(jm, now)
+    recs, meta, err = _delivery_records(jm, now)
     if recs is None:
         lines.append("- 표시용 열람 실패(%s) · 층1 대조(내 pane 앞): %d건" % (err, len(matches)))
         return lines
@@ -259,6 +273,10 @@ def _section_delivery():
                  % (len(matches), stale, len(recs)))
     lines.append("- origin별: %s" % (" · ".join("%s=%d" % (k, by_origin[k])
                                                 for k in sorted(by_origin)) or "없음"))
+    if meta:
+        # 배달 계수 밖의 회계 줄(0.14.31+) — 영수증=인계 확인, 묘비=배달 없이 큐를 떠난 항목.
+        lines.append("- 회계 줄(배달 아님): %s"
+                     % " · ".join("%s=%d" % (k, meta[k]) for k in sorted(meta)))
     for r in recs[-5:]:
         lines.append("- %s surface=%s origin=%s from=%s \"%s\""
                      % (_fmt_epoch(r.get("ts_epoch")), _clip(r.get("surface"), 12),

@@ -699,5 +699,78 @@ class PushTargetRouting(unittest.TestCase):
             self.assertTrue(os.path.exists(G.seen_path(t, key)))
 
 
+class QueueExpiryTermination(unittest.TestCase):
+    """★(0.14.31 · WP-5 리뷰 R1 · codex major) **만료는 재시도 사슬을 끊는다.**
+
+    데몬이 TTL(기본 6h)로 큐 항목을 뺐다는 사실(`queue.expired` · `entry_ids` 에코)을 종전 게이트는
+    구독하지도, 넘겨받아도 해석하지도 않았다. 그래서 만료된 critical wakeup 이 `inflight` 로 남아
+    seen TTL 마다 재enqueue 됐고, 그 재enqueue 가 또 만료되며 만료 통지까지 반복 생산했다
+    (적체가 스스로를 먹여 살린다). 지금은 **종결**로 처리하되 배달로는 세지 않는다.
+    """
+
+    def _pend(self, t, wid, key):
+        G.seen_claim(t, key, G.SEV_CRIT, 1_000_000.0)
+        G.seen_mark(t, key, 1_000_000.0, state=G.SEEN_STATE_INFLIGHT, wakeup_id=wid)
+
+    def test_expired_event_is_subscribed(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            g = gate(t, r)
+            g._poll_once()
+            self.assertTrue(r.polls, "이벤트 폴링을 하지 않았다")
+            self.assertIn("queue.expired", r.polls[0][1],
+                          "만료 사실을 구독하지 않는다 — 종결 신호가 도착조차 하지 않는다")
+
+    def test_expired_wakeup_is_terminally_disarmed_without_counting_as_delivered(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:worker", G.SEV_CRIT)
+            self._pend(t, "W-0000000001", key)
+            r.events = [{"name": "queue.expired",
+                         "payload": {"entry_ids": ["W-0000000001"],
+                                     "queue_entry_id": "q1", "surface_ref": "surface:9"}}]
+            g = gate(t, r)
+            g._poll_once()
+            counters = {}
+            g._reconcile_inflight(counters, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["state"], G.SEEN_STATE_EXPIRED,
+                             "만료가 inflight 를 풀지 않았다 — TTL 마다 영구 재enqueue 된다")
+            self.assertNotEqual(rec["state"], G.SEEN_STATE_DELIVERED,
+                                "만료를 배달로 셌다(배달되지 않은 일을 완료로 기록)")
+            self.assertFalse(counters.get("push_edge", {}).get(key, {}).get("armed", True),
+                             "엣지가 무장 해제되지 않아 같은 주기에 다시 발화한다")
+
+    def test_delivered_receipt_still_marks_delivered(self):
+        """대조군 — 영수증 경로는 종전 그대로 `delivered` 다(만료 처리가 전면화되지 않았다)."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:worker2", G.SEV_CRIT)
+            self._pend(t, "W-0000000002", key)
+            r.events = [{"name": "queue.delivered",
+                         "payload": {"entry_ids": ["W-0000000002"]}}]
+            g = gate(t, r)
+            g._poll_once()
+            g._reconcile_inflight({}, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["state"], G.SEEN_STATE_DELIVERED)
+
+    def test_unrelated_expiry_leaves_other_work_inflight(self):
+        """다른 항목의 만료가 내 wakeup 을 종결시키지 않는다(id 대조가 실제로 걸린다)."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:worker3", G.SEV_CRIT)
+            self._pend(t, "W-0000000003", key)
+            r.events = [{"name": "queue.expired", "payload": {"entry_ids": ["W-0000009999"]}}]
+            g = gate(t, r)
+            g._poll_once()
+            g._reconcile_inflight({}, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["state"], G.SEEN_STATE_INFLIGHT)
+
+
 if __name__ == "__main__":
     unittest.main()

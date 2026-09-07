@@ -123,6 +123,16 @@ pub struct QueueEntry {
     /// 나가지 않게 하는 항목 id 단위 멱등 표식.
     #[serde(default)]
     pub expired_notified: bool,
+    /// ★(0.14.31 · 리뷰 R1) `queue.expired` **이벤트**를 이미 발행했는가 — 통지 표식
+    /// (`expired_notified`)과 **분리된** 래치다.
+    ///
+    /// 왜 갈랐나: 종전에는 이벤트와 통지가 한 표식을 공유해, 발신 surface 의 활성 큐가 상한(100)에
+    /// 닿아 통지 enqueue 가 실패하면 표식이 서지 않았고 → 같은 항목의 `queue.expired` 가 **매 틱
+    /// (5s) 재발행**됐다(만료 100건이면 20 events/s 가 버스·`_events` 로그로 유출 — 적체 상태에서
+    /// 정확히 발화해 관측을 스스로 오염시킨다). 이벤트는 "이 항목이 만료됐다"는 **사실**이라 항목당
+    /// 1회면 족하고, 재시도 대상은 통지뿐이다.
+    #[serde(default)]
+    pub expired_event_sent: bool,
 }
 
 /// ★(0.14.31 · WP-5 M) 큐 항목 TTL 기본(초) = 6h. env `CYS_QUEUE_TTL_SECS` 가 덮는다
@@ -135,6 +145,26 @@ pub fn queue_ttl_default_secs() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(QUEUE_TTL_DEFAULT_SECS)
+}
+
+/// ★(0.14.31 · 리뷰 R1) `QueueEntry` → WAL 행(Value) — `persist_queue_state` 와
+/// `governance::park_expired_to_restored`(묘비 실패분의 데몬 보존소 이관)가 **같은 산식**을 쓴다
+/// (행 스키마가 두 벌이 되면 복원이 갈린다). `queue_entry_from_row` 의 역함수.
+///
+/// mid 병기는 구 데몬 롤백 호환(구 코드는 mid/surface_id/text/role 만 읽고 미지 키는 버린다).
+/// TTL 회계 키는 전부 additive 라, 구 데몬이 이 파일을 다시 쓰면 사라졌다가 신 데몬 재기동 시
+/// serde default 로 되살아난다(활성 항목의 만료는 보존된 `enqueued_at` 기준 재계산 = 무손실).
+pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -> Value {
+    json!({
+        "mid": queue_mid(surface_id, &e.text), "id": e.id, "seq": e.seq,
+        "surface_id": surface_id, "role": role, "text": e.text,
+        "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
+        "ttl_secs": e.ttl_secs, "paused_total_secs": e.paused_total_secs,
+        "expired_at": e.expired_at, "revived_at": e.revived_at,
+        "expired_notified": e.expired_notified,
+        // ★(0.14.31 · 리뷰 R1) 이벤트 래치 — 재기동이 만료 이벤트를 다시 쏘지 않게 관통한다.
+        "expired_event_sent": e.expired_event_sent,
+    })
 }
 
 /// ★(0.14.31 · WP-5 M) WAL 행(Value) → `QueueEntry` 되살림 — rehome 의 되살림 규칙과 같은 값
@@ -169,6 +199,10 @@ pub fn queue_entry_from_row(it: &Value) -> QueueEntry {
         revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
         expired_notified: it
             .get("expired_notified")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        expired_event_sent: it
+            .get("expired_event_sent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
     }
@@ -513,6 +547,117 @@ pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64
     q.len()
 }
 
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) 큐 배달의 **인계 가드** — "판정이 본 화면"과 "실제로
+/// 바이트가 나가는 순간" 사이를 잇는 유일한 축.
+///
+/// 【무엇이 틀렸었나】 `deliver_head_locked` 는 판정 뒤 원장 선기록(파일 append · 회전 · 느릴 수
+/// 있다)을 하고 나서 `try_send(Inject)` 했고, writer 는 세대를 보지 않았다. 그래서 원장 I/O 가
+/// 막히는 동안 모달이 다 그려져도 그 승인으로 본문+CR 이 나갔다(codex 리뷰 blocking).
+///
+/// 【핸드셰이크】 상태는 세 값뿐이다: 0 pending · 1 claimed(writer 가 쓴다) · 2 aborted(아무도
+/// 쓰지 않는다). 결판은 **CAS 로 단 한 번**만 나고, 진 쪽은 상대의 결정을 따른다.
+///   · writer: 요청을 집자마자 `output_gen != expect_gen` 이면 CAS(0→2) 를 시도하고, 이기면 **한
+///     바이트도 쓰지 않고** 버린다(Ctrl-U 선정리보다도 앞이라 화면 부작용 0). 세대가 같으면
+///     CAS(0→1) 로 **소유권을 먼저 집고** 쓴다 — 그 CAS 에 지면(호출부가 이미 중단시켰다)
+///     세대가 같아도 쓰지 않는다(codex 리뷰: "세대 load 와 CAS 는 한 원자 연산이 아니다").
+///   · 호출부: 인계 성공 뒤 락을 놓고 유계 대기([`INJECT_GUARD_WAIT_MS`])로 결판을 본다. 아직
+///     pending 이면 스스로 CAS(0→2)로 **중단**시킨다 — 종전 초안은 여기서 커밋(강제 주입)했으나
+///     그것은 "writer 가 적체된 동안 모달이 떠도 결국 꽂는다" 는 정확한 반례를 남긴다(codex 리뷰).
+///     오탐의 귀결은 **보류**여야 한다(§3-3). 항목은 큐로 되돌아가 다음 틱에 재시도된다.
+///
+/// 【한계 — 정직】 `claimed` 는 "writer 가 쓰기로 결정했다" 이지 "PTY 에 다 나갔다" 가 아니다.
+/// 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는 종전
+/// (`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
+#[derive(Debug)]
+pub struct InjectGuard {
+    /// 판정이 본 출력 세대(짝수 = 발행 완료).
+    pub expect_gen: u64,
+    /// 그 surface 의 `output_gen`(공유 카운터).
+    pub output_gen: Arc<AtomicU64>,
+    /// 0 = pending · 1 = claimed(writer 가 쓴다) · 2 = aborted(아무도 쓰지 않았다).
+    pub state: AtomicU8,
+}
+
+/// 가드 상태 상수 — 숫자를 코드 여기저기에 흩지 않는다.
+pub const INJECT_PENDING: u8 = 0;
+pub const INJECT_CLAIMED: u8 = 1;
+pub const INJECT_ABORTED: u8 = 2;
+
+/// 호출부가 writer 의 결판을 기다리는 상한(ms). writer 는 큐 배달 좌석에서 사실상 항상 유휴
+/// (배달 최소 간격 10s)라 평시 수십 µs 안에 결판난다. 값을 800 으로 둔 이유: writer 가 **직전
+/// 주입**을 처리 중이면 그 arm 은 본문 → `cr_delay_ms`(400) → CR 로 최대 ~0.5s 를 쓴다. 그보다
+/// 짧으면 정상적인 연속 쓰기마다 배달이 한 틱씩 미뤄진다(불필요한 지연). 그보다 길면 watchdog
+/// 틱이 surface 하나에 그만큼 묶인다 — 이 대기는 **배달이 실제로 인계된 경우에만** 발생하고
+/// 그 빈도는 배달 최소 간격(10s)이 상한을 이룬다.
+pub const INJECT_GUARD_WAIT_MS: u64 = 800;
+
+impl InjectGuard {
+    pub fn new(expect_gen: u64, output_gen: Arc<AtomicU64>) -> Self {
+        Self { expect_gen, output_gen, state: AtomicU8::new(INJECT_PENDING) }
+    }
+    /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
+    ///
+    /// `CLAIMED` 는 "누군가 쓰기로 결정했다" 는 뜻이고 그 결정은 되돌리지 않는다: 호출부가 먼저
+    /// `CLAIMED` 로 정했다면(그 배달은 이미 '배달됨' 으로 보고됐다) 세대가 흘렀더라도 **쓴다** —
+    /// 그러지 않으면 보고된 배달이 실제로는 나가지 않아 메시지가 사라진다(유실 > 오주입).
+    pub fn claim_for_write(&self) -> bool {
+        if self.output_gen.load(Ordering::Acquire) != self.expect_gen {
+            return match self.state.compare_exchange(
+                INJECT_PENDING,
+                INJECT_ABORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => false,                     // 내가 중단시켰다 — 쓰지 않는다
+                Err(cur) => cur == INJECT_CLAIMED,  // 호출부의 결정을 따른다
+            };
+        }
+        match self.state.compare_exchange(
+            INJECT_PENDING,
+            INJECT_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(cur) => cur == INJECT_CLAIMED,
+        }
+    }
+    /// 호출부의 결판 대기 — 반환값은 `INJECT_CLAIMED`(writer 가 쓴다) 또는 `INJECT_ABORTED`.
+    ///
+    /// 두 가지 방식으로 끝난다.
+    ///   ① **빠른 중단**: 기다리는 동안 출력 세대가 움직이면 그 판정은 이미 무효다 — 더 기다리지
+    ///      않고 중단시킨다(writer 가 아직 요청을 집지도 않았을 수 있다).
+    ///   ② **마감 중단**: writer 가 선행 요청(예: 다른 주입의 cr_delay 400ms)으로 늦으면 마감에서
+    ///      중단시킨다. 커밋하지 **않는** 이유: 그때 쓰기는 수백 ms 뒤에 일어나고 그 사이 화면이
+    ///      바뀌어도 아무도 다시 보지 않는다(codex 리뷰의 정확한 반례). 항목은 큐에 남아 다음 틱에
+    ///      **다시 판정**되므로 유실이 아니라 지연이다(§3-3).
+    pub fn settle(&self, wait_ms: u64) -> u8 {
+        let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            let st = self.state.load(Ordering::Acquire);
+            if st != INJECT_PENDING {
+                return st;
+            }
+            if self.output_gen.load(Ordering::Acquire) != self.expect_gen {
+                break; // ① 판정이 본 프레임이 아니게 됐다 — 기다릴 이유가 없다
+            }
+            if Instant::now() >= deadline {
+                break; // ②
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        match self.state.compare_exchange(
+            INJECT_PENDING,
+            INJECT_ABORTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => INJECT_ABORTED,
+            Err(cur) => cur,
+        }
+    }
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -524,6 +669,12 @@ pub enum WriteReq {
         text: String,
         cr_delay_ms: u64,
         clear_first: bool,
+        /// ★(0.14.31 · 리뷰 R1 · codex blocking) **인계 가드** — `None` 이면 종전 동작 그대로다.
+        /// 정적(quiet) 기반 판정으로 열린 배달(alt-screen 양성 유휴 · 마커 없는 quiet 폴백)만
+        /// 건다: 그 경로는 애초에 "판정이 본 출력 세대가 그대로일 것"을 요구하므로 writer 가
+        /// 같은 조건을 **쓰기 직전에** 한 번 더 볼 수 있다. 비-alt 경로는 세대 불변을 요구하지
+        /// 않는 계약(스트리밍 중 주입 허용 · 기아 #1 의 수리)이라 가드를 걸지 않는다.
+        guard: Option<Arc<InjectGuard>>,
     },
     /// ★B2(0.14.24) delay_ms 만큼 **먼저 기다렸다가** 그대로 쓰기 — 프로그램이 본문을 꽂은
     /// 직후 곧바로 도착한 제출 CR 을 최소 간격 뒤로 밀어내는 전용 변형이다.
@@ -695,7 +846,11 @@ pub struct Surface {
     /// 한 관측이 된다 — 종전에는 스탬프를 파서 반영 **뒤**에 찍고 핸들러가 스탬프를 먼저 읽어, 그 사이에
     /// 도착한 청크가 '새 화면 + 오래된 quiet' 로 Boot Valve 를 열 수 있었다(codex BLOCK). 쓰기 주체는
     /// surface 당 reader 스레드 하나다(홀/짝 불변의 전제).
-    pub output_gen: AtomicU64,
+    /// ★(0.14.31 · 리뷰 R1 · codex blocking) `Arc` 인 이유: **writer 스레드**가 `WriteReq::Inject`
+    /// 의 인계 가드([`InjectGuard`])에서 같은 카운터를 읽어야 한다(판정이 본 프레임이 아직 그
+    /// 프레임인지 — 판정과 실제 PTY 쓰기 사이의 창). Surface 를 통째로 넘기면 writer 요청이
+    /// Surface 를 살려 두는 참조 순환이 생기므로 카운터만 공유한다.
+    pub output_gen: Arc<AtomicU64>,
     pub idle_notified: AtomicBool,
     /// recall 영속용 직전 라인 (연속 중복 스킵 — TUI 리드로우 노이즈 억제)
     last_recall_line: Mutex<String>,
@@ -1983,6 +2138,16 @@ pub struct Daemon {
     /// (`QueueEntry::paused_total_secs`)의 델타 시계. `None` = 아직 틱 없음(첫 틱 델타 0). 틱 간
     /// 실제 경과로 재므로 틱 주기가 바뀌거나 늘어져도 누적이 틀어지지 않는다.
     pub queue_tick_at: Mutex<Option<f64>>,
+    /// ★(0.14.31 · 리뷰 R1 · codex blocking) **큐 WAL 미영속 표식** — `persist_queue_state` 의
+    /// 어느 단계든 실패하면 선다. watchdog 틱(`governance::deliver_queued` 머리)이 이 표식을 보고
+    /// **큐 변경이 없어도** 재시도한다.
+    ///
+    /// 【무엇이 틀렸었나】 enqueue 는 `persist_queue_state()` 를 부른 뒤 곧바로 `queued:true` 를
+    /// 돌려준다. 그런데 그 안에서 `queue-expired.json` 치환이 실패하면 활성 파일은 **쓰이지 않고**
+    /// 조용히 돌아왔고, 그 뒤로 큐 변경이 없으면 재시도할 기회가 영영 오지 않았다 — 데몬이 죽으면
+    /// 승인된 메시지가 사라진다(일시적 공유 위반·권한 오류만으로 유실). 표식 + 틱 재시도는
+    /// 유실 창을 "실패 후 다음 틱(≤5s) 안의 크래시" 로 줄이고, 응답에는 `durable` 로 사실을 싣는다.
+    pub queue_persist_dirty: AtomicBool,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -2794,6 +2959,7 @@ impl Daemon {
             queue_persist_lock: Mutex::new(()),
             queue_expired_persisted: Mutex::new(expired_persisted_seed),
             queue_tick_at: Mutex::new(None),
+            queue_persist_dirty: AtomicBool::new(false),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -3050,6 +3216,7 @@ impl Daemon {
             expired_at: None,
             revived_at: None,
             expired_notified: false,
+            expired_event_sent: false,
         }
     }
 
@@ -3075,20 +3242,7 @@ impl Daemon {
         //   활성 WAL 만 읽고 만료분을 활성 큐로 되살려 배달하는 경로를 파일 경계로 차단한다.
         let mut expired_entries: Vec<serde_json::Value> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let row = |s: &Surface, role: &Option<String>, e: &QueueEntry| {
-            json!({
-                "mid": queue_mid(s.id, &e.text), "id": e.id, "seq": e.seq,
-                "surface_id": s.id, "role": role, "text": e.text,
-                "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
-                // ★(0.14.31 · WP-5 M) TTL 회계 5키 — additive. 구 데몬은 모르는 키를 버리고
-                //   다시 쓰므로(→ 신 데몬 재기동 시 serde default 로 복원) 활성 항목의 만료는
-                //   enqueued_at 기준 재계산으로 무손실이다(왕복 테스트 핀 · 항목별 TTL·revive·
-                //   pause 크레딧·통지 표식은 그 왕복에서 기본값으로 되돌아온다 — 문서화된 잔여).
-                "ttl_secs": e.ttl_secs, "paused_total_secs": e.paused_total_secs,
-                "expired_at": e.expired_at, "revived_at": e.revived_at,
-                "expired_notified": e.expired_notified,
-            })
-        };
+        let row = |s: &Surface, role: &Option<String>, e: &QueueEntry| queue_entry_row(s.id, role, e);
         // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) **스냅샷 전 구간이 한 임계영역이다.**
         //   ① 두 복원 컬렉션을 따로 잡으면 그 사이의 `queue revive`(만료→활성)가 항목을 두 스냅샷
         //      어디에도 남기지 않는다.
@@ -3182,6 +3336,8 @@ impl Daemon {
                 .map_err(|e| format!("{name} 원자 치환 실패: {e}"))
         };
         let warn = |stage: &'static str, why: String| {
+            // ★(0.14.31 · 리뷰 R1) 재시도 표식 — 다음 틱이 큐 변경 없이도 다시 쓴다(위 필드 doc).
+            self.queue_persist_dirty.store(true, Ordering::Release);
             // 침묵 금지 — 어느 단계에서 멈췄는지가 곧 "디스크에 무엇이 남아 있는가" 다.
             eprintln!("[queue] 영속 중단({stage}) — {why} · 원본 보존(다음 틱 재시도)");
             self.bus.publish(
@@ -3236,6 +3392,14 @@ impl Daemon {
             }
         }
         remember(&expired_entries); // ③ 성공 = carry 가 빠진 내용이 파일에 남았다
+        // 세 단계가 전부 성공했다 — 디스크가 메모리와 같다.
+        self.queue_persist_dirty.store(false, Ordering::Release);
+    }
+
+    /// 큐 WAL 이 **디스크에 반영됐는가**(마지막 `persist_queue_state` 가 끝까지 성공했는가).
+    /// enqueue 응답의 `durable` 과 watchdog 재시도 판정이 같은 사실을 읽는다.
+    pub fn queue_wal_durable(&self) -> bool {
+        !self.queue_persist_dirty.load(Ordering::Acquire)
     }
 
     /// 복원 두 컬렉션의 스냅샷을 한 임계영역 안에서 뜬다(가드는 호출부가 쥐고 있다 — 이 함수는
@@ -3358,6 +3522,10 @@ impl Daemon {
                     revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
                     expired_notified: it
                         .get("expired_notified")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    expired_event_sent: it
+                        .get("expired_event_sent")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                 };
@@ -3695,7 +3863,7 @@ impl Daemon {
             }),
             out_tx,
             last_output: Mutex::new(Instant::now()),
-            output_gen: AtomicU64::new(0),
+            output_gen: Arc::new(AtomicU64::new(0)),
             idle_notified: AtomicBool::new(false),
             last_recall_line: Mutex::new(String::new()),
             pending_queue: Mutex::new(std::collections::VecDeque::new()),
@@ -4004,6 +4172,11 @@ impl Daemon {
             // ★(0.14.31 · WP-5 M) 만료 큐 drain — "삭제 없음" 약속은 **원장 기록**으로 정의한다:
             //   항목마다 원장에 `expired` 사유 레코드를 남긴 뒤 폐기(queue.dropped reason "expired").
             crate::governance::discard_expired_queue(&daemon, &surf, "expired");
+            // ★(0.14.31 · 리뷰 R1 · codex blocking) 묘비 실패분은 데몬 보존소로 — 이 좌석은 곧
+            //   reap(close_surface)으로 맵에서 빠지고, 그때 이 큐는 어디에서도 도달할 수 없다.
+            if crate::governance::park_expired_to_restored(&daemon, &surf) > 0 {
+                daemon.persist_queue_state();
+            }
             // ★B3 #19: 자력 종료(셸 EOF)한 좌석이 **역할을 쥐고 있었다는 사실**을 이 시점에
             //   싣는다(additive — 기존 키 불변). 종전 페이로드에는 role 이 없어 "어느 역할
             //   좌석이 죽었나" 를 여기서 알 수 없었고, 그 사실은 **60초 뒤** reap 의
@@ -4297,6 +4470,30 @@ pub(crate) fn cr_gap_delay_ms(
     (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
 }
 
+/// `WriteReq::Inject` 의 바이트 시퀀스 — (선정리 Ctrl-U → settle) → bracketed paste → cr_delay →
+/// CR. 종전 arm 본문 그대로이며, 인계 가드(`InjectGuard`)를 arm 머리에 넣기 위해 함수로만 뺐다
+/// (한 arm = 원자 · 다른 WriteReq 끼어듦 없음이라는 계약은 호출부가 그대로 지킨다).
+fn inject_write<W: Write>(
+    writer: &mut W,
+    text: &str,
+    cr_delay_ms: u64,
+    clear_first: bool,
+) -> std::io::Result<()> {
+    if clear_first {
+        // Ctrl-U(0x15) 선정리 → settle: 잔존 미제출 텍스트를 지우고 TUI가 처리할 짬을 준다.
+        // paste·CR과 같은 arm에 묶여 다른 주입이 끼어들 수 없다(원자). 키 의미 게이트는
+        // 호출자(send_text)가 agent 등록 pane으로 제한한다(TUI별 Ctrl-U 의미 상이).
+        writer.write_all(b"\x15")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(clear_settle_ms()));
+    }
+    writer.write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
+    writer.flush()?;
+    std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms));
+    writer.write_all(b"\r")?;
+    writer.flush()
+}
+
 /// (테스트 가시성) `delivery` 모듈의 race 봉쇄 실증이 이 루프를 직접 구동한다 —
 /// "원장 기록이 PTY write 보다 앞선다"는 불변식은 **실제 writer 루프**로만 증명된다.
 ///
@@ -4361,22 +4558,17 @@ pub(crate) fn run_writer_loop<W: Write>(
                 text,
                 cr_delay_ms,
                 clear_first,
-            } => (if clear_first {
-                // Ctrl-U(0x15) 선정리 → settle: 잔존 미제출 텍스트를 지우고 TUI가 처리할 짬을 준다.
-                // paste·CR과 같은 arm에 묶여 다른 주입이 끼어들 수 없다(원자). 키 의미 게이트는
-                // 호출자(send_text)가 agent 등록 pane으로 제한한다(TUI별 Ctrl-U 의미 상이).
-                writer
-                    .write_all(b"\x15")
-                    .and_then(|_| writer.flush())
-                    .map(|_| std::thread::sleep(std::time::Duration::from_millis(clear_settle_ms())))
-            } else {
-                Ok(())
-            })
-            .and_then(|_| writer.write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes()))
-            .and_then(|_| writer.flush())
-            .map(|_| std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms)))
-            .and_then(|_| writer.write_all(b"\r"))
-            .and_then(|_| writer.flush()),
+                guard,
+            } => {
+                // ★(0.14.31 · 리뷰 R1 · codex blocking) 인계 가드 — **첫 바이트 앞**에서 결판.
+                //   Ctrl-U 선정리보다도 앞이므로, 포기한 요청은 화면에 어떤 흔적도 남기지 않는다.
+                //   가드가 없으면(None) 종전 동작 그대로다.
+                // 소유권을 집지 못하면(세대가 흘렀거나 호출부가 이미 중단시켰다) **쓰지 않는다**.
+                if guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
+                    continue;
+                }
+                inject_write(&mut writer, &text, cr_delay_ms, clear_first)
+            }
             // ★B2″(agy 감사 R2-①): Inject 는 기준점을 **찍지 않는다**. 이 arm 은 자체
             // cr_delay_ms(기본 400)를 두고 본문→CR 까지 원자로 보내므로, 뒤따라 오는 제출
             // Return 은 이미 ≥400ms 떨어져 있다 = 최소 간격(150ms)이 보호할 것이 없다.
@@ -5338,6 +5530,7 @@ mod tests {
             text: "hi".into(),
             cr_delay_ms: 0,
             clear_first: true,
+            guard: None,
         })
         .unwrap();
         drop(tx); // Disconnected → 루프 종료
@@ -5384,6 +5577,7 @@ mod tests {
             text: "hi".into(),
             cr_delay_ms: 0,
             clear_first: true,
+            guard: None,
         })
         .unwrap();
         tx.send(WriteReq::Data(b"X".to_vec())).unwrap();
@@ -5428,6 +5622,7 @@ mod tests {
             text: "hi".into(),
             cr_delay_ms: 0,
             clear_first: false,
+            guard: None,
         })
         .unwrap();
         drop(tx);
@@ -5680,7 +5875,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let w = TimedBuf::new(&log);
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
-        tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false })
+        tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false, guard: None })
             .unwrap();
         let t_enqueue = std::time::Instant::now();
         tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
@@ -7505,6 +7700,7 @@ mod tests {
             expired_at: None,
             revived_at: None,
             expired_notified: false,
+            expired_event_sent: false,
         }
     }
 
@@ -7687,6 +7883,7 @@ mod tests {
             expired_at: None,
             revived_at: None,
             expired_notified: false,
+            expired_event_sent: false,
         }
     }
 
@@ -8011,6 +8208,353 @@ mod tests {
             expired[0].ttl_secs, None,
             "구 WAL의 TTL 키 부재는 기본값 승계"
         );
+    }
+
+
+    /// ★(0.14.31 · 리뷰 R1 · codex blocking) **실제 구 데몬 왕복** — 구 데몬은 `queue-expired.json`
+    /// 을 *지우지 않는다*. 그 파일의 존재조차 모르므로 **손대지 않고 남긴다**.
+    ///
+    /// 종전 검체는 신 필드를 손으로 지우고 만료 사이드카를 **삭제**했다(구 데몬이 하지 않을 일).
+    /// 그래서 "만료분이 사이드카에 그대로 남아 신 데몬으로 돌아온다" 는 실제 경로가 한 번도
+    /// 검증되지 않았다. 여기서는 ⓐ 활성 파일만 구 형식으로 재기록하고 ⓑ 사이드카는 그대로 둔 뒤
+    /// ⓒ 신 데몬으로 다시 열어, 비기본 TTL·revive·pause 회계와 **두 래치**가 어디까지 살아남는지
+    /// 사실대로 고정한다.
+    #[test]
+    fn wp5_r1_old_daemon_roundtrip_leaves_the_expired_sidecar_intact() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-r1-sidecar");
+        let dir = queue_wal_dir("wp5-r1-sidecar");
+        let daemon_a = Daemon::new(dir.join("cysd.sock"));
+        let a = daemon_a
+            .create_surface(None, Some("sleep 30".into()), None, Some("r".into()), 24, 80)
+            .expect("A surface");
+        daemon_a.surfaces.lock().unwrap().insert(a.id, a.clone());
+        let now = now_epoch();
+        // 활성 — 비기본 회계(개별 TTL·pause 크레딧·revive 시각)를 전부 채운다.
+        let mut active = w2c_entry("wp5-r1-active", 71, now - 600.0);
+        active.ttl_secs = Some(9_000);
+        active.paused_total_secs = 42.0;
+        active.revived_at = Some(now - 300.0);
+        // 만료 — 통지·이벤트 래치가 선 채로 사이드카에 있다(재기동이 그것을 다시 쏘면 안 된다).
+        let mut expired = w2c_entry("wp5-r1-expired", 72, now - 9.0 * 3600.0);
+        expired.expired_at = Some(now - 3600.0);
+        expired.expired_notified = true;
+        expired.expired_event_sent = true;
+        expired.ttl_secs = Some(60);
+        a.pending_queue.lock().unwrap().push_back(active.clone());
+        a.expired_queue.lock().unwrap().push_back(expired.clone());
+        daemon_a.persist_queue_state();
+        let active_path = dir.join("queue-state.json");
+        let sidecar_path = dir.join("queue-expired.json");
+        let sidecar_before = std::fs::read_to_string(&sidecar_path).expect("사이드카 기록");
+        // ── 구 데몬(0.14.30) 모사: 활성 WAL 만 자기 스키마로 다시 쓴다. 사이드카는 **무접촉**.
+        let mut rows: Value = serde_json::from_str(
+            &std::fs::read_to_string(&active_path).expect("활성 WAL"),
+        )
+        .expect("배열");
+        for row in rows.as_array_mut().expect("배열") {
+            let obj = row.as_object_mut().expect("객체");
+            for key in [
+                "ttl_secs",
+                "paused_total_secs",
+                "expired_at",
+                "revived_at",
+                "expired_notified",
+                "expired_event_sent",
+            ] {
+                assert!(obj.contains_key(key), "신 WAL 필드 누락: {key}");
+                obj.remove(key); // 구 데몬은 모르는 키를 버리고 다시 쓴다
+            }
+        }
+        std::fs::write(&active_path, serde_json::to_vec(&rows).expect("직렬화")).expect("구 재기록");
+        assert_eq!(
+            std::fs::read_to_string(&sidecar_path).expect("사이드카"),
+            sidecar_before,
+            "구 데몬은 이 파일을 모른다 — 검체가 대신 지우면 실제 경로를 재지 못한다"
+        );
+        // ── 신 데몬으로 복귀.
+        let daemon_b = Daemon::new(dir.join("cysd.sock"));
+        let restored_expired = daemon_b.restored_expired.lock().unwrap().clone();
+        let row = restored_expired
+            .iter()
+            .find(|it| it["id"].as_str() == Some(expired.id.as_str()))
+            .expect("사이드카의 만료 항목이 복원되지 않았다");
+        assert_eq!(row["expired_notified"], json!(true), "통지 표식이 왕복에서 사라졌다(중복 통지)");
+        assert_eq!(
+            row["expired_event_sent"],
+            json!(true),
+            "이벤트 래치가 왕복에서 사라졌다 — 재기동마다 같은 항목의 queue.expired 가 다시 나간다"
+        );
+        assert_eq!(row["ttl_secs"], json!(60), "사이드카는 개별 TTL 을 그대로 보존한다");
+        assert_eq!(row["text"], json!(expired.text), "본문 보존");
+        // 활성분: 구 데몬이 지운 키는 기본값으로 돌아오고(문서화된 손실) 발신 시각은 보존된다.
+        let b = daemon_b
+            .create_surface(None, Some("sleep 30".into()), None, Some("r".into()), 24, 80)
+            .expect("B surface");
+        daemon_b.surfaces.lock().unwrap().insert(b.id, b.clone());
+        daemon_b.rehome_restored_queue();
+        let q = b.pending_queue.lock().unwrap().clone();
+        let x = b.expired_queue.lock().unwrap().clone();
+        for s in [&a, &b] {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let got = q.iter().find(|e| e.id == active.id).expect("활성 항목이 사라졌다");
+        assert_eq!(got.enqueued_at, active.enqueued_at, "원 발신 시각은 보존된다");
+        assert_eq!(got.ttl_secs, None, "구 왕복에서 개별 TTL 은 기본으로 돌아온다(문서화된 잔여)");
+        assert_eq!(got.paused_total_secs, 0.0, "pause 크레딧도 기본으로 돌아온다");
+        assert!(got.revived_at.is_none(), "revive 시각도 기본으로 돌아온다");
+        let xe = x.iter().find(|e| e.id == expired.id).expect("만료분이 재홈되지 않았다");
+        assert!(xe.expired_notified && xe.expired_event_sent, "재홈이 래치를 잃었다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.31 · 리뷰 R1 · codex blocking) **인계 가드의 결판 규칙** — writer 는 자기가 CAS 에
+    /// 이겼을 때만 쓰고, 호출부가 이미 커밋했으면 세대가 흘렀어도 쓴다(보고된 배달은 반드시 나간다).
+    #[test]
+    fn wp5_r1_inject_guard_writer_skips_only_when_it_wins_the_race() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // ⓐ 세대가 흘렀다 → writer 가 중단시키고 **한 바이트도** 쓰지 않는다.
+        let gen = Arc::new(AtomicU64::new(4));
+        let guard = Arc::new(InjectGuard::new(4, gen.clone()));
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        gen.store(6, Ordering::Release); // 판정 이후 청크가 흘렀다(모달이 그려졌을 수 있다)
+        tx.send(WriteReq::Inject {
+            text: "큐 본문".into(),
+            cr_delay_ms: 0,
+            clear_first: true,
+            guard: Some(guard.clone()),
+        })
+        .unwrap();
+        drop(tx);
+        handle.join().ok();
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "세대가 흘렀는데 본문·Ctrl-U·CR 중 하나라도 나갔다: {:?}",
+            String::from_utf8_lossy(&buf.lock().unwrap())
+        );
+        assert_eq!(guard.state.load(Ordering::Acquire), INJECT_ABORTED);
+        assert_eq!(guard.settle(0), INJECT_ABORTED, "결판은 한 번이고 뒤집히지 않는다");
+
+        // ⓑ 호출부가 먼저 커밋했다(그 배달은 이미 '배달됨' 으로 보고됐다) → 세대가 흘렀어도 쓴다.
+        let gen2 = Arc::new(AtomicU64::new(10));
+        let g2 = Arc::new(InjectGuard::new(10, gen2.clone()));
+        assert!(g2
+            .state
+            .compare_exchange(INJECT_PENDING, INJECT_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok());
+        gen2.store(12, Ordering::Release);
+        let buf2: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx2, rx2) = sync_channel::<WriteReq>(2);
+        let stop2 = Arc::new(AtomicBool::new(false));
+        let w2 = SharedBuf(Arc::clone(&buf2));
+        let h2 = std::thread::spawn(move || run_writer_loop(w2, rx2, stop2));
+        tx2.send(WriteReq::Inject {
+            text: "확정된 본문".into(),
+            cr_delay_ms: 0,
+            clear_first: false,
+            guard: Some(g2),
+        })
+        .unwrap();
+        drop(tx2);
+        h2.join().ok();
+        let out = String::from_utf8_lossy(&buf2.lock().unwrap()).to_string();
+        assert!(
+            out.contains("확정된 본문") && out.ends_with('\r'),
+            "호출부가 커밋한 배달이 나가지 않았다(보고된 배달의 유실): {out:?}"
+        );
+
+        // ⓒ 세대가 그대로면 종전과 똑같이 나간다(가드가 상시 닫히면 기아다).
+        let gen3 = Arc::new(AtomicU64::new(2));
+        let g3 = Arc::new(InjectGuard::new(2, gen3.clone()));
+        let buf3: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx3, rx3) = sync_channel::<WriteReq>(2);
+        let stop3 = Arc::new(AtomicBool::new(false));
+        let w3 = SharedBuf(Arc::clone(&buf3));
+        let h3 = std::thread::spawn(move || run_writer_loop(w3, rx3, stop3));
+        tx3.send(WriteReq::Inject {
+            text: "정상 배달".into(),
+            cr_delay_ms: 0,
+            clear_first: false,
+            guard: Some(g3.clone()),
+        })
+        .unwrap();
+        drop(tx3);
+        h3.join().ok();
+        assert_eq!(g3.state.load(Ordering::Acquire), INJECT_CLAIMED);
+        assert!(String::from_utf8_lossy(&buf3.lock().unwrap()).contains("정상 배달"));
+    }
+
+    // ─── ★(리뷰 R1) codex(gpt-6-astra) 위임 검체 — `InjectGuard` 상태기계(결판 1회·불가역·
+    //     writer/호출부 승패·커밋 후 세대 변화·실스레드 경합 128회). 초안 검토 후 수정 0 으로 통합.
+
+    #[test]
+    fn wp5_r1_cx_inject_settlement_never_reverses() {
+        use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED, INJECT_PENDING};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        for terminal in [INJECT_CLAIMED, INJECT_ABORTED] {
+            let generation = Arc::new(AtomicU64::new(4));
+            let guard = InjectGuard::new(4, Arc::clone(&generation));
+            assert_eq!(
+                guard.state.compare_exchange(
+                    INJECT_PENDING,
+                    terminal,
+                    Ordering::AcqRel,
+                    Ordering::Acquire
+                ),
+                Ok(INJECT_PENDING),
+                "새 가드가 pending이 아니어서 단일 결판 검체를 구성할 수 없다"
+            );
+            for next_generation in [4, 6, 8] {
+                generation.store(next_generation, Ordering::Release);
+                assert_eq!(
+                    (guard.settle(0), guard.state.load(Ordering::Acquire)),
+                    (terminal, terminal),
+                    "반복 settle 또는 세대 변경이 이미 확정된 결판을 뒤집었다"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wp5_r1_cx_inject_writer_abort_is_seen_by_caller() {
+        use super::{InjectGuard, INJECT_ABORTED};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        let generation = Arc::new(AtomicU64::new(4));
+        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        generation.store(6, Ordering::Release);
+        let writes = guard.claim_for_write();
+        assert_eq!(
+            (writes, guard.settle(0)),
+            (false, INJECT_ABORTED),
+            "세대 불일치로 writer가 먼저 중단했는데 호출부와 쓰기 여부가 일치하지 않는다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_inject_caller_abort_prevents_writer_claim() {
+        use super::{InjectGuard, INJECT_ABORTED};
+        use std::sync::{atomic::AtomicU64, Arc};
+
+        let guard = InjectGuard::new(4, Arc::new(AtomicU64::new(4)));
+        // 0ms는 마감 분기를 즉시 선택한다. 경과 시간이나 스레드 스케줄링을 재지 않는다.
+        let settled = guard.settle(0);
+        let writes = guard.claim_for_write();
+        assert_eq!(
+            (settled, writes),
+            (INJECT_ABORTED, false),
+            "호출부가 먼저 마감 중단한 항목을 같은 세대의 writer가 다시 쓰기로 결정했다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_inject_committed_claim_survives_generation_change() {
+        use super::{InjectGuard, INJECT_CLAIMED, INJECT_PENDING};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        let generation = Arc::new(AtomicU64::new(4));
+        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        // 현재 settle은 커밋하지 않는다. 이미 보고된 claimed 상태를 CAS로 구성한다.
+        assert_eq!(
+            guard.state.compare_exchange(
+                INJECT_PENDING,
+                INJECT_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire
+            ),
+            Ok(INJECT_PENDING),
+            "이미 보고된 배달을 나타내는 claimed 상태를 구성하지 못했다"
+        );
+        generation.store(6, Ordering::Release);
+        assert!(
+            guard.claim_for_write(),
+            "이미 claimed로 보고한 배달을 세대 변경 때문에 writer가 누락시켰다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_inject_settle_aborts_changed_generation() {
+        use super::{InjectGuard, INJECT_ABORTED};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+
+        let generation = Arc::new(AtomicU64::new(4));
+        let guard = InjectGuard::new(4, Arc::clone(&generation));
+        generation.store(6, Ordering::Release);
+        // 긴 유한 마감을 주되 시간 단언은 하지 않는다. 진입 전에 세대 변경을 확정한다.
+        assert_eq!(
+            (guard.settle(1_000), guard.state.load(Ordering::Acquire)),
+            (INJECT_ABORTED, INJECT_ABORTED),
+            "세대가 바뀐 pending 가드를 settle이 aborted로 확정하지 않았다"
+        );
+    }
+
+    #[test]
+    fn wp5_r1_cx_inject_concurrent_write_and_queue_decisions_agree() {
+        use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED};
+        use std::sync::{atomic::AtomicU64, Arc, Barrier};
+
+        // 반복마다 실제 두 스레드가 경쟁한다. 특정 승자나 양쪽 승자의 출현 횟수는 요구하지 않는다.
+        // 버퍼와 큐는 호출 계약의 모형이며 실제 PTY 쓰기나 rollback 구현을 검증하지 않는다.
+        for round in 0..128 {
+            let guard = Arc::new(InjectGuard::new(4, Arc::new(AtomicU64::new(4))));
+            let start = Arc::new(Barrier::new(2));
+            let writer_guard = Arc::clone(&guard);
+            let writer_start = Arc::clone(&start);
+            let writer = std::thread::spawn(move || {
+                let mut output = Vec::new();
+                writer_start.wait();
+                if writer_guard.claim_for_write() {
+                    output.push("본문");
+                }
+                output
+            });
+            let caller = std::thread::spawn(move || {
+                let mut queue = vec!["항목"];
+                start.wait();
+                let settled = guard.settle(0);
+                if settled == INJECT_CLAIMED {
+                    queue.clear();
+                }
+                (settled, queue)
+            });
+            let output = writer.join().expect("writer 경쟁 스레드가 패닉했다");
+            let (settled, queue) = caller.join().expect("호출부 경쟁 스레드가 패닉했다");
+            assert!(
+                matches!(
+                    (settled, output.as_slice(), queue.as_slice()),
+                    (INJECT_CLAIMED, ["본문"], []) | (INJECT_ABORTED, [], ["항목"])
+                ),
+                "경쟁 {round}회차에서 쓰기와 큐 처분이 섞이거나 결판이 pending으로 남았다: 상태={settled}, 출력={output:?}, 큐={queue:?}"
+            );
+        }
     }
 
     /// ★(0.14.31 · 리뷰 R5 · codex major) **두 파일 커밋 사이의 크래시가 항목을 지우지 않는다.**

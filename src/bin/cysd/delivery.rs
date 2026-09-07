@@ -370,7 +370,9 @@ fn append_side_record(
         }
     }
     rotate_if_needed(&p);
-    match append_line(&p, rec) {
+    // ★(0.14.31 · 리뷰 R1 · codex blocking) 영수증·묘비는 **내구 append** 다 — 묘비의 `true` 가
+    //   곧 "이 항목을 지워도 된다" 이므로, 그 근거가 디스크에 없으면 성공이 아니다.
+    match append_line_durable(&p, rec) {
         Outcome::Recorded | Outcome::Blank => true,
         Outcome::Failed(why) => {
             daemon.bus.publish(
@@ -575,13 +577,30 @@ pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
 /// 원장 파일에 JSON 1줄 append(공통부). append 모드 단일 write — O_APPEND 라 여러 스레드가
 /// 붙어도 라인이 섞이지 않는다(PIPE_BUF 이하 · 레코드는 수백 바이트).
 fn append_line(p: &Path, rec: &Value) -> Outcome {
-    append_lines(p, std::slice::from_ref(rec))
+    append_lines_opt(p, std::slice::from_ref(rec), false)
+}
+
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) **내구 append** — write+flush 뒤 `sync_data` 까지 성공해야
+/// `Recorded` 다.
+///
+/// 왜 필요한가: 묘비(`queue_tombstone`)는 "이 항목을 지워도 된다" 는 **유일한 근거**이고, 그 삭제는
+/// WAL 원자 치환(fsync 동반)으로 곧바로 내구화된다. 원장이 페이지 캐시에만 있으면 전원 단절이
+/// **삭제만** 남기고 근거를 잃는다(항목도 없고 기록도 없다 = 조용한 유실 · §3-3 위반). flush 는
+/// 프로세스 버퍼를 비울 뿐 커널 캐시를 내리지 않는다.
+///
+/// Windows: `File::sync_data` 는 `FlushFileBuffers` 로 매핑된다(ConPTY·경로 규약과 무관 · 안전).
+fn append_line_durable(p: &Path, rec: &Value) -> Outcome {
+    append_lines_opt(p, std::slice::from_ref(rec), true)
 }
 
 /// 여러 레코드를 **한 번 열어** append 한다(R6 조각 기록용). 파일 열기는 1회지만 write 는
 /// `APPEND_CHUNK_BYTES` 이하로 끊는다 — 한 번에 수십 KB 를 쓰면 O_APPEND 원자성이 깨져
 /// 동시 기록자와 줄이 섞일 수 있기 때문이다(섞인 줄은 판독자에서 `ledger_bad_lines`).
 fn append_lines(p: &Path, recs: &[Value]) -> Outcome {
+    append_lines_opt(p, recs, false)
+}
+
+fn append_lines_opt(p: &Path, recs: &[Value], durable: bool) -> Outcome {
     if recs.is_empty() {
         return Outcome::Recorded;
     }
@@ -601,10 +620,15 @@ fn append_lines(p: &Path, recs: &[Value]) -> Outcome {
         }
         buf.push_str(&line);
     }
-    match f.write_all(buf.as_bytes()).and_then(|_| f.flush()) {
-        Ok(()) => Outcome::Recorded,
-        Err(e) => Outcome::Failed(format!("원장 write 실패: {e}")),
+    if let Err(e) = f.write_all(buf.as_bytes()).and_then(|_| f.flush()) {
+        return Outcome::Failed(format!("원장 write 실패: {e}"));
     }
+    if durable {
+        if let Err(e) = f.sync_data() {
+            return Outcome::Failed(format!("원장 sync 실패: {e}"));
+        }
+    }
+    Outcome::Recorded
 }
 
 /// ★R6 — 이 텍스트가 pane 에 **몇 번에 나눠 제출되는가**(정규화된 제출 단위 목록).
@@ -1355,6 +1379,83 @@ pub(crate) mod tests {
             let d = ledger_path(Path::new("/Users/x/.local/state/cys-dept-a/cys.sock"));
             assert_ne!(d, p, "부서 레인은 base 원장과 분리된다");
         });
+    }
+
+    /// ★(0.14.31 · 리뷰 R1 · codex blocking) **묘비·영수증은 내구 append 다.**
+    ///
+    /// 묘비의 `true` 는 "이 항목을 지워도 된다" 는 **유일한 근거**이고, 그 삭제는 곧바로 WAL 원자
+    /// 치환(fsync 동반)으로 내구화된다. 원장이 페이지 캐시에만 있으면 전원 단절이 삭제만 남기고
+    /// 근거를 잃는다(항목도 없고 기록도 없다). 여기서 재는 것:
+    ///   ⓐ 기록 불능(경로가 디렉터리)이면 `false` — 호출부는 항목을 폐기하지 않는다.
+    ///   ⓑ 성공이면 그 줄이 **디스크에서 즉시 읽힌다**.
+    ///   ⓒ 소스핀 — 부수 레코드 경로가 내구 append(`sync_data`)를 쓴다(fsync 자체는 단위 검체로
+    ///      관측할 수 없다 · 전원 단절 실증은 not-tested 로 남긴다).
+    #[test]
+    fn wp5_r1_side_records_use_a_durable_append() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let daemon = crate::state::Daemon::new(sock.to_path_buf());
+            let entry = crate::state::QueueEntry {
+                id: "wp5-r1-tomb".into(),
+                seq: 5,
+                text: "[보고] 묘비 본문".into(),
+                enqueued_at: crate::state::now_epoch() - 10.0,
+                from: Some("surface:3".into()),
+                origin: "send".into(),
+                ttl_secs: None,
+                paused_total_secs: 0.0,
+                expired_at: Some(crate::state::now_epoch()),
+                revived_at: None,
+                expired_notified: false,
+                expired_event_sent: false,
+            };
+            // ⓐ 기록 불능 — 원장 경로를 디렉터리로 막는다(POSIX·Windows 공통 실패).
+            let p = ledger_path(sock);
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            std::fs::create_dir_all(&p).expect("실패 주입용 디렉터리");
+            assert!(
+                !record_queue_tombstone(&daemon, 7, &entry, "dropped", crate::state::now_epoch()),
+                "기록에 실패했는데 성공을 돌려줬다 — 원장 없는 삭제가 열린다"
+            );
+            assert!(
+                daemon.bus.tail(10).into_iter().any(|e| e["name"] == "delivery.record_failed"),
+                "실패가 침묵했다"
+            );
+            std::fs::remove_dir_all(&p).expect("실패 주입 해제");
+            // ⓑ 성공 — 줄이 디스크에서 읽힌다.
+            assert!(record_queue_tombstone(
+                &daemon,
+                7,
+                &entry,
+                "dropped",
+                crate::state::now_epoch()
+            ));
+            let body = std::fs::read_to_string(&p).expect("원장");
+            let rec: serde_json::Value = body
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .find(|r: &serde_json::Value| r["queue_entry_id"] == "wp5-r1-tomb")
+                .expect("묘비 줄");
+            assert_eq!(rec["origin"], "queue_tombstone");
+            assert_eq!(rec["reason"], "dropped");
+        });
+        // ⓒ 소스핀 — 부수 레코드는 내구 경로를 쓴다.
+        let src = include_str!("delivery.rs");
+        let prod = &src[..src.find("pub(crate) mod tests").expect("테스트 모듈 앵커")];
+        let side = {
+            let i = prod.find("fn append_side_record(").expect("부수 레코드 writer");
+            &prod[i..]
+        };
+        assert!(
+            side.contains("append_line_durable(&p, rec)"),
+            "영수증·묘비가 비내구 append 로 돌아갔다(전원 단절이 삭제만 남긴다)"
+        );
+        assert!(
+            prod.contains("f.sync_data()"),
+            "내구 append 가 sync_data 를 부르지 않는다"
+        );
     }
 
     #[test]

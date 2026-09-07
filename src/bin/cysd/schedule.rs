@@ -1043,6 +1043,7 @@ fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
             text: text.to_string(),
             cr_delay_ms: 500,
             clear_first: false, // 스케줄 발화는 현행 동작 보존
+            guard: None,        // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
         })
         .map_err(|e| match e {
             std::sync::mpsc::TrySendError::Full(_) => {
