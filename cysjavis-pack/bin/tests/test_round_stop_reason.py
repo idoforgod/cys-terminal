@@ -32,6 +32,7 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
 ORC = os.path.join(BIN, "javis_orchestra.py")
 RSI = os.path.join(BIN, "javis_rsi.py")
+LEARN = os.path.join(BIN, "javis_learn.py")
 PY = sys.executable or "python3"
 TASK = "WP6 정체"
 
@@ -198,7 +199,12 @@ class RoundStopReason(unittest.TestCase):
         self.log_machine(2)
         out = self.status().stdout
         self.assertIn("stop_reason=open", out)
-        self.assertIn("| 2 | gemini | - | BLOCK |", open(self.ledger, encoding="utf-8").read())
+        # ★기록값 칸은 이제 **증거 식별자**(`vj:<sha 앞 32자>`)다(R2 blocking-1 수리) — 등급이
+        #   아니라 "이 행이 어느 verdict 파일로 났는가" 다. 등급·점수는 여전히 0이다.
+        text = open(self.ledger, encoding="utf-8").read()
+        row = [l for l in text.splitlines() if l.startswith("| 2 | gemini |")]
+        self.assertEqual(len(row), 1, text)
+        self.assertRegex(row[0], r"^\| 2 \| gemini \| vj:[0-9a-f]{32} \| BLOCK \|$")
 
     def test_machine_fail_stays_open(self):
         """machine FAIL / 리뷰 ACCEPT → open (기계검증 실패를 종결로 접지 않는다)."""
@@ -359,11 +365,34 @@ class RoundStopReason(unittest.TestCase):
         stops = [e for e in self.events() if e.get("event") == "stagnation_stop"]
         self.assertEqual(len(stops), 1)
         self.assertEqual(stops[0]["task"], TASK)
+        # ★R2 수리: 슬러그가 겹치는 **다른 task 는 이 장부에 아예 쓸 수 없다**(장부 귀속).
+        #   종전엔 rc=0 으로 행이 붙었고, 그 행이 원 task 의 완결권·`gate_verdicts` 에 섞여
+        #   정체 게이트가 **표기를 바꾸는 것만으로 우회**됐다(codex R2 blocking-7).
         twin = "WP6/정체"          # 같은 슬러그(WP6_정체) → 같은 장부·사이드카
         r = subprocess.run([PY, ORC, "round-log", "--task", twin, "--round", "9",
                             "--evaluator", "master", "--verdict", "approve"],
                            capture_output=True, text=True, timeout=120, env=self.env)
-        self.assertEqual(r.returncode, 0, (r.returncode, r.stderr))
+        self.assertEqual(r.returncode, 2, (r.returncode, r.stderr))
+        self.assertIn("다른 task", r.stderr)
+        self.assertNotIn("| 9 | master", open(self.ledger, encoding="utf-8").read())
+
+    def test_colliding_task_cannot_manufacture_completion_rights(self):
+        """슬러그 충돌 task 가 **완결권을 제조**하지 못한다(codex R2 blocking-7).
+
+        시나리오: 원 task 가 R3 에서 정체 종결(exit 3) → 다른 표기(`WP6/정체`)로 R9 를 먼저
+        기록 → 다시 원 task 로 R9 요청. 종전엔 두 번째가 rc=0(이미 행이 있는 라운드 = 완결권)
+        이었다. 이제 충돌 task 의 쓰기 자체가 거부되므로 그 행이 존재할 수 없고, 원 task 의
+        R9 는 여전히 exit 3 이다.
+        """
+        self.seed_two_minor_rounds()
+        self.assertEqual(self.log_reviewer(3, "gemini").returncode, 3)
+        twin = "WP6/정체"
+        r = subprocess.run([PY, ORC, "round-log", "--task", twin, "--round", "9",
+                            "--evaluator", "machine", "--from-cmd", "exit 0"],
+                           capture_output=True, text=True, timeout=120, env=self.env)
+        self.assertEqual(r.returncode, 2, (r.returncode, r.stderr))
+        r2 = self.log_machine(9)
+        self.assertEqual(r2.returncode, 3, (r2.returncode, r2.stderr))
 
     # ── ⑧ round-status 는 읽기 전용 ───────────────────────────────────────
     def test_status_is_read_only(self):
@@ -424,10 +453,37 @@ class RoundStopReason(unittest.TestCase):
 
     def test_ledger_failure_refuses_and_says_so(self):
         """장부 append 실패는 exit 2 — 기록되지 않은 것을 기록됐다고 말하지 않는다."""
-        os.makedirs(self.ledger)           # 장부 경로를 디렉터리로 → append 실패
+        os.makedirs(self.ledger)           # 장부 경로를 디렉터리로 → append 불가(결정론)
         r = self.log_reviewer(1, "gemini")
         self.assertEqual(r.returncode, 2, (r.returncode, r.stdout, r.stderr))
-        self.assertIn("장부 기록 실패", r.stderr)
+        self.assertIn("일반 파일이 아니다", r.stderr)
+        self.assertIn("아무것도 기록되지 않았다", r.stderr)
+
+    def test_ledger_creation_failure_is_a_refusal_not_a_traceback(self):
+        """장부 **생성** 실패는 traceback + exit 1 이 아니라 exit 2 거부다(claude R2 minor).
+
+        ★왜: 'exit 1 = 행은 기록됐고 기계검증 실패' 라는 계약과 충돌한다 — rc 단일 경로로
+          판정하는 소비자가 '행이 남았다'로 오독한다.
+        """
+        rd = os.path.join(self.pack, "round")
+        os.chmod(rd, 0o500)                # 생성 불가(읽기·실행만)
+        probe = os.path.join(rd, ".probe")
+        try:                               # Windows 는 디렉터리 chmod 가 무효 — 실효 없으면 SKIP
+            open(probe, "w").close()
+            os.remove(probe)
+            os.chmod(rd, 0o700)
+            self.skipTest("이 플랫폼에서 디렉터리 chmod 가 생성을 막지 못한다(Windows)")
+        except OSError:
+            pass
+        try:
+            r = self.orc("round-init", "--task", TASK)
+            self.assertEqual(r.returncode, 2, (r.returncode, r.stdout, r.stderr))
+            self.assertNotIn("Traceback", r.stderr)
+            r2 = self.log_machine(1)
+            self.assertEqual(r2.returncode, 2, (r2.returncode, r2.stdout, r2.stderr))
+            self.assertNotIn("Traceback", r2.stderr)
+        finally:
+            os.chmod(rd, 0o700)
 
     def test_separate_path_reevaluation_wins(self):
         """재평가를 **다른 경로**의 파일로 해도 마지막 결속이 이긴다 — 종전 검체는 같은 경로를
@@ -671,6 +727,205 @@ class RoundStopReason(unittest.TestCase):
                          "장부 헤더가 중복·절단됐다(초기 생성 경쟁)")
 
 
+    # ── ⑨ 리뷰 반영 R2 반례 — 결속-행 세대·손상·귀속·잠금·불확정 ──────────────
+    def test_row_ordinal_reuse_cannot_bind_minor_evidence_to_another_row(self):
+        """행 서수 재사용으로 **남의 행에 내 증거**를 묶지 못한다(codex R2 blocking-1).
+
+        시나리오: (R2,codex) 축에 minor 행 1개가 있다. 그 뒤 **major** 이슈를 가진 재평가 행이
+        서수 2로 커밋된다. 뒤늦게 도착한 writer 가 minor 파일을 가리키는 결속을 서수 2로
+        남긴다(마지막-승). 종전엔 서수만 맞으면 통과해 **major 행이 minor 증거로 판정**됐다.
+        이제 행 스스로가 어느 증거로 났는지(기록값 칸의 `vj:` 식별자) 말하므로 짝이 어긋난다.
+        """
+        self.seed_two_minor_rounds()
+        minor_b = [e for e in self.events()
+                   if e.get("event") == "verdict_src" and e.get("round") == 2
+                   and e.get("evaluator") == "codex"][-1]
+        r = self.log_reviewer(2, "codex", ("major",))     # 서수 2 = major 행
+        self.assertEqual(r.returncode, 0, r.stderr)
+        forged = dict(minor_b)                            # 낡은(minor) 결속을 서수 2로 재기록
+        forged.pop("_line", None)
+        forged["row_ordinal"] = 2
+        with open(self.sidecar, "a", encoding="utf-8") as f:
+            f.write(json.dumps(forged, ensure_ascii=False) + "\n")
+        out = self.status().stdout
+        self.assertNotIn("stop_reason=stopped_stagnation", out)
+        self.assertIn("증거 불일치", out + self.status().stderr)
+
+    def test_damaged_row_does_not_resurrect_older_approval(self):
+        """장부의 **읽히지 않는 거절 행**이 낡은 승인을 부활시키지 못한다(codex R2 blocking-5).
+
+        두 변형을 모두 본다: ⓐ깨진 UTF-8 바이트 ⓑ유효 UTF-8인데 구조가 깨진 행(첫 `|`→`!`).
+        둘 다 종전엔 정규식에 안 걸려 **행이 사라졌고**, 마지막-승 규칙이 직전 PASS 를 되살려
+        정체가 성립했다.
+        """
+        for mutate in ("utf8", "struct"):
+            self.setUp()
+            self.seed_two_minor_rounds()
+            self.assertIn("stop_reason=stopped_stagnation", self.status().stdout)
+            raw = open(self.ledger, "rb").read()
+            bad = b"| 2 | machine | - | FAIL(exit 1) |\n"
+            open(self.ledger, "wb").write(raw + bad)
+            self.assertIn("stop_reason=open", self.status().stdout, "정상 FAIL 행이 안 읽힌다")
+            raw2 = open(self.ledger, "rb").read()
+            if mutate == "utf8":
+                broken = raw2.replace(b"| 2 | machine | - | FAIL(exit 1) |",
+                                      b"| 2 | mach\xffne | - | FAIL(exit 1) |")
+            else:
+                broken = raw2.replace(b"| 2 | machine | - | FAIL(exit 1) |",
+                                      b"! 2 | machine | - | FAIL(exit 1) |")
+            open(self.ledger, "wb").write(broken)
+            out = self.status().stdout
+            self.assertNotIn("stop_reason=stopped_stagnation", out, mutate)
+            self.assertNotIn("stop_reason=accepted", out, mutate)
+            g = self.orc("gate-status", "--task", TASK)
+            self.assertNotEqual(g.returncode, 0, "손상 장부에서 수렴(자동 착수)이 열렸다")
+
+    def test_ledger_damage_is_recoverable_by_rerecording(self):
+        """손상은 **영구 불통**이 아니다 — 손상 줄 뒤에 다시 기록하면 판정이 회복된다.
+
+        (codex R2 major-8: 옛 설명문 한 바이트가 이후 모든 라운드의 승인을 영원히 막으면
+        복구 경로가 '역사 삭제' 뿐이 된다.)
+        """
+        self.seed_two_minor_rounds()
+        raw = open(self.ledger, "rb").read()
+        open(self.ledger, "wb").write(raw.replace(b"| 1 | machine", b"| 1 | mach\xffne", 1))
+        self.assertNotIn("stop_reason=stopped_stagnation", self.status().stdout)
+        for rnd in (1, 2):                      # 손상 줄 **뒤에** 축을 다시 기록
+            self.assertEqual(self.log_reviewer(rnd, "gemini").returncode, 0)
+            self.assertEqual(self.log_reviewer(rnd, "codex").returncode, 0)
+            self.assertEqual(self.log_machine(rnd).returncode, 0)
+        self.assertIn("stop_reason=stopped_stagnation", self.status().stdout,
+                      "재기록으로 회복되지 않는다(회복 경계 없음)")
+
+    def test_unreadable_sidecar_is_not_proof_of_empty_history(self):
+        """사이드카를 **읽을 수 없는 것**은 '이력 없음'이 아니다(codex R2 blocking-6)."""
+        self.seed_two_minor_rounds()
+        self.assertEqual(self.log_reviewer(3, "gemini").returncode, 3)   # 끈끈한 종결 기록
+        os.remove(self.sidecar)
+        os.makedirs(self.sidecar)              # 판독 불가(디렉터리 — OS 중립)
+        r = self.log_machine(9)
+        self.assertEqual(r.returncode, 3, (r.returncode, r.stderr))
+        self.assertIn("읽을 수 없다", r.stderr)
+        r2 = self.log_machine(9, extra=("--override", "판독 불가 확인 후 재개"))
+        self.assertIn(r2.returncode, (0, 1), (r2.returncode, r2.stderr))
+
+    def test_malformed_numeric_stop_round_does_not_release_the_stop(self):
+        """`stop_round: 2.9`·`Infinity` 는 종결을 풀지 않는다(codex R2 blocking-8).
+
+        종전엔 `int(2.9)==2` 가 라운드 2 의 종결을 풀었고 `Infinity` 는 **잡히지 않는
+        OverflowError** 였다. 또 `round: Infinity` 는 판정기 자체를 죽였다.
+        """
+        for payload in ('{"event":"override","task":"%s","round":9,"stop_round":2.9,'
+                        '"reason":"x"}' % TASK,
+                        '{"event":"override","task":"%s","round":9,"stop_round":Infinity,'
+                        '"reason":"x"}' % TASK,
+                        '{"event":"override","task":"%s","round":Infinity,"stop_round":2,'
+                        '"reason":"x"}' % TASK):
+            self.setUp()
+            self.seed_two_minor_rounds()
+            self.assertEqual(self.log_reviewer(3, "gemini").returncode, 3)
+            with open(self.sidecar, "a", encoding="utf-8") as f:
+                f.write(payload + "\n")
+            r = self.log_machine(9)
+            self.assertNotIn("Traceback", r.stderr, payload)
+            self.assertEqual(r.returncode, 3, (payload, r.returncode, r.stderr))
+
+    def test_null_byte_in_binding_path_does_not_crash_judgment(self):
+        """사이드카의 널 바이트 경로가 판정기를 죽이지 않는다(codex R2 major)."""
+        self.seed_two_minor_rounds()
+        evs = self.events()
+        for e in evs:
+            if e.get("event") == "verdict_src" and e.get("round") == 2:
+                e["path"] = "x\u0000y"
+        with open(self.sidecar, "w", encoding="utf-8") as f:
+            for e in evs:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        r = self.status()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("stop_reason=stopped_stagnation", r.stdout)
+        r2 = self.log_machine(9)
+        self.assertNotIn("Traceback", r2.stderr)
+
+    def test_lock_contention_refuses_instead_of_racing(self):
+        """잠금 경합이면 **쓰지 않고 거부**한다(codex R2 blocking-1·3) — init 도 같은 뮤텍스."""
+        lock = self.ledger + ".lock"
+        os.makedirs(lock)
+        with open(os.path.join(lock, "owner"), "wb") as f:
+            f.write(b"other-writer")
+        try:
+            r = self.orc("round-init", "--task", TASK)
+            self.assertEqual(r.returncode, 2, (r.returncode, r.stderr))
+            self.assertIn("잠금", r.stderr)
+            self.assertFalse(os.path.exists(self.ledger), "경합 중에 장부가 생겼다")
+            r2 = self.log_machine(1)
+            self.assertEqual(r2.returncode, 2, (r2.returncode, r2.stderr))
+            self.assertFalse(os.path.exists(self.ledger))
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
+
+    def test_readonly_ledger_refuses_and_unwritable_is_unknown(self):
+        """쓰기 실패의 두 갈래를 **다른 값**으로 말한다: 되읽기 성공=exit 2(기록 없음) ·
+        되읽기 실패=exit 5(불확정). 둘을 한 값으로 접으면 어느 쪽이든 거짓말이다."""
+        self.assertEqual(self.log_machine(1).returncode, 0)
+        os.chmod(self.ledger, 0o400)
+        try:
+            with open(self.ledger, "a", encoding="utf-8"):
+                pass
+            os.chmod(self.ledger, 0o600)
+            self.skipTest("이 플랫폼에서 파일 chmod 가 쓰기를 막지 못한다")
+        except OSError:
+            pass
+        try:
+            r = self.orc("round-log", "--task", TASK, "--round", "1",
+                         "--evaluator", "machine", "--from-cmd", "exit 0")
+            self.assertEqual(r.returncode, 2, (r.returncode, r.stderr))
+            self.assertIn("장부 기록 실패", r.stderr)
+        finally:
+            os.chmod(self.ledger, 0o600)
+        os.chmod(self.ledger, 0o000)
+        try:
+            readable = True
+            try:
+                open(self.ledger, "rb").close()
+            except OSError:
+                readable = False
+            r2 = self.orc("round-log", "--task", TASK, "--round", "1",
+                          "--evaluator", "machine", "--from-cmd", "exit 0")
+            self.assertNotIn("Traceback", r2.stderr)
+            self.assertEqual(r2.returncode, 2 if readable else 5, (r2.returncode, r2.stderr))
+            if not readable:
+                self.assertIn("불확정", r2.stderr)
+        finally:
+            os.chmod(self.ledger, 0o600)
+
+    def test_relocate_does_not_launder_pre_damage_binding(self):
+        """재배치는 **손상 이전** 결속을 새 줄 번호로 세탁하지 못한다(codex R2 blocking-4)."""
+        self.seed_two_minor_rounds()
+        paths = {}
+        for rnd in (1, 2):
+            for ev in ("gemini", "codex"):
+                paths[(rnd, ev)] = os.path.join(
+                    self.pack, "round", "_reviews", "WP6_정체-r%d-%s.json" % (rnd, ev))
+        with open(self.sidecar, "ab") as f:
+            f.write(b'{"event":"verdict_src","round":2,')      # 찢긴 줄
+        self.assertNotIn("stop_reason=stopped_stagnation", self.status().stdout)
+        for (rnd, ev), path in sorted(paths.items()):
+            r = self.orc("round-relocate", "--task", TASK, "--round", str(rnd),
+                         "--evaluator", ev, "--path", path)
+            self.assertEqual(r.returncode, 2, (rnd, ev, r.returncode, r.stderr))
+            self.assertIn("손상", r.stderr)
+        self.assertNotIn("stop_reason=stopped_stagnation", self.status().stdout,
+                         "재배치가 손상 이전 증거를 세탁했다")
+
+    def test_ignored_override_is_announced(self):
+        """게이트 미발동 호출의 `--override` 는 **조용히 사라지지 않는다**(claude R2 minor)."""
+        r = self.log_machine(1, extra=("--override", "재개 사유"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("적용되지 않았다", r.stderr)
+        self.assertEqual([e for e in self.events() if e.get("event") == "override"], [])
+
+
 class RsiRoundBudget(unittest.TestCase):
     """RSI 라운드 예산 — `attempts` 는 재checkpoint·재시작·ledger 삭제를 넘어 영속한다."""
     maxDiff = None
@@ -695,6 +950,72 @@ class RsiRoundBudget(unittest.TestCase):
     def rsi(self, *args):
         return subprocess.run([PY, RSI] + list(args), cwd=self.root, capture_output=True,
                               text=True, timeout=120, env=self.env)
+
+    def test_damaged_ledger_line_neither_crashes_nor_burns_other_rounds(self):
+        """깨진 ledger 1줄이 ⓐ도구를 죽이지 않고 ⓑ **남의 라운드 예산을 태우지 않는다**.
+
+        (claude R2 major-2 = 영구 크래시 · codex R2 major-10 = 손상 줄을 시도수에 더하면
+        신규 라운드가 첫 호출부터 `stopped_budget` 이 된다.)
+        """
+        self.assertEqual(self.rsi("checkpoint", "--round", "rA", "--score", "1.0").returncode, 0)
+        led = os.path.join(self.root, "_round", "rsi", "ledger.jsonl")
+        with open(led, "ab") as f:
+            for _ in range(3):
+                f.write(b'{"event":"progress","round":"rA","note":"\xed\x95"}\n')
+        r = self.rsi("checkpoint", "--round", "rB", "--score", "1.0")
+        self.assertEqual(r.returncode, 0, (r.returncode, r.stderr))
+        self.assertNotIn("Traceback", r.stderr)
+        e = json.loads(r.stdout)
+        self.assertEqual(e["attempts"], 1, "남의 손상 줄이 신규 라운드 예산을 태웠다")
+        self.assertEqual(e["stop_reason"], "open")
+        self.assertEqual(e.get("ledger_damaged"), 3)
+        self.assertTrue(e.get("budget_unknown"), "손상을 감췄다(불확정 표기 없음)")
+        r2 = self.rsi("progress", "--round", "rB", "--score", "2.0")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+
+    def test_rsi_attempts_do_not_leak_into_learn_judge_shopping_cap(self):
+        """RSI 시도수가 미러를 타고 `javis_learn` 의 judge-shopping 상한으로 **새지 않는다**.
+
+        (claude R2 major-1 실측 재현: rsi checkpoint + progress×3 뒤 첫 `learn evaluate` 가
+        'evaluate 4회 기록 — 4회째=ESCALATE'(fail 9)로 막혔다 — learn 평가는 0회인데.)
+        """
+        self.assertEqual(self.rsi("checkpoint", "--round", "r1", "--score", "10").returncode, 0)
+        for _ in range(3):
+            self.rsi("progress", "--round", "r1", "--score", "10")
+        mirror = json.load(open(os.path.join(self.root, "_round", "learn", "state.json"),
+                                encoding="utf-8"))
+        rec = mirror["rounds"]["r1"]
+        self.assertNotIn("attempts", rec, "learn 이 읽는 키 이름 그대로 미러됐다")
+        self.assertEqual(rec.get("rsi_attempts"), 4)
+        r = subprocess.run([PY, LEARN, "evaluate", "--round", "r1", "--score", "20",
+                            "--baseline"], cwd=self.root, capture_output=True, text=True,
+                           timeout=120, env=self.env)
+        self.assertEqual(r.returncode, 0, (r.returncode, r.stdout, r.stderr))
+        self.assertEqual(json.loads(r.stdout)["attempt"], 1, r.stdout)
+
+    def test_ceiling_latch_backfills_the_ledger_leg(self):
+        """큐에만 남은 래치는 **ledger 다리를 메운다**(codex R2 major-11): 큐 회전 + state 소실
+        뒤에도 같은 추천이 다시 나가지 않는다."""
+        self.env["CYS_RSI_CEILING_FLATS"] = "2"
+        self.env["CYS_RSI_MAX_ROUNDS"] = "99"
+        self.rsi("checkpoint", "--round", "r1", "--score", "5.0")
+        for _ in range(2):
+            self.rsi("progress", "--round", "r1", "--score", "5.0")
+        led = os.path.join(self.root, "_round", "rsi", "ledger.jsonl")
+        keep = [l for l in open(led, encoding="utf-8")
+                if json.loads(l).get("event") != "ceiling_recommend"]
+        open(led, "w", encoding="utf-8").writelines(keep)      # ledger 다리만 제거
+        self.rsi("progress", "--round", "r1", "--score", "5.0")   # 복구 호출
+        evs = [json.loads(l) for l in open(led, encoding="utf-8")]
+        self.assertTrue(any(e.get("event") == "ceiling_recommend" and e.get("backfilled")
+                            for e in evs), "ledger 래치가 메워지지 않았다")
+        q = os.path.join(self.root, "_round", "learn", "digest_queue.jsonl")
+        open(q, "w", encoding="utf-8").write("")                  # 큐 회전
+        os.remove(os.path.join(self.root, "_round", "rsi", "state.json"))
+        self.rsi("checkpoint", "--round", "r1", "--score", "5.0")
+        self.rsi("progress", "--round", "r1", "--score", "5.0")
+        lines = [l for l in open(q, encoding="utf-8") if l.strip()]
+        self.assertEqual(len(lines), 0, ("세 근거가 남아 있는데 재추천됐다", lines))
 
     def test_recheckpoint_keeps_the_cap(self):
         seen = []

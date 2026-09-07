@@ -187,13 +187,37 @@ def _learn_state_dir():
     return os.path.join(pack, "round", "learn")
 
 
+# ★미러에서 **이름을 바꿔야 하는** 키(claude R2 major-1): `javis_learn.cmd_evaluate` 는 라운드
+#   레코드의 `attempts` 를 **자기 judge-shopping 시도수**로 읽는다(:724 `max(_existing.get("attempts")…)`
+#   → `EVALUATE_ATTEMPT_CAP=3` 초과면 fail(9) ESCALATE). 그런데 이 미러는 `<CYS_ROUND_DIR>/learn/state.json`
+#   에 쓰고, learn 은 사설 `learn_state.json` 이 없거나(첫 evaluate) canonical union 경로에서 그 파일을
+#   폴백으로 읽는다. 즉 RSI 의 시도수가 learn 의 상한으로 **새어** 첫 평가가 즉시 막혔다(실측 재현:
+#   rsi checkpoint+progress×3 → learn evaluate = "evaluate 4회 기록 — 4회째=ESCALATE", learn 평가 0회).
+#   자가치유 루프 정지 방향(§7 위험 ③)이므로 미러에서는 **다른 이름**으로 내보낸다. 데몬은 라운드
+#   레코드를 그대로 전달만 하고(handlers.rs learn.status), 병합은 화이트리스트(verdict·stored·harness·
+#   items·evaluator_hash·schema)라 이 개명에 무영향이다.
+MIRROR_RENAME_KEYS = {"attempts": "rsi_attempts"}
+
+
+def _mirror_round_rec(rec):
+    """미러용 라운드 레코드 — learn 의 lifecycle 키와 **이름이 겹치지 않게** 개명(순수 함수)."""
+    if not isinstance(rec, dict):
+        return rec
+    out = {}
+    for k, v in rec.items():
+        out[MIRROR_RENAME_KEYS.get(k, k)] = v
+    return out
+
+
 def _mirror_learn_state(state):
     """rounds/discovery를 데몬 가독 위치로 미러(best-effort) — 실패는 RSI 판정에 불간섭."""
     try:
         d = _learn_state_dir()
         os.makedirs(d, exist_ok=True)
+        rounds = state.get("rounds", {})
         payload = {
-            "rounds": state.get("rounds", {}),
+            "rounds": {k: _mirror_round_rec(v) for k, v in rounds.items()}
+                      if isinstance(rounds, dict) else {},
             "discovery": state.get("discovery", {"capability": 0, "perspective": 0, "knowledge": 0}),
         }
         p = os.path.join(d, "state.json")
@@ -221,30 +245,73 @@ def _append_ledger(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _read_ledger():
+    """ledger.jsonl → (레코드 목록, 손상 줄 수). **바이트로 읽고 줄마다 strict 디코드**한다.
+
+    ★깨진 1바이트로 도구가 죽지 않는다(리뷰 R2 blocking · claude major-2): 종전엔 텍스트 모드
+      반복이라 `\xed\x95` 같은 줄 하나가 `UnicodeDecodeError` 를 던졌고, 핸들러는 `OSError` 만
+      잡아 **checkpoint·progress 가 rc=1 로 죽었다**. 소비자(`javis_learn.py:766`)는 그 rc≠0 을
+      "일시적·재시도 가능"(fail 12)으로 올리는데 손상 줄은 남으므로 **영구 정지**였다
+      (§7 위험 ③ 자가치유 전멸 방향). 이제 손상은 예외가 아니라 **세어서 돌려주는 값**이다.
+    ★`errors="replace"` 를 쓰지 않는 이유는 orchestra 사이드카와 같다: 문자열 **안**의 깨진
+      바이트가 유효 JSON 으로 통과해 `round`·`event` 가 조용히 바뀔 수 있다(거짓 계수).
+    """
+    recs, damaged = [], 0
+    try:
+        with open(os.path.join(rsi_dir(), "ledger.jsonl"), "rb") as f:
+            raw = f.read()
+    except OSError:
+        return recs, damaged
+    for chunk in raw.split(b"\n"):
+        if not chunk.strip():
+            continue
+        try:
+            e = json.loads(chunk.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            damaged += 1
+            continue
+        if isinstance(e, dict):
+            recs.append(e)
+        else:
+            damaged += 1
+    return recs, damaged
+
+
+def _safe_append_ledger(entry):
+    """보조 기록용 append — 실패를 **삼킨다**(주 평가의 rc 를 바꾸지 않는다). 반환 성공 여부."""
+    try:
+        _append_ledger(entry)
+        return True
+    except Exception:
+        return False
+
+
 def _ledger_attempt_count(rid):
     """라운드별 평가 시도 수 — ledger.jsonl 계수(append-only 진실 · 선례 javis_learn :625).
-    state.json 을 지우거나 되돌려도 이 값이 남아 상한을 되살린다."""
+    state.json 을 지우거나 되돌려도 이 값이 남아 상한을 되살린다. 반환 (계수, 손상 줄 수).
+
+    ★손상 줄은 **어느 라운드의 것인지 알 수 없다**. 그래서 계수에 더하지 않는다(codex R2
+      major-10 반례: 라운드 A 의 깨진 3줄이 신규 라운드 B·C·D 의 첫 checkpoint 를 곧바로
+      `stopped_budget` 으로 만들었다 — 남의 예산을 태우는 거짓 정밀도다). 대신 **불확정**으로
+      따로 돌려주고(`budget_unknown`) 고지한다: 계수는 확인된 것만, 모르는 것은 모른다고.
+    ★그럼 예산이 되돌아가지 않는가? 되돌아갈 수 있는 경로는 'state 소실 + 그 라운드의 ledger
+      줄 손상' 동시 발생뿐이고, 그때 stop_reason 은 `budget_unknown` 을 달고 나간다(§5 한계).
+    """
+    recs, damaged = _read_ledger()
     n = 0
-    try:
-        with open(os.path.join(rsi_dir(), "ledger.jsonl"), encoding="utf-8") as f:
-            for ln in f:
-                try:
-                    e = json.loads(ln)
-                except ValueError:
-                    continue
-                if isinstance(e, dict) and e.get("event") in RSI_ATTEMPT_EVENTS \
-                        and e.get("round") == rid:
-                    n += 1
-    except OSError:
-        pass
-    return n
+    for e in recs:
+        if e.get("event") in RSI_ATTEMPT_EVENTS and e.get("round") == rid:
+            n += 1
+    return n, damaged
 
 
 def _next_attempt(state, rid):
-    """이번 호출의 시도 번호 — max(state, ledger) + 1(양쪽 되돌리기 방어)."""
+    """이번 호출의 시도 번호 — max(state, ledger) + 1(양쪽 되돌리기 방어).
+    반환 (시도번호, 직전 라운드 레코드, 손상 줄 수)."""
     prev = state.get("rounds", {}).get(rid)
     prev = prev if isinstance(prev, dict) else {}
-    return max(_as_int(prev.get("attempts"), 0), _ledger_attempt_count(rid)) + 1, prev
+    led, damaged = _ledger_attempt_count(rid)
+    return max(_as_int(prev.get("attempts"), 0), led) + 1, prev, damaged
 
 
 # ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
@@ -277,23 +344,52 @@ class _best_effort_lock(object):
 
     def __init__(self, path, wait=5.0, stale=300.0):
         self.path, self.wait, self.stale, self.held = path + ".lock", wait, stale, False
+        self.blocked, self.unsupported = False, ""
+        # 소유자 토큰 — **내 잠금일 때만** 지운다(orchestra 와 같은 규율: 느린 소유자가 고아로
+        # 오인돼 회수된 뒤 그대로 rmdir 하면 다음 소유자의 잠금을 지워 둘이 함께 들어간다).
+        self.token = ("%d-%d" % (os.getpid(), int(time.time() * 1000))).encode("ascii")
+
+    def _owner_file(self):
+        return os.path.join(self.path, "owner")
+
+    def _owner(self):
+        try:
+            with open(self._owner_file(), "rb") as f:
+                return f.read(200)
+        except OSError:
+            return b""
 
     def __enter__(self):
-        deadline = time.time() + self.wait
+        deadline = time.monotonic() + self.wait      # 단조 시계 — 시스템 시각 되감기 방어
         while True:
             try:
                 os.mkdir(self.path)
                 self.held = True
+                try:
+                    with open(self._owner_file(), "wb") as f:
+                        f.write(self.token)
+                except OSError:
+                    pass
                 return self
             except FileExistsError:
                 pass
-            except OSError:
+            except OSError as e:
+                self.unsupported = "%s" % e
                 return self
-            if time.time() >= deadline:
+            if time.monotonic() >= deadline:
+                self.blocked = True
                 return self
             try:
                 if time.time() - os.path.getmtime(self.path) > self.stale:
-                    os.rmdir(self.path)
+                    seen = self._owner()
+                    time.sleep(0.2)
+                    if seen == self._owner() and \
+                            time.time() - os.path.getmtime(self.path) > self.stale:
+                        try:
+                            os.unlink(self._owner_file())
+                        except OSError:
+                            pass
+                        os.rmdir(self.path)
                     continue
             except OSError:
                 pass
@@ -301,10 +397,15 @@ class _best_effort_lock(object):
 
     def __exit__(self, *exc):
         if self.held:
-            try:
-                os.rmdir(self.path)
-            except OSError:
-                pass
+            if self._owner() == self.token:
+                try:
+                    os.unlink(self._owner_file())
+                except OSError:
+                    pass
+                try:
+                    os.rmdir(self.path)
+                except OSError:
+                    pass
             self.held = False
         return False
 
@@ -338,7 +439,12 @@ def enqueue_learn_digest(reason, topic, source, key=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         rec = {"ts": time.time(), "reason": reason, "topic": topic, "source": source,
                "status": "queued_for_weekly_digest", "key": key or ""}
-        with _best_effort_lock(path):
+        with _best_effort_lock(path) as lk:
+            # ★잠금을 못 쥐면 **쓰지 않는다**(codex R2 major-6 과 같은 규율): 경합 중에 검사+적재를
+            #   하면 같은 키가 두 줄 쌓인다. 적재하지 않으면 래치도 서지 않으므로 추천은 다음
+            #   호출에서 다시 시도된다(영구 유실 0).
+            if lk.blocked:
+                return False
             if key and digest_queue_has_key(path, key):
                 return False
             with open(path, "a", encoding="utf-8") as f:
@@ -352,17 +458,10 @@ def _ledger_has_event(kind, rid):
     """append-only ledger 에 그 라운드의 이벤트가 있는가 — 래치의 두 번째 내구 근거.
     (큐가 주간 다이제스트로 **소비·정리**된 뒤에도 남는다. `RSI_ATTEMPT_EVENTS` 밖의 종류라
      시도 계수에는 잡히지 않는다.)"""
-    try:
-        with open(os.path.join(rsi_dir(), "ledger.jsonl"), encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                try:
-                    e = json.loads(ln)
-                except ValueError:
-                    continue
-                if isinstance(e, dict) and e.get("event") == kind and e.get("round") == rid:
-                    return True
-    except OSError:
-        pass
+    recs, _damaged = _read_ledger()          # 판독 규약은 `_ledger_attempt_count` 와 같다(비대칭 금지)
+    for e in recs:
+        if e.get("event") == kind and e.get("round") == rid:
+            return True
     return False
 
 
@@ -384,7 +483,7 @@ def cmd_checkpoint(a):
     # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
     #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
     #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
-    attempts, prev = _next_attempt(state, a.round)
+    attempts, prev, damaged = _next_attempt(state, a.round)
     flat = _as_int(prev.get("flat_streak"), 0)
     stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
     state.setdefault("rounds", {})[a.round] = {
@@ -400,14 +499,28 @@ def cmd_checkpoint(a):
              "score": a.score, "ts": ts, "ref": ref,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
+    if damaged:
+        entry["ledger_damaged"], entry["budget_unknown"] = damaged, True
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
-    _warn_stop(stop_reason, a.round, attempts)
+    _warn_stop(stop_reason, a.round, attempts, damaged)
     return 0
 
 
-def _warn_stop(stop_reason, rid, attempts):
+def _warn_damaged(damaged):
+    """ledger 손상 고지(stderr) — 손상을 조용히 건너뛰지 않는다. exit code 는 바꾸지 않는다."""
+    if not damaged:
+        return
+    print("[rsi] 주의: ledger.jsonl 에 판독 불가 %d줄(깨진 UTF-8·JSON 아님) — **어느 라운드의 "
+          "시도인지 알 수 없어** 계수에 넣지 않았다(budget_unknown). 즉 이 라운드의 시도수는 "
+          "확인된 것만 센 값이며, 손상 줄이 이 라운드의 시도였다면 실제보다 작을 수 있다. "
+          "파일: %s — 손상 줄을 고치거나 걷어내면 계수가 정확해진다."
+          % (damaged, os.path.join(rsi_dir(), "ledger.jsonl")), file=sys.stderr)
+
+
+def _warn_stop(stop_reason, rid, attempts, damaged=0):
     """종료 사유 고지(stderr) — exit code 는 바꾸지 않는다(소비자 루프를 세우지 않는다)."""
+    _warn_damaged(damaged)
     if stop_reason == "stopped_budget":
         print("[rsi] stop_reason=stopped_budget — 라운드 '%s' 시도 %d회 > 상한 %d "
               "(CYS_RSI_MAX_ROUNDS). 라운드를 잇지 말고 격차를 보고하라(기록은 남았다)."
@@ -443,7 +556,7 @@ def cmd_progress(a):
     r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
     # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
     #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
-    attempts, _prev = _next_attempt(state, a.round)
+    attempts, _prev, damaged = _next_attempt(state, a.round)
     r["attempts"] = attempts
     stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
                                   rsi_ceiling_flats())
@@ -452,9 +565,11 @@ def cmd_progress(a):
     entry = {"event": "progress", "round": a.round, **rec,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
+    if damaged:
+        entry["ledger_damaged"], entry["budget_unknown"] = damaged, True
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
-    _warn_stop(stop_reason, a.round, attempts)
+    _warn_stop(stop_reason, a.round, attempts, damaged)
     # 추천은 **라운드당 1회**다(다이제스트 1줄 계약). 종전엔 ceiling 이상인 매 progress 마다
     # 적재해 같은 사유가 큐에 쌓였다 — 배달 채널은 그대로(feed 0 · 주간 다이제스트).
     # ★래치는 state.json 밖에도 있어야 한다(codex R1 major-10): state 를 지우거나 되돌리면
@@ -462,16 +577,34 @@ def cmd_progress(a):
     #   ②append-only ledger 양쪽에서 조회한다(큐가 소비돼도 ledger 가 남고, ledger 를 잃어도
     #   큐가 남는다). 적재 실패면 래치를 걸지 않는다 — 추천을 영구히 잃지 않기 위해서다.
     key = "rsi.ceiling:%s" % a.round
-    if r["flat_streak"] >= rsi_ceiling_flats() and not r.get("ceiling_recommended"):
-        if digest_queue_has_key(learn_digest_queue_path(), key) or \
-                _ledger_has_event("ceiling_recommend", a.round):
-            r["ceiling_recommended"] = True   # 이미 추천됨(다른 경로에서) — 래치만 복원
-            _save_state(state)
+    if r["flat_streak"] >= rsi_ceiling_flats():
+        # ★내구 다리 셋을 **매번 함께** 본다(codex R2 major-11 B): 종전엔 state 래치가 참이면
+        #   분기 자체에 들어오지 않아, "큐에서 복구해 래치만 세운" 프로세스가 ledger 를 영영
+        #   비워 뒀다. 그 뒤 큐 회전 + state 소실이면 같은 추천이 다시 나간다.
+        in_queue = digest_queue_has_key(learn_digest_queue_path(), key)
+        in_ledger = _ledger_has_event("ceiling_recommend", a.round)
+        latched = bool(r.get("ceiling_recommended"))
+        if latched or in_queue or in_ledger:
+            if not in_ledger:
+                # ★보조 기록의 실패가 **주 평가의 rc 를 바꾸지 않는다**(codex R2 major-11 A):
+                #   `_append_ledger` 가 ENOSPC 로 던지면 progress 전체가 rc=1 이 되고
+                #   `javis_learn.py:766` 이 그것을 fail(12)(일시적·재시도 가능)로 올려 이미
+                #   끝난 평가가 재시도로 되돌아간다(§7 위험 ③ 방향). 실패는 삼키고 래치는
+                #   세우지 않는다 — 다음 호출이 다시 메울 단서를 남긴다.
+                if _safe_append_ledger({"event": "ceiling_recommend", "round": a.round,
+                                        "key": key, "ts": time.time(), "backfilled": True}):
+                    in_ledger = True
+                else:
+                    print("[rsi] 주의: ceiling 추천의 ledger 래치를 메우지 못했다 — 추천은 이미 "
+                          "나갔고(큐 또는 state), 다음 호출이 다시 시도한다.", file=sys.stderr)
+            if not latched and (in_queue or in_ledger):
+                r["ceiling_recommended"] = True   # 이미 추천됨(다른 경로에서) — 래치 복원
+                _save_state(state)
         elif _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round, key):
-            _append_ledger({"event": "ceiling_recommend", "round": a.round,
-                            "key": key, "ts": time.time()})
-            r["ceiling_recommended"] = True
-            _save_state(state)
+            if _safe_append_ledger({"event": "ceiling_recommend", "round": a.round,
+                                    "key": key, "ts": time.time()}):
+                r["ceiling_recommended"] = True
+                _save_state(state)
     return 0
 
 

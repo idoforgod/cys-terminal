@@ -2051,11 +2051,113 @@ def round_path(task):
     return os.path.join(pack_dir(), "round", "ORCHESTRATION-%s.md" % safe)
 
 
+# ★task 의 신원은 **슬러그도 표시문자열도 아니다**(codex R2 blocking-5): `round_path` 의 슬러그는
+#   `a/b` 와 `a_b` 를 한 파일로 접고, 감사 새니타이즈(`_audit_text`)는 `a/b` 와 `a|b` 를 같은
+#   문자열로 접으며 400자에서 자른다. 표시용 정규화로 **신원 비교**를 하면 그 두 접힘이 서로
+#   다른 우회로가 된다. 그래서 신원은 원문 바이트의 sha256 하나로 고정하고, 장부 헤더·사이드카
+#   이벤트·귀속 판정이 **모두 그 값**을 쓴다(같은 task 의 정의가 하나뿐이게).
+def task_id(task):
+    """task 원문(무절단)의 sha256 hex — 장부·사이드카·게이트가 공유하는 유일 신원."""
+    return hashlib.sha256(str(task or "").encode("utf-8", "surrogatepass")).hexdigest()
+
+
+LEDGER_HEADER_RE = re.compile(r"^#\s*ORCHESTRATION 라운드 장부\s*—\s*(.*)$")
+LEDGER_TASKID_RE = re.compile(r"^<!--\s*task-id:\s*([0-9a-f]{64})\s*-->\s*$")
+
+
+def ledger_identity(path):
+    """장부 머리에서 (표시 task, task-id) 를 읽는다 — 없으면 (None, None)(구 장부 = 호환)."""
+    disp, tid = None, None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        return None, None
+    for chunk in raw.split(b"\n")[:8]:
+        try:
+            ln = chunk.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            continue
+        m = LEDGER_HEADER_RE.match(ln)
+        if m and disp is None:
+            disp = m.group(1).strip()
+        m2 = LEDGER_TASKID_RE.match(ln)
+        if m2 and tid is None:
+            tid = m2.group(1)
+    return disp, tid
+
+
+def ledger_owner_mismatch(path, task):
+    """이 장부가 **다른 task** 의 것인가 — 반환 사유|None.
+
+    ★슬러그가 겹치는 두 task(`a/b` vs `a_b`)는 같은 장부·같은 사이드카를 쓴다. 사이드카는
+      귀속이 있어 남의 결속·종결을 물려받지 않지만, **장부 행 자체**는 공유돼 남의 행이
+      이쪽 라운드에 완결권을 주고 `gate_verdicts` 에도 섞였다(codex R2 blocking-7 · R1 §6 (A)(B)).
+      귀속을 강제하면 두 방향이 함께 닫힌다.
+    ★신판 장부는 `task-id`(원문 sha256)로 정확히 비교한다. 구 장부는 그 줄이 없으므로 표시
+      문자열 원문 비교로만 걸러낸다(약한 비교 = 이전과 같은 정도 · 이주 경계를 문서화한다).
+    """
+    disp, tid = ledger_identity(path)
+    if tid:
+        if tid == task_id(task):
+            return None
+        return ("이 장부는 다른 task 의 것이다(장부 task-id %s… ≠ 이 호출 %s… · 장부 표기 %r) — "
+                "`round_path` 슬러그가 겹쳤다. 같은 장부를 이어 쓰려면 **장부 표기 그대로** "
+                "`--task` 를 주고, 다른 작업이면 겹치지 않는 이름을 써라."
+                % (tid[:12], task_id(task)[:12], disp))
+    if disp is not None and disp != str(task):
+        return ("이 장부는 다른 task 의 것으로 보인다(장부 표기 %r ≠ 이 호출 %r · 구 장부라 "
+                "task-id 가 없다) — 같은 장부를 이어 쓰려면 장부 표기 그대로 `--task` 를 줘라."
+                % (disp, task))
+    return None
+
+
+def ledger_header_text(task):
+    """장부 헤더 원문 — 표시 줄 + **task-id 주석**(신원의 정본)."""
+    return (
+        "# ORCHESTRATION 라운드 장부 — %s\n"
+        "<!-- task-id: %s -->\n\n"
+        "> 라운드 루프(운영계약 §6-5·§6-6). 완료조건: **잠근 합격 기준의 미달 항목 0**"
+        "(외부 리뷰어 판정) 또는 %dR 상한 도달 — 먼저 온 것이 종결 사유다.\n"
+        "> 자기채점 금지 · 점수(0-100) 금지(§6-4) — 판정은 producer≠evaluator(외부 리뷰어)의\n"
+        "> verdict enum + evidence(file:line)다. 기록값 칸은 등급이 아니라 증거 발췌다.\n\n"
+        "| 라운드 | 평가자 | 기록값 | 판정 |\n|---|---|---|---|\n"
+        % (_audit_text(task), task_id(task), MAX_ROUNDS)
+    )
+
+
+def write_ledger_header(path, task):
+    """장부를 **원자적으로** 만든다(잠금을 쥔 채 호출). 반환 (ok, 사유).
+
+    ★부분 헤더가 보이면 안 된다(codex R2 blocking-3): 종전엔 `open(p,"x")` 로 **빈 파일**을 먼저
+      만들고 헤더를 썼다 — 그 사이에 다른 writer 가 '이미 존재' 로 보고 행을 append 하면 뒤이은
+      헤더 쓰기가 그 행을 **0 오프셋부터 덮었다**. 임시 파일에 다 쓰고 `os.replace` 로 공개하면
+      파일은 '없음' 아니면 '완성' 둘 중 하나다.
+    """
+    if os.path.exists(path):
+        return True, ""
+    tmp = "%s.init.%d.tmp" % (path, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(ledger_header_text(task))
+            _fsync(f)
+        os.replace(tmp, path)
+        return True, ""
+    except OSError as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, "장부 생성 실패(%s)" % e
+
+
 def cmd_round_init(args, gate=True):
-    # ★(부트 v2 §2-9 · A1-6) ACK 사전검사. `gate=False` 경로가 있는 이유: `cmd_round_log` 가
-    #   장부 부재 시 이 함수를 **내부 호출**해 장부를 만든다. 그 호출까지 막으면 round-log 가
-    #   없는 파일에 append 하려다 죽는다 — 명세가 게이트를 건 대상은 `round-init` **명령**이지
-    #   장부 생성이라는 기계 행위가 아니다(round-log 는 소비자 표에 없다).
+    # ★(부트 v2 §2-9 · A1-6) ACK 사전검사는 `round-init` **명령**에만 건다 — 장부 생성이라는
+    #   기계 행위가 아니라(round-log 는 ACK 소비자 표에 없다). `gate=False` 는 그 구분을 위한
+    #   내부 스위치로 남긴다.
+    # ★R2: `round-log` 는 더 이상 이 함수를 부르지 않는다. 헤더 생성은 결속·행과 **같은 잠금
+    #   안**에서 `write_ledger_header` 가 한다(잠금 밖 헤더 쓰기가 남의 행을 덮던 경로를 닫았다).
     if gate:
         _blocked, _lines = ack_gate_precheck("round-init")
         for _l in _lines:
@@ -2063,28 +2165,35 @@ def cmd_round_init(args, gate=True):
         if _blocked:
             return CHECK_EXIT_ACK_PENDING
     p = round_path(args.task)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    if os.path.exists(p):
-        print("이미 존재: %s (round-status로 확인)" % p)
-        return 0
-    # ★배타 생성(codex R1 추가 발견): 종전엔 존재 검사 후 `open(...,"w")` 라, 두 프로세스가
-    #   동시에 없다고 보면 나중 것이 **이미 기록된 장부를 잘라냈다**(행 전소실). "x" 는 원자적
-    #   실패를 내므로 그 경쟁이 데이터 손실이 아니라 '이미 존재'가 된다.
     try:
-        f = open(p, "x", encoding="utf-8")
-    except FileExistsError:
-        print("이미 존재: %s (round-status로 확인)" % p)
-        return 0
-    f.write(
-        "# ORCHESTRATION 라운드 장부 — %s\n\n"
-        "> 라운드 루프(운영계약 §6-5·§6-6). 완료조건: **잠근 합격 기준의 미달 항목 0**"
-        "(외부 리뷰어 판정) 또는 %dR 상한 도달 — 먼저 온 것이 종결 사유다.\n"
-        "> 자기채점 금지 · 점수(0-100) 금지(§6-4) — 판정은 producer≠evaluator(외부 리뷰어)의\n"
-        "> verdict enum + evidence(file:line)다. 기록값 칸은 등급이 아니라 증거 발췌다.\n\n"
-        "| 라운드 | 평가자 | 기록값 | 판정 |\n|---|---|---|---|\n" % (args.task, MAX_ROUNDS)
-    )
-    _fsync(f)
-    f.close()
+        os.makedirs(os.path.dirname(p), exist_ok=True)   # 잠금 **전**에 부모를 준비한다
+    except OSError as e:                                 # (codex R2 major-7 A: 첫 장부가 영영 안 생긴다)
+        print("[round-init] 거부: round 디렉터리를 만들 수 없다(%s)" % e, file=sys.stderr)
+        return 2
+    own = ledger_owner_mismatch(p, args.task)
+    if own:
+        print("[round-init] 거부: %s" % own, file=sys.stderr)
+        return 2
+    # ★생성도 append 와 **같은 뮤텍스**를 쓴다(codex R2 blocking-1·3): 독립 `round-init` 이
+    #   잠금 밖에서 헤더를 쓰면, 그 사이 `round-log` 가 append 한 행을 헤더가 덮는다.
+    with _best_effort_lock(p) as lk:
+        if lk.blocked:
+            print("[round-init] 거부: 다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 "
+                  "헤더를 쓰면 이미 기록된 행을 덮는다. 잠시 뒤 다시 하라(고아 잠금은 %d초 뒤 "
+                  "자동 회수)." % (lk.path, int(WP6_LOCK_STALE)), file=sys.stderr)
+            return 2
+        if lk.unsupported:
+            print("[round-init] 주의: 이 파일계에서 잠금을 만들 수 없다(%s) — 직렬화 없이 "
+                  "진행한다(동시 writer 가 있으면 기록이 섞일 수 있다)." % lk.unsupported,
+                  file=sys.stderr)
+        if os.path.exists(p):
+            print("이미 존재: %s (round-status로 확인)" % p)
+            return 0
+        ok, why = write_ledger_header(p, args.task)
+    if not ok:
+        print("[round-init] 거부: %s — 아무것도 기록되지 않았다(디스크·권한을 확인하라)." % why,
+              file=sys.stderr)
+        return 2
     print("라운드 장부 생성: %s" % p)
     return 0
 
@@ -2094,7 +2203,7 @@ def _cell(s):
     return str(s).replace("|", "/").replace("\n", " ").strip()
 
 
-def stagnation_gate(args, path, rows, events, damage=None):
+def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, holding=False):
     """`round-log` 의 WP-6 정체 종결 게이트 — 반환 (exit code|None, 보류 override|None).
 
     ★위치가 계약이다(codex 적대 검토 major-5): 이 검사는 `--from-cmd` **실행 전**에 돈다.
@@ -2121,14 +2230,15 @@ def stagnation_gate(args, path, rows, events, damage=None):
     #   `stagnation_stop` 이면 종결이 조용히 사라진다. 판정 불가일 때는 **새 라운드 발행**만
     #   막고(진행 중인 라운드의 완결은 이 게이트 앞에서 이미 통과했다) 명시 재개를 요구한다 —
     #   교착이 아니라 확인 요구다.
-    if int((damage or {}).get("damaged") or 0) > 0 and blocked_round is None:
+    unknown = history_unknown(damage)
+    if unknown and blocked_round is None:
         raw = getattr(args, "override", None)
         override = _audit_text(raw or "")
         if not override:
-            print("[round-log] 거부(exit %d): 감사 사이드카가 손상됐다(%d줄) — 정체 종결이 "
-                  "기록됐는지 **확인할 수 없다**(찢긴 줄이 종결일 수 있다). 새 라운드는 "
+            print("[round-log] 거부(exit %d): %s — 정체 종결이 기록됐는지 **확인할 수 없다**"
+                  "(찢긴 줄·판독 불가가 하필 종결일 수 있다). 새 라운드는 "
                   "`--override \"<사유>\"` 로만 연다. 이미 기록된 라운드의 완결은 막지 않는다."
-                  % (ROUND_LOG_EXIT_STAGNATION, damage.get("damaged")), file=sys.stderr)
+                  % (ROUND_LOG_EXIT_STAGNATION, unknown), file=sys.stderr)
             if raw is not None:
                 print("  · `--override` 가 **빈 사유**다 — 재개는 사유 없이 기록되지 않는다.",
                       file=sys.stderr)
@@ -2140,9 +2250,9 @@ def stagnation_gate(args, path, rows, events, damage=None):
         evidence, notes = load_verdict_evidence(
             args.task, stagnation_target_rounds(last), (),
             events=events, rows=rows, damage=damage)
-        for n in notes:
+        for n in (() if holding else notes):   # 잠금 안 재판정은 같은 안내를 두 번 내지 않는다
             print("[round-log] %s" % n, file=sys.stderr)
-        reason, why = round_stop_reason(rows, evidence)
+        reason, why = round_stop_reason(rows, evidence, row_damage=row_damage)
     if blocked_round is None and reason != "stopped_stagnation":
         return None, None
     stop_round = blocked_round if blocked_round is not None else last
@@ -2152,7 +2262,8 @@ def stagnation_gate(args, path, rows, events, damage=None):
         if blocked_round is None:      # 첫 거부에서만 종결을 못박는다(중복 기록 없음)
             if not append_round_event(args.task, {"event": "stagnation_stop", "round": stop_round,
                                                   "requested_round": args.round,
-                                                  "reason": [_audit_text(w) for w in why]}):
+                                                  "reason": [_audit_text(w) for w in why]},
+                                      lock=not holding):
                 print("[round-log] 경고: 정체 종결을 사이드카에 남기지 못했다(디스크·권한). "
                       "이번 호출은 막았지만 **끈끈하지 않다** — 같은 라운드에 행이 더 붙어 계산이 "
                       "달라지면 다음 요청이 열릴 수 있다. 저장소를 고친 뒤 다시 확인하라.",
@@ -2194,11 +2305,16 @@ def commit_override(task, path, pend):
               "(정체 종결 유지). 다음 새 라운드에도 `--override` 가 필요하다.", file=sys.stderr)
         return
     try:
-        with _best_effort_lock(path), open(path, "a", encoding="utf-8") as f:
-            f.write("\n> [override] %s · 라운드 %d 재개(정체 종결 라운드 %d) — 사유: %s\n\n"
-                    % (time.strftime("%Y-%m-%d %H:%M:%S"), pend["round"], pend["stop_round"],
-                       pend["reason"]))
-            _fsync(f)
+        with _best_effort_lock(path) as lk:
+            if lk.blocked:      # 같은 저장소의 writer 는 모두 상호배제를 지킨다(codex R2 major-6)
+                print("[round-log] 주의: 잠금 경합으로 override 표시줄을 장부에 남기지 못했다 "
+                      "— 정본 기록은 사이드카다(재개는 이미 기록됐다).", file=sys.stderr)
+                return
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n> [override] %s · 라운드 %d 재개(정체 종결 라운드 %d) — 사유: %s\n\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"), pend["round"], pend["stop_round"],
+                           pend["reason"]))
+                _fsync(f)
     except OSError as e:
         print("[round-log] 경고: override 표시줄 기록 실패(%s) — 정본 기록은 사이드카다" % e,
               file=sys.stderr)
@@ -2207,7 +2323,13 @@ def commit_override(task, path, pend):
 
 
 def append_ledger_row(path, row):
-    """장부 행 append(찢긴 마지막 줄 보정 + fsync). 반환 성공 여부 — 실패는 **기록 없음**이다."""
+    """장부 행 append(찢긴 마지막 줄 보정 + fsync). 반환 성공 여부 — 실패는 **기록 없음**이다.
+
+    ★"실패" 라고 말하기 전에 **되읽는다**(codex R2 blocking-2): 종전엔 close/fsync 오류에서
+      행 바이트가 이미 디스크에 남았는데도 exit 2(기록 없음)를 냈다. 그 행은 다음 호출에
+      **완결권**(이미 개시된 라운드)을 주므로, 거부됐다던 라운드가 override 없이 열렸다.
+    """
+    before = _file_size(path)
     try:
         need_nl = False
         try:
@@ -2221,47 +2343,120 @@ def append_ledger_row(path, row):
             if need_nl:
                 f.write("\n")
             f.write(row)
-            _fsync(f)
+            if not _fsync(f):
+                print("[round-log] 주의: 장부 fsync 실패 — 바이트는 보이지만 **내구성은 미상**"
+                      "이다(전원 장애 시 유실 가능).", file=sys.stderr)
         return True
-    except OSError:
+    except OSError as e:
+        seen = _appended_since(path, before, row)
+        if seen is True:
+            print("[round-log] 주의: 장부 기록 중 오류(%s) — 그러나 **되읽기 결과 행이 남았다**. "
+                  "기록된 것으로 취급한다(완결권이 생긴다)." % e, file=sys.stderr)
+            return True
+        if seen is None:
+            # ★불확정을 '기록 없음'으로 접지 않는다(codex R2 blocking-2): 되읽기까지 실패하면
+            #   행이 남았는지 **알 수 없다**. exit 2(아무것도 기록 안 됨)도 exit 1(기록됨)도
+            #   거짓말이므로 별도 코드로 올린다 — 조작자가 눈으로 확인해야 하는 상태다.
+            print("[round-log] 오류: 장부 기록 중 오류(%s) 이고 **되읽기도 실패**했다 — 행이 "
+                  "남았는지 확인할 수 없다." % e, file=sys.stderr)
+            return None
         return False
 
 
-def commit_round_row(task, path, row, binding=None, rnd=None, std=None):
-    """결속 이벤트 → 장부 행을 **한 잠금 안에서** 커밋. 반환 (ok, 사유).
+COMMIT_OK, COMMIT_REFUSED, COMMIT_STAGNATION, COMMIT_UNKNOWN = "ok", "refused", "stag", "unknown"
+
+
+def commit_round_row(args, path, row, binding=None, rnd=None, std=None):
+    """준입 재판정 → 장부 생성 → 결속 → 행을 **한 잠금 안에서** 커밋. 반환 (상태, 사유, 재개).
 
     ★순서가 계약이다(codex R1 blocking-1): 결속이 디스크에 남지 않았는데 행만 남으면 status 가
       **낡은 결속**으로 정체를 선언한다. 그래서 결속 실패 = 행을 쓰지 않는다(fail-closed).
-    ★행 서수는 **잠금 안에서 다시 센다**: `--from-cmd` 가 최대 1800s 도는 사이 장부가 자랐을 수
-      있다. 서수가 어긋난 결속은 판정에서 증거로 쓰이지 않으므로(안전 방향), 여기서 최신 값으로
-      묶어 정상 기록이 헛되이 무효화되는 것을 막는다.
+    ★잠금은 **필수**다(codex R2 blocking-1): 최선노력으로 두면 두 writer 가 같은 서수를 계산해
+      A 의 (minor) 결속이 B 의 (major) 행에 묶인다 — 장부 행은 내용이 같으면 구별되지 않으므로
+      서수만으로는 세대를 못 가른다. 경합이면 **쓰지 않고 거부**한다(잠금 자체가 불가능한
+      파일계는 종전대로 진행하되 고지 — 그때는 아무도 못 쥐므로 거부해봐야 기록만 막힌다).
+    ★준입(새 라운드 허용)도 **잠금 안에서 다시** 판정한다(codex R2 blocking-3): 게이트를 통과한
+      뒤 `--from-cmd` 가 최대 1800s 도는 사이 다른 writer 가 정체 종결을 기록할 수 있다. 그때
+      행 없는 새 라운드를 그대로 커밋하면 종결 뒤에 라운드가 열린다.
+    ★행 서수도 같은 잠금 안에서 최신 값으로 센다.
     """
-    with _best_effort_lock(path):
+    task = args.task
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)   # 잠금 **전**에 부모 준비
+    except OSError as e:
+        return COMMIT_REFUSED, "round 디렉터리를 만들 수 없다(%s)" % e, None
+    with _best_effort_lock(path) as lk:
+        if lk.blocked:
+            return COMMIT_REFUSED, ("다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 쓰면 "
+                                    "행 서수·결속 세대가 겹쳐 남의 행에 내 증거가 묶인다. 잠시 뒤 "
+                                    "다시 기록하라(고아 잠금은 %d초 뒤 자동 회수)."
+                                    % (lk.path, int(WP6_LOCK_STALE))), None
+        if lk.unsupported:
+            print("[round-log] 주의: 이 파일계에서 잠금을 만들 수 없다(%s) — 직렬화 없이 "
+                  "진행한다(동시 writer 가 있으면 증거 결속이 섞일 수 있다)." % lk.unsupported,
+                  file=sys.stderr)
+        if os.path.exists(path) and not os.path.isfile(path):
+            # 결정론으로 **기록 불가**임을 아는 형상 — 불확정이 아니라 거부다(디렉터리·특수 파일).
+            return COMMIT_REFUSED, ("장부 경로가 일반 파일이 아니다(%s) — 행을 append 할 수 없다. "
+                                    "아무것도 기록되지 않았다." % path), None
+        own = ledger_owner_mismatch(path, task)
+        if own:
+            return COMMIT_REFUSED, own, None
+        rows, rdamage = parse_rounds(path, with_damage=True)
+        events, damage = read_round_events(task, with_damage=True)
+        sg, pend = stagnation_gate(args, path, rows, events, damage, rdamage, holding=True)
+        if sg is not None:
+            return COMMIT_STAGNATION, "", None
+        ok, why = write_ledger_header(path, task)
+        if not ok:
+            return COMMIT_REFUSED, why, None
         if binding is not None:
             b = dict(binding)
-            b["row_ordinal"] = axis_row_count(parse_rounds(path), rnd, std) + 1
+            b["row_ordinal"] = axis_row_count(rows, rnd, std) + 1
             if not append_round_event(task, b, lock=False):
-                return False, ("증거 결속(사이드카) 기록 실패 — 결속 없는 행은 낡은 결속과 결합해 "
-                               "거짓 종결을 만든다. 디스크·권한을 고친 뒤 다시 기록하라")
-        if not append_ledger_row(path, row):
-            return False, ("장부 기록 실패 — 디스크·권한을 확인하라"
-                           + ("(결속 이벤트는 남았으나 짝이 없어 증거로 쓰이지 않는다)"
-                              if binding is not None else ""))
-    return True, ""
+                return COMMIT_REFUSED, ("증거 결속(사이드카) 기록 실패 — 결속 없는 행은 낡은 "
+                                        "결속과 결합해 거짓 종결을 만든다. 디스크·권한을 고친 뒤 "
+                                        "다시 기록하라(장부 행은 남기지 않았다)"), None
+        st = append_ledger_row(path, row)
+        if st is None:
+            return COMMIT_UNKNOWN, ("장부 기록 결과 **불확정** — 행이 남았는지 확인할 수 없다. "
+                                    "`round-status` 로 눈으로 확인한 뒤 다시 기록하라"), pend
+        if not st:
+            return COMMIT_REFUSED, ("장부 기록 실패 — 디스크·권한을 확인하라"
+                                    + ("(결속 이벤트는 남았으나 짝이 없어 증거로 쓰이지 않는다)"
+                                       if binding is not None else "")), None
+    return COMMIT_OK, "", pend
 
 
 def cmd_round_log(args):
     p = round_path(args.task)
-    rows = parse_rounds(p)                   # 부재 = 빈 목록(장부 생성은 커밋 직전으로 미룬다)
+    # ★장부 귀속을 **가장 먼저** 본다(codex R2 blocking-7): 슬러그가 겹치는 다른 task 의 장부에
+    #   행을 쓰면 그 행이 원 task 의 완결권·게이트 판정에 섞인다(정체 게이트 전면 우회).
+    own = ledger_owner_mismatch(p, args.task)
+    if own:
+        print("[round-log] 거부: %s" % own, file=sys.stderr)
+        return 2
+    rows, rdamage = parse_rounds(p, with_damage=True)   # 부재 = 빈 목록(장부 생성은 커밋 직전)
+    ldmg = ledger_unknown(rdamage)
+    if ldmg:
+        print("[round-log] 주의: %s — 손상 줄 **뒤에** 그 (라운드,평가자)를 다시 기록하면 판정이 "
+              "회복된다. 기록 자체는 계속 가능하다." % ldmg, file=sys.stderr)
     events, damage = read_round_events(args.task, with_damage=True)
-    if damage.get("damaged"):
-        print("[round-log] 주의: 감사 사이드카에 손상 %d줄(마지막 %d행) — 그 이전 결속은 증거로 "
-              "쓰이지 않는다(재기록하면 회복). 기록 자체는 계속 가능하다."
-              % (damage["damaged"], damage["last_damaged_line"]), file=sys.stderr)
+    unk = history_unknown(damage)
+    if unk:
+        print("[round-log] 주의: %s — 그 이전 결속은 증거로 쓰이지 않는다(재기록하면 회복). "
+              "기록 자체는 계속 가능하다." % unk, file=sys.stderr)
     # ★WP-6 정체 종결 게이트 — 어떤 부수효과(--from-cmd 실행·기록)보다 **먼저** 본다.
-    _sg, pending_override = stagnation_gate(args, p, rows, events, damage)
+    #   (권위 판정은 커밋 잠금 안에서 한 번 더 한다 — 그 사이 종결이 기록될 수 있다.)
+    _sg, _pend = stagnation_gate(args, p, rows, events, damage, rdamage)
     if _sg is not None:
         return _sg
+    if getattr(args, "override", None) is not None and _pend is None:
+        # ★조용히 삼키지 않는다(claude R2 minor): 게이트가 발동하지 않은 호출에 붙인 `--override`
+        #   는 사이드카에도 장부에도 남지 않는다 — 조작자는 "재개를 기록했다"고 믿는다.
+        print("[round-log] 주의: `--override` 는 이번 호출에 적용되지 않았다(집행 중인 정체 종결이 "
+              "없거나 이미 개시된 라운드의 완결이다) — **재개 사유는 어디에도 기록되지 않는다**.",
+              file=sys.stderr)
     # ★전환 게이트 §9-7-2 부수 1: --score 플래그를 제거했다(§6-4 점수 금지).
     #   기록값 칸의 기본은 "-" 이며, --from-cmd 경로에서만 기계검증 출력 꼬리를 담는다
     #   (등급이 아니라 증거 발췌다 — 평균·다수결 affordance 없음).
@@ -2346,18 +2541,31 @@ def cmd_round_log(args):
         # ★WP-6 증거 결속: 이 행이 **어느 파일로** 판정됐는지를 sha256 · 행 서수와 함께 사이드카에
         #   남긴다. 정체 판정은 이 결속을 통해서만 verdict JSON 을 읽는다 — 결속 없이 정본 경로만
         #   훑으면 나중에 덮인 낡은 파일이 새 행과 결합해 거짓 종결을 만든다.
+        vsha = sha256_bytes(data)
+        # ★행에 **증거 식별자**를 남긴다(codex R2 blocking-1): 장부 행 넷(라운드·평가자·기록값·
+        #   판정)은 서로 다른 증거로 만들어도 **바이트가 같을 수 있다**(둘 다 ACCEPT). 그래서
+        #   서수만으로는 "이 결속이 그 행의 근거인가"를 가를 수 없었다. 기록값 칸에 verdict
+        #   파일의 sha 앞 32자(128비트)를 넣으면 행 스스로가 어느 증거로 났는지 말한다.
+        #   이것은 등급이 아니라 **증거 발췌**다(점수 금지 계약 §6-4 와 충돌하지 않는다).
+        #   결속의 완전한 sha256 대조는 그대로 유지된다(요약은 짝맞춤용이지 검증용이 아니다).
+        score = row_evidence_token(vsha)
         binding = {"event": "verdict_src", "round": args.round,
                    "evaluator": _audit_text(args.evaluator), "verdict": verdict_out,
-                   "path": os.path.abspath(vj), "sha256": sha256_bytes(data)}
+                   "path": os.path.abspath(vj), "sha256": vsha, "row_token": score}
     row = "| %d | %s | %s | %s |\n" % (args.round, _cell(args.evaluator), _cell(score),
                                        _cell(verdict))
-    # ★장부 생성은 **여기서** 한다(codex R1 검체 발견): 맨 앞에서 만들면 그 뒤 검증에 걸려 거부된
-    #   호출(오타 난 task 이름의 machine 행 등)이 **빈 장부**를 남긴다 — 기록되지 않은 호출은
-    #   아무것도 남기지 않는다는 이번 라운드의 원칙과 어긋난다. 내부 생성은 게이트 대상이 아니다.
-    if not os.path.exists(p):
-        cmd_round_init(args, gate=False)
-    ok, why = commit_round_row(args.task, p, row, binding, args.round, std)
-    if not ok:
+    # ★장부 생성·준입 재판정·결속·행은 전부 `commit_round_row` 의 **한 잠금 안**에서 일어난다
+    #   (codex R2 blocking-1·3): 맨 앞에서 만들면 거부된 호출이 빈 장부를 남기고, 잠금 밖에서
+    #   만들면 헤더 쓰기가 남의 행을 덮는다.
+    st, why, pending_override = commit_round_row(args, p, row, binding, args.round, std)
+    if st == COMMIT_STAGNATION:
+        return ROUND_LOG_EXIT_STAGNATION
+    if st == COMMIT_UNKNOWN:
+        print("[round-log] %s" % why, file=sys.stderr)
+        print("  · 재개(`--override`)는 **소진되지 않았다** — 정체 종결이 있었다면 그대로 유지된다.",
+              file=sys.stderr)
+        return ROUND_LOG_EXIT_UNKNOWN
+    if st != COMMIT_OK:
         print("[round-log] 거부: %s" % why, file=sys.stderr)
         return 2
     if pending_override is not None:      # 재개는 **행이 남은 뒤에만** 소진된다
@@ -2369,27 +2577,104 @@ def cmd_round_log(args):
     return 1 if machine_fail else 0
 
 
-def parse_rounds(p):
-    """장부 Markdown → 행 목록. **바이트로 읽고 줄마다 관대 디코드**한다.
+def parse_rounds(p, with_damage=False):
+    """장부 Markdown → 행 목록(`with_damage=True` 면 `(rows, damage)`).
 
-    ★깨진 UTF-8 로 죽지 않는다(codex R1 추가 발견): 종전엔 텍스트 모드 반복이라 장부에 깨진
-      바이트가 하나만 있어도 `UnicodeDecodeError` 로 round-log·round-status·gate-status 가
-      **모두 죽었다**(핸들러는 OSError 만 잡는다). 깨진 줄은 정규식에 걸리지 않아 '기록 없음'이
-      되고, 그 방향은 정체 미선언(라운드 계속) = 안전이다.
+    ★깨진 UTF-8 로 죽지 않는다(codex R1 추가 발견): 바이트로 읽고 줄마다 디코드한다.
+    ★그러나 깨진 줄을 '기록 없음'으로 접는 것은 **안전 방향이 아니었다**(codex R2 blocking-5):
+      마지막-승 규칙에서 최신 거절 행이 사라지면 **더 낡은 승인이 부활**한다. 그래서 깨진 줄을
+      세어 `damage` 로 올리고, 판정은 그 상태에서 `accepted`·`stopped_stagnation` 을 선언하지
+      않는다(= open · 라운드 계속 · 자동 착수 금지).
     """
-    rows = []
+    rows, bad_lines, unreadable = [], [], ""
     try:
         with open(p, "rb") as f:
             raw = f.read()
-    except OSError:
-        return []
-    for chunk in raw.split(b"\n"):
-        ln = chunk.decode("utf-8", "replace")
-        m = re.match(r"\|\s*(\d+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|", ln)
+    except FileNotFoundError:
+        raw = b""
+    except OSError as e:
+        raw, unreadable = b"", "%s" % e
+    for i, chunk in enumerate(raw.split(b"\n"), 1):
+        try:
+            ln = chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            # ★손상을 조용히 삼키지 않는다(codex R2 blocking-5): 종전엔 `errors="replace"` 라
+            #   `| 2 | mach\xffne | - | FAIL |` 이 평가자 미매칭으로 **행 자체가 사라졌고**,
+            #   마지막-승 규칙 때문에 **직전 machine PASS 가 부활**해 정체가 성립했다. 읽을 수
+            #   없는 거절을 소리 없이 버리는 것은 안전 방향이 아니다 — 세어서 위로 올린다.
+            if chunk.strip():
+                bad_lines.append(i)
+            continue
+        m = LEDGER_ROW_RE.match(ln)
         if m:
             rows.append({"round": int(m.group(1)), "evaluator": m.group(2),
-                         "score": m.group(3), "verdict": m.group(4)})
+                         "score": m.group(3), "verdict": m.group(4), "_line": i})
+        elif _row_candidate(ln):
+            # ★디코드 손상만 세면 한 바이트 변형만 막는다(codex R2 blocking-4): 첫 글자를
+            #   `|`→`!` 로 바꾸거나 마지막 `|` 를 잘라내면 **유효 UTF-8인데 행이 사라진다**.
+            #   파이프가 둘 이상인데 행으로 파싱되지 않는 줄은 '행이 되려다 만 것'으로 본다
+            #   (설명문·인용줄은 `_audit_text` 가 파이프를 접어 여기 걸리지 않는다).
+            bad_lines.append(i)
+    if with_damage:
+        return rows, {"damaged": len(bad_lines), "lines": bad_lines,
+                      "last_damaged_line": (bad_lines[-1] if bad_lines else 0),
+                      "unreadable": unreadable}
     return rows
+
+
+LEDGER_ROW_RE = re.compile(r"\|\s*(\d+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|")
+_LEDGER_HEAD_ROW = "| 라운드 | 평가자 | 기록값 | 판정 |"
+
+
+def _row_candidate(ln):
+    """행이 되려다 만 줄인가 — 파이프 2개 이상인데 행으로 파싱되지 않는 줄(표 머리·구분선 제외)."""
+    t = ln.strip()
+    if not t or t.count("|") < 2:
+        return False
+    if t == _LEDGER_HEAD_ROW or set(t) <= set("|- :"):
+        return False
+    return True
+
+
+def ledger_unknown(damage):
+    """장부를 신뢰할 수 없는가 — 손상 줄 또는 판독 불가. 반환 사유|None(순수 함수)."""
+    d = damage or {}
+    if d.get("unreadable"):
+        return "장부를 읽을 수 없다(%s)" % d["unreadable"]
+    n = int(d.get("damaged") or 0)
+    if n > 0:
+        return ("장부에 판독 불가 %d줄(깨진 UTF-8·잘린 행) — 그 줄이 **거절 행**일 수 있다"
+                "(줄 번호 %s)" % (n, ", ".join(str(x) for x in (d.get("lines") or [])[:5])))
+    return None
+
+
+def damage_blocks_round(rows, damage, rnd):
+    """손상이 **이 라운드의 판정**을 막는가 — 반환 사유|None(순수 함수).
+
+    ★손상을 전역·영구 불통으로 만들지 않는다(codex R2 major-8): 옛 설명문 한 바이트가 깨졌다고
+      이후 모든 라운드의 승인을 영원히 막으면, 복구할 길이 '역사를 지우는 것' 뿐이 된다.
+    ★대신 **회복 경계**를 준다: 마지막-승 규칙에서 판정을 뒤집을 수 있는 것은 그 축의 **가장
+      나중 행**뿐이다. 그러므로 손상 줄보다 **뒤에** 그 축의 행이 보이면 손상은 그 축을 뒤집을
+      수 없다. 즉 "손상 줄 이후에 그 (라운드,평가자)를 다시 기록하면 판정이 회복된다".
+    ★판독 불가(장부를 아예 못 읽음)는 회복 경계가 없다 — 그때는 막는다.
+    """
+    d = damage or {}
+    if d.get("unreadable"):
+        return "장부를 읽을 수 없다(%s) — 판정 불가" % d["unreadable"]
+    lines = [int(x) for x in (d.get("lines") or [])]
+    if not lines:
+        return None
+    worst = max(lines)
+    stale = []
+    for e in GATE_EVALUATORS:
+        seen = [r for r in rows if r.get("round") == rnd and evaluator_std(r.get("evaluator")) == e]
+        if seen and int(seen[-1].get("_line") or 0) <= worst:
+            stale.append(e)
+    if not stale:
+        return None
+    return ("장부 손상 %d줄(마지막 %d행) **뒤에** 라운드 %d 의 %s 기록이 없다 — 사라진 줄이 그 축의 "
+            "최신 판정일 수 있다(마지막-승). 해당 (라운드,평가자)를 다시 기록하면 회복된다"
+            % (len(lines), worst, rnd, "·".join(stale)))
 
 
 def cmd_round_status(args):
@@ -2404,7 +2689,11 @@ def cmd_round_status(args):
     if not os.path.exists(p):
         print("라운드 장부 없음: %s — `round-init`로 생성" % p)
         return 1
-    rows = parse_rounds(p)
+    own = ledger_owner_mismatch(p, args.task)
+    if own:
+        print("라운드 장부 없음(귀속 불일치): %s" % own)
+        return 1
+    rows, rdamage = parse_rounds(p, with_damage=True)
     last = max((r["round"] for r in rows), default=0)
     print("라운드 현황 — %s" % args.task)
     print("  기록된 라운드: %d / 상한 %d" % (last, MAX_ROUNDS))
@@ -2418,7 +2707,10 @@ def cmd_round_status(args):
         getattr(args, "verdict_json", None) or (), events=events, rows=rows, damage=damage)
     for n in notes:
         print("[round-status] %s" % n, file=sys.stderr)
-    reason, why = round_stop_reason(rows, evidence)
+    ldmg = ledger_unknown(rdamage)
+    if ldmg:
+        print("[round-status] 주의: %s" % ldmg, file=sys.stderr)
+    reason, why = round_stop_reason(rows, evidence, row_damage=rdamage)
     print("  stop_reason=%s" % reason)
     for l in why:
         print("    · %s" % l)
@@ -2447,13 +2739,13 @@ def cmd_round_status(args):
               " 발행은 `round-log --override \"<사유>\"` 없이 거부된다(exit %d). 이미 기록된 "
               "라운드의 완결·재평가 기록은 막히지 않는다 — 종결 ≠ 합격."
               % (blocked, reason, ROUND_LOG_EXIT_STAGNATION))
-    elif int((damage or {}).get("damaged") or 0) > 0:
-        # ★status 와 집행이 갈리지 않게(codex R1 major-8 의 같은 원리): 손상 상태에서 round-log 는
-        #   새 라운드를 exit 3 으로 막는다 — 그 사실을 여기서도 같은 말로 알린다.
-        print("  → 감사 사이드카 손상(%d줄): 종결이 기록됐는지 **확인할 수 없다** — 새 라운드는 "
+    elif history_unknown(damage):
+        # ★status 와 집행이 갈리지 않게(codex R1 major-8 의 같은 원리): 손상·판독불가 상태에서
+        #   round-log 는 새 라운드를 exit 3 으로 막는다 — 그 사실을 여기서도 같은 말로 알린다.
+        print("  → %s: 종결이 기록됐는지 **확인할 수 없다** — 새 라운드는 "
               "`round-log --override \"<사유>\"` 로만 열린다(이미 기록된 라운드의 완결은 가능). "
-              "손상 원인을 확인하고 해당 (라운드,평가자)를 다시 기록하면 증거가 회복된다."
-              % damage["damaged"])
+              "원인을 확인하고 해당 (라운드,평가자)를 다시 기록하면 증거가 회복된다."
+              % history_unknown(damage))
     else:
         print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
               "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
@@ -2691,6 +2983,17 @@ STAGNATION_REVIEWERS = ("gemini", "codex")
 STAGNATION_ROUNDS = 2                 # "최근 2라운드 연속"
 MINOR_SEVERITY = "minor"              # javis_verdict.SEVERITY_ENUM 의 최하 등급
 ROUND_LOG_EXIT_STAGNATION = 3         # round-log 의 미사용 exit 코드(2=거부 · 1=machine_fail)
+# ★exit 계약(정직한 3값 + 1): 1=행이 남았고 기계검증 실패 · 2=**장부 행이 남지 않았다**(사이드카에
+#   짝 없는 고아 결속이 남을 수는 있으나 서수 대조에서 증거로 쓰이지 않는다) · 3=정체 종결 거부 ·
+#   5=**기록 여부 불확정**(쓰기 오류 + 되읽기 실패). 5 를 2 나 1 로 접으면 어느 쪽이든 거짓말이다.
+ROUND_LOG_EXIT_UNKNOWN = 5
+ROW_TOKEN_PREFIX = "vj:"
+ROW_TOKEN_HEX = 32                    # 128비트 — 행 짝맞춤용 식별자(검증은 완전 sha256 이 한다)
+
+
+def row_evidence_token(sha):
+    """장부 '기록값' 칸에 넣는 증거 식별자 — `vj:<sha256 앞 32자>`(등급 아님)."""
+    return ROW_TOKEN_PREFIX + str(sha or "")[:ROW_TOKEN_HEX]
 # 조사 필요로 읽는 판정 접두 — INVESTIGATE 는 javis_verdict R2 강등 결과(승인 아님), ESCALATE 는
 # 리뷰어 enum 의 오너 상신이다. 둘 다 "라운드를 한 번 더" 로 풀리지 않는다.
 INVESTIGATE_PREFIXES = ("investigate", "escalate")
@@ -2740,23 +3043,60 @@ class _best_effort_lock(object):
 
     def __init__(self, path, wait=WP6_LOCK_WAIT, stale=WP6_LOCK_STALE):
         self.path, self.wait, self.stale, self.held = path + ".lock", wait, stale, False
+        # ★두 실패를 **구분**한다(codex R2 blocking-1·3): `blocked` = 다른 writer 가 쥐고 있다
+        #   (= 직렬화가 필요한 임계구간은 진행하면 안 된다) · `unsupported` = 이 파일계에서
+        #   잠금 자체가 불가(권한·경로 길이 등 — 아무도 못 쥐므로 종전대로 완충 없이 진행하되
+        #   그 사실을 호출자가 고지한다). 둘을 뭉치면 Windows 경로 한계 같은 형상에서 기록이
+        #   전면 거부돼 부트체인 ④ 방향이 된다.
+        self.blocked, self.unsupported = False, ""
+        self.token = ("%d-%d-%s" % (os.getpid(), int(time.time() * 1000),
+                                    hashlib.sha256(os.urandom(16)).hexdigest()[:16])).encode("ascii")
+
+    def _owner_file(self):
+        return os.path.join(self.path, "owner")
+
+    def _owner(self):
+        try:
+            with open(self._owner_file(), "rb") as f:
+                return f.read(200)
+        except OSError:
+            return b""
 
     def __enter__(self):
-        deadline = time.time() + self.wait
+        # ★단조 시계(codex R2 major-7 C): `time.time()` 은 시스템 시각이 뒤로 밀리면 대기 상한이
+        #   늘어난다("5초 상한" 이 깨진다). 대기·나이 판정 모두 monotonic 을 쓴다.
+        deadline = time.monotonic() + self.wait
         while True:
             try:
                 os.mkdir(self.path)
                 self.held = True
+                try:                            # 소유자 토큰 — 남의 잠금을 지우지 않기 위한 표식
+                    with open(self._owner_file(), "wb") as f:
+                        f.write(self.token)
+                except OSError:
+                    pass
                 return self
             except FileExistsError:
                 pass
-            except OSError:
+            except OSError as e:
+                self.unsupported = "%s" % e
                 return self                    # 잠글 수 없는 파일계 — 완충 없이 진행
-            if time.time() >= deadline:
-                return self                    # 대기 상한 — 완충 없이 진행(멈추지 않는다)
+            if time.monotonic() >= deadline:
+                self.blocked = True            # 다른 writer 가 쥐고 있다(대기 상한)
+                return self                    # 멈추지 않는다 — 판단은 호출자 몫
+            # 고아 회수는 **두 번 확인**한다: 나이가 상한을 넘고 그 사이 소유자 토큰이 바뀌지
+            # 않았을 때만 지운다(살아 있는 소유자를 즉시 강탈하는 폭을 좁힌다).
             try:
                 if time.time() - os.path.getmtime(self.path) > self.stale:
-                    os.rmdir(self.path)        # 고아(5분 초과) 회수 — 임계구간은 초 단위다
+                    seen = self._owner()
+                    time.sleep(0.2)
+                    if seen == self._owner() and \
+                            time.time() - os.path.getmtime(self.path) > self.stale:
+                        try:
+                            os.unlink(self._owner_file())
+                        except OSError:
+                            pass
+                        os.rmdir(self.path)    # 고아 회수 — 임계구간은 초 단위다
                     continue
             except OSError:
                 pass
@@ -2764,21 +3104,34 @@ class _best_effort_lock(object):
 
     def __exit__(self, *exc):
         if self.held:
-            try:
-                os.rmdir(self.path)
-            except OSError:
-                pass
+            # ★**내 잠금일 때만** 지운다(codex R2 major-6): 느린 소유자가 고아로 오인돼 회수된
+            #   뒤 그대로 rmdir 하면 **다음 소유자의 잠금**을 지워 둘이 동시에 임계구간에 든다.
+            if self._owner() == self.token:
+                try:
+                    os.unlink(self._owner_file())
+                except OSError:
+                    pass
+                try:
+                    os.rmdir(self.path)
+                except OSError:
+                    pass
             self.held = False
         return False
 
 
 def _fsync(f):
-    """flush + fsync(best-effort) — 플랫폼·파일계가 거부해도 명령을 세우지 않는다."""
+    """flush + fsync — 반환 True=내구 확인. 플랫폼·파일계가 거부해도 명령을 세우지 않는다.
+
+    ★반환값을 삼키지 않는다(codex R2): fsync 실패를 조용히 무시하면 append 함수가 "남았다"고
+      말하는데 전원 장애 후 사라질 수 있다. 쓰기 실패로 격상하지는 않는다(바이트는 보인다) —
+      **내구성 미상**으로 고지한다(정직한 표기 · 결정 방향 불변).
+    """
     try:
         f.flush()
         os.fsync(f.fileno())
+        return True
     except (OSError, ValueError, AttributeError):
-        pass
+        return False
 
 
 def round_events_path(task):
@@ -2809,12 +3162,19 @@ def append_round_event(task, rec, lock=True):
     rec.pop("_line", None)                    # 판독기 부여 필드는 기록하지 않는다
     rec.setdefault("ts", time.time())
     rec.setdefault("task", task)
+    rec.setdefault("task_id", task_id(task))  # 귀속의 정본(표시문자열이 아니라 원문 sha256)
     line = json.dumps(rec, ensure_ascii=False) + "\n"
+    p = round_events_path(task)
+    before = _file_size(p)
     try:
-        p = round_events_path(task)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
+        os.makedirs(os.path.dirname(p), exist_ok=True)   # 잠금 전에 부모를 준비한다
         ctx = _best_effort_lock(round_path(task)) if lock else _null_ctx()
         with ctx:
+            # ★같은 저장소를 바꾸는 writer 는 **모두** 상호배제를 지킨다(codex R2 major-6):
+            #   경합으로 잠금을 못 쥔 호출이 그냥 append 하면 required 잠금은 장식이 된다.
+            #   여기서는 멈추지 않고 **쓰지 않는다** — 호출자가 이미 실패를 판정에 반영한다.
+            if getattr(ctx, "blocked", False):
+                return False
             need_nl = False
             try:
                 with open(p, "rb") as f:
@@ -2827,10 +3187,86 @@ def append_round_event(task, rec, lock=True):
                 if need_nl:
                     f.write("\n")
                 f.write(line)
-                _fsync(f)
+                if not _fsync(f):
+                    print("[round] 주의: 사이드카 fsync 실패 — 바이트는 보이지만 **내구성은 "
+                          "미상**이다(전원 장애 시 유실 가능).", file=sys.stderr)
         return True
-    except OSError:
+    except OSError as e:
+        # ★쓰기 후 되읽기(주인님 규율: 반환값은 반영의 증거가 아니다 · codex R2 blocking-2):
+        #   close/fsync 단계에서 터져도 **바이트는 이미 남았을 수 있다**. 남았는데 "실패" 라고
+        #   보고하면 호출자가 '기록 없음' 으로 판단해 계약(exit 2 = 아무것도 기록되지 않음)이
+        #   거짓말이 된다. 실제로 남았는지 다시 읽어 확인한다.
+        seen = _appended_since(p, before, line)
+        if seen is True:
+            print("[round] 주의: 사이드카 기록 중 오류(%s) — 그러나 **되읽기 결과 남았다**. "
+                  "기록된 것으로 취급한다." % e, file=sys.stderr)
+            return True
+        if seen is None:
+            print("[round] 오류: 사이드카 기록 중 오류(%s) 이고 되읽기도 실패 — 남았는지 확인 "
+                  "불가. 기록되지 않은 것으로 취급한다(보수적)." % e, file=sys.stderr)
         return False
+
+
+def _file_size(path):
+    """파일 크기(부재·읽기 실패는 0) — append 되읽기 검증의 기준점."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _appended_since(path, since, text):
+    """`since` 바이트 이후에 `text` 가 실제로 붙었는가 — 반환 True/False/**None(확인 불가)**.
+
+    ★끝에서 뒤지지 않고 **오프셋 이후**만 본다: 같은 내용의 행을 재기록하는 갈래(같은 verdict
+      파일로 재평가)에서 옛 행을 새 행으로 오인하면 "남았다"는 거짓 보고가 된다.
+    ★비교는 `strip()` 한 본문으로 한다: 끝 개행만 못 쓴 채 죽어도 **파서는 그 행을 본다**
+      (그러면 그것은 '남은 행'이다 — 다음 호출에 완결권을 준다).
+    ★되읽기 자체가 실패하면 None 이다. 그것을 False(기록 없음)로 접으면 계약이 거짓이 된다.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, int(since or 0)))
+            tail = f.read()
+    except OSError:
+        return None
+    return text.strip() in tail.decode("utf-8", "replace")
+
+
+def _is_int(v):
+    """엄격 정수인가 — bool·float·문자열은 정수가 아니다(강제 변환 금지)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _event_shape_ok(rec):
+    """사이드카 이벤트의 최소 형상 검사(순수) — 어긋나면 **손상**으로 접는다."""
+    if "event" in rec and not isinstance(rec["event"], str):
+        return False
+    if "task" in rec and not isinstance(rec["task"], str):
+        return False
+    if "task_id" in rec and not (isinstance(rec["task_id"], str)
+                                 and _SHA256_RE.match(rec["task_id"])):
+        return False
+    for k in ("round", "stop_round", "requested_round", "row_ordinal"):
+        if k in rec and not _is_int(rec[k]):
+            return False
+    return True
+
+
+def event_owned_by(e, task, tid):
+    """이 이벤트가 이 task 의 것인가 — 신원은 `task_id`(원문 sha256)가 정본.
+
+    구 기록(귀속 키 부재)은 **호환을 위해 수용**한다(그 시절엔 파일이 곧 귀속이었다).
+    `task_id` 가 있으면 그것만 본다 — 표시 문자열은 새니타이즈·슬러그로 겹칠 수 있어
+    신원 비교에 쓰지 않는다(codex R2 blocking-5).
+    """
+    etid = e.get("task_id")
+    if isinstance(etid, str) and _SHA256_RE.match(etid):
+        return etid == tid
+    et = e.get("task")
+    if et is None:
+        return True
+    return et == task
 
 
 def read_round_events(task, with_damage=False):
@@ -2845,12 +3281,17 @@ def read_round_events(task, with_damage=False):
     ★손상을 조용히 건너뛰면 **더 낡은 결속이 되살아난다**(blocking-2). 그래서 세어서 돌려주고,
       판정은 손상 줄 **이후**의 결속만 증거로 쓴다(그 이전은 세대가 불명이다).
     """
-    events, damaged, last_bad = [], 0, 0
+    events, damaged, last_bad, unreadable = [], 0, 0, ""
     try:
         with open(round_events_path(task), "rb") as f:
             raw = f.read()
-    except OSError:
-        raw = b""
+    except FileNotFoundError:
+        raw = b""                       # 없음 = 이력 없음(정상 · 첫 라운드)
+    except OSError as e:
+        # ★"읽을 수 없다" 는 "없다" 가 아니다(codex R2 blocking-6): 권한·디렉터리·I/O 오류를
+        #   빈 이력으로 접으면 **끈끈한 종결이 사라져** 새 라운드가 override 없이 열린다.
+        #   판독 불가는 손상과 같은 취급(판정 불가 · 명시 재개 요구)으로 올린다.
+        raw, unreadable = b"", "%s" % e
     for i, chunk in enumerate(raw.split(b"\n"), 1):
         if not chunk.strip():
             continue
@@ -2864,14 +3305,33 @@ def read_round_events(task, with_damage=False):
         except ValueError:
             damaged, last_bad = damaged + 1, i
             continue
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or not _event_shape_ok(rec):
+            # ★구조 이상도 손상이다(codex R2 major-12): `{"round": Infinity}` 는 유효 JSON 이라
+            #   통과한 뒤 `int()` 에서 **잡히지 않는 OverflowError** 로 판정기를 죽였다. 타입이
+            #   어긋난 이벤트를 조용히 무시하면 그 이벤트가 종결이었을 때 낡은 상태가 부활한다.
             damaged, last_bad = damaged + 1, i
             continue
         rec["_line"] = i
         events.append(rec)
     if with_damage:
-        return events, {"damaged": damaged, "last_damaged_line": last_bad}
+        return events, {"damaged": damaged, "last_damaged_line": last_bad,
+                        "unreadable": unreadable}
     return events
+
+
+def history_unknown(damage):
+    """이력을 신뢰할 수 없는가 — 손상 줄 또는 판독 불가. 반환 사유 문자열|None(순수 함수).
+
+    ★두 사건을 한 축으로 묶는 이유: 둘 다 "종결이 기록됐는지 **확인할 수 없다**" 이고, 그 답은
+      같아야 한다(새 라운드는 명시 재개로만 · 정체는 선언하지 않는다 · 완결은 막지 않는다).
+    """
+    d = damage or {}
+    if d.get("unreadable"):
+        return "감사 사이드카를 읽을 수 없다(%s)" % d["unreadable"]
+    n = int(d.get("damaged") or 0)
+    if n > 0:
+        return "감사 사이드카에 손상 %d줄(마지막 %d행)" % (n, int(d.get("last_damaged_line") or 0))
+    return None
 
 
 def read_bytes_once(path, limit=WP6_MAX_VERDICT_BYTES):
@@ -2884,10 +3344,15 @@ def read_bytes_once(path, limit=WP6_MAX_VERDICT_BYTES):
     """
     if not isinstance(path, str) or not path.strip():
         return None, "경로가 문자열이 아니다"
+    # ★널 바이트는 OSError 가 아니라 ValueError 를 던진다(codex R2 major): 사이드카는 손편집될 수
+    #   있고, 타입만 검사한 문자열이 `open()` 을 **ValueError 로 터뜨려** 판정기(round-status·
+    #   round-log 게이트)가 traceback 으로 죽었다. 증거 부재는 예외가 아니라 '판정 불가'다.
+    if "\x00" in path:
+        return None, "경로에 널 바이트가 있다 — 증거로 읽지 않는다"
     try:
         with open(path, "rb") as f:
             data = f.read(limit + 1)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return None, "파일 부재·읽기 실패(%s)" % e
     if len(data) > limit:
         return None, "파일이 상한(%d bytes)을 넘는다 — 증거로 읽지 않는다" % limit
@@ -2985,29 +3450,28 @@ def axis_row_count(rows, rnd, std):
       **옛 행 + 새 결속**이 결합해 거짓 종결이 난다(그 반대 조합도 같다). 결속이 "내가 몇 번째
       행의 근거인가"를 들고 있으면 그 짝이 어긋난 순간 증거로 쓰이지 않는다(fail-closed).
     """
-    n = 0
-    for r in rows:
-        if r["round"] == rnd and evaluator_std(r["evaluator"]) == std:
-            n += 1
-    return n
+    return len(axis_rows(rows, rnd, std))
+
+
+def axis_rows(rows, rnd, std):
+    """장부에서 (라운드, 표준평가자) 행들 — 기록 순서 그대로."""
+    return [r for r in rows if r.get("round") == rnd
+            and evaluator_std(r.get("evaluator") or "") == std]
 
 
 def verdict_bindings(events, task):
     """사이드카 → {(라운드, 표준평가자): 결속}. 같은 키의 뒤 기록이 이긴다(재평가 = 마지막 승 ·
     `gate_verdicts` 와 같은 규칙). 반환 (bindings, foreign_tasks)."""
-    out, foreign = {}, set()
+    out, foreign, tid = {}, set(), task_id(task)
     for e in events:
-        t = e.get("task")
-        if t is not None and t != task:
-            foreign.add(str(t))       # 어떤 이벤트든 — 슬러그 충돌의 신호는 전부 모은다
-        if e.get("event") != "verdict_src" or t != task:
+        mine = event_owned_by(e, task, tid)
+        if not mine:
+            foreign.add(str(e.get("task")))   # 어떤 이벤트든 — 슬러그 충돌의 신호는 전부 모은다
+        if e.get("event") != "verdict_src" or not mine:
             continue
         std = evaluator_std(str(e.get("evaluator") or ""))
-        try:
-            rnd = int(e.get("round"))
-        except (TypeError, ValueError):
-            continue
-        if std is None:
+        rnd = e.get("round")
+        if std is None or not _is_int(rnd):   # 강제 변환 금지(2.9·Infinity 는 라운드가 아니다)
             continue
         out[(rnd, std)] = e
     return out, foreign
@@ -3062,7 +3526,9 @@ def load_verdict_evidence(task, rounds, specs=(), events=None, rows=(), damage=N
             if (rnd, std) in explicit:
                 used.add((rnd, std))
             ordinal = b.get("row_ordinal")
-            nrows = axis_row_count(rows or (), rnd, std)
+            arows = axis_rows(rows or (), rnd, std)
+            nrows = len(arows)
+            token = b.get("row_token")
             bad = None
             # ★해시 없는 결속은 증거가 아니다(codex 위임 검체 발견): 경로만 가리키는 결속은
             #   그 내용을 묶지 못한다 — 낡은/바뀐 파일이 종결의 근거가 된다.
@@ -3077,6 +3543,19 @@ def load_verdict_evidence(task, rounds, specs=(), events=None, rows=(), damage=N
             elif ordinal != nrows:
                 bad = ("결속-행 세대 불일치(결속 서수 %d ≠ 장부 행 %d개) — 부분 기록(행 또는 결속 "
                        "한쪽만 남음)이다. 다시 기록하면 회복된다" % (ordinal, nrows))
+            elif not isinstance(token, str) or not token.startswith(ROW_TOKEN_PREFIX):
+                # 구 형식 결속(행 식별자 없음)은 증거가 아니다 — 자동 승격 금지(codex R2 major-13).
+                bad = ("결속에 행 식별자(row_token)가 없다 — 구 형식이다. 서수만으로는 같은 내용의 "
+                       "다른 행과 구별되지 않으므로 증거로 쓰지 않는다(다시 기록하면 회복된다)")
+            elif token != row_evidence_token(sha):
+                bad = ("결속의 행 식별자가 제 sha 와 어긋난다(%s ≠ %s)"
+                       % (token, row_evidence_token(sha)))
+            elif (arows[ordinal - 1].get("score") or "").strip() != token:
+                # ★행 스스로가 어느 증거로 났는지 말한다(codex R2 blocking-1): 서수가 같아도
+                #   그 행이 **다른 증거**로 기록됐으면 이 결속은 그 행의 근거가 아니다.
+                bad = ("결속-행 증거 불일치(장부 %d번째 %s 행의 기록값 %r ≠ 결속 식별자 %r) — "
+                       "다른 증거로 난 행이다. 다시 기록하면 회복된다"
+                       % (ordinal, std, (arows[ordinal - 1].get("score") or "").strip(), token))
             if bad:
                 evidence[(rnd, std)] = {"ok": False, "verdict": None, "severities": [],
                                         "path": path if isinstance(path, str) else "", "why": bad}
@@ -3099,7 +3578,7 @@ def load_verdict_evidence(task, rounds, specs=(), events=None, rows=(), damage=N
     return evidence, notes
 
 
-def stagnation_state(rows, evidence, last_round, rounds=STAGNATION_ROUNDS):
+def stagnation_state(rows, evidence, last_round, rounds=STAGNATION_ROUNDS, row_damage=None):
     """최근 `rounds` 라운드 연속 '게이트 전원 ACCEPT + 이슈 전부 minor' 인가 — 순수 함수.
 
     반환 (bool, [사유줄]). 참이 되는 조건은 전부 **양성 증거**다:
@@ -3120,6 +3599,9 @@ def stagnation_state(rows, evidence, last_round, rounds=STAGNATION_ROUNDS):
     for rnd in stagnation_target_rounds(last_round, rounds):
         if rnd not in recorded:
             return False, ["정체 아님: 라운드 %d 기록 없음(연속 %dR 미충족)" % (rnd, rounds)]
+        dmg = damage_blocks_round(rows, row_damage, rnd)
+        if dmg:
+            return False, ["정체 판정 불가: %s" % dmg]
         gv = gate_verdicts(rows, rnd)
         for e in GATE_EVALUATORS:
             if gv.get(e) is False:
@@ -3174,24 +3656,38 @@ def investigate_rows(rows, rnd):
     return out
 
 
-def round_stop_reason(rows, evidence, max_rounds=MAX_ROUNDS, rounds=STAGNATION_ROUNDS):
+def round_stop_reason(rows, evidence, max_rounds=MAX_ROUNDS, rounds=STAGNATION_ROUNDS,
+                      row_damage=None):
     """라운드 종료 사유 — 순수 함수. 반환 (stop_reason, [사유줄]).
 
     우선순위는 정본이 열거한 순서다: accepted > stopped_budget > stopped_stagnation >
     needs_investigation > open. 합격이 가장 강하고(4자 수렴 = 기존 gate-status 계약),
     그 다음이 헌장의 하드 상한(10R)이다.
+    ★`row_damage`(장부 판독 불가)가 있으면 **승인·정체 둘 다 선언하지 않는다**(codex R2
+      blocking-5): 사라진 줄이 거절이면 낡은 승인이 부활하고, 그 부활은 종결(정지)과 자동
+      착수를 동시에 만든다. 판정 불능은 통과가 아니다 — 라운드를 계속하는 쪽으로 접는다.
     """
     last = max((r["round"] for r in rows), default=0)
     if last <= 0:
         return "open", ["기록된 라운드 없음 — 라운드 1부터 기록하라"]
+    dmg = damage_blocks_round(rows, row_damage, last)
     gv = gate_verdicts(rows, last)
-    if all(gv.get(e) is True for e in GATE_EVALUATORS):
+    if all(gv.get(e) is True for e in GATE_EVALUATORS) and not dmg:
         return "accepted", ["라운드 %d: 게이트 4자(%s) 전원 승인"
                             % (last, "·".join(GATE_EVALUATORS))]
     if last >= max_rounds:
         return "stopped_budget", ["%dR 상한 도달(기록 라운드 %d) — 무한 루프 금지(운영계약 §6-5)"
                                   % (max_rounds, last)]
-    stag, why = stagnation_state(rows, evidence, last, rounds)
+    if dmg:
+        # 손상이 이 라운드의 축을 가릴 수 있으면 승인도 정체도 선언하지 않는다(둘 다 '정지'를
+        # 만든다). 조사 필요(승인 아님)는 그대로 올린다 — 그것은 라운드를 계속하라는 뜻이다.
+        inv0 = investigate_rows(rows, last)
+        if inv0:
+            return "needs_investigation", [
+                "라운드 %d: 평가자 %s 판정 %s — 조사 필요(승인 아님)"
+                % (last, r["evaluator"].strip(), r["verdict"].strip()) for r in inv0]
+        return "open", [dmg + " — 라운드를 계속하라(판정 불능은 통과가 아니다)"]
+    stag, why = stagnation_state(rows, evidence, last, rounds, row_damage)
     if stag:
         return "stopped_stagnation", why
     inv = investigate_rows(rows, last)
@@ -3219,13 +3715,13 @@ def stagnation_block_round(events, task=None):
       없으므로 종전대로 해제 — 호환).
     """
     blocked = None
+    tid = task_id(task) if task is not None else None
     for e in events:
         ev = e.get("event")
-        if task is not None and e.get("task") is not None and e.get("task") != task:
+        if task is not None and not event_owned_by(e, task, tid):
             continue
-        try:
-            rnd = int(e.get("round"))
-        except (TypeError, ValueError):
+        rnd = e.get("round")
+        if not _is_int(rnd):        # 강제 변환 금지 — 형상 이상은 이미 손상으로 접혔다
             continue
         if ev == "stagnation_stop":
             blocked = rnd
@@ -3235,14 +3731,12 @@ def stagnation_block_round(events, task=None):
                 continue
             # ★키가 있는데 값이 정수가 아니면 **손상·손편집**이다(codex R1 검체 발견): 그것을
             #   '구 기록 호환'으로 읽으면 아무 종결이나 푸는 만능 재개가 된다. 해제하지 않는다.
+            # ★강제 변환도 하지 않는다(codex R2 blocking-8): `int(2.9) == 2` 가 라운드 2 의 종결을
+            #   풀었고 `Infinity` 는 **잡히지 않는 OverflowError** 였다. 저장된 타입이 그대로
+            #   정수일 때만 해제한다(구 호환은 키 **부재**에만 준다).
             v = e.get("stop_round")
-            if isinstance(v, bool):
-                continue
-            try:
-                if int(v) == blocked:
-                    blocked = None
-            except (TypeError, ValueError):
-                pass
+            if isinstance(v, int) and not isinstance(v, bool) and v == blocked:
+                blocked = None
     return blocked
 
 
@@ -3263,10 +3757,15 @@ def cmd_round_relocate(args):
         print("[round-relocate] 거부: 결속은 리뷰어 축(%s)에만 있다 — 평가자 %r"
               % ("·".join(STAGNATION_REVIEWERS), args.evaluator), file=sys.stderr)
         return 2
+    lp = round_path(args.task)
+    own = ledger_owner_mismatch(lp, args.task)
+    if own:
+        print("[round-relocate] 거부: %s" % own, file=sys.stderr)
+        return 2
     events, damage = read_round_events(args.task, with_damage=True)
-    if damage.get("damaged"):
-        print("[round-relocate] 주의: 사이드카 손상 %d줄(마지막 %d행)"
-              % (damage["damaged"], damage["last_damaged_line"]), file=sys.stderr)
+    unk = history_unknown(damage)
+    if unk:
+        print("[round-relocate] 주의: %s" % unk, file=sys.stderr)
     bindings, _foreign = verdict_bindings(events, args.task)
     b = bindings.get((args.round, std))
     if not b:
@@ -3279,6 +3778,19 @@ def cmd_round_relocate(args):
         print("[round-relocate] 거부: 기존 결속에 유효한 sha256 이 없다 — 같은 파일인지 확인할 "
               "방법이 없다(재기록이 답이다).", file=sys.stderr)
         return 2
+    # ★손상 이전 결속은 **세탁되지 않는다**(codex R2 blocking-4): 손상 줄 이전의 결속은 세대가
+    #   불명이라 이미 증거가 아니다. 재배치는 '이사'일 뿐인데, 새 줄 번호를 얻는 부작용으로
+    #   그 결속이 손상 뒤로 올라오면 리뷰 증거 없이 종결이 되살아난다.
+    last_bad = int((damage or {}).get("last_damaged_line") or 0)
+    if int(b.get("_line") or 0) <= last_bad:
+        print("[round-relocate] 거부: 이 결속은 사이드카 손상 줄(%d행) **이전**이라 이미 증거가 "
+              "아니다 — 재배치로는 회복되지 않는다. `round-log --verdict-json` 으로 그 "
+              "(라운드,평가자)를 다시 기록하라." % last_bad, file=sys.stderr)
+        return 2
+    if not isinstance(b.get("row_token"), str):
+        print("[round-relocate] 거부: 이 결속에는 행 식별자(row_token)가 없다(구 형식) — "
+              "재배치해도 증거로 쓰이지 않는다. 다시 기록하라.", file=sys.stderr)
+        return 2
     data, why = read_bytes_once(args.path)
     if data is None:
         print("[round-relocate] 거부: 새 경로를 읽을 수 없다(%s)" % why, file=sys.stderr)
@@ -3289,19 +3801,31 @@ def cmd_round_relocate(args):
               "재평가가 아니다 — 내용이 바뀌었으면 `round-log` 로 다시 기록하라."
               % (sha[:12], got[:12]), file=sys.stderr)
         return 2
-    with _best_effort_lock(round_path(args.task)):
-        now, _d = read_round_events(args.task, with_damage=True)
+    with _best_effort_lock(round_path(args.task)) as lk:
+        if lk.blocked:
+            print("[round-relocate] 거부: 다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 "
+                  "옮기면 최신 재평가를 덮는다. 잠시 뒤 다시 하라." % lk.path, file=sys.stderr)
+            return 2
+        # ★커밋 경계 **안에서** 손상·세대를 다시 본다(codex R2 blocking-4).
+        now, nd = read_round_events(args.task, with_damage=True)
         cur, _f = verdict_bindings(now, args.task)
         c = cur.get((args.round, std)) or {}
+        nbad = int((nd or {}).get("last_damaged_line") or 0)
         if str(c.get("sha256") or "").strip().lower() != sha or \
-                c.get("row_ordinal") != b.get("row_ordinal"):
+                c.get("row_ordinal") != b.get("row_ordinal") or \
+                c.get("row_token") != b.get("row_token"):
             print("[round-relocate] 거부: 그 사이 결속이 바뀌었다(재평가 진행 중) — 최신 결속을 "
                   "덮지 않는다. 다시 확인하라.", file=sys.stderr)
+            return 2
+        if int(c.get("_line") or 0) <= nbad:
+            print("[round-relocate] 거부: 그 사이 사이드카가 손상됐다(%d행) — 손상 이전 결속은 "
+                  "증거가 아니다(재기록이 답이다)." % nbad, file=sys.stderr)
             return 2
         rec = {"event": "verdict_src", "round": args.round,
                "evaluator": _audit_text(args.evaluator), "verdict": c.get("verdict"),
                "path": os.path.abspath(args.path), "sha256": sha,
-               "row_ordinal": c.get("row_ordinal"), "relocated_from": c.get("path")}
+               "row_ordinal": c.get("row_ordinal"), "row_token": c.get("row_token"),
+               "relocated_from": c.get("path")}
         if not append_round_event(args.task, rec, lock=False):
             print("[round-relocate] 거부: 사이드카 기록 실패 — 재배치되지 않았다(디스크·권한).",
                   file=sys.stderr)
@@ -3324,10 +3848,20 @@ def cmd_gate_status(args):
         print("[gate-status] 라운드 장부 없음: %s — round-init·round-log로 기록을 쌓아라"
               % p, file=sys.stderr)
         return 1
-    rows = parse_rounds(p)
+    own = ledger_owner_mismatch(p, args.task)
+    if own:      # 남의 장부에서 수렴을 읽지 않는다(codex R2 blocking-7 유입 방향)
+        print("[gate-status] 미수렴: %s" % own, file=sys.stderr)
+        return 1
+    rows, rdamage = parse_rounds(p, with_damage=True)
     rnd = args.round or max((r["round"] for r in rows), default=0)
     if rnd <= 0:
         print("[gate-status] 기록된 라운드 없음 — 미수렴", file=sys.stderr)
+        return 1
+    dmg = damage_blocks_round(rows, rdamage, rnd)
+    if dmg:
+        # ★사라진 줄이 **거절**이면 낡은 승인이 부활해 자동 착수가 열린다(codex R2 blocking-5).
+        #   판정 불능은 통과가 아니다 — 미수렴으로 접고 회복 경계를 알린다.
+        print("[gate-status] 미수렴(판정 불가): %s" % dmg, file=sys.stderr)
         return 1
     verdicts = gate_verdicts(rows, rnd)
     missing = [e for e, v in verdicts.items() if v is None]
@@ -3440,7 +3974,9 @@ def enqueue_learn_digest(reason, topic, source, key=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         rec = {"ts": time.time(), "reason": reason, "topic": topic, "source": source,
                "status": "queued_for_weekly_digest", "key": key or ""}
-        with _best_effort_lock(path):
+        with _best_effort_lock(path) as lk:
+            if lk.blocked:      # 경합 중 검사+적재는 같은 키를 두 줄 쌓는다 — 쓰지 않는다
+                return False
             if key and digest_queue_has_key(path, key):
                 return False
             with open(path, "a", encoding="utf-8") as f:
@@ -3972,6 +4508,44 @@ def cmd_self_test(args):
         assert STOP_REASONS == ("accepted", "stopped_budget", "stopped_stagnation",
                                 "needs_investigation", "open"), "stop_reason enum 변형"
         assert ROUND_LOG_EXIT_STAGNATION == 3, "round-log 정체 거부 exit 코드는 3(미사용 값)이다"
+        # ── R2: 기록 불확정 · 행 증거 식별자 · 엄격 정수 · 신원 · 손상 회복 경계 ──────────
+        assert ROUND_LOG_EXIT_UNKNOWN == 5 and ROUND_LOG_EXIT_UNKNOWN not in (0, 1, 2, 3), \
+            "불확정 exit 코드는 기존 계약값과 겹치면 안 된다(2=기록없음·1=기록됨)"
+        assert row_evidence_token("a" * 64) == "vj:" + "a" * 32 and ROW_TOKEN_HEX == 32, \
+            "행 증거 식별자 형식 변형(짝맞춤 식별자 · 검증은 완전 sha256 이 한다)"
+        for _bad in (2.9, True, False, "2", None, float("inf")):
+            assert not _is_int(_bad), "엄격 정수 판정 실패: %r" % (_bad,)
+        assert _is_int(2) and _is_int(0), "정수를 정수가 아니라고 했다"
+        # `_audit_text` 는 신원 함수가 아니다 — 슬러그·새니타이즈로 겹치는 표기가 서로 다른 신원.
+        assert _audit_text("a/b") == _audit_text("a|b"), "전제 붕괴(새니타이즈가 두 표기를 접는다)"
+        assert task_id("a/b") != task_id("a|b") != task_id("a_b"), "task 신원이 표기로 접힌다"
+        assert len(task_id("x")) == 64, "task 신원은 sha256 hex"
+        _ev = [{"event": "stagnation_stop", "round": 2, "task_id": task_id("T")},
+               {"event": "override", "round": 9, "stop_round": 2.9, "task_id": task_id("T")}]
+        assert stagnation_block_round(_ev, "T") == 2, "2.9 가 라운드 2 의 종결을 풀었다(강제 변환)"
+        _ev2 = list(_ev[:1]) + [{"event": "override", "round": 9, "stop_round": 2,
+                                 "task_id": task_id("T")}]
+        assert stagnation_block_round(_ev2, "T") is None, "정상 override 가 해제하지 못한다"
+        _ev3 = list(_ev[:1]) + [{"event": "override", "round": 9, "stop_round": 2,
+                                 "task_id": task_id("U")}]
+        assert stagnation_block_round(_ev3, "T") == 2, "남의 task override 가 종결을 풀었다"
+        assert _row_candidate("! 2 | machine | - | FAIL |") and \
+            not _row_candidate("> [override] 재개 사유") and \
+            not _row_candidate("| 라운드 | 평가자 | 기록값 | 판정 |") and \
+            not _row_candidate("|---|---|---|---|"), "행 손상 후보 판정 오류"
+        _rows_d = [{"round": 1, "evaluator": "machine", "verdict": "PASS", "score": "-",
+                    "_line": 10}]
+        assert damage_blocks_round(_rows_d, {"lines": [12]}, 1), "손상 뒤 재기록 없이 판정했다"
+        assert damage_blocks_round(_rows_d, {"lines": [5]}, 1) is None, \
+            "손상이 축의 최신 행보다 앞인데 판정을 막았다(회복 경계 없음)"
+        assert damage_blocks_round(_rows_d, {"unreadable": "x"}, 1), "판독 불가를 통과시켰다"
+        assert history_unknown({"unreadable": "boom"}) and \
+            history_unknown({"damaged": 1, "last_damaged_line": 3}) and \
+            history_unknown({"damaged": 0}) is None, "이력 불확실 판정 오류"
+        assert _event_shape_ok({"event": "override", "round": 1}) and \
+            not _event_shape_ok({"round": float("inf")}) and \
+            not _event_shape_ok({"round": 2.9}) and \
+            not _event_shape_ok({"task": 3}), "이벤트 형상 검사 오류"
         assert STAGNATION_EVALUATORS == ("gemini", "codex", "machine") and STAGNATION_ROUNDS == 2, \
             "정체 판정 축·연속 요건 변형"
         assert stagnation_target_rounds(2) == [1, 2] and stagnation_target_rounds(1) == [1] \
@@ -4830,7 +5404,17 @@ def main():
                          "4대 행동지침③). 미지정 시 티켓 byte-동일")
 
     ri = sub.add_parser("round-init"); ri.add_argument("--task", required=True)
-    rl = sub.add_parser("round-log")
+    rl = sub.add_parser(
+        "round-log",
+        help="라운드 장부에 평가자 행 기록(정체 종결 게이트 포함)",
+        description="라운드 행을 기록한다. **exit 계약**: 0=기록됨 · 1=기록됐고 기계검증 실패 · "
+                    "2=거부(**장부 행이 남지 않았다** — 사이드카에 짝 없는 고아 결속이 남을 수는 "
+                    "있으나 행 서수·행 식별자 대조에서 증거로 쓰이지 않는다) · "
+                    "%d=정체 종결로 새 라운드 거부(`--override \"<사유>\"` 로만 재개) · "
+                    "%d=**기록 여부 불확정**(쓰기 오류 + 되읽기 실패 — 눈으로 확인하라). "
+                    "리뷰어 행의 기록값 칸에는 증거 식별자 `vj:<sha256 앞 %d자>` 가 들어간다"
+                    "(등급이 아니라 그 행이 어느 verdict 파일로 났는지의 표식)."
+                    % (ROUND_LOG_EXIT_STAGNATION, ROUND_LOG_EXIT_UNKNOWN, ROW_TOKEN_HEX))
     rl.add_argument("--task", required=True); rl.add_argument("--round", type=int, required=True)
     rl.add_argument("--evaluator", required=True)   # --score 제거: §6-4 점수 금지 · §9-7-2 부수 1
     rl.add_argument("--verdict", default="")
