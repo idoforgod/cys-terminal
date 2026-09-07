@@ -297,6 +297,22 @@ class RoundStopReason(unittest.TestCase):
         self.assertIn("stop_reason=open", out)
         self.assertIn("파일 부재", out)
 
+    def test_binding_without_hash_is_not_evidence(self):
+        """해시 없는 결속은 증거가 아니다 — 경로만 가리키는 결속으로는 종결하지 못한다
+        (손편집·기록 시점 읽기 실패로 sha256 이 null/빈 값이 된 경우 · codex 위임 검체 발견)."""
+        self.seed_two_minor_rounds()
+        for blank in (None, ""):
+            evs = self.events()
+            for e in evs:
+                if e.get("event") == "verdict_src" and e.get("round") == 2:
+                    e["sha256"] = blank
+            with open(self.sidecar, "w", encoding="utf-8") as f:
+                for e in evs:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            out = self.status().stdout
+            self.assertIn("stop_reason=open", out)
+            self.assertIn("결속이 불완전", out)
+
     def test_slug_collision_does_not_inherit_foreign_stop(self):
         """슬러그가 충돌하는 다른 task 의 **종결을 물려받지 않는다** — 장부·사이드카는 공유되지만
         끈끈한 종결은 task 귀속으로 걸러진다(codex 위임 검체 발견)."""

@@ -2696,10 +2696,10 @@ def verdict_bindings(events, task):
     `gate_verdicts` 와 같은 규칙). 반환 (bindings, foreign_tasks)."""
     out, foreign = {}, set()
     for e in events:
-        if e.get("event") != "verdict_src":
-            continue
-        if e.get("task") != task:
-            foreign.add(str(e.get("task")))
+        t = e.get("task")
+        if t is not None and t != task:
+            foreign.add(str(t))       # 어떤 이벤트든 — 슬러그 충돌의 신호는 전부 모은다
+        if e.get("event") != "verdict_src" or t != task:
             continue
         std = evaluator_std(str(e.get("evaluator") or ""))
         try:
@@ -2742,10 +2742,18 @@ def load_verdict_evidence(task, rounds, specs=(), events=None):
             b = bindings.get((rnd, std))
             if not b:
                 continue
+            # ★해시 없는 결속은 증거가 아니다(codex 위임 검체 발견): `sha256` 이 null·빈 문자열이면
+            #   결속이 파일을 **가리키기만** 할 뿐 그 내용을 묶지 못한다 — 그 상태로 통과시키면
+            #   경로만 맞춘 낡은/바뀐 파일이 종결의 근거가 된다. 판정 불가로 접는다(fail-closed).
+            sha = str(b.get("sha256") or "").strip()
             path = explicit.get((rnd, std)) or b.get("path")
-            if not path:
+            if not sha or not path:
+                evidence[(rnd, std)] = {
+                    "ok": False, "verdict": None, "severities": [], "path": path or "",
+                    "why": "결속이 불완전하다(%s 없음) — 해시로 묶이지 않은 결속은 증거가 아니다"
+                           % ("sha256" if not sha else "경로")}
                 continue
-            evidence[(rnd, std)] = read_verdict_facts(path, expect_sha=b.get("sha256"))
+            evidence[(rnd, std)] = read_verdict_facts(path, expect_sha=sha)
     return evidence, notes
 
 
