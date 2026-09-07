@@ -6406,7 +6406,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .alert_route
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .snapshot(now);
+                // ★(리뷰 R1 · codex major) 창 계산은 **단조 초** 축이다(벽시계 `now` 가 아니다) —
+                //   NTP 보정 한 번에 routed_1h 가 0으로 비어 보이면 관측이 거짓말을 한다.
+                .snapshot(daemon.started_instant.elapsed().as_secs_f64());
             // W3.6 형해화 back-pressure: 발행자별 (요청, 거부) 카운터를 노출한다(임계 함께).
             let back_pressure: Value = {
                 let threshold = approval_backpressure_threshold();

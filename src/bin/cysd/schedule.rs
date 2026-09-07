@@ -16,6 +16,13 @@ const TICK_SECS: u64 = 30;
 /// alert 라우팅의 `"alert"` 와 **다른 값**이다: 같은 큐에 들어가도 출처가 다르다(스케줄 발화 ↔
 /// 데몬 경보). 배달 규칙은 origin 을 보지 않으므로 동작 차이는 없고 관측만 갈린다.
 const SCHEDULE_QUEUE_ORIGIN: &str = "schedule";
+/// ★(0.14.31 · 리뷰 R1 · codex blocking) 큐 경유가 **계약**인 push 의 action 이름.
+/// 구 데몬(`fire()` 의 match 가 push·command 뿐)은 이 action 을 `unknown action` 으로 거절한다 —
+/// 즉 데몬을 되돌려도 이 잡은 **주입되지 않는다**(게이트 없이 발화하느니 발화하지 않는 쪽).
+pub(crate) const ACTION_PUSH_QUEUED: &str = "push_queued";
+/// 구 데몬(v0.14.30 · 이 브랜치 이전)이 아는 action 전부 — 강등 안전성 핀의 대조군.
+#[cfg(test)]
+pub(crate) const LEGACY_ACTIONS: &[&str] = &["push", "command"];
 /// `via_queue` 적재의 활성 큐 상한 — 기존 enqueue 3경로와 **같은 100**(경보와 달리 보호선을
 /// 따로 두지 않는다: 시간당 1회 발화라 적체 축이 아니다).
 const SCHEDULE_QUEUE_CAP: usize = 100;
@@ -94,6 +101,17 @@ pub struct Job {
     pub via_queue: bool,
     #[serde(default)]
     pub launch: Option<LaunchSpec>,
+}
+
+impl Job {
+    /// 이 잡의 push 가 **큐를 경유해야 하는가**.
+    ///
+    /// 두 표현이 같은 뜻이다: ①`action:"push_queued"`(구 데몬이 **거절**하는 강등 안전 표현) ·
+    /// ②`via_queue:true`(추가-전용 필드 · 기존 잡의 opt-in). 새 builtin 은 ①을 쓰고 ②를 함께
+    /// 세운다 — 운영자가 action 을 손으로 `push` 로 되돌려도 신 데몬에서는 큐 경유가 유지된다.
+    pub fn uses_queue(&self) -> bool {
+        self.via_queue || self.action == ACTION_PUSH_QUEUED
+    }
 }
 
 /// schedule_state.json 영속 스키마 버전 — 추가-전용 마이그레이션의 기준점.
@@ -273,7 +291,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
         json!({
             "id": "cso-alert-inbox-check-60m",
             "every_minutes": 60,
-            "action": "push",
+            "action": ACTION_PUSH_QUEUED,
             "to": "cso",
             "if_absent": "skip",
             "via_queue": true,
@@ -312,6 +330,26 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
                 if !is_ours {
                     conflicts.push(id);
                     continue;
+                }
+                // ★(0.14.31 · 리뷰 R1 · codex blocking) **표적 마이그레이션: action 만 고친다.**
+                //   동버전 항목은 아래에서 무접촉인데, 우리 잡의 `action` 이 코드 정의와 달라진
+                //   경우(구 빌드가 `push` 로 심어 둔 그 잡)는 그대로 두면 **큐 우회 주입**이
+                //   남는다. 전역 버전 범프는 다른 builtin 전부를 코드 정의로 덮어 운영자 편집을
+                //   소실시키므로(§B-5 금지), 같은 id·같은 마커 항목의 **그 필드만** 고친다.
+                //   `via_queue` 도 함께 세워, 운영자가 action 을 되돌려도 신 데몬은 큐를 탄다.
+                if let Some(want_action) = bj.get("action").and_then(|v| v.as_str()) {
+                    if want_action == ACTION_PUSH_QUEUED
+                        && jobs[pos].get("action").and_then(|v| v.as_str()) != Some(want_action)
+                    {
+                        if let Some(o) = jobs[pos].as_object_mut() {
+                            o.insert("action".into(), serde_json::json!(want_action));
+                            o.insert("via_queue".into(), serde_json::json!(true));
+                        }
+                        changed = true;
+                        eprintln!(
+                            "[cysd] ensure_builtin_jobs: '{id}' 의 action 을 '{want_action}' 로 이관 — 큐 경유가 이 잡의 계약이다(직접 주입 차단)"
+                        );
+                    }
                 }
                 let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
                 if cur_ver != Some(want_ver) {
@@ -827,7 +865,11 @@ async fn fire(daemon: Arc<Daemon>, job: Job) {
         return;
     }
     let result = match job.action.as_str() {
-        "push" => fire_push(&daemon, &job).await,
+        // ★(0.14.31 · 리뷰 R1 · codex blocking) `push_queued` 는 **큐 경유가 계약인 push** 다.
+        //   `action:"push"` + `via_queue:true` 로만 표현하면 구 데몬(강등·롤백)이 미지 필드를
+        //   무시하고 **직접 주입**한다 — 초안·승인 대기 화면에 글자와 Return 이 꽂힌다.
+        //   구 데몬은 이 action 을 모르므로 `unknown action` 으로 **거절**한다(주입 0 · 안전 방향).
+        "push" | ACTION_PUSH_QUEUED => fire_push(&daemon, &job).await,
         "command" => fire_command(&daemon, &job).await,
         other => Err(format!("unknown action '{other}'")),
     };
@@ -976,11 +1018,12 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         let mut spec = spec.clone();
         spec.role = format!("{}-fresh-{}", spec.role, now_epoch() as u64);
         let sid = launch_via_cli(daemon, &spec).await?;
-        // ★(0.14.31 · WP-3 B) fresh 경로에도 같은 배달 선택을 적용한다 — 여기만 직접 주입으로
-        //   남기면 `via_queue` 잡이 fresh 옵션 하나로 게이트를 통째 우회한다(같은 계약의 구멍).
-        let how = deliver_push(daemon, job, sid, text)?;
         // TTL: fresh surface 누수 차단 — 지정(또는 반복 job 기본) 시간 후 자동 close.
         // 원샷+fresh는 명시 시에만, 반복(time)+fresh는 미설정이어도 기본 TTL로 회수한다.
+        // ★(0.14.31 · 리뷰 R1 · codex major) **기동 성공 직후·배달 시도 전**에 건다. 종전에는
+        //   `deliver_push(...)?` 뒤였고, 큐 경유가 추가되며 실패 사유(늦은 pause·큐 포화·좌석
+        //   소멸)가 늘어났다 — 그 조기 반환은 갓 띄운 좌석을 **회수 약속 없이** 남긴다
+        //   (반복 잡이면 매 발화마다 좌석이 단조 누적된다 = 자원 누수).
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
             tokio::spawn(async move {
@@ -988,9 +1031,16 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
                 let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
             });
         }
+        // ★(0.14.31 · WP-3 B) fresh 경로에도 같은 배달 선택을 적용한다 — 여기만 직접 주입으로
+        //   남기면 `via_queue` 잡이 fresh 옵션 하나로 게이트를 통째 우회한다(같은 계약의 구멍).
+        // 갓 띄운 좌석이 곧 대상이다 — 역할 결속은 이 잡의 계약이 아니다.
+        let how = deliver_push(daemon, job, sid, text, None)?;
         return Ok(format!("fresh-launched and {how} (surface:{sid})"));
     }
     let mut sid = daemon.roles.lock().unwrap().get(to).copied();
+    // 이 sid 가 **역할 맵에서** 나왔는가(=적재 시점 재검증 대상인가). `if_absent:launch` 로
+    // 새로 만든 좌석은 sid 자체가 대상이라 가드를 걸지 않는다.
+    let mut from_role_map = sid.is_some();
     // 대상 surface가 죽어 있거나 agent-backed가 아니면(빈 셸) 부재로 간주.
     // agent_meta=None인 surface(new-surface로 만든 빈 zsh 셸)에 자연어 프롬프트를 push하면
     // 셸이 명령으로 해석해 깨진다(예: '[heartbeat]…' → zsh no matches). launch-agent로 등록된
@@ -1006,6 +1056,7 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
             .unwrap_or(false);
         if !valid {
             sid = None;
+            from_role_map = false;
         }
     }
 
@@ -1032,7 +1083,8 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         }
     }
     let sid = sid.ok_or_else(|| format!("role '{to}' absent"))?;
-    let how = deliver_push(daemon, job, sid, text)?;
+    let guard = from_role_map.then(|| crate::alert_route::RoleGuard::Exact(to));
+    let how = deliver_push(daemon, job, sid, text, guard)?;
     Ok(format!("{how} to {to} (surface:{sid})"))
 }
 
@@ -1045,8 +1097,20 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
 /// 큐 경유는 배달 원장을 여기서 쓰지 않는다: 큐 배달 경로가 선기록(origin `queue`)과 영수증을
 /// 자기 시점에 남긴다(여기서 `record_audited` 를 또 하면 한 발화가 원장에 두 번 남는다).
 /// 큐 포화·좌석 소멸은 **에러**다 — 성공으로 보고하면 발화가 사라진 사실이 묻힌다.
-fn deliver_push(daemon: &Arc<Daemon>, job: &Job, sid: u64, text: &str) -> Result<&'static str, String> {
-    if !job.via_queue {
+///
+/// 【`role_guard`】 대상 sid 를 **역할 맵에서 골랐다면** 적재 시점에 그 결속이 아직 유효한지
+/// 다시 본다(리뷰 R1 · codex 추가지적). 역할 조회와 적재가 다른 트랜잭션이라, 그 사이에
+/// `claim_role` 인계가 끝나면 정기 점검이 **버려진 셸**로 들어간다. 갓 띄운 좌석(`fresh`·
+/// `if_absent:launch`)은 sid 자체가 대상이므로 가드를 걸지 않는다(걸면 launch 직후의
+/// 등록 지연이 곧 실패가 된다).
+fn deliver_push(
+    daemon: &Arc<Daemon>,
+    job: &Job,
+    sid: u64,
+    text: &str,
+    role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+) -> Result<&'static str, String> {
+    if !job.uses_queue() {
         inject(daemon, sid, text)?;
         return Ok("pushed");
     }
@@ -1054,9 +1118,14 @@ fn deliver_push(daemon: &Arc<Daemon>, job: &Job, sid: u64, text: &str) -> Result
         daemon,
         sid,
         text.to_string(),
-        Some(crate::alert_route::ALERT_FROM.to_string()),
+        // ★(0.14.31 · 리뷰 R1 · claude minor) 발신 라벨은 **그 잡** 이다. 종전에는 데몬 경보의
+        //   `"daemon"` 을 그대로 넘겨, 원장(`delivery::split_queue_from` → `from_label`)에
+        //   스케줄 발화가 데몬 경보로 찍혔다 — 스케줄 축으로 집계하는 소비자에게는 이 잡의
+        //   발화가 보이지 않았다. surface ref 형식이 아니므로 `from_label` 로 간다(§8 준수).
+        Some(format!("{SCHEDULE_QUEUE_ORIGIN}:{}", job.id)),
         SCHEDULE_QUEUE_ORIGIN,
         SCHEDULE_QUEUE_CAP,
+        role_guard,
     )
     .map(|_| "queued")
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
@@ -2308,7 +2377,14 @@ mod tests {
             .expect("WP-3 B 60분 점검 잡 부재")
             .clone();
         assert_eq!(j["every_minutes"].as_u64(), Some(60), "정본 '정기 60분 점검'");
-        assert_eq!(j["action"].as_str(), Some("push"), "CSO 좌석 앞 push 레인");
+        // ★(리뷰 R1 · codex blocking) **강등 안전**: 이 잡의 action 은 구 데몬이 **모르는** 이름이다.
+        //   `action:"push"` + `via_queue` 로만 표현하면 구 데몬(롤백)이 미지 필드를 무시하고
+        //   직접 주입한다 — 초안·승인 화면에 글자와 Return 이 꽂힌다.
+        assert_eq!(j["action"].as_str(), Some(ACTION_PUSH_QUEUED), "큐 경유가 계약인 push 레인");
+        assert!(
+            !LEGACY_ACTIONS.contains(&j["action"].as_str().unwrap()),
+            "구 데몬이 아는 action 이면 강등 시 게이트 없이 주입된다"
+        );
         assert_eq!(j["to"].as_str(), Some("cso"));
         assert_eq!(j["if_absent"].as_str(), Some("skip"), "좌석 부재는 에러가 아니다");
         assert_eq!(j["via_queue"].as_bool(), Some(true), "이 잡만 큐 경유(게이트 통과)");
@@ -2363,7 +2439,7 @@ mod tests {
 
     /// ★배달 선택은 대상 좌석이 확정된 **뒤** 한 지점에서만 갈린다 — `fresh` 경로와 일반 경로가
     /// **같은 함수**를 부르지 않으면 `fresh: true` 하나로 게이트를 통째 우회할 수 있다.
-    /// (소스 핀: 이 배선은 async 경로라 단위 검체로 두 갈래를 동시에 재현하기 어렵다.)
+    /// (소스 핀 — 행동 검체는 아래 `deliver_push_branches_are_observable` 가 진다.)
     #[test]
     fn source_pin_both_push_paths_share_one_delivery_choice() {
         let src = include_str!("schedule.rs");
@@ -2376,7 +2452,7 @@ mod tests {
             .expect("deliver_push 소실");
         let body = &src[at..end];
         assert_eq!(
-            body.matches("deliver_push(daemon, job, sid, text)").count(),
+            body.matches("deliver_push(daemon, job, sid, text,").count(),
             2,
             "fresh 경로와 일반 경로 **양쪽**이 같은 배달 선택을 타야 한다"
         );
@@ -2384,10 +2460,148 @@ mod tests {
             !body.contains("inject(daemon, sid, text)?;"),
             "fire_push 안에 직접 주입이 남아 있다(via_queue 가 우회된다)"
         );
-        // fresh 의 TTL 회수 배선이 큐 분기로 인해 생략되지 않았는지(좌석 누수 방지).
-        assert!(
-            body.contains("effective_close_ttl(job)"),
-            "fresh TTL 회수 배선이 사라졌다(surface 누수)"
+        // ★fresh 의 TTL 회수 배선은 **배달 시도보다 앞**에 있어야 한다(리뷰 R1 · codex major):
+        //   뒤에 있으면 배달 실패(늦은 pause·큐 포화·좌석 소멸)의 조기 반환이 갓 띄운 좌석을
+        //   회수 약속 없이 남긴다 — 반복 잡이면 발화마다 좌석이 누적된다.
+        let ttl_at = body.find("effective_close_ttl(job)").expect("fresh TTL 회수 배선이 사라졌다");
+        let deliver_at = body.find("deliver_push(daemon, job, sid, text,").expect("배달 호출 소실");
+        assert!(ttl_at < deliver_at, "TTL 회수 등록이 배달 시도 뒤에 있다(실패 시 좌석 누수)");
+    }
+
+    /// ★행동 검체(리뷰 R1 · codex major): `deliver_push` 의 **두 분기를 실제로 실행**해
+    /// 큐 적재와 직접 주입을 관측한다. 소스 문자열 검체만으로는 `deliver_push` 를 항상 주입으로
+    /// 바꿔도 호출 문자열이 그대로라 초록이었다.
+    #[test]
+    fn deliver_push_branches_are_observable() {
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("cso".into()), 24, 80)
+            .expect("좌석 생성");
+        daemon.roles.lock().unwrap().insert("cso".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let depth = || s.pending_queue.lock().unwrap().len();
+
+        // ① 직접 주입 분기 — 큐에는 아무것도 남지 않는다(§8 "스케줄 push 는 큐를 우회한다").
+        let direct: Job = serde_json::from_value(json!({
+            "id": "direct", "action": "push", "to": "cso", "text": "x"
+        }))
+        .unwrap();
+        assert!(!direct.uses_queue());
+        assert_eq!(deliver_push(&daemon, &direct, s.id, "[schedule direct] 본문", None), Ok("pushed"));
+        assert_eq!(depth(), 0, "직접 주입이 큐에 적재됐다(경로가 뒤바뀌었다)");
+
+        // ② 큐 경유 분기 — 좌석 활성 큐에 남고 **주입은 배달자(게이트 통과 후)가 한다**.
+        let queued: Job = serde_json::from_value(json!({
+            "id": "cso-alert-inbox-check-60m", "action": ACTION_PUSH_QUEUED, "to": "cso", "text": "x"
+        }))
+        .unwrap();
+        assert!(queued.uses_queue(), "action 만으로도 큐 경유여야 한다(via_queue 필드 없이)");
+        assert_eq!(
+            deliver_push(&daemon, &queued, s.id, "[schedule cso-alert-inbox-check-60m] 점검", None),
+            Ok("queued")
         );
+        assert_eq!(depth(), 1, "큐 경유가 적재하지 않았다");
+        let e = s.pending_queue.lock().unwrap()[0].clone();
+        assert_eq!(e.origin, "schedule", "큐 항목의 경로 태그가 schedule 이 아니다");
+        // ★발신 라벨은 **그 잡**이다(종전 "daemon" → 원장에서 스케줄 발화가 데몬 경보로 찍혔다).
+        assert_eq!(e.from.as_deref(), Some("schedule:cso-alert-inbox-check-60m"));
+        // surface ref 형식이 아니므로 원장에서는 from_label 로 간다(§8 from 계약 준수).
+        let (from, label) = crate::delivery::split_queue_from(e.from.as_deref());
+        assert_eq!(from, None, "임의 문자열이 원장 from(surface ref)에 들어갔다");
+        assert_eq!(label.as_deref(), Some("schedule:cso-alert-inbox-check-60m"));
+
+        // ③ 역할 가드 — 대상을 역할로 골랐다면 인계 뒤 적재는 거절된다.
+        daemon.roles.lock().unwrap().insert("cso".into(), s.id + 9_999);
+        let err = deliver_push(
+            &daemon,
+            &queued,
+            s.id,
+            "[schedule x] y",
+            Some(crate::alert_route::RoleGuard::Exact("cso")),
+        )
+        .expect_err("인계된 뒤에도 버려진 셸에 적재됐다");
+        assert!(err.contains("role_changed"), "실패 사유가 인계 경쟁이 아니다: {err}");
+        assert_eq!(depth(), 1, "거절인데 항목이 늘었다");
+        let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::Reap);
+    }
+
+    /// ★강등 실행 검체(리뷰 R1 · codex blocking): 구 데몬의 `fire()` 는 action 을
+    /// `push`·`command` 로만 분기하고 나머지는 `unknown action` 에러다. 이 잡의 action 이
+    /// 그 집합에 들어가는 순간 **롤백한 데몬이 게이트 없이 주입한다**.
+    #[test]
+    fn a_downgraded_daemon_rejects_the_queue_job_instead_of_injecting() {
+        // 구 데몬의 분기를 그대로 재현한 순수 함수(그쪽 코드는 여기서 실행할 수 없다).
+        fn legacy_dispatch(action: &str) -> Result<&'static str, String> {
+            match action {
+                "push" => Ok("fire_push"),
+                "command" => Ok("fire_command"),
+                other => Err(format!("unknown action '{other}'")),
+            }
+        }
+        let mut jobs: Vec<serde_json::Value> = Vec::new();
+        apply_builtin_jobs(&mut jobs);
+        let j = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("cso-alert-inbox-check-60m"))
+            .expect("점검 잡 부재");
+        let action = j["action"].as_str().unwrap();
+        assert!(
+            legacy_dispatch(action).is_err(),
+            "구 데몬이 이 잡을 실행한다 — 강등이 곧 게이트 우회다"
+        );
+        // 신 데몬은 두 표현 모두 큐 경유로 읽는다.
+        for a in [ACTION_PUSH_QUEUED, "push"] {
+            let job: Job = serde_json::from_value(json!({
+                "id": "x", "action": a, "to": "cso", "text": "t",
+                "via_queue": a == "push"
+            }))
+            .unwrap();
+            assert!(job.uses_queue(), "{a} 가 큐 경유로 읽히지 않았다");
+        }
+        // 다른 builtin(직접 주입이 계약인 잡)은 여전히 구 데몬이 아는 action 이다 — 무회귀.
+        for other in jobs.iter().filter(|x| x["id"].as_str() != Some("cso-alert-inbox-check-60m")) {
+            let a = other["action"].as_str().unwrap();
+            assert!(LEGACY_ACTIONS.contains(&a), "{} 의 action 이 바뀌었다: {a}", other["id"]);
+        }
+    }
+
+    /// ★표적 마이그레이션(리뷰 R1 · codex blocking): 구 빌드가 심어 둔 **동버전** 잡은
+    /// `apply_builtin_jobs` 가 무접촉으로 지나간다 — 그러면 저장된 `action:"push"` 가 남아
+    /// 큐 우회 주입이 계속된다. 전역 버전 범프는 §B-5 금지(다른 builtin 의 운영자 편집 소실)이므로
+    /// **같은 id·같은 마커 항목의 그 필드만** 고친다.
+    #[test]
+    fn stored_legacy_push_action_is_migrated_in_place_without_a_version_bump() {
+        let mut jobs: Vec<serde_json::Value> = vec![json!({
+            "id": "cso-alert-inbox-check-60m",
+            "every_minutes": 120,                       // 운영자가 손으로 고친 주기
+            "action": "push",                            // 구 빌드가 심은 값
+            "to": "cso",
+            "if_absent": "skip",
+            "via_queue": true,
+            "text": "운영자가 고친 문안",
+            "_builtin": "alert",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        })];
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        assert!(changed, "저장된 구 action 이 그대로 남았다(강등 시 게이트 우회)");
+        assert!(conflicts.is_empty());
+        let j = &jobs[0];
+        assert_eq!(j["action"].as_str(), Some(ACTION_PUSH_QUEUED));
+        assert_eq!(j["via_queue"].as_bool(), Some(true));
+        // ★운영자 편집은 **그대로** 남는다(통째 교체가 아니라 그 필드만 고쳤다는 증거).
+        assert_eq!(j["every_minutes"].as_u64(), Some(120), "운영자 주기 편집이 소실됐다");
+        assert_eq!(j["text"].as_str(), Some("운영자가 고친 문안"), "운영자 문안이 소실됐다");
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
+        // 재실행 무접촉(멱등).
+        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        assert!(!c2, "이관 뒤 재실행이 또 바꾼다(비멱등)");
+        // 사용자가 그 id 를 선점한 경우(마커 불일치)는 손대지 않는다 — 종전 계약 불변.
+        let mut theirs: Vec<serde_json::Value> = vec![json!({
+            "id": "cso-alert-inbox-check-60m", "action": "push", "to": "master"
+        })];
+        let (c3, conf3) = apply_builtin_jobs(&mut theirs);
+        assert!(!c3 || theirs[0]["action"].as_str() == Some("push"));
+        assert_eq!(theirs[0]["action"].as_str(), Some("push"), "사용자 잡의 action 을 바꿨다");
+        assert!(conf3.contains(&"cso-alert-inbox-check-60m".to_string()), "선점 conflict 미보고");
     }
 }

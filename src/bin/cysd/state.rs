@@ -2321,6 +2321,11 @@ pub struct Daemon {
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
+    /// ★(0.14.31 · 리뷰 R1 · codex major) **단조 기동 기준점**. `started_at`(epoch)은 벽시계라
+    /// NTP 보정·수동 시각 변경에 앞뒤로 뛴다 — 경과시간 창(부트 유예·쿨다운·시간당 상한)을
+    /// epoch 차로 재면 "두 시간 앞으로 보정" 한 번에 상한 창이 통째 비고, "하루 뒤로 보정" 은
+    /// 300초 유예를 하루로 늘린다. 경과는 이 `Instant` 로만 잰다(epoch 는 보고·영속 전용).
+    pub started_instant: std::time::Instant,
     /// 세션 트랜스크립트 FTS 영속 채널 (전용 writer 스레드)
     pub recall_tx: Mutex<std::sync::mpsc::Sender<crate::recall::LineRecord>>,
     /// T6 Control Center 소비 트래커 (claude 메시지 누적 — 오늘·최근창·12h 스파크라인).
@@ -3141,6 +3146,7 @@ impl Daemon {
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
             started_at: now_epoch(),
+            started_instant: Instant::now(),
             consumption: Mutex::new(Consumption::default()),
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),

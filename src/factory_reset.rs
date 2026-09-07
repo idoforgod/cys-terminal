@@ -123,8 +123,9 @@ const WIN_STATE_EXACT: [&str; 21] = [
 ];
 
 /// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
-const WIN_STATE_PREFIX: [&str; 7] = [
+const WIN_STATE_PREFIX: [&str; 8] = [
     "cys-dept-",          // 부서 데몬 슬러그 디렉토리(state.rs pipe_slug 규약)
+    "alert-route",        // ★(0.14.31 WP-3 B) alert-route-pending.json · -folded.jsonl(+.1·.corrupt)
     "phoenix",            // phoenix/ · phoenix-embed/
     "office-bridge",      // office-bridge/ · office-bridge.log
     "report_gate",        // report_gate*/badges.json 레인
