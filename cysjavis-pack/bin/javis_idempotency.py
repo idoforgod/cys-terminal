@@ -36,6 +36,14 @@ OBSERVE_VERBS = frozenset({          # 부작용 없음 — 관찰 경로 허용
     # ③실측: 3회 연속 실행 후 ~/.cys 쓰기 0(대조군 동일). cmd_check 관찰 경로의 정당한 호출
     # (어댑터 감지 단일 오라클 · javis_orchestra.py:225).
     "agent-detect",
+    # ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) 'gate-corpus' — 첫기동 관문 코퍼스 보고(신설).
+    # 읽기 전용 실측 근거(3중): ①Rust 구현 run_gate_corpus(cys.rs)는 resolve_gate_corpus →
+    # first_run_gates::report_json → println 뿐 — 데몬 RPC·서브프로세스·send_key·파일 쓰기 0
+    # (소스 핀 gate_corpus_verb_is_a_daemon_free_subprocess_free_observation_source_pin 이 집행).
+    # ②실측 2026-09-08: `CYS_SOCKET=/nonexistent/nope.sock cys gate-corpus --json` 이 exit 0
+    # (데몬 무의존). ③버전을 스스로 재지 않는다 — `--detected-version` 을 호출부가 넣는다.
+    # 소비자: preflight C82.gate-corpus-drift(팩 레인).
+    "gate-corpus",
 })
 MUTATE_VERBS = frozenset({           # 상태 변경 — repair/실행 의도 뒤에서만
     "new-surface", "send", "send-key", "set-status",

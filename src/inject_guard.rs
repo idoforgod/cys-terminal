@@ -1264,4 +1264,35 @@ mod tests {
         assert!(crate::readiness::modal_signature(fixtures::LIVE_PERMISSION_PROMPT).is_some());
         assert!(crate::readiness::modal_signature("Yes, I trust this folder ✔\n").is_none());
     }
+
+    /// ★(0.14.31 · WP-1 H-2 · **실측**) 2026-09-08 격리 계측에서 claude 2.1.261 이 실제로 그린
+    /// **코퍼스 밖 모달**(커스텀 API 키 확인창 · 기본 포커스가 `No (recommended)` · 번호 없음)이
+    /// 주입 가드에서도 보류된다.
+    ///
+    /// 【왜 이 검체가 필요한가】 H-1 의 모달 축은 그때까지 **파생 검체**로만 증명돼 있었다
+    /// (관문 화면을 잘라 만든 것). 이 화면은 지어낸 것이 아니라 벤더가 실제로 그린 것이고,
+    /// 코퍼스의 needle 도 위젯 라벨도 하나도 걸리지 않는데 **푸터 어휘만으로** 보류된다 —
+    /// "코퍼스에 없는 새 관문에 Return 이 나가지 않는다" 의 실측 증거다.
+    ///
+    /// 【확인 허가도 닫힌다】 자동확인은 지목 관문으로 **식별**돼야 열리는데 이 화면은 미식별이다
+    /// (`ConfirmDenied::Unidentified`). 번호 없는 선택 위젯이라 종전 `❯ N.` 축으로는 잡히지 않는
+    /// 형상이기도 하다 — 그래서 푸터 축(ⓑ)이 유일한 그물이다.
+    #[test]
+    fn measured_2_1_261_vendor_modal_outside_the_corpus_is_held_and_never_confirmed() {
+        let gs = gates();
+        let screen = fixtures::CUSTOM_API_KEY_MODAL_2_1_261;
+        assert!(first_run_gates::identify(&gs, screen).is_none(), "코퍼스가 이 화면을 관문으로 오탐했다");
+        let sig = crate::readiness::modal_signature(screen).expect("실측 모달이 모달로 안 읽혔다");
+        assert!(sig.kinds.contains(&"confirm-cancel-footer"), "푸터 축이 아니라 다른 축이 잡았다: {:?}", sig.kinds);
+        assert!(!sig.cursor_on_exit, "`No (recommended)` 는 종료 라벨 전문이 아니다(어휘 과확장 금지)");
+        match decide(&obs(screen, &gs)) {
+            Decision::Hold(h) => assert_eq!(h.id, crate::readiness::MODAL_UNKNOWN_ID),
+            other => panic!("실측 벤더 모달에 주입이 허용됐다: {other:?}"),
+        }
+        assert_eq!(
+            confirm_denied(&obs(screen, &gs), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::Unidentified),
+            "미식별 화면에서 확인이 열렸다"
+        );
+    }
 }

@@ -691,6 +691,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) 첫기동 관문 코퍼스를 있는 그대로 낸다 —
+    /// **데몬 무의존 · 서브프로세스 0 · 키 0**. 소비자는 preflight `C82.gate-corpus-drift`
+    /// (`claude --version` ≠ `measured_on` → WARN)와 사람이다.
+    ///
+    /// `measured_on` 은 **언제나 코드 내장 상수**이고, 봉투가 일부 관문만 덮은 혼합 상태는
+    /// `effective_measured_on: null` + `mixed_versions: true` 로 드러낸다(한 필드가 상황에 따라
+    /// 뜻을 바꾸면 하류는 어느 쪽도 믿을 수 없다).
+    #[command(name = "gate-corpus")]
+    GateCorpus {
+        /// 기계 판독 JSON:
+        /// `{"measured_on","effective_measured_on","mixed_versions","source","source_detail",
+        ///   "agent","detected_version","notes",
+        ///   "gates":[{"id","title","passability","measured_on","origin","absence_cost",
+        ///             "default_index","action","down_presses","absence_is_fatal"}]}`
+        #[arg(long)]
+        json: bool,
+        /// 어댑터 이름 — 코드 정본 코퍼스는 **claude 실측**이다(`MEASURED_ON` 도 claude 버전).
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// 지금 도는 바이너리 버전(예: `claude --version` 의 값). 주면 관문마다 버전 핀 판정
+        /// (`policy`)을 함께 낸다. ★주지 않으면 넣지 않는다 — 묻지 않은 것을 관측 결과로
+        /// 인쇄하면 "버전을 재지 못했다" 는 사실처럼 읽힌다.
+        #[arg(long)]
+        detected_version: Option<String>,
+    },
     /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출.
     /// 새로 만드는 파일에는 선언 블록 v1 한 줄이 **자동 동봉**된다(집계기는 파일명이 아니라 이 선언으로 귀속을 판정한다).
     TodoPath {
@@ -1923,6 +1948,65 @@ fn gate_corpus_for_seat(agent: Option<&str>) -> Vec<cys::first_run_gates::Gate> 
         Some(a) => resolve_gate_corpus(a).gates,
         None => cys::first_run_gates::builtin(),
     }
+}
+
+/// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) `cys gate-corpus` — 첫기동 관문 코퍼스를 있는 그대로 낸다.
+///
+/// 【무엇을 위한 동사인가】 코퍼스는 지금까지 **코드 안에만** 있었다. 그래서 "이 기계가 도는
+/// claude 버전이 코퍼스가 실측된 버전과 같은가" 를 물을 수 있는 자리가 없었고, 그 물음의 부재가
+/// 감사 에러 4 의 한 층이었다(2.1.241 코퍼스 · 2.1.26x 좌석 · 아무도 안 물음). preflight
+/// `C82.gate-corpus-drift` 가 이 출력의 `measured_on` 을 `claude --version` 과 대조한다.
+///
+/// 【이 동사가 하지 않는 것 — 관측 동사의 정직성】
+///   · 데몬에 붙지 않는다(부트 전·데몬 사망 중에도 답이 나와야 진단이다).
+///   · 서브프로세스를 띄우지 않는다 — **버전을 스스로 재지 않는다.** `--detected-version` 을
+///     주지 않으면 `policy` 를 아예 넣지 않는다. `claude --version` 을 여기서 부르면 그 값은
+///     PATH 의 바이너리이지 **좌석이 실제로 실행한 바이너리**가 아니다(codex 설계 검토 Q2).
+///   · 좌석에 키를 보내지 않는다. 이 동사는 `javis_idempotency.py` 에서 OBSERVE 다.
+///
+/// 【코퍼스는 단일 소스를 지난다】 [`resolve_gate_corpus`] — `agents.json` override 봉투가
+/// 도달하는 그 경로다. 여기서 `builtin()` 을 직접 집으면 운영자가 봉투로 고친 코퍼스와 보고서가
+/// 갈리고, 그 순간 보고서는 진단이 아니라 소문이 된다(BLOCK-3 형태).
+fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
+    let resolved = resolve_gate_corpus(agent);
+    let report = cys::first_run_gates::report_json(&resolved, agent, detected);
+    if as_json {
+        println!("{report}");
+        return 0;
+    }
+    println!(
+        "gate-corpus  agent={agent}  source={}  measured_on={}  effective={}  gates={}",
+        report["source"].as_str().unwrap_or("?"),
+        report["measured_on"].as_str().unwrap_or("?"),
+        report["effective_measured_on"].as_str().unwrap_or("(혼합)"),
+        report["gates"].as_array().map(|a| a.len()).unwrap_or(0),
+    );
+    if let Some(v) = detected {
+        println!("detected_version={v}");
+    }
+    for g in report["gates"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let down = g["down_presses"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  {:<28} {:<10} default={:<4} down={:<3} action={:<28} absence={:<11} measured_on={}{}",
+            g["id"].as_str().unwrap_or("?"),
+            g["passability"].as_str().unwrap_or("?"),
+            g["default_index"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            down,
+            g["action"]["label"].as_str().unwrap_or("-"),
+            g["absence_cost"].as_str().unwrap_or("?"),
+            g["measured_on"].as_str().unwrap_or("?"),
+            g["policy"]["kind"].as_str().map(|k| format!("  policy={k}")).unwrap_or_default(),
+        );
+    }
+    for n in report["notes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        if let Some(s) = n.as_str() {
+            println!("  note: {s}");
+        }
+    }
+    0
 }
 
 /// ★U-14 주입·제출 가드 — **부트 경로 전용**(생애 창을 상수로 연다 · 코퍼스는 해소본).
@@ -3915,6 +3999,9 @@ fn run(command: Command) -> i32 {
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd, json } => return run_boot(cwd, json),
         Command::AgentDetect { json } => return run_agent_detect(json),
+        Command::GateCorpus { json, agent, detected_version } => {
+            return run_gate_corpus(&agent, json, detected_version.as_deref())
+        }
         Command::TodoPath { role, emit_decl } => return run_todo_path(role, emit_decl),
 
         Command::SurfaceRole => return run_surface_role(),
@@ -23679,6 +23766,54 @@ mod tests {
     /// 【결함 4(P4-6)】 화면 관측 실패가 `""` 로 접혀 '관문 없음' 과 구별되지 않았고 **로그가
     /// 0** 이었다. fail-open 은 선택일 수 있어도 fail-silent 는 아니다 — 그물이 없는 것과 그물이
     /// 눈을 감은 것은 밖에서 구별되지 않고, 그래서 아무도 고치지 않는다.
+    /// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) `cys gate-corpus` 는 **관측 동사**다 — 소스 핀.
+    ///
+    /// 【왜 소스로 박제하는가】 이 동사의 계약은 "출력이 맞다" 가 아니라 **"아무것도 건드리지
+    /// 않는다"** 이다. 그 성질은 산출 JSON 을 아무리 들여다봐도 보이지 않는다(부작용은 결과에
+    /// 안 실린다). 그리고 이 동사는 `javis_idempotency.py` 의 OBSERVE 집합에 등재돼 관찰
+    /// 경로에서 **호출이 허용**되므로, 여기 데몬 RPC 나 서브프로세스가 한 줄 들어오는 순간
+    /// 그 등재가 거짓말이 된다(관찰 경로가 상태를 바꾼다).
+    ///
+    /// 【코퍼스 단일 소스】 위 핀이 집행하는 `resolve_gate_corpus` 를 이 동사도 지난다 —
+    /// `builtin()` 을 직접 집으면 운영자의 `agents.json` 봉투가 보고서에만 도달하지 않아
+    /// "고쳤는데 진단은 옛 값" 이 된다.
+    #[test]
+    fn gate_corpus_verb_is_a_daemon_free_subprocess_free_observation_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let i = prod
+            .find("fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {")
+            .expect("gate-corpus 동사 본체가 사라졌다(CONTRACTS §C)");
+        let end = prod[i..]
+            .find("\n/// ★U-14 주입")
+            .map(|e| i + e)
+            .unwrap_or_else(|| (i + 4000).min(prod.len()));
+        let body = &prod[i..end];
+        assert!(body.contains("resolve_gate_corpus("), "관문 코퍼스 단일 소스를 지나지 않는다");
+        assert!(
+            !body.contains("cys::first_run_gates::builtin()"),
+            "보고서가 코드 정본을 직접 집는다 — override 봉투가 이 경로에만 도달하지 않는다"
+        );
+        for forbidden in [
+            "request(",            // 데몬 RPC
+            "std::process::Command", // 서브프로세스(= 스스로 버전을 재는 것)
+            "send_key",
+            "inject_text",
+            "std::fs::write",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "관측 동사가 `{forbidden}` 를 쓴다 — idempotency OBSERVE 등재가 거짓이 된다"
+            );
+        }
+        // 버전은 **호출부가 재서 넣는다**. 인자가 없으면 정책을 인쇄하지 않는다(묻지 않은 것을
+        // 관측 결과로 내지 않는다 — `report_json` 의 같은 규율).
+        assert!(
+            body.contains("detected") && prod.contains("detected_version: Option<String>"),
+            "`--detected-version` 계약이 사라졌다"
+        );
+    }
+
     #[test]
     fn gate_corpus_has_a_single_production_source_and_observation_failure_is_loud_source_pin() {
         let src = include_str!("cys.rs");

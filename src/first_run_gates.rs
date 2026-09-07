@@ -755,6 +755,156 @@ pub struct Resolved {
     pub source: Source,
 }
 
+/// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) **관문 코퍼스 보고서** — `cys gate-corpus --json` 의 봉투.
+///
+/// 【왜 CLI 가 아니라 여기인가】 코퍼스의 어휘(`passability`·`absence_cost`·`origin`·`source`)를
+/// 소유한 것은 이 모듈이다. 문자열을 CLI 에서 다시 지으면 override 봉투가 읽는 어휘
+/// ([`parse_passability`]·[`parse_absence_cost`])와 **두 벌**이 되고, 그 순간 보고서는 봉투로
+/// 되먹일 수 없는 방언이 된다. 그래서 산출 문자열은 봉투 파서가 **되읽을 수 있는 값**과 같다.
+///
+/// 【`measured_on` 두 필드의 의미 분리(codex 설계 검토 Q4)】
+///   · `measured_on` — **언제나 코드 내장 상수**([`MEASURED_ON`]). 상태에 따라 뜻이 바뀌지 않는
+///     안정 앵커이며, preflight `C82.gate-corpus-drift` 가 `claude --version` 과 대조하는 값이다.
+///   · `effective_measured_on` — 해소된 코퍼스 **전 관문이 같은 값을 주장할 때만** 그 문자열,
+///     봉투가 일부 관문만 덮어 **혼합**이면 `null`. 한 필드가 상황에 따라 '내장' 이었다가
+///     '유효' 였다가 하면 하류는 어느 쪽도 믿을 수 없다 — 그래서 필드를 나눈다.
+///   · `mixed_versions` — **두 값 이상이 섞였는가**(`versions.len() > 1`). `effective` 가 `null` 인
+///     경우가 둘(혼합 · 관문 0개=도달 불가)이라 그 둘을 이 플래그가 가른다 — `null` 하나로는
+///     "섞였다" 와 "잴 것이 없다" 가 구별되지 않는다.
+///
+/// 【`policy` 는 요청했을 때만】 `detected` 가 없으면 필드를 **넣지 않는다**. 넣으면 전 관문이
+/// `held_version_unknown` 이 되어 "버전을 재지 못했다" 는 사실처럼 읽히는데, 실제로는 **묻지
+/// 않은 것**이다(관측하지 않은 것을 관측 결과로 인쇄하지 않는다).
+///
+/// 【이 함수는 순수하다】 파일·데몬·서브프로세스 접촉 0. 버전은 **호출부가 재서 넣는다**.
+pub fn report_json(resolved: &Resolved, agent: &str, detected: Option<&str>) -> Value {
+    let versions: std::collections::BTreeSet<&str> =
+        resolved.gates.iter().map(|g| g.measured_on.as_str()).collect();
+    // 유효 버전은 **전 관문이 한 값을 주장할 때만** 잡힌다. 0개(도달 불가 — 해소기가 빈 코퍼스를
+    // 돌려주지 않는다)는 '미상'이지 '혼합'이 아니므로 `mixed_versions` 는 `len > 1` 로 따로 센다.
+    let effective: Option<&str> = if versions.len() == 1 {
+        versions.iter().next().copied()
+    } else {
+        None
+    };
+    let gates: Vec<Value> = resolved
+        .gates
+        .iter()
+        .map(|g| {
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), Value::from(g.id.as_str()));
+            o.insert("title".into(), Value::from(g.title.as_str()));
+            o.insert("passability".into(), Value::from(passability_str(g.passability)));
+            o.insert("measured_on".into(), Value::from(g.measured_on.as_str()));
+            o.insert("origin".into(), Value::from(origin_str(g.origin)));
+            o.insert(
+                "absence_cost".into(),
+                Value::from(absence_cost_str(g.absence_cost)),
+            );
+            o.insert(
+                "default_index".into(),
+                g.default_index.map(Value::from).unwrap_or(Value::Null),
+            );
+            o.insert(
+                "action".into(),
+                match g.action.as_ref() {
+                    None => Value::Null,
+                    Some(a) => serde_json::json!({
+                        "select_index": a.select_index,
+                        "label": a.label,
+                        "literal": a.literal,
+                    }),
+                },
+            );
+            o.insert(
+                "down_presses".into(),
+                g.down_presses().map(Value::from).unwrap_or(Value::Null),
+            );
+            o.insert("absence_is_fatal".into(), Value::from(g.absence_is_fatal()));
+            if let Some(v) = detected {
+                o.insert("policy".into(), action_policy_json(&action_policy(g, Some(v))));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    serde_json::json!({
+        "agent": agent,
+        "source": source_kind(&resolved.source),
+        "source_detail": source_detail(&resolved.source),
+        "measured_on": MEASURED_ON,
+        "effective_measured_on": effective,
+        "mixed_versions": versions.len() > 1,
+        "detected_version": detected,
+        "notes": resolved.notes,
+        "gates": gates,
+    })
+}
+
+/// 봉투 파서([`parse_passability`])가 **되읽을 수 있는** 문자열.
+fn passability_str(p: Passability) -> &'static str {
+    match p {
+        Passability::Machine => "machine",
+        Passability::HumanOnly => "human_only",
+    }
+}
+
+/// 봉투 파서([`parse_absence_cost`])가 **되읽을 수 있는** 문자열.
+fn absence_cost_str(c: AbsenceCost) -> &'static str {
+    match c {
+        AbsenceCost::Fatal => "fatal",
+        AbsenceCost::Recoverable => "recoverable",
+    }
+}
+
+fn origin_str(o: Origin) -> &'static str {
+    match o {
+        Origin::Builtin => "builtin",
+        Origin::Overridden => "overridden",
+        Origin::Added => "added",
+    }
+}
+
+/// 해소 출처의 **종류**. 회계 수치는 [`source_detail`] 이 따로 낸다 — 한 필드에 종류와 수치를
+/// 섞어 넣으면(`"merged(overridden=1,…)"`) 하류가 그 문자열을 되파싱하게 되고, 되파싱은 다음 판에
+/// 반드시 깨진다.
+fn source_kind(s: &Source) -> &'static str {
+    match s {
+        Source::Builtin => "builtin",
+        Source::Merged { .. } => "merged",
+        Source::Replaced { .. } => "replaced",
+        Source::OverrideDisabled => "override_disabled",
+    }
+}
+
+fn source_detail(s: &Source) -> Value {
+    match s {
+        Source::Builtin | Source::OverrideDisabled => Value::Null,
+        Source::Merged { overridden, added } => {
+            serde_json::json!({"overridden": overridden, "added": added})
+        }
+        Source::Replaced { count } => serde_json::json!({"count": count}),
+    }
+}
+
+/// [`ActionPolicy`] 를 **타입 그대로** 실은 JSON. 하류가 사유 문자열을 되파싱하지 않게 `kind` 를 둔다.
+fn action_policy_json(p: &ActionPolicy) -> Value {
+    match p {
+        ActionPolicy::Allowed { down, literal, label } => serde_json::json!({
+            "kind": "allowed", "down": down, "literal": literal, "label": label,
+        }),
+        ActionPolicy::HumanRequired { reason } => serde_json::json!({
+            "kind": "human_required", "reason": reason,
+        }),
+        ActionPolicy::HeldNoAction => serde_json::json!({"kind": "held_no_action"}),
+        ActionPolicy::HeldVersionDrift { measured_on, detected } => serde_json::json!({
+            "kind": "held_version_drift", "measured_on": measured_on, "detected": detected,
+        }),
+        ActionPolicy::HeldVersionUnknown { measured_on } => serde_json::json!({
+            "kind": "held_version_unknown", "measured_on": measured_on,
+        }),
+    }
+}
+
 /// ★env 를 읽는 **유일한 지점**(롤백 스위치 1지점 규약).
 pub fn override_enabled() -> bool {
     override_enabled_from(std::env::var(OVERRIDE_ENV).ok().as_deref())
@@ -1510,7 +1660,112 @@ pub mod fixtures {
         \x20 Opus 5 · CTX 35% · 7d 33%                                                  \n\
         \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
 
+    // ── ★2026-09-08 실측(WP-1 H-2 · claude 2.1.261/2.1.263 · 격리 CLAUDE_CONFIG_DIR) ──────
+    //
+    // 【무엇을 쟀나】 버려 쓰는 `CLAUDE_CONFIG_DIR` 로 claude 2.1.261 을 격리 데몬의 PTY 좌석에
+    // 띄우고 화면만 읽었다. 본 관문은 **theme · login-method 둘뿐**이다 — 그 다음은
+    // `login-method`(HumanOnly · action 없음)의 벽이라 기계가 넘을 키가 없다. 그래서
+    // 폴더신뢰·면책·fullscreen 은 **못 봤고**, [`MEASURED_ON`] 도 folder-trust 선언도
+    // 이 회차에서 움직이지 않는다(정본 §4 H-2 "부분 실측이면 핀을 올리지 않는다").
+    //
+    // 【왜 더하기만 하는가】 2.1.241 픽스처는 그 버전의 **역사적 관측**이다. 덮어쓰면 그때의
+    // 증거가 사라지고, 두 버전 사이의 드리프트를 다시는 대조할 수 없다(§3-8).
+
+    /// ★실측(2026-09-08 04:31 · claude **2.1.261** · 격리 CLAUDE_CONFIG_DIR · 120x40 PTY).
+    /// 인사 배너(ASCII 아트 15줄)는 한 줄로 접고, 미리보기 괘선은 폭만 40 으로 줄였다
+    /// (H-1 의 `LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT` 와 같은 전사 규약 — 판정 재료가 아닌 줄만).
+    /// **2.1.241 픽스처 `THEME` 를 대체하지 않는다**(§3-8 · 반례는 더한다).
+    pub const THEME_2_1_261: &str = "\
+        Welcome to Claude Code v2.1.261\n\
+        \x20…배너…\n\
+        \x20Let's get started.\n\
+        \n\
+        \x20Choose the text style that looks best with your terminal\n\
+        \x20To change this later, run /theme\n\
+        \n\
+        \x20  1. Auto (match terminal)\n\
+        \x20❯ 2. Dark mode ✔\n\
+        \x20  3. Light mode\n\
+        \x20  4. Dark mode (colorblind-friendly)\n\
+        \x20  5. Light mode (colorblind-friendly)\n\
+        \x20  6. Dark mode (ANSI colors only)\n\
+        \x20  7. Light mode (ANSI colors only)\n\
+        \n\
+        \x20╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\
+        \x20 1  function greet() {\n\
+        \x20 2 -  console.log(\"Hello, World!\");                                                                               \n\
+        \x20 2 +  console.log(\"Hello, Claude!\");                                                                              \n\
+        \x20 3  }\n\
+        \x20╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\
+        \x20 Syntax theme: Monokai Extended (ctrl+t to disable)\n\
+        ";
+
+    /// ★실측(2026-09-08 04:32 · claude 2.1.261 · 테마 관문 Return 1발 뒤 화면).
+    /// 2.1.241 대비 **선택지 3번이 늘었다**(`3rd-party platform · Amazon Bedrock, …`).
+    pub const LOGIN_METHOD_2_1_261: &str = "\
+        Welcome to Claude Code v2.1.261\n\
+        \x20…배너…\n\
+        \n\
+        \x20Claude Code can be used with your Claude subscription or billed based on API usage through your Console account.\n\
+        \n\
+        \x20Select login method:\n\
+        \n\
+        \x20❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise\n\
+        \x20  2. Anthropic Console account · API usage billing\n\
+        \x20  3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI\n\
+        ";
+
+    /// ★실측(2026-09-08 04:34 · claude 2.1.261) — **코퍼스에 없는** 벤더 모달.
+    pub const CUSTOM_API_KEY_MODAL_2_1_261: &str = "\
+        Welcome to Claude Code v2.1.261\n\
+        \x20…배너…\n\
+        \n\
+        \n\
+        ────────────────────────────────────────\n\
+        \x20 Detected a custom API key in your environment\n\
+        \n\
+        \x20 ANTHROPIC_API_KEY: sk-ant-...alid-local-tui-probe\n\
+        \n\
+        \x20 Do you want to use this API key?\n\
+        \n\
+        \x20   Yes\n\
+        \x20 ❯ No (recommended)\n\
+        \n\
+        \x20 Enter to confirm · Esc to cancel\n\
+        ";
+
+    /// ★실측(2026-09-08 04:35 · claude **2.1.263** = 이 기계의 현행 설치본).
+    pub const THEME_2_1_263: &str = "\
+        Welcome to Claude Code v2.1.263\n\
+        \x20…배너…\n\
+        \x20Let's get started.\n\
+        \n\
+        \x20Choose the text style that looks best with your terminal\n\
+        \x20To change this later, run /theme\n\
+        \n\
+        \x20  1. Auto (match terminal)\n\
+        \x20❯ 2. Dark mode ✔\n\
+        \x20  3. Light mode\n\
+        \x20  4. Dark mode (colorblind-friendly)\n\
+        \x20  5. Light mode (colorblind-friendly)\n\
+        \x20  6. Dark mode (ANSI colors only)\n\
+        \x20  7. Light mode (ANSI colors only)\n\
+        \n\
+        \x20╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\
+        \x20 1  function greet() {\n\
+        \x20 2 -  console.log(\"Hello, World!\");                                                                               \n\
+        \x20 2 +  console.log(\"Hello, Claude!\");                                                                              \n\
+        \x20 3  }\n\
+        \x20╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌\n\
+        \x20 Syntax theme: Monokai Extended (ctrl+t to disable)\n\
+        ";
+
     pub const NON_GATE_SCREENS: &[(&str, &str)] = &[
+        // ★실측 벤더 모달(2026-09-08 · 2.1.261) — 코퍼스 **밖**이다. 여기 등재하는 이유는
+        //   "어떤 needle 도 이 화면에 단독으로 걸리지 않는다" 를 전수로 집행받기 위해서다.
+        //   판정 기대값은 Ready 가 아니라 `unknown-modal` 보류이며, 그 예외는 readiness
+        //   `non_gate_screens_through_judge_hold_only_true_modals` 의 모달 팔이 소유한다.
+        ("custom-api-key-modal-2.1.261", CUSTOM_API_KEY_MODAL_2_1_261),
         ("live-tui-2.1.261-nbsp-prompt", LIVE_TUI_2_1_261_NBSP_PROMPT),
         ("ready-shell", READY_SHELL),
         ("healthy-welcome-box", HEALTHY_WELCOME_BOX),
@@ -2391,6 +2646,294 @@ mod tests {
         assert_eq!(trust.down_presses(), Some(0));
         // 면책: 기본 포커스가 목표가 아니다 → Return 만 누르면 rc 1.
         assert_ne!(disc.down_presses(), Some(0), "면책 Return 안전 오판(치명)");
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════
+    // ★2026-09-08 실측 회차(WP-1 H-2) — 측정 기록과 보고서 봉투
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// 실측 화면에서 **기본 포커스 번호**를 뽑는다(손으로 옮겨 적지 않는다 · 화면이 SOT).
+    /// `❯` 뒤 첫 정수. 번호 없는 위젯(2.1.261 커스텀 API 키 창)은 `None`.
+    fn measured_default_index(screen: &str) -> Option<u8> {
+        let line = screen.lines().find(|l| l.trim_start().starts_with('❯'))?;
+        let rest = line.trim_start().trim_start_matches('❯').trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    /// **이 회차의 실측이 선언값을 하나도 움직이지 않았다**는 기계 기록.
+    ///
+    /// 【무엇을 쟀나】 버려 쓰는 `CLAUDE_CONFIG_DIR` + 임시 소켓 데몬의 PTY 좌석에서 claude
+    /// **2.1.261** 을 띄워 `theme` · `login-method` 두 화면을 읽었다(2.1.263 도 같은 두 화면 동형).
+    ///
+    /// 【무엇을 못 쟀나 · 왜】 `login-method` 는 [`Passability::HumanOnly`] 다 — 액션 선언이
+    /// **없으므로** 기계가 넘을 키가 없다. 그 벽 뒤의 `oauth-code`·`folder-trust`·
+    /// `bypass-disclaimer`·`feature-announce-fullscreen` 은 **보지 못했다**. 새 config dir 은
+    /// 자격증명이 없고(mac Keychain 은 config dir 절대경로로 봉인된다), 살아 있는 계정 dir 을
+    /// 빌려 오는 것은 설치본 무접촉 규약 위반이다.
+    ///
+    /// 【그래서 무엇을 안 했나】 정본 §4 H-2 는 "6관문 전부 실측한 뒤에만" [`MEASURED_ON`] 을
+    /// 올리라고 한다. 부분 실측이므로 **올리지 않았고**, CONTRACTS §B-7 이 승인해 둔 folder-trust
+    /// 재핀(`down_presses()` `Some(0)` → `Some(1)`)도 **하지 않았다**. 승인은 실측의 대체물이
+    /// 아니다 — 그 값이 틀리면 Return 한 발이 `No, exit` 를 눌러 좌석이 rc 1 로 죽는다(§7 ④).
+    ///
+    /// 다음 회차가 남은 4관문을 실측하면 이 검체를 **의도적으로** 고치게 된다. 조용히 바뀌지
+    /// 않는 것이 이 검체의 목적이다.
+    #[test]
+    fn the_2026_09_08_partial_measurement_moved_no_declared_value() {
+        let gs = builtin();
+        let g = |id: &str| gs.iter().find(|g| g.id == id).expect(id).clone();
+
+        // ── ① 실측한 두 관문: 화면이 여전히 그 관문으로 식별되고, 기본 포커스가 선언과 같다 ──
+        for (name, screen) in [
+            ("2.1.261", fixtures::THEME_2_1_261),
+            ("2.1.263", fixtures::THEME_2_1_263),
+        ] {
+            let hit = identify(&gs, screen).unwrap_or_else(|| panic!("{name}: theme 미식별\n{screen}"));
+            assert_eq!(hit.id, "theme", "{name}: 다른 관문으로 읽혔다");
+            assert_eq!(
+                measured_default_index(screen),
+                g("theme").default_index,
+                "{name}: 실측 기본 포커스가 선언과 다르다 — 선언을 고쳐야 한다"
+            );
+        }
+        // theme 는 기본 포커스가 곧 통과 액션이다(아래키 0회) — 실측이 이것을 **확인**했다.
+        assert_eq!(g("theme").down_presses(), Some(0));
+        assert_eq!(g("theme").action.as_ref().map(|a| a.select_index), Some(2));
+
+        let login = identify(&gs, fixtures::LOGIN_METHOD_2_1_261).expect("login-method 미식별");
+        assert_eq!(login.id, "login-method");
+        assert_eq!(
+            measured_default_index(fixtures::LOGIN_METHOD_2_1_261),
+            login.default_index,
+            "로그인 관문 기본 포커스 실측 불일치"
+        );
+        // ★기계가 넘을 수 없다는 것이 **측정 결과**다 — 이것이 아래 ③의 미실측 사유다.
+        assert_eq!(login.passability, Passability::HumanOnly);
+        assert!(login.action.is_none(), "HumanOnly 관문에 액션이 생겼다");
+        assert!(matches!(
+            action_policy(login, Some("2.1.261")),
+            ActionPolicy::HumanRequired { .. }
+        ));
+
+        // ── ② 코퍼스 밖 벤더 모달(실측) — 어떤 관문으로도 식별되지 않는다 ──────────────
+        assert!(
+            identify(&gs, fixtures::CUSTOM_API_KEY_MODAL_2_1_261).is_none(),
+            "코퍼스가 모르는 벤더 모달을 관문으로 오탐했다"
+        );
+        assert_eq!(
+            measured_default_index(fixtures::CUSTOM_API_KEY_MODAL_2_1_261),
+            None,
+            "번호 없는 선택 위젯인데 번호가 읽혔다(전사 오류)"
+        );
+
+        // ── ③ 못 본 관문의 선언은 종전 그대로다(핀 미갱신) ──────────────────────────
+        assert_eq!(MEASURED_ON, "2.1.241", "부분 실측인데 버전 핀이 올라갔다");
+        let trust = g("folder-trust");
+        assert_eq!(trust.default_index, Some(1), "미실측 관문의 기본 포커스가 바뀌었다");
+        assert_eq!(trust.action.as_ref().map(|a| a.select_index), Some(1));
+        assert_eq!(trust.down_presses(), Some(0), "CONTRACTS §B-7 재핀은 실측 전에는 하지 않는다");
+        assert_eq!(g("bypass-disclaimer").default_index, Some(1));
+        assert_eq!(g("feature-announce-fullscreen").default_index, Some(1));
+    }
+
+    /// 보고서(`cys gate-corpus --json`)는 **코퍼스의 어휘**로 쓴다 — 봉투 파서가 되읽을 수 있다.
+    ///
+    /// 방언이면 보고서를 그대로 `agents.json` 봉투에 되먹일 수 없고, 그 순간 진단과 정정이
+    /// 다른 언어를 쓰게 된다(운영자가 본 값과 고치는 값이 다르다).
+    #[test]
+    fn gate_corpus_report_speaks_the_corpus_vocabulary_and_carries_the_contract_keys() {
+        let r = resolve_with(None, true);
+        let v = report_json(&r, "claude", None);
+
+        // CONTRACTS §C 최소 계약: 최상위 measured_on · gates[].{id,passability}
+        assert_eq!(v["measured_on"].as_str(), Some(MEASURED_ON));
+        let gates = v["gates"].as_array().expect("gates 배열");
+        assert_eq!(gates.len(), builtin().len(), "관문 수가 다르다");
+        for (i, gv) in gates.iter().enumerate() {
+            let id = gv["id"].as_str().expect("id");
+            assert!(!id.is_empty());
+            // 어휘 왕복 — 봉투 파서가 이 문자열을 되읽는다(사본 0).
+            assert_eq!(
+                parse_passability(gv.get("passability")),
+                Some(builtin()[i].passability),
+                "{id}: passability 어휘가 봉투 파서와 갈렸다"
+            );
+            assert_eq!(
+                parse_absence_cost(gv.get("absence_cost")),
+                Some(builtin()[i].absence_cost),
+                "{id}: absence_cost 어휘가 봉투 파서와 갈렸다"
+            );
+            assert!(gv.get("policy").is_none(), "{id}: 묻지 않은 버전 정책이 인쇄됐다");
+        }
+        // 빌트인만이면 전 관문이 같은 버전을 주장한다 → 유효 버전이 잡히고 혼합이 아니다.
+        assert_eq!(v["effective_measured_on"].as_str(), Some(MEASURED_ON));
+        assert_eq!(v["mixed_versions"].as_bool(), Some(false));
+        assert_eq!(v["detected_version"], Value::Null);
+        assert_eq!(v["source"].as_str(), Some("builtin"));
+        assert_eq!(v["agent"].as_str(), Some("claude"));
+
+        // 실측 대장의 아래키·라벨이 보고서에 그대로 실린다(운영자가 코드를 안 읽어도 된다).
+        let theme = gates.iter().find(|g| g["id"] == "theme").expect("theme");
+        assert_eq!(theme["down_presses"].as_u64(), Some(0));
+        assert_eq!(theme["action"]["label"].as_str(), Some("Dark mode"));
+        assert_eq!(theme["default_index"].as_u64(), Some(2));
+        let login = gates.iter().find(|g| g["id"] == "login-method").expect("login");
+        assert_eq!(login["action"], Value::Null);
+        assert_eq!(login["down_presses"], Value::Null, "액션 없는 관문에 아래키가 생겼다");
+        assert_eq!(login["absence_is_fatal"].as_bool(), Some(true));
+    }
+
+    /// 혼합 버전은 **추측하지 않는다** — 유효 버전은 `null`, 내장 핀은 그대로.
+    ///
+    /// 봉투가 관문 **일부**만 새 버전으로 덮으면 코퍼스는 두 버전을 동시에 주장한다. 그때
+    /// 최상위 한 값을 고르면 그 값은 어느 쪽으로 읽어도 거짓이다(codex 설계 검토 Q4).
+    #[test]
+    fn gate_corpus_report_reports_mixed_versions_as_null_instead_of_guessing() {
+        let env = serde_json::json!({
+            "gates": [{"id": "theme", "measured_on": "9.9.9"}]
+        });
+        let r = resolve_with(Some(&env), true);
+        let v = report_json(&r, "claude", None);
+        assert_eq!(v["measured_on"].as_str(), Some(MEASURED_ON), "내장 핀은 상태에 따라 흔들리지 않는다");
+        assert_eq!(v["effective_measured_on"], Value::Null);
+        assert_eq!(v["mixed_versions"].as_bool(), Some(true));
+        let theme = v["gates"].as_array().unwrap().iter().find(|g| g["id"] == "theme").unwrap().clone();
+        assert_eq!(theme["measured_on"].as_str(), Some("9.9.9"));
+        assert_eq!(theme["origin"].as_str(), Some("overridden"));
+        // 전 관문을 같은 버전으로 덮으면 다시 하나로 접힌다(대조군).
+        let all = serde_json::json!({"measured_on": "9.9.9", "source": "builtin", "gates": []});
+        let r2 = resolve_with(Some(&all), true);
+        assert_eq!(report_json(&r2, "claude", None)["mixed_versions"].as_bool(), Some(false));
+    }
+
+    /// 버전 정책은 **물었을 때만** 답한다 — 그리고 그 답은 [`ActionPolicy`] 타입 그대로다.
+    #[test]
+    fn gate_corpus_report_carries_the_version_policy_only_when_a_version_is_supplied() {
+        let r = resolve_with(None, true);
+        let pick = |v: &Value, id: &str| {
+            v["gates"].as_array().unwrap().iter().find(|g| g["id"] == id).unwrap().clone()
+        };
+
+        let same = report_json(&r, "claude", Some(MEASURED_ON));
+        assert_eq!(same["detected_version"].as_str(), Some(MEASURED_ON));
+        assert_eq!(pick(&same, "theme")["policy"]["kind"].as_str(), Some("allowed"));
+        assert_eq!(pick(&same, "theme")["policy"]["down"].as_u64(), Some(0));
+        // HumanOnly 는 버전과 무관하게 사람 몫이다(정책 우선순위 · 회귀 잠금).
+        assert_eq!(pick(&same, "login-method")["policy"]["kind"].as_str(), Some("human_required"));
+
+        // ★이 기계의 현행 설치본(2.1.263)에서 코퍼스가 서는 자리 — 액션은 전부 보류다.
+        let drift = report_json(&r, "claude", Some("2.1.263"));
+        let t = pick(&drift, "theme");
+        assert_eq!(t["policy"]["kind"].as_str(), Some("held_version_drift"));
+        assert_eq!(t["policy"]["measured_on"].as_str(), Some(MEASURED_ON));
+        assert_eq!(t["policy"]["detected"].as_str(), Some("2.1.263"));
+        for gv in drift["gates"].as_array().unwrap() {
+            assert_ne!(
+                gv["policy"]["kind"].as_str(),
+                Some("allowed"),
+                "{}: 버전 드리프트에서 액션이 열렸다(위젯 서명 우회 금지 · §8)",
+                gv["id"]
+            );
+        }
+    }
+
+    /// ★(codex gpt-6-astra 위임 산출 · 전행 검토 후 채택 — `impl/codex/R5-WP1-H2-roundtrip.md`)
+    /// 보고서는 운영자가 코퍼스를 읽고 수정할 때 쓰는 같은 어휘를 제공해야 한다.
+    /// 보고서가 코퍼스 어휘의 방언이면 운영자가 본 값과 고치는 값이 달라진다.
+    /// 그 순간 `cys gate-corpus`는 진단이 아니라 소문이 된다.
+    /// 선언 축을 그대로 되먹여도 코퍼스 전체가 보존되는지 검증해 이 계약을 지킨다.
+    #[test]
+    fn gate_corpus_report_is_lossless_for_the_declared_axes_round_trip() {
+        let base = resolve_with(None, true);
+        let report = report_json(&base, "claude", None);
+        let reported = report["gates"]
+            .as_array()
+            .expect("전체 관문: 보고서 gates 축이 배열이 아니다");
+        let declarations: Vec<Value> = reported
+            .iter()
+            .enumerate()
+            .map(|(index, gate)| {
+                let id = gate.get("id").and_then(Value::as_str).unwrap_or_else(|| {
+                    panic!("보고서 {index}번째 관문: id 축이 없거나 문자열이 아니다")
+                });
+                let field = |axis: &str| {
+                    gate.get(axis).unwrap_or_else(|| {
+                        panic!("관문 {id}: 보고서의 {axis} 선언 축이 없다")
+                    })
+                };
+                let action = field("action");
+                let action = if action.is_null() {
+                    Value::Null
+                } else {
+                    let action_field = |axis: &str| {
+                        action.get(axis).unwrap_or_else(|| {
+                            panic!("관문 {id}: 보고서의 action.{axis} 선언 축이 없다")
+                        })
+                    };
+                    serde_json::json!({
+                        "select_index": action_field("select_index"),
+                        "label": action_field("label"),
+                        "literal": action_field("literal"),
+                    })
+                };
+                serde_json::json!({
+                    "id": field("id"),
+                    "passability": field("passability"),
+                    "default_index": field("default_index"),
+                    "action": action,
+                    "absence_cost": field("absence_cost"),
+                    "measured_on": field("measured_on"),
+                })
+            })
+            .collect();
+        let env: Value = serde_json::json!({
+            "source": report.get("source")
+                .expect("전체 관문: 보고서 source 축이 없다"),
+            "gates": declarations,
+        });
+        let round_trip = resolve_with(Some(&env), true);
+
+        assert_eq!(
+            round_trip.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            base.gates.iter().map(|g| &g.id).collect::<Vec<_>>(),
+            "전체 관문: id 목록 축이 달라졌다(관문 누락·추가·순서 변경)"
+        );
+        for (actual, expected) in round_trip.gates.iter().zip(&base.gates) {
+            macro_rules! same_axis {
+                ($axis:ident) => {
+                    assert_eq!(
+                        actual.$axis, expected.$axis,
+                        "관문 {}: {} 축이 되먹임 전후 달라졌다",
+                        expected.id, stringify!($axis)
+                    );
+                };
+            }
+            same_axis!(id);
+            same_axis!(title);
+            same_axis!(needles);
+            same_axis!(widget);
+            same_axis!(confirm_echo);
+            same_axis!(passability);
+            same_axis!(default_index);
+            same_axis!(human_reason);
+            same_axis!(absence_cost);
+            same_axis!(measured_on);
+            match (&actual.action, &expected.action) {
+                (Some(actual), Some(wanted)) => {
+                    assert_eq!(actual.select_index, wanted.select_index,
+                        "관문 {}: action.select_index 축이 달라졌다", expected.id);
+                    assert_eq!(actual.label, wanted.label,
+                        "관문 {}: action.label 축이 달라졌다", expected.id);
+                    assert_eq!(actual.literal, wanted.literal,
+                        "관문 {}: action.literal 축이 달라졌다", expected.id);
+                }
+                (None, None) => {}
+                _ => panic!("관문 {}: action 존재 여부 축이 달라졌다", expected.id),
+            }
+            // 병합으로 origin은 Builtin에서 Overridden이 되므로 이 필드만 비교에서 제외한다.
+        }
     }
 
     // ── 버전 핀 ────────────────────────────────────────────────────────────

@@ -3351,7 +3351,12 @@ mod tests {
         assert!(modal_signature(&echo_then_live).is_none());
         // 건강한 화면 전량 — 관문이 아닌 화면 표에서 **진짜 모달·본문 표**를 뺀 나머지.
         for &(id, screen) in fixtures::NON_GATE_SCREENS {
-            let expect_modal = matches!(id, "audit-log-line" | "live-permission-prompt");
+            // ★(0.14.31 · WP-1 H-2) 실측 벤더 모달(2.1.261 커스텀 API 키 확인창)이 셋째 항목이다 —
+            //   그 화면은 코퍼스 밖이지만 `Enter to confirm` ∧ `Esc to cancel` 푸터가 전경이라 모달이다.
+            let expect_modal = matches!(
+                id,
+                "audit-log-line" | "live-permission-prompt" | "custom-api-key-modal-2.1.261"
+            );
             assert_eq!(
                 modal_signature(screen).is_some(),
                 expect_modal,
@@ -3935,7 +3940,10 @@ mod tests {
         for &(id, screen) in fixtures::NON_GATE_SCREENS {
             let v = judge(&boot_all_open(screen, &gates));
             match id {
-                "live-permission-prompt" | "audit-log-line" => assert!(
+                // ★(0.14.31 · WP-1 H-2) 실측 벤더 모달(2.1.261 커스텀 API 키 확인창)은 코퍼스 밖이지만
+                //   `Enter to confirm` ∧ `Esc to cancel` 푸터가 전경이라 H-1 의 모달 축이 보류한다 —
+                //   그 보류가 곧 "코퍼스에 없는 새 관문에 Return 이 나가지 않는다" 의 실측 증거다.
+                "live-permission-prompt" | "audit-log-line" | "custom-api-key-modal-2.1.261" => assert!(
                     held_as(&v, MODAL_UNKNOWN_ID),
                     "{id}: 모달 어휘가 전경인데 보류가 아니다: {v:?}"
                 ),
