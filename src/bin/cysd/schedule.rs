@@ -1024,6 +1024,17 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         //   `deliver_push(...)?` 뒤였고, 큐 경유가 추가되며 실패 사유(늦은 pause·큐 포화·좌석
         //   소멸)가 늘어났다 — 그 조기 반환은 갓 띄운 좌석을 **회수 약속 없이** 남긴다
         //   (반복 잡이면 매 발화마다 좌석이 단조 누적된다 = 자원 누수).
+        // ★(0.14.31 · WP-3 B) fresh 경로에도 같은 배달 선택을 적용한다 — 여기만 직접 주입으로
+        //   남기면 `via_queue` 잡이 fresh 옵션 하나로 게이트를 통째 우회한다(같은 계약의 구멍).
+        // 갓 띄운 좌석이 곧 대상이다 — 역할 결속은 이 잡의 계약이 아니다.
+        //
+        // ★(리뷰 R2 · claude minor) 회수 타이머는 **배달을 시도한 뒤** 건다. R1 에서 이 등록을
+        //   `deliver_push` 앞으로 옮긴 이유는 "실패로 조기 반환해도 좌석을 회수한다" 였는데,
+        //   `effective_close_ttl` 은 `close_after_secs: 0` 을 그대로 Some(0) 으로 돌리므로
+        //   멀티스레드 런타임에서 회수가 배달을 **앞지를 수 있었다**(SeatGone·"surface gone").
+        //   결과를 손에 쥔 채 등록하면 두 성질을 함께 얻는다: 순서(배달 시도가 먼저)와
+        //   무조건성(성공·실패 어느 반환 경로에서도 회수가 걸린다).
+        let delivered = deliver_push(daemon, job, sid, text, None);
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
             tokio::spawn(async move {
@@ -1031,10 +1042,7 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
                 let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
             });
         }
-        // ★(0.14.31 · WP-3 B) fresh 경로에도 같은 배달 선택을 적용한다 — 여기만 직접 주입으로
-        //   남기면 `via_queue` 잡이 fresh 옵션 하나로 게이트를 통째 우회한다(같은 계약의 구멍).
-        // 갓 띄운 좌석이 곧 대상이다 — 역할 결속은 이 잡의 계약이 아니다.
-        let how = deliver_push(daemon, job, sid, text, None)?;
+        let how = delivered?;
         return Ok(format!("fresh-launched and {how} (surface:{sid})"));
     }
     let mut sid = daemon.roles.lock().unwrap().get(to).copied();
@@ -1046,13 +1054,13 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     // 셸이 명령으로 해석해 깨진다(예: '[heartbeat]…' → zsh no matches). launch-agent로 등록된
     // 에이전트 pane만 유효 대상 → 빈 셸은 if_absent 규칙으로 처리(owner 보고는 skip).
     if let Some(s) = sid {
+        // ★(0.14.31 · 리뷰 R2) 판정은 `alert_route::seat_is_agent_backed` **한 곳**이다.
+        //   종전에는 같은 규칙을 여기 인라인으로 복제했고, 경보 라우팅이 그 사본과 갈라져
+        //   빈 셸을 목적지로 골랐다. 술어가 하나면 갈라질 수 없다(그 술어는 등록 이력만이
+        //   아니라 이미 관측된 부재 증거까지 본다 — Unknown 은 종전대로 통과).
         let valid = daemon
             .get_surface(s)
-            .map(|surf| {
-                let alive = !surf.exited.load(std::sync::atomic::Ordering::Relaxed);
-                let is_agent = surf.agent_meta.lock().unwrap().is_some();
-                alive && is_agent
-            })
+            .map(|surf| crate::alert_route::seat_is_agent_backed(&surf))
             .unwrap_or(false);
         if !valid {
             sid = None;
@@ -1111,7 +1119,16 @@ fn deliver_push(
     role_guard: Option<crate::alert_route::RoleGuard<'_>>,
 ) -> Result<&'static str, String> {
     if !job.uses_queue() {
-        inject(daemon, sid, text)?;
+        // ★(0.14.31 · 리뷰 R2 · claude minor) 직접 주입 분기도 **같은 역할 가드**를 받는다.
+        //   종전에는 큐 경유 분기에만 가드가 있었고, 그래서 기존 builtin push(하트비트 등)는
+        //   선택과 주입 사이의 인계 경쟁이 그대로였다 — 인계가 끝난 뒤 구 좌석에 주입하면
+        //   그 문안은 버려진 셸에 타이핑된다.
+        //   좌석 조회와 역할 재검증을 **한 임계영역**에서 하고(락 순서 surfaces → roles =
+        //   `close_surface`·`claim_role` 과 동순), 그렇게 확정한 `Arc<Surface>` 로 주입한다.
+        //   ★정직한 한계: PTY 쓰기까지 락을 쥘 수는 없으므로(원장 I/O·writer 채널) 검증
+        //   **직후**의 인계는 여전히 지나간다. 큐 경유 경로도 삽입 이후에는 같은 성질이다.
+        let surface = resolve_push_target(daemon, sid, role_guard)?;
+        inject_on(daemon, &surface, text)?;
         return Ok("pushed");
     }
     crate::alert_route::enqueue_into_seat(
@@ -1163,11 +1180,34 @@ fn ensure_machine_label(text: &str, job_id: &str) -> String {
     format!("[schedule {job_id}] {text}")
 }
 
+/// 대상 좌석을 **한 임계영역**에서 확정한다 — 존재·생존·역할 결속을 함께 본다.
+/// 락 순서: surfaces → roles(`close_surface`·`claim_role` 과 동순 · AB-BA 없음).
+fn resolve_push_target(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+) -> Result<Arc<crate::state::Surface>, String> {
+    let surfaces = daemon.surfaces.lock().unwrap();
+    let surface = surfaces.get(&sid).cloned().ok_or("surface gone")?;
+    if let Some(guard) = role_guard {
+        let roles = daemon.roles.lock().unwrap();
+        if !roles.iter().any(|(r, s)| *s == sid && guard.matches(r)) {
+            return Err("role handed over between selection and inject".to_string());
+        }
+    }
+    Ok(surface)
+}
+
 /// 살아있는 세션의 stdin에 과업을 주입 (bracketed paste + Return).
 /// 전체 시퀀스가 writer 스레드의 단일 Inject 항목으로 직렬화돼
 /// 동시 발화·동시 배달과 섞이지 않는다 (메시지 병합·오염 차단).
-fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
-    let surface = daemon.get_surface(sid).ok_or("surface gone")?;
+/// 확정된 좌석에 주입한다(조회를 다시 하지 않는다 — 확정과 주입 사이에 좌석이 바뀌지 않게).
+fn inject_on(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    text: &str,
+) -> Result<(), String> {
+    let sid = surface.id;
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 자기 예약 wake
     //   (`cys schedule add --text "[wakeup] 다음 액션 착수" --to master`)가 시간이 지나
     //   stdin 으로 돌아오는 경로가 바로 여기다.
@@ -2460,12 +2500,27 @@ mod tests {
             !body.contains("inject(daemon, sid, text)?;"),
             "fire_push 안에 직접 주입이 남아 있다(via_queue 가 우회된다)"
         );
-        // ★fresh 의 TTL 회수 배선은 **배달 시도보다 앞**에 있어야 한다(리뷰 R1 · codex major):
-        //   뒤에 있으면 배달 실패(늦은 pause·큐 포화·좌석 소멸)의 조기 반환이 갓 띄운 좌석을
-        //   회수 약속 없이 남긴다 — 반복 잡이면 발화마다 좌석이 누적된다.
+        // ★fresh 의 TTL 회수 배선(리뷰 R2 · claude minor로 **재핀**).
+        //
+        // R1 은 "회수 등록이 배달 **앞**" 을 핀으로 박았다. 그 순서 자체가 결함이었다:
+        // `effective_close_ttl` 은 `close_after_secs: 0` 을 그대로 Some(0) 으로 돌리므로
+        // 멀티스레드 런타임에서 회수 태스크가 **배달보다 먼저** 좌석을 닫을 수 있었다
+        // (`deliver_push` 가 SeatGone·"surface gone" 으로 실패 — 종전 순서에는 없던 경로).
+        //
+        // 지켜야 할 불변은 순서가 아니라 **무조건성**이다: 성공·실패 어느 반환 경로에서도
+        // 회수가 걸려야 갓 띄운 좌석이 누수되지 않는다. 그래서 배달 결과를 손에 쥔 채
+        // (`let delivered = deliver_push(...);`) 등록하고 그 뒤에 `?` 로 전파한다.
         let ttl_at = body.find("effective_close_ttl(job)").expect("fresh TTL 회수 배선이 사라졌다");
         let deliver_at = body.find("deliver_push(daemon, job, sid, text,").expect("배달 호출 소실");
-        assert!(ttl_at < deliver_at, "TTL 회수 등록이 배달 시도 뒤에 있다(실패 시 좌석 누수)");
+        assert!(
+            deliver_at < ttl_at,
+            "TTL 회수 등록이 배달 시도보다 앞이다 — close_after_secs:0 에서 회수가 배달을 앞지른다"
+        );
+        assert!(
+            body.contains("let delivered = deliver_push(daemon, job, sid, text, None);")
+                && body.contains("let how = delivered?;"),
+            "배달 결과를 보류한 채 회수를 등록하는 구조가 아니다 — 실패 경로에서 좌석이 누수된다"
+        );
     }
 
     /// ★행동 검체(리뷰 R1 · codex major): `deliver_push` 의 **두 분기를 실제로 실행**해
@@ -2479,6 +2534,8 @@ mod tests {
             .expect("좌석 생성");
         daemon.roles.lock().unwrap().insert("cso".into(), s.id);
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        // ★(리뷰 R2) 목적지 적격성은 **에이전트 등록**을 요구한다(빈 셸은 대상이 아니다).
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
         let depth = || s.pending_queue.lock().unwrap().len();
 
         // ① 직접 주입 분기 — 큐에는 아무것도 남지 않는다(§8 "스케줄 push 는 큐를 우회한다").
@@ -2509,6 +2566,31 @@ mod tests {
         let (from, label) = crate::delivery::split_queue_from(e.from.as_deref());
         assert_eq!(from, None, "임의 문자열이 원장 from(surface ref)에 들어갔다");
         assert_eq!(label.as_deref(), Some("schedule:cso-alert-inbox-check-60m"));
+
+        // ③' 직접 주입 분기도 **같은 역할 가드**를 받는다(리뷰 R2 · claude minor).
+        //     종전에는 큐 경유에만 가드가 있어 기존 builtin push 전원(하트비트 등)이 인계 경쟁을
+        //     그대로 졌다 — 인계가 끝난 뒤의 주입은 버려진 셸에 타이핑된다.
+        {
+            let mut roles = daemon.roles.lock().unwrap();
+            roles.insert("cso".into(), s.id + 4_242); // 인계 완료(다른 좌석이 역할을 가져갔다)
+        }
+        let direct_err = deliver_push(
+            &daemon,
+            &direct,
+            s.id,
+            "[schedule direct] 인계 뒤 본문",
+            Some(crate::alert_route::RoleGuard::Exact("cso")),
+        )
+        .expect_err("인계된 뒤에도 구 좌석에 직접 주입했다");
+        assert!(direct_err.contains("handed over"), "실패 사유가 인계 경쟁이 아니다: {direct_err}");
+        assert_eq!(depth(), 1, "직접 주입 거절이 큐를 건드렸다");
+        // 가드가 없으면(좌석을 지목받은 fresh·if_absent:launch 경로) 종전대로 주입된다.
+        assert_eq!(
+            deliver_push(&daemon, &direct, s.id, "[schedule direct] 지목 본문", None),
+            Ok("pushed"),
+            "좌석을 지목받은 경로까지 가드가 막았다(무회귀 위반)"
+        );
+        daemon.roles.lock().unwrap().insert("cso".into(), s.id); // 원복
 
         // ③ 역할 가드 — 대상을 역할로 골랐다면 인계 뒤 적재는 거절된다.
         daemon.roles.lock().unwrap().insert("cso".into(), s.id + 9_999);

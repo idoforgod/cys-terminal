@@ -9476,9 +9476,16 @@ mod tests {
     /// ★(0.14.31 · WP-3 B · CONTRACTS §C) `cys status --json` 최상위 키 `alert_route` —
     /// **정확히 4키**(`enabled`·`routed_1h`·`suppressed_1h`·`pending`)다.
     ///
-    /// 왜 키 집합까지 잠그는가: 팩 preflight 의 능력 게이트(A) **등록 조건 ①**이 이 키로
+    /// 왜 키 집합까지 잠그는가: 팩 preflight 의 능력 게이트(A) **등록 조건 ①**이 이 값으로
     /// "이 데몬이 alert 라우팅을 지원한다"를 판정한다. 키 이름이 흔들리면 구 데몬으로 오판해
     /// 게이트가 영영 등록되지 않거나(WARN 침묵), 반대로 미지원 데몬에 게이트가 붙는다.
+    ///
+    /// ★술어는 **`alert_route.enabled == true`** 다(리뷰 R2 · claude minor · 팩 레인 계약).
+    /// 키 **존재**로 판정하면 `CYS_ALERT_ROUTE=0`(이 모듈의 유일한 롤백 스위치) 상태에서도
+    /// A 가 등록된다 — CSO 의 Monitor 는 막히는데 경보는 데몬이 밀어 주지 않는 형상, 곧
+    /// 정본 §7 치명위험 ③의 "A만 배포" 다. 롤백 시 Rust 쪽 값은 `enabled:false` 로 정직하게
+    /// 나오므로, 팩은 반드시 **값**을 본다.
+    /// (정직한 범위: `enabled:true` 는 **기동 표식**이지 구독 태스크의 생존 증명은 아니다.)
     #[test]
     fn status_exposes_alert_route_contract_keys() {
         let dir = std::env::temp_dir().join(format!("cysd-alertroute-{:x}", std::process::id()));
