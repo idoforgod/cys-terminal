@@ -206,8 +206,41 @@ if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CW
   else
     SHARE=0
   fi
+  # ── ★WP-7 O(0.14.31 · 버그리포트 B1): 역할 좌석에서는 이것이 '위험'이 아니라 '형상'이다 ──
+  # 실측(2026-09-06): 본부 좌석 12개가 전부 cwd=/Users/cys 다 — 데몬이 좌석을 그렇게 띄운다.
+  # 그 12개에 매 세션 race 경고를 물리면 경고가 상시 참이 되어 아무도 안 읽는다(경보 피로).
+  # 그래서 **역할 좌석이면 경고 대신 사실 1줄**, 무역할 세션(손으로 띄운 claude)은 종전 경고 그대로.
+  # ★"레인 격리됨" 같은 미검증 문구는 쓰지 않는다(codex O): 이 훅이 아는 사실은 세션 수와
+  #   이 좌석의 역할뿐이고, 편집 충돌이 불가능하다는 것은 우리가 재지 않은 주장이다.
+  #
+  # 신원은 **데몬이 권위**다(plan §8: `CYS_ROLE` env 는 승계 후 stale — 폴백 전용).
+  #   rc 0 + 비어 있지 않음 = 역할 좌석 · rc 0 + 빈 줄 = **확정 무역할**(env 폴백 금지 — 그러지 않으면
+  #   역할이 풀린 좌석의 env 잔재가 경고를 영영 끈다) · rc≠0 = 판정 불가 → env 폴백.
+  # ★CR 제거: Windows 네이티브 `cys` 는 `\r\n` 을 내고 `$()` 는 LF 만 지운다 — 남은 `\r` 은
+  #   "비어 있지 않음"으로 읽혀 무역할 세션을 역할 좌석으로 둔갑시킨다.
+  # ★자동기동 금지: `cys surface-role` 은 소켓이 없으면 데몬을 띄우려 든다. SessionStart 가 좌석
+  #   수만큼 동시에 도는 자리라 그 부작용은 부트 폭주(치명 ①) 방향이다 — CYS_NO_AUTOSTART=1 로 막는다.
+  # 조회는 **경고를 낼 상황(SHARE>=2)에서만** 1회. 비용을 안 낼 자리에서는 아예 안 낸다.
   if [ "${SHARE:-0}" -ge 2 ]; then
-    OUT="${OUT}⚠ 같은 작업폴더($(_esc "$CWD"))에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
+    _IC_ROLE=""
+    if command -v cys >/dev/null 2>&1; then
+      # env 는 `$( )` 서브셸 안에서 export 한다 — `VAR=x func` 형태는 셸마다 지속 여부가 갈린다.
+      _IC_OUT=$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+                 cys_timeout_run 2 cys surface-role </dev/null 2>/dev/null )
+      _IC_RC=$?
+      _IC_ROLE=$(printf '%s' "$_IC_OUT" | head -n1 | tr -d '\r')
+      if [ "$_IC_RC" -ne 0 ]; then                 # 판정 불가 — env 폴백(좌석 env 는 데몬이 주입한다)
+        _IC_ROLE="${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}"
+        _IC_ROLE=$(printf '%s' "$_IC_ROLE" | tr -d '\r')
+      fi
+    else                                            # cys 부재 — env 만이 근거다
+      _IC_ROLE=$(printf '%s' "${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}" | tr -d '\r')
+    fi
+    if [ -n "$_IC_ROLE" ]; then
+      OUT="${OUT}ℹ 동일 cwd claude 세션 ${SHARE}개(역할 좌석 포함) — 이 세션은 역할 좌석 $(_esc "$_IC_ROLE") 이다. 작업기억(SESSION_STATE) 편집은 한 세션에서만.\n"
+    else
+      OUT="${OUT}⚠ 같은 작업폴더($(_esc "$CWD"))에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
+    fi
   fi
 fi
 
