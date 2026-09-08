@@ -2425,6 +2425,13 @@ pub struct Daemon {
     /// 승인된 메시지가 사라진다(일시적 공유 위반·권한 오류만으로 유실). 표식 + 틱 재시도는
     /// 유실 창을 "실패 후 다음 틱(≤5s) 안의 크래시" 로 줄이고, 응답에는 `durable` 로 사실을 싣는다.
     pub queue_persist_dirty: AtomicBool,
+    /// ★(0.14.31 · 독립 판정 triage X4) **부팅이 큐 WAL 을 온전히 복원하지 못했다.**
+    /// `queue_wal_durable`(=마지막 쓰기가 디스크에 닿았는가)과 **다른 사실**이다: 이 비트는
+    /// "지금 메모리에 있는 큐가 재기동 이전의 전부인가" 를 말한다. false 로 시작하지 않고
+    /// 부팅 판독에서 정해지며, 이후의 성공적인 쓰기가 지우지 않는다(그 쓰기는 복원하지 못한
+    /// 내용을 되살리지 못한다). 소비자: `alert_route` 의 인계 조정 — 큐에 없다는 관측을
+    /// "큐가 소비했다" 로 읽는 판단을 이 비트가 막는다.
+    pub queue_restore_incomplete: AtomicBool,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -3026,18 +3033,49 @@ fn queue_mid(sid: u64, text: &str) -> String {
 ///
 /// ★비타입 감사 지점 ①(§Daemon::restored_queue) — QueueEntry 스키마 변경 시 여기의
 /// 레거시 합성이 전 항목에 신 필드를 보장해야 하류(rehome·queue.list)가 결손 없이 읽는다.
-fn load_queue_state(dir: &std::path::Path) -> Vec<serde_json::Value> {
+fn load_queue_state(dir: &std::path::Path) -> QueueWalRead {
     load_queue_file(dir, "queue-state.json")
+}
+
+/// 큐 WAL 한 파일의 판독 결과 — **행 목록과 "끝까지 이해했는가" 를 함께** 돌려준다.
+///
+/// ★(0.14.31 · 독립 판정 triage X4) 종전에는 `Vec` 하나였고 읽기 실패·JSON 파손이
+/// **빈 큐와 같은 모양**이었다. 그 모양을 하류(`alert_route::reconcile_restored_admissions`)가
+/// "큐가 이미 소비했다" 로 읽어 보관된 경보를 지웠다 — 배달·만료·폐기 어느 것도 확인되지 않은
+/// 채로. 결측은 값이 아니다: 부재(NotFound)와 판독 실패를 여기서 가른다.
+pub(crate) struct QueueWalRead {
+    pub(crate) rows: Vec<serde_json::Value>,
+    /// 파일이 **있었는데** 그 내용을 온전히 복원하지 못했다(읽기 실패 · JSON 파손 ·
+    /// 신원 불능 행 건너뜀). 부재는 `false` 다 — 없는 파일은 잃은 것이 없다.
+    pub(crate) incomplete: bool,
+    /// 파일을 **한 줄도 해석하지 못했다**(읽기 실패 · JSON 파손). 이때만 원본을 옆으로 보존한다 —
+    /// 파싱에 성공한 파일은 해석 가능한 내용이 전부 메모리에 있으므로 다음 영속이 그것을 되쓴다.
+    pub(crate) unreadable: bool,
 }
 
 /// ★(0.14.31 · WP-5 M) 큐 WAL 파일 판독 본체 — 활성(`queue-state.json`)·만료(`queue-expired.json`)
 /// 두 파일이 같은 합성·dedup 규칙을 탄다(규칙 세목은 `load_queue_state` doc).
-fn load_queue_file(dir: &std::path::Path, name: &str) -> Vec<serde_json::Value> {
+fn load_queue_file(dir: &std::path::Path, name: &str) -> QueueWalRead {
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let restored_at = now_epoch();
-    if let Ok(content) = std::fs::read_to_string(dir.join(name)) {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+    let mut incomplete = false;
+    let mut unreadable = false;
+    // ★부재와 실패를 가른다(triage X4). NotFound 만 "잃은 것 없음" 이고, 권한·EISDIR·I/O
+    //   오류와 JSON 파손은 **파일이 있는데 못 읽은 것**이라 하류가 빈 큐로 읽으면 안 된다.
+    let content = match std::fs::read_to_string(dir.join(name)) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("[cysd] 큐 WAL '{name}' 판독 실패({e}) — 빈 큐로 읽지 않는다(복원 불완전 표시)");
+            incomplete = true;
+            unreadable = true;
+            None
+        }
+    };
+    if let Some(content) = content {
+        match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+            Ok(arr) => {
             for (pos, mut it) in arr.into_iter().enumerate() {
                 let mid = it.get("mid").and_then(|v| v.as_str()).map(str::to_string);
                 let key = it
@@ -3046,7 +3084,9 @@ fn load_queue_file(dir: &std::path::Path, name: &str) -> Vec<serde_json::Value> 
                     .map(str::to_string)
                     .or_else(|| mid.clone());
                 let Some(key) = key else {
-                    continue; // id·mid 둘 다 없음 — 신원 불능 항목은 복원하지 않는다
+                    // 신원 불능 항목은 복원하지 않는다 — 그러나 **버렸다는 사실**은 남긴다.
+                    incomplete = true;
+                    continue;
                 };
                 if !seen.insert(key) {
                     continue; // 이중 replay dedup — 파일 첫 등장 항목 승
@@ -3066,9 +3106,46 @@ fn load_queue_file(dir: &std::path::Path, name: &str) -> Vec<serde_json::Value> 
                 }
                 out.push(it);
             }
+            }
+            Err(e) => {
+                eprintln!("[cysd] 큐 WAL '{name}' 파싱 실패({e}) — 빈 큐로 읽지 않는다(복원 불완전 표시)");
+                incomplete = true;
+                unreadable = true;
+            }
         }
     }
-    out
+    QueueWalRead { rows: out, incomplete, unreadable }
+}
+
+/// 판독하지 못한 큐 WAL 을 **유일한 이름으로 옆에 치운다**(원본 보존).
+///
+/// ★자기치유 전소 차단: 판독 실패 뒤에도 `persist_queue_state` 는 30초마다 그 이름 위에
+/// 메모리(=비어 있거나 부분 복원된) 큐를 원자 치환한다 — 그 순간 못 읽은 원본의 마지막 사본이
+/// 사라진다. 치우기에 실패하면 아무것도 하지 않는다(원본을 건드리지 않는 쪽으로 틀린다).
+fn preserve_unreadable_queue_wal(dir: &std::path::Path, name: &str) {
+    let src = dir.join(name);
+    if !src.exists() {
+        return;
+    }
+    let base = format!("{name}.corrupt-{}-{}", now_epoch() as u64, std::process::id());
+    let mut target = dir.join(&base);
+    for n in 1..64u32 {
+        if !target.exists() {
+            break;
+        }
+        target = dir.join(format!("{base}.{n}"));
+    }
+    if target.exists() {
+        eprintln!("[cysd] 큐 WAL '{name}' 보존 실패(격리 이름이 모두 선점됨) — 원본 무접촉");
+        return;
+    }
+    match std::fs::rename(&src, &target) {
+        Ok(()) => eprintln!(
+            "[cysd] 큐 WAL '{name}' 을 판독하지 못해 '{}' 로 보존했다 — 다음 영속이 원본을 덮지 않는다",
+            target.display()
+        ),
+        Err(e) => eprintln!("[cysd] 큐 WAL '{name}' 보존 실패({e}) — 원본 무접촉"),
+    }
 }
 
 impl Daemon {
@@ -3159,10 +3236,24 @@ impl Daemon {
         // (미배달 큐 재기동 생존·P7). ★G1(W2-A): queue_seq 시드 계산이 이 복원분을 근거로
         // 하므로 struct init 전에 먼저 로드한다 — 시드 = max(seq)+1(WAL 부재 시 1)로
         // 재기동 후 발급 seq가 살아있는 복원 항목과 절대 겹치지 않는다.
-        let restored_qentries = load_queue_state(&dir);
+        let active_wal = load_queue_state(&dir);
         // ★(0.14.31 · WP-5 M) 만료 복원분은 별 파일(queue-expired.json · 구 데몬 비가시). 시드는
         //   두 집합의 max(seq)+1 — 만료 항목 id 와도 겹치지 않아야 revive 후 pop-by-id 가 안전하다.
-        let mut restored_expired = load_queue_file(&dir, "queue-expired.json");
+        let expired_wal = load_queue_file(&dir, "queue-expired.json");
+        // ★(triage X4) 판독 불완전은 **하나의 사실**로 모아 데몬 수명 내내 남긴다. "마지막 쓰기가
+        //   성공했는가"(`queue_wal_durable`)와 다른 축이다 — 뒤이은 성공적인 쓰기가 "부팅이 전
+        //   내용을 복원하지 못했다" 는 사실을 지우면 안 된다.
+        let queue_restore_incomplete = active_wal.incomplete || expired_wal.incomplete;
+        // 보존(옆으로 치우기)은 **한 줄도 해석하지 못한** 파일에만 한다 — 파싱에 성공한 파일은
+        // 해석 가능한 내용이 전부 메모리에 있고 다음 영속이 그것을 되쓴다.
+        if active_wal.unreadable {
+            preserve_unreadable_queue_wal(&dir, "queue-state.json");
+        }
+        if expired_wal.unreadable {
+            preserve_unreadable_queue_wal(&dir, "queue-expired.json");
+        }
+        let restored_qentries = active_wal.rows;
+        let mut restored_expired = expired_wal.rows;
         // ★(0.14.31 · 리뷰 R5 · codex major) **파일 간 dedup — 활성이 이긴다.**
         //   목적지-먼저 쓰기(아래 `persist_queue_state`)는 두 치환 사이의 크래시에서 같은 id 가
         //   **두 파일에 다 있는** 상태를 남긴다(유실 대신 중복 — 의도된 안전 방향). 그때 두 벌을
@@ -3250,6 +3341,7 @@ impl Daemon {
             queue_expired_persisted: Mutex::new(expired_persisted_seed),
             queue_tick_at: Mutex::new(None),
             queue_persist_dirty: AtomicBool::new(false),
+            queue_restore_incomplete: AtomicBool::new(queue_restore_incomplete),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -7847,7 +7939,7 @@ mod tests {
                 {"mid":"qaaa","surface_id":3,"text":"첫 메시지","role":"master"}]"#,
         )
         .unwrap();
-        let out = load_queue_state(&dir);
+        let out = load_queue_state(&dir).rows;
         assert_eq!(out.len(), 2, "mid dedup — 파일 첫 등장 승");
         assert_eq!(out[0]["id"], json!("qaaa"), "id=mid 재사용(재기동 간 안정)");
         assert_eq!(out[1]["id"], json!("qbbb"));
@@ -7880,7 +7972,7 @@ mod tests {
             .collect();
         std::fs::write(dir.join("queue-state.json"), serde_json::to_string(&arr).unwrap())
             .unwrap();
-        let out = load_queue_state(&dir);
+        let out = load_queue_state(&dir).rows;
         assert_eq!(out.len(), 12);
         for (i, it) in out.iter().enumerate() {
             assert_eq!(
@@ -7905,7 +7997,7 @@ mod tests {
             r#"[{"surface_id":3,"text":"신원 없음"},{"mid":"qok","surface_id":3,"text":"정상"}]"#,
         )
         .unwrap();
-        let out = load_queue_state(&dir);
+        let out = load_queue_state(&dir).rows;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["id"], json!("qok"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7940,7 +8032,7 @@ mod tests {
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         s.pending_queue.lock().unwrap().push_back(e.clone());
         daemon.persist_queue_state();
-        let out = load_queue_state(&dir);
+        let out = load_queue_state(&dir).rows;
         assert_eq!(out.len(), 2, "라이브 1 + restored 1");
         let live = out
             .iter()
@@ -9517,7 +9609,7 @@ mod tests {
             "만료 표식 영속화"
         );
         assert!(
-            load_queue_state(&dir).is_empty(),
+            load_queue_state(&dir).rows.is_empty(),
             "구 데몬 reader는 만료 파일을 읽지 않는다"
         );
         let restored = Daemon::new(dir.join("cysd.sock"));
