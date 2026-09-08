@@ -910,7 +910,17 @@ jobs:
       #   system 파일의 벤더 미전진 보존·전진 시 자동 3-way)은 0.14.29 바이너리에서 처음 생긴다 —
       #   ≤0.14.28 스윕은 종전대로 vendor 본으로 치유해 팩 자신의 약속이 거짓이 된다(기능 의존 —
       #   RELEASE.md 불변 규칙). pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 동시 상향(두 값 동일 계약).
-      PACK_MIN_BINARY: '0.14.29'
+      # ★0.14.31 상향(2026-09-08 · CONTRACTS §B-10 · 통합 단계 마스터 집행). 이 세대 팩이
+      #   **0.14.31 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — `cys reclaim-role --auto`
+      #   (`cysjavis-pack/hooks/session-start.sh:94`, 안내 `:207`) · `cys gate-corpus --json`
+      #   (팩 preflight `C82.gate-corpus-drift`) · `cys approval sign --ttl` / `check --require-ttl`
+      #   · `cys status --json` 의 `alert_route` 키. 부재 실측(2026-09-08 · v0.14.30 대조):
+      #   `git show v0.14.30:src/bin/cys.rs | grep -c reclaim-role` → 0, 같은 명령 `gate-corpus` → 0,
+      #   `git show v0.14.30:cysjavis-pack/hooks/session-start.sh | grep -c reclaim-role` → 0.
+      #   ≤0.14.30 바이너리는 지시대로 실행하면 unknown-subcommand/unknown-flag 로 죽는다(기능
+      #   의존 — RELEASE.md 불변 규칙). pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서
+      #   동시 상향(두 값 동일 계약).
+      PACK_MIN_BINARY: '0.14.31'
     steps:
       - uses: actions/checkout@v4
 
