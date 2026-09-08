@@ -359,6 +359,62 @@ CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
 CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있어야 한다(P3 와 공유하는 계약)
 
 
+# ★triage T11: 판정 불능(`unknown`)은 등록도 해제도 하지 않는데 **그 사실이 어디에도 남지
+#   않았다**. preflight 를 자동으로 돌리는 유일 지점(`javis_bootstrap.py` ①) 앞의 레인 마커
+#   fast path 가 같은 pack_version 이면 preflight 를 통째로 생략하므로, 그 팩 버전의 첫 부팅이
+#   판정 불능이면 게이트는 그 버전 내내 미등록이고 두 번째 부팅부터는 경고조차 사라진다.
+#   그래서 미해소 사실을 **부트 체인이 읽을 수 있는 곳**(자기 레인 팩 state)에 남긴다.
+CAPGATE_UNRESOLVED_REL = os.path.join("state", "capgate-unresolved.json")
+
+
+def capgate_unresolved_path(pack=None):
+    """미해소 표식 경로(레인별 — 팩 디렉터리가 곧 레인이다)."""
+    return os.path.join(pack or pack_dir(), CAPGATE_UNRESOLVED_REL)
+
+
+def capgate_unresolved(pack=None):
+    """(True|False, doc|None) — 이 레인에 **미해소 능력 게이트 판정**이 남아 있는가.
+
+    부트 체인(`javis_bootstrap`)이 fast path 조건에 AND 로 넣는다. 판독 실패는 '미해소'로
+    읽는다(결측은 값이 아니다 — 표식을 못 읽으면 재측정하는 쪽이 막는 방향이다).
+    """
+    path = capgate_unresolved_path(pack)
+    if not os.path.exists(path):
+        return False, None
+    raw = _read_text_tolerant(path)
+    if raw is None:
+        return True, None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return True, None
+    return True, (doc if isinstance(doc, dict) else None)
+
+
+def _no_autostart_env(base=None):
+    """데몬을 **깨우지 않는** 조회용 env(`javis_guard_register.no_autostart_env` 미러).
+
+    ★triage T10: `cys` 는 연결 실패 경로에서 **형제 cysd 를 detached 로 기동**한다
+      (src/bin/cys.rs connect()). 옵트아웃은 `CYS_NO_AUTOSTART` 하나뿐이고, 타임아웃은 이미
+      태어난 데몬을 되돌리지 못한다. preflight 는 부트 체인의 **첫 단계**이고 이 축은 자기
+      주석에 '데몬을 깨우지 않는다' 고 적어 두었다 — 문서와 코드를 맞춘다(팩 안 선례:
+      `javis_completion_guard.py`). 표지 집합은 그대로 두고(죽은 데몬의 로그도 '조회를
+      시도해도 되는가' 의 신호로는 유효하다) **봉인은 항상** 건다.
+    """
+    env = dict(os.environ if base is None else base)
+    env["CYS_NO_AUTOSTART"] = "1"
+    return env
+
+
+def _is_pipe_address(sock):
+    """`\\\\.\\pipe\\…`·`//./pipe/…` 형태인가 — **파일 실재로 잴 수 없는** 주소다.
+
+    `_dept_state_dir` 이 쓰던 판별과 **같은 1지점**이다(사본 금지 · triage T12).
+    """
+    s = sock if isinstance(sock, str) else ""
+    return s.startswith(_WIN_PIPE_PREFIX) or s.startswith("//./pipe/")
+
+
 def _read_text_tolerant(path):
     """막히지 않는 텍스트 판독(FIFO·심링크 함정에서 preflight 가 정지하지 않게)."""
     try:
@@ -452,6 +508,21 @@ def capgate_registration_verdict(status_obj, directive_text):
     return False, " · ".join(missing)
 
 
+def _targets_doc_err(doc, path):
+    """대상표 문서의 검증 오류(없으면 None) — **수동 등록기의 검증기를 공유한다**(triage T13).
+
+    형제 모듈 import 실패(팩 스큐·부분 배포)는 '검증 불가' 이고, 그 귀결은 **등록 보류**여야
+    한다(C28 의 `_cap_tbl_err` → `unknown`). 손상된 표를 하드코딩으로 조용히 대체하지 않는
+    기존 계약과 같은 방향이다.
+    """
+    try:
+        import javis_guard_register as _gr   # 형제 모듈 — 표 검증기 1지점(읽기 전용)
+    except Exception as e:                   # noqa: BLE001 — import 실패는 사유로 올린다
+        return "대상표 검증기(javis_guard_register) 사용 불가(%s): %s" % (path, e)
+    _idx, err = _gr.validate_targets_doc(doc)
+    return ("대상표 손상(%s): %s" % (path, err)) if err else None
+
+
 def capgate_table_denied_basenames(pack, reader=None):
     """(deny 집합, err|None) — 대상표(`state/hook-targets.json` → `.example`)가 **명시적으로**
     `eligibility.capgate == "deny"` 라고 선언한 프로필 basename 들.
@@ -467,19 +538,28 @@ def capgate_table_denied_basenames(pack, reader=None):
     """
     base = os.path.join(pack, "state", "hook-targets.json")
     for path in (base, base + ".example"):
+        # ★triage T13ⓑ: **판독 실패는 부재가 아니다**(결측은 값이 아니다). 종전엔 둘 다
+        #   `raw is None` 으로 접혀 퍼미션 0 인 운영 표가 조용히 `.example` 폴백 —
+        #   나아가 "표 부재 = 전 프로필 등록" 으로 접혔다(운영자의 명시 제외가 사라진다).
+        if reader is None and not os.path.exists(path):
+            continue
         raw = (reader or _read_text_tolerant)(path)
         if raw is None:
+            if reader is None:
+                return set(), ("대상표 판독 실패(%s) — 파일은 있는데 읽지 못했다"
+                               "(판독 실패는 부재가 아니다)" % path)
             continue
         try:
             doc = json.loads(raw)
         except ValueError as e:
             return set(), "대상표 손상(%s): %s" % (path, e)
-        if not isinstance(doc, dict) or not isinstance(doc.get("profiles"), list):
-            return set(), "대상표 스키마 이상(%s): profiles 배열 없음" % path
+        # ★triage T13ⓐ: 검증은 **수동 등록기와 같은 로더**가 한다 — 두 등록기가 같은 표를
+        #   다르게 읽으면 그것은 표가 아니다(schema_version·eligibility 값 어휘 포함).
+        err = _targets_doc_err(doc, path)
+        if err:
+            return set(), err
         deny = set()
         for ent in doc["profiles"]:
-            if not isinstance(ent, dict):
-                return set(), "대상표 스키마 이상(%s): profiles 항목이 객체가 아니다" % path
             elig = ent.get("eligibility")
             if isinstance(elig, dict) and elig.get("capgate") == "deny":
                 deny.add(str(ent.get("basename") or ""))
@@ -1122,7 +1202,7 @@ def _settings_rmw(settings_path, mutate, indent=2):
 
 
 class Preflight:
-    def __init__(self, fix, skips, mode="report", allow_irreversible=False):
+    def __init__(self, fix, skips, mode="report", allow_irreversible=False, only=None):
         # OPP-17: mode ∈ report(관찰만)|fix(집행)|dry(미리보기)|safe(무변경+갭만).
         # self.fix 는 *집행 모드일 때만* True — dry/safe 에선 False 라 기존 50+ `if self.fix and …`
         # 가역 부작용 분기(c04 soul·c07 hook·c08 settings·c10 todo·c32 statusline·c33 event_hooks
@@ -1138,6 +1218,10 @@ class Preflight:
         # settings/todo 등)은 self.fix=False 로 일괄 비집행되므로 이 버퍼에 기록되지 않는다(정직 범위).
         self.planned = []
         self.skips = set(skips)
+        # ★triage T11: `--only` 는 **표적 재측정**(부트 체인이 미해소 축 하나만 다시 잰다).
+        #   `--skip` 과 달리 SKIP 행조차 남기지 않는다 — 출력이 그 검사 하나여야 소비자가
+        #   "무엇이 다시 측정됐는가"를 오해 없이 읽는다.
+        self.only = set(only or [])
         self.results = []
         self._init_pack_ran = None  # None=미시도, True/False=시도 결과
         # report 모드 병렬화용 sink 격리: 병렬 워커 스레드는 자기 버퍼에 add() 하고
@@ -1145,11 +1229,18 @@ class Preflight:
         self._local = threading.local()
 
     def add(self, cid, status, detail):
+        # ★triage T11 `--only`: 표적 밖 행은 **기록도 하지 않는다**. `skipped()` 는 검사 진입을
+        #   막지만 조기 반환(예: C03 의 부서 팩 면제)은 그 앞에서 행을 남긴다 — 두 지점을 함께
+        #   막아야 "무엇이 다시 측정됐는가" 가 출력 하나로 읽힌다.
+        if self.only and cid not in self.only:
+            return
         sink = getattr(self._local, "sink", None)
         target = self.results if sink is None else sink
         target.append({"id": cid, "status": status, "detail": detail})
 
     def skipped(self, cid):
+        if self.only and cid not in self.only:
+            return True                    # --only: 표적 밖은 **행조차 남기지 않는다**
         if cid in self.skips:
             self.add(cid, SKIP, "skipped by --skip")
             return True
@@ -3833,6 +3924,34 @@ class Preflight:
         return False
 
     @staticmethod
+    def _event_hook_scope_ok(settings_path, event, script_name, declared_matcher):
+        """우리 훅이 **선언 matcher 와 같은 범위**로 실려 있는가(범위가 다르면 부분 집행이다).
+
+        ★triage T8: `_event_hook_registered` 는 `entry.get("matcher")` 를 아예 보지 않았다.
+          `{"matcher":"Bash", …}` 로 이미 실려 있으면 C28 이 '등록됨' 으로 건너뛰어 교정하지
+          않는다 — capgate 계약은 matcher 없음(전 도구)이므로 그 상태의 게이트는 **Bash 에만**
+          붙고 CronCreate·Agent·Edit/Write 는 무게이트가 되며 `tool_calls` 예산도 Bash 만 센다
+          (조용한 게이트 면제). 실려 있지 않으면 이 축은 참이다(범위 위반이 없다).
+        """
+        try:
+            data = json.load(open(settings_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return True                    # 판독 불가는 이 축의 사실이 아니다(등록 축이 잰다)
+        if not isinstance(data, dict):
+            return True
+        prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
+        want = declared_matcher or ""
+        for entry in data.get("hooks", {}).get(event, []):
+            if not isinstance(entry, dict):
+                continue
+            ours = any(isinstance(h, dict)
+                       and _hook_entry_is_ours(h.get("command", ""), script_name, prefix)
+                       for h in entry.get("hooks", []))
+            if ours and (entry.get("matcher") or "") != want:
+                return False
+        return True
+
+    @staticmethod
     def _event_hook_present_any(settings_path, event, script_name):
         """**표기와 무관하게** 우리 팩의 script_name 훅이 그 이벤트에 실려 있나.
 
@@ -4017,9 +4136,14 @@ class Preflight:
                         "topology.json")
 
     def _capgate_daemon_present(self):
-        """(present: bool, why: str) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가."""
+        """(present: bool, why: str) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가.
+
+        ★triage T12: 명명 파이프 주소(`\\\\.\\pipe\\…`)는 파일 실재로 잴 수 없다 —
+          그 주소에서는 허브 표지 폴백으로 넘긴다(R2 가 넣었다고 적은 '플랫폼 공통 폴백' 이
+          명시 파이프 주소 환경에는 닿지 않았다). 판별은 `_is_pipe_address` 1지점이다.
+        """
         sock = os.environ.get("CYS_SOCKET")
-        if sock:
+        if sock and not _is_pipe_address(sock):
             # 한 번만 잰다 — 두 번 재면 판정과 사유가 갈릴 수 있다(측정은 한 시점의 사실이다).
             ok = os.path.exists(sock)
             return ok, ("CYS_SOCKET 실재(%s)" % sock if ok
@@ -4051,7 +4175,7 @@ class Preflight:
             # ★부트 창 예산(R1 minor): 이 축은 WARN-only 이고 데몬이 기동 중이면 상한까지
             #   끌려간다 — 판정 품질을 떨어뜨리지 않는 선에서 짧게 잡는다(15s→6s).
             r = subprocess.run([cys, "status", "--json"], capture_output=True,
-                               text=True, timeout=6)
+                               text=True, timeout=6, env=_no_autostart_env())
         except (OSError, subprocess.SubprocessError) as e:
             return None, "`cys status --json` 조회 실패(%s) — 판정 불능" % e
         if r.returncode != 0:
@@ -4225,9 +4349,21 @@ class Preflight:
             for t in _cap_allow_targets:
                 for _ev, _m in CAPGATE_HOOK[1]:
                     _cto = hook_timeout_for(CAPGATE_HOOK[0], _ev)
-                    if self._event_hook_registered(t, _ev, CAPGATE_HOOK[0], _cto):
+                    # ★triage T8: **범위 축**을 등록 유효성에 넣는다 — matcher 로 좁혀진 등록은
+                    #   '등록됨' 이 아니라 '부분 집행' 이다. 교정은 우리 항목만 빼고(남의 훅
+                    #   보존은 `_hook_entry_is_ours` 가 한다) matcher 없는 블록에 다시 넣는다.
+                    _scope_ok = self._event_hook_scope_ok(t, _ev, CAPGATE_HOOK[0], _m)
+                    if _scope_ok and self._event_hook_registered(t, _ev, CAPGATE_HOOK[0], _cto):
                         continue
                     if self.fix:
+                        if not _scope_ok:
+                            _serr = self._unregister_event_hook(t, _ev, CAPGATE_HOOK[0])
+                            if _serr:
+                                warns.append("%s/%s 능력 게이트 matcher 범위 교정 실패: %s"
+                                             % (os.path.basename(t), _ev, _serr))
+                            else:
+                                fixed.append("%s 능력 게이트 matcher 범위 교정(전 도구로 환원)"
+                                             % os.path.basename(t))
                         err = self._register_event_hook(t, _ev, CAPGATE_HOOK[0], _m,
                                                         timeout=_cto)
                         if err:
@@ -4237,6 +4373,10 @@ class Preflight:
                             fixed.append("%s←%s(%s)" % (os.path.basename(t),
                                                         CAPGATE_HOOK[0], _ev))
                             _cap_added.append(os.path.basename(t))
+                    elif not _scope_ok:
+                        warns.append("%s 능력 게이트(%s)가 matcher 로 좁혀져 있다 — 전 도구 계약 "
+                                     "위반(Bash 밖 도구가 무게이트 · --fix 로 교정)"
+                                     % (os.path.basename(t), _ev))
                     else:
                         warns.append("%s 능력 게이트(%s) 미등록(--fix)"
                                      % (os.path.basename(t), _ev))
@@ -4264,6 +4404,42 @@ class Preflight:
         elif not _cap_body:
             warns.append("능력 게이트(%s) 조건은 충족인데 훅 **본체가 없다** — init-pack 재실행"
                          % CAPGATE_HOOK[0])
+        # ⓔ ★triage T11: **미해소 표식**을 남긴다(다음 부팅의 재측정 기회). 지우는 조건은
+        #   '판정이 났다' 가 아니라 **'반영까지 확인됐다'** 이다(codex 설계비평 C-1: 훅 부재·
+        #   설정 쓰기 실패에도 표식을 지우면 다시 고착된다). report/dry/safe 모드는 상태를
+        #   바꾸지 않는다(무변경 계약).
+        _cap_reflected = (
+            (_cap_state == CAPGATE_ON and _cap_body
+             and all(self._event_hook_scope_ok(t, ev, CAPGATE_HOOK[0], m)
+                     and self._event_hook_registered(t, ev, CAPGATE_HOOK[0],
+                                                     hook_timeout_for(CAPGATE_HOOK[0], ev))
+                     for t in _cap_allow_targets for ev, m in CAPGATE_HOOK[1]))
+            or (_cap_state == CAPGATE_OFF and not _cap_still))
+        if self.fix:
+            _cap_mark = capgate_unresolved_path()
+            try:
+                if _cap_reflected:
+                    if os.path.exists(_cap_mark):
+                        os.remove(_cap_mark)
+                        fixed.append("능력 게이트 미해소 표식 해소")
+                else:
+                    os.makedirs(os.path.dirname(_cap_mark), exist_ok=True)
+                    _payload = {"state": _cap_state, "why": _cap_why,
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "pack": pack_dir(),
+                                "note": ("다음 부팅의 fast path 가 이 표식을 보고 C28 만 다시 "
+                                         "돈다(전량 preflight 재실행이 아니다)")}
+                    if _lock is not None:
+                        _lock.atomic_write_json(_cap_mark, _payload)
+                    else:
+                        with open(_cap_mark, "w", encoding="utf-8") as _f:
+                            json.dump(_payload, _f, ensure_ascii=False, indent=1)
+                    warns.append("능력 게이트 미해소(%s) — 표식을 남겼다(%s). 다음 부팅이 "
+                                 "fast path 로 preflight 를 건너뛰지 않고 C28 만 재측정한다"
+                                 % (_cap_state, _cap_mark))
+            except OSError as _e:
+                warns.append("능력 게이트 미해소 표식 기록 실패(%s) — 다음 부팅의 재측정 "
+                             "기회가 없다" % _e)
         for t in targets:
             for script_name, events in _reg_hooks:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
@@ -8523,7 +8699,7 @@ def _dept_state_dir(name, sock, os_name=None, platform=None):
     돌리지 않는다 · codex R1) · named pipe(`\\\\.\\pipe\\…`) 또는 Windows = %LOCALAPPDATA%\\cys\\<pipe_slug>(state.rs RC-13 ·
     슬러그 빈/`cys` 는 루트) · 소켓 미기록 = cys-dept dept_sock 규약 ~/.local/state/cys-dept-<name>(bash 는 XDG 를 모른다)."""
     sock = sock if isinstance(sock, str) else ""
-    is_pipe = sock.startswith(_WIN_PIPE_PREFIX) or sock.startswith("//./pipe/")
+    is_pipe = _is_pipe_address(sock)
     if is_pipe or (os_name or os.name) == "nt":
         root = _win_state_root()
         if root is None:
@@ -9405,12 +9581,44 @@ def _self_test():
         check("바이너리 해소는 `CYS_BIN` **우선**(명시 오버라이드가 PATH 발견보다 앞 · 축 1지점)",
               'os.environ.get("CYS_BIN") or shutil.which("cys")'
               in _pin_src(Preflight._capgate_alert_axis))
+        # ★triage T13 재핀(의도적 계약 변경 · 계획 §3-8): 종전 핀은 `schema_version`·policy·
+        #   eligibility 값 어휘가 **없는** 문서를 유효로 못박고 있었다 — 그것이 곧 결함이었다
+        #   (같은 표를 수동 등록기는 손상으로 거부하고 부팅 등록기는 통과시켰다). 이제 두
+        #   등록기가 `javis_guard_register.validate_targets_doc` 하나를 공유한다.
+        _tbl_ok = ('{"schema_version":1,"policy":{"unknown_profile":"deny"},"profiles":['
+                   '{"basename":".claude-2","eligibility":{"guard_stop":"allow",'
+                   '"brief_warn":"allow","capgate":"deny"}},'
+                   '{"basename":".claude","eligibility":{"guard_stop":"allow",'
+                   '"brief_warn":"allow"}}]}')
         check("대상표 판독기: 명시 deny 만 집행 · 미지 프로필은 deny 가 아니다 · 손상은 폴백 없이 err",
               capgate_table_denied_basenames("/nonexistent/pack") == (set(), None)
               and capgate_table_denied_basenames(
-                  "/x", reader=lambda _p: '{"profiles":[{"basename":".claude-2",'
-                  '"eligibility":{"capgate":"deny"}},{"basename":".claude"}]}') == ({".claude-2"}, None)
+                  "/x", reader=lambda _p: _tbl_ok) == ({".claude-2"}, None)
               and capgate_table_denied_basenames("/x", reader=lambda _p: "{")[1] is not None)
+        check("대상표 검증은 **두 등록기가 같은 로더**를 쓴다(schema_version·값 어휘 · triage T13)",
+              capgate_table_denied_basenames(
+                  "/x", reader=lambda _p: _tbl_ok.replace('"schema_version":1',
+                                                          '"schema_version":99'))[1] is not None
+              and capgate_table_denied_basenames(
+                  "/x", reader=lambda _p: _tbl_ok.replace('"capgate":"deny"',
+                                                          '"capgate":"DENY"'))[1] is not None)
+        check("판독 실패는 **부재가 아니다**(퍼미션·FIFO 함정에서 조용히 폴백하지 않는다 · T13ⓑ)",
+              "판독 실패는 부재가 아니다"
+              in _pin_src(capgate_table_denied_basenames))
+        check("판정 불능은 **지속 기록**으로 남고 반영 확인 뒤에만 지워진다(triage T11)",
+              "capgate_unresolved_path(" in _pin_src(Preflight.c28_self_correction)
+              and "_cap_reflected" in _pin_src(Preflight.c28_self_correction)
+              and capgate_unresolved("/nonexistent/pack") == (False, None))
+        check("등록 유효성에 **matcher 범위 축**이 있다(matcher 로 좁혀진 등록은 부분 집행 · T8)",
+              "_event_hook_scope_ok(" in _pin_src(Preflight.c28_self_correction)
+              and Preflight._event_hook_scope_ok.__doc__ is not None)
+        check("등록 프로브는 데몬 autostart 를 **봉인**한다(triage T10 · 두 등록기 같은 계약)",
+              "_no_autostart_env()" in _pin_src(Preflight._capgate_alert_axis)
+              and _no_autostart_env().get("CYS_NO_AUTOSTART") == "1")
+        check("명명 파이프 주소는 파일 실재 대신 **허브 표지 폴백**으로 간다(triage T12)",
+              "_is_pipe_address(" in _pin_src(Preflight._capgate_daemon_present)
+              and _is_pipe_address("\\\\.\\pipe\\cys") and _is_pipe_address("//./pipe/cys")
+              and not _is_pipe_address("/tmp/cys.sock"))
         check("능력 게이트 훅 선언 timeout(전 도구 훅의 바깥 겹)",
               HOOK_TIMEOUT_S.get(("role-capability-gate.sh", "PreToolUse")) == 15)
         c82_src = _pin_src(Preflight.c82_gate_corpus_drift)
@@ -9457,6 +9665,8 @@ def main():
     ap.add_argument("--json", action="store_true", help="JSON 출력")
     ap.add_argument("--skip", action="append", default=[], metavar="ID",
                     help="해당 검사 건너뜀 (예: --skip C12.daemon)")
+    ap.add_argument("--only", action="append", default=[], metavar="ID",
+                    help="해당 검사만 실행 (부트 체인의 표적 재측정 · 예: --only C28.self-correction)")
     args = ap.parse_args()
 
     if args.safe and (args.dry_run or args.fix):
@@ -9467,7 +9677,7 @@ def main():
             else "fix" if args.fix else "report")
 
     pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
-                   allow_irreversible=args.allow_irreversible)
+                   allow_irreversible=args.allow_irreversible, only=args.only)
     results = pf.run()
     fails = sum(1 for r in results if r["status"] == FAIL)
     warns = sum(1 for r in results if r["status"] == WARN)

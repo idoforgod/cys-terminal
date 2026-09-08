@@ -171,10 +171,26 @@ def _hub_state_dir():
     return os.path.join(root, "cys")
 
 
+# ★Windows 명명 파이프 주소 — `javis_preflight._dept_state_dir` 의 같은 판별을 미러한다
+#   (HUB_LIVE_MARKERS·_hub_state_dir 와 같은 미러 계약 · 파리티는 검체가 잰다).
+WIN_PIPE_PREFIXES = ("\\\\.\\pipe\\", "//./pipe/")
+
+
+def is_pipe_address(sock):
+    """`\\\\.\\pipe\\…`·`//./pipe/…` 형태인가 — **파일 실재로 잴 수 없는** 주소다."""
+    s = sock if isinstance(sock, str) else ""
+    return any(s.startswith(pre) for pre in WIN_PIPE_PREFIXES)
+
+
 def _daemon_present():
-    """(present, why) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가(파일 실재만 본다)."""
+    """(present, why) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가(파일 실재만 본다).
+
+    ★triage T12: 명명 파이프 주소는 `os.path.exists()` 로 잴 수 없다(인스턴스 사용 중·
+      메타데이터 조회 실패에서도 stat 이 실패한다). 그때 살아 있는 데몬을 '미실재' 로 읽으면
+      수동 등록은 거부·부팅 등록기는 영구 `unknown` 이 된다 — 허브 표지 폴백으로 넘긴다.
+    """
     sock = os.environ.get("CYS_SOCKET")
-    if sock:
+    if sock and not is_pipe_address(sock):
         return os.path.exists(sock), ("CYS_SOCKET 실재(%s)" % sock if os.path.exists(sock)
                                       else "데몬 소켓 미실재(%s)" % sock)
     sd = _hub_state_dir()
@@ -184,6 +200,19 @@ def _daemon_present():
     if not found:
         return False, "허브 상태 디렉터리(%s)에 데몬 표지 0건" % sd
     return True, "데몬 표지 %s" % ",".join(found[:3])
+
+
+def no_autostart_env(base=None):
+    """데몬을 **깨우지 않는** 조회용 env(`javis_preflight._no_autostart_env` 미러).
+
+    ★triage T10: `cys` 는 연결 실패 경로에서 **형제 cysd 를 detached 로 기동**한다
+      (src/bin/cys.rs connect()). 옵트아웃은 `CYS_NO_AUTOSTART` 하나뿐이고 타임아웃은 이미
+      태어난 데몬을 되돌리지 못한다 — 이 축은 '데몬을 깨우지 않는다' 고 적어 두었으므로
+      문서와 코드를 맞춘다(팩 안 선례: javis_completion_guard.py).
+    """
+    env = dict(os.environ if base is None else base)
+    env["CYS_NO_AUTOSTART"] = "1"
+    return env
 
 
 def _capgate_eligibility(pack, timeout=6):
@@ -208,7 +237,7 @@ def _capgate_eligibility(pack, timeout=6):
         else:
             try:
                 r = subprocess.run([cys, "status", "--json"], capture_output=True, text=True,
-                                   timeout=timeout)
+                                   timeout=timeout, env=no_autostart_env())
                 doc = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
                 ar = doc.get("alert_route") if isinstance(doc, dict) else None
                 ok_alert = isinstance(ar, dict) and ar.get("enabled") is True
@@ -276,6 +305,22 @@ def _load_targets(path):
         doc = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as e:
         return None, "판독/파싱 실패: %s" % e
+    index, err = validate_targets_doc(doc)
+    if err:
+        return None, err
+    policy = doc.get("policy") if isinstance(doc.get("policy"), dict) else {}
+    return {"doc": doc, "index": index, "policy": policy, "path": path,
+            "sha256": hashlib.sha256(raw).hexdigest()}, None
+
+
+def validate_targets_doc(doc):
+    """(index|None, err|None) — 대상표 **문서**의 검증(파일 I/O 없음).
+
+    ★triage T13: 부팅 등록기(`javis_preflight.capgate_table_denied_basenames`)와 수동 등록기가
+      **같은 검증기**를 쓴다. 종전엔 preflight 가 `schema_version` 도 eligibility 값 어휘도 보지
+      않아, 수동 등록기가 손상으로 거부하는 표를 부팅 경로는 조용히 통과시켰다(운영자가 선언한
+      제외가 부팅 경로에서만 사라졌다 — "표가 표다" 라는 계약이 손상 입력에서 깨졌다).
+    """
     if not isinstance(doc, dict):
         return None, "최상위가 객체가 아님(%s)" % type(doc).__name__
     if doc.get("schema_version") != 1:
@@ -305,8 +350,7 @@ def _load_targets(path):
     policy = doc.get("policy") if isinstance(doc.get("policy"), dict) else {}
     if policy.get("unknown_profile") not in ("deny", "allow"):
         return None, "policy.unknown_profile=%r (deny|allow 기대)" % policy.get("unknown_profile")
-    return {"doc": doc, "index": index, "policy": policy, "path": path,
-            "sha256": hashlib.sha256(raw).hexdigest()}, None
+    return index, None
 
 
 def _decide(table, base, hook_key, spec, force_master, force_unknown):

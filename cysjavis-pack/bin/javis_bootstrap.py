@@ -2706,10 +2706,25 @@ def _cmd_run_chain(log):
     _marker = _read_json(lane_state_path("marker")) or {}
     _marker_fresh = (_marker.get("pack_version") == _pack_version()
                      and _marker.get("pack_version") not in (None, "unknown"))
-    if _marker_fresh:
+    # ★triage T11(2026-09-08) 소비 축: fast path 는 **미해소 능력 게이트 표식**을 AND 로 본다.
+    #   preflight C28 의 `unknown`(데몬 미기동·표 판독 실패 등)은 등록도 해제도 하지 않는데,
+    #   fast path 가 preflight 자체를 생략하면 그 팩 버전 내내 재측정 기회가 없다 — 게이트가
+    #   미등록인 채 조용히 굳고 두 번째 부팅부터는 경고조차 사라진다(봉인표 ② 방향).
+    #   표식이 있으면 **전량 재실행이 아니라 C28 만** 짧게 다시 돈다(데몬을 기다리는 재시도
+    #   루프는 넣지 않는다 — 부트 지연·큐 적체를 만들지 않는 것이 이 축의 전제다).
+    #   표식의 생성·삭제 정본은 `javis_preflight.capgate_unresolved_path()` 다.
+    _cap_mark = os.path.join(PACK, "state", "capgate-unresolved.json")
+    _cap_unresolved = os.path.exists(_cap_mark)
+    if _marker_fresh and not _cap_unresolved:
         log.step(STEP.PREFLIGHT, 0,
                  "레인 마커(%s)가 현재 pack_version — preflight 생략(fast path)"
                  % lane_state_path("marker"))
+    elif _marker_fresh and os.path.isfile(preflight):
+        _progress("① 능력 게이트 판정 불능 표식 — C28 만 재측정 중(최대 90s · 비치명)…")
+        code, out = _run([py, preflight, "--fix", "--only", "C28.self-correction"], timeout=90)
+        log.step(STEP.PREFLIGHT, code,
+                 "레인 마커는 신선하지만 능력 게이트 미해소 표식(%s) — C28 표적 재측정: %s"
+                 % (_cap_mark, out))
     elif os.path.isfile(preflight):
         _progress("① preflight --fix 실행 중(최대 300s · 비치명 — FAIL이어도 팀 부팅 계속)…")
         code, out = _run([py, preflight, "--fix"], timeout=300)
