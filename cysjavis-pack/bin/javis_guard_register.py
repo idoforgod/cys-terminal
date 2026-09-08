@@ -412,7 +412,7 @@ def _command_str(spec, pack):
     r"""등록될 command 문자열 — 훅 실물 절대경로. 팩 경로가 바뀌면 문자열도 바뀐다(의도).
 
     ★Windows 규칙은 preflight `_cys_hook_cmd` 와 **같아야 한다**(R2 blocking · codex 실증):
-      종전 `"sh %s" % os.path.join(...)` 는 Windows 에서 `sh C:\Users\A B\.cys\pack\hooks/…` 를
+      종전 `"sh %s" % os.path.join(...)` 는 Windows 에서 `sh C:\Users\user name\.cys\pack\hooks/…` 를
       만들고, 실제 Bash 는 그 역슬래시를 escape 로 먹어 `C:UsersA` 처럼 **경로를 파괴**한다 —
       자격 검사는 통과하고 '등록됨' 을 보고하는데 훅은 실행되지 않는다(게이트 소실).
       정슬래시 + 따옴표가 유일하게 안전한 형태이고, 두 등록기가 같은 문자열을 내야 서로의

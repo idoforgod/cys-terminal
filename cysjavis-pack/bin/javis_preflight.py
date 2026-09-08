@@ -6791,7 +6791,7 @@ _MAXPATHLEN = 1024
 def _fgetpath(path):
     """darwin 전용 **저장 표기 오라클** — `fcntl(fd, F_GETPATH)` 은 `getcwd(3)`/libuv `uv_cwd`(= node `process.cwd()`)
     와 같은 출처(vnode 이름)를 돌려준다. 실패·미지원·비-darwin 은 None(호출자는 종전 realpath 유지).
-    실측(2026-09-07 · macOS 27 · APFS): `/Users/cys/Desktop/cysjavis` → `/Users/cys/Desktop/CYSjavis`(자식 getcwd 와 일치 ·
+    실측(2026-09-07 · macOS 27 · APFS): `/Users/user/Desktop/cysjavis` → `/Users/user/Desktop/CYSjavis`(자식 getcwd 와 일치 ·
     realpath 는 별칭 표기를 그대로 둔다) · NFC/NFD 로 만든 디렉터리를 반대 형태로 열어도 자식 getcwd 와 일치(realpath 는 4형
     중 2형에서 불일치). 정규화는 **우리가 하지 않는다**(APFS 는 정규화 보존 · codex D1)."""
     if sys.platform != "darwin":
@@ -8939,30 +8939,30 @@ def _self_test():
               and not _trusted_exact({"projects": {"/w/a": 1}}, "/w/a") and not _trusted_exact({"projects": {"/w/a": {"hasTrustDialogAccepted": 1}}}, "/w/a")
               and _trusted_exact({"projects": {"/w/a": {"hasTrustDialogAccepted": True}}}, "/w/a"))
         check("_is_claude_command: 실행 형상만(basename claude/claude.exe/claude.cmd · claude-code cli.js)",
-              _is_claude_command(["/Users/o/.local/bin/claude", "--continue"])
-              and _is_claude_command(["C:\\Users\\o\\AppData\\claude.exe"])
+              _is_claude_command(["/Users/user/.local/bin/claude", "--continue"])
+              and _is_claude_command(["C:\\Users\\user\\AppData\\claude.exe"])
               and _is_claude_command(["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"])
               and not _is_claude_command(["python3", "javis_preflight.py", "--seed-trust", "--config",
-                                          "/Users/o/.cys/claude-default-dept-3"])
+                                          "/Users/user/.cys/claude-default-dept-3"])
               and not _is_claude_command(["/usr/bin/python3", "-m", "notebooklm"]))
         ps_lines = [
-            "  91703 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg HOME=/Users/o",
-            "  92160 /Users/o/.local/share/uv/tools/x/bin/python CLAUDE_CONFIG_DIR=/w/cfg HOME=/Users/o",
-            "  93000 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=/w/other HOME=/Users/o",
+            "  91703 /Users/user/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg HOME=/Users/o",
+            "  92160 /Users/user/.local/share/uv/tools/x/bin/python CLAUDE_CONFIG_DIR=/w/cfg HOME=/Users/o",
+            "  93000 /Users/user/.local/bin/claude CLAUDE_CONFIG_DIR=/w/other HOME=/Users/o",
             "  94000 /bin/sh /tmp/x/claude CLAUDE_CONFIG_DIR=/w/cfg/",
             "  95000 python3 javis_preflight.py --seed-trust --config /w/cfg CLAUDE_CONFIG_DIR=/w/cfg",
-            "  96000 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg",
+            "  96000 /Users/user/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg",
         ]
         check("ps -E 판정(구분자 없는 모드): 그 config 의 claude 만 양성(uv python 제외 · 검사기 자기 제외 · self_pid 제외 · 꼬리 / 허용) · 타 config claude 는 0 이 아니라 unresolved(R3) = (2, 6, 1)",
               _count_claude_in_ps_lines(ps_lines, "/w/cfg", self_pids={"96000"}) == (2, 6, 1))
         check("ps -E 판정: 공백 포함 env 값 보존(다음 NAME= 직전까지)",
               _count_claude_in_ps_lines(["  1 /usr/bin/claude CLAUDE_CONFIG_DIR=/w/My Dir HOME=/x"], "/w/My Dir") == (1, 1, 0))
         check("ps -E 판정: claude 형상인데 env 세그먼트 0 → unresolved(0 으로 흡수 금지 · R1 codex)",
-              _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude --continue", "  8 /usr/bin/python3 x.py"], "/w/cfg") == (0, 2, 1))
+              _count_claude_in_ps_lines(["  7 /Users/user/.local/bin/claude --continue", "  8 /usr/bin/python3 x.py"], "/w/cfg") == (0, 2, 1))
         check("ps -E 판정: env 는 보이는데 CLAUDE_CONFIG_DIR 없음 → 기본 ~/.claude 대상이면 양성 · 아니면 unresolved(R3 · 구분자 없는 모드는 claude 형상에 검증된 0 을 주지 않는다)",
-              _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude HOME=/x"], "/w/cfg") == (0, 1, 1)
-              and _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude HOME=/x"], _default_claude_config_dir()) == (1, 1, 0)
-              and _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude HOME=/x"], "/w/cfg", argv_lines=["7 /Users/o/.local/bin/claude"]) == (0, 1, 0))
+              _count_claude_in_ps_lines(["  7 /Users/user/.local/bin/claude HOME=/x"], "/w/cfg") == (0, 1, 1)
+              and _count_claude_in_ps_lines(["  7 /Users/user/.local/bin/claude HOME=/x"], _default_claude_config_dir()) == (1, 1, 0)
+              and _count_claude_in_ps_lines(["  7 /Users/user/.local/bin/claude HOME=/x"], "/w/cfg", argv_lines=["7 /Users/user/.local/bin/claude"]) == (0, 1, 0))
         amb = "  7 claude -p CLAUDE_CONFIG_DIR=/w/other CLAUDE_CONFIG_DIR=/w/cfg HOME=/x"
         check("ps -E 판정(R3 codex): 경계 없는 줄은 CLAUDE_CONFIG_DIR= 세그먼트 어느 하나라도 일치하면 양성 · 불일치는 전부 unresolved(인자가 env 를 가릴 수 있다)",
               _count_claude_in_ps_lines([amb], "/w/cfg") == (1, 1, 0)
@@ -9019,9 +9019,9 @@ def _self_test():
         check("claude_procs_for_config darwin: 주입 ps 출력 계수(96000 은 실 pid 가 아니므로 포함 = 3)",
               claude_procs_for_config("/w/cfg", runner=_two_ps("\n".join(ps_lines)), os_name="posix", platform="darwin")[0] == 3)
         check("claude_procs_for_config darwin: 양성 0 + env 비노출 claude 형상 → None · 양성 ≥1 이면 unresolved 보다 우선 n(강행 불가 방향)",
-              claude_procs_for_config("/w/cfg", runner=_two_ps("  7 /Users/o/.local/bin/claude\n"),
+              claude_procs_for_config("/w/cfg", runner=_two_ps("  7 /Users/user/.local/bin/claude\n"),
                                       os_name="posix", platform="darwin")[0] is None
-              and claude_procs_for_config("/w/cfg", runner=_two_ps("  7 /Users/o/.local/bin/claude\n  8 /Users/o/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg\n"),
+              and claude_procs_for_config("/w/cfg", runner=_two_ps("  7 /Users/user/.local/bin/claude\n  8 /Users/user/.local/bin/claude CLAUDE_CONFIG_DIR=/w/cfg\n"),
                                           os_name="posix", platform="darwin")[0] == 1)
         check("claude_procs_for_config darwin(R3): ps 2회 — argv 만(-o) 먼저 · 그 다음 -E · argv ps 실패 → None",
               '["ps", "-ax", "-ww", "-o", "pid=,command="]' in _pin_src(claude_procs_for_config)
@@ -9401,16 +9401,16 @@ def _self_test():
               and "open(" not in gapread_src)
         check("_is_claude_command strict(env 비노출 줄): argv[0] 이름/설치 경로 · argv[0..1] claude-code .js 만 — tail/less/grep 인자 속 claude 제외(R2)",
               not _is_claude_command(["tail", "-f", "/x/logs/claude"], strict=True)
-              and not _is_claude_command(["less", "/Users/o/.local/bin/claude"], strict=True)
+              and not _is_claude_command(["less", "/Users/user/.local/bin/claude"], strict=True)
               and not _is_claude_command(["tail", "-f", "/x/claude-code/debug.log"], strict=True)
               and not _is_claude_command(["python3", "x.py", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], strict=True)
-              and _is_claude_command(["/Users/o/.local/bin/claude", "--continue"], strict=True)
-              and _is_claude_command(["/Users/o/.local/share/claude/versions/2.1.263", "--effort"], strict=True)
+              and _is_claude_command(["/Users/user/.local/bin/claude", "--continue"], strict=True)
+              and _is_claude_command(["/Users/user/.local/share/claude/versions/2.1.263", "--effort"], strict=True)
               and _is_claude_command(["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"], strict=True)
               and _is_claude_command(["tail", "-f", "/x/logs/claude"]))
         check("ps -E 판정: env 비노출 tail/less 줄은 unresolved 가 아니다 · env 비노출 claude 줄은 unresolved(R2)",
-              _count_claude_in_ps_lines(["  7 tail -f /x/logs/claude", "  8 less /Users/o/.local/bin/claude"], "/w/cfg") == (0, 2, 0)
-              and _count_claude_in_ps_lines(["  7 /Users/o/.local/bin/claude --continue"], "/w/cfg") == (0, 1, 1))
+              _count_claude_in_ps_lines(["  7 tail -f /x/logs/claude", "  8 less /Users/user/.local/bin/claude"], "/w/cfg") == (0, 2, 0)
+              and _count_claude_in_ps_lines(["  7 /Users/user/.local/bin/claude --continue"], "/w/cfg") == (0, 1, 1))
         seed_body = _PinSrc(seed_src.split('"""', 2)[2])   # 시그니처·docstring 뒤 본문
         check("seed_trust: --force-unverified 는 프로세스 확인 단계만 넘긴다(본문 참조 1회 · 프로브 뒤 · mkstemp 앞 · 교환 기구 부재 거부는 못 넘는다 R3)",
               seed_body.count("force_unverified") == 1

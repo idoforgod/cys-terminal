@@ -624,8 +624,8 @@ pub(crate) mod tests {
         }
     }
 
-    const CFG: &str = "/Users/cys/.cys/claude";
-    const CWD: &str = "/Users/cys/dev/proj";
+    const CFG: &str = "/Users/user/.cys/claude";
+    const CWD: &str = "/Users/user/dev/proj";
 
     /// 데몬이 호출 좌석(sid 9)에 대해 아는 축 — 신뢰 출처 계정 dir + 지금의 cwd.
     fn known() -> &'static [String] {
@@ -808,13 +808,13 @@ pub(crate) mod tests {
             Decision::Bind { role: "worker-2".into(), from_surface: 3 }
         );
         // ⓑ 다른 값 신고 → **좁혀서** 무결합(데몬 축은 맞지만 사람은 다른 곳에 있다).
-        ax.narrow_cwds = narrow(&["/Users/cys/dev/elsewhere"]);
+        ax.narrow_cwds = narrow(&["/Users/user/dev/elsewhere"]);
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
             Decision::NoCandidate
         );
         // ⓒ 신고로 **넓히지 못한다**: 데몬이 아는 cwd 와 다른 좌석은 신고를 맞춰도 후보가 아니다.
-        let elsewhere = [ent("worker-2", 3, "empty", CFG, "/Users/cys/dev/elsewhere")];
+        let elsewhere = [ent("worker-2", 3, "empty", CFG, "/Users/user/dev/elsewhere")];
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &elsewhere, false),
             Decision::NoCandidate,
@@ -895,10 +895,10 @@ pub(crate) mod tests {
     /// 부서 데몬끼리 surface id 공간이 겹치므로 id 일치는 아무 것도 증명하지 않는다.
     #[test]
     fn other_department_config_dir_is_not_a_candidate() {
-        let other = ent("cso", 3, "empty", "/Users/cys/.cys/claude-default-dept-2", CWD);
+        let other = ent("cso", 3, "empty", "/Users/user/.cys/claude-default-dept-2", CWD);
         assert_eq!(decide_one(&[other]), Decision::NoCandidate);
         // cwd 만 다른 경우도 마찬가지(프로젝트가 다르면 남의 역할이다).
-        let elsewhere = ent("cso", 3, "empty", CFG, "/Users/cys/dev/other");
+        let elsewhere = ent("cso", 3, "empty", CFG, "/Users/user/dev/other");
         assert_eq!(decide_one(&[elsewhere]), Decision::NoCandidate);
     }
 
@@ -975,7 +975,7 @@ pub(crate) mod tests {
         assert_eq!(norm_path_on("///", false), "///", "루트류를 빈 문자열로 접었다");
         assert!(same_path(Some("/a/b/"), Some("/a/b")));
         assert!(!same_path(Some("/a/b"), Some("/a/B")), "대소문자 관용 금지");
-        assert!(!same_path(Some("~/dev/x"), Some("/Users/cys/dev/x")), "tilde 확장 금지(순수)");
+        assert!(!same_path(Some("~/dev/x"), Some("/Users/user/dev/x")), "tilde 확장 금지(순수)");
         assert!(!same_path(None, None), "결측끼리 일치");
         assert!(!same_path(Some(""), Some("")), "빈 문자열끼리 일치");
         assert!(!same_path(Some(" "), Some("  ")), "공백뿐인 값끼리 일치");
@@ -1080,8 +1080,8 @@ pub(crate) mod tests {
     /// (`reported_cwd_only_narrows_never_widens`).
     #[test]
     fn authentication_axes_come_from_the_daemon_not_from_the_caller() {
-        const OTHER_CFG: &str = "/Users/cys/.cys/claude-dept-3";
-        const OTHER_CWD: &str = "/Users/cys/dev/other-proj";
+        const OTHER_CFG: &str = "/Users/user/.cys/claude-dept-3";
+        const OTHER_CWD: &str = "/Users/user/dev/other-proj";
         // ⓐ 타 계정 dir 좌석은 후보가 아니다 — 신고로 뒤집을 수 있는 축이 아예 없다.
         assert_eq!(
             decide(None, Some(&axes()), 10_000.0, LeaseState::Free,
