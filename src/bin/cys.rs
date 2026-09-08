@@ -1937,6 +1937,8 @@ fn resolve_gate_corpus(agent: &str) -> cys::first_run_gates::Resolved {
                 source: cys::first_run_gates::Source::SpecUnreadable {
                     reason: e.to_string(),
                 },
+                // 스펙 자체에 도달하지 못했다 — '봉투가 무시됐다' 와 다른 사실이고, 출처가 이미 싣는다.
+                envelope_ignored: false,
             }
         }
     };
@@ -2013,14 +2015,21 @@ fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
     }
     if let Some(v) = detected {
         println!("detected_version={v}");
-        // ★(0.14.31 · 리뷰 R1) 아래 policy 열은 **진단이지 집행이 아니다.** 이 한 줄이 없으면
-        //   운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는다 — 거짓이다.
-        if !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED {
-            println!(
-                "  ★policy 는 진단이다 — 자동확인 조립은 **버전을 보지 않는다**. 그 조립이 보는 \
-                 것은 화면 층위 봉인(정본 사람 1회 관문) · 커서 벨트 · 선언 시퀀스가 Return \
-                 한 발인가(down=0) 셋이고, held_version_* 를 '키가 안 나간다' 로 읽지 말 것"
-            );
+        // ★(0.14.31 · 리뷰 R1 · 독립 재유도 H2-B 개정) 아래 policy 열이 **어디까지 집행되는가**를
+        //   사람용 출력에서도 말한다. 이 줄이 없으면 운영자는 `held_version_drift` 와
+        //   `held_version_unknown` 을 같은 무게로 읽는데, 지금 그 둘의 귀결은 다르다.
+        match cys::first_run_gates::ACTION_POLICY_ENFORCEMENT {
+            cys::first_run_gates::PolicyEnforcement::VersionDriftOnly => println!(
+                "  ★policy 중 집행되는 것은 **버전 불일치 하나**다 — held_version_drift 면 그 관문의 \
+                 자동확인 Return 이 0발이다(사람 1회 필요). held_version_unknown(버전 미상)은 \
+                 **여전히 통과**하고, allowed 의 down 다발 전송은 어디에도 배선돼 있지 않다"
+            ),
+            cys::first_run_gates::PolicyEnforcement::Unwired => println!(
+                "  ★policy 는 진단이다 — 자동확인 조립은 **버전을 보지 않는다**"
+            ),
+            cys::first_run_gates::PolicyEnforcement::Full => println!(
+                "  ★policy 는 집행 판정이다(전량 배선)"
+            ),
         }
     }
     for g in report["gates"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
@@ -2070,6 +2079,7 @@ fn gate_guard_decide_in_boot(
         awakened: Some(false), // 부트 창은 상수다(위 doc 참조)
         guard_off: cys::inject_guard::guard_off(),
         readiness_legacy: cys::readiness::legacy_v1(),
+        cli_version: None, // 위와 같은 이유(보류 판정은 버전을 보지 않는다)
     })
 }
 
@@ -2099,6 +2109,9 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
         awakened,
         guard_off: cys::inject_guard::guard_off(),
         readiness_legacy: cys::readiness::legacy_v1(),
+        // 주입 **보류** 판정은 버전을 보지 않는다(관문 화면이면 어느 버전이든 막는다).
+        //   버전 축은 키를 **쏘는** 자리(확인 경계)에만 든다 — H2-B.
+        cli_version: None,
     });
     match decision {
         cys::inject_guard::Decision::Send => Ok(()),
@@ -11827,6 +11840,13 @@ fn boot_agent_on_surface(
     //   롤백 스위치(`CYS_TRUST_RETURN_V1=1`) 분기의 실사용 입력으로 남긴다 — 그 사유는
     //   `trust_send` 의 doc('죽은 코드를 남길지 지울지' 명시 결정)에 적혀 있다.
     let mut trust_sends: u32 = 0;
+    // ★(0.14.31 · 독립 재유도 H2-B) **좌석 기동 결속 버전 래치.** 이 부트에서 좌석이 스스로 찍은
+    //   배너(`Welcome to Claude Code v…`)를 한 번 잡아 두고 확인 경계로 넘긴다. 재료는 **누적
+    //   델타**다(`since_line` 은 기동 시점에 고정 · 아래 doc) — 화면 배너는 관문이 그려지면 밀려
+    //   나지만 델타에서는 밀려나지 않는다. 그 증거 소멸이 정확히 "한 틱은 거부, 다음 틱은 미상이라
+    //   통과" 를 만드는 경로였다(codex 설계 검토 3).
+    //   ★`ps`·PATH 의 `claude` 를 근거로 쓰지 않는다(그 바이너리가 아니다 — 워커 노트 §6-7-1).
+    let mut seat_cli_version: Option<String> = None;
     let mut trust_seen_at: Option<u64> = None; // 프롬프트를 관측한 시점의 델타 커서
     // ★(0.14.31 · 리뷰 R5) 확인 거부 사유의 **1회 로그** 래치(사유가 바뀌면 다시 찍는다).
     let mut trust_denied_logged: Option<String> = None;
@@ -11856,6 +11876,13 @@ fn boot_agent_on_surface(
         let delta_text = delta["text"].as_str().unwrap_or("").to_string();
         let delta_cursor = delta["next_cursor"].as_u64().unwrap_or(since_line);
         let delta_flat: String = delta_text.chars().filter(|c| !c.is_whitespace()).collect();
+        // ★(H2-B) 버전 배너 래치 — **처음 본 것 하나**만 잡는다(이 기동의 배너는 좌석이 스스로
+        //   찍은 첫 줄이다). 뒤에 다른 배너가 섞여 들어와도 확인 경계가 화면 배너 전량을 함께
+        //   대조하므로(합집합) 놓치지 않는다.
+        if seat_cli_version.is_none() {
+            seat_cli_version = cys::first_run_gates::banner_version(&delta_text)
+                .or_else(|| cys::first_run_gates::banner_version(text));
+        }
         // ① 기동 실패 — **신규 출현분에서만** 판정한다(잔존 에러 텍스트로 새 기동을 죽이지 않는다).
         if screen_shows_launch_failure(&delta_flat) {
             // ★(U-11) 화면이 기동 실패를 **확증**한 유일한 지점 — 종전 귀결(close)을 그대로
@@ -11894,6 +11921,9 @@ fn boot_agent_on_surface(
                     awakened: Some(false), // 부트 창은 상수다(구 데몬에서 꺼지면 안 된다)
                     guard_off: cys::inject_guard::guard_off(),
                     readiness_legacy: readiness_v1, // 루프 밖 1회 판독값(판정 재료 일관성)
+                    // ★(H2-B) 이 기동의 버전 증거. 확인 경계는 이것과 화면 배너의 **합집합**을
+                    //   실측본과 대조해, 하나라도 다르면 Return 을 보내지 않는다.
+                    cli_version: seat_cli_version.as_deref(),
                 },
                 cys::inject_guard::GATE_FOLDER_TRUST,
             );
@@ -11923,12 +11953,17 @@ fn boot_agent_on_surface(
                 trust_sends += 1;
                 trust_seen_at = Some(delta_cursor);
                 std::thread::sleep(std::time::Duration::from_secs(BUDGET_TRUST_SETTLE_SECS));
-            } else if let Some(why) = denied.filter(|_| !trust_v1) {
+            } else if let Some(why) = denied {
                 // ★(0.14.31 · 리뷰 R5 · claude 적대) **첫 발도 말한다.** 종전 조건에는 `trust_sends > 0`
                 //   가 있어, R4 가 생산자를 `!confirm_allowed(..)` 로 바꾼 뒤 지배적이 된 경로(첫 발
                 //   미식별·모호·커서 종료 위)가 **무성**이었다 — 운영자·릴리스 게이트 실측자가 '감지 실패'
                 //   와 '확인 거부' 를 가르지 못한다. 사유는 타입([`ConfirmDenied`])이 소유하고 여기서는
                 //   찍기만 한다. 같은 사유는 **1회만** 찍는다(틱마다 같은 줄이면 진짜 신호가 묻힌다).
+                //   ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 2) 종전 조건에 있던
+                //     `.filter(|_| !trust_v1)` 를 뺀다 — 확인 벨트는 롤백 노브로 **열리지 않으므로**
+                //     `trust_v1=1` 에서도 거부는 그대로 일어난다. 그런데 사유만 가려져 있었다:
+                //     운영자는 "종전 정책으로 되돌렸는데 왜 Return 이 안 나가나" 를 로그 없이
+                //     마주했다. 되돌리는 노브가 **진단까지** 되돌리면 안 된다.
                 let line = why.label();
                 if trust_denied_logged.as_deref() != Some(line.as_str()) {
                     eprintln!(
@@ -15344,6 +15379,9 @@ fn gate_guard_check_on(
         awakened,
         guard_off: cys::inject_guard::guard_off(),
         readiness_legacy: cys::readiness::legacy_v1(),
+        // 주입 **보류** 판정은 버전을 보지 않는다(관문 화면이면 어느 버전이든 막는다).
+        //   버전 축은 키를 **쏘는** 자리(확인 경계)에만 든다 — H2-B.
+        cli_version: None,
     }) {
         cys::inject_guard::Decision::Send => Ok(()),
         cys::inject_guard::Decision::SendObserved(hit) => {
@@ -24017,55 +24055,66 @@ mod tests {
         assert_eq!(report["observed_at"].as_str(), Some("2026-09-08T06:30:00+0900"));
     }
 
-    /// ★(0.14.31 · 리뷰 R1) 버전 핀 판정은 **CLI 키 경로 어디에도 배선돼 있지 않다** — 소스 핀.
+    /// ★버전 핀의 **집행 범위 핀**(0.14.31 · 리뷰 R1 신설 → 독립 재유도 H2-B 재핀).
     ///
-    /// 【무엇을 막는가】 `cys gate-corpus --detected-version <v>` 는 관문마다 `policy` 를 인쇄한다.
-    /// 운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽지만, 폴더신뢰 자동확인
-    /// 조립(`trust_prompt_hit → confirm_denied → trust_send → Return`)은 **버전을 보지 않고**
-    /// 커서 벨트(`confirm_allowed`)만 본 뒤 Return 1발을 보낸다. 즉 인쇄된 판정과 실제 키 경로가
-    /// 다르다. 그래서 보고서가 `policy_enforcement.enforced=false` 를 함께 싣고, 이 핀이 그 값이
-    /// **거짓말이 아님**(= 실제로 배선 0)을 실행으로 확인한다.
+    /// 【종전 핀이 무엇을 못박았나】 R1~R2 판은 이름 그대로
+    /// `action_policy_is_not_wired_into_any_cli_key_path_source_pin` 이었다 — 버전 축이 CLI 에도
+    /// 확인 경계에도 **배선 0** 임을 두 파일에서 재고, 보고서의 `policy_enforcement.enforced=false`
+    /// 가 거짓말이 아님을 확인했다.
     ///
-    /// 【범위 — 정직하게】 이 핀이 재는 것은 **이 파일(CLI)** 뿐이다. 그래서 보고서도 범위를
-    /// `scope:"cli-auto-confirm"` 으로 명시한다. 데몬(`cysd`)까지의 전역 주장은 하지 않는다
-    /// (2026-09-08 실측 `grep -rn "action_policy\|ActionPolicy\|down_presses" src/ ui/src` 는
-    ///  `first_run_gates.rs` 밖 호출자 0 이었으나, 그 grep 은 검체가 아니라 관측이다).
+    /// 【왜 재핀하는가 — 의도적 기본값 변경(정본 §3-8 · 오너 위임 2026-09-06)】 독립 재유도가
+    /// CONFIRMED 한 H2-B(“버전 미상·불일치에서도 자동확인이 열려 정본의 보류 계약을 위반한다”)를
+    /// 고치면서 **불일치 팔 하나**를 확인 경계에 배선했다. 그러므로 "배선 0" 은 더는 참이 아니고,
+    /// 그 핀을 그대로 두면 수리가 적색으로 막힌다. 대신 이 핀은 **얼마나 배선됐는가**를 잰다:
+    ///   · CLI(`cys.rs`) 프로덕션 — 여전히 버전 축 배선 **0**(범위 표기 `cli-auto-confirm` 의 근거).
+    ///   · 확인 경계(`inject_guard.rs`) 프로덕션 — `HeldVersionDrift` **하나만** 소비하고
+    ///     `HeldVersionUnknown`·`Allowed` 는 소비하지 않는다(미상 거부는 별도 결정 · 다발 전송은
+    ///     이 조립의 능력 밖).
+    ///   · 시퀀스 축(`down_presses`)의 소비는 종전대로 살아 있다(두 축을 한 값으로 접지 않는다).
+    ///   · 그리고 산출물([`report_json`] 의 `policy_enforcement`)이 그 상태를 **그대로** 싣는다.
     ///
-    /// 【배선하는 사람에게】 여기서 적색이 나면 상수 한 줄을 올리는 것으로 끝내지 말 것 —
-    /// **키 전송 경로의 집행 검체**(버전 미상·불일치·산출 불가 각각에서 전송 0)를 먼저 넣고,
-    /// 이 핀의 범위를 다시 정한 뒤 `ACTION_POLICY_IS_ENFORCED` 를 올려라.
+    /// 【소스 핀은 보조다 — codex 설계 검토 4】 토큰 개수는 집행의 증명이 아니다(호출 결과를 버려도
+    /// 맞출 수 있다). 집행 자체는 실행 검체가 잰다:
+    /// `inject_guard::tests::confirm_is_denied_when_the_screen_declares_a_version_the_corpus_never_measured`
+    /// (불일치 → 확인 거부 · 전송 0)와
+    /// `inject_guard::tests::version_axis_holds_on_drift_evidence_but_unknown_still_passes`
+    /// (미상 통과 · 래치 증거 · 배너 소멸 후에도 유지). 이 핀이 재는 것은 **범위**뿐이다.
     #[test]
-    fn action_policy_is_not_wired_into_any_cli_key_path_source_pin() {
+    fn action_policy_version_axis_is_wired_only_as_drift_denial_source_pin() {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
         for token in ["action_policy(", "ActionPolicy", "down_presses()"] {
             assert_eq!(
                 prod.matches(token).count(),
                 0,
-                "`{token}` 가 CLI 프로덕션에 나타났다 — 버전 핀이 배선됐다면 보고서의 \
-                 policy_enforcement.enforced 가 거짓말이 된다. 상수만 올리지 말고 전송 경로의 \
-                 집행 검체(버전 미상·불일치·산출 불가에서 전송 0)를 먼저 넣고 이 핀의 범위를 \
-                 다시 정하라"
+                "`{token}` 가 CLI 프로덕션에 나타났다 — 버전 핀의 집행 범위가 넓어졌다면 보고서의 \
+                 policy_enforcement.scope 가 거짓말이 된다. 상수만 올리지 말고 전송 경로의 \
+                 집행 검체(불일치·미상·산출 불가에서 전송 0)를 먼저 넣고 이 핀의 범위를 다시 정하라"
             );
         }
-        // ★(0.14.31 · 리뷰 R2 · codex 설계 검토 ⑫) 이 핀이 **CLI 한 파일만** 보면 확인 경계
-        //   (`inject_guard`)에 들어온 배선을 놓친다 — 거기가 실제로 키를 여는 자리다. 그래서
-        //   버전 축(`action_policy`·`ActionPolicy`)의 부재를 **그 파일에서도** 못박는다.
+        // ★(0.14.31 · 리뷰 R2 · codex 설계 검토 ⑫) 확인 경계가 **실제로 키를 여는 자리**다 —
+        //   그래서 범위는 거기서 잰다.
         let guard = include_str!("../inject_guard.rs");
         let guard_prod = &guard[..guard
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("inject_guard 테스트 모듈 경계")];
-        for token in ["action_policy(", "ActionPolicy"] {
+        assert_eq!(
+            guard_prod.matches("ActionPolicy::HeldVersionDrift").count(),
+            1,
+            "확인 경계가 버전 **불일치** 팔을 더는 소비하지 않는다 — 인쇄된 held_version_drift 와 \
+             실제 키 경로가 다시 갈린다(독립 재유도 H2-B 회귀)"
+        );
+        for token in ["ActionPolicy::HeldVersionUnknown", "ActionPolicy::Allowed"] {
             assert_eq!(
                 guard_prod.matches(token).count(),
                 0,
-                "`{token}` 가 확인 경계(inject_guard)에 배선됐다 — 버전 핀이 집행된다면 보고서의 \
-                 policy_enforcement.enforced 가 거짓말이 된다"
+                "`{token}` 가 확인 경계에 배선됐다 — 미상 거부(가용성 절단)와 down 다발 전송은 \
+                 **별도 결정**이다. 배선했다면 ACTION_POLICY_ENFORCEMENT 를 Full 로 올리고 \
+                 전송 후 재관측·멱등 래치 검체를 함께 넣어라(워커 노트 §6-7)"
             );
         }
-        // ★그리고 **시퀀스 축은 배선돼 있다**(같은 리뷰의 codex major). 두 축을 한 상수로 접지
-        //   않기 위해 여기서 그 차이를 못박는다 — `down_presses` 는 확인 경계가 소비하고,
-        //   `action_policy`(버전)는 어디에서도 소비하지 않는다.
+        // ★그리고 **시퀀스 축은 종전대로 배선돼 있다**. 두 축을 한 값으로 접지 않기 위해 여기서
+        //   그 차이를 못박는다.
         //   ★doc 문면이 아니라 **코드 한 줄**을 본다(주석에 같은 토큰이 있어 `contains("down_presses()")`
         //     만으로는 소비가 사라져도 초록이었다 — 변이검증 M9 에서 실제로 그랬다).
         assert!(
@@ -24074,14 +24123,26 @@ mod tests {
              인쇄만 하고 Return 은 나가는' 상태로 돌아갔다(리뷰 R2 codex major 회귀). 판정 자체의 \
              집행은 `inject_guard::tests::confirm_needs_the_declared_sequence_to_be_a_bare_return`"
         );
-        assert!(
-            !cys::first_run_gates::ACTION_POLICY_IS_ENFORCED,
-            "배선 0인데 상수가 '집행 중' 이라고 말한다(반대 방향의 거짓말)"
+        assert_eq!(
+            cys::first_run_gates::ACTION_POLICY_ENFORCEMENT,
+            cys::first_run_gates::PolicyEnforcement::VersionDriftOnly,
+            "배선과 상수가 어긋났다 — 상수만 움직이는 거짓 안심(또는 반대 방향의 거짓말)"
         );
         // 그리고 그 사실이 **산출물에 실린다**(사람이 코드를 읽지 않아도 된다).
         let r = cys::first_run_gates::resolve_with(None, true);
         let report = cys::first_run_gates::report_json(&r, "claude", Some("2.1.263"), Some("2026-09-08T00:00:00+0900"));
-        assert_eq!(report["policy_enforcement"]["enforced"].as_bool(), Some(false));
+        assert_eq!(report["policy_enforcement"]["state"].as_str(), Some("version_drift_only"));
+        assert_eq!(
+            report["policy_enforcement"]["enforced"].as_bool(),
+            Some(false),
+            "부분 집행이 '전량 집행' 으로 인쇄됐다"
+        );
+        assert_eq!(report["policy_enforcement"]["axes"]["version_drift"].as_bool(), Some(true));
+        assert_eq!(
+            report["policy_enforcement"]["axes"]["version_unknown"].as_bool(),
+            Some(false),
+            "미상 거부는 아직 결정되지 않았는데 산출물이 집행한다고 말한다"
+        );
         assert_eq!(
             report["policy_enforcement"]["scope"].as_str(),
             Some("cli-auto-confirm"),
@@ -24763,6 +24824,8 @@ mod tests {
                         awakened: Some(false),
                         guard_off,
                         readiness_legacy: false, // 이 검체는 U-14/U-15 두 축만 잰다(모달 축 무관 화면)
+                        // 실측 픽스처에는 버전 배너가 없다 = 미상 → 버전 축은 이 검체를 건드리지 않는다.
+                        cli_version: None,
                     };
                     let other_gate = if legacy_producer {
                         cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
@@ -24846,6 +24909,7 @@ mod tests {
                         awakened: Some(false),
                         guard_off,
                         readiness_legacy: false,
+                        cli_version: None, // 위와 같다(배너 없는 픽스처 = 버전 미상)
                     };
                     // ★(리뷰 R4) 프로덕션과 같은 생산자 — `legacy_producer` 만 구 배선을 재현한다.
                     let other_gate = if legacy_producer {
@@ -24928,6 +24992,7 @@ mod tests {
                     awakened,
                     guard_off: false,
                     readiness_legacy: false,
+                    cli_version: None,
                 });
                 assert!(!d.blocks(), "정상 화면에서 주입이 막혔다: {screen:?}");
             }

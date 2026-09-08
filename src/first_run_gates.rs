@@ -669,31 +669,68 @@ impl ActionPolicy {
     }
 }
 
-/// ★(0.14.31 · 리뷰 R1) [`action_policy`] 판정이 **키 경로에 배선돼 있는가**.
+/// ★[`action_policy`](버전 핀) 판정이 **키 경로에 얼마나 배선돼 있는가** — 세 상태.
 ///
-/// 【왜 상수인가 — 무엇을 막는가】 이 판정은 지금 **진단일 뿐**이다. 실측(2026-09-08 · `grep -rn
-/// "action_policy\|ActionPolicy" src/ ui/src`): 이 모듈 **밖에서 호출자가 0**이고,
-/// 폴더신뢰 자동확인 조립(`cys.rs` `trust_prompt_hit → confirm_denied → trust_send → Return`)은
-/// 버전을 보지 않고 Return 을 **1발**만 보낸다. 그런데
+/// 【왜 bool 이 아닌가 — 0.14.31 · 독립 재유도 H2-B】 종전에는 `ACTION_POLICY_IS_ENFORCED: bool`
+/// 하나였고 값은 `false`("어느 지점에도 배선돼 있지 않다")였다. 그런데 확인 경계가
+/// **불일치 팔 하나**를 집행하기 시작하면 `false` 도 `true` 도 거짓말이 된다 — `false` 는 실제로
+/// 서는 벨트를 없다고 말하고, `true` 는 여전히 통과하는 **미상**과 배선 0 인 `Allowed{down}`
+/// 다발 전송을 집행한다고 말한다. 부분 집행을 bool 로 접으면 어느 쪽으로든 산출물이 거짓이 된다
+/// (codex 설계 검토 4). 그래서 **상태**로 싣는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyEnforcement {
+    /// 배선 0 — `policy` 는 순수 진단이다.
+    Unwired,
+    /// ★오늘. [`ActionPolicy::HeldVersionDrift`] **하나만** 확인 경계
+    /// ([`crate::inject_guard::confirm_denied`])가 집행한다:
+    ///   · **불일치** → 그 관문의 자동확인 보류(키 0) ·
+    ///   · **미상**([`ActionPolicy::HeldVersionUnknown`]) → 여전히 통과한다(가용성 · 별도 결정) ·
+    ///   · [`ActionPolicy::Allowed`] 의 `down` 다발 전송 → 배선 0(이 조립은 Return 만 보낸다).
+    VersionDriftOnly,
+    /// 판정 전량이 집행된다(오늘 아니다).
+    Full,
+}
+
+impl PolicyEnforcement {
+    /// 산출물 어휘(하류가 문자열로 읽는다).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyEnforcement::Unwired => "unwired",
+            PolicyEnforcement::VersionDriftOnly => "version_drift_only",
+            PolicyEnforcement::Full => "full",
+        }
+    }
+    /// 버전 **불일치**가 키를 막는가.
+    pub fn denies_version_drift(self) -> bool {
+        matches!(
+            self,
+            PolicyEnforcement::VersionDriftOnly | PolicyEnforcement::Full
+        )
+    }
+    /// 버전 **미상**이 키를 막는가(오늘 아니다).
+    pub fn denies_version_unknown(self) -> bool {
+        matches!(self, PolicyEnforcement::Full)
+    }
+    /// `Allowed{down}` 의 다발 전송이 집행되는가(오늘 아니다).
+    pub fn sends_down_bundle(self) -> bool {
+        matches!(self, PolicyEnforcement::Full)
+    }
+}
+
+/// ★지금의 집행 상태. [`report_json`] 이 `policy_enforcement` 로 싣고, 소스 핀
+/// (`cys.rs` `action_policy_version_axis_is_wired_only_as_drift_denial_source_pin`)이 이 값과
+/// 실제 배선이 어긋나지 않는지 못박는다(상수만 움직이는 거짓 안심이 구조적으로 불가능하다).
 ///
-/// ★(0.14.31 · 리뷰 R2) [`Gate::down_presses`] 는 **배선됐다** — [`crate::inject_guard::confirm_denied`]
-///   가 `Some(0)`(= Return 한 발)이 아닌 선언을 보류한다. 그것은 이 조립의 **능력**과 선언을 맞춘
-///   것이지 버전 핀의 집행이 아니다: `Allowed{down}` 이 기술하는 다발 전송도, 좌석이 실제로 실행한
-///   바이너리의 버전 대조도 여전히 어디에도 없다. 그래서 이 상수는 `false` 로 남는다.
-/// [`report_json`] 이 관문마다 `policy` 를 인쇄하므로, 그것을 읽는 운영자는 `held_version_drift`
-/// 를 "이 버전에선 키가 안 나간다" 로 읽는다 — **거짓이다**(커서 벨트만 통과하면 Return 은 나간다).
-/// 반대로 재핀 뒤의 `allowed` 도 "이 down 이 집행된다" 는 뜻이 아니다.
-///
-/// 그래서 보고서는 이 상수를 함께 싣고(`policy_enforcement.enforced` + `scope`), 소스 핀
-/// (`cys.rs` `action_policy_is_not_wired_into_any_cli_key_path_source_pin`)이 **배선 0** 을 못박는다.
-/// 배선하는 사람은 그 핀이 적색으로 막아서므로 이 상수를 함께 올리게 된다(상수만 남는 거짓
-/// 안심이 구조적으로 불가능하다).
-///
-/// ★핀의 범위는 **CLI 한 파일**이다(그래서 보고서도 `scope:"cli-auto-confirm"` 을 함께 싣는다).
-///   모듈 밖 호출자 0 은 재실측 **2026-09-08 05:41** 의 관측이고 — `first_run_gates.rs` 밖 히트
-///   7건 전부가 JSON 키 문자열·doc·그 핀 자신·"호출하지 않는다"는 cysd 주석이었다 — 관측은
-///   검체가 아니다. 데몬까지의 전역 주장은 하지 않는다(codex 설계 검토 R1).
-pub const ACTION_POLICY_IS_ENFORCED: bool = false;
+/// 【무엇이 배선됐고 무엇이 아닌가 — 실측 2026-09-08】 확인 경계가 보는 것은 ⓪ 코드 정본 사람 1회
+/// 관문이 화면에 서지 않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 아닐 것
+/// ③ 선언 시퀀스가 Return 한 발일 것(`down_presses()==Some(0)`) ④ 커서가 액션 라벨 전문 위일 것
+/// ⑤ **좌석이 밝힌 버전이 이 관문의 실측본과 다르지 않을 것**(이번에 더한 축) — 다섯이다.
+/// ⑤의 증거는 좌석 기동에 결속된 래치([`crate::inject_guard::Observed::cli_version`])와 지금
+/// 화면의 배너([`banner_versions`])의 **합집합**이고, 그중 하나라도 불일치면 보류다.
+/// **미상은 아직 통과한다** — `MEASURED_ON` 이 부분 실측이라(6관문 중 2관문) 미상까지 접으면
+/// 오늘 전 좌석이 매 부트마다 사람 1회를 요구한다(정본 §3-3 은 보류를 허용하지만 그 절단은
+/// 별도 결정이다). 그 결정이 서면 이 상수가 [`PolicyEnforcement::Full`] 로 간다.
+pub const ACTION_POLICY_ENFORCEMENT: PolicyEnforcement = PolicyEnforcement::VersionDriftOnly;
 
 /// ★버전 핀 게이트. 보류의 귀결은 언제나 '아무 키도 보내지 않음' 이므로 이 게이트는
 /// **오살 방향으로 열리지 않는다** — 잘못 보류하면 사람이 한 번 눌러 주면 되고,
@@ -734,15 +771,57 @@ pub fn action_policy(gate: &Gate, detected_version: Option<&str>) -> ActionPolic
 /// 실측 문면: `Welcome to Claude Code v2.1.241` / `Claude Code v2.1.241` /
 /// `claude --version` = `2.1.241 (Claude Code)`. 어느 것도 못 찾으면 `None` 이고,
 /// `None` 은 `action_policy` 에서 **보류**로 접힌다(추정 금지).
+///
+/// ★두 번째 갈래(앵커 없는 선두 점숫자)는 **`--version` stdout 을 읽을 때의 형태**다. 화면
+///   (vt100 그리드)에 그것을 걸면 "첫 글자가 점 있는 숫자면 그게 도는 버전" 이 되어, 벤더가 무엇을
+///   그리든 근거가 된다. 그래서 **화면을 재료로 쓰는 자리**는 이 함수가 아니라 [`banner_version`]
+///   을 쓴다(0.14.31 · 독립 재유도 H2-B).
 pub fn parse_cli_version(text: &str) -> Option<String> {
-    const ANCHOR: &str = "Claude Code v";
-    if let Some(i) = text.find(ANCHOR) {
-        if let Some(v) = take_dotted(&text[i + ANCHOR.len()..]) {
-            return Some(v);
-        }
-    }
-    take_dotted(text.trim_start())
+    banner_version(text).or_else(|| take_dotted(text.trim_start()))
 }
+
+/// ★**배너 앵커가 있을 때만** 버전을 뽑는다 — 화면을 재료로 쓰는 자리의 판독기
+/// (0.14.31 · 독립 재유도 H2-B).
+///
+/// 【왜 나누는가】 [`parse_cli_version`] 의 폴백은 앵커가 없으면 텍스트 **선두**에서 점 있는
+/// 숫자를 집는다. `claude --version` stdout(`2.1.241 (Claude Code)`)에는 옳지만 화면에는 틀리다 —
+/// 관문 화면의 첫 줄이 우연히 `1.5x …` 로 시작하면 그것이 "지금 도는 버전" 이 된다. 확인 경계
+/// ([`crate::inject_guard::confirm_denied`])는 좌석이 **스스로 찍은 배너**만 증거로 인정한다.
+///
+/// 【실패 방향】 못 찾으면 `None` = "이 화면은 버전을 밝히지 않았다" 이고, 그 귀결은 오늘 보류가
+/// **아니다**(미상은 아직 통과한다 — [`ACTION_POLICY_ENFORCEMENT`] doc 의 버전 축 표 참조).
+/// 앵커를 좁혀서 잘못 놓치는 귀결은 "종전과 같음"이지 새로 열리는 구멍이 아니다.
+pub fn banner_version(text: &str) -> Option<String> {
+    banner_versions(text).into_iter().next()
+}
+
+/// 화면이 밝힌 배너 버전 **전량**(중복 제거 · 최대 [`BANNER_SCAN_MAX`]개).
+///
+/// 【왜 첫 배너 하나로는 부족한가】 화면은 잔존 출력이 섞인 그리드다. 앞쪽에 옛 배너(또는
+/// 에이전트가 출력한 문자열)가 있고 뒤쪽에 지금 좌석의 배너가 있으면, "첫 앵커 하나" 규칙은
+/// **앞쪽만 보고** 뒤쪽의 불일치를 놓친다(codex 설계 검토 3). 확인 경계는 이 목록을 전부 대조해
+/// **하나라도 불일치면 보류**한다 — 증거가 갈리면 조이는 쪽으로 접는다.
+pub fn banner_versions(text: &str) -> Vec<String> {
+    const ANCHOR: &str = "Claude Code v";
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(ANCHOR) {
+        let tail = &rest[i + ANCHOR.len()..];
+        if let Some(v) = take_dotted(tail) {
+            if !out.contains(&v) {
+                out.push(v);
+                if out.len() >= BANNER_SCAN_MAX {
+                    break;
+                }
+            }
+        }
+        rest = tail;
+    }
+    out
+}
+
+/// 한 화면에서 훑는 배너 상한(병적 입력에서 판정 시간이 화면 길이에 끌려가지 않게).
+pub const BANNER_SCAN_MAX: usize = 8;
 
 fn take_dotted(s: &str) -> Option<String> {
     let head: String = s
@@ -790,6 +869,18 @@ pub struct Resolved {
     pub gates: Vec<Gate>,
     pub notes: Vec<String>,
     pub source: Source,
+    /// ★(0.14.31 · 독립 재유도 H2-A 확장 · codex 설계 검토 1) 봉투가 **도달했는데 선언이 한 줄도
+    /// 코퍼스에 닿지 않았는가**.
+    ///
+    /// 【왜 `source` 로는 부족한가】 [`Source::Builtin`] 은 "덮을 봉투가 없다"(정상)만 뜻하지
+    /// 않는다 — 봉투가 객체가 아니거나, `replace` 선언이 전부 거부됐거나, 병합 선언이 하나도
+    /// 적용되지 않으면 [`resolve_raw`] 는 같은 `Builtin` 을 돌려준다. 그 상태에서 보고서가
+    /// 되먹임 봉투를 내주면, 운영자가 **쓴 적 있는 선언**(파서가 거부했을 뿐 파일에는 남아 있는
+    /// 것)이 안내대로 붙여 넣는 순간 빌트인으로 덮여 사라진다. 출처 하나로는 "원 선언이 애초에
+    /// 없었다" 와 "있었는데 반영되지 않았다" 가 구별되지 않는다.
+    ///
+    /// ★명시 `null` 봉투(= 의도적 비움)와 키 부재는 **거짓**이다 — 지워질 선언이 없다.
+    pub envelope_ignored: bool,
 }
 
 /// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) **관문 코퍼스 보고서** — `cys gate-corpus --json` 의 봉투.
@@ -811,6 +902,14 @@ pub struct Resolved {
 ///     스스로 싣고 선언 축을 전량 싣는다. 되먹임의 유일한 정당 경로다.
 ///   · [`envelope_mode`] 는 보고서 출처 어휘를 모드로 **읽지 않고**(별칭은 새 권한을 연다 —
 ///     codex 설계 검토 R1) 병합에 착지시킨 뒤 `override_envelope` 를 이름으로 지목한다.
+///
+/// 【되먹임 재료를 **주지 않는** 경우 — `override_envelope_status`】 이 봉투가 정당한 되먹임
+/// 재료이려면 "이 코퍼스가 운영자 선언을 반영했는가" 가 참이어야 한다. 그 답이 거짓인 출처가
+/// 둘이다 — [`Source::SpecUnreadable`](스펙에 도달하지 못했다 · 고장)과
+/// [`Source::OverrideDisabled`](롤백 스위치로 읽지 않기로 했다). 두 경우 모두
+/// `override_envelope` 를 `null` 로 두고 `paste_safe:false` + **서로 다른 사유**를 낸다
+/// (0.14.31 · 독립 재유도 H2-A/C). [`Source::Builtin`] 은 "덮을 봉투가 애초에 없다"(정상)라서
+/// 여기 들지 않는다 — 셋을 한 값으로 접으면 정상 기계의 되먹임까지 죽는다.
 ///
 /// 무손실의 범위는 **식별 가능한 관문**(needle ≥ 1)의 선언 축 전량이다. 자기규칙 수리로 needle 이
 /// 0개가 된 관문은 재파싱에서 거부되는데, 그 관문은 이미 어떤 화면도 식별하지 못하는 불활성
@@ -914,7 +1013,52 @@ pub fn report_json(
     //   `override_envelope` 를 `null` 로 두고, 왜 재료를 주지 않는지를 `override_envelope_status`
     //   가 말한다. ★`paste_safe` 는 파서가 집행하는 제약이 아니다(codex 설계 검토 ⑨) — 이 필드는
     //   "이 산출물을 복사해 쓰지 말라" 는 **표식**이지, 붙여 넣어도 안전하다는 보증이 아니다.
-    let paste_safe = !matches!(resolved.source, Source::SpecUnreadable { .. });
+    //
+    // ★★(0.14.31 · 독립 재유도 H2-A/C · 2026-09-08) **묻는 것은 출처가 아니라 "이 코퍼스가 운영자
+    //   선언을 반영했는가" 하나다.** R2 는 그 질문을 `SpecUnreadable` **하나로만** 물었는데,
+    //   [`Source::OverrideDisabled`](롤백 스위치로 봉투를 한 줄도 읽지 않은 상태) 역시 같은 답을
+    //   갖는다 — 판독 실패가 "봉투에 도달하지 못했다"(고장)라면 이쪽은 "읽지 않기로 했다"(스위치)
+    //   이고, **원 선언 미반영**이라는 사실은 똑같다. 실측(격리 CLI e2e · 2026-09-08): 운영자가
+    //   folder-trust 를 `human_only` 로 조이고 자기 관문을 신설해 둔 기계에서 스위치를 끄고 뜬
+    //   보고서의 봉투를 안내대로 붙여 넣으면 ⓐ 신설 관문이 소멸하고 ⓑ 조여 둔 관문이 `machine`
+    //   으로 되돌아간다(= 자동확인 재개방). 스위치를 되켜도 복구되지 않는다 — 원본이 사용자 소유
+    //   파일에서 지워졌다. 조이는 방향의 선언이 문서화된 되먹임으로 풀리는 것은 §3-3 역행이다.
+    //
+    // ★그리고 **셋을 한 값으로 접지 않는다**: `Builtin`(덮을 봉투가 애초에 없다 · 정상)에서는 봉투가
+    //   그대로 안전하다. 사유 문면도 두 경우에 서로 다르다(처방이 다르다 — 하나는 판독 실패를
+    //   고치는 것이고 하나는 스위치를 되켜는 것이다). 아래 `match` 는 `_` 팔을 두지 않는다:
+    //   `Source` 에 변이가 늘면 컴파일러가 "이 새 출처의 코퍼스는 운영자 선언을 반영하는가" 를
+    //   다시 묻게 한다(기본값이 조용히 '안전' 으로 접히지 않는다).
+    let paste_reason: Option<&str> = match &resolved.source {
+        Source::SpecUnreadable { .. } => Some(
+            "agents.json 어댑터 스펙을 읽지 못해 코드 정본으로 되돌아온 코퍼스라, 이 보고서는 \
+             운영자의 선언을 반영하지 않는다(붙여 넣으면 원 선언이 빌트인으로 덮인다). \
+             먼저 판독 실패를 고칠 것",
+        ),
+        Source::OverrideDisabled => Some(
+            "롤백 스위치(CYS_FIRST_RUN_GATES_OVERRIDE=0)로 override 파싱이 꺼져 있어 이 코퍼스는 \
+             코드 정본뿐이다 — agents.json 에 어떤 선언이 있든 한 줄도 읽지 않았다. 이 봉투를 \
+             붙여 넣으면 스위치를 되켰을 때 원 선언 대신 빌트인이 선다(조여 둔 passability 가 \
+             풀리고 신설 관문이 사라진다 · 원본은 파일에서 지워져 복구되지 않는다). \
+             먼저 스위치를 되켜고 보고서를 다시 뜰 것",
+        ),
+        // ★(codex 설계 검토 1) 봉투가 도달했는데 **한 줄도 반영되지 않은** 코퍼스. 출처는
+        //   `Builtin` 으로 접히지만 "덮을 봉투가 없다"(정상)와는 다른 사실이다 —
+        //   운영자가 쓴 선언이 파일에 남아 있고, 이 봉투를 붙여 넣으면 그것이 사라진다.
+        Source::Builtin | Source::Merged { .. } | Source::Replaced { .. }
+            if resolved.envelope_ignored =>
+        {
+            Some(
+                "agents.json 의 override 봉투가 도달했지만 선언이 **한 줄도** 이 코퍼스에 \
+                 반영되지 않았다(비객체 봉투 · 전부 거부된 선언). 이 보고서를 붙여 넣으면 \
+                 파일에 남아 있는 그 선언이 빌트인으로 덮여 사라진다 — 먼저 notes 가 지목한 \
+                 거부 사유를 고칠 것",
+            )
+        }
+        // 봉투가 실제로 도달한 코퍼스(또는 덮을 봉투가 애초에 없는 정상) — 되먹임이 항등이다.
+        Source::Builtin | Source::Merged { .. } | Source::Replaced { .. } => None,
+    };
+    let paste_safe = paste_reason.is_none();
     let envelope = if paste_safe {
         let envelope_gates: Vec<Value> = resolved
             .gates
@@ -941,30 +1085,44 @@ pub fn report_json(
         "override_envelope": envelope,
         "override_envelope_status": {
             "paste_safe": paste_safe,
-            "reason": if paste_safe { Value::Null } else { Value::from(
-                "agents.json 어댑터 스펙을 읽지 못해 코드 정본으로 되돌아온 코퍼스라, 이 보고서는 \
-                 운영자의 선언을 반영하지 않는다(붙여 넣으면 원 선언이 빌트인으로 덮인다). \
-                 먼저 판독 실패를 고칠 것"
-            ) },
+            // ★사유는 경우마다 **다른 문면**이다(처방이 다르다) — 하나로 접으면 운영자가
+            //   스위치를 되켜야 할 자리에서 파일 권한을 뒤진다.
+            "reason": paste_reason.map(Value::from).unwrap_or(Value::Null),
         },
-        // ★(0.14.31 · 리뷰 R1) `policy` 는 **진단이지 집행이 아니다** — 이 사실을 산출물이 스스로
-        //   싣는다. 없으면 운영자는 `held_version_drift` 를 "이 버전에선 키가 안 나간다" 로 읽는데,
-        //   실제 키 경로(CLI 자동확인 조립)는 버전을 보지 않는다([`ACTION_POLICY_IS_ENFORCED`] doc).
+        // ★(0.14.31 · 리뷰 R1 · 독립 재유도 H2-B 개정) `policy` 열이 **어디까지 집행되는가**를
+        //   산출물이 스스로 싣는다. 없으면 운영자는 `held_version_drift` 를 "이 버전에선 키가 안
+        //   나간다" 로 읽는데 — 이제 그 읽기는 **불일치에서만** 참이고 **미상에서는 거짓**이다.
+        //   그 차이를 축별로 적는다([`ACTION_POLICY_ENFORCEMENT`] doc).
         "policy_enforcement": {
-            "enforced": ACTION_POLICY_IS_ENFORCED,
+            "state": ACTION_POLICY_ENFORCEMENT.as_str(),
+            // 종전 축(하위 호환) — **판정 전량**이 집행되는가. 부분 집행은 여기서 false 다.
+            "enforced": ACTION_POLICY_ENFORCEMENT == PolicyEnforcement::Full,
             "scope": "cli-auto-confirm",
-            "note": if ACTION_POLICY_IS_ENFORCED {
-                "action_policy 가 키 경로에 배선돼 있다 — policy 는 집행 판정이다"
-            } else {
-                concat!(
-                    "action_policy(버전 핀)는 CLI 자동확인 조립 어느 지점에도 배선돼 있지 않다",
-                    "(실측 2026-09-08). policy 는 **진단**이며, 그 조립이 보는 것은 ⓪ 정본 사람 1회 ",
-                    "관문이 화면에 서지 않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 ",
-                    "아닐 것 ③ 선언 시퀀스가 Return 한 발일 것(down_presses==Some(0)) ④ 커서가 액션 ",
-                    "라벨 전문 위일 것 — 넷뿐이고 **버전은 그중에 없다**. held_version_* 를 '이 ",
-                    "버전에선 키가 안 나간다' 로, allowed 를 'down 이 집행된다' 로 읽지 말 것",
-                    "(0.14.31 리뷰 R2: ③은 새로 배선됐고 버전 축은 여전히 미배선이다)"
-                )
+            "axes": {
+                "version_drift": ACTION_POLICY_ENFORCEMENT.denies_version_drift(),
+                "version_unknown": ACTION_POLICY_ENFORCEMENT.denies_version_unknown(),
+                "down_bundle": ACTION_POLICY_ENFORCEMENT.sends_down_bundle(),
+            },
+            // ★집행되는 축의 **증거가 무엇인가**. 이 보고서의 `detected_version` 은 호출부가
+            //   손으로 준 값이라 좌석에서 관측된 것이 아니다 — 두 축을 섞어 읽지 않게 적는다.
+            "evidence": "seat-boot-latch + screen-banner (inject_guard::Observed)",
+            "note": match ACTION_POLICY_ENFORCEMENT {
+                PolicyEnforcement::Full =>
+                    "action_policy 가 전량 집행된다 — policy 는 집행 판정이다",
+                PolicyEnforcement::VersionDriftOnly => concat!(
+                    "확인 경계(폴더신뢰 자동확인)가 보는 것은 ⓪ 정본 사람 1회 관문이 화면에 서지 ",
+                    "않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 아닐 것 ③ 선언 ",
+                    "시퀀스가 Return 한 발일 것(down_presses==Some(0)) ④ 커서가 액션 라벨 전문 ",
+                    "위일 것 ⑤ 좌석이 밝힌 버전이 이 관문 실측본과 **다르지 않을 것** — 다섯이다. ",
+                    "즉 held_version_drift 는 이제 '키가 안 나간다' 가 참이지만, ",
+                    "held_version_unknown 은 **여전히 통과한다**(부분 실측 코퍼스로 가용성을 ",
+                    "끊지 않는다 · 별도 결정). allowed 를 'down 이 집행된다' 로 읽지 말 것 — ",
+                    "이 조립은 Return 만 보낸다(0.14.31 독립 재유도 H2-B)"
+                ),
+                PolicyEnforcement::Unwired => concat!(
+                    "action_policy(버전 핀)는 CLI 자동확인 조립 어느 지점에도 배선돼 있지 않다. ",
+                    "policy 는 **진단**이며 held_version_* 를 '키가 안 나간다' 로 읽지 말 것"
+                ),
             },
         },
         "measured_on": MEASURED_ON,
@@ -1086,6 +1244,7 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
         gates,
         mut notes,
         source,
+        envelope_ignored,
     } = resolve_raw(envelope, override_on);
     // ★해소 **직후**에 Fatal 바닥을 세운다(아래 [`restore_fatal_builtin_floor`]). 아래
     //   [`enforce_absence_cost`] 는 '집행 전후 대조' 라 replace 모드에서는 눈이 멀어 있다 —
@@ -1103,6 +1262,7 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
     Resolved {
         gates: kept,
         notes,
+        envelope_ignored,
         source,
     }
 }
@@ -1463,6 +1623,8 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
                 "{OVERRIDE_ENV}=0 — agents.json override 파싱 비활성(코드 정본만 사용)"
             )],
             source: Source::OverrideDisabled,
+            // 봉투를 **읽지 않았다** — 반영/미반영을 말할 자리가 아니다(출처가 이미 말한다).
+            envelope_ignored: false,
         };
     }
     let mut notes: Vec<String> = Vec::new();
@@ -1471,6 +1633,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             gates: base,
             notes,
             source: Source::Builtin,
+            envelope_ignored: false, // 키가 없다 = 지워질 선언이 없다
         };
     };
     if env_v.is_null() {
@@ -1479,6 +1642,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             gates: base,
             notes,
             source: Source::Builtin,
+            envelope_ignored: false, // 의도적 비움도 지워질 선언이 없다
         };
     }
     let Some(obj) = env_v.as_object() else {
@@ -1489,6 +1653,8 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             gates: base,
             notes,
             source: Source::Builtin,
+            // ★운영자가 **무언가 써 두었는데** 파서가 통째로 버렸다 — 되먹임이 그것을 덮는다.
+            envelope_ignored: true,
         };
     };
     let mode = envelope_mode(obj.get("source").and_then(|v| v.as_str()), &mut notes);
@@ -1521,6 +1687,8 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
                 gates: base,
                 notes,
                 source: Source::Builtin,
+                // 선언이 있었는데 전부 거부됐으면 되먹임이 그 선언을 지운다(선언 0건이면 지울 것도 없다).
+                envelope_ignored: !decls.is_empty(),
             };
         }
         // ★(0.14.31 · 리뷰 R2 · codex major) **중복 id 를 시끄럽게 만든다.** 버리지는 않는다 —
@@ -1554,6 +1722,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             gates: out,
             notes,
             source: Source::Replaced { count },
+            envelope_ignored: false, // 선언이 코퍼스가 됐다
         };
     }
     let mut gates = base;
@@ -1590,6 +1759,9 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
         } else {
             Source::Merged { overridden, added }
         },
+        // ★선언이 있었는데 **하나도** 착지하지 못했다(id 결손·비객체·needle 결손 신규 선언 …).
+        //   그 상태의 보고서 봉투를 붙여 넣으면 파일에 남아 있던 그 선언들이 빌트인으로 덮인다.
+        envelope_ignored: !decls.is_empty() && overridden == 0 && added == 0,
     }
 }
 
@@ -3050,6 +3222,7 @@ mod tests {
                 screen,
                 gates: &gs,
                 awakened,
+                cli_version: None,
                 guard_off: false,
                 readiness_legacy: false,
             };
@@ -3291,8 +3464,32 @@ mod tests {
                 Some(want.confirm_echo.len())
             );
         }
-        // ★그리고 `policy` 열이 **집행이 아니라는 사실**을 보고서 자신이 싣는다.
-        assert_eq!(v["policy_enforcement"]["enforced"].as_bool(), Some(ACTION_POLICY_IS_ENFORCED));
+        // ★그리고 `policy` 열이 **어디까지 집행되는가**를 보고서 자신이 싣는다.
+        //   ★(0.14.31 · 독립 재유도 H2-B 재핀) 종전 핀은 bool 한 축(`enforced`)만 봤다. 확인 경계가
+        //     **불일치 팔만** 집행하기 시작했으므로 bool 하나로는 어느 값도 참이 아니다 — 상태와
+        //     축 표를 함께 못박는다(축이 늘 때 산출물이 조용히 뒤처지지 않게).
+        assert_eq!(
+            v["policy_enforcement"]["state"].as_str(),
+            Some(ACTION_POLICY_ENFORCEMENT.as_str())
+        );
+        assert_eq!(
+            v["policy_enforcement"]["enforced"].as_bool(),
+            Some(ACTION_POLICY_ENFORCEMENT == PolicyEnforcement::Full),
+            "부분 집행이 '전량 집행' 으로 인쇄됐다"
+        );
+        assert_eq!(
+            v["policy_enforcement"]["axes"]["version_drift"].as_bool(),
+            Some(ACTION_POLICY_ENFORCEMENT.denies_version_drift())
+        );
+        assert_eq!(
+            v["policy_enforcement"]["axes"]["version_unknown"].as_bool(),
+            Some(ACTION_POLICY_ENFORCEMENT.denies_version_unknown())
+        );
+        assert_eq!(
+            v["policy_enforcement"]["axes"]["down_bundle"].as_bool(),
+            Some(ACTION_POLICY_ENFORCEMENT.sends_down_bundle())
+        );
+        assert!(v["policy_enforcement"]["evidence"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(v["policy_enforcement"]["scope"].as_str(), Some("cli-auto-confirm"));
         assert!(v["policy_enforcement"]["note"].as_str().is_some_and(|s| !s.is_empty()));
         // ★되먹임 재료는 `source`(출처)가 아니라 `override_envelope`(모드를 스스로 싣는 봉투)다.
@@ -3926,6 +4123,7 @@ mod tests {
             gates: builtin(),
             notes: vec!["어댑터 스펙 판독 실패(no such file) — 코드 정본 폴백".to_string()],
             source: Source::SpecUnreadable { reason: "no such file".to_string() },
+            envelope_ignored: false, // 스펙에 도달조차 못 했다(출처가 그 사실을 싣는다)
         };
         let v = report_json(&broken, "claude", None, None);
         assert_eq!(v["source"].as_str(), Some("spec_unreadable"), "고장이 정상과 같은 값으로 접혔다");
@@ -4300,5 +4498,161 @@ mod tests {
         let r = resolve_with(Some(env), true);
         assert_eq!(r.gates, builtin());
         assert_eq!(r.source, Source::Builtin);
+    }
+
+    /// ★TRIAGE(R5-WP1-H2-corpus · 독립 재유도 2026-09-08) — **override 파싱이 꺼져 있을 때도**
+    /// 보고서가 "붙여 넣어도 안전" 이라며 빌트인 봉투를 내준다(reviewer-claude major ·
+    /// reviewer-codex major 는 같은 결함의 두 진술이다).
+    ///
+    /// 【무엇이 뚫려 있는가】 `paste_safe` 는 `Source::SpecUnreadable` **하나만** 배제한다
+    /// (`report_json` :917). 그런데 [`Source::OverrideDisabled`] 도 운영자의 봉투를 **한 줄도
+    /// 반영하지 않은** 코드 정본이다 — "덮을 봉투가 없다"(정상)가 아니라 "봉투를 읽지 않기로
+    /// 했다"(스위치)이며, 판독 실패와 **똑같이** 원 선언을 반영하지 않는다.
+    ///
+    /// 【실패 경로】 운영자가 folder-trust 를 `human_only` 로 조이고 자기 관문을 하나 신설해 둔
+    /// 상태에서 `CYS_FIRST_RUN_GATES_OVERRIDE=0` 으로 보고서를 뜬 뒤 안내대로
+    /// `override_envelope` 를 `agents.json` 에 붙여 넣으면 ⓐ 신설 관문이 사라지고 ⓑ 조여 둔
+    /// folder-trust 가 **machine 으로 되돌아가 자동확인이 다시 열린다**(스위치를 켜도 복구되지
+    /// 않는다 — 원본이 파일에서 지워졌다). 조이는 방향의 선언이 되먹임으로 풀리는 것은
+    /// §3-3("막는 쪽으로만 틀린다") 역행이다.
+    #[test]
+    fn report_refuses_paste_material_when_override_parsing_is_disabled() {
+        // 운영자의 선언: folder-trust 를 사람 1회로 조이고, 자기 관문을 하나 신설한다.
+        let operator = serde_json::json!({"gates": [
+            {"id": "folder-trust", "passability": "human_only", "human_reason": "우리 조직 규정"},
+            {"id": "ops-extra-gate", "needles": ["Approve this workspace policy"], "passability": "human_only"},
+        ]});
+        let live = resolve_with(Some(&operator), true);
+        assert_eq!(
+            live.gates.iter().find(|g| g.id == "folder-trust").map(|g| g.passability),
+            Some(Passability::HumanOnly),
+            "전제가 깨졌다 — 운영자가 조이는 방향으로 덮을 수 없다면 이 검체는 다른 것을 잰다"
+        );
+        assert!(live.gates.iter().any(|g| g.id == "ops-extra-gate"));
+
+        // 같은 선언 · 스위치만 끈 상태 → 코퍼스는 코드 정본이고 **운영자 선언은 반영되지 않았다**.
+        let off = resolve_with(Some(&operator), false);
+        assert_eq!(off.source, Source::OverrideDisabled);
+        assert_eq!(off.gates, builtin(), "전제: 이 코퍼스에는 운영자 선언이 한 줄도 없다");
+        let v = report_json(&off, "claude", None, Some("2026-09-08T09:00:00+0900"));
+        assert_eq!(v["source"].as_str(), Some("override_disabled"));
+
+        // ── ① 실제 피해: 지금 나오는 봉투를 안내대로 붙여 넣으면 원 선언이 사라진다.
+        if let Some(env) = v.get("override_envelope").filter(|e| !e.is_null()) {
+            let pasted = resolve_with(Some(env), true);
+            assert_eq!(
+                pasted.gates.iter().find(|g| g.id == "folder-trust").map(|g| g.passability),
+                Some(Passability::HumanOnly),
+                "override 비활성 보고서의 봉투를 붙여 넣자 운영자가 조여 둔 folder-trust 가 \
+                 machine 으로 되돌아갔다 — 자동확인이 다시 열린다"
+            );
+            assert!(
+                pasted.gates.iter().any(|g| g.id == "ops-extra-gate"),
+                "운영자가 신설한 관문이 되먹임으로 소멸했다"
+            );
+        }
+
+        // ── ② 표식: 판독 실패와 **같은 이유**로 재료를 주지 않는다(둘 다 원 선언 미반영이다).
+        assert_eq!(
+            v.get("override_envelope"),
+            Some(&Value::Null),
+            "override 가 꺼진 코퍼스가 붙여넣기용 봉투를 내준다(필드 삭제도 아니고 빌트인 사본이다)"
+        );
+        assert_eq!(
+            v["override_envelope_status"]["paste_safe"].as_bool(),
+            Some(false),
+            "원 선언을 반영하지 않은 보고서가 '붙여 넣어도 안전' 이라고 말한다"
+        );
+        assert!(
+            v["override_envelope_status"]["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "왜 재료를 주지 않는지 말하지 않는다"
+        );
+
+        // ── ③ 정상 경로는 종전 그대로다(이 수리가 되먹임 자체를 죽이지 않는다).
+        let normal = report_json(&resolve_with(Some(&operator), true), "claude", None, None);
+        assert_eq!(normal["override_envelope_status"]["paste_safe"].as_bool(), Some(true));
+        assert!(normal["override_envelope"]["gates"].as_array().is_some_and(|a| a.len() >= 6));
+    }
+
+    /// ★(0.14.31 · 독립 재유도 H2-A 확장 · codex 설계 검토 1) 봉투가 **도달했는데 한 줄도
+    /// 반영되지 않은** 코퍼스도 되먹임 재료를 내지 않는다.
+    ///
+    /// 【무엇이 뚫려 있었나】 [`Source::Builtin`] 은 두 사실을 한 값으로 접는다 — "덮을 봉투가
+    /// 애초에 없다"(정상)와 "봉투는 있었는데 선언이 전부 거부됐다"(운영자가 쓴 것이 파일에 남아
+    /// 있다). 뒤쪽에서 보고서 봉투를 안내대로 붙여 넣으면 그 선언이 빌트인으로 덮여 사라진다 —
+    /// `override_disabled` 와 **같은 형태의 손실**이다(다만 거부된 선언이라 즉시 위험하진 않다).
+    #[test]
+    fn report_refuses_paste_material_when_the_envelope_reached_but_nothing_was_applied() {
+        // 운영자가 쓴 선언 2건이 **전부 거부**되는 형상(needles 결손 · id 결손).
+        let env = json!({"gates": [
+            {"id": "ops-extra-gate", "passability": "human_only"},
+            {"needles": ["Approve this workspace policy"]},
+        ]});
+        let r = resolve_with(Some(&env), true);
+        assert_eq!(r.source, Source::Builtin, "전제: 출처가 '정상' 으로 접힌다");
+        assert!(r.envelope_ignored, "봉투가 도달했는데 반영 0 인 사실이 소실됐다");
+        let v = report_json(&r, "claude", None, None);
+        assert_eq!(v["override_envelope"], Value::Null, "지울 선언이 있는데 붙여넣기 재료를 내준다");
+        assert_eq!(v["override_envelope_status"]["paste_safe"].as_bool(), Some(false));
+        assert!(v["override_envelope_status"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("반영")));
+
+        // 비객체 봉투도 같다(운영자가 무언가 써 두었고, 파서가 통째로 버렸다).
+        let junk = json!("first_run_gates 를 문자열로 썼다");
+        assert!(resolve_with(Some(&junk), true).envelope_ignored);
+
+        // ── 대조군: 지울 선언이 **없는** 두 형상은 종전대로 안전하다(셋을 한 값으로 접지 않는다).
+        for (label, envelope) in [
+            ("키 부재", None),
+            ("명시 null(의도적 비움)", Some(Value::Null)),
+        ] {
+            let r = resolve_with(envelope.as_ref(), true);
+            assert!(!r.envelope_ignored, "{label}: 지울 선언이 없는데 재료를 막았다");
+            let v = report_json(&r, "claude", None, None);
+            assert_eq!(
+                v["override_envelope_status"]["paste_safe"].as_bool(),
+                Some(true),
+                "{label}: 정상 기계의 되먹임이 죽었다"
+            );
+        }
+        // 그리고 **반영된** 봉투는 그대로 재료를 낸다.
+        let ok = json!({"gates": [{"id": "folder-trust", "passability": "human_only"}]});
+        let r = resolve_with(Some(&ok), true);
+        assert!(!r.envelope_ignored);
+        assert_eq!(
+            report_json(&r, "claude", None, None)["override_envelope_status"]["paste_safe"].as_bool(),
+            Some(true)
+        );
+    }
+
+    /// ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 3) 화면용 판독기와 `--version` 용 판독기를
+    /// **가른다**.
+    ///
+    /// [`parse_cli_version`] 의 둘째 갈래(앵커 없는 선두 점숫자)는 `claude --version` stdout 을
+    /// 읽을 때의 형태다. 화면(vt100 그리드)에 그것을 걸면 "첫 글자가 점 있는 숫자면 그게 도는
+    /// 버전" 이 되어 벤더가 무엇을 그리든 좌석의 버전 선언이 된다. 확인 경계는 좌석이 **스스로
+    /// 찍은 배너**만 증거로 본다([`banner_versions`]).
+    #[test]
+    fn banner_reader_takes_every_banner_and_ignores_the_version_stdout_shape() {
+        // ① 배너 전량 · 등장 순서 · 중복 제거.
+        let screen = "Welcome to Claude Code v2.1.241\n(중략)\nClaude Code v9.9.9 …\n\
+                      Welcome to Claude Code v2.1.241\n";
+        assert_eq!(banner_versions(screen), vec!["2.1.241".to_string(), "9.9.9".to_string()]);
+        assert_eq!(banner_version(screen).as_deref(), Some("2.1.241"));
+
+        // ② `--version` stdout 형상은 **배너가 아니다**(두 판독기가 갈린다).
+        let stdout = "2.1.263 (Claude Code)";
+        assert_eq!(banner_versions(stdout), Vec::<String>::new());
+        assert_eq!(parse_cli_version(stdout).as_deref(), Some("2.1.263"));
+
+        // ③ 실측 픽스처: 관문 화면은 배너를 밝히지 않는다(= 미상) · 테마 화면은 밝힌다.
+        assert!(banner_versions(fixtures::FOLDER_TRUST).is_empty());
+        assert_eq!(banner_version(fixtures::THEME).as_deref(), Some(MEASURED_ON));
+        assert_eq!(banner_version(fixtures::THEME_2_1_263).as_deref(), Some("2.1.263"));
+
+        // ④ 상한 — 병적 입력에서 판정 시간이 화면 길이에 끌려가지 않는다.
+        let many: String = (0..50).map(|i| format!("Claude Code v1.{i}\n")).collect();
+        assert_eq!(banner_versions(&many).len(), BANNER_SCAN_MAX);
     }
 }

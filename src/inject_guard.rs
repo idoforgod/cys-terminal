@@ -150,6 +150,20 @@ pub struct Observed<'a> {
     /// 않게. 종전부터 있던 코퍼스 가드(U-14 축 · [`guard_off`])와 커서-종료 벨트(조여지는 방향만)는 이 값과
     /// 무관하다. 마스터 `CYS_BOOT_GATES=0` 은 두 값 모두 켠다(전 축 종전).
     pub readiness_legacy: bool,
+    /// ★(0.14.31 · 독립 재유도 H2-B) **이 좌석의 이번 기동에서 관측된 claude 버전**(래치).
+    ///
+    /// 생산자는 부트 루프(`cys.rs boot_agent_on_surface`)이고, 재료는 그 부트의 **누적 델타**
+    /// (`since_line` 고정 · 기동 시점 이후 전량)에서 뽑은 배너다
+    /// ([`first_run_gates::banner_version`]). 화면(vt100 그리드)의 배너는 관문이 그려지면서
+    /// 밀려나지만 누적 델타에서는 밀려나지 않는다 — 그 **증거 소멸**이 정확히 드리프트 거부를
+    /// 다음 틱에 무효로 만드는 경로였다(codex 설계 검토 3).
+    ///
+    /// `None` = 이 부트에서 배너를 아직 못 봤다(= 버전 미상). 미상은 오늘 **통과**한다
+    /// ([`first_run_gates::ACTION_POLICY_ENFORCEMENT`] doc — 별도 결정).
+    ///
+    /// ★래치와 지금 화면의 배너는 **합집합**으로 쓴다(둘 중 하나라도 실측본과 다르면 보류).
+    ///   래치를 우선하고 화면을 버리면, 앞선 틱의 가짜 일치 배너가 뒤의 진짜 불일치를 덮는다.
+    pub cli_version: Option<&'a str>,
 }
 
 /// 가드의 결론.
@@ -337,6 +351,13 @@ pub enum ConfirmDenied {
     SequenceNotBareReturn { down: Option<u8> },
     /// 커서가 액션 라벨 **전문** 위가 아니거나, 활성 선택 블록에 **경쟁 커서**가 있다(모호).
     LabelUnresolved,
+    /// ★(0.14.31 · 독립 재유도 H2-B) 좌석이 밝힌 claude 버전이 이 관문을 **실측한 버전과 다르다**.
+    /// 선언된 기본 포커스·항목 순서가 그 버전에서 참이라는 근거가 없으므로 Return 을 보내지 않는다
+    /// (정본 §4 WP-1 H-2 "미실측은 보류" · §7 봉인표 ④).
+    VersionDrift {
+        measured_on: String,
+        detected: String,
+    },
 }
 
 impl ConfirmDenied {
@@ -365,6 +386,11 @@ impl ConfirmDenied {
             ConfirmDenied::LabelUnresolved => {
                 "커서가 액션 라벨 전문 위가 아니거나 활성 선택 블록에 경쟁 커서가 있다(모호)".into()
             }
+            ConfirmDenied::VersionDrift { measured_on, detected } => format!(
+                "좌석이 밝힌 claude 버전({detected})이 이 관문을 실측한 버전({measured_on})과 \
+                 다르다 — 선언된 통과 액션이 이 버전에서 참이라는 근거가 없다(사람 1회로 넘기거나, \
+                 실측한 뒤 agents.json 봉투의 measured_on 을 갱신할 것)"
+            ),
         }
     }
 }
@@ -407,6 +433,41 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
     match g.down_presses() {
         Some(0) => {}
         down => return Some(ConfirmDenied::SequenceNotBareReturn { down }),
+    }
+    // ★(0.14.31 · 독립 재유도 H2-B · 정본 §4 WP-1 H-2 · §7 봉인표 ④) **버전 축.**
+    //   종전 이 경계는 버전을 한 번도 보지 않았다 — 그래서 보고서가 `held_version_drift` 를
+    //   인쇄하면서 같은 화면에 Return 이 나갔다(인쇄된 판정과 실제 키 경로가 달랐다). 관문 선언
+    //   (기본 포커스·항목 순서)은 **어떤 버전에 대고 실측한 값**이고, 벤더가 순서를 바꾸면
+    //   `Return 한 발 = 통과` 가 곧 `Return 한 발 = No, exit`(좌석 rc 1)이 된다.
+    //
+    //   ★판정은 코퍼스가 소유한 [`first_run_gates::action_policy`] 를 그대로 소비한다(사본 0 —
+    //     여기서 `!=` 를 다시 쓰면 버전 대조가 두 벌이 되고 다음 판에 갈린다). 소비하는 팔은
+    //     **불일치 하나**다: `HeldVersionUnknown`(미상)은 오늘 통과한다 — `MEASURED_ON` 이 부분
+    //     실측이라 미상까지 접으면 전 좌석이 매 부트마다 사람 1회를 요구한다(별도 결정 ·
+    //     [`first_run_gates::ACTION_POLICY_ENFORCEMENT`] doc).
+    //
+    //   ★증거는 **합집합**이다 — 기동 래치(`o.cli_version`) ∪ 지금 화면의 배너 전량. 하나라도
+    //     실측본과 다르면 보류한다(증거가 갈리면 조이는 쪽). 화면 배너만 보면 배너가 관문 렌더에
+    //     밀려난 틱에서 거부가 풀리고, 래치만 보면 앞 틱의 배너가 뒤의 불일치를 덮는다.
+    //
+    //   【실패 방향】 오탐(엉뚱한 문자열을 배너로 읽음)의 귀결은 자동확인 보류 = 사람 1회(가역).
+    //   미탐의 귀결은 미실측 버전 화면에 Return = 좌석 rc 1(비가역).
+    for v in o
+        .cli_version
+        .into_iter()
+        .map(str::to_string)
+        .chain(first_run_gates::banner_versions(o.screen))
+    {
+        if let first_run_gates::ActionPolicy::HeldVersionDrift {
+            measured_on,
+            detected,
+        } = first_run_gates::action_policy(g, Some(&v))
+        {
+            return Some(ConfirmDenied::VersionDrift {
+                measured_on,
+                detected,
+            });
+        }
     }
     // 술어는 `decide_allowing` 의 allow 구멍과 **같은 하나**다(사본 0 — 두 자리가 갈리면 구멍이 생긴다).
     if action_label_selected(g, o.screen) {
@@ -556,6 +617,8 @@ mod tests {
             awakened: Some(false),
             guard_off: false,
             readiness_legacy: false,
+            // 기동 래치 없음 = 이 검체의 버전 증거는 **화면 배너뿐**이다(H2-B).
+            cli_version: None,
         }
     }
 
@@ -1273,7 +1336,7 @@ mod tests {
         let corpus_gate = fixtures::OAUTH_CODE;
         let corpus_id = first_run_gates::identify(&gs, corpus_gate).expect("전제: 코퍼스 관문").id.clone();
         let mk = |screen: &str, v1: bool, off: bool| -> Decision {
-            decide(&Observed { screen, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1 })
+            decide(&Observed { screen, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_version: None })
         };
         let unknown = crate::readiness::MODAL_UNKNOWN_ID;
         // 기본(두 노브 0): 둘 다 보류.
@@ -1292,7 +1355,7 @@ mod tests {
         // 벨트: V1 에는 열리지 않고(보류) 마스터(guard_off)에서만 관측 강등된다.
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
         let belt = |v1: bool, off: bool| decide_allowing(
-            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1 },
+            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_version: None },
             Some(GATE_FOLDER_TRUST),
         );
         assert!(belt(true, false).blocks(), "readiness 롤백이 커서-종료 벨트를 열었다(2.1.261 좌석 사망 경로)");
@@ -1441,7 +1504,7 @@ mod tests {
         }
         // 롤백 노브로도 열리지 않는다(조이는 벨트는 어느 노브로도 열지 않는다).
         for (guard_off, readiness_legacy) in [(true, false), (false, true), (true, true)] {
-            let o = Observed { screen, gates: &gs, awakened: Some(false), guard_off, readiness_legacy };
+            let o = Observed { screen, gates: &gs, awakened: Some(false), guard_off, readiness_legacy, cli_version: None };
             assert!(
                 !confirm_allowed(&o, "login-escape"),
                 "노브({guard_off},{readiness_legacy})가 사람 1회 화면의 확인을 열었다"
@@ -1486,5 +1549,151 @@ mod tests {
             Some(ConfirmDenied::Unidentified),
             "미식별 화면에서 확인이 열렸다"
         );
+    }
+
+    /// ★TRIAGE(R5-WP1-H2-corpus · 독립 재유도 2026-09-08 · reviewer-codex blocking) —
+    /// **좌석이 스스로 밝힌 미실측 버전에서도 확인이 열린다.**
+    ///
+    /// 【정본】 §4 WP-1 H-2: "미실측은 `MEASURED_ON` 미일치 상태로 남겨 **보류되게 한다**"
+    /// · §7 봉인표 ④(전 pane 사망 / 코퍼스 액션 오측정)의 봉인이 "미실측 관문은 핀 미갱신
+    /// (**보류 유지**)" 이다. 그런데 확인 경계는 버전을 판정 재료로 **한 번도** 보지 않는다
+    /// (`confirm_denied` :373~ · [`first_run_gates::ACTION_POLICY_IS_ENFORCED`] = false).
+    /// 그래서 인쇄된 `held_version_drift` 와 실제 키 경로가 동시에 성립한다.
+    ///
+    /// 【왜 이 형상인가 — 버전을 받을 API 가 없다는 반론에 대해】 이 검체는 새 인자를 요구하지
+    /// 않는다. 좌석은 **자기 화면에** 배너로 버전을 찍고, 코퍼스는 그것을 뽑는 순수 함수를 이미
+    /// 소유한다([`first_run_gates::parse_cli_version`]). 즉 "지금 이 좌석이 도는 바이너리" 의
+    /// 증거가 판정 입력(`Observed::screen`) 안에 이미 들어와 있는데도 쓰이지 않는다.
+    ///
+    /// 【실측 근거】 이 기계의 라이브 claude 는 2.1.263 이고 코퍼스 실측본은 2.1.241 이다.
+    /// 정본 §4 H-2 는 2.1.261 폴더신뢰의 기본 포커스가 `0="No, exit"` 라고 적는다 — 즉 이
+    /// 코퍼스가 선언한 `default_index: Some(1)`(=Return 한 발이 안전)은 그 버전에서 **거짓**이다.
+    /// 오늘 좌석을 지키는 것은 버전 핀이 아니라 커서 벨트 하나뿐이다.
+    #[test]
+    fn confirm_is_denied_when_the_screen_declares_a_version_the_corpus_never_measured() {
+        let gs = gates();
+        let g = gs.iter().find(|g| g.id == GATE_FOLDER_TRUST).expect("코퍼스에 folder-trust");
+
+        // 좌석이 자기 배너로 밝힌 버전 — 코퍼스 실측본과 다르다(라이브 실측값 2.1.263).
+        let drifted = format!("Welcome to Claude Code v2.1.263\n{}", fixtures::FOLDER_TRUST);
+        assert_eq!(
+            first_run_gates::parse_cli_version(&drifted).as_deref(),
+            Some("2.1.263"),
+            "전제: 화면에서 버전을 뽑을 수 있다(이 증거는 이미 판정 입력 안에 있다)"
+        );
+        assert_ne!("2.1.263", g.measured_on.as_str(), "전제: 실측본과 다른 버전이다");
+        assert!(
+            !first_run_gates::action_policy(g, Some("2.1.263")).is_allowed(),
+            "전제: 버전 핀은 이 조합을 **보류**로 판정한다(보고서가 그렇게 인쇄한다)"
+        );
+
+        // 그런데 확인 경계는 그 보류를 집행하지 않는다 — Return 이 나간다.
+        assert!(
+            confirm_denied(&obs(&drifted, &gs), GATE_FOLDER_TRUST).is_some(),
+            "화면이 미실측 버전을 스스로 밝히는데 확인이 열렸다 — 인쇄된 held_version_drift 와 \
+             실제 키 경로가 다르다(정본 §4 H-2 '미실측은 보류' · §7 봉인표 ④)"
+        );
+
+        // 그리고 조립의 산출까지 0발이어야 한다(판정만 고치고 소비자를 두면 반쪽이다).
+        let other_gate = !confirm_allowed(&obs(&drifted, &gs), GATE_FOLDER_TRUST);
+        for legacy_v1 in [false, true] {
+            assert!(
+                !trust_send(&TrustObserved {
+                    hit: true,
+                    first: true,
+                    persisted: false,
+                    sends: 0,
+                    max_sends: 2,
+                    other_gate,
+                    legacy_v1,
+                }),
+                "미실측 버전 화면에 Return 이 나갔다(legacy_v1={legacy_v1})"
+            );
+        }
+    }
+
+    /// ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 3) 버전 축의 **증거 규칙**.
+    ///
+    /// 위 검체(`confirm_is_denied_when_the_screen_declares_a_version_the_corpus_never_measured`)는
+    /// "불일치 배너가 화면에 있을 때" 하나를 잰다. 여기서는 그 축이 **어떤 증거로 서는지**를 잰다:
+    ///   ① 미상(배너 없음) → **오늘은 통과한다**(부분 실측 코퍼스로 가용성을 끊지 않는다 ·
+    ///      별도 결정 · [`first_run_gates::ACTION_POLICY_ENFORCEMENT`] doc) ·
+    ///   ② 기동 래치만 불일치(배너가 화면에서 밀려난 뒤) → **보류**. 이것이 없으면 드리프트 거부는
+    ///      다음 틱에 저절로 풀린다 — 배너는 관문이 그려지면 화면 밖으로 나간다 ·
+    ///   ③ 래치는 일치인데 화면 뒤쪽에 불일치 배너 → **보류**(증거는 합집합이다) ·
+    ///   ④ 둘 다 일치 → 통과(이 수리가 자동확인 기능 자체를 죽이지 않는다) ·
+    ///   ⑤ 앵커 없는 `--version` 형상은 이 경계에서 **증거가 아니다**(좌석이 스스로 찍은 배너만
+    ///      증거다). 그래서 ⑤는 미상으로 접혀 통과한다 — 이 결정을 바꾸려면 이 줄을 먼저 고쳐라.
+    ///   ⑥ 롤백 노브 셋 중 어느 것으로도 열리지 않는다(조이는 벨트의 규율 · CONTRACTS B-7).
+    #[test]
+    fn version_axis_holds_on_any_drifting_evidence_but_unknown_still_passes() {
+        let gs = gates();
+        let measured = gs
+            .iter()
+            .find(|g| g.id == GATE_FOLDER_TRUST)
+            .expect("코퍼스에 folder-trust")
+            .measured_on
+            .clone();
+        let drift = "9.9.9";
+        assert_ne!(drift, measured, "전제: 실측본과 다른 버전");
+        let denied = |screen: &str, latch: Option<&str>| -> Option<ConfirmDenied> {
+            confirm_denied(
+                &Observed {
+                    screen,
+                    gates: &gs,
+                    awakened: Some(false),
+                    guard_off: false,
+                    readiness_legacy: false,
+                    cli_version: latch,
+                },
+                GATE_FOLDER_TRUST,
+            )
+        };
+        let banner = |v: &str| format!("Welcome to Claude Code v{v}\n{}", fixtures::FOLDER_TRUST);
+
+        // ① 미상 — 배너가 없으면 종전대로 열린다(오늘의 결정).
+        assert_eq!(denied(fixtures::FOLDER_TRUST, None), None, "미상에서 확인이 닫혔다(가용성 절단)");
+
+        // ② 래치만 불일치 — **화면에는 배너가 없다**(밀려난 상태). 그래도 닫힌다.
+        assert_eq!(
+            denied(fixtures::FOLDER_TRUST, Some(drift)),
+            Some(ConfirmDenied::VersionDrift {
+                measured_on: measured.clone(),
+                detected: drift.to_string(),
+            }),
+            "배너가 화면에서 밀려나자 드리프트 거부가 풀렸다 — 거부가 한 틱짜리면 없는 것과 같다"
+        );
+
+        // ③ 래치는 일치인데 화면 뒤쪽에 불일치 배너 — 합집합이므로 닫힌다.
+        let two = format!("Welcome to Claude Code v{measured}\n(중략)\n{}", banner(drift));
+        assert!(
+            denied(&two, Some(&measured)).is_some(),
+            "앞선 일치 배너가 뒤의 불일치를 덮었다 — 증거는 합집합이어야 한다"
+        );
+
+        // ④ 둘 다 일치 — 자동확인은 그대로 산다.
+        assert_eq!(denied(&banner(&measured), Some(&measured)), None, "일치인데 확인이 닫혔다");
+
+        // ⑤ `--version` stdout 형상(앵커 없음)은 이 경계의 증거가 아니다 → 미상 → 통과.
+        //    ★좁힌 판독기의 대가를 정직하게 박제한다: 이 줄이 초록인 동안 "화면 첫 점숫자" 는
+        //      좌석의 버전 선언으로 쓰이지 않는다([`first_run_gates::banner_versions`] doc).
+        let stdout_shape = format!("{drift} (Claude Code)\n{}", fixtures::FOLDER_TRUST);
+        assert_eq!(denied(&stdout_shape, None), None);
+
+        // ⑥ 롤백 노브로 열리지 않는다.
+        for (guard_off, readiness_legacy) in [(true, false), (false, true), (true, true)] {
+            let o = Observed {
+                screen: &banner(drift),
+                gates: &gs,
+                awakened: Some(false),
+                guard_off,
+                readiness_legacy,
+                cli_version: None,
+            };
+            assert!(
+                !confirm_allowed(&o, GATE_FOLDER_TRUST),
+                "노브({guard_off},{readiness_legacy})가 미실측 버전 화면의 확인을 열었다"
+            );
+        }
     }
 }
