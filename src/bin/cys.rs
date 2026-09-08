@@ -12946,14 +12946,21 @@ fn run_reclaim_role(
         Ok(r) => {
             let role = r["role"].as_str().unwrap_or("");
             let reason = r["reason"].as_str().unwrap_or("");
+            // ★(수렴 R2) 진단 축 — **사유 코드가 아니다**. 사유는 종전 어휘 그대로 두고(그 값에
+            //   훅·검체의 기존 핀이 걸려 있다), "같은 무결합인데 처방이 다른" 경우만 여기로
+            //   말한다. 구 데몬은 이 키를 내지 않으므로 빈 문자열이 되고 종전과 같아진다.
+            let detail = r["reason_detail"].as_str().unwrap_or("");
             println!("role={role}");
             // ★둘째 줄 `reason=` (계약 C 는 **첫 줄**만 규정한다 — 이 줄은 추가다).
             //   훅은 이 값으로 **"데몬이 판정했다"와 "판정을 못 받았다"를 가른다**: 전자만
             //   권위이고, 후자에서 역할을 내리면 살아 있는 좌석이 지침을 잃는다(치명위험 ③).
             println!("reason={reason}");
             println!("env_role={}", r["env_role_state"].as_str().unwrap_or("unknown"));
+            // ★넷째 줄 `detail=` (계약 C 는 **첫 줄**만 규정한다 — 이 줄도 추가다). 빈 값이
+            //   정상이고, 훅은 이 줄이 없어도(구 바이너리) 종전대로 동작한다.
+            println!("detail={detail}");
             if role.is_empty() {
-                // 사유는 **stderr 한 줄**. 훅은 stdout 의 정해진 줄(1·2·3)만 읽으므로 여기 무엇을
+                // 사유는 **stderr 한 줄**. 훅은 stdout 의 정해진 줄(1~4)만 읽으므로 여기 무엇을
                 // 써도 파싱은 안전하다.
                 let hint = match reason {
                     "caller_unresolved" => {
@@ -12962,12 +12969,6 @@ fn run_reclaim_role(
                     "caller_axes_unknown" => {
                         "데몬이 이 좌석의 계정 dir(신뢰 출처)·작업 디렉터리를 확정하지 못했다 \
                          — 축 없이 역할을 옮기지 않는다"
-                    }
-                    // ★(독립 재유도) 신고 `$PWD` 와 이 좌석의 **실제** cwd 가 다른 곳이다.
-                    //   신고는 좁히기만 하므로 둘이 어긋나면 만족하는 후보가 없다.
-                    "reported_cwd_conflict" => {
-                        "신고한 폴더와 이 좌석의 실제 작업 폴더가 다르다 — 신고로 다른 폴더의 \
-                         역할을 가져오지 않는다(그 폴더에서 시작하거나 `cys claim-role <역할>`)"
                     }
                     "privileged_needs_optin" => {
                         "빈 좌석이 특권 역할(master·cso)이다 — 자동 경로는 그 문을 열지 않는다. \
@@ -12992,6 +12993,14 @@ fn run_reclaim_role(
                         "판정과 결합 사이에 좌석 상태가 바뀌었다(경합) — 결합하지 않았다"
                     }
                     _ => "무결합",
+                };
+                // 진단 축이 있으면 **처방만** 그것으로 바꾼다(사유 코드는 그대로다 — 이 무결합의
+                // 사실은 `no_candidate` 가 맞고, 다른 것은 "무엇을 하면 되는가"뿐이다).
+                let hint = if detail == "reported_cwd_conflict" {
+                    "신고한 폴더와 이 좌석의 실제 작업 폴더가 다르다 — 신고로 다른 폴더의 \
+                     역할을 가져오지 않는다(그 폴더에서 시작하거나 `cys claim-role <역할>`)"
+                } else {
+                    hint
                 };
                 eprintln!("[reclaim-role] role= (reason={reason}: {hint})");
                 if reason == "ambiguous" {

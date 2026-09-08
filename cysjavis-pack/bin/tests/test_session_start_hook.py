@@ -35,7 +35,8 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
     """claim_mode: ok | denied | dead(비0 무패턴) | silent(무한대기→timeout)
 
     reclaim_mode(★0.14.31 WP-4): 스텁 `cys` 의 surface-role·reclaim-role 응답 조합.
-      reclaim-role 의 stdout 계약은 **3줄**이다: `role=` · `reason=` · `env_role=`.
+      reclaim-role 의 stdout 계약은 **4줄**이다: `role=` · `reason=` · `env_role=` · `detail=`
+      (넷째는 진단 축 — 사유 어휘를 늘리지 않고 처방만 가른다 · 빈 값·부재 모두 정상).
       none        surface-role exit 0 · `role=` / no_candidate / env_role=unknown  (무결합)
       found       surface-role exit 0 · `role=cso` / bound / env_role=unknown      (자동 복구)
       undecidable surface-role **exit 2** · (호출되면 안 된다)
@@ -57,9 +58,12 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
             "denied": "echo 'claim_denied: privileged role held by live surface' >&2; exit 1",
             "dead": "echo 'connect error' >&2; exit 1",
             "silent": "sleep 10"}[claim_mode]
-    def _rc(role, reason, env_role):
-        return ("printf 'role=%s\\nreason=%s\\nenv_role=%s\\n' '{r}' '{s}' '{e}'; exit 0"
-                .format(r=role, s=reason, e=env_role))
+    def _rc(role, reason, env_role, detail=""):
+        # ★(수렴 R2) 계약은 4줄이다 — 넷째 `detail=` 은 사유 코드가 아니라 진단 축이고 빈 값이
+        #   정상이다(구 바이너리는 이 줄이 없다 → 훅은 종전대로 동작해야 한다).
+        return ("printf 'role=%s\\nreason=%s\\nenv_role=%s\\ndetail=%s\\n' "
+                "'{r}' '{s}' '{e}' '{d}'; exit 0"
+                .format(r=role, s=reason, e=env_role, d=detail))
     sr_body, rc_body = {
         "none":        ("exit 0", _rc("", "no_candidate", "unknown")),
         "found":       ("exit 0", _rc("cso", "bound", "unknown")),
@@ -79,9 +83,12 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
         "axes_unknown": ("exit 0", _rc("", "caller_axes_unknown", "unknown")),
         # ★(독립 재유도) 신고 $PWD 와 좌석의 실제 cwd 가 다른 폴더다 — 축 미확정과 **처방이
         #   다른** 무결합이므로 사유를 나눠 말한다(신고로 다른 폴더의 역할을 가져오지 않는다).
-        "cwd_conflict": ("exit 0", _rc("", "reported_cwd_conflict", "unknown")),
+        "cwd_conflict": ("exit 0", _rc("", "no_candidate", "unknown", "reported_cwd_conflict")),
         # ★(R2) 데몬이 **판정해서** 무역할이라고 답했고 env 역할은 주인이 없다(미등록).
         "unregistered":  ("exit 0", _rc("", "no_candidate", "vacant")),
+        # ★(수렴 R2) 구 바이너리 — 넷째 줄(`detail=`)이 **없는** 3줄 응답. 훅은 종전대로 돈다.
+        "legacy3":      ("exit 0",
+                         "printf 'role=\\nreason=no_candidate\\nenv_role=unknown\\n'; exit 0"),
         # ★독립 재유도(triage · codex major #7): **손상된 응답**을 '정상적인 빈 역할 답변'으로
         #   읽으면 안 된다. ⓐ 형식 가드에 걸린 역할명(첫 줄이 `role=` 이지만 채택 불가) ·
         #   ⓑ 첫 줄이 계약 형식이 아니고 명령 자체가 실패(exit 1). 둘 다 CYS_RECLAIMED 가
@@ -310,6 +317,18 @@ check("11t-a cwd 충돌 사유가 그대로 고지된다", "실제 작업 폴더
 check("11t-b 처방이 붙는다(해당 폴더에서 시작 · claim-role)",
       "cys claim-role" in out and "폴더에서 세션을 시작" in out)
 check("11t-c 강등이 아니다", "역할 주소 상실" not in out)
+check("11t-d 사유 코드는 종전 어휘 그대로다(처방만 진단 축으로 가른다)",
+      "reported_cwd_conflict" not in out)
+shutil.rmtree(tmp)
+
+# ── 11s. ★(수렴 R2) **구 바이너리 3줄 응답**(넷째 줄 없음)에서도 종전대로 동작한다 ──
+#   `detail=` 은 추가 줄이다. 없으면 빈 값이고, 없는 것을 충돌로 읽으면 정상 좌석에 엉뚱한
+#   처방이 붙는다(그리고 있는 줄을 못 읽으면 처방이 사라진다). 양방향을 여기서 함께 잰다.
+tmp = tempfile.mkdtemp(prefix="hook-t11s-")
+env = setup(tmp, "ok", reclaim_mode="legacy3")
+code, out, _ = run_hook(env)
+check("11s-a 넷째 줄이 없어도 훅이 산다", code == 0)
+check("11s-b 없는 진단 축을 충돌로 읽지 않는다", "실제 작업 폴더가 달라" not in out)
 shutil.rmtree(tmp)
 
 # ── 11v. ★(R2 · codex major) 판정된 '무역할' + 주인 없는 env 역할 → 지침은 주되 **미등록 고지** ──

@@ -223,13 +223,29 @@ pub struct CallerAxes<'a> {
     /// 놓치지 않기 위해서다: macOS 의 `/tmp` → `/private/tmp` 처럼 심링크가 끼면 생성 표기와
     /// 프로세스가 보고하는 표기가 문자열로 다르다(실측). 이 집합만으로는 codex 가 지적한
     /// 넓힘(`/proj/A` 에서 태어나 `cd /proj/B` 한 좌석이 A 의 역할을 가져감)이 남으므로,
-    /// **아래 `narrow_cwd` 와 AND** 로만 쓴다.
+    /// **아래 `narrow_cwds` 와 AND** 로만 쓴다.
     pub known_cwds: &'a [String],
-    /// 좁히기 값 — 후보는 이 값과도 **반드시** 같아야 한다. 우선순위:
-    /// ①훅이 신고한 `$PWD`(사람이 지금 있는 프로젝트) ②좌석 셸의 실제 cwd ③좌석 생성 cwd.
-    /// 자기신고에 줄 수 있는 유일하게 안전한 권한이 '좁히기'다(넓히지 못하므로 위조 이득 0).
-    pub narrow_cwd: Option<&'a str>,
-    /// `narrow_cwd` 가 어디서 왔는가(`reported|live|created|unknown`) — 진단·검체용.
+    /// 좁히기 조건들 — 후보는 **모든 조건**을 만족해야 한다(AND). 한 조건 안의 값들은
+    /// **같은 디렉터리의 다른 표기**(별칭)이므로 그중 하나와 같으면 그 조건은 만족이다(OR).
+    /// 값의 출처는 ①좌석 셸의 실제 cwd ②훅이 신고한 `$PWD` ③좌석 생성 cwd 이고, 자기신고에
+    /// 줄 수 있는 유일하게 안전한 권한이 '좁히기'다(넓히지 못하므로 위조 이득 0).
+    ///
+    /// 왜 AND-of-OR 인가:
+    ///   · **AND**(조건 사이 · 수렴 R1) — 실제 cwd 를 아는 경우 그것이 **독립 필수 조건**이고
+    ///     신고는 그 위에 얹히기만 한다. 신고가 실제와 다른 디렉터리면 두 조건을 함께 만족하는
+    ///     좌석이 **없다** → 무결합. `/proj/A` 에서 태어나 `cd /proj/B` 한 pane 이 `--cwd
+    ///     /proj/A` 를 신고해 A 의 역할을 가져가는 경로가 이 AND 로 닫힌다.
+    ///   · **OR**(조건 안 · 수렴 R2 · codex 재검증 minor) — `/tmp` ↔ `/private/tmp`(macOS
+    ///     심링크)처럼 같은 곳의 표기가 여럿일 때 그중 하나를 대표로 **강제하면**, 다른 표기로
+    ///     기록된 **정상 좌석**이 거부된다(안전 방향의 오작동이지만 기능 손실이다). 파일
+    ///     시스템이 "같은 곳"이라고 답한 표기들은 전부 싣고, 후보는 그중 하나와만 같으면 된다.
+    ///
+    /// 비어 있으면(또는 조건 하나가 통째로 공백이면) **축 미확정**이다 — 후보를 고르지 않는다
+    /// (fail-closed · [`decide`] 가 `AxesUnknown` 으로 답한다).
+    pub narrow_cwds: &'a [Vec<&'a str>],
+    /// 좁히기 값이 어디서 왔는가(`reported|live|created|conflict|unknown`) — **진단·검체용**이며
+    /// 판정 입력이 아니다. `conflict` = 신고 `$PWD` 와 실제 cwd 가 서로 다른 디렉터리라
+    /// 조건이 둘로 갈렸다(그 상태에서 만족하는 후보는 없다).
     pub cwd_source: &'static str,
 }
 
@@ -300,9 +316,15 @@ pub fn is_candidate(
     if !axes.known_cwds.iter().any(|k| same_path(e.cwd.as_deref(), Some(k))) {
         return false;
     }
-    // cwd 축 ②: **좁히기 값과도** 같아야 한다 — 이 AND 가 "생성 cwd 로 우회해 다른 프로젝트에
-    // 결합"(codex 적대검증 R2)을 닫는다. 값이 없으면 후보를 고르지 않는다(fail-closed).
-    same_path(e.cwd.as_deref(), axes.narrow_cwd)
+    // cwd 축 ②: **좁히기 조건 전부**를 만족해야 한다(§CallerAxes.narrow_cwds). 이 AND 가
+    // "생성 cwd 로 우회해 다른 프로젝트에 결합"(codex 적대검증 R2)과 "신고로 실제 cwd 이기기"
+    // (수렴 R1)를 함께 닫는다. 조건이 하나도 없으면 후보를 고르지 않는다(fail-closed).
+    if axes.narrow_cwds.is_empty() {
+        return false;
+    }
+    axes.narrow_cwds
+        .iter()
+        .all(|g| g.iter().any(|k| same_path(e.cwd.as_deref(), Some(k))))
 }
 
 /// 실효 유예(초) — 릴리스에서는 [`NEW_SEAT_GRACE_SECS`] 상수 그대로다.
@@ -354,7 +376,8 @@ pub fn decide(
     //   "데몬이 이 좌석의 계정 dir(신뢰 출처)·디렉터리를 모른다"이고, 그때 후보를 고르면
     //   축 없는 승계가 된다.
     if axes.cfg.map(|c| c.trim().is_empty()).unwrap_or(true)
-        || axes.narrow_cwd.map(|c| c.trim().is_empty()).unwrap_or(true)
+        || axes.narrow_cwds.is_empty()
+        || axes.narrow_cwds.iter().any(|g| g.iter().all(|c| c.trim().is_empty()))
         || axes.known_cwds.iter().all(|c| c.trim().is_empty())
     {
         return Decision::AxesUnknown;
@@ -609,8 +632,14 @@ pub(crate) mod tests {
         static K: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         K.get_or_init(|| vec![CWD.to_string()])
     }
+    /// 좁히기 조건 한 벌(별칭 없음) — 검체 대부분이 쓰는 기본형.
+    fn narrow(v: &'static [&'static str]) -> &'static [Vec<&'static str>] {
+        // 정적 수명이 필요해 leak 한다(검체 프로세스 종료로 회수).
+        Box::leak(vec![v.to_vec()].into_boxed_slice())
+    }
+
     fn axes() -> CallerAxes<'static> {
-        CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" }
+        CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: known(), narrow_cwds: narrow(&[CWD]), cwd_source: "live" }
     }
 
     fn decide_one(entries: &[LiveEntry]) -> Decision {
@@ -772,14 +801,14 @@ pub(crate) mod tests {
         let here = [ent("worker-2", 3, "empty", CFG, CWD)];
         // ⓐ 일치 신고 → 종전대로 결합.
         let mut ax = axes();
-        ax.narrow_cwd = Some(CWD);
+        ax.narrow_cwds = narrow(&[CWD]);
         ax.cwd_source = "reported";
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
             Decision::Bind { role: "worker-2".into(), from_surface: 3 }
         );
         // ⓑ 다른 값 신고 → **좁혀서** 무결합(데몬 축은 맞지만 사람은 다른 곳에 있다).
-        ax.narrow_cwd = Some("/Users/cys/dev/elsewhere");
+        ax.narrow_cwds = narrow(&["/Users/cys/dev/elsewhere"]);
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
             Decision::NoCandidate
@@ -793,19 +822,60 @@ pub(crate) mod tests {
         );
         // ⓓ 신고가 없으면 좁히기 값은 **데몬이 아는 실제 cwd** 로 접힌다(훅이 `$PWD` 를 못
         //    넘긴 경우에도 기능이 살지만, 넓어지지는 않는다).
-        ax.narrow_cwd = Some(CWD);
+        ax.narrow_cwds = narrow(&[CWD]);
         ax.cwd_source = "live";
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
             Decision::Bind { role: "worker-2".into(), from_surface: 3 }
         );
         // ⓔ 좁히기 값이 아예 없으면 후보를 고르지 않는다(fail-closed).
-        ax.narrow_cwd = None;
+        ax.narrow_cwds = &[];
         ax.cwd_source = "unknown";
         assert_eq!(
             decide(None, Some(&ax), 10_000.0, LeaseState::Free, &here, false),
             Decision::AxesUnknown
         );
+    }
+
+    /// ★(수렴 R2) 좁히기 조건의 **AND-of-OR** 계약을 순수층에 박제한다.
+    ///   ⓐ 조건 **안**은 별칭(OR) — 같은 폴더의 다른 표기로 기록된 좌석도 후보여야 한다.
+    ///     (`/tmp/proj` ↔ `/private/tmp/proj`: macOS 에서 데몬 기록과 프로세스 보고가 갈린다.
+    ///      대표 표기를 하나로 강제하면 **정상 좌석이 거부된다** — codex 재검증 minor.)
+    ///   ⓑ 조건 **사이**는 AND — 신고 `$PWD` 와 실제 cwd 가 다른 폴더면 둘을 함께 만족하는
+    ///     좌석이 없다. 이때 사유는 `no_candidate` 다: 축을 모르는 것이 아니라(그 둘을 다
+    ///     안다) 만족하는 후보가 없는 것이다.
+    #[test]
+    fn narrow_conditions_are_anded_while_aliases_inside_one_are_ored() {
+        const ALIAS: &str = "/private/tmp/cys-proj";
+        let known = vec![CWD.to_string(), ALIAS.to_string()];
+        // ⓐ 한 조건 · 두 별칭 — 어느 표기로 기록된 좌석이든 결합한다.
+        let one = vec![vec![CWD, ALIAS]];
+        let ax = CallerAxes {
+            sid: 9,
+            cfg: Some(CFG),
+            known_cwds: &known,
+            narrow_cwds: &one,
+            cwd_source: "reported",
+        };
+        for repr in [CWD, ALIAS] {
+            assert_eq!(
+                decide(None, Some(&ax), 10_000.0, LeaseState::Free,
+                       &[ent("worker-2", 3, "empty", CFG, repr)], false),
+                Decision::Bind { role: "worker-2".into(), from_surface: 3 },
+                "같은 폴더의 다른 표기({repr})로 기록된 좌석이 후보에서 빠졌다"
+            );
+        }
+        // ⓑ 두 조건(신고 ∧ 실제) — 서로 다른 폴더라 어느 좌석도 둘 다 만족하지 못한다.
+        let two = vec![vec![CWD], vec![ALIAS]];
+        let split = CallerAxes { narrow_cwds: &two, cwd_source: "conflict", ..ax };
+        for repr in [CWD, ALIAS] {
+            assert_eq!(
+                decide(None, Some(&split), 10_000.0, LeaseState::Free,
+                       &[ent("worker-2", 3, "empty", CFG, repr)], false),
+                Decision::NoCandidate,
+                "충돌한 좁히기 조건 아래에서 좌석({repr})이 후보가 됐다"
+            );
+        }
     }
 
     /// ★lease 보유 중이면 후보가 있어도 보류. 락 기구 불능도 **보류**(fail-open 금지).
@@ -840,12 +910,12 @@ pub(crate) mod tests {
         e.cwd = None;
         e.claude_config_dir = None;
         // 데몬이 호출 좌석의 축을 모르면 후보 계산 자체를 하지 않는다(AxesUnknown).
-        let blind = CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" };
+        let blind = CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwds: narrow(&[CWD]), cwd_source: "live" };
         assert_eq!(
             decide(None, Some(&blind), 10_000.0, LeaseState::Free, &[e.clone()], false),
             Decision::AxesUnknown
         );
-        let blank = CallerAxes { sid: 9, cfg: Some(""), known_cwds: known(), narrow_cwd: Some("   "), cwd_source: "live" };
+        let blank = CallerAxes { sid: 9, cfg: Some(""), known_cwds: known(), narrow_cwds: narrow(&["   "]), cwd_source: "live" };
         assert_eq!(
             decide(None, Some(&blank), 10_000.0, LeaseState::Free, &[e.clone()], false),
             Decision::AxesUnknown,
@@ -922,8 +992,8 @@ pub(crate) mod tests {
         assert!(!same_path(Some("/tmp/proj"), Some(" /tmp/proj")), "선행 공백이 지워졌다");
         // 후보 술어까지 관통시킨다(문자열 함수만 고치고 술어를 놓치는 회귀 차단).
         let e = LiveEntry { cwd: Some("/tmp/proj ".into()), ..ent("worker-2", 3, "empty", CFG, CWD) };
-        let narrow = vec!["/tmp/proj".to_string()];
-        let ax = CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &narrow, narrow_cwd: Some("/tmp/proj"), cwd_source: "live" };
+        let known_here = vec!["/tmp/proj".to_string()];
+        let ax = CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &known_here, narrow_cwds: narrow(&["/tmp/proj"]), cwd_source: "live" };
         assert!(
             !is_candidate(&e, &ax, 10_000.0, false),
             "후행 공백만 다른 cwd 좌석이 후보가 됐다"
@@ -1028,9 +1098,9 @@ pub(crate) mod tests {
         );
         // ⓒ 축 결측(신뢰 못 하는 계정 dir·읽지 못한 cwd)은 **무결합**이다 — 결측은 값이 아니다.
         for ax in [
-            CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwd: Some(CWD), cwd_source: "live" },
-            CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &[], narrow_cwd: None, cwd_source: "unknown" },
-            CallerAxes { sid: 9, cfg: None, known_cwds: &[], narrow_cwd: None, cwd_source: "unknown" },
+            CallerAxes { sid: 9, cfg: None, known_cwds: known(), narrow_cwds: narrow(&[CWD]), cwd_source: "live" },
+            CallerAxes { sid: 9, cfg: Some(CFG), known_cwds: &[], narrow_cwds: &[], cwd_source: "unknown" },
+            CallerAxes { sid: 9, cfg: None, known_cwds: &[], narrow_cwds: &[], cwd_source: "unknown" },
         ] {
             assert_eq!(
                 decide(None, Some(&ax), 10_000.0, LeaseState::Free,

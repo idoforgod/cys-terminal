@@ -100,6 +100,10 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"
     CYS_RC_L2="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 2p)"
     CYS_RC_L3="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 3p)"
+    # ★(수렴 R2) 넷째 줄 `detail=` 은 **사유 코드가 아니라 진단 축**이다. 사유 어휘를 늘리지
+    #   않고 "같은 무결합인데 처방이 다른" 경우만 가른다. 구 바이너리는 이 줄을 내지 않으므로
+    #   빈 값이 되고 종전과 완전히 같아진다(스큐 안전).
+    CYS_RC_L4="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 4p)"
     # ── ★(독립 재유도 · codex major #7) 응답을 **세 갈래로** 가른다 ────────────────────
     #   종전에는 셋이 한 값(`CYS_RECLAIMED=""`)으로 접혔다:
     #     ⓐ `valid_empty`  — 첫 줄이 **정확히** `role=` (데몬이 판정해서 '무역할'이라고 답함)
@@ -128,6 +132,7 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     fi
     CYS_RECLAIMED=""
     CYS_RC_REASON=""
+    CYS_RC_DETAIL=""
     CYS_ENV_ROLE_STATE="unknown"
     if [ "$CYS_RC_KIND" != "invalid_reply" ]; then
       if [ "$CYS_RC_KIND" = "valid_role" ]; then
@@ -138,6 +143,9 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       esac
       case "$CYS_RC_L3" in
         env_role=*) CYS_ENV_ROLE_STATE="${CYS_RC_L3#env_role=}" ;;
+      esac
+      case "$CYS_RC_L4" in
+        detail=*) CYS_RC_DETAIL="${CYS_RC_L4#detail=}" ;;
       esac
     fi
     # ── ★(0.14.31 · 리뷰 R2 · blocking ×2) 채택 규칙: **데몬의 답이 이긴다** ──────────────
@@ -210,15 +218,15 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
         echo "■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다."
         echo "  역할이 필요하면 \`cys claim-role <역할>\` 로 직접 등록하라."
         ;;
-      reported_cwd_conflict)
-        # ★(독립 재유도 · codex blocking #1) 신고한 `$PWD` 와 이 좌석의 **실제** 작업 폴더가
-        #   다른 곳이다. 신고는 좁히기만 하므로 두 조건을 함께 만족하는 좌석이 없다 —
-        #   처방이 `caller_axes_unknown`(축 미확정)과 다르기 때문에 사유를 나눠 말한다.
-        echo "■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다."
-        echo "  신고로 다른 폴더의 역할을 가져오지는 않는다(그것이 이 장치의 계약이다)."
-        echo "  그 역할이 필요하면 해당 폴더에서 세션을 시작하거나 \`cys claim-role <역할>\` 로 등록하라."
-        ;;
     esac
+    # ★(수렴 R2) 신고한 `$PWD` 와 이 좌석의 **실제** 작업 폴더가 다른 곳이다. 신고는 좁히기만
+    #   하므로 두 조건을 함께 만족하는 좌석이 없다 — 사실은 `no_candidate` 가 맞고(사유 코드는
+    #   건드리지 않는다), 처방만 다르다. 그래서 사유가 아니라 **진단 축**으로 가른다.
+    if [ "$CYS_RC_DETAIL" = "reported_cwd_conflict" ]; then
+      echo "■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다."
+      echo "  신고로 다른 폴더의 역할을 가져오지는 않는다(그것이 이 장치의 계약이다)."
+      echo "  그 역할이 필요하면 해당 폴더에서 세션을 시작하거나 \`cys claim-role <역할>\` 로 등록하라."
+    fi
   fi
 fi
 

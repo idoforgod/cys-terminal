@@ -936,47 +936,66 @@ fn reclaim_auto(
     //   주 경로가 통째로 죽는다(claude 적대검증 R2 major).
     let reported_cfg = param_str(params, "claude_config_dir").or_else(|| param_str(params, "config"));
     let reported_cwd = param_str(params, "cwd").filter(|v| !v.trim().is_empty());
-    // ★좁히기 값(§CallerAxes.narrow_cwd) — 후보는 **반드시** 이 값과 같아야 한다. 우선순위는
-    //   ①훅이 신고한 `$PWD`(사람이 지금 있는 프로젝트) ②좌석 셸의 실제 cwd ③좌석 생성 cwd.
-    //   신고가 없어도 넓어지지 않는다: 다음 순위가 그 자리를 채운다(fail-closed).
+    // ★좁히기 조건(§CallerAxes.narrow_cwds) — 후보는 **모든 조건**을 만족해야 하고(AND), 조건
+    //   하나 안의 값들은 **같은 디렉터리의 다른 표기**(별칭 · OR)다. 값의 출처는 ①좌석 셸의
+    //   실제 cwd ②훅이 신고한 `$PWD` ③좌석 생성 cwd(①②가 없을 때의 폴백)다.
     let created_cwd = caller_seat.as_ref().map(|s| s.cwd.as_str()).filter(|c| !c.trim().is_empty());
-    // ★실제 cwd 의 **대표 표기**: 같은 디렉터리의 다른 표기를 '다른 디렉터리'로 읽지 않는다
-    //   (실측: macOS 의 `/tmp` → `/private/tmp` 심링크. 데몬은 생성 표기를, 프로세스는 해소된
-    //   표기를 보고한다). 파일시스템에 직접 물어 같은 곳이면 **기록 표기**를 쓴다 — 좌석들의
-    //   `cwd` 가 그 표기로 적혀 있기 때문이다. 정말 다른 곳이면(사람이 `cd` 했다) 지금 값이
-    //   대표다. 이 syscall 들은 어떤 락도 쥐지 않은 지점에서 돈다.
-    let live_repr: Option<&str> = match (caller_live_cwd.as_deref(), created_cwd) {
-        (Some(l), Some(c)) if same_dir_on_disk(l, c) => Some(c),
-        (Some(l), _) => Some(l),
-        (None, _) => None,
+    /// 같은 디렉터리인가 — 문자열 규칙이 먼저이고, 그것이 아니라고 하면 파일시스템에 묻는다
+    /// (실측: macOS 의 `/tmp` → `/private/tmp` 심링크. 데몬은 생성 표기를, 프로세스는 해소된
+    /// 표기를 보고한다). 이 syscall 들은 어떤 락도 쥐지 않은 지점에서 돈다.
+    fn same_dir(a: &str, b: &str) -> bool {
+        crate::reclaim::norm_path(a) == crate::reclaim::norm_path(b) || same_dir_on_disk(a, b)
+    }
+    // 실제 cwd 조건의 **별칭들**: 프로세스가 보고한 표기와, 그것과 같은 곳으로 확인된 좌석
+    // 생성 표기를 **함께** 싣는다. 하나를 대표로 강제하면 다른 표기로 기록된 정상 좌석이
+    // 거부된다 — `/tmp/P` 로 만든 좌석과 `/private/tmp/P` 로 만든 좌석은 같은 폴더다
+    // (codex 재검증 minor: 안전 방향이지만 정상 재결합을 잃는 오작동).
+    let live_alias: Vec<&str> = match (caller_live_cwd.as_deref(), created_cwd) {
+        (Some(l), Some(c)) if c != l && same_dir(l, c) => vec![l, c],
+        (Some(l), _) => vec![l],
+        (None, _) => Vec::new(),
     };
-    // ★(독립 재유도 · codex blocking #1) 실제 cwd 를 **알면 그것이 독립 필수 조건**이고,
-    //   신고는 그 위에 AND 로만 얹힌다(narrow = live ∧ reported). 종전 판은 신고를 **무조건
-    //   1순위**로 두어, `/proj/A` 에서 태어나 `cd /proj/B` 한 pane 이 `--cwd /proj/A` 를 신고하면
-    //   A 의 빈 좌석을 가져갔다 — 같은 상태에서 자기신고 하나가 거부를 결합으로 뒤집는다.
-    //   그러면 "신고는 좁히기만 한다"(넓히지 못하므로 위조 이득 0)는 보증이 성립하지 않는다:
-    //   사람은 B 에 있는데 A 프로젝트의 역할·큐가 이 pane 으로 이사한다.
-    //   신고가 실제 cwd 와 어긋나면 두 조건을 함께 만족하는 후보는 **없다** — 그때는 좁히기
-    //   값을 세우지 않아 무결합(`caller_axes_unknown`)으로 접는다(fail-closed).
-    //   실제 cwd 를 못 읽는 기계(Windows ConPTY·권한 제약)에서는 종전대로 신고가 좁히기 값이다.
-    let (narrow_cwd, cwd_source): (Option<&str>, &'static str) =
-        match (reported_cwd.as_deref(), live_repr) {
+    // ★(수렴 R1 · codex blocking #1) 실제 cwd 를 **알면 그것이 독립 필수 조건**이고, 신고는 그
+    //   위에 AND 로만 얹힌다. 종전 판은 신고를 **무조건 1순위**로 두어, `/proj/A` 에서 태어나
+    //   `cd /proj/B` 한 pane 이 `--cwd /proj/A` 를 신고하면 A 의 빈 좌석을 가져갔다 — 같은
+    //   상태에서 자기신고 하나가 거부를 결합으로 뒤집는다. 그러면 "신고는 좁히기만 한다"
+    //   (넓히지 못하므로 위조 이득 0)는 보증이 성립하지 않는다: 사람은 B 에 있는데 A 프로젝트의
+    //   역할·큐가 이 pane 으로 이사한다.
+    //   신고가 실제 cwd 와 **다른 디렉터리**면 조건이 둘로 갈리고, 둘을 함께 만족하는 좌석은
+    //   없다 → 무결합(`no_candidate`). 실제 cwd 를 못 읽는 기계(Windows ConPTY·권한 제약)에서는
+    //   종전대로 신고가 좁히기 값이다.
+    let (narrow_groups, cwd_source): (Vec<Vec<&str>>, &'static str) =
+        match (reported_cwd.as_deref(), live_alias.first().copied()) {
             (Some(r), Some(l)) => {
-                if crate::reclaim::norm_path(r) == crate::reclaim::norm_path(l)
-                    || same_dir_on_disk(r, l)
-                {
-                    // 신고가 실제와 같은 곳이다 — 좁히기 값은 **데몬의 대표 표기**로 둔다
-                    // (좌석 `cwd` 문자열이 그 표기다).
-                    (Some(l), "reported")
+                if same_dir(r, l) {
+                    // 같은 곳이다 — 조건은 하나이고, 신고 표기도 별칭으로 함께 싣는다.
+                    let mut g = live_alias.clone();
+                    if !g.iter().any(|k| *k == r) {
+                        g.push(r);
+                    }
+                    (vec![g], "reported")
                 } else {
-                    (None, "conflict")
+                    // 다른 곳이다 — 조건 둘(AND). 함께 만족하는 좌석이 없으므로 무결합이다.
+                    (vec![live_alias.clone(), vec![r]], "conflict")
                 }
             }
-            (Some(r), None) => (Some(r), "reported"),
-            (None, Some(l)) => (Some(l), if Some(l) == created_cwd { "created" } else { "live" }),
+            (Some(r), None) => {
+                let mut g = vec![r];
+                if let Some(c) = created_cwd {
+                    if c != r && same_dir(r, c) {
+                        g.push(c);
+                    }
+                }
+                (vec![g], "reported")
+            }
+            (None, Some(l)) => {
+                let src =
+                    if live_alias.len() > 1 || Some(l) == created_cwd { "created" } else { "live" };
+                (vec![live_alias.clone()], src)
+            }
             (None, None) => match created_cwd {
-                Some(c) => (Some(c), "created"),
-                None => (None, "unknown"),
+                Some(c) => (vec![vec![c]], "created"),
+                None => (Vec::new(), "unknown"),
             },
         };
     let axis_state = |reported: Option<&str>, known: &[String]| -> &'static str {
@@ -1011,7 +1030,7 @@ fn reclaim_auto(
         sid,
         cfg: caller_known_cfg.as_deref(),
         known_cwds: &caller_known_cwds,
-        narrow_cwd,
+        narrow_cwds: &narrow_groups,
         cwd_source,
     });
     let snapshot_now = |daemon: &Arc<Daemon>| {
@@ -1031,26 +1050,13 @@ fn reclaim_auto(
         &snapshot_now(daemon),
         allow_privileged,
     );
-    // ★무결합 사유의 **정련**: 좁히기 값이 없는 이유가 "축을 모른다"가 아니라 "신고와 실제
-    //   cwd 가 어긋난다"이면 그렇게 말한다. 처방이 다르기 때문이다 — 전자는 `claim-role` 로
-    //   직접 등록, 후자는 **그 폴더에서 다시 시작**하는 것이 정답이다(codex 설계비평 #5).
-    //   ★판정 자체는 바꾸지 않는다(면제 신호가 아니다 · `decide` 의 `AlreadyRoled` 우선순위도
-    //     그대로다 — 이 정련은 `decide` 가 이미 무결합을 답한 뒤에만 문자열을 갈아 끼운다).
-    let refine_reason = |d: &crate::reclaim::Decision| -> &'static str {
-        match d {
-            crate::reclaim::Decision::AxesUnknown if cwd_source == "conflict" => {
-                "reported_cwd_conflict"
-            }
-            other => other.reason(),
-        }
-    };
     if !matches!(first, crate::reclaim::Decision::Bind { .. }) {
         let candidates = match &first {
             crate::reclaim::Decision::Ambiguous(roles) => Some(roles.clone()),
             _ => None,
         };
         return no_bind_reply(
-            daemon, id, caller_sid, refine_reason(&first), candidates, &env_role, &reported_axes,
+            daemon, id, caller_sid, first.reason(), candidates, &env_role, &reported_axes,
         );
     }
     // ── 2차 판정: lease 를 **확보한 뒤 다시** 판정한다(이것이 최종 판정이다) ────────
@@ -1072,7 +1078,7 @@ fn reclaim_auto(
         &snapshot_now(daemon),
         allow_privileged,
     );
-    let reason = refine_reason(&decision);
+    let reason = decision.reason();
     match decision {
         crate::reclaim::Decision::Bind { role, from_surface } => {
             // `caller_sid`·`axes` 는 Bind 판정이 성립한 시점에 둘 다 Some 이다.
@@ -1128,6 +1134,13 @@ fn reclaim_auto(
 /// 무조건 `already_roled` 로 바꿔서, `deadline_exceeded`·`raced_holder_changed` 로 **취소된
 /// 사실**이 운영자 대면 문안에서 사라졌다(감사 이벤트에만 남았다). 역할은 최신값으로, 사유는
 /// 있었던 그대로 — 둘은 다른 축이다.
+///
+/// ★(수렴 R2) `reason_detail` 은 **사유 코드를 늘리지 않고** 처방을 가르는 진단 축이다.
+/// 신고 `$PWD` 가 좌석의 실제 cwd 와 다른 디렉터리면(`reported_axes.cwd_source == "conflict"`)
+/// 좁히기 조건이 둘로 갈려 만족하는 좌석이 없다 — 사실은 `no_candidate` 가 정확히 말하고,
+/// **무엇을 하면 되는가**(그 폴더에서 시작하라)는 이 필드가 말한다. 사유 코드 자체를 바꾸면
+/// 그 값에 걸린 훅·검체의 기존 핀이 함께 흔들린다(그 재핀이 이 커밋이 되돌린 것이다).
+/// 결합(`Bind`)에는 실리지 않는다 — 무결합 전용 진단이라 게이트를 여는 방향이 될 수 없다.
 fn no_bind_reply(
     daemon: &Arc<Daemon>,
     id: &Value,
@@ -1139,9 +1152,13 @@ fn no_bind_reply(
 ) -> Reply {
     let now_role = caller_sid.and_then(|sid| reclaim_authoritative_role(daemon, sid));
     let env_state = reclaim_env_role_state(daemon, caller_sid, env_role);
+    let detail: Option<&str> = (now_role.is_none()
+        && reported_axes.get("cwd_source") == Some(&json!("conflict")))
+    .then_some("reported_cwd_conflict");
     let mut body = json!({
         "role": now_role.clone(),
         "reason": reason,
+        "reason_detail": detail,
         "surface_id": caller_sid,
         "env_role_state": env_state,
         "reported_axes": reported_axes.clone(),
@@ -18808,11 +18825,12 @@ mod tests {
         // 테스트 수명 동안만 사는 값이 필요해 leak 한다(검체 프로세스 종료로 회수).
         let cfg: &'static str = Box::leak(rc_cfg().into_boxed_str());
         static KNOWN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        static NARROW: std::sync::OnceLock<Vec<Vec<&'static str>>> = std::sync::OnceLock::new();
         crate::reclaim::CallerAxes {
             sid,
             cfg: Some(cfg),
             known_cwds: KNOWN.get_or_init(|| vec![RC_CWD.to_string()]),
-            narrow_cwd: Some(RC_CWD),
+            narrow_cwds: NARROW.get_or_init(|| vec![vec![RC_CWD]]),
             cwd_source: "reported",
         }
     }
@@ -19469,15 +19487,17 @@ mod tests {
         assert_eq!(r1["result"]["reason"], json!("no_candidate"));
         assert_eq!(r1["result"]["reported_axes"]["config"], json!("differ"), "진단이 사실을 감췄다");
         // ⓑ 프로젝트 공격: 남의 프로젝트를 신고하면 **좁혀서** 아무 것도 고르지 않는다.
-        //   ★재핀(독립 재유도 · codex blocking #1): 사유가 `no_candidate` → `reported_cwd_conflict`
-        //     로 바뀐다. 이제 신고는 실제 cwd 를 **이길 수 없고**(narrow = live ∧ reported), 둘이
-        //     어긋나면 좁히기 값 자체가 서지 않기 때문이다 — "후보를 다 보고 없었다"가 아니라
-        //     "무엇으로 좁힐지 확정하지 못했다"가 사실이다. 결과 방향(무결합·피해 0)은 그대로다.
+        //   ★사유 코드는 이 검체가 처음부터 핀한 `no_candidate` 그대로다(수렴 R2 · codex
+        //     재검증 major: 기존 핀을 새 구현에 맞춰 바꾸지 않는다). 신고가 실제 cwd 를
+        //     이길 수 없게 된 뒤에도 사실은 같다 — 좁히기 조건이 둘로 갈렸고(신고 ∧ 실제),
+        //     둘을 함께 만족하는 좌석이 **없다**. 그 갈림 자체는 아래 **진단 축**이 말한다.
         let r2 = reclaim_rpc(&daemon, Some(pid), json!({"config": rc_cfg(), "cwd": OTHER_CWD}));
         assert_eq!(r2["result"]["role"], json!(null), "타 프로젝트 신고로 결합했다: {r2}");
-        assert_eq!(r2["result"]["reason"], json!("reported_cwd_conflict"));
+        assert_eq!(r2["result"]["reason"], json!("no_candidate"));
         assert_eq!(r2["result"]["reported_axes"]["cwd"], json!("differ"));
         assert_eq!(r2["result"]["reported_axes"]["cwd_source"], json!("conflict"));
+        // 진단 축(사유 코드가 아니다) — 처방이 다른 무결합임을 여기서만 말한다.
+        assert_eq!(r2["result"]["reason_detail"], json!("reported_cwd_conflict"));
         // 두 피해 좌석 모두 역할을 그대로 쥐고 있다(부분 적용 0).
         assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(victim_cfg));
         assert_eq!(daemon.roles.lock().unwrap().get("reviewer-codex").copied(), Some(victim_cwd));
@@ -19497,6 +19517,14 @@ mod tests {
     /// 뒤집힌다**. 자기신고가 후보 집합을 바꾼 것이므로 "신고는 좁히기만 한다"(R2 의 보증)가
     /// 성립하지 않는다 — 사람은 B 에 있는데 A 프로젝트의 역할·큐가 이 pane 으로 이사한다.
     #[test]
+    // ★(수렴 R2 · codex 재검증 minor) **unix 한정**: 전제 단계가 좌석 셸에 `cd <B> && sleep 30`
+    //   을 태운다. `CYS_SHELL` 미설정 Windows 의 기본 셸은 `powershell.exe`(state.rs)이고
+    //   Windows PowerShell 5.1 은 `&&` 를 구문 오류로 거부한다 — 좌석이 B 로 옮겨가지 않아
+    //   제품 결함을 잡기 전에 **검체가 먼저 실패한다**(위생 문제). 판정 자체(신고가 실제 cwd 를
+    //   이기지 못한다)는 플랫폼 독립이고 순수층
+    //   (`reclaim::tests::narrow_conditions_are_anded_while_aliases_inside_one_are_ored`)이
+    //   Windows 에서도 그대로 잰다.
+    #[cfg(unix)]
     fn reported_cwd_cannot_widen_past_the_live_cwd() {
         let daemon = isolated_daemon();
         const CWD_A: &str = "/tmp/cys-triage-proj-a";
@@ -19566,6 +19594,93 @@ mod tests {
         );
         assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(victim));
         assert!(daemon.get_surface(s.id).unwrap().role.lock().unwrap().is_none());
+    }
+
+    /// ★(수렴 R2 · codex 재검증 minor) **같은 폴더의 다른 표기는 같은 폴더다.**
+    ///
+    /// 사람이 한 pane 을 `/tmp/P`(심링크)에서, 다른 pane 을 `/private/tmp/P`(해소 경로)에서
+    /// 띄우면 데몬 기록의 cwd 표기가 좌석마다 갈린다. 좁히기 값을 **호출 좌석의 생성 표기
+    /// 하나로 강제**하면, 같은 폴더에 있는 빈 좌석이 "표기가 다르다"는 이유로 후보에서 빠진다 —
+    /// 잘못 결합하는 방향은 아니지만 정상 재결합을 통째로 잃는다(가용성 손실). 조건 하나 안의
+    /// 값들은 **별칭**이어야 한다.
+    ///
+    /// 이 검체는 심링크를 실제로 만들고, 호출 좌석은 링크 표기로·빈 좌석은 해소 표기로 만든다.
+    /// 음성 대조(ⓑ)로 "정말 다른 폴더"는 여전히 무결합임을 같은 자리에서 잰다.
+    #[test]
+    #[cfg(unix)] // 심링크 생성이 필요하다(Windows 는 권한·정책이 걸린다).
+    fn reclaim_binds_across_two_representations_of_one_directory() {
+        let daemon = isolated_daemon();
+        // 기준 디렉터리부터 **해소된 표기**로 잡는다 — macOS 의 `/var` → `/private/var` 처럼
+        // 상위가 이미 심링크면 세 번째 표기가 끼어들어 검체가 자기 주제를 못 잰다.
+        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize tmp");
+        let uniq = format!("{}-{}", std::process::id(), crate::state::now_epoch() as u64);
+        let real = base.join(format!("cys-alias-real-{uniq}"));
+        let link = base.join(format!("cys-alias-link-{uniq}"));
+        let other = base.join(format!("cys-alias-other-{uniq}"));
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::create_dir_all(&other).expect("other dir");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let (real_s, link_s, other_s) = (
+            real.display().to_string(),
+            link.display().to_string(),
+            other.display().to_string(),
+        );
+        crate::reclaim::tests::set_grace_secs(0.0);
+
+        // 빈 worker 좌석은 **해소 표기**로 기록됐다.
+        let victim = reclaim_seat(&daemon, "worker-2", &real_s, None, false);
+        // 호출 좌석은 **링크 표기**로 태어났다(같은 폴더다).
+        let pid = 970_150_u32;
+        let me = reclaim_caller(&daemon, &link_s, pid);
+
+        // 전제: 데몬이 이 좌석의 실제 cwd 를 해소 표기로 관측한다(못 하면 이 검체는 사실을
+        // 재지 못하므로 조용히 초록이 되지 않게 여기서 세운다).
+        let live_cwd = |target: u32| -> Option<String> {
+            let sp = sysinfo::Pid::from_u32(target);
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[sp]),
+                false,
+                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+            );
+            sys.process(sp).and_then(|x| x.cwd()).map(|c| c.display().to_string())
+        };
+        let caller_pid = daemon.get_surface(me).unwrap().pid;
+        let mut observed = false;
+        for _ in 0..50 {
+            if live_cwd(caller_pid).is_some_and(|c| c == real_s) {
+                observed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(observed, "호출 좌석의 실제 cwd 를 해소 표기({real_s})로 관측하지 못했다(전제 미성립)");
+
+        // ⓐ 훅은 해소된 `$PWD`(`cd -P` 뒤의 표기)를 신고한다 — 같은 폴더이므로 결합해야 한다.
+        let r1 = reclaim_rpc(&daemon, Some(pid), json!({"config": rc_cfg(), "cwd": real_s}));
+        assert_eq!(
+            r1["result"]["role"],
+            json!("worker-2"),
+            "같은 폴더인데 표기가 달라 재결합이 거부됐다(별칭이 접히지 않았다): {r1}"
+        );
+        assert_eq!(r1["result"]["reason"], json!("bound"));
+        assert_eq!(daemon.roles.lock().unwrap().get("worker-2").copied(), Some(me));
+        assert_ne!(Some(victim), daemon.roles.lock().unwrap().get("worker-2").copied());
+
+        // ⓑ 음성 대조 — **정말 다른 폴더**의 빈 좌석은 여전히 가져오지 못한다.
+        let daemon2 = isolated_daemon();
+        let far = reclaim_seat(&daemon2, "worker-3", &other_s, None, false);
+        let pid2 = 970_151_u32;
+        let me2 = reclaim_caller(&daemon2, &link_s, pid2);
+        let r2 = reclaim_rpc(&daemon2, Some(pid2), json!({"config": rc_cfg(), "cwd": real_s}));
+        assert_eq!(r2["result"]["role"], json!(null), "다른 폴더의 좌석을 가져왔다: {r2}");
+        assert_eq!(daemon2.roles.lock().unwrap().get("worker-3").copied(), Some(far));
+        assert!(daemon2.get_surface(me2).unwrap().role.lock().unwrap().is_none());
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     /// ★(codex blocking #2 의 근본) **인증 표식은 호출자 env 로 뒤집을 수 없어야 한다.**
