@@ -1355,7 +1355,7 @@ def h_mission_1():
         notes.append("모듈 부재: 판정 불가=무스폰(fail-closed) · 판정불가 명시 주입문")
     # ⓒ 검증자가 실증한 **자기인가 우회로 2종**을 그 문안 그대로 재투입 → 대장 미기록
     with tempfile.TemporaryDirectory() as tmp:
-        for prompt, why in (("[wakeup] 다음 액션 착수", "자기 예약 wake(CLAUDE.md.template:44)"),
+        for prompt, why in (("[wakeup] 다음 액션 착수", "자기 예약 wake(CLAUDE.md.template:52)"),
                             ("[worker-1 완료] T1 끝났습니다. 다음 지시 주세요",
                              "워커 완료 push(CLAUDE.md §7)")):
             sb = os.path.join(tmp, re.sub(r"\W+", "_", why)[:20])
@@ -7721,6 +7721,134 @@ def h_seed_2():
         need('os.environ.get("CLAUDE_CONFIG_DIR"' not in old[di:di + 3000],
              "계측 타당성 실패: 구 discover 가 이미 CLAUDE_CONFIG_DIR env 를 읽는다")
         calib = "구 C28 FAIL 부재 + 구 discover CLAUDE_CONFIG_DIR 미참조 확인"
+    return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+@specimen("H-SEED-CAPGATE-1", "W3",
+          "능력 게이트 판정 불능이 **다음 부팅에 재측정된다**(지속 표식 + fast path 소비 축)",
+          ["triage-T11"])
+def h_seed_capgate_1():
+    """★독립 재유도 T11(2026-09-08): C28 의 `unknown` 은 등록도 해제도 하지 않는데 그 사실이
+    **어디에도 남지 않았다**. preflight 를 자동으로 돌리는 유일 지점은 `javis_bootstrap.py` ①
+    이고, 그 앞의 레인 마커 fast path 는 같은 pack_version 이면 preflight 를 통째로 생략한다 —
+    그 팩 버전의 첫 부팅이 판정 불능이면 게이트는 그 버전 내내 미등록으로 굳고 두 번째 부팅부터는
+    경고조차 사라진다. 검체는 **지속화 축**(preflight)과 **소비 축**(bootstrap fast path)을
+    함께 잰다 — 둘 중 하나만 있으면 재측정 기회는 여전히 없다."""
+    PF = _preflight_mod()
+    notes = []
+    # ⓐ `--only` 는 **그 검사 하나만** 낸다(표적 재측정의 출력 계약).
+    #   ★임시 팩 가드는 마커 기반으로 치환한다(H-SEED-2 와 같은 규약) — 이 러너의 샌드박스가
+    #     그 자체로 `/var/folders/…` 아래라 실 가드는 모든 샌드박스 팩을 '임시 팩=등록 금지'로
+    #     판정하고, 그러면 C28 이 게이트 판정 **앞에서** 조기 반환해 이 축이 공허해진다.
+    with tempfile.TemporaryDirectory() as tmp, _temp_guard_double(PF, "SNAPMARK"):
+        home = os.path.join(tmp, "home")
+        pack = _fake_pack_with_hooks(os.path.join(home, ".cys", "pack"))
+        _make_profile(home, ".claude", {})
+        # 게이트 훅 본체 + **신판 표지가 달린** 지침 — 이 둘이 없으면 (a) 실재 검사가
+        # `repair_via_init_pack()` 로 실 팩을 설치해 픽스처가 다른 세계가 된다.
+        _w(os.path.join(pack, "hooks", "role-capability-gate.sh"), "#!/bin/sh\nexit 0\n")
+        _dpath = os.path.join(pack, "directives", "CSO_DIRECTIVE.md")
+        _w(_dpath, "# CSO\n%s\n본문\n" % PF.CSO_DIRECTIVE_REV_MARKER, 0o644)
+        # ★등록 대상은 **실사용 config dir** 로 준다(H-SEED-2 와 같은 규약) — 임시 팩 컨텍스트는
+        #   등록이 금지돼 C28 이 게이트 판정 앞에서 조기 반환한다(그러면 이 축이 공허해진다).
+        ccd = os.path.join(tmp, "live-config")
+        os.makedirs(ccd, exist_ok=True)
+        _w(os.path.join(ccd, "settings.json"), "{}", 0o644)
+        with _env_patch(HOME=home, CYS_PACK_DIR=pack, CYS_SOCKET=None, CYS_BIN=None,
+                        CLAUDE_CONFIG_DIR=ccd):
+            ids = [r["id"] for r in PF.Preflight(False, [], only=["C28.self-correction"]).run()]
+            need(ids == ["C28.self-correction"],
+                 "--only 가 표적 밖 검사를 남겼다(부트 체인이 무엇이 재측정됐는지 오독한다): %s"
+                 % ids)
+            notes.append("--only 출력 1행")
+            # ⓑ 판정 불능(허브 표지 0 → alert 축 None · 데몬을 깨우지 않는다)이 **지속 표식**이 된다.
+            mark = PF.capgate_unresolved_path(pack)
+            need(not os.path.exists(mark), "계측 타당성 실패: 표식이 이미 있다")
+            need(PF.Preflight(False, [])._capgate_gate()[0] == PF.CAPGATE_UNKNOWN,
+                 "계측 타당성 실패: 이 픽스처가 판정 불능이 아니다")
+            p = PF.Preflight(True, [], only=["C28.self-correction"])
+            p.run()
+            row = [r for r in p.results if r["id"] == "C28.self-correction"][0]
+            need("판정 불능" in row["detail"],
+                 "판정 불능을 사실대로 보고하지 않았다: %r" % row["detail"][:200])
+            need(os.path.exists(mark),
+                 "판정 불능이 지속 기록으로 남지 않았다 — 다음 부팅은 fast path 로 preflight 를 "
+                 "건너뛰므로 재측정 기회가 없다(%s)" % mark)
+            need(PF.capgate_unresolved(pack)[0] is True,
+                 "표식 판독기가 자기가 쓴 표식을 읽지 못한다(%s)" % mark)
+            notes.append("unknown → 표식 기록")
+            # ⓑ-2 조건이 **양성으로 거짓**이 되고 잔존 등록이 0 이면(=반영 확인) 표식은 해소된다.
+            #     ★'판정이 났다' 가 아니라 '반영까지 확인됐다' 가 해소 조건이다(codex 설계비평).
+            _w(_dpath, "# CSO\n표지 없음\n", 0o644)
+            p2 = PF.Preflight(True, [], only=["C28.self-correction"])
+            p2.run()
+            need(PF.Preflight(False, [])._capgate_gate()[0] == PF.CAPGATE_OFF,
+                 "계측 타당성 실패: 표지를 지웠는데 조건 거짓이 아니다")
+            need(not os.path.exists(mark),
+                 "반영이 확인됐는데 미해소 표식이 남았다 — 매 부팅이 표적 재측정을 반복한다")
+            notes.append("반영 확인 → 표식 해소")
+    # ⓒ 소비 축: fast path 가 표식을 **AND 로** 보고, 표적 재측정은 C28 하나뿐이다.
+    bsrc = _read(os.path.join(BIN_DIR, "javis_bootstrap.py"))
+    need("capgate-unresolved.json" in bsrc and "_cap_unresolved" in bsrc,
+         "부트 fast path 가 미해소 표식을 읽지 않는다(지속화만 있고 소비가 없다)")
+    need("if _marker_fresh and not _cap_unresolved:" in bsrc,
+         "fast path 조건에 미해소 표식이 AND 로 들어가지 않았다")
+    need('"--only", "C28.self-correction"' in bsrc,
+         "재측정이 표적(C28)이 아니다 — 전량 preflight 재실행은 부트 지연·큐 적체를 만든다")
+    need("PING_RETRY" not in bsrc.split("_cap_unresolved")[1][:1200],
+         "재측정 경로에 데몬 대기 재시도 루프가 붙었다(이 축의 전제 위반)")
+    notes.append("fast path AND + C28 표적")
+    # ⓒ-2 ★R2 minor(codex): 위 ⓒ는 **소스 문자열 탐색**이다 — 그 `_run(...)` 을
+    #     `code, out = 0, ""` 로 갈아 끼워도 전부 통과한다(codex 실증). 그래서 여기서는
+    #     bootstrap 을 **실제로 돌려** 재측정이 일어나는지 본다: 스텁 preflight 가 자기 argv 를
+    #     파일에 적으므로 '불렸는가·무엇을 표적으로 했는가' 가 관측으로 남는다.
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    with tempfile.TemporaryDirectory() as btmp:
+        benv, bhome = _boot_sandbox(os.path.join(btmp, "b"))
+        bpack = os.path.join(bhome, ".cys", "pack")
+        # fast path 전제(H-LIFE-1 과 같은 규약): 마커에 **실팩 버전**이 박혀야 재선언이 preflight
+        # 를 생략한다 — `unknown` 은 판정 불가라 fast path 가 아예 켜지지 않는다.
+        _w(os.path.join(bpack, ".pack-version"), "9.9.9\n", 0o644)
+        argv_log = os.path.join(btmp, "pf-argv.log")
+        _w(os.path.join(bpack, "bin", "javis_preflight.py"),
+           "import sys\n"
+           "open(%r, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n"
+           "sys.exit(0)\n" % argv_log, 0o644)
+        r1 = _run([PY, boot], env=benv, timeout=180)
+        need(r1.returncode == 0, "① 첫 부팅 실패: %d\n%s" % (r1.returncode, r1.stderr[-400:]))
+        need(os.path.exists(argv_log) and _read(argv_log).strip(),
+             "계측 타당성 실패: 첫 부팅이 preflight 를 돌리지 않았다(픽스처가 공허하다)")
+        # ⓐ 대조군 — 표식이 없으면 두 번째 부팅은 preflight 를 **생략**한다(fast path).
+        _w(argv_log, "", 0o644)
+        r2 = _run([PY, boot], env=benv, timeout=180)
+        need(r2.returncode == 0, "② 재선언 실패: %d\n%s" % (r2.returncode, r2.stderr[-400:]))
+        need(not _read(argv_log).strip(),
+             "계측 타당성 실패: 표식이 없는데 fast path 가 발동하지 않았다: %r" % _read(argv_log))
+        # ⓑ 표식이 있으면 **다시 잰다** — 그것도 C28 만(전량 재실행은 부트 지연·큐 적체다).
+        _w(os.path.join(bpack, "state", "capgate-unresolved.json"), "{}\n", 0o644)
+        r3 = _run([PY, boot], env=benv, timeout=180)
+        need(r3.returncode == 0, "③ 표식 부팅 실패: %d\n%s" % (r3.returncode, r3.stderr[-400:]))
+        got = _read(argv_log).strip()
+        need(got, "미해소 표식이 있는데 **재측정이 일어나지 않았다** — 소비 축이 문면에만 있고 "
+                  "실행에는 없다(다음 부팅이 다시 재는 것이 이 축의 유일한 계약이다)")
+        need("--only C28.self-correction" in got,
+             "재측정이 표적(C28)이 아니다 — 전량 preflight 재실행은 부트 지연·큐 적체를 만든다: %r"
+             % got)
+        need("--fix" in got,
+             "재측정이 판정만 하고 교정하지 않는다 — 표식이 해소되지 않아 매 부팅이 반복된다: %r"
+             % got)
+    notes.append("실행 축: 표식 X→생략 · 표식 O→`--fix --only C28` 재측정")
+    old = _git_show("cysjavis-pack/bin/javis_bootstrap.py")
+    calib = "skip(no-git)"
+    if old is not None:
+        need("capgate-unresolved" not in old,
+             "계측 타당성 실패: 구 bootstrap 이 이미 미해소 표식을 읽는다")
+        calib = "구 bootstrap 미해소 표식 미참조 확인"
+    oldpf = _git_show(os.path.join("cysjavis-pack", "bin", "javis_preflight.py"))
+    if oldpf is not None:
+        need("capgate_unresolved_path" not in oldpf,
+             "계측 타당성 실패: 구 preflight 가 이미 표식을 기록한다")
+        calib += " · 구 preflight 표식 부재 확인"
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 

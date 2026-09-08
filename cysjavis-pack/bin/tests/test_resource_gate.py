@@ -24,7 +24,11 @@ import types
 import unittest
 from unittest import mock
 
-BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+# ★R2(리뷰 major): 이 파일은 종전 `cysjavis-pack/tests/` 에 있었고 **어느 CI 레인에서도 실행되지
+#   않았다**(3레인은 `cysjavis-pack/bin/tests/` 만 이름으로 열거한다 · 글롭·pytest 없음).
+#   480235d 가 깬 스위트가 바로 이것이라, 그 회귀는 다음에 또 나도 CI 가 녹색이었다.
+#   `bin/tests/` 로 옮겨 3레인 등재 대상에 넣는다(등재 자체는 CONTRACTS §B-9 통합 단계 소관).
+BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 
@@ -45,6 +49,17 @@ def make_args(**over):
         #   (라이브 의존 = 기계마다 다른 결과 = 결정론 파괴). 폴백 경로를 재는 테스트는
         #   _ledger_servers 를 명시 패치한다.
         servers_ledger_override={"lane": "(ledger empty)", "depts": {}},
+        # ★0.14.31 R1 밀폐 복구(단언 무수정 · 위 servers_ledger_override 와 **같은 이유**):
+        #   0.14.31 이 신설한 fleet_cpu 축은 measure() 에서 `ps -axo pid,pcpu,command` 를 스폰하고,
+        #   부트 유예 축은 `boot-epoch` mtime 을 읽는다. 둘 다 **실행 기계의 라이브 상태**라
+        #   그대로 두면 이 모듈의 밀폐 규약(override 를 다 주면 스폰 0)이 깨진다 — 실측으로
+        #   `test_measure_end_to_end_with_live_double` 이 대역 subprocess 에 걸려 실패했고,
+        #   PATH 앞에 바쁜 ps 스텁을 두면 임계 핀(`test_threshold_unchanged`)까지 무너졌다.
+        #   신설 축의 판정은 전용 검체(bin/tests/test_resource_gate_fleet_cpu.py · 모듈 self-test)가
+        #   잰다. 여기서는 **고정값**으로 죽여 기존 축의 단언만 남긴다.
+        fleet_cpu_override=0.0, fleet_cpu_hold_override=None,
+        fleet_cpu_soft=G.FLEET_CPU_SOFT_DEFAULT, fleet_cpu_hard=G.FLEET_CPU_HARD_DEFAULT,
+        boot_elapsed_override=99999.0,
     )
     for k, v in over.items():
         setattr(a, k, v)
@@ -492,7 +507,10 @@ class TestServersLedger(unittest.TestCase):
         실제 CLI 기본값으로 확인해야 의미가 있으므로 main() 경로를 그대로 탄다."""
         import contextlib
         import io
+        # ★0.14.31 R1: 신설 CPU 축·부트 유예도 고정 주입한다 — 이 핀이 재는 것은 servers 임계이고,
+        #   그것을 기계의 현재 부하(fleet_cpu)나 데몬 부트 시각에 좌우되게 두면 임계 핀이 아니게 된다.
         argv = ["check", "--json", "--nodes-override", "0", "--load-override", "0.0",
+                "--fleet-cpu-override", "0.0", "--boot-elapsed-override", "99999",
                 "--dept-roster-override", '{"active":0,"seats":0,"errors":[],"depts":[]}',
                 "--servers-ledger-override", '{"lane":"(ledger empty)","depts":{}}']
         with contextlib.redirect_stdout(io.StringIO()):
@@ -501,6 +519,45 @@ class TestServersLedger(unittest.TestCase):
         self.assertEqual(rc_soft, G.EXIT_SOFT, "servers 2 가 soft 가 아니다 — 임계가 움직였다")
         self.assertEqual(rc_hard, G.EXIT_HARD, "servers 3 이 hard 가 아니다 — 임계가 움직였다")
         self.assertEqual(G.NODES_HARD_DEFAULT, 18)
+
+
+class TestMeasureHermeticity(unittest.TestCase):
+    """★0.14.31 R1 신설 반례 — **override 를 다 준 measure() 는 프로세스를 스폰하지 않고
+    파일도 건드리지 않는다.** 이 모듈의 밀폐 규약을 말이 아니라 기계로 잡는다(리뷰 major:
+    신설 축이 그 규약을 조용히 깼고, 검증 census 가 이 파일을 안 돌려 못 잡았다)."""
+
+    def test_all_overrides_spawn_nothing(self):
+        a = make_args(servers_override=0, nodes_override=0, load_override=0.0)
+        with mock.patch.object(G, "_dept_roster", return_value=roster()), \
+                mock.patch.object(G.subprocess, "run",
+                                  side_effect=AssertionError("live spawn")) as run:
+            m = G.measure(a)
+        run.assert_not_called()
+        self.assertEqual(m["measure_errors"], [])
+        self.assertEqual(m["fleet_cpu_ratio"], 0.0)
+        self.assertEqual(m["fleet_cpu_reason"], "override")
+
+    def test_all_overrides_touch_no_latch_or_epoch(self):
+        # 래치(`fleet-cpu-hard-since`)·boot-epoch 어느 쪽도 읽거나 쓰지 않는다.
+        a = make_args(servers_override=0, nodes_override=0, load_override=0.0)
+        with mock.patch.object(G, "_dept_roster", return_value=roster()), \
+                mock.patch.object(G, "_fleet_hard_hold",
+                                  side_effect=AssertionError("latch")) as hold, \
+                mock.patch.object(G, "_boot_epoch_path",
+                                  side_effect=AssertionError("epoch")) as ep:
+            G.measure(a)
+        hold.assert_not_called()
+        ep.assert_not_called()
+
+    def test_fleet_axis_is_ok_not_unavailable_under_override(self):
+        # 음성 대조: override 가 없으면 이 축은 라이브를 읽는다(= 위 밀폐가 공허하지 않다).
+        a = make_args(servers_override=0, nodes_override=0, load_override=0.0,
+                      fleet_cpu_override=None)
+        with mock.patch.object(G, "_dept_roster", return_value=roster()), \
+                mock.patch.object(G, "_ps_cpu_lines", return_value=(None, "absent")) as ps:
+            m = G.measure(a)
+        ps.assert_called_once()
+        self.assertIsNone(m["fleet_cpu_ratio"])
 
 
 class TestClaudeArgvForms(unittest.TestCase):

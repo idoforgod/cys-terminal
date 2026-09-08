@@ -119,9 +119,12 @@ def _sanitize_key(socket):
     return safe or "base"
 
 
-def _run(argv, timeout=30):
+def _run(argv, timeout=30, env=None):
+    """자식 실행 → (rc, stdout, stderr). 실패는 예외가 아니라 127 버킷.
+
+    ★env(0.14.31 R2): 지정하면 그 환경으로 스폰한다(미지정 = 상속 · 종전 동작 그대로)."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
         return r.returncode, (r.stdout or ""), (r.stderr or "")
     except Exception as e:
         return 127, "", str(e)
@@ -535,16 +538,32 @@ def _resource_verdict(socket):
     if gate is None:
         return True, None
     py = sys.executable or "python3"
+    # ★R2(리뷰 major): 게이트의 **레인 종속 판정**(부트 유예 300s · hard 보류 래치)은 이 호출이
+    #   어느 레인을 위한 것인지 알아야 한다. 종전엔 받은 `socket` 을 자식에 전혀 알리지 않아,
+    #   실제 호출자(base 데몬 builtin `formation-heartbeat` 가 전 부서 소켓을 순회하는 셸 루프)의
+    #   자식이 **항상 base 의 boot-epoch·래치**를 봤다 — 부서 데몬 재시작 직후(= 좌석 전멸 부서의
+    #   자동 복구 구간)에 신설 hard 축의 유예가 0 이었다(실측: base env → boot_elapsed=158781.6 ·
+    #   hard_block / 부서 env → boot_elapsed=8.9 · boot_grace → soft_warn).
+    #   ★`CYS_SOCKET` 이 아니라 전용 변수로 나른다: 그 이름은 `cys` CLI 가 읽어서 게이트 안의
+    #     원장 조회(`cys ps`) 대상까지 바꾸고, 그러면 base 원장이 servers 집계에서 빠진다.
+    #   ★플래그가 아니라 env 인 이유: 구 게이트는 미지 플래그에 EX_USAGE(64)를 내고 이 함수는 그것을
+    #     '스큐' 로 읽어 축소 재시도를 한다 — 버전 스큐 창에서 판정이 흔들린다. env 는 무시될 뿐이다.
+    kw = {"timeout": 30}
+    if socket:
+        kw["env"] = dict(os.environ, CYS_GATE_LANE_SOCKET=str(socket))
     code, out, err = _run(
-        [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], timeout=30)
+        [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], **kw)
     branch = _resource_branch(code)
     if branch == "block":
         return False, _gate_json(out)
     if branch == "retry":
         sys.stderr.write("[formation] 자원 게이트 측정 실패(exit %s — 스큐/내부오류) — "
                          "무플래그 1회 재시도\n" % code)
-        code2, o2, _e2 = _run([py, gate, "check", "--json"],
-                              timeout=RESOURCE_RETRY_TIMEOUT_S)
+        # ★재시도도 **같은 레인**이어야 한다(codex R2 A1) — 축소 재시도는 플래그만 줄인다.
+        kw2 = {"timeout": RESOURCE_RETRY_TIMEOUT_S}
+        if socket:
+            kw2["env"] = dict(os.environ, CYS_GATE_LANE_SOCKET=str(socket))
+        code2, o2, _e2 = _run([py, gate, "check", "--json"], **kw2)
         if code2 == 2:
             return False, _gate_json(o2)
         if code2 not in (0, 1):
@@ -1194,15 +1213,15 @@ def self_test():
         g["_gate_path"] = lambda: "/fake/javis_resource_gate.py"
         # ① rc=2 → False · 재시도 없음(1회 호출)
         calls = []
-        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, "", ""))
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (2, "", ""))
         with _ctx.redirect_stderr(_io.StringIO()):
             ck(_resource_ok(None) is False and len(calls) == 1, "rc=2 즉시 차단 회귀")
         ck(any("--formation-size" in c for c in calls[0][0]), "본 호출에 --formation-size 부재")
         # ② rc=64 → 무플래그 1회 재시도(timeout 15) rc=0 → True
         calls = []
 
-        def _r64(argv, timeout=30):
-            calls.append((list(argv), timeout))
+        def _r64(argv, timeout=30, **_kw):
+            calls.append((list(argv), timeout, _kw))
             return (64, "", "") if len(calls) == 1 else (0, "", "")
         g["_run"] = _r64
         with _ctx.redirect_stderr(_io.StringIO()):
@@ -1213,20 +1232,20 @@ def self_test():
         # ③ rc=70 → 재시도 rc=2 → False(재시도 hard 는 차단으로 접힘)
         calls = []
 
-        def _r70(argv, timeout=30):
-            calls.append((list(argv), timeout))
+        def _r70(argv, timeout=30, **_kw):
+            calls.append((list(argv), timeout, _kw))
             return (70, "", "") if len(calls) == 1 else (2, "", "")
         g["_run"] = _r70
         with _ctx.redirect_stderr(_io.StringIO()):
             ck(_resource_ok(None) is False and len(calls) == 2, "70→재시도 hard 가 False 아님")
         # ④ rc=127 → 무재시도(1회)·True(loud 진행)
         calls = []
-        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (127, "", "no such file"))
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (127, "", "no such file"))
         with _ctx.redirect_stderr(_io.StringIO()):
             ck(_resource_ok(None) is True and len(calls) == 1, "127 무재시도·진행 계약 위반")
         # ⑤ rc=1(soft) → True·1회
         calls = []
-        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (1, "", ""))
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (1, "", ""))
         ck(_resource_ok(None) is True and len(calls) == 1, "soft(1) 진행 회귀")
         # ── ★A2(SURVEY B2) 게이트 JSON 보존 — _resource_verdict 는 판정은 그대로, stdout 만 살린다 ──
         gate_json = json.dumps({"verdict": "hard_block",
@@ -1234,20 +1253,51 @@ def self_test():
                                            "hard": 42, "level": "hard"}],
                                 "warnings": [], "measured": {"nodes": 44}})
         calls = []
-        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, gate_json, ""))
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (2, gate_json, ""))
         ok2, gate2 = _resource_verdict(None)
         ck(ok2 is False and isinstance(gate2, dict) and gate2.get("verdict") == "hard_block"
            and len(calls) == 1, "rc=2 + JSON stdout 이 (False, dict) 아님 — 축 정보 유실")
         calls = []
-        g["_run"] = lambda argv, timeout=30: (calls.append((list(argv), timeout)) or (2, "not json {", ""))
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (2, "not json {", ""))
         ok3, gate3 = _resource_verdict(None)
         ck(ok3 is False and gate3 is None and len(calls) == 1, "rc=2 + 파손 stdout 이 (False, None) 아님")
         # 슬롯 경유(ensure ④ 소비 형상): _resource_ok 는 bool, JSON 은 _resource_gate_last 로 · 읽고 비움.
-        g["_run"] = lambda argv, timeout=30: (2, gate_json, "")
+        g["_run"] = lambda argv, timeout=30, **_kw: (2, gate_json, "")
         ck(_resource_ok("/x/a.sock") is False
            and (_resource_gate_last("/x/a.sock") or {}).get("verdict") == "hard_block",
            "_resource_ok 슬롯이 게이트 JSON 을 나르지 않음")
         ck(_resource_gate_last("/x/a.sock") is None, "슬롯이 읽고 비워지지 않음(stale 라벨 위험)")
+        # ── ★R2(리뷰 major) 레인 전달 — 게이트의 부트 유예·보류 래치는 레인 종속이다 ──
+        calls = []
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw))
+                                                     or (0, "{}", ""))
+        _resource_verdict("/dept/cys.sock")
+        env0 = (calls[0][2] or {}).get("env") or {}
+        ck(env0.get("CYS_GATE_LANE_SOCKET") == "/dept/cys.sock",
+           "게이트 자식 env 에 레인 소켓이 없다 — 부서 편성이 base 의 boot-epoch·래치를 본다: %r"
+           % (sorted(k for k in env0 if k.startswith("CYS_")),))
+        ck("CYS_SOCKET" not in (calls[0][2] or {}).get("env", {})
+           or env0.get("CYS_SOCKET") == os.environ.get("CYS_SOCKET"),
+           "레인 전달이 CYS_SOCKET 을 덮어써 게이트 안 `cys ps` 원장 대상까지 바꿨다(집계 모집단 변경)")
+        # 재시도(64 스큐) 경로도 같은 레인이어야 한다
+        calls = []
+
+        def _r64b(argv, timeout=30, **_kw):
+            calls.append((list(argv), timeout, _kw))
+            return (64, "", "") if len(calls) == 1 else (0, "{}", "")
+        g["_run"] = _r64b
+        with _ctx.redirect_stderr(_io.StringIO()):
+            _resource_verdict("/dept/cys.sock")
+        ck(len(calls) == 2 and ((calls[1][2] or {}).get("env") or {})
+           .get("CYS_GATE_LANE_SOCKET") == "/dept/cys.sock",
+           "축소 재시도가 레인을 잃었다(다른 레인의 유예·래치로 판정): %r" % (calls[1][2],))
+        # 음성 대조: socket 이 없으면 env 를 만들지 않는다(종전 호출 형상 보존)
+        calls = []
+        g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw))
+                                                     or (0, "{}", ""))
+        _resource_verdict(None)
+        ck("env" not in (calls[0][2] or {}),
+           "socket 없는 호출이 env 를 만들었다(불필요한 환경 사본): %r" % (calls[0][2],))
     finally:
         g["_run"], g["_gate_path"] = saved_run, saved_gp
     # ── ★A2 라벨 순수 함수 핀 — hard 축만 · JSON 부재=축 미상 · 거짓 라벨(곱셈) 0 · gate 축약 규약 ──

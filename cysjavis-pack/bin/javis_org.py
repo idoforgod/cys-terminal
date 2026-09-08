@@ -22,6 +22,20 @@ except ImportError:  # Windows
         except OSError:
             pass
 
+# ★형제 모듈 경로 가드(tests/test_import_guard.py 계약 · 선례 javis_bootstrap.py:127):
+#   Windows 번들 파이썬(embeddable)은 스크립트 폴더를 sys.path 에 넣지 않는다.
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+
+# 역할 해소 단일 소유(0.14.31 P6). import 실패는 이 도구를 죽이지 않는다 — 구 팩·부서 팩에
+# 아직 이 모듈이 없을 수 있고(`build.rs` 는 git 추적 파일만 임베드), 그때는 **종전 env 판정**만
+# 남는다(강등의 방향이 '더 허용'이 아니라 '현행 유지'라는 것이 이 배선의 요점이다).
+try:
+    import javis_role as _role_mod
+except Exception:
+    _role_mod = None
+
 HOME = os.path.expanduser("~")
 CATALOG = os.environ.get("CYS_DEPT_CATALOG", f"{HOME}/.cys/dept-catalog.json")
 DEPTS = os.environ.get("CYS_DEPTS_JSON", f"{HOME}/.cys/depts.json")
@@ -43,8 +57,75 @@ def sha256_file(path):
     with open(path, "rb") as f: return hashlib.sha256(f.read()).hexdigest()
 
 def require_cso():
-    if os.environ.get("CYS_ROLE") != "cso":
-        sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). CSO에 위임하라.\n")
+    """부서 mutation 단일소유 게이트 — **단조 거부**(monotone deny) 합성(0.14.31 P6).
+
+    ★I5 수렴(판정관 T3a·T3b · 2026-09-08): 여기에 **ⓓ 통과 절**이 붙는다 — 데몬이 권위 있게
+      `cso` 라고 답하면 stale `CYS_ROLE` 이 그것을 뒤집지 못한다(정본 §8 의 표적 그 자체였다).
+      새 허용의 근거는 **살아 있는 데몬의 직접 응답**(`SOURCE_DAEMON`)뿐이다: 디스크 캐시는
+      같은 uid 의 아무 프로세스나 쓸 수 있어서 그것을 통과 근거로 삼으면 위조 한 줄이
+      lifecycle mutation 을 연다(codex 설계 비평 (g)). 캐시가 `cso` 라고 말하고 env 가 stale 이면
+      `confirm_role_detail()` 로 **디스크를 건너뛰고 한 번 더 직접** 묻는다 — 그래야 첫 호출은
+      허용되고 60초 안의 둘째 호출은 캐시 때문에 거부되는 판정 요동이 생기지 않는다.
+      자식 프리미티브(`cys-dept`)도 **같은 규칙**으로 같은 커밋에서 바꾼다 — 부모만 열면
+      `destroy_dept` 가 자식 거부 rc 를 만나 정리 경로가 새로 도달 가능해진다(codex (f)).
+
+    ★왜 '데몬 답으로 갈아끼우기'가 아니라 '거부만 추가'였는가(codex R1 적대 검토 · 종전 판):
+      이 함수가 허용한 뒤 하위 프리미티브 `cys-dept down` 이 **자기 env 판정으로 거부**하면,
+      `destroy_dept` 는 그 실패를 삼키지 않으면서도 pack/workdir 격리는 best-effort 로
+      **계속 진행한다**(:511-524). 즉 '부모 허용 + 자식 거부' = 살아 있는 부서의 팩·작업 폴더가
+      이동되는 **반파괴(half-op)** 다. 그래서 이 층은 종전보다 **더 허용하지 않는다**:
+        ⓐ 데몬이 권위 있게 비-cso 역할을 말하면 → 거부(승계 후 stale env 로 mutation 하던 길을 닫는다)
+        ⓑ 데몬이 권위 있게 '역할 없음'을 말하는데 env 가 역할을 주장하면 → 거부(같은 이유)
+        ⓒ 판정 불가·주소 없음 → **종전 그대로** `CYS_ROLE == "cso"` 만 본다
+      새 허용 경로가 없으므로 '부모 허용 + 자식 거부' 조합은 이 변경으로 늘지 않는다.
+    """
+    why = ""
+    granted = False
+    if _role_mod is not None:
+        try:
+            role, src = _role_mod.resolve_role_detail()
+            if _role_mod.is_authoritative_none(src):
+                if (os.environ.get("CYS_ROLE") or "").strip():
+                    why = ("데몬이 이 좌석에 역할이 없다고 답했다(env CYS_ROLE=%s 는 stale). "
+                           % (os.environ.get("CYS_ROLE") or "").strip()[:32])
+            elif _role_mod.is_authoritative(src):
+                if role != "cso":
+                    why = "데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). " % role[:32]
+                elif src == _role_mod.SOURCE_DAEMON:
+                    granted = True                          # ⓓ 데몬이 **방금** cso 라고 답했다
+                elif os.environ.get("CYS_ROLE") == "cso":
+                    granted = True                          # 종전 판정이 이미 허용 — 새 허용 아님
+                else:
+                    # 캐시만으로는 stale env 를 뒤집지 못한다 — 디스크를 건너뛰고 직접 확인한다.
+                    role2, src2 = _role_mod.confirm_role_detail()
+                    if src2 == _role_mod.SOURCE_DAEMON and role2 == "cso":
+                        granted = True
+                    elif _role_mod.is_authoritative(src2) and role2 != "cso":
+                        why = ("데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). "
+                               % (role2 or "-")[:32])
+            elif (os.environ.get("CYS_ROLE") or "").strip() == "cso":
+                # ★수렴 R2(blocking · reviewer-codex): 권위 있는 답이 **없다**는 것은 조회가
+                #   실패했거나 `.fail` 백오프가 조회를 **지웠다**는 뜻이다. 그 상태에서 stale env
+                #   하나로 통과시키면 같은 uid 가 쓸 수 있는 표식 한 줄이 판정을 바꾼다(codex
+                #   실측: `HOME=/tmp/h:x` · 신선한 `.fail` → 조회 0회 → ('cso','env-cys-role') →
+                #   통과. 같은 입력에서 base 는 그 신원을 표현하지 못해 매번 물었고 데몬이
+                #   `worker` 라 exit 3 이었다). 그래서 **env 로 통과하기 전에 살아 있는 데몬이
+                #   반박하지 않는다는 것을 한 번 확인한다** — 디스크 캐시·디스크 백오프를 건너뛴다.
+                #   데몬이 정말 죽어 있으면 이 확인도 실패하고 그때는 종전대로 env 로 통과한다
+                #   (회귀 0 · 복구 경로 보존 · 프로세스 안 표식이 2s 중복 대기를 막는다).
+                role2, src2 = _role_mod.confirm_role_detail()
+                if _role_mod.is_authoritative_none(src2):
+                    why = ("데몬이 이 좌석에 역할이 없다고 답했다(env CYS_ROLE=cso 는 stale). ")
+                elif _role_mod.is_authoritative(src2) and role2 != "cso":
+                    why = ("데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). "
+                           % (role2 or "-")[:32])
+        except Exception:
+            why = ""      # 해소 실패가 이 게이트를 **열지도 닫지도** 않는다 — 아래 종전 판정으로.
+            granted = False
+    if granted:
+        return
+    if why or os.environ.get("CYS_ROLE") != "cso":
+        sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). %sCSO에 위임하라.\n" % why)
         sys.exit(3)
 
 def v_schema(m):
@@ -515,6 +596,23 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     r = subprocess.run(down_cmd, capture_output=True, text=True,
                        env={**os.environ, "CYS_TRASH_STAMP": ts})
     actions.append(("down", r.returncode))
+    # ★0.14.31 P6 R1 (두 리뷰어 blocking): **거부(=부서 생존)** 는 부분 실패가 아니라 무효 조작이다.
+    #   `cys-dept down` 이 아래 rc 로 끝나면 teardown 은 **한 글자도 일어나지 않았다** —
+    #     7 = 단일소유 강제 거부(env 절 또는 데몬 권위 절 · cys-dept 가드)
+    #     2 = 인자 검증 거부(미지 플래그·인자 과다·이름 없음 — 전부 teardown **이전**)
+    #   그런데도 아래 3)4)가 pack/workdir 을 격리하면 **살아 있는 부서의 팩·작업 폴더를 옮기는**
+    #   반파괴(half-op)가 된다. 부모(require_cso)와 자식(cysd_role_gate)은 이제 각자 시각에
+    #   데몬에 묻기 때문에 '부모 허용 + 자식 거부' 조합이 실제로 생길 수 있다(워크디렉터리
+    #   tar.gz 가 60s 를 넘으면 캐시 TTL 을 가로지른다). 그래서 **격리 이전에 멈춘다**.
+    #   ★스냅샷(tar.gz)은 이미 만들어졌을 수 있으나 그것은 비파괴 백업이라 되돌릴 것이 없다.
+    #   ★그 밖의 비0(예: 3 = teardown 은 끝났고 state 격리만 실패)은 종전 계약대로
+    #   best-effort 격리를 계속한다(사용자 회수 표면 최대화 · 기존 핀 불변).
+    if r.returncode in (2, 7):
+        sys.stderr.write(
+            "[destroy] %s: cys-dept down 이 조작을 **거부**했다(rc=%d) — 부서는 살아 있다. "
+            "pack/workdir 격리를 하지 않고 중단한다(반파괴 방지). %s\n"
+            % (name, r.returncode, (r.stderr or "").strip()[:300]))
+        return actions
     # ★F1(reviewer1): down 실패(특히 --purge-state의 state 격리 실패=exit 3)를 삼키지 않는다 —
     #   사유를 stderr로 정직 보고하고 최종 exit는 cmd_destroy가 비0으로 판정한다. 부분 실패라도
     #   pack/workdir 격리는 best-effort로 진행(사용자 회수 표면 최대화).

@@ -59,6 +59,23 @@ GATE_TWO = {"verdict": "hard",
                       {"metric": "servers", "value": 3, "hard": 3, "level": "hard"}]}
 GATE_WARN_ONLY = {"verdict": "soft",
                   "trips": [{"metric": "load_ratio", "value": 2, "hard": 4, "level": "warn"}]}
+# ★WP-7 N(0.14.31): 신설 축 `fleet_cpu_ratio` 와 신설 라벨 `unavailable`(Windows `ps` 부재).
+#   라벨 함수는 metric 이름을 모른다(문자열 고정 0) — 새 축이 들어와도 그대로 나와야 하고,
+#   값 없는 `unavailable` 이 축으로 둔갑하면 안 된다(거짓 라벨의 재발).
+GATE_FLEET = {"verdict": "hard",
+              "trips": [{"metric": "fleet_cpu_ratio", "value": 1.2, "soft": 0.5,
+                         "hard": 1.0, "level": "hard"}],
+              "warnings": [], "measured": {"fleet_cpu_ratio": 1.2, "boot_grace": False}}
+# 부트 유예로 hard→soft 로 내려간 CPU 축: level 이 soft 라 **hard 축이 아니다**.
+GATE_GRACED = {"verdict": "soft",
+               "trips": [{"metric": "fleet_cpu_ratio", "value": 1.5, "soft": 0.5, "hard": 1.0,
+                          "level": "soft", "boot_grace": True}],
+               "measured": {"boot_grace": True, "boot_elapsed": 12.0}}
+# ps 부재 축은 `checks` 에만 남고 `trips` 에는 없다(게이트 계약) — 소비자에 들어와도 축이 아니다.
+GATE_UNAVAIL = {"verdict": "allow",
+                "checks": [{"metric": "fleet_cpu_ratio", "value": None, "soft": 0.5, "hard": 1.0,
+                            "level": "unavailable", "reason": "absent"}],
+                "trips": [], "warnings": ["context_unmeasured"], "measured": {}}
 
 try:
     # ① _gate_json
@@ -80,6 +97,22 @@ try:
     d5 = F._resource_detail(GATE_WARN_ONLY)
     check("2e warn trip 은 축이 아니다(오라벨 방지)",
           "축 미상" in d5 and "load_ratio" not in d5, repr(d5))
+
+    # ②' ★WP-7 N: 신설 축·신설 라벨에서의 라벨 계약
+    d6 = F._resource_detail(GATE_FLEET)
+    check("2f 신설 축 이름이 그대로 나온다(고정 문구 0의 실증)",
+          d6 == "자원 게이트 hard — fleet_cpu_ratio 1.2/1.0 · 편성 대기", repr(d6))
+    check("2g _axes_text 도 동일", F._axes_text(GATE_FLEET) == "fleet_cpu_ratio 1.2/1.0",
+          repr(F._axes_text(GATE_FLEET)))
+    d7 = F._resource_detail(GATE_GRACED)
+    check("2h 부트 유예로 soft 가 된 축은 hard 축이 아니다",
+          "축 미상(hard trips 없음)" in d7 and "fleet_cpu_ratio" not in d7, repr(d7))
+    d8 = F._resource_detail(GATE_UNAVAIL)
+    check("2i ★unavailable 축은 축이 아니다(값 없는 트립 금지)",
+          "축 미상(hard trips 없음)" in d8 and "fleet_cpu_ratio" not in d8, repr(d8))
+    check("2j _hard_trips 는 unavailable 을 걸러낸다",
+          F._hard_trips(GATE_UNAVAIL) == [] and F._hard_trips(GATE_GRACED) == [],
+          repr(F._hard_trips(GATE_UNAVAIL)))
 
     # ③ _resource_feed_body
     b1 = F._resource_feed_body(GATE_ONE)

@@ -223,6 +223,12 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   자기가 검사할 대상을 오염시켜 '추가 파일' 오탐을 만든다(SEAL-1 과 같은 계급).
     ".github/workflows/release.yml",
     ".github/workflows/windows-build.yml",
+    # ★2026-09-08 P6 등재(0.14.31 · 역할 해소 단일 소유 모듈 신설). **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도, 강제점도 **아니다**. 이 모듈이 띄우는 자식은 Rust 바이너리 `cys` 하나뿐이고
+    #   (`surface-role` 조회), 그 자식 env 는 부모 것을 그대로 복사해 넘긴다 — 즉 봉인을 **벗기지도
+    #   새로 걸지도 않는다**(벗겼다면 그것이 SEAL-1 재발이고, 새로 걸었다면 강제점으로 세야 한다).
+    #   니들 보유 사유는 그 사실을 적어 둔 주석 1줄이다(성격 표기이지 누락이 아니다).
+    "cysjavis-pack/bin/javis_role.py",
     "cysjavis-pack/bin/tests/run_bootstrap_health.py",
     # ★2026-09-04 W-A A2 등재 — 훅 런처/본체 분할 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   python 서브프로세스를 하나도 띄우지 않는다(스폰 대상은 전부 `sh`/`dash`/`bash` 런처다) —
@@ -230,6 +236,19 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
     "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
+    # ★2026-09-08 P6 등재 — 셸 역할 권위·단일소유 가드 검체. **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 강제점도 아니다. 이 검체가 스폰하는 것은 `sh`/`bash`/`cys-dept`(bash)와
+    #   가짜 `cys` 스텁(sh)뿐이다. 니들은 **밀폐 env 를 짜는 한 줄**에 있다 — 검체가 띄우는 셸이
+    #   번들 python 을 물었을 때 그 자식이 캐시를 쓰지 않도록 상속시키는 것이라 봉인 방향이 옳다.
+    "cysjavis-pack/bin/tests/test_role_authority_shell.py",
+    # ★2026-09-08 P6 수렴 등재 — 독립 판정관 회귀 핀. **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 강제점도 아니다. 이 검체가 스폰하는 것은 `bash`(게이트 훅)·`sh`(슬러그
+    #   대조)·`cys-dept`(bash)와 가짜 `cys` 스텁(sh)뿐이고, 파이썬은 **자기 프로세스 안에서**
+    #   `javis_role`/`javis_org`/`javis_snapshot` 을 import 해 쓴다(자식 python 0).
+    #   니들은 `cys-dept` 를 `env -i` 로 띄울 때 짜는 **밀폐 env 한 줄**에 있다 — 그 셸이 번들
+    #   python 을 물었을 때 자식이 `__pycache__` 를 쓰지 않도록 상속시키는 것이라 봉인 방향이 옳다
+    #   (빼면 검체가 팩 트리를 오염시킨다 = SEAL-1 과 같은 계급).
+    "cysjavis-pack/bin/tests/test_role_authority_triage.py",
     "cysjavis-pack/hooks/_lib.sh",
     "docs/RELEASE.md",
     # ★2026-09-04 W-C 등재 — 사용자 대면 릴리스 노트. **봉인 점검 결과**: 진입점도 강제점도

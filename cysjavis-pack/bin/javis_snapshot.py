@@ -45,6 +45,15 @@ SECTION_MARKER = "\n…(섹션 캡)"
 SECTION_CAPS = {"tasks": 700, "wakeups": 700, "delivery": 1800, "gate": 300}
 
 
+def _role_mod():
+    """javis_role import(역할 해소 단일 소유자 · 0.14.31 P6). 부재는 종전 env 판정으로 강등."""
+    try:
+        import javis_role
+        return javis_role
+    except Exception:
+        return None
+
+
 def _mission_mod():
     """javis_mission import(판독 규칙 단일 소유자). 부재는 관측 생략(graceful)."""
     try:
@@ -155,7 +164,60 @@ def is_master():
 
     env CYS_ROLE=="master" OR (surface id 비어있지 않고 임무 대장 레코드 surface 와 일치).
     surface 판독은 javis_mission._surface(신·구 env 통일 규약), 대장 판독은 read_ledger
-    재사용. 대장 부재·판독 불가 = 불통과(fail-quiet)."""
+    재사용. 대장 부재·판독 불가 = 불통과(fail-quiet).
+
+    ★0.14.31 P6 — 데몬 권위 선행(**단조 거부**): 데몬이 이 좌석의 역할을 **권위 있게 다른
+      역할로** 답하면 env 절도 대장 절도 보지 않고 즉시 불통과다. 종전에는 승계로 role 이 옮겨간
+      뒤에도 stale `CYS_ROLE=master` 하나로 스냅샷 생산이 계속됐고, 설령 그 절을 고쳐도
+      **대장 일치 절이 다시 master 를 허용**했다(codex R1 반례). 실패 방향은 '생산 skip(exit 0)' —
+      좌석 사망이 아니라 관측 1건의 보류다(§3-3).
+      판정 불가·주소 없음은 종전 경로 그대로다(새 거부를 만들지 않는다).
+
+    ★R2(blocking · reviewer-codex): 종전에는 **권위 있는 '역할 없음'** 을 데몬 절에서 일부러
+      빼 놓고 그 아래 `CYS_ROLE=master` 절과 대장 절이 통과시켰다 — 정본 §8("`CYS_ROLE` env 를
+      권위로 쓰지 않는다 — 승계 후 stale")의 표적 그 자체가 살아 있었다는 뜻이다. 데몬이
+      **확정적으로** '이 좌석에는 역할이 없다'고 답한 것은 판정 불가가 아니라 사실이므로,
+      그 답 앞에서는 stale env 도 stale 대장도 마스터 권한을 되살리지 못한다. 실패 방향은
+      여전히 '생산 skip(exit 0)' 이다(§3-3 · 좌석 사망이 아니다). 검체 8i-1~8i-4."""
+    _rm = _role_mod()
+    if _rm is not None:
+        try:
+            _role, _src = _rm.resolve_role_detail()
+            if _rm.is_authoritative_none(_src):
+                return False, "daemon knows no role for this seat"
+            if _rm.is_authoritative(_src):
+                if _role.strip().lower() != "master":
+                    return False, "daemon role is not master"
+                # ★I5 수렴(판정관 T3e): 데몬이 권위 있게 master 라고 답하면 **그 답이 결정한다** —
+                #   stale env 도 stale 대장도 그것을 뒤집지 못한다(정본 §8 의 표적). 새 허용의
+                #   근거는 살아 있는 데몬의 직접 응답뿐이다(디스크 캐시는 같은 uid 가 위조할 수
+                #   있으므로 통과 근거가 아니다 · codex 설계 비평 (g)).
+                if _src == _rm.SOURCE_DAEMON:
+                    return True, "daemon role is master"
+                if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
+                    return True, "env CYS_ROLE=master"      # 종전 판정이 이미 허용 — 새 허용 아님
+                _role2, _src2 = _rm.confirm_role_detail()
+                if _src2 == _rm.SOURCE_DAEMON and _role2.strip().lower() == "master":
+                    return True, "daemon role is master (confirmed)"
+                # ★수렴 R2(minor · reviewer-claude — 판정은 종전과 같고 **사유 문면만** 세운다):
+                #   확인 답이 '권위 있는 무역할' 일 때도 아래 절이 이미 False 를 냈다
+                #   (`is_authoritative("daemon-none")` 이 참이고 ""≠master). 다만 사유가
+                #   'not master' 로 나가 형제 게이트(org·cys-dept)와 어긋났다 — 전용 절로 세운다.
+                if _rm.is_authoritative_none(_src2):
+                    return False, "daemon knows no role for this seat"
+                if _rm.is_authoritative(_src2) and _role2.strip().lower() != "master":
+                    return False, "daemon role is not master"
+            elif (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
+                # ★수렴 R2(blocking 형제 조항 · org 와 같은 규율): 권위 있는 답이 없을 때
+                #   stale env 로 통과하기 전에 **살아 있는 데몬이 반박하지 않는지** 한 번 본다
+                #   (디스크 캐시·디스크 백오프를 건너뛴다). 데몬이 죽어 있으면 종전대로 통과한다.
+                _role2, _src2 = _rm.confirm_role_detail()
+                if _rm.is_authoritative_none(_src2):
+                    return False, "daemon knows no role for this seat"
+                if _rm.is_authoritative(_src2) and _role2.strip().lower() != "master":
+                    return False, "daemon role is not master"
+        except Exception:
+            pass          # 해소 실패는 이 게이트를 열지도 닫지도 않는다
     if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
         return True, "env CYS_ROLE=master"
     jm = _mission_mod()
@@ -496,12 +558,32 @@ def cmd_is_master(argv):
     return 0 if ok else 1
 
 
+_ST_SEAL = [None]
+
+
 def _st_env(extra=None):
-    """self-test 밀폐 env — ambient 역할·surface·레인·상태 경로를 전부 걷어낸다."""
+    """self-test 밀폐 env — ambient 역할·surface·레인·상태 경로를 전부 걷어낸다.
+
+    ★0.14.31 P6: `is_master()` 가 역할을 데몬에 묻게 됐다 — 하네스가 그대로면 **라이브 데몬**에
+      물어 비결정이 된다. `CYS_BIN` 을 없는 절대경로로(조회 판정 불가 → 종전 env 판정) ·
+      전용 `TMPDIR`(라이브 역할 캐시 차단). 단언은 바뀌지 않는다.
+    """
+    import tempfile as _tf
+    if _ST_SEAL[0] is None:
+        _ST_SEAL[0] = _tf.mkdtemp(prefix="snapshot-st-seal-")
+        # ★R1(리뷰어 minor): 이 디렉터리는 종전에 **한 번도 지워지지 않았다** —
+        #   `javis_snapshot --self-test`(= `javis_preflight --self-test` 가 구동한다)를
+        #   돌릴 때마다 tmp 에 한 개씩 쌓였다. 프로세스 종료 시 정리한다.
+        import atexit as _ax
+        import shutil as _sh
+        _ax.register(_sh.rmtree, _ST_SEAL[0], True)
     env = dict(os.environ)
-    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_MISSION",
+    for k in ("CYS_ROLE", "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SURFACE_ID",
+              "CYS_SURFACE_ROLE", "CYS_MISSION",
               "CYS_SOCKET", "JAVIS_ROOT", "CYS_STATE_DIR"):
         env.pop(k, None)
+    env["CYS_BIN"] = os.path.join(_ST_SEAL[0], "cys-absent-in-test")
+    env["TMPDIR"] = _ST_SEAL[0]
     if extra:
         env.update(extra)
     return env

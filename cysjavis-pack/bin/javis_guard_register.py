@@ -71,10 +71,12 @@ import argparse
 import copy
 import datetime
 import hashlib
+import inspect
 import contextlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -103,14 +105,157 @@ HOOKS = {
         "timeout": 20,
         "why": "brief-lint-warn(PostToolUse) — 인세션 위임 브리프 경고 주입(fail-open)",
     },
+    # ★WP-3 A(0.14.31) 역할 능력 게이트. matcher 는 **없다**(전 도구) — 도구 이름 deny 목록
+    #   (CronCreate·Monitor·Agent·WebSearch·mcp__computer-use__* …)과 `tool_calls` 예산이
+    #   Bash 밖 도구까지 봐야 하기 때문이다. 역할 판정은 훅 자신이 데몬 권위(`cys surface-role`)로
+    #   하므로 **프로필 경계로 대상을 좁히지 않는다**(전 프로필 eligibility=allow): 공용 프로필
+    #   `~/.cys/claude` 하나를 CSO·워커·리뷰어가 함께 쓰는 실측 형상에서 프로필 단위 배제는
+    #   격리가 아니라 누락이 된다(hook-targets 표 _README (c) 참조).
+    "capgate": {
+        "event": "PreToolUse",
+        "script": "hooks/role-capability-gate.sh",
+        "master_allowed": True,
+        "timeout": 15,        # javis_preflight.HOOK_TIMEOUT_S 와 같은 값(축 1지점)
+        "why": "role-capability-gate(PreToolUse) — 역할 능력 경계 집행(CSO §1-1 · reviewer producer≠evaluator)",
+    },
 }
 MASTER_PROFILE_BASENAMES = (".claude",)   # ★폴백 전용 — 표 부재 시에만 쓰인다(E3-1)
 
 # 훅 키 → 대상표 eligibility 필드. 두 집합은 **다르다**(계약 §2): 파일을 합치는 것과 판정을
 # 합치는 것은 다르고, 합치면 master pane 의 Stop 체인에 검증 블록이 걸린다(D5 경고).
-HOOK_ELIGIBILITY_KEY = {"stop": "guard_stop", "brief-warn": "brief_warn"}
+HOOK_ELIGIBILITY_KEY = {"stop": "guard_stop", "brief-warn": "brief_warn",
+                        "capgate": "capgate"}
+# ★표 스키마의 **필수** eligibility 키는 legacy 둘로 고정한다(0.14.31).
+#   이유: 검증기가 `HOOK_ELIGIBILITY_KEY.values()` 전부를 요구하면, 운영자가 이미 설치한
+#   `hook-targets.json`(capgate 키 없음)이 통째로 **손상** 판정이 되어 exit 2 · 쓰기 0 이 되고
+#   stop·brief-warn 등록까지 함께 죽는다. 새 키는 **선택**이고 부재는 아래 기본값으로 읽는다 —
+#   표를 늘리는 일이 기존 배선을 깨뜨리지 않게 하는 것이 이 분리의 전부다.
+REQUIRED_ELIGIBILITY_KEYS = ("guard_stop", "brief_warn")
+ELIGIBILITY_DEFAULT = {"capgate": "allow"}
 TARGETS_REL = os.path.join("state", "hook-targets.json")
 TARGETS_EXAMPLE_SUFFIX = ".example"   # ★E4-1: 배포 실물 = <표>.example (폴백 표)
+
+
+# ★WP-3 A(0.14.31 R1) 능력 게이트 등록 자격 — **preflight 와 같은 두 조건**(CONTRACTS §C).
+#   이 경로에 판정이 없으면 조건부 등록이 우회된다: 구 데몬·구 지침에서도 guard-register 로
+#   훅을 올릴 수 있었다(부분 배포 = CSO 가 경보 없이 능력만 잃는 상태 = 봉인표 ③).
+#   판정의 **정본은 preflight** 이고 여기서는 같은 두 사실을 다시 재서 **막는다**(중복이 아니라
+#   같은 계약의 두 집행 지점 — 우회 가능한 등록기가 하나라도 있으면 조건은 조건이 아니다).
+CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
+CSO_DIRECTIVE_MARKER_MAX_LINE = 20
+
+
+# ★데몬 **실재** 가드 — preflight `Preflight._capgate_daemon_present` 의 미러(R2 minor · 두 리뷰어).
+#   이 판정도 실제 `cys` 를 띄우고, 그 바이너리는 자기 HOME 아래에 팩·상태를 부트스트랩한다.
+#   임시 HOME 문맥(검체·격리 실행)에서 그 부수효과가 정리와 경합해 부트 헬스 검체가 크래시했다
+#   (H-SEED-2). preflight 만 고치고 여기를 두면 같은 원인이 두 번째 경로로 남는다.
+HUB_LIVE_MARKERS = ("cys.sock", "boot-epoch", "cysd.log", "queue-state.json", "topology.json")
+
+
+def _hub_state_dir():
+    """본부 데몬 state dir(플랫폼 규약) 또는 None — `javis_preflight._hub_state_dir` 미러.
+
+    ★darwin 은 `XDG_STATE_HOME` 을 **보지 않는다**(Rust `dirs::state_dir` 이 None 을 돌려
+      home 폴백이 된다) — 두 도구가 다른 위치를 보면 같은 조건을 다르게 재게 된다.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        return os.path.join(base, "cys") if base else None
+    root = None
+    if sys.platform.startswith("linux"):
+        xdg = os.environ.get("XDG_STATE_HOME")
+        if xdg and os.path.isabs(xdg):
+            root = xdg
+    if not root:
+        root = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(root, "cys")
+
+
+# ★Windows 명명 파이프 주소 — `javis_preflight._dept_state_dir` 의 같은 판별을 미러한다
+#   (HUB_LIVE_MARKERS·_hub_state_dir 와 같은 미러 계약 · 파리티는 검체가 잰다).
+WIN_PIPE_PREFIXES = ("\\\\.\\pipe\\", "//./pipe/")
+
+
+def is_pipe_address(sock):
+    """`\\\\.\\pipe\\…`·`//./pipe/…` 형태인가 — **파일 실재로 잴 수 없는** 주소다."""
+    s = sock if isinstance(sock, str) else ""
+    return any(s.startswith(pre) for pre in WIN_PIPE_PREFIXES)
+
+
+def _daemon_present():
+    """(present, why) — 데몬을 **깨우지 않고** 조회해도 되는 상태인가(파일 실재만 본다).
+
+    ★triage T12: 명명 파이프 주소는 `os.path.exists()` 로 잴 수 없다(인스턴스 사용 중·
+      메타데이터 조회 실패에서도 stat 이 실패한다). 그때 살아 있는 데몬을 '미실재' 로 읽으면
+      수동 등록은 거부·부팅 등록기는 영구 `unknown` 이 된다 — 허브 표지 폴백으로 넘긴다.
+    """
+    sock = os.environ.get("CYS_SOCKET")
+    if sock and not is_pipe_address(sock):
+        return os.path.exists(sock), ("CYS_SOCKET 실재(%s)" % sock if os.path.exists(sock)
+                                      else "데몬 소켓 미실재(%s)" % sock)
+    sd = _hub_state_dir()
+    if not sd or not os.path.isdir(sd):
+        return False, "허브 상태 디렉터리 미실재(%s) — 데몬이 기동한 적이 없다" % (sd or "미해소")
+    found = [m for m in HUB_LIVE_MARKERS if os.path.exists(os.path.join(sd, m))]
+    if not found:
+        return False, "허브 상태 디렉터리(%s)에 데몬 표지 0건" % sd
+    return True, "데몬 표지 %s" % ",".join(found[:3])
+
+
+def no_autostart_env(base=None):
+    """데몬을 **깨우지 않는** 조회용 env(`javis_preflight._no_autostart_env` 미러).
+
+    ★triage T10: `cys` 는 연결 실패 경로에서 **형제 cysd 를 detached 로 기동**한다
+      (src/bin/cys.rs connect()). 옵트아웃은 `CYS_NO_AUTOSTART` 하나뿐이고 타임아웃은 이미
+      태어난 데몬을 되돌리지 못한다 — 이 축은 '데몬을 깨우지 않는다' 고 적어 두었으므로
+      문서와 코드를 맞춘다(팩 안 선례: javis_completion_guard.py).
+    """
+    env = dict(os.environ if base is None else base)
+    env["CYS_NO_AUTOSTART"] = "1"
+    return env
+
+
+def _capgate_eligibility(pack, timeout=6):
+    """(ok, why) — ①데몬 `alert_route.enabled is True` ②설치본 지침 신판 표지(첫 20행 행 등가).
+
+    판정 불능(cys 부재·데몬 미실재·호출 실패·지침 판독 실패)은 **미자격**이다 — 결측은 값이
+    아니고, 여기서 관대하면 구 데몬에 게이트를 등록하게 된다.
+
+    ★preflight 와 다른 점 하나(의도적): preflight 는 3값(`on`/`off`/`unknown`)이다. 이 도구는
+      **등록만** 하고 해제하지 않으므로 '판정 불능=미자격'(등록 안 함)이 곧 안전 방향이고,
+      두 값으로 접어도 잃는 판정이 없다. 해제 판정의 정본은 preflight C28 이다.
+    """
+    missing = []
+    cys = os.environ.get("CYS_BIN") or shutil.which("cys")
+    ok_alert = False
+    if not cys:
+        missing.append("cys 바이너리 미발견 — alert_route 판정 불가(판정 불능은 미자격이다)")
+    else:
+        _present, _why = _daemon_present()
+        if not _present:
+            missing.append("%s — alert_route 판정 불가(이 축은 데몬을 깨우지 않는다)" % _why)
+        else:
+            try:
+                r = subprocess.run([cys, "status", "--json"], capture_output=True, text=True,
+                                   timeout=timeout, env=no_autostart_env())
+                doc = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+                ar = doc.get("alert_route") if isinstance(doc, dict) else None
+                ok_alert = isinstance(ar, dict) and ar.get("enabled") is True
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                missing.append("cys status --json 조회 실패(%s)" % e)
+            if not ok_alert and not missing:
+                missing.append("데몬 alert_route 미지원(status --json 에 alert_route.enabled=true 없음)")
+    d = os.path.join(pack, "directives", "CSO_DIRECTIVE.md")
+    try:
+        with open(d, encoding="utf-8", errors="replace") as f:
+            head = [next(f, "") for _ in range(CSO_DIRECTIVE_MARKER_MAX_LINE)]
+        if not any(ln.strip() == CSO_DIRECTIVE_REV_MARKER for ln in head):
+            missing.append("설치본 CSO_DIRECTIVE 에 신판 표지 없음(%s)" % d)
+    except OSError as e:
+        missing.append("설치본 CSO_DIRECTIVE 판독 불가(%s: %s)" % (d, e))
+    if missing:
+        return False, " · ".join(missing)
+    return True, "alert_route.enabled=true · CSO_DIRECTIVE 신판 표지 확인"
 
 
 def _targets_path(pack, override=None):
@@ -160,6 +305,22 @@ def _load_targets(path):
         doc = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as e:
         return None, "판독/파싱 실패: %s" % e
+    index, err = validate_targets_doc(doc)
+    if err:
+        return None, err
+    policy = doc.get("policy") if isinstance(doc.get("policy"), dict) else {}
+    return {"doc": doc, "index": index, "policy": policy, "path": path,
+            "sha256": hashlib.sha256(raw).hexdigest()}, None
+
+
+def validate_targets_doc(doc):
+    """(index|None, err|None) — 대상표 **문서**의 검증(파일 I/O 없음).
+
+    ★triage T13: 부팅 등록기(`javis_preflight.capgate_table_denied_basenames`)와 수동 등록기가
+      **같은 검증기**를 쓴다. 종전엔 preflight 가 `schema_version` 도 eligibility 값 어휘도 보지
+      않아, 수동 등록기가 손상으로 거부하는 표를 부팅 경로는 조용히 통과시켰다(운영자가 선언한
+      제외가 부팅 경로에서만 사라졌다 — "표가 표다" 라는 계약이 손상 입력에서 깨졌다).
+    """
     if not isinstance(doc, dict):
         return None, "최상위가 객체가 아님(%s)" % type(doc).__name__
     if doc.get("schema_version") != 1:
@@ -174,19 +335,22 @@ def _load_targets(path):
         elig = ent.get("eligibility")
         if not isinstance(elig, dict):
             return None, "%s: eligibility 누락/형식 오류" % ent.get("basename")
-        for k in HOOK_ELIGIBILITY_KEY.values():
+        for k in REQUIRED_ELIGIBILITY_KEYS:
             v = elig.get(k)
             if v not in ("allow", "deny"):
                 return None, "%s: eligibility.%s=%r (allow|deny 기대)" % (
                     ent.get("basename"), k, v)
+        for k, _dflt in ELIGIBILITY_DEFAULT.items():
+            if k in elig and elig[k] not in ("allow", "deny"):
+                return None, "%s: eligibility.%s=%r (allow|deny 기대)" % (
+                    ent.get("basename"), k, elig[k])
         if ent["basename"] in index:
             return None, "basename 중복: %s(판정이 둘로 갈린다)" % ent["basename"]
         index[ent["basename"]] = ent
     policy = doc.get("policy") if isinstance(doc.get("policy"), dict) else {}
     if policy.get("unknown_profile") not in ("deny", "allow"):
         return None, "policy.unknown_profile=%r (deny|allow 기대)" % policy.get("unknown_profile")
-    return {"doc": doc, "index": index, "policy": policy, "path": path,
-            "sha256": hashlib.sha256(raw).hexdigest()}, None
+    return index, None
 
 
 def _decide(table, base, hook_key, spec, force_master, force_unknown):
@@ -209,7 +373,11 @@ def _decide(table, base, hook_key, spec, force_master, force_unknown):
                            "--force-unknown" % (base, table["path"]))
         return True, ("표 밖 프로필 — %s" % ("--force-unknown 우회"
                                              if force_unknown else "policy=allow"))
-    verdict = ent["eligibility"][HOOK_ELIGIBILITY_KEY[hook_key]]
+    _ekey = HOOK_ELIGIBILITY_KEY[hook_key]
+    verdict = ent["eligibility"].get(_ekey, ELIGIBILITY_DEFAULT.get(_ekey))
+    if verdict is None:
+        return False, ("역할 경계: %s 의 대상표 항목에 eligibility.%s 가 없고 기본값도 없다"
+                       % (base, _ekey))
     if verdict == "deny" and not force_master:
         return False, ("역할 경계: %s 는 대상표에서 %s=deny 다 — 역할 %s · 근거 %s. "
                        "의도했다면 --force-master"
@@ -224,7 +392,7 @@ def _table_eligible(table, hook_key):
     """표에서 이 훅이 allow 인 프로필 항목 목록(사전순 — 파생표 3개의 공용 파생원)."""
     key = HOOK_ELIGIBILITY_KEY[hook_key]
     return [e for _b, e in sorted(table["index"].items())
-            if e["eligibility"][key] == "allow"]
+            if e["eligibility"].get(key, ELIGIBILITY_DEFAULT.get(key)) == "allow"]
 
 
 def _now_tag():
@@ -241,8 +409,19 @@ def _pack_dir():
 
 
 def _command_str(spec, pack):
-    """등록될 command 문자열 — 훅 실물 절대경로. 팩 경로가 바뀌면 문자열도 바뀐다(의도)."""
-    return "sh %s" % os.path.join(pack, spec["script"])
+    r"""등록될 command 문자열 — 훅 실물 절대경로. 팩 경로가 바뀌면 문자열도 바뀐다(의도).
+
+    ★Windows 규칙은 preflight `_cys_hook_cmd` 와 **같아야 한다**(R2 blocking · codex 실증):
+      종전 `"sh %s" % os.path.join(...)` 는 Windows 에서 `sh C:\Users\A B\.cys\pack\hooks/…` 를
+      만들고, 실제 Bash 는 그 역슬래시를 escape 로 먹어 `C:UsersA` 처럼 **경로를 파괴**한다 —
+      자격 검사는 통과하고 '등록됨' 을 보고하는데 훅은 실행되지 않는다(게이트 소실).
+      정슬래시 + 따옴표가 유일하게 안전한 형태이고, 두 등록기가 같은 문자열을 내야 서로의
+      멱등·해제 판정이 성립한다.
+    """
+    script = os.path.join(pack, spec["script"])
+    if os.name == "nt":
+        return 'bash "%s"' % script.replace("\\", "/")
+    return "sh %s" % script
 
 
 def _resolve_settings(profile):
@@ -441,7 +620,7 @@ def _sha(data):
 # ── 처리 ────────────────────────────────────────────────────────────────────
 def process(profiles, hook_key, apply_, force_master, pack, out=None,
             repair_timeout=False, force_unknown=False, targets_path=None, table=None,
-            table_source=None):
+            table_source=None, force_ineligible=False, eligibility=None):
     # out 기본값을 def 시점에 sys.stdout 으로 **묶지 않는다** — 묶으면 호출자의
     # redirect_stdout 이 무효가 되고(자기검증 하네스가 출력을 회수하지 못한다) 그 무능이
     # "검증했다"로 오독된다(계측 타당성).
@@ -492,6 +671,25 @@ def process(profiles, hook_key, apply_, force_master, pack, out=None,
                   "살아 있다). 운영 표를 확정하려면: cp %s%s %s (설치 후 measured_at 갱신)"
                   % (_targets_path(pack, targets_path), _targets_path(pack, targets_path),
                      TARGETS_EXAMPLE_SUFFIX, _targets_path(pack, targets_path)), file=out)
+    if hook_key == "capgate":
+        # `eligibility` 는 **검체 주입 이음매**다(기본은 실제 판정기) — 스텁 바이너리를 만들지
+        # 않고도 자격 참/거짓 두 갈래를 결정론으로 잴 수 있게 한다(Windows 이식성).
+        _elig_ok, _elig_why = (eligibility or _capgate_eligibility)(pack)
+        if _elig_ok:
+            print("등록 조건(CONTRACTS §C): 충족 — %s" % _elig_why, file=out)
+        elif force_ineligible:
+            print("경고: 능력 게이트 등록 조건 미충족인데 --force-ineligible 로 진행한다 — %s"
+                  % _elig_why, file=out)
+            print("        ※ 부분 배포(A만 등록)는 CSO 가 경보를 못 받는 채로 능력만 잃는 "
+                  "상태다(봉인표 ③). 조건을 복구한 뒤 등록하는 것이 정상 경로다.", file=out)
+        else:
+            print("등록 조건(CONTRACTS §C) 미충족 — %s" % _elig_why, file=out)
+            print("→ 등록 중단(쓰기 0). 조건은 ①데몬 alert_route 지원 ②설치본 CSO_DIRECTIVE "
+                  "신판 표지 둘 다이며, 하나라도 아니면 게이트는 **미등록**이 정본이다"
+                  "(그 상태에서도 CSO_DIRECTIVE §1-1 경계는 문자 그대로 유효하다). "
+                  "판정의 정본은 preflight C28 이고, 의도적으로 밀어붙이려면 "
+                  "--force-ineligible 을 명시하라.", file=out)
+            return EXIT_TARGET, [], command, spec
     print("모드: %s" % ("APPLY(쓰기)" if apply_ else "DRY-RUN(기본 — 쓰기 0)"), file=out)
     if not os.path.isfile(hook_path):
         print("경고: 훅 실물 부재 — %s (등록해도 래퍼가 없으면 무발동)" % hook_path, file=out)
@@ -1035,6 +1233,89 @@ def self_test():
         rc, rows, _c, _s = process([live3], "stop", True, False, pack, out=buf)
         chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
             "⑱ 운영 표 존재 시에도 손상 예시표가 판정을 오염시킴: rc=%s" % rc)
+        # ── ⑲ WP-3 A capgate(0.14.31): 전 프로필 등록 · 구 표 하위호환 · matcher 없음 ──
+        mktable(tbl_doc)          # capgate 키가 **없는** 종전 표(운영자 설치본 형상)
+        buf = io.StringIO()
+        rc, rows, cmd, spec = process([live3, wdir], "capgate", False, False, pack, out=buf,
+                                      force_ineligible=True)
+        chk(rc == EXIT_OK and all(r["action"] != "REFUSED" for r in rows),
+            "⑲ capgate 키 없는 구 표가 손상/거부로 판정됨: rc=%s rows=%s"
+            % (rc, [r["action"] for r in rows]))
+        chk(spec["event"] == "PreToolUse" and "matcher" not in spec,
+            "⑲ capgate 는 PreToolUse · matcher 없음(전 도구)이어야 한다: %r" % spec)
+        chk(spec.get("timeout") == 15, "⑲ capgate timeout 선언 15 아님: %r" % spec.get("timeout"))
+        chk("role-capability-gate.sh" in cmd, "⑲ capgate command 문자열에 훅 실물이 없다: %s" % cmd)
+        # master 프로필(.claude-3)도 대상이다 — 역할 판정은 훅 자신이 데몬 권위로 한다.
+        chk(any(r["profile"] == ".claude-3" and r["action"] != "REFUSED" for r in rows),
+            "⑲ master 프로필이 capgate 대상에서 빠짐: %s" % rows)
+        # 표에 capgate=deny 를 명시하면 그것은 존중한다(기본값은 부재일 때만).
+        denydoc = json.loads(json.dumps(tbl_doc))
+        for e in denydoc["profiles"]:
+            if e["basename"] == ".claude-3":
+                e["eligibility"]["capgate"] = "deny"
+        mktable(denydoc)
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                   force_ineligible=True)
+        chk(rc == EXIT_TARGET and rows[0]["action"] == "REFUSED",
+            "⑲ 표의 명시 capgate=deny 가 무시됨: rc=%s %s" % (rc, rows))
+        # ── ⑳ R1: 등록 자격(§C 두 조건)은 **이 경로에서도** 검사한다 ──
+        #   판정의 정본은 preflight 지만, 우회 가능한 등록기가 하나라도 있으면 조건은 조건이 아니다.
+        #   ★결정론: `CYS_BIN` 을 없는 경로로 고정해 **라이브 데몬 상태와 무관**하게 만든다.
+        mktable(tbl_doc)
+        _saved_bin = os.environ.get("CYS_BIN")
+        os.environ["CYS_BIN"] = os.path.join(pack, "no-such-cys")
+        try:
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", True, False, pack, out=buf)
+            chk(rc == EXIT_TARGET and rows == [] and "등록 조건" in buf.getvalue()
+                and "등록 중단(쓰기 0)" in buf.getvalue(),
+                "⑳ 자격 미충족(구 데몬·구 지침)인데 등록이 진행됨: rc=%s rows=%s" % (rc, rows))
+            _e_ok, _e_why = _capgate_eligibility(pack)
+            chk(_e_ok is False and "CSO_DIRECTIVE" in _e_why and "cys" in _e_why,
+                "⑳ 두 조건의 결손이 모두 사유에 적히지 않음: %r" % _e_why)
+            _dd = os.path.join(pack, "directives")
+            os.makedirs(_dd, exist_ok=True)
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n%s\n본문\n" % CSO_DIRECTIVE_REV_MARKER)
+            _e_ok2, _e_why2 = _capgate_eligibility(pack)
+            chk(_e_ok2 is False and "CSO_DIRECTIVE" not in _e_why2,
+                "⑳ 조건 하나(지침)만 참인데 자격이 났다/사유가 낡았다: %r %r" % (_e_ok2, _e_why2))
+            # 표지를 인용한 산문은 표지가 아니다(첫 20행 **행 등가** — preflight 와 같은 규칙).
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n표지 %s 를 확인하라\n" % CSO_DIRECTIVE_REV_MARKER)
+            _e_ok3, _e_why3 = _capgate_eligibility(pack)
+            chk(_e_ok3 is False and "신판 표지 없음" in _e_why3,
+                "⑳ 표지를 **인용한 산문**이 신판으로 오독됨: %r" % _e_why3)
+            with open(os.path.join(_dd, "CSO_DIRECTIVE.md"), "w", encoding="utf-8") as _f:
+                _f.write("# t\n%s\n본문\n" % CSO_DIRECTIVE_REV_MARKER)
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                       force_ineligible=True)
+            chk(rc == EXIT_OK and "--force-ineligible" in buf.getvalue(),
+                "⑳ --force-ineligible 경고가 없거나 진행되지 않음: rc=%s" % rc)
+            # 자격이 **참**이면 우회 플래그 없이 진행한다(게이트가 영구 차단이 아니어야 한다).
+            buf = io.StringIO()
+            rc, rows, _c, _s = process([live3], "capgate", False, False, pack, out=buf,
+                                       eligibility=lambda _p: (True, "검체 주입: 조건 충족"))
+            chk(rc == EXIT_OK and rows and all(r["action"] != "REFUSED" for r in rows)
+                and "등록 조건(CONTRACTS §C): 충족" in buf.getvalue(),
+                "⑳ 자격 충족인데 등록이 막힘: rc=%s rows=%s" % (rc, [r["action"] for r in rows]))
+            chk("_capgate_eligibility)(pack)" in inspect.getsource(process),
+                "⑳ 기본 판정기가 배선에서 빠졌다(이음매만 남으면 실경로가 무검사다)")
+        finally:
+            if _saved_bin is None:
+                os.environ.pop("CYS_BIN", None)
+            else:
+                os.environ["CYS_BIN"] = _saved_bin
+        # 잘못된 값은 손상이다(선택 키라도 형식은 검사한다).
+        baddoc = json.loads(json.dumps(tbl_doc))
+        baddoc["profiles"][0]["eligibility"]["capgate"] = "maybe"
+        mktable(baddoc)
+        buf = io.StringIO()
+        rc, rows, _c, _s = process([live3], "stop", False, False, pack, out=buf)
+        chk(rc == EXIT_ARGS and rows == [], "⑲ capgate 값 오류가 손상으로 잡히지 않음: rc=%s" % rc)
+        mktable(tbl_doc)
         os.remove(expath)
 
     if fails:
@@ -1052,7 +1333,10 @@ def self_test():
           "--from-table 파생·CLI 경로 재확인"
           " · E4-1(R-04 배포 기본값) 예시표 폴백: `.example` 만 있는 install 직후 상태에서 "
           ".claude-3+stop REFUSED(기계 방어 생존)·폴백 출처+cp 설치 안내 고지·워커 프로필 "
-          "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선")
+          "무영향·CLI/--from-table 동일·예시표 손상 exit 2 무폴백·운영 표 우선"
+          " · ⑳ capgate 등록 자격(§C 두 조건)을 이 경로에서도 집행(--force-ineligible 만 우회)"
+          " · ⑲ capgate(0.14.31): 구 표 하위호환(키 부재=allow)·전 프로필(master 포함)·"
+          "PreToolUse matcher 없음·timeout 15·명시 deny 존중·값 오류는 손상")
     return 0
 
 
@@ -1069,6 +1353,9 @@ def main(argv=None):
                     help="역할 경계 우회(대상표 deny 프로필에 등록) — 의도 명시용")
     ap.add_argument("--force-unknown", action="store_true",
                     help="대상표에 없는 미지 프로필 등록 우회(E3-1 · deny-by-default 해제)")
+    ap.add_argument("--force-ineligible", action="store_true",
+                    help="capgate 등록 조건(데몬 alert_route · 지침 신판 표지) 미충족에도 진행 — "
+                         "의도 명시용(부분 배포는 봉인표 ③ 방향이다)")
     ap.add_argument("--hook-targets", metavar="PATH", default=None,
                     help="대상표 경로 override(기본 <pack>/state/hook-targets.json)")
     ap.add_argument("--from-table", action="store_true",
@@ -1118,7 +1405,8 @@ def main(argv=None):
                                      repair_timeout=a.repair_timeout,
                                      force_unknown=a.force_unknown,
                                      targets_path=a.hook_targets, table=table,
-                                     table_source=tsource)
+                                     table_source=tsource,
+                                     force_ineligible=a.force_ineligible)
     if a.emit_expected:
         emit_expected(profiles, a.hook, pack, a.emit_expected, a.apply, table=table)
     if a.emit_warn_targets:
