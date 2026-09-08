@@ -404,8 +404,12 @@ cys_role_token_ok() {
 #   파이썬은 UTF-8 바이트로 세어 **같은 소켓이 두 파일**이 됐다(R1 의 '바이트 단위로 같다'는
 #   틀린 주장이었다). `-s`(연속 치환 접기)를 더하면 허용 집합이 순수 ASCII 라 두 층이 언제나
 #   같은 구간을 접어 결과가 동일해지고, 결과가 ASCII 라 80자 절단의 단위 문제도 사라진다.
+# ★I2 수렴(판정관 T2 · 2026-09-08): 허용 집합에서 `_` 를 **뺀다**. 종전 집합은 `_` 를 허용해서
+#   입력에 원래 있던 `_` 를 파이썬은 보존하고 `tr -s` 는 출처를 가리지 않고 접었다
+#   (`/tmp/a__b.sock` → py `_tmp_a__b.sock` vs sh `_tmp_a_b.sock` = 같은 종단점이 두 파일).
+#   `_` 를 빼면 출력의 모든 `_` 가 치환 산물이라 두 층이 언제나 같은 구간을 접는다.
 cys_role_slug() {
-  _cys_sl="$(printf '%s' "${1-}" | tr -cs 'A-Za-z0-9._-' '_' 2>/dev/null)" || _cys_sl=""
+  _cys_sl="$(printf '%s' "${1-}" | tr -cs 'A-Za-z0-9.-' '_' 2>/dev/null)" || _cys_sl=""
   while [ "${#_cys_sl}" -gt 80 ]; do _cys_sl="${_cys_sl%?}"; done
   printf '%s' "$_cys_sl"
   return 0
@@ -428,15 +432,60 @@ cys_role_socket_env()  { printf '%s' "${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOC
 #     절대 경로가 아닌 소켓(상대 경로·`C:foo`·named pipe — cwd·드라이브에 따라 다른 종단점) ·
 #     `:` 가 든 XDG/HOME(접두 인코딩이 단사가 아니게 된다) · 512 초과 · LF/CR 포함.
 #     파이썬 짝 `javis_role._sock_id` 와 **같은 규칙**이다(어긋나면 test_role_authority 가 멈춘다).
+# ★I7 수렴(판정관 T5 · 2026-09-08 · codex 설계 비평 (i)(j)(k)) — 두 규칙을 파이썬 짝
+#   `javis_role._is_abs_endpoint` / `_pct_esc` 와 **글자 그대로** 같게 둔다.
+#  ⓐ Windows 정규 종단점은 named pipe 다(`bin/cys-dept:48` 이 `\\.\pipe\cys-dept-<n>` 을 만들고
+#     `src/lib.rs:385` 의 기본 소켓이 `\\.\pipe\cys`). 종전 `/*` 검사는 그것을 통째로 '신원 미지'로
+#     접어 **디스크 캐시도 `.fail` 백오프도 함께** 껐다 — 데몬이 죽으면 훅마다 2s 를 온전히 문다
+#     (§7 ④ 방향이 Windows 에서만 사라진다). 이름이 비면·`/` 가 섞이면 인정하지 않는다.
+#  ⓑ 기본 신원은 `:` 거절 대신 **퍼센트 이스케이프**로 단사가 된다(`%`→`%25` 먼저, `:`→`%3A`).
+#     길이 접두를 쓰지 않는 이유: `${#var}` 가 dash 는 바이트·bash/zsh 는 글자라 UTF-8 HOME 에서
+#     두 층이 갈린다(실측 `한글`: dash 6 · bash 2). 바꾸는 글자가 ASCII 둘뿐이라 비-ASCII 는
+#     원문 바이트 그대로 복사된다.
+cys_role_abs_endpoint() {   # $1=소켓 값 · rc 0 = cwd 에 매달리지 않는 종단점
+  case "${1-}" in
+    /*) return 0 ;;
+    */*) return 1 ;;                       # `/` 가 든 값은 pipe 로 인정하지 않는다
+    '\\.\pipe\'?*) return 0 ;;
+    '\\?\pipe\'?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ★결과는 `CYS_ROLE_PCT_OUT` 에 담는다 — **명령 치환으로 회수하지 않는다**(`$( )` 가 말미 개행을
+#   먹어 다른 문맥의 이름표를 달던 R2 함정과 같은 자리). 현재 셸에서만 부른다.
+cys_role_pct_esc() {   # $1=원문 → CYS_ROLE_PCT_OUT
+  _cys_pe_r="${1-}"
+  _cys_pe_o=""
+  while :; do
+    case "$_cys_pe_r" in
+      *"%"*) _cys_pe_o="$_cys_pe_o${_cys_pe_r%%"%"*}%25"; _cys_pe_r="${_cys_pe_r#*"%"}" ;;
+      *) _cys_pe_o="$_cys_pe_o$_cys_pe_r"; break ;;
+    esac
+  done
+  _cys_pe_r="$_cys_pe_o"
+  _cys_pe_o=""
+  while :; do
+    case "$_cys_pe_r" in
+      *":"*) _cys_pe_o="$_cys_pe_o${_cys_pe_r%%":"*}%3A"; _cys_pe_r="${_cys_pe_r#*":"}" ;;
+      *) _cys_pe_o="$_cys_pe_o$_cys_pe_r"; break ;;
+    esac
+  done
+  CYS_ROLE_PCT_OUT="$_cys_pe_o"
+  return 0
+}
+
 cys_role_sock_id_init() {
   cys_role_ws_init
   CYS_ROLE_SOCK_ID=""
+  CYS_ROLE_PCT_OUT=""
   _cys_si="${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOCKET:-}}}"
   if [ -n "$_cys_si" ]; then
-    case "$_cys_si" in /*) : ;; *) return 0 ;; esac        # ⓐ 절대 경로가 아니면 신원 미지
+    cys_role_abs_endpoint "$_cys_si" || return 0          # ⓐ 종단점이 아니면 신원 미지
   else
-    case "${XDG_STATE_HOME:-}${HOME:-}" in *:*) return 0 ;; esac   # ⓑ 단사 아님
-    _cys_si="default:${XDG_STATE_HOME:-}:${HOME:-}"
+    cys_role_pct_esc "${XDG_STATE_HOME:-}"; _cys_si_x="$CYS_ROLE_PCT_OUT"
+    cys_role_pct_esc "${HOME:-}"; _cys_si_h="$CYS_ROLE_PCT_OUT"
+    _cys_si="default:$_cys_si_x:$_cys_si_h"               # ⓑ 단사 인코딩
   fi
   [ "${#_cys_si}" -le 512 ] || return 0
   case "$_cys_si" in *"$CYS_ROLE_NL"*|*"$CYS_ROLE_CR"*) return 0 ;; esac
@@ -531,8 +580,13 @@ cys_role_read_bounded() {   # $1=경로 · stdout: 선두 최대 4KB · rc≠0 =
 }
 
 # boot-epoch 토큰 또는 `-`(모름). 파이썬 `_boot_epoch` 와 같은 규칙(권위가 아니라 세대 표식).
+# ★I7 수렴(codex 설계 비평 (j)): `/` 로 시작하지 않는 종단점(named pipe)에서는 **아예 읽지
+#   않는다** — 유닉스 `dirname '\\.\pipe\cys'` 는 `.` 이라 cwd 의 `boot-epoch` 를 열었고,
+#   cwd 마다 다른 세대 표식이 레코드에 실려 같은 종단점의 캐시가 서로를 무효화한다.
+#   파이썬 짝 `javis_role._boot_epoch` 와 같은 규칙(Windows 에서 이미 `-` 인 것과 같은 결과).
 cys_role_epoch() {
   _cys_ep_s="$(cys_role_socket_env)"
+  case "$_cys_ep_s" in /*) : ;; *) _cys_ep_s="" ;; esac
   if [ -n "$_cys_ep_s" ]; then
     _cys_ep_f="$(dirname "$_cys_ep_s" 2>/dev/null)/boot-epoch"
     if _cys_ep_l="$(cys_role_read_bounded "$_cys_ep_f")"; then
@@ -618,9 +672,18 @@ cys_role_env_fallback() {
   return 0
 }
 
+# ★`cys_resolve_role --no-cache`(I5 수렴 · codex 설계 비평 (g)): **디스크 역할 캐시를 권위로
+#   읽지 않는다**. 새 허용(=stale `CYS_ROLE` 을 뒤집는 통과 판정)의 근거는 살아 있는 데몬의
+#   직접 응답뿐이어야 한다 — 캐시 레코드는 같은 uid 의 아무 프로세스나 쓸 수 있으므로(게이트는
+#   도구 호출만 본다) 그것을 통과 근거로 삼으면 위조 한 줄이 lifecycle mutation 을 연다.
+#   `.fail` 백오프는 **그대로 존중한다**(데몬 사망 시 매 호출 2s 정지가 §7 ④ 방향이다) —
+#   백오프에 걸리면 판정 불가로 강등되고 그 귀결은 종전 env 동작(거부 방향)이다.
+#   파이썬 짝은 `javis_role.confirm_role_detail()` 이다.
 cys_resolve_role() {
   CYS_RESOLVED_ROLE=""
   CYS_RESOLVED_ROLE_SOURCE="none"
+  _cys_rr_trust=1
+  [ "${1:-}" = "--no-cache" ] && _cys_rr_trust=0
   # ★현재 셸에서 한 번 — 아래 `case` 가 `$CYS_ROLE_NL` 을 직접 쓴다(하위 함수는 전부 `$( )`
   #   서브셸이라 거기서 설정된 값은 여기까지 오지 않는다 · `set -u` 안전 보장).
   cys_role_ws_init
@@ -650,7 +713,7 @@ cys_resolve_role() {
 
   # ① 신선 캐시 — 미래 시각(시계 역행)은 신선이 아니다(그러면 캐시가 무기한 유효해진다).
   CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""
-  if [ -n "$_cys_rr_cache" ] && [ "$_cys_rr_now" -gt 0 ] \
+  if [ "$_cys_rr_trust" = "1" ] && [ -n "$_cys_rr_cache" ] && [ "$_cys_rr_now" -gt 0 ] \
      && cys_role_record "$_cys_rr_cache" "$_cys_rr_sock" "$_cys_rr_ep" \
      && [ "$CYS_ROLE_REC_TS" -le "$_cys_rr_now" ] \
      && [ $(( _cys_rr_now - CYS_ROLE_REC_TS )) -lt "$CYS_ROLE_CACHE_TTL" ]; then

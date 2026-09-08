@@ -110,6 +110,15 @@ def sh_resolve(env, interp="sh"):
     return (r.stdout or "").strip("\n")
 
 
+def sh_sock_id(env):
+    """셸 짝이 계산한 종단점 신원 — 파이썬 `_sock_id()` 와 글자 그대로 같아야 한다."""
+    script = ('. "%s" >/dev/null 2>&1; cys_role_sock_id_init; '
+              'printf "%%s" "$CYS_ROLE_SOCK_ID"') % LIB
+    r = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                       encoding="utf-8", timeout=60, env=env)
+    return r.stdout or ""
+
+
 def _identity(env, sid):
     """주어진 env 에서 (캐시 경로, sockid, epoch) — **해소기 자신의 규칙**으로 계산한다.
 
@@ -429,9 +438,27 @@ def test_org_gate():
     rc, e = _org_rc(base_env(CYS_SURFACE_ID="7", CYS_ROLE="cso", CYS_BIN=stub_dir(2, "")))
     check("8c ★org: 판정 불가 → 종전 그대로 통과(게이트 무발화 · rc=2 는 매니페스트 부재)",
           rc == 2 and GATE_MSG not in e, "rc=%s err=%r" % (rc, e.strip()[:120]))
-    rc, e = _org_rc(base_env(CYS_SURFACE_ID="7", CYS_ROLE="worker", CYS_BIN=stub_dir(0, "cso\n")))
-    check("8d ★org: 데몬=cso 인데 env=worker → **여전히 거부**(단조 거부 — 새 허용 0)",
-          rc == 3 and GATE_MSG in e, "rc=%s" % rc)
+    # ★I5 재핀(판정관 T3a·T3b · 2026-09-08 · **의도적 계약 변경**): 종전 8d 는 "데몬=cso 인데
+    #   env=worker → 여전히 거부" 를 핀했다 — 그것이 정본 §8("`CYS_ROLE` env 를 권위로 쓰지
+    #   않는다 — 승계 후 stale")의 미달 지점 그 자체다. 승계로 정당하게 CSO 가 된 좌석은 자기
+    #   env 를 고칠 수 없어(SessionStart 는 부모 env 를 못 고친다) 부서 mutation 을 **영구히**
+    #   못 썼다. 이제 **살아 있는 데몬의 직접 응답**이 stale env 를 이긴다.
+    e_live = base_env(CYS_SURFACE_ID="7", CYS_ROLE="worker", CYS_BIN=stub_dir(0, "cso\n"))
+    rc, e = _org_rc(e_live)
+    check("8d ★org: 데몬 직접 응답 cso 는 stale env=worker 를 이긴다(게이트 무발화 · rc=2)",
+          rc == 2 and GATE_MSG not in e, "rc=%s err=%r" % (rc, e.strip()[:120]))
+    # ★같은 env 로 한 번 더 — 첫 호출이 남긴 **신선 캐시** 때문에 판정이 뒤집히면(요동) 안 된다.
+    rc, e = _org_rc(e_live)
+    check("8d-2 ★두 번째 호출도 같은 판정이다(신선 캐시가 통과를 되돌리지 않는다)",
+          rc == 2 and GATE_MSG not in e, "rc=%s err=%r" % (rc, e.strip()[:120]))
+    # ★음성 대조(새 허용의 근거를 좁힌 증거 · codex 설계 비평 (g)): **캐시만으로는 통과하지
+    #   못한다**. 같은 uid 의 아무 프로세스나 쓸 수 있는 파일 한 줄이 부서 lifecycle mutation 을
+    #   열면 §3-3(막는 쪽으로만 틀린다)이 거짓이 된다 — 통과 근거는 `daemon` 직접 응답뿐이다.
+    e_forge = base_env(CYS_SURFACE_ID="7", CYS_ROLE="worker", CYS_BIN=stub_dir(2, ""))
+    _seed_record(e_forge, "7", "cso")
+    rc, e = _org_rc(e_forge)
+    check("8d-3 ★위조된 신선 캐시 `cso` 만으로는 통과하지 못한다(데몬 사망 · env=worker)",
+          rc == 3 and GATE_MSG in e, "rc=%s err=%r" % (rc, e.strip()[:120]))
     rc, e = _org_rc(base_env(CYS_ROLE="cso", CYS_BIN=stub_dir(0, "worker\n")))
     check("8e org: 주소 없음 → 종전 env 판정만(게이트 무발화 · rc=2)",
           rc == 2 and GATE_MSG not in e, "rc=%s err=%r" % (rc, e.strip()[:120]))
@@ -804,14 +831,43 @@ def test_endpoint_identity():
           py_got == "cso\tdaemon" and sh_got == "cso\tdaemon" and _cache_files(e) == [],
           "py=%r sh=%r files=%s" % (py_got, sh_got, _cache_files(e)))
 
-    # ⓔ `default:<XDG>:<HOME>` 은 값에 `:` 가 있으면 단사가 아니다 → 그때도 신원 미지.
+    # ⓔ ★I7 재핀(판정관 T5c · **의도적 계약 변경**): `default:<XDG>:<HOME>` 은 이제 성분을
+    #   **퍼센트 이스케이프**해 단사다(`%`→`%25` 먼저, `:`→`%3A`). 종전에는 `:` 하나로 캐시를
+    #   통째로 껐는데, Windows 의 드라이브 지정 HOME(`C:\Users\x`)은 **늘** 거기에 걸려
+    #   디스크 캐시도 `.fail` 백오프도 없이 훅마다 2s 데몬 왕복을 물었다(§7 ④ 방향 소실).
     e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "cso\n"))
     e["HOME"] = "/h:x"
-    py_got = resolve(e)
     sh_got = sh_resolve(e)
-    check("15e ★모호한 기본 신원 인코딩(`:` 포함)은 캐시를 끈다(두 층 동형)",
-          py_got == "cso\tdaemon" and sh_got == "cso\tdaemon" and _cache_files(e) == [],
-          "py=%r sh=%r files=%s" % (py_got, sh_got, _cache_files(e)))
+    e2 = dict(e); e2["CYS_BIN"] = stub_dir(2, "")
+    py_got = resolve(e2)
+    check("15e ★`:` 가 든 기본 신원도 단사로 표현된다 — 캐시가 서고 두 층이 그 파일을 공유한다",
+          sh_got == "cso\tdaemon" and py_got == "cso\tcache" and len(_cache_files(e)) == 1,
+          "sh=%r py=%r files=%s" % (sh_got, py_got, _cache_files(e)))
+
+    # ★단사성 — 종전에 **한 문자열로 접히던** 두 문맥이 서로 다른 신원이 된다(권위가 넘어가지
+    #   않는다). 두 층이 같은 값을 내야 계약이 참이다.
+    idents = []
+    for xdg, home in (("/x:state", "/h"), ("/x", "state:/h")):
+        ee = base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(2, ""))
+        ee["XDG_STATE_HOME"] = xdg
+        ee["HOME"] = home
+        idents.append((_identity(ee, "7")[1], sh_sock_id(ee)))
+    check("15e-2 ★모호했던 두 문맥이 서로 다른 신원이 된다(두 층 동형)",
+          idents[0][0] and idents[0][0] == idents[0][1] and idents[1][0] == idents[1][1]
+          and idents[0][0] != idents[1][0], "%r vs %r" % (idents[0], idents[1]))
+
+    # ★Windows 정규 종단점(named pipe)에도 신원이 선다 — 그래야 `.fail` 백오프가 산다.
+    for ep in ("\\\\.\\pipe\\cys", "\\\\?\\pipe\\cys-dept-one"):
+        ee = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=ep, CYS_BIN=stub_dir(2, ""))
+        py_id, sh_id = _identity(ee, "7")[1], sh_sock_id(ee)
+        check("15e-3 ★named pipe 종단점의 신원(두 층 동형) %s" % ep,
+              py_id == ep and sh_id == ep, "py=%r sh=%r" % (py_id, sh_id))
+    # 음성 대조: 이름이 빈 접두·`/` 가 섞인 값은 여전히 신원 미지다(pipe 인정이 만능이 아니다).
+    for bad in ("\\\\.\\pipe\\", "\\\\.\\pipe\\a/b", "C:\\x", "rel.sock"):
+        ee = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=bad, CYS_BIN=stub_dir(2, ""))
+        py_id, sh_id = _identity(ee, "7")[1], sh_sock_id(ee)
+        check("15e-4 음성대조 신원 미지 %r" % bad, py_id == "" and sh_id == "",
+              "py=%r sh=%r" % (py_id, sh_id))
 
 
 def test_slug_parity_nonascii():

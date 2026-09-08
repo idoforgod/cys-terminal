@@ -59,7 +59,17 @@ def sha256_file(path):
 def require_cso():
     """부서 mutation 단일소유 게이트 — **단조 거부**(monotone deny) 합성(0.14.31 P6).
 
-    ★왜 '데몬 답으로 갈아끼우기'가 아니라 '거부만 추가'인가(codex R1 적대 검토 반영):
+    ★I5 수렴(판정관 T3a·T3b · 2026-09-08): 여기에 **ⓓ 통과 절**이 붙는다 — 데몬이 권위 있게
+      `cso` 라고 답하면 stale `CYS_ROLE` 이 그것을 뒤집지 못한다(정본 §8 의 표적 그 자체였다).
+      새 허용의 근거는 **살아 있는 데몬의 직접 응답**(`SOURCE_DAEMON`)뿐이다: 디스크 캐시는
+      같은 uid 의 아무 프로세스나 쓸 수 있어서 그것을 통과 근거로 삼으면 위조 한 줄이
+      lifecycle mutation 을 연다(codex 설계 비평 (g)). 캐시가 `cso` 라고 말하고 env 가 stale 이면
+      `confirm_role_detail()` 로 **디스크를 건너뛰고 한 번 더 직접** 묻는다 — 그래야 첫 호출은
+      허용되고 60초 안의 둘째 호출은 캐시 때문에 거부되는 판정 요동이 생기지 않는다.
+      자식 프리미티브(`cys-dept`)도 **같은 규칙**으로 같은 커밋에서 바꾼다 — 부모만 열면
+      `destroy_dept` 가 자식 거부 rc 를 만나 정리 경로가 새로 도달 가능해진다(codex (f)).
+
+    ★왜 '데몬 답으로 갈아끼우기'가 아니라 '거부만 추가'였는가(codex R1 적대 검토 · 종전 판):
       이 함수가 허용한 뒤 하위 프리미티브 `cys-dept down` 이 **자기 env 판정으로 거부**하면,
       `destroy_dept` 는 그 실패를 삼키지 않으면서도 pack/workdir 격리는 best-effort 로
       **계속 진행한다**(:511-524). 즉 '부모 허용 + 자식 거부' = 살아 있는 부서의 팩·작업 폴더가
@@ -70,6 +80,7 @@ def require_cso():
       새 허용 경로가 없으므로 '부모 허용 + 자식 거부' 조합은 이 변경으로 늘지 않는다.
     """
     why = ""
+    granted = False
     if _role_mod is not None:
         try:
             role, src = _role_mod.resolve_role_detail()
@@ -77,10 +88,26 @@ def require_cso():
                 if (os.environ.get("CYS_ROLE") or "").strip():
                     why = ("데몬이 이 좌석에 역할이 없다고 답했다(env CYS_ROLE=%s 는 stale). "
                            % (os.environ.get("CYS_ROLE") or "").strip()[:32])
-            elif _role_mod.is_authoritative(src) and role != "cso":
-                why = "데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). " % role[:32]
+            elif _role_mod.is_authoritative(src):
+                if role != "cso":
+                    why = "데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). " % role[:32]
+                elif src == _role_mod.SOURCE_DAEMON:
+                    granted = True                          # ⓓ 데몬이 **방금** cso 라고 답했다
+                elif os.environ.get("CYS_ROLE") == "cso":
+                    granted = True                          # 종전 판정이 이미 허용 — 새 허용 아님
+                else:
+                    # 캐시만으로는 stale env 를 뒤집지 못한다 — 디스크를 건너뛰고 직접 확인한다.
+                    role2, src2 = _role_mod.confirm_role_detail()
+                    if src2 == _role_mod.SOURCE_DAEMON and role2 == "cso":
+                        granted = True
+                    elif _role_mod.is_authoritative(src2) and role2 != "cso":
+                        why = ("데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). "
+                               % (role2 or "-")[:32])
         except Exception:
             why = ""      # 해소 실패가 이 게이트를 **열지도 닫지도** 않는다 — 아래 종전 판정으로.
+            granted = False
+    if granted:
+        return
     if why or os.environ.get("CYS_ROLE") != "cso":
         sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). %sCSO에 위임하라.\n" % why)
         sys.exit(3)

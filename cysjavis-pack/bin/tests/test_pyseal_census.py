@@ -241,6 +241,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   가짜 `cys` 스텁(sh)뿐이다. 니들은 **밀폐 env 를 짜는 한 줄**에 있다 — 검체가 띄우는 셸이
     #   번들 python 을 물었을 때 그 자식이 캐시를 쓰지 않도록 상속시키는 것이라 봉인 방향이 옳다.
     "cysjavis-pack/bin/tests/test_role_authority_shell.py",
+    # ★2026-09-08 P6 수렴 등재 — 독립 판정관 회귀 핀. **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 강제점도 아니다. 이 검체가 스폰하는 것은 `bash`(게이트 훅)·`sh`(슬러그
+    #   대조)·`cys-dept`(bash)와 가짜 `cys` 스텁(sh)뿐이고, 파이썬은 **자기 프로세스 안에서**
+    #   `javis_role`/`javis_org`/`javis_snapshot` 을 import 해 쓴다(자식 python 0).
+    #   니들은 `cys-dept` 를 `env -i` 로 띄울 때 짜는 **밀폐 env 한 줄**에 있다 — 그 셸이 번들
+    #   python 을 물었을 때 자식이 `__pycache__` 를 쓰지 않도록 상속시키는 것이라 봉인 방향이 옳다
+    #   (빼면 검체가 팩 트리를 오염시킨다 = SEAL-1 과 같은 계급).
+    "cysjavis-pack/bin/tests/test_role_authority_triage.py",
     "cysjavis-pack/hooks/_lib.sh",
     "docs/RELEASE.md",
     # ★2026-09-04 W-C 등재 — 사용자 대면 릴리스 노트. **봉인 점검 결과**: 진입점도 강제점도

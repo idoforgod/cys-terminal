@@ -148,13 +148,15 @@ def is_authoritative_none(source):
 
 # (key, mono_expiry, wall_created, wall_expiry, (role, source)) — 두 시계로 만료하는 메모.
 # 단조시계는 벽시계 조작에, 벽시계는 서스펜드를 세지 않는 단조시계에 각각 면역이다(R2).
-_MEMO = None
+_MEMO = None            # 일반 해소(`resolve_role_detail`)
+_MEMO_CONFIRM = None    # 직접 확인(`confirm_role_detail` · 디스크 역할 캐시를 권위로 쓰지 않는다)
 
 
 def reset_cache():
     """프로세스 메모 초기화 — 검체 전용(같은 프로세스에서 여러 env 를 재실측할 때)."""
-    global _MEMO
+    global _MEMO, _MEMO_CONFIRM
     _MEMO = None
+    _MEMO_CONFIRM = None
 
 
 # ── 문자열 규율(셸 짝과 글자 그대로 같은 규칙) ────────────────────────────────
@@ -211,8 +213,42 @@ def _has_break(*vals):
     return False
 
 
+# Windows 정규 종단점 접두 — `cys-dept:48`(MINGW/MSYS/CYGWIN)과 `src/lib.rs:385` 가 만든다.
+# 셸 짝 `cys_role_sock_id_init` 의 `case` 패턴과 **글자 그대로** 같은 집합이다.
+_PIPE_PREFIXES = ("\\\\.\\pipe\\", "\\\\?\\pipe\\")
+
+
+def _is_abs_endpoint(v):
+    r"""소켓 값이 **cwd 에 매달리지 않는 종단점**인가(유닉스 절대 경로 또는 Windows named pipe).
+
+    ★`/` 가 든 값은 pipe 로 인정하지 않는다 — 정규 named pipe 경로에는 `/` 가 없고, 그 배제가
+      유닉스의 백슬래시 상대 파일명을 pipe 로 오인할 여지를 좁힌다(codex 설계 비평 (k)).
+    ★접두만으로는 부족하다: 이름이 비어 있는 `\\.\pipe\` 는 종단점이 아니다(codex (j)).
+    """
+    if not v:
+        return False
+    if v.startswith("/"):
+        return True
+    if "/" in v:
+        return False
+    for pre in _PIPE_PREFIXES:
+        if v.startswith(pre) and len(v) > len(pre):
+            return True
+    return False
+
+
+def _pct_esc(s):
+    """기본 신원 성분의 **단사** 인코딩 — `%`→`%25` 를 먼저, 그 다음 `:`→`%3A`.
+
+    순서가 뒤바뀌면 단사가 아니다(`:` 를 먼저 바꾸면 원문의 `%3A` 와 구별되지 않는다).
+    셸 짝 `cys_role_pct_esc` 와 **글자 그대로** 같은 규칙이며, 바꾸는 것이 ASCII 두 글자뿐이라
+    비-ASCII 는 원문 바이트 그대로 복사된다(두 층의 문자/바이트 셈 차이가 결과에 닿지 않는다).
+    """
+    return (s or "").replace("%", "%25").replace(":", "%3A")
+
+
 def _sock_id():
-    """데몬 신원 문자열 또는 **""(표현 불가 → 디스크 캐시 끔)**.
+    r"""데몬 신원 문자열 또는 **""(표현 불가 → 디스크 캐시 끔)**.
 
     캐시 **레코드에 그대로 실려** 정확 비교된다.
     ★왜 슬러그가 아니라 원문인가(reviewer-codex R1): `tr -c` 슬러그는 손실 치환이라
@@ -230,29 +266,42 @@ def _sock_id():
            Git Bash `/c/work` 는 같은 자리를 다른 바이트로 적는다 · codex R2). 그래서
            **절대 경로가 아니면 신원 미지**로 간주하고 디스크 캐시를 끈다(데몬에 매번 묻는다).
         ⓑ `default:<XDG>:<HOME>` 은 값에 `:` 가 있으면 서로 다른 문맥을 같은 문자열로 접는다
-           (`XDG=/x:state,HOME=/h` 와 `XDG=/x,HOME=state:/h`) → 그때도 신원 미지다.
+           (`XDG=/x:state,HOME=/h` 와 `XDG=/x,HOME=state:/h`) → 그때도 신원 미지였다.
         ⓒ 512 초과 절단은 서로 다른 긴 경로를 같은 신원으로 만들었다 → 절단 대신 신원 미지.
+    ★I7 수렴(판정관 T5 · 2026-09-08) — ⓐ·ⓑ 를 **거절이 아니라 표현**으로 바꾼다.
+      Windows 의 정규 종단점은 named pipe 다(`bin/cys-dept:48` 이 `\\.\pipe\cys-dept-<n>` 을
+      만들고 `src/lib.rs:385` 의 기본 소켓이 `\\.\pipe\cys` 다). 종전 규칙은 그것을 통째로
+      '신원 미지'로 접어 **디스크 캐시도 `.fail` 백오프도 둘 다** 껐다 — 데몬이 죽어 있으면
+      훅·도구 프로세스마다 `CYS_ROLE_QUERY_TIMEOUT`(2s)를 온전히 문다(§7 ④ 방향이 Windows 에서만
+      사라진다). 드라이브 지정 `HOME=C:\Users\x` 도 `:` 규칙에 걸려 기본 신원조차 없었다.
+        · ⓐ `\\.\pipe\<이름>` · `\\?\pipe\<이름>` 을 **명시적 절대 종단점**으로 인정한다
+          (`_is_abs_endpoint`). 이름이 비어 있으면·`/` 가 섞이면 인정하지 않는다.
+        · ⓑ `:` 를 거절하는 대신 성분을 **퍼센트 이스케이프**해 단사로 만든다(`%`→`%25` 를 먼저,
+          그 다음 `:`→`%3A`). 구분자와 이스케이프 문자만 바꾸므로 비-ASCII 는 원문 그대로
+          복사되고, 두 층이 `${#}`(셸마다 바이트/글자가 갈린다)에 의존하지 않는다 —
+          길이 접두 인코딩을 버린 이유가 이것이다(codex 설계 비평 (i)).
+      **남는 정직한 한계**: 유닉스에서 `\\.\pipe\x` 는 백슬래시가 든 **상대 파일명**일 수도
+      있다. 그 형상을 절대 종단점으로 인정하면 cwd 가 다른 두 좌석이 한 신원을 공유한다.
+      플랫폼으로 가르면 두 층(Git Bash sh vs 네이티브 파이썬)이 갈리므로 규칙은 순수하게 두고,
+      대신 `/` 가 없는 정규 pipe 형상만 인정한다(실제 유닉스 소켓 경로는 `/` 를 포함한다).
       "신원 미지"의 귀결은 **디스크 캐시 없음 = 매번 데몬 조회**이고, 조회가 실패하면 이 WP
       이전 동작(env 폴백)이다 — 새 허용은 0 이지만 캐시가 실어 나르던 *거부*도 함께 사라진다는
       점은 정직하게 적어 둔다(코덱스 R2 지적 · 그 상태는 P6 이전 기준선과 같다).
     """
     v = _env_compat(SOCKET_ENV_KEYS)
     if v:
-        if not v.startswith("/"):
-            return ""                       # ⓐ 상대·드라이브 상대·named pipe = 신원 미지
+        if not _is_abs_endpoint(v):
+            return ""                       # ⓐ 상대·드라이브 상대 = 신원 미지
     else:
-        xdg = os.environ.get("XDG_STATE_HOME", "")
-        home = os.environ.get("HOME", "")
-        if ":" in xdg or ":" in home:
-            return ""                       # ⓑ 접두 인코딩이 단사가 아니게 되는 값
-        v = "default:%s:%s" % (xdg, home)
+        v = "default:%s:%s" % (_pct_esc(os.environ.get("XDG_STATE_HOME", "")),
+                               _pct_esc(os.environ.get("HOME", "")))
     if len(v) > SOCKID_MAX or _has_break(v):
         return ""                           # ⓒ 절단하지 않는다
     return v
 
 
 def _slug(s):
-    """파일명 성분 — 셸 짝 `tr -cs 'A-Za-z0-9._-' '_'` 와 **글자 그대로** 같다.
+    """파일명 성분 — 셸 짝 `tr -cs 'A-Za-z0-9.-' '_'` 와 **글자 그대로** 같다.
 
     ★R2(codex 위임 차분 프로브 실측): R1 의 "파이썬도 UTF-8 바이트로 치환하니 셸(`tr`=바이트)과
       갈리지 않는다"는 **틀린 주장이었다**. macOS `tr` 는 `env -i`(로케일 없음)에서도 멀티바이트를
@@ -263,10 +312,17 @@ def _slug(s):
     ★수정: **연속된 치환은 하나로 접는다**(`-s`). 허용 문자 집합이 순수 ASCII 라 두 층은 언제나
       **같은 구간**을 치환하고 길이만 달랐다 — 접고 나면 어떤 입력에서도 결과가 같아지며,
       결과가 ASCII 라 80자 절단의 단위(코드포인트/바이트) 문제도 함께 사라진다.
+    ★I2 수렴(판정관 T2 · 2026-09-08): 접기만으로는 파리티가 서지 않았다 — `_` 가 **허용 문자**라
+      입력에 원래 있던 `_` 는 파이썬이 그대로 흘리는데 `tr -s` 는 출력의 연속 `_` 를 **출처를
+      가리지 않고** 접었다(`/tmp/a__b.sock` → py `_tmp_a__b.sock` vs sh `_tmp_a_b.sock`).
+      규칙을 하나로 만든다: **허용 집합에서 `_` 를 뺀다**(`A-Za-z0-9.-`). 그러면 출력의 모든
+      `_` 가 치환 산물이라 `-s` 와 아래 접기가 **언제나 같은 구간**을 접는다.
+      대가는 `a_b` 와 `a-b`… 가 아니라 `a_b` 와 `a b` 가 같은 **파일명**이 되는 것뿐인데,
+      권위는 파일명이 아니라 레코드의 `sockid` 원문 대조가 가른다(겹침의 귀결은 캐시 미스).
     """
     out = []
     for c in (s or "").encode("utf-8", "replace"):
-        if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122) or c in (46, 95, 45):
+        if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122) or c in (46, 45):
             out.append(chr(c))
         elif not out or out[-1] != "_":
             out.append("_")
@@ -409,9 +465,13 @@ def _boot_epoch():
       ⓐ Windows 의 소켓은 named pipe 라 `dirname` 이 상태 디렉터리가 아니다 → `-`.
       ⓑ 소켓 지정이 없거나 감독자 비활성·쓰기 실패면 → `-`.
       그 경우 무효화는 **TTL 60s 하나만** 남는다. 셸 짝도 같은 규칙이라 두 층이 갈리지 않는다.
+    ★I7 수렴(codex 설계 비평 (j)): `/` 로 시작하지 않는 종단점에서는 **아예 읽지 않는다**.
+      유닉스 `os.path.dirname("\\\\.\\pipe\\cys")` 는 `""` 라 상대 경로 `boot-epoch` 를 열었다
+      — cwd 마다 다른 세대 표식이 레코드에 실려 같은 종단점의 캐시가 서로를 무효화한다.
+      Windows 에서 이미 `-` 인 것과 같은 결과로 두 층·두 플랫폼을 한 규칙에 모은다.
     """
     sock = _env_compat(SOCKET_ENV_KEYS)
-    if not sock:
+    if not sock or not sock.startswith("/"):
         return "-"
     try:
         line = _read_first_line(os.path.join(os.path.dirname(sock), "boot-epoch"))
@@ -512,8 +572,16 @@ def _env_fallback():
     return "", SOURCE_NONE
 
 
-def _resolve_uncached(now):
-    """(role, source, expires_at) — 만료 시각은 프로세스 메모의 상한이 된다."""
+def _resolve_uncached(now, trust_cache=True):
+    """(role, source, expires_at) — 만료 시각은 프로세스 메모의 상한이 된다.
+
+    ★`trust_cache=False`(I5 수렴 · codex 설계 비평 (g)): **디스크 역할 캐시를 권위로 읽지 않는다**.
+      새 허용(=stale env 를 뒤집는 판정)의 근거는 살아 있는 데몬의 직접 응답뿐이어야 한다 —
+      캐시 레코드는 같은 uid 의 아무 프로세스나 쓸 수 있으므로 그것을 통과 근거로 삼으면
+      위조 한 줄이 부서 lifecycle mutation 을 연다. `.fail` 백오프는 **그대로 존중한다**
+      (데몬 사망 시 매 호출 2s 정지가 전 pane 에 걸리는 것이 §7 ④ 방향이다) — 백오프에 걸리면
+      판정 불가로 강등되고 그 귀결은 종전 env 동작이다(거부 방향).
+    """
     fb_exp = now + FAIL_BACKOFF_S
     sid = surface_id()
     if not sid:
@@ -525,7 +593,7 @@ def _resolve_uncached(now):
     # 신원을 표현할 수 없으면(상대 경로·모호한 기본 인코딩·512 초과) 디스크 캐시를 쓰지 않는다
     # — 자르거나 뭉개서 **남의 데몬 역할을 권위로 읽는 것**보다 왕복 한 번이 낫다(R2).
     cpath = _cache_path(sid) if sockid else ""
-    if cpath:
+    if cpath and trust_cache:
         rec = _parse_record(_read_first_line(cpath), sockid, epoch)
         if rec:
             ts, role = rec
@@ -563,23 +631,30 @@ def _memo_key():
     """프로세스 메모의 신원 키 — **표현 불가한 신원도 문맥을 잃지 않는다**(R2 · codex).
 
     `_sock_id()` 는 상대 경로에서 ""(신원 미지)를 내는데, 그 하나로 키를 잡으면 cwd 만 바꾼
-    **다른 소켓**이 같은 메모를 재사용한다. 그래서 원값 두 개에 더해, 소켓 값이 절대 경로가
-    아닐 때만 cwd 를 키에 싣는다(절대 경로에서는 cwd 가 판정에 영향을 주지 않으므로 부르지도
+    **다른 소켓**이 같은 메모를 재사용한다. 그래서 원값 두 개에 더해, 소켓 값이 절대 종단점이
+    아닐 때만 cwd 를 키에 싣는다(절대 종단점에서는 cwd 가 판정에 영향을 주지 않으므로 부르지도
     않는다 — 호출당 getcwd 1회를 아낀다).
+
+    ★I6 수렴(판정관 T4 · 2026-09-08): 종전 키는 `(raw_surface, raw_socket, cwd)` 뿐이라
+      **기본 종단점의 입력을 통째로 빠뜨렸다**. 소켓 지정이 없으면 신원은
+      `default:<XDG_STATE_HOME>:<HOME>` 인데(`_sock_id`), 그 둘이 키에 없으니 한 프로세스가
+      HOME 을 A→B 로 바꿔 다시 해소하면 **디스크 신원이 달라졌는데도** A 데몬의 답이 재사용됐다.
+      `_sock_id()` 의 **산출**을 키에 실으면 그 산출이 곧 디스크 신원이라 정의상 빠짐이 없다
+      (I7 의 퍼센트 이스케이프로 기본 신원이 단사가 됐으므로 `:` 가 든 값도 서로 구별된다).
     """
     raw_s = _env_compat(SURFACE_ENV_KEYS)
     raw_k = _env_compat(SOCKET_ENV_KEYS)
     cwd = ""
-    if raw_k and not raw_k.startswith("/"):
+    if raw_k and not _is_abs_endpoint(raw_k):
         try:
             cwd = os.getcwd()
         except Exception:
             cwd = "\x00unknown"      # 알 수 없는 cwd 는 어떤 실제 cwd 와도 같지 않다
-    return (raw_s, raw_k, cwd)
+    return (raw_s, raw_k, _sock_id(), cwd)
 
 
-def resolve_role_detail():
-    """(role, source) — 데몬 권위 우선 · 캐시 · env 폴백. **예외를 내지 않는다**.
+def _resolve_memoized(trust_cache):
+    """`resolve_role_detail`/`confirm_role_detail` 공통 몸통 — 메모 슬롯만 갈린다.
 
     소비처는 `source` 로 '권위 있는 무역할'(daemon-none/cache-none)과 '판정 불가 후 env 폴백'
     을 구분할 수 있다 — `cys-dept` 단일소유 가드가 그 구분을 쓴다.
@@ -595,21 +670,23 @@ def resolve_role_detail():
       늘어나지 않는다. 남은 수명이 0 이하면 **메모하지 않는다**(종전의 `now+1` 갱신은 만료된
       답을 1초 되살리는 길이었다 — 삭제).
     """
-    global _MEMO
+    global _MEMO, _MEMO_CONFIRM
     try:
         now = int(time.time())
         mono = time.monotonic()
         key = _memo_key()
-        if _MEMO is not None and _MEMO[0] == key:
-            _mexp, _wcreated, _wexp, _val = _MEMO[1], _MEMO[2], _MEMO[3], _MEMO[4]
+        memo = _MEMO if trust_cache else _MEMO_CONFIRM
+        if memo is not None and memo[0] == key:
+            _mexp, _wcreated, _wexp, _val = memo[1], memo[2], memo[3], memo[4]
             if mono < _mexp and _wcreated <= now < _wexp:
                 return _val
-        role, src, exp = _resolve_uncached(now)
+        role, src, exp = _resolve_uncached(now, trust_cache)
         remaining = exp - now
-        if remaining > 0:
-            _MEMO = (key, mono + remaining, now, exp, (role, src))
+        fresh = (key, mono + remaining, now, exp, (role, src)) if remaining > 0 else None
+        if trust_cache:
+            _MEMO = fresh
         else:
-            _MEMO = None
+            _MEMO_CONFIRM = fresh
         return role, src
     except Exception:
         # 이 모듈이 소비처를 죽이는 경로는 없다(§3-3) — 최악이 현행(env) 동작이다.
@@ -617,6 +694,29 @@ def resolve_role_detail():
             return _env_fallback()
         except Exception:
             return "", SOURCE_NONE
+
+
+def resolve_role_detail():
+    """(role, source) — 데몬 권위 우선 · 캐시 · env 폴백. **예외를 내지 않는다**.
+
+    (아래 서술은 `_resolve_memoized` 의 계약이며 이 함수가 그 기본 진입점이다.)
+    """
+    return _resolve_memoized(True)
+
+
+def confirm_role_detail():
+    """(role, source) — **디스크 역할 캐시를 권위로 쓰지 않는** 직접 확인(I5 · codex 비평 (g)).
+
+    새 허용(=stale `CYS_ROLE` env 를 뒤집어 통과시키는 판정)의 유일한 근거다. 반환 `source` 가
+    `daemon`/`daemon-none` 이면 살아 있는 데몬이 **방금** 답한 것이고, 그 밖이면(백오프·데몬
+    사망·주소 없음) 판정 불가라 소비처는 **종전 env 판정 그대로**로 강등한다(거부 방향).
+
+    ★왜 캐시를 통과 근거에서 빼는가: 캐시 레코드는 같은 uid 의 아무 프로세스나 쓸 수 있다
+      (게이트는 도구 호출만 본다). 캐시를 통과 근거로 삼으면 위조 한 줄이 부서 lifecycle
+      mutation 을 여는 **새 허용**이 된다 — 거부 방향으로만 틀린다는 §3-3 약속이 깨진다.
+      거부 방향(캐시가 '비-cso'라고 말할 때 더 막는 것)에는 종전대로 캐시를 쓴다.
+    """
+    return _resolve_memoized(False)
 
 
 def resolve_role(default=""):

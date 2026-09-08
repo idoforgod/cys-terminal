@@ -114,29 +114,35 @@ class Sandbox:
         equal((self.home / "resolver.stdout").read_bytes(), b"", "resolver stdout")
 
     def sock_id(self):
-        """레코드에 실리는 데몬 신원 — `_lib.sh cys_role_sock_id` / `javis_role._sock_id` 와 동형.
+        r"""레코드에 실리는 데몬 신원 — `_lib.sh cys_role_sock_id` / `javis_role._sock_id` 와 동형.
 
-        ★R2: **절단하지 않는다** — 절대 경로가 아니거나 `:` 로 모호하거나 512 를 넘거나 개행이
-        들어 있으면 신원 미지("")이고, 그때 두 층은 디스크 캐시를 통째로 끈다.
+        ★R2: **절단하지 않는다** — 종단점이 아니거나 512 를 넘거나 개행이 들어 있으면
+        신원 미지("")이고, 그때 두 층은 디스크 캐시를 통째로 끈다.
+        ★I7 수렴: Windows 정규 종단점(`\\.\pipe\…`·`\\?\pipe\…`)도 종단점이고, 기본 신원의
+        `:` 는 거절이 아니라 **퍼센트 이스케이프**(`%`→`%25` 먼저, `:`→`%3A`)로 단사가 된다.
         """
+        def esc(v):
+            return v.replace("%", "%25").replace(":", "%3A")
+
         socket = self.env.get("CYS_SOCKET", "")
         if socket:
             if not socket.startswith("/"):
-                return ""
+                if "/" in socket or not any(
+                        socket.startswith(pre) and len(socket) > len(pre)
+                        for pre in ("\\\\.\\pipe\\", "\\\\?\\pipe\\")):
+                    return ""
             value = socket
         else:
-            xdg = self.env.get("XDG_STATE_HOME", "")
-            home = self.env.get("HOME", "")
-            if ":" in xdg or ":" in home:
-                return ""
-            value = "default:%s:%s" % (xdg, home)
+            value = "default:%s:%s" % (esc(self.env.get("XDG_STATE_HOME", "")),
+                                       esc(self.env.get("HOME", "")))
         if len(value) > 512 or "\n" in value or "\r" in value:
             return ""
         return value
 
     def epoch(self):
         socket = self.env.get("CYS_SOCKET", "")
-        if socket:
+        # ★I7 수렴: `/` 로 시작하지 않는 종단점(named pipe)에서는 두 층 모두 읽지 않는다.
+        if socket and socket.startswith("/"):
             epoch_file = Path(socket).parent / "boot-epoch"
             if epoch_file.exists():
                 line = epoch_file.read_text().splitlines()
@@ -151,7 +157,9 @@ class Sandbox:
         def slug(value):
             # ★R2: 연속 치환은 하나로 접는다(`tr -cs` / 파이썬 `_slug` 와 동형) — 접지 않으면
             #   멀티바이트 경로에서 셸(`tr`=글자)과 파이썬(=UTF-8 바이트)이 다른 파일을 쓴다.
-            return re.sub(rb"[^A-Za-z0-9._-]+", b"_", value.encode("utf-8")).decode()[:80]
+            # ★I2 수렴: 허용 집합에서 `_` 를 뺀다(`A-Za-z0-9.-`). `_` 를 허용하면 입력에 원래
+            #   있던 `_` 를 파이썬은 보존하고 `tr -s` 는 출처를 가리지 않고 접어 두 층이 갈렸다.
+            return re.sub(rb"[^A-Za-z0-9.-]+", b"_", value.encode("utf-8")).decode()[:80]
         return self.cache_dir() / f"role-{slug(surface)}-{slug(self.sock_id())}"
 
     def record(self, value="cso", age=0, epoch=None, sock=None, ts=None):
@@ -386,7 +394,20 @@ dept_case("H2 cso / cso allowed", {"CYS_ROLE": "cso"}, False, 1)
 dept_case("H3 cso / daemon-none denied", {"CYS_ROLE": "cso", "STUB_OUT": ""}, True, 1)
 dept_case("H4 no env / daemon-none allowed", {"STUB_OUT": ""}, False, 1)
 dept_case("H5 cso / rc2 allowed", {"CYS_ROLE": "cso", "STUB_RC": 2}, False, 1)
-dept_case("H6 master / cso still denied before query", {"CYS_ROLE": "master"}, True, 0)
+# ★I5 재핀(판정관 T3g · 2026-09-08 · **의도적 계약 변경**): 종전 H6 은 "env=master 면 데몬에게
+#   묻기도 전에 거부" 를 핀했다 — 정본 §8("`CYS_ROLE` env 를 권위로 쓰지 않는다 — 승계 후
+#   stale")의 미달 지점 그 자체다. 승계로 정당하게 CSO 가 된 좌석은 자기 env 를 고칠 수 없어
+#   (SessionStart 는 부모 env 를 못 고친다) `down`·`launch` 를 **영구히** 못 썼다.
+#   지금은 env 절이 `cysd_role_gate` **안**으로 들어가 데몬 권위가 없을 때만 선다.
+dept_case("H6 ★데몬 직접 응답 cso 가 stale env=master 를 이긴다(질의가 먼저 간다)",
+          {"CYS_ROLE": "master"}, False, 1)
+# 음성 대조 — 새 통과가 '데몬이 그렇다고 말할 때' 에만 생긴다는 증거.
+dept_case("H6b 음성대조: env=master + 데몬=worker → 여전히 거부",
+          {"CYS_ROLE": "master", "STUB_OUT": "worker"}, True, 1)
+dept_case("H6c 음성대조: env=master + 데몬 판정 불가 → 종전 env 절이 그대로 거부한다",
+          {"CYS_ROLE": "master", "STUB_RC": 2}, True, 1)
+dept_case("H6d 음성대조: env=master + 권위 무역할 → 거부(stale 주장)",
+          {"CYS_ROLE": "master", "STUB_OUT": ""}, True, 1)
 # ★K: rotate 면제는 **상속되지 않는 argv** 다(0.14.31 P6 R1 · 두 리뷰어 blocking).
 # 2026-09-08 라이브 실측: dept-2 cysd(pid 2634)와 그 좌석 3기(4147/5087/7981)가 전부
 # `CYS_DEPT_ROTATE=1` 을 물고 있었다 — 종전 판에서는 그 부서의 모든 pane 에서 이 게이트가
@@ -399,8 +420,11 @@ dept_case("I list never queries", {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, Fal
 dept_case("I request-only never queries", {"CYS_ROLE": "master", "STUB_OUT": "worker"}, False, 0, ("promote-if-pending", "--request-only"))
 dept_case("J missing prelude retains cso permission", {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0, missing=True)
 dept_case("J missing prelude retains master rejection", {"CYS_ROLE": "master"}, True, 0, missing=True)
-dept_case("K2 inherited CYS_DEPT_ROTATE keeps the env clause too",
-          {"CYS_ROLE": "master", "CYS_DEPT_ROTATE": 1}, True, 0)
+# ★I5 재핀: 상속된 `CYS_DEPT_ROTATE` 는 여전히 게이트를 끄지 못한다 — 다만 이제 판정은
+#   **데몬에게 묻고 나서** 난다(종전에는 env 절이 앞이라 질의 0회로 죽었다). 데몬이 비-cso 를
+#   말하면 그대로 거부다.
+dept_case("K2 inherited CYS_DEPT_ROTATE keeps the gate (daemon clause denies)",
+          {"CYS_ROLE": "master", "STUB_OUT": "worker", "CYS_DEPT_ROTATE": 1}, True, 1)
 dept_case("K3 --rotate is launch-only (down still denied)",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1,
           args=("down", "some-dept", "--rotate"))
@@ -412,6 +436,12 @@ def _register_bad_name(box):
     """`bad name` 을 레지스트리에 심는다 — R2 부터 면제는 **등재된 부서**에만 선다."""
     box.registry.write_text('{"depts":{"bad name":{}}}', encoding="utf-8")
 
+
+# ★argv `--rotate` 면제는 **데몬 절만** 면제한다 — env 절은 종전대로 선다(면제가 새 허용이
+#   되지 않는다). 등재된 이름 + 소켓 부재라 면제 조건은 성립하는데, env=master 가 막는다.
+dept_case("K2b ★argv --rotate 면제는 env 절을 면제하지 않는다",
+          {"CYS_ROLE": "master", "STUB_OUT": "cso"}, True, 0,
+          args=("launch", "bad name", "--rotate"), prepare=_register_bad_name)
 
 dept_case("K5 ★argv --rotate exempts launch (falls through to name validation rc=2)",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0,
@@ -438,6 +468,14 @@ dept_case("K8 ★unreadable registry keeps the rotate exemption (no post-kill ha
 
 
 def _plant_socket(box):
+    """★I9 수렴(codex #6 · 판정관 돌연변이 실측 2026-09-08): **등재까지 한다**.
+
+    종전 K6 은 소켓만 심고 부서를 등재하지 않았다. rotate 면제 조건(`cys-dept:1199`)은
+    `소켓 부재 ∧ 레지스트리 등재` 연언이라, 소켓 조건을 코드에서 **지워도** 등재 조건이 혼자
+    면제를 막아 결과가 같았다(원본 `rc=7` · 돌연변이 `rc=7`) — 검체가 자기가 이름 붙인 가드를
+    검출하지 못했다. 등재해 두면 남는 것은 소켓 조건 하나뿐이라 그 줄의 돌연변이가 적색이 된다.
+    """
+    _register_bad_name(box)
     sock = box.home / ".local" / "state" / "cys-dept-bad name" / "cys.sock"
     sock.parent.mkdir(parents=True, exist_ok=True)
     sock.write_text("")

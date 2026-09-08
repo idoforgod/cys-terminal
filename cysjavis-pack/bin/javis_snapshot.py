@@ -185,8 +185,22 @@ def is_master():
             _role, _src = _rm.resolve_role_detail()
             if _rm.is_authoritative_none(_src):
                 return False, "daemon knows no role for this seat"
-            if _rm.is_authoritative(_src) and _role.strip().lower() != "master":
-                return False, "daemon role is not master"
+            if _rm.is_authoritative(_src):
+                if _role.strip().lower() != "master":
+                    return False, "daemon role is not master"
+                # ★I5 수렴(판정관 T3e): 데몬이 권위 있게 master 라고 답하면 **그 답이 결정한다** —
+                #   stale env 도 stale 대장도 그것을 뒤집지 못한다(정본 §8 의 표적). 새 허용의
+                #   근거는 살아 있는 데몬의 직접 응답뿐이다(디스크 캐시는 같은 uid 가 위조할 수
+                #   있으므로 통과 근거가 아니다 · codex 설계 비평 (g)).
+                if _src == _rm.SOURCE_DAEMON:
+                    return True, "daemon role is master"
+                if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
+                    return True, "env CYS_ROLE=master"      # 종전 판정이 이미 허용 — 새 허용 아님
+                _role2, _src2 = _rm.confirm_role_detail()
+                if _src2 == _rm.SOURCE_DAEMON and _role2.strip().lower() == "master":
+                    return True, "daemon role is master (confirmed)"
+                if _rm.is_authoritative(_src2) and _role2.strip().lower() != "master":
+                    return False, "daemon role is not master"
         except Exception:
             pass          # 해소 실패는 이 게이트를 열지도 닫지도 않는다
     if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
