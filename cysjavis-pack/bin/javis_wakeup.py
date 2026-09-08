@@ -61,6 +61,10 @@ import javis_scrub  # ★G2: 원장 기록 직전 비밀 마스킹(같은 폴더
 ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()  # 개인경로 하드코딩 금지(pack scan gate) — env 또는 CWD(워크스페이스 루트에서 호출)
 WK_DIR = os.path.join(ROOT, "_round", "wakeups")
 PENDING_DIR = os.path.join(WK_DIR, "pending")
+# ★(0.14.31 · triage 2026-09-08 · codex major M10) 데몬이 `durable=false`(큐 WAL 저장 실패)로
+#   답한 배달의 **보관소**. pending 에서 빼되(다음 drain 이 다시 보내면 큐에 멱등 키가 없어
+#   중복 배달 = 폭주 ①) 버리지도 않는다 — 원본 레코드를 여기 남겨 사후 재투입이 가능하게 한다.
+UNCONFIRMED_DIR = os.path.join(WK_DIR, "unconfirmed")
 LEDGER = os.path.join(WK_DIR, "queue.jsonl")
 
 EXIT_OK, EXIT_USAGE, EXIT_EMPTY = 0, 2, 5
@@ -344,6 +348,36 @@ def cmd_enqueue(a):
 
 
 # javis_snapshot 소비 — 리네임 시 동반 수정
+def _durable_verdict(cp):
+    """`cys send --queued` 출력에서 내구 표식을 읽는다 — True(내구) · False(미확정) · None(미상).
+
+    구 데몬·구 CLI 는 이 표식을 **아예 내지 않는다**(키 부재 = 스큐). 그때 `None` 을 돌려
+    종전 동작(삭제)을 유지한다 — '부재 ≠ 부정'. 표식이 있고 false 일 때만 보관 경로로 간다.
+    """
+    out = getattr(cp, "stdout", None) or ""
+    err = getattr(cp, "stderr", None) or ""
+    blob = f"{out}\n{err}".lower()
+    if "durable=false" in blob:
+        return False
+    if "durable=true" in blob:
+        return True
+    return None
+
+
+def _park_unconfirmed(path, rec):
+    """내구 미확정 배달의 원본을 `unconfirmed/` 로 옮긴다. 반환 = 보관 경로(원장 기록용)."""
+    # 경로는 **호출 시점의** WK_DIR 에서 파생한다(검체 하네스가 WK_DIR 을 스크래치로 갈아끼운다).
+    parked_dir = os.path.join(WK_DIR, "unconfirmed")
+    os.makedirs(parked_dir, exist_ok=True)
+    dest = os.path.join(parked_dir, f"{_safe(rec.get('id') or 'w')}.json")
+    try:
+        os.replace(path, dest)
+    except OSError:
+        # 이동 실패는 삭제로 접지 않는다 — 원본을 그 자리에 두는 편이 유실보다 낫다.
+        return path
+    return dest
+
+
 def _iter_pending():
     if not os.path.isdir(PENDING_DIR):
         return []
@@ -539,7 +573,18 @@ def cmd_drain(a):
             if alive == "unknown":
                 print(f"warn: {target} 생존 미확인 상태로 배달 시도", file=sys.stderr)
             try:
-                subprocess.run(cmd, check=True, timeout=15)
+                # ★(triage 2026-09-08 · codex major M10) 출력을 **읽는다**. `cys send --queued` 는
+                #   데몬의 `durable:false`(큐 WAL 저장 실패)를 stdout 조각 `· durable=false` 와
+                #   stderr 경고로만 알리고 **exit 0** 이다(항목은 메모리 큐에 있고 다음 틱이 재시도
+                #   하므로 비0 은 중복 배달을 부른다 — CLI 쪽 설계는 타당하다). 종전에는 소비자가
+                #   반환코드만 보고 성공으로 처리해 원본 pending 을 즉시 지웠다: 데몬이 WAL 재시도
+                #   전에 죽으면 그 wakeup 은 **양쪽 어디에도 없다**(메시지 유실).
+                cp = subprocess.run(cmd, check=True, timeout=15,
+                                    capture_output=True, text=True)
+                durable = _durable_verdict(cp)
+                # 캡처했으므로 사람이 보던 문면을 그대로 흘려 준다(관측 손실 0).
+                sys.stdout.write(getattr(cp, "stdout", None) or "")
+                sys.stderr.write(getattr(cp, "stderr", None) or "")
                 if _load_failcount().get(target):
                     _bump_failcount(target, reset=True)  # 성공 = 연속실패 해소
             except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
@@ -565,10 +610,24 @@ def cmd_drain(a):
                           file=sys.stderr)
                 continue
         else:
+            durable = None
             # digest 본문은 여러 줄이라 그대로 찍으면 DRYRUN 이 N 줄이 된다 — **표시만** 1줄로
             # 접는다(실제 배달 인자는 원문 그대로). W-id 는 전부 리터럴로 남는다.
             print("DRYRUN:", " ".join(cmd[:-1] + [cmd[-1].replace("\n", "\\n")]))
         for path, rec in items:
+            if a.deliver and durable is False:
+                # 내구 미확정 — 원본을 **보관**하고 원장에 사실을 남긴다(pending 에는 두지 않는다:
+                # 다음 drain 이 다시 보내면 큐에 멱등 키가 없어 중복 배달이 된다).
+                parked = _park_unconfirmed(path, rec)
+                _ledger_append({"event": "delivered_unconfirmed", "target": target,
+                                "wakeup_id": rec["id"], "durable": False,
+                                "queue_entry_id": None, "parked": parked,
+                                "why": "데몬이 큐 WAL 저장에 실패했다(durable=false) — 데몬이 "
+                                       "재시도 전에 죽으면 이 wakeup 은 유실된다"})
+                print(f"warn: 내구 미확정 배달 — 원본 보관: {rec['id']} → {parked}",
+                      file=sys.stderr)
+                delivered += 1
+                continue
             os.remove(path)
             _ledger_append({"event": "delivered" if a.deliver else "delivered_dryrun",
                             "target": target, "wakeup_id": rec["id"]})

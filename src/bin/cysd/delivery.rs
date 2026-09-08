@@ -368,8 +368,24 @@ pub fn record_queue_tombstones(
     if entries.is_empty() {
         return true;
     }
-    let recs: Vec<Value> =
-        entries.iter().map(|e| queue_tombstone_row(surface_id, e, reason, at)).collect();
+    // ★(0.14.31 · triage 2026-09-08 · codex) 묘비 줄에 **디렉터리 내구화 가능 여부**를 싣는다 —
+    //   삭제 허가의 근거가 되는 줄이므로, 그 줄이 담긴 파일 이름 자체가 내구화되지 못하는
+    //   환경이면 사후 대조에서 그것을 읽을 수 있어야 한다(침묵 금지 · 값은 쓰기 **전** 관측이라
+    //   `Failed` 는 여기 없다 — 그 경우 이 함수는 false 를 돌려주고 아무것도 지우지 않는다).
+    let dir_synced = ledger_path(&daemon.socket_path)
+        .parent()
+        .map(dir_sync_supported)
+        .unwrap_or(false);
+    let recs: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let mut r = queue_tombstone_row(surface_id, e, reason, at);
+            if let Some(o) = r.as_object_mut() {
+                o.insert("dir_synced".into(), Value::Bool(dir_synced));
+            }
+            r
+        })
+        .collect();
     append_side_records(daemon, surface_id, Origin::QueueTombstone, &recs)
 }
 
@@ -438,7 +454,28 @@ fn append_side_records(
         //   묘비가 '기존 파일' 로 판정돼 그 엔트리가 영영 내구화되지 않는다(codex 반례). 값은
         //   fsync 한 번이고, 이 경로는 영수증(≥10s 간격)·묘비(배치 1회)뿐이라 유계다.
         Outcome::Recorded | Outcome::Blank => match p.parent().map(sync_dir) {
-            Some(Err(e)) => fail(format!("원장 디렉터리 sync 실패: {e}")),
+            Some(Err(DirSyncMiss::Failed(e))) => fail(format!("원장 디렉터리 sync 실패: {e}")),
+            // ★(triage 2026-09-08) 불가 환경은 삭제를 막지 않는다(가용성) — 대신 **그 사실을
+            //   이벤트로 낸다**. 이 배치의 id 를 함께 실어 사후 대조가 가능하게 한다(침묵 금지).
+            Some(Err(m @ DirSyncMiss::Unsupported(_))) => {
+                daemon.bus.publish(
+                    "delivery.dir_sync_unsupported",
+                    "system",
+                    Some(surface_id),
+                    json!({
+                        "origin": origin.as_str(),
+                        "path": p.display().to_string(),
+                        "why": m.to_string(),
+                        "queue_entry_ids": recs
+                            .iter()
+                            .filter_map(|r| r["queue_entry_id"].as_str())
+                            .collect::<Vec<_>>(),
+                        "hint": "파일은 fsync 했으나 디렉터리 엔트리는 내구화하지 못했다 — \
+                                 이 줄들은 묘비에 dir_synced:false 로도 실려 있다",
+                    }),
+                );
+                true
+            }
             _ => true,
         },
         Outcome::Failed(why) => fail(why),
@@ -452,25 +489,57 @@ fn ledger_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 디렉터리 엔트리 내구화(unix).
+/// ★(0.14.31 · triage 2026-09-08 · codex) 디렉터리 내구화의 **3값** — `Ok(())` = Durable.
 ///
-/// 【열지 못하면 건너뛴다 · 열고 나서 실패하면 실패다】 디렉터리 핸들을 **열 수 없는** 환경
-/// (일부 파일시스템·권한)에서 그것을 실패로 치면 묘비가 영영 성공하지 못해 만료 큐가 무한히
-/// 자란다(차단이 새 가용성 구멍이 되는 형태). 그때의 보장은 0.14.30 과 같다. 반면 **열었는데
-/// fsync 가 실패**한 것은 진짜 내구성 실패이므로 삭제를 허가하지 않는다(항목 보존).
-#[cfg(unix)]
-fn sync_dir(d: &Path) -> std::io::Result<()> {
-    match std::fs::File::open(d) {
-        Ok(f) => f.sync_all(),
-        Err(_) => Ok(()), // 디렉터리 핸들 불가 — 이 축 없음(종전 보장)
+/// 종전에는 `File::open` 실패를 전부 `Ok(())` 로 접었다(= 성공). 가용성 논거 자체는 타당하다
+/// (핸들을 못 여는 환경에서 실패로 치면 묘비가 영영 성공하지 못해 만료 큐가 무한히 자란다).
+/// 틀린 것은 **그 사실을 성공과 구별하지 않은 것**이다 — 호출부는 반환값을 "삭제해도 된다" 로
+/// 소비하므로, 쓰기·탐색만 되고 읽기가 막힌 디렉터리(0o333)에서는 이름이 내구화되지 않은 채
+/// 삭제가 허가되고 전원 단절 시 항목과 묘비가 함께 사라진다. 지금은 갈라서 돌려준다:
+/// `Unsupported` 는 삭제를 막지 않되 **침묵하지 않고**(이벤트로 드러난다), `Failed` 는 막는다.
+#[derive(Debug)]
+pub(crate) enum DirSyncMiss {
+    /// 디렉터리 핸들을 열 수 없다 — 이 축이 없는 환경(종전 0.14.30 과 같은 보장).
+    Unsupported(String),
+    /// 열었는데 fsync 가 실패했다 — 진짜 내구성 실패(삭제 불허 · 항목 보존).
+    Failed(String),
+}
+
+impl std::fmt::Display for DirSyncMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DirSyncMiss::Unsupported(e) => write!(f, "디렉터리 핸들 불가: {e}"),
+            DirSyncMiss::Failed(e) => write!(f, "디렉터리 fsync 실패: {e}"),
+        }
     }
 }
 
-/// Windows: 디렉터리 핸들 open 이 불가하므로 축 자체가 없다(종전 동작 유지 · 노트 잔여 —
-/// "파일 flush 와 이름 변경의 전원 장애 내구성은 별개이고 후자는 미검증" 이 정직한 서술이다).
+/// 이 디렉터리에 **핸들을 열 수 있는가**(= 내구화 축이 존재하는가). fsync 는 하지 않는다 —
+/// 묘비 줄의 `dir_synced` 표기용 사전 관측이다.
+#[cfg(unix)]
+fn dir_sync_supported(d: &Path) -> bool {
+    std::fs::File::open(d).is_ok()
+}
+
 #[cfg(not(unix))]
-fn sync_dir(_d: &Path) -> std::io::Result<()> {
-    Ok(())
+fn dir_sync_supported(_d: &Path) -> bool {
+    false
+}
+
+/// 디렉터리 엔트리 내구화(unix). `Ok(())` 는 **실제로 fsync 했다**는 뜻뿐이다.
+#[cfg(unix)]
+fn sync_dir(d: &Path) -> Result<(), DirSyncMiss> {
+    match std::fs::File::open(d) {
+        Ok(f) => f.sync_all().map_err(|e| DirSyncMiss::Failed(e.to_string())),
+        Err(e) => Err(DirSyncMiss::Unsupported(e.to_string())),
+    }
+}
+
+/// Windows: 디렉터리 핸들 open 이 불가하므로 축 자체가 없다 — **`Unsupported`** 다(종전 동작
+/// 유지: 삭제를 막지 않는다). 종전에는 이것이 `Ok` 여서 "내구화했다" 와 구별되지 않았다.
+#[cfg(not(unix))]
+fn sync_dir(_d: &Path) -> Result<(), DirSyncMiss> {
+    Err(DirSyncMiss::Unsupported("windows: 디렉터리 핸들 flush 불가".into()))
 }
 
 /// `record` 의 결과 — 종전 `bool` 은 "공백이라 안 씀"과 "쓰려다 실패"를 같은 false 로 뭉쳐서
@@ -677,6 +746,32 @@ fn append_lines(p: &Path, recs: &[Value]) -> Outcome {
     append_lines_opt(p, recs, false)
 }
 
+/// 원장 파일의 **마지막 바이트가 개행인가**(빈 파일은 참). 읽지 못하면 거짓으로 접는다 —
+/// 그때 대가는 빈 줄 하나이고, 반대로 접으면 판독 불가한 줄이 생긴다(비대칭이 분명하다).
+fn ledger_tail_is_newline(p: &Path, f: &std::fs::File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    if len == 0 {
+        return true;
+    }
+    // append 핸들은 읽기 권한이 없다 — 별도 읽기 핸들로 꼬리 1바이트만 본다.
+    let mut rf = match std::fs::File::open(p) {
+        Ok(x) => x,
+        Err(_) => return false,
+    };
+    if rf.seek(SeekFrom::Start(len - 1)).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    match rf.read_exact(&mut b) {
+        Ok(()) => b[0] == b'\n',
+        Err(_) => false,
+    }
+}
+
 fn append_lines_opt(p: &Path, recs: &[Value], durable: bool) -> Outcome {
     if recs.is_empty() {
         return Outcome::Recorded;
@@ -685,7 +780,18 @@ fn append_lines_opt(p: &Path, recs: &[Value], durable: bool) -> Outcome {
         Ok(f) => f,
         Err(e) => return Outcome::Failed(format!("원장 open 실패({}): {e}", p.display())),
     };
+    // ★(0.14.31 · triage 2026-09-08 · codex blocking) **경계 복구.** `write_all` 은 짧은 쓰기
+    //   (ENOSPC·EIO)에서 **이미 쓴 바이트를 되돌리지 않는다** — 즉 직전 시도가 줄 중간에서
+    //   끊겼을 수 있다. 그 조각에 다음 줄을 이어 붙이면 첫 줄이 `부분 JSON + 완전 JSON` 이 되어
+    //   **판독 불가**가 되는데, 반환은 성공이라 호출부가 그 배치를 지운다("원장 없는 삭제는
+    //   하지 않는다" 는 불변이 그 항목에서 깨진다 · 종전 doc 의 "append 는 한 번의 write 이므로
+    //   부분 기록이 원리상 없다" 는 사실오류였다). 그래서 꼬리가 개행이 아니면 **개행을 먼저**
+    //   쓴다. 빈 줄은 모든 판독기가 건너뛰므로(줄 단위 JSON) 무해하고, 읽지 못하는 경우에도
+    //   개행을 쓰는 쪽으로 접는다(이어붙임보다 빈 줄이 싸다).
     let mut buf = String::new();
+    if !ledger_tail_is_newline(p, &f) {
+        buf.push('\n');
+    }
     for rec in recs {
         let mut line = rec.to_string();
         line.push('\n');

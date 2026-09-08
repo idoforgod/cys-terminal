@@ -593,13 +593,19 @@ pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 ///     §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다"). 종전 가드에는 이 축이 없어서,
 ///     writer 가 적체된 800ms 사이에 승인 feed 가 늘어도(출력 세대는 그대로) 본문이 나갔다.
 ///
-/// 【핸드셰이크】 상태는 넷이다: 0 pending · 1 claimed(writer 가 쓰기로 정했다) · 2 aborted
-/// (아무도 쓰지 않는다) · 3 acked(호출부가 claimed 를 **수확**했다 = 되돌릴 수 없다).
+/// 【핸드셰이크】 상태는 다섯이다: 0 pending · **4 claiming(writer 가 소유권을 집고 재검사 중)** ·
+/// 1 claimed(재검사까지 끝나 쓰기로 정했다) · 2 aborted(아무도 쓰지 않는다) · 3 acked(호출부가
+/// claimed 를 **수확**했다 = 되돌릴 수 없다).
 ///   · writer: ⓐ 두 축을 읽어 하나라도 움직였으면 CAS(0→2)로 중단하고 **한 바이트도 쓰지 않는다**
-///     ⓑ 같으면 CAS(0→1)로 소유권을 집고 ⓒ **집은 뒤 다시 한 번** 두 축을 읽는다 — 그 사이에
-///     움직였으면 CAS(1→2)('늦은 중단')를 시도한다. 이것이 codex 지적("세대 load 와 CAS 는 한
-///     원자 연산이 아니다")에 대한 답이다: 남는 창은 ⓑ와 ⓒ 사이 수 ns 이고, 그 창조차 호출부가
-///     아직 수확하지 않았으면 늦은 중단이 잡는다.
+///     ⓑ 같으면 CAS(0→**4**)로 소유권을 집고 ⓒ **집은 뒤 다시 한 번** 두 축을 읽는다 — 그 사이에
+///     움직였으면 CAS(4→2)('늦은 중단'), 그대로면 CAS(4→1)로 확정한다.
+///   ★(triage 2026-09-08 · codex blocking) ⓑ가 종전에 `CLAIMED` 를 **곧바로** 세웠던 것이 결함이다:
+///     ⓒ의 재검사는 승인 탐침(데몬 락 + 스캔)이라 짧지 않은데, 그 창에서 호출부가 `CLAIMED` 를
+///     수확(`ACKED`)하면 늦은 중단 CAS 가 실패해 **승인·모달이 뜬 화면에도 본문+CR 이 나갔다**.
+///     `CLAIMING` 은 "안전 판정 완료 · 쓰기 권한 · 배달 보고" 를 분리한다 — 재검사가 끝나기
+///     전에는 아무도 수확하지 못하므로 늦은 중단이 항상 성립한다. 남는 창은 ⓒ의 마지막 탐침과
+///     첫 바이트 사이뿐이고(그 창은 어떤 설계로도 남는다 — 락을 쓰기까지 쥐지 않는 한),
+///     그 창의 귀결은 종전과 같다(노트 잔여).
 ///   · 호출부: 인계 뒤 락을 놓고 유계 대기([`INJECT_GUARD_WAIT_MS`])로 결판을 본다. `CLAIMED` 를
 ///     보면 CAS(1→3)로 **수확**하고 그 뒤부터 늦은 중단은 성립하지 않는다(수확한 배달은 반드시
 ///     쓰인다 = 보고된 배달이 사라지지 않는다). 아직 pending 이면 스스로 CAS(0→2)로 중단시킨다 —
@@ -638,6 +644,12 @@ pub const INJECT_CLAIMED: u8 = 1;
 pub const INJECT_ABORTED: u8 = 2;
 /// 호출부가 `CLAIMED` 를 수확했다 — 이 뒤로 writer 의 늦은 중단은 성립하지 않는다.
 pub const INJECT_ACKED: u8 = 3;
+/// ★(0.14.31 · triage 2026-09-08 · codex blocking) **재검사 중** — writer 가 소유권을 집었으나
+/// 안전 재검사(승인 탐침)를 아직 끝내지 않았다. 이 상태는 **수확 대상이 아니다**(호출부는 계속
+/// 기다린다) — 그래야 "ACK 가 늦은 중단을 무력화한다" 는 결함이 자리 자체를 잃는다.
+/// 처분자·호출부는 이 상태를 `ABORTED` 로 되돌릴 수 있고, 그때 writer 의 확정 CAS 가 실패해
+/// **한 바이트도 쓰이지 않는다**(§3-3 보류 방향).
+pub const INJECT_CLAIMING: u8 = 4;
 
 /// 호출부가 writer 의 결판을 기다리는 상한(ms). writer 는 큐 배달 좌석에서 사실상 항상 유휴
 /// (배달 최소 간격 10s)라 평시 수십 µs 안에 결판난다. 값을 800 으로 둔 이유: writer 가 **직전
@@ -666,13 +678,28 @@ impl InjectGuard {
     fn output_moved(&self) -> bool {
         self.expect_gen.is_some_and(|g| self.output_gen.load(Ordering::Acquire) != g)
     }
-    /// 두 축 중 하나라도 움직였는가(승인 탐침 포함 — writer 만 쓴다).
+    /// 두 축 중 하나라도 **주입을 막는가**(승인 탐침 포함 — writer 만 쓴다).
+    ///
+    /// ★(0.14.31 · triage 2026-09-08 · codex blocking) 승인 축은 종전에 **변화**만 봤다
+    /// (`p() != expect_approval`). 그래서 판정 뒤 다시 읽은 "지금 승인 대기 중"(`expect_approval
+    /// == true`)이 **정상 기대값**으로 채택되면, 승인이 계속 대기 중이어도 축이 움직이지 않아
+    /// writer 가 본문+CR 을 그대로 썼다 — 승인 창에 Return 을 넣는 것이 정본 §8("승인 대기
+    /// 게이트는 어떤 경로에서도 면제되지 않는다")이 금지한 바로 그 동작이다.
+    ///
+    /// 지금은 **절대 거부**다: `지금 승인 대기 = 거부` ∨ `판정이 승인을 봤다 = 거부`
+    /// (= `now || expect_approval`). 두 번째 항이 남는 이유는 종전 핀 그대로다 — 판정이 본 재료가
+    /// 사라지는 것도 변화이고, 그 판정은 이미 무효다. 탐침이 없으면(`None` = 검체 전용) 이 축은
+    /// 없다(종전과 같다).
     fn axes_moved(&self) -> bool {
         if self.output_moved() {
             return true;
         }
         match &self.approval {
-            Some(p) => p() != self.expect_approval,
+            // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
+            Some(p) => {
+                let now = p();
+                now || self.expect_approval
+            }
             None => false,
         }
     }
@@ -692,26 +719,35 @@ impl InjectGuard {
         }
         match self.state.compare_exchange(
             INJECT_PENDING,
-            INJECT_CLAIMED,
+            INJECT_CLAIMING,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                // ★소유권을 집은 **뒤** 마지막 재확인 — load 와 CAS 사이의 창(수 ns)을 닫는다.
-                //   호출부가 아직 수확하지 않았을 때만 늦은 중단이 성립한다(수확 뒤엔 쓴다).
+                // ★소유권을 집은 **뒤** 마지막 재확인. 이 구간의 상태는 `CLAIMING` 이라 호출부가
+                //   수확할 수 없다 = 늦은 중단이 언제나 성립한다(triage codex blocking).
                 if self.axes_moved() {
-                    return !matches!(
-                        self.state.compare_exchange(
-                            INJECT_CLAIMED,
-                            INJECT_ABORTED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ),
-                        Ok(_)
+                    // 중단 확정. 그 사이 처분자가 먼저 `ABORTED` 로 바꿨어도 결론은 같다.
+                    let _ = self.state.compare_exchange(
+                        INJECT_CLAIMING,
+                        INJECT_ABORTED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
                     );
+                    return false;
                 }
-                true
+                // 재검사 통과 — 이제야 쓰기 확정을 **공개**한다. 그 사이 처분자·호출부가
+                // `ABORTED` 로 바꿨으면 그 결정을 따른다(주입 0 · 항목 보존).
+                self.state
+                    .compare_exchange(
+                        INJECT_CLAIMING,
+                        INJECT_CLAIMED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
             }
+            // 이미 수확·확정된 배달은 반드시 쓴다(보고된 배달이 사라지지 않는다 — 기존 핀).
             Err(cur) => cur == INJECT_CLAIMED || cur == INJECT_ACKED,
         }
     }
@@ -720,15 +756,22 @@ impl InjectGuard {
     /// 된다). false = writer 가 이미 쓰기로 확정했다 → 그 항목은 **배달 중**이므로 처분하지 않는다
     /// (폐기 통지 뒤 실제 주입 = 승인·빈 좌석 사고로 이어지는 방향이라 그쪽을 택하지 않는다).
     pub fn abort_if_pending(&self) -> bool {
-        match self.state.compare_exchange(
-            INJECT_PENDING,
-            INJECT_ABORTED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => true,
-            Err(cur) => cur == INJECT_ABORTED,
+        // ★(triage 2026-09-08) `CLAIMING`(writer 가 재검사 중)도 취소 대상이다 — 그 상태의 writer 는
+        //   아직 확정을 공개하지 않았고, 여기서 이기면 writer 의 확정 CAS 가 실패해 한 바이트도
+        //   나가지 않는다. 취소 창이 넓어지는 방향이고(= 처분이 더 자주 성립) 귀결은 보류다.
+        for from in [INJECT_PENDING, INJECT_CLAIMING] {
+            match self.state.compare_exchange(
+                from,
+                INJECT_ABORTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(cur) if cur == INJECT_ABORTED => return true,
+                Err(_) => continue,
+            }
         }
+        self.state.load(Ordering::Acquire) == INJECT_ABORTED
     }
     /// `CLAIMED` 를 **수확**한다 — 성공하면 `INJECT_CLAIMED`, 그 사이 writer 가 늦게 중단했으면
     /// 그 값(`INJECT_ABORTED`)을 돌려준다.
@@ -759,6 +802,9 @@ impl InjectGuard {
         loop {
             match self.state.load(Ordering::Acquire) {
                 INJECT_PENDING => {}
+                // ★(triage 2026-09-08) writer 가 재검사 중이다 — **아직 미결판**이므로 기다린다.
+                //   여기서 수확하면 늦은 중단이 무력화된다(그 결함의 자리다).
+                INJECT_CLAIMING => {}
                 INJECT_CLAIMED => return self.ack(),
                 // 이미 수확된 결판을 다시 물으면 같은 답을 준다(멱등 — 반환 계약은 두 값뿐이다).
                 INJECT_ACKED => return INJECT_CLAIMED,
@@ -772,16 +818,46 @@ impl InjectGuard {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        match self.state.compare_exchange(
-            INJECT_PENDING,
-            INJECT_ABORTED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => INJECT_ABORTED,
-            Err(INJECT_CLAIMED) => self.ack(),
-            Err(INJECT_ACKED) => INJECT_CLAIMED,
-            Err(other) => other,
+        // ★반환 계약은 **두 값뿐**이다(`CLAIMED` 또는 `ABORTED`) — 호출부는 "ABORTED 가 아니면
+        //   배달됐다" 로 읽고 큐에서 뺀다(`governance::deliver_head_locked`). `CLAIMING` 을 그대로
+        //   돌려주면 쓰이지도 않은 항목이 큐에서 사라진다(유실). 그래서 미결판 상태는 여기서
+        //   **중단으로 확정**하고, 그 사이 writer 가 확정을 공개했으면 그것을 수확한다.
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                INJECT_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            INJECT_PENDING,
+                            INJECT_ABORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return INJECT_ABORTED;
+                    }
+                }
+                INJECT_CLAIMING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            INJECT_CLAIMING,
+                            INJECT_ABORTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return INJECT_ABORTED;
+                    }
+                }
+                INJECT_CLAIMED => return self.ack(),
+                INJECT_ACKED => return INJECT_CLAIMED,
+                INJECT_ABORTED => return INJECT_ABORTED,
+                // 미지 상태는 **보류 방향**으로 접는다(주입 0 · 항목 보존).
+                _ => return INJECT_ABORTED,
+            }
         }
     }
 }

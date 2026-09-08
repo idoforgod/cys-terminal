@@ -4920,6 +4920,12 @@ pub(crate) const BLOCKED_PROMPT_UNKNOWN: &str = "prompt_unknown(프롬프트 경
 pub(crate) const BLOCKED_PROMPT_NOT_READY: &str = "prompt_not_ready(프롬프트 경계 미도달)";
 pub(crate) const BLOCKED_ALT_SCREEN: &str = "alt_screen(전체화면 · 프롬프트 레이아웃 미확인)";
 pub(crate) const BLOCKED_INTERVAL: &str = "delivery_interval(배달 최소 간격)";
+/// ★(0.14.31 · triage 2026-09-08 · #7 의 값싼 부분) 이 틱의 인계 결판 예산이 바닥났다 —
+/// **원장 선기록·writer 인계를 시작하기 전에** 건너뛴다. 종전에는 예산이 0 이어도 좌석마다
+/// 선기록(fsync 동반)과 `try_send` 가 먼저 돌고 `settle` 단계에서야 예산을 봤다 = 영수증 없는
+/// 원장 줄이 매 틱 쌓였다. 이 보류는 다음 틱에 스스로 풀린다(기아 집계 제외).
+pub(crate) const BLOCKED_SETTLE_BUDGET: &str =
+    "settle_budget(이 틱의 인계 결판 예산 소진 — 다음 틱이 이 좌석부터 시작한다)";
 
 pub(crate) fn prompt_gate_verdict(i: &PromptGateInput) -> PromptGate {
     // ★(0.14.31 · 리뷰 R5 · codex major) **발행 중 프레임은 어느 경로에서도 판정 재료가 아니다.**
@@ -5432,27 +5438,31 @@ struct InflightInject {
 }
 
 /// 인계 가드가 **중단**으로 결판났을 때의 되돌림 — 화면에는 한 바이트도 나가지 않았다.
-///   ① 항목을 활성 큐 머리로 순서 그대로 복원(id 중복은 넣지 않는다 — 그 사이 다른 경로가
-///      되살렸을 수 있다). §8("만료 항목을 활성 큐 머리에 두지 않는다")은 지켜진다: 이 항목들은
-///      인계 직전 임계영역에서 만료 아님으로 확인된 것들이고, 그 뒤 만료되면 다음 틱 스윕이 뺀다.
-///   ② `pending_input_bytes`·`last_queue_delivery_at` 을 인계 직전 값으로 되돌린다(쓰이지 않은
+///   ① `pending_input_bytes`·`last_queue_delivery_at` 을 인계 직전 값으로 되돌린다(쓰이지 않은
 ///      배달이 입력줄 계수와 간격 시계를 움직여선 안 된다).
-///   ③ `queue.inject_aborted` 발행 — 침묵 금지(운영자·재측정이 이 사건을 사유별로 센다).
+///   ② `queue.inject_aborted` 발행 — 침묵 금지(운영자·재측정이 이 사건을 사유별로 센다).
 ///      원장에는 **선기록만** 남고 영수증이 없다 = "인계 불명 배달" 로 이미 관측 가능하다.
+///
+/// ★(0.14.31 · triage 2026-09-08 · claude/codex blocking) **항목을 되살리지 않는다.**
+/// 종전에는 `f.entries` 를 "활성 큐에 그 id 가 없으면" 큐 **머리**로 밀어 넣었다. 그 조건은
+/// 처분 결과·만료 큐·묘비를 하나도 보지 않으므로, 결판을 기다리는 동안 처분자(`queue.clear`·
+/// 좌석 종료·TTL 스윕·`queue.drop`)가 **폐기하고 묘비를 남긴** 항목이 그대로 되살아났다 —
+/// 운영자에게 폐기를 통지한 문장이 다음 틱에 실제로 주입되고(§3-3 반대 방향), TTL 판에서는
+/// 같은 id 가 활성·만료 **양쪽**에 존재해 `queue.revive` 가 중복 배달을 만들었다(§8 위반).
+/// R2 이후 항목은 결판 전에 큐에서 **빠지지 않으므로** 되살릴 것이 애초에 없다: 살아 있으면
+/// 그대로 있고, 없으면 누군가 정당하게 처분한 것이다(그 사실은 아래 이벤트가 싣는다).
 fn rollback_aborted_inject(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     f: &InflightInject,
     delivered: &Delivered,
 ) {
-    {
-        let mut q = s.pending_queue.lock().unwrap();
+    let (still_queued, disposed) = {
+        let q = s.pending_queue.lock().unwrap();
         let _gate = s.input_gate.lock().unwrap();
-        for e in f.entries.iter().rev() {
-            if !q.iter().any(|x| x.id == e.id) {
-                q.push_front(e.clone());
-            }
-        }
+        // ★(triage codex 보완) 예약 해제도 **이 임계영역 안에서** — 종전에는 호출부가 먼저 풀고
+        //   그 뒤 여기서 표식을 되돌려, 그 사이 새 인계가 시작되면 롤백이 남의 상태를 되돌렸다.
+        *s.inject_reservation.lock().unwrap() = None;
         // ★(리뷰 R1 · codex A2-iv) 되돌림은 **내가 쓴 값이 그대로일 때만** — 결판을 기다리는
         //   동안 사람이 치거나 다른 주입이 있었다면 그 사실이 최신이고, 옛 값으로 덮으면 그것이
         //   곧 새 오류다(입력줄 점유를 잘못 알면 큐 본문이 사람 문장과 합쳐진다).
@@ -5461,13 +5471,37 @@ fn rollback_aborted_inject(
         {
             s.set_pending_input(f.prev_pending);
         }
-    }
+        let mut alive: Vec<String> = Vec::new();
+        let mut gone: Vec<String> = Vec::new();
+        for e in &f.entries {
+            if q.iter().any(|x| x.id == e.id) {
+                alive.push(e.id.clone());
+            } else {
+                gone.push(e.id.clone());
+            }
+        }
+        (alive, gone)
+    };
     {
         let mut t = s.last_queue_delivery_at.lock().unwrap();
         if *t == f.set_delivery_at {
             *t = f.prev_delivery_at;
         }
     }
+    // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
+    //   말했고(그 재삽입 자체가 결함이었다) `why` 는 출력 세대 하나로 단정했다. 지금은 세 갈래를
+    //   가른다: 화면이 흘렀나 · 처분자가 가져갔나 · 그 밖(승인 대기·마감).
+    let gen_moved = f.guard.as_ref().is_some_and(|g| {
+        g.expect_gen.is_some_and(|e| g.output_gen.load(Ordering::Acquire) != e)
+    });
+    let why = if !disposed.is_empty() {
+        "disposed_while_inflight(결판을 기다리는 동안 처분자가 그 항목을 폐기·묘비했다 — \
+         되살리지 않는다)"
+    } else if gen_moved {
+        "output_gen_moved(판정이 본 프레임이 아니다 — writer 가 쓰기 전에 화면이 바뀌었다)"
+    } else {
+        "guard_aborted(승인·관문 대기 또는 결판 마감 — 판정 재료가 더는 유효하지 않다)"
+    };
     daemon.bus.publish(
         "queue.inject_aborted",
         "queue",
@@ -5476,10 +5510,12 @@ fn rollback_aborted_inject(
             "surface_ref": cys::surface_ref(s.id),
             "queue_entry_id": delivered.entry.id,
             "merged_ids": delivered.merged_ids,
-            "restored": f.entries.len(),
-            "why": "output_gen_moved(판정이 본 프레임이 아니다 — writer 가 쓰기 전에 화면이 바뀌었다)",
-            "hint": "주입 0 · 항목은 큐 머리에 그대로 있다(다음 틱 재시도). 잦으면 그 좌석의 \
-                     출력이 판정 창 안에서 계속 흐른다는 뜻이다",
+            // 되살린 수가 아니라 **지금 큐에 남아 있는 수**다(재삽입 없음).
+            "still_queued": still_queued.len(),
+            "disposed_ids": disposed,
+            "why": why,
+            "hint": "주입 0 · 항목은 큐에 그대로 있다(다음 틱 재시도). 처분됐으면 그 항목은 \
+                     묘비와 함께 정당하게 폐기된 것이며 되살리지 않는다",
         }),
     );
     daemon.persist_queue_state();
@@ -5678,7 +5714,16 @@ pub(crate) fn deliver_head_locked(
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
             break 'tx None;
         }
-        let approval_now = approval_or_gate_pending(daemon, s.id);
+        // ★(0.14.31 · triage 2026-09-08 · codex blocking) 마지막 게이트 **뒤에** 승인이 생겼으면
+        //   그 사실을 가드의 '정상 기대값' 으로 채택하지 않는다 — 종전에는 그 값이 그대로
+        //   `expect_approval` 이 되어 승인이 계속 대기 중이어도 축이 면제됐다(§8 위반). 지금은
+        //   **배달 자체를 하지 않는다**: 항목은 큐에 그대로 남고 다음 틱이 다시 판정한다(§3-3 보류).
+        if approval_or_gate_pending(daemon, s.id) {
+            break 'tx None;
+        }
+        // 가드의 기대값은 **언제나 false**(= "승인 대기는 무조건 거부")다. 이 상수는 축을 끄는
+        // 노브가 아니라, 축이 '변화' 가 아니라 '지금 대기 중인가' 를 보게 만드는 고정점이다.
+        let approval_now = false;
         // ★(0.14.31 · 리뷰 R1 · codex blocking) **인계 가드** — writer 가 첫 바이트 앞에서 판정
         //   재료를 한 번 더 본다(판정↔쓰기 사이에 writer 가 선행 요청으로 자고 있는 창).
         //   축은 둘이고 **경로에 따라 다른 것은 출력 세대뿐**이다: 정적(quiet) 기반 판정은
@@ -5807,7 +5852,7 @@ pub(crate) fn deliver_head_locked(
             let verdict = g.settle(wait);
             spend_tick_settle_budget(t0.elapsed());
             if verdict == crate::state::INJECT_ABORTED {
-                *s.inject_reservation.lock().unwrap() = None;
+                // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
                 rollback_aborted_inject(daemon, s, &f, &delivered);
                 return None;
             }
@@ -5956,6 +6001,11 @@ fn enforce_expired_cap_budgeted(
     if candidates.is_empty() {
         return false;
     }
+    // ★(0.14.31 · triage 2026-09-08 · codex major) 예산은 "제거한 수" 가 아니라 **시도 수**로
+    //   차감한다. 종전에는 원장 기록이 실패하면 `budget` 을 한 칸도 쓰지 않고 돌아가, 디스크가
+    //   죽었을 때 상한 초과 좌석 수만큼 원장 I/O(락 대기 + append + fsync 시도)를 **매 틱** 반복
+    //   하면서 예산은 그대로였다 — watchdog 이 그만큼 묶여 뒤따르는 사망 점검·자가치유가 밀린다.
+    *budget = budget.saturating_sub(candidates.len());
     // ★(0.14.31 · 리뷰 R2 · codex major) 축출 전에 **아직 발행되지 않은 `queue.expired`** 를 먼저
     //   낸다. 종전에는 상한 축출이 통지 적재보다 먼저 돌아, 복원 만료 백로그의 첫 20건은
     //   `queue.expired` 가 **아예 생성되지 않은 채** `queue.dropped(expired_evicted)` 로만 사라졌다
@@ -5977,7 +6027,7 @@ fn enforce_expired_cap_budgeted(
     //   원장에만 축출이 남는다. **제거 직전에 다시 확인**해 그 사이 되살아난(revived_at 이 생긴)
     //   항목은 건드리지 않고, 그 사실을 이벤트로 드러낸다(원장 오기록의 유일한 관측 지점).
     let (evicted, superseded) = retain_out_of_expired(s, &candidates);
-    *budget = budget.saturating_sub(evicted.len() + superseded.len());
+    // 예산은 위에서 **시도 수**로 이미 차감했다(성공 여부와 무관 · 이중 차감 금지).
     publish_tombstone_superseded(daemon, Some(s.id), &superseded, "expired_evicted");
     if evicted.is_empty() {
         return !superseded.is_empty();
@@ -6036,17 +6086,23 @@ fn publish_tombstone_superseded(
     );
 }
 
-/// 아직 `queue.expired` 를 발행하지 않은 항목들에 대해 그 이벤트를 **지금** 낸다(축출 직전).
-/// 래치(`expired_event_sent`)는 발행 **뒤**에 세운다(리뷰 R2 · codex major).
-fn publish_pending_expired_events(
+/// 아직 `queue.expired` 를 발행하지 않은 항목들에 대해 그 이벤트를 **지금** 낸다 — 래치 갱신은
+/// 호출부가 한다(저장소가 좌석 큐냐 복원 보존소냐에 따라 다르므로). 반환 = 발행한 항목 id.
+///
+/// ★(0.14.31 · triage 2026-09-08 · codex major M7) 이 함수를 좌석에서 떼어낸 이유: 복원 보존소
+/// (`Daemon::restored_expired`) 축출에는 이 계약이 아예 없어서, 좌석이 아직 복구되지 않은 역할의
+/// 만료분은 `queue.expired` **없이** 사라졌다. 소비자(`javis_report_gate.py`)는 `queue.delivered`·
+/// `queue.expired` 만 종결로 읽으므로 그 W-id 는 영원히 inflight = TTL 마다 재enqueue(폭주 ①).
+/// 판정 분리를 만들지 않기 위해 **살아있는 경로와 같은 함수**를 쓴다.
+fn publish_expired_events_for(
     daemon: &Arc<Daemon>,
-    s: &Arc<crate::state::Surface>,
+    surface_id: u64,
+    role: Option<String>,
     entries: &[crate::state::QueueEntry],
     now: f64,
-) {
+) -> Vec<String> {
     let default_ttl = crate::state::queue_ttl_default_secs();
-    let role = s.role.lock().unwrap().clone();
-    let target_ref = cys::surface_ref(s.id);
+    let target_ref = cys::surface_ref(surface_id);
     let mut sent: Vec<String> = Vec::new();
     for e in entries {
         if e.expired_event_sent {
@@ -6055,9 +6111,21 @@ fn publish_pending_expired_events(
         let mut payload =
             crate::state::queue_expired_payload(&target_ref, role.clone(), e, now, default_ttl);
         payload["entry_ids"] = json!(wakeup_entry_ids(&e.text));
-        daemon.bus.publish("queue.expired", "queue", Some(s.id), payload);
+        daemon.bus.publish("queue.expired", "queue", Some(surface_id), payload);
         sent.push(e.id.clone());
     }
+    sent
+}
+
+/// 살아있는 좌석 판 — 발행 뒤 그 좌석 만료 큐의 래치(`expired_event_sent`)를 세운다.
+fn publish_pending_expired_events(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    entries: &[crate::state::QueueEntry],
+    now: f64,
+) {
+    let role = s.role.lock().unwrap().clone();
+    let sent = publish_expired_events_for(daemon, s.id, role, entries, now);
     if sent.is_empty() {
         return;
     }
@@ -6095,7 +6163,7 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
             by_sid.entry(it.get("surface_id").and_then(|v| v.as_u64())).or_default()
                 .push((e.order_at(), i));
         }
-        let mut picked: Vec<usize> = Vec::new();
+        let mut picked: Vec<(f64, usize)> = Vec::new();
         let mut groups: Vec<(Option<u64>, Vec<(f64, usize)>)> = by_sid.into_iter().collect();
         groups.sort_by_key(|(sid, _)| *sid);
         for (_, mut rows) in groups {
@@ -6107,13 +6175,20 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
                 a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
             });
             let over = rows.len() - QUEUE_EXPIRED_CAP;
-            picked.extend(rows.iter().take(over).map(|(_, i)| *i));
+            picked.extend(rows.iter().take(over).copied());
         }
-        picked.sort_unstable();
+        // ★(0.14.31 · triage 2026-09-08 · codex major M9) 예산 자르기는 **나이순** 위에서 한다.
+        //   종전에는 여기서 `picked.sort_unstable()`(= 파일 등장순)로 되돌린 뒤 `take(budget)` 해서,
+        //   파일이 최신→과거 순인 흔한 형상에서 **가장 오래된 것이 남고 더 최신 것이 먼저** 축출됐다
+        //   (정책과 정반대). 최종 집합은 여러 틱에 걸쳐 수렴하지만 틱 안의 순서가 틀렸다.
+        //   인덱스 정렬은 여기서 하지 않는다 — 제거는 아래에서 **id 로** 하므로 필요가 없다.
+        picked.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+        });
         picked
             .into_iter()
             .take(*budget)
-            .map(|i| {
+            .map(|(_, i)| {
                 let it = &rx[i];
                 (
                     it.get("surface_id").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -6125,8 +6200,12 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
     if candidates.is_empty() {
         return false;
     }
+    // ★(triage 2026-09-08 · codex major) 예산은 **시도 수**로 차감한다(좌석 경로와 같은 규율 —
+    //   원장이 죽어도 매 틱 같은 I/O 를 무한 반복하지 않는다).
+    *budget = budget.saturating_sub(candidates.len());
     // 묘비는 surface 별로 묶어 배치 기록한다(한 묶음 = 한 fsync · 전부 아니면 전무).
     let mut evicted: Vec<crate::state::QueueEntry> = Vec::new();
+    let mut event_sent: Vec<String> = Vec::new();
     let mut sids: Vec<u64> = candidates.iter().map(|(sid, _)| *sid).collect();
     sids.sort_unstable();
     sids.dedup();
@@ -6136,10 +6215,30 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
             .filter(|(s2, _)| *s2 == sid)
             .map(|(_, e)| e.clone())
             .collect();
+        // ★(0.14.31 · triage 2026-09-08 · codex major M7) **묘비 앞에** 만료 종결 이벤트를 낸다 —
+        //   살아있는 좌석 경로와 같은 함수·같은 순서다. 이 줄이 없으면 소비자에게 그 W-id 는
+        //   영원히 inflight 로 남아 TTL 마다 재enqueue 된다(wakeup 홍수 재발).
+        event_sent.extend(publish_expired_events_for(daemon, sid, None, &group, now));
         if crate::delivery::record_queue_tombstones(daemon, sid, &group, "expired_evicted", now) {
             evicted.extend(group);
         }
         // 실패한 묶음은 폐기하지 않는다(다음 틱 재시도).
+    }
+    // 발행 사실을 복원 행에도 반영한다 — 다음 틱이 같은 항목의 이벤트를 두 번 내지 않는다
+    // (기록 실패로 남은 항목이 그 대상이다).
+    if !event_sent.is_empty() {
+        let mut rx = daemon.restored_expired.lock().unwrap();
+        for it in rx.iter_mut() {
+            let hit = it
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| event_sent.iter().any(|s2| s2 == id));
+            if hit {
+                if let Some(o) = it.as_object_mut() {
+                    o.insert("expired_event_sent".into(), json!(true));
+                }
+            }
+        }
     }
     if evicted.is_empty() {
         return false;
@@ -6163,7 +6262,7 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
             }
         }
     }
-    *budget = budget.saturating_sub(removed.len() + superseded.len());
+    // 예산은 위에서 **시도 수**로 이미 차감했다(이중 차감 금지).
     publish_tombstone_superseded(daemon, None, &superseded, "expired_evicted");
     if removed.is_empty() {
         return !superseded.is_empty();
@@ -7224,8 +7323,20 @@ fn deliver_queued(
     //   갈린다 — check_approvals 의 env 1회 로드 규약과 동형). 큐가 전부 비면 아래 루프가
     //   먼저 continue 하므로 평시 비용은 0 이다(지연 로드).
     let mut adapters: Option<(serde_json::Value, serde_json::Value)> = None;
-    let surfaces: Vec<Arc<crate::state::Surface>> =
+    // ★(0.14.31 · triage 2026-09-08 · #7) 순회 순서를 **결정적**으로 두고(id 오름차순),
+    //   예산 소진으로 건너뛴 좌석부터 다음 틱을 시작한다(라운드로빈). 종전에는 HashMap 순서를
+    //   그대로 썼는데 그 순서는 프로세스 수명 동안 고정이라, 예산 소진이 반복되면 **언제나 같은
+    //   뒤쪽 좌석들만** 배달을 잃는다(그 좌석에서는 관측상 dead pane 이다).
+    let mut surfaces: Vec<Arc<crate::state::Surface>> =
         daemon.surfaces.lock().unwrap().values().cloned().collect();
+    surfaces.sort_by_key(|s| s.id);
+    let resume_from = QUEUE_SEAT_CURSOR.load(Ordering::Relaxed);
+    if resume_from > 0 {
+        if let Some(pos) = surfaces.iter().position(|s| s.id >= resume_from) {
+            surfaces.rotate_left(pos);
+        }
+    }
+    let mut skipped_from: Option<u64> = None;
     for s in surfaces {
         if s.exited.load(Ordering::Relaxed) {
             continue;
@@ -7241,6 +7352,18 @@ fn deliver_queued(
                 None => continue,
             }
         };
+        // ★(0.14.31 · triage 2026-09-08 · #7) 결판 예산이 바닥났으면 **원장·writer 를 건드리기
+        //   전에** 이 좌석을 건너뛴다(항목 보존 · 다음 틱이 여기서 재개). 침묵은 금지 —
+        //   사유는 남기되 기아 집계에서는 뺀다(몇 초 뒤 스스로 풀리는 보류라 만성 기아의
+        //   원인으로 기록되면 재측정을 오도한다 · BLOCKED_INTERVAL 과 같은 규율).
+        if tick_settle_budget_ms() == 0 {
+            if skipped_from.is_none() {
+                skipped_from = Some(s.id);
+            }
+            mark_queue_blocked(&s, BLOCKED_SETTLE_BUDGET);
+            alert_queue_depth_if_high(daemon, &s, depth_alerted, BLOCKED_SETTLE_BUDGET);
+            continue;
+        }
         // ★G1(W2-D BLOCKER): overdue·기아 자격의 대기 = uptime 클램프 측정(부트 직후
         // typing 가드 공백 창 봉인 — queue_head_wait_secs doc 참조).
         let head_wait =
@@ -7420,7 +7543,15 @@ fn deliver_queued(
             *s.queue_blocked.lock().unwrap() = None;
         }
     }
+    // ★(triage 2026-09-08 · #7) 다음 틱은 **예산 때문에 건너뛴 첫 좌석**부터 시작한다. 끝까지
+    //   돌았으면 커서를 지운다(0 = 처음부터) — 그래야 평시 순회가 언제나 id 순 그대로다.
+    QUEUE_SEAT_CURSOR.store(skipped_from.unwrap_or(0), Ordering::Relaxed);
 }
+
+/// ★(0.14.31 · triage 2026-09-08 · #7) 좌석 순회 재개 지점(surface id · 0 = 처음부터).
+/// 결판 예산이 바닥나 건너뛴 첫 좌석을 다음 틱의 시작점으로 삼는다 = 라운드로빈. 프로세스
+/// 전역 하나인 이유: 큐 틱은 watchdog 스레드 하나에서만 돈다(다중 데몬은 별 프로세스).
+static QUEUE_SEAT_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// ★(0.14.31 · WP-5 B-2②) stale `pending_input_bytes` 리셋 — 조건 전부 AND:
 ///   · 계수 > 0 ∧ 커서행에 마커가 있고 커서 앞이 공백뿐(화면상 빈 입력줄) ∧ 출력 정적 ≥ quiet

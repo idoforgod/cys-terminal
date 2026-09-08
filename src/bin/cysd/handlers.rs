@@ -375,8 +375,15 @@ fn migrate_seat_queue(
     next: &Arc<crate::state::Surface>,
     role: &str,
 ) {
+    // ★(0.14.31 · triage 2026-09-08 · codex blocking) 승계도 **예약 프로토콜에 참여**한다.
+    //   종전에는 활성 큐를 무조건 `drain` 해서 결판 대기 중인(예약된) 항목까지 신 좌석으로
+    //   옮겼다 — writer 가 그 뒤 쓰기로 확정하면 **구 좌석에 주입되고 신 좌석 큐에도 남아**
+    //   같은 문장이 두 번 나간다(배달자는 구 좌석 큐만 pop 한다 = 폭주 ①의 씨앗).
+    //   처분자 3경로(`clear`·TTL 스윕·`drop`)는 전부 `cancel_inject_reservation` 을 먼저 부르는데
+    //   승계만 그 규약 밖이었다. 지금은 같은 헬퍼를 쓴다: 인계를 **취소**하고, 취소에 실패한
+    //   (=이미 쓰기로 확정된) 항목만 구 좌석에 남긴다. 대기 항목은 종전대로 전부 이관된다.
     let drained: Vec<crate::state::QueueEntry> =
-        prev.pending_queue.lock().unwrap().drain(..).collect();
+        governance::drain_active_except_inflight(prev);
     if drained.is_empty() {
         return; // 이관 0건 — 이벤트도 없다(발행은 사실의 파생)
     }

@@ -8768,9 +8768,22 @@ mod seat_latch_negation_tests {
                            "composer_placeholder": "Ask Codex to do anything"});
         assert_eq!(composer_marker_of(&codex).as_deref(), Some("›"));
         assert_eq!(composer_placeholder_of(&codex).as_deref(), Some("Ask Codex to do anything"));
-        let claude = json!({"ready_marker": "❯"});
-        assert_eq!(composer_marker_of(&claude).as_deref(), Some("❯"), "claude 는 종전과 같은 값이어야 한다");
-        assert_eq!(composer_placeholder_of(&claude), None);
+        // ★(triage 2026-09-08) `ready_marker` 폴백 제거 — 그 키는 부트 judge 의 **화면 꼬리 토큰**
+        //   이라 composer 행의 글리프가 아니다(gemini 에서 그 혼동이 영구 보류를 만들었다).
+        let claude_legacy = json!({"ready_marker": "❯"});
+        assert_eq!(
+            composer_marker_of(&claude_legacy),
+            None,
+            "ready_marker 만 있는 스펙이 composer 마커를 갖게 되면 gemini 결함이 되살아난다"
+        );
+        assert_eq!(composer_placeholder_of(&claude_legacy), None);
+        // 가용성 대조 — claude 의 글리프는 임베드 정본이 `prompt_marker` 로 **명시**한다(계층 대상
+        // 키라 기존 설치본 디스크 파일에 없어도 도달한다 · `fill_missing_fields`).
+        assert_eq!(
+            composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]).as_deref(),
+            Some("❯"),
+            "claude 좌석의 composer 마커가 사라졌다(이월 축이 idle_quiet 로 강등된다)"
+        );
         assert_eq!(composer_marker_of(&json!({"ready_marker": "", "prompt_marker": ""})), None, "빈 문자열 = 미정의");
         // ④''' 임베드 어댑터 정본이 두 신 키를 실제로 들고 있는가(계층이 전달할 값이 없으면 무의미).
         let embed = embedded_agents_json().expect("임베드 agents.json");
@@ -8779,10 +8792,12 @@ mod seat_latch_negation_tests {
         //   (1글자 `>` 는 셸 PS2·인용 행과 겹쳐 fail-open 이 된다 — 오탐 방향이 반대다 · §3-3).
         //   기구가 죽은 것이 아니라 데이터를 켜지 않은 것이다: 디스크 선언은 그대로 먹는다.
         assert!(embed["gemini"].get("prompt_marker").is_none(), "실측 없는 gemini 마커가 켜졌다");
+        // ★(triage 2026-09-08 · claude blocking) 선언이 없으면 **미정의**여야 한다. 종전에는
+        //   `ready_marker`(`? for shortcuts` = 상태줄 문면)로 떨어져 이월 축이 영구 거짓이었다.
         assert_eq!(
-            composer_marker_of(&embed["gemini"]).as_deref(),
-            Some("? for shortcuts"),
-            "해소는 ready_marker 폴백으로 떨어져야 한다(그 문면은 composer 행에 없다 = prompt_unknown 보류)"
+            composer_marker_of(&embed["gemini"]),
+            None,
+            "실측 없는 gemini 가 상태줄 문면을 composer 마커로 갖는다(carry-unproven 영구 보류)"
         );
         assert_eq!(
             composer_marker_of(&json!({"ready_marker": "? for shortcuts", "prompt_marker": ">"}))
@@ -12297,8 +12312,11 @@ fn inject_directive_after_ready(
 ///     (codex·gemini = `? for shortcuts`), composer 행의 프롬프트 글리프는 `prompt_marker` 다
 ///     (`cysd::governance::merged_prompt_marker` 의 doc). 그래서 codex·gemini 좌석은 이 술어가
 ///     **영원히 거짓** → 관문을 한 번 본 뒤 `carry-unproven` 영구 보류 = 디렉티브 미주입(치명위험 ③).
-///     지금은 [`composer_marker_of`] 가 `prompt_marker → ready_marker` 순서로 해소한다(부트 `judge` 가
+///     지금은 [`composer_marker_of`] 가 **선언된 `prompt_marker` 하나**로 해소한다(부트 `judge` 가
 ///     보는 마커는 **그대로 `ready_marker`** — 부트 판정 폭은 한 글자도 넓히지 않는다).
+///     ★(triage 2026-09-08) `ready_marker` 폴백은 **제거**했다: gemini 처럼 composer 글리프를
+///     선언하지 않은 어댑터에서 그 폴백은 상태줄 문면을 마커로 만들어 이 축을 **영구 거짓**으로
+///     굳혔다(치명위험 ③). 선언이 없으면 마커 미정의 = `idle_quiet` 축이다.
 ///   ⓑ 롤백 스위치를 보지 않았다. 정본 §4 WP-1 의 롤백 계약은 "노브 하나로 종전 판정 복귀" 인데,
 ///     이 축만 스위치 밖에 있어 **되돌릴 수 없는 보류**가 남았다. 지금은 `legacy_v1` 이면 축이 없다.
 fn gate_carry_ok(
@@ -12323,15 +12341,25 @@ fn gate_carry_ok(
     }
 }
 
-/// 이 어댑터의 **composer 행 프롬프트 글리프** — `prompt_marker` → `ready_marker` 순서.
+/// 이 어댑터의 **composer 행 프롬프트 글리프** — **선언된 `prompt_marker` 하나**다.
 ///
-/// ★`cysd::governance::merged_prompt_marker` 와 **같은 규약**이다(디스크/임베드 계층은 이미
-/// [`load_agent_spec`] 의 `fill_missing_fields` 가 해소해 넘겨준다 — 그래서 여기서는 키 순서만 본다).
+/// ★(0.14.31 · triage 2026-09-08 · claude blocking) 종전에는 `ready_marker` **폴백**이 있었다.
+/// 그 폴백은 claude 를 위한 편의였지만(두 값이 같아 무해했다) gemini 에서 치명적이었다:
+/// gemini 는 실측 프레임이 0건이라 `prompt_marker` 를 선언하지 않았고(1글자 `>` 는 셸 PS2 와
+/// 겹쳐 fail-open 이 되므로 그 선택 자체는 옳다), 그래서 해소 결과가 `? for shortcuts` —
+/// **composer 행의 글리프가 아니라 상태줄 문면**이었다. `scan_composer` 는 그 상태줄을 마커
+/// 줄로 잡으므로 강한 증거(마커 아래 괘선·상태줄)도 약한 증거(마커 위 상태줄)도 설 수 없고,
+/// [`gate_carry_ok`] 는 **어떤 유휴 화면에서도 거짓**이 된다 = 관문을 한 번이라도 본 gemini
+/// 좌석은 그 부트에서도 `gate_pending` 재관측 채택에서도 영원히 `carry-unproven` 보류 =
+/// **역할 디렉티브 미주입**(부트 체인 치명위험 ③). 사람이 관문을 통과시켜도 풀리지 않는다.
+///
+/// 그래서 **출처로 가른다**(문자 모양이 아니라 — codex 보완 권고와 같다): 선언이 있으면 그것을
+/// 쓰고, 없으면 `None` 이다. `None` 인 어댑터는 마커 축 대신 **출력 정적**(`idle_quiet`) 축으로
+/// 판정한다(마커 미정의 어댑터의 종전 등급 그대로 · [`gate_carry_ok`]). claude 의 글리프는
+/// `agents.json` 이 `prompt_marker: "❯"` 로 **명시**한다(계층 대상 키라 기존 설치본에도 도달한다).
 /// 빈 문자열은 미정의와 같다(`readiness::marker_of` 규약).
 fn composer_marker_of(spec: &Value) -> Option<String> {
-    ["prompt_marker", "ready_marker"]
-        .iter()
-        .find_map(|k| spec[*k].as_str().filter(|m| !m.is_empty()).map(String::from))
+    spec["prompt_marker"].as_str().filter(|m| !m.is_empty()).map(String::from)
 }
 
 /// 이 어댑터의 **빈 composer 플레이스홀더**(codex `Ask Codex to do anything`). 없으면 `None`.

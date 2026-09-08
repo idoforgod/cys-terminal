@@ -533,6 +533,11 @@ pub const PROMPT_TRAILER_TOKENS: [&str; 3] = ["for shortcuts", "bypass permissio
 /// 괘선 줄로 인정하는 박스 문자(U+2500..=U+259F) **연속 길이** 하한 — cys.rs `TUI_FRAME_RUN_MIN`(맨 셸 술어의
 /// 프레임 자)과 같은 값이어야 한다(파리티 핀 `prompt_trailer_rule_run_matches_tui_frame_run_min` · cys.rs 테스트).
 pub const PROMPT_TRAILER_RULE_MIN_RUN: usize = 8;
+/// ★(0.14.31 · triage 2026-09-08 · codex blocking) **상태줄 장식 글리프.** 이 줄이 사람이 친
+/// 문장이 아니라 TUI 가 그린 상태 바임을 가리키는 표지다 — 실측 문면 `? for shortcuts` ·
+/// `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents` · `…43% context left` 는
+/// 모두 이 글리프를 포함하고, 사람이 치는 초안(`shift+tab 동작을 설명해 줘`)은 포함하지 않는다.
+pub const STATUS_ROW_DECOR: [char; 10] = ['?', '⏵', '▶', '·', '←', '→', '…', '%', '⇧', '│'];
 /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) 꼬리가 빈 분기에서 상태줄을 **이 composer 의 것**으로
 /// 인정하는 최대 거리(행). 실측 2.1.241 레이아웃은 2행(`? for shortcuts` → `…43% context left` → `❯ `)이고,
 /// 사용자 statusLine 한 줄이 더 낄 수 있어 여유를 둔다. 그보다 멀면 스크롤백의 역사로 본다(조여지는 방향).
@@ -1281,6 +1286,40 @@ pub fn composer_layout_static_ok(
 /// 상자 레이아웃의 상태줄은 상자 **아래**에 온다 — 위쪽 괘선 뒤의 상태줄은 이 composer 의 것이 아니다),
 /// 마커로부터 [`PROMPT_STATUS_ABOVE_MAX_ROWS`] 행 안이어야 한다.
 /// 실측 2.1.241 레이아웃(`? for shortcuts` / `…43% context left` / `❯ `)은 2행 위라 그대로 통과한다.
+/// ★(0.14.31 · triage 2026-09-08 · codex blocking) **이 줄이 상태줄 자체인가.**
+///
+/// 【무엇이 틀렸었나】 판정은 `norm.contains(t)` 하나였다. 그런데 토큰
+/// (`for shortcuts`·`bypass permissions`·`shift+tab`)은 전부 **이 제품을 쓰는 사람이 실제로
+/// 타이핑하는 말**이다. 그래서 멀티라인 초안의 이어짐 줄에 그 말이 들어 있으면 그 줄이 "편집
+/// 영역의 끝(상태줄)" 으로 인정돼 초안 전체가 '빈 대기 composer' 로 읽혔고, `governance` 의
+/// stale `pending_input_bytes` 리셋이 그 초안 계수를 지운 뒤 다음 틱이 큐 본문을 사람 문장과
+/// **한 줄로 합쳐 제출**했다(R2 가 닫으려던 fail-open 의 잔여 구멍 · §3-3 위반).
+///
+/// 【규칙 — 전부 AND】
+///   ⓐ 토큰을 포함한다(종전 조건 · 필요조건으로 남는다)
+///   ⓑ 라틴·숫자·[`STATUS_ROW_DECOR`] 밖의 문자가 **없다** — 한글·CJK 가 한 자라도 있으면 사람의
+///      문장이다(실측 상태줄에는 그런 문자가 없다)
+///   ⓒ 장식 글리프가 **적어도 하나** 있다(영문 초안 배제 — 상태 바는 언제나 장식을 단다)
+///   ⓓ 토큰이 줄의 **앞머리**(장식·공백을 벗긴 뒤) 또는 **꼬리**에 붙는다(문장 가운데에 낀
+///      토큰은 인용이다)
+/// 방향은 조이는 쪽 하나다: 실측 2.1.263 `⏵⏵ bypass permissions on …`·2.1.241 `? for shortcuts`
+/// 는 그대로 통과하고(가용성 대조군 검체), 통과하지 못하면 귀결은 **보류**다(리셋 안 함).
+fn is_status_row(l: &str) -> bool {
+    let norm = first_run_gates::normalize(l).to_lowercase();
+    let t = norm.trim();
+    if t.is_empty() || !PROMPT_TRAILER_TOKENS.iter().any(|k| t.contains(k)) {
+        return false;
+    }
+    if t.chars().any(|c| !(c.is_ascii() || STATUS_ROW_DECOR.contains(&c))) {
+        return false; // ⓑ 사람 문장의 문자(한글·CJK 등)
+    }
+    if !t.chars().any(|c| STATUS_ROW_DECOR.contains(&c)) {
+        return false; // ⓒ 장식 0 = 상태 바로 보지 않는다
+    }
+    let head = t.trim_start_matches(|c: char| c.is_whitespace() || STATUS_ROW_DECOR.contains(&c));
+    PROMPT_TRAILER_TOKENS.iter().any(|k| head.starts_with(k) || t.ends_with(k))
+}
+
 fn status_row_bound_to_composer(lines: &[&str], li: usize) -> bool {
     let mut looked = 0usize;
     for k in (0..li).rev() {
@@ -1291,8 +1330,8 @@ fn status_row_bound_to_composer(lines: &[&str], li: usize) -> bool {
         if is_rule_line(l) {
             return false; // 입력 상자 테두리 — 상태줄은 상자 아래에 온다
         }
-        let norm = first_run_gates::normalize(l).to_lowercase();
-        if PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t)) {
+        // 같은 술어를 쓴다(판정 분리 금지 · triage 2026-09-08).
+        if is_status_row(l) {
             return true;
         }
         looked += 1;
@@ -1331,10 +1370,6 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
     if !placeholder_ok && !rest.trim().is_empty() {
         return None; // 같은 줄에 문면 — 선택 커서 행이거나 사람이 치던 초안이다(둘 다 닫지 않는다).
     }
-    let has_status_token = |l: &str| -> bool {
-        let norm = first_run_gates::normalize(l).to_lowercase();
-        PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
-    };
     let trailer: Vec<&str> = lines[li + 1..]
         .iter()
         .copied()
@@ -1374,7 +1409,7 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
     //   초안 이어짐일 수 있으므로 증거로 접지 않는다(조여지는 방향 · 실측 2.1.263 은 괘선이라 불변).
     Some(ComposerScan {
         trailer_empty: false,
-        strong: is_rule_line(trailer[0]) || has_status_token(trailer[0]),
+        strong: is_rule_line(trailer[0]) || is_status_row(trailer[0]),
         weak: placeholder_ok,
     })
 }
