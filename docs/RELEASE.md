@@ -293,6 +293,22 @@ bash scripts/release-gate-gatekeeper.sh <DMG | .app>
     빌드 시점 러너 산출물 검사다. 이 게이트는 업로드 **전**(release.yml)과 발행 후처리
     (`scripts/release-postprocess.py` 가 draft 백업 DMG = **발행될 실물 바이트**에 재실행)에서
     돌므로 발행 전 마지막 지점이다.
+- ★**⑨ gktool 실평가 축 — 2026-09-08 신설(오너 참고2)**: ①~⑧ 의 Gatekeeper 판정은 전부
+  `spctl` **한 도구**에 걸려 있었다. `gktool scan <app>` 은 사용자가 앱을 **처음 열 때** 도는
+  스캔 경로(‘Verifying…’ 캐시 예열)를 CLI 로 부르는, spctl 과 다른 축이다. 격리를 붙인 **설치
+  모사 사본**에 ④ 바로 뒤에서 돌고, **rc≠0 이면 그대로 FAIL(업로드 금지)** 이다.
+  · **판정은 rc 다 — 판정문 문자열이 아니다.** 실측 3형(2026-09-08): 격리 없음 → rc 0
+    "allowed by system policy" · 격리+공증(정상 발행물) → rc 0 "would be allowed but the user
+    still needs to approve it on first launch" · 격리+미서명 → **rc 70**. 문자열로 "allowed" 를
+    찾으면 정상형을 FAIL 로 오판한다.
+  · **격리 없는 대상의 rc 0 은 공허**라 PASS 로 세지 않는다(같은 미서명 앱이 격리 전 rc 0,
+    후 rc 70 — 격리가 없으면 첫-실행 재검증 경로 자체가 안 돈다).
+  · **도구 부재만 SKIP**(사유 1줄 · `GKTOOL_AXIS=absent` 로 요약 승격)이다. 부재를 exit 2 로
+    닫지 않는 이유는 gktool 이 비교적 새 도구여서 구 러너를 통째로 멈추기 때문이고, 그 경우
+    판정 범위는 ①~⑧ 로 **종전과 정확히 같아질 뿐 넓어지지 않는다**.
+  · **로컬 드라이런**: `bash scripts/release-gate-gatekeeper.sh --gktool-only <.app>` — 대상을
+    복사도 수정도 하지 않고(설치본 읽기 전용) ⑨ 만 돈다. 진단 전용이라 발행 경로가 이 플래그를
+    싣지 않음은 `test_release_postprocess_gate.py` 의 핀이 지킨다.
   · **평가식 근거** — `spctl(8)`: "-t open to assess the opening of documents".
   · **실측(2026-09-03 · macOS 27.0 · assessments enabled)** — v0.14.29 DMG 2종(aarch64·x64)
     격리 사본: `stapler validate` rc=0 · `spctl -t open --context context:primary-signature`
