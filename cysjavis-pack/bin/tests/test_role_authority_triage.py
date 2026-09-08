@@ -100,6 +100,36 @@ def t1():
           not gate("reviewer-codex", "sh -c 'echo x > /tmp/reviewer-note.md'"))
     check("T1e 양성대조 CSO 는 같은 문자열을 이미 막는다(구멍은 reviewer 한쪽)",
           gate("cso", "sh -c 'echo x > %s'" % CACHE_REC))
+    # ★수렴 R2(major · reviewer-claude + reviewer-codex 실측): I1 의 재귀 판정을 **한 토큰**으로
+    #   되돌리던 셸/래퍼 옵션 문법. 아래 15행은 전부 커밋 655f63a 시점 HEAD 에서 ALLOW 로
+    #   실측된 위조 벡터다(같은 하네스 · 같은 페이로드 · `sh -c` 만 DENY 였다).
+    for label, prefix in (
+            ("T1f bash -o pipefail -c", "bash -o pipefail -c"),
+            ("T1g bash -o posix -c", "bash -o posix -c"),
+            ("T1h bash -O extglob -c", "bash -O extglob -c"),
+            ("T1i bash +o posix -c", "bash +o posix -c"),
+            ("T1j bash --rcfile /dev/null -c", "bash --rcfile /dev/null -c"),
+            ("T1k bash -eo pipefail -c", "bash -eo pipefail -c"),
+            ("T1l bash -c --", "bash -c --"),
+            ("T1m env --unset NAME sh -c", "env --unset CYS_ROLE sh -c"),
+            ("T1n sudo --user root sh -c", "sudo --user root sh -c"),
+            ("T1o xargs --replace {} sh -c", "xargs --replace {} sh -c"),
+            ("T1p busybox.exe sh -c", "busybox.exe sh -c"),
+            ("T1q nice sh -c", "nice sh -c"),
+            ("T1r setsid sh -c", "setsid sh -c"),
+            ("T1s stdbuf -oL sh -c", "stdbuf -oL sh -c"),
+            ("T1t timeout 5 sh -c", "timeout 5 sh -c")):
+        check("%s 로 역할 캐시 위조 deny" % label,
+              gate("reviewer-codex", "%s 'echo x > %s'" % (prefix, CACHE_REC)))
+    # ★양성 대조: 값-옵션 표를 지우면(또는 '모르는 긴 옵션 거부'를 넓히면) 이 **읽기 실행**이
+    #   거부된다 — 과도차단의 검출 자리다(§3-3: 오탐의 귀결이 '리뷰어가 읽지 못한다' 이면 안 된다).
+    for label, cmd in (
+            ("T1u 양성대조 bash -o pipefail -c 읽기", "bash -o pipefail -c 'cargo test --offline'"),
+            ("T1v 양성대조 bash --rcfile -c 읽기", "bash --rcfile /dev/null -c 'cargo test --offline'"),
+            ("T1w 양성대조 xargs --replace 읽기", "xargs --replace {} grep pat /x/f"),
+            ("T1x 양성대조 timeout 읽기", "timeout 300 cargo test --locked --offline"),
+            ("T1y 양성대조 env --unset 읽기", "env --unset CYS_ROLE cargo test --offline")):
+        check(label + " allow", not gate("reviewer-codex", cmd))
 
 
 # ── T2 두 층 슬러그 파리티 ───────────────────────────────────────────────────

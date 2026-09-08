@@ -523,8 +523,24 @@ class NegativeControls(unittest.TestCase):
          "            if False:"),
         ("선행 환경 할당 실행기 주입(R2·claude)",
          "                if env_assign_is_write(name):", "                if False:"),
+        # ★수렴 R2: 래퍼 인식은 `_wrapper_name`(경로·`.exe`·대소문자 정규화) 한 규칙이 됐다 —
+        #   그 정규화를 지우면(`tok in WRAPPERS` 문면 비교) `/usr/bin/env rm -rf` 가 다시 샌다.
         ("래퍼도 이름으로(R2·claude)",
-         "            if tok in WRAPPERS or base in WRAPPERS:", "            if tok in WRAPPERS:"),
+         "            _wname = _wrapper_name(tok)",
+         "            _wname = tok if tok in WRAPPERS else None"),
+        # ★수렴 R2(major): 셸 실행기의 **값 옵션** 인식을 지우면 `bash -o pipefail -c '<위조>'` 가
+        #   재귀를 건너뛴다(실측 ALLOW → 지금은 DENY).
+        ("셸 실행기 값 옵션(수렴 R2)",
+         "            if raw in SHELL_VALUE_OPTS:       # `-o pipefail` — 값은 스크립트가 아니다",
+         "            if False:"),
+        # 묶음 옵션의 **마지막 글자**가 값을 먹는 갈래(`bash -eo pipefail -c`)는 위 검사가 못 잡는다.
+        ("셸 실행기 묶음 값 옵션(수렴 R2)",
+         "            if body and (raw[0] + body[-1]) in SHELL_VALUE_OPTS:",
+         "            if False:"),
+        # ★수렴 R2(major): 래퍼의 **긴 옵션** 처리를 지우면 `env --unset X sh -c '<위조>'` 가 샌다.
+        ("래퍼 긴 옵션(수렴 R2)",
+         "                    if raw in wvals or raw in wlong:",
+         "                    if raw in wvals:"),
         ("셸 축 폐기 장치(R2·T9)",
          '    shell = ("/dev/null",) + (("NUL", "nul") if osname == "nt" else ())',
          "    shell = builder"),

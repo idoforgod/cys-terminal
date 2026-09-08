@@ -54,8 +54,12 @@
 #   심링크가 아니고 소유자가 자신인 정규 파일일 때만 읽는다(못 재면 신뢰하지 않고 조회한다).
 #
 # Threat model (defensive-security-gate 9원칙): 비-악의 협력 에이전트의 *오작동* + reviewer의
-#   직접 변형 시도 차단. 근본한계(명문화·은폐 금지): ① 인터프리터 우회(`bash -c "..."`·스크립트)·
-#   git alias·셸 변수 확장은 Bash 토큰화 검사가 못 잡는다(block-dangerous-git와 동일 한계) →
+#   직접 변형 시도 차단. 근본한계(명문화·은폐 금지): ① 인터프리터 우회(**셸 실행기의 `-c`·`eval`
+#   인자는 0.14.31 I1·수렴 R2 에서 재귀 판정한다** — `sh -c`·`bash -o pipefail -c`·`bash -c --`·
+#   래퍼(`env --unset X sh -c`·`nice`·`timeout`) 전부. 남는 것은 `python3 -c`·`perl -e`·`awk`·
+#   `node` 같은 **다른 언어 인터프리터**, 외부 스크립트 파일, 변수로 만든 실행기, stdin 스크립트,
+#   로그인 셸 시작 파일이다)·git alias·셸 변수 확장은 Bash 토큰화 검사가 못 잡는다
+#   (block-dangerous-git와 동일 한계) →
 #   reviewer 는 write-shell의 *대표* 위험 동사만 deny 하고, **CSO 는 반대로 allowlist**(허용 접두
 #   밖은 전부 deny)라서 이 한계가 좁다. 단 CSO 경로도 명령치환(`$(…)`·백틱)·프로세스 치환은
 #   토큰화로 안을 볼 수 없으므로 **문자 발견 즉시 deny** 한다(해석 불가 = 거부 방향).
@@ -64,7 +68,8 @@
 #     막는다 — `PATH=`·`PAGER=`·`EDITOR=`·`PYTHONPATH=` 등 읽기 작업에서도 흔한 이름은 열려
 #     있고, 그것들도 '무엇이 실행되는가' 를 바꿀 수 있다. 넓히면 정상 조회의 오탐 대가가 커서
 #     따로 재야 한다(계획 §3-3: 오탐의 귀결이 '리뷰어가 읽지 못한다' 여서는 안 된다).
-#     `$(echo rm)`·`eval rm`·`/bin/sh -c 'rm …'` 는 위 ① 인터프리터 우회와 같은 층이다.
+#     `$(echo rm)` 는 위 ① 인터프리터 우회와 같은 층이다(`eval rm`·`/bin/sh -c 'rm …'` 는
+#     지금은 재귀 판정 대상이라 이 예시에서 뺀다 — 문면이 실제보다 무력하게 읽히지 않게).
 #   kill-switch = 사람의 세션 리뷰.
 #
 # Design:
@@ -578,19 +583,73 @@ def git_sub_is_write(sub, sub_args):
     return True
 
 
-WRAPPERS = {"command", "exec", "env", "sudo", "nohup", "time", "xargs", "busybox"}
+WRAPPERS = {"command", "exec", "env", "sudo", "doas", "nohup", "time", "xargs", "busybox",
+            "nice", "setsid", "stdbuf", "timeout", "ionice", "chrt"}
 # ★I1 수렴: `busybox` 는 멀티콜 런처라 뒤 토큰이 진짜 명령이다(`busybox sh -c …`·`busybox rm`).
 #   래퍼로 접어야 그 뒤가 명령 자리로 남는다(거부 방향으로만 넓어진다).
+# ★수렴 R2(minor · reviewer-claude 실측): 래퍼 멤버십을 `os.path.basename(tok)` 문면 그대로
+#   보던 탓에 `busybox.exe sh -c '<위조>'` 가 통과했다(`busybox sh -c` 는 거부). 이제 래퍼도
+#   `_shell_exec_name` 과 **같은 정규화**(구분자·`.exe`·대소문자)로 본다 — `_wrapper_name`.
+# ★수렴 R2(major · reviewer-claude 실측): `nice`·`setsid`·`stdbuf`·`timeout`·`ionice`·`chrt` 도
+#   뒤 토큰이 진짜 명령인 래퍼다(`nice sh -c '<위조>'` 실측 통과 → 지금은 거부).
+#   `timeout` 은 명령 앞에 **기간 피연산자**를 하나 먹으므로 `WRAPPER_OPERANDS` 로 함께 센다.
 # ★래퍼의 **값을 먹는 옵션** — 값까지 건너뛰지 않으면 그 값이 명령 이름으로 소비되어 진짜 명령이
 #   인자 자리로 밀린다(`env -u CYS_ROLE sh -c '…'` 실측: 종전 판은 `CYS_ROLE` 을 명령으로 봤다).
 #   `git` 의 GIT_GLOBAL_VALUE_OPTS 와 같은 규율이며, 방향은 **거부 전용**이다.
 WRAPPER_VALUE_OPTS = {
     "env": {"-u", "-C", "-S", "-P"},
     "sudo": {"-u", "-g", "-C", "-p", "-r", "-t", "-U", "-h"},
+    "doas": {"-u", "-C"},
     "xargs": {"-n", "-P", "-I", "-E", "-d", "-L", "-s", "-a"},
     "time": {"-o", "-f"},
     "exec": {"-a"},
+    "nice": {"-n"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "timeout": {"-k", "-s"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u"},
+    "chrt": {"-p"},
 }
+# ★수렴 R2(major · reviewer-claude 실측): GNU **긴 옵션**의 분리 값은 같은 구멍을 한 손가락으로
+#   열었다 — `env -u CYS_ROLE sh -c '<위조>'` 는 거부인데 `env --unset CYS_ROLE sh -c '<위조>'` 는
+#   통과했고(`--unset=NAME` 은 거부), `sudo --user root sh -c`·`xargs --replace {} sh -c` 도 같았다.
+#   Git Bash 는 GNU coreutils 를 싣으므로 **이 철자가 Windows 에서 쓰이는 철자**다.
+#   규칙: `--opt=값` 은 자기완결(1개 건너뜀) · 아는 값-옵션은 값까지(2개) · 아는 불리언은 1개 ·
+#   **모르는 긴 옵션은 거부**한다(값 유무를 모르면 무엇이 실행되는지를 모른다 · 깊이 상한과 같은 fail-closed).
+WRAPPER_VALUE_LONG_OPTS = {
+    "env": {"--unset", "--chdir", "--split-string", "--block-signal", "--default-signal",
+            "--ignore-signal"},
+    "sudo": {"--user", "--group", "--prompt", "--chdir", "--role", "--type", "--other-user",
+             "--close-from", "--command-timeout", "--host"},
+    "doas": {"--user"},
+    "xargs": {"--replace", "--max-args", "--max-procs", "--delimiter", "--eof", "--max-lines",
+              "--max-chars", "--arg-file", "--process-slot-var"},
+    "timeout": {"--kill-after", "--signal"},
+    "nice": {"--adjustment"},
+    "stdbuf": {"--input", "--output", "--error"},
+    "time": {"--output", "--format"},
+    "ionice": {"--class", "--classdata", "--pid"},
+    "chrt": {"--pid"},
+}
+# 값을 먹지 **않는** 긴 옵션(상식적인 공통 집합). 여기도 위 표도 아니면 거부다.
+WRAPPER_BOOL_LONG_OPTS = {
+    "--help", "--version", "--verbose", "--debug", "--null", "--interactive", "--no-run-if-empty",
+    "--ignore-environment", "--exit", "--open-tty", "--preserve-status", "--foreground",
+    "--fork", "--wait", "--ctty", "--login", "--non-interactive", "--stdin", "--shell",
+}
+# 명령 **앞**에 붙는 피연산자 개수(`timeout <기간> <명령>`).
+WRAPPER_OPERANDS = {"timeout": 1}
+
+
+def _wrapper_name(tok):
+    """토큰이 **래퍼**를 가리키면 그 이름, 아니면 None — `_shell_exec_name` 과 같은 정규화.
+
+    경로(`/usr/bin/env`)·역슬래시 구분자·`.exe` 접미·대소문자를 한 규칙으로 접는다.
+    종전에는 `tok in WRAPPERS or os.path.basename(tok) in WRAPPERS` 라 `busybox.exe` 가 샐다.
+    """
+    base = os.path.basename(_txt(tok).replace("\\", "/")).lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base if base in WRAPPERS else None
 
 # 검증 대상 외 허용 경로 접두(과도차단 방지 — reviewer tmp/로그 write 허용).
 ALLOW_PATH_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/")
@@ -1298,36 +1357,72 @@ def _shell_exec_name(tok):
     return base if base in SHELL_EXECUTORS else None
 
 
+# ★수렴 R2(major · 두 리뷰어 실측): 셸 실행기의 옵션 문법을 한 토큰 분량 잘못 읽어 I1 이
+#   되돌려졌다. 실측(HEAD · reviewer-codex 좌석 · 게이트 종단 실행 · 페이로드는 역할 캐시 위조):
+#     DENY  sh -c '<위조>'                 (I1 이 닫은 그 벡터)
+#     ALLOW bash -o pipefail -c '<위조>'   ALLOW sh -o errexit -c   ALLOW zsh -o nullglob -c
+#     ALLOW bash -O extglob -c             ALLOW bash --rcfile x -c ALLOW bash +o posix -c
+#     ALLOW bash -o posix -c               ALLOW bash -c -- '<위조>'
+#   원인 둘: ⓐ **값을 따로 먹는 옵션**(`-o`·`-O`·`+o`·`+O`·`--rcfile`…)의 값이 옵션이 아닌
+#   토큰이라 종전 루프가 그것을 '스크립트 파일'로 읽고 **재귀를 통째로 건너뛰었다**.
+#   ⓑ `-c` 를 만나면 **곧바로 다음 토큰**을 스크립트로 잡아서 `bash -c -- <스크립트>` 의 `--` 를
+#   스크립트로 읽었다(실측: bash 는 `--` 뒤 토큰을 실행한다).
+#   지금 규칙은 실측한 셸 문법 그대로다: 옵션을 끝까지 훑되(값 옵션은 값까지) `-c` 를 봤다는
+#   사실만 기억하고, **처음 만나는 비-옵션 토큰**(또는 `--` 다음 토큰)이 스크립트다.
+#   판정할 수 없는 긴 옵션은 **거부**한다 — 값 유무를 모르면 무엇이 실행되는지도 모른다.
+SHELL_VALUE_OPTS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file", "--emulate"}
+SHELL_BOOL_LONG_OPTS = {
+    "--login", "--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--debug",
+    "--help", "--version", "--noediting", "--nolineediting", "--dump-strings",
+    "--dump-po-strings", "--protected", "--pretty-print", "--no-rcs", "--no-globalrcs",
+    "--interactive", "--debugger",
+}
+
+
 def _nested_shell_script(tokens, i):
     """(script|None, next_index, err|None) — `sh …-c <문자열>` 의 스크립트 인자를 집는다.
 
-    `-c` 하나만 보지 않는다: **묶음 옵션**(`-lc`·`-ec`·`-xc`)도 `c` 를 담으면 다음 토큰이
-    스크립트다(로컬 dash·bash·zsh 실측). 옵션이 아닌 토큰(스크립트 **파일**)을 먼저 만나면
-    재귀 대상이 없다(외부 파일 = 근본한계). 옵션은 있는데 인자가 없으면 **거부**한다.
+    `-c` 하나만 보지 않는다: **묶음 옵션**(`-lc`·`-ec`·`-xc`)도 `c` 를 담으면 스크립트가 뒤에
+    온다(로컬 dash·bash·zsh 실측). `-c` 를 보지 못한 채 비-옵션 토큰을 만나면 그것은 스크립트
+    **파일**이라 재귀 대상이 없다(외부 파일 = 근본한계). `-c` 는 있는데 인자가 없으면 **거부**한다.
     """
     j = i + 1
     n = len(tokens)
+    seen_c = False
     while j < n:
         t = tokens[j]
         if is_separator(t) or _is_redirect_op(t):
-            return None, j, None
+            break
         raw = _txt(t)
-        if raw == "--":
-            return None, j + 1, None
-        if raw.startswith("-") and len(raw) > 1:
-            if raw.startswith("--"):          # `--login` 류 긴 옵션(값은 `=` 로 붙는다)
-                j += 1
+        if raw == "--":                       # 옵션 끝 — 다음 토큰이 스크립트다
+            j += 1
+            break
+        if len(raw) > 1 and raw[0] in "-+":
+            if raw in SHELL_VALUE_OPTS:       # `-o pipefail` — 값은 스크립트가 아니다
+                j += 2
                 continue
-            if "c" in raw[1:]:
-                if (j + 1 >= n or is_separator(tokens[j + 1])
-                        or _is_redirect_op(tokens[j + 1])):
-                    return None, j + 1, ("셸 실행기의 `-c` 에 스크립트 인자가 없다 — 판정기가 "
-                                         "무엇이 실행되는지 볼 수 없으면 거부다")
-                return _txt(tokens[j + 1]), j + 2, None
+            if raw.startswith("--"):
+                if "=" in raw or raw in SHELL_BOOL_LONG_OPTS:
+                    j += 1
+                    continue
+                return None, j, ("셸 실행기의 긴 옵션 `%s` 이 값을 따로 먹는지 판정기가 모른다 — "
+                                 "무엇이 실행되는지 볼 수 없으면 거부다" % raw)
+            body = raw[1:]
+            if "c" in body:
+                seen_c = True
+            # 묶음의 **마지막 글자**가 값을 먹으면 다음 토큰은 그 값이다(`bash -eo pipefail -c …`).
+            if body and (raw[0] + body[-1]) in SHELL_VALUE_OPTS:
+                j += 2
+                continue
             j += 1
             continue
-        return None, j, None                  # 스크립트 파일·인자 — 정적 재귀 대상이 아니다
-    return None, j, None
+        break                                 # 비-옵션 토큰 — 여기서 스크립트 자리가 결정된다
+    if not seen_c:
+        return None, j, None                  # 스크립트 파일·stdin — 정적 재귀 대상이 아니다
+    if j >= n or is_separator(tokens[j]) or _is_redirect_op(tokens[j]):
+        return None, j, ("셸 실행기의 `-c` 에 스크립트 인자가 없다 — 판정기가 "
+                         "무엇이 실행되는지 볼 수 없으면 거부다")
+    return _txt(tokens[j]), j + 1, None
 
 
 def _eval_script(tokens, i):
@@ -1419,26 +1514,46 @@ def bash_write_reason(command, _depth=0):
             # ★래퍼도 **이름으로** 본다(R2 minor): 종전엔 정확 토큰 비교라 `/usr/bin/env rm -rf`
             #   가 래퍼로 인식되지 않아 `rm` 이 인자 자리로 밀려 통과했다(아래 write 판정은
             #   이미 basename 을 쓴다 — 한 함수 안에서 두 모양이었다).
-            if tok in WRAPPERS or base in WRAPPERS:
+            _wname = _wrapper_name(tok)
+            if _wname is not None:
                 # ★래퍼 뒤의 **옵션**도 건너뛰며 명령 자리를 유지한다(I1): 종전엔 `env -i sh -c …`
                 #   의 `-i` 가 명령 이름으로 소비되어 그 뒤 `sh` 가 인자 자리로 밀렸다.
                 #   값을 먹는 옵션은 **값까지** 건너뛴다(`env -u CYS_ROLE sh -c …`).
+                #   ★수렴 R2: 긴 옵션의 분리 값(`env --unset NAME sh -c …`)도 같은 자리였다 —
+                #     아는 값-옵션은 값까지, `--opt=값` 은 하나, **모르는 긴 옵션은 거부**.
+                #     `timeout <기간>` 처럼 명령 앞 피연산자를 먹는 래퍼는 그 개수만큼 더 넘긴다.
                 #   방향은 거부 전용이다(명령이 새로 **보이게** 될 뿐 새 허용은 없다).
-                wname = base if base in WRAPPERS else tok
-                wvals = WRAPPER_VALUE_OPTS.get(wname, ())
+                wvals = WRAPPER_VALUE_OPTS.get(_wname, ())
+                wlong = WRAPPER_VALUE_LONG_OPTS.get(_wname, ())
+                woperands = WRAPPER_OPERANDS.get(_wname, 0)
+                _wrap_err = None
                 i += 1
                 while i < n:
                     nxt = tokens[i]
                     if is_separator(nxt) or _is_redirect_op(nxt):
                         break
                     raw = _txt(nxt)
-                    if raw in wvals:
+                    if raw in wvals or raw in wlong:
                         i += 2
                         continue
+                    if raw.startswith("--") and len(raw) > 2:
+                        if "=" in raw or raw in WRAPPER_BOOL_LONG_OPTS:
+                            i += 1
+                            continue
+                        _wrap_err = ("래퍼 `%s` 의 긴 옵션 `%s` 이 값을 따로 먹는지 판정기가 "
+                                     "모른다 — 그 값이 명령 자리에 남으면 진짜 명령이 인자 자리로 "
+                                     "밀려 보이지 않는다(`--opt=값` 으로 적어라)" % (_wname, raw))
+                        break
                     if raw.startswith("-") and len(raw) > 1:
                         i += 1
                         continue
+                    if woperands > 0:
+                        woperands -= 1
+                        i += 1
+                        continue
                     break
+                if _wrap_err:
+                    return True, _wrap_err
                 continue
             # ★I1: 셸 실행기의 `-c` 인자를 **새 셸 문맥으로 재귀 판정**한다.
             _sx = _shell_exec_name(tok)
@@ -2698,6 +2813,25 @@ def self_test():
          {"file_path": "/tmp/cys-role-authority.d/role-3-default.A1b2C3/r"}),
         ("reviewer-codex", "Write", {"file_path": "/private/tmp/cys-role-authority.d/x"}),
         ("reviewer-gemini", "Write", {"file_path": "/tmp/cys-role-authority.d/role-9-x"}),
+        # ★수렴 R2(major · 두 리뷰어 실측): I1 의 재귀 판정을 **한 토큰**으로 되돌리던 셸/래퍼
+        #   옵션 문법. 아래 8행은 전부 HEAD 이전에서 ALLOW 로 실측된 위조 벡터다
+        #   (`sh -c` 만 거부였다 — 그것이 I1 이 닫은 자리다).
+        ("reviewer-codex", "Bash", {"command": "sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash -o pipefail -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash -o posix -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash -O extglob -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash +o posix -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash --rcfile /dev/null -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "bash -c -- 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        # 묶음 옵션의 마지막 글자가 값을 먹는 형(`-eo pipefail`) — 실측 실행 확인(EXEC_EO).
+        ("reviewer-codex", "Bash", {"command": "bash -eo pipefail -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "env --unset CYS_ROLE sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "sudo --user root sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "xargs --replace {} sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "busybox.exe sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "nice sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "setsid sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        ("reviewer-codex", "Bash", {"command": "timeout 5 sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
     ]
     cases_allow = [
         ("worker", "Edit", {"file_path": "/x/a.rs"}),
@@ -2715,6 +2849,14 @@ def self_test():
         ("reviewer-codex", "Write", {"file_path": "/tmp/review-notes.md"}),
         ("reviewer-codex", "Edit", {"file_path": "/Users/x/.cys/scratch.txt"}),
         ("reviewer-codex", "Bash", {"command": "echo hi > /tmp/out.log"}),
+        # ★수렴 R2 양성 대조: 래퍼의 **아는** 긴 옵션은 값까지 건너뛰고 진짜 명령을 본다 —
+        #   표를 지우면 이 읽기 명령이 '모르는 긴 옵션' 으로 거부되어 self-test 가 적색이 된다
+        #   (표의 존재를 검출하는 자리 · 거부 벡터만으로는 이 표가 관측되지 않는다).
+        ("reviewer-codex", "Bash", {"command": "xargs --replace {} grep pat /x/f"}),
+        ("reviewer-codex", "Bash", {"command": "env --unset CYS_ROLE cargo test --offline"}),
+        ("reviewer-codex", "Bash", {"command": "timeout 300 cargo test --locked --offline"}),
+        ("reviewer-codex", "Bash", {"command": "bash -o pipefail -c 'cargo test --offline'"}),
+        ("reviewer-codex", "Bash", {"command": "bash --rcfile /dev/null -c 'cargo test --offline'"}),
         # ★0.14.31 완화(별 커밋 · 반례 추가): reviewer 의 정당한 **검증 실행**.
         #   완화의 뜻은 '명령 수준 변형 없음' 이지 '파일 쓰기 없음' 이 아니다(위 주석 참조).
         ("reviewer-codex", "Bash", {"command": "cargo test --locked --offline"}),
