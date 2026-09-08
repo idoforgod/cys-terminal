@@ -42,7 +42,22 @@ jobs:
       #   (같은 규칙의 본체 레인 대응물 = release.yml 의 `PACK_MIN_BINARY`. 두 레인은 **따로**
       #    고쳐야 한다 — 한쪽만 고치면 다른 문으로 같은 실패가 들어온다. 이게 S26 의 실제 사고다.)
       #
-      # 현재 값 0.14.29 의 근거(2026-08-31 · T5T6 R1-적대 차단 수리 · master 결재): 0.14.29 팩의
+      # 현재 값 0.14.31 의 근거(2026-09-08 · CONTRACTS §B-10 · 통합 단계 마스터 집행): 이 세대 팩이
+      #   **0.14.31 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 —
+      #     · `cysjavis-pack/hooks/session-start.sh:94` → `cys reclaim-role --auto --config … --cwd …`
+      #       (`:207` 은 `cys reclaim-role --auto --takeover-empty-seat` 를 사람에게 지시)
+      #     · 팩 preflight `C82.gate-corpus-drift` → `cys gate-corpus --json`
+      #     · 역할/승인 관문 → `cys approval sign --ttl` · `cys approval check --require-ttl`
+      #     · 경보 라우팅 게이트 → `cys status --json` 의 최상위 `alert_route` 키
+      #   부재 실측(2026-09-08 · v0.14.30 태그 대조):
+      #     `git show v0.14.30:src/bin/cys.rs | grep -c reclaim-role` → 0
+      #     `git show v0.14.30:src/bin/cys.rs | grep -c gate-corpus`  → 0
+      #     `git show v0.14.30:cysjavis-pack/hooks/session-start.sh | grep -c reclaim-role` → 0
+      #   즉 ≤0.14.30 바이너리 사용자가 이 팩을 받아 지시대로 실행하면 unknown-subcommand /
+      #   unknown-flag 로 죽고 세션 시작 훅이 역할 없이 진행한다(기능 의존 — RELEASE.md 불변 규칙).
+      #   release.yml PACK_MIN_BINARY 와 **같은 커밋에서 동시 상향**(두 값 동일 계약).
+      #
+      # 구 값 0.14.29 의 근거(이력 · 2026-08-31 · T5T6 R1-적대 차단 수리 · master 결재): 0.14.29 팩의
       #   pack-guard.sh 가 "이 수정은 보존됩니다(kept-drift)" 를 약속하는데, 그 거동(수정 system
       #   파일의 벤더 미전진 보존·전진 시 자동 3-way)은 0.14.29 바이너리에서 처음 생긴다 —
       #   ≤0.14.28 스윕은 종전대로 치유해 팩 자신의 약속이 거짓이 된다(기능 의존).
@@ -55,7 +70,7 @@ jobs:
       #
       # 값 지정 시 정책이 무시되고 "min_binary 정책 오버라이드 사용" ::warning 이 로그에 남는다
       #   (아래 Compute min_binary 스텝) — 의도된 흔적이다. 근거를 커밋에 남길 것.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.29'
+      PACK_MIN_BINARY_OVERRIDE: '0.14.31'
     steps:
       - uses: actions/checkout@v4
 
