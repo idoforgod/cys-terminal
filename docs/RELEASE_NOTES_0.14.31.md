@@ -9,10 +9,6 @@
 역할을 잃었고, 큐에 넣은 메시지는 평균 35분씩 묶였고, 감시 역할(CSO)은 10분마다 스스로를 깨우는
 크론을 세션마다 되살리며 토큰을 태웠습니다. 각각은 작은 결함이지만, 서로를 가려 주고 있었습니다.
 
-> **이 문서는 통합 전 초안입니다.** 버전 문자열 8곳 상향과 팩 하한(`PACK_MIN_BINARY`) 상향은
-> 통합 커밋에서 확정되며, 그때 이 문서의 해당 절이 실측값으로 교체됩니다. 그 밖의 절은 각 작업
-> 패키지의 구현·검증이 끝난 내용입니다.
-
 ---
 
 ## 에러 1 — 감시 역할이 자기 자신을 소모하던 고리
@@ -402,8 +398,23 @@ python3 ~/.cys/pack/bin/javis_preflight.py --seed-trust \
 
 ### 팩 하한
 
-무중단 팩 채널의 **바이너리 하한(`PACK_MIN_BINARY`)을 0.14.31로 올립니다.** 이번 판의 팩은
+무중단 팩 채널의 **바이너리 하한(`PACK_MIN_BINARY`)을 0.14.31로 올렸습니다.** 이번 판의 팩은
 0.14.31 이상의 본체에서만 적용됩니다.
+
+두 발행 레인의 값은 통합 커밋에서 **동시에** 올렸고, 통합 후 실측은 아래와 같습니다
+(측정 2026-09-08 18:46 KST · 통합 브랜치 `fix/0.14.31-audit` · 행번호는 통합 커밋 뒤 값):
+
+| 레인 | 키 | 위치 | 값 |
+|---|---|---|---|
+| `release.yml` | `PACK_MIN_BINARY` | `:1003` | `0.14.31` |
+| `pack-release.yml` | `PACK_MIN_BINARY_OVERRIDE` | `:73` | `0.14.31` |
+
+하한을 뒷받침하는 **네 가지 표면**은 통합 트리에서 소비자까지 다시 확인했습니다 —
+`cys reclaim-role --auto`(`hooks/session-start.sh:94` · 안내 `:215`) ·
+`cys gate-corpus --json`(사전 점검 `C82.gate-corpus-drift` · `javis_preflight.py:5218`) ·
+`cys approval sign --ttl` / `check --require-ttl`(`hooks/role-capability-gate.sh:2308`) ·
+`cys status --json` 의 `alert_route` 키(`javis_preflight.py:446` 소비 · 데몬 `handlers.rs:7137` 생산).
+넷 다 v0.14.30 태그에는 없습니다(`git show v0.14.30:src/bin/cys.rs | grep -c reclaim-role` → 0).
 
 **왜 올리는가**: 이번 판의 팩(지침·훅·파이썬)은 0.14.31 본체가 제공하는 것들에 의존합니다 —
 능력 게이트의 역할 조회(`cys surface-role` 권위 응답), 등록 조건이 보는 `alert_route` 키,
@@ -414,8 +425,25 @@ TTL 승인 플래그, `cys gate-corpus`. 구 본체 위에 이 팩만 얹으면 
 
 ### 버전
 
-버전 문자열은 게이트가 강제하는 8곳 전부 0.14.31로 올립니다(빌드 설정 4곳 · 윈도우 설치 템플릿
-2곳 · 잠금 파일 2패키지). 어긋나면 태그 CI가 그 자리에서 멈춥니다.
+버전 문자열은 게이트가 강제하는 8곳 전부 **0.14.31 로 올렸습니다**(빌드 설정 4곳 · 윈도우 설치
+템플릿 2곳 · 잠금 파일 2패키지). 어긋나면 태그 CI가 그 자리에서 멈춥니다.
+
+통합 후 실측(`sh scripts/version-check.sh v0.14.31` · 2026-09-08 18:38 KST · rc=0):
+
+```
+버전 SOT 8곳:
+  Cargo.toml                     0.14.31
+  src-tauri/Cargo.toml           0.14.31
+  src-tauri/tauri.conf.json      0.14.31
+  ui/package.json                0.14.31
+  dist-win/cys.wxs               0.14.31
+  dist-win/cys-x64.wxs           0.14.31
+  Cargo.lock [cys-terminal]      0.14.31
+  Cargo.lock [cys-app]           0.14.31
+
+✅ 8곳 일치: 0.14.31
+✅ 기대 버전 일치: 0.14.31
+```
 
 ---
 
