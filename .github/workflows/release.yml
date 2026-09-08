@@ -697,6 +697,11 @@ jobs:
               grep -E '^GATE_MODE=' "$GLOG" | tail -1 || echo 'GATE_MODE=(미출력 — 태그 트리의 게이트 스크립트가 구판)'
               grep -E '^spctl: ' "$GLOG" | tail -1 || true
               grep -E '^(PASS|FAIL) ⑦' "$GLOG" || echo '⑦ DMG 축 (미출력 — 태그 트리의 게이트 스크립트가 구판)'
+              # ⑨ gktool 실평가(첫-실행 스캔 경로) — PASS/FAIL 줄과 축 요약(GKTOOL_AXIS)을 함께
+              # 올린다. 이 축은 도구 부재를 SKIP 으로 허용하므로, 승격이 없으면 "gktool 없는
+              # 초록"과 "gktool 이 통과시킨 초록"이 증적층에서 구분되지 않는다.
+              grep -E '^(PASS|FAIL|SKIP) ⑨' "$GLOG" || echo '⑨ gktool 축 (미출력 — 태그 트리의 게이트 스크립트가 구판)'
+              grep -E '^GKTOOL_AXIS=' "$GLOG" || true
               echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가·degraded 폐쇄 포함)"
               echo
             } >> "$GITHUB_STEP_SUMMARY"
