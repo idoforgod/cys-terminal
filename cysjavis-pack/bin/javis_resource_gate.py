@@ -277,43 +277,73 @@ _UV_OPTS = {
     "value": frozenset(("-p", "--python", "--from", "--with", "--with-requirements", "-c",
                         "--constraints", "--index", "--index-url", "--extra-index-url",
                         "--directory", "--project", "--cache-dir", "--refresh-package",
-                        "--config-file", "--color")),
+                        "--config-file", "--color",
+                        # ★R2(수렴): 기준선 복원분 — 전부 값을 먹는다.
+                        "--with-editable", "--python-preference", "--index-strategy",
+                        "--keyring-provider", "--exclude-newer", "--resolution",
+                        "--prerelease", "--link-mode", "--default-index", "--find-links",
+                        "--upgrade-package", "--allow-insecure-host", "--no-binary-package",
+                        "--no-build-package", "--extra", "--group", "--no-group",
+                        "--only-group", "--package")),
     "bool": frozenset(("-q", "--quiet", "-v", "--verbose", "-n", "--no-cache", "--refresh",
                        "--native-tls", "--offline", "--isolated", "--system", "--preview",
                        "--no-project", "--frozen", "--locked", "--no-sync", "--no-config",
-                       "-h", "--help", "-V", "--version")),
-    "abort": frozenset(),
+                       "-h", "--help", "-V", "--version",
+                       # ★R2(수렴 · 실측 `uv run --active serena` · `uv run --no-progress serena`).
+                       "--active", "--no-active", "--no-progress", "--dev", "--no-dev",
+                       "--all-extras", "--no-extra", "--all-groups", "--no-default-groups",
+                       "--all-packages", "--no-editable", "--exact", "--inexact",
+                       "--managed-python", "--no-managed-python", "--no-binary", "--no-build",
+                       "--no-sources", "--reinstall", "-U", "--upgrade",
+                       "--compile-bytecode", "--no-compile-bytecode")),
+    # ★`--script` 는 **프로그램 자리를 옮긴다**: `uv run --script /tmp/x.py serena` 의 실행 대상은
+    #   x.py 이고 serena 는 그 인자다. 값 옵션으로 두면(=값 하나 건너뛰기) 그 뒤 토큰이 실행 주체로
+    #   승격돼 기준선의 오탐(`--script=/tmp/x.py serena` → serena)이 되살아난다. 그래서 abort 다.
+    "abort": frozenset(("--script", "--module")),
 }
 FLEET_RUNNER_OPTS = {
     "uv": _UV_OPTS, "uvx": _UV_OPTS,
     "npx": {
         "value": frozenset(("-p", "--package", "--userconfig", "--cache", "--registry",
-                            "--node-options", "--prefix", "-C")),
+                            "--node-options", "--prefix", "-C", "--loglevel", "--workspace",
+                            "--node-version")),
         "bool": frozenset(("-y", "--yes", "--no", "--no-install", "-q", "--quiet", "--silent",
                            "--prefer-online", "--prefer-offline", "--offline",
-                           "--ignore-existing", "-h", "--help")),
+                           "--ignore-existing", "-h", "--help",
+                           # ★R2(수렴 · 실측 `npx --no-audit codex`).
+                           "--no-audit", "--no-fund", "--no-progress", "--no-update-notifier",
+                           "-g", "--global", "-d", "--verbose")),
         "abort": frozenset(("-c", "--call")),      # 셸 명령 문자열 — 뒤는 그 셸의 몫이다
     },
     "npm": {
+        # ★R2(수렴 · 리뷰 major 표 1행): `npm exec --package @openai/codex codex` 는 실형상인데
+        #   `--package` 가 표에 없어 기준선이 세던 codex 를 통째로 잃었다.
         "value": frozenset(("-w", "--workspace", "-C", "--prefix", "--registry", "--userconfig",
-                            "--cache", "--node-options")),
+                            "--cache", "--node-options", "--package", "--loglevel",
+                            "--node-version", "--globalconfig")),
         "bool": frozenset(("-p", "--parseable", "-y", "--yes", "-g", "--global", "-s", "--silent",
                            "--workspaces", "--no-workspaces", "-q", "--quiet", "--offline",
                            "--prefer-online", "--prefer-offline", "--ignore-scripts",
-                           "-h", "--help")),
+                           "-h", "--help", "--no-audit", "--no-fund", "--no-progress",
+                           "--if-present", "--include-workspace-root", "-d", "--verbose")),
         "abort": frozenset(("-c", "--call")),
     },
     "pnpm": {
         "value": frozenset(("-C", "--dir", "-F", "--filter", "--package", "--registry",
-                            "--store-dir")),
+                            "--store-dir", "--reporter", "--loglevel", "--config-dir")),
         "bool": frozenset(("-r", "--recursive", "-w", "--workspace-root", "-y", "--yes",
-                           "-s", "--silent", "--offline", "--prefer-offline", "-h", "--help")),
+                           "-s", "--silent", "--offline", "--prefer-offline", "-h", "--help",
+                           "--no-progress", "--ignore-scripts", "--stream", "--aggregate-output")),
         "abort": frozenset(("-c", "--shell-mode")),
     },
     "yarn": {
-        "value": frozenset(("--cwd", "--registry", "--cache-folder", "--modules-folder")),
+        "value": frozenset(("--cwd", "--registry", "--cache-folder", "--modules-folder",
+                            "-p", "--package")),
         "bool": frozenset(("-s", "--silent", "--no-lockfile", "--offline", "--prefer-offline",
-                           "-y", "--yes", "-h", "--help")),
+                           "-y", "--yes", "-h", "--help",
+                           # ★R2(수렴 · 실측 `yarn dlx --quiet codex`).
+                           "-q", "--quiet", "--verbose", "--no-progress", "--non-interactive",
+                           "--frozen-lockfile", "--ignore-engines", "--ignore-scripts")),
         "abort": frozenset(),
     },
     "pipx": {
@@ -323,16 +353,21 @@ FLEET_RUNNER_OPTS = {
         "abort": frozenset(),
     },
     "bunx": {
-        "value": frozenset(),
+        "value": frozenset(("--cwd", "--config")),
         "bool": frozenset(("-b", "--bun", "--silent", "--no-install", "-y", "--yes",
-                           "-h", "--help")),
+                           "-h", "--help", "-v", "--version", "--revision", "--no-summary")),
         "abort": frozenset(),
     },
 }
-# 하위호환 상수(외부 임포터 보존) — 판정은 위 두 표가 한다.
+# 하위호환 상수(외부 임포터 보존) — 판정은 위 두 표가 한다. 모듈 안에서는 아무도 안 쓴다.
+# ★R2(수렴 · 리뷰 minor "하위호환 상수가 하위호환이 아니다"): `FLEET_RUNNER_VALUE_OPTS` 는 종전
+#   **긴 값 옵션 집합**이었다. 런처별 표의 `value` 를 그대로 합집합하면 `-p`·`-C`·`-w` 같은 짧은
+#   옵션까지 섞여 뜻이 조용히 바뀐다(같은 이름이 다른 것을 가리킨다). 긴 옵션만 남겨 뜻을 보존한다 —
+#   짧은 옵션은 런처마다 해석이 갈리므로(`-p` = npx 값 · npm 불리언) 애초에 합집합이 성립하지 않는다.
 FLEET_RUNNER_RULES = {k: (frozenset(c[0] for c in v if c), bool(v))
                       for k, v in FLEET_RUNNER_CHAINS.items()}
-FLEET_RUNNER_VALUE_OPTS = frozenset().union(*[o["value"] for o in FLEET_RUNNER_OPTS.values()])
+FLEET_RUNNER_VALUE_OPTS = frozenset(o for opt in FLEET_RUNNER_OPTS.values()
+                                    for o in opt["value"] if o.startswith("--"))
 FLEET_RUNNER_SUBCMDS = frozenset().union(*[frozenset(t for c in v for t in c)
                                            for v in FLEET_RUNNER_CHAINS.values()])
 FLEET_RUNNER_SCAN_MAX = 40       # 인자 스캔 상한(비용 상한 — 12 는 `node --flag`×12 형상에서 짧았다)
@@ -353,8 +388,34 @@ _LONG_CODE_MODE_FLAGS = frozenset(("--eval", "--print", "--command", "--module")
 _PY_VALUE_SHORT = "WX"          # `-W ignore` · `-X dev` (붙여 쓰면 값이 클러스터 안에 있다)
 _JS_VALUE_SHORT = "rC"          # `-r preload.js` · `-C condition`
 _PY_VALUE_LONG = frozenset(("--check-hash-based-pycs",))
-_JS_VALUE_LONG = frozenset(("--require", "--import", "--loader", "--experimental-loader",
-                            "--conditions", "--max-old-space-size", "--inspect-port"))
+# ★R2(수렴 · 리뷰 major "기준선이 세던 형상이 사라졌다"): 표를 늘리는 것이 수리다. 여기 있는 이름은
+#   전부 **값을 먹는** node/bun 옵션이라, 등재는 그 값을 실행 대상으로 오인하지 않게 만들면서
+#   (`node --diagnostic-dir /tmp/codex /tmp/report.js` → 계속 None) 그 **뒤의 진짜 실행 대상**을
+#   되찾는다(`node --diagnostic-dir /tmp/x /x/bin/codex` → codex). 두 방향 모두 검체로 박았다.
+_JS_VALUE_LONG = frozenset((
+    "--require", "--import", "--loader", "--experimental-loader",
+    "--conditions", "--max-old-space-size", "--inspect-port",
+    "--unhandled-rejections", "--stack-size", "--dns-result-order",
+    "--max-http-header-size", "--max-semi-space-size", "--v8-pool-size",
+    "--diagnostic-dir", "--cpu-prof-dir", "--cpu-prof-name", "--cpu-prof-interval",
+    "--heap-prof-dir", "--heap-prof-name", "--heap-prof-interval",
+    "--heapsnapshot-signal", "--heapsnapshot-near-heap-limit",
+    "--report-directory", "--report-filename", "--report-signal",
+    "--test-reporter", "--test-reporter-destination", "--test-name-pattern",
+    "--test-shard", "--test-concurrency", "--test-timeout",
+    "--redirect-warnings", "--disable-warning", "--disable-proto",
+    "--env-file", "--env-file-if-exists", "--title", "--icu-data-dir",
+    "--tls-cipher-list", "--tls-keylog", "--openssl-config",
+    "--trace-event-categories", "--trace-event-file-pattern",
+    "--secure-heap", "--secure-heap-min", "--use-largepages",
+    "--snapshot-blob", "--build-snapshot-config", "--watch-path",
+    "--allow-fs-read", "--allow-fs-write", "--experimental-policy", "--policy-integrity",
+    "--experimental-default-type", "--input-type", "--experimental-test-isolation",
+    "--tsconfig-override", "--experimental-config-file", "--inspect-publish-uid"))
+# ★`=` 형이라고 무조건 자족적이지 않은 이름들 — **실행 모드 자체**를 바꾼다. `node --run=build`
+#   뒤의 토큰은 Node 의 스크립트가 아니라 그 태스크의 인자다. 이 목록 밖의 `=` 형은 값 소비가
+#   이미 끝난 형태이므로 이름을 몰라도 자족적 불리언으로 통과시킨다(기준선 규칙 복원 · 리콜).
+_LONG_MODE_CHANGE_FLAGS = frozenset(("--run", "--eval", "--print", "--command", "--module"))
 # ★R3(판정자 핀 2 · codex major B2 재발): **해석하지 못한 옵션 뒤의 토큰은 소유권의 양성 근거가
 #   아니다.** 종전엔 미열거 긴 옵션을 '불리언' 으로 가정하고 건너뛰어, 그 옵션의 **값**이 첫
 #   비옵션 경로 토큰이 되어 실행 주체로 승격됐다 —
@@ -376,8 +437,40 @@ _JS_BOOL_LONG = frozenset((
     "--throw-deprecation", "--trace-deprecation", "--no-deprecation", "--pending-deprecation",
     "--preserve-symlinks", "--preserve-symlinks-main", "--abort-on-uncaught-exception",
     "--zero-fill-buffers", "--frozen-intrinsics", "--force-node-api-uncaught-exceptions-policy",
-    "--check", "--interactive", "--version", "--help", "--expose-gc", "--no-experimental-fetch"))
-_PY_BOOL_LONG = frozenset(("--help", "--version"))
+    "--check", "--interactive", "--version", "--help", "--expose-gc", "--no-experimental-fetch",
+    # ★R2(수렴 · 리뷰 major): 기준선이 세던 **평범한 불리언** 형상의 복원. 값을 안 먹으므로
+    #   등재는 뒤 토큰을 실행 대상으로 되살릴 뿐 새 오탐을 만들지 않는다.
+    "--inspect", "--inspect-brk", "--inspect-wait", "--inspect-brk-node",
+    "--experimental-strip-types", "--no-experimental-strip-types",
+    "--experimental-transform-types", "--experimental-detect-module",
+    "--no-experimental-detect-module", "--experimental-require-module",
+    "--no-experimental-require-module", "--experimental-import-meta-resolve",
+    "--experimental-network-imports", "--experimental-wasm-modules",
+    "--experimental-permission", "--experimental-sqlite", "--experimental-websocket",
+    "--experimental-test-coverage", "--experimental-global-webcrypto",
+    "--experimental-abortcontroller", "--experimental-top-level-await",
+    "--experimental-shadow-realm", "--experimental-webstorage", "--experimental-addon-modules",
+    "--no-addons", "--no-global-search-paths", "--no-force-async-hooks-checks",
+    "--no-node-snapshot", "--node-memory-debug", "--jitless", "--napi-modules",
+    "--report-uncaught-exception", "--report-on-fatalerror", "--report-on-signal",
+    "--report-compact", "--track-heap-objects", "--trace-sync-io", "--trace-tls",
+    "--trace-sigint", "--trace-atomics-wait",
+    "--use-openssl-ca", "--use-bundled-ca", "--openssl-legacy-provider",
+    "--enable-fips", "--force-fips",
+    "--insecure-http-parser", "--disallow-code-generation-from-strings",
+    "--force-context-aware", "--build-snapshot", "--prof", "--perf-basic-prof",
+    "--perf-prof", "--cpu-prof", "--heap-prof",
+    "--tls-min-v1.0", "--tls-min-v1.1", "--tls-min-v1.2", "--tls-min-v1.3",
+    "--tls-max-v1.2", "--tls-max-v1.3",
+    "--enable-network-family-autoselection", "--no-network-family-autoselection",
+    "--allow-child-process", "--allow-worker", "--allow-addons", "--allow-wasi",
+    "--watch", "--watch-preserve-output", "--test", "--test-only", "--test-force-exit",
+    "--test-update-snapshots",
+    # bun 고유(실측 형상 `bun --smol /x/bin/codex`) — 전부 값을 안 먹는다.
+    "--smol", "--hot", "--bun", "--no-install", "--silent", "--minify",
+    "--no-clear-screen", "--no-summary"))
+_PY_BOOL_LONG = frozenset(("--help", "--version", "--help-env", "--help-xoptions",
+                           "--help-all"))
 # 짧은 **불리언** 문자. 값 문자(`_*_VALUE_SHORT`)·코드 문자(`_*_CODE_MODE_LETTERS`)와 셋이
 # 서로소여야 한다 — 어느 표에도 없는 문자는 '미지' 이고, 미지 클러스터는 포기한다.
 #   python3: `-b -B -d -E -h -i -I -O -P -q -R -s -S -u -v -V -x`(값 없음 · 공식 목록)
@@ -726,10 +819,15 @@ def _fleet_opt_class(tok, js):
         name = tok.split("=", 1)[0]
         known_value = name in (_JS_VALUE_LONG if js else _PY_VALUE_LONG)
         known_bool = name in (_JS_BOOL_LONG if js else _PY_BOOL_LONG)
-        if not (known_value or known_bool):
-            return "unknown"                  # 표에 없는 이름 — `=` 형이어도 실행 모드를 모른다
         if "=" in tok:
-            return "bool"                     # 값이 자족적이다(다음 토큰을 안 먹는다)
+            # ★R2(수렴 · 리뷰 minor "= 형 거부는 순손실"): `=` 형은 값 소비가 **이미 끝난** 형태다 —
+            #   다음 토큰은 그 옵션의 값일 수 없다. 그러니 이름을 몰라도 자족적 불리언이다.
+            #   R3 가 이것까지 포기한 근거는 `--run=build`(실행 모드 변경) 하나였는데, 그 소수는
+            #   이름으로 거부하는 편이 옳다 — 전체를 포기하면 기준선이 옳게 세던 형상 다수가
+            #   미계상(=hard 가 안 걸림 = 축이 조용히 얇아짐)으로 바뀐다.
+            return "unknown" if name in _LONG_MODE_CHANGE_FLAGS else "bool"
+        if not (known_value or known_bool):
+            return "unknown"                  # 표에 없는 이름 — 값 소비 여부를 모른다
         return "value" if known_value else "bool"
     letters = _JS_VALUE_SHORT if js else _PY_VALUE_SHORT
     code = _JS_CODE_MODE_LETTERS if js else _PY_CODE_MODE_LETTERS
@@ -748,13 +846,6 @@ def _fleet_opt_class(tok, js):
     return "bool"
 
 
-def _fleet_opt_takes_value(tok, js):
-    """하위호환 얇은 껍데기 — 판정은 `_fleet_opt_class` 가 한다.
-    ★`unknown` 을 여기서 False 로 접는 것이 바로 종전의 결함이므로, 새 호출자는 이 함수가 아니라
-      `_fleet_opt_class` 를 써야 한다."""
-    return _fleet_opt_class(tok, js) == "value"
-
-
 def _fleet_runner_opt_class(tok, opts):
     """런처 옵션 토큰 → `"value"` · `"bool"` · `"abort"`(셸/명령 문자열 모드 — 언랩 종료) ·
     `"unknown"`(표에 없음 — 언랩 포기). 순수(R3 · codex "약어는 런처별이다").
@@ -765,6 +856,11 @@ def _fleet_runner_opt_class(tok, opts):
     if name in opts["value"]:
         return "bool" if (tok.startswith("--") and "=" in tok) else "value"
     if name in opts["bool"]:
+        return "bool"
+    if tok.startswith("--") and "=" in tok:
+        # ★R2(수렴 · 리뷰 minor): 런처에서도 `=` 형은 값 소비가 끝난 자족적 형태다
+        #   (`npx --loglevel=silly codex` · `pnpm dlx --reporter=silent codex`). 실행 자리를
+        #   옮기는 이름(`uv --script=`)은 위 `abort` 표가 먼저 잡는다.
         return "bool"
     return "unknown"
 
@@ -837,27 +933,36 @@ def _fleet_owner(cmd):
         #   그것이 바로 이 라운드가 없앤 B2 오탐이다. 대가는 `node --require x.js /x/codex` 형상의
         #   미계상(=차단 안 함=종전 상태)이고, 그 방향을 택한다.
         skip_next = False
+        opts_done = False
         for t in rest:
             if skip_next:
                 skip_next = False
                 continue                              # 앞 옵션이 먹은 **값** — 실행 대상이 아니다
-            # ★코드 문자열 모드가 **경로 토큰보다 먼저** 나오면 언랩하지 않는다: `-c`/`-e`/`-m` 뒤의
-            #   토큰은 실행 파일이 아니다(`python3 -c print(1) /tmp/serena`). 순서를 봐야 한다 —
-            #   실측 `node /…/bin/codex exec -m gpt-6-astra …` 처럼 **대상 프로그램의 인자**에
-            #   같은 글자가 오는 형상이 흔하다(그때는 이미 실행 주체를 정한 뒤다).
-            if _fleet_code_mode(t, js):
-                return None
-            if t == "-":
-                return None                           # stdin 스크립트 — 뒤는 그 스크립트의 인자다
-            if t.startswith("-"):
-                cls = _fleet_opt_class(t, js)
-                if cls == "unknown":
-                    # ★R3(판정자 핀 2): 해석 못 한 옵션 **뒤의 토큰을 소유권 근거로 쓰지 않는다**.
-                    #   값 소비 여부를 모르면 다음 토큰이 '그 옵션의 값' 인지 '실행 대상' 인지도
-                    #   모른다 — 둘 중 하나로 찍으면 반드시 한쪽이 오탐이다.
+            if not opts_done:
+                # ★R2(수렴 · 리뷰 major 표 1·2행): `--` 는 '모르는 옵션' 이 아니라 **옵션 해석을
+                #   끝내는 상태 전이**다(POSIX). 그 뒤의 첫 토큰은 정의상 실행 대상이므로,
+                #   `node -- /opt/bin/codex exec` · `python3 -- /opt/bin/serena` 는 기준선처럼
+                #   다시 소유자를 낸다. 런처 갈래(:아래)는 이미 같은 규칙을 갖고 있었다.
+                if t == "--":
+                    opts_done = True
+                    continue
+                # ★코드 문자열 모드가 **경로 토큰보다 먼저** 나오면 언랩하지 않는다: `-c`/`-e`/`-m` 뒤의
+                #   토큰은 실행 파일이 아니다(`python3 -c print(1) /tmp/serena`). 순서를 봐야 한다 —
+                #   실측 `node /…/bin/codex exec -m gpt-6-astra …` 처럼 **대상 프로그램의 인자**에
+                #   같은 글자가 오는 형상이 흔하다(그때는 이미 실행 주체를 정한 뒤다).
+                if _fleet_code_mode(t, js):
                     return None
-                skip_next = (cls == "value")
-                continue                              # 런타임 옵션 — 실행 대상이 아니다
+                if t == "-":
+                    return None                       # stdin 스크립트 — 뒤는 그 스크립트의 인자다
+                if t.startswith("-"):
+                    cls = _fleet_opt_class(t, js)
+                    if cls == "unknown":
+                        # ★R3(판정자 핀 2): 해석 못 한 옵션 **뒤의 토큰을 소유권 근거로 쓰지 않는다**.
+                        #   값 소비 여부를 모르면 다음 토큰이 '그 옵션의 값' 인지 '실행 대상' 인지도
+                        #   모른다 — 둘 중 하나로 찍으면 반드시 한쪽이 오탐이다.
+                        return None
+                    skip_next = (cls == "value")
+                    continue                          # 런타임 옵션 — 실행 대상이 아니다
             # ★R2(리뷰 major): 여기서 멈춘다 — 첫 **비옵션** 토큰이 실행 대상(스크립트·모듈)이고,
             #   그 뒤는 전부 그 프로그램의 **데이터 인자**다. 종전 판본은 '슬래시 있는 첫 토큰' 을
             #   찾느라 상대경로 스크립트를 건너뛰어 `python3 report.py /tmp/serena` ·
@@ -1149,6 +1254,20 @@ def _fleet_expired_mark_set(path):
         return False
 
 
+def _fleet_expired_reason(path, stale):
+    """만료 사유 문자열 — **표식이 실제로 서 있는가**를 사유에 적는다. 순수하지 않음(표식 1회 조회).
+
+    ★R2(수렴 · 리뷰 minor "표식 생성 실패가 조용하다"): `_fleet_hold_write` 는
+      `_fleet_expired_mark_set` 의 반환값을 버린다 — 상태 디렉터리가 쓰기 불가(ENOSPC/EACCES)면
+      표식이 안 서고, 만료는 **가변 레코드의 비트 하나**로만 남는다. 그 상태는 이 라운드가 고친
+      잃어버린 갱신 경합이 그대로 되살아난 것인데, 종전엔 아무 표시가 없었다. 대칭적으로 `below`
+      의 삭제 실패는 `clear_failed` 로 남는다 — 생성 실패만 침묵할 이유가 없다.
+      방향: 사유만 바뀐다(만료 여부·exit 불변). `_stale` 접미는 유지한다 — 사람 출력의
+      `endswith("_stale")` 판정이 그것을 읽는다."""
+    base = "expired" if _fleet_expired_mark(path) else "expired_unmarked"
+    return (base + "_stale") if stale else base
+
+
 def _fleet_expired_mark_clear(path):
     """만료 표식 삭제 → 성공 여부(부재도 성공). `below` 경로 전용."""
     try:
@@ -1273,7 +1392,10 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
 
     state ∈ "hard"(임계 이상) · "below"(쟀는데 임계 미만) · "unmeasured"(값이 없다 — 축 부재·측정 실패).
     reason ∈ "override" · "armed" · "held" · "held_stale" · "expired" · "expired_stale" ·
-             "cleared" · "clear_failed" · "unmeasured" · "unbounded_io".
+             "expired_unmarked" · "expired_unmarked_stale" · "cleared" · "clear_failed" ·
+             "unmeasured" · "unbounded_io".
+    ★`expired_unmarked*` = 만료는 났는데 **표식 파일을 못 세웠다**(상태 디렉터리 쓰기 불가).
+      만료 자체는 그대로 공개하지만(방향 불변), 그 만료는 경합에 취약하다는 사실을 사유로 남긴다.
     계약(봉인표 ③): `expired=True` 면 소비자(evaluate)가 hard 를 soft 로 내린다.
       · below            → 래치 삭제(연속만 센다) · expired False
       · unmeasured       → 래치 **무접촉**(codex R1-2): 값을 못 잰 호출이 남의 연속 hard 시계를 0으로
@@ -1333,7 +1455,7 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
         hold = max(0.0, now - rec["since"])
         stale = (now - rec["last"]) > FLEET_CPU_HARD_MAX_HOLD_SECS
         _fleet_hold_write(path, {"since": rec["since"], "last": now, "expired": True}, merge=True)
-        return hold, ("expired_stale" if stale else "expired"), True
+        return hold, _fleet_expired_reason(path, stale), True
     if rec is None or rec["since"] > now + FLEET_HOLD_FUTURE_SLACK_S:
         # 부재·파손·미래 저장값(시계 역행) → 지금 무장. 쓰기 실패는 유계 증명 불능이다.
         # ★R3: **표식이 살아 있으면 무장이 아니라 만료다.** 레코드를 잃었거나(부재·파손) 시계가
@@ -1341,8 +1463,15 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
         #   여기서 재무장하면 그 공개가 취소되고 상한만큼이 다시 막힌다(판정자 핀 1c).
         if _fleet_expired_mark(path):
             _fleet_hold_write(path, {"since": now, "last": now, "expired": True}, merge=True)
-            return 0.0, "expired", True
+            return 0.0, _fleet_expired_reason(path, False), True
         ok = _fleet_hold_write(path, {"since": now, "last": now, "expired": False})
+        # ★R2(수렴 · 리뷰 minor "되읽기가 held 갈래에만 있다"): 무장 갈래도 **쓰기 뒤에** 표식을
+        #   되읽는다. 종전엔 쓰기 **전** 한 번만 봐서, 우리가 재무장하는 사이 다른 호출이 공개한
+        #   만료가 이 호출에만 안 보였다 — '만료는 모든 호출자에게 동일하게 보인다' 는 이 수리의
+        #   계약이 이 갈래에서만 깨져 있었다(파일=True · 반환=False). 표식은 단조(생성 전용)라
+        #   이 되읽기는 남의 갱신을 잃어버릴 수 없다.
+        if ok and _fleet_expired_mark(path):
+            return 0.0, _fleet_expired_reason(path, False), True
         return (0.0 if ok else None), ("armed" if ok else "unbounded_io"), (not ok)
     # 허용오차 안의 '미래' 저장값은 음수 경과를 만든다 — 0 으로 죈다(음수 보류초는 뜻이 없다).
     hold = max(0.0, now - rec["since"])
@@ -1359,7 +1488,7 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
     if not expired and _fleet_expired_mark(path):
         expired, stale = True, (now - rec["last"]) > FLEET_CPU_HARD_MAX_HOLD_SECS
     if expired:
-        return hold, ("expired_stale" if stale else "expired"), True
+        return hold, _fleet_expired_reason(path, stale), True
     return hold, ("held_stale" if stale else "held"), False
 
 
