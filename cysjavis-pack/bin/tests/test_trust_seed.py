@@ -5597,6 +5597,11 @@ class TriageConvergence(TriageP1WP2Trust):
     판정한다 ②통상 경로(활성 무변경)는 그 크래시 뒤에도 잔재·conflict 0 이다(보수화가 상시 잔재가 되지 않는다)
     ③저널이 아직 책임지는 사본은 고아 가드의 대상이 아니다(codex 설계비평 4) ④보존 rename 이 실패하면 저널을
     남긴다(codex 설계비평 2) ⑤플래그뿐인 최소 문서 임시본은 종전대로 청소된다(격리 위양성 0).
+    ★수렴 R2(2026-09-08 · 최종 리뷰 claude) 추가분: ⑥저널 공개 **전** 크래시(triage 가 '더 넓다' 고 적은 ⓑ 창)의
+    무손실 잔재는 conflict 로 격리되지 않는다 — '지금 다시 계획한 payload 와 바이트 동등' 증명 ⑦그 창은 교환 기구
+    상시 부재(Windows) 축에서 부트마다 다시 열리는데 **누적이 없다** ⑧청소가 격리를 해 놓고 `_read_plan()` 오류로
+    빠져나가도 사유를 버리지 않는다 ⑨교환 성공 뒤 보존은 성공/실패를 갈라 적는다 ⑩플래그뿐 문서 통의 **실제 범위**
+    (다중 키는 든다 · `true` 아닌 플래그는 지킨다).
     `TriageP1WP2Trust` 를 상속하는 것은 **의도**다 — 헬퍼(`payload_bytes`·`assert_only_copy_survives`·`plant_orphan_copy`)를
     공유하고, 재유도 5핀이 이 클래스에서 한 번 더 도는 것이 수렴 계약의 음성 대조가 된다(중복 실행 0.03s)."""
 
@@ -5744,6 +5749,137 @@ class TriageConvergence(TriageP1WP2Trust):
         self.assertEqual(rc, 0, reason)
         self.assertIn("stale-tmp swept 2", reason)
         self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [], "지킬 데이터가 없는 잔재를 격리했다")
+
+    def crash_before_journal(self):
+        """SIGKILL 모사 — 저널 **공개 전** 사망(triage 가 '더 넓다' 고 적은 ⓑ 창: mkstemp 기록~저널 공개).
+        `finally` 가 돌지 않으므로 mkstemp payload(= 원본 + 플래그)가 그대로 남고 **활성은 무접촉**이다 —
+        즉 이 창의 잔재는 정의상 활성과 바이트가 다르고, 잃을 것은 하나도 없다."""
+        with patch.object(pf, "_write_seed_intent", side_effect=KeyboardInterrupt), \
+                patch.object(pf, "_unlink_quiet", lambda path: None):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+
+    def test_conv_crash_before_the_journal_leaves_no_conflict_on_the_normal_path(self):
+        """★수렴 R2(최종 리뷰 claude major) — 음성 대조가 비어 있던 ⓑ 창.
+        저널 공개 전 사망이 남기는 잔재는 언제나 `원본 + 플래그`이고 그때 활성은 `원본` 그대로다 → 활성 대조
+        (`_active_digest == _payload_digest`)는 **정의상** 성립하지 않는다. 종전 규칙은 그래서 원본이 사용자 문서이기만
+        하면 **잃을 것이 하나도 없는 통상 경로**에서 격리를 돌렸다(실측 2026-09-08: 부트 1회에 conflict 1개 · 그 내용이
+        최종 활성과 바이트 동일한 순수 쓰레기인데 사유는 '사람이 병합').
+        '잔재 == 지금 다시 계획한 payload' 증명이 그 자리를 덮는다: conflict 0 · 잔재 0 · 활성 무손실."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        self.crash_before_journal()
+        litter = [n for n in self.names(pf.SEED_TRUST_TMP_PREFIX) if n != pf.SEED_TRUST_LOCK_NAME]
+        self.assertEqual(len(litter), 1, os.listdir(self.cfg))              # 창이 실제로 재현됐다
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, litter[0])), self.payload_bytes())
+        self.assertEqual(_read_bytes(self.cfgfile), before, "활성 무접촉 창이어야 한다(전제)")
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [], "저널 공개 전 창이어야 한다(전제)")
+        r = self.seed()
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [],
+                         "잃을 것이 없는 잔재를 영구 conflict 로 격리했다: %s" % sorted(os.listdir(self.cfg)))
+        self.assertIn("stale-tmp swept 1", r[2], r[2])
+        self.assertNotIn("stale-tmp preserved", r[2], r[2])
+        self.assertEqual([n for n in self.names(pf.SEED_TRUST_TMP_PREFIX) if n != pf.SEED_TRUST_LOCK_NAME], [])
+        self.assertEqual(json.loads(_read_bytes(self.cfgfile))["user"], "ONLY-COPY")
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return                      # ★R6 축: 교환 기구가 없어도 청소 계약은 위에서 이미 단언했다
+        self.assertEqual(r[0], 0, r)
+
+    def test_conv_the_pre_journal_crash_does_not_accumulate_conflicts(self):
+        """상한 없는 누적의 회귀 핀(같은 major) — 교환 기구가 **상시 부재**면(Windows) 플래그가 영영 커밋되지 않아
+        `changed` 가 매 부트 참이라 그 창이 좌석마다 다시 열린다. 실측(수정 전): conflict 0→1→2→3→4→5 · 총 0→875B ·
+        상한 없음(어느 자동 경로도 conflict 네임스페이스를 지우지 않는다 · 실 `.claude.json` 은 수 MB 도 흔하다).
+        수정 뒤에는 몇 번을 돌아도 conflict 0 이고 활성 바이트는 불변이다."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        unavailable = lambda a, b: pf._ExchangeUnavailable("platform:nt")   # noqa: E731 — 축 강제(플랫폼 무관 재현)
+        for boot in range(3):
+            with patch.object(pf, "_exchange_paths", unavailable):
+                self.crash_before_journal()
+                r = self.seed()
+            self.assertEqual(r[:2], (2, "REFUSE"), r)
+            self.assertIn("exchange-unavailable", r[2])
+            self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [],
+                             "부트 %d: 무손실 크래시 잔재가 conflict 로 쌓였다 %s" % (boot + 1, sorted(os.listdir(self.cfg))))
+            self.assertEqual([n for n in self.names(pf.SEED_TRUST_TMP_PREFIX) if n != pf.SEED_TRUST_LOCK_NAME], [],
+                             "부트 %d: 잔재가 남았다" % (boot + 1))
+            self.assertEqual(_read_bytes(self.cfgfile), before, "거부 축인데 활성 바이트가 바뀌었다")
+
+    def test_conv_a_litter_from_another_cwd_is_still_preserved(self):
+        """음성 대조: 계획 대조 증명은 **같은 cwd 일반형**만 덮는다 — 다른 cwd 의 잔재(= 지금 계획과 다른 바이트)에
+        사용자 데이터가 들어 있으면 종전대로 격리한다(증명이 없으면 보존)."""
+        self.untrusted_file(self.ORIGINAL)
+        other, _c, _k = pf.trust_plan(json.loads(self.ORIGINAL), "/some/other/cwd")
+        foreign = json.dumps(other, ensure_ascii=False, indent=2).encode("utf-8")
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"), foreign)
+        r = self.seed()
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertIn("stale-tmp preserved", r[2], r[2])
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, kept[0])), foreign)
+
+    def test_conv_flag_only_scope_is_pinned_and_a_declined_flag_is_kept(self):
+        """★수렴 R2(최종 리뷰 claude minor) — '플래그뿐 문서' 통의 **실제 범위** 검체(문면을 술어에 맞춘 뒤의 고지).
+        ① 다른 폴더의 신뢰 플래그만 든 다중 키 문서도 그 통에 든다 = 청소된다 — 근거는 '작다' 가 아니라 **재생성 가능**
+           (그 좌석의 다음 부트가 그 자리에서 다시 심는다). 종전 독스트링은 이 통을 '부재 dir 의 최소 문서' 로만 설명했다.
+        ② 값이 정확히 `true` 가 **아닌** 플래그(`false` = 사람이 관문에서 거절한 결정)는 시더가 쓰지 않는 값이므로 지킨다."""
+        multi = json.dumps({"projects": {"/some/other/folder": {"hasTrustDialogAccepted": True},
+                                         "/new": {"hasTrustDialogAccepted": True}}},
+                           ensure_ascii=False, indent=2).encode("utf-8")
+        declined = b'{"projects": {"/o": {"hasTrustDialogAccepted": false}}}'
+        self.assertFalse(pf._document_carries_user_data(multi))
+        self.assertTrue(pf._document_carries_user_data(declined))
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"), multi)
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd35"), declined)
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertIn("stale-tmp swept 1", reason)                 # 다중 키 플래그 문서만 청소
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertIn("stale-tmp preserved", reason)
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, kept[0])), declined)
+
+    def test_conv_sweep_reason_survives_a_read_plan_error(self):
+        """★수렴 R2(최종 리뷰 claude minor): 청소가 **격리(conflict 이동)** 를 해 놓고 `_read_plan()` 오류로 빠져나가면서
+        사유를 통째로 버렸다 — 디스크는 바뀌었는데 '사람이 병합해야 할 파일이 생겼다' 가 침묵하는 파일시스템 변경이다."""
+        self.untrusted_file("{broken")                              # 활성 손상 → _read_plan 이 ERROR
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"),
+                     b'{"user": "ONLY-COPY", "projects": {"/o": {"hasTrustDialogAccepted": true}}}')
+        rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("파싱 실패", reason)
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertIn("stale-tmp preserved", reason)
+        self.assertIn(kept[0], reason, "격리한 파일 이름을 사유에 적지 않았다")
+        self.assert_only_copy_survives("손상 활성 경로가 사본을 지웠다")
+
+    def test_conv_exchange_success_reports_a_failed_preserve_as_failed(self):
+        """★수렴 R2(최종 리뷰 claude minor): `_preserve_copy` 가 실패하면 사본은 conflict 네임스페이스로 **옮겨지지
+        않았다** — 그런데 문면은 `displaced-preserved(...)` 로 성공을 단언했다(이름 모양으로만 실패를 유추).
+        `_orphan_recovery_guard`(moved/stuck) · `_sweep_stale_seed_tmp`(preserved/preserve-failed) ·
+        `_release_uncommitted_copy`('사본 보존'/'사본 보존 실패')와 같은 규율로 가른다."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        real_ex = pf._exchange_paths
+
+        def exchange_then_replace(a, b):
+            r = real_ex(a, b)
+            if r is True:
+                _write(b, "{}")                                     # 교환 직후 끼어든 파괴자
+            return r
+
+        with patch.object(pf, "_exchange_paths", exchange_then_replace), \
+                patch.object(pf, "_preserve_copy", return_value=None):
+            r = self.seed()
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return                                                  # 교환 기구가 없으면 이 창 자체가 열리지 않는다
+        self.assertIn("displaced-preserve-failed", r[2], r[2])
+        self.assertNotIn("displaced-preserved(", r[2], r[2])
+        self.assertEqual(len(self.names(pf.SEED_TRUST_INTENT_PREFIX)), 1, "보존에 실패했는데 저널을 지웠다")
+        self.assertEqual(len(self.names(pf.SEED_TRUST_DISPLACED_PREFIX)), 1, os.listdir(self.cfg))
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [], "실패인데 conflict 사본이 생겼다")
+        self.assert_only_copy_survives("보존 실패 경로가 옛 원본을 지웠다")
 
     def test_conv_journal_tmp_field_is_validated(self):
         """codex 설계비평 5: `tmp` 는 **mkstemp 이름 형식의 basename** 만 — 경로 탈출·타 네임스페이스·개행 꼬리는 형식
