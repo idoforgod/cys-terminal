@@ -457,7 +457,11 @@ fn append_side_records(
             Some(Err(DirSyncMiss::Failed(e))) => fail(format!("원장 디렉터리 sync 실패: {e}")),
             // ★(triage 2026-09-08) 불가 환경은 삭제를 막지 않는다(가용성) — 대신 **그 사실을
             //   이벤트로 낸다**. 이 배치의 id 를 함께 실어 사후 대조가 가능하게 한다(침묵 금지).
-            Some(Err(m @ DirSyncMiss::Unsupported(_))) => {
+            // ★경로당 **1회만** 낸다. Windows 는 이 축이 상시 없어서(디렉터리 핸들 flush 불가)
+            //   매 묘비 배치마다 같은 사실을 발행하면 이벤트 링이 그것으로 찬다 — 사실은 묘비 줄의
+            //   `dir_synced:false` 에 매 줄 실려 있고, 이 이벤트는 '이 설치에서 그 축이 없다' 는
+            //   1회 고지다(침묵 금지의 최소치).
+            Some(Err(m @ DirSyncMiss::Unsupported(_))) if dir_sync_notice_first(&p) => {
                 daemon.bus.publish(
                     "delivery.dir_sync_unsupported",
                     "system",
@@ -512,6 +516,17 @@ impl std::fmt::Display for DirSyncMiss {
             DirSyncMiss::Failed(e) => write!(f, "디렉터리 fsync 실패: {e}"),
         }
     }
+}
+
+/// 이 경로에 대해 "디렉터리 내구화 축 없음" 을 **아직 고지하지 않았는가**(고지하면 참을 돌려주고
+/// 그 경로를 기억한다 — 프로세스 수명 동안 1회).
+fn dir_sync_notice_first(p: &Path) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(p.to_path_buf())
 }
 
 /// 이 디렉터리에 **핸들을 열 수 있는가**(= 내구화 축이 존재하는가). fsync 는 하지 않는다 —
