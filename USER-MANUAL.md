@@ -822,7 +822,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
-| `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보 |
+| `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보. quiet 는 **1 미만 설정을 1로 승격**(0초 강제주입 봉인 — overdue 단계와 같은 하한). 이 노브는 **언제 배달할지**만 조정한다 — alt-screen 의 약한 레이아웃 증거가 요구하는 '출력 정적' 은 판정부 상수 3초(`readiness::BOOT_VALVE_QUIET_SECS`)이고 이 노브로 바뀌지 않는다 |
 | `CYS_QUEUE_MAX_WAIT_SECS` | 0 (=비활성) | 단계형 quiet — 큐 머리가 이 값 이상 대기하면 quiet 임계를 낮춘 '제한 배달(overdue)' 자격. 0=현행 quiet 3s 그대로(활성 권장 120) |
 | `CYS_QUEUE_OVERDUE_QUIET_SECS` | 1 | overdue 단계의 quiet 임계 — 1 미만 설정은 1로 승격(0초 강제주입 봉인) |
 | `CYS_QUEUE_STARVE_ALERT_SECS` | 0 (=비활성) | 큐 머리 기아 경보 임계 — 이 값 이상 배달이 막혀 있으면 `queue.starved` 발행(쿨다운 5분·depth_high와 별도 축·발행뿐 자동 조치 없음. 활성 권장 600) |
