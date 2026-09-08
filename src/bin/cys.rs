@@ -11293,7 +11293,12 @@ const GATE_REASON_CARRY_UNPROVEN: &str = "carry-unproven";
 /// 나가고, 2.1.261 의 기본 포커스는 `No, exit` 다 — ⓐ 절이 경고한 바로 그 사망을 ⓑ 절이 로스터
 /// 전체에서 일으킨다(문단 내부 모순). 문안을 고치는 것이 지금의 수리이고, 옳은 방향(좌석 한정
 /// 채택 동사)은 `roles` 부분 배열·티켓 회계·GUI 소비 계약을 함께 바꿔야 하므로 이 WP 밖이다.
-/// 파리티: python `javis_bootstrap._GATE_REASON_PRESCRIPTION[carry-unproven]`(H-BOOT-GATE-78 이 대조).
+/// 파리티: python `javis_bootstrap._GATE_REASON_PRESCRIPTION[carry-unproven]` 과 **같은 문안**이어야
+/// 한다(두 채널 = 부트 요약 소비자 · `cys boot --json` 의 `hint` 소비자·CLI 안내).
+/// ★(수렴 R2 · codex 본문 caveat) 그 파리티를 재는 것은 `cysjavis-pack/bin/tests/test_carry_unproven_scope.py`
+/// 다 — 두 채널의 처방을 뽑아 **같은 범위·대가 토큰 집합**으로 대조한다. 헬스체크 H-BOOT-GATE-78 의
+/// 보증 범위는 그보다 좁다(사유 상수와 스위치 **부분문자열 존재** + 스위치 문장 뒤 범위·대가 어휘 1축).
+/// 즉 "파리티는 헬스체크가 본다" 는 과대주장이었다 — 전문 대조는 저 검체다.
 const CARRY_UNPROVEN_HINT: &str = "화면은 읽었고 관문 서명도 없었지만 **입력 상자(대기 프롬프트) 레이아웃 증거가 없다** — 재도색 중이라 선택지 라벨이 아직 안 그려진 관문일 수 있어 주입 0 · 키 0 으로 보류했다. ⓐ먼저 `cys read-screen` 으로 화면을 1회 확인하라(관문이면 사람이 통과시킨다). ⓑ화면이 **정상 입력창인데도** 다음 `cys boot` 이 같은 판정을 내면 그 레이아웃은 이 축의 양성 어휘 밖이다 — 마지막 수단이 `CYS_BOOT_GATES=0 cys boot` 이다. ★그러나 이것은 좌석 1개짜리 손잡이가 아니다: `cys boot` 은 로스터 전체를 돌고 이 스위치는 **그 부트의 모든 좌석**에서 관문·모달 거부를 함께 끈다(종전 판정에서는 첫기동 관문 6종이 전부 ready 다). 다른 좌석이 진짜 관문에 앉아 있으면 그 좌석에도 디렉티브 + Return 이 나가고 그 창의 기본 포커스는 `No, exit` 이다 = 좌석 사망. 그러므로 쓰기 전에 **모든 좌석**을 `cys read-screen` 으로 1회씩 확인해 관문에 앉은 좌석이 0 임을 보고, 그 뒤에만 1회 채택용으로 쓰라(종전 판정 복귀 · 그 부트에서만 유효).";
 
 /// ★(0.14.31 · 리뷰 R2(R7회차) · codex major D4) **주입 도중 가드가 걸린** 보류의 관문 id.

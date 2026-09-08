@@ -12619,6 +12619,22 @@ def h_boot_gate_78():
         # ★(리뷰 R7) 두 처방이 **같은 스위치**를 지목한다(한쪽만 고치면 채널마다 다른 지시가 나간다).
         need("CYS_BOOT_GATES=0 cys boot" in rs,
              "Rust 쪽 이월 처방이 롤백 스위치를 지목하지 않는다(처방 파리티 붕괴)")
+        # ★(0.14.31 · 수렴 R2 · codex 본문 caveat) 종전에는 스위치를 **지목하는지**만 봤다 — 그래서
+        #   A-M3 이 넣은 범위(모든 좌석)·대가(관문 거부가 함께 꺼진다 · 기본 포커스 `No, exit`) 문안이
+        #   Rust 쪽에서만 지워져도 이 관문은 계속 초록이었고, 그때 `cys boot --json` 의 hint 를 읽는
+        #   소비자만 마스터 스위치를 **범위 고지 없이** 권고받는다(python 채널과 지시가 갈린다).
+        #   전문 대조는 tests/test_carry_unproven_scope.py 가 두 채널에 같은 토큰 집합으로 하고,
+        #   여기서는 같은 사실의 값싼 축 하나를 **스위치 문장 뒤**에서 건다(문안 전문 파리티 아님).
+        hi = rs.find("const CARRY_UNPROVEN_HINT: &str =")
+        need(hi >= 0, "Rust 처방 상수 `CARRY_UNPROVEN_HINT` 가 사라졌거나 이름이 갈렸다 — "
+                      "이 채널의 처방을 재는 대상이 없다(파리티 붕괴)")
+        si = rs.find("CYS_BOOT_GATES=0 cys boot", hi) if hi >= 0 else -1
+        hint_tail = rs[si:][:1500] if si >= 0 else ""
+        need(any(t in hint_tail for t in ("모든 좌석", "로스터 전체", "다른 좌석"))
+             and any(t in hint_tail for t in ("No, exit", "좌석 사망", "함께 끈다", "함께 꺼진다")),
+             "Rust 이월 처방이 마스터 스위치를 **범위·대가 고지 없이** 권한다 — 좌석 1개 사실에 "
+             "로스터 전체의 관문·모달 거부를 끄는 손잡이를 조건 없이 권고한다(python 처방과 문안 "
+             "파리티 붕괴 · 전문 대조는 tests/test_carry_unproven_scope.py)")
         # ★(리뷰 R7 · codex major D4) '관문을 못 봤다(unknown)' 와 '가드가 보고 멈췄다' 를 표식에서
         #   가른다 — 섞이면 재부트 채택의 이월 래치가 실제 관측 이력을 잃는다.
         need('GATE_ID_INJECT_HELD: &str = "inject-guard-held"' in rs,
