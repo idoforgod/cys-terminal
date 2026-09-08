@@ -74,11 +74,16 @@ def run_hook(tmp, seats, cys_mode, role_env=None, cys_present=True):
                     'printf "%%s\\n" "${CYS_NO_AUTOSTART:-<unset>}" >> "%s/autostart.log"\n'
                     'case "$1" in surface-role) %s ;; esac\nexit 0\n' % (tmp, body))
     env = {k: v for k, v in os.environ.items()
-           if k not in ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SOCKET")}
+           if k not in ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SOCKET",
+                        "CYS_GATE_LANE_SOCKET", "CYS_SOUL")}
     # PATH 는 스텁만 + 최소 시스템(awk·grep·sed·printf 해소용)
     env["PATH"] = bindir + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
     env["CYS_PACK_DIR"] = pack
     env["CYS_ROOT"] = tmp
+    # ★R3(codex · CI 3레인 등재 전제): **홈 무접촉**. 빈 임시 팩에는 soul 이 없어서 훅의 soul 해소가
+    #   `$HOME/.claude/soul.md` → `$HOME/.cys/pack/soul.md` 로 폴백한다 — 러너/오너 홈의 내용이
+    #   판정에 섞이면 초록이 근거가 되지 못한다. `HOME` 을 임시로 고정하고 `CYS_SOUL` 상속도 끊는다.
+    env["HOME"] = tmp
     if role_env:
         env["CYS_ROLE"] = role_env
     payload = json.dumps({"source": "startup", "cwd": cwd})

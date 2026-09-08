@@ -438,6 +438,46 @@ jobs:
       #   티켓): ①드리프트(재합성==커밋본) ②표지 핀 구·신 템플릿 공통 실존 ③bash 스니펫 실행 스모크.
       #   ci-branch.yml 의 같은 게이트가 조기 경보, 여기가 최종 차단선. 레그는 macOS 네이티브 1회
       #   (게이트 대상 = 리포 커밋본 텍스트라 OS 무관 — 위 계약 게이트와 같은 레그 고정 근거).
+      # ★WP-7 R3(0.14.31 · 독립 재유도 지적 2·5): **안 도는 검체는 게이트가 아니다** 의 재발.
+      #   `cysjavis-pack/tests/` → `cysjavis-pack/bin/tests/` 이동은 됐는데 등재가 없어
+      #   test_resource_gate·test_resource_gate_fleet_cpu·test_inject_context_role_seat 세 스위트와
+      #   `javis_resource_gate.py --self-test` 가 **3레인 전부에서 0회 실행**이었다. 그 사각 안에
+      #   WP-7 이 R1·R2·R3 에서 고친 것들(함대CPU 소유권·보류 상한 래치·부트 유예·역할 좌석 강등)의
+      #   핀이 전부 들어 있다 — 다음 회귀는 초록으로 지나간다.
+      #   ★기존 목록에 이름만 덧붙이지 않고 **전용 스텝**으로 둔 이유(codex): 같은 꼬리 줄을 여러
+      #     레인 워커가 동시에 고치면 통합에서 충돌한다. 스텝 단위면 삽입 지점이 서로 다르다.
+      #   ★밀폐: 검체마다 임시 CYS_PACK_DIR·CYS_STATE_DIR·JAVIS_ROOT + 소켓/역할/soul env 제거
+      #     (`env -u`). 라이브 데몬·오너 홈 무접촉 — 훅 검체는 자기 HOME 도 임시로 고정한다.
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지) · 파일 부재와 비정상 종료는 그대로 실패다.
+      #   실측(로컬): 네 검체 합 약 1.6s + self-test 0.2s.
+      - name: 팩 검체 — 자원 게이트·함대CPU·역할 좌석 (WP-7 R3 3레인 등재 · leg1)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_resource_gate test_resource_gate_fleet_cpu \
+                   test_inject_context_role_seat test_wp7_gate_triage; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t =="
+            env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
+            r=$?
+            tail -60 "/tmp/wp7-$t.log"
+            [ $r -eq 0 ] || { echo "::error::$t rc=$r (WP-7 자원 게이트 회귀)"; rc=$r; }
+          done
+          g="cysjavis-pack/bin/javis_resource_gate.py"
+          [ -f "$g" ] || { echo "게이트 누락: $g (git add 누락 의심)" >&2; exit 1; }
+          echo "== javis_resource_gate --self-test =="
+          env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
+              CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+              python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
+          r=$?
+          tail -20 /tmp/wp7-selftest.log
+          [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
+          exit $rc
+
       - name: CEO_TEMPLATE 재합성 드리프트 게이트 (gen --check · 릴리스 차단)
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
@@ -1027,6 +1067,46 @@ jobs:
       # ★cargo clean 선행 — rust-cache가 복원한 스테일 OUT_DIR/pack_all.rs(이전 cysjavis-pack 트리로
       # 생성된 임베드 테이블)가 재사용돼 manifest SOT를 오염시키는 회귀를 차단한다. 캐시 복원 직후에
       # target을 비워 build.rs 코드젠을 강제 재실행시킨다(스테일 생성표 무효화).
+      # ★WP-7 R3(0.14.31 · 독립 재유도 지적 2·5): **안 도는 검체는 게이트가 아니다** 의 재발.
+      #   `cysjavis-pack/tests/` → `cysjavis-pack/bin/tests/` 이동은 됐는데 등재가 없어
+      #   test_resource_gate·test_resource_gate_fleet_cpu·test_inject_context_role_seat 세 스위트와
+      #   `javis_resource_gate.py --self-test` 가 **3레인 전부에서 0회 실행**이었다. 그 사각 안에
+      #   WP-7 이 R1·R2·R3 에서 고친 것들(함대CPU 소유권·보류 상한 래치·부트 유예·역할 좌석 강등)의
+      #   핀이 전부 들어 있다 — 다음 회귀는 초록으로 지나간다.
+      #   ★기존 목록에 이름만 덧붙이지 않고 **전용 스텝**으로 둔 이유(codex): 같은 꼬리 줄을 여러
+      #     레인 워커가 동시에 고치면 통합에서 충돌한다. 스텝 단위면 삽입 지점이 서로 다르다.
+      #   ★밀폐: 검체마다 임시 CYS_PACK_DIR·CYS_STATE_DIR·JAVIS_ROOT + 소켓/역할/soul env 제거
+      #     (`env -u`). 라이브 데몬·오너 홈 무접촉 — 훅 검체는 자기 HOME 도 임시로 고정한다.
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지) · 파일 부재와 비정상 종료는 그대로 실패다.
+      #   실측(로컬): 네 검체 합 약 1.6s + self-test 0.2s.
+      - name: 팩 검체 — 자원 게이트·함대CPU·역할 좌석 (WP-7 R3 3레인 등재 · leg2-서명전)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_resource_gate test_resource_gate_fleet_cpu \
+                   test_inject_context_role_seat test_wp7_gate_triage; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t =="
+            env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
+            r=$?
+            tail -60 "/tmp/wp7-$t.log"
+            [ $r -eq 0 ] || { echo "::error::$t rc=$r (WP-7 자원 게이트 회귀)"; rc=$r; }
+          done
+          g="cysjavis-pack/bin/javis_resource_gate.py"
+          [ -f "$g" ] || { echo "게이트 누락: $g (git add 누락 의심)" >&2; exit 1; }
+          echo "== javis_resource_gate --self-test =="
+          env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
+              CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+              python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
+          r=$?
+          tail -20 /tmp/wp7-selftest.log
+          [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
+          exit $rc
+
       - name: cargo clean (스테일 생성표 무효화)
         run: cargo clean
 
