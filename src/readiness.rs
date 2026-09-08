@@ -3069,6 +3069,46 @@ mod tests {
         }
     }
 
+    /// ★[triage 2026-09-08 · 판정서 요구 "가용성 대조군"] **실측 상태줄은 그대로 경계로 선다.**
+    ///
+    /// §WP5-06 의 수리는 조이는 방향이므로, 조여진 뒤에도 실측 문면이 통과하는지를 같은 자리에서
+    /// 잰다(막는 쪽으로만 틀린다 ≠ 다 막는다). 대조는 셋이다:
+    ///   ⓐ 2.1.263 실측 `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`
+    ///   ⓑ 2.1.241 실측 `? for shortcuts`
+    ///   ⓒ 같은 토큰이 든 **사람 문장**(한글·장식 없음)은 여전히 경계가 아니다 — 이것이 없으면
+    ///      이 검체는 "다 통과시키면 통과한다" 는 동어반복이 된다.
+    #[test]
+    fn triage_wp5_measured_status_rows_still_close_the_edit_region() {
+        for (name, status) in [
+            ("2.1.263", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"),
+            ("2.1.241", "  ? for shortcuts"),
+        ] {
+            let screen = format!("  이전 출력
+❯ 
+{status}
+");
+            assert!(
+                composer_edit_region_empty(&screen, "❯", None),
+                "{name}: 실측 상태줄이 편집 영역의 경계로 서지 못한다(리셋이 영영 안 걸린다)"
+            );
+            assert!(
+                composer_layout_positive(&screen, "❯", None),
+                "{name}: 실측 상태줄이 강한 레이아웃 증거로 서지 못한다"
+            );
+        }
+        // ⓒ 같은 토큰 · 사람 문장 = 경계 아님(조인 방향이 실제로 조여져 있는가).
+        for draft in ["  bypass permissions 를 끄고 싶다", "  shift+tab that toggles modes"] {
+            let screen = format!("  이전 출력
+❯ 
+{draft}
+");
+            assert!(
+                !composer_edit_region_empty(&screen, "❯", None),
+                "사람 문장 {draft:?} 이 편집 영역의 경계로 인정됐다"
+            );
+        }
+    }
+
     #[test]
     fn r6_choice_tail_boundary_and_end_are_exact() {
         let trust = MODAL_CHOICE_LABELS[0];
