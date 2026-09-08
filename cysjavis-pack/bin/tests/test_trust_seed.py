@@ -843,8 +843,11 @@ class Concurrent(Base):
 
         def flaky(path):
             calls.append(path)
-            if path == self.cfgfile and len([c for c in calls if c == self.cfgfile]) == 3:
-                raise OSError("injected readback failure")   # .claude.json 3번째 읽기 = 커밋 후 되읽기(초기 · 교체 직전 대조 · 되읽기)
+            # ★재핀(★codex 설계비평 8 · plan §8): 교환 성공 뒤 옛 원본(displaced) 폐기에 **바이트 증명** 판독이
+            #   한 번 더 들어왔다(활성이 우리 payload 임을 확인해야 지운다) — 되읽기는 이제 4번째다.
+            #   (초기 · 교체 직전 대조 · 폐기 증명 · 되읽기)
+            if path == self.cfgfile and len([c for c in calls if c == self.cfgfile]) == 4:
+                raise OSError("injected readback failure")
             return real(path)
 
         with patch.object(pf, "_read_claude_json_bytes", flaky):
@@ -961,7 +964,20 @@ class Concurrent(Base):
                     self.assertIn(token, reason)
                     self.assertEqual(_read_bytes(self.cfgfile), late, "기록자 바이트가 덮였다")
                     leftovers = [n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME]
-                    self.assertEqual(leftovers, [], leftovers)
+                    # ★triage I4 재핀(plan §8 '의도적 기본값 변경만 재핀'): 미커밋 사본 삭제의 근거가 '활성 문서가
+                    #   유효하다' 에서 **저널의 두 지문에 대한 바이트 증명**으로 바뀌었다. 이 서브케이스는 대조(⑥)를
+                    #   통과한 **뒤** 끼어든 기록자가 활성을 `late` 로 바꾼 자리라 증명이 성립하지 않는다 — 우리 사본
+                    #   (원본 + 플래그)은 지워지지 않고 conflict 네임스페이스에 남는다. '잔재 0' 은 활성 무변경(통상·
+                    #   Windows 상시) 경로의 계약이고 그것은 `test_r7_exchange_failure_with_a_healthy_active_leaves_no_litter`
+                    #   와 `_refused_without_exchange` 가 그대로 지킨다.
+                    self.assertEqual([n for n in leftovers if not n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)], [], leftovers)
+                    saved = [n for n in leftovers if n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)]
+                    self.assertEqual(len(saved), 1, leftovers)
+                    self.assertIn("사본 보존", reason)
+                    doc = json.loads(_read_bytes(os.path.join(self.cfg, saved[0])).decode("utf-8"))
+                    self.assertIs(doc["projects"][self.key]["hasTrustDialogAccepted"], True,
+                                  "보존한 사본이 우리 payload 가 아니다")
+                    os.unlink(os.path.join(self.cfg, saved[0]))     # 다음 서브케이스는 깨끗한 상태에서
         # 부재 파일은 교환과 무관(os.link) — 기구 부재 플랫폼에서도 신규 부서 시드는 동작
         os.unlink(self.cfgfile)
         with patch.object(pf, "_exchange_paths", lambda a, b: pf._ExchangeUnavailable("platform:nt")):
@@ -1091,7 +1107,11 @@ class Concurrent(Base):
         _require_exchange(self)
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
         self.assertEqual((rc, verdict), (0, "OK"), reason)      # 원본은 crash 에 무접촉 → 이번엔 정상 커밋
-        self.assertIn("stale-tmp swept 2", reason)               # mkstemp 잔재 1 + payload displaced 1
+        # ★triage I1 재핀(plan §8): 저널이 있는 자리에서는 **회수(ⓑ)가 스스로** 사본을 지운다 — 청소는 저널의
+        #   `captured_sha256` 을 모르므로 더 약한 증거로 같은 결정을 다시 내려야 했다(활성 = captured 인 이 형상에서
+        #   바이트 증명에 실패해 애먼 격리가 된다). 회수 1 + mkstemp 잔재 청소 1 로 나뉘고 합계는 그대로다.
+        self.assertIn("recovery-reclaimed(1", reason)
+        self.assertIn("stale-tmp swept 1", reason)               # mkstemp 잔재 1(payload displaced 는 회수가 처리)
         self.assertIn("commit=exchange", reason)
         self.assertFalse(os.path.lexists(os.path.join(self.cfg, displaced[0])), "우리 payload displaced 가 회수되지 않았다")
         self.assertFalse(os.path.lexists(os.path.join(self.cfg, ".claude.json.seed-abcd1234")))
@@ -3184,9 +3204,9 @@ class CodexR2Counterexamples(unittest.TestCase):
             (self.cfg / name).write_bytes(b'precious')
         sweep = pf._sweep_stale_seed_tmp
         held = []
-        def sweeping(d):
+        def sweeping(d, *a, **k):        # ★triage: 청소가 사유 꼬리(note)를 받는다
             self.assertTrue(held, 'sweep ran before lock acquisition')
-            return sweep(d)
+            return sweep(d, *a, **k)
         def lock_ok(f):
             held.append(True)
             return True
@@ -3210,19 +3230,20 @@ class CodexR2Counterexamples(unittest.TestCase):
             self.result(self.seed(lock_fn=lock_ok), 0, 'stale-tmp swept 2')
         self.assertTrue(all(not (self.cfg / n).exists() for n in stale[:2]), 'mkstemp 잔재가 남았다')
         self.assertEqual(saved[0].read_bytes(), b'precious', '보존 사본이 다음 실행에서 청소됐다')
-        # 양성 대조: 활성 문서가 유효하면 같은 지문의 잔재는 정상적으로 회수된다(청소 계약 보존)
+        # ★triage I1 재핀(plan §8): 지문 청소의 근거는 '활성 문서가 유효하다' 가 **아니라 바이트 증명**이다.
+        # 양성 대조: 활성이 바로 그 사본이면(순수 중복) 정상적으로 회수된다(청소 계약 보존)
         displaced.write_bytes(b'precious')
+        self.file.write_bytes(b'precious')
         self.assertEqual(pf._sweep_stale_seed_tmp(str(self.cfg)), 1)
-        self.assertFalse(displaced.exists(), '활성 문서가 유효한데도 displaced 를 남겼다(청소가 죽었다)')
-        # 음성 대조: 활성 문서를 0바이트로 잘라 두면 다시 무접촉이다(`_parse_claude_json` 의 '빈 파일 → {}' 관용이
-        #   보존 사본 삭제의 근거가 되지 않는다)
-        displaced.write_bytes(b'precious')
-        self.file.write_bytes(b'')
-        self.assertEqual(pf._sweep_stale_seed_tmp(str(self.cfg)), 0)
-        self.assertTrue(displaced.exists())
-        self.file.write_bytes(b'   \n')
-        self.assertEqual(pf._sweep_stale_seed_tmp(str(self.cfg)), 0)
-        self.assertTrue(displaced.exists())
+        self.assertFalse(displaced.exists(), '활성이 그 사본과 바이트 동등한데도 displaced 를 남겼다(청소가 죽었다)')
+        # 음성 대조: 잘린 활성뿐 아니라 **유효하지만 다른** 활성 문서에서도 무접촉이다 — `{}` 재생성이 고아 보호를
+        #   우회하던 자리(triage I1/I3 이 확정한 손실)
+        for active in (b'', b'   \n', b'{}', b'{"projects": {}}'):
+            displaced.write_bytes(b'precious')
+            self.file.write_bytes(active)
+            self.assertEqual(pf._sweep_stale_seed_tmp(str(self.cfg)), 0, active)
+            self.assertTrue(displaced.exists(), active)
+            self.assertEqual(displaced.read_bytes(), b'precious', active)
         self.assertEqual([(self.cfg / n).read_bytes() for n in kept], [b'precious'] * len(kept))
 
     def test_11_strict_argv_positions_and_hidden_visible_ps(self):
@@ -3597,7 +3618,7 @@ class CodexR3Counterexamples(Base):
         self.assertIn(hashlib.sha256(payload).hexdigest(), displaced[0].name)
         rc, verdict, reason = self.seed()
         self.assertEqual((rc, verdict), (0, 'OK'), reason)
-        self.assertIn('stale-tmp swept 1', reason)
+        self.assertIn('recovery-reclaimed(1', reason)   # ★triage I1 재핀: 저널이 있으면 회수 ⓑ 가 스스로 회수한다
         self.assertIn('commit=exchange', reason)
         self.assertFalse(displaced[0].exists())
         self.assert_clean(existing=True)
@@ -3627,10 +3648,11 @@ class CodexR3Counterexamples(Base):
         if hasattr(os, 'mkfifo'):        # ★R4: Windows 엔 mkfifo 부재 — 그 항목만 건너뛴다
             os.mkfifo(fifo)
         good = Path(self.cfg, prefix + digest + '-good'); good.write_bytes(data)
-        # ★R6 재핀(리뷰 codex '추가로 놓친 것' ②): 지문 청소의 전제는 '활성 문서가 유효하다' 다 — 이 픽스처는
-        #   활성 문서가 없어 종전엔 그 전제 없이 청소를 단언했다. 유효한 활성 문서를 두고 양성 대조를 유지하고,
-        #   아래에서 **잘린 활성 문서**로 무접촉까지 못 박는다.
-        active = Path(self.cfg, '.claude.json'); active.write_bytes(b'{"projects": {}}')
+        # ★triage I1 재핀(plan §8 · R6 재핀의 후속): 지문 청소의 전제가 '활성 문서가 유효하다' 에서 **바이트 증명**
+        #   (활성 = 그 사본)으로 바뀌었다 — '유효한 문서' 는 '그 데이터가 그 안에 있다' 가 아니어서, 외부가 활성을
+        #   `{}` 로 재생성하기만 하면 종전 규칙이 유일한 사용자 사본을 지웠다. 양성 대조의 활성을 그 바이트로 두고,
+        #   아래에서 **잘린·다른 활성 문서**로 무접촉을 못 박는다.
+        active = Path(self.cfg, '.claude.json'); active.write_bytes(data)
         # Run in a child with Python's portable timeout: a wrong FIFO open cannot hang the suite.
         script = ('import sys; sys.path.insert(0, sys.argv[1]); import javis_preflight as pf; '
                   'print(pf._sweep_stale_seed_tmp(sys.argv[2]))')
@@ -3646,13 +3668,13 @@ class CodexR3Counterexamples(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, '1\n')
         self.assertFalse(good.exists(), 'positive control was not swept')
-        for raw in (b'', b' \t\n', b'{broken', b'[]'):
+        for raw in (b'', b' \t\n', b'{broken', b'[]', b'{}', b'{"projects": {}}'):
             with self.subTest(active=raw):
                 good.write_bytes(data)
                 active.write_bytes(raw)
                 r = sweep_in_child()
                 self.assertEqual(r.returncode, 0, r.stderr)
-                self.assertEqual(r.stdout, '0\n', '활성 문서가 유효하지 않은데 displaced 를 지웠다')
+                self.assertEqual(r.stdout, '0\n', '활성이 그 사본과 바이트 동등하지 않은데 displaced 를 지웠다')
                 self.assertEqual(good.read_bytes(), data)
         good.unlink()
         for path, content in protected.items():
@@ -4598,7 +4620,7 @@ class R5InterruptedTransaction(Base):
         self.assertEqual(len(self.journals()), 1, os.listdir(self.cfg))
         rc, verdict, reason = self.seed()
         self.assertEqual(rc, 0, reason)
-        self.assertIn("stale-tmp swept", reason)
+        self.assertIn("recovery-reclaimed", reason)   # ★triage I1 재핀: 회수 ⓑ 가 스스로 지운다(청소 위임 폐기)
         self.assertEqual(self.journals(), [])
         self.assertEqual(self.displaced(), [])
         self.assertIs(_read_json(self.cfgfile)["projects"][self.key]["hasTrustDialogAccepted"], True)
@@ -5458,6 +5480,284 @@ class R5TestChildSeal(unittest.TestCase):
         self.assertEqual(unsealed.returncode, 0, unsealed.stderr)
         if not os.path.isdir(cache):
             self.skipTest("이 실행 환경은 자식 파이썬을 이미 봉인한다 — 음성 대조군 성립 불가(양성 단언은 통과)")
+
+
+
+class TriageP1WP2Trust(Base):
+    """독립 재유도(triage · CONTRACTS §E-1) — P1-WP2-trust 잔여 major 4건의 회귀 핀.
+    공통 불변(워커가 §R7-2 에서 스스로 세운 것): **보존 사본은 '지워도 잃는 것이 없다' 는 증명 없이는 지우지 않는다**.
+    아래 검체는 그 증명(`_copy_is_redundant`)이 적용되지 **않는** 세 자리에서 유일한 사용자 문서가 사라지는 것을
+    데이터로 단언한다(파일 이름·경로가 아니라 `user` 필드의 생존으로 본다)."""
+
+    ORIGINAL = '{"user": "ONLY-COPY", "projects": {}}'
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(self.cfg)
+
+    def names(self, prefix):
+        return sorted(n for n in os.listdir(self.cfg) if n.startswith(prefix))
+
+    def payload_bytes(self, original=None):
+        new, _changed, _k = pf.trust_plan(json.loads(original or self.ORIGINAL), self.key)
+        return json.dumps(new, ensure_ascii=False, indent=2).encode("utf-8")
+
+    def assert_only_copy_survives(self, why):
+        survivors = []
+        for root, _dirs, files in os.walk(self.tmp):
+            for name in files:
+                try:
+                    doc = json.loads(_read_bytes(os.path.join(root, name)))
+                except (ValueError, UnicodeDecodeError, OSError):
+                    continue
+                if isinstance(doc, dict) and doc.get("user") == "ONLY-COPY":
+                    survivors.append(os.path.join(root, name))
+        self.assertTrue(survivors, "%s — 유일한 사용자 필드가 모든 파일에서 사라졌다(%s)"
+                        % (why, sorted(os.listdir(self.cfg))))
+
+    # ── ⑪(reviewer-claude major) · 'A healthy replacement bypasses orphan protection'(reviewer-codex major)
+    def test_triage_orphan_survives_when_the_active_is_recreated_empty(self):
+        """저널 없는 지문 일치 사본 + 외부가 활성을 `{}` 로 재생성 → 가드는 '건강' 에서 즉시 통과하고 지문 청소가
+        그 사본을 지운다. `_sweep_stale_seed_tmp` 의 전제는 `_active_document_healthy` 하나이고 R7 의 바이트 증명
+        (`_copy_is_redundant`)이 여기엔 적용되지 않는다 — '유효한 문서' 는 '그 데이터가 그 안에 있다' 가 아니다.
+        R7 회귀 검체(`test_r7_two_retries_…`)는 활성 **부재**만 덮는다."""
+        payload = self.payload_bytes()
+        orphan = self.plant_orphan_copy(payload)
+        _write(self.cfgfile, "{}")                       # 외부 기록자가 빈 문서를 만들었다(건강 · 사용자 필드 0)
+        self.seed()
+        self.assertTrue(os.path.exists(os.path.join(self.cfg, orphan))
+                        or self.names(pf.SEED_TRUST_CONFLICT_PREFIX),
+                        "보존 사본이 증명 없이 사라졌다: %s" % sorted(os.listdir(self.cfg)))
+        self.assert_only_copy_survives("빈 활성 문서가 고아 보호를 우회했다")
+
+    def plant_orphan_copy(self, payload):
+        name = pf.SEED_TRUST_DISPLACED_PREFIX + pf._payload_digest(payload) + "-20260907T000000Z-1"
+        _write_bytes(os.path.join(self.cfg, name), payload)
+        return name
+
+    # ── 'Journal-first recovery can delete the unrenamed payload'(reviewer-codex major)
+    def test_triage_crash_between_journal_and_rename_keeps_the_only_copy(self):
+        """저널 공개 성공 → rename 전 사망(SIGKILL)의 실제 디스크 상태: 저널 + mkstemp payload + 활성.
+        그 뒤 외부가 활성을 `{}` 로 바꾸면 회수 ⓐ 는 '가리키는 displaced 부재 + 활성 건강' 으로 저널을 지우고
+        `_sweep_stale_seed_tmp` 는 mkstemp 잔재를 **활성 건강과 무관하게 무조건** 지운다(리터럴 분기: `continue`
+        앞에서 healthy 판정을 거치지 않는다). payload = 원본 + 플래그이므로 사용자 필드가 전부 사라진다."""
+        self.untrusted_file(self.ORIGINAL)
+        captured = _read_bytes(self.cfgfile)
+        payload = self.payload_bytes()
+        displaced = pf.SEED_TRUST_DISPLACED_PREFIX + pf._payload_digest(payload) + "-20260907T000000Z-1"
+        litter = os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34")   # mkstemp 접미 8자 형식
+        _write_bytes(litter, payload)
+        jpath = pf._write_seed_intent(self.cfg, displaced, pf._payload_digest(captured),
+                                      pf._payload_digest(payload))
+        self.assertTrue(os.path.exists(jpath))
+        _write(self.cfgfile, "{}")                       # 외부 기록자가 활성을 빈 문서로 교체
+        self.seed()
+        self.assert_only_copy_survives("저널~rename 창의 payload 를 회수+청소가 함께 지웠다")
+
+    def test_triage_litter_sweep_is_unconditional_even_with_no_active_document(self):
+        """저널 **공개 전** 사망 + 그 뒤 활성 소실 — 저널이 없으니 회수도 가드도 개입하지 않고, 청소는 mkstemp
+        잔재를 무조건 지운다. 이 payload 는 원본이 있던 실행에서 만들어진 것이라 '플래그뿐' 이 아니다."""
+        payload = self.payload_bytes()
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"), payload)
+        self.seed()
+        self.assert_only_copy_survives("활성 부재인데 mkstemp payload 를 지웠다")
+
+    # ── 'Unsuccessful-exchange cleanup still equates validity with redundancy'(reviewer-codex major)
+    def test_triage_release_after_a_foreign_replacement_keeps_the_only_copy(self):
+        """대조(⑥) 뒤 · 교환 실패 사이에 다른 기록자가 활성을 `{}` 로 바꾸면 `_release_uncommitted_copy` 는
+        '유효한 문서가 있다' 만 보고 우리 사본(원본 + 플래그)과 저널을 함께 지운다. 원본은 그 사본에만 있었다."""
+        self.untrusted_file(self.ORIGINAL)
+
+        def replace_then_fail(a, b):
+            _write(b, "{}")                              # 대조를 통과한 뒤 끼어든 기록자
+            raise OSError(errno.EIO, "injected")
+
+        with patch.object(pf, "_exchange_paths", replace_then_fail):
+            rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 1, reason)
+        self.assert_only_copy_survives("교환 실패 경로가 유일한 사본을 지웠다")
+
+    def test_triage_release_on_the_exchange_unavailable_path_keeps_the_only_copy(self):
+        """같은 결함의 Windows(기구 부재) 경로 — `_release_uncommitted_copy` 호출 지점이 둘이다."""
+        self.untrusted_file(self.ORIGINAL)
+
+        def replace_then_unavailable(a, b):
+            _write(b, "{}")
+            return pf._ExchangeUnavailable("platform:nt")
+
+        with patch.object(pf, "_exchange_paths", replace_then_unavailable):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assert_only_copy_survives("exchange-unavailable 경로가 유일한 사본을 지웠다")
+
+
+class TriageConvergence(TriageP1WP2Trust):
+    """★triage 수렴(2026-09-08) — 재유도 CONFIRMED 4건을 고치며 **새로 생긴 계약**의 회귀 핀.
+    검체가 지키는 것: ①의도 저널이 아직 rename 되지 않은 mkstemp 이름을 담고 회수 ⓐ 가 그것까지 바이트 증명으로
+    판정한다 ②통상 경로(활성 무변경)는 그 크래시 뒤에도 잔재·conflict 0 이다(보수화가 상시 잔재가 되지 않는다)
+    ③저널이 아직 책임지는 사본은 고아 가드의 대상이 아니다(codex 설계비평 4) ④보존 rename 이 실패하면 저널을
+    남긴다(codex 설계비평 2) ⑤플래그뿐인 최소 문서 임시본은 종전대로 청소된다(격리 위양성 0).
+    `TriageP1WP2Trust` 를 상속하는 것은 **의도**다 — 헬퍼(`payload_bytes`·`assert_only_copy_survives`·`plant_orphan_copy`)를
+    공유하고, 재유도 5핀이 이 클래스에서 한 번 더 도는 것이 수렴 계약의 음성 대조가 된다(중복 실행 0.03s)."""
+
+    def crash_between_journal_and_rename(self):
+        """SIGKILL 모사 — `finally` 가 돌지 않으므로 mkstemp payload 가 그대로 남는다(KeyboardInterrupt 는 finally 가
+        돌아 tmp 를 지우므로 이 창을 재현하지 못한다)."""
+        real_rename, real_unlink_quiet = os.rename, pf._unlink_quiet
+
+        def die(a, b, *r, **k):
+            if os.path.basename(b).startswith(pf.SEED_TRUST_DISPLACED_PREFIX):
+                raise KeyboardInterrupt("저널 공개 뒤 · rename 전 사망")
+            return real_rename(a, b, *r, **k)
+
+        with patch.object(pf.os, "rename", die), patch.object(pf, "_unlink_quiet", lambda path: None):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+
+    def test_conv_journal_records_the_unrenamed_payload_and_recovery_judges_it(self):
+        self.untrusted_file(self.ORIGINAL)
+        self.crash_between_journal_and_rename()
+        journals = self.names(pf.SEED_TRUST_INTENT_PREFIX)
+        self.assertEqual(len(journals), 1, os.listdir(self.cfg))
+        rec = json.loads(_read_bytes(os.path.join(self.cfg, journals[0])).decode("utf-8"))
+        self.assertIn("tmp", rec, "저널이 아직 rename 되지 않은 임시 이름을 담지 않았다")
+        self.assertIsNotNone(pf._SEED_TMP_LITTER_RE.match(rec["tmp"]), rec["tmp"])
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, rec["tmp"])), self.payload_bytes())
+        _write(self.cfgfile, "{}")                              # 외부 기록자가 활성을 파괴했다
+        rc, verdict, reason = self.seed()
+        self.assertIn("recovery-preserved", reason, reason)
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertEqual(json.loads(_read_bytes(os.path.join(self.cfg, kept[0])))["user"], "ONLY-COPY")
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [], "처분이 끝났는데 저널이 남았다")
+        self.assert_only_copy_survives("저널이 가리키는 임시본을 판정하지 못했다")
+
+    def test_conv_the_same_crash_on_the_normal_path_leaves_no_conflict(self):
+        """음성 대조: 활성이 그대로면(통상) 그 임시본은 **증명된 중복**이라 회수된다 — 보수화가 상시 잔재가 되지 않는다."""
+        self.untrusted_file(self.ORIGINAL)
+        self.crash_between_journal_and_rename()
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertIn("recovery-reclaimed", reason, reason)
+        self.assertNotIn("recovery-preserved", reason, reason)
+        for prefix in (pf.SEED_TRUST_CONFLICT_PREFIX, pf.SEED_TRUST_INTENT_PREFIX, pf.SEED_TRUST_TMP_PREFIX):
+            self.assertEqual([n for n in self.names(prefix) if n != pf.SEED_TRUST_LOCK_NAME], [], prefix)
+        self.assertEqual(json.loads(_read_bytes(self.cfgfile))["user"], "ONLY-COPY")
+
+    def test_conv_guard_ignores_a_copy_that_a_journal_still_claims(self):
+        """codex 설계비평 4: 회수 ⓑ 가 정리에 실패하면 **저널을 남긴다** — 그 사본은 고아가 아니므로 가드가 격리·거부하지
+        않는다(종전 설계였다면 저널이 남은 사본까지 고아로 잡아 애먼 conflict·REFUSE 를 냈다)."""
+        self.untrusted_file(self.ORIGINAL)
+        with patch.object(pf, "_exchange_paths", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.seed()
+        displaced = self.names(pf.SEED_TRUST_DISPLACED_PREFIX)
+        self.assertEqual(len(displaced), 1, os.listdir(self.cfg))
+        real_unlink = os.unlink
+
+        def blocked(path, *a, **k):
+            if os.path.basename(path).startswith(pf.SEED_TRUST_DISPLACED_PREFIX):
+                raise OSError(errno.EACCES, "injected")
+            return real_unlink(path, *a, **k)
+
+        note = []
+        with patch.object(pf.os, "unlink", blocked):
+            self.assertIsNone(pf._recover_interrupted_seed(self.cfg, self.cfgfile, note))
+        self.assertEqual(note, [], "회수가 실패했는데 회수했다고 사유에 적었다")
+        self.assertEqual(len(self.names(pf.SEED_TRUST_INTENT_PREFIX)), 1, "정리 실패인데 저널을 지웠다")
+        self.assertIsNone(pf._orphan_recovery_guard(self.cfg, self.cfgfile),
+                          "저널이 책임지는 사본을 고아로 잡았다")
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [], "저널이 있는 사본을 격리했다")
+        self.assertEqual(self.names(pf.SEED_TRUST_DISPLACED_PREFIX), displaced)
+
+    def test_conv_release_keeps_the_journal_when_preserving_fails(self):
+        """codex 설계비평 2: 보존 rename 이 막히면 사본은 청소 네임스페이스에 그대로 남는다 — 저널까지 지우면 다음
+        실행이 두 지문을 잃고 고아 경로로 떨어진다. 저널을 남기고 그 사실을 사유에 적는다."""
+        self.untrusted_file(self.ORIGINAL)
+
+        def replace_then_fail(a, b):
+            _write(b, "{}")
+            raise OSError(errno.EIO, "injected")
+
+        with patch.object(pf, "_exchange_paths", replace_then_fail), \
+                patch.object(pf, "_preserve_copy", return_value=None):
+            rc, verdict, reason = self.seed()
+        self.assertEqual((rc, verdict), (1, "ERROR"), reason)
+        self.assertIn("사본 보존 실패", reason)
+        self.assertEqual(len(self.names(pf.SEED_TRUST_INTENT_PREFIX)), 1, "보존에 실패했는데 저널을 지웠다")
+        self.assertEqual(len(self.names(pf.SEED_TRUST_DISPLACED_PREFIX)), 1, os.listdir(self.cfg))
+        self.assert_only_copy_survives("보존 실패 경로가 사본을 지웠다")
+
+    def test_conv_exchange_success_preserves_the_old_original_when_the_active_is_replaced(self):
+        """codex 설계비평 8(후반): 교환은 성립했는데 **그 직후** 외부가 활성을 `{}` 로 바꾸면 displaced 의 옛 원본이
+        유일한 사본이다 — 폐기도 바이트 증명 아래에 둔다(종전엔 무조건 unlink 였다)."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        real_ex = pf._exchange_paths
+
+        def exchange_then_replace(a, b):
+            r = real_ex(a, b)
+            if r is True:
+                _write(b, "{}")                                 # 교환 직후 끼어든 파괴자
+            return r
+
+        with patch.object(pf, "_exchange_paths", exchange_then_replace):
+            r = self.seed()
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return                                              # 교환 기구가 없으면 이 창 자체가 열리지 않는다
+        self.assertEqual(r[:2], (2, "REFUSE"), r)               # 되읽기가 플래그 없는 문서를 본다(post-commit)
+        self.assertIn("displaced-preserved", r[2], r[2])
+        kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
+        self.assertEqual(len(kept), 1, os.listdir(self.cfg))
+        self.assertEqual(json.loads(_read_bytes(os.path.join(self.cfg, kept[0])))["user"], "ONLY-COPY")
+        self.assertEqual(self.names(pf.SEED_TRUST_INTENT_PREFIX), [], "처분이 끝났는데 저널이 남았다")
+        self.assert_only_copy_survives("교환 직후 파괴자가 유일한 원본을 지우게 했다")
+
+    def test_conv_exchange_success_on_the_normal_path_leaves_no_conflict(self):
+        """음성 대조: 아무도 끼어들지 않으면 활성 = 우리 payload 라 증명이 성립한다 — 옛 원본은 종전대로 폐기되고
+        conflict 잔재 0(보수화가 통상 경로의 잔재를 만들지 않는다)."""
+        self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
+        r = self.seed()
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return
+        self.assertEqual(r[0], 0, r)
+        self.assertIn("commit=exchange", r[2])
+        self.assertNotIn("displaced-preserved", r[2], r[2])
+        for prefix in (pf.SEED_TRUST_CONFLICT_PREFIX, pf.SEED_TRUST_DISPLACED_PREFIX, pf.SEED_TRUST_INTENT_PREFIX):
+            self.assertEqual(self.names(prefix), [], prefix)
+        self.assertEqual(json.loads(_read_bytes(self.cfgfile))["user"], "ONLY-COPY")
+
+    def test_conv_flag_only_litter_is_still_swept(self):
+        """격리 위양성 0: 부재 dir 경로가 만드는 **최소 문서**(플래그뿐)는 지킬 데이터가 없다 — 활성이 없어도 청소된다.
+        (여기까지 격리하면 평범한 크래시 잔재가 영구 conflict 파일이 된다 · codex 설계비평 3)"""
+        minimal = json.dumps({"projects": {self.key: {"hasTrustDialogAccepted": True}}},
+                             ensure_ascii=False, indent=2).encode("utf-8")
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"), minimal)
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd35"),
+                     b'{"v": 1, "displaced": "x"}')                 # 저널 조각도 지킬 데이터 0
+        rc, verdict, reason = self.seed()
+        self.assertEqual(rc, 0, reason)
+        self.assertIn("stale-tmp swept 2", reason)
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [], "지킬 데이터가 없는 잔재를 격리했다")
+
+    def test_conv_journal_tmp_field_is_validated(self):
+        """codex 설계비평 5: `tmp` 는 **mkstemp 이름 형식의 basename** 만 — 경로 탈출·타 네임스페이스·개행 꼬리는 형식
+        위반(판독 None → 호출자는 REFUSE) · 필드 **부재**는 구판 저널로 유효하다."""
+        base = {"v": 1, "displaced": pf.SEED_TRUST_DISPLACED_PREFIX + "a" * 64 + "-20260907T000000Z-1",
+                "captured_sha256": "b" * 64, "payload_sha256": "c" * 64}
+        path = os.path.join(self.cfg, pf.SEED_TRUST_INTENT_PREFIX + "probe")
+        for tmp, ok in ((None, True), (".claude.json.seed-ab12cd34", True), ("../victim", False),
+                        ("/etc/passwd", False), (".claude.json.seed-lock", False),
+                        (".claude.json.seed-abcdefgh\n", False), (".claude.json.displaced-x", False),
+                        (".claude.json.seed-short", False), (12, False), (None if False else "", False)):
+            with self.subTest(tmp=tmp):
+                rec = dict(base)
+                if tmp is not None:
+                    rec["tmp"] = tmp
+                _write_bytes(path, json.dumps(rec, ensure_ascii=True).encode("utf-8"))
+                got = pf._read_seed_intent(path)
+                self.assertEqual(got is not None, ok, (tmp, got))
 
 
 if __name__ == "__main__":

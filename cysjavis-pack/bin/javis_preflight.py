@@ -7361,27 +7361,75 @@ def _payload_digest(payload_b):
     return hashlib.sha256(payload_b).hexdigest()[:_SEED_DISPLACED_DIGEST_LEN]
 
 
-def _sweep_stale_seed_tmp(config_dir):
+def _document_carries_user_data(data):
+    """바이트가 **사용자 데이터를 담은 문서**인가 = JSON 객체 + `projects` 객체 + 그 안에 신뢰 플래그 말고 다른 것이 있다.
+    시더 payload 는 언제나 문서 형상이지만(`trust_plan` 이 `projects[key]` 를 만든다) 두 종류가 있다:
+      · 부재 dir 에서 만든 **최소 문서**(`{"projects": {<key>: {"hasTrustDialogAccepted": true}}}`) = 지킬 데이터 0
+      · 기존 문서에서 만든 **원본 + 플래그** = 사용자 데이터가 통째로 들어 있다
+    ★triage I2: 후자를 '공개된 적 없는 임시 이름' 이라는 이유로 무조건 지우던 것이 손실이었다. 전자와 의도 저널의
+    내용(`{"v":1,"displaced":…}` · `projects` 없음)은 지워도 잃는 것이 없으므로 이 술어가 거짓이다."""
+    try:
+        doc = json.loads(data.decode("utf-8-sig"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(doc, dict) or not isinstance(doc.get("projects"), dict):
+        return False
+    if set(doc) != {"projects"}:
+        return True                            # 최상위에 다른 사용자 필드가 있다
+    for v in doc["projects"].values():
+        if not isinstance(v, dict) or set(v) - {"hasTrustDialogAccepted"}:
+            return True                        # 프로젝트 항목에 플래그 말고 다른 것이 있다
+    return False
+
+
+def _litter_may_be_dropped(path, cfg):
+    """mkstemp 잔재(.claude.json.seed-<8자>)를 **지워도 잃는 것이 없는가** → True(삭제 가능) / False(보존).
+    ①비정규(심링크·FIFO·정션)면 이름만 지운다(데이터 파괴 0) ②판독 불가는 보존('못 봤다' 는 '비어 있다' 가 아니다)
+    ③활성 문서가 그 바이트와 **동등**하면 순수 중복 → 삭제 ④사용자 데이터를 담은 문서면 보존(격리 대상)
+    ⑤그 밖(0바이트·부분 기록·저널 조각·플래그뿐인 최소 문서)은 종전대로 삭제.
+    잔여(고지 · codex 설계비평 3): **쓰다 만 payload**(잘려 JSON 이 아닌 바이트)는 ⑤ 로 떨어져 여전히 지워진다 —
+    그것까지 지키려면 우리 임시 네임스페이스의 식별 불가 바이트를 전부 격리해야 하고, 그러면 평범한 크래시 잔재가
+    영구 conflict 파일이 된다. 완전한 문서만 보호한다(범위 고지)."""
+    try:
+        if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+            return True
+        fd, _st = _open_unblocking_ro(path, nofollow=True)       # ★R4: FIFO 교체도 막힘 0
+        with os.fdopen(fd, "rb") as f:
+            data = f.read()
+    except (OSError, ValueError):
+        return False
+    if _active_digest(cfg) == _payload_digest(data):
+        return True
+    return not _document_carries_user_data(data)
+
+
+def _sweep_stale_seed_tmp(config_dir, note=None):
     """잠금 보유 중에만 호출 — 죽은 시더(SIGKILL)의 잔재를 치운다 → 청소 수. 대상 ①mkstemp 잔재(.claude.json.seed-<8자>)
     ②★R3 displaced(.claude.json.displaced-<sha256>-… · 교환 직전 사망 = 우리 payload 만 든 파일) 중 **바이트의 sha256 이 이름의
     지문과 같은 것** — 이는 'payload 와 바이트 동등' 의 회수이지 소유 증명이 아니다: 교환 뒤 옛 inode(낯선 바이트)가 앉은
     displaced 는 지문이 달라 무접촉(낯선 데이터의 유일 사본일 수 있다) · 심링크/정션/FIFO/비정규/판독 불가 후보도 무접촉.
+    ★triage I1(blocking · 재유도 CONFIRMED): 삭제의 근거는 이제 `_active_document_healthy` 가 **아니라 바이트 증명**이다 —
+    '유효한 문서가 있다' 는 '그 데이터가 그 안에 있다' 가 아니어서, 외부가 활성을 `{}` 로 재생성하기만 하면 종전 규칙이
+    유일한 사용자 사본을 조용히 지웠다. 이제 displaced 는 **활성 바이트 = 그 payload** 일 때만 지운다(그때만 순수 중복).
+    증명이 없으면 무접촉이고, 격리(conflict 이동)는 `_orphan_recovery_guard` 가 한다 — 청소는 지우기만 하고 displaced 의
+    이름을 옮기지 않는다(판정 지점 단일화).
+    ★triage I2: mkstemp 잔재도 무조건 삭제가 아니다 — `_litter_may_be_dropped` 참조.
     잔여(고지): 해시~unlink 사이에 그 inode 를 fd 로 잡고 고쳐 쓰는 기록자는 이 판정이 못 본다(_restore_foreign 과 같은
     in-place 기록자 한계 · 알려진 기록자 중 없음). 잠금 파일·.bak-*·.conflict-*·지문 없는 구형 displaced 는 대상이 아니다.
     실패는 무시(청소는 부수 효과)."""
-    swept = 0
+    swept, moved, stuck, held = 0, [], [], []
+    cfg = os.path.join(config_dir, ".claude.json")
     try:
         names = os.listdir(config_dir)
     except OSError:
         return 0
-    # ★R6(리뷰 codex '추가로 놓친 것' ②): displaced 지문 청소는 **활성 문서가 유효할 때만** 한다. payload 를
-    #   displaced 로 rename 한 뒤 저널 공개 전에 죽으면 저널 없는 payload 잔재가 남는데, 그 내용은 '원본 + 플래그'
-    #   라 그 사이 활성이 잘렸다면 그것이 유일한 완전한 문서다(회수 ⓑ 와 같은 손실). mkstemp 잔재(.seed-<8자>)는
-    #   공개된 적 없는 순수 임시파일이라 이 조건과 무관하게 치운다.
-    healthy = None                     # 지연 판정 — displaced 후보가 없으면 판독하지 않는다
     for n in names:
         path = os.path.join(config_dir, n)
         if _SEED_TMP_LITTER_RE.match(n) and n != SEED_TRUST_LOCK_NAME:
+            if not _litter_may_be_dropped(path, cfg):
+                kept = _preserve_copy(path)                     # 증명 없는 사용자 문서 임시본 = 격리 1회
+                (moved if kept else stuck).append(kept or n)    # 옮겼는지 못 옮겼는지를 뭉뚱그리지 않는다
+                continue
             try:
                 os.unlink(path)
                 swept += 1
@@ -7391,10 +7439,6 @@ def _sweep_stale_seed_tmp(config_dir):
         m = _SEED_DISPLACED_RE.match(n)
         if not m:
             continue
-        if healthy is None:
-            healthy = _active_document_healthy(os.path.join(config_dir, ".claude.json"))
-        if not healthy:
-            continue                                       # 유일한 완전한 사본일 수 있다 — 무접촉(사람이 병합)
         try:
             if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
                 continue
@@ -7405,11 +7449,23 @@ def _sweep_stale_seed_tmp(config_dir):
             continue
         if _payload_digest(data) != m.group(1):
             continue                                       # 낯선 inode — 보존(수동 병합 대상)
+        if _active_digest(cfg) != m.group(1):
+            held.append(n)                                 # ★triage I1: 활성이 그 payload 가 아니다 = 증명 실패 → 무접촉
+            continue
         try:
             os.unlink(path)
             swept += 1
         except OSError:
             pass
+    if note is not None:
+        if moved:
+            note.append("stale-tmp preserved(%s — 사용자 데이터를 담은 임시본이 활성과 바이트 동등하지 않다 · 사람이 병합)"
+                        % ", ".join(sorted(moved)))
+        if stuck:
+            note.append("stale-tmp preserve-failed(%s — 보존 이름으로 옮기지 못해 그 이름 그대로 둔다)"
+                        % ", ".join(sorted(stuck)))
+        if held:
+            note.append("displaced held(%d — 활성 .claude.json 이 그 payload 가 아니어서 지우지 않았다)" % len(held))
     return swept
 
 
@@ -7425,17 +7481,23 @@ def _digest_of_regular(path):
         return None
 
 
-def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_digest):
+def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_digest, tmp_name=None):
     """교환 **전** 의도 저널을 내구적으로 공개 → 저널 경로. 실패는 OSError(호출자는 교환하지 않는다).
     ★R5(리뷰 codex major): 교환~검증 창에서 시더가 죽으면(마감 감시 `os._exit`·SIGKILL) 상대의 **더 새 문서**가
     displaced 이름에 남고 우리 payload 가 활성이 된다 — 다음 실행은 플래그가 이미 있으니 `already-trusted` 로 조용히
     OK 를 냈다(고립된 사용자 문서 · 아무도 모른다). 저널이 그 창을 **내구적으로** 표시한다.
-    담는 것: displaced 이름(basename) · 우리가 읽은 원본 바이트의 sha256 · payload sha256 · pid/utc(진단).
+    담는 것: displaced 이름(basename) · 우리가 읽은 원본 바이트의 sha256 · payload sha256 · pid/utc(진단) ·
+    ★triage I2 로 추가된 `tmp`(= 아직 rename 되지 않은 mkstemp payload 의 basename · 선택).
+    `tmp` 를 적는 이유: 저널 공개~rename 사이에 죽으면 payload 는 **아직 임시 이름에** 있는데, 잔재 청소는 저널의 두
+    지문을 모르므로 그 파일을 판정할 근거가 없었다(회수 ⓐ 가 저널만 지우고 청소가 payload 를 지웠다). 이 필드가 있으면
+    회수 ⓐ 가 그 임시본까지 **같은 바이트 증명**으로 판정한다. 구판 저널(필드 없음)도 그대로 유효하다.
     지문 하나로는 트랜잭션 단계를 증명할 수 없으므로(codex D4) 회수는 **두 파일의 증거**로 판정한다."""
-    payload = json.dumps({"v": 1, "displaced": displaced_name, "captured_sha256": captured_digest,
-                          "payload_sha256": payload_digest, "pid": os.getpid(),
-                          "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-                         ensure_ascii=True).encode("utf-8")
+    rec = {"v": 1, "displaced": displaced_name, "captured_sha256": captured_digest,
+           "payload_sha256": payload_digest, "pid": os.getpid(),
+           "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if tmp_name is not None:
+        rec["tmp"] = tmp_name
+    payload = json.dumps(rec, ensure_ascii=True).encode("utf-8")
     fd, tmp = tempfile.mkstemp(prefix=SEED_TRUST_TMP_PREFIX, dir=config_dir)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -7481,6 +7543,13 @@ def _read_seed_intent(path):
     for k in ("captured_sha256", "payload_sha256"):
         v = rec.get(k)
         if not isinstance(v, str) or not _SEED_HEX64_RE.match(v):
+            return None
+    if "tmp" in rec:
+        # ★triage I2 · codex 설계비평 5: 있으면 **mkstemp 이름 형식의 basename** 이어야 한다(경로 탈출 · 잠금 ·
+        #   저널 · conflict 참조 금지 · `\Z` 라 개행 꼬리도 불통). 필드 자체의 부재는 구판 저널이므로 유효하다.
+        t = rec["tmp"]
+        if not isinstance(t, str) or os.path.basename(t) != t or not _SEED_TMP_LITTER_RE.match(t) \
+                or t == SEED_TRUST_LOCK_NAME:
             return None
     return rec
 
@@ -7540,30 +7609,34 @@ def _preserve_copy(path):
     return os.path.basename(target)
 
 
-def _release_uncommitted_copy(cfg, dpath, jpath):
+def _release_uncommitted_copy(cfg, dpath, jpath, digests):
     """교환이 **성립하지 않은** 자리에서 우리 payload 사본(displaced)과 의도 저널을 처분 → 사유 꼬리.
     ★R7(리뷰 codex): 종전 근거 '교환 안 됨 = 사본을 지워도 안전' 은 성립하지 않는다 — 교환이 ENOENT 로 실패하는
     바로 그 형상(그 사이 외부가 활성을 지웠다)에서 이 사본(원본 + 플래그)이 **유일한 완전한 문서**다.
-    판정은 '활성 문서가 유효한 문서로 있는가' 하나다: 있으면(누가 썼든) 우리 사본은 그 문서보다 낡은 스냅샷이므로
-    지운다 — 여기서 바이트 동등까지 요구하면 커밋 순간 끼어든 정상 기록자마다 conflict 파일이 쌓인다(Windows 는
-    기존 문서 경로가 **언제나** 이 자리라 잔재가 상시화된다). 없거나 깨졌으면 보존 이름으로 옮긴다.
-    잔여(고지): 외부가 지운 뒤 그 마이크로초에 다시 만들면(healthy) 낡은 스냅샷으로 보고 지운다 — 저널로 보호되는
-    **공개된** 사본(회수 ⓑⓒ)과 달리 이 사본은 공개된 적이 없고 창은 syscall 두 개 폭이다."""
-    if _active_document_healthy(cfg):
+    ★triage I4(재유도 CONFIRMED): R7 은 판정을 '활성 문서가 유효한가' 하나로 뒀다 — 그것은 **유효를 중복과 등치**한
+    것이라, 대조(⑥)를 통과한 뒤 다른 기록자가 활성을 `{}` 로 바꾸고 교환이 실패/부재하면 유일한 사본을 지웠다.
+    이제 판정은 저널이 적어 둔 두 지문(우리가 읽은 원본 · 우리 payload)에 대한 **바이트 증명**이다.
+    실측(triage): 통상 경로(활성 무변경 = 활성 바이트가 captured 그대로)는 증명이 성립해 잔재 0 이다 — Windows 의
+    상시 경로(교환 기구 부재)도 마찬가지다. conflict 가 생기는 것은 **대조~교환 사이에 실제로 활성이 바뀐** 때뿐이고,
+    그때 그 사본을 지우는 것은 알려진 손실이다(보수적으로 남긴다).
+    ★codex 설계비평 2: 보존 rename 이 실패하면 **저널을 남긴다** — 사본이 displaced 이름에 그대로 있으므로 다음 실행의
+    회수(ⓑ)가 두 지문을 갖고 다시 판정해야 한다(저널을 지우면 그 근거를 잃고 고아 경로로 떨어진다)."""
+    if _copy_is_redundant(cfg, digests):
         _unlink_quiet(dpath)
         _unlink_quiet(jpath)
         return ""
     kept = _preserve_copy(dpath)
-    _unlink_quiet(jpath)                       # 사본 처분이 끝났다 = 이 트랜잭션의 표시는 소임을 다했다
     if kept:
-        return " · 사본 보존(%s — 활성 .claude.json 이 유효하지 않다 · 사람이 병합)" % kept
-    return " · 사본 보존(%s — 보존 이름으로 옮기지 못해 그 이름 그대로 둔다)" % os.path.basename(dpath)
+        _unlink_quiet(jpath)                   # 사본 처분이 끝났다 = 이 트랜잭션의 표시는 소임을 다했다
+        return " · 사본 보존(%s — 활성 .claude.json 이 우리가 읽은 원본도 우리 payload 도 아니다 · 사람이 병합)" % kept
+    return (" · 사본 보존 실패(%s 를 보존 이름으로 옮기지 못했다 — 그 이름 그대로 두고 저널도 남긴다 · 다음 실행이 "
+            "다시 판정한다)" % os.path.basename(dpath))
 
 
 def _orphan_recovery_guard(config_dir, cfg):
     """잠금 아래 · 저널 회수 **뒤** · 청소/계획 **앞**: 저널 없는 보존 사본(`.claude.json.displaced-<지문>-*`)이 있는데
-    활성 문서가 없거나 유효하지 않으면 → 사본을 **자동 삭제되지 않는 이름으로 옮긴 뒤** REFUSE. 반환: None(계속) 또는
-    (rc, verdict, reason).
+    활성 문서가 **그 사본과 바이트 동등하지 않으면**(= 지워도 잃는 것이 없다는 증명이 없다) → 사본을 **자동 삭제되지
+    않는 이름으로 옮긴 뒤** REFUSE. 반환: None(계속) 또는 (rc, verdict, reason).
     ★R7(리뷰 codex major '재시도가 보호된 회수 사본을 지워도 되는 잔재로 바꾼다'): 종전엔 이 상태에서 그대로 진행해
     **활성 부재 = link 경로**로 '플래그만 든 새 문서' 를 만들고 OK 를 냈다. 다음 실행은 그 새 문서를 '건강' 으로 읽고
     지문 일치 사본을 청소한다 — 두 번의 성공적인 재시도가 사용자 필드를 영구히 지운다. 여기서 멈추는 이유는 그
@@ -7572,26 +7645,50 @@ def _orphan_recovery_guard(config_dir, cfg):
     (cys-dept)는 fail-open WARN 이고 관문 1회 수동 신뢰가 2차 방어다."""
     R = SEED_TRUST_REFUSE
     try:
-        orphans = sorted(n for n in os.listdir(config_dir) if _SEED_DISPLACED_RE.match(n))
+        names = os.listdir(config_dir)
     except OSError as e:
         return (R, "REFUSE", "orphan-scan-failed(%s — 보존 사본의 유무를 관측할 수 없다 · 무접촉 · 사람이 확인)"
                 % (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
-    if not orphans or _active_document_healthy(cfg):
+    orphans = sorted(n for n in names if _SEED_DISPLACED_RE.match(n))
+    if not orphans:
         return None                            # 사본이 없으면 활성 문서를 **읽지도 않는다**(주경로 판독 횟수 불변)
+    # ★codex 설계비평 4: '저널 없는' 은 이 가드의 전제이지 관측이 아니었다 — 회수(ⓑ)가 정리에 실패해 저널을 남긴
+    #   사본까지 고아로 잡아 애먼 격리·거부를 냈다. 같은 열거에서 저널이 가리키는 이름을 빼 둔다(추가 listdir 0).
+    claimed = set()
+    for n in names:
+        if n.startswith(SEED_TRUST_INTENT_PREFIX):
+            rec = _read_seed_intent(os.path.join(config_dir, n))
+            if rec is not None:
+                claimed.add(rec["displaced"])
     # 대상은 **지문 청소가 지울 수 있는 것**뿐이다(바이트의 sha256 = 이름의 지문 = 우리 payload 동등). 지문이 다른
     #   displaced(교환 뒤 옛 inode = 낯선 문서)는 어느 경로에서도 자동 삭제되지 않으므로 이미 안전하고, 그것 때문에
     #   막으면 사람이 손대기 전까지 **매번** 거부하게 된다(1회 계약 위반 · 부트 마찰).
+    # ★triage I3(blocking · 재유도 CONFIRMED): 통과 조건도 `_active_document_healthy` 가 아니라 **바이트 증명**이다 —
+    #   외부가 활성을 `{}` 로 재생성하면 '건강' 이 참이 되어 가드가 통과했고, 곧바로 지문 청소가 그 사본을 지웠다.
+    #   활성이 바로 그 payload 일 때만 '지워도 잃는 것이 없다' 가 증명된다.
+    active = _active_digest(cfg)
     at_risk = []
     for n in orphans:
         m = _SEED_DISPLACED_RE.match(n)
-        if m and _digest_of_regular(os.path.join(config_dir, n)) == m.group(1):
+        if n in claimed or not m or m.group(1) == active:
+            continue                           # 저널이 책임지는 사본 · 낯선 이름 · 증명된 중복은 이 가드의 대상이 아니다
+        if _digest_of_regular(os.path.join(config_dir, n)) == m.group(1):
             at_risk.append(n)
     if not at_risk:
         return None
-    kept = [(_preserve_copy(os.path.join(config_dir, n)) or n) for n in at_risk]
-    return (R, "REFUSE", "unresolved-recovery(활성 .claude.json 이 없거나 유효하지 않은데 중단된 교환의 보존 사본 %d건이 "
-                         "있다 — 그 사본이 유일한 완전한 문서일 수 있어 대체 문서를 만들지 않는다 · 자동 삭제되지 않는 "
-                         "이름으로 보존: %s · 사람이 병합한 뒤 그 파일을 지운다)" % (len(at_risk), ", ".join(kept)))
+    moved, stuck = [], []
+    for n in at_risk:
+        kept = _preserve_copy(os.path.join(config_dir, n))
+        (moved if kept else stuck).append(kept or n)
+    # ★codex 설계비평 2: '거부는 1회' 는 **격리가 성공했을 때만** 성립한다 — rename 이 막히면(EACCES 등) 사본이 청소
+    #   네임스페이스에 그대로 남아 다음 실행도 같은 판정을 낸다. 성공과 실패를 따로 말한다(둘을 뭉뚱그리지 않는다).
+    tail = ("자동 삭제되지 않는 이름으로 보존: %s" % ", ".join(moved)) if moved else ""
+    if stuck:
+        tail += ("%s보존 이름으로 옮기지 못한 사본: %s(그 이름 그대로 둔다 — 사람이 옮기기 전까지 이 거부가 반복된다)"
+                 % (" · " if tail else "", ", ".join(stuck)))
+    return (R, "REFUSE", "unresolved-recovery(활성 .claude.json 이 그 사본과 바이트 동등하지 않은데 중단된 교환의 보존 "
+                         "사본 %d건이 있다 — 그 사본이 유일한 완전한 문서일 수 있어 대체 문서를 만들지 않는다 · %s · "
+                         "사람이 병합한 뒤 그 파일을 지운다)" % (len(at_risk), tail))
 
 
 def _journal_lines(journals):
@@ -7612,6 +7709,45 @@ def _journal_lines(journals):
     return residual, resolved
 
 
+def _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed):
+    """★triage I2 — 저널이 적어 둔 mkstemp payload(`rec["tmp"]`)를 회수 ⓐ 에서 판정한다.
+    반환: None(그 이름이 없다·구판 저널 = 호출자가 종전대로) · True(처분 완료 → 저널 회수) · False(정리 실패 →
+    저널 유지) · (rc, verdict, reason)(무접촉 REFUSE).
+    구분(codex 설계비평 5): **부재 / 조회 실패 / 비정규·판독 실패 / 지문 불일치** 를 접지 않는다 — 접으면 그 접힘이
+    곧 '지워도 된다' 가 된다(결측은 값이 아니다)."""
+    R = SEED_TRUST_REFUSE
+    t = rec.get("tmp")
+    if not isinstance(t, str):
+        return None                            # 구판 저널 — 이 갈래는 없다(잔재 청소의 문서 형상 규칙이 2차 방어)
+    tpath = os.path.join(config_dir, t)
+    here = _lexists_strict(tpath)
+    if here is None:
+        return (R, "REFUSE", "interrupted-transaction(저널이 가리키는 임시본 %s 의 존재를 조회할 수 없다 — 무접촉 · "
+                             "사람이 확인)" % t)
+    if here is False:
+        return None                            # rename 을 넘겼거나 이미 처분됐다 — 종전 판정으로
+    d = _digest_of_regular(tpath)
+    if d is None:
+        return (R, "REFUSE", "interrupted-transaction(저널이 가리키는 임시본 %s 를 판독할 수 없다(비정규/권한) — "
+                             "무접촉 · 사람이 확인)" % t)
+    if d != rec["payload_sha256"]:
+        return (R, "REFUSE", "interrupted-transaction(저널이 가리키는 임시본 %s 의 바이트가 저널의 payload 지문과 다르다 "
+                             "— 우리 것이 아닌 내용이 그 이름에 있다 · 무접촉 · 사람이 확인)" % t)
+    if not _copy_is_redundant(cfg, (rec["captured_sha256"], rec["payload_sha256"])):
+        kept = _preserve_copy(tpath)
+        if kept is None:
+            return (R, "REFUSE", "interrupted-transaction(임시본 %s 를 보존 이름으로 옮기지 못했다 — 활성 문서가 그 "
+                                 "바이트가 아니어서 지울 수도 없다 · 무접촉 · 사람이 확인)" % t)
+        preserved.append(kept)
+        return True
+    try:
+        os.unlink(tpath)
+    except OSError:
+        return False                           # 정리는 못 했다 — 저널을 남겨 다음 실행이 다시 판정한다
+    reclaimed.append(t)
+    return True
+
+
 def _recover_interrupted_seed(config_dir, cfg, note=None):
     """잠금 아래 · 잔재 청소와 'already-trusted' **앞**에서 중단된 교환 트랜잭션을 판정한다 → None(계속) 또는
     (rc, verdict, reason). 판정은 저널 + **두 파일의 바이트**로 한다(codex D4):
@@ -7630,6 +7766,7 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
     선후를 알 수 없다(codex D4)."""
     R = SEED_TRUST_REFUSE
     preserved = []                             # 지울 수 없어 보존 이름으로 옮긴 사본(★R7) — 사유에 남긴다
+    reclaimed = []                             # 증명이 성립해 회수(unlink)한 사본(★triage I1) — 사유에 남긴다
     try:
         names = sorted(n for n in os.listdir(config_dir) if n.startswith(SEED_TRUST_INTENT_PREFIX))
     except OSError as e:
@@ -7650,6 +7787,18 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
             return (R, "REFUSE", "interrupted-transaction(저널 %s 가 가리키는 %s 의 존재를 조회할 수 없다 — 무접촉 · "
                                  "사람이 확인)" % (n, rec["displaced"]))
         if here is False:
+            # ★triage I2(재유도 CONFIRMED): displaced 가 없다 = rename 전에 죽었을 수 있다 — 그때 payload 는 아직
+            #   **mkstemp 이름**에 있다. 저널이 그 이름을 적어 두므로(★R7 이후 저널은 rename 보다 먼저 공개된다)
+            #   여기서 같은 바이트 증명으로 함께 판정한다. 종전엔 이 갈래가 저널만 지웠고, 그 뒤 잔재 청소가
+            #   '공개된 적 없는 임시파일' 이라는 이유로 payload(= 원본 + 플래그)를 무조건 지웠다.
+            got = _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed)
+            if isinstance(got, tuple):
+                return got                     # 무접촉 REFUSE(조회 불가 · 비정규 · 낯선 바이트 · 격리 실패)
+            if got is True:                    # 처분 완료(회수 또는 격리) — 이 트랜잭션의 표시는 소임을 다했다
+                _unlink_quiet(jpath)
+                continue
+            if got is False:                   # 처분 실패(unlink 막힘) — 저널을 남겨 다음 실행이 다시 판정한다
+                continue
             if _active_document_healthy(cfg):
                 _unlink_quiet(jpath)
                 continue
@@ -7674,7 +7823,17 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
                     return (R, "REFUSE", "interrupted-transaction(%s 를 보존 이름으로 옮기지 못했다 — 활성 문서가 "
                                          "원본이 아니어서 지울 수도 없다 · 무접촉 · 사람이 확인)" % rec["displaced"])
                 preserved.append(kept)
-            _unlink_quiet(jpath)                 # 우리 payload 뿐 — 파일은 지문 청소(⑪)가 회수한다
+                _unlink_quiet(jpath)
+                continue
+            # ★triage I1 함께: 종전엔 저널만 지우고 "파일은 지문 청소(⑪)가 회수한다" 로 넘겼다 — 그 청소는 저널의
+            #   `captured_sha256` 을 모르므로 **더 약한 증거**로 같은 결정을 다시 내려야 했다(활성 = captured 인
+            #   ⓑ 의 정상 형상에서 증명에 실패해 애먼 격리·거부가 된다). 증명이 여기서 이미 성립했으니 여기서 지운다.
+            try:
+                os.unlink(dpath)
+            except OSError:
+                continue                         # ★codex 설계비평 4: 정리 실패면 저널을 남긴다(다음 실행·C58 이 본다)
+            reclaimed.append(rec["displaced"])
+            _unlink_quiet(jpath)                 # 처분 완료 뒤에만 표시를 지운다(순서 고정 · codex D4)
             continue
         if d == rec["captured_sha256"]:
             if not _active_document_healthy(cfg):
@@ -7702,9 +7861,12 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
         return (R, "REFUSE", "interrupted-transaction(교환 뒤 검증 전에 중단됐다 — 상대의 더 새 문서가 %s 에 있고 활성 "
                              ".claude.json 은 우리 문서다 · 어느 쪽이 최신인지 도구가 판정하지 않는다 · 사람이 병합한 뒤 "
                              "%s 를 지운다)" % (rec["displaced"], n))
-    if preserved and note is not None:
-        note.append("recovery-preserved(%s — 활성 문서가 원본이 아니어서 지우지 않고 옮겼다 · 사람이 병합)"
-                    % ", ".join(preserved))
+    if note is not None:
+        if preserved:
+            note.append("recovery-preserved(%s — 활성 문서가 원본이 아니어서 지우지 않고 옮겼다 · 사람이 병합)"
+                        % ", ".join(preserved))
+        if reclaimed:
+            note.append("recovery-reclaimed(%d — 저널의 두 지문으로 중복을 증명하고 회수했다)" % len(reclaimed))
     return None
 
 
@@ -7830,7 +7992,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         orphan = _orphan_recovery_guard(config_dir, cfg)            # ⑭ ★R7: 저널 없는 보존 사본 + 불건강 활성 = 대체 문서 금지
         if orphan:
             return orphan
-        swept = _sweep_stale_seed_tmp(config_dir)                                   # ⑪ 잠금 아래 잔재 청소
+        swept = _sweep_stale_seed_tmp(config_dir, note)                             # ⑪ 잠금 아래 잔재 청소
         state = _read_plan()
         if len(state) == 3:
             return state
@@ -7920,9 +8082,12 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 #   '저널 없는 payload 사본' 이 남는 창이 있었고, 그 사본은 보호 근거를 잃은 채 남아 다음 실행이
                 #   만든 새 문서가 '건강' 판정을 주는 순간 청소 대상이 됐다(사용자 필드 소실). 저널이 먼저면 그
                 #   창에서 남는 것은 '가리키는 파일이 없는 저널' 이고 회수 ⓐ 가 그것을 안전하게 접는다.
+                # ★triage I2: 저널에 **아직 rename 되지 않은 mkstemp 이름**도 함께 적는다 — 저널 공개~rename 창에서
+                #   죽으면 payload 는 그 임시 이름에만 있고, 잔재 청소는 저널의 두 지문을 모른다.
+                digests = (_payload_digest(raw), _payload_digest(payload_b))
                 try:
                     intent = _write_seed_intent(config_dir, os.path.basename(displaced),
-                                                _payload_digest(raw), _payload_digest(payload_b))
+                                                digests[0], digests[1], tmp_name=os.path.basename(tmp))
                 except OSError as e:
                     return E, "ERROR", "의도 저널 기록 실패 — 교환하지 않는다(무변경): %s" % e
                 try:
@@ -7938,7 +8103,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 except OSError as e:                      # syscall -1 = 교환 안 됨 → displaced 는 우리 payload 그대로
                     # ★R7(리뷰 codex): '교환 안 됨 = 사본을 지워도 안전' 은 성립하지 않는다 — 그 사이 외부가 활성을
                     #   지웠다면(교환이 ENOENT 로 실패하는 바로 그 형상) 이 사본이 유일한 완전한 문서다.
-                    kept = _release_uncommitted_copy(cfg, displaced, intent)
+                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests)
                     return E, "ERROR", "쓰기 실패(교환): %s%s" % (e, kept)
                 if swapped:
                     # displaced 에는 교환 순간 .claude.json 에 있던 inode 가 그대로 있다 — 그것이 우리가 읽은 원본인가?
@@ -7953,12 +8118,22 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                             _unlink_quiet(intent)         # 되교환까지 끝나 창이 닫혔다(실패면 저널을 남겨 증거로 둔다)
                         return got
                     note.append("commit=exchange")            # ★R4: 커밋은 교환으로 이미 성립 — 아래 청소 실패가 이 사실을 못 뒤집는다
-                    try:
-                        os.unlink(displaced)                  # 옛 원본(= 우리 계획의 전제 · 바이트 동일) 폐기
-                        _unlink_quiet(intent)                 # 처분 완료 뒤에만 표시를 지운다(순서 고정 · codex D4)
-                    except OSError as e:                      # 잔재는 남지만 커밋은 성공(리뷰 minor: 종전엔 ERROR 로 보고했다)
-                        note.append("displaced-left(%s · 저널이 남아 다음 실행이 회수한다)"
-                                    % (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
+                    # ★codex 설계비평 8(triage 4건과 같은 과): 여기서도 삭제의 근거는 **바이트 증명**이어야 한다 —
+                    #   교환 직후 그 마이크로초에 외부가 활성을 `{}` 로 바꾸면 displaced 의 옛 원본이 유일한 사본이다.
+                    #   통상 경로는 활성 = 우리 payload 이므로 증명이 성립하고 잔재는 그대로 0 이다.
+                    if not _copy_is_redundant(cfg, digests):
+                        kept = _preserve_copy(displaced)
+                        note.append("displaced-preserved(%s — 교환 직후 활성이 우리 문서도 원본도 아니게 바뀌었다 · 사람이 병합)"
+                                    % (kept or os.path.basename(displaced)))
+                        if kept:
+                            _unlink_quiet(intent)
+                    else:
+                        try:
+                            os.unlink(displaced)              # 옛 원본(= 우리 계획의 전제 · 바이트 동일) 폐기
+                            _unlink_quiet(intent)             # 처분 완료 뒤에만 표시를 지운다(순서 고정 · codex D4)
+                        except OSError as e:                  # 잔재는 남지만 커밋은 성공(리뷰 minor: 종전엔 ERROR 로 보고했다)
+                            note.append("displaced-left(%s · 저널이 남아 다음 실행이 회수한다)"
+                                        % (errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
                     _fsync_dir(config_dir)
                 else:
                     # ★R3(리뷰 codex BLOCK): 기구 부재(Windows · 미지원 FS)는 **REFUSE** — 대조~os.replace 창의 기록자(C43
@@ -7966,7 +8141,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     #   무손실 계약을 만족하지 못한다. 강행 플래그로도 열지 않는다(귀속 불확실을 감수하는 것과 알려진 손실을
                     #   감수하는 것은 다른 예외 · codex R3) — 사람이 관문에서 1회 신뢰하면 claude 가 스스로 플래그를 쓴다(2차 방어).
                     # ★R7: 같은 규율 — 활성 문서가 **유효할 때만** 우리 사본을 지운다(아니면 보존 이름으로 옮긴다).
-                    kept = _release_uncommitted_copy(cfg, displaced, intent)
+                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests)
                     return R, "REFUSE", ("exchange-unavailable(%s — 원자 교환 없이는 대조~교체 창을 닫을 수 없다 · 기존 문서 무접촉 · "
                                          "관문에서 1회 수동 신뢰 뒤 already-trusted)%s%s"
                                          % (getattr(swapped, "why", None) or "기구 부재",
@@ -8796,7 +8971,7 @@ def _self_test():
               # ★R7 재핀(리뷰 codex major · plan §8 '의도적 기본값 변경만 재핀'): ⓐ 회수 호출에 note 인자가 붙어
               #   닫는 괄호까지 박은 종전 핀 문자열이 못 쓰게 됐고 ⓑ already-trusted 사유에 꼬리가 붙었으며
               #   ⓒ **저널 < rename** 이 이 라운드의 계약이다(종전은 rename < 저널이어도 통과했다).
-              seed_src.index("_recover_interrupted_seed(config_dir, cfg") < seed_src.index("_sweep_stale_seed_tmp(config_dir)")
+              seed_src.index("_recover_interrupted_seed(config_dir, cfg") < seed_src.index("_sweep_stale_seed_tmp(config_dir, note)")
               < seed_src.index('"already-trusted(key=%s)%s" % (key')     # 본문 반환 지점(머리 주석 언급이 아니라)
               and seed_src.index("_write_seed_intent(config_dir") < seed_src.index("os.rename(tmp, displaced)")
               < seed_src.index("_exchange_paths(displaced, cfg)")
@@ -8828,11 +9003,27 @@ def _self_test():
               "_parse_claude_json(" not in _pin_src(_active_document_healthy)   # 호출 0(주석의 이름 언급은 무관)
               and "raw.strip()" in _pin_src(_active_document_healthy)
               and "utf-8-sig" in _pin_src(_active_document_healthy))
-        check("_sweep_stale_seed_tmp(R6 리뷰 codex): displaced 지문 청소는 활성 문서가 유효할 때만(저널 없는 payload 잔재가 "
-              "유일한 완전한 사본일 수 있다) · mkstemp 잔재는 무관하게 청소",
-              "_active_document_healthy(" in _pin_src(_sweep_stale_seed_tmp)
-              and _pin_src(_sweep_stale_seed_tmp).index("_SEED_TMP_LITTER_RE.match(n)")
-              < _pin_src(_sweep_stale_seed_tmp).index("_active_document_healthy("))
+        sw_src = _pin_src(_sweep_stale_seed_tmp)
+        check("_sweep_stale_seed_tmp(★triage I1 재핀 · plan §8 '의도적 기본값 변경만 재핀'): 지문 일치 displaced 삭제의 "
+              "근거는 `_active_document_healthy` 가 **아니라 바이트 증명**(활성 = 그 payload)이다 — R6 규칙은 외부가 활성을 "
+              "`{}` 로 재생성하기만 하면 유일한 사용자 사본을 지웠다 · 증명 실패는 무접촉(격리는 가드가 한다)",
+              "_active_document_healthy(" not in sw_src                    # 호출 0(독스트링의 이름 언급은 무관)
+              and '_active_digest(cfg) != m.group(1)' in sw_src
+              and sw_src.index("_payload_digest(data) != m.group(1)") < sw_src.index("_active_digest(cfg) != m.group(1)")
+              and "if not _litter_may_be_dropped(path, cfg):" in sw_src     # 잔재도 판정을 거친다(★triage I2)
+              and "_preserve_copy(path)" in sw_src                          # 증명 없는 사용자 문서 임시본 격리
+              and "SEED_TRUST_CONFLICT_PREFIX" not in sw_src)
+        check("_litter_may_be_dropped(★triage I2): mkstemp 잔재도 무조건 삭제가 아니다 — **사용자 데이터를 담은 문서**는 "
+              "활성과 바이트 동등이 증명될 때만 지운다 · 최소 문서(플래그뿐)·저널 조각·부분 기록은 종전대로 삭제 · 판독 실패는 보존",
+              _document_carries_user_data(b'{"projects": {"/a": {"hasTrustDialogAccepted": true}}, "user": "u"}')
+              and _document_carries_user_data(b'{"projects": {"/a": {"hasTrustDialogAccepted": true, "x": 1}}}')
+              and not _document_carries_user_data(b'{"projects": {"/a": {"hasTrustDialogAccepted": true}}}')   # 최소 문서 = 지킬 데이터 0
+              and not _document_carries_user_data(b'{"projects": {}}')
+              and not _document_carries_user_data(b'{"projects": []}') and not _document_carries_user_data(b"[]")
+              and not _document_carries_user_data(b'{"v": 1, "displaced": "x"}')   # 저널 내용은 문서가 아니다
+              and not _document_carries_user_data(b"{broken") and not _document_carries_user_data(b"")
+              and "_document_carries_user_data(data)" in _pin_src(_litter_may_be_dropped)
+              and "return False" in _pin_src(_litter_may_be_dropped).split("except (OSError, ValueError):")[1][:40])
         check("_exclusive_name(★R7 리뷰 claude minor): 보존 이름은 **증명된 부재**에서만 확정한다 — 3값 "
               "`_lexists_strict`(True·None 은 다음 후보) · `os.path.lexists` 0 · 상한 소진은 OSError(쓰지 않는다)",
               "os.path.lexists(" not in _pin_src(_exclusive_name)   # 호출 0(독스트링의 이름 언급은 무관)
@@ -8846,11 +9037,19 @@ def _self_test():
         check("_orphan_recovery_guard(★R7 리뷰 codex major): 저널 없는 **지문 일치** 보존 사본 + 불건강 활성 = 대체 문서 "
               "생성 금지 — 사본을 자동 삭제되지 않는 이름으로 옮긴 뒤 REFUSE(1회) · 회수 뒤·청소 앞",
               seed_src.index("_recover_interrupted_seed(config_dir, cfg") < seed_src.index("_orphan_recovery_guard(config_dir, cfg)")
-              < seed_src.index("_sweep_stale_seed_tmp(config_dir)")
+              < seed_src.index("_sweep_stale_seed_tmp(config_dir, note)")
               and '"REFUSE", "unresolved-recovery(' in og_src and "_preserve_copy(" in og_src
               and "_digest_of_regular(" in og_src            # 청소가 지울 수 있는 것만 막는다(무한 거부 0)
               and "orphan-scan-failed" in og_src             # 열거 실패는 '사본 없음' 이 아니다
-              and og_src.index("os.listdir(config_dir)") < og_src.index("_active_document_healthy(cfg)"))
+              and og_src.index("os.listdir(config_dir)") < og_src.index("_active_digest(cfg)"))
+        check("_orphan_recovery_guard(★triage I3 재핀 · plan §8): 통과 조건이 `_active_document_healthy` 가 아니라 **바이트 "
+              "동등**이다(건강한 대체 문서가 고아 보호를 우회하던 자리) · 저널이 책임지는 사본은 대상 밖 · 격리 성공과 "
+              "실패를 따로 보고한다(거부 1회는 격리가 성공했을 때의 계약이다)",
+              "_active_document_healthy(" not in og_src      # 호출 0
+              and "m.group(1) == active" in og_src
+              and "n in claimed" in og_src and "_read_seed_intent(" in og_src
+              and og_src.count("os.listdir(config_dir)") == 1   # 저널 제외에 추가 열거 0
+              and "옮기지 못한 사본" in og_src)
         check("_preserve_copy(★R7): 보호는 **네임스페이스 이동**이다 — conflict 접두는 어느 자동 삭제 경로에도 없다"
               "(지문 청소·잔재 청소가 그 이름을 지우지 못한다) · 바이트는 rename 하나로 불변",
               "SEED_TRUST_CONFLICT_PREFIX" in _pin_src(_preserve_copy) and "os.rename(path, target)" in _pin_src(_preserve_copy)
@@ -8862,14 +9061,25 @@ def _self_test():
               "하나와 같을 때만 사본을 지운다(아니면 보존 이름으로 이동) · 판독 실패는 보존 방향",
               rec_src.count("_copy_is_redundant(cfg, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]))") == 2
               and rec_src.count("_preserve_copy(dpath)") == 2
+              # ★triage I1: ⓑ 가 **스스로** 회수한다 — ⓒ 의 unlink 가 이 핀을 대신 만족시키지 못하도록 ⓑ 구간만 본다
+              and "os.unlink(dpath)" in rec_src.split('d == rec["payload_sha256"]')[1].split('d == rec["captured_sha256"]')[0]
+              and "reclaimed.append(" in rec_src
               and "_active_digest(cfg)" in _pin_src(_copy_is_redundant)
               and _copy_is_redundant.__doc__ is not None
               and _active_digest(os.path.join(os.path.dirname(os.path.abspath(__file__)), "no-such-file")) is None)
-        check("_release_uncommitted_copy(★R7 리뷰 codex): 교환이 성립하지 않은 자리(syscall 실패 · 기구 부재)에서 "
-              "사본 삭제는 **활성 문서가 유효할 때만** — 아니면 보존 이름으로",
-              seed_src.count("_release_uncommitted_copy(cfg, displaced, intent)") == 2
-              and "_active_document_healthy(cfg)" in _pin_src(_release_uncommitted_copy)
-              and "_preserve_copy(dpath)" in _pin_src(_release_uncommitted_copy))
+        ruc_src = _pin_src(_release_uncommitted_copy)
+        check("_release_uncommitted_copy(★triage I4 재핀 · plan §8): 교환이 성립하지 않은 자리(syscall 실패 · 기구 부재 = "
+              "Windows 상시 경로)의 사본 삭제도 **저널의 두 지문에 대한 바이트 증명**이다 — R7 의 '활성이 유효하면 삭제' 는 "
+              "유효를 중복과 등치해 대조 뒤 끼어든 기록자가 활성을 비우면 유일한 사본을 지웠다 · 보존 실패면 저널을 남긴다",
+              seed_src.count("_release_uncommitted_copy(cfg, displaced, intent, digests)") == 2
+              and "_active_document_healthy(cfg)" not in ruc_src
+              and "_copy_is_redundant(cfg, digests)" in ruc_src
+              and "_preserve_copy(dpath)" in ruc_src
+              and ruc_src.index("kept = _preserve_copy(dpath)") < ruc_src.rindex("_unlink_quiet(jpath)"))
+        check("교환 성공 경로(★codex 설계비평 8): 옛 원본(displaced) 폐기도 바이트 증명 아래에 둔다 — 교환 직후 그 창에 "
+              "외부가 활성을 바꾸면 그 옛 원본이 유일한 사본이다(통상 경로는 활성 = 우리 payload 라 잔재 0 불변)",
+              seed_src.index('note.append("commit=exchange")') < seed_src.index("if not _copy_is_redundant(cfg, digests):")
+              < seed_src.index("os.unlink(displaced)") and "displaced-preserved(" in seed_src)
         check("self-test 러너(★R7 리뷰 claude minor): 순서 핀의 소스는 `_pin_src` 경유 — 핀 문자열이 사라지면 그 핀 "
               "하나만 FAIL 이고 결과 줄은 반드시 나온다(종전엔 ValueError 로 전체 중단)",
               (_PinSrc("abc").index("zz") < 5) is False and (5 < _PinSrc("abc").index("zz")) is False
@@ -8877,6 +9087,19 @@ def _self_test():
               and _PinSrc("abc").rindex("zz") is _NOWHERE
               and "except Exception as e" in _pin_src(_self_test)
               and "self-test 중단" in _pin_src(_self_test))
+        jup_src = _pin_src(_judge_unrenamed_payload)
+        check("의도 저널의 `tmp` 필드(★triage I2): 저널은 **아직 rename 되지 않은 mkstemp 이름**도 담고, 회수 ⓐ 가 그 "
+              "임시본까지 같은 바이트 증명으로 판정한다 — 종전엔 저널만 지우고 잔재 청소가 payload 를 무조건 지웠다 · "
+              "필드 부재(구판 저널)는 유효 · 있으면 mkstemp 형식 basename 만 허용 · 부재/조회 실패/비정규/불일치를 접지 않는다",
+              "tmp_name=os.path.basename(tmp)" in seed_src
+              and '"tmp"] = tmp_name' in _pin_src(_write_seed_intent)
+              and "_SEED_TMP_LITTER_RE.match(t)" in _pin_src(_read_seed_intent)
+              and _read_seed_intent.__doc__ is not None
+              and "_judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed)" in _pin_src(_recover_interrupted_seed)
+              and "_lexists_strict(tpath)" in jup_src and "_digest_of_regular(tpath)" in jup_src
+              and 'd != rec["payload_sha256"]' in jup_src
+              and "_copy_is_redundant(cfg, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]))" in jup_src
+              and "_preserve_copy(tpath)" in jup_src and "os.unlink(tpath)" in jup_src)
         check("_recover_interrupted_seed(R6 리뷰 codex major): 저널 열거 실패는 '저널 없음' 이 아니라 REFUSE",
               "journal-scan-failed" in _pin_src(_recover_interrupted_seed)
               # 문(statement)으로서의 `return None` 이 열거 앞에 0(주석 속 이름 언급은 무관)
