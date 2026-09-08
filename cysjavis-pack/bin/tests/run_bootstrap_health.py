@@ -7787,6 +7787,46 @@ def h_seed_capgate_1():
     need("PING_RETRY" not in bsrc.split("_cap_unresolved")[1][:1200],
          "재측정 경로에 데몬 대기 재시도 루프가 붙었다(이 축의 전제 위반)")
     notes.append("fast path AND + C28 표적")
+    # ⓒ-2 ★R2 minor(codex): 위 ⓒ는 **소스 문자열 탐색**이다 — 그 `_run(...)` 을
+    #     `code, out = 0, ""` 로 갈아 끼워도 전부 통과한다(codex 실증). 그래서 여기서는
+    #     bootstrap 을 **실제로 돌려** 재측정이 일어나는지 본다: 스텁 preflight 가 자기 argv 를
+    #     파일에 적으므로 '불렸는가·무엇을 표적으로 했는가' 가 관측으로 남는다.
+    boot = os.path.join(BIN_DIR, "javis_bootstrap.py")
+    with tempfile.TemporaryDirectory() as btmp:
+        benv, bhome = _boot_sandbox(os.path.join(btmp, "b"))
+        bpack = os.path.join(bhome, ".cys", "pack")
+        # fast path 전제(H-LIFE-1 과 같은 규약): 마커에 **실팩 버전**이 박혀야 재선언이 preflight
+        # 를 생략한다 — `unknown` 은 판정 불가라 fast path 가 아예 켜지지 않는다.
+        _w(os.path.join(bpack, ".pack-version"), "9.9.9\n", 0o644)
+        argv_log = os.path.join(btmp, "pf-argv.log")
+        _w(os.path.join(bpack, "bin", "javis_preflight.py"),
+           "import sys\n"
+           "open(%r, 'a', encoding='utf-8').write(' '.join(sys.argv[1:]) + '\\n')\n"
+           "sys.exit(0)\n" % argv_log, 0o644)
+        r1 = _run([PY, boot], env=benv, timeout=180)
+        need(r1.returncode == 0, "① 첫 부팅 실패: %d\n%s" % (r1.returncode, r1.stderr[-400:]))
+        need(os.path.exists(argv_log) and _read(argv_log).strip(),
+             "계측 타당성 실패: 첫 부팅이 preflight 를 돌리지 않았다(픽스처가 공허하다)")
+        # ⓐ 대조군 — 표식이 없으면 두 번째 부팅은 preflight 를 **생략**한다(fast path).
+        _w(argv_log, "", 0o644)
+        r2 = _run([PY, boot], env=benv, timeout=180)
+        need(r2.returncode == 0, "② 재선언 실패: %d\n%s" % (r2.returncode, r2.stderr[-400:]))
+        need(not _read(argv_log).strip(),
+             "계측 타당성 실패: 표식이 없는데 fast path 가 발동하지 않았다: %r" % _read(argv_log))
+        # ⓑ 표식이 있으면 **다시 잰다** — 그것도 C28 만(전량 재실행은 부트 지연·큐 적체다).
+        _w(os.path.join(bpack, "state", "capgate-unresolved.json"), "{}\n", 0o644)
+        r3 = _run([PY, boot], env=benv, timeout=180)
+        need(r3.returncode == 0, "③ 표식 부팅 실패: %d\n%s" % (r3.returncode, r3.stderr[-400:]))
+        got = _read(argv_log).strip()
+        need(got, "미해소 표식이 있는데 **재측정이 일어나지 않았다** — 소비 축이 문면에만 있고 "
+                  "실행에는 없다(다음 부팅이 다시 재는 것이 이 축의 유일한 계약이다)")
+        need("--only C28.self-correction" in got,
+             "재측정이 표적(C28)이 아니다 — 전량 preflight 재실행은 부트 지연·큐 적체를 만든다: %r"
+             % got)
+        need("--fix" in got,
+             "재측정이 판정만 하고 교정하지 않는다 — 표식이 해소되지 않아 매 부팅이 반복된다: %r"
+             % got)
+    notes.append("실행 축: 표식 X→생략 · 표식 O→`--fix --only C28` 재측정")
     old = _git_show("cysjavis-pack/bin/javis_bootstrap.py")
     calib = "skip(no-git)"
     if old is not None:

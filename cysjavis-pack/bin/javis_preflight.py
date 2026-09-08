@@ -4361,9 +4361,16 @@ class Preflight:
                             if _serr:
                                 warns.append("%s/%s 능력 게이트 matcher 범위 교정 실패: %s"
                                              % (os.path.basename(t), _ev, _serr))
-                            else:
-                                fixed.append("%s 능력 게이트 matcher 범위 교정(전 도구로 환원)"
-                                             % os.path.basename(t))
+                                # ★R2 minor(claude 리뷰어): 해제가 실패했으면 **등록기를 부르지
+                                #   않는다**. 등록기는 우리 명령이 이미 있으면(=matcher 로 좁혀진
+                                #   그 항목이 그대로 남아 있으면) 아무것도 붙이지 않고 성공(None)
+                                #   을 돌려주므로, 그대로 두면 `fixed` 에 "등록됨" 한 줄이 더
+                                #   실린다 — settings.json 은 여전히 matcher 로 좁혀져 있고
+                                #   게이트는 Bash 전용인데 보고만 FIXED 다(계획 §8 "검증 결과를
+                                #   재작성하지 않는다"). 표식(T11)이 남아 다음 부팅이 재시도한다.
+                                continue
+                            fixed.append("%s 능력 게이트 matcher 범위 교정(전 도구로 환원)"
+                                         % os.path.basename(t))
                         err = self._register_event_hook(t, _ev, CAPGATE_HOOK[0], _m,
                                                         timeout=_cto)
                         if err:

@@ -816,6 +816,48 @@ class TriageRegistrationGaps(_CapgateEnv):
                         "preflight 자체를 건너뛰므로 재측정 기회가 없다(탐색 대상: %s)"
                         % [str(r) for r in roots])
 
+    # ── ④ 교정 실패를 성공으로 보고하지 않는다(수렴 R2) ─────────────────────
+    def test_failed_scope_repair_is_not_reported_as_fixed(self):
+        """★R2 minor(claude 리뷰어): matcher 범위 교정에서 **해제가 실패했는데** 등록기를 그대로
+        부르면, 등록기는 우리 명령이 이미 있다고 보고(=matcher 로 좁혀진 그 항목이 남아 있으니)
+        아무것도 붙이지 않은 채 성공을 돌려준다. 그러면 한 실행이 "교정 실패" 경고와
+        "등록됨" 성공을 **동시에** 낸다 — settings.json 은 여전히 Bash 전용인데 보고만 FIXED 다
+        (계획 §8 "검증 결과를 재작성하지 않는다"). 상태는 자가 해소되지만 **문면이 사실과
+        어긋나는 것**이 결함이다.
+        """
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        cmd = pf._cys_hook_cmd(pf.CAPGATE_HOOK[0])
+        scoped = {"hooks": {"PreToolUse": [
+            {"matcher": "Bash",
+             "hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]}}
+        sp.write_text(json.dumps(scoped), encoding="utf-8")
+        seen = []
+        _orig_reg = pf.Preflight._register_event_hook
+
+        def _record(inner, settings_path, event, script_name, matcher=None, timeout=None):
+            seen.append((script_name, event))
+            return _orig_reg(inner, settings_path, event, script_name, matcher, timeout)
+
+        with mock.patch.object(pf.Preflight, "_unregister_event_hook",
+                               return_value="settings.json 쓰기 실패(모의)"), \
+                mock.patch.object(pf.Preflight, "_register_event_hook", _record):
+            res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                     directive=self.new_directive)
+        self.assertNotIn((pf.CAPGATE_HOOK[0], "PreToolUse"), seen,
+                         "해제가 실패했는데 등록기를 불렀다 — 등록기는 '이미 있음'(=좁혀진 그 "
+                         "항목)으로 보고 아무것도 하지 않은 채 성공을 돌려주므로, 한 실행이 "
+                         "'교정 실패' 경고와 '등록됨' 성공을 동시에 낸다: %r" % (seen,))
+        # ※문면 축은 여기서 재지 않는다 — C28 의 detail 은 `warns[:3]`/`fixed[:6]` 로 잘려서
+        #   이 픽스처(훅 본체 다수 부재)의 경고 목록 뒤로 밀린다. 재는 것은 **호출 사실**이다.
+        self.assertNotIn("%s(PreToolUse)" % pf.CAPGATE_HOOK[0], res["detail"],
+                         "해제가 실패했는데 '등록됨' 을 보고했다: %s" % res["detail"])
+        blocks = [b for b in doc["hooks"]["PreToolUse"]
+                  if any(pf.CAPGATE_HOOK[0] in h.get("command", "")
+                         for h in b.get("hooks", []))]
+        self.assertTrue(blocks and all(b.get("matcher") for b in blocks),
+                        "계측 타당성 실패: 해제가 실패했으면 범위는 그대로여야 한다: %s" % doc)
 
 
 if __name__ == "__main__":
