@@ -367,14 +367,73 @@ fn canonicalize_stored_queue_actions(jobs: &mut [serde_json::Value]) -> bool {
     changed
 }
 
+/// ★(0.14.31 · 수렴 R2 · triage X8 잔여) **파일을 정규형으로 접고 그 사실을 남긴다.**
+///
+/// 정규화가 데몬 부트(`ensure_builtin_jobs`)에서만 돌면 그 뒤의 운영자 수기 편집은 **파일에
+/// 강등 취약형으로 남는다**: `load_jobs` 의 핫리로드는 메모리 안에서만 접고, `remove_job_from_file`
+/// 은 그 원시 JSON 을 **그대로 다시 쓴다**. 신 데몬이 도는 동안 손으로 넣은
+/// `action:"push" + via_queue:true` 가 그렇게 디스크에 살아남아, 강등된 구 데몬이 그것을 `push`
+/// 로 읽고 **큐 준비 게이트를 통째 우회해 직접 주입**한다(이 정규화의 목적 그 자체).
+///
+/// 그래서 **원시 JSON 을 쓰는 모든 자리**가 이 함수를 지난다. 뜻은 보존한다(같은 잡·같은 목적지·
+/// 같은 문안 · action 표현만 하나로) — §B-5 의 "무언 소실" 이 아니지만, 조용한 무접촉도 관측
+/// 소실이므로 바꾼 잡 id 를 한 줄로 남긴다.
+/// 반환: 파일을 바꿨는가.
+fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Value) -> bool {
+    let ids: Vec<String> = match root.get_mut("jobs").and_then(|j| j.as_array_mut()) {
+        Some(arr) => {
+            if !canonicalize_stored_queue_actions(arr) {
+                return false;
+            }
+            arr.iter()
+                .filter(|j| j.get("action").and_then(|v| v.as_str()) == Some(ACTION_PUSH_QUEUED))
+                .filter_map(|j| j.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        }
+        None => return false,
+    };
+    if !write_schedule_atomic(path, root) {
+        eprintln!("[cysd] schedule.json 정규화 기록 실패 — 파일은 구 표현 그대로다(강등 시 직접 주입 위험)");
+        return false;
+    }
+    eprintln!(
+        "[cysd] schedule.json: 'action:\"push\" + via_queue:true' 를 '{ACTION_PUSH_QUEUED}' 로 접었다(뜻 보존 · 대상 {ids:?})"
+    );
+    true
+}
+
+/// schedule.json 원자 치환(tmp+rename) — 핫리로드 torn read 회피. 반환: 성공했는가.
+fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bool {
+    let Ok(body) = serde_json::to_string_pretty(root) else {
+        return false;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, body).is_err() {
+        return false;
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
 ///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle"·"formation"·"promote") → 버전 상이 시 교체(갱신)·동버전 무접촉
 ///   · 존재 + **마커 없음/불일치(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
-/// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
-fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
+/// 반환 `(changed, preempted, edited_action)` — ★(0.14.31 · 수렴 R2 · triage X13) **덮지 않은
+/// 두 사유를 가른다**. 종전에는 둘이 한 벡터라 호출부가 양쪽에 "예약 id 선점" 문안을 찍었다:
+/// action 만 편집한 운영자는 일어나지도 않은 선점을 통보받고 틀린 처방(다른 id 로 옮기라)을
+/// 읽었다 — 같은 실행에서 정확한 줄과 함께 나오므로 **서로 모순되는 두 줄**이었다.
+///   · `preempted` = 사용자 잡이 예약 id 를 선점(마커 없음/불일치) → 처방: 다른 id 로 옮기라.
+///   · `edited_action` = 우리 잡인데 운영자가 action 을 편집(id, 현재 action) → 처방: action 을 되돌리라.
+fn apply_builtin_jobs(
+    jobs: &mut Vec<serde_json::Value>,
+) -> (bool, Vec<String>, Vec<(String, String)>) {
     let mut changed = false;
     let mut conflicts = Vec::new();
+    let mut edited_action: Vec<(String, String)> = Vec::new();
     for bj in builtin_jobs() {
         let id = match bj.get("id").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
@@ -421,9 +480,13 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
                                 "[cysd] ensure_builtin_jobs: '{id}' 의 action 을 '{want_action}' 로 이관 — 큐 경유가 이 잡의 계약이다(직접 주입 차단)"
                             );
                         } else {
-                            conflicts.push(id.clone());
+                            // ★(triage X13 · 수렴 R2) 이것은 **id 선점이 아니다** — 우리 잡인데
+                            //   운영자가 action 을 고쳤다. 사유를 갈라 담아야 호출부가 맞는
+                            //   처방을 찍는다(선점 문안은 여기서 틀린 안내가 된다).
+                            edited_action
+                                .push((id.clone(), cur_action.unwrap_or("(없음)").to_string()));
                             eprintln!(
-                                "[cysd] ensure_builtin_jobs: '{id}' 의 action 이 '{}' 로 편집돼 있다 — 이관하지 않는다(운영자 편집 보존).                                  큐 경유가 필요하면 action 을 '{want_action}' 로 두라.",
+                                "[cysd] ensure_builtin_jobs: '{id}' 의 action 이 '{}' 로 편집돼 있다 — 이관하지 않는다(운영자 편집 보존). 큐 경유가 필요하면 action 을 '{want_action}' 로 두라.",
                                 cur_action.unwrap_or("(없음)")
                             );
                         }
@@ -461,7 +524,7 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
             }
         }
     }
-    (changed, conflicts)
+    (changed, conflicts, edited_action)
 }
 
 /// ★B2-1(W3): 데몬 부트 시 built-in phoenix 잡을 schedule.json 에 idempotent 하게 보장한다. schedule.json 은
@@ -499,25 +562,32 @@ pub fn ensure_builtin_jobs() {
     // ★(triage X8) 저장된 표현도 같은 정규형으로 접는다 — 메모리에서만 접으면 **파일**은 여전히
     //   `action:"push"` 라 강등된 구 데몬이 그것을 직접 주입한다(이 정규화의 목적 그 자체).
     let normalized = canonicalize_stored_queue_actions(arr);
-    let (bchanged, conflicts) = apply_builtin_jobs(arr);
+    if normalized {
+        // ★(triage X8 minor · 수렴 R2) 조용한 파일 수정은 관측 소실이다 — 무엇을 접었는지 남긴다.
+        eprintln!(
+            "[cysd] ensure_builtin_jobs: 저장된 'action:\"push\" + via_queue:true' 를 '{ACTION_PUSH_QUEUED}' 로 접었다(뜻 보존 · 강등된 구 데몬이 직접 주입하지 못하게)"
+        );
+    }
+    let (bchanged, preempted, edited_action) = apply_builtin_jobs(arr);
     let changed = normalized || bchanged;
-    for id in &conflicts {
+    for id in &preempted {
         eprintln!(
             "[cysd] ensure_builtin_jobs: 사용자 잡이 예약 id '{id}' 를 선점 — built-in 갱신 skip(사용자 잡 보존). \
              built-in 기능을 원하면 사용자 잡을 다른 id 로 옮기라."
         );
     }
+    for (id, cur) in &edited_action {
+        // ★(triage X13 · 수렴 R2) 선점이 아니다 — id 는 우리 것이고 운영자가 action 만 고쳤다.
+        eprintln!(
+            "[cysd] ensure_builtin_jobs: built-in 잡 '{id}' 의 action 이 '{cur}' 로 편집돼 있다 — 덮지 않는다(운영자 편집 보존). \
+             이 잡의 큐 경유가 필요하면 action 을 '{ACTION_PUSH_QUEUED}' 로 되돌리라(id 는 그대로 두라)."
+        );
+    }
     if changed {
-        match serde_json::to_string_pretty(&root) {
-            Ok(s) => {
-                let tmp = path.with_extension("json.tmp");
-                if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-                    eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
-                } else {
-                    eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
-                }
-            }
-            Err(e) => eprintln!("[cysd] ensure_builtin_jobs: 직렬화 실패({e})"),
+        if write_schedule_atomic(&path, &root) {
+            eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
+        } else {
+            eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
         }
     }
 }
@@ -554,7 +624,7 @@ pub fn load_jobs() -> Vec<Job> {
     };
     // 존재하나 파싱 불가 = 데이터 손상. 조용히 빈 스케줄로 대체하면 24/365 데몬의 전 하트비트가
     // 신호 0으로 소실된다(헌장 복원 불변식 모순). 손상본을 격리하고 loud 신호를 남긴다.
-    let root: serde_json::Value = match serde_json::from_str(&content) {
+    let mut root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
             let note = match quarantine_corrupt(&path) {
@@ -565,6 +635,11 @@ pub fn load_jobs() -> Vec<Job> {
             return Vec::new();
         }
     };
+    // ★(수렴 R2 · triage X8 잔여) **핫리로드도 파일을 접는다.** 종전에는 아래 serde 계층이
+    //   메모리의 `Job` 만 정규화했고(`canonicalize_queue_action`), 디스크는 운영자가 손으로 넣은
+    //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
+    //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음).
+    canonicalize_schedule_file(&path, &mut root);
     match root.get("jobs") {
         None => Vec::new(), // jobs 키 부재 = 빈 스케줄(정상)
         Some(j) => match serde_json::from_value::<Vec<Job>>(j.clone()) {
@@ -888,6 +963,19 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     }
 }
 
+/// 원샷 잡 제거의 **순수 코어**(회귀 핀 대상).
+///
+/// ★(0.14.31 · 수렴 R2 · triage X8 잔여) 이 자리는 **원시 JSON 을 되쓰는** 경로다 — 남은 잡을
+/// 읽은 그대로 쓰면 운영자가 손으로 넣은 `action:"push" + via_queue:true` 가 디스크에 그대로
+/// 다시 영속된다(원샷 잡 하나가 끝날 때마다). 강등된 구 데몬은 그 표현을 `push` 로 읽고 큐
+/// 준비 게이트를 통째 우회해 직접 주입한다. 쓰기 전에 같은 정규형으로 접는다.
+fn drop_job_and_canonicalize(root: &mut serde_json::Value, job_id: &str) {
+    if let Some(arr) = root["jobs"].as_array_mut() {
+        arr.retain(|j| j["id"].as_str() != Some(job_id));
+        canonicalize_stored_queue_actions(arr);
+    }
+}
+
 /// T3-10: 처리 완료된 원샷 job을 schedule.json에서 제거 (영구 잔존 차단)
 fn remove_job_from_file(job_id: &str) {
     let path = schedule_path();
@@ -897,13 +985,11 @@ fn remove_job_from_file(job_id: &str) {
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) else {
         return;
     };
-    if let Some(arr) = root["jobs"].as_array_mut() {
-        arr.retain(|j| j["id"].as_str() != Some(job_id));
+    drop_job_and_canonicalize(&mut root, job_id);
+    // 원자 치환 — 부분 쓰기가 핫리로드에 잡히면 스케줄 전체가 빈 스케줄로 읽힌다.
+    if !write_schedule_atomic(&path, &root) {
+        eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 기록 실패 — 다음 틱이 다시 시도한다");
     }
-    let _ = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&root).unwrap_or_default(),
-    );
 }
 
 /// 즉시 발화 (CLI `schedule run-now` — 검증용, last_fired 갱신 없음)
@@ -1702,7 +1788,7 @@ mod tests {
         // 1차: built-in 9개(phoenix2 + learn2 + cycle2 + formation1 + promote1 + alert1) 생성 → changed=true.
         // ★(0.14.31 · WP-3 B) 계수 갱신: 신규 id `cso-alert-inbox-check-60m` 1건 append.
         //   버전은 **범프하지 않았다**(신규 id 는 버전 무관 append — 아래 범프 금지 핀 유지).
-        let (c1, conf1) = apply_builtin_jobs(&mut jobs);
+        let (c1, conf1, _) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
         assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
         let ids: Vec<&str> = jobs.iter().filter_map(|j| j["id"].as_str()).collect();
@@ -1808,7 +1894,7 @@ mod tests {
         }
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
-        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        let (c2, _, _) = apply_builtin_jobs(&mut jobs);
         assert!(!c2, "동버전 재실행은 무접촉(변경 없음)이어야 한다");
         let snap_count = jobs
             .iter()
@@ -1824,7 +1910,7 @@ mod tests {
                 j["every_minutes"] = json!(99999); // 사용자가 못 고치는 드리프트 시뮬
             }
         }
-        let (c3, _) = apply_builtin_jobs(&mut jobs);
+        let (c3, _, _) = apply_builtin_jobs(&mut jobs);
         assert!(c3, "구버전 항목은 갱신돼야 한다");
         let refreshed = jobs
             .iter()
@@ -1857,7 +1943,7 @@ mod tests {
             "id": "phoenix-snapshot-6h",           // 사용자가 예약 id 선점(_builtin 마커 없음)
             "every_minutes": 5, "action": "push", "to": "master", "text": "USER OWN SNAPSHOT"
         })];
-        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
         // snapshot id 는 conflict 로 보존, drill 은 신규 생성.
         assert!(conflicts.contains(&"phoenix-snapshot-6h".to_string()), "예약 id 충돌 보고");
         let snap = jobs
@@ -2517,7 +2603,7 @@ mod tests {
     #[test]
     fn alert_inbox_job_is_queue_routed_and_added_without_version_bump() {
         let mut jobs: Vec<serde_json::Value> = Vec::new();
-        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
         assert!(changed && conflicts.is_empty());
         let j = jobs
             .iter()
@@ -2542,7 +2628,7 @@ mod tests {
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "신규 잡 추가로 버전을 올리지 않았다");
         assert_eq!(j["_builtin_version"].as_u64(), Some(BUILTIN_JOBS_VERSION));
         // 재실행 무접촉(중복 0) — add-if-missing 멱등.
-        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        let (c2, _, _) = apply_builtin_jobs(&mut jobs);
         assert!(!c2, "동버전 재실행은 무접촉");
         assert_eq!(
             jobs.iter().filter(|j| j["id"].as_str() == Some("cso-alert-inbox-check-60m")).count(),
@@ -2772,7 +2858,7 @@ mod tests {
             "_builtin": "alert",
             "_builtin_version": BUILTIN_JOBS_VERSION
         })];
-        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
         assert!(changed, "저장된 구 action 이 그대로 남았다(강등 시 게이트 우회)");
         assert!(conflicts.is_empty());
         let j = &jobs[0];
@@ -2783,13 +2869,13 @@ mod tests {
         assert_eq!(j["text"].as_str(), Some("운영자가 고친 문안"), "운영자 문안이 소실됐다");
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
         // 재실행 무접촉(멱등).
-        let (c2, _) = apply_builtin_jobs(&mut jobs);
+        let (c2, _, _) = apply_builtin_jobs(&mut jobs);
         assert!(!c2, "이관 뒤 재실행이 또 바꾼다(비멱등)");
         // 사용자가 그 id 를 선점한 경우(마커 불일치)는 손대지 않는다 — 종전 계약 불변.
         let mut theirs: Vec<serde_json::Value> = vec![json!({
             "id": "cso-alert-inbox-check-60m", "action": "push", "to": "master"
         })];
-        let (c3, conf3) = apply_builtin_jobs(&mut theirs);
+        let (c3, conf3, _) = apply_builtin_jobs(&mut theirs);
         assert!(!c3 || theirs[0]["action"].as_str() == Some("push"));
         assert_eq!(theirs[0]["action"].as_str(), Some("push"), "사용자 잡의 action 을 바꿨다");
         assert!(conf3.contains(&"cso-alert-inbox-check-60m".to_string()), "선점 conflict 미보고");
@@ -2860,7 +2946,7 @@ mod triage_schedule {
             "_builtin": "alert",
             "_builtin_version": BUILTIN_JOBS_VERSION
         })];
-        let (_changed, _conflicts) = apply_builtin_jobs(&mut jobs);
+        let (_changed, _conflicts, _) = apply_builtin_jobs(&mut jobs);
         assert_eq!(
             jobs[0]["action"].as_str(),
             Some("command"),
@@ -2915,11 +3001,72 @@ mod converge_schedule {
             "id": "cso-alert-inbox-check-60m", "every_minutes": 60, "action": "command",
             "command": "true", "_builtin": "alert", "_builtin_version": BUILTIN_JOBS_VERSION
         })];
-        let (_changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        let (_changed, preempted, edited) = apply_builtin_jobs(&mut jobs);
         assert_eq!(jobs[0]["action"].as_str(), Some("command"), "운영자 편집이 덮였다");
-        assert!(
-            conflicts.contains(&"cso-alert-inbox-check-60m".to_string()),
+        assert_eq!(
+            edited,
+            vec![("cso-alert-inbox-check-60m".to_string(), "command".to_string())],
             "덮지 않은 사실을 알리지 않았다(조용한 무접촉은 관측 소실이다)"
+        );
+        // ★(수렴 R2 · X13) 그 사실이 **예약 id 선점**으로 보고되면 운영자는 틀린 처방을 읽는다.
+        assert!(
+            preempted.is_empty(),
+            "id 선점은 일어나지 않았는데 선점 목록에 넣었다(다른 id 로 옮기라는 틀린 안내가 나간다)"
+        );
+    }
+
+    /// ★X8 잔여(major): **핫리로드도 파일을 접는다** — 메모리만 접으면 디스크는 강등 취약형이다.
+    ///
+    /// 신 데몬이 도는 동안 운영자가 손으로 `action:"push" + via_queue:true` 를 넣으면, 종전에는
+    /// `load_jobs` 의 serde 계층이 **메모리의 Job 만** 정규화했다. 파일은 그대로 남아 강등된 구
+    /// 데몬이 그것을 `push` 로 읽고 큐 준비 게이트를 우회해 직접 주입한다.
+    #[test]
+    fn converge_x8_hot_reload_folds_the_stored_representation_too() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-converge-x8-{}-{}",
+            std::process::id(),
+            now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedule.json");
+        let raw = json!({"jobs": [
+            {"id": "q", "action": "push", "via_queue": true, "to": "cso", "text": "x",
+             "every_minutes": 60},
+            {"id": "c", "action": "command", "command": "true", "every_minutes": 5}
+        ]});
+        std::fs::write(&path, raw.to_string()).unwrap();
+        let mut root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(canonicalize_schedule_file(&path, &mut root), "구 표현을 접지 않았다");
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["jobs"][0]["action"].as_str(),
+            Some(ACTION_PUSH_QUEUED),
+            "파일이 여전히 구 표현이다 — 강등된 구 데몬이 직접 주입한다"
+        );
+        assert_eq!(on_disk["jobs"][0]["via_queue"].as_bool(), Some(true), "뜻이 바뀌었다");
+        assert_eq!(on_disk["jobs"][1]["action"].as_str(), Some("command"), "다른 action 을 만졌다");
+        // 멱등 — 바꿀 것이 없으면 파일을 건드리지 않는다(매 틱 쓰기 금지).
+        let mut again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!canonicalize_schedule_file(&path, &mut again), "재실행이 또 쓴다(비멱등)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★X8 잔여: 원샷 잡 제거가 **강등 취약형을 다시 영속하지 않는다**.
+    #[test]
+    fn converge_x8_one_shot_removal_does_not_repersist_the_unsafe_action() {
+        let mut root = json!({"jobs": [
+            {"id": "once", "action": "command", "command": "true", "at": 1},
+            {"id": "q", "action": "push", "via_queue": true, "to": "cso", "text": "x"}
+        ]});
+        drop_job_and_canonicalize(&mut root, "once");
+        assert_eq!(root["jobs"].as_array().map(|a| a.len()), Some(1), "원샷 잡이 남았다");
+        assert_eq!(
+            root["jobs"][0]["action"].as_str(),
+            Some(ACTION_PUSH_QUEUED),
+            "원시 JSON 을 되쓰는 경로가 구 표현을 디스크에 다시 심었다"
         );
     }
 }
