@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -785,6 +786,11 @@ class RoundStopReason(unittest.TestCase):
 
         (codex R2 major-8: 옛 설명문 한 바이트가 이후 모든 라운드의 승인을 영원히 막으면
         복구 경로가 '역사 삭제' 뿐이 된다.)
+        ★재기록 대상에 **행이 없던 축(master)** 도 포함된다(X-3 R2 재수리 · 의도적 변경):
+          회복 경계를 넘는 유일한 수단이 '손상 뒤의 행'인데 행이 없는 축은 그것을 만들 수
+          없다. 종전 판은 그 축을 면제했고, 그래서 **사라진 master 반려 위에서** 종결이
+          선언됐다(X-3). 여기서 확인하는 것은 그 면제가 사라진 뒤에도 **회복이 실재한다**는
+          것이다 — master 를 명시 기록(`SKIPPED: <사유>`)하면 정체 판정이 되돌아온다.
         """
         self.seed_two_minor_rounds()
         raw = open(self.ledger, "rb").read()
@@ -794,8 +800,89 @@ class RoundStopReason(unittest.TestCase):
             self.assertEqual(self.log_reviewer(rnd, "gemini").returncode, 0)
             self.assertEqual(self.log_reviewer(rnd, "codex").returncode, 0)
             self.assertEqual(self.log_machine(rnd).returncode, 0)
+        self.assertNotIn("stop_reason=stopped_stagnation", self.status().stdout,
+                         "행이 하나도 없는 master 축이 회복 경계를 면제받았다(X-3 재발)")
+        for rnd in (1, 2):                      # 사라졌을 수 있는 축도 명시 기록해야 회복된다
+            self.assertEqual(self.orc("round-log", "--task", TASK, "--round", str(rnd),
+                                      "--evaluator", "master",
+                                      "--verdict", "SKIPPED: 손상 확인 후 유보").returncode, 0)
         self.assertIn("stop_reason=stopped_stagnation", self.status().stdout,
                       "재기록으로 회복되지 않는다(회복 경계 없음)")
+
+    def test_damage_does_not_permanently_block_approval(self):
+        """손상 뒤 **네 축을 다시 기록**하면 합격(자동 착수)이 열린다 — 전면 차단 아님.
+
+        (codex R2 major-8 의 방향을 R2 재수리가 되살리지 않았다는 양성 대조: '행이 없는 축은
+        회복 경계를 넘을 수 없다'가 **승인의 영구 불통**을 만들지 않는다. 합격은 어차피 네 축이
+        모두 그 라운드에 기록돼야 성립하므로, 손상 뒤 재기록이면 그대로 열린다.)
+        """
+        for ev in ("gemini", "codex"):
+            self.assertEqual(self.log_reviewer(1, ev).returncode, 0)
+        self.assertEqual(self.log_machine(1).returncode, 0)
+        raw = open(self.ledger, "rb").read()
+        open(self.ledger, "wb").write(raw.replace(b"| 1 | gemini", b"| 1 | gem\xffni", 1))
+        self.assertIn("stop_reason=open", self.status().stdout, "전제 불성립(손상 상태)")
+        for ev in ("gemini", "codex"):
+            self.assertEqual(self.log_reviewer(1, ev).returncode, 0)
+        self.assertEqual(self.log_machine(1).returncode, 0)
+        self.assertEqual(self.orc("round-log", "--task", TASK, "--round", "1", "--evaluator",
+                                  "master", "--verdict", "approve").returncode, 0)
+        self.assertIn("stop_reason=accepted", self.status().stdout,
+                      "손상이 **승인**을 영구히 막았다(codex R2 major-8 방향 재발)")
+        g = self.orc("gate-status", "--task", TASK)
+        self.assertIn(g.returncode, (0, 4),          # 4 = 수렴했으나 임무 미지정(수렴 자체는 성립)
+                      "재기록으로 회복됐는데 수렴이 열리지 않는다(%s · %s)"
+                      % (g.returncode, g.stderr.strip()))
+
+    def test_surviving_earlier_row_does_not_hide_a_vanished_master_rejection(self):
+        """손상 줄 **앞의** 살아남은 행(R0 승자 기록)이 사라진 master 반려를 가리면 안 된다.
+
+        (reviewer-claude·reviewer-codex 잔여 major · X-3 PARTIAL) 종전 수리는 손상이 **장부
+        전체의 머리**에 있을 때만 '행 없는 축'을 stale 로 뒀다(`worst < min(known)`). 그런데
+        그 '앞 행'은 예외가 아니라 **기본값**이다 — `javis_compete` 는 승자를 `--round 0` 으로
+        장부 머리에 기록한다. 그래서 R0 행 하나만 있어도 head_damage=False 가 되어, 유일한
+        master BLOCK 이 손상으로 사라진 장부 위에서 `stopped_stagnation`(종결·정지)이 그대로
+        선언됐다 — triage 가 major 로 판정한 '끝내는 쪽의 오답'이다.
+        """
+        self.assertEqual(self.orc("round-log", "--task", TASK, "--round", "0", "--evaluator",
+                                  "machine", "--from-cmd", "exit 0").returncode, 0)
+        self.assertEqual(self.orc("round-log", "--task", TASK, "--round", "1", "--evaluator",
+                                  "master", "--verdict", "BLOCK").returncode, 0)
+        raw = open(self.ledger, "rb").read()
+        block = b"| 1 | master | - | BLOCK |"
+        self.assertIn(block, raw, "전제 불성립: master 반려 행이 기록되지 않았다")
+        open(self.ledger, "wb").write(raw.replace(block, b"| 1 | mast\xffr | - | BLOCK |", 1))
+        for rnd in (1, 2):                      # 손상 **뒤에** 세 축을 기록(회복 경계 통과)
+            for ev in ("gemini", "codex"):
+                self.assertEqual(self.log_reviewer(rnd, ev).returncode, 0)
+            self.assertEqual(self.log_machine(rnd).returncode, 0)
+        out = self.status().stdout
+        self.assertNotIn("stop_reason=stopped_stagnation", out,
+                         "사라진 master 반려 위에서 종결(정체)을 선언했다:\n%s" % out)
+        self.assertNotIn("stop_reason=accepted", out, "사라진 반려 위에서 합격을 선언했다")
+        self.assertNotEqual(self.orc("gate-status", "--task", TASK).returncode, 0,
+                            "사라진 master 반려 위에서 자동 착수가 열렸다")
+
+    def test_empty_orphan_lock_dir_does_not_refuse_recording_forever(self):
+        """**빈** 잠금 디렉터리(mkdir 직후 사망)가 영구 교착이 되면 안 된다.
+
+        (reviewer-claude·reviewer-codex 잔여 major · X-1 회귀) rename 청구는 owner 파일이,
+        잔재 회수는 청구 파일이 있을 때만 동작한다 — 둘 다 없는 **빈** 잠금은 어느 경로에도
+        걸리지 않아 `_reclaim_orphan` 이 항상 False 를 냈다. 그러면 `round-log` 가 매번
+        `거부: 다른 writer 가 …(고아 잠금은 300초 뒤 자동 회수)` rc=2 를 내는데 그 안내가
+        **영원히** 거짓말이 된다(사람이 잠금을 지울 때까지 그 task 의 장부가 안 쓰인다).
+        """
+        self.assertEqual(self.log_reviewer(1, "gemini").returncode, 0)
+        lock = self.ledger + ".lock"
+        os.mkdir(lock)                                   # owner 를 쓰기 전에 죽은 형상
+        old = time.time() - 10 * 3600
+        os.utime(lock, (old, old))
+        r = self.log_reviewer(1, "codex")
+        self.assertEqual(r.returncode, 0,
+                         "빈 고아 잠금이 기록을 영구 거부했다(rc=%s · %s)" % (r.returncode, r.stderr))
+        self.assertNotIn("| 1 | codex", "".join(self.rows()[:1]))
+        self.assertTrue(any("| 1 | codex" in ln for ln in self.rows()),
+                        "거부는 안 했는데 행이 남지 않았다")
 
     def test_unreadable_sidecar_is_not_proof_of_empty_history(self):
         """사이드카를 **읽을 수 없는 것**은 '이력 없음'이 아니다(codex R2 blocking-6)."""
@@ -1328,6 +1415,104 @@ class Wp6TriageDamageRecovery(unittest.TestCase):
         reason, why = o.round_stop_reason(rows, evidence, row_damage=dmg)
         self.assertNotEqual(reason, "stopped_stagnation",
                             "귀속을 모르는 손상 줄 위에서 종결을 선언했다: %r" % (why,))
+
+
+    def test_one_surviving_row_before_the_damage_does_not_exempt_a_vanished_axis(self):
+        """(X-3 PARTIAL · reviewer-codex) 손상 줄 앞의 **살아남은 행 하나**가 '행 없는 축'을
+        면제하면 안 된다. 두 변형을 다 본다: ⓐ앞 행이 R0 master 승인 ⓑ앞 행이 나중에
+        재기록된 같은 축(R1 gemini). 둘 다 종전 판에서 `stopped_stagnation` 이 나왔다.
+        """
+        o = self.orc
+        base, ln = [], 21
+        for rnd in (1, 2):
+            for ev in ("gemini", "codex", "machine"):
+                base.append({"round": rnd, "evaluator": ev, "score": "-",
+                             "verdict": "PASS(exit 0)" if ev == "machine" else "ACCEPT",
+                             "_line": ln})
+                ln += 1
+        dmg = {"damaged": 1, "lines": [20], "last_damaged_line": 20, "unreadable": ""}
+        ok = {"ok": True, "verdict": "ACCEPT", "severities": ["minor"]}
+        evidence = {(r, e): ok for r in (1, 2) for e in ("gemini", "codex")}
+        for label, early in (
+                ("R0 master 승인", {"round": 0, "evaluator": "master", "score": "-",
+                                    "verdict": "approve", "_line": 19}),
+                ("재기록된 R1 gemini", {"round": 1, "evaluator": "gemini", "score": "-",
+                                        "verdict": "ACCEPT", "_line": 19})):
+            rows = [early] + base
+            self.assertEqual(o.round_stop_reason(rows, evidence)[0], "stopped_stagnation",
+                             "양성 대조 불성립(%s)" % label)
+            reason, why = o.round_stop_reason(rows, evidence, row_damage=dmg)
+            self.assertNotEqual(reason, "stopped_stagnation",
+                                "%s 한 줄이 사라진 master 축을 면제했다: %r" % (label, why))
+            self.assertTrue(o.damage_blocks_round(rows, dmg, 1),
+                            "%s: 라운드 1 의 사라진 축을 통과시켰다" % label)
+
+
+class Wp6TriageEmptyLockReclaim(unittest.TestCase):
+    """**빈** 고아 잠금은 회수된다 — X-1 수리가 만든 영구 교착 회귀 (2026-09-08).
+
+    `javis_orchestra` · `javis_rsi` 의 동명 클래스는 의도적 중복이므로 **둘 다** 잰다.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        sys.path.insert(0, BIN)
+        import javis_orchestra
+        import javis_rsi
+        self.mods = (javis_orchestra, javis_rsi)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_aged_empty_lock_dir_is_reclaimed(self):
+        for mod in self.mods:
+            base = os.path.join(self.root, "%s-base" % mod.__name__)
+            lock = base + ".lock"
+            os.mkdir(lock)
+            old = time.time() - 4000
+            os.utime(lock, (old, old))
+            with mod._best_effort_lock(base, wait=2.0, stale=300.0) as lk:
+                self.assertTrue(lk.held, "%s: 빈 고아 잠금을 회수하지 못했다" % mod.__name__)
+                self.assertFalse(lk.blocked, "%s: 영구 교착(blocked)" % mod.__name__)
+
+    def test_fresh_empty_lock_dir_is_still_respected(self):
+        """음성 대조: **갓 만들어진** 빈 잠금은 owner 를 쓰는 중인 살아 있는 소유자다."""
+        for mod in self.mods:
+            base = os.path.join(self.root, "%s-fresh" % mod.__name__)
+            os.mkdir(base + ".lock")
+            with mod._best_effort_lock(base, wait=0.3, stale=300.0) as lk:
+                self.assertFalse(lk.held, "%s: 살아 있는 소유자의 잠금을 강탈했다" % mod.__name__)
+                self.assertTrue(lk.blocked, "%s: 경합을 blocked 로 표기하지 않았다" % mod.__name__)
+
+    def test_ctrl_c_between_mkdir_and_owner_leaves_a_reclaimable_lock(self):
+        """도달 경로: `KeyboardInterrupt` 는 `except OSError` 에 걸리지 않아 `__enter__` 밖으로
+        빠져나가고 `__exit__` 도 돌지 않는다 — **빈** 잠금이 남는다."""
+        import builtins
+        mod = self.mods[0]
+        base = os.path.join(self.root, "ctrlc")
+        lock = base + ".lock"
+        real_open, hit = builtins.open, []
+
+        def interrupting_open(f, *a, **kw):
+            if not hit and str(f) == os.path.join(lock, "owner"):
+                hit.append(True)
+                raise KeyboardInterrupt("Ctrl-C")
+            return real_open(f, *a, **kw)
+
+        builtins.open = interrupting_open
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with mod._best_effort_lock(base, wait=1.0, stale=300.0):
+                    pass
+        finally:
+            builtins.open = real_open
+        self.assertTrue(hit, "전제 불성립: owner 쓰기 지점에 도달하지 못했다")
+        self.assertTrue(os.path.isdir(lock) and not os.listdir(lock),
+                        "전제 불성립: 빈 잠금이 남지 않았다")
+        old = time.time() - 4000
+        os.utime(lock, (old, old))
+        with mod._best_effort_lock(base, wait=2.0, stale=300.0) as lk:
+            self.assertTrue(lk.held, "Ctrl-C 가 남긴 빈 잠금이 영구 교착이 됐다")
 
 
 class Wp6TriageRsiProjectScope(unittest.TestCase):

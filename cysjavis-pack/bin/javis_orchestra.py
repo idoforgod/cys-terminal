@@ -2222,7 +2222,7 @@ def stagnation_stop_recorded(events, task, rnd):
     return False
 
 
-def _record_stagnation_stop(task, stop_round, requested_round, why, holding):
+def _record_stagnation_stop(task, stop_round, requested_round, why, holding, events=None):
     """정체 종결을 사이드카에 남긴다 — **잠금 안에서 이력을 다시 읽은 뒤에만**.
 
     반환 True=남았다 · False=쓰지 못했다(고지 대상) · None=쓸 필요가 없었다.
@@ -2237,11 +2237,17 @@ def _record_stagnation_stop(task, stop_round, requested_round, why, holding):
       기록돼 있으면(그리고 그것이 override 로 풀렸든 아니든) 다시 쓰지 않는다 — 종결의
       끈끈함은 첫 기록이 이미 담당하고, 재개 권한은 override 가 담당한다.
     ★`holding=True` 는 이미 커밋 잠금 안이고 이력도 그 잠금 안에서 읽은 값이다(중첩 잠금 금지).
+      그 경로에도 **같은 한 줄 검사**를 준다(reviewer-claude 잔여 minor): 게이트 통과 후
+      `--from-cmd`(최대 1800s)가 도는 사이 다른 writer 가 종결+override 를 기록한 형상에서는
+      잠금 안 경로에서도 같은 재폐쇄가 성립한다. 이미 읽어 둔 `events` 를 한 번 훑으면 되므로
+      비대칭을 남길 이유가 없다(`events=None` 이면 검사할 이력이 없다 — 종전대로 append).
     """
     rec = {"event": "stagnation_stop", "round": stop_round,
            "requested_round": requested_round,
            "reason": [_audit_text(w) for w in why]}
     if holding:
+        if events is not None and stagnation_stop_recorded(events, task, stop_round):
+            return None                # 이미 기록된 종결 — 승인된 재개를 다시 닫지 않는다
         return append_round_event(task, rec, lock=False)
     ctx = _best_effort_lock(round_path(task))
     with ctx:
@@ -2309,7 +2315,8 @@ def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, hold
     override = _audit_text(raw or "")
     if not override:
         if blocked_round is None:      # 첫 거부에서만 종결을 못박는다(중복 기록 없음)
-            if _record_stagnation_stop(args.task, stop_round, args.round, why, holding) is False:
+            if _record_stagnation_stop(args.task, stop_round, args.round, why, holding,
+                                       events) is False:
                 print("[round-log] 경고: 정체 종결을 사이드카에 남기지 못했다(디스크·권한). "
                       "이번 호출은 막았지만 **끈끈하지 않다** — 같은 라운드에 행이 더 붙어 계산이 "
                       "달라지면 다음 요청이 열릴 수 있다. 저장소를 고친 뒤 다시 확인하라.",
@@ -2717,20 +2724,26 @@ def damage_blocks_round(rows, damage, rnd):
     """손상이 **이 라운드의 판정**을 막는가 — 반환 사유|None(순수 함수).
 
     ★손상을 전역·영구 불통으로 만들지 않는다(codex R2 major-8): 옛 설명문 한 바이트가 깨졌다고
-      이후 모든 라운드의 승인을 영원히 막으면, 복구할 길이 '역사를 지우는 것' 뿐이 된다.
-    ★대신 **회복 경계**를 준다: 마지막-승 규칙에서 판정을 뒤집을 수 있는 것은 그 축의 **가장
-      나중 행**뿐이다. 그러므로 손상 줄보다 **뒤에** 그 축의 행이 보이면 손상은 그 축을 뒤집을
-      수 없다. 즉 "손상 줄 이후에 그 (라운드,평가자)를 다시 기록하면 판정이 회복된다".
+      이후 모든 라운드의 **승인**을 영원히 막으면, 복구할 길이 '역사를 지우는 것' 뿐이 된다.
+    ★그래서 규칙은 하나다 — **회복 경계**: 마지막-승에서 판정을 뒤집을 수 있는 것은 그 축의
+      가장 나중 행뿐이다. 그러므로 손상 줄보다 **뒤에** 그 (라운드,평가자) 행이 보이면 손상은
+      그 축을 뒤집을 수 없다. "손상 줄 이후에 다시 기록하면 회복된다".
+    ★**행이 하나도 없는 축은 그 경계를 넘을 수 없다**(독립 재유도 X-3 · R2 재수리): 경계를
+      넘는 유일한 수단이 '손상 뒤의 행'인데 그 축에는 행이 없다. 종전 수리는 손상이 **장부
+      전체의 머리**에 있을 때만 사라진 축을 stale 로 뒀는데, 손상 줄 앞에 살아남은 행이 하나만
+      있어도(R0 승자 기록 · 같은 축의 재기록 이력) 그 예외가 깨졌다 — 사라진 master 반려 위에서
+      `stopped_stagnation`(종결·정지)이 그대로 선언됐다.
+    ★위치 휴리스틱(라운드 구간·머리 여부)으로는 이 형상을 가를 수 없다: '손상 줄이 사라진
+      master 반려였던 장부'와 '손상 줄이 나중에 재기록된 machine 행이었던 장부'는 남은 행만으로는
+      **완전히 같은 모양**이다(둘 다 손상 뒤에 그 라운드의 세 축이 다시 기록돼 있다). 어느 쪽으로
+      가를 선을 그어도 그 선 바로 옆에 X-3 이 되살아난다. 그래서 선을 긋지 않고 경계를 그대로
+      적용한다 — 모르는 것은 모른다고 한다(§8-1 M5).
+    ★전면 차단이 아니다: **합격(accepted)** 은 네 축이 모두 이 라운드에 기록돼야 성립하므로
+      '행이 없는 축' 규칙에 걸리지 않는다(codex R2 major-8 이 막으려던 것은 승인의 영구 불통이다).
+      영향은 `stopped_stagnation`·`accepted` 를 `open`(라운드 계속)으로 접는 것뿐이고, 상한
+      `stopped_budget` 은 그 앞에서 여전히 루프를 끝낸다. 회복도 열려 있다 — 손상 줄 **뒤에**
+      그 축을 명시 기록하면(반려·승인·`SKIPPED: <사유>` 무엇이든) 경계를 넘는다.
     ★판독 불가(장부를 아예 못 읽음)는 회복 경계가 없다 — 그때는 막는다.
-    ★**행이 하나도 없는 축**도 손상이 이력의 **머리**(살아남은 첫 행보다 앞)에 있으면 불확정으로
-      둔다(독립 재유도 X-3): 손상 줄의 귀속은 알 수 없는데 그 줄이 그 축의 **유일한 기록**
-      (예: master 의 BLOCK)이었으면, 그 축은 `gate_verdicts` 에서 `None`(미기록)이 되어 정체
-      판정의 "미승인 0" 을 통과한다 — 해소되지 않은 반려 위에서 **종결(정지)** 이 선언된다.
-      이것은 "막는 쪽"이 아니라 "끝내는 쪽"의 오답이라 회복 경계보다 우선한다.
-    ★그러나 전면 차단으로 퇴화시키지는 않는다(codex R2 major-8 의 문제를 되살리지 않는다):
-      손상 줄 **앞에** 살아남은 행이 하나라도 있으면 그 손상은 이미 시작된 기록 흐름 안에서
-      일어난 것이므로 종전 회복 경계(그 축을 다시 기록)만 적용한다. 머리 손상에서도 회복은
-      열려 있다 — 네 축을 손상 줄 **뒤에** 명시 기록하면 stale 이 사라진다.
     """
     d = damage or {}
     if d.get("unreadable"):
@@ -2739,21 +2752,22 @@ def damage_blocks_round(rows, damage, rnd):
     if not lines:
         return None
     worst = max(lines)
-    known = [int(r.get("_line") or 0) for r in rows if int(r.get("_line") or 0) > 0]
-    head_damage = bool(known) and worst < min(known)     # 손상이 이력의 머리에 있다
-    stale = []
+    stale, vanished = [], []
     for e in GATE_EVALUATORS:
         seen = [r for r in rows if r.get("round") == rnd and evaluator_std(r.get("evaluator")) == e]
-        if seen:
-            if int(seen[-1].get("_line") or 0) <= worst:
-                stale.append(e)
-        elif head_damage:
-            stale.append(e)                              # 통째로 사라졌을 수 있는 축
-    if not stale:
+        if not seen:
+            vanished.append(e)                       # 통째로 사라졌을 수 있는 축
+        elif int(seen[-1].get("_line") or 0) <= worst:
+            stale.append(e)
+    blocked = [e for e in GATE_EVALUATORS if e in stale or e in vanished]
+    if not blocked:
         return None
+    tail = "" if not vanished else (
+        " (그중 %s 는 이 라운드에 행이 **하나도 없다** — 사라진 줄이 그 축의 유일한 기록"
+        "(예: master 반려)이었을 수 있다)" % "·".join(vanished))
     return ("장부 손상 %d줄(마지막 %d행) **뒤에** 라운드 %d 의 %s 기록이 없다 — 사라진 줄이 그 축의 "
-            "최신 판정일 수 있다(마지막-승). 해당 (라운드,평가자)를 다시 기록하면 회복된다"
-            % (len(lines), worst, rnd, "·".join(stale)))
+            "최신 판정일 수 있다(마지막-승). 해당 (라운드,평가자)를 다시 기록하면 회복된다%s"
+            % (len(lines), worst, rnd, "·".join(blocked), tail))
 
 
 def cmd_round_status(args):
@@ -2829,10 +2843,10 @@ def cmd_round_status(args):
         # ★사이드카와 같은 어휘로 접는다(독립 재유도 C-1): 장부를 읽지 못했거나 남은 행이
         #   하나도 파싱되지 않은 상태는 '이력 없음'이 아니라 **확인 불가**다. 이 면에서
         #   "다음 라운드 진행 가능"을 내면 사라진 master 반려 위에서 착수가 열린다.
-        print("  → %s: 이력이 없는 것이 아니라 **확인할 수 없다** — 이 상태에서는 승인도 정체도 "
-              "선언하지 않는다(판정 불능은 통과가 아니다). 원인(권한·경로·손상 줄)을 고치고 "
-              "해당 (라운드,평가자)를 다시 기록하면 판정이 회복된다. 그 전에는 새 라운드 착수를 "
-              "지시하지 마라." % ldmg)
+        print("  → %s: 이력이 없는 것이 아니라 **확인할 수 없다** — **기록은 가능하나 판정은 "
+              "불능**이다(round-log 는 계속 받는다 · 판정 불능은 통과가 아니다). 원인(권한·경로·"
+              "손상 줄)을 고치고 해당 (라운드,평가자)를 다시 기록하면 판정이 회복된다. 그 전에는 "
+              "이 장부를 근거로 수렴·종결을 선언하지 마라." % ldmg)
     else:
         print("  → 다음 라운드 %d 진행 가능(잠근 합격 기준의 미달 항목 0 도달 전까지). "
               "외부 리뷰어가 verdict enum + evidence로 평가한다 — 점수·고정 향상률 금지." % (last + 1))
@@ -3143,8 +3157,13 @@ class _best_effort_lock(object):
         #   있으면 그것은 고아가 아니라 **새 소유자**다. 연쇄 회수를 허용하면 대기 상한이 상한을
         #   넘긴 나이의 새 잠금까지 강탈해 두 writer 를 만든다(수리 전 실측 형상).
         self.reclaim_tried = False
+        # ★청구 파일명은 **짧게**(reviewer-codex Windows 노트): 종전 `owner.stale-<pid>-<ms>-
+        #   <16hex>` 는 약 50자라 MAX_PATH 제약 경로에서 `os.rename` 이 실패해 고아가 회수
+        #   불능이 될 수 있었다(같은 방향의 교착). 파일명은 `owner.<8hex>`(14자)로 두고,
+        #   소유자 식별에 쓰는 긴 토큰은 **파일 내용**에 남긴다(경로 길이와 무관).
+        self.tag = hashlib.sha256(os.urandom(16)).hexdigest()[:8]
         self.token = ("%d-%d-%s" % (os.getpid(), int(time.time() * 1000),
-                                    hashlib.sha256(os.urandom(16)).hexdigest()[:16])).encode("ascii")
+                                    self.tag)).encode("ascii")
 
     def _owner_file(self):
         return os.path.join(self.path, "owner")
@@ -3157,8 +3176,22 @@ class _best_effort_lock(object):
             return b""
 
     def _claim_name(self):
-        """회수 청구 파일 — 잠금 디렉터리 **안**의 `owner.stale-<내토큰>`(청구자마다 유일)."""
-        return self._owner_file() + ".stale-" + self.token.decode("ascii", "replace")
+        """회수 청구 파일 — 잠금 디렉터리 **안**의 `owner.<8hex>`(청구자마다 유일 · 짧다)."""
+        return self._owner_file() + "." + self.tag
+
+    @staticmethod
+    def _is_claim(name):
+        """청구 파일 이름인가 — 신형 `owner.<8hex>` · 구형 `owner.stale-<토큰>`(호환).
+
+        구형을 계속 인정하지 않으면 이전 판이 남긴 잔재가 '모르는 내용물'이 되어 그 잠금이
+        영구 교착으로 남는다(회수 불능 = 모든 기록 거부 · 부트체인 ④ 방향).
+        """
+        if not name.startswith("owner."):
+            return False
+        rest = name[len("owner."):]
+        if rest.startswith("stale-"):
+            return True
+        return len(rest) == 8 and all(c in "0123456789abcdef" for c in rest)
 
     def _abandoned_claim(self):
         """중단된 회수가 남긴 청구 파일 하나 — owner 가 없고 나이가 상한을 넘은 것만.
@@ -3175,7 +3208,7 @@ class _best_effort_lock(object):
         if "owner" in names:
             return None
         for n in names:
-            if not n.startswith("owner.stale-"):
+            if not self._is_claim(n):
                 return None          # 모르는 내용물이 있다 — 손대지 않는다(보류 방향)
         for n in names:
             p = os.path.join(self.path, n)
@@ -3185,6 +3218,31 @@ class _best_effort_lock(object):
             except OSError:
                 return None
         return None
+
+    def _reclaim_empty(self):
+        """owner 도 청구 잔재도 없는 **빈 잠금 디렉터리**를 회수한다 — 반환 회수 여부.
+
+        ★X-1 수리의 회귀를 닫는다(reviewer-claude·reviewer-codex 잔여 major): rename 청구는
+          owner 파일이 있을 때만 동작하고 잔재 회수는 청구 파일이 있을 때만 동작한다. 그런데
+          `__enter__` 는 `os.mkdir` 성공 **직후**에 owner 를 쓰므로 그 사이의 SIGKILL·전원
+          장애·페인 종료는 물론 **KeyboardInterrupt(Ctrl-C)** — `except OSError` 에 걸리지
+          않아 `__enter__` 밖으로 빠져나가고 `__exit__` 도 돌지 않는다 — 가 **빈** 잠금
+          디렉터리를 남긴다. 그 형상은 두 회수 경로 모두에 걸리지 않아 **영구 교착**이 됐다:
+          이후 모든 `round-log`·다이제스트 큐 기록이 사람이 `rm -rf <잠금>` 을 할 때까지
+          거부된다(부트체인 ④ 방향 · 안내문 "300초 뒤 자동 회수" 가 거짓말이 된다).
+        ★`os.rmdir` 는 디렉터리가 **비었을 때만** 성공하므로 원자성은 그대로다: 그 사이 누군가
+          owner 를 썼다면 실패하고 우리는 아무것도 지우지 않는다. 나이도 다시 확인한다 —
+          갓 만들어진 빈 잠금은 owner 를 쓰는 중인 **살아 있는** 소유자다.
+        """
+        try:
+            if os.listdir(self.path):
+                return False                   # 내용이 있다 — 여기서 다룰 형상이 아니다
+            if time.time() - os.path.getmtime(self.path) <= self.stale:
+                return False                   # 살아 있는 소유자가 owner 를 쓰는 중일 수 있다
+            os.rmdir(self.path)                # 비어 있을 때만 성공한다
+        except OSError:
+            return False
+        return True
 
     def _reclaim_orphan(self, seen):
         """고아 잠금 회수 — **원자적 청구(rename)에 성공한 하나만** 회수자다. 반환 회수 여부.
@@ -3207,7 +3265,7 @@ class _best_effort_lock(object):
         if not os.path.exists(src):
             src = self._abandoned_claim()      # 중단된 회수의 잔재 — 교착을 풀기 위한 유일한 길
             if not src:
-                return False
+                return self._reclaim_empty()   # owner 도 잔재도 없는 **빈** 잠금(영구 교착)
             seen = None                        # 잔재의 내용은 이미 죽은 소유자의 토큰이다
         try:
             os.rename(src, claim)              # ★원자적 청구 — 성공한 하나만 회수자
@@ -4728,17 +4786,29 @@ def cmd_self_test(args):
         _rows_d = [{"round": 1, "evaluator": "machine", "verdict": "PASS", "score": "-",
                     "_line": 10}]
         assert damage_blocks_round(_rows_d, {"lines": [12]}, 1), "손상 뒤 재기록 없이 판정했다"
-        # ★재핀(독립 재유도 X-3 · 의도적 의미 변경): 손상이 **이력의 머리**(살아남은 첫 행보다
-        #   앞)면 행이 하나도 없는 축은 통째로 사라졌을 수 있다 — 종전 핀은 그 형상을 통과
-        #   시켜, 유일한 master BLOCK 이 손상으로 사라진 장부 위에서 `stopped_stagnation`
-        #   (종결·정지)이 선언됐다. 회복 경계 자체는 아래 `_rows_h` 가 그대로 지킨다.
+        # ★재핀(독립 재유도 X-3 · R2 재수리): **행이 하나도 없는 축**은 회복 경계를 넘을 수
+        #   없다(경계를 넘는 유일한 수단이 '손상 뒤의 행'인데 그 축엔 행이 없다). 손상의 위치는
+        #   따지지 않는다 — 종전 수리(`worst < min(known)` = 이력의 머리)는 손상 줄 **앞에**
+        #   살아남은 행이 하나만 있어도 깨졌고(R0 승자 기록·같은 축의 재기록), 사라진 master
+        #   BLOCK 위에서 `stopped_stagnation`(종결·정지)이 그대로 선언됐다.
         assert damage_blocks_round(_rows_d, {"lines": [5]}, 1), \
-            "이력 머리의 손상에서 **행이 없는 축**(사라졌을 수 있다)을 통과시켰다"
+            "손상보다 **뒤의** 행이 없는 축(사라졌을 수 있다)을 통과시켰다"
+        _rows_x3 = [{"round": 0, "evaluator": "master", "verdict": "approve", "score": "-",
+                     "_line": 5}] + \
+                   [{"round": 1, "evaluator": _e, "verdict": _v, "score": "-", "_line": 8 + _i}
+                    for _i, (_e, _v) in enumerate((("gemini", "ACCEPT"), ("codex", "ACCEPT"),
+                                                   ("machine", "PASS")))]
+        assert damage_blocks_round(_rows_x3, {"lines": [6]}, 1), \
+            "손상 줄 **앞의** 살아남은 행 하나가 사라진 master 축을 면제시켰다(X-3 재발)"
+        _rows_x3b = [{"round": 1, "evaluator": "gemini", "verdict": "ACCEPT", "score": "-",
+                      "_line": 5}] + _rows_x3[1:]
+        assert damage_blocks_round(_rows_x3b, {"lines": [6]}, 1), \
+            "같은 축의 재기록 이력이 사라진 master 축을 면제시켰다(X-3 재발 · 변형)"
         _rows_h = [{"round": 1, "evaluator": _e, "verdict": _v, "score": "-", "_line": 8 + _i}
                    for _i, (_e, _v) in enumerate((("gemini", "ACCEPT"), ("codex", "ACCEPT"),
                                                   ("master", "approve"), ("machine", "PASS")))]
         assert damage_blocks_round(_rows_h, {"lines": [5]}, 1) is None, \
-            "손상이 축의 최신 행보다 앞인데 판정을 막았다(회복 경계 없음)"
+            "손상이 **네 축 전부**의 최신 행보다 앞인데 판정을 막았다(회복 경계 없음)"
         assert damage_blocks_round(_rows_h, {"lines": [12]}, 1), \
             "손상 뒤 재기록이 없는데 판정했다(회복 경계 역방향)"
         assert damage_blocks_round(_rows_d, {"unreadable": "x"}, 1), "판독 불가를 통과시켰다"

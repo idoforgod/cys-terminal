@@ -400,8 +400,13 @@ class _best_effort_lock(object):
         self.wrote_owner = False
         # 회수는 `__enter__` 당 한 번만(orchestra 와 같은 규율 — 연쇄 강탈 차단).
         self.reclaim_tried = False
+        # ★청구 파일명은 **짧게**(reviewer-codex Windows 노트): 종전 `owner.stale-<pid>-<ms>-
+        #   <16hex>` 는 약 50자라 MAX_PATH 제약 경로에서 `os.rename` 이 실패해 고아가 회수
+        #   불능이 될 수 있었다(같은 방향의 교착). 파일명은 `owner.<8hex>`(14자)로 두고,
+        #   소유자 식별에 쓰는 긴 토큰은 **파일 내용**에 남긴다(경로 길이와 무관).
+        self.tag = hashlib.sha256(os.urandom(16)).hexdigest()[:8]
         self.token = ("%d-%d-%s" % (os.getpid(), int(time.time() * 1000),
-                                    hashlib.sha256(os.urandom(16)).hexdigest()[:16])).encode("ascii")
+                                    self.tag)).encode("ascii")
 
     def _owner_file(self):
         return os.path.join(self.path, "owner")
@@ -414,8 +419,22 @@ class _best_effort_lock(object):
             return b""
 
     def _claim_name(self):
-        """회수 청구 파일 — 잠금 디렉터리 **안**의 `owner.stale-<내토큰>`(청구자마다 유일)."""
-        return self._owner_file() + ".stale-" + self.token.decode("ascii", "replace")
+        """회수 청구 파일 — 잠금 디렉터리 **안**의 `owner.<8hex>`(청구자마다 유일 · 짧다)."""
+        return self._owner_file() + "." + self.tag
+
+    @staticmethod
+    def _is_claim(name):
+        """청구 파일 이름인가 — 신형 `owner.<8hex>` · 구형 `owner.stale-<토큰>`(호환).
+
+        구형을 계속 인정하지 않으면 이전 판이 남긴 잔재가 '모르는 내용물'이 되어 그 잠금이
+        영구 교착으로 남는다(회수 불능 = 모든 기록 거부 · 부트체인 ④ 방향).
+        """
+        if not name.startswith("owner."):
+            return False
+        rest = name[len("owner."):]
+        if rest.startswith("stale-"):
+            return True
+        return len(rest) == 8 and all(c in "0123456789abcdef" for c in rest)
 
     def _abandoned_claim(self):
         """중단된 회수가 남긴 청구 파일 하나 — owner 가 없고 나이가 상한을 넘은 것만
@@ -427,7 +446,7 @@ class _best_effort_lock(object):
         if "owner" in names:
             return None
         for n in names:
-            if not n.startswith("owner.stale-"):
+            if not self._is_claim(n):
                 return None          # 모르는 내용물 — 손대지 않는다(보류 방향)
         for n in names:
             q = os.path.join(self.path, n)
@@ -438,6 +457,31 @@ class _best_effort_lock(object):
                 return None
         return None
 
+    def _reclaim_empty(self):
+        """owner 도 청구 잔재도 없는 **빈 잠금 디렉터리**를 회수한다 — 반환 회수 여부.
+
+        ★X-1 수리의 회귀를 닫는다(reviewer-claude·reviewer-codex 잔여 major): rename 청구는
+          owner 파일이 있을 때만 동작하고 잔재 회수는 청구 파일이 있을 때만 동작한다. 그런데
+          `__enter__` 는 `os.mkdir` 성공 **직후**에 owner 를 쓰므로 그 사이의 SIGKILL·전원
+          장애·페인 종료는 물론 **KeyboardInterrupt(Ctrl-C)** — `except OSError` 에 걸리지
+          않아 `__enter__` 밖으로 빠져나가고 `__exit__` 도 돌지 않는다 — 가 **빈** 잠금
+          디렉터리를 남긴다. 그 형상은 두 회수 경로 모두에 걸리지 않아 **영구 교착**이 됐다:
+          이후 모든 `round-log`·다이제스트 큐 기록이 사람이 `rm -rf <잠금>` 을 할 때까지
+          거부된다(부트체인 ④ 방향 · 안내문 "300초 뒤 자동 회수" 가 거짓말이 된다).
+        ★`os.rmdir` 는 디렉터리가 **비었을 때만** 성공하므로 원자성은 그대로다: 그 사이 누군가
+          owner 를 썼다면 실패하고 우리는 아무것도 지우지 않는다. 나이도 다시 확인한다 —
+          갓 만들어진 빈 잠금은 owner 를 쓰는 중인 **살아 있는** 소유자다.
+        """
+        try:
+            if os.listdir(self.path):
+                return False                   # 내용이 있다 — 여기서 다룰 형상이 아니다
+            if time.time() - os.path.getmtime(self.path) <= self.stale:
+                return False                   # 살아 있는 소유자가 owner 를 쓰는 중일 수 있다
+            os.rmdir(self.path)                # 비어 있을 때만 성공한다
+        except OSError:
+            return False
+        return True
+
     def _reclaim_orphan(self, seen):
         """고아 잠금 회수 — **원자적 청구(rename)에 성공한 하나만** 회수자다(javis_orchestra
         동명 메서드와 같은 규율 · 독립 재유도 X-1). 확인과 삭제가 원자적이지 않으면 마지막
@@ -446,7 +490,7 @@ class _best_effort_lock(object):
         if not os.path.exists(src):
             src = self._abandoned_claim()
             if not src:
-                return False
+                return self._reclaim_empty()   # owner 도 잔재도 없는 **빈** 잠금(영구 교착)
             seen = None
         try:
             os.rename(src, claim)              # ★원자적 청구
