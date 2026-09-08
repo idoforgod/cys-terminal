@@ -110,11 +110,11 @@ def sh_resolve(env, interp="sh"):
     return (r.stdout or "").strip("\n")
 
 
-def sh_sock_id(env):
+def sh_sock_id(env, interp="sh"):
     """셸 짝이 계산한 종단점 신원 — 파이썬 `_sock_id()` 와 글자 그대로 같아야 한다."""
     script = ('. "%s" >/dev/null 2>&1; cys_role_sock_id_init; '
               'printf "%%s" "$CYS_ROLE_SOCK_ID"') % LIB
-    r = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+    r = subprocess.run([interp, "-c", script], capture_output=True, text=True,
                        encoding="utf-8", timeout=60, env=env)
     return r.stdout or ""
 
@@ -925,6 +925,170 @@ def test_concurrent_writers():
     check("16b 임시 잔재 0(전용 디렉터리는 매번 치운다)", leftovers == [], str(leftovers))
 
 
+# ── ⑰ 수렴 R2: 최종 리뷰 blocking 2 + minor 3 의 회귀 핀 ─────────────────────
+def _legacy_path(env, sid):
+    """I2 이전 이름의 캐시 경로 — 해소기 자신의 규칙으로 계산한다(검체 재구현 금지)."""
+    old_env = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        JR.reset_cache()
+        return JR._cache_path_legacy(sid)
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        JR.reset_cache()
+
+
+def _qcount(log):
+    if not os.path.exists(log):
+        return 0
+    body = open(log, encoding="utf-8").read().strip()
+    return len(body.split("\n")) if body else 0
+
+
+def test_convergence_r2_backoff():
+    """R2a(blocking · reviewer-codex): `.fail` 백오프가 **직접 확인**의 조회를 지워, 같은 uid 가
+    쓸 수 있는 표식 한 줄이 stale env 를 통과 근거로 만들었다.
+
+    신원은 I7 이 새로 표현하게 된 `:` 든 HOME 이다 — base 는 그 신원을 표현하지 못해 백오프
+    자체가 없었고(매번 데몬에 물어 거부), HEAD 는 표현하면서 백오프까지 되살려 **거부가 허용으로**
+    바뀌었다. 지금은 확인 경로가 표식을 무시하고 묻는다(표식은 계속 쓴다 · 일반 경로는 그대로).
+    """
+    home = os.path.join(_tmproot, "h:x")
+    os.makedirs(home, exist_ok=True)
+    log = os.path.join(_tmproot, "r2a.log")
+    env = base_env(CYS_SURFACE_ID="7", CYS_ROLE="cso", HOME=home,
+                   CYS_BIN=stub_dir(0, "worker\n", log=log))
+    cpath, _sk, _ep = _identity(env, "7")
+    check("R2a-0 전제: `:` 든 HOME 도 신원이 있다(I7)", cpath != "", repr(cpath))
+    _seed_record(env, "7", "-", path=cpath + ".fail")
+    got = resolve(env)
+    check("R2a-1 양성대조: **일반** 해소는 백오프를 존중한다(조회 0 · env 폴백)",
+          got == "cso\tenv-cys-role" and _qcount(log) == 0, "%r 조회 %d" % (got, _qcount(log)))
+    rc, e = _org_rc(env)
+    check("R2a-2 ★`.fail` 이 신선해도 직접 확인은 데몬에 묻는다(stale env 통과 차단)",
+          rc == 3 and GATE_MSG in e and _qcount(log) == 1,
+          "rc=%s 조회 %d err=%r" % (rc, _qcount(log), e.strip()[:100]))
+
+
+def test_convergence_r2_legacy_slug():
+    """R2b(blocking · reviewer-codex): I2 의 슬러그 변경이 고아로 만든 **거부 레코드**.
+
+    `/tmp/a__b.sock` 에서 base 파이썬은 `role-7-_tmp_a__b.sock` 에 썼고 새 규칙은
+    `role-7-_tmp_a_b.sock` 을 읽는다 — 만료 전 `worker` 레코드가 통째로 안 보이면 판정이
+    'cache worker(거부)' 에서 'env cso(허용)' 으로 **뒤집힌다**. 이제 새 이름이 비면 옛 이름도
+    한 번 읽는다(권위는 여전히 레코드의 sockid 원문 대조가 가른다).
+    """
+    sock = "/tmp/a__b.sock"
+    env = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=sock, CYS_ROLE="cso", CYS_BIN=stub_dir(2, ""))
+    legacy = _legacy_path(env, "7")
+    new = _identity(env, "7")[0]
+    check("R2b-0 전제: 두 이름이 실제로 다르다(고아가 생기는 조건)",
+          legacy and new and os.path.basename(legacy) != os.path.basename(new),
+          "legacy=%r new=%r" % (os.path.basename(legacy or ""), os.path.basename(new or "")))
+    _seed_record(env, "7", "worker", path=legacy)
+    got = resolve(env)
+    check("R2b-1 ★옛 이름의 신선한 `worker` 레코드는 여전히 권위다(거부→허용 뒤집기 차단)",
+          got == "worker\tcache", got)
+    # 음성 대조 ①: 옛 이름이어도 레코드의 sockid 가 다르면 **캐시 미스**다(별칭 금지).
+    env2 = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=sock, CYS_ROLE="cso", CYS_BIN=stub_dir(2, ""))
+    _seed_record(env2, "7", "worker", path=_legacy_path(env2, "7"), sockid="/tmp/other.sock")
+    check("R2b-2 음성대조: 옛 이름이어도 sockid 가 다르면 캐시 미스",
+          resolve(env2) == "cso\tenv-cys-role", resolve(env2))
+    # 음성 대조 ②: 옛 이름의 `.fail` 은 **되살리지 않는다** — 조회를 지우는 방향이라 허용 쪽이다.
+    log = os.path.join(_tmproot, "r2b.log")
+    env3 = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=sock, CYS_ROLE="cso",
+                    CYS_BIN=stub_dir(0, "worker\n", log=log))
+    _seed_record(env3, "7", "-", path=_legacy_path(env3, "7") + ".fail")
+    got = resolve(env3)
+    check("R2b-3 ★옛 이름의 `.fail` 은 백오프로 인정하지 않는다(조회는 그대로 간다)",
+          got == "worker\tdaemon" and _qcount(log) == 1, "%r 조회 %d" % (got, _qcount(log)))
+
+
+_MEMO_HOME_DRIVER = """
+import json, os, sys
+sys.path.insert(0, %r)
+import javis_role as R
+out = []
+for home in json.loads(sys.argv[1]):
+    os.environ["HOME"] = home
+    out.append(list(R.resolve_role_detail()))
+print(json.dumps(out))
+"""
+
+
+def test_convergence_r2_memo_key():
+    """R2c(minor · reviewer-codex 잔여 I6): 표현 **불가**한 기본 신원 둘이 한 메모를 공유했다.
+
+    `_sock_id()` 가 둘 다 "" 를 내므로 키가 같았다 — 한 프로세스가 HOME 을 A→B 로 바꾸면
+    B 데몬이 답할 참이던 것을 A 의 답으로 대신했다. 지금은 소켓 지정이 없을 때 **입력 원값**을
+    키에 함께 싣는다.
+    """
+    log = os.path.join(_tmproot, "r2c.log")
+    env = _no_disk_cache(base_env(CYS_SURFACE_ID="7", CYS_ROLE="master",
+                                  CYS_BIN=stub_dir(0, "cso\n", log=log)))
+    a = "/tmp/" + "a/" * 300
+    b = "/tmp/" + "b/" * 300
+    check("R2c-0 전제: 두 HOME 모두 상한을 넘어 신원이 없다",
+          _identity(dict(env, HOME=a), "7")[1] == "" and _identity(dict(env, HOME=b), "7")[1] == "",
+          "")
+    r = subprocess.run([sys.executable, "-c", _MEMO_HOME_DRIVER % BIN, json.dumps([a, b])],
+                       capture_output=True, text=True, encoding="utf-8", timeout=60,
+                       env=env, cwd=BIN)
+    check("R2c-1 ★표현 불가한 두 HOME 은 메모를 공유하지 않는다(조회 2회)",
+          _qcount(log) == 2, "조회 %d회 out=%r err=%r" % (_qcount(log), r.stdout.strip()[:80],
+                                                        r.stderr.strip()[:120]))
+
+
+def test_convergence_r2_length_unit():
+    r"""R2d(minor · reviewer-codex): 길이 단위 파리티 — `${#var}` 는 dash 가 바이트·bash/zsh 가
+    글자였다. `\.\pipe\` + `한`*200 은 209자·609바이트라 파이썬·bash·zsh 는 신원을 인정하고
+    dash 만 거절했다(같은 좌석에서 캐시·백오프가 층마다 켜졌다 꺼졌다). 지금은 네 층이 바이트다.
+    """
+    long_pipe = "\\\\.\\pipe\\" + "\ud55c" * 200
+    env = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=long_pipe, CYS_ROLE="cso",
+                   LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8")
+    py = _identity(env, "7")[1]
+    layers = {"py": py}
+    for interp in ("sh", "bash", "zsh", "dash"):
+        if shutil.which(interp):
+            layers[interp] = sh_sock_id(env, interp)
+    check("R2d-1 ★609바이트 종단점은 어느 층에서도 신원이 아니다(바이트 단위 통일)",
+          all(v == "" for v in layers.values()), repr(layers))
+    # 양성 대조: 같은 문자열의 짧은 판(3글자·9바이트)은 네 층 모두 **같은 신원**이다.
+    short_pipe = "\\\\.\\pipe\\" + "\ud55c" * 3
+    env = base_env(CYS_SURFACE_ID="7", CYS_SOCKET=short_pipe, CYS_ROLE="cso",
+                   LC_ALL="en_US.UTF-8", LANG="en_US.UTF-8")
+    py = _identity(env, "7")[1]
+    got = {"py": py}
+    for interp in ("sh", "bash", "zsh", "dash"):
+        if shutil.which(interp):
+            got[interp] = sh_sock_id(env, interp)
+    check("R2d-2 양성대조: 상한 안의 비-ASCII pipe 는 네 층이 같은 신원을 낸다",
+          py == short_pipe and len(set(got.values())) == 1, repr(got))
+
+
+def test_convergence_r2_snapshot_none():
+    """R2e(minor · reviewer-claude — **반박 후 문면만 정정**): 확인 답이 `daemon-none` 일 때
+    `is_master()` 가 대장 절로 흘러 stale 대장으로 True 를 낼 수 있다는 지적은 **재현되지
+    않는다**(`is_authoritative("daemon-none")` 이 참이고 역할 ""≠master 라 그 앞에서 끊긴다).
+    다만 사유 문면이 'not master' 로 나가 세 형제(org·dept)와 어긋났으므로 전용 절을 세웠다 —
+    판정은 그대로 False 이고, 이 핀이 그 사실을 고정한다.
+    """
+    import json as _json
+    state = os.path.join(_tmproot, "r2e-state")
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "mission.json"), "w", encoding="utf-8") as f:
+        _json.dump({"schema": 1, "mission": None, "surface": "7"}, f)
+    # 디스크 캐시=master(신선) · env=worker · 데몬 확인=권위 무역할 → 대장이 일치해도 불통과.
+    env = base_env(CYS_SURFACE_ID="7", CYS_ROLE="worker", CYS_BIN=stub_dir(0, "\n"))
+    _seed_record(env, "7", "master")
+    rc, out = _snapshot_rc(env, state)
+    check("R2e-1 ★캐시=master + 확인=권위 무역할 → 불통과(대장 일치해도)",
+          rc == 1 and "daemon knows no role" in out, "rc=%s out=%r" % (rc, out.strip()))
+
+
 def main():
     try:
         test_three_states()
@@ -946,6 +1110,11 @@ def main():
         test_endpoint_identity()
         test_slug_parity_nonascii()
         test_concurrent_writers()
+        test_convergence_r2_backoff()
+        test_convergence_r2_legacy_slug()
+        test_convergence_r2_memo_key()
+        test_convergence_r2_length_unit()
+        test_convergence_r2_snapshot_none()
     finally:
         shutil.rmtree(_tmproot, ignore_errors=True)
     if fails:

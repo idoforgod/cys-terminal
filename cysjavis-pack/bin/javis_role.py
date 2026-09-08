@@ -150,13 +150,19 @@ def is_authoritative_none(source):
 # 단조시계는 벽시계 조작에, 벽시계는 서스펜드를 세지 않는 단조시계에 각각 면역이다(R2).
 _MEMO = None            # 일반 해소(`resolve_role_detail`)
 _MEMO_CONFIRM = None    # 직접 확인(`confirm_role_detail` · 디스크 역할 캐시를 권위로 쓰지 않는다)
+# ★수렴 R2: **이 프로세스에서** 라이브 조회가 실패한 단조시각. 디스크 `.fail` 과 역할이 다르다 —
+#   디스크 표식은 같은 uid 의 아무 프로세스나 쓸 수 있어 *판정*을 바꿀 수 있지만(그래서 확인
+#   경로는 그것을 믿지 않는다), 이 값은 이 프로세스가 방금 직접 겪은 사실이라 위조 불가다.
+#   쓰임: 데몬이 죽었을 때 한 프로세스가 2s 를 **두 번**(일반 해소 + 직접 확인) 물지 않게 한다.
+_LIVE_FAIL_MONO = None
 
 
 def reset_cache():
     """프로세스 메모 초기화 — 검체 전용(같은 프로세스에서 여러 env 를 재실측할 때)."""
-    global _MEMO, _MEMO_CONFIRM
+    global _MEMO, _MEMO_CONFIRM, _LIVE_FAIL_MONO
     _MEMO = None
     _MEMO_CONFIRM = None
+    _LIVE_FAIL_MONO = None
 
 
 # ── 문자열 규율(셸 짝과 글자 그대로 같은 규칙) ────────────────────────────────
@@ -203,6 +209,23 @@ def surface_id():
     if not _SID_RE.match(t):
         return ""
     return t.lstrip("0") or "0"
+
+
+def _blen(v):
+    r"""길이는 **바이트**로 센다 — 두 층이 같은 단위여야 한다(수렴 R2 · reviewer-codex minor).
+
+    ★왜 글자가 아닌가: 셸 짝의 `${#var}` 는 dash 가 **바이트**, bash/zsh 가 **글자**다. 종전
+      파이썬은 글자로 셌으므로 `\\.\pipe\` + `한`*200 (209자·609바이트)에서 파이썬·bash·zsh 는
+      신원을 인정하고 dash 는 인정하지 않았다 — 같은 좌석에서 층에 따라 캐시·백오프가 켜졌다
+      꺼졌다 했다(I7 이 닫으려던 바로 그 두 층 분기가 길이 경계에만 남아 있었다).
+      셸 짝은 `LC_ALL=C` 를 잠깐 세워 `${#}` 를 바이트로 만든다 — 그러면 세 셸이 모두 같다.
+    ★방향: 바이트가 글자보다 크거나 같으므로 이 규칙은 **더 많이 '신원 미지'** 로 간다 =
+      디스크 캐시를 더 자주 끄고 데몬에 더 자주 묻는다(거부·비용 방향 · 새 허용 0).
+    """
+    try:
+        return len((v or "").encode("utf-8", "replace"))
+    except Exception:
+        return len(v or "")
 
 
 def _has_break(*vals):
@@ -295,7 +318,7 @@ def _sock_id():
     else:
         v = "default:%s:%s" % (_pct_esc(os.environ.get("XDG_STATE_HOME", "")),
                                _pct_esc(os.environ.get("HOME", "")))
-    if len(v) > SOCKID_MAX or _has_break(v):
+    if _blen(v) > SOCKID_MAX or _has_break(v):
         return ""                           # ⓒ 절단하지 않는다
     return v
 
@@ -384,6 +407,33 @@ def _cache_dir():
     return d
 
 
+def _slug_legacy(s):
+    """0.14.31 I2 **이전** 파이썬 슬러그(`_` 를 허용 문자로 두던 규칙) — **판독 전용** 호환 경로.
+
+    ★수렴 R2(blocking · reviewer-codex 차분 실행): I2 로 허용 집합에서 `_` 를 빼면서 옛
+      파이썬 층이 쓴 레코드가 **고아**가 됐다. 그 고아가 *거부* 레코드일 때 결과는 캐시 미스가
+      아니라 **거부→허용 뒤집기**다:
+        `CYS_SOCKET=/tmp/a__b.sock` · surface 7 · stale `CYS_ROLE=cso` · 데몬 불가 ·
+        만료 전 `worker` 레코드 →
+          base `role-7-_tmp_a__b.sock` → ('worker','cache')  = lifecycle mutation 거부
+          I2   `role-7-_tmp_a_b.sock`  → 캐시 미스 → env 폴백 ('cso','env-cys-role') = 허용
+      그래서 새 이름이 비면 **옛 이름도 한 번 읽는다**. 권위는 파일명이 아니라 레코드의
+      `sockid` 원문 대조가 가르므로(슬러그 충돌은 캐시 미스), 이 경로가 남의 데몬 답을
+      권위로 만들지 않는다.
+    ★`.fail` 표식에는 **적용하지 않는다** — 옛 실패 표식을 되살리면 조회를 건너뛰게 되어
+      방향이 '허용'이 된다(아래 백오프 규율과 같은 이유).
+    ★셸 짝에는 대응물이 없다(필요 없다): 옛 셸 `tr -cs 'A-Za-z0-9._-' '_'` 는 출력의 `_` 연속을
+      출처와 무관하게 접었으므로 그 산출이 **새 규칙과 언제나 같다**. 고아는 파이썬 층에만 생겼다.
+    """
+    out = []
+    for c in (s or "").encode("utf-8", "replace"):
+        if (48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122) or c in (46, 95, 45):
+            out.append(chr(c))
+        elif not out or out[-1] != "_":
+            out.append("_")
+    return "".join(out)[:SLUG_MAX]
+
+
 def _cache_path(sid):
     """(surface, socket 슬러그)당 정확히 하나. 캐시 불가면 "".
 
@@ -398,6 +448,17 @@ def _cache_path(sid):
     if not d:
         return ""
     return os.path.join(d, "role-%s-%s" % (_slug(sid or "none"), _slug(_sock_id())))
+
+
+def _cache_path_legacy(sid):
+    """I2 이전 이름의 같은 레코드 경로 — 이름이 새 규칙과 같으면 ""(읽을 것이 없다)."""
+    new = _cache_path(sid)
+    if not new:
+        return ""
+    d = os.path.dirname(new)
+    old = os.path.join(d, "role-%s-%s" % (_slug_legacy(sid or "none"),
+                                          _slug_legacy(_sock_id())))
+    return "" if old == new else old
 
 
 def _open_trusted(path):
@@ -539,21 +600,33 @@ def _query_daemon():
     ★표현 불가한 역할(공백 포함·64자 초과·문법 밖)은 **판정 불가**로 낸다 — 잘라 쓰면 없는
       역할을 지어내는 것이고, 그 자리에서 캐시 문법도 깨진다. 판정 불가의 귀결은 종전 동작이다.
     """
+    global _LIVE_FAIL_MONO
     exe = _line(os.environ.get("CYS_BIN", "")) or "cys"
     env = dict(os.environ)
     env["CYS_NO_AUTOSTART"] = "1"
+
+    def _failed():
+        # ★수렴 R2: 이 프로세스가 직접 겪은 실패만 기록한다(위조 불가한 사실).
+        global _LIVE_FAIL_MONO
+        try:
+            _LIVE_FAIL_MONO = time.monotonic()
+        except Exception:
+            _LIVE_FAIL_MONO = None
+        return "", False
+
     try:
         p = subprocess.run([exe, "surface-role"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
                            timeout=QUERY_TIMEOUT_S, env=env)
     except Exception:
         # FileNotFoundError(cys 부재) · TimeoutExpired · PermissionError … 전부 판정 불가.
-        return "", False
+        return _failed()
     if p.returncode != 0:
-        return "", False
+        return _failed()
     role = _line(p.stdout)
     if role and not _token_ok(role):
-        return "", False
+        return _failed()
+    _LIVE_FAIL_MONO = None
     return role, True
 
 
@@ -594,21 +667,45 @@ def _resolve_uncached(now, trust_cache=True):
     # — 자르거나 뭉개서 **남의 데몬 역할을 권위로 읽는 것**보다 왕복 한 번이 낫다(R2).
     cpath = _cache_path(sid) if sockid else ""
     if cpath and trust_cache:
-        rec = _parse_record(_read_first_line(cpath), sockid, epoch)
-        if rec:
-            ts, role = rec
-            if 0 < ts <= now and (now - ts) < CACHE_TTL_S:
-                exp = ts + CACHE_TTL_S      # ★다 된 캐시를 메모가 되살리지 않는다(codex R1)
-                if role == "-":
-                    return "", SOURCE_CACHE_NONE, exp
-                return role, SOURCE_CACHE, exp
+        # ★수렴 R2: 새 이름이 비면 I2 이전 이름도 한 번 읽는다(고아가 된 **거부** 레코드가
+        #   env 폴백 허용으로 뒤집히지 않게). 레코드의 sockid·세대 대조는 똑같이 건다.
+        for _p in (cpath, _cache_path_legacy(sid)):
+            if not _p:
+                continue
+            rec = _parse_record(_read_first_line(_p), sockid, epoch)
+            if rec:
+                ts, role = rec
+                if 0 < ts <= now and (now - ts) < CACHE_TTL_S:
+                    exp = ts + CACHE_TTL_S  # ★다 된 캐시를 메모가 되살리지 않는다(codex R1)
+                    if role == "-":
+                        return "", SOURCE_CACHE_NONE, exp
+                    return role, SOURCE_CACHE, exp
     fpath = (cpath + ".fail") if cpath else ""
     skip = False
-    if fpath:
+    # ★수렴 R2(blocking · reviewer-codex): **직접 확인 경로(trust_cache=False)는 백오프로
+    #   조회를 건너뛰지 않는다.** 백오프는 비용 장치인데, 이 경로에서는 그것이 *판정*을 바꾼다:
+    #     surface 7 · `HOME=/tmp/h:x`(I7 로 표현 가능해진 신원) · stale `CYS_ROLE=cso` ·
+    #     신선한 `.fail` 한 줄 → 조회 0회 → env 폴백 ('cso','env-cys-role') → require_cso 통과.
+    #     같은 입력에서 base 는 신원을 표현하지 못해 **매번 데몬에 물었고** 데몬은 `worker` 라
+    #     exit 3 이었다. 즉 같은 uid 가 쓸 수 있는 표식 한 줄이 **거부를 허용으로** 바꿨다.
+    #   표식은 계속 **쓴다**(일반 경로의 폭주 차단은 그대로다). 값은 조회 한 번의 비용이고,
+    #   그 비용을 무는 경로는 lifecycle 게이트뿐이라 훅 초당 호출에는 닿지 않는다.
+    #   ★짝이 되는 절반은 **소비처**에 있다: 일반 해소가 백오프로 답을 못 내면 소비처의 종전
+    #   env 절이 통과시키므로, `javis_org.require_cso`·`cys-dept cysd_resolved_role`·
+    #   `javis_snapshot.is_master` 는 **env 로 통과하기 직전에** 이 확인을 한 번 부른다.
+    #   두 절반이 함께여야 "표식 한 줄이 판정을 정하지 못한다"가 성립한다.
+    if fpath and trust_cache:
         rec = _parse_record(_read_first_line(fpath), sockid, epoch)
         if rec:
             ts, _r = rec
             skip = (0 < ts <= now and (now - ts) < FAIL_BACKOFF_S)
+    if not skip and _LIVE_FAIL_MONO is not None:
+        # ★프로세스 안 표식은 **두 경로 모두** 존중한다 — 위조 불가한 사실이고, 데몬 사망 시
+        #   한 프로세스가 같은 2s 를 두 번 무는 것을 막는다(§7 ④ 방향은 그대로 지킨다).
+        try:
+            skip = (time.monotonic() - _LIVE_FAIL_MONO) < FAIL_BACKOFF_S
+        except Exception:
+            skip = False
     if not skip:
         role, ok = _query_daemon()
         if ok:
@@ -650,7 +747,16 @@ def _memo_key():
             cwd = os.getcwd()
         except Exception:
             cwd = "\x00unknown"      # 알 수 없는 cwd 는 어떤 실제 cwd 와도 같지 않다
-    return (raw_s, raw_k, _sock_id(), cwd)
+    # ★수렴 R2(minor · reviewer-codex 잔여): `_sock_id()` 는 **표현할 수 없는** 기본 신원에서
+    #   똑같이 "" 를 낸다 — 상한을 넘는 서로 다른 HOME 둘이 한 메모를 공유했다(실측: 두 번째
+    #   데몬이 `worker` 를 답할 참이었는데 첫 데몬의 `cso` 가 조회 없이 재사용됐다).
+    #   소켓 지정이 없을 때는 그 신원의 **입력 원값**을 키에 함께 싣는다(I/O 0 · env 두 번 읽기).
+    raw_x = ""
+    raw_h = ""
+    if not raw_k:
+        raw_x = os.environ.get("XDG_STATE_HOME", "") or ""
+        raw_h = os.environ.get("HOME", "") or ""
+    return (raw_s, raw_k, _sock_id(), cwd, raw_x, raw_h)
 
 
 def _resolve_memoized(trust_cache):

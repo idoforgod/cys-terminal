@@ -437,14 +437,26 @@ def _register_bad_name(box):
     box.registry.write_text('{"depts":{"bad name":{}}}', encoding="utf-8")
 
 
-# ★argv `--rotate` 면제는 **데몬 절만** 면제한다 — env 절은 종전대로 선다(면제가 새 허용이
-#   되지 않는다). 등재된 이름 + 소켓 부재라 면제 조건은 성립하는데, env=master 가 막는다.
-dept_case("K2b ★argv --rotate 면제는 env 절을 면제하지 않는다",
-          {"CYS_ROLE": "master", "STUB_OUT": "cso"}, True, 0,
+# ★K2b 재핀(수렴 R2 · blocking · reviewer-codex · **의도적 계약 변경**): 종전 K2b 는
+#   "rotate 면제는 데몬 절만 면제하고 env 절은 그대로 선다" 를 핀했다. 그 핀이 곧 반파괴였다 —
+#   `CYS_ROLE=master`(stale) 좌석의 데몬이 `cso` 라고 답하면 **부모 rotate 는 통과해서 부서
+#   데몬을 죽이고**(:1800), 곧바로 재기동하는 자식 `launch <name> --rotate` 가 env 절에 걸려
+#   exit 7 로 죽는다 → 부서는 정지된 채 등재만 남는다(이 파일이 :1739 에서 일부러 피하는 상태).
+#   지금은 면제 갈래에서도 **살아 있는 데몬의 직접 응답 cso** 가 stale env 를 이긴다. 방향은
+#   허용 추가뿐이고(데몬이 반박하거나 답하지 못하면 종전 env 절 그대로), 아래 두 음성 대조가
+#   그 사실을 고정한다. 조회는 0→1 회가 된다(면제 갈래도 이제 데몬에게 묻는다).
+dept_case("K2b ★rotate 면제에서도 데몬 직접 응답 cso 가 stale env 를 이긴다(반파괴 차단)",
+          {"CYS_ROLE": "master", "STUB_OUT": "cso"}, False, 1,
+          args=("launch", "bad name", "--rotate"), rc=2, prepare=_register_bad_name)
+dept_case("K2b-2 음성대조: rotate 면제 + 데몬=worker → env 절이 그대로 거부",
+          {"CYS_ROLE": "master", "STUB_OUT": "worker"}, True, 1,
+          args=("launch", "bad name", "--rotate"), prepare=_register_bad_name)
+dept_case("K2b-3 음성대조: rotate 면제 + 판정 불가 → env 절이 그대로 거부(새 거부 0)",
+          {"CYS_ROLE": "master", "STUB_RC": 2}, True, 1,
           args=("launch", "bad name", "--rotate"), prepare=_register_bad_name)
 
 dept_case("K5 ★argv --rotate exempts launch (falls through to name validation rc=2)",
-          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0,
+          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 1,
           args=("launch", "bad name", "--rotate"), rc=2, prepare=_register_bad_name)
 # ★R2(minor · reviewer-claude): 종전 면제 조건은 **아직 없는 부서명 전부**에 성립해서, stale
 #   `CYS_ROLE=cso` 로도 데몬 절을 건너뛰고 신규 등재·데몬 스폰까지 갈 수 있었다. 진짜 rotate 는
@@ -463,8 +475,28 @@ def _unreadable_registry(box):
 #   새로 거절하면, 이 파일이 :1739 에서 일부러 피하는 '데몬은 죽고 등재만 남는' 반파괴가 된다.
 #   판독 불가는 미등재가 아니다 — 그때는 종전 조건(소켓 부재)만으로 면제를 유지한다.
 dept_case("K8 ★unreadable registry keeps the rotate exemption (no post-kill half-op)",
-          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 0,
+          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, False, 1,
           args=("launch", "bad name", "--rotate"), rc=2, prepare=_unreadable_registry)
+
+
+def _seed_fail(box):
+    """신선한 `.fail` 표식만 심는다(역할 레코드는 없다) — 조회를 지우던 그 한 줄."""
+    box.cache_dir().mkdir(mode=0o700, exist_ok=True)
+    Path(str(box.cache()) + ".fail").write_text(box.record("-"), encoding="utf-8")
+
+
+# ★수렴 R2(blocking · reviewer-codex): `.fail` 백오프는 **비용 장치**인데 판정을 바꿨다 —
+#   같은 uid 가 쓸 수 있는 표식 한 줄이 데몬 조회를 지워서 stale `CYS_ROLE=cso` 가 lifecycle
+#   mutation 의 통과 근거가 됐다(종전: 조회 0회 · 통과). 지금은 env 로 통과하기 **전에** 한 번
+#   직접 확인한다(디스크 캐시·디스크 백오프를 건너뛴다).
+dept_case("R2a ★신선한 `.fail` 이 있어도 env=cso 통과 전에 데몬에게 묻는다(표식 무력화)",
+          {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1, prepare=_seed_fail)
+# 양성 대조 — 데몬이 **정말** 죽어 있으면 확인도 실패하고 종전대로 env 절이 통과시킨다.
+#   (복구 경로 보존: 데몬 사망 중에도 CSO 는 `cys-dept launch` 를 쓸 수 있어야 한다 · §7 ④·③)
+dept_case("R2a-2 양성대조: 데몬 사망이면 확인도 실패하고 종전대로 통과(복구 경로 보존)",
+          {"CYS_ROLE": "cso", "STUB_RC": 2}, False, 1, prepare=_seed_fail)
+# ★H5 가 '중복 대기 없음'을 함께 핀한다: 조회 실패 뒤의 확인은 **셸 안 표식**으로 건너뛰므로
+#   데몬 사망 시에도 한 호출이 무는 시간은 2s 한 번뿐이다(조회 1회 · 위 두 케이스도 같다).
 
 
 def _plant_socket(box):

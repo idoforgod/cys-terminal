@@ -1240,6 +1240,16 @@ cysd_resolved_role() {   # stdout: "<역할>\t<출처>" · 실패해도 항상 r
        && [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       cys_resolve_role --no-cache >/dev/null 2>&1 || :
     fi
+    # ★수렴 R2(blocking · reviewer-codex): 권위 있는 답이 **없는데** env 가 cso 를 주장하면
+    #   그것만으로 통과한다(종전·base 동작). 그런데 '권위 있는 답이 없다' 는 상태는 디스크
+    #   `.fail` 표식 한 줄로도 만들어진다 — 같은 uid 가 쓸 수 있는 파일이 lifecycle mutation 의
+    #   통과 근거를 정한다는 뜻이다. 그래서 **env 로 통과하기 전에 살아 있는 데몬이 반박하지
+    #   않는지 한 번 확인**한다(디스크 캐시·디스크 백오프를 건너뛴다). 데몬이 정말 죽어 있으면
+    #   이 확인도 실패하고 그때는 종전대로 env 절이 통과시킨다(복구 경로 보존 · 셸 안 표식이
+    #   2s 중복 대기를 막는다). 파이썬 짝은 `javis_org.require_cso` 의 같은 절이다.
+    if [ "${CYS_RESOLVED_ROLE_SOURCE:-}" = "env-cys-role" ] && [ "${CYS_ROLE:-}" = "cso" ]; then
+      cys_resolve_role --no-cache >/dev/null 2>&1 || :
+    fi
     printf '%s\t%s\n' "${CYS_RESOLVED_ROLE:-}" "${CYS_RESOLVED_ROLE_SOURCE:-}"
   ) 2>/dev/null
   return 0
@@ -1263,7 +1273,22 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
   #   (종전 상속 env 판은 rotate 된 부서의 모든 좌석에서 이 게이트를 영구 무력화했다 · 실측).
   #   ★env 절은 면제하지 않는다 — 종전에는 env 절이 이 함수 **바깥 앞**에 있어서 rotate 면제와
   #   무관하게 섰다. 그 사실을 여기서 그대로 보존한다(면제가 새 허용이 되지 않게).
-  if [ "${_CYS_ROTATE_SELF:-}" = "1" ]; then cysd_env_clause "$1"; return 0; fi
+  if [ "${_CYS_ROTATE_SELF:-}" = "1" ]; then
+    # ★수렴 R2(blocking · reviewer-codex): 면제 갈래에서도 **데몬이 방금 cso 라고 답하면 그 답이
+    #   env 를 이긴다**. 종전에는 env 절만 남겨서, 승계로 정당하게 CSO 가 된 stale-env 좌석의
+    #   `rotate` 가 **부모 통과(데몬 절) → 데몬 kill → 자식 거부(env 절)** 라는 반파괴를 100%
+    #   재현했다(부서는 정지·등재만 남는다 — 이 파일이 :1739 에서 일부러 피하는 그 상태다).
+    #   방향은 **허용 추가뿐**이다: 데몬이 비-cso 를 말하거나 답하지 못하면 종전 env 절이 그대로
+    #   선다. 여기에 새 거부를 넣지 않는 이유도 같다 — kill 이 끝난 자리의 새 거부가 곧 반파괴다.
+    #   (부모가 통과한 근거와 같은 데몬·같은 소켓을 묻는다. 부모 통과 후 데몬이 죽는 창은 남는
+    #    경합이고, 그때는 종전과 같은 env 절로 떨어진다 — 노트 §수렴 R2 잔여에 적었다.)
+    _cdrg_out="$(cysd_resolved_role)" || _cdrg_out=""
+    _cdrg_role="${_cdrg_out%%	*}"
+    _cdrg_src="${_cdrg_out#*	}"
+    if [ "$_cdrg_src" = "daemon" ] && [ "$_cdrg_role" = "cso" ]; then return 0; fi
+    cysd_env_clause "$1"
+    return 0
+  fi
   _cdrg_out="$(cysd_resolved_role)" || _cdrg_out=""
   # `$( )` 가 말미 개행을 이미 지운다 — 남는 것은 "<역할>\t<출처>" 한 줄뿐이다.
   _cdrg_role="${_cdrg_out%%	*}"

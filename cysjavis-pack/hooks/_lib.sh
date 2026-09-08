@@ -487,7 +487,17 @@ cys_role_sock_id_init() {
     cys_role_pct_esc "${HOME:-}"; _cys_si_h="$CYS_ROLE_PCT_OUT"
     _cys_si="default:$_cys_si_x:$_cys_si_h"               # ⓑ 단사 인코딩
   fi
-  [ "${#_cys_si}" -le 512 ] || return 0
+  # ★수렴 R2(minor · reviewer-codex 실측): 길이는 **바이트**로 잰다. `${#var}` 는 dash 가 바이트·
+  #   bash/zsh 가 글자여서 `\\.\pipe\` + `한`*200(209자·609바이트)에서 파이썬·bash·zsh 는 신원을
+  #   인정하고 dash 는 인정하지 않았다 — 같은 좌석에서 층·셸에 따라 캐시와 백오프가 켜졌다 꺼졌다
+  #   했다(I7 이 닫으려던 두 층 분기가 길이 경계에만 남아 있었다). `LC_ALL=C` 를 **잠깐** 세우면
+  #   bash·zsh·sh 가 모두 바이트를 세고 dash 는 원래 바이트라 무영향이다(로컬 4셸 실측 18/18).
+  #   포크 0 · 파이썬 짝 `javis_role._blen` 과 같은 단위 · 값은 원상 복구한다(미설정/빈 값 구분).
+  if [ "${LC_ALL+x}" = "x" ]; then _cys_si_lcset=1; _cys_si_lc="$LC_ALL"; else _cys_si_lcset=0; _cys_si_lc=""; fi
+  LC_ALL=C
+  _cys_si_n="${#_cys_si}"
+  if [ "$_cys_si_lcset" = "1" ]; then LC_ALL="$_cys_si_lc"; else unset LC_ALL; fi
+  [ "$_cys_si_n" -le 512 ] || return 0
   case "$_cys_si" in *"$CYS_ROLE_NL"*|*"$CYS_ROLE_CR"*) return 0 ;; esac
   CYS_ROLE_SOCK_ID="$_cys_si"
   return 0
@@ -658,6 +668,13 @@ cys_role_cache_write() {   # $1=path $2=한 줄 내용(개행 없이)
   return 0
 }
 
+# ★수렴 R2: **이 셸에서** 라이브 조회가 실패했는가(파이썬 짝 `_LIVE_FAIL_MONO`).
+#   ⓐ 로드 시 0 으로 **덮어쓴다** — 상속된 env 한 줄로 조회를 지울 수 있으면 디스크 `.fail` 과
+#      같은 구멍이 env 에 생긴다(그 구멍이 이번 blocking 지적이다).
+#   ⓑ export 하지 않는다 — 자식에게 새어 자식의 첫 조회를 지우면 안 된다.
+#   쓰임: 데몬이 죽었을 때 한 셸이 같은 2s 를 두 번(일반 해소 + `--no-cache` 확인) 물지 않게.
+CYS_ROLE_LIVE_FAIL=0
+
 # ★폴백은 `CYS_ROLE` **하나뿐**이다(codex R1): `CYS_SURFACE_ROLE` 은
 #   `role-capability-gate.sh` 가 해소 결과로 export 하는 **산출물**이지 신원 입력이 아니다.
 #   일반 폴백에 넣으면 `CYS_SURFACE_ROLE=cso` + `CYS_ROLE=worker` 에서 **현행이 거부하던 것을
@@ -729,12 +746,19 @@ cys_resolve_role() {
   [ -n "$_cys_rr_cache" ] && _cys_rr_fail="$_cys_rr_cache.fail"
   _cys_rr_skip=0
   CYS_ROLE_REC_TS=""
-  if [ -n "$_cys_rr_fail" ] && [ "$_cys_rr_now" -gt 0 ] \
+  # ★수렴 R2(blocking · reviewer-codex): `--no-cache`(직접 확인) 경로는 **백오프로 조회를
+  #   건너뛰지 않는다**. 백오프는 비용 장치인데 이 경로에서는 그것이 *판정*을 바꾼다 — 같은 uid 가
+  #   쓸 수 있는 `.fail` 한 줄이 데몬 조회를 지워 stale env 가 통과 근거가 된다(파이썬 짝
+  #   `javis_role._resolve_uncached` 의 같은 자리에 같은 규율). 표식은 계속 **쓴다**.
+  if [ "$_cys_rr_trust" = "1" ] && [ -n "$_cys_rr_fail" ] && [ "$_cys_rr_now" -gt 0 ] \
      && cys_role_record "$_cys_rr_fail" "$_cys_rr_sock" "$_cys_rr_ep" \
      && [ "$CYS_ROLE_REC_TS" -le "$_cys_rr_now" ] \
      && [ $(( _cys_rr_now - CYS_ROLE_REC_TS )) -lt "$CYS_ROLE_QUERY_BACKOFF" ]; then
     _cys_rr_skip=1
   fi
+  # ★수렴 R2: 이 셸이 방금 직접 겪은 실패는 **두 경로 모두** 존중한다(위조 불가한 사실 ·
+  #   데몬 사망 시 같은 2s 를 두 번 물지 않게 · §7 ④ 방향 보존).
+  [ "${CYS_ROLE_LIVE_FAIL:-0}" = "1" ] && _cys_rr_skip=1
   if [ "$_cys_rr_skip" = "0" ] && command -v "${CYS_BIN:-cys}" >/dev/null 2>&1; then
     # ★`CYS_NO_AUTOSTART=1`: 소켓이 없으면 `cys` 는 autostart 경로를 탄다(src/bin/cys.rs:2258).
     #   **역할을 묻는 행위가 데몬을 낳아서는 안 된다** — 특히 `cys-dept` 가드는 데몬이 아직
@@ -758,14 +782,17 @@ cys_resolve_role() {
         cys_role_cache_write "$_cys_rr_cache" \
           "$_cys_rr_now $_cys_rr_role $_cys_rr_ep $_cys_rr_sock"
         [ -n "$_cys_rr_fail" ] && { rm -f "$_cys_rr_fail" 2>/dev/null || :; }
+        CYS_ROLE_LIVE_FAIL=0
         CYS_RESOLVED_ROLE="$_cys_rr_role"; CYS_RESOLVED_ROLE_SOURCE="daemon"; return 0
       fi
       # 권위 있는 '역할 없음' — 옛 역할 캐시를 덮는다.
       cys_role_cache_write "$_cys_rr_cache" "$_cys_rr_now - $_cys_rr_ep $_cys_rr_sock"
       [ -n "$_cys_rr_fail" ] && { rm -f "$_cys_rr_fail" 2>/dev/null || :; }
+      CYS_ROLE_LIVE_FAIL=0
       CYS_RESOLVED_ROLE=""; CYS_RESOLVED_ROLE_SOURCE="daemon-none"; return 0
     fi
     cys_role_cache_write "$_cys_rr_fail" "$_cys_rr_now - $_cys_rr_ep $_cys_rr_sock"
+    CYS_ROLE_LIVE_FAIL=1
   fi
   # ③ 판정 불가 — 낡은 캐시는 쓰지 않는다(옛 역할이 무기한 사는 길). env 폴백 = 현행 동작.
   cys_role_env_fallback

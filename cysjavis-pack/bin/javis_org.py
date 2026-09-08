@@ -103,6 +103,22 @@ def require_cso():
                     elif _role_mod.is_authoritative(src2) and role2 != "cso":
                         why = ("데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). "
                                % (role2 or "-")[:32])
+            elif (os.environ.get("CYS_ROLE") or "").strip() == "cso":
+                # ★수렴 R2(blocking · reviewer-codex): 권위 있는 답이 **없다**는 것은 조회가
+                #   실패했거나 `.fail` 백오프가 조회를 **지웠다**는 뜻이다. 그 상태에서 stale env
+                #   하나로 통과시키면 같은 uid 가 쓸 수 있는 표식 한 줄이 판정을 바꾼다(codex
+                #   실측: `HOME=/tmp/h:x` · 신선한 `.fail` → 조회 0회 → ('cso','env-cys-role') →
+                #   통과. 같은 입력에서 base 는 그 신원을 표현하지 못해 매번 물었고 데몬이
+                #   `worker` 라 exit 3 이었다). 그래서 **env 로 통과하기 전에 살아 있는 데몬이
+                #   반박하지 않는다는 것을 한 번 확인한다** — 디스크 캐시·디스크 백오프를 건너뛴다.
+                #   데몬이 정말 죽어 있으면 이 확인도 실패하고 그때는 종전대로 env 로 통과한다
+                #   (회귀 0 · 복구 경로 보존 · 프로세스 안 표식이 2s 중복 대기를 막는다).
+                role2, src2 = _role_mod.confirm_role_detail()
+                if _role_mod.is_authoritative_none(src2):
+                    why = ("데몬이 이 좌석에 역할이 없다고 답했다(env CYS_ROLE=cso 는 stale). ")
+                elif _role_mod.is_authoritative(src2) and role2 != "cso":
+                    why = ("데몬 권위 역할=%s (env 가 아니라 데몬이 신원의 정본이다). "
+                           % (role2 or "-")[:32])
         except Exception:
             why = ""      # 해소 실패가 이 게이트를 **열지도 닫지도** 않는다 — 아래 종전 판정으로.
             granted = False

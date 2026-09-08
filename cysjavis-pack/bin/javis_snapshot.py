@@ -199,6 +199,21 @@ def is_master():
                 _role2, _src2 = _rm.confirm_role_detail()
                 if _src2 == _rm.SOURCE_DAEMON and _role2.strip().lower() == "master":
                     return True, "daemon role is master (confirmed)"
+                # ★수렴 R2(minor · reviewer-claude — 판정은 종전과 같고 **사유 문면만** 세운다):
+                #   확인 답이 '권위 있는 무역할' 일 때도 아래 절이 이미 False 를 냈다
+                #   (`is_authoritative("daemon-none")` 이 참이고 ""≠master). 다만 사유가
+                #   'not master' 로 나가 형제 게이트(org·cys-dept)와 어긋났다 — 전용 절로 세운다.
+                if _rm.is_authoritative_none(_src2):
+                    return False, "daemon knows no role for this seat"
+                if _rm.is_authoritative(_src2) and _role2.strip().lower() != "master":
+                    return False, "daemon role is not master"
+            elif (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
+                # ★수렴 R2(blocking 형제 조항 · org 와 같은 규율): 권위 있는 답이 없을 때
+                #   stale env 로 통과하기 전에 **살아 있는 데몬이 반박하지 않는지** 한 번 본다
+                #   (디스크 캐시·디스크 백오프를 건너뛴다). 데몬이 죽어 있으면 종전대로 통과한다.
+                _role2, _src2 = _rm.confirm_role_detail()
+                if _rm.is_authoritative_none(_src2):
+                    return False, "daemon knows no role for this seat"
                 if _rm.is_authoritative(_src2) and _role2.strip().lower() != "master":
                     return False, "daemon role is not master"
         except Exception:
