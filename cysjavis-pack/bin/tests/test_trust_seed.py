@@ -5635,14 +5635,18 @@ class TriageConvergence(TriageP1WP2Trust):
     def test_conv_the_same_crash_on_the_normal_path_leaves_no_conflict(self):
         """음성 대조: 활성이 그대로면(통상) 그 임시본은 **증명된 중복**이라 회수된다 — 보수화가 상시 잔재가 되지 않는다."""
         self.untrusted_file(self.ORIGINAL)
+        before = _read_bytes(self.cfgfile)
         self.crash_between_journal_and_rename()
-        rc, verdict, reason = self.seed()
-        self.assertEqual(rc, 0, reason)
-        self.assertIn("recovery-reclaimed", reason, reason)
-        self.assertNotIn("recovery-preserved", reason, reason)
-        for prefix in (pf.SEED_TRUST_CONFLICT_PREFIX, pf.SEED_TRUST_INTENT_PREFIX, pf.SEED_TRUST_TMP_PREFIX):
+        r = self.seed()
+        self.assertIn("recovery-reclaimed", r[2], r[2])
+        self.assertNotIn("recovery-preserved", r[2], r[2])
+        for prefix in (pf.SEED_TRUST_CONFLICT_PREFIX, pf.SEED_TRUST_DISPLACED_PREFIX,
+                       pf.SEED_TRUST_INTENT_PREFIX, pf.SEED_TRUST_TMP_PREFIX):
             self.assertEqual([n for n in self.names(prefix) if n != pf.SEED_TRUST_LOCK_NAME], [], prefix)
         self.assertEqual(json.loads(_read_bytes(self.cfgfile))["user"], "ONLY-COPY")
+        if _refused_without_exchange(self, r, self.cfgfile, before):
+            return          # ★R6 축: 교환 기구가 없으면 커밋은 REFUSE 다 — 회수·잔재 계약은 위에서 이미 단언했다
+        self.assertEqual(r[0], 0, r)
 
     def test_conv_guard_ignores_a_copy_that_a_journal_still_claims(self):
         """codex 설계비평 4: 회수 ⓑ 가 정리에 실패하면 **저널을 남긴다** — 그 사본은 고아가 아니므로 가드가 격리·거부하지
