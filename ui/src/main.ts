@@ -2898,7 +2898,13 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
           const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
             surfaces: SurfaceRow[];
           } | null;
-          if (destinationLooksAwake(rr?.surfaces?.find((x) => x.surface_id === agentSid))) {
+          if (
+            destinationLooksAwake(
+              rr?.surfaces?.find((x) => x.surface_id === agentSid),
+              srcRole,
+              wantAgent,
+            )
+          ) {
             awake = true;
             break;
           }
@@ -2918,6 +2924,31 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         }
       }
       // ⑤ 목적지 확정 + 인계 적재 + **각성 확인** 후에만 원본 정리
+      // ★(독립 재유도 · codex blocking #3) 닫기 **직전에** 선택 술어를 그대로 다시 본다.
+      //   각성 래치는 한 번 서면 내려가지 않는 과거 사실이라, 폴링이 참이 된 뒤 목적지가
+      //   죽거나 역할을 잃어도 종전 코드는 그대로 원본을 닫았다(좌석 사망 + 인계 유실).
+      //   이 재평가가 거짓이면 **닫지 않는다** — 실패 방향은 언제나 '전출 안 함'이다.
+      if (isAgent) {
+        const fin = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+          surfaces: SurfaceRow[];
+        } | null;
+        if (
+          !destinationLooksAwake(
+            fin?.surfaces?.find((x) => x.surface_id === agentSid),
+            srcRole,
+            wantAgent,
+          )
+        ) {
+          toast(
+            "watchdog",
+            "전출 보류",
+            `목적지 surface:${agentSid} 가 종료 직전 재확인에서 인계 가능 상태가 아닙니다(사망·역할 상실·종료) — 인계는 적재됐고 원본 pane 은 보존했습니다. 목적지를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${newSid} 도 남아 있습니다.`,
+          );
+          dismissToast("transfer");
+          render();
+          return;
+        }
+      }
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 보상 롤백: 런처 셸은 **기동 명령을 보내지 않았을 때만** 회수한다.

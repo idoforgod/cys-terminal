@@ -124,4 +124,14 @@ describe("destinationLooksAwake", () => {
   test("행이 없으면 거짓(관측 실패는 통과가 아니다)", () => {
     expect(destinationLooksAwake(undefined)).toBe(false);
   });
+  // ★독립 재유도(triage · codex blocking #3): 각성 래치는 **한 번 서면 내려가지 않는 표식**이다.
+  //   원본을 닫는 결정은 "지금 이 좌석이 인계를 받을 수 있는가"인데, 래치만 보면 각성 뒤에
+  //   에이전트가 죽었거나(agent_alive=false · 셸만 남아 exited=false) 역할을 잃은 좌석도 통과한다.
+  //   그 상태에서 원본을 닫으면 인계는 아무도 읽지 않고 작업 세션만 사라진다.
+  test("각성 뒤 에이전트가 죽으면 거짓(래치는 과거 사실이다)", () => {
+    expect(destinationLooksAwake(good({ awakened_at: 1234, agent_alive: false }))).toBe(false);
+  });
+  test("각성 뒤 역할을 잃은 좌석은 거짓(인계 대상이 아니다)", () => {
+    expect(destinationLooksAwake(good({ awakened_at: 1234, role: null }))).toBe(false);
+  });
 });

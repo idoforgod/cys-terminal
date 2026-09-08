@@ -109,12 +109,31 @@ export function pickLaunchedAgentSid(
   return hits.length === 1 ? hits[0].surface_id : null;
 }
 
-/** 목적지가 **인계를 받을 수 있는 상태**인가 — 각성 래치(첫 자기보고)가 섰는가.
+/** 목적지가 **지금** 인계를 받을 수 있는 상태인가 — 선택 때 쓴 술어를 그대로 재평가한다.
  *
  * ★왜 생존 관측만으로 부족한가(codex 적대검증 R2 blocking): 프로세스가 살아 있어도 신뢰
  * 관문·인증 화면에 앉아 있을 수 있다. 그 상태에서 원본을 닫으면 인계는 아무도 읽지 않는다.
  * 래치는 "노드가 지침을 읽고 스스로 신고했다"는 데몬의 단방향 사실이다(status.set 이 유일
- * write path). 서지 않으면 **원본을 닫지 않는다** — 목적지는 살아 있으니 사람이 판단한다. */
-export function destinationLooksAwake(row: SurfaceRow | undefined): boolean {
-  return !!row && !row.exited && row.awakened_at != null;
+ * write path). 서지 않으면 **원본을 닫지 않는다** — 목적지는 살아 있으니 사람이 판단한다.
+ *
+ * ★그리고 래치는 **필요조건이지 충분조건이 아니다**(독립 재유도 · codex blocking #3):
+ * `awakened_at` 은 한 번 서면 내려가지 않는 **과거 사실**인데, 원본 종료의 유일한 관문이
+ * 그것 하나였다. 각성 뒤에 에이전트가 죽거나(`agent_alive=false` — 셸만 남아 `exited=false`)
+ * 역할을 잃은 좌석도 그대로 통과해, 그 상태에서 원본을 닫으면 **좌석 사망 + 인계 유실**이다.
+ * 그래서 종료 직전 이 술어가 선택 때 쓴 축을 다시 본다: 역할 보유(요구하면 동일 역할) ·
+ * 생존 **관측**(3값을 `true` 로만 좁힌다) · 시킨 종류 · 미종료 · 래치. 모르면 거짓이다. */
+export function destinationLooksAwake(
+  row: SurfaceRow | undefined,
+  wantRole?: string,
+  wantAgent?: string,
+): boolean {
+  if (!row || row.exited) return false;
+  // 역할 축: 인계는 '그 역할' 앞으로 간다 — 역할을 잃은 좌석은 수신자가 아니다.
+  if (!row.role) return false;
+  if (wantRole != null && row.role !== wantRole) return false;
+  // 생존 축: `null`(말할 것 없음)·`false`(종료 통지) 둘 다 근거가 아니다.
+  if (row.agent_alive !== true) return false;
+  // 종류 축: 시킨 CLI 가 아직 그 좌석의 것인가(호출부가 요구할 때만).
+  if (wantAgent != null && row.agent !== wantAgent) return false;
+  return row.awakened_at != null;
 }
