@@ -134,6 +134,27 @@ const WIN_STATE_PREFIX: [&str; 8] = [
     "analytics.db-",      // WAL/SHM 사이드카
 ];
 
+/// Windows 상태 항목인가 — 정확 이름 · 접두 · **원자쓰기 임시 잔재**의 세 축.
+///
+/// ★(0.14.31 · 독립 판정 triage X14) `write_json_atomic`(governance.rs)의 임시 이름은
+/// `.{name}.tmp` 다 — **선두 점** 때문에 `WIN_STATE_PREFIX` 의 `starts_with` 에도,
+/// `WIN_STATE_EXACT` 의 정확 일치에도 걸리지 않는다. 크래시가 남긴
+/// `.alert-route-pending.json.tmp` · `.queue-state.json.tmp` · `.topology.json.tmp` 가
+/// "앱 설치 파일 — 보존" 으로 분류돼 초기화 후에도 데몬 상태가 남았다(선재 결함 · 이 WP 가
+/// 파일 두 개를 더 얹었을 뿐이다). 임시 이름은 **알려진 이름에서 파생될 때만** 잡는다 —
+/// 임의의 점 파일을 격리하면 설치본을 옮기는 사고 방향이 된다(fail-safe).
+fn is_win_state_name(name: &str) -> bool {
+    if WIN_STATE_EXACT.contains(&name) || WIN_STATE_PREFIX.iter().any(|p| name.starts_with(p)) {
+        return true;
+    }
+    // `.{알려진 이름}.tmp` — 선두 점과 꼬리 `.tmp` 를 벗겨 같은 두 축으로 다시 본다.
+    name.strip_prefix('.')
+        .and_then(|s| s.strip_suffix(".tmp"))
+        .is_some_and(|base| {
+            WIN_STATE_EXACT.contains(&base) || WIN_STATE_PREFIX.iter().any(|p| base.starts_with(p))
+        })
+}
+
 /// D1a 계승 보호 루트 — realpath 가 이 중 하나면 어떤 격리도 금지.
 const PROTECTED_ROOTS: [&str; 6] = ["/", "/Users", "/tmp", "/var", "/private/tmp", "/private/var"];
 
@@ -576,8 +597,7 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
             entries.sort_by_key(|e| e.file_name());
             for e in entries {
                 let name = e.file_name().to_string_lossy().into_owned();
-                let known = WIN_STATE_EXACT.contains(&name.as_str())
-                    || WIN_STATE_PREFIX.iter().any(|p| name.starts_with(p));
+                let known = is_win_state_name(&name);
                 if known {
                     push_quarantine(&mut quarantine, e.path(), "데몬 상태(Windows)");
                 } else {
@@ -3343,5 +3363,100 @@ mod tests {
             Some("it's ok")
         );
         assert_eq!(shell_unquote_single(""), None);
+    }
+}
+
+// ═════════════════ 독립 판정(triage R3-WP3B) — 잔여 지적 재현 검체 ═════════════════
+#[cfg(test)]
+mod triage_factory_reset {
+    use super::*;
+    use std::path::Path;
+
+    fn touch(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// [codex #14 major] Windows 리셋이 새 원자쓰기 임시 파일을 놓친다.
+    ///
+    /// `write_json_atomic`(governance.rs:2530)의 임시 이름은 `.{name}.tmp` 라
+    /// `.alert-route-pending.json.tmp` 다 — `WIN_STATE_PREFIX` 의 `"alert-route"`(:128)는
+    /// 선두 점 때문에 `starts_with` 에 걸리지 않는다. 크래시 잔재가 "앱 설치 파일 — 보존"
+    /// 으로 분류돼 초기화 후에도 경보 상태가 남는다.
+    #[test]
+    fn triage_x14_windows_reset_claims_atomic_write_leftovers() {
+        let td = std::env::temp_dir().join(format!("cys-triage-freset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let lad = td.join("AppData/Local");
+        let inst = lad.join("cys");
+        touch(&inst.join("cys.exe"), "MZ"); // 설치본(보존 대상)
+        touch(&inst.join("alert-route-pending.json"), "{}"); // 정상 상태 파일(격리 대상)
+        touch(&inst.join(".alert-route-pending.json.tmp"), "{}"); // 크래시 잔재
+        touch(&inst.join(".alert-route-folded.jsonl.tmp"), "{}");
+
+        let roots = ResetRoots {
+            home: td.clone(),
+            cys_base: td.join(".cys"),
+            state_root: td.join(".local/state"),
+            trash_root: td.join(".local/state/cys-trash"),
+            library: None,
+            darwin_cache: None,
+            temp: td.join("tmpzone"),
+            workspace_root: td.join("Desktop/CYSjavis"),
+            win_local_state: Some(inst.clone()),
+            win_webview_data: None,
+        };
+        let opts = ResetOptions { purge_license: false, purge_local: false, purge_round: false };
+        let plan = build_plan(&roots, &opts);
+        let quarantined: Vec<String> = plan
+            .quarantine
+            .iter()
+            .filter_map(|i| i.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        let kept: Vec<String> = plan
+            .keep
+            .iter()
+            .filter_map(|i| i.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(kept.contains(&"cys.exe".to_string()), "전제: 설치본은 보존한다");
+        assert!(
+            quarantined.contains(&".alert-route-pending.json.tmp".to_string())
+                && quarantined.contains(&".alert-route-folded.jsonl.tmp".to_string()),
+            "원자쓰기 잔재가 설치 파일로 분류돼 남는다 — 격리: {quarantined:?} · 보존: {kept:?}"
+        );
+    }
+}
+
+// ═════════════════ 수렴(R3-WP3B) — 고침이 세운 불변식의 회귀 핀 ═════════════════
+#[cfg(test)]
+mod converge_factory_reset {
+    use super::*;
+
+    /// ★X14: `.{알려진 이름}.tmp` 만 상태로 잡는다 — 임의의 점 파일·설치본은 **보존**이다
+    /// (음성 대조가 없으면 "전부 격리" 로 고쳐도 통과한다 = 앱을 옮기는 사고 방향).
+    #[test]
+    fn converge_atomic_temp_rule_does_not_swallow_unknown_dotfiles() {
+        for name in [
+            ".alert-route-pending.json.tmp",
+            ".queue-state.json.tmp",
+            ".topology.json.tmp",
+            ".cys-dept-dept-1.tmp",
+        ] {
+            assert!(is_win_state_name(name), "알려진 이름의 원자쓰기 잔재를 놓쳤다: {name}");
+        }
+        for name in [
+            ".installer-cache.tmp",
+            ".env",
+            "cys.exe",
+            "alert-route-pending.json.tmp", // 선두 점이 없는 형태는 우리 규약이 아니다
+            "unins000.dat",
+        ] {
+            assert_eq!(
+                is_win_state_name(name),
+                name.starts_with("alert-route"),
+                "설치본·미지 점 파일을 상태로 분류했다: {name}"
+            );
+        }
     }
 }
