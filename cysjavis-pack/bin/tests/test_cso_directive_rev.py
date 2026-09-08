@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""test_cso_directive_rev.py — CSO alert inbox 개정 계약의 회귀를 막는다(0.14.31 WP-3 C · codex 초안 → 워커 전 행 검토 채택 · R1 리뷰 반영).
+r"""test_cso_directive_rev.py — CSO alert inbox 개정 계약의 회귀를 막는다(0.14.31 WP-3 C · codex 초안 → 워커 전 행 검토 채택 · R1 리뷰 반영).
 
 왜 존재하는가: Pack P2 표지 판정·preflight 핀·벤치 문구가 실제 배포 지시문과
 엇갈리거나, 폐기한 직접 구독이 되살아나는 것을 음성 대조군과 함께 검출한다.
