@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """test_inject_context_role_seat.py — WP-7 O: 동일 cwd 세션 카운트의 역할 좌석 강등 핀 (0.14.31).
 
-무엇을 막는가: 데몬은 좌석을 전부 같은 cwd 로 띄운다(실측 2026-09-06 본부 12좌석 cwd=/Users/cys).
+무엇을 막는가: 데몬은 좌석을 전부 같은 cwd 로 띄운다(실측 2026-09-06 본부 12좌석 cwd=오너 홈).
 그 형상에 race 경고를 물리면 경고가 **상시 참**이 되어 아무도 읽지 않는다(경보 피로 · 버그리포트 B1).
 0.14.31 부터 역할 좌석은 경고 대신 사실 1줄을 받고, 무역할 세션만 종전 경고를 받는다.
 
@@ -58,7 +58,7 @@ def run_hook(tmp, seats, cys_mode, role_env=None, cys_present=True):
     for d in (bindir, pack, cwd):
         os.makedirs(d, exist_ok=True)
     # 스텁 ps — awk 가 comm=claude 로 잡는 형상(실측 ⓐ 런처 실행)
-    rows = "".join("echo '%d claude /Users/u/.local/bin/claude --x'\n" % (9000 + i)
+    rows = "".join("echo '%d claude /Users/user/.local/bin/claude --x'\n" % (9000 + i)
                    for i in range(max(seats, 1)))
     _write_exec(os.path.join(bindir, "ps"), "#!/bin/sh\n" + rows)
     # 스텁 lsof — 요청한 pid 집합에 대해 cwd 를 seats 번 낸다

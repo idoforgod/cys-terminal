@@ -727,7 +727,7 @@ def _fleet_owner(cmd):
             low = norm.lower()
             owner = FLEET_EXE_NAMES.get(base)
             if owner and _APP_BUNDLE_MARKER not in low:
-                return owner                          # 실측: `node /Users/u/.local/bin/codex …`
+                return owner                          # 실측: `node /Users/user/.local/bin/codex …`
             if js:
                 for marker, name in FLEET_JS_BUNDLE_MARKERS:
                     if marker in low and low.endswith(_JS_SUFFIXES):
@@ -951,8 +951,71 @@ def _fleet_hold_legacy_path():
                         "%s-%s" % (FLEET_CPU_HOLD_BASENAME, key))
 
 
+def _fleet_expired_mark_path(path):
+    """래치 레코드 경로 → **만료 표식** 경로. 순수(부작용 0).
+
+    ★왜 별도 파일인가(R3 · codex blocking 의 수리): 만료는 `below` 전까지 **단조**인 한 비트인데,
+      그것을 가변 JSON 레코드 안에 두면 '읽기→판정→교체' 의 잃어버린 갱신이 그 비트를 되돌린다.
+      실측 인터리브: A(now=1899)의 병합 재읽기와 `os.replace` **사이**에 B(now=1900)가 `expired=True`
+      를 저장하고 그 완화를 **호출자에게 이미 공개**하면, A 의 낡은 `expired=False` 가 그것을 덮었다.
+      그 뒤 시계 역행이 오면 `below` 관측 없이 재무장해 899초가 다시 막혔다(판정자 핀 1b/1c/1d).
+    ★왜 잠금이 아닌가: ⓐ 이 게이트는 부트 체인 경로다 — 잠금 획득 실패·스테일 락 회수(시계 역행과
+      결합하면 살아 있는 락을 뺏거나 죽은 락을 영원히 남긴다)라는 **새 실패 모드**를 들이는 값이
+      이 이득보다 비싸다. ⓑ Windows 에 `flock` 이 없다. ⓒ 무엇보다 잠금은 이 문제를 못 푼다:
+      직렬화해도 '타임아웃으로 만료를 공개한 호출' 의 공개가 파일에 남지 않는다(codex 반례).
+      **생성만 가능한 표식**은 잃어버린 갱신이 원리적으로 불가능하다 — 덮어쓸 내용이 없다.
+    ★단조성의 경계: 표식은 `below`(축이 임계 미만으로 관측됨)에서만 지워진다. 그 삭제와 동시에
+      진행 중이던 hard 호출이 표식을 되만들 수 있다 — 귀결은 '한 번 더 soft(권고)' 이고, 방향은
+      **덜 막음**이라 §3-3 이 허용하는 쪽이다(그리고 다음 `below` 가 다시 지운다)."""
+    return path + ".expired"
+
+
+def _fleet_expired_mark(path):
+    """만료 표식 존재 여부 → bool. 판독 실패는 **False 가 아니라** 호출자가 따로 다룬다(여기선 존재만).
+    ★`os.path.exists` 는 권한 오류에서도 False 다 — 그 경우의 귀결은 '만료를 못 봄 = 더 막음' 이라
+      래치 본체의 `unreadable → unbounded_io` 정책이 상위에서 그 통을 덮는다."""
+    try:
+        return os.path.exists(_fleet_expired_mark_path(path))
+    except OSError:
+        return False
+
+
+def _fleet_expired_mark_set(path):
+    """만료 표식 **생성**(멱등) → 성공 여부. 실패는 예외가 아니라 False.
+    이미 있으면 True — `O_EXCL` 의 EEXIST 는 '남이 먼저 만들었다' 이고 그것도 성공이다."""
+    mp = _fleet_expired_mark_path(path)
+    try:
+        d = os.path.dirname(mp)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fd = os.open(mp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, b"1\n")
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        return True
+    except OSError:
+        return False
+
+
+def _fleet_expired_mark_clear(path):
+    """만료 표식 삭제 → 성공 여부(부재도 성공). `below` 경로 전용."""
+    try:
+        os.remove(_fleet_expired_mark_path(path))
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _fleet_hold_read(path):
     """래치 → `(rec|None, reason)`. rec = `{"since","last","expired"}` (전부 유한 float / bool).
+
+    ★`expired` 는 **레코드의 비트 ∨ 만료 표식의 존재**다(R3). 표식이 있으면 레코드가 무엇을 말하든
+      만료다 — 그것이 이 단조 비트를 경합에서 지키는 유일한 장치다.
 
     reason ∈ None(정상) · "missing"(정상 부재) · "unreadable"(있는데 못 읽음) · "corrupt"(내용 파손).
     ★셋을 가르는 이유(codex R2 B3): '정상 부재' 는 **지금 무장**(상한이 지금부터 다시 유계)이지만,
@@ -991,14 +1054,15 @@ def _fleet_hold_read(path):
             return None, "corrupt"
         if not (math.isfinite(since) and math.isfinite(last)):
             return None, "corrupt"
-        return {"since": since, "last": last, "expired": obj.get("expired") is True}, None
+        return {"since": since, "last": last,
+                "expired": (obj.get("expired") is True) or _fleet_expired_mark(path)}, None
     try:
         v = float(raw)                       # 구 형식(R1 · bare float)
     except ValueError:
         return None, "corrupt"
     if not math.isfinite(v):
         return None, "corrupt"
-    return {"since": v, "last": v, "expired": False}, None
+    return {"since": v, "last": v, "expired": _fleet_expired_mark(path)}, None
 
 
 def _fleet_hold_write(path, value, merge=False):
@@ -1010,10 +1074,13 @@ def _fleet_hold_write(path, value, merge=False):
       읽기→판정→쓰기가 겹칠 때 늦은 쓰기가 남의 `expired=True` 를 되돌리면 이미 공개된 완화가
       취소돼 차단이 되살아난다(봉인표 ③ 역행).
     ★정직 표기: 이것은 **완화**이지 직렬화가 아니다 — 재읽기와 replace 사이에도 창은 남는다.
-      다만 `since` 는 arm 경로에서만 앞으로 움직이므로, 잃어버린 갱신의 손해는 '한 호출이 다시
-      hard 를 본다' 로 유계이고 다음 호출이 `now-since` 로 스스로 회복한다. 잠금(javis_lock)을
-      들이지 않은 이유: 게이트는 부트 체인에서 죽으면 안 되는 경로라 새 실패 모드(잠금 획득 실패·
-      Windows 백엔드 차이)를 늘리는 값이 이 이득보다 비싸다."""
+      그 창에서 잃어버릴 수 있는 것은 이제 `since`/`last` 뿐이고(손해 = '한 호출이 다시 hard 를
+      본다' · 다음 호출이 `now-since` 로 스스로 회복), **`expired` 는 이 레코드가 아니라 생성 전용
+      표식이 지킨다**(R3 · `_fleet_expired_mark_path`). 잠금을 들이지 않은 이유는 그 함수 주석에
+      있다 — 요지는 ⓐ부트 체인에 새 실패 모드를 늘리지 않는다 ⓑWindows 에 flock 이 없다
+      ⓒ직렬화해도 '타임아웃으로 만료를 공개한 호출' 의 공개는 파일에 남지 않는다(codex 반례).
+    ★쓰기가 `expired=True` 를 담고 있으면 **표식을 먼저 세운다**: 레코드만 True 인 상태로 남으면
+      다음 경합이 그것을 되돌릴 수 있다(그 경로가 바로 이 라운드의 결함이었다)."""
     if not isinstance(value, dict):
         value = {"since": float(value), "last": float(value), "expired": False}
     rec = {"v": FLEET_HOLD_RECORD_V, "since": float(value["since"]),
@@ -1025,6 +1092,9 @@ def _fleet_hold_write(path, value, merge=False):
             rec["since"] = min(rec["since"], cur["since"])
             rec["last"] = max(rec["last"], cur["last"])
             rec["expired"] = bool(rec["expired"] or cur["expired"])
+    if rec["expired"]:
+        # 표식이 진실의 보관소다 — 레코드의 비트는 그 사본(구 판본 호환·진단 가독성)일 뿐이다.
+        _fleet_expired_mark_set(path)
     tmp = None
     try:
         d = os.path.dirname(path)
@@ -1070,6 +1140,11 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
       · ★만료는 **저장된 상태**다(R2 리뷰 major · codex B1 ①): 종전은 매 호출 `now - since` 로
         재계산해서, 시계가 2초만 뒤로 가도 만료가 풀리고 차단이 되살아났다(저장값 1000·now=1901 →
         만료 / now=1899 → 다시 차단). 이제 한 번 만료하면 `below` 관측 전까지 만료다.
+      · ★그리고 그 저장은 **가변 레코드가 아니라 생성 전용 표식**이다(R3 · 판정자 핀 1b/1c/1d ·
+        codex blocking): 레코드 안의 비트는 '읽기→판정→교체' 의 잃어버린 갱신으로 되돌려졌다 —
+        A 의 낡은 `expired=False` 가 B 가 **이미 호출자에게 공개한** 만료를 덮었고, 이어진 시계
+        역행이 `below` 없이 재무장을 불러 899초를 다시 막았다. 생성 전용 표식은 덮어쓸 내용이
+        없어 그 경합이 원리적으로 불가능하다. 표식은 `below` 에서만 지워진다.
       · ★관측 공백(`now - last > 상한`)은 사유에 `_stale` 로 남긴다 — 그 구간에 실제로 막힌 호출은
         없으므로 `hold` 수치를 '차단한 시간' 으로 읽으면 안 된다(R2 리뷰 minor · 정직 표기).
     ★부작용 경계: `override` 가 주어지면 파일을 **읽지도 쓰지도 않는다**(self-test·검체 밀폐)."""
@@ -1090,6 +1165,10 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
             # 지우지 못했으면 그렇게 적는다 — 다음 hard 가 남은 래치 때문에 **더 일찍** 만료된다
             # (방향은 ③ 안전이지만 '연속 보류' 의 의미가 달라지므로 침묵하지 않는다).
             ok = False
+        # ★만료 표식도 여기서만 지워진다(R3). 못 지우면 그 축은 다음 포화에서 처음부터 권고(soft)
+        #   로 관측된다 — 방향은 **덜 막음**이라 §3-3 이 허용하는 쪽이고, 침묵하지 않고 사유에 적는다.
+        if not _fleet_expired_mark_clear(path):
+            ok = False
         try:
             os.remove(_fleet_hold_legacy_path())     # R1 잔재 청소(best-effort · 판정 무관)
         except OSError:
@@ -1108,6 +1187,12 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
         return hold, ("expired_stale" if stale else "expired"), True
     if rec is None or rec["since"] > now + FLEET_HOLD_FUTURE_SLACK_S:
         # 부재·파손·미래 저장값(시계 역행) → 지금 무장. 쓰기 실패는 유계 증명 불능이다.
+        # ★R3: **표식이 살아 있으면 무장이 아니라 만료다.** 레코드를 잃었거나(부재·파손) 시계가
+        #   뒤로 갔더라도 `below` 는 관측되지 않았고, 그 사이 만료는 이미 호출자에게 공개됐다.
+        #   여기서 재무장하면 그 공개가 취소되고 상한만큼이 다시 막힌다(판정자 핀 1c).
+        if _fleet_expired_mark(path):
+            _fleet_hold_write(path, {"since": now, "last": now, "expired": True}, merge=True)
+            return 0.0, "expired", True
         ok = _fleet_hold_write(path, {"since": now, "last": now, "expired": False})
         return (0.0 if ok else None), ("armed" if ok else "unbounded_io"), (not ok)
     # 허용오차 안의 '미래' 저장값은 음수 경과를 만든다 — 0 으로 죈다(음수 보류초는 뜻이 없다).
@@ -1118,6 +1203,12 @@ def _fleet_hard_hold(state, override=None, now=None, thr=None):
                            merge=True)
     if not ok:
         return hold, "unbounded_io", True
+    # ★R3(codex "파일=True·반환=False 가 가능하다"): 쓰기 뒤 **표식을 되읽어** 반환값을 맞춘다.
+    #   표식은 단조(생성 전용)라 이 되읽기는 뜻이 있다 — 가변 레코드의 되읽기와 달리 남의 갱신을
+    #   잃어버릴 수 없다. 우리가 `held` 를 계산하는 사이 다른 호출이 만료를 공개했다면 그 완화가
+    #   이 호출에도 보여야 한다(만료는 모든 호출자에게 동일하게 보인다는 계약).
+    if not expired and _fleet_expired_mark(path):
+        expired, stale = True, (now - rec["last"]) > FLEET_CPU_HARD_MAX_HOLD_SECS
     if expired:
         return hold, ("expired_stale" if stale else "expired"), True
     return hold, ("held_stale" if stale else "held"), False
@@ -2377,7 +2468,7 @@ def _self_test_body(fails):
     # (g) `_fleet_cpu_percent` 순수 핀 — 합산·무매칭 0.0·형상 불일치·함대 행 파손·NaN
     #     ★열 계약이 `pid pcpu command` 로 바뀌었다(자기 제외를 PID 로 하기 위해 · R1 blocking 1).
     L = ["  101  10.5 /usr/local/bin/cysd --socket /x",
-         "  102   4.5 /Users/u/.local/bin/claude --foo",
+         "  102   4.5 /Users/user/.local/bin/claude --foo",
          "  103   1.0 /usr/bin/mediaanalysisd",
          "  104   2.0 /opt/serena --transport stdio",
          "  105   9.9 python3 /w/bin/javis_resource_gate.py check"]
@@ -2431,20 +2522,20 @@ def _self_test_body(fails):
         got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
         chk(got == (0.0, None), "B2 오탐 재발(%s): %r → %r" % (tag, cmd_, got))
     # (g4) ★진짜 함대 형상은 **전부 매칭**이어야 한다(과소계상 반대 방향의 음성 대조).
-    for cmd_, tag in ((" 8  10.0 /Users/u/.local/share/claude/versions/2.1.261 -p", "버전 경로 직접 exec"),
+    for cmd_, tag in ((" 8  10.0 /Users/user/.local/share/claude/versions/2.1.261 -p", "버전 경로 직접 exec"),
                       (" 8  10.0 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                        "npm 번들 node 형상"),
-                      (" 8  10.0 /Users/u/.codex/bin/codex-darwin-arm64 --child", "codex vendor native"),
+                      (" 8  10.0 /Users/user/.codex/bin/codex-darwin-arm64 --child", "codex vendor native"),
                       (" 8  10.0 uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server",
                        "uvx 온디맨드 serena"),
                       (" 8  10.0 /usr/local/bin/cysd --socket /x", "데몬"),
                       # ★실측 형상(2026-09-08 이 기계) — 셋 다 R1 초안에서 **놓쳤던** 것들이다.
                       (" 8  10.0 /Applications/cys.app/Contents/MacOS/cysd",
                        "앱 번들 안의 우리 데몬(정확 이름이 번들 배제보다 우선)"),
-                      (" 8  10.0 node /Users/u/.local/bin/codex "
+                      (" 8  10.0 node /Users/user/.local/bin/codex "
                        "--dangerously-bypass-approvals-and-sandbox resume --last",
                        "node 래퍼가 실행하는 codex(비 .js 경로)"),
-                      (" 8  10.0 /Users/u/.local/lib/node_modules/@openai/codex/node_modules/"
+                      (" 8  10.0 /Users/user/.local/lib/node_modules/@openai/codex/node_modules/"
                        "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
                        "codex vendor native(basename 이 codex 가 아니다)"),
                       (" 8  10.0 claude --dangerously-skip-permissions", "맨 claude"),
@@ -2453,9 +2544,9 @@ def _self_test_body(fails):
                       (" 8  10.0 uv run serena start-mcp-server", "런처 하위 명령 1회 건너뛰기"),
                       (" 8  10.0 uvx --from serena-agent==1.5.3 serena", "긴 옵션 값 건너뛰기"),
                       # ★실측 2차(2026-09-08) — R1 1차 조임이 **놓쳤던** 두 형상
-                      (" 8  10.0 node /Users/u/.local/bin/codex exec -m gpt-6-astra -s read-only",
+                      (" 8  10.0 node /Users/user/.local/bin/codex exec -m gpt-6-astra -s read-only",
                        "대상 프로그램의 인자에 -m 이 있는 형상(코드모드 판정은 순서를 본다)"),
-                      (" 8  10.0 /Users/u/.local/bin/uv tool uvx --python 3.13 "
+                      (" 8  10.0 /Users/user/.local/bin/uv tool uvx --python 3.13 "
                        "--from serena-agent==1.5.3 serena start-mcp-server",
                        "중첩 런처(uv → tool → uvx → serena)")):
         got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
