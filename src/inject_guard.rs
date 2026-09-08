@@ -477,6 +477,26 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
     }
 }
 
+/// ★(0.14.31 · 독립 재유도 H2-B) [`Observed::cli_version`] **래치의 갱신 규칙**(순수).
+///
+/// 부트 루프가 매 틱 부른다: `seat = latch_seat_version(seat, &delta_text, screen)`.
+///
+/// 【규칙 둘, 그리고 각각의 이유】
+///   · **한 번 잡으면 바꾸지 않는다**(sticky). 이 기동의 배너는 좌석이 기동 직후 스스로 찍은
+///     줄이고, 그 뒤에 화면에 들어오는 같은 문면은 에이전트 출력·잔상일 수 있다. 래치가 흔들리면
+///     "버전이 오락가락하는 좌석" 이 되어 판정이 틱마다 뒤집힌다.
+///   · **누적 델타를 화면보다 먼저 본다.** 화면(vt100 그리드)의 배너는 관문이 그려지면 밀려나지만,
+///     이 부트의 누적 델타(`since_line` 고정)에서는 밀려나지 않는다. 화면만 보면 드리프트 거부가
+///     한 틱짜리가 되고 다음 틱엔 미상으로 열린다(codex 설계 검토 3 — 이 규칙이 그 구멍을 닫는다).
+///
+/// 【실패 방향】 못 잡으면 `None` = 미상이고, 미상은 오늘 확인을 막지 않는다(종전과 같음).
+/// 잘못 잡으면(가짜 배너) 불일치로 접혀 **보류**다 — 조이는 쪽이다.
+pub fn latch_seat_version(latched: Option<String>, delta: &str, screen: &str) -> Option<String> {
+    latched.or_else(|| {
+        first_run_gates::banner_version(delta).or_else(|| first_run_gates::banner_version(screen))
+    })
+}
+
 /// 관문 하나의 **질문형 needle** 만으로 화면을 판별한다(위젯 서명 AND 를 요구하지 않는다).
 ///
 /// ★[`first_run_gates::Gate::matches`](needle ∧ 위젯 서명)와 술어를 나누는 이유 — **쓰임이 둘**이고
@@ -1695,5 +1715,46 @@ mod tests {
                 "노브({guard_off},{readiness_legacy})가 미실측 버전 화면의 확인을 열었다"
             );
         }
+    }
+
+    /// ★(0.14.31 · 독립 재유도 H2-B) 기동 래치의 **갱신 규칙** — 이 규칙이 없으면 드리프트 거부가
+    /// 한 틱짜리가 된다(배너가 관문 렌더에 밀려나는 순간 미상으로 열린다).
+    #[test]
+    fn seat_version_latch_is_sticky_and_prefers_the_cumulative_delta() {
+        let banner = "Welcome to Claude Code v2.1.263\n";
+        // ① 처음엔 델타에서 잡는다.
+        assert_eq!(
+            latch_seat_version(None, banner, fixtures::FOLDER_TRUST).as_deref(),
+            Some("2.1.263")
+        );
+        // ② 델타에 없으면 화면에서 잡는다(폴백).
+        assert_eq!(
+            latch_seat_version(None, "", banner).as_deref(),
+            Some("2.1.263")
+        );
+        // ③ 둘 다 배너가 없으면 미상 그대로(추정 금지).
+        assert_eq!(latch_seat_version(None, "", fixtures::FOLDER_TRUST), None);
+        // ④ ★한 번 잡은 값은 바뀌지 않는다 — 화면·델타가 나중에 무엇을 그리든.
+        let held = Some("2.1.241".to_string());
+        assert_eq!(
+            latch_seat_version(held.clone(), banner, banner).as_deref(),
+            Some("2.1.241"),
+            "래치가 흔들리면 같은 좌석의 판정이 틱마다 뒤집힌다"
+        );
+        // ⑤ 그리고 그 래치는 확인 경계에서 **실제로 문다**(배너가 화면에서 사라진 뒤에도).
+        let gs = gates();
+        let latched = latch_seat_version(None, banner, "");
+        let o = Observed {
+            screen: fixtures::FOLDER_TRUST, // 화면에는 배너가 없다
+            gates: &gs,
+            awakened: Some(false),
+            guard_off: false,
+            readiness_legacy: false,
+            cli_version: latched.as_deref(),
+        };
+        assert!(
+            !confirm_allowed(&o, GATE_FOLDER_TRUST),
+            "래치가 물지 않으면 이 규칙은 장식이다"
+        );
     }
 }

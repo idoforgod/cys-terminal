@@ -709,7 +709,10 @@ enum Command {
         ///
         /// ★`source` 는 **출처**(어떻게 만들어진 코퍼스인가)이지 봉투의 모드가 아니다.
         ///   되먹이려면 `override_envelope` 를 통째로 `agents.json` 의 `first_run_gates` 에 넣어라.
-        /// ★`policy_enforcement.enforced=false` — `policy` 열은 진단이지 집행이 아니다.
+        /// ★`policy_enforcement` — `policy` 열이 **어디까지 집행되는가**. 오늘
+        ///   `state="version_drift_only"`: 버전 **불일치**면 그 관문의 자동확인 Return 이 0발이고
+        ///   (= 사람 1회 필요), **미상**은 여전히 통과하며, `allowed` 의 down 다발 전송은 배선 0 이다.
+        ///   `enforced` 는 **판정 전량** 집행 여부라 부분 집행에서 `false` 다(`axes` 를 볼 것).
         #[arg(long)]
         json: bool,
         /// 어댑터 이름 — 코드 정본 코퍼스는 **claude 실측**이다(`MEASURED_ON` 도 claude 버전).
@@ -11879,10 +11882,8 @@ fn boot_agent_on_surface(
         // ★(H2-B) 버전 배너 래치 — **처음 본 것 하나**만 잡는다(이 기동의 배너는 좌석이 스스로
         //   찍은 첫 줄이다). 뒤에 다른 배너가 섞여 들어와도 확인 경계가 화면 배너 전량을 함께
         //   대조하므로(합집합) 놓치지 않는다.
-        if seat_cli_version.is_none() {
-            seat_cli_version = cys::first_run_gates::banner_version(&delta_text)
-                .or_else(|| cys::first_run_gates::banner_version(text));
-        }
+        seat_cli_version =
+            cys::inject_guard::latch_seat_version(seat_cli_version, &delta_text, text);
         // ① 기동 실패 — **신규 출현분에서만** 판정한다(잔존 에러 텍스트로 새 기동을 죽이지 않는다).
         if screen_shows_launch_failure(&delta_flat) {
             // ★(U-11) 화면이 기동 실패를 **확증**한 유일한 지점 — 종전 귀결(close)을 그대로
@@ -24127,6 +24128,19 @@ mod tests {
             cys::first_run_gates::ACTION_POLICY_ENFORCEMENT,
             cys::first_run_gates::PolicyEnforcement::VersionDriftOnly,
             "배선과 상수가 어긋났다 — 상수만 움직이는 거짓 안심(또는 반대 방향의 거짓말)"
+        );
+        // ★그리고 **증거 생산자**가 이 파일에 살아 있다. 확인 경계가 아무리 옳게 판정해도 부트 루프가
+        //   래치를 만들지 않으면 증거는 화면 한 틱짜리가 되고, 배너가 관문 렌더에 밀려나는 순간
+        //   드리프트 거부가 저절로 풀린다(변이검증 M7: 이 두 줄을 지웠을 때 어떤 검체도 물지 않았다).
+        //   규칙 자체의 집행은 `inject_guard::tests::seat_version_latch_is_sticky_and_prefers_the_cumulative_delta`.
+        assert!(
+            prod.contains("latch_seat_version(seat_cli_version, &delta_text, text)"),
+            "부트 루프가 좌석 기동 버전 래치를 더는 만들지 않는다 — 확인 경계의 버전 축이 화면 \
+             한 틱짜리 증거로 되돌아갔다"
+        );
+        assert!(
+            prod.contains("cli_version: seat_cli_version.as_deref()"),
+            "래치를 만들기만 하고 확인 경계에 넘기지 않는다 — 판정 입력에 닿지 않는 관측은 장식이다"
         );
         // 그리고 그 사실이 **산출물에 실린다**(사람이 코드를 읽지 않아도 된다).
         let r = cys::first_run_gates::resolve_with(None, true);
