@@ -2432,6 +2432,12 @@ pub struct Daemon {
     /// 내용을 되살리지 못한다). 소비자: `alert_route` 의 인계 조정 — 큐에 없다는 관측을
     /// "큐가 소비했다" 로 읽는 판단을 이 비트가 막는다.
     pub queue_restore_incomplete: AtomicBool,
+    /// ★(0.14.31 · 수렴 R2 · triage X4 잔여) **판독하지 못했는데 옆으로 치우지도 못한 WAL 이름.**
+    /// `queue_restore_incomplete` 는 살아남은 인계 사본을 지키지만 **읽지 못한 WAL 자체**는
+    /// 지키지 못한다: 보존이 실패한 뒤에도 `persist_queue_state` 는 30초마다 그 이름 위에
+    /// (비었거나 부분 복원된) 메모리 큐를 원자 치환했고, 그 순간 마지막 사본이 사라졌다.
+    /// 이 집합이 비어야 그 이름에 대한 쓰기가 허용된다 — 매 영속이 보존을 다시 시도한다.
+    pub queue_wal_unpreserved: Mutex<std::collections::BTreeSet<&'static str>>,
     pub config: Config,
     pub socket_path: PathBuf,
     pub started_at: f64,
@@ -3122,10 +3128,13 @@ fn load_queue_file(dir: &std::path::Path, name: &str) -> QueueWalRead {
 /// ★자기치유 전소 차단: 판독 실패 뒤에도 `persist_queue_state` 는 30초마다 그 이름 위에
 /// 메모리(=비어 있거나 부분 복원된) 큐를 원자 치환한다 — 그 순간 못 읽은 원본의 마지막 사본이
 /// 사라진다. 치우기에 실패하면 아무것도 하지 않는다(원본을 건드리지 않는 쪽으로 틀린다).
-fn preserve_unreadable_queue_wal(dir: &std::path::Path, name: &str) {
+/// 반환: **치웠는가**(치울 것이 없던 경우도 성공). `false` 는 "판독하지 못한 원본이 그 이름
+/// 그대로 남아 있다" 는 뜻이고, 그 동안 그 이름에 대한 쓰기는 [`Daemon::wal_write_blocked`] 가
+/// 거절한다 — 보존 실패를 로그 한 줄로 흘려보내면 뒤이은 성공적인 영속이 원본을 덮는다.
+fn preserve_unreadable_queue_wal(dir: &std::path::Path, name: &str) -> bool {
     let src = dir.join(name);
     if !src.exists() {
-        return;
+        return true; // 치울 것이 없다 = 덮어쓸 원본도 없다
     }
     let base = format!("{name}.corrupt-{}-{}", now_epoch() as u64, std::process::id());
     let mut target = dir.join(&base);
@@ -3137,15 +3146,43 @@ fn preserve_unreadable_queue_wal(dir: &std::path::Path, name: &str) {
     }
     if target.exists() {
         eprintln!("[cysd] 큐 WAL '{name}' 보존 실패(격리 이름이 모두 선점됨) — 원본 무접촉");
-        return;
+        return false;
     }
     match std::fs::rename(&src, &target) {
-        Ok(()) => eprintln!(
-            "[cysd] 큐 WAL '{name}' 을 판독하지 못해 '{}' 로 보존했다 — 다음 영속이 원본을 덮지 않는다",
-            target.display()
-        ),
-        Err(e) => eprintln!("[cysd] 큐 WAL '{name}' 보존 실패({e}) — 원본 무접촉"),
+        Ok(()) => {
+            eprintln!(
+                "[cysd] 큐 WAL '{name}' 을 판독하지 못해 '{}' 로 보존했다 — 다음 영속이 원본을 덮지 않는다",
+                target.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[cysd] 큐 WAL '{name}' 보존 실패({e}) — 원본 무접촉(그 이름에 대한 쓰기를 거절한다)");
+            false
+        }
     }
+}
+
+/// ★(0.14.31 · 수렴 R2 · triage X4 잔여) **보존하지 못한 WAL 위에는 쓰지 않는다.**
+///
+/// 판정: 그 이름이 아직 미보존 집합에 있으면 **먼저 보존을 다시 시도**하고(외부 핸들이 닫힌
+/// 뒤라면 여기서 성공한다), 그래도 못 치우면 사유를 돌려준다 → 호출부가 그 치환을 거절한다.
+/// 순수 판정으로 뽑아 두어 검체가 데몬 없이도 같은 자리를 잰다.
+fn wal_write_verdict(
+    unpreserved: &mut std::collections::BTreeSet<&'static str>,
+    dir: &std::path::Path,
+    name: &'static str,
+) -> Option<String> {
+    if !unpreserved.contains(name) {
+        return None;
+    }
+    if preserve_unreadable_queue_wal(dir, name) {
+        unpreserved.remove(name);
+        return None;
+    }
+    Some(format!(
+        "판독하지 못한 큐 WAL '{name}' 을 아직 옆으로 치우지 못했다 — 그 위에 (복원하지 못한) 메모리 큐를 쓰지 않는다"
+    ))
 }
 
 impl Daemon {
@@ -3246,11 +3283,13 @@ impl Daemon {
         let queue_restore_incomplete = active_wal.incomplete || expired_wal.incomplete;
         // 보존(옆으로 치우기)은 **한 줄도 해석하지 못한** 파일에만 한다 — 파싱에 성공한 파일은
         // 해석 가능한 내용이 전부 메모리에 있고 다음 영속이 그것을 되쓴다.
-        if active_wal.unreadable {
-            preserve_unreadable_queue_wal(&dir, "queue-state.json");
+        let mut queue_wal_unpreserved: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        if active_wal.unreadable && !preserve_unreadable_queue_wal(&dir, "queue-state.json") {
+            queue_wal_unpreserved.insert("queue-state.json");
         }
-        if expired_wal.unreadable {
-            preserve_unreadable_queue_wal(&dir, "queue-expired.json");
+        if expired_wal.unreadable && !preserve_unreadable_queue_wal(&dir, "queue-expired.json") {
+            queue_wal_unpreserved.insert("queue-expired.json");
         }
         let restored_qentries = active_wal.rows;
         let mut restored_expired = expired_wal.rows;
@@ -3342,6 +3381,7 @@ impl Daemon {
             queue_tick_at: Mutex::new(None),
             queue_persist_dirty: AtomicBool::new(false),
             queue_restore_incomplete: AtomicBool::new(queue_restore_incomplete),
+            queue_wal_unpreserved: Mutex::new(queue_wal_unpreserved),
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
@@ -3718,6 +3758,18 @@ impl Daemon {
             }
         };
         let write_file = |name: &'static str, rows: &Vec<serde_json::Value>| -> Result<(), String> {
+            // ★(수렴 R2 · triage X4 잔여) 보존하지 못한 판독 불능 WAL 위에는 **쓰지 않는다**.
+            //   보존을 먼저 다시 시도하고(핸들이 닫혔으면 여기서 성공한다), 그래도 못 치우면
+            //   이 치환을 거절한다 — 그 파일이 그 사실들의 마지막 사본이다.
+            {
+                let mut set = self
+                    .queue_wal_unpreserved
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(why) = wal_write_verdict(&mut set, &dir, name) {
+                    return Err(why);
+                }
+            }
             let content = serde_json::to_string(rows).map_err(|e| format!("{name} 직렬화 실패: {e}"))?;
             crate::governance::write_json_atomic(&dir, name, &content)
                 .map_err(|e| format!("{name} 원자 치환 실패: {e}"))
@@ -9755,6 +9807,72 @@ mod tests {
             fallback.get("role"),
             Some(&Value::Null),
             "역할 미상도 키는 보존"
+        );
+    }
+
+    /// ★(수렴 R2 · triage X4 잔여) **보존에 실패한 WAL 위에는 다음 영속이 쓰지 못한다.**
+    ///
+    /// 종전 보존은 실패해도 로그 한 줄만 남기고 성공 여부를 돌려주지 않았다 — 그 뒤
+    /// `persist_queue_state` 가 그 이름 위에 (복원하지 못한) 메모리 큐를 원자 치환하면
+    /// 판독하지 못한 원본의 마지막 사본이 사라진다. 막는 방향: **치우기 전에는 쓰지 않는다**.
+    #[cfg(unix)]
+    #[test]
+    fn converge_x4_unpreserved_wal_refuses_the_next_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-converge-walblock-{}-{}",
+            std::process::id(),
+            now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("queue-state.json");
+        std::fs::write(&src, "판독하지 못한 원본").unwrap();
+        // 치우기(rename)를 실패시킨다 — 디렉터리 쓰기 권한을 뗀다.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dir.join(".probe"), "x").is_ok() {
+            // root 등으로 권한이 무의미한 환경 — 전제가 서지 않으면 재기 자체를 하지 않는다.
+            let _ = std::fs::remove_file(dir.join(".probe"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut set: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::from(["queue-state.json"]);
+        assert!(
+            wal_write_verdict(&mut set, &dir, "queue-state.json").is_some(),
+            "치우지 못한 WAL 위에 쓰기를 허용했다 — 그 치환이 마지막 사본을 지운다"
+        );
+        // 외부 핸들이 닫힌 뒤: 같은 자리가 보존을 **다시 시도**해 성공하고, 그때 쓰기가 열린다.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            wal_write_verdict(&mut set, &dir, "queue-state.json").is_none(),
+            "치운 뒤에도 쓰기를 막는다(영구 정지)"
+        );
+        assert!(!src.exists(), "보존했다면서 원본이 그 이름 그대로 남아 있다");
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| std::fs::read_to_string(e.path())
+                .map(|c| c.contains("판독하지 못한 원본"))
+                .unwrap_or(false));
+        assert!(kept, "치웠다면서 바이트가 사라졌다");
+        // 음성 대조: 미보존 집합에 없는 이름은 처음부터 막지 않는다(결측형을 값으로 읽지 않는다).
+        assert!(wal_write_verdict(&mut set, &dir, "queue-expired.json").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ── 소스 핀: **영속 경로가 그 판정을 실제로 거친다**(판정만 두고 배선을 잊으면 무효다).
+        let src = include_str!("state.rs");
+        let body = {
+            let i = src.find("pub fn persist_queue_state(&self)").expect("persist 본체");
+            let rest = &src[i..];
+            let end = rest.find("\n    }\n").expect("persist 본체 끝");
+            &rest[..end]
+        };
+        let gate = body.find("wal_write_verdict").expect("영속의 쓰기 경로가 보존 판정을 거치지 않는다");
+        let serialize = body.find("serde_json::to_string(rows)").expect("직렬화 지점");
+        assert!(
+            gate < serialize,
+            "보존 판정이 직렬화·치환 뒤에 온다 — 그 순서로는 원본이 이미 덮인다"
         );
     }
 }
