@@ -578,7 +578,19 @@ def git_sub_is_write(sub, sub_args):
     return True
 
 
-WRAPPERS = {"command", "exec", "env", "sudo", "nohup", "time", "xargs"}
+WRAPPERS = {"command", "exec", "env", "sudo", "nohup", "time", "xargs", "busybox"}
+# ★I1 수렴: `busybox` 는 멀티콜 런처라 뒤 토큰이 진짜 명령이다(`busybox sh -c …`·`busybox rm`).
+#   래퍼로 접어야 그 뒤가 명령 자리로 남는다(거부 방향으로만 넓어진다).
+# ★래퍼의 **값을 먹는 옵션** — 값까지 건너뛰지 않으면 그 값이 명령 이름으로 소비되어 진짜 명령이
+#   인자 자리로 밀린다(`env -u CYS_ROLE sh -c '…'` 실측: 종전 판은 `CYS_ROLE` 을 명령으로 봤다).
+#   `git` 의 GIT_GLOBAL_VALUE_OPTS 와 같은 규율이며, 방향은 **거부 전용**이다.
+WRAPPER_VALUE_OPTS = {
+    "env": {"-u", "-C", "-S", "-P"},
+    "sudo": {"-u", "-g", "-C", "-p", "-r", "-t", "-U", "-h"},
+    "xargs": {"-n", "-P", "-I", "-E", "-d", "-L", "-s", "-a"},
+    "time": {"-o", "-f"},
+    "exec": {"-a"},
+}
 
 # 검증 대상 외 허용 경로 접두(과도차단 방지 — reviewer tmp/로그 write 허용).
 ALLOW_PATH_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/")
@@ -1259,7 +1271,77 @@ def _tokenize(command):
         return None
 
 
-def bash_write_reason(command):
+# ★I1 수렴(판정관 T1a·T1b·T1c · 2026-09-08) — reviewer 의 write 판정은 **denylist** 라
+#   `sh -c '<쓰기>'` · `eval "<쓰기>"` 가 **게이트가 이미 막고 있는 바로 그 리다이렉트를 한 겹
+#   감싼 것**만으로 통과했다(CSO 는 allowlist 라 같은 문자열을 이미 막는다 — 구멍은 reviewer
+#   한쪽이었다). 실측 귀결: 집행 대상이 남의 좌석 역할 캐시에 `cache-none` 을 심어 CSO 의
+#   `cys-dept launch/down/rotate`(exit 7)·`javis_org apply/destroy`(exit 3)를 잠근다.
+#   그래서 셸 실행기의 `-c` 인자와 `eval` 인자를 **원문으로 복원해 새 셸 문맥으로 재귀 판정**한다
+#   (codex 설계 비평 (a): 토큰을 그대로 재귀시키면 센티널 충돌로 정상 tmp 쓰기까지 거부된다 —
+#    `_txt` 로 복원한 **실행 문자열**을 `bash_write_reason` 에 다시 먹인다).
+#   ★근본한계(정직 · 헤더 규율): `python3 -c`·`perl -e`·`awk`·`node`·`ruby` 같은 인터프리터,
+#     외부 스크립트 파일, 변수로 만든 실행기, stdin 스크립트, 로그인 셸의 시작 파일은 이 재귀가
+#     닿지 못한다. 이것은 우회 한 겹을 벗기는 **보강**이지 봉인이 아니다 — 진짜 경계는 실행
+#     격리(별도 uid·샌드박스)이고, 캐시 층의 진짜 경계는 파일이 아니라 데몬 직접 응답이다
+#     (그래서 I5 의 통과 근거를 `SOURCE_DAEMON` 으로 좁혔다).
+#   ★수용하는 보수성: 재귀는 **정적**이라 실행되지 않는 갈래도 센다
+#     (`sh -c 'if false; then rm /x; fi'` 는 거부된다). 방향이 거부이므로 §3-3 안이다.
+SHELL_EXECUTORS = {"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "yash"}
+NESTED_SHELL_MAX_DEPTH = 3
+
+
+def _shell_exec_name(tok):
+    """토큰이 **셸 실행기**를 가리키면 그 이름, 아니면 None(`bash.exe` 도 같은 이름으로 본다)."""
+    base = os.path.basename(_txt(tok).replace("\\", "/")).lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base if base in SHELL_EXECUTORS else None
+
+
+def _nested_shell_script(tokens, i):
+    """(script|None, next_index, err|None) — `sh …-c <문자열>` 의 스크립트 인자를 집는다.
+
+    `-c` 하나만 보지 않는다: **묶음 옵션**(`-lc`·`-ec`·`-xc`)도 `c` 를 담으면 다음 토큰이
+    스크립트다(로컬 dash·bash·zsh 실측). 옵션이 아닌 토큰(스크립트 **파일**)을 먼저 만나면
+    재귀 대상이 없다(외부 파일 = 근본한계). 옵션은 있는데 인자가 없으면 **거부**한다.
+    """
+    j = i + 1
+    n = len(tokens)
+    while j < n:
+        t = tokens[j]
+        if is_separator(t) or _is_redirect_op(t):
+            return None, j, None
+        raw = _txt(t)
+        if raw == "--":
+            return None, j + 1, None
+        if raw.startswith("-") and len(raw) > 1:
+            if raw.startswith("--"):          # `--login` 류 긴 옵션(값은 `=` 로 붙는다)
+                j += 1
+                continue
+            if "c" in raw[1:]:
+                if (j + 1 >= n or is_separator(tokens[j + 1])
+                        or _is_redirect_op(tokens[j + 1])):
+                    return None, j + 1, ("셸 실행기의 `-c` 에 스크립트 인자가 없다 — 판정기가 "
+                                         "무엇이 실행되는지 볼 수 없으면 거부다")
+                return _txt(tokens[j + 1]), j + 2, None
+            j += 1
+            continue
+        return None, j, None                  # 스크립트 파일·인자 — 정적 재귀 대상이 아니다
+    return None, j, None
+
+
+def _eval_script(tokens, i):
+    """(script, next_index) — `eval` 의 인자 전부를 공백으로 이어 붙인 문자열(POSIX 규정)."""
+    parts = []
+    j = i + 1
+    n = len(tokens)
+    while j < n and not is_separator(tokens[j]) and not _is_redirect_op(tokens[j]):
+        parts.append(_txt(tokens[j]))
+        j += 1
+    return " ".join(parts), j
+
+
+def bash_write_reason(command, _depth=0):
     """(write: bool, why|None) — `bash_has_write` 의 **사유를 잃지 않는** 판(R2 minor).
 
     ★왜 사유가 필요한가(claude 리뷰어): reviewer 경로의 deny 문면은 "producer 산출물 수정 금지"
@@ -1338,7 +1420,56 @@ def bash_write_reason(command):
             #   가 래퍼로 인식되지 않아 `rm` 이 인자 자리로 밀려 통과했다(아래 write 판정은
             #   이미 basename 을 쓴다 — 한 함수 안에서 두 모양이었다).
             if tok in WRAPPERS or base in WRAPPERS:
+                # ★래퍼 뒤의 **옵션**도 건너뛰며 명령 자리를 유지한다(I1): 종전엔 `env -i sh -c …`
+                #   의 `-i` 가 명령 이름으로 소비되어 그 뒤 `sh` 가 인자 자리로 밀렸다.
+                #   값을 먹는 옵션은 **값까지** 건너뛴다(`env -u CYS_ROLE sh -c …`).
+                #   방향은 거부 전용이다(명령이 새로 **보이게** 될 뿐 새 허용은 없다).
+                wname = base if base in WRAPPERS else tok
+                wvals = WRAPPER_VALUE_OPTS.get(wname, ())
                 i += 1
+                while i < n:
+                    nxt = tokens[i]
+                    if is_separator(nxt) or _is_redirect_op(nxt):
+                        break
+                    raw = _txt(nxt)
+                    if raw in wvals:
+                        i += 2
+                        continue
+                    if raw.startswith("-") and len(raw) > 1:
+                        i += 1
+                        continue
+                    break
+                continue
+            # ★I1: 셸 실행기의 `-c` 인자를 **새 셸 문맥으로 재귀 판정**한다.
+            _sx = _shell_exec_name(tok)
+            if _sx is not None:
+                script, nxt, err = _nested_shell_script(tokens, i)
+                if err:
+                    return True, err
+                if script is not None:
+                    if _depth + 1 > NESTED_SHELL_MAX_DEPTH:
+                        return True, ("중첩 셸 깊이 상한(%d) 초과 — 판정기가 끝까지 볼 수 없으면 "
+                                      "거부다" % NESTED_SHELL_MAX_DEPTH)
+                    _w, _why = bash_write_reason(script, _depth + 1)
+                    if _w:
+                        return True, "`%s -c` 안의 명령이 변형이다: %s" % (_sx, _why)
+                    i = nxt
+                    cmd_pos = False
+                    continue
+                cmd_pos = False
+                i += 1
+                continue
+            if _txt(tok) == "eval":
+                script, nxt = _eval_script(tokens, i)
+                if script.strip():
+                    if _depth + 1 > NESTED_SHELL_MAX_DEPTH:
+                        return True, ("중첩 셸 깊이 상한(%d) 초과 — 판정기가 끝까지 볼 수 없으면 "
+                                      "거부다" % NESTED_SHELL_MAX_DEPTH)
+                    _w, _why = bash_write_reason(script, _depth + 1)
+                    if _w:
+                        return True, "`eval` 인자가 변형이다: %s" % _why
+                i = nxt
+                cmd_pos = False
                 continue
             if base in WRITE_SHELL_BUILDERS:
                 if builder_is_write(base, tokens, i):
