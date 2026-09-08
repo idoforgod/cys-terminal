@@ -1022,6 +1022,16 @@ pub struct Surface {
     pub cwd: String,
     pub pid: u32,
     pub created_at: f64,
+    /// ★(0.14.31 · 독립 재유도 · codex major #10) 좌석 생성의 **단조 시각** — 경과는 이 값으로만
+    /// 잰다(`created_at` 은 보고·영속 전용). `Daemon.started_instant` 가 이미 세운 규약과 같다.
+    ///
+    /// 왜 필요한가: 신생 좌석 유예(`reclaim::NEW_SEAT_GRACE_SECS`)는 `now_epoch() - created_at`
+    /// 이라 **벽시계가 앞으로 뛰면 즉시 사라진다**. 실무 트리거는 NTP 스텝보다 **랩톱 절전/복귀**
+    /// 다: macOS 의 `Instant`(mach_absolute_time)는 절전 중 멈추지만 벽시계는 그만큼 뛴다 →
+    /// 방금 기동한 좌석이 "305초 된 빈 좌석"으로 보여 역할을 빼앗긴다(치명위험 ③).
+    /// 반대로 시계가 **뒤로** 밀리면 벽시계 나이가 음수가 되는데, 그 방향은 유예가 길어지는
+    /// 쪽(보류)이라 안전하다. 판정은 두 나이의 **작은 쪽**을 쓴다(§reclaim::is_candidate).
+    pub created_instant: std::time::Instant,
     /// RC-3 잔여(T2.1): 이 surface가 create_surface_with_env로 **env 주입**되어 생성됐는가.
     /// Windows node-recover가 기존 pane 재사용 전, pane env에 CLAUDE_CONFIG_DIR 등이 실려있는지
     /// (=순수 cmd 재기동이 안전한지) 판정하는 근거. env 미주입 pane(수동·구세션) 재사용 시 fail-closed.
@@ -1559,6 +1569,60 @@ impl Config {
                 .unwrap_or(false),
         }
     }
+}
+
+/// 계정 dir 을 **실제로 정하는** 호출자 env 키 — 이 둘 중 하나라도 데몬 해소값과 다르면
+/// "기록 = 실제 실행"이 아니다.
+///   · `CLAUDE_CONFIG_DIR` — claude 가 직접 읽는 값.
+///   · `CYS_ACCOUNT_DIR`  — [`cys::resolve_claude_config_dir`] 의 **1순위**이고, agents.json 의
+///     `${CYS_ACCOUNT_DIR:-…}` 가 그 값으로 전개돼 `CLAUDE_CONFIG_DIR` 이 된다.
+const ACCOUNT_DIR_ENV_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CYS_ACCOUNT_DIR"];
+
+/// 기본 계정 dir 의 **뿌리**를 갈아끼우는 키 — `resolve_claude_config_dir()` 의 폴백은
+/// `home_dir()/.cys/claude` 이고, agents.json 의 `${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}` 도
+/// 좌석 셸의 `$HOME` 으로 전개된다. 위 두 키가 없어도 이 키 하나로 계정이 갈릴 수 있다.
+const HOME_ENV_KEYS: [&str; 2] = ["HOME", "USERPROFILE"];
+
+/// 호출자 env 오버레이가 **계정 dir 을 갈아끼우지 않았는가** — `Surface.config_dir_trusted` 의 판정.
+///
+/// ★(0.14.31 · 독립 재유도 · codex blocking #2) 종전 판은 `k == "CLAUDE_CONFIG_DIR"` **정확
+/// 일치** 하나만 보고, 없으면 신뢰했다. 그 판정은 두 방향으로 뚫린다:
+///   ⓐ **다른 키** — `CYS_ACCOUNT_DIR` 은 검사 대상이 아닌데 계정 dir 해소의 1순위다.
+///      `surface.create` 는 호출자 env 에서 `CYS_SEAT_TOKEN` 하나만 거르고, 이 함수의 호출부는
+///      데몬이 넣은 `CYS_ACCOUNT_DIR` **뒤에** 호출자 env 를 덮어쓴다 → 기록은 데몬 계정 A,
+///      실제 실행은 B 인 좌석이 `config_dir_trusted=true` 로 남는다. reclaim 은 그 좌석을 A 의
+///      신뢰된 호출자로 인정한다(부서 계정 경계의 조용한 면제).
+///   ⓑ **대소문자** — Windows 의 env 생성기가 키를 소문자로 접는다
+///      (`vendor/portable-pty/src/cmdbuilder.rs` `EnvEntry::map_key`). 그 플랫폼에서
+///      `claude_config_dir` 는 곧 `CLAUDE_CONFIG_DIR` 인데 정확 일치 검사에는 걸리지 않는다.
+///
+/// 그래서 ① 두 키를 **모두** 보고 ② 비교는 **모든 호스트에서 ASCII 대소문자 무시**하며
+/// (unix 에서 비용 0 이고, 소문자 키를 정당하게 쓰는 호출 경로는 이 저장소에 없다)
+/// ③ 같은 키가 여러 표기로 오면 **그 전부가** 데몬 해소값과 같아야 한다.
+///
+/// ★③ 을 "마지막 값 승"으로 두면 안 된다(codex 설계비평 #6): unix 의 builder 는 대소문자를
+/// 접지 않으므로 `CLAUDE_CONFIG_DIR=/foreign` 뒤에 `claude_config_dir=/trusted` 를 얹으면
+/// **검사만 통과하고 실행 환경에서는 `/foreign` 이 이긴다**. 어느 호스트의 접기 규칙을
+/// 흉내내든 그 규칙과 어긋나는 순간 우회가 생기므로, 표기가 무엇이든 **하나라도 다르면
+/// 거짓**으로 접는다(과잉 차단은 무결합 = 안전 방향이다).
+/// 그리고 계정 dir 의 **뿌리**인 홈(`HOME`·`USERPROFILE`)도 같은 규율로 본다 — 두 키가 없어도
+/// `$HOME/.cys/claude` 전개가 달라지면 실제 계정이 갈린다(codex 설계비평 #7).
+/// 값이 데몬 값과 다르면 — 빈 문자열(=미설정 취급으로 기본값에 떨어지는 신고)이라도 —
+/// 표식을 세우지 않는다. 모르면 서지 않는 것이 이 표식의 계약이다(fail-closed).
+pub fn caller_env_keeps_config_dir(env: &[(String, String)], daemon_resolved: &str) -> bool {
+    env.iter().all(|(k, v)| {
+        if ACCOUNT_DIR_ENV_KEYS.iter().any(|key| k.eq_ignore_ascii_case(key)) {
+            // 값이 데몬 해소값과 같을 때만 통과한다. 빈 문자열(=미설정 취급으로 기본값에
+            // 떨어지는 신고)도 '같지 않으면 거짓'이다 — 그 신고가 정말 무해한지는 좌석의
+            // 실행 환경 전체를 봐야 알 수 있고, 여기서 우리는 그것을 모른다(fail-closed).
+            return v == daemon_resolved;
+        }
+        if let Some(key) = HOME_ENV_KEYS.iter().find(|key| k.eq_ignore_ascii_case(key)) {
+            // 홈은 **데몬 자신의 값**과 대조한다(계정 dir 이 아니라 그 뿌리다).
+            return std::env::var(key).ok().as_deref() == Some(v.as_str());
+        }
+        true
+    })
 }
 
 /// LANG 결정: 데몬 env → (macOS) 시스템 사용자 로케일 → en_US.UTF-8.
@@ -4078,18 +4142,11 @@ impl Daemon {
         //   않았을 때만 "기록 = 실제 실행"이라고 말할 수 있다. 그 표식이 없으면 reclaim 의
         //   인증 축이 **호출자가 정한 문자열**이 된다(§Surface.config_dir_trusted).
         let daemon_resolved = cys::resolve_claude_config_dir();
-        let env_config_dir = env
-            .iter()
-            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-            .map(|(_, v)| v.clone());
         let resolved_config_dir = claude_config_dir_override
             .clone()
             .unwrap_or_else(|| daemon_resolved.clone());
-        let config_dir_trusted = claude_config_dir_override.is_none()
-            && env_config_dir
-                .as_deref()
-                .map(|v| v == daemon_resolved)
-                .unwrap_or(true);
+        let config_dir_trusted =
+            claude_config_dir_override.is_none() && caller_env_keeps_config_dir(env, &daemon_resolved);
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -4265,6 +4322,8 @@ impl Daemon {
             cwd: cwd_str,
             pid,
             created_at: now_epoch(),
+            // 경과 측정 전용(§Surface.created_instant) — 벽시계 보정과 절전/복귀에 면역이다.
+            created_instant: std::time::Instant::now(),
             // (B5 · §2-8) 부트 논스·ack — arm 전에는 둘 다 None 이고, arm 은 explicit RPC 로만
             // 일어난다(A19-1 · 자동 arm 은 B4-R 러너와 함께 온다).
             boot_nonce: Mutex::new(None),
@@ -5490,6 +5549,51 @@ fn default_health_rules() -> Vec<HealthRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(독립 재유도 · codex blocking #2 · 설계비평 #6·#7) 계정 dir 인증 표식의 **진리표**.
+    ///
+    /// 이 표식이 서면 reclaim 은 그 좌석을 "계정 A 의 신뢰된 호출자"로 인정한다. 그러므로 표식은
+    /// **호출자 env 로 뒤집을 수 없어야** 한다. 아래 음성 대조가 각각 닫는 우회:
+    ///   ⓐ `CYS_ACCOUNT_DIR` — 계정 해소의 1순위(정확 키 검사가 못 보던 축).
+    ///   ⓑ 대소문자만 다른 키 — Windows 의 env 생성기가 소문자로 접어 하나로 만든다.
+    ///   ⓒ **순서 우회** — `CLAUDE_CONFIG_DIR=/foreign` 뒤에 `claude_config_dir=<정상>` 을 얹어
+    ///      "마지막 값"만 보는 검사를 속이는 형상. unix builder 는 두 키를 **둘 다** 남기므로
+    ///      실행 환경에서는 `/foreign` 이 이긴다 → 하나라도 다르면 거짓이어야 한다.
+    ///   ⓓ 홈 치환 — 위 두 키가 없어도 `$HOME/.cys/claude` 전개가 달라지면 계정이 갈린다.
+    #[test]
+    fn caller_env_cannot_forge_the_config_dir_trust_flag() {
+        const OK: &str = "/tmp/cys-trust-account";
+        const OTHER: &str = "/tmp/cys-trust-other";
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        // 기준선: 오염 없는 오버레이·같은 값 신고는 신뢰된다(이 검사가 기능을 죽이지 않는다).
+        assert!(caller_env_keeps_config_dir(&[], OK));
+        assert!(caller_env_keeps_config_dir(&[pair("CLAUDE_CONFIG_DIR", OK)], OK));
+        assert!(caller_env_keeps_config_dir(&[pair("CYS_ACCOUNT_DIR", OK)], OK));
+        assert!(
+            caller_env_keeps_config_dir(&[pair("CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1")], OK),
+            "무관한 env 키가 표식을 죽였다 — launch-agent 의 D5 벨트가 통째로 무결합이 된다"
+        );
+        // ⓐ·ⓑ·ⓒ·ⓓ 음성 대조.
+        for (label, env) in [
+            ("ⓐ CYS_ACCOUNT_DIR 갈아끼우기", vec![pair("CYS_ACCOUNT_DIR", OTHER)]),
+            ("ⓑ 소문자 키", vec![pair("claude_config_dir", OTHER)]),
+            ("ⓑ' 소문자 계정 키", vec![pair("cys_account_dir", OTHER)]),
+            (
+                "ⓒ 순서 우회(대문자 오염 + 소문자 정상)",
+                vec![pair("CLAUDE_CONFIG_DIR", OTHER), pair("claude_config_dir", OK)],
+            ),
+            (
+                "ⓒ' 순서 우회(역순)",
+                vec![pair("claude_config_dir", OK), pair("CLAUDE_CONFIG_DIR", OTHER)],
+            ),
+            ("ⓓ 홈 치환", vec![pair("HOME", "/tmp/cys-trust-elsewhere")]),
+            // 빈 문자열 = '미설정 취급' 신고. 실제로 무해한지는 좌석의 실행 환경 전체를 봐야
+            // 알 수 있고 여기서는 모른다 → 표식을 세우지 않는다(fail-closed).
+            ("빈 값 신고", vec![pair("CYS_ACCOUNT_DIR", "")]),
+        ] {
+            assert!(!caller_env_keeps_config_dir(&env, OK), "{label} 가 표식을 통과했다");
+        }
+    }
 
     // ── pid_alive: 생존 판정 단일 정의처(channels·deadman 위임 대상)의 unix 계약 핀 ──
     // windows arm(OpenProcess+WaitForSingleObject)은 이 호스트에서 컴파일 불가 — 정책 계약은

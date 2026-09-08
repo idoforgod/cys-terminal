@@ -12955,6 +12955,12 @@ fn run_reclaim_role(
                         "데몬이 이 좌석의 계정 dir(신뢰 출처)·작업 디렉터리를 확정하지 못했다 \
                          — 축 없이 역할을 옮기지 않는다"
                     }
+                    // ★(독립 재유도) 신고 `$PWD` 와 이 좌석의 **실제** cwd 가 다른 곳이다.
+                    //   신고는 좁히기만 하므로 둘이 어긋나면 만족하는 후보가 없다.
+                    "reported_cwd_conflict" => {
+                        "신고한 폴더와 이 좌석의 실제 작업 폴더가 다르다 — 신고로 다른 폴더의 \
+                         역할을 가져오지 않는다(그 폴더에서 시작하거나 `cys claim-role <역할>`)"
+                    }
                     "privileged_needs_optin" => {
                         "빈 좌석이 특권 역할(master·cso)이다 — 자동 경로는 그 문을 열지 않는다. \
                          사람이 `cys reclaim-role --auto --takeover-empty-seat` 로 명시하라"

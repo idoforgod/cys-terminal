@@ -87,30 +87,59 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       echo "■ 고지: 역할 판정 불가(데몬 미응답·응답 파손·데드라인) — 자동 역할 복구를 건너뛴다."
     fi
   else
+    # ★(독립 재유도 · codex major #7) **종료 코드를 파이프 밖에서 받는다.** 종전은
+    #   `$(cmd | tr -d '\r')` 라 파이프 마지막 단계(`tr`)의 rc 가 잡혀 reclaim 명령의 실패가
+    #   구조적으로 보이지 않았다 — 소켓이 끊겨 에러 문면이 나와도 '정상 응답'과 같은 값이 됐다.
+    #   판정은 리다이렉트 뒤 `rc=$?` 하나로만 뜨고, `\r` 제거는 그 뒤에 따로 한다.
     CYS_RECLAIM_OUT="$(cys_timeout_run 12 cys reclaim-role --auto \
       --config "$(cys_native_path "${CLAUDE_CONFIG_DIR:-}")" \
       --cwd "$(cys_native_path "$PWD")" \
-      --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null | tr -d '\r')"
+      --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null)"
+    CYS_RECLAIM_RC=$?
+    CYS_RECLAIM_OUT="$(printf '%s\n' "$CYS_RECLAIM_OUT" | tr -d '\r')"
     CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"
     CYS_RC_L2="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 2p)"
     CYS_RC_L3="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 3p)"
-    case "$CYS_RC_L1" in
-      role=*) CYS_RECLAIMED="${CYS_RC_L1#role=}" ;;
-      *)      CYS_RECLAIMED="" ;;
-    esac
-    case "$CYS_RC_L2" in
-      reason=*) CYS_RC_REASON="${CYS_RC_L2#reason=}" ;;
-      *)        CYS_RC_REASON="" ;;
-    esac
-    case "$CYS_RC_L3" in
-      env_role=*) CYS_ENV_ROLE_STATE="${CYS_RC_L3#env_role=}" ;;
-      *)          CYS_ENV_ROLE_STATE="unknown" ;;
-    esac
-    # 형식 가드: 데몬 유래 값이지만 이 뒤로 `case` 매칭·파일 경로 조립에 들어가므로 역할명
-    # 문자집합([a-z0-9-] 계열)을 벗어나면 채택하지 않는다(GUI 의 srcRole 가드와 같은 규율).
-    case "$CYS_RECLAIMED" in
-      ''|*[!a-zA-Z0-9_-]*) CYS_RECLAIMED="" ;;
-    esac
+    # ── ★(독립 재유도 · codex major #7) 응답을 **세 갈래로** 가른다 ────────────────────
+    #   종전에는 셋이 한 값(`CYS_RECLAIMED=""`)으로 접혔다:
+    #     ⓐ `valid_empty`  — 첫 줄이 **정확히** `role=` (데몬이 판정해서 '무역할'이라고 답함)
+    #     ⓑ `valid_role`   — 첫 줄이 `role=<역할명>` 이고 형식 가드를 통과
+    #     ⓒ `invalid_reply`— 첫 줄이 계약 형식이 아니거나 · 역할명이 형식 가드 탈락이거나 ·
+    #                        명령 자체가 비0 으로 끝났다(소켓 끊김·깨진 출력·부분 출력)
+    #   ⓒ 를 ⓐ 로 읽으면 `env_role=other_live` 와 만나 **강등**으로 떨어진다 — 데몬이 방금
+    #   결합해 준 좌석까지 지침 0 으로 만드는 경로다(치명위험 ③ 바보 좌석). 손상된 응답은
+    #   '판정 없음'이지 '무역할 판정'이 아니다. ⓒ 에서는 사유·env_role 도 신뢰하지 않는다
+    #   (같은 손상된 출력에서 온 줄이다) → 종전 경로 그대로: 무채택·무강등·무고지.
+    CYS_RC_KIND="invalid_reply"
+    if [ "$CYS_RECLAIM_RC" -eq 0 ]; then
+      case "$CYS_RC_L1" in
+        role=) CYS_RC_KIND="valid_empty" ;;
+        role=*)
+          # 형식 가드: 데몬 유래 값이지만 이 뒤로 `case` 매칭·파일 경로 조립에 들어가므로
+          # 역할명 문자집합([a-zA-Z0-9_-])을 벗어나면 **채택하지 않는다**(GUI srcRole 가드와
+          # 같은 규율). 탈락은 '무역할'이 아니라 손상이다.
+          case "${CYS_RC_L1#role=}" in
+            *[!a-zA-Z0-9_-]*) CYS_RC_KIND="invalid_reply" ;;
+            *)                CYS_RC_KIND="valid_role" ;;
+          esac
+          ;;
+        *) CYS_RC_KIND="invalid_reply" ;;
+      esac
+    fi
+    CYS_RECLAIMED=""
+    CYS_RC_REASON=""
+    CYS_ENV_ROLE_STATE="unknown"
+    if [ "$CYS_RC_KIND" != "invalid_reply" ]; then
+      if [ "$CYS_RC_KIND" = "valid_role" ]; then
+        CYS_RECLAIMED="${CYS_RC_L1#role=}"
+      fi
+      case "$CYS_RC_L2" in
+        reason=*) CYS_RC_REASON="${CYS_RC_L2#reason=}" ;;
+      esac
+      case "$CYS_RC_L3" in
+        env_role=*) CYS_ENV_ROLE_STATE="${CYS_RC_L3#env_role=}" ;;
+      esac
+    fi
     # ── ★(0.14.31 · 리뷰 R2 · blocking ×2) 채택 규칙: **데몬의 답이 이긴다** ──────────────
     # 종전 규칙은 `role=` 을 `CYS_ROLE` 이 **비어 있을 때만** 채택하고, 그렇지 않으면
     # `env_role=other_live` 하나만 보고 강등했다. 두 리뷰어가 각각 그 규칙의 반례를 실행으로
@@ -142,7 +171,8 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
         CYS_ROLE="$CYS_RECLAIMED"
         export CYS_ROLE
       fi
-    elif [ -n "$CYS_ROLE" ] && [ "$CYS_ENV_ROLE_STATE" = "other_live" ]; then
+    elif [ "$CYS_RC_KIND" = "valid_empty" ] && [ -n "$CYS_ROLE" ] \
+         && [ "$CYS_ENV_ROLE_STATE" = "other_live" ]; then
       # 강등은 **디렉티브 선택 앞**에서 결정하고, 실제 문안은 아래 매핑 뒤에서 낸다
       # (역할군을 알아야 인계 안내가 정확하다).
       CYS_DEMOTE_ROLE="$CYS_ROLE"
@@ -179,6 +209,14 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
       caller_axes_unknown)
         echo "■ 고지: 데몬이 이 좌석의 계정 dir·작업 디렉터리를 확정하지 못해 자동 역할 복구를 건너뛴다."
         echo "  역할이 필요하면 \`cys claim-role <역할>\` 로 직접 등록하라."
+        ;;
+      reported_cwd_conflict)
+        # ★(독립 재유도 · codex blocking #1) 신고한 `$PWD` 와 이 좌석의 **실제** 작업 폴더가
+        #   다른 곳이다. 신고는 좁히기만 하므로 두 조건을 함께 만족하는 좌석이 없다 —
+        #   처방이 `caller_axes_unknown`(축 미확정)과 다르기 때문에 사유를 나눠 말한다.
+        echo "■ 고지: 이 세션이 신고한 폴더와 좌석의 실제 작업 폴더가 달라 자동 역할 복구를 건너뛴다."
+        echo "  신고로 다른 폴더의 역할을 가져오지는 않는다(그것이 이 장치의 계약이다)."
+        echo "  그 역할이 필요하면 해당 폴더에서 세션을 시작하거나 \`cys claim-role <역할>\` 로 등록하라."
         ;;
     esac
   fi

@@ -48,6 +48,10 @@ pub struct LiveEntry {
     pub seat: String,
     pub env_injected: bool,
     pub created_at: f64,
+    /// ★(독립 재유도 · codex major #10) 좌석의 **단조 나이**(초) — 스냅샷을 뜬 시점에
+    /// `Surface.created_instant.elapsed()` 로 잰 값. `None` 은 '못 쟀다'이고, 그때는 벽시계
+    /// 나이만 쓴다(순수층 검체의 기본값이기도 하다).
+    pub age_secs: Option<f64>,
     pub cwd: Option<String>,
     pub claude_config_dir: Option<String>,
     /// 이 좌석이 종료됐는가(exited). 종료 좌석은 후보가 아니다 — 회수(reap)·부활(phoenix)의
@@ -274,7 +278,18 @@ pub fn is_candidate(
     //   watchdog 에 `empty` 로 보이는 순간 재결합이 그 역할을 가져갔고, 원 런처가 재개하면
     //   **이미 역할을 잃은 좌석에** 에이전트를 띄웠다. 역할을 쥔 신생 좌석은 그 출생 경로가
     //   무엇이든 "아직 붙는 중"일 수 있다 — 나이 하나로 판정한다(넓은 쪽 = 안전 방향).
-    if now - e.created_at < grace_secs() {
+    // ★유예는 **두 나이의 작은 쪽**으로 잰다(codex major #10). 벽시계 나이 하나로 재면
+    //   랩톱 절전/복귀·NTP 스텝이 유예를 **즉시 없애** 기동 중인 좌석의 역할을 빼앗는다
+    //   (macOS 의 `Instant` 는 절전 중 멈추고 벽시계는 그만큼 뛴다 — 방금 뜬 좌석이 "305초 된
+    //   빈 좌석"으로 보인다). 반대로 시계가 뒤로 밀린 경우 벽시계 나이가 작아지는데, 그 방향은
+    //   유예가 길어지는 쪽(=보류)이라 그대로 안전하다. 둘 중 하나라도 "아직 어리다"고 하면
+    //   후보가 아니다 — 판정 불가는 결합의 근거가 아니다.
+    let wall_age = now - e.created_at;
+    let age = match e.age_secs {
+        Some(mono) => wall_age.min(mono),
+        None => wall_age,
+    };
+    if age < grace_secs() {
         return false;
     }
     // 계정 dir 축: 양쪽 다 **데몬 기록**(호출 쪽은 출처 신뢰까지). 결측은 값이 아니다.
@@ -579,6 +594,7 @@ pub(crate) mod tests {
             seat: seat.to_string(),
             env_injected: false,
             created_at: 0.0,
+            age_secs: None,
             cwd: Some(cwd.to_string()),
             claude_config_dir: Some(cfg.to_string()),
             exited: false,
@@ -662,6 +678,40 @@ pub(crate) mod tests {
                 "유예를 넘긴 좌석이 후보에서 빠졌다(env_injected={injected})"
             );
         }
+    }
+
+    /// ★(독립 재유도 · codex major #10) **유예는 벽시계 보정으로 사라지지 않는다.**
+    ///
+    /// 랩톱이 절전에 들어갔다 깨면 `Instant` 는 멈춰 있었지만 벽시계는 그만큼 뛴다(macOS 실측
+    /// 성질). 그러면 방금 기동한 좌석의 **벽시계 나이**가 유예를 훌쩍 넘어, 아직 에이전트가
+    /// 붙는 중인 좌석이 "오래된 빈 좌석"으로 보여 역할을 빼앗긴다(치명위험 ③). 단조 나이가
+    /// 함께 있으면 그 신호가 이긴다 — 둘 중 **작은 쪽**이 판정한다.
+    #[test]
+    fn grace_survives_a_wall_clock_jump() {
+        let mut e = ent("worker-2", 3, "empty", CFG, CWD);
+        // 벽시계로는 유예를 한참 넘겼다(절전 중 시계가 뛴 그림).
+        e.created_at = 10_000.0 - (NEW_SEAT_GRACE_SECS * 10.0);
+        // 그러나 이 좌석이 **실제로 산 시간**은 1초다.
+        e.age_secs = Some(1.0);
+        assert_eq!(
+            decide_one(&[e.clone()]),
+            Decision::NoCandidate,
+            "벽시계가 뛰었다는 이유로 기동 중 좌석의 역할을 가져갔다"
+        );
+        // 단조 나이가 유예를 넘기면 종전대로 후보다(이 축이 기능을 죽이지 않는다).
+        e.age_secs = Some(NEW_SEAT_GRACE_SECS + 1.0);
+        assert_eq!(
+            decide_one(&[e.clone()]),
+            Decision::Bind { role: "worker-2".into(), from_surface: 3 },
+            "단조 나이로도 충분히 늙은 좌석이 후보에서 빠졌다"
+        );
+        // 반대 방향(시계가 뒤로 밀려 벽시계 나이가 어리다)은 **보류**가 안전 방향이다.
+        e.created_at = 10_000.0 + 60.0; // now 보다 미래 = 음수 나이
+        assert_eq!(
+            decide_one(&[e]),
+            Decision::NoCandidate,
+            "벽시계가 뒤로 밀린 좌석을 후보로 삼았다(모르면 보류가 안전 방향이다)"
+        );
     }
 
     /// ★(R2 · claude major) **특권 역할(master·cso)은 자동 경로의 후보가 아니다.**

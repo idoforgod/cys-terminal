@@ -77,8 +77,19 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
         "priv_optin":   ("exit 0", _rc("", "privileged_needs_optin", "unknown")),
         # ★(R2) 데몬이 이 좌석의 축을 모른다 — 무결합 + 처방 고지.
         "axes_unknown": ("exit 0", _rc("", "caller_axes_unknown", "unknown")),
+        # ★(독립 재유도) 신고 $PWD 와 좌석의 실제 cwd 가 다른 폴더다 — 축 미확정과 **처방이
+        #   다른** 무결합이므로 사유를 나눠 말한다(신고로 다른 폴더의 역할을 가져오지 않는다).
+        "cwd_conflict": ("exit 0", _rc("", "reported_cwd_conflict", "unknown")),
         # ★(R2) 데몬이 **판정해서** 무역할이라고 답했고 env 역할은 주인이 없다(미등록).
         "unregistered":  ("exit 0", _rc("", "no_candidate", "vacant")),
+        # ★독립 재유도(triage · codex major #7): **손상된 응답**을 '정상적인 빈 역할 답변'으로
+        #   읽으면 안 된다. ⓐ 형식 가드에 걸린 역할명(첫 줄이 `role=` 이지만 채택 불가) ·
+        #   ⓑ 첫 줄이 계약 형식이 아니고 명령 자체가 실패(exit 1). 둘 다 CYS_RECLAIMED 가
+        #   빈 문자열이 되어 `env_role=other_live` 와 만나면 **강등**으로 떨어진다.
+        "bogus_live":   ("exit 0", _rc("cso; rm -rf /", "bound", "other_live")),
+        "garbled_live": ("exit 0",
+                         "printf 'cys: connection reset by peer\\nreason=bound\\n"
+                         "env_role=other_live\\n'; exit 1"),
     }[reclaim_mode]
     with open(os.path.join(bindir, "cys"), "w", encoding="utf-8", newline="\n") as f:
         f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
@@ -289,6 +300,18 @@ code, out, _ = run_hook(env)
 check("11w-a 축 미확정 고지 + 수동 처방", "cys claim-role" in out and "확정하지 못" in out)
 shutil.rmtree(tmp)
 
+# ── 11t. ★(독립 재유도) cwd 충돌은 축 미확정과 **다른 처방**을 낸다 ──
+#   신고한 폴더와 좌석의 실제 폴더가 다르면 두 조건을 함께 만족하는 후보가 없다. 그 사실과
+#   "신고로 남의 폴더 역할을 가져오지 않는다"를 말해야 사람이 무엇을 할지 안다.
+tmp = tempfile.mkdtemp(prefix="hook-t11t-")
+env = setup(tmp, "ok", reclaim_mode="cwd_conflict")
+code, out, _ = run_hook(env)
+check("11t-a cwd 충돌 사유가 그대로 고지된다", "실제 작업 폴더가 달라" in out)
+check("11t-b 처방이 붙는다(해당 폴더에서 시작 · claim-role)",
+      "cys claim-role" in out and "폴더에서 세션을 시작" in out)
+check("11t-c 강등이 아니다", "역할 주소 상실" not in out)
+shutil.rmtree(tmp)
+
 # ── 11v. ★(R2 · codex major) 판정된 '무역할' + 주인 없는 env 역할 → 지침은 주되 **미등록 고지** ──
 #   지침을 끊으면 지침 없는 좌석을 새로 만든다(치명위험 ③). 그러나 등록되지 않았다는 사실을
 #   숨기면 그 좌석은 자기 `cys` 명령이 왜 거부되는지 모른 채 역할처럼 행동한다.
@@ -353,6 +376,25 @@ check("16a --config·--cwd 가 실제로 실려 나간다", "--config" in _c and
 _src = open(HOOK, encoding="utf-8").read()
 check("16b 두 인자가 cys_native_path 를 경유(원문 전달 금지)",
       'cys_native_path "${CLAUDE_CONFIG_DIR:-}"' in _src and 'cys_native_path "$PWD"' in _src)
+shutil.rmtree(tmp)
+
+# ── 17. ★독립 재유도(triage · codex major #7): 손상된 응답은 강등 근거가 아니다 ──
+#   `role=` 이 비어 있다는 사실은 **데몬이 판정해서 '이 좌석은 무역할'이라고 답했을 때만**
+#   성립한다. 형식 위반·실패한 명령의 출력은 '판정 없음'이고, 그것으로 강등하면 데몬이 방금
+#   결합해 준(reason=bound) 좌석까지 지침 0 으로 만든다(치명위험 ③ 바보 좌석).
+tmp = tempfile.mkdtemp(prefix="hook-t17a-")
+env = setup(tmp, "ok", reclaim_mode="bogus_live")
+code, out, _ = run_hook(env, role="reviewer-codex")
+check("17a 형식 위반 역할명 + other_live 에서 강등하지 않는다", "역할 주소 상실" not in out)
+check("17b 형식 위반이어도 좌석은 지침을 받는다(무채택·무강등)",
+      "DIRECTIVE-BODY-REVIEWER" in out)
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t17b-")
+env = setup(tmp, "ok", reclaim_mode="garbled_live")
+code, out, _ = run_hook(env, role="reviewer-codex")
+check("17c 손상된 응답(첫 줄 비계약·exit 1)에서 강등하지 않는다", "역할 주소 상실" not in out)
+check("17d 손상된 응답에서도 지침은 주입된다", "DIRECTIVE-BODY-REVIEWER" in out)
 shutil.rmtree(tmp)
 
 # ── 12. Windows 함정 회귀 — 재대조가 검증되지 않은 `timeout` 을 직접 부르지 않는다 ──
