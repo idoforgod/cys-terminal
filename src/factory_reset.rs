@@ -134,6 +134,19 @@ const WIN_STATE_PREFIX: [&str; 8] = [
     "analytics.db-",      // WAL/SHM 사이드카
 ];
 
+/// `write_json_atomic`(governance.rs)이 **실제로 쓰는** 상태 파일 이름 전량.
+/// 임시 잔재(`.{name}.tmp`)의 판정은 이 목록·[`WIN_STATE_EXACT`] 와의 **정확 일치**로만 한다 —
+/// 접두 가족으로 넓히면 임의의 점 파일이 상태로 잡힌다(아래 X14 주석).
+const WIN_STATE_ATOMIC: [&str; 7] = [
+    "topology.json",
+    "dept_tombstones.json",
+    "queue-state.json",
+    "queue-expired.json",
+    "learn_stuck_debounce.json",
+    "alert-route-pending.json",
+    "alert-route-folded.jsonl",
+];
+
 /// Windows 상태 항목인가 — 정확 이름 · 접두 · **원자쓰기 임시 잔재**의 세 축.
 ///
 /// ★(0.14.31 · 독립 판정 triage X14) `write_json_atomic`(governance.rs)의 임시 이름은
@@ -143,15 +156,29 @@ const WIN_STATE_PREFIX: [&str; 8] = [
 /// "앱 설치 파일 — 보존" 으로 분류돼 초기화 후에도 데몬 상태가 남았다(선재 결함 · 이 WP 가
 /// 파일 두 개를 더 얹었을 뿐이다). 임시 이름은 **알려진 이름에서 파생될 때만** 잡는다 —
 /// 임의의 점 파일을 격리하면 설치본을 옮기는 사고 방향이 된다(fail-safe).
+///
+/// ★(0.14.31 · 수렴 R2 · X14 잔여) 그 "알려진 이름" 을 **접두 가족**으로 읽은 것이 두 방향으로
+/// 틀렸다:
+///   ① 넓다 — 무관한 `.alert-route-theme.tmp` 가 `alert-route` 접두에 걸려 격리됐다(임의 점
+///      파일 보존 원칙 위반). 임시 잔재는 원자쓰기가 **실제로 쓰는 이름**에서만 파생되므로
+///      정확 일치([`WIN_STATE_ATOMIC`]·[`WIN_STATE_EXACT`])로 좁힌다.
+///   ② 좁다 — 대소문자를 가려 `.ALERT-ROUTE-PENDING.JSON.TMP` 를 놓쳤다. Windows·macOS 기본
+///      파일계는 대소문자를 구분하지 않아 **그 이름이 곧 정본 임시 파일**이고, 그대로 두면
+///      초기화 잔재가 된다. 세 축을 모두 소문자 접기로 대조한다.
 fn is_win_state_name(name: &str) -> bool {
-    if WIN_STATE_EXACT.contains(&name) || WIN_STATE_PREFIX.iter().any(|p| name.starts_with(p)) {
+    let lower = name.to_ascii_lowercase();
+    let n = lower.as_str();
+    if WIN_STATE_EXACT.iter().any(|e| e.eq_ignore_ascii_case(name))
+        || WIN_STATE_PREFIX.iter().any(|p| n.starts_with(&p.to_ascii_lowercase()))
+    {
         return true;
     }
-    // `.{알려진 이름}.tmp` — 선두 점과 꼬리 `.tmp` 를 벗겨 같은 두 축으로 다시 본다.
-    name.strip_prefix('.')
+    // `.{알려진 이름}.tmp` — 선두 점과 꼬리 `.tmp` 를 벗기고 **정확 일치**로만 본다.
+    n.strip_prefix('.')
         .and_then(|s| s.strip_suffix(".tmp"))
         .is_some_and(|base| {
-            WIN_STATE_EXACT.contains(&base) || WIN_STATE_PREFIX.iter().any(|p| base.starts_with(p))
+            WIN_STATE_EXACT.iter().any(|e| e.eq_ignore_ascii_case(base))
+                || WIN_STATE_ATOMIC.iter().any(|e| e.eq_ignore_ascii_case(base))
         })
 }
 
@@ -3435,13 +3462,20 @@ mod converge_factory_reset {
 
     /// ★X14: `.{알려진 이름}.tmp` 만 상태로 잡는다 — 임의의 점 파일·설치본은 **보존**이다
     /// (음성 대조가 없으면 "전부 격리" 로 고쳐도 통과한다 = 앱을 옮기는 사고 방향).
+    ///
+    /// ★(수렴 R2 · X14 잔여) 판정을 **접두 가족**이 아니라 원자쓰기가 실제로 쓰는 **정확한
+    /// 이름**으로 좁히고, 대소문자를 접는다. 두 방향의 음성/양성 대조를 함께 박는다.
     #[test]
     fn converge_atomic_temp_rule_does_not_swallow_unknown_dotfiles() {
         for name in [
             ".alert-route-pending.json.tmp",
+            ".alert-route-folded.jsonl.tmp",
             ".queue-state.json.tmp",
+            ".queue-expired.json.tmp",
             ".topology.json.tmp",
-            ".cys-dept-dept-1.tmp",
+            // ★대소문자 변형 — Windows·macOS 기본 파일계에서 **그 이름이 곧 정본 임시 파일**이다.
+            ".ALERT-ROUTE-PENDING.JSON.TMP",
+            ".Queue-State.Json.Tmp",
         ] {
             assert!(is_win_state_name(name), "알려진 이름의 원자쓰기 잔재를 놓쳤다: {name}");
         }
@@ -3449,14 +3483,19 @@ mod converge_factory_reset {
             ".installer-cache.tmp",
             ".env",
             "cys.exe",
-            "alert-route-pending.json.tmp", // 선두 점이 없는 형태는 우리 규약이 아니다
             "unins000.dat",
+            // ★과대적용 음성 대조: 접두 가족으로 읽으면 이 무관한 점 파일이 격리된다.
+            ".alert-route-theme.tmp",
+            ".cys-dept-dept-1.tmp", // cys-dept-* 는 디렉터리다 — 원자쓰기 대상이 아니다
         ] {
-            assert_eq!(
-                is_win_state_name(name),
-                name.starts_with("alert-route"),
-                "설치본·미지 점 파일을 상태로 분류했다: {name}"
+            assert!(
+                !is_win_state_name(name),
+                "설치본·미지 점 파일을 상태로 분류했다(임의 점 파일 보존 원칙 위반): {name}"
             );
         }
+        // 선두 점이 없는 접두 가족은 종전대로 상태다(이 고침이 좁힌 것은 **임시 이름 축**뿐이다).
+        assert!(is_win_state_name("alert-route-pending.json"));
+        assert!(is_win_state_name("cys-dept-dept-1"));
+        assert!(is_win_state_name("CYS-DEPT-DEPT-1"), "접두 축의 대소문자 변형을 놓쳤다");
     }
 }
