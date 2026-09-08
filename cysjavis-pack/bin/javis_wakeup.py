@@ -557,6 +557,7 @@ def cmd_drain(a):
         # 생존 판정은 **target 당 1회**(종전 pending 당 1회) — 판정 기준·강등 규칙은 그대로이고
         # 같은 target 을 같은 순간에 두 번 묻지 않을 뿐이다(`cys list` 호출도 N→1).
         alive = _target_alive(target)
+        durable = None  # 이 target 의 내구 표식(True·False·None=미상) — 그룹마다 새로 판정한다
         if alive == "dead":
             # zombie 가드: 죽은 대상에 배달/병합 유지 금지 → skipped로 종결(pending 제거)
             for path, rec in items:
