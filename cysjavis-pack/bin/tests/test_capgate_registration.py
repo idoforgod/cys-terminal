@@ -141,6 +141,53 @@ class _CapgateEnv(unittest.TestCase):
         self.assertEqual(result["id"], "C82.gate-corpus-drift", "C82 결과 식별자를 유지해야 한다")
         return result
 
+    def _profile_with_capgate(self, extra_user_hook=True):
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        cmd = pf._cys_hook_cmd(pf.CAPGATE_HOOK[0])
+        blocks = [{"hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]
+        if extra_user_hook:
+            blocks.append({"hooks": [{"type": "command", "command": "echo user-own-hook"}]})
+        sp.write_text(json.dumps({"hooks": {"PreToolUse": blocks,
+                                            "Stop": [{"hooks": [{"type": "command",
+                                                                 "command": "echo keep-me"}]}]}},
+                                 indent=2), encoding="utf-8")
+        return sp
+
+    # ── ★R2: C28 을 **실제로 실행**해서 잰다(codex: 소스 문자열 검사는 집행의 증거가 아니다) ──
+    def _run_c28(self, settings_path, fix=True, status=None, rc=0, directive=None,
+                 sock=True, table=None):
+        """C28 을 격리 상태에서 1회 실행하고 (결과 dict, settings 본문) 을 돌려준다."""
+        hooks = self.pack / "hooks"
+        hooks.mkdir(exist_ok=True)
+        (hooks / pf.CAPGATE_HOOK[0]).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        if directive is not None:
+            self.directive.write_text(directive, encoding="utf-8")
+        if table is not None:
+            tdir = self.pack / "state"
+            tdir.mkdir(exist_ok=True)
+            (tdir / "hook-targets.json").write_text(json.dumps(table), encoding="utf-8")
+        if status is None:
+            self._stub("cys", {})
+        else:
+            self._status_stub(status, rc)
+        if not sock and self.sock.exists():
+            self.sock.unlink()
+        p = pf.Preflight(fix=fix, skips=[])
+        with mock.patch.object(pf, "resolve_registration_targets",
+                               return_value=([str(settings_path)], None)):
+            p.c28_self_correction()
+        res = [r for r in p.results if r["id"] == "C28.self-correction"]
+        self.assertEqual(len(res), 1, "C28 결과는 한 건이어야 한다: %s" % p.results)
+        return res[0], json.loads(settings_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _capgate_cmds(doc):
+        return [h.get("command", "") for b in doc.get("hooks", {}).get("PreToolUse", [])
+                for h in b.get("hooks", [])
+                if pf.CAPGATE_HOOK[0] in h.get("command", "")]
+
 
 class CapgateRegistration(_CapgateEnv):
     """등록 조건 · C82 · 배선 계약."""
@@ -397,20 +444,6 @@ class CapgateDeregistration(_CapgateEnv):
     판정문이 사실과 반대였다(§8 검증 결과 재작성 금지 · 부분 배포 = 봉인표 ③).
     """
 
-    def _profile_with_capgate(self, extra_user_hook=True):
-        prof = self.home / ".claude"
-        prof.mkdir(parents=True, exist_ok=True)
-        sp = prof / "settings.json"
-        cmd = pf._cys_hook_cmd(pf.CAPGATE_HOOK[0])
-        blocks = [{"hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]
-        if extra_user_hook:
-            blocks.append({"hooks": [{"type": "command", "command": "echo user-own-hook"}]})
-        sp.write_text(json.dumps({"hooks": {"PreToolUse": blocks,
-                                            "Stop": [{"hooks": [{"type": "command",
-                                                                 "command": "echo keep-me"}]}]}},
-                                 indent=2), encoding="utf-8")
-        return sp
-
     def test_unregister_removes_only_our_hook(self):
         sp = self._profile_with_capgate()
         p = pf.Preflight(fix=True, skips=[])
@@ -444,39 +477,6 @@ class CapgateDeregistration(_CapgateEnv):
         data = json.loads(sp.read_text(encoding="utf-8"))
         self.assertEqual([h["command"] for b in data["hooks"]["PreToolUse"] for h in b["hooks"]],
                          ["echo other"], "없는 훅을 지우려다 남의 것을 건드렸다")
-
-    # ── ★R2: C28 을 **실제로 실행**해서 잰다(codex: 소스 문자열 검사는 집행의 증거가 아니다) ──
-    def _run_c28(self, settings_path, fix=True, status=None, rc=0, directive=None,
-                 sock=True, table=None):
-        """C28 을 격리 상태에서 1회 실행하고 (결과 dict, settings 본문) 을 돌려준다."""
-        hooks = self.pack / "hooks"
-        hooks.mkdir(exist_ok=True)
-        (hooks / pf.CAPGATE_HOOK[0]).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        if directive is not None:
-            self.directive.write_text(directive, encoding="utf-8")
-        if table is not None:
-            tdir = self.pack / "state"
-            tdir.mkdir(exist_ok=True)
-            (tdir / "hook-targets.json").write_text(json.dumps(table), encoding="utf-8")
-        if status is None:
-            self._stub("cys", {})
-        else:
-            self._status_stub(status, rc)
-        if not sock and self.sock.exists():
-            self.sock.unlink()
-        p = pf.Preflight(fix=fix, skips=[])
-        with mock.patch.object(pf, "resolve_registration_targets",
-                               return_value=([str(settings_path)], None)):
-            p.c28_self_correction()
-        res = [r for r in p.results if r["id"] == "C28.self-correction"]
-        self.assertEqual(len(res), 1, "C28 결과는 한 건이어야 한다: %s" % p.results)
-        return res[0], json.loads(settings_path.read_text(encoding="utf-8"))
-
-    @staticmethod
-    def _capgate_cmds(doc):
-        return [h.get("command", "") for b in doc.get("hooks", {}).get("PreToolUse", [])
-                for h in b.get("hooks", [])
-                if pf.CAPGATE_HOOK[0] in h.get("command", "")]
 
     def test_undecidable_keeps_live_registration(self):
         """★R2 blocking: 판정 불능(소켓 미실재)이 **살아 있는 게이트를 해제하면 안 된다**.
@@ -626,6 +626,196 @@ class CapgateRegistrarEligibility(_CapgateEnv):
         self.assertIn("cys", why)
         self.assertEqual(gr.CSO_DIRECTIVE_REV_MARKER, pf.CSO_DIRECTIVE_REV_MARKER,
                          "두 등록 경로의 표지 문자열이 갈라졌다(§C 계약은 하나다)")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★독립 재유도(triage 2026-09-08 · P2-WP3A-capgate) — 등록기 잔여 5갈래.
+#   전부 **실행**해서 잰다(소스 문자열 단언 0 — C28 을 돌리거나 판정 함수를 직접 부른다).
+# ─────────────────────────────────────────────────────────────────────────────
+class TriageRegistrationGaps(_CapgateEnv):
+    """부팅 등록기의 잔여 결함(triage CONFIRMED 5종)."""
+
+    def _env_recording_cys(self, status, varname="CYS_NO_AUTOSTART"):
+        """`cys` 스텁 — 호출 시의 env 한 개를 `<log>.env` 에 남긴다."""
+        envlog = self.root / "cys-env.log"
+        path = self.bin / "cys"
+        body = "\n".join([
+            "#!/bin/sh",
+            'printf "%s=%s\\n" ' + shlex.quote(varname)
+            + ' "${' + varname + '-<unset>}" >> ' + shlex.quote(str(envlog)),
+            'printf "%s\\n" ' + shlex.quote(json.dumps(status)),
+        ]) + "\n"
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+        return envlog
+
+    # ── ① 역사적 표지만으로 데몬을 **깨우며** 조회한다 ─────────────────────────
+    def test_alert_probe_seals_daemon_autostart(self):
+        """★triage(codex major): 이 축은 `cys status --json` 를 **autostart 봉인 없이** 부른다.
+
+        `_capgate_daemon_present()` 는 죽은 데몬이 남긴 `cysd.log`·`topology.json` 만으로도
+        참이 되고(표지는 종료해도 남는다), 그 뒤의 `cys status` 는 `connect()` 실패 경로에서
+        **형제 cysd 를 detached 로 기동**한다(src/bin/cys.rs:2258 — 옵트아웃은
+        `CYS_NO_AUTOSTART=1` 뿐이다). 6초 타임아웃은 이미 태어난 데몬을 되돌리지 못한다.
+        preflight 는 부트 체인의 첫 단계이고 이 축은 자기 주석에 '데몬을 깨우지 않는다'
+        고 적고 있다(H-SEED-2 가 잡은 부수효과와 같은 층).
+        """
+        # 살아 있는 소켓을 지우고 **역사적 표지**만 남긴다 — 그래도 present 가 참이다.
+        self.sock.unlink()
+        (self.sock.parent / "cysd.log").write_text("stopped\n", encoding="utf-8")
+        present, why = pf.Preflight(fix=False, skips=[])._capgate_daemon_present()
+        self.assertTrue(present, "선행 사실: 역사적 표지만으로 present 가 참이다(%s)" % why)
+        envlog = self._env_recording_cys(self.good_status)
+        axis, _why = pf.Preflight(fix=False, skips=[])._capgate_alert_axis()
+        self.assertIs(axis, True, "선행 사실: 이 축이 실제로 `cys status --json` 을 불렀다")
+        self.assertEqual(envlog.read_text(encoding="utf-8").strip(),
+                         "CYS_NO_AUTOSTART=1",
+                         "등록 프로브가 데몬 autostart 를 봉인하지 않았다 — 부트 첫 단계의 "
+                         "읽기 전용 관측이 데몬을 낳는다")
+
+    def test_manual_registrar_probe_seals_daemon_autostart(self):
+        """수동 등록기(`javis_guard_register._capgate_eligibility`)도 같은 봉인이 필요하다."""
+        envlog = self._env_recording_cys(self.good_status)
+        ok, why = gr._capgate_eligibility(str(self.pack))
+        self.assertTrue(ok, "선행 사실: 자격 판정이 실제로 데몬에 물었다(%s)" % why)
+        self.assertEqual(envlog.read_text(encoding="utf-8").strip(),
+                         "CYS_NO_AUTOSTART=1",
+                         "수동 등록기의 자격 프로브가 데몬 autostart 를 봉인하지 않았다")
+
+    # ── ② matcher 가 달린 기존 등록이 '등록됨' 으로 인정된다 ────────────────────
+    def test_matcher_scoped_registration_is_repaired(self):
+        """★triage(codex major): `matcher: "Bash"` 가 달린 등록을 그대로 두면 게이트가
+        **Bash 에만** 붙는다 — CronCreate·Agent·Edit/Write 는 무게이트가 되고 예산 계수도
+        Bash 호출만 센다. `_event_hook_registered` 는 matcher 축을 아예 보지 않아서
+        C28 이 '이미 등록됨' 으로 건너뛴다(조용한 게이트 면제).
+        """
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        cmd = pf._cys_hook_cmd(pf.CAPGATE_HOOK[0])
+        sp.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "Bash",
+             "hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]}}),
+            encoding="utf-8")
+        # 선행 사실: 계약상 capgate 는 matcher 가 없어야 한다(전 도구).
+        self.assertEqual([m for _ev, m in pf.CAPGATE_HOOK[1]], [None],
+                         "계약 확인: capgate 선언에는 matcher 가 없다")
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive)
+        blocks = [b for b in doc["hooks"]["PreToolUse"]
+                  if any(pf.CAPGATE_HOOK[0] in h.get("command", "")
+                         for h in b.get("hooks", []))]
+        self.assertTrue(blocks, "등록이 사라졌다: %s · %s" % (doc, res["detail"]))
+        self.assertTrue(any(not b.get("matcher") for b in blocks),
+                        "matcher 로 좁혀진 등록이 교정되지 않았다 — 게이트가 Bash 에만 붙는다: %s"
+                        % doc)
+
+    # ── ③ 부팅 등록기와 수동 등록기가 손상 표를 다르게 읽는다 ──────────────────
+    def test_schema_mismatch_table_defers_like_the_manual_registrar(self):
+        """★triage(codex major): 수동 등록기가 **손상**이라 거부하는 표를 부팅 등록기는
+        조용히 통과시킨다(`capgate_table_denied_basenames` 는 schema_version 도 값 어휘도
+        보지 않는다). 운영자가 선언한 제외가 부팅 경로에서만 사라진다.
+        """
+        tdir = self.pack / "state"
+        tdir.mkdir(exist_ok=True)
+        table = {"schema_version": 99, "policy": {"unknown_profile": "deny"},
+                 "profiles": [{"basename": ".claude",
+                               "eligibility": {"guard_stop": "allow", "brief_warn": "allow",
+                                               "capgate": "DENY"}}]}
+        tpath = tdir / "hook-targets.json"
+        tpath.write_text(json.dumps(table), encoding="utf-8")
+        _tbl, err = gr._load_targets(str(tpath))
+        self.assertIsNotNone(err, "선행 사실: 수동 등록기는 이 표를 손상으로 거부한다")
+        prof = self.home / ".claude"
+        prof.mkdir(parents=True, exist_ok=True)
+        sp = prof / "settings.json"
+        sp.write_text("{}", encoding="utf-8")
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive)
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "손상 표(수동 등록기는 거부)인데 부팅 경로가 등록했다: %s · %s"
+                         % (doc, res["detail"]))
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root 는 퍼미션으로 판독 불가를 만들 수 없다")
+    def test_unreadable_installed_table_is_not_absence(self):
+        """★triage(codex major): 설치된 표를 **읽지 못한 것**과 표가 **없는 것**이 같은 값으로
+        접힌다 — 판독 실패가 조용히 예시표/기본값 폴백이 되어 운영자의 제외가 사라진다.
+        """
+        tdir = self.pack / "state"
+        tdir.mkdir(exist_ok=True)
+        tpath = tdir / "hook-targets.json"
+        tpath.write_text(json.dumps({"schema_version": 1,
+                                     "policy": {"unknown_profile": "deny"},
+                                     "profiles": [{"basename": ".claude",
+                                                   "eligibility": {"guard_stop": "allow",
+                                                                   "brief_warn": "allow",
+                                                                   "capgate": "deny"}}]}),
+                         encoding="utf-8")
+        os.chmod(str(tpath), 0)
+        self.addCleanup(os.chmod, str(tpath), 0o600)
+        self.assertIsNone(pf._read_text_tolerant(str(tpath)),
+                          "선행 사실: 이 표는 판독 불가다")
+        deny, err = pf.capgate_table_denied_basenames(str(self.pack))
+        self.assertIsNotNone(err,
+                             "판독 실패가 '표 부재'(폴백)로 접혔다 — 결측은 값이 아니다: %r"
+                             % (deny,))
+
+    # ── ④ 명시 명명 파이프 주소가 표지 폴백을 건너뛴다 ─────────────────────────
+    def test_named_pipe_socket_falls_back_to_hub_markers(self):
+        """★triage(codex major · Windows): `CYS_SOCKET=\\.\pipe\cys` 면 두 등록기 모두
+        파일시스템 `exists()` 하나로 판정을 끝내고 허브 표지를 **보지 않는다**.
+
+        명명 파이프는 인스턴스가 사용 중이거나 메타데이터 조회가 실패해도 stat 이 실패한다 —
+        그때 살아 있는 데몬을 '미실재' 로 읽으면 preflight 는 영구 `unknown`, 수동 등록은 거부다
+        (R2 B8 이 넣었다고 적은 '플랫폼 공통 표지 폴백' 이 이 환경에는 닿지 않는다).
+        """
+        pipe = "\\\\.\\pipe\\cys"
+        self.assertFalse(os.path.exists(pipe), "선행 사실: 이 경로는 파일로 실재하지 않는다")
+        self.assertTrue(self.sock.exists(), "선행 사실: 허브 표지는 살아 있다")
+        with mock.patch.dict(os.environ, {"CYS_SOCKET": pipe}):
+            present, why = pf.Preflight(fix=False, skips=[])._capgate_daemon_present()
+            self.assertTrue(present,
+                            "명명 파이프 주소에서 허브 표지 폴백이 동작하지 않았다: %s" % why)
+            gpresent, gwhy = gr._daemon_present()
+            self.assertTrue(gpresent,
+                            "수동 등록기도 같은 갈래다: %s" % gwhy)
+
+    # ── ⑤ 판정 불능이 다음 부팅으로 이어지지 않는다 ────────────────────────────
+    def test_undecidable_capgate_is_persisted_for_recheck(self):
+        """★triage(codex major): `unknown` 은 등록도 해제도 하지 않는데, 그 사실이 **어디에도
+        남지 않는다**.
+
+        preflight 를 자동으로 돌리는 유일한 지점은 `javis_bootstrap.py:2701` 이고 그 앞의
+        레인 마커 fast path(`_marker_fresh`)는 **같은 pack_version 이면 preflight 를 통째로
+        생략**한다. 즉 그 팩 버전의 첫 부팅이 판정 불능이면 게이트는 그 버전 내내 미등록으로
+        남고, 두 번째 부팅부터는 경고조차 나오지 않는다.
+        복구 재측정을 하려면 '미해소' 사실이 **부팅 체인이 읽을 수 있는 곳에 남아야** 한다.
+        (이 검체는 지속화 축만 핀한다 — 소비 축(fast path 우회)은 부트 하네스가 따로 핀해야 한다.)
+        """
+        sp = self._profile_with_capgate()
+        res, doc = self._run_c28(sp, fix=True, status=None, sock=False)
+        self.assertIn("판정 불능", res["detail"], "선행 사실: 이 실행은 판정 불능이다")
+        self.assertEqual(len(self._capgate_cmds(doc)), 1,
+                         "선행 사실: 판정 불능은 등록을 건드리지 않는다")
+        roots = [self.javis, self.pack / "state", self.sock.parent]
+        found = []
+        for root in roots:
+            for dirpath, _dirs, files in os.walk(str(root)):
+                for name in files:
+                    fp = os.path.join(dirpath, name)
+                    try:
+                        body = open(fp, "rb").read()
+                    except OSError:
+                        continue
+                    if b"capgate" in body or "capgate" in name:
+                        found.append(fp)
+        self.assertTrue(found,
+                        "판정 불능이 지속 기록으로 남지 않았다 — 다음 부팅은 fast path 로 "
+                        "preflight 자체를 건너뛰므로 재측정 기회가 없다(탐색 대상: %s)"
+                        % [str(r) for r in roots])
+
 
 
 if __name__ == "__main__":

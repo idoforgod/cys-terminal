@@ -349,12 +349,34 @@ BUILDER_DENY_OPTS = ("-toolexec", "-exec", "-overlay", "-modfile", "-pkgdir")
 #   키를 열거로 안전하게 가려낼 수 없으므로 **아는 키만** 통과시킨다(allowlist 의 뜻).
 #   정직: `cargo test` 자체가 테스트 본문·build.rs 로 임의 코드를 돌린다(이 완화는 샌드박스가
 #   아니다 · 위 머리말). 여기서 닫는 것은 **검증 명령의 얼굴을 한 실행기 주입**이다.
+#   ★triage T1/T7: 키 대조는 **경계까지** 본다. 종전 `startswith(k)` 는 `build.jobsX` 처럼
+#     아는 키의 **접두를 빌린 모르는 키**를 통과시켰다. 점으로 끝나는 항목만 네임스페이스
+#     접두이고, 나머지는 `k` 자신이거나 `k=<값>` 일 때만 안전하다.
 CARGO_CONFIG_SAFE_KEYS = ("build.jobs", "build.target-dir", "build.incremental",
                           "net.offline", "net.retry", "term.")
+
+
+def _cargo_config_value_safe(val):
+    """`cargo --config <이것>` 이 **아는 키**인가(분리·결합 표기 공통 · 경계 대조)."""
+    v = str(val or "").lstrip("\'\"")
+    for k in CARGO_CONFIG_SAFE_KEYS:
+        if k.endswith("."):
+            if v.startswith(k):
+                return True
+        elif v == k or v.startswith(k + "="):
+            return True
+    return False
 BUILDER_DENY_OPT_VALUES = {"-mod": ("mod",)}
 # 산출물 폐기 장치는 플랫폼마다 다르다 — unix 에서 `NUL` 은 **일반 파일**이고
 # `/dev/stdout`·`/dev/tty` 는 null sink 가 아니다(리다이렉트의 NULL_SINKS 와 뜻이 다르다).
-BUILDER_NULL_SINKS = ("NUL", "nul") if os.name == "nt" else ("/dev/null",)
+# ★triage T9: 이 상수는 **플랫폼 폐기 장치의 단일 정본**이다. 종전엔 여기만 플랫폼을 갈랐고
+#   리다이렉트의 `NULL_SINKS` 는 철자 `NUL`/`nul` 을 무조건 면제해서 **한 파일 안에서 두 계약이
+#   어긋났다** — unix bash 의 `> NUL` 은 cwd 에 일반 파일을 만들거나 자른다.
+PLATFORM_NULL_DEVICES = ("NUL", "nul") if os.name == "nt" else ("/dev/null",)
+# 이 플랫폼에서는 **폐기 장치가 아닌** 예약 이름(unix 의 `NUL` · nt 의 `/dev/null`).
+FOREIGN_NULL_NAMES = tuple(n for n in ("NUL", "nul", "/dev/null")
+                           if n not in PLATFORM_NULL_DEVICES)
+BUILDER_NULL_SINKS = PLATFORM_NULL_DEVICES
 # ★명령 **자체가** 상태를 바꾸는 하위-옵션(R1 minor): `go env -w/-u` 는 GOENV 파일을 영속
 #   변경한다 — 조회 하위 명령의 얼굴을 한 설정 변경이다. `cargo fmt` 는 소스를 다시 쓴다
 #   (`--check` 는 쓰지 않고 종료 코드만 낸다).
@@ -391,13 +413,20 @@ def builder_is_write(base, tokens, i):
             _val = t.split("=", 1)[1] if "=" in t else (tokens[j + 1] if j + 1 < n else "")
             if _val in _dv:
                 return True              # `go build -mod=mod` 는 go.mod 를 고친다
-        if t in value_opts:
-            if base == "cargo" and t == "--config":
-                _cv = (tokens[j + 1] if j + 1 < n else "").lstrip("'\"")
-                if not any(_cv.startswith(k) for k in CARGO_CONFIG_SAFE_KEYS):
+        # ★triage T1/T7: 값 옵션은 **분리(`--config <v>`)·결합(`--config=<v>`) 양쪽**을 같은
+        #   규칙으로 본다. 종전은 `t in value_opts`(정확 토큰)라 결합 표기가 이 분기에 들어오지
+        #   못하고 `t.startswith("-")` 로 흘러 `CARGO_CONFIG_SAFE_KEYS` 검증을 통째로 건너뛰었다
+        #   — 분리 표기는 deny 인데 결합 표기는 allow 였다(실행기 주입 경로가 그대로 남았다).
+        #   `BUILDER_DENY_OPTS`·`BUILDER_OUT_OPTS` 는 이미 이 규칙을 쓴다(축 1지점).
+        _vopt = next((o for o in value_opts if t == o or t.startswith(o + "=")), None)
+        if _vopt is not None:
+            if base == "cargo" and _vopt == "--config":
+                _cv = (t.split("=", 1)[1] if "=" in t
+                       else (tokens[j + 1] if j + 1 < n else ""))
+                if not _cargo_config_value_safe(_cv):
                     return True          # 실행기·래퍼 주입 경로(아는 키만 통과)
             seg_opts.append(t)
-            j += 2                       # 옵션 **값**은 하위 명령이 아니다
+            j += 1 if "=" in t else 2    # 옵션 **값**은 하위 명령이 아니다
             continue
         # ★산출물 내보내기 옵션은 **세그먼트 전체**에서 찾는다 — `go build -o <path>` 처럼
         #   하위 명령 **뒤에** 오는 것이 보통이라, 하위 명령을 만나면 멈추는 스캔은 놓친다.
@@ -658,7 +687,7 @@ def _arg_hits_deny(arg, bad):
             and bad.startswith(head))
 # 값을 먹는 옵션(그 다음 토큰은 하위 명령이 아니다). 하위 명령을 **받지 않는** 도구에서도
 # 필요하다 — `--skip <ID>` 의 ID 가 '허용 밖 하위 명령'으로 읽히면 정상 진단이 거부된다.
-CSO_PY_VALUE_OPTS = {"javis_preflight.py": ("--skip",)}
+CSO_PY_VALUE_OPTS = {"javis_preflight.py": ("--skip", "--only")}
 CSO_ESSENTIAL_PY_TOOLS = {"javis_cycle_autopilot.py"}
 
 # 읽기 전용 셸(인자 규칙이 없는 것들). `sed` 는 **정본 §10-1 에서 의도적으로 뺐다** —
@@ -697,7 +726,10 @@ CSO_RG_OPT_DENY = ("--pre", "--hostname-bin", "--search-zip", "-z")
 #   대가(정직): `"시각: $(date)"` 같은 무해한 치환도 막힌다 — 값을 먼저 구해 인자로 넣어야 한다.
 CSO_SUBST_MARKERS = ("$(", "`", "<(", ">(")
 # 리다이렉트 대상으로 항상 허용되는 장치(파일 쓰기가 아니다).
-NULL_SINKS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "nul", "NUL"}
+# ★triage T9: **플랫폼별로** 만든다(`BUILDER_NULL_SINKS` 와 같은 상수에서 파생 — 축 1지점).
+#   unix 에서 `NUL`/`nul` 은 장치가 아니라 cwd 의 일반 파일이고, nt 에서 `/dev/*` 는 없다.
+NULL_SINKS = set(PLATFORM_NULL_DEVICES) | (
+    {"/dev/stdout", "/dev/stderr", "/dev/tty"} if os.name != "nt" else set())
 
 
 # ── 공용 술어 ────────────────────────────────────────────────────────────────
@@ -945,47 +977,89 @@ WORD_BREAK = " \t;&|()<>"
 #   사람이 보는 문자열로 되돌릴 때만 `_txt` 로 복원한다.
 SENT_DOLLAR = "\x01"
 SENT_TILDE = "\x02"
+# **확장** 센티널: 이것이 남아 있는 문자열은 그 자리에서 셸이 확장을 하지 않는다는 사실을
+# 정규화 끝까지(`_norm`) 들고 간다.
 SENTINELS = (SENT_DOLLAR, SENT_TILDE)
+# ★인용된 셸 구두점(triage T5): 큰/작은따옴표·백슬래시 뒤의 `< > & | ; ( )` 는 bash 에게
+#   **평범한 문자**다. shlex 는 따옴표를 벗겨 돌려주므로 토큰에서 그 사실이 사라지고, 판정기가
+#   그것을 연산자로 읽어 **다음 토큰을 리다이렉트 대상으로 삼켜** 금지 옵션을 판정에서 지웠다
+#   (`cys send --to master '>' --clear-first`). 그래서 인용 출처를 토큰까지 들고 간다.
+#   ★확장 센티널과 **집합을 가른다**(codex 설계비평 B-3): 하나로 합치면 `"$HOME > ready"`
+#   같은 정상 보고가 '혼합 확장' 으로 거부된다.
+PUNCT_SENTINELS = {"<": "\x11", ">": "\x12", "&": "\x13", "|": "\x14",
+                   ";": "\x15", "(": "\x16", ")": "\x17"}
+ALL_SENTINELS = SENTINELS + tuple(PUNCT_SENTINELS.values())
+_UNSENTINEL = dict([(v, k) for k, v in PUNCT_SENTINELS.items()]
+                   + [(SENT_DOLLAR, "$"), (SENT_TILDE, "~")])
 
 
 def _txt(tok):
-    """센티널을 원래 문자로 되돌린 **사람이 보는·셸이 넘기는** 문자열."""
-    return str(tok).replace(SENT_DOLLAR, "$").replace(SENT_TILDE, "~")
+    """센티널을 원래 문자로 되돌린 **사람이 보는·셸이 넘기는** 문자열.
+
+    ★구조 판정(연산자·경계·경로 정규화) **전에는 부르지 않는다** — 복원하는 순간 인용 출처가
+      사라져 결함이 되살아난다(codex 설계비평 B-2). 사유 문면·승인 조회 문자열 전용이다.
+    """
+    st = str(tok)
+    for sent, ch in _UNSENTINEL.items():
+        if sent in st:
+            st = st.replace(sent, ch)
+    return st
 
 
 def _has_sentinel(tok):
+    """**확장** 센티널(리터럴 `$`·`~`)을 담고 있는가 — 구두점 센티널은 세지 않는다."""
     return any(x in str(tok) for x in SENTINELS)
 
 
 def cso_prepare(command):
-    """(prepared|None, err|None) — 토큰화 직전 문자열. 리터럴 `$`·`~` 를 센티널로 바꾼다."""
-    if any(x in (command or "") for x in SENTINELS):
-        return None, ("제어문자(U+0001·U+0002)가 들어 있다 — 판정기의 내부 표기와 충돌하므로 "
-                      "거부한다")
+    """(prepared|None, err|None) — 토큰화 직전 문자열. **셸이 확장하지 않는 표기**를 센티널로.
+
+    셋을 덮는다(triage T4·T5 — 셋 다 "판정기가 보는 명령 ≠ bash 가 실행하는 명령"의 한 뿌리):
+      ⓐ 리터럴 `$` — 작은따옴표 안·백슬래시 이스케이프(**큰따옴표 안은 확장된다** — 제외).
+      ⓑ 리터럴 `~` — 작은따옴표·**큰따옴표**·이스케이프 **전부**, 그리고 인용 밖이라도
+        **단어 시작이 아닌** 자리(`''~/x`·`a~/x`). bash 는 어떤 따옴표 안에서도, 단어 중간에서도
+        틸드를 확장하지 않는다 — 그런데 판정기는 `_resolve_pack_token`·`expanduser` 로 그것을
+        설치 팩 도구로 정규화해 **임의 사본 실행**을 승인했다.
+      ⓒ 인용된 셸 구두점 — 연산자가 아니라 인자다(`'>'` 가 다음 옵션을 삼키던 갈래).
+    """
+    if any(x in (command or "") for x in ALL_SENTINELS):
+        return None, ("제어문자(U+0001·U+0002·U+0011~U+0017)가 들어 있다 — 판정기의 내부 표기와 "
+                      "충돌하므로 거부한다")
     cleaned, mask = scan_shell(command)
     out = []
+    at_word_start = True
     for i, ch in enumerate(cleaned):
         m = mask[i]
+        if m == "u" and ch in WORD_BREAK:
+            out.append(ch)
+            at_word_start = True
+            continue
         if m in ("s", "e") and ch == "$":
             out.append(SENT_DOLLAR)
-        elif m in ("s", "e") and ch == "~":
+        elif ch == "~" and (m in ("s", "e", "d")
+                            or (m == "u" and not at_word_start)):
             out.append(SENT_TILDE)
+        elif m != "u" and ch in PUNCT_SENTINELS:
+            out.append(PUNCT_SENTINELS[ch])
         else:
             out.append(ch)
+        at_word_start = False
     return "".join(out), None
 
 
 def _resolve_token(tok, ctx):
-    """확장 **가능한** 표기만 푼다. 리터럴 `$`·`~` 는 그대로 두고 복원한다.
+    """확장 **가능한** 표기만 푼다 — 리터럴 센티널은 **그대로 남긴다**.
 
-    혼합 토큰(리터럴 + 확장이 한 단어에 섞임)은 효과를 한 값으로 말할 수 없으므로 None 이다.
+    ★triage T4: 종전엔 리터럴 토큰을 `_txt` 로 **복원**해 돌려줬고, 그 뒤 `_norm` 의
+      `os.path.expanduser` 가 인용된 `~` 를 **다시** 확장해 설치 팩 `bin/` 아래로 정규화했다
+      (임의 python 사본이 판정 도구로 승인됐다 — 실행 실증됨). 리터럴 출처는 정규화 끝까지
+      따라가야 하므로 센티널을 유지한다(`_norm` 이 그것을 보고 expanduser 를 적용하지 않는다).
+    ★혼합 토큰도 **판정한다**(codex 설계비평 A-3): 센티널은 `_resolve_pack_token` 의 어떤
+      패턴과도 일치하지 않으므로, 확장 가능한 부분만 풀리고 리터럴 부분은 리터럴로 남는다 —
+      `cys send --to master "$HOME ~ 확인"` 같은 정상 보고를 막지 않는다(오탐의 귀결이
+      'CSO 가 보고하지 못한다' 여서는 안 된다 · 계획 §3-3).
     """
-    st = str(tok)
-    if _has_sentinel(st):
-        if "$" in st or st.startswith("~"):
-            return None                   # 혼합 표기 — 판정 불가
-        return _txt(st)
-    return _resolve_pack_token(st, ctx)
+    return _resolve_pack_token(str(tok), ctx)
 
 
 def cso_expansion_hazard(command):
@@ -1023,23 +1097,37 @@ def cso_expansion_hazard(command):
             if (not prev or prev in WORD_BREAK) and nxt and nxt not in ("/",) + tuple(WORD_BREAK):
                 return ("틸드 확장 `~%s…` 는 게이트가 값을 알 수 없다(허용 표기는 `~/…` 뿐이다)"
                         % nxt)
-    # 중괄호 확장: 인용 밖 `{` … `}` 사이에 인용 밖 `,` 또는 `..` 가 있으면 인자가 늘어난다.
-    depth_start = None
+    return brace_expansion_hazard(command)
+
+
+def brace_expansion_hazard(command):
+    """(err|None) — 인용 밖 중괄호 확장(`{a,b}`·`{a..b}`)이 인자 **개수**를 바꾸는가.
+
+    ★triage T2: 종전 스캔은 `{` 를 만날 때마다 시작 위치를 **덮어써서**, 안쪽 쌍이 먼저 닫히면
+      바깥 쌍을 통째로 잃었다 — `--{clear-first,x{y}}` 는 bash 에서 `--clear-first`(대상 pane
+      입력 버퍼 Ctrl-U · 메시지 유실 방향)로 펼쳐지는데 **검사 자체를 받지 못했다**.
+      짝을 정확히 꺼내는 **스택**으로 바꾼다(안쪽 쌍을 소비해도 바깥 쌍은 남는다).
+    ★triage T3: reviewer 의 write-shell deny 에는 중괄호 처리가 **아예 없었다**
+      (`rm{,x} <path>` → bash 는 `rm` 을 실제로 돌린다). 그래서 이 술어를 따로 떼어
+      `bash_has_write` 도 **거부 방향으로만** 태운다.
+    """
+    cleaned, mask = scan_shell(command)
+    stack = []
     for i, ch in enumerate(cleaned):
         if mask[i] != "u":
             continue
         if ch == "{":
-            depth_start = i
-        elif ch == "}" and depth_start is not None:
-            inner = cleaned[depth_start + 1:i]
-            inner_mask = mask[depth_start + 1:i]
+            stack.append(i)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            inner = cleaned[start + 1:i]
+            inner_mask = mask[start + 1:i]
             has_comma = any(c == "," and inner_mask[j] == "u" for j, c in enumerate(inner))
             has_range = any(inner[j:j + 2] == ".." and inner_mask[j:j + 2] == "uu"
                             for j in range(len(inner) - 1))
             if has_comma or has_range:
                 return ("중괄호 확장 `{%s}` 은 한 토큰이 여러 인자로 늘어난다 — 늘어난 인자를 "
                         "판정할 수 없으므로 거부한다(풀어서 적어라)" % inner)
-            depth_start = None
     return None
 
 
@@ -1083,7 +1171,17 @@ def bash_has_write(command):
     해석불가=True(fail-closed). 리다이렉트 대상이 허용경로(tmp/log)면 그 리다이렉트는 무시."""
     # ★reviewer 경로도 **같은** 전처리를 쓴다 — 종전의 `replace("\n", " ; ")` 는 인용 안 개행을
     #   경계로 만들고 주석을 shlex 에 맡겨(=명령 은닉) 같은 우회를 열어 뒀다.
-    tokens = _tokenize(split_unquoted_newlines(command))
+    # ★triage T3: 중괄호 확장은 **거부 방향으로만** 태운다. reviewer 경로는 allowlist 가 아니라
+    #   deny 목록이라, 확장으로 인자가 늘어나면 판정기가 본 명령과 셸이 실행하는 명령이 갈린다
+    #   (`rm{,x} /x/build` → bash 는 `rm` 을 실제로 돌려 파일을 지운다).
+    if brace_expansion_hazard(command):
+        return True
+    # ★triage T5: 인용된 리다이렉트 문자를 연산자로 읽어 **다음 토큰을 삼키던** 갈래도 여기서
+    #   닫는다 — `cso_prepare` 가 인용 출처를 토큰까지 들고 간다(구두점 센티널).
+    prepared, _perr = cso_prepare(command)
+    if _perr:
+        return True  # 제어문자 충돌 — fail-closed(변형으로 간주)
+    tokens = _tokenize(prepared)
     if tokens is None:
         return True  # 따옴표 불일치 등 — fail-closed(변형으로 간주)
 
@@ -1096,7 +1194,8 @@ def bash_has_write(command):
         if _is_redirect_op(tok):
             target = tokens[i + 1] if i + 1 < n else ""
             fd_dup = target.isdigit() and _is_fd_dup_op(tok)
-            if target not in NULL_SINKS and not fd_dup and not path_is_allowed(target):
+            if (_txt(target) not in NULL_SINKS and not fd_dup
+                    and not path_is_allowed(_txt(target))):
                 return True
             i += 2
             continue
@@ -1166,8 +1265,14 @@ def _norm(p):
     """
     if p is None:
         return ""
+    # ★triage T4: **리터럴 출처를 여기까지 들고 온다**. 인용된 `~`·`$`(센티널)는 셸이 확장하지
+    #   않으므로 `expanduser` 를 적용하면 안 된다 — 적용하면 `"~/.cys/pack/bin/x.py"` 가 설치 팩
+    #   도구로 정규화되지만 셸은 `./~/.cys/pack/bin/x.py`(같은 이름의 **다른 파일**)를 넘긴다.
+    _raw = str(p)
+    _literal = any(x in _raw for x in SENTINELS)
+    _raw = _txt(_raw)
     try:
-        ap = os.path.abspath(os.path.expanduser(str(p)))
+        ap = os.path.abspath(_raw if _literal else os.path.expanduser(_raw))
         # ★심링크·junction 을 따라간다(R1 blocking · codex 실증: 감사 워크트리에서 `hooks` 와
         #   `HOOKS` 가 samefile · 허용 뿌리 안의 링크가 밖을 가리키면 경계가 이름뿐이었다).
         #   존재하지 않는 경로에서도 realpath 는 **존재하는 앞부분만** 해소하고 나머지는 그대로
@@ -1175,7 +1280,7 @@ def _norm(p):
         ap = os.path.realpath(ap)
     except (TypeError, ValueError, OSError):
         try:
-            ap = os.path.abspath(os.path.expanduser(str(p)))
+            ap = os.path.abspath(_raw if _literal else os.path.expanduser(_raw))
         except (TypeError, ValueError):
             return ""
     ap = ap.replace("\\", "/")
@@ -1496,6 +1601,13 @@ def _py_segment_verdict(tokens, ctx):
     if resolved is None:
         return False, ("스크립트 경로의 변수를 해소할 수 없다 — 허용 표기는 "
                        "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` 뿐이다"), False
+    # ★triage T4(codex 설계비평 A-3): 리터럴 `~`·`$` 로 적힌 경로는 **cwd 가 어디든** 설치 팩
+    #   도구가 아니다 — `./~/…` 는 같은 이름의 다른 파일이다. `_norm` 의 리터럴 처리와 별개로
+    #   여기서 명시 거부해서, cwd 가 우연히 팩 아래일 때 `_under` 가 참이 되는 갈래를 닫는다.
+    if any(x in resolved for x in SENTINELS):
+        return False, ("인용된 `~`·`$` 는 셸이 확장하지 않는다 — `%s` 는 설치 팩 판정 도구가 "
+                       "아니라 현재 디렉터리 아래의 **같은 이름 파일**이다"
+                       % _txt(resolved)), False
     base = os.path.basename(resolved.replace("\\", "/"))
     if base not in CSO_PY_TOOLS:
         return False, "판정 도구 목록 밖 스크립트: %s" % base, False
@@ -1504,7 +1616,7 @@ def _py_segment_verdict(tokens, ctx):
     bin_root = os.path.join(ctx.pack, "bin")
     if not _under(resolved, bin_root):
         return False, ("판정 도구는 설치 팩 `%s` 아래에서만 실행한다(같은 이름의 사본은 "
-                       "판정 도구가 아니다): %s" % (bin_root, resolved)), False
+                       "판정 도구가 아니다): %s" % (bin_root, _txt(resolved))), False
     args = tokens[idx + 1:]
     for bad in CSO_PY_ARG_DENY.get(base, ()):  # 변이 플래그(접두 축약 포함)
         if any(_arg_hits_deny(a, bad) for a in args):
@@ -1725,17 +1837,24 @@ def cso_bash_verdict(command, ti, ctx):
     if err:
         return True, err, False
     for op, target in redirects:
-        if target in NULL_SINKS:
+        if _txt(target) in NULL_SINKS:
             continue
         if target.isdigit() and _is_fd_dup_op(op):
             continue      # `2>&1` 류 fd 복제만 숫자 대상을 허용한다(`> 1` 은 파일이다)
-        target = _txt(target)
+        # ★triage T9: 이 플랫폼의 폐기 장치가 **아닌** 예약 이름(unix 의 `NUL`)은 거부한다.
+        #   unix bash 는 그것으로 cwd 에 일반 파일을 만들거나 자른다 — '폐기하려는 의도' 와
+        #   '파일을 만드는 사실' 이 갈리는 표기는 판정하지 않는다(`/dev/null` 로 적으면 된다).
+        _tname = os.path.basename(_txt(target).replace("\\", "/"))
+        if _tname in FOREIGN_NULL_NAMES:
+            return True, ("`%s` 는 이 플랫폼의 폐기 장치가 아니다 — %s 에서는 **평범한 파일**을 "
+                          "만들거나 자른다(폐기하려면 `%s` 로 적어라)"
+                          % (_txt(target), os.name, PLATFORM_NULL_DEVICES[0])), False
         ok, why = cso_path_allowed(target, ctx)
         if not ok:
-            return True, "출력 리다이렉트 대상 %r: %s" % (target, why), False
+            return True, "출력 리다이렉트 대상 %r: %s" % (_txt(target), why), False
         if is_cso_state_file(target):
             return True, ("상태 파일(%s)에 셸 리다이렉트로 쓰면 64KB 상한 검사를 건너뛴다 — "
-                          "Write/Edit 도구를 써라" % target), False
+                          "Write/Edit 도구를 써라" % _txt(target)), False
     if not segs:
         return False, "실행 세그먼트 없음", False
     essential = True
@@ -3148,6 +3267,81 @@ def self_test_r2(fails):
             os.chdir(_cwd0)
         except OSError:
             pass
+
+    # ⑭ ★독립 재유도(triage 2026-09-08) — "판정기가 보는 명령 ≠ bash 가 실행하는 명령"의 잔여
+    #    다섯 갈래(T1·T2·T3·T4·T5)와 플랫폼 폐기 이름(T9). 전부 bash 실측으로 확정된 표기다.
+    # T1/T7: `--config` 는 분리·결합 표기가 **같은 검증**을 받는다 + 키 경계
+    rv(True, "cargo --config=target.aarch64-apple-darwin.runner=['/tmp/r.sh'] test --offline",
+       "결합 표기 실행기 주입")
+    rv(False, "cargo --config=build.jobs=2 test", "결합 표기의 아는 키")
+    rv(True, "cargo --config build.jobsX=2 test", "아는 키의 접두를 빌린 모르는 키")
+    rv(True, "cargo --config=build.rustc-wrapper='/tmp/w' test", "결합 표기 래퍼 주입")
+    # T2: 중첩 중괄호(안쪽 쌍이 바깥 쌍을 지우던 갈래)
+    want(True, "Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+         "중첩 중괄호가 감춘 --clear-first")
+    want(True, "Bash", {"command": "tail -{f,x{y}} /w/pack/round/SESSION_STATE.md"},
+         "중첩 중괄호가 감춘 tail -f")
+    want(False, "Bash", {"command": "cys send --to master '{a,b} 는 본문이다'"},
+         "인용 안 중괄호는 여전히 본문이다(오탐 금지)")
+    # T3: reviewer write-shell deny 에도 중괄호 술어를 태운다(거부 방향 전용)
+    rv(True, "rm{,x} /w/repo/build", "중괄호로 감춘 rm")
+    rv(True, "git{,x} commit -m x", "중괄호로 감춘 git commit")
+    rv(True, "c{p,q} /w/a /w/b", "중괄호로 감춘 cp")
+    # T4: 인용된 틸드 = 리터럴 상대 경로(정상 설치 형상에서 잰다 — 뿌리가 달라 우연히 거부되면
+    #     그 검체는 공허하다 · codex 지적)
+    _hpack = HOME + "/.cys/pack"
+
+    def ctx_home_pack():
+        return Ctx(pack=_hpack, state=STATE, home=HOME, reader=reader, tempdir="/w/tmp")
+
+    for _q, _lab in (('"', "큰따옴표"), ("'", "작은따옴표")):
+        want(True, "Bash",
+             {"command": "python3 %s~/.cys/pack/bin/javis_preflight.py%s --self-test"
+                         % (_q, _q)},
+             "%s 안 틸드는 확장되지 않는다" % _lab, c=ctx_home_pack())
+    want(True, "Bash",
+         {"command": "python3 ''~/.cys/pack/bin/javis_preflight.py --self-test"},
+         "빈 인용 접합 뒤의 틸드는 단어 시작이 아니다", c=ctx_home_pack())
+    want(False, "Bash",
+         {"command": "python3 ~/.cys/pack/bin/javis_preflight.py --self-test"},
+         "인용 없는 `~/…` 는 확장된다(오탐 금지)", c=ctx_home_pack())
+    want(False, "Bash", {"command": "cys send --to master \"$HOME ~ 아래를 확인했다\""},
+         "확장과 리터럴이 한 인자에 섞여도 본문은 본문이다(오탐 금지)")
+    # T5: 인용된 리다이렉트 문자는 연산자가 아니라 인자다(다음 옵션을 삼키지 않는다).
+    #     ★cwd 를 **허용 스크래치로 고정**해서 잰다 — 상대 경로 판정이 실행 위치에 따라 갈리면
+    #       그 검체는 우연히 통과한다(삼켜진 `--clear-first` 가 '허용 밖 대상' 으로 대신 거부되면
+    #       음성 대조가 공허해진다 · codex 가 지적한 픽스처 오염과 같은 층).
+    _t5 = None
+    _cwd1 = os.getcwd()
+    try:
+        _t5 = tempfile.mkdtemp(prefix="capgate-r2t5-")
+        os.chdir(_t5)
+
+        def ctx_scratch():
+            return Ctx(pack=PACK, state=STATE, home=HOME, reader=reader, tempdir=_t5)
+
+        want(True, "Bash", {"command": "cys send --to master '>' --clear-first"},
+             "인용된 `>` 가 삼킨 --clear-first", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys send --to master ">" --clear-first'},
+             "큰따옴표 판도 같다", c=ctx_scratch())
+        want(True, "Bash", {"command": "cys send --to master \\> --clear-first"},
+             "이스케이프 판도 같다", c=ctx_scratch())
+    except OSError:
+        pass
+    finally:
+        try:
+            os.chdir(_cwd1)
+        except OSError:
+            pass
+        if _t5:
+            try:
+                os.rmdir(_t5)
+            except OSError:
+                pass
+    # T9: 이 플랫폼의 폐기 장치가 아닌 예약 이름
+    want(os.name != "nt", "Bash", {"command": "cys status > NUL"},
+         "unix 의 `NUL` 은 폐기 장치가 아니라 일반 파일이다")
+    want(False, "Bash", {"command": "cys status > /dev/null"}, "실제 폐기 장치는 통과")
     return fails
 
 

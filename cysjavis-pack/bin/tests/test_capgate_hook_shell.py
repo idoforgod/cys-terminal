@@ -495,9 +495,31 @@ class NegativeControls(unittest.TestCase):
         ("리터럴 `$`·`~` 센티널(인용 인지)",
          '        if m in ("s", "e") and ch == "$":\n'
          "            out.append(SENT_DOLLAR)\n"
-         '        elif m in ("s", "e") and ch == "~":\n'
+         '        elif ch == "~" and (m in ("s", "e", "d")\n'
+         '                            or (m == "u" and not at_word_start)):\n'
          "            out.append(SENT_TILDE)\n",
          "        if False:\n            pass\n"),
+        # ★triage(2026-09-08) — 판정기와 bash 가 갈리던 잔여 갈래. 검사를 지우면 self_test_r2 ⑭가
+        #   실패해야 한다(음성 대조가 공허하지 않은지는 이 목록의 존재 이유다).
+        ("인용/비-단어시작 틸드 인지(T4)",
+         '        elif ch == "~" and (m in ("s", "e", "d")\n'
+         '                            or (m == "u" and not at_word_start)):',
+         '        elif m in ("s", "e") and ch == "~":'),
+        ("인용된 셸 구두점 센티널(T5)",
+         '        elif m != "u" and ch in PUNCT_SENTINELS:\n'
+         "            out.append(PUNCT_SENTINELS[ch])\n",
+         "        elif False:\n            pass\n"),
+        ("중괄호 짝 스택(T2)",
+         '        if ch == "{":\n            stack.append(i)',
+         '        if ch == "{":\n            stack[:] = [i]'),
+        ("reviewer 경로 중괄호 술어(T3)",
+         "    if brace_expansion_hazard(command):\n        return True\n", ""),
+        ("값 옵션 결합 표기(T1)",
+         '        _vopt = next((o for o in value_opts if t == o or t.startswith(o + "=")), None)',
+         "        _vopt = t if t in value_opts else None"),
+        ("cargo --config 키 경계(T1)",
+         "        elif v == k or v.startswith(k + \"=\"):",
+         "        elif v.startswith(k):"),
         ("인용 밖 변수 확장 거부", '        if ch == "$":', "        if False:"),
         ("글롭 거부", "        if ch in GLOB_CHARS:", "        if False:"),
         ("변수 이름 경계", "_VAR_PACK_RE = re.compile(r\"\\$CYS_PACK_DIR(?![A-Za-z0-9_])\")",
@@ -525,7 +547,7 @@ class NegativeControls(unittest.TestCase):
          'DIVERGENT_CHARS = ZERO_WIDTH_CHARS + ("\\r",)',
          "DIVERGENT_CHARS = ZERO_WIDTH_CHARS"),
         ("cargo --config 키 allowlist",
-         '            if base == "cargo" and t == "--config":',
+         '            if base == "cargo" and _vopt == "--config":',
          "            if False:"),
         ("선행 환경 할당 거부",
          '        _eqh = raw_head.split("=", 1)[0]', "        _eqh = \"\""),
@@ -562,6 +584,165 @@ class NegativeControls(unittest.TestCase):
                              "음성 대조 패턴이 코드와 어긋난다(검체가 낡았다): %s" % missing)
             self.assertEqual(blind, [],
                              "검사를 지워도 self-test 가 통과한다(사각지대): %s" % blind)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★독립 재유도(triage 2026-09-08 · P2-WP3A-capgate) — "판정기가 보는 명령 ≠ bash 가 실행하는
+#   명령" 의 잔여 4갈래. 각 케이스는 **먼저 bash 로 실제 확장을 관측**해서 픽스처가 사실임을
+#   증명하고(픽스처가 틀리면 검체가 공허하다 — codex 가 `/w/home` 틸드 검체에서 지적한 것이
+#   바로 그것이다), 같은 문자열을 훅에 넣어 판정을 잰다.
+# ─────────────────────────────────────────────────────────────────────────────
+@NEED_SH
+class TriageQuotingAndExpansion(_HookEnv):
+    """인용·중괄호 표기로 게이트가 열리는 갈래(triage CONFIRMED 6종)."""
+
+    def bash_words(self, snippet):
+        """bash 가 그 조각을 어떤 **인자들**로 펼치는가(확장을 실행하지 않고 관측만)."""
+        r = subprocess.run([SH, "-c", "printf '%s\\n' " + snippet],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.splitlines()
+
+    def run_hook_in(self, cwd, tool="Bash", tool_input=None, session_id="s-1", **envkw):
+        """`run_hook` 과 같되 **cwd 를 고정**한다 — 상대 경로 판정이 검체 실행 위치에 따라
+        갈리면 그 검체는 우연히 통과한다(codex 가 지적한 픽스처 오염과 같은 층)."""
+        env = dict(self.env)
+        env.update({k: str(v) for k, v in envkw.items()})
+        payload = json.dumps({"session_id": session_id, "tool_name": tool,
+                              "tool_input": tool_input or {}})
+        r = subprocess.run([SH, str(HOOK)], input=payload, env=env, cwd=str(cwd),
+                           capture_output=True, text=True, timeout=90)
+        return HookRun(r.returncode, r.stdout, r.stderr)
+
+    def home_pack(self):
+        """정상 설치 형상(`$HOME/.cys/pack`) — 틸드 판정을 실기와 같은 세계에서 잰다."""
+        pack = self.home / ".cys" / "pack"
+        (pack / "bin").mkdir(parents=True, exist_ok=True)
+        (pack / "round").mkdir(parents=True, exist_ok=True)
+        return pack
+
+    # ── ① 인용된 틸드 = 리터럴 상대 경로(임의 python 사본 실행) ─────────────────
+    def test_double_quoted_tilde_is_not_the_installed_pack_tool(self):
+        """★triage blocking(codex): bash 는 **큰따옴표 안 틸드를 확장하지 않는다**.
+
+        판정기는 `_norm`(expanduser)으로 그것을 설치 팩 도구로 정규화해 통과시키지만,
+        셸은 cwd 아래 `./~/.cys/pack/bin/javis_preflight.py` 를 실행한다 — 같은 이름의
+        **다른 파일**이다(동명 사본 실행 차단이 무너진다).
+        """
+        self.assertEqual(self.bash_words('"~/x"'), ["~/x"],
+                         "선행 사실: bash 가 큰따옴표 안 틸드를 확장하지 않는다")
+        pack = self.home_pack()
+        r = self.run_hook("Bash",
+                          {"command": 'python3 "~/.cys/pack/bin/javis_preflight.py" --self-test'},
+                          CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertTrue(r.denied,
+                        "인용된 틸드가 설치 팩 도구로 오인돼 통과했다(임의 사본 실행): %r/%r"
+                        % (r.out, r.err))
+
+    def test_single_quoted_tilde_is_not_the_installed_pack_tool(self):
+        """작은따옴표도 같다 — 센티널로 복원한 뒤 `_norm` 이 다시 확장해 버린다."""
+        self.assertEqual(self.bash_words("'~/x'"), ["~/x"],
+                         "선행 사실: bash 가 작은따옴표 안 틸드를 확장하지 않는다")
+        pack = self.home_pack()
+        r = self.run_hook("Bash",
+                          {"command": "python3 '~/.cys/pack/bin/javis_preflight.py' --self-test"},
+                          CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertTrue(r.denied,
+                        "작은따옴표 틸드가 통과했다(임의 사본 실행): %r/%r" % (r.out, r.err))
+
+    # ── ② 인용된 리다이렉트 문자가 금지 옵션을 삼킨다 ──────────────────────────
+    def test_quoted_redirection_operator_does_not_swallow_the_next_option(self):
+        """★triage blocking(codex): `'>'` 는 **연산자가 아니라 인자**다.
+
+        판정기는 그것을 리다이렉트로 읽고 **다음 토큰을 대상으로 소비**해서, 금지 옵션
+        `--clear-first`(대상 pane 입력 버퍼 Ctrl-U)가 판정에서 사라진 채 실행된다.
+        """
+        self.assertEqual(self.bash_words("'>' --clear-first"), [">", "--clear-first"],
+                         "선행 사실: 인용된 `>` 는 인자다")
+        deny_plain = self.run_hook_in(self.tmpdir, "Bash",
+                                      {"command": "cys send --to master --clear-first"},
+                                      CYS_ROLE="cso")
+        self.assertTrue(deny_plain.denied, "대조군: 인용 없는 --clear-first 는 이미 deny 다")
+        r = self.run_hook_in(self.tmpdir, "Bash",
+                             {"command": "cys send --to master '>' --clear-first"},
+                             CYS_ROLE="cso")
+        self.assertTrue(r.denied,
+                        "인용된 `>` 가 금지 옵션을 삼켜 통과했다: %r/%r" % (r.out, r.err))
+
+    # ── ③ 중첩 중괄호가 확장 위험 판정을 무력화한다 ───────────────────────────
+    def test_nested_brace_expansion_is_refused(self):
+        """★triage blocking(claude): `--{clear-first,x{y}}` 는 `--clear-first` 로 펼쳐진다.
+
+        `cso_expansion_hazard` 의 중괄호 스캔은 `{` 마다 `depth_start` 를 **덮어써서**
+        안쪽 쌍이 닫히면 바깥 쌍을 잃는다(쉼표를 가진 바깥 쌍이 통째로 무검사).
+        """
+        self.assertEqual(self.bash_words("--{clear-first,x{y}}"),
+                         ["--clear-first", "--x{y}"],
+                         "선행 사실: 중첩 중괄호도 인자를 늘린다")
+        r = self.run_hook("Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+                          CYS_ROLE="cso")
+        self.assertTrue(r.denied,
+                        "중첩 중괄호가 금지 옵션을 숨겼다: %r/%r" % (r.out, r.err))
+
+    def test_nested_brace_expansion_is_refused_for_stream_flags(self):
+        """같은 구멍으로 `tail -f`(종결 없는 관측)가 통과한다."""
+        self.assertEqual(self.bash_words("-{f,x{y}}"), ["-f", "-x{y}"],
+                         "선행 사실: 중첩 중괄호가 `-f` 를 만든다")
+        pack = self.home_pack()
+        target = str(pack / "round" / "SESSION_STATE.md")
+        (pack / "round" / "SESSION_STATE.md").write_text("s", encoding="utf-8")
+        plain = self.run_hook("Bash", {"command": "tail -f %s" % target},
+                              CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertTrue(plain.denied, "대조군: `tail -f` 는 이미 deny 다")
+        r = self.run_hook("Bash", {"command": "tail -{f,x{y}} %s" % target},
+                          CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertTrue(r.denied,
+                        "중첩 중괄호로 `tail -f` 가 통과했다: %r/%r" % (r.out, r.err))
+
+    def test_reviewer_write_shell_survives_brace_expansion(self):
+        """★triage(claude major): reviewer 의 write-shell deny 에는 중괄호 처리가 **아예 없다**.
+
+        `rm{,x} <path>` 는 bash 에서 `rm rmx <path>` 이고 `rm` 이 실제로 돈다
+        (producer≠evaluator 의 기계 집행이 표기 하나로 사라진다).
+        """
+        self.assertEqual(self.bash_words("rm{,x} /x/build"), ["rm", "rmx", "/x/build"],
+                         "선행 사실: `rm{,x}` 의 첫 인자는 `rm` 이다")
+        plain = self.run_hook("Bash", {"command": "rm -rf /x/build"},
+                              CYS_ROLE="reviewer-codex")
+        self.assertTrue(plain.denied, "대조군: `rm -rf` 는 이미 deny 다")
+        r = self.run_hook("Bash", {"command": "rm{,x} /x/build"}, CYS_ROLE="reviewer-codex")
+        self.assertTrue(r.denied,
+                        "중괄호 표기로 write-shell deny 가 통과했다: %r/%r" % (r.out, r.err))
+
+    # ── ④ `--opt=value` 결합 표기가 값 검사를 건너뛴다 ─────────────────────────
+    def test_cargo_config_equals_form_is_validated(self):
+        """★triage blocking(claude)/major(codex): `--config=<k=v>` 는 `t in value_opts` 를
+        만족하지 못해 `CARGO_CONFIG_SAFE_KEYS` 검증을 통째로 건너뛴다 — 분리 표기는 deny 인데
+        결합 표기는 allow 다(실행기 주입 경로가 그대로 남는다)."""
+        inj = "target.aarch64-apple-darwin.runner=['/tmp/runner.sh']"
+        sep = self.run_hook("Bash", {"command": "cargo --config %s test --offline" % inj},
+                            CYS_ROLE="reviewer-codex")
+        self.assertTrue(sep.denied, "대조군: 분리 표기는 이미 deny 다")
+        r = self.run_hook("Bash", {"command": "cargo --config=%s test --offline" % inj},
+                          CYS_ROLE="reviewer-codex")
+        self.assertTrue(r.denied,
+                        "`--config=` 결합 표기가 실행기 주입 검증을 건너뛰었다: %r/%r"
+                        % (r.out, r.err))
+
+    # ── ⑤ Windows 예약 이름이 unix 에서는 평범한 파일이다 ─────────────────────
+    @unittest.skipIf(os.name == "nt", "unix 전용 계약(nt 에서는 NUL 이 실제 장치다)")
+    def test_unix_NUL_redirect_is_an_ordinary_file(self):
+        """★triage(codex major): `> NUL` 은 unix 에서 **cwd 의 일반 파일**을 만들거나 자른다.
+
+        `NULL_SINKS` 가 철자만 보고 경로 보호를 면제한다(플랫폼 분기 없음).
+        """
+        r = self.run_hook_in(self.tmpdir, "Bash", {"command": "cys status > NUL"},
+                             CYS_ROLE="cso")
+        self.assertTrue(r.denied,
+                        "`> NUL` 이 경로 검사를 면제받았다(unix 에서는 일반 파일이다): %r/%r"
+                        % (r.out, r.err))
+
 
 
 if __name__ == "__main__":
