@@ -250,25 +250,91 @@ FLEET_RUNNER_PROGRAMS = {
 #   프로그램 실행으로 인정한다(틀리는 방향 = 미계상 = 차단 안 함).
 #   ★codex 위임 검체 D4: `uv`/`pipx` 도 **하위 명령 필수**다 — `uv codex`·`pipx codex` 는 실행
 #     형상이 아닌데(그 런처에 그런 호출 규약이 없다) 종전 표는 codex 로 셌다(과대계상).
-FLEET_RUNNER_RULES = {
-    "uv":   (frozenset(("run", "tool", "x")), True),    # `uv run serena` · `uv tool uvx …`(실측)
-    "uvx":  (frozenset(), False),
-    "npx":  (frozenset(), False),
-    "bunx": (frozenset(), False),
-    "pipx": (frozenset(("run",)), True),
-    "npm":  (frozenset(("exec",)), True),
-    "pnpm": (frozenset(("exec", "dlx")), True),
-    "yarn": (frozenset(("exec", "dlx")), True),
+# ★R3(판정자 핀 2 · codex): 하위 명령은 **집합이 아니라 체인**이다. 종전의 `seen_sub` 는 허용
+#   하위명령을 **반복해서** 소비해 `npm exec exec codex` · `uv run run codex` 의 두 번째 토큰
+#   (=실행되는 프로그램/스크립트 이름)을 건너뛰고 그 뒤의 codex 를 실행 주체로 승격시켰다.
+#   체인표는 그 반복을 원천적으로 막는다 — `("exec","exec")` 는 어떤 체인의 접두도 아니다.
+#   ★`uv tool run` 은 `uvx` 의 정본 형태이고(uvx = uv tool run 별칭), `uv tool uvx` 는 이 기계의
+#     실측 형상이다. 둘 다 체인으로 명시한다 — 전역 '1회 소비' 규칙은 전자를 놓친다(codex).
+#   ★`pnpm dlx exec codex` 의 `exec` 는 프로그램/패키지 자리다 → 보수적 결과는 None(codex).
+FLEET_RUNNER_CHAINS = {
+    "uv":   frozenset((("run",), ("tool", "run"), ("tool", "uvx"), ("x",))),
+    "uvx":  frozenset(),
+    "npx":  frozenset(),
+    "bunx": frozenset(),
+    "pipx": frozenset((("run",),)),
+    "npm":  frozenset((("exec",),)),
+    "pnpm": frozenset((("exec",), ("dlx",))),
+    "yarn": frozenset((("exec",), ("dlx",))),
 }
-# ★codex 위임 검체 D7: 런처의 긴 옵션은 **기본이 불리언**이고, 값을 먹는 것만 열거한다.
-#   종전엔 모든 긴 옵션이 다음 토큰을 먹어 `npx --yes codex`(=`npx -y` 의 긴 형)가 미계상됐다.
-#   두 방향 모두 오차는 대체로 **미계상**이지만(값 토큰이 우리 프로그램 이름과 같아야 오탐),
-#   실재하는 형상을 잡는 쪽을 택한다.
-FLEET_RUNNER_VALUE_OPTS = frozenset((
-    "--from", "--with", "--python", "--prefix", "--package", "--index", "--index-url",
-    "--directory", "--cwd", "--registry", "--project", "--spec"))
-# 하위호환 상수(외부 임포터 보존) — 판정은 위 규칙표가 한다.
-FLEET_RUNNER_SUBCMDS = frozenset().union(*[r[0] for r in FLEET_RUNNER_RULES.values()])
+# ★R3(codex): 옵션 표는 **런처별**이다. 약어를 런처 전체에 합집합으로 적용하면 안 된다 —
+#   `-p` 는 npx 에서 `--package`(값), npm 에서 `--parseable`(불리언), uv 에서 `--python`(값)이다.
+#   합집합으로 두면 그중 한 해석이 다른 런처에서 값을 먹거나 안 먹어 실행 주체가 어긋난다.
+#   `-c`/`--call` 은 **셸 명령 문자열 모드**라 값 소비가 아니라 **언랩 종료**다(abort).
+#   표에 없는 이름은 `unknown` → 언랩 포기(미계상 = 차단 안 함). 리콜의 대가는 정직 고지 대상이다.
+_RUNNER_OPTS_EMPTY = {"value": frozenset(), "bool": frozenset(), "abort": frozenset()}
+_UV_OPTS = {
+    "value": frozenset(("-p", "--python", "--from", "--with", "--with-requirements", "-c",
+                        "--constraints", "--index", "--index-url", "--extra-index-url",
+                        "--directory", "--project", "--cache-dir", "--refresh-package",
+                        "--config-file", "--color")),
+    "bool": frozenset(("-q", "--quiet", "-v", "--verbose", "-n", "--no-cache", "--refresh",
+                       "--native-tls", "--offline", "--isolated", "--system", "--preview",
+                       "--no-project", "--frozen", "--locked", "--no-sync", "--no-config",
+                       "-h", "--help", "-V", "--version")),
+    "abort": frozenset(),
+}
+FLEET_RUNNER_OPTS = {
+    "uv": _UV_OPTS, "uvx": _UV_OPTS,
+    "npx": {
+        "value": frozenset(("-p", "--package", "--userconfig", "--cache", "--registry",
+                            "--node-options", "--prefix", "-C")),
+        "bool": frozenset(("-y", "--yes", "--no", "--no-install", "-q", "--quiet", "--silent",
+                           "--prefer-online", "--prefer-offline", "--offline",
+                           "--ignore-existing", "-h", "--help")),
+        "abort": frozenset(("-c", "--call")),      # 셸 명령 문자열 — 뒤는 그 셸의 몫이다
+    },
+    "npm": {
+        "value": frozenset(("-w", "--workspace", "-C", "--prefix", "--registry", "--userconfig",
+                            "--cache", "--node-options")),
+        "bool": frozenset(("-p", "--parseable", "-y", "--yes", "-g", "--global", "-s", "--silent",
+                           "--workspaces", "--no-workspaces", "-q", "--quiet", "--offline",
+                           "--prefer-online", "--prefer-offline", "--ignore-scripts",
+                           "-h", "--help")),
+        "abort": frozenset(("-c", "--call")),
+    },
+    "pnpm": {
+        "value": frozenset(("-C", "--dir", "-F", "--filter", "--package", "--registry",
+                            "--store-dir")),
+        "bool": frozenset(("-r", "--recursive", "-w", "--workspace-root", "-y", "--yes",
+                           "-s", "--silent", "--offline", "--prefer-offline", "-h", "--help")),
+        "abort": frozenset(("-c", "--shell-mode")),
+    },
+    "yarn": {
+        "value": frozenset(("--cwd", "--registry", "--cache-folder", "--modules-folder")),
+        "bool": frozenset(("-s", "--silent", "--no-lockfile", "--offline", "--prefer-offline",
+                           "-y", "--yes", "-h", "--help")),
+        "abort": frozenset(),
+    },
+    "pipx": {
+        "value": frozenset(("--python", "--spec", "--index-url", "--pip-args", "--suffix")),
+        "bool": frozenset(("-q", "--quiet", "--verbose", "-y", "--yes", "--force", "--no-cache",
+                           "--include-deps", "-h", "--help")),
+        "abort": frozenset(),
+    },
+    "bunx": {
+        "value": frozenset(),
+        "bool": frozenset(("-b", "--bun", "--silent", "--no-install", "-y", "--yes",
+                           "-h", "--help")),
+        "abort": frozenset(),
+    },
+}
+# 하위호환 상수(외부 임포터 보존) — 판정은 위 두 표가 한다.
+FLEET_RUNNER_RULES = {k: (frozenset(c[0] for c in v if c), bool(v))
+                      for k, v in FLEET_RUNNER_CHAINS.items()}
+FLEET_RUNNER_VALUE_OPTS = frozenset().union(*[o["value"] for o in FLEET_RUNNER_OPTS.values()])
+FLEET_RUNNER_SUBCMDS = frozenset().union(*[frozenset(t for c in v for t in c)
+                                           for v in FLEET_RUNNER_CHAINS.values()])
 FLEET_RUNNER_SCAN_MAX = 40       # 인자 스캔 상한(비용 상한 — 12 는 `node --flag`×12 형상에서 짧았다)
 # 런타임이 **코드 문자열**을 받는 모드. 이때는 뒤 토큰이 실행 대상이 아니므로 아예 언랩하지 않는다
 # (`python3 -c 'print(1)' /tmp/serena` 가 serena 로 오인되던 길 · codex 위임 검체 4).
@@ -289,6 +355,35 @@ _JS_VALUE_SHORT = "rC"          # `-r preload.js` · `-C condition`
 _PY_VALUE_LONG = frozenset(("--check-hash-based-pycs",))
 _JS_VALUE_LONG = frozenset(("--require", "--import", "--loader", "--experimental-loader",
                             "--conditions", "--max-old-space-size", "--inspect-port"))
+# ★R3(판정자 핀 2 · codex major B2 재발): **해석하지 못한 옵션 뒤의 토큰은 소유권의 양성 근거가
+#   아니다.** 종전엔 미열거 긴 옵션을 '불리언' 으로 가정하고 건너뛰어, 그 옵션의 **값**이 첫
+#   비옵션 경로 토큰이 되어 실행 주체로 승격됐다 —
+#     `node --diagnostic-dir /tmp/codex /tmp/report.js` → codex(실제 실행 대상은 report.js) ·
+#     `node --cpu-prof-dir …` · `node --test-reporter-destination /tmp/serena …`.
+#   그 한 행의 CPU 가 그대로 함대 합에 실려 기동 거부(hard)를 만든다.
+#   규칙: 옵션은 **값 소비·불리언·코드모드** 셋 중 하나로 *확정된 것만* 통과시키고, 그 밖은
+#   그 지점에서 언랩을 포기한다(`None` = 미계상 = 차단 안 함 = 0.14.31 이전과 같은 상태).
+#   ★대가(정직 고지 · codex 지적): `node --enable-source-maps /x/bin/codex` 처럼 표에 없는 진짜
+#     불리언 옵션 뒤의 우리 CLI 는 미계상된다. 표를 늘리는 것이 수리이고, 늘릴 때는 **정상 형상과
+#     '값이 codex 인 비함대 형상' 을 함께** 검체에 넣는다. 완전한 리콜은 포기한 것이다.
+#   ★`=` 형이라고 무조건 안전하지 않다(codex): `node --run=build /tmp/codex` 는 값 소비가 끝났어도
+#     **실행 모드**가 바뀌어 뒤 토큰이 Node 의 스크립트가 아니다. 그래서 `=` 형도 이름이 표에
+#     있어야 통과한다(`--run` 은 어느 표에도 없다 → 포기).
+_JS_BOOL_LONG = frozenset((
+    "--enable-source-maps", "--experimental-vm-modules", "--experimental-modules",
+    "--experimental-json-modules", "--experimental-specifier-resolution",
+    "--no-warnings", "--trace-warnings", "--trace-uncaught", "--trace-exit",
+    "--throw-deprecation", "--trace-deprecation", "--no-deprecation", "--pending-deprecation",
+    "--preserve-symlinks", "--preserve-symlinks-main", "--abort-on-uncaught-exception",
+    "--zero-fill-buffers", "--frozen-intrinsics", "--force-node-api-uncaught-exceptions-policy",
+    "--check", "--interactive", "--version", "--help", "--expose-gc", "--no-experimental-fetch"))
+_PY_BOOL_LONG = frozenset(("--help", "--version"))
+# 짧은 **불리언** 문자. 값 문자(`_*_VALUE_SHORT`)·코드 문자(`_*_CODE_MODE_LETTERS`)와 셋이
+# 서로소여야 한다 — 어느 표에도 없는 문자는 '미지' 이고, 미지 클러스터는 포기한다.
+#   python3: `-b -B -d -E -h -i -I -O -P -q -R -s -S -u -v -V -x`(값 없음 · 공식 목록)
+#   node/bun/deno: `-c(--check) -h -i -v`(값 없음). `-e`/`-p` 는 코드, `-r`/`-C` 는 값이다.
+_PY_BOOL_SHORT = "bBdEhiIOPqRsSuvVx"
+_JS_BOOL_SHORT = "chiv"
 _PY_VERSIONED_RE = re.compile(r"^python\d+(\.\d+)?$")
 # ★쉘(`sh`/`bash`/`zsh`)·`env` 는 **언랩하지 않는다**: 데몬은 로그인셸 우산으로 좌석을 띄우지만
 #   그 셸이 exec/spawn 한 실제 좌석은 **자기 ps 행**을 따로 갖는다(셸을 세면 이중계상이고, 셸의
@@ -620,23 +715,63 @@ def _fleet_code_mode(tok, js):
     return False
 
 
-def _fleet_opt_takes_value(tok, js):
-    """이 런타임 옵션 토큰이 **다음 토큰을 값으로 먹는가** — 순수(codex R2 C1).
-    긴 옵션은 `=` 가 있으면 자족적이고, 짧은 클러스터는 값 문자가 **마지막**일 때만 다음을 먹는다
-    (`-Wignore` 는 값이 붙어 있다)."""
+def _fleet_opt_class(tok, js):
+    """런타임 옵션 토큰 → `"value"`(다음 토큰을 값으로 먹는다) · `"bool"`(값을 안 먹는다) ·
+    `"unknown"`(해석 못 함 — 언랩을 포기해야 한다). 순수(R3 · 판정자 핀 2).
+
+    코드모드(`-c`/`-m`/`-e`/`-p`/`--eval`…)는 호출 전에 `_fleet_code_mode` 가 이미 잘라낸다.
+    ★`unknown` 을 `bool` 로 뭉개면 그 옵션의 **값**이 실행 주체로 승격된다(B2 재발). 반대로
+      `value` 로 뭉개면 진짜 실행 대상을 건너뛴다. 둘 다 틀리므로 **모른다고 말하고 포기**한다."""
     if tok.startswith("--"):
+        name = tok.split("=", 1)[0]
+        known_value = name in (_JS_VALUE_LONG if js else _PY_VALUE_LONG)
+        known_bool = name in (_JS_BOOL_LONG if js else _PY_BOOL_LONG)
+        if not (known_value or known_bool):
+            return "unknown"                  # 표에 없는 이름 — `=` 형이어도 실행 모드를 모른다
         if "=" in tok:
-            return False
-        return tok in (_JS_VALUE_LONG if js else _PY_VALUE_LONG)
+            return "bool"                     # 값이 자족적이다(다음 토큰을 안 먹는다)
+        return "value" if known_value else "bool"
     letters = _JS_VALUE_SHORT if js else _PY_VALUE_SHORT
     code = _JS_CODE_MODE_LETTERS if js else _PY_CODE_MODE_LETTERS
+    boolean = _JS_BOOL_SHORT if js else _PY_BOOL_SHORT
     body = tok[1:]
+    if not body:
+        return "unknown"                      # 맨 `-` 는 호출 전에 stdin 스크립트로 잘린다
     for i, ch in enumerate(body):
         if ch in code:
-            return False                      # 코드모드는 위에서 이미 잘렸다
+            return "bool"                     # 코드모드는 위에서 이미 잘렸다(도달 불가 방어)
         if ch in letters:
-            return i == len(body) - 1         # 붙은 값이 없으면 다음 토큰이 값이다
-    return False
+            # 값 문자에서 멈춘다 — 그 뒤는 옵션 문자가 아니라 **값**이다(`-Wignore`).
+            return "value" if i == len(body) - 1 else "bool"
+        if ch not in boolean:
+            return "unknown"                  # 미지 문자 — 이 클러스터가 값을 먹는지 알 수 없다
+    return "bool"
+
+
+def _fleet_opt_takes_value(tok, js):
+    """하위호환 얇은 껍데기 — 판정은 `_fleet_opt_class` 가 한다.
+    ★`unknown` 을 여기서 False 로 접는 것이 바로 종전의 결함이므로, 새 호출자는 이 함수가 아니라
+      `_fleet_opt_class` 를 써야 한다."""
+    return _fleet_opt_class(tok, js) == "value"
+
+
+def _fleet_runner_opt_class(tok, opts):
+    """런처 옵션 토큰 → `"value"` · `"bool"` · `"abort"`(셸/명령 문자열 모드 — 언랩 종료) ·
+    `"unknown"`(표에 없음 — 언랩 포기). 순수(R3 · codex "약어는 런처별이다").
+    긴 옵션의 `=` 형은 이름이 표에 있을 때만 자족적인 불리언으로 본다."""
+    name = tok.split("=", 1)[0] if tok.startswith("--") else tok
+    if name in opts["abort"]:
+        return "abort"
+    if name in opts["value"]:
+        return "bool" if (tok.startswith("--") and "=" in tok) else "value"
+    if name in opts["bool"]:
+        return "bool"
+    return "unknown"
+
+
+def _fleet_chain_is_prefix(chains, cand):
+    """`cand`(토큰 튜플)가 어느 체인의 **접두**인가 — 순수."""
+    return any(c[:len(cand)] == cand for c in chains)
 
 
 def _fleet_runner_key(token):
@@ -715,7 +850,13 @@ def _fleet_owner(cmd):
             if t == "-":
                 return None                           # stdin 스크립트 — 뒤는 그 스크립트의 인자다
             if t.startswith("-"):
-                skip_next = _fleet_opt_takes_value(t, js)
+                cls = _fleet_opt_class(t, js)
+                if cls == "unknown":
+                    # ★R3(판정자 핀 2): 해석 못 한 옵션 **뒤의 토큰을 소유권 근거로 쓰지 않는다**.
+                    #   값 소비 여부를 모르면 다음 토큰이 '그 옵션의 값' 인지 '실행 대상' 인지도
+                    #   모른다 — 둘 중 하나로 찍으면 반드시 한쪽이 오탐이다.
+                    return None
+                skip_next = (cls == "value")
                 continue                              # 런타임 옵션 — 실행 대상이 아니다
             # ★R2(리뷰 major): 여기서 멈춘다 — 첫 **비옵션** 토큰이 실행 대상(스크립트·모듈)이고,
             #   그 뒤는 전부 그 프로그램의 **데이터 인자**다. 종전 판본은 '슬래시 있는 첫 토큰' 을
@@ -744,32 +885,40 @@ def _fleet_owner(cmd):
         #     serena-agent==1.5.3 serena start-mcp-server`(uv → tool → uvx → serena).
         #   ★R2: 허용 하위 명령은 **런처별**이고, npm/pnpm/yarn 은 그것이 **필수**다
         #     (`npm run codex`·`yarn codex` 의 positional 은 프로그램이 아니라 스크립트 이름).
-        allowed, need_sub = FLEET_RUNNER_RULES.get(base0, (frozenset(), False))
-        seen_sub = False
+        chains = FLEET_RUNNER_CHAINS.get(base0, frozenset())
+        opts = FLEET_RUNNER_OPTS.get(base0, _RUNNER_OPTS_EMPTY)
+        chain = ()
+        opts_done = False
         skip_next = False
         for t in rest:
             if skip_next:
                 skip_next = False
                 continue
-            if t == "--":
-                continue                              # 옵션 끝(codex D6: `npm exec -- codex`)
-            if t.startswith("--"):
-                skip_next = ("=" not in t) and (t in FLEET_RUNNER_VALUE_OPTS)
-                continue
-            if t.startswith("-"):
-                continue
+            if not opts_done:
+                if t == "--":
+                    # ★R3(codex): `--` 는 '건너뛰기' 가 아니라 **옵션 해석을 끝내는 상태 전이**다.
+                    #   그 뒤의 `-x` 는 옵션이 아니라 프로그램 이름/인자다(codex D6 형상 보존).
+                    opts_done = True
+                    continue
+                if t.startswith("-") and t != "-":
+                    cls = _fleet_runner_opt_class(t, opts)
+                    if cls in ("unknown", "abort"):
+                        return None                   # 모르는 옵션·셸 문자열 모드 — 언랩 포기
+                    skip_next = (cls == "value")
+                    continue
             low = t.lower()
-            if low in allowed:
-                seen_sub = True
-                continue                              # 하위 명령
+            if _fleet_chain_is_prefix(chains, chain + (low,)):
+                chain += (low,)
+                continue                              # 하위 명령 체인이 이어진다
             # ★codex D5: 필수 하위 명령 검사가 **중첩 런처 전환보다 먼저**다 — 아니면
             #   `yarn npx codex` 처럼 스크립트 이름 자리의 토큰이 런처로 승격한다.
-            if need_sub and not seen_sub:
+            if chains and chain not in chains:
                 return None                           # 스크립트 이름 자리 — 실행 주체가 아니다
             nested = _fleet_exe_name(t)[1].lower()
             if nested in FLEET_RUNNERS:               # 중첩 런처 — 규칙도 그쪽으로 갈아탄다
-                allowed, need_sub = FLEET_RUNNER_RULES.get(nested, (frozenset(), False))
-                seen_sub = False
+                chains = FLEET_RUNNER_CHAINS.get(nested, frozenset())
+                opts = FLEET_RUNNER_OPTS.get(nested, _RUNNER_OPTS_EMPTY)
+                chain, opts_done = (), False
                 continue
             return FLEET_RUNNER_PROGRAMS.get(_fleet_runner_key(t))
         return None
@@ -2697,6 +2846,46 @@ def _self_test_body(fails):
         chk(not os.path.exists(_fleet_hold_path()), "포화가 끝났는데 래치가 안 지워졌다")
         h, why, exp = _fleet_hard_hold("hard", now=t0 + FLEET_CPU_HARD_MAX_HOLD_SECS + 4)
         chk((h, why, exp) == (0.0, "armed", False), "포화 재개 시 시계가 0에서 다시 시작하지 않는다")
+        # ★R3(판정자 핀 1b/1c/1d · codex blocking) — 만료는 **생성 전용 표식**이 지킨다.
+        #   ① `below` 는 레코드와 표식을 **둘 다** 지운다(위 armed 가 그 간접 증거지만, 표식을
+        #      직접 보지 않으면 '레코드만 지웠는데 표식이 없어서 통과' 와 구별되지 않는다).
+        _mk = _fleet_expired_mark_path(_fleet_hold_path())
+        _fleet_hard_hold("hard", now=t0 + 2 * FLEET_CPU_HARD_MAX_HOLD_SECS + 10)
+        chk(os.path.exists(_mk), "만료를 냈는데 표식이 안 생겼다: %s" % _mk)
+        _fleet_hard_hold("below", now=t0 + 2 * FLEET_CPU_HARD_MAX_HOLD_SECS + 11)
+        chk(not os.path.exists(_mk), "below 가 만료 표식을 안 지웠다(축이 영구 권고로 죽는다)")
+        #   ② **경합 + 시계 역행**: A 의 병합 재읽기와 `os.replace` 사이에 B 가 만료를 공개하면,
+        #      A 의 낡은 `expired=False` 가 그것을 덮으면 안 된다. 덮으면 이어진 역행이 `below`
+        #      관측 없이 재무장해 상한만큼을 다시 막는다(그 회귀를 여기서 잡는다).
+        _fleet_hard_hold("below", now=t0 + 3000)
+        _fleet_hold_write(_fleet_hold_path(), {"since": 1000.0, "last": 1000.0, "expired": False})
+        _race = {"fired": False, "b": None}
+        _rp = os.replace
+
+        def _race_replace(_a, _b):
+            if not _race["fired"] and str(_b) == _fleet_hold_path():
+                _race["fired"] = True
+                _race["b"] = _fleet_hard_hold("hard", now=1900.0)
+            return _rp(_a, _b)
+
+        try:
+            os.replace = _race_replace
+            _a_ret = _fleet_hard_hold("hard", now=1899.0)
+        finally:
+            os.replace = _rp
+        chk(bool(_race["b"]) and _race["b"][2] is True,
+            "경합 검체가 만료를 공개하지 못했다(계측 타당성): %r" % (_race["b"],))
+        _rec_r, _why_r = _fleet_hold_read(_fleet_hold_path())
+        chk(bool(_rec_r) and _rec_r["expired"] is True,
+            "공개된 만료가 낡은 쓰기에 덮였다: %r(why=%r · A=%r)" % (_rec_r, _why_r, _a_ret))
+        chk(_a_ret[2] is True,
+            "파일은 만료인데 같은 호출의 반환이 아니다(codex '파일=True·반환=False'): %r" % (_a_ret,))
+        _c_ret = _fleet_hard_hold("hard", now=997.0)          # 시계 역행
+        chk(_c_ret[1] != "armed" and _c_ret[2] is True,
+            "시계 역행이 below 없이 재무장해 만료를 취소했다: %r" % (_c_ret,))
+        chk(_fleet_hard_hold("hard", now=1896.0)[2] is True,
+            "공개된 완화 뒤 상한 미만 구간이 다시 차단됐다")
+        _fleet_hard_hold("below", now=t0 + 3100)              # 뒷정리(이후 검체 오염 금지)
         # ★codex 위임 검체(R2) — 임시 파일 이름이 호출마다 달라야 한다(같은 프로세스 두 호출이
         #   서로의 tmp 를 지우면 한쪽이 unbounded_io=만료로 번진다).
         _tmps = []
@@ -2889,7 +3078,29 @@ def _self_test_body(fails):
             ("uvx npm run codex", None, "중첩 런처가 규칙을 갈아탄 뒤의 스크립트 이름(D5 음성)"),
             ("npm exec -- codex", "codex", "옵션 끝 표시가 실행 대상을 삼킴(D6)"),
             ("npx --yes codex", "codex", "불리언 긴 옵션이 대상을 값으로 먹음(D7)"),
-            ("pipx run serena", "serena", "pipx run 은 정상 형상(D4 음성 대조)")):
+            ("pipx run serena", "serena", "pipx run 은 정상 형상(D4 음성 대조)"),
+            # ★R3(판정자 핀 2 · codex major) — 해석 못 한 옵션 뒤 토큰의 실행 주체 승격(B2 재발).
+            #   미열거 **긴** 옵션의 값이 첫 경로 토큰이 되어 소유자로 승격되던 길:
+            ("node --diagnostic-dir /tmp/codex /tmp/report.js", None, "미열거 긴 옵션의 값(R3)"),
+            ("node --cpu-prof-dir /tmp/codex /tmp/report.js", None, "미열거 긴 옵션의 값(R3)"),
+            ("node --test-reporter-destination /tmp/serena /tmp/x.js", None,
+             "미열거 긴 옵션의 값(R3)"),
+            ("node --run=build /tmp/codex", None, "= 형이어도 실행 모드를 모르면 포기(R3·codex)"),
+            ("python3 -Zq /tmp/serena", None, "미지 짧은 문자가 든 클러스터(R3)"),
+            #   런처: 짧은 값 옵션의 값 · 셸 문자열 모드 · 허용 하위명령의 **반복** 소비:
+            ("npx -p @openai/codex node /tmp/report.js", None, "런처 짧은 값 옵션 -p 의 값(R3)"),
+            ("npx -c codex", None, "npx -c 는 셸 문자열 모드다(R3·codex)"),
+            ("npm exec exec codex", None, "허용 하위명령 반복 소비(R3)"),
+            ("uv run run codex", None, "허용 하위명령 반복 소비(R3)"),
+            ("pnpm dlx exec codex", None, "dlx 뒤의 exec 는 패키지 자리다(R3·codex)"),
+            ("npx --unknown-flag codex", None, "표에 없는 런처 옵션(R3)"),
+            #   음성 대조 — 미계상 방향으로 **과교정**하면 축이 죽는다(전부 계속 양성이어야 한다):
+            ("node --enable-source-maps /x/bin/codex", "codex", "표에 있는 불리언 긴 옵션(R3)"),
+            ("python3 -u /opt/venv/bin/serena", "serena", "표에 있는 불리언 짧은 옵션(R3)"),
+            ("uv tool run serena start-mcp-server", "serena", "uvx = uv tool run 별칭(R3·codex)"),
+            ("npm exec -w pkg codex", "codex", "npm -w 는 값 소비다(R3)"),
+            ("npm exec -p codex", "codex",
+             "npm 의 -p 는 parseable **불리언** — npx 의 -p(package·값)와 다르다(R3·codex)")):
         chk(_fleet_owner(_cmd) == _want,
             "소유권 R2 규칙 이탈(%s): %r → %r(기대 %r)" % (_tag, _cmd, _fleet_owner(_cmd), _want))
     # (r6) 래치 — 레인 전용 변수 · 임계 격리 · 만료 영속 · 읽기 불능 · 관측 공백 표기 · 해시 불멸
