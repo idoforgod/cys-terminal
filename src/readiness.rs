@@ -538,6 +538,16 @@ pub const PROMPT_TRAILER_RULE_MIN_RUN: usize = 8;
 /// `⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents` · `…43% context left` 는
 /// 모두 이 글리프를 포함하고, 사람이 치는 초안(`shift+tab 동작을 설명해 줘`)은 포함하지 않는다.
 pub const STATUS_ROW_DECOR: [char; 10] = ['?', '⏵', '▶', '·', '←', '→', '…', '%', '⇧', '│'];
+/// ★(0.14.31 · 수렴 R2 · reviewer-claude/codex major F1) 상태줄 조각(chip)을 가르는 **열 패딩**의
+/// 연속 공백 하한. TUI 는 오른쪽 칸에 맞춰 수십 칸을 채우고(실측 2.1.241 `? for shortcuts` 뒤
+/// 50칸+ · 2.1.261 statusLine `/rc` 앞 19칸+), 사람은 문장 가운데에 이만큼을 치지 않는다.
+/// 2칸은 사람도 치므로 경계로 삼지 않는다(조여지는 방향).
+pub const STATUS_ROW_PAD_MIN: usize = 4;
+/// ★(0.14.31 · 수렴 R2 · codex major F1) 토큰 **뒤**에 상태줄로서 허용하는 낱말 전량. 실측 꼬리는
+/// 두 가지뿐이다 — `⏵⏵ bypass permissions **on**` · `… **on (shift+tab to cycle)**`. 이 밖의 낱말이
+/// 하나라도 오면 그 줄은 사람이 친 문장이다(`shift+tab does what?` · `bypass permissions can be
+/// disabled?`). 목록에 없는 어휘의 귀결은 **보류**이므로 방향은 조이는 쪽 하나다.
+pub const STATUS_ROW_TAIL_WORDS: [&str; 2] = ["on", "off"];
 /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) 꼬리가 빈 분기에서 상태줄을 **이 composer 의 것**으로
 /// 인정하는 최대 거리(행). 실측 2.1.241 레이아웃은 2행(`? for shortcuts` → `…43% context left` → `❯ `)이고,
 /// 사용자 statusLine 한 줄이 더 낄 수 있어 여유를 둔다. 그보다 멀면 스크롤백의 역사로 본다(조여지는 방향).
@@ -1295,29 +1305,119 @@ pub fn composer_layout_static_ok(
 /// stale `pending_input_bytes` 리셋이 그 초안 계수를 지운 뒤 다음 틱이 큐 본문을 사람 문장과
 /// **한 줄로 합쳐 제출**했다(R2 가 닫으려던 fail-open 의 잔여 구멍 · §3-3 위반).
 ///
+/// 【1차 수리가 왜 부족했나 — 수렴 R2 · reviewer-claude/codex major F1】 종전 판정의 두 축이
+/// 약했다. ⓒ '장식 ≥1' 은 [`STATUS_ROW_DECOR`] 에 순수 ASCII `?` 가 들어 있어 **물음표 하나면
+/// 충족**되고, ⓓ 는 `head.starts_with(token)` 이라 토큰으로 **시작만** 하면 뒤에 사람 문장이
+/// 얼마든지 붙어도 통과했다. ⓑ(비-ASCII 0)는 한글만 거르므로 **영문 초안에는 방어가 없었다**:
+/// `shift+tab does what?` · `bypass permissions - is it safe?` · `? for shortcuts is missing on
+/// my screen` 이 전부 상태줄로 인정됐다(재현 검체
+/// [`triage_wp5_english_draft_with_status_word_is_not_a_status_row`]).
+///
+/// 【지금 — 실측 상태줄의 **문법**을 읽는다】 상태 바는 자유 문장이 아니라 **조각(chip)의 나열**
+/// 이다. 조각은 가운뎃점(`·`)이나 **열 패딩**([`STATUS_ROW_PAD_MIN`] 칸 이상의 연속 공백)으로
+/// 갈린다. 실측 4종이 모두 같은 모양이다:
+///   `  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`
+///   `  ⏵⏵ bypass permissions on · 2 shells, 1 monitor · ← for agents`
+///   `? for shortcuts<열 패딩>Gemini 3.8 Flash · hig`
+///   `  ? for shortcuts`
+/// 세 사실이 공통이다 — ⓘ **첫** 조각이 토큰 조각이고, ⓙ 그 조각은 **장식 글리프로 시작**하며
+/// (`⏵⏵` · `?`), ⓚ 토큰 뒤에는 [`STATUS_ROW_TAIL_WORDS`] 와 괄호 묶음밖에 오지 않는다.
+/// 사람 문장은 이 셋 중 어느 하나도 지키지 못한다(토큰 뒤에 동사가 온다 · 장식으로 시작하지
+/// 않는다).
+///
 /// 【규칙 — 전부 AND】
-///   ⓐ 토큰을 포함한다(종전 조건 · 필요조건으로 남는다)
+///   ⓐ 토큰을 포함한다(종전 조건 · 값싼 선별로 남는다)
 ///   ⓑ 라틴·숫자·[`STATUS_ROW_DECOR`] 밖의 문자가 **없다** — 한글·CJK 가 한 자라도 있으면 사람의
 ///      문장이다(실측 상태줄에는 그런 문자가 없다)
-///   ⓒ 장식 글리프가 **적어도 하나** 있다(영문 초안 배제 — 상태 바는 언제나 장식을 단다)
-///   ⓓ 토큰이 줄의 **앞머리**(장식·공백을 벗긴 뒤) 또는 **꼬리**에 붙는다(문장 가운데에 낀
-///      토큰은 인용이다)
-/// 방향은 조이는 쪽 하나다: 실측 2.1.263 `⏵⏵ bypass permissions on …`·2.1.241 `? for shortcuts`
-/// 는 그대로 통과하고(가용성 대조군 검체), 통과하지 못하면 귀결은 **보류**다(리셋 안 함).
+///   ⓒ **첫 조각**이 장식 글리프로 **시작**한다(어딘가에 하나 있는 것으로는 부족하다 — 위치가
+///      재료다. `shift+tab does what?` 의 `?` 는 꼬리라 자격이 없다)
+///   ⓓ 그 조각이 토큰으로 시작하고, 토큰 **뒤**는 [`status_row_tail_ok`] 문법뿐이다
+/// 방향은 조이는 쪽 하나다: 실측 4종은 그대로 통과하고(가용성 대조군 검체), 통과하지 못하면
+/// 귀결은 **보류**다(리셋 안 함 = 0.14.30 의 종전 거동).
 fn is_status_row(l: &str) -> bool {
     let norm = first_run_gates::normalize(l).to_lowercase();
     let t = norm.trim();
     if t.is_empty() || !PROMPT_TRAILER_TOKENS.iter().any(|k| t.contains(k)) {
-        return false;
+        return false; // ⓐ
     }
     if t.chars().any(|c| !(c.is_ascii() || STATUS_ROW_DECOR.contains(&c))) {
         return false; // ⓑ 사람 문장의 문자(한글·CJK 등)
     }
-    if !t.chars().any(|c| STATUS_ROW_DECOR.contains(&c)) {
-        return false; // ⓒ 장식 0 = 상태 바로 보지 않는다
+    // ⓒⓓ 조각 문법 — **원문**에서 가른다(정규화 공간은 공백 런을 한 칸으로 접어 열 패딩을 지운다).
+    status_row_chips(l).first().is_some_and(|c| status_row_chip_ok(c))
+}
+
+/// 상태줄을 조각으로 가른다 — 가운뎃점(`·`)과 열 패딩([`STATUS_ROW_PAD_MIN`] 칸 이상 연속 공백).
+/// 각 조각은 정규화·소문자화해 돌려준다(빈 조각은 버린다 — 줄 앞 들여쓰기가 그것이다).
+fn status_row_chips(l: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut it = l.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '·' {
+            out.push(std::mem::take(&mut cur));
+        } else if c.is_whitespace() {
+            let mut run = 1usize;
+            while it.peek().is_some_and(|x| x.is_whitespace()) {
+                it.next();
+                run += 1;
+            }
+            if run >= STATUS_ROW_PAD_MIN {
+                out.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(' ');
+            }
+        } else {
+            cur.push(c);
+        }
     }
-    let head = t.trim_start_matches(|c: char| c.is_whitespace() || STATUS_ROW_DECOR.contains(&c));
-    PROMPT_TRAILER_TOKENS.iter().any(|k| head.starts_with(k) || t.ends_with(k))
+    out.push(cur);
+    out.into_iter()
+        .map(|s| first_run_gates::normalize(&s).to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 한 조각이 **상태 조각**인가 — `<장식 1개 이상> <토큰> <허용 꼬리>`.
+fn status_row_chip_ok(chip: &str) -> bool {
+    let rest = chip.trim_start();
+    let head = rest.trim_start_matches(|c: char| c.is_whitespace() || STATUS_ROW_DECOR.contains(&c));
+    if head.len() == rest.len() {
+        return false; // ⓒ 장식으로 시작하지 않는다 = 사람 문장
+    }
+    PROMPT_TRAILER_TOKENS
+        .iter()
+        .find(|k| head.starts_with(**k))
+        .is_some_and(|k| status_row_tail_ok(head[k.len()..].trim()))
+}
+
+/// 토큰 뒤에 허용하는 꼬리 문법 — [`STATUS_ROW_TAIL_WORDS`] 낱말과 **괄호 묶음** 하나뿐이다.
+/// 실측 꼬리는 `on` 과 `on (shift+tab to cycle)` 둘이고, 괄호 안은 낱말·`+`·`-`·`/` 만 받는다
+/// (문장부호가 들어오면 그것은 사람의 말이다).
+fn status_row_tail_ok(tail: &str) -> bool {
+    let mut rest = tail.trim();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix('(') {
+            let Some(end) = after.find(')') else { return false };
+            let inner = &after[..end];
+            if inner.is_empty()
+                || !inner.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == ' ' || c == '+' || c == '-' || c == '/'
+                })
+            {
+                return false;
+            }
+            rest = after[end + 1..].trim_start();
+        } else {
+            let cut = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (w, r) = rest.split_at(cut);
+            if !STATUS_ROW_TAIL_WORDS.contains(&w) {
+                return false;
+            }
+            rest = r.trim_start();
+        }
+    }
+    true
 }
 
 fn status_row_bound_to_composer(lines: &[&str], li: usize) -> bool {
@@ -3069,6 +3169,93 @@ mod tests {
         }
     }
 
+    /// ★[수렴 R2 · reviewer-claude major + reviewer-codex F1] **영문 초안도 상태줄이 아니다.**
+    ///
+    /// 1차 수리는 한글 초안만 닫았다(ⓑ 비-ASCII 축). 영문 사용자에게는 방어가 없었다 —
+    /// ⓒ '장식 ≥1' 은 [`STATUS_ROW_DECOR`] 의 순수 ASCII `?` 로 충족되고, ⓓ 는 토큰으로 **시작만**
+    /// 하면 뒤에 사람 문장이 얼마든지 붙어도 통과했다. 그 귀결은 판정서가 적은 것과 같다:
+    /// `governance::maybe_reset_stale_pending_input` 의 `screen_empty` 가 참이 되어 사람 초안의
+    /// `pending_input_bytes` 를 0 으로 지우고, 다음 틱이 큐 본문을 그 초안과 **한 줄로 합쳐 제출**
+    /// 한다(§3-3 반대 방향).
+    ///
+    /// 검체는 두 리뷰어가 제시한 변형을 그대로 채택한다(4 + 2건). 어느 하나라도 '빈 편집 영역' 으로
+    /// 읽히면 실패다.
+    #[test]
+    fn triage_wp5_english_draft_with_status_word_is_not_a_status_row() {
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        let drafts = [
+            // reviewer-claude 변형 4건(HEAD becd4a8 에서 전부 실패했다)
+            "  shift+tab does what?",
+            "  shift+tab, then what? explain",
+            "  bypass permissions - is it safe?",
+            "  ? for shortcuts is missing on my screen",
+            // reviewer-codex F1 예문 2건
+            "  bypass permissions can be disabled?",
+            "  bypass permissions on my machine is scary, right?",
+            // 종전 수리로 이미 닫혀 있던 것들(장식 0) — 되돌아가지 않았는지 같은 자리에서 잰다
+            "  turn off bypass permissions",
+            "  shift+tab does nothing",
+        ];
+        for d in drafts {
+            assert!(!is_status_row(d), "영문 초안이 상태줄로 인정됐다: {d:?}");
+            // ⓐ 꼬리 첫 줄로 놓았을 때(강한 증거 자리)
+            let below = format!("  prev output\n❯ \n{d}\n");
+            assert!(
+                !composer_edit_region_empty(&below, "❯", None),
+                "영문 초안이 빈 편집 영역으로 읽힌다(꼬리): {d:?}"
+            );
+            assert!(
+                !composer_layout_positive(&below, "❯", None),
+                "영문 초안이 강한 레이아웃 증거로 세어졌다: {d:?}"
+            );
+            // ⓑ 마커 **위**(약한 증거 자리 — 2.1.241 레이아웃) 에 놓였을 때도 열리지 않는다
+            let above = format!("  prev output\n{d}\n❯ \n");
+            assert!(
+                !composer_layout_static_ok(&above, "❯", None, Some(true)),
+                "영문 초안이 마커 위 상태줄(약한 증거)로 세어졌다: {d:?}"
+            );
+            // ⓒ 멀티라인 초안의 이어짐 줄(판정서 §6 원형)
+            let multi =
+                format!("  prev output\n{rule}\n❯ \n{d}\n{rule}\n  ⏵⏵ bypass permissions on\n");
+            assert!(
+                !composer_edit_region_empty(&multi, "❯", None),
+                "멀티라인 초안이 빈 편집 영역으로 읽힌다: {d:?}"
+            );
+        }
+    }
+
+    /// ★[수렴 R2 · reviewer-claude minor(H-WIN)] **ConPTY 문면에서도 상태줄 문법이 성립한다.**
+    ///
+    /// 기존 H-WIN 5검체(`conpty_rendered_modal_variants_are_held`)는 `modal_signature` 만 잰다 —
+    /// 상태줄 형상은 ConPTY 로 한 번도 재지 않았다. 새 판정은 장식 글리프(`⏵`·`←`·`·`)와 **열 패딩**
+    /// 에 의존하는 구조라, CRLF 개행과 우측 패딩이 그 축을 깨는지 여기서 못 박는다.
+    /// (`windows-health.yml` 의 `readiness::` 필터가 이 검체를 ConPTY 축에 자동 포함한다 · §B-8.)
+    #[test]
+    fn h_win_status_row_survives_crlf_and_right_padding() {
+        for (name, row) in [
+            ("2.1.263", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"),
+            ("2.1.241", "? for shortcuts                                    Gemini 3.8 Flash · hig"),
+        ] {
+            // 우측 패딩(콘솔 셀 채움) + CRLF — 두 축이 함께 걸린 문면이 실제 ConPTY 렌더다.
+            let padded = format!("{row}{}", " ".repeat(12));
+            let screen = format!("  prev output\r\n❯ \r\n{padded}\r\n");
+            assert!(
+                composer_edit_region_empty(&screen, "❯", None),
+                "{name}: CRLF+우측 패딩 렌더에서 실측 상태줄이 경계로 서지 못한다"
+            );
+            assert!(
+                composer_layout_positive(&screen, "❯", None),
+                "{name}: CRLF+우측 패딩 렌더에서 강한 레이아웃 증거가 사라졌다"
+            );
+            // 같은 렌더에서 사람 문장은 여전히 경계가 아니다(조인 방향의 대조).
+            let draft = format!("  prev output\r\n❯ \r\n  shift+tab does what?{}\r\n", " ".repeat(12));
+            assert!(
+                !composer_edit_region_empty(&draft, "❯", None),
+                "{name}: CRLF 렌더에서 영문 초안이 경계로 인정됐다"
+            );
+        }
+    }
+
     /// ★[triage 2026-09-08 · 판정서 요구 "가용성 대조군"] **실측 상태줄은 그대로 경계로 선다.**
     ///
     /// §WP5-06 의 수리는 조이는 방향이므로, 조여진 뒤에도 실측 문면이 통과하는지를 같은 자리에서
@@ -3080,8 +3267,14 @@ mod tests {
     #[test]
     fn triage_wp5_measured_status_rows_still_close_the_edit_region() {
         for (name, status) in [
+            // impl/R2-WP5-queue-screens-1349.txt :85·:127·:192·:253 실측 전사(읽기 전용 read-screen)
             ("2.1.263", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"),
+            ("2.1.263/shells", "  ⏵⏵ bypass permissions on · 2 shells, 1 monitor · ← for agents"),
             ("2.1.241", "  ? for shortcuts"),
+            (
+                "gemini/열패딩",
+                "? for shortcuts                                                    Gemini 3.8 Flash · hig",
+            ),
         ] {
             let screen = format!("  이전 출력
 ❯ 
@@ -3097,7 +3290,11 @@ mod tests {
             );
         }
         // ⓒ 같은 토큰 · 사람 문장 = 경계 아님(조인 방향이 실제로 조여져 있는가).
-        for draft in ["  bypass permissions 를 끄고 싶다", "  shift+tab that toggles modes"] {
+        for draft in [
+            "  bypass permissions 를 끄고 싶다",
+            "  shift+tab that toggles modes",
+            "  ? for shortcuts is missing on my screen",
+        ] {
             let screen = format!("  이전 출력
 ❯ 
 {draft}
