@@ -19,6 +19,7 @@
      reviewer-claude minor). 방향은 '막는 쪽' 이 아니라 '안 막는 쪽' 이라 축이 조용히 얇아진다.
   ⑥ ★R2 수렴 — 만료 표식 되읽기가 `held` 갈래에만 있고 `arm` 갈래에 없다(양 리뷰어 minor).
   ⑦ ★R2 수렴 — 만료 표식 **생성 실패**가 사유에 안 남는다(양 리뷰어 minor · 침묵 금지 규율).
+  ⑧ ★R2 수렴 — 레인 배선: windows 레그 고정 · Ubuntu 해석기(bash) · `-e` 조기 종료 방지.
 
 밀폐: 게이트는 `CYS_STATE_DIR` 임시 디렉터리 · 소켓 env 제거 · 라이브 ps/데몬 무접촉(스폰 0).
 실행 규약: CYS_PACK_DIR="$(mktemp -d)" JAVIS_ROOT="$(mktemp -d)" python3 bin/tests/test_wp7_gate_triage.py
@@ -267,6 +268,28 @@ check("7c-표식이서면사유는평범한expired",
       G._fleet_hard_hold("hard", now=1000.0 + G.FLEET_CPU_HARD_MAX_HOLD_SECS + 2,
                          thr=7.0)[1] == "expired")
 G._fleet_hard_hold("below", now=99000.0, thr=7.0)
+
+# ── ⑧ 레인 배선(reviewer-claude major · reviewer-codex minor) ────────────────
+# ⓐ release.yml `build` 잡은 매트릭스에 windows-latest 를 포함한다 — POSIX 전용 검체를 `if:`
+#    없이 걸면 그 레그가 적색 → pack-artifacts 미실행 → 팩 자산 0 → **공개 발행 0**.
+_rel = open(_LANES["release"], encoding="utf-8").read() if os.path.isfile(_LANES["release"]) else ""
+_leg1 = re.search(r"- name: 팩 검체 — 자원 게이트[^\n]*leg1\)\n((?:\s+\S[^\n]*\n)+?)\s+run:", _rel)
+check("8a-leg1레그고정", bool(_leg1) and "matrix.target == 'aarch64-apple-darwin'" in _leg1.group(1),
+      "leg1 스텝 머리말=%r" % (_leg1.group(1) if _leg1 else None))
+# ⓑ Ubuntu 레인(pack-artifacts · pack-only)이 도는 훅 검체는 bash 로 부른다(`/bin/sh`=dash 는
+#    훅 :34 의 here-string 을 받지 못한다 — 실측 rc 2).
+_seat = open(os.path.join(SELF, "test_inject_context_role_seat.py"), encoding="utf-8").read()
+check("8b-훅검체해석기가bash", '["sh", HOOK]' not in _seat and "[BASH, HOOK]" in _seat,
+      "sh 로 부르면 Ubuntu 레인이 훅 결함이 아니라 호출 규약 오류로 적색이 된다")
+# ⓒ GitHub 의 `shell: bash` 는 `-e` 다 — `python3 …` 뒤에 맨 `r=$?` 를 두면 첫 실패에서 스텝이
+#    즉시 끝나 로그 꼬리·::error::·나머지 검체·`exit $rc` 집계가 하나도 안 돈다.
+for lane, p in _LANES.items():
+    txt = open(p, encoding="utf-8").read() if os.path.isfile(p) else ""
+    blocks = re.findall(r"- name: 팩 검체 — 자원 게이트[^\n]*\n(?:.*?\n)*?          exit \$rc\n", txt)
+    check("8c-%s:스텝존재" % lane, len(blocks) >= 1, "발견 %d" % len(blocks))
+    bad = [b for b in blocks if re.search(r'python3 "\$[fg]"[^\n]*\n\s+r=\$\?', b)]
+    check("8c-%s:조기종료방지" % lane, not bad,
+          "`python3 …` 직후의 맨 `r=$?` 는 -e 아래에서 도달하지 않는다(집계·진단 소실)")
 
 shutil.rmtree(_TMP, ignore_errors=True)
 if fails:

@@ -438,6 +438,15 @@ jobs:
       #   티켓): ①드리프트(재합성==커밋본) ②표지 핀 구·신 템플릿 공통 실존 ③bash 스니펫 실행 스모크.
       #   ci-branch.yml 의 같은 게이트가 조기 경보, 여기가 최종 차단선. 레그는 macOS 네이티브 1회
       #   (게이트 대상 = 리포 커밋본 텍스트라 OS 무관 — 위 계약 게이트와 같은 레그 고정 근거).
+      - name: CEO_TEMPLATE 재합성 드리프트 게이트 (gen --check · 릴리스 차단)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          g="scripts/gen_ceo_template.py"
+          [ -f "$g" ] || { echo "::error::재합성 생성기 누락: $g (D2 티켓 산출물 — git add 누락 의심)" >&2; exit 1; }
+          python3 "$g" --check
+
       # ★WP-7 R3(0.14.31 · 독립 재유도 지적 2·5): **안 도는 검체는 게이트가 아니다** 의 재발.
       #   `cysjavis-pack/tests/` → `cysjavis-pack/bin/tests/` 이동은 됐는데 등재가 없어
       #   test_resource_gate·test_resource_gate_fleet_cpu·test_inject_context_role_seat 세 스위트와
@@ -448,44 +457,50 @@ jobs:
       #     레인 워커가 동시에 고치면 통합에서 충돌한다. 스텝 단위면 삽입 지점이 서로 다르다.
       #   ★밀폐: 검체마다 임시 CYS_PACK_DIR·CYS_STATE_DIR·JAVIS_ROOT + 소켓/역할/soul env 제거
       #     (`env -u`). 라이브 데몬·오너 홈 무접촉 — 훅 검체는 자기 HOME 도 임시로 고정한다.
-      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지) · 파일 부재와 비정상 종료는 그대로 실패다.
+      #   ★레그 고정(R2 수렴 · 리뷰 major): 이 잡의 매트릭스는 macOS 2 + **windows-latest** 이고
+      #     `runs-on: ${{ matrix.platform }}` 다. 등재 검체 중 `test_inject_context_role_seat.py`
+      #     는 POSIX 전용이며(`bash <훅>` 실행 · `#!/bin/sh` 스텁의 `os.chmod(0o755)` · MSYS
+      #     `mktemp -d` 경로를 네이티브 python 에 넘김), `test_resource_gate.py` 의 소켓 핀은
+      #     `os.name=='nt'` 에서 게이트가 계약대로 True 를 내므로 Windows 에서 **정상 구현인데도**
+      #     적색이다. 그 적색은 `build` 실패 → `pack-artifacts` 미실행 → 팩 자산 0 →
+      #     release-verify 실패 = **공개 발행 0** 이다(막는 쪽이지만 결과가 '릴리스 불가').
+      #     그래서 이 잡의 다른 python 게이트와 같은 레그 고정 규약을 따른다. '돌지 않는 초록'
+      #     금지는 여전히 지켜진다 — 이 검체 4종은 ci-branch(macOS) · release leg1(mac arm64) ·
+      #     release pack-artifacts(ubuntu) · pack-release(ubuntu) 에서 실제로 돈다.
       #   실측(로컬): 네 검체 합 약 1.6s + self-test 0.2s.
       - name: 팩 검체 — 자원 게이트·함대CPU·역할 좌석 (WP-7 R3 3레인 등재 · leg1)
+        if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         run: |
           set -u
+          # ★R2(수렴 · 리뷰 minor): GitHub 의 `shell: bash` 는 `bash --noprofile --norc -eo pipefail`
+          #   이다 — `-e` 때문에 **첫 실패 검체에서 스텝이 즉시 끝난다**: `r=$?` · `tail` 로그 꼬리 ·
+          #   `::error::` 주석 · 나머지 검체 · 마지막 `exit $rc` 집계가 하나도 실행되지 않는다.
+          #   레인은 여전히 적색(fail-closed)이지만 이 스텝이 존재하는 이유인 **진단**이 사라진다.
+          #   `if <명령>; then …; else r=$?; fi` 는 그 명령에 한해 `-e` 를 끈다(POSIX 셸 규약).
           rc=0
           for t in test_resource_gate test_resource_gate_fleet_cpu \
                    test_inject_context_role_seat test_wp7_gate_triage; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t =="
-            env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
-                CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-                JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
-            r=$?
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
+            then r=0; else r=$?; fi
             tail -60 "/tmp/wp7-$t.log"
             [ $r -eq 0 ] || { echo "::error::$t rc=$r (WP-7 자원 게이트 회귀)"; rc=$r; }
           done
           g="cysjavis-pack/bin/javis_resource_gate.py"
           [ -f "$g" ] || { echo "게이트 누락: $g (git add 누락 의심)" >&2; exit 1; }
           echo "== javis_resource_gate --self-test =="
-          env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
-              CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-              python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
-          r=$?
+          if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
+                 CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                 python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
+          then r=0; else r=$?; fi
           tail -20 /tmp/wp7-selftest.log
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
           exit $rc
-
-      - name: CEO_TEMPLATE 재합성 드리프트 게이트 (gen --check · 릴리스 차단)
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        run: |
-          set -euo pipefail
-          g="scripts/gen_ceo_template.py"
-          [ -f "$g" ] || { echo "::error::재합성 생성기 누락: $g (D2 티켓 산출물 — git add 누락 의심)" >&2; exit 1; }
-          python3 "$g" --check
 
       # Windows 자기완결 런타임 동봉 (windows-build.yml과 동일 절차 — PortableGit + Python embeddable).
       # tauri.windows.conf.json bundle.resources("runtime/")가 이 트리를 NSIS에 싣는다.
@@ -1064,9 +1079,6 @@ jobs:
             exit 1
           fi
 
-      # ★cargo clean 선행 — rust-cache가 복원한 스테일 OUT_DIR/pack_all.rs(이전 cysjavis-pack 트리로
-      # 생성된 임베드 테이블)가 재사용돼 manifest SOT를 오염시키는 회귀를 차단한다. 캐시 복원 직후에
-      # target을 비워 build.rs 코드젠을 강제 재실행시킨다(스테일 생성표 무효화).
       # ★WP-7 R3(0.14.31 · 독립 재유도 지적 2·5): **안 도는 검체는 게이트가 아니다** 의 재발.
       #   `cysjavis-pack/tests/` → `cysjavis-pack/bin/tests/` 이동은 됐는데 등재가 없어
       #   test_resource_gate·test_resource_gate_fleet_cpu·test_inject_context_role_seat 세 스위트와
@@ -1083,30 +1095,38 @@ jobs:
         shell: bash
         run: |
           set -u
+          # ★R2(수렴 · 리뷰 minor): GitHub 의 `shell: bash` 는 `bash --noprofile --norc -eo pipefail`
+          #   이다 — `-e` 때문에 **첫 실패 검체에서 스텝이 즉시 끝난다**: `r=$?` · `tail` 로그 꼬리 ·
+          #   `::error::` 주석 · 나머지 검체 · 마지막 `exit $rc` 집계가 하나도 실행되지 않는다.
+          #   레인은 여전히 적색(fail-closed)이지만 이 스텝이 존재하는 이유인 **진단**이 사라진다.
+          #   `if <명령>; then …; else r=$?; fi` 는 그 명령에 한해 `-e` 를 끈다(POSIX 셸 규약).
           rc=0
           for t in test_resource_gate test_resource_gate_fleet_cpu \
                    test_inject_context_role_seat test_wp7_gate_triage; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t =="
-            env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
-                CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-                JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
-            r=$?
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
+            then r=0; else r=$?; fi
             tail -60 "/tmp/wp7-$t.log"
             [ $r -eq 0 ] || { echo "::error::$t rc=$r (WP-7 자원 게이트 회귀)"; rc=$r; }
           done
           g="cysjavis-pack/bin/javis_resource_gate.py"
           [ -f "$g" ] || { echo "게이트 누락: $g (git add 누락 의심)" >&2; exit 1; }
           echo "== javis_resource_gate --self-test =="
-          env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
-              CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-              python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
-          r=$?
+          if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
+                 CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                 python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
+          then r=0; else r=$?; fi
           tail -20 /tmp/wp7-selftest.log
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
           exit $rc
 
+      # ★cargo clean 선행 — rust-cache가 복원한 스테일 OUT_DIR/pack_all.rs(이전 cysjavis-pack 트리로
+      # 생성된 임베드 테이블)가 재사용돼 manifest SOT를 오염시키는 회귀를 차단한다. 캐시 복원 직후에
+      # target을 비워 build.rs 코드젠을 강제 재실행시킨다(스테일 생성표 무효화).
       - name: cargo clean (스테일 생성표 무효화)
         run: cargo clean
 

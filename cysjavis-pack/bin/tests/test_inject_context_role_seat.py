@@ -22,6 +22,8 @@
      안 자르면 여러 줄 CYS_ROLE 이 정보 1줄을 여러 줄로 부풀려 SessionStart 컨텍스트에 들어간다
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 INJECT-CONTEXT-ROLE-SEAT-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_inject_context_role_seat.py
+해석기: 훅의 shebang(`#!/bin/bash`)을 따라 **bash** 로 부른다 — Ubuntu 의 `/bin/sh`(dash)는 훅 :34 의
+       here-string 을 받지 못한다(실측 rc 2). POSIX 전용 검체이므로 Windows 레그에는 등재하지 않는다.
 """
 import json
 import os
@@ -32,6 +34,15 @@ import tempfile
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.normpath(os.path.join(SELF, "..", "..", "hooks", "inject-context.sh"))
+# ★R2(수렴 · 리뷰 minor "Ubuntu 레인에서 이 검체가 적색"): 훅은 `#!/bin/bash` 이고 :34 에
+#   **bash 전용 here-string**(`<<< "$_PARSED"`)을 쓴다. macOS 의 `sh` 는 posix 모드 bash 라 그것을
+#   받지만 Ubuntu 의 `/bin/sh` 는 dash 이고 받지 못한다 — 실측: `dash -n hooks/inject-context.sh`
+#   → rc 2 `Syntax error: redirection unexpected`. 이 검체가 등재된 두 레인(release
+#   `pack-artifacts` · pack-release `pack-only`)은 **ubuntu-latest** 라, `sh` 로 부르면 훅의 결함이
+#   아니라 **호출 규약의 오류**로 레인이 적색이 되고 서명 전에 팩 발행이 멈춘다.
+#   저장소 규약과도 어긋났다 — `run_bootstrap_health.py` 는 같은 훅을 `[BASH, hook]` 으로 부른다.
+#   해석기는 훅의 shebang 이 정하고, 이 검체는 그 shebang 을 따른다.
+BASH = shutil.which("bash") or "/bin/bash"
 INFO_MARK = "역할 좌석 포함"
 WARN_MARK = "동시에 도는 claude 세션이"
 fails = []
@@ -87,7 +98,7 @@ def run_hook(tmp, seats, cys_mode, role_env=None, cys_present=True):
     if role_env:
         env["CYS_ROLE"] = role_env
     payload = json.dumps({"source": "startup", "cwd": cwd})
-    r = subprocess.run(["sh", HOOK], input=payload, capture_output=True, text=True,
+    r = subprocess.run([BASH, HOOK], input=payload, capture_output=True, text=True,
                        encoding="utf-8", env=env, timeout=60)
     return r
 

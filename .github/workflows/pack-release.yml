@@ -227,8 +227,6 @@ jobs:
             exit 1
           fi
 
-      # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
-      # 오염시키는 회귀 차단(release.yml과 동일).
       # ★WP-7 R3(0.14.31 · 독립 재유도 지적 2·5): **안 도는 검체는 게이트가 아니다** 의 재발.
       #   `cysjavis-pack/tests/` → `cysjavis-pack/bin/tests/` 이동은 됐는데 등재가 없어
       #   test_resource_gate·test_resource_gate_fleet_cpu·test_inject_context_role_seat 세 스위트와
@@ -245,30 +243,37 @@ jobs:
         shell: bash
         run: |
           set -u
+          # ★R2(수렴 · 리뷰 minor): GitHub 의 `shell: bash` 는 `bash --noprofile --norc -eo pipefail`
+          #   이다 — `-e` 때문에 **첫 실패 검체에서 스텝이 즉시 끝난다**: `r=$?` · `tail` 로그 꼬리 ·
+          #   `::error::` 주석 · 나머지 검체 · 마지막 `exit $rc` 집계가 하나도 실행되지 않는다.
+          #   레인은 여전히 적색(fail-closed)이지만 이 스텝이 존재하는 이유인 **진단**이 사라진다.
+          #   `if <명령>; then …; else r=$?; fi` 는 그 명령에 한해 `-e` 를 끈다(POSIX 셸 규약).
           rc=0
           for t in test_resource_gate test_resource_gate_fleet_cpu \
                    test_inject_context_role_seat test_wp7_gate_triage; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t =="
-            env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
-                CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-                JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
-            r=$?
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/wp7-$t.log" 2>&1
+            then r=0; else r=$?; fi
             tail -60 "/tmp/wp7-$t.log"
             [ $r -eq 0 ] || { echo "::error::$t rc=$r (WP-7 자원 게이트 회귀)"; rc=$r; }
           done
           g="cysjavis-pack/bin/javis_resource_gate.py"
           [ -f "$g" ] || { echo "게이트 누락: $g (git add 누락 의심)" >&2; exit 1; }
           echo "== javis_resource_gate --self-test =="
-          env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
-              CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
-              python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
-          r=$?
+          if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE \
+                 CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                 python3 "$g" --self-test > /tmp/wp7-selftest.log 2>&1
+          then r=0; else r=$?; fi
           tail -20 /tmp/wp7-selftest.log
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
           exit $rc
 
+      # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
+      # 오염시키는 회귀 차단(release.yml과 동일).
       - name: cargo clean (스테일 생성표 무효화)
         run: cargo clean
 
