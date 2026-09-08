@@ -95,13 +95,11 @@ GLOB_TOKENS = {"test_phoenix_": "cysjavis-pack/bin/tests/test_phoenix_*.py"}
 # 이름은 등재됐으나 **파일이 아직 이 브랜치에 없는** 것. 값 = (도착 경로, 근거).
 # ★등재는 왜 먼저 하는가: 3완전 레인 동시 등재가 계약(CONTRACTS B-9)이고, 등재를 머지 뒤로
 #   미루면 그 커밋이 다시 '레인 하나 빼먹기' 의 기회가 된다. 파일이 도착하면 여기서 지워라.
-PENDING_MERGE = {n: ("wp/0.14.31-pack", "Pack 레인 신설 · 통합 머지 시 도착(CONTRACTS E-4 ①)")
-                 for n in (
-    "test_trust_seed", "test_capgate_registration", "test_capgate_hook_shell",
-    "test_cso_directive_rev", "test_role_authority", "test_role_authority_shell",
-    "test_round_stop_reason", "test_resource_gate", "test_resource_gate_fleet_cpu",
-    "test_inject_context_role_seat",
-)}
+# ★2026-09-08 통합 완료 — 위 10종은 `wp/0.14.31-pack` 머지(76a83ff)로 전부 도착했다.
+#   도착한 이름을 여기 남겨 두면 `--strict` 가 아닌 예행에서 그 이름들이 "대기"로 접혀
+#   존재 축이 사실상 꺼진다(그래서 게이트가 도착 시 ::warning:: 로 청소를 재촉한다).
+#   다음 통합에서 다시 쓸 때는 {이름: (도착 브랜치, 근거)} 형태로 채운다.
+PENDING_MERGE = {}
 
 SB, SE = "LANE-GATE-SELF-BEGIN", "LANE-GATE-SELF-END"
 

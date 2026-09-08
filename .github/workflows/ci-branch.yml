@@ -562,13 +562,15 @@ jobs:
           #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
           #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
           # ★0.14.31 audit 통합(2026-09-08 · CONTRACTS B-9 · E-4 ①): 두 레인(Rust fix/0.14.31-audit ·
-          #   Pack wp/0.14.31-pack)이 bc01f43 이후 신설한 팩 검체 **15종**을 3완전 레인에 **같은
+          #   Pack wp/0.14.31-pack)이 bc01f43 이후 신설한 팩 검체 **16종**을 3완전 레인에 **같은
           #   커밋으로** 등재한다. 레인 워커가 각자 자기 레인에만 넣으면 ci-branch.yml 의 '팩 스위트
           #   레인 대조' 게이트가 비대칭으로 적색이 되므로(B-9), 등재는 통합 단계 1회다 — 레인 워커는
           #   신규 파일 목록만 인계했다.
           #   WP-2 test_trust_seed(폴더 신뢰 사전 주입) · WP-3A test_capgate_registration·
           #   test_capgate_hook_shell(능력 게이트 등록조건·셸 배선) · WP-3C test_cso_directive_rev ·
-          #   P6 test_role_authority·test_role_authority_shell(역할 해소 데몬 권위 · 단조 거부) ·
+          #   P6 test_role_authority·test_role_authority_shell(역할 해소 데몬 권위 · 단조 거부)·
+          #   test_role_authority_triage(독립 판정관 회귀 핀 — 2026-09-08 통합에서 **추가 등재**:
+          #   머지 후 신규 파일 대조에서 이 1종만 3레인 어디에도 없었다) ·
           #   WP-6 test_round_stop_reason · WP-7 test_resource_gate·test_resource_gate_fleet_cpu·
           #   test_inject_context_role_seat · WP-1 test_carry_unproven_scope·
           #   test_wakeup_durable_receipt·test_wakeup_park_failure · phoenix 2종.
@@ -582,13 +584,15 @@ jobs:
           #     `test_phoenix_fresh_honest` 를 통째로 한 토큰으로 잡으므로 접두 토큰과 섞이지 않는다 — 실측).
           #   전부 격리 HOME/PATH 스텁 하네스(라이브 데몬·~/.cys·~/.local/state 무접촉).
           #   실측 2026-09-08 14:4x KST · macOS arm64 · python 3.14.7 · **루프와 같은 env(CYS_PACK_DIR
-          #   만 주입)** 로 15종 전건 rc=0: round_stop_reason 41s · role_authority_shell 24s ·
+          #   만 주입)** 로 당시 15종 전건 rc=0: round_stop_reason 41s · role_authority_shell 24s ·
           #   trust_seed 17s(258 테스트) · role_authority 11s · capgate_hook_shell 10s ·
           #   capgate_registration 9s · inject_context_role_seat 8s · 나머지 8종 합계 ≤4s → 약 123s.
           #   검체 문서가 권하는 JAVIS_ROOT 는 검체가 스스로 임시로 덮으므로 루프 주입 불요(실측).
-          #   ⚠**Pack 레인 10종의 파일은 이 커밋 시점 트리에 없다** — 팩 브랜치 머지 때 도착한다.
-          #     루프의 `[ -f ]` 단언은 머지 전 실행에서 그 10종에 붉어진다(의도된 상태). 레인 대조
-          #     게이트는 **토큰 집합** 대조라 지금도 통과한다. 로컬 예행: `scripts/lane-parity-rehearsal.sh`
+          #   ★16종째 test_role_authority_triage 는 통합 단계 실측(2026-09-08 18:45 KST · macOS arm64 ·
+          #     python 3.14.7 · CYS_PACK_DIR·JAVIS_ROOT·CYS_PROBE_RUNS 임시 주입): **rc=0 · 4s**.
+          #   ✅**Pack 레인 10종은 2026-09-08 통합 머지(76a83ff)로 전부 도착했다**(종전 ⚠ 해소).
+          #     머지 전에는 루프의 `[ -f ]` 단언이 그 10종에 붉었다(의도된 상태였다). 레인 대조
+          #     게이트는 **토큰 집합** 대조라 그때도 통과했다. 머지 뒤 검증: `scripts/lane-parity-rehearsal.sh --strict`
           #     — ①레인 대조 파이썬을 ci-branch.yml 원본에서 추출해 그대로 돌리고(로직 복제 0)
           #       ②등재 이름의 파일 존재를 PENDING(머지 대기) 목록과 대조한다.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
@@ -604,6 +608,7 @@ jobs:
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
+                   test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
                    test_inject_context_role_seat test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
