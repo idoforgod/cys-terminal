@@ -587,8 +587,13 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
      master는 즉시 자율 복구(RECOVERY 프로토콜·G2 실측 대조)하고 미해결 지점부터 재개한다.
   6. **🔴 무응답 정책(제품 기본 절차 = 독립검증 후 조건부 집행)**: master가 통보 후
      타임아웃(cycle-agent 기본 120s) 내 ack를 못 보내면(비대·hang) CSO가 SESSION_STATE를 **독립
-     검증**(checksum + 최신 mtime) — ①신선(미저장 작업 없음 확정) → cycle-agent로 clear 집행(손실0)
-     ②낡음(미저장 위험) → clear 금지·오너께 escalation. 무한 대기·맹목 force-clear 없음
+     검증**(checksum + 최신 mtime) — ①**저장 기준선이 신선함**이 확정되면 cycle-agent로 clear 집행을
+     **시도**한다. checksum·mtime은 **저장된 파일의 상태만** 증명하므로 '미저장 작업 없음'도 **'손실
+     0'도 단언하지 마라**(그 단언은 이 증명의 범위 밖이다 — CSO_DIRECTIVE §1-2 ⑦ 과 같은 문면).
+     또 `cys cycle-agent`는 **호출 시점에 새 기준선**을 잡고 **호출 이후의 파일 갱신**을 저장 증거로
+     요구하므로, 저장 지시를 받지 못하는 hang에서는 `저장 검증 실패 … clear 미실행`이 종착점이고
+     그때의 출구는 오너 채널 상신뿐이다 — 미실행을 '집행됨'으로 적지 마라 ②신선 확정 불가·낡음
+     (미저장 위험) → clear 금지·오너께 escalation. 무한 대기·맹목 force-clear 없음
      (eval-driven 독립 재유도 원칙과 정합). **CSO 부재 / AUTOPILOT_PAUSED / 오너 실시간 입력 중 =
      clear 보류.** 상세 [[feedback_autonomous_pilot_mandate]].
 
