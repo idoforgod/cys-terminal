@@ -33,6 +33,15 @@ const MISS_WINDOW_SECS: i64 = 600;
 /// surface·roles 맵·PTY fd가 단조 증가한다(원샷+fresh는 1회뿐이나 반복은 무한 누적).
 /// close_after_secs를 명시하면 그 값이 우선 — 기본은 주입 과업이 끝날 여유를 둔 보수적 상한.
 const FRESH_RECURRING_DEFAULT_TTL_SECS: u64 = 1800;
+/// ★(0.14.31 · triage X9) 큐 경유 잡의 fresh 좌석 회수 **하한**(초). 큐 배달은 배달자 틱이
+/// 초안·alt-screen·승인대기·빈 좌석 게이트를 통과시킨 뒤에야 주입하므로, 0초 회수는 "적재하고
+/// 즉시 버린다" 와 같다.
+const QUEUED_CLOSE_MIN_TTL_SECS: u64 = 60;
+/// 적재된 항목의 **처분이 정해질 때까지** 회수를 미루는 상한(초). 무한 대기는 좌석 누수이므로
+/// 여기서 끊고 회수한다(그때는 `queue.dropped` 묘비가 남는다).
+const QUEUED_CLOSE_MAX_WAIT_SECS: u64 = FRESH_RECURRING_DEFAULT_TTL_SECS;
+/// 처분 확인 간격(초).
+const QUEUED_CLOSE_POLL_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchSpec {
@@ -43,6 +52,7 @@ pub struct LaunchSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Job {
     pub id: String,
     /// "HH:MM" (로컬 시간). 원샷(at)·주기(every_minutes) job은 생략.
@@ -103,7 +113,45 @@ pub struct Job {
     pub launch: Option<LaunchSpec>,
 }
 
+/// ★(0.14.31 · 독립 판정 triage X8) **수용 시점 정규화** — `#[serde(remote = "Self")]` 는
+/// 파생 구현을 연관함수로 내려두고, 그 위에 이 검증 계층을 씌우는 serde 의 표준 관용이다.
+/// 여기가 "큐 경유가 계약인 잡" 의 단일 정규형(`action = push_queued`)을 세우는 지점이다.
+impl<'de> Deserialize<'de> for Job {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut job = Job::deserialize(deserializer)?;
+        job.canonicalize_queue_action();
+        Ok(job)
+    }
+}
+
+impl Serialize for Job {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Job::serialize(self, serializer)
+    }
+}
+
 impl Job {
+    /// ★(triage X8) 큐 경유가 계약인 push 잡을 **구 데몬이 거절하는 표현**으로 정규화한다.
+    ///
+    /// 강등 안전의 전제는 "구 데몬이 이 잡을 실행하지 못한다" 이다. 그런데 문서가 **지원한다고
+    /// 명시한** opt-in 표현(`action:"push" + via_queue:true`)은 구 데몬이 미지 필드를 무시하고
+    /// `"push"` 로 읽어 **직접 주입**한다 — 초안·승인대기·alt-screen·빈 좌석 게이트가 통째로
+    /// 사라진다. 두 표현은 같은 뜻이므로 저장·수용의 정규형을 하나로 접는다.
+    ///
+    /// `action` 이 `push` 인 경우에만 만진다 — `command` 등 **다른 action** 을 큐 표현으로
+    /// 바꾸면 그것이 운영자 편집의 무언 소실이다(§B-5 · 같은 부류의 결함 X13).
+    fn canonicalize_queue_action(&mut self) {
+        if self.via_queue && self.action == "push" {
+            self.action = ACTION_PUSH_QUEUED.to_string();
+        }
+    }
+
     /// 이 잡의 push 가 **큐를 경유해야 하는가**.
     ///
     /// 두 표현이 같은 뜻이다: ①`action:"push_queued"`(구 데몬이 **거절**하는 강등 안전 표현) ·
@@ -302,6 +350,23 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
     ]
 }
 
+/// 저장된 잡 배열에서 `action:"push" + via_queue:true` 를 `action:"push_queued"` 로 접는다(순수).
+/// 반환: 바꾼 것이 있는가. **`push` 이외의 action 은 건드리지 않는다**(운영자 편집 보존 · §B-5).
+fn canonicalize_stored_queue_actions(jobs: &mut [serde_json::Value]) -> bool {
+    let mut changed = false;
+    for j in jobs.iter_mut() {
+        let is_push = j.get("action").and_then(|v| v.as_str()) == Some("push");
+        let via = j.get("via_queue").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_push && via {
+            if let Some(o) = j.as_object_mut() {
+                o.insert("action".into(), json!(ACTION_PUSH_QUEUED));
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
 ///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle"·"formation"·"promote") → 버전 상이 시 교체(갱신)·동버전 무접촉
@@ -337,18 +402,31 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) 
                 //   남는다. 전역 버전 범프는 다른 builtin 전부를 코드 정의로 덮어 운영자 편집을
                 //   소실시키므로(§B-5 금지), 같은 id·같은 마커 항목의 **그 필드만** 고친다.
                 //   `via_queue` 도 함께 세워, 운영자가 action 을 되돌려도 신 데몬은 큐를 탄다.
+                //   ★(0.14.31 · 독립 판정 triage X13) 조건은 "**구 표현인가**" 이지 "코드 정의와
+                //   다른가" 가 아니다. 종전 조건은 같은 id·같은 마커를 유지한 채 `action` 을
+                //   `command` 로 바꾼 운영자 잡까지 `push_queued` 로 덮었다 — 설정한 명령이 돌지
+                //   않고 그 문자열이 inbox 잡이 된다(§B-5 "운영자 수기 편집 무언 소실 금지" 위반).
+                //   이관 대상은 구 빌드가 심은 정확히 그 표현(`"push"`)뿐이고, 그 밖의 불일치는
+                //   **덮지 않고 conflict 로 보고**한다.
                 if let Some(want_action) = bj.get("action").and_then(|v| v.as_str()) {
-                    if want_action == ACTION_PUSH_QUEUED
-                        && jobs[pos].get("action").and_then(|v| v.as_str()) != Some(want_action)
-                    {
-                        if let Some(o) = jobs[pos].as_object_mut() {
-                            o.insert("action".into(), serde_json::json!(want_action));
-                            o.insert("via_queue".into(), serde_json::json!(true));
+                    let cur_action = jobs[pos].get("action").and_then(|v| v.as_str());
+                    if want_action == ACTION_PUSH_QUEUED && cur_action != Some(want_action) {
+                        if cur_action == Some("push") {
+                            if let Some(o) = jobs[pos].as_object_mut() {
+                                o.insert("action".into(), serde_json::json!(want_action));
+                                o.insert("via_queue".into(), serde_json::json!(true));
+                            }
+                            changed = true;
+                            eprintln!(
+                                "[cysd] ensure_builtin_jobs: '{id}' 의 action 을 '{want_action}' 로 이관 — 큐 경유가 이 잡의 계약이다(직접 주입 차단)"
+                            );
+                        } else {
+                            conflicts.push(id.clone());
+                            eprintln!(
+                                "[cysd] ensure_builtin_jobs: '{id}' 의 action 이 '{}' 로 편집돼 있다 — 이관하지 않는다(운영자 편집 보존).                                  큐 경유가 필요하면 action 을 '{want_action}' 로 두라.",
+                                cur_action.unwrap_or("(없음)")
+                            );
                         }
-                        changed = true;
-                        eprintln!(
-                            "[cysd] ensure_builtin_jobs: '{id}' 의 action 을 '{want_action}' 로 이관 — 큐 경유가 이 잡의 계약이다(직접 주입 차단)"
-                        );
                     }
                 }
                 let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
@@ -418,7 +496,11 @@ pub fn ensure_builtin_jobs() {
             .insert("jobs".to_string(), json!([]));
     }
     let arr = root.get_mut("jobs").and_then(|j| j.as_array_mut()).unwrap();
-    let (changed, conflicts) = apply_builtin_jobs(arr);
+    // ★(triage X8) 저장된 표현도 같은 정규형으로 접는다 — 메모리에서만 접으면 **파일**은 여전히
+    //   `action:"push"` 라 강등된 구 데몬이 그것을 직접 주입한다(이 정규화의 목적 그 자체).
+    let normalized = canonicalize_stored_queue_actions(arr);
+    let (bchanged, conflicts) = apply_builtin_jobs(arr);
+    let changed = normalized || bchanged;
     for id in &conflicts {
         eprintln!(
             "[cysd] ensure_builtin_jobs: 사용자 잡이 예약 id '{id}' 를 선점 — built-in 갱신 skip(사용자 잡 보존). \
@@ -896,6 +978,15 @@ async fn fire(daemon: Arc<Daemon>, job: Job) {
 /// - 미설정 + 원샷(at) job → None (1회뿐이라 무한 누적 없음 — 기존 동작 보존)
 fn effective_close_ttl(job: &Job) -> Option<u64> {
     if let Some(ttl) = job.close_after_secs {
+        // ★(0.14.31 · 독립 판정 triage X9) **큐 경유 배달은 준비 게이트를 기다린다.**
+        //   `close_after_secs: 0` 은 그대로 `Some(0)` 이라 회수 타이머가 배달 게이트가 열리기
+        //   전에 돌고, `close_surface` 는 활성 큐를 폐기한다(governance `drain_active_except_inflight`)
+        //   — 적재된 일감이 배달 전에 사라진다. 큐가 계약인 잡에는 **하한**을 둔다: 회수가
+        //   배달 시도보다 앞설 수 없게 만드는 최소 창이다(운영자의 0 은 "가능한 한 빨리" 이지
+        //   "배달 전에" 가 아니다). 처분이 정해질 때까지의 실제 유예는 호출부가 따로 진다.
+        if job.uses_queue() {
+            return Some(ttl.max(QUEUED_CLOSE_MIN_TTL_SECS));
+        }
         return Some(ttl);
     }
     if job.at.is_none() {
@@ -1037,8 +1128,18 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         let delivered = deliver_push(daemon, job, sid, text, None);
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
+            // ★(triage X9) 적재 성공(`"queued"`)은 **배달이 아니다**. 회수는 그 항목의 처분
+            //   (배달·만료·폐기)이 정해진 뒤에 한다 — 상한(QUEUED_CLOSE_MAX_WAIT_SECS)까지만.
+            let await_disposition = matches!(delivered, Ok("queued"));
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl)).await;
+                if await_disposition {
+                    let mut waited = 0u64;
+                    while waited < QUEUED_CLOSE_MAX_WAIT_SECS && surface_queue_pending(&d, sid) {
+                        tokio::time::sleep(Duration::from_secs(QUEUED_CLOSE_POLL_SECS)).await;
+                        waited += QUEUED_CLOSE_POLL_SECS;
+                    }
+                }
                 let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
             });
         }
@@ -1170,6 +1271,13 @@ fn has_machine_label(text: &str) -> bool {
         return ch == '[' || ch == '\u{ff3b}';
     }
     false
+}
+
+/// 그 좌석의 활성 큐에 아직 배달되지 않은 항목이 남아 있는가(처분 미정) — 좌석이 없으면 false.
+fn surface_queue_pending(daemon: &Arc<Daemon>, sid: u64) -> bool {
+    daemon
+        .get_surface(sid)
+        .is_some_and(|s| !s.pending_queue.lock().unwrap_or_else(|e| e.into_inner()).is_empty())
 }
 
 /// 라벨이 없으면 `[schedule <job-id>] ` 을 앞에 붙인다(실물 라벨 규약 `[wakeup <W-id>]` 와 동형).
@@ -2685,5 +2793,133 @@ mod tests {
         assert!(!c3 || theirs[0]["action"].as_str() == Some("push"));
         assert_eq!(theirs[0]["action"].as_str(), Some("push"), "사용자 잡의 action 을 바꿨다");
         assert!(conf3.contains(&"cso-alert-inbox-check-60m".to_string()), "선점 conflict 미보고");
+    }
+}
+
+// ═════════════════ 독립 판정(triage R3-WP3B) — 잔여 지적 재현 검체 ═════════════════
+// 현재 HEAD 에서 **실패하도록** 쓰였다. 통과하면 그 지적은 반증이다.
+#[cfg(test)]
+mod triage_schedule {
+    use super::*;
+    use serde_json::json;
+
+    /// [codex #8 blocking] 강등 안전이 builtin 만 덮고, **지원한다고 문서화한 opt-in 표현**은 덮지 않는다.
+    ///
+    /// `Job::uses_queue`(schedule.rs:113)는 `action:"push" + via_queue:true` 도 큐 경유로 인정한다.
+    /// 그 표현으로 저장된 잡을 구 데몬(=`via_queue` 미지 필드 무시)이 읽으면 `"push"` 로 보고
+    /// `fire_push` → 직접 `inject` 를 한다 — 큐가 지키던 초안·승인대기·alt-screen 게이트가
+    /// 통째로 사라진다.
+    #[test]
+    fn triage_x8_queue_required_job_is_stored_in_a_downgrade_rejected_action() {
+        let job: Job = serde_json::from_value(json!({
+            "id": "operator-opt-in", "action": "push", "to": "cso",
+            "text": "x", "every_minutes": 60, "via_queue": true
+        }))
+        .expect("추가-전용 스키마");
+        assert!(job.uses_queue(), "전제: 신 데몬은 이 표현을 큐 경유로 읽는다");
+        assert_eq!(
+            job.action, ACTION_PUSH_QUEUED,
+            "큐 경유가 계약인 잡이 구 데몬이 **수용**하는 action 으로 저장돼 있다(강등 시 직접 주입)"
+        );
+    }
+
+    /// [codex #9 blocking] fresh 좌석 회수가 큐에 적재된 일감을 파괴한다.
+    ///
+    /// `fire_push`(schedule.rs:1043-1050)는 `deliver_push` 가 `"queued"`(=적재 성공, 배달 아님)
+    /// 를 돌려줘도 `effective_close_ttl` 로 회수 타이머를 **무조건** 건다. `close_after_secs:0`
+    /// 은 `Some(0)` 이라(:897-900) 배달 게이트가 열리기 전에 `close_surface` 가 돌고,
+    /// 그 경로는 활성 큐를 폐기한다(governance.rs:4277 `drain_active_except_inflight`).
+    #[test]
+    fn triage_x9_queued_fresh_job_does_not_arm_an_immediate_reclamation() {
+        let job: Job = serde_json::from_value(json!({
+            "id": "fresh-queued", "action": ACTION_PUSH_QUEUED, "to": "w", "text": "x",
+            "at": 1_700_000_000i64, "fresh": true, "close_after_secs": 0,
+            "launch": {"role": "w", "agent": "claude"}
+        }))
+        .expect("스키마");
+        assert!(job.uses_queue() && job.fresh, "전제: 큐 경유 + fresh");
+        assert_ne!(
+            effective_close_ttl(&job),
+            Some(0),
+            "큐 경유 배달은 준비 게이트를 기다리는데 회수는 즉시다 — 적재된 일감이 배달 전에 폐기된다"
+        );
+    }
+
+    /// [codex #13 major] 표적 마이그레이션이 운영자의 **임의** action 편집을 덮어쓴다.
+    ///
+    /// 조건이 "구 표현(`push`)인가" 가 아니라 "코드 정의와 다른가" 다(schedule.rs:341-342).
+    /// 같은 id·같은 마커를 유지한 채 action 을 `command` 로 바꾼 운영자 잡은 다음 부트에서
+    /// `push_queued` 로 바뀌어 설정한 명령이 돌지 않고 그 문자열이 inbox 잡이 된다.
+    #[test]
+    fn triage_x13_migration_preserves_an_operator_non_push_action() {
+        let mut jobs = vec![json!({
+            "id": "cso-alert-inbox-check-60m",
+            "every_minutes": 60,
+            "action": "command",
+            "command": "cys status --json > /tmp/cso-inbox.json",
+            "_builtin": "alert",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        })];
+        let (_changed, _conflicts) = apply_builtin_jobs(&mut jobs);
+        assert_eq!(
+            jobs[0]["action"].as_str(),
+            Some("command"),
+            "운영자가 바꾼 action 이 무언 소실됐다(§B-5 수기 편집 보존 위반)"
+        );
+    }
+}
+
+// ═════════════════ 수렴(R3-WP3B) — 고침이 세운 불변식의 회귀 핀 ═════════════════
+#[cfg(test)]
+mod converge_schedule {
+    use super::*;
+    use serde_json::json;
+
+    /// ★X8: 저장된 표현도 정규형으로 접힌다 — **그리고 `push` 이외의 action 은 건드리지 않는다**
+    /// (그것을 건드리는 것이 X13 과 같은 부류의 운영자 편집 소실이다).
+    #[test]
+    fn converge_stored_queue_action_is_canonicalized_but_only_from_push() {
+        let mut jobs = vec![
+            json!({"id": "a", "action": "push", "to": "cso", "text": "x", "via_queue": true}),
+            json!({"id": "b", "action": "command", "command": "true", "via_queue": true}),
+            json!({"id": "c", "action": "push", "to": "master", "text": "x"}),
+        ];
+        assert!(canonicalize_stored_queue_actions(&mut jobs), "구 표현이 그대로 남았다");
+        assert_eq!(jobs[0]["action"].as_str(), Some(ACTION_PUSH_QUEUED));
+        assert_eq!(jobs[1]["action"].as_str(), Some("command"), "다른 action 을 큐 표현으로 덮었다");
+        assert_eq!(jobs[2]["action"].as_str(), Some("push"), "큐 경유가 아닌 잡을 바꿨다");
+        // 멱등.
+        assert!(!canonicalize_stored_queue_actions(&mut jobs), "재실행이 또 바꾼다(비멱등)");
+    }
+
+    /// ★X9: 큐 경유 잡의 회수 하한 — 직접 주입 잡의 `0` 은 **그대로**다(무회귀).
+    #[test]
+    fn converge_close_ttl_floor_applies_only_to_queue_backed_jobs() {
+        let mk = |v: serde_json::Value| -> Job { serde_json::from_value(v).expect("스키마") };
+        let direct = mk(json!({"id": "d", "action": "push", "to": "w", "text": "x",
+                               "at": 1_700_000_000i64, "fresh": true, "close_after_secs": 0}));
+        assert_eq!(effective_close_ttl(&direct), Some(0), "직접 주입 잡의 운영자 0 이 바뀌었다");
+        let queued = mk(json!({"id": "q", "action": ACTION_PUSH_QUEUED, "to": "w", "text": "x",
+                               "at": 1_700_000_000i64, "fresh": true, "close_after_secs": 0}));
+        assert_eq!(effective_close_ttl(&queued), Some(QUEUED_CLOSE_MIN_TTL_SECS));
+        // 하한보다 큰 명시값은 존중한다(하한은 바닥이지 덮개가 아니다).
+        let long = mk(json!({"id": "l", "action": ACTION_PUSH_QUEUED, "to": "w", "text": "x",
+                             "at": 1_700_000_000i64, "fresh": true, "close_after_secs": 9_000}));
+        assert_eq!(effective_close_ttl(&long), Some(9_000));
+    }
+
+    /// ★X13: 운영자가 바꾼 action 은 덮지 않고 **conflict 로 보고**한다(무음 소실 금지).
+    #[test]
+    fn converge_edited_builtin_action_is_reported_not_overwritten() {
+        let mut jobs = vec![json!({
+            "id": "cso-alert-inbox-check-60m", "every_minutes": 60, "action": "command",
+            "command": "true", "_builtin": "alert", "_builtin_version": BUILTIN_JOBS_VERSION
+        })];
+        let (_changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        assert_eq!(jobs[0]["action"].as_str(), Some("command"), "운영자 편집이 덮였다");
+        assert!(
+            conflicts.contains(&"cso-alert-inbox-check-60m".to_string()),
+            "덮지 않은 사실을 알리지 않았다(조용한 무접촉은 관측 소실이다)"
+        );
     }
 }
