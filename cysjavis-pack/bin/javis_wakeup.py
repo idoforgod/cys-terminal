@@ -364,18 +364,45 @@ def _durable_verdict(cp):
     return None
 
 
+# 수락됐으나 내구 미확정인 레코드의 표식(값 = 표식 시각). 이 키가 있으면 drain 은 그 레코드를
+# **재전송 대상에서 뺀다** — 큐에 멱등 키가 없어 재전송은 곧 중복 배달이기 때문이다(폭주 ①).
+PARK_MARK = "delivered_unconfirmed_at"
+
+
 def _park_unconfirmed(path, rec):
-    """내구 미확정 배달의 원본을 `unconfirmed/` 로 옮긴다. 반환 = 보관 경로(원장 기록용)."""
+    """내구 미확정 배달의 원본을 처리한다. 반환 = `(상태, 경로)`.
+
+    상태는 셋이며 **원장에 그대로 적힌다**(사실을 뭉개지 않는다):
+      · `"parked"`  — `unconfirmed/` 로 옮겼다(원본은 pending 에 없다).
+      · `"marked"`  — 이동은 실패했지만 원본에 [`PARK_MARK`] 를 영속화했다. pending 에 남되
+                      다음 drain 이 **재전송하지 않는다**.
+      · `"failed"`  — 표식조차 남기지 못했다(원본 파일 자체가 잡혀 있다). 다음 drain 이 같은
+                      digest 를 **재전송한다** — 그 사실을 숨기지 않고 그대로 적는다.
+
+    ★(0.14.31 · 수렴 R2 · reviewer-claude minor + reviewer-codex F2) 종전에는 ⓐ `os.makedirs` 가
+    try 밖이라 여기서 OSError 가 나면 `cmd_drain` 이 통째로 예외 종료했고(이미 `cys send --queued`
+    는 성공한 뒤다 → 다음 drain 이 같은 digest 를 재전송 = 중복 배달), ⓑ `os.replace` 실패 시
+    **원본 경로를 그대로 돌려주어** 원장에는 `delivered_unconfirmed{parked:<pending 경로>}` 가
+    남는데 파일은 여전히 pending 에 있었다(원장은 '보관했다'고 말하는데 실제로는 재전송 대기).
+    """
     # 경로는 **호출 시점의** WK_DIR 에서 파생한다(검체 하네스가 WK_DIR 을 스크래치로 갈아끼운다).
-    parked_dir = os.path.join(WK_DIR, "unconfirmed")
-    os.makedirs(parked_dir, exist_ok=True)
-    dest = os.path.join(parked_dir, f"{_safe(rec.get('id') or 'w')}.json")
     try:
+        parked_dir = os.path.join(WK_DIR, "unconfirmed")
+        os.makedirs(parked_dir, exist_ok=True)
+        dest = os.path.join(parked_dir, f"{_safe(rec.get('id') or 'w')}.json")
         os.replace(path, dest)
+        return ("parked", dest)
     except OSError:
         # 이동 실패는 삭제로 접지 않는다 — 원본을 그 자리에 두는 편이 유실보다 낫다.
-        return path
-    return dest
+        # 대신 **재전송 대상에서 빼는 표식**을 영속화한다(그것이 실패해야 비로소 재전송 위험이다).
+        pass
+    try:
+        marked = dict(rec)
+        marked[PARK_MARK] = _now()
+        _write_json_atomic(path, marked)
+        return ("marked", path)
+    except OSError:
+        return ("failed", path)
 
 
 def _iter_pending():
@@ -542,7 +569,10 @@ def cmd_drain(a):
                               "evidence": evidence}, ensure_ascii=False))
             return EXIT_PAUSED
     fastfail_max = int(os.environ.get("JAVIS_FASTFAIL_MAX", "3"))
-    pending = _iter_pending()
+    # ★(0.14.31 · 수렴 R2 · reviewer-codex F2) 이미 수락됐으나 내구 미확정으로 표식된 레코드는
+    #   **재전송 대상이 아니다**. 큐에 멱등 키가 없어 재전송은 곧 중복 배달이다(정본 §7 위험 ①).
+    #   `cancel`·`list` 는 종전대로 이 레코드도 본다(사람이 처분할 수 있어야 한다).
+    pending = [(pp, rr) for pp, rr in _iter_pending() if not rr.get(PARK_MARK)]
     if a.target:
         pending = [(p, r) for p, r in pending if r["target"] == a.target]
     if not pending:
@@ -619,14 +649,29 @@ def cmd_drain(a):
             if a.deliver and durable is False:
                 # 내구 미확정 — 원본을 **보관**하고 원장에 사실을 남긴다(pending 에는 두지 않는다:
                 # 다음 drain 이 다시 보내면 큐에 멱등 키가 없어 중복 배달이 된다).
-                parked = _park_unconfirmed(path, rec)
-                _ledger_append({"event": "delivered_unconfirmed", "target": target,
-                                "wakeup_id": rec["id"], "durable": False,
-                                "queue_entry_id": None, "parked": parked,
-                                "why": "데몬이 큐 WAL 저장에 실패했다(durable=false) — 데몬이 "
-                                       "재시도 전에 죽으면 이 wakeup 은 유실된다"})
-                print(f"warn: 내구 미확정 배달 — 원본 보관: {rec['id']} → {parked}",
-                      file=sys.stderr)
+                # ★(수렴 R2) 보관이 실패하면 그 사실을 `delivered_unconfirmed` 로 덮지 않는다 —
+                #   `park_failed` 로 갈라 적고, 재전송이 예정돼 있는지까지 한 줄에 남긴다.
+                state, parked = _park_unconfirmed(path, rec)
+                if state == "parked":
+                    _ledger_append({"event": "delivered_unconfirmed", "target": target,
+                                    "wakeup_id": rec["id"], "durable": False,
+                                    "queue_entry_id": None, "parked": parked,
+                                    "why": "데몬이 큐 WAL 저장에 실패했다(durable=false) — 데몬이 "
+                                           "재시도 전에 죽으면 이 wakeup 은 유실된다"})
+                    print(f"warn: 내구 미확정 배달 — 원본 보관: {rec['id']} → {parked}",
+                          file=sys.stderr)
+                else:
+                    retransmit = state == "failed"
+                    _ledger_append({"event": "park_failed", "target": target,
+                                    "wakeup_id": rec["id"], "durable": False,
+                                    "queue_entry_id": None, "pending": parked,
+                                    "park_state": state, "will_retransmit": retransmit,
+                                    "why": "보관 이동이 실패했다 — 원본은 pending 에 남아 있다"
+                                           + ("(표식 실패 · 다음 drain 이 재전송한다 = 중복 배달)"
+                                              if retransmit else
+                                              "(미확정 표식을 남겼다 · 재전송하지 않는다)")})
+                    print(f"warn: 내구 미확정 배달 — 보관 실패({state}): {rec['id']} → {parked}",
+                          file=sys.stderr)
                 delivered += 1
                 continue
             os.remove(path)
