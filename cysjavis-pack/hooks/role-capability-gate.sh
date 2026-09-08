@@ -60,6 +60,11 @@
 #   밖은 전부 deny)라서 이 한계가 좁다. 단 CSO 경로도 명령치환(`$(…)`·백틱)·프로세스 치환은
 #   토큰화로 안을 볼 수 없으므로 **문자 발견 즉시 deny** 한다(해석 불가 = 거부 방향).
 #   ② cysd 인증(peer-pid)이 붕괴하면 role 조회가 오염될 수 있다(ADR: 소켓 동등노드 모델의 신뢰 뿌리).
+#   ③ (수렴 R2 · 명문화) reviewer 경로의 **선행 환경 할당**은 `BUILDER_ENV_WRITE` 이름 축만
+#     막는다 — `PATH=`·`PAGER=`·`EDITOR=`·`PYTHONPATH=` 등 읽기 작업에서도 흔한 이름은 열려
+#     있고, 그것들도 '무엇이 실행되는가' 를 바꿀 수 있다. 넓히면 정상 조회의 오탐 대가가 커서
+#     따로 재야 한다(계획 §3-3: 오탐의 귀결이 '리뷰어가 읽지 못한다' 여서는 안 된다).
+#     `$(echo rm)`·`eval rm`·`/bin/sh -c 'rm …'` 는 위 ① 인터프리터 우회와 같은 층이다.
 #   kill-switch = 사람의 세션 리뷰.
 #
 # Design:
@@ -367,16 +372,34 @@ def _cargo_config_value_safe(val):
             return True
     return False
 BUILDER_DENY_OPT_VALUES = {"-mod": ("mod",)}
-# 산출물 폐기 장치는 플랫폼마다 다르다 — unix 에서 `NUL` 은 **일반 파일**이고
-# `/dev/stdout`·`/dev/tty` 는 null sink 가 아니다(리다이렉트의 NULL_SINKS 와 뜻이 다르다).
-# ★triage T9: 이 상수는 **플랫폼 폐기 장치의 단일 정본**이다. 종전엔 여기만 플랫폼을 갈랐고
-#   리다이렉트의 `NULL_SINKS` 는 철자 `NUL`/`nul` 을 무조건 면제해서 **한 파일 안에서 두 계약이
-#   어긋났다** — unix bash 의 `> NUL` 은 cwd 에 일반 파일을 만들거나 자른다.
-PLATFORM_NULL_DEVICES = ("NUL", "nul") if os.name == "nt" else ("/dev/null",)
-# 이 플랫폼에서는 **폐기 장치가 아닌** 예약 이름(unix 의 `NUL` · nt 의 `/dev/null`).
-FOREIGN_NULL_NAMES = tuple(n for n in ("NUL", "nul", "/dev/null")
-                           if n not in PLATFORM_NULL_DEVICES)
-BUILDER_NULL_SINKS = PLATFORM_NULL_DEVICES
+# 폐기 장치는 **누가 그 이름을 여느냐**로 갈린다 — 축이 둘이고, 둘은 같지 않다.
+#   ⓐ 빌드 산출물 옵션(`-o <이것>`)은 **네이티브 도구**(cargo.exe·go.exe)가 연다. nt 에서
+#     장치인 이름은 Win32 예약어 `NUL` 뿐이고 `/dev/null` 은 그 도구에게 평범한 경로다.
+#     unix 에서는 반대다(`/dev/null` 이 장치 · `NUL` 은 cwd 의 일반 파일).
+#   ⓑ 리다이렉트(`> <이것>`)는 **셸**이 연다. 이 팩의 실행 셸은 양 플랫폼 모두 bash 이고
+#     (Windows 는 Git Bash/MSYS) MSYS 는 `/dev/null`·`/dev/stdout`·`/dev/stderr`·`/dev/tty` 를
+#     매핑한다 — 그래서 `/dev/*` 는 **양 플랫폼 공통**이다.
+# ★triage T9 R1 은 ⓑ 를 ⓐ 에서 파생시켜(=축을 하나로 접어서) nt 에서 `> /dev/null` 을 새로
+#   거부했다(R2 리뷰어 2인 실증): Git Bash 가 지원하는 관용구를 Windows 에서만 막고, 정작
+#   MSYS bash 에서 일반 파일이 될 수 있는 `> NUL` 만 열어 두는 **정반대 결과**였다.
+#   축이 둘이면 상수도 둘이다 — 각 상수가 **자기 축의** 단일 정본이다(파생 방향 고정).
+# ★플랫폼을 **인자로** 받는다: 그러지 않으면 내장 배터리가 자기가 도는 플랫폼의 분기밖에 못
+#   재고, 반대편 분기는 검체 0 인 채로 릴리스된다(R1 이 정확히 그렇게 nt 를 깨뜨렸다).
+def _null_device_axes(osname):
+    """(ⓐ 네이티브 도구 축, ⓑ 셸 축) — 두 축을 한 자리에서, 그러나 **갈라서** 만든다."""
+    builder = ("NUL", "nul") if osname == "nt" else ("/dev/null",)
+    shell = ("/dev/null",) + (("NUL", "nul") if osname == "nt" else ())
+    return builder, shell
+
+
+def _foreign_null_names(shell_devices):
+    """이 셸에서 폐기 장치가 **아닌** 예약 이름(unix bash 의 `NUL`/`nul` · nt 는 공집합)."""
+    return tuple(n for n in ("NUL", "nul", "/dev/null") if n not in shell_devices)
+
+
+PLATFORM_NULL_DEVICES, SHELL_NULL_DEVICES = _null_device_axes(os.name)
+BUILDER_NULL_SINKS = PLATFORM_NULL_DEVICES            # ⓐ 네이티브 도구가 여는 이름
+FOREIGN_NULL_NAMES = _foreign_null_names(SHELL_NULL_DEVICES)
 # ★명령 **자체가** 상태를 바꾸는 하위-옵션(R1 minor): `go env -w/-u` 는 GOENV 파일을 영속
 #   변경한다 — 조회 하위 명령의 얼굴을 한 설정 변경이다. `cargo fmt` 는 소스를 다시 쓴다
 #   (`--check` 는 쓰지 않고 종료 코드만 낸다).
@@ -726,10 +749,32 @@ CSO_RG_OPT_DENY = ("--pre", "--hostname-bin", "--search-zip", "-z")
 #   대가(정직): `"시각: $(date)"` 같은 무해한 치환도 막힌다 — 값을 먼저 구해 인자로 넣어야 한다.
 CSO_SUBST_MARKERS = ("$(", "`", "<(", ">(")
 # 리다이렉트 대상으로 항상 허용되는 장치(파일 쓰기가 아니다).
-# ★triage T9: **플랫폼별로** 만든다(`BUILDER_NULL_SINKS` 와 같은 상수에서 파생 — 축 1지점).
-#   unix 에서 `NUL`/`nul` 은 장치가 아니라 cwd 의 일반 파일이고, nt 에서 `/dev/*` 는 없다.
-NULL_SINKS = set(PLATFORM_NULL_DEVICES) | (
-    {"/dev/stdout", "/dev/stderr", "/dev/tty"} if os.name != "nt" else set())
+# ★triage T9 R2: **셸 축**(`SHELL_NULL_DEVICES`)에서 파생한다 — 리다이렉트를 여는 것은 셸이다.
+#   unix bash 에서 `NUL`/`nul` 은 장치가 아니라 cwd 의 일반 파일이라 빠지고(T9 의 본래 요구),
+#   `/dev/*` 는 Git Bash 가 매핑하므로 nt 에서도 남는다(R1 이 여기서 nt 만 깨뜨렸다).
+NULL_SINKS = set(SHELL_NULL_DEVICES) | {"/dev/stdout", "/dev/stderr", "/dev/tty"}
+
+
+def _is_foreign_null(name, foreign=None):
+    """이 **셸**의 폐기 장치가 아닌 예약 철자인가 — 양변을 **같은 모양**으로 비교한다.
+
+    `foreign` 은 검체가 **반대 플랫폼의 목록**을 넣어 모양을 재기 위한 것이다(기본값은 현재
+    플랫폼). 모양 결함은 목록이 비어 있는 쪽에서는 드러나지 않는다.
+
+    ★R2 major(claude 리뷰어): 종전엔 한쪽만 `os.path.basename` 을 취해 nt 에서
+      `FOREIGN_NULL_NAMES == ("/dev/null",)` vs `basename == "null"` 이 되어 분기가 **영원히
+      죽어 있었다**(같은 축이라 적어 놓고 두 모양을 비교했다). 철자마다 모양을 맞춘다:
+      경로형(`/dev/null`)은 **전체**가 같아야 하고(아무 파일 `null` 을 잡으면 과차단이다),
+      맨이름형(`NUL`)은 어느 디렉터리 아래여도 같은 함정이므로 **basename** 으로 본다.
+    """
+    n = str(name or "").replace("\\", "/")
+    for f in (FOREIGN_NULL_NAMES if foreign is None else foreign):
+        if "/" in f:
+            if n == f:
+                return True
+        elif os.path.basename(n) == f:
+            return True
+    return False
 
 
 # ── 공용 술어 ────────────────────────────────────────────────────────────────
@@ -1131,6 +1176,54 @@ def brace_expansion_hazard(command):
     return None
 
 
+def ansi_c_quote_hazard(command):
+    """(err|None) — `$'…'`(ANSI-C 인용)·`$"…"`(로케일 번역)가 있는가.
+
+    ★R2 major(codex 실증): **shlex 는 이 표기를 모른다** — `$` 를 평범한 글자로 읽고 따옴표만
+      벗겨서 `$--config=…` 라는, bash 의 argv 에 **존재하지 않는** 토큰을 만든다. bash 는 `$` 를
+      지우고 이스케이프를 풀어 `--config=…` 를 넘긴다. 그래서 옵션 검증(`_vopt` →
+      `CARGO_CONFIG_SAFE_KEYS`)이 통째로 비껴갔다:
+      `cargo test $'--config=build.rustc-wrapper="/tmp/w"'` 가 ALLOW 였다(실행기 주입).
+      값도 개수도 아니라 **토큰의 철자 자체**가 갈리므로 판정할 수 없다 — 거부 방향이다
+      (§1-1 '아는 것만 통과'). 대가(정직): `grep -P $'\\t'` 같은 무해한 표기도 막힌다 —
+      따옴표 없이(`grep -P '\\t'`) 적으면 된다.
+    """
+    cleaned, mask = scan_shell(command)
+    for i in range(len(cleaned) - 1):
+        if (mask[i] == "u" and cleaned[i] == "$"
+                and mask[i + 1] == "q" and cleaned[i + 1] in ("'", '"')):
+            return ("`$%s…%s` 표기(ANSI-C 인용·로케일 번역)는 셸이 **다른 문자열**로 바꾼다 — "
+                    "게이트가 보는 토큰과 bash 가 넘기는 인자가 갈린다(따옴표 앞의 `$` 를 "
+                    "빼고 적어라)" % (cleaned[i + 1], cleaned[i + 1]))
+    return None
+
+
+# ★선행 환경 할당으로 **빌더가 실행할 프로그램**을 바꾸는 이름(R2 minor · claude 리뷰어 실증).
+#   `--config=build.rustc-wrapper=…` 를 막아 놓고 `RUSTC_WRAPPER=…` 를 열어 두면 같은 통제가
+#   표기 하나로 비껴간다(CSO 경로는 선행 할당을 이미 '도구가 보는 문맥을 바꾼다'로 거부한다 —
+#   한 파일 안에서 두 계약이 갈려 있었다). **이름 축만** 본다(값은 보지 않는다).
+#   경계(정직): PATH·PAGER·EDITOR 처럼 읽기 작업에서도 흔한 이름은 넣지 않는다 — 그 축까지
+#   막으려면 오탐 대가를 따로 재야 한다(머리말 한계 항목).
+BUILDER_ENV_WRITE = ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTDOC",
+                     "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO", "CARGO_BUILD_RUSTC",
+                     "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                     "CARGO_BUILD_RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                     "CARGO_BUILD_TARGET_DIR", "CARGO_TARGET_DIR",
+                     "GOFLAGS", "GOENV", "GOBIN", "CC", "CXX",
+                     "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV")
+# `CARGO_TARGET_<TRIPLE>_RUNNER|LINKER|RUSTFLAGS` — 삼중자가 무한하므로 접미로 본다.
+BUILDER_ENV_WRITE_TAILS = ("RUNNER", "LINKER", "RUSTFLAGS")
+
+
+def env_assign_is_write(name):
+    """선행 환경 할당이 **실행될 프로그램**을 바꾸는가(이름 축)."""
+    n = (name or "").upper()
+    if n in BUILDER_ENV_WRITE:
+        return True
+    return (n.startswith("CARGO_TARGET_")
+            and n.rsplit("_", 1)[-1] in BUILDER_ENV_WRITE_TAILS)
+
+
 ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad")
 # ★캐리지 리턴(R2 · codex 실증): bash 에서 CR 은 개행도 구분자도 아닌 **평범한 문자**다.
 #   그래서 `"…/javis_pre\<CR>flight.py"` 는 셸에게 같은 이름의 **다른 파일**이고, 판정기가 그것을
@@ -1166,24 +1259,40 @@ def _tokenize(command):
         return None
 
 
-def bash_has_write(command):
-    """Bash 명령에 write-shell 동사 또는 (비-허용경로) 출력 리다이렉트가 있으면 True(=변형).
+def bash_write_reason(command):
+    """(write: bool, why|None) — `bash_has_write` 의 **사유를 잃지 않는** 판(R2 minor).
+
+    ★왜 사유가 필요한가(claude 리뷰어): reviewer 경로의 deny 문면은 "producer 산출물 수정 금지"
+      하나여서, `ls dir/{a,b}` 처럼 **읽기 명령이 표기 때문에** 막힌 좌석은 무엇을 고쳐야 하는지
+      알 수 없었다(중괄호를 가리키는 말이 한 마디도 없다). 방향은 그대로 deny 이고 진단만
+      돌려준다 — 술어들은 이미 문자열을 만들고 있었고 호출측이 버리고 있었을 뿐이다.
+
+    Bash 명령에 write-shell 동사 또는 (비-허용경로) 출력 리다이렉트가 있으면 True(=변형).
     해석불가=True(fail-closed). 리다이렉트 대상이 허용경로(tmp/log)면 그 리다이렉트는 무시."""
     # ★reviewer 경로도 **같은** 전처리를 쓴다 — 종전의 `replace("\n", " ; ")` 는 인용 안 개행을
     #   경계로 만들고 주석을 shlex 에 맡겨(=명령 은닉) 같은 우회를 열어 뒀다.
     # ★triage T3: 중괄호 확장은 **거부 방향으로만** 태운다. reviewer 경로는 allowlist 가 아니라
     #   deny 목록이라, 확장으로 인자가 늘어나면 판정기가 본 명령과 셸이 실행하는 명령이 갈린다
     #   (`rm{,x} /x/build` → bash 는 `rm` 을 실제로 돌려 파일을 지운다).
-    if brace_expansion_hazard(command):
-        return True
+    _bz = brace_expansion_hazard(command)
+    if _bz:
+        return True, _bz
+    # ★R2 major(codex 실증): `$'…'` 는 shlex 가 모르는 표기다 — 게이트가 보는 토큰과 bash 가
+    #   넘기는 인자가 **철자부터** 갈려 옵션 검증이 통째로 비껴갔다. 중괄호와 같은 층(순수 셸
+    #   문법)이므로 같은 방향(거부 전용)으로 닫는다.
+    _az = ansi_c_quote_hazard(command)
+    if _az:
+        return True, _az
     # ★triage T5: 인용된 리다이렉트 문자를 연산자로 읽어 **다음 토큰을 삼키던** 갈래도 여기서
     #   닫는다 — `cso_prepare` 가 인용 출처를 토큰까지 들고 간다(구두점 센티널).
     prepared, _perr = cso_prepare(command)
     if _perr:
-        return True  # 제어문자 충돌 — fail-closed(변형으로 간주)
+        return True, _perr  # 제어문자 충돌 — fail-closed(변형으로 간주)
     tokens = _tokenize(prepared)
     if tokens is None:
-        return True  # 따옴표 불일치 등 — fail-closed(변형으로 간주)
+        # 따옴표 불일치·영폭 문자 등 — fail-closed(변형으로 간주)
+        return True, ("토큰화 실패(따옴표 짝·비가시 문자) — 판정기가 보는 명령과 셸이 실행하는 "
+                      "명령이 갈릴 수 있으면 거부다")
 
     cmd_pos = True
     i = 0
@@ -1196,7 +1305,8 @@ def bash_has_write(command):
             fd_dup = target.isdigit() and _is_fd_dup_op(tok)
             if (_txt(target) not in NULL_SINKS and not fd_dup
                     and not path_is_allowed(_txt(target))):
-                return True
+                return True, ("출력 리다이렉트 대상 %r 이 허용 경로(tmp/log) 밖이다"
+                              % _txt(target))
             i += 2
             continue
         if is_separator(tok):
@@ -1206,20 +1316,39 @@ def bash_has_write(command):
         if cmd_pos:
             name = tok.split("=", 1)[0]
             if "=" in tok and name and name.replace("_", "").isalnum():
+                # ★R2 minor(claude 리뷰어 실증): 선행 할당은 **도구가 보는 문맥**을 바꾼다.
+                #   `RUSTC_WRAPPER=/tmp/r.sh cargo test` 는 `--config=build.rustc-wrapper=…` 와
+                #   같은 실행기 주입인데 종전엔 이 분기가 전부 통과시켰다.
+                if env_assign_is_write(name):
+                    return True, ("선행 환경 할당 `%s=` 는 빌드 도구가 **무엇을 실행할지**를 "
+                                  "바꾼다(실행기·래퍼·링커 주입) — 검증 명령의 얼굴을 한 실행이다"
+                                  % name)
                 i += 1
                 continue  # env 할당
-            if tok in WRAPPERS:
+            # ★R2 minor(claude 리뷰어 실증): **명령 이름 자리의 글롭**(`/bin/r?`·`/bin/r[m]`)은
+            #   셸이 실존 파일 이름으로 바꾼다 — 판정기가 본 이름과 bash 가 실행하는 프로그램이
+            #   갈린다(`rm` 이 그대로 돈다). 중괄호와 같은 층이라 같은 방향으로 닫는다.
+            #   **인자 자리의 글롭은 건드리지 않는다**(`rg pat src/*.rs` 오탐 금지) — 여기서 재는
+            #   것은 '무엇이 실행되는가' 뿐이다. `[`·`[[` 는 셸 내장 test 라 뺀다.
+            if tok not in ("[", "[[") and any(g in tok for g in GLOB_CHARS):
+                return True, ("명령 이름 자리의 글롭(`%s`)은 셸이 **실존 파일 이름으로 바꾼다** — "
+                              "무엇이 실행되는지 판정할 수 없다(이름을 그대로 적어라)" % _txt(tok))
+            base = os.path.basename(tok)
+            # ★래퍼도 **이름으로** 본다(R2 minor): 종전엔 정확 토큰 비교라 `/usr/bin/env rm -rf`
+            #   가 래퍼로 인식되지 않아 `rm` 이 인자 자리로 밀려 통과했다(아래 write 판정은
+            #   이미 basename 을 쓴다 — 한 함수 안에서 두 모양이었다).
+            if tok in WRAPPERS or base in WRAPPERS:
                 i += 1
                 continue
-            base = os.path.basename(tok)
             if base in WRITE_SHELL_BUILDERS:
                 if builder_is_write(base, tokens, i):
-                    return True
+                    return True, ("빌드 도구 `%s` 세그먼트가 명령 수준 변형이다(모르는 하위 "
+                                  "명령·쓰기 옵션·실행기 주입)" % base)
                 cmd_pos = False
                 i += 1
                 continue
             if base in WRITE_SHELL_CMDS or base in WRITE_SHELL_INSTALLERS:
-                return True
+                return True, "write-shell 명령 `%s`" % base
             if base == "git":
                 # ★값을 먹는 전역 옵션은 **값까지** 건너뛴다 — 그러지 않으면 `git -C /repo reset`
                 #   에서 `/repo` 를 서브커맨드로 보고 검사를 끝낸다(종전 결함 · codex 실증).
@@ -1244,10 +1373,15 @@ def bash_has_write(command):
                         sub_args.append(tokens[j])
                         j += 1
                     if git_sub_is_write(sub, sub_args):
-                        return True
+                        return True, "git `%s` 는 변형 서브커맨드다" % sub
             cmd_pos = False
         i += 1
-    return False
+    return False, None
+
+
+def bash_has_write(command):
+    """`bash_write_reason` 의 불리언 표면(호출 지점·검체가 이 이름을 쓴다)."""
+    return bash_write_reason(command)[0]
 
 
 # ── CSO 문맥 · 경로 ──────────────────────────────────────────────────────────
@@ -1841,14 +1975,14 @@ def cso_bash_verdict(command, ti, ctx):
             continue
         if target.isdigit() and _is_fd_dup_op(op):
             continue      # `2>&1` 류 fd 복제만 숫자 대상을 허용한다(`> 1` 은 파일이다)
-        # ★triage T9: 이 플랫폼의 폐기 장치가 **아닌** 예약 이름(unix 의 `NUL`)은 거부한다.
-        #   unix bash 는 그것으로 cwd 에 일반 파일을 만들거나 자른다 — '폐기하려는 의도' 와
-        #   '파일을 만드는 사실' 이 갈리는 표기는 판정하지 않는다(`/dev/null` 로 적으면 된다).
-        _tname = os.path.basename(_txt(target).replace("\\", "/"))
-        if _tname in FOREIGN_NULL_NAMES:
+        # ★triage T9(R2 로 축 정정): 이 **셸**의 폐기 장치가 **아닌** 예약 이름(unix bash 의
+        #   `NUL`)은 거부한다 — unix bash 는 그것으로 cwd 에 일반 파일을 만들거나 자른다.
+        #   '폐기하려는 의도' 와 '파일을 만드는 사실' 이 갈리는 표기는 판정하지 않는다
+        #   (`/dev/null` 로 적으면 된다). nt(Git Bash)에서는 이 목록이 공집합이다.
+        if _is_foreign_null(_txt(target)):
             return True, ("`%s` 는 이 플랫폼의 폐기 장치가 아니다 — %s 에서는 **평범한 파일**을 "
                           "만들거나 자른다(폐기하려면 `%s` 로 적어라)"
-                          % (_txt(target), os.name, PLATFORM_NULL_DEVICES[0])), False
+                          % (_txt(target), os.name, SHELL_NULL_DEVICES[0])), False
         ok, why = cso_path_allowed(target, ctx)
         if not ok:
             return True, "출력 리다이렉트 대상 %r: %s" % (_txt(target), why), False
@@ -2220,8 +2354,10 @@ def decide(tool, tool_input, role, ctx=None):
         cmd = tool_input.get("command") if isinstance(tool_input, dict) else ""
         if not isinstance(cmd, str) or not cmd:
             return False, "empty bash"
-        if bash_has_write(cmd):
-            return True, "reviewer/planner may not run write-shell"
+        _w, _wwhy = bash_write_reason(cmd)
+        if _w:
+            return True, ("reviewer/planner may not run write-shell"
+                          + (" — %s" % _wwhy if _wwhy else ""))
         return False, "read-only bash allowed"
     # matcher 밖 도구가 흘러들어와도 변형 아니면 통과.
     return False, "non-mutation tool"
@@ -2381,7 +2517,12 @@ def main():
               % (reason, role, tool, os.environ.get("CAPGATE_ROLE_SOURCE", "?")), file=sys.stderr)
         if is_cso(role):
             emit_deny("[CSO 능력 게이트] %s" % reason)
-        emit_deny("%s surface는 producer 산출물 수정 금지 (producer != evaluator)" % (role or "reviewer"))
+        # ★R2 minor: 진단을 **문면에 싣는다**(claude 리뷰어). 종전엔 사유가 stderr 에만 남아
+        #   좌석은 "producer 산출물 수정 금지" 한 줄만 받았다 — 읽기 명령이 표기 때문에 막힌
+        #   경우(`ls dir/{a,b}`) 무엇을 고쳐야 하는지 가리키는 말이 없었다. 방향은 불변이다.
+        _diag = reason.split(" — ", 1)[1].strip() if " — " in reason else ""
+        emit_deny("%s surface는 producer 산출물 수정 금지 (producer != evaluator)%s"
+                  % (role or "reviewer", ("\n\n" + _diag) if _diag else ""))
     sys.exit(0)
 
 
@@ -3341,7 +3482,68 @@ def self_test_r2(fails):
     # T9: 이 플랫폼의 폐기 장치가 아닌 예약 이름
     want(os.name != "nt", "Bash", {"command": "cys status > NUL"},
          "unix 의 `NUL` 은 폐기 장치가 아니라 일반 파일이다")
+    # ★R2: `/dev/null` 은 **양 플랫폼 공통**이다(리다이렉트는 bash 가 연다 · Git Bash 매핑).
+    #   R1 은 이 단언을 무조건 참으로 적어 두고 상수는 nt 에서 거짓으로 만들어, Windows 레인의
+    #   내장 배터리가 통째로 실패하게 했다(리뷰어 2인 실증).
     want(False, "Bash", {"command": "cys status > /dev/null"}, "실제 폐기 장치는 통과")
+
+    # ⑮ ★R2 수렴 — 폐기 장치 두 축을 **양 플랫폼 분기 모두** 잰다(리뷰어 2인: nt 분기에
+    #    검체가 0 이었고, 그래서 R1 이 Windows 만 깨뜨린 채 초록으로 나갔다).
+    _b_nt, _s_nt = _null_device_axes("nt")
+    _b_ux, _s_ux = _null_device_axes("posix")
+    if "/dev/null" not in _s_nt:
+        fails.append("R2[T9-축/nt]: Git Bash 가 매핑하는 `> /dev/null` 이 nt 에서 리다이렉트 "
+                     "면제를 잃었다 — 같은 관용구가 Windows 에서만 막힌다(plan §7 Windows 행)")
+    if "NUL" not in _s_nt:
+        fails.append("R2[T9-축/nt]: nt 의 Win32 예약 장치 `NUL` 이 셸 축에서 빠졌다")
+    if {"NUL", "nul"} & set(_s_ux):
+        fails.append("R2[T9-축/unix]: unix 에서 `NUL` 이 리다이렉트 면제를 받는다 — bash 는 "
+                     "그것으로 cwd 에 일반 파일을 만든다(T9 본래 요구)")
+    if _b_nt != ("NUL", "nul") or _b_ux != ("/dev/null",):
+        fails.append("R2[T9-축]: 네이티브 도구 축이 셸 축과 합쳐졌다(`-o` 는 도구가 연다) — "
+                     "%r/%r" % (_b_nt, _b_ux))
+    if _foreign_null_names(_s_nt):
+        fails.append("R2[T9-축/nt]: nt 에서 %r 를 이물 이름으로 본다 — Git Bash 가 여는 이름이고, "
+                     "basename 비교와 모양이 달라 분기가 **영원히 거짓**이 된다"
+                     % (_foreign_null_names(_s_nt),))
+    if _foreign_null_names(_s_ux) != ("NUL", "nul"):
+        fails.append("R2[T9-축/unix]: unix 의 이물 이름이 `NUL`/`nul` 이 아니다: %r"
+                     % (_foreign_null_names(_s_ux),))
+    # 모양 축: 경로형 철자는 **전체**, 맨이름형은 **basename** — 양변이 같은 모양이어야 한다.
+    if _is_foreign_null("/w/repo/null", ("/dev/null",)):
+        fails.append("R2[T9-모양]: 경로형 철자를 basename 으로 비교한다 — 평범한 파일 `null` 을 "
+                     "폐기 장치로 오탐한다")
+    if not _is_foreign_null("/dev/null", ("/dev/null",)):
+        fails.append("R2[T9-모양]: 경로형 철자의 전체 비교가 깨졌다")
+    if not (_is_foreign_null("NUL", ("NUL", "nul"))
+            and _is_foreign_null("sub/NUL", ("NUL", "nul"))):
+        fails.append("R2[T9-모양]: 맨이름형 이물(`NUL`)을 디렉터리 아래에서 놓친다")
+    if any(_is_foreign_null(_d) for _d in SHELL_NULL_DEVICES):
+        fails.append("R2[T9-모양]: 이물 판정이 **이 셸의 폐기 장치**를 이물로 본다")
+
+    # T1/T7 R2(codex major): ANSI-C 인용은 shlex 가 모르는 표기다 — 옵션 검증을 통째로 비껴갔다
+    rv(True, "cargo test $'--config=build.rustc-wrapper=\"/tmp/w\"'", "ANSI-C 인용 실행기 주입")
+    rv(True, "cargo $'--config=build.rustc-wrapper=/tmp/w' test", "ANSI-C 인용 결합 옵션")
+    rv(True, 'cargo test $"--config=build.rustc-wrapper=/tmp/w"', "로케일 번역 인용")
+    rv(False, "cargo test --offline", "정상 검증 명령은 통과(오탐 금지)")
+    # T1/T7 R2(claude minor): 실행기 주입은 **선행 환경 할당**으로도 온다(같은 통제·다른 표기)
+    rv(True, "RUSTC_WRAPPER=/tmp/r.sh cargo test", "선행 할당 래퍼 주입")
+    rv(True, "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=/tmp/r.sh cargo test", "선행 할당 러너 주입")
+    rv(True, "LD_PRELOAD=/tmp/x.so cargo test", "선행 할당 코드 주입")
+    rv(False, "RUST_BACKTRACE=1 cargo test", "정상 환경 변수는 통과(오탐 금지)")
+    rv(False, "CI=1 cargo test --offline", "정상 환경 변수는 통과(오탐 금지)")
+    # T3 R2(claude minor): 글롭은 **명령 이름 자리**에서만 거부한다(인자 자리 오탐 금지)
+    rv(True, "/bin/r? -rf /w/repo/build", "글롭으로 감춘 rm")
+    rv(True, "/bin/r[m] -rf /w/repo/build", "문자 클래스로 감춘 rm")
+    rv(True, "/usr/bin/env rm -rf /w/repo/build", "경로 지정 래퍼 뒤의 rm")
+    rv(False, "rg pat /w/repo/src/*.rs", "인자 자리 글롭은 읽기다(오탐 금지)")
+    rv(False, "ls -la /w/repo/*", "인자 자리 글롭은 읽기다(오탐 금지)")
+    rv(False, "[ -f /w/repo/a ] && ls /w/repo", "셸 내장 test 는 글롭이 아니다(오탐 금지)")
+    # T3 R2(claude minor): reviewer deny 는 **무엇이 걸렸는지** 말한다(진단 가능성)
+    _db, _dr = decide("Bash", {"command": "ls dir/{a,b}"}, "reviewer-codex")
+    if not _db or "중괄호" not in _dr:
+        fails.append("R2[T3-진단]: 중괄호 deny 가 사유를 말하지 않는다(좌석이 표기를 고칠 수 "
+                     "없다): %r" % _dr)
     return fails
 
 

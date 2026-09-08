@@ -513,7 +513,29 @@ class NegativeControls(unittest.TestCase):
          '        if ch == "{":\n            stack.append(i)',
          '        if ch == "{":\n            stack[:] = [i]'),
         ("reviewer 경로 중괄호 술어(T3)",
-         "    if brace_expansion_hazard(command):\n        return True\n", ""),
+         "    _bz = brace_expansion_hazard(command)\n    if _bz:\n        return True, _bz\n",
+         ""),
+        # ★R2 수렴 — 이번 라운드에 신설한 검사도 **지우면 실패해야** 한다(공허한 검사 금지).
+        ("ANSI-C 인용 거부(R2·codex)",
+         "    _az = ansi_c_quote_hazard(command)\n    if _az:\n        return True, _az\n", ""),
+        ("명령 이름 자리 글롭(R2·claude)",
+         '            if tok not in ("[", "[[") and any(g in tok for g in GLOB_CHARS):',
+         "            if False:"),
+        ("선행 환경 할당 실행기 주입(R2·claude)",
+         "                if env_assign_is_write(name):", "                if False:"),
+        ("래퍼도 이름으로(R2·claude)",
+         "            if tok in WRAPPERS or base in WRAPPERS:", "            if tok in WRAPPERS:"),
+        ("셸 축 폐기 장치(R2·T9)",
+         '    shell = ("/dev/null",) + (("NUL", "nul") if osname == "nt" else ())',
+         "    shell = builder"),
+        ("이물 판정 비교 모양(R2·T9)",
+         '        if "/" in f:\n            if n == f:\n                return True\n'
+         "        elif os.path.basename(n) == f:\n            return True\n",
+         "        if os.path.basename(n) == f:\n            return True\n"),
+        ("reviewer deny 진단(R2·T3)",
+         '            return True, ("reviewer/planner may not run write-shell"\n'
+         '                          + (" — %s" % _wwhy if _wwhy else ""))',
+         '            return True, "reviewer/planner may not run write-shell"'),
         ("값 옵션 결합 표기(T1)",
          '        _vopt = next((o for o in value_opts if t == o or t.startswith(o + "=")), None)',
          "        _vopt = t if t in value_opts else None"),
@@ -743,6 +765,153 @@ class TriageQuotingAndExpansion(_HookEnv):
                         "`> NUL` 이 경로 검사를 면제받았다(unix 에서는 일반 파일이다): %r/%r"
                         % (r.out, r.err))
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ★수렴 R2(2026-09-08) — 최종 리뷰어 2인이 남긴 잔여 지적의 회귀 검체.
+# ─────────────────────────────────────────────────────────────────────────────
+class NullSinkPlatformAxis(unittest.TestCase):
+    """★R2 major(리뷰어 2인): `NULL_SINKS` 를 **네이티브 도구 축**에서 파생시키면 nt 에서
+    `> /dev/null` 이 새로 거부된다(Git Bash 는 그것을 매핑한다) — Windows 전용 회귀다.
+
+    Windows 가 없어도 잰다: 훅에 박힌 상수 정의문을 **`os.name` 만 바꾼 이름공간에서 실제로
+    실행**해서 양 플랫폼 분기의 값을 둘 다 계산한다(문자열 검색이 아니라 실행이다).
+    """
+
+    def axes(self):
+        """훅의 축 계산 함수 3개를 **그대로 실행**한다(문자열 검색이 아니라 실행이다)."""
+        src = HOOK.read_text(encoding="utf-8")
+        a = src.index("def _null_device_axes(")
+        b = src.index("PLATFORM_NULL_DEVICES, SHELL_NULL_DEVICES = _null_device_axes(os.name)")
+        c = src.index("def _is_foreign_null(")
+        d = src.index("\n    return False\n", c) + len("\n    return False\n")
+
+        class _OS(object):
+            path = os.path
+        ns = {"os": _OS}
+        exec(compile(src[a:b] + "\n\n" + src[c:d], "<capgate-null-axes>", "exec"), ns)
+        return ns
+
+    def consts(self, osname):
+        ns = self.axes()
+        builder, shell = ns["_null_device_axes"](osname)
+        return {"BUILDER_NULL_SINKS": builder, "SHELL_NULL_DEVICES": shell,
+                "FOREIGN_NULL_NAMES": ns["_foreign_null_names"](shell),
+                "NULL_SINKS": set(shell) | {"/dev/stdout", "/dev/stderr", "/dev/tty"},
+                "_is_foreign_null": ns["_is_foreign_null"]}
+
+    def test_git_bash_dev_null_survives_on_windows(self):
+        nt = self.consts("nt")
+        self.assertIn("/dev/null", nt["NULL_SINKS"],
+                      "nt 에서 `> /dev/null` 이 리다이렉트 면제를 잃었다 — Git Bash 가 매핑하는 "
+                      "관용구를 Windows 에서만 막는다(plan §7 Windows 행)")
+        for d in ("/dev/stdout", "/dev/stderr", "/dev/tty"):
+            self.assertIn(d, nt["NULL_SINKS"], "nt 에서 `%s` 가 사라졌다(MSYS 는 매핑한다)" % d)
+        self.assertIn("NUL", nt["NULL_SINKS"], "nt 의 Win32 예약 장치가 빠졌다")
+
+    def test_unix_NUL_is_not_a_sink(self):
+        ux = self.consts("posix")
+        self.assertNotIn("NUL", ux["NULL_SINKS"],
+                         "unix 에서 `NUL` 이 면제를 받는다(cwd 의 일반 파일이다 — T9 본래 요구)")
+        self.assertIn("/dev/null", ux["NULL_SINKS"])
+
+    def test_foreign_axis_is_not_a_dead_branch_on_either_platform(self):
+        """이물 이름 판정의 **양변 모양**이 같은가 — 종전 nt 분기는 영원히 거짓이었다."""
+        ux, nt = self.consts("posix"), self.consts("nt")
+        self.assertEqual(tuple(ux["FOREIGN_NULL_NAMES"]), ("NUL", "nul"),
+                         "unix 의 이물 이름이 `NUL`/`nul` 이 아니다")
+        self.assertEqual(tuple(nt["FOREIGN_NULL_NAMES"]), (),
+                         "nt 에서 이물 이름이 남았다 — 그 철자는 Git Bash 가 여는 이름이고, "
+                         "basename 비교와 모양이 달라 분기가 죽는다")
+        # 남는 축(네이티브 도구)은 **갈라진 채로** 있어야 한다 — 두 축을 합치면 R1 회귀다.
+        self.assertEqual(tuple(nt["BUILDER_NULL_SINKS"]), ("NUL", "nul"))
+        self.assertEqual(tuple(ux["BUILDER_NULL_SINKS"]), ("/dev/null",))
+        # 비교 **모양**: 경로형은 전체, 맨이름형은 basename — 한쪽만 접으면 분기가 죽는다.
+        _f = ux["_is_foreign_null"]
+        self.assertTrue(_f("/dev/null", ("/dev/null",)), "경로형 전체 비교가 깨졌다")
+        self.assertFalse(_f("/w/repo/null", ("/dev/null",)),
+                         "경로형을 basename 으로 비교해 평범한 파일 `null` 을 오탐한다")
+        self.assertTrue(_f("sub/NUL", ("NUL", "nul")), "맨이름형을 디렉터리 아래에서 놓친다")
+
+
+@NEED_SH
+class TriageConvergenceR2(_HookEnv):
+    """표기 축 잔여 4건 — 전부 **bash 실측으로 픽스처를 증명**하고 같은 문자열로 판정을 잰다."""
+
+    def bash_words(self, snippet):
+        r = subprocess.run([SH, "-c", "printf '%s\\n' " + snippet],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.splitlines()
+
+    def test_ansi_c_quoted_cargo_option_is_validated(self):
+        """★R2 major(codex): shlex 는 `$'…'` 를 모른다 — 게이트는 `$--config=…` 라는 **없는
+        토큰**을 보고 옵션 검증을 건너뛰었고, bash 는 `--config=…` 를 cargo 에 넘겼다."""
+        self.assertEqual(self.bash_words("""$'--config=build.rustc-wrapper="/tmp/w"'"""),
+                         ['--config=build.rustc-wrapper="/tmp/w"'],
+                         "선행 사실: bash 는 `$` 를 지우고 인용을 푼다")
+        plain = self.run_hook("Bash",
+                              {"command": 'cargo test --config=build.rustc-wrapper="/tmp/w"'},
+                              CYS_ROLE="reviewer-codex")
+        self.assertTrue(plain.denied, "대조군: 인용 없는 표기는 이미 deny 다")
+        r = self.run_hook("Bash",
+                          {"command": """cargo test $'--config=build.rustc-wrapper="/tmp/w"'"""},
+                          CYS_ROLE="reviewer-codex")
+        self.assertTrue(r.denied,
+                        "ANSI-C 인용이 `CARGO_CONFIG_SAFE_KEYS` 검증을 비껴갔다: %r/%r"
+                        % (r.out, r.err))
+
+    def test_glob_in_command_name_position_is_refused(self):
+        """★R2 minor(claude): `/bin/r?` 는 bash 가 `/bin/rm` 으로 바꾼다(중괄호와 같은 층)."""
+        r = self.run_hook("Bash", {"command": "/bin/r? -rf /x/build"}, CYS_ROLE="reviewer-codex")
+        self.assertTrue(r.denied, "명령 이름 글롭으로 rm 이 통과했다: %r/%r" % (r.out, r.err))
+        r2 = self.run_hook("Bash", {"command": "/bin/r[m] -rf /x/build"},
+                           CYS_ROLE="reviewer-codex")
+        self.assertTrue(r2.denied, "문자 클래스로 rm 이 통과했다: %r/%r" % (r2.out, r2.err))
+        ok = self.run_hook("Bash", {"command": "rg pat /x/src/*.rs"}, CYS_ROLE="reviewer-codex")
+        self.assertFalse(ok.denied,
+                         "인자 자리 글롭까지 막았다 — 읽기 전용 조회 오탐(계획 §3-3): %r" % ok.out)
+
+    def test_leading_env_assignment_cannot_inject_a_runner(self):
+        """★R2 minor(claude): `--config=build.rustc-wrapper=…` 를 막고 `RUSTC_WRAPPER=…` 를
+        열어 두면 같은 통제가 표기 하나로 비껴간다(CSO 경로는 이미 거부한다)."""
+        for cmd in ("RUSTC_WRAPPER=/tmp/r.sh cargo test",
+                    "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER=/tmp/r.sh cargo test"):
+            r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="reviewer-codex")
+            self.assertTrue(r.denied, "선행 할당 실행기 주입이 통과했다(%s): %r" % (cmd, r.out))
+        ok = self.run_hook("Bash", {"command": "RUST_BACKTRACE=1 cargo test"},
+                           CYS_ROLE="reviewer-codex")
+        self.assertFalse(ok.denied, "정상 환경 변수까지 막았다(오탐): %r" % ok.out)
+
+    def test_reviewer_deny_names_the_notation_that_blocked_it(self):
+        """★R2 minor(claude): 읽기 명령이 **표기 때문에** 막혔으면 문면이 그것을 가리켜야 한다."""
+        r = self.run_hook("Bash", {"command": "ls dir/{a,b}"}, CYS_ROLE="reviewer-codex")
+        self.assertTrue(r.denied, "대조군: 중괄호는 거부 방향이다(계획 §3-3)")
+        self.assertIn("중괄호", r.reason,
+                      "deny 문면이 무엇이 걸렸는지 말하지 않는다(좌석이 표기를 고칠 수 없다): %r"
+                      % r.reason)
+
+    def test_mixed_literal_token_still_cannot_forge_a_pack_tool(self):
+        """codex 지적(deny→allow 확대)의 **안전 축**을 못으로 박는다: 혼합 토큰을 판정하게
+        바꿨어도, 리터럴 센티널이 남은 경로는 설치 팩 도구로 정규화되지 않는다."""
+        pack = self.home / ".cys" / "pack"
+        (pack / "bin").mkdir(parents=True, exist_ok=True)
+        cmd = ('python3 "$HOME/"\'$CYS_PACK_DIR/bin/javis_preflight.py\' --self-test')
+        _w = self.bash_words('"$HOME/"\'$CYS_PACK_DIR/x\'')
+        self.assertEqual(len(_w), 1, "선행 사실: 한 토큰이다: %r" % _w)
+        self.assertTrue(_w[0].endswith("/$CYS_PACK_DIR/x"),
+                        "선행 사실: 작은따옴표 안 `$` 는 확장되지 않는다(리터럴 디렉터리 "
+                        "이름으로 남는다): %r" % _w)
+        ok = self.run_hook("Bash",
+                           {"command": 'python3 "$CYS_PACK_DIR/bin/javis_preflight.py" '
+                                       "--self-test"},
+                           CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertFalse(ok.denied,
+                         "대조군: 온전히 확장되는 표기는 설치 팩 판정 도구다: %r" % ok.out)
+        r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso", CYS_PACK_DIR=str(pack))
+        self.assertTrue(r.denied,
+                        "혼합 토큰의 **리터럴 부분이 확장돼** 설치 팩 도구로 오인됐다"
+                        "(동명 사본 실행): %r/%r" % (r.out, r.err))
 
 
 if __name__ == "__main__":
