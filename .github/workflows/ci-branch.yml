@@ -124,23 +124,21 @@ jobs:
           ALLOWED = {
               "test_phoenix_": (
                   {"release"},
-                  "release 전용(`test_phoenix_*.py` 글롭 · 실측 15종 · 2026-09-07 09:0x 계수 "
-                  "— 0.14.31 audit 브랜치가 fresh_honest·f1_production_path 2종을 더해 13→15). "
-                  "**팩 배송과 무관해서가 아니다** — 대상 javis_phoenix.py 는 팩에 실려 나간다. "
-                  "실제 이유는 하네스 의존이다: release.yml build 잡은 `cargo build --bin cys "
-                  "--bin cysd` 로 실 데몬을 만들고 PHOENIX_HARNESS_CYSD 로 kill→재기동 host-level "
-                  "e2e 를 돌린다. 팩-only 레인은 manifest emit 용 `cys` 만 빌드해 cysd 가 없고, "
-                  "ci-branch 는 그 예산(수 분)을 안 쓴다. 15종 중 cysd 를 실제로 요구하는 것은 3종"
-                  "(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 나머지는 원리상 이식 "
-                  "가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 예산이 "
-                  "허용되면 밀폐 부분집합부터 편입하라. 글롭이라 토큰이 접두사로만 잡힌다. "
-                  "★(2026-09-07 · 리뷰 R6) 이 접두 글롭은 **새 파일을 자동으로 면제한다** — "
-                  "0.14.31 audit 이 더한 fresh_honest(218 검체)·f1_production_path(63 검체)는 "
-                  "stdlib 만 쓰는 밀폐 검체라 위 사유(cysd 하네스 의존)에 해당하지 않는데도 "
-                  "release 전용이 됐다. 레인 워커가 단독으로 ci-branch 에만 등재하면 이 게이트가 "
-                  "비대칭으로 적색이 되므로(3레인 동시 등재가 계약 · CONTRACTS B-9), **통합 단계 "
-                  "마스터의 인계 항목**으로 남긴다: 두 파일을 3완전 레인에 같은 커밋으로 등재하고 "
-                  "이 사유문에서 그 사실을 지워라.",
+                  "release 전용 글롭(`test_phoenix_*.py`)이 남긴 접두 토큰. 파일은 실측 15종"
+                  "(2026-09-08 14:46 KST 계수) 이고, 그 중 **fresh_honest·f1_production_path 2종은 "
+                  "이제 3완전 레인에 이름으로 등재돼 있다**(0.14.31 통합 · stdlib 밀폐라 cysd 하네스 "
+                  "불요 — 아래 팩 스위트 루프 참조). 이 접두 토큰이 여전히 release 에만 있는 것은 "
+                  "**나머지 13종** 때문이다. **팩 배송과 무관해서가 아니다** — 대상 javis_phoenix.py "
+                  "는 팩에 실려 나간다. 실제 이유는 하네스 의존이다: release.yml build 잡은 "
+                  "`cargo build --bin cys --bin cysd` 로 실 데몬을 만들고 PHOENIX_HARNESS_CYSD 로 "
+                  "kill→재기동 host-level e2e 를 돌린다. 팩-only 레인은 manifest emit 용 `cys` 만 "
+                  "빌드해 cysd 가 없고, ci-branch 는 그 예산(수 분)을 안 쓴다. 13종 중 cysd 를 실제로 "
+                  "요구하는 것은 3종(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 나머지는 "
+                  "원리상 이식 가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 "
+                  "예산이 허용되면 밀폐 부분집합부터 편입하라. "
+                  "⚠이 접두 글롭은 **새 phoenix 파일을 자동으로 면제한다**(추출 정규식이 `*` 앞에서 "
+                  "끊겨 토큰이 접두사로만 잡힌다) — 새 파일이 밀폐 검체라면 위 2종처럼 3레인에 "
+                  "**이름으로** 등재하라. 글롭에 맡기면 그 파일은 조용히 release 전용이 된다.",
               ),
               "test_version_sot_mutation": (
                   {"ci-branch", "release"},
@@ -420,6 +418,29 @@ jobs:
           PY
       # LANE-GATE-SELF-END
 
+      # ★(0.14.31 통합 · CONTRACTS E-4 ②) 이 잡의 python3 를 3.12 로 **고정**한다.
+      #   종전엔 이 잡만 setup-python 이 없어 러너 이미지 기본 python3 를 썼다 — 잡2
+      #   (boot-health-full)·windows-health.yml 은 이미 3.12 다. 즉 세 잡이 서로 다른
+      #   인터프리터로 같은 팩 스위트를 돌고 있었고, 그 차이는 **이미지가 갱신될 때마다
+      #   말없이 바뀐다**.
+      #   왜 지금 고치는가: 신설 test_trust_seed 의 LiveProcess 군은 자기 인터프리터가
+      #   `ps -E` 에 env 를 노출할 때만 실행되고, 아니면 **정직 skip** 한다
+      #   (`_env_visible_for_python_child` — darwin `ps -E` 는 Apple 플랫폼 바이너리의 env 를
+      #   숨긴다). 그 전제를 러너 이미지에 맡기면 "라이브 claude 가 있는데 신뢰 시드를
+      #   써버리는" 회귀의 검체가 **아무 신호 없이 빠질 수 있다** — 이 리포가 반복해 당한
+      #   '안 도는 검체는 게이트가 아니다' 의 조용한 판본이다. 인터프리터를 고정해 그
+      #   전제를 이미지 종속에서 빼낸다.
+      #   ⚠정직한 한계: 3.12 러너에서 그 군이 실제로 실행되는지는 **GitHub 러너에서 미확인**
+      #     이다(로컬 실측은 brew 3.14.7=전건 실행 · Apple 3.9.6=LiveProcess 실행 · 둘 다
+      #     skip 아님). 여기서 얻는 것은 '실행된다'는 보증이 아니라 **재현 가능한 전제**다.
+      #   위치: 레인 대조 게이트 **뒤** — 그 게이트는 stdlib(re·sys) 만 쓰고 "비대칭은 1초
+      #   안에 알 수 있어야 한다"는 배치 근거(위 스텝 머리말)를 setup-python 설치 시간이
+      #   깨서는 안 된다. 그 아래 모든 python 스텝은 이 3.12 를 쓴다.
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       # 2언어 파리티 하네스가 rustc 를 단독 호출한다(크레이트 의존 0 불변식의 기계 증명).
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -540,6 +561,36 @@ jobs:
           #   봉인 축 11개(추가·삭제·내용변경·심링크↔실복사본 양방향·실행비트·미추적·결정론·
           #   판정불가 3종·자기제외) · 뮤테이션 5종 RED 실측으로 게이트 실효 확인 ·
           #   3완전 레인 동시·대칭 등재(release 는 양 루프) · 격리 tempdir 하네스(라이브 무접촉) · 실측 0.9s.
+          # ★0.14.31 audit 통합(2026-09-08 · CONTRACTS B-9 · E-4 ①): 두 레인(Rust fix/0.14.31-audit ·
+          #   Pack wp/0.14.31-pack)이 bc01f43 이후 신설한 팩 검체 **15종**을 3완전 레인에 **같은
+          #   커밋으로** 등재한다. 레인 워커가 각자 자기 레인에만 넣으면 ci-branch.yml 의 '팩 스위트
+          #   레인 대조' 게이트가 비대칭으로 적색이 되므로(B-9), 등재는 통합 단계 1회다 — 레인 워커는
+          #   신규 파일 목록만 인계했다.
+          #   WP-2 test_trust_seed(폴더 신뢰 사전 주입) · WP-3A test_capgate_registration·
+          #   test_capgate_hook_shell(능력 게이트 등록조건·셸 배선) · WP-3C test_cso_directive_rev ·
+          #   P6 test_role_authority·test_role_authority_shell(역할 해소 데몬 권위 · 단조 거부) ·
+          #   WP-6 test_round_stop_reason · WP-7 test_resource_gate·test_resource_gate_fleet_cpu·
+          #   test_inject_context_role_seat · WP-1 test_carry_unproven_scope·
+          #   test_wakeup_durable_receipt·test_wakeup_park_failure · phoenix 2종.
+          #   ★test_resource_gate 는 신설이 아니라 **이관**이다 — 종전 `cysjavis-pack/tests/` 에 있어
+          #     3레인이 이름으로 열거하는 `bin/tests/` 밖이었고 그래서 **0레인 실행**이었다(480235d 가
+          #     깬 스위트가 이것인데 그때 CI 는 녹색이었다). 이관 = 등재 대상 편입.
+          #   ★phoenix 2종(test_phoenix_fresh_honest·test_phoenix_f1_production_path)은 ci-branch.yml
+          #     레인 대조 게이트의 ALLOWED `test_phoenix_` 글롭 면제에서 **빼낸다** — stdlib 만 쓰는
+          #     밀폐 검체라 그 면제의 사유(cysd 하네스 의존)에 해당하지 않는다. 나머지 13종은 그대로
+          #     release 전용이라 글롭 토큰 `test_phoenix_` 자체는 ALLOWED 에 남는다(추출 정규식이
+          #     `test_phoenix_fresh_honest` 를 통째로 한 토큰으로 잡으므로 접두 토큰과 섞이지 않는다 — 실측).
+          #   전부 격리 HOME/PATH 스텁 하네스(라이브 데몬·~/.cys·~/.local/state 무접촉).
+          #   실측 2026-09-08 14:4x KST · macOS arm64 · python 3.14.7 · **루프와 같은 env(CYS_PACK_DIR
+          #   만 주입)** 로 15종 전건 rc=0: round_stop_reason 41s · role_authority_shell 24s ·
+          #   trust_seed 17s(258 테스트) · role_authority 11s · capgate_hook_shell 10s ·
+          #   capgate_registration 9s · inject_context_role_seat 8s · 나머지 8종 합계 ≤4s → 약 123s.
+          #   검체 문서가 권하는 JAVIS_ROOT 는 검체가 스스로 임시로 덮으므로 루프 주입 불요(실측).
+          #   ⚠**Pack 레인 10종의 파일은 이 커밋 시점 트리에 없다** — 팩 브랜치 머지 때 도착한다.
+          #     루프의 `[ -f ]` 단언은 머지 전 실행에서 그 10종에 붉어진다(의도된 상태). 레인 대조
+          #     게이트는 **토큰 집합** 대조라 지금도 통과한다. 로컬 예행: `scripts/lane-parity-rehearsal.sh`
+          #     — ①레인 대조 파이썬을 ci-branch.yml 원본에서 추출해 그대로 돌리고(로직 복제 0)
+          #       ②등재 이름의 파일 존재를 PENDING(머지 대기) 목록과 대조한다.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -549,7 +600,14 @@ jobs:
                    test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
                    test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
                    test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
-                   test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue; do
+                   test_pyseal_negative_specimen \
+                   test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
+                   test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_cso_directive_rev test_role_authority test_role_authority_shell \
+                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
+                   test_inject_context_role_seat test_carry_unproven_scope \
+                   test_wakeup_durable_receipt test_wakeup_park_failure \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="

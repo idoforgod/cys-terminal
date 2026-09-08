@@ -51,6 +51,25 @@
 #      worked!") · spctl -t open accepted(source=Notarized Developer ID) · 미서명 합성 DMG
 #      (hdiutil create · Fake.app)는 stapler 비영·spctl rejected(test_release_postprocess_gate.py
 #      DmgAxisTests 가 음성 대조로 박제).
+#   ⑨ gktool 실평가(Gatekeeper 첫-실행 경로) — 통합 단계 신설(2026-09-08 · 오너 참고2 ·
+#      CONTRACTS §B-12). `gktool scan <app>` 은 **사용자가 앱을 처음 열 때 도는 바로 그 평가**
+#      (Verifying… 다이얼로그의 캐시 예열)를 CLI 로 수행한다. ④ `spctl --assess` 와 겹쳐 보이지만
+#      같은 축이 아니다: spctl 은 정책 평가 API 를, gktool 은 첫-실행 스캔 경로를 부른다 — 지금까지
+#      이 저장소의 어느 층도 gktool 을 부른 적이 없다(release-pipeline-map §7 "gktool 은 어디에도
+#      배선되지 않았다 · 전부 spctl"). 한 도구의 판정만 믿는 것이 이 게이트의 규율이 아니다.
+#      ★대상은 **격리 부착 설치 모사 사본**($APP)이다 — 격리가 없으면 gktool 은 미서명 앱조차
+#      "allowed by system policy" 로 통과시킨다(2026-09-08 실측: 같은 합성 앱이 격리 부착 전 rc=0,
+#      부착 후 rc=70). 그래서 ⑨ 는 quarantine 부재를 PASS 로 접지 않고 공허(FAIL)로 판정한다.
+#      rc≠0 = **fail-hard**(FAIL_N 증가 → exit 1 → 업로드 금지). 도구 부재만 SKIP 이며 그때도
+#      사유를 한 줄로 남긴다(무음 생략 금지). ④ 와 같은 관례로 full 모드에서만 돈다.
+#      ★판정은 **rc** 다(판정문 문자열이 아니다) — 2026-09-08 로컬 실측 3형:
+#        rc=0  "Scan completed and software is allowed by system policy."          (격리 없음)
+#        rc=0  "Scan completed, and would be allowed but the user still needs to
+#               approve it on first launch."                                        (격리+공증 = 정상)
+#        rc=70 "Scan completed, but failed because the software is not signed by a
+#               distributor that meets the system Gatekeeper requirements."         (격리+미서명)
+#      두 번째가 정상 발행물의 모습이다(공증된 Developer ID 앱은 첫 실행에서 사용자 승인을
+#      한 번 받는다) — 문자열로 "allowed" 를 찾으면 이 정상형을 FAIL 로 오판한다.
 #
 # ★스코프 판정(공백 B · Windows 레인 · 2026-08-20): Windows 산출물에는 SEAL-2 선컴파일이 없고
 #   이 게이트도 macOS 전용이다 — 여기서 수리하지 않는다. 오너 앵커: 윈도우 설치파일은 신중 접근,
@@ -80,6 +99,9 @@
 #         --diagnose-degraded-ok(진단 전용 — degraded 폐쇄를 열어 ①②③⑤⑥ 강등 평가 · 발행 경로 사용 금지)
 #         --seal2-only(진단 전용 — 대상 .app 에 ⑤ 전칭 검사만 단독 실행 · 적대 픽스처 테스트의 호출 지점)
 #         --runtime-manifest-only(진단 전용 — 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행)
+#         --gktool-only(진단 전용 · **로컬 드라이런** — 임의 .app 에 ⑨ 만 단독 실행 · 대상을
+#           복사하지도 격리를 붙이지도 않는다(설치본 읽기 전용). 예:
+#           `bash scripts/release-gate-gatekeeper.sh --gktool-only /Applications/cys.app`)
 #
 # 종료 코드
 #   0 = 전 검사 PASS (기본 모드에선 full 에서만 도달 가능 · --diagnose-degraded-ok 의 0 은 진단용이다)
@@ -104,6 +126,7 @@ QVAL=""
 TARGET=""
 DIAG_DEGRADED=0
 SEAL2_ONLY=0
+GKTOOL_ONLY=0
 
 usage() {
   cat <<'USAGE'
@@ -115,6 +138,8 @@ usage() {
                             ①②③⑤⑥ 강등 평가를 돈다 — **발행 경로 사용 금지**(테스트 핀)
   --seal2-only              진단 전용: 대상 .app 에 ⑤ SEAL-2 전칭 검사만 단독 실행
   --runtime-manifest-only   진단 전용: 대상 .app 에 ⑧ runtime-manifest 대조만 단독 실행
+  --gktool-only             진단 전용(로컬 드라이런): 대상 .app 에 ⑨ gktool 실평가만 단독 실행
+                            — 대상을 복사·수정하지 않는다(설치본 읽기 전용)
   -h, --help                이 도움말
 종료: 0=PASS · 1=FAIL(업로드 금지) · 2=판정 불가(degraded 폐쇄 포함)
 USAGE
@@ -127,6 +152,7 @@ while [ $# -gt 0 ]; do
     --diagnose-degraded-ok) DIAG_DEGRADED=1; shift ;;
     --seal2-only) SEAL2_ONLY=1; shift ;;
     --runtime-manifest-only) RTMAN_ONLY=1; shift ;;
+    --gktool-only) GKTOOL_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "알 수 없는 옵션: $1" >&2; usage >&2; exit 2 ;;
     *) TARGET="$1"; shift ;;
@@ -137,7 +163,7 @@ done
 
 # ── 도구 fail-closed (없으면 판정 불가 = exit 2 · 통과 아님) ──
 # --seal2-only(진단)는 ⑤ 만 돌므로 러너 python3 해소만 요구한다 — macOS 밖(픽스처 테스트)에서도 돈다.
-if [ "$SEAL2_ONLY" != "1" ] && [ "${RTMAN_ONLY:-0}" != "1" ]; then
+if [ "$SEAL2_ONLY" != "1" ] && [ "${RTMAN_ONLY:-0}" != "1" ] && [ "$GKTOOL_ONLY" != "1" ]; then
   for t in hdiutil spctl codesign xattr ditto find uuidgen; do
     command -v "$t" >/dev/null 2>&1 || { echo "✗ 필수 도구 없음: $t (macOS + Xcode CLT 필요)" >&2; exit 2; }
   done
@@ -326,6 +352,54 @@ print_seal_culprits() {
 # codesign --verify --deep --strict 재통과를 단언한다. ★읽기 전용 DMG 마운트(APP_SRC)가 아니라
 # 사본이어야 한다 — 읽기 전용 지반에선 결함 코드도 쓰기에 실패해 검사가 공허해진다.
 # 반환: 0=수행(위반은 ok/bad 집계) · 2=판정 불가 · 3=대상 아님(Contents/MacOS/cys 부재 — 설치 도우미 등)
+# ── ⑨ gktool 실평가 축 (오너 참고2 · CONTRACTS §B-12 · 신설 2026-09-08) ───────────────
+# 도구 해소: `xcrun -f gktool` → PATH `gktool` → `/usr/bin/gktool`. 셋 다 없으면 GKTOOL="" 이고
+# 그때만 SKIP 한다(사유 1줄 고정). ★부재를 fail-closed 로 만들지 않는 이유: 이 축은 기존 4겹
+# (①quarantine ②codesign ③stapler ④spctl)에 **더하는** 축이고, gktool 은 macOS 15/Xcode 16
+# 대에 들어온 비교적 새 도구다. 부재를 exit 2 로 닫으면 구 러너에서 릴리스가 통째로 멈춘다 —
+# 반면 ①~⑧ 은 그대로 fail-closed 이므로 부재 상태의 판정 범위는 종전과 정확히 같다(퇴행 0).
+# 존재하는데 거부하면 그때는 **fail-hard** 다.
+GKTOOL=""
+if command -v xcrun >/dev/null 2>&1; then
+  GKTOOL="$(xcrun -f gktool 2>/dev/null || true)"
+fi
+[ -n "$GKTOOL" ] && [ -x "$GKTOOL" ] || GKTOOL="$(command -v gktool 2>/dev/null || true)"
+[ -n "$GKTOOL" ] && [ -x "$GKTOOL" ] || { [ -x /usr/bin/gktool ] && GKTOOL=/usr/bin/gktool; }
+[ -n "${GKTOOL:-}" ] && [ -x "$GKTOOL" ] || GKTOOL=""
+
+# gktool_check <app경로> <표시이름> <quarantine값 · 빈 값이면 부재>
+#   반환 0=PASS · 1=FAIL(FAIL_N 증가는 bad 가 한다) · 3=SKIP(도구 부재)
+# 출력 규약: gktool 은 진행률을 `\r` 로 수천 줄 쏟는다(521MB 앱 실측 ~8000회) — CI 로그를
+# 익사시키지 않도록 파일로 받아 `\r`→개행 변환 후 **Progress 가 아닌 마지막 줄**(판정문)만 싣는다.
+gktool_check() {
+  local app="$1" name="$2" qval="$3" out rc verdict
+  if [ -z "$GKTOOL" ]; then
+    echo "SKIP ⑨ gktool 실평가($name) — gktool 부재(xcrun -f gktool·PATH·/usr/bin 전부 미해소): \
+이 기계에는 첫-실행 스캔 경로를 부를 도구가 없다. 발행 모드의 ①~⑧ 은 이 부재와 무관하게 \
+그대로 fail-closed 다(판정 범위가 종전과 같아질 뿐 넓어지지 않는다)"
+    return 3
+  fi
+  out="$WORK/gktool.$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_').log"
+  "$GKTOOL" scan "$app" >"$out" 2>&1; rc=$?
+  verdict="$(tr '\r' '\n' <"$out" | grep -v '^Progress: ' | grep -v '^[[:space:]]*$' | tail -1)"
+  [ -n "$verdict" ] || verdict="(판정문 없음 · rc=$rc)"
+  if [ -z "$qval" ]; then
+    # 격리가 없으면 gktool 은 미서명 앱도 allowed 로 통과시킨다(2026-09-08 실측) — 그 rc=0 은
+    # 통과가 아니라 공허다. ① 이 이미 FAIL 이겠지만 이 축이 거짓 초록을 얹지 않게 여기서 닫는다.
+    bad "⑨ gktool 실평가($name)" "quarantine 부재로 평가가 공허하다(rc=$rc · $verdict) — 격리 없는 allowed 는 첫-실행 경로를 재지 않는다"
+    return 1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ok "⑨ gktool scan($name)" "$verdict"
+    return 0
+  fi
+  bad "⑨ gktool scan($name)" "rc=$rc · $verdict"
+  echo "     ── gktool 출력(verbatim · Progress 제외) ──"
+  tr '\r' '\n' <"$out" | grep -v '^Progress: ' | grep -v '^[[:space:]]*$' \
+    | sed "s|$app|<app>|g" | sed 's/^/     | /'
+  return 1
+}
+
 # ── ⑧ runtime-manifest 축 (부트 v2 §2-10 G5 · W-C C1 신설 2026-09-04) ─────────────────
 # ★왜 ②(codesign)와 별개인가: ② 는 **이 산출물이 mac 에서 봉인돼 있는가**를 본다. ⑧ 은
 #   **배송될 매니페스트가 실제 트리와 맞는가**를 본다 — 그 매니페스트는 Windows 설치본에서
@@ -470,6 +544,8 @@ PYSIM
   return 0
 }
 SIM_TARGETS=0     # 첫-부팅 기록자 모사를 실제로 돌린 앱 수 — 0이면 PASS 선언 불가(말미 폐쇄)
+GK_TARGETS=0      # ⑨ gktool 실평가를 통과시킨 앱 수(증적용)
+GK_SKIPPED=0      # ⑨ 를 도구 부재로 건너뛴 앱 수 — 판정에 쓰지 않고 요약에 사실로만 남긴다
 
 # ── 진단 전용: --seal2-only — ⑤ 전칭 검사만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
 #   적대 픽스처 박제(test_release_postprocess_gate.py Seal2UniversalCheckTests)의 호출 지점.
@@ -501,6 +577,34 @@ if [ "${RTMAN_ONLY:-0}" = "1" ]; then
     0) ;;
     3) echo "✗ --runtime-manifest-only: 동봉 런타임 없음(Contents/Resources/runtime)" >&2; exit 2 ;;
     *) exit 2 ;;
+  esac
+  [ "$FAIL_N" -gt 0 ] && exit 1
+  exit 0
+fi
+
+# ── 진단 전용: --gktool-only — ⑨ 만 단독 실행 (게이트 판정 아님 · GATE_MODE 미출력) ──
+#   ★로컬 드라이런의 자리다: 임의 .app 을 **복사도 수정도 하지 않고**(설치본 읽기 전용) 첫-실행
+#   스캔 경로만 부른다. 발행 판정이 아닌 이유가 여기 있다 — 격리를 붙이지 않으므로 대상이 이미
+#   격리를 달고 있지 않은 한 이 실행의 allowed 는 **첫-실행 경로를 재지 않는다**(2026-09-08 실측:
+#   같은 미서명 앱이 격리 전 rc=0, 후 rc=70). 그 사실을 매 실행 한 줄로 고지한다.
+#   발행 경로가 이 플래그를 싣지 않음은 test_release_postprocess_gate.py 의 핀이 지킨다.
+if [ "$GKTOOL_ONLY" = "1" ]; then
+  TARGET="${TARGET%/}"
+  [ -d "$TARGET" ] || { echo "✗ --gktool-only 대상 없음(.app 디렉터리 필요): $TARGET" >&2; exit 2; }
+  echo "[진단 전용] --gktool-only: $TARGET — ⑨ gktool 실평가만 돈다(발행 판정 아님 · 대상 무변경)"
+  [ -n "$GKTOOL" ] && info "gktool: $GKTOOL" || info "gktool: 미해소"
+  GK_Q="$(xattr -p com.apple.quarantine "$TARGET" 2>/dev/null || true)"
+  if [ -n "$GK_Q" ]; then
+    info "대상 quarantine: $GK_Q — 첫-실행 경로를 그대로 재고 있다"
+  else
+    info "대상 quarantine: 없음 — 이 실행의 allowed 는 첫-실행 재검증 경로를 재지 않는다(설치 완료본의 정상 상태다). 발행 판정은 DMG/앱 사본에 격리를 붙이는 기본 모드로 하라"
+    # 드라이런에서는 격리 부재를 FAIL 로 접지 않는다(설치본을 읽기 전용으로 보는 것이 목적) —
+    # 대신 위 고지를 남기고 rc 만 그대로 전한다. 기본(발행) 모드의 공허 폐쇄와는 자리가 다르다.
+    GK_Q="(드라이런 · 격리 미부착)"
+  fi
+  gktool_check "$TARGET" "$(basename "$TARGET")" "$GK_Q"; GK_RC=$?
+  case "$GK_RC" in
+    3) echo "     ⑨ 를 돌리지 못했다(도구 부재) — 측정 0회다(통과 선언 아님)"; exit 2 ;;
   esac
   [ "$FAIL_N" -gt 0 ] && exit 1
   exit 0
@@ -699,6 +803,20 @@ for APP_SRC in "${APPS[@]}"; do
     echo "SKIP ④ spctl --assess($APP_NAME) — assessments disabled (진단 전용 강등 · --diagnose-degraded-ok · 위 배너 참조)"
   fi
 
+  # ── ⑨ gktool 실평가(첫-실행 스캔 경로) — ④ 와 같은 관례로 full 모드에서만 · rc≠0 = fail-hard ──
+  #   대상은 ①에서 quarantine 을 확인한 **설치 모사 사본**($APP)이다: 사용자가 다운로드 사본을
+  #   처음 여는 순간의 상태와 같아야 이 축이 첫-실행 경로를 잰다.
+  #   degraded 에서 SKIP 하는 근거는 ④ 와 같다 — 시스템 평가 정책이 꺼진 기계의 allowed 는
+  #   통과의 증거가 아니다. (기본 모드의 degraded 는 위 F2 폐쇄에서 이미 exit 2 로 닫혔으므로
+  #   이 SKIP 에 도달하는 실행은 --diagnose-degraded-ok 뿐이다.)
+  if [ "$MODE" = "full" ]; then
+    gktool_check "$APP" "$APP_NAME" "$QAPP"; GK_RC=$?
+    [ "$GK_RC" -eq 0 ] && GK_TARGETS=$((GK_TARGETS+1))
+    [ "$GK_RC" -eq 3 ] && GK_SKIPPED=$((GK_SKIPPED+1))
+  else
+    echo "SKIP ⑨ gktool 실평가($APP_NAME) — assessments disabled (진단 전용 강등 · ④ 와 같은 근거)"
+  fi
+
   # ── ⑤ SEAL-2 불변식 전칭 정적 검사 — 원본 트리(마운트된 DMG 안 / 직접 지정 .app) 판독 전용 ──
   seal2_static_check "$APP_SRC"; SEAL2_RC=$?
   case "$SEAL2_RC" in
@@ -755,6 +873,10 @@ fi
 
 echo "═══ 판정 ═══"
 echo "모드: $MODE $( [ "$MODE" = "degraded" ] && echo '(spctl 실평가 미수행 — 강등)' )"
+# ⑨ 는 부재 SKIP 이 허용된 **추가** 축이라 ⑤⑥⑧ 같은 '0회 폐쇄'를 걸지 않는다. 대신 몇 번
+# 돌았고 몇 번 도구 부재로 건너뛰었는지를 사실로 남긴다 — 증적층에서 "gktool 없는 초록"이
+# 보이지 않으면 다음 감사가 이 축이 돌았다고 오독한다.
+echo "GKTOOL_AXIS=$( [ -n "$GKTOOL" ] && echo "$GKTOOL" || echo absent ) · 평가 통과 $GK_TARGETS · 도구부재 SKIP $GK_SKIPPED"
 echo "PASS=$PASS_N · FAIL=$FAIL_N"
 RC=0
 if [ "$FAIL_N" -gt 0 ]; then

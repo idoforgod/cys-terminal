@@ -151,6 +151,11 @@ PRE_WA3_REF = os.environ.get("CYS_HEALTH_PRE_WA3_REF", "8def22a")
 # "구 코드에 인라인 소유가 있었다"를 잴 수 없다. 잘못된 기준의 '탐지 실패'는 탐지기 파손이 아니라
 # 기준 선택 오류다(러너 헤더 규약) — 그래서 이 축만의 고정 해시를 따로 둔다.
 PRE_U24_REF = os.environ.get("CYS_HEALTH_PRE_U24_REF", "985093d")
+# H-WIN-7 격리 파손(E-4 ⑤ · 팩 fixture 를 실 `cys` 가 자가치유해 TemporaryDirectory 정리가
+# `Directory not empty` 로 크래시) **이전** 트리 — H-META-ISO 의 계측 대조용. 이 축의 '구 코드'는
+# W0 이 아니다(그 트리엔 H-WIN-7 자체가 없다) — 잘못된 기준의 '탐지 실패'는 탐지기 파손이 아니라
+# 기준 선택 오류이므로(러너 헤더 규약) 이 축만의 고정 해시를 따로 둔다.
+PRE_ISO_REF = os.environ.get("CYS_HEALTH_PRE_ISO_REF", "085041a")
 
 # ★U-0(2026-08-23 · 계측 타당성 복원) — `_read` 의 읽기 상한(문자 수).
 #   구 값 400,000자는 검체가 읽는 실제 파일보다 **작았다**. `f.read(limit)` 은 초과분을 말없이
@@ -240,6 +245,7 @@ MEASUREMENT_PIN_OVERRIDES = (
     ("CYS_HEALTH_D4A_REF", "계측 대조 기준 커밋(D4-a 무스폰 시대)"),
     ("CYS_HEALTH_PRE_WA3_REF", "계측 대조 기준 커밋(W-A3 이전)"),
     ("CYS_HEALTH_PRE_U24_REF", "계측 대조 기준 커밋(U-24 이전)"),
+    ("CYS_HEALTH_PRE_ISO_REF", "계측 대조 기준 커밋(H-WIN-7 격리 파손 이전)"),
     ("CYS_HEALTH_W5_CALIB_REF", "계측 대조 기준 커밋(W5 축)"),
     ("CYS_HEALTH_U23_CALIB_REF", "계측 대조 기준 커밋(U-23 축)"),
     ("CYS_HEALTH_READ_LIMIT", "`_read` 절단 가드 임계(U-0)"),
@@ -3805,7 +3811,25 @@ def h_win_7():
         # 미측정이지 FAIL 이 아니다 — 사유 명시 skip 으로 접는다. 비교는 구분자 정규화 후
         # 수행한다(훅이 os.path 산출 경로를 백슬래시로 렌더해도 경로 동일성 판정은 불변).
         env.pop("CYS_ROLE")
-        env["PATH"] = os.environ.get("PATH", "")
+        # ★격리 파손 수리(E-4 ⑤ · 2026-09-08) — 종전 판은 이 자리에서 PATH 를 **통째로 실 환경
+        #   PATH 로 교체**해 cygpath 목을 떨궜다. 그런데 그 교체는 목 `cys`(binp 선두)까지 같이
+        #   떨어뜨려, 훅의 `cys surface-role`·`cys reclaim-role --auto` 가 **설치된 실 바이너리**
+        #   로 해소됐다. 실 `cys` 는 `CYS_PACK_DIR`(=이 tmp fixture)를 자가치유 대상으로 보고 팩
+        #   전량(850여 파일 · `.pristine/` 미러 · `.new`/`.user` 병치)을 써 넣으며, 그 쓰기는
+        #   **프로세스 종료 뒤에도 이어진다**(실측 2026-09-08: cys 종료 시점 675/857 파일).
+        #   그래서 `TemporaryDirectory` 정리가 그 쓰기와 경합해
+        #   `OSError: [Errno 66] Directory not empty: …/pack/.pristine`(혹은 `…/pack/bin`)
+        #   으로 검체가 크래시했다 — 검체가 잰 것은 훅이 아니라 실 제품의 팩 설치였다.
+        #   ★이 leg 의 전제는 '**cygpath 부재**' 하나뿐이다. 목 `cys` 를 떨굴 이유가 없으므로
+        #     목 bindir 은 PATH 선두에 그대로 두고 **cygpath 목 파일만 지운다**. 판정 조건은
+        #     하나도 바뀌지 않는다(핀 이사 계약 ② — 완화 아님).
+        os.remove(os.path.join(binp, "cygpath"))
+        # ★실패 방향 핀: 이 leg 가 실 `cys` 에 닿으면 안 된다. 누군가 다시 PATH 를 통째로
+        #   갈아끼우면 여기서 **큰 소리로** 실패한다(종전엔 정리 경합 OSError 로 나타나 원인이
+        #   가려졌다 — 게다가 tmp 밖 실 데몬·실 팩에 닿을 수 있는 형상이었다).
+        need(shutil.which("cys", path=env["PATH"]) == os.path.join(binp, "cys"),
+             "격리 파손: PATH 의 cys 가 목이 아니다(%r) — 실 바이너리가 fixture CYS_PACK_DIR 을 "
+             "자가치유 대상으로 삼는다" % shutil.which("cys", path=env["PATH"]))
         if shutil.which("cygpath", path=env["PATH"]):
             return ("cygpath 변환·인용 왕복 검증 · unix 대조 leg skip"
                     "(실행 환경에 cygpath 실재=전제 미충족 — 미측정이지 FAIL 아님)")
@@ -10681,6 +10705,117 @@ def h_voice_u29():
                  "계측 타당성 실패: 구 훅이 이 조건에서 이미 말한다(결함 재현 불가): %r" % ro.stdout[:200])
             calib = "구 훅 stdout 0바이트(침묵 종료) 재현"
     return " · ".join(notes) + " · 계측검증=%s" % calib
+
+
+# ── 하네스 격리 자기감시(E-4 ⑤ · 2026-09-08) ────────────────────────────────
+# 검체가 PATH 를 만드는 지점을 수확하는 단일 정규식. 대입형(`[..] =`)과 dict 리터럴형(`..:`)
+# 둘 다 잡는다. ★자기면역: 패턴 텍스트 자신은 이 패턴에 매치되지 않는다(따옴표 앞뒤가 전부
+# 이스케이프 메타문자라 리터럴 일치가 성립하지 않는다) — 수확이 자기 자신을 세지 않는다.
+_ISO_PATH_SITE_RE = re.compile(r'(?:\[\s*"PATH"\s*\]\s*=|"PATH"\s*:)\s*(?P<rhs>[^\n]*)')
+
+
+def _iso_path_sites(body):
+    """블록 안에서 PATH 를 설정하는 지점 → [(블록내 줄번호, rhs 문자열)]."""
+    return [(body[:m.start()].count("\n") + 1, m.group("rhs").strip())
+            for m in _ISO_PATH_SITE_RE.finditer(body)]
+
+
+def _iso_ambient_restores(body):
+    """**주변 환경 PATH 를 통째로 되돌리는** 지점만 골라낸다 = 목 bindir 소실 지점."""
+    return [(ln, rhs) for ln, rhs in _iso_path_sites(body) if rhs.startswith("os.environ")]
+
+
+@specimen("H-META-ISO", "W6",
+          "계측기 자기감시 — 검체 PATH 가 실 `cys` 를 열지 않는다(fixture 팩 자가치유 차단)",
+          ["E4-5"])
+def h_meta_iso():
+    """E-4 ⑤(2026-09-08 실측): H-WIN-7 이 `OSError: [Errno 66] Directory not empty:
+    …/pack/.pristine` 로 크래시했다. 원인은 정리 코드가 아니라 **격리 파손**이다 —
+    마지막 leg 가 cygpath 목을 떨구려고 PATH 를 주변 환경 값으로 통째로 되돌렸고, 그 바람에
+    목 `cys` 까지 사라져 훅의 `cys surface-role`·`cys reclaim-role --auto` 가 **설치된 실
+    바이너리**로 해소됐다. 실 `cys` 는 `CYS_PACK_DIR`(= tmp fixture)를 자가치유 대상으로 보고
+    팩 전량(실측 857파일 · `.pristine/` 미러 · `.new`/`.user` 병치)을 써 넣고, 그 쓰기는
+    **프로세스 종료 뒤에도 이어졌다**(실측: cys 종료 시점 675/857) — `TemporaryDirectory`
+    정리가 그 쓰기와 경합해 크래시한 것이다.
+    ★위험의 크기: 이 형상에서 검체는 훅이 아니라 **실 제품의 팩 설치**를 쟀고(검체 6.0s →
+      수리 후 0.9s), 실 바이너리는 fixture 밖(실 데몬 소켓·실 상태 디렉터리)에 닿을 수 있었다.
+      "격리 tmp 뿐"이라는 이 파일 헤더의 약속이 실제로는 깨져 있었다.
+    ∴ 이 검체가 그 클래스의 기계 집행자다 — 세 축이다:
+      ⓐ 러너 **전역**: PATH 를 주변 환경 값으로 통째로 되돌리는 지점 0(목 소실 지점 0).
+      ⓑ 목을 세운 블록: `_mock_cys(` 를 부른 검체의 모든 PATH 설정 rhs 는 bin 디렉터리 변수를
+         참조해야 한다 — 목을 세우고 스스로 떨구는 형상 금지.
+      ⓒ H-WIN-7 의 **실패 방향 런타임 핀**(목 cys 동일성 단언)이 소스에 살아 있는가 —
+         조용한 삭제 차단.
+    계측 타당성: 같은 탐지기를 `PRE_ISO_REF` 트리에 돌려 **구 코드에서 FIRE** 하는지 확인한다.
+    탐지기가 구 결함을 못 잡으면 신 코드의 PASS 는 아무 의미가 없다(MEMORY '디버깅 계측 타당성
+    게이트' 3칙 ①).
+    """
+    notes = []
+    runner = _read(os.path.abspath(__file__))
+    marks = [(m.start(), m.group(1))
+             for m in re.finditer(r'^@(?:specimen|pending)\(\s*"([A-Za-z0-9\-]+)"', runner, re.M)]
+    need(len(marks) >= 50,
+         "검체 블록 수확 실패(정규식 파손) — %d건만 잡혔다" % len(marks))
+    blocks = [("<module>", runner[:marks[0][0]])]
+    for i, (pos, sid) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(runner)
+        blocks.append((sid, runner[pos:end]))
+    bodies = dict(blocks)
+
+    # 수확기 자체가 살아 있는가(fail-closed) — 0건이면 정규식이 죽은 것이지 '깨끗한' 것이 아니다.
+    sites = [(sid, ln, rhs) for sid, body in blocks for ln, rhs in _iso_path_sites(body)]
+    need(len(sites) >= 8,
+         "PATH 설정 지점을 %d건밖에 수확하지 못했다 — 수확 정규식 파손(fail-closed)" % len(sites))
+    need(all(rhs for _s, _l, rhs in sites),
+         "rhs 가 빈 PATH 설정 지점이 있다(다행 표기 등) — 수확기가 판정할 수 없다: %s"
+         % [(s_, l_) for s_, l_, r_ in sites if not r_])
+    notes.append("PATH 설정 %d지점 수확" % len(sites))
+
+    # ⓐ 전역: 주변 환경 PATH 통째 복원 = 0
+    amb = [(sid, ln, rhs) for sid, body in blocks for ln, rhs in _iso_ambient_restores(body)]
+    need(not amb,
+         "검체가 PATH 를 주변 환경 값으로 통째로 되돌린다 %s — 그 순간 목 bindir 이 사라져 "
+         "훅이 **설치된 실 `cys`** 를 부르고, 실 바이너리가 fixture CYS_PACK_DIR 을 자가치유 "
+         "대상으로 삼는다(E-4 ⑤ 재발). 떨궈야 할 목이 있으면 그 목 **파일만** 지워라."
+         % [(s_, l_) for s_, l_, _r in amb])
+    notes.append("주변 PATH 통째 복원 0")
+
+    # ⓑ 목을 세운 블록은 목을 스스로 떨구지 않는다
+    mocked = [sid for sid, body in blocks if "_mock_cys(" in body]
+    need(mocked, "`_mock_cys(` 호출 블록을 하나도 찾지 못했다(수확 파손)")
+    lost = []
+    for sid in mocked:
+        for ln, rhs in _iso_path_sites(bodies[sid]):
+            if not re.search(r"\bbin[a-z_0-9]*\b", rhs):
+                lost.append((sid, ln, rhs[:60]))
+    need(not lost,
+         "목 `cys` 를 세워 놓고 PATH 에서 그 bin 디렉터리를 빼는 지점 %s — 목이 닿지 않으면 "
+         "실 바이너리가 대신 해소된다. 새 변수 이름을 쓴다면 이 검체의 술어를 함께 넓혀라." % lost)
+    notes.append("목 세운 블록 %d종 · bin 참조 유지" % len(mocked))
+
+    # ⓒ H-WIN-7 실패 방향 런타임 핀 실재
+    need("H-WIN-7" in bodies, "H-WIN-7 블록을 찾지 못했다(이름 변경·삭제)")
+    need('shutil.which("cys", path=env["PATH"])' in bodies["H-WIN-7"],
+         "H-WIN-7 의 목 cys 동일성 런타임 핀이 사라졌다 — 격리 파손이 다시 조용한 정리 경합 "
+         "OSError 로만 나타나게 된다(원인이 가려진다)")
+    need('os.remove(os.path.join(binp, "cygpath"))' in bodies["H-WIN-7"],
+         "H-WIN-7 이 cygpath 목만 지우는 형태가 아니다 — 전제('cygpath 부재')를 만드는 방법이 "
+         "바뀌었다면 목 cys 보존이 유지되는지 이 검체와 함께 재검토하라")
+    notes.append("H-WIN-7 실패방향 핀 실재")
+
+    # 계측 타당성 — 구 트리에서 탐지기가 FIRE 하는가
+    old = _git_show(os.path.join("cysjavis-pack", "bin", "tests",
+                                 "run_bootstrap_health.py").replace(os.sep, "/"),
+                    ref=PRE_ISO_REF)
+    if old is None:
+        notes.append("계측대조=skip(no-git · 배포 팩)")
+    else:
+        fired = _iso_ambient_restores(old)
+        need(fired,
+             "계측 타당성 실패: 구 트리(%s)에서 탐지기가 FIRE 하지 않는다 — 기준 커밋이 틀렸거나 "
+             "탐지기가 파손됐다. 신 코드의 PASS 가 아무 의미도 없어진다." % PRE_ISO_REF)
+        notes.append("계측대조 %s FIRE %d건" % (PRE_ISO_REF, len(fired)))
+    return " · ".join(notes)
 
 
 @specimen("H-META-PIN", "W6",

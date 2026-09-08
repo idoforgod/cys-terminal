@@ -236,6 +236,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
     "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
+    # ★2026-09-08 통합 단계 등재(오너 참고1 · CONTRACTS §B-11 "음성 검체 1개 추가").
+    #   **봉인 점검 결과(등재 = 이 선언)**: 새 python 진입점도 강제점도 **아니다** — 이 파일은
+    #   봉인을 *강제*하는 게 아니라 봉인이 실제로 듣는지를 **관측**한다(데몬이 주입하는 env 를
+    #   재현해 인터프리터를 한 번 돌리고 트리에 `.pyc` 가 0개임을 재는다). 니들 보유 이유는 그
+    #   env 이름·값을 실제로 싸서 돌려야 하기 때문이다. ba 축은 이 census 의 ⓐ·ⓒ(iii) 와 같은
+    #   사실을 **정적이 아니라 실행으로** 재는 짝이다(정적 핀만 있을 때 남는 계급 — "env 를 실었다"와
+    #   "실었는데 인터프리터가 무시한다"의 차이 — 을 닫는다).
+    "cysjavis-pack/bin/tests/test_pyseal_negative_specimen.py",
     # ★2026-09-08 P6 등재 — 셸 역할 권위·단일소유 가드 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도 강제점도 아니다. 이 검체가 스폰하는 것은 `sh`/`bash`/`cys-dept`(bash)와
     #   가짜 `cys` 스텁(sh)뿐이다. 니들은 **밀폐 env 를 짜는 한 줄**에 있다 — 검체가 띄우는 셸이
