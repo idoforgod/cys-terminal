@@ -3809,6 +3809,14 @@ fn run(command: Command) -> i32 {
                             if r["approved"].as_bool() == Some(true) {
                                 0 // 서명된 prefix — guard.sh가 우회 통과
                             } else {
+                                // ★(수렴 R2 · claude minor) 거부 사유가 있으면 **말한다**.
+                                //   데몬이 승인 저장소를 읽지 못한 거부는 "승인이 없다"와
+                                //   결과가 같아서, 사유가 없으면 권한·파손 하나로 모든 승인이
+                                //   조용히 막히는 상태를 운영자가 진단할 길이 없다.
+                                //   판정은 그대로 차단이다(사유는 거부에만 실린다).
+                                if let Some(why) = r["reason"].as_str() {
+                                    eprintln!("[approval] 차단(승인 없음이 아니라 판정 불가): {why}");
+                                }
                                 2 // 미서명 — 차단 유지
                             }
                         }

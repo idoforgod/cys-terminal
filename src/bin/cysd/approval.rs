@@ -450,18 +450,31 @@ const ENV_SECRET_B64: &str = "CYS_APPROVAL_SECRET_B64";
 /// 시크릿 파일 경로: ~/.cys/.approval-secret — pack(~/.cys/pack) 밖, ~/.cys/ 직하.
 /// pack은 배포·git 추적 대상일 수 있으므로 시크릿이 새지 않게 분리한다.
 fn secret_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cys")
-        .join(".approval-secret")
+    store_root().join(".cys").join(".approval-secret")
+}
+
+/// 승인 저장소·시크릿의 **루트** — 릴리스에서는 언제나 `dirs::home_dir()` 하나다.
+///
+/// ★(0.14.31 수렴 R2 · codex 재검증 major) **검체 이음매**(`cfg(test)` 한정): Windows 의
+/// `dirs::home_dir()` 은 `SHGetKnownFolderPath(FOLDERID_Profile)` 이라 `HOME` 을 바꿔도
+/// 격리되지 않는다. `HOME` 만 임시 디렉터리로 돌린 승인 검체는 그 플랫폼에서 **실제 사용자
+/// 프로필의 승인 저장소**를 읽고 쓰고(테스트 승인이 프로필에 남는다), 만들지도 않은 임시
+/// 디렉터리의 파일을 찾다 실패한다. 그래서 검체는 루트를 이 이음매로 **직접 주입**한다.
+///
+/// **env 로는 열지 않는다.** 호출자가 정할 수 있는 값 하나로 승인 저장소를 옮길 수 있으면
+/// 그것이 곧 게이트 우회다(빈 저장소를 가리키게 하는 것은 거부 방향이지만, 공격자가 자기
+/// 서명 저장소를 가리키게 하는 것은 통과 방향이다). 릴리스 빌드에는 이 분기가 아예 없다.
+fn store_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = tests::store_root_override() {
+        return p;
+    }
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// 승인 레코드 영속 경로: ~/.cys/approvals.json (0600).
 fn records_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cys")
-        .join("approvals.json")
+    store_root().join(".cys").join("approvals.json")
 }
 
 /// 우선순위: ① env override(B64, 로깅 금지) → ② 0600 파일 → ③ 생성·0600 저장.
@@ -569,10 +582,7 @@ fn random_32() -> Option<Vec<u8>> {
 /// 병합은 읽을 때 한 번(`load_records`), 분리는 쓸 때 한 번(`save_records`) 일어나므로 호출부는
 /// 종전 그대로다.
 fn ttl_records_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cys")
-        .join("approvals-ttl.json")
+    store_root().join(".cys").join("approvals-ttl.json")
 }
 
 /// 한 파일에서 레코드 목록 디코드: `{"records":[...]}` 또는 bare 배열 둘 다(cmux 하위호환).
@@ -647,7 +657,14 @@ fn save_records_to(path: &PathBuf, records: &[&ApprovalRecord]) -> Result<(), St
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
     set_owner_only(&tmp);
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    // ★(수렴 R2 · claude minor) rename 이 실패하면 **그 자리에서 tmp 를 지운다.** pid 가 이름에
+    //   들어간 뒤로는 다음 실행이 같은 이름을 재사용하지 않으므로, 지우지 않으면 승인 전체를
+    //   담은 0600 사본이 pid 하나당 하나씩 `~/.cys` 에 쌓인다(디스크 가득참·AV 잠금으로 rename
+    //   이 반복 실패하는 기계). 삭제 실패는 무시한다 — 보고할 사실은 rename 실패 쪽이다.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
     set_owner_only(path);
     Ok(())
 }
@@ -684,8 +701,9 @@ pub fn save_records(records: &[ApprovalRecord]) -> Result<(), String> {
 ///      덮여 사라진다(프로세스 뮤텍스 밖 갱신 손실 · claude major / codex major #5).
 /// 변경 판정은 **직렬화 동등성**이다: 필드 하나가 늘어도 자동으로 따라오고, `updated_at`
 /// 재서명처럼 진짜 변경은 반드시 다르게 나온다. 승인 목록은 수십 건 규모라 비용이 무시된다.
-/// 읽기에 실패하면 클로저는 **빈 목록** 위에서 돌고(호출부는 "승인 없음"으로 답한다 —
-/// fail-closed) 저장은 하지 않으며, 실패 사유가 `Err` 로 나간다.
+/// 읽기에 실패하면 **클로저를 돌리지 않는다**(아래 `Err` 팔). 그 자리에서 `(None, Err(..))`
+/// 로 나가므로 변형도 부수효과도 없고, 호출부는 `None` 을 "판정하지 못했다"로 읽어 거부로
+/// 접는다(fail-closed). 실패 사유는 `Err` 가 싣는다.
 pub fn mutate_records<R>(
     f: impl FnOnce(&mut Vec<ApprovalRecord>) -> R,
 ) -> (Option<R>, Result<(), String>) {
@@ -745,10 +763,60 @@ pub fn env_from_json(v: &serde_json::Value) -> Vec<(String, String)> {
 // ── 테스트 (E-n: 10종, hmac_kat = RFC 4231) ──────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const SECRET: &[u8] = b"test-approval-secret-32-bytes!!!";
+
+    // ── 승인 저장소 루트 이음매(§`store_root`) ────────────────────────────────
+    /// 검체가 주입한 루트. `None` 이면 릴리스 경로(`dirs::home_dir()`) 그대로다.
+    /// 프로세스 **전역** 값이므로 승인 저장소를 만지는 검체들은 서로 직렬화돼야 한다
+    /// (handlers 쪽 `ACL_ENV_LOCK` 이 그 역할을 한다 — `HOME` 교체도 같은 이유로 그 락 안이다).
+    static STORE_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn store_root_override() -> Option<PathBuf> {
+        STORE_ROOT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 되돌리기를 잊을 수 없게 **가드**로 준다 — 살아 있는 동안만 루트가 바뀐다.
+    /// 이것이 필요한 이유는 `store_root` 의 doc 참조(Windows 의 `home_dir()` 은 `HOME` 을 보지
+    /// 않는다 — `HOME` 만 바꾼 검체는 실제 사용자 프로필의 승인 저장소를 만진다).
+    #[must_use]
+    pub(crate) fn with_store_root(root: &std::path::Path) -> StoreRootGuard {
+        // 이음매 자체를 직렬화한다 — 루트는 프로세스 전역이라, 병렬 검체 둘이 동시에 세우면
+        // 한쪽이 다른 쪽의 임시 저장소를 읽는다(그 실패는 산발적이라 진단이 가장 비싸다).
+        let held = SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *STORE_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(root.to_path_buf());
+        StoreRootGuard(held)
+    }
+
+    static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct StoreRootGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for StoreRootGuard {
+        fn drop(&mut self) {
+            // 필드(`SEAM_LOCK` 가드)는 이 본문 **뒤에** 풀린다 — 루트를 되돌린 뒤에 다음
+            // 검체가 들어온다.
+            *STORE_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// 이음매가 실제로 경로를 옮기는가 — 이것이 거짓이면 위 검체들이 **사용자 프로필**을 만진다.
+    #[test]
+    fn store_root_seam_moves_every_approval_path() {
+        let _g = with_store_root(std::path::Path::new("/tmp/cys-approval-seam-probe"));
+        for p in [records_path(), ttl_records_path(), secret_path()] {
+            assert!(
+                p.starts_with("/tmp/cys-approval-seam-probe"),
+                "이음매가 적용되지 않은 경로가 있다: {}",
+                p.display()
+            );
+        }
+        drop(_g);
+        // 가드가 풀리면 릴리스 경로로 돌아온다(검체가 서로의 저장소를 물려받지 않는다).
+        assert!(store_root_override().is_none());
+    }
 
     fn rec(prefix: &[&str], cwd: Option<&str>, env: &[(&str, &str)]) -> ApprovalRecord {
         ApprovalRecord {

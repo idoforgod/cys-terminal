@@ -509,6 +509,23 @@ fn same_dir_on_disk(a: &str, b: &str) -> bool {
     }
 }
 
+/// 승인 저장소 사고를 **stderr 에 한 번만** 남긴다(수렴 R2 · claude minor).
+///
+/// 왜 한 번인가: 읽기 실패는 사람이 파일을 고칠 때까지 **매 호출** 재발하고, guard.sh 는 위험
+/// 명령마다 `approval.check` 를 부른다. 매번 찍으면 그 로그가 데몬 stderr 를 덮어 다른 사실을
+/// 밀어낸다. 사유 문자열이 **달라지면** 다시 찍는다 — 그것은 새 사실이기 때문이다.
+/// (판정에는 영향이 없다. 이 함수는 아무 값도 돌려주지 않는다.)
+fn warn_approval_store_once(kind: &str, reason: &str) {
+    static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let line = format!("{kind}: {reason}");
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_deref() == Some(line.as_str()) {
+        return;
+    }
+    *last = Some(line.clone());
+    eprintln!("[approval] 승인 저장소 {line}");
+}
+
 /// 호출 좌석의 **데몬 권위** 역할 — `surface.role` 과 `roles[role] == sid` 가 **둘 다** 맞을 때만
 /// 역할로 인정한다.
 ///
@@ -8111,7 +8128,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★`hit` 이 이중 Option 인 이유: 바깥은 "트랜잭션이 돌았는가"(저장소를 읽지 못하면
             //   `None` — 그 자체가 거부다), 안쪽은 "매칭이 있었는가"다. 둘을 flatten 해 **거부로
             //   합류**시킨다 — 읽기·잠금 실패가 `approved:true` 와 만날 수 있는 경로가 없다.
-            let (hit, _saved) = crate::approval::mutate_records(|records| {
+            let (hit, saved) = crate::approval::mutate_records(|records| {
                 // ★(독립 재유도 · codex major #6) **시각은 잠금 안에서 뜬다.** 종전엔 트랜잭션
                 //   **밖에서** 뜬 뒤 저장소 잠금을 기다렸다 — 다른 트랜잭션이 저장소를 붙잡고
                 //   있는 동안 만료가 지나가면, 대기가 끝난 뒤에도 낡은 시각으로 매칭해
@@ -8146,8 +8163,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 hit
             });
-            // `_saved` 는 매칭 성공 시의 `updated_at`(lastUsed) 기록 실패를 뜻한다 — 승인 자체는
-            // 디스크의 서명으로 이미 유효하므로 판정을 뒤집지 않는다(장부 갱신 실패 ≠ 미승인).
+            // ★(수렴 R2 · claude minor) 실패 사유를 **어디에도 남기지 않던** 자리다.
+            //   · `hit == None` = 저장소를 읽지 못해 트랜잭션이 아예 돌지 않았다. 그 거부는
+            //     "승인이 없다"와 응답·이벤트에서 구별되지 않아, 권한이 막힌
+            //     `~/.cys/approvals*.json` 하나로 guard.sh 의 **모든** 승인이 영구히 조용히
+            //     거부된다(운영자가 볼 단서 0). 판정은 그대로 두고(모르면 거부 — §3-3)
+            //     **사유만** 싣는다: 거부 전용 필드라 게이트를 여는 방향이 될 수 없다.
+            //   · `hit == Some` 인데 `saved` 가 `Err` = `updated_at`(lastUsed) 장부 갱신 실패다.
+            //     승인 자체는 디스크의 서명으로 이미 유효하므로 판정을 뒤집지 않는다
+            //     (장부 갱신 실패 ≠ 미승인). 그래도 **사실은 남긴다**.
+            let ran = hit.is_some();
+            let store_error = saved.err();
+            if let Some(e) = store_error.as_deref() {
+                warn_approval_store_once(if ran { "ledger" } else { "read" }, e);
+            }
+            let deny_reason = (!ran).then(|| store_error.clone()).flatten();
             match hit.flatten() {
                 Some((_matched_idx, matched_id, matched_prefix, matched_expires_at)) => {
                     daemon.bus.publish(
@@ -8171,11 +8201,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "autopilot.approval_checked",
                         "autopilot",
                         None,
-                        json!({"approved": false, "require_ttl": require_ttl}),
+                        json!({"approved": false, "require_ttl": require_ttl,
+                               "reason": deny_reason}),
                     );
                     Reply::Single(ok_response(
                         &id,
-                        json!({"approved": false, "ttl_enforced": require_ttl}),
+                        json!({"approved": false, "ttl_enforced": require_ttl,
+                               "reason": deny_reason}),
                     ))
                 }
             }
@@ -16467,6 +16499,9 @@ mod tests {
         // 서명 부작용(secret·approvals.json)을 임시 HOME으로 격리 — 실제 ~/.cys 오염 방지.
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 992_002_u32;
         let _sid = setup_master(&daemon, caller);
@@ -19742,6 +19777,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-rt", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_101_u32;
         let _sid = setup_master(&daemon, caller);
@@ -19837,6 +19875,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-wipe", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_401_u32;
         let _sid = setup_master(&daemon, caller);
@@ -19869,13 +19910,22 @@ mod tests {
             crate::approval::load_records().is_empty(),
             "검체 전제 미성립: 깨진 파일이 그대로 읽혔다"
         );
-        let Reply::Single(_) =
+        let Reply::Single(rp) =
             dispatch(&daemon, approval_check_req("echo nothing-matches", "/tmp", false), Some(caller))
         else { panic!() };
         assert_eq!(
             std::fs::read(&ttl_path).unwrap(),
             before,
             "파싱 못 한 승인 저장소를 무매칭 검사 하나가 되썼다 — 승인 기록이 영구 소멸한다"
+        );
+        // ★(수렴 R2 · claude minor) 그 거부는 "승인이 없다"와 **구별돼야 한다**. 사유가 어디에도
+        //   없으면 권한·파손 하나로 guard.sh 의 모든 승인이 조용히 거부되고, 운영자에게는
+        //   단서가 0 이다(응답·이벤트·stderr 어디에도 없었다). 판정은 그대로 거부다.
+        assert_eq!(rp["result"]["approved"], json!(false), "{rp}");
+        let why = rp["result"]["reason"].as_str().unwrap_or("");
+        assert!(
+            why.contains("읽지 못해") && why.contains("approvals-ttl.json"),
+            "읽지 못한 저장소의 거부가 사유 없이 나갔다(‘승인 없음’과 구별 불가): {rp}"
         );
 
         // ③ 읽기 실패(unix) — 상위 디렉터리는 쓰기 가능한 채 파일만 못 읽는 상태.
@@ -19888,11 +19938,15 @@ mod tests {
                 std::fs::read_to_string(&ttl_path).is_err(),
                 "검체 전제 미성립: 권한 0000 파일이 읽힌다(root 실행?)"
             );
-            let Reply::Single(_) = dispatch(
+            let Reply::Single(rd) = dispatch(
                 &daemon,
                 approval_check_req("echo nothing-matches", "/tmp", false),
                 Some(caller),
             ) else { panic!() };
+            assert!(
+                rd["result"]["reason"].as_str().unwrap_or("").contains("읽기 실패"),
+                "권한이 막힌 저장소의 거부가 사유 없이 나갔다: {rd}"
+            );
             std::fs::set_permissions(&ttl_path, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert_eq!(
                 std::fs::read(&ttl_path).unwrap(),
@@ -19924,6 +19978,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-notouch", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_403_u32;
         let _sid = setup_master(&daemon, caller);
@@ -19942,6 +19999,8 @@ mod tests {
             dispatch(&daemon, approval_check_req("echo nothing-matches", "/tmp", false), Some(caller))
         else { panic!() };
         assert_eq!(rc["result"]["approved"], json!(false), "{rc}");
+        // 음성 대조: **읽을 수 있는** 저장소의 무매칭 거부에는 사유가 붙지 않는다(과잉 고지 0).
+        assert_eq!(rc["result"]["reason"], json!(null), "정상 무매칭에 저장소 사유가 붙었다: {rc}");
         assert_eq!(
             std::fs::metadata(&ttl_path).unwrap().ino(),
             before,
@@ -19967,6 +20026,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-lockwait", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_402_u32;
         let _sid = setup_master(&daemon, caller);
@@ -20021,6 +20083,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-wash", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_301_u32;
         let _sid = setup_master(&daemon, caller);
@@ -20090,6 +20155,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-ext", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
 
         let caller = 993_302_u32;
         let _sid = setup_master(&daemon, caller);
@@ -20145,6 +20213,9 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("ttl-cap", r#"{"default":"allow","rules":[]}"#);
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &dir);
+        // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
+        //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
+        let _store = crate::approval::tests::with_store_root(&dir);
         let before = crate::approval::load_records().len();
         let req = Request { id: json!(1), method: "approval.capabilities".into(), params: json!({}) };
         let Reply::Single(r) = dispatch(&daemon, req, None) else { panic!() };
