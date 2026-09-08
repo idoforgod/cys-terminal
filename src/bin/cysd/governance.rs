@@ -4427,6 +4427,17 @@ pub(crate) const QUEUE_EXPIRED_EVICT_PER_TICK: usize = 20;
 /// 않은 배달은 **보류**된다(다음 틱 재시도 — 유실 아님 · §3-3).
 pub(crate) const QUEUE_TICK_SETTLE_BUDGET_MS: u64 = 2_000;
 
+/// ★(0.14.31 · 수렴 R2 · reviewer-claude minor) 좌석 하나가 **결판을 시도할 값어치가 있는** 최소
+/// 잔여 예산(ms). 종전 문턱은 `== 0` 이었다 — 잔여가 1~2ms 면 그 좌석은 여전히 진입해
+/// `record_audited_with`(원장 선기록 + fsync)와 `try_send` 를 돌린 뒤 `settle(1)` 에서 거의 확실히
+/// ABORTED 를 받는다. 귀결은 **영수증 없는 원장 줄 + `queue.inject_aborted`** 이고, 그것이 바로
+/// 이 예산이 없애려던 낭비다(경계에서만 남아 있었다). 문턱을 가드 대기 상한
+/// ([`crate::state::INJECT_GUARD_WAIT_MS`])의 1/8 로 올려 그 경계를 닫는다 — 그보다 적은 예산으로
+/// 결판이 나는 경우는 이미 결판이 나 있는 때뿐이고, 그 좌석은 다음 틱에 예산 전액으로 다시 온다
+/// (보류일 뿐 유실이 아니다 · §3-3). 예산 자체는 [`TickSettleBudget::begin`] 이 매 틱 RAII 로
+/// 재설정하므로 '영구 전 좌석 skip' 같은 부트체인 사고는 원리상 없다.
+pub(crate) const QUEUE_TICK_SETTLE_MIN_MS: u64 = crate::state::INJECT_GUARD_WAIT_MS / 8;
+
 thread_local! {
     /// 이 스레드의 남은 결판 예산(ms). watchdog 틱만 값을 세우고(`deliver_queued` 머리), RPC 처리
     /// 스레드는 `u64::MAX`(예산 없음 = 좌석당 상한만 적용)로 남는다 — 그 경로는 운영자 1회 명령이라
@@ -7356,7 +7367,7 @@ fn deliver_queued(
         //   전에** 이 좌석을 건너뛴다(항목 보존 · 다음 틱이 여기서 재개). 침묵은 금지 —
         //   사유는 남기되 기아 집계에서는 뺀다(몇 초 뒤 스스로 풀리는 보류라 만성 기아의
         //   원인으로 기록되면 재측정을 오도한다 · BLOCKED_INTERVAL 과 같은 규율).
-        if tick_settle_budget_ms() == 0 {
+        if tick_settle_budget_ms() < QUEUE_TICK_SETTLE_MIN_MS {
             if skipped_from.is_none() {
                 skipped_from = Some(s.id);
             }
@@ -10693,7 +10704,7 @@ mod tests {
         QueueOpDenied, TickSettleBudget, BLOCKED_ALT_SCREEN, BLOCKED_APPROVAL, BLOCKED_BUSY,
         BLOCKED_INPUT_PENDING, BLOCKED_INTERVAL, BLOCKED_MODAL, BLOCKED_PROMPT_UNKNOWN,
         QUEUE_EXPIRED_CAP, QUEUE_EXPIRED_EVICT_PER_TICK, QUEUE_NOTICE_ORIGIN,
-        QUEUE_TICK_SETTLE_BUDGET_MS,
+        QUEUE_TICK_SETTLE_BUDGET_MS, QUEUE_TICK_SETTLE_MIN_MS,
     };
     use super::drop_queue_entry;
     use serde_json::Value;
@@ -12476,6 +12487,51 @@ mod tests {
             assert_eq!(tick_settle_budget_ms(), 0, "예산이 음수로 돌지 않아야 한다");
         }
         assert_eq!(tick_settle_budget_ms(), u64::MAX, "틱이 끝나면 예산 표식이 남지 않는다");
+    }
+
+    /// ★[수렴 R2 · reviewer-claude minor] **결판 예산 건너뛰기 문턱은 0 이 아니다.**
+    ///
+    /// 종전 `== 0` 은 예산이 **정확히 0** 일 때만 좌석을 건너뛰었다. 잔여가 1~2ms 면 그 좌석은
+    /// 여전히 진입해 `record_audited_with`(원장 선기록 + fsync)와 `try_send` 를 돌린 뒤 `settle(1)`
+    /// 에서 거의 확실히 ABORTED 를 받는다 = **영수증 없는 원장 줄 + `queue.inject_aborted`**.
+    /// 문턱을 명명 상수로 올려 그 경계를 닫는다(보류일 뿐 유실이 아니다 — 다음 틱이 예산 전액으로
+    /// 재개한다). 예산 자체는 RAII 라 '영구 전 좌석 skip' 은 원리상 없다(같은 검체가 그것도 잰다).
+    #[test]
+    fn wp5_settle_budget_skip_threshold_is_not_zero() {
+        assert!(QUEUE_TICK_SETTLE_MIN_MS > 0, "문턱이 0 이면 잔여 1ms 좌석이 그대로 진입한다");
+        assert!(
+            QUEUE_TICK_SETTLE_MIN_MS < QUEUE_TICK_SETTLE_BUDGET_MS,
+            "문턱이 예산 전액 이상이면 어떤 좌석도 결판을 시도하지 못한다(배달 영구 정지)"
+        );
+        {
+            let _b = TickSettleBudget::begin();
+            spend_tick_settle_budget(std::time::Duration::from_millis(
+                QUEUE_TICK_SETTLE_BUDGET_MS - 1,
+            ));
+            assert_eq!(tick_settle_budget_ms(), 1, "검체 전제: 잔여 1ms 를 만들어야 한다");
+            assert!(
+                tick_settle_budget_ms() < QUEUE_TICK_SETTLE_MIN_MS,
+                "잔여 1ms 인데 좌석이 여전히 진입한다(유령 원장 줄이 경계에서 남는다)"
+            );
+            // 틱 머리(예산 전액)에서는 반드시 진입한다 — 조인 방향이 배달을 죽이지 않는가.
+            let _fresh = TickSettleBudget::begin();
+            assert!(
+                tick_settle_budget_ms() >= QUEUE_TICK_SETTLE_MIN_MS,
+                "예산 전액에서도 좌석이 건너뛰어진다(전 좌석 배달 정지)"
+            );
+        }
+        assert_eq!(tick_settle_budget_ms(), u64::MAX, "틱 밖에서 문턱이 걸리면 RPC 경로가 막힌다");
+        assert!(
+            tick_settle_budget_ms() >= QUEUE_TICK_SETTLE_MIN_MS,
+            "틱 밖(u64::MAX)이 문턱 아래로 읽히면 운영자 1회 명령이 영구 거부된다"
+        );
+        // 소스 핀 — 분기가 상수를 쓴다(`== 0` 으로 되돌아가면 여기서 죽는다).
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("mod tests {").expect("테스트 모듈 앵커")];
+        assert!(
+            prod.contains("if tick_settle_budget_ms() < QUEUE_TICK_SETTLE_MIN_MS {"),
+            "좌석 건너뛰기 분기가 명명 상수 문턱을 쓰지 않는다"
+        );
     }
 
     // ─── ★(0.14.31 · 리뷰 R2 · codex B6ⓓ) 통지 재기동 창 검체 ─────────────────────────────
