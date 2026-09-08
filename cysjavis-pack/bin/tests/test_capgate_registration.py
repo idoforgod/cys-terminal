@@ -764,7 +764,7 @@ class TriageRegistrationGaps(_CapgateEnv):
 
     # ── ④ 명시 명명 파이프 주소가 표지 폴백을 건너뛴다 ─────────────────────────
     def test_named_pipe_socket_falls_back_to_hub_markers(self):
-        """★triage(codex major · Windows): `CYS_SOCKET=\\.\pipe\cys` 면 두 등록기 모두
+        r"""★triage(codex major · Windows): `CYS_SOCKET=\\.\pipe\cys` 면 두 등록기 모두
         파일시스템 `exists()` 하나로 판정을 끝내고 허브 표지를 **보지 않는다**.
 
         명명 파이프는 인스턴스가 사용 중이거나 메타데이터 조회가 실패해도 stat 이 실패한다 —
