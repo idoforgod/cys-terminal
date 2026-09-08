@@ -925,6 +925,93 @@ class RoundStopReason(unittest.TestCase):
         self.assertIn("적용되지 않았다", r.stderr)
         self.assertEqual([e for e in self.events() if e.get("event") == "override"], [])
 
+    # ── ⑧ 독립 재유도(triage) 반례 — 3R 잔여 지적의 재현 핀 (2026-09-08) ────────
+    # 판정자는 산출자도 직전 리뷰어도 아니다(CONTRACTS §E-1). 아래 검체는 각 지적을
+    # **현재 HEAD 에서 실패하는 최소 반례**로 고정한 것이며, 수리 방식은 규정하지 않는다.
+
+    def test_triage_unreadable_ledger_is_not_an_empty_history(self):
+        """**판독 불가** 장부를 '기록 없음'으로 접고 "다음 라운드 진행 가능" 을 내면 안 된다.
+
+        (reviewer-claude 잔여 major: 수리 축 ⑥ '판독 불가 ≠ 이력 없음' 이 사이드카
+        (`read_round_events`·`history_unknown`)에만 적용됐다. 장부 쪽은 `unreadable` 을
+        stderr 주의로만 흘리고, `round_stop_reason` 은 rows 가 비었다는 이유로
+        `last<=0 → open · "기록된 라운드 없음"` 으로 접어 `damage_blocks_round` 를 아예
+        보지 않는다 — 소비자가 읽는 stdout 은 **빈 장부와 구별되지 않는다**.)
+        장부 자리를 디렉터리로 만드는 형상은 chmod 없이도 읽기를 실패시킨다(Windows 포함).
+        """
+        os.makedirs(self.ledger)                     # 파일 자리 = 디렉터리 → open 실패(OSError)
+        r = self.status()
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertNotIn("진행 가능", r.stdout,
+                         "판독 불가 장부에서 새 라운드 진행을 지시했다:\n%s" % r.stdout)
+        self.assertNotIn("기록된 라운드 없음", r.stdout,
+                         "판독 불가를 '이력 없음'으로 보고했다:\n%s" % r.stdout)
+
+    def test_triage_negative_round_does_not_damage_the_ledger(self):
+        """`--round -1` 은 도구가 **스스로 판독 불가 줄**을 써 넣어 수렴을 뒤집는다(rc=0 보고).
+
+        (reviewer-claude 잔여 major) `LEDGER_ROW_RE` 는 라운드를 `[0-9]+` 로만 읽으므로 `| -1 | … |` 를 행으로
+        읽지 못하고, `_row_candidate` 는 그 줄을 **손상**으로 센다. 그 손상 줄은 파일 끝에
+        붙으므로 `damage_blocks_round` 의 회복 경계에서 **모든 축이 stale** 이 되어 이미
+        `accepted` 인 라운드가 `open` 으로 되돌아간다. 게이트는 음수 라운드를 통과시키고
+        (`args.round <= 0` 은 R0 취급) 호출은 rc=0 "기록:" 을 낸다.
+        수리 방향은 자유다(거부하거나, 행이 되게 쓰거나) — 이 핀은 **결과**만 못박는다:
+        성공을 보고한 호출이 자기 장부를 판독 불가로 만들지 않는다.
+        """
+        for ev in ("gemini", "codex"):
+            self.assertEqual(self.log_reviewer(1, ev).returncode, 0)
+        self.assertEqual(self.log_machine(1).returncode, 0)
+        r = self.orc("round-log", "--task", TASK, "--round", "1",
+                     "--evaluator", "master", "--verdict", "ACCEPT")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stop_reason=accepted", self.status().stdout, "전제 불성립(수렴 상태)")
+        neg = self.orc("round-log", "--task", TASK, "--round", "-1",
+                       "--evaluator", "master", "--verdict", "ACCEPT")
+        st = self.status()
+        self.assertNotIn("판독 불가", st.stderr,
+                         "도구가 자기 손으로 손상 줄을 만들었다(rc=%s · %s)"
+                         % (neg.returncode, neg.stdout.strip()))
+        self.assertIn("stop_reason=accepted", st.stdout,
+                      "음수 라운드 한 줄이 수렴 판정을 뒤집었다:\n%s" % st.stdout)
+
+    def test_triage_stale_stop_does_not_reclose_an_approved_resume(self):
+        """잠금 **밖에서** 계산한 종결이 성공한 override 뒤에 다시 기록되면 안 된다.
+
+        (reviewer-codex 잔여 major) `cmd_round_log` 는 rows·events 를 맨 위에서 읽고
+        `stagnation_gate(holding=False)` 가 그 **스냅샷으로** `stagnation_stop` 을 append 한다.
+        append 는 잠금을 쥐지만 rows/events 를 **재조회하지 않는다** — 그 사이(사이드카 잠금
+        대기는 최대 5s) 다른 writer 가 종결+명시 override 를 기록하면, 뒤늦은 append 가
+        승인된 재개를 다시 닫는다. 여기서는 A 의 스냅샷을 실제로 먼저 떠서 그 순서를 고정한다.
+        """
+        import argparse
+        sys.path.insert(0, BIN)
+        import javis_orchestra as orc
+        prev = os.environ.get("CYS_PACK_DIR")
+        os.environ["CYS_PACK_DIR"] = self.pack
+        try:
+            self.seed_two_minor_rounds()
+            rows, rdmg = orc.parse_rounds(self.ledger, with_damage=True)     # A 의 스냅샷
+            events, dmg = orc.read_round_events(TASK, with_damage=True)      # (종결 기록 전)
+            r = self.orc("round-log", "--task", TASK, "--round", "3",
+                         "--evaluator", "master", "--verdict", "ACCEPT")
+            self.assertEqual(r.returncode, 3, (r.returncode, r.stderr))      # B: 종결 기록
+            r = self.orc("round-log", "--task", TASK, "--round", "3", "--evaluator", "master",
+                         "--verdict", "ACCEPT", "--override", "오너 승인 재개")
+            self.assertEqual(r.returncode, 0, (r.returncode, r.stderr))      # B: 명시 재개
+            self.assertIsNone(orc.stagnation_block_round(orc.read_round_events(TASK), TASK),
+                              "전제 불성립: override 가 종결을 풀지 못했다")
+            args = argparse.Namespace(task=TASK, round=4, override=None)
+            code, _pend = orc.stagnation_gate(args, self.ledger, rows, events, dmg, rdmg)
+            self.assertEqual(code, 3, "전제 불성립: 낡은 스냅샷이 종결로 계산되지 않았다")
+            self.assertIsNone(orc.stagnation_block_round(orc.read_round_events(TASK), TASK),
+                              "승인된 재개가 **낡은 스냅샷의 종결 재기록**으로 다시 닫혔다: %r"
+                              % (self.events(),))
+        finally:
+            if prev is None:
+                os.environ.pop("CYS_PACK_DIR", None)
+            else:
+                os.environ["CYS_PACK_DIR"] = prev
+
 
 class RsiRoundBudget(unittest.TestCase):
     """RSI 라운드 예산 — `attempts` 는 재checkpoint·재시작·ledger 삭제를 넘어 영속한다."""
@@ -1082,7 +1169,13 @@ class RsiRoundBudget(unittest.TestCase):
         self.assertEqual(self.rsi("checkpoint", "--round", "r1", "--score", "1.0").returncode, 0)
         self.flat_round()
         self.assertEqual(len(self.queue_recs()), 1, self.queue_recs())
-        self.assertEqual(self.queue_recs()[0]["key"], "rsi.ceiling:r1", self.queue_recs())
+        # ★재핀(독립 재유도 X-5 · 의도적 키 변경): 멱등키에 **프로젝트 신원**이 들어간다. 종전
+        #   `rsi.ceiling:<라운드>` 는 팩을 공유하는 다른 프로젝트의 같은 라운드 추천을 영구
+        #   억제했다(라운드 id 는 `r1` 처럼 짧아 충돌이 기본값이다). 여기서는 **형태**만 핀한다.
+        key = self.queue_recs()[0]["key"]
+        self.assertTrue(key.startswith("rsi.ceiling:") and key.endswith(":r1")
+                        and len(key.split(":")) == 3 and key.split(":")[1],
+                        "멱등키에 프로젝트 신원이 없다: %r" % key)
         os.remove(self.state)                        # state 소실(복구·되돌리기)
         self.assertEqual(self.rsi("checkpoint", "--round", "r1", "--score", "1.0").returncode, 0)
         self.flat_round()
@@ -1108,6 +1201,197 @@ class RsiRoundBudget(unittest.TestCase):
             e = json.loads(self.rsi("checkpoint", "--round", "r1", "--score", "1.0").stdout)
         self.assertEqual(e["max_rounds"], 3, "잘못된 노브 값이 기본값으로 접히지 않았다")
         self.assertEqual(e["stop_reason"], "stopped_budget")
+
+
+    def test_triage_unreadable_ledger_is_not_an_empty_history(self):
+        """**읽을 수 없는** ledger 를 '이력 없음'으로 접으면 라운드 예산이 조용히 리셋된다.
+
+        (reviewer-codex 잔여 major) `_read_ledger` 의 `except OSError: return recs, damaged`
+        는 파일 **부재**와 권한·I/O 실패를 구분하지 않는다(`_load_state` 도 같다). 그래서
+        state 가 소실·복원된 형상에서 이력이 통째로 안 읽히면 `attempts=1 · stop_reason=open`
+        을 **확정으로** 보고한다 — 같은 모듈이 손상 줄 1개에는 `budget_unknown` 을 붙여
+        "모름을 모른다" 고 말하는데(§8-1 M5), 전면 판독 불가에는 그 표기가 없다.
+        """
+        self.assertEqual(self.rsi("checkpoint", "--round", "r1", "--score", "1.0").returncode, 0)
+        for _ in range(2):
+            self.assertEqual(self.rsi("progress", "--round", "r1", "--score", "1.0").returncode, 0)
+        led = os.path.join(self.root, "_round", "rsi", "ledger.jsonl")
+        os.remove(self.state)                       # state 소실(재시작·복원)
+        os.chmod(led, 0o222)                        # append 는 되고 읽기는 안 되는 형상
+        try:
+            open(led, "rb").close()
+            os.chmod(led, 0o600)
+            self.skipTest("이 플랫폼에서 chmod 가 읽기를 막지 못한다")
+        except OSError:
+            pass
+        try:
+            r = self.rsi("checkpoint", "--round", "r1", "--score", "1.0")
+            self.assertEqual(r.returncode, 0, (r.returncode, r.stderr))
+            self.assertNotIn("Traceback", r.stderr)
+            e = json.loads(r.stdout)
+            self.assertTrue(e.get("budget_unknown"),
+                            "판독 불가 ledger 를 빈 이력으로 접고 attempts=%s 를 확정으로 "
+                            "보고했다: %s" % (e.get("attempts"), r.stdout.strip()))
+        finally:
+            os.chmod(led, 0o600)
+
+
+class Wp6TriageLockOwnership(unittest.TestCase):
+    """고아 잠금 회수는 **새 소유자의 잠금**을 지우지 않는다 (독립 재유도 · 2026-09-08).
+
+    (reviewer-codex 잔여 blocking) `_best_effort_lock.__enter__` 의 회수는 토큰·mtime 확인과
+    `unlink`·`rmdir` 가 원자적이지 않다. 마지막 확인 **뒤** 소유자가 바뀌면 남의 잠금을 지우고
+    자기가 쥔다 — 그러면 두 writer 가 동시에 임계구간에 들어가고, `write_ledger_header` 의
+    `os.replace` 가 먼저 커밋된 장부 행을 덮을 수 있다(기록 유실).
+    검체는 그 순간을 결정론으로 고정한다: A 가 "고아다" 를 확인한 직후(첫 `os.unlink` 호출
+    경계에서) B 가 회수를 마치고 **살아 있는** 새 잠금을 쥔다.
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.base = os.path.join(self.root, "ORCHESTRATION-t.md")
+        self.lock = self.base + ".lock"
+        sys.path.insert(0, BIN)
+        import javis_orchestra
+        self.orc = javis_orchestra
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_orphan_reclaim_does_not_delete_a_new_owners_lock(self):
+        import time as _time
+        os.mkdir(self.lock)
+        with open(os.path.join(self.lock, "owner"), "wb") as f:
+            f.write(b"DEAD-OWNER")
+        old = _time.time() - 10 * 3600
+        os.utime(self.lock, (old, old))
+
+        real_unlink, raced = os.unlink, []
+
+        def racing_unlink(p, *a, **kw):
+            # A 가 고아 판정을 마치고 **지우기 직전**에 멈춘 사이 B 가 회수하고 새로 쥔다.
+            if not raced and os.path.dirname(str(p)) == self.lock:
+                raced.append(True)
+                shutil.rmtree(self.lock, ignore_errors=True)
+                os.mkdir(self.lock)
+                with open(os.path.join(self.lock, "owner"), "wb") as f:
+                    f.write(b"NEW-LIVE-OWNER")
+            return real_unlink(p, *a, **kw)
+
+        os.unlink = racing_unlink
+        try:
+            with self.orc._best_effort_lock(self.base, wait=2.0, stale=1.0) as lk:
+                held = bool(lk.held)
+                try:
+                    with open(os.path.join(self.lock, "owner"), "rb") as f:
+                        owner = f.read()
+                except OSError as e:
+                    owner = b"<%s>" % str(e).encode("utf-8", "replace")
+        finally:
+            os.unlink = real_unlink
+        self.assertTrue(raced, "전제 불성립: 고아 회수 경로에 도달하지 못했다")
+        self.assertEqual(owner, b"NEW-LIVE-OWNER",
+                         "회수가 **새 소유자의 잠금**을 지웠다(owner=%r · held=%s)" % (owner, held))
+        self.assertFalse(held, "남의 잠금을 지우고 자기가 쥐었다 — 동시 임계구간")
+
+
+class Wp6TriageDamageRecovery(unittest.TestCase):
+    """손상 회복 경계 — **사라진 축**은 '손상 없음'이 아니다 (독립 재유도 · 2026-09-08)."""
+
+    def setUp(self):
+        sys.path.insert(0, BIN)
+        import javis_orchestra
+        self.orc = javis_orchestra
+
+    def test_vanished_master_rejection_is_not_stagnation(self):
+        """유일한 master 반려 행이 손상으로 **사라지면** 정체를 선언해서는 안 된다.
+
+        (reviewer-codex 잔여 major) `damage_blocks_round` 는 `if seen and …` 로 **현재 파싱된
+        행이 있는 축만** 검사한다. 손상 줄의 귀속은 알 수 없는데, 그 줄이 유일한 master BLOCK
+        이었으면 master 는 검사 대상에서 아예 빠지고 `gate_verdicts` 에서도 `None`(미기록)이라
+        정체 판정의 ③(미승인 0)을 통과한다 — 해소되지 않은 반려 위에서 `stopped_stagnation`
+        (=종결·정지)이 선언된다. 다른 세 축은 손상 **뒤에** 재기록돼 회복 경계를 통과한다.
+        """
+        o = self.orc
+        rows, ln = [], 21                      # 20행 = 손상(사라진 master BLOCK)
+        for rnd in (1, 2):
+            for ev in ("gemini", "codex", "machine"):
+                rows.append({"round": rnd, "evaluator": ev, "score": "-",
+                             "verdict": "PASS(exit 0)" if ev == "machine" else "ACCEPT",
+                             "_line": ln})
+                ln += 1
+        dmg = {"damaged": 1, "lines": [20], "last_damaged_line": 20, "unreadable": ""}
+        ok = {"ok": True, "verdict": "ACCEPT", "severities": ["minor"]}
+        evidence = {(r, e): ok for r in (1, 2) for e in ("gemini", "codex")}
+        # 양성 대조: 손상이 없으면 이 상태는 정체다(검체가 무언가를 재고 있다는 증거).
+        self.assertEqual(o.round_stop_reason(rows, evidence)[0], "stopped_stagnation")
+        reason, why = o.round_stop_reason(rows, evidence, row_damage=dmg)
+        self.assertNotEqual(reason, "stopped_stagnation",
+                            "귀속을 모르는 손상 줄 위에서 종결을 선언했다: %r" % (why,))
+
+
+class Wp6TriageRsiProjectScope(unittest.TestCase):
+    """프로젝트별 RSI 라운드가 **공용 다이제스트 키**로 뭉치지 않는다 (독립 재유도)."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.pack = os.path.join(self.root, "pack")
+        os.makedirs(self.pack)
+        self.env = dict(os.environ)
+        self.env["CYS_PACK_DIR"] = self.pack
+        for k in ("CYS_ROUND_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR"):
+            self.env.pop(k, None)
+        self.env["CYS_RSI_CEILING_FLATS"] = "2"
+        self.env["CYS_RSI_MAX_ROUNDS"] = "99"
+        self.proj = {}
+        for name in ("A", "B"):
+            d = os.path.join(self.root, name)
+            os.makedirs(d)
+            subprocess.run(["git", "init", "-q", "."], cwd=d, check=True)
+            for kv in (("user.email", "t@example.invalid"), ("user.name", "t")):
+                subprocess.run(["git", "config"] + list(kv), cwd=d, check=True)
+            open(os.path.join(d, "a"), "w").write("x\n")
+            subprocess.run(["git", "add", "a"], cwd=d, check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=d, check=True)
+            self.proj[name] = d
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def queue(self):
+        p = os.path.join(self.pack, "round", "learn", "digest_queue.jsonl")
+        if not os.path.isfile(p):
+            return []
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def hit_ceiling(self, name):
+        d = self.proj[name]
+        for args in (["checkpoint", "--round", "r1", "--score", "5.0"],
+                     ["progress", "--round", "r1", "--score", "5.0"],
+                     ["progress", "--round", "r1", "--score", "5.0"]):
+            r = subprocess.run([PY, RSI] + args, cwd=d, capture_output=True, text=True,
+                               timeout=120, env=self.env)
+            self.assertEqual(r.returncode, 0, (name, args, r.stderr))
+
+    def test_other_projects_round_does_not_suppress_this_ones_recommendation(self):
+        """(reviewer-codex 잔여 major) RSI 이력은 프로젝트별(`cwd/_round/rsi`)인데 다이제스트
+        큐는 공용 팩(`<팩>/round/learn`)이고 멱등키는 `rsi.ceiling:<round>` 로 **프로젝트
+        신원이 없다**. 그래서 프로젝트 A 의 `r1` 추천이 큐에 남아 있으면 프로젝트 B 의 `r1`
+        추천이 '이미 나갔다'로 눌리고, B 의 ledger 에는 나간 적 없는 추천의 `backfilled` 래치가
+        영속한다(큐가 비워져도 재추천되지 않는다).
+        """
+        self.hit_ceiling("A")
+        self.assertEqual(len(self.queue()), 1, "전제 불성립: A 의 추천이 적재되지 않았다")
+        self.hit_ceiling("B")
+        self.assertEqual(len(self.queue()), 2,
+                         "프로젝트 B 의 추천이 A 의 공용 키에 눌렸다: %r" % (self.queue(),))
+        led = os.path.join(self.proj["B"], "_round", "rsi", "ledger.jsonl")
+        with open(led, encoding="utf-8") as f:
+            recs = [json.loads(l) for l in f if l.strip()]
+        self.assertFalse([e for e in recs if e.get("event") == "ceiling_recommend"
+                          and e.get("backfilled")],
+                         "나간 적 없는 추천을 B 의 ledger 에 backfill 했다: %r" % recs)
 
 
 if __name__ == "__main__":

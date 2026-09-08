@@ -31,6 +31,7 @@ soul/CLAUDE의 ★eval-driven 원칙(producer≠evaluator·측정실패 hard fai
 사용: python3 javis_rsi.py <cmd> ... · 의존성: 표준 라이브러리 + PATH의 git.
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -169,12 +170,26 @@ def rollback_plan(round_id, ckpt_sha, head_sha, discarded, dirty, is_ancestor):
 
 # ───────────────────────── 상태 파일 I/O ─────────────────────────
 
-def _load_state():
+def _read_state_file():
+    """state.json → (상태, 판독 불가 사유). **부재만** 빈 상태다(독립 재유도 X-4).
+
+    ★"읽을 수 없다"는 "없다"가 아니다: 권한·I/O 실패·깨진 JSON 을 빈 상태로 접으면 라운드
+      예산(attempts)이 조용히 리셋되고, 그 리셋이 **확정**으로 보고된다. 부재(첫 라운드)만
+      정상이고 나머지는 불확정으로 올려 `budget_unknown` 어휘에 싣는다.
+    """
     p = os.path.join(rsi_dir(), "state.json")
     try:
-        return json.load(open(p, encoding="utf-8"))
-    except (OSError, ValueError):
-        return {"rounds": {}}
+        with open(p, encoding="utf-8") as f:
+            return json.load(f), ""
+    except FileNotFoundError:
+        return {"rounds": {}}, ""
+    except (OSError, ValueError) as e:
+        return {"rounds": {}}, "%s" % e
+
+
+def _load_state():
+    """호환 진입점 — 상태만 돌려준다(불확정 여부가 필요하면 `_read_state_file`)."""
+    return _read_state_file()[0]
 
 
 def _learn_state_dir():
@@ -246,7 +261,9 @@ def _append_ledger(entry):
 
 
 def _read_ledger():
-    """ledger.jsonl → (레코드 목록, 손상 줄 수). **바이트로 읽고 줄마다 strict 디코드**한다.
+    """ledger.jsonl → 레코드 목록. **바이트로 읽고 줄마다 strict 디코드**한다.
+
+    반환 `(레코드 목록, 손상 줄 수, 판독 불가 사유)`.
 
     ★깨진 1바이트로 도구가 죽지 않는다(리뷰 R2 blocking · claude major-2): 종전엔 텍스트 모드
       반복이라 `\xed\x95` 같은 줄 하나가 `UnicodeDecodeError` 를 던졌고, 핸들러는 `OSError` 만
@@ -256,12 +273,17 @@ def _read_ledger():
     ★`errors="replace"` 를 쓰지 않는 이유는 orchestra 사이드카와 같다: 문자열 **안**의 깨진
       바이트가 유효 JSON 으로 통과해 `round`·`event` 가 조용히 바뀔 수 있다(거짓 계수).
     """
-    recs, damaged = [], 0
+    recs, damaged, unreadable = [], 0, ""
     try:
         with open(os.path.join(rsi_dir(), "ledger.jsonl"), "rb") as f:
             raw = f.read()
-    except OSError:
-        return recs, damaged
+    except FileNotFoundError:
+        return recs, damaged, unreadable          # 없음 = 이력 없음(정상 · 첫 라운드)
+    except OSError as e:
+        # ★"읽을 수 없다"는 "없다"가 아니다(독립 재유도 X-4 · orchestra 사이드카와 같은 규율):
+        #   권한·I/O 실패를 빈 이력으로 접으면 예산이 조용히 리셋되는데, 같은 모듈이 손상 줄
+        #   1개에는 `budget_unknown` 을 붙여 "모름을 모른다"고 말한다(§8-1 M5). 비대칭을 없앤다.
+        return recs, damaged, "%s" % e
     for chunk in raw.split(b"\n"):
         if not chunk.strip():
             continue
@@ -274,7 +296,7 @@ def _read_ledger():
             recs.append(e)
         else:
             damaged += 1
-    return recs, damaged
+    return recs, damaged, unreadable
 
 
 def _safe_append_ledger(entry):
@@ -297,21 +319,21 @@ def _ledger_attempt_count(rid):
     ★그럼 예산이 되돌아가지 않는가? 되돌아갈 수 있는 경로는 'state 소실 + 그 라운드의 ledger
       줄 손상' 동시 발생뿐이고, 그때 stop_reason 은 `budget_unknown` 을 달고 나간다(§5 한계).
     """
-    recs, damaged = _read_ledger()
+    recs, damaged, unreadable = _read_ledger()
     n = 0
     for e in recs:
         if e.get("event") in RSI_ATTEMPT_EVENTS and e.get("round") == rid:
             n += 1
-    return n, damaged
+    return n, damaged, unreadable
 
 
 def _next_attempt(state, rid):
     """이번 호출의 시도 번호 — max(state, ledger) + 1(양쪽 되돌리기 방어).
-    반환 (시도번호, 직전 라운드 레코드, 손상 줄 수)."""
+    반환 (시도번호, 직전 라운드 레코드, 손상 줄 수, ledger 판독 불가 사유)."""
     prev = state.get("rounds", {}).get(rid)
     prev = prev if isinstance(prev, dict) else {}
-    led, damaged = _ledger_attempt_count(rid)
-    return max(_as_int(prev.get("attempts"), 0), led) + 1, prev, damaged
+    led, damaged, unreadable = _ledger_attempt_count(rid)
+    return max(_as_int(prev.get("attempts"), 0), led) + 1, prev, damaged, unreadable
 
 
 # ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
@@ -333,6 +355,34 @@ def learn_digest_queue_path():
     return os.path.join(_learn_state_dir(), LEARN_DIGEST_QUEUE)
 
 
+def rsi_project_identity():
+    """다이제스트 멱등키에 넣을 **프로젝트 신원** — RSI 이력 디렉터리의 실경로 sha256.
+
+    ★왜 필요한가(독립 재유도 X-5): RSI 이력은 프로젝트별(`cwd/_round/rsi`)인데 다이제스트 큐는
+      **공용 팩**(`<팩>/round/learn`)이고, 종전 멱등키는 `rsi.ceiling:<round>` 로 신원이 없었다.
+      라운드 id 는 `r1`·`r2` 처럼 짧아 팩을 공유하는 다중 프로젝트에서 충돌이 예외가 아니라
+      **기본값**이다 — A 의 r1 추천이 큐에 있으면 B 의 r1 추천이 '이미 나갔다'로 눌리고,
+      B 의 ledger 에는 나간 적 없는 추천의 래치가 영속해 큐가 비워져도 **영구 억제**된다.
+    ★한계(정직한 표기): 이것은 프로젝트의 신원이 아니라 **이력 저장 경로의 이름**이다.
+      별칭·이동은 같은 이력을 다른 키로 만들어 **추천 1건 중복**을 낼 수 있고, `CYS_ROUND_DIR`
+      을 여러 프로젝트가 공유하면 이력 자체가 공유되므로 키도 같아진다. 두 오답 중 중복은
+      다이제스트 한 줄이고 억제는 자가치유 신호의 영구 유실이다 — 중복 쪽으로 튼다.
+    ★자르지 않는다(codex 지적): 12자(48비트)는 불필요한 충돌 가능성을 더한다. 전체 sha256 을
+      쓰는 비용은 큐 한 줄의 길이뿐이다.
+    """
+    try:
+        real = os.path.realpath(rsi_dir())
+    except OSError:
+        real = os.path.abspath(rsi_dir())
+    return hashlib.sha256(real.encode("utf-8", "replace")).hexdigest()
+
+
+def ceiling_digest_key(rid):
+    """ceiling 추천의 멱등키 — `rsi.ceiling:<프로젝트 신원>:<라운드>`(순수 함수는 아니다:
+    경로를 읽는다). 구 키(`rsi.ceiling:<라운드>`)는 조회 대상이 아니다."""
+    return "rsi.ceiling:%s:%s" % (rsi_project_identity(), rid)
+
+
 class _best_effort_lock(object):
     """`os.mkdir` 원자성만 쓰는 최선노력 상호배제 — fcntl·msvcrt 무의존(Windows 안전).
 
@@ -347,7 +397,11 @@ class _best_effort_lock(object):
         self.blocked, self.unsupported = False, ""
         # 소유자 토큰 — **내 잠금일 때만** 지운다(orchestra 와 같은 규율: 느린 소유자가 고아로
         # 오인돼 회수된 뒤 그대로 rmdir 하면 다음 소유자의 잠금을 지워 둘이 함께 들어간다).
-        self.token = ("%d-%d" % (os.getpid(), int(time.time() * 1000))).encode("ascii")
+        self.wrote_owner = False
+        # 회수는 `__enter__` 당 한 번만(orchestra 와 같은 규율 — 연쇄 강탈 차단).
+        self.reclaim_tried = False
+        self.token = ("%d-%d-%s" % (os.getpid(), int(time.time() * 1000),
+                                    hashlib.sha256(os.urandom(16)).hexdigest()[:16])).encode("ascii")
 
     def _owner_file(self):
         return os.path.join(self.path, "owner")
@@ -359,6 +413,73 @@ class _best_effort_lock(object):
         except OSError:
             return b""
 
+    def _claim_name(self):
+        """회수 청구 파일 — 잠금 디렉터리 **안**의 `owner.stale-<내토큰>`(청구자마다 유일)."""
+        return self._owner_file() + ".stale-" + self.token.decode("ascii", "replace")
+
+    def _abandoned_claim(self):
+        """중단된 회수가 남긴 청구 파일 하나 — owner 가 없고 나이가 상한을 넘은 것만
+        (rename 성공과 unlink 사이의 사망이 잠금을 영구 교착으로 만들지 않게 한다)."""
+        try:
+            names = sorted(os.listdir(self.path))
+        except OSError:
+            return None
+        if "owner" in names:
+            return None
+        for n in names:
+            if not n.startswith("owner.stale-"):
+                return None          # 모르는 내용물 — 손대지 않는다(보류 방향)
+        for n in names:
+            q = os.path.join(self.path, n)
+            try:
+                if time.time() - os.path.getmtime(q) > self.stale:
+                    return q
+            except OSError:
+                return None
+        return None
+
+    def _reclaim_orphan(self, seen):
+        """고아 잠금 회수 — **원자적 청구(rename)에 성공한 하나만** 회수자다(javis_orchestra
+        동명 메서드와 같은 규율 · 독립 재유도 X-1). 확인과 삭제가 원자적이지 않으면 마지막
+        확인 **뒤** 들어온 새 소유자의 잠금을 지워 두 writer 가 동시에 임계구간에 든다."""
+        claim, src = self._claim_name(), self._owner_file()
+        if not os.path.exists(src):
+            src = self._abandoned_claim()
+            if not src:
+                return False
+            seen = None
+        try:
+            os.rename(src, claim)              # ★원자적 청구
+        except OSError:
+            return False
+        if seen is not None:
+            try:
+                with open(claim, "rb") as f:
+                    got = f.read(200)
+            except OSError:
+                got = None
+            if got != seen:                    # 내가 본 그 고아가 아니다 — 원상복구
+                try:
+                    os.rename(claim, self._owner_file())
+                except OSError:
+                    pass
+                return False
+        try:
+            os.unlink(claim)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            try:
+                os.rename(claim, self._owner_file())
+            except OSError:
+                pass
+            return False
+        try:
+            os.rmdir(self.path)                # 비어 있을 때만 성공한다
+        except OSError:
+            return False
+        return True
+
     def __enter__(self):
         deadline = time.monotonic() + self.wait      # 단조 시계 — 시스템 시각 되감기 방어
         while True:
@@ -368,6 +489,7 @@ class _best_effort_lock(object):
                 try:
                     with open(self._owner_file(), "wb") as f:
                         f.write(self.token)
+                    self.wrote_owner = self._owner() == self.token     # 되읽어 확인한다
                 except OSError:
                     pass
                 return self
@@ -380,16 +502,14 @@ class _best_effort_lock(object):
                 self.blocked = True
                 return self
             try:
-                if time.time() - os.path.getmtime(self.path) > self.stale:
+                if not self.reclaim_tried and \
+                        time.time() - os.path.getmtime(self.path) > self.stale:
                     seen = self._owner()
                     time.sleep(0.2)
                     if seen == self._owner() and \
                             time.time() - os.path.getmtime(self.path) > self.stale:
-                        try:
-                            os.unlink(self._owner_file())
-                        except OSError:
-                            pass
-                        os.rmdir(self.path)
+                        self.reclaim_tried = True
+                        self._reclaim_orphan(seen)
                     continue
             except OSError:
                 pass
@@ -398,7 +518,10 @@ class _best_effort_lock(object):
     def __exit__(self, *exc):
         if self.held:
             # 토큰이 비어 있으면(owner 쓰기 실패) 우리가 만든 것 — 반납하지 않으면 아무도 못 푼다.
-            if self._owner() in (self.token, b""):
+            # ★단 내 토큰이 되읽기로 **확인**된 경우엔 빈 owner 를 내 것으로 보지 않는다: 새
+            #   소유자가 mkdir 뒤 owner 를 쓰기 전의 빈 상태를 옛 소유자가 오인하면 안 된다.
+            own = self._owner()
+            if own == self.token or (own == b"" and not self.wrote_owner):
                 try:
                     os.unlink(self._owner_file())
                 except OSError:
@@ -455,14 +578,22 @@ def enqueue_learn_digest(reason, topic, source, key=None):
         return False
 
 
-def _ledger_has_event(kind, rid):
+def _ledger_has_event(kind, rid, key=None):
     """append-only ledger 에 그 라운드의 이벤트가 있는가 — 래치의 두 번째 내구 근거.
+    `key` 를 주면 **그 멱등키로 기록된 것만** 인정한다(구 키의 래치를 승계하지 않는다).
     (큐가 주간 다이제스트로 **소비·정리**된 뒤에도 남는다. `RSI_ATTEMPT_EVENTS` 밖의 종류라
      시도 계수에는 잡히지 않는다.)"""
-    recs, _damaged = _read_ledger()          # 판독 규약은 `_ledger_attempt_count` 와 같다(비대칭 금지)
+    recs, _damaged, _unreadable = _read_ledger()   # 판독 규약은 `_ledger_attempt_count` 와 같다
     for e in recs:
-        if e.get("event") == kind and e.get("round") == rid:
-            return True
+        if e.get("event") != kind or e.get("round") != rid:
+            continue
+        if key is not None and e.get("key") != key:
+            # ★신원 없는 **구 키**의 래치는 승계하지 않는다(독립 재유도 X-5): 프로젝트 신원이
+            #   없던 시절의 키로 눌린 기록(특히 남의 추천을 보고 메운 `backfilled`)이 이 
+            #   프로젝트의 추천을 영구히 억제한다. 출처를 증명할 수 없으면 **중복 1회**가
+            #   영구 유실보다 안전하다.
+            continue
+        return True
     return False
 
 
@@ -480,36 +611,64 @@ def cmd_checkpoint(a):
     ts = time.time()
     ref = f"refs/rsi/ckpt/{a.round}"
     _git(["update-ref", ref, head])  # 복구 anchor (비파괴)
-    state = _load_state()
+    state, state_unreadable = _read_state_file()
     # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
     #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
     #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
-    attempts, prev, damaged = _next_attempt(state, a.round)
+    attempts, prev, damaged, unreadable = _next_attempt(state, a.round)
     flat = _as_int(prev.get("flat_streak"), 0)
     stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
-    state.setdefault("rounds", {})[a.round] = {
+    rec = {
         "round": a.round, "checkpoint_sha": head, "ref": ref,
         "baseline_score": a.score, "started_at": ts, "note": a.note or "",
         "progress": [], "attempts": attempts, "flat_streak": flat,
         "stop_reason": stop_reason,
         "ceiling_recommended": bool(prev.get("ceiling_recommended")),
     }
+    if prev.get("ceiling_recommended_key"):
+        rec["ceiling_recommended_key"] = prev["ceiling_recommended_key"]
+    if damaged or unreadable or state_unreadable:
+        rec["budget_unknown"] = True      # 영속 state 에도 싣는다(다음 호출이 이어 읽는다)
+    state.setdefault("rounds", {})[a.round] = rec
     state["current_round"] = a.round
     _save_state(state)
     entry = {"event": "checkpoint", "round": a.round, "sha": head[:12],
              "score": a.score, "ts": ts, "ref": ref,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
-    if damaged:
-        entry["ledger_damaged"], entry["budget_unknown"] = damaged, True
+    _mark_unknown(entry, damaged, unreadable, state_unreadable)
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
-    _warn_stop(stop_reason, a.round, attempts, damaged)
+    _warn_stop(stop_reason, a.round, attempts, damaged, unreadable, state_unreadable)
     return 0
 
 
-def _warn_damaged(damaged):
+def _mark_unknown(entry, damaged, unreadable="", state_unreadable=""):
+    """예산 불확정 표기를 stdout JSON 레코드에 싣는다 — **기존 어휘 재사용**(소비자 개정 0).
+
+    `budget_unknown` 은 이미 손상 줄 1개에 붙던 표기다(§8-1 M5). 전면 판독 불가(권한·I/O)와
+    state 판독 불가도 같은 축의 사건이므로 같은 키에 싣고, 원인만 별도 필드로 남긴다.
+    """
+    if damaged:
+        entry["ledger_damaged"], entry["budget_unknown"] = damaged, True
+    if unreadable:
+        entry["ledger_unreadable"], entry["budget_unknown"] = unreadable, True
+    if state_unreadable:
+        entry["state_unreadable"], entry["budget_unknown"] = state_unreadable, True
+    return entry
+
+
+def _warn_damaged(damaged, unreadable="", state_unreadable=""):
     """ledger 손상 고지(stderr) — 손상을 조용히 건너뛰지 않는다. exit code 는 바꾸지 않는다."""
+    if unreadable:
+        print("[rsi] 주의: ledger.jsonl 을 **읽을 수 없다**(%s) — 읽을 수 없는 것은 '이력 없음'이 "
+              "아니다. 이 라운드의 시도수는 확인된 것만 센 값이며 실제보다 작을 수 있다"
+              "(budget_unknown). 파일: %s"
+              % (unreadable, os.path.join(rsi_dir(), "ledger.jsonl")), file=sys.stderr)
+    if state_unreadable:
+        print("[rsi] 주의: state.json 을 **읽을 수 없다**(%s) — 예산 이력의 한쪽 다리가 빠졌다"
+              "(budget_unknown). 파일: %s"
+              % (state_unreadable, os.path.join(rsi_dir(), "state.json")), file=sys.stderr)
     if not damaged:
         return
     print("[rsi] 주의: ledger.jsonl 에 판독 불가 %d줄(깨진 UTF-8·JSON 아님) — **어느 라운드의 "
@@ -519,9 +678,9 @@ def _warn_damaged(damaged):
           % (damaged, os.path.join(rsi_dir(), "ledger.jsonl")), file=sys.stderr)
 
 
-def _warn_stop(stop_reason, rid, attempts, damaged=0):
+def _warn_stop(stop_reason, rid, attempts, damaged=0, unreadable="", state_unreadable=""):
     """종료 사유 고지(stderr) — exit code 는 바꾸지 않는다(소비자 루프를 세우지 않는다)."""
-    _warn_damaged(damaged)
+    _warn_damaged(damaged, unreadable, state_unreadable)
     if stop_reason == "stopped_budget":
         print("[rsi] stop_reason=stopped_budget — 라운드 '%s' 시도 %d회 > 상한 %d "
               "(CYS_RSI_MAX_ROUNDS). 라운드를 잇지 말고 격차를 보고하라(기록은 남았다)."
@@ -533,8 +692,8 @@ def _warn_stop(stop_reason, rid, attempts, damaged=0):
 
 
 def cmd_progress(a):
-    state = _load_state()
-    r = state["rounds"].get(a.round)
+    state, state_unreadable = _read_state_file()
+    r = state.get("rounds", {}).get(a.round)
     if not r:
         print(f"error: 라운드 '{a.round}' checkpoint 없음 — 먼저 checkpoint 하라", file=sys.stderr)
         return 2
@@ -557,34 +716,37 @@ def cmd_progress(a):
     r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
     # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
     #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
-    attempts, _prev, damaged = _next_attempt(state, a.round)
+    attempts, _prev, damaged, unreadable = _next_attempt(state, a.round)
     r["attempts"] = attempts
     stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
                                   rsi_ceiling_flats())
     r["stop_reason"] = stop_reason
+    if damaged or unreadable or state_unreadable:
+        r["budget_unknown"] = True
     _save_state(state)
     entry = {"event": "progress", "round": a.round, **rec,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
-    if damaged:
-        entry["ledger_damaged"], entry["budget_unknown"] = damaged, True
+    _mark_unknown(entry, damaged, unreadable, state_unreadable)
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
-    _warn_stop(stop_reason, a.round, attempts, damaged)
+    _warn_stop(stop_reason, a.round, attempts, damaged, unreadable, state_unreadable)
     # 추천은 **라운드당 1회**다(다이제스트 1줄 계약). 종전엔 ceiling 이상인 매 progress 마다
     # 적재해 같은 사유가 큐에 쌓였다 — 배달 채널은 그대로(feed 0 · 주간 다이제스트).
     # ★래치는 state.json 밖에도 있어야 한다(codex R1 major-10): state 를 지우거나 되돌리면
     #   같은 라운드의 같은 사유가 두 번 적재됐다. 그래서 **라운드별 멱등키**를 ①큐 레코드와
     #   ②append-only ledger 양쪽에서 조회한다(큐가 소비돼도 ledger 가 남고, ledger 를 잃어도
     #   큐가 남는다). 적재 실패면 래치를 걸지 않는다 — 추천을 영구히 잃지 않기 위해서다.
-    key = "rsi.ceiling:%s" % a.round
+    key = ceiling_digest_key(a.round)
     if r["flat_streak"] >= rsi_ceiling_flats():
         # ★내구 다리 셋을 **매번 함께** 본다(codex R2 major-11 B): 종전엔 state 래치가 참이면
         #   분기 자체에 들어오지 않아, "큐에서 복구해 래치만 세운" 프로세스가 ledger 를 영영
         #   비워 뒀다. 그 뒤 큐 회전 + state 소실이면 같은 추천이 다시 나간다.
         in_queue = digest_queue_has_key(learn_digest_queue_path(), key)
-        in_ledger = _ledger_has_event("ceiling_recommend", a.round)
-        latched = bool(r.get("ceiling_recommended"))
+        in_ledger = _ledger_has_event("ceiling_recommend", a.round, key)
+        # ★state 래치도 **키로 범위를 좁힌다**(독립 재유도 X-5): 신원 없는 구 키로 눌려 세워진
+        #   래치(남의 추천을 보고 세운 것)를 그대로 인정하면 키를 고쳐도 억제가 풀리지 않는다.
+        latched = bool(r.get("ceiling_recommended")) and r.get("ceiling_recommended_key") == key
         if latched or in_queue or in_ledger:
             if not in_ledger:
                 # ★보조 기록의 실패가 **주 평가의 rc 를 바꾸지 않는다**(codex R2 major-11 A):
@@ -600,11 +762,13 @@ def cmd_progress(a):
                           "나갔고(큐 또는 state), 다음 호출이 다시 시도한다.", file=sys.stderr)
             if not latched and (in_queue or in_ledger):
                 r["ceiling_recommended"] = True   # 이미 추천됨(다른 경로에서) — 래치 복원
+                r["ceiling_recommended_key"] = key
                 _save_state(state)
         elif _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round, key):
             if _safe_append_ledger({"event": "ceiling_recommend", "round": a.round,
                                     "key": key, "ts": time.time()}):
                 r["ceiling_recommended"] = True
+                r["ceiling_recommended_key"] = key
                 _save_state(state)
     return 0
 
