@@ -3005,6 +3005,35 @@ mod tests {
         assert_eq!(modal_signature(&echo), None, "접힌 확인 에코가 관문으로 오탐됐다: {echo:?}");
     }
 
+    /// ★[triage · codex blocking] **상태줄 어휘가 들어간 실초안은 빈 편집 영역이 아니다.**
+    ///
+    /// `scan_composer` 는 꼬리 **첫 비공백 줄**로 범위를 좁혔지만, 그 줄이 상태줄 어휘를 *포함*
+    /// 하기만 하면 편집 영역의 끝으로 인정한다(`norm.contains(t)`). 토큰은
+    /// `for shortcuts`·`bypass permissions`·`shift+tab` — 전부 이 제품을 쓰는 사람이 실제로 타이핑하는
+    /// 말이다. 그래서 커서를 첫 행에 둔 멀티라인 초안의 둘째 줄에 그 말이 들어 있으면 "빈 대기
+    /// composer" 로 읽히고, `governance` 의 stale `pending_input_bytes` 리셋이 그 초안 계수를 지운 뒤
+    /// 다음 틱이 큐 본문을 사람 문장과 **한 줄로 합쳐 제출**한다(fail-open · §3-3 위반).
+    #[test]
+    fn triage_wp5_status_word_inside_a_real_draft_is_not_an_empty_edit_region() {
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        for draft in [
+            "  shift+tab 동작을 설명해 줘",
+            "  bypass permissions 를 끄는 방법이 뭐야",
+            "  ? for shortcuts 가 안 보이는데",
+        ] {
+            let screen =
+                format!("  이전 출력\n{rule}\n❯ \n{draft}\n{rule}\n  ⏵⏵ bypass permissions on\n");
+            assert!(
+                !composer_edit_region_empty(&screen, "❯", None),
+                "실초안 {draft:?} 이 '빈 편집 영역' 으로 읽힌다 — stale 리셋이 그 초안을 지우고 큐 본문과 합친다"
+            );
+            assert!(
+                !composer_layout_positive(&screen, "❯", None),
+                "실초안 {draft:?} 이 대기 프롬프트 레이아웃의 강한 증거로 세어졌다"
+            );
+        }
+    }
+
     #[test]
     fn r6_choice_tail_boundary_and_end_are_exact() {
         let trust = MODAL_CHOICE_LABELS[0];

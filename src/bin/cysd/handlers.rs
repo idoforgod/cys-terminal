@@ -15358,6 +15358,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★[triage · codex blocking] **좌석 승계 이관이 인계 예약을 취소하지 않는다.**
+    ///
+    /// `migrate_seat_queue` 는 구 좌석 활성 큐를 무조건 `drain` 한다 — 결판 대기 중인(예약된) 항목도
+    /// 함께 간다. writer 가 그 뒤 쓰기로 확정하면 **구 좌석에 주입되고 신 좌석 큐에도 남아** 같은
+    /// 문장이 두 번 나간다(배달자는 구 좌석 큐만 pop 하므로 신 좌석분은 지워지지 않는다).
+    /// 처분자 3경로(`clear`·TTL 스윕·`drop`)는 전부 `cancel_inject_reservation` 을 먼저 부르는데
+    /// 승계만 그 규약 밖에 있다.
+    #[test]
+    fn triage_wp5_seat_migration_must_not_move_an_inflight_entry() {
+        let daemon = claim_daemon();
+        let prev_id = make_surface(&daemon, Some("master"));
+        let next_id = make_surface(&daemon, None);
+        let (prev_s, next_s) = {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            (surfaces[&prev_id].clone(), surfaces[&next_id].clone())
+        };
+        let inflight = daemon.next_queue_entry("[인계중] 지금 쓰는 문장".into(), None, "test");
+        let waiting = daemon.next_queue_entry("[대기] 이관되어도 되는 문장".into(), None, "test");
+        {
+            let mut pq = prev_s.pending_queue.lock().unwrap();
+            pq.push_back(inflight.clone());
+            pq.push_back(waiting.clone());
+        }
+        // 배달자가 예약을 걸고 writer 가 이미 쓰기로 확정했다(취소 불가 = 배달 중).
+        let g = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None,
+            prev_s.output_gen.clone(),
+            false,
+            None,
+        ));
+        assert!(g.claim_for_write(), "전제: writer 가 소유권을 집는다");
+        *prev_s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec![inflight.id.clone()],
+            guard: g,
+        });
+        migrate_seat_queue(&daemon, &prev_s, &next_s, "master");
+        let moved: Vec<String> = next_s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert!(
+            moved.contains(&waiting.id),
+            "대기 항목은 이관돼야 한다(보고 유실 0 — 이 검체는 그 정책을 바꾸지 않는다)"
+        );
+        assert!(
+            !moved.contains(&inflight.id),
+            "쓰기로 확정된 인계 항목이 신 좌석 큐로 옮겨졌다 — 구 좌석에 주입되고 신 좌석에서 또 배달된다"
+        );
+    }
+
     /// ★G1(W2-C) 좌석 승계 이관 핀 — ①병합 정책은 현행 그대로 '신 좌석 큐 **뒤에** append'
     /// (대상 큐 기존 항목이 앞서는 재정렬 가능 지점 — 정책 변경이 아니라 명시가 이번 범위)
     /// ②queue.migrated {from_surface, to_surface, queue_entry_ids, role} 발행(무음 승계 금지)

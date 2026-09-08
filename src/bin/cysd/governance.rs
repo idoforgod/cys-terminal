@@ -11926,6 +11926,242 @@ mod tests {
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부했는데 항목이 사라졌다");
     }
 
+    // ═══════════ ★독립 재유도(triage · 2026-09-08) — 잔여 지적의 실패 검체 ═══════════
+    //
+    // 산출자도 직전 리뷰어도 아닌 판정자가 각 지적을 **실패하는 테스트**로 재현한 것이다.
+    // 통과하도록 고치는 것이 수리이고, 이 검체 자체가 회귀 핀이 된다.
+
+    /// ★[triage · codex blocking / claude blocking] **중단 롤백이 처분자의 폐기를 되살린다.**
+    ///
+    /// 【경로】 배달자가 예약을 걸고 락 밖에서 결판을 기다리는 동안 처분자(`queue.clear`·좌석 종료)
+    /// 가 인계를 취소하고 항목을 drain·묘비한다 → 배달자는 `INJECT_ABORTED` 를 수확하고
+    /// `rollback_aborted_inject` 를 부른다 → 그 함수의 복원 조건은 **활성 큐에 그 id 가 없다** 뿐이라
+    /// 방금 폐기된 항목을 큐 **머리**로 되살린다(폐기 통지·묘비 뒤 다음 틱에 실제 배달).
+    #[test]
+    fn triage_wp5_rollback_must_not_resurrect_a_disposed_entry() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("triage-rollback");
+        let (daemon, s) = wp5_seat("wp5-triage-rollback", "claude");
+        let e = daemon.next_queue_entry("[보고] 운영자가 비운 문장".into(), None, "test");
+        let id = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e.clone());
+        reserve_inject(&s, &[&id], false);
+        let guard = s
+            .inject_reservation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.guard.clone())
+            .expect("예약");
+        // 처분자: 인계를 취소하고 항목을 가져가 묘비를 남긴다(= 운영자에게 폐기를 보고했다).
+        let taken = drain_active_except_inflight(&s);
+        assert_eq!(taken.len(), 1, "전제: 취소 가능한 예약은 처분자가 가져간다");
+        assert!(record_active_drain(&daemon, s.id, &taken, "cleared"), "전제: 묘비 기록");
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "전제: 폐기 후 활성 큐는 비어 있다");
+        // 배달자: 결판(=ABORTED)을 수확하고 롤백한다.
+        assert_eq!(guard.settle(0), crate::state::INJECT_ABORTED, "전제: 처분자가 중단시켰다");
+        let f = super::InflightInject {
+            guard: Some(guard),
+            prev_delivery_at: None,
+            set_delivery_at: None,
+            prev_pending: 0,
+            pending_gen: s.input_gen.load(AtomicOrdering::Acquire),
+            entries: vec![e.clone()],
+        };
+        let delivered = super::Delivered {
+            entry: e.clone(),
+            remaining: 0,
+            merged_ids: vec![id.clone()],
+            body: e.text.clone(),
+        };
+        *s.inject_reservation.lock().unwrap() = None;
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "폐기·묘비된 항목이 중단 롤백으로 활성 큐 머리에 되살아났다 — 다음 틱에 그 문장이 배달된다"
+        );
+    }
+
+    /// ★[triage · codex blocking] **TTL 처분 뒤의 롤백은 만료 항목을 활성 큐 머리에 둔다(§8 위반).**
+    /// 스윕이 인계를 취소하고 항목을 만료 큐로 옮긴 뒤 롤백이 돌면 같은 id 가 **활성·만료 양쪽**에
+    /// 생긴다 — `queue.revive` 가 중복 배달을 만들고, 정본 §8("만료 항목을 활성 큐 머리에 두지
+    /// 않는다")이 깨진다.
+    #[test]
+    fn triage_wp5_rollback_must_not_put_an_expired_entry_back_on_the_active_head() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("triage-rollback-ttl");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_TTL_SECS", "1"),
+        ]);
+        let (daemon, s) = wp5_seat("wp5-triage-rollback-ttl", "claude");
+        let mut e = daemon.next_queue_entry("[보고] TTL 만료분".into(), None, "test");
+        e.enqueued_at = now_epoch() - 3_600.0;
+        let id = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e.clone());
+        reserve_inject(&s, &[&id], false);
+        let guard = s
+            .inject_reservation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.guard.clone())
+            .expect("예약");
+        queue_expiry_pass(&daemon); // 스윕이 취소하고 만료 큐로 옮긴다
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "전제: 활성 큐에서 빠졌다");
+        assert_eq!(s.expired_queue.lock().unwrap().len(), 1, "전제: 만료 큐로 갔다");
+        assert_eq!(guard.settle(0), crate::state::INJECT_ABORTED, "전제: 스윕이 중단시켰다");
+        let f = super::InflightInject {
+            guard: Some(guard),
+            prev_delivery_at: None,
+            set_delivery_at: None,
+            prev_pending: 0,
+            pending_gen: s.input_gen.load(AtomicOrdering::Acquire),
+            entries: vec![e.clone()],
+        };
+        let delivered = super::Delivered {
+            entry: e.clone(),
+            remaining: 0,
+            merged_ids: vec![id.clone()],
+            body: e.text.clone(),
+        };
+        *s.inject_reservation.lock().unwrap() = None;
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "만료된 항목이 활성 큐 머리로 되살아났다(§8) — 활성·만료 양쪽에 같은 id 가 있다"
+        );
+    }
+
+    /// ★[triage · codex major] **실패한 묘비 I/O 도 틱 예산을 쓴다.**
+    /// 예산은 "성공적으로 제거한 수" 에서만 차감된다 — 디스크가 죽으면 좌석 수만큼 원장 I/O 를
+    /// 시도하면서 예산은 그대로 20 이라 한 틱이 I/O 대기에 묶인다(뒤따르는 사망 점검·자가치유 지연).
+    #[test]
+    fn triage_wp5_failed_tombstone_io_must_consume_the_tick_budget() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("triage-evict-budget");
+        let (daemon, s) = wp5_seat("wp5-triage-evict-budget", "claude");
+        {
+            let mut x = s.expired_queue.lock().unwrap();
+            for i in 0..(QUEUE_EXPIRED_CAP + 5) {
+                let mut e = daemon.next_queue_entry(format!("[만료] {i}"), None, "test");
+                e.expired_at = Some(now_epoch());
+                e.expired_event_sent = true; // 이벤트 축은 이 검체의 관심사가 아니다
+                x.push_back(e);
+            }
+        }
+        // 원장 경로를 **디렉터리**로 만들어 append 를 확실히 실패시킨다(디스크 장애 모사).
+        let led = crate::delivery::ledger_path(&daemon.socket_path);
+        let _ = std::fs::remove_file(&led);
+        std::fs::create_dir_all(&led).expect("원장 자리에 디렉터리");
+        let mut budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+        let changed = enforce_expired_cap_budgeted(&daemon, &s, now_epoch(), &mut budget);
+        assert!(!changed, "전제: 기록 실패 시 폐기하지 않는다");
+        assert_eq!(
+            s.expired_queue.lock().unwrap().len(),
+            QUEUE_EXPIRED_CAP + 5,
+            "전제: 항목은 보존된다"
+        );
+        assert!(
+            budget < QUEUE_EXPIRED_EVICT_PER_TICK,
+            "실패한 묘비 I/O 가 예산을 한 칸도 쓰지 않았다 — 좌석 100개면 한 틱이 그만큼 I/O 에 묶인다"
+        );
+    }
+
+    /// ★[triage · codex major] **복원 보존소 축출도 예산 적용까지 시간순을 지켜야 한다.**
+    /// 후보는 `order_at()` 오름차순으로 고르지만 그 뒤 `picked.sort_unstable()` 로 **파일 등장순**
+    /// 으로 되돌리고 예산을 자른다 — 파일이 최신→과거 순이면 가장 오래된 것이 아니라 그 중 **최신**
+    /// 이 먼저 지워진다(정책과 반대).
+    #[test]
+    fn triage_wp5_restored_cap_budget_slice_must_stay_in_age_order() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("triage-restored-order");
+        let daemon = drill_daemon("wp5-triage-restored-order");
+        let now = now_epoch();
+        let total = QUEUE_EXPIRED_CAP + 30;
+        {
+            let mut rx = daemon.restored_expired.lock().unwrap();
+            // 파일 등장순 = **최신 → 과거**(시간순과 반대).
+            for i in 0..total {
+                rx.push(json!({
+                    "id": format!("age-{i:03}"),
+                    "text": format!("[만료] {i}"),
+                    "surface_id": 7u64,
+                    "seq": i as u64,
+                    "enqueued_at": now - (i as f64),
+                    "origin": "test",
+                    "expired_at": now,
+                    "expired_event_sent": true,
+                }));
+            }
+        }
+        let mut budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+        assert!(enforce_restored_expired_cap(&daemon, now, &mut budget), "전제: 축출이 돌았다");
+        let left: Vec<String> = daemon
+            .restored_expired
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        // 가장 오래된 20건 = i 가 가장 큰 20건(enqueued_at 이 가장 작다).
+        for i in (total - QUEUE_EXPIRED_EVICT_PER_TICK)..total {
+            let id = format!("age-{i:03}");
+            assert!(
+                !left.contains(&id),
+                "가장 오래된 {id} 가 남고 더 최신 항목이 먼저 축출됐다(예산 적용 전 파일순 재정렬)"
+            );
+        }
+    }
+
+    /// ★[triage · codex major] **복원 보존소 축출도 삭제 전에 `queue.expired` 를 먼저 낸다(M7).**
+    /// 살아있는 좌석의 만료 큐에는 선발행이 배선됐지만(`publish_pending_expired_events`),
+    /// `restored_expired` 축출에는 없다 — 그 W-id 의 만료 종결 신호가 영영 나오지 않아
+    /// `javis_report_gate` 의 inflight 가 TTL 마다 재enqueue 된다.
+    #[test]
+    fn triage_wp5_restored_cap_must_publish_expired_before_evicting() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("triage-restored-event");
+        let daemon = drill_daemon("wp5-triage-restored-event");
+        let now = now_epoch();
+        let total = QUEUE_EXPIRED_CAP + 5;
+        {
+            let mut rx = daemon.restored_expired.lock().unwrap();
+            for i in 0..total {
+                rx.push(json!({
+                    "id": format!("ev-{i:03}"),
+                    "text": format!("[만료] {i}"),
+                    "surface_id": 7u64,
+                    "seq": i as u64,
+                    "enqueued_at": now - ((total - i) as f64),
+                    "origin": "test",
+                    "expired_at": now,
+                    "expired_event_sent": false, // 아직 만료 이벤트가 나가지 않았다
+                }));
+            }
+        }
+        let mut budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+        assert!(enforce_restored_expired_cap(&daemon, now, &mut budget), "전제: 축출이 돌았다");
+        let expired_ids: Vec<String> = daemon
+            .bus
+            .tail(200)
+            .into_iter()
+            .filter(|ev| ev["name"] == "queue.expired")
+            .filter_map(|ev| {
+                ev["payload"]["queue_entry_id"].as_str().map(String::from)
+            })
+            .collect();
+        // 가장 오래된 5건(ev-000..ev-004)이 축출 대상이다.
+        for i in 0..5usize {
+            let id = format!("ev-{i:03}");
+            assert!(
+                expired_ids.contains(&id),
+                "축출된 {id} 의 queue.expired 가 발행되지 않았다 — 소비자가 그 사건을 종결하지 못해 재enqueue 된다"
+            );
+        }
+    }
+
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) **TTL 스윕도 인계 중 항목을 만료 큐로 옮기지 않는다.**
     /// 옮기면 그 항목은 배달되면서 만료 큐에도 남아 `queue.revive` 가 **중복 배달**을 만든다.
     #[test]

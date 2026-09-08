@@ -1531,6 +1531,100 @@ pub(crate) mod tests {
         });
     }
 
+    /// ★[triage · codex blocking(재유도 severity=minor)] **디렉터리를 열지 못한 것은 내구화 성공이 아니다.**
+    ///
+    /// `sync_dir` 은 `File::open` 오류를 전부 `Ok(())` 로 접는다(가용성 논거: 핸들을 못 여는 파일
+    /// 시스템에서 묘비가 영영 성공하지 못하면 만료 큐가 무한히 자란다 — 그 논거 자체는 타당하다).
+    /// 그러나 반환값의 의미는 호출부에서 **"삭제해도 된다"** 로 소비된다. 쓰기·탐색은 되는데 읽기가
+    /// 막힌 디렉터리(0o333)에서 새 원장 파일을 만들면 그 이름이 내구화되지 않은 채 삭제가 허가되고,
+    /// 전원 단절 시 항목과 묘비가 함께 사라진다. 최소 요구: 내구화하지 못했다는 사실이 성공과
+    /// 구별돼야 한다(불가 플랫폼의 보장은 별도로 정의).
+    #[cfg(unix)]
+    #[test]
+    fn triage_wp5_dir_sync_that_cannot_open_must_not_be_reported_as_durable() {
+        use std::os::unix::fs::PermissionsExt;
+        with_state_dir(|td| {
+            let d = td.join("triage-unreadable");
+            std::fs::create_dir_all(&d).expect("디렉터리");
+            let mut perm = std::fs::metadata(&d).expect("메타").permissions();
+            perm.set_mode(0o333); // 쓰기·탐색 가능 · 읽기 불가 → open 은 EACCES
+            std::fs::set_permissions(&d, perm).expect("권한");
+            let bypasses = std::fs::File::open(&d).is_ok();
+            let verdict = sync_dir(&d);
+            let mut perm = std::fs::metadata(&d).expect("메타").permissions();
+            perm.set_mode(0o755);
+            let _ = std::fs::set_permissions(&d, perm);
+            if bypasses {
+                eprintln!("SKIP: 이 실행 주체는 디렉터리 권한을 우회한다(root) — 축을 잴 수 없다");
+                return;
+            }
+            assert!(
+                verdict.is_err(),
+                "디렉터리 핸들을 열지 못했는데 내구화 성공을 반환했다 — 호출부는 그것을 삭제 허가로 읽는다"
+            );
+        });
+    }
+
+    /// ★[triage · codex blocking] **부분 쓰기 뒤의 재시도는 읽을 수 없는 묘비로 삭제를 허가한다.**
+    ///
+    /// `record_queue_tombstones` 의 doc 은 "append 는 한 번의 write 이므로 '일부만 기록' 이 원리상
+    /// 없다" 고 적었지만 `write_all` 은 **이미 쓴 바이트를 되돌리지 않는다**(ENOSPC·EIO 는 접두를
+    /// 남기고 Err 를 돌려준다). 다음 호출은 그 접두에 이어 붙으므로 첫 줄이
+    /// `A의 부분 JSON + A의 완전 JSON` 이 되어 **파싱 불가**다. 그런데 반환은 `true` 라 호출부는
+    /// A·B 를 모두 지운다 — "원장 없는 삭제는 하지 않는다" 는 불변이 A 에서 깨진다.
+    /// 이 검체는 실패한 append 가 남긴 상태(꼬리에 개행 없는 조각)를 그대로 조립해 재시도한다.
+    #[test]
+    fn triage_wp5_partial_ledger_line_must_not_authorize_deletion() {
+        with_state_dir(|_td| {
+            let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
+            let daemon = crate::state::Daemon::new(sock.to_path_buf());
+            let mk = |id: &str, text: &str| crate::state::QueueEntry {
+                id: id.into(),
+                seq: 1,
+                text: text.into(),
+                enqueued_at: crate::state::now_epoch() - 10.0,
+                from: Some("surface:3".into()),
+                origin: "send".into(),
+                ttl_secs: None,
+                paused_total_secs: 0.0,
+                expired_at: Some(crate::state::now_epoch()),
+                revived_at: None,
+                expired_notified: false,
+                expired_event_sent: false,
+            };
+            let batch = vec![mk("triage-tomb-a", "A 본문"), mk("triage-tomb-b", "B 본문")];
+            let p = ledger_path(sock);
+            std::fs::create_dir_all(p.parent().unwrap()).expect("상태 디렉터리");
+            // 직전 시도가 A 의 행 중간에서 실패했다 — 접두는 파일에 남아 있다(개행 없음).
+            {
+                use std::io::Write;
+                let partial = queue_tombstone_row(9, &batch[0], "expired_evicted", 1.0).to_string();
+                let cut = partial.len() / 2;
+                let mut f = std::fs::File::create(&p).expect("원장 생성");
+                f.write_all(partial[..cut].as_bytes()).expect("부분 쓰기 모사");
+            }
+            // 공간이 회복돼 재시도한다 — 반환 true = 호출부는 A·B 를 지운다.
+            assert!(
+                record_queue_tombstones(&daemon, 9, &batch, "expired_evicted", 2.0),
+                "전제: 재시도 append 는 성공한다"
+            );
+            let body = std::fs::read_to_string(&p).expect("원장");
+            let readable: Vec<String> = body
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter_map(|r| r["queue_entry_id"].as_str().map(String::from))
+                .collect();
+            for e in &batch {
+                assert!(
+                    readable.contains(&e.id),
+                    "삭제를 허가했는데 {}의 묘비가 판독 불가다(첫 줄이 '부분 JSON + 완전 JSON') — \
+                     원장 대조에서 그 항목은 흔적 없이 사라진 것으로 보인다",
+                    e.id
+                );
+            }
+        });
+    }
+
     /// ★(0.14.31 · 리뷰 R1 · codex blocking) **묘비·영수증은 내구 append 다.**
     ///
     /// 묘비의 `true` 는 "이 항목을 지워도 된다" 는 **유일한 근거**이고, 그 삭제는 곧바로 WAL 원자

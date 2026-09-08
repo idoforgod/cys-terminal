@@ -8817,6 +8817,46 @@ mod seat_latch_negation_tests {
         );
     }
 
+    /// ★[triage · claude blocking] **gemini 좌석의 관문 증거 이월이 영구 거짓이다(치명위험 ③).**
+    ///
+    /// `composer_marker_of` 는 `prompt_marker → ready_marker` 순서로 해소한다. gemini 는 실측 프레임이
+    /// 없어 `prompt_marker` 를 선언하지 않았으므로(정당한 선택) 해소 결과는 **`? for shortcuts`**
+    /// — composer 행의 글리프가 아니라 **상태줄 문면**이다. 그러면 `scan_composer` 가 상태줄을 마커
+    /// 줄로 잡아 강한 증거(마커 **아래** 괘선·상태줄)도 약한 증거(마커 **위** 상태줄)도 설 수 없고,
+    /// `gate_carry_ok` 는 어떤 유휴 화면에서도 거짓이다. 관문·모달을 한 번이라도 본 gemini 좌석은
+    /// 그 부트에서도, `gate_pending` 재관측 채택에서도 영원히 `carry-unproven` 보류 = **역할
+    /// 디렉티브 미주입**(부트 체인 치명위험 ③). 검체는 codex 어댑터가 플레이스홀더로 이 자리를
+    /// 어떻게 닫았는지를 대조군으로 함께 잰다.
+    #[test]
+    fn triage_wp5_gemini_seat_can_prove_carry_evidence_after_a_gate() {
+        let embed = embedded_agents_json().expect("임베드 agents.json");
+        let marker = composer_marker_of(&embed["gemini"]);
+        let placeholder = composer_placeholder_of(&embed["gemini"]);
+        // gemini 유휴 화면 2형상(상태줄이 composer 아래 / 위) — 둘 다 사람이 볼 수 있는 정상 화면이다.
+        let below = "  각성 확인 완료.\n────────────────────────\n>\n────────────────────────\n? for shortcuts                     Gemini 3.8 Flash · hig\n";
+        let above = "  각성 확인 완료.\n? for shortcuts                     Gemini 3.8 Flash · hig\n>\n";
+        for (name, screen) in [("상태줄이 아래", below), ("상태줄이 위", above)] {
+            assert!(
+                gate_carry_ok(true, false, marker.as_deref(), placeholder.as_deref(), screen, Some(true)),
+                "{name}: 관문을 본 gemini 좌석이 정상 유휴 화면에서도 이월을 풀지 못한다 \
+                 (carry-unproven 영구 보류 = 디렉티브 미주입 · 치명위험 ③)"
+            );
+        }
+        // 대조군 — codex 는 같은 자리를 플레이스홀더로 닫았다(기구가 죽은 것이 아니라 데이터 문제다).
+        let codex_idle = "• ACK\n\n────────────────────────\n\n\n› Ask Codex to do anything\n\n  gpt-6-astra medium · ~/dev\n";
+        assert!(
+            gate_carry_ok(
+                true,
+                false,
+                composer_marker_of(&embed["codex"]).as_deref(),
+                composer_placeholder_of(&embed["codex"]).as_deref(),
+                codex_idle,
+                Some(true)
+            ),
+            "대조군 붕괴: codex 도 못 푼다면 이 검체는 gemini 고유의 결함을 재지 못한다"
+        );
+    }
+
     /// ★(0.14.31 · 리뷰 R2 · codex major) 관문 보류 채택이 복원 연속 지시([RESTORE]/[RECOVER])를 잃지 않는다 —
     /// 지시는 **첫 표식**에 실리고(`mark_gate_pending` 의 `followup`), 채택은 해제 전에 표식에서 읽어 전문 뒤에
     /// **한 제출**로 잇는다. 순수 함수는 직접 실행하고, 배선(세 호출부가 지시를 넘기는가 · 채택이 읽는가)은 소스로 잰다.

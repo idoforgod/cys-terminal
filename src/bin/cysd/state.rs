@@ -8854,6 +8854,73 @@ mod tests {
         );
     }
 
+    /// ★[triage · codex blocking] **가드는 "지금 승인 대기 중" 을 정상 기대값으로 채택하면 안 된다.**
+    ///
+    /// `governance::deliver_head_locked` 는 마지막 게이트 **뒤에** `approval_or_gate_pending` 을 한 번 더
+    /// 읽어 그 값을 `expect_approval` 로 심는다. 그 사이(게이트 통과 ↔ 가드 생성)에 승인 feed 가
+    /// 생기면 기대값이 `true` 로 굳고, `axes_moved()` 는 `p() != expect_approval` 만 보므로 승인이
+    /// **계속 대기 중이어도** writer 가 본문+CR 을 그대로 쓴다 — 승인 창에 Return 을 넣는 것이
+    /// 정본 §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다")이 금지한 바로 그 동작이다.
+    #[test]
+    fn triage_wp5_guard_must_not_adopt_a_pending_approval_as_its_expectation() {
+        use super::{ApprovalProbe, InjectGuard};
+        use std::sync::{atomic::AtomicU64, Arc};
+
+        let probe: ApprovalProbe = Arc::new(|| true); // 승인은 계속 대기 중이다
+        let guard = InjectGuard::new(None, Arc::new(AtomicU64::new(4)), true, Some(probe));
+        assert!(
+            !guard.claim_for_write(),
+            "승인이 대기 중인데 writer 가 쓰기로 확정했다 — 기대값 true 가 승인 축을 통째로 면제한다"
+        );
+    }
+
+    /// ★[triage · codex blocking] **호출부의 ACK 가 writer 의 안전 재검사를 무력화한다.**
+    ///
+    /// `claim_for_write` 는 `PENDING→CLAIMED` CAS 로 소유권을 **공개한 뒤** 승인·세대를 다시 본다.
+    /// 그 두 번째 관측은 승인 탐침(데몬 락)을 부르므로 짧지 않고, 그 창에서 호출부의 `settle` 이
+    /// CLAIMED 를 수확(`ACKED`)하면 늦은 중단 CAS 가 실패해 **바뀐 판정 재료를 보고도 쓴다**.
+    /// 재검사가 끝나기 전에는 성공을 수확할 수 없어야 한다(쓰기 권한과 배달 보고의 분리).
+    #[test]
+    fn triage_wp5_ack_must_not_defeat_the_writer_late_abort() {
+        use super::{ApprovalProbe, InjectGuard, INJECT_ACKED, INJECT_CLAIMED, INJECT_PENDING};
+        use std::sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, OnceLock, Weak,
+        };
+
+        let slot: Arc<OnceLock<Weak<InjectGuard>>> = Arc::new(OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (s2, c2) = (Arc::clone(&slot), Arc::clone(&calls));
+        // 탐침은 ① 첫 호출(CAS 앞) = 승인 없음 ② 두 번째 호출(CAS 뒤 재검사) = 그 창에서 호출부가
+        // CLAIMED 를 수확했고 승인이 떴다 — 를 재현한다(스레드 타이밍에 기대지 않는다).
+        let probe: ApprovalProbe = Arc::new(move || {
+            let n = c2.fetch_add(1, Ordering::AcqRel);
+            if n == 0 {
+                return false;
+            }
+            if let Some(g) = s2.get().and_then(Weak::upgrade) {
+                // 호출부(watchdog)의 수확 — settle 이 CLAIMED 를 보고 ACKED 로 굳힌다.
+                let _ = g.state.compare_exchange(
+                    INJECT_CLAIMED,
+                    INJECT_ACKED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            true // 그 사이 승인·모달이 떴다
+        });
+        let guard =
+            Arc::new(InjectGuard::new(None, Arc::new(AtomicU64::new(4)), false, Some(probe)));
+        let _ = slot.set(Arc::downgrade(&guard));
+        assert_eq!(guard.state.load(Ordering::Acquire), INJECT_PENDING, "전제: 미결판");
+        let writes = guard.claim_for_write();
+        assert_eq!(calls.load(Ordering::Acquire), 2, "전제: 재검사가 실제로 두 번 돌았다");
+        assert!(
+            !writes,
+            "호출부가 CLAIMED 를 수확한 뒤에는 승인이 떠도 writer 가 그대로 쓴다 — 안전 재검사가 죽는다"
+        );
+    }
+
     #[test]
     fn wp5_r1_cx_inject_concurrent_write_and_queue_decisions_agree() {
         use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED};
