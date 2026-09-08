@@ -477,9 +477,24 @@ pub fn signing_secret() -> Option<Vec<u8>> {
     }
     // ② 0600 파일(pack 밖 ~/.cys/ 하위) — Keychain crate 부재라 1차 경로.
     let path = secret_path();
-    if let Ok(d) = std::fs::read(&path) {
-        if !d.is_empty() {
-            return Some(d);
+    match std::fs::read(&path) {
+        Ok(d) if !d.is_empty() => return Some(d),
+        // 0바이트 = 미완성 쓰기의 잔재. 잃을 것이 없으므로 아래에서 새로 만든다.
+        Ok(_) => {}
+        // 부재 = 아직 만들지 않았다(정상 초기 상태) → 아래에서 만든다.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // ★(독립 재유도 · codex 설계비평 #15) **읽지 못한 시크릿은 덮어쓰지 않는다.**
+        //   종전엔 권한 오류·IO 오류도 '없음'으로 접고 새 시크릿을 그 자리에 썼다 — 성공하면
+        //   기존 승인 **전부**가 서명 불일치로 영구 무효가 된다(승인 저장소 되쓰기와 같은
+        //   클래스의 파괴). 모르면 서명 능력을 포기한다: 호출부는 미서명 취급(fail-closed)이라
+        //   방향은 '거부'이고, 사람이 권한을 고치면 그대로 돌아온다.
+        Err(e) => {
+            eprintln!(
+                "cysd: 승인 시크릿을 읽지 못했다({}: {e}) — 새로 만들지 않고 미서명으로 접는다\
+                 (기존 승인을 무효화하지 않기 위함 · 권한을 고치면 복구된다)",
+                path.display()
+            );
+            return None;
         }
     }
     // ③ 생성 + 0600 저장.
@@ -561,20 +576,36 @@ fn ttl_records_path() -> PathBuf {
 }
 
 /// 한 파일에서 레코드 목록 디코드: `{"records":[...]}` 또는 bare 배열 둘 다(cmux 하위호환).
-fn load_records_from(path: &PathBuf) -> Vec<ApprovalRecord> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
+///
+/// ★(0.14.31 · 독립 재유도 · codex blocking #4) **부재와 실패를 가른다.** 종전 판은 열기 실패도
+/// 파싱 실패도 `Vec::new()` 로 접었고, 호출부(`mutate_records`)는 그 빈 목록을 **그대로 저장**
+/// 했다 — 권한이 막힌 파일·레코드 하나가 깨진 파일이 아무 `approval.check` 한 번에
+/// `{"records":[]}` 로 갈아끼워졌다(사람이 서명한 승인의 영구 파괴 · tmp→rename 은 상위
+/// 디렉터리 권한만 있으면 성공한다). 그래서:
+///   · 파일 **부재** → `Ok(vec![])` (승인이 아직 없다 — 정상 상태다)
+///   · 그 밖의 IO 오류·JSON 파싱 실패 → `Err` → 호출부는 **쓰기 없이 트랜잭션을 중단**한다.
+/// 판정 방향은 그대로 fail-closed 다: 읽지 못한 저장소는 "승인 없음"으로 답한다(거부).
+fn load_records_from(path: &PathBuf) -> Result<Vec<ApprovalRecord>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: 읽기 실패: {e}", path.display())),
     };
+    // 빈 파일은 '아직 아무 것도 안 썼다'로 읽는다(0바이트는 JSON 이 아니다 — 여기서 Err 로
+    // 접으면 첫 서명 전 상태의 데몬이 승인을 만들 수 없다).
+    if content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     // ① {"records":[...]} 형태
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
         if let Some(arr) = v.get("records") {
-            if let Ok(recs) = serde_json::from_value::<Vec<ApprovalRecord>>(arr.clone()) {
-                return recs;
-            }
+            return serde_json::from_value::<Vec<ApprovalRecord>>(arr.clone())
+                .map_err(|e| format!("{}: records 디코드 실패: {e}", path.display()));
         }
     }
     // ② bare 배열
-    serde_json::from_str::<Vec<ApprovalRecord>>(&content).unwrap_or_default()
+    serde_json::from_str::<Vec<ApprovalRecord>>(&content)
+        .map_err(|e| format!("{}: JSON 디코드 실패: {e}", path.display()))
 }
 
 /// 저장 포맷: `{"records":[...]}` 또는 bare 배열 둘 다 디코드(cmux 하위호환).
@@ -583,15 +614,23 @@ fn load_records_from(path: &PathBuf) -> Vec<ApprovalRecord> {
 /// 같은 `id` 가 양쪽에 있으면 **TTL 쪽이 이긴다**: 그 상태는 분리 저장 중 중단(TTL 먼저 쓰고
 /// 공용을 쓰기 전에 죽음)에서만 생기고, 그때 살아 있는 사실은 만료를 포함한 TTL 판이다.
 pub fn load_records() -> Vec<ApprovalRecord> {
-    let ttl = load_records_from(&ttl_records_path());
-    let main = load_records_from(&records_path());
+    // 읽기·파싱 실패는 **승인 없음**으로 답한다(fail-closed). 저장은 하지 않는다 —
+    // 그 결정은 `try_load_records` 를 직접 쓰는 `mutate_records` 가 한다.
+    try_load_records().unwrap_or_default()
+}
+
+/// [`load_records`] 의 **실패를 숨기지 않는** 판 — 두 저장소 중 하나라도 읽거나 파싱하지
+/// 못하면 `Err`. 되쓰기 여부를 결정하는 트랜잭션(`mutate_records`)만 이 판을 쓴다.
+pub fn try_load_records() -> Result<Vec<ApprovalRecord>, String> {
+    let ttl = load_records_from(&ttl_records_path())?;
+    let main = load_records_from(&records_path())?;
     let ttl_ids: std::collections::HashSet<&str> = ttl.iter().map(|r| r.id.as_str()).collect();
     let mut out: Vec<ApprovalRecord> = main
         .into_iter()
         .filter(|r| !ttl_ids.contains(r.id.as_str()))
         .collect();
     out.extend(ttl);
-    out
+    Ok(out)
 }
 
 /// atomic write: tmp 작성·0600 부여 후 rename. 디렉토리 자동 생성.
@@ -601,7 +640,11 @@ fn save_records_to(path: &PathBuf, records: &[&ApprovalRecord]) -> Result<(), St
     }
     let body = serde_json::to_string_pretty(&serde_json::json!({"records": records}))
         .map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    // ★(독립 재유도 · codex major #5 ②) tmp 이름에 **pid** 를 넣어 writer 를 분리한다.
+    //   같은 `$HOME` 에 부서 데몬이 여럿 뜨는 배치에서 공용 `<name>.json.tmp` 하나를 두면,
+    //   A 가 쓰는 중인 tmp 를 B 가 덮어쓰고 A 가 그 **B 의 내용**을 rename 하는 창이 있다.
+    //   rename 은 같은 디렉터리 안이므로 원자성은 그대로다.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, body.as_bytes()).map_err(|e| e.to_string())?;
     set_owner_only(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
@@ -632,14 +675,46 @@ pub fn save_records(records: &[ApprovalRecord]) -> Result<(), String> {
 /// 【계약】 이 함수 **안에서** 다시 읽고, 변경하고, 쓴다. 프로세스 안의 모든 변경은 이 뮤텍스로
 /// 직렬화된다. 프로세스 **밖**(같은 HOME 의 다른 데몬)은 여전히 경쟁할 수 있다 — 그것은 이
 /// 저장소가 처음부터 안고 있던 성질이고(파일 락 없음), 이 커밋의 범위 밖이다.
-pub fn mutate_records<R>(f: impl FnOnce(&mut Vec<ApprovalRecord>) -> R) -> (R, Result<(), String>) {
+///
+/// ★(0.14.31 · 독립 재유도) 이 트랜잭션이 파일을 **쓰는 조건**은 둘 다 참일 때뿐이다:
+///   ① 두 저장소를 **읽어냈다**(`try_load_records` 가 `Ok`) — 읽지 못한 파일을 빈 목록으로
+///      되쓰면 사람이 서명한 승인이 영구 소멸한다(codex blocking #4).
+///   ② 클로저가 목록을 **실제로 바꿨다** — 무매칭 `approval.check` 하나까지 두 파일을
+///      tmp→rename 으로 갈아끼우면, 그 사이 다른 부서 데몬이 서명한 승인이 이 스냅샷에
+///      덮여 사라진다(프로세스 뮤텍스 밖 갱신 손실 · claude major / codex major #5).
+/// 변경 판정은 **직렬화 동등성**이다: 필드 하나가 늘어도 자동으로 따라오고, `updated_at`
+/// 재서명처럼 진짜 변경은 반드시 다르게 나온다. 승인 목록은 수십 건 규모라 비용이 무시된다.
+/// 읽기에 실패하면 클로저는 **빈 목록** 위에서 돌고(호출부는 "승인 없음"으로 답한다 —
+/// fail-closed) 저장은 하지 않으며, 실패 사유가 `Err` 로 나간다.
+pub fn mutate_records<R>(
+    f: impl FnOnce(&mut Vec<ApprovalRecord>) -> R,
+) -> (Option<R>, Result<(), String>) {
     static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // poison 되어도 승인 저장은 계속돼야 한다(잠금 목적은 순서 직렬화뿐 — 불변식 보호가 아니다).
     let _g = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut records = load_records();
+    let mut records = match try_load_records() {
+        Ok(r) => r,
+        Err(e) => {
+            // ★읽지 못한 저장소는 **건드리지 않고, 클로저도 돌리지 않는다**(codex 설계비평 #9):
+            //   빈 목록 위에서 돌리면 "실패 상태에서 변형·부수효과를 실행한다"는 계약이 되고,
+            //   호출부가 그 결과를 성공과 구별할 수 없다. `None` 이 곧 "판정하지 못했다"이고,
+            //   호출부는 그것을 **거부**로 접는다(fail-closed).
+            return (None, Err(format!("승인 저장소를 읽지 못해 트랜잭션을 중단했다 — {e}")));
+        }
+    };
+    let before = fingerprint(&records);
     let out = f(&mut records);
+    if before.is_some() && fingerprint(&records) == before {
+        return (Some(out), Ok(())); // 변경 없음 = 쓸 이유 없음(경합 반경 0).
+    }
     let saved = save_records(&records);
-    (out, saved)
+    (Some(out), saved)
+}
+
+/// 변경 판정용 지문 — 직렬화 실패(사실상 불가)는 `None` 으로 두고 "변경됐다"로 접는다
+/// (모르면 쓰는 쪽이 데이터 보존 방향이다).
+fn fingerprint(records: &[ApprovalRecord]) -> Option<Vec<u8>> {
+    serde_json::to_vec(records).ok()
 }
 
 /// 신규 레코드 id 생성: epoch초 + 프로세스 카운터(동일 초 충돌 차단).

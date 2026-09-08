@@ -8062,14 +8062,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"approved": false, "ttl_enforced": require_ttl}),
                 ));
             };
-            let now_check_ttl = crate::state::now_epoch();
             // ★(0.14.31 · R2 · codex major) 읽기-변경-쓰기를 **한 트랜잭션**으로 묶는다. 종전엔
             //   스냅샷을 뜨고 한참 뒤 그 스냅샷 전체를 되써서, 그 사이 추가된 승인이 사라졌다
             //   (갱신 손실 · 저장소가 둘로 나뉜 뒤에는 일반 검사가 TTL 파일까지 덮는다).
             // ★(0.14.31 · codex 적대검증) 갱신 대상은 **검증한 그 자리(인덱스)** 다. 종전처럼
             //   `id` 로 다시 찾으면, 같은 id 를 가진 **서명 무효 위조 레코드**를 앞에 끼워 넣은
             //   공격자가 검증받은 적 없는 그 레코드를 데몬 손으로 정당 서명시킬 수 있다(서명 세탁).
+            // ★`hit` 이 이중 Option 인 이유: 바깥은 "트랜잭션이 돌았는가"(저장소를 읽지 못하면
+            //   `None` — 그 자체가 거부다), 안쪽은 "매칭이 있었는가"다. 둘을 flatten 해 **거부로
+            //   합류**시킨다 — 읽기·잠금 실패가 `approved:true` 와 만날 수 있는 경로가 없다.
             let (hit, _saved) = crate::approval::mutate_records(|records| {
+                // ★(독립 재유도 · codex major #6) **시각은 잠금 안에서 뜬다.** 종전엔 트랜잭션
+                //   **밖에서** 뜬 뒤 저장소 잠금을 기다렸다 — 다른 트랜잭션이 저장소를 붙잡고
+                //   있는 동안 만료가 지나가면, 대기가 끝난 뒤에도 낡은 시각으로 매칭해
+                //   **만료된 승인이 exit 0** 을 받았다(게이트 면제). 이 자리에서 뜬 값 하나로
+                //   선택(`is_expired`)과 응답의 `expires_at` 을 **같이** 판정한다.
+                let now_check_ttl = crate::state::now_epoch();
                 let hit = crate::approval::best_match_index_at(
                     records,
                     &secret,
@@ -8079,6 +8087,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     now_check_ttl,
                     require_ttl,
                 )
+                .filter(|i| {
+                    // 응답 계약 재확인: 고른 레코드의 만료가 **이 시각 기준으로도** 미래인가.
+                    // (선택 필터와 같은 시각이라 정상 경로에서는 항상 참이다 — 선택 규칙이
+                    //  바뀌어 만료 검사가 빠지면 여기서 드러난다.)
+                    records[*i].expires_at.is_none_or(|e| e > now_check_ttl)
+                })
                 .map(|i| {
                     (i, records[i].id.clone(), records[i].command_prefix.clone(), records[i].expires_at)
                 });
@@ -8092,7 +8106,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 hit
             });
-            match hit {
+            // `_saved` 는 매칭 성공 시의 `updated_at`(lastUsed) 기록 실패를 뜻한다 — 승인 자체는
+            // 디스크의 서명으로 이미 유효하므로 판정을 뒤집지 않는다(장부 갱신 실패 ≠ 미승인).
+            match hit.flatten() {
                 Some((_matched_idx, matched_id, matched_prefix, matched_expires_at)) => {
                     daemon.bus.publish(
                         "autopilot.approval_checked",
@@ -8250,9 +8266,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let new_id = rec.id.clone();
             let new_expires_at = rec.expires_at;
             // ★(R2) 추가도 같은 트랜잭션을 탄다 — 다른 요청의 검사가 이 승인을 덮어쓰지 못한다.
-            let ((), saved) = crate::approval::mutate_records(move |records| {
+            let (ran, saved) = crate::approval::mutate_records(move |records| {
                 records.push(rec);
             });
+            // 저장소를 읽지 못하면 클로저 자체가 돌지 않는다(`None`) — 그 경우도 실패다.
+            // 손상된 저장소 위에 새 승인을 얹어 **덮어쓰지 않는다**: 사람이 원인을 고쳐야 한다.
+            if ran.is_none() {
+                return Reply::Single(err_response(
+                    &id,
+                    "persist_failed",
+                    &saved.err().unwrap_or_else(|| "승인 저장소를 읽지 못했다".to_string()),
+                ));
+            }
             if let Err(e) = saved {
                 return Reply::Single(err_response(&id, "persist_failed", &e));
             }
@@ -19614,6 +19639,191 @@ mod tests {
                 "만료된 승인이 require_ttl={require} 에서 통과했다: {r7}"
             );
         }
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(codex blocking #4 · claude major) **읽지 못한 저장소를 되쓰지 않는다.**
+    ///
+    /// `load_records_from` 은 열기 실패도 파싱 실패도 `Vec::new()` 로 접는다. `mutate_records`
+    /// 는 **매칭 실패에도** 그 빈 목록을 그대로 저장하므로, 아무 `approval.check` 한 번이
+    /// 멀쩡한 승인 파일을 `{"records":[]}` 로 갈아끼운다(tmp→rename 은 상위 디렉터리 권한만
+    /// 있으면 성공한다). 레코드 하나의 역직렬화 오류도 파일 전체에 같은 결과를 낸다.
+    #[test]
+    fn approval_check_never_rewrites_a_store_it_could_not_read() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("ttl-wipe", r#"{"default":"allow","rules":[]}"#);
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        let caller = 993_401_u32;
+        let _sid = setup_master(&daemon, caller);
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch() - 120.0);
+
+        // ① 유효한 TTL 승인 1건(데몬 손으로 서명 — 시크릿을 몰라도 된다).
+        let sign = Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({"command_prefix": ["git", "push"], "cwd": "/tmp", "ttl_secs": 3600}),
+        };
+        let Reply::Single(r1) = dispatch(&daemon, sign, Some(caller)) else { panic!() };
+        assert_eq!(r1["ok"], json!(true), "서명 실패: {r1}");
+        let ttl_path = dir.join(".cys").join("approvals-ttl.json");
+        let good = std::fs::read(&ttl_path).expect("TTL 저장소 미생성");
+        assert!(!good.is_empty());
+
+        // ② 파싱 실패(포터블) — 레코드 하나가 깨진 파일. 나머지 한 건은 여전히 살아 있는 승인이다.
+        let broken = format!(
+            "{{\"records\":[{},{{\"id\":\"half-written\"}}]}}",
+            String::from_utf8_lossy(&good)
+                .split_once("[")
+                .and_then(|(_, r)| r.rsplit_once("]"))
+                .map(|(inner, _)| inner.to_string())
+                .unwrap_or_default()
+        );
+        std::fs::write(&ttl_path, broken.as_bytes()).unwrap();
+        let before = std::fs::read(&ttl_path).unwrap();
+        assert!(
+            crate::approval::load_records().is_empty(),
+            "검체 전제 미성립: 깨진 파일이 그대로 읽혔다"
+        );
+        let Reply::Single(_) =
+            dispatch(&daemon, approval_check_req("echo nothing-matches", "/tmp", false), Some(caller))
+        else { panic!() };
+        assert_eq!(
+            std::fs::read(&ttl_path).unwrap(),
+            before,
+            "파싱 못 한 승인 저장소를 무매칭 검사 하나가 되썼다 — 승인 기록이 영구 소멸한다"
+        );
+
+        // ③ 읽기 실패(unix) — 상위 디렉터리는 쓰기 가능한 채 파일만 못 읽는 상태.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&ttl_path, &good).unwrap();
+            std::fs::set_permissions(&ttl_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                std::fs::read_to_string(&ttl_path).is_err(),
+                "검체 전제 미성립: 권한 0000 파일이 읽힌다(root 실행?)"
+            );
+            let Reply::Single(_) = dispatch(
+                &daemon,
+                approval_check_req("echo nothing-matches", "/tmp", false),
+                Some(caller),
+            ) else { panic!() };
+            std::fs::set_permissions(&ttl_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                std::fs::read(&ttl_path).unwrap(),
+                good,
+                "읽지 못한 승인 저장소를 빈 목록으로 덮어썼다 — 유효 승인이 영구 삭제된다"
+            );
+        }
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(claude major · codex major #5) **무매칭 검사는 저장소를 건드릴 이유가 없다.**
+    ///
+    /// 지금은 `approval.check` 가 매칭 실패에도 두 파일을 tmp→rename 으로 갈아끼운다. 그래서
+    /// ①읽지 못한 파일이 빈 목록으로 교체되고(위 검체) ②같은 HOME 의 다른 부서 데몬이 그 사이
+    /// 새로 서명한 TTL 승인이 이 스냅샷에 덮여 사라진다(프로세스 뮤텍스 밖 갱신 손실). 종전에는
+    /// 공용 파일 하나였던 그 노출이 **신설 TTL 파일까지** 넓어졌다.
+    /// inode 로 재는 이유: 내용이 같아도 rename 은 새 파일을 만든다(경합 창은 그 사이에 있다).
+    #[test]
+    #[cfg(unix)]
+    fn approval_check_that_matches_nothing_leaves_the_store_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("ttl-notouch", r#"{"default":"allow","rules":[]}"#);
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        let caller = 993_403_u32;
+        let _sid = setup_master(&daemon, caller);
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch() - 120.0);
+        let sign = Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({"command_prefix": ["git", "push"], "cwd": "/tmp", "ttl_secs": 3600}),
+        };
+        let Reply::Single(r1) = dispatch(&daemon, sign, Some(caller)) else { panic!() };
+        assert_eq!(r1["ok"], json!(true), "서명 실패: {r1}");
+
+        let ttl_path = dir.join(".cys").join("approvals-ttl.json");
+        let before = std::fs::metadata(&ttl_path).unwrap().ino();
+        let Reply::Single(rc) =
+            dispatch(&daemon, approval_check_req("echo nothing-matches", "/tmp", false), Some(caller))
+        else { panic!() };
+        assert_eq!(rc["result"]["approved"], json!(false), "{rc}");
+        assert_eq!(
+            std::fs::metadata(&ttl_path).unwrap().ino(),
+            before,
+            "무매칭 검사가 TTL 저장소를 되썼다 — 다른 데몬이 그 사이 서명한 승인을 덮는다"
+        );
+
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(codex major #6) **만료는 잠금을 얻은 뒤의 시각으로 판정해야 한다.**
+    ///
+    /// `approval.check` 는 `now_check_ttl` 을 저장소 트랜잭션 **밖에서** 뜬 뒤 잠금을 기다린다.
+    /// 다른 승인 트랜잭션이 저장소를 붙잡고 있는 동안 만료가 지나가면, 대기가 끝난 뒤에도
+    /// 낡은 시각으로 매칭해 **만료된 승인이 exit 0** 을 받는다.
+    #[test]
+    fn approval_check_rechecks_expiry_after_it_gets_the_store_lock() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("ttl-lockwait", r#"{"default":"allow","rules":[]}"#);
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        let caller = 993_402_u32;
+        let _sid = setup_master(&daemon, caller);
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch() - 120.0);
+
+        // 1초짜리 TTL 승인.
+        let sign = Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({"command_prefix": ["git", "push"], "cwd": "/tmp", "ttl_secs": 1}),
+        };
+        let Reply::Single(r1) = dispatch(&daemon, sign, Some(caller)) else { panic!() };
+        assert_eq!(r1["ok"], json!(true), "서명 실패: {r1}");
+
+        // 다른 승인 트랜잭션이 저장소를 2.5초 붙잡는다(정상 경합 — 잠금은 그러라고 있다).
+        let holder = std::thread::spawn(|| {
+            let (_, _) = crate::approval::mutate_records(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+            });
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let t0 = crate::state::now_epoch();
+        let Reply::Single(rc) =
+            dispatch(&daemon, approval_check_req("git push origin main", "/tmp", true), Some(caller))
+        else { panic!() };
+        let waited = crate::state::now_epoch() - t0;
+        let _ = holder.join();
+        assert!(waited > 1.5, "잠금 대기가 재현되지 않았다({waited}s) — 검체 전제 미성립");
+        assert_eq!(
+            rc["result"]["approved"],
+            json!(false),
+            "잠금 대기 이전 시각으로 검사해 만료된 승인이 통과했다({waited}s 대기): {rc}"
+        );
 
         match prev_home {
             Some(h) => std::env::set_var("HOME", h),

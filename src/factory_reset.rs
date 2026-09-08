@@ -46,7 +46,15 @@ const CYS_BASE_EXACT: [&str; 25] = [
 
 /// ~/.cys 직하에서 격리하는 정확 이름(2차) — 배열 상수 길이 고정을 피하려 분리하지 않고
 /// 접두로 못 잡는 단건들을 이어 담는다.
-const CYS_BASE_EXACT2: [&str; 6] = [
+const CYS_BASE_EXACT2: [&str; 9] = [
+    // ★(0.14.31 · 독립 재유도) TTL 승인 전용 저장소와 두 저장소의 **원자적 쓰기 잔재**.
+    //   0.14.31 이 `expires_at` 레코드를 `approvals-ttl.json` 으로 분리했는데 인벤토리는
+    //   `approvals.json` 하나였다 → 초기화 뒤에도 미만료 승인이 남는다(시크릿을 env 로 고정한
+    //   배치에서는 **그대로 유효한 승인**이다 — 초기화라는 사람의 명시 행위가 조용히 면제된다).
+    //   구 판이 남긴 pid 없는 tmp 이름도 함께 담는다(현행 tmp 는 `is_approval_tmp` 가 잡는다).
+    "approvals-ttl.json",
+    "approvals.json.tmp",
+    "approvals-ttl.json.tmp",
     ".pending-restore",
     "ime-debug",
     "allow-app-mouse",
@@ -66,6 +74,20 @@ const CYS_BASE_PREFIX: [&str; 4] = [
     ".pack-staging",
     ".master-bootstrapped",
 ];
+
+/// 승인 저장소의 **원자적 쓰기 잔재**를 이름으로 판정한다 — `approvals.json.<pid>.tmp` ·
+/// `approvals-ttl.json.<pid>.tmp`(approval.rs 의 tmp 규약 · writer 별 분리를 위해 pid 가 붙는다).
+///
+/// ★왜 접두 규칙(`CYS_BASE_PREFIX`)에 넣지 않는가: `approvals` 접두를 열면 오너가 둔
+/// `approvals-notes.md` 같은 **미등록 파일 보존** 계약이 접두에 진다(P2-2 ④ 와 같은 역전).
+/// 그래서 pid 자리가 실제로 숫자일 때만 잔재로 인정한다(넓히지 않는다).
+fn is_approval_tmp(name: &str) -> bool {
+    ["approvals.json.", "approvals-ttl.json."].iter().any(|base| {
+        name.strip_prefix(base)
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
 
 /// 기본 보존(오너 구매물) — `purge_license` 로만 격리 대상이 된다. 파일명 지식은 정적 핀
 /// (라이선스 파일명 리터럴은 license.rs에만)에 따라 license 표면에서 가져온다.
@@ -512,6 +534,7 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
             let is_dir = path.is_dir();
             let known = CYS_BASE_EXACT.contains(&name.as_str())
                 || CYS_BASE_EXACT2.contains(&name.as_str())
+                || (!is_dir && is_approval_tmp(&name))
                 || CYS_BASE_PREFIX
                     .iter()
                     .any(|p| name.starts_with(p) && (is_dir || !p.ends_with('-')));
@@ -2507,6 +2530,51 @@ mod tests {
             .quarantine
             .iter()
             .any(|i| i.path.ends_with(crate::license::LICENSE_BASENAMES[0])));
+    }
+
+    /// ★(독립 재유도 · claude major / codex minor) 승인 저장소는 **전부** 초기화 대상이다.
+    /// 0.14.31 이 TTL 레코드를 새 파일(`~/.cys/approvals-ttl.json`)로 분리했는데 초기화
+    /// 인벤토리는 `approvals.json`·`.approval-secret` 그대로다 → 초기화 뒤에도 미만료 승인이
+    /// 남는다(시크릿을 env 로 고정한 배치에서는 **그대로 유효한 승인**이다).
+    #[test]
+    fn plan_quarantines_every_approval_store() {
+        let td = test_home("approvals");
+        let r = fake_roots(&td);
+        touch(&r.cys_base.join("approvals.json"), "{\"records\":[]}");
+        touch(&r.cys_base.join("approvals-ttl.json"), "{\"records\":[]}");
+        touch(&r.cys_base.join(".approval-secret"), "s");
+        let plan = build_plan(&r, &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        for name in ["approvals.json", ".approval-secret", "approvals-ttl.json"] {
+            assert!(
+                plan.quarantine.iter().any(|i| i.path.ends_with(name)),
+                "초기화가 {name} 를 남긴다 — 초기화 뒤에도 승인이 살아 있다"
+            );
+        }
+    }
+
+    /// ★(독립 재유도) 승인 저장소의 **원자적 쓰기 잔재**도 초기화 대상이다 — 그 tmp 는
+    /// rename 직전까지 승인 레코드 전문을 담고 있어, 남기면 초기화 뒤에도 승인 내용이 남는다.
+    /// 반대로 이름이 비슷할 뿐인 **오너 파일은 보존**한다(미등록 보존 계약이 접두에 지면 안 된다).
+    #[test]
+    fn plan_sweeps_approval_write_leftovers_but_keeps_owner_files() {
+        let td = test_home("approval-tmp");
+        let r = fake_roots(&td);
+        let pid_tmp = format!("approvals-ttl.json.{}.tmp", std::process::id());
+        touch(&r.cys_base.join(&pid_tmp), "{}");
+        touch(&r.cys_base.join("approvals.json.4242.tmp"), "{}");
+        touch(&r.cys_base.join("approvals.json.tmp"), "{}"); // 구 판(pid 없는 이름)
+        touch(&r.cys_base.join("approvals-notes.md"), "owner");
+        let plan = build_plan(&r, &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        for name in [pid_tmp.as_str(), "approvals.json.4242.tmp", "approvals.json.tmp"] {
+            assert!(
+                plan.quarantine.iter().any(|i| i.path.ends_with(name)),
+                "{name} 가 남는다 — 승인 레코드 전문이 초기화 뒤에도 디스크에 있다"
+            );
+        }
+        assert!(
+            plan.keep.iter().any(|i| i.path.ends_with("approvals-notes.md")),
+            "이름만 비슷한 오너 파일을 격리했다(미등록 보존 계약 위반)"
+        );
     }
 
     /// 트립와이어(설계 §7): plan 은 $HOME 자신·홈 밖·보호 루트를 절대 포함하지 않는다.
