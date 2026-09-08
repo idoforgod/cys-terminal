@@ -11038,6 +11038,13 @@ mod tests {
     /// (마커/무마커 두 분기)가 **무조건** `Some(recheck)` 를 넘기고, `handoff_gate_ok` 의 승인 재확인은
     /// `match rc.marker` 보다 **앞**이라 alt·비-alt·세대 변화와 무관하게 돈다.
     /// 이 검체는 그 사실을 alt-screen 좌석에서 **런타임으로** 확인한다(HEAD 에서 초록 = 반증).
+    ///
+    /// ★(수렴 R2 · codex 본문 caveat 정정) 하네스 정직: 이 검체는 선재 헬퍼 `wp5_seat` 를 쓰고 그
+    /// 헬퍼는 `create_surface(.., Some("sleep 30"), ..)` 로 **실 PTY 자식을 띄운다** — triage 보고서의
+    /// "신규 검체는 새 프로세스 의존 0" 은 부정확했다(새 `ps`·launchd·flock 호출은 여전히 0이고,
+    /// 선재 하네스 재사용이라 이 diff 가 새로 만든 위험은 아니다). Windows 레인에서 그 스폰이 실패하면
+    /// 이 검체는 결함이 아니라 하네스 사유로 적색이 된다 — `windows-health.yml` 의 `--bin cysd` 스텝은
+    /// `continue-on-error: true`(IG-31 A10 1단계)라 릴리스를 막지는 않는다.
     #[test]
     fn triage_r1wp1hf_alt_screen_handoff_rereads_approval_control() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -11087,24 +11094,42 @@ mod tests {
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부인데 항목이 사라졌다(유실)");
     }
 
-    /// ★(triage R1-WP1-HF · claude major) **약한 레이아웃 증거의 '출력 정적' AND 가 운영 노브
-    /// `CYS_QUEUE_QUIET_SECS=0` 으로 통째로 무효가 된다** — 그 노브는 데몬 자신이 적체 경보의
+    /// ★(triage R1-WP1-HF · claude major A-M1 · **수렴 R2 재핀**) **약한 레이아웃 증거의 '출력 정적'
+    /// AND 는 운영 노브 `CYS_QUEUE_QUIET_SECS` 로 꺼지지 않는다** — 그 노브는 데몬 자신이 적체 경보의
     /// 처방으로 권한다(`alert_queue_depth_if_high` 의 "임계 조정은 CYS_QUEUE_QUIET_SECS").
     ///
-    /// `prompt_gate_input_with_approval` 은 약한 증거의 AND 항으로 판정부 상수
-    /// (`readiness::BOOT_VALVE_QUIET_SECS`)가 아니라 **큐 배달 임계**(`queue_quiet_secs()`)를 넘긴다:
-    ///   `Some(obs.quiet_secs >= quiet)` → `quiet == 0` 이면 항상 `Some(true)`.
-    /// 그러면 "재도색 중 프레임은 정적일 수 없다" 는 유일한 판별 사실이 사라지고, 라벨이 아직 안
-    /// 그려진 선택기(=플레이스홀더 잔여 셀)와 정상 유휴 composer 가 다시 구별되지 않는다.
-    /// 출력이 **지금 흐르는 중**(quiet_secs=0)인 codex alt-screen 프레임에 본문 + Return 이 나간다.
+    /// `prompt_gate_input_with_approval` 은 종전에 약한 증거의 AND 항으로 판정부 상수
+    /// (`readiness::BOOT_VALVE_QUIET_SECS` 3.0)가 아니라 **큐 배달 임계**(`queue_quiet_secs()`)를
+    /// 넘겼다: `Some(obs.quiet_secs >= quiet)`. 그러면 "재도색 중 프레임은 정적일 수 없다" 는 유일한
+    /// 판별 사실이 노브 하나로 사라지고, 라벨이 아직 안 그려진 선택기(=플레이스홀더 잔여 셀)와 정상
+    /// 유휴 composer 가 다시 구별되지 않는다 — 출력이 **지금 흐르는 중**인 codex alt-screen 프레임에
+    /// 본문 + Return 이 나간다(귀결 계급 = 좌석 사망).
     ///
-    /// 기대(조이는 방향): 노브는 **배달 스케줄**을 조정할 뿐 약한 증거의 안전 AND 를 끄지 못한다.
+    /// 【R2 리뷰가 실측한 구멍 · 이 재핀의 이유】 R1 판의 축은 `노브 0 · quiet_secs 0` 하나뿐이었다.
+    /// 그 시나리오는 같은 커밋의 **하한**(`queue_quiet_secs()` 의 `.max(1)`)이 우연히 막아서, A-M1
+    /// 한 줄을 종전 표현으로 되돌려도 검체가 초록이었다(리뷰어 실측: 3 passed) — §17-2 가 스스로
+    /// 경계한 '가장 나쁜 형태의 초록'. 하한만으로는 A-M1 이 닫히지 않는다: 하한이 1 이므로 **운영자가
+    /// 도달할 수 있는 가장 낮은 값**은 1 이고, `노브 1 · quiet_secs 1` 에서 종전 표현은
+    /// `Some(1 >= 1) = Some(true)` 라 약한 증거가 통째로 열린다(리뷰어 probe 실측: 큐 잔량 0 ·
+    /// `blocked_reason` 공백 = 배달됐다).
+    ///
+    /// 【그래서 이 검체가 재는 축】
+    ///   ⓐ 노브를 **운영자가 실제로 도달하는 값**(0→하한 1 · 1 · 2)으로 낮춰도, 정적이 판정부 상수
+    ///      3.0 에 못 미치면 약한 증거는 alt-screen 프레임을 열지 못한다 → `BLOCKED_ALT_SCREEN`.
+    ///   ⓑ 음성 대조 — 같은 노브에서 정적이 그 상수를 넘으면 **배달된다**(이 축이 '항상 거부' 로
+    ///      퇴화하면 ⓐ 는 아무것도 재지 않는다).
+    ///   ⓒ `layout_ok` 자체가 노브에 **독립**이다 — 같은 프레임·같은 quiet 를 노브 1/3/30 으로 돌려
+    ///      판정이 같다(하한이 우연히 막아 주는 경로를 아예 통과하지 않는 순수 술어 축).
+    ///
+    /// 기대(조이는 방향): 노브는 **언제 배달할지**를 조정할 뿐 **무엇을 증거로 볼지**를 바꾸지 못한다.
+    ///
+    /// ★(수렴 R2 · codex 본문 caveat 정정) 하네스 정직: ⓐⓑ 는 선재 헬퍼 `wp5_seat`(실 PTY 자식
+    /// `sleep 30`)를 쓴다 — "새 프로세스 의존 0" 은 부정확했다. ⓒ 는 **같은 좌석**을 재사용하는 순수
+    /// 술어 축이라 추가 스폰이 0이다. Windows 레인의 그 스텝은 `continue-on-error: true` 다.
     #[test]
     fn triage_r1wp1hf_weak_layout_static_and_survives_the_queue_quiet_knob() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_pack, _env) = wp5_env("quietknob");
-        // 운영자가 적체 처방대로 임계를 0 으로 낮췄다(데몬이 가리킨 그 손잡이).
-        let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "0")]);
         let (daemon, s) = wp5_seat("wp5-quietknob", "codex");
         let idle = [
             "  이전 출력 한 줄",
@@ -11115,24 +11140,80 @@ mod tests {
             "",
             "  gpt-6-astra medium · ~/dev/cys-t1/src",
         ];
-        let e = daemon.next_queue_entry("[리뷰 의뢰] 출력 중".into(), None, "test");
-        s.pending_queue.lock().unwrap().push_back(e);
-        s.set_pending_input(0);
-        *s.last_queue_delivery_at.lock().unwrap() = None;
-        paint_screen(&s, &idle, 4, 2, true);
-        quiet_since(&s, 0); // 출력이 방금 흘렀다 — 약한 증거는 이 프레임을 열 수 없어야 한다
-        tick(&daemon);
-        assert_eq!(
-            s.pending_queue.lock().unwrap().len(),
-            1,
-            "노브 하나로 약한 증거의 정적 AND 가 꺼져 재도색 가능 프레임에 배달했다(사유: {})",
-            blocked_reason(&s)
-        );
-        assert_eq!(
-            blocked_reason(&s),
-            BLOCKED_ALT_SCREEN,
-            "사유가 레이아웃 미확인이 아니다 — 다른 축이 우연히 막은 것이면 이 검체는 무효다"
-        );
+        const PH: &str = "Ask Codex to do anything";
+        let arm = |tag: &str| {
+            let e = daemon.next_queue_entry(format!("[리뷰 의뢰] {tag}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+            s.set_pending_input(0);
+            *s.last_queue_delivery_at.lock().unwrap() = None;
+        };
+        // ⓐ 운영자가 적체 처방대로 임계를 낮췄다(데몬이 가리킨 그 손잡이). 정적이 판정부 상수에
+        //    못 미치는 한 어느 노브에서도 약한 증거는 서지 않는다.
+        //    ★노브 1 축이 A-M1 의 **진짜 핀**이다 — 하한(.max(1))이 막아 주지 않는 유일한 축.
+        for (knob, quiet_secs) in [("0", 0u64), ("1", 1), ("1", 2), ("2", 2)] {
+            let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
+            arm("출력 중");
+            paint_screen(&s, &idle, 4, 2, true);
+            quiet_since(&s, quiet_secs); // 판정부 상수 3.0 미만 — 재도색 가능 프레임이다
+            tick(&daemon);
+            assert_eq!(
+                s.pending_queue.lock().unwrap().len(),
+                1,
+                "노브 {knob}s · 정적 {quiet_secs}s 에서 약한 증거의 정적 AND 가 꺼져 재도색 가능 \
+                 프레임에 배달했다(사유: {})",
+                blocked_reason(&s)
+            );
+            assert_eq!(
+                blocked_reason(&s),
+                BLOCKED_ALT_SCREEN,
+                "노브 {knob}s: 사유가 레이아웃 미확인이 아니다 — 다른 축이 우연히 막은 것이면 \
+                 이 축은 A-M1 을 재지 못한다"
+            );
+            s.pending_queue.lock().unwrap().clear();
+        }
+        // ⓑ 음성 대조 — 같은(가장 낮은) 노브에서 정적이 3.0 을 넘으면 배달된다.
+        {
+            let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "1")]);
+            arm("정적 충분");
+            paint_screen(&s, &idle, 4, 2, true);
+            quiet_since(&s, 4);
+            tick(&daemon);
+            assert!(
+                s.pending_queue.lock().unwrap().is_empty(),
+                "판정부 상수를 넘긴 정적인데도 배달하지 않았다 — ⓐ 가 '항상 거부' 라 아무것도 \
+                 재지 못한다는 뜻이다(사유: {})",
+                blocked_reason(&s)
+            );
+        }
+        // ⓒ 순수 술어 축 — 같은 프레임·같은 quiet 에서 `layout_ok` 는 노브에 **독립**이다.
+        //    (종전 표현이면 노브 1·quiet 1 에서 참, 노브 30·quiet 5 에서 거짓이 되어 둘 다 깨진다.)
+        let screen = idle.join("\n");
+        let obs_at = |quiet_secs: u64| super::PromptObs {
+            marker_seen: true,
+            line: Some(("› ".to_string(), PH.to_string())),
+            screen: screen.clone(),
+            selector_row: false,
+            busy_near_cursor: false,
+            output_gen: 2,
+            output_gen_after: 2,
+            quiet_secs,
+            alt_screen: true,
+        };
+        for knob in ["1", "3", "30"] {
+            let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
+            assert!(
+                !super::prompt_gate_input_with_approval(&s, "›", Some(PH), &obs_at(1), false)
+                    .layout_ok,
+                "노브 {knob}s: 정적 1s(< BOOT_VALVE_QUIET_SECS 3.0)인데 약한 레이아웃 증거가 \
+                 섰다 — layout_ok 가 배달 노브를 읽고 있다"
+            );
+            assert!(
+                super::prompt_gate_input_with_approval(&s, "›", Some(PH), &obs_at(5), false)
+                    .layout_ok,
+                "노브 {knob}s: 정적 5s(≥ 3.0)인데 약한 레이아웃 증거가 서지 않는다 — \
+                 layout_ok 가 배달 노브를 읽고 있다"
+            );
+        }
     }
 
     /// ★(0.14.31 · triage R1-WP1-HF · C-B2 값싼 절반) **배달 quiet 노브에는 하한 1초가 있다.**
