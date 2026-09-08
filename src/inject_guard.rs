@@ -58,13 +58,14 @@
 //! |---|---|---|
 //! | `CYS_INJECT_GATE_GUARD` | `0` | **U-14** 주입 가드를 관측 전용으로 강등(관문을 봐도 종전대로 보낸다) |
 //! | `CYS_TRUST_RETURN_V1` | `1` | **U-15** 폴더신뢰 정책을 종전으로(하드코딩 needle 감지 + 재전송 상한 2발) |
+//! | `CYS_GATE_VERSION_PIN` | `0` | **H2-B** 확인 경계의 **버전 대조**를 관측 전용으로(= 버전을 보지 않던 종전) |
 //!
-//! 둘 다 **엄격 비교**다(`== Some("0")` / `== Some("1")`) — 형제 게이트
+//! 셋 다 **엄격 비교**다(`== Some("0")` / `== Some("1")`) — 형제 게이트
 //! (`CYS_GATE_PENDING_CLOSE`·`CYS_READINESS_V1`)와 같은 규율로, 오타 하나로 안전장치가 조용히
 //! 뒤집히는 것을 막는다. env 를 읽는 지점은 축마다 **함수 하나**뿐이고 판정은 순수 코어에 있다.
-//! 두 스위치를 다 켜면 이 단위 착지 이전의 **주입 정책**으로 복귀한다.
+//! 앞 두 스위치를 다 켜면 이 단위 착지 이전의 **주입 정책**으로 복귀한다(세 번째는 아래 참조).
 //!
-//! ### ★롤백 예외 — 관문 **확인 허가**([`confirm_allowed`])는 어느 노브로도 열리지 않는다
+//! ### ★롤백 예외 — 관문 **확인 허가**([`confirm_allowed`])의 **증거 벨트**는 어느 노브로도 열리지 않는다
 //!
 //! (0.14.31 · 리뷰 R2·R4 · codex) 위 두 노브와 `CYS_READINESS_V1` 은 전부 **보류를 푸는** 방향의
 //! 스위치다(관문을 봐도 보낸다 · 모달 축을 끈다 · 재전송을 되살린다). 그러나 자동확인이 쏘는 것은
@@ -73,6 +74,25 @@
 //! 면제하지 않는다(CONTRACTS B-7). 되돌릴 수 있는 것은 **몇 발 보내는가**(U-15 `CYS_TRUST_RETURN_V1`)
 //! 까지이며, **무엇을 보고 보내는가**는 아니다. 이 예외를 문서에 적어 두는 이유는, 노브를 켠 사람이
 //! "완전 복귀" 를 기대하다가 자동확인이 안 열리는 것을 결함으로 오독하지 않게 하기 위해서다.
+//!
+//! ### ★★그 예외의 **경계** — 버전 축은 노브를 갖는다(0.14.31 · 수렴 R2 · reviewer-claude major)
+//!
+//! 위 예외는 **양성 증거 벨트**(커서가 액션 라벨 위 · 정본 사람 1회 관문 · 코퍼스 식별)에 대한
+//! 것이다. 그 벨트들은 **위험이 관측될 때만** 닫히므로 정상 좌석에서는 아무것도 막지 않는다.
+//! 버전 축은 성질이 다르다 — 그 보류는 **기본 상태**다: `MEASURED_ON` 을 재실측하지 않은 모든
+//! 기계에서 항상 참이고(이 저장소의 개발 기계가 지금 그렇다: 라이브 2.1.263 대 실측본 2.1.241),
+//! 그래서 "노브 없는 벨트" 로 두면 **전 좌석이 매 부트마다** 관문에 선다.
+//!
+//! 그 상태에서 운영자가 쥘 손잡이가 마스터(`CYS_BOOT_GATES=0`) 하나뿐이면 BLOCK-4 형상이
+//! 그대로 재현된다: 마스터는 `gate_pending_close` 를 켜므로(보류 → 즉시 close) **보류는 사망이
+//! 되는데 버전 축만 엄격하게 남아** Return 이 끝내 나가지 않는다 → readiness 는 legacy 라
+//! 관문 화면을 Ready 라 하고 → 주입 가드는 강등돼 디렉티브가 신뢰 모달로 들어가고 → 타임아웃이
+//! 좌석을 close 한다. **엄격화와 보류는 한 몸**(BLOCK-4 불변식)이라, 보류가 사망으로 강등된
+//! 조합에서 엄격하게 남을 권리는 이 축에도 없다.
+//!
+//! 그래서 이 축은 `crate::GateAxes::version_pin_legacy` 로 **마스터에 접히고**, 축 단독 노브
+//! (`CYS_GATE_VERSION_PIN=0`)도 함께 둔다 — 드리프트가 기본인 기계의 운영자가 마스터(전 축 종전
+//! + close 강등)를 누르지 않고 **이 축만** 끌 수 있어야 한다(그것이 사고를 줄이는 방향이다).
 
 use crate::first_run_gates::{self, Gate, Passability};
 
@@ -105,6 +125,10 @@ pub fn guard_off_from(raw: Option<&str>) -> bool {
     raw == Some("0")
 }
 
+/// ★(0.14.31 · 수렴 R2) 버전 축 롤백 스위치의 env 이름. `0` → 확인 경계의 **버전 대조**를
+/// 관측 전용으로 내린다(= 이 축이 태어나기 전과 같이 버전을 보지 않는다).
+pub const ENV_VERSION_PIN: &str = "CYS_GATE_VERSION_PIN";
+
 /// U-15 폴더신뢰 정책이 종전(V1)인가. **env 를 읽는 유일한 지점**.
 ///
 /// ★(BLOCK-3 · 2026-08-24) 마스터 스위치·보류 접기값과 OR 한다 — 마스터 하나로 이 캠페인의
@@ -116,6 +140,22 @@ pub fn trust_v1() -> bool {
 /// 위 판정의 순수 절반.
 pub fn trust_v1_from(raw: Option<&str>) -> bool {
     raw == Some("1")
+}
+
+/// 확인 경계의 **버전 축**이 종전(= 버전을 보지 않음)인가. **env 를 읽는 유일한 지점**.
+///
+/// ★(0.14.31 · 수렴 R2 · reviewer-claude major · codex blocking 재기) 마스터·보류 접기값과
+/// OR 한다. 근거 전문은 이 모듈 doc 의 「롤백 예외의 경계」와 `crate::gate_axes_from` 의
+/// BLOCK-4 불변식 — 보류가 close 로 강등된 조합에서 이 축만 엄격하면 "Return 도 안 나가고
+/// 좌석은 닫히는" 상태가 되고, 그것은 이 축이 없던 때보다 나쁘다.
+pub fn version_pin_legacy() -> bool {
+    version_pin_legacy_from(std::env::var(ENV_VERSION_PIN).ok().as_deref())
+        || crate::gate_axes_forced_legacy()
+}
+
+/// 위 판정의 순수 절반(형제 노브와 같은 엄격 비교 — `"0"` 만 끈다).
+pub fn version_pin_legacy_from(raw: Option<&str>) -> bool {
+    raw == Some("0")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -150,20 +190,33 @@ pub struct Observed<'a> {
     /// 않게. 종전부터 있던 코퍼스 가드(U-14 축 · [`guard_off`])와 커서-종료 벨트(조여지는 방향만)는 이 값과
     /// 무관하다. 마스터 `CYS_BOOT_GATES=0` 은 두 값 모두 켠다(전 축 종전).
     pub readiness_legacy: bool,
-    /// ★(0.14.31 · 독립 재유도 H2-B) **이 좌석의 이번 기동에서 관측된 claude 버전**(래치).
+    /// ★(0.14.31 · 독립 재유도 H2-B · 수렴 R2) **이 좌석의 이번 기동에서 관측된 claude 버전
+    /// 전량**(누적 래치 · [`latch_seat_versions`]).
     ///
-    /// 생산자는 부트 루프(`cys.rs boot_agent_on_surface`)이고, 재료는 그 부트의 **누적 델타**
-    /// (`since_line` 고정 · 기동 시점 이후 전량)에서 뽑은 배너다
-    /// ([`first_run_gates::banner_version`]). 화면(vt100 그리드)의 배너는 관문이 그려지면서
-    /// 밀려나지만 누적 델타에서는 밀려나지 않는다 — 그 **증거 소멸**이 정확히 드리프트 거부를
-    /// 다음 틱에 무효로 만드는 경로였다(codex 설계 검토 3).
+    /// 생산자는 부트 루프(`cys.rs boot_agent_on_surface`)이고, 재료는 그 부트의 누적 델타와
+    /// 화면에서 뽑은 배너다([`first_run_gates::banner_versions`]). 화면의 배너는 관문이
+    /// 그려지면서 밀려나지만 이 래치에서는 밀려나지 않는다 — 그 **증거 소멸**이 정확히
+    /// 드리프트 거부를 다음 틱에 무효로 만드는 경로였다(codex 설계 검토 3).
     ///
-    /// `None` = 이 부트에서 배너를 아직 못 봤다(= 버전 미상). 미상은 오늘 **통과**한다
+    /// ★**하나가 아니라 전량**인 이유(수렴 R2 · codex major): 값을 하나만 들면 "먼저 잡힌
+    ///   일치" 가 **나중에 관측한 불일치를 영구히 덮는다** — 첫 틱에 실측본과 같은 배너(이전
+    ///   좌석의 잔상이거나 업그레이드 전 출력)를 잡으면, 다음 틱 델타에 진짜 버전이 실려도
+    ///   sticky 라 갱신되지 않고 확인 화면에서 배너가 밀려나는 순간 미상으로 열린다. 래치는
+    ///   **단조 증가하는 합집합**이어야 시간축의 증거가 보존된다.
+    ///
+    /// 빈 슬라이스 = 이 부트에서 배너를 아직 못 봤다(= 버전 미상). 미상은 오늘 **통과**한다
     /// ([`first_run_gates::ACTION_POLICY_ENFORCEMENT`] doc — 별도 결정).
     ///
-    /// ★래치와 지금 화면의 배너는 **합집합**으로 쓴다(둘 중 하나라도 실측본과 다르면 보류).
-    ///   래치를 우선하고 화면을 버리면, 앞선 틱의 가짜 일치 배너가 뒤의 진짜 불일치를 덮는다.
-    pub cli_version: Option<&'a str>,
+    /// ★래치와 지금 화면의 배너는 **합집합**으로 쓴다(하나라도 실측본과 다르면 보류).
+    pub cli_versions: &'a [String],
+    /// ★(0.14.31 · 수렴 R2) 버전 축이 **종전(관측 전용)** 인가 — 호출부가
+    /// [`version_pin_legacy`] 로 1회 읽어 넘긴다(마스터·보류 접기값 포함).
+    ///
+    /// 참이면 [`confirm_denied`] 는 버전을 **한 번도 보지 않는다**(이 축이 태어나기 전과 같다).
+    /// 왜 이 축만 노브를 갖는지는 모듈 doc 「롤백 예외의 경계」 — 요약하면 이 축의 보류는
+    /// **기본 상태**이고, 보류가 close 로 강등된 조합(BLOCK-4)에서 엄격하게 남으면 좌석이
+    /// "Return 도 못 받고 close 되는" 상태가 되기 때문이다.
+    pub version_pin_legacy: bool,
 }
 
 /// 가드의 결론.
@@ -388,8 +441,10 @@ impl ConfirmDenied {
             }
             ConfirmDenied::VersionDrift { measured_on, detected } => format!(
                 "좌석이 밝힌 claude 버전({detected})이 이 관문을 실측한 버전({measured_on})과 \
-                 다르다 — 선언된 통과 액션이 이 버전에서 참이라는 근거가 없다(사람 1회로 넘기거나, \
-                 실측한 뒤 agents.json 봉투의 measured_on 을 갱신할 것)"
+                 다르다 — 선언된 통과 액션이 이 버전에서 참이라는 근거가 없다. 탈출구 셋: \
+                 ① 사람 1회로 넘긴다 ② 실측한 뒤 agents.json 봉투의 measured_on 을 갱신한다 \
+                 ③ 이 축만 종전으로 되돌린다({ENV_VERSION_PIN}=0 — 마스터를 누르지 말 것: \
+                 마스터는 보류를 close 로 강등한다)"
             ),
         }
     }
@@ -446,27 +501,35 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
     //     실측이라 미상까지 접으면 전 좌석이 매 부트마다 사람 1회를 요구한다(별도 결정 ·
     //     [`first_run_gates::ACTION_POLICY_ENFORCEMENT`] doc).
     //
-    //   ★증거는 **합집합**이다 — 기동 래치(`o.cli_version`) ∪ 지금 화면의 배너 전량. 하나라도
-    //     실측본과 다르면 보류한다(증거가 갈리면 조이는 쪽). 화면 배너만 보면 배너가 관문 렌더에
-    //     밀려난 틱에서 거부가 풀리고, 래치만 보면 앞 틱의 배너가 뒤의 불일치를 덮는다.
+    //   ★증거는 **합집합**이다 — 기동 래치(`o.cli_versions` · 이 부트에서 관측한 버전 전량)
+    //     ∪ 지금 화면의 배너 전량. 하나라도 실측본과 다르면 보류한다(증거가 갈리면 조이는 쪽).
+    //     화면 배너만 보면 배너가 관문 렌더에 밀려난 틱에서 거부가 풀리고, 래치가 값 하나면
+    //     먼저 잡힌 일치가 뒤의 불일치를 영구히 덮는다(수렴 R2 · codex major).
     //
     //   【실패 방향】 오탐(엉뚱한 문자열을 배너로 읽음)의 귀결은 자동확인 보류 = 사람 1회(가역).
     //   미탐의 귀결은 미실측 버전 화면에 Return = 좌석 rc 1(비가역).
-    for v in o
-        .cli_version
-        .into_iter()
-        .map(str::to_string)
-        .chain(first_run_gates::banner_versions(o.screen))
-    {
-        if let first_run_gates::ActionPolicy::HeldVersionDrift {
-            measured_on,
-            detected,
-        } = first_run_gates::action_policy(g, Some(&v))
+    //   ★★(수렴 R2) 그리고 이 축은 **롤백 노브를 가진다**(`o.version_pin_legacy`). 형제 벨트
+    //     (커서·라벨·정본 사람 1회)와 달리 이 보류는 재실측 전 기계의 **기본 상태**라, 노브가
+    //     없으면 운영자가 쥘 손잡이는 마스터뿐이고 마스터는 보류를 close 로 강등한다 — 그
+    //     조합이 정확히 BLOCK-4('엄격 + 즉시 close')다. 종전으로 내린 귀결은 이 축이 태어나기
+    //     전과 같다(Return 이 나간다 · 그때의 위험을 그대로 되찾는다 — 그것이 롤백의 뜻이다).
+    if !o.version_pin_legacy {
+        for v in o
+            .cli_versions
+            .iter()
+            .cloned()
+            .chain(first_run_gates::banner_versions(o.screen))
         {
-            return Some(ConfirmDenied::VersionDrift {
+            if let first_run_gates::ActionPolicy::HeldVersionDrift {
                 measured_on,
                 detected,
-            });
+            } = first_run_gates::action_policy(g, Some(&v))
+            {
+                return Some(ConfirmDenied::VersionDrift {
+                    measured_on,
+                    detected,
+                });
+            }
         }
     }
     // 술어는 `decide_allowing` 의 allow 구멍과 **같은 하나**다(사본 0 — 두 자리가 갈리면 구멍이 생긴다).
@@ -477,24 +540,47 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
     }
 }
 
-/// ★(0.14.31 · 독립 재유도 H2-B) [`Observed::cli_version`] **래치의 갱신 규칙**(순수).
+/// 한 좌석의 기동 래치가 보존하는 **서로 다른 버전 문자열의 상한**.
 ///
-/// 부트 루프가 매 틱 부른다: `seat = latch_seat_version(seat, &delta_text, screen)`.
+/// ★상한이 판정을 무디게 하지 않는 이유: 서로 다른 값이 **둘만 되어도** 그중 하나는 반드시
+///   실측본과 다르다 = 드리프트가 이미 확정이다. 상한은 병적 입력(배너를 무한히 찍는 화면)에서
+///   래치가 무한히 자라는 것만 막는다.
+pub const SEAT_VERSION_LATCH_MAX: usize = 4;
+
+/// ★(0.14.31 · 독립 재유도 H2-B · 수렴 R2) [`Observed::cli_versions`] **래치의 갱신 규칙**(순수).
 ///
-/// 【규칙 둘, 그리고 각각의 이유】
-///   · **한 번 잡으면 바꾸지 않는다**(sticky). 이 기동의 배너는 좌석이 기동 직후 스스로 찍은
-///     줄이고, 그 뒤에 화면에 들어오는 같은 문면은 에이전트 출력·잔상일 수 있다. 래치가 흔들리면
-///     "버전이 오락가락하는 좌석" 이 되어 판정이 틱마다 뒤집힌다.
-///   · **누적 델타를 화면보다 먼저 본다.** 화면(vt100 그리드)의 배너는 관문이 그려지면 밀려나지만,
-///     이 부트의 누적 델타(`since_line` 고정)에서는 밀려나지 않는다. 화면만 보면 드리프트 거부가
-///     한 틱짜리가 되고 다음 틱엔 미상으로 열린다(codex 설계 검토 3 — 이 규칙이 그 구멍을 닫는다).
+/// 부트 루프가 매 틱 부른다: `seat = latch_seat_versions(seat, &delta_text, screen)`.
 ///
-/// 【실패 방향】 못 잡으면 `None` = 미상이고, 미상은 오늘 확인을 막지 않는다(종전과 같음).
-/// 잘못 잡으면(가짜 배너) 불일치로 접혀 **보류**다 — 조이는 쪽이다.
-pub fn latch_seat_version(latched: Option<String>, delta: &str, screen: &str) -> Option<String> {
-    latched.or_else(|| {
-        first_run_gates::banner_version(delta).or_else(|| first_run_gates::banner_version(screen))
-    })
+/// 【규칙 셋, 그리고 각각의 이유】
+///   · **지우지 않는다**(단조 증가). 이 부트에서 한 번 관측한 버전 증거는 배너가 화면에서
+///     밀려나도 남아야 한다 — 안 그러면 드리프트 거부가 한 틱짜리가 되고 다음 틱엔 미상으로
+///     열린다(codex 설계 검토 3).
+///   · **덮지 않는다**(합집합). R1 판은 값 하나를 sticky 로 들었는데, 그 규칙에서는 **먼저
+///     잡힌 일치가 나중의 불일치를 영구히 덮었다**(수렴 R2 · codex major): 첫 틱 델타가 비어
+///     있고 화면에 이전 좌석의 잔상 배너(= 실측본과 같은 값)가 있으면 래치가 그 값으로 굳고,
+///     그 뒤 델타에 실린 진짜 버전은 다시 읽히지 않는다. 그 좌석은 2.1.263 인데 Return 이
+///     나간다(reviewer-claude major · 실측 v1). 합집합은 시간축의 증거를 잃지 않는다.
+///   · **판정은 여전히 뒤집히지 않는다.** 집합이 커지는 방향은 언제나 '조이는' 쪽이다(불일치가
+///     하나라도 들어오면 보류) — 그래서 R1 이 sticky 로 지키려던 성질(틱마다 판정이 뒤집히지
+///     않을 것)은 그대로 산다. 잃는 것은 "느슨해지는 방향의 변동" 뿐이고, 그것은 잃어야 한다.
+///
+/// 【실패 방향】 못 잡으면 빈 집합 = 미상이고, 미상은 오늘 확인을 막지 않는다(종전과 같음).
+/// 잘못 잡으면(잔상·가짜 배너) 불일치로 접혀 **보류**다 — 조이는 쪽이고, 그 보류가 잦은
+/// 기계에는 축 노브([`ENV_VERSION_PIN`])가 있다.
+pub fn latch_seat_versions(latched: Vec<String>, delta: &str, screen: &str) -> Vec<String> {
+    let mut out = latched;
+    for v in first_run_gates::banner_versions(delta)
+        .into_iter()
+        .chain(first_run_gates::banner_versions(screen))
+    {
+        if out.len() >= SEAT_VERSION_LATCH_MAX {
+            break;
+        }
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// 관문 하나의 **질문형 needle** 만으로 화면을 판별한다(위젯 서명 AND 를 요구하지 않는다).
@@ -638,7 +724,9 @@ mod tests {
             guard_off: false,
             readiness_legacy: false,
             // 기동 래치 없음 = 이 검체의 버전 증거는 **화면 배너뿐**이다(H2-B).
-            cli_version: None,
+            cli_versions: &[],
+            // 버전 축은 켜져 있다(기본) — 노브를 재는 검체는 이 값을 스스로 뒤집는다.
+            version_pin_legacy: false,
         }
     }
 
@@ -1356,7 +1444,7 @@ mod tests {
         let corpus_gate = fixtures::OAUTH_CODE;
         let corpus_id = first_run_gates::identify(&gs, corpus_gate).expect("전제: 코퍼스 관문").id.clone();
         let mk = |screen: &str, v1: bool, off: bool| -> Decision {
-            decide(&Observed { screen, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_version: None })
+            decide(&Observed { screen, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_versions: &[], version_pin_legacy: false })
         };
         let unknown = crate::readiness::MODAL_UNKNOWN_ID;
         // 기본(두 노브 0): 둘 다 보류.
@@ -1375,7 +1463,7 @@ mod tests {
         // 벨트: V1 에는 열리지 않고(보류) 마스터(guard_off)에서만 관측 강등된다.
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
         let belt = |v1: bool, off: bool| decide_allowing(
-            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_version: None },
+            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_versions: &[], version_pin_legacy: false },
             Some(GATE_FOLDER_TRUST),
         );
         assert!(belt(true, false).blocks(), "readiness 롤백이 커서-종료 벨트를 열었다(2.1.261 좌석 사망 경로)");
@@ -1524,7 +1612,7 @@ mod tests {
         }
         // 롤백 노브로도 열리지 않는다(조이는 벨트는 어느 노브로도 열지 않는다).
         for (guard_off, readiness_legacy) in [(true, false), (false, true), (true, true)] {
-            let o = Observed { screen, gates: &gs, awakened: Some(false), guard_off, readiness_legacy, cli_version: None };
+            let o = Observed { screen, gates: &gs, awakened: Some(false), guard_off, readiness_legacy, cli_versions: &[], version_pin_legacy: false };
             assert!(
                 !confirm_allowed(&o, "login-escape"),
                 "노브({guard_off},{readiness_legacy})가 사람 1회 화면의 확인을 열었다"
@@ -1656,7 +1744,7 @@ mod tests {
             .clone();
         let drift = "9.9.9";
         assert_ne!(drift, measured, "전제: 실측본과 다른 버전");
-        let denied = |screen: &str, latch: Option<&str>| -> Option<ConfirmDenied> {
+        let denied = |screen: &str, latch: &[String]| -> Option<ConfirmDenied> {
             confirm_denied(
                 &Observed {
                     screen,
@@ -1664,19 +1752,21 @@ mod tests {
                     awakened: Some(false),
                     guard_off: false,
                     readiness_legacy: false,
-                    cli_version: latch,
+                    cli_versions: latch,
+                    version_pin_legacy: false,
                 },
                 GATE_FOLDER_TRUST,
             )
         };
+        let latch = |v: &str| vec![v.to_string()];
         let banner = |v: &str| format!("Welcome to Claude Code v{v}\n{}", fixtures::FOLDER_TRUST);
 
         // ① 미상 — 배너가 없으면 종전대로 열린다(오늘의 결정).
-        assert_eq!(denied(fixtures::FOLDER_TRUST, None), None, "미상에서 확인이 닫혔다(가용성 절단)");
+        assert_eq!(denied(fixtures::FOLDER_TRUST, &[]), None, "미상에서 확인이 닫혔다(가용성 절단)");
 
         // ② 래치만 불일치 — **화면에는 배너가 없다**(밀려난 상태). 그래도 닫힌다.
         assert_eq!(
-            denied(fixtures::FOLDER_TRUST, Some(drift)),
+            denied(fixtures::FOLDER_TRUST, &latch(drift)),
             Some(ConfirmDenied::VersionDrift {
                 measured_on: measured.clone(),
                 detected: drift.to_string(),
@@ -1687,20 +1777,31 @@ mod tests {
         // ③ 래치는 일치인데 화면 뒤쪽에 불일치 배너 — 합집합이므로 닫힌다.
         let two = format!("Welcome to Claude Code v{measured}\n(중략)\n{}", banner(drift));
         assert!(
-            denied(&two, Some(&measured)).is_some(),
+            denied(&two, &latch(&measured)).is_some(),
             "앞선 일치 배너가 뒤의 불일치를 덮었다 — 증거는 합집합이어야 한다"
         );
 
+        // ③' ★(수렴 R2 · codex major) **래치 안에서도** 합집합이다 — 일치 하나를 먼저 잡은 뒤
+        //     불일치를 관측했고 그 뒤 화면에서 배너가 사라져도 거부는 유지된다.
+        assert!(
+            denied(
+                fixtures::FOLDER_TRUST,
+                &[measured.clone(), drift.to_string()]
+            )
+            .is_some(),
+            "먼저 잡힌 일치가 나중에 관측한 불일치를 덮었다 — 시간축의 증거가 소멸한다"
+        );
+
         // ④ 둘 다 일치 — 자동확인은 그대로 산다.
-        assert_eq!(denied(&banner(&measured), Some(&measured)), None, "일치인데 확인이 닫혔다");
+        assert_eq!(denied(&banner(&measured), &latch(&measured)), None, "일치인데 확인이 닫혔다");
 
         // ⑤ `--version` stdout 형상(앵커 없음)은 이 경계의 증거가 아니다 → 미상 → 통과.
         //    ★좁힌 판독기의 대가를 정직하게 박제한다: 이 줄이 초록인 동안 "화면 첫 점숫자" 는
         //      좌석의 버전 선언으로 쓰이지 않는다([`first_run_gates::banner_versions`] doc).
         let stdout_shape = format!("{drift} (Claude Code)\n{}", fixtures::FOLDER_TRUST);
-        assert_eq!(denied(&stdout_shape, None), None);
+        assert_eq!(denied(&stdout_shape, &[]), None);
 
-        // ⑥ 롤백 노브로 열리지 않는다.
+        // ⑥ **보류를 푸는 형제 노브**로는 열리지 않는다(조이는 벨트의 규율 · CONTRACTS B-7).
         for (guard_off, readiness_legacy) in [(true, false), (false, true), (true, true)] {
             let o = Observed {
                 screen: &banner(drift),
@@ -1708,53 +1809,173 @@ mod tests {
                 awakened: Some(false),
                 guard_off,
                 readiness_legacy,
-                cli_version: None,
+                cli_versions: &[],
+                version_pin_legacy: false,
             };
             assert!(
                 !confirm_allowed(&o, GATE_FOLDER_TRUST),
                 "노브({guard_off},{readiness_legacy})가 미실측 버전 화면의 확인을 열었다"
             );
         }
+
+        // ⑦ ★(수렴 R2) 그러나 **이 축 자신의 노브**(`version_pin_legacy`)로는 열린다 —
+        //    그리고 그것이 이 축이 마스터에 접히는 방식이다. 근거: 이 보류는 재실측 전 기계의
+        //    **기본 상태**라, 노브가 없으면 운영자가 쥘 손잡이는 마스터뿐이고 마스터는 보류를
+        //    close 로 강등한다(= BLOCK-4 '엄격 + 즉시 close').
+        let rolled_back = Observed {
+            screen: &banner(drift),
+            gates: &gs,
+            awakened: Some(false),
+            guard_off: false,
+            readiness_legacy: false,
+            cli_versions: &latch(drift),
+            version_pin_legacy: true,
+        };
+        assert_eq!(
+            confirm_denied(&rolled_back, GATE_FOLDER_TRUST),
+            None,
+            "버전 축 롤백이 듣지 않는다 — 드리프트가 기본인 기계에서 운영자에게 남는 손잡이는 \
+             마스터뿐이고, 마스터는 이 보류를 close 로 바꾼다"
+        );
+        // 그리고 그 롤백 상태에서 조립은 실제로 **1발을 낸다**(종전 복귀가 반쪽이 아니다).
+        assert!(
+            trust_send(&TrustObserved {
+                hit: true,
+                first: true,
+                persisted: false,
+                sends: 0,
+                max_sends: 2,
+                other_gate: !confirm_allowed(&rolled_back, GATE_FOLDER_TRUST),
+                legacy_v1: false,
+            }),
+            "버전 축을 되돌렸는데 Return 이 여전히 0발이다 — 좌석은 관문에 서고 보류는 close 로 \
+             강등되는 조합(reviewer-claude major)이 그대로 남는다"
+        );
+        // ⑧ 축 노브의 **판독 규약**(형제 게이트와 같은 엄격 비교 — 오타로 벨트가 조용히 열리지 않는다).
+        assert!(version_pin_legacy_from(Some("0")));
+        for loose in [None, Some(""), Some("1"), Some("true"), Some("off"), Some(" 0")] {
+            assert!(!version_pin_legacy_from(loose), "느슨한 값 {loose:?} 이 버전 축을 껐다");
+        }
+        assert_eq!(ENV_VERSION_PIN, "CYS_GATE_VERSION_PIN");
     }
 
-    /// ★(0.14.31 · 독립 재유도 H2-B) 기동 래치의 **갱신 규칙** — 이 규칙이 없으면 드리프트 거부가
-    /// 한 틱짜리가 된다(배너가 관문 렌더에 밀려나는 순간 미상으로 열린다).
+    /// ★(0.14.31 · 독립 재유도 H2-B · 수렴 R2) 기동 래치의 **갱신 규칙** — 이 규칙이 없으면
+    /// 드리프트 거부가 한 틱짜리가 된다(배너가 관문 렌더에 밀려나는 순간 미상으로 열린다).
+    ///
+    /// 【R1 판이 무엇을 못박았고 왜 고쳤나】 R1 은 값 **하나**를 sticky 로 들었다("한 번 잡으면
+    /// 바꾸지 않는다"). 두 리뷰어가 같은 구멍을 서로 다른 형상으로 재현했다:
+    ///   · reviewer-claude major — 틱1 델타는 비어 있고(alt-screen 기본) 화면에는 **이전 좌석의
+    ///     잔상 배너**(실측본과 같은 값)가 있다 → 래치가 그 값으로 굳는다 → 틱N 델타에 실린
+    ///     진짜 버전은 sticky 라 무시된다 → 확인 시점엔 배너가 밀려나 증거 합집합={실측본}
+    ///     → **Return 이 나간다**(좌석은 미실측 버전인데).
+    ///   · codex major — 일치 래치 → 이후 틱 델타에 불일치 관측 → 다음 틱 화면에서 배너 소멸.
+    ///     같은 귀결이다(관측한 불일치가 시간축에서 소멸한다).
+    /// 그래서 래치는 **단조 증가하는 합집합**이 됐다. sticky 가 지키려던 성질(판정이 틱마다
+    /// 뒤집히지 않을 것)은 그대로다 — 집합은 커지기만 하고, 커지는 방향은 언제나 '조이는' 쪽이다.
     #[test]
-    fn seat_version_latch_is_sticky_and_prefers_the_cumulative_delta() {
+    fn seat_version_latch_accumulates_every_observed_version_and_never_forgets() {
         let banner = "Welcome to Claude Code v2.1.263\n";
         // ① 처음엔 델타에서 잡는다.
         assert_eq!(
-            latch_seat_version(None, banner, fixtures::FOLDER_TRUST).as_deref(),
-            Some("2.1.263")
+            latch_seat_versions(vec![], banner, fixtures::FOLDER_TRUST),
+            vec!["2.1.263".to_string()]
         );
-        // ② 델타에 없으면 화면에서 잡는다(폴백).
-        assert_eq!(
-            latch_seat_version(None, "", banner).as_deref(),
-            Some("2.1.263")
-        );
+        // ② 델타에 없으면 화면에서도 잡는다(alt-screen 좌석의 유일한 증거일 수 있다).
+        assert_eq!(latch_seat_versions(vec![], "", banner), vec!["2.1.263".to_string()]);
         // ③ 둘 다 배너가 없으면 미상 그대로(추정 금지).
-        assert_eq!(latch_seat_version(None, "", fixtures::FOLDER_TRUST), None);
-        // ④ ★한 번 잡은 값은 바뀌지 않는다 — 화면·델타가 나중에 무엇을 그리든.
-        let held = Some("2.1.241".to_string());
+        assert!(latch_seat_versions(vec![], "", fixtures::FOLDER_TRUST).is_empty());
+        // ④ ★한 번 들어온 값은 사라지지 않는다(단조) — 배너가 화면에서 밀려나도.
+        let held = vec!["2.1.241".to_string()];
         assert_eq!(
-            latch_seat_version(held.clone(), banner, banner).as_deref(),
-            Some("2.1.241"),
+            latch_seat_versions(held.clone(), "", fixtures::FOLDER_TRUST),
+            held,
             "래치가 흔들리면 같은 좌석의 판정이 틱마다 뒤집힌다"
         );
-        // ⑤ 그리고 그 래치는 확인 경계에서 **실제로 문다**(배너가 화면에서 사라진 뒤에도).
+        // ⑤ ★그리고 **덮지 않는다** — 나중에 관측한 다른 버전이 합류한다(수렴 R2 의 핵심).
+        assert_eq!(
+            latch_seat_versions(held.clone(), banner, banner),
+            vec!["2.1.241".to_string(), "2.1.263".to_string()],
+            "먼저 잡힌 값이 나중의 관측을 덮으면 드리프트 거부가 영구히 무력해진다"
+        );
+        // ⑥ 상한이 있다(병적 입력에서 무한 성장 금지) — 그리고 상한에 닿기 전에 이미 보류다.
+        let many: String = (0..20).map(|i| format!("Claude Code v9.9.{i}\n")).collect();
+        assert_eq!(latch_seat_versions(vec![], &many, "").len(), SEAT_VERSION_LATCH_MAX);
+
         let gs = gates();
-        let latched = latch_seat_version(None, banner, "");
+        // ⑦ 그리고 그 래치는 확인 경계에서 **실제로 문다**(배너가 화면에서 사라진 뒤에도).
+        let latched = latch_seat_versions(vec![], banner, "");
         let o = Observed {
             screen: fixtures::FOLDER_TRUST, // 화면에는 배너가 없다
             gates: &gs,
             awakened: Some(false),
             guard_off: false,
             readiness_legacy: false,
-            cli_version: latched.as_deref(),
+            cli_versions: &latched,
+            version_pin_legacy: false,
         };
         assert!(
             !confirm_allowed(&o, GATE_FOLDER_TRUST),
             "래치가 물지 않으면 이 규칙은 장식이다"
+        );
+    }
+
+    /// ★(0.14.31 · 수렴 R2 · reviewer-claude major 실측 v1) **틱 시퀀스 재현** — 부트 루프가
+    /// 실제로 부르는 순서 그대로 잰다(잔상 화면 → 진짜 배너 → 관문 화면).
+    ///
+    /// 【발동 조건】 같은 pane 을 재사용하며 그 사이 claude 를 업그레이드한 첫 부트:
+    /// 잔상 버전 == `MEASURED_ON` · 실행 버전 != `MEASURED_ON` · 기동 send 직전에 `since_line` 을
+    /// 잡으므로 첫 틱의 델타는 비어 있는 것이 **정상**이다(claude 는 alt-screen 기본).
+    #[test]
+    fn stale_screen_residue_cannot_shadow_the_real_banner_seen_later_in_the_delta() {
+        let gs = gates();
+        let measured = gs
+            .iter()
+            .find(|g| g.id == GATE_FOLDER_TRUST)
+            .expect("코퍼스에 folder-trust")
+            .measured_on
+            .clone();
+        let live = "2.1.263";
+        assert_ne!(live, measured, "전제: 라이브 버전이 실측본과 다르다");
+
+        // 틱1 — 델타는 비어 있고 화면은 **이전 좌석의 잔상**(실측본과 같은 배너).
+        let residue = format!("Welcome to Claude Code v{measured}\n❯ ");
+        let mut seat = latch_seat_versions(vec![], "", &residue);
+        assert_eq!(seat, vec![measured.clone()], "전제: 잔상이 래치에 든다(그 자체는 정상)");
+
+        // 틱N — 누적 델타에 **진짜 배너**가 실린다.
+        let real = format!("Welcome to Claude Code v{live}\n");
+        seat = latch_seat_versions(seat, &real, fixtures::FOLDER_TRUST);
+
+        // 확인 시점 — 화면은 관문이고 배너는 밀려났다(증거는 래치뿐).
+        let o = Observed {
+            screen: fixtures::FOLDER_TRUST,
+            gates: &gs,
+            awakened: Some(false),
+            guard_off: false,
+            readiness_legacy: false,
+            cli_versions: &seat,
+            version_pin_legacy: false,
+        };
+        assert_eq!(
+            confirm_denied(&o, GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::VersionDrift {
+                measured_on: measured.clone(),
+                detected: live.to_string(),
+            }),
+            "잔상 배너가 진짜 버전을 가렸다 — 좌석은 {live} 인데 Return 이 나간다(H2-B 확정 결함 재현)"
+        );
+        // 조립까지 0발이어야 한다(판정만 고치고 소비자를 두면 반쪽이다).
+        assert!(
+            !trust_send(&TrustObserved {
+                hit: true,
+                first: true,
+                persisted: false,
+                sends: 0,
+                max_sends: 2,
+                other_gate: !confirm_allowed(&o, GATE_FOLDER_TRUST),
+                legacy_v1: false,
+            }),
+            "미실측 버전 좌석에 Return 이 나갔다"
         );
     }
 }

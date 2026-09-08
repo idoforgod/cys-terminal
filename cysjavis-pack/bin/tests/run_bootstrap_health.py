@@ -4949,16 +4949,19 @@ def h_seat_4axis():
          "판정 축 접기가 보류 장치 상태를 합류시키지 않는다 — BLOCK-4 조합이 되살아난다")
     # ★(U-17) 축이 하나 늘었다 — 기존 항목을 지우지 않고 **추가**한다. 새 축만 엄격하게 남으면
     #   마스터 스위치가 다시 거짓말이 되고, 인증 판정기가 마스터를 눌러도 계속 차단한다.
+    # ★(0.14.31 수렴 R2) 여덟 번째 축 `version_pin_legacy`(확인 경계의 버전 대조)도 같은 항이다 —
+    #   이 축을 빠뜨린 판에서 마스터 롤백이 'Return 0발 + 좌석 close' 를 만들었다(리뷰 재기).
     for axis in ("readiness_legacy: holding_off", "inject_guard_off: holding_off",
-                 "trust_legacy: holding_off", "profile_gate_observe_only: holding_off"):
+                 "trust_legacy: holding_off", "profile_gate_observe_only: holding_off",
+                 "version_pin_legacy: holding_off"):
         need(axis in ax,
              "축 '%s' 이 보류 꺼짐과 함께 풀리지 않는다 — 그 축만 엄격하게 남아 관문 화면이 "
              "곧 close 가 된다(재난④)" % axis)
     # ★경로는 레지스트리 경유로만 얻는다(핀 이사 계약 ⓒ — 직접 `_repo_file` 은 우회다).
     need(src.count("|| crate::gate_axes_forced_legacy()") == 1,
          "readiness 축이 상위 접기값을 소비하지 않는다 — 마스터 스위치가 거짓말이 된다")
-    need(_scan_source("inject_guard").count("|| crate::gate_axes_forced_legacy()") == 2,
-         "inject_guard 의 두 축(가드·신뢰) 중 하나가 상위 접기값을 소비하지 않는다")
+    need(_scan_source("inject_guard").count("|| crate::gate_axes_forced_legacy()") == 3,
+         "inject_guard 의 세 축(가드·신뢰·버전 핀) 중 하나가 상위 접기값을 소비하지 않는다")
     need("cys::ENV_BOOT_GATES" in src,
          "보류 처방·진단 문안이 **실제로 듣는** 스위치를 알려주지 않는다 — 사람이 축 노브만 끄고 "
          "여전히 보류되어 원인을 못 찾는다(BLOCK-3)")
@@ -4969,7 +4972,7 @@ def h_seat_4axis():
         need(battery in lib, "BLOCK-3/BLOCK-4 진리표 배터리 결손: %s" % battery)
     need("fn gate_hold_prescription_names_the_switch_that_actually_works(" in src,
          "처방 문안 검체 결손 — 듣지 않는 손잡이만 안내하는 회귀를 아무 데서도 못 잡는다")
-    notes.append("마스터 스위치 1개 · 축 3종 합류 · '엄격+즉시close' 불변식 단일 소유 · 배터리 4종")
+    notes.append("마스터 스위치 1개 · 축 5종 합류 · '엄격+즉시close' 불변식 단일 소유 · 배터리 4종")
     need('"surface.gate_pending"' in src, "CLI 가 표식을 기록하는 write path 가 없다")
     need('"surface.gate_pending" =>' in hsrc, "데몬에 표식 write path RPC 가 없다(생산자 미착지)")
     need("gate_denied" in hsrc, "자칭 선언 차단(산출자=평가자) 게이트가 없다")
@@ -9963,10 +9966,13 @@ def h_killchain_1():
          "U-11(보류 귀결)이 없다 — 이 단위는 그 뒤에만 착지할 수 있다")
     notes.append("보류 귀결(close 0 · kill 0) · 보류 에러 분류")
 
-    # ⓕ 롤백 2축 · env 1지점 · 엄격 비교
+    # ⓕ 롤백 3축 · env 1지점 · 엄격 비교
     for env_name, const_name, reader, strict in (
         ("CYS_INJECT_GATE_GUARD", "ENV_GUARD_OFF", "std::env::var(ENV_GUARD_OFF)", 'raw == Some("0")'),
         ("CYS_TRUST_RETURN_V1", "ENV_TRUST_V1", "std::env::var(ENV_TRUST_V1)", 'raw == Some("1")'),
+        # ★(0.14.31 수렴 R2) 확인 경계의 버전 축 — 같은 1지점·엄격 비교 계약을 진다.
+        ("CYS_GATE_VERSION_PIN", "ENV_VERSION_PIN", "std::env::var(ENV_VERSION_PIN)",
+         'raw == Some("0")'),
     ):
         need('pub const %s: &str = "%s"' % (const_name, env_name) in gsrc,
              "롤백 스위치 이름 상수 %s 가 없다" % const_name)
@@ -9978,7 +9984,7 @@ def h_killchain_1():
              % (env_name, len(readers)))
         need('std::env::var("%s")' % env_name not in cli + gsrc,
              "%s 를 상수 밖에서 문자열로 직접 읽는 곳이 있다(1지점 규약 이탈)" % env_name)
-    notes.append("롤백 2축 · env 1지점 · 엄격 비교")
+    notes.append("롤백 3축 · env 1지점 · 엄격 비교")
 
     # ⓖ ★U-15 — 상한 '상수' 가 아니라 '조건' 을 줄였다 + 예산 leaf 값 무접촉
     ts = _slice_between(gsrc, "pub fn trust_send(o: &TrustObserved) -> bool {", "\n}\n",

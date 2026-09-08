@@ -802,22 +802,55 @@ pub fn banner_version(text: &str) -> Option<String> {
 /// **앞쪽만 보고** 뒤쪽의 불일치를 놓친다(codex 설계 검토 3). 확인 경계는 이 목록을 전부 대조해
 /// **하나라도 불일치면 보류**한다 — 증거가 갈리면 조이는 쪽으로 접는다.
 pub fn banner_versions(text: &str) -> Vec<String> {
-    const ANCHOR: &str = "Claude Code v";
     let mut out: Vec<String> = Vec::new();
+    scan_banners(text, BANNER_ANCHOR, &mut out);
+    // ★(0.14.31 · 수렴 R2 · reviewer-claude minor) **접힌 배너**도 읽는다. 좁은 pane·ConPTY
+    //   에서 배너는 `│ Welcome to Claude` / `│ Code v2.1.263 │` 로 접히고, 그러면 연속 앵커가
+    //   깨져 이 축의 **유일한 증거**가 통째로 사라진다(그 귀결은 미상 = 통과). 그래서 공백과
+    //   상자 테두리를 지운 사본을 한 번 더 훑는다.
+    //   【실패 방향】 이 패스가 만들 수 있는 오탐(앵커 뒤에 무관한 점숫자가 붙는 형상)의 귀결은
+    //   **보류**(사람 1회 · 가역)이고, 못 읽는 귀결은 미상 = 종전과 같음이다. 조이는 쪽으로만
+    //   틀리는 패스다.
+    if out.len() < BANNER_SCAN_MAX {
+        let folded = fold_for_banner_scan(text);
+        scan_banners(&folded, &flatten(BANNER_ANCHOR), &mut out);
+    }
+    out
+}
+
+/// 배너 앵커 문면(정본 1지점 — 접힌 배너 패스가 같은 문자열의 공백 제거본을 쓴다).
+const BANNER_ANCHOR: &str = "Claude Code v";
+
+/// 앵커 뒤의 점숫자를 훑어 `out` 에 **중복 없이** 넣는다(상한 [`BANNER_SCAN_MAX`]).
+fn scan_banners(text: &str, anchor: &str, out: &mut Vec<String>) {
     let mut rest = text;
-    while let Some(i) = rest.find(ANCHOR) {
-        let tail = &rest[i + ANCHOR.len()..];
+    while let Some(i) = rest.find(anchor) {
+        let tail = &rest[i + anchor.len()..];
         if let Some(v) = take_dotted(tail) {
             if !out.contains(&v) {
                 out.push(v);
                 if out.len() >= BANNER_SCAN_MAX {
-                    break;
+                    return;
                 }
             }
         }
         rest = tail;
     }
-    out
+}
+
+/// 접힌 배너 판독용 사본 — 공백과 **상자 테두리**를 지운다.
+///
+/// 테두리까지 지우는 이유: [`flatten`] 만으로는 `│ Welcome to Claude\n│ Code v2.1.263` 이
+/// `…Claude│Codev2.1.263` 이 되어 앵커가 여전히 깨진다(줄머리 테두리가 두 조각 사이에 남는다).
+fn fold_for_banner_scan(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !is_box_border(*c))
+        .collect()
+}
+
+/// 상자 렌더의 **세로 테두리** 문자(가로줄·모서리는 배너 줄 안에 끼지 않는다).
+fn is_box_border(c: char) -> bool {
+    matches!(c, '│' | '┃' | '║' | '╎' | '┆' | '┊' | '╏' | '|' | '┇' | '┋')
 }
 
 /// 한 화면에서 훑는 배너 상한(병적 입력에서 판정 시간이 화면 길이에 끌려가지 않게).
@@ -881,6 +914,20 @@ pub struct Resolved {
     ///
     /// ★명시 `null` 봉투(= 의도적 비움)와 키 부재는 **거짓**이다 — 지워질 선언이 없다.
     pub envelope_ignored: bool,
+    /// ★(0.14.31 · 수렴 R2 · reviewer-claude minor) 봉투에 있었으나 **이 코퍼스에 착지하지
+    /// 못한 선언의 수**(id 결손 · 비객체 항목 · needle 결손 신규 선언 · replace 파싱 실패 ·
+    /// `gates` 가 배열이 아님).
+    ///
+    /// 【왜 [`Resolved::envelope_ignored`] 로는 부족한가】 그 축은 **전부/전무**다 — 선언 둘 중
+    /// 하나만 착지하면(예: folder-trust 조이기는 착지, 신설 관문은 needle 결손으로 거부)
+    /// `overridden=1` 이라 `envelope_ignored=false` 이고 보고서는 `paste_safe=true` 를 낸다.
+    /// 그런데 그 봉투를 안내대로 붙여 넣으면 **거부된 선언이 파일에서 사라진다**(오타를 고칠
+    /// 원본까지). 효력 있던 조임은 살아남으므로 관문 재개방은 아니지만(그래서 minor),
+    /// 운영자는 "몇 건이 빠졌는지" 를 산출물에서 알아야 한다.
+    ///
+    /// 【이 값은 판정 재료가 아니다】 보고서의 경고 문면에만 쓴다 — 코퍼스 자체는 착지한
+    /// 선언으로 이미 결정돼 있다.
+    pub declarations_rejected: usize,
 }
 
 /// ★(0.14.31 · WP-1 H-2 · CONTRACTS §C) **관문 코퍼스 보고서** — `cys gate-corpus --json` 의 봉투.
@@ -1088,6 +1135,23 @@ pub fn report_json(
             // ★사유는 경우마다 **다른 문면**이다(처방이 다르다) — 하나로 접으면 운영자가
             //   스위치를 되켜야 할 자리에서 파일 권한을 뒤진다.
             "reason": paste_reason.map(Value::from).unwrap_or(Value::Null),
+            // ★(0.14.31 · 수렴 R2 · reviewer-claude minor) **부분 착지**의 회계. `paste_safe`
+            //   는 전부/전무 축이라 "선언 둘 중 하나만 착지" 를 안전으로 낸다 — 그 봉투를 붙여
+            //   넣으면 거부된 선언이 파일에서 사라진다(오타를 고칠 원본까지). 그래서 개수를
+            //   싣고, 0 이 아니면 경고를 함께 낸다. `paste_safe` 자체는 뒤집지 않는다: 착지한
+            //   조임은 봉투에 그대로 실려 있고(관문 재개방 없음), 이 사실의 처방은 '붙여 넣기
+            //   전에 notes 의 거부 사유를 고쳐라' 이지 '이 산출물을 쓰지 마라' 가 아니다.
+            "declarations_rejected": resolved.declarations_rejected,
+            "warning": if resolved.declarations_rejected > 0 {
+                Value::from(format!(
+                    "봉투의 선언 {}건이 이 코퍼스에 착지하지 못했다(notes 의 거부 사유 참조). \
+                     이 봉투를 agents.json 에 붙여 넣으면 그 {}건이 파일에서 사라진다 — \
+                     먼저 거부 사유를 고치고 보고서를 다시 뜰 것",
+                    resolved.declarations_rejected, resolved.declarations_rejected
+                ))
+            } else {
+                Value::Null
+            },
         },
         // ★(0.14.31 · 리뷰 R1 · 독립 재유도 H2-B 개정) `policy` 열이 **어디까지 집행되는가**를
         //   산출물이 스스로 싣는다. 없으면 운영자는 `held_version_drift` 를 "이 버전에선 키가 안
@@ -1245,6 +1309,7 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
         mut notes,
         source,
         envelope_ignored,
+        declarations_rejected,
     } = resolve_raw(envelope, override_on);
     // ★해소 **직후**에 Fatal 바닥을 세운다(아래 [`restore_fatal_builtin_floor`]). 아래
     //   [`enforce_absence_cost`] 는 '집행 전후 대조' 라 replace 모드에서는 눈이 멀어 있다 —
@@ -1263,6 +1328,7 @@ pub fn resolve_with(envelope: Option<&Value>, override_on: bool) -> Resolved {
         gates: kept,
         notes,
         envelope_ignored,
+        declarations_rejected,
         source,
     }
 }
@@ -1625,6 +1691,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             source: Source::OverrideDisabled,
             // 봉투를 **읽지 않았다** — 반영/미반영을 말할 자리가 아니다(출처가 이미 말한다).
             envelope_ignored: false,
+            declarations_rejected: 0,
         };
     }
     let mut notes: Vec<String> = Vec::new();
@@ -1634,6 +1701,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             notes,
             source: Source::Builtin,
             envelope_ignored: false, // 키가 없다 = 지워질 선언이 없다
+            declarations_rejected: 0,
         };
     };
     if env_v.is_null() {
@@ -1643,6 +1711,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             notes,
             source: Source::Builtin,
             envelope_ignored: false, // 의도적 비움도 지워질 선언이 없다
+            declarations_rejected: 0,
         };
     }
     let Some(obj) = env_v.as_object() else {
@@ -1655,6 +1724,7 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             source: Source::Builtin,
             // ★운영자가 **무언가 써 두었는데** 파서가 통째로 버렸다 — 되먹임이 그것을 덮는다.
             envelope_ignored: true,
+            declarations_rejected: 0, // 선언 단위로 셀 수 없다(봉투가 통째로 비객체다)
         };
     };
     let mode = envelope_mode(obj.get("source").and_then(|v| v.as_str()), &mut notes);
@@ -1663,18 +1733,38 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
         .and_then(|v| v.as_str())
         .unwrap_or(MEASURED_ON)
         .to_string();
-    let decls: Vec<&Value> = obj
-        .get("gates")
+    // ★(0.14.31 · 수렴 R2 · codex major) `gates` 키의 **형(型)을 구분한다.** 종전은
+    //   `as_array()` 실패를 빈 배열로 접었고, 그래서 `{"gates":{…객체 하나…}}` 같은 흔한 오타가
+    //   ⓐ 선언 0건으로 접히고 ⓑ `envelope_ignored` 도 서지 않아 ⓒ 보고서가 `paste_safe=true`
+    //   와 빌트인 봉투를 냈다 — 안내대로 덮어쓰면 그 객체 선언이 파일에서 사라진다. 원 선언이
+    //   이미 파싱되지 않던 상태라 활성 관문의 재개방은 아니지만, "반영 0" 분기의 누락이다.
+    //   ★키 부재·명시 null·의도적 빈 배열은 **지울 선언이 없다** — 그 셋과 타입 오류를 가른다.
+    let gates_v = obj.get("gates");
+    let gates_malformed = matches!(gates_v, Some(v) if !v.is_array() && !v.is_null());
+    if gates_malformed {
+        notes.push(format!(
+            "{ADAPTER_KEY}.gates 가 배열이 아니다({}) — 선언을 한 건도 읽지 못했다. 이 보고서의 \
+             봉투를 붙여 넣으면 파일에 남아 있는 그 선언이 사라진다",
+            gates_v.map(kind_of).unwrap_or("없음")
+        ));
+    }
+    let decls: Vec<&Value> = gates_v
         .and_then(|v| v.as_array())
         .map(|a| a.iter().collect())
         .unwrap_or_default();
+    // 착지하지 못한 선언의 수(보고서 경고용 · 판정 재료 아님). 비배열은 **개수를 셀 수 없다**
+    // — 그 사실은 `envelope_ignored` 가 싣는다.
+    let mut rejected = 0usize;
 
     if mode == EnvelopeMode::Replace {
         let mut out: Vec<Gate> = Vec::new();
         for d in &decls {
             match parse_new_gate(d, &default_measured) {
                 Ok(g) => out.push(g),
-                Err(e) => notes.push(format!("replace 선언 무시: {e}")),
+                Err(e) => {
+                    rejected += 1;
+                    notes.push(format!("replace 선언 무시: {e}"));
+                }
             }
         }
         if out.is_empty() {
@@ -1688,7 +1778,9 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
                 notes,
                 source: Source::Builtin,
                 // 선언이 있었는데 전부 거부됐으면 되먹임이 그 선언을 지운다(선언 0건이면 지울 것도 없다).
-                envelope_ignored: !decls.is_empty(),
+                // ★비배열 `gates` 도 같은 사실이다(선언이 파일에 남아 있는데 한 줄도 반영되지 않았다).
+                envelope_ignored: gates_malformed || !decls.is_empty(),
+                declarations_rejected: rejected,
             };
         }
         // ★(0.14.31 · 리뷰 R2 · codex major) **중복 id 를 시끄럽게 만든다.** 버리지는 않는다 —
@@ -1723,16 +1815,19 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
             notes,
             source: Source::Replaced { count },
             envelope_ignored: false, // 선언이 코퍼스가 됐다
+            declarations_rejected: rejected,
         };
     }
     let mut gates = base;
     let (mut overridden, mut added) = (0usize, 0usize);
     for d in &decls {
         let Some(dm) = d.as_object() else {
+            rejected += 1;
             notes.push("gates[] 항목이 객체가 아니다 — 무시".to_string());
             continue;
         };
         let Some(id) = dm.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            rejected += 1;
             notes.push("gates[] 항목에 id 가 없다 — 무시".to_string());
             continue;
         };
@@ -1747,7 +1842,10 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
                     gates.push(g);
                     added += 1;
                 }
-                Err(e) => notes.push(format!("신규 관문 선언 무시: {e}")),
+                Err(e) => {
+                    rejected += 1;
+                    notes.push(format!("신규 관문 선언 무시: {e}"));
+                }
             },
         }
     }
@@ -1761,7 +1859,22 @@ fn resolve_raw(envelope: Option<&Value>, override_on: bool) -> Resolved {
         },
         // ★선언이 있었는데 **하나도** 착지하지 못했다(id 결손·비객체·needle 결손 신규 선언 …).
         //   그 상태의 보고서 봉투를 붙여 넣으면 파일에 남아 있던 그 선언들이 빌트인으로 덮인다.
-        envelope_ignored: !decls.is_empty() && overridden == 0 && added == 0,
+        //   ★비배열 `gates` 도 같은 사실이다(codex major) — `decls` 가 비어 접히므로 이 항이
+        //     없으면 "반영 0" 분기가 통째로 비어 있다.
+        envelope_ignored: gates_malformed || (!decls.is_empty() && overridden == 0 && added == 0),
+        declarations_rejected: rejected,
+    }
+}
+
+/// 진단 문면용 JSON 형(型) 이름 — 파서가 되읽는 값이 아니다(사람이 읽는 한 마디).
+fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -3222,7 +3335,8 @@ mod tests {
                 screen,
                 gates: &gs,
                 awakened,
-                cli_version: None,
+                cli_versions: &[],
+                version_pin_legacy: false,
                 guard_off: false,
                 readiness_legacy: false,
             };
@@ -4124,6 +4238,7 @@ mod tests {
             notes: vec!["어댑터 스펙 판독 실패(no such file) — 코드 정본 폴백".to_string()],
             source: Source::SpecUnreadable { reason: "no such file".to_string() },
             envelope_ignored: false, // 스펙에 도달조차 못 했다(출처가 그 사실을 싣는다)
+            declarations_rejected: 0,
         };
         let v = report_json(&broken, "claude", None, None);
         assert_eq!(v["source"].as_str(), Some("spec_unreadable"), "고장이 정상과 같은 값으로 접혔다");
@@ -4624,6 +4739,131 @@ mod tests {
             report_json(&r, "claude", None, None)["override_envelope_status"]["paste_safe"].as_bool(),
             Some(true)
         );
+    }
+
+    /// ★(0.14.31 · 수렴 R2 · codex major) `gates` 가 **배열이 아닐 때**도 "반영 0" 이다.
+    ///
+    /// 【무엇이 비어 있었나】 `obj.get("gates").and_then(|v| v.as_array())` 는 타입 오류를 빈
+    /// 배열로 접었다. 그래서 `{"gates":{…객체 하나…}}`(흔한 오타)는 `decls=[]` → `Builtin` →
+    /// `envelope_ignored=false` → **`paste_safe=true` + 빌트인 봉투**가 됐고, 안내대로 덮어쓰면
+    /// 파일의 그 객체 선언이 사라진다. 원 선언은 이미 파싱되지 않던 상태라 활성 관문의 재개방은
+    /// 아니지만(그래서 major-not-blocking), 이번 수리가 세운 "반영 0" 분기의 **누락**이다.
+    ///
+    /// 【가르는 것 셋】 키 부재 · 명시 `null` · **의도적 빈 배열**은 지울 선언이 없다(안전).
+    /// 타입 오류만 봉투를 `null` 로 낸다.
+    #[test]
+    fn non_array_gates_declaration_is_recorded_as_unapplied_and_refuses_paste_material() {
+        for (label, bad) in [
+            ("객체", json!({"id": "ops-extra-gate", "needles": ["Approve this workspace policy?"],
+                            "passability": "human_only"})),
+            ("문자열", json!("ops-extra-gate")),
+            ("숫자", json!(3)),
+            ("불리언", json!(true)),
+        ] {
+            let env = json!({"gates": bad});
+            let r = resolve_with(Some(&env), true);
+            assert_eq!(r.source, Source::Builtin, "{label}: 전제(출처는 Builtin 으로 접힌다)");
+            assert!(
+                r.envelope_ignored,
+                "{label}: `gates` 타입 오류가 '반영 0' 으로 서지 않는다 — 보고서가 빌트인 봉투를 \
+                 내고, 붙여 넣으면 원 선언이 사라진다"
+            );
+            assert!(
+                r.notes.iter().any(|n| n.contains("배열이 아니다")),
+                "{label}: 왜 한 건도 읽지 못했는지 말하지 않는다 → {:?}",
+                r.notes
+            );
+            let v = report_json(&r, "claude", None, None);
+            assert_eq!(v["override_envelope"], Value::Null, "{label}: 붙여넣기 재료를 내준다");
+            assert_eq!(v["override_envelope_status"]["paste_safe"].as_bool(), Some(false));
+        }
+        // replace 모드에서도 같다(빈 코퍼스 폴백을 타는 경로).
+        let repl_env = json!({"source": "replace", "gates": {"id": "x"}});
+        let repl = resolve_with(Some(&repl_env), true);
+        assert!(repl.envelope_ignored, "replace 경로의 타입 오류가 '반영 0' 으로 서지 않는다");
+
+        // ── 대조군: **의도적 빈 배열**은 지울 선언이 없다(안전 · 타입 오류와 가른다).
+        let empty = resolve_with(Some(&json!({"gates": []})), true);
+        assert!(!empty.envelope_ignored, "빈 배열(의도적)이 타입 오류와 같은 값으로 접혔다");
+        assert_eq!(
+            report_json(&empty, "claude", None, None)["override_envelope_status"]["paste_safe"]
+                .as_bool(),
+            Some(true)
+        );
+    }
+
+    /// ★(0.14.31 · 수렴 R2 · reviewer-claude minor) **부분 착지**의 회계 — 거부된 선언 수가
+    /// 산출물에 실리고 경고가 붙는다.
+    ///
+    /// 【형상】 `folder-trust` 조이기(착지) + 신설 관문(needles 결손 · 거부) 두 선언.
+    /// `Merged{1,0}` 이라 `envelope_ignored=false` 이고 `paste_safe=true` 다 — 효력 있던 조임은
+    /// 봉투에 그대로 실리므로 관문 재개방은 없다(그래서 minor). 그러나 안내대로 붙여 넣으면
+    /// **거부된 선언이 파일에서 사라진다**(오타를 고칠 원본까지). 최소 조치는 그 수를 싣는 것.
+    #[test]
+    fn partially_applied_envelope_reports_how_many_declarations_were_rejected() {
+        let env = json!({"gates": [
+            {"id": "folder-trust", "passability": "human_only"},
+            {"id": "ops-extra-gate", "passability": "human_only"}, // needles 결손 → 거부
+        ]});
+        let r = resolve_with(Some(&env), true);
+        assert!(matches!(r.source, Source::Merged { overridden: 1, added: 0 }), "전제 → {:?}", r.source);
+        assert!(!r.envelope_ignored, "전제: 전부/전무 축은 '반영됨' 이다(그래서 이 회계가 필요하다)");
+        assert_eq!(r.declarations_rejected, 1, "거부된 선언을 세지 않는다");
+
+        let v = report_json(&r, "claude", None, None);
+        assert_eq!(v["override_envelope_status"]["paste_safe"].as_bool(), Some(true));
+        assert_eq!(v["override_envelope_status"]["declarations_rejected"].as_u64(), Some(1));
+        assert!(
+            v["override_envelope_status"]["warning"].as_str().is_some_and(|w| w.contains("1건")),
+            "부분 착지인데 경고가 없다 → {:?}",
+            v["override_envelope_status"]
+        );
+        // 그리고 **착지한 조임은 봉투에 살아 있다**(이 사실이 이 항을 minor 로 만든다).
+        let landed = v["override_envelope"]["gates"]
+            .as_array()
+            .expect("봉투")
+            .iter()
+            .find(|g| g["id"].as_str() == Some("folder-trust"))
+            .expect("folder-trust 선언")
+            .clone();
+        assert_eq!(landed["passability"].as_str(), Some("human_only"));
+
+        // 대조군 — 전부 착지하면 경고가 없다(정상 기계에 소음을 만들지 않는다).
+        let ok = resolve_with(Some(&json!({"gates": [{"id": "folder-trust", "passability": "human_only"}]})), true);
+        assert_eq!(ok.declarations_rejected, 0);
+        let ov = report_json(&ok, "claude", None, None);
+        assert_eq!(ov["override_envelope_status"]["declarations_rejected"].as_u64(), Some(0));
+        assert_eq!(ov["override_envelope_status"]["warning"], Value::Null);
+    }
+
+    /// ★(0.14.31 · 수렴 R2 · reviewer-claude minor) **줄바꿈으로 접힌 배너**에서도 버전을 읽는다.
+    ///
+    /// 좁은 pane·ConPTY 에서 배너는 상자 안에서 접힌다. 연속 앵커(`Claude Code v`)만 요구하면
+    /// 그 화면의 버전 증거는 **통째로 사라지고**(미상 → 통과), 이 축의 유일한 증거가 화면
+    /// 문자열이라 그 손실은 곧 드리프트 미탐이다. 실패 방향은 종전과 같지만(새 구멍은 아니다)
+    /// 닫을 수 있으면 닫는다.
+    ///
+    /// ★라이브 좌석에서 배너가 **실제로 어디에 어떤 폭으로** 찍히는지는 아직 미관측이다 —
+    ///   릴리스 게이트 항목으로 남는다(커밋 Not-tested).
+    #[test]
+    fn banner_version_survives_a_line_wrapped_box_render() {
+        let wrapped = "│ ✻ Welcome to Claude\n│   Code v2.1.263      │\n│ /help for help       │\n";
+        assert_eq!(
+            banner_versions(wrapped),
+            vec!["2.1.263".to_string()],
+            "접힌 배너에서 버전 증거가 사라진다"
+        );
+        // 종전 형상(한 줄)은 그대로 읽는다 — 그리고 두 패스가 같은 값을 중복으로 싣지 않는다.
+        assert_eq!(
+            banner_versions("Welcome to Claude Code v2.1.263\n"),
+            vec!["2.1.263".to_string()]
+        );
+        // 접힌 배너 둘이면 합집합이다(불일치가 하나라도 있으면 확인 경계가 문다).
+        let two = format!("{wrapped}(중략)\n│ Welcome to Claude\n│ Code v2.1.241 │\n");
+        assert_eq!(banner_versions(&two), vec!["2.1.263".to_string(), "2.1.241".to_string()]);
+        // 앵커가 없으면 여전히 미상이다(추정 금지 — 접기 패스가 판독기를 넓히지 않는다).
+        assert!(banner_versions("2.1.263 (Claude Code)\n").is_empty());
+        assert!(banner_versions(fixtures::FOLDER_TRUST).is_empty());
     }
 
     /// ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 3) 화면용 판독기와 `--version` 용 판독기를

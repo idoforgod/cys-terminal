@@ -1051,12 +1051,12 @@ mod tests {
         }
         assert_eq!(ENV_OBSERVE_ONLY, "CYS_PROFILE_GATE_OBSERVE_ONLY");
         // 마스터 스위치 하나로 이 축도 종전(관측 전용)으로 돌아간다.
-        let master = crate::gate_axes_from(Some("0"), None, None, None, None, None, None);
+        let master = crate::gate_axes_from(Some("0"), None, None, None, None, None, None, None);
         assert!(master.profile_gate_observe_only, "★마스터 스위치가 이 축에 닿지 않는다");
-        let none = crate::gate_axes_from(None, None, None, None, None, None, None);
+        let none = crate::gate_axes_from(None, None, None, None, None, None, None, None);
         assert!(!none.profile_gate_observe_only, "기본에서 축이 꺼졌다");
         // 축 노브 단독도 자기 축만 끈다(교차 오염 금지).
-        let only = crate::gate_axes_from(None, None, None, None, None, None, Some("1"));
+        let only = crate::gate_axes_from(None, None, None, None, None, None, Some("1"), None);
         assert!(only.profile_gate_observe_only);
         assert!(!only.readiness_legacy && !only.gate_pending_close, "축 노브가 다른 축을 건드렸다");
         // env 판독은 1지점이다(형제 축과 같은 규율).

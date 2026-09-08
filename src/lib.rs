@@ -701,7 +701,7 @@ pub fn gate_pending_axis_effective_from(
     close_env: Option<&str>,
     axis_env: Option<&str>,
 ) -> bool {
-    !gate_axes_from(master_env, None, None, None, close_env, axis_env, None).gate_pending_close
+    !gate_axes_from(master_env, None, None, None, close_env, axis_env, None, None).gate_pending_close
 }
 
 /// **축 노브 하나만** 보는 순수 코어 — `"0"` 만 끈다.
@@ -891,6 +891,16 @@ pub struct GateAxes {
     /// 사람이 조합을 기억해야 한다(BLOCK-3 이 그 값을 치렀다). 새 축은 태어날 때 마스터에
     /// 접는다 — `CYS_BOOT_GATES=0` 하나로 이 판정기도 함께 종전(차단 없음)으로 돌아간다.
     pub profile_gate_observe_only: bool,
+    /// ★(H2-B · 수렴 R2) 관문 **확인 경계의 버전 대조**가 관측 전용으로 강등됐는가
+    /// (= 버전을 보지 않던 종전 · [`inject_guard::confirm_denied`] 의 축 ⑤).
+    ///
+    /// 이 축이 여기 있는 이유(reviewer-claude major · codex blocking 재기): 이 축의 보류는
+    /// **재실측 전 기계의 기본 상태**다. 마스터를 눌러도 이 축만 엄격하게 남으면
+    /// ⓐ Return 은 끝내 안 나가고 ⓑ readiness 는 legacy 라 관문 화면을 Ready 라 하고
+    /// ⓒ 주입 가드는 강등돼 디렉티브가 신뢰 모달로 들어가고 ⓓ `gate_pending_close` 가 좌석을
+    /// 닫는다 — 문서화된 롤백 손잡이 하나로 §7 봉인표의 '전 pane 사망' 이 재현된다.
+    /// **엄격화와 보류는 한 몸**(BLOCK-4)이라, 이 축도 예외가 아니다.
+    pub version_pin_legacy: bool,
 }
 
 /// ★판정 축의 **순수 접기 함수**(진리표 대상). env 는 하나도 읽지 않는다.
@@ -908,6 +918,7 @@ pub fn gate_axes_from(
     close_env: Option<&str>,
     axis_env: Option<&str>,
     profile_gate_env: Option<&str>,
+    version_pin_env: Option<&str>,
 ) -> GateAxes {
     // 보류 장치가 꺼졌는가 = 마스터 ∨ 강등 스위치 ∨ 축 스위치.
     let holding_off = boot_gates_master_off_from(master_env)
@@ -919,6 +930,7 @@ pub fn gate_axes_from(
         gate_pending_close: holding_off,
         profile_gate_observe_only: holding_off
             || profile_gate::observe_only_from(profile_gate_env),
+        version_pin_legacy: holding_off || inject_guard::version_pin_legacy_from(version_pin_env),
     }
 }
 
@@ -932,6 +944,7 @@ pub fn gate_axes() -> GateAxes {
         std::env::var(ENV_GATE_PENDING_CLOSE).ok().as_deref(),
         std::env::var(ENV_GATE_PENDING).ok().as_deref(),
         std::env::var(profile_gate::ENV_OBSERVE_ONLY).ok().as_deref(),
+        std::env::var(inject_guard::ENV_VERSION_PIN).ok().as_deref(),
     )
 }
 
@@ -2770,6 +2783,10 @@ mod tests {
     /// ★(U-17) 축이 여섯에서 일곱으로 늘었다 — 핀을 **지우지 않고 이사**시켰다: 기존 세 축
     /// 단언은 그대로 두고 `profile_gate_observe_only` 를 같은 AND 사슬에 **추가**한다.
     /// 새 축만 엄격하게 남으면 마스터 스위치가 다시 거짓말이 되기 때문이다(완화가 아니라 강화).
+    ///
+    /// ★(0.14.31 · 수렴 R2) 여덟 번째 축 `version_pin_legacy`(확인 경계의 버전 대조)도 같은
+    /// 사슬에 **추가**한다. 이 축을 빠뜨린 판이 정확히 reviewer-claude major/codex blocking
+    /// 재기의 형상이었다: 마스터를 눌러도 버전 축만 엄격해 Return 이 0발인 채 좌석이 close 됐다.
     #[test]
     fn strict_judgment_and_immediate_close_is_unreachable_in_every_env_combination() {
         const VALS: [Option<&str>; 5] = [None, Some(""), Some("0"), Some("1"), Some("true")];
@@ -2781,18 +2798,20 @@ mod tests {
                         for c in VALS {
                             for a in VALS {
                                 for p in VALS {
-                                let ax = super::gate_axes_from(m, r, g, t, c, a, p);
+                                for vp in VALS {
+                                let ax = super::gate_axes_from(m, r, g, t, c, a, p, vp);
                                 if ax.gate_pending_close {
                                     close_seen += 1;
                                     assert!(
                                         ax.readiness_legacy
                                             && ax.inject_guard_off
                                             && ax.trust_legacy
-                                            && ax.profile_gate_observe_only,
+                                            && ax.profile_gate_observe_only
+                                            && ax.version_pin_legacy,
                                         "★재난④ 조합: 보류가 close 로 강등됐는데 판정 축이 \
                                          엄격하게 남았다 — master={m:?} readiness={r:?} \
                                          guard={g:?} trust={t:?} close={c:?} axis={a:?} \
-                                         profile={p:?} → {ax:?}"
+                                         profile={p:?} version_pin={vp:?} → {ax:?}"
                                     );
                                 }
                                 if super::boot_gates_master_off_from(m) {
@@ -2802,9 +2821,11 @@ mod tests {
                                             && ax.inject_guard_off
                                             && ax.trust_legacy
                                             && ax.gate_pending_close
-                                            && ax.profile_gate_observe_only,
+                                            && ax.profile_gate_observe_only
+                                            && ax.version_pin_legacy,
                                         "마스터 스위치가 전 축을 되돌리지 못했다 → {ax:?}"
                                     );
+                                }
                                 }
                                 }
                             }
@@ -2830,9 +2851,9 @@ mod tests {
             "계측 무효: 구 조립에서 '엄격 + 즉시 close' 가 성립하지 않는다면 BLOCK-4 서사가 틀린 것"
         );
         // 지금 조립은 같은 입력에서 판정도 함께 종전으로 푼다.
-        let ax = super::gate_axes_from(None, None, None, None, None, Some("0"), None);
+        let ax = super::gate_axes_from(None, None, None, None, None, Some("0"), None, None);
         assert!(ax.gate_pending_close && ax.readiness_legacy && ax.inject_guard_off
-                    && ax.profile_gate_observe_only,
+                    && ax.profile_gate_observe_only && ax.version_pin_legacy,
                 "축 스위치 단독이 여전히 엄격 판정을 남긴다 → {ax:?}");
     }
 
@@ -2841,7 +2862,7 @@ mod tests {
     #[test]
     fn master_switch_alone_restores_the_previous_behavior_on_every_axis() {
         // ① `CYS_READINESS_V1=1` 단독 — ready 는 나지만 주입 가드가 그대로다(= 여전히 rc 78).
-        let only_v1 = super::gate_axes_from(None, Some("1"), None, None, None, None, None);
+        let only_v1 = super::gate_axes_from(None, Some("1"), None, None, None, None, None, None);
         assert!(only_v1.readiness_legacy);
         assert!(
             !only_v1.inject_guard_off,
@@ -2849,14 +2870,14 @@ mod tests {
              이 대조군이 마스터 스위치의 존재 이유다"
         );
         // ② `CYS_INJECT_GATE_GUARD=0` 단독 — 가드만 열리고 판정은 엄격(관문 화면은 보류).
-        let only_guard = super::gate_axes_from(None, None, Some("0"), None, None, None, None);
+        let only_guard = super::gate_axes_from(None, None, Some("0"), None, None, None, None, None);
         assert!(only_guard.inject_guard_off && !only_guard.readiness_legacy);
         // ③ 리뷰어가 찾은 '종전 복귀의 유일한 조합' — 사람이 둘을 동시에 기억해야 했다.
-        let both = super::gate_axes_from(None, Some("1"), Some("0"), None, None, None, None);
+        let both = super::gate_axes_from(None, Some("1"), Some("0"), None, None, None, None, None);
         assert!(both.readiness_legacy && both.inject_guard_off);
         assert!(!both.gate_pending_close, "노브 둘이 보류 귀결까지 바꾸면 축 경계가 무너진다");
         // ④ ★마스터 하나 = 네 축 전부 종전.
-        let master = super::gate_axes_from(Some("0"), None, None, None, None, None, None);
+        let master = super::gate_axes_from(Some("0"), None, None, None, None, None, None, None);
         assert_eq!(
             master,
             super::GateAxes {
@@ -2865,6 +2886,7 @@ mod tests {
                 trust_legacy: true,
                 gate_pending_close: true,
                 profile_gate_observe_only: true,
+                version_pin_legacy: true,
             },
             "마스터 스위치가 '하나를 끄면 전부 복귀' 계약을 지키지 못한다"
         );
@@ -2890,8 +2912,9 @@ mod tests {
         assert_eq!(r.matches(FOLD).count(), 1, "readiness 축이 상위 접기값을 소비하지 않는다");
         assert_eq!(
             g.matches(FOLD).count(),
-            2,
-            "inject_guard 의 두 축(가드·신뢰) 중 하나가 상위 접기값을 소비하지 않는다"
+            3,
+            "inject_guard 의 세 축(가드·신뢰·버전 핀) 중 하나가 상위 접기값을 소비하지 않는다 \
+             — 하나라도 빠지면 마스터를 눌러도 그 축만 엄격하게 남는다(수렴 R2 회귀)"
         );
         assert_eq!(
             pg.matches(FOLD).count(),
@@ -2903,6 +2926,7 @@ mod tests {
         assert_eq!(r.matches("std::env::var(ENV_V1)").count(), 1);
         assert_eq!(g.matches("std::env::var(ENV_GUARD_OFF)").count(), 1);
         assert_eq!(g.matches("std::env::var(ENV_TRUST_V1)").count(), 1);
+        assert_eq!(g.matches("std::env::var(ENV_VERSION_PIN)").count(), 1);
         assert_eq!(pg.matches("std::env::var(ENV_OBSERVE_ONLY)").count(), 1);
     }
 
@@ -2940,7 +2964,7 @@ mod tests {
         for m in VALS {
             for c in VALS {
                 for a in VALS {
-                    let ax = super::gate_axes_from(m, None, None, None, c, a, None);
+                    let ax = super::gate_axes_from(m, None, None, None, c, a, None, None);
                     assert_eq!(
                         on(m, c, a),
                         !ax.gate_pending_close,

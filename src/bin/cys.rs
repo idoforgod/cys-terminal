@@ -713,6 +713,11 @@ enum Command {
         ///   `state="version_drift_only"`: 버전 **불일치**면 그 관문의 자동확인 Return 이 0발이고
         ///   (= 사람 1회 필요), **미상**은 여전히 통과하며, `allowed` 의 down 다발 전송은 배선 0 이다.
         ///   `enforced` 는 **판정 전량** 집행 여부라 부분 집행에서 `false` 다(`axes` 를 볼 것).
+        /// ★그 축의 **롤백 노브는 `CYS_GATE_VERSION_PIN=0`** 이다(0.14.31 수렴 R2) — 재실측 전
+        ///   기계에서 드리프트는 기본 상태라, 마스터(`CYS_BOOT_GATES=0`)를 누르는 대신 이 축만
+        ///   되돌린다. 마스터는 보류를 **close 로 강등**하므로 이 축의 탈출구로 쓰면 안 된다.
+        /// ★`override_envelope_status.declarations_rejected` — 봉투에 있었으나 착지하지 못한
+        ///   선언의 수. 0 이 아니면 `warning` 이 함께 선다(그 봉투를 붙여 넣으면 그만큼 사라진다).
         #[arg(long)]
         json: bool,
         /// 어댑터 이름 — 코드 정본 코퍼스는 **claude 실측**이다(`MEASURED_ON` 도 claude 버전).
@@ -1942,6 +1947,7 @@ fn resolve_gate_corpus(agent: &str) -> cys::first_run_gates::Resolved {
                 },
                 // 스펙 자체에 도달하지 못했다 — '봉투가 무시됐다' 와 다른 사실이고, 출처가 이미 싣는다.
                 envelope_ignored: false,
+                declarations_rejected: 0,
             }
         }
     };
@@ -2082,7 +2088,8 @@ fn gate_guard_decide_in_boot(
         awakened: Some(false), // 부트 창은 상수다(위 doc 참조)
         guard_off: cys::inject_guard::guard_off(),
         readiness_legacy: cys::readiness::legacy_v1(),
-        cli_version: None, // 위와 같은 이유(보류 판정은 버전을 보지 않는다)
+        cli_versions: &[], // 위와 같은 이유(보류 판정은 버전을 보지 않는다)
+        version_pin_legacy: false, // 이 자리는 확인 경계가 아니다 — 버전 축을 소비하지 않는다
     })
 }
 
@@ -2114,7 +2121,8 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
         readiness_legacy: cys::readiness::legacy_v1(),
         // 주입 **보류** 판정은 버전을 보지 않는다(관문 화면이면 어느 버전이든 막는다).
         //   버전 축은 키를 **쏘는** 자리(확인 경계)에만 든다 — H2-B.
-        cli_version: None,
+        cli_versions: &[],
+        version_pin_legacy: false,
     });
     match decision {
         cys::inject_guard::Decision::Send => Ok(()),
@@ -11849,7 +11857,21 @@ fn boot_agent_on_surface(
     //   나지만 델타에서는 밀려나지 않는다. 그 증거 소멸이 정확히 "한 틱은 거부, 다음 틱은 미상이라
     //   통과" 를 만드는 경로였다(codex 설계 검토 3).
     //   ★`ps`·PATH 의 `claude` 를 근거로 쓰지 않는다(그 바이너리가 아니다 — 워커 노트 §6-7-1).
-    let mut seat_cli_version: Option<String> = None;
+    //   ★(수렴 R2) 래치는 **값 하나가 아니라 합집합**이다. 값 하나를 sticky 로 들면 첫 틱의
+    //     잔상 배너(이전 좌석 · 실측본과 같은 값)가 뒤에 실린 진짜 버전을 영구히 덮는다.
+    let mut seat_cli_versions: Vec<String> = Vec::new();
+    //   ★버전 축의 롤백 노브도 루프 밖에서 1회만 읽는다(env 1지점 · 판정 재료 일관성).
+    //     마스터(`CYS_BOOT_GATES=0`)·보류 강등이 켜지면 이 값도 참이 된다 — 보류가 close 가
+    //     되는 조합에서 이 축만 엄격하면 좌석은 Return 도 못 받고 닫힌다(BLOCK-4).
+    let version_pin_legacy = cys::inject_guard::version_pin_legacy();
+    if version_pin_legacy {
+        eprintln!(
+            "[launch-agent] ⚠ 버전 축 종전({}=0 또는 마스터 {}=0) — 좌석이 밝힌 claude 버전이 \
+             코퍼스 실측본과 달라도 자동확인을 보류하지 않는다",
+            cys::inject_guard::ENV_VERSION_PIN,
+            cys::ENV_BOOT_GATES
+        );
+    }
     let mut trust_seen_at: Option<u64> = None; // 프롬프트를 관측한 시점의 델타 커서
     // ★(0.14.31 · 리뷰 R5) 확인 거부 사유의 **1회 로그** 래치(사유가 바뀌면 다시 찍는다).
     let mut trust_denied_logged: Option<String> = None;
@@ -11879,11 +11901,11 @@ fn boot_agent_on_surface(
         let delta_text = delta["text"].as_str().unwrap_or("").to_string();
         let delta_cursor = delta["next_cursor"].as_u64().unwrap_or(since_line);
         let delta_flat: String = delta_text.chars().filter(|c| !c.is_whitespace()).collect();
-        // ★(H2-B) 버전 배너 래치 — **처음 본 것 하나**만 잡는다(이 기동의 배너는 좌석이 스스로
-        //   찍은 첫 줄이다). 뒤에 다른 배너가 섞여 들어와도 확인 경계가 화면 배너 전량을 함께
-        //   대조하므로(합집합) 놓치지 않는다.
-        seat_cli_version =
-            cys::inject_guard::latch_seat_version(seat_cli_version, &delta_text, text);
+        // ★(H2-B · 수렴 R2) 버전 배너 래치 — 이 부트에서 관측한 버전을 **전부 모은다**(단조
+        //   합집합 · 지우지도 덮지도 않는다). 화면 배너는 관문 렌더에 밀려나고 잔상은 앞 틱에만
+        //   있으므로, 시간축의 증거를 잃지 않는 유일한 형태가 합집합이다.
+        seat_cli_versions =
+            cys::inject_guard::latch_seat_versions(seat_cli_versions, &delta_text, text);
         // ① 기동 실패 — **신규 출현분에서만** 판정한다(잔존 에러 텍스트로 새 기동을 죽이지 않는다).
         if screen_shows_launch_failure(&delta_flat) {
             // ★(U-11) 화면이 기동 실패를 **확증**한 유일한 지점 — 종전 귀결(close)을 그대로
@@ -11922,9 +11944,11 @@ fn boot_agent_on_surface(
                     awakened: Some(false), // 부트 창은 상수다(구 데몬에서 꺼지면 안 된다)
                     guard_off: cys::inject_guard::guard_off(),
                     readiness_legacy: readiness_v1, // 루프 밖 1회 판독값(판정 재료 일관성)
-                    // ★(H2-B) 이 기동의 버전 증거. 확인 경계는 이것과 화면 배너의 **합집합**을
-                    //   실측본과 대조해, 하나라도 다르면 Return 을 보내지 않는다.
-                    cli_version: seat_cli_version.as_deref(),
+                    // ★(H2-B) 이 기동의 버전 증거 **전량**. 확인 경계는 이것과 화면 배너의
+                    //   **합집합**을 실측본과 대조해, 하나라도 다르면 Return 을 보내지 않는다.
+                    cli_versions: &seat_cli_versions,
+                    // ★(수렴 R2) 그 축의 롤백값(마스터·보류 접기 포함 · 루프 밖 1회 판독).
+                    version_pin_legacy,
                 },
                 cys::inject_guard::GATE_FOLDER_TRUST,
             );
@@ -15382,7 +15406,8 @@ fn gate_guard_check_on(
         readiness_legacy: cys::readiness::legacy_v1(),
         // 주입 **보류** 판정은 버전을 보지 않는다(관문 화면이면 어느 버전이든 막는다).
         //   버전 축은 키를 **쏘는** 자리(확인 경계)에만 든다 — H2-B.
-        cli_version: None,
+        cli_versions: &[],
+        version_pin_legacy: false,
     }) {
         cys::inject_guard::Decision::Send => Ok(()),
         cys::inject_guard::Decision::SendObserved(hit) => {
@@ -24078,8 +24103,9 @@ mod tests {
     /// 맞출 수 있다). 집행 자체는 실행 검체가 잰다:
     /// `inject_guard::tests::confirm_is_denied_when_the_screen_declares_a_version_the_corpus_never_measured`
     /// (불일치 → 확인 거부 · 전송 0)와
-    /// `inject_guard::tests::version_axis_holds_on_drift_evidence_but_unknown_still_passes`
-    /// (미상 통과 · 래치 증거 · 배너 소멸 후에도 유지). 이 핀이 재는 것은 **범위**뿐이다.
+    /// `inject_guard::tests::version_axis_holds_on_any_drifting_evidence_but_unknown_still_passes`
+    /// (미상 통과 · 래치 증거 · 배너 소멸 후에도 유지 · 축 노브의 롤백). 이 핀이 재는 것은
+    /// **범위**뿐이다.
     #[test]
     fn action_policy_version_axis_is_wired_only_as_drift_denial_source_pin() {
         let src = include_str!("cys.rs");
@@ -24132,14 +24158,15 @@ mod tests {
         // ★그리고 **증거 생산자**가 이 파일에 살아 있다. 확인 경계가 아무리 옳게 판정해도 부트 루프가
         //   래치를 만들지 않으면 증거는 화면 한 틱짜리가 되고, 배너가 관문 렌더에 밀려나는 순간
         //   드리프트 거부가 저절로 풀린다(변이검증 M7: 이 두 줄을 지웠을 때 어떤 검체도 물지 않았다).
-        //   규칙 자체의 집행은 `inject_guard::tests::seat_version_latch_is_sticky_and_prefers_the_cumulative_delta`.
+        //   규칙 자체의 집행은
+        //   `inject_guard::tests::seat_version_latch_accumulates_every_observed_version_and_never_forgets`.
         assert!(
-            prod.contains("latch_seat_version(seat_cli_version, &delta_text, text)"),
+            prod.contains("latch_seat_versions(seat_cli_versions, &delta_text, text)"),
             "부트 루프가 좌석 기동 버전 래치를 더는 만들지 않는다 — 확인 경계의 버전 축이 화면 \
              한 틱짜리 증거로 되돌아갔다"
         );
         assert!(
-            prod.contains("cli_version: seat_cli_version.as_deref()"),
+            prod.contains("cli_versions: &seat_cli_versions"),
             "래치를 만들기만 하고 확인 경계에 넘기지 않는다 — 판정 입력에 닿지 않는 관측은 장식이다"
         );
         // 그리고 그 사실이 **산출물에 실린다**(사람이 코드를 읽지 않아도 된다).
@@ -24161,6 +24188,162 @@ mod tests {
             report["policy_enforcement"]["scope"].as_str(),
             Some("cli-auto-confirm"),
             "집행 범위 표기가 사라졌다 — 범위 없는 '미집행' 은 데몬까지의 전역 주장으로 오독된다"
+        );
+    }
+
+    /// ★(0.14.31 · 수렴 R2 · codex blocking 재기 · reviewer-claude major) **확인 거부부터
+    /// readiness · 타임아웃 · close 까지 이어 붙인 사슬** — 버전 보류가 좌석의 close 로 바뀌는
+    /// 조합이 **어느 env 조합에서도 성립하지 않는다**.
+    ///
+    /// 【무엇이 지적됐나】 새 버전 거부는 롤백에서도 유지되는데, 타임아웃 처리는 여전히
+    /// `gate_close_override` 로 `GatePending` 을 `LaunchFailed` 로 강등하고 호출부가
+    /// `surface.close` 를 부른다(cys.rs:14621). 그래서 `CYS_BOOT_GATES=0` · 생존 좌석
+    /// (`agent_alive=null`) · 신뢰 확인을 받아야 나오는 ready 마커라는 조합에서
+    /// ⓐ 버전 거부로 Return 이 0발 → ⓑ 마커·생존 양성 증거 없음 → ⓒ 타임아웃 → ⓓ 강등 → close.
+    /// **종전에는 Yes 위 Return 으로 진행하던 좌석**이 이 변경 때문에 닫힌다.
+    ///
+    /// 【고친 방향】 축을 `gate_axes_from` 에 접었다 — 보류 장치가 꺼진(close 강등) 조합에서는
+    /// 버전 축도 종전(관측 전용)이 되므로 **보류 자체가 생기지 않고** Return 이 나간다.
+    /// 이것이 BLOCK-4 불변식("보류 없는 엄격은 없다")의 이 축에 대한 적용이다. 반대 방향
+    /// (보류를 유지한 채 close 만 면제)은 택하지 않았다 — 그러면 운영자에게 이 축을 되돌릴
+    /// 손잡이가 하나도 없고, 좌석은 닫히지 않는 대신 관문에 **영구히** 서고 강등된 주입 가드가
+    /// 디렉티브를 신뢰 모달에 밀어 넣는다(같은 사고의 다른 이름).
+    ///
+    /// ★사슬의 세 마디(확인 경계 · 타임아웃 판정 · 강등)를 **같은 검체 안에서** 잰다 —
+    ///   마디마다 따로 재면 이 조합이 다시 열려도 어느 검체도 물지 않는다.
+    #[test]
+    fn version_drift_hold_and_the_close_downgrade_are_unreachable_together_end_to_end() {
+        use cys::first_run_gates::fixtures;
+        let gs = cys::first_run_gates::builtin();
+        let measured = gs
+            .iter()
+            .find(|g| g.id == cys::inject_guard::GATE_FOLDER_TRUST)
+            .expect("코퍼스에 folder-trust")
+            .measured_on
+            .clone();
+        let live = "2.1.263"; // 이 기계의 라이브 claude(= 드리프트가 기본 상태)
+        assert_ne!(live, measured.as_str(), "전제: 라이브 버전이 실측본과 다르다");
+        let screen = format!("Welcome to Claude Code v{live}\n{}", fixtures::FOLDER_TRUST);
+        let latch = vec![live.to_string()];
+
+        const VALS: [Option<&str>; 3] = [None, Some("0"), Some("1")];
+        let (mut close_seen, mut hold_seen) = (0usize, 0usize);
+        for m in VALS {
+            for c in VALS {
+                for a in VALS {
+                    for vp in VALS {
+                        let ax = cys::gate_axes_from(m, None, None, None, c, a, None, vp);
+                        // 프로덕션이 close 강등에 쓰는 값과 **같은 순수 술어**다(사본 0 ·
+                        // `gate_close_override_once()` 가 env 로 읽는 바로 그 접기).
+                        let close_override = cys::gate_pending_close_override_from(c, a)
+                            || cys::boot_gates_master_off_from(m);
+                        assert_eq!(
+                            close_override, ax.gate_pending_close,
+                            "강등 술어와 축 접기가 갈렸다(m={m:?} c={c:?} a={a:?})"
+                        );
+                        // ① 확인 경계 — 이 조합에서 버전 보류가 서는가.
+                        let o = cys::inject_guard::Observed {
+                            screen: &screen,
+                            gates: &gs,
+                            awakened: Some(false),
+                            guard_off: ax.inject_guard_off,
+                            readiness_legacy: ax.readiness_legacy,
+                            cli_versions: &latch,
+                            version_pin_legacy: ax.version_pin_legacy,
+                        };
+                        let version_held = matches!(
+                            cys::inject_guard::confirm_denied(
+                                &o,
+                                cys::inject_guard::GATE_FOLDER_TRUST
+                            ),
+                            Some(cys::inject_guard::ConfirmDenied::VersionDrift { .. })
+                        );
+                        // ② 타임아웃 — 생존 좌석(`agent_alive=null`) · 마커 미관측.
+                        // ③ 강등 — 프로덕션과 같은 순수 함수 조합.
+                        let verdict = boot_verdict_effective(
+                            readiness_timeout_verdict(
+                                None,
+                                "claude",
+                                12,
+                                "❯ 1. Yes, proceed",
+                                Some(cys::inject_guard::GATE_FOLDER_TRUST),
+                            ),
+                            close_override,
+                        );
+                        let closes = matches!(verdict, BootVerdict::LaunchFailed { .. });
+                        if closes {
+                            close_seen += 1;
+                        }
+                        if version_held {
+                            hold_seen += 1;
+                        }
+                        assert!(
+                            !(version_held && closes),
+                            "★버전 보류가 살아 있는 좌석의 close 로 바뀐다 — m={m:?} close={c:?} \
+                             axis={a:?} version_pin={vp:?} → {ax:?}"
+                        );
+                        // 그리고 보류가 살아 있는 조합에서는 좌석이 **보존**된다(close 0).
+                        if version_held {
+                            assert!(
+                                matches!(verdict, BootVerdict::GatePending { .. }),
+                                "버전 보류인데 귀결이 보류가 아니다 → {verdict:?}"
+                            );
+                        }
+                        // 롤백 조합에서는 Return 이 **실제로 나간다**(종전 복귀가 반쪽이 아니다).
+                        if ax.version_pin_legacy {
+                            assert!(
+                                cys::inject_guard::trust_send(&cys::inject_guard::TrustObserved {
+                                    hit: true,
+                                    first: true,
+                                    persisted: false,
+                                    sends: 0,
+                                    max_sends: BUDGET_TRUST_MAX_SENDS,
+                                    other_gate: !cys::inject_guard::confirm_allowed(
+                                        &o,
+                                        cys::inject_guard::GATE_FOLDER_TRUST
+                                    ),
+                                    legacy_v1: ax.trust_legacy,
+                                }),
+                                "버전 축을 되돌렸는데 Return 이 0발이다 — 좌석은 관문에 서고 \
+                                 보류는 close 로 강등된다(m={m:?} c={c:?} a={a:?} vp={vp:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            close_seen > 0 && hold_seen > 0,
+            "진리표가 대상 조합을 하나도 밟지 않았다(close={close_seen} hold={hold_seen})"
+        );
+
+        // ★계측 타당성 — **수리 전 조립**에서는 그 조합이 실제로 성립했다(버전 축이 마스터에
+        //   접히지 않은 판 = `version_pin_legacy: false` 고정).
+        let pre_fix = cys::inject_guard::Observed {
+            screen: &screen,
+            gates: &gs,
+            awakened: Some(false),
+            guard_off: true,       // 마스터가 켠 값
+            readiness_legacy: true, // 마스터가 켠 값
+            cli_versions: &latch,
+            version_pin_legacy: false, // ← 접히지 않은 축(리뷰어가 지적한 그 형상)
+        };
+        assert!(
+            matches!(
+                cys::inject_guard::confirm_denied(&pre_fix, cys::inject_guard::GATE_FOLDER_TRUST),
+                Some(cys::inject_guard::ConfirmDenied::VersionDrift { .. })
+            ),
+            "계측 무효: 구 조립에서 마스터 롤백 중에도 버전 보류가 서지 않는다면 지적 서사가 틀린 것"
+        );
+        assert!(
+            matches!(
+                boot_verdict_effective(
+                    readiness_timeout_verdict(None, "claude", 12, "tail", Some("folder-trust")),
+                    true,
+                ),
+                BootVerdict::LaunchFailed { .. }
+            ),
+            "계측 무효: 강등 경로가 없다면 codex 서사가 틀린 것"
         );
     }
 
@@ -24839,7 +25022,8 @@ mod tests {
                         guard_off,
                         readiness_legacy: false, // 이 검체는 U-14/U-15 두 축만 잰다(모달 축 무관 화면)
                         // 실측 픽스처에는 버전 배너가 없다 = 미상 → 버전 축은 이 검체를 건드리지 않는다.
-                        cli_version: None,
+                        cli_versions: &[],
+                        version_pin_legacy: false,
                     };
                     let other_gate = if legacy_producer {
                         cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
@@ -24923,7 +25107,8 @@ mod tests {
                         awakened: Some(false),
                         guard_off,
                         readiness_legacy: false,
-                        cli_version: None, // 위와 같다(배너 없는 픽스처 = 버전 미상)
+                        cli_versions: &[], // 위와 같다(배너 없는 픽스처 = 버전 미상)
+                        version_pin_legacy: false,
                     };
                     // ★(리뷰 R4) 프로덕션과 같은 생산자 — `legacy_producer` 만 구 배선을 재현한다.
                     let other_gate = if legacy_producer {
@@ -25006,7 +25191,8 @@ mod tests {
                     awakened,
                     guard_off: false,
                     readiness_legacy: false,
-                    cli_version: None,
+                    cli_versions: &[],
+                    version_pin_legacy: false,
                 });
                 assert!(!d.blocks(), "정상 화면에서 주입이 막혔다: {screen:?}");
             }
