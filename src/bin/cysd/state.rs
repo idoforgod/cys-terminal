@@ -609,15 +609,29 @@ pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64
 /// 【한계 — 정직】 `claimed` 는 "writer 가 쓰기로 결정했다" 이지 "PTY 에 다 나갔다" 가 아니다.
 /// 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는 종전
 /// (`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
-/// ★(0.14.31 · 리뷰 R2 · codex blocking) 가드가 보는 **승인·관문 사실**의 탐침. writer 스레드가
-/// 첫 바이트 앞에서 호출한다. `Weak<Daemon>` 를 담아 만들므로 순환 참조가 없고(채널에 실린 요청이
-/// 데몬을 살려 두지 않는다), 데몬이 이미 소멸했으면 **보수적으로 "대기 중"**(=중단)을 답한다.
+/// ★(0.14.31 · 성찰 Q1·Q2) writer 가 첫 바이트 앞에서 부르는 **안전 탐침** — 반환 true =
+/// "지금 이 좌석에 큐 본문을 넣으면 안 된다".
+///
+/// 【종전 이름과 범위】 이 자리는 `ApprovalProbe` 였고 승인·관문 feed 만 다시 읽었다. 그런데
+/// 비-alt(B1) 경로는 `expect_gen=None`(세대 불변 미요구 — 그 계약은 의도적이다)이라 **화면 축이
+/// 통째로 없었고**, 남은 승인 feed 는 `check_approvals` 가 15초 주기로만 채운다. 즉 인계~쓰기
+/// (≤800ms) 사이에 **새로 그려진 모달**을 원리상 볼 수 없었다 — 그 창에 본문+Return 이 나갔다.
+/// 이제 탐침은 같은 자리에서 **현재 프레임의 화면**과 **pause** 까지 본다(생성자는
+/// `governance::inject_safety_probe` 하나 — 판정 분리 금지).
+///
+/// `Weak<Daemon>`·`Weak<Surface>` 를 담아 만들므로 순환 참조가 없고(채널에 실린 요청이 좌석·데몬을
+/// 살려 두지 않는다), 어느 쪽이든 이미 소멸했으면 **보수적으로 "막는다"** 를 답한다.
 ///
 /// 왜 세대 카운터가 아니라 탐침인가: 승인·관문 pending 은 `feed_items` 여러 지점에서 바뀌고,
 /// 단조 카운터를 심으려면 그 전 지점을 빠짐없이 계측해야 한다(하나라도 빠지면 가드가 조용히
-/// 거짓 안심을 준다). 탐침은 **판정과 같은 함수**(`governance::approval_or_gate_pending`)를 그대로
-/// 부르므로 판정 분리가 생기지 않는다.
-pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+/// 거짓 안심을 준다). 탐침은 **판정과 같은 함수**(`prompt_gate_verdict`·`no_marker_gate`·
+/// `approval_or_gate_pending`)를 그대로 부르므로 판정 분리가 생기지 않는다.
+///
+/// 【호출 규약 — 락】 writer 는 어떤 큐 락도 쥐지 않은 채 이것을 부른다. 탐침이 잡는 락
+/// (`queue_paused_until` · `feed_items` · `parser` · `last_output`)은 전부 리프이고 **차례로 잡았다
+/// 놓는다** — `pending_queue`/`input_gate` 를 향하는 역간선이 없어야 한다(그 규약을 깨면 배달
+/// 임계영역과 AB-BA 다 · codex 설계 검토 #1).
+pub type SafetyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// ★(0.14.31 · 리뷰 R1 · codex blocking) 큐 배달의 **인계 가드** — "판정이 본 화면"과 "실제로
 /// 바이트가 나가는 순간" 사이를 잇는 유일한 축.
@@ -630,7 +644,8 @@ pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 ///   · **출력 세대**(`expect_gen`) — 정적(quiet) 기반 판정 경로만 요구한다. 비-alt(B1) 경로는
 ///     `None` 이다: 그 계약이 스트리밍 중 배달을 허용하고, 불변을 요구하면 연속 출력 노드가
 ///     영구 기아다(기아 #1).
-///   · **승인·관문 pending**(`expect_approval` + [`ApprovalProbe`]) — **모든 경로**가 요구한다.
+///   · **주입 안전**(`expect_approval` + [`SafetyProbe`]: pause · 승인·관문 · 현재 프레임의
+///     화면) — **모든 경로**가 요구한다(★성찰 Q1·Q2).
 ///     §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다"). 종전 가드에는 이 축이 없어서,
 ///     writer 가 적체된 800ms 사이에 승인 feed 가 늘어도(출력 세대는 그대로) 본문이 나갔다.
 ///
@@ -666,8 +681,9 @@ pub struct InjectGuard {
     pub output_gen: Arc<AtomicU64>,
     /// 판정이 본 승인·관문 pending 사실.
     pub expect_approval: bool,
-    /// 지금의 승인·관문 pending 을 다시 읽는 탐침(`None` = 검체 전용 · 축 없음).
-    pub approval: Option<ApprovalProbe>,
+    /// ★(성찰 Q1·Q2) 지금의 **주입 안전**(pause · 승인·관문 · 현재 프레임의 화면)을 다시 읽는
+    /// 탐침(`None` = 검체 전용 · 축 없음).
+    pub safety: Option<SafetyProbe>,
     /// 0 = pending · 1 = claimed · 2 = aborted · 3 = acked(호출부가 claimed 를 수확했다).
     pub state: AtomicU8,
 }
@@ -708,13 +724,13 @@ impl InjectGuard {
         expect_gen: Option<u64>,
         output_gen: Arc<AtomicU64>,
         expect_approval: bool,
-        approval: Option<ApprovalProbe>,
+        safety: Option<SafetyProbe>,
     ) -> Self {
         Self {
             expect_gen,
             output_gen,
             expect_approval,
-            approval,
+            safety,
             state: AtomicU8::new(INJECT_PENDING),
         }
     }
@@ -722,7 +738,23 @@ impl InjectGuard {
     fn output_moved(&self) -> bool {
         self.expect_gen.is_some_and(|g| self.output_gen.load(Ordering::Acquire) != g)
     }
-    /// 두 축 중 하나라도 **주입을 막는가**(승인 탐침 포함 — writer 만 쓴다).
+    /// ★(0.14.31 · 성찰 Q1·Q2) **무거운 축** — 안전 탐침을 실제로 돌린다(pause · 승인·관문 ·
+    /// 현재 프레임의 화면). writer 스레드만 부르고, `claim_for_write` 에서 **정확히 한 번** 돈다
+    /// (`CLAIMING` 을 집은 뒤 · 확정 CAS 앞). 종전에는 소유권을 집기 **전에도** 한 번 돌아 좌석당
+    /// 2회였는데, `CLAIMING` 은 취소 가능한 상태라 앞의 무거운 검사는 안전에 기여하지 않으면서
+    /// writer 를 두 배로 묶었다(codex 설계 검토 #2·#6).
+    fn injection_blocked_now(&self) -> bool {
+        match &self.safety {
+            // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
+            Some(p) => {
+                let now = p();
+                now || self.expect_approval
+            }
+            None => false,
+        }
+    }
+
+    /// 두 축 중 하나라도 **주입을 막는가**(안전 탐침 포함 — writer 만 쓴다).
     ///
     /// ★(0.14.31 · triage 2026-09-08 · codex blocking) 승인 축은 종전에 **변화**만 봤다
     /// (`p() != expect_approval`). 그래서 판정 뒤 다시 읽은 "지금 승인 대기 중"(`expect_approval
@@ -735,21 +767,14 @@ impl InjectGuard {
     /// 사라지는 것도 변화이고, 그 판정은 이미 무효다. 탐침이 없으면(`None` = 검체 전용) 이 축은
     /// 없다(종전과 같다).
     fn axes_moved(&self) -> bool {
-        if self.output_moved() {
-            return true;
-        }
-        match &self.approval {
-            // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
-            Some(p) => {
-                let now = p();
-                now || self.expect_approval
-            }
-            None => false,
-        }
+        self.output_moved() || self.injection_blocked_now()
     }
     /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
     pub fn claim_for_write(&self) -> bool {
-        if self.axes_moved() {
+        // ★(0.14.31 · 성찰 Q1·Q2 · codex 설계 검토 #2) 값싼 축(락 없는 원자 읽기)만으로 먼저
+        //   거른다 — 이미 결판났거나 세대가 흘렀으면 무거운 안전 탐침(화면 복사·스캔 · 락 3개)을
+        //   돌 이유가 없다. 무거운 축은 아래 `CLAIMING` 구간에서 **한 번만** 돈다.
+        if self.output_moved() {
             return match self.state.compare_exchange(
                 INJECT_PENDING,
                 INJECT_ABORTED,
@@ -770,6 +795,7 @@ impl InjectGuard {
             Ok(_) => {
                 // ★소유권을 집은 **뒤** 마지막 재확인. 이 구간의 상태는 `CLAIMING` 이라 호출부가
                 //   수확할 수 없다 = 늦은 중단이 언제나 성립한다(triage codex blocking).
+                //   여기가 안전 탐침의 **유일한** 호출 지점이다(성찰 Q1·Q2).
                 if self.axes_moved() {
                     // 중단 확정. 그 사이 처분자가 먼저 `ABORTED` 로 바꿨어도 결론은 같다.
                     let _ = self.state.compare_exchange(
@@ -1371,6 +1397,14 @@ impl Surface {
             Some(r) if r.guard.abort_if_pending() => Vec::new(),
             Some(r) => r.ids.clone(),
         }
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) `pending_queue` 락을 **여기서 잡고** 취소한다(예약 생성이 그 락
+    /// 안이라 창이 없다). 반환 = 취소하지 못한 항목 수(= writer 가 이미 쓰기로 확정 = 배달 중).
+    /// 호출자는 다른 좌석 락을 쥐지 않은 채 불러야 한다(락 순서 규약).
+    pub fn cancel_inject_reservation_locked(&self) -> usize {
+        let _q = self.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel_inject_reservation().len()
     }
 
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
@@ -4967,6 +5001,23 @@ impl Daemon {
                             *surface.queue_paused_until.lock().unwrap() = Some(
                                 Instant::now() + std::time::Duration::from_secs(rule.pause_secs),
                             );
+                            // ★(0.14.31 · 성찰 Q2) 전이 순간의 **미확정 예약을 끊는다** — 그러지
+                            //   않으면 헬스가 "이 좌석은 지금 위험하다" 고 판단한 바로 그 순간
+                            //   결판을 기다리던 배달이 그대로 나간다(리더 스레드가 세운 pause 는
+                            //   판정 **이후**라 그 배달을 못 막는다 · 성찰 Q2 사슬).
+                            //   `queue_paused_until` 락은 위 줄에서 이미 놓았다(락 순서 규약).
+                            let still = surface.cancel_inject_reservation_locked();
+                            if still > 0 {
+                                self.bus.publish(
+                                    "queue.inject_uncancellable",
+                                    "queue",
+                                    Some(surface_id),
+                                    json!({"reason": "health_pause_queue", "rule": rule.name,
+                                           "entries": still,
+                                           "hint": "pause 전이 시점에 writer 가 이미 쓰기로 확정한 \
+                                                    배달이 있다 — 그 항목은 나간다(다음 배달부터 정지)"}),
+                                );
+                            }
                             self.bus.publish(
                                 "health.action",
                                 "health",
@@ -4979,6 +5030,55 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) **미확정 인계 일괄 취소** — pause 전이가 부른다. 반환 = 취소하지
+    /// **못한**(= writer 가 이미 쓰기로 확정한) 좌석 수.
+    ///
+    /// pause 의 계약은 "응답을 손에 쥔 뒤 큐 주입 0" 이다. 그런데 pause 시점에 이미 인계돼
+    /// 결판을 기다리는 예약이 있으면, 그 좌석은 pause 와 무관하게 쓴다(가드의 축은 writer 가
+    /// **첫 바이트 앞에서** 보는 것이고, 그때 pause 를 보게 하는 것이 안전 탐침의 ⓐ축이지만
+    /// writer 가 이미 `CLAIMED` 를 공개한 뒤라면 그 결정은 되돌릴 수 없다 — 수확된 배달은 반드시
+    /// 쓰인다는 계약 때문이다). 그래서 전이 순간에 **아직 확정되지 않은** 예약을 능동으로 끊는다.
+    ///
+    /// 락 규약: `surfaces` → 좌석별 `pending_queue`(전역 순서 그대로). 호출자는 `queue_paused_until`
+    /// 같은 리프 락을 **쥐지 않은 채** 불러야 한다(쥔 채 부르면 배달 임계영역과 AB-BA 다 ·
+    /// codex 설계 검토 #1).
+    ///
+    /// 【남는 창 — 정직】 이미 `CLAIMED`/`ACKED` 인 쓰기는 끊지 못한다. 그 좌석 수를 돌려주므로
+    /// 호출자는 "완전히 0 이 아니다" 를 말할 수 있다. 진짜 fence(본문+CR 완료 대기)는 writer 층의
+    /// 별도 추적이 필요하다(백로그 · codex 설계 검토 #4).
+    /// ★(0.14.31 · 성찰 Q2) kill-switch **전이의 유일한 진입점** — 플래그를 세우고, 켜는 방향이면
+    /// 그 순간의 미확정 인계를 끊는다. 반환 = 끊지 못한(이미 쓰기로 확정된) 좌석 수(끄는 방향은 0).
+    /// `handlers::system.pause` 가 `paused.store(true)` 대신 이것을 불러야 pause 응답을 손에 쥔
+    /// 뒤의 주입 0 이 성립한다(store 만 하면 결판 대기 중인 배달이 그대로 나간다). 영속
+    /// (`persist_pause`)은 종전대로 호출자 책임이다(이 함수는 I/O 를 하지 않는다).
+    pub fn set_paused(&self, on: bool) -> usize {
+        self.paused.store(on, Ordering::SeqCst);
+        if on {
+            self.cancel_unsettled_injects()
+        } else {
+            0
+        }
+    }
+
+    pub fn cancel_unsettled_injects(&self) -> usize {
+        let surfaces: Vec<Arc<Surface>> = self
+            .surfaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut still_writing = 0usize;
+        for s in surfaces {
+            // 예약 생성이 `pending_queue` 안이므로 같은 락 아래에서 취소해야 창이 없다.
+            let _q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.cancel_inject_reservation().is_empty() {
+                still_writing += 1;
+            }
+        }
+        still_writing
     }
 
     /// T4-15 pause 상태 영속 — 데몬 재시작 후에도 kill-switch가 유지된다.
@@ -9084,6 +9184,13 @@ mod tests {
     /// 붙어서 비-alt 요청은 애초에 아무 재확인도 없었다(codex 반례 ①③).
     /// 지금은 ⓐ 승인 축이 별도 세대 카운터가 아니라 **판정과 같은 술어를 다시 읽는 탐침**이고
     /// ⓑ 출력 세대는 `Option`(비-alt 는 `None`)이라 **모든 경로가 승인 축을 진다**.
+    ///
+    /// ★(0.14.31 · 성찰 Q1 · 핀 정정) 이 탐침은 이제 `SafetyProbe` 다 — 반환 true 의 뜻은 "승인
+    /// 대기 중" 이 아니라 "**지금 이 좌석에 넣으면 안 된다**"(pause · 승인·관문 · 현재 프레임의
+    /// 화면). 아래 ⓑ 가 "탐침 false → 쓴다" 를 핀하는 것은 그대로 옳지만, 종전 문면("승인이
+    /// 없으면 쓴다")은 비-alt 경로에서 **화면을 보지 않아도 된다** 로 읽혔고 그것이 Q1 의 구멍
+    /// (완성된 모달 위에 본문+Return)을 '성공해야 한다' 로 고정하고 있었다. 화면 축의 실검체는
+    /// `governance::reflect_queue_tests::q1_writer_safety_probe_sees_a_modal_drawn_after_the_verdict`.
     #[test]
     fn wp5_r2_inject_guard_carries_the_approval_axis_on_every_path() {
         use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED};
@@ -9091,11 +9198,12 @@ mod tests {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         };
-        // 승인 pending 을 흉내내는 탐침 — 판정 시점 false, 그 뒤 true 로 바뀐다.
+        // 주입 차단 사실(승인·화면·pause 어느 것이든)을 흉내내는 안전 탐침 — 판정 시점 false,
+        // 그 뒤 true 로 바뀐다.
         let flipped = Arc::new(AtomicBool::new(false));
         let probe = {
             let f = flipped.clone();
-            Arc::new(move || f.load(Ordering::Acquire)) as super::ApprovalProbe
+            Arc::new(move || f.load(Ordering::Acquire)) as super::SafetyProbe
         };
         // ⓐ 비-alt 경로(expect_gen=None · 출력 세대 불변을 요구하지 않는다)도 승인이 뜨면 중단한다.
         let gen = Arc::new(AtomicU64::new(7)); // 홀짝·값 무관 — 이 경로는 세대를 보지 않는다
@@ -9261,10 +9369,10 @@ mod tests {
     /// 정본 §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다")이 금지한 바로 그 동작이다.
     #[test]
     fn triage_wp5_guard_must_not_adopt_a_pending_approval_as_its_expectation() {
-        use super::{ApprovalProbe, InjectGuard};
+        use super::{InjectGuard, SafetyProbe};
         use std::sync::{atomic::AtomicU64, Arc};
 
-        let probe: ApprovalProbe = Arc::new(|| true); // 승인은 계속 대기 중이다
+        let probe: SafetyProbe = Arc::new(|| true); // 승인은 계속 대기 중이다
         let guard = InjectGuard::new(None, Arc::new(AtomicU64::new(4)), true, Some(probe));
         assert!(
             !guard.claim_for_write(),
@@ -9278,9 +9386,15 @@ mod tests {
     /// 그 두 번째 관측은 승인 탐침(데몬 락)을 부르므로 짧지 않고, 그 창에서 호출부의 `settle` 이
     /// CLAIMED 를 수확(`ACKED`)하면 늦은 중단 CAS 가 실패해 **바뀐 판정 재료를 보고도 쓴다**.
     /// 재검사가 끝나기 전에는 성공을 수확할 수 없어야 한다(쓰기 권한과 배달 보고의 분리).
+    ///
+    /// ★(0.14.31 · 성찰 Q1·Q2 · 의도적 재핀) 무거운 안전 탐침은 이제 **정확히 한 번**, `CLAIMING`
+    /// 을 집은 뒤에만 돈다(종전 2회 — 소유권을 집기 전의 1회는 취소 가능한 상태라 안전에 기여하지
+    /// 않으면서 writer 를 두 배로 묶었다). 그래서 이 검체의 핀은 "두 번 돌았다" → "**한 번**, 그리고
+    /// 그 한 번은 `CLAIMING` 안에서" 로 바뀐다. 재는 성질은 그대로다: 탐침이 도는 동안 호출부의
+    /// 수확(`CLAIMED→ACKED`)이 **성립할 수 없고**, 탐침이 막으면 writer 는 쓰지 않는다.
     #[test]
     fn triage_wp5_ack_must_not_defeat_the_writer_late_abort() {
-        use super::{ApprovalProbe, InjectGuard, INJECT_ACKED, INJECT_CLAIMED, INJECT_PENDING};
+        use super::{InjectGuard, SafetyProbe, INJECT_ACKED, INJECT_CLAIMED, INJECT_PENDING};
         use std::sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, OnceLock, Weak,
@@ -9289,21 +9403,23 @@ mod tests {
         let slot: Arc<OnceLock<Weak<InjectGuard>>> = Arc::new(OnceLock::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let (s2, c2) = (Arc::clone(&slot), Arc::clone(&calls));
-        // 탐침은 ① 첫 호출(CAS 앞) = 승인 없음 ② 두 번째 호출(CAS 뒤 재검사) = 그 창에서 호출부가
-        // CLAIMED 를 수확했고 승인이 떴다 — 를 재현한다(스레드 타이밍에 기대지 않는다).
-        let probe: ApprovalProbe = Arc::new(move || {
+        // 탐침이 도는 **그 창**에서 호출부가 CLAIMED 를 수확하려 시도하고, 그 사이 승인·모달이
+        // 떴다 — 를 재현한다(스레드 타이밍에 기대지 않는다). 탐침 안에서 상태가 `CLAIMING` 인지도
+        // 함께 잰다: 그것이 "수확이 성립할 수 없다" 의 실체다.
+        let probe: SafetyProbe = Arc::new(move || {
             let n = c2.fetch_add(1, Ordering::AcqRel);
-            if n == 0 {
-                return false;
-            }
             if let Some(g) = s2.get().and_then(Weak::upgrade) {
-                // 호출부(watchdog)의 수확 — settle 이 CLAIMED 를 보고 ACKED 로 굳힌다.
-                let _ = g.state.compare_exchange(
-                    INJECT_CLAIMED,
-                    INJECT_ACKED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                assert_eq!(
+                    g.state.load(Ordering::Acquire),
+                    super::INJECT_CLAIMING,
+                    "탐침 {n}회차가 CLAIMING 밖에서 돌았다 — 소유권을 집기 전의 무거운 검사가 되살아났다"
                 );
+                // 호출부(watchdog)의 수확 — settle 이 CLAIMED 를 보고 ACKED 로 굳히려 한다.
+                let acked = g
+                    .state
+                    .compare_exchange(INJECT_CLAIMED, INJECT_ACKED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                assert!(!acked, "재검사 중에 호출부가 CLAIMED 를 수확했다");
             }
             true // 그 사이 승인·모달이 떴다
         });
@@ -9312,10 +9428,19 @@ mod tests {
         let _ = slot.set(Arc::downgrade(&guard));
         assert_eq!(guard.state.load(Ordering::Acquire), INJECT_PENDING, "전제: 미결판");
         let writes = guard.claim_for_write();
-        assert_eq!(calls.load(Ordering::Acquire), 2, "전제: 재검사가 실제로 두 번 돌았다");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "안전 탐침은 CLAIMING 안에서 정확히 한 번 돈다(성찰 Q1·Q2 재핀)"
+        );
         assert!(
             !writes,
             "호출부가 CLAIMED 를 수확한 뒤에는 승인이 떠도 writer 가 그대로 쓴다 — 안전 재검사가 죽는다"
+        );
+        assert_eq!(
+            guard.state.load(Ordering::Acquire),
+            super::INJECT_ABORTED,
+            "막힌 인계가 ABORTED 로 확정되지 않았다 — 호출부가 항목을 빼 버린다(유실)"
         );
     }
 

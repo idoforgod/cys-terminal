@@ -5004,6 +5004,99 @@ fn approval_or_gate_pending(daemon: &Arc<Daemon>, sid: u64) -> bool {
     !pending_gate_items(daemon, sid).is_empty() || !daemon.pending_daemon_approvals(sid).is_empty()
 }
 
+/// ★(0.14.31 · 성찰 Q2) **큐 주입이 지금 정지 중인가** — 데몬 kill-switch `∨` 좌석 헬스 pause.
+///
+/// 【무엇이 틀렸었나】 `daemon.paused` 는 `deliver_queued` 머리에서 **틱당 1회**만 평가됐다. 틱은
+/// 좌석을 순회하며 좌석마다 원장 선기록(fsync) + `try_send` + `settle(≤800ms)` 를 한다 — 그 검사를
+/// 통과한 직후 운영자가 `cys pause` 를 완료해도 **그 틱의 남은 좌석 전부**에 주입됐다. 0.14.30 에는
+/// 결판 대기가 없어 창이 ms 였는데 이번 변경이 그것을 **초 단위**로 늘렸고, 새로 만든 재판정
+/// 지점들(승인·화면·간격·만료)이 pause 만 빠뜨렸다.
+///
+/// 두 축은 **OR** 다(codex 설계 검토 #4 — AND 로 읽으면 즉시 오답이다): 어느 하나라도 참이면
+/// 큐 주입은 정지다. 범위는 **큐 주입**이며 직접 `send` 는 pause 중에도 통과한다(kill-switch 의
+/// 원래 계약 = "자율 루프 동결 · 사람의 손은 살려 둔다" · handlers `system.pause`).
+///
+/// 락 규약: 두 축 모두 **리프**를 잠깐 잡았다 놓는다 — 이 함수를 `pending_queue` 안에서 불러도
+/// 역간선이 생기지 않는다(반대로 `queue_paused_until` 을 쥔 채 `pending_queue` 를 잡으면 그것이
+/// 곧 AB-BA 다 · codex 설계 검토 #1).
+pub(crate) fn queue_injection_paused(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> bool {
+    if daemon.paused.load(Ordering::Relaxed) {
+        return true;
+    }
+    let until = *s.queue_paused_until.lock().unwrap_or_else(|e| e.into_inner());
+    until.is_some_and(|t| t > std::time::Instant::now())
+}
+
+/// ★(0.14.31 · 성찰 Q1·Q2) writer 가 첫 바이트 앞에서 돌리는 **안전 탐침**의 유일한 생산자.
+///
+/// 【무엇이 틀렸었나】 종전 탐침은 승인·관문 feed 만 다시 읽었다. 비-alt(B1) 경로는
+/// `expect_gen=None`(세대 불변 미요구 — 연속 출력 노드의 기아를 피하려는 의도된 계약)이라 가드의
+/// 두 축 중 **화면 축이 통째로 죽고**, 남은 승인 feed 는 `check_approvals` 가 15초 주기로만 채운다.
+/// 그래서 인계~쓰기(≤800ms) 사이에 **완성된 승인 모달**을 원리상 볼 수 없었다: 비큐 직접 send 로
+/// writer 가 400ms 점유 → 같은 틱의 큐 배달이 인계 → 그 사이 모달 완성 → 본문+CR(= 승인 버튼을
+/// 누른다 · §8 위반).
+///
+/// 【지금】 같은 자리에서 **네 축**을 현재 프레임에 대해 본다. 어느 하나라도 막으면 `ABORTED` 이고,
+/// 그 귀결은 **보류**다 — 항목은 큐에 그대로 있고 다음 틱이 다시 판정한다(§3-3 · 유실 아님).
+///   ⓐ pause(`queue_injection_paused` — Q2)
+///   ⓑ 승인·관문 feed(`approval_or_gate_pending` — 종전 축)
+///   ⓒ 마커 좌석: `observe_prompt` + `prompt_gate_verdict`(모달·선택기·발행 중·초안·alt 전환)
+///   ⓓ 마커 없는 좌석: `no_marker_gate`(대체화면·모달 어휘·미제출 바이트)
+///
+/// 【계약을 좁히지 않는다】 비-alt 의 "프롬프트 박스가 열려 있으면 출력 중이라도 주입" 은 그대로다 —
+/// `prompt_gate_verdict` 는 비-alt 분기에서 quiet·layout·`frame_consistent` 를 **보기 전에** 반환한다.
+/// 여기에 별도의 `!frame_consistent()` 차단을 **더하지 않는 것**이 핵심이다: 그것을 더하면 관측 창
+/// 양 끝 사이에 청크가 하나씩 완성되는 노드에서 모든 재시도가 실패해 기아 #1 이 되살아난다
+/// (codex 설계 검토 #3). 발행 중(`frame_published` 거짓)만 막는데, 그 창은 파서 락 보유 시간이다.
+///
+/// 【판정 불능은 막는다】 데몬·좌석이 소멸했거나 클로저가 패닉하면 `true`(막는다)를 답한다. 패닉이
+/// 새면 그 좌석의 writer 스레드가 죽어 pane 이 영구 무응답이다(치명위험 ④).
+///
+/// 【남는 창 — 정직】 마지막 탐침과 첫 바이트 사이, 그리고 본문과 CR(`cr_delay_ms`) 사이는 여전히
+/// 열려 있다. 그 창의 원자성은 탐침 횟수로 만들어지지 않는다(writer fence 가 필요하다 — 백로그).
+pub(crate) fn inject_safety_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    marker: Option<String>,
+    placeholder: Option<String>,
+) -> crate::state::SafetyProbe {
+    let wd = Arc::downgrade(daemon);
+    let ws = Arc::downgrade(s);
+    std::sync::Arc::new(move || {
+        // ★ 이 클로저는 **writer 스레드**에서 돈다 — 패닉이 새면 그 좌석의 writer 가 죽는다.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
+                return true; // 데몬·좌석 소멸 — 보수적으로 막는다
+            };
+            // ⓐ pause(Q2) — 두 축 OR.
+            if queue_injection_paused(&d, &s) {
+                return true;
+            }
+            // ⓑ 승인·관문 feed. 여기서 한 번 읽고, 아래 화면 판정에는 그 값을 **다시 읽지 않고**
+            //    넘긴다(feed 전량 순회를 두 배로 하지 않는다 · codex 설계 검토 #2).
+            if approval_or_gate_pending(&d, s.id) {
+                return true;
+            }
+            // ⓒ·ⓓ 현재 프레임의 화면 — 판정은 틱과 **같은 함수**다(판정 분리 금지).
+            match marker.as_deref() {
+                Some(m) => {
+                    let obs = observe_prompt(&s, m);
+                    let input = prompt_gate_input_with_approval(
+                        &s,
+                        m,
+                        placeholder.as_deref(),
+                        &obs,
+                        false, // ⓑ에서 이미 확인했다
+                    );
+                    matches!(prompt_gate_verdict(&input), PromptGate::Blocked(_))
+                }
+                None => no_marker_gate(&d, &s).is_some(),
+            }
+        }))
+        .unwrap_or(true)
+    })
+}
+
 /// 관측(`PromptObs`)·좌석 사실 → 판정 입력 조립(틱·강제 공용). `quiet_for` 는 호출부가 잰 값.
 fn prompt_gate_input(
     daemon: &Arc<Daemon>,
@@ -5381,6 +5474,13 @@ fn handoff_gate_ok(
     expect_output_gen: Option<u64>,
     recheck: Option<&ScreenRecheck>,
 ) -> bool {
+    // ★(0.14.31 · 성찰 Q2) **pause 를 여기서 다시 읽는다.** 이 함수는 `deliver_head_locked` 이
+    //   두 번 부른다(원장 선기록 앞 · `try_send` 직전) — 틱 머리의 1회 검사와 실제 주입 사이에
+    //   운영자의 `cys pause` 가 완료되는 창이 그 두 지점에서 닫힌다. 축은 OR(데몬 ∨ 좌석)이고
+    //   범위는 큐 주입이다(직접 send 는 종전대로 통과한다).
+    if queue_injection_paused(daemon, s) {
+        return false;
+    }
     let now_gen = s.output_gen.load(Ordering::Acquire);
     if now_gen % 2 == 1 {
         return false; // reader 가 청크를 반영하는 중 — 화면에 없는 바이트가 이미 도착해 있다
@@ -5755,27 +5855,22 @@ pub(crate) fn deliver_head_locked(
         //   경로도 가드를 받되 출력 세대는 `None`(불변 미요구)이고 승인·관문 pending 만 본다.
         //   종전에는 비-alt 요청에 가드가 아예 없어서, writer 적체 800ms 사이에 모달·승인이
         //   완성돼도 그대로 꽂혔다(codex 반례 ③).
-        let approval_probe: crate::state::ApprovalProbe = {
-            let weak = std::sync::Arc::downgrade(daemon);
-            let sid = s.id;
-            std::sync::Arc::new(move || {
-                // ★(0.14.31 · 리뷰 R2) 이 클로저는 **writer 스레드**에서 돈다 — 여기서 패닉이 새면
-                //   그 좌석의 writer 가 죽어 pane 이 영구 무응답이다(치명위험 ④). 어떤 이유로든
-                //   판정하지 못하면 **보수적으로 '대기 중'**(=인계 중단 · 보류)을 답한다.
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    match weak.upgrade() {
-                        Some(d) => approval_or_gate_pending(&d, sid),
-                        None => true, // 데몬 소멸
-                    }
-                }))
-                .unwrap_or(true)
-            })
-        };
+        // ★(0.14.31 · 성찰 Q1·Q2) 탐침은 승인 feed 뿐 아니라 **pause 와 현재 프레임의 화면**도
+        //   본다(생성자 하나 — `inject_safety_probe`). 재판정 재료는 판정이 쓴 것과 같다:
+        //   마커는 `recheck` 가 실어 온 것을 그대로 쓴다(여기서 어댑터 정의를 다시 읽지 않는다 —
+        //   틱은 어댑터를 **틱당 1회**만 읽는 것이 규약이고, 그 규약이 좌석마다 판정을 갈리게
+        //   하지 않는다). `recheck` 가 없는 호출(구 호출부)은 마커 없는 게이트로 판정한다.
+        let safety_probe = inject_safety_probe(
+            daemon,
+            s,
+            recheck.and_then(|r| r.marker.clone()),
+            recheck.and_then(|r| r.placeholder.clone()),
+        );
         let guard = Some(std::sync::Arc::new(crate::state::InjectGuard::new(
             expect_output_gen,
             s.output_gen.clone(),
             approval_now,
-            Some(approval_probe),
+            Some(safety_probe),
         )));
         let req = crate::state::WriteReq::Inject {
             text: body.clone(),
@@ -7334,6 +7429,21 @@ fn deliver_queued(
     }
     // T4-15 kill-switch: pause 중에는 큐 배달 동결 (메시지는 보존 — resume 시 재개)
     if daemon.paused.load(Ordering::Relaxed) {
+        // ★(0.14.31 · 성찰 Q2) 전이 진입점(`Daemon::set_paused`)을 거치지 않은 pause(구 호출부의
+        //   `paused.store(true)` · 재기동 복원)라도 결판 대기 중인 인계는 여기서 끊는다 — 두 번째
+        //   방어선이다(첫째는 writer 의 안전 탐침 ⓐ축). pause 중에는 예약이 새로 생기지 않으므로
+        //   이 순회는 좌석당 리프 락 1회이고 평시(비-pause) 비용은 0 이다.
+        let still = daemon.cancel_unsettled_injects();
+        if still > 0 {
+            daemon.bus.publish(
+                "queue.inject_uncancellable",
+                "queue",
+                None,
+                json!({"reason": "daemon_paused", "entries": still,
+                       "hint": "pause 시점에 writer 가 이미 쓰기로 확정한 배달이 있다 — \
+                                그 항목은 나간다(다음 배달부터 정지)"}),
+            );
+        }
         return;
     }
     // ★G1(W2-D): 노브는 틱당 1회 로드 — surface 루프 안 env 재조회 방지(판정 재료 고정).
@@ -16911,6 +17021,181 @@ mod todo_decl_tests {
 /// 병렬로 고치므로, 새 검체를 파일 **끝**에 모으면 병합 충돌이 이 블록 하나로 국소화된다.
 #[cfg(test)]
 mod reflect_queue_tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    /// 이 모듈 전용 좌석 픽스처 — 실 PTY(`sleep 30`) + claude 어댑터 + 임시 팩 디렉터리.
+    /// (`mod tests` 의 형제 픽스처를 빌리지 않는 이유는 병합 충돌 국소화 하나뿐이다.)
+    fn probe_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-reflq-{tag}-{}-{}",
+            std::process::id(),
+            (now_epoch() * 1000.0) as u64
+        ));
+        let pack = dir.join("pack");
+        std::fs::create_dir_all(&pack).expect("temp pack");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".to_string(), "worker".to_string()));
+        // 로그인 프로파일 초기 출력이 픽스처를 덮지 않게 안정화(형제 픽스처와 같은 규율).
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        (daemon, s, pack)
+    }
+
+    /// vt100 파서에 화면을 직접 먹인다(PTY 프로그램 무관 · alt 여부 명시).
+    fn paint(s: &Arc<crate::state::Surface>, lines: &[&str], row: u16, col: u16, alt: bool) {
+        let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+        if alt {
+            p.process(b"\x1b[?1049h");
+        }
+        p.process(b"\x1b[2J\x1b[H");
+        for (i, l) in lines.iter().enumerate() {
+            p.process(format!("\x1b[{};1H{}", i + 1, l).as_bytes());
+        }
+        p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        drop(p);
+        s.alt_screen.store(alt, AtomicOrdering::Relaxed);
+    }
+
+    /// ★(0.14.31 · 성찰 Q1) **writer 안전 탐침은 판정 뒤에 그려진 모달을 본다.**
+    ///
+    /// 비-alt(B1) 경로는 `expect_gen=None` 으로 인계한다(세대 불변 미요구 — 연속 출력 노드의
+    /// 기아를 피하려는 의도된 계약). 그래서 writer 가드의 두 축 중 **화면 축이 통째로 죽었고**,
+    /// 남은 승인 feed 는 `check_approvals` 가 15초 주기로만 채운다 — 인계~쓰기(≤800ms) 사이에
+    /// 새로 완성된 모달을 원리상 볼 수 없었다. 반례: 비큐 직접 send 로 writer 가 400ms 점유 →
+    /// 같은 틱의 큐 배달이 인계 → 그 사이 모달 완성 → **본문+CR**(= 승인 버튼을 누른다).
+    ///
+    /// 대조군(정상 유휴 프롬프트)에서 탐침이 **통과**해야 한다는 단언이 함께 있다 — 그것이 없으면
+    /// "전부 막는다" 가 초록을 받고 기아 #1 이 되살아난다.
+    #[test]
+    fn q1_writer_safety_probe_sees_a_modal_drawn_after_the_verdict() {
+        let (daemon, s, _pack) = probe_seat("q1");
+        // ⓐ 대조군 — 정상 유휴 프롬프트(비-alt)는 통과한다(배달 유지).
+        paint(&s, &["❯ "], 0, 2, false);
+        let probe = inject_safety_probe(&daemon, &s, Some("❯".into()), None);
+        assert!(!probe(), "정상 유휴 프롬프트인데 탐침이 막았다 — 기아 #1 회귀");
+        // ⓑ 같은 좌석에 **완성된 승인 모달**만 그린다(출력 세대 축은 비-alt 라 없다).
+        paint(
+            &s,
+            &[
+                " Do you want to proceed?",
+                " ❯ 1. Yes",
+                "   2. Yes, and don't ask again",
+                "   3. No",
+                " Enter to confirm · Esc to cancel",
+            ],
+            1,
+            3,
+            false,
+        );
+        assert!(probe(), "완성된 승인 모달 위에서 탐침이 통과했다 — 본문+Return 이 그대로 나간다(§8)");
+        // ⓒ 가드까지: 비-alt(expect_gen=None) 인계는 그 모달에서 **한 바이트도 쓰지 않는다**.
+        let gen = s.output_gen.clone();
+        let g = crate::state::InjectGuard::new(None, gen, false, Some(probe.clone()));
+        assert!(!g.claim_for_write(), "비-alt 인계가 모달 위에서 쓰기를 확정했다");
+        assert_eq!(
+            g.settle(0),
+            crate::state::INJECT_ABORTED,
+            "가드가 ABORTED 로 결판나지 않았다 — 호출부가 항목을 큐에서 빼 버린다(유실)"
+        );
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) **pause 는 좌석마다 다시 평가된다** — 두 축은 OR 다.
+    ///
+    /// `daemon.paused` 는 `deliver_queued` 머리에서 틱당 1회만 평가됐다. 틱은 좌석마다 원장
+    /// 선기록(fsync) + `try_send` + `settle(≤800ms)` 를 하므로, 그 검사를 통과한 직후 운영자가
+    /// `cys pause` 를 완료해도 **그 틱의 남은 좌석 전부**에 주입됐다. 결판 대기가 그 창을 ms 에서
+    /// 초 단위로 늘렸다.
+    #[test]
+    fn q2_pause_is_re_read_by_the_writer_probe_and_the_handoff_gate() {
+        let (daemon, s, _pack) = probe_seat("q2");
+        paint(&s, &["❯ "], 0, 2, false);
+        let probe = inject_safety_probe(&daemon, &s, Some("❯".into()), None);
+        assert!(!probe(), "정지 중이 아닌데 막혔다(대조군)");
+        assert!(!queue_injection_paused(&daemon, &s), "정지 중이 아닌데 참이다");
+        // ⓐ 데몬 kill-switch.
+        daemon.paused.store(true, Ordering::Relaxed);
+        assert!(queue_injection_paused(&daemon, &s), "데몬 pause 를 보지 않는다");
+        assert!(probe(), "pause 뒤에도 writer 탐침이 통과했다 — 남은 좌석 전부에 주입된다");
+        assert!(
+            !handoff_gate_ok(&daemon, &s, None, None),
+            "pause 뒤에도 인계 게이트가 통과했다"
+        );
+        daemon.paused.store(false, Ordering::Relaxed);
+        assert!(!probe(), "resume 뒤에도 막혀 있다(정지가 영구화됐다)");
+        // ⓑ 좌석 헬스 pause — **OR** 이지 AND 가 아니다(데몬은 정지 중이 아니다).
+        *s.queue_paused_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        assert!(queue_injection_paused(&daemon, &s), "좌석 pause 를 보지 않는다(AND 로 읽었다)");
+        assert!(probe(), "좌석 pause 뒤에도 writer 탐침이 통과했다");
+        assert!(
+            !handoff_gate_ok(&daemon, &s, None, None),
+            "좌석 pause 뒤에도 인계 게이트가 통과했다"
+        );
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) pause 전이는 **미확정 예약을 취소한다.**
+    ///
+    /// 안전 탐침의 pause 축은 writer 가 첫 바이트 앞에서 보는 것이라, writer 가 이미 `CLAIMED` 를
+    /// 공개한 뒤라면 되돌릴 수 없다(수확된 배달은 반드시 쓰인다는 계약). 그래서 전이 순간에 아직
+    /// 확정되지 않은 예약을 능동으로 끊는다. 반환은 **끊지 못한** 수 — "완전히 0 이 아니다" 를
+    /// 호출자가 말할 수 있어야 한다(정직).
+    #[test]
+    fn q2_pause_transition_cancels_unsettled_reservations() {
+        let (daemon, s, _pack) = probe_seat("q2c");
+        let e = daemon.next_queue_entry("[보고] 정지 검체".into(), None, "test");
+        let eid = e.id.clone();
+        s.pending_queue.lock().unwrap().push_back(e);
+        let guard = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None,
+            s.output_gen.clone(),
+            false,
+            None,
+        ));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec![eid.clone()],
+            guard: guard.clone(),
+        });
+        // 전이 진입점 하나 — 플래그를 세우고 그 순간의 미확정 예약을 끊는다.
+        assert_eq!(daemon.set_paused(true), 0, "미확정 예약을 끊지 못했다고 보고했다");
+        assert!(daemon.paused.load(Ordering::Relaxed), "set_paused 가 플래그를 세우지 않았다");
+        assert_eq!(daemon.set_paused(false), 0, "끄는 방향에서 취소 수를 보고했다");
+        assert!(!daemon.paused.load(Ordering::Relaxed), "set_paused(false) 가 플래그를 내리지 않았다");
+        assert_eq!(
+            guard.settle(0),
+            crate::state::INJECT_ABORTED,
+            "pause 전이가 미확정 인계를 중단시키지 않았다 — 정지 응답 뒤에 그 배달이 나간다"
+        );
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "취소가 항목을 함께 없앴다(보류여야 한다 · §3-3)"
+        );
+        // 대조군 — 이미 쓰기로 확정된 인계는 끊지 못하고, 그 사실을 **수치로** 보고한다.
+        let claimed = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None,
+            s.output_gen.clone(),
+            false,
+            None,
+        ));
+        assert!(claimed.claim_for_write(), "검체 전제: 확정에 성공해야 한다");
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec![eid],
+            guard: claimed,
+        });
+        assert_eq!(
+            daemon.cancel_unsettled_injects(),
+            1,
+            "이미 확정된 쓰기를 '끊었다' 고 보고했다 — 폐기 통지 뒤 실제 주입이 된다"
+        );
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
     /// ★(0.14.31 · 성찰 Q14) **노브 롤아웃 문면이 실제 기본값과 같은가.**
     ///
     /// 종전 주석 블록은 "1단(관측 배치 = 현재 기본값) MAX_WAIT=0 · STARVE=0 — 배달 동작
