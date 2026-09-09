@@ -432,27 +432,27 @@ class HookInputHandoff(_HookEnv):
         """
         self._break_cygpath()
         r = self.run_hook("Edit", {"file_path": "/nonexistent-repo/a.rs"},
-                          CYS_SURFACE_ROLE="reviewer-codex")
+                          CYS_ROLE="reviewer-codex")
         self.assertEqual(r.rc, 0, "인계 실패가 reviewer 좌석을 exit 2 로 죽였다: %s" % r.err)
         self.assertTrue(r.denied, "판정이 수행되지 않았다(집행 0): %r / %r" % (r.out, r.err))
 
     def test_broken_native_path_still_judges_cso(self):
         self._break_cygpath()
-        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("CronCreate", {}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertTrue(r.denied, "인계 실패로 CSO 게이트가 조용히 꺼졌다: %r / %r"
                         % (r.out, r.err))
 
     def test_broken_native_path_allows_normal_call(self):
         self._break_cygpath()
-        r = self.run_hook("Bash", {"command": "cys status --json"}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("Bash", {"command": "cys status --json"}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertFalse(r.denied, "정상 호출이 인계 실패로 막혔다: %s" % r.reason)
 
     def test_destroyed_input_small_payload_uses_env_fallback(self):
         """원본까지 사라져도 **소용량은 env 로도 실려 있다** — 판정이 계속된다."""
         self._destroy_input()
-        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("CronCreate", {}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertTrue(r.denied, "env 폴백이 동작하지 않아 게이트가 꺼졌다: %r / %r"
                         % (r.out, r.err))
@@ -466,7 +466,7 @@ class HookInputHandoff(_HookEnv):
         self._destroy_input()
         r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
                                     "content": "x" * 70000},
-                          CYS_SURFACE_ROLE="reviewer-codex")
+                          CYS_ROLE="reviewer-codex")
         self.assertEqual(r.rc, 2, "판독 불능인데 대형 Write 가 통과했다: rc=%s %r"
                          % (r.rc, r.out))
 
@@ -475,14 +475,14 @@ class HookInputHandoff(_HookEnv):
         self._destroy_input()
         r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
                                     "content": "x" * 70000},
-                          CYS_SURFACE_ROLE="cso")
+                          CYS_ROLE="cso")
         self.assertEqual(r.rc, 0, "CSO 좌석이 판독 불능으로 죽었다: %s" % r.err)
         self.assertIn("게이트 강등", r.err)
 
     def test_no_temp_file_leftover_on_broken_conversion(self):
         """★`exec` 뒤에는 셸 trap 이 돌지 않는다 — 판정기가 **두 경로를 다** 지워야 한다."""
         self._break_cygpath()
-        self.run_hook("Bash", {"command": "cys status"}, CYS_SURFACE_ROLE="cso")
+        self.run_hook("Bash", {"command": "cys status"}, CYS_ROLE="cso")
         leftovers = [p.name for p in self.tmpdir.iterdir()
                      if p.name.startswith("cys-capgate-in.")]
         self.assertEqual(leftovers, [], "임시 입력 파일이 남았다: %s" % leftovers)
@@ -1116,6 +1116,43 @@ class HookCacheIdentity(_HookEnv):
         self.assertTrue(got, "데몬 조회가 나지 않아 봉인을 잴 수 없다(계측 불능)")
         self.assertEqual(set(got), {"1"},
                          "훅이 autostart 를 막지 않고 `cys` 를 불렀다: %r" % got)
+
+    def test_surface_role_env_is_an_output_not_an_identity(self):
+        """★G6: `CYS_SURFACE_ROLE` 한 줄로 **절대 deny 집합**이 열리지 않는다.
+
+        `CronCreate`/`Task`/`WebSearch` 는 §1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은
+        집합이다. 종전 게이트만 `CYS_SURFACE_ROLE` 을 폴백 **1순위**로 써서
+        `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 가 그 집합을 열었다 — 자매 두 층
+        (`javis_role.py:636` · `_lib.sh:678`)이 검체로 금지한 경로다.
+        """
+        self.fake_cys(role="", rc=2)          # 데몬 판정 불가
+        a = self.run_hook("CronCreate", {}, CYS_ROLE="cso", CYS_SURFACE_ID="7")
+        b = self.run_hook("CronCreate", {}, CYS_ROLE="cso", CYS_SURFACE_ROLE="master",
+                          CYS_SURFACE_ID="7")
+        self.assertTrue(a.denied, "선행 사실: A(단독 CYS_ROLE=cso)가 막혀야 이 검체가 뜻이 있다")
+        self.assertEqual(a.denied, b.denied,
+                         "env 한 줄(CYS_SURFACE_ROLE=master)이 절대 deny 집합을 열었다: %r"
+                         % b.out)
+
+    def test_surface_role_env_alone_is_not_a_seat_identity(self):
+        """`CYS_SURFACE_ROLE` 만 있고 `CYS_ROLE` 이 없으면 그것은 신원이 아니다(무역할=통과).
+
+        이 훅이 export 하는 **산출물**이 다음 프로세스의 신원으로 되돌아오면(상속·런처 export)
+        같은 변수가 입력이자 출력이 된다 — 그 고리를 끊는다.
+        """
+        self.fake_cys(role="", rc=2)
+        r = self.run_hook("Edit", {"file_path": "/nonexistent-repo/a.rs"},
+                          CYS_SURFACE_ROLE="reviewer-codex", CYS_SURFACE_ID="7")
+        self.assertFalse(r.denied,
+                         "산출물 변수가 신원으로 되돌아왔다: %r" % r.out)
+
+    def test_gated_surface_role_hint_still_forces_a_query(self):
+        """대조군 — 힌트가 **게이트 대상**이라고 말하면 캐시 fast-path 는 끈다(막는 축은 넓게)."""
+        self.fake_cys(role="master")
+        self.plant_cache("master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ROLE="cso", CYS_SURFACE_ID="7")
+        self.assertIn("surface-role", self.calls_log(),
+                      "게이트 대상 힌트가 있는데 캐시를 권위로 썼다(캐시 오염 경로)")
 
     def test_cache_dirname_matches_both_sibling_layers(self):
         """★G14: 역할 캐시 디렉터리 이름이 세 층에서 같은가(보호가 조용히 늙지 않게)."""

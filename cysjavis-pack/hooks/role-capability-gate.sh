@@ -154,11 +154,19 @@ capgate_resolve_role() {
   # env 힌트(폴백 전용 신원 · plan §8). 여기서의 쓰임은 두 가지뿐이다:
   #   ① 게이트 대상이면 캐시 fast-path 를 끈다(캐시 오염으로 게이트가 열리지 않게)
   #   ② 데몬 조회가 실패했을 때의 후보
+  # ★폴백 후보는 `CYS_ROLE` **하나뿐**이다(0.14.31 성찰 G6 · `javis_role.py:636`·`_lib.sh:678`
+  #   과 글자 그대로 같게). `CYS_SURFACE_ROLE` 은 이 훅이 해소 결과로 export 하는 **산출물**이지
+  #   신원 입력이 아니다 — 폴백 1순위로 두면 `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 한 줄로
+  #   `CronCreate`/`Task`/`WebSearch`(§1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은 절대
+  #   deny 집합)가 열린다. 자매 두 층은 그 경로를 **검체로 금지**했는데 게이트만 열려 있었다.
   _cg_env=""
-  [ -n "${CYS_SURFACE_ROLE:-}" ] && _cg_env="$CYS_SURFACE_ROLE"
-  [ -z "$_cg_env" ] && [ -n "${CYS_ROLE:-}" ] && _cg_env="$CYS_ROLE"
+  [ -n "${CYS_ROLE:-}" ] && _cg_env="$CYS_ROLE"
+  # ★fast-path 차단(①)은 **막는 축**이라 넓게 본다: 어느 힌트든 게이트 대상이라고 말하면
+  #   캐시를 권위로 쓰지 않고 데몬에 묻는다(오탐의 귀결이 '조회 1회'다).
   _cg_env_gated=0
-  capgate_gated_role "$_cg_env" && _cg_env_gated=1
+  if capgate_gated_role "$_cg_env" || capgate_gated_role "${CYS_SURFACE_ROLE:-}"; then
+    _cg_env_gated=1
+  fi
 
   # 캐시 판독 — 공용 `cys_role_record`(정규 파일·비심링크·4KB 유계 판독·토큰 문법 검사 ·
   # **세대와 소켓 신원 원문 정확 비교**). 못 재면 신뢰하지 않고 조회한다(codex R1).
@@ -208,6 +216,10 @@ capgate_resolve_role() {
      && [ $(( _cg_now - CYS_ROLE_REC_TS )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
     _cg_skip_query=1
   fi
+  # ★신원 전제(공용 `cys_resolve_role` 과 같은 규칙): 숫자 surface id 가 없으면 데몬에게 '나'를
+  #   물을 수 없다. 그때 Rust 는 rc 0 + 빈 줄을 낼 수 있는데 그것을 '권위 있는 무역할'로 채택하면
+  #   **주소가 없다는 사실이 역할이 없다는 판정으로 승격**된다(정상 위임 경로가 죽는다).
+  [ -n "$_cg_sid" ] || _cg_skip_query=1
   if [ "$_cg_skip_query" = "0" ] && command -v cys >/dev/null 2>&1; then
     # ★`CYS_NO_AUTOSTART=1`(0.14.31 성찰 G5): 소켓이 없으면 `cys` 는 autostart 경로를 타고
     #   `connect()` 가 형제 `cysd` 를 detached 로 **스폰한 뒤** 폴링한다 — 밖의
@@ -256,10 +268,6 @@ capgate_resolve_role() {
   fi
   if [ -n "$_cg_c1" ]; then
     CYS_SURFACE_ROLE_RESOLVED="$_cg_c1"; CAPGATE_ROLE_SOURCE="cache-fallback"
-    return 0
-  fi
-  if [ -n "${CYS_SURFACE_ROLE:-}" ]; then
-    CYS_SURFACE_ROLE_RESOLVED="$CYS_SURFACE_ROLE"; CAPGATE_ROLE_SOURCE="env-surface-role"
     return 0
   fi
   if [ -n "${CYS_ROLE:-}" ]; then
@@ -311,14 +319,12 @@ else
   fi
   # ★역할 해소는 **인터프리터 판정보다 먼저** 한다 — python 부재 분기가 역할을 알아야
   #   reviewer(fail-closed exit 2)와 CSO(fail-open 강등)를 가를 수 있다.
-  if [ -z "${CYS_SURFACE_ROLE:-}" ] || [ -n "${CYS_SURFACE_ID:-}" ]; then
-    capgate_resolve_role
-    if [ -n "$CYS_SURFACE_ROLE_RESOLVED" ]; then
-      CYS_SURFACE_ROLE="$CYS_SURFACE_ROLE_RESOLVED"
-    elif [ "$CAPGATE_ROLE_SOURCE" = "daemon-none" ] || [ "$CAPGATE_ROLE_SOURCE" = "cache-none" ]; then
-      CYS_SURFACE_ROLE=""
-    fi
-  fi
+  # ★`CYS_SURFACE_ROLE` 은 **해소 산출물**이지 입력이 아니다(0.14.31 성찰 G6). 종전에는
+  #   `CYS_SURFACE_ROLE` 이 설정돼 있고 `CYS_SURFACE_ID` 가 없으면 해소기를 아예 부르지 않고
+  #   그 값을 그대로 판정기에 넘겼다 — 상속된 env 한 줄이 신원이 됐다. 항상 해소하고,
+  #   해소가 답을 주지 못하면 **비운다**(무역할 = 통과 · 무역할 pane 은 사람/일반 셸이다).
+  capgate_resolve_role
+  CYS_SURFACE_ROLE="$CYS_SURFACE_ROLE_RESOLVED"
   export CYS_SURFACE_ROLE
   export CAPGATE_ROLE_SOURCE
   export CAPGATE_ROLE_ALT
