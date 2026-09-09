@@ -414,12 +414,19 @@ fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Val
 }
 
 /// schedule.json 원자 치환(tmp+rename) — 핫리로드 torn read 회피. 반환: 성공했는가.
+///
+/// ★(성찰 A11) tmp 이름은 **pid + nonce** 다. 종전의 고정 `schedule.json.tmp` 는 데몬의 세
+/// writer(`ensure_builtin_jobs` · 틱 핫리로드 정규화 · `remove_job_from_file`)와 CLI
+/// (`cys schedule add/rm`)가 **같은 이름**을 나눠 써, A 의 `rename` 이 B 가 반쯤 쓴 파일을
+/// `schedule.json` 자리에 놓을 수 있었다(부분 JSON → 손상 격리 → 빈 스케줄 → 전 builtin 침묵).
+/// 이름 분리는 torn 파일을 막고, **쓰기 순서**는 [`ScheduleFileLock`] 이 직렬화한다.
 fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bool {
     let Ok(body) = serde_json::to_string_pretty(root) else {
         return false;
     };
-    let tmp = path.with_extension("json.tmp");
+    let tmp = schedule_tmp_path(path);
     if std::fs::write(&tmp, body).is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
     if std::fs::rename(&tmp, path).is_err() {
@@ -427,6 +434,95 @@ fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bo
         return false;
     }
     true
+}
+
+/// writer 별로 다른 임시 파일 — `schedule.json.<pid>.<nonce>.tmp`(같은 디렉터리 = 같은 볼륨 → rename 원자).
+fn schedule_tmp_path(path: &std::path::Path) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "schedule.json".into());
+    path.with_file_name(format!("{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// ★(성찰 A11) **schedule.json writer 잠금** — 디렉터리 잠금(`schedule.json.lock` 을 `create_dir`).
+///
+/// `create_dir` 은 POSIX·NTFS 모두에서 "있으면 실패" 가 **원자**라 Windows 에서 flock 없이
+/// 되는 유일한 상호배제 원시다(Git Bash `sh` · ConPTY 환경 포함). 보유자가 죽어 잠금이 남으면
+/// mtime 이 [`SCHEDULE_LOCK_STALE_SECS`] 를 넘긴 잠금을 **깨고** 진입한다(pid 검사는 Windows 에서
+/// 신뢰할 수 없어 쓰지 않는다). 대기는 [`SCHEDULE_LOCK_WAIT_MS`] 로 유계 — 못 잡으면 `None` 이고
+/// 호출부는 **이번 쓰기를 포기**한다(다음 틱이 다시 온다 · 잠금 없이 쓰는 경로는 없다).
+///
+/// 같은 프로토콜을 CLI(`cys.rs` 의 `schedule add/rm` 저장 — cli-boot C10)가 써야 직렬화가
+/// 완성된다: 잠금 = `<schedule.json>.lock` 디렉터리 · 획득 = `create_dir` · 대기 ≤ 2,000ms(10ms 간격) ·
+/// mtime 30s 초과 잠금은 깨도 된다 · tmp = `<schedule.json>.<pid>.<nonce>.tmp` + rename · 해제 = `remove_dir`.
+///
+/// **읽기는 잠그지 않는다**(CQS). 읽기가 보는 것은 언제나 rename 전이거나 후인 온전한 문서다.
+pub struct ScheduleFileLock {
+    dir: PathBuf,
+}
+
+/// 잠금 대기 상한(ms). 데몬 틱·CLI 의 쓰기는 수 ms 라 이 안에 언제나 풀린다.
+pub const SCHEDULE_LOCK_WAIT_MS: u64 = 2_000;
+/// 이보다 오래된 잠금은 죽은 보유자의 것이다(깨도 된다).
+pub const SCHEDULE_LOCK_STALE_SECS: u64 = 30;
+
+impl ScheduleFileLock {
+    pub fn lock_dir_for(path: &std::path::Path) -> PathBuf {
+        let name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "schedule.json".into());
+        path.with_file_name(format!("{name}.lock"))
+    }
+
+    /// 프로덕션 진입점 — 기본 대기·부패 상한.
+    pub fn acquire(path: &std::path::Path) -> Option<Self> {
+        Self::acquire_with(
+            path,
+            Duration::from_millis(SCHEDULE_LOCK_WAIT_MS),
+            Duration::from_secs(SCHEDULE_LOCK_STALE_SECS),
+        )
+    }
+
+    /// 대기·부패 상한을 주입받는 본체(검체가 부패 잠금 깨기를 초 단위로 기다리지 않게).
+    pub fn acquire_with(path: &std::path::Path, wait: Duration, stale: Duration) -> Option<Self> {
+        let dir = Self::lock_dir_for(path);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Some(Self { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 죽은 보유자의 잠금인가 — mtime 이 부패 상한을 넘겼으면 깨고 다시 잡는다.
+                    let stale_now = std::fs::metadata(&dir)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > stale);
+                    if stale_now {
+                        let _ = std::fs::remove_dir(&dir);
+                        continue;
+                    }
+                }
+                Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ScheduleFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.dir);
+    }
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
@@ -543,8 +639,21 @@ fn apply_builtin_jobs(
 /// 파일 부재=빈 골격 생성 · 손상(파싱 실패)=무접촉(load_jobs 의 격리 경로가 별도 처리 — 여기서 덮어써 사용자 잡을
 /// 잃지 않는다) · 변경 있을 때만 원자적 재기록(핫 리로드 torn read 회피).
 pub fn ensure_builtin_jobs() {
-    let path = schedule_path();
-    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+    ensure_builtin_jobs_at(&schedule_path());
+}
+
+/// 경로 주입판(검체 가능) — 위 함수의 본체. ★(성찰 A11) **writer 잠금** 아래에서 읽고·접고·쓴다.
+pub fn ensure_builtin_jobs_at(path: &std::path::Path) {
+    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+        eprintln!("[cysd] ensure_builtin_jobs: schedule.json writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 무접촉(다음 기회에 다시)");
+        return;
+    };
+    ensure_builtin_jobs_locked(path);
+}
+
+/// 잠금을 **이미 쥔** 호출자용 본체(손상 격리 직후 같은 틱의 복구가 여기로 온다).
+fn ensure_builtin_jobs_locked(path: &std::path::Path) {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(c) => match serde_json::from_str(&c) {
             Ok(v) => v,
             Err(e) => {
@@ -595,7 +704,7 @@ pub fn ensure_builtin_jobs() {
         );
     }
     if changed {
-        if write_schedule_atomic(&path, &root) {
+        if write_schedule_atomic(path, &root) {
             eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
         } else {
             eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
@@ -619,9 +728,47 @@ fn quarantine_corrupt(path: &std::path::Path) -> Option<PathBuf> {
     std::fs::rename(path, &backup).ok().map(|_| backup)
 }
 
+/// ★(성찰 A11) **읽기 전용 로더**(CQS). `schedule.status`(`cys schedule list`)·`run_now` 가 쓴다 —
+/// 조회 RPC 는 디스크를 바꾸지 않는다. 손상도 **격리하지 않는다**(rename 은 쓰기다): loud 신호만
+/// 남기고 빈 스케줄을 돌려주며, 격리·복구는 30초 안에 오는 스케줄러 틱([`load_jobs_hot_reload`])의
+/// 소관이다. 메모리의 `Job` 은 serde 계층이 그대로 정규화하므로 뜻은 같다.
 pub fn load_jobs() -> Vec<Job> {
-    let path = schedule_path();
-    let content = match std::fs::read_to_string(&path) {
+    load_jobs_at(&schedule_path(), LoadMode::ReadOnly)
+}
+
+/// ★(성찰 A11) 스케줄러 틱 전용 **단일 writer 로더** — writer 잠금 아래에서 (a) 손상이면 격리하고
+/// **같은 틱에** builtin 을 복구하며 (b) 저장 표현을 정규형으로 접어 되쓴다(triage X8).
+/// 종전에는 `load_jobs()` 하나가 `status`·`run_now`·틱에서 전부 파일을 되썼다 — 잠금 없는 병렬
+/// writer 3개(`main.rs` 의 `spawn_blocking` 이 RPC 를 진짜 병렬로 만든다) + CLI 1개.
+pub fn load_jobs_hot_reload() -> Vec<Job> {
+    load_jobs_at(&schedule_path(), LoadMode::HotReload)
+}
+
+/// 로더의 두 모드 — **읽기**와 **쓰기 겸 읽기**를 자료형으로 가른다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadMode {
+    /// 파일을 바꾸지 않는다(격리도 정규화도 없음). 잠금을 잡지 않는다.
+    ReadOnly,
+    /// writer 잠금 아래에서 격리 + 같은 틱 builtin 복구 + 정규형 되쓰기.
+    HotReload,
+}
+
+/// 경로 주입판(검체 가능) — 두 로더의 본체.
+pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
+    // 쓰기 모드는 읽기 **전에** 잠근다 — 읽기와 치환 사이에 CLI 추가가 끼어들면 그 추가가
+    // 우리의 옛 문서로 덮여 사라진다(CLI 는 이미 성공을 출력한 뒤 = 거짓 성공).
+    let lock = match mode {
+        LoadMode::ReadOnly => None,
+        LoadMode::HotReload => match ScheduleFileLock::acquire(path) {
+            Some(l) => Some(l),
+            None => {
+                // 잠금을 못 잡았다 — 이번 틱은 **읽기만** 한다(쓰기 없는 경로로 강등 · 발화는 계속).
+                eprintln!("[cysd] schedule: writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 이번 틱은 읽기만 한다");
+                return load_jobs_at(path, LoadMode::ReadOnly);
+            }
+        },
+    };
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         // 부재 = 정상(스케줄 미설정). 빈 스케줄로 조용히 진행한다.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -638,19 +785,41 @@ pub fn load_jobs() -> Vec<Job> {
     let mut root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            let note = match quarantine_corrupt(&path) {
+            if lock.is_none() {
+                // 읽기 전용 경로는 격리하지 않는다(rename 은 쓰기다) — 틱이 30초 안에 처리한다.
+                eprintln!("[cysd] schedule.json 파싱 실패: {e} — 읽기 전용 경로라 격리하지 않는다(다음 틱이 격리·복구) · 빈 스케줄로 진행");
+                return Vec::new();
+            }
+            let note = match quarantine_corrupt(path) {
                 Some(b) => format!("손상본을 {}로 격리(데이터 보존)", b.display()),
                 None => "손상본 격리 실패".to_string(),
             };
-            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 빈 스케줄로 진행");
-            return Vec::new();
+            // ★(성찰 A11 ⓒ) 격리 뒤 **같은 틱에서** builtin 을 복구한다. 종전에는 `ensure_builtin_jobs`
+            //   가 부트에만 돌아 phoenix 스냅샷·learn 감사·cycle 틱·편성 심박·CSO 60분 점검이
+            //   **데몬 재시작까지 전부 정지**했다(코드 자신이 경고한 무발화 침묵).
+            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 같은 틱에서 built-in 잡을 복구한다");
+            ensure_builtin_jobs_locked(path);
+            return match std::fs::read_to_string(path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            {
+                Some(v) => jobs_of(&v),
+                None => Vec::new(),
+            };
         }
     };
     // ★(수렴 R2 · triage X8 잔여) **핫리로드도 파일을 접는다.** 종전에는 아래 serde 계층이
     //   메모리의 `Job` 만 정규화했고(`canonicalize_queue_action`), 디스크는 운영자가 손으로 넣은
     //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
-    //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음).
-    canonicalize_schedule_file(&path, &mut root);
+    //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음). ★(성찰 A11) 쓰기 모드에서만 · 잠금 아래에서.
+    if lock.is_some() {
+        canonicalize_schedule_file(path, &mut root);
+    }
+    jobs_of(&root)
+}
+
+/// 최상위 문서 → `Vec<Job>`(스키마 불일치는 loud + 빈 스케줄).
+fn jobs_of(root: &serde_json::Value) -> Vec<Job> {
     match root.get("jobs") {
         None => Vec::new(), // jobs 키 부재 = 빈 스케줄(정상)
         Some(j) => match serde_json::from_value::<Vec<Job>>(j.clone()) {
@@ -816,7 +985,7 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     if daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let jobs = load_jobs(); // 핫 리로드: CLI가 schedule.json만 고치면 됨
+    let jobs = load_jobs_hot_reload(); // 핫 리로드: CLI가 schedule.json만 고치면 됨 · 이 틱이 유일한 데몬 writer 자리다
     if jobs.is_empty() {
         return;
     }
@@ -989,8 +1158,16 @@ fn drop_job_and_canonicalize(root: &mut serde_json::Value, job_id: &str) {
 
 /// T3-10: 처리 완료된 원샷 job을 schedule.json에서 제거 (영구 잔존 차단)
 fn remove_job_from_file(job_id: &str) {
-    let path = schedule_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    remove_job_from_file_at(&schedule_path(), job_id);
+}
+
+/// 경로 주입판 — ★(성찰 A11) writer 잠금 아래에서 읽고·빼고·쓴다(읽기와 치환 사이의 CLI 추가 보존).
+fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
+    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+        eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 — writer 잠금을 잡지 못했다 · 다음 틱이 다시 시도한다");
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -998,7 +1175,7 @@ fn remove_job_from_file(job_id: &str) {
     };
     drop_job_and_canonicalize(&mut root, job_id);
     // 원자 치환 — 부분 쓰기가 핫리로드에 잡히면 스케줄 전체가 빈 스케줄로 읽힌다.
-    if !write_schedule_atomic(&path, &root) {
+    if !write_schedule_atomic(path, &root) {
         eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 기록 실패 — 다음 틱이 다시 시도한다");
     }
 }
@@ -2364,6 +2541,174 @@ mod tests {
         oneshot.at = Some(1_900_000_000);
         oneshot.fresh = true;
         assert_eq!(effective_close_ttl(&oneshot), None);
+    }
+
+    fn sched_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-sched-a11-{tag}-{}-{}-{n}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ★(성찰 A11) **잠금 없는 병렬 writer 가 없다** — writer 셋이 각자 잠금 아래에서
+    /// 읽기→추가→원자 치환을 반복하는 동안 독립 reader 는 언제나 파싱 가능한 문서를 보고,
+    /// 끝난 뒤 문서에는 **모든 writer 의 모든 추가**가 남아 있다(읽기와 치환 사이에 낀 추가가
+    /// 옛 문서로 덮이지 않는다 = 완료된 `cys schedule add` 소멸 없음).
+    #[test]
+    fn schedule_writers_serialize_under_the_lock_and_no_add_is_lost() {
+        let dir = sched_dir("writers");
+        let path = dir.join("schedule.json");
+        std::fs::write(&path, r#"{"jobs": []}"#).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bad_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let (path, stop, bad) = (path.clone(), stop.clone(), bad_reads.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(c) = std::fs::read_to_string(&path) {
+                        reads += 1;
+                        if serde_json::from_str::<serde_json::Value>(&c).is_err() {
+                            bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                reads
+            })
+        };
+        const WRITERS: usize = 3;
+        const ADDS: usize = 25;
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..ADDS {
+                        let _lock = ScheduleFileLock::acquire(&path).expect("writer 잠금");
+                        let mut root: serde_json::Value =
+                            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                        root["jobs"].as_array_mut().unwrap().push(json!({
+                            "id": format!("w{w}-{i}"), "action": "push", "via_queue": true,
+                            "to": "master", "text": "x", "every_minutes": 60}));
+                        assert!(write_schedule_atomic(&path, &root), "원자쓰기 실패");
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reads = reader.join().unwrap();
+        assert!(reads > 0, "reader 가 한 번도 읽지 못했다");
+        assert_eq!(bad_reads.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "reader 가 파싱 불가한(찢긴) schedule.json 을 봤다");
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["jobs"].as_array().unwrap().len(), WRITERS * ADDS,
+            "잠금 아래의 추가가 다른 writer 의 치환에 덮여 사라졌다");
+        // 잠금 디렉터리는 전부 해제됐고 tmp 잔재도 없다.
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists(), "잠금이 해제되지 않았다");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp 잔재: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(성찰 A11) 핫리로드(쓰기 모드)는 잠금을 **기다리고**, 읽기 전용 로더는 잠금 아래에서도
+    /// **기다리지 않는다**(CQS) — 그리고 읽기 전용은 파일을 바꾸지 않는다(구 표현 그대로).
+    #[test]
+    fn hot_reload_waits_for_the_writer_lock_but_read_only_never_does_and_never_writes() {
+        let dir = sched_dir("cqs");
+        let path = dir.join("schedule.json");
+        let legacy = r#"{"jobs": [{"id": "j", "action": "push", "via_queue": true, "to": "master",
+            "text": "x", "every_minutes": 60}]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // 검체가 잠금을 쥔다(= CLI 가 쓰는 중).
+        let held = ScheduleFileLock::acquire(&path).expect("잠금");
+        // 읽기 전용: 즉시 돌아오고 파일은 바이트 동일.
+        let t0 = std::time::Instant::now();
+        let jobs = load_jobs_at(&path, LoadMode::ReadOnly);
+        assert_eq!(jobs.len(), 1);
+        assert!(t0.elapsed() < Duration::from_millis(500), "읽기 전용 로더가 잠금을 기다렸다");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy, "읽기 전용 로더가 파일을 바꿨다");
+        // 쓰기 모드: 잠금이 풀릴 때까지 기다린다(그 사이 파일 무접촉).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = path.clone();
+        let hot = std::thread::spawn(move || {
+            let jobs = load_jobs_at(&p2, LoadMode::HotReload);
+            tx.send(()).unwrap();
+            jobs
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "핫리로드가 잠금을 기다리지 않았다");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy, "잠금 보유 중에 파일이 바뀌었다");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5)).expect("잠금 해제 뒤 핫리로드가 끝나야 한다");
+        let jobs = hot.join().unwrap();
+        assert_eq!(jobs.len(), 1);
+        // 잠금 아래에서 정규형으로 접혔다(triage X8 의 되쓰기는 유지된다 — 단일 writer 자리에서).
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["jobs"][0]["action"], json!(ACTION_PUSH_QUEUED));
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(성찰 A11 ⓒ) 손상 격리 뒤 **같은 틱에서** builtin 이 복구된다 — 종전에는 재기동까지 전
+    /// builtin(phoenix·learn·cycle·formation·promote) 이 침묵했다. 읽기 전용 로더는 격리하지 않는다.
+    #[test]
+    fn corrupt_schedule_is_quarantined_and_builtins_return_in_the_same_tick() {
+        let dir = sched_dir("corrupt");
+        let path = dir.join("schedule.json");
+        std::fs::write(&path, b"{ this is not valid json ]").unwrap();
+        // 읽기 전용: 격리하지 않는다(rename 은 쓰기다).
+        assert!(load_jobs_at(&path, LoadMode::ReadOnly).is_empty());
+        assert!(path.exists(), "읽기 전용 로더가 손상본을 격리(rename)했다");
+        // 핫리로드: 격리 + 같은 호출에서 builtin 복구.
+        let jobs = load_jobs_at(&path, LoadMode::HotReload);
+        let quarantined = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "손상본이 격리되지 않았다");
+        let builtin_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        let expected: Vec<String> = builtin_jobs()
+            .iter()
+            .filter_map(|j| j["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(!expected.is_empty());
+        for id in &expected {
+            assert!(builtin_ids.contains(&id.as_str()), "같은 틱 복구에 builtin {id} 가 없다: {builtin_ids:?}");
+        }
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["jobs"].as_array().unwrap().len() >= expected.len());
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 죽은 보유자의 잠금(부패 mtime)은 깨고 진입한다 · 살아있는 잠금은 대기 상한에서 `None`.
+    #[test]
+    fn stale_schedule_lock_is_broken_and_live_lock_times_out() {
+        let dir = sched_dir("stale");
+        let path = dir.join("schedule.json");
+        let lock_dir = ScheduleFileLock::lock_dir_for(&path);
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // 부패 상한 10ms → 30ms 된 잠금은 깨진다.
+        let got = ScheduleFileLock::acquire_with(&path, Duration::from_millis(200), Duration::from_millis(10));
+        assert!(got.is_some(), "부패 잠금을 깨지 못했다");
+        // 살아있는(방금 만든) 잠금은 대기 상한 안에 못 잡는다 — 잠금 없이 쓰는 경로는 없다.
+        let again = ScheduleFileLock::acquire_with(&path, Duration::from_millis(100), Duration::from_secs(30));
+        assert!(again.is_none(), "살아있는 잠금을 뚫었다");
+        drop(got);
+        assert!(!lock_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
