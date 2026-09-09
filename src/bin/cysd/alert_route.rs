@@ -116,6 +116,20 @@ pub const PENDING_ABSOLUTE_MAX: usize = 4 * PENDING_HARD_MAX;
 /// 그 배압이 [`PENDING_ABSOLUTE_MAX`] 를 통해 문 앞의 **보고된 거절**로 이어진다.
 /// 압축 임계([`FOLDED_COMPACT_BYTES`])의 16배라 정상 운전에서는 닿지 않는다.
 pub const FOLDED_ABSOLUTE_MAX_BYTES: u64 = 16 * FOLDED_COMPACT_BYTES;
+/// ★(성찰 A2) **최종 보존소가 링뿐이던 자리**의 내구 overflow 원장(추가-전용 JSONL).
+///
+/// 이 모듈에는 경보의 마지막 사본을 `daemon.bus` 의 4,096칸 ring 에만 남기고 지나가는 자리가
+/// 셋 있었다: ① 문 앞 절대 천장 거절([`route_once`] 의 `ingest_refused{original}`)
+/// ② 무내구 접기([`announce_folded`] 의 `spilled_to: null` · `original`)
+/// ③ 뒤늦게 CSO 가 된 좌석의 보류분 폐기([`dispatch`] 의 `Verdict::Ignore` → `became_cso`).
+/// ring 은 회전하고 재기동에서 통째로 사라진다 — 그리고 이 모듈의 창립 논거가 "CSO 는
+/// 구독하지 않는다" 라 **그 마지막 사본의 독자가 제도적으로 없다**. 그러므로 세 자리 모두
+/// 링에 싣기 **전에** 이 파일에 먼저 붙이고, 붙이지 못했으면 그 사실을 이벤트에 명시한다
+/// (`durable:false` · `note` 에 "유실이며 복구 불가").
+pub const REFUSED_FILE: &str = "alert-route-refused.jsonl";
+/// overflow 원장의 절대 바이트 상한 — 압축·회전이 없는 추가-전용 파일이라 천장이 필요하다.
+/// 여기 닿으면 append 가 실패로 돌아가고 호출부가 "유실" 을 명시 보고한다(조용한 폐기 금지).
+pub const REFUSED_ABSOLUTE_MAX_BYTES: u64 = 4 * FOLDED_COMPACT_BYTES;
 /// ★재생 갭 통지의 **합성 키** 이름. [`OVERFLOW_NAME`] 과 같은 방식으로 **버스에 발행하지 않는다**
 /// (발행하면 자기 이벤트를 다시 라우팅하는 되먹임이 생긴다). 관측용 이벤트는 `alert_route.replay_gap`
 /// 이라는 **다른 이름**으로 나간다 — 이름을 가른 것이 되먹임 금지의 구조적 근거다.
@@ -253,6 +267,10 @@ pub enum HoldReason {
     /// ★적재 예산(시간당 상한)을 **내구화하지 못했다** — 그 상태에서 적재하면 재기동마다
     /// 상한이 새로 열린다(같은 실제 한 시간에 두 배). 디스크가 돌아오면 저절로 풀린다.
     BudgetUndurable,
+    /// ★(성찰 A2) 더는 라우팅 대상이 아니게 된 보류분을 **내구 보존하지 못했다**.
+    /// 그 상태에서 미해결 집합에서 빼면 그 사실의 마지막 사본이 이벤트 링뿐이 된다 —
+    /// 보존될 때까지 **소비하지 않는다**(디스크가 돌아오면 저절로 풀린다).
+    ArchiveUndurable,
 }
 
 impl HoldReason {
@@ -264,6 +282,7 @@ impl HoldReason {
             HoldReason::NoCso => "no_cso",
             HoldReason::EmptySeat => "empty_seat",
             HoldReason::BudgetUndurable => "budget_undurable",
+            HoldReason::ArchiveUndurable => "archive_undurable",
             HoldReason::Cooldown => "cooldown",
             HoldReason::HourlyCap => "hourly_cap",
             HoldReason::QueueHeadroom => "queue_headroom",
@@ -584,14 +603,21 @@ impl RouteState {
     /// 호출부가 [`enforce_pending_bound`] 로 처리한다.
     ///
     /// 반환: 받아들였는가. `false` 는 **신규 키 거절**이다 — 디스크 불능으로 접기가 계속 실패해
-    /// 집합이 [`PENDING_HARD_MAX`] 를 넘었을 때, **재발행되는 사실**(health·watchdog·queue)의
-    /// *새 키*만 거절한다. 에지 1회 경보(`context.threshold`·`surface.exited`·갭 통지)와 이미
-    /// 있는 키의 병합은 언제나 받는다 — 그것을 거절하면 치명위험 ②가 그대로 돌아온다.
+    /// 집합이 [`PENDING_HARD_MAX`] 를 넘었을 때, **버려도 되는 사실**([`is_discardable`] —
+    /// 살아있는 발행자가 틱마다 다시 내는 것)의 *새 키*만 거절한다. 다시 오지 않는 사실
+    /// (`health.alert` 의 새 오류 줄 · `context.threshold` · `surface.exited` · 갭 통지)과
+    /// 이미 있는 키의 병합은 언제나 받는다 — 그것을 거절하면 치명위험 ②가 그대로 돌아온다.
+    ///
+    /// ★(성찰 A1) 종전 기준은 접기 우선순위(`fold_rank == 0`)였다. 그것은 *순서*이지 *폐기
+    ///   허가*가 아니다: `health.alert` 는 rank 0 이지만 `state.rs::run_health_rules` 가 **새로
+    ///   완성된 출력 줄**에서만 내므로 한 번 지나간 panic 줄은 재생 보장이 없다. 그 키를 문
+    ///   앞에서 거절하면 그 사실의 마지막 사본이 생기지도 못한다. 보존 등급 질의는 이제
+    ///   [`is_discardable`] **하나**이고 `fold_rank` 는 순서에만 쓴다.
     pub fn ingest(&mut self, key: &AlertKey, summary: &str, reason: HoldReason, now: Now) -> bool {
         self.prune(now.mono);
         if !self.pending.contains_key(key)
             && self.pending.len() >= PENDING_HARD_MAX
-            && Self::fold_rank(key) == 0
+            && is_discardable(&key.name)
         {
             return false;
         }
@@ -1639,10 +1665,53 @@ pub fn persist_pending(daemon: &Arc<Daemon>, now: Now, force: bool) {
     }
 }
 
-/// 마지막 영속이 실제로 디스크에 닿았는가(직전 [`persist_pending`] 호출 기준).
-fn pending_is_durable(daemon: &Arc<Daemon>) -> bool {
+/// ★(성찰 A3) 예산 내구성의 **세 상태** — 종전에는 두 상태였고 그 접기가 이 세대의 배달을
+/// 통째로 껐다.
+///
+/// `persist_blocked`(영구 봉인 · 해제는 재기동뿐)와 "이번 쓰기가 실패했다"(일시)는 **다른
+/// 사실**인데 [`pending_is_durable`] 이 둘을 하나로 접었다. 그 결과 읽을 수 없는
+/// `alert-route-pending.json` 하나로 [`dispatch`] 가 매 배차마다 `break` 했고 — 이 세대의
+/// CSO 경보가 **0건** 이 되면서 `org.status.alert_route.enabled` 는 `true` 로 남아 팩 preflight
+/// 의 능력 게이트를 등록시켰다(CSO 는 구독 금지 ∧ 무배달 = §7 치명위험 ③의 형상).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetDurability {
+    /// 방금 쓴 예약이 디스크에 닿았다.
+    Durable,
+    /// ★영속이 **영구 봉인**된 세대다. 예산은 메모리에만 계상되고 재기동에서 사라진다 —
+    /// 대가는 "같은 실제 한 시간에 상한이 두 번 열릴 수 있다" 이고, 그것을 피하려 배달을 끄면
+    /// 이 세대의 경보가 0건이 된다. **배달을 고른다**(같은 모듈이 인계에서 "중복이 안전 방향"
+    /// 이라고 선언한 것과 같은 방향). 그 사실은 `alert_route.routed` 에 실린다.
+    MemoryOnly,
+    /// 봉인은 아닌데 이번 쓰기가 디스크에 닿지 않았다(일시 오류) — 보류하고 다음 틱에 다시 쓴다.
+    Undurable,
+}
+
+impl BudgetDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BudgetDurability::Durable => "durable",
+            BudgetDurability::MemoryOnly => "memory_only",
+            BudgetDurability::Undurable => "undurable",
+        }
+    }
+}
+
+/// 직전 [`persist_pending`] 호출 기준의 예산 내구성.
+fn budget_durability(daemon: &Arc<Daemon>) -> BudgetDurability {
     let st = state_lock(daemon);
-    !st.persist_blocked && st.persisted_gen >= st.pending_gen
+    if st.persist_blocked {
+        BudgetDurability::MemoryOnly
+    } else if st.persisted_gen >= st.pending_gen {
+        BudgetDurability::Durable
+    } else {
+        BudgetDurability::Undurable
+    }
+}
+
+/// 마지막 영속이 실제로 디스크에 닿았는가(직전 [`persist_pending`] 호출 기준).
+/// **파괴적 조작의 전제**로만 쓴다(원장 재작성 등) — 배달 여부의 판정은 [`budget_durability`] 다.
+fn pending_is_durable(daemon: &Arc<Daemon>) -> bool {
+    budget_durability(daemon) == BudgetDurability::Durable
 }
 
 /// 이 세대의 영속을 봉인한다 — 이유를 남기고 다시는 원본을 덮지 않는다.
@@ -2404,23 +2473,125 @@ fn spill_folded(daemon: &Arc<Daemon>, victims: &[(AlertKey, PendingAlert)], now:
     f.sync_all()
 }
 
+/// ★(성찰 A2) **내구 overflow 원장 append** — 링이 마지막 사본이 되려는 자리에서 먼저 부른다.
+///
+/// 추가-전용 · `sync_all` 까지. 실패는 삼키지 않고 돌려준다 — 호출부가 그 실패를 "이것은
+/// 유실이며 복구 불가" 로 **명시 보고**하거나(ⓒ) 소비를 미룬다. 성공/실패의 판정을 호출부가
+/// 이벤트에 그대로 싣기 때문에 "저장했다고 말하고 저장하지 않는" 형태가 구조적으로 없다.
+fn append_refused(daemon: &Arc<Daemon>, rows: &[Value]) -> std::io::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    use std::io::Write;
+    let dir = state_dir(daemon);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(REFUSED_FILE);
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= REFUSED_ABSOLUTE_MAX_BYTES {
+        return Err(std::io::Error::other(format!(
+            "overflow 원장이 절대 상한({REFUSED_ABSOLUTE_MAX_BYTES}B)에 닿았다 — 더 붙이지 않는다"
+        )));
+    }
+    // 잘린 마지막 줄 뒤에 그대로 붙이면 두 행이 한 줄로 합쳐진다(접힘 원장과 같은 규율).
+    // 확인하지 못했으면 개행을 **넣는 쪽**으로 틀린다 — 빈 줄은 판독이 건너뛴다.
+    let needs_nl = {
+        use std::io::{Read, Seek, SeekFrom};
+        match std::fs::File::open(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+            Ok(mut f) => (|| -> std::io::Result<bool> {
+                let len = f.metadata()?.len();
+                if len == 0 {
+                    return Ok(false);
+                }
+                f.seek(SeekFrom::End(-1))?;
+                let mut last = [0u8; 1];
+                f.read_exact(&mut last)?;
+                Ok(last[0] != b'\n')
+            })()
+            .unwrap_or(true),
+        }
+    };
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    if needs_nl {
+        f.write_all(b"\n")?;
+    }
+    let mut buf = String::new();
+    for r in rows {
+        buf.push_str(&r.to_string());
+        buf.push('\n');
+    }
+    f.write_all(buf.as_bytes())?;
+    f.sync_all()
+}
+
+/// overflow 원장의 한 행 — 사실의 재구성에 필요한 것만 담는다(요약은 이미 sanitize 된 값이다).
+fn refused_row(kind: &str, key: &AlertKey, p: &PendingAlert, now: Now) -> Value {
+    json!({"at": now.epoch, "kind": kind, "name": key.name, "surface_id": key.surface,
+           "detail": key.detail, "first_seen": p.first_seen, "last_seen": p.last_seen,
+           "count": p.count, "summary": p.summary})
+}
+
+/// overflow 원장의 행들(관측·검체). 판독 실패는 빈 목록이 아니라 오류다 — 결측을 값으로 접지 않는다.
+pub fn read_refused_rows(daemon: &Arc<Daemon>) -> std::io::Result<Vec<Value>> {
+    let path = state_dir(daemon).join(REFUSED_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect())
+}
+
 fn announce_folded(
     daemon: &Arc<Daemon>,
     folded: &[(AlertKey, PendingAlert)],
     spilled: bool,
+    now: Now,
 ) {
+    // ★(성찰 A2 · 자리 ②) 무내구 접기는 원본을 ring 에만 남겼다 — ring 은 회전하고 재기동에서
+    //   사라지며 그 마지막 사본의 독자는 제도적으로 없다. 링에 싣기 **전에** overflow 원장에
+    //   붙이고, 붙이지 못했을 때만 "복구 불가" 를 명시한다. (A1 이후 이 경로의 대상은
+    //   [`is_discardable`] 뿐이라 실패해도 살아있는 발행자가 다시 낸다 — 그 사실도 적는다.)
+    let archived = if spilled {
+        None
+    } else {
+        let rows: Vec<Value> =
+            folded.iter().map(|(k, p)| refused_row("fold_undurable", k, p, now)).collect();
+        match append_refused(daemon, &rows) {
+            Ok(()) => Some(Ok(())),
+            Err(e) => Some(Err(e.to_string())),
+        }
+    };
     for (k, p) in folded {
+        let (durable, note) = match &archived {
+            None => (Value::Null, "접힌 원본은 접힘 원장에 내구 보존됐다"),
+            Some(Ok(())) => (
+                json!(true),
+                "미해결 집합이 상한을 넘어 내구 없이 접었다 — 원본은 overflow 원장에 보존했다",
+            ),
+            Some(Err(_)) => (
+                json!(false),
+                "★유실이며 복구 불가: 접힘 원장도 overflow 원장도 쓰지 못했다 — 이 사실의 마지막 사본은 이벤트 링뿐이다(살아있는 발행자가 다시 내는 종류만 여기까지 온다)",
+            ),
+        };
         publish_route(
             daemon,
             "alert_route.pending_folded",
             json!({"name": k.name, "surface_id": k.surface, "detail": k.detail,
                    "count": p.count, "limit": PENDING_MAX,
-                   "spilled_to": if spilled { json!(FOLDED_FILE) } else { Value::Null },
+                   "spilled_to": if spilled { json!(FOLDED_FILE) } else if matches!(archived, Some(Ok(()))) { json!(REFUSED_FILE) } else { Value::Null },
+                   "durable": durable,
+                   "archive_error": match &archived { Some(Err(e)) => json!(e), _ => Value::Null },
                    // 내구 보존에 실패한 접기는 **원본을 이벤트에 통째로** 싣는다(ring 이 마지막 사본이다).
                    "original": if spilled { Value::Null } else {
                        json!({"first_seen": p.first_seen, "last_seen": p.last_seen,
                               "count": p.count, "summary": p.summary})
-                   }}),
+                   },
+                   "note": note}),
         );
     }
 }
@@ -2451,7 +2622,7 @@ pub fn enforce_pending_bound(daemon: &Arc<Daemon>, now: Now, force: bool) {
     match spill_folded(daemon, &victims, now) {
         Ok(()) => {
             let folded = state_lock(daemon).commit_fold(&victims, now);
-            announce_folded(daemon, &folded, true);
+            announce_folded(daemon, &folded, true, now);
         }
         Err(e) => {
             let len = state_lock(daemon).pending.len();
@@ -2463,17 +2634,21 @@ pub fn enforce_pending_bound(daemon: &Arc<Daemon>, now: Now, force: bool) {
                        "note": "접힐 원본을 디스크에 보존하지 못했다 — 접지 않고 보류를 유지한다(다음 틱 재시도)"}),
             );
             if len > PENDING_HARD_MAX {
-                // ★무내구 접기는 **재발행되는 사실만** 대상이다(리뷰 R2 · codex BLOCK):
-                //   에지 1회 경보를 여기서 버리면 그 사실의 마지막 사본이 사라진다(치명위험 ②).
-                //   그것들은 접지 않고 남기며, 대신 [`RouteState::ingest`] 가 신규 재발행 키를
-                //   거절해 집합을 유계로 만든다.
-                let repeating: Vec<(AlertKey, PendingAlert)> = victims
+                // ★무내구 접기는 **버려도 되는 사실만** 대상이다(리뷰 R2 · codex BLOCK · 성찰 A1):
+                //   내구 사본 없이 접는 것은 폐기다. 다시 오지 않는 사실을 여기서 버리면 그
+                //   사실의 마지막 사본이 사라진다(치명위험 ②). 종전 기준은 `fold_rank == 0`
+                //   이었는데 그것은 *순서*이지 *폐기 허가*가 아니어서 `health.alert`(rank 0 ·
+                //   재생 보장 없음)가 통째로 대상이 됐다. 이제 [`is_discardable`] 하나로
+                //   판단한다 — 그 밖은 접지 않고 남기며, 집합의 유계는 절대 천장
+                //   ([`PENDING_ABSOLUTE_MAX`])과 [`RouteState::ingest`] 의 신규 폐기가능 키
+                //   거절이 맡는다.
+                let discardable: Vec<(AlertKey, PendingAlert)> = victims
                     .iter()
-                    .filter(|(k, _)| RouteState::fold_rank(k) == 0)
+                    .filter(|(k, _)| is_discardable(&k.name))
                     .cloned()
                     .collect();
-                let folded = state_lock(daemon).commit_fold(&repeating, now);
-                announce_folded(daemon, &folded, false);
+                let folded = state_lock(daemon).commit_fold(&discardable, now);
+                announce_folded(daemon, &folded, false, now);
             }
         }
     }
@@ -2595,6 +2770,7 @@ fn commit_routed(
     repeat: u64,
     now: Now,
     from_pending: bool,
+    budget: BudgetDurability,
 ) {
     let durable = daemon.queue_wal_durable();
     state_lock(daemon).mark_admitted(&item.key, entry_id, durable);
@@ -2608,7 +2784,10 @@ fn commit_routed(
         "alert_route.routed",
         json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
                "cso_surface": sid, "queue_entry_id": entry_id, "repeat": repeat,
-               "from_pending": from_pending, "durable": durable, "acked": durable}),
+               "from_pending": from_pending, "durable": durable, "acked": durable,
+               // ★(성찰 A3) 이 배달의 예산이 재기동을 넘는가. `memory_only` 는 영속이 봉인된
+               //   세대라는 뜻이다 — 배달은 계속하되 그 사실을 숨기지 않는다.
+               "budget_durability": budget.as_str()}),
     );
 }
 
@@ -2668,14 +2847,50 @@ pub fn route_once(daemon: &Arc<Daemon>, item: &AlertItem, now: Now) -> usize {
         //   그것은 다시 오지 않으므로 **원본(요약)을 이벤트에 통째로 실어** 링이 마지막 사본이
         //   되게 한다(`announce_folded` 의 `spilled_to: null` 과 같은 정직 규약).
         let absolute = state_lock(daemon).pending.len() >= PENDING_ABSOLUTE_MAX;
+        // ★(성찰 A2 · 자리 ①) 거절된 경보의 마지막 사본이 ring 이면 안 된다. 다시 오지 않는
+        //   사실([`is_discardable`] 이 아닌 것 — `health.alert` 의 새 오류 줄 · `context.threshold`
+        //   · `surface.exited` · 갭 통지)은 링에 싣기 **전에** overflow 원장에 붙인다.
+        //   버려도 되는 사실은 발행자 재시도 책임(ⓑ)으로 남기고 그 근거를 이벤트에 적는다.
+        let archived = if is_discardable(&item.key.name) {
+            None
+        } else {
+            let p = PendingAlert {
+                first_seen: now.epoch,
+                last_seen: now.epoch,
+                first_mono: now.mono,
+                count: 1,
+                summary: item.summary.clone(),
+                reason: "ingest_refused",
+                admitted_as: None,
+                admit_durable: false,
+            };
+            Some(append_refused(daemon, &[refused_row("ingest_refused", &item.key, &p, now)]))
+        };
+        let (durable, note) = match &archived {
+            None => (
+                Value::Null,
+                "접힘 원장 내구 보존이 계속 실패해 미해결 집합이 상한에 닿았다 — 이 이름은 살아있는 발행자가 다시 낸다(발행자 재시도 책임) · 디스크를 점검하라",
+            ),
+            Some(Ok(())) => (
+                json!(true),
+                "미해결 집합이 상한에 닿아 문 앞에서 거절했다 — 원본은 overflow 원장에 보존했다 · 디스크를 점검하라",
+            ),
+            Some(Err(_)) => (
+                json!(false),
+                "★유실이며 복구 불가: 상한에 닿았고 overflow 원장에도 쓰지 못했다 — 이 사실의 마지막 사본은 이벤트 링뿐이다",
+            ),
+        };
         publish_route(
             daemon,
             "alert_route.ingest_refused",
             json!({"name": item.key.name, "surface_id": item.key.surface,
                    "detail": item.key.detail, "hard_max": PENDING_HARD_MAX,
                    "absolute_max": PENDING_ABSOLUTE_MAX, "ceiling": if absolute { "absolute" } else { "hard" },
-                   "original": if absolute { json!({"summary": item.summary, "at": now.epoch}) } else { Value::Null },
-                   "note": "접힘 원장 내구 보존이 계속 실패해 미해결 집합이 상한에 닿았다 — 디스크를 점검하라"}),
+                   "durable": durable,
+                   "archived_to": if matches!(archived, Some(Ok(()))) { json!(REFUSED_FILE) } else { Value::Null },
+                   "archive_error": match &archived { Some(Err(e)) => json!(e.to_string()), _ => Value::Null },
+                   "original": json!({"summary": item.summary, "at": now.epoch}),
+                   "note": note}),
         );
         state_lock(daemon).count_suppressed(now.mono);
         return 0;
@@ -2779,17 +2994,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
                 //   크래시는 "쓰지 않은 예산 1건 소모" 라 보수적이다(막는 방향).
                 let prev = state_lock(daemon).reserve_admission(&item.key, now.mono);
                 persist_pending(daemon, now, true);
-                if !pending_is_durable(daemon) {
-                    // ★예약을 내구화하지 못했다 = 이 적재는 **하지 않는다**(보류).
-                    //   영속이 불가능한 상태에서 계속 적재하면 재기동마다 상한이 새로 열린다.
+                let budget = budget_durability(daemon);
+                if budget == BudgetDurability::Undurable {
+                    // ★예약을 내구화하지 못했다(일시 오류) = 이 적재는 **하지 않는다**(보류).
+                    //   다음 틱이 다시 쓴다 — 디스크가 돌아오면 저절로 풀린다.
                     let mut st = state_lock(daemon);
                     st.rollback_admission(&item.key, prev, now.mono);
                     st.note_reason(&item.key, HoldReason::BudgetUndurable);
                     break;
                 }
+                // ★(성찰 A3) `MemoryOnly`(영구 봉인)는 **배달을 막지 않는다**. 막으면 이 세대의
+                //   경보가 0건이 되고, 그 사실이 `status.enabled:true` 뒤에 숨는다.
                 match enqueue_alert(daemon, sid, render_text(&item, repeat)) {
                     Ok(entry_id) => {
-                        commit_routed(daemon, &item, sid, &entry_id, repeat, now, true);
+                        commit_routed(daemon, &item, sid, &entry_id, repeat, now, true, budget);
                         routed += 1;
                     }
                     // 적재 실패 — pending 에 **그대로 남는다**(재보류 기록 없음). 예약도 되돌린다
@@ -2815,12 +3033,37 @@ pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
                 } else {
                     r
                 };
+                // ★(성찰 A2 · 자리 ③) 여기서 pending 에서 빼면 그 사실의 마지막 사본은 이벤트
+                //   ring 뿐이다 — 회전하고 재기동에서 사라지며 독자가 제도적으로 없다.
+                //   다시 오지 않는 사실은 **내구 보존에 성공한 뒤에만 소비한다**: 실패하면
+                //   빼지 않고 보류로 남겨 다음 틱이 다시 시도한다(디스크가 돌아오면 풀린다).
+                let archived = if is_discardable(&item.key.name) {
+                    None
+                } else {
+                    Some(append_refused(
+                        daemon,
+                        &[refused_row(reason.as_str(), &item.key, &p, now)],
+                    ))
+                };
+                if let Some(Err(e)) = &archived {
+                    publish_route(
+                        daemon,
+                        "alert_route.ignore_deferred",
+                        json!({"name": item.key.name, "surface_id": item.key.surface,
+                               "detail": item.key.detail, "reason": reason.as_str(),
+                               "error": e.to_string(),
+                               "note": "더는 대상이 아니지만 내구 보존에 실패했다 — 소비하지 않고 보류한다(다음 틱 재시도)"}),
+                    );
+                    state_lock(daemon).note_reason(&item.key, HoldReason::ArchiveUndurable);
+                    break;
+                }
                 publish_route(
                     daemon,
                     "alert_route.ignored",
                     json!({"name": item.key.name, "surface_id": item.key.surface,
                            "detail": item.key.detail, "reason": reason.as_str(),
-                           "dropped_pending": p.count, "summary": item.summary}),
+                           "dropped_pending": p.count, "summary": item.summary,
+                           "archived_to": if archived.is_some() { json!(REFUSED_FILE) } else { Value::Null }}),
                 );
                 let mut st = state_lock(daemon);
                 if st.pending.remove(&item.key).is_some() {
@@ -2922,6 +3165,25 @@ pub fn spawn(daemon: Arc<Daemon>) {
     }
     // ★재기동 생존: 전 세대의 미해결 집합과 **억제 예산**을 되살린다(복원분이 최우선 배차).
     load_pending(&daemon, Now::live(&daemon));
+    // ★(성찰 A2) 전 세대가 링에만 남기고 지나갈 뻔한 사실들이 overflow 원장에 있으면 그것을
+    //   **기동 때 한 번 보고한다**. 링은 재기동을 넘지 못하지만 이 파일은 넘는다 — 보고가
+    //   없으면 파일이 있다는 사실 자체를 아무도 모른다(독자가 제도적으로 없는 것이 원인이었다).
+    //   ★`enabled` 는 여기서도 `true` 로 남는다(성찰 A3): 영속이 봉인된 세대도 **배달은 계속**
+    //   하므로 그 보고는 이제 정직하다. 봉인이 배달을 끄던 시절에는 같은 `true` 가 거짓이었다.
+    match read_refused_rows(&daemon) {
+        Ok(rows) if !rows.is_empty() => publish_route(
+            &daemon,
+            "alert_route.refused_ledger",
+            json!({"file": REFUSED_FILE, "rows": rows.len(),
+                   "note": "천장·무내구 접기·뒤늦은 제외로 미해결 집합에 남지 못한 사실들이다 — 사람이 읽어야 한다"}),
+        ),
+        Ok(_) => {}
+        Err(e) => publish_route(
+            &daemon,
+            "alert_route.refused_ledger_unreadable",
+            json!({"file": REFUSED_FILE, "error": e.to_string()}),
+        ),
+    }
     tokio::spawn(async move {
         // ★구독을 **replay 보다 먼저** 연다(run_event_stream 규약) — 그 사이에 발행된 이벤트가
         //   두 경로 어디에도 없는 갭으로 떨어지지 않게. 중복은 seq 커서로 거른다.
@@ -3827,14 +4089,24 @@ mod drills {
         assert_eq!(depth(&daemon, _cso), 1, "정상 복구 뒤에는 적재가 계속돼야 한다");
     }
 
-    /// ★[codex major M2 후반] 영속을 **봉인한 세대는 새 적재를 하지 않는다**(보류만 한다).
+    /// ★(성찰 A3) **일시적 쓰기 실패**는 보류다 — 다음 틱이 다시 쓴다.
+    ///
+    /// 종전에는 이 사유가 영구 봉인([`RouteState::persist_blocked`])과 한 술어로 접혀 있었고,
+    /// 그래서 봉인 한 번이 **이 세대의 배달을 통째로** 껐다(자매 검체
+    /// `drill_a_sealed_persist_keeps_delivering_and_reports_memory_only_budget` 이 반대편을 핀).
+    /// 여기서 보는 것은 그 반대편이 아니라 원래의 계약이다: 일시 실패는 여전히 막는 방향.
     #[test]
     fn drill_a_blocked_persist_holds_admissions_instead_of_reopening_the_cap() {
         let daemon = drill_daemon("blockedpersist");
         let cso = seat(&daemon, "cso");
         let now = after_grace(&daemon);
-        block_persist(&daemon, "drill", "강제 봉인");
+        // 상태 디렉터리 안의 **영속 목적지를 디렉터리로 선점** → 원자 쓰기가 계속 실패한다
+        // (봉인이 아니라 일시 오류의 형상 — `persist_blocked` 는 서지 않는다).
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::create_dir_all(dir.join(PENDING_FILE));
         handle_event(&daemon, &ev("health.alert", Some(31), json!({"rule": "y"})), now);
+        assert!(!daemon.alert_route.lock().unwrap().persist_blocked,
+            "드릴 전제 불성립 — 일시 실패가 봉인으로 잡혔다");
         assert_eq!(depth(&daemon, cso), 0, "예산을 내구화할 수 없는데 적재했다");
         assert_eq!(pending_len(&daemon), 1, "그 사실이 보관되지 않았다");
         assert_eq!(
@@ -3844,6 +4116,203 @@ mod drills {
         );
         assert_eq!(daemon.alert_route.lock().unwrap().routed_1h(now.mono), 0,
             "적재하지 않았는데 예산이 소모됐다(예약 롤백 누락)");
+    }
+
+    /// ★(성찰 A3 · blocking) **영속 봉인 한 번이 이 세대의 경보 배달을 통째로 끄지 않는다.**
+    ///
+    /// 실행 반례(종전): 읽을 수 없는 `alert-route-pending.json` → `persist_blocked=true`(해제는
+    /// 재기동뿐) → `pending_is_durable()` 상시 false → [`dispatch`] 가 매 배차마다 `break` →
+    /// **이 데몬 세대의 CSO 경보 0건**. 그런데 `org.status.alert_route.enabled` 는 `true` 로
+    /// 남아 팩 preflight 의 능력 게이트 등록 조건 ①을 충족시켰다 — CSO 는 구독을 금지당한
+    /// 채로 배달도 0인 §7 치명위험 ③의 형상이 **B 의 부정직한 자기보고**로 성립했다.
+    ///
+    /// 이제 봉인은 예산을 메모리로 강등할 뿐 배달은 계속하고, 그 사실을 `routed` 이벤트에
+    /// 싣는다 — `enabled:true` 가 다시 참이 된다.
+    #[test]
+    fn drill_a_sealed_persist_keeps_delivering_and_reports_memory_only_budget() {
+        let daemon = drill_daemon("sealedpersist");
+        let cso = seat(&daemon, "cso");
+        let now = after_grace(&daemon);
+        let mut rx = daemon.bus.subscribe();
+        // 읽을 수 없는 미해결 집합 파일(디렉터리로 선점 = 격리도 실패한다) → 기동 복원이 봉인한다.
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        std::fs::create_dir_all(dir.join(PENDING_FILE)).unwrap();
+        assert_eq!(load_pending(&daemon, now), 0, "읽을 수 없는 파일에서 무언가를 복원했다");
+        assert!(daemon.alert_route.lock().unwrap().persist_blocked,
+            "드릴 전제 불성립 — 봉인되지 않았다");
+        // spawn 이 세우는 것과 같은 상태(구독 태스크가 살아 있다).
+        daemon.alert_route.lock().unwrap().enabled = true;
+        handle_event(&daemon, &ev("health.alert", Some(31), json!({"rule": "y"})), now);
+        assert_eq!(depth(&daemon, cso), 1,
+            "봉인 한 번이 이 세대의 배달을 통째로 껐다(§7 치명위험 ③의 형상)");
+        assert_eq!(pending_len(&daemon), 0, "배달했는데 보류에 남았다");
+        // 상태 보고가 정직하다: 배달하므로 enabled:true 가 참이다.
+        let snap = daemon.alert_route.lock().unwrap().snapshot(now.mono);
+        assert_eq!(snap["enabled"], json!(true));
+        assert_eq!(snap["routed_1h"], json!(1), "적재를 보고하지 않는다");
+        // 그리고 그 예산이 재기동을 넘지 못한다는 사실을 숨기지 않는다.
+        let mut saw = false;
+        while let Ok(e) = rx.try_recv() {
+            if e["name"] == "alert_route.routed" {
+                assert_eq!(e["payload"]["budget_durability"], json!("memory_only"),
+                    "봉인 세대의 배달이 예산 내구성을 정직하게 보고하지 않는다");
+                saw = true;
+            }
+        }
+        assert!(saw, "적재 이벤트가 없다");
+    }
+
+    /// ★(성찰 A1 · blocking · PROBE-F1 회귀 핀) **`fold_rank == 0` 은 폐기 허가가 아니다.**
+    ///
+    /// 실행 반례(종전): 접힘 원장 목적지를 디렉터리로 선점(=`spill_folded` 상시 실패) +
+    /// `health.alert` 1,024종 + 에지 1종 → `spill_failed=true health.alert before=1024
+    /// after=510 folded_total=514` — **514건의 마지막 사본이 내구 없이 사라졌다.**
+    /// `health.alert` 는 `fold_rank==0`(재발행 종류) 이지만 `state.rs::run_health_rules` 가
+    /// **새로 완성된 출력 줄**에서만 내므로 한 번 지나간 panic 줄은 다시 오지 않는다.
+    ///
+    /// 기존 검체(`drill_fold_keeps_originals_when_the_spill_fails`)는 513종만 넣어
+    /// `len > PENDING_HARD_MAX` 가지에 **도달하지 못했다**(그 가지의 검체가 0이었다).
+    #[test]
+    fn drill_probe_f1_undurable_fold_never_discards_a_fact_that_does_not_come_back() {
+        let daemon = drill_daemon("probef1");
+        let now = after_grace(&daemon);
+        // 접힘 원장 목적지를 디렉터리로 선점 — append 가 상시 실패한다.
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::create_dir_all(dir.join(FOLDED_FILE));
+        {
+            let mut st = daemon.alert_route.lock().unwrap();
+            // `health.alert` 1,024종(= PENDING_HARD_MAX) — 룰마다 다른 키다.
+            for n in 0..PENDING_HARD_MAX {
+                assert!(
+                    st.ingest(
+                        &AlertKey::with_detail("health.alert", Some(7), Some(format!("rule{n}"))),
+                        "panic",
+                        HoldReason::NoCso,
+                        now
+                    ),
+                    "다시 오지 않는 사실의 새 키가 문 앞에서 거절됐다(n={n})"
+                );
+            }
+            // 에지 1회 1종 — 이것이 한 칸을 더해 `len > PENDING_HARD_MAX` 가지를 연다.
+            assert!(st.ingest(&AlertKey::new("surface.exited", Some(9)), "종료",
+                HoldReason::NoCso, now));
+            assert_eq!(st.pending.len(), PENDING_HARD_MAX + 1, "드릴 전제 불성립");
+            // 전제 핀: 이 이름은 **접기 우선순위 최하위**(먼저 접힌다)이면서 **폐기 불가**다.
+            assert_eq!(RouteState::fold_rank(&AlertKey::new("health.alert", Some(7))), 0);
+            assert!(!is_discardable("health.alert"),
+                "보존 등급이 접기 우선순위로 되돌아갔다 — PROBE-F1 이 되살아난다");
+            // 종전 반례의 규모: 이 상태의 희생 후보는 정확히 514건이었다.
+            assert_eq!(st.fold_candidates().len(), 514, "반례 규모가 달라졌다(전제 재확인 필요)");
+        }
+        enforce_pending_bound(&daemon, now, true);
+        let (len, folded_total, has_overflow) = {
+            let st = daemon.alert_route.lock().unwrap();
+            (st.pending.len(), st.folded_total,
+             st.pending.contains_key(&AlertKey::new(OVERFLOW_NAME, None)))
+        };
+        assert_eq!(len, PENDING_HARD_MAX + 1,
+            "내구 보존 없이 접었다 — 514건의 마지막 사본이 사라졌다(PROBE-F1)");
+        assert_eq!(folded_total, 0, "접히지 않았는데 접혔다고 기록했다");
+        assert!(!has_overflow, "보존 실패인데 요약 키가 원본을 대체했다");
+        // 그리고 상한을 넘긴 그 상태에서도 **기존 보존 · 신규 수용**이 함께 성립한다.
+        {
+            let mut st = daemon.alert_route.lock().unwrap();
+            assert!(
+                st.ingest(&AlertKey::with_detail("health.alert", Some(7), Some("새 룰".into())),
+                    "새 panic", HoldReason::NoCso, now),
+                "다시 오지 않는 사실의 새 키를 문 앞에서 거절했다(:594 확장 반례)"
+            );
+            assert!(
+                !st.ingest(&AlertKey::new("watchdog.load_high", Some(8)), "부하",
+                    HoldReason::NoCso, now),
+                "버려도 되는 사실의 새 키까지 받아들이면 집합이 무계로 자란다"
+            );
+        }
+    }
+
+    /// ★(성찰 A2 · blocking) **저장 천장을 넘은 경보가 휘발성 ring 에만 남지 않는다.**
+    ///
+    /// 두 천장(접힘 원장 · 미해결 집합 절대 상한)에 닿은 상태에서 단발 경보를 하나 더 넣고,
+    /// 그 사실이 **재기동을 넘어** 내구 원장에 남아 있는지 본다. ring 은 4,096칸에서 회전하고
+    /// 재기동에서 통째로 사라진다 — 그리고 이 모듈의 창립 논거가 "CSO 는 구독하지 않는다" 라
+    /// 그 마지막 사본의 독자가 제도적으로 없다.
+    #[test]
+    fn drill_refused_alerts_reach_a_durable_ledger_not_only_the_event_ring() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-alertdrill-refused-{}-{}",
+            std::process::id(),
+            now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("cysd.sock");
+        let now = Now::at(BOOT_GRACE_SECS + 100.0);
+        {
+            let d1 = Daemon::new(sock.clone());
+            // 천장 ①: 접힘 원장 목적지를 디렉터리로 선점 → 보존이 상시 실패한다.
+            let sd = crate::state::state_dir(&sock);
+            let _ = std::fs::create_dir_all(sd.join(FOLDED_FILE));
+            // 천장 ②: 미해결 집합을 **절대 상한**까지 채운다(에지 1회 키도 여기서는 멈춘다).
+            {
+                let mut st = d1.alert_route.lock().unwrap();
+                for n in 0..PENDING_ABSOLUTE_MAX {
+                    st.ingest(&AlertKey::new("surface.exited", Some(n as u64)), "종료",
+                        HoldReason::NoCso, now);
+                }
+                assert_eq!(st.pending.len(), PENDING_ABSOLUTE_MAX, "드릴 전제 불성립");
+            }
+            // 단발 경보 1건 — 종전에는 ring 의 `ingest_refused{original}` 이 마지막 사본이었다.
+            handle_event(
+                &d1,
+                &ev("context.threshold", Some(77),
+                    json!({"role": "worker", "context_pct": 91, "threshold": 60})),
+                now,
+            );
+            assert_eq!(pending_len(&d1), PENDING_ABSOLUTE_MAX, "절대 천장이 열렸다");
+        }
+        // 재기동: ring 은 사라지고 파일만 남는다.
+        let d2 = Daemon::new(sock.clone());
+        let rows = read_refused_rows(&d2).expect("overflow 원장 판독");
+        let hit = rows.iter().find(|r| r["name"] == "context.threshold");
+        let hit = hit.expect("거절된 단발 경보가 내구 원장에 없다 — ring 회전·재기동으로 소멸한다");
+        assert_eq!(hit["kind"], json!("ingest_refused"));
+        assert_eq!(hit["surface_id"], json!(77));
+        assert!(hit["summary"].as_str().unwrap().contains("context=91%"),
+            "사실이 요약 없이 저장됐다: {hit}");
+    }
+
+    /// ★(성찰 A2 · 자리 ③) **내구 보존 없는 경보를 처리 완료로 소비하지 않는다.**
+    ///
+    /// 뒤늦게 CSO 가 된 좌석의 보류분은 `became_cso` 로 미해결 집합에서 빠진다 — 그때 그
+    /// 사실의 마지막 사본은 ring 뿐이었다. 이제 내구 원장에 먼저 붙이고, 붙이지 못하면
+    /// **빼지 않는다**(다음 틱 재시도).
+    #[test]
+    fn drill_became_cso_drop_waits_for_a_durable_copy() {
+        let daemon = drill_daemon("becamecso-durable");
+        let cso = seat(&daemon, "cso");
+        let now = after_grace(&daemon);
+        // overflow 원장 목적지를 디렉터리로 선점 → append 가 상시 실패한다.
+        let sd = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::create_dir_all(sd.join(REFUSED_FILE));
+        {
+            let mut st = daemon.alert_route.lock().unwrap();
+            st.ingest(&AlertKey::new("surface.exited", Some(cso)), "그 좌석이 종료했다",
+                HoldReason::NoCso, now);
+        }
+        assert_eq!(dispatch(&daemon, now), 0);
+        assert_eq!(pending_len(&daemon), 1,
+            "내구 사본 없이 소비했다 — 그 사실의 마지막 사본이 ring 뿐이 된다");
+        assert_eq!(
+            daemon.alert_route.lock().unwrap().pending.values().next().unwrap().reason,
+            "archive_undurable",
+            "보류 사유가 보존 불능이 아니다"
+        );
+        // 디스크가 돌아오면 저절로 풀린다.
+        std::fs::remove_dir(sd.join(REFUSED_FILE)).unwrap();
+        assert_eq!(dispatch(&daemon, now), 0);
+        assert_eq!(pending_len(&daemon), 0, "보존에 성공했는데 소비하지 않았다");
+        let rows = read_refused_rows(&daemon).expect("overflow 원장 판독");
+        assert_eq!(rows.len(), 1, "제외분이 내구 원장에 남지 않았다");
+        assert_eq!(rows[0]["kind"], json!("became_cso"));
     }
 
     /// ★`enqueue_into_seat` 의 원자성 계약(회귀 핀): 좌석 조회·생존 판정·삽입이 **surfaces 맵
@@ -5082,14 +5551,18 @@ mod pure_tests {
     }
 
     // 하드 상한 비교가 늦거나 기존 키까지 거절하면 폭풍 메모리 증가와 관측 유실이 통과한다.
+    // ★(성찰 A1) 문 앞 거절의 기준은 접기 우선순위(`fold_rank == 0`)가 아니라 **보존 등급**
+    //   ([`is_discardable`])이다. `health.alert` 는 rank 0 이지만 `run_health_rules` 가 새로
+    //   완성된 출력 줄에서만 내므로 다시 오지 않는다 — 그 키를 문 앞에서 거절하면 그 사실의
+    //   사본이 **생기지도 못한다**. 종전 판은 이 자리에서 `health.alert` 거절을 단언했다.
     #[test]
-    fn hard_limit_rejects_new_recurring_keys_but_accepts_existing_key_merges() {
+    fn hard_limit_rejects_new_discardable_keys_but_accepts_everything_that_does_not_come_back() {
         let mut state = RouteState::default();
         let now = Now::at(10.0);
         for i in 0..PENDING_HARD_MAX {
             assert!(
                 state.ingest(
-                    &AlertKey::new("health.alert", Some(i as u64)),
+                    &AlertKey::new("watchdog.load_high", Some(i as u64)),
                     "관측",
                     HoldReason::NoCso,
                     now
@@ -5097,26 +5570,39 @@ mod pure_tests {
                 "하드 상한에 이르기 전 새 키를 거절했다: {i}"
             );
         }
+        let mut grown = 0usize;
         for extra in 0..2 {
             assert_eq!(
                 state.pending.len(),
-                PENDING_HARD_MAX + extra,
+                PENDING_HARD_MAX + grown,
                 "하드 상한 경계 입력이 잘못됐다"
             );
-            for name in [
-                "health.alert",
-                "watchdog.load_high",
-                "watchdog.any_future_rule",
-            ] {
+            // ① 버려도 되는 사실의 새 키만 거절된다.
+            for name in ["queue.depth_high", "queue.starved", "watchdog.any_future_rule"] {
+                assert!(is_discardable(name), "전제: {name}은 버려도 되는 사실이다");
                 let before = state.pending.clone();
-                let key = AlertKey::new(name, Some(PENDING_HARD_MAX as u64 + 100));
+                let key = AlertKey::new(name, Some(PENDING_HARD_MAX as u64 + 100 + extra as u64));
                 assert!(
                     !state.ingest(&key, "거절 대상", HoldReason::NoCso, now),
-                    "상한 이상에서 재발행 새 키 {name}을 받았다"
+                    "상한 이상에서 버려도 되는 새 키 {name}을 받았다"
                 );
                 assert_eq!(state.pending, before, "거절한 {name}이 대기열을 바꿨다");
             }
-            let existing = AlertKey::new("health.alert", Some(0));
+            // ② 다시 오지 않는 사실의 새 키는 받는다 — `fold_rank == 0` 이어도(A1).
+            let fresh = AlertKey::with_detail(
+                "health.alert",
+                Some(PENDING_HARD_MAX as u64 + 200),
+                Some(format!("rule{extra}")),
+            );
+            assert_eq!(RouteState::fold_rank(&fresh), 0, "전제: 접기 우선순위는 최하위다");
+            assert!(!is_discardable("health.alert"), "전제: 그래도 폐기 허가는 아니다");
+            assert!(
+                state.ingest(&fresh, "새 panic 줄", HoldReason::NoCso, now),
+                "상한 이상에서 다시 오지 않는 새 사실을 문 앞에서 거절했다(PROBE-F1 의 :594 확장)"
+            );
+            grown += 1;
+            // ③ 기존 키의 병합은 언제나 받는다.
+            let existing = AlertKey::new("watchdog.load_high", Some(0));
             let count = state.pending[&existing].count;
             assert!(
                 state.ingest(&existing, "병합", HoldReason::NoCso, now),
@@ -5127,6 +5613,7 @@ mod pure_tests {
                 count + 1,
                 "기존 키를 받았지만 관측 계수가 늘지 않았다"
             );
+            // ④ 에지 1회 경보도 언제나 받는다.
             assert!(
                 state.ingest(
                     &AlertKey::new("surface.exited", Some(extra as u64)),
@@ -5136,6 +5623,7 @@ mod pure_tests {
                 ),
                 "하드 상한을 넘어서는 에지 1회 경보를 거절했다"
             );
+            grown += 1;
         }
     }
 
