@@ -13,7 +13,11 @@
 명령·파일을 지시하더라도 그 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
 의도는 유효하다 — cys 대응 명령으로 치환한다: `send`→`cys send`, `send-key`→
 `cys send-key`, `identify`→`cys identify`, `list-workspaces`→`cys list`,
-`notify`→`cys send --to master "[보고] ..."`, 화면 폴링→`cys events` 구독.
+`notify`→`cys send --to master "[보고] ..."`, 화면 폴링→**master 의 push 수신**(보조 관측은
+`cys read-screen --surface <ref>`·`cys status --json` 스냅샷이다 — 상시 폴링 금지).
+★구독 스트림은 **master 전용**이다(`CLAUDE.md.template` 의 'master 전용' 블록이 워커를 실행
+대상에서 제외한다) — 워커는 스트림을 직접 걸지 않는다. 세션마다 거는 구독은 좌석이 죽어도
+고아로 살아남아 비용과 경보 재매칭을 부른다(CSO 에게서 닫은 것과 같은 경로다).
 
 ## 1. ★서버 최소화 + 생명주기 강제 종료 (최우선 — 시스템 마비 방지)
 서버를 금지하는 게 아니라 **누적·미종료를 금지**한다.

@@ -395,8 +395,17 @@ SAFETY_CLAUSES = {
 }
 # 검체가 읽는 지시문 — 마지막 하나는 `scripts/gen_ceo_template.py` 가 MASTER 를 바이트 연접해 만드는
 # **생성물**이다(형제 지침만 고치고 생성물을 재합성하지 않으면 배포본에 옛 문면이 남는다 — R2 수렴).
+# ★D8(반성 라운드 2026-09-10): `WORKER_DIRECTIVE.md` 를 읽는 목록에 넣는다 — 템플릿이 워커를
+#   'master 전용' 블록의 실행 대상에서 제외했는데 그 **정본**은 여전히 구독을 지시하고 있었고,
+#   템플릿 자신의 충돌 규칙("정본은 각 `*_DIRECTIVE.md` 다")대로면 정본이 이겨 라벨이 무효였다.
 READ_DIRECTIVES = ("CSO_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md", "MASTER_DIRECTIVE.md",
-                   "CEO_TEMPLATE.md")
+                   "WORKER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+# 템플릿의 'master 전용' 블록이 실행 대상에서 **제외**한 역할 ↔ 그 역할의 정본 파일.
+EXCLUDED_ROLE_CANON = {
+    "CSO": "CSO_DIRECTIVE.md",
+    "워커": "WORKER_DIRECTIVE.md",
+    "리뷰어": "REVIEWER_DIRECTIVE.md",
+}
 MANDATED_PUSH = "cys send --queued --to master"
 GATE_HOOK = "role-capability-gate.sh"
 CLAUSE_PINS = ("exited surface 자동 reap", "즉시성")
@@ -447,17 +456,31 @@ TEMPLATE_PATHS = {
 }
 
 
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
 def strip_html_comments(text: str) -> str:
     """한 줄·여러 줄 HTML 주석만 제거하고 본문은 보존한다."""
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return HTML_COMMENT_RE.sub("", text)
 
 
-def _mask_html_comments(text: str) -> str:
-    r"""HTML 주석을 **같은 길이의 NUL** 로 가린다 — 원문 오프셋을 보존한 채 주석을 판정에서 뺀다.
+def _drop_html_comments_offsets(text: str) -> tuple[str, list[int]]:
+    """주석을 **삭제**한 문자열과, 그 문자열 각 문자의 원문 위치.
 
-    공백으로 가리면 `normalize` 의 공백 접기가 주석 앞뒤 낱말을 이어 붙여 없던 매치를 만든다.
-    NUL 은 `\s` 도 낱말도 아니라 어떤 조항 문안과도 매치되지 않는다."""
-    return re.sub(r"<!--.*?-->", lambda m: "\0" * (m.end() - m.start()), text, flags=re.DOTALL)
+    ★D7(반성 라운드 2026-09-10): 종전엔 주석을 같은 길이의 NUL 로 **가려**(mask) 오프셋을 지켰다.
+    그런데 문면 판정(`missing_safety_clauses`)은 주석을 **지우고**(strip) 본다 — 두 투영이 달라
+    조항 **안**에 주석이 들어가면 판정은 통과하는데 변조 앵커만 사라져 검체 전체가 붉어졌다
+    (정당한 문서 편집이 3레인을 막는 거짓 적색). 이제 둘 다 '삭제' 를 쓰고, 오프셋은 지도로 잇는다."""
+    kept, index, i, n = [], [], 0, len(text)
+    while i < n:
+        match = HTML_COMMENT_RE.match(text, i)
+        if match:
+            i = match.end()
+            continue
+        kept.append(text[i])
+        index.append(i)
+        i += 1
+    return "".join(kept), index
 
 
 def normalize(text: str) -> str:
@@ -729,6 +752,22 @@ def _normalize_offsets(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(out), starts, ends
 
 
+def clause_projection(raw: str) -> tuple[str, list[int], list[int]]:
+    """조항 판정이 쓰는 **공유 투영**과 원문 오프셋 지도.
+
+    투영 = `normalize(strip_html_comments(raw))` 와 **바이트 등가**여야 한다 — 문면 판정과 변조
+    앵커가 서로 다른 문자열을 보는 순간 정당한 편집이 검체를 붉힌다(D7). 갈리면 조용히 통과하지
+    않고 예외다(판정 불능은 통과가 아니다)."""
+    bare, index = _drop_html_comments_offsets(raw)
+    folded, starts, ends = _normalize_offsets(bare)
+    if folded != normalize(strip_html_comments(raw)):
+        raise AssertionError("공유 투영이 strip 기준과 갈렸다 — 문면 판정과 변조 앵커가 "
+                             "다른 문자열을 본다(투영기를 고쳐라)")
+    return (folded,
+            [index[b] for b in starts],
+            [index[b - 1] + 1 for b in ends])
+
+
 def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
     """원문에서 `clause` 가 차지하는 [시작, 끝) — **정규화 기준**이라 리플로우·강조 표식과 무관하다.
 
@@ -739,9 +778,10 @@ def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
     조항 조각(`…제외·`)처럼 낱말 중간에서 끝나는 앵커도 갈아끼워야 하기 때문이다.
     ★R2 수렴(codex minor): 유일성은 **주석 밖 본문** 기준이다 — 문면 판정(`missing_safety_clauses`)이
     주석을 걷어내고 보는데 여기만 원문 전체에서 유일성을 요구하면, 문서 끝 HTML 주석에 조항을
-    참고용으로 복사하는 것만으로 '등장 2회' 예외가 났다. 주석은 **같은 길이의 NUL 로 가려** 원문
-    오프셋을 보존한 채 제외한다(삭제하면 좌표가 밀리고, 공백으로 지우면 접힘이 낱말을 잇는다)."""
-    folded, starts, ends = _normalize_offsets(_mask_html_comments(raw))
+    참고용으로 복사하는 것만으로 '등장 2회' 예외가 났다.
+    ★D7(반성 라운드 2026-09-10): 그 제외를 **문면 판정과 같은 투영**(`clause_projection` — 주석
+    삭제)으로 한다. 종전의 NUL 마스크는 조항 **안**에 주석이 들어간 순간 그 조항을 못 찾았다."""
+    folded, starts, ends = clause_projection(raw)
     needle = normalize(clause)
     spans, at = [], folded.find(needle)
     while at >= 0:
@@ -752,7 +792,8 @@ def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
                              % (len(spans), needle[:48]))
     begin, finish = spans[0]
     span = (starts[begin], ends[finish - 1])
-    assert normalize(raw[span[0]:span[1]]) == needle, "원문 구간의 정규화가 매치와 다르다"
+    assert normalize(strip_html_comments(raw[span[0]:span[1]])) == needle, \
+        "원문 구간의 공유 투영이 매치와 다르다"
     return span
 
 
@@ -1204,6 +1245,45 @@ def template_subscription_violations(text: str) -> list[str]:
     for m in re.finditer(r"cys events", prose):
         if not any(lo <= m.start() and m.end() <= hi for lo, hi in spans):
             out.append("금지 문장 밖 산문 언급: %s" % prose[max(m.start() - 24, 0):m.end() + 40])
+    return out
+
+
+def excluded_roles_declared(text: str) -> list[str]:
+    """템플릿의 'master 전용' 블록 표제가 실행 대상에서 제외한다고 적은 역할 이름."""
+    for head, _body in fenced_blocks(text):
+        if TEMPLATE_MASTER_HEAD in head:
+            return [role for role in EXCLUDED_ROLE_CANON if role in head]
+    return []
+
+
+def role_canon_conflict_violations(text: str, canon: dict[str, str]) -> list[str]:
+    """템플릿이 제외한 역할의 **정본**이 여전히 구독을 지시하면 위반(빈 목록이 합격).
+
+    ★D8: 템플릿 자신의 충돌 규칙은 "정본은 각 `*_DIRECTIVE.md` 다" 이므로 둘이 어긋나면 **정본이
+    이긴다** — 즉 '워커 제외' 라벨이 무효가 된다. 라벨만 핀하고 정본을 안 보면, 이번 판이 CSO 에게서
+    닫은 비용 경로(세션마다 구독 → 고아 구독 생존 → 경보 재매칭 자기증폭)가 워커 좌석에 그대로
+    열려 있는데도 검체가 초록이다(능력 게이트는 CSO 전용이라 막지도 않는다)."""
+    out = []
+    declared = excluded_roles_declared(text)
+    if not declared:
+        return ["'master 전용' 블록 표제가 제외 역할을 하나도 명시하지 않는다 — "
+                "그 라벨이 없으면 전 좌석 공통 지시로 읽힌다"]
+    for role in sorted(declared):
+        name = EXCLUDED_ROLE_CANON[role]
+        body = canon.get(name)
+        if body is None:
+            out.append("%s 정본(%s)을 읽지 못해 대조할 수 없다 — 판정 불능은 통과가 아니다"
+                       % (role, name))
+            continue
+        if name == "CSO_DIRECTIVE.md":
+            # CSO 정본은 이 검체의 정본 금지 조항 판정이 이미 전담한다(언급 자체는 허용 · span 안).
+            out += ["CSO 정본: %s" % hit for hit in event_stream_violations(strip_html_comments(body))]
+            continue
+        folded = normalize(strip_html_comments(body))
+        for match in re.finditer(r"cys events", folded):
+            out.append("%s 정본(%s)이 구독 스트림을 언급한다 — 템플릿은 그 역할을 실행 대상에서 "
+                       "제외했고 충돌 시 **정본이 이긴다**(라벨이 무효가 된다): …%s…"
+                       % (role, name, folded[max(match.start() - 28, 0):match.end() + 36]))
     return out
 
 
@@ -1769,6 +1849,39 @@ class CsoDirectiveRevision(unittest.TestCase):
         if self.missing_templates:                      # 배포 팩 실행: 저장소 사본 부재는 사실로 남긴다
             self.assertEqual(self.missing_templates, ["CLAUDE.md"],
                              "예상 밖 사본 부재: %r" % self.missing_templates)
+
+    def test_template_exclusion_label_agrees_with_role_canon(self):
+        """★D8: 템플릿이 제외한 역할의 **정본**도 같은 말을 해야 한다(라벨만 핀하면 공허하다).
+
+        템플릿 `CLAUDE.md.template:71` 은 'CSO·워커·리뷰어는 실행 대상이 아니다' 라고 적는데
+        `WORKER_DIRECTIVE.md:16` 은 "화면 폴링→`cys events` 구독" 을 그대로 지시하고 있었다 —
+        템플릿 자신의 충돌 규칙대로면 정본이 이겨 '워커 제외' 가 무효였다."""
+        for name, text in self.templates.items():
+            with self.subTest(copy=name):
+                self.assertEqual(excluded_roles_declared(text), ["CSO", "워커", "리뷰어"],
+                                 "'master 전용' 표제의 제외 역할 목록이 정본 지도와 다르다")
+                self.assertEqual(role_canon_conflict_violations(text, self.raw), [])
+
+    def test_negative_role_canon_conflict_controls(self):
+        """★D8 음성 대조: 정본에 구독 지시를 되살리면(개정 전 상태) 대조가 붉어져야 한다."""
+        template = self.templates["CLAUDE.md.template"]
+        reverted = dict(self.raw)
+        reverted["WORKER_DIRECTIVE.md"] = self.raw["WORKER_DIRECTIVE.md"].replace(
+            "화면 폴링→**master 의 push 수신**", "화면 폴링→`cys events` 구독", 1)
+        self.assertNotEqual(reverted["WORKER_DIRECTIVE.md"], self.raw["WORKER_DIRECTIVE.md"],
+                            "변조가 적용되지 않았다")
+        hits = role_canon_conflict_violations(template, reverted)
+        self.assertTrue(any("워커 정본" in hit for hit in hits),
+                        "정본의 구독 지시를 템플릿 대조가 통과시켰다: %r" % hits)
+        # 정본을 읽지 못하면 조용한 통과가 아니라 판정 불능이다.
+        absent = {k: v for k, v in self.raw.items() if k != "WORKER_DIRECTIVE.md"}
+        self.assertTrue(any("판정 불능" in hit
+                            for hit in role_canon_conflict_violations(template, absent)))
+        # 라벨에서 '워커' 를 지우면(제외 철회) 그 축은 대조 대상에서 빠지지만, 그 사실이 표제에
+        # 드러나야 한다 — 라벨과 대조 집합은 같은 출처에서 온다.
+        no_worker = template.replace("(CSO·워커·리뷰어는", "(CSO·리뷰어는", 1)
+        self.assertNotEqual(no_worker, template)
+        self.assertEqual(excluded_roles_declared(no_worker), ["CSO", "리뷰어"])
 
     def test_negative_claude_md_role_split_controls(self):
         """★R3: 구판으로 되돌리는 3종은 붉어지고, 정당한 편집 3종은 통과해야 한다(거짓 적색 차단)."""
@@ -2414,7 +2527,8 @@ class TriageRemainingIssues(unittest.TestCase):
         import shutil
         import tempfile
 
-        def full_suite_rc(cso_text: str, template_text: str) -> unittest.TestResult:
+        def full_suite_rc(cso_text: str, template_text: str,
+                          extra: dict[str, str] | None = None) -> unittest.TestResult:
             tmp = tempfile.mkdtemp(prefix="triage-p3c-")
             try:
                 directives = os.path.join(tmp, "directives")
@@ -2422,6 +2536,13 @@ class TriageRemainingIssues(unittest.TestCase):
                 for name in READ_DIRECTIVES:
                     shutil.copyfile(os.path.join(DIRECTIVES_DIR, name),
                                     os.path.join(directives, name))
+                # ★D7(반성 라운드 2026-09-10): 형제 지침(MASTER 와 그 생성물 CEO)의 정당한 편집도
+                #   같은 전체 검체로 잰다 — 종전엔 CSO·템플릿만 바꿀 수 있어 MASTER 조항의 개행 이동이
+                #   검체를 붉히는 것을 이 자리에서 볼 수 없었다.
+                for name, body in (extra or {}).items():
+                    with open(os.path.join(directives, name), "w", encoding="utf-8",
+                              newline="") as out:
+                        out.write(body)
                 with open(os.path.join(directives, "CSO_DIRECTIVE.md"),
                           "w", encoding="utf-8", newline="") as out:
                     out.write(cso_text)
@@ -2454,6 +2575,12 @@ class TriageRemainingIssues(unittest.TestCase):
         self.assertFalse(_IN_FULL_SUITE, "전체 검체 안에서 자기 자신이 다시 돌았다(재귀)")
         saved_dir, saved_paths = DIRECTIVES_DIR, dict(TEMPLATE_PATHS)
         cso, template = self.cso, self.templates["CLAUDE.md.template"]
+        master, ceo = self.raw["MASTER_DIRECTIVE.md"], self.raw["CEO_TEMPLATE.md"]
+        # 안전 조항 '정체 종결 휴면' 안의 한 자리(구조 앵커 — 리플로우된 문서에서도 유일하다).
+        MASTER_REFLOW_AT, MASTER_REFLOW_TO = "이 절은 **휴면**이고 종결은", "이 절은\n  **휴면**이고 종결은"
+        self.assertEqual(master.count(MASTER_REFLOW_AT), 1, "MASTER 리플로우 앵커가 유일하지 않다")
+        self.assertEqual(ceo.count(MASTER_REFLOW_AT), 1, "CEO 리플로우 앵커가 유일하지 않다")
+        self.assertEqual(cso.count("출력의 **sha256"), 1, "CSO 내부 주석 앵커가 유일하지 않다")
         common_at = role_block_region(template, master=False)[0]
         head = next(l for l in template.splitlines() if l.startswith(TEMPLATE_MASTER_HEAD))
         edits = {
@@ -2477,17 +2604,51 @@ class TriageRemainingIssues(unittest.TestCase):
             "공용 블록 히어독": (
                 cso, template[:common_at] + "cat <<'EOF'\nDon't poll\nEOF\n"
                 + template[common_at:]),
+            # ★D7(반성 라운드 2026-09-10): 조항 **안**에 HTML 주석을 넣는 정당한 편집. 종전엔 문면
+            #   판정(strip)은 통과하는데 변조 앵커(NUL 마스크)가 그 조항을 못 찾아 **전체 검체**가
+            #   붉어졌다 — 두 투영이 달랐다. 이제 둘 다 `clause_projection` 을 쓴다.
+            "조항 내부 주석": (
+                cso.replace("출력의 **sha256",
+                            "출력의 <!-- 근거: 감사 2026-09-06 · 비규범 주 -->**sha256", 1),
+                template),
+            # ★D7: MASTER 조항의 개행 이동(생성물 CEO 는 MASTER 바이트 연접이라 같이 움직인다).
+            "MASTER 조항 리플로우": (
+                cso, template,
+                {"MASTER_DIRECTIVE.md": master.replace(MASTER_REFLOW_AT, MASTER_REFLOW_TO, 1),
+                 "CEO_TEMPLATE.md": ceo.replace(MASTER_REFLOW_AT, MASTER_REFLOW_TO, 1)}),
         }
-        for label, (cso_text, template_text) in edits.items():
+        for label, edit in edits.items():
+            cso_text, template_text = edit[0], edit[1]
+            extra = edit[2] if len(edit) > 2 else None
             with self.subTest(edit=label):
-                self.assertTrue(cso_text != cso or template_text != template,
+                self.assertTrue(cso_text != cso or template_text != template
+                                or any(v != self.raw[k] for k, v in (extra or {}).items()),
                                 "정당한 편집 앵커 부재(검체가 낡았다)")
-                result = full_suite_rc(cso_text, template_text)
+                result = full_suite_rc(cso_text, template_text, extra)
                 self.assertTrue(
                     result.wasSuccessful(),
                     "정당한 편집이 전체 검체에서 거짓 적색을 냈다(%s): failures=%d errors=%d\n%s"
                     % (label, len(result.failures), len(result.errors),
                        "\n".join(t[0].id() for t in result.failures + result.errors)))
+
+        # ★D7 음성 대조 — **같은 입력**(조항 내부 주석 문서)에서 조항을 지우거나 뒤집으면 전체
+        #   검체는 붉어야 한다. 이것이 없으면 위 통과 대조는 "투영을 느슨하게 해서 다 통과" 로도
+        #   만족되므로 공허하다.
+        commented = edits["조항 내부 주석"][0]
+        clause = dict(SAFETY_CLAUSES["CSO_DIRECTIVE.md"])["스크린샷 증거"]
+        lo, hi = raw_span_of(commented, clause)          # 주석이 안에 있어도 앵커는 잡혀야 한다
+        self.assertIn("<!--", commented[lo:hi], "앵커 구간이 조항 내부 주석을 품지 않는다")
+        deleted = commented[:lo] + commented[hi:]
+        inverted = commented.replace(
+            "후 초기화된다 — 경고를 받으면",
+            "후 초기화된다는 설명은 틀렸다. 누적값을 유지한다 — 경고를 받으면", 1)
+        self.assertNotEqual(inverted, commented, "반전 앵커 부재(검체가 낡았다)")
+        for label, bad in (("조항 내부 주석 + 조항 삭제", deleted),
+                           ("조항 내부 주석 + 접미 반전", inverted)):
+            with self.subTest(edit=label):
+                result = full_suite_rc(bad, template)
+                self.assertFalse(result.wasSuccessful(),
+                                 "변조된 문서가 전체 검체를 통과했다(%s) — 투영이 느슨해졌다" % label)
 
 
 
