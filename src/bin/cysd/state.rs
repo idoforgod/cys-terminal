@@ -220,6 +220,25 @@ impl QueueEntry {
     }
 }
 
+/// ★(0.14.31 · 성찰 Q3) WAL 행의 **마지막으로 영속된 생명주기 전이 시각** — `max(expired_at,
+/// revived_at)`. 둘 다 없으면 `f64::NEG_INFINITY`(= 전이를 겪은 적이 없다).
+///
+/// 이 값 하나가 "이 사본이 더 최근의 사실인가" 를 판정한다. 두 WAL 파일에 같은 id 가 남는 창은
+/// **목적지 먼저 쓰기**의 크래시 창뿐인데, 그 창에서 목적지 사본은 언제나 방금 찍은 전이 시각을
+/// 갖고 원본 사본은 그 이전 값을 갖는다 — 그래서 이 비교 하나로 만료 이동·revive 두 방향이
+/// 모두 옳게 갈린다(파일 우선순위 규칙이 필요 없다). NaN 은 비교에서 지므로 결과가 뒤집히지
+/// 않는다(`f64::max` 는 NaN 을 무시한다).
+pub fn queue_row_transition_at(it: &Value) -> f64 {
+    let ex = it.get("expired_at").and_then(|v| v.as_f64());
+    let rv = it.get("revived_at").and_then(|v| v.as_f64());
+    match (ex, rv) {
+        (None, None) => f64::NEG_INFINITY,
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (Some(a), Some(b)) => a.max(b),
+    }
+}
+
 /// 항목의 실효 TTL(초) — 항목 명시값 우선, 없으면 데몬 기본. 0 = 만료 없음.
 pub fn queue_entry_ttl_secs(e: &QueueEntry, default_ttl: u64) -> u64 {
     e.ttl_secs.unwrap_or(default_ttl)
@@ -3355,16 +3374,25 @@ impl Daemon {
         if expired_wal.unreadable && !preserve_unreadable_queue_wal(&dir, "queue-expired.json") {
             queue_wal_unpreserved.insert("queue-expired.json");
         }
-        let restored_qentries = active_wal.rows;
+        let mut restored_qentries = active_wal.rows;
         let mut restored_expired = expired_wal.rows;
-        // ★(0.14.31 · 리뷰 R5 · codex major) **파일 간 dedup — 활성이 이긴다.**
-        //   목적지-먼저 쓰기(아래 `persist_queue_state`)는 두 치환 사이의 크래시에서 같은 id 가
-        //   **두 파일에 다 있는** 상태를 남긴다(유실 대신 중복 — 의도된 안전 방향). 그때 두 벌을
-        //   그대로 살리면 같은 항목이 활성 큐와 만료 큐에 동시에 들어간다.
-        //   활성을 이기게 두는 근거: ⓐ 만료→활성(revive) 창의 중복은 **활성이 정답**이다.
-        //   ⓑ 활성→만료 창의 중복도 활성으로 살아나지만, `rehome_restored_queue` 가 복원 시점에
-        //     TTL 을 **재계산**해 이미 만료된 항목을 만료 큐로 되돌린다(§8 "만료 항목을 활성 큐 머리에
-        //     두지 않는다" 는 그 재분류가 집행한다) — 즉 어느 방향이든 유실 0 · 오배달 0 이다.
+        // ★(0.14.31 · 성찰 Q3) **파일 간 dedup 은 파일이 아니라 '영속된 전이 시각' 으로 푼다.**
+        //
+        // 【무엇이 틀렸었나】 종전 규칙은 "활성이 이긴다" 였고, 그 근거는 "활성→만료 창의 중복도
+        //   `rehome_restored_queue` 가 TTL 을 재계산해 만료 큐로 되돌린다" 였다. 그 재계산은 **지금
+        //   시각 기준**이라 두 경우에 확정된 만료를 취소한다: ⓐ 시계 역행(NTP 스텝백)으로 지금이
+        //   만료 시각보다 앞서면 TTL 나이가 다시 짧아지고 ⓑ `CYS_QUEUE_TTL_SECS` 를 올리면 그
+        //   항목은 더 이상 만료가 아니다. 두 경우 모두 만료가 **취소**되고, `revived_at` 이 없으니
+        //   `order_at()` 은 원 `enqueued_at`(가장 오래됨)이라 `queue_merge_insert_pos` 가 그것을
+        //   **활성 큐 머리**에 꽂는다 — §8("만료 항목을 활성 큐 머리에 두지 않는다") 정면 위반이고,
+        //   하필 재기동 직후(부트체인 최취약 창)에 6시간+ 묵은 지시가 최우선으로 배달된다.
+        //
+        // 【지금】 같은 id 가 두 파일에 있으면 `max(expired_at, revived_at)` 이 **큰** 사본이 이긴다.
+        //   두 크래시 창이 방향까지 정확히 갈린다: 만료 이동 창에서는 만료 사본의 `expired_at` 이
+        //   최신이고(만료 승), revive 창에서는 활성 사본의 `revived_at` 이 최신이다(활성 승).
+        //   후속 revive 증거가 없는 확정 만료는 그대로 보존된다. 동률·양쪽 다 부재는 종전대로
+        //   활성 승(무회귀 방향 — 그런 사본은 애초에 만료 전이를 겪은 적이 없다).
+        //   원장 `v=1` 유지 — 새 키를 만들지 않고 **이미 영속돼 있던** 두 시각만 읽는다.
         // 만료 파일의 **디스크 현재 내용**이 목적지-먼저 쓰기의 기억이다(dedup **전** 집합이어야
         // 다음 persist 가 "직전에 만료 파일에 무엇을 남겼는지" 를 정확히 안다).
         let expired_persisted_seed: std::collections::HashSet<String> = restored_expired
@@ -3372,15 +3400,39 @@ impl Daemon {
             .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
             .collect();
         {
-            let live: std::collections::HashSet<&str> = restored_qentries
+            let live: std::collections::HashMap<&str, f64> = restored_qentries
                 .iter()
-                .filter_map(|it| it.get("id").and_then(|v| v.as_str()))
+                .filter_map(|it| {
+                    it.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| (id, queue_row_transition_at(it)))
+                })
                 .collect();
+            // 만료 사본이 이긴 id — 그만큼 활성 사본에서 뺀다(두 파일 어디에도 없는 상태는 만들지
+            // 않는다: 한쪽이 반드시 이긴다).
+            let mut expired_wins: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             restored_expired.retain(|it| {
-                !it.get("id")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|id| live.contains(id))
+                let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
+                    return true; // id 없는 행은 dedup 대상이 아니다(그대로 둔다)
+                };
+                let Some(&live_at) = live.get(id) else {
+                    return true; // 활성 사본이 없다 — 충돌이 아니다
+                };
+                if queue_row_transition_at(it) > live_at {
+                    expired_wins.insert(id.to_string());
+                    true
+                } else {
+                    false // 동률 포함 활성 승(종전 동작)
+                }
             });
+            if !expired_wins.is_empty() {
+                restored_qentries.retain(|it| {
+                    !it.get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| expired_wins.contains(id))
+                });
+            }
         }
         let queue_seq_seed = restored_qentries
             .iter()
@@ -3888,7 +3940,9 @@ impl Daemon {
         if !carry.is_empty() {
             if let Err(e) = write_file("queue-expired.json", &expired_entries) {
                 // 만료 파일에 중복이 남는다(활성에도 있는 항목) — 유실이 아니라 중복이고, 읽는 쪽
-                // dedup(활성 우선)이 처리한다. 캐시를 갱신하지 않으므로 다음 persist 가 같은 carry 를
+                // dedup 이 처리한다: carry 는 정의상 **되살린** 항목이라 활성 사본의 `revived_at` 이
+                // 만료 사본의 `expired_at` 보다 최신이고, 전이 시각 규칙(★성찰 Q3)이 활성을 고른다.
+                // 캐시를 갱신하지 않으므로 다음 persist 가 같은 carry 를
                 // 다시 계산해 재시도하고, carry 가 비면 ①이 곧 정상 내용이라 자기치유된다.
                 warn("carry-cleanup", e);
                 return; // 캐시는 ①의 내용(expired ∪ carry) 그대로 — 다음 회차가 같은 carry 를 다시 쓴다
@@ -9262,8 +9316,15 @@ mod tests {
     ///
     /// 【무엇을 재는가】 종전 순서(활성 → 만료)에서 활성→만료 이동은 ① 활성 파일이 항목을 잃고
     /// ② 만료 파일이 그것을 얻는다 — ①과 ② 사이의 크래시는 **어느 파일에도 없는** 상태를 남겼다.
-    /// 지금은 **목적지 먼저**라 그 창의 디스크 상태가 "두 파일 모두" 이고, 읽는 쪽은 활성 우선
-    /// dedup + 복원 시점 TTL 재분류로 그것을 정확히 한 벌로 되살린다.
+    /// 지금은 **목적지 먼저**라 그 창의 디스크 상태가 "두 파일 모두" 이고, 읽는 쪽은 dedup 으로
+    /// 그것을 정확히 한 벌로 되살린다(유실 0 · 중복 0).
+    ///
+    /// ★(0.14.31 · 성찰 Q3) dedup 의 **승자 규칙이 바뀌었다** — 종전 "활성이 이긴다" 에서
+    /// "`max(expired_at, revived_at)` 이 큰 사본이 이긴다" 로. 종전 규칙의 안전 논거는 "활성으로
+    /// 되살아나도 rehome 이 TTL 을 재계산해 만료로 되돌린다" 였는데, 그 재계산은 **지금 시각**
+    /// 기준이라 시계 역행·TTL 상향에서 확정된 만료를 취소하고 그 항목을 활성 큐 **머리**에
+    /// 꽂았다(§8 위반). 그래서 아래 ⓑ 의 기대값이 (활성 1 · 만료 0) → (활성 0 · 만료 1) 로
+    /// 바뀐다 — 이 검체가 재는 불변식(유실 0 · 중복 0 · 한 벌)은 그대로다.
     #[test]
     fn wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry() {
         // ── ⓐ 쓰기 순서: 만료 파일이 활성 파일보다 **먼저** 치환된다(소스 핀 · 이동 방향 무관).
@@ -9336,9 +9397,16 @@ mod tests {
         let act = daemon.restored_queue.lock().unwrap().len();
         let exp = daemon.restored_expired.lock().unwrap().len();
         assert_eq!(
+            act + exp,
+            1,
+            "크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — dedup 결손"
+        );
+        // ★(성찰 Q3) 이 잔상은 **활성→만료 이동**의 크래시다: 목적지(만료 파일)가 `expired_at` 을
+        //   방금 찍었고 원본(활성 파일)은 그 앞 사본이다. 그러므로 만료 사본이 최신 사실이다.
+        assert_eq!(
             (act, exp),
-            (1, 0),
-            "크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — 활성 우선 dedup 결손"
+            (0, 1),
+            "확정된 만료가 활성으로 되살아났다 — 시계 역행·TTL 상향이면 그대로 활성 큐 머리 배달이다(§8)"
         );
         // ── ⓒ 계측 타당성: **종전 순서**의 크래시 잔상(두 파일 모두 비어 있음)은 그대로 유실이다.
         //     이 대조군이 없으면 위 단언은 '원래 안 나는 일' 을 확인하는 공허한 검사가 된다.
@@ -9523,7 +9591,8 @@ mod tests {
         )
         .unwrap();
         let d3 = Daemon::new(dir3.join("cysd.sock"));
-        // 복원 dedup(활성 우선)으로 R 은 활성, E 는 만료에 있다. 여기서 E 를 revive 한다(메모리).
+        // 복원 dedup(전이 시각 우선 · ★성찰 Q3)으로 R 은 활성(두 사본 다 전이 없음 = 동률 → 활성),
+        // E 는 만료(만료 사본만 expired_at 보유)에 있다. 여기서 E 를 revive 한다(메모리).
         let revived_e = {
             let mut rx = d3.restored_expired.lock().unwrap();
             let pos = rx
@@ -9946,6 +10015,164 @@ mod tests {
         assert!(
             gate < serialize,
             "보존 판정이 직렬화·치환 뒤에 온다 — 그 순서로는 원본이 이미 덮인다"
+        );
+    }
+}
+
+/// ★(0.14.31 · 성찰 반영 라운드 · daemon-queue) 이 라운드가 세운 큐 생명주기 계약의 검체.
+/// 파일 **끝**에 모은 이유는 병합 충돌의 국소화 하나뿐이다(여러 영역이 같은 파일을 병렬로 고친다).
+#[cfg(test)]
+mod reflect_queue_tests {
+    use super::*;
+
+    /// 한 번 쓰고 버리는 상태 디렉터리 + 그 안의 소켓 경로(unix 에서 `state_dir` = 소켓의 부모).
+    fn scratch_state_dir(tag: &str) -> std::path::PathBuf {
+        let td = std::env::temp_dir().join(format!(
+            "cys-reflectq-{tag}-{}-{}",
+            std::process::id(),
+            (now_epoch() * 1000.0) as u64
+        ));
+        std::fs::create_dir_all(&td).expect("스크래치 상태 디렉터리");
+        td
+    }
+
+    fn write_rows(dir: &std::path::Path, name: &str, rows: &[serde_json::Value]) {
+        std::fs::write(dir.join(name), serde_json::to_string(&rows).expect("직렬화"))
+            .expect("WAL 기록");
+    }
+
+    /// ★(0.14.31 · 성찰 Q3) **WAL 이중 사본의 dedup 은 확정된 만료를 취소하지 않는다.**
+    ///
+    /// 목적지-먼저 쓰기의 크래시 창은 같은 id 를 두 파일에 남긴다(유실 대신 중복 — 의도된 안전
+    /// 방향). 종전 규칙은 "활성이 이긴다" 였고, 그 안전 논거는 "rehome 이 복원 시점에 TTL 을
+    /// 재계산해 만료로 되돌린다" 였다. 그 재계산은 **지금 시각** 기준이라, 시계가 역행했거나
+    /// TTL 이 올라가면 만료가 **취소**된다. 그리고 `revived_at` 이 없으니 `order_at()` 은 원
+    /// `enqueued_at`(가장 오래됨) → 병합 삽입이 그것을 **활성 큐 머리**에 꽂는다 = §8 위반이자
+    /// 재기동 직후(부트체인 최취약 창)에 6시간+ 묵은 지시가 최우선 배달이다.
+    ///
+    /// ⓐ 시계 역행(만료 시각이 '지금' 보다 앞선다) ⓑ TTL 상향(항목 TTL 이 나이보다 크다) 두 축
+    /// 모두에서 만료 사본이 이겨야 한다. ⓒ 반대 방향(revive 창)은 활성이 이겨야 한다 —
+    /// 이 수정이 revive 를 뒤집지 않는다는 음성 대조다.
+    #[test]
+    fn q3_wal_duplicate_resolves_by_persisted_transition_time_not_by_file() {
+        let now = now_epoch();
+        // ⓐ+ⓑ 확정 만료 사본이 있고, 활성 사본은 '지금' 기준으로는 만료가 아니다.
+        //     (enqueued_at = now-20900 · ttl 21600 → 나이 20900 < 21600 = 만료 아님.
+        //      expired_at = now+700 = 그 항목이 실제로 만료된 시각이 '지금' 보다 미래다 = 시계 역행.
+        //      TTL 상향 축도 같은 술어 상태로 수렴한다 — `queue_entry_expired` 가 거짓이 되는 것이
+        //      두 축의 공통 귀결이기 때문이다. 그래서 한 검체가 둘을 함께 핀한다.)
+        let active_row = json!({
+            "mid": "m-q3", "id": "q3-rollback", "seq": 7, "surface_id": 3, "role": "worker",
+            "text": "6시간 묵은 지시", "enqueued_at": now - 20_900.0, "from": "surface:9",
+            "origin": "send", "ttl_secs": 21_600u64, "paused_total_secs": 0.0,
+            "expired_at": serde_json::Value::Null, "revived_at": serde_json::Value::Null,
+            "expired_notified": false, "expired_event_sent": false,
+        });
+        let mut expired_row = active_row.clone();
+        expired_row["expired_at"] = json!(now + 700.0);
+        // ⓒ revive 창의 중복 — 활성 사본이 `revived_at` 으로 더 최근이다.
+        let revived_active = json!({
+            "mid": "m-q3b", "id": "q3-revived", "seq": 8, "surface_id": 3, "role": "worker",
+            "text": "운영자가 되살린 지시", "enqueued_at": now - 30_000.0, "from": "surface:9",
+            "origin": "send", "ttl_secs": 0u64, "paused_total_secs": 0.0,
+            "expired_at": serde_json::Value::Null, "revived_at": now - 5.0,
+            "expired_notified": false, "expired_event_sent": false,
+        });
+        let mut revived_expired = revived_active.clone();
+        revived_expired["revived_at"] = serde_json::Value::Null;
+        revived_expired["expired_at"] = json!(now - 60.0);
+
+        let dir = scratch_state_dir("q3");
+        write_rows(&dir, "queue-state.json", &[active_row, revived_active]);
+        write_rows(&dir, "queue-expired.json", &[expired_row, revived_expired]);
+        let daemon = Daemon::new(dir.join("cys.sock"));
+
+        let live_ids: Vec<String> = daemon
+            .restored_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let exp_ids: Vec<String> = daemon
+            .restored_expired
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !live_ids.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 활성 복원분으로 되살아났다 — 시계 역행/TTL 상향이 만료를 취소했다(§8 위반)"
+        );
+        assert!(
+            exp_ids.iter().any(|i| i == "q3-rollback"),
+            "확정 만료 사본이 어디에도 없다(유실) — dedup 은 한쪽을 반드시 남겨야 한다"
+        );
+        assert!(
+            live_ids.iter().any(|i| i == "q3-revived"),
+            "revive 창의 중복에서 활성 사본이 졌다 — 이 수정이 revive 방향을 뒤집었다"
+        );
+        assert!(
+            !exp_ids.iter().any(|i| i == "q3-revived"),
+            "되살린 항목이 만료 사본으로도 남았다 — 같은 id 가 양쪽에 있으면 중복 배달이다"
+        );
+
+        // 배달 경로까지: role 좌석이 살아 있어도 확정 만료는 활성 큐에 들어가지 않는다.
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        *s.role.lock().unwrap() = Some("worker".into());
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        daemon.rehome_restored_queue();
+        let active: Vec<String> = s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let expired: Vec<String> = s
+            .expired_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert!(
+            !active.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 rehome 을 거쳐 활성 큐에 들어갔다(머리 배달 = 부트체인 사고)"
+        );
+        assert!(
+            expired.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 좌석 만료 큐에도 없다 — 도달 불가(유실)"
+        );
+        assert!(
+            active.iter().any(|i| i == "q3-revived"),
+            "되살린 항목이 배달 경로에 오지 못했다"
+        );
+        let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 전이 시각 판정자의 진리표 — 결측은 값이 아니다(전이를 겪은 적 없음 = 언제나 진다).
+    #[test]
+    fn q3_transition_at_truth_table() {
+        assert_eq!(queue_row_transition_at(&json!({})), f64::NEG_INFINITY);
+        assert_eq!(queue_row_transition_at(&json!({"expired_at": 10.0})), 10.0);
+        assert_eq!(queue_row_transition_at(&json!({"revived_at": 20.0})), 20.0);
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": 10.0, "revived_at": 20.0})),
+            20.0
+        );
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": 30.0, "revived_at": 20.0})),
+            30.0
+        );
+        // null 은 부재와 같다(구 데몬이 다시 쓴 WAL 은 이 키를 null 로 남긴다).
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": serde_json::Value::Null})),
+            f64::NEG_INFINITY
         );
     }
 }

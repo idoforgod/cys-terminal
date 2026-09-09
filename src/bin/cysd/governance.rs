@@ -5646,7 +5646,8 @@ pub(crate) fn deliver_head_locked(
             //   락 밖에서 만료 큐에 넣었다 — 그 사이에 `persist_queue_state` 가 스냅샷을 뜨면 항목이
             //   **두 큐 어디에도 없는** 상태가 파일에 박히고, 그 직후 크래시는 그것을 지운다.
             //   지금은 만료 큐가 그것을 **가진 뒤에** 활성 큐에서 뺀다(중간 스냅샷은 중복 · 유실 0 ·
-            //   읽는 쪽 dedup 은 활성 우선 + 복원 시점 TTL 재분류가 처리한다).
+            //   읽는 쪽 dedup 은 **전이 시각**(★성찰 Q3)이 처리한다 — 만료 사본만 `expired_at` 을
+            //   갖고 있으므로 그것이 이긴다 = 만료가 취소되지 않는다).
             let mut e = entry.clone();
             e.expired_at = Some(now);
             expired_head = Some(e);
