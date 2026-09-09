@@ -347,11 +347,9 @@ fn grace_secs() -> f64 {
 
 /// 특권 역할(빈좌석 승계에 `takeover_empty_seat` opt-in 을 요구하는 등급) — `handlers` 의
 /// `privileged_role` 과 **같은 집합**이어야 한다(두 곳이 갈리면 한쪽만 열린 문이 생긴다).
-/// 여기서는 `cso-1` 같은 변형까지 접두로 받는다: 자동 경로가 특권 쪽으로 **넓게 닫히는** 것은
-/// 안전 방향이고, 좁게 닫히면 변형 이름 하나로 이 게이트가 통째로 우회된다.
-pub fn is_privileged_role(role: &str) -> bool {
-    role == "master" || role == "cso" || role.starts_with("cso-")
-}
+/// ★(성찰 A10) 이제 **같은 함수**다(재수출) — 종전에는 여기가 접두(`cso-`)였고 handlers 는 정확
+/// 일치라 두 집합이 실제로 갈려 있었다. 정의처는 `alert_route::is_cso_role`(라우팅 범위) 하나다.
+pub use crate::handlers::privileged_role as is_privileged_role;
 
 /// 재결합 판정 — 순수. 부작용 0 · 시각과 lease 보유 여부까지 **주입**받는다(테스트 결정론).
 pub fn decide(
@@ -789,9 +787,13 @@ pub(crate) mod tests {
             .next()
             .unwrap_or("");
         assert!(
-            body.contains("\"master\"") && body.contains("\"cso\""),
+            body.contains("\"master\"") && (body.contains("\"cso\"") || body.contains("is_cso_role")),
             "claim 게이트의 특권 집합이 바뀌었다 — reclaim 쪽을 함께 갱신하라: {body}"
         );
+        // ★(성찰 A10) 집합이 하나임을 **값**으로도 대조한다(소스 대조는 정의처 이동을 잡을 뿐이다).
+        for r in ["master", "cso", "cso-1", "cso-fresh-1700000000", "worker", "reviewer-codex", "csx"] {
+            assert_eq!(is_privileged_role(r), crate::handlers::privileged_role(r), "{r}");
+        }
     }
 
     /// ★(R2 · codex blocking) 신고 `$PWD` 는 **좁히기 전용**이다 — 데몬이 아는 축과 AND 로

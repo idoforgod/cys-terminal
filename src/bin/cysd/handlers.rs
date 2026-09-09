@@ -224,8 +224,12 @@ fn record_create_caller(daemon: &Daemon, new_sid: u64, caller_pid: u32) {
 /// ★G4(W4-C) 권위 role 집합의 **단일 정의처** — authoritative_caller_ok(타이핑 가드 면제)·
 /// surface.reap(수동 좌석 회수)·queue.clear exited 예외(죽은 좌석 큐 정리)가 공유한다.
 /// 집합 변경 시 세 게이트가 갈라지지 않게 여기 한 곳만 고친다.
-fn privileged_role(r: &str) -> bool {
-    r == "master" || r == "cso"
+pub fn privileged_role(r: &str) -> bool {
+    // ★(성찰 A10) "cso" · "cso-2" · "cso-fresh-<epoch>" — 경보 라우팅과 **같은 범위**(접두).
+    //   종전의 정확 일치는 `claim_role(cso-2)` 를 비특권 latest-wins 로 흘려보내 임의 pane 이
+    //   자기 경보를 자기제외로 폐기시키고 CSO 부재 시 inbox 를 가져가게 했다. 정의처는 하나다:
+    //   `alert_route::is_cso_role`(라우팅) — 이 함수와 `reclaim::is_privileged_role` 은 그것을 쓴다.
+    r == "master" || crate::alert_route::is_cso_role(r)
 }
 
 /// ★(성찰 A5 · CONTRACTS §E-2) `queue.revive` 의 **권위 역할** — `privileged_role` 보다 좁다.
@@ -3745,7 +3749,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // (W2 · G14) announce 를 성공 아크로 미루므로 role 문자열도 상위 스코프에 보존한다.
             let role_for_announce = param_str(&params, "role").unwrap_or_default();
             if let Some(role) = param_str(&params, "role") {
-                if matches!(role.as_str(), "master" | "cso") {
+                if privileged_role(&role) {
                     // ★SEAT 승계(opt-in): 보유자가 '살아있으나 빈 좌석'(role 만 쥔 셸)이면 부활·부트가
                     // 영원히 잠긴다(2026-07-17 실사고). 승계는 **명시 요청(takeover_empty_seat)이 있고**
                     // 그 좌석이 결정론으로 Empty 일 때만 허용한다 — 파라미터가 없으면 아래 판정은
@@ -5307,7 +5311,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 판정 프로브(seat_claimable_now)는 전 프로세스 표를 refresh 하므로 **락 진입 전에**
             // 끝낸다: surfaces/roles 락을 쥔 채 수십 ms 를 태우면 데몬 전체가 그동안 정지한다.
             // 결과는 (승계 대상 surface_id) — 아래 임계영역이 이 판정만 소비한다(락 안 프로브 0).
-            let seat_takeover_ok: Option<u64> = if matches!(role.as_str(), "master" | "cso")
+            let seat_takeover_ok: Option<u64> = if privileged_role(&role)
                 && params
                     .get("takeover_empty_seat")
                     .and_then(|v| v.as_bool())
@@ -5352,7 +5356,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 이미 살아있는 다른 surface가 점유 중이면 재지정을 거부한다. 자기 surface가
                 // 이미 보유 중인 경우(idempotent re-claim)와 직전 보유자가 죽은(없거나 exited)
                 // 경우의 정당한 승계는 허용 — governance의 live 판정과 동일 기준.
-                if matches!(role.as_str(), "master" | "cso") {
+                if privileged_role(&role) {
                     if let Some(&holder) = roles.get(&role) {
                         // ★(W2 · G13) 임계영역 내 저비용 재검증 — 프로브↔여기 사이에 좌석이 다시
                         // 채워졌는지 값싼 사실(exited·agent_meta·last_human_input·seat_cache)로만
@@ -5411,7 +5415,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // **agent_alive 좌석 한정으로만** 보호한다. 살아 일하는 리뷰어의 역할 주소를 새
                 // pane 이 조용히 빼앗아 라우팅·알림·감시를 끊는 경로를 닫되, 죽은·행 걸린 좌석은
                 // 현행 latest-wins 를 그대로 둔다(그것이 사실상의 self-heal 경로 — 전면 제거 금지).
-                if !matches!(role.as_str(), "master" | "cso") {
+                if !privileged_role(&role) {
                     if let Some(&holder) = roles.get(&role) {
                         if holder != sid {
                             let protected = surfaces
@@ -13659,6 +13663,52 @@ mod tests {
             Some(master),
             "master 매핑이 공격자로 넘어갔다"
         );
+    }
+
+    /// ★(성찰 A10) 경보 라우팅은 `cso` 를 **접두**로 넓혔는데(`cso-2` 도 CSO 좌석) 특권 좌석 게이트는
+    /// 정확 일치였다 — `claim_role{"cso-2"}` 가 비특권 latest-wins 를 타 어떤 pane 이든 자기 좌석에
+    /// `cso-2` 를 박을 수 있었고, 그 순간부터 그 좌석의 `health.alert`·`context.threshold`·
+    /// `surface.exited` 는 자기제외로 **폐기**되며(①) CSO 부재 시 `live.first()` 가 그 좌석이라
+    /// inbox 를 가져갔다(②). 이제 특권 집합은 라우팅과 같은 범위이고, 명시 승계·죽은 보유자 승계는
+    /// 게이트가 닫지 않는다(자동 복구 경로 보존).
+    #[test]
+    fn claim_role_cso_variant_goes_through_the_privileged_gate() {
+        let daemon = claim_daemon();
+        // 살아있으나 **빈** cso-2 좌석(에이전트 미등록 = latest-wins 의 live-slot 보호 밖이었다).
+        let holder = make_surface(&daemon, Some("cso-2"));
+        daemon.roles.lock().unwrap().insert("cso-2".into(), holder);
+        let attacker = make_surface(&daemon, Some("worker-3"));
+        let pid = 990_301_u32;
+        bind_caller(&daemon, pid, attacker);
+        let resp = claim(&daemon, "cso-2", attacker, Some(pid));
+        assert_eq!(resp["ok"], json!(false), "빈 cso-2 좌석을 임의 pane 이 latest-wins 로 가져갔다: {resp}");
+        assert_eq!(resp["error"]["code"], json!("claim_denied"));
+        assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(holder), "cso-2 매핑이 넘어갔다");
+        // 대조 ①: **명시 승계**(`takeover_empty_seat`) 경로는 게이트가 닫지 않는다 — 답은 좌석
+        //   판정(`seat_claimable_now` · 이 프로세스 표의 Empty 여부)을 그대로 따른다.
+        let hs = daemon.get_surface(holder).unwrap();
+        let claimable = crate::governance::seat_claimable_now(&hs);
+        let req = Request { id: json!(1), method: "system.claim_role".into(),
+            params: json!({"role": "cso-2", "surface_id": attacker, "takeover_empty_seat": true}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else { panic!("single reply") };
+        assert_eq!(resp["ok"], json!(claimable),
+            "명시 승계 경로가 좌석 판정(claimable={claimable})과 다르게 답했다: {resp}");
+        if claimable {
+            assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
+            daemon.roles.lock().unwrap().insert("cso-2".into(), holder); // 대조 ② 는 원 보유자 기준
+        }
+        // 대조 ②: 죽은 보유자의 승계는 opt-in 없이 열린다(self-heal 보존 — 게이트가 기능을 닫지 않는다).
+        hs.exited.store(true, Ordering::Relaxed);
+        let resp = claim(&daemon, "cso-2", attacker, Some(pid));
+        assert_eq!(resp["ok"], json!(true), "죽은 cso-2 보유자의 승계가 막혔다: {resp}");
+        assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
+        // 특권 집합 ≡ 라우팅 범위.
+        for r in ["cso", "cso-2", "cso-fresh-1700000000", "master"] {
+            assert!(privileged_role(r), "{r} 가 특권 집합 밖이다");
+        }
+        for r in ["worker", "worker-2", "reviewer-codex", "planner", "csx"] {
+            assert!(!privileged_role(r), "{r} 가 특권 집합에 들어갔다");
+        }
     }
 
     fn create_surface_rpc(daemon: &Arc<Daemon>, role: Option<&str>, caller_pid: Option<u32>) -> Value {

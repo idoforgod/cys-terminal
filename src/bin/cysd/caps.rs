@@ -115,6 +115,10 @@ pub fn is_reviewer_or_planner(role: &str) -> bool {
 }
 
 /// full-trust 역할 — worker/master/cso(및 worker-N dedup 변형).
+///
+/// ★(성찰 A10) **의도적으로 정확 일치**다. 특권 *좌석* 집합(`handlers::privileged_role` — 접두
+/// `cso*`, 빈 좌석 탈취 봉쇄)과 full-trust *능력* 집합은 다른 축이다: 좌석 보호는 넓게, 능력은
+/// 좁게. `cso-2` 를 특권 좌석으로 넓혀도 능력은 새지 않는다(권한 상승 0).
 fn is_full_trust(role: &str) -> bool {
     role == "master"
         || role == "cso"
@@ -145,6 +149,17 @@ mod tests {
             assert!(!c.allows(Cap::Edit), "{r} must not edit");
             assert!(!c.allows(Cap::WriteShell), "{r} must not write-shell");
         }
+    }
+
+    /// ★(성찰 A10) `cso-*` 변형은 특권 **좌석**(claim 게이트)이지만 full-trust **능력**은 아니다.
+    #[test]
+    fn cso_variants_are_privileged_seats_but_not_full_trust() {
+        for r in ["cso-2", "cso-fresh-1700000000"] {
+            assert!(crate::handlers::privileged_role(r), "{r} 좌석이 특권 게이트 밖이다");
+            assert!(!is_full_trust(r), "{r} 가 full-trust 능력을 얻었다(권한 상승)");
+            assert!(!Caps::for_role(Some(r)).allows(Cap::Edit), "{r} 가 edit 능력을 얻었다");
+        }
+        assert!(is_full_trust("cso") && crate::handlers::privileged_role("cso"));
     }
 
     #[test]

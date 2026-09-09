@@ -79,6 +79,16 @@ pub const ALERT_ORIGIN: &str = "alert";
 pub const ALERT_FROM: &str = "daemon";
 /// CSO 좌석을 고르는 역할 접두 — 훅 `session-start.sh` 의 `cso*)` 와 같은 규칙.
 pub const CSO_ROLE_PREFIX: &str = "cso";
+
+/// ★(성찰 A10) **CSO 역할 범위의 단일 술어** — 라우팅(목적지·자기제외)과 특권 좌석 게이트
+/// (`handlers::privileged_role` · `reclaim::is_privileged_role`)가 **같은 함수**를 쓴다.
+/// 종전에는 라우팅이 접두(`cso-2` 도 CSO)였는데 게이트는 정확 일치라, 어떤 pane 이든
+/// `claim_role{"cso-x"}` 로 자기 좌석을 CSO 로 만들어 그 좌석의 경보를 자기제외로 **폐기**시키고
+/// (`route_once` ①) CSO 부재 시 `live.first()` 로 inbox 를 가져갈 수 있었다(권한 상승이 아니라
+/// **경보 도달성의 봉쇄·전용**). 능력(`caps::is_full_trust`)은 이 술어를 쓰지 않는다(정확 일치 유지).
+pub fn is_cso_role(role: &str) -> bool {
+    role.starts_with(CSO_ROLE_PREFIX)
+}
 /// ★(성찰 A9) 데몬 자신의 경보 엔진이 내는 이름 접두(`governance` 워치독 → `alert.{kind}` ·
 /// `alerts.rs` 의 rate_limit·account_rate·weekly_budget·repeated_failure·node_liveness).
 /// 점(`.`)까지가 접두다 — 이 모듈 자신의 관측 이름(`alert_route.*`)은 여기 걸리지 않는다.
@@ -1504,7 +1514,7 @@ pub fn cso_seats_detail(daemon: &Arc<Daemon>) -> (Vec<u64>, Vec<u64>, bool) {
         let roles = daemon.roles.lock().unwrap();
         roles
             .iter()
-            .filter(|(r, _)| r.starts_with(CSO_ROLE_PREFIX))
+            .filter(|(r, _)| is_cso_role(r))
             .map(|(r, s)| (r.clone(), *s))
             .collect()
     };
@@ -4570,6 +4580,23 @@ mod pure_tests {
         assert!(s.starts_with("kind=node_liveness severity=crit isolate=true key=#"), "{s}");
         assert!(s.contains("age_secs=900") && !s.contains("worker-2") && !s.contains("dept-2"), "{s}");
         assert_eq!(key_detail("alert.node_liveness", &payload).as_deref().map(|d| d.starts_with("node_liveness:worker-2#")), Some(true));
+    }
+
+    /// ★(성찰 A10) CSO 범위는 **술어 하나**다 — 라우팅 목적지 선택·적재 시 역할 가드·특권 좌석
+    /// 게이트가 같은 답을 낸다(한쪽만 넓으면 그 차이가 경보 봉쇄·전용의 문이다).
+    #[test]
+    fn cso_role_scope_is_one_predicate_shared_by_routing_and_the_privileged_gate() {
+        for r in ["cso", "cso-2", "cso-fresh-1700000000"] {
+            assert!(is_cso_role(r), "{r} 가 CSO 범위 밖이다");
+            assert!(RoleGuard::Prefix(CSO_ROLE_PREFIX).matches(r), "{r} 적재 가드 불일치");
+            assert!(crate::handlers::privileged_role(r), "{r} 가 특권 좌석 게이트 밖이다");
+            assert!(crate::reclaim::is_privileged_role(r), "{r} 가 reclaim 특권 집합 밖이다");
+        }
+        for r in ["master", "worker", "worker-2", "reviewer-codex", "csx", "xcso", ""] {
+            assert!(!is_cso_role(r), "{r} 가 CSO 범위에 들어갔다");
+            assert_eq!(RoleGuard::Prefix(CSO_ROLE_PREFIX).matches(r), is_cso_role(r), "{r}");
+        }
+        assert!(crate::handlers::privileged_role("master") && !is_cso_role("master"));
     }
 
     // 결측끼리의 일치를 자기좌석으로 오인해 CSO 부재 경보를 폐기하지 못하게 한다.
