@@ -881,6 +881,12 @@ _STEP_DEFS = (
     ("LANE_PACK_NOTIFY", "⓪lane-pack-notify"),
     ("PREFLIGHT", "①preflight"),
     ("PING", "②ping"),
+    # ★성찰 P7: 능력 게이트 표적 재측정(`--only C28`)은 ② **뒤**다. `unknown` 의 지배적 원인이
+    #   `cys status --json` 무응답인데 ① 에서 다시 재면 같은 국면·같은 입력을 다시 재는 것이라
+    #   수렴 경로가 없다(매 부트 unknown → 표식 → 다음 부트 ① 에서 다시 unknown · 로그는 매번 rc 0).
+    #   선언 순서 = 실행 순서 계약이므로 PING 과 CLAIM_ROLE 사이에 선언한다.
+    ("PREFLIGHT_CAPGATE", "②′preflight-capgate"),
+
     ("CLAIM_ROLE", "③claim-role"),
     ("CLAIM_ROLE_CONTEXT", "③claim-role-context"),
     # ★위계 폴백(2026-08 현장 결함 3호 · 오너 결정 D1ⓐ/D2/D3): base 레인에서 살아있는 master 가
@@ -2706,8 +2712,37 @@ def cmd_run():
             log.finish(exit_code if exit_code is not None else 1)
 
 
+# ★성찰 P16: 미해소 능력 게이트 표식의 **경로와 판독 의미**는 preflight 가 정본이다.
+#   종전엔 바로 위 주석이 "정본은 `javis_preflight.capgate_unresolved_path()`" 라고 적어 두고도
+#   리터럴 경로 + `os.path.exists` 를 썼다 — ⓐ 파일명·디렉터리를 옮기면 부트 체인이 **경고 0**
+#   으로 "fast path 로 preflight 영구 생략" 으로 되돌아가고 ⓑ `capgate_unresolved()` 가 문서화한
+#   '판독 실패·조회 실패는 미해소' 3값 의미가 한 값으로 접혔다.
+CAPGATE_UNRESOLVED_REL = os.path.join("state", "capgate-unresolved.json")   # 폴백 전용 사본
+
+
+def _capgate_unresolved_state(pack):
+    """(미해소?, 표식 경로) — 판정 정본은 `javis_preflight.capgate_unresolved()`.
+
+    import 실패(구 팩·부서 팩 결손·스큐)는 부트를 죽이지 않는다 — 공유 상수 경로로 강등하되
+    **같은 방향**을 지킨다: 증명된 부재만 '해소됨' 이고, 있는데 못 읽으면 미해소다.
+    """
+    try:
+        import javis_preflight as _pf
+        return bool(_pf.capgate_unresolved(pack)[0]), _pf.capgate_unresolved_path(pack)
+    except Exception:                       # noqa: BLE001 — 지혈이 새 크래시 지점이 되면 안 된다
+        path = os.path.join(pack, CAPGATE_UNRESOLVED_REL)
+        try:
+            os.lstat(path)
+            return True, path
+        except FileNotFoundError:
+            return False, path
+        except OSError:
+            return True, path               # 조회 실패는 '없다' 가 아니다(막는 방향)
+
+
 def _cmd_run_chain(log):
     """부트 단계 체인(①~⑧) — 종료 기록은 호출자(cmd_run)의 try/finally 가 소유한다."""
+
     py = sys.executable or "python3"
 
     # ★불량 레인 가드(R1-LOW-2): 빈 부서명(cys-dept-/ — suffix 없음) 소켓은 base도 부서도 아닌
@@ -2774,20 +2809,24 @@ def _cmd_run_chain(log):
     #   미등록인 채 조용히 굳고 두 번째 부팅부터는 경고조차 사라진다(봉인표 ② 방향).
     #   표식이 있으면 **전량 재실행이 아니라 C28 만** 짧게 다시 돈다(데몬을 기다리는 재시도
     #   루프는 넣지 않는다 — 부트 지연·큐 적체를 만들지 않는 것이 이 축의 전제다).
-    #   표식의 생성·삭제 정본은 `javis_preflight.capgate_unresolved_path()` 다.
-    _cap_mark = os.path.join(PACK, "state", "capgate-unresolved.json")
-    _cap_unresolved = os.path.exists(_cap_mark)
+    #   표식의 생성·삭제·판독 정본은 `javis_preflight.capgate_unresolved()` 다(성찰 P16 — 종전
+    #   리터럴 경로 + `os.path.exists` 는 ⓐ 파일명이 옮겨지면 **조용히** fast path 영구 생략으로
+    #   되돌아가고 ⓑ '판독 실패는 미해소' 라는 3값 의미를 한 값으로 접었다).
+    # ★성찰 P7: 재측정 자체는 여기서 **하지 않는다** — ② ping 성공 뒤로 미룬다(아래 참조).
+    _cap_unresolved, _cap_mark = _capgate_unresolved_state(PACK)
+    _cap_remeasure = None
     if _marker_fresh and not _cap_unresolved:
         log.step(STEP.PREFLIGHT, 0,
                  "레인 마커(%s)가 현재 pack_version — preflight 생략(fast path)"
                  % lane_state_path("marker"))
     elif _marker_fresh and os.path.isfile(preflight):
-        _progress("① 능력 게이트 판정 불능 표식 — C28 만 재측정 중(최대 90s · 비치명)…")
-        code, out = _run([py, preflight, "--fix", "--only", "C28.self-correction"], timeout=90)
-        log.step(STEP.PREFLIGHT, code,
-                 "레인 마커는 신선하지만 능력 게이트 미해소 표식(%s) — C28 표적 재측정: %s"
-                 % (_cap_mark, out))
+        _cap_remeasure = preflight
+        log.step(STEP.PREFLIGHT, 0,
+                 "레인 마커는 신선하지만 능력 게이트 미해소 표식(%s) — C28 표적 재측정을 ② ping "
+                 "성공 뒤로 미룬다(성찰 P7: 무응답 데몬이 unknown 의 지배적 원인이라 ① 에서 다시 "
+                 "재면 같은 입력을 다시 재는 것이다)" % _cap_mark)
     elif os.path.isfile(preflight):
+
         _progress("① preflight --fix 실행 중(최대 300s · 비치명 — FAIL이어도 팀 부팅 계속)…")
         code, out = _run([py, preflight, "--fix"], timeout=300)
         log.step(STEP.PREFLIGHT, code, out)
@@ -2837,6 +2876,20 @@ def _cmd_run_chain(log):
                         "cys ping 유계 재시도 소진 — %d회 시도·총 %.1fs 대기(창 상한 %.0fs)에도 "
                         "데몬 무응답(마지막 rc=%s).\n%s"
                         % (ping_attempts, _ping_waited, PING_RETRY_TOTAL_S, code, out), EXIT_PING)
+
+    # ②′ 능력 게이트 표적 재측정(성찰 P7) — **데몬 생존이 확인된 뒤**에만 돈다.
+    #   ① 에서 돌던 종전 배치는 `unknown` 을 만든 그 국면에서 그대로 다시 재는 것이라, 재시도가
+    #   새 정보를 얻지 못했다(게이트는 영원히 미등록이고 부트 로그는 매번 rc 0 = 봉인표 ③ 의
+    #   다른 얼굴). 비치명·90s 상한은 그대로다 — 여기서 실패해도 부트는 계속한다.
+    if _cap_remeasure:
+        _progress("②′ 능력 게이트 판정 불능 표식 — 데몬 생존 확인 뒤 C28 재측정 중(최대 90s · 비치명)…")
+        _cap_rc, _cap_out = _run([py, _cap_remeasure, "--fix", "--only", "C28.self-correction"],
+                                 timeout=90)
+        _cap_after, _ = _capgate_unresolved_state(PACK)
+        log.step(STEP.PREFLIGHT_CAPGATE, _cap_rc,
+                 "미해소 표식(%s) C28 표적 재측정(② ping 성공 뒤) — 표식 %s: %s"
+                 % (_cap_mark, "잔존" if _cap_after else "해소", _cap_out))
+
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
     # ★SEAT(2026-07-17 실사고): 보유자가 '빈 좌석'(role 만 쥔 agent 없는 셸 — cys-dept 가 부서 생성 시

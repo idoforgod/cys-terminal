@@ -377,10 +377,14 @@ def capgate_unresolved(pack=None):
 
     부트 체인(`javis_bootstrap`)이 fast path 조건에 AND 로 넣는다. 판독 실패는 '미해소'로
     읽는다(결측은 값이 아니다 — 표식을 못 읽으면 재측정하는 쪽이 막는 방향이다).
+    ★성찰 P16: 존재 판정도 3값(`_lexists_strict`)이다 — `os.path.exists` 는 EACCES/EIO/ESTALE 를
+    '없다' 로 접어, **있는데 못 보는** 표식이 '해소됨' 이 되고 그 레인은 C28 을 영영 재진입하지
+    않는다(같은 파일의 회수 판정이 이미 버린 접힘 · 결측은 값이 아니다).
     """
     path = capgate_unresolved_path(pack)
-    if not os.path.exists(path):
+    if _lexists_strict(path) is False:          # **증명된** 부재만 '해소됨'
         return False, None
+
     raw = _read_text_tolerant(path)
     if raw is None:
         return True, None
@@ -4466,13 +4470,24 @@ class Preflight:
         #   '판정이 났다' 가 아니라 **'반영까지 확인됐다'** 이다(codex 설계비평 C-1: 훅 부재·
         #   설정 쓰기 실패에도 표식을 지우면 다시 고착된다). report/dry/safe 모드는 상태를
         #   바꾸지 않는다(무변경 계약).
+        # ★성찰 P11: ON 완료 조건에 **deny 프로필 잔존 등록 0** 을 넣는다. 종전엔 허용 프로필만
+        #   봤기 때문에, 표가 deny 한 프로필의 해제(ⓐ)가 실패(잠금·백업·퍼미션)해도 '반영 완료'
+        #   로 접혀 미해소 표식이 지워졌다 — 다음 부팅의 fast path 가 C28 을 생략하고 그 프로필은
+        #   범위 밖 게이트를 문 채 굳는다(pack-capgate-role G9 와 같은 표식·같은 완료 조건 계약).
+        _cap_deny_still = [(t, ev) for (t, ev) in _cap_still if t in _cap_table_off]
         _cap_reflected = (
-            (_cap_state == CAPGATE_ON and _cap_body
+            (_cap_state == CAPGATE_ON and _cap_body and not _cap_deny_still
              and all(self._event_hook_scope_ok(t, ev, CAPGATE_HOOK[0], m)
                      and self._event_hook_registered(t, ev, CAPGATE_HOOK[0],
                                                      hook_timeout_for(CAPGATE_HOOK[0], ev))
                      for t in _cap_allow_targets for ev, m in CAPGATE_HOOK[1]))
             or (_cap_state == CAPGATE_OFF and not _cap_still))
+        if _cap_deny_still and _cap_state == CAPGATE_ON:
+            warns.append("능력 게이트가 대상표 deny 프로필(%s)에 **여전히** 등록돼 있다 — 해제가 "
+                         "끝나지 않았으므로 '반영 완료' 가 아니다(미해소 표식 유지 · 다음 부팅이 "
+                         "C28 을 다시 돈다)"
+                         % ", ".join(sorted({os.path.basename(t) for t, _e in _cap_deny_still})))
+
         if self.fix:
             _cap_mark = capgate_unresolved_path()
             try:
