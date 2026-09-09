@@ -918,6 +918,30 @@ enum QueueAction {
 /// EXIT_UNSAFE_CORE_REFUSED 선례 계열(타입드 거부 — 브리프 확정).
 const EXIT_QUEUE_GATE_REFUSED: i32 = 7;
 
+/// ★(0.14.31 · 성찰 C4ⓑ) `cys node-recover` 의 **전처리 안전 거부** 전용 종료코드.
+///
+/// 【왜 rc 1 이면 안 되는가】 `run_boot` 은 node-recover 의 rc 를 `0`/[`cys::EXIT_GATE_PENDING`]
+/// 두 값만 살려 주고 그 밖은 전부 `escalate_reclaim(role)`(= `javis_boot_node.py --reclaim` =
+/// **kill 경로**)로 내려보낸다. 그런데 node-recover 의 전처리 거부 중 하나는
+/// `agent_alive == Some(true)`("살아 있어 보인다 — 강제 재기동 금지") 다. 즉 죽음 확정 스냅샷과
+/// 이 재관측 사이에 사람이 에이전트를 **다시 띄우면**, 그 자기보호 규칙의 거부가 곧바로
+/// 그 에이전트를 죽이는 방아쇠가 된다(TOCTOU · 치명위험 ④ 정면).
+///
+/// 실패 방향은 "아무것도 하지 않는다" 여야지 "죽인다" 가 아니다(§3-3). 그래서 파괴 체인을
+/// **부르지 않는 것**을 1선으로 두고(reclaim 헬퍼의 hold-first 는 2선으로 남는다), 이 값을 본
+/// `run_boot` 은 escalate 하지 않고 `skipped_unconfirmed` 로 계상한다(Fatal 집합 밖).
+///
+/// 값 79: sysexits 예약대(64–78) **밖**이고 형제 코드(0·1·2·7·75·78)와 겹치지 않는다.
+const EXIT_RECOVER_REFUSED: i32 = 79;
+
+/// 전처리 안전 거부 에러의 머리표 — `is_hold_error` 와 같은 형태의 순수 문자열 계약.
+const RECOVER_REFUSED_TOKEN: &str = "recover-refused:";
+
+/// 이 에러가 **비파괴 전처리 거부**인가(순수 · 회귀 핀 대상).
+fn is_recover_refusal(e: &str) -> bool {
+    e.starts_with(RECOVER_REFUSED_TOKEN)
+}
+
 /// queue.deliver 거부 exit 판정(순수) — request() 에러 문자열("code: message")의 code 접두로
 /// '안전 게이트 거부'(exit 7)와 '오류'(exit 1)를 가른다. 게이트 코드 목록은 데몬
 /// governance::ForceDeliverDenied::code() + handlers "queue.deliver" 게이트 ①②와 1:1 계약 —
@@ -944,11 +968,20 @@ fn queue_deliver_exit_code(err: &str) -> i32 {
 }
 
 /// ★(0.14.31 · WP-5 M) queue.revive / queue.drop 거부 exit 판정(순수) — `queue_deliver_exit_code`
-/// 관례 동형: ACL 거부(revive_denied/drop_denied)·상한(queue_full)·원장(ledger_failed)·kill-switch
-/// (paused)는 exit 7(게이트 거부), 그 밖(not_found·통신)은 1.
+/// 관례 동형: ACL 거부(revive_denied/drop_denied)·상한(queue_full)·원장(ledger_failed)은
+/// exit 7(게이트 거부), 그 밖(not_found·통신)은 1.
+///
+/// ★(0.14.31 · 성찰 C13) `paused` 를 **뺐다**. 이 목록은 계약 문서로도 읽히는데(운영자는
+/// "kill-switch 중에는 revive 가 거부된다" 로 읽는다) 데몬의 `queue.revive`/`queue.drop` arm 에는
+/// pause 게이트가 **없고** `QueueOpDenied::code()` 도 `paused` 를 내지 않는다 — 즉 그 문서는
+/// 거짓이었다. 실제 거동은 "pause 중에도 만료 항목을 활성 큐로 되돌릴 수 있다" 이고, 그것 자체는
+/// 안전하다(되살아난 항목은 배달 틱의 pause 게이트에서 다시 막힌다 — 되살림은 주입이 아니다).
+/// 그래서 여기서는 **없는 코드를 선언하지 않는 쪽**으로 맞춘다. 데몬에 pause 게이트를 넣는
+/// 반대 방향은 `handlers.rs`(이 레인 밖) 변경이라 open item 으로 남긴다.
+/// 드리프트 방어는 `queue_op_gate_codes_match_the_daemon_deny_codes` 가 소스 대조로 건다.
 fn queue_op_exit_code(err: &str) -> i32 {
-    const GATE_CODES: [&str; 5] =
-        ["paused", "revive_denied", "drop_denied", "queue_full", "ledger_failed"];
+    const GATE_CODES: [&str; 4] =
+        ["revive_denied", "drop_denied", "queue_full", "ledger_failed"];
     if GATE_CODES.iter().any(|c| err.starts_with(&format!("{c}:"))) {
         EXIT_QUEUE_GATE_REFUSED
     } else {
@@ -1172,10 +1205,12 @@ mod queue_list_row_tests {
     }
 
     /// ★WP-5: 운영 게이트는 exit 7, 조회 실패·통신 오류는 exit 1로 남겨 자동화의 재시도 분기를 지킨다.
+    /// ★(0.14.31 · 성찰 C13) `paused` 는 **게이트 목록에서 빠졌다** — 데몬의 revive/drop arm 에는
+    /// pause 게이트가 없고 `QueueOpDenied::code()` 도 그 값을 내지 않는다(없는 코드를 계약으로
+    /// 선언하면 운영자가 kill-switch 중 revive 가 막힌다고 오독한다). 아래 음성 대조로 옮긴다.
     #[test]
     fn wp5_queue_op_exit_codes() {
         for err in [
-            "paused: x",
             "revive_denied: x",
             "drop_denied: x",
             "queue_full: x",
@@ -1184,6 +1219,7 @@ mod queue_list_row_tests {
             assert_eq!(queue_op_exit_code(err), 7, "운영 게이트는 exit 7: {err}");
         }
         for err in [
+            "paused: x", // ★C13: 데몬이 이 동사에서 낼 수 없는 코드 — 게이트로 선언하지 않는다
             "not_found: x",
             "connect: y",
             "x queue_full: y",
@@ -7804,6 +7840,15 @@ fn boot_lock_path() -> std::path::PathBuf {
 ///   **별도 프로세스 `cys launch-agent`**  ③ `cys restore`·`node-recover`.
 /// ②·③이 락 **밖**이라 ①과 겹치면 같은 리뷰어를 두 번 스폰하는 창이 열려 있었다(G12).
 /// 그래서 `launch-agent` 도 같은 소켓별 락에 참여시킨다. 두 겹의 재진입 방어:
+///
+/// ★(0.14.31 · 성찰 C11) 이 doc 이 "세 경로" 라고 적어 놓고도 실제 `acquire_launch_lock()` 호출은
+/// `run_launch_agent_opts` **한 곳**뿐이었다 — ③의 두 경로(`cys node-recover` · `cys restore` 의
+/// 좌석 내 재연결)는 `boot_agent_on_surface` 를 직접 부르므로 커버리지 밖이었고, 같은 pane 을 겨눈
+/// 두 호출이 각자 `C-u` + 기동 커맨드를 보내면 화면 파괴·이중 기동이 난다. 지금은 그 두 호출부도
+/// 이 함수를 지난다(락 참여 지점 3곳 · `boot_lock_coverage_includes_recover_and_in_seat_restore` 핀).
+/// 락을 `boot_agent_on_surface` 안으로 **옮기지는 않았다**: `run_launch_agent_opts` 가 이미 밖에서
+/// 쥐고 부르므로 같은 프로세스가 다른 fd 로 flock 을 재획득해 **자기 교착**한다(플래그는 `run_boot`
+/// 만 세운다 — 이 함수의 반환 guard 는 플래그를 세우지 않는다).
 ///   · 프로세스 내부: `BOOT_LOCK_HELD`(run_boot 가 이미 쥔 채 in-process 로 호출한다 — 같은
 ///     프로세스에서 다른 fd 로 flock 을 재획득하면 자기 자신에게 막힌다).
 ///   · 자식 프로세스: `CYS_BOOT_LOCK_HELD=1` env 전파(javis_boot_node 가 띄우는 `cys launch-agent`
@@ -10236,6 +10281,21 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                              "hint": "첫기동 관문(테마·로그인·OAuth·폴더신뢰·면책·새기능안내) 통과 후 재부트 — 좌석과 프로세스는 살아 있다"}));
                         continue;
                     }
+                    // ★(0.14.31 · 성찰 C4ⓑ) 전처리 **안전 거부**(살아 있는 에이전트 관측)는
+                    //   실패가 아니다 — 여기서 escalate 하면 그 거부가 곧 파괴 명령이 된다.
+                    //   죽음 확정 스냅샷 이후 되살아난 좌석이므로 다음 틱 재관측에 맡긴다.
+                    if rc == EXIT_RECOVER_REFUSED {
+                        println!(
+                            "· {agent}: 역할 '{role}' node-recover 안전 거부(재관측에서 에이전트 생존) \
+                             — 회수·파괴·스폰 0(죽음 확정과 재관측 사이에 되살아났다)"
+                        );
+                        outcomes.push(json!({"role": role, "agent": agent,
+                                             "outcome": "skipped_unconfirmed", "mandatory": mandatory,
+                                             "surface_ref": sref, "liveness": "alive_on_recheck",
+                                             "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측",
+                                             "hint": "죽음 확정 이후 되살아난 좌석 — 파괴·중복 스폰 금지(다음 부트가 재관측)"}));
+                        continue;
+                    }
                     println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·hold-first 판정 내장)");
                     escalate_reclaim(role);
                     let after = fetch_surfaces();
@@ -11171,6 +11231,37 @@ fn resolve_resume_suffix(
     Some(arg.replace("{session_id}", id))
 }
 
+/// ★(0.14.31 · 성찰 C7) 붙은 접미가 **정확한 세션 재개**인가 — `[RESUME] 절대지침은 이미 보유
+/// 중` 이 그 좌석에 대해 **참인 진술**인가를 가르는 순수 술어.
+///
+/// 【왜 필요한가】 F-1("fresh 는 정직하게 fresh")은 `resolve_resume_suffix` 안에서 **claude 에만**
+/// 걸려 있다. 그런데 역할 무관 재개는 claude 전용 현상이 아니다:
+///   · gemini `resume_arg: "--continue"` (placeholder 없음) — config dir + cwd 의 **최근 대화**를
+///     역할과 무관하게 이어받는다.
+///   · codex `resume_arg_fallback: "resume --last"` — 세션 id 가 없을 때 붙는데, 뜻이 똑같이
+///     "**마지막** 대화" 다.
+/// 둘 다 감사 에러 2(역할 초기화 실패 = 다른 역할의 대화를 물려받은 좌석)의 **정의 그 자체**이고,
+/// 그 좌석에 가는 `[RESUME] … 절대지침은 이미 보유 중이니 재숙지만 하고` 는 거짓 진술이다 —
+/// 그 노드는 자기 역할 지침을 **한 번도 받지 못한 채** 남의 대화를 이어간다(치명위험 ③).
+///
+/// 【무엇을 바꾸고 무엇을 안 바꾸는가】 접미 문자열은 **그대로 붙인다**(하위호환 · byte-identical —
+/// `--continue` 를 명시적으로 고른 사용자의 선택을 CLI 가 몰래 지우지 않는다). 바뀌는 것은
+/// **디렉티브 선택의 근거**뿐이다(`apply_resume_suffix` 가 세운 '문자열'과 '효력'의 분리를 그대로
+/// 따른다). 실패 방향은 **전문 디렉티브 주입**(= 지침 있는 좌석)이지 작업 유실이 아니다(§3-3).
+///
+/// 【claude 는 불변】 claude 는 이 함수에 오기 전에 `resolve_resume_suffix` 가 세션 **파일 실재**를
+/// 검증했다(F-1 · placeholder 유무 무관). 검증을 통과해 접미가 붙었다면 그것은 정확한 재개이므로
+/// 여기서 다시 좁히지 않는다 — 그래야 `--continue` 를 고른 claude 사용자의 종전 판정이 보존된다.
+fn resume_suffix_is_precise(agent: &str, arg: &str, session_id: Option<&str>) -> bool {
+    if agent == "claude" {
+        return true;
+    }
+    // 타 어댑터는 세션 파일 레이아웃을 검증할 수 없다 → 정확 재개의 유일한 증거는
+    // "**이 좌석의** 세션 id 가 접미에 실제로 치환됐다" 이다.
+    arg.contains("{session_id}")
+        && session_id.map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 /// ★(0.14.31 · F-1 · 리뷰 R2 · codex major) 해소된 resume 접미를 기동 명령에 붙이고 **효력**을 돌려준다.
 ///
 /// 효력(`true`)은 "접미가 `Some` 이었다" 가 아니라 "**비공백 접미가 실제로 붙었다**" 다. `resume_arg: ""`(또는
@@ -11686,7 +11777,11 @@ fn boot_agent_on_surface(
             let fallback = spec["resume_arg_fallback"].as_str().unwrap_or("--continue");
             let resolved = resolve_resume_suffix(agent, arg, session_id, config_dir, cwd, fallback);
             // ★(리뷰 R2 · codex major) 효력은 `Some` 이 아니라 **비공백 접미**다(`apply_resume_suffix` doc).
-            effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref());
+            // ★(성찰 C7) 그 위에 **정확성** 축을 하나 더 AND 한다 — 접미가 붙었어도 그것이
+            //   역할 무관 최근 대화(`--continue`·`resume --last`)면 `[RESUME]` 은 거짓 진술이다.
+            //   `apply_resume_suffix` 는 왼쪽이라 항상 실행된다(문자열 부착은 무조건 · 하위호환).
+            effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref())
+                && resume_suffix_is_precise(agent, arg, session_id);
         }
     }
     if requested_resume && !effective_resume {
@@ -11764,9 +11859,15 @@ fn boot_agent_on_surface(
         "surface.set_meta",
         json!({"surface_id": sid, "agent": agent, "agent_bin": bin}),
     )?;
+    // ★(0.14.31 · 성찰 C12) 기동 로그의 예산 문구는 **판정과 같은 값 1지점**에서 나온다.
+    //   종전 `delay.max(30) * 2` 는 `budget_readiness_max` 를 우회한 마지막 하드코딩 사본이라
+    //   restore(상한 20s)에서 "max 60s" 라고 3배 거짓 보고했다 — 운영자·릴리스 게이트 실측자는
+    //   그 문구를 보고 "아직 폴링 중" 으로 읽지만 실제로는 이미 타임아웃해 gate_pending/
+    //   LaunchFailed 로 갈린 뒤다. 계산을 로그 **위로** 올려 소유자를 하나로 만든다.
+    let max_wait = budget_readiness_max(delay, restore);
+    let max_wait_secs = max_wait.as_secs();
     eprintln!(
-        "[launch-agent] {agent} starting… (polling readiness, max {}s)",
-        delay.max(30) * 2
+        "[launch-agent] {agent} starting… (polling readiness, max {max_wait_secs}s)"
     );
 
     // 2) 준비 감지 폴링: 폴더 신뢰 프롬프트는 자동 확인, ready_marker가 보이면 주입 단계로
@@ -11783,8 +11884,7 @@ fn boot_agent_on_surface(
     //   데드라인만 쓴다. 종전 회계는 틱당 실비용(RPC 왕복 + 2.5s sleep + trust 분기의 추가 sleep,
     //   그중 trust 분기 sleep 은 아예 미집계)이 가정치 2s 와 어긋나 실효 대기가 25%+α 오차났다.
     //   상한은 BUDGET 파생(하드코딩 30/2/20 제거 — javis_budget 와 기계 대조).
-    let max_wait = budget_readiness_max(delay, restore);
-    let max_wait_secs = max_wait.as_secs();
+    //   ★(성찰 C12) `max_wait`/`max_wait_secs` 는 위 기동 로그 직전에서 이미 계산됐다(값 1지점).
     let deadline = std::time::Instant::now() + max_wait;
     let time_fallback_at = std::time::Instant::now() + std::time::Duration::from_secs(delay.max(1));
     let mut ready = false;
@@ -16417,6 +16517,12 @@ fn run_cycle_agent(
 
 /// T2-5 노드 복구: 죽은 에이전트를 같은 surface에서 재기동 + 지침 재주입 + 복원 포인터
 fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
+    // ★(0.14.31 · 성찰 C11) node-recover 도 boot 락에 참여한다 — 이 경로는
+    //   `boot_agent_on_surface` 를 **직접** 부르므로 종전엔 락 밖이었다(doc 은 3경로 커버리지를
+    //   주장했지만 실제 `acquire_launch_lock()` 호출은 launch-agent 한 곳뿐이었다). 같은 pane 을
+    //   겨눈 두 node-recover(또는 node-recover ∥ restore in-seat)가 각자 `C-u` + 기동 커맨드를
+    //   같은 pane 에 보내면 화면 파괴·이중 기동이다.
+    let _recover_lock = acquire_launch_lock();
     let result = (|| -> Result<BootVerdict, String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
         let entry = surface_entry(sid)?;
@@ -16430,8 +16536,12 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             .ok_or("agent 메타 없음 (launch-agent로 기동된 pane만 복구 가능)")?
             .to_string();
         if entry["agent_alive"].as_bool() == Some(true) {
+            // ★(0.14.31 · 성찰 C4ⓑ) 이것은 **오류가 아니라 자기보호 거부**다. 머리표를 달아
+            //   `run_boot` 의 파괴 에스컬레이션에서 갈라낸다(rc 1 로 접으면 이 거부가 곧
+            //   그 살아 있는 에이전트를 죽이는 방아쇠가 된다 — `EXIT_RECOVER_REFUSED` doc).
             return Err(format!(
-                "agent '{agent}'가 살아있는 것으로 보임 — 강제 재기동은 close-surface 후 launch-agent"
+                "{RECOVER_REFUSED_TOKEN} agent '{agent}'가 살아있는 것으로 보임 — 강제 재기동은 \
+                 close-surface 후 launch-agent(죽음 확정 스냅샷 이후 되살아났을 수 있다 · 회수·파괴 0)"
             ));
         }
         // RC-3 잔여(T2.1·codex CONFIRMED): Windows node-recover는 기존 pane에 **순수 cmd**를 재기동한다
@@ -16469,10 +16579,59 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             rec_cfg.as_deref(),
             Some(recover_directive()),
         )?;
-        match &verdict {
+        let verdict = match verdict {
             BootVerdict::Ready => {
-                inject_text(sid, recover_directive())?;
-                println!("recovered surface:{sid} ({agent})");
+                // ★(0.14.31 · 성찰 C4ⓐ) 종전 `inject_text(...)?` 는 **주입 가드의 보류**
+                //   (`HOLD_TOKEN`)를 클로저 밖으로 던져 rc 1 을 냈고, `run_boot` 은 그 값을
+                //   `escalate_reclaim`(kill)으로 번역했다 — 정상 복구된 좌석을 죽이려 들고,
+                //   2선 방어가 그것을 막으면 이번엔 `outcome:"failed"`(의무면 fatal) 라는
+                //   **거짓 보고**가 남았다. 게다가 판정이 `Ready` 였으므로 `mark_gate_pending`
+                //   은 호출되지 않았고 `inject_directive_after_ready` 는 이미
+                //   `clear_gate_pending` 했다 — `[RECOVER]` 는 **유실**됐다.
+                //   같은 구문이 `run_restore` 두 자리에서는 이미 `if let Err(e)` + 경고로
+                //   고쳐져 있다(N7). 여기만 종전 `?` 를 유지했다 — 같은 철자로 맞춘다.
+                //   U-11 계약: `Err` 머리표가 `HOLD_TOKEN` 이면 그것은 **보류이지 파괴 근거가
+                //   아니다**. 보류는 표식으로 접어 지시를 이월시키고 rc 78 을 낸다.
+                match inject_text(sid, recover_directive()) {
+                    Ok(()) => {
+                        println!("recovered surface:{sid} ({agent})");
+                        BootVerdict::Ready
+                    }
+                    Err(e) if cys::inject_guard::is_hold_error(&e) => {
+                        eprintln!("[node-recover] {e}");
+                        // 진단 문안 전용 — 판정이 아니라 에러 본문이라 관측 실패의 빈 문자열이 정확하다.
+                        let tail =
+                            screen_tail_lines(&gate_guard_screen(sid).unwrap_or_default(), 5);
+                        let v = settle_gate_pending(
+                            sid,
+                            GATE_ID_INJECT_HELD,
+                            tail,
+                            gate_close_override_once(),
+                            // ★[RECOVER] 를 표식에 **이월**한다 — 그러지 않으면 다음 부트가
+                            //   `already_alive` 로 접어 이 노드는 복구 프로토콜 지시를 한 번도
+                            //   받지 못한다.
+                            Some(recover_directive()),
+                        );
+                        if let BootVerdict::GatePending { gate, tail } = &v {
+                            print_gate_pending_prescription(sid, &role_name, &agent, gate, tail);
+                            println!(
+                                "gate-pending surface:{sid} ({agent}) — 재기동은 됐고 주입만 보류 \
+                                 · [RECOVER] 이월 · 회수 0 · 파괴 0(사람 1회 조치 대기)"
+                            );
+                        }
+                        v
+                    }
+                    Err(e) => {
+                        // 보류가 아닌 주입 실패는 정직히 알리되 **파괴로 번역하지 않는다**
+                        //  — 좌석은 살아 있고 재기동 자체는 성공했다(run_restore 와 같은 철자).
+                        eprintln!(
+                            "· {role_name}: 재기동은 됐으나 **복구 디렉티브 미주입** \
+                             (좌석 보존 · 회수 0) — {e}"
+                        );
+                        println!("recovered surface:{sid} ({agent}) — 디렉티브 미주입");
+                        BootVerdict::Ready
+                    }
+                }
             }
             // ★(U-11) 이 호출부의 귀결은 launch 와 **다르다** — 여기엔 닫을 새 surface 가 없다.
             //   대신 이 경로의 실패는 `run_boot` 에서 `escalate_reclaim`(=kill)으로 자동
@@ -16481,13 +16640,14 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             //   주입도 하지 않는다: 관문 창에 `[RECOVER]` 를 밀어 넣는 것은 화면 파괴이고,
             //   그 붙여넣기의 Return 이 실측상 면책 창의 종료 버튼을 누른다.
             BootVerdict::GatePending { gate, tail } => {
-                print_gate_pending_prescription(sid, &role_name, &agent, gate, tail);
+                print_gate_pending_prescription(sid, &role_name, &agent, &gate, &tail);
                 println!(
                     "gate-pending surface:{sid} ({agent}) — 좌석 보존 · 주입 0 · 회수 0(사람 1회 조치 대기)"
                 );
+                BootVerdict::GatePending { gate, tail }
             }
-            BootVerdict::LaunchFailed { .. } => {}
-        }
+            v @ BootVerdict::LaunchFailed { .. } => v,
+        };
         Ok(verdict)
     })();
     match result {
@@ -16497,6 +16657,11 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         Ok(BootVerdict::LaunchFailed { evidence }) => {
             eprintln!("error: {evidence}");
             1
+        }
+        // ★(0.14.31 · 성찰 C4ⓑ) 전처리 안전 거부는 **비파괴 전용 코드**로 나간다.
+        Err(e) if is_recover_refusal(&e) => {
+            eprintln!("node-recover 안전 거부: {e}");
+            EXIT_RECOVER_REFUSED
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -16630,6 +16795,13 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                     }
                 };
                 let seat_cwd = target_cwd.clone();
+                // ★(0.14.31 · 성찰 C11) 좌석 내 재연결도 boot 락에 참여한다 — 이 경로는
+                //   `boot_agent_on_surface` 를 **직접** 부르므로 종전엔 락 밖이었다. 같은 pane 을
+                //   겨눈 두 `cys restore`(또는 restore ∥ node-recover)가 각자 `C-u` + 기동 커맨드를
+                //   보내면 화면 파괴·이중 기동이다. 가드는 이 블록 수명이다 — 아래 fresh 폴백의
+                //   `run_launch_agent_opts` 가 같은 락을 다시 잡으므로(자기 교착 방지) 그 전에
+                //   반드시 drop 돼야 한다(블록 끝 · `continue` 둘 다 여기서 벗어난다).
+                let _seat_lock = acquire_launch_lock();
                 match boot_agent_on_surface(
                     sid,
                     role,
@@ -16637,7 +16809,16 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                     &spec,
                     !no_resume,
                     sess.as_deref(),
-                    false,
+                    // ★(0.14.31 · 성찰 C5) 좌석 내 재연결도 **restore** 다. 종전 `false` 는 두 가지를
+                    //   한꺼번에 잃었다: ① `apply_config_dir_override` 가 꺼져 기록된 `claude_config_dir`
+                    //   이 기동 문자열에 리터럴로 박히지 않는다 → pane 셸이 `${CYS_ACCOUNT_DIR:-…}` 를
+                    //   전개하므로 데몬 재기동으로 값이 바뀐 경우 `resolve_resume_suffix` 는 **기록된**
+                    //   cfg 로 세션 파일을 찾아 `--resume <id>` 를 붙이는데 claude 는 **다른** 계정 dir 로
+                    //   뜬다 = `effective_resume=true` 인데 지침 0 인 좌석(치명위험 ③).
+                    //   ② `budget_readiness_max` 의 restore 캡(20s)이 **선호 경로인 in-seat 에서만** 빠져
+                    //   5좌석이면 100s 대신 300s — DRILL_LIVE_1 이 막으려던 로스터 stall 그대로다.
+                    //   fresh 폴백(`run_launch_agent_opts(..., restore=true, ...)`)과 같은 규칙으로 맞춘다.
+                    true,
                     seat_cwd.as_deref(),
                     cfg.as_deref(),
                     Some(restore_directive(role)),
@@ -26326,7 +26507,9 @@ mod tests {
         for anchor in [
             "let requested_resume = resume;",
             "let mut effective_resume = false;",
-            "effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref());",
+            // ★(성찰 C7) 효력 = 비공백 접미 ∧ **정확 재개**(역할 무관 `--continue`/`resume --last` 제외).
+            "effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref())",
+            "&& resume_suffix_is_precise(agent, arg, session_id);",
             "let directive = boot_directive_for(role, effective_resume)?;",
             "if requested_resume && !effective_resume {",
         ] {
@@ -29537,6 +29720,244 @@ mod tests {
         assert_eq!(
             send_body_from_bytes(&parts, Some(b"raw wins\n")).expect("전문 본문"),
             "raw wins"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ★(0.14.31 · 성찰 반영 · AREA cli-boot) C4·C5·C7·C11·C12·C13 회귀 핀
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// 열 0 `fn <name>(` 정의부부터 열 0 닫는 중괄호까지의 본문 슬라이스(형제 핀과 같은 방식).
+    fn refl_fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let head = format!("\nfn {name}(");
+        let i = src.find(&head).unwrap_or_else(|| panic!("{name} 이 사라졌다"));
+        let rest = &src[i + 1..];
+        let end = rest.find("\n}\n").map(|e| e + 2).expect("함수 끝");
+        &rest[..end]
+    }
+
+    /// ★C12: 기동 로그의 readiness 예산 문구가 **판정과 같은 값 1지점**에서 나온다.
+    ///
+    /// 종전 `delay.max(30) * 2` 는 `budget_readiness_max` 를 우회한 마지막 하드코딩 사본이라
+    /// restore(캡 20s)에서 "max 60s" 라고 3배 거짓 보고했다. 개정 전 소스에서는 적색이다.
+    #[test]
+    fn c12_launch_log_prints_the_budget_derived_readiness_max() {
+        // ① 값 자체 — restore 는 캡 20s, 비-restore 는 base(=max(10,30)*2=60s).
+        assert_eq!(budget_readiness_max(10, true).as_secs(), 20, "restore 캡이 20s 가 아니다");
+        assert_eq!(budget_readiness_max(10, false).as_secs(), 60);
+        // ② 배선 — 계산이 로그보다 **앞**이고, 로그가 그 값을 인쇄한다.
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "boot_agent_on_surface");
+        let calc = body
+            .find("let max_wait = budget_readiness_max(delay, restore);")
+            .expect("예산 계산이 사라졌다");
+        let log = body
+            .find("(polling readiness, max {max_wait_secs}s)")
+            .expect("기동 로그가 예산 값을 인쇄하지 않는다");
+        assert!(calc < log, "예산 계산이 로그보다 뒤에 있다 — 로그가 값을 인쇄할 수 없다");
+        // 종전 포맷 리터럴(`max {}s` + 하드코딩 인자)이 사라졌는지로 잰다 —
+        // 위 doc 주석이 그 산식을 **인용**하므로 소스 문면 검색은 주석에 걸린다.
+        assert!(
+            !body.contains("(polling readiness, max {}s)"),
+            "하드코딩 예산 문구가 남아 있다(restore 에서 3배 거짓 보고)"
+        );
+    }
+
+    /// ★C13: `queue_op_exit_code` 의 게이트 코드 목록이 **데몬이 실제로 내는 코드**와 일치한다.
+    ///
+    /// 종전 목록은 `paused` 를 선언했지만 `queue.revive`/`queue.drop` arm 에는 pause 게이트가
+    /// 없고 `QueueOpDenied::code()` 도 그 값을 내지 않는다 — 계약 문서가 거짓이었다(운영자는
+    /// "kill-switch 중 revive 는 거부된다" 로 읽는다). 실제 rc 를 단언하고, 소스 대조로 드리프트를 막는다.
+    #[test]
+    fn c13_queue_op_gate_codes_match_the_daemon_deny_codes() {
+        // ① 실제 rc — pause 문면이 와도 게이트 거부(7)가 아니라 일반 오류(1)다.
+        //    (데몬이 그 코드를 낼 수 없으므로 7 로 선언하는 것 자체가 거짓 계약이었다.)
+        assert_eq!(queue_op_exit_code("paused: kill-switch engaged"), 1);
+        // ② 데몬이 실제로 내는 코드는 그대로 게이트 거부(7)다 — 무회귀.
+        for c in ["revive_denied", "drop_denied", "queue_full", "ledger_failed"] {
+            assert_eq!(
+                queue_op_exit_code(&format!("{c}: x")),
+                EXIT_QUEUE_GATE_REFUSED,
+                "{c} 가 게이트 거부에서 빠졌다"
+            );
+        }
+        assert_eq!(queue_op_exit_code("not_found: x"), 1);
+        // ③ 소스 대조 — 데몬의 revive/drop arm 과 `QueueOpDenied::code()` 어디에도 `paused` 가 없다.
+        let gov = include_str!("cysd/governance.rs");
+        let ci = gov.find("fn code(&self) -> &'static str {").expect("QueueOpDenied::code 가 사라졌다");
+        let cbody = &gov[ci..ci + gov[ci..].find("\n    }\n").expect("code() 끝")];
+        assert!(
+            !cbody.contains("\"paused\""),
+            "데몬이 revive/drop 에서 paused 를 내기 시작했다 — CLI 목록에 다시 넣어라(C13 반대 방향)"
+        );
+        for c in ["revive_denied", "drop_denied", "queue_full", "ledger_failed"] {
+            let seen = cbody.contains(&format!("\"{c}\""))
+                || include_str!("cysd/handlers.rs")
+                    [{
+                        let h = include_str!("cysd/handlers.rs");
+                        let a = h.find("\"queue.revive\" | \"queue.drop\" => {").expect("revive/drop arm");
+                        let b = h.find("\n        \"queue.clear\" => {").expect("queue.clear arm");
+                        a..b
+                    }]
+                    .contains(&format!("\"{c}\""));
+            assert!(seen, "CLI 가 선언한 게이트 코드 '{c}' 를 데몬 어디에서도 찾지 못했다");
+        }
+    }
+
+    /// ★C11: boot 락 커버리지 주석과 배선이 일치한다 — 세 경로가 **모두** 락에 참여한다.
+    ///
+    /// 종전에는 `acquire_launch_lock()` 호출이 `run_launch_agent_opts` 하나뿐이라
+    /// node-recover·restore in-seat 가 같은 pane 을 동시에 겨눌 수 있었다(화면 파괴·이중 기동).
+    #[test]
+    fn c11_boot_lock_coverage_includes_recover_and_in_seat_restore() {
+        let src = include_str!("cys.rs");
+        assert!(
+            refl_fn_body(src, "run_launch_agent_opts").contains("acquire_launch_lock()"),
+            "launch-agent 경로의 락 참여가 사라졌다"
+        );
+        assert!(
+            refl_fn_body(src, "run_node_recover").contains("acquire_launch_lock()"),
+            "node-recover 가 boot 락 밖이다 — 같은 pane 동시 기동이 가능하다"
+        );
+        let restore = refl_fn_body(src, "run_restore");
+        assert!(
+            restore.contains("acquire_launch_lock()"),
+            "restore in-seat 가 boot 락 밖이다 — 같은 pane 동시 기동이 가능하다"
+        );
+        // in-seat 가드는 fresh 폴백보다 **앞**에서 잡히고, 그 호출부보다 앞에 있어야 한다
+        // (같은 프로세스가 다른 fd 로 재획득하면 자기 교착 — 블록 수명으로 drop 된다).
+        let lock_at = restore.find("let _seat_lock = acquire_launch_lock();").expect("in-seat 락 바인딩");
+        let fresh_at = restore.find("run_launch_agent_opts(").expect("fresh 폴백 호출부");
+        assert!(lock_at < fresh_at, "in-seat 락이 fresh 폴백 뒤에 있다 — 배선이 뒤집혔다");
+    }
+
+    /// ★C5: `cys restore` 의 좌석 내 재연결이 **restore 정책 두 축을 모두** 쓴다.
+    ///
+    /// 종전 `restore=false` 는 ⓐ 계정 dir 리터럴 인라인(`apply_config_dir_override`)과
+    /// ⓑ readiness 예산 캡(20s)을 **둘 다** 잃었다. 두 축을 함께 핀한다.
+    #[test]
+    fn c5_in_seat_restore_carries_the_config_dir_and_the_budget_cap() {
+        // ⓐ 기록된 config_dir 이 restore=true 에서만 리터럴로 인라인된다.
+        let mut pairs = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "${CYS_ACCOUNT_DIR:-/x}".to_string()),
+            ("OTHER".to_string(), "keep".to_string()),
+        ];
+        apply_config_dir_override(&mut pairs, false, Some("/acct/dept-1"));
+        assert_eq!(pairs[0].1, "${CYS_ACCOUNT_DIR:-/x}", "restore=false 는 종전대로 무변경");
+        apply_config_dir_override(&mut pairs, true, Some("/acct/dept-1"));
+        assert_eq!(pairs[0].1, "/acct/dept-1", "restore=true 인데 리터럴 인라인이 안 됐다");
+        assert_eq!(pairs[1].1, "keep", "다른 키를 건드렸다");
+        // ⓑ 예산 캡.
+        assert_eq!(budget_readiness_max(10, true).as_secs(), 20);
+        // ⓒ 배선 — in-seat 호출부가 `restore` 자리에 `true` 를 넘긴다(fresh 폴백과 같은 규칙).
+        let src = include_str!("cys.rs");
+        let restore = refl_fn_body(src, "run_restore");
+        let call = restore.find("match boot_agent_on_surface(").expect("in-seat 호출부");
+        let seg = &restore[call..call + restore[call..].find(") {").expect("호출부 끝")];
+        assert!(
+            seg.contains("sess.as_deref(),") && seg.contains("seat_cwd.as_deref(),"),
+            "in-seat 호출부 슬라이스가 어긋났다:\n{seg}"
+        );
+        assert!(
+            !seg.contains("\n                    false,\n"),
+            "in-seat 가 아직 restore=false 를 넘긴다 — 계정 dir 인라인과 20s 캡을 둘 다 잃는다:\n{seg}"
+        );
+        assert!(
+            seg.contains("\n                    true,\n"),
+            "in-seat 의 restore 인자가 true 가 아니다:\n{seg}"
+        );
+    }
+
+    /// ★C7: 역할 무관 재개 접미(`--continue`·`resume --last`)는 `[RESUME]` 을 정당화하지 않는다.
+    ///
+    /// F-1 의 "fresh 는 정직하게 fresh" 가 claude 전용이라 gemini·codex 좌석에는 감사 에러 2
+    /// (역할 무관 최근 대화 상속 + 거짓 `[RESUME]`)가 그대로 살아 있었다. 접미 문자열은 그대로
+    /// 붙이고(하위호환) **디렉티브 선택의 근거만** 바꾼다.
+    #[test]
+    fn c7_role_agnostic_resume_suffixes_do_not_claim_a_restored_context() {
+        // ① gemini: placeholder 없는 `--continue` = 최근 대화 상속 → 정확 재개가 아니다.
+        assert!(!resume_suffix_is_precise("gemini", "--continue", None));
+        assert!(!resume_suffix_is_precise("gemini", "--continue", Some("abc")));
+        // ② codex: 세션 id 가 있으면 정확 재개, 없으면(폴백 `resume --last`) 아니다.
+        assert!(resume_suffix_is_precise("codex", "resume {session_id}", Some("abc")));
+        assert!(!resume_suffix_is_precise("codex", "resume {session_id}", None));
+        assert!(!resume_suffix_is_precise("codex", "resume {session_id}", Some("  ")));
+        assert!(!resume_suffix_is_precise("codex", "resume --last", Some("abc")));
+        // ③ claude 는 **불변** — 세션 파일 실재를 이미 검증하고 온 자리라 여기서 다시 좁히지 않는다.
+        assert!(resume_suffix_is_precise("claude", "--resume {session_id}", Some("abc")));
+        assert!(resume_suffix_is_precise("claude", "--continue", None));
+        // ④ 귀결 — 정확한 재개만 `[RESUME]` 이고, 그 밖은 `compose_directive`(전문) 경로다.
+        //    (전문 분기는 팩 파일(`directives/*.md`)을 읽으므로 여기서 실행하지 않는다 —
+        //     선택 자체는 `boot_directive_for` 소스가 소유하고 형제 핀이 그것을 잰다.)
+        let resumed = boot_directive_for("worker-1", true).expect("resume 디렉티브");
+        assert!(resumed.starts_with("[RESUME]"));
+        let src0 = include_str!("cys.rs");
+        let choose = refl_fn_body(src0, "boot_directive_for");
+        assert!(
+            choose.contains("if effective_resume {") && choose.contains("compose_directive(role)"),
+            "전문 분기가 사라졌다 — 정확하지 않은 재개가 [RESUME] 로 접힌다"
+        );
+        // ⑤ 배선 — 효력 판정이 두 술어의 AND 이고, 문자열 부착은 무조건이다(왼쪽 피연산자).
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "boot_agent_on_surface");
+        assert!(
+            body.contains("apply_resume_suffix(&mut cmd, resolved.as_deref())\n                && resume_suffix_is_precise(agent, arg, session_id);"),
+            "효력 판정에 정확성 축이 AND 되지 않았다"
+        );
+    }
+
+    /// ★C4: `node-recover` 의 두 **비파괴 사유**가 파괴 에스컬레이션을 부르지 않는다.
+    ///
+    /// ⓐ 주입 가드의 보류(HOLD)는 `?` 로 흘러 rc 1 → `escalate_reclaim`(kill) 이었다.
+    ///    지금은 표식(`GATE_ID_INJECT_HELD`) + `[RECOVER]` 이월 + rc 78 이다.
+    /// ⓑ `agent_alive == Some(true)` 전처리 안전 거부도 rc 1 → kill 이었다(TOCTOU: 죽음 확정
+    ///    스냅샷 뒤 사람이 다시 띄운 에이전트를 그 자기보호 규칙이 죽인다).
+    #[test]
+    fn c4_node_recover_nondestructive_reasons_do_not_reach_the_kill_path() {
+        // ① 종료코드 계약 — 예약 exit·형제 코드와 겹치지 않는다.
+        assert_eq!(EXIT_RECOVER_REFUSED, 79);
+        for reserved in [0, 1, 2, EXIT_QUEUE_GATE_REFUSED, EXIT_BOOT_BUSY, cys::EXIT_GATE_PENDING] {
+            assert_ne!(EXIT_RECOVER_REFUSED, reserved, "79 가 형제 exit 과 충돌: {reserved}");
+        }
+        // ② 순수 술어 — 머리표 있는 것만 비파괴 거부다(다른 에러는 종전대로 rc 1).
+        assert!(is_recover_refusal(&format!("{RECOVER_REFUSED_TOKEN} agent 'claude'가 살아있음")));
+        assert!(!is_recover_refusal("surface:7 셸 자체가 종료됨"));
+        assert!(!is_recover_refusal(""));
+        // 보류 머리표와는 **다른 축**이다(둘을 섞으면 처방이 갈리지 않는다).
+        assert!(!is_recover_refusal(cys::inject_guard::HOLD_TOKEN));
+        let src = include_str!("cys.rs");
+        let rec = refl_fn_body(src, "run_node_recover");
+        // ③ⓐ Ready 팔이 보류를 `?` 로 흘리지 않는다 — 갈라서 표식으로 접고 지시를 이월한다.
+        assert!(
+            !rec.contains("inject_text(sid, recover_directive())?;"),
+            "Ready 팔이 아직 보류를 `?` 로 흘린다 — rc 1 → escalate_reclaim(kill)"
+        );
+        for anchor in [
+            "cys::inject_guard::is_hold_error(&e)",
+            "GATE_ID_INJECT_HELD",
+            "Some(recover_directive()),",
+            "gate_close_override_once(),",
+        ] {
+            assert!(rec.contains(anchor), "보류 접기 배선 결손: {anchor}");
+        }
+        // ③ⓑ 전처리 안전 거부가 머리표를 달고 전용 코드로 나간다.
+        assert!(rec.contains("{RECOVER_REFUSED_TOKEN} agent"), "안전 거부에 머리표가 없다");
+        assert!(rec.contains("EXIT_RECOVER_REFUSED"), "안전 거부가 전용 코드로 나가지 않는다");
+        // ④ run_boot 이 그 값에서 **escalate 하지 않는다** — 분기가 파괴 호출보다 앞이다.
+        let boot = refl_fn_body(src, "run_boot");
+        let guard = boot
+            .find("if rc == EXIT_RECOVER_REFUSED {")
+            .expect("run_boot 에 비파괴 거부 분기가 없다");
+        let kill = boot.find("escalate_reclaim(role);").expect("escalate 호출부");
+        assert!(guard < kill, "비파괴 거부 분기가 escalate 뒤에 있다 — 값이 파괴 경로를 그대로 탄다");
+        // 그 분기의 outcome 은 Fatal 집합 밖이다(거짓 실패 보고 금지).
+        let seg = &boot[guard..kill];
+        assert!(seg.contains("\"outcome\": \"skipped_unconfirmed\""), "비파괴 거부가 실패로 계상된다:\n{seg}");
+        assert_eq!(
+            boot_summary_buckets(&[json!({"role":"x","outcome":"skipped_unconfirmed","mandatory":true})])
+                ["fatal_failed"],
+            json!(0),
+            "안전 거부가 의무 실패로 집계된다"
         );
     }
 }
