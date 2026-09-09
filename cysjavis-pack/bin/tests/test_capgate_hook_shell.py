@@ -658,6 +658,14 @@ class NegativeControls(unittest.TestCase):
         ("리다이렉트 대상 변수 해소(G4)",
          "        _rt = _resolve_token(target, ctx)\n",
          "        _rt = target\n"),
+        # ★0.14.31 성찰 G13 — 하위 명령 allowlist 를 지우면 `bun add` 가 다시 샌다.
+        ("패키지 도구 하위 명령 allowlist(G13)",
+         "    subs = PKG_TOOL_VERIFY_SUBS.get(base)\n    if subs is None or sub not in subs:\n",
+         "    subs = PKG_TOOL_VERIFY_SUBS.get(base)\n    if False:\n"),
+        # 러너 설치 옵션은 실행 대상 **앞**에서만 본다 — 그 검사를 지우면 `npx --yes` 가 샌다.
+        ("러너 설치 옵션(G13)",
+         "        if any(a == o or a.startswith(o + \"=\") for o in PKG_RUNNER_INSTALL_OPTS):\n            return True\n",
+         "        if False:\n            return True\n"),
     ]
 
     @NEED_SH

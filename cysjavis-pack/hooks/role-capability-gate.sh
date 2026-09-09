@@ -373,7 +373,41 @@ WRITE_SHELL_CMDS = {
     "ln", "mkdir", "rmdir", "touch", "sed",  # sed -i 등
 }
 # 패키지/빌드 설치자(상태 변형) — 대표만. git은 서브커맨드로 별도 판정(읽기 전용 다수).
-WRITE_SHELL_INSTALLERS = {"npm", "pip", "pip3", "make", "apt", "brew"}
+#   `uvx` 는 항상 패키지를 내려받아 실행한다(설치 없는 형태가 없다) → 통째로 막는다.
+WRITE_SHELL_INSTALLERS = {"pip", "pip3", "make", "apt", "brew", "uvx"}
+# ★패키지 관리자·러너는 **하위 명령으로** 가른다(0.14.31 성찰 G13 · cargo/go 와 같은 처리).
+#   종전 `WRITE_SHELL_INSTALLERS` 의 `npm` 한 항목은 이 저장소의 실제 JS 툴체인을 빗나갔다
+#   (ui/package.json: `bun test`·`bunx tsc`) — `bun add`·`bunx --yes <pkg>`·`uv pip install`·
+#   `pipx run` 은 전부 ALLOW(lockfile·캐시 변형 = producer≠evaluator 위반)였고, 정당한 검증
+#   `npm run typecheck` 는 DENY 였다. 완화의 뜻은 cargo/go 머리말과 같다 — 여기서 막는 것은
+#   **명령 수준의 설치·변형**뿐이고 `npm run <script>`·`bun test` 의 본문은 신뢰 실행이다
+#   (사후 diff 가 탐지 수단이지 예방 장치가 아니다). 목록 밖·하위 명령 없음은 거부 방향이다
+#   (`yarn` 단독 = install).
+PKG_TOOL_VERIFY_SUBS = {
+    "npm":  {"run", "run-script", "test", "t", "tst", "ls", "list", "ll", "view", "info", "show",
+             "v", "outdated", "explain", "why", "ping", "prefix", "root", "bin"},
+    "bun":  {"test", "run"},                      # `bun x` 는 아래 러너 축
+    "pnpm": {"run", "test", "t", "tst", "ls", "list", "why", "outdated"},
+    "yarn": {"run", "test", "why", "info", "list"},
+    "uv":   {"tree", "pip"},                      # `uv run`/`sync` 는 .venv·lock 동기화 = 쓰기
+    "pipx": {"list"},
+}
+# `uv pip <이것>` 만 조회다(`install`·`sync`·`uninstall`·`compile` 은 밖).
+UV_PIP_RO_SUBS = {"list", "freeze", "show", "check", "tree"}
+# 값을 먹는 **전역** 옵션(하위 명령 앞) — 값을 건너뛰지 않으면 그 값이 하위 명령으로 오인된다.
+PKG_TOOL_VALUE_OPTS = {
+    "npm":  {"--prefix", "-C", "--workspace", "-w", "--registry", "--loglevel", "--cache",
+             "--userconfig"},
+    "pnpm": {"-C", "--dir", "--filter", "-F"},
+    "yarn": {"--cwd"},
+    "bun":  {"--cwd", "--filter"},
+    "uv":   {"--directory", "--project", "--python", "-p"},
+}
+# ★러너(`npx`·`bunx`·`bun x`)는 하위 명령이 아니라 **실행 대상**을 받는다. 러너 자신의 옵션은
+#   실행 대상 **앞**에만 온다 — `npx tsc -p tsconfig.json` 의 `-p` 는 tsc 의 옵션이지 npx 의
+#   `--package` 가 아니다. 그래서 첫 비-옵션 토큰 앞의 설치 옵션만 본다.
+PKG_RUNNERS = {"npx", "bunx"}
+PKG_RUNNER_INSTALL_OPTS = ("--yes", "-y", "--package", "-p")
 # cargo/go 는 하위 명령으로 가른다(0.14.31 완화 — 아래 계약을 정확히 읽어라).
 WRITE_SHELL_BUILDERS = {"cargo", "go"}
 # ★reviewer 검증 실행 완화(0.14.31 · 별 커밋) — **완화의 뜻을 정직하게 적는다**:
@@ -465,6 +499,57 @@ BUILDER_SUB_WRITE_OPTS = {("go", "env"): ("-w", "-u"),
 BUILDER_SUB_REQUIRE_OPTS = {("cargo", "fmt"): ("--check",)}
 # 빌드 산출물을 **임의 경로로 내보내는** 옵션은 리다이렉트와 같은 부류다(대상이 허용 경로여야 한다).
 BUILDER_OUT_OPTS = ("-o", "--out-dir", "--output", "--target-dir")
+
+
+def _runner_installs(args):
+    """러너 인자열에서 **실행 대상 앞**의 설치 옵션(`--yes`·`-y`·`--package`·`-p`)이 있는가."""
+    for a in args:
+        if a == "--":
+            return False
+        if not a.startswith("-"):
+            return False                 # 실행 대상 — 그 뒤는 대상 프로그램의 옵션이다
+        if any(a == o or a.startswith(o + "=") for o in PKG_RUNNER_INSTALL_OPTS):
+            return True
+    return False
+
+
+def pkg_is_write(base, tokens, i):
+    """npm/bun/pnpm/yarn/uv/pipx/npx/bunx 세그먼트가 **명령 수준 설치·변형**인가(0.14.31 성찰 G13).
+    해석 불가·목록 밖 하위 명령·하위 명령 없음은 True(거부 방향)."""
+    value_opts = PKG_TOOL_VALUE_OPTS.get(base, frozenset())
+    n = len(tokens)
+    j = i + 1
+    sub = None
+    rest = []
+    while j < n:
+        t = tokens[j]
+        if is_separator(t) or _is_redirect_op(t):
+            break
+        if sub is None:
+            _gopt = next((o for o in value_opts if t == o or t.startswith(o + "=")), None)
+            if _gopt is not None:
+                j += 1 if "=" in t else 2    # 옵션 **값**은 하위 명령이 아니다
+                continue
+            if t.startswith("-") or t.startswith("+"):
+                j += 1
+                continue
+            sub = t
+        else:
+            rest.append(t)
+        j += 1
+    if base in PKG_RUNNERS:
+        return _runner_installs([tokens[k] for k in range(i + 1, j)])
+    if sub is None:
+        return True                      # `yarn`/`bun` 단독 = install
+    if base == "bun" and sub == "x":
+        return _runner_installs(rest)
+    subs = PKG_TOOL_VERIFY_SUBS.get(base)
+    if subs is None or sub not in subs:
+        return True
+    if base == "uv" and sub == "pip":
+        sub2 = next((r for r in rest if not r.startswith("-")), None)
+        return sub2 not in UV_PIP_RO_SUBS
+    return False
 
 
 def builder_is_write(base, tokens, i):
@@ -1643,6 +1728,13 @@ def bash_write_reason(command, _depth=0):
                 if builder_is_write(base, tokens, i):
                     return True, ("빌드 도구 `%s` 세그먼트가 명령 수준 변형이다(모르는 하위 "
                                   "명령·쓰기 옵션·실행기 주입)" % base)
+                cmd_pos = False
+                i += 1
+                continue
+            if base in PKG_TOOL_VERIFY_SUBS or base in PKG_RUNNERS:
+                if pkg_is_write(base, tokens, i):
+                    return True, ("패키지 도구 `%s` 세그먼트가 명령 수준 설치·변형이다(설치 하위 "
+                                  "명령·러너 설치 옵션·모르는 하위 명령)" % base)
                 cmd_pos = False
                 i += 1
                 continue
@@ -3825,6 +3917,53 @@ def self_test_r2(fails):
          "중첩 중괄호가 감춘 tail -f")
     want(False, "Bash", {"command": "cys send --queued --to master '{a,b} 는 본문이다'"},
          "인용 안 중괄호는 여전히 본문이다(오탐 금지)")
+    # ⑯ ★패키지 도구 하위 명령 축(0.14.31 성찰 G13) — 이 저장소의 실제 툴체인으로 잰다.
+    for _c, _exp, _lab in (
+            ("bun add left-pad", True, "bun add = lockfile 변형"),
+            ("bun install", True, "bun install"),
+            ("bun", True, "bun 단독"),
+            ("bunx --yes cowsay hi", True, "bunx --yes = 내려받아 실행"),
+            ("bun x --yes cowsay hi", True, "bun x --yes"),
+            ("npx --yes cowsay hi", True, "npx --yes"),
+            ("npx -y cowsay hi", True, "npx -y"),
+            ("npx --package=cowsay cowsay hi", True, "npx --package="),
+            ("npx -p cowsay cowsay hi", True, "npx -p"),
+            ("uv pip install requests", True, "uv pip install"),
+            ("uv run pytest", True, "uv run 은 .venv·lock 동기화"),
+            ("uv sync", True, "uv sync"),
+            ("uvx ruff check .", True, "uvx 는 항상 내려받는다"),
+            ("pipx run cowsay hi", True, "pipx run"),
+            ("pipx install cowsay", True, "pipx install"),
+            ("pnpm add left-pad", True, "pnpm add"),
+            ("pnpm dlx cowsay hi", True, "pnpm dlx"),
+            ("yarn", True, "yarn 단독 = install"),
+            ("yarn add left-pad", True, "yarn add"),
+            ("yarn dlx cowsay hi", True, "yarn dlx"),
+            ("npm install", True, "npm install(종전 배터리와 같은 방향)"),
+            ("npm i left-pad", True, "npm i"),
+            ("npm ci", True, "npm ci"),
+            ("npm audit fix", True, "npm audit fix"),
+            ("npm exec -- cowsay hi", True, "npm exec"),
+            ("npm version patch", True, "npm version 은 package.json 을 고친다"),
+            ("npm run typecheck", False, "npm run typecheck(정당한 검증)"),
+            ("npm test", False, "npm test"),
+            ("npm --prefix ui run typecheck", False, "값 옵션 뒤의 run"),
+            ("npm ls", False, "npm ls"),
+            ("bun test", False, "bun test"),
+            ("bun run typecheck", False, "bun run"),
+            ("bunx tsc -p tsconfig.check.json", False, "bunx tsc -p = tsc 의 -p 이지 npx --package 가 아니다"),
+            ("npx tsc --noEmit -p tsconfig.json", False, "npx tsc -p 도 같다"),
+            ("bun x tsc -p tsconfig.check.json", False, "bun x tsc -p"),
+            ("uv pip list", False, "uv pip list"),
+            ("uv tree", False, "uv tree"),
+            ("pipx list", False, "pipx list"),
+            ("pnpm run test", False, "pnpm run"),
+            ("pnpm test", False, "pnpm test"),
+            ("yarn test", False, "yarn test"),
+            ("yarn run lint", False, "yarn run"),
+            ("npm run build && bun add x", True, "복합: 뒤 세그먼트의 설치"),
+    ):
+        rv(_exp, _c, "G13 " + _lab)
     # T3: reviewer write-shell deny 에도 중괄호 술어를 태운다(거부 방향 전용)
     rv(True, "rm{,x} /w/repo/build", "중괄호로 감춘 rm")
     rv(True, "git{,x} commit -m x", "중괄호로 감춘 git commit")
