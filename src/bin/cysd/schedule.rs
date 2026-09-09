@@ -37,9 +37,20 @@ const FRESH_RECURRING_DEFAULT_TTL_SECS: u64 = 1800;
 /// 초안·alt-screen·승인대기·빈 좌석 게이트를 통과시킨 뒤에야 주입하므로, 0초 회수는 "적재하고
 /// 즉시 버린다" 와 같다.
 const QUEUED_CLOSE_MIN_TTL_SECS: u64 = 60;
-/// 적재된 항목의 **처분이 정해질 때까지** 회수를 미루는 상한(초). 무한 대기는 좌석 누수이므로
-/// 여기서 끊고 회수한다(그때는 `queue.dropped` 묘비가 남는다).
-const QUEUED_CLOSE_MAX_WAIT_SECS: u64 = FRESH_RECURRING_DEFAULT_TTL_SECS;
+/// ★(성찰 A4) **배달 유예의 안내 경계**(초) — *회수 시각이 아니다.*
+///
+/// 종전 이름은 `QUEUED_CLOSE_MAX_WAIT_SECS` 였고 값이
+/// [`FRESH_RECURRING_DEFAULT_TTL_SECS`] 와 **같은 상수**였다. 두 성질이 한 숫자에 묶여 있었다:
+/// '누수 방지 주기'(좌석을 언제까지 살려 두는가)와 '배달 유예'(적재된 일감의 처분을 얼마나
+/// 기다리는가). 그래서 승인 대기가 31분을 넘기면 활성 큐에 항목이 **남아 있는데도** 좌석이
+/// 닫혔고, 그 항목은 `record_active_drain(…, "surface_closed")` + `queue.dropped` 로 폐기됐다 —
+/// 잡의 일감은 끝내 실행되지 않는데 그 사실은 이미 `schedule.fired{detail:"queued"}`(성공)로
+/// 보고된 뒤다. 이제 이 경계는 **안내 이벤트를 내는 시각**일 뿐이고, 미완료 항목이 있으면
+/// 좌석을 닫지 않는다(대기의 실질 상한은 큐 항목 자신의 TTL 이 진다 — 배달·만료 어느 쪽이든
+/// 처분이 정해지면 그 즉시 회수된다).
+const QUEUED_DELIVERY_GRACE_SECS: u64 = 1800;
+/// 유예를 넘긴 뒤 안내를 **되풀이하는** 간격(초) — 매 폴링마다 발행하면 관측이 소음이 된다.
+const QUEUED_DEFER_NOTICE_INTERVAL_SECS: u64 = 900;
 /// 처분 확인 간격(초).
 const QUEUED_CLOSE_POLL_SECS: u64 = 5;
 
@@ -1215,18 +1226,12 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
             // ★(triage X9) 적재 성공(`"queued"`)은 **배달이 아니다**. 회수는 그 항목의 처분
-            //   (배달·만료·폐기)이 정해진 뒤에 한다 — 상한(QUEUED_CLOSE_MAX_WAIT_SECS)까지만.
+            //   (배달·만료·폐기)이 정해진 뒤에 한다.
             let await_disposition = matches!(delivered, Ok("queued"));
+            let job_id = job.id.clone();
+            let timing = ReapTiming::for_job(ttl);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(ttl)).await;
-                if await_disposition {
-                    let mut waited = 0u64;
-                    while waited < QUEUED_CLOSE_MAX_WAIT_SECS && surface_queue_pending(&d, sid) {
-                        tokio::time::sleep(Duration::from_secs(QUEUED_CLOSE_POLL_SECS)).await;
-                        waited += QUEUED_CLOSE_POLL_SECS;
-                    }
-                }
-                let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
+                reap_fresh_seat(d, sid, job_id, timing, await_disposition).await;
             });
         }
         let how = delivered?;
@@ -1357,6 +1362,92 @@ fn has_machine_label(text: &str) -> bool {
         return ch == '[' || ch == '\u{ff3b}';
     }
     false
+}
+
+/// ★(성찰 A4 · blocking) fresh 좌석의 **회수** — 미완료 항목이 있으면 닫지 않는다.
+///
+/// 종전 배선: `sleep(ttl)` → 처분을 최대 1,800초 기다림 → **무조건** `close_surface(Reap)`.
+/// 그 마지막 한 줄이 조건 없는 폐기였다. `push_queued + fresh:true + close_after_secs:0`
+/// (→ 하한 60초) 적재 후 승인 대기가 1,800초를 넘으면 활성 큐에 항목이 남아 있는데도 좌석이
+/// 닫히고, 그 항목은 `record_active_drain(…, "surface_closed")` + `queue.dropped` 로 폐기된다 —
+/// 잡의 일감은 끝내 실행되지 않는데 그 사실은 이미 `schedule.fired{detail:"queued"}`(성공)로
+/// 보고된 뒤다. 게다가 [`surface_queue_pending`] 은 좌석이 사라지면 `false` 라
+/// "처분이 정해졌다" 와 "좌석이 없어졌다" 가 **같은 모양**이었다.
+///
+/// 이제 시간 상한은 **회수 보류 + 안내 이벤트**다: 유예([`QUEUED_DELIVERY_GRACE_SECS`])를
+/// 넘기면 `schedule.fresh_reap_deferred` 를 한 번 내고(그 뒤로는
+/// [`QUEUED_DEFER_NOTICE_INTERVAL_SECS`] 간격으로 되풀이) **계속 기다린다**. 대기의 실질
+/// 상한은 큐 항목 자신의 TTL 이 진다 — 배달이든 만료든 처분이 정해지면 즉시 회수된다.
+/// 좌석이 이미 사라진 경우도 `close_surface` 가 멱등이라 그대로 지나간다.
+/// 회수 타이머의 **네 시간축** — 프로덕션은 상수에서, 검체는 같은 비율의 압축 시계에서 만든다
+/// (`tokio` 의 `test-util`(가상시간)은 이 크레이트의 feature 집합에 없다 — 축을 값으로 빼서
+///  같은 배선을 그대로 돌린다). 세 번째와 네 번째가 종전에 **한 상수**로 묶여 있었다.
+#[derive(Clone, Copy, Debug)]
+struct ReapTiming {
+    /// 좌석 회수까지의 기본 유예(잡의 `close_after_secs` · 큐 경유면 하한 60초).
+    ttl: Duration,
+    /// 처분 미정 상태에서 **안내를 내기 시작하는** 경계(회수 시각이 아니다).
+    grace: Duration,
+    /// 처분 확인 간격.
+    poll: Duration,
+    /// 유예를 넘긴 뒤 안내를 되풀이하는 간격.
+    notice: Duration,
+}
+
+impl ReapTiming {
+    fn for_job(ttl_secs: u64) -> Self {
+        Self {
+            ttl: Duration::from_secs(ttl_secs),
+            grace: Duration::from_secs(QUEUED_DELIVERY_GRACE_SECS),
+            poll: Duration::from_secs(QUEUED_CLOSE_POLL_SECS),
+            notice: Duration::from_secs(QUEUED_DEFER_NOTICE_INTERVAL_SECS),
+        }
+    }
+
+    /// 검체 전용 — **1000배 압축**(1초 → 1밀리초). 경계 건수·순서는 프로덕션과 동일하다.
+    #[cfg(test)]
+    fn compressed(ttl_secs: u64) -> Self {
+        Self {
+            ttl: Duration::from_millis(ttl_secs),
+            grace: Duration::from_millis(QUEUED_DELIVERY_GRACE_SECS),
+            poll: Duration::from_millis(QUEUED_CLOSE_POLL_SECS),
+            notice: Duration::from_millis(QUEUED_DEFER_NOTICE_INTERVAL_SECS),
+        }
+    }
+}
+
+async fn reap_fresh_seat(
+    d: Arc<Daemon>,
+    sid: u64,
+    job_id: String,
+    t: ReapTiming,
+    await_disposition: bool,
+) {
+    tokio::time::sleep(t.ttl).await;
+    if await_disposition {
+        let mut waited = Duration::ZERO;
+        let mut since_notice = t.notice;
+        // ★좌석 소멸과 처분 확정을 **가른다**: 좌석이 없어졌으면 더 기다릴 대상이 없다.
+        //   ([`surface_queue_pending`] 하나만 보면 두 사실이 같은 `false` 로 접힌다.)
+        while d.get_surface(sid).is_some() && surface_queue_pending(&d, sid) {
+            if waited >= t.grace && since_notice >= t.notice {
+                d.bus.publish(
+                    "schedule.fresh_reap_deferred",
+                    "schedule",
+                    Some(sid),
+                    json!({"job": job_id, "surface_id": sid,
+                           "waited_secs": waited.as_secs(), "waited_ms": waited.as_millis() as u64,
+                           "grace_secs": QUEUED_DELIVERY_GRACE_SECS,
+                           "note": "적재된 일감의 처분이 아직 정해지지 않았다 — 좌석을 회수하지 않는다(회수하면 그 일감이 폐기된다)"}),
+                );
+                since_notice = Duration::ZERO;
+            }
+            tokio::time::sleep(t.poll).await;
+            waited += t.poll;
+            since_notice += t.poll;
+        }
+    }
+    let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
 }
 
 /// 그 좌석의 활성 큐에 아직 배달되지 않은 항목이 남아 있는가(처분 미정) — 좌석이 없으면 false.
@@ -1765,7 +1856,7 @@ mod tests {
     }
 
     /// 테스트 전용 격리 데몬 — 고유 하위 디렉터리에 소켓을 둬 병렬 실행 시 상태가 섞이지 않게 한다.
-    fn test_daemon() -> Arc<Daemon> {
+    pub(super) fn test_daemon() -> Arc<Daemon> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "cys-sched-test-{}-{}-{}",
@@ -2888,6 +2979,8 @@ mod tests {
 mod triage_schedule {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use super::tests::test_daemon;
 
     /// [codex #8 blocking] 강등 안전이 builtin 만 덮고, **지원한다고 문서화한 opt-in 표현**은 덮지 않는다.
     ///
@@ -2928,6 +3021,109 @@ mod triage_schedule {
             effective_close_ttl(&job),
             Some(0),
             "큐 경유 배달은 준비 게이트를 기다리는데 회수는 즉시다 — 적재된 일감이 배달 전에 폐기된다"
+        );
+    }
+
+    /// ★(성찰 A4 · blocking) **보류 중인 fresh 작업을 좌석과 함께 회수하지 않는다.**
+    ///
+    /// 실행 반례(종전): `push_queued + fresh:true + close_after_secs:0`(→ 하한 60초) 적재 후
+    /// 승인 대기 1,800초가 지나면 활성 큐에 항목이 남아도 `close_surface(…, Reap)` 이 조건 없이
+    /// 돌아 그 항목이 `queue.dropped` 로 폐기됐다 — 잡의 일감은 끝내 실행되지 않는데 그 사실은
+    /// 이미 `schedule.fired{detail:"queued"}`(성공)로 보고된 뒤다.
+    ///
+    /// 전체 경로(60초 TTL + 1,800초 유예 = **1,860초**)를 1000배 압축 시계로 그대로 돈다
+    /// ([`ReapTiming::compressed`] — 경계 건수·순서는 프로덕션과 동일하다). 상수 자체의 값과
+    /// **분리**는 `fresh_reap_constants_separate_leak_period_from_delivery_grace` 가 핀한다.
+    #[tokio::test]
+    async fn triage_a4_a_pending_queue_item_defers_the_fresh_seat_reap() {
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w-fresh-1".into()), 24, 80)
+            .expect("좌석 생성");
+        daemon.roles.lock().unwrap().insert("w-fresh-1".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        // 적재(승인 대기) — 배달자가 게이트를 통과시키기 전까지 이 항목은 활성 큐에 남는다.
+        let job: Job = serde_json::from_value(json!({
+            "id": "fresh-queued", "action": ACTION_PUSH_QUEUED, "to": "w", "text": "x",
+            "fresh": true, "close_after_secs": 0, "launch": {"role": "w", "agent": "claude"}
+        }))
+        .expect("스키마");
+        assert_eq!(effective_close_ttl(&job), Some(QUEUED_CLOSE_MIN_TTL_SECS), "전제: 하한 60초");
+        assert_eq!(
+            deliver_push(&daemon, &job, s.id, "[schedule fresh-queued] 본문", None),
+            Ok("queued")
+        );
+        let depth = || s.pending_queue.lock().unwrap().len();
+        assert_eq!(depth(), 1, "전제 불성립 — 적재되지 않았다");
+
+        let mut rx = daemon.bus.subscribe();
+        let d = Arc::clone(&daemon);
+        let sid = s.id;
+        let handle = tokio::spawn(async move {
+            reap_fresh_seat(d, sid, "fresh-queued".into(), ReapTiming::compressed(QUEUED_CLOSE_MIN_TTL_SECS), true).await;
+        });
+
+        // 유예 경계(60 + 1,800)에서 **전용 안내 이벤트 1건**이 나온다.
+        let notice = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let e = rx.recv().await.expect("버스");
+                if e["name"] == "schedule.fresh_reap_deferred" {
+                    return e;
+                }
+                assert_ne!(e["name"], "queue.dropped", "보류 중인 일감이 폐기됐다");
+            }
+        })
+        .await
+        .expect("유예 경계에서 안내 이벤트가 오지 않았다(조용히 회수했거나 영영 기다린다)");
+        assert_eq!(notice["payload"]["job"], json!("fresh-queued"));
+        assert_eq!(notice["payload"]["waited_ms"], json!(QUEUED_DELIVERY_GRACE_SECS),
+            "안내가 유예 경계가 아닌 곳에서 났다");
+        assert_eq!(notice["payload"]["grace_secs"], json!(QUEUED_DELIVERY_GRACE_SECS));
+        // ★그 순간의 사실(이 스레드는 await 하지 않았으므로 회수 태스크는 진행하지 않는다):
+        //   좌석 보존 · 항목 보존 · 주입 0.
+        assert!(daemon.get_surface(sid).is_some(), "미완료 항목이 있는데 좌석을 닫았다");
+        assert_eq!(depth(), 1, "미완료 항목이 큐에서 사라졌다(주입 또는 폐기)");
+
+        // 처분이 정해지면(배달·만료) 그때 회수된다 — 무한 보류가 아니다.
+        s.pending_queue.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("처분이 정해졌는데 회수가 끝나지 않았다")
+            .expect("회수 태스크 패닉");
+        assert!(
+            daemon.get_surface(sid).is_none_or(|x| x.exited.load(Ordering::Relaxed)),
+            "처분이 정해졌는데 좌석이 회수되지 않았다(누수)"
+        );
+    }
+
+    /// ★(성찰 A4) '누수 방지 주기' 와 '배달 유예' 는 **다른 상수**다 — 한 숫자로 묶여 있어서
+    /// 반복 fresh 잡의 기본 TTL 을 바꾸면 배달 유예가 함께 움직였다.
+    #[test]
+    fn fresh_reap_constants_separate_leak_period_from_delivery_grace() {
+        assert_eq!(FRESH_RECURRING_DEFAULT_TTL_SECS, 1800, "누수 방지 주기");
+        assert_eq!(QUEUED_DELIVERY_GRACE_SECS, 1800, "배달 유예 안내 경계");
+        assert_eq!(QUEUED_CLOSE_MIN_TTL_SECS, 60, "큐 경유 회수 하한");
+        // 실행 반례의 전체 경로: 60초 TTL + 1,800초 유예 = 1,860초.
+        assert_eq!(QUEUED_CLOSE_MIN_TTL_SECS + QUEUED_DELIVERY_GRACE_SECS, 1_860);
+        let src = include_str!("schedule.rs");
+        // ★needle 을 쪼개 조립한다 — `include_str!` 은 **이 검체 자신**도 읽으므로 통짜
+        //   리터럴을 쓰면 검체가 자기 문자열에 걸려 언제나 실패한다(자기참조 함정).
+        let fused = format!("{}{}", "QUEUED_CLOSE_MAX_WAIT_SECS: u64 = ", "FRESH_RECURRING_DEFAULT_TTL_SECS");
+        assert!(!src.contains(&fused), "두 성질이 다시 한 상수로 묶였다");
+        // 회수는 **조건부**다: 미완료 항목이 있으면 닫지 않는다.
+        let body = src
+            .split("async fn reap_fresh_seat(")
+            .nth(1)
+            .expect("회수 함수 소실");
+        let body = &body[..body.find("\n}\n").expect("함수 끝")];
+        assert!(
+            body.contains("while d.get_surface(sid).is_some() && surface_queue_pending(&d, sid)"),
+            "회수 대기가 '좌석 소멸'과 '처분 확정'을 다시 한 술어로 접었다"
+        );
+        assert!(
+            !body.contains("waited < QUEUED"),
+            "시간 상한이 다시 회수 조건이 됐다(미완료 항목이 좌석과 함께 폐기된다)"
         );
     }
 
