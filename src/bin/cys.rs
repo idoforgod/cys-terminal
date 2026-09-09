@@ -1913,7 +1913,48 @@ fn gate_guard_screen(sid: u64) -> Option<String> {
 fn gate_guard_screen_with_quiet(sid: u64) -> Option<(String, Option<bool>)> {
     let r = request("surface.read_text", json!({"surface_id": sid})).ok()?;
     let text = r["text"].as_str()?.to_string();
+    note_quiet_axis(&r); // ★(성찰 C3) 같은 응답에서 데몬 능력을 1회 판정한다.
     Some((text, cys::readiness::idle_quiet_from(r["quiet_secs"].as_f64())))
+}
+
+/// ★(0.14.31 · 성찰 C3) `surface.read_text` 응답이 **출력 정적 축을 낼 수 있는가**(순수).
+///
+/// 판정 재료는 값이 아니라 **키의 실재**다. `quiet_secs` 는 0.14.31 신설 필드이고 신 데몬은
+/// 두 응답 분기 모두에서 **항상** 싣는다(`handlers.rs` 의 `surface.read_text`). 그러므로
+/// "키가 없다" = "이 데몬은 이 축을 낼 수 없다" 이고, "키는 있는데 값이 null·비수" 는
+/// "이 틱에 재지 못했다"(보류 유지)로 남는다 — 결측과 부정을 가르는 자리가 여기다.
+fn quiet_axis_in_response(resp: &Value) -> bool {
+    resp.get("quiet_secs").is_some()
+}
+
+/// 능력 래치(프로세스 1회 · 0=미판정 1=지원 2=미지원).
+///
+/// 소켓은 프로세스당 하나이므로 이 래치의 범위는 **이 데몬**이다. 판정은 **첫 성공 응답**으로
+/// 확정하고 다시 뒤집지 않는다 — 데몬 세대가 바뀌면 이 프로세스는 어차피 끝난다(부트 1회).
+static QUIET_AXIS_CAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 응답 1건에서 능력을 확정하고, **부재는 시끄럽게** 남긴다(1회).
+fn note_quiet_axis(resp: &Value) {
+    use std::sync::atomic::Ordering;
+    if QUIET_AXIS_CAP.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let supported = quiet_axis_in_response(resp);
+    QUIET_AXIS_CAP.store(if supported { 1 } else { 2 }, Ordering::Relaxed);
+    if !supported {
+        eprintln!(
+            "[launch-agent] ⚠ 이 데몬은 `surface.read_text` 에 `quiet_secs` 를 싣지 않는다(0.14.30 이하)              — **출력 정적 축을 낼 수 없다**. composer 프롬프트 글리프를 선언하지 않은 어댑터             (gemini·grok)의 관문 증거 이월은 이 축이 유일한 재료라, 그대로 두면 관문을 한 번 본              좌석에 역할 디렉티브가 **영원히** 들어가지 않는다(치명위험 ③). 그 좌석 한정으로 이월              축을 끄고 종전 판정으로 진행한다. 근본 처방은 **데몬을 0.14.31 이상으로 갱신**하는              것이다(`CYS_BOOT_GATES=0` 은 로스터 전체의 관문 거부를 끄는 손잡이라 처방이 아니다)."
+        );
+    }
+}
+
+/// 이 데몬이 출력 정적 축을 낼 수 있는가 — `None` = 아직 응답을 한 번도 못 봤다(판정 유보).
+fn quiet_axis_supported() -> Option<bool> {
+    match QUIET_AXIS_CAP.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }
 
 /// 관측 실패를 **소리 내어** fail-open 으로 접는 단일 지점(P4-6).
@@ -8703,7 +8744,7 @@ mod seat_latch_negation_tests {
             "전제 붕괴: 모달 서명이 이미 잡는 화면이면 이 검체는 이월 축을 재지 못한다"
         );
         let carry = |v: GateRecheck, screen: &str| {
-            gate_recheck_with_carry(v, true, false, Some("❯"), None, screen, Some(true))
+            gate_recheck_with_carry(v, true, false, Some("❯"), None, screen, Some(true), Some(true))
         };
         assert_eq!(
             carry(GateRecheck::Adopt(ev), repainting),
@@ -8741,6 +8782,7 @@ mod seat_latch_negation_tests {
                 Some("›"),
                 Some("Ask Codex to do anything"),
                 &codex_idle,
+                Some(true),
                 Some(true)
             ),
             GateRecheck::Adopt(ev),
@@ -8754,6 +8796,7 @@ mod seat_latch_negation_tests {
                 Some("? for shortcuts"),
                 None,
                 &codex_idle,
+                Some(true),
                 Some(true)
             ),
             GateRecheck::CarryUnproven,
@@ -8761,7 +8804,7 @@ mod seat_latch_negation_tests {
         );
         // ②'''' 롤백 계약 — `legacy_v1` 이면 이 축 자체가 없다(정본 §4 WP-1).
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), true, true, Some("❯"), None, repainting, Some(true)),
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), true, true, Some("❯"), None, repainting, Some(true), Some(true)),
             GateRecheck::Adopt(ev),
             "롤백 스위치가 이 축을 끄지 못한다(되돌릴 수 없는 보류)"
         );
@@ -8770,7 +8813,7 @@ mod seat_latch_negation_tests {
         assert!(!gate_mark_saw_a_gate(None) && !gate_mark_saw_a_gate(Some(GATE_ID_UNIDENTIFIED)));
         assert!(gate_mark_saw_a_gate(Some("folder-trust")) && gate_mark_saw_a_gate(Some("unknown-modal")));
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), false, false, Some("❯"), None, repainting, Some(true)),
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), false, false, Some("❯"), None, repainting, Some(true), Some(true)),
             GateRecheck::Adopt(ev),
             "관문을 본 적 없는 표식(readiness 타임아웃)이 재관측에서만 더 엄한 요구를 받는다(판정 분리)"
         );
@@ -8811,31 +8854,31 @@ mod seat_latch_negation_tests {
         // ① 관문을 본 적 없다 = 종전 그대로(어떤 화면이든 Ready 를 막지 않는다).
         for screen in ["❯ \n", live, ""] {
             assert!(
-                gate_carry_ok(false, false, Some("❯"), None, screen, None),
+                gate_carry_ok(false, false, Some("❯"), None, screen, None, Some(true)),
                 "건강한 부트에 이월이 걸렸다(회귀): {screen:?}"
             );
         }
         // ② 관문을 봤다 + 라벨이 사라진 프레임 = **보류**(그 틈이 R5 blocking 의 자리다).
         for screen in ["❯ \n", "❯ ", "\n"] {
             assert!(
-                !gate_carry_ok(true, false, Some("❯"), None, screen, Some(true)),
+                !gate_carry_ok(true, false, Some("❯"), None, screen, Some(true), Some(true)),
                 "재도색 중 프레임에 주입이 열렸다: {screen:?}"
             );
         }
         // ③ 관문을 봤어도 **대기 프롬프트 레이아웃**이 관측되면 열린다(가용성 — 사람이 통과시킨 뒤).
         assert!(
-            gate_carry_ok(true, false, Some("❯"), None, live, None),
+            gate_carry_ok(true, false, Some("❯"), None, live, None, Some(true)),
             "관문 통과 뒤 라이브 프롬프트에서도 이월이 안 풀린다(영구 보류)"
         );
         // ④ 마커 미정의 어댑터는 출력 정적으로 대신한다 — 미관측(None)은 참으로 접지 않는다.
-        assert!(gate_carry_ok(true, false, None, None, "…", Some(true)));
+        assert!(gate_carry_ok(true, false, None, None, "…", Some(true), Some(true)));
         for q in [None, Some(false)] {
-            assert!(!gate_carry_ok(true, false, None, None, "…", q), "미관측/출력 중에 열렸다: {q:?}");
+            assert!(!gate_carry_ok(true, false, None, None, "…", q, Some(true)), "미관측/출력 중에 열렸다: {q:?}");
         }
         // ④' ★(리뷰 R2(R7회차)) 롤백(`legacy_v1`)이면 축 자체가 없다 — 어떤 화면·어떤 마커에서도 참.
         for screen in ["❯ \n", "", "────\n❯ "] {
             assert!(
-                gate_carry_ok(true, true, Some("❯"), None, screen, Some(false)),
+                gate_carry_ok(true, true, Some("❯"), None, screen, Some(false), Some(true)),
                 "롤백 스위치가 이 축을 끄지 못한다: {screen:?}"
             );
         }
@@ -8929,7 +8972,7 @@ mod seat_latch_negation_tests {
         let above = "  각성 확인 완료.\n? for shortcuts                     Gemini 3.8 Flash · hig\n>\n";
         for (name, screen) in [("상태줄이 아래", below), ("상태줄이 위", above)] {
             assert!(
-                gate_carry_ok(true, false, marker.as_deref(), placeholder.as_deref(), screen, Some(true)),
+                gate_carry_ok(true, false, marker.as_deref(), placeholder.as_deref(), screen, Some(true), Some(true)),
                 "{name}: 관문을 본 gemini 좌석이 정상 유휴 화면에서도 이월을 풀지 못한다 \
                  (carry-unproven 영구 보류 = 디렉티브 미주입 · 치명위험 ③)"
             );
@@ -8943,6 +8986,7 @@ mod seat_latch_negation_tests {
                 composer_marker_of(&embed["codex"]).as_deref(),
                 composer_placeholder_of(&embed["codex"]).as_deref(),
                 codex_idle,
+                Some(true),
                 Some(true)
             ),
             "대조군 붕괴: codex 도 못 푼다면 이 검체는 gemini 고유의 결함을 재지 못한다"
@@ -10092,7 +10136,9 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
             //   `followup=None` 이므로 데몬은 기존 복원 연속 지시를 **보존**한다(지시 소실 0).
             if let (GateRecheck::StillHeld { gate_id, .. }, Some(sid)) = (&recheck, sid) {
                 if !gate_mark_saw_a_gate(marked_gate.as_deref()) && gate_mark_saw_a_gate(Some(gate_id)) {
-                    mark_gate_pending(sid, gate_id, "재관측이 관문 상주를 확인했다(관측 이력 영속화)", None);
+                    // ★(성찰 C6) 지시 부재 재표식 = 데몬이 기존 봉투(지시 + 종류 축 마커)를
+                    //   **보존**하는 경로다. 여기서 축을 다시 주장하지 않는다(무접촉이 보존이다).
+                    mark_gate_pending(sid, gate_id, "재관측이 관문 상주를 확인했다(관측 이력 영속화)", None, false);
                 }
             }
             // ★(0.14.31 · 리뷰 R3b · codex) 채택을 **표식 판독 실패로 미룬** 사실. 관문이 재발한 것과
@@ -11613,7 +11659,7 @@ fn surface_agent_alive_in(surfaces: &[Value], sid: u64) -> Option<bool> {
 ///
 /// 실패해도 부트를 막지 않는다(구 데몬은 `method_not_found`) — 표식이 없으면 좌석은 종전
 /// 등급으로 읽힐 뿐이고, 그것이 이 축의 fail-open 방향("오늘보다 나빠지지 않는다")이다.
-fn mark_gate_pending(sid: u64, gate: &str, tail: &str, followup: Option<&str>) {
+fn mark_gate_pending(sid: u64, gate: &str, tail: &str, followup: Option<&str>, directive_held: bool) {
     // 근거 발췌는 topology 에도 실린다 — 화면 전문을 넣으면 스냅샷이 부풀고 사람이 못 읽는다.
     let evidence: String = tail.chars().take(400).collect();
     let mut params = json!({"surface_id": sid, "gate": gate, "evidence": evidence});
@@ -11622,7 +11668,8 @@ fn mark_gate_pending(sid: u64, gate: &str, tail: &str, followup: Option<&str>) {
     //   있으면 채택 시점에 잃는다(F-1 계약: 전문 디렉티브 + [RESTORE] · 비-master 는 master 지시 대기). 뒤늦은
     //   별도 RPC 로 붙이지 않는다 — 그 사이 다른 부트가 채택·해제하면 채택된 좌석에 표식이 되살아난다(codex 설계
     //   검토). 구 데몬은 키를 무시한다(오늘과 같은 거동). 데몬은 `followup` 부재 재표식에서 기존 값을 보존한다.
-    if let Some(f) = followup {
+    // ★(성찰 C6) 지시와 **디렉티브 종류 축**을 한 봉투로 싣는다(`gate_mark_wire` doc).
+    if let Some(f) = gate_mark_wire(followup, directive_held) {
         params["followup"] = json!(f);
     }
     if let Err(e) = request("surface.gate_pending", params) {
@@ -11639,7 +11686,15 @@ fn mark_gate_pending(sid: u64, gate: &str, tail: &str, followup: Option<&str>) {
 ///   를 스스로 부르면 **롤백 킬스위치 판독이 3지점**이 되고, 한 곳만 빠져도 "되돌렸다"가
 ///   거짓말이 된다(U-11 이 세운 계약 · H-SEAT-4AXIS ⑦ 이 기계 집행). 그래서 강등은 여전히
 ///   판정 반환 지점 **한 곳**이고, env 판독은 부트 1회다(호출부가 값을 넘긴다).
-fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool, followup: Option<&str>) -> BootVerdict {
+fn settle_gate_pending(
+    sid: u64,
+    gate: &str,
+    tail: String,
+    close_override: bool,
+    followup: Option<&str>,
+    // ★(0.14.31 · 성찰 C6) 이 좌석이 이미 전문 디렉티브를 보유하는가(= 채택이 전문을 다시 넣지 않는다).
+    directive_held: bool,
+) -> BootVerdict {
     let verdict = boot_verdict_effective(
         BootVerdict::GatePending {
             gate: gate.to_string(),
@@ -11651,7 +11706,7 @@ fn settle_gate_pending(sid: u64, gate: &str, tail: String, close_override: bool,
         // 좌석 등급을 기록한다(U-10 이 만든 자리의 유일한 생산자). 이것이 없으면 보류 좌석이
         // `agent_alive` 하나로 `AlivePresumed` → **"이미 가동 중"** 으로 접혀, 관문에 갇힌
         // 팀 전체가 '정상 가동 중' 으로 집계된다 — 지금보다 나빠진다.
-        mark_gate_pending(sid, gate, tail, followup);
+        mark_gate_pending(sid, gate, tail, followup, directive_held);
     }
     verdict
 }
@@ -11991,6 +12046,8 @@ fn boot_agent_on_surface(
         std::thread::sleep(std::time::Duration::from_millis(BUDGET_TICK_MS));
         // 화면(vt100 그리드) — 사람이 보는 현재 상태. 잔존 프롬프트도 여기 남는다.
         let screen = request("surface.read_text", json!({"surface_id": sid}))?;
+        // ★(성찰 C3) 부트 1회 능력 판정 — 이 응답에 `quiet_secs` 키가 있는가(값이 아니라 키).
+        note_quiet_axis(&screen);
         let text = screen["text"].as_str().unwrap_or("");
         last_screen = text.to_string();
         // 델타(커서 이후 신규 출현분) — **시간 귀속이 있는** 유일한 재료(B4).
@@ -12165,6 +12222,7 @@ fn boot_agent_on_surface(
                     composer_placeholder.as_deref(),
                     text,
                     obs.idle_quiet,
+                    quiet_axis_supported(),
                 );
                 if !carry_ok {
                     if !carry_held_logged {
@@ -12238,7 +12296,7 @@ fn boot_agent_on_surface(
             // 좌석 등급을 기록한다(U-10 이 만든 자리의 유일한 생산자). 이것이 없으면 보류 좌석이
             // `agent_alive` 하나로 `AlivePresumed` → **"이미 가동 중"** 으로 접혀, 관문에 갇힌
             // 팀 전체가 '정상 가동 중' 으로 집계된다 — 지금보다 나빠진다.
-            mark_gate_pending(sid, gate, &tail, followup);
+            mark_gate_pending(sid, gate, &tail, followup, effective_resume);
         }
         return Ok(verdict);
     }
@@ -12254,6 +12312,7 @@ fn boot_agent_on_surface(
         gate_close_override,
         since_line,
         followup,
+        effective_resume,
     )
 }
 
@@ -12279,6 +12338,8 @@ fn inject_directive_after_ready(
     since_line: u64,
     // ★(리뷰 R2) 이 주입이 보류로 접히면 재표식에 다시 싣는 복원 연속 지시(다음 관문의 재표식이 지시를 지우지 않게).
     followup: Option<&str>,
+    // ★(0.14.31 · 성찰 C6) 그 재표식이 함께 나르는 **디렉티브 종류 축**(전문 재주입 금지 플래그).
+    directive_held: bool,
 ) -> Result<BootVerdict, String> {
     // ★(U-11) 준비 확정 = 보류 표식의 **해제** 지점. 보류 좌석은 `cys boot` 이 관측만 하고
     //   건너뛰므로(U-10), 사람이 관문을 통과시킨 뒤 이 좌석에 다시 붙는 경로(node-recover·
@@ -12332,7 +12393,14 @@ fn inject_directive_after_ready(
             hit.title,
             directive.len()
         );
-        return Ok(settle_gate_pending(sid, &hit.id, tail, gate_close_override, followup));
+        return Ok(settle_gate_pending(
+            sid,
+            &hit.id,
+            tail,
+            gate_close_override,
+            followup,
+            directive_held,
+        ));
     }
     // ★가드에 걸린 실패는 `Err` 로 올라오지만 **파괴 근거가 아니다**(머리표가 그 계약이다).
     //   `?` 로 흘리면 호출부 3곳이 그것을 close·kill·좌석증식으로 번역한다 — 정확히 U-11 이
@@ -12355,6 +12423,7 @@ fn inject_directive_after_ready(
             tail,
             gate_close_override,
             followup,
+            directive_held,
         ));
     }
     // ★제출이 성공한 지금이 표식 해제 지점이다(위 doc — 해제와 제출 사이에 창을 두지 않는다).
@@ -12494,6 +12563,10 @@ fn gate_carry_ok(
     placeholder: Option<&str>,
     screen: &str,
     idle_quiet: Option<bool>,
+    // ★(0.14.31 · 성찰 C3) 이 데몬이 **출력 정적 축을 낼 수 있는가**. `Some(false)` = 능력 부재
+    //   (구 데몬 · `quiet_secs` 키 자체가 없다) · `Some(true)` = 낼 수 있다 · `None` = 아직 판정
+    //   못 함(보수적으로 '낼 수 있다' 와 같이 취급 = 종전 거동 · 보류 유지).
+    idle_axis_capable: Option<bool>,
 ) -> bool {
     if legacy_v1 || !gate_evidence_seen {
         return true;
@@ -12505,6 +12578,17 @@ fn gate_carry_ok(
         //   출력 정적과 AND 다 — 그 두 프레임은 문자열이 같아 화면만으로는 갈리지 않고, 갈라 주는
         //   유일한 사실이 "재도색 중은 정적일 수 없다" 이기 때문이다(근거 전문은 판정부 doc).
         Some(m) => cys::readiness::composer_layout_static_ok(screen, m, placeholder, idle_quiet),
+        // ★(0.14.31 · 성찰 C3) `None`(미관측)을 **두 사실로 가른다**.
+        //   ⓐ "이 틱에 재지 못했다" — 보류 유지(종전 그대로 · '부재 ≠ 부정').
+        //   ⓑ "이 데몬은 이 축을 **낼 수 없다**" — 그 좌석에서 이 축은 영원히 거짓이므로
+        //     보류가 '조여지는 방향' 이 아니라 **영원히 닫힘**이 된다. 마커도 없고 축도 없으면
+        //     이월을 증명할 수단이 0 이고, 그 귀결은 그 좌석의 가동 전체 유실(치명위험 ③)이다.
+        //     그래서 능력 부재는 **그 좌석 한정으로 축을 끄고**(= 종전 판정 = 오늘의 거동)
+        //     `note_quiet_axis` 가 시끄럽게 남긴다 — 로스터 전체를 끄는 마스터 스위치
+        //     (`CYS_BOOT_GATES=0`)를 사람에게 권하는 것보다 범위가 좁고, `approval sign --ttl` 이
+        //     `approval.capabilities` 로 구 데몬을 먼저 가려낸 것과 **같은 패턴**이다.
+        //   claude(`❯`)·codex(`›`)는 `Some(m)` 팔이라 이 분기에 오지 않는다(판정 불변).
+        None if idle_axis_capable == Some(false) => true,
         None => idle_quiet == Some(true),
     }
 }
@@ -12624,6 +12708,8 @@ fn gate_pending_reobserve(sid: u64, agent: &str, marked_gate: Option<&str>) -> G
         composer_placeholder.as_deref(),
         &screen,
         idle_quiet,
+        // 위 `gate_guard_screen_with_quiet` 가 같은 응답에서 이미 래치했다(같은 관측 · 1지점).
+        quiet_axis_supported(),
     )
 }
 
@@ -12663,6 +12749,8 @@ fn gate_recheck_with_carry(
     placeholder: Option<&str>,
     screen: &str,
     idle_quiet: Option<bool>,
+    // ★(0.14.31 · 성찰 C3) 부트 폴링과 **같은 능력 축**(판정 분리 금지).
+    idle_axis_capable: Option<bool>,
 ) -> GateRecheck {
     match verdict {
         GateRecheck::Adopt(_)
@@ -12673,6 +12761,7 @@ fn gate_recheck_with_carry(
                 placeholder,
                 screen,
                 idle_quiet,
+                idle_axis_capable,
             ) =>
         {
             GateRecheck::CarryUnproven
@@ -12727,7 +12816,20 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
     //   성공 뒤에 표식을 지운다). 전문 디렉티브 뒤에 **한 제출**로 잇는다 — 전문은 들어갔는데 [RESTORE] 만
     //   잃는 창(두 번째 제출 실패·프로세스 중단)을 없앤다. followup 이 없으면 종전대로 전문만.
     let followup = row.and_then(gate_followup_from_row);
-    let directive = adoption_payload(&compose_directive(role)?, followup.as_deref());
+    // ★(0.14.31 · 성찰 C6) 디렉티브 **종류**가 관문 보류 → 재부트 채택 경계를 넘는다.
+    //   종전 채택은 언제나 `compose_directive(role)`(전문 + soul + MEMORY + 스킬 색인)이었다 —
+    //   `--resume <id>` 로 뜬 좌석(짧은 `[RESUME]`)이 면책 창에 걸렸다가 사람이 통과시키면,
+    //   이미 컨텍스트를 가진 대화에 전문이 통째로 다시 들어간다. 같은 파일이 두 자리에서
+    //   "전문 재주입은 토큰 2배·중복 지침 혼선 + resume 직후 컨텍스트 임계(clear) 유발" 로
+    //   **명시적으로 금지한** 행위다. 선택은 부트와 **같은 순수 함수**가 한다(사본 금지).
+    let directive_held = row.map(gate_directive_held_from_row).unwrap_or(false);
+    let directive = adoption_payload(&boot_directive_for(role, directive_held)?, followup.as_deref());
+    if directive_held {
+        eprintln!(
+            "[boot] role={role} 표식이 '디렉티브 보유' 를 기록했다 — 채택은 [RESUME] + 복원 지시만 \
+             잇는다(전문 재주입 0 · 컨텍스트 임계 회피)"
+        );
+    }
     if followup.is_some() {
         eprintln!("[boot] role={role} 채택 페이로드에 표식의 복원 연속 지시를 동봉한다(전문 뒤 · 한 제출)");
     }
@@ -12746,6 +12848,8 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
         since_line,
         // 채택 중 다음 관문이 뜨면 재표식에 같은 지시를 다시 싣는다(지시는 관문을 넘어 살아남는다).
         followup.as_deref(),
+        // ★(성찰 C6) 종류 축도 함께 이월한다 — 표식이 살아 있는 한 이 사실은 변하지 않는다.
+        directive_held,
     )
 }
 
@@ -12758,13 +12862,59 @@ fn gate_mark_id(row: Option<&Value>) -> Option<String> {
         .map(String::from)
 }
 
+/// ★(0.14.31 · 성찰 C6) 표식 봉투의 **디렉티브 종류 축** 마커.
+///
+/// 【무엇을 나르는가】 "이 좌석은 채택 시점에 **전문 디렉티브를 다시 받을 필요가 없다**" 는 사실.
+/// 생산자는 `boot_agent_on_surface` 의 `effective_resume`(= 접미가 실제로 붙었고 그것이 정확한
+/// 재개다 — F-1 + 성찰 C7)이고, `node-recover` 의 주입-보류 경로도 같은 사실을 낸다(그 자리는
+/// 부트가 이미 `Ready` 를 냈으므로 지침이 실제로 들어갔다).
+///
+/// 【왜 별도 필드가 아니라 봉투 접두인가】 데몬의 `GatePending` 은 `{gate, since, evidence,
+/// followup}` 고정 4필드이고 미지 파라미터를 버린다(`handlers.rs` 의 write path). 새 필드를 만들면
+/// `state.rs`+`handlers.rs` 변경이 필요한데 그것은 이 레인 밖이다. `followup` 은 데몬이 **불투명
+/// 문자열로 보관하고 재표식에서 보존**하므로(`followup.or(kept_followup)`), 그 문자열의 첫 줄에
+/// 마커를 실으면 additive 하게 같은 계약을 얻는다. 소비자는 이 파일 하나뿐이다(팩·GUI 에 `followup`
+/// 소비처 0건 — 전수 확인).
+///
+/// 【실패 방향】 마커를 못 읽으면 `false` = **전문 디렉티브**(오늘의 거동). 즉 스큐·손상은
+/// "토큰 2배" 로 끝나고 "지침 없는 좌석" 으로는 절대 가지 않는다.
+const GATE_MARK_DIRECTIVE_HELD: &str = "@cys:directive-held";
+
+/// 표식에 실을 `followup` **와이어 값**(순수) — 지시 문자열에 종류 축 마커를 접두한다.
+///
+/// ★지시가 없으면 `None` 이다(마커만 싣지 않는다). 이유: `followup` 부재 재표식은 데몬이 기존
+/// 값을 **보존**하는 경로인데, 마커만 실어 보내면 그 보존이 깨져 이미 실려 있던 `[RESTORE]`/
+/// `[RECOVER]` 를 마커로 **덮어쓴다**(지시 유실). 실제로 종류 축이 참인 경로(restore·node-recover)는
+/// 언제나 지시를 함께 나르므로 이 제한으로 잃는 것이 없다.
+fn gate_mark_wire(followup: Option<&str>, directive_held: bool) -> Option<String> {
+    let f = followup.filter(|f| !f.trim().is_empty())?;
+    Some(if directive_held {
+        format!("{GATE_MARK_DIRECTIVE_HELD}\n{f}")
+    } else {
+        f.to_string()
+    })
+}
+
+/// ★(0.14.31 · 성찰 C6) 표식이 기록한 **디렉티브 종류 축** — 참이면 채택은 전문을 다시 넣지 않는다.
+/// 부재·null·비문자열·구 데몬은 `false`(전문 = 오늘의 거동 · 실패 방향).
+fn gate_directive_held_from_row(row: &Value) -> bool {
+    row["gate_pending"]["followup"]
+        .as_str()
+        .map(|f| f.starts_with(GATE_MARK_DIRECTIVE_HELD))
+        .unwrap_or(false)
+}
+
 /// ★(0.14.31 · 리뷰 R2) 좌석 행(`surface.list` · `gate_pending` object)에서 복원 연속 지시를 꺼낸다 — 구 데몬·
 /// 키 부재·null·공백은 `None`(전문만 주입 = 오늘의 거동). 술어("object 인가")에는 쓰지 않는다(진단·채택 재료).
 fn gate_followup_from_row(row: &Value) -> Option<String> {
-    row["gate_pending"]["followup"]
-        .as_str()
-        .filter(|f| !f.trim().is_empty())
-        .map(String::from)
+    let raw = row["gate_pending"]["followup"].as_str()?;
+    // ★(성찰 C6) 종류 축 마커는 봉투 메타이지 주입할 문안이 아니다 — 벗겨서 돌려준다.
+    //   (마커 없는 종전 값은 한 글자도 바뀌지 않는다.)
+    let body = raw
+        .strip_prefix(GATE_MARK_DIRECTIVE_HELD)
+        .map(|r| r.trim_start_matches('\n'))
+        .unwrap_or(raw);
+    (!body.trim().is_empty()).then(|| body.to_string())
 }
 
 /// ★(0.14.31 · 리뷰 R3 · codex major) 그 행의 표식이 **읽을 수 없는 형태**인가 — 참이면 "지시가 없다" 고
@@ -16611,6 +16761,10 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
                             //   `already_alive` 로 접어 이 노드는 복구 프로토콜 지시를 한 번도
                             //   받지 못한다.
                             Some(recover_directive()),
+                            // ★(성찰 C6) 여기 도달했다는 것은 `boot_agent_on_surface` 가 `Ready` 를
+                            //   냈다는 뜻이다 = 이 좌석은 **지침을 이미 받았다**(전문이든 [RESUME]
+                            //   이든). 채택이 전문을 다시 넣으면 정확히 C6 가 막으려는 사고다.
+                            true,
                         );
                         if let BootVerdict::GatePending { gate, tail } = &v {
                             print_gate_pending_prescription(sid, &role_name, &agent, gate, tail);
@@ -25130,8 +25284,9 @@ mod tests {
             .find("if let cys::inject_guard::Decision::Hold(hit) =")
             .expect("부트 경로의 typed 관문 가드가 사라졌다");
         let hseg = &src[hi..hi + 1200];
+        // ★(성찰 C6) 인자가 늘어 호출이 여러 줄로 갈라졌다 — 문면이 아니라 **호출과 인자**를 잰다.
         assert!(
-            hseg.contains("settle_gate_pending(sid, &hit.id"),
+            hseg.contains("settle_gate_pending(") && hseg.contains("&hit.id,"),
             "주입 직전 관문 감지의 귀결이 보류(U-11)가 아니다"
         );
         assert!(
@@ -25143,7 +25298,13 @@ mod tests {
         let si = src
             .find("fn settle_gate_pending(")
             .expect("보류 확정 단일 경로가 사라졌다");
-        let sseg = &src[si..si + 900];
+        // ★(성찰 C6) 인자가 하나 늘어(디렉티브 종류 축) 본문이 길어졌다 — 고정 바이트 창 대신
+        //   **함수 경계**로 자른다(한글 본문이라 문자 경계 보정 포함).
+        let sseg = {
+            let rest = &src[si..];
+            let e = rest.find("\n}\n").map(|e| e + 2).expect("settle_gate_pending 끝");
+            &rest[..e]
+        };
         for anchor in ["boot_verdict_effective(", "BootVerdict::GatePending", "mark_gate_pending("] {
             assert!(sseg.contains(anchor), "settle_gate_pending 결손: {anchor}");
         }
@@ -29959,5 +30120,117 @@ mod tests {
             json!(0),
             "안전 거부가 의무 실패로 집계된다"
         );
+    }
+
+    /// ★C3: 마커 미선언 어댑터(gemini·grok)가 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
+    ///
+    /// `idle_quiet == None` 을 두 사실로 가른다 — "이 틱에 못 쟀다"(보류 유지) vs
+    /// "이 데몬은 이 축을 낼 수 없다"(능력 부재 → 그 좌석 한정 축 끄기 + 시끄러운 경고).
+    /// 종전에는 둘이 한 값이라, cys 0.14.31 + cysd 0.14.30 조합에서 관문을 한 번 본 gemini
+    /// 좌석에 역할 디렉티브가 **영원히** 들어가지 않았다(치명위험 ③).
+    #[test]
+    fn c3_marker_less_adapters_escape_carry_unproven_on_a_daemon_without_the_quiet_axis() {
+        // ① 능력 판정은 **키의 실재**로 한다(값이 아니라 키 — 결측은 값이 아니다).
+        assert!(quiet_axis_in_response(&json!({"text": "x", "quiet_secs": 0.0})));
+        assert!(
+            quiet_axis_in_response(&json!({"text": "x", "quiet_secs": null})),
+            "키는 있는데 값이 null = '이 틱에 못 쟀다' 이지 능력 부재가 아니다"
+        );
+        assert!(!quiet_axis_in_response(&json!({"text": "x"})), "구 데몬(키 부재)이 지원으로 읽혔다");
+        // ② 능력 있는 데몬: 종전 판정 그대로 — 미관측·출력 중은 보류다(회귀 방지).
+        for q in [None, Some(false)] {
+            assert!(
+                !gate_carry_ok(true, false, None, None, "…", q, Some(true)),
+                "능력 있는 데몬에서 미관측이 열렸다: {q:?}"
+            );
+        }
+        assert!(gate_carry_ok(true, false, None, None, "…", Some(true), Some(true)));
+        // ③ 능력 **부재** 데몬 + 마커 미선언 어댑터: 이월 축을 끈다(관문 1회 뒤 ready 도달).
+        assert!(
+            gate_carry_ok(true, false, None, None, "…", None, Some(false)),
+            "구 데몬 + gemini 좌석이 여전히 영구 보류다(디렉티브 미주입 · 치명위험 ③)"
+        );
+        // ④ 판정 유보(`None` = 아직 응답을 못 봤다)는 종전과 같이 **보류**다(조여지는 방향).
+        assert!(!gate_carry_ok(true, false, None, None, "…", None, None));
+        // ⑤ claude·codex 판정 **불변** — 마커 선언 어댑터는 이 분기에 오지 않는다.
+        let live = cys::first_run_gates::fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        for cap in [Some(true), Some(false), None] {
+            assert!(
+                gate_carry_ok(true, false, Some("❯"), None, live, None, cap),
+                "claude 라이브 프롬프트 판정이 능력 축에 흔들렸다: {cap:?}"
+            );
+            assert!(
+                !gate_carry_ok(true, false, Some("❯"), None, "❯ \n", Some(false), cap),
+                "claude 재도색 프레임이 능력 축으로 열렸다: {cap:?}"
+            );
+        }
+        // ⑥ 배선 — 부트 폴링과 재관측이 **같은 능력 축**을 태운다(판정 분리 금지) · 응답 1지점 래치.
+        let src = include_str!("cys.rs");
+        let boot = refl_fn_body(src, "boot_agent_on_surface");
+        assert!(boot.contains("note_quiet_axis(&screen);"), "부트 폴링이 능력을 판정하지 않는다");
+        assert!(boot.contains("quiet_axis_supported(),"), "부트 폴링이 능력 축을 넘기지 않는다");
+        let re = refl_fn_body(src, "gate_pending_reobserve");
+        assert!(re.contains("quiet_axis_supported(),"), "재관측이 능력 축을 넘기지 않는다(판정 분리)");
+        assert!(
+            refl_fn_body(src, "gate_guard_screen_with_quiet").contains("note_quiet_axis(&r);"),
+            "재관측의 화면 읽기가 같은 응답에서 능력을 판정하지 않는다"
+        );
+    }
+
+    /// ★C6: 디렉티브 **종류**가 관문 보류 → 재부트 채택 경계를 넘는다.
+    ///
+    /// 종전 채택은 언제나 `compose_directive(role)` 였다 — `--resume <id>` 로 뜬 좌석(짧은
+    /// `[RESUME]`)이 면책 창에 걸렸다가 사람이 통과시키면, 이미 컨텍스트를 가진 대화에 전문 +
+    /// soul + MEMORY + 스킬 색인이 통째로 다시 들어간다(같은 파일이 두 자리에서 금지한 행위).
+    #[test]
+    fn c6_directive_kind_survives_the_gate_pending_to_adoption_boundary() {
+        // ① 봉투 — 지시 문자열에 종류 축이 접두된다. 지시가 없으면 `None`(보존 경로를 깨지 않는다).
+        assert_eq!(gate_mark_wire(None, true), None, "마커만 실으면 재표식이 기존 지시를 덮는다");
+        assert_eq!(gate_mark_wire(None, false), None);
+        assert_eq!(gate_mark_wire(Some("   "), true), None);
+        assert_eq!(gate_mark_wire(Some("[RESTORE] x"), false).as_deref(), Some("[RESTORE] x"),
+                   "축이 거짓이면 종전 값과 byte-identical 이어야 한다");
+        let wire = gate_mark_wire(Some("[RESTORE] x"), true).expect("봉투");
+        assert!(wire.starts_with(GATE_MARK_DIRECTIVE_HELD) && wire.ends_with("[RESTORE] x"));
+        // ② 읽기 — 마커는 벗겨져 나오고 축은 따로 읽힌다. 종전 값(마커 없음)은 불변.
+        let row_held = json!({"gate_pending": {"gate": "disclaimer", "followup": wire}});
+        assert_eq!(gate_followup_from_row(&row_held).as_deref(), Some("[RESTORE] x"),
+                   "봉투 마커가 주입 문안으로 새어 나갔다");
+        assert!(gate_directive_held_from_row(&row_held));
+        let row_plain = json!({"gate_pending": {"gate": "disclaimer", "followup": "[RECOVER] y"}});
+        assert_eq!(gate_followup_from_row(&row_plain).as_deref(), Some("[RECOVER] y"));
+        assert!(!gate_directive_held_from_row(&row_plain), "구 데몬·구 표식이 축을 참으로 읽혔다");
+        // 결측·손상은 전부 거짓 = 전문 디렉티브(실패 방향: 토큰 2배이지 지침 0 이 아니다).
+        for row in [json!({}), json!({"gate_pending": null}),
+                    json!({"gate_pending": {"gate": "x"}}),
+                    json!({"gate_pending": {"gate": "x", "followup": 7}})] {
+            assert!(!gate_directive_held_from_row(&row), "{row}");
+        }
+        // ③ 채택 페이로드 — 축이 참이면 `[RESUME]` + followup 이고 전문이 아니다.
+        let held = adoption_payload(&boot_directive_for("worker-1", true).expect("resume"),
+                                    gate_followup_from_row(&row_held).as_deref());
+        assert!(held.starts_with("[RESUME]"), "{held}");
+        assert!(held.ends_with("[RESTORE] x"), "{held}");
+        assert!(!held.contains(GATE_MARK_DIRECTIVE_HELD), "봉투 마커가 페이로드에 실렸다");
+        // ④ 배선 — 채택이 `compose_directive` 를 **직접** 부르지 않고 부트와 같은 순수 함수를 쓴다.
+        let src = include_str!("cys.rs");
+        let adopt = refl_fn_body(src, "gate_pending_adopt");
+        assert!(
+            adopt.contains("boot_directive_for(role, directive_held)?"),
+            "채택이 아직 종류 축을 무시한다(resume 좌석에 전문 재주입)"
+        );
+        assert!(
+            !adopt.contains("compose_directive(role)?"),
+            "채택이 전문을 무조건 조립한다 — C6 회귀"
+        );
+        assert!(adopt.contains("gate_directive_held_from_row"), "채택이 축을 읽지 않는다");
+        assert!(adopt.contains("directive_held,\n    )"), "채택이 축을 재표식으로 이월하지 않는다");
+        // ⑤ 생산자 — 부트는 `effective_resume` 을, node-recover 의 주입 보류는 `true` 를 싣는다.
+        let boot = refl_fn_body(src, "boot_agent_on_surface");
+        assert!(boot.contains("mark_gate_pending(sid, gate, &tail, followup, effective_resume);"));
+        assert!(boot.contains("followup,\n        effective_resume,\n    )"));
+        // ⑥ 지시 부재 재표식은 축을 주장하지 않는다(무접촉 = 데몬의 보존 경로).
+        let rb = refl_fn_body(src, "run_boot");
+        assert!(rb.contains("(관측 이력 영속화)\", None, false);"), "관측 영속화가 봉투를 덮는다");
     }
 }
