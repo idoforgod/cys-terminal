@@ -197,7 +197,18 @@ impl Gate {
     pub fn matches(&self, screen: &str) -> bool {
         let norm = normalize(screen);
         let flat = flatten(screen);
-        let hit = |s: &String| norm.contains(&normalize(s)) || flat.contains(&flatten(s));
+        // ★(0.14.31 · 성찰 R3 · blocking) **빈 문면은 아무것도 식별하지 않는다.** `normalize`/
+        //   `flatten` 은 공백뿐인 문자열을 빈 문자열로 만들고, `String::contains("")` 는 **모든**
+        //   화면에 참이다. 그래서 needle `"   "` 한 줄이 이 관문을 상시 참으로 만들었다 —
+        //   그 귀결은 ① `judge` 가 전 좌석·전 틱 `GateHeld`(디렉티브 영구 미주입 = 노드 0 +
+        //   고아 좌석) ② `inject_guard::decide` 가 항상 `Hold` ③ `CYS_GATE_PENDING_CLOSE=1`
+        //   기계에서 `boot_verdict_effective` 가 `LaunchFailed` 로 강등 = **모든 pane 사망**이다
+        //   (§7 부트체인 재난표). 파서([`str_vec`])가 이미 거르지만 판정부에도 벨트를 둔다 —
+        //   봉투를 거치지 않고 조립된 `Gate` 도 이 함수를 지난다.
+        let hit = |s: &String| {
+            let (n, f) = (normalize(s), flatten(s));
+            (!n.is_empty() && norm.contains(&n)) || (!f.is_empty() && flat.contains(&f))
+        };
         if !self.needles.iter().any(hit) {
             return false;
         }
@@ -599,7 +610,14 @@ pub fn gate_rule_violations(g: &Gate) -> Vec<String> {
 pub fn needle_non_gate_hits(needle: &str) -> Vec<&'static str> {
     let (nn, nf) = (normalize(needle), flatten(needle));
     if nf.is_empty() {
-        return Vec::new();
+        // ★(0.14.31 · 성찰 R3 · blocking) 종전에는 여기서 **면제**(빈 벡터 = 위반 없음)했다.
+        //   그런데 공백뿐인 needle 은 `contains("")` 로 **모든 화면**에 걸리는 문면이다 — 면제는
+        //   정확히 거꾸로였고, 그래서 `gate_rule_violations` 가 아무 말도 하지 않은 채
+        //   `repair_gate` 가 그 항목을 지나쳤다(그리고 `notes` 는 "needle 축은 정상 화면 대조를
+        //   이미 통과했다" 는 **정반대**를 찍었다). 전량을 돌려주면 사용자 신설 관문에서는 그
+        //   needle 만 제거되고 사유가 남으며(조용한 무력화 0), 빌트인 대응물이 있으면 정본
+        //   needle 로 복원된다 — 어느 쪽도 관문을 잃지 않는다(P4-10 보존 계약 무변).
+        return fixtures::NON_GATE_SCREENS.iter().map(|&(sid, _)| sid).collect();
     }
     fixtures::NON_GATE_SCREENS
         .iter()
@@ -1878,12 +1896,19 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
+/// 봉투의 문자열 배열 — **공백뿐인 항목은 버린다**.
+///
+/// ★(0.14.31 · 성찰 R3 · blocking) 종전 필터는 `!s.is_empty()` 였다. `"   "`·`"\t"`·NBSP 는
+/// 비어 있지 않으므로 통과했고, [`normalize`]/[`flatten`] 이 그것을 빈 문자열로 만든 뒤
+/// `contains("")` 가 **모든 화면에 참**이 되어 그 관문이 상시 성립했다(영구 부트 라이브락 →
+/// `CYS_GATE_PENDING_CLOSE=1` 이면 모든 pane 사망). `trim()` 은 유니코드 공백(NBSP 포함)을
+/// 벗기므로 세 변형이 여기서 함께 사라진다.
 fn str_vec(v: Option<&Value>) -> Option<Vec<String>> {
     let arr = v?.as_array()?;
     Some(
         arr.iter()
             .filter_map(|x| x.as_str())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
             .collect(),
     )
@@ -2760,6 +2785,82 @@ mod tests {
         );
         assert_eq!(g.passability, Passability::HumanOnly);
         assert!(g.action.is_none());
+    }
+
+    /// ★(0.14.31 · 성찰 R3 · blocking) **공백뿐인 needle 은 모든 화면을 관문으로 만들 수 없다.**
+    ///
+    /// 【사슬】 `"   "` needle → [`normalize`]/[`flatten`] 이 빈 문자열 → `contains("")` 가 **모든
+    /// 화면에 참** → `identify` 상시 참 → ① `judge` 가 전 좌석·전 틱 `GateHeld`(디렉티브 영구
+    /// 미주입 = 노드 0 + 고아 좌석) ② `inject_guard::decide` 가 항상 `Hold`(pack-update 재주입
+    /// 영구 미도달) ③ `CYS_GATE_PENDING_CLOSE=1` 기계에서 `boot_verdict_effective` 가
+    /// `LaunchFailed` 로 강등 = **모든 pane 사망**(§7 부트체인 재난표 전량).
+    /// 그리고 종전 `needle_non_gate_hits` 는 빈 문면을 **면제**했으므로 `notes` 가 정반대를
+    /// 찍었다("needle 축은 정상 화면 대조를 이미 통과했다").
+    ///
+    /// 【재는 것 — 셋 다 AND】 공백·탭·NBSP 3변형이
+    ///   ⓐ 파서에서 사라지거나(`str_vec` 의 `trim`), 남더라도
+    ///   ⓑ `matches(정상 화면) == false` 이고,
+    ///   ⓒ 규칙 위반으로 **말해진다**([`needle_non_gate_hits`] 가 대조군 전량을 돌려준다 →
+    ///      `gate_rule_violations` 비지 않음 → `repair_gate` 가 사유를 `notes` 에 남긴다).
+    #[test]
+    fn blank_needle_cannot_match_every_screen() {
+        const BLANKS: [(&str, &str); 3] = [("공백", "   "), ("탭", "\t\t"), ("NBSP", "\u{a0}\u{a0}")];
+        for (name, blank) in BLANKS {
+            // ⓒ 규칙 축 — 면제가 아니라 **대조군 전량**이 걸린다(수리가 그 항목만 지우는 근거).
+            assert_eq!(
+                needle_non_gate_hits(blank).len(),
+                fixtures::NON_GATE_SCREENS.len(),
+                "{name}: 공백 needle 이 규칙 위반으로 세어지지 않는다(종전 면제 회귀)"
+            );
+            // ⓑ 판정 축 — 손으로 조립한 관문(봉투를 거치지 않는 경로)도 정상 화면을 잡지 못한다.
+            let g = Gate {
+                needles: vec![blank.to_string()],
+                widget: Vec::new(),
+                ..builtin().into_iter().next().expect("코드 정본이 비었다")
+            };
+            for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+                assert!(
+                    !g.matches(screen),
+                    "{name}: 공백 needle 이 정상 화면 {sid} 를 관문으로 만든다(영구 부트 라이브락)"
+                );
+            }
+            // ⓐ 파서 축 — 공백 항목은 사라진다. 그것만 선언하면 신설 선언 자체가 거절된다.
+            let env = serde_json::json!({"gates": [
+                {"id": "blank-only", "title": "공백 needle 뿐", "needles": [blank]},
+                {"id": "blank-mixed", "title": "공백 + 실문면", "needles": [blank, "Do you trust the files in this folder"]},
+            ]});
+            let r = resolve_with(Some(&env), true);
+            assert!(
+                r.gates.iter().all(|g| g.id != "blank-only"),
+                "{name}: needle 이 공백뿐인 선언이 코퍼스에 들어왔다"
+            );
+            let mixed = r.gates.iter().find(|g| g.id == "blank-mixed").expect("혼합 선언이 사라졌다");
+            assert!(
+                mixed.needles.iter().all(|n| !n.trim().is_empty()),
+                "{name}: 혼합 선언에서 공백 needle 이 살아남았다: {:?}",
+                mixed.needles
+            );
+            // 그리고 그 관문은 여전히 **정상 화면을 잡지 않는다**(수리가 이빨을 남겼는지).
+            for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+                assert!(
+                    !mixed.matches(screen),
+                    "{name}: 혼합 선언이 정상 화면 {sid} 를 관문으로 만든다"
+                );
+            }
+        }
+        // ★사유가 **말해진다** — 빌트인 id 로 공백 needle 을 덮으면 정본 needle 로 복원되고 note 가 남는다.
+        let victim = builtin().into_iter().next().expect("코드 정본이 비었다");
+        let mut notes = Vec::new();
+        let repaired = repair_gate(
+            Gate { needles: vec!["   ".to_string()], ..victim.clone() },
+            &builtin(),
+            &mut notes,
+        );
+        assert_eq!(repaired.needles, victim.needles, "빌트인 대응물의 정본 needle 로 복원되지 않았다");
+        assert!(
+            notes.iter().any(|n| n.contains(&victim.id)),
+            "공백 needle 을 고치고도 사유를 남기지 않았다(조용한 무력화): {notes:?}"
+        );
     }
 
     /// 위와 같은 축을 **판정 경로 그대로**(needle ∧ 위젯) 확인한다.
