@@ -72,6 +72,10 @@ EXIT_OK, EXIT_USAGE, EXIT_EMPTY = 0, 2, 5
 #   정지 중 `drain --deliver` 가 자율 루프를 wake 로 재점화시키는 경로를 닫는다.
 #   exit 4 는 `cys gate-check` 의 paused 코드와 같은 의미로 맞춘다(호출부 분기 일관성).
 EXIT_PAUSED = 4
+# ★(0.14.31 · 성찰 Q4) enqueue 가 **수락 세대**(내구 미확정 표식 레코드)를 슬롯 밖으로 옮기지 못해
+#   새 요청을 성공으로 답할 수 없을 때. 호출자(report_gate)는 rc≠0 에 seen 을 되돌려 다음 주기에
+#   다시 온다 — 병합해 놓고 `coalesced` 로 답하면 그 요청은 drain 이 영구히 건너뛴다(무성 유실).
+EXIT_PARK_FAILED = 6
 PAUSED_BASENAME = "AUTOPILOT_PAUSED"
 # 팩 경로 env 키 목록·순서는 Rust 정본 `src/pack.rs::PACK_DIR_ENV_KEYS` 와 동일하다
 # (javis_orchestra·javis_report·javis_bootstrap 과 같은 목록 — 한 곳만 고치면 계약이 깨진다).
@@ -310,6 +314,29 @@ def cmd_enqueue(a):
                                 "idempotency_key": a.idempotency_key, "wakeup_id": cur["id"]})
                 print(json.dumps({"result": "suppressed", "id": cur["id"]}, ensure_ascii=False))
                 return EXIT_OK
+        if cur and cur.get(PARK_MARK):
+            # ★(0.14.31 · 성찰 Q4) 이 슬롯의 레코드는 이미 **수락된 세대**다 — 데몬이 exit 0 으로
+            #   받았고 내구만 미확정이며, 보관 이동이 실패해 표식만 남았다. 종전에는 후속 요청이
+            #   여기에 **병합**돼 `coalesced` 로 성공 처리됐는데 drain 은 표식 레코드를 영구히
+            #   건너뛴다 — 같은 (target, task) 채널의 모든 후속 wakeup 이 무성으로 유실됐다.
+            #   위의 멱등키 억제는 그대로 옳다(그 사건은 정말 수락됐다). 그 밖의 요청은 세대를
+            #   가른다: 수락 세대를 슬롯 밖으로 옮긴 뒤 새 레코드를 만든다. 옮기지 못하면 이
+            #   요청을 성공으로 답하지 않는다(rc≠0 → 호출자가 seen 을 되돌려 다음 주기에 다시 온다).
+            state, where = _split_accepted_generation(path, cur)
+            if state == "failed":
+                _ledger_append({"event": "enqueue_refused", "target": a.to, "task_key": a.task,
+                                "idempotency_key": a.idempotency_key,
+                                "blocked_by": cur["id"], "reason": a.reason,
+                                "why": "수락 세대(내구 미확정 표식)를 슬롯 밖으로 옮기지 못했다 — "
+                                       "병합하면 이 요청은 drain 이 영구히 건너뛴다(유실)"})
+                print(json.dumps({"result": "refused", "reason": "accepted_generation_stuck",
+                                  "blocked_by": cur["id"]}, ensure_ascii=False))
+                return EXIT_PARK_FAILED
+            _ledger_append({"event": "generation_split", "target": a.to, "task_key": a.task,
+                            "accepted_wakeup_id": cur["id"], "park_state": state,
+                            "moved_to": where})
+            cur = None
+        if cur:
             # 코얼레싱: 최신 reason으로 갱신, payload 얕은 병합, count 증가
             cur["coalesced_count"] = cur.get("coalesced_count", 0) + 1
             cur["reason"] = a.reason
@@ -403,6 +430,26 @@ def _park_unconfirmed(path, rec):
         return ("marked", path)
     except OSError:
         return ("failed", path)
+
+
+def _split_accepted_generation(path, rec):
+    """★(0.14.31 · 성찰 Q4) 수락 세대(표식 레코드)를 pending **슬롯** 밖으로 — `(상태, 경로)`.
+
+      ① 보관소(`unconfirmed/`)로 이동을 다시 시도한다(원래 가려던 곳 · 성공하면 `"parked"`).
+      ② 실패하면 **같은 디렉터리 안에서** 세대 접미 이름으로 비켜 세운다(`"sidestepped"`) —
+         디렉터리 내 rename 은 보관소의 makedirs/replace 실패와 독립이다. 표식은 그대로라
+         drain 은 여전히 건너뛰고 `list`/`cancel` 은 여전히 본다(사람이 처분할 수 있다).
+      ③ 그것도 실패하면 `"failed"` — 호출자는 새 요청을 **성공 처리하지 않는다**.
+    """
+    state, where = _park_unconfirmed(path, rec)
+    if state == "parked":
+        return state, where
+    try:
+        alt = f"{path[:-len('.json')]}.accepted-{uuid.uuid4().hex[:8]}.json"
+        os.replace(path, alt)
+        return "sidestepped", alt
+    except OSError:
+        return "failed", path
 
 
 def _iter_pending():
