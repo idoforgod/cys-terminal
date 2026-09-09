@@ -3957,14 +3957,16 @@ class Preflight:
     def _event_hook_registered(settings_path, event, script_name, declared_timeout=None):
         """event 에 pack 경로의 script_name 이 **선언 timeout 을 충족한 채** 등록돼 있나
         (구 .config 경로는 미인정). 판정 = `command 동등 ∧ 선언 timeout 충족`(U-21).
-        `declared_timeout=None`(기본) 이면 종전 판정 그대로 — command 축 단독이다."""
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
+        `declared_timeout=None`(기본) 이면 종전 판정 그대로 — command 축 단독이다.
+        ★성찰 P17: 판독은 `_read_json_tolerant`(O_NONBLOCK + fstat 정규 재확인) — 무가드 `open` 은
+        `settings.json` 자리에 writer 없는 FIFO 가 있으면 **그 자리에서 영구 정지**한다. 이 함수는
+        C28 이 대상 프로필마다 부르고 C28 은 부트 체인이 자동으로 도는 유일한 검사라, 정지가 곧
+        '뒤 체크 전부 소실' 이다(`_mcp_enabled` 가 R5 에서 받은 하드닝과 같은 이유·같은 처방)."""
+        data = _read_json_tolerant(settings_path)
         if not isinstance(data, dict):
             return False
         desired = _cys_hook_cmd(script_name)
+
         for entry in data.get("hooks", {}).get(event, []):
             for h in entry.get("hooks", []):
                 if h.get("command", "") == desired and hook_timeout_satisfied(
@@ -3981,12 +3983,12 @@ class Preflight:
           않는다 — capgate 계약은 matcher 없음(전 도구)이므로 그 상태의 게이트는 **Bash 에만**
           붙고 CronCreate·Agent·Edit/Write 는 무게이트가 되며 `tool_calls` 예산도 Bash 만 센다
           (조용한 게이트 면제). 실려 있지 않으면 이 축은 참이다(범위 위반이 없다).
+        ★성찰 P17: `_read_json_tolerant` 로 판독한다(FIFO 정지 0 — 위 `_event_hook_registered` 와 같은 근거).
         """
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return True                    # 판독 불가는 이 축의 사실이 아니다(등록 축이 잰다)
+        data = _read_json_tolerant(settings_path)
+        # 판독 불가(None)는 이 축의 사실이 아니다(등록 축이 잰다) — 종전과 같은 True.
         if not isinstance(data, dict):
+
             return True
         prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
         want = declared_matcher or ""
@@ -4009,15 +4011,15 @@ class Preflight:
           (`sh "/opt/cys/pack/hooks/role-capability-gate.sh"`) 거짓이 되어 ①해제 대상에서 빠지고
           ②'미등록' 으로 **거짓 보고**된다 — 그 사이 훅은 계속 실행된다. 해제·잔존 판정은
           `_unregister_event_hook` 이 실제로 지우는 것과 **같은 소유 술어**로 재야 한다.
+        ★성찰 P17: `_read_json_tolerant` 로 판독한다(FIFO 정지 0 — 같은 커밋에서 신설된 이 판독기 2개가
+          `.claude.json` 에 적용한 하드닝을 빠뜨렸다).
         """
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
+        data = _read_json_tolerant(settings_path)
         if not isinstance(data, dict):
             return False
         prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
         for entry in data.get("hooks", {}).get(event, []):
+
             if not isinstance(entry, dict):
                 continue
             for h in entry.get("hooks", []):
@@ -5031,12 +5033,13 @@ class Preflight:
 
     @staticmethod
     def _guard_wired(settings_path):
-        """PreToolUse 에 팩경로 guard.sh(hooks/guard.sh) 배선이 있으면 True."""
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
+        """PreToolUse 에 팩경로 guard.sh(hooks/guard.sh) 배선이 있으면 True.
+        ★성찰 P17: 같은 정리 대상 — `_read_json_tolerant`(FIFO 정지 0)."""
+        data = _read_json_tolerant(settings_path)
+        if not isinstance(data, dict):
             return False
         for entry in data.get("hooks", {}).get("PreToolUse", []):
+
             if not isinstance(entry, dict):
                 continue
             for h in entry.get("hooks", []):
@@ -5258,8 +5261,14 @@ class Preflight:
         cid = "C82.gate-corpus-drift"
         if self.skipped(cid):
             return
-        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
+        # ★성찰 P14: 해석 순서는 `_capgate_alert_axis` 와 **같아야 한다**(축 1지점 규칙).
+        #   종전 `which("cys") or CYS_BIN` 은 명시 오버라이드를 PATH 발견 뒤에 뒀다 — 릴리스
+        #   검증에서 `CYS_BIN=/…/0.14.31/cys` 를 주고 PATH 에 0.14.30 이 남으면 C28 은 신형에,
+        #   C82 는 **구형**에 물어 `SKIP 동사 부재` 를 냈다(드리프트를 재라고 만든 축이 '잴 수
+        #   없음' 으로 접힌다). 명시 오버라이드가 이긴다.
+        cys = os.environ.get("CYS_BIN") or shutil.which("cys")
         if not cys:
+
             self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가")
             return
         try:
@@ -8307,7 +8316,18 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     return R, "REFUSE", "unverified(%s) — --force-unverified 없이는 거부" % pdetail
                 note.append("force-unverified(%s)" % pdetail)
             elif count > 0:
-                return R, "REFUSE", "live-claude(n=%d · %s)" % (count, pdetail)
+                # ★성찰 P15: 가동 중 함대에서 **가장 흔한** REFUSE 인데 처방 문장이 없었다 —
+                #   기존 문서 + 플래그 부재(에러 4 가 실제로 일어난 상태)인 계정 dir 은 그 좌석들이
+                #   사는 한 매 부트 같은 WARN 만 반복하고 스스로 낫지 않는다. 다른 REFUSE 에는 있는
+                #   '사람이 1회 통과' 문장을 여기에도 둔다(§9 WP-2 의 '4계정 dir true' 가 그 부서
+                #   claude 가 전부 죽어 있는 창에서만 달성된다는 사실을 문면이 실어 나른다).
+                return R, "REFUSE", ("live-claude(n=%d · %s) — 그 config 의 claude 가 도는 동안은 "
+                                     "시드하지 않는다(메모리에 든 기존 문서를 지킨다). 세대교체로 "
+                                     "닫힌다: `cys-dept rotate <dept>` 직후 launch 경로가 시드한다 "
+                                     "· 또는 그 좌석에서 관문을 1회 수동 신뢰하면 claude 자신이 "
+                                     "플래그를 쓰고 이후는 already-trusted 다"
+                                     % (count, pdetail))
+
             else:
                 note.append("probe=%s" % pdetail)          # 무엇이 0 을 검증했는지 사유에 남긴다(감사 · 스텁/실물 구분)
         else:
@@ -9697,6 +9717,23 @@ def _self_test():
         check("C82 run() 배선(마지막 고정 슬롯 C62 앞)",
               "c82_gate_corpus_drift" in run_src2
               and run_src2.index("c82_gate_corpus_drift") < run_src2.index("c62_pack_heal_ledger"))
+        # ── ★성찰(2026-09-10) 핀 — P14 축 1지점 · P15 처방 문면 · P17 FIFO 정지 하드닝 ──
+        check("P14: C82 의 cys 해석은 **명시 오버라이드 우선** — _capgate_alert_axis 와 같은 순서(축 1지점)",
+              'os.environ.get("CYS_BIN") or shutil.which("cys")' in c82_src
+              and 'os.environ.get("CYS_BIN") or shutil.which("cys")'
+              in _pin_src(Preflight._capgate_alert_axis)
+              and 'shutil.which("cys") or os.environ.get("CYS_BIN")' not in c82_src)
+        check("P15: live-claude REFUSE 에 실행 가능한 처방(rotate 세대교체 또는 관문 1회 수동 신뢰)이 실린다",
+              "live-claude(n=%d" in seed_src and "cys-dept rotate" in seed_src
+              and "관문을 1회 수동 신뢰" in seed_src)
+        for _fn, _nm in ((Preflight._event_hook_registered, "_event_hook_registered"),
+                         (Preflight._event_hook_scope_ok, "_event_hook_scope_ok"),
+                         (Preflight._event_hook_present_any, "_event_hook_present_any"),
+                         (Preflight._guard_wired, "_guard_wired")):
+            _s = _pin_src(_fn)
+            check("P17: %s 는 막히지 않는 관용 판독(_read_json_tolerant) — 무가드 json.load(open( 0" % _nm,
+                  "_read_json_tolerant(settings_path)" in _s and "json.load(open(" not in _s)
+
     except Exception as e:
         # ★R7(리뷰 claude minor): 핀 표현식 하나가 예외로 죽어도 **결과 줄은 반드시 낸다** — 종전엔 트레이스백이
         #   self-test 전체를 삼켜 나머지 핀의 상태가 가려졌다(회귀 진단이 트레이스백 1개로 축소).
