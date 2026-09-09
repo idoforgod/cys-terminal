@@ -2290,16 +2290,33 @@ def cso_bash_verdict(command, ti, ctx):
         #   `NUL`)은 거부한다 — unix bash 는 그것으로 cwd 에 일반 파일을 만들거나 자른다.
         #   '폐기하려는 의도' 와 '파일을 만드는 사실' 이 갈리는 표기는 판정하지 않는다
         #   (`/dev/null` 로 적으면 된다). nt(Git Bash)에서는 이 목록이 공집합이다.
-        if _is_foreign_null(_txt(target)):
+        # ★리다이렉트 대상은 **변수를 해소한 뒤** 판정한다(0.14.31 성찰 G4 · major):
+        #   종전은 원 토큰을 그대로 `cso_path_allowed` 에 넘겼고, `_norm` 은 `$HOME` 을 전개하지
+        #   않아 `<cwd>/$HOME/…` 로 정규화했다 — 게이트가 본 경로 ≠ bash 가 쓰는 경로.
+        #   ⓐ 거부 방향(항상): `> "$HOME/Desktop/CYSjavis/cso/logs/s.txt"` 가 리터럴 경로와 달리
+        #      deny 됐다(지침 §1-1 문면 `cso_expansion_hazard` 가 **권장하는 철자**가 막혔다).
+        #   ⓑ 허용 방향(cwd 가 허용 뿌리일 때): `> "$HOME/.claude/settings.json"`(훅 등록 파일 =
+        #      게이트 자기 해제) · `> "$HOME/.cys/state/delivery-ledger.jsonl"` · `> "$CYS_PACK_DIR/
+        #      hooks/role-capability-gate.sh"` · `> "$HOME/.ssh/authorized_keys"` 가 전부 ALLOW 였다.
+        #   형제 `_ro_segment_verdict`·`_py_segment_verdict` 와 같은 철자(`_resolve_token`)로
+        #   해소하고, 그 값으로 폐기 장치·허용 경로·상태 파일 판정을 **전부** 다시 한다.
+        #   해소 불가(None)는 `cso_split` 이 이미 거부하지만 여기서도 거부다(심층 방어 · 값을
+        #   모르면 효과를 판정할 수 없다).
+        _rt = _resolve_token(target, ctx)
+        if _rt is None:
+            return True, ("출력 리다이렉트 대상 `%s` 의 변수를 해소할 수 없다 — 허용 표기는 "
+                          "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` 뿐이다"
+                          % _txt(target)), False
+        if _is_foreign_null(_txt(_rt)):
             return True, ("`%s` 는 이 플랫폼의 폐기 장치가 아니다 — %s 에서는 **평범한 파일**을 "
                           "만들거나 자른다(폐기하려면 `%s` 로 적어라)"
-                          % (_txt(target), os.name, SHELL_NULL_DEVICES[0])), False
-        ok, why = cso_path_allowed(target, ctx)
+                          % (_txt(_rt), os.name, SHELL_NULL_DEVICES[0])), False
+        ok, why = cso_path_allowed(_rt, ctx)
         if not ok:
-            return True, "출력 리다이렉트 대상 %r: %s" % (_txt(target), why), False
-        if is_cso_state_file(target):
+            return True, "출력 리다이렉트 대상 %r: %s" % (_txt(_rt), why), False
+        if is_cso_state_file(_rt):
             return True, ("상태 파일(%s)에 셸 리다이렉트로 쓰면 64KB 상한 검사를 건너뛴다 — "
-                          "Write/Edit 도구를 써라" % _txt(target)), False
+                          "Write/Edit 도구를 써라" % _txt(_rt)), False
     if not segs:
         return False, "실행 세그먼트 없음", False
     essential = True
@@ -3156,6 +3173,19 @@ def self_test_contracts(fails):
     want(True, "Bash", {"command": "cat /w/big > /w/pack/round/CSO_TODO.md"},
          "상태 파일 리다이렉트(상한 우회)")
     want(False, "Bash", {"command": "cys status > /dev/null"}, "/dev/null 싱크")
+    # ★G4(0.14.31 성찰): 리다이렉트 대상의 변수는 **해소한 뒤** 판정한다 — 지침 문면이 권장하는
+    #   철자가 리터럴 경로와 다른 판정을 받으면 CSO 는 "허용 경로에 로그를 남겨라" 를 따를 수 없다.
+    want(False, "Bash",
+         {"command": 'cys read-screen 7 > "$HOME/Desktop/CYSjavis/cso/logs/s.txt"'},
+         "G4 ⓐ `$HOME` 허용 뿌리 리다이렉트는 리터럴 경로와 같은 판정(오탐 금지)")
+    want(False, "Bash", {"command": 'cys status --json > "${HOME}/.cys/state/cso/status.json"'},
+         "G4 ⓐ `${HOME}` 자기 작업 트리도 같다")
+    want(False, "Bash", {"command": "cys status --json > ~/.cys/state/cso/status.json"},
+         "G4 ⓐ 인용 없는 `~/` 도 같다")
+    want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/delivery-base.jsonl"'},
+         "G4 ⓑ 해소된 경로로 데몬 소유 원장을 다시 판정한다(cwd 무관)")
+    want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/SESSION_STATE.md"'},
+         "G4 ⓑ 해소된 경로의 상태 파일 상한 우회도 잡는다")
     want(True, "Write", {"file_path": PACK + "/round/MASTER_TODO.md", "content": "x"},
          "같은 팩의 남의 TODO")
     # 64KB 상한 — UTF-8 바이트 · replace_all · MultiEdit 누적 · 축소 허용.
@@ -3828,6 +3858,20 @@ def self_test_r2(fails):
              "큰따옴표 판도 같다", c=ctx_scratch())
         want(True, "Bash", {"command": "cys send --queued --to master \\> --clear-first"},
              "이스케이프 판도 같다", c=ctx_scratch())
+        # ★G4 ⓑ(0.14.31 성찰 · 허용 방향): cwd 가 허용 뿌리(스크래치)일 때 종전 판정기는
+        #   `<cwd>/$HOME/…` 를 봤고 그것이 허용 뿌리 안이라 **전부 ALLOW** 였다 — bash 가 실제로
+        #   여는 파일은 훅 등록 파일·배달 원장·게이트 자신·authorized_keys 다. 4종 전부 deny.
+        want(True, "Bash", {"command": 'cys status > "$HOME/.claude/settings.json"'},
+             "G4 ⓑ 훅 등록 파일(게이트 자기 해제)", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/delivery-ledger.jsonl"'},
+             "G4 ⓑ 배달 원장", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$CYS_PACK_DIR/hooks/role-capability-gate.sh"'},
+             "G4 ⓑ 게이트 자신", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$HOME/.ssh/authorized_keys"'},
+             "G4 ⓑ authorized_keys", c=ctx_scratch())
+        # 양성 대조: 같은 cwd 에서 스크래치 상대 경로는 여전히 허용(해소가 오탐을 만들지 않는다).
+        want(False, "Bash", {"command": "cys status > ./probe.log"},
+             "G4 양성 대조: 스크래치 상대 경로", c=ctx_scratch())
     except OSError:
         pass
     finally:

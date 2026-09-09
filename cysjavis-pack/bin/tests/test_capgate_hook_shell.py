@@ -653,6 +653,11 @@ class NegativeControls(unittest.TestCase):
         ("옵션 종료 `--` 처리",
          '    args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args',
          "    args = raw_args"),
+        # ★0.14.31 성찰 G4 — 리다이렉트 대상의 변수 해소를 지우면(원 토큰 판정) 게이트가 본
+        #   경로 ≠ bash 가 쓰는 경로로 돌아간다(거부 방향 오탐 + cwd 허용 뿌리에서의 허용 방향).
+        ("리다이렉트 대상 변수 해소(G4)",
+         "        _rt = _resolve_token(target, ctx)\n",
+         "        _rt = target\n"),
     ]
 
     @NEED_SH
