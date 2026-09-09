@@ -548,6 +548,32 @@ pub const STATUS_ROW_PAD_MIN: usize = 4;
 /// 하나라도 오면 그 줄은 사람이 친 문장이다(`shift+tab does what?` · `bypass permissions can be
 /// disabled?`). 목록에 없는 어휘의 귀결은 **보류**이므로 방향은 조이는 쪽 하나다.
 pub const STATUS_ROW_TAIL_WORDS: [&str; 2] = ["on", "off"];
+/// ★(0.14.31 · 성찰 R1 · codex blocking ≡ claude R1-F1) **둘째 조각 이후**의 낱말 상한.
+///
+/// 실측 꼬리 조각은 전부 4낱말 이하다 — `← for agents` · `Gemini 3.8 Flash` · `hig` ·
+/// `2 shells, 1 monitor` · `gpt-6-astra medium` · `~63% context left`. 사람이 조각 구분자
+/// (`·` · 열 패딩) 뒤에 이어 붙이는 말은 문장이라 이보다 길다. 넘치면 **보류**(리셋 안 함)다.
+pub const STATUS_ROW_TAIL_CHIP_MAX_WORDS: usize = 4;
+/// ★(0.14.31 · 성찰 R1) 낱말의 앞뒤에서 벗기는 문장부호 — 조각 안 낱말의 **모양**을 보기 전에
+/// 장식·괄호·쉼표를 떼어 낸다(`shells,` → `shells` · `~63%` → `63%` · `(shift+tab` → `shift+tab`).
+const STATUS_ROW_WORD_TRIM: [char; 11] = ['~', ',', ';', ':', '(', ')', '[', ']', '/', '$', '"'];
+/// ★(0.14.31 · 성찰 R1 · blocking) **사람 문장의 낱말**. 상태 바의 조각은 라벨·수치·연결어뿐이고
+/// 의문사·대명사·계사·조동사·서술 동사가 오지 않는다 — 실측 꼬리 조각 전량(위 목록)에 이 낱말이
+/// 하나도 없고, 사람이 구분자 뒤에 이어 붙이는 말(`why is it missing` · `is it safe` ·
+/// `does nothing on my screen`)에는 반드시 하나 이상 있다.
+///
+/// 【실패 방향】 목록에 없는 낱말은 '라벨' 로 통과하므로 이 축 단독으로는 fail-open 이다. 그래서
+/// 낱말 수 상한([`STATUS_ROW_TAIL_CHIP_MAX_WORDS`])·물음표 금지·낱말 모양 세 벨트와 **AND** 로만
+/// 쓴다. 목록에 잘못 넣은 낱말의 귀결은 **보류**(리셋 안 함 = 0.14.30 거동)라 조이는 쪽이다.
+const STATUS_ROW_SENTENCE_WORDS: [&str; 80] = [
+    "i", "me", "my", "mine", "you", "your", "yours", "we", "us", "our", "it", "its", "this",
+    "that", "these", "those", "they", "them", "their", "he", "she", "him", "her", "is", "are",
+    "am", "was", "were", "be", "been", "being", "do", "does", "did", "don", "doesn", "can",
+    "cant", "could", "should", "would", "will", "wont", "shall", "may", "might", "must", "why",
+    "what", "how", "when", "where", "who", "whom", "which", "whether", "not", "please", "help",
+    "missing", "safe", "nothing", "the", "an", "and", "but", "if", "because", "there", "here",
+    "with", "about", "just", "very", "really", "also", "again", "still", "already", "maybe",
+];
 /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2) 꼬리가 빈 분기에서 상태줄을 **이 composer 의 것**으로
 /// 인정하는 최대 거리(행). 실측 2.1.241 레이아웃은 2행(`? for shortcuts` → `…43% context left` → `❯ `)이고,
 /// 사용자 statusLine 한 줄이 더 낄 수 있어 여유를 둔다. 그보다 멀면 스크롤백의 역사로 본다(조여지는 방향).
@@ -1332,8 +1358,18 @@ pub fn composer_layout_static_ok(
 ///   ⓒ **첫 조각**이 장식 글리프로 **시작**한다(어딘가에 하나 있는 것으로는 부족하다 — 위치가
 ///      재료다. `shift+tab does what?` 의 `?` 는 꼬리라 자격이 없다)
 ///   ⓓ 그 조각이 토큰으로 시작하고, 토큰 **뒤**는 [`status_row_tail_ok`] 문법뿐이다
+///   ⓔ **나머지 조각 전부**가 [`status_row_chip_tail_ok`] 문법이다 — 미분류 조각이 하나라도
+///      남으면 거짓이다
 /// 방향은 조이는 쪽 하나다: 실측 4종은 그대로 통과하고(가용성 대조군 검체), 통과하지 못하면
 /// 귀결은 **보류**다(리셋 안 함 = 0.14.30 의 종전 거동).
+///
+/// ★(0.14.31 · 성찰 R1 · codex blocking ≡ claude R1-F1) **ⓔ 가 왜 필요한가 — 첫 조각만 보면
+/// 구분자 뒤는 무검사다.** 종전 판정은 `chips.first()` 하나였다. 그러면 사람이 실측 상태줄을
+/// 그대로 복사해 뒤에 질문을 이어 붙인 초안(`? for shortcuts · why is it missing` · 4칸 패딩
+/// 변형 · `⏵⏵ bypass permissions on · …`)이 전부 상태줄로 인정된다 — ⓐ~ⓓ 는 **첫 조각에서**
+/// 이미 만족되기 때문이다. 그 귀결은 R1 이 닫으려던 바로 그 사슬이다:
+/// `screen_empty=true` → quiet 초 지속 → `governance::maybe_reset_stale_pending_input` 이
+/// `pending_input_bytes` 를 0 으로 지움 → 다음 틱이 큐 본문을 사람 초안과 **한 줄로 합쳐 제출**.
 fn is_status_row(l: &str) -> bool {
     let norm = first_run_gates::normalize(l).to_lowercase();
     let t = norm.trim();
@@ -1343,8 +1379,12 @@ fn is_status_row(l: &str) -> bool {
     if t.chars().any(|c| !(c.is_ascii() || STATUS_ROW_DECOR.contains(&c))) {
         return false; // ⓑ 사람 문장의 문자(한글·CJK 등)
     }
-    // ⓒⓓ 조각 문법 — **원문**에서 가른다(정규화 공간은 공백 런을 한 칸으로 접어 열 패딩을 지운다).
-    status_row_chips(l).first().is_some_and(|c| status_row_chip_ok(c))
+    // ⓒⓓⓔ 조각 문법 — **원문**에서 가른다(정규화 공간은 공백 런을 한 칸으로 접어 열 패딩을 지운다).
+    let chips = status_row_chips(l);
+    let Some((head, tail)) = chips.split_first() else {
+        return false;
+    };
+    status_row_chip_ok(head) && tail.iter().all(|c| status_row_chip_tail_ok(c))
 }
 
 /// 상태줄을 조각으로 가른다 — 가운뎃점(`·`)과 열 패딩([`STATUS_ROW_PAD_MIN`] 칸 이상 연속 공백).
@@ -1391,21 +1431,105 @@ fn status_row_chip_ok(chip: &str) -> bool {
         .is_some_and(|k| status_row_tail_ok(head[k.len()..].trim()))
 }
 
+/// ★(0.14.31 · 성찰 R1 · blocking) 상태 바 조각의 **낱말 하나**가 위젯의 말인가, 사람의 말인가.
+///
+/// 【실측 낱말 전량】 장식(`←` `⏵⏵` `…`) · 수치(`3.8` `43%` `5h` `20%` `2`) · 하이픈 식별자
+/// (`gpt-6-astra`) · 라벨(`for` `agents` `shells` `monitor` `gemini` `flash` `hig` `opus` `ctx`
+/// `context` `left` `medium`) · 이어쓰기 부호를 낀 낱말(`shift+tab`).
+///
+/// 【규칙 — 모양의 allowlist】 앞뒤의 장식·문장부호([`STATUS_ROW_WORD_TRIM`])를 벗긴 뒤:
+///   ⓐ 남은 것이 없다 → 장식만인 낱말(참)
+///   ⓑ 숫자를 담았다 → 문자는 영숫자와 `. - + / %` 뿐이고, **숫자로 시작**하거나 하이픈으로 갈린
+///      조각 중 하나가 **전부 숫자**여야 한다(`gpt-6-astra` 참 · `missing2`·`why-is-it-missing2`
+///      거짓 — 금지 낱말에 숫자만 붙이는 우회를 이 항이 닫는다)
+///   ⓒ 숫자가 없다 → 문자는 알파벳과 `- + /` 뿐이고, 이어쓰기 부호로 갈린 조각 어느 것도
+///      [`STATUS_ROW_SENTENCE_WORDS`] 에 없어야 한다
+///
+/// 【받아들인 잔여 — codex(gpt-6-astra) 설계 검토 2026-09-10】 이 문법은 **모양**만 보므로
+/// 순수 명사구·오류 코드는 통과한다(`404` · `HTTP 500` · `keyboard shortcuts broken`).
+/// 닫지 못하는 이유는 어휘를 닫힌 목록으로 만들면 모델명·사용자 statusLine(고정 문법이 없다)이
+/// 통째로 거부되어 좌석이 리셋 자격을 영영 잃기 때문이다. 잔여의 **크기**는 첫 조각 문법이
+/// 정한다 — 이 잔여가 발화하려면 사람이 초안 첫머리에 상태 바 접두(`? for shortcuts` ·
+/// `⏵⏵ bypass permissions on`)를 **글자 그대로** 쳐 두어야 한다. 종전(구분자 뒤 무검사)에 견주면
+/// 남은 표면은 그 접두를 친 줄로 한정된다.
+fn status_row_word_ok(word: &str) -> bool {
+    let w = word
+        .trim_matches(|c: char| STATUS_ROW_DECOR.contains(&c) || STATUS_ROW_WORD_TRIM.contains(&c));
+    if w.is_empty() {
+        return true; // ⓐ 장식만인 낱말
+    }
+    if w.chars().any(|c| c.is_ascii_digit()) {
+        // ⓑ 수치·식별자
+        if !w
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '/' | '%'))
+        {
+            return false;
+        }
+        if w.starts_with(|c: char| c.is_ascii_digit()) {
+            return true;
+        }
+        return w.split('-').any(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())
+        }) && w.split('-').all(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric())
+        });
+    }
+    // ⓒ 라벨 낱말
+    w.chars().all(|c| c.is_ascii_alphabetic() || matches!(c, '-' | '+' | '/'))
+        && w.split(|c: char| matches!(c, '-' | '+' | '/'))
+            .all(|seg| !STATUS_ROW_SENTENCE_WORDS.contains(&seg))
+}
+
+/// ★(0.14.31 · 성찰 R1 · blocking) **둘째 조각 이후**의 조각 문법 — 토큰을 담지 않는 조각이
+/// 상태 바의 조각인가, 사람이 이어 붙인 말인가.
+///
+/// 【실측 꼬리 조각 전량】 `← for agents`(2.1.263) · `Gemini 3.8 Flash` · `hig`(사용자 statusLine) ·
+/// `2 shells, 1 monitor`(2.1.263) · `gpt-6-astra medium` · `~63% context left`(codex-cli 0.153.4) ·
+/// `/rc`·`CTX 35%`·`5h 20%`(실측 사용자 statusLine · `LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT`).
+///
+/// 【규칙 — 전부 AND】 ⓐ 물음표·느낌표가 없다 ⓑ 낱말 수 ≤ [`STATUS_ROW_TAIL_CHIP_MAX_WORDS`]
+/// ⓒ 낱말 전부가 [`status_row_word_ok`] 다.
+///
+/// 【실패 방향】 어느 하나라도 거짓이면 그 줄은 상태줄이 아니고, 귀결은 **보류**(편집 영역을
+/// 비었다고 선언하지 않음 = 0.14.30 거동)다.
+fn status_row_chip_tail_ok(chip: &str) -> bool {
+    if chip.contains('?') || chip.contains('!') {
+        return false; // ⓐ
+    }
+    let mut words = 0usize;
+    for w in chip.split_whitespace() {
+        words += 1;
+        if words > STATUS_ROW_TAIL_CHIP_MAX_WORDS || !status_row_word_ok(w) {
+            return false; // ⓑⓒ
+        }
+    }
+    words > 0
+}
+
 /// 토큰 뒤에 허용하는 꼬리 문법 — [`STATUS_ROW_TAIL_WORDS`] 낱말과 **괄호 묶음** 하나뿐이다.
 /// 실측 꼬리는 `on` 과 `on (shift+tab to cycle)` 둘이고, 괄호 안은 낱말·`+`·`-`·`/` 만 받는다
 /// (문장부호가 들어오면 그것은 사람의 말이다).
+///
+/// ★(0.14.31 · 성찰 R1 · codex 설계 검토 2026-09-10) 괄호 갈래에 **두 구멍**이 있었다:
+/// ⓐ 안쪽을 문자 집합으로만 검사해 `? for shortcuts (why is it missing)` · `(please help)` 가
+///   통과했고(꼬리 조각 문법은 이 경로에 도달하지 않는다), ⓑ doc 이 "괄호 묶음 **하나**" 라고
+///   적었는데 루프가 반복을 허용해 `(why is it missing) (please help)` 도 통과했다. 이제 안쪽은
+///   [`status_row_word_ok`] 낱말 문법 + 낱말 수 상한을 지고, 묶음은 **한 번**만 온다.
+///   실측 `(shift+tab to cycle)` 은 그대로 통과한다(조여지는 방향 하나).
 fn status_row_tail_ok(tail: &str) -> bool {
     let mut rest = tail.trim();
+    let mut paren_seen = false;
     while !rest.is_empty() {
         if let Some(after) = rest.strip_prefix('(') {
+            if paren_seen {
+                return false; // ⓑ 묶음은 하나뿐이다
+            }
+            paren_seen = true;
             let Some(end) = after.find(')') else { return false };
             let inner = &after[..end];
-            if inner.is_empty()
-                || !inner.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || c == ' ' || c == '+' || c == '-' || c == '/'
-                })
-            {
-                return false;
+            if inner.is_empty() || !status_row_chip_tail_ok(inner) {
+                return false; // ⓐ 안쪽도 조각 문법을 진다
             }
             rest = after[end + 1..].trim_start();
         } else {
@@ -1507,11 +1631,83 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
     //   (커서를 Home 으로 옮긴 상태의 실측 형상 · codex 반례). 마커 줄 바로 아래가 입력 상자
     //   테두리이거나 상태줄이라는 것은 **편집 영역이 비었다**는 구조적 사실이고, 그 밖의 문면은
     //   초안 이어짐일 수 있으므로 증거로 접지 않는다(조여지는 방향 · 실측 2.1.263 은 괘선이라 불변).
+    // ★(0.14.31 · 성찰 R2 · blocking) 그 '한 줄의 모양' 으로는 **두 변이가 남았다** —
+    //   [`marker_row_is_composer_row`] · [`trailer_is_closed_box`] doc 참조. 이제 강한 증거는
+    //   ⓐ 고른 마커 줄이 초안 안의 전사가 아니고 ⓑ 마커 줄 **아래 전량**이 입력 상자를 닫은
+    //   뒤의 위젯(괘선·상태줄)일 때만 선다.
     Some(ComposerScan {
         trailer_empty: false,
-        strong: is_rule_line(trailer[0]) || is_status_row(trailer[0]),
+        strong: marker_row_is_composer_row(&lines, li, marker) && trailer_is_closed_box(&trailer),
         weak: placeholder_ok,
     })
+}
+
+/// ★(0.14.31 · 성찰 R2 · blocking) **변이 A 차단** — [`scan_composer`] 가 `rposition` 으로 고른
+/// 마커 줄이 진짜 composer 행인가, 아니면 **초안 안에 붙여넣은 셸 전사**의 프롬프트 줄인가.
+///
+/// 【무엇이 틀렸었나】 마커 줄 해소가 "마커를 담은 **마지막** 줄" 하나였다. 사람이 셸 전사를
+/// 붙여넣으면(끝 줄이 빈 프롬프트 `  ❯ `) 그 줄이 선택되고, 그 아래는 진짜 입력 상자 괘선·상태줄
+/// 이라 강한 증거가 선다 = 초안이 통째로 있는데 '편집 영역이 비었다'. 그 뒤는 R2 의 사슬 그대로다
+/// (`pending_input_bytes` 소거 → 큐 본문이 사람 초안과 한 줄로 합쳐 제출).
+///
+/// 【장치】 고른 줄에서 **위로** 올라가며 같은 비공백 블록을 훑는다. 빈 줄이나 괘선(입력 상자
+/// 테두리)에서 멎고, 그 전에 **마커를 담은 줄**이 또 있으면 고른 줄은 이 composer 의 행이 아니다
+/// (진짜 composer 행이 위에 있고, 고른 것은 그 안의 초안이다).
+///
+/// 【실패 방향】 오탐(스크롤백 셸 프롬프트가 빈 줄 없이 마커 줄 바로 위에 붙은 pane)의 귀결은
+/// **강한 증거 불인정 = 보류**(리셋 안 함 · 배달 자격 없음)이고, 그것은 0.14.30 거동이다.
+fn marker_row_is_composer_row(lines: &[&str], li: usize, marker: &str) -> bool {
+    for k in (0..li).rev() {
+        let l = lines[k];
+        if l.trim().is_empty() || is_rule_line(l) {
+            return true; // 블록의 끝 — 그 위는 이 입력 상자 밖이다
+        }
+        if l.contains(marker) || l.contains('❯') {
+            return false; // 같은 블록 안에 마커 줄이 또 있다 = 고른 줄은 초안 안이다
+        }
+    }
+    true
+}
+
+/// ★(0.14.31 · 성찰 R2 · blocking) **변이 B 차단** — 마커 줄 아래가 '입력 상자를 **닫은** 뒤의
+/// 위젯' 인가. 인자는 마커 줄 아래의 **비공백** 줄 전량이다.
+///
+/// 【무엇이 틀렸었나】 강한 증거를 `trailer[0]` **한 줄의 모양**으로 셌다. 초안 첫 행이 괘선 모양
+/// (붙여넣은 표·박스의 테두리)이면 그 한 줄만으로 강한 증거가 서고, 그 아래에 초안이 얼마든지
+/// 이어져도 보지 않았다 — R1 의 상태줄 문법 수정은 이 변이에 한 글자도 닿지 않는다(이 줄들은
+/// 상태줄 어휘를 쓰지 않는다).
+///
+/// 【장치 — 괘선의 **개수**가 구조다】 입력 상자의 아래 테두리는 화면에 **한 번** 온다. 그 아래는
+/// 사용자 statusLine·상태 바이고, 거기에 또 괘선이 오지 않는다.
+///   ⓐ 첫 줄이 괘선이다 → 꼬리 전체에 괘선이 **정확히 하나**여야 한다(그 하나가 아래 테두리다).
+///      둘이면 첫 괘선은 초안 안의 줄이고 진짜 테두리는 아래에 있다(= 그 사이가 편집 영역이다).
+///   ⓑ 첫 줄이 상태줄이다 → 꼬리에 괘선이 **하나도 없어야** 한다(상자 없는 2.1.241 계열 레이아웃).
+///      상태줄 아래에 괘선이 있으면 그 상태줄은 아직 상자 **안**이다(= 초안이 상태줄 모양이다).
+///   ⓒ 그 밖은 거짓이다.
+/// 실측 2.1.263(`괘선` + 사용자 statusLine `Opus 5 · CTX 35% … /rc` + `⏵⏵ bypass permissions …`)은
+/// ⓐ로 통과한다 — **꼬리 줄 전량을 위젯 문법으로 검사하지 않는 이유가 그 사용자 statusLine 이다**
+/// (statusLine 출력에는 고정 문법이 없다 · codex 설계 검토 2026-09-10 이 실측 반례로 지적).
+///
+/// 【실패 방향】 괘선이 둘 이상인 정상 레이아웃(장식 괘선을 쓰는 사용자 statusLine)에서는 강한
+/// 증거가 서지 않는다 — 귀결은 **보류**(리셋 안 함)이고 약한 증거 경로(마커 위 상태줄·플레이스홀더
+/// ∧ 출력 정적)는 그대로 남는다.
+fn trailer_is_closed_box(trailer: &[&str]) -> bool {
+    let Some(first) = trailer.first() else {
+        return false;
+    };
+    let mut rules = 0usize;
+    for l in trailer {
+        if is_rule_line(l) {
+            rules += 1;
+        }
+    }
+    if is_rule_line(first) {
+        rules == 1 // ⓐ
+    } else if is_status_row(first) {
+        rules == 0 // ⓑ
+    } else {
+        false // ⓒ
+    }
 }
 
 /// ★(0.14.31 · 리뷰 R2 · codex blocking) **composer 편집 영역이 비어 있는가** — 커서 한 행이
@@ -3222,6 +3418,105 @@ mod tests {
                 "멀티라인 초안이 빈 편집 영역으로 읽힌다: {d:?}"
             );
         }
+
+        // ★(0.14.31 · 성찰 R1 · blocking · codex ≡ claude R1-F1) **구분자 뒤도 검사한다.**
+        //   종전 판정은 `chips.first()` 하나였다 — 사람이 실측 상태 바를 복사해 뒤에 말을 이어
+        //   붙인 초안이 전부 상태줄로 인정됐고, 그 귀결이 R1 이 닫으려던 바로 그 사슬이다
+        //   (`pending_input_bytes` 소거 → 큐 본문이 사람 문장과 한 줄로 합쳐 제출).
+        //   5변형은 판정서가 실행으로 확인한 문면이다.
+        let pad = " ".repeat(STATUS_ROW_PAD_MIN);
+        let chip_drafts = [
+            ("가운뎃점", "  ? for shortcuts · why is it missing".to_string()),
+            ("열 패딩", format!("  ? for shortcuts{pad}why is it missing")),
+            ("2.1.263 접두", "  ⏵⏵ bypass permissions on · why is it missing".to_string()),
+            ("% 장식", "  ? for shortcuts · % why is it missing".to_string()),
+            // ★codex(gpt-6-astra) 설계 검토 2026-09-10 이 짚은 **첫 조각의 괄호 구멍** — 안쪽을
+            //   문자 집합으로만 검사해 사람 문장이 통째로 들어갔다(꼬리 조각 문법은 여기 못 닿는다).
+            ("괄호 묶음", "  ? for shortcuts (why is it missing)".to_string()),
+            ("괄호 반복", "  ? for shortcuts (shift+tab to cycle) (please help)".to_string()),
+            // 금지 낱말에 숫자만 붙이는 우회(같은 검토의 반례) — 낱말 **모양**이 닫는다.
+            ("숫자 접미 우회", "  ? for shortcuts · why2 is2 it2 missing2".to_string()),
+            ("하이픈 포장 우회", "  ? for shortcuts · why-is-it-missing2".to_string()),
+        ];
+        for (name, d) in &chip_drafts {
+            assert!(!is_status_row(d), "{name}: 구분자 뒤 사람 문장이 상태줄로 인정됐다: {d:?}");
+            let below = format!("  prev output\n❯ \n{d}\n");
+            assert!(
+                !composer_edit_region_empty(&below, "❯", None),
+                "{name}: 구분자 뒤 사람 문장이 빈 편집 영역으로 읽힌다: {d:?}"
+            );
+            assert!(
+                !composer_layout_positive(&below, "❯", None),
+                "{name}: 구분자 뒤 사람 문장이 강한 레이아웃 증거로 세어졌다: {d:?}"
+            );
+        }
+        // ⓔ CRLF + 우측 패딩(ConPTY 렌더)에서도 같다 — 장식·열 패딩에 기대는 축이라 함께 잰다.
+        let crlf = format!(
+            "  prev output\r\n❯ \r\n  ? for shortcuts · why is it missing{}\r\n",
+            " ".repeat(12)
+        );
+        assert!(
+            !composer_edit_region_empty(&crlf, "❯", None),
+            "CRLF+우측 패딩 렌더에서 구분자 뒤 사람 문장이 경계로 인정됐다"
+        );
+    }
+
+    /// ★(0.14.31 · 성찰 R2 · blocking) **초안 부재는 '한 줄의 모양' 이 아니라 상자 구조다.**
+    ///
+    /// R1 의 상태줄 문법 수정은 이 두 변이에 **한 글자도 닿지 않는다**(둘 다 상태줄 어휘를 쓰지
+    /// 않는다). 그래서 `scan_composer` 의 두 축을 따로 잰다:
+    ///   ⓐ 변이 A — 초안이 마커 글리프를 담은 **셸 전사**다. `rposition` 이 초안 안의 `❯` 줄을
+    ///      마커 줄로 골랐고, 그 아래는 진짜 입력 상자라 강한 증거가 섰다.
+    ///   ⓑ 변이 B — 초안 **첫 행이 괘선** 이다(붙여넣은 표·박스). `trailer[0]` 한 줄만 보고
+    ///      강한 증거가 섰다.
+    /// 가용성 대조군은 실측 두 장이다 — 2.1.263 상자(사용자 statusLine 포함) · 2.1.241 꼬리 없는
+    /// 유휴 프롬프트. 조인 방향이 실측을 깨면 좌석이 리셋 자격을 영영 잃는다.
+    #[test]
+    fn reflect_r2_pasted_marker_and_rule_drafts_are_not_an_empty_edit_region() {
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        // ⓐ 변이 A — 붙여넣은 셸 전사의 마지막 줄이 빈 프롬프트다.
+        let variant_a = format!(
+            "  prev output\n{rule}\n❯ \n  $ ls -la\n  total 24\n  ❯ \n{rule}\n  ⏵⏵ bypass permissions on\n"
+        );
+        // ⓑ 변이 B — 초안 첫 행이 괘선 모양이고 그 아래로 초안이 이어진다.
+        let variant_b = format!(
+            "  prev output\n{rule}\n❯ \n{rule}\n  | 붙여넣은 표의 한 행 |\n{rule}\n  ⏵⏵ bypass permissions on\n"
+        );
+        // ⓑ' codex 설계 검토 반례 — 초안이 **허용 모양으로만** 끝난다(괘선 두 장).
+        let variant_b2 = format!("❯ \n{rule}\n{rule}\n  ? for shortcuts\n");
+        // ⓑ'' 같은 반례 — 초안이 상태줄 모양이고 그 아래에 진짜 상자 테두리가 있다.
+        let variant_b3 = format!("❯ \n  ? for shortcuts\n{rule}\n  ? for shortcuts\n");
+        for (name, screen) in [
+            ("A/셸 전사", &variant_a),
+            ("B/괘선 초안", &variant_b),
+            ("B'/괘선 두 장", &variant_b2),
+            ("B''/상태줄 초안", &variant_b3),
+        ] {
+            assert!(
+                !composer_edit_region_empty(screen, "❯", None),
+                "{name}: 초안이 살아 있는데 '빈 편집 영역' 으로 읽힌다 — stale 리셋이 그 초안을 지운다"
+            );
+            assert!(
+                !composer_layout_positive(screen, "❯", None),
+                "{name}: 초안 화면이 강한 레이아웃 증거로 세어졌다(alt-screen 배달 자격이 열린다)"
+            );
+        }
+        // 가용성 대조군 ① 실측 2.1.263 — 상자 + **사용자 statusLine** + 상태 바.
+        //   (statusLine 출력에는 고정 문법이 없다 — 꼬리 줄 전량을 위젯 문법으로 검사하면 여기서
+        //    회귀한다는 것이 codex 설계 검토 2026-09-10 의 실측 반례였다.)
+        assert!(
+            composer_layout_positive(fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT, "❯", None),
+            "실측 2.1.263 상자가 강한 증거를 잃었다(리셋·배달 자격 영구 상실)"
+        );
+        assert!(
+            composer_edit_region_empty(fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT, "❯", None),
+            "실측 2.1.263 빈 composer 가 리셋 자격을 잃었다"
+        );
+        // 가용성 대조군 ② 실측 2.1.241 — 꼬리가 비었다(마커가 마지막 문면).
+        assert!(
+            composer_edit_region_empty(fixtures::LIVE_TUI_AT_PROMPT, "❯", None),
+            "실측 2.1.241 빈 composer 가 리셋 자격을 잃었다"
+        );
     }
 
     /// ★[수렴 R2 · reviewer-claude minor(H-WIN)] **ConPTY 문면에서도 상태줄 문법이 성립한다.**
