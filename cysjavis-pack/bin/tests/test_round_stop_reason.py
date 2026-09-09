@@ -1486,27 +1486,30 @@ class Wp6TriageEmptyLockReclaim(unittest.TestCase):
 
     def test_ctrl_c_between_mkdir_and_owner_leaves_a_reclaimable_lock(self):
         """도달 경로: `KeyboardInterrupt` 는 `except OSError` 에 걸리지 않아 `__enter__` 밖으로
-        빠져나가고 `__exit__` 도 돌지 않는다 — **빈** 잠금이 남는다."""
-        import builtins
+        빠져나가고 `__exit__` 도 돌지 않는다 — **빈** 잠금이 남는다.
+
+        ★주입 지점은 `os.open`(소유권 배타 게시 · 성찰 R4 N6)이다. 종전에는 `builtins.open` 을
+        가로챘는데, 게시가 `O_EXCL` 로 바뀌면서 그 지점은 **되읽기**가 되어 owner 파일이 이미
+        생긴 뒤였다(빈 잠금이 아니라 owner 있는 잠금이 남아 전제가 깨졌다)."""
         mod = self.mods[0]
         base = os.path.join(self.root, "ctrlc")
         lock = base + ".lock"
-        real_open, hit = builtins.open, []
+        real_os_open, hit = os.open, []
 
         def interrupting_open(f, *a, **kw):
             if not hit and str(f) == os.path.join(lock, "owner"):
                 hit.append(True)
                 raise KeyboardInterrupt("Ctrl-C")
-            return real_open(f, *a, **kw)
+            return real_os_open(f, *a, **kw)
 
-        builtins.open = interrupting_open
+        os.open = interrupting_open
         try:
             with self.assertRaises(KeyboardInterrupt):
                 with mod._best_effort_lock(base, wait=1.0, stale=300.0):
                     pass
         finally:
-            builtins.open = real_open
-        self.assertTrue(hit, "전제 불성립: owner 쓰기 지점에 도달하지 못했다")
+            os.open = real_os_open
+        self.assertTrue(hit, "전제 불성립: owner 게시 지점에 도달하지 못했다")
         self.assertTrue(os.path.isdir(lock) and not os.listdir(lock),
                         "전제 불성립: 빈 잠금이 남지 않았다")
         old = time.time() - 4000
