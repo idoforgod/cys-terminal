@@ -7608,7 +7608,10 @@ fn maybe_reset_stale_pending_input(
         && quiet_for >= quiet
         && !obs.selector_row
         && !obs.busy_near_cursor
-        && cys::readiness::modal_signature(&obs.screen).is_none();
+        // ★(0.14.31 · 성찰 R5 · major) 모달 AND 항은 **어댑터 마커를 들고** 본다 — 종전 스캐너는
+        //   `'❯'` 리터럴 고정이라 codex(`›`)·사용자 어댑터에서 이 항이 상시 참이었다(= 모달 방어
+        //   부재). claude 는 두 값이 같아 거동 불변.
+        && cys::readiness::modal_signature_with_marker(&obs.screen, Some(marker)).is_none();
     let mut slot = s.pending_input_stale.lock().unwrap();
     if !contradiction {
         *slot = None;

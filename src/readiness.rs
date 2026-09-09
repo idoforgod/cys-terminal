@@ -681,9 +681,14 @@ struct CursorRow {
 /// 번호 항목 행 · 다른 선택 커서 행 · 상태줄([`PROMPT_TRAILER_TOKENS`]). 다섯 다 "접힌 라벨의 이어짐"
 /// 으로 볼 수 없는 형상이다(상태줄 어휘는 [`scan_composer`] 의 양성 증거와 **같은 코퍼스**다 —
 /// 그 줄이 나왔다는 것은 입력 상자 블록이 끝났다는 뜻이다).
-fn is_choice_tail_boundary(line: &str) -> bool {
+/// ★(0.14.31 · 성찰 R5 · major) `marker` 는 이 좌석 어댑터의 **선언된** composer 글리프다
+/// (`agents.json` `prompt_marker` — [`marker_of`]). claude 는 `❯` 라 두 값이 같아 거동 불변.
+fn is_choice_tail_boundary(line: &str, marker: Option<&str>) -> bool {
     if line.trim().is_empty() || is_rule_line(line) || is_numbered_item_row(line) || line.contains('❯') {
         return true;
+    }
+    if marker.is_some_and(|m| !m.is_empty() && line.contains(m)) {
+        return true; // 다른 어댑터의 선택 커서 행
     }
     let norm = first_run_gates::normalize(line).to_lowercase();
     PROMPT_TRAILER_TOKENS.iter().any(|t| norm.contains(t))
@@ -699,7 +704,7 @@ fn line_end_of(raw: &[char], from: usize) -> usize {
 }
 
 /// 커서 행에서 시작하는 선택 행 블록의 **원문 끝 위치**([`is_choice_tail_boundary`] 앞에서 멎는다).
-fn choice_tail_end(raw: &[char], cursor: usize) -> usize {
+fn choice_tail_end(raw: &[char], cursor: usize, marker: Option<&str>) -> usize {
     let line_end = |from: usize| -> usize { line_end_of(raw, from) };
     let mut end = line_end(cursor);
     while end < raw.len() {
@@ -710,7 +715,7 @@ fn choice_tail_end(raw: &[char], cursor: usize) -> usize {
         //   판정(`is_numbered_item_row` — `N.` 뒤가 공백/문말)이 `\r` 때문에 거짓이 되어 Windows·
         //   ConPTY 전사에서만 경계를 놓친다(codex 위임 검체가 실제로 이 결함을 잡았다).
         let line = line.strip_suffix('\r').unwrap_or(&line);
-        if is_choice_tail_boundary(line) {
+        if is_choice_tail_boundary(line, marker) {
             return end;
         }
         end = next_end;
@@ -724,14 +729,31 @@ fn choice_tail_end(raw: &[char], cursor: usize) -> usize {
 /// ★스캔은 **원문**에서 한다(리뷰 R4). 커서 뒤 공백 건너뛰기는 개행도 건너뛰므로 접힌 라벨
 ///   (`❯\n  1. Yes …`)은 종전 정규화 공간과 **같은 결과**를 낸다 — 바뀐 것은 물리 행 경계를
 ///   함께 얻는다는 것뿐이다.
-fn cursor_rows(f: &Frame) -> Vec<CursorRow> {
+fn cursor_rows(f: &Frame, marker: Option<&str>) -> Vec<CursorRow> {
     let raw = &f.raw;
+    // ★(0.14.31 · 성찰 R5 · major) 스캐너가 `'❯'` **리터럴**에 고정돼 있었다. codex(`›`)·
+    //   사용자 정의 어댑터에서는 이 벡터가 늘 비었고, 그러면 [`modal_signature`] 의 세 규칙
+    //   (ⓐ cursor-on-exit · ⓓ cursor-on-numbered-item · clipped-choice-row)이 **구조적으로 죽는다** —
+    //   ⓐ `judge` 의 `modal_on_screen` 이 그 좌석에서 아무것도 거부하지 못하고 ⓑ 확인 경계의
+    //   `unknown-modal` 폴백도 서지 못하며 ⓒ `governance::maybe_reset_stale_pending_input` 의
+    //   모달 AND 항이 상시 참이 된다. 같은 파일의 `scan_composer` 는 리뷰 R1(R6회차)에서 정확히
+    //   이 결함을 고쳤다(파일 안에서 판정 분리 금지가 깨져 있던 자리).
+    //   이제 `'❯' ∨ 선언된 어댑터 마커` 로 훑는다 — claude 는 두 값이 같아 거동 불변이다.
+    //   ★fail-open 우려에 대해: 마커의 출처는 `agents.json` 의 **선언된 `prompt_marker`** 하나이고
+    //   (`composer_marker_of`·`merged_prompt_marker` 와 같은 출처 규율 · 성찰 R6 이 세 사본을
+    //   맞췄다), 이 스캐너의 산출이 늘리는 것은 **보류**뿐이다(모달 서명 = 거부 근거).
+    let mk: Vec<char> = marker
+        .filter(|m| !m.is_empty())
+        .map(|m| m.chars().collect())
+        .unwrap_or_default();
     let mut rows = Vec::new();
-    for (i, &c) in raw.iter().enumerate() {
-        if c != '❯' {
+    for i in 0..raw.len() {
+        let default_hit = raw[i] == '❯';
+        let marker_hit = !mk.is_empty() && i + mk.len() <= raw.len() && raw[i..i + mk.len()] == mk[..];
+        if !default_hit && !marker_hit {
             continue;
         }
-        let mut j = i + 1;
+        let mut j = i + if default_hit { 1 } else { mk.len() };
         while j < raw.len() && raw[j].is_whitespace() {
             j += 1;
         }
@@ -758,7 +780,7 @@ fn cursor_rows(f: &Frame) -> Vec<CursorRow> {
             label_flat: f.raw_pre[label_start],
             // 꼬리 경계는 **커서 행**에서 잰다(라벨 시작 행이 아니다 — 라벨 탐색은 개행을 건너뛰므로
             // 경계 너머의 글자를 라벨로 집을 수 있고, 그 경우 `label_flat >= tail_end_flat` 로 걸린다).
-            tail_end_flat: f.raw_pre[choice_tail_end(raw, i)],
+            tail_end_flat: f.raw_pre[choice_tail_end(raw, i, marker)],
             // 행 끝은 **라벨이 시작하는 행**에서 잰다(커서 행이 아니다 — `❯⏎  1. Yes …` 처럼 라벨이
             // 다음 줄로 접힌 렌더에서 커서 행 끝을 쓰면 '라벨 한 글자도 없음' 이 되어 규칙 ①이 죽는다).
             row_end_flat: f.raw_pre[line_end_of(raw, label_start)],
@@ -863,7 +885,11 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> 
     }
     let f = screen_frame(screen);
     let block = choice_block_start(&f.flat, anchors);
-    let rows = cursor_rows(&f);
+    // ★(성찰 R5) 이 술어의 **유일한** 소비처는 폴더신뢰 자동확인(claude)이다 — 어댑터 마커를
+    //   받지 않는다(claude 글리프 `❯` 는 기본 축과 같다). 확인은 '키를 보내도 되는가' 라
+    //   커서 집합을 넓히는 것이 곧 **양성 증거를 넓히는 것**이므로, 실측 없는 어댑터의 글리프를
+    //   여기 들이지 않는다(모달 서명 쪽은 반대다 — 거기서 넓어지는 것은 보류뿐이다).
+    let rows = cursor_rows(&f, None);
     // 양성 증거도 **블록 안**에서만 인정한다 — 이전 화면의 `❯ … Yes …` 잔상이 새 질문 뒤의 잘린 선택을
     // 승인하는 경로를 막는다(리뷰 R4 · codex).
     let starts_here = |r: &CursorRow| -> bool {
@@ -1056,6 +1082,16 @@ fn clipped_choice_cursor(
 ///   allow 구멍의 양성 증거([`cursor_resolves_to_label`])와 이 서명이 **같은 것을 본다**(판정 분리 금지).
 ///   좌표계도 하나다([`screen_frame`] — 정규화·평탄화·원문 셋을 한 번에 만든다).
 pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
+    modal_signature_with_marker(screen, None)
+}
+
+/// 위의 **어댑터 인지판**(0.14.31 · 성찰 R5 · major) — 선택 커서 스캐너가 `'❯'` 외에 이 좌석의
+/// 선언된 composer 글리프도 본다([`cursor_rows`] doc 에 근거 전문).
+///
+/// `marker == None` 이면 [`modal_signature`] 와 **완전히 같다**(claude 는 `❯` 라 두 경로가 같은
+/// 값을 낸다). 소비처가 좌석 어댑터를 손에 들고 있으면 이쪽을 부른다 — `judge`(`modal_on_screen`) ·
+/// `modal_foreground` · `governance::maybe_reset_stale_pending_input` 셋이 그렇다.
+pub fn modal_signature_with_marker(screen: &str, marker: Option<&str>) -> Option<ModalSignature> {
     let f = screen_frame(screen);
     let (norm, flat) = (&f.norm, &f.flat);
     let mut sig = ModalSignature {
@@ -1079,7 +1115,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
     };
 
     // ⓐ·ⓓ·ⓔ·ⓕ — 선택 커서 행(스캐너는 `cursor_rows` 하나 · allow 구멍의 양성 증거와 같은 것을 본다).
-    for row in cursor_rows(&f) {
+    for row in cursor_rows(&f, marker) {
         if let Some(ne) = row.numbered_flat_end {
             sig.note("cursor-on-numbered-item", ne);
         }
@@ -1145,7 +1181,7 @@ pub fn modal_signature(screen: &str) -> Option<ModalSignature> {
 /// **닫지 않는다**(fail-closed = 모달 어휘가 있으면 전경으로 본다). 재주입 창([`modal_window_closed`])과
 /// 같은 판정기다 — 두 소비처가 각자 판정하면 벨트에 구멍이 난다.
 pub fn modal_foreground(screen: &str, marker: Option<&str>) -> Option<ModalSignature> {
-    let sig = modal_signature(screen)?;
+    let sig = modal_signature_with_marker(screen, marker)?;
     if modal_left_behind(&sig, screen, marker) {
         None
     } else {
@@ -1736,7 +1772,7 @@ fn modal_on_screen(o: &Observed) -> Option<ModalSignature> {
     if o.legacy_v1 {
         return None;
     }
-    let sig = modal_signature(o.screen)?;
+    let sig = modal_signature_with_marker(o.screen, marker_of(o))?;
     (!modal_window_closed(o, &sig)).then_some(sig)
 }
 
@@ -3628,10 +3664,10 @@ mod tests {
             ));
         }
         for (name, line) in &boundaries {
-            assert!(is_choice_tail_boundary(line), "{name}: 경계 줄을 놓쳤다: {line:?}");
+            assert!(is_choice_tail_boundary(line, None), "{name}: 경계 줄을 놓쳤다: {line:?}");
         }
         for line in [folded_tail.as_str(), partial_label.as_str(), "Welcome back", "  일반 출력 한 줄", "문장 속 ─ 기호"] {
-            assert!(!is_choice_tail_boundary(line), "평문 또는 접힌 라벨 조각을 경계로 오인했다: {line:?}");
+            assert!(!is_choice_tail_boundary(line, None), "평문 또는 접힌 라벨 조각을 경계로 오인했다: {line:?}");
         }
 
         // find는 바이트 위치이므로 반드시 문자 수로 변환한다. 한글 머리말과 ❯가 혼동을 드러낸다.
@@ -3652,7 +3688,7 @@ mod tests {
                     rendered_prefix.push('\r');
                 }
                 let expected_end = rendered_prefix.chars().count();
-                let actual_end = choice_tail_end(&raw, cursor);
+                let actual_end = choice_tail_end(&raw, cursor, None);
                 assert_eq!(actual_end, expected_end, "{name}/{render}: 원문 끝 인덱스가 틀렸다: {text:?}");
                 let actual_flat = raw[..actual_end].iter().filter(|c| !c.is_whitespace()).count();
                 assert_eq!(actual_flat, expected_flat, "{name}/{render}: 끝까지의 비공백 문자 수가 틀렸다");
@@ -3694,7 +3730,7 @@ mod tests {
         check("빈 화면의 cursor=0", "", "".len());
 
         let raw: Vec<char> = "한글 기록".chars().collect();
-        assert_eq!(choice_tail_end(&raw, raw.len()), raw.len(), "cursor가 원문 끝이면 원문 길이를 반환해야 한다");
+        assert_eq!(choice_tail_end(&raw, raw.len(), None), raw.len(), "cursor가 원문 끝이면 원문 길이를 반환해야 한다");
     }
 
     /// ★(0.14.31 · 리뷰 R1(R6회차) · codex blocking) **꼬리에 이어지는 무관한 줄이 잘린 선택기 거부를
@@ -4081,7 +4117,7 @@ mod tests {
         // 경쟁 판정의 순수 술어 직접 실행 — 번호 커서 · 라벨 유무 · 블록 경계.
         let probe = |line: &str, block: usize| -> bool {
             let f = screen_frame(line);
-            let rows = cursor_rows(&f);
+            let rows = cursor_rows(&f, None);
             assert_eq!(rows.len(), 1, "전제: 커서 1개\n{line}");
             cursor_row_competes(&rows[0], &f.flat, block)
         };
@@ -4184,6 +4220,97 @@ mod tests {
         assert!(held_as(&judge(&r), MODAL_UNKNOWN_ID), "{:?}", judge(&r));
     }
 
+    /// ★(0.14.31 · 성찰 R5 · major) **미등재 모달 방어의 커서 스캐너가 어댑터 마커를 본다.**
+    ///
+    /// 종전 [`cursor_rows`] 는 `'❯'` 리터럴 고정이라 codex(`›`)·사용자 어댑터 좌석에서 세 규칙
+    /// (커서-종료 · 커서-번호 항목 · 잘린 선택 행)이 **구조적으로 죽었다** — 코퍼스 밖 선택기
+    /// (`› 1. Yes, proceed`)에 디렉티브가 붙여넣어지고 그 Return 이 선택지를 누른다.
+    /// 재는 것: ⓐ 마커 없는 스캔은 그 프레임을 모달로 보지 못한다(결함 실재 · 계측 타당성)
+    /// ⓑ 마커를 들면 서명이 서고 `judge` 는 양성 증거 종류와 무관하게 `GateHeld{unknown-modal}` 다
+    /// ⓒ claude 프레임 **전량**(관문 6장 · 정상 화면 · 코퍼스 밖 모달 · 본문 표)에서 두 경로
+    /// (`None` · `Some("❯")`)가 같은 값이다(거동 불변) ⓓ codex 정상 유휴(플레이스홀더)·출력 속 인용
+    /// 행은 마커를 들어도 모달이 아니다(가용성 — 넓어지는 것은 보류뿐이어야 하지만 유휴까지 접으면
+    /// 영구 보류다).
+    #[test]
+    fn reflect_r5_adapter_marker_arms_the_unknown_modal_belt_for_non_claude_seats() {
+        let gates = first_run_gates::builtin();
+        // codex 실측 형상의 코퍼스 밖 선택기 — 질문이 위로 밀려 잘린 렌더(needle 없음).
+        let codex_modal = "› 1. Yes, proceed\n  2. No\n";
+        assert!(first_run_gates::identify(&gates, codex_modal).is_none(), "전제: 코퍼스가 모르는 선택기");
+        // ⓐ 결함 실재 — `❯` 만 훑는 종전 스캔은 이 선택기를 보지 못한다.
+        assert!(
+            modal_signature(codex_modal).is_none(),
+            "전제 붕괴: `❯` 스캔만으로 codex 선택기가 잡힌다면 이 검체는 R5 를 재지 못한다"
+        );
+        // ⓑ 마커를 들면 커서-번호 항목 규칙이 선다.
+        let sig = modal_signature_with_marker(codex_modal, Some("›"))
+            .expect("codex 선택기가 모달 서명 0 이다 — 스캐너가 다시 `❯` 리터럴에 고정됐다(R5 회귀)");
+        assert!(sig.kinds.contains(&"cursor-on-numbered-item"), "{sig:?}");
+        // 커서가 종료 선택지 위인 codex 형(`› 2. No, exit`) — 종료 축도 같은 스캐너로 선다.
+        let on_exit = "  1. Yes, proceed\n› 2. No, exit\n";
+        let exit_sig = modal_signature_with_marker(on_exit, Some("›")).expect("종료 위 커서가 서명 0 이다");
+        assert!(exit_sig.cursor_on_exit, "{exit_sig:?}");
+        assert!(modal_signature(on_exit).is_some_and(|s| !s.cursor_on_exit), "전제: `❯` 스캔은 종료 위 커서를 모른다(choice-row 만)");
+        // `judge` — codex 좌석(마커 `›`)은 어떤 양성 증거가 열려도 보류다(증거 종류 무관 · H-1 계약).
+        let mut fallback = obs(codex_modal, "", &gates);
+        fallback.time_fallback_reached = true;
+        for (name, mut o) in [
+            ("마커 델타", obs(codex_modal, codex_modal, &gates)),
+            ("밸브", boot_all_open(codex_modal, &gates)),
+            ("시간 폴백 + 마커 화면", fallback),
+        ] {
+            o.marker = Some("›");
+            assert!(held_as(&judge(&o), MODAL_UNKNOWN_ID), "{name}: {:?}", judge(&o));
+        }
+        // 재주입 창도 같은 함수 — 전경 선택기에는 재주입하지 않는다.
+        let mut r = obs(codex_modal, "", &gates);
+        r.marker = Some("›");
+        r.site = Site::Reinject;
+        assert!(held_as(&judge(&r), MODAL_UNKNOWN_ID), "{:?}", judge(&r));
+        // ★계측 타당성 — 같은 입력에서 롤백(종전 판정)은 ready 다(고칠 결함이 실재한다).
+        let mut legacy = obs(codex_modal, codex_modal, &gates);
+        legacy.marker = Some("›");
+        legacy.legacy_v1 = true;
+        assert!(judge(&legacy).is_ready(), "종전 판정이 codex 선택기를 ready 로 내지 않았다면 결함이 없다는 뜻");
+        // ⓒ claude 거동 불변 — 두 경로가 프레임 전량에서 같은 값을 낸다.
+        for &(id, screen) in GATE_SCREENS
+            .iter()
+            .chain(fixtures::NON_GATE_SCREENS)
+            .chain(fixtures::MEASURED_NON_CORPUS_MODALS)
+            .chain(fixtures::BODY_TEXT_SCREENS)
+        {
+            assert_eq!(
+                modal_signature(screen),
+                modal_signature_with_marker(screen, Some("❯")),
+                "{id}: claude 마커를 들었더니 판정이 달라졌다(claude 는 두 값이 같아야 한다)"
+            );
+        }
+        assert_eq!(modal_signature(HEALTHY_BANNER), modal_signature_with_marker(HEALTHY_BANNER, Some("❯")));
+        // ⓓ 가용성 — codex 정상 유휴(플레이스홀더) · 출력 속 `›` 인용 행 · 상태줄은 모달이 아니다.
+        let codex_idle = "• DIRECTIVE-ACK-11137\n\n────────────────────────\n\n\n› Ask Codex to do anything\n\n  gpt-6-astra medium · ~/dev/cys-t1/src\n";
+        assert!(
+            modal_signature_with_marker(codex_idle, Some("›")).is_none(),
+            "codex 유휴 composer 가 모달로 읽혔다(그 좌석은 영구 보류가 된다)"
+        );
+        let quoted = "  출력:\n  › 인용된 한 줄\n  › 또 한 줄\n\n› Ask Codex to do anything\n";
+        assert!(modal_signature_with_marker(quoted, Some("›")).is_none(), "인용 행이 모달로 읽혔다");
+        let mut idle = obs(codex_idle, codex_idle, &gates);
+        idle.marker = Some("›");
+        assert!(judge(&idle).is_ready(), "codex 유휴가 ready 가 아니다: {:?}", judge(&idle));
+        // 빈 마커·미정의 마커는 `❯` 단독 스캔과 같다(`marker_of` 규약 — 빈 문자열은 미정의).
+        assert_eq!(modal_signature_with_marker(codex_modal, Some("")), modal_signature(codex_modal));
+        assert_eq!(modal_signature_with_marker(codex_modal, None), modal_signature(codex_modal));
+        // ★받아들인 잔여(codex 설계 검토 · 성찰 R5) — 본문이 마커 글리프로 시작하는 번호 행을 **출력**하면
+        //   (`› 1. apples` · `› 2`) 서명이 선다. `❯` 좌석의 `BODY_TEXT_SCREENS` 와 **같은 계급**이고 귀결은
+        //   부트 창 안의 보류(재주입 창은 레이아웃 증거로 역사화)라 받는다. 마커의 출처가 선언된
+        //   `prompt_marker` 하나라는 것이 이 잔여의 상한이다(1글자 셸 글리프 `>` 는 `_doc` 이 선언을 금한다).
+        for residue in ["  기록:\n› 1. apples\n", "  기록:\n› 2\n"] {
+            assert!(
+                modal_signature_with_marker(residue, Some("›")).is_some(),
+                "잔여 기대값이 바뀌었다 — 스캐너 규칙이 좁아졌다면 `› No, exi`·`› 2` 부분 선택기 방어가 함께 죽었는지 보라"
+            );
+        }
+    }
     /// ★밸브 창 — 감사 에러 4 의 실제 지점(+9.1s < inject_delay 10s 에 밸브가 열렸다).
     #[test]
     fn boot_valve_requires_time_fallback_and_quiet_output() {
