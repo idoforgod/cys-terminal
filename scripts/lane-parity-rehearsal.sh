@@ -275,4 +275,73 @@ if [ $SELF_TEST -eq 1 ]; then
     exit 1
   fi
   echo "[자기 검체] 미등재 $PROBE.py → exit 1 · 사유 일치 (역방향 축 살아 있음)"
+
+  echo
+  echo "── 자기 검체 2: 레인 대조 게이트의 변이 대조(워크플로 사본 · LANE_GATE_ROOT) ─────────"
+  # 게이트는 텍스트만 읽는다 — 워크플로 **사본**에 변이를 넣고 1단계가 추출한 **같은 게이트 원본**이
+  # 붉어지는지 잰다(리포 트리 무접촉). 통과 대조(무변이 사본 rc=0)와 실패 대조 4종을 나란히 둔다:
+  #   ①이름 변조(한 레인만 다른 이름 → 3레인 비대칭 · D3 의 '대조가 여전히 비대칭을 잡는가')
+  #   ②`if: false`(완전 레인의 등재되지 않은 조건 · D9)
+  #   ③필수 명령 소거(`cargo test --bin cysd` 스텝 이름·실행 줄 변조 · D4)
+  #   ④필터 가드 삭제(`cargo_filter_count --lib readiness::` 선행 호출 제거 · D10)
+  MUT_ROOT="$SELF_TMP/mut"
+  mut_reset() {
+    rm -rf "$MUT_ROOT"; mkdir -p "$MUT_ROOT/.github/workflows"
+    for w in ci-branch release pack-release windows-build windows-health; do
+      cp ".github/workflows/$w.yml" "$MUT_ROOT/.github/workflows/$w.yml"
+    done
+  }
+  mut_expect() {  # $1=기대 rc · $2=라벨 · $3=사유 grep 패턴(고정 문자열)
+    LANE_GATE_ROOT="$MUT_ROOT" python3 "$GATE_SRC" > "$SELF_TMP/mut.log" 2>&1
+    local rc=$?
+    if [ "$rc" -ne "$1" ]; then
+      cat "$SELF_TMP/mut.log"
+      echo "::error::자기 검체 2 실패 — $2: 기대 exit $1 · 실제 exit $rc" >&2
+      exit 1
+    fi
+    if ! grep -qF -- "$3" "$SELF_TMP/mut.log"; then
+      cat "$SELF_TMP/mut.log"
+      echo "::error::자기 검체 2 실패 — $2: exit 는 맞지만 사유 '$3' 가 로그에 없다(다른 이유로 붉어졌다)" >&2
+      exit 1
+    fi
+    echo "[자기 검체 2] $2 → exit $rc · 사유 일치"
+  }
+  mut_reset; mut_expect 0 "무변이 사본" "비대칭 0"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/pack-release.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+assert t.count("test_pyseal_census") >= 1, "변이 앵커 부재(test_pyseal_census)"
+t = t.replace("test_pyseal_census", "test_pyseal_censux")     # 한 레인에서만 이름이 갈린다
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "이름 변조(pack-release 만 test_pyseal_censux)" "test_pyseal_census"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/pack-release.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "      - name: 팩 검체 — 자원 게이트·함대CPU·역할 좌석 (WP-7 R3 3레인 등재 · pack-only 서명전)\n"
+assert t.count(a) == 1, "변이 앵커 부재(WP-7 pack-only 스텝)"
+t = t.replace(a, a + "        if: false\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "if: false(pack-release WP-7 스텝)" "if: false"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+run = "cargo test --bin cysd -- --test-threads=1 --skip hwmon::"
+name = "- name: cargo test --bin cysd ("
+assert t.count(run) == 1 and t.count(name) == 1, "변이 앵커 부재(cysd 스텝)"
+t = t.replace(run, "cargo test --bin cys -- --test-threads=1 --skip hwmon::", 1)
+t = t.replace(name, "- name: cargo test --bin cys (", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "필수 명령 소거(ci-branch cysd 스텝)" "cargo test --bin cysd"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/windows-health.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "          cargo_filter_count --lib readiness::\n"
+assert t.count(a) == 1, "변이 앵커 부재(readiness 가드)"
+t = t.replace(a, "", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "필터 가드 삭제(windows-health readiness::)" "cargo_filter_count --lib readiness::"
 fi
