@@ -2105,11 +2105,59 @@ def ledger_owner_mismatch(path, task):
                 "`round_path` 슬러그가 겹쳤다. 같은 장부를 이어 쓰려면 **장부 표기 그대로** "
                 "`--task` 를 주고, 다른 작업이면 겹치지 않는 이름을 써라."
                 % (tid[:12], task_id(task)[:12], disp))
-    if disp is not None and disp != str(task):
+    # ★성찰 R4 N18: **양쪽 같은 정규화**로 비교한다. 종전은 `disp`(장부에서 읽으며 `.strip()`
+    #   된 값) 대 `str(task)`(원문) 였다 — 후행 공백·탭·개행이 든 표기로 만든 구 장부에 **같은
+    #   표기로** append 해도 영원히 거부됐고(안내는 "장부 표기 그대로 `--task` 를 줘라" = 이미 한
+    #   일을 하라는 말이었다), 이 검사는 다른 무엇보다 먼저 도는데 override 경로가 없어 진행
+    #   중이던 라운드 장부가 업그레이드 순간 **append 불능**이 됐다(자율 루프 정지 방향).
+    #   신판 장부의 헤더는 `_audit_text(task)` 로 쓰므로 그 함수가 이 비교의 정본 정규화다.
+    if disp is not None and _audit_text(disp) != _audit_text(task):
         return ("이 장부는 다른 task 의 것으로 보인다(장부 표기 %r ≠ 이 호출 %r · 구 장부라 "
-                "task-id 가 없다) — 같은 장부를 이어 쓰려면 장부 표기 그대로 `--task` 를 줘라."
-                % (disp, task))
+                "task-id 가 없다) — 같은 장부를 이어 쓰려면 장부 표기 그대로 `--task` 를 주고, "
+                "표기를 헤더에 담을 수 없는 경우(개행 등)는 **헤더 줄을 직접 고쳐 이주하라**: "
+                "첫 줄을 `# ORCHESTRATION 라운드 장부 — %s` 로 바꾸거나 그 아래에 "
+                "`<!-- task-id: %s -->` 한 줄을 넣으면 그 뒤로는 신원이 정확히 비교된다."
+                % (disp, task, _audit_text(task), task_id(task)))
     return None
+
+
+def backfill_ledger_task_id(path, task):
+    """구 장부(0.14.30 · `task-id` 주석 없음)에 신원 주석을 **한 번** 심는다 — 반환 심었는지.
+
+    ★왜(성찰 R4 N18): 신원 비교가 **통과한 첫 기록** 때 정본 신원(sha256)을 심어 두면 다음
+      호출부터는 표시 문자열이 아니라 `task-id` 정확 비교로 넘어가 이주가 끝난다(표시 표기의
+      정규화 차이가 영구 거부를 만드는 길이 그 장부에서 닫힌다).
+    ★반드시 **잠금을 쥔 채** 부른다(`write_ledger_header` 와 같은 자리). 실패는 조용히 무시한다 —
+      심지 못해도 기록은 계속돼야 한다(이주 실패가 기록을 막으면 그것이 더 나쁘다).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+            body = f.read()
+    except OSError:
+        return False
+    lines = body.split("\n")
+    hdr = None
+    for i, ln in enumerate(lines[:8]):
+        if LEDGER_TASKID_RE.match(ln.strip()):
+            return False                       # 이미 신원이 있다 — 이주 끝
+        if hdr is None and LEDGER_HEADER_RE.match(ln.strip()):
+            hdr = i
+    if hdr is None:
+        return False                           # 헤더가 없다(형상 미상) — 손대지 않는다
+    lines.insert(hdr + 1, "<!-- task-id: %s -->" % task_id(task))
+    tmp = "%s.mig.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("\n".join(lines))
+            _fsync(f)
+        os.replace(tmp, path)                  # 잠금 안이므로 남의 행을 덮지 않는다
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def ledger_header_text(task):
@@ -2135,6 +2183,8 @@ def write_ledger_header(path, task):
       파일은 '없음' 아니면 '완성' 둘 중 하나다.
     """
     if os.path.exists(path):
+        # 구 장부 이주(성찰 R4 N18) — 신원 비교를 이미 통과한 자리다. 실패해도 기록은 계속된다.
+        backfill_ledger_task_id(path, task)
         return True, ""
     tmp = "%s.init.%d.tmp" % (path, os.getpid())
     try:
@@ -2257,6 +2307,19 @@ def _record_stagnation_stop(task, stop_round, requested_round, why, holding, eve
         return append_round_event(task, rec, lock=False)
 
 
+# ★성찰 R4 N3: 게이트가 **집행**하는 종료 사유 — `round_stop_reason` 의 우선순위 함수는
+#   `stopped_budget` 을 `stopped_stagnation` **앞에서** 반환한다(정본이 정한 순서다: 헌장의 하드
+#   상한이 정체보다 강하다). 그런데 게이트가 `stopped_stagnation` 하나만 집행하던 탓에, R10 에
+#   상한이 차는 순간 사유가 budget 으로 바뀌면서 **정체 종결이 통째로 무장 해제**됐다 — R11·R12
+#   가 rc 0 으로 열리고 `stagnation_stop` 은 0건인데 도구는 "무한 루프 금지" 를 출력했다(실측).
+#   두 사유 모두 종결이고 재개는 `--override "<사유>"` 하나뿐이므로, 집행 목록을 여기 한 곳에
+#   두고 게이트·문면이 그것을 공유한다(값 = 그 사유의 사람 문면 한 조각).
+ROUND_STOP_ENFORCED = {
+    "stopped_stagnation": "stopped_stagnation 은 종결이며",
+    "stopped_budget": "stopped_budget 은 헌장의 하드 상한(운영계약 §6-5)이며",
+}
+
+
 def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, holding=False):
     """`round-log` 의 WP-6 정체 종결 게이트 — 반환 (exit code|None, 보류 override|None).
 
@@ -2307,7 +2370,7 @@ def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, hold
         for n in (() if holding else notes):   # 잠금 안 재판정은 같은 안내를 두 번 내지 않는다
             print("[round-log] %s" % n, file=sys.stderr)
         reason, why = round_stop_reason(rows, evidence, row_damage=row_damage)
-    if blocked_round is None and reason != "stopped_stagnation":
+    if blocked_round is None and reason not in ROUND_STOP_ENFORCED:
         return None, None
     stop_round = blocked_round if blocked_round is not None else last
     raw = getattr(args, "override", None)
@@ -2322,15 +2385,16 @@ def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, hold
                       file=sys.stderr)
         # 사유 표기는 **정직해야** 한다: 종결 이후 같은 라운드에 행이 더 붙어 지금 계산된
         # stop_reason 이 달라졌을 수 있다. 그 사실을 감추지 않고 둘 다 적는다.
-        if blocked_round is not None and reason != "stopped_stagnation":
-            print("[round-log] 거부(exit %d): 라운드 %d 에서 **정체 종결이 기록**됐다"
+        if blocked_round is not None and reason not in ROUND_STOP_ENFORCED:
+            print("[round-log] 거부(exit %d): 라운드 %d 에서 **종결이 기록**됐다"
                   "(사이드카 stagnation_stop). 그 뒤 기록으로 지금 계산된 stop_reason=%s 이지만, "
                   "재개 권한은 명시 override 까지 유지된다(종결 ≠ 합격)."
                   % (ROUND_LOG_EXIT_STAGNATION, stop_round, reason), file=sys.stderr)
         else:
-            print("[round-log] 거부(exit %d): stop_reason=stopped_stagnation — 라운드 %d 에서 "
-                  "종결됐다. stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계한다"
-                  "(종결 ≠ 합격)." % (ROUND_LOG_EXIT_STAGNATION, stop_round), file=sys.stderr)
+            print("[round-log] 거부(exit %d): stop_reason=%s — 라운드 %d 에서 종결됐다. "
+                  "%s minor 는 백로그 목록으로 인계한다(종결 ≠ 합격)."
+                  % (ROUND_LOG_EXIT_STAGNATION, reason, stop_round,
+                     ROUND_STOP_ENFORCED[reason]), file=sys.stderr)
         for w in why:
             print("  · %s" % w, file=sys.stderr)
         if raw is not None:
