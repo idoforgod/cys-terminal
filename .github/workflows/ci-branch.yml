@@ -418,6 +418,23 @@ jobs:
           PY
       # LANE-GATE-SELF-END
 
+      # ★D3(반성 라운드 2026-09-10): 위 게이트는 '이름이 세 레인에 다 있는가' 만 본다 — 세 레인
+      #   **모두**에 없는 파일은 union 밖이라 비대칭 0 으로 초록이었다(수용 검체 4종이 그렇게 0회
+      #   실행이었고 전체로는 34종). 역방향 축(파일→등재)은 scripts/lane-parity-rehearsal.sh 3단계에
+      #   있고 여기서 그 예행 도구를 게이트로 **승격**한다 — `--strict` 는 머지 대기 0 을 요구하고,
+      #   `--self-test` 는 임시 디렉터리의 미등재 파일 하나를 실제로 잡는지 재는 음성 대조다(통과
+      #   대조만 있으면 "다 허용해서 초록" 으로도 만족된다). 1단계는 위 게이트 파이썬을 원본에서
+      #   추출해 다시 돌리므로(로직 복제 0) 이 스텝이 위 스텝을 대체하지는 않는다 — 위 스텝은
+      #   `::error::` 위치가 이 파일 자신이라 판독이 빠르고, 이 스텝은 예행 도구 자체가 CI 에서
+      #   깨지지 않았음을 증명한다. stdlib 만 쓰므로 setup-python 앞이어도 된다(1초 안쪽).
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지).
+      - name: 레인 예행 도구 — 역방향 축(파일→등재) + 자기 검체 (D3)
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/lane-parity-rehearsal.sh --strict
+          bash scripts/lane-parity-rehearsal.sh --self-test
+
       # ★(0.14.31 통합 · CONTRACTS E-4 ②) 이 잡의 python3 를 3.12 로 **고정**한다.
       #   종전엔 이 잡만 setup-python 이 없어 러너 이미지 기본 python3 를 썼다 — 잡2
       #   (boot-health-full)·windows-health.yml 은 이미 3.12 다. 즉 세 잡이 서로 다른
@@ -733,6 +750,34 @@ jobs:
           then r=0; else r=$?; fi
           tail -20 /tmp/wp7-selftest.log
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
+          exit $rc
+
+      # ★D3(반성 라운드 2026-09-10 · fix-plan directives-ci-release): 수용 검체 4종이 **3레인 전부에서
+      #   0회 실행**이었다 — WP-4 test_session_start_hook(+317 · session-start.sh 의 `reclaim-role --auto`
+      #   배선 수용) · WP-7 test_formation_gate_label(+33 · javis_formation 의 fleet_cpu_ratio 라벨 소비) ·
+      #   WP-6 test_review_prompt_verdict_path(리뷰 판정 경로) · P6 test_dept_teardown_atomicity(+17 ·
+      #   상속 env 회귀). 세 레인 **모두**에 없으면 레인 대조 게이트의 union 에 들어오지 않아 비대칭 0 으로
+      #   초록이었다 — 반례: session-start.sh 의 reclaim-role 배선을 되돌려도 3레인 전부 초록. 역방향 축
+      #   (파일→등재)은 이제 scripts/lane-parity-rehearsal.sh 3단계가 잰다.
+      #   실측(로컬 · 아래와 같은 격리 env · 2026-09-10): 14s · 0s · 1s · 4s · 전건 rc=0.
+      #   전용 스텝·격리 env·`if:` 없음(레그 고정 제외)의 근거는 위 WP-7 스텝과 같다.
+      - name: 팩 검체 — 수용 검체 4종 (D3 3레인 등재 · macOS)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_session_start_hook test_formation_gate_label \
+                   test_review_prompt_verdict_path test_dept_teardown_atomicity; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t =="
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/d3-$t.log" 2>&1
+            then r=0; else r=$?; fi
+            tail -60 "/tmp/d3-$t.log"
+            [ $r -eq 0 ] || { echo "::error::$t rc=$r (D3 수용 검체 회귀)"; rc=$r; }
+          done
           exit $rc
 
       - name: verify_win_crt 게이트 도구 밀폐 스위트 (macOS)

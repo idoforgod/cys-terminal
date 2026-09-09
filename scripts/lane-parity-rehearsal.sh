@@ -14,15 +14,32 @@
 #   이름의 **파일이 있는가**는 묻지 않는다(그 단언은 CI 런타임의 `[ -f "$f" ]` 에 있다). 여기서
 #   미리 확인하고, 아직 머지되지 않아 없는 것은 PENDING_MERGE 에 근거와 함께 등재한다.
 #
-# 사용:
-#   scripts/lane-parity-rehearsal.sh           # 예행(PENDING 은 통과 · 배너로 남김)
-#   scripts/lane-parity-rehearsal.sh --strict  # 머지 뒤 검증(PENDING 이 남아 있으면 실패)
+# 3단계(★D3 · 반성 라운드 2026-09-10)는 **역방향**이다: 디스크의 `test_*.py` 가 세 레인 union 에
+#   있는가. 게이트는 레인 **간** 대칭만 재므로 세 레인 **모두**에 없는 파일은 union 밖이라 비대칭
+#   0 으로 초록이었다 — 수용 검체 4종(session_start_hook·formation_gate_label·
+#   review_prompt_verdict_path·dept_teardown_atomicity)이 그렇게 3레인 0회 실행이었고, 전체로는
+#   34종이 어느 레인에도 없었다. 미등재는 UNREGISTERED_OK 에 **사유와 함께** 등재된 것만 통과한다
+#   (게이트의 ALLOWED 와 같은 마찰 — "등재를 미룬다" 는 사유가 아니다). 이 축은 ci-branch 의
+#   '레인 예행 도구' 스텝이 게이트로 돌린다.
 #
-# 종료코드: 0=통과 · 1=계약 위반(등재 비대칭 · 등재됐는데 파일 없음) · 3=구조 판별 실패(도구 수리)
+# 사용:
+#   scripts/lane-parity-rehearsal.sh             # 예행(PENDING 은 통과 · 배너로 남김)
+#   scripts/lane-parity-rehearsal.sh --strict    # 머지 뒤 검증(PENDING 이 남아 있으면 실패)
+#   scripts/lane-parity-rehearsal.sh --self-test # 자기 검체 — 3단계가 임의 미등재 파일을 실제로 잡는가
+#
+# 종료코드: 0=통과 · 1=계약 위반(등재 비대칭 · 등재됐는데 파일 없음 · 사유 없는 미등재 파일) ·
+#          3=구조 판별 실패(도구 수리)
 set -uo pipefail
 
 STRICT=0
-[ "${1:-}" = "--strict" ] && STRICT=1
+SELF_TEST=0
+for arg in "$@"; do
+  case "$arg" in
+    --strict) STRICT=1 ;;
+    --self-test) SELF_TEST=1 ;;
+    *) echo "::error::모르는 인자: $arg (--strict | --self-test)" >&2; exit 3 ;;
+  esac
+done
 
 cd "$(dirname "$0")/.."
 CI_YML=".github/workflows/ci-branch.yml"
@@ -30,7 +47,8 @@ CI_YML=".github/workflows/ci-branch.yml"
 
 echo "── 1단계: 레인 대조 게이트(원본 추출 실행) ───────────────────────────────"
 GATE_SRC="$(mktemp)"
-trap 'rm -f "$GATE_SRC"' EXIT
+SELF_TMP=""
+trap 'rm -f "$GATE_SRC"; [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"' EXIT
 python3 - "$CI_YML" "$GATE_SRC" <<'PYEXTRACT'
 import sys, pathlib
 yml, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
@@ -75,9 +93,12 @@ if [ $GATE_RC -ne 0 ]; then
   exit $GATE_RC
 fi
 
-echo
-echo "── 2단계: 등재된 이름의 파일 존재(게이트가 보지 않는 축) ─────────────────"
+# 2·3단계 — 한 파이썬 블록이다(이름 추출기 `names()` 를 두 축이 공유한다 · 복제 금지).
+#   env `LANE_PARITY_DIRS`(os.pathsep 구분)로 검체 디렉터리를 바꿀 수 있다 — 자기 검체가 임시
+#   디렉터리를 **덧붙여** 3단계가 미등재 파일을 잡는지 재는 데 쓴다(리포 트리 무접촉).
+existence_axes() {
 python3 - "$STRICT" <<'PYEXIST'
+import glob as _g
 import os, re, sys
 
 STRICT = sys.argv[1] == "1"
@@ -86,7 +107,9 @@ LANES = {
     "release":      ".github/workflows/release.yml",
     "pack-release": ".github/workflows/pack-release.yml",
 }
-DIRS = ("cysjavis-pack/bin/tests", "scripts/tests")
+DIRS = tuple(d for d in os.environ.get(
+    "LANE_PARITY_DIRS", os.pathsep.join(("cysjavis-pack/bin/tests", "scripts/tests"))
+).split(os.pathsep) if d)
 
 # 글롭으로 도는 이름 — 추출 정규식이 `*` 앞에서 끊겨 **접두 토큰**이 된다. 파일 1개 이상이
 # 글롭에 걸리면 해소된 것으로 본다(0 개면 글롭 스텝이 빈 루프를 도는 것이므로 실패다).
@@ -100,6 +123,27 @@ GLOB_TOKENS = {"test_phoenix_": "cysjavis-pack/bin/tests/test_phoenix_*.py"}
 #   존재 축이 사실상 꺼진다(그래서 게이트가 도착 시 ::warning:: 로 청소를 재촉한다).
 #   다음 통합에서 다시 쓸 때는 {이름: (도착 브랜치, 근거)} 형태로 채운다.
 PENDING_MERGE = {}
+
+# ★3단계(D3) 역방향 축의 허용 목록 — 디스크에 있으나 세 레인 어디에도 등재되지 않은 파일.
+#   값 = 사유. **사유 없는 등재 금지**(게이트 ALLOWED 와 같은 규율). "나중에 편입" 은 사유가
+#   아니다 — 그 파일이 왜 CI 밖이어도 되는지, 아니면 무엇이 편입을 막는지를 적어라.
+#   ★기준선(2026-09-10 · 반성 라운드 D3): 아래 30종은 0.14.31 **이전부터** 0레인이던 격차다
+#   (integration-notes §7-3 · 로컬 전수 rc=0 · 등재만 없다). 이번 판은 수용 검체 4종만 편입했고
+#   나머지는 "안 도는 검체는 게이트가 아니다" 계급의 **잔여 격차**로 여기 못박는다 — 편입은
+#   다음 판의 독립 작업이고, 편입하는 커밋이 이 항목을 지운다(그때 이 축이 ::warning:: 으로
+#   청소를 재촉한다). 이 사유는 "정당한 무관함" 이 아니라 **미해소의 기록**이다.
+_BASELINE = ("0.14.31 이전부터 0레인이던 격차의 기준선 등재(2026-09-10 D3 · integration-notes §7-3 · "
+             "로컬 rc=0) — 정당한 무관함이 아니라 미해소 기록 · 편입 커밋이 이 항목을 지운다")
+UNREGISTERED_OK = {n: _BASELINE for n in (
+    "test_atomic_bundle", "test_ceo_pending_gate", "test_cli_probe", "test_completion_guard_notice",
+    "test_contracts_ct", "test_deploy_gate_bundle_swap", "test_dept_creds_seed", "test_dept_doctrine_v1",
+    "test_dept_list_unregistered", "test_dept_ticket_deficit_zero", "test_dept_ticket_request",
+    "test_distill_fx", "test_formation", "test_hud_bridge_master_idle", "test_installer_atomic",
+    "test_lane_isolation_v1", "test_memory_desc_drift", "test_mission_boot_command_filter",
+    "test_mission_harness_filter", "test_orchestra_ticket_snapshot", "test_orchestra_todo_path",
+    "test_org_audit", "test_pack_syntax_warnings", "test_preflight_nlm_pin", "test_preflight_phase1_checks",
+    "test_release_verify", "test_seat_revival", "test_verify_gate", "test_vibecheck", "test_viberoute",
+)}
 
 SB, SE = "LANE-GATE-SELF-BEGIN", "LANE-GATE-SELF-END"
 
@@ -122,7 +166,7 @@ if not union:
     print("::error::세 레인에서 이름 0건 — 추출기 파손(fail-closed).", file=sys.stderr)
     sys.exit(3)
 
-import glob as _g
+print("── 2단계: 등재된 이름의 파일 존재(게이트가 보지 않는 축) ─────────────────")
 ok, pending, missing, stale = [], [], [], []
 for n in sorted(union):
     if n in GLOB_TOKENS:
@@ -152,18 +196,83 @@ for n in pending:
 for n, why in missing:
     print("::error::  미해소 %s — %s" % (n, why), file=sys.stderr)
 
+print()
+print("── 3단계: 역방향 — 디스크의 검체가 세 레인 union 에 있는가(D3) ─────────────")
+disk = {}
+for d in DIRS:
+    for p in _g.glob(os.path.join(d, "test_*.py")):
+        disk[os.path.basename(p)[:-3]] = p
+if not disk:
+    print("::error::검체 디렉터리 %s 에서 test_*.py 0건 — 역방향 축이 잴 대상이 없다(fail-closed)."
+          % " · ".join(DIRS), file=sys.stderr)
+    sys.exit(3)
+
+def registered(n):
+    return n in union or any(n.startswith(tok) for tok in GLOB_TOKENS if tok in union)
+
+unregistered = sorted(n for n in disk if not registered(n))
+listed = [n for n in unregistered if n in UNREGISTERED_OK]
+orphans = [n for n in unregistered if n not in UNREGISTERED_OK]
+# 허용 목록이 낡았는가 — 편입됐거나 삭제된 이름은 경고(막을 이유는 없지만 방치하면 목록이 썩는다).
+for n in sorted(UNREGISTERED_OK):
+    if n not in disk:
+        print("::warning::UNREGISTERED_OK '%s' 의 파일이 없다 — 삭제됐다면 목록에서도 지워라" % n)
+    elif registered(n):
+        print("::warning::UNREGISTERED_OK '%s' 이 이제 레인에 등재됐다 — 목록에서 지워라" % n)
+print("[역방향] 디스크 %d종 · 등재 %d · 사유 있는 미등재 %d · 사유 없는 미등재 %d"
+      % (len(disk), len(disk) - len(unregistered), len(listed), len(orphans)))
+for n in orphans:
+    print("::error::  미등재 %s (%s) — 세 레인 어디에도 없다. 3완전 레인에 같은 커밋으로 등재하거나, "
+          "CI 밖이어도 되는 **사유**를 UNREGISTERED_OK 에 적어라(\"나중에\" 는 사유가 아니다)"
+          % (n, disk[n]), file=sys.stderr)
+
 if missing:
     print("::error::등재된 이름의 파일이 없다 — CI 런타임의 `[ -f \"$f\" ]` 단언이 붉어진다. "
           "파일을 커밋하거나(git add 누락) PENDING_MERGE 에 근거와 함께 등재하라.",
           file=sys.stderr)
+    sys.exit(1)
+if orphans:
+    print("::error::세 레인 모두에 없는 검체는 레인 대조 게이트의 union 밖이라 **비대칭 0 으로 초록**"
+          "이다 — 안 도는 검체는 게이트가 아니다.", file=sys.stderr)
     sys.exit(1)
 if pending and STRICT:
     print("::error::--strict 인데 머지 대기 %d종이 남아 있다 — 팩 브랜치 머지가 끝나지 않았거나 "
           "PENDING_MERGE 를 청소하지 않았다." % len(pending), file=sys.stderr)
     sys.exit(1)
 if pending:
-    print("\n[예행 판정] 레인 대조 통과 · 파일 존재는 머지 대기 %d종을 제외하고 통과."
+    print("\n[예행 판정] 레인 대조 통과 · 파일 존재는 머지 대기 %d종을 제외하고 통과 · 역방향 통과."
           "\n            머지 후 `--strict` 로 다시 돌려라(그때 0 이어야 완결)." % len(pending))
 else:
-    print("\n[예행 판정] 레인 대조 통과 · 등재 전건 파일 확인.")
+    print("\n[예행 판정] 레인 대조 통과 · 등재 전건 파일 확인 · 역방향(사유 없는 미등재 0) 통과.")
 PYEXIST
+}
+
+echo
+existence_axes
+AX_RC=$?
+[ $AX_RC -eq 0 ] || exit $AX_RC
+
+if [ $SELF_TEST -eq 1 ]; then
+  echo
+  echo "── 자기 검체: 3단계가 임의 미등재 파일을 실제로 잡는가(음성 대조) ────────────"
+  # 리포 트리에 쓰지 않는다 — 임시 디렉터리를 검체 디렉터리 목록에 **덧붙여** 미등재 파일 하나를
+  # 보인다. 통과 대조(위 existence_axes 의 rc=0)가 있으므로 이 실패 대조가 없으면 3단계는
+  # "다 허용해서 초록" 으로도 만족된다.
+  SELF_TMP="$(mktemp -d)"
+  PROBE="test_zz_probe_unregistered"
+  : > "$SELF_TMP/$PROBE.py"
+  SELF_LOG="$SELF_TMP/reverse.log"
+  LANE_PARITY_DIRS="cysjavis-pack/bin/tests:scripts/tests:$SELF_TMP" existence_axes > "$SELF_LOG" 2>&1
+  PROBE_RC=$?
+  if [ $PROBE_RC -ne 1 ]; then
+    cat "$SELF_LOG"
+    echo "::error::자기 검체 실패 — 미등재 파일 $PROBE.py 를 넣었는데 3단계가 exit 1 이 아니라 exit $PROBE_RC 를 냈다(역방향 축이 눈을 감았다)" >&2
+    exit 1
+  fi
+  if ! grep -q "미등재 $PROBE " "$SELF_LOG"; then
+    cat "$SELF_LOG"
+    echo "::error::자기 검체 실패 — exit 1 이지만 그 사유가 $PROBE 미등재가 아니다(다른 이유로 붉어졌다)" >&2
+    exit 1
+  fi
+  echo "[자기 검체] 미등재 $PROBE.py → exit 1 · 사유 일치 (역방향 축 살아 있음)"
+fi
