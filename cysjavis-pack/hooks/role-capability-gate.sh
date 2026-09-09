@@ -775,6 +775,11 @@ CSO_CYS_OPT_DENY = {
     # 효과가 **다른** 옵션(검증 생략·임의 clear 명령·수신자 우회)만 여기 남긴다.
     "cycle-agent": ("--force-no-verify", "--clear-cmd"),
     "send": ("--clear-first", "--surface"),
+    # ★0.14.31 성찰 G12: `cys set-status --surface <남의 좌석>` 은 자기 좌석 보고가 아니라 **다른
+    #   좌석의 상태를 바꾸는** 옵션이다(clap `Command::SetStatus` 가 `--surface` 를 받는다). 데몬이
+    #   peer-pid 로 막고 있어(handlers.rs) 심층 방어이지만, 게이트 자기 규칙("허용 동사라도 효과가
+    #   다른 옵션은 따로 막는다")과 어긋난 채 두지 않는다. 자기 좌석 보고(옵션 없음)는 그대로다.
+    "set-status": ("--surface",),
 }
 # ★효과가 아니라 **주소 방식**이 다른 옵션(R1 blocking): `cys cycle-agent --surface <id>` 는
 #   clap 정의상 `--role` 과 택일 주소일 뿐이다. 이것을 무조건 deny 하면 **역할이 유실된 pane**
@@ -3130,6 +3135,12 @@ def self_test_contracts(fails):
     want(False, "Bash", {"command": 'cys send --queued --to=master "x"'}, "--to=master 형태")
     want(True, "Bash", {"command": 'cys send --queued --to master --clear-first "x"'}, "--clear-first")
     want(True, "Bash", {"command": 'cys send --surface 7 "x"'}, "--surface 주소 우회")
+    # ★G12(0.14.31 성찰): set-status 의 `--surface` 는 남의 좌석 상태 변경이다.
+    want(True, "Bash", {"command": "cys set-status --surface 12 busy"}, "G12 set-status --surface")
+    want(True, "Bash", {"command": "cys set-status --surface=12 busy"}, "G12 set-status --surface=")
+    want(False, "Bash", {"command": "cys set-status busy"}, "G12 자기 좌석 보고는 allow")
+    want(False, "Bash", {"command": "cys set-status '보고: --surface 12 를 확인했다'"},
+         "G12 인용 본문의 문자열은 옵션이 아니다")
     want(False, "Bash",
          {"command": 'cys send --queued --to master "본문에 --to master-shadow 문자열"'},
          "본문 문자열은 수신자가 아니다")
