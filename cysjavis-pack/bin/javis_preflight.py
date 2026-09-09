@@ -1201,9 +1201,17 @@ def _settings_rmw(settings_path, mutate, indent=2):
                 pass
 
 
+class OnlyUsageError(Exception):
+    """`--only` 가 어떤 검사와도 매칭되지 않는다 = **사용법 오류**(rc 2).
+
+    ★성찰 P5: 이 상태를 `READY · rc 0` 으로 내면 오타 하나가 "다 재 봤고 이상 없다" 로 읽힌다.
+    측정이 0 인 실행은 판정을 내지 않는다(§3-3 · C58 의 '쌍 0 → SKIP' 과 같은 규율)."""
+
+
 class Preflight:
     def __init__(self, fix, skips, mode="report", allow_irreversible=False, only=None):
         # OPP-17: mode ∈ report(관찰만)|fix(집행)|dry(미리보기)|safe(무변경+갭만).
+
         # self.fix 는 *집행 모드일 때만* True — dry/safe 에선 False 라 기존 50+ `if self.fix and …`
         # 가역 부작용 분기(c04 soul·c07 hook·c08 settings·c10 todo·c32 statusline·c33 event_hooks
         # 등)가 self.fix=False 로 **일괄 비집행**된다. may_mutate() 게이트는 *비가역 외부설치*
@@ -1228,23 +1236,64 @@ class Preflight:
         # run() 이 원래 순서로 재조립한다(직렬 경로는 sink=None 으로 self.results 직행).
         self._local = threading.local()
 
+    # ── `--only` 표적 재측정: 가족 토큰 단위 디스패치 + 보고 필터 ──
+    # ★성찰 P5(2026-09-10): 종전 `--only` 는 **보고 계층에서만** 걸렀다 — `run()` 은 81개 체크를
+    #   전량 순회했고, 매칭이 0 이면 "아무것도 재지 않은 실행" 이 `READY · 검사 0 · rc 0` 을
+    #   선언했다(실패 방향이 초록 · C58 이 '쌍 0 → SKIP' 으로 구현한 §3-3 원칙의 역전). 게다가
+    #   `--help` 는 "이 검사만 실행" 이라고 적는데 실제로는 "이 행만 기록" 이라, 가드를 잊은
+    #   체크(예: `c03_content_pins` 의 조기 반환 부작용)가 `--fix --only` 에서 **행 없이 부작용만**
+    #   남길 수 있었다. 이제 자르는 자리는 **디스패치**이고, 매칭 0 은 사용법 오류(rc 2)다.
+    @staticmethod
+    def _cid_family(cid):
+        """검사 id 의 **가족 토큰** — `C28.self-correction` → `C28` · `C03.pin.master` → `C03`."""
+        return str(cid).split(".", 1)[0]
+
+    @staticmethod
+    def _check_family(check):
+        """체크 **메서드 이름** → 그 메서드가 내는 id 의 가족(`c11b_cys_dept_path` → `C11b`).
+        이름 규약(`c<번호><접미>_…`)이 곧 id 규약이라 별도 표를 두지 않는다 — 표를 두면 체크가
+        늘 때 한쪽만 갱신되어 조용히 갈린다(같은 파일의 STEP 레지스트리와 반대 이유: 저기는
+        순서가 계약이고 여기는 이름이 계약이다)."""
+        m = re.match(r"^c(\d+)([a-z]*)_", getattr(check, "__name__", "") or "")
+        return ("C%s%s" % (m.group(1), m.group(2))) if m else ""
+
+    def _only_match(self, cid):
+        """`--only` 표적인가 — 정확 id 또는 가족 토큰(`--only C03` = C03.* 전부)."""
+        return cid in self.only or self._cid_family(cid) in self.only
+
+    def _dispatch_only(self, checks):
+        """`--only` 를 **디스패치에서** 적용 → 실행할 체크 목록. 매칭 0 이면 OnlyUsageError."""
+        known = {}
+        for c in checks:
+            known.setdefault(self._check_family(c), []).append(c)
+        unknown = sorted(x for x in self.only if self._cid_family(x) not in known)
+        if unknown:
+            raise OnlyUsageError(
+                "--only 인자가 어떤 검사와도 매칭되지 않는다: %s · 알려진 가족 %d개(예: "
+                "--only C28.self-correction · --only C03). 매칭 0 은 READY 가 아니다 — "
+                "아무것도 측정하지 않은 실행이다"
+                % (", ".join(unknown), len(known)))
+        wanted = {self._cid_family(x) for x in self.only}
+        return [c for c in checks if self._check_family(c) in wanted]
+
     def add(self, cid, status, detail):
         # ★triage T11 `--only`: 표적 밖 행은 **기록도 하지 않는다**. `skipped()` 는 검사 진입을
         #   막지만 조기 반환(예: C03 의 부서 팩 면제)은 그 앞에서 행을 남긴다 — 두 지점을 함께
         #   막아야 "무엇이 다시 측정됐는가" 가 출력 하나로 읽힌다.
-        if self.only and cid not in self.only:
+        if self.only and not self._only_match(cid):
             return
         sink = getattr(self._local, "sink", None)
         target = self.results if sink is None else sink
         target.append({"id": cid, "status": status, "detail": detail})
 
     def skipped(self, cid):
-        if self.only and cid not in self.only:
+        if self.only and not self._only_match(cid):
             return True                    # --only: 표적 밖은 **행조차 남기지 않는다**
         if cid in self.skips:
             self.add(cid, SKIP, "skipped by --skip")
             return True
         return False
+
 
     # ── OPP-17 비가역 외부설치 Mutation 게이트 — "관찰이 상태를 바꾸지 않는다"(PHIL-04) 동형 ──
     # ★범위 정직(적대검증 REVISE 교정): may_mutate() 는 **비가역 외부설치(denylist external_install
@@ -6568,9 +6617,15 @@ class Preflight:
             self.c62_pack_heal_ledger,
             self.c68_merge_pending_age,
         ]
+        # ★성찰 P5: `--only` 는 **여기서** 자른다(보고 필터보다 앞). 표적 밖 체크는 아예 돌지
+        #   않으므로 `--fix --only` 가 표적 밖의 부작용을 남길 수 없고, 매칭 0 은 사용법
+        #   오류(OnlyUsageError → rc 2)로 끝난다 — 측정 0 인 실행이 READY 를 선언하지 않는다.
+        if self.only:
+            checks = self._dispatch_only(checks)
         # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
         # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.
         if self.mode != "report":
+
             for check in checks:
                 check()
             return self.results
@@ -9652,8 +9707,21 @@ def _self_test():
     return 1 if fails else 0
 
 
+def _only_usage_exit(json_mode, mode, detail):
+    """`--only` 사용법 오류 1줄 출력 → rc 2. READY/ok:true 를 **내지 않는다**(성찰 P5)."""
+    if json_mode:
+        print(json.dumps({"ok": False, "fails": 0, "warns": 0, "mode": mode,
+                          "error": "only-no-match", "detail": detail,
+                          "planned": [], "pack_dir": pack_dir(), "checks": []},
+                         ensure_ascii=False, indent=2))
+    else:
+        print("preflight: 사용법 오류(--only) — %s" % detail)
+    return 2
+
+
 def main():
     # --self-test 가로채기 — argparse 앞(팩 bin 도구 관례: 인자 스키마와 독립인 자기검증 채널).
+
     if "--self-test" in sys.argv[1:]:
         return _self_test()
     # ★WP-2(0.14.31): --seed-trust 가로채기 — 같은 관례(argparse 앞·인자 스키마 독립). cys-dept 가 계정 dir 생성
@@ -9673,7 +9741,9 @@ def main():
     ap.add_argument("--skip", action="append", default=[], metavar="ID",
                     help="해당 검사 건너뜀 (예: --skip C12.daemon)")
     ap.add_argument("--only", action="append", default=[], metavar="ID",
-                    help="해당 검사만 실행 (부트 체인의 표적 재측정 · 예: --only C28.self-correction)")
+                    help="해당 검사만 실행 (부트 체인의 표적 재측정 · 예: --only C28.self-correction "
+                         "· 가족 토큰 --only C03 도 가능 · 매칭 0 이면 rc 2 사용법 오류)")
+
     args = ap.parse_args()
 
     if args.safe and (args.dry_run or args.fix):
@@ -9685,8 +9755,20 @@ def main():
 
     pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
                    allow_irreversible=args.allow_irreversible, only=args.only)
-    results = pf.run()
+    # ★성찰 P5: `--only` 가 아무것도 재지 못한 실행은 **판정을 내지 않는다**(rc 2 사용법 오류).
+    #   ⓐ 알려진 가족에 없는 id → 디스패치가 OnlyUsageError ⓑ 가족은 맞는데 행이 0 → 아래 재확인
+    #   (동적 id 인 `C03.pin.<파일>` 처럼 정적으로 못 거르는 오타가 여기서 잡힌다).
+    try:
+        results = pf.run()
+    except OnlyUsageError as e:
+        return _only_usage_exit(args.json, mode, str(e))
+    if args.only and not results:
+        return _only_usage_exit(
+            args.json, mode,
+            "--only %s 로 실행했으나 기록된 검사 행이 0 이다 — 그 id 를 내는 검사가 없다(오타?). "
+            "검사 0 인 실행은 READY 가 아니다" % ", ".join(args.only))
     fails = sum(1 for r in results if r["status"] == FAIL)
+
     warns = sum(1 for r in results if r["status"] == WARN)
     # dry/safe: "변경했나"가 아니라 "변경이 필요한가"를 보고 — planned 비어있지 않으면 변경 예정.
     planned_change = any(p["cid"] for p in pf.planned)
