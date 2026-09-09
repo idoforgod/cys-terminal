@@ -3973,10 +3973,9 @@ impl Daemon {
                 }
             }
             // 1단: 이관 대상 분리 — role 매칭 항목을 QueueEntry로 되살려 role별 배치로 모은다.
-            // ★비타입 감사 지점 ③(§restored_queue): WAL 원값(id/seq/enqueued_at/from/origin)을
-            // 보존 승계한다 — id는 load_queue_state가 전 항목에 합성 보장(방어적 mid 폴백).
-            // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
-            // 복원 경유 사실은 관측 가능하게 남긴다.
+            // 되살림 규칙(id=mid 폴백 · origin 부재 "wal-legacy" · TTL 회계 5키 serde default)은
+            // 공용 함수 [`queue_entry_from_row`] 하나가 소유한다(★성찰 Q15 — 비타입 감사 지점 ③
+            // 소멸: 이 자리의 바이트 동일 복제를 그 함수 호출로 교체했다).
             let mut batches: Vec<(String, Vec<QueueEntry>)> = Vec::new();
             // ★(0.14.31 · WP-5 M) 만료 배치 — expired_queue 행선(활성 큐 금지 · §8). 세 출처:
             //   ⓐ queue-expired.json 복원분(expired_at 보유) ⓑ 활성 복원분 중 복원 시점에 이미
@@ -3995,43 +3994,13 @@ impl Daemon {
                 if !role_surface.contains_key(role) {
                     return true; // role 무매칭 — 보존(재기동 더 기다림)
                 }
-                let mut entry = QueueEntry {
-                    id: it
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| it.get("mid").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string(),
-                    seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-                    text: it.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    enqueued_at: it
-                        .get("enqueued_at")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or_else(now_epoch),
-                    from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
-                    origin: it
-                        .get("origin")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("wal-legacy")
-                        .to_string(),
-                    // ★(0.14.31 · WP-5 M) TTL 회계 5키 관통 — 키 부재(구 데몬이 다시 쓴 WAL·레거시)는
-                    //   serde default 와 같은 값으로 되살린다. 없는 정보를 지어내지 않는다.
-                    ttl_secs: it.get("ttl_secs").and_then(|v| v.as_u64()),
-                    paused_total_secs: it
-                        .get("paused_total_secs")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
-                    expired_at: it.get("expired_at").and_then(|v| v.as_f64()),
-                    revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
-                    expired_notified: it
-                        .get("expired_notified")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    expired_event_sent: it
-                        .get("expired_event_sent")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                };
+                // ★(0.14.31 · 성찰 Q15) 종전에는 여기에 `queue_entry_from_row` 의 **바이트 동일
+                //   복제**가 인라인돼 있었고, 주석 세 개("★비타입 감사 지점 ①②③")가 그 결합을
+                //   스스로 자백했다. `QueueEntry` 에 필드를 더하면 세 곳을 동시에 고쳐야 했고,
+                //   하필 빠뜨리기 쉬운 이 세 번째가 **복원분이 배달 경로로 들어가는 유일한 통로**
+                //   였다(값 산식의 갈림은 컴파일러가 잡지 못한다). 지금은 공용 함수 하나다 —
+                //   감사 지점 ③은 소멸했다(현재 값 동일 → 동작 무변경).
+                let mut entry = queue_entry_from_row(it);
                 let expired_now = entry.expired_at.is_none()
                     && queue_entry_expired(&entry, now, default_ttl);
                 if force_expired || entry.expired_at.is_some() || expired_now {
