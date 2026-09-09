@@ -76,8 +76,23 @@ BOOT_CMD="$(cys_shquote "${CYS_PY:-python3}") $(cys_shquote "$(cys_native_path "
 #   (`C:\…`)를 기록한다 — 원문 그대로 넘기면 두 축이 **항상** 어긋나 Windows 의 모든 호출이
 #   무결합이 된다(WP-4 가 그 플랫폼에 배포되지 않는다). 팩이 이미 쓰는 `cys_native_path`
 #   (cygpath 가드 · unix 는 무변환)로 접어서 넘긴다(`_lib.sh` 의 CYS_STATE_DIR 과 같은 이유).
+# ★두 왕복 합에 **하나의 예산**(0.14.31 성찰 G8 · major): 종전은 surface-role 5s + reclaim-role
+#   12s 가 각자 데드라인이라 데몬 의존 합계가 17s 였고, SessionStart 는 preflight `HOOK_TIMEOUT_S`
+#   표에 항목이 없어 플랫폼 기본(30s)이 천장이었다. 부트 폭풍(N pane 동시 기동 → 한 데몬이 2N
+#   왕복을 직렬화)에서는 훅 전체가 취소되고 취소의 귀결은 **지침 미주입** — 이 훅이 막으려던
+#   바보 좌석을 전 pane 동시에 만든다. 그래서 두 왕복이 예산 하나(12s = 종전 reclaim 단독 몫)를
+#   나눠 쓴다: surface-role 프로브 뒤 경과를 재서 남은 예산을 reclaim 데드라인으로 준다.
+#   ★바닥(10s)은 CLI 내부 총예산(`run_reclaim_role` — 1차 7.5s + 조정 2.5s)이다. 그 아래로
+#     깎아 밖에서 먼저 죽이면 "데몬은 결합했는데 훅은 못 들은" 상태(치명위험 ③)가 되므로,
+#     남은 예산이 바닥에 못 미치면 reclaim 을 **건너뛴다**(무채택·무강등·종전 경로 — 이 블록의
+#     선언된 실패 방향). 느린 데몬에서 자동 복구를 한 번 놓치는 것이 전 pane 지침 소실보다 낫다.
+#   ★`date +%s` 실패(0)면 경과를 0 으로 본다 — 시계를 못 읽었다고 복구를 끄지 않는다.
+CYS_SS_ROLE_BUDGET_S=12
+CYS_SS_RECLAIM_MIN_S=10
 CYS_DEMOTE_ROLE=""
 if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/null 2>&1; then
+  CYS_SS_T0="$(date +%s 2>/dev/null || printf '0')"
+  case "$CYS_SS_T0" in ''|*[!0-9]*) CYS_SS_T0=0 ;; esac
   # ★`CYS_NO_AUTOSTART=1`(0.14.31 성찰 G5 · 봉인된 형제 `_lib.sh:768` 과 같은 형태):
   #   소켓이 없으면 `cys` 는 autostart 경로에서 형제 `cysd` 를 detached 로 스폰한 뒤 폴링한다 —
   #   밖의 데드라인이 죽여도 **스폰은 이미 일어났다**. 운영자가 의도적으로 내린 데몬이
@@ -85,6 +100,13 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
   ( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
     cys_timeout_run 5 cys surface-role </dev/null >/dev/null 2>&1 )
   CYS_SR_RC=$?
+  CYS_SS_T1="$(date +%s 2>/dev/null || printf '0')"
+  case "$CYS_SS_T1" in ''|*[!0-9]*) CYS_SS_T1=0 ;; esac
+  CYS_SS_ELAPSED=0
+  if [ "$CYS_SS_T0" -gt 0 ] && [ "$CYS_SS_T1" -ge "$CYS_SS_T0" ]; then
+    CYS_SS_ELAPSED=$((CYS_SS_T1 - CYS_SS_T0))
+  fi
+  CYS_SS_RECLAIM_DEADLINE=$((CYS_SS_ROLE_BUDGET_S - CYS_SS_ELAPSED))
   # rc 2 = 판정 불가(데몬 미응답·응답 파손) · rc 124 = 데드라인 초과(hang). 둘 다 "모른다"이므로
   # 조회를 시도하지 않는다 — 두 번째 왕복으로 훅을 또 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
   if [ "$CYS_SR_RC" -eq 2 ] || [ "$CYS_SR_RC" -eq 124 ]; then
@@ -96,12 +118,22 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     #   `$(cmd | tr -d '\r')` 라 파이프 마지막 단계(`tr`)의 rc 가 잡혀 reclaim 명령의 실패가
     #   구조적으로 보이지 않았다 — 소켓이 끊겨 에러 문면이 나와도 '정상 응답'과 같은 값이 됐다.
     #   판정은 리다이렉트 뒤 `rc=$?` 하나로만 뜨고, `\r` 제거는 그 뒤에 따로 한다.
+    if [ "$CYS_SS_RECLAIM_DEADLINE" -lt "$CYS_SS_RECLAIM_MIN_S" ]; then
+      # 예산 밖 = **판정 없음**(아래 ⓒ invalid_reply 경로 그대로: 무채택·무강등). 데몬을 죽이지도
+      # 커밋 도중에 끊지도 않는다 — 다음 SessionStart(/clear·compact)가 다시 시도한다.
+      CYS_RECLAIM_OUT=""
+      CYS_RECLAIM_RC=124
+      if [ -z "$CYS_ROLE" ]; then
+        echo "■ 고지: 데몬 응답이 느려 역할 자동 복구를 건너뛴다(역할 조회 예산 ${CYS_SS_ROLE_BUDGET_S}s 중 ${CYS_SS_ELAPSED}s 소진 · reclaim 최소 ${CYS_SS_RECLAIM_MIN_S}s 미확보) — 다음 세션 시작에서 다시 시도한다."
+      fi
+    else
     CYS_RECLAIM_OUT="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
-      cys_timeout_run 12 cys reclaim-role --auto \
+      cys_timeout_run "$CYS_SS_RECLAIM_DEADLINE" cys reclaim-role --auto \
       --config "$(cys_native_path "${CLAUDE_CONFIG_DIR:-}")" \
       --cwd "$(cys_native_path "$PWD")" \
       --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null )"
     CYS_RECLAIM_RC=$?
+    fi
     CYS_RECLAIM_OUT="$(printf '%s\n' "$CYS_RECLAIM_OUT" | tr -d '\r')"
     CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"
     CYS_RC_L2="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 2p)"

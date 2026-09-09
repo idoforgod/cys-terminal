@@ -97,6 +97,9 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
         "garbled_live": ("exit 0",
                          "printf 'cys: connection reset by peer\\nreason=bound\\n"
                          "env_role=other_live\\n'; exit 1"),
+        # ★0.14.31 성찰 G8: 느린 데몬 — surface-role 이 예산의 절반 가까이를 먹는다(3s).
+        #   남은 예산(12-3=9s)이 reclaim 바닥(10s)에 못 미치므로 훅은 reclaim 을 **건너뛴다**.
+        "slow_found":   ("sleep 3; exit 0", _rc("cso", "bound", "unknown")),
     }[reclaim_mode]
     with open(os.path.join(bindir, "cys"), "w", encoding="utf-8", newline="\n") as f:
         f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
@@ -429,8 +432,8 @@ check("12a 훅이 bare `timeout N cys` 를 쓰지 않는다(cys_timeout_run 경�
 #   하나 더 생기면 그대로 통과한다. 이제 **각 호출의 실제 형태**를 본다.
 check("12b-1 surface-role 이 cys_timeout_run 경유",
       "cys_timeout_run 5 cys surface-role" in _code)
-check("12b-2 reclaim-role 이 cys_timeout_run 경유",
-      "cys_timeout_run 12 cys reclaim-role --auto" in _code)
+check("12b-2 reclaim-role 이 cys_timeout_run 경유(데드라인은 예산 파생 · G8)",
+      'cys_timeout_run "$CYS_SS_RECLAIM_DEADLINE" cys reclaim-role --auto' in _code)
 check("12b-3 claim-role 재대조가 cys_timeout_run 경유",
       "cys_timeout_run 2 cys claim-role" in _code)
 check("12b-4 bare `cys surface-role`·`cys reclaim-role` 직접 호출 0",
@@ -468,6 +471,38 @@ check("18e 봉인은 두 자리에만 걸렸다(claim-role 은 종전 그대로)
       _seen.get("claim-role", {"unset"}) == {"unset"},
       "받은 값: %r" % _seen.get("claim-role"))
 shutil.rmtree(tmp)
+
+# ── 19. ★0.14.31 성찰 G8 — 두 왕복 합에 하나의 예산 ──
+#   surface-role 5s + reclaim-role 12s 가 각자 데드라인이면 데몬 의존 합계가 17s 이고, SessionStart 는
+#   preflight HOOK_TIMEOUT_S 표에 없어 플랫폼 기본 30s 가 천장이다. 부트 폭풍에서 훅이 통째로
+#   취소되면 그 귀결은 **지침 미주입**(바보 좌석 · 전 pane 동시). 훅은 surface-role 뒤 경과를 재서
+#   남은 예산을 reclaim 에 주고, 남은 예산이 CLI 내부 총예산(10s) 밑이면 reclaim 을 건너뛴다.
+import time as _time
+tmp = tempfile.mkdtemp(prefix="hook-t19a-")
+env = setup(tmp, "ok", reclaim_mode="slow_found")
+_t0 = _time.monotonic()
+code, out, _ = run_hook(env)
+_dt = _time.monotonic() - _t0
+_calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read() \
+    if os.path.exists(os.path.join(tmp, "calls.log")) else ""
+check("19a 느린 데몬(3s)에서 reclaim-role 왕복을 내지 않는다(남은 예산 < 바닥 10s)",
+      "cys surface-role" in _calls and "cys reclaim-role" not in _calls, "calls=%r" % _calls)
+check("19b 건너뛴 사실을 고지한다(무채택·무강등 · 다음 세션 재시도)",
+      "자동 복구를 건너뛴다" in out and "DIRECTIVE-BODY-CSO" not in out, out[-300:])
+check("19c 좌석은 종전 경로(무역할 안내문)를 받는다 — 좌석 사망이 아니다",
+      code == 0 and "javis_bootstrap.py" in out, "rc=%s" % code)
+check("19d 두 왕복 합이 예산(12s) 안이다(실측 %.1fs)" % _dt, _dt < 12.0)
+shutil.rmtree(tmp)
+# 양성 대조: 빠른 데몬이면 reclaim 이 그대로 난다(예산이 정상 경로를 깎지 않는다).
+tmp = tempfile.mkdtemp(prefix="hook-t19b-")
+env = setup(tmp, "ok", reclaim_mode="found")
+code, out, _ = run_hook(env)
+_calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
+check("19e 양성 대조: 빠른 데몬에서는 reclaim 왕복이 나고 역할이 복구된다",
+      "cys reclaim-role" in _calls and "DIRECTIVE-BODY-CSO" in out, "calls=%r" % _calls)
+shutil.rmtree(tmp)
+check("19f 예산 상수가 훅에 선언돼 있다(바닥 = CLI 내부 총예산 10s)",
+      "CYS_SS_ROLE_BUDGET_S=12" in _code and "CYS_SS_RECLAIM_MIN_S=10" in _code)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)
