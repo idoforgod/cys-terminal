@@ -772,5 +772,85 @@ class QueueExpiryTermination(unittest.TestCase):
             self.assertEqual(rec["state"], G.SEEN_STATE_INFLIGHT)
 
 
+class QueueDropTermination(unittest.TestCase):
+    """★(0.14.31 · 성찰 Q6) **폐기도 종결이다** — 좌석 종료·자력 종료·clear·만료 축출.
+
+    종전에는 `queue.dropped` 를 구독하지도 않았고 페이로드에 W-id 에코(`entry_ids`)도 없었다.
+    그래서 폐기 4사유 중 `expired_evicted` 만(그것도 나란히 나가는 `queue.expired` 덕에) 종결이
+    도달했고, 나머지 셋의 W-id 는 영원히 `inflight` 로 남아 seen TTL 마다 **낡은 wakeup_id 그대로**
+    재enqueue 됐다(wakeup 홍수 — M7 이 없애려던 병리의 재개방).
+    """
+
+    def _pend(self, t, wid, key):
+        G.seen_claim(t, key, G.SEV_CRIT, 1_000_000.0)
+        G.seen_mark(t, key, 1_000_000.0, state=G.SEEN_STATE_INFLIGHT, wakeup_id=wid)
+
+    def test_dropped_event_is_subscribed(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            g = gate(t, r)
+            g._poll_once()
+            self.assertTrue(r.polls, "이벤트 폴링을 하지 않았다")
+            self.assertIn("queue.dropped", r.polls[0][1],
+                          "폐기 사실을 구독하지 않는다 — 종결 신호가 도착조차 하지 않는다")
+
+    def test_dropped_wakeup_is_terminally_disarmed_without_counting_as_delivered(self):
+        for reason in ("surface_closed", "process_exited", "cleared", "expired_evicted"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as t:
+                r = FakeRunner()
+                key = G.seen_key("stall_confirmed", "s:w-%s" % reason, G.SEV_CRIT)
+                self._pend(t, "W-000000dead", key)
+                r.events = [{"name": "queue.dropped",
+                             "payload": {"reason": reason,
+                                         "entry_ids": ["W-000000dead"],
+                                         "queue_entry_ids": ["q7"], "count": 1}}]
+                g = gate(t, r)
+                g._poll_once()
+                counters = {}
+                g._reconcile_inflight(counters, 1_000_100.0)
+                with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                self.assertEqual(rec["state"], G.SEEN_STATE_DROPPED,
+                                 "폐기가 inflight 를 풀지 않았다 — seen TTL 마다 영구 재enqueue")
+                self.assertNotEqual(rec["state"], G.SEEN_STATE_DELIVERED,
+                                    "폐기를 배달로 셌다(배달되지 않은 일을 완료로 기록)")
+                self.assertFalse(
+                    counters.get("push_edge", {}).get(key, {}).get("armed", True),
+                    "엣지가 무장 해제되지 않아 같은 주기에 다시 발화한다")
+
+    def test_unrelated_drop_leaves_other_work_inflight(self):
+        """다른 항목의 폐기가 내 wakeup 을 종결시키지 않는다(조인 키가 실제로 걸린다)."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:worker4", G.SEV_CRIT)
+            self._pend(t, "W-0000000004", key)
+            r.events = [{"name": "queue.dropped",
+                         "payload": {"reason": "cleared", "entry_ids": ["W-0000009999"]}}]
+            g = gate(t, r)
+            g._poll_once()
+            g._reconcile_inflight({}, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["state"], G.SEEN_STATE_INFLIGHT)
+
+    def test_queue_entry_ids_are_not_joined_as_wakeup_ids(self):
+        """`queue_entry_ids`(큐 항목 id)를 조인 키로 쓰면 두 체계가 섞인다 — 그 경로가 없다."""
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:worker5", G.SEV_CRIT)
+            self._pend(t, "W-0000000005", key)
+            r.events = [{"name": "queue.dropped",
+                         "payload": {"reason": "cleared",
+                                     "queue_entry_ids": ["W-0000000005"],
+                                     "entry_ids": []}}]
+            g = gate(t, r)
+            g._poll_once()
+            g._reconcile_inflight({}, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["state"], G.SEEN_STATE_INFLIGHT,
+                             "queue_entry_ids 로 조인했다 — 두 id 체계 혼선")
+
+
 if __name__ == "__main__":
     unittest.main()

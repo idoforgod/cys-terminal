@@ -5195,7 +5195,10 @@ fn alert_queue_starved_if_stalled(
 ///
 /// 경계 규약: `W-` 뒤 hex 0자는 무시(`W-`·`W-ZZZZ`), hex 뒤 첫 비-hex 문자가 종료 경계
 /// (`[wakeup W-a1b2c3d4e5]` → `W-a1b2c3d4e5`), 등장 순서 보존 + 중복 제거, 최대 32개.
-fn wakeup_entry_ids(text: &str) -> Vec<String> {
+/// ★(0.14.31 · 성찰 Q6) `pub(crate)` 승격 — 폐기 페이로드(`state::queue_dropped_payload`)도
+/// 같은 에코를 실어야 소비자가 폐기를 **종결**로 읽는다. 두 벌로 구현하면 그 순간 조인 키가
+/// 갈린다(이 저장소가 반복해서 맞은 사본 드리프트).
+pub(crate) fn wakeup_entry_ids(text: &str) -> Vec<String> {
     /// 한 배달 텍스트에서 뽑는 id 상한 — digest 병합이라도 이 이상은 페이로드 비대만 낳는다.
     const MAX_IDS: usize = 32;
     /// id 본문 hex 상한(계약: 1~32자).

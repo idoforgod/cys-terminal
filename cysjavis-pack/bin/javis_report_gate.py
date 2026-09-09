@@ -403,6 +403,13 @@ SEEN_STATE_CLAIMED, SEEN_STATE_INFLIGHT, SEEN_STATE_DELIVERED = "claimed", "infl
 # 남기지 않는다 — 종전에는 만료된 critical wakeup 이 inflight 로 영원히 남아 seen TTL 마다
 # 재enqueue 됐고, 그 재enqueue 가 또 만료되며 만료 통지까지 반복 생산했다(적체 자기증식).
 SEEN_STATE_EXPIRED = "expired"
+# ★(0.14.31 · 성찰 Q6) 데몬이 그 항목을 **폐기**했다(`queue.dropped`). 사유는 넷이다:
+# `expired_evicted`(만료 큐 상한 축출) · `surface_closed`(좌석 종료) · `process_exited`
+# (자력 종료) · `cleared`(운영자 queue.clear). 종전에는 `expired_evicted` 만 `queue.expired`
+# 로도 함께 나가 종결이 도달했고 나머지 셋은 **아무 종결 신호도 도달하지 않았다** — 그
+# W-id 는 영원히 inflight 로 남아 seen TTL 마다 낡은 wakeup_id 그대로 재enqueue 됐다
+# (wakeup 홍수). 만료와 같은 급의 종결이되 **배달이 아니다**(delivered 계수 불변).
+SEEN_STATE_DROPPED = "dropped"
 
 
 def _safe_key(key):
@@ -1729,7 +1736,7 @@ class Gate:
             return
         try:
             ok, events, latest = fn(self._load_cursor(),
-                                    ["queue.delivered", "queue.expired",
+                                    ["queue.delivered", "queue.expired", "queue.dropped",
                                      "master.deadman", "master.idle"])
         except Exception:                       # noqa: BLE001 — 관측 실패가 판정을 죽이지 않는다
             return
@@ -1758,19 +1765,30 @@ class Gate:
                 if r.get("state") == SEEN_STATE_INFLIGHT and r.get("wakeup_id")]
         if not pend or not self._ack_ok:
             return
-        acked, expired = set(), set()
+        acked, expired, dropped = set(), set(), set()
+        # ★(0.14.31 · 성찰 Q6) 종결은 셋이다 — 배달·만료·**폐기**. 조인 키는 셋 다 `entry_ids`
+        #   (배달 원문에서 되읽은 W-id)이고, 그것이 이 상태머신의 유일한 조인 키다.
+        _bucket = {"queue.delivered": acked, "queue.expired": expired, "queue.dropped": dropped}
         for ev in self._events:
             name = ev.get("name")
-            if name not in ("queue.delivered", "queue.expired"):
+            if name not in _bucket:
                 continue
             payload = ev.get("payload") or {}
             for i in payload.get("entry_ids") or []:
-                (acked if name == "queue.delivered" else expired).add(i)
+                _bucket[name].add(i)
         for rec in pend:
             wid = rec.get("wakeup_id")
             if wid in acked:
                 seen_mark(self.state_dir, rec["key"], now_epoch,
                           state=SEEN_STATE_DELIVERED)
+                edge_fire(counters, "push_edge", rec["key"], now_epoch)
+            elif wid in dropped:
+                # ★(0.14.31 · 성찰 Q6) 데몬이 그 항목을 폐기했다(좌석 종료·자력 종료·clear·
+                #   만료 축출). 배달이 아니므로 delivered 로 세지 않지만 **종결**이므로 inflight
+                #   에서 푼다 — 그러지 않으면 seen TTL 마다 같은 wakeup_id 가 재enqueue 된다.
+                #   조건이 여전하면 다음 주기의 **새 관측**이 새 wakeup 을 만든다.
+                seen_mark(self.state_dir, rec["key"], now_epoch,
+                          state=SEEN_STATE_DROPPED)
                 edge_fire(counters, "push_edge", rec["key"], now_epoch)
             elif wid in expired:
                 # ★(0.14.31 · WP-5 리뷰 R1 · codex major) 데몬이 TTL 로 그 항목을 뺐다 —

@@ -314,11 +314,33 @@ pub fn queue_dropped_payload(
     dropped: &[QueueEntry],
     reclaim: Option<(u64, &str)>,
 ) -> Value {
+    // ★(0.14.31 · 성찰 Q6) **W-id 에코 additive** — `queue.delivered`·`queue.expired` 와 같은 계약.
+    //
+    // 【무엇이 틀렸었나】 이 페이로드에는 `queue_entry_ids`(큐 항목 자신의 id)만 있었다. 소비자
+    //   (`javis_report_gate.py`)가 조인에 쓰는 유일한 키는 배달 원문에서 되읽은 **W-id**(`entry_ids`)
+    //   인데, 폐기 4사유 중 `expired_evicted` 만 M7 수리에서 덮였고 나머지 3종(`surface_closed` ·
+    //   `process_exited` · `cleared`)은 종결이 소비자에게 **도달하지 않았다**. 귀결은 그 W-id 가
+    //   영원히 `inflight` 로 남아 seen TTL 마다 낡은 wakeup_id 그대로 재enqueue 되는 것이다
+    //   (= wakeup 홍수 · M7 이 없애려던 병리의 재개방).
+    // 【명명 계약 준수】 `queue_entry_ids` 키명은 **그대로 둔다**(두 id 체계가 한 키명을 공유하면
+    //   disarm 조인이 오염된다 — 위 명명 계약 주석). `entry_ids` 는 W-id 에코 전용이다.
+    let entry_ids: Vec<String> = {
+        let mut out: Vec<String> = Vec::new();
+        for e in dropped {
+            for w in crate::governance::wakeup_entry_ids(&e.text) {
+                if !out.iter().any(|x| x == &w) {
+                    out.push(w);
+                }
+            }
+        }
+        out
+    };
     let mut p = json!({
         "reason": reason,
         "count": dropped.len(),
         "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>(),
         "queue_entry_ids": dropped.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "entry_ids": entry_ids,
     });
     if let Some((cleared_by, via)) = reclaim {
         p["cleared_by"] = json!(cleared_by);
@@ -8498,9 +8520,17 @@ mod tests {
                 json!(["qa.1", "qa.2"]),
                 "additive queue_entry_ids — 큐 순서 보존"
             );
-            assert!(
-                p.get("entry_ids").is_none(),
-                "entry_ids 키명은 W-id 에코 전용(javis_report_gate disarm 조인 키) — 재사용 금지"
+            // ★(0.14.31 · 성찰 Q6) `entry_ids` 는 **W-id 에코 전용**이다 — 두 id 체계가 한 키명을
+            //   공유하면 disarm 조인이 오염된다. 이 검체의 본문에는 W-id 가 없으므로 **빈 배열**이고,
+            //   무엇보다 `queue_entry_ids` 와 **같지 않아야** 한다(키명 재사용 금지의 실체).
+            assert_eq!(
+                p["entry_ids"],
+                json!([] as [&str; 0]),
+                "W-id 가 없는 본문인데 entry_ids 에 무언가 실렸다 — 조인 키 오염"
+            );
+            assert_ne!(
+                p["entry_ids"], p["queue_entry_ids"],
+                "entry_ids 에 큐 항목 id 가 실렸다 — javis_report_gate disarm 조인이 오염된다"
             );
             assert!(
                 p.get("cleared_by").is_none() && p.get("via").is_none(),
@@ -8511,6 +8541,24 @@ mod tests {
         let empty = queue_dropped_payload("cleared", &[], None);
         assert_eq!(empty["count"], json!(0));
         assert_eq!(empty["queue_entry_ids"], json!([] as [&str; 0]));
+        assert_eq!(empty["entry_ids"], json!([] as [&str; 0]));
+        // ★(0.14.31 · 성찰 Q6) 본문에 W-id 가 실려 있으면 **등장 순서 보존 · 중복 제거**로 에코한다
+        //   (`queue.delivered`·`queue.expired` 와 같은 산식 — `governance::wakeup_entry_ids`).
+        let with_wid = vec![
+            w2b_entry("qb.1", 1, "[wakeup W-a1b2c3] 보고 요망", 10.0),
+            w2b_entry("qb.2", 2, "[wakeup W-a1b2c3] 중복 · [wakeup W-ff00] 둘째", 20.0),
+        ];
+        let echoed = queue_dropped_payload("surface_closed", &with_wid, None);
+        assert_eq!(
+            echoed["entry_ids"],
+            json!(["W-a1b2c3", "W-ff00"]),
+            "폐기 통지에 W-id 에코가 없다/틀렸다 — 소비자에게 종결이 도달하지 않아 TTL 마다 재enqueue 된다"
+        );
+        assert_eq!(
+            echoed["queue_entry_ids"],
+            json!(["qb.1", "qb.2"]),
+            "queue_entry_ids 의미가 바뀌었다(두 체계 혼선)"
+        );
         // ★G4(W4-C) exited_reclaim 예외 경유: cleared_by/via 두 키만 additive — 기존 키 불변.
         let reclaimed = queue_dropped_payload("cleared", &dropped, Some((7, "exited_reclaim")));
         assert_eq!(reclaimed["reason"], json!("cleared"), "reclaim 경유도 기존 키 reason 불변");
