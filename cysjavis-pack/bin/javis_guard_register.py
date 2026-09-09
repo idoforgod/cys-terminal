@@ -330,8 +330,15 @@ def validate_targets_doc(doc):
         return None, "profiles 가 비어 있거나 배열이 아님"
     index = {}
     for ent in profiles:
-        if not isinstance(ent, dict) or not ent.get("basename"):
+        if not isinstance(ent, dict):
             return None, "profiles 항목 형식 오류: %r" % (ent,)
+        # ★0.14.31 성찰 G9: `basename` 의 **타입을 먼저** 검증한다. 배열·객체 basename 은 아래
+        #   `ent["basename"] in index` 에서 unhashable 예외를 내 C28 을 중단시켰고, 그러면 재시도
+        #   표식(미해소 기록)이 만들어지지 않아 다음 부팅이 재측정하지 않았다. 손상은 예외가
+        #   아니라 **err 문자열**로 나가야 한다 — preflight 는 그것을 UNKNOWN·표식으로 접는다.
+        _bn = ent.get("basename")
+        if not isinstance(_bn, str) or not _bn:
+            return None, "profiles 항목의 basename 이 비어 있거나 문자열이 아님: %r" % (_bn,)
         elig = ent.get("eligibility")
         if not isinstance(elig, dict):
             return None, "%s: eligibility 누락/형식 오류" % ent.get("basename")

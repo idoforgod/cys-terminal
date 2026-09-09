@@ -860,5 +860,54 @@ class TriageRegistrationGaps(_CapgateEnv):
                         "계측 타당성 실패: 해제가 실패했으면 범위는 그대로여야 한다: %s" % doc)
 
 
+
+
+class ReflectRegistrarGaps(_CapgateEnv):
+    """★0.14.31 성찰(2026-09-10) — 등록기 잔여 결함 G9. 전부 **실행**해서 잰다."""
+
+    def _table_with_basename(self, bn):
+        return {"schema_version": 1, "policy": {"unknown_profile": "deny"},
+                "profiles": [{"basename": bn,
+                              "eligibility": {k: "allow" for k in gr.REQUIRED_ELIGIBILITY_KEYS}}]}
+
+    def test_non_string_basename_is_corruption_not_a_traceback(self):
+        """G9: 배열·객체 basename 은 unhashable 예외로 C28 을 **중단**시켰고, 그러면 재시도 표식이
+        만들어지지 않아 다음 부팅이 재측정하지 않았다. 손상은 err 문자열 → UNKNOWN·표식이어야 한다."""
+        for bn in ([".claude"], {"name": ".claude"}, None, ""):
+            with self.subTest(basename=bn):
+                doc = self._table_with_basename(bn)
+                idx, err = gr.validate_targets_doc(doc)      # 예외 0 이 곧 검체다
+                self.assertIsNone(idx)
+                self.assertTrue(err and "basename" in err, "손상 사유가 basename 을 지목하지 않는다: %r" % err)
+                tdir = self.pack / "state"
+                tdir.mkdir(exist_ok=True)
+                (tdir / "hook-targets.json").write_text(json.dumps(doc), encoding="utf-8")
+                denied, perr = pf.capgate_table_denied_basenames(str(self.pack))
+                self.assertIsNotNone(perr, "preflight 가 손상 표를 err 없이 통과시켰다")
+                self.assertFalse(denied, "손상 표에서 deny 집합이 비어 있지 않다: %r" % (denied,))
+
+    def test_corrupt_basename_keeps_registration_and_leaves_a_recheck_marker(self):
+        """G9: 기존 등록 유지(등록도 해제도 아님) + 미해소 표식이 남아 다음 부팅이 재측정한다."""
+        sp = self._profile_with_capgate()
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive,
+                                 table=self._table_with_basename([".claude"]))
+        self.assertIn("판정 불능", res["detail"], "손상 표가 판정 불능으로 접히지 않았다: %s" % res["detail"])
+        self.assertEqual(len(self._capgate_cmds(doc)), 1, "손상 표에서 등록이 바뀌었다: %s" % doc)
+        found = []
+        for root in (self.javis, self.pack / "state", self.sock.parent):
+            for dirpath, _dirs, files in os.walk(str(root)):
+                for name in files:
+                    fp = os.path.join(dirpath, name)
+                    if name == "hook-targets.json":
+                        continue
+                    try:
+                        body = open(fp, "rb").read()
+                    except OSError:
+                        continue
+                    if b"capgate" in body or "capgate" in name:
+                        found.append(fp)
+        self.assertTrue(found, "손상 표에서 재시도 표식이 남지 않았다 — 다음 부팅이 재측정하지 않는다")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
