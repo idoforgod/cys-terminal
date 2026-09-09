@@ -833,6 +833,13 @@ pub fn banner_versions(text: &str) -> Vec<String> {
         let folded = fold_for_banner_scan(text);
         scan_banners(&folded, &flatten(BANNER_ANCHOR), &mut out);
     }
+    // ★(0.14.31 · 성찰 R4 · major) **둘째 벨트** — 다른 후보의 **점 접두**인 후보는 같은 배너의
+    //   잘린 판본이다(`"2.1"` ⊂ `"2.1.263"`). `take_dotted` 가 줄바꿈 절단을 이미 거르지만, 접기
+    //   패스와 원문 패스가 같은 배너를 다른 길이로 읽는 렌더(테두리가 점 사이에 낀 형상)가 남는다.
+    //   버리는 방향은 '보류를 줄이는' 쪽이라 근거가 필요하고, 그 근거가 **포함관계**다 —
+    //   claude 배너는 언제나 세 자리이므로 `2.1` 과 `2.1.263` 이 같은 화면에서 참일 수 없다.
+    let full = out.clone();
+    out.retain(|v| !full.iter().any(|o| o != v && o.starts_with(&format!("{v}."))));
     out
 }
 
@@ -874,11 +881,34 @@ fn is_box_border(c: char) -> bool {
 /// 한 화면에서 훑는 배너 상한(병적 입력에서 판정 시간이 화면 길이에 끌려가지 않게).
 pub const BANNER_SCAN_MAX: usize = 8;
 
+/// 앵커 뒤의 점숫자 런을 버전으로 읽는다.
+///
+/// ★(0.14.31 · 성찰 R4 · major) **줄바꿈으로 잘린 런은 채택하지 않는다.** 좁은 pane·ConPTY 에서
+/// 배너가 둘째 점 **바로 뒤**에서 접히면 런은 `2.1.` 이고, `trim_end_matches('.')` 가 그것을
+/// `"2.1"` 이라는 **정상 판독**으로 만들었다. 그 값은 접힌 배너 패스가 읽은 진짜 `2.1.263` 과
+/// **둘 다** 합집합 래치에 남고([`crate::inject_guard::latch_seat_versions`]), 확인 경계는 하나라도
+/// 불일치면 보류하므로 `MEASURED_ON` 과 **같은 버전 좌석까지** 영구 보류가 된다(무인 부트에서
+/// 노드 0). 게다가 진단 라벨이 "좌석이 밝힌 claude 버전(2.1)" 이라 **거짓을 단언**했다.
+///
+/// 【판정】 런이 `.` 으로 끝나고 그 다음 문자가 줄바꿈(`\n`·`\r`)이면 그것은 **잘린 렌더**이지
+/// 두 자리 버전이 아니다 → `None`. 접힌 배너의 진짜 값은 [`banner_versions`] 의 접기 패스가
+/// (공백·테두리를 지운 사본에서) 그대로 읽는다.
+///
+/// 【실패 방향】 못 읽으면 미상이고 미상은 오늘 확인을 막지 않는다(= 종전과 같음). 잘못 읽으면
+/// 영구 보류다 — 그래서 모호한 런은 버린다.
 fn take_dotted(s: &str) -> Option<String> {
     let head: String = s
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
+    if head.ends_with('.')
+        && s[head.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '\n' || c == '\r')
+    {
+        return None; // 줄바꿈으로 잘린 런 — 두 자리 버전이 아니다
+    }
     let trimmed = head.trim_end_matches('.');
     if trimmed.split('.').filter(|p| !p.is_empty()).count() >= 2
         && trimmed.starts_with(|c: char| c.is_ascii_digit())
@@ -4965,6 +4995,28 @@ mod tests {
         // 앵커가 없으면 여전히 미상이다(추정 금지 — 접기 패스가 판독기를 넓히지 않는다).
         assert!(banner_versions("2.1.263 (Claude Code)\n").is_empty());
         assert!(banner_versions(fixtures::FOLDER_TRUST).is_empty());
+
+        // ★(0.14.31 · 성찰 R4 · major) **둘째 점 직후 접힘** 3변형 — 산출은 정확히 1건이어야 한다.
+        //
+        //   종전에는 원문 패스가 런 `2.1.` 을 `trim_end_matches('.')` 로 `"2.1"` 이라는 정상
+        //   판독으로 만들었고, 접기 패스가 읽은 진짜 `2.1.263` 과 **둘 다** 합집합 래치에 남았다.
+        //   확인 경계는 하나라도 불일치면 보류하므로 `MEASURED_ON`(2.1.241)과 같은 버전 좌석까지
+        //   영구 보류가 됐고(무인 부트에서 노드 0), 진단 라벨은 "좌석이 밝힌 claude 버전(2.1)"
+        //   이라 **거짓을 단언**했다. 처방 ②를 따르면 `measured_on:"2.1"` 이 되어 진짜 2.1.241
+        //   좌석 전량이 드리프트로 뒤집힌다.
+        for (name, folded) in [
+            ("LF", "│ ✻ Welcome to Claude Code v2.1.\n│ 263      │\n"),
+            ("CRLF", "│ ✻ Welcome to Claude Code v2.1.\r\n│ 263      │\r\n"),
+            ("테두리 낀 접힘", "│ Welcome to Claude Code v2.1.\n│ 263 · /help for help │\n"),
+        ] {
+            assert_eq!(
+                banner_versions(folded),
+                vec!["2.1.263".to_string()],
+                "{name}: 둘째 점 직후 접힘에서 가짜 버전이 함께 잡힌다(영구 보류 · 거짓 단언)"
+            );
+        }
+        // 그리고 **두 자리 버전 자체**는 여전히 읽는다(잘린 렌더가 아닐 때 — 조인 방향의 대조).
+        assert_eq!(banner_versions("Claude Code v2.1 (old)\n"), vec!["2.1".to_string()]);
     }
 
     /// ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 3) 화면용 판독기와 `--version` 용 판독기를

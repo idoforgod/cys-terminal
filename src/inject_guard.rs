@@ -439,12 +439,18 @@ impl ConfirmDenied {
             ConfirmDenied::LabelUnresolved => {
                 "커서가 액션 라벨 전문 위가 아니거나 활성 선택 블록에 경쟁 커서가 있다(모호)".into()
             }
+            // ★(0.14.31 · 성찰 R4 · major) 종전 ②는 "실측한 뒤 measured_on 을 갱신하라" 였다.
+            //   그런데 `detected` 가 **접힌 배너의 잘린 판독**(`2.1`)일 수 있었고, 그 처방을
+            //   그대로 따르면 `measured_on:"2.1"` 이 되어 진짜 2.1.241 좌석 전량이 드리프트로
+            //   뒤집힌다. 처방은 화면 판독값을 **베끼라**가 아니라 **실측하라**여야 한다.
             ConfirmDenied::VersionDrift { measured_on, detected } => format!(
                 "좌석이 밝힌 claude 버전({detected})이 이 관문을 실측한 버전({measured_on})과 \
                  다르다 — 선언된 통과 액션이 이 버전에서 참이라는 근거가 없다. 탈출구 셋: \
-                 ① 사람 1회로 넘긴다 ② 실측한 뒤 agents.json 봉투의 measured_on 을 갱신한다 \
-                 ③ 이 축만 종전으로 되돌린다({ENV_VERSION_PIN}=0 — 마스터를 누르지 말 것: \
-                 마스터는 보류를 close 로 강등한다)"
+                 ① 사람 1회로 넘긴다 ② 이 값을 **베끼지 말고** 실측하라 — 접힌 배너의 잘린 \
+                 판독일 수 있다(`claude --version` · `cys gate-corpus --agent claude \
+                 --detected-version <실측값> --json`)—— 그 실측값이 다르면 agents.json 봉투의 \
+                 measured_on 을 그 값으로 갱신한다 ③ 이 축만 종전으로 되돌린다({ENV_VERSION_PIN}=0 \
+                 — 마스터를 누르지 말 것: 마스터는 보류를 close 로 강등한다)"
             ),
         }
     }
