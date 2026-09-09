@@ -52,6 +52,7 @@ repo 지시문만 읽으며 HOME·라이브 팩을 건드리지 않는다. 변�
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -238,8 +239,15 @@ META_NEGATION_PATTERNS = (
 )
 # 예산 면제 집합의 **정확한 원소**(과대 면제도 과소 면제도 거부한다 — codex 는 목록에
 # `cys send --to master-shadow` 를 더해도 통과시켰다).
+# ★D1(반성 라운드 2026-09-10): 훅이 실제로 면제하는 5종(하위 명령)과 2종(read-screen·todo-path)이
+#   빠져 있었다 — 'master hang ∧ 예산 소진' 교차에서 지침상 출구가 `send --to master` 뿐이고 그
+#   수신자가 곧 hang 대상이라 **문서상 출구가 0** 이 됐다(훅은 열려 있는데 지침이 닫았다).
+#   이 집합은 이제 `gate_hook_contract_violations()` 가 훅 선언과 **집합으로** 대조한다.
 EXPECTED_BUDGET_EXEMPT = frozenset((
     "cys cycle-agent", "cys set-status", "cys identify", "cys status", "cys list",
+    "cys read-screen", "cys todo-path",
+    "cys queue list", "cys feed list", "cys feed push", "cys schedule list",
+    "cys approval check",
     "cys send --to master", "cys send --queued --to master",
 ))
 STRAY_EVENT_RE = re.compile(r"[a-z_]+(?:\.[a-z_*]+)+")
@@ -792,6 +800,21 @@ def _scan_outside_quotes(line: str):
         yield None
 
 
+def unquoted_comment_index(line: str) -> int | None:
+    """인용 밖 주석(`#`)이 시작하는 위치 — 없거나 **판정 불능**(따옴표 불일치)이면 `None`.
+
+    셸에서 인용 밖 `#` 는 낱말 첫 자리일 때만 주석이다. 따옴표가 닫히지 않으면 그 `#` 가 인용 안일
+    수도 있으므로 "주석 없음" 으로 접는다 — 그 줄은 어차피 `shell_command_segments` 가 판정 불능
+    (위반)으로 잡는다(보수적)."""
+    for item in _scan_outside_quotes(line):
+        if item is None:
+            return None
+        index, ch, at_word_start = item
+        if ch == "#" and at_word_start:
+            return index
+    return None
+
+
 def code_part(line: str) -> str:
     """인용 밖 주석(`#`)을 걷어낸 **실행 부분**.
 
@@ -799,13 +822,8 @@ def code_part(line: str) -> str:
     때문에 "따옴표 불일치 → 판정 불능" 으로 붉어졌다. 셸에서 인용 밖 `#` 는 낱말 첫 자리일 때만
     주석이므로 그 규칙 그대로 자른다 — `: '#' ; cys events --reconnect`(따옴표 안 `#`)는 잘리지
     않는다(R3 codex L5 의 회귀 방지). 따옴표가 닫히지 않으면 **원문 그대로** 돌려준다(보수적)."""
-    for item in _scan_outside_quotes(line):
-        if item is None:
-            return line
-        index, ch, at_word_start = item
-        if ch == "#" and at_word_start:
-            return line[:index]
-    return line
+    index = unquoted_comment_index(line)
+    return line if index is None else line[:index]
 
 
 def heredoc_tags(line: str) -> list[str]:
@@ -856,7 +874,13 @@ def _walk_block(block: str) -> tuple[list[tuple[str, bool]], list[str]]:
             i += 1
             continue
         logical = line
-        while _odd_trailing_backslashes(logical) and i + 1 < len(raw):
+        # ★D6 수렴(반성 라운드 2026-09-10): **주석 종료가 행 계속보다 먼저**다. 셸에서 인용 밖
+        #   `#` 뒤는 개행까지 전부 주석이므로 행말 역슬래시가 있어도 다음 줄과 접합되지 않는다.
+        #   종전 순서는 `echo ok # 설명 \` + 다음 줄 `cys "$verb" --reconnect` 를 한 논리 줄로
+        #   접합했고, 그 뒤 `code_part` 가 `#` 부터 잘라 **다음 줄의 동적 구독을 통째로 삼켰다**
+        #   (그 줄은 실제로는 독립 명령으로 실행된다 — 검출력이 아니라 판정 대상이 사라졌다).
+        while (unquoted_comment_index(logical) is None
+               and _odd_trailing_backslashes(logical) and i + 1 < len(raw)):
             logical = logical[:-1] + raw[i + 1]
             i += 1
         out.append((logical, True))
@@ -1032,6 +1056,52 @@ def command_substitutions(line: str) -> list[str]:
     return out
 
 
+# ★D6 수렴(반성 라운드 2026-09-10): **명령 래퍼를 명시적으로 해석**한다. `command cys "$verb"` 는
+#   셸이 `cys "$verb"` 로 실행하는데 종전 판정기는 명령 이름을 `command` 로 읽고 "cys 가 아니다" 로
+#   통과시켰다(`builtin`·`exec`·`nohup`·`env` 도 같다). 값 = (값을 먹지 않는 옵션, 값을 먹는 옵션).
+#   **모르는 옵션은 통과가 아니라 판정 불능(위반)** 이다 — 아는 것만 걷는다(allowlist 의 뜻).
+COMMAND_WRAPPERS = {
+    "command": (("-p", "-v", "-V"), ()),
+    "builtin": ((), ()),
+    "exec":    (("-c", "-l"), ("-a",)),
+    "nohup":   ((), ()),
+    "time":    (("-p",), ()),
+    "env":     (("-i", "-"), ("-u",)),
+}
+_WRAPPER_DEPTH = 4          # 래퍼 중첩 상한 — 넘으면 판정하지 않고 바깥이 동적/미지 이름으로 잡는다
+
+
+def _strip_command_wrappers(seg: list[tuple[str, bool]], head: int) -> tuple[int, str | None]:
+    """명령 래퍼를 걷어 **실제 명령 이름의 위치**를 돌려준다 — (위치, 판정 불능 사유 또는 None)."""
+    for _ in range(_WRAPPER_DEPTH):
+        if head >= len(seg):
+            return head, None
+        name, dynamic = seg[head]
+        if dynamic:
+            return head, None                       # 동적 이름은 호출자가 판정한다
+        base = os.path.basename(name)
+        if base not in COMMAND_WRAPPERS:
+            return head, None
+        opts, value_opts = COMMAND_WRAPPERS[base]
+        head += 1
+        while head < len(seg):
+            token = seg[head][0]
+            if base == "env" and _ASSIGN_RE.match(token):
+                head += 1                           # `env NAME=value cys …` 의 선행 대입
+                continue
+            if not token.startswith("-") or token == "-":
+                break
+            if token in value_opts:
+                head += 2
+                continue
+            if token in opts:
+                head += 1
+                continue
+            return head, ("명령 래퍼 `%s` 의 옵션 `%s` 를 해석할 수 없다 — 실제 실행될 명령을 "
+                          "정할 수 없다" % (base, token))
+    return head, None
+
+
 def literal_subscription_violations(line: str, where: str) -> list[str]:
     """실행되지 않는 영역(히어독 본문)에도 거는 **리터럴 바닥 검사**(빈 목록이 합격).
 
@@ -1065,6 +1135,10 @@ def subscription_command_violations(line: str, depth: int = 0) -> list[str]:
         #   않으므로 대입은 **동적이든 아니든** 걷는다 — 값 안의 명령 치환은 위 재귀가 본다.
         while head < len(seg) and _ASSIGN_RE.match(seg[head][0]):
             head += 1        # 선행 `NAME=value` 할당은 걷는다 — **값은 전파하지 않는다**
+        head, wrapper_problem = _strip_command_wrappers(seg, head)
+        if wrapper_problem:
+            out.append("공용 블록 실행 줄의 %s: %s" % (wrapper_problem, line.strip()))
+            continue
         if head >= len(seg):
             continue
         name, name_dynamic = seg[head]
@@ -1176,25 +1250,193 @@ def push_form_is_budget_exempt(body: str) -> bool:
                for pre in budget_exempt_prefixes(body))
 
 
-def gate_hook_contract_violations() -> list[str]:
-    """능력 게이트 훅(WP-3 A)이 배선되면 지침과의 계약 3항을 검사한다(미배선이면 빈 목록).
+HOOK_PY_OPEN = "<<'PYEOF'"          # 훅이 판정 파이썬을 인터프리터에 넘기는 히어독
+HOOK_PY_CLOSE = "PYEOF"
 
-    지금은 훅에 CSO 판정이 없어 항상 빈 목록이다 — 이것은 **미래를 향한 트립와이어**이며,
-    붉어지면 뜻은 '훅을 지침에 맞춰라' 이지 '지침을 훅에 맞춰 넓혀라' 가 아니다."""
-    path = os.path.join(os.path.dirname(BIN), "hooks", GATE_HOOK)
-    if not os.path.isfile(path):
-        return []
-    with open(path, encoding="utf-8", errors="replace") as source:
-        text = source.read()
-    if "tool_calls" not in text and "CronCreate" not in text:
+
+def hook_path() -> str:
+    return os.path.join(os.path.dirname(BIN), "hooks", GATE_HOOK)
+
+
+def hook_python_block(text: str) -> str:
+    """훅 셸 스크립트에서 **판정 파이썬 블록**만 떼어 낸다.
+
+    ★D6(반성 라운드 2026-09-10): 종전 판정기는 훅 소스를 통째 문자열로 읽고 `in text` 로만 봤다 —
+    그래서 ⓐ훅 **주석**에 우연히 든 문자열이 트립와이어를 만족시켜 실제 허용을 제거해도 초록이었고
+    (실증: `CSO_CYS_SUBVERBS["feed"]` 에서 `"push"` 를 지워도 전건 OK) ⓑ거동과 무관한 주석 한 줄을
+    더하는 것만으로 3레인이 붉어졌다(문서 편집이 릴리스를 막는다). 판정은 **코드**를 봐야 한다.
+    구조를 못 읽으면 조용히 통과하지 않는다 — 판정 불능은 통과가 아니다."""
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.strip().endswith(HOOK_PY_OPEN)]
+    if len(heads) != 1:
+        raise AssertionError("훅의 `%s` 히어독이 %d 개다(1 이어야 한다) — 판정기를 고쳐라"
+                             % (HOOK_PY_OPEN, len(heads)))
+    ends = [i for i in range(heads[0] + 1, len(lines)) if lines[i].rstrip() == HOOK_PY_CLOSE]
+    if not ends:
+        raise AssertionError("훅의 파이썬 히어독 종료(`%s`)를 찾지 못했다" % HOOK_PY_CLOSE)
+    return "\n".join(lines[heads[0] + 1:ends[0]])
+
+
+def _module_sets(tree: ast.Module, names: tuple[str, ...]) -> dict[str, object]:
+    """훅 파이썬 블록의 **모듈 수준** 상수 선언을 값으로 읽는다(리터럴만)."""
+    out: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                out[target.id] = ast.literal_eval(node.value)
+    return out
+
+
+def _verb_literal_membership(tree: ast.Module) -> list[tuple]:
+    """`verb in (…리터럴…)` 형태의 비교 — 훅의 **예산 면제 조회 동사** 집합이 이 형태로 적혀 있다."""
+    hits = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Compare) and isinstance(node.left, ast.Name)
+                and node.left.id == "verb" and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.In)
+                and isinstance(node.comparators[0], (ast.Tuple, ast.Set, ast.List))):
+            try:
+                hits.append(tuple(ast.literal_eval(node.comparators[0])))
+            except ValueError:
+                continue
+    return hits
+
+
+def _verb_eq_branches(tree: ast.Module) -> list[tuple[str, ast.If]]:
+    """`verb == "<동사>"` 분기 목록 — 하위 명령 계약이 따로 있는 동사(`send`·`cycle-agent`)의 자리."""
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "verb"
+                and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.Eq)
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and isinstance(node.test.comparators[0].value, str)):
+            out.append((node.test.comparators[0].value, node))
+    return out
+
+
+def _branch_essential_prefixes(branches: list[tuple[str, ast.If]]) -> dict[str, str]:
+    """예산 **면제**로 끝나는 `verb == …` 분기의 {동사: 접두 문면}.
+
+    면제는 `return True, "<접두>", True` 의 셋째 값이다 — 라벨의 괄호 주석은 접두가 아니라 설명이라
+    잘라 낸다(`cys cycle-agent(사이클 필수 도구)` → `cys cycle-agent`)."""
+    out: dict[str, str] = {}
+    for verb, node in branches:
+        for ret in ast.walk(node):
+            if not (isinstance(ret, ast.Return) and isinstance(ret.value, ast.Tuple)
+                    and len(ret.value.elts) == 3):
+                continue
+            ok, label, essential = ret.value.elts
+            if not (isinstance(ok, ast.Constant) and ok.value is True
+                    and isinstance(essential, ast.Constant) and essential.value is True):
+                continue
+            text = label.value if isinstance(label, ast.Constant) else ""
+            prefix = text.split("(")[0].strip() if isinstance(text, str) else ""
+            out[verb] = prefix if prefix.startswith("cys ") else "cys %s" % verb
+    return out
+
+
+HOOK_CONST_NAMES = ("CSO_CYS_VERBS", "CSO_CYS_SUBVERBS", "CSO_CYS_SUBVERB_ESSENTIAL",
+                    "CSO_CYS_DENY_VERBS", "CSO_CYS_TTL_VERBS")
+
+
+def hook_capability_model(text: str) -> dict[str, object] | None:
+    """훅이 **코드로** 선언한 CSO 접두 모델(미배선이면 None).
+
+    돌려주는 것: 허용 동사·허용 하위 명령·예산 면제 접두 집합·deny 동사·TTL 동사 · `send` 분기가
+    `--queued` 를 판정에 쓰는지 여부."""
+    block = hook_python_block(text)
+    tree = ast.parse(block)
+    consts = _module_sets(tree, HOOK_CONST_NAMES)
+    if not consts:
+        return None                       # WP-3 A 미배선 — 검사 대상 자체가 없다
+    missing = [n for n in HOOK_CONST_NAMES if n not in consts]
+    if missing:
+        raise AssertionError("훅에 %s 선언이 없다 — 접두 모델을 읽을 수 없다" % ", ".join(missing))
+    literal_verb_sets = _verb_literal_membership(tree)
+    if len(literal_verb_sets) != 1:
+        raise AssertionError("훅의 `verb in (…리터럴…)`(예산 면제 조회 동사) 비교가 %d 개다"
+                             "(1 이어야 한다) — 판정기를 고쳐라" % len(literal_verb_sets))
+    branches = _verb_eq_branches(tree)
+    branch_essential = _branch_essential_prefixes(branches)
+    send_uses_queued = any(
+        isinstance(c, ast.Constant) and isinstance(c.value, str) and "--queued" in c.value
+        for verb, node in branches if verb == "send" for c in ast.walk(node))
+    essential = {"cys %s" % v for v in literal_verb_sets[0]}
+    essential |= set(branch_essential.values())
+    essential |= {"cys %s %s" % pair for pair in consts["CSO_CYS_SUBVERB_ESSENTIAL"]}
+    return {
+        "verbs": set(consts["CSO_CYS_VERBS"]),
+        "subverbs": {k: set(v) for k, v in consts["CSO_CYS_SUBVERBS"].items()},
+        "deny": set(consts["CSO_CYS_DENY_VERBS"]),
+        "ttl": set(consts["CSO_CYS_TTL_VERBS"]),
+        "essential": essential,
+        "send_uses_queued": send_uses_queued,
+    }
+
+
+def directive_exempt_prefixes(body: str) -> set[str]:
+    """지침 예산 면제 bullet 이 선언한 `cys …` 접두 **집합**.
+
+    `--queued` 는 같은 접두의 **형태**다(훅의 `send` 분기가 그 플래그를 보지 않는다) — 집합 대조에서는
+    한 값으로 접는다. 그 형태가 실제로 덮이는지는 `push_form_is_budget_exempt` 가 따로 잰다."""
+    out = set()
+    for prefix in budget_exempt_prefixes(body):
+        out.add(prefix.replace(" --queued", "", 1))
+    return out
+
+
+def gate_hook_contract_violations(hook_text: str | None = None,
+                                  directive_body: str | None = None) -> list[str]:
+    """능력 게이트 훅(WP-3 A)이 배선되면 지침과의 계약을 **집합으로** 대조한다(미배선이면 빈 목록).
+
+    ★D1·D6(반성 라운드 2026-09-10): 판정은 문자열 검색이 아니라 훅 파이썬 블록의 선언
+    (`CSO_CYS_SUBVERBS`·`CSO_CYS_SUBVERB_ESSENTIAL`·`CSO_CYS_DENY_VERBS`·예산 면제 조회 동사 튜플)
+    을 읽어 **집합으로** 비교한다. 붉어지면 뜻은 '훅과 지침 중 **틀린 쪽**을 고쳐라' 이지 '넓은 쪽에
+    맞춰라' 가 아니다 — 좁은 쪽이 이긴다는 §1-1 규칙은 그대로다."""
+    if hook_text is None:
+        path = hook_path()
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8", errors="replace") as source:
+            hook_text = source.read()
+    model = hook_capability_model(hook_text)
+    if model is None:
         return []  # WP-3 A 미배선 — 검사 대상 자체가 없다(침묵은 통과가 아니라 부재다)
     out = []
-    if "events --after-seq" in text:
-        out.append("게이트에 `events --after-seq` 접두가 있다 — 지침은 전 플래그 deny(§1-1)")
-    if MANDATED_PUSH not in text:
-        out.append("면제/허용 접두에 `%s` 형태가 없다 — 예산 소진 보고가 막힌다(봉인 ②)" % MANDATED_PUSH)
-    if "feed push" not in text:
-        out.append("`cys feed push` 접두가 없다 — §1-2 ②(오너 채널) 도달 불가")
+    # ① `cys events` 는 **어떤 플래그로도** 접두 밖이다(§1-1) — 허용/TTL 어디에도 있으면 안 된다.
+    if "events" not in model["deny"]:
+        out.append("훅의 deny 동사 집합에 `events` 가 없다 — 지침은 전 플래그 deny(§1-1)")
+    for axis in ("verbs", "ttl"):
+        if "events" in model[axis]:
+            out.append("훅의 %s 집합에 `events` 가 있다 — 구독에는 예외가 없다(§1-1)" % axis)
+    if "events" in model["subverbs"]:
+        out.append("훅의 하위 명령 표에 `events` 가 있다 — 구독에는 예외가 없다(§1-1)")
+    # ② `feed push` = §1-2 ② 오너 채널의 유일 출구. 허용이면서 **예산 면제**여야 한다 —
+    #    허용만 있고 면제가 없으면 'master hang ∧ 예산 소진' 교차에서 출구가 0 이 된다.
+    if "push" not in model["subverbs"].get("feed", set()):
+        out.append("훅에 `cys feed push` 허용이 없다 — §1-2 ②(오너 채널) 도달 불가")
+    if "cys feed push" not in model["essential"]:
+        out.append("훅의 예산 면제에 `cys feed push` 가 없다 — 예산 소진 ∧ master hang 에서 출구 0")
+    # ③ 머리글이 의무화한 push 형태는 `--queued` 유무와 무관하게 면제여야 한다.
+    if model["send_uses_queued"]:
+        out.append("훅의 `send` 분기가 `--queued` 를 판정에 쓴다 — 면제는 그 플래그와 무관해야 한다"
+                   "(머리글이 의무화한 형태가 면제 밖이면 예산 소진 보고 자체가 막힌다)")
+    if "cys send --to master" not in model["essential"]:
+        out.append("훅의 예산 면제에 `cys send --to master` 가 없다 — 보고 채널이 막힌다(봉인 ②)")
+    # ④ 지침 문면 ↔ 훅 접두 집합의 **기계 대조**(D1). 한쪽만 넓으면 지침이 없는 출구를 약속하거나
+    #    있는 출구를 없다고 적는다 — 둘 다 §3-1(문장은 장치의 설명) 위반이다.
+    if directive_body is None:
+        with open(os.path.join(DIRECTIVES_DIR, "CSO_DIRECTIVE.md"), encoding="utf-8") as source:
+            directive_body = source.read()
+    declared = directive_exempt_prefixes(directive_body)
+    for extra in sorted(declared - model["essential"]):
+        out.append("지침만 면제로 적은 접두: %s — 훅은 면제하지 않는다(없는 출구를 약속한다)" % extra)
+    for absent in sorted(model["essential"] - declared):
+        out.append("훅만 면제하는 접두: %s — 지침 §1-1 예산 면제 목록에 없다"
+                   "(있는 출구를 없다고 적는다)" % absent)
     return out
 
 
@@ -1594,8 +1836,67 @@ class CsoDirectiveRevision(unittest.TestCase):
         self.assertIn("§1-2 ④ 의 보류로 떨어지고", life)
 
     def test_capability_gate_hook_contract_when_wired(self):
-        """능력 게이트 훅이 배선되면(WP-3 A) 지침이 요구하는 3항을 훅도 지켜야 한다(미배선이면 무검사)."""
+        """능력 게이트 훅이 배선되면(WP-3 A) 지침이 요구하는 계약을 훅도 지켜야 한다(미배선이면 무검사)."""
         self.assertEqual(gate_hook_contract_violations(), [])
+
+    def test_gate_hook_contract_reads_code_not_comments(self):
+        """★D1·D6(반성 라운드 2026-09-10): 종전 판정기가 **양방향으로 오판**한 두 변이를 고정한다.
+
+        ⓐ거짓 음성 — `CSO_CYS_SUBVERBS["feed"]` 에서 실제 허용 `"push"` 를 지워도 훅 **주석**이
+          `feed push` 문자열을 담고 있어 52 tests OK 였다(실측). 이제 코드를 읽으므로 RED 여야 한다.
+        ⓑ거짓 양성 — 거동과 무관한 주석 한 줄(`# 주: cys events --after-seq 도 스트림이라 deny 다`)
+          만 넣어도 검체가 붉어졌다(문서 편집이 3레인을 막는다). 이제 GREEN 이어야 한다."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        self.assertEqual(gate_hook_contract_violations(hook, self.body), [],
+                         "현행 훅·지침 조합이 계약을 어긴다")
+
+        removed = hook.replace('"feed": {"list", "push"},', '"feed": {"list"},', 1)
+        self.assertNotEqual(removed, hook, "변이가 실제로 적용되지 않았다")
+        hits = gate_hook_contract_violations(removed, self.body)
+        self.assertTrue(any("feed push" in h for h in hits),
+                        "허용을 제거한 변이를 판정기가 통과시켰다(주석을 코드로 읽는다): %r" % hits)
+
+        # 주석 삽입은 거동 불변 — 판정도 불변이어야 한다(모듈 상수 선언 **뒤**에 넣어 위치도 옮긴다).
+        anchor = "CSO_CYS_TTL_VERBS = "
+        self.assertIn(anchor, hook)
+        commented = hook.replace(
+            anchor, "# 주: cys events --after-seq 도 스트림이라 deny 다\n" + anchor, 1)
+        self.assertNotEqual(commented, hook)
+        self.assertEqual(gate_hook_contract_violations(commented, self.body), [],
+                         "거동 불변 주석 삽입에 판정기가 붉어졌다(거짓 적색)")
+
+    def test_gate_hook_contract_compares_exemption_sets_with_the_directive(self):
+        """★D1: 지침 면제 목록 ↔ 훅 면제 집합의 **기계 대조** — 한쪽만 넓어지면 잡아야 한다."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        narrowed = self.body.replace("|read-screen|todo-path", "", 1)
+        self.assertNotEqual(narrowed, self.body)
+        hits = gate_hook_contract_violations(hook, narrowed)
+        self.assertTrue(any("훅만 면제하는 접두" in h for h in hits),
+                        "지침이 훅보다 좁아졌는데 대조가 통과했다: %r" % hits)
+        widened = self.body.replace("`cys queue list|feed list|feed push",
+                                    "`cys queue clear|queue list|feed list|feed push", 1)
+        self.assertNotEqual(widened, self.body)
+        hits = gate_hook_contract_violations(hook, widened)
+        self.assertTrue(any("지침만 면제로 적은 접두" in h for h in hits),
+                        "지침이 훅보다 넓어졌는데 대조가 통과했다: %r" % hits)
+
+    def test_gate_hook_contract_fails_closed_on_unreadable_structure(self):
+        """구조를 못 읽으면 **조용한 통과**가 아니라 예외다(판정 불능은 통과가 아니다)."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        for label, mutated in (
+                ("히어독 종료 제거", hook.replace("\nPYEOF\n", "\n# PYEOF\n", 1)),
+                ("면제 동사 튜플 중복(어느 쪽이 정본인지 정할 수 없다)",
+                 hook.replace("CSO_CYS_TTL_VERBS = {",
+                              'CSO_CYS_DUP = verb in ("x",)\nCSO_CYS_TTL_VERBS = {', 1)),
+                ("상수 선언 이름 변경",
+                 hook.replace("CSO_CYS_SUBVERB_ESSENTIAL = {", "CSO_CYS_SUBVERB_ESS = {", 1))):
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutated, hook, "변이가 실제로 적용되지 않았다")
+                with self.assertRaises(AssertionError):
+                    gate_hook_contract_violations(mutated, self.body)
 
     def test_negative_permissive_subscription_controls(self):
         """★R2(리뷰 major · codex 반례 전수): 금지를 뒤집거나 다른 도구로 구독을 허용하는 문장은
@@ -2100,6 +2401,12 @@ SHELL_SAFE_LINES = (
     'ROLE=$(cys reclaim-role --auto); echo "$ROLE"',
     "cys status --json # don't poll",
     "cys read-screen --surface <ref>       # 보조 확인 수단 (don't poll)",
+    # ★D6(반성 라운드 2026-09-10): 명령 래퍼의 **정상** 사용은 통과해야 한다(래퍼 해석의 양성 대조).
+    "command cys status --json",
+    "command -p cys list",
+    "env CYS_PACK_DIR=/tmp cys status",
+    'echo "ok # 주석 아님"; cys status',
+    "cys \\\nstatus --json",                        # 정상 행 계속(주석 없음) — 접합해도 안전하다
 )
 SHELL_SAFE_HEREDOC = "cat <<'EOF'\nDon't poll\nEOF"
 # 같은 스캐너가 **막아야** 하는 어법 — 위 통과 대조가 공허해지지 않게 같은 자리에 건다.
@@ -2108,6 +2415,16 @@ SHELL_UNSAFE_LINES = (
     'V=$(cys "$verb" --reconnect)',                # 대입 값 **안**의 동적 하위 명령(판정 불능)
     'X="$(cys events --reconnect)"',               # 대입 값 안의 정적 구독
     "cat <<'EOF'\ncys events --reconnect\nEOF",     # 히어독 본문의 구독 리터럴(셸에 먹일 수 있다)
+    # ★D6(반성 라운드 2026-09-10) — 종전 스캐너의 두 사각:
+    #   ①명령 래퍼: 셸은 `command cys …` 를 `cys …` 로 실행하는데 판정기는 이름을 `command` 로 읽고
+    #     "cys 가 아니다" 로 통과시켰다(`builtin`·`exec`·`nohup`·`env` 도 같다).
+    #   ②주석 뒤 행 계속: 인용 밖 `#` 뒤는 개행까지 주석이라 행 계속이 **성립하지 않는데**, 접합을
+    #     먼저 해서 다음 줄의 실제 명령이 주석 안으로 삼켜졌다.
+    'command cys "$verb" --reconnect',             # 래퍼 뒤 동적 하위 명령(판정 불능)
+    "command cys events --reconnect",              # 래퍼 뒤 정적 구독
+    "env CYS_X=1 cys events --reconnect",          # env 래퍼 + 선행 대입 뒤의 구독
+    "command -Z cys status",                       # 모르는 래퍼 옵션 — 실행될 명령을 정할 수 없다
+    'echo ok # 설명 \\\ncys "$verb" --reconnect',    # 주석 뒤 행 계속(다음 줄은 독립 명령이다)
 )
 # 닫지 않은 히어독은 그 뒤 **전부**를 본문으로 만들어 실행 줄 판정을 끈다 — 블록 단위로 따로 본다
 # (템플릿에 다른 히어독이 있으면 그쪽 종료 태그가 이 우회를 닫아 버려, 삽입 검사로는 증명되지 않는다).
@@ -2194,6 +2511,29 @@ class ConvergenceRoundTwo(unittest.TestCase):
         # 미종결 히어독은 **판정 불능**이다(그 뒤 전부가 본문이 되어 실행 줄 판정이 꺼진다).
         self.assertEqual(unterminated_heredocs(UNTERMINATED_HEREDOC_BLOCK), ["EOF"])
         self.assertEqual(unterminated_heredocs(SHELL_SAFE_HEREDOC), [])
+
+    def test_shell_scanner_reads_wrappers_and_ends_lines_at_comments(self):
+        """★D6(반성 라운드 2026-09-10): 래퍼 해석과 '주석 종료 우선' 을 판정 함수 수준에서 고정한다."""
+        # ① 주석이 있는 줄은 **접합되지 않는다** — 다음 줄은 그 자체로 실행 줄이다.
+        block = 'echo ok # 설명 \\\ncys "$verb" --reconnect'
+        self.assertEqual(command_lines(block),
+                         ["echo ok # 설명 \\", 'cys "$verb" --reconnect'])
+        self.assertTrue(subscription_command_violations(command_lines(block)[1]))
+        # 주석이 **없는** 행 계속은 종전대로 접합한다(과교정 방지).
+        self.assertEqual(command_lines("cys \\\nstatus --json"), ["cys status --json"])
+        # ② 래퍼는 걷어 내고 그 뒤의 실제 명령을 판정한다.
+        for line in ("command cys events", 'builtin cys "$verb"', "exec cys events",
+                     "nohup cys events --reconnect", "env A=1 cys events"):
+            with self.subTest(wrapper=line):
+                self.assertTrue(subscription_command_violations(line),
+                                "래퍼 뒤의 구독을 판정기가 통과시켰다: %r" % line)
+        for line in ("command cys status", "command -v cys", "env A=1 cys list",
+                     "nohup cys status --json"):
+            with self.subTest(ok=line):
+                self.assertEqual(subscription_command_violations(line), [],
+                                 "정상 래퍼 사용을 판정기가 붉혔다: %r" % line)
+        # ③ 모르는 래퍼 옵션은 통과가 아니라 판정 불능이다(아는 것만 걷는다).
+        self.assertTrue(subscription_command_violations("command -Z cys status"))
 
     # ── 한국어 금지문(codex major 2건) ────────────────────────────────────
     def test_legitimate_prohibitions_are_not_flagged(self):
