@@ -374,6 +374,46 @@ def cmd_enqueue(a):
         return EXIT_OK
 
 
+def _as_text(blob):
+    """bytes → str(utf-8 · 치환) · str → 그대로 · None → ""."""
+    if blob is None:
+        return ""
+    if isinstance(blob, bytes):
+        return blob.decode("utf-8", errors="replace")
+    return blob
+
+
+def _echo_captured(cp):
+    """★(0.14.31 · 성찰 Q9) 캡처한 CLI 출력을 사람에게 흘려 준다 — **표시 오류를 배달 사실과
+    격리**한다. 종전에는 이 echo 가 `subprocess.run` 과 같은 try 안에 있었고 `UnicodeEncodeError`
+    (ValueError 계열)는 except 절에 잡히지 않아 drain 이 통째로 죽었다: `cys send --queued` 는
+    이미 성공했는데 pending 이 남아 다음 drain 이 **같은 wakeup 을 재전송**했다(Windows cp949
+    콘솔 · 데몬 응답의 `·`/한글). 여기서 실패하면 ASCII 한 줄만 남기고 계속 간다."""
+    for stream, blob in ((sys.stdout, getattr(cp, "stdout", None)),
+                         (sys.stderr, getattr(cp, "stderr", None))):
+        if not blob:
+            continue
+        try:
+            stream.write(_as_text(blob))
+            stream.flush()
+        except (UnicodeError, OSError, ValueError):
+            try:
+                sys.stderr.write("warn: captured cys output is not displayable on this console "
+                                 "(encoding) - delivery verdict unaffected\n")
+            except Exception:  # noqa: BLE001 — 표시는 부수 효과다
+                pass
+
+
+def _isolate_console_encoding():
+    """★(0.14.31 · 성찰 Q9) 콘솔이 UTF-8 이 아니어도(Windows cp949 · C 로캘) 한글·기호 출력이
+    프로세스를 죽이지 않게 한다 — 표시는 부수 효과이고 배달 사실은 원장·pending 파일이 말한다."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 # javis_snapshot 소비 — 리네임 시 동반 수정
 def _durable_verdict(cp):
     """`cys send --queued` 출력에서 내구 표식을 읽는다 — True(내구) · False(미확정) · None(미상).
@@ -381,8 +421,11 @@ def _durable_verdict(cp):
     구 데몬·구 CLI 는 이 표식을 **아예 내지 않는다**(키 부재 = 스큐). 그때 `None` 을 돌려
     종전 동작(삭제)을 유지한다 — '부재 ≠ 부정'. 표식이 있고 false 일 때만 보관 경로로 간다.
     """
-    out = getattr(cp, "stdout", None) or ""
-    err = getattr(cp, "stderr", None) or ""
+    # ★(0.14.31 · 성찰 Q9) 응답은 **바이트**로 받는다(`text=True` 금지) — 로캘 디코딩은 여기서
+    #   `errors="replace"` 로 하며 판정 토큰은 ASCII 라 치환 문자에 영향받지 않는다. str 도 받는다
+    #   (javis_snapshot 등 구 호출부 호환).
+    out = _as_text(getattr(cp, "stdout", None))
+    err = _as_text(getattr(cp, "stderr", None))
     blob = f"{out}\n{err}".lower()
     if "durable=false" in blob:
         return False
@@ -657,12 +700,10 @@ def cmd_drain(a):
                 #   하므로 비0 은 중복 배달을 부른다 — CLI 쪽 설계는 타당하다). 종전에는 소비자가
                 #   반환코드만 보고 성공으로 처리해 원본 pending 을 즉시 지웠다: 데몬이 WAL 재시도
                 #   전에 죽으면 그 wakeup 은 **양쪽 어디에도 없다**(메시지 유실).
-                cp = subprocess.run(cmd, check=True, timeout=15,
-                                    capture_output=True, text=True)
-                durable = _durable_verdict(cp)
-                # 캡처했으므로 사람이 보던 문면을 그대로 흘려 준다(관측 손실 0).
-                sys.stdout.write(getattr(cp, "stdout", None) or "")
-                sys.stderr.write(getattr(cp, "stderr", None) or "")
+                # ★(0.14.31 · 성찰 Q9) **바이트**로 받는다 — `text=True` 는 로캘(cp949 등)로
+                #   디코딩하다 `UnicodeDecodeError` 를 `run()` 안에서 올렸고, 그것은 아래 except 에
+                #   잡히지 않아 drain 이 죽었다(전송은 이미 성공 → pending 잔존 → 재전송 = 중복).
+                cp = subprocess.run(cmd, check=True, timeout=15, capture_output=True)
                 if _load_failcount().get(target):
                     _bump_failcount(target, reset=True)  # 성공 = 연속실패 해소
             except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
@@ -687,6 +728,10 @@ def cmd_drain(a):
                     print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {e}",
                           file=sys.stderr)
                 continue
+            # ★(0.14.31 · 성찰 Q9) 수락·내구 판정을 **표시보다 먼저** 확정한다. 그 뒤의 echo 는
+            #   격리돼 있어 어떤 표시 오류도 아래의 pending 종결(삭제/보관)을 건너뛰게 하지 않는다.
+            durable = _durable_verdict(cp)
+            _echo_captured(cp)  # 캡처했으므로 사람이 보던 문면을 그대로 흘려 준다(관측 손실 0)
         else:
             durable = None
             # digest 본문은 여러 줄이라 그대로 찍으면 DRYRUN 이 N 줄이 된다 — **표시만** 1줄로
@@ -770,6 +815,7 @@ def main(argv=None):
     c.set_defaults(fn=cmd_cancel)
 
     a = p.parse_args(argv)
+    _isolate_console_encoding()  # ★성찰 Q9 — 표시 오류가 배달 사실을 바꾸지 못하게
     return a.fn(a)
 
 
