@@ -86,20 +86,35 @@
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)" >&2; exit 0; }
 
-# ── 역할 해소(데몬 권위 우선 · 60s 캐시) ────────────────────────────────────────
-# 캐시 파일 1줄 형식: `<epoch초> <역할>`. 키에 boot-epoch 를 넣어 데몬 재시작에 자동 무효화된다
-# (감독자가 꺼졌거나 Windows 파이프면 그 성분이 빠지고 TTL 60s 만 남는다 — 정직한 강등).
-capgate_slug() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || printf 'x'; }
+# ── 역할 해소(데몬 권위 우선 · TTL 15s 캐시) ─────────────────────────────────────
+# ★캐시 **신원·레코드 문법·디렉터리**는 `_lib.sh` 공용층과 같은 것을 쓴다(0.14.31 성찰 G1·G7·G14).
+#   종전 자체 구현은 세 곳에서 공용층과 갈렸고, 그 셋이 각각 실패였다:
+#     ⓐ `capgate_slug` 는 손실 치환이라 `/tmp/a/b.sock` 과 `/tmp/a_b.sock` 이 같은 이름을 냈는데
+#        레코드가 `<ts> <역할>` 2필드라 **종단점 신원이 실려 있지 않았다** — 같은 uid·같은
+#        TMPDIR·같은 surface 번호의 두 데몬 좌석이 한 캐시 파일을 공유해, 앞 좌석의 `worker`
+#        레코드가 뒤 좌석(reviewer)의 fast-path 가 됐다(리뷰어가 데몬에 묻지도 않고 자기 산출물을
+#        고친다 = producer≠evaluator 의 기계 집행이 통째로 사라진다 · 로그에도 흔적이 없다).
+#     ⓑ 캐시가 TMPDIR **루트**라 이름이 완전히 예측 가능했다(공용층이 0700 전용 디렉터리로 옮긴
+#        이유가 게이트에서만 되돌아와 있었다).
+#     ⓒ 세대 성분을 `dirname "$CYS_SOCKET"/boot-epoch` 에서 **무계·무검증**으로 읽었다 — 유닉스
+#        `dirname '\\.\pipe\cys'` 는 `.` 이라 Windows 명명 파이프에서 **cwd** 의 `boot-epoch` 를
+#        열었고(cwd 마다 캐시가 갈린다), 저장소에 그 이름의 큰 파일이 있으면 캐시 이름이
+#        ENAMETOOLONG 이 되며, FIFO 가 있으면 **모든 도구 호출 앞에서** 열기에 매달렸다.
+#   공용화하는 것은 신원·문법·디렉터리·유계 판독뿐이다 — **TTL 15s·게이트대상 재조회 정책은
+#   capgate 가 계속 소유한다**(공용층은 60s 이고 소비 규칙도 다르다 · 두 해소기 공존은 의도다).
+#
+# 캐시 레코드 1줄 = `"<ts> <역할|-> <세대> <소켓신원>"`(공용 `cys_role_record` 문법과 동일).
+# 소켓 신원은 **원문 그대로** 실려 정확 비교된다 — 슬러그가 충돌해도 남의 레코드를 읽지 않는다.
+CAPGATE_CACHE_TTL=15         # 초 · 승계 반영 지연의 상한(명시적 수용 · 노브 없음 §3-4)
+CAPGATE_QUERY_BACKOFF=5      # 초 · 조회 실패 후 재조회 유예(폭주 차단 · 노브 없음)
 
-CAPGATE_CACHE_TTL="${CAPGATE_CACHE_TTL:-15}"   # 초 · 승계 반영 지연의 상한(명시적 수용)
-CAPGATE_QUERY_BACKOFF="${CAPGATE_QUERY_BACKOFF:-5}"   # 초 · 조회 실패 후 재조회 유예(폭주 차단)
+# 캐시 파일 basename 접두 — 파이썬 판정기의 `GATE_STATE_FILE_PREFIX` 와 **같은 문자열**이어야
+# 게이트 자기상태 보호(`_is_gate_state_path`)가 이 파일을 덮는다(공용 디렉터리 규칙과 이중).
+CAPGATE_CACHE_PREFIX="cys-capgate-role-"
 
-capgate_cache_write() {   # `<epoch> <역할|->` 1줄 · 0600 · 같은 디렉터리 원자 교체
-  [ -n "${CYS_SURFACE_ID:-}" ] || return 0
-  _cg_tmp="$CAPGATE_CACHE.$$"
-  ( umask 077; printf '%s %s\n' "$1" "$2" > "$_cg_tmp" ) 2>/dev/null || {
-    rm -f "$_cg_tmp" 2>/dev/null; return 0; }
-  mv -f "$_cg_tmp" "$CAPGATE_CACHE" 2>/dev/null || rm -f "$_cg_tmp" 2>/dev/null
+capgate_record_write() {   # $1=경로 $2=ts $3=역할|- · 공용 원자 교체(대상이 디렉터리면 안 쓴다)
+  [ -n "${1:-}" ] || return 0
+  cys_role_cache_write "$1" "$2 $3 ${CAPGATE_EPOCH:--} ${CAPGATE_SOCKID:-}"
   return 0
 }
 
@@ -114,14 +129,27 @@ capgate_resolve_role() {
   CAPGATE_ROLE_SOURCE="none"
   CYS_SURFACE_ROLE_RESOLVED=""
   CAPGATE_ROLE_ALT=""
+  CAPGATE_CACHE=""
+  CAPGATE_SOCKID=""
+  CAPGATE_EPOCH="-"
   _cg_now="$(date +%s 2>/dev/null || printf '0')"
-  case "$_cg_now" in ''|*[!0-9]*) _cg_now=0 ;; esac
-  _cg_epoch=""
-  if [ -n "${CYS_SOCKET:-}" ]; then
-    _cg_epoch_file="$(dirname "$CYS_SOCKET" 2>/dev/null)/boot-epoch"
-    [ -f "$_cg_epoch_file" ] && _cg_epoch="$(head -n1 "$_cg_epoch_file" 2>/dev/null)"
+  case "$_cg_now" in ''|0*|*[!0-9]*) _cg_now=0 ;; esac
+  [ "${#_cg_now}" -le 12 ] || _cg_now=0
+
+  # ── 캐시 신원(공용층과 같은 규칙) ──
+  #   하나라도 표현 불가면 **디스크 캐시를 끈다**(매번 데몬 조회 · 남의 레코드를 읽는 것보다 낫다).
+  #   `id -u` 는 여기서 한 번 — 서브셸 안에서 세우면 나오지 못해 해소마다 포크가 하나 더 든다.
+  cys_role_sock_id_init
+  CAPGATE_SOCKID="$CYS_ROLE_SOCK_ID"
+  CAPGATE_EPOCH="$(cys_role_epoch)"
+  [ -n "${CYS_ROLE_UID:-}" ] || CYS_ROLE_UID="$(id -u 2>/dev/null || printf '')"
+  _cg_sid="$(cys_role_surface_id)" || _cg_sid=""
+  if [ -n "$CAPGATE_SOCKID" ] && [ -n "$_cg_sid" ]; then
+    _cg_dir="$(cys_role_cache_dir)" || _cg_dir=""
+    if [ -n "$_cg_dir" ]; then
+      CAPGATE_CACHE="$_cg_dir/$CAPGATE_CACHE_PREFIX$(cys_role_slug "$_cg_sid")-$(cys_role_slug "$CAPGATE_SOCKID")"
+    fi
   fi
-  CAPGATE_CACHE="${TMPDIR:-/tmp}/cys-capgate-role-$(capgate_slug "${CYS_SURFACE_ID:-none}")-$(capgate_slug "${CYS_SOCKET:-none}")-$(capgate_slug "$_cg_epoch")"
 
   # env 힌트(폴백 전용 신원 · plan §8). 여기서의 쓰임은 두 가지뿐이다:
   #   ① 게이트 대상이면 캐시 fast-path 를 끈다(캐시 오염으로 게이트가 열리지 않게)
@@ -132,22 +160,20 @@ capgate_resolve_role() {
   _cg_env_gated=0
   capgate_gated_role "$_cg_env" && _cg_env_gated=1
 
-  # 캐시 판독 — 정규 파일 · 비심링크 · 소유자 자신일 때만. 못 재면 **신뢰하지 않고 조회**한다
-  # (검사 실패를 '비대상 역할'로 읽지 않는다 · codex R1).
+  # 캐시 판독 — 공용 `cys_role_record`(정규 파일·비심링크·4KB 유계 판독·토큰 문법 검사 ·
+  # **세대와 소켓 신원 원문 정확 비교**). 못 재면 신뢰하지 않고 조회한다(codex R1).
   _cg_cached=""; _cg_fresh=0; _cg_cached_none=0
-  if [ -f "$CAPGATE_CACHE" ] && [ ! -L "$CAPGATE_CACHE" ] && [ -O "$CAPGATE_CACHE" ]; then
-    _cg_line="$(head -n1 "$CAPGATE_CACHE" 2>/dev/null)"
-    _cg_ts="${_cg_line%% *}"
-    _cg_cached="${_cg_line#* }"
-    [ "$_cg_ts" = "$_cg_line" ] && _cg_cached=""      # 구형·손상 형식은 무시
-    case "$_cg_ts" in ''|*[!0-9]*) _cg_ts=0 ;; esac
-    # 미래 시각(시계 역행)은 신선이 아니다 — 그러면 캐시가 무기한 유효해진다.
-    if [ "$_cg_now" -gt 0 ] && [ "$_cg_ts" -gt 0 ] && [ "$_cg_ts" -le "$_cg_now" ] \
-       && [ $(( _cg_now - _cg_ts )) -lt "$CAPGATE_CACHE_TTL" ]; then
-      _cg_fresh=1
-    fi
-    if [ "$_cg_cached" = "-" ]; then                  # 권위 있는 '역할 없음'
-      _cg_cached=""; _cg_cached_none=1
+  CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""
+  if [ -n "$CAPGATE_CACHE" ] && [ "$_cg_now" -gt 0 ] \
+     && cys_role_record "$CAPGATE_CACHE" "$CAPGATE_SOCKID" "$CAPGATE_EPOCH" \
+     && [ "$CYS_ROLE_REC_TS" -le "$_cg_now" ] \
+     && [ $(( _cg_now - CYS_ROLE_REC_TS )) -lt "$CAPGATE_CACHE_TTL" ]; then
+    # 미래 시각(시계 역행)은 위 `-le` 가 이미 거른다 — 그러지 않으면 캐시가 무기한 유효해진다.
+    _cg_fresh=1
+    if [ "$CYS_ROLE_REC_VAL" = "-" ]; then     # 권위 있는 '역할 없음'
+      _cg_cached_none=1
+    else
+      _cg_cached="$CYS_ROLE_REC_VAL"
     fi
   fi
 
@@ -170,34 +196,41 @@ capgate_resolve_role() {
   #   ★조회 실패 백오프(R1): 데몬이 죽거나 응답이 없으면 **모든 좌석이 도구 호출마다** 2s 를
   #     내는 폭풍이 된다(리뷰어 실측 우려 · 봉인표 ④ 방향). 실패를 짧게 기억해 그 창 동안은
   #     곧장 폴백으로 간다 — 폴백의 답은 어차피 그 조회가 줄 답과 같다(정지만 없앤다).
-  _cg_failmark="$CAPGATE_CACHE.fail"
+  #   ★백오프 표식도 **같은 신원 규칙**을 쓴다 — 신원 없는 표식이면 남의 종단점 실패가
+  #     이 좌석의 조회를 지운다(그 자리가 곧 캐시 충돌과 같은 구멍이다).
+  _cg_failmark=""
+  [ -n "$CAPGATE_CACHE" ] && _cg_failmark="$CAPGATE_CACHE.fail"
   _cg_skip_query=0
-  if [ -f "$_cg_failmark" ]; then
-    _cg_fts="$(head -n1 "$_cg_failmark" 2>/dev/null)"
-    case "$_cg_fts" in ''|*[!0-9]*) _cg_fts=0 ;; esac
-    if [ "$_cg_now" -gt 0 ] && [ "$_cg_fts" -gt 0 ] && [ "$_cg_fts" -le "$_cg_now" ] \
-       && [ $(( _cg_now - _cg_fts )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
-      _cg_skip_query=1
-    fi
+  CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""
+  if [ -n "$_cg_failmark" ] && [ "$_cg_now" -gt 0 ] \
+     && cys_role_record "$_cg_failmark" "$CAPGATE_SOCKID" "$CAPGATE_EPOCH" \
+     && [ "$CYS_ROLE_REC_TS" -le "$_cg_now" ] \
+     && [ $(( _cg_now - CYS_ROLE_REC_TS )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
+    _cg_skip_query=1
   fi
   if [ "$_cg_skip_query" = "0" ] && command -v cys >/dev/null 2>&1; then
     _cg_out="$(cys_timeout_run 2 cys surface-role 2>/dev/null)"; _cg_rc=$?
-    _cg_role="$(printf '%s' "$_cg_out" | head -n1 | tr -d '\r')"
+    _cg_role="$(cys_role_line "$_cg_out")"
+    # 표현 불가한 역할(공백 포함·64자 초과·문법 밖)은 **판정 불가**다 — 잘라 쓰면 없는 역할을
+    # 지어내는 것이고 레코드 문법도 깨진다(공용층 `cys_resolve_role` 과 같은 규칙).
+    if [ "$_cg_rc" -eq 0 ] && [ -n "$_cg_role" ] && ! cys_role_token_ok "$_cg_role"; then
+      _cg_rc=1
+    fi
     if [ "$_cg_rc" -eq 0 ] && [ -n "$_cg_role" ]; then
       CYS_SURFACE_ROLE_RESOLVED="$_cg_role"; CAPGATE_ROLE_SOURCE="daemon"
-      capgate_cache_write "$_cg_now" "$_cg_role"
-      rm -f "$_cg_failmark" 2>/dev/null || :
+      capgate_record_write "$CAPGATE_CACHE" "$_cg_now" "$_cg_role"
+      [ -n "$_cg_failmark" ] && { rm -f "$_cg_failmark" 2>/dev/null || :; }
       return 0
     fi
     # ★권위 있는 **역할 없음**(rc 0 · 빈 줄)도 사실이다 — `-` 로 캐시한다(옛 대상 캐시는 덮인다).
     if [ "$_cg_rc" -eq 0 ] && [ -z "$_cg_role" ]; then
-      capgate_cache_write "$_cg_now" "-"
-      rm -f "$_cg_failmark" 2>/dev/null || :
+      capgate_record_write "$CAPGATE_CACHE" "$_cg_now" "-"
+      [ -n "$_cg_failmark" ] && { rm -f "$_cg_failmark" 2>/dev/null || :; }
       CAPGATE_ROLE_SOURCE="daemon-none"
       return 0
     fi
     # 조회 실패 — 백오프 표시(같은 창의 다음 호출은 곧장 폴백으로 간다)
-    ( umask 077; printf '%s\n' "$_cg_now" > "$_cg_failmark" ) 2>/dev/null || :
+    capgate_record_write "$_cg_failmark" "$_cg_now" "-"
   fi
   # ③조회 실패 — 후보가 **갈리면 둘 다** 적용한다(정책 교집합 · codex R1).
   #   "게이트 대상을 먼저" 는 틀린 규칙이다: reviewer 와 CSO 의 허용 집합은 포함 관계가 아니라

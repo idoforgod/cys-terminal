@@ -49,9 +49,37 @@ SH = shutil.which("sh") or shutil.which("bash")
 NEED_SH = unittest.skipIf(not SH, "sh 부재 — 셸 종단 검체 실행 불가")
 
 
+CACHE_DIR_NAME = "cys-role-authority.d"
+CACHE_PREFIX = "cys-capgate-role-"
+
+
 def _slug(v):
-    """훅의 `capgate_slug`(`tr -c 'A-Za-z0-9._-' '_'`) 미러."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", v or "")
+    """공용 `cys_role_slug`(`tr -cs 'A-Za-z0-9.-' '_'` + 80자 절단) 미러.
+
+    ★0.14.31 성찰 G1: 훅 전용 `capgate_slug`(손실 치환·절단 없음)를 없애고 공용층 규칙으로
+      접었다. 이 미러가 어긋나면 아래 캐시 검체가 **엉뚱한 파일**을 심어 조용히 통과한다.
+    """
+    return re.sub(r"[^A-Za-z0-9.-]+", "_", v or "")[:80]
+
+
+def _pct(v):
+    """공용 `cys_role_pct_esc` 미러(`%`→`%25` 먼저, `:`→`%3A`)."""
+    return (v or "").replace("%", "%25").replace(":", "%3A")
+
+
+def sock_id(env):
+    """공용 `cys_role_sock_id_init` 미러 — 캐시 레코드에 **원문 그대로** 실리는 종단점 신원."""
+    s = env.get("CYS_SOCKET") or env.get("JAVIS_SOCKET") or env.get("AITERM_SOCKET") or ""
+    if s:
+        if not (s.startswith("/") or (("/" not in s) and
+                                      (s.startswith("\\\\.\\pipe\\") or
+                                       s.startswith("\\\\?\\pipe\\")) and len(s) > 9)):
+            return ""
+    else:
+        s = "default:%s:%s" % (_pct(env.get("XDG_STATE_HOME", "")), _pct(env.get("HOME", "")))
+    if len(s.encode("utf-8")) > 512 or "\n" in s or "\r" in s:
+        return ""
+    return s
 
 
 class HookRun(object):
@@ -134,14 +162,32 @@ class _HookEnv(unittest.TestCase):
         p.chmod(0o755)
         return p
 
-    def cache_path(self, surface="7", socket=""):
-        return self.tmpdir / ("cys-capgate-role-%s-%s-%s"
-                              % (_slug(surface), _slug(socket or "none"), ""))
+    def cache_dir(self):
+        d = self.tmpdir / CACHE_DIR_NAME
+        d.mkdir(mode=0o700, exist_ok=True)
+        return d
 
-    def plant_cache(self, role, surface="7", age=0, socket=""):
+    def cache_path(self, surface="7", socket="", epoch=None):
+        """공용 캐시 디렉터리 안의 capgate 전용 레코드 경로(0.14.31 성찰 G1).
+
+        세대(boot-epoch)는 **파일명이 아니라 레코드**에 있다 — 재기동 고아가 남지 않는다.
+        """
+        env = dict(self.env)
+        if socket:
+            env["CYS_SOCKET"] = socket
+        sid = sock_id(env)
+        return self.cache_dir() / (CACHE_PREFIX + "%s-%s" % (_slug(surface), _slug(sid)))
+
+    def plant_cache(self, role, surface="7", age=0, socket="", epoch="-", sockid=None):
+        """`"<ts> <역할|-> <세대> <소켓신원>"` 4필드 레코드를 심는다."""
         import time
         p = self.cache_path(surface, socket)
-        p.write_text("%d %s\n" % (int(time.time()) - age, role), encoding="utf-8")
+        env = dict(self.env)
+        if socket:
+            env["CYS_SOCKET"] = socket
+        sid = sock_id(env) if sockid is None else sockid
+        p.write_text("%d %s %s %s\n" % (int(time.time()) - age, role, epoch, sid),
+                     encoding="utf-8")
         p.chmod(0o600)
         return p
 
@@ -149,12 +195,13 @@ class _HookEnv(unittest.TestCase):
         return self.cyslog.read_text(encoding="utf-8") if self.cyslog.exists() else ""
 
     # ── 실행 ────────────────────────────────────────────────────────────────
-    def run_hook(self, tool="Bash", tool_input=None, session_id="s-1", **envkw):
+    def run_hook(self, tool="Bash", tool_input=None, session_id="s-1", cwd=None, **envkw):
         env = dict(self.env)
         env.update({k: str(v) for k, v in envkw.items()})
         payload = json.dumps({"session_id": session_id, "tool_name": tool,
                               "tool_input": tool_input or {}})
         r = subprocess.run([SH, str(HOOK)], input=payload, env=env,
+                           cwd=str(cwd) if cwd else None,
                            capture_output=True, text=True, timeout=90)
         return HookRun(r.returncode, r.stdout, r.stderr)
 
@@ -929,6 +976,145 @@ class TriageConvergenceR2(_HookEnv):
                         "혼합 토큰의 **리터럴 부분이 확장돼** 설치 팩 도구로 오인됐다"
                         "(동명 사본 실행): %r/%r" % (r.out, r.err))
 
+
+class HookCacheIdentity(_HookEnv):
+    """★0.14.31 성찰 G1·G7·G14 — 캐시 레코드의 **종단점 신원**과 세대 성분.
+
+    종전 훅은 캐시 파일명을 손실 슬러그로 만들고 레코드를 `<ts> <역할>` 2필드로 썼다:
+    슬러그가 충돌하는 두 소켓(`…/s/x.sock` ↔ `…/s_x.sock`)이 **한 파일**을 공유하는데
+    레코드에 신원이 없어 서로의 역할을 자기 것으로 읽었다. 그 방향은 **열림**이다 —
+    앞 좌석의 비대상 역할(worker)이 뒤 좌석(reviewer)의 fast-path 가 되어 리뷰어가
+    데몬에 묻지도 않고 자기 산출물을 고친다(로그에도 흔적이 없다).
+    """
+
+    def _colliding_sockets(self):
+        a = self.root / "s" / "x.sock"
+        b = self.root / "s_x.sock"
+        (self.root / "s").mkdir(exist_ok=True)
+        return str(a), str(b)
+
+    def test_colliding_socket_slugs_share_a_file_but_not_a_verdict(self):
+        """두 소켓이 **같은 캐시 파일**을 가리켜도 남의 레코드는 권위가 아니다."""
+        a, b = self._colliding_sockets()
+        pa, pb = self.cache_path(socket=a), self.cache_path(socket=b)
+        self.assertEqual(pa, pb, "선행 사실: 두 종단점의 슬러그가 충돌해야 이 검체가 뜻이 있다")
+        # A 좌석(worker)의 신선한 레코드를 심고 — B 좌석(reviewer)으로 도구를 부른다.
+        self.plant_cache("worker", socket=a)
+        self.fake_cys(role="reviewer-codex")
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7", CYS_SOCKET=b)
+        self.assertIn("surface-role", self.calls_log(),
+                      "남의 종단점 레코드를 fast-path 로 써서 데몬에 묻지 않았다(캐시 충돌)")
+        self.assertTrue(r.denied,
+                        "리뷰어가 캐시 충돌로 **구현 권한**을 얻었다: %r / %r" % (r.out, r.err))
+
+    def test_matching_socket_identity_is_still_a_fastpath(self):
+        """대조군 — 신원이 **맞으면** 종전대로 fast-path 다(비대상 좌석의 RPC 폭풍 방지)."""
+        a, _b = self._colliding_sockets()
+        self.plant_cache("worker", socket=a)
+        self.fake_cys(role="reviewer-codex")
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7", CYS_SOCKET=a)
+        self.assertEqual(self.calls_log(), "",
+                         "신원이 맞는 비대상 캐시가 fast-path 가 아니다: %r" % self.calls_log())
+        self.assertFalse(r.denied, "worker 좌석이 막혔다: %r" % r.out)
+
+    def test_legacy_two_field_record_is_not_authoritative(self):
+        """구형 `<ts> <역할>` 2필드 레코드(신원 없음)는 권위가 아니다 — 데몬에 묻는다."""
+        import time
+        self.fake_cys(role="reviewer-codex")
+        p = self.cache_path()
+        p.parent.mkdir(mode=0o700, exist_ok=True)
+        p.write_text("%d worker\n" % int(time.time()), encoding="utf-8")
+        p.chmod(0o600)
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7")
+        self.assertIn("surface-role", self.calls_log(),
+                      "신원 없는 구형 레코드를 권위로 읽었다")
+        self.assertTrue(r.denied, "구형 레코드가 리뷰어의 구현 권한을 열었다: %r" % r.out)
+
+    def test_cache_lives_in_the_shared_0700_directory(self):
+        """캐시는 TMPDIR **루트**가 아니라 공용 0700 전용 디렉터리 안이다(이름 예측·심기 차단)."""
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        d = self.tmpdir / CACHE_DIR_NAME
+        self.assertTrue(d.is_dir(), "공용 캐시 디렉터리가 없다")
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700, "캐시 디렉터리가 0700 이 아니다")
+        stray = [p.name for p in self.tmpdir.iterdir()
+                 if p.is_file() and p.name.startswith("cys-capgate-role-")]
+        self.assertEqual(stray, [], "캐시가 TMPDIR 루트에 흩뿌려졌다: %s" % stray)
+        rec = self.cache_path().read_text(encoding="utf-8").split()
+        self.assertEqual(len(rec), 4, "레코드가 4필드(ts·역할·세대·신원)가 아니다: %r" % rec)
+        self.assertEqual(rec[1], "master")
+        self.assertEqual(rec[3], sock_id(self.env), "레코드에 종단점 신원이 원문으로 없다")
+
+    def test_named_pipe_endpoint_does_not_read_cwd_boot_epoch(self):
+        """★G7: 유닉스 `dirname '\\\\.\\pipe\\cys'` 는 `.` 이다 — cwd 의 `boot-epoch` 를 읽지 않는다.
+
+        읽으면 같은 좌석이 **cwd 마다** 캐시를 따로 갖고(도구 호출마다 RPC), 저장소에 그
+        이름의 파일이 있으면 전 pane 이 매 호출 2s 데드라인을 문다.
+        """
+        work = self.root / "repo"
+        work.mkdir(exist_ok=True)
+        (work / "boot-epoch").write_text("9999\n", encoding="utf-8")
+        pipe = "\\\\.\\pipe\\cys"
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=pipe, cwd=work)
+        p = self.cache_path(socket=pipe)
+        self.assertTrue(p.exists(), "명명 파이프 좌석이 캐시를 쓰지 않았다(백오프도 함께 꺼진다)")
+        rec = p.read_text(encoding="utf-8").split()
+        self.assertEqual(rec[2], "-",
+                         "cwd 의 boot-epoch 가 세대 성분으로 실렸다: %r" % rec)
+
+    def test_hostile_boot_epoch_folds_to_unknown(self):
+        """★G7: 거대한 한 줄·FIFO `boot-epoch` 에서 유계로 접힌다(훅이 매달리지 않는다)."""
+        import time
+        sockdir = self.root / "sock"
+        sockdir.mkdir(exist_ok=True)
+        sock = str(sockdir / "cys.sock")
+        self.fake_cys(role="master")
+        # ⓐ 거대한 한 줄 — 4KB 유계 판독 + 토큰 문법에서 접힌다(파일명 ENAMETOOLONG 방지).
+        (sockdir / "boot-epoch").write_text("A" * 200000, encoding="utf-8")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=sock)
+        rec = self.cache_path(socket=sock).read_text(encoding="utf-8").split()
+        self.assertEqual(rec[2], "-", "거대한 boot-epoch 가 그대로 세대 성분이 됐다: %r" % rec[2][:40])
+        # ⓑ FIFO — 열기에서 매달리면 **모든 도구 호출**이 멈춘다.
+        (sockdir / "boot-epoch").unlink()
+        try:
+            os.mkfifo(str(sockdir / "boot-epoch"))
+        except (AttributeError, OSError):
+            self.skipTest("mkfifo 불가 — FIFO 축을 잴 수 없다")
+        t0 = time.time()
+        r = self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=sock)
+        self.assertEqual(r.rc, 0)
+        self.assertLess(time.time() - t0, 20,
+                        "FIFO `boot-epoch` 에서 PreToolUse 훅이 매달렸다")
+
+    def test_cache_dirname_matches_both_sibling_layers(self):
+        """★G14: 역할 캐시 디렉터리 이름이 세 층에서 같은가(보호가 조용히 늙지 않게)."""
+        sys.path.insert(0, str(BIN))
+        try:
+            import javis_role
+        finally:
+            sys.path.pop(0)
+        hook = HOOK.read_text(encoding="utf-8")
+        lib = LIB.read_text(encoding="utf-8")
+        m = re.search(r'^ROLE_CACHE_DIRNAME = "([^"]+)"', hook, re.M)
+        self.assertTrue(m, "훅에 ROLE_CACHE_DIRNAME 상수가 없다")
+        ml = re.search(r'^CYS_ROLE_CACHE_DIRNAME="([^"]+)"', lib, re.M)
+        self.assertTrue(ml, "_lib.sh 에 CYS_ROLE_CACHE_DIRNAME 상수가 없다")
+        self.assertEqual(m.group(1), javis_role.CACHE_DIR_NAME,
+                         "게이트의 자기상태 보호가 파이썬 짝과 다른 이름을 본다")
+        self.assertEqual(ml.group(1), javis_role.CACHE_DIR_NAME,
+                         "공용 셸층이 파이썬 짝과 다른 이름을 쓴다")
+        self.assertEqual(m.group(1), CACHE_DIR_NAME, "이 검체의 미러가 낡았다")
+        # capgate 캐시 basename 은 게이트 자기상태 접두 안에 있어야 이중으로 보호된다.
+        mp = re.search(r'^CAPGATE_CACHE_PREFIX="([^"]+)"', hook, re.M)
+        mg = re.search(r'^GATE_STATE_FILE_PREFIX = "([^"]+)"', hook, re.M)
+        self.assertTrue(mp and mg)
+        self.assertTrue(mp.group(1).startswith(mg.group(1)),
+                        "capgate 캐시 이름이 게이트 자기상태 접두 밖이다: %r ⊄ %r"
+                        % (mp.group(1), mg.group(1)))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
