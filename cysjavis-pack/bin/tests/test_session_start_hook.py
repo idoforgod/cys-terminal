@@ -100,11 +100,12 @@ def setup(tmp, claim_mode, reclaim_mode="none"):
     }[reclaim_mode]
     with open(os.path.join(bindir, "cys"), "w", encoding="utf-8", newline="\n") as f:
         f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
+                "echo \"$1 ${CYS_NO_AUTOSTART:-unset}\" >> \"%s/autostart.log\"\n"
                 "case \"$1\" in\n"
                 "  claim-role) %s;;\n"
                 "  surface-role) %s;;\n"
                 "  reclaim-role) %s;;\n"
-                "esac\nexit 0\n" % (tmp, body, sr_body, rc_body))
+                "esac\nexit 0\n" % (tmp, tmp, body, sr_body, rc_body))
     os.chmod(os.path.join(bindir, "cys"), 0o755)
     env = dict(os.environ)
     env.update({"CYS_PACK_DIR": pack, "CYS_SURFACE_ID": "3",
@@ -352,7 +353,7 @@ check("11u-b cso 지침 주입 유지", "DIRECTIVE-BODY-CSO" in out)
 shutil.rmtree(tmp)
 
 # ── 13. ★강등: `env_role=other_live` — 그 역할을 지금 다른 산 좌석이 쥐었다 ──
-tmp = tempfile.mkdtemp(prefix="hook-t13-")
+tmp = tempfile.mkdtemp(prefix="hook-t18-")
 env = setup(tmp, "ok", reclaim_mode="taken")
 code, out, _ = run_hook(env, role="reviewer-codex")
 check("13a 강등: 역할 지침 미주입", "DIRECTIVE-BODY-REVIEWER" not in out)
@@ -437,6 +438,36 @@ check("12b-4 bare `cys surface-role`·`cys reclaim-role` 직접 호출 0",
               for l in _code.splitlines()))
 check("12c 훅에 ps·flock 없음(Windows 안전)",
       " ps " not in _code and "flock" not in _code)
+
+# ── 18. ★0.14.31 성찰 G5 — 역할을 묻는 행위가 데몬을 낳지 않는다 ──
+#   `cys` 는 소켓이 없으면 autostart 경로에서 형제 `cysd` 를 detached 로 **스폰한 뒤** 폴링한다.
+#   밖의 `cys_timeout_run` 데드라인이 죽여도 스폰은 이미 일어났다 — 즉 운영자가 의도적으로 내린
+#   데몬이 세션 시작 훅 하나로 되살아난다(봉인표 ① 방향). 두 왕복 모두 `CYS_NO_AUTOSTART=1`
+#   안에서 돌아야 하고, 그 사실은 **스텁이 받은 env** 로만 정직하게 잴 수 있다.
+tmp = tempfile.mkdtemp(prefix="hook-t13-")
+env = setup(tmp, "ok", reclaim_mode="found")
+run_hook(env)
+_al = os.path.join(tmp, "autostart.log")
+_seen = {}
+if os.path.exists(_al):
+    for line in open(_al, encoding="utf-8").read().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            _seen.setdefault(parts[0], set()).add(parts[1])
+check("18a surface-role 왕복이 실제로 났다(계측 가능)", "surface-role" in _seen,
+      "autostart.log=%r" % _seen)
+check("18b surface-role 이 CYS_NO_AUTOSTART=1 안에서 돈다",
+      _seen.get("surface-role") == {"1"}, "받은 값: %r" % _seen.get("surface-role"))
+check("18c reclaim-role 왕복이 실제로 났다(계측 가능)", "reclaim-role" in _seen,
+      "autostart.log=%r" % _seen)
+check("18d reclaim-role 이 CYS_NO_AUTOSTART=1 안에서 돈다",
+      _seen.get("reclaim-role") == {"1"}, "받은 값: %r" % _seen.get("reclaim-role"))
+#   부수 계약: 봉인이 **자식에게만** 걸린다 — 훅 본체의 나머지 소비자(claim-role 재대조)까지
+#   조용히 바뀌면 그 자리의 계약이 이 커밋 밖에서 변한 것이다(범위를 못박는다).
+check("18e 봉인은 두 자리에만 걸렸다(claim-role 은 종전 그대로)",
+      _seen.get("claim-role", {"unset"}) == {"unset"},
+      "받은 값: %r" % _seen.get("claim-role"))
+shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

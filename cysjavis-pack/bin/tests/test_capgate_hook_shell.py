@@ -123,6 +123,7 @@ class _HookEnv(unittest.TestCase):
                   self.pack / "bin", self.fakebin):
             d.mkdir(parents=True, exist_ok=True)
         self.cyslog = self.root / "cys-calls.log"
+        self.cysenvlog = self.root / "cys-env.log"
         self.env = dict(os.environ)
         self.env.update({
             "HOME": str(self.home),
@@ -131,6 +132,7 @@ class _HookEnv(unittest.TestCase):
             "CYS_PACK_DIR": str(self.pack),
             "CYS_PY": sys.executable,
             "CYS_FAKE_LOG": str(self.cyslog),
+            "CYS_FAKE_ENV_LOG": str(self.cysenvlog),
             "PATH": os.pathsep.join([str(self.fakebin)] + self._clean_path()),
         })
         for k in ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SURFACE_ID", "CYS_SOCKET",
@@ -154,7 +156,10 @@ class _HookEnv(unittest.TestCase):
     def fake_cys(self, role="", rc=0):
         """PATH 위의 `cys` 스텁 — 호출을 기록하고 지정한 역할 1줄을 낸다."""
         p = self.fakebin / "cys"
-        body = ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$CYS_FAKE_LOG"']
+        body = ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$CYS_FAKE_LOG"',
+                # ★스텁이 **받은 env** 를 기록한다 — 소스 문자열 핀이 아니라 실제 자식 환경으로
+                #   `CYS_NO_AUTOSTART` 봉인을 잰다(0.14.31 성찰 G5).
+                'printf "%s\\n" "${CYS_NO_AUTOSTART:-unset}" >> "$CYS_FAKE_ENV_LOG"']
         if role:
             body.append('printf "%s\\n"' % role)
         body.append("exit %d" % rc)
@@ -193,6 +198,12 @@ class _HookEnv(unittest.TestCase):
 
     def calls_log(self):
         return self.cyslog.read_text(encoding="utf-8") if self.cyslog.exists() else ""
+
+    def calls_env(self):
+        """스텁 `cys` 가 실제로 받은 `CYS_NO_AUTOSTART` 값들."""
+        if not self.cysenvlog.exists():
+            return []
+        return self.cysenvlog.read_text(encoding="utf-8").split()
 
     # ── 실행 ────────────────────────────────────────────────────────────────
     def run_hook(self, tool="Bash", tool_input=None, session_id="s-1", cwd=None, **envkw):
@@ -1089,6 +1100,22 @@ class HookCacheIdentity(_HookEnv):
         self.assertEqual(r.rc, 0)
         self.assertLess(time.time() - t0, 20,
                         "FIFO `boot-epoch` 에서 PreToolUse 훅이 매달렸다")
+
+    def test_role_query_never_spawns_a_daemon(self):
+        """★G5: 역할을 묻는 행위가 **데몬을 낳지 않는다**(`CYS_NO_AUTOSTART=1`).
+
+        `cys` 는 소켓이 없으면 `connect()` 에서 형제 `cysd` 를 detached 로 **스폰한 뒤**
+        폴링한다 — 밖의 `cys_timeout_run 2` 가 2s 에 죽여도 스폰은 이미 일어났다. 이 훅은
+        matcher 없이 전 도구에 붙고 게이트 대상 좌석은 캐시 fast-path 를 쓰지 않으므로,
+        데몬이 내려간 상태에서 **좌석당 5초에 한 번** 기동 시도가 된다(운영자가 의도적으로
+        내린 데몬이 도구 호출 하나로 되살아난다 · 봉인표 ① 방향).
+        """
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        got = self.calls_env()
+        self.assertTrue(got, "데몬 조회가 나지 않아 봉인을 잴 수 없다(계측 불능)")
+        self.assertEqual(set(got), {"1"},
+                         "훅이 autostart 를 막지 않고 `cys` 를 불렀다: %r" % got)
 
     def test_cache_dirname_matches_both_sibling_layers(self):
         """★G14: 역할 캐시 디렉터리 이름이 세 층에서 같은가(보호가 조용히 늙지 않게)."""

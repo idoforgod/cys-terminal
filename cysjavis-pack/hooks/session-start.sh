@@ -78,7 +78,12 @@ BOOT_CMD="$(cys_shquote "${CYS_PY:-python3}") $(cys_shquote "$(cys_native_path "
 #   (cygpath 가드 · unix 는 무변환)로 접어서 넘긴다(`_lib.sh` 의 CYS_STATE_DIR 과 같은 이유).
 CYS_DEMOTE_ROLE=""
 if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/null 2>&1; then
-  cys_timeout_run 5 cys surface-role </dev/null >/dev/null 2>&1
+  # ★`CYS_NO_AUTOSTART=1`(0.14.31 성찰 G5 · 봉인된 형제 `_lib.sh:768` 과 같은 형태):
+  #   소켓이 없으면 `cys` 는 autostart 경로에서 형제 `cysd` 를 detached 로 스폰한 뒤 폴링한다 —
+  #   밖의 데드라인이 죽여도 **스폰은 이미 일어났다**. 운영자가 의도적으로 내린 데몬이
+  #   세션 시작 훅 하나로 되살아나서는 안 된다(역할을 묻는 행위가 데몬을 낳지 않는다).
+  ( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+    cys_timeout_run 5 cys surface-role </dev/null >/dev/null 2>&1 )
   CYS_SR_RC=$?
   # rc 2 = 판정 불가(데몬 미응답·응답 파손) · rc 124 = 데드라인 초과(hang). 둘 다 "모른다"이므로
   # 조회를 시도하지 않는다 — 두 번째 왕복으로 훅을 또 12초 붙잡지도 않는다(사람의 프롬프트 앞이다).
@@ -91,10 +96,11 @@ if [ -n "${CYS_SURFACE_ID:-}" ] && [ -n "${PWD:-}" ] && command -v cys >/dev/nul
     #   `$(cmd | tr -d '\r')` 라 파이프 마지막 단계(`tr`)의 rc 가 잡혀 reclaim 명령의 실패가
     #   구조적으로 보이지 않았다 — 소켓이 끊겨 에러 문면이 나와도 '정상 응답'과 같은 값이 됐다.
     #   판정은 리다이렉트 뒤 `rc=$?` 하나로만 뜨고, `\r` 제거는 그 뒤에 따로 한다.
-    CYS_RECLAIM_OUT="$(cys_timeout_run 12 cys reclaim-role --auto \
+    CYS_RECLAIM_OUT="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+      cys_timeout_run 12 cys reclaim-role --auto \
       --config "$(cys_native_path "${CLAUDE_CONFIG_DIR:-}")" \
       --cwd "$(cys_native_path "$PWD")" \
-      --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null)"
+      --env-role "${CYS_ROLE:-}" </dev/null 2>/dev/null )"
     CYS_RECLAIM_RC=$?
     CYS_RECLAIM_OUT="$(printf '%s\n' "$CYS_RECLAIM_OUT" | tr -d '\r')"
     CYS_RC_L1="$(printf '%s\n' "$CYS_RECLAIM_OUT" | sed -n 1p)"

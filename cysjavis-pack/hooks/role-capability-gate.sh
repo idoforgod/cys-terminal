@@ -209,7 +209,16 @@ capgate_resolve_role() {
     _cg_skip_query=1
   fi
   if [ "$_cg_skip_query" = "0" ] && command -v cys >/dev/null 2>&1; then
-    _cg_out="$(cys_timeout_run 2 cys surface-role 2>/dev/null)"; _cg_rc=$?
+    # ★`CYS_NO_AUTOSTART=1`(0.14.31 성찰 G5): 소켓이 없으면 `cys` 는 autostart 경로를 타고
+    #   `connect()` 가 형제 `cysd` 를 detached 로 **스폰한 뒤** 폴링한다 — 밖의
+    #   `cys_timeout_run 2` 가 2s 에 죽여도 스폰은 이미 일어났다. 이 훅은 matcher 없이 전 도구에
+    #   붙고 게이트 대상 좌석은 캐시 fast-path 를 쓰지 않으므로, 데몬이 내려간 상태에서
+    #   **좌석당 5초에 한 번 cysd 기동 시도**가 된다(운영자가 의도적으로 내린 데몬이 도구 호출
+    #   하나로 되살아난다 · 봉인표 ① 방향). 역할을 묻는 행위가 데몬을 낳아서는 안 된다.
+    #   (봉인된 형제 `_lib.sh:768` 과 **글자 그대로 같은 형태** — 함수 앞 `VAR=1 func` 은 셸마다
+    #   '호출 후에도 남는가/자식에게 export 되는가'가 갈려서 서브셸 안 명시 export 로 닫는다.)
+    _cg_out="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+                cys_timeout_run 2 cys surface-role 2>/dev/null )"; _cg_rc=$?
     _cg_role="$(cys_role_line "$_cg_out")"
     # 표현 불가한 역할(공백 포함·64자 초과·문법 밖)은 **판정 불가**다 — 잘라 쓰면 없는 역할을
     # 지어내는 것이고 레코드 문법도 깨진다(공용층 `cys_resolve_role` 과 같은 규칙).
