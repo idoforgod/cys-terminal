@@ -1440,6 +1440,78 @@ def gate_hook_contract_violations(hook_text: str | None = None,
     return out
 
 
+# ★D2(반성 라운드 2026-09-10): §7 (5-8) 종결 사유의 **계수**를 문자열이 아니라 **열거 항목**으로
+#   센다. 종전 핀은 "넷 중 먼저 온 것"·"넷째는 §9" 두 리터럴만 봤고, 그 문면 자체가 틀려 있었다 —
+#   본문 열거는 이미 ⓐⓑⓒ**ⓓ**(제품 무전진 종결) 넷인데 머리글이 넷째를 `stopped_stagnation` 으로
+#   지목해 **ⓓ 를 밀어냈다**. 조항을 더하거나 지웠을 때 계수 판정이 따라가야 한다.
+TERMINATION_HEAD = "**(5-8)** 종료:"
+CIRCLED_MARKS = "ⓐⓑⓒⓓⓔⓕⓖⓗ"
+COUNT_WORDS = {1: "하나", 2: "둘", 3: "셋", 4: "넷", 5: "다섯", 6: "여섯", 7: "일곱", 8: "여덟"}
+# `normalize()` 는 강조 표식(`**`)을 걷어 내므로 정규식에도 넣지 않는다(한쪽만 접으면 영원히 불일치).
+TERMINATION_HEAD_RE = re.compile(
+    r"다음\s*(?P<word>[가-힣]+)\((?P<first>[%s])~(?P<last>[%s])\)\s*중 먼저 온 것"
+    % (CIRCLED_MARKS, CIRCLED_MARKS))
+_FIRST_CAUSE_RE = re.compile(r"(?m)^\s*%s" % CIRCLED_MARKS[0])
+
+
+def termination_section(raw: str) -> str:
+    """§7 (5-8) 항목의 본문 — 주석을 걷고 다음 번호 항목(`9. `) 직전까지."""
+    body = strip_html_comments(raw)
+    start = body.find(TERMINATION_HEAD)
+    if start < 0:
+        raise AssertionError("§7 (5-8) 머리글(%r)이 없다" % TERMINATION_HEAD)
+    end = body.find("\n9. ", start)
+    return body[start:end if end >= 0 else len(body)]
+
+
+def termination_parts(raw: str) -> tuple[str, str]:
+    """(머리글, 열거 본문) — 열거는 줄머리 `ⓐ` 에서 시작한다(머리글의 범위 표기와 섞지 않는다)."""
+    section = termination_section(raw)
+    match = _FIRST_CAUSE_RE.search(section)
+    if not match:
+        raise AssertionError("(5-8) 에 줄머리 `%s` 열거가 없다" % CIRCLED_MARKS[0])
+    return section[:match.start()], section[match.start():]
+
+
+def termination_causes(raw: str) -> list[str]:
+    """(5-8) 이 **열거한** 종결 사유 기호 — 등장 순서대로(중복 제거 · 머리글 제외)."""
+    out = []
+    for mark in termination_parts(raw)[1]:
+        if mark in CIRCLED_MARKS and mark not in out:
+            out.append(mark)
+    return out
+
+
+def termination_count_violations(raw: str) -> list[str]:
+    """머리글의 계수·범위가 **열거와 일치**하고, §9 도구 판정이 그 열거에 더해지는가(빈 목록이 합격)."""
+    head, _body = termination_parts(raw)
+    section = termination_section(raw)
+    causes = termination_causes(raw)
+    out = []
+    expected = list(CIRCLED_MARKS[:len(causes)])
+    if causes != expected:
+        out.append("열거 기호가 ⓐ부터 연속이 아니다: %s" % "".join(causes))
+    match = TERMINATION_HEAD_RE.search(normalize(head))
+    if not match:
+        return out + ["머리글이 `다음 **<계수>(ⓐ~<마지막>) 중 먼저 온 것**` 형태가 아니다 — "
+                      "계수를 열거와 대조할 수 없다(판정 불능은 통과가 아니다)"]
+    if match.group("word") != COUNT_WORDS.get(len(causes)):
+        out.append("머리글 계수(%s)가 열거 %d개와 다르다" % (match.group("word"), len(causes)))
+    if match.group("first") != (causes[0] if causes else ""):
+        out.append("머리글 범위의 시작(%s)이 첫 열거(%s)와 다르다"
+                   % (match.group("first"), causes[0] if causes else "없음"))
+    if match.group("last") != (causes[-1] if causes else ""):
+        out.append("머리글 범위의 끝(%s)이 마지막 열거(%s)와 다르다"
+                   % (match.group("last"), causes[-1] if causes else "없음"))
+    folded = normalize(head)
+    if "stopped_stagnation" not in folded:
+        out.append("머리글이 §9 의 도구 판정(`stopped_stagnation`)을 언급하지 않는다")
+    elif "더해진다" not in folded:
+        out.append("§9 의 도구 판정이 열거에 **더해진다**는 관계가 없다 — "
+                   "계수 안에 넣으면 마지막 열거 항목이 밀려난다(ⓓ 유실)")
+    return out
+
+
 def active_check_bullet(body: str) -> str:
     """'- **능동 점검(' bullet 본문(공용 추출기 사용)."""
     return bullet_body(body, "- **능동 점검(")
@@ -1577,12 +1649,45 @@ class CsoDirectiveRevision(unittest.TestCase):
                                 "%s 동기화 문장 횟수: %d" % (name, raw.count(SYNC)))
                 self.assertTrue(sync_occurs_once(section_body(raw, heading)))
 
-    def test_master_termination_count_matches_fourth_cause(self):
-        """MASTER §7 (5-8) 의 종결 사유 계수는 §9 의 도구 판정을 넷째로 센다."""
+    def test_master_termination_count_matches_enumerated_causes(self):
+        """★D2: §7 (5-8) 의 계수는 **열거 항목**과 일치해야 하고, §9 도구 판정은 거기에 더해진다.
+
+        종전 핀은 계수 문자열("넷 중 먼저 온 것"·"넷째는 §9")만 봤다 — 그 문면이 틀렸는데도(본문
+        열거는 이미 ⓐ~ⓓ 넷이라 머리글이 ⓓ 를 밀어냈다) 핀이 그 오류를 3레인에 고정했다."""
+        for name in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            with self.subTest(directive=name):
+                raw = self.raw[name]
+                self.assertEqual(termination_causes(raw), ["ⓐ", "ⓑ", "ⓒ", "ⓓ"],
+                                 "종결 사유 열거가 ⓐ~ⓓ 넷이 아니다")
+                self.assertEqual(termination_count_violations(raw), [])
+                self.assertNotIn("넷째는 §9", raw,
+                                 "§9 도구 판정을 열거의 넷째로 세면 ⓓ(제품 무전진 종결)가 밀려난다")
+
+    def test_termination_count_judge_follows_clause_edits(self):
+        """★D2 음성 대조: 조항을 더하거나 지우면 계수 판정이 **따라가야** 한다(리터럴 핀은 못 한다)."""
         master = self.raw["MASTER_DIRECTIVE.md"]
-        self.assertNotIn("셋 중 먼저 온 것", master)
-        self.assertIn("넷 중 먼저 온 것", master)
-        self.assertIn("넷째는 §9", master)
+        # ⓔ 를 하나 더한다 → 머리글 계수(넷)가 열거 다섯과 어긋나야 한다.
+        #   앵커는 다음 번호 항목의 줄머리 — 열거의 끝이자 (5-8) 본문의 경계다.
+        tail = "\n9. **(5-9)**"
+        self.assertIn(tail, master, "(5-9) 경계 앵커 부재(검체가 낡았다)")
+        added = master.replace(tail, "\n   ⓔ **가상의 다섯째 종결 사유**." + tail, 1)
+        self.assertNotEqual(added, master, "변조가 적용되지 않았다")
+        self.assertEqual(termination_causes(added), ["ⓐ", "ⓑ", "ⓒ", "ⓓ", "ⓔ"])
+        self.assertTrue(any("계수" in hit for hit in termination_count_violations(added)),
+                        "조항을 더했는데 계수 판정이 따라가지 않았다")
+        # ⓓ 를 지운다 → 열거 셋과 머리글(넷)이 어긋나야 한다.
+        dropped = master.replace("   ⓓ ★**제품 무전진 종결**", "   ★**제품 무전진 종결**", 1)
+        self.assertNotEqual(dropped, master)
+        self.assertEqual(termination_causes(dropped), ["ⓐ", "ⓑ", "ⓒ"])
+        self.assertTrue(termination_count_violations(dropped),
+                        "조항을 지웠는데 계수 판정이 따라가지 않았다")
+        # '더해진다' 관계를 '넷째' 로 되돌리면(개정 전 상태) 붉어져야 한다.
+        reverted = master.replace(
+            "여기에 §9 의 정체 종결 도구\n   판정 `stopped_stagnation` 이 **더해진다**",
+            "넷째는 §9 의 정체 종결 도구\n   판정 `stopped_stagnation` 이다", 1)
+        self.assertNotEqual(reverted, master)
+        self.assertTrue(termination_count_violations(reverted),
+                        "'더해진다' 를 지운 개정 전 문면이 통과했다")
 
     def test_gate_enforcement_claims_are_conditional_on_registration(self):
         """★R5(리뷰 major): 지침이 존재하지 않을 수 있는 집행 장치를 무조건 단언하면 안 된다 — 등록 조건과
