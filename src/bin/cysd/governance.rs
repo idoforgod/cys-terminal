@@ -4374,12 +4374,16 @@ fn queue_human_quiet_secs() -> u64 {
         .unwrap_or(30)
 }
 
-// ─── ★G1(W2-D): 단계형 quiet(기아·결함 1 봉인) 노브 3종 — 기본값 잠금 배포 ───────────
-// 활성화 절차(2단 롤아웃 · 브리프 확정): 1단(관측 배치 = **현재 기본값**) MAX_WAIT=0·
-// STARVE=0 — 배달 동작·주입 바이트 완전 현행 동일, queue.delivered 의 wait_secs 분포만
-// 관측된다. 2단(활성) 실측 분포 확인 후 데몬 env 에 CYS_QUEUE_MAX_WAIT_SECS=120 ·
-// CYS_QUEUE_STARVE_ALERT_SECS=600 권장값을 설정한다. 각 노브는 즉시 현행 복원 스위치를
-// 겸한다(0 재설정 = 구동작 — 무회귀 절대 불변).
+// ─── ★G1(W2-D): 단계형 quiet(기아·결함 1 봉인) 노브 3종 — **2단(활성) 배포 중** ───────
+// ★(0.14.31 · 성찰 Q14) 이 블록은 종전에 "1단(관측 배치 = 현재 기본값) MAX_WAIT=0 ·
+// STARVE=0" 라고 적혀 있었다 — **실제 기본값과 정반대**다. 두 노브의 기본값은 이미
+// `queue_max_wait_secs()=120` · `queue_starve_alert_secs()=600`(오너 위임 승인 2026-09-06 ·
+// 아래 각 함수 doc 참조)이고, 그 사실을 모르는 운영자는 "지금은 관측 배치라 배달 동작이
+// 0.14.30 과 동일하다" 고 읽어 재측정 표를 오독한다(주석이 코드보다 오래 산다).
+// 현재 배치(사실): 1단(관측 · MAX_WAIT=0 · STARVE=0)은 **끝났다**. 2단이 기본값이며
+// 각 노브는 여전히 즉시 현행 복원 스위치를 겸한다 — 데몬 env 에 `CYS_QUEUE_MAX_WAIT_SECS=0` ·
+// `CYS_QUEUE_STARVE_ALERT_SECS=0` 을 설정하면 그 자리에서 1단(구동작)으로 돌아간다.
+// 릴리스 노트의 같은 문장(directives-ci-release D12)도 이 사실과 대조해야 한다.
 
 /// 단계형 배달의 머리 최대 대기(초) — 머리 항목의 (uptime 클램프) 대기가 이 값 이상이면
 /// quiet 임계를 `queue_overdue_quiet_secs()`(기본 1s)로 낮춘 '제한 배달(overdue)' 자격을
@@ -4493,8 +4497,11 @@ fn queue_overdue_quiet_secs() -> u64 {
 }
 
 /// 기아 경보 임계(초) — 머리 대기(uptime 클램프)가 이 값 이상인 채 배달이 막혀 있으면
-/// `queue.starved` 발행(전용 쿨다운 5분 · depth_high 와 별도 축). **기본 0 = 비활성**
-/// (활성 권장값 600). 경보는 발행뿐 — 자동 조치 없음(hint 문구 계약 = state.rs).
+/// `queue.starved` 발행(전용 쿨다운 5분 · depth_high 와 별도 축). **기본 600 = 활성**
+/// (오너 위임 승인 2026-09-06 · 즉시 복원 스위치는 env `CYS_QUEUE_STARVE_ALERT_SECS=0`).
+/// ★(0.14.31 · 성찰 Q14) 이 첫 줄은 종전에 "기본 0 = 비활성(활성 권장값 600)" 이었다 —
+/// 아래 상수와 정반대라 운영자가 "우리 함대는 기아 경보가 꺼져 있다" 고 읽었다.
+/// 경보는 발행뿐 — 자동 조치 없음(hint 문구 계약 = state.rs).
 fn queue_starve_alert_secs() -> u64 {
     std::env::var("CYS_QUEUE_STARVE_ALERT_SECS")
         .ok()
@@ -16892,5 +16899,56 @@ mod todo_decl_tests {
         assert_eq!(f.owner("PLAIN_TODO.md"), None, "미선언은 주인을 모른다");
         // ADR-4 C-3 센티널 `"?"`는 저장하지 않는다 — 소비자가 `"?"` 노드를 그리면 안 된다.
         assert_eq!(f.owner("LEGACY_TODO.md"), None, "센티널이 owner로 새어나갔다");
+    }
+}
+
+/// ★(0.14.31 · 성찰 반영 라운드 · daemon-queue) 이 라운드가 세운 계약의 **소스 핀·순수 판정자
+/// 검체**. 기존 `mod tests` 와 분리한 이유는 하나뿐이다 — 이 라운드는 여러 영역이 같은 파일을
+/// 병렬로 고치므로, 새 검체를 파일 **끝**에 모으면 병합 충돌이 이 블록 하나로 국소화된다.
+#[cfg(test)]
+mod reflect_queue_tests {
+    /// ★(0.14.31 · 성찰 Q14) **노브 롤아웃 문면이 실제 기본값과 같은가.**
+    ///
+    /// 종전 주석 블록은 "1단(관측 배치 = 현재 기본값) MAX_WAIT=0 · STARVE=0 — 배달 동작
+    /// 완전 현행 동일"(강조 표기 생략 — 아래 조립 규칙 참조) 이라고 단언했는데 실제 기본값은
+    /// 120/600(2단 활성)이었다. 운영자는 그
+    /// 문면을 읽고 "이 함대는 아직 관측 배치" 로 판단하고, 재측정 보고는 그 전제 위에서 쓰인다.
+    /// 문면은 검증되지 않으면 반드시 코드보다 오래 산다 — 그래서 값을 바꾸는 사람이 문면도
+    /// 함께 고치도록 여기서 강제한다.
+    #[test]
+    fn q14_rollout_notes_match_the_real_defaults() {
+        let src = include_str!("governance.rs");
+        // ① 상수(env 미설정일 때의 기본값) — env 를 세운 러너에서는 그 축을 건너뛴다.
+        if std::env::var("CYS_QUEUE_MAX_WAIT_SECS").is_err() {
+            assert_eq!(
+                super::queue_max_wait_secs(),
+                120,
+                "max-wait 기본값이 바뀌었다 — 롤아웃 주석과 릴리스 노트(D12)도 같이 고쳐야 한다"
+            );
+        }
+        if std::env::var("CYS_QUEUE_STARVE_ALERT_SECS").is_err() {
+            assert_eq!(
+                super::queue_starve_alert_secs(),
+                600,
+                "기아 경보 기본값이 바뀌었다 — doc 첫 줄과 릴리스 노트(D12)도 같이 고쳐야 한다"
+            );
+        }
+        // ② 문면 — 종전의 거짓 문장이 되살아나지 않는다. 금지 문자열은 **조각으로 조립**한다:
+        //    이 파일 자신이 검사 대상(`include_str!`)이라, 리터럴로 적으면 이 검체의 소스가
+        //    곧 위반 사례가 되어 영원히 빨갛다(자기 참조 함정).
+        let banned_stage1 = format!("1단(관측 배치 = {}현재 기본값{})", "**", "**");
+        assert!(
+            !src.contains(&banned_stage1),
+            "롤아웃 주석이 다시 '1단 = 현재 기본값' 이라고 말한다(실제 기본값은 120/600)"
+        );
+        let banned_starve = format!("{}기본 0 = 비활성{}", "**", "**");
+        assert!(
+            !src.contains(&banned_starve),
+            "queue_starve_alert_secs doc 첫 줄이 다시 '기본 0 = 비활성' 이라고 말한다"
+        );
+        assert!(
+            src.contains("**2단(활성) 배포 중**") && src.contains("**기본 600 = 활성**"),
+            "실제 배치(2단 활성)를 말하는 문면이 사라졌다 — 운영자가 배달 정책을 오독한다"
+        );
     }
 }
