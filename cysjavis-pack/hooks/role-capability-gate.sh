@@ -2140,7 +2140,24 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
         if any(t != "master" for t in tos):
             return False, ("`cys send` 의 수신자는 master 뿐이다(경계까지 대조 — "
                            "`--to master-shadow` 는 master 가 아니다): %s" % ", ".join(tos)), False
-        return True, "cys send --to master", True
+        # ★`--queued` 는 허용·예산 면제의 **선행 조건**이다(0.14.31 성찰 G2 · CSO_DIRECTIVE 머리글).
+        #   비큐 `cys send` 는 `surface.send_text` 만 부르고 **CR 을 보내지 않는다**
+        #   (src/bin/cys.rs Command::Send — 타이핑 가드가 걸렸을 때만 큐로 1회 전환된다). 그래서
+        #   ⓐ master 가 미제출 초안을 쥔 상태에서는 보고가 **그 초안에 합체**되고
+        #   ⓑ 조용한 pane 에서는 본문이 미제출 초안으로 남는데, 제출에 필요한
+        #     `cys send-key … Return` 은 CSO 허용 접두 밖이다 — 즉 CSO 는 지침을 정확히 따랐는데
+        #     보고가 도달할 방법이 없다("CSO 는 보고했다고 믿고 오너는 침묵을 본다").
+        #   `--queued` 배달은 출력이 조용해진 뒤 CR 을 **포함해** 주입하므로 두 실패가 함께 닫힌다.
+        #   ★옵션 종료 `--` **앞의 실제 토큰**만 인정한다(`args` 가 이미 그 경계다) — 본문 문자열
+        #     안의 `"--queued"` 는 옵션이 아니고, `--queued=…` 는 clap bool 플래그가 받지 않는다.
+        if "--queued" not in args:
+            return False, ("`cys send` 는 `--queued` 여야 한다(CSO_DIRECTIVE 머리글) — 비큐 send 는 "
+                           "CR 을 보내지 않아 조용한 pane 에서는 보고가 **미제출 초안**으로 남고, "
+                           "master 가 초안을 쥐고 있으면 그 초안에 합체된다. 제출에 필요한 "
+                           "`send-key Return` 은 CSO 접두 밖이므로 비큐 보고는 도달 경로가 없다. "
+                           "`cys send --queued --to master \"<보고>\"` 로 다시 내라(옵션 종료 "
+                           "`--` 앞의 실제 옵션이어야 한다)"), False
+        return True, "cys send --queued --to master", True
     if verb == "cycle-agent":
         return True, "cys cycle-agent(사이클 필수 도구)", True
     if verb in CSO_CYS_VERBS:
@@ -2999,7 +3016,6 @@ def self_test():
                              "--save-file '/w/cwd/_round/SESSION_STATE.md' "
                              "--save-file '/w/pack/round/MASTER_TODO.md'"}),
         ("Bash", {"command": "cys cycle-agent --role master --verifier cso"}),
-        ("Bash", {"command": 'cys send --to master "예산 소진 보고"'}),
         ("Bash", {"command": 'cys send --queued --to master "예산 소진 보고"'}),
         ("Bash", {"command": "cys status --json"}),
         ("Bash", {"command": "cys queue list"}),
@@ -3052,7 +3068,7 @@ def self_test_contracts(fails):
     want(False, "Bash", {"command": 'cys send --queued --to master "1줄\n2줄"'},
          "인용 안 개행은 경계가 아니다")
     # 명령 치환·백그라운드·스트림.
-    want(True, "Bash", {"command": 'cys send --to master "결과: $(cys events)"'}, "명령 치환")
+    want(True, "Bash", {"command": 'cys send --queued --to master "결과: $(cys events)"'}, "명령 치환")
     want(True, "Bash", {"command": "cat `cys status`"}, "백틱 치환")
     want(True, "Bash", {"command": "cat <(cys status)"}, "프로세스 치환")
     want(True, "Bash", {"command": "cat < /w/x"}, "입력 리다이렉트")
@@ -3069,16 +3085,36 @@ def self_test_contracts(fails):
          "sqlite3 -readonly 없음")
     want(True, "Bash", {"command": "sed -n '1,80p' /w/x"}, "sed 는 CSO 접두 밖(좁히는 방향)")
     want(True, "Bash", {"command": "rg --pre /w/h pat /w/f"}, "rg --pre 외부 실행")
+    # ★`--queued` 축(0.14.31 성찰 G2) — 허용·예산 면제의 **선행 조건**이다.
+    #   비큐 send 는 CR 을 보내지 않아 ⓐ master 미제출 초안에 합체되고 ⓑ 조용한 pane 에서는
+    #   본문이 초안으로 남는데 제출용 `send-key Return` 은 CSO 접두 밖이다(도달 경로 0).
+    want(True, "Bash", {"command": 'cys send --to master "[CSO] 보고"'}, "큐 옵션 없음")
+    want(True, "Bash", {"command": 'cys send --to master "--queued 라고 적힌 본문"'},
+         "본문 문자열은 옵션이 아니다")
+    want(True, "Bash", {"command": 'cys send --to master -- --queued'},
+         "옵션 종료 `--` 뒤는 본문이다")
+    want(True, "Bash", {"command": 'cys send --to master "x" --queued=true'},
+         "clap bool 플래그가 받지 않는 표기는 큐가 아니다")
+    want(False, "Bash", {"command": 'cys send --queued --to master "[CSO] 보고"'},
+         "실제 큐 옵션")
+    want(False, "Bash", {"command": 'cys send --to master --queued "[CSO] 보고"'},
+         "실제 큐 옵션(수신자 뒤)")
+    want(True, "Bash", {"command": 'cys send --to master "[CSO] 예산 소진 보고"'},
+         "예산 소진 뒤에도 비큐 send 는 면제가 아니다(도달 경로가 없는 채널은 출구가 아니다)",
+         c=ctx(tool_calls=BUDGET_DENY + 5))
+    want(False, "Bash", {"command": 'cys send --queued --to master "[CSO] 예산 소진 보고"'},
+         "예산 소진 뒤 실제 큐 옵션은 면제(봉인표 ②)", c=ctx(tool_calls=BUDGET_DENY + 5))
     # `cys` 인자 계약.
     want(True, "Bash", {"command": "cys cycle-agent --role master --force-no-verify"},
          "--force-no-verify")
     want(True, "Bash", {"command": "cys cycle-agent --role master --clear-cmd 'x'"}, "--clear-cmd")
-    want(True, "Bash", {"command": 'cys send --to master-shadow "x"'}, "수신자 경계")
-    want(True, "Bash", {"command": 'cys send --to master --to worker "x"'}, "수신자 둘")
-    want(False, "Bash", {"command": 'cys send --to=master "x"'}, "--to=master 형태")
-    want(True, "Bash", {"command": 'cys send --to master --clear-first "x"'}, "--clear-first")
+    want(True, "Bash", {"command": 'cys send --queued --to master-shadow "x"'}, "수신자 경계")
+    want(True, "Bash", {"command": 'cys send --queued --to master --to worker "x"'}, "수신자 둘")
+    want(False, "Bash", {"command": 'cys send --queued --to=master "x"'}, "--to=master 형태")
+    want(True, "Bash", {"command": 'cys send --queued --to master --clear-first "x"'}, "--clear-first")
     want(True, "Bash", {"command": 'cys send --surface 7 "x"'}, "--surface 주소 우회")
-    want(False, "Bash", {"command": 'cys send --to master "본문에 --to master-shadow 문자열"'},
+    want(False, "Bash",
+         {"command": 'cys send --queued --to master "본문에 --to master-shadow 문자열"'},
          "본문 문자열은 수신자가 아니다")
     want(True, "Bash", {"command": "cys events --category queue"}, "events 전 플래그 deny")
     want(True, "Bash", {"command": "cys events --reconnect"}, "events --reconnect deny")
@@ -3208,7 +3244,7 @@ def self_test_r1(fails):
     want(True, "Bash", {"command": "cys status # x\ncys kill 12"}, "주석 뒤 무승인 kill")
     want(False, "Bash", {"command": "cys status   # 점검"}, "행 끝 주석 자체는 무해")
     # 단어 **안**의 `#` 는 주석이 아니다(bash 규칙) — 잘라내면 수신자 경계 검사가 무력해진다.
-    want(True, "Bash", {"command": 'cys send --to master#shadow "x"'},
+    want(True, "Bash", {"command": 'cys send --queued --to master#shadow "x"'},
          "단어 안 `#` 를 주석으로 잘라 수신자 경계를 지우지 않는다")
 
     # ①-2 주석 제거의 **동작 자체**를 잰다(판정 결과만으로는 이 검사가 지워져도 티가 안 난다)
@@ -3381,7 +3417,7 @@ def self_test_r1(fails):
         # 줄 이어붙이기(`\`+개행)는 셸이 둘 다 지운다 — 조각으로 보면 금지 플래그가 사라진다.
         ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --f\\\nix"},
          "줄 이어붙이기 뒤 --fix"),
-        ("deny", "Bash", {"command": "cys send --to master --clear-\\\nfirst x"},
+        ("deny", "Bash", {"command": "cys send --queued --to master --clear-\\\nfirst x"},
          "줄 이어붙이기 뒤 --clear-first"),
         ("allow", "Bash", {"command": "cys queue cl\\\near 77"},
          "줄 이어붙이기 뒤 queue clear 는 정상 청소"),
@@ -3389,7 +3425,7 @@ def self_test_r1(fails):
         ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --{fix,seed-trust}"},
          "중괄호 확장"),
         # 변수 확장은 값을 모르면 효과를 모른다(`${IFS}` 는 단어를 쪼갠다).
-        ("deny", "Bash", {"command": "cys send --to master ${IFS}--surface${IFS}7 x"},
+        ("deny", "Bash", {"command": "cys send --queued --to master ${IFS}--surface${IFS}7 x"},
          "${IFS} 단어 분리로 만든 --surface"),
         ("deny", "Bash", {"command": "cys status > /w/home/.cys/state/${IFS}mission.json"},
          "${IFS} 로 보호 파일명 검사 우회"),
@@ -3402,9 +3438,9 @@ def self_test_r1(fails):
         ("deny", "Bash", {"command": "cys status > /w/t\u200bmp/a"}, "영폭 문자 tmp 동형"),
         # `--` 뒤는 본문이다(옵션으로 읽으면 오탐과 우회가 함께 생긴다).
         ("deny", "Bash", {"command": "cys send -- '--to=master'"}, "옵션 종료 뒤 본문을 수신자로 오인"),
-        ("allow", "Bash", {"command": "cys send --to master -- '--to=worker'"},
+        ("allow", "Bash", {"command": "cys send --queued --to master -- '--to=worker'"},
          "옵션 종료 뒤 본문은 수신자가 아니다"),
-        ("allow", "Bash", {"command": "cys send --to master -- '--clear-first'"},
+        ("allow", "Bash", {"command": "cys send --queued --to master -- '--clear-first'"},
          "옵션 종료 뒤 본문의 금지 철자"),
         # 리다이렉트 연산자 종류·경로 정규화.
         ("deny", "Bash", {"command": "cys status 2>&1 > /w/repo/a"},
@@ -3438,7 +3474,8 @@ def self_test_r1(fails):
          "승인 대상은 복합 실행 금지"),
         ("deny", "Bash", {"command": "cys send --to 'master ' x"}, "후행 공백 주소"),
         ("deny", "Bash", {"command": "cys send --to 'master\nworker' x"}, "인용 안 개행 주소"),
-        ("allow", "Bash", {"command": "cys send --to master '상태\n# 본문\ncys kill 77'"},
+        ("allow", "Bash",
+         {"command": "cys send --queued --to master '상태\n# 본문\ncys kill 77'"},
          "인용 안 개행·주석은 본문이다(경계가 아니다)"),
         # python 옵션.
         ("deny", "Bash", {"command": "python3 -IBcpass /w/pack/bin/javis_orchestra.py check"},
@@ -3502,7 +3539,7 @@ def self_test_r2(fails):
     want(True, "Bash", {"command": "cys cycle-agent --{s..s}urface 7"}, "중괄호 범위 --surface")
     want(True, "Bash", {"command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/'
                                    'javis_preflight.py" --{f..f}ix'}, "중괄호 범위 --fix")
-    want(False, "Bash", {"command": "cys send --to master 'a{b..c}d 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master 'a{b..c}d 는 본문이다'"},
          "인용 안 중괄호는 확장이 아니다")
 
     # ② 글롭(codex blocking — `deliver[y]-base.jsonl` 이 실존 원장으로 확장됐다)
@@ -3525,7 +3562,8 @@ def self_test_r2(fails):
          "작은따옴표 안 리터럴 `~` 경로")
     want(True, "Bash", {"command": "python3 \\~/.cys/pack/bin/javis_orchestra.py check"},
          "백슬래시 이스케이프된 `~`")
-    want(False, "Bash", {"command": "cys send --to master '설정에서 $HOME 을 확인했다'"},
+    want(False, "Bash",
+         {"command": "cys send --queued --to master '설정에서 $HOME 을 확인했다'"},
          "리터럴 `$` 는 **본문**이다(오탐 금지)")
     want(False, "Bash", {"command": "grep -n '^ctx$' /w/log"}, "정규식 안의 `$`")
 
@@ -3539,7 +3577,7 @@ def self_test_r2(fails):
     # ★큰따옴표 안이라 확장 하자드는 통과하고 **토큰 해소**만이 막는 자리(R1 ${IFS} 의 인용판)
     want(True, "Bash", {"command": 'cys status > "/w/home/.cys/state/${IFS}mission.json"'},
          "인용 안 미지 변수는 값 미상")
-    want(True, "Bash", {"command": 'cys send --to master "${IFS}--surface 7"'},
+    want(True, "Bash", {"command": 'cys send --queued --to master "${IFS}--surface 7"'},
          "인용 안 미지 변수 본문")
 
     # ⑤ `cys` 전역 옵션·대상 소켓(codex blocking — 동사 오인 · 대상 데몬 교체)
@@ -3610,7 +3648,8 @@ def self_test_r2(fails):
     _cr = "python3 \"/w/pack/bin/javis_pre\\" + "\r" + "flight.py\" --self-test"
     want(True, "Bash", {"command": _cr}, "CR 이어붙이기로 설치 팩 도구 위장")
     want(True, "Bash", {"command": "cys status\rcys kill 1"}, "인용 밖 생 CR")
-    want(False, "Bash", {"command": 'cys send --to master "1줄\n2줄"'}, "LF 본문은 그대로 통과")
+    want(False, "Bash", {"command": 'cys send --queued --to master "1줄\n2줄"'},
+         "LF 본문은 그대로 통과")
     for _c, _exp in (("cargo --config target.x.runner=['/tmp/r.sh'] test --offline", True),
                      ("cargo --config build.jobs=2 test", False),
                      ("cargo --config net.offline=true test", False),
@@ -3632,7 +3671,7 @@ def self_test_r2(fails):
         if not _b or "선행 환경 할당" not in _r:
             fails.append("R2[선행 env 할당]: `%s` → %s (%s)"
                          % (_c, "allow" if not _b else "deny", _r[:80]))
-    want(False, "Bash", {"command": "cys send --to master 'a=b 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master 'a=b 는 본문이다'"},
          "인용 안 `=` 는 본문이다")
 
     # ⑪ `_norm` 은 심링크를 따라간다(문서·코드가 갈리던 자리 · 음성 대조의 짝)
@@ -3739,11 +3778,11 @@ def self_test_r2(fails):
     rv(True, "cargo --config build.jobsX=2 test", "아는 키의 접두를 빌린 모르는 키")
     rv(True, "cargo --config=build.rustc-wrapper='/tmp/w' test", "결합 표기 래퍼 주입")
     # T2: 중첩 중괄호(안쪽 쌍이 바깥 쌍을 지우던 갈래)
-    want(True, "Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+    want(True, "Bash", {"command": "cys send --queued --to master --{clear-first,x{y}}"},
          "중첩 중괄호가 감춘 --clear-first")
     want(True, "Bash", {"command": "tail -{f,x{y}} /w/pack/round/SESSION_STATE.md"},
          "중첩 중괄호가 감춘 tail -f")
-    want(False, "Bash", {"command": "cys send --to master '{a,b} 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master '{a,b} 는 본문이다'"},
          "인용 안 중괄호는 여전히 본문이다(오탐 금지)")
     # T3: reviewer write-shell deny 에도 중괄호 술어를 태운다(거부 방향 전용)
     rv(True, "rm{,x} /w/repo/build", "중괄호로 감춘 rm")
@@ -3767,7 +3806,8 @@ def self_test_r2(fails):
     want(False, "Bash",
          {"command": "python3 ~/.cys/pack/bin/javis_preflight.py --self-test"},
          "인용 없는 `~/…` 는 확장된다(오탐 금지)", c=ctx_home_pack())
-    want(False, "Bash", {"command": "cys send --to master \"$HOME ~ 아래를 확인했다\""},
+    want(False, "Bash",
+         {"command": "cys send --queued --to master \"$HOME ~ 아래를 확인했다\""},
          "확장과 리터럴이 한 인자에 섞여도 본문은 본문이다(오탐 금지)")
     # T5: 인용된 리다이렉트 문자는 연산자가 아니라 인자다(다음 옵션을 삼키지 않는다).
     #     ★cwd 를 **허용 스크래치로 고정**해서 잰다 — 상대 경로 판정이 실행 위치에 따라 갈리면
@@ -3782,11 +3822,11 @@ def self_test_r2(fails):
         def ctx_scratch():
             return Ctx(pack=PACK, state=STATE, home=HOME, reader=reader, tempdir=_t5)
 
-        want(True, "Bash", {"command": "cys send --to master '>' --clear-first"},
+        want(True, "Bash", {"command": "cys send --queued --to master '>' --clear-first"},
              "인용된 `>` 가 삼킨 --clear-first", c=ctx_scratch())
-        want(True, "Bash", {"command": 'cys send --to master ">" --clear-first'},
+        want(True, "Bash", {"command": 'cys send --queued --to master ">" --clear-first'},
              "큰따옴표 판도 같다", c=ctx_scratch())
-        want(True, "Bash", {"command": "cys send --to master \\> --clear-first"},
+        want(True, "Bash", {"command": "cys send --queued --to master \\> --clear-first"},
              "이스케이프 판도 같다", c=ctx_scratch())
     except OSError:
         pass

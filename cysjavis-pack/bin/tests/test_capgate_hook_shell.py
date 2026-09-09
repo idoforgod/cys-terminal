@@ -757,11 +757,11 @@ class TriageQuotingAndExpansion(_HookEnv):
         self.assertEqual(self.bash_words("'>' --clear-first"), [">", "--clear-first"],
                          "선행 사실: 인용된 `>` 는 인자다")
         deny_plain = self.run_hook_in(self.tmpdir, "Bash",
-                                      {"command": "cys send --to master --clear-first"},
+                                      {"command": "cys send --queued --to master --clear-first"},
                                       CYS_ROLE="cso")
         self.assertTrue(deny_plain.denied, "대조군: 인용 없는 --clear-first 는 이미 deny 다")
         r = self.run_hook_in(self.tmpdir, "Bash",
-                             {"command": "cys send --to master '>' --clear-first"},
+                             {"command": "cys send --queued --to master '>' --clear-first"},
                              CYS_ROLE="cso")
         self.assertTrue(r.denied,
                         "인용된 `>` 가 금지 옵션을 삼켜 통과했다: %r/%r" % (r.out, r.err))
@@ -776,7 +776,7 @@ class TriageQuotingAndExpansion(_HookEnv):
         self.assertEqual(self.bash_words("--{clear-first,x{y}}"),
                          ["--clear-first", "--x{y}"],
                          "선행 사실: 중첩 중괄호도 인자를 늘린다")
-        r = self.run_hook("Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+        r = self.run_hook("Bash", {"command": "cys send --queued --to master --{clear-first,x{y}}"},
                           CYS_ROLE="cso")
         self.assertTrue(r.denied,
                         "중첩 중괄호가 금지 옵션을 숨겼다: %r/%r" % (r.out, r.err))
@@ -1179,6 +1179,37 @@ class HookCacheIdentity(_HookEnv):
         self.assertTrue(mp.group(1).startswith(mg.group(1)),
                         "capgate 캐시 이름이 게이트 자기상태 접두 밖이다: %r ⊄ %r"
                         % (mp.group(1), mg.group(1)))
+
+
+
+class QueuedReportChannel(_HookEnv):
+    """★0.14.31 성찰 G2 — CSO 보고 채널은 `cys send --queued --to master` **하나**다(훅 종단).
+
+    비큐 `cys send` 는 `surface.send_text` 만 부르고 CR 을 보내지 않는다(src/bin/cys.rs
+    Command::Send). 조용한 pane 에서는 본문이 **미제출 초안**으로 남고, master 가 초안을 쥐고
+    있으면 그 초안에 합체된다. 제출에 필요한 `cys send-key … Return` 은 CSO 접두 밖이라
+    비큐 보고는 **도달 경로가 없다**("CSO 는 보고했다고 믿고 오너는 침묵을 본다").
+    그래서 게이트는 옵션 종료 `--` 앞의 **실제** `--queued` 토큰을 허용·예산 면제의 선행
+    조건으로 요구한다. 여기서는 훅을 실제로 실행해 deny 문면이 처방을 담는지까지 잰다.
+    """
+
+    def test_unqueued_report_is_denied_with_the_prescription(self):
+        r = self.run_hook("Bash", {"command": 'cys send --to master "[CSO] 보고"'}, CYS_ROLE="cso")
+        self.assertTrue(r.denied, "비큐 send 가 통과했다: %r/%r" % (r.out, r.err))
+        self.assertIn("--queued", r.reason, "deny 문면에 처방(`--queued`)이 없다: %r" % r.reason)
+
+    def test_queued_report_is_allowed(self):
+        r = self.run_hook("Bash", {"command": 'cys send --queued --to master "[CSO] 보고"'},
+                          CYS_ROLE="cso")
+        self.assertFalse(r.denied, "실제 큐 옵션이 거부됐다: %r" % r.reason)
+        self.assertEqual(r.rc, 0)
+
+    def test_queued_string_in_body_or_after_double_dash_is_not_the_option(self):
+        for cmd in ('cys send --to master "--queued 라고 적힌 본문"',
+                    "cys send --to master -- --queued"):
+            with self.subTest(cmd=cmd):
+                r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso")
+                self.assertTrue(r.denied, "본문의 `--queued` 문자열이 옵션으로 읽혔다: %r" % cmd)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
