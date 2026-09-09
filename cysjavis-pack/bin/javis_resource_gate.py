@@ -722,8 +722,14 @@ def _is_windows_host():
 
 # ps 가 **플래그를 거부**한 형상(구현이 `-axo` 를 모른다)의 관용 문구. 이것은 '측정 실패'가 아니라
 # '이 ps 로는 이 축을 못 잰다'는 플랫폼 능력 사실이라, 어느 플랫폼에서든 `unsupported` 로 접는다.
+# ★N16(성찰 R4): BusyBox 는 `ps: bad -o argument 'pcpu'` 로 거부한다 — 종전 패턴은 `bad option`
+#   만 알아서 그 문구가 `"failed"` 로 접혔고, Alpine/BusyBox 에서는 **매 호출** `measure_errors:
+#   fleet_cpu(ps)` → 최소 soft → `javis_completion_guard._soft_kind` 가 skip_soft(SKIPPED_RESOURCE)
+#   = 완료 검증 영구 skip 이 됐다(거부 문면은 플랫폼 능력 사실이지 측정 실패가 아니다).
+#   거부 문면의 **플래그 이름은 임의**(`-o`·`--sort`)라 그 자리를 선택 그룹으로 연다.
 _PS_FLAG_REJECT_RE = re.compile(
-    r"(unknown|invalid|illegal|unrecognized)\s+(option|argument|flag)|\bbad\s+option\b", re.I)
+    r"(unknown|invalid|illegal|unrecognized)\s+(option|argument|flag)"
+    r"|\bbad\s+(-\S+\s+)?(option|argument)\b", re.I)
 # `usage:` 하나만으로는 접지 않는다(codex R1-2): 진짜 호출 결함도 usage 를 낸다. Windows 호스트에서만
 # 보조 신호로 인정한다 — 그 플랫폼에서는 어차피 이 축이 없는 것과 같고(exit 계약 불변) 다른
 # 플랫폼에서는 '측정 실패' 로 남아 최소 soft 로 신호된다.
