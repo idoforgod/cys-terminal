@@ -909,5 +909,99 @@ class ReflectRegistrarGaps(_CapgateEnv):
                         found.append(fp)
         self.assertTrue(found, "손상 표에서 재시도 표식이 남지 않았다 — 다음 부팅이 재측정하지 않는다")
 
+
+class ReflectHookCommandQuoting(_CapgateEnv):
+    """★0.14.31 성찰 G3(blocking)·G11(major) — 등록 문자열의 인용 규율과 등록 축 미러 7종 파리티."""
+
+    HOSTILE_PACKS = ("pack $HOME", "pack$(touch CAPGATE_PROBE)", "pack`touch CAPGATE_PROBE2`",
+                     'pack"q', "pack'q", "pack q", "pack;touch CAPGATE_PROBE3", "pack\\q")
+
+    def _argv_via(self, cmd, shell_fn):
+        """`sh`/`bash` 를 **기록 함수**로 가려 cmd 를 bash 로 실제 실행 — 훅이 받은 argv(NUL 구분)."""
+        rec = self.root / ("argv-%s.bin" % shell_fn)
+        if rec.exists():
+            rec.unlink()
+        prog = "%s() { printf '%%s\\0' \"$@\" > %s; }\n%s\n" % (shell_fn, shlex.quote(str(rec)), cmd)
+        r = subprocess.run(["/bin/bash", "-c", prog], cwd=str(self.root), capture_output=True,
+                           text=True, timeout=30, env={"PATH": str(self.bin), "HOME": str(self.home)})
+        self.assertEqual(r.returncode, 0, "명령이 실행되지 않았다: %r / %r" % (cmd, r.stderr))
+        body = rec.read_bytes() if rec.exists() else b""
+        return [a.decode("utf-8", "replace") for a in body.split(b"\0")[:-1]]
+
+    def _probes(self):
+        return [p for p in ("CAPGATE_PROBE", "CAPGATE_PROBE2", "CAPGATE_PROBE3")
+                if (self.root / p).exists() or (self.home / p).exists()]
+
+    def test_unix_command_passes_hostile_pack_paths_as_one_literal_argument(self):
+        spec = {"script": "hooks/" + pf.CAPGATE_HOOK[0]}
+        for name in self.HOSTILE_PACKS:
+            with self.subTest(pack=name):
+                pack = self.root / name
+                (pack / "hooks").mkdir(parents=True, exist_ok=True)
+                want = os.path.join(str(pack), spec["script"])
+                cmd = gr._command_str(spec, str(pack))
+                argv = self._argv_via(cmd, "sh")
+                self.assertEqual(argv, [want], "인자가 하나의 정확한 경로가 아니다: %r ← %r" % (argv, cmd))
+                self.assertEqual(self._probes(), [], "부수 실행이 일어났다: %r ← %r" % (self._probes(), cmd))
+
+    def test_windows_command_passes_hostile_pack_paths_as_one_literal_argument(self):
+        spec = {"script": "hooks/" + pf.CAPGATE_HOOK[0]}
+        for name in self.HOSTILE_PACKS:
+            if "\\" in name:
+                continue                      # windows 갈래는 역슬래시를 정슬래시로 접는다(경로 구분자)
+            with self.subTest(pack=name):
+                pack = self.root / name
+                (pack / "hooks").mkdir(parents=True, exist_ok=True)
+                with mock.patch.object(os, "name", "nt"):
+                    cmd = gr._command_str(spec, str(pack))
+                self.assertTrue(cmd.startswith('bash "'), cmd)
+                want = os.path.join(str(pack), spec["script"]).replace("\\", "/")
+                argv = self._argv_via(cmd, "bash")
+                self.assertEqual(argv, [want], "인자가 하나의 정확한 경로가 아니다: %r ← %r" % (argv, cmd))
+                self.assertEqual(self._probes(), [], "부수 실행이 일어났다: %r ← %r" % (self._probes(), cmd))
+
+    def test_safe_paths_stay_byte_identical_with_preflight(self):
+        """안전 문자 경로(배포 기본형)는 종전 문자열 그대로 — preflight·Rust writer 와 byte-identical."""
+        spec = {"script": "hooks/" + pf.CAPGATE_HOOK[0]}
+        self.assertEqual(gr._command_str(spec, pf.pack_dir()), pf._cys_hook_cmd(pf.CAPGATE_HOOK[0]))
+        with mock.patch.object(os, "name", "nt"):
+            self.assertEqual(gr._command_str(spec, "C:\\Users\\u\\.cys\\pack"),
+                             'bash "C:/Users/u/.cys/pack/hooks/%s"' % pf.CAPGATE_HOOK[0])
+
+    def test_registration_axis_mirrors_match_preflight(self):
+        """G11: 미러 7종을 **전부** assertEqual 로 잰다(주석이 약속한 '파리티는 검체가 잰다')."""
+        # ① 지침 표지
+        self.assertEqual(gr.CSO_DIRECTIVE_REV_MARKER, pf.CSO_DIRECTIVE_REV_MARKER)
+        # ② 데몬 실재 표지 집합
+        self.assertEqual(tuple(gr.HUB_LIVE_MARKERS), tuple(pf.Preflight.HUB_LIVE_MARKERS))
+        # ③ 허브 상태 디렉터리(현 플랫폼 · XDG 유무·상대 XDG)
+        for xdg in (None, "/x/state", "rel/state"):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("XDG_STATE_HOME", None)
+                if xdg is not None:
+                    os.environ["XDG_STATE_HOME"] = xdg
+                self.assertEqual(gr._hub_state_dir(), pf._hub_state_dir(), "XDG=%r" % xdg)
+        # ④ 명명 파이프 주소 판별
+        for v in ("\\\\.\\pipe\\cys", "//./pipe/cys", "/tmp/cys.sock", "", None, 7, "pipe"):
+            self.assertEqual(gr.is_pipe_address(v), pf._is_pipe_address(v), repr(v))
+        # ⑤ 무기동 조회 env
+        base = {"PATH": "/x", "CYS_NO_AUTOSTART": "0"}
+        self.assertEqual(gr.no_autostart_env(base), pf._no_autostart_env(base))
+        self.assertEqual(gr.no_autostart_env(), pf._no_autostart_env())
+        # ⑥ 팩 위치 4단 폴백 — 키 **순서**까지
+        self.assertEqual(tuple(gr.PACK_DIR_ENV_KEYS), tuple(pf.PACK_DIR_ENV_KEYS))
+        keys = pf.PACK_DIR_ENV_KEYS
+        for i in range(len(keys) + 1):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                for k in keys:
+                    os.environ.pop(k, None)
+                for j, k in enumerate(keys):
+                    if j >= i:
+                        os.environ[k] = "/p/%d" % j
+                self.assertEqual(gr._pack_dir(), pf.pack_dir(), "첫 %d 키 부재" % i)
+        # ⑦ 훅 명령 문자열(안전 경로 byte-identical · 인용 규칙은 G3 검체가 잰다)
+        self.assertEqual(gr._command_str({"script": "hooks/" + pf.CAPGATE_HOOK[0]}, pf.pack_dir()),
+                         pf._cys_hook_cmd(pf.CAPGATE_HOOK[0]))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
