@@ -1827,9 +1827,16 @@ def evaluate(m, a):
         checks.extend(_rate_checks(a))
 
     # ★T9(W6) 곱셈 편성 예산 축 — 발화 조건(플래그∧env 정수) 미충족이면 완전 무동작(회귀 0).
-    fb, _fb_warn = _formation_budget_check(m, a)
+    # ★N16 성찰(R4 N11): 이 축은 **여기서 한 번만** 평가하고 사유는 `m` 에 실어 `cmd_check` 와
+    #   나눠 쓴다. 종전엔 `evaluate` 와 `cmd_check` 가 각각 불러(중복 평가) `cmd_check` 쪽이
+    #   그 사유를 **판정 입력인 `warnings` 배열**에 얹었다 — 바로 아래 주석이 금지한 그 일이다.
+    fb, fb_warn = _formation_budget_check(m, a)
     if fb is not None:
         checks.append(fb)
+    if fb_warn:
+        # 판정 입력이 아니라 **측정 표기**다(`measured.formation_budget_reason`). 침묵하지 않으면서
+        # `warnings` 완전일치 계약(javis_completion_guard._soft_kind)을 깨지 않는 유일한 자리.
+        m["formation_budget_reason"] = fb_warn
 
     # 측정 실패는 최소 soft로 격상(조용한 allow 금지 · P-ORCH-1) — 실제 hard 트립이 있으면 hard가 우선.
     worst = "soft" if m.get("measure_errors") else "ok"
@@ -1875,9 +1882,18 @@ def cmd_check(a):
                          "0.14.31 부터 soft 전용(호스트 부하로 착수를 거부하지 않는다). "
                          "함대 CPU 차단은 --fleet-cpu-hard 소관.\n" % a.load_hard_ratio)
     # ★T9: 비정수 CYS_FORMATION_BUDGET 는 판정 무접촉(발화 조건 미충족)이되 침묵하지 않는다.
-    _fb, fb_warn = _formation_budget_check(m, a)
-    if fb_warn:
-        warnings.append(fb_warn)
+    # ★성찰 R4 N11: 그 가청화를 **stderr(진단 채널)** 로 낸다. 종전엔 `warnings` 에 얹었는데,
+    #   그 배열은 표기가 아니라 판정 입력이다 — `javis_completion_guard._soft_kind`(:675)가
+    #   `warnings == ["context_unmeasured"]` **완전일치**로 proceed_unmeasured/skip_soft 를
+    #   가른다. `--formation-size` 는 `javis_formation.py` 가 매 호출 붙이므로 env 오타 하나가
+    #   서 있는 동안 `SKIPPED_RESOURCE` 가 계속 났고 원인은 어디에도 안 보였다(20행 위 주석이
+    #   "아무것도 더 넣지 않는다" 라고 적은 바로 그 배열을 같은 함수가 깨고 있었다).
+    #   사유 자체는 `measured.formation_budget_reason`(evaluate 가 실었다) + stderr 1줄로 남는다.
+    fb_reason = m.get("formation_budget_reason")
+    if fb_reason:
+        sys.stderr.write("[resource-gate] %s — CYS_FORMATION_BUDGET 이 정수가 아니라 편성 예산 "
+                         "축이 발화하지 않았다(판정 무접촉). 값을 고치면 축이 살아난다.\n"
+                         % fb_reason)
     result = {"verdict": verdict, "measured": m, "trips": trips,
               "checks": checks, "warnings": warnings}
     if a.json:
@@ -2506,16 +2522,25 @@ def _self_test_body(fails):
         with contextlib.redirect_stdout(io.StringIO()):
             rc = main(base_argv)
         chk(rc == EXIT_ALLOW, "플래그 부재인데 예산 축이 발화(기존 호출자 회귀): rc=%r" % rc)
-        # (e) env 비정수 + 플래그 → 판정 무접촉(allow) + warning 가청화
+        # (e) env 비정수 + 플래그 → 판정 무접촉(allow) + 가청화
+        # ★성찰 R4 N11: 가청화 자리가 `warnings`(판정 입력)에서 `measured.formation_budget_reason`
+        #   + stderr 로 옮겼다. `warnings` 는 `javis_completion_guard._soft_kind` 가 완전일치로
+        #   읽는 배열이라 여기에 사유를 얹으면 완료 검증이 상시 skip 된다.
         os.environ["CYS_FORMATION_BUDGET"] = "abc"
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        buf, ebuf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(ebuf):
             rc = main(base_argv + ["--json", "--formation-size", "0"])
         chk(rc == EXIT_ALLOW, "비정수 env 가 판정을 오염: rc=%r" % rc)
         try:
             doc = json.loads(buf.getvalue().strip())
-            chk(any(w.startswith("formation_budget_env_invalid") for w in doc.get("warnings") or []),
-                "비정수 env 가 침묵(warning 부재): %r" % doc.get("warnings"))
+            chk(str((doc.get("measured") or {}).get("formation_budget_reason") or "")
+                .startswith("formation_budget_env_invalid"),
+                "비정수 env 가 침묵(measured.formation_budget_reason 부재): %r"
+                % (doc.get("measured") or {}).get("formation_budget_reason"))
+            chk(not any(str(w).startswith("formation_budget") for w in doc.get("warnings") or []),
+                "예산 사유가 판정 입력 warnings 를 오염: %r" % doc.get("warnings"))
+            chk("formation_budget_env_invalid" in ebuf.getvalue(),
+                "비정수 env 가 stderr 로도 침묵: %r" % ebuf.getvalue())
         except ValueError as e:
             fails.append("예산 축(비정수 env) --json 파싱 실패: %s" % e)
         # (f) nodes 미측정(ps 실패 형상) → 예외 금지(70 방지·None 무발화) — 순수 함수 직접 핀
