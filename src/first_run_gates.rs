@@ -112,9 +112,10 @@ pub struct GateAction {
     /// 선택할 항목(1-based · 화면에 보이는 번호).
     pub select_index: u8,
     /// 그 항목의 라벨. ★(0.14.31 · 리뷰 R3·R4) 종전엔 "사람 확인용 · 판정 근거 아님" 이었으나, 지금은
-    /// **자동확인의 양성 증거**다 — `inject_guard::confirm_allowed`(관문 확인 허가)와
-    /// `decide_allowing`(주입 허가의 allow 구멍)이 둘 다 커서가 이 라벨 전문 위에 있고 **활성 선택 블록에
-    /// 경쟁 커서가 없을 때만**(`readiness::cursor_resolves_to_label`) 그 관문의 Return 을 허용한다. 그러므로
+    /// **자동확인의 양성 증거**다 — `inject_guard::confirm_allowed`(관문 확인 허가)가 커서가 이 라벨 전문
+    /// 위에 있고 **활성 선택 블록에 경쟁 커서가 없을 때만**(`readiness::cursor_resolves_to_label`) 그 관문의
+    /// Return 을 허용한다(★성찰 R7: 종전엔 주입 허가의 allow 구멍도 같은 술어를 썼으나 그 구멍은 삭제됐다 —
+    /// 이 라벨을 읽는 판정은 **확인 경계 하나**다). 그러므로
     /// 이 값은 화면 실측 문면과 **글자 그대로** 같아야 하고, 틀리면 구멍이 닫히는 쪽(보류)으로 틀린다.
     /// 그 술어의 블록 경계는 이 관문의 [`Gate::needles`] 가 정한다(질문 문면이 SOT · 사본 0).
     pub label: String,
@@ -743,8 +744,9 @@ impl PolicyEnforcement {
 /// 관문이 화면에 서지 않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 아닐 것
 /// ③ 선언 시퀀스가 Return 한 발일 것(`down_presses()==Some(0)`) ④ 커서가 액션 라벨 전문 위일 것
 /// ⑤ **좌석이 밝힌 버전이 이 관문의 실측본과 다르지 않을 것**(이번에 더한 축) — 다섯이다.
-/// ⑤의 증거는 좌석 기동에 결속된 래치([`crate::inject_guard::Observed::cli_version`])와 지금
-/// 화면의 배너([`banner_versions`])의 **합집합**이고, 그중 하나라도 불일치면 보류다.
+/// ⑤의 증거는 좌석 기동에 결속된 래치([`crate::inject_guard::Observed::cli_versions`] — 이 부트에서
+/// 관측한 버전 **전량**의 단조 증가 합집합이지 값 하나가 아니다 · 수렴 R2)와 지금 화면의 배너
+/// ([`banner_versions`])의 **합집합**이고, 그중 하나라도 불일치면 보류다.
 /// **미상은 아직 통과한다** — `MEASURED_ON` 이 부분 실측이라(6관문 중 2관문) 미상까지 접으면
 /// 오늘 전 좌석이 매 부트마다 사람 1회를 요구한다(정본 §3-3 은 보류를 허용하지만 그 절단은
 /// 별도 결정이다). 그 결정이 서면 이 상수가 [`PolicyEnforcement::Full`] 로 간다.

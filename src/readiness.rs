@@ -64,7 +64,7 @@
 //! ```
 //!
 //! `modal_signature` 는 코퍼스와 **독립**인 순수 술어이고(위젯 푸터·선택지 라벨·선택 커서), 형제
-//! 축 `inject_guard::decide_allowing` 도 **같은 함수**를 소비한다(판정 분리 금지). 밸브는 이제
+//! 축 `inject_guard::decide` 도 **같은 함수**를 소비한다(판정 분리 금지). 밸브는 이제
 //! `time_fallback_reached ∧ idle_quiet==Some(true)` 창 안에서만 열린다 — 아직 그리는 화면에는
 //! 열리지 않는다. 두 변경 모두 **보류 방향**이고, 롤백 스위치는 종전 그대로다(아래 표 · 새 노브 0).
 //!
@@ -907,7 +907,7 @@ pub fn cursor_resolves_to_label(screen: &str, label: &str, anchors: &[&str]) -> 
 /// 커서 뒤 꼬리(평탄화 · **화면 끝까지**)로 판정한다. `Some((규칙 라벨, flat 끝))` 이면 모달이다.
 ///
 /// 【무엇이 열려 있었나(R4 잔여 blocking)】 R4 는 **확인(Return) 허가**만 좁혔다. 주입 허가
-/// ([`crate::inject_guard::decide_allowing`])와 부트 준비 판정([`judge`])은 그대로였고, 그래서
+/// ([`crate::inject_guard::decide`])와 부트 준비 판정([`judge`])은 그대로였고, 그래서
 /// 화면이 `❯ No, exi`(질문·번호·푸터 없음)뿐인 잘린 렌더에서 코퍼스 식별도 모달 서명도 서지 않아
 /// **Ready{MarkerDelta} → 디렉티브 붙여넣기 + Return** 이 부분 렌더된 종료 선택지로 나갔다.
 /// 자동확인만 막고 정상 주입 경로를 열어 두면 킬체인은 그대로다 — 그래서 거부를 **공용 서명**에 둔다.
@@ -1318,7 +1318,12 @@ fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
 /// 양성 증거다. 잘려 그려진 플레이스홀더(부분 일치)는 **인정하지 않는다**(fail-closed — 부분 일치를 받으면
 /// 짧은 접두가 선택지 라벨과 겹칠 수 있다).
 /// 꼬리의 모달 형상 배제(`❯`·어댑터 마커·번호 항목 행)는 플레이스홀더가 있어도 그대로 적용한다.
-pub fn composer_layout_positive(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+///
+/// ★(0.14.31 · 성찰 R9 · minor) **검체 전용**이다 — 프로덕션 소비처 0. 형제 함수(인자 없는 관대판)를
+///   지운 것과 같은 이유로 `pub` 을 거둔다: 이 이름을 부르는 새 소비처가 "강한 증거 단독" 이 아니라
+///   "약한 증거까지 포함" 으로 오해할 수 있고, 프로덕션은 [`composer_layout_static_ok`] 하나를 쓴다.
+#[cfg(test)]
+fn composer_layout_positive(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
     matches!(scan_composer(screen, marker, placeholder), Some(sc) if sc.strong)
 }
 
