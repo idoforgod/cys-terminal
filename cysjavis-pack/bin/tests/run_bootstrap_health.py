@@ -4936,7 +4936,13 @@ def h_seat_4axis():
          "Fatal 이 보류에 가려진다")
     # ⑥ restore in-seat: **fresh 폴백 금지**(좌석 증식·관문 재진입 루프 차단).
     si2 = src.find("fn run_restore(")
-    sbody2 = src[si2:src.find("\n/// T2-7", si2)]
+    # ★(통합 2026-09-10) 판정은 **코드**를 읽는다 — `//` 줄주석을 먼저 걷어낸다.
+    #   붉었던 이유가 그것이다: 성찰 C5 가 이 함수 안에 "fresh 폴백(`run_launch_agent_opts(...)`)과
+    #   같은 규칙으로 맞춘다" 는 **설명 주석**을 넣었고, 그 주석이 보류 분기보다 위에 있어
+    #   `find()` 의 첫 일치가 되었다. 폴백이 앞당겨진 것이 아니라 **주석을 코드로 읽은 것**이다.
+    #   주석 한 줄로 핀이 붉으면 다음 사람은 설명을 지우거나 핀을 완화한다(둘 다 나쁘다 —
+    #   `_rs_prod` 의 doc 이 이미 그 규율을 적어 두었다).
+    sbody2 = _rs_prod_lines(src[si2:src.find("\n/// T2-7", si2)])
     gj = sbody2.find("Ok(BootVerdict::GatePending")
     fj = sbody2.find("run_launch_agent_opts(")
     need(0 < gj < fj, "restore 보류 분기가 없거나 fresh 폴백보다 뒤다")
@@ -7929,20 +7935,36 @@ def h_seed_4():
     need(os.path.isfile(dept), "cys-dept 부재")
     src = _read(dept)
     notes = []
-    # ⓐ launch 스폰에 CYS_ACCOUNT_DIR 주입 + 시드 검증 fail-closed
-    li = src.find("\n  launch)")
-    need(li > 0, "launch 분기를 못 찾았다")
-    lbody = src[li:src.find("\n  allocate)", li)]
+    # ⓐ launch **본체**에 CYS_ACCOUNT_DIR 주입 + 시드 검증 fail-closed
+    # ★(통합 2026-09-10 · 성찰 P1) 측정 축 교체 — 계약은 그대로다. P1 이 launch 본체를
+    #   `launch_dept()` **함수**로 떼어냈다(단일소유 게이트·프리루드 밖에서 자기 rotate 를
+    #   프로세스 내부로 돌리기 위해). 그래서 `case` 팔은 이제 위임 한 줄
+    #   (`launch_dept "${2:-}"`)뿐이고, 종전처럼 팔 본문을 읽으면 42바이트를 읽는다 —
+    #   **주입이 사라져서 붉은 것이 아니라 주소가 바뀌어서 붉었다**. 본문을 따라간다.
+    lfi = src.find("\nlaunch_dept()")
+    need(lfi > 0, "launch 본체 함수(launch_dept)를 못 찾았다")
+    lbody = src[lfi:src.find('\ncase "$cmd" in', lfi)]
     need('CYS_ACCOUNT_DIR="$acctdir"' in lbody, "launch 스폰에 CYS_ACCOUNT_DIR 주입이 없다(G3 재발)")
     need("resolve_lane_acctdir" in lbody, "launch 가 계정 dir 을 유도하지 않는다")
     need("verify_lane_account_seed" in lbody, "launch 가 계정격리 시드를 검증하지 않는다")
     need("exit 6" in lbody, "시드 실패가 fail-closed 가 아니다(비격리 기동 허용)")
-    notes.append("launch 주입+검증+fail-closed")
-    # ⓑ rotate 는 launch 를 재귀 호출한다(= 이 수리가 rotate 에도 적용된다는 결박)
+    # 그리고 `launch` 팔은 그 본체로 **위임만** 한다(두 벌 구현 금지 — 한쪽만 고쳐지는 사고).
+    li = src.find("\n  launch)")
+    need(li > 0, "launch 분기를 못 찾았다")
+    need('launch_dept "' in src[li:src.find("\n  allocate)", li)],
+         "launch 팔이 본체 함수로 위임하지 않는다(본체가 두 벌이면 한쪽만 고쳐진다)")
+    notes.append("launch 주입+검증+fail-closed(본체=launch_dept)")
+    # ⓑ rotate 는 launch **본체**를 경유한다(= 이 수리가 rotate 에도 적용된다는 결박)
+    # ★(통합 2026-09-10 · 성찰 P1) 종전 결박은 `bash "$0" launch "$name"`(자식 프로세스)였다.
+    #   P1 이 그것을 서브셸 함수 호출로 바꿨다 — 자식 프로세스는 프리루드·단일소유 게이트를
+    #   처음부터 다시 돌아 **자기 부서 rotate 가 자기 자신에게 막혔다**. 결박의 **뜻**(rotate 가
+    #   launch 본체를 그대로 물려받는다)은 같고, 그 사실을 새 형상으로 잰다.
     ri = src.find("\n  rotate)")
-    need(ri > 0 and 'bash "$0" launch "$name"' in src[ri:ri + 4000],
-         "rotate 가 launch 를 경유하지 않는다(복원 경로 결박 실패)")
-    notes.append("rotate=launch 재귀(복원 상속)")
+    need(ri > 0, "rotate 분기를 못 찾았다")
+    rbody = src[ri:ri + 4000]
+    need('launch_dept "$name"' in rbody or 'bash "$0" launch "$name"' in rbody,
+         "rotate 가 launch 본체를 경유하지 않는다(복원 경로 결박 실패)")
+    notes.append("rotate=launch 본체 경유(복원 상속)")
     # ⓒ allocate 가 account_dir 을 레지스트리에 기록한다(복원 SOT)
     ai = src.find("\n  allocate)")
     need("reg_set_field \"$name\" account_dir" in src[ai:src.find("\n  create)", ai)],
@@ -10114,7 +10136,12 @@ def h_killchain_1():
     hi = cli.find("if let cys::inject_guard::Decision::Hold(hit) =")
     need(hi > 0, "부트 경로의 typed 관문 가드를 못 찾았다")
     hseg = cli[hi:hi + 1400]
-    need("settle_gate_pending(sid, &hit.id" in hseg,
+    # ★(통합 2026-09-10) 두 조각으로 나눠 본다 — 한 줄 문자열로 보면 **rustfmt 의 줄바꿈**에
+    #   묶인다. 이번 판이 그 호출에 인자 3개(`gate_close_override`·`followup`·`directive_held`)를
+    #   더하자 rustfmt 가 인자를 줄마다 쪼갰고, 계약은 그대로인데 핀만 붉었다.
+    #   저장소의 Rust 측 같은 계급 핀(`src/bin/cys.rs` 의 `hseg.contains(...) && hseg.contains(...)`)
+    #   이 이미 이 형태다 — 두 판정기를 같은 규약으로 맞춘다.
+    need("settle_gate_pending(" in hseg and "&hit.id" in hseg,
          "주입 직전 관문 감지의 귀결이 보류(U-11)가 아니다")
     need('"surface.close"' not in hseg and "escalate_reclaim" not in hseg,
          "가드 보류 분기가 좌석을 파괴한다 — 살아 있는 노드를 죽이는 방향(오살 > 오탐)")
@@ -10171,11 +10198,22 @@ def h_killchain_1():
     notes.append("1발 정책 · 화면 재확인 · 예산 leaf 무접촉(=2)")
 
     # ⓗ 킬체인 e2e Rust 검체의 실재(러너는 컴파일러가 아니다 — 이름과 배선을 핀한다)
+    # ★(통합 2026-09-10 · 성찰 R7) 세 번째 이름을 교체했다 — **계약은 더 강해졌다.**
+    #   R7 이 `decide_allowing(.., Some(id))`(주입 가드의 allow 구멍)를 **삭제**했으므로 그 구멍의
+    #   진리표를 재던 `allow_hole_is_exactly_one_gate_and_never_the_disclaimer` 도 함께 사라졌다.
+    #   그 자리를 잇는 검체는 `injection_guard_has_no_allow_hole_and_confirmation_is_a_separate_belt`
+    #   이고, 같은 두 화면(FOLDER_TRUST · TRUST_ECHO_THEN_DISCLAIMER)에서
+    #   ⓐ 가드는 **언제나 보류** ⓑ 자동확인은 **그 id 하나**에만 열리고 면책 창에서는 닫힌다 를
+    #   재며, 구 구멍의 진리표(Send / Hold(bypass-disclaimer))를 `legacy_decide_allowing` 대조군으로
+    #   그대로 보존한다. 즉 킬 스텝 방어가 약해진 것이 아니라 구멍 자체가 없어졌다.
     for t in ("killchain_trust_then_disclaimer_sends_exactly_one_return_and_never_touches_the_disclaimer",
               "after_awakening_ack_the_scan_is_off_even_on_gate_text",
-              "allow_hole_is_exactly_one_gate_and_never_the_disclaimer",
+              "injection_guard_has_no_allow_hole_and_confirmation_is_a_separate_belt",
               "confirm_echo_is_not_a_trust_detection"):
         need(t in gsrc, "킬체인 진리표 검체 %s 가 사라졌다" % t)
+    # 구 구멍이 **되살아나지 않았다**는 사실도 함께 잰다(이름 교체가 완화가 아님의 증명).
+    need("pub fn decide_allowing" not in gsrc.split("#[cfg(test)]")[0],
+         "삭제된 allow 구멍 API(decide_allowing)가 라이브러리 본문에 부활했다(R7 회귀)")
     for t in ("killchain_trust_then_disclaimer_sends_exactly_one_return_at_the_call_site_composition",
               "inject_gate_guard_is_wired_inside_the_single_choke_point_source_pin",
               "inject_guard_does_not_block_normal_screens"):
@@ -11849,6 +11887,21 @@ _U23_DESTRUCTIVE = ("close_surface", "kill_on_drop(true)", "check_agent_death",
                     "launch_via_cli", "restart_counts", "reap_", ".kill(")
 
 
+def _rs_prod_lines(src):
+    """`//` 줄주석만 걷어낸다(테스트 모듈 절단은 하지 않는다).
+
+    [`_rs_prod`] 는 `#[cfg(test)]` **이후 전체**를 자르므로 파일 통째를 볼 때만 맞다. 함수 한 개의
+    본문을 이미 잘라낸 뒤라면 그 앵커가 없어 아무것도 안 자르거나(무해) 엉뚱한 자리를 자른다.
+    그래서 '주석은 부르는 것이 아니다' 라는 규율만 떼어 쓴다."""
+    if src is None:
+        return ""
+    out = []
+    for line in src.split("\n"):
+        i = line.find("//")
+        out.append(line if i < 0 else line[:i])
+    return "\n".join(out)
+
+
 def _rs_prod(src):
     """Rust 소스의 **프로덕션 부분만** 남기고 `//` 줄주석을 제거한다.
 
@@ -11915,11 +11968,37 @@ def _u23_tick_violations(sup, main_rs, gov):
     else:
         body = gov_c[wi:gov_c.find("\nfn env_u64(", wi) if gov_c.find("\nfn env_u64(", wi) > 0
                      else wi + 12000]
+        # ★(통합 2026-09-10 · 성찰 Q8) **측정 축 교체 — 계약은 더 강해졌다.**
+        #   종전 축은 "watchdog 은 tokio 태스크이고 그 `.await` 는 sleep 하나뿐"(= 틱 본문이
+        #   동기 클로저라는 사실의 대리 측정)이었다. Q8 이 그 루프를 **전용 OS 스레드**로 옮겼다 —
+        #   틱이 완전 동기이고 결판 대기만 2,000ms 라, tokio 워커에 얹혀 있으면 1~2코어에서
+        #   accept 루프와 이벤트 write 를 밀어내 `cys send`·`cys status` 가 타임아웃되고
+        #   훅이 실패한다(부트체인). 그래서 지금은 `.await` 가 **0개인 것이 정답**이고,
+        #   종전 축을 그대로 두면 옳은 구조가 붉다.
+        #   지켜야 할 것(불변)은 둘이다: ⓐ 틱 본문에 비동기 대기가 없다 ⓑ cadence 는 그 상수의
+        #   한 번의 sleep 이다. 숙주가 스레드면 동기 sleep, tokio 폴백이면 `.await` sleep 이다.
+        thread_host = "spawn_governance_loop(" in body
         n_await = body.count(".await")
-        if n_await != 1:
-            v.append("watchdog 태스크의 .await 가 %d개다 — sleep 하나라는 계약이 깨졌다" % n_await)
-        if "tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await" not in body:
-            v.append("watchdog 의 유일한 .await 가 sleep 이 아니다")
+        sync_sleep = "std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS))" in body
+        async_sleep = "tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await" in body
+        if thread_host:
+            # 전용 스레드 숙주(정상) — 비동기 대기 0 · 동기 sleep 1.
+            if n_await != 0:
+                v.append("전용 스레드 watchdog 의 틱에 .await 가 %d개 있다 — 틱 본문은 동기 클로저다"
+                         % n_await)
+            if not sync_sleep:
+                v.append("전용 스레드 watchdog 의 cadence sleep 이 "
+                         "std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)) 이 아니다")
+            # 스레드 생성 실패 폴백이 살아 있어야 한다 — 없으면 거버넌스가 **소멸**한다(최악).
+            if "AsyncFallback" not in gov_c:
+                v.append("전용 스레드 생성 실패 폴백(AsyncFallback)이 없다 — 스레드가 못 뜨면 "
+                         "거버넌스가 데몬 수명 내내 조용히 사라진다")
+        else:
+            # tokio 태스크 숙주(구형·폴백) — 종전 계약 그대로.
+            if n_await != 1:
+                v.append("watchdog 태스크의 .await 가 %d개다 — sleep 하나라는 계약이 깨졌다" % n_await)
+            if not async_sleep:
+                v.append("watchdog 의 유일한 .await 가 sleep 이 아니다")
         # ⑤ 틱 4단 순서 불변식(감독자가 이 순서를 흔들지 않았다).
         order = ["refresh_seat_cache(&daemon", "deliver_queued(&daemon",
                  "check_agent_death(&daemon", "check_role_deadman(&daemon"]
@@ -12087,7 +12166,7 @@ def _u23_bound_violations(sup, delivery):
 
 @specimen("H-TICK-ALIVE", "W6",
           "U-23 감독자는 watchdog 틱을 막지 않는다 — 별도 태스크·자기 cadence·틱 4단 순서 보존 · "
-          "watchdog 의 유일한 .await 는 sleep",
+          "watchdog 틱 본문은 동기(전용 스레드=.await 0 · tokio 폴백=sleep 하나)",
           ["R3"])
 def h_tick_alive():
     """★이 검체가 지키는 것: 부트 1회(수십 초)를 watchdog 틱 본문(**동기 클로저**)에 얹으면
