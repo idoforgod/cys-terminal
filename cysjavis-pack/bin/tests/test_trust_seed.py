@@ -956,34 +956,55 @@ class Concurrent(Base):
                             f.write(late)
                         return _u
 
+                    def no_rename_over(a, b, _f=os.replace):
+                        self.assertNotEqual(os.path.abspath(b), os.path.abspath(self.cfgfile),
+                                            "rename-over 폴백이 호출됐다")
+                        return _f(a, b)
+
                     with patch.object(pf, "_exchange_paths", unavailable_after_writer), \
-                            patch.object(pf.os, "replace", side_effect=AssertionError("rename-over 폴백이 호출됐다")):
+                            patch.object(pf.os, "replace", no_rename_over):
                         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"),
                                                             force_unverified=force)
                     self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
                     self.assertIn(token, reason)
                     self.assertEqual(_read_bytes(self.cfgfile), late, "기록자 바이트가 덮였다")
                     leftovers = [n for n in os.listdir(self.cfg) if n.startswith(".claude.json.") and n != pf.SEED_TRUST_LOCK_NAME]
-                    # ★triage I4 재핀(plan §8 '의도적 기본값 변경만 재핀'): 미커밋 사본 삭제의 근거가 '활성 문서가
-                    #   유효하다' 에서 **저널의 두 지문에 대한 바이트 증명**으로 바뀌었다. 이 서브케이스는 대조(⑥)를
-                    #   통과한 **뒤** 끼어든 기록자가 활성을 `late` 로 바꾼 자리라 증명이 성립하지 않는다 — 우리 사본
-                    #   (원본 + 플래그)은 지워지지 않고 conflict 네임스페이스에 남는다. '잔재 0' 은 활성 무변경(통상·
-                    #   Windows 상시) 경로의 계약이고 그것은 `test_r7_exchange_failure_with_a_healthy_active_leaves_no_litter`
-                    #   와 `_refused_without_exchange` 가 그대로 지킨다.
-                    self.assertEqual([n for n in leftovers if not n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)], [], leftovers)
-                    saved = [n for n in leftovers if n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)]
-                    self.assertEqual(len(saved), 1, leftovers)
-                    self.assertIn("사본 보존", reason)
-                    doc = json.loads(_read_bytes(os.path.join(self.cfg, saved[0])).decode("utf-8"))
-                    self.assertIs(doc["projects"][self.key]["hasTrustDialogAccepted"], True,
-                                  "보존한 사본이 우리 payload 가 아니다")
-                    os.unlink(os.path.join(self.cfg, saved[0]))     # 다음 서브케이스는 깨끗한 상태에서
+                    # ★성찰 P12 재핀(major · 2026-09-10 · **의도적 방향 변경**): 종전(triage I4)은 '활성이 우리 두 지문
+                    #   중 하나와 바이트가 같은가' 만 봤고, 그 바이트 축에서는 이 서브케이스가 증명 실패라 conflict 를
+                    #   남겼다. 그런데 여기서 우리 사본은 **시더가 다음 부트에 스스로 다시 쓰는 플래그뿐**이다(캡처
+                    #   원본이 `{"projects": {}}` 였다) — 지워도 잃는 것이 0 인데 좌석 수만큼 매 부트 쌓였다(실측 축).
+                    #   축을 바이트에서 **구조**로 올려(`_strip_regenerable_flags`+`_covers`) 재생성 가능한 차이만
+                    #   흡수한다: 잔재 0.
+                    self.assertEqual(leftovers, [], "재생성 가능한 사본이 conflict 로 쌓였다(P12 누적 축)")
         # 부재 파일은 교환과 무관(os.link) — 기구 부재 플랫폼에서도 신규 부서 시드는 동작
         os.unlink(self.cfgfile)
         with patch.object(pf, "_exchange_paths", lambda a, b: pf._ExchangeUnavailable("platform:nt")):
             rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=_no_probe)
         self.assertEqual((rc, verdict), (0, "OK"), reason)
         self.assertIn("commit=link", reason)
+
+    def test_4g2b_uncommitted_copy_with_user_data_is_still_preserved(self):
+        """★성찰 P12 양성 대조(2026-09-10): 위 핀이 '잔재 0' 으로 바뀐 근거는 **그 사본이 재생성 가능**했기 때문이지
+        '미커밋 사본은 지워도 된다' 가 아니다 — 같은 형상(교환 기구 부재 + 대조 뒤 끼어든 기록자)에서 캡처 원본이
+        사용자 데이터를 담고 있으면 우리 사본은 그 데이터의 유일한 사본이므로 conflict 로 보존된다."""
+        original = b'{"userID": "u-1", "oauthAccount": {"emailAddress": "a@b"}, "projects": {}}'
+        _write_bytes(self.cfgfile, original)
+        late = b'{"projects": {"/late": {"hasTrustDialogAccepted": true}}}'   # 활성이 원본을 통째로 잃었다
+
+        def unavailable_after_writer(a, b):
+            with open(b, "wb") as f:
+                f.write(late)
+            return pf._ExchangeUnavailable("ENOTSUP")
+
+        with patch.object(pf, "_exchange_paths", unavailable_after_writer):
+            rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+        self.assertIn("사본 보존", reason)
+        saved = [n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)]
+        self.assertEqual(len(saved), 1, os.listdir(self.cfg))
+        doc = json.loads(_read_bytes(os.path.join(self.cfg, saved[0])).decode("utf-8"))
+        self.assertEqual(doc["userID"], "u-1", "보존한 사본에 사용자 데이터가 없다")
+        self.assertIs(doc["projects"][self.key]["hasTrustDialogAccepted"], True)
 
     def test_4h_absent_file_create_if_absent_refuses_when_writer_creates_first(self):
         """★R2: 부재 파일 커밋 = os.link(원자 create-if-absent) — 그 사이 다른 기록자가 만든 파일은 덮이지 않고 REFUSE."""
@@ -1103,7 +1124,12 @@ class Concurrent(Base):
         fifo = os.path.join(self.cfg, pf.SEED_TRUST_DISPLACED_PREFIX + m.group(1) + "-fifo")
         if hasattr(os, "mkfifo"):        # ★R4: Windows 엔 mkfifo 가 없다 — 그 항목만 건너뛴다(검체 전체 skip 아님)
             os.mkfifo(fifo)
-        _write(os.path.join(self.cfg, ".claude.json.seed-abcd1234"), "litter")
+        # ★성찰 P2 재핀(blocking · 2026-09-10 · **의도적 기본값 변경**): 잔재 청소의 기본값이 뒤집혔다 — 판독·파싱에
+        #   실패한 바이트는 이제 '지킬 데이터 있음' 이다(종전엔 '읽을 수 없으면 잃을 것도 없다' 로 접혀, 사용자 필드가
+        #   남은 채 잘린 임시 JSON 이 지워졌다 · 키 이름만으로는 값의 뜻을 판정할 수 없다). 그래서 '청소된다' 를 재는
+        #   이 자리의 잔재는 **실제 부분 기록**(우리가 쓰다 만 payload 접두)이어야 한다 — 그 바이트는 지금 다시 계획해도
+        #   나오므로 `_copy_supersedable` 의 접두 증명(⑤)이 삭제를 인가한다. 반대 방향은 아래 음성 대조가 잰다.
+        _write_bytes(os.path.join(self.cfg, ".claude.json.seed-abcd1234"), payload[:20])
         _require_exchange(self)
         rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
         self.assertEqual((rc, verdict), (0, "OK"), reason)      # 원본은 crash 에 무접촉 → 이번엔 정상 커밋
@@ -1119,6 +1145,16 @@ class Concurrent(Base):
             self.assertTrue(os.path.lexists(keep), "보존 대상이 지워졌다: %s" % keep)
         self.assertEqual(_read_bytes(target), payload, "심링크 타깃이 지워졌다")
         self.assertEqual(_read_json(self.cfgfile), {"projects": {self.key: {"hasTrustDialogAccepted": True}}})
+        # ★성찰 P2 음성 대조: 같은 자리에 **읽을 수 없는** 바이트를 두면 청소되지 않고 보존 네임스페이스로 간다
+        #   (파싱 실패를 '비어 있다' 로 읽던 것이 사용자 필드가 남은 잘린 임시본을 지운 축이다).
+        _write_bytes(os.path.join(self.cfg, ".claude.json.seed-ffff0000"), b"{not json at all")
+        rc2, verdict2, reason2 = pf.seed_trust(self.cfg, self.ws, proc_counter=lambda d: (0, "t"))
+        self.assertEqual((rc2, verdict2), (0, "OK"), reason2)
+        self.assertIn("stale-tmp preserved", reason2)
+        self.assertFalse(os.path.lexists(os.path.join(self.cfg, ".claude.json.seed-ffff0000")))
+        kept_conflicts = [n for n in os.listdir(self.cfg) if n.startswith(pf.SEED_TRUST_CONFLICT_PREFIX)]
+        self.assertTrue(any(_read_bytes(os.path.join(self.cfg, n)) == b"{not json at all" for n in kept_conflicts),
+                        kept_conflicts)
 
     def test_4k_lone_surrogate_document_is_seeded_without_traceback(self):
         """★R3(리뷰 claude): 기존 문서의 고아 서로게이트 이스케이프(`"\\ud800"`)는 json.loads 는 받지만 utf-8 인코딩이 UnicodeEncodeError 를
@@ -1769,6 +1805,17 @@ class WindowsStatePaths(_IsoEnv):
 
 
 def _block(src, start_label, end_label):
+    # ★성찰 P1(blocking · 2026-09-10): `launch` 본체는 case 갈래가 아니라 **함수**(`launch_dept(){ … }`)다 —
+    #   rotate 가 자식 프로세스(`bash "$0" launch … --rotate`)를 띄우면 프리루드·단일소유 게이트를 처음부터 다시
+    #   돌게 되고, 자기 부서를 rotate 하는 CSO 는 **자기가 방금 죽인 데몬**에게 권위를 물어 exit 7 로 끝났다(부서가
+    #   내려간 채 남는 반파괴). 인가를 마친 부모 안에서 본체를 부르도록 옮겼으므로 이 정적 핀도 **함수 본체**를 본다 —
+    #   핀의 의도(시드가 데몬·셸보다 앞이고 하나의 cwd 가 시드·편성에 같이 간다)는 그대로다.
+    if start_label == "launch":
+        i = src.find("\nlaunch_dept(){")
+        assert i > 0, "launch_dept() 함수 부재(본체가 다시 case 갈래로 돌아갔는가)"
+        j = src.find("\n}\n", i)
+        assert j > i, "launch_dept() 종결 부재"
+        return src[i:j]
     i = src.find("\n  %s)" % start_label)
     assert i > 0, start_label
     j = src.find("\n  %s)" % end_label, i)
@@ -1985,7 +2032,15 @@ class DeptWiringStatic(unittest.TestCase):
                                           "dept-3": {"socket": "/s/3/cys.sock"}}}))
         self.assertEqual(verb("dept-1").stdout.strip(), os.path.realpath(ws))
         self.assertEqual(verb("dept-2").stdout.strip(), os.path.realpath(home), '"/" 등재 → $HOME')
-        self.assertEqual(verb("dept-3").stdout.strip(), os.path.realpath(home), "cwd 미기록 등재 → $HOME")
+        # ★성찰 P4(major · 2026-09-10 · **의도적 방향 변경**): 등재 cwd 가 없으면 이 verb 는 `$HOME` 을 **확정값으로
+        #   내주지 않는다** — 소비자는 편성 심박(`javis_formation ensure --cwd`)이고, 거기에 `$HOME` 을 실어 보내면
+        #   시드되지 않은 폴더에서 좌석이 다시 떠 신뢰 관문에 걸린다(감사 에러 4 의 재발 경로). `$HOME` 폴백은
+        #   launch 의 결정이지 이 verb 의 값이 아니므로 exit 4 · stdout 0 으로 접고, 소비자는 `--cwd` 를 생략해
+        #   종전 동작으로 떨어진다. 음성 대조: 등재값이 있는 부서(dept-1·dept-2)는 그대로 값을 낸다(위 두 줄).
+        r3 = verb("dept-3")
+        self.assertEqual(r3.returncode, 4, r3.stdout + r3.stderr)
+        self.assertEqual(r3.stdout, "", "확정값 없음인데 값을 냈다")
+        self.assertIn("확정값 없음", r3.stderr)
         for bad in ("nope", ):
             r = verb(bad)
             self.assertEqual(r.returncode, 3, r.stderr)
@@ -2586,8 +2641,21 @@ class CodexR1Counterexamples(unittest.TestCase):
             self.assertEqual(self.read(self.bak), original)
             return real_ex(a, b)
 
+        # ★성찰 P2 조임(2026-09-10): 금지의 대상은 `os.replace` **호출 자체**가 아니라 **활성 문서를 덮는 rename** 이다.
+        #   되교환 뒤 우리 사본을 보존하는 경로가 `os.replace(tmp, <방금 배타 생성한 conflict 이름>)` 을 쓴다(Windows 는
+        #   대상이 있으면 `os.rename` 이 실패하므로 `replace` 가 유일한 이식 가능 이동이다). 술어를 목적지로 좁히면
+        #   핀의 의도(교체 창을 rename-over 로 열지 않는다)는 더 정확해지고, 보존 이동은 통과한다.
+        real_replace_fn = os.replace
+
+        def replacing(src, dst, *a, **kw):
+            self.assertNotEqual(os.path.abspath(dst), os.path.abspath(self.file),
+                                "exchange path must not rename-over the active document")
+            self.assertTrue(os.path.basename(dst).startswith(pf.SEED_TRUST_CONFLICT_PREFIX),
+                            "보존 이동 외의 rename 이 생겼다: %s" % dst)
+            return real_replace_fn(src, dst, *a, **kw)
+
         with patch.object(pf.os, "open", opening), patch.object(pf, "_exchange_paths", exchanging), \
-                patch.object(pf.os, "replace", side_effect=AssertionError("exchange path must not rename-over")):
+                patch.object(pf.os, "replace", replacing):
             result = self.seed(backup=True, _pre_write_hook=hook)
         # ★R2 재핀(리뷰 codex BLOCK): 대조 뒤 백업 open 중 끼어든 기록자(late)는 교환이 드러낸다 → 되교환 → REFUSE · late 보존 ·
         #   백업은 캡처 바이트(원본) 그대로(1회 보존 계약) · 종전 핀은 'late 가 덮이고 OK' 였다(데이터 손실 핀 폐기).
@@ -3223,13 +3291,19 @@ class CodexR2Counterexamples(unittest.TestCase):
             self.assertFalse(self.file.exists(), '거부인데 대체 문서를 만들었다')
             self.assertTrue(all((self.cfg / n).exists() for n in stale[:2]), '거부 경로가 잔재를 청소했다(무접촉 위반)')
             self.assertFalse(displaced.exists(), '보존 사본이 청소 네임스페이스에 그대로 남았다(보호가 1회용이다)')
+            # ★성찰 P12 재핀(major · 2026-09-10 · **의도적 방향 변경**): 보존은 네임스페이스 이동이라 되돌릴 수 없다 —
+            #   **같은 바이트가 conflict 에 이미 있으면 다시 보존하지 않는다**(중복 보존 자체가 무한 누적 축이다).
+            #   이 픽스처의 `kept` 에는 b'precious' 를 담은 conflict 가 이미 둘 있으므로 **새** 사본은 0 이고,
+            #   데이터는 그 쌍둥이가 계속 지킨다(데이터 손실 0 · 상한 있음).
             saved = [n for n in self.leftovers('conflict') if n.name not in kept]
-            self.assertEqual(len(saved), 1, [p.name for p in self.leftovers('conflict')])
-            self.assertEqual(saved[0].read_bytes(), b'precious', '보존이 바이트를 바꿨다')
+            self.assertEqual(saved, [], [p.name for p in self.leftovers('conflict')])
+            twins = [p.name for p in self.leftovers('conflict') if p.read_bytes() == b'precious']
+            self.assertTrue(twins, '보존한 바이트가 어디에도 남지 않았다')
             # 재시도 2회차: 사본이 보호 네임스페이스로 빠졌으므로 이제 정상 시드다(잔재 청소는 mkstemp 2건만)
             self.result(self.seed(lock_fn=lock_ok), 0, 'stale-tmp swept 2')
         self.assertTrue(all(not (self.cfg / n).exists() for n in stale[:2]), 'mkstemp 잔재가 남았다')
-        self.assertEqual(saved[0].read_bytes(), b'precious', '보존 사본이 다음 실행에서 청소됐다')
+        self.assertTrue([p for p in self.leftovers('conflict') if p.read_bytes() == b'precious'],
+                        '보존 사본이 다음 실행에서 청소됐다')
         # ★triage I1 재핀(plan §8): 지문 청소의 근거는 '활성 문서가 유효하다' 가 **아니라 바이트 증명**이다.
         # 양성 대조: 활성이 바로 그 사본이면(순수 중복) 정상적으로 회수된다(청소 계약 보존)
         displaced.write_bytes(b'precious')
@@ -3353,7 +3427,13 @@ class CodexR2Counterexamples(unittest.TestCase):
         r = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', driver],
                            cwd=self.root, env=env, capture_output=True, timeout=10)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stderr, b'')
+        # ★성찰 P4 ⓒ(major · 2026-09-10 · **의도적 방향 변경**): 값이 있었는데 못 써서 폴백한 것은 이제 **침묵이 아니다**.
+        #   `~` 미전개(카탈로그 `"cwd": "~/work/sales"`)가 리터럴로 남아 `[ -d ]` 거짓 → 무경고 `$HOME` 으로 접히던 자리가
+        #   오설정을 영구히 숨겼다(종전 표현이던 'WARN: 셸 생성 실패' 라는 가시적 실패조차 사라졌다). stderr 는 비어 있거나
+        #   `[cys-dept] WARN:` 줄뿐이어야 한다 — 그 밖의 stderr 출력은 여전히 계약 위반이다.
+        self.last_stderr = r.stderr
+        for line in r.stderr.splitlines():
+            self.assertTrue(line.startswith(b'[cys-dept] WARN: '), r.stderr)
         return r.stdout, calls.read_text().splitlines() if calls.exists() else []
 
     def test_16_resolver_symlink_dotdot_is_physical_and_lazy(self):
@@ -3373,17 +3453,47 @@ class CodexR2Counterexamples(unittest.TestCase):
         target.mkdir()
         home_alias = self.root / 'home-alias'
         home_alias.symlink_to(self.home)
-        out, calls = self.shell('resolve_dept_cwd "missing" "dept name"', value='registered space', home=home_alias)
+        # ★성찰 P4 ⓑ(major · 2026-09-10 · **의도적 방향 변경**): 등재값은 이제 **절대경로만** 인정한다 — 상대 등재값은
+        #   그 파일을 읽는 프로세스의 cwd 에 따라 다른 폴더로 풀려 부서 좌석·시드가 조용히 이동한다(같은 결함을 R4 가
+        #   allocate 에서 이미 고쳤고 create 카탈로그에만 남아 있었다). 공백이 든 이름은 그대로 지켜야 하므로
+        #   픽스처를 **절대경로 + 공백**으로 올린다(핀의 원 의도 = CRLF·공백 보존).
+        out, calls = self.shell('resolve_dept_cwd "missing" "dept name"', value=str(target), home=home_alias)
         self.assertEqual(out, (str(target) + '\n').encode())
         self.assertEqual(calls, ['-', str(self.root / 'dummy-registry'), 'dept name', 'cwd'])
+        # ★성찰 P4 ⓒ: 못 쓴 명시값은 한 줄로 말한다(등재값이 대신 서더라도 — 요청이 조용히 무시된 것이다)
+        self.assertIn(b"explicit cwd 'missing'", self.last_stderr)
+        # 상대 등재값은 **부재로 취급**(호출자 cwd 의존) — 존재하는 상대 dir 이어도 쓰지 않는다(음성 대조)
+        out, calls = self.shell('resolve_dept_cwd "" "dept name"', value='registered space', home=home_alias)
+        self.assertEqual(out, (str(self.home) + '\n').encode())
+        self.assertIn('절대경로가 아니다'.encode('utf-8'), self.last_stderr)
         for value in ('/', 'gone', ''):
             with self.subTest(value=value):
                 out, calls = self.shell('resolve_dept_cwd "missing" "dept name"', value=value, home=home_alias)
                 self.assertEqual(out, (str(self.home) + '\n').encode())
                 self.assertEqual(len(calls), 4)
+                self.assertIn(b"explicit cwd 'missing'", self.last_stderr)
+                # ★성찰 P4 ⓑ: 상대 등재값은 **부재로 취급**한다(호출자 cwd 에 좌우돼 부서 폴더가 이동한다) — 그 사실도 한 줄로.
+                if value == 'gone':
+                    self.assertIn('등재 cwd \'gone\' 는 절대경로가 아니다'.encode('utf-8'), self.last_stderr)
+                else:
+                    self.assertNotIn('절대경로가 아니다'.encode('utf-8'), self.last_stderr)
         out, calls = self.shell('resolve_dept_cwd "/" "dept name"', value=str(target), home=home_alias)
         self.assertEqual(out, (str(self.home) + '\n').encode())
         self.assertEqual(calls, [])
+        # 음성 대조: 루트 교정은 '못 쓴 값' 이 아니라 계약된 정규화다 — 경고 0(WARN 을 남발하면 아무도 안 읽는다)
+        self.assertEqual(self.last_stderr, b'')
+
+    def test_17b_tilde_registry_value_is_expanded_not_taken_literally(self):
+        """★성찰 P4 ⓑ(major · 2026-09-10): 카탈로그가 `"cwd": "~/work/sales"` 를 주면 종전엔 `expandvars` 만 거쳐
+        리터럴 `~/work/sales` 로 남았고 `[ -d ]` 가 거짓이라 **무경고 `$HOME`** 으로 접혔다(오설정 → 침묵). 읽는 쪽이
+        `~`·`~/x` 를 푼다 — 하위호환(종전 등재값은 전부 절대경로라 이 갈래를 타지 않는다)."""
+        (self.home / 'work').mkdir()
+        (self.home / 'work' / 'sales').mkdir()
+        out, _calls = self.shell('resolve_dept_cwd "" "dept name"', value='~/work/sales')
+        self.assertEqual(out, (os.path.realpath(self.home / 'work' / 'sales') + '\n').encode())
+        self.assertEqual(self.last_stderr, b'', '푼 값인데 경고를 냈다')
+        out, _calls = self.shell('resolve_dept_cwd "" "dept name"', value='~')
+        self.assertEqual(out, (os.path.realpath(self.home) + '\n').encode())
 
     def test_18_reg_get_field_strips_all_cr_without_losing_spaces(self):
         out, calls = self.shell('reg_get_field "department with spaces" account_dir', value='  /a\rb c  ')
@@ -3734,7 +3844,13 @@ class CodexR3Counterexamples(Base):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 expected = pf.claude_project_key(pf._resolve_catalog_cwd(value, home=self.home))
                 self.assertEqual(r.stdout, expected + '\n')
-                self.assertEqual(r.stderr, '')
+                # ★성찰 P4 ⓒ(2026-09-10): 값이 있었는데 **못 써서** $HOME 으로 접힌 것만 WARN 1줄이다 — 루트 교정(`/`·`///`·
+                #   `C:\`)은 계약된 정규화라 여전히 침묵이고, 부재 dir 은 이제 말한다(무경고 $HOME 이 오설정을 숨기던 자리).
+                if os.path.isabs(value) and not pf._is_root_cwd(value) and not os.path.isdir(value):
+                    self.assertIn("WARN", r.stderr)
+                    self.assertIn(value, r.stderr)
+                else:
+                    self.assertEqual(r.stderr, '')
                 self.assertTrue(os.path.isabs(expected))
                 root = self.shell_functions('_dept_cwd_is_root %s' % shlex.quote(value))
                 self.assertEqual(root.returncode, 0 if pf._is_root_cwd(value) else 1)
@@ -5805,18 +5921,34 @@ class TriageConvergence(TriageP1WP2Trust):
                              "부트 %d: 잔재가 남았다" % (boot + 1))
             self.assertEqual(_read_bytes(self.cfgfile), before, "거부 축인데 활성 바이트가 바뀌었다")
 
-    def test_conv_a_litter_from_another_cwd_is_still_preserved(self):
-        """음성 대조: 계획 대조 증명은 **같은 cwd 일반형**만 덮는다 — 다른 cwd 의 잔재(= 지금 계획과 다른 바이트)에
-        사용자 데이터가 들어 있으면 종전대로 격리한다(증명이 없으면 보존)."""
+    def test_conv_a_litter_from_another_cwd_is_dropped_only_when_lossless(self):
+        """★성찰 P12 재핀(major · 2026-09-10 · **의도적 방향 변경**). 종전 핀은 '다른 cwd 의 잔재는 바이트가 다르니
+        무조건 격리' 였는데, 그 축(바이트)에서는 **잃을 것이 하나도 없는** 사본이 좌석 수만큼 매 부트 conflict 로 쌓였다
+        (`changed` 가 매 부트 참이라 그 창이 좌석마다 다시 열린다 · 어느 자동 경로도 conflict 를 지우지 않는다).
+        축을 **구조**로 올린다: 시더가 스스로 다시 쓰는 `true` 플래그 차이만 흡수하고, 활성이 그 사본의 비재생성
+        데이터를 **전부** 담을 때만 지운다. 그래서 두 방향을 한 자리에서 잰다 —
+          ⓐ 다른 cwd 의 잔재라도 사용자 데이터가 활성에 그대로 있으면 지운다(누적 0)
+          ⓑ 활성이 **담지 않은** 사용자 데이터가 그 잔재에 있으면 종전대로 격리한다(증명이 없으면 보존)."""
         self.untrusted_file(self.ORIGINAL)
         other, _c, _k = pf.trust_plan(json.loads(self.ORIGINAL), "/some/other/cwd")
         foreign = json.dumps(other, ensure_ascii=False, indent=2).encode("utf-8")
         _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "ab12cd34"), foreign)
         r = self.seed()
+        self.assertEqual(self.names(pf.SEED_TRUST_CONFLICT_PREFIX), [],
+                         "무손실 잔재가 conflict 로 쌓였다 %s" % sorted(os.listdir(self.cfg)))
+        self.assertNotIn("stale-tmp preserved", r[2], r[2])
+        self.assertEqual(json.loads(_read_bytes(self.cfgfile))["user"], "ONLY-COPY", "활성이 사용자 데이터를 잃었다")
+        # ⓑ 음성 대조: 활성에 없는 사용자 필드(mcpServers)를 담은 잔재는 증명이 서지 않는다 → 격리
+        richer = json.loads(self.ORIGINAL)
+        richer["mcpServers"] = {"x": {"command": "y"}}
+        other2, _c2, _k2 = pf.trust_plan(richer, "/some/other/cwd")
+        foreign2 = json.dumps(other2, ensure_ascii=False, indent=2).encode("utf-8")
+        _write_bytes(os.path.join(self.cfg, pf.SEED_TRUST_TMP_PREFIX + "cd34ab12"), foreign2)
+        r2 = self.seed()
         kept = self.names(pf.SEED_TRUST_CONFLICT_PREFIX)
         self.assertEqual(len(kept), 1, os.listdir(self.cfg))
-        self.assertIn("stale-tmp preserved", r[2], r[2])
-        self.assertEqual(_read_bytes(os.path.join(self.cfg, kept[0])), foreign)
+        self.assertIn("stale-tmp preserved", r2[2], r2[2])
+        self.assertEqual(_read_bytes(os.path.join(self.cfg, kept[0])), foreign2)
 
     def test_conv_flag_only_scope_is_pinned_and_a_declined_flag_is_kept(self):
         """★수렴 R2(최종 리뷰 claude minor) — '플래그뿐 문서' 통의 **실제 범위** 검체(문면을 술어에 맞춘 뒤의 고지).
