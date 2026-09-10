@@ -43,10 +43,24 @@ HOOK = PACK / "hooks" / "role-capability-gate.sh"
 LIB = PACK / "hooks" / "_lib.sh"
 sys.dont_write_bytecode = True
 
-SH = shutil.which("sh") or shutil.which("bash")
+# ★A2(v0.14.33 · 2026-09-11 · 우분투 레인 첫 실행이 잡은 두 번째 비대칭): **bash 를 먼저** 찾는다.
+#   종전 `which("sh") or which("bash")` 는 macOS 에서만 맞는 코드였다 — 거기선 `/bin/sh` 가 곧
+#   bash(3.2)라 `sh` 를 잡아도 bash 를 잰 셈이었다. 우분투에서 `/bin/sh` 는 **dash** 이고 dash 에는
+#   중괄호 확장도 `$'…'`(ANSI-C 인용)도 **없다**. 그래서 이 파일의 `bash_words` 가 세우는 "선행 사실"
+#   (= bash 가 그 조각을 어떤 인자들로 펼치는가)이 리눅스에서 거짓이 돼 4건이 붉었다.
+#   두 가지가 함께 틀렸다:
+#     ① `bash_words` 는 이름 그대로 **bash 의 단어분리**를 재야 한다 — 그것이 이 검체들이 방어하려는
+#        위협 모델이다(에이전트의 Bash 도구가 bash 로 펼친 뒤 훅이 그 문자열을 본다).
+#     ② 판정 대상 훅 `role-capability-gate.sh` 의 셔뱅이 `#!/usr/bin/env bash` 다 — 실기는 bash 로
+#        돈다. dash 로 부르던 종전 호출은 실기와 다른 세계에서 잰 것이다(우연히 통과했을 뿐).
+#   한 줄로 둘 다 닫는다. macOS 에서는 `which("bash")` 가 `/bin/bash`(3.2) = 종전 `/bin/sh` 와 같은
+#   바이너리라 **로컬 거동 변화 0**(실측)이고, 우분투에서만 dash → bash 로 바뀐다.
+#   ※ `test_completion_guard_notice.py` 는 그대로 `sh` 를 쓴다 — 그쪽 훅은 셔뱅이 `#!/bin/sh` 인
+#     진짜 POSIX 스크립트라 sh 로 재는 것이 맞다(여기서 같이 바꾸면 그 검체를 약화한다).
+SH = shutil.which("bash") or shutil.which("sh")
 # 셸이 없으면(이론상 Windows 비-GitBash) 이 파일은 통째로 건너뛴다 — 없는 셸을 부르는 것보다
 # '재지 못했다'를 드러내는 것이 낫다(판정 불능은 통과가 아니다).
-NEED_SH = unittest.skipIf(not SH, "sh 부재 — 셸 종단 검체 실행 불가")
+NEED_SH = unittest.skipIf(not SH, "bash·sh 모두 부재 — 셸 종단 검체 실행 불가")
 
 
 CACHE_DIR_NAME = "cys-role-authority.d"
