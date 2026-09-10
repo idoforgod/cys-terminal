@@ -19325,6 +19325,35 @@ mod tests {
         }
     }
 
+    /// ★(2026-09-10 · ci-branch 첫 실행에서 실측 · gh run 34461244910 최초+재실행 둘 다 동일
+    ///   검체군 결정론 실패) `reclaim_seat`/`reclaim_caller` 가 띄우는 PTY 좌석은 **로그인
+    ///   셸**(`-l`)이다 — 프로필 로딩(`path_helper` 등)이 실제 자손 프로세스를 잠깐 띄웠다
+    ///   접는 **과도기 창**이 있다. `seat_claimable_now()`는 그 순간의 실 프로세스표를 그대로
+    ///   재는 정책 함수라(느슨하게 만들면 안 된다 — 판정 로직은 이 검체가 아니라 프로덕션
+    ///   호출부의 계약이다), 스폰 직후 곧바로 재면 그 과도기를 Occupied 로 오관측할 수 있다.
+    ///   로컬 실측(같은 커밋 · macOS · 1284 passed 0 failed)에서는 이 창이 감지 임계 아래로
+    ///   좁아 안 보였고, GitHub Actions macOS 러너(자원 제약으로 셸 프로필 로딩이 더 걸린다)
+    ///   에서는 두 번의 독립 실행 모두 같은 검체군이 실패해 **결정론적으로** 걸렸다 — 임의
+    ///   노이즈가 아니라 픽스처가 실제 정착을 기다리지 않는 타이밍 결함이다.
+    ///   그래서 판정 로직은 하나도 바꾸지 않고 **픽스처가 실제로 정착할 때까지 기다리는** 쪽만
+    ///   고친다: 생산 코드의 `seat_claimable_now`(governance.rs)를 그대로 재사용해 폴링하고,
+    ///   그 함수가 "예"(=Empty·claimable) 라고 답하거나 상한(2s)에 닿을 때까지만 기다린다.
+    ///   상한에 닿아도 예외를 던지지 않는다 — 여전히 정착 못 한 형상이라면 그 자체가 검체가
+    ///   재려는 실패이고, 조용히 숨기지 않고 그대로 단언 실패로 드러나야 한다.
+    fn wait_seat_settled(daemon: &Arc<Daemon>, sid: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let claimable = daemon
+                .get_surface(sid)
+                .map(|s| governance::seat_claimable_now(&s))
+                .unwrap_or(false);
+            if claimable || std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// 역할을 쥔 **빈 좌석**을 만든다(seat_cache=Empty · agent_meta 없음).
     /// 역할을 쥔 **빈 좌석**을 만든다. `cfg=None` = 데몬이 스스로 해소한 계정 dir(호출자와 같은
     /// 계정) · `Some(_)` = 명시 오버라이드(다른 계정 · 음성 대조용).
@@ -19359,6 +19388,11 @@ mod tests {
         daemon.roles.lock().unwrap().insert(role.to_string(), s.id);
         s.seat_cache
             .store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
+        // ★타이밍 수리(위 wait_seat_settled 문서 참조) — 캐시는 이미 Empty 로 세팅했지만
+        //   seat_claimable_now() 는 캐시를 보지 않고 그 순간의 실 프로세스표를 다시 잰다.
+        //   로그인 셸 프로필 로딩이 아직 자손을 그리는 과도기에 이 함수가 반환하면, 뒤이은
+        //   reclaim RPC 가 그 과도기를 관측해 seat_not_claimable 로 오판한다.
+        wait_seat_settled(daemon, s.id);
         s.id
     }
 
