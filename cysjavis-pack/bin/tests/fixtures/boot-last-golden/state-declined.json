@@ -11,7 +11,7 @@
    "step": "③claim-role",
    "exit": 1,
    "detail": "<detail>",
-   "order": 6
+   "order": 7
   }
  ],
  "retry": {},

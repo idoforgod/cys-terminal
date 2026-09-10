@@ -116,7 +116,16 @@ check("W1 launch 배선", src.count("dept_tombstone_remove \"$name\"") >= 3,
 #   그 배선의 **표현**만 갈아탄다. 근거(라이브 실측 2026-09-08 05:2x): dept-2 cysd(pid 2634)와
 #   그 좌석 3기(4147/5087/7981)가 `CYS_DEPT_ROTATE=1` 을 상속하고 있어서, 종전 표식은 그 부서의
 #   모든 pane 에서 이 가드와 단일소유 게이트를 **영구히 껐다**(정본 §3-4 "게이트를 끄는 노브 없음").
-check("W2 rotate 가드(argv 표식)", 'bash "$0" launch "$name" --rotate' in src)
+# ★성찰 P1 재핀(blocking · 2026-09-10 · **기전 변경**): 재기동은 이제 **자식 프로세스가 아니라 같은 프로세스 안**이다.
+#   종전 `bash "$0" launch "$name" --rotate` 는 프리루드·단일소유 게이트를 처음부터 다시 돌았고, 자기 부서를 rotate 하는
+#   CSO(stale env=master · 실제 역할=cso)는 부모가 데몬 권위로 통과한 뒤 **그 데몬을 죽였으므로** 자식이 권위를 잃고
+#   env 절(master≠cso)에서 exit 7 로 끝났다 — 부서가 내려간 채 등재만 남는 반파괴다. 인가는 파괴 전에 끝났으니 그 인가
+#   아래에서 생애주기를 완결한다. 핀의 의도("rotate 재귀에서 묘비를 건드리지 않는 배선이 소실되지 않았는가")는 그대로고
+#   표현만 갈아탄다: 비상속 표식 `_CYS_ROTATE_SELF` 는 서브셸 지역이라 자식 cysd·좌석에 새지 않는다.
+check("W2 rotate 재기동은 프로세스 내부 호출(argv 표식 → 서브셸 지역 표식)",
+      '( _CYS_ROTATE_SELF=1; launch_dept "$name" )' in src and "launch_dept(){" in src)
+_src_code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))   # 주석 속 인용은 반례가 아니다
+check("W2b ★자식 재exec 부활 금지(권위 상실 축)", 'bash "$0" launch' not in _src_code)
 check("W3 helper rotate 가드", '[ "${_CYS_ROTATE_SELF:-}" = "1" ] && return 0' in src)
 # ★반례(신설): 상속되는 표식으로 되돌아가면 즉시 적색.
 check("W3b ★상속 env 표식 부활 금지", "CYS_DEPT_ROTATE=1 bash" not in src)

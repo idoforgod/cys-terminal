@@ -281,7 +281,7 @@ usage: cys-dept <verb> ...
   cys-dept promote-if-pending [--request-only]  보류 승격 해소(알림만=--request-only)
   cys-dept list                                 부서명 목록
   cys-dept sock <name>                          부서 소켓 경로 출력
-  cys-dept cwd <name>                           부서 좌석 cwd 출력(등재 cwd → $HOME · 절대·물리 · 읽기 전용 · 미등재 exit 3)
+  cys-dept cwd <name>                           부서 좌석 등재 cwd 출력(절대·물리 · 읽기 전용 · 미등재 exit 3 · 등재 cwd 없음/사용 불가 exit 4 — $HOME 을 확정값으로 내지 않는다)
   cys-dept <name> -- <cmd>                      부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
 USAGE
 }
@@ -796,18 +796,35 @@ _dept_cwd_is_root(){
   case "$t" in [A-Za-z]:) return 0 ;; esac
   return 1
 }
+# ★성찰 P4(major): `depts.json` 의 `cwd` 는 쓰는 쪽이 셋(launch 무기록 · allocate 정규값 · create 카탈로그 원값)이라 계약이 갈렸고
+#   `~` 미전개가 오설정을 **침묵**으로 바꿨다(카탈로그 `"cwd": "~/work/sales"` 가 리터럴로 남아 `[ -d ]` 거짓 → 무경고 $HOME · 종전엔
+#   '셸 생성 실패' 라는 가시적 실패였다). 읽는 쪽이 계약을 지킨다(하위호환 · 종전 등재값은 전부 절대):
+#   ⓐ `~`·`~/x` 는 우리가 푼다(명시·등재 모두) ⓑ 등재값은 **절대경로만** 인정(상대값은 호출자 cwd 에 좌우돼 부서 폴더가 이동한다 —
+#   부재로 취급) ⓒ 값이 있었는데 못 썼으면 WARN 1줄(stderr · 침묵 0) ⓓ `--registered-only`(cwd verb): 등재값만 — 없으면 빈 출력·rc 1
+#   ($HOME 폴백은 launch 의 결정이지 '확정값' 이 아니다). 쓰는 쪽은 launch 가 확정값을 등재한다(launch 갈래 주석).
 resolve_dept_cwd(){
-  local explicit="$1" name="${2:-}" c r src
+  local explicit="$1" name="${2:-}" mode="${3:-}" c r src
   for src in explicit registry; do
-    if [ "$src" = explicit ]; then c="$explicit"
+    if [ "$src" = explicit ]; then
+      [ "$mode" = "--registered-only" ] && continue
+      c="$explicit"
     else c="$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; fi
     [ -n "$c" ] || continue
+    case "$c" in "~") c="$HOME" ;; "~/"*) c="$HOME/${c#\~/}" ;; esac
     _dept_cwd_is_root "$c" && c="$HOME"
+    if [ "$src" = registry ]; then
+      case "$c" in
+        /*|[A-Za-z]:[/\\]*) ;;
+        *) echo "[cys-dept] WARN: ${name} 등재 cwd '$c' 는 절대경로가 아니다 — 부재로 취급(등재값을 고쳐라 · 상대값은 호출자 cwd 에 좌우된다)" >&2; continue ;;
+      esac
+    fi
     if [ -d "$c" ]; then
       r="$(_dept_cwd_canon "$c")"
       [ -n "$r" ] && ! _dept_cwd_is_root "$r" && { printf '%s\n' "$r"; return 0; }
     fi
+    echo "[cys-dept] WARN: ${src} cwd '$c' 를 쓸 수 없다(부재 dir)${name:+ · $name} — 다음 후보로 내려간다(등재값 → \$HOME · 최종 폴백이면 좌석이 홈에서 뜬다 · 값을 고쳐라)" >&2
   done
+  [ "$mode" = "--registered-only" ] && return 1
   r="$(_dept_cwd_canon "$HOME")"
   printf '%s\n' "${r:-$HOME}"; return 0
 }
@@ -1250,6 +1267,18 @@ cysd_resolved_role() {   # stdout: "<역할>\t<출처>" · 실패해도 항상 r
     if [ "${CYS_RESOLVED_ROLE_SOURCE:-}" = "env-cys-role" ] && [ "${CYS_ROLE:-}" = "cso" ]; then
       cys_resolve_role --no-cache >/dev/null 2>&1 || :
     fi
+    # ★성찰 P13(minor): `cache-none`(디스크 캐시의 '역할 없음' 레코드)도 **거부 방향으로만** 권위인데 같은 함수의 다른 캐시
+    #   갈래와 달리 재확인이 없었다 — 60초 전 데몬 무응답이 남긴 `- ` 한 줄이 데몬 정상화 뒤에도 TTL 동안 CSO 의 lifecycle
+    #   을 막았다. env 가 역할을 주장할 때만 한 번 더 **직접** 묻는다. 허용 추가 0: 재확인이 살아 있는 데몬의 답(daemon ·
+    #   daemon-none)을 얻지 못하면 cache-none 판정을 그대로 되돌린다(데몬이 여전히 모르거나 죽어 있으면 종전대로 거부).
+    if [ "${CYS_RESOLVED_ROLE_SOURCE:-}" = "cache-none" ] && [ -n "${CYS_ROLE:-}" ]; then
+      _p13_role="${CYS_RESOLVED_ROLE:-}"; _p13_src="${CYS_RESOLVED_ROLE_SOURCE:-}"
+      cys_resolve_role --no-cache >/dev/null 2>&1 || :
+      case "${CYS_RESOLVED_ROLE_SOURCE:-}" in
+        daemon|daemon-none) ;;
+        *) CYS_RESOLVED_ROLE="$_p13_role"; CYS_RESOLVED_ROLE_SOURCE="$_p13_src" ;;
+      esac
+    fi
     printf '%s\t%s\n' "${CYS_RESOLVED_ROLE:-}" "${CYS_RESOLVED_ROLE_SOURCE:-}"
   ) 2>/dev/null
   return 0
@@ -1310,7 +1339,10 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
       # env 가 비었으면 GUI·오너 직접 실행(종전 면제 그대로)이고, env 가 역할을 주장하는데
       # 데몬이 '역할 없음'이라고 답했으면 그 주장은 stale 이다 — 그때만 막는다.
       [ -z "${CYS_ROLE:-}" ] && return 0
-      echo "[cys-dept] ★단일소유 강제: $1 — 데몬이 이 좌석의 역할을 모른다(CYS_ROLE=$CYS_ROLE 는 stale). \`cys claim-role cso\` 로 역할을 되찾은 뒤 재시도하라." >&2
+      # ★성찰 P9: 종전 처방 `cys claim-role cso` 는 **같은 stale 신원**(CYS_SURFACE_ID)을 다시 써서 같은 이유로 거절됐다 —
+      #   좌석은 자기 env 를 못 고치므로(SessionStart 는 부모 env 를 못 고친다) lifecycle 경로가 영구히 닫혔다. `--surface` 없이
+      #   되는 명령을 권하지 않는다: 실제 id 를 지목하거나 CONTRACTS §C 의 `reclaim-role --auto` 를 쓴다.
+      echo "[cys-dept] ★단일소유 강제: $1 — 데몬이 이 좌석의 역할을 모른다(CYS_ROLE=$CYS_ROLE · CYS_SURFACE_ID=${CYS_SURFACE_ID:-없음} 는 stale — 데몬 목록에 없는 신원). 복구: \`cys reclaim-role --auto\` 또는 \`cys claim-role cso --surface <cys list 로 확인한 실제 id>\` (--surface 없는 claim-role 은 같은 stale 신원을 다시 쓴다)." >&2
       exit 7 ;;
     *) cysd_env_clause "$1"; return 0 ;;   # 판정 불가·주소 없음·프리루드 부재 → 종전 env 판정만
   esac
@@ -1329,9 +1361,11 @@ case "$cmd" in
     [ "${2:-}" != "--request-only" ] && cysd_role_gate "promote-if-pending(대기형)은 CSO/GUI 전용"
     : ;;
 esac
-case "$cmd" in
-  launch)
-    name="${2:-}"
+# ★성찰 P1(blocking): launch **본체**를 함수로 뗀다 — 단일소유 게이트·프리루드 **밖**이다. rotate 가 자식 프로세스(`bash "$0" launch
+#   <name> --rotate`) 대신 **같은 프로세스 안**에서 이 함수를 부른다(아래 rotate 갈래 주석). `launch)` 갈래는 종전과 바이트 동일한
+#   동작(게이트 → 이 함수)이고, 본체의 `exit N` 규약도 그대로다(rotate 는 서브셸로 감싸 그 exit 를 rc 로 받는다).
+launch_dept(){   # $1=name
+    name="${1:-}"
     # ★D3(i): name 확보 직후·일체 부작용(dept_sock 산출·mkdir·reg_upsert) 이전 검증 — 빈/미지정 포함
     #   전부 exit 2. rotate 재귀(`--rotate`)에도 검증 유지(rotate 진입부 사전 검증과 이중 방어).
     #   slug 충돌도 부작용 이전 조기 거부(reg_upsert 진입부 검사와 공통 헬퍼 — 기존명 재-launch는 자기
@@ -1347,6 +1381,16 @@ case "$cmd" in
     #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
     acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)"
     dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")"   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
+    # ★성찰 P4 ⓐ: launch 는 종전에 cwd 를 **해소만 하고 기록하지 않았다** — `CYS_DEPT_CWD=/proj cys-dept launch d` 뒤의 다음
+    #   launch/rotate(부트 체인·GUI 재기동)는 등재값이 없어 $HOME 으로 조용히 이주했고 `cys-dept cwd` 도 그 거짓값을 내줬다.
+    #   확정값을 등재한다 — 단 ① 명시값이 **채택**됐을 때(확정값 = 명시값의 물리 경로) 또는 ② 등재값이 아예 없을 때만.
+    #   등재값이 있는데 못 써서 $HOME 으로 폴백한 경우는 덮지 않는다(오설정을 영구화하지 않는다 · WARN 은 resolve_dept_cwd 가 낸다).
+    _lc_expl="${CYS_DEPT_CWD:-}"
+    case "$_lc_expl" in "~") _lc_expl="$HOME" ;; "~/"*) _lc_expl="$HOME/${_lc_expl#\~/}" ;; esac
+    if { [ -n "$_lc_expl" ] && [ "$dept_cwd" = "$(_dept_cwd_canon "$_lc_expl")" ]; } \
+       || [ -z "$(reg_get_field "$name" cwd 2>/dev/null | tail -1)" ]; then
+      reg_set_field "$name" cwd "$dept_cwd" || echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2
+    fi
     if [ -n "$acctdir" ]; then
       mkdir -p "$acctdir" 2>/dev/null || true
       [ -d "$acctdir" ] || { echo "[cys-dept] ERROR: $name account dir 사용 불가($acctdir) — fail-closed(비격리 기동 금지)" >&2; exit 5; }
@@ -1402,6 +1446,11 @@ case "$cmd" in
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
     formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none} cwd=$dept_cwd). 부서 수=$(reg_count)"
+}
+
+case "$cmd" in
+  launch)
+    launch_dept "${2:-}"
     ;;
   allocate)
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
@@ -1552,7 +1601,8 @@ dep=d['departments'].get(key)
 if not dep: sys.exit(4)
 acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
 # 탭 구분(codex 비차단 하드닝): display/cwd 에 공백 있어도 필드 안 깨짐(공백필드 취약성 제거)
-print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expandvars(dep['cwd'])]))
+# ★성찰 P4: `~` 도 푼다(expandvars 만으로는 `~/work/sales` 가 리터럴로 남아 [ -d ] 거짓 → 무경고 $HOME 이 됐다)
+print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expanduser(os.path.expandvars(dep['cwd']))]))
 PY
 ) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
     # 부서별 config dir 분리(제품 기본 절차): primary(공유) 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
@@ -1835,7 +1885,14 @@ PY
     # `--rotate`(argv · 비상속): launch의 dept_tombstone_remove를 no-op으로 — rotate=묘비 불변
     # 계약(WP-3). ★0.14.31 P6 R1: 종전 `CYS_DEPT_ROTATE=1` env 는 자식 cysd·그 좌석 전부에
     # 상속돼 그 부서의 단일소유 게이트와 묘비 해소를 영구히 껐다(라이브 실측). argv 는 안 샌다.
-    bash "$0" launch "$name" --rotate || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
+    # ★성찰 P1(blocking · codex + phase2 DEFERRED 'self-rotate 경합' 해소): 재기동은 **자식 프로세스가 아니라 이 프로세스 안**에서.
+    #   종전 `bash "$0" launch <name> --rotate` 는 프리루드·단일소유 게이트를 처음부터 다시 돌았고, 자기 부서를 rotate 하는
+    #   CSO(stale env=master · 실제 역할=cso)는 부모가 데몬 권위로 통과한 뒤 **그 데몬을 죽였으므로** 자식은 권위를 잃고 env 절
+    #   (master≠cso)에서 exit 7 — 부서는 내려간 채 등재만 남았다(반파괴). 인가는 파괴 전에 끝났다: 그 인가 아래에서 생애주기를
+    #   완결한다. 위조 가능한 env·argv 승인 표식은 추가하지 않는다 — 서브셸이 게이트를 다시 묻지 않을 뿐이고, `_CYS_ROTATE_SELF=1`
+    #   은 묘비 불변(WP-3 `dept_tombstone_remove` no-op)의 내부 표식으로만 쓰인다(서브셸 지역 · 자식 cysd·좌석에 상속 0).
+    #   서브셸인 이유: 본체의 `exit N` 이 이 프로세스를 끝내지 않게(실패 사유 1줄 + exit 1 은 종전과 같다).
+    ( _CYS_ROTATE_SELF=1; launch_dept "$name" ) || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
     newver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
     # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
     echo "rotated $name: v${oldver:-?}→v${newver:-?}"
@@ -1979,8 +2036,12 @@ EOF
     if ! reg_names 2>/dev/null | grep -Fxq -- "$name"; then
       echo "[cys-dept] cwd: 미등재 부서 '$name'(또는 레지스트리 판독 불가)" >&2; exit 3
     fi
-    resolve_dept_cwd "" "$name"
-    exit 0 ;;
+    # ★성찰 P4: $HOME 폴백을 **확정값으로 내주지 않는다** — 등재 cwd 가 없거나 못 쓰면 exit 4(stdout 0). 소비자(편성 심박 · P3)는
+    #   --cwd 를 생략해 종전 동작(데몬 cwd → 기동기 루트 교정)으로 떨어진다. launch 가 확정값을 등재하므로(P4 ⓐ) 한 번이라도 뜬
+    #   부서는 여기서 값을 얻는다. 미등재 부서 exit 3 은 그대로.
+    if _c="$(resolve_dept_cwd "" "$name" --registered-only)" && [ -n "$_c" ]; then printf '%s\n' "$_c"; exit 0; fi
+    echo "[cys-dept] cwd: $name 등재 cwd 없음/사용 불가 — 확정값 없음(\$HOME 폴백은 launch 의 결정이지 이 verb 의 값이 아니다 · exit 4)" >&2
+    exit 4 ;;
   sock)
     name="${2:-}"
     # ★D3(i): sock은 read-only(방송 fan-out 루프 `sock "$d"` 호출부)라 기존 등재의 레거시 비정형명

@@ -2031,15 +2031,28 @@ def stage_g2_ack(socket, role, surface, stub):
 
 # ------------------------------------------------------------------ restore 상태머신
 
-def _acquire_restore_lease(socket):
-    """★W2 restore lease: 단일 restore-in-progress 파일락 — 콜드부트 auto-restore와 deploy
-    오케스트레이션이 동시에 restore를 돌려 같은 역할을 이중 스폰하는 TOCTOU를 차단한다.
-    반환 (ok, handle): ok=False 는 '다른 restore가 진행 중 → 중복 skip'. ok=True 면 진행하되
-    handle(열린 파일객체)를 함수 끝까지 살려 락을 유지해야 한다(fail-open 시 handle=None).
-    ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows 전면 fail-open(P1-8: auto+수동
-    restore 이중 스폰)을 제거. 락 기구 미가용만 fail-open."""
+# ★성찰 P10(major · 2026-09-10): 락이 **두 겹**이다. 하나로 겸하던 것이 결함의 축이었다.
+#   · `restore.run.lock`(신설) = restore ↔ restore 배타. 저널을 읽고 쓰는 전 구간을 직렬화한다 —
+#     이중 스폰뿐 아니라 **이전 실행의 후행 쓰기 경합**(A 가 ④에서 관측·재주입하는 동안 B 가 다른
+#     티켓으로 같은 역할을 다시 target 으로 잡는 것)까지 이 락이 막는다.
+#   · `restore.lease`(기존 · **cysd 가 읽는 축**) = `src/bin/cysd/reclaim.rs` 의 `try_hold_restore_lease`
+#     가 잡아 보는 바로 그 파일이고, 잡히면 `role.reclaim_auto` 는 후보 계산 **앞에서** 하드 Defer 다.
+#     그 근거("부활이 도는 중이면 무엇을 고르든 그 결정은 낡았다")가 실제로 성립하는 구간은 **스폰**이다 —
+#     ④ 역할별 하위 단계(관측 폴링·재주입·재검증)는 토폴로지를 바꾸지 않는데, F-1 이 그 구간을 역할당
+#     6회×1.5s(재관측이면 2 pass)로 늘리면서 lease 보유가 역할 수에 비례해 커졌다(8역할이면 sleep 만
+#     5×1.5×2×8=120초). 그 창에서 시작한 좌석은 결합 0 = `external:N`(감사 §2 에러 2 의 결과).
+#     그래서 이 lease 는 **④ 진입 직전에 놓는다**(스폰 구간만 배타 · restore 끼리의 배타는 run.lock 이 잇는다).
+#   고지(닫지 못한 것): ②③ 도중에 이미 Defer 로 끝난 훅은 **조기 해제 뒤에도 스스로 재결합하지 않는다** —
+#   그것은 reclaim 쪽 유계 재시도(fix-plan P10 ⓑ · `src/bin/cysd/reclaim.rs`)의 몫이고 이 파일 밖이다.
+#   구버전 phoenix 와의 혼재도 run.lock 으로는 못 막는다 — 그래서 lease 자체의 획득 검사는 그대로 남긴다.
+_RESTORE_LEASE_HANDLE = None      # 공유(cysd 가독) lease 핸들 — ④ 직전 조기 해제의 단일 소유자
+
+
+def _acquire_lock_file(socket, name):
+    """`<phoenix_home>/<name>` 을 비블로킹 파일락으로 잡는다 → (ok, handle).
+    ok=False 는 '다른 실행이 보유 중 → 중복 skip'. handle=None 은 락 기구 미가용(fail-open)."""
     try:
-        lease_path = os.path.join(phoenix_home(socket), "restore.lease")
+        lease_path = os.path.join(phoenix_home(socket), name)
         f = open(lease_path, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
     except Exception:
         return True, None  # 락 파일 생성 실패 = 게이트 없이 진행(가용성 우선 fail-open)
@@ -2058,6 +2071,37 @@ def _acquire_restore_lease(socket):
             time.sleep(0.5)
     f.close()
     return False, None      # 다른 restore 가 계속 보유 중 — 중복 인지 skip(종전 계약)
+
+
+def _acquire_restore_lease(socket):
+    """★W2 restore lease(공유 축 · **cysd 가독**): 콜드부트 auto-restore와 deploy 오케스트레이션이
+    동시에 restore를 돌려 같은 역할을 이중 스폰하는 TOCTOU를 차단한다. `reclaim.rs` 도 이 파일을
+    잡아 보고, 잡히면 SessionStart 의 `role.reclaim_auto` 가 하드 Defer 한다(위 P10 주석).
+    반환 (ok, handle): ok=False 는 '다른 restore가 진행 중 → 중복 skip'. ok=True 면 진행하되
+    handle(열린 파일객체)를 **스폰 구간 끝까지** 살려 락을 유지해야 한다(fail-open 시 handle=None).
+    ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows 전면 fail-open(P1-8: auto+수동
+    restore 이중 스폰)을 제거. 락 기구 미가용만 fail-open."""
+    return _acquire_lock_file(socket, "restore.lease")
+
+
+def _acquire_restore_run_lock(socket):
+    """★성찰 P10: restore ↔ restore **전 구간** 배타(cysd 는 이 파일을 모른다 — 그래서 reclaim 을 막지 않는다).
+    `restore.lease` 를 ④ 직전에 놓아도 두 restore 가 겹치지 않는 것은 이 락이 보증한다."""
+    return _acquire_lock_file(socket, "restore.run.lock")
+
+
+def _release_shared_restore_lease(why=""):
+    """공유 lease(`restore.lease`)를 **한 번만** 놓는다(멱등 · 이미 놓았으면 무동작).
+    ★성찰 P10: 스폰 구간이 끝나면 cysd 가독 축을 즉시 비운다 — 그래야 그 뒤에 시작하는 좌석의
+    `role.reclaim_auto` 가 Defer 로 끝나지 않는다. restore 끼리의 배타는 `restore.run.lock` 이 잇는다."""
+    global _RESTORE_LEASE_HANDLE
+    h, _RESTORE_LEASE_HANDLE = _RESTORE_LEASE_HANDLE, None
+    if h is None:
+        return False
+    _release_lease(h)
+    log("★restore lease(공유 축) 조기 해제 — 스폰 구간 종료%s. 이후 구간은 restore.run.lock 으로만 배타한다"
+        % ((" · " + why) if why else ""))
+    return True
 
 
 def _release_lease(handle):
@@ -2097,14 +2141,47 @@ def c6_reap_stale_surfaces(socket):
     return {"detected": detected, "reaped": reaped, "reap_failed": failed}
 
 
+def _lease_held_out(print_result, which):
+    """LEASE_HELD 결과 dict(두 락의 공용 문안 — 소비자 계약은 `phoenix_restore` 하나다)."""
+    out = {"phoenix_restore": "LEASE_HELD",
+           "note": "다른 restore가 진행 중 — 이중 스폰 방지 위해 이번 호출은 skip(멱등)."}
+    log("★restore %s 보유 중(다른 restore 진행) — 중복 skip." % which)
+    if print_result:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=None,
                 include_master=False, stub_sids=None, print_result=True):
     """부활 저널 상태머신 본체(재사용 가능한 함수). cmd_restore(CLI)와 cmd_deploy(restore 단계)가 이 하나를
     공유한다 — P2 재사용 제1원칙(신규 부활 엔진을 만들지 않는다·코드 복제 금지). print_result=False 면 결과
-    dict 만 반환하고 stdout 에 출력하지 않는다(deploy 가 단일 JSON 레코드로 감싸 출력할 때 사용)."""
-    global _ACTIVE_EPOCH
-    # ★W2 restore lease: 동시 restore(콜드부트 auto vs deploy) 이중 스폰 차단. 먼저 획득해
-    # breaker·spawn 전체를 직렬화한다. 다른 restore 진행 중이면 즉시 중복 skip(무해).
+    dict 만 반환하고 stdout 에 출력하지 않는다(deploy 가 단일 JSON 레코드로 감싸 출력할 때 사용).
+
+    ★성찰 P10(major): 이 껍데기는 **restore ↔ restore 전 구간 배타**(`restore.run.lock`)만 담당한다 —
+    본체(`_run_restore_locked`)는 그 안에서 돌고, `finally` 가 두 락을 **함수 반환 시점에** 놓는다
+    (종전엔 atexit 뿐이라 같은 프로세스의 두 번째 restore 가 자기 락에 막혔다). cysd 가 읽는 축
+    (`restore.lease`)은 본체가 스폰 구간 끝에서 먼저 놓는다."""
+    _run_ok, _run_handle = _acquire_restore_run_lock(socket)
+    if not _run_ok:
+        return _lease_held_out(print_result, "run.lock")
+    if _run_handle is not None:
+        atexit.register(lambda h=_run_handle: _release_lease(h))   # 예외·sys.exit 경로의 2차 방어
+    try:
+        return _run_restore_locked(socket, ticket=ticket, stub=stub, no_breaker=no_breaker, roles=roles,
+                                   include_master=include_master, stub_sids=stub_sids, print_result=print_result)
+    finally:
+        # 본체가 ④ 앞에서 접혔으면 공유 lease 가 아직 남아 있다 — 여기서 확실히 놓는다(멱등).
+        _release_shared_restore_lease("run_restore 종료")
+        if _run_handle is not None:
+            _release_lease(_run_handle)
+
+
+def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, roles=None,
+                        include_master=False, stub_sids=None, print_result=True):
+    """`run_restore` 본체 — `restore.run.lock` 을 보유한 상태에서만 불린다(그 껍데기가 유일 호출자)."""
+    global _ACTIVE_EPOCH, _RESTORE_LEASE_HANDLE
+    # ★W2 restore lease(공유 축 · cysd 가독): 동시 restore 이중 스폰 차단 + reclaim 의 Defer 근거.
+    #   구버전 phoenix 는 run.lock 을 모르고 이 파일만 잡는다 — 그 혼재를 막는 것은 이 검사뿐이므로 남긴다.
     _lease_ok, _lease_handle = _acquire_restore_lease(socket)
     if not _lease_ok:
         out = {"phoenix_restore": "LEASE_HELD",
@@ -2116,6 +2193,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     # ★P2-7/W1: lease 핸들을 atexit 로 확실히 해제 등록(예외·sys.exit 경로에서도 flock 이 남지 않게).
     #   flock 은 fd close 시 자동 해제되지만, 프로세스가 살아있는 채 다음 restore 를 부르는 경로(deploy 중첩)
     #   에서 GC 타이밍에 의존하지 않도록 명시 해제한다. handle=None(fail-open)이면 등록 불요.
+    _RESTORE_LEASE_HANDLE = _lease_handle      # ★성찰 P10: 조기 해제의 단일 소유자(멱등 해제)
     if _lease_handle is not None:
         atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
@@ -2424,6 +2502,13 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     save_journal(socket, ticket, j)
 
     # ── 역할별 하위 단계: ready → resume → reinject → g2_ack → verify ──
+    # ★성찰 P10(major): 여기부터는 **토폴로지를 만들지 않는다**(관측 폴링·재주입·재검증뿐) — 그런데 F-1 이
+    #   이 구간을 역할당 6회×1.5s(재관측이면 2 pass)로 늘리면서, cysd 가 읽는 `restore.lease` 보유가 역할
+    #   수에 비례해 커졌고 그 창에서 시작한 좌석은 `role.reclaim_auto` 가 후보 계산 앞에서 하드 Defer 로
+    #   끝나 역할 결합 0(= `external:N` · 감사 §2 에러 2 의 결과)이 됐다. 스폰이 끝났으므로 공유 축을 놓는다.
+    #   restore 끼리의 배타는 `restore.run.lock` 이 이 함수 끝까지 잇는다(이중 스폰·후행 쓰기 경합 0).
+    #   고지: ②③ 도중에 **이미 Defer 로 끝난** 훅은 이 해제로 되살아나지 않는다 — reclaim 쪽 유계 재시도의 몫.
+    _release_shared_restore_lease("spawn 완료 · 이후는 관측/재주입/재검증")
     for role in pending:
         surface = role_surface.get(role)
         if not surface:

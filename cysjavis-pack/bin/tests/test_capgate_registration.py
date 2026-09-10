@@ -860,5 +860,52 @@ class TriageRegistrationGaps(_CapgateEnv):
                         "계측 타당성 실패: 해제가 실패했으면 범위는 그대로여야 한다: %s" % doc)
 
 
+class CapgateDenyResidualMarker(_CapgateEnv):
+    """★성찰 P11(2026-09-10) — deny 프로필 **해제 실패**를 '등록 반영 완료' 로 처리하면 미해소
+    표식이 지워지고 다음 부팅의 fast path 가 C28 을 생략한다(그 프로필은 범위 밖 게이트를 문 채
+    굳는다). ON 완료 조건에 **deny 프로필 잔존 등록 0** 이 들어가야 한다.
+    교차: pack-capgate-role G9(같은 표식·같은 완료 조건 계약)."""
+
+    DENY_TABLE = {"schema_version": 1, "policy": {"unknown_profile": "deny"},
+                  "profiles": [{"basename": ".claude",
+                                "eligibility": {"guard_stop": "deny", "brief_warn": "allow",
+                                                "capgate": "deny"}}]}
+
+    def _marker(self):
+        return Path(pf.capgate_unresolved_path(str(self.pack)))
+
+    def test_deny_unregister_failure_keeps_unresolved_marker(self):
+        sp = self._profile_with_capgate()
+        self._marker().parent.mkdir(parents=True, exist_ok=True)
+        self._marker().write_text('{"state":"unknown"}', encoding="utf-8")
+        with mock.patch.object(pf.Preflight, "_unregister_event_hook",
+                               return_value="settings.json 잠금 실패(모의)"):
+            res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                     directive=self.new_directive, table=self.DENY_TABLE)
+        self.assertTrue(self._capgate_cmds(doc),
+                        "계측 타당성: 해제가 실패했으면 잔존 등록이 남아 있어야 한다: %s" % doc)
+        self.assertTrue(self._marker().exists(),
+                        "deny 프로필 해제가 실패했는데 미해소 표식을 지웠다 — 다음 부팅이 "
+                        "C28 을 재진입하지 않는다: %s" % res["detail"])
+        # ※문면 축은 여기서 재지 않는다 — C28 의 detail 은 `warns[:3]` 로 잘려 이 픽스처(훅 본체
+        #   다수 부재)의 경고 목록 뒤로 밀린다(형제 검체 `test_failed_scope_repair…` 와 같은 이유).
+        #   재는 것은 **표식의 생존**이다 = 다음 부팅이 C28 을 재진입한다는 사실 자체.
+        self.assertTrue(res["detail"], "판정 행이 비어 있다")
+
+
+    def test_deny_unregister_success_resolves_marker(self):
+        """음성 대조 — 같은 픽스처에서 해제가 **성공**하면 표식은 해소된다(과잉 보류 0)."""
+        sp = self._profile_with_capgate()
+        self._marker().parent.mkdir(parents=True, exist_ok=True)
+        self._marker().write_text('{"state":"unknown"}', encoding="utf-8")
+        res, doc = self._run_c28(sp, fix=True, status=self.good_status,
+                                 directive=self.new_directive, table=self.DENY_TABLE)
+        self.assertEqual(self._capgate_cmds(doc), [],
+                         "계측 타당성: 해제가 성공했어야 한다: %s" % doc)
+        self.assertFalse(self._marker().exists(),
+                         "잔존 0 인데 표식이 남았다(과잉 보류): %s" % res["detail"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

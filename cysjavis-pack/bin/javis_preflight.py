@@ -377,10 +377,14 @@ def capgate_unresolved(pack=None):
 
     부트 체인(`javis_bootstrap`)이 fast path 조건에 AND 로 넣는다. 판독 실패는 '미해소'로
     읽는다(결측은 값이 아니다 — 표식을 못 읽으면 재측정하는 쪽이 막는 방향이다).
+    ★성찰 P16: 존재 판정도 3값(`_lexists_strict`)이다 — `os.path.exists` 는 EACCES/EIO/ESTALE 를
+    '없다' 로 접어, **있는데 못 보는** 표식이 '해소됨' 이 되고 그 레인은 C28 을 영영 재진입하지
+    않는다(같은 파일의 회수 판정이 이미 버린 접힘 · 결측은 값이 아니다).
     """
     path = capgate_unresolved_path(pack)
-    if not os.path.exists(path):
+    if _lexists_strict(path) is False:          # **증명된** 부재만 '해소됨'
         return False, None
+
     raw = _read_text_tolerant(path)
     if raw is None:
         return True, None
@@ -1201,9 +1205,17 @@ def _settings_rmw(settings_path, mutate, indent=2):
                 pass
 
 
+class OnlyUsageError(Exception):
+    """`--only` 가 어떤 검사와도 매칭되지 않는다 = **사용법 오류**(rc 2).
+
+    ★성찰 P5: 이 상태를 `READY · rc 0` 으로 내면 오타 하나가 "다 재 봤고 이상 없다" 로 읽힌다.
+    측정이 0 인 실행은 판정을 내지 않는다(§3-3 · C58 의 '쌍 0 → SKIP' 과 같은 규율)."""
+
+
 class Preflight:
     def __init__(self, fix, skips, mode="report", allow_irreversible=False, only=None):
         # OPP-17: mode ∈ report(관찰만)|fix(집행)|dry(미리보기)|safe(무변경+갭만).
+
         # self.fix 는 *집행 모드일 때만* True — dry/safe 에선 False 라 기존 50+ `if self.fix and …`
         # 가역 부작용 분기(c04 soul·c07 hook·c08 settings·c10 todo·c32 statusline·c33 event_hooks
         # 등)가 self.fix=False 로 **일괄 비집행**된다. may_mutate() 게이트는 *비가역 외부설치*
@@ -1228,23 +1240,64 @@ class Preflight:
         # run() 이 원래 순서로 재조립한다(직렬 경로는 sink=None 으로 self.results 직행).
         self._local = threading.local()
 
+    # ── `--only` 표적 재측정: 가족 토큰 단위 디스패치 + 보고 필터 ──
+    # ★성찰 P5(2026-09-10): 종전 `--only` 는 **보고 계층에서만** 걸렀다 — `run()` 은 81개 체크를
+    #   전량 순회했고, 매칭이 0 이면 "아무것도 재지 않은 실행" 이 `READY · 검사 0 · rc 0` 을
+    #   선언했다(실패 방향이 초록 · C58 이 '쌍 0 → SKIP' 으로 구현한 §3-3 원칙의 역전). 게다가
+    #   `--help` 는 "이 검사만 실행" 이라고 적는데 실제로는 "이 행만 기록" 이라, 가드를 잊은
+    #   체크(예: `c03_content_pins` 의 조기 반환 부작용)가 `--fix --only` 에서 **행 없이 부작용만**
+    #   남길 수 있었다. 이제 자르는 자리는 **디스패치**이고, 매칭 0 은 사용법 오류(rc 2)다.
+    @staticmethod
+    def _cid_family(cid):
+        """검사 id 의 **가족 토큰** — `C28.self-correction` → `C28` · `C03.pin.master` → `C03`."""
+        return str(cid).split(".", 1)[0]
+
+    @staticmethod
+    def _check_family(check):
+        """체크 **메서드 이름** → 그 메서드가 내는 id 의 가족(`c11b_cys_dept_path` → `C11b`).
+        이름 규약(`c<번호><접미>_…`)이 곧 id 규약이라 별도 표를 두지 않는다 — 표를 두면 체크가
+        늘 때 한쪽만 갱신되어 조용히 갈린다(같은 파일의 STEP 레지스트리와 반대 이유: 저기는
+        순서가 계약이고 여기는 이름이 계약이다)."""
+        m = re.match(r"^c(\d+)([a-z]*)_", getattr(check, "__name__", "") or "")
+        return ("C%s%s" % (m.group(1), m.group(2))) if m else ""
+
+    def _only_match(self, cid):
+        """`--only` 표적인가 — 정확 id 또는 가족 토큰(`--only C03` = C03.* 전부)."""
+        return cid in self.only or self._cid_family(cid) in self.only
+
+    def _dispatch_only(self, checks):
+        """`--only` 를 **디스패치에서** 적용 → 실행할 체크 목록. 매칭 0 이면 OnlyUsageError."""
+        known = {}
+        for c in checks:
+            known.setdefault(self._check_family(c), []).append(c)
+        unknown = sorted(x for x in self.only if self._cid_family(x) not in known)
+        if unknown:
+            raise OnlyUsageError(
+                "--only 인자가 어떤 검사와도 매칭되지 않는다: %s · 알려진 가족 %d개(예: "
+                "--only C28.self-correction · --only C03). 매칭 0 은 READY 가 아니다 — "
+                "아무것도 측정하지 않은 실행이다"
+                % (", ".join(unknown), len(known)))
+        wanted = {self._cid_family(x) for x in self.only}
+        return [c for c in checks if self._check_family(c) in wanted]
+
     def add(self, cid, status, detail):
         # ★triage T11 `--only`: 표적 밖 행은 **기록도 하지 않는다**. `skipped()` 는 검사 진입을
         #   막지만 조기 반환(예: C03 의 부서 팩 면제)은 그 앞에서 행을 남긴다 — 두 지점을 함께
         #   막아야 "무엇이 다시 측정됐는가" 가 출력 하나로 읽힌다.
-        if self.only and cid not in self.only:
+        if self.only and not self._only_match(cid):
             return
         sink = getattr(self._local, "sink", None)
         target = self.results if sink is None else sink
         target.append({"id": cid, "status": status, "detail": detail})
 
     def skipped(self, cid):
-        if self.only and cid not in self.only:
+        if self.only and not self._only_match(cid):
             return True                    # --only: 표적 밖은 **행조차 남기지 않는다**
         if cid in self.skips:
             self.add(cid, SKIP, "skipped by --skip")
             return True
         return False
+
 
     # ── OPP-17 비가역 외부설치 Mutation 게이트 — "관찰이 상태를 바꾸지 않는다"(PHIL-04) 동형 ──
     # ★범위 정직(적대검증 REVISE 교정): may_mutate() 는 **비가역 외부설치(denylist external_install
@@ -3908,14 +3961,16 @@ class Preflight:
     def _event_hook_registered(settings_path, event, script_name, declared_timeout=None):
         """event 에 pack 경로의 script_name 이 **선언 timeout 을 충족한 채** 등록돼 있나
         (구 .config 경로는 미인정). 판정 = `command 동등 ∧ 선언 timeout 충족`(U-21).
-        `declared_timeout=None`(기본) 이면 종전 판정 그대로 — command 축 단독이다."""
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
+        `declared_timeout=None`(기본) 이면 종전 판정 그대로 — command 축 단독이다.
+        ★성찰 P17: 판독은 `_read_json_tolerant`(O_NONBLOCK + fstat 정규 재확인) — 무가드 `open` 은
+        `settings.json` 자리에 writer 없는 FIFO 가 있으면 **그 자리에서 영구 정지**한다. 이 함수는
+        C28 이 대상 프로필마다 부르고 C28 은 부트 체인이 자동으로 도는 유일한 검사라, 정지가 곧
+        '뒤 체크 전부 소실' 이다(`_mcp_enabled` 가 R5 에서 받은 하드닝과 같은 이유·같은 처방)."""
+        data = _read_json_tolerant(settings_path)
         if not isinstance(data, dict):
             return False
         desired = _cys_hook_cmd(script_name)
+
         for entry in data.get("hooks", {}).get(event, []):
             for h in entry.get("hooks", []):
                 if h.get("command", "") == desired and hook_timeout_satisfied(
@@ -3932,12 +3987,12 @@ class Preflight:
           않는다 — capgate 계약은 matcher 없음(전 도구)이므로 그 상태의 게이트는 **Bash 에만**
           붙고 CronCreate·Agent·Edit/Write 는 무게이트가 되며 `tool_calls` 예산도 Bash 만 센다
           (조용한 게이트 면제). 실려 있지 않으면 이 축은 참이다(범위 위반이 없다).
+        ★성찰 P17: `_read_json_tolerant` 로 판독한다(FIFO 정지 0 — 위 `_event_hook_registered` 와 같은 근거).
         """
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return True                    # 판독 불가는 이 축의 사실이 아니다(등록 축이 잰다)
+        data = _read_json_tolerant(settings_path)
+        # 판독 불가(None)는 이 축의 사실이 아니다(등록 축이 잰다) — 종전과 같은 True.
         if not isinstance(data, dict):
+
             return True
         prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
         want = declared_matcher or ""
@@ -3960,15 +4015,15 @@ class Preflight:
           (`sh "/opt/cys/pack/hooks/role-capability-gate.sh"`) 거짓이 되어 ①해제 대상에서 빠지고
           ②'미등록' 으로 **거짓 보고**된다 — 그 사이 훅은 계속 실행된다. 해제·잔존 판정은
           `_unregister_event_hook` 이 실제로 지우는 것과 **같은 소유 술어**로 재야 한다.
+        ★성찰 P17: `_read_json_tolerant` 로 판독한다(FIFO 정지 0 — 같은 커밋에서 신설된 이 판독기 2개가
+          `.claude.json` 에 적용한 하드닝을 빠뜨렸다).
         """
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
+        data = _read_json_tolerant(settings_path)
         if not isinstance(data, dict):
             return False
         prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
         for entry in data.get("hooks", {}).get(event, []):
+
             if not isinstance(entry, dict):
                 continue
             for h in entry.get("hooks", []):
@@ -4415,13 +4470,24 @@ class Preflight:
         #   '판정이 났다' 가 아니라 **'반영까지 확인됐다'** 이다(codex 설계비평 C-1: 훅 부재·
         #   설정 쓰기 실패에도 표식을 지우면 다시 고착된다). report/dry/safe 모드는 상태를
         #   바꾸지 않는다(무변경 계약).
+        # ★성찰 P11: ON 완료 조건에 **deny 프로필 잔존 등록 0** 을 넣는다. 종전엔 허용 프로필만
+        #   봤기 때문에, 표가 deny 한 프로필의 해제(ⓐ)가 실패(잠금·백업·퍼미션)해도 '반영 완료'
+        #   로 접혀 미해소 표식이 지워졌다 — 다음 부팅의 fast path 가 C28 을 생략하고 그 프로필은
+        #   범위 밖 게이트를 문 채 굳는다(pack-capgate-role G9 와 같은 표식·같은 완료 조건 계약).
+        _cap_deny_still = [(t, ev) for (t, ev) in _cap_still if t in _cap_table_off]
         _cap_reflected = (
-            (_cap_state == CAPGATE_ON and _cap_body
+            (_cap_state == CAPGATE_ON and _cap_body and not _cap_deny_still
              and all(self._event_hook_scope_ok(t, ev, CAPGATE_HOOK[0], m)
                      and self._event_hook_registered(t, ev, CAPGATE_HOOK[0],
                                                      hook_timeout_for(CAPGATE_HOOK[0], ev))
                      for t in _cap_allow_targets for ev, m in CAPGATE_HOOK[1]))
             or (_cap_state == CAPGATE_OFF and not _cap_still))
+        if _cap_deny_still and _cap_state == CAPGATE_ON:
+            warns.append("능력 게이트가 대상표 deny 프로필(%s)에 **여전히** 등록돼 있다 — 해제가 "
+                         "끝나지 않았으므로 '반영 완료' 가 아니다(미해소 표식 유지 · 다음 부팅이 "
+                         "C28 을 다시 돈다)"
+                         % ", ".join(sorted({os.path.basename(t) for t, _e in _cap_deny_still})))
+
         if self.fix:
             _cap_mark = capgate_unresolved_path()
             try:
@@ -4844,10 +4910,51 @@ class Preflight:
         전체가 죽는다(R3 · lone surrogate UnicodeEncodeError 재현)."""
         if not self.fix:
             return None
+        # ★성찰 P6: 쌍당 상한(`CYS_SEED_TRUST_TIMEOUT`)과 C58 총예산의 **남은 몫** 중 작은 값으로 유계 래퍼를 부른다 — 응답
+        #   없는 마운트 하나가 뒤 체크(C59~C82)를 통째로 지우던 자리. 예산이 다하면 이 쌍은 '보류' 로 보고된다(침묵 0).
+        secs = self._seed_pair_budget()
+        if secs is not None and secs <= 0:
+            return SEED_TRUST_REFUSE, "REFUSE", ("budget-exhausted(C58 --fix 총예산(%s · 기본 %gs) 소진 — 이 쌍은 보류 · 앞선 "
+                                                 "쌍의 timeout 을 확인하라 · 다음 부트에 재시도)"
+                                                 % (_C58_FIX_BUDGET_ENV, _C58_FIX_BUDGET_DEFAULT))
         try:
-            return seed_trust(cfg_dir, ws, backup=True)
+            return seed_trust_bounded(cfg_dir, ws, secs, backup=True)
         except Exception as e:  # noqa: BLE001 — 수리 1건의 예외가 점검 전체를 멈추면 안 된다
             return SEED_TRUST_ERROR, "ERROR", "예외 %s: %s" % (type(e).__name__, e)
+
+    def _seed_pair_budget(self):
+        """이번 쌍에 줄 상한(초) → None(무한 · 두 노브 모두 끔) / 양수 / 0 이하(예산 소진). 쌍당 상한과 C58 총예산의 남은 몫 중
+        **작은 값**이다(둘 중 하나만 켜져 있으면 그것)."""
+        pair = _seed_trust_timeout_secs()
+        dl = getattr(self, "_c58_deadline", None)
+        if dl is None:
+            return pair
+        remaining = dl - time.monotonic()
+        return remaining if pair is None else min(pair, remaining)
+
+    def _conflict_lines(self, reg):
+        """읽기 전용 — 스코프 안 config dir 의 보존 사본(`.claude.json.conflict-*`)을 사람이 읽는 줄로 → list.
+        ★성찰 P2: 시더는 '지워도 잃는 것이 없다' 를 증명 못 한 사본을 이 이름으로 옮기고 **다시는 손대지 않는다** — 그 존재와
+        경로를 안내하는 자리는 여기뿐이다(없으면 사람이 병합해야 할 파일이 조용히 쌓인다 · `finally` 경로의 보존은 반환값에
+        실리지도 않는다). 열거 실패는 '없음' 이 아니다."""
+        out = []
+        seen = set()
+        for k, cfg_dir in sorted(reg["configs"].items(), key=lambda kv: kv[1]):
+            if k in seen or not os.path.isdir(cfg_dir):
+                continue
+            seen.add(k)
+            try:
+                names = sorted(n for n in os.listdir(cfg_dir) if n.startswith(SEED_TRUST_CONFLICT_PREFIX))
+            except OSError as e:
+                out.append("%s: 보존 사본 열거 불가(%s — '없음' 이 아니다)"
+                           % (cfg_dir, errno.errorcode.get(e.errno, str(e.errno)) if e.errno else e))
+                continue
+            if names:
+                more = (" 외 %d" % (len(names) - 1)) if len(names) > 1 else ""
+                out.append("%s: 보존 사본 %d건(%s%s) — 시더가 '지워도 잃는 것이 없다' 를 증명하지 못해 자동 삭제되지 않는 이름으로 "
+                           "옮긴 문서 · 사람이 .claude.json 과 병합한 뒤 그 파일을 지운다(자동 정리 0)"
+                           % (cfg_dir, len(names), names[0], more))
+        return out
 
     def _survey_journals(self, reg, previous=None):
         """스코프 안 모든 config dir 의 저널 상태를 **읽기 전용**으로 훑는다 → {identity: {dir, names, err, verdict}}.
@@ -4874,6 +4981,10 @@ class Preflight:
         if self.skipped(cid):
             return
         reg = self._registry()
+        # ★성찰 P6: --fix 의 시드는 쌍당 상한에 더해 **C58 총예산**(`CYS_C58_FIX_BUDGET` · 기본 120s) 아래에서 돈다 — 응답 없는
+        #   마운트의 계정 dir 하나가 부트 체인의 300s 를 통째로 먹고 뒤 체크(C59~C82)를 전부 지우던 자리.
+        budget = _c58_fix_budget_secs()
+        self._c58_deadline = (time.monotonic() + budget) if (self.fix and budget) else None
         n_pairs = sum(len(v) for v in reg["pairs"].values())
         unreadable = reg.get("unreadable") or []
         stats = "출처 %d · config %d · 쌍 %d · 판독불가 %d · scope=%s" % (
@@ -4888,6 +4999,7 @@ class Preflight:
             #   증명하지 않는다. 출처 0(판독 없음)·임시 팩·계정 미상 부서·판독불가 파일 전부 이 경로.
             tail = (" · 판독불가: " + " | ".join(unreadable)) if unreadable else ""
             residual, _resolved = _journal_lines(journals)
+            residual.extend(self._conflict_lines(reg))     # ★성찰 P2: 쌍 0 이어도 보존 사본은 관측된 사실이다
             if residual:
                 # 쌍이 0 이어도 미해결 저널은 **관측된 사실**이다 — SKIP(판정 불가)로 덮지 않는다.
                 self.add(cid, WARN, "cysjavis 레지스트리 쌍 0(%s · 트러스트 판정 불가) · %s%s"
@@ -4942,6 +5054,7 @@ class Preflight:
             # rc 만으로 '정리 완료' 를 단정하지 않는다 — 수리 뒤 **재열거**가 잔존의 정본이다(codex R6 · 위임 반례 ②).
             journals = self._survey_journals(reg, journals)
         residual, resolved = _journal_lines(journals)
+        residual.extend(self._conflict_lines(reg))         # ★성찰 P2: 보존 사본의 존재·경로 안내(수리 뒤 재열거)
         gap_lines.extend(residual)
         set_lines.extend(resolved)
         if unreadable:
@@ -4982,12 +5095,13 @@ class Preflight:
 
     @staticmethod
     def _guard_wired(settings_path):
-        """PreToolUse 에 팩경로 guard.sh(hooks/guard.sh) 배선이 있으면 True."""
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
+        """PreToolUse 에 팩경로 guard.sh(hooks/guard.sh) 배선이 있으면 True.
+        ★성찰 P17: 같은 정리 대상 — `_read_json_tolerant`(FIFO 정지 0)."""
+        data = _read_json_tolerant(settings_path)
+        if not isinstance(data, dict):
             return False
         for entry in data.get("hooks", {}).get("PreToolUse", []):
+
             if not isinstance(entry, dict):
                 continue
             for h in entry.get("hooks", []):
@@ -5209,8 +5323,14 @@ class Preflight:
         cid = "C82.gate-corpus-drift"
         if self.skipped(cid):
             return
-        cys = shutil.which("cys") or os.environ.get("CYS_BIN")
+        # ★성찰 P14: 해석 순서는 `_capgate_alert_axis` 와 **같아야 한다**(축 1지점 규칙).
+        #   종전 `which("cys") or CYS_BIN` 은 명시 오버라이드를 PATH 발견 뒤에 뒀다 — 릴리스
+        #   검증에서 `CYS_BIN=/…/0.14.31/cys` 를 주고 PATH 에 0.14.30 이 남으면 C28 은 신형에,
+        #   C82 는 **구형**에 물어 `SKIP 동사 부재` 를 냈다(드리프트를 재라고 만든 축이 '잴 수
+        #   없음' 으로 접힌다). 명시 오버라이드가 이긴다.
+        cys = os.environ.get("CYS_BIN") or shutil.which("cys")
         if not cys:
+
             self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가")
             return
         try:
@@ -6568,9 +6688,15 @@ class Preflight:
             self.c62_pack_heal_ledger,
             self.c68_merge_pending_age,
         ]
+        # ★성찰 P5: `--only` 는 **여기서** 자른다(보고 필터보다 앞). 표적 밖 체크는 아예 돌지
+        #   않으므로 `--fix --only` 가 표적 밖의 부작용을 남길 수 없고, 매칭 0 은 사용법
+        #   오류(OnlyUsageError → rc 2)로 끝난다 — 측정 0 인 실행이 READY 를 선언하지 않는다.
+        if self.only:
+            checks = self._dispatch_only(checks)
         # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
         # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.
         if self.mode != "report":
+
             for check in checks:
                 check()
             return self.results
@@ -6699,6 +6825,14 @@ _SEED_DISPLACED_RE = re.compile(r"^\.claude\.json\.displaced-([0-9a-f]{64})-")
 # ★R5(리뷰 codex major · 중단된 트랜잭션): 교환 **직전**에 기록하고 처분이 끝나면 지우는 의도 저널. 이름은 mkstemp 잔재
 #   정규식(`_SEED_TMP_LITTER_RE` = seed-<8자>)과 겹치지 않아 잔재 청소가 지우지 못한다.
 SEED_TRUST_INTENT_PREFIX = ".claude.json.seed-intent-"
+# ★성찰 P2(codex 설계비평 7): 의도 저널의 mkstemp 임시본은 payload 와 **같은 잔재 네임스페이스**(.seed-<8자>)에 만들어진다 —
+#   저널 쓰기 도중 죽으면 `{"v": 1, "displaced": ".claude.json.displaced-<지문>-…` 로 잘린 비-JSON 조각이 남고, 그것은 사용자
+#   데이터가 아니라 우리 트랜잭션 메타데이터다(재생성 가능). `_write_seed_intent` 의 직렬화가 이 접두를 **보장**하고(키 순서 v →
+#   displaced 고정 · ensure_ascii · 기본 구분자) `_document_carries_user_data` 가 이 접두의 조각을 '지킬 데이터 0' 으로 읽는다
+#   — 단 **파싱에 실패한 바이트에 한한다**(완성 JSON 은 접두가 같아도 문서로 정식 판정 · 접두 위조로 삭제를 얻지 못한다).
+#   네임스페이스를 가르지 않는 이유: 다른 접두의 임시본은 잔재 청소가 못 보고 회수 경로는 '저널 판독 불가' 로 영구 거부한다.
+_SEED_INTENT_FRAGMENT_PREFIX = b'{"v": 1, "displaced": "' + SEED_TRUST_DISPLACED_PREFIX.encode("ascii")
+_SEED_INTENT_KEYS = frozenset({"v", "displaced", "captured_sha256", "payload_sha256", "pid", "utc", "tmp"})
 _SEED_INTENT_MAX_BYTES = 8192
 _SEED_HEX64_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _SEED_DISPLACED_DIGEST_LEN = 64
@@ -7594,15 +7728,37 @@ def _document_carries_user_data(data):
       · 신뢰 플래그(`true`)만 든 문서 = 재생성 가능 = 지킬 데이터 0
       · 기존 문서에서 만든 **원본 + 플래그** = 사용자 데이터가 통째로 들어 있다
     ★triage I2: 후자를 '공개된 적 없는 임시 이름' 이라는 이유로 무조건 지우던 것이 손실이었다. 전자와 의도 저널의
-    내용(`{"v":1,"displaced":…}` · `projects` 없음)은 지워도 잃는 것이 없으므로 이 술어가 거짓이다."""
-    try:
-        doc = json.loads(data.decode("utf-8-sig"))
-    except (ValueError, UnicodeDecodeError):
-        return False
-    if not isinstance(doc, dict) or not isinstance(doc.get("projects"), dict):
-        return False
+    내용(`{"v":1,"displaced":…}` · `projects` 없음)은 지워도 잃는 것이 없으므로 이 술어가 거짓이다.
+    ★성찰 P2(관측 공백 · **의도적 기본값 변경**): **파싱 실패는 이제 참**이다(지킬 데이터가 있다고 본다).
+    종전엔 '읽을 수 없으면 잃을 것도 없다' 로 접혀, 사용자 필드가 남은 채 잘린 임시 JSON 이 지워졌다 —
+    키 이름만으로는 값의 의미를 판정할 수 없으므로(`{"projects":{"/x":{"hasTrustDialogAccepted":false` 는
+    허용 키뿐인데 사람의 명시 거절이다 · codex 반례 7) **읽을 수 없으면 지키는 쪽**으로 뒤집는다.
+    평범한 부분 기록 잔재가 영구 conflict 가 되지 않는 것은 이 술어가 아니라 `_copy_supersedable` 의
+    **접두 증명**이 보증한다(그 바이트는 지금 다시 계획해도 나온다). 0바이트·공백은 여전히 거짓이다."""
+    if not data or not data.strip():
+        return False                           # 담긴 것이 없다(0바이트·공백)
+    doc = _json_or_none(data)
+    if doc is None:
+        # ★codex 설계비평 7: 쓰다 만 **우리 저널** 조각(=파싱 불가) = 트랜잭션 메타데이터(재생성 가능).
+        # ★성찰 P2 조임: 접두 면제는 **파싱에 실패한 바이트에만** 준다 — 완성 JSON 이 이 접두로 시작하면
+        #   그것은 조각이 아니라 문서이므로 아래 정식 판정을 거친다. 종전엔 접두만 보고 접어서
+        #   `{"v": 1, "displaced": ".claude.json.displaced-x", "userID": "u"}`(저널 접두 + 사용자 필드)가
+        #   '지킬 데이터 0' 으로 읽혔고, 접두 24바이트를 앞에 붙이는 것만으로 임의 문서가 삭제를 인가받았다.
+        if data.startswith(_SEED_INTENT_FRAGMENT_PREFIX):
+            return False
+        return True                            # ★성찰 P2: 읽을 수 없는 바이트를 '비어 있다' 로 읽지 않는다
+    if isinstance(doc, list):
+        return bool(doc)                       # `[]` 는 담긴 것이 없다 · 그 밖의 리스트는 모른다 = 지킨다
+    if not isinstance(doc, dict):
+        return True                            # ★codex 설계비평 4: 미인식 형상은 '지킬 데이터 없음' 의 증거가 아니다
+    if not doc:
+        return False                           # `{}`
+    if "displaced" in doc and set(doc) <= _SEED_INTENT_KEYS:
+        return False                           # 완성된 의도 저널 내용(`{"v":1,"displaced":…}`) — 문서가 아니다
     if set(doc) != {"projects"}:
-        return True                            # 최상위에 다른 사용자 필드가 있다
+        return True                            # 최상위에 다른 사용자 필드가 있다(`projects` 부재 포함 · codex 4)
+    if not isinstance(doc["projects"], dict):
+        return True                            # 시더가 쓰지 않는 형상(`"projects": []`) = 모른다 = 지킨다
     for v in doc["projects"].values():
         if not isinstance(v, dict) or set(v) - {"hasTrustDialogAccepted"}:
             return True                        # 프로젝트 항목에 플래그 말고 다른 것이 있다
@@ -7611,17 +7767,17 @@ def _document_carries_user_data(data):
     return False
 
 
-def _litter_may_be_dropped(path, cfg, plan_b=None):
+def _litter_may_be_dropped(path, cfg, key=None, digests=()):
+
     """mkstemp 잔재(.claude.json.seed-<8자>)를 **지워도 잃는 것이 없는가** → True(삭제 가능) / False(보존).
     ①비정규(심링크·FIFO·정션)면 이름만 지운다(데이터 파괴 0) ②판독 불가는 보존('못 봤다' 는 '비어 있다' 가 아니다)
-    ③활성 문서가 그 바이트와 **동등**하면 순수 중복 → 삭제 ③′★수렴 R2: 그 바이트가 **지금 다시 계획하면 나올
-    payload**(`plan_b` · `_planned_payload_bytes`)와 같아도 삭제 — 활성 + 우리 키 하나로 언제든 다시 만들어지는
-    바이트다. 이 갈래가 없으면 저널 공개 **전** 크래시(잔재 = 원본 + 플래그 · 활성 = 원본)가 정의상 ③ 을 통과하지
-    못해 **잃을 것이 없는 통상 경로**가 매 부트 영구 conflict 를 낳는다(리뷰 claude major · 실측 상한 없음)
-    ④사용자 데이터를 담은 문서면 보존(격리 대상) ⑤그 밖(0바이트·부분 기록·저널 조각·플래그뿐인 최소 문서)은 종전대로 삭제.
-    잔여(고지 · codex 설계비평 3): **쓰다 만 payload**(잘려 JSON 이 아닌 바이트)는 ⑤ 로 떨어져 여전히 지워진다 —
-    그것까지 지키려면 우리 임시 네임스페이스의 식별 불가 바이트를 전부 격리해야 하고, 그러면 평범한 크래시 잔재가
-    영구 conflict 파일이 된다. 완전한 문서만 보호한다(범위 고지)."""
+    ③그 밖은 **공용 증명**(`_copy_supersedable`)이 정한다 — 활성 동등·저널 지문·구조 포함·접두·이미 보존됨.
+    ④증명이 서지 않아도 **재생성 가능한 문서**(신뢰 플래그만 든 최소 문서·저널 조각)면 종전대로 삭제.
+    ⑤그 밖은 보존(격리 대상).
+    ★성찰 P2: ③ 은 **삭제 시각의 활성**으로 다시 판정한다(종전엔 스윕 시작에 한 번 memo 한 계획 바이트와
+    비교했다 — 그 사이 외부가 활성을 `{}` 로 바꾸면 낡은 계획이 유일한 사용자 사본의 삭제를 인가했다).
+    ★성찰 P2(관측 공백): 쓰다 만 바이트는 이제 ④ 로 떨어지지 않는다 — `_document_carries_user_data` 가
+    파싱 실패를 '지킬 데이터 있음' 으로 읽고, 평범한 부분 기록은 ③ 의 **접두 증명**이 지운다."""
     try:
         if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
             return True
@@ -7630,11 +7786,10 @@ def _litter_may_be_dropped(path, cfg, plan_b=None):
             data = f.read()
     except (OSError, ValueError):
         return False
-    if _active_digest(cfg) == _payload_digest(data):
-        return True
-    if plan_b is not None and data == plan_b:      # ★수렴 R2: 지금 다시 계획해도 같은 바이트 = 재생성 가능
+    if _copy_supersedable(cfg, data, digests=digests, key=key) is not None:
         return True
     return not _document_carries_user_data(data)
+
 
 
 def _sweep_stale_seed_tmp(config_dir, note=None, key=None):
@@ -7648,14 +7803,15 @@ def _sweep_stale_seed_tmp(config_dir, note=None, key=None):
     증명이 없으면 무접촉이고, 격리(conflict 이동)는 `_orphan_recovery_guard` 가 한다 — 청소는 지우기만 하고 displaced 의
     이름을 옮기지 않는다(판정 지점 단일화).
     ★triage I2: mkstemp 잔재도 무조건 삭제가 아니다 — `_litter_may_be_dropped` 참조.
-    ★수렴 R2(리뷰 claude major): `key` 가 주어지면 **지금 다시 계획하면 나올 payload** 를 두 번째 증명으로 넘긴다
-    (`_planned_payload_bytes` · 잔재 후보가 있을 때만 활성을 한 번 더 읽는 지연 계산). 없으면 종전 판정 그대로다.
+    ★수렴 R2 → ★성찰 P2: `key` 는 이제 **판정 시각에** 계획을 다시 세우는 데 쓰인다(스윕 시작의 memo 폐기 —
+    memo 는 계산~삭제 사이의 활성 교체를 못 보고 낡은 계획으로 삭제를 인가했다). 후보당 활성을 다시 읽는 값은
+    후보가 0 이면 0 이고, 정확성이 그 비용보다 크다.
+
     잔여(고지): 해시~unlink 사이에 그 inode 를 fd 로 잡고 고쳐 쓰는 기록자는 이 판정이 못 본다(_restore_foreign 과 같은
     in-place 기록자 한계 · 알려진 기록자 중 없음). 잠금 파일·.bak-*·.conflict-*·지문 없는 구형 displaced 는 대상이 아니다.
     실패는 무시(청소는 부수 효과)."""
     swept, moved, stuck, held = 0, [], [], []
     cfg = os.path.join(config_dir, ".claude.json")
-    plan = []                       # ★수렴 R2: 계획 바이트 지연 계산 memo — 잔재 후보 0 이면 활성을 다시 읽지 않는다
     try:
         names = os.listdir(config_dir)
     except OSError:
@@ -7663,9 +7819,8 @@ def _sweep_stale_seed_tmp(config_dir, note=None, key=None):
     for n in names:
         path = os.path.join(config_dir, n)
         if _SEED_TMP_LITTER_RE.match(n) and n != SEED_TRUST_LOCK_NAME:
-            if not plan:
-                plan.append(_planned_payload_bytes(cfg, key))
-            if not _litter_may_be_dropped(path, cfg, plan[0]):
+            if not _litter_may_be_dropped(path, cfg, key):
+
                 kept = _preserve_copy(path)                     # 증명 없는 사용자 문서 임시본 = 격리 1회
                 (moved if kept else stuck).append(kept or n)    # 옮겼는지 못 옮겼는지를 뭉뚱그리지 않는다
                 continue
@@ -7721,6 +7876,28 @@ def _digest_of_regular(path):
         return None
 
 
+def _bytes_of_regular(path):
+    """정규 파일(무추종)의 바이트 → bytes · 판독 불가/비정규/심링크는 None. 잠금 아래 호출.
+    ★성찰 P2: 삭제 증명(`_copy_supersedable`)의 입력을 읽는 **단일 자리** — 판독 실패를 빈 바이트로 흘리지 않는다."""
+    try:
+        if _is_link_like(path) or not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        fd, _st = _open_unblocking_ro(path, nofollow=True)
+        with os.fdopen(fd, "rb") as f:
+            return f.read()
+    except (OSError, ValueError):
+        return None
+
+
+def _supersedable_file(cfg, path, digests=(), key=None):
+    """`path` 의 사본을 **지금 지워도 잃는 것이 없다**는 증명 → 사유 또는 None(보존). 판독 불가는 None —
+    `_copy_supersedable` 의 '담긴 것이 없다' 갈래에 None 을 흘리면 그 접힘이 곧 삭제 인가가 된다(결측은 값이 아니다)."""
+    data = _bytes_of_regular(path)
+    if data is None:
+        return None
+    return _copy_supersedable(cfg, data, digests=digests, key=key)
+
+
 def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_digest, tmp_name=None):
     """교환 **전** 의도 저널을 내구적으로 공개 → 저널 경로. 실패는 OSError(호출자는 교환하지 않는다).
     ★R5(리뷰 codex major): 교환~검증 창에서 시더가 죽으면(마감 감시 `os._exit`·SIGKILL) 상대의 **더 새 문서**가
@@ -7737,7 +7914,8 @@ def _write_seed_intent(config_dir, displaced_name, captured_digest, payload_dige
            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     if tmp_name is not None:
         rec["tmp"] = tmp_name
-    payload = json.dumps(rec, ensure_ascii=True).encode("utf-8")
+    payload = json.dumps(rec, ensure_ascii=True).encode("utf-8")   # ★키 순서·구분자 고정 = `_SEED_INTENT_FRAGMENT_PREFIX` 계약
+    assert payload.startswith(_SEED_INTENT_FRAGMENT_PREFIX), "저널 직렬화가 조각 접두 계약을 깼다"
     fd, tmp = tempfile.mkstemp(prefix=SEED_TRUST_TMP_PREFIX, dir=config_dir)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -7833,14 +8011,185 @@ def _copy_is_redundant(cfg, digests):
     return d is not None and d in digests
 
 
+def _strip_regenerable_flags(doc):
+    """문서에서 **시더가 스스로 다시 쓰는 것**만 걷어낸 정규형(순수) — `projects[*].hasTrustDialogAccepted: true`
+    와 그 결과로 비는 항목·빈 `projects`. 다른 값(`false`·숫자·사용자 필드)은 그대로 남는다.
+    ★성찰 P12: '무손실 사본' 판정의 축이다 — 시더가 재생성하는 플래그 차이만 남은 사본은 지워도 잃는 것이 없고,
+    그 차이를 바이트로만 재면 다른 cwd 의 잔재가 매 부트 영구 conflict 로 쌓인다."""
+    if not isinstance(doc, dict):
+        return doc
+    out = dict(doc)
+    pj = out.get("projects")
+    if isinstance(pj, dict):
+        kept = {}
+        for k, v in pj.items():
+            if isinstance(v, dict):
+                v2 = {kk: vv for kk, vv in v.items()
+                      if not (kk == "hasTrustDialogAccepted" and vv is True)}
+                if v2 or not v:                  # ★codex 설계비평 3: 원래 비어 있던 `{}` 은 사람의 값이다 — 플래그를 걷어내서 빈 것만 떨어진다
+                    kept[k] = v2
+            else:
+                kept[k] = v                      # 비-객체 항목은 사람/claude 의 값이다(무접촉)
+        if kept:
+            out["projects"] = kept
+        else:
+            out.pop("projects", None)
+    return out
+
+
+def _json_equal(a, b):
+    """JSON 값의 **형 구분** 동등(순수) — 파이썬의 `1 == True`·`1 == 1.0` 을 같다고 하지 않는다(사용자 값의 형은
+    데이터다 · 시더가 쓰는 `true` 와 사람이 쓴 `1` 을 등치하면 그 등치가 곧 삭제 인가가 된다). NaN 은 자기와도
+    다르다(보존 방향)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_json_equal(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _covers(big, small):
+    """`small` 의 모든 잎이 `big` 안에 **같은 값**으로 있는가(순수 · 재귀 포함 관계).
+    dict 는 키별 포함, 그 밖(리스트 포함)은 `_json_equal`(형 구분 동등). 활성 문서가 그 사이 필드를 **더** 얻은 것은
+    포함을 깨지 않는다 — 리스트는 원소 단위 포함이 아니라 **통째 동등**이다(순서·중복이 데이터다)."""
+    if isinstance(small, dict):
+        if not isinstance(big, dict):
+            return False
+        return all(k in big and _covers(big[k], v) for k, v in small.items())
+    return _json_equal(big, small)
+
+
+def _json_or_none(raw):
+    """바이트 → **비교용 엄격** JSON 값 또는 None(파싱·디코딩·형식 위반). `utf-8-sig` 는 시더와 같게 유지한다.
+    ★성찰 P2(codex 설계비평 6): 삭제 증명의 입력이므로 파싱이 '같아지게' 만드는 것을 막는다 — 부동소수는 `Decimal`
+    (`1e500` 과 `1e400` 이 둘 다 inf 로 접혀 같아지는 것 0 · 긴 소수의 반올림 동등 0) · `NaN`/`Infinity` 거부 · **중복 키
+    거부**(어느 값이 이기는지 정의되지 않은 문서는 비교 대상이 아니다 → None = 보존 방향)."""
+    import decimal
+
+    def _pairs(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise ValueError("duplicate key: %r" % (k,))
+            d[k] = v
+        return d
+
+    def _const(name):
+        raise ValueError("non-finite constant: %s" % name)
+    try:
+        return json.loads(raw.decode("utf-8-sig"), parse_float=decimal.Decimal, parse_constant=_const,
+                          object_pairs_hook=_pairs)
+    except (ValueError, UnicodeDecodeError, AttributeError, decimal.InvalidOperation, RecursionError):
+        return None
+
+
+def _active_covers(cfg, data):
+    """활성 `.claude.json` 이 이 사본의 **비재생성 데이터를 전부** 담고 있는가 → bool.
+    바이트가 아니라 **파싱된 구조**로 본다 — 공백·키 순서·직렬화 차이는 여기서 흡수되고
+    (codex 설계비평: 그 차이를 '보존 필요' 로 읽으면 무손실 경쟁이 곧 무한 누적이다),
+    시더가 재생성하는 `true` 플래그 차이도 `_strip_regenerable_flags` 가 흡수한다.
+    판독·파싱 실패는 False(모르면 보존한다)."""
+    try:
+        existed, raw, _st = _read_claude_json_bytes(cfg)
+    except (OSError, ValueError):
+        return False
+    if not existed:
+        return False
+    a, c = _json_or_none(raw), _json_or_none(data)
+    if not isinstance(a, dict) or not isinstance(c, dict):
+        return False
+    return _covers(_strip_regenerable_flags(a), _strip_regenerable_flags(c))
+
+
+def _conflict_twin(dirpath, digest):
+    """`.claude.json.conflict-*` 중 **바이트가 같은** 것 → basename 또는 None.
+    ★성찰 P12: 보존은 네임스페이스 이동이라 되돌릴 수 없다 — 같은 바이트를 두 번 보존하면 그것 자체가
+    누적 축이다. 이미 보존된 쌍둥이가 있으면 새 사본은 '이미 보존됨' 이다(데이터 손실 0 · 상한 있음)."""
+    try:
+        names = os.listdir(dirpath)
+    except OSError:
+        return None
+    for n in sorted(names):
+        if n.startswith(SEED_TRUST_CONFLICT_PREFIX) and _digest_of_regular(os.path.join(dirpath, n)) == digest:
+            return n
+    return None
+
+
+def _copy_supersedable(cfg, data, digests=(), key=None):
+    """이 바이트 사본을 **지금 지워도 잃는 것이 없다**는 증명 → 사유 문자열(삭제 가능) 또는 None(보존).
+
+    ★성찰 P2(blocking): 삭제 인가의 **단일 술어**다. 종전엔 세 자리가 각자 다른 근거로 지웠고
+    그중 둘은 **삭제 시점의 활성**을 다시 보지 않았다 — 계획·임시본을 만든 뒤 외부가 활성을 `{}` 로
+    교체하면 ⓐ 캐시된 계획 동등성 ⓑ 되교환 payload 동등성 ⓒ `finally` 정리 각각에서 유일한 사용자
+    사본이 사라졌다. 이제 세 자리가 이 함수 하나를 부르고, 증명이 없으면 conflict 로 보존한다.
+
+    증명(강한 것부터 · 하나라도 서면 삭제):
+      ① 빈 바이트(공백뿐) — 담긴 것이 없다.
+      ② 활성 바이트 == 이 바이트 — 순수 중복.
+      ③ 활성 바이트 ∈ `digests`(저널이 적어 둔 캡처 원본 · 우리 payload) — 종전 `_copy_is_redundant`.
+      ④ **구조 포함**(`_active_covers`) — 활성이 이 사본의 비재생성 데이터를 전부 담고 있다(P12).
+      ⑤ **접두 증명** — 지금 다시 계획하면 나올 payload 의 접두다(= 우리가 쓰다 만 바이트 · 완전 일치 포함). 살아남은
+         바이트 전부가 `plan[:len(data)]` 로 재생 가능하다는 뜻이고, **현재** 계획과 맞을 때만 선다 — 활성이 그 사이 바뀌었거나
+         다른 cwd 의 조각이라 맞지 않으면 그 부분 문서는 증거로 보존된다(codex 설계비평 9 · 수렴 약속을 넓게 말하지 않는다).
+      ⑥ conflict 네임스페이스에 **같은 바이트**가 이미 있다 — 이미 내구적으로 보존됐다(P12 상한).
+    잔여(정직 · codex 설계비평 3·4·8): 활성을 읽은 뒤 unlink 까지의 창은 닫히지 않는다 — 잠금을 모르는
+    기록자가 그 마이크로초에 활성을 갈아치우면 이 증명은 낡고, 지는 방향은 **삭제**다. 보증의 범위는 **협력하는
+    기록자**(같은 잠금 아래: C43 `_enable_mcp_server`·Rust 시더 · claude 는 프로브가 배제)이고, 그 창을 없애려면
+    모든 기록자가 같은 잠금에 참여해야 하며 그것은 이 층의 권한 밖이다(남는 것은 미지의 제3자뿐). ⑥ 의 쌍둥이도
+    같은 성격이다 — 해시~unlink 사이에 그 conflict 파일을 지우는 자는 사람뿐이라고 가정한다."""
+    if not data or not data.strip():
+        return "empty(담긴 것이 없다)"
+    d = _payload_digest(data)
+    a = _active_digest(cfg)
+    if a is not None and a == d:
+        return "active-identical(활성 바이트와 같다)"
+    if digests and a is not None and a in digests and d in digests:
+        # ★codex 설계비평 5: 활성이 저널 지문과 같다는 것만으로는 **임의의** 바이트를 지울 수 없다 — 이 사본 자신도 그 쌍(원본 ·
+        #   payload)에 속해야 '활성 + 키로 재생성 가능' 이 성립한다(되교환 뒤 우리 inode 에 제3 쓰기가 앉은 경우가 그 반례).
+        return "journal-pair(저널 지문 증명 — 이 사본도 활성도 캡처 원본/payload 쌍에 속한다)"
+    if _active_covers(cfg, data):
+        return "active-covers(활성이 이 사본의 비재생성 데이터를 전부 담는다)"
+    plan_b = _planned_payload_bytes(cfg, key) if key else None
+    if plan_b is not None and plan_b.startswith(data):
+        return "replannable(지금 계획하면 나올 payload 의 접두 — 우리가 쓰다 만 바이트)"
+    twin = _conflict_twin(os.path.dirname(cfg), d)
+    if twin:
+        return "already-preserved(%s — 같은 바이트가 conflict 에 이미 있다)" % twin
+    return None
+
+
+def _release_tmp_copy(cfg, tmp, digests=(), key=None):
+    """중단 경로에서 **아직 공개되지 않은** mkstemp 임시본을 처분 → 보존 basename 또는 None.
+    ★성찰 P2 ⓒ: 종전 `finally` 는 무조건 지웠다 — 대조(⑥)를 통과한 뒤 외부가 활성을 `{}` 로 바꾸고
+    우리가 예외로 빠지면 그 임시본(원본 + 플래그)이 유일한 완전한 문서다. 삭제는 공용 증명이 설 때만이고,
+    서지 않으면 conflict 로 옮긴다(그 사실의 보고는 C58 conflict 열거가 한다 — 이 자리는 이미 만들어진
+    반환값을 바꿀 수 없다). 판독 불가는 **무접촉**(이름 그대로 남고 다음 실행의 잔재 청소가 다시 판정한다)."""
+    if _litter_may_be_dropped(tmp, cfg, key, digests):   # 잔재 청소와 **같은 규칙**(공용 증명 + 재생성 가능 문서)
+        _unlink_quiet(tmp)
+        return None
+    return _preserve_copy(tmp)
+
+
 def _preserve_copy(path):
-    """보존 사본을 **자동 삭제되지 않는 이름**(`.claude.json.conflict-*`)으로 옮긴다 → 새 basename 또는 None(실패).
+    """보존 사본을 **자동 삭제되지 않는 이름**(`.claude.json.conflict-*`)으로 옮긴다 → basename 또는 None(실패).
+    ★성찰 P12: 옮기기 **전**에 conflict 네임스페이스의 **같은 바이트**를 찾는다 — 있으면 이 사본은 이미
+    보존된 것의 중복이므로 그 이름을 돌려주고 원본을 지운다(데이터 손실 0 · 누적 상한). 판독 불가는 종전대로
+    그냥 옮긴다(모르면 보존).
+
     ★R7(리뷰 codex major): `.displaced-<지문>-*` 는 지문 청소의 대상이라 '보호' 가 다음 실행까지 살아남지 못한다 —
     활성 문서가 (우리든 claude 든) 새로 만들어져 '건강' 해지는 순간 그 사본은 지워도 되는 잔재가 된다. conflict
     네임스페이스는 어느 경로에서도 자동 삭제되지 않으므로 **이름을 옮기는 것 자체가 내구적 보호 표시**다(별도 marker
     파일을 만들지 않는 이유: 그 표시 자체가 또 하나의 내구성·청소 대상이 된다). 바이트는 건드리지 않는다(rename 하나).
     잔여(고지): 이름 선택은 예약이 아니다 — 잠금 밖의 제3자가 그 마이크로초에 같은 이름을 만들면 rename 이 덮는다
     (그 이름은 우리 pid·utc 를 담고 알려진 기록자 중 만드는 자가 없다)."""
+    _d = _digest_of_regular(path)
+    if _d is not None:
+        _twin = _conflict_twin(os.path.dirname(path), _d)
+        if _twin:
+            _unlink_quiet(path)            # 같은 바이트가 이미 보존돼 있다 = 이 사본은 중복(P12 상한)
+            return _twin
     try:
         target = _exclusive_name(os.path.join(os.path.dirname(path), SEED_TRUST_CONFLICT_PREFIX))
         os.rename(path, target)
@@ -7849,7 +8198,8 @@ def _preserve_copy(path):
     return os.path.basename(target)
 
 
-def _release_uncommitted_copy(cfg, dpath, jpath, digests):
+
+def _release_uncommitted_copy(cfg, dpath, jpath, digests, key=None):
     """교환이 **성립하지 않은** 자리에서 우리 payload 사본(displaced)과 의도 저널을 처분 → 사유 꼬리.
     ★R7(리뷰 codex): 종전 근거 '교환 안 됨 = 사본을 지워도 안전' 은 성립하지 않는다 — 교환이 ENOENT 로 실패하는
     바로 그 형상(그 사이 외부가 활성을 지웠다)에서 이 사본(원본 + 플래그)이 **유일한 완전한 문서**다.
@@ -7861,7 +8211,9 @@ def _release_uncommitted_copy(cfg, dpath, jpath, digests):
     그때 그 사본을 지우는 것은 알려진 손실이다(보수적으로 남긴다).
     ★codex 설계비평 2: 보존 rename 이 실패하면 **저널을 남긴다** — 사본이 displaced 이름에 그대로 있으므로 다음 실행의
     회수(ⓑ)가 두 지문을 갖고 다시 판정해야 한다(저널을 지우면 그 근거를 잃고 고아 경로로 떨어진다)."""
-    if _copy_is_redundant(cfg, digests):
+    # ★성찰 P2: 증명은 공용 술어(`_supersedable_file` → `_copy_supersedable`)다 — 지문 동등(③)에 구조 포함(④)·접두(⑤)·
+    #   쌍둥이(⑥)를 더하고, **판독 불가는 보존**한다(종전 `_copy_is_redundant` 는 사본을 읽지도 않고 활성 지문만 봤다).
+    if _supersedable_file(cfg, dpath, digests, key) is not None:
         _unlink_quiet(dpath)
         _unlink_quiet(jpath)
         return ""
@@ -7949,7 +8301,7 @@ def _journal_lines(journals):
     return residual, resolved
 
 
-def _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed):
+def _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed, key=None):
     """★triage I2 — 저널이 적어 둔 mkstemp payload(`rec["tmp"]`)를 회수 ⓐ 에서 판정한다.
     반환: None(그 이름이 없다·구판 저널 = 호출자가 종전대로) · True(처분 완료 → 저널 회수) · False(정리 실패 →
     저널 유지) · (rc, verdict, reason)(무접촉 REFUSE).
@@ -7973,7 +8325,7 @@ def _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed):
     if d != rec["payload_sha256"]:
         return (R, "REFUSE", "interrupted-transaction(저널이 가리키는 임시본 %s 의 바이트가 저널의 payload 지문과 다르다 "
                              "— 우리 것이 아닌 내용이 그 이름에 있다 · 무접촉 · 사람이 확인)" % t)
-    if not _copy_is_redundant(cfg, (rec["captured_sha256"], rec["payload_sha256"])):
+    if _supersedable_file(cfg, tpath, (rec["captured_sha256"], rec["payload_sha256"]), key) is None:   # ★성찰 P2 공용 증명
         kept = _preserve_copy(tpath)
         if kept is None:
             return (R, "REFUSE", "interrupted-transaction(임시본 %s 를 보존 이름으로 옮기지 못했다 — 활성 문서가 그 "
@@ -7988,7 +8340,7 @@ def _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed):
     return True
 
 
-def _recover_interrupted_seed(config_dir, cfg, note=None):
+def _recover_interrupted_seed(config_dir, cfg, note=None, key=None):
     """잠금 아래 · 잔재 청소와 'already-trusted' **앞**에서 중단된 교환 트랜잭션을 판정한다 → None(계속) 또는
     (rc, verdict, reason). 판정은 저널 + **두 파일의 바이트**로 한다(codex D4):
       ⓐ 저널이 가리키는 displaced 부재 → 활성 문서가 유효하면 저널만 회수(교환 전 사망이거나 처분까지 끝난 뒤) ·
@@ -8031,7 +8383,7 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
             #   **mkstemp 이름**에 있다. 저널이 그 이름을 적어 두므로(★R7 이후 저널은 rename 보다 먼저 공개된다)
             #   여기서 같은 바이트 증명으로 함께 판정한다. 종전엔 이 갈래가 저널만 지웠고, 그 뒤 잔재 청소가
             #   '공개된 적 없는 임시파일' 이라는 이유로 payload(= 원본 + 플래그)를 무조건 지웠다.
-            got = _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed)
+            got = _judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed, key=key)
             if isinstance(got, tuple):
                 return got                     # 무접촉 REFUSE(조회 불가 · 비정규 · 낯선 바이트 · 격리 실패)
             if got is True:                    # 처분 완료(회수 또는 격리) — 이 트랜잭션의 표시는 소임을 다했다
@@ -8057,7 +8409,7 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
             # ★R7(리뷰 codex): '건강' 은 '원본 데이터가 그 안에 있다' 가 아니다 — 중단 뒤 외부가 활성을 `{}` 로
             #   재생성하면 종전엔 저널을 지웠고 지문 청소가 유일한 사용자 사본을 삭제했다. 활성 바이트가 원본이나
             #   우리 payload 와 같을 때만 '지워도 잃는 것이 없다' 가 증명된다 · 아니면 보존 이름으로 옮긴다.
-            if not _copy_is_redundant(cfg, (rec["captured_sha256"], rec["payload_sha256"])):
+            if _supersedable_file(cfg, dpath, (rec["captured_sha256"], rec["payload_sha256"]), key) is None:   # ★성찰 P2
                 kept = _preserve_copy(dpath)
                 if kept is None:
                     return (R, "REFUSE", "interrupted-transaction(%s 를 보존 이름으로 옮기지 못했다 — 활성 문서가 "
@@ -8079,7 +8431,7 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
             if not _active_document_healthy(cfg):
                 return (R, "REFUSE", "interrupted-transaction(교환 뒤 활성 .claude.json 이 유효하지 않다 — %s 가 유일한 "
                                      "유효 사본일 수 있어 지우지 않는다 · 사람이 확인)" % rec["displaced"])
-            if not _copy_is_redundant(cfg, (rec["captured_sha256"], rec["payload_sha256"])):
+            if _supersedable_file(cfg, dpath, (rec["captured_sha256"], rec["payload_sha256"]), key) is None:   # ★성찰 P2
                 # ★R7: 교환 뒤 제3자가 활성을 다시 썼다 — 옛 원본에만 있는 필드를 잃을 수 있으므로 지우지 않고 옮긴다.
                 kept = _preserve_copy(dpath)
                 if kept is None:
@@ -8110,7 +8462,7 @@ def _recover_interrupted_seed(config_dir, cfg, note=None):
     return None
 
 
-def _restore_foreign(tmp, cfg, payload_b, note):
+def _restore_foreign(tmp, cfg, payload_b, note, digests=(), key=None):
     """교환으로 드러난 '낯선 inode'(교환 순간 .claude.json 에 있던 것이 우리가 읽은 원본이 아니다) 복원 → (rc, verdict, reason).
     되교환으로 상대 inode 를 그대로 되돌린다(무손실). 되교환 뒤 tmp(우리 inode)가 우리 payload 그대로면 폐기 · 아니면(그 마이크로초
     창에 제3의 쓰기가 우리 inode 에 앉았다) .claude.json.conflict-<utc>-<pid> 로 보존해 사유에 적는다. 되교환 자체가 실패하면 상대
@@ -8130,18 +8482,18 @@ def _restore_foreign(tmp, cfg, payload_b, note):
         conflict = _exclusive_name(os.path.join(os.path.dirname(cfg), SEED_TRUST_CONFLICT_PREFIX))
     except OSError:
         conflict = None                      # ★R7: 보존 이름을 못 얻었다 — 옮기지 않고 그 자리(displaced 이름)에 둔다
-    try:
-        _e, mine, _s = _read_claude_json_bytes(tmp)
-        intact = _e and mine == payload_b
-    except (ValueError, OSError):
-        intact = False
-    if intact:
+    # ★성찰 P2 ⓑ(blocking): 종전 판정 '우리 inode == 우리 payload 면 폐기' 는 **payload 동등**을 **중복**과 등치했다 —
+    #   대조(⑥) 뒤 외부가 활성을 `{}` 로 바꾼 바로 그 형상에서 되교환 뒤 우리 payload(원본 + 플래그)가 원본의 유일한
+    #   사본인데 지웠다. 삭제 근거는 공용 증명(`_copy_supersedable`: 활성 동등·저널 지문·구조 포함·접두·쌍둥이)이고
+    #   서지 않으면 아래 conflict 보존 경로로 떨어진다(제3 쓰기와 '활성이 원본을 잃음' 을 같은 자리에서 지킨다).
+    proof = _supersedable_file(cfg, tmp, digests, key)
+    if proof is not None:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 무손실 복원 · 재시도 가능)%s"
-                             % ((" · " + " · ".join(note)) if note else ""))
+        return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 무손실 복원 · 우리 사본 폐기[%s] · "
+                             "재시도 가능)%s" % (proof, (" · " + " · ".join(note)) if note else ""))
     if conflict is None:
         conflict = tmp
     else:
@@ -8149,8 +8501,8 @@ def _restore_foreign(tmp, cfg, payload_b, note):
             os.replace(tmp, conflict)
         except OSError:
             conflict = tmp
-    return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 복원 · 되교환 창의 제3 쓰기는 %s 에 보존 · "
-                         "수동 병합)" % conflict)
+    return R, "REFUSE", ("concurrent-change(교체 순간 다른 기록자 감지 — 상대 inode 복원 · 되교환 뒤 우리 inode 는 '지워도 잃는 "
+                         "것이 없다' 가 증명되지 않아(제3 쓰기 또는 활성이 원본을 잃음) %s 에 보존 · 수동 병합)" % conflict)
 
 
 def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backup=False,
@@ -8160,7 +8512,8 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
     (usage|구조|IO|되읽기). 절차는 파일 머리 주석 ①~⑫. backup=True 면 기존 파일을 .bak-preflight 로 1회 보존(캡처 바이트
     배타 생성 · C58 --fix 경로). proc_counter/lock_fn/_pre_write_hook 은 테스트 주입점(기본 = 실물). ★R2: 프로브는 기존
     문서가 있을 때만 · 커밋은 교환/link 무손실 CAS. ★R3: 교환 기구 부재는 **무조건** REFUSE(강행 플래그도 못 연다 ·
-    os.replace 0) · O_EXCL 폴백 제거."""
+    os.replace 로 활성을 덮는 폴백 0 — 보존 사본을 **배타 생성한 conflict 이름**으로 옮기는 `os.replace` 는 그 금지의 대상이
+    아니다) · O_EXCL 폴백 제거."""
     proc_counter = proc_counter or claude_procs_for_config
     lock_fn = lock_fn or _try_lock_nb
     E, R, OK_ = SEED_TRUST_ERROR, SEED_TRUST_REFUSE, SEED_TRUST_OK
@@ -8226,7 +8579,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         if err:
             return err
         note = []
-        broken = _recover_interrupted_seed(config_dir, cfg, note)   # ⑬ ★R5: 중단된 교환 — 청소·판정보다 **먼저**
+        broken = _recover_interrupted_seed(config_dir, cfg, note, key=key)   # ⑬ ★R5: 중단된 교환 — 청소·판정보다 **먼저**
         if broken:
             return broken
         orphan = _orphan_recovery_guard(config_dir, cfg)            # ⑭ ★R7: 저널 없는 보존 사본 + 불건강 활성 = 대체 문서 금지
@@ -8252,7 +8605,18 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     return R, "REFUSE", "unverified(%s) — --force-unverified 없이는 거부" % pdetail
                 note.append("force-unverified(%s)" % pdetail)
             elif count > 0:
-                return R, "REFUSE", "live-claude(n=%d · %s)" % (count, pdetail)
+                # ★성찰 P15: 가동 중 함대에서 **가장 흔한** REFUSE 인데 처방 문장이 없었다 —
+                #   기존 문서 + 플래그 부재(에러 4 가 실제로 일어난 상태)인 계정 dir 은 그 좌석들이
+                #   사는 한 매 부트 같은 WARN 만 반복하고 스스로 낫지 않는다. 다른 REFUSE 에는 있는
+                #   '사람이 1회 통과' 문장을 여기에도 둔다(§9 WP-2 의 '4계정 dir true' 가 그 부서
+                #   claude 가 전부 죽어 있는 창에서만 달성된다는 사실을 문면이 실어 나른다).
+                return R, "REFUSE", ("live-claude(n=%d · %s) — 그 config 의 claude 가 도는 동안은 "
+                                     "시드하지 않는다(메모리에 든 기존 문서를 지킨다). 세대교체로 "
+                                     "닫힌다: `cys-dept rotate <dept>` 직후 launch 경로가 시드한다 "
+                                     "· 또는 그 좌석에서 관문을 1회 수동 신뢰하면 claude 자신이 "
+                                     "플래그를 쓰고 이후는 already-trusted 다"
+                                     % (count, pdetail))
+
             else:
                 note.append("probe=%s" % pdetail)          # 무엇이 0 을 검증했는지 사유에 남긴다(감사 · 스텁/실물 구분)
         else:
@@ -8260,6 +8624,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
         # ⑦ 같은 dir mkstemp + fsync + 교체 前 임시파일 되읽기 → ⑥ 교체 직전 존재+바이트 대조 → 백업 → 무손실 커밋
         tmp = None
         intent = None
+        digests = ()                                  # ★성찰 P2: finally 의 처분 증명 입력(payload 확정 전엔 빈 튜플 = 증명 ③ 없음)
         try:
             # ★R3(리뷰): 직렬화·인코딩도 try 안 — 기존 문서의 고아 서로게이트 이스케이프(`"\ud800"`)는 json.loads 는 받지만
             #   ensure_ascii=False 출력의 utf-8 인코딩이 UnicodeEncodeError 를 낸다(종전: try 밖 → C58 --fix 경유 시 preflight
@@ -8269,6 +8634,9 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
             payload_b, escaped = _serialize_payload(new)
             if escaped:
                 note.append("ascii-escaped(lone surrogate · JSON 값 보존)")
+            # ★성찰 P2: 두 지문(우리가 읽은 원본 · 우리 payload)은 **모든 삭제 자리**의 공용 증명 입력이다 — 교환 경로뿐
+            #   아니라 `finally` 의 임시본 처분(ⓒ)과 되교환(ⓑ)도 같은 증명을 쓴다(mkstemp 보다 앞에서 확정).
+            digests = (_payload_digest(raw), _payload_digest(payload_b))
             fd, tmp = tempfile.mkstemp(prefix=SEED_TRUST_TMP_PREFIX, dir=config_dir)
             with os.fdopen(fd, "wb") as f:
                 f.write(payload_b)
@@ -8325,7 +8693,6 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 #   창에서 남는 것은 '가리키는 파일이 없는 저널' 이고 회수 ⓐ 가 그것을 안전하게 접는다.
                 # ★triage I2: 저널에 **아직 rename 되지 않은 mkstemp 이름**도 함께 적는다 — 저널 공개~rename 창에서
                 #   죽으면 payload 는 그 임시 이름에만 있고, 잔재 청소는 저널의 두 지문을 모른다.
-                digests = (_payload_digest(raw), _payload_digest(payload_b))
                 try:
                     intent = _write_seed_intent(config_dir, os.path.basename(displaced),
                                                 digests[0], digests[1], tmp_name=os.path.basename(tmp))
@@ -8344,7 +8711,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                 except OSError as e:                      # syscall -1 = 교환 안 됨 → displaced 는 우리 payload 그대로
                     # ★R7(리뷰 codex): '교환 안 됨 = 사본을 지워도 안전' 은 성립하지 않는다 — 그 사이 외부가 활성을
                     #   지웠다면(교환이 ENOENT 로 실패하는 바로 그 형상) 이 사본이 유일한 완전한 문서다.
-                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests)
+                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests, key=key)
                     return E, "ERROR", "쓰기 실패(교환): %s%s" % (e, kept)
                 if swapped:
                     # displaced 에는 교환 순간 .claude.json 에 있던 inode 가 그대로 있다 — 그것이 우리가 읽은 원본인가?
@@ -8354,7 +8721,7 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     except (ValueError, OSError):
                         foreign = True                    # 심링크/정션/비정규 파일이 끼어들었거나 판독 불가 = 낯선 것 → 복원
                     if foreign:
-                        got = _restore_foreign(displaced, cfg, payload_b, note)    # displaced 처분은 그 안에서 확정
+                        got = _restore_foreign(displaced, cfg, payload_b, note, digests=digests, key=key)   # displaced 처분은 그 안에서 확정
                         if got[0] != E:
                             _unlink_quiet(intent)         # 되교환까지 끝나 창이 닫혔다(실패면 저널을 남겨 증거로 둔다)
                         return got
@@ -8362,7 +8729,10 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     # ★codex 설계비평 8(triage 4건과 같은 과): 여기서도 삭제의 근거는 **바이트 증명**이어야 한다 —
                     #   교환 직후 그 마이크로초에 외부가 활성을 `{}` 로 바꾸면 displaced 의 옛 원본이 유일한 사본이다.
                     #   통상 경로는 활성 = 우리 payload 이므로 증명이 성립하고 잔재는 그대로 0 이다.
-                    if not _copy_is_redundant(cfg, digests):
+                    # ★성찰 P2: 증명은 **공용 술어**(`_copy_supersedable`) 하나다 — displaced 의 바이트는 `raw`(교환 순간 그
+                    #   inode 가 우리가 읽은 원본임을 위에서 확인했다) · 활성이 우리 payload 에 필드를 더 얻었어도 구조 포함(④)이
+                    #   서면 옛 원본은 중복이다(종전엔 지문 동등만 봐서 그런 정상 경우도 conflict 가 됐다 · 판정은 삭제 시각).
+                    if _copy_supersedable(cfg, raw, digests=digests, key=key) is None:
                         # ★수렴 R2(리뷰 claude minor): `kept is None`(rename 막힘)이면 사본은 conflict 네임스페이스로
                         #   **옮겨지지 않았다** — 성공과 실패를 뭉뚱그리지 않는다(`_orphan_recovery_guard` ·
                         #   `_sweep_stale_seed_tmp` · `_release_uncommitted_copy` 와 같은 규율 · codex 설계비평 2).
@@ -8388,9 +8758,13 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
                     #   무손실 계약을 만족하지 못한다. 강행 플래그로도 열지 않는다(귀속 불확실을 감수하는 것과 알려진 손실을
                     #   감수하는 것은 다른 예외 · codex R3) — 사람이 관문에서 1회 신뢰하면 claude 가 스스로 플래그를 쓴다(2차 방어).
                     # ★R7: 같은 규율 — 활성 문서가 **유효할 때만** 우리 사본을 지운다(아니면 보존 이름으로 옮긴다).
-                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests)
+                    kept = _release_uncommitted_copy(cfg, displaced, intent, digests, key=key)
+                    # ★성찰 P18(문서): Windows 합성 — 이 REFUSE(교환 기구 부재 = Windows 상시)와 편성 심박의 POSIX 셸 문법
+                    #   (schedule.rs formation-heartbeat · cmd /C 폴백이면 매 틱 실패)이 **동시에** 무력해 자동 복구가 0 이다.
+                    #   각각은 문서화됐지만 합성은 어디에도 없었다 — 사실의 소유자는 이 영역이므로 문면을 여기 둔다.
                     return R, "REFUSE", ("exchange-unavailable(%s — 원자 교환 없이는 대조~교체 창을 닫을 수 없다 · 기존 문서 무접촉 · "
-                                         "관문에서 1회 수동 신뢰 뒤 already-trusted)%s%s"
+                                         "관문에서 1회 수동 신뢰 뒤 already-trusted · ★Windows 합성: 편성 심박도 POSIX 셸 문법이라 "
+                                         "자동 재기동 0 = 자동 복구 0 — 기존 계정 dir 의 신뢰 관문은 사람 1회 통과가 유일 경로)%s%s"
                                          % (getattr(swapped, "why", None) or "기구 부재",
                                             (" · " + " · ".join(note)) if note else "", kept))
             else:
@@ -8416,7 +8790,10 @@ def seed_trust(config_dir, cwd, force_unverified=False, proc_counter=None, backu
             return E, "ERROR", "쓰기 실패: %s" % e
         finally:
             if tmp:                                       # mkstemp 잔재만(displaced 는 여기서 손대지 않는다)
-                _unlink_quiet(tmp)
+                # ★성찰 P2 ⓒ(blocking): 무조건 unlink 가 아니다 — 대조(⑥) 뒤 외부가 활성을 `{}` 로 바꾸고 우리가 REFUSE/예외로
+                #   빠지면 이 임시본(원본 + 플래그)이 유일한 완전한 문서다. 공용 증명이 설 때만 지우고 아니면 conflict 로 옮긴다
+                #   (보고는 C58 의 보존 사본 열거가 한다 — 이미 만들어진 반환값은 여기서 바꿀 수 없다).
+                _release_tmp_copy(cfg, tmp, digests=digests, key=key)
         # ⑧ 되읽기 — 형 검사 전수 · **롤백 0**(R1): 다른 기록자가 그 사이 썼다면 그 내용을 보존한다.
         try:
             b_existed, braw, _bst = _read_claude_json_bytes(cfg)
@@ -8446,26 +8823,72 @@ _SEED_TRUST_TIMEOUT_DEFAULT = 20.0
 _SEED_TRUST_EXIT_GRACE = 2.0      # 마감 감시 발화 뒤 '진단 출력' 에 허용하는 시간 — 지나면 무조건 종료(codex D5)
 
 
-def _seed_trust_timeout_secs(env=None):
+def _seed_trust_timeout_secs(env=None, name=_SEED_TRUST_TIMEOUT_ENV, default=_SEED_TRUST_TIMEOUT_DEFAULT):
     """마감 감시 상한(초) — 미설정 = 기본 20 · 0 이하 = 끔(None) · 비수치 = 기본(파싱 실패로 감시를 잃지 않는다).
     롤백 노브지 게이트 노브가 아니다(끄면 종전 동작 = 무한 대기).
     ★R5(리뷰 codex minor): **비유한값**(`nan`·`inf`·`1e309`)은 계약("0 이하면 끔") 밖인데 종전엔 nan → None(감시
     상실) · inf → `threading.Timer(inf)`(사실상 감시 상실 · 내부 오버플로로 타이머 스레드가 죽을 수도) 였다 →
     `math.isfinite` 아니면 **기본값**으로 되돌린다(감시를 잃지 않는 방향)."""
-    raw = (os.environ if env is None else env).get(_SEED_TRUST_TIMEOUT_ENV, "")
+    raw = (os.environ if env is None else env).get(name, "")
     if not raw:
-        return _SEED_TRUST_TIMEOUT_DEFAULT
+        return default
     try:
         v = float(raw)
     except (TypeError, ValueError):
-        return _SEED_TRUST_TIMEOUT_DEFAULT
+        return default
     if not math.isfinite(v):
-        return _SEED_TRUST_TIMEOUT_DEFAULT
+        return default
     if v <= 0:
         return None
     # ★R5(리뷰 codex D5): 유한이어도 `threading.TIMEOUT_MAX` 를 넘으면 타이머 스레드가 OverflowError 로 죽어 감시가
     #   조용히 사라진다(`1e300`) → 상한으로 접는다(그 값은 사실상 '끄기' 지만 예외 없이 그렇게 된다).
     return min(v, threading.TIMEOUT_MAX)
+
+
+_C58_FIX_BUDGET_ENV = "CYS_C58_FIX_BUDGET"
+_C58_FIX_BUDGET_DEFAULT = 120.0   # 부트 체인의 preflight --fix 상한(300s) 안에서 C59~C82 가 돌 여지를 남긴다
+
+
+def _c58_fix_budget_secs(env=None):
+    """★성찰 P6: C58 `--fix` 시드 **총예산**(초) — 규칙은 `CYS_SEED_TRUST_TIMEOUT` 과 같다(미설정 = 120 · 0 이하 = 끔 ·
+    비수치/비유한 = 기본). 쌍당 상한이 20s 여도 응답 없는 마운트의 계정 dir 이 여럿이면 합이 부트 체인 300s 를 먹는다."""
+    return _seed_trust_timeout_secs(env, name=_C58_FIX_BUDGET_ENV, default=_C58_FIX_BUDGET_DEFAULT)
+
+
+def seed_trust_bounded(config_dir, cwd, secs=None, **kw):
+    """★성찰 P6(major): `seed_trust` 의 **유계 래퍼** — 두 호출자(CLI `--seed-trust` · C58 `--fix`)가 공유한다.
+    종전엔 마감 감시가 CLI 진입점(`_seed_trust_main` · `os._exit`)에만 붙어 같은 부트 경로의 C58 `--fix`(부트 체인 ①)는
+    무시간제한이었다: 등재 계정 dir 하나가 응답 없는 마운트 위에 있으면 `os.makedirs`/`mkstemp`/`fsync`/청소가 블록 →
+    `--fix` 는 전면 직렬이라 C58 뒤의 C59~C82 가 한 줄도 실행되지 않고 300s 뒤 rc 124 · boot-last 체크 행 0 이었다.
+    라이브러리 경로는 `os._exit` 대신 **(rc, verdict, reason) 반환**이다: 본체를 데몬 워커 스레드에서 돌리고 `secs` 만
+    기다린다. 초과면 REFUSE timeout 을 돌려주고 워커는 **버린다**(블로킹 syscall 은 끊을 수 없다 — 그 스레드가 쥔
+    잠금은 프로세스 종료로 풀리고, 같은 config 의 다음 쌍은 lock-busy 로 정직하게 거부된다). `secs` 가 None/0 이면
+    종전 동작(무한 대기 = 롤백 노브). 워커의 예외는 호출 스레드로 다시 올린다(호출자의 예외 처리 계약 불변).
+    커밋 여부는 이 반환으로 단정하지 않는다 — 중단된 교환은 다음 실행이 의도 저널로 판정한다."""
+    if not secs:
+        return seed_trust(config_dir, cwd, **kw)
+    box = {}
+
+    def _run():
+        try:
+            box["r"] = seed_trust(config_dir, cwd, **kw)
+        except BaseException as e:  # noqa: BLE001 — 호출 스레드로 그대로 되던진다
+            box["e"] = e
+    t = threading.Thread(target=_run, name="seed-trust", daemon=True)
+    try:
+        t.start()
+    except RuntimeError:
+        return SEED_TRUST_REFUSE, "REFUSE", ("watchdog-unavailable(유계 워커 스레드를 띄우지 못했다 — 시간 상한 없이 부트 경로를 "
+                                             "붙잡지 않는다 · 무쓰기 · %s=0 으로 상한을 끄면 종전 동작)" % _SEED_TRUST_TIMEOUT_ENV)
+    t.join(secs)
+    if t.is_alive():
+        return SEED_TRUST_REFUSE, "REFUSE", ("timeout(%gs 안에 끝나지 않았다 — 응답 없는 파일시스템/판독 대기 · 호출자를 붙잡지 "
+                                             "않으려 중단 · **커밋 여부는 이 줄로 단정하지 않는다**: 중단된 교환은 다음 실행이 의도 "
+                                             "저널로 판정한다 · 워커는 버려진다(그 잠금은 프로세스 종료로 풀린다) · 상한은 %s)"
+                                             % (secs, _SEED_TRUST_TIMEOUT_ENV))
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
 
 
 def _start_seed_deadline(secs, emit):
@@ -8557,7 +8980,10 @@ def _seed_trust_main(argv):
     except SystemExit as e:
         return 0 if e.code == 0 else SEED_TRUST_ERROR
     secs = _seed_trust_timeout_secs()
-    cancel = _start_seed_deadline(secs, lambda: _seed_trust_emit(
+    # ★성찰 P6: 본체는 두 호출자가 공유하는 유계 래퍼(`seed_trust_bounded`)로 돈다 — 정상 초과는 래퍼가 REFUSE timeout 을
+    #   **반환**하고 이 자리가 같은 문면으로 찍는다. 아래 프로세스 마감 감시(os._exit)는 그 뒤의 최후 보루(emit/flush 가 막힌
+    #   stdout 에 걸리는 경우)라 래퍼보다 유예만큼 늦게 발화한다.
+    cancel = _start_seed_deadline(secs and secs + _SEED_TRUST_EXIT_GRACE, lambda: _seed_trust_emit(
         args.json, SEED_TRUST_REFUSE, "REFUSE",
         # ★R5(리뷰 codex D5): 종전 문면의 '공개 전이면 무쓰기' 는 **거짓일 수 있다** — 교환 뒤 검증 전에 끊기면 커밋은
         #   성립했고 상대 문서가 displaced 에 남는다. 결과를 단정하지 않고, 그 판정은 다음 실행의 의도 저널이 한다.
@@ -8571,7 +8997,7 @@ def _seed_trust_main(argv):
                          args.config, args.cwd)
         return SEED_TRUST_REFUSE
     try:
-        rc, verdict, reason = seed_trust(args.config, args.cwd, force_unverified=args.force_unverified)
+        rc, verdict, reason = seed_trust_bounded(args.config, args.cwd, secs, force_unverified=args.force_unverified)
     finally:
         cancel()
     _seed_trust_emit(args.json, rc, verdict, reason, args.config, args.cwd)
@@ -9068,7 +9494,7 @@ def _self_test():
               and json.loads(_serialize_payload(_surrogate)[0].decode("utf-8")) == _surrogate
               and "_payload_digest(payload_b)" in seed_src)
         check("seed_trust: 교환 뒤 옛 inode 가 원본과 다르면 되교환(_restore_foreign) · 교체 後 되읽기 불일치/실패에 롤백 0(R1) · copy2 0",
-              "_restore_foreign(displaced, cfg, payload_b, note)" in seed_src and "_rollback_file" not in seed_src
+              "_restore_foreign(displaced, cfg, payload_b, note, digests=digests, key=key)" in seed_src and "_rollback_file" not in seed_src
               and "shutil.copy2" not in seed_src and "커밋 상태로 둔다" in seed_src and "_trusted_exact(back, key)" in seed_src)
         rf_src = _pin_src(_restore_foreign)
         check("_restore_foreign: 되교환 실패 시 displaced 를 지우지 않는다(unlink 는 되교환 성공+payload 동일 분기에만) · 제3 쓰기는 conflict 이름 보존",
@@ -9265,7 +9691,7 @@ def _self_test():
               "_active_document_healthy(" not in sw_src                    # 호출 0(독스트링의 이름 언급은 무관)
               and '_active_digest(cfg) != m.group(1)' in sw_src
               and sw_src.index("_payload_digest(data) != m.group(1)") < sw_src.index("_active_digest(cfg) != m.group(1)")
-              and "if not _litter_may_be_dropped(path, cfg, plan[0]):" in sw_src   # 잔재도 판정을 거친다(★triage I2)
+              and "if not _litter_may_be_dropped(path, cfg, key):" in sw_src   # 잔재도 판정을 거친다(★triage I2 → ★성찰 P2 판정 시각 재계획)
               and "_preserve_copy(path)" in sw_src                          # 증명 없는 사용자 문서 임시본 격리
               and "SEED_TRUST_CONFLICT_PREFIX" not in sw_src)
         check("_litter_may_be_dropped(★triage I2): mkstemp 잔재도 무조건 삭제가 아니다 — **사용자 데이터를 담은 문서**는 "
@@ -9274,9 +9700,9 @@ def _self_test():
               and _document_carries_user_data(b'{"projects": {"/a": {"hasTrustDialogAccepted": true, "x": 1}}}')
               and not _document_carries_user_data(b'{"projects": {"/a": {"hasTrustDialogAccepted": true}}}')   # 최소 문서 = 지킬 데이터 0
               and not _document_carries_user_data(b'{"projects": {}}')
-              and not _document_carries_user_data(b'{"projects": []}') and not _document_carries_user_data(b"[]")
+              and _document_carries_user_data(b'{"projects": []}') and not _document_carries_user_data(b"[]")   # ★codex 4: 미인식 형상 = 지킨다(의도적 기본값 변경)
               and not _document_carries_user_data(b'{"v": 1, "displaced": "x"}')   # 저널 내용은 문서가 아니다
-              and not _document_carries_user_data(b"{broken") and not _document_carries_user_data(b"")
+              and _document_carries_user_data(b"{broken") and not _document_carries_user_data(b"")   # ★성찰 P2: 판독 불가 = 지킬 데이터(의도적 기본값 변경)
               and "_document_carries_user_data(data)" in _pin_src(_litter_may_be_dropped)
               and "return False" in _pin_src(_litter_may_be_dropped).split("except (OSError, ValueError):")[1][:40])
         check("_document_carries_user_data(★수렴 R2 리뷰 claude minor): 문면을 술어에 맞췄다 — 통에 넣는 근거는 '작다' 가 "
@@ -9298,8 +9724,9 @@ def _self_test():
               and "_serialize_payload(new)" in seed_src
               and "json.dumps(new, ensure_ascii=False, indent=2)" not in seed_src   # 복사본 0(한 자리에서만 만든다)
               and "except (OSError, ValueError, UnicodeDecodeError):" in _pin_src(_planned_payload_bytes)
-              and "if plan_b is not None and data == plan_b:" in _pin_src(_litter_may_be_dropped)
-              and "plan.append(_planned_payload_bytes(cfg, key))" in _pin_src(_sweep_stale_seed_tmp))
+              and "plan_b.startswith(data)" in _pin_src(_copy_supersedable)          # ★성찰 P2: 접두 증명(공용 술어 안 · 판정 시각)
+              and "_planned_payload_bytes(cfg, key)" in _pin_src(_copy_supersedable)
+              and "plan.append(" not in _pin_src(_sweep_stale_seed_tmp))              # 스윕 시작 memo 폐기(낡은 계획으로 삭제 인가 0)
         check("청소 사유는 `_read_plan()` 오류에도 실린다(★수렴 R2 리뷰 claude minor): 격리(conflict 이동)를 해 놓고 사유를 "
               "통째로 버리면 침묵의 파일시스템 변경이 된다 · 교환 성공 뒤 보존은 성공/실패를 가른다",
               'return state[0], state[1], "%s%s" % (state[2],' in seed_src
@@ -9342,7 +9769,7 @@ def _self_test():
         rec_src = _pin_src(_recover_interrupted_seed)
         check("회수 ⓑⓒ(★R7 리뷰 codex): '건강' 은 '원본이 그 안에 있다' 가 아니다 — 활성 바이트가 저널의 두 지문 중 "
               "하나와 같을 때만 사본을 지운다(아니면 보존 이름으로 이동) · 판독 실패는 보존 방향",
-              rec_src.count("_copy_is_redundant(cfg, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]))") == 2
+              rec_src.count("_supersedable_file(cfg, dpath, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]), key)") == 2
               and rec_src.count("_preserve_copy(dpath)") == 2
               # ★triage I1: ⓑ 가 **스스로** 회수한다 — ⓒ 의 unlink 가 이 핀을 대신 만족시키지 못하도록 ⓑ 구간만 본다
               and "os.unlink(dpath)" in rec_src.split('d == rec["payload_sha256"]')[1].split('d == rec["captured_sha256"]')[0]
@@ -9354,14 +9781,14 @@ def _self_test():
         check("_release_uncommitted_copy(★triage I4 재핀 · plan §8): 교환이 성립하지 않은 자리(syscall 실패 · 기구 부재 = "
               "Windows 상시 경로)의 사본 삭제도 **저널의 두 지문에 대한 바이트 증명**이다 — R7 의 '활성이 유효하면 삭제' 는 "
               "유효를 중복과 등치해 대조 뒤 끼어든 기록자가 활성을 비우면 유일한 사본을 지웠다 · 보존 실패면 저널을 남긴다",
-              seed_src.count("_release_uncommitted_copy(cfg, displaced, intent, digests)") == 2
+              seed_src.count("_release_uncommitted_copy(cfg, displaced, intent, digests, key=key)") == 2
               and "_active_document_healthy(cfg)" not in ruc_src
-              and "_copy_is_redundant(cfg, digests)" in ruc_src
+              and "_supersedable_file(cfg, dpath, digests, key)" in ruc_src
               and "_preserve_copy(dpath)" in ruc_src
               and ruc_src.index("kept = _preserve_copy(dpath)") < ruc_src.rindex("_unlink_quiet(jpath)"))
         check("교환 성공 경로(★codex 설계비평 8): 옛 원본(displaced) 폐기도 바이트 증명 아래에 둔다 — 교환 직후 그 창에 "
               "외부가 활성을 바꾸면 그 옛 원본이 유일한 사본이다(통상 경로는 활성 = 우리 payload 라 잔재 0 불변)",
-              seed_src.index('note.append("commit=exchange")') < seed_src.index("if not _copy_is_redundant(cfg, digests):")
+              seed_src.index('note.append("commit=exchange")') < seed_src.index("if _copy_supersedable(cfg, raw, digests=digests, key=key) is None:")
               < seed_src.index("os.unlink(displaced)") and "displaced-preserved(" in seed_src)
         check("self-test 러너(★R7 리뷰 claude minor): 순서 핀의 소스는 `_pin_src` 경유 — 핀 문자열이 사라지면 그 핀 "
               "하나만 FAIL 이고 결과 줄은 반드시 나온다(종전엔 ValueError 로 전체 중단)",
@@ -9378,10 +9805,10 @@ def _self_test():
               and '"tmp"] = tmp_name' in _pin_src(_write_seed_intent)
               and "_SEED_TMP_LITTER_RE.match(t)" in _pin_src(_read_seed_intent)
               and _read_seed_intent.__doc__ is not None
-              and "_judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed)" in _pin_src(_recover_interrupted_seed)
+              and "_judge_unrenamed_payload(config_dir, cfg, rec, preserved, reclaimed, key=key)" in _pin_src(_recover_interrupted_seed)
               and "_lexists_strict(tpath)" in jup_src and "_digest_of_regular(tpath)" in jup_src
               and 'd != rec["payload_sha256"]' in jup_src
-              and "_copy_is_redundant(cfg, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]))" in jup_src
+              and "_supersedable_file(cfg, tpath, (rec[\"captured_sha256\"], rec[\"payload_sha256\"]), key)" in jup_src
               and "_preserve_copy(tpath)" in jup_src and "os.unlink(tpath)" in jup_src)
         check("_recover_interrupted_seed(R6 리뷰 codex major): 저널 열거 실패는 '저널 없음' 이 아니라 REFUSE",
               "journal-scan-failed" in _pin_src(_recover_interrupted_seed)
@@ -9393,7 +9820,80 @@ def _self_test():
               "threading.Timer" in dl_src and "t.daemon = True" in dl_src and "os._exit(SEED_TRUST_REFUSE)" in dl_src
               and "signal" not in dl_src
               and "_start_seed_deadline(secs" in main_seed_src and "cancel()" in main_seed_src
-              and main_seed_src.index("_start_seed_deadline(secs") < main_seed_src.index("seed_trust(args.config"))
+              and main_seed_src.index("_start_seed_deadline(secs") < main_seed_src.index("seed_trust_bounded(args.config"))
+        # ── ★성찰 반영 핀(P2·P6·P12·P18 · 2026-09-10) ──
+        cs_src = _pin_src(_copy_supersedable)
+        check("★성찰 P2(blocking): 삭제 인가는 **공용 술어 하나**(`_copy_supersedable`)다 — 스윕(ⓐ)·되교환(ⓑ)·finally(ⓒ)·교환 성공 "
+              "displaced·미성립 교환 사본·저널 회수 전부 그 술어를 **삭제 시점에** 부른다(캐시된 계획 0 · payload 동등 ≠ 중복)",
+              "_copy_supersedable(cfg, data, digests=digests, key=key)" in _pin_src(_litter_may_be_dropped)
+              and "_supersedable_file(cfg, tmp, digests, key)" in _pin_src(_restore_foreign)
+              and "mine == payload_b" not in _pin_src(_restore_foreign)
+              and "_release_tmp_copy(cfg, tmp, digests=digests, key=key)" in seed_src
+              and seed_src.count("_unlink_quiet(tmp)") == 0
+              and "_litter_may_be_dropped(tmp, cfg, key, digests)" in _pin_src(_release_tmp_copy)
+              and seed_src.index("digests = (_payload_digest(raw), _payload_digest(payload_b))") < seed_src.index("tempfile.mkstemp(")
+              and cs_src.index("_active_digest(cfg)") < cs_src.index("_active_covers(cfg, data)")
+              < cs_src.index("_planned_payload_bytes(cfg, key)") < cs_src.index("_conflict_twin(")
+              and _copy_supersedable(os.path.join(tempfile.gettempdir(), "no-such-cfg-%d" % os.getpid()), b"  ") is not None   # 빈 바이트만 무증명 삭제
+              and _supersedable_file(os.path.join(tempfile.gettempdir(), "no-such-cfg-%d" % os.getpid()),
+                                     os.path.join(tempfile.gettempdir(), "no-such-copy-%d" % os.getpid())) is None)   # 판독 불가 = 보존
+        check("★성찰 P2(codex 설계비평 3·4·5·6·7 반영): ③ 저널 지문 증명은 **사본 자신의 지문**도 그 쌍에 속해야 선다 · 비교 파서는 "
+              "엄격(Decimal · NaN/Infinity 거부 · 중복 키 거부) · `projects` 없는 dict·미인식 형상은 지킬 데이터 · 원래 빈 항목 `{}` 보존 · "
+              "우리 저널 조각(접두)·완성 저널 내용은 재생성 가능",
+              "and d in digests" in cs_src
+              and _json_or_none(b'{"x": 1e500}') is not None
+              and _json_or_none(b'{"x": 1e500}')["x"] != _json_or_none(b'{"x": 1e400}')["x"]
+              and _json_or_none(b'{"x": NaN}') is None and _json_or_none(b'{"a": 1, "a": 2}') is None
+              and _json_or_none(b'\xef\xbb\xbf{"a": 1}') == {"a": 1}
+              and _document_carries_user_data(b'{"userID": "only"}') and _document_carries_user_data(b'["only"]')
+              and _document_carries_user_data(b'{"projects": null, "userID": "only"}') and _document_carries_user_data(b'"s"')
+              and not _document_carries_user_data(b"{}")
+              and not _document_carries_user_data(_SEED_INTENT_FRAGMENT_PREFIX + b'abc-2026')
+              and not _document_carries_user_data(b'{"v": 1, "displaced": ".claude.json.displaced-x", "captured_sha256": "a", '
+                                                  b'"payload_sha256": "b", "pid": 1, "utc": "t"}')
+              and _document_carries_user_data(b'{"v": 1, "displaced": ".claude.json.displaced-x", "userID": "u"}')
+              and json.dumps({"v": 1, "displaced": SEED_TRUST_DISPLACED_PREFIX + "x"}, ensure_ascii=True).encode("utf-8")
+              .startswith(_SEED_INTENT_FRAGMENT_PREFIX)
+              and "assert payload.startswith(_SEED_INTENT_FRAGMENT_PREFIX)" in _pin_src(_write_seed_intent)
+              and _strip_regenerable_flags({"projects": {"/o": {}}}) == {"projects": {"/o": {}}}
+              and _strip_regenerable_flags({"projects": {"/o": {"hasTrustDialogAccepted": True}}}) == {}
+              and not _covers({}, {"projects": {"/o": {}}}))
+        check("★성찰 P2(관측 공백): C58 은 보존 사본(`.claude.json.conflict-*`)의 존재·경로를 안내한다 — 쌍 0 갈래와 수리 뒤 재열거 "
+              "양쪽 · 열거 실패는 '없음' 이 아니다",
+              "_conflict_lines(self, reg)" in _pin_src(Preflight._conflict_lines)
+              and _pin_src(Preflight.c58_trust_harden).count("self._conflict_lines(reg)") == 2
+              and "열거 불가" in _pin_src(Preflight._conflict_lines)
+              and "SEED_TRUST_CONFLICT_PREFIX" in _pin_src(Preflight._conflict_lines))
+        check("★성찰 P6(major): 시드 마감 감시는 CLI 진입점만이 아니다 — C58 `--fix` 의 `_seed_pair` 도 **유계 래퍼**(`seed_trust_bounded` · "
+              "(rc,verdict,reason) 반환 · os._exit 0)를 거치고 C58 총예산(`CYS_C58_FIX_BUDGET`)의 남은 몫을 넘긴다 · 소진은 '보류' 보고",
+              "seed_trust_bounded(cfg_dir, ws, secs, backup=True)" in _pin_src(Preflight._seed_pair)
+              and "os._exit(" not in _pin_src(seed_trust_bounded)
+              and "t.join(secs)" in _pin_src(seed_trust_bounded) and "daemon=True" in _pin_src(seed_trust_bounded)
+              and "budget-exhausted(" in _pin_src(Preflight._seed_pair)
+              and "self._c58_deadline" in _pin_src(Preflight.c58_trust_harden)
+              and seed_trust_bounded("rel", "rel", 0.5) == (SEED_TRUST_ERROR, "ERROR", "절대경로만 허용(config=rel cwd=rel)")
+              and seed_trust_bounded("rel", "rel", None) == (SEED_TRUST_ERROR, "ERROR", "절대경로만 허용(config=rel cwd=rel)")
+              and _c58_fix_budget_secs({}) == _C58_FIX_BUDGET_DEFAULT and _c58_fix_budget_secs({_C58_FIX_BUDGET_ENV: "0"}) is None
+              and _c58_fix_budget_secs({_C58_FIX_BUDGET_ENV: "nan"}) == _C58_FIX_BUDGET_DEFAULT
+              and _seed_trust_timeout_secs({}) == _SEED_TRUST_TIMEOUT_DEFAULT)
+        check("★성찰 P12(major): 무손실 사본의 축은 바이트가 아니라 **구조**다 — 시더가 재생성하는 `true` 플래그 차이만 흡수하고 "
+              "`false`·숫자·사용자 필드·형 차이는 보존 · 같은 바이트의 conflict 쌍둥이가 있으면 다시 보존하지 않는다(누적 상한)",
+              _strip_regenerable_flags({"projects": {"/a": {"hasTrustDialogAccepted": True}}}) == {}
+              and _strip_regenerable_flags({"projects": {"/a": {"hasTrustDialogAccepted": False}}})
+              == {"projects": {"/a": {"hasTrustDialogAccepted": False}}}
+              and _strip_regenerable_flags({"projects": {"/a": {"hasTrustDialogAccepted": 1}}})
+              == {"projects": {"/a": {"hasTrustDialogAccepted": 1}}}
+              and _strip_regenerable_flags({"u": 1, "projects": {"/a": {"hasTrustDialogAccepted": True, "x": 2}}})
+              == {"u": 1, "projects": {"/a": {"x": 2}}}
+              and _covers({"a": {"b": 1, "c": 2}}, {"a": {"b": 1}}) and not _covers({"a": {"b": 1}}, {"a": {"b": 1, "c": 2}})
+              and not _covers({"a": 1}, {"a": True}) and not _covers({"a": True}, {"a": 1})    # 1 ≠ True(형 구분)
+              and not _covers({"a": [1, 2]}, {"a": [1]}) and _covers({"a": [1, 2]}, {"a": [1, 2]})   # 리스트는 통째 동등
+              and not _covers({"a": 1.0}, {"a": 1}) and not _covers({"a": None}, {"a": False})
+              and "_conflict_twin(" in _pin_src(_preserve_copy) and "_unlink_quiet(path)" in _pin_src(_preserve_copy))
+        check("★성찰 P18(문서): Windows 합성 — 신뢰 시드(교환 기구 부재 REFUSE)와 편성 심박(POSIX 셸 문법)이 동시에 무력 = 자동 복구 0 · "
+              "기존 계정 dir 의 신뢰 관문은 사람 1회 통과가 유일 경로(문면이 그 사실을 실어 나른다)",
+              "자동 복구 0" in seed_src and "사람 1회 통과가 유일 경로" in seed_src
+              and seed_src.index("exchange-unavailable(") < seed_src.index("사람 1회 통과가 유일 경로"))
         gapread_src = _pin_src(Preflight._trust_gap_workspaces)
         check("C58 갭 탐지 판독(★R5 재핀 · 이 WP 의 R4 자기 핀): 막히지 않는 관용 판독(_read_json_tolerant) — FIFO 정지 0 이면서 "
               "심링크는 따라간다(시더 가드는 심링크를 거부해 영구 거짓 갭을 만들었다) · 쓰기 정책은 시더가 따로 판정",
@@ -9440,10 +9940,10 @@ def _self_test():
         check("C58 쓰기 진입점은 _seed_pair 하나 — c58 본문에 직접 seed_trust 호출 0(R6 재핀)",
               "seed_trust(" not in c58_src and "self._seed_pair(" in c58_src)
         check("C58 report 모드는 읽기 전용 — _seed_pair 가 self.fix 가드를 **먼저** 통과해야 seed_trust 에 닿는다(R6 재핀)",
-              "if not self.fix:" in pair_src and pair_src.index("if not self.fix:") < pair_src.index("seed_trust(")
-              and "backup=True" in pair_src and pair_src.count("seed_trust(") == 1)
+              "if not self.fix:" in pair_src and pair_src.index("if not self.fix:") < pair_src.index("seed_trust_bounded(")
+              and "backup=True" in pair_src and pair_src.count("seed_trust_bounded(") == 1)   # ★성찰 P6: 유계 래퍼 경유
         check("C58(R3): --fix 의 seed_trust 예외는 WARN 1줄로 접힌다(preflight 전체 중단 0)",
-              pair_src.index("try:") < pair_src.index("seed_trust(") < pair_src.index("except Exception"))
+              pair_src.index("try:") < pair_src.index("seed_trust_bounded(") < pair_src.index("except Exception"))
         check("C58: 판정할 쌍 0 → SKIP(PASS 아님 · 판정 정직성 R1) · hook 배선 프로필 루프(스코프 ①) 제거",
               "self.add(cid, SKIP" in c58_src and c58_src.index("self.add(cid, SKIP") < c58_src.index("targets = []")
               and "discover_claude_settings" not in c58_src and "_hook_registered" not in c58_src)
@@ -9642,6 +10142,23 @@ def _self_test():
         check("C82 run() 배선(마지막 고정 슬롯 C62 앞)",
               "c82_gate_corpus_drift" in run_src2
               and run_src2.index("c82_gate_corpus_drift") < run_src2.index("c62_pack_heal_ledger"))
+        # ── ★성찰(2026-09-10) 핀 — P14 축 1지점 · P15 처방 문면 · P17 FIFO 정지 하드닝 ──
+        check("P14: C82 의 cys 해석은 **명시 오버라이드 우선** — _capgate_alert_axis 와 같은 순서(축 1지점)",
+              'os.environ.get("CYS_BIN") or shutil.which("cys")' in c82_src
+              and 'os.environ.get("CYS_BIN") or shutil.which("cys")'
+              in _pin_src(Preflight._capgate_alert_axis)
+              and 'shutil.which("cys") or os.environ.get("CYS_BIN")' not in c82_src)
+        check("P15: live-claude REFUSE 에 실행 가능한 처방(rotate 세대교체 또는 관문 1회 수동 신뢰)이 실린다",
+              "live-claude(n=%d" in seed_src and "cys-dept rotate" in seed_src
+              and "관문을 1회 수동 신뢰" in seed_src)
+        for _fn, _nm in ((Preflight._event_hook_registered, "_event_hook_registered"),
+                         (Preflight._event_hook_scope_ok, "_event_hook_scope_ok"),
+                         (Preflight._event_hook_present_any, "_event_hook_present_any"),
+                         (Preflight._guard_wired, "_guard_wired")):
+            _s = _pin_src(_fn)
+            check("P17: %s 는 막히지 않는 관용 판독(_read_json_tolerant) — 무가드 json.load(open( 0" % _nm,
+                  "_read_json_tolerant(settings_path)" in _s and "json.load(open(" not in _s)
+
     except Exception as e:
         # ★R7(리뷰 claude minor): 핀 표현식 하나가 예외로 죽어도 **결과 줄은 반드시 낸다** — 종전엔 트레이스백이
         #   self-test 전체를 삼켜 나머지 핀의 상태가 가려졌다(회귀 진단이 트레이스백 1개로 축소).
@@ -9652,8 +10169,21 @@ def _self_test():
     return 1 if fails else 0
 
 
+def _only_usage_exit(json_mode, mode, detail):
+    """`--only` 사용법 오류 1줄 출력 → rc 2. READY/ok:true 를 **내지 않는다**(성찰 P5)."""
+    if json_mode:
+        print(json.dumps({"ok": False, "fails": 0, "warns": 0, "mode": mode,
+                          "error": "only-no-match", "detail": detail,
+                          "planned": [], "pack_dir": pack_dir(), "checks": []},
+                         ensure_ascii=False, indent=2))
+    else:
+        print("preflight: 사용법 오류(--only) — %s" % detail)
+    return 2
+
+
 def main():
     # --self-test 가로채기 — argparse 앞(팩 bin 도구 관례: 인자 스키마와 독립인 자기검증 채널).
+
     if "--self-test" in sys.argv[1:]:
         return _self_test()
     # ★WP-2(0.14.31): --seed-trust 가로채기 — 같은 관례(argparse 앞·인자 스키마 독립). cys-dept 가 계정 dir 생성
@@ -9673,7 +10203,9 @@ def main():
     ap.add_argument("--skip", action="append", default=[], metavar="ID",
                     help="해당 검사 건너뜀 (예: --skip C12.daemon)")
     ap.add_argument("--only", action="append", default=[], metavar="ID",
-                    help="해당 검사만 실행 (부트 체인의 표적 재측정 · 예: --only C28.self-correction)")
+                    help="해당 검사만 실행 (부트 체인의 표적 재측정 · 예: --only C28.self-correction "
+                         "· 가족 토큰 --only C03 도 가능 · 매칭 0 이면 rc 2 사용법 오류)")
+
     args = ap.parse_args()
 
     if args.safe and (args.dry_run or args.fix):
@@ -9685,8 +10217,20 @@ def main():
 
     pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
                    allow_irreversible=args.allow_irreversible, only=args.only)
-    results = pf.run()
+    # ★성찰 P5: `--only` 가 아무것도 재지 못한 실행은 **판정을 내지 않는다**(rc 2 사용법 오류).
+    #   ⓐ 알려진 가족에 없는 id → 디스패치가 OnlyUsageError ⓑ 가족은 맞는데 행이 0 → 아래 재확인
+    #   (동적 id 인 `C03.pin.<파일>` 처럼 정적으로 못 거르는 오타가 여기서 잡힌다).
+    try:
+        results = pf.run()
+    except OnlyUsageError as e:
+        return _only_usage_exit(args.json, mode, str(e))
+    if args.only and not results:
+        return _only_usage_exit(
+            args.json, mode,
+            "--only %s 로 실행했으나 기록된 검사 행이 0 이다 — 그 id 를 내는 검사가 없다(오타?). "
+            "검사 0 인 실행은 READY 가 아니다" % ", ".join(args.only))
     fails = sum(1 for r in results if r["status"] == FAIL)
+
     warns = sum(1 for r in results if r["status"] == WARN)
     # dry/safe: "변경했나"가 아니라 "변경이 필요한가"를 보고 — planned 비어있지 않으면 변경 예정.
     planned_change = any(p["cid"] for p in pf.planned)
