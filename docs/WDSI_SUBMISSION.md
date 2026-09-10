@@ -140,3 +140,26 @@ Requesting removal of the false-positive detection.
 v0.14.31." 한 줄을 `v0.14.32`로 교체해 그대로 쓴다(C3 §9-6). 사람이 Windows 기기에서
 실제 설치 → 탐지 관측(있다면) → 있을 때만 §3 절차대로 제출.
 상세: `impl/release/wdsi-result.md`, `impl/release/stage2.md`.
+
+### v0.14.33 — 2026-09-11 — 제출하지 않음 (전제조건 미충족, blocked · v0.14.31/v0.14.32와 동일 사유)
+
+`v0.14.31`(빌드 관문 실패로 폐기)·`v0.14.32`(pack-artifacts 관문 실패로 미발행)를 잇는 재발행
+태그다. 위 두 절의 차단 사유(Windows 기기 부재)가 **환경 변화 없이 그대로** 적용된다 — 새 근거
+없이 재시도해도 같은 결과이므로 재시도하지 않았다(C3 §10: 탐지가 관측되지 않으면 제출 자체가
+불요 · 1회 규칙 유지).
+
+이번 태그는 `release.yml`(pack-artifacts 포함 전 잡 success) → `release-postprocess.py --apply`
+→ `release-publish.yml`(오너 위임 승인)까지 **완주해 실제로 공개(public)됐다** — 전판들과 달리
+아래 바이트는 지금 실제로 다운로드 가능한 공개 자산이다.
+
+대상 바이트(v0.14.31·v0.14.32와 바이트가 다르다 — 별도 CI 빌드, sha256 재사용 금지):
+
+| 자산 | sha256 |
+|---|---|
+| `cys_0.14.33_x64-setup.exe` | `39ee4f9bb9b68ad213d3dd0b4cb49985b388c5120ae9f744670ef6973e397d30` |
+| `cys_0.14.33_x64-setup.zip` | `2e2d28edad82b4ab205bf149f8725e3af044ed3aced0942a7d7b8204514d9888` |
+
+제출 문안은 `impl/wdsi-0.14.31.md` §4의 "The submitted binaries are from release
+v0.14.31." 한 줄을 `v0.14.33`으로 교체해 그대로 쓴다(C3 §9-6). 사람이 Windows 기기에서
+실제 설치 → 탐지 관측(있다면) → 있을 때만 §3 절차대로 제출.
+상세: `impl/release/wdsi-result.md`, `impl/release/stage2.md`.
