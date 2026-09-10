@@ -78,7 +78,12 @@ def main():
 
     ok = bool(after) or bool(tracked)
     if ok:
-        print("PASS 내구 미확정(durable=false)을 받은 뒤 원본을 버리지 않거나 추적한다")
+        q9 = _q9_console_encoding_axes()
+        if q9:
+            print("FAIL " + " | ".join(q9))
+            return 1
+        print("PASS 내구 미확정(durable=false)을 받은 뒤 원본을 버리지 않거나 추적한다"
+              " · 콘솔 인코딩 오류(디코딩·표시)가 성공한 enqueue 를 재전송시키지 않는다")
         print("WAKEUP-DURABLE-RECEIPT-OK")
         return 0
     print(
@@ -87,6 +92,76 @@ def main():
         "데몬이 WAL 재시도 전에 죽으면 그 wakeup 은 양쪽 어디에도 없다"
     )
     return 1
+
+
+# ★(0.14.31 · 성찰 Q9) 데몬 응답에 로캘 비호환 문자(`·` U+00B7 · 한글 · 잘못된 바이트 0xFF)를 넣는다.
+MOCK_CYS_Q9 = """#!/bin/sh
+echo "$@" >> "$MOCK_CALLS"
+printf 'QUEUED (depth 1) \\302\\267 durable=true \\377\\n'
+printf '[queue] \\355\\225\\234\\352\\270\\200 \\302\\267 stderr\\n' >&2
+exit 0
+"""
+
+
+def _q9_console_encoding_axes():
+    """★(0.14.31 · 성찰 Q9) **성공한 enqueue 가 콘솔 인코딩 오류 때문에 재전송되지 않는다.**
+
+    두 축을 각각 잰다: ⓐ 디코딩 — C 로캘(ASCII)에서 `text=True` 였다면 `UnicodeDecodeError` 가
+    `run()` 안에서 났다 ⓑ 표시 — `PYTHONIOENCODING=ascii:strict` 콘솔에 캡처 출력을 되쏘면
+    `UnicodeEncodeError` 가 났다. 둘 다 except 절 밖의 예외라 drain 이 죽고 pending 이 남아
+    다음 drain 이 같은 wakeup 을 다시 보냈다(Windows cp949 실측 계열). 기대: 각 축에서 rc 0 ·
+    목 cys 호출 정확히 1회 · pending 0 · 원장 delivered 1 · 두 번째 drain 은 호출 0.
+    """
+    fails = []
+    axes = {
+        "decode(C-locale)": {"PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0", "LC_ALL": "C", "LANG": "C"},
+        "display(ascii-console)": {"PYTHONIOENCODING": "ascii:strict"},
+    }
+    for label, extra in axes.items():
+        root = tempfile.mkdtemp(prefix="wakeup-q9-")
+        binhome = tempfile.mkdtemp(prefix="wakeup-q9-bin-")
+        calls = os.path.join(binhome, "calls.log")
+        mock = os.path.join(binhome, "cys")
+        with open(mock, "w", encoding="utf-8") as f:
+            f.write(MOCK_CYS_Q9)
+        os.chmod(mock, 0o755)
+        env = dict(os.environ)
+        env.pop("LC_CTYPE", None)
+        env.update({"JAVIS_ROOT": root, "CYS_PACK_DIR": tempfile.mkdtemp(prefix="wakeup-q9-pack-"),
+                    "JAVIS_WAKEUP_LIVENESS": "alive", "MOCK_CALLS": calls,
+                    "PATH": binhome + os.pathsep + env.get("PATH", "")})
+        env.update(extra)
+
+        def run(*args):
+            return subprocess.run([sys.executable, WAKEUP, *args], env=env,
+                                  capture_output=True, timeout=60)
+
+        r = run("enqueue", "--to", "master", "--task", "q9", "--reason", "encoding probe")
+        if r.returncode != 0:
+            fails.append(f"[{label}] enqueue 실패 rc={r.returncode}: {r.stderr[-300:]!r}")
+            continue
+        r1 = run("drain", "--deliver")
+        pending_dir = os.path.join(root, "_round", "wakeups", "pending")
+        left = [n for n in os.listdir(pending_dir) if n.endswith(".json")] if os.path.isdir(pending_dir) else []
+        n1 = len(open(calls, encoding="utf-8").read().splitlines()) if os.path.exists(calls) else 0
+        if r1.returncode != 0:
+            fails.append(f"[{label}] 표시·디코딩 오류가 drain 을 죽였다 rc={r1.returncode}: {r1.stderr[-300:]!r}")
+        if n1 != 1:
+            fails.append(f"[{label}] 전제 붕괴: 첫 drain 호출 수 {n1}")
+        if left:
+            fails.append(f"[{label}] 성공한 enqueue 의 pending 이 남았다(재전송 예약): {left}")
+        ledger = os.path.join(root, "_round", "wakeups", "queue.jsonl")
+        rows = []
+        if os.path.exists(ledger):
+            with open(ledger, encoding="utf-8") as f:
+                rows = [json.loads(l) for l in f if l.strip()]
+        if len([x for x in rows if x.get("event") == "delivered"]) != 1:
+            fails.append(f"[{label}] 원장 delivered 가 1 이 아니다: {[x.get('event') for x in rows]}")
+        r2 = run("drain", "--deliver")
+        n2 = len(open(calls, encoding="utf-8").read().splitlines()) if os.path.exists(calls) else 0
+        if n2 != n1:
+            fails.append(f"[{label}] 두 번째 drain 이 같은 wakeup 을 재전송했다({n1}→{n2})")
+    return fails
 
 
 if __name__ == "__main__":

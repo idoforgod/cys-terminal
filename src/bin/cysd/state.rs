@@ -220,6 +220,25 @@ impl QueueEntry {
     }
 }
 
+/// ★(0.14.31 · 성찰 Q3) WAL 행의 **마지막으로 영속된 생명주기 전이 시각** — `max(expired_at,
+/// revived_at)`. 둘 다 없으면 `f64::NEG_INFINITY`(= 전이를 겪은 적이 없다).
+///
+/// 이 값 하나가 "이 사본이 더 최근의 사실인가" 를 판정한다. 두 WAL 파일에 같은 id 가 남는 창은
+/// **목적지 먼저 쓰기**의 크래시 창뿐인데, 그 창에서 목적지 사본은 언제나 방금 찍은 전이 시각을
+/// 갖고 원본 사본은 그 이전 값을 갖는다 — 그래서 이 비교 하나로 만료 이동·revive 두 방향이
+/// 모두 옳게 갈린다(파일 우선순위 규칙이 필요 없다). NaN 은 비교에서 지므로 결과가 뒤집히지
+/// 않는다(`f64::max` 는 NaN 을 무시한다).
+pub fn queue_row_transition_at(it: &Value) -> f64 {
+    let ex = it.get("expired_at").and_then(|v| v.as_f64());
+    let rv = it.get("revived_at").and_then(|v| v.as_f64());
+    match (ex, rv) {
+        (None, None) => f64::NEG_INFINITY,
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (Some(a), Some(b)) => a.max(b),
+    }
+}
+
 /// 항목의 실효 TTL(초) — 항목 명시값 우선, 없으면 데몬 기본. 0 = 만료 없음.
 pub fn queue_entry_ttl_secs(e: &QueueEntry, default_ttl: u64) -> u64 {
     e.ttl_secs.unwrap_or(default_ttl)
@@ -295,11 +314,33 @@ pub fn queue_dropped_payload(
     dropped: &[QueueEntry],
     reclaim: Option<(u64, &str)>,
 ) -> Value {
+    // ★(0.14.31 · 성찰 Q6) **W-id 에코 additive** — `queue.delivered`·`queue.expired` 와 같은 계약.
+    //
+    // 【무엇이 틀렸었나】 이 페이로드에는 `queue_entry_ids`(큐 항목 자신의 id)만 있었다. 소비자
+    //   (`javis_report_gate.py`)가 조인에 쓰는 유일한 키는 배달 원문에서 되읽은 **W-id**(`entry_ids`)
+    //   인데, 폐기 4사유 중 `expired_evicted` 만 M7 수리에서 덮였고 나머지 3종(`surface_closed` ·
+    //   `process_exited` · `cleared`)은 종결이 소비자에게 **도달하지 않았다**. 귀결은 그 W-id 가
+    //   영원히 `inflight` 로 남아 seen TTL 마다 낡은 wakeup_id 그대로 재enqueue 되는 것이다
+    //   (= wakeup 홍수 · M7 이 없애려던 병리의 재개방).
+    // 【명명 계약 준수】 `queue_entry_ids` 키명은 **그대로 둔다**(두 id 체계가 한 키명을 공유하면
+    //   disarm 조인이 오염된다 — 위 명명 계약 주석). `entry_ids` 는 W-id 에코 전용이다.
+    let entry_ids: Vec<String> = {
+        let mut out: Vec<String> = Vec::new();
+        for e in dropped {
+            for w in crate::governance::wakeup_entry_ids(&e.text) {
+                if !out.iter().any(|x| x == &w) {
+                    out.push(w);
+                }
+            }
+        }
+        out
+    };
     let mut p = json!({
         "reason": reason,
         "count": dropped.len(),
         "bytes": dropped.iter().map(|e| e.text.len()).sum::<usize>(),
         "queue_entry_ids": dropped.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "entry_ids": entry_ids,
     });
     if let Some((cleared_by, via)) = reclaim {
         p["cleared_by"] = json!(cleared_by);
@@ -406,6 +447,40 @@ pub fn queue_rehomed_payload(role: &str, rehomed: &[QueueEntry], reordered: bool
         "queue_entry_ids": rehomed.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
         "role": role,
         "reordered": reordered,
+        // ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #9) W-id 에코(additive · `queue.delivered` 와 같은
+        //   계약) — 소비자(report_gate)가 "아직 살아서 이동 중" 을 알고 inflight TTL 을 되감는다.
+        //   그러지 않으면 park 가 seen TTL(30분)을 넘길 때 같은 사건이 다시 enqueue 된다(중복).
+        "entry_ids": wakeup_entry_ids_union(rehomed),
+    })
+}
+
+/// 항목 본문들에서 되읽은 W-id 합집합(등장순 · 중복 제거) — `queue.dropped`·`queue.parked`·
+/// `queue.rehomed` 의 `entry_ids` 산식 하나.
+pub fn wakeup_entry_ids_union(entries: &[QueueEntry]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        for w in crate::governance::wakeup_entry_ids(&e.text) {
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
+/// ★(0.14.31 · 성찰 Q7) `queue.parked` payload — 역할 좌석의 종료(reap · 자력 종료)가 미배달 활성
+/// 항목을 **데몬 보존소(`restored_queue`)로 옮겼다**(폐기 아님). 같은 role 의 다음 좌석에 rehome 되어
+/// 순서대로 배달된다. `entry_ids` 는 W-id 에코(소비자의 inflight 되감기 · 종결 아님).
+pub fn queue_parked_payload(reason: &str, role: &str, surface_id: u64, parked: &[QueueEntry]) -> Value {
+    json!({
+        "reason": reason,
+        "role": role,
+        "surface_ref": cys::surface_ref(surface_id),
+        "count": parked.len(),
+        "queue_entry_ids": parked.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "entry_ids": wakeup_entry_ids_union(parked),
+        "hint": "역할 좌석이 종료됐다 — 미배달 항목을 데몬 보존소로 옮겼다(폐기 아님). 같은 role 의 \
+                 새 좌석에 rehome 되어 순서대로 배달되며 `cys queue list` 에 보인다 · TTL 은 계속 흐른다",
     })
 }
 
@@ -568,15 +643,29 @@ pub(crate) fn queue_merge_insert_pos(q: &VecDeque<QueueEntry>, at: f64, seq: u64
 /// 【한계 — 정직】 `claimed` 는 "writer 가 쓰기로 결정했다" 이지 "PTY 에 다 나갔다" 가 아니다.
 /// 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는 종전
 /// (`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
-/// ★(0.14.31 · 리뷰 R2 · codex blocking) 가드가 보는 **승인·관문 사실**의 탐침. writer 스레드가
-/// 첫 바이트 앞에서 호출한다. `Weak<Daemon>` 를 담아 만들므로 순환 참조가 없고(채널에 실린 요청이
-/// 데몬을 살려 두지 않는다), 데몬이 이미 소멸했으면 **보수적으로 "대기 중"**(=중단)을 답한다.
+/// ★(0.14.31 · 성찰 Q1·Q2) writer 가 첫 바이트 앞에서 부르는 **안전 탐침** — 반환 true =
+/// "지금 이 좌석에 큐 본문을 넣으면 안 된다".
+///
+/// 【종전 이름과 범위】 이 자리는 `ApprovalProbe` 였고 승인·관문 feed 만 다시 읽었다. 그런데
+/// 비-alt(B1) 경로는 `expect_gen=None`(세대 불변 미요구 — 그 계약은 의도적이다)이라 **화면 축이
+/// 통째로 없었고**, 남은 승인 feed 는 `check_approvals` 가 15초 주기로만 채운다. 즉 인계~쓰기
+/// (≤800ms) 사이에 **새로 그려진 모달**을 원리상 볼 수 없었다 — 그 창에 본문+Return 이 나갔다.
+/// 이제 탐침은 같은 자리에서 **현재 프레임의 화면**과 **pause** 까지 본다(생성자는
+/// `governance::inject_safety_probe` 하나 — 판정 분리 금지).
+///
+/// `Weak<Daemon>`·`Weak<Surface>` 를 담아 만들므로 순환 참조가 없고(채널에 실린 요청이 좌석·데몬을
+/// 살려 두지 않는다), 어느 쪽이든 이미 소멸했으면 **보수적으로 "막는다"** 를 답한다.
 ///
 /// 왜 세대 카운터가 아니라 탐침인가: 승인·관문 pending 은 `feed_items` 여러 지점에서 바뀌고,
 /// 단조 카운터를 심으려면 그 전 지점을 빠짐없이 계측해야 한다(하나라도 빠지면 가드가 조용히
-/// 거짓 안심을 준다). 탐침은 **판정과 같은 함수**(`governance::approval_or_gate_pending`)를 그대로
-/// 부르므로 판정 분리가 생기지 않는다.
-pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+/// 거짓 안심을 준다). 탐침은 **판정과 같은 함수**(`prompt_gate_verdict`·`no_marker_gate`·
+/// `approval_or_gate_pending`)를 그대로 부르므로 판정 분리가 생기지 않는다.
+///
+/// 【호출 규약 — 락】 writer 는 어떤 큐 락도 쥐지 않은 채 이것을 부른다. 탐침이 잡는 락
+/// (`queue_paused_until` · `feed_items` · `parser` · `last_output`)은 전부 리프이고 **차례로 잡았다
+/// 놓는다** — `pending_queue`/`input_gate` 를 향하는 역간선이 없어야 한다(그 규약을 깨면 배달
+/// 임계영역과 AB-BA 다 · codex 설계 검토 #1).
+pub type SafetyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// ★(0.14.31 · 리뷰 R1 · codex blocking) 큐 배달의 **인계 가드** — "판정이 본 화면"과 "실제로
 /// 바이트가 나가는 순간" 사이를 잇는 유일한 축.
@@ -589,7 +678,8 @@ pub type ApprovalProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 ///   · **출력 세대**(`expect_gen`) — 정적(quiet) 기반 판정 경로만 요구한다. 비-alt(B1) 경로는
 ///     `None` 이다: 그 계약이 스트리밍 중 배달을 허용하고, 불변을 요구하면 연속 출력 노드가
 ///     영구 기아다(기아 #1).
-///   · **승인·관문 pending**(`expect_approval` + [`ApprovalProbe`]) — **모든 경로**가 요구한다.
+///   · **주입 안전**(`expect_approval` + [`SafetyProbe`]: pause · 승인·관문 · 현재 프레임의
+///     화면) — **모든 경로**가 요구한다(★성찰 Q1·Q2).
 ///     §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다"). 종전 가드에는 이 축이 없어서,
 ///     writer 가 적체된 800ms 사이에 승인 feed 가 늘어도(출력 세대는 그대로) 본문이 나갔다.
 ///
@@ -625,8 +715,9 @@ pub struct InjectGuard {
     pub output_gen: Arc<AtomicU64>,
     /// 판정이 본 승인·관문 pending 사실.
     pub expect_approval: bool,
-    /// 지금의 승인·관문 pending 을 다시 읽는 탐침(`None` = 검체 전용 · 축 없음).
-    pub approval: Option<ApprovalProbe>,
+    /// ★(성찰 Q1·Q2) 지금의 **주입 안전**(pause · 승인·관문 · 현재 프레임의 화면)을 다시 읽는
+    /// 탐침(`None` = 검체 전용 · 축 없음).
+    pub safety: Option<SafetyProbe>,
     /// 0 = pending · 1 = claimed · 2 = aborted · 3 = acked(호출부가 claimed 를 수확했다).
     pub state: AtomicU8,
 }
@@ -667,13 +758,13 @@ impl InjectGuard {
         expect_gen: Option<u64>,
         output_gen: Arc<AtomicU64>,
         expect_approval: bool,
-        approval: Option<ApprovalProbe>,
+        safety: Option<SafetyProbe>,
     ) -> Self {
         Self {
             expect_gen,
             output_gen,
             expect_approval,
-            approval,
+            safety,
             state: AtomicU8::new(INJECT_PENDING),
         }
     }
@@ -681,7 +772,23 @@ impl InjectGuard {
     fn output_moved(&self) -> bool {
         self.expect_gen.is_some_and(|g| self.output_gen.load(Ordering::Acquire) != g)
     }
-    /// 두 축 중 하나라도 **주입을 막는가**(승인 탐침 포함 — writer 만 쓴다).
+    /// ★(0.14.31 · 성찰 Q1·Q2) **무거운 축** — 안전 탐침을 실제로 돌린다(pause · 승인·관문 ·
+    /// 현재 프레임의 화면). writer 스레드만 부르고, `claim_for_write` 에서 **정확히 한 번** 돈다
+    /// (`CLAIMING` 을 집은 뒤 · 확정 CAS 앞). 종전에는 소유권을 집기 **전에도** 한 번 돌아 좌석당
+    /// 2회였는데, `CLAIMING` 은 취소 가능한 상태라 앞의 무거운 검사는 안전에 기여하지 않으면서
+    /// writer 를 두 배로 묶었다(codex 설계 검토 #2·#6).
+    fn injection_blocked_now(&self) -> bool {
+        match &self.safety {
+            // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
+            Some(p) => {
+                let now = p();
+                now || self.expect_approval
+            }
+            None => false,
+        }
+    }
+
+    /// 두 축 중 하나라도 **주입을 막는가**(안전 탐침 포함 — writer 만 쓴다).
     ///
     /// ★(0.14.31 · triage 2026-09-08 · codex blocking) 승인 축은 종전에 **변화**만 봤다
     /// (`p() != expect_approval`). 그래서 판정 뒤 다시 읽은 "지금 승인 대기 중"(`expect_approval
@@ -694,21 +801,14 @@ impl InjectGuard {
     /// 사라지는 것도 변화이고, 그 판정은 이미 무효다. 탐침이 없으면(`None` = 검체 전용) 이 축은
     /// 없다(종전과 같다).
     fn axes_moved(&self) -> bool {
-        if self.output_moved() {
-            return true;
-        }
-        match &self.approval {
-            // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
-            Some(p) => {
-                let now = p();
-                now || self.expect_approval
-            }
-            None => false,
-        }
+        self.output_moved() || self.injection_blocked_now()
     }
     /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
     pub fn claim_for_write(&self) -> bool {
-        if self.axes_moved() {
+        // ★(0.14.31 · 성찰 Q1·Q2 · codex 설계 검토 #2) 값싼 축(락 없는 원자 읽기)만으로 먼저
+        //   거른다 — 이미 결판났거나 세대가 흘렀으면 무거운 안전 탐침(화면 복사·스캔 · 락 3개)을
+        //   돌 이유가 없다. 무거운 축은 아래 `CLAIMING` 구간에서 **한 번만** 돈다.
+        if self.output_moved() {
             return match self.state.compare_exchange(
                 INJECT_PENDING,
                 INJECT_ABORTED,
@@ -729,6 +829,7 @@ impl InjectGuard {
             Ok(_) => {
                 // ★소유권을 집은 **뒤** 마지막 재확인. 이 구간의 상태는 `CLAIMING` 이라 호출부가
                 //   수확할 수 없다 = 늦은 중단이 언제나 성립한다(triage codex blocking).
+                //   여기가 안전 탐침의 **유일한** 호출 지점이다(성찰 Q1·Q2).
                 if self.axes_moved() {
                     // 중단 확정. 그 사이 처분자가 먼저 `ABORTED` 로 바꿨어도 결론은 같다.
                     let _ = self.state.compare_exchange(
@@ -1330,6 +1431,33 @@ impl Surface {
             Some(r) if r.guard.abort_if_pending() => Vec::new(),
             Some(r) => r.ids.clone(),
         }
+    }
+
+    /// ★(0.14.31 · 성찰 Q13) **조준 취소** — 예약이 `ids` 중 하나라도 겨누고 있을 때만 중단한다.
+    ///
+    /// 반환 = 지금 인계 중(= 처분 금지)인 항목 id 들. 교집합이 없으면 예약을 **건드리지 않고** 그
+    /// id 들을 그대로 돌려준다(호출자는 그것을 처분 대상에서 뺀다 — 그 항목은 남의 인계다).
+    /// 교집합이 있으면 [`Self::cancel_inject_reservation`] 과 같다. 종전에는 무관한 항목 Y 의
+    /// drop·매 틱 만료 스윕이 진행 중인 X 의 인계를 통째로 끊어, 방향은 안전이었으나 영수증 없는
+    /// 원장 선기록(§9 sha 대조 잡음)과 운영자의 `Raced` 재시도가 쌓였다.
+    ///
+    /// 호출 규약: `pending_queue` 락을 쥔 채 부른다(형제 함수와 같다).
+    pub fn cancel_inject_reservation_targeting(&self, ids: &[String]) -> Vec<String> {
+        let slot = self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            None => Vec::new(),
+            Some(r) if !r.ids.iter().any(|k| ids.iter().any(|t| t == k)) => r.ids.clone(),
+            Some(r) if r.guard.abort_if_pending() => Vec::new(),
+            Some(r) => r.ids.clone(),
+        }
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) `pending_queue` 락을 **여기서 잡고** 취소한다(예약 생성이 그 락
+    /// 안이라 창이 없다). 반환 = 취소하지 못한 항목 수(= writer 가 이미 쓰기로 확정 = 배달 중).
+    /// 호출자는 다른 좌석 락을 쥐지 않은 채 불러야 한다(락 순서 규약).
+    pub fn cancel_inject_reservation_locked(&self) -> usize {
+        let _q = self.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancel_inject_reservation().len()
     }
 
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
@@ -3355,16 +3483,25 @@ impl Daemon {
         if expired_wal.unreadable && !preserve_unreadable_queue_wal(&dir, "queue-expired.json") {
             queue_wal_unpreserved.insert("queue-expired.json");
         }
-        let restored_qentries = active_wal.rows;
+        let mut restored_qentries = active_wal.rows;
         let mut restored_expired = expired_wal.rows;
-        // ★(0.14.31 · 리뷰 R5 · codex major) **파일 간 dedup — 활성이 이긴다.**
-        //   목적지-먼저 쓰기(아래 `persist_queue_state`)는 두 치환 사이의 크래시에서 같은 id 가
-        //   **두 파일에 다 있는** 상태를 남긴다(유실 대신 중복 — 의도된 안전 방향). 그때 두 벌을
-        //   그대로 살리면 같은 항목이 활성 큐와 만료 큐에 동시에 들어간다.
-        //   활성을 이기게 두는 근거: ⓐ 만료→활성(revive) 창의 중복은 **활성이 정답**이다.
-        //   ⓑ 활성→만료 창의 중복도 활성으로 살아나지만, `rehome_restored_queue` 가 복원 시점에
-        //     TTL 을 **재계산**해 이미 만료된 항목을 만료 큐로 되돌린다(§8 "만료 항목을 활성 큐 머리에
-        //     두지 않는다" 는 그 재분류가 집행한다) — 즉 어느 방향이든 유실 0 · 오배달 0 이다.
+        // ★(0.14.31 · 성찰 Q3) **파일 간 dedup 은 파일이 아니라 '영속된 전이 시각' 으로 푼다.**
+        //
+        // 【무엇이 틀렸었나】 종전 규칙은 "활성이 이긴다" 였고, 그 근거는 "활성→만료 창의 중복도
+        //   `rehome_restored_queue` 가 TTL 을 재계산해 만료 큐로 되돌린다" 였다. 그 재계산은 **지금
+        //   시각 기준**이라 두 경우에 확정된 만료를 취소한다: ⓐ 시계 역행(NTP 스텝백)으로 지금이
+        //   만료 시각보다 앞서면 TTL 나이가 다시 짧아지고 ⓑ `CYS_QUEUE_TTL_SECS` 를 올리면 그
+        //   항목은 더 이상 만료가 아니다. 두 경우 모두 만료가 **취소**되고, `revived_at` 이 없으니
+        //   `order_at()` 은 원 `enqueued_at`(가장 오래됨)이라 `queue_merge_insert_pos` 가 그것을
+        //   **활성 큐 머리**에 꽂는다 — §8("만료 항목을 활성 큐 머리에 두지 않는다") 정면 위반이고,
+        //   하필 재기동 직후(부트체인 최취약 창)에 6시간+ 묵은 지시가 최우선으로 배달된다.
+        //
+        // 【지금】 같은 id 가 두 파일에 있으면 `max(expired_at, revived_at)` 이 **큰** 사본이 이긴다.
+        //   두 크래시 창이 방향까지 정확히 갈린다: 만료 이동 창에서는 만료 사본의 `expired_at` 이
+        //   최신이고(만료 승), revive 창에서는 활성 사본의 `revived_at` 이 최신이다(활성 승).
+        //   후속 revive 증거가 없는 확정 만료는 그대로 보존된다. 동률·양쪽 다 부재는 종전대로
+        //   활성 승(무회귀 방향 — 그런 사본은 애초에 만료 전이를 겪은 적이 없다).
+        //   원장 `v=1` 유지 — 새 키를 만들지 않고 **이미 영속돼 있던** 두 시각만 읽는다.
         // 만료 파일의 **디스크 현재 내용**이 목적지-먼저 쓰기의 기억이다(dedup **전** 집합이어야
         // 다음 persist 가 "직전에 만료 파일에 무엇을 남겼는지" 를 정확히 안다).
         let expired_persisted_seed: std::collections::HashSet<String> = restored_expired
@@ -3372,15 +3509,39 @@ impl Daemon {
             .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
             .collect();
         {
-            let live: std::collections::HashSet<&str> = restored_qentries
+            let live: std::collections::HashMap<&str, f64> = restored_qentries
                 .iter()
-                .filter_map(|it| it.get("id").and_then(|v| v.as_str()))
+                .filter_map(|it| {
+                    it.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| (id, queue_row_transition_at(it)))
+                })
                 .collect();
+            // 만료 사본이 이긴 id — 그만큼 활성 사본에서 뺀다(두 파일 어디에도 없는 상태는 만들지
+            // 않는다: 한쪽이 반드시 이긴다).
+            let mut expired_wins: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             restored_expired.retain(|it| {
-                !it.get("id")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|id| live.contains(id))
+                let Some(id) = it.get("id").and_then(|v| v.as_str()) else {
+                    return true; // id 없는 행은 dedup 대상이 아니다(그대로 둔다)
+                };
+                let Some(&live_at) = live.get(id) else {
+                    return true; // 활성 사본이 없다 — 충돌이 아니다
+                };
+                if queue_row_transition_at(it) > live_at {
+                    expired_wins.insert(id.to_string());
+                    true
+                } else {
+                    false // 동률 포함 활성 승(종전 동작)
+                }
             });
+            if !expired_wins.is_empty() {
+                restored_qentries.retain(|it| {
+                    !it.get("id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| expired_wins.contains(id))
+                });
+            }
         }
         let queue_seq_seed = restored_qentries
             .iter()
@@ -3888,7 +4049,9 @@ impl Daemon {
         if !carry.is_empty() {
             if let Err(e) = write_file("queue-expired.json", &expired_entries) {
                 // 만료 파일에 중복이 남는다(활성에도 있는 항목) — 유실이 아니라 중복이고, 읽는 쪽
-                // dedup(활성 우선)이 처리한다. 캐시를 갱신하지 않으므로 다음 persist 가 같은 carry 를
+                // dedup 이 처리한다: carry 는 정의상 **되살린** 항목이라 활성 사본의 `revived_at` 이
+                // 만료 사본의 `expired_at` 보다 최신이고, 전이 시각 규칙(★성찰 Q3)이 활성을 고른다.
+                // 캐시를 갱신하지 않으므로 다음 persist 가 같은 carry 를
                 // 다시 계산해 재시도하고, carry 가 비면 ①이 곧 정상 내용이라 자기치유된다.
                 warn("carry-cleanup", e);
                 return; // 캐시는 ①의 내용(expired ∪ carry) 그대로 — 다음 회차가 같은 carry 를 다시 쓴다
@@ -3973,10 +4136,9 @@ impl Daemon {
                 }
             }
             // 1단: 이관 대상 분리 — role 매칭 항목을 QueueEntry로 되살려 role별 배치로 모은다.
-            // ★비타입 감사 지점 ③(§restored_queue): WAL 원값(id/seq/enqueued_at/from/origin)을
-            // 보존 승계한다 — id는 load_queue_state가 전 항목에 합성 보장(방어적 mid 폴백).
-            // origin 부재(레거시)는 "wal-legacy"로 표기 — 없는 정보를 지어내지 않되
-            // 복원 경유 사실은 관측 가능하게 남긴다.
+            // 되살림 규칙(id=mid 폴백 · origin 부재 "wal-legacy" · TTL 회계 5키 serde default)은
+            // 공용 함수 [`queue_entry_from_row`] 하나가 소유한다(★성찰 Q15 — 비타입 감사 지점 ③
+            // 소멸: 이 자리의 바이트 동일 복제를 그 함수 호출로 교체했다).
             let mut batches: Vec<(String, Vec<QueueEntry>)> = Vec::new();
             // ★(0.14.31 · WP-5 M) 만료 배치 — expired_queue 행선(활성 큐 금지 · §8). 세 출처:
             //   ⓐ queue-expired.json 복원분(expired_at 보유) ⓑ 활성 복원분 중 복원 시점에 이미
@@ -3995,43 +4157,13 @@ impl Daemon {
                 if !role_surface.contains_key(role) {
                     return true; // role 무매칭 — 보존(재기동 더 기다림)
                 }
-                let mut entry = QueueEntry {
-                    id: it
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| it.get("mid").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string(),
-                    seq: it.get("seq").and_then(|v| v.as_u64()).unwrap_or(0),
-                    text: it.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    enqueued_at: it
-                        .get("enqueued_at")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or_else(now_epoch),
-                    from: it.get("from").and_then(|v| v.as_str()).map(str::to_string),
-                    origin: it
-                        .get("origin")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("wal-legacy")
-                        .to_string(),
-                    // ★(0.14.31 · WP-5 M) TTL 회계 5키 관통 — 키 부재(구 데몬이 다시 쓴 WAL·레거시)는
-                    //   serde default 와 같은 값으로 되살린다. 없는 정보를 지어내지 않는다.
-                    ttl_secs: it.get("ttl_secs").and_then(|v| v.as_u64()),
-                    paused_total_secs: it
-                        .get("paused_total_secs")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
-                    expired_at: it.get("expired_at").and_then(|v| v.as_f64()),
-                    revived_at: it.get("revived_at").and_then(|v| v.as_f64()),
-                    expired_notified: it
-                        .get("expired_notified")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    expired_event_sent: it
-                        .get("expired_event_sent")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                };
+                // ★(0.14.31 · 성찰 Q15) 종전에는 여기에 `queue_entry_from_row` 의 **바이트 동일
+                //   복제**가 인라인돼 있었고, 주석 세 개("★비타입 감사 지점 ①②③")가 그 결합을
+                //   스스로 자백했다. `QueueEntry` 에 필드를 더하면 세 곳을 동시에 고쳐야 했고,
+                //   하필 빠뜨리기 쉬운 이 세 번째가 **복원분이 배달 경로로 들어가는 유일한 통로**
+                //   였다(값 산식의 갈림은 컴파일러가 잡지 못한다). 지금은 공용 함수 하나다 —
+                //   감사 지점 ③은 소멸했다(현재 값 동일 → 동작 무변경).
+                let mut entry = queue_entry_from_row(it);
                 let expired_now = entry.expired_at.is_none()
                     && queue_entry_expired(&entry, now, default_ttl);
                 if force_expired || entry.expired_at.is_some() || expired_now {
@@ -4082,12 +4214,23 @@ impl Daemon {
             }
             // ★(0.14.31 · WP-5 M) 만료 복원분 → 대상 surface 의 expired_queue(등장순 · id 중복 배제).
             //   상한 초과 회계(묘비·폐기)는 governance::queue_expiry_pass 가 같은 틱에서 집행한다.
-            for (role, batch) in expired_batches {
+            // ★(0.14.31 · 성찰 Q12) 만료 큐도 **순서 키(`order_at`)로 정렬 병합**한다. 종전에는 파일
+            //   등장순으로 push_back 해서 "앞 = 가장 오래된 것" 이라는 좌석 상한 집행의 전제가 rehome
+            //   뒤에 거짓이 됐다(가장 최근 만료분을 먼저 버렸다 = M9 가 복원 경로에서 고친 정책
+            //   역전의 부활). 축출 후보 선정 자체도 이제 `order_at` 키의 순수 함수 하나가 한다.
+            for (role, mut batch) in expired_batches {
+                batch.sort_by(|a, b| {
+                    a.order_at()
+                        .partial_cmp(&b.order_at())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.seq.cmp(&b.seq))
+                });
                 let surf = &role_surface[&role];
                 let mut x = surf.expired_queue.lock().unwrap();
                 for entry in batch {
                     if !x.iter().any(|e| e.id == entry.id) {
-                        x.push_back(entry);
+                        let pos = queue_merge_insert_pos(&x, entry.order_at(), entry.seq);
+                        x.insert(pos, entry);
                     }
                 }
             }
@@ -4672,24 +4815,37 @@ impl Daemon {
                     let _ = child.try_wait();
                 }
             }
-            // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-            // (★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유).
-            // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중 항목은 남긴다(폐기 통지 뒤 주입 금지).
-            let dropped: Vec<QueueEntry> = crate::governance::drain_active_except_inflight(&surf);
-            if !dropped.is_empty() {
-                // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치).
-                crate::governance::record_active_drain(
-                    &daemon,
-                    surf.id,
-                    &dropped,
-                    "process_exited",
-                );
-                daemon.bus.publish(
-                    "queue.dropped",
-                    "queue",
-                    Some(surf.id),
-                    queue_dropped_payload("process_exited", &dropped, None),
-                );
+            // ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #1) **역할 좌석의 자력 종료는 보존이다.** 이 역할은
+            //   reap 뒤 phoenix 가 되살리고(묘비 없음), 데몬 재기동이었다면 같은 항목이 WAL → 복원 →
+            //   rehome 으로 살아남았다. 종전에는 여기서 활성 큐를 폐기해 그 대칭이 깨졌다 — 그리고
+            //   reap(close_surface) 만 고치면 이 EOF 경로가 먼저 비워 버려 보존할 것이 없다. 그래서
+            //   여기서 `restored_queue` 로 park 한다(`queue.parked` · 폐기 아님). 역할 없는 좌석은
+            //   돌아올 주소가 없으므로 종전대로 폐기한다(인계 중 항목은 남긴다 — 폐기 통지 뒤 주입 금지).
+            match crate::governance::park_active_to_restored(&daemon, &surf, "process_exited") {
+                Some(n) => {
+                    if n > 0 {
+                        daemon.persist_queue_state();
+                    }
+                }
+                None => {
+                    let dropped: Vec<QueueEntry> =
+                        crate::governance::drain_active_except_inflight(&surf);
+                    if !dropped.is_empty() {
+                        // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치).
+                        crate::governance::record_active_drain(
+                            &daemon,
+                            surf.id,
+                            &dropped,
+                            "process_exited",
+                        );
+                        daemon.bus.publish(
+                            "queue.dropped",
+                            "queue",
+                            Some(surf.id),
+                            queue_dropped_payload("process_exited", &dropped, None),
+                        );
+                    }
+                }
             }
             // ★(0.14.31 · WP-5 M) 만료 큐 drain — "삭제 없음" 약속은 **원장 기록**으로 정의한다:
             //   항목마다 원장에 `expired` 사유 레코드를 남긴 뒤 폐기(queue.dropped reason "expired").
@@ -4922,6 +5078,23 @@ impl Daemon {
                             *surface.queue_paused_until.lock().unwrap() = Some(
                                 Instant::now() + std::time::Duration::from_secs(rule.pause_secs),
                             );
+                            // ★(0.14.31 · 성찰 Q2) 전이 순간의 **미확정 예약을 끊는다** — 그러지
+                            //   않으면 헬스가 "이 좌석은 지금 위험하다" 고 판단한 바로 그 순간
+                            //   결판을 기다리던 배달이 그대로 나간다(리더 스레드가 세운 pause 는
+                            //   판정 **이후**라 그 배달을 못 막는다 · 성찰 Q2 사슬).
+                            //   `queue_paused_until` 락은 위 줄에서 이미 놓았다(락 순서 규약).
+                            let still = surface.cancel_inject_reservation_locked();
+                            if still > 0 {
+                                self.bus.publish(
+                                    "queue.inject_uncancellable",
+                                    "queue",
+                                    Some(surface_id),
+                                    json!({"reason": "health_pause_queue", "rule": rule.name,
+                                           "entries": still,
+                                           "hint": "pause 전이 시점에 writer 가 이미 쓰기로 확정한 \
+                                                    배달이 있다 — 그 항목은 나간다(다음 배달부터 정지)"}),
+                                );
+                            }
                             self.bus.publish(
                                 "health.action",
                                 "health",
@@ -4934,6 +5107,55 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// ★(0.14.31 · 성찰 Q2) **미확정 인계 일괄 취소** — pause 전이가 부른다. 반환 = 취소하지
+    /// **못한**(= writer 가 이미 쓰기로 확정한) 좌석 수.
+    ///
+    /// pause 의 계약은 "응답을 손에 쥔 뒤 큐 주입 0" 이다. 그런데 pause 시점에 이미 인계돼
+    /// 결판을 기다리는 예약이 있으면, 그 좌석은 pause 와 무관하게 쓴다(가드의 축은 writer 가
+    /// **첫 바이트 앞에서** 보는 것이고, 그때 pause 를 보게 하는 것이 안전 탐침의 ⓐ축이지만
+    /// writer 가 이미 `CLAIMED` 를 공개한 뒤라면 그 결정은 되돌릴 수 없다 — 수확된 배달은 반드시
+    /// 쓰인다는 계약 때문이다). 그래서 전이 순간에 **아직 확정되지 않은** 예약을 능동으로 끊는다.
+    ///
+    /// 락 규약: `surfaces` → 좌석별 `pending_queue`(전역 순서 그대로). 호출자는 `queue_paused_until`
+    /// 같은 리프 락을 **쥐지 않은 채** 불러야 한다(쥔 채 부르면 배달 임계영역과 AB-BA 다 ·
+    /// codex 설계 검토 #1).
+    ///
+    /// 【남는 창 — 정직】 이미 `CLAIMED`/`ACKED` 인 쓰기는 끊지 못한다. 그 좌석 수를 돌려주므로
+    /// 호출자는 "완전히 0 이 아니다" 를 말할 수 있다. 진짜 fence(본문+CR 완료 대기)는 writer 층의
+    /// 별도 추적이 필요하다(백로그 · codex 설계 검토 #4).
+    /// ★(0.14.31 · 성찰 Q2) kill-switch **전이의 유일한 진입점** — 플래그를 세우고, 켜는 방향이면
+    /// 그 순간의 미확정 인계를 끊는다. 반환 = 끊지 못한(이미 쓰기로 확정된) 좌석 수(끄는 방향은 0).
+    /// `handlers::system.pause` 가 `paused.store(true)` 대신 이것을 불러야 pause 응답을 손에 쥔
+    /// 뒤의 주입 0 이 성립한다(store 만 하면 결판 대기 중인 배달이 그대로 나간다). 영속
+    /// (`persist_pause`)은 종전대로 호출자 책임이다(이 함수는 I/O 를 하지 않는다).
+    pub fn set_paused(&self, on: bool) -> usize {
+        self.paused.store(on, Ordering::SeqCst);
+        if on {
+            self.cancel_unsettled_injects()
+        } else {
+            0
+        }
+    }
+
+    pub fn cancel_unsettled_injects(&self) -> usize {
+        let surfaces: Vec<Arc<Surface>> = self
+            .surfaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        let mut still_writing = 0usize;
+        for s in surfaces {
+            // 예약 생성이 `pending_queue` 안이므로 같은 락 아래에서 취소해야 창이 없다.
+            let _q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.cancel_inject_reservation().is_empty() {
+                still_writing += 1;
+            }
+        }
+        still_writing
     }
 
     /// T4-15 pause 상태 영속 — 데몬 재시작 후에도 kill-switch가 유지된다.
@@ -8345,9 +8567,20 @@ mod tests {
         );
         assert_eq!(ev["payload"]["role"], json!("w2c-merge"));
         assert_eq!(ev["payload"]["reordered"], json!(true), "기존 라이브 항목이 뒤로 밀림");
+        // ★(0.14.31 · 성찰 Q7) `entry_ids` 는 additive **W-id 에코**다 — 소비자(report_gate)가
+        //   "폐기가 아니라 아직 살아서 이동 중" 을 알고 inflight 의 TTL 창을 되감는 조인 키다
+        //   (그러지 않으면 park·rehome 이 seen TTL 을 넘길 때 같은 사건이 다시 enqueue 된다).
+        //   명명 계약(성찰 BLOCKER)이 금지하는 것은 **키명 재사용** — 큐 항목 id 를 이 키에 싣는
+        //   것 — 이지 키의 존재가 아니다. 이 배치의 본문에는 W-id 가 없으므로 에코는 빈 배열이고,
+        //   큐 항목 id 는 어느 것도 여기 들어오지 않는다.
+        let echo = ev["payload"]["entry_ids"]
+            .as_array()
+            .cloned()
+            .expect("W-id 에코 키가 없다 — 소비자가 inflight 를 되감지 못한다");
+        assert!(echo.is_empty(), "W-id 없는 본문인데 에코가 비어 있지 않다: {echo:?}");
         assert!(
-            ev["payload"].get("entry_ids").is_none(),
-            "entry_ids 키명은 W-id 에코 전용 — 재사용 금지(성찰 BLOCKER)"
+            !echo.iter().any(|v| v == "qold.1" || v == "qold.2"),
+            "entry_ids 키명 재사용 금지(성찰 BLOCKER) — 큐 항목 id 가 W-id 에코 키에 실렸다"
         );
         {
             let mut child = s.child.lock().unwrap();
@@ -8407,7 +8640,25 @@ mod tests {
         assert_eq!(p["queue_entry_ids"], json!(["qr.1", "qr.2"]), "병합 삽입 순서 보존");
         assert_eq!(p["role"], json!("worker"));
         assert_eq!(p["reordered"], json!(true));
-        assert!(p.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
+        // ★(0.14.31 · 성찰 Q7) `entry_ids` = additive **W-id 에코**(소비자의 inflight TTL 되감기).
+        //   명명 계약(성찰 BLOCKER)은 **키명 재사용** 금지다 — 아래 두 단언이 그것을 집행한다:
+        //   본문에 W-id 가 없으면 빈 배열이고, 있으면 그 W-id 만 담는다(큐 항목 id 는 절대 아니다).
+        assert_eq!(p["entry_ids"], json!([]), "W-id 없는 본문의 에코가 빈 배열이 아니다");
+        let mut wa = w2c_entry("qr.3", 3, 30.0);
+        wa.text = "[wakeup W-0000abc123] 지시".into();
+        let mut wb = w2c_entry("qr.4", 4, 40.0);
+        wb.text = "[wakeup W-0000abc123] 중복 · [wakeup W-0000def456] 둘째".into();
+        let pw = queue_rehomed_payload("worker", &[wa, wb], false);
+        assert_eq!(
+            pw["entry_ids"],
+            json!(["W-0000abc123", "W-0000def456"]),
+            "W-id 에코가 등장순·중복 제거가 아니다"
+        );
+        assert_eq!(
+            pw["queue_entry_ids"],
+            json!(["qr.3", "qr.4"]),
+            "두 id 체계가 한 키에 섞였다(성찰 BLOCKER)"
+        );
 
         let m = queue_migrated_payload(3, 7, "master", &batch);
         assert_eq!(m["from_surface"], json!(3));
@@ -8475,9 +8726,17 @@ mod tests {
                 json!(["qa.1", "qa.2"]),
                 "additive queue_entry_ids — 큐 순서 보존"
             );
-            assert!(
-                p.get("entry_ids").is_none(),
-                "entry_ids 키명은 W-id 에코 전용(javis_report_gate disarm 조인 키) — 재사용 금지"
+            // ★(0.14.31 · 성찰 Q6) `entry_ids` 는 **W-id 에코 전용**이다 — 두 id 체계가 한 키명을
+            //   공유하면 disarm 조인이 오염된다. 이 검체의 본문에는 W-id 가 없으므로 **빈 배열**이고,
+            //   무엇보다 `queue_entry_ids` 와 **같지 않아야** 한다(키명 재사용 금지의 실체).
+            assert_eq!(
+                p["entry_ids"],
+                json!([] as [&str; 0]),
+                "W-id 가 없는 본문인데 entry_ids 에 무언가 실렸다 — 조인 키 오염"
+            );
+            assert_ne!(
+                p["entry_ids"], p["queue_entry_ids"],
+                "entry_ids 에 큐 항목 id 가 실렸다 — javis_report_gate disarm 조인이 오염된다"
             );
             assert!(
                 p.get("cleared_by").is_none() && p.get("via").is_none(),
@@ -8488,6 +8747,24 @@ mod tests {
         let empty = queue_dropped_payload("cleared", &[], None);
         assert_eq!(empty["count"], json!(0));
         assert_eq!(empty["queue_entry_ids"], json!([] as [&str; 0]));
+        assert_eq!(empty["entry_ids"], json!([] as [&str; 0]));
+        // ★(0.14.31 · 성찰 Q6) 본문에 W-id 가 실려 있으면 **등장 순서 보존 · 중복 제거**로 에코한다
+        //   (`queue.delivered`·`queue.expired` 와 같은 산식 — `governance::wakeup_entry_ids`).
+        let with_wid = vec![
+            w2b_entry("qb.1", 1, "[wakeup W-a1b2c3] 보고 요망", 10.0),
+            w2b_entry("qb.2", 2, "[wakeup W-a1b2c3] 중복 · [wakeup W-ff00] 둘째", 20.0),
+        ];
+        let echoed = queue_dropped_payload("surface_closed", &with_wid, None);
+        assert_eq!(
+            echoed["entry_ids"],
+            json!(["W-a1b2c3", "W-ff00"]),
+            "폐기 통지에 W-id 에코가 없다/틀렸다 — 소비자에게 종결이 도달하지 않아 TTL 마다 재enqueue 된다"
+        );
+        assert_eq!(
+            echoed["queue_entry_ids"],
+            json!(["qb.1", "qb.2"]),
+            "queue_entry_ids 의미가 바뀌었다(두 체계 혼선)"
+        );
         // ★G4(W4-C) exited_reclaim 예외 경유: cleared_by/via 두 키만 additive — 기존 키 불변.
         let reclaimed = queue_dropped_payload("cleared", &dropped, Some((7, "exited_reclaim")));
         assert_eq!(reclaimed["reason"], json!("cleared"), "reclaim 경유도 기존 키 reason 불변");
@@ -9013,6 +9290,13 @@ mod tests {
     /// 붙어서 비-alt 요청은 애초에 아무 재확인도 없었다(codex 반례 ①③).
     /// 지금은 ⓐ 승인 축이 별도 세대 카운터가 아니라 **판정과 같은 술어를 다시 읽는 탐침**이고
     /// ⓑ 출력 세대는 `Option`(비-alt 는 `None`)이라 **모든 경로가 승인 축을 진다**.
+    ///
+    /// ★(0.14.31 · 성찰 Q1 · 핀 정정) 이 탐침은 이제 `SafetyProbe` 다 — 반환 true 의 뜻은 "승인
+    /// 대기 중" 이 아니라 "**지금 이 좌석에 넣으면 안 된다**"(pause · 승인·관문 · 현재 프레임의
+    /// 화면). 아래 ⓑ 가 "탐침 false → 쓴다" 를 핀하는 것은 그대로 옳지만, 종전 문면("승인이
+    /// 없으면 쓴다")은 비-alt 경로에서 **화면을 보지 않아도 된다** 로 읽혔고 그것이 Q1 의 구멍
+    /// (완성된 모달 위에 본문+Return)을 '성공해야 한다' 로 고정하고 있었다. 화면 축의 실검체는
+    /// `governance::reflect_queue_tests::q1_writer_safety_probe_sees_a_modal_drawn_after_the_verdict`.
     #[test]
     fn wp5_r2_inject_guard_carries_the_approval_axis_on_every_path() {
         use super::{InjectGuard, INJECT_ABORTED, INJECT_CLAIMED};
@@ -9020,11 +9304,12 @@ mod tests {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
         };
-        // 승인 pending 을 흉내내는 탐침 — 판정 시점 false, 그 뒤 true 로 바뀐다.
+        // 주입 차단 사실(승인·화면·pause 어느 것이든)을 흉내내는 안전 탐침 — 판정 시점 false,
+        // 그 뒤 true 로 바뀐다.
         let flipped = Arc::new(AtomicBool::new(false));
         let probe = {
             let f = flipped.clone();
-            Arc::new(move || f.load(Ordering::Acquire)) as super::ApprovalProbe
+            Arc::new(move || f.load(Ordering::Acquire)) as super::SafetyProbe
         };
         // ⓐ 비-alt 경로(expect_gen=None · 출력 세대 불변을 요구하지 않는다)도 승인이 뜨면 중단한다.
         let gen = Arc::new(AtomicU64::new(7)); // 홀짝·값 무관 — 이 경로는 세대를 보지 않는다
@@ -9190,10 +9475,10 @@ mod tests {
     /// 정본 §8("승인 대기 게이트는 어떤 경로에서도 면제되지 않는다")이 금지한 바로 그 동작이다.
     #[test]
     fn triage_wp5_guard_must_not_adopt_a_pending_approval_as_its_expectation() {
-        use super::{ApprovalProbe, InjectGuard};
+        use super::{InjectGuard, SafetyProbe};
         use std::sync::{atomic::AtomicU64, Arc};
 
-        let probe: ApprovalProbe = Arc::new(|| true); // 승인은 계속 대기 중이다
+        let probe: SafetyProbe = Arc::new(|| true); // 승인은 계속 대기 중이다
         let guard = InjectGuard::new(None, Arc::new(AtomicU64::new(4)), true, Some(probe));
         assert!(
             !guard.claim_for_write(),
@@ -9207,9 +9492,15 @@ mod tests {
     /// 그 두 번째 관측은 승인 탐침(데몬 락)을 부르므로 짧지 않고, 그 창에서 호출부의 `settle` 이
     /// CLAIMED 를 수확(`ACKED`)하면 늦은 중단 CAS 가 실패해 **바뀐 판정 재료를 보고도 쓴다**.
     /// 재검사가 끝나기 전에는 성공을 수확할 수 없어야 한다(쓰기 권한과 배달 보고의 분리).
+    ///
+    /// ★(0.14.31 · 성찰 Q1·Q2 · 의도적 재핀) 무거운 안전 탐침은 이제 **정확히 한 번**, `CLAIMING`
+    /// 을 집은 뒤에만 돈다(종전 2회 — 소유권을 집기 전의 1회는 취소 가능한 상태라 안전에 기여하지
+    /// 않으면서 writer 를 두 배로 묶었다). 그래서 이 검체의 핀은 "두 번 돌았다" → "**한 번**, 그리고
+    /// 그 한 번은 `CLAIMING` 안에서" 로 바뀐다. 재는 성질은 그대로다: 탐침이 도는 동안 호출부의
+    /// 수확(`CLAIMED→ACKED`)이 **성립할 수 없고**, 탐침이 막으면 writer 는 쓰지 않는다.
     #[test]
     fn triage_wp5_ack_must_not_defeat_the_writer_late_abort() {
-        use super::{ApprovalProbe, InjectGuard, INJECT_ACKED, INJECT_CLAIMED, INJECT_PENDING};
+        use super::{InjectGuard, SafetyProbe, INJECT_ACKED, INJECT_CLAIMED, INJECT_PENDING};
         use std::sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, OnceLock, Weak,
@@ -9218,21 +9509,23 @@ mod tests {
         let slot: Arc<OnceLock<Weak<InjectGuard>>> = Arc::new(OnceLock::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let (s2, c2) = (Arc::clone(&slot), Arc::clone(&calls));
-        // 탐침은 ① 첫 호출(CAS 앞) = 승인 없음 ② 두 번째 호출(CAS 뒤 재검사) = 그 창에서 호출부가
-        // CLAIMED 를 수확했고 승인이 떴다 — 를 재현한다(스레드 타이밍에 기대지 않는다).
-        let probe: ApprovalProbe = Arc::new(move || {
+        // 탐침이 도는 **그 창**에서 호출부가 CLAIMED 를 수확하려 시도하고, 그 사이 승인·모달이
+        // 떴다 — 를 재현한다(스레드 타이밍에 기대지 않는다). 탐침 안에서 상태가 `CLAIMING` 인지도
+        // 함께 잰다: 그것이 "수확이 성립할 수 없다" 의 실체다.
+        let probe: SafetyProbe = Arc::new(move || {
             let n = c2.fetch_add(1, Ordering::AcqRel);
-            if n == 0 {
-                return false;
-            }
             if let Some(g) = s2.get().and_then(Weak::upgrade) {
-                // 호출부(watchdog)의 수확 — settle 이 CLAIMED 를 보고 ACKED 로 굳힌다.
-                let _ = g.state.compare_exchange(
-                    INJECT_CLAIMED,
-                    INJECT_ACKED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                assert_eq!(
+                    g.state.load(Ordering::Acquire),
+                    super::INJECT_CLAIMING,
+                    "탐침 {n}회차가 CLAIMING 밖에서 돌았다 — 소유권을 집기 전의 무거운 검사가 되살아났다"
                 );
+                // 호출부(watchdog)의 수확 — settle 이 CLAIMED 를 보고 ACKED 로 굳히려 한다.
+                let acked = g
+                    .state
+                    .compare_exchange(INJECT_CLAIMED, INJECT_ACKED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                assert!(!acked, "재검사 중에 호출부가 CLAIMED 를 수확했다");
             }
             true // 그 사이 승인·모달이 떴다
         });
@@ -9241,10 +9534,19 @@ mod tests {
         let _ = slot.set(Arc::downgrade(&guard));
         assert_eq!(guard.state.load(Ordering::Acquire), INJECT_PENDING, "전제: 미결판");
         let writes = guard.claim_for_write();
-        assert_eq!(calls.load(Ordering::Acquire), 2, "전제: 재검사가 실제로 두 번 돌았다");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "안전 탐침은 CLAIMING 안에서 정확히 한 번 돈다(성찰 Q1·Q2 재핀)"
+        );
         assert!(
             !writes,
             "호출부가 CLAIMED 를 수확한 뒤에는 승인이 떠도 writer 가 그대로 쓴다 — 안전 재검사가 죽는다"
+        );
+        assert_eq!(
+            guard.state.load(Ordering::Acquire),
+            super::INJECT_ABORTED,
+            "막힌 인계가 ABORTED 로 확정되지 않았다 — 호출부가 항목을 빼 버린다(유실)"
         );
     }
 
@@ -9293,8 +9595,15 @@ mod tests {
     ///
     /// 【무엇을 재는가】 종전 순서(활성 → 만료)에서 활성→만료 이동은 ① 활성 파일이 항목을 잃고
     /// ② 만료 파일이 그것을 얻는다 — ①과 ② 사이의 크래시는 **어느 파일에도 없는** 상태를 남겼다.
-    /// 지금은 **목적지 먼저**라 그 창의 디스크 상태가 "두 파일 모두" 이고, 읽는 쪽은 활성 우선
-    /// dedup + 복원 시점 TTL 재분류로 그것을 정확히 한 벌로 되살린다.
+    /// 지금은 **목적지 먼저**라 그 창의 디스크 상태가 "두 파일 모두" 이고, 읽는 쪽은 dedup 으로
+    /// 그것을 정확히 한 벌로 되살린다(유실 0 · 중복 0).
+    ///
+    /// ★(0.14.31 · 성찰 Q3) dedup 의 **승자 규칙이 바뀌었다** — 종전 "활성이 이긴다" 에서
+    /// "`max(expired_at, revived_at)` 이 큰 사본이 이긴다" 로. 종전 규칙의 안전 논거는 "활성으로
+    /// 되살아나도 rehome 이 TTL 을 재계산해 만료로 되돌린다" 였는데, 그 재계산은 **지금 시각**
+    /// 기준이라 시계 역행·TTL 상향에서 확정된 만료를 취소하고 그 항목을 활성 큐 **머리**에
+    /// 꽂았다(§8 위반). 그래서 아래 ⓑ 의 기대값이 (활성 1 · 만료 0) → (활성 0 · 만료 1) 로
+    /// 바뀐다 — 이 검체가 재는 불변식(유실 0 · 중복 0 · 한 벌)은 그대로다.
     #[test]
     fn wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry() {
         // ── ⓐ 쓰기 순서: 만료 파일이 활성 파일보다 **먼저** 치환된다(소스 핀 · 이동 방향 무관).
@@ -9367,9 +9676,16 @@ mod tests {
         let act = daemon.restored_queue.lock().unwrap().len();
         let exp = daemon.restored_expired.lock().unwrap().len();
         assert_eq!(
+            act + exp,
+            1,
+            "크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — dedup 결손"
+        );
+        // ★(성찰 Q3) 이 잔상은 **활성→만료 이동**의 크래시다: 목적지(만료 파일)가 `expired_at` 을
+        //   방금 찍었고 원본(활성 파일)은 그 앞 사본이다. 그러므로 만료 사본이 최신 사실이다.
+        assert_eq!(
             (act, exp),
-            (1, 0),
-            "크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — 활성 우선 dedup 결손"
+            (0, 1),
+            "확정된 만료가 활성으로 되살아났다 — 시계 역행·TTL 상향이면 그대로 활성 큐 머리 배달이다(§8)"
         );
         // ── ⓒ 계측 타당성: **종전 순서**의 크래시 잔상(두 파일 모두 비어 있음)은 그대로 유실이다.
         //     이 대조군이 없으면 위 단언은 '원래 안 나는 일' 을 확인하는 공허한 검사가 된다.
@@ -9554,7 +9870,8 @@ mod tests {
         )
         .unwrap();
         let d3 = Daemon::new(dir3.join("cysd.sock"));
-        // 복원 dedup(활성 우선)으로 R 은 활성, E 는 만료에 있다. 여기서 E 를 revive 한다(메모리).
+        // 복원 dedup(전이 시각 우선 · ★성찰 Q3)으로 R 은 활성(두 사본 다 전이 없음 = 동률 → 활성),
+        // E 는 만료(만료 사본만 expired_at 보유)에 있다. 여기서 E 를 revive 한다(메모리).
         let revived_e = {
             let mut rx = d3.restored_expired.lock().unwrap();
             let pos = rx
@@ -9977,6 +10294,164 @@ mod tests {
         assert!(
             gate < serialize,
             "보존 판정이 직렬화·치환 뒤에 온다 — 그 순서로는 원본이 이미 덮인다"
+        );
+    }
+}
+
+/// ★(0.14.31 · 성찰 반영 라운드 · daemon-queue) 이 라운드가 세운 큐 생명주기 계약의 검체.
+/// 파일 **끝**에 모은 이유는 병합 충돌의 국소화 하나뿐이다(여러 영역이 같은 파일을 병렬로 고친다).
+#[cfg(test)]
+mod reflect_queue_tests {
+    use super::*;
+
+    /// 한 번 쓰고 버리는 상태 디렉터리 + 그 안의 소켓 경로(unix 에서 `state_dir` = 소켓의 부모).
+    fn scratch_state_dir(tag: &str) -> std::path::PathBuf {
+        let td = std::env::temp_dir().join(format!(
+            "cys-reflectq-{tag}-{}-{}",
+            std::process::id(),
+            (now_epoch() * 1000.0) as u64
+        ));
+        std::fs::create_dir_all(&td).expect("스크래치 상태 디렉터리");
+        td
+    }
+
+    fn write_rows(dir: &std::path::Path, name: &str, rows: &[serde_json::Value]) {
+        std::fs::write(dir.join(name), serde_json::to_string(&rows).expect("직렬화"))
+            .expect("WAL 기록");
+    }
+
+    /// ★(0.14.31 · 성찰 Q3) **WAL 이중 사본의 dedup 은 확정된 만료를 취소하지 않는다.**
+    ///
+    /// 목적지-먼저 쓰기의 크래시 창은 같은 id 를 두 파일에 남긴다(유실 대신 중복 — 의도된 안전
+    /// 방향). 종전 규칙은 "활성이 이긴다" 였고, 그 안전 논거는 "rehome 이 복원 시점에 TTL 을
+    /// 재계산해 만료로 되돌린다" 였다. 그 재계산은 **지금 시각** 기준이라, 시계가 역행했거나
+    /// TTL 이 올라가면 만료가 **취소**된다. 그리고 `revived_at` 이 없으니 `order_at()` 은 원
+    /// `enqueued_at`(가장 오래됨) → 병합 삽입이 그것을 **활성 큐 머리**에 꽂는다 = §8 위반이자
+    /// 재기동 직후(부트체인 최취약 창)에 6시간+ 묵은 지시가 최우선 배달이다.
+    ///
+    /// ⓐ 시계 역행(만료 시각이 '지금' 보다 앞선다) ⓑ TTL 상향(항목 TTL 이 나이보다 크다) 두 축
+    /// 모두에서 만료 사본이 이겨야 한다. ⓒ 반대 방향(revive 창)은 활성이 이겨야 한다 —
+    /// 이 수정이 revive 를 뒤집지 않는다는 음성 대조다.
+    #[test]
+    fn q3_wal_duplicate_resolves_by_persisted_transition_time_not_by_file() {
+        let now = now_epoch();
+        // ⓐ+ⓑ 확정 만료 사본이 있고, 활성 사본은 '지금' 기준으로는 만료가 아니다.
+        //     (enqueued_at = now-20900 · ttl 21600 → 나이 20900 < 21600 = 만료 아님.
+        //      expired_at = now+700 = 그 항목이 실제로 만료된 시각이 '지금' 보다 미래다 = 시계 역행.
+        //      TTL 상향 축도 같은 술어 상태로 수렴한다 — `queue_entry_expired` 가 거짓이 되는 것이
+        //      두 축의 공통 귀결이기 때문이다. 그래서 한 검체가 둘을 함께 핀한다.)
+        let active_row = json!({
+            "mid": "m-q3", "id": "q3-rollback", "seq": 7, "surface_id": 3, "role": "worker",
+            "text": "6시간 묵은 지시", "enqueued_at": now - 20_900.0, "from": "surface:9",
+            "origin": "send", "ttl_secs": 21_600u64, "paused_total_secs": 0.0,
+            "expired_at": serde_json::Value::Null, "revived_at": serde_json::Value::Null,
+            "expired_notified": false, "expired_event_sent": false,
+        });
+        let mut expired_row = active_row.clone();
+        expired_row["expired_at"] = json!(now + 700.0);
+        // ⓒ revive 창의 중복 — 활성 사본이 `revived_at` 으로 더 최근이다.
+        let revived_active = json!({
+            "mid": "m-q3b", "id": "q3-revived", "seq": 8, "surface_id": 3, "role": "worker",
+            "text": "운영자가 되살린 지시", "enqueued_at": now - 30_000.0, "from": "surface:9",
+            "origin": "send", "ttl_secs": 0u64, "paused_total_secs": 0.0,
+            "expired_at": serde_json::Value::Null, "revived_at": now - 5.0,
+            "expired_notified": false, "expired_event_sent": false,
+        });
+        let mut revived_expired = revived_active.clone();
+        revived_expired["revived_at"] = serde_json::Value::Null;
+        revived_expired["expired_at"] = json!(now - 60.0);
+
+        let dir = scratch_state_dir("q3");
+        write_rows(&dir, "queue-state.json", &[active_row, revived_active]);
+        write_rows(&dir, "queue-expired.json", &[expired_row, revived_expired]);
+        let daemon = Daemon::new(dir.join("cys.sock"));
+
+        let live_ids: Vec<String> = daemon
+            .restored_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let exp_ids: Vec<String> = daemon
+            .restored_expired
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        assert!(
+            !live_ids.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 활성 복원분으로 되살아났다 — 시계 역행/TTL 상향이 만료를 취소했다(§8 위반)"
+        );
+        assert!(
+            exp_ids.iter().any(|i| i == "q3-rollback"),
+            "확정 만료 사본이 어디에도 없다(유실) — dedup 은 한쪽을 반드시 남겨야 한다"
+        );
+        assert!(
+            live_ids.iter().any(|i| i == "q3-revived"),
+            "revive 창의 중복에서 활성 사본이 졌다 — 이 수정이 revive 방향을 뒤집었다"
+        );
+        assert!(
+            !exp_ids.iter().any(|i| i == "q3-revived"),
+            "되살린 항목이 만료 사본으로도 남았다 — 같은 id 가 양쪽에 있으면 중복 배달이다"
+        );
+
+        // 배달 경로까지: role 좌석이 살아 있어도 확정 만료는 활성 큐에 들어가지 않는다.
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        *s.role.lock().unwrap() = Some("worker".into());
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        daemon.rehome_restored_queue();
+        let active: Vec<String> = s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let expired: Vec<String> = s
+            .expired_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert!(
+            !active.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 rehome 을 거쳐 활성 큐에 들어갔다(머리 배달 = 부트체인 사고)"
+        );
+        assert!(
+            expired.iter().any(|i| i == "q3-rollback"),
+            "확정 만료가 좌석 만료 큐에도 없다 — 도달 불가(유실)"
+        );
+        assert!(
+            active.iter().any(|i| i == "q3-revived"),
+            "되살린 항목이 배달 경로에 오지 못했다"
+        );
+        let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 전이 시각 판정자의 진리표 — 결측은 값이 아니다(전이를 겪은 적 없음 = 언제나 진다).
+    #[test]
+    fn q3_transition_at_truth_table() {
+        assert_eq!(queue_row_transition_at(&json!({})), f64::NEG_INFINITY);
+        assert_eq!(queue_row_transition_at(&json!({"expired_at": 10.0})), 10.0);
+        assert_eq!(queue_row_transition_at(&json!({"revived_at": 20.0})), 20.0);
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": 10.0, "revived_at": 20.0})),
+            20.0
+        );
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": 30.0, "revived_at": 20.0})),
+            30.0
+        );
+        // null 은 부재와 같다(구 데몬이 다시 쓴 WAL 은 이 키를 null 로 남긴다).
+        assert_eq!(
+            queue_row_transition_at(&json!({"expired_at": serde_json::Value::Null})),
+            f64::NEG_INFINITY
         );
     }
 }
