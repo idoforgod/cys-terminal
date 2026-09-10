@@ -13,8 +13,83 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 const WATCHDOG_INTERVAL_SECS: u64 = 5;
 const LOAD_DEBOUNCE_SECS: f64 = 60.0;
 
+/// ★(0.14.31 · 성찰 Q8) watchdog 루프가 **어디서 도는가**. 관측·보고용(기동 1회).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogMode {
+    /// 전용 OS 스레드(정상) — 틱의 블로킹이 tokio 워커를 점유하지 않는다.
+    DedicatedThread,
+    /// 스레드 생성 실패 폴백 — 종전대로 tokio 태스크에서 돈다(워커 점유 위험 복귀).
+    /// watchdog **소멸**보다는 낫다: 거버넌스가 사라지면 자원 관리·자가치유가 데몬 수명 내내
+    /// 조용히 없다(부트체인 최악). 대신 사실을 반드시 드러낸다(stderr + `watchdog.mode`).
+    AsyncFallback,
+}
+
+/// ★(0.14.31 · 성찰 Q8 · codex 설계 검토 A) 거버넌스 루프를 **런타임 워커 밖**에서 돌린다.
+///
+/// 【무엇이 틀렸었나】 `spawn_watchdog` 은 `tokio::spawn` 이었고 그 틱은 완전 동기다 — 결판
+/// 대기 예산만 2,000ms(`QUEUE_TICK_SETTLE_BUDGET_MS`)이고 대기 구현은 `std::thread::sleep(1ms)`
+/// 폴링이다. 1~2코어(Windows CI 러너·소형 VM)에서 그 구간 동안 accept 루프와 이벤트 스트림
+/// write 가 밀려 `cys send`·`cys status` 가 타임아웃 → 훅 실패 → 부트체인. RPC dispatch 는 정확히
+/// 이 사유로 이미 `spawn_blocking` 을 쓴다(main.rs).
+///
+/// 【왜 전용 스레드인가 — 기각한 대안】 `spawn_blocking` 안의 무한 루프는 abort 로 중단되지 않아
+/// 런타임 드롭이 무한 대기가 되고 블로킹 풀 포화 시 기동 자체가 RPC 뒤로 밀린다. 결판 대기만
+/// 블로킹 풀로 내보내는 안은 동기 사슬을 쪼개야 하고 TLS 예산이 그 스레드로 전달되지 않으며
+/// 프로세스 스캔·파일 I/O 는 그대로 남는다. 문서만 고치는 안은 실제 점유를 남긴다.
+///
+/// 【런타임 컨텍스트】 틱 안에서 런타임을 요구하는 호출은 node-recover 자식(`tokio::spawn`)
+/// 하나뿐이라 `Handle::enter()` 가드로 충분하다. 종료는 양 OS 모두 `process::exit` 라
+/// (main.rs 신호 핸들러) 이 detached 스레드도 프로세스와 함께 회수된다 — 별도 종료 채널은
+/// 이 변경의 차단 조건이 아니다(향후 graceful shutdown 을 도입하면 그때 함께 넣어야 한다).
+pub(crate) fn spawn_governance_loop<F>(name: &str, body: F) -> WatchdogMode
+where
+    F: FnOnce() + Send + 'static,
+{
+    type Body = Box<dyn FnOnce() + Send>;
+    // 스레드 생성이 실패하면 클로저는 `Builder::spawn` 이 삼켜 되돌려주지 않는다 — 그래서
+    // 본체를 셀에 담아 넘기고, 실패 시 **아직 셀 안에 있는** 본체를 폴백 경로가 꺼내 쓴다.
+    let cell: Arc<std::sync::Mutex<Option<Body>>> =
+        Arc::new(std::sync::Mutex::new(Some(Box::new(body) as Body)));
+    let take_and_run = |c: &Arc<std::sync::Mutex<Option<Body>>>| {
+        let f = c.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = f {
+            f();
+        }
+    };
+    let handle = tokio::runtime::Handle::try_current().ok();
+    let inner = Arc::clone(&cell);
+    let spawned = std::thread::Builder::new().name(name.to_string()).spawn(move || {
+        // 런타임 컨텍스트를 이 스레드 전체에 건다(틱 안의 `tokio::spawn` 이 계속 돈다).
+        let _rt = handle.as_ref().map(tokio::runtime::Handle::enter);
+        take_and_run(&inner);
+    });
+    match spawned {
+        Ok(_) => WatchdogMode::DedicatedThread,
+        Err(e) => {
+            eprintln!(
+                "cysd: 전용 watchdog 스레드 생성 실패({e}) — tokio 태스크로 폴백한다\
+                 (거버넌스는 계속 돈다 · 틱이 런타임 워커를 점유할 수 있다)"
+            );
+            tokio::spawn(async move {
+                take_and_run(&cell);
+            });
+            WatchdogMode::AsyncFallback
+        }
+    }
+}
+
+/// watchdog 이 이미 기동했는가 — **프로세스당 1회**. 두 번 돌면 `QUEUE_SEAT_CURSOR`(전역 하나)를
+/// 서로 덮어써 좌석 순회 공정성이 깨지고, 태스크-로컬 디바운스 맵이 두 벌이 되어 경보가 겹친다
+/// (codex 설계 검토 #3). 재기동 요청은 조용히 무시하지 않고 사실을 남긴다.
+static WATCHDOG_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn spawn_watchdog(daemon: Arc<Daemon>) {
-    tokio::spawn(async move {
+    if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {
+        eprintln!("cysd: watchdog 이 이미 기동해 있다 — 중복 기동 요청을 무시한다");
+        return;
+    }
+    let mode = spawn_governance_loop("cys-watchdog", move || {
         let mut sys = System::new();
         let mut last_load_alert: f64 = 0.0;
         let mut last_dup_alert: HashMap<String, f64> = HashMap::new();
@@ -51,7 +126,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             std::collections::HashSet::new();
         let mut tick_no: u64 = 0;
         loop {
-            tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
+            // ★(0.14.31 · 성찰 Q8) 전용 스레드이므로 **동기 sleep** 이다(런타임 타이머 불필요).
+            //   async 폴백 경로에서도 같은 본체가 돌아 그 경우에만 종전처럼 워커를 점유한다.
+            std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS));
             tick_no += 1;
             // 패닉 격리: 한 틱의 unwrap 패닉이 watchdog 태스크 전체를 죽여
             // 자원 거버넌스가 데몬 수명 내내 조용히 사라지는 것을 막는다.
@@ -122,15 +199,24 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 deadman.retain_roles(&deadman_watched_roles());
             });
             if std::panic::catch_unwind(tick).is_err() {
-                daemon.bus.publish(
-                    "watchdog.tick_panic",
-                    "watchdog",
-                    None,
-                    json!({"note": "watchdog tick panicked; continuing next tick"}),
-                );
+                // ★(0.14.31 · 성찰 Q8 · codex #5) **보고 자체도 격리한다** — 종전에는 이 발행이
+                //   catch_unwind 밖이라, 여기서 한 번 패닉하면(poisoned mutex 등) 루프가 통째로
+                //   죽어 거버넌스가 데몬 수명 내내 조용히 사라졌다(부트체인 최악).
+                let d = Arc::clone(&daemon);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    d.bus.publish(
+                        "watchdog.tick_panic",
+                        "watchdog",
+                        None,
+                        json!({"note": "watchdog tick panicked; continuing next tick"}),
+                    );
+                }));
             }
         }
     });
+    if mode == WatchdogMode::AsyncFallback {
+        eprintln!("cysd: watchdog 실행 모드 = async 폴백(전용 스레드 없음)");
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -4532,6 +4618,12 @@ thread_local! {
     /// 이 스레드의 남은 결판 예산(ms). watchdog 틱만 값을 세우고(`deliver_queued` 머리), RPC 처리
     /// 스레드는 `u64::MAX`(예산 없음 = 좌석당 상한만 적용)로 남는다 — 그 경로는 운영자 1회 명령이라
     /// 틱의 후속 작업을 밀지 않는다.
+    ///
+    /// ★(0.14.31 · 성찰 Q8) 이 TLS 가 성립하는 근거는 "전용 스레드" 가 아니라 **`TickSettleBudget`
+    /// 가드의 생성~Drop 사이에 `.await` 가 없다**는 것이다(동기 `deliver_queued` 안에서 RAII).
+    /// 그 사이 태스크가 워커를 옮길 수 없으므로 다른 스레드에서 Drop 되지 않는다. watchdog 이
+    /// 전용 스레드로 옮겨진 뒤에도 근거는 같다 — 그러니 예산 가드를 await 너머로 살려두는 변경은
+    /// 이 계약을 깨뜨린다(앞으로도 가드는 한 동기 구간 안에서 끝나야 한다).
     static TICK_SETTLE_BUDGET_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
@@ -8069,7 +8161,11 @@ fn deliver_queued(
 
 /// ★(0.14.31 · triage 2026-09-08 · #7) 좌석 순회 재개 지점(surface id · 0 = 처음부터).
 /// 결판 예산이 바닥나 건너뛴 첫 좌석을 다음 틱의 시작점으로 삼는다 = 라운드로빈. 프로세스
-/// 전역 하나인 이유: 큐 틱은 watchdog 스레드 하나에서만 돈다(다중 데몬은 별 프로세스).
+/// 전역 하나인 이유: 큐 틱은 **단일 watchdog 실행 흐름**에서만 직렬로 돈다(다중 데몬은 별
+/// 프로세스). ★(0.14.31 · 성찰 Q8) 그 단일성은 두 장치가 함께 지킨다 — 기동 1회 보증
+/// (`WATCHDOG_STARTED`)과 전용 스레드([`spawn_governance_loop`]). 스레드 생성 실패 폴백에서도
+/// 실행 흐름은 하나다(태스크 1개). 이것이 깨지면 두 흐름이 커서를 서로 덮어써 특정 좌석이
+/// 영구히 배달을 잃는다(관측상 dead pane).
 static QUEUE_SEAT_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// ★(0.14.31 · WP-5 B-2②) stale `pending_input_bytes` 리셋 — 조건 전부 AND:
@@ -18011,6 +18107,97 @@ mod reflect_queue_tests {
             .min()
             .unwrap();
         assert_eq!(min_idx, 200, "활성 그룹에서 가장 오래된 200행이 아니라 다른 것이 축출됐다");
+    }
+
+    /// ★(0.14.31 · 성찰 Q8) **거버넌스 루프는 tokio 워커를 점유하지 않는다.**
+    ///
+    /// 【무엇이 틀렸었나】 watchdog 은 `tokio::spawn` 이었고 틱은 완전 동기다 — 결판 대기 예산만
+    /// 2,000ms 이고 대기 구현은 `std::thread::sleep(1ms)` 폴링이다. 1~2코어에서 그 구간 동안
+    /// accept 루프·이벤트 스트림 write 가 밀려 `cys send`·`cys status` 가 타임아웃 → 훅 실패 →
+    /// 부트체인. 이 검체는 **워커 1개** 런타임에서 세 축을 함께 잰다:
+    ///   ① 본체가 도는 스레드가 런타임 워커와 **다른 스레드**다(이름만으로는 증명이 아니다).
+    ///   ② 본체가 300ms 를 블로킹하는 동안 별도 async 태스크가 **계속 진행한다**(진행성 = 비점유의
+    ///      직접 증거 · codex 설계 검토 #6). 종전 배선이면 이 값이 0 이다.
+    ///   ③ 그 스레드 안에서도 런타임 컨텍스트가 살아 있다(틱의 `tokio::spawn` = node-recover 자식).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn q8_governance_loop_runs_off_the_runtime_workers() {
+        use std::sync::atomic::AtomicU64;
+        let worker = tokio::spawn(async { std::thread::current().id() }).await.expect("워커 신원");
+        let ticker = Arc::new(AtomicU64::new(0));
+        let pump_ticker = Arc::clone(&ticker);
+        // async 진행성 계측기 — 워커가 블로킹되면 이 값이 늘지 않는다.
+        let pump = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                pump_ticker.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body_ticker = Arc::clone(&ticker);
+        let mode = spawn_governance_loop("cys-watchdog-probe", move || {
+            let name = std::thread::current().name().unwrap_or("").to_string();
+            let id = std::thread::current().id();
+            let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+            let before = body_ticker.load(AtomicOrdering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(300)); // 틱의 결판 대기 흉내
+            let advanced = body_ticker.load(AtomicOrdering::Relaxed) - before;
+            let _ = tx.send((name, id, in_runtime, advanced));
+        });
+        assert_eq!(mode, WatchdogMode::DedicatedThread, "전용 스레드로 뜨지 않았다");
+        let (name, id, in_runtime, advanced) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+                .await
+                .expect("거버넌스 본체가 10초 안에 끝나지 않았다")
+                .expect("본체가 결과를 보내지 못했다");
+        pump.abort();
+        assert_eq!(name, "cys-watchdog-probe", "스레드 이름이 다르다");
+        assert_ne!(id, worker, "거버넌스 루프가 런타임 워커 스레드에서 돈다(점유 그대로)");
+        assert!(
+            advanced >= 10,
+            "본체가 300ms 블로킹하는 동안 async 태스크가 {advanced} 번밖에 못 돌았다 — 워커 점유"
+        );
+        assert!(in_runtime, "런타임 컨텍스트가 없다 — 틱 안의 tokio::spawn 이 조용히 죽는다");
+    }
+
+    /// ★(0.14.31 · 성찰 Q8) **런타임 컨텍스트가 없어도 거버넌스 루프는 뜬다.** `Handle::try_current`
+    /// 가 실패하는 호출(테스트·동기 부트 경로)에서 `expect`/`unwrap` 으로 죽으면 그것이 곧 watchdog
+    /// 소멸이다 — 자원 관리·자가치유가 데몬 수명 내내 조용히 없다(부트체인 최악).
+    #[test]
+    fn q8_governance_loop_starts_without_a_runtime_context() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "전제 붕괴: 이 검체는 런타임 밖에서 돌아야 한다"
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mode = spawn_governance_loop("cys-watchdog-nort", move || {
+            let _ = tx.send(std::thread::current().name().unwrap_or("").to_string());
+        });
+        assert_eq!(mode, WatchdogMode::DedicatedThread);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect("본체가 돌지 않았다"),
+            "cys-watchdog-nort"
+        );
+    }
+
+    /// ★(0.14.31 · 성찰 Q8 · codex 설계 검토 #3) **watchdog 은 프로세스당 한 흐름이다** — 소스 핀.
+    ///
+    /// 두 흐름이 돌면 전역 `QUEUE_SEAT_CURSOR` 를 서로 덮어써 특정 좌석이 영구히 배달을 잃고
+    /// (관측상 dead pane), 태스크-로컬 디바운스 맵이 두 벌이 되어 경보가 겹친다. 실행 증거로
+    /// 재려면 실제 watchdog 을 띄워야 하는데(5초 주기 · 전 좌석 순회) 그것은 테스트 바이너리
+    /// 전체에 부작용을 남긴다 — 그래서 여기서는 **기동 1회 보증 배선의 존재**만 고정한다.
+    /// (정직: 이것은 문면 핀이며 실행 증거가 아니다. 배선을 지우는 변경은 잡지만, 배선이 있는데
+    /// 논리가 틀린 경우는 잡지 못한다.)
+    #[test]
+    fn q8_watchdog_start_is_guarded_once_per_process() {
+        let src = include_str!("governance.rs");
+        assert!(
+            src.contains("if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {"),
+            "watchdog 기동 1회 보증이 사라졌다 — 두 흐름이 좌석 커서를 덮어쓴다"
+        );
+        assert!(
+            src.contains(r#"spawn_governance_loop("cys-watchdog""#),
+            "watchdog 이 전용 스레드 배선을 쓰지 않는다 — 틱이 런타임 워커를 다시 점유한다"
+        );
     }
 
     /// ★(0.14.31 · 성찰 Q11) **머리가 임계를 넘게 기다렸으면 배달 최소 간격이 단계적으로 줄어든다.**
