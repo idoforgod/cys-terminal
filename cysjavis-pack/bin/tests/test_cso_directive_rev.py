@@ -52,6 +52,7 @@ repo 지시문만 읽으며 HOME·라이브 팩을 건드리지 않는다. 변�
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import sys
@@ -238,8 +239,15 @@ META_NEGATION_PATTERNS = (
 )
 # 예산 면제 집합의 **정확한 원소**(과대 면제도 과소 면제도 거부한다 — codex 는 목록에
 # `cys send --to master-shadow` 를 더해도 통과시켰다).
+# ★D1(반성 라운드 2026-09-10): 훅이 실제로 면제하는 5종(하위 명령)과 2종(read-screen·todo-path)이
+#   빠져 있었다 — 'master hang ∧ 예산 소진' 교차에서 지침상 출구가 `send --to master` 뿐이고 그
+#   수신자가 곧 hang 대상이라 **문서상 출구가 0** 이 됐다(훅은 열려 있는데 지침이 닫았다).
+#   이 집합은 이제 `gate_hook_contract_violations()` 가 훅 선언과 **집합으로** 대조한다.
 EXPECTED_BUDGET_EXEMPT = frozenset((
     "cys cycle-agent", "cys set-status", "cys identify", "cys status", "cys list",
+    "cys read-screen", "cys todo-path",
+    "cys queue list", "cys feed list", "cys feed push", "cys schedule list",
+    "cys approval check",
     "cys send --to master", "cys send --queued --to master",
 ))
 STRAY_EVENT_RE = re.compile(r"[a-z_]+(?:\.[a-z_*]+)+")
@@ -387,8 +395,17 @@ SAFETY_CLAUSES = {
 }
 # 검체가 읽는 지시문 — 마지막 하나는 `scripts/gen_ceo_template.py` 가 MASTER 를 바이트 연접해 만드는
 # **생성물**이다(형제 지침만 고치고 생성물을 재합성하지 않으면 배포본에 옛 문면이 남는다 — R2 수렴).
+# ★D8(반성 라운드 2026-09-10): `WORKER_DIRECTIVE.md` 를 읽는 목록에 넣는다 — 템플릿이 워커를
+#   'master 전용' 블록의 실행 대상에서 제외했는데 그 **정본**은 여전히 구독을 지시하고 있었고,
+#   템플릿 자신의 충돌 규칙("정본은 각 `*_DIRECTIVE.md` 다")대로면 정본이 이겨 라벨이 무효였다.
 READ_DIRECTIVES = ("CSO_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md", "MASTER_DIRECTIVE.md",
-                   "CEO_TEMPLATE.md")
+                   "WORKER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+# 템플릿의 'master 전용' 블록이 실행 대상에서 **제외**한 역할 ↔ 그 역할의 정본 파일.
+EXCLUDED_ROLE_CANON = {
+    "CSO": "CSO_DIRECTIVE.md",
+    "워커": "WORKER_DIRECTIVE.md",
+    "리뷰어": "REVIEWER_DIRECTIVE.md",
+}
 MANDATED_PUSH = "cys send --queued --to master"
 GATE_HOOK = "role-capability-gate.sh"
 CLAUSE_PINS = ("exited surface 자동 reap", "즉시성")
@@ -439,17 +456,31 @@ TEMPLATE_PATHS = {
 }
 
 
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
 def strip_html_comments(text: str) -> str:
     """한 줄·여러 줄 HTML 주석만 제거하고 본문은 보존한다."""
-    return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return HTML_COMMENT_RE.sub("", text)
 
 
-def _mask_html_comments(text: str) -> str:
-    r"""HTML 주석을 **같은 길이의 NUL** 로 가린다 — 원문 오프셋을 보존한 채 주석을 판정에서 뺀다.
+def _drop_html_comments_offsets(text: str) -> tuple[str, list[int]]:
+    """주석을 **삭제**한 문자열과, 그 문자열 각 문자의 원문 위치.
 
-    공백으로 가리면 `normalize` 의 공백 접기가 주석 앞뒤 낱말을 이어 붙여 없던 매치를 만든다.
-    NUL 은 `\s` 도 낱말도 아니라 어떤 조항 문안과도 매치되지 않는다."""
-    return re.sub(r"<!--.*?-->", lambda m: "\0" * (m.end() - m.start()), text, flags=re.DOTALL)
+    ★D7(반성 라운드 2026-09-10): 종전엔 주석을 같은 길이의 NUL 로 **가려**(mask) 오프셋을 지켰다.
+    그런데 문면 판정(`missing_safety_clauses`)은 주석을 **지우고**(strip) 본다 — 두 투영이 달라
+    조항 **안**에 주석이 들어가면 판정은 통과하는데 변조 앵커만 사라져 검체 전체가 붉어졌다
+    (정당한 문서 편집이 3레인을 막는 거짓 적색). 이제 둘 다 '삭제' 를 쓰고, 오프셋은 지도로 잇는다."""
+    kept, index, i, n = [], [], 0, len(text)
+    while i < n:
+        match = HTML_COMMENT_RE.match(text, i)
+        if match:
+            i = match.end()
+            continue
+        kept.append(text[i])
+        index.append(i)
+        i += 1
+    return "".join(kept), index
 
 
 def normalize(text: str) -> str:
@@ -721,6 +752,22 @@ def _normalize_offsets(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(out), starts, ends
 
 
+def clause_projection(raw: str) -> tuple[str, list[int], list[int]]:
+    """조항 판정이 쓰는 **공유 투영**과 원문 오프셋 지도.
+
+    투영 = `normalize(strip_html_comments(raw))` 와 **바이트 등가**여야 한다 — 문면 판정과 변조
+    앵커가 서로 다른 문자열을 보는 순간 정당한 편집이 검체를 붉힌다(D7). 갈리면 조용히 통과하지
+    않고 예외다(판정 불능은 통과가 아니다)."""
+    bare, index = _drop_html_comments_offsets(raw)
+    folded, starts, ends = _normalize_offsets(bare)
+    if folded != normalize(strip_html_comments(raw)):
+        raise AssertionError("공유 투영이 strip 기준과 갈렸다 — 문면 판정과 변조 앵커가 "
+                             "다른 문자열을 본다(투영기를 고쳐라)")
+    return (folded,
+            [index[b] for b in starts],
+            [index[b - 1] + 1 for b in ends])
+
+
 def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
     """원문에서 `clause` 가 차지하는 [시작, 끝) — **정규화 기준**이라 리플로우·강조 표식과 무관하다.
 
@@ -731,9 +778,10 @@ def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
     조항 조각(`…제외·`)처럼 낱말 중간에서 끝나는 앵커도 갈아끼워야 하기 때문이다.
     ★R2 수렴(codex minor): 유일성은 **주석 밖 본문** 기준이다 — 문면 판정(`missing_safety_clauses`)이
     주석을 걷어내고 보는데 여기만 원문 전체에서 유일성을 요구하면, 문서 끝 HTML 주석에 조항을
-    참고용으로 복사하는 것만으로 '등장 2회' 예외가 났다. 주석은 **같은 길이의 NUL 로 가려** 원문
-    오프셋을 보존한 채 제외한다(삭제하면 좌표가 밀리고, 공백으로 지우면 접힘이 낱말을 잇는다)."""
-    folded, starts, ends = _normalize_offsets(_mask_html_comments(raw))
+    참고용으로 복사하는 것만으로 '등장 2회' 예외가 났다.
+    ★D7(반성 라운드 2026-09-10): 그 제외를 **문면 판정과 같은 투영**(`clause_projection` — 주석
+    삭제)으로 한다. 종전의 NUL 마스크는 조항 **안**에 주석이 들어간 순간 그 조항을 못 찾았다."""
+    folded, starts, ends = clause_projection(raw)
     needle = normalize(clause)
     spans, at = [], folded.find(needle)
     while at >= 0:
@@ -744,7 +792,8 @@ def raw_span_of(raw: str, clause: str) -> tuple[int, int]:
                              % (len(spans), needle[:48]))
     begin, finish = spans[0]
     span = (starts[begin], ends[finish - 1])
-    assert normalize(raw[span[0]:span[1]]) == needle, "원문 구간의 정규화가 매치와 다르다"
+    assert normalize(strip_html_comments(raw[span[0]:span[1]])) == needle, \
+        "원문 구간의 공유 투영이 매치와 다르다"
     return span
 
 
@@ -792,6 +841,21 @@ def _scan_outside_quotes(line: str):
         yield None
 
 
+def unquoted_comment_index(line: str) -> int | None:
+    """인용 밖 주석(`#`)이 시작하는 위치 — 없거나 **판정 불능**(따옴표 불일치)이면 `None`.
+
+    셸에서 인용 밖 `#` 는 낱말 첫 자리일 때만 주석이다. 따옴표가 닫히지 않으면 그 `#` 가 인용 안일
+    수도 있으므로 "주석 없음" 으로 접는다 — 그 줄은 어차피 `shell_command_segments` 가 판정 불능
+    (위반)으로 잡는다(보수적)."""
+    for item in _scan_outside_quotes(line):
+        if item is None:
+            return None
+        index, ch, at_word_start = item
+        if ch == "#" and at_word_start:
+            return index
+    return None
+
+
 def code_part(line: str) -> str:
     """인용 밖 주석(`#`)을 걷어낸 **실행 부분**.
 
@@ -799,13 +863,8 @@ def code_part(line: str) -> str:
     때문에 "따옴표 불일치 → 판정 불능" 으로 붉어졌다. 셸에서 인용 밖 `#` 는 낱말 첫 자리일 때만
     주석이므로 그 규칙 그대로 자른다 — `: '#' ; cys events --reconnect`(따옴표 안 `#`)는 잘리지
     않는다(R3 codex L5 의 회귀 방지). 따옴표가 닫히지 않으면 **원문 그대로** 돌려준다(보수적)."""
-    for item in _scan_outside_quotes(line):
-        if item is None:
-            return line
-        index, ch, at_word_start = item
-        if ch == "#" and at_word_start:
-            return line[:index]
-    return line
+    index = unquoted_comment_index(line)
+    return line if index is None else line[:index]
 
 
 def heredoc_tags(line: str) -> list[str]:
@@ -856,7 +915,13 @@ def _walk_block(block: str) -> tuple[list[tuple[str, bool]], list[str]]:
             i += 1
             continue
         logical = line
-        while _odd_trailing_backslashes(logical) and i + 1 < len(raw):
+        # ★D6 수렴(반성 라운드 2026-09-10): **주석 종료가 행 계속보다 먼저**다. 셸에서 인용 밖
+        #   `#` 뒤는 개행까지 전부 주석이므로 행말 역슬래시가 있어도 다음 줄과 접합되지 않는다.
+        #   종전 순서는 `echo ok # 설명 \` + 다음 줄 `cys "$verb" --reconnect` 를 한 논리 줄로
+        #   접합했고, 그 뒤 `code_part` 가 `#` 부터 잘라 **다음 줄의 동적 구독을 통째로 삼켰다**
+        #   (그 줄은 실제로는 독립 명령으로 실행된다 — 검출력이 아니라 판정 대상이 사라졌다).
+        while (unquoted_comment_index(logical) is None
+               and _odd_trailing_backslashes(logical) and i + 1 < len(raw)):
             logical = logical[:-1] + raw[i + 1]
             i += 1
         out.append((logical, True))
@@ -1032,6 +1097,52 @@ def command_substitutions(line: str) -> list[str]:
     return out
 
 
+# ★D6 수렴(반성 라운드 2026-09-10): **명령 래퍼를 명시적으로 해석**한다. `command cys "$verb"` 는
+#   셸이 `cys "$verb"` 로 실행하는데 종전 판정기는 명령 이름을 `command` 로 읽고 "cys 가 아니다" 로
+#   통과시켰다(`builtin`·`exec`·`nohup`·`env` 도 같다). 값 = (값을 먹지 않는 옵션, 값을 먹는 옵션).
+#   **모르는 옵션은 통과가 아니라 판정 불능(위반)** 이다 — 아는 것만 걷는다(allowlist 의 뜻).
+COMMAND_WRAPPERS = {
+    "command": (("-p", "-v", "-V"), ()),
+    "builtin": ((), ()),
+    "exec":    (("-c", "-l"), ("-a",)),
+    "nohup":   ((), ()),
+    "time":    (("-p",), ()),
+    "env":     (("-i", "-"), ("-u",)),
+}
+_WRAPPER_DEPTH = 4          # 래퍼 중첩 상한 — 넘으면 판정하지 않고 바깥이 동적/미지 이름으로 잡는다
+
+
+def _strip_command_wrappers(seg: list[tuple[str, bool]], head: int) -> tuple[int, str | None]:
+    """명령 래퍼를 걷어 **실제 명령 이름의 위치**를 돌려준다 — (위치, 판정 불능 사유 또는 None)."""
+    for _ in range(_WRAPPER_DEPTH):
+        if head >= len(seg):
+            return head, None
+        name, dynamic = seg[head]
+        if dynamic:
+            return head, None                       # 동적 이름은 호출자가 판정한다
+        base = os.path.basename(name)
+        if base not in COMMAND_WRAPPERS:
+            return head, None
+        opts, value_opts = COMMAND_WRAPPERS[base]
+        head += 1
+        while head < len(seg):
+            token = seg[head][0]
+            if base == "env" and _ASSIGN_RE.match(token):
+                head += 1                           # `env NAME=value cys …` 의 선행 대입
+                continue
+            if not token.startswith("-") or token == "-":
+                break
+            if token in value_opts:
+                head += 2
+                continue
+            if token in opts:
+                head += 1
+                continue
+            return head, ("명령 래퍼 `%s` 의 옵션 `%s` 를 해석할 수 없다 — 실제 실행될 명령을 "
+                          "정할 수 없다" % (base, token))
+    return head, None
+
+
 def literal_subscription_violations(line: str, where: str) -> list[str]:
     """실행되지 않는 영역(히어독 본문)에도 거는 **리터럴 바닥 검사**(빈 목록이 합격).
 
@@ -1065,6 +1176,10 @@ def subscription_command_violations(line: str, depth: int = 0) -> list[str]:
         #   않으므로 대입은 **동적이든 아니든** 걷는다 — 값 안의 명령 치환은 위 재귀가 본다.
         while head < len(seg) and _ASSIGN_RE.match(seg[head][0]):
             head += 1        # 선행 `NAME=value` 할당은 걷는다 — **값은 전파하지 않는다**
+        head, wrapper_problem = _strip_command_wrappers(seg, head)
+        if wrapper_problem:
+            out.append("공용 블록 실행 줄의 %s: %s" % (wrapper_problem, line.strip()))
+            continue
         if head >= len(seg):
             continue
         name, name_dynamic = seg[head]
@@ -1133,6 +1248,45 @@ def template_subscription_violations(text: str) -> list[str]:
     return out
 
 
+def excluded_roles_declared(text: str) -> list[str]:
+    """템플릿의 'master 전용' 블록 표제가 실행 대상에서 제외한다고 적은 역할 이름."""
+    for head, _body in fenced_blocks(text):
+        if TEMPLATE_MASTER_HEAD in head:
+            return [role for role in EXCLUDED_ROLE_CANON if role in head]
+    return []
+
+
+def role_canon_conflict_violations(text: str, canon: dict[str, str]) -> list[str]:
+    """템플릿이 제외한 역할의 **정본**이 여전히 구독을 지시하면 위반(빈 목록이 합격).
+
+    ★D8: 템플릿 자신의 충돌 규칙은 "정본은 각 `*_DIRECTIVE.md` 다" 이므로 둘이 어긋나면 **정본이
+    이긴다** — 즉 '워커 제외' 라벨이 무효가 된다. 라벨만 핀하고 정본을 안 보면, 이번 판이 CSO 에게서
+    닫은 비용 경로(세션마다 구독 → 고아 구독 생존 → 경보 재매칭 자기증폭)가 워커 좌석에 그대로
+    열려 있는데도 검체가 초록이다(능력 게이트는 CSO 전용이라 막지도 않는다)."""
+    out = []
+    declared = excluded_roles_declared(text)
+    if not declared:
+        return ["'master 전용' 블록 표제가 제외 역할을 하나도 명시하지 않는다 — "
+                "그 라벨이 없으면 전 좌석 공통 지시로 읽힌다"]
+    for role in sorted(declared):
+        name = EXCLUDED_ROLE_CANON[role]
+        body = canon.get(name)
+        if body is None:
+            out.append("%s 정본(%s)을 읽지 못해 대조할 수 없다 — 판정 불능은 통과가 아니다"
+                       % (role, name))
+            continue
+        if name == "CSO_DIRECTIVE.md":
+            # CSO 정본은 이 검체의 정본 금지 조항 판정이 이미 전담한다(언급 자체는 허용 · span 안).
+            out += ["CSO 정본: %s" % hit for hit in event_stream_violations(strip_html_comments(body))]
+            continue
+        folded = normalize(strip_html_comments(body))
+        for match in re.finditer(r"cys events", folded):
+            out.append("%s 정본(%s)이 구독 스트림을 언급한다 — 템플릿은 그 역할을 실행 대상에서 "
+                       "제외했고 충돌 시 **정본이 이긴다**(라벨이 무효가 된다): …%s…"
+                       % (role, name, folded[max(match.start() - 28, 0):match.end() + 36]))
+    return out
+
+
 def bullet_body(body: str, head: str) -> str:
     """`- **<표제>` 로 시작하는 bullet 본문(다음 bullet 직전까지)."""
     start = body.find(head)
@@ -1176,25 +1330,265 @@ def push_form_is_budget_exempt(body: str) -> bool:
                for pre in budget_exempt_prefixes(body))
 
 
-def gate_hook_contract_violations() -> list[str]:
-    """능력 게이트 훅(WP-3 A)이 배선되면 지침과의 계약 3항을 검사한다(미배선이면 빈 목록).
+HOOK_PY_OPEN = "<<'PYEOF'"          # 훅이 판정 파이썬을 인터프리터에 넘기는 히어독
+HOOK_PY_CLOSE = "PYEOF"
 
-    지금은 훅에 CSO 판정이 없어 항상 빈 목록이다 — 이것은 **미래를 향한 트립와이어**이며,
-    붉어지면 뜻은 '훅을 지침에 맞춰라' 이지 '지침을 훅에 맞춰 넓혀라' 가 아니다."""
-    path = os.path.join(os.path.dirname(BIN), "hooks", GATE_HOOK)
-    if not os.path.isfile(path):
-        return []
-    with open(path, encoding="utf-8", errors="replace") as source:
-        text = source.read()
-    if "tool_calls" not in text and "CronCreate" not in text:
+
+def hook_path() -> str:
+    return os.path.join(os.path.dirname(BIN), "hooks", GATE_HOOK)
+
+
+def hook_python_block(text: str) -> str:
+    """훅 셸 스크립트에서 **판정 파이썬 블록**만 떼어 낸다.
+
+    ★D6(반성 라운드 2026-09-10): 종전 판정기는 훅 소스를 통째 문자열로 읽고 `in text` 로만 봤다 —
+    그래서 ⓐ훅 **주석**에 우연히 든 문자열이 트립와이어를 만족시켜 실제 허용을 제거해도 초록이었고
+    (실증: `CSO_CYS_SUBVERBS["feed"]` 에서 `"push"` 를 지워도 전건 OK) ⓑ거동과 무관한 주석 한 줄을
+    더하는 것만으로 3레인이 붉어졌다(문서 편집이 릴리스를 막는다). 판정은 **코드**를 봐야 한다.
+    구조를 못 읽으면 조용히 통과하지 않는다 — 판정 불능은 통과가 아니다."""
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.strip().endswith(HOOK_PY_OPEN)]
+    if len(heads) != 1:
+        raise AssertionError("훅의 `%s` 히어독이 %d 개다(1 이어야 한다) — 판정기를 고쳐라"
+                             % (HOOK_PY_OPEN, len(heads)))
+    ends = [i for i in range(heads[0] + 1, len(lines)) if lines[i].rstrip() == HOOK_PY_CLOSE]
+    if not ends:
+        raise AssertionError("훅의 파이썬 히어독 종료(`%s`)를 찾지 못했다" % HOOK_PY_CLOSE)
+    return "\n".join(lines[heads[0] + 1:ends[0]])
+
+
+def _module_sets(tree: ast.Module, names: tuple[str, ...]) -> dict[str, object]:
+    """훅 파이썬 블록의 **모듈 수준** 상수 선언을 값으로 읽는다(리터럴만)."""
+    out: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in names:
+                out[target.id] = ast.literal_eval(node.value)
+    return out
+
+
+def _verb_literal_membership(tree: ast.Module) -> list[tuple]:
+    """`verb in (…리터럴…)` 형태의 비교 — 훅의 **예산 면제 조회 동사** 집합이 이 형태로 적혀 있다."""
+    hits = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Compare) and isinstance(node.left, ast.Name)
+                and node.left.id == "verb" and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.In)
+                and isinstance(node.comparators[0], (ast.Tuple, ast.Set, ast.List))):
+            try:
+                hits.append(tuple(ast.literal_eval(node.comparators[0])))
+            except ValueError:
+                continue
+    return hits
+
+
+def _verb_eq_branches(tree: ast.Module) -> list[tuple[str, ast.If]]:
+    """`verb == "<동사>"` 분기 목록 — 하위 명령 계약이 따로 있는 동사(`send`·`cycle-agent`)의 자리."""
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "verb"
+                and len(node.test.ops) == 1 and isinstance(node.test.ops[0], ast.Eq)
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and isinstance(node.test.comparators[0].value, str)):
+            out.append((node.test.comparators[0].value, node))
+    return out
+
+
+def _branch_essential_prefixes(branches: list[tuple[str, ast.If]]) -> dict[str, str]:
+    """예산 **면제**로 끝나는 `verb == …` 분기의 {동사: 접두 문면}.
+
+    면제는 `return True, "<접두>", True` 의 셋째 값이다 — 라벨의 괄호 주석은 접두가 아니라 설명이라
+    잘라 낸다(`cys cycle-agent(사이클 필수 도구)` → `cys cycle-agent`)."""
+    out: dict[str, str] = {}
+    for verb, node in branches:
+        for ret in ast.walk(node):
+            if not (isinstance(ret, ast.Return) and isinstance(ret.value, ast.Tuple)
+                    and len(ret.value.elts) == 3):
+                continue
+            ok, label, essential = ret.value.elts
+            if not (isinstance(ok, ast.Constant) and ok.value is True
+                    and isinstance(essential, ast.Constant) and essential.value is True):
+                continue
+            text = label.value if isinstance(label, ast.Constant) else ""
+            prefix = text.split("(")[0].strip() if isinstance(text, str) else ""
+            out[verb] = prefix if prefix.startswith("cys ") else "cys %s" % verb
+    return out
+
+
+HOOK_CONST_NAMES = ("CSO_CYS_VERBS", "CSO_CYS_SUBVERBS", "CSO_CYS_SUBVERB_ESSENTIAL",
+                    "CSO_CYS_DENY_VERBS", "CSO_CYS_TTL_VERBS")
+
+
+def hook_capability_model(text: str) -> dict[str, object] | None:
+    """훅이 **코드로** 선언한 CSO 접두 모델(미배선이면 None).
+
+    돌려주는 것: 허용 동사·허용 하위 명령·예산 면제 접두 집합·deny 동사·TTL 동사 · `send` 분기가
+    `--queued` 를 판정에 쓰는지 여부."""
+    block = hook_python_block(text)
+    tree = ast.parse(block)
+    consts = _module_sets(tree, HOOK_CONST_NAMES)
+    if not consts:
+        return None                       # WP-3 A 미배선 — 검사 대상 자체가 없다
+    missing = [n for n in HOOK_CONST_NAMES if n not in consts]
+    if missing:
+        raise AssertionError("훅에 %s 선언이 없다 — 접두 모델을 읽을 수 없다" % ", ".join(missing))
+    literal_verb_sets = _verb_literal_membership(tree)
+    if len(literal_verb_sets) != 1:
+        raise AssertionError("훅의 `verb in (…리터럴…)`(예산 면제 조회 동사) 비교가 %d 개다"
+                             "(1 이어야 한다) — 판정기를 고쳐라" % len(literal_verb_sets))
+    branches = _verb_eq_branches(tree)
+    branch_essential = _branch_essential_prefixes(branches)
+    send_uses_queued = any(
+        isinstance(c, ast.Constant) and isinstance(c.value, str) and "--queued" in c.value
+        for verb, node in branches if verb == "send" for c in ast.walk(node))
+    essential = {"cys %s" % v for v in literal_verb_sets[0]}
+    essential |= set(branch_essential.values())
+    essential |= {"cys %s %s" % pair for pair in consts["CSO_CYS_SUBVERB_ESSENTIAL"]}
+    return {
+        "verbs": set(consts["CSO_CYS_VERBS"]),
+        "subverbs": {k: set(v) for k, v in consts["CSO_CYS_SUBVERBS"].items()},
+        "deny": set(consts["CSO_CYS_DENY_VERBS"]),
+        "ttl": set(consts["CSO_CYS_TTL_VERBS"]),
+        "essential": essential,
+        "send_uses_queued": send_uses_queued,
+    }
+
+
+def directive_exempt_prefixes(body: str) -> set[str]:
+    """지침 예산 면제 bullet 이 선언한 `cys …` 접두 **집합**.
+
+    `--queued` 는 같은 접두의 **형태**다(훅의 `send` 분기가 그 플래그를 보지 않는다) — 집합 대조에서는
+    한 값으로 접는다. 그 형태가 실제로 덮이는지는 `push_form_is_budget_exempt` 가 따로 잰다."""
+    out = set()
+    for prefix in budget_exempt_prefixes(body):
+        out.add(prefix.replace(" --queued", "", 1))
+    return out
+
+
+def gate_hook_contract_violations(hook_text: str | None = None,
+                                  directive_body: str | None = None) -> list[str]:
+    """능력 게이트 훅(WP-3 A)이 배선되면 지침과의 계약을 **집합으로** 대조한다(미배선이면 빈 목록).
+
+    ★D1·D6(반성 라운드 2026-09-10): 판정은 문자열 검색이 아니라 훅 파이썬 블록의 선언
+    (`CSO_CYS_SUBVERBS`·`CSO_CYS_SUBVERB_ESSENTIAL`·`CSO_CYS_DENY_VERBS`·예산 면제 조회 동사 튜플)
+    을 읽어 **집합으로** 비교한다. 붉어지면 뜻은 '훅과 지침 중 **틀린 쪽**을 고쳐라' 이지 '넓은 쪽에
+    맞춰라' 가 아니다 — 좁은 쪽이 이긴다는 §1-1 규칙은 그대로다."""
+    if hook_text is None:
+        path = hook_path()
+        if not os.path.isfile(path):
+            return []
+        with open(path, encoding="utf-8", errors="replace") as source:
+            hook_text = source.read()
+    model = hook_capability_model(hook_text)
+    if model is None:
         return []  # WP-3 A 미배선 — 검사 대상 자체가 없다(침묵은 통과가 아니라 부재다)
     out = []
-    if "events --after-seq" in text:
-        out.append("게이트에 `events --after-seq` 접두가 있다 — 지침은 전 플래그 deny(§1-1)")
-    if MANDATED_PUSH not in text:
-        out.append("면제/허용 접두에 `%s` 형태가 없다 — 예산 소진 보고가 막힌다(봉인 ②)" % MANDATED_PUSH)
-    if "feed push" not in text:
-        out.append("`cys feed push` 접두가 없다 — §1-2 ②(오너 채널) 도달 불가")
+    # ① `cys events` 는 **어떤 플래그로도** 접두 밖이다(§1-1) — 허용/TTL 어디에도 있으면 안 된다.
+    if "events" not in model["deny"]:
+        out.append("훅의 deny 동사 집합에 `events` 가 없다 — 지침은 전 플래그 deny(§1-1)")
+    for axis in ("verbs", "ttl"):
+        if "events" in model[axis]:
+            out.append("훅의 %s 집합에 `events` 가 있다 — 구독에는 예외가 없다(§1-1)" % axis)
+    if "events" in model["subverbs"]:
+        out.append("훅의 하위 명령 표에 `events` 가 있다 — 구독에는 예외가 없다(§1-1)")
+    # ② `feed push` = §1-2 ② 오너 채널의 유일 출구. 허용이면서 **예산 면제**여야 한다 —
+    #    허용만 있고 면제가 없으면 'master hang ∧ 예산 소진' 교차에서 출구가 0 이 된다.
+    if "push" not in model["subverbs"].get("feed", set()):
+        out.append("훅에 `cys feed push` 허용이 없다 — §1-2 ②(오너 채널) 도달 불가")
+    if "cys feed push" not in model["essential"]:
+        out.append("훅의 예산 면제에 `cys feed push` 가 없다 — 예산 소진 ∧ master hang 에서 출구 0")
+    # ③ 머리글이 의무화한 push 형태는 `--queued` 유무와 무관하게 면제여야 한다.
+    if model["send_uses_queued"]:
+        out.append("훅의 `send` 분기가 `--queued` 를 판정에 쓴다 — 면제는 그 플래그와 무관해야 한다"
+                   "(머리글이 의무화한 형태가 면제 밖이면 예산 소진 보고 자체가 막힌다)")
+    if "cys send --to master" not in model["essential"]:
+        out.append("훅의 예산 면제에 `cys send --to master` 가 없다 — 보고 채널이 막힌다(봉인 ②)")
+    # ④ 지침 문면 ↔ 훅 접두 집합의 **기계 대조**(D1). 한쪽만 넓으면 지침이 없는 출구를 약속하거나
+    #    있는 출구를 없다고 적는다 — 둘 다 §3-1(문장은 장치의 설명) 위반이다.
+    if directive_body is None:
+        with open(os.path.join(DIRECTIVES_DIR, "CSO_DIRECTIVE.md"), encoding="utf-8") as source:
+            directive_body = source.read()
+    declared = directive_exempt_prefixes(directive_body)
+    for extra in sorted(declared - model["essential"]):
+        out.append("지침만 면제로 적은 접두: %s — 훅은 면제하지 않는다(없는 출구를 약속한다)" % extra)
+    for absent in sorted(model["essential"] - declared):
+        out.append("훅만 면제하는 접두: %s — 지침 §1-1 예산 면제 목록에 없다"
+                   "(있는 출구를 없다고 적는다)" % absent)
+    return out
+
+
+# ★D2(반성 라운드 2026-09-10): §7 (5-8) 종결 사유의 **계수**를 문자열이 아니라 **열거 항목**으로
+#   센다. 종전 핀은 "넷 중 먼저 온 것"·"넷째는 §9" 두 리터럴만 봤고, 그 문면 자체가 틀려 있었다 —
+#   본문 열거는 이미 ⓐⓑⓒ**ⓓ**(제품 무전진 종결) 넷인데 머리글이 넷째를 `stopped_stagnation` 으로
+#   지목해 **ⓓ 를 밀어냈다**. 조항을 더하거나 지웠을 때 계수 판정이 따라가야 한다.
+TERMINATION_HEAD = "**(5-8)** 종료:"
+CIRCLED_MARKS = "ⓐⓑⓒⓓⓔⓕⓖⓗ"
+COUNT_WORDS = {1: "하나", 2: "둘", 3: "셋", 4: "넷", 5: "다섯", 6: "여섯", 7: "일곱", 8: "여덟"}
+# `normalize()` 는 강조 표식(`**`)을 걷어 내므로 정규식에도 넣지 않는다(한쪽만 접으면 영원히 불일치).
+TERMINATION_HEAD_RE = re.compile(
+    r"다음\s*(?P<word>[가-힣]+)\((?P<first>[%s])~(?P<last>[%s])\)\s*중 먼저 온 것"
+    % (CIRCLED_MARKS, CIRCLED_MARKS))
+_FIRST_CAUSE_RE = re.compile(r"(?m)^\s*%s" % CIRCLED_MARKS[0])
+
+
+def termination_section(raw: str) -> str:
+    """§7 (5-8) 항목의 본문 — 주석을 걷고 다음 번호 항목(`9. `) 직전까지."""
+    body = strip_html_comments(raw)
+    start = body.find(TERMINATION_HEAD)
+    if start < 0:
+        raise AssertionError("§7 (5-8) 머리글(%r)이 없다" % TERMINATION_HEAD)
+    end = body.find("\n9. ", start)
+    return body[start:end if end >= 0 else len(body)]
+
+
+def termination_parts(raw: str) -> tuple[str, str]:
+    """(머리글, 열거 본문) — 열거는 줄머리 `ⓐ` 에서 시작한다(머리글의 범위 표기와 섞지 않는다)."""
+    section = termination_section(raw)
+    match = _FIRST_CAUSE_RE.search(section)
+    if not match:
+        raise AssertionError("(5-8) 에 줄머리 `%s` 열거가 없다" % CIRCLED_MARKS[0])
+    return section[:match.start()], section[match.start():]
+
+
+def termination_causes(raw: str) -> list[str]:
+    """(5-8) 이 **열거한** 종결 사유 기호 — 등장 순서대로(중복 제거 · 머리글 제외)."""
+    out = []
+    for mark in termination_parts(raw)[1]:
+        if mark in CIRCLED_MARKS and mark not in out:
+            out.append(mark)
+    return out
+
+
+def termination_count_violations(raw: str) -> list[str]:
+    """머리글의 계수·범위가 **열거와 일치**하고, §9 도구 판정이 그 열거에 더해지는가(빈 목록이 합격)."""
+    head, _body = termination_parts(raw)
+    section = termination_section(raw)
+    causes = termination_causes(raw)
+    out = []
+    expected = list(CIRCLED_MARKS[:len(causes)])
+    if causes != expected:
+        out.append("열거 기호가 ⓐ부터 연속이 아니다: %s" % "".join(causes))
+    match = TERMINATION_HEAD_RE.search(normalize(head))
+    if not match:
+        return out + ["머리글이 `다음 **<계수>(ⓐ~<마지막>) 중 먼저 온 것**` 형태가 아니다 — "
+                      "계수를 열거와 대조할 수 없다(판정 불능은 통과가 아니다)"]
+    if match.group("word") != COUNT_WORDS.get(len(causes)):
+        out.append("머리글 계수(%s)가 열거 %d개와 다르다" % (match.group("word"), len(causes)))
+    if match.group("first") != (causes[0] if causes else ""):
+        out.append("머리글 범위의 시작(%s)이 첫 열거(%s)와 다르다"
+                   % (match.group("first"), causes[0] if causes else "없음"))
+    if match.group("last") != (causes[-1] if causes else ""):
+        out.append("머리글 범위의 끝(%s)이 마지막 열거(%s)와 다르다"
+                   % (match.group("last"), causes[-1] if causes else "없음"))
+    folded = normalize(head)
+    if "stopped_stagnation" not in folded:
+        out.append("머리글이 §9 의 도구 판정(`stopped_stagnation`)을 언급하지 않는다")
+    elif "더해진다" not in folded:
+        out.append("§9 의 도구 판정이 열거에 **더해진다**는 관계가 없다 — "
+                   "계수 안에 넣으면 마지막 열거 항목이 밀려난다(ⓓ 유실)")
     return out
 
 
@@ -1335,12 +1729,45 @@ class CsoDirectiveRevision(unittest.TestCase):
                                 "%s 동기화 문장 횟수: %d" % (name, raw.count(SYNC)))
                 self.assertTrue(sync_occurs_once(section_body(raw, heading)))
 
-    def test_master_termination_count_matches_fourth_cause(self):
-        """MASTER §7 (5-8) 의 종결 사유 계수는 §9 의 도구 판정을 넷째로 센다."""
+    def test_master_termination_count_matches_enumerated_causes(self):
+        """★D2: §7 (5-8) 의 계수는 **열거 항목**과 일치해야 하고, §9 도구 판정은 거기에 더해진다.
+
+        종전 핀은 계수 문자열("넷 중 먼저 온 것"·"넷째는 §9")만 봤다 — 그 문면이 틀렸는데도(본문
+        열거는 이미 ⓐ~ⓓ 넷이라 머리글이 ⓓ 를 밀어냈다) 핀이 그 오류를 3레인에 고정했다."""
+        for name in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            with self.subTest(directive=name):
+                raw = self.raw[name]
+                self.assertEqual(termination_causes(raw), ["ⓐ", "ⓑ", "ⓒ", "ⓓ"],
+                                 "종결 사유 열거가 ⓐ~ⓓ 넷이 아니다")
+                self.assertEqual(termination_count_violations(raw), [])
+                self.assertNotIn("넷째는 §9", raw,
+                                 "§9 도구 판정을 열거의 넷째로 세면 ⓓ(제품 무전진 종결)가 밀려난다")
+
+    def test_termination_count_judge_follows_clause_edits(self):
+        """★D2 음성 대조: 조항을 더하거나 지우면 계수 판정이 **따라가야** 한다(리터럴 핀은 못 한다)."""
         master = self.raw["MASTER_DIRECTIVE.md"]
-        self.assertNotIn("셋 중 먼저 온 것", master)
-        self.assertIn("넷 중 먼저 온 것", master)
-        self.assertIn("넷째는 §9", master)
+        # ⓔ 를 하나 더한다 → 머리글 계수(넷)가 열거 다섯과 어긋나야 한다.
+        #   앵커는 다음 번호 항목의 줄머리 — 열거의 끝이자 (5-8) 본문의 경계다.
+        tail = "\n9. **(5-9)**"
+        self.assertIn(tail, master, "(5-9) 경계 앵커 부재(검체가 낡았다)")
+        added = master.replace(tail, "\n   ⓔ **가상의 다섯째 종결 사유**." + tail, 1)
+        self.assertNotEqual(added, master, "변조가 적용되지 않았다")
+        self.assertEqual(termination_causes(added), ["ⓐ", "ⓑ", "ⓒ", "ⓓ", "ⓔ"])
+        self.assertTrue(any("계수" in hit for hit in termination_count_violations(added)),
+                        "조항을 더했는데 계수 판정이 따라가지 않았다")
+        # ⓓ 를 지운다 → 열거 셋과 머리글(넷)이 어긋나야 한다.
+        dropped = master.replace("   ⓓ ★**제품 무전진 종결**", "   ★**제품 무전진 종결**", 1)
+        self.assertNotEqual(dropped, master)
+        self.assertEqual(termination_causes(dropped), ["ⓐ", "ⓑ", "ⓒ"])
+        self.assertTrue(termination_count_violations(dropped),
+                        "조항을 지웠는데 계수 판정이 따라가지 않았다")
+        # '더해진다' 관계를 '넷째' 로 되돌리면(개정 전 상태) 붉어져야 한다.
+        reverted = master.replace(
+            "여기에 §9 의 정체 종결 도구\n   판정 `stopped_stagnation` 이 **더해진다**",
+            "넷째는 §9 의 정체 종결 도구\n   판정 `stopped_stagnation` 이다", 1)
+        self.assertNotEqual(reverted, master)
+        self.assertTrue(termination_count_violations(reverted),
+                        "'더해진다' 를 지운 개정 전 문면이 통과했다")
 
     def test_gate_enforcement_claims_are_conditional_on_registration(self):
         """★R5(리뷰 major): 지침이 존재하지 않을 수 있는 집행 장치를 무조건 단언하면 안 된다 — 등록 조건과
@@ -1422,6 +1849,39 @@ class CsoDirectiveRevision(unittest.TestCase):
         if self.missing_templates:                      # 배포 팩 실행: 저장소 사본 부재는 사실로 남긴다
             self.assertEqual(self.missing_templates, ["CLAUDE.md"],
                              "예상 밖 사본 부재: %r" % self.missing_templates)
+
+    def test_template_exclusion_label_agrees_with_role_canon(self):
+        """★D8: 템플릿이 제외한 역할의 **정본**도 같은 말을 해야 한다(라벨만 핀하면 공허하다).
+
+        템플릿 `CLAUDE.md.template:71` 은 'CSO·워커·리뷰어는 실행 대상이 아니다' 라고 적는데
+        `WORKER_DIRECTIVE.md:16` 은 "화면 폴링→`cys events` 구독" 을 그대로 지시하고 있었다 —
+        템플릿 자신의 충돌 규칙대로면 정본이 이겨 '워커 제외' 가 무효였다."""
+        for name, text in self.templates.items():
+            with self.subTest(copy=name):
+                self.assertEqual(excluded_roles_declared(text), ["CSO", "워커", "리뷰어"],
+                                 "'master 전용' 표제의 제외 역할 목록이 정본 지도와 다르다")
+                self.assertEqual(role_canon_conflict_violations(text, self.raw), [])
+
+    def test_negative_role_canon_conflict_controls(self):
+        """★D8 음성 대조: 정본에 구독 지시를 되살리면(개정 전 상태) 대조가 붉어져야 한다."""
+        template = self.templates["CLAUDE.md.template"]
+        reverted = dict(self.raw)
+        reverted["WORKER_DIRECTIVE.md"] = self.raw["WORKER_DIRECTIVE.md"].replace(
+            "화면 폴링→**master 의 push 수신**", "화면 폴링→`cys events` 구독", 1)
+        self.assertNotEqual(reverted["WORKER_DIRECTIVE.md"], self.raw["WORKER_DIRECTIVE.md"],
+                            "변조가 적용되지 않았다")
+        hits = role_canon_conflict_violations(template, reverted)
+        self.assertTrue(any("워커 정본" in hit for hit in hits),
+                        "정본의 구독 지시를 템플릿 대조가 통과시켰다: %r" % hits)
+        # 정본을 읽지 못하면 조용한 통과가 아니라 판정 불능이다.
+        absent = {k: v for k, v in self.raw.items() if k != "WORKER_DIRECTIVE.md"}
+        self.assertTrue(any("판정 불능" in hit
+                            for hit in role_canon_conflict_violations(template, absent)))
+        # 라벨에서 '워커' 를 지우면(제외 철회) 그 축은 대조 대상에서 빠지지만, 그 사실이 표제에
+        # 드러나야 한다 — 라벨과 대조 집합은 같은 출처에서 온다.
+        no_worker = template.replace("(CSO·워커·리뷰어는", "(CSO·리뷰어는", 1)
+        self.assertNotEqual(no_worker, template)
+        self.assertEqual(excluded_roles_declared(no_worker), ["CSO", "리뷰어"])
 
     def test_negative_claude_md_role_split_controls(self):
         """★R3: 구판으로 되돌리는 3종은 붉어지고, 정당한 편집 3종은 통과해야 한다(거짓 적색 차단)."""
@@ -1594,8 +2054,67 @@ class CsoDirectiveRevision(unittest.TestCase):
         self.assertIn("§1-2 ④ 의 보류로 떨어지고", life)
 
     def test_capability_gate_hook_contract_when_wired(self):
-        """능력 게이트 훅이 배선되면(WP-3 A) 지침이 요구하는 3항을 훅도 지켜야 한다(미배선이면 무검사)."""
+        """능력 게이트 훅이 배선되면(WP-3 A) 지침이 요구하는 계약을 훅도 지켜야 한다(미배선이면 무검사)."""
         self.assertEqual(gate_hook_contract_violations(), [])
+
+    def test_gate_hook_contract_reads_code_not_comments(self):
+        """★D1·D6(반성 라운드 2026-09-10): 종전 판정기가 **양방향으로 오판**한 두 변이를 고정한다.
+
+        ⓐ거짓 음성 — `CSO_CYS_SUBVERBS["feed"]` 에서 실제 허용 `"push"` 를 지워도 훅 **주석**이
+          `feed push` 문자열을 담고 있어 52 tests OK 였다(실측). 이제 코드를 읽으므로 RED 여야 한다.
+        ⓑ거짓 양성 — 거동과 무관한 주석 한 줄(`# 주: cys events --after-seq 도 스트림이라 deny 다`)
+          만 넣어도 검체가 붉어졌다(문서 편집이 3레인을 막는다). 이제 GREEN 이어야 한다."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        self.assertEqual(gate_hook_contract_violations(hook, self.body), [],
+                         "현행 훅·지침 조합이 계약을 어긴다")
+
+        removed = hook.replace('"feed": {"list", "push"},', '"feed": {"list"},', 1)
+        self.assertNotEqual(removed, hook, "변이가 실제로 적용되지 않았다")
+        hits = gate_hook_contract_violations(removed, self.body)
+        self.assertTrue(any("feed push" in h for h in hits),
+                        "허용을 제거한 변이를 판정기가 통과시켰다(주석을 코드로 읽는다): %r" % hits)
+
+        # 주석 삽입은 거동 불변 — 판정도 불변이어야 한다(모듈 상수 선언 **뒤**에 넣어 위치도 옮긴다).
+        anchor = "CSO_CYS_TTL_VERBS = "
+        self.assertIn(anchor, hook)
+        commented = hook.replace(
+            anchor, "# 주: cys events --after-seq 도 스트림이라 deny 다\n" + anchor, 1)
+        self.assertNotEqual(commented, hook)
+        self.assertEqual(gate_hook_contract_violations(commented, self.body), [],
+                         "거동 불변 주석 삽입에 판정기가 붉어졌다(거짓 적색)")
+
+    def test_gate_hook_contract_compares_exemption_sets_with_the_directive(self):
+        """★D1: 지침 면제 목록 ↔ 훅 면제 집합의 **기계 대조** — 한쪽만 넓어지면 잡아야 한다."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        narrowed = self.body.replace("|read-screen|todo-path", "", 1)
+        self.assertNotEqual(narrowed, self.body)
+        hits = gate_hook_contract_violations(hook, narrowed)
+        self.assertTrue(any("훅만 면제하는 접두" in h for h in hits),
+                        "지침이 훅보다 좁아졌는데 대조가 통과했다: %r" % hits)
+        widened = self.body.replace("`cys queue list|feed list|feed push",
+                                    "`cys queue clear|queue list|feed list|feed push", 1)
+        self.assertNotEqual(widened, self.body)
+        hits = gate_hook_contract_violations(hook, widened)
+        self.assertTrue(any("지침만 면제로 적은 접두" in h for h in hits),
+                        "지침이 훅보다 넓어졌는데 대조가 통과했다: %r" % hits)
+
+    def test_gate_hook_contract_fails_closed_on_unreadable_structure(self):
+        """구조를 못 읽으면 **조용한 통과**가 아니라 예외다(판정 불능은 통과가 아니다)."""
+        with open(hook_path(), encoding="utf-8") as source:
+            hook = source.read()
+        for label, mutated in (
+                ("히어독 종료 제거", hook.replace("\nPYEOF\n", "\n# PYEOF\n", 1)),
+                ("면제 동사 튜플 중복(어느 쪽이 정본인지 정할 수 없다)",
+                 hook.replace("CSO_CYS_TTL_VERBS = {",
+                              'CSO_CYS_DUP = verb in ("x",)\nCSO_CYS_TTL_VERBS = {', 1)),
+                ("상수 선언 이름 변경",
+                 hook.replace("CSO_CYS_SUBVERB_ESSENTIAL = {", "CSO_CYS_SUBVERB_ESS = {", 1))):
+            with self.subTest(mutation=label):
+                self.assertNotEqual(mutated, hook, "변이가 실제로 적용되지 않았다")
+                with self.assertRaises(AssertionError):
+                    gate_hook_contract_violations(mutated, self.body)
 
     def test_negative_permissive_subscription_controls(self):
         """★R2(리뷰 major · codex 반례 전수): 금지를 뒤집거나 다른 도구로 구독을 허용하는 문장은
@@ -2008,7 +2527,8 @@ class TriageRemainingIssues(unittest.TestCase):
         import shutil
         import tempfile
 
-        def full_suite_rc(cso_text: str, template_text: str) -> unittest.TestResult:
+        def full_suite_rc(cso_text: str, template_text: str,
+                          extra: dict[str, str] | None = None) -> unittest.TestResult:
             tmp = tempfile.mkdtemp(prefix="triage-p3c-")
             try:
                 directives = os.path.join(tmp, "directives")
@@ -2016,6 +2536,13 @@ class TriageRemainingIssues(unittest.TestCase):
                 for name in READ_DIRECTIVES:
                     shutil.copyfile(os.path.join(DIRECTIVES_DIR, name),
                                     os.path.join(directives, name))
+                # ★D7(반성 라운드 2026-09-10): 형제 지침(MASTER 와 그 생성물 CEO)의 정당한 편집도
+                #   같은 전체 검체로 잰다 — 종전엔 CSO·템플릿만 바꿀 수 있어 MASTER 조항의 개행 이동이
+                #   검체를 붉히는 것을 이 자리에서 볼 수 없었다.
+                for name, body in (extra or {}).items():
+                    with open(os.path.join(directives, name), "w", encoding="utf-8",
+                              newline="") as out:
+                        out.write(body)
                 with open(os.path.join(directives, "CSO_DIRECTIVE.md"),
                           "w", encoding="utf-8", newline="") as out:
                     out.write(cso_text)
@@ -2048,6 +2575,12 @@ class TriageRemainingIssues(unittest.TestCase):
         self.assertFalse(_IN_FULL_SUITE, "전체 검체 안에서 자기 자신이 다시 돌았다(재귀)")
         saved_dir, saved_paths = DIRECTIVES_DIR, dict(TEMPLATE_PATHS)
         cso, template = self.cso, self.templates["CLAUDE.md.template"]
+        master, ceo = self.raw["MASTER_DIRECTIVE.md"], self.raw["CEO_TEMPLATE.md"]
+        # 안전 조항 '정체 종결 휴면' 안의 한 자리(구조 앵커 — 리플로우된 문서에서도 유일하다).
+        MASTER_REFLOW_AT, MASTER_REFLOW_TO = "이 절은 **휴면**이고 종결은", "이 절은\n  **휴면**이고 종결은"
+        self.assertEqual(master.count(MASTER_REFLOW_AT), 1, "MASTER 리플로우 앵커가 유일하지 않다")
+        self.assertEqual(ceo.count(MASTER_REFLOW_AT), 1, "CEO 리플로우 앵커가 유일하지 않다")
+        self.assertEqual(cso.count("출력의 **sha256"), 1, "CSO 내부 주석 앵커가 유일하지 않다")
         common_at = role_block_region(template, master=False)[0]
         head = next(l for l in template.splitlines() if l.startswith(TEMPLATE_MASTER_HEAD))
         edits = {
@@ -2071,17 +2604,51 @@ class TriageRemainingIssues(unittest.TestCase):
             "공용 블록 히어독": (
                 cso, template[:common_at] + "cat <<'EOF'\nDon't poll\nEOF\n"
                 + template[common_at:]),
+            # ★D7(반성 라운드 2026-09-10): 조항 **안**에 HTML 주석을 넣는 정당한 편집. 종전엔 문면
+            #   판정(strip)은 통과하는데 변조 앵커(NUL 마스크)가 그 조항을 못 찾아 **전체 검체**가
+            #   붉어졌다 — 두 투영이 달랐다. 이제 둘 다 `clause_projection` 을 쓴다.
+            "조항 내부 주석": (
+                cso.replace("출력의 **sha256",
+                            "출력의 <!-- 근거: 감사 2026-09-06 · 비규범 주 -->**sha256", 1),
+                template),
+            # ★D7: MASTER 조항의 개행 이동(생성물 CEO 는 MASTER 바이트 연접이라 같이 움직인다).
+            "MASTER 조항 리플로우": (
+                cso, template,
+                {"MASTER_DIRECTIVE.md": master.replace(MASTER_REFLOW_AT, MASTER_REFLOW_TO, 1),
+                 "CEO_TEMPLATE.md": ceo.replace(MASTER_REFLOW_AT, MASTER_REFLOW_TO, 1)}),
         }
-        for label, (cso_text, template_text) in edits.items():
+        for label, edit in edits.items():
+            cso_text, template_text = edit[0], edit[1]
+            extra = edit[2] if len(edit) > 2 else None
             with self.subTest(edit=label):
-                self.assertTrue(cso_text != cso or template_text != template,
+                self.assertTrue(cso_text != cso or template_text != template
+                                or any(v != self.raw[k] for k, v in (extra or {}).items()),
                                 "정당한 편집 앵커 부재(검체가 낡았다)")
-                result = full_suite_rc(cso_text, template_text)
+                result = full_suite_rc(cso_text, template_text, extra)
                 self.assertTrue(
                     result.wasSuccessful(),
                     "정당한 편집이 전체 검체에서 거짓 적색을 냈다(%s): failures=%d errors=%d\n%s"
                     % (label, len(result.failures), len(result.errors),
                        "\n".join(t[0].id() for t in result.failures + result.errors)))
+
+        # ★D7 음성 대조 — **같은 입력**(조항 내부 주석 문서)에서 조항을 지우거나 뒤집으면 전체
+        #   검체는 붉어야 한다. 이것이 없으면 위 통과 대조는 "투영을 느슨하게 해서 다 통과" 로도
+        #   만족되므로 공허하다.
+        commented = edits["조항 내부 주석"][0]
+        clause = dict(SAFETY_CLAUSES["CSO_DIRECTIVE.md"])["스크린샷 증거"]
+        lo, hi = raw_span_of(commented, clause)          # 주석이 안에 있어도 앵커는 잡혀야 한다
+        self.assertIn("<!--", commented[lo:hi], "앵커 구간이 조항 내부 주석을 품지 않는다")
+        deleted = commented[:lo] + commented[hi:]
+        inverted = commented.replace(
+            "후 초기화된다 — 경고를 받으면",
+            "후 초기화된다는 설명은 틀렸다. 누적값을 유지한다 — 경고를 받으면", 1)
+        self.assertNotEqual(inverted, commented, "반전 앵커 부재(검체가 낡았다)")
+        for label, bad in (("조항 내부 주석 + 조항 삭제", deleted),
+                           ("조항 내부 주석 + 접미 반전", inverted)):
+            with self.subTest(edit=label):
+                result = full_suite_rc(bad, template)
+                self.assertFalse(result.wasSuccessful(),
+                                 "변조된 문서가 전체 검체를 통과했다(%s) — 투영이 느슨해졌다" % label)
 
 
 
@@ -2100,6 +2667,12 @@ SHELL_SAFE_LINES = (
     'ROLE=$(cys reclaim-role --auto); echo "$ROLE"',
     "cys status --json # don't poll",
     "cys read-screen --surface <ref>       # 보조 확인 수단 (don't poll)",
+    # ★D6(반성 라운드 2026-09-10): 명령 래퍼의 **정상** 사용은 통과해야 한다(래퍼 해석의 양성 대조).
+    "command cys status --json",
+    "command -p cys list",
+    "env CYS_PACK_DIR=/tmp cys status",
+    'echo "ok # 주석 아님"; cys status',
+    "cys \\\nstatus --json",                        # 정상 행 계속(주석 없음) — 접합해도 안전하다
 )
 SHELL_SAFE_HEREDOC = "cat <<'EOF'\nDon't poll\nEOF"
 # 같은 스캐너가 **막아야** 하는 어법 — 위 통과 대조가 공허해지지 않게 같은 자리에 건다.
@@ -2108,6 +2681,16 @@ SHELL_UNSAFE_LINES = (
     'V=$(cys "$verb" --reconnect)',                # 대입 값 **안**의 동적 하위 명령(판정 불능)
     'X="$(cys events --reconnect)"',               # 대입 값 안의 정적 구독
     "cat <<'EOF'\ncys events --reconnect\nEOF",     # 히어독 본문의 구독 리터럴(셸에 먹일 수 있다)
+    # ★D6(반성 라운드 2026-09-10) — 종전 스캐너의 두 사각:
+    #   ①명령 래퍼: 셸은 `command cys …` 를 `cys …` 로 실행하는데 판정기는 이름을 `command` 로 읽고
+    #     "cys 가 아니다" 로 통과시켰다(`builtin`·`exec`·`nohup`·`env` 도 같다).
+    #   ②주석 뒤 행 계속: 인용 밖 `#` 뒤는 개행까지 주석이라 행 계속이 **성립하지 않는데**, 접합을
+    #     먼저 해서 다음 줄의 실제 명령이 주석 안으로 삼켜졌다.
+    'command cys "$verb" --reconnect',             # 래퍼 뒤 동적 하위 명령(판정 불능)
+    "command cys events --reconnect",              # 래퍼 뒤 정적 구독
+    "env CYS_X=1 cys events --reconnect",          # env 래퍼 + 선행 대입 뒤의 구독
+    "command -Z cys status",                       # 모르는 래퍼 옵션 — 실행될 명령을 정할 수 없다
+    'echo ok # 설명 \\\ncys "$verb" --reconnect',    # 주석 뒤 행 계속(다음 줄은 독립 명령이다)
 )
 # 닫지 않은 히어독은 그 뒤 **전부**를 본문으로 만들어 실행 줄 판정을 끈다 — 블록 단위로 따로 본다
 # (템플릿에 다른 히어독이 있으면 그쪽 종료 태그가 이 우회를 닫아 버려, 삽입 검사로는 증명되지 않는다).
@@ -2194,6 +2777,29 @@ class ConvergenceRoundTwo(unittest.TestCase):
         # 미종결 히어독은 **판정 불능**이다(그 뒤 전부가 본문이 되어 실행 줄 판정이 꺼진다).
         self.assertEqual(unterminated_heredocs(UNTERMINATED_HEREDOC_BLOCK), ["EOF"])
         self.assertEqual(unterminated_heredocs(SHELL_SAFE_HEREDOC), [])
+
+    def test_shell_scanner_reads_wrappers_and_ends_lines_at_comments(self):
+        """★D6(반성 라운드 2026-09-10): 래퍼 해석과 '주석 종료 우선' 을 판정 함수 수준에서 고정한다."""
+        # ① 주석이 있는 줄은 **접합되지 않는다** — 다음 줄은 그 자체로 실행 줄이다.
+        block = 'echo ok # 설명 \\\ncys "$verb" --reconnect'
+        self.assertEqual(command_lines(block),
+                         ["echo ok # 설명 \\", 'cys "$verb" --reconnect'])
+        self.assertTrue(subscription_command_violations(command_lines(block)[1]))
+        # 주석이 **없는** 행 계속은 종전대로 접합한다(과교정 방지).
+        self.assertEqual(command_lines("cys \\\nstatus --json"), ["cys status --json"])
+        # ② 래퍼는 걷어 내고 그 뒤의 실제 명령을 판정한다.
+        for line in ("command cys events", 'builtin cys "$verb"', "exec cys events",
+                     "nohup cys events --reconnect", "env A=1 cys events"):
+            with self.subTest(wrapper=line):
+                self.assertTrue(subscription_command_violations(line),
+                                "래퍼 뒤의 구독을 판정기가 통과시켰다: %r" % line)
+        for line in ("command cys status", "command -v cys", "env A=1 cys list",
+                     "nohup cys status --json"):
+            with self.subTest(ok=line):
+                self.assertEqual(subscription_command_violations(line), [],
+                                 "정상 래퍼 사용을 판정기가 붉혔다: %r" % line)
+        # ③ 모르는 래퍼 옵션은 통과가 아니라 판정 불능이다(아는 것만 걷는다).
+        self.assertTrue(subscription_command_violations("command -Z cys status"))
 
     # ── 한국어 금지문(codex major 2건) ────────────────────────────────────
     def test_legitimate_prohibitions_are_not_flagged(self):

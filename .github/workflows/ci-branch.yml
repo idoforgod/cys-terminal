@@ -85,7 +85,15 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re, sys
+          import os, re, sys
+
+          # ★D9(반성 라운드 2026-09-10): 레인 파일의 **루트**를 env 로 바꿀 수 있다 — 예행 도구의 자기 검체가
+          #   워크플로 사본에 변이(`if: false` · 이름 삭제 · 가드 삭제)를 넣고 이 게이트가 붉어지는지 잰다.
+          #   CI 에서는 미설정(= 리포 루트). 판정 로직은 루트와 무관하다.
+          ROOT = os.environ.get("LANE_GATE_ROOT", ".")
+
+          def _read(path):
+              return open(os.path.join(ROOT, path), encoding="utf-8").read()
 
           # 팩 테스트를 실행하는 **모든** 레인. 여기 없는 워크플로우는 대조 밖이다(한계 6).
           LANES = {
@@ -108,6 +116,51 @@ jobs:
                   "그 레인의 재현은 runpy 모사다. 여기서 빠지면 D1 회귀는 다시 무증상으로 산다.",
               ),
           }
+
+          # ★D9(반성 라운드 2026-09-10): 완전 레인의 **정당한 레그 고정**. 종전 '무조건 실행' 검사는
+          #   SUBSET_LANES 루프 **안에만** 있어 완전 레인의 조건부 스텝을 보지 않았는데, 이번 판에
+          #   완전 레인 첫 조건부 스텝(release.yml WP-7 leg1 · `if: matrix.target == …`)이 생겼다 —
+          #   정당한 레그 고정과 `if: false` 로 스위트를 조용히 끄는 것이 **같은 초록**이었다.
+          #   값 = {레인: {조건 원문(공백 정리): 사유}}. 등재된 조건만 통과하고, 등재 없는 조건은
+          #   실패다(ALLOWED 와 같은 마찰). 조건 원문은 `if:` 뒤 문자열과 **정확히** 같아야 한다.
+          ALLOWED_STEP_CONDITIONS = {
+              "release": {
+                  "matrix.target == 'aarch64-apple-darwin'":
+                      "build 잡은 3레그 매트릭스(arm64 · x86_64 크로스 · windows)다 — 팩 스위트는 레그와 "
+                      "무관한 순수 python 검체라 arm64 한 레그에 고정해 예산을 지킨다. 같은 스위트는 "
+                      "pack-artifacts 잡(ubuntu · 무조건)에서 한 번 더 돈다. `if: false` 류 소거와 이 "
+                      "고정을 가르는 근거는 이 문장이다.",
+                  "matrix.platform == 'macos-latest'":
+                      "macOS 발행 게이트 도구(scripts/tests test_release_postprocess_gate)의 소비 지점이 "
+                      "macOS 레그뿐이다 — 그 레그 밖에서는 도구가 실행될 일이 없다(ALLOWED 의 같은 항목 "
+                      "참조). windows 레그에서 돌리면 근거 없는 실행이 된다.",
+                  "matrix.platform == 'windows-latest'":
+                      "Windows CRT 게이트 도구(scripts/tests test_verify_win_crt)의 소비 지점이 windows "
+                      "레그의 업로드 전 CRT 게이트뿐이다(ALLOWED 의 같은 항목 참조) — 도구 증명을 소비 "
+                      "직전 레그에 고정한다. ★이 항목은 D9 검사 첫 실행이 잡아낸 것이다(등재 전 실측).",
+              },
+          }
+
+          # ★D4(반성 라운드 2026-09-10): 팩 스위트 이름이 아닌 **명령 토큰**의 존재 + 무조건 실행 계약.
+          #   `cargo test --bin cysd` 가 브랜치 CI 에 없었다 — release.yml 태그 레인의 레그 고정 스텝
+          #   안에만 있어 0.14.31 최대 신설 표면(alert_route.rs · governance/state/delivery 큐 생명주기)의
+          #   단위 검체 1,228종이 브랜치 push 에서 0회 실행이었고 컴파일 실패조차 안 잡혔다. 값 =
+          #   {레인: {토큰: 사유}}. 토큰은 주석·SELF 표식 밖의 코드 줄에 있어야 하고 그 스텝은 등재된
+          #   레그 고정 외의 조건이 없어야 한다.
+          MUST_RUN_TOKENS = {
+              "ci-branch": {
+                  "cargo test --bin cysd":
+                      "데몬 단위 검체(alert_route·governance·state·delivery)의 브랜치 조기 경보. 태그 push "
+                      "에서 처음 붉어지면 pack-artifacts 미실행 → 팩 자산 0 → 발행 0 이다.",
+              },
+          }
+
+          # ★D10(반성 라운드 2026-09-10): 필터형 cargo 게이트의 '측정 ≥1' 폐쇄. windows-health.yml 의
+          #   `cargo test --lib <모듈>::` / `--bin <bin> <필터>` 는 Windows 실기에서 ConPTY 문면 검체가
+          #   도는 **유일한** 자리인데 cargo 필터는 0매치도 초록이라 모듈 경로가 바뀌면 조용한 초록으로
+          #   되돌아간다. 실행 줄마다 같은 스텝 **앞**에 `cargo_filter_count <같은 인자>` 호출이 있어야
+          #   한다(그 함수가 `-- --list` 로 세어 0 이면 붉힌다 · 함수 이름이 두 파일 사이의 계약이다).
+          FILTERED_CARGO_GUARD = {"windows-health": ".github/workflows/windows-health.yml"}
 
           # 레인별 "빠지면 무엇이 거짓말이 되는가" — 에러 메시지에 붙여 편입 방향을 지시한다.
           HINT = {
@@ -181,7 +234,7 @@ jobs:
 
           def names(path):
               try:
-                  raw = open(path, encoding="utf-8").read().splitlines()
+                  raw = _read(path).splitlines()
               except OSError as e:
                   print(f"::error::레인 파일을 읽지 못함: {path} ({e})", file=sys.stderr)
                   sys.exit(1)
@@ -250,6 +303,8 @@ jobs:
           # 이름이 등장하는 **스텝 자체가 조건부인지** 본다. 이 게이트는 텍스트만 읽으므로
           # `if: false` 로 스텝을 죽여도 이름은 그대로 남아 초록을 유지한다(리뷰어2 실증).
           # 필수 스위트는 무조건 실행돼야 하므로, 그 스텝에 step-level `if:` 가 있으면 실패시킨다.
+          # ★D9: 이 검사는 종전 **부분 레인 한정**이었다(호출이 SUBSET_LANES 루프 안에만). 이제 완전
+          #   레인에도 돌리되 정당한 레그 고정은 ALLOWED_STEP_CONDITIONS 등재로 통과시킨다(아래).
           #
           # ★스텝 경계는 `- name:` 이 아니라 **`steps:` 블록의 리스트 항목**으로 잡는다.
           #   `name` 은 GitHub Actions 에서 **필수가 아니고** 키 순서도 자유다 — 초안은 `- name:` 을
@@ -351,7 +406,7 @@ jobs:
               return out
 
           def step_conditions(path, token):
-              lines = open(path, encoding="utf-8").read().splitlines()
+              lines = _read(path).splitlines()
               ranges = _step_ranges(lines, path)
               found = []
               for i, raw in enumerate(lines):
@@ -414,9 +469,97 @@ jobs:
                     "등재하라('팩 레인이라 생략'은 이유가 아니다).", file=sys.stderr)
               sys.exit(1)
 
-          print("[레인 대조] 비대칭 0 — 3완전 레인 목록 일치(허용 항목 제외) · 부분 레인 계약 충족")
+          # ── 완전 레인 무조건 실행 검사(D9) + 필수 명령 토큰(D4) ──
+          def code_lines(path):
+              """SELF 표식 밖 · 주석 제거 후의 코드 줄(`names()` 와 같은 시야)."""
+              out, skipping = [], False
+              for line in _read(path).splitlines():
+                  if SELF_BEGIN in line:
+                      skipping = True; continue
+                  if SELF_END in line:
+                      skipping = False; continue
+                  if skipping:
+                      continue
+                  out.append(re.sub(r"#.*$", "", line))
+              return out
+
+          cond_err, used_conds = [], {lane: set() for lane in LANES}
+          for lane, path in LANES.items():
+              allowed = ALLOWED_STEP_CONDITIONS.get(lane, {})
+              for n in sorted(sets[lane]):
+                  for cond in step_conditions(path, n):
+                      if cond in allowed:
+                          used_conds[lane].add(cond)
+                          continue
+                      cond_err.append(f"{lane}: 스위트 '{n}' 의 스텝이 **등재되지 않은** 조건부다(`if: {cond}`) — "
+                                      f"정당한 레그 고정이면 ALLOWED_STEP_CONDITIONS[{lane!r}] 에 조건 원문과 "
+                                      f"사유를 등재하고, 아니면 조건을 걷어내라(텍스트 게이트는 스텝이 실제로 "
+                                      f"도는지 모른다 · `if: false` 와 구별할 길이 이 등재뿐이다)")
+              for tok, why in MUST_RUN_TOKENS.get(lane, {}).items():
+                  if not any(tok in line for line in code_lines(path)):
+                      cond_err.append(f"{lane}: 필수 명령 '{tok}' 이 {path} 의 코드 줄에 없다 — {why}")
+                      continue
+                  for cond in step_conditions(path, tok):
+                      if cond in allowed:
+                          used_conds[lane].add(cond)
+                          continue
+                      cond_err.append(f"{lane}: 필수 명령 '{tok}' 의 스텝이 등재되지 않은 조건부다(`if: {cond}`) — {why}")
+          for lane, allowed in ALLOWED_STEP_CONDITIONS.items():
+              for cond in sorted(set(allowed) - used_conds[lane]):
+                  print(f"::warning::ALLOWED_STEP_CONDITIONS[{lane!r}] 의 '{cond}' 가 어느 스위트에도 "
+                        f"쓰이지 않는다 — 등재를 지워라(목록이 썩는다)")
+
+          # ── 필터형 cargo 게이트의 '측정 ≥1' 폐쇄 핀(D10) ──
+          FILTER_RUN_RE = re.compile(r"cargo test\s+((?:--lib|--bin\s+\S+)\s+\S+)\s+--\s")
+          for lane, path in FILTERED_CARGO_GUARD.items():
+              lines = _read(path).splitlines()
+              runs = 0
+              for start, end, *_rest in _step_ranges(lines, path):
+                  for i in range(start, end):
+                      code = re.sub(r"#.*$", "", lines[i])
+                      m = FILTER_RUN_RE.search(code)
+                      if not m or "--list" in code:
+                          continue
+                      runs += 1
+                      args = re.sub(r"\s+", " ", m.group(1)).strip()
+                      guard = re.compile(r"^\s*cargo_filter_count\s+" + r"\s+".join(map(re.escape, args.split(" "))) + r"\s*$")
+                      if not any(guard.match(re.sub(r"#.*$", "", lines[j])) for j in range(start, i)):
+                          cond_err.append(f"{lane}: {path}:{i + 1} `cargo test {args} -- …` 앞에 같은 스텝의 "
+                                          f"`cargo_filter_count {args}` 가 없다 — cargo 필터는 0매치도 초록이라 "
+                                          f"모듈 경로가 바뀌면 이 게이트는 조용한 초록이 된다(돌지 않는 초록 금지)")
+              if runs == 0:
+                  cond_err.append(f"{lane}: {path} 에 필터형 `cargo test` 실행 줄이 0건 — 핀이 잴 대상이 없다"
+                                  f"(정규식·파일 구조가 바뀐 신호 · fail-closed)")
+              else:
+                  print(f"[필터 폐쇄] {lane}: 필터형 실행 {runs}건 · 전건 cargo_filter_count 선행")
+
+          if cond_err:
+              print("::error::무조건 실행·필수 명령·필터 폐쇄 계약 위반.", file=sys.stderr)
+              for m in cond_err:
+                  print(f"::error::  {m}", file=sys.stderr)
+              sys.exit(1)
+
+          print("[레인 대조] 비대칭 0 — 3완전 레인 목록 일치(허용 항목 제외) · 부분 레인 계약 충족 · "
+                "완전 레인 조건부 스텝 전건 등재 · 필수 명령 무조건 · 필터 폐쇄 선행")
           PY
       # LANE-GATE-SELF-END
+
+      # ★D3(반성 라운드 2026-09-10): 위 게이트는 '이름이 세 레인에 다 있는가' 만 본다 — 세 레인
+      #   **모두**에 없는 파일은 union 밖이라 비대칭 0 으로 초록이었다(수용 검체 4종이 그렇게 0회
+      #   실행이었고 전체로는 34종). 역방향 축(파일→등재)은 scripts/lane-parity-rehearsal.sh 3단계에
+      #   있고 여기서 그 예행 도구를 게이트로 **승격**한다 — `--strict` 는 머지 대기 0 을 요구하고,
+      #   `--self-test` 는 임시 디렉터리의 미등재 파일 하나를 실제로 잡는지 재는 음성 대조다(통과
+      #   대조만 있으면 "다 허용해서 초록" 으로도 만족된다). 1단계는 위 게이트 파이썬을 원본에서
+      #   추출해 다시 돌리므로(로직 복제 0) 이 스텝이 위 스텝을 대체하지는 않는다 — 위 스텝은
+      #   `::error::` 위치가 이 파일 자신이라 판독이 빠르고, 이 스텝은 예행 도구 자체가 CI 에서
+      #   깨지지 않았음을 증명한다. stdlib 만 쓰므로 setup-python 앞이어도 된다(1초 안쪽).
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지).
+      - name: 레인 예행 도구 — 역방향 축(파일→등재) + 자기 검체 (D3)
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/lane-parity-rehearsal.sh --strict
+          bash scripts/lane-parity-rehearsal.sh --self-test
 
       # ★(0.14.31 통합 · CONTRACTS E-4 ②) 이 잡의 python3 를 3.12 로 **고정**한다.
       #   종전엔 이 잡만 setup-python 이 없어 러너 이미지 기본 python3 를 썼다 — 잡2
@@ -735,6 +878,34 @@ jobs:
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
           exit $rc
 
+      # ★D3(반성 라운드 2026-09-10 · fix-plan directives-ci-release): 수용 검체 4종이 **3레인 전부에서
+      #   0회 실행**이었다 — WP-4 test_session_start_hook(+317 · session-start.sh 의 `reclaim-role --auto`
+      #   배선 수용) · WP-7 test_formation_gate_label(+33 · javis_formation 의 fleet_cpu_ratio 라벨 소비) ·
+      #   WP-6 test_review_prompt_verdict_path(리뷰 판정 경로) · P6 test_dept_teardown_atomicity(+17 ·
+      #   상속 env 회귀). 세 레인 **모두**에 없으면 레인 대조 게이트의 union 에 들어오지 않아 비대칭 0 으로
+      #   초록이었다 — 반례: session-start.sh 의 reclaim-role 배선을 되돌려도 3레인 전부 초록. 역방향 축
+      #   (파일→등재)은 이제 scripts/lane-parity-rehearsal.sh 3단계가 잰다.
+      #   실측(로컬 · 아래와 같은 격리 env · 2026-09-10): 14s · 0s · 1s · 4s · 전건 rc=0.
+      #   전용 스텝·격리 env·`if:` 없음(레그 고정 제외)의 근거는 위 WP-7 스텝과 같다.
+      - name: 팩 검체 — 수용 검체 4종 (D3 3레인 등재 · macOS)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_session_start_hook test_formation_gate_label \
+                   test_review_prompt_verdict_path test_dept_teardown_atomicity; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t =="
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/d3-$t.log" 2>&1
+            then r=0; else r=$?; fi
+            tail -60 "/tmp/d3-$t.log"
+            [ $r -eq 0 ] || { echo "::error::$t rc=$r (D3 수용 검체 회귀)"; rc=$r; }
+          done
+          exit $rc
+
       - name: verify_win_crt 게이트 도구 밀폐 스위트 (macOS)
         shell: bash
         run: |
@@ -878,6 +1049,22 @@ jobs:
           echo "::notice title=cys-rehearsal 요약::${summary:-(요약 없음)}"
           echo "::notice title=cys-rehearsal 로그 꼬리::$(tail -5 "$LOG" | tr '\n' ' | ')"
           exit 0
+
+      # ★D4(반성 라운드 2026-09-10): `cargo test --bin cysd` 가 브랜치 CI 에 **없었다** — release.yml
+      #   태그 레인의 `if: matrix.target == 'aarch64-apple-darwin'` 스텝 안에만 있어, 0.14.31 최대
+      #   신설 표면(alert_route.rs 전량 · governance/state/delivery 의 WP-5 큐 생명주기)의 단위 검체
+      #   1,228종이 브랜치 push 에서 0회 실행이고 **컴파일 실패조차** 안 잡혔다. 그 적색은 태그 push
+      #   에서 처음 보이는데 그 시점엔 pack-artifacts 미실행 → 팩 자산 0 → 발행 0 이다(release.yml
+      #   이 그 인과를 스스로 적었다). `--skip hwmon::` 은 release.yml 과 같은 선례(가상 러너 GPU
+      #   부재 · 테스트 삭제 금지). 격리·직렬화 근거는 위 리허설 스텝과 같다.
+      #   ★`if:` 를 달지 않는다 — 위 레인 대조 게이트의 MUST_RUN_TOKENS 가 이 토큰의 존재와 무조건
+      #   실행을 핀한다(D9). 예산: 로컬 실측 2026-09-10(콜드 빌드 포함) 1226 passed · 0 failed ·
+      #   2 filtered(hwmon) · 137s — 러너 캐시 히트 시 더 짧다.
+      - name: cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
 
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
       #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한

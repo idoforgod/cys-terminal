@@ -343,6 +343,34 @@ jobs:
           [ $r -eq 0 ] || { echo "::error::javis_resource_gate --self-test rc=$r"; rc=$r; }
           exit $rc
 
+      # ★D3(반성 라운드 2026-09-10 · fix-plan directives-ci-release): 수용 검체 4종이 **3레인 전부에서
+      #   0회 실행**이었다 — WP-4 test_session_start_hook(+317 · session-start.sh 의 `reclaim-role --auto`
+      #   배선 수용) · WP-7 test_formation_gate_label(+33 · javis_formation 의 fleet_cpu_ratio 라벨 소비) ·
+      #   WP-6 test_review_prompt_verdict_path(리뷰 판정 경로) · P6 test_dept_teardown_atomicity(+17 ·
+      #   상속 env 회귀). 세 레인 **모두**에 없으면 레인 대조 게이트의 union 에 들어오지 않아 비대칭 0 으로
+      #   초록이었다 — 반례: session-start.sh 의 reclaim-role 배선을 되돌려도 3레인 전부 초록. 역방향 축
+      #   (파일→등재)은 이제 scripts/lane-parity-rehearsal.sh 3단계가 잰다.
+      #   실측(로컬 · 아래와 같은 격리 env · 2026-09-10): 14s · 0s · 1s · 4s · 전건 rc=0.
+      #   전용 스텝·격리 env·`if:` 없음(레그 고정 제외)의 근거는 위 WP-7 스텝과 같다.
+      - name: 팩 검체 — 수용 검체 4종 (D3 3레인 등재 · pack-only 서명전)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          for t in test_session_start_hook test_formation_gate_label \
+                   test_review_prompt_verdict_path test_dept_teardown_atomicity; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== $t =="
+            if env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_SOUL -u CYS_ROLE \
+                   CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$f" > "/tmp/d3-$t.log" 2>&1
+            then r=0; else r=$?; fi
+            tail -60 "/tmp/d3-$t.log"
+            [ $r -eq 0 ] || { echo "::error::$t rc=$r (D3 수용 검체 회귀)"; rc=$r; }
+          done
+          exit $rc
+
       # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
       # 오염시키는 회귀 차단(release.yml과 동일).
       - name: cargo clean (스테일 생성표 무효화)
