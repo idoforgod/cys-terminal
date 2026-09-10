@@ -19340,22 +19340,38 @@ mod tests {
     ///   그 함수가 "예"(=Empty·claimable) 라고 답하거나 상한(2s)에 닿을 때까지만 기다린다.
     ///   상한에 닿아도 예외를 던지지 않는다 — 여전히 정착 못 한 형상이라면 그 자체가 검체가
     ///   재려는 실패이고, 조용히 숨기지 않고 그대로 단언 실패로 드러나야 한다.
+    /// ★(2026-09-10 · 3차 CI 재현으로 확정) 단발 관측(`claimable == true` 를 **한 번** 보고
+    ///   바로 반환)은 불충분했다 — `reclaim_seat()` 생성 직후 1회 관측은 통과했는데(진단 로그
+    ///   0건 = 그 시점엔 안정), `reclaim_caller()` 스폰을 거쳐 실제 `role.reclaim_auto` 디스패치
+    ///   시점에는 **다시 seat_not_claimable** 이었다(9개 검체 · gh run 34467774995). 로그인
+    ///   셸(`-l`)의 프로필 로딩(`path_helper` 등)이 스폰 직후 바로 시작하지 않고 조금 뒤에
+    ///   자손을 잠깐 띄웠다 접는 형상이면, "운 좋게 빈 창을 1회 관측"과 "실제로 정착"은 다른
+    ///   사실이다. 그래서 **연속 `STABLE_CONSECUTIVE`회** claimable 을 관측해야만 정착으로
+    ///   인정한다(중간에 한 번이라도 false 면 streak 를 0 으로 되돌린다).
+    const STABLE_CONSECUTIVE: u32 = 6;
+
     fn wait_seat_settled(daemon: &Arc<Daemon>, sid: u64) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut streak: u32 = 0;
         loop {
             let claimable = daemon
                 .get_surface(sid)
                 .map(|s| governance::seat_claimable_now(&s))
                 .unwrap_or(false);
             if claimable {
-                return;
+                streak += 1;
+                if streak >= STABLE_CONSECUTIVE {
+                    return;
+                }
+            } else {
+                streak = 0;
             }
             if std::time::Instant::now() >= deadline {
-                // ★(2026-09-10 · 2차 CI 재현에서 2초 대기로도 안 풀림 실측) 여기서 그냥 조용히
-                //   반환하면 하류 단언이 "seat_not_claimable" 한 줄만 남기고 왜 안 풀렸는지는
-                //   영영 안 남는다 — 진단 채널을 이 자리로 옮긴다. 실패해도(테스트가 어차피 뒤에서
-                //   실패할 값이면) 원인 후보 셋(프로세스 존재·자손·메타)을 전부 stdout 에 남긴다
-                //   (cargo test 는 실패한 테스트의 stdout 만 CI 로그에 올린다 — `--nocapture` 불요).
+                // ★2차 CI 재현에서 2초 단발 대기로도 안 풀림 실측 — 여기서 그냥 조용히 반환하면
+                //   하류 단언이 "seat_not_claimable" 한 줄만 남기고 왜 안 풀렸는지는 영영 안
+                //   남는다. 실패해도(테스트가 어차피 뒤에서 실패할 값이면) 원인 후보 셋(프로세스
+                //   존재·자손·메타)을 전부 stdout 에 남긴다(cargo test 는 실패한 테스트의
+                //   stdout 만 CI 로그에 올린다 — `--nocapture` 불요).
                 if let Some(s) = daemon.get_surface(sid) {
                     let mut sys = sysinfo::System::new();
                     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
@@ -19369,19 +19385,44 @@ mod tests {
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(u64::MAX);
                     println!(
-                        "[wait_seat_settled] 2s 뒤에도 미정착: sid={sid} pid={} exited={} \
-                         proc_exists={proc_exists} descendants={:?} has_meta={has_meta} \
-                         last_human_input_elapsed_secs={human_recent}",
+                        "[wait_seat_settled] 3s 뒤에도 미정착(연속 {streak}/{STABLE_CONSECUTIVE}): \
+                         sid={sid} pid={} exited={} proc_exists={proc_exists} \
+                         descendants={:?} has_meta={has_meta} last_human_input_elapsed_secs={human_recent}",
                         s.pid,
                         s.exited.load(Ordering::Relaxed),
                         descendants,
                     );
                 } else {
-                    println!("[wait_seat_settled] 2s 뒤에도 미정착: sid={sid} — surface 자체가 사라짐");
+                    println!("[wait_seat_settled] 3s 뒤에도 미정착: sid={sid} — surface 자체가 사라짐");
                 }
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// `role.reclaim_auto` 디스패치 **직전**에, "빈 좌석"으로 표시해 둔(= `reclaim_seat()` 가
+    /// `seat_cache=Empty` 로 세팅한) 모든 좌석이 실제로 안정됐는지 다시 잰다.
+    ///
+    /// `reclaim_seat()` 자신도 생성 직후 같은 대기를 한다 — 그런데 **생성 시점의 안정 관측과
+    /// 소비 시점(=이 디스패치)의 안정은 다른 사실**이다(위 `wait_seat_settled` 문서의 3차 CI
+    /// 재현 실측). `reclaim_caller()` 스폰 등 그 사이에 걸리는 실제 시간이 있어서, 생성 직후엔
+    /// 아직 시작 안 했던 로그인 셸 프로필 로딩이 디스패치 시점엔 진행 중일 수 있다. 그래서
+    /// **실제로 그 판정을 소비하는 바로 이 지점**에서 다시 잰다 — `reclaim_rpc` 의 모든 호출자가
+    /// 자동으로 이 이득을 보도록 여기 한 곳에 둔다(개별 테스트 호출부를 전부 고치는 대신).
+    fn settle_all_empty_marked_seats(daemon: &Arc<Daemon>) {
+        let ids: Vec<u64> = daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| {
+                s.seat_cache.load(Ordering::Relaxed) == crate::governance::SeatState::Empty.as_u8()
+            })
+            .map(|s| s.id)
+            .collect();
+        for sid in ids {
+            wait_seat_settled(daemon, sid);
         }
     }
 
@@ -19471,6 +19512,7 @@ mod tests {
     }
 
     fn reclaim_rpc(daemon: &Arc<Daemon>, pid: Option<u32>, params: Value) -> Value {
+        settle_all_empty_marked_seats(daemon);
         let req = Request { id: json!(1), method: "role.reclaim_auto".into(), params };
         let Reply::Single(resp) = dispatch(daemon, req, pid) else {
             panic!("expected single reply");
