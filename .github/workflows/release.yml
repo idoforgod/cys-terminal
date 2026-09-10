@@ -1045,6 +1045,11 @@ jobs:
       #   ≤0.14.30 바이너리는 지시대로 실행하면 unknown-subcommand/unknown-flag 로 죽는다(기능
       #   의존 — RELEASE.md 불변 규칙). pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서
       #   동시 상향(두 값 동일 계약).
+      # ★0.14.32 재발행에서 **유지**(2026-09-10). v0.14.31 태그는 pack-artifacts 게이트
+      #   (scan-pack-secrets.sh 71건)로 발행되지 못했고 0.14.32 가 그 내용의 재발행이다.
+      #   하한이 가리키는 네 CLI 표면은 전부 0.14.31 트리에서 생겼고 0.14.32 는 새 표면을
+      #   추가하지 않는다(팩 변경은 테스트 픽스처 문자열뿐) → 근거 없는 상향을 하지 않는다.
+      #   0.14.32 는 0.14.31 이상이므로 이 하한을 그대로 만족한다(막는 대상은 ≤0.14.30).
       PACK_MIN_BINARY: '0.14.31'
     steps:
       - uses: actions/checkout@v4

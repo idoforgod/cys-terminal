@@ -104,6 +104,10 @@ Requesting removal of the false-positive detection.
 
 ### v0.14.31 — 2026-09-10 — 제출하지 않음 (전제조건 미충족, blocked)
 
+> ※ `v0.14.31` 태그는 이후 **발행되지 않았습니다**(태그 빌드의 pack-artifacts 관문이
+> `scripts/scan-pack-secrets.sh` 71건으로 멈춤 · 초안 릴리스 폐기). 그 내용은 `v0.14.32`
+> 로 재발행됩니다 — 아래 자산 이름은 **발행되지 않은 초안 빌드**의 것입니다.
+
 `~/Desktop/CYSjavis/audit-2026-09-06/impl/wdsi-0.14.31.md` §0·§5-1이 못박은 전제조건
 ("탐지가 실제로 났는지부터 본다. 나지 않았으면 제출하지 않는다")을 이 실행 환경에서
 충족할 수 없어 제출을 시도하지 않았다: v0.14.31을 실제로 설치하고 Windows Defender의

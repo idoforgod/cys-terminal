@@ -70,6 +70,9 @@ jobs:
       #
       # 값 지정 시 정책이 무시되고 "min_binary 정책 오버라이드 사용" ::warning 이 로그에 남는다
       #   (아래 Compute min_binary 스텝) — 의도된 흔적이다. 근거를 커밋에 남길 것.
+      # ★0.14.32 재발행에서 **유지**(2026-09-10) — 근거는 release.yml PACK_MIN_BINARY 주석과
+      #   같다. v0.14.31 은 발행되지 않았고 0.14.32 가 그 재발행이며, 0.14.32 는 새 CLI 표면을
+      #   추가하지 않는다. 두 값 동일 계약이므로 한쪽만 올리는 일이 없도록 함께 둔다.
       PACK_MIN_BINARY_OVERRIDE: '0.14.31'
     steps:
       - uses: actions/checkout@v4
