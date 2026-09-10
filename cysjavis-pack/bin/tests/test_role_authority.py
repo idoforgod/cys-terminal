@@ -562,6 +562,13 @@ def test_guard_label():
                        cwd=BIN)
     check("8p ★guard: env 폴백 라벨은 raw 그대로(' cso ')",
           (r.stdout or "").strip() == "' cso '", (r.stdout or "").strip())
+    # ★0.14.31 성찰 G15: 같은 좌석은 **두 갈래(권위 무역할 / 판정 불가)에서 같은 주소 라벨**을 낸다.
+    #   종전 폴백 갈래는 지역 파서라 `surface:surface12`·`surface:007` 을 냈다(원장에 두 행위자).
+    for _sid, _want in (("surface:12", "surface:12"), ("007", "surface:7")):
+        _a = label(base_env(CYS_SURFACE_ID=_sid, CYS_BIN=stub_dir(0, "\n")))     # 권위 무역할
+        _b = label(base_env(CYS_SURFACE_ID=_sid, CYS_BIN=stub_dir(2, "")))        # 판정 불가·env 없음
+        check("8q ★guard(G15): %r → 권위 갈래 라벨 %s" % (_sid, _want), _a == _want, _a)
+        check("8r ★guard(G15): %r → 폴백 갈래도 같은 라벨 %s" % (_sid, _want), _b == _want, _b)
 
 
 
