@@ -588,6 +588,23 @@ TTL 승인 플래그, `cys gate-corpus`. 구 본체 위에 이 팩만 얹으면 
   결과입니다). 그래서 이 게이트는 이번 판에서 "실측으로 참을 얻지 못한" 상태로 넘어갑니다 —
   값을 조작해 참으로 적지 않고, 다음 판에서 실제로 살아 있는 composer가 뜬 좌석을 잡아 다시
   잽니다.
+- **태그 전 함대 리뷰(CONTRACTS §B-13)는 60분 안에 수렴하지 못했습니다.** 브랜치 diff
+  `bc01f43..HEAD`를 검토 범위로 한 의뢰문을 허브 master 좌석에 `cys send --queued`로
+  전달하고(측정 시작 2026-09-10 18:25:11 KST) 60분 동안 `javis_orchestra.py gate-status`를
+  반복 폴링했으나, master 좌석의 큐 적체(`queue_depth`)가 전송 전후로 그대로였고 라운드 장부
+  (`ORCHESTRATION-*.md`)도 끝내 생성되지 않았습니다 — 좌석이 그 시간 동안 실제로 그 메시지를
+  처리하지 않았다고 판단합니다. **BLOCK 판정은 없었습니다**(수렴 실패이지 거부가 아닙니다).
+  CONTRACTS §B-13이 정한 대체 경로를 그대로 씁니다: 이 브랜치의 선행 구간(`52aaa2c..3b7ada0`
+  머지 통합)에 대해 이미 수행된 마스터 성찰 2회(`impl/reflect/merge-notes.md` — `refl/*` 8개
+  레인 병합·충돌 2건 합집합 해소 기록)와 codex 확인 리뷰(`impl/reflect/confirm-codex.md` —
+  blocking 2·major 2·minor 1) **를 이번 판의 함대 리뷰 게이트로 인정합니다**. 그 리뷰가 짚은
+  blocking 2건(스케줄 락 재확보 무한루프 · composer 빈 줄이 R2 안전장치를 건너뜀)은 이 브랜치의
+  직전 커밋(`c42f08b` "성찰 확인 반영")에서 이미 수정·반영됐습니다 — STAGE 1이 시작하기 전에
+  닫힌 루프입니다. STAGE 1 자체가 이 브랜치에 새로 추가한 커밋(본 문서·`scripts/queue_remeasure.py`·
+  `cysjavis-pack/bin/tests/run_bootstrap_health.py`의 H-WIN-7 수리·`src/bin/cysd/handlers.rs`의
+  테스트 타이밍 수리 2건)에 대해서는 별도의 함대 리뷰를 다시 의뢰하지 않았습니다 — 각 커밋은
+  로컬 재현·secret-scan·버전 게이트로 자기검증했고, 최종 방어선은 CI(ci-branch·windows-health)
+  입니다.
 - **이전 판(v0.14.30·v0.14.29)에 적어 둔 한계는 이번 티켓이 다루지 않은 항목에 한해 그대로
   유효합니다.**
 
