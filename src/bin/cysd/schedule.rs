@@ -541,9 +541,20 @@ impl ScheduleFileLock {
                         .and_then(|t| t.elapsed().ok())
                         .is_some_and(|age| age > stale);
                     if stale_now {
-                        let _ = std::fs::remove_dir(&dir);
-                        continue;
+                        // ★(0.14.31 · 성찰 확인 · blocking) **회수는 CLI 와 같은 철자여야 한다.**
+                        //   CLI(`cys.rs::acquire_schedule_lock`)는 잠금 디렉터리 **안**에 owner 파일을
+                        //   쓴다. 그 창에서 writer 가 SIGKILL 되면 잔존 잠금은 **비어 있지 않다** —
+                        //   종전의 `remove_dir` 는 ENOTEMPTY(실측 errno 66)로 실패하고 mtime 은 그대로라
+                        //   `stale_now` 가 계속 참이다. 두 writer 의 비대칭이 그 자체로 부트체인 사고였다.
+                        let _ = std::fs::remove_dir_all(&dir);
                     }
+                    // ★회수 실패도 **유계**여야 한다 — 종전엔 여기서 `continue` 로 돌아 아래의
+                    //   deadline 검사와 10ms sleep 을 **둘 다 건너뛰었다**. remove 가 지속 실패하면
+                    //   (Windows: 인덱서·백신이 디렉터리를 열고 있으면 sharing violation) 루프가
+                    //   영원히 돌고 함수는 절대 반환하지 않는다 — 이 함수는
+                    //   `ensure_builtin_jobs()`(main.rs)가 accept 루프 **이전**에 동기로 부르므로
+                    //   데몬이 소켓을 한 번도 받지 못한다(부트체인 전손 · 자가 회복 경로 없음).
+                    //   유계 대기 뒤 `None` = 쓰기 포기(막는 방향).
                 }
                 Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
             }
@@ -2771,6 +2782,104 @@ mod tests {
         assert!(again.is_none(), "살아있는 잠금을 뚫었다");
         drop(got);
         assert!(!lock_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.31 · 성찰 확인 · blocking) **CLI 가 남긴 부패 잠금에서 데몬 acquire 가 유계로 끝난다.**
+    ///
+    /// 【무엇이 틀렸었나】 부패 갈래가 `remove_dir`(비재귀) + `continue` 였다. CLI 잠금
+    /// (`cys.rs::acquire_schedule_lock`)은 `create_dir` **직후 잠금 디렉터리 안**에 owner 파일을
+    /// 쓴다 — 그 창에서 `cys schedule add|rm` 이 SIGKILL 되면 **비어 있지 않은** 잠금이 남는다.
+    /// 부패 문턱을 넘긴 뒤 데몬이 들어오면 `remove_dir` 는 ENOTEMPTY 로 실패하고, mtime 이 그대로라
+    /// `stale_now` 는 계속 참이며, `continue` 가 deadline 검사와 sleep 을 건너뛰어 **함수가 절대
+    /// 반환하지 않는다**. 이 함수는 `ensure_builtin_jobs()` 로 accept 루프 **이전**에 동기로 불리므로
+    /// 데몬이 소켓을 한 번도 받지 않고 코어 하나를 100% 태운다(부트체인 전손).
+    ///
+    /// 【검체 형상】 종전 검체(`stale_schedule_lock_is_broken_and_live_lock_times_out`)는 **빈**
+    /// 잠금만 만들어 이 교차 시나리오가 검체 밖이었다. 여기서는 CLI 가 남기는 실제 형상(owner 파일이
+    /// 든 잠금)을 만들고 ① 유계 종료 ② 실제 회수를 잰다. 무한 스핀 회귀 시 검체가 **함께 멎지
+    /// 않도록** 별도 스레드 + `recv_timeout` 으로 잰다(하네스 정지 방지).
+    #[test]
+    fn corrupt_nonempty_schedule_lock_left_by_the_cli_is_reclaimed_within_the_deadline() {
+        let dir = sched_dir("corrupt-lock");
+        let path = dir.join("schedule.json");
+        let lock_dir = ScheduleFileLock::lock_dir_for(&path);
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        // CLI 가 남기는 실제 형상 — 잠금 디렉터리 **안**의 owner 파일(cys.rs:5270).
+        std::fs::write(lock_dir.join("owner"), "4242\n").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            let got = ScheduleFileLock::acquire_with(
+                &p2,
+                Duration::from_millis(200),
+                Duration::from_millis(10),
+            );
+            let _ = tx.send(got);
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("부패(비어 있지 않은) 잠금에서 acquire 가 유계로 끝나지 않았다 — 무한 스핀");
+        assert!(
+            got.is_some(),
+            "CLI 가 남긴 owner 든 잠금을 데몬이 회수하지 못했다(두 writer 의 비대칭)"
+        );
+        drop(got);
+        assert!(!lock_dir.exists(), "해제가 잠금을 남겼다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.31 · 성찰 확인 · blocking) **회수가 지속 실패해도 유계다** — 회수 실패의 귀결은
+    /// 유계 대기 뒤 `None`(쓰기 포기 = 막는 방향)이지 무한 대기가 아니다.
+    ///
+    /// 【형상】 회수가 **반드시** 실패하는 잠금을 만든다: 잠금 디렉터리 안에 항목을 두고 그
+    /// 디렉터리를 읽기 전용(0o555)으로 만든다 — 안의 항목을 지울 수 없으므로 `remove_dir` 도
+    /// `remove_dir_all` 도 실패한다(Windows 의 sharing violation 과 같은 자리 · 그쪽은 이식성
+    /// 있게 만들 수 없어 권한으로 대신한다 · `#[cfg(unix)]`).
+    ///
+    /// 【무엇을 가르는가】 종전 갈래(`remove_dir` + `continue`)는 deadline 을 **한 번도** 검사하지
+    /// 않으므로 여기서 영원히 돈다(개정 전 소스에서 이 검체는 recv_timeout 으로 붉다). 개정 뒤에는
+    /// 대기 상한을 지나 `None` 이다. 무한 스핀 회귀 시 검체가 함께 멎지 않도록 별도 스레드로 잰다.
+    #[cfg(unix)]
+    #[test]
+    fn schedule_lock_deadline_is_checked_even_when_stale_reclaim_keeps_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = sched_dir("noreclaim");
+        let path = dir.join("schedule.json");
+        let lock_dir = ScheduleFileLock::lock_dir_for(&path);
+        std::fs::create_dir_all(lock_dir.join("inner")).unwrap();
+        let mut perm = std::fs::metadata(&lock_dir).unwrap().permissions();
+        perm.set_mode(0o555); // 안의 항목을 지울 수 없다 = 회수는 반드시 실패한다
+        std::fs::set_permissions(&lock_dir, perm).unwrap();
+        if std::fs::remove_dir(lock_dir.join("inner")).is_ok() {
+            // 권한이 무의미한 실행(root 등) — 이 파일계에서는 '회수 실패' 를 만들 수 없다.
+            let mut perm = std::fs::metadata(&lock_dir).unwrap().permissions();
+            perm.set_mode(0o755);
+            let _ = std::fs::set_permissions(&lock_dir, perm);
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("skip: 회수 실패를 만들 수 없는 실행 환경(root?) — 측정 불가");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let got = ScheduleFileLock::acquire_with(
+                &p2,
+                Duration::from_millis(120),
+                Duration::from_millis(0),
+            );
+            let _ = tx.send((got.is_some(), t0.elapsed()));
+        });
+        let (acquired, took) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("회수가 계속 실패하는 잠금에서 acquire 가 반환하지 않았다 — 무한 스핀(부트 정지)");
+        assert!(!acquired, "회수하지 못한 잠금을 쥐었다고 보고했다(상호 배제 붕괴)");
+        assert!(took < Duration::from_secs(5), "대기 상한(120ms)을 크게 넘겼다: {took:?}");
+        let mut perm = std::fs::metadata(&lock_dir).unwrap().permissions();
+        perm.set_mode(0o755);
+        let _ = std::fs::set_permissions(&lock_dir, perm);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

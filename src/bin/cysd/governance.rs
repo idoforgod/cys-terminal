@@ -18,10 +18,28 @@ const LOAD_DEBOUNCE_SECS: f64 = 60.0;
 pub(crate) enum WatchdogMode {
     /// 전용 OS 스레드(정상) — 틱의 블로킹이 tokio 워커를 점유하지 않는다.
     DedicatedThread,
-    /// 스레드 생성 실패 폴백 — 종전대로 tokio 태스크에서 돈다(워커 점유 위험 복귀).
+    /// 스레드 생성 실패 폴백 — **블로킹 풀**(`Handle::spawn_blocking`)에서 돈다.
     /// watchdog **소멸**보다는 낫다: 거버넌스가 사라지면 자원 관리·자가치유가 데몬 수명 내내
-    /// 조용히 없다(부트체인 최악). 대신 사실을 반드시 드러낸다(stderr + `watchdog.mode`).
-    AsyncFallback,
+    /// 조용히 없다(부트체인 최악). 대신 사실을 반드시 드러낸다(stderr).
+    ///
+    /// ★(0.14.31 · 성찰 확인 · major) **종전에는 `tokio::spawn` 이었고 그것이 기준 대비 회귀였다.**
+    /// 같은 커밋이 틱 본체를 완전 동기로 바꿨다(`std::thread::sleep(WATCHDOG_INTERVAL_SECS)` ·
+    /// `.await` 0 — run_bootstrap_health H-TICK-ALIVE 가 그 사실을 핀한다). 그래서 폴백 태스크는
+    /// **한 번도 yield 하지 않고** 워커 스레드를 프로세스 수명 내내 점유한다. `#[tokio::main]` 의
+    /// 기본은 worker_threads=num_cpus 이므로, Q8 이 근거로 든 바로 그 환경(1~2코어 Windows CI
+    /// 러너·소형 VM)에서 워커가 1개면 런타임 전체가 정지한다 — accept 루프·RPC dispatch·이벤트
+    /// write 가 전부 죽는다. 기준(52aaa2c)의 `tokio::time::sleep(..).await` 는 매 틱 yield 했으므로
+    /// 종전 최대 2초 점유가 **영구 점유**로 바뀐 것이다.
+    ///
+    /// 【왜 블로킹 풀인가】 블로킹 풀은 무한 루프를 감당하도록 설계됐고 워커를 굶기지 않는다.
+    /// 위 doc 이 기각한 것은 **주 경로**에서의 abort 의미론(런타임 드롭이 무한 대기)이지 폴백이
+    /// 아니다 — 이 팔은 전용 스레드가 못 뜬 퇴화 상태이고, 데몬 종료는 양 OS 모두 `process::exit`
+    /// 라(main.rs 신호 핸들러) 드롭 대기가 사실상 없다.
+    BlockingPoolFallback,
+    /// 스레드도 못 뜨고 런타임 핸들도 없다 — 거버넌스는 **돌지 않는다**. 종전에는 이 자리에서
+    /// `tokio::spawn` 이 패닉했다(런타임 밖 호출). 자매 모듈과 같은 규율로 사실을 드러낸다
+    /// (`alert_route::spawn` 은 실행자 스레드 생성 실패 시 enabled=false + `worker_unavailable`).
+    Unavailable,
 }
 
 /// ★(0.14.31 · 성찰 Q8 · codex 설계 검토 A) 거버넌스 루프를 **런타임 워커 밖**에서 돌린다.
@@ -45,6 +63,17 @@ pub(crate) fn spawn_governance_loop<F>(name: &str, body: F) -> WatchdogMode
 where
     F: FnOnce() + Send + 'static,
 {
+    spawn_governance_loop_with(name, body, false)
+}
+
+/// 본체 — **폴백 팔을 검체가 태울 수 있게** 스레드 생성 실패를 주입받는다(`force_fallback`).
+/// 스레드 생성 실패는 이식성 있게 만들 수 없다(OS·rlimit 의존). `ScheduleFileLock::acquire_with`
+/// 가 대기·부패 상한을 주입받는 것과 같은 규율이다 — 폴백 팔의 **진행성**(블로킹 중에도 런타임이
+/// 계속 도는가)은 이 주입점 없이는 어디서도 재지 못한다.
+pub(crate) fn spawn_governance_loop_with<F>(name: &str, body: F, force_fallback: bool) -> WatchdogMode
+where
+    F: FnOnce() + Send + 'static,
+{
     type Body = Box<dyn FnOnce() + Send>;
     // 스레드 생성이 실패하면 클로저는 `Builder::spawn` 이 삼켜 되돌려주지 않는다 — 그래서
     // 본체를 셀에 담아 넘기고, 실패 시 **아직 셀 안에 있는** 본체를 폴백 경로가 꺼내 쓴다.
@@ -58,22 +87,41 @@ where
     };
     let handle = tokio::runtime::Handle::try_current().ok();
     let inner = Arc::clone(&cell);
-    let spawned = std::thread::Builder::new().name(name.to_string()).spawn(move || {
-        // 런타임 컨텍스트를 이 스레드 전체에 건다(틱 안의 `tokio::spawn` 이 계속 돈다).
-        let _rt = handle.as_ref().map(tokio::runtime::Handle::enter);
-        take_and_run(&inner);
-    });
+    let thread_handle = handle.clone();
+    let spawned = if force_fallback {
+        Err(std::io::Error::new(std::io::ErrorKind::Other, "forced fallback(검체 주입)"))
+    } else {
+        std::thread::Builder::new().name(name.to_string()).spawn(move || {
+            // 런타임 컨텍스트를 이 스레드 전체에 건다(틱 안의 `tokio::spawn` 이 계속 돈다).
+            let _rt = thread_handle.as_ref().map(tokio::runtime::Handle::enter);
+            take_and_run(&inner);
+        })
+    };
     match spawned {
         Ok(_) => WatchdogMode::DedicatedThread,
         Err(e) => {
+            let Some(h) = handle else {
+                // 런타임도 없다 — 종전에는 여기서 `tokio::spawn` 이 **패닉**했다. 사실을 드러낸다.
+                eprintln!(
+                    "cysd: 전용 watchdog 스레드 생성 실패({e}) · 런타임 핸들도 없다 — \
+                     거버넌스를 켜지 않는다(자원 관리·자가치유 없음)"
+                );
+                return WatchdogMode::Unavailable;
+            };
             eprintln!(
-                "cysd: 전용 watchdog 스레드 생성 실패({e}) — tokio 태스크로 폴백한다\
-                 (거버넌스는 계속 돈다 · 틱이 런타임 워커를 점유할 수 있다)"
+                "cysd: 전용 watchdog 스레드 생성 실패({e}) — 블로킹 풀로 폴백한다\
+                 (거버넌스는 계속 돈다 · 런타임 워커는 굶기지 않는다)"
             );
-            tokio::spawn(async move {
+            // ★블로킹 풀이다(`tokio::spawn` 아님) — 틱 본체는 완전 동기라 워커에 얹으면 yield 가
+            //   0 이고, 1코어에서 런타임 전체가 정지한다(accept·RPC·이벤트 write 전손).
+            //   `Handle::spawn_blocking` 은 런타임 컨텍스트 **밖**에서도 부를 수 있다.
+            let ctx = h.clone();
+            h.spawn_blocking(move || {
+                // 전용 스레드 팔과 같은 규율 — 틱 안의 `tokio::spawn`(node-recover 자식)이 계속 돈다.
+                let _rt = ctx.enter();
                 take_and_run(&cell);
             });
-            WatchdogMode::AsyncFallback
+            WatchdogMode::BlockingPoolFallback
         }
     }
 }
@@ -89,6 +137,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         eprintln!("cysd: watchdog 이 이미 기동해 있다 — 중복 기동 요청을 무시한다");
         return;
     }
+    let report = Arc::clone(&daemon);
     let mode = spawn_governance_loop("cys-watchdog", move || {
         let mut sys = System::new();
         let mut last_load_alert: f64 = 0.0;
@@ -214,8 +263,21 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
             }
         }
     });
-    if mode == WatchdogMode::AsyncFallback {
-        eprintln!("cysd: watchdog 실행 모드 = async 폴백(전용 스레드 없음)");
+    match mode {
+        WatchdogMode::DedicatedThread => {}
+        WatchdogMode::BlockingPoolFallback => {
+            eprintln!("cysd: watchdog 실행 모드 = 블로킹 풀 폴백(전용 스레드 없음)");
+        }
+        WatchdogMode::Unavailable => {
+            // 거버넌스가 **없는** 채로 데몬이 산다 — 조용히 넘기지 않는다(자매 모듈과 같은 규율).
+            eprintln!("cysd: watchdog 실행 모드 = 없음(전용 스레드·런타임 둘 다 실패) — 자원 관리·자가치유 없음");
+            report.bus.publish(
+                "watchdog.unavailable",
+                "watchdog",
+                None,
+                json!({"note": "전용 스레드 생성 실패 + 런타임 핸들 부재 — watchdog 이 돌지 않는다"}),
+            );
+        }
     }
 }
 
@@ -18273,6 +18335,79 @@ mod reflect_queue_tests {
             "본체가 300ms 블로킹하는 동안 async 태스크가 {advanced} 번밖에 못 돌았다 — 워커 점유"
         );
         assert!(in_runtime, "런타임 컨텍스트가 없다 — 틱 안의 tokio::spawn 이 조용히 죽는다");
+    }
+
+    /// ★(0.14.31 · 성찰 확인 · major) **폴백 팔도 런타임 워커를 굶기지 않는다.**
+    ///
+    /// 【무엇이 틀렸었나】 Q8 이 watchdog 을 전용 스레드로 옮기면서 남긴 폴백이 `tokio::spawn` 이었다.
+    /// 그런데 같은 커밋이 틱 본체를 **완전 동기**로 바꿨다(`.await` 0 · H-TICK-ALIVE 가 그 사실을
+    /// 핀한다) — 그 태스크는 한 번도 yield 하지 않고 워커를 프로세스 수명 내내 점유한다. 워커가
+    /// 1개면(1~2코어 Windows CI 러너·소형 VM — Q8 이 근거로 든 바로 그 환경) 런타임 전체가
+    /// 정지한다: accept 루프·RPC dispatch·이벤트 write 전손. 기준(52aaa2c)의 `tokio::time::sleep`
+    /// 은 매 틱 yield 했으므로 **기준 대비 회귀**였다.
+    ///
+    /// 【이 검체가 재는 것】 형제 검체(`q8_governance_loop_runs_off_the_runtime_workers`)와 **같은
+    /// 형태**로 폴백 팔의 진행성을 잰다 — 워커 1개 런타임에서 본체가 300ms 블로킹하는 동안 async
+    /// 태스크가 계속 도는가. 종전 배선(`tokio::spawn`)이면 이 값이 0 이다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn reflect_q8_fallback_arm_does_not_occupy_the_runtime_worker() {
+        use std::sync::atomic::AtomicU64;
+        let worker = tokio::spawn(async { std::thread::current().id() }).await.expect("워커 신원");
+        let ticker = Arc::new(AtomicU64::new(0));
+        let pump_ticker = Arc::clone(&ticker);
+        let pump = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                pump_ticker.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body_ticker = Arc::clone(&ticker);
+        // 스레드 생성 실패는 이식성 있게 만들 수 없다 — 주입점으로 **폴백 팔 그 자체**를 태운다.
+        let mode = spawn_governance_loop_with(
+            "cys-watchdog-fallback-probe",
+            move || {
+                let id = std::thread::current().id();
+                let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+                let before = body_ticker.load(AtomicOrdering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(300)); // 틱의 결판 대기 흉내
+                let advanced = body_ticker.load(AtomicOrdering::Relaxed) - before;
+                let _ = tx.send((id, in_runtime, advanced));
+            },
+            true,
+        );
+        assert_eq!(mode, WatchdogMode::BlockingPoolFallback, "폴백이 블로킹 풀이 아니다");
+        let (id, in_runtime, advanced) = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("폴백 본체가 10초 안에 끝나지 않았다")
+            .expect("본체가 결과를 보내지 못했다");
+        pump.abort();
+        assert_ne!(id, worker, "폴백 본체가 런타임 워커 스레드에서 돈다(영구 점유)");
+        assert!(
+            advanced >= 10,
+            "폴백 본체가 300ms 블로킹하는 동안 async 태스크가 {advanced} 번밖에 못 돌았다 — \
+             워커 점유(1코어면 accept·RPC·이벤트 write 전손)"
+        );
+        assert!(in_runtime, "폴백 팔에 런타임 컨텍스트가 없다 — 틱 안의 tokio::spawn 이 패닉한다");
+    }
+
+    /// ★(0.14.31 · 성찰 확인 · major) **런타임도 스레드도 없으면 거짓 보고 대신 사실을 드러낸다.**
+    ///
+    /// 종전 폴백은 런타임 밖에서 `tokio::spawn` 을 불러 **패닉**했다(호출자가 그대로 죽는다).
+    /// 자매 모듈(`alert_route::spawn`)의 규율과 같이, 못 돌면 못 돈다고 보고한다(`Unavailable`).
+    #[test]
+    fn reflect_q8_fallback_without_a_runtime_reports_unavailable_instead_of_panicking() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "전제 붕괴: 이 검체는 런타임 밖에서 돌아야 한다"
+        );
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = Arc::clone(&ran);
+        let mode = spawn_governance_loop_with("cys-watchdog-noworker", move || {
+            r2.store(true, AtomicOrdering::SeqCst);
+        }, true);
+        assert_eq!(mode, WatchdogMode::Unavailable, "런타임 없는 폴백이 켜졌다고 보고했다");
+        assert!(!ran.load(AtomicOrdering::SeqCst), "돌지 않는 본체가 돌았다고 보고됐다");
     }
 
     /// ★(0.14.31 · 성찰 Q8) **런타임 컨텍스트가 없어도 거버넌스 루프는 뜬다.** `Handle::try_current`

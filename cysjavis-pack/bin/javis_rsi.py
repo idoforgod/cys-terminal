@@ -337,6 +337,24 @@ def _save_state(state):
     _mirror_learn_state(state)  # CC 학습 탭 배선(B-10)
 
 
+# ★(0.14.31 · 성찰 확인 · major · 계획 N7) state.json **세 writer 공용** 잠금과 경합 rc.
+#   writer 는 checkpoint · progress · ceiling 래치 셋이고, 셋이 **같은 잠금**을 써야만 상호배제가
+#   성립한다(하나만 쥐면 그 사이로 나머지가 끼어든다 — 잠금이 있다는 착각이 더 나쁘다).
+#   잠금 자체는 최선노력이다(`_best_effort_lock` doc): 파일계가 잠금을 지원하지 않으면
+#   종전대로 진행하고(`unsupported`), 남이 쥐고 있으면(`blocked`) **쓰지 않는다**.
+RSI_RC_BUSY = 4                           # 경합으로 아무것도 쓰지 않았다(일시 실패 · 재시도 가능)
+
+
+def _state_lock():
+    """state.json 트랜잭션 잠금 — 세 writer 가 이 한 자리를 공유한다."""
+    d = rsi_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return _best_effort_lock(os.path.join(d, "state.json"))
+
+
 def _latch_ceiling_recommended(rid, key):
     """추천 래치 **두 필드만** 최신 상태 위에 얹는다(보조 저장) → 성공 여부.
 
@@ -352,17 +370,26 @@ def _latch_ceiling_recommended(rid, key):
     ★어떤 실패도 예외로 올리지 않는다(N14): 보조 저장의 ENOSPC 가 주 평가의 rc 를 바꾸면
       `javis_learn.py` 가 끝난 평가를 fail(12)(일시 실패)로 올려 재시도로 되돌린다."""
     try:
-        cur, unreadable = _read_state_file()
-        if unreadable:
-            print("[rsi] 주의: 상태 판독 실패로 ceiling 래치를 남기지 못했다(%s) — 추천은 이미 "
-                  "나갔고 큐·ledger 가 중복을 막는다." % unreadable, file=sys.stderr)
-            return False
-        r = cur.get("rounds", {}).get(rid)
-        if not isinstance(r, dict):
-            return False                 # 그 라운드가 최신 상태에 없다 — 얹을 자리가 없다
-        r["ceiling_recommended"] = True
-        r["ceiling_recommended_key"] = key
-        _save_state(cur)
+        # ★(성찰 확인 · N7) 재읽기만으로는 부족하다 — 읽기와 쓰기 **사이**에 남의 checkpoint 가
+        #   저장되면 그것이 그대로 지워진다(래치는 성공을 반환해 아무도 모른다). 주 writer 와
+        #   **같은 잠금** 안에서 읽고 쓴다. 못 쥐면 래치를 세우지 않는다 — 래치는 편의(캐시)이고
+        #   내구 근거는 큐와 ledger 라, 다음 호출이 다시 메운다(§N7 실패 방향).
+        with _state_lock() as lk:
+            if lk.blocked:
+                print("[rsi] 주의: 상태 잠금 경합으로 ceiling 래치를 남기지 못했다 — 추천은 이미 "
+                      "나갔고 큐·ledger 가 중복을 막는다.", file=sys.stderr)
+                return False
+            cur, unreadable = _read_state_file()
+            if unreadable:
+                print("[rsi] 주의: 상태 판독 실패로 ceiling 래치를 남기지 못했다(%s) — 추천은 이미 "
+                      "나갔고 큐·ledger 가 중복을 막는다." % unreadable, file=sys.stderr)
+                return False
+            r = cur.get("rounds", {}).get(rid)
+            if not isinstance(r, dict):
+                return False             # 그 라운드가 최신 상태에 없다 — 얹을 자리가 없다
+            r["ceiling_recommended"] = True
+            r["ceiling_recommended_key"] = key
+            _save_state(cur)
         return True
     except Exception as e:               # noqa: BLE001 — 보조 저장은 주 평가의 rc 를 바꾸지 않는다
         print("[rsi] 주의: ceiling 래치 저장 실패(%s) — 큐·ledger 가 중복을 막는다." % e,
@@ -976,29 +1003,42 @@ def cmd_checkpoint(a):
     ts = time.time()
     ref = f"refs/rsi/ckpt/{a.round}"
     _git(["update-ref", ref, head])  # 복구 anchor (비파괴)
-    state, state_unreadable = _read_state_file()
-    # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
-    #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
-    #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
-    attempts, prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
-    flat = _as_int(prev.get("flat_streak"), 0)
-    stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
-    rec = {
-        "round": a.round, "checkpoint_sha": head, "ref": ref,
-        "baseline_score": a.score, "started_at": ts, "note": a.note or "",
-        "progress": [], "attempts": attempts, "flat_streak": flat,
-        "stop_reason": stop_reason,
-        "ceiling_recommended": bool(prev.get("ceiling_recommended")),
-    }
-    if prev.get("ceiling_recommended_key"):
-        rec["ceiling_recommended_key"] = prev["ceiling_recommended_key"]
-    if damaged or unreadable or state_unreadable or budget_bad:
-        # ★N14: `budget_bad` = 저장된 `attempts` 를 **읽었는데 쓸 수 없었다**(비유한 수 등).
-        #   그것을 0 으로 접으면 예산이 조용히 되돌아가므로 불확정으로 표기한다.
-        rec["budget_unknown"] = True      # 영속 state 에도 싣는다(다음 호출이 이어 읽는다)
-    state.setdefault("rounds", {})[a.round] = rec
-    state["current_round"] = a.round
-    _save_state(state)
+    # ★(0.14.31 · 성찰 확인 · major · 계획 N7) **읽기→변이→쓰기는 공용 잠금 안에서 한다.**
+    #   state.json 의 writer 는 셋이다(checkpoint · progress · ceiling 래치). 셋 다 잠금 없이
+    #   read-modify-write 를 했으므로 두 프로세스가 겹치면 **나중 쓰기가 먼저 쓰기를 통째로
+    #   되돌린다**: A 가 H1 을 읽는 사이 B 가 H2·attempts 2 를 저장하면, A 의 저장이 그것을 H1·1 로
+    #   내려앉히고 그 뒤 rollback 이 **틀린 커밋**을 앵커로 잡는다(되돌리기 사고 방향 · §7 위험 ③).
+    #   N7 이 요구한 '세 writer 를 덮는 공유 트랜잭션 잠금' 이 이것이다.
+    # ★잠금을 못 쥐면 **쓰지 않는다**(enqueue_learn_digest 와 같은 규율) — 경합 중 쓰기는 곧
+    #   남의 기록 소실이다. 호출자(javis_learn)는 비-0 을 일시 실패(12)로 받아 재시도한다.
+    with _state_lock() as lk:
+        if lk.blocked:
+            print("error: state.json 잠금 경합 — 다른 rsi writer 가 쥐고 있다. 아무것도 쓰지 "
+                  "않았다(재시도 가능).", file=sys.stderr)
+            return RSI_RC_BUSY
+        state, state_unreadable = _read_state_file()
+        # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
+        #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
+        #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
+        attempts, prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
+        flat = _as_int(prev.get("flat_streak"), 0)
+        stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
+        rec = {
+            "round": a.round, "checkpoint_sha": head, "ref": ref,
+            "baseline_score": a.score, "started_at": ts, "note": a.note or "",
+            "progress": [], "attempts": attempts, "flat_streak": flat,
+            "stop_reason": stop_reason,
+            "ceiling_recommended": bool(prev.get("ceiling_recommended")),
+        }
+        if prev.get("ceiling_recommended_key"):
+            rec["ceiling_recommended_key"] = prev["ceiling_recommended_key"]
+        if damaged or unreadable or state_unreadable or budget_bad:
+            # ★N14: `budget_bad` = 저장된 `attempts` 를 **읽었는데 쓸 수 없었다**(비유한 수 등).
+            #   그것을 0 으로 접으면 예산이 조용히 되돌아가므로 불확정으로 표기한다.
+            rec["budget_unknown"] = True      # 영속 state 에도 싣는다(다음 호출이 이어 읽는다)
+        state.setdefault("rounds", {})[a.round] = rec
+        state["current_round"] = a.round
+        _save_state(state)
     entry = {"event": "checkpoint", "round": a.round, "sha": head[:12],
              "score": a.score, "ts": ts, "ref": ref,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
@@ -1063,38 +1103,51 @@ def _warn_stop(stop_reason, rid, attempts, damaged=0, unreadable="", state_unrea
 
 
 def cmd_progress(a):
-    state, state_unreadable = _read_state_file()
-    r = state.get("rounds", {}).get(a.round)
-    if not r:
-        print(f"error: 라운드 '{a.round}' checkpoint 없음 — 먼저 checkpoint 하라", file=sys.stderr)
-        return 2
-    base = r.get("baseline_score")
-    # 직전 progress가 있으면 그것과 비교(라운드 내 단조), 없으면 baseline.
-    prev = r["progress"][-1]["score"] if r.get("progress") else base
-    if prev is None:
-        print("error: 기준 score 없음 — checkpoint에 --score 주거나 직전 progress 필요", file=sys.stderr)
-        return 2
-    delta = a.score - prev
-    v = verdict(delta)               # ★verdict는 순수 delta 산술 — tokens_saved 절대 미접촉(injected-only)
-    ts = time.time()
-    rec = {"score": a.score, "prev": prev, "delta": round(delta, 6), "verdict": v,
-           "ts": ts, "note": a.note or ""}
-    # U4 rider: tokens_saved는 score 옆 공동기록만(verdict/delta/flat_streak 불변). 미지정=키 생략.
-    if getattr(a, "tokens_saved", None) is not None:
-        rec["tokens_saved"] = a.tokens_saved
-    r["progress"].append(rec)
-    # (RSI 자율추천 iii) ceiling — flat N연속 = 점수 정체 → 학습 추천(추천만·사람 승인).
-    r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
-    # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
-    #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
-    attempts, _prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
-    r["attempts"] = attempts
-    stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
-                                  rsi_ceiling_flats())
-    r["stop_reason"] = stop_reason
-    if damaged or unreadable or state_unreadable or budget_bad:
-        r["budget_unknown"] = True        # ★N14 — 해석 불가한 저장 예산도 불확정이다
-    _save_state(state)
+    # ★(0.14.31 · 성찰 확인 · major · 계획 N7) **읽기→변이→쓰기는 공용 잠금 안에서 한다.**
+    #   state.json 의 writer 는 셋이다(checkpoint · progress · ceiling 래치). 셋 다 잠금 없이
+    #   read-modify-write 를 했으므로 두 프로세스가 겹치면 **나중 쓰기가 먼저 쓰기를 통째로
+    #   되돌린다**: A 가 H1 을 읽는 사이 B 가 H2·attempts 2 를 저장하면, A 의 저장이 그것을 H1·1 로
+    #   내려앉히고 그 뒤 rollback 이 **틀린 커밋**을 앵커로 잡는다(되돌리기 사고 방향 · §7 위험 ③).
+    #   N7 이 요구한 '세 writer 를 덮는 공유 트랜잭션 잠금' 이 이것이다.
+    # ★잠금을 못 쥐면 **쓰지 않는다**(enqueue_learn_digest 와 같은 규율) — 경합 중 쓰기는 곧
+    #   남의 기록 소실이다. 호출자(javis_learn)는 비-0 을 일시 실패(12)로 받아 재시도한다.
+    with _state_lock() as lk:
+        if lk.blocked:
+            print("error: state.json 잠금 경합 — 다른 rsi writer 가 쥐고 있다. 아무것도 쓰지 "
+                  "않았다(재시도 가능).", file=sys.stderr)
+            return RSI_RC_BUSY
+        state, state_unreadable = _read_state_file()
+        r = state.get("rounds", {}).get(a.round)
+        if not r:
+            print(f"error: 라운드 '{a.round}' checkpoint 없음 — 먼저 checkpoint 하라", file=sys.stderr)
+            return 2
+        base = r.get("baseline_score")
+        # 직전 progress가 있으면 그것과 비교(라운드 내 단조), 없으면 baseline.
+        prev = r["progress"][-1]["score"] if r.get("progress") else base
+        if prev is None:
+            print("error: 기준 score 없음 — checkpoint에 --score 주거나 직전 progress 필요", file=sys.stderr)
+            return 2
+        delta = a.score - prev
+        v = verdict(delta)               # ★verdict는 순수 delta 산술 — tokens_saved 절대 미접촉(injected-only)
+        ts = time.time()
+        rec = {"score": a.score, "prev": prev, "delta": round(delta, 6), "verdict": v,
+               "ts": ts, "note": a.note or ""}
+        # U4 rider: tokens_saved는 score 옆 공동기록만(verdict/delta/flat_streak 불변). 미지정=키 생략.
+        if getattr(a, "tokens_saved", None) is not None:
+            rec["tokens_saved"] = a.tokens_saved
+        r["progress"].append(rec)
+        # (RSI 자율추천 iii) ceiling — flat N연속 = 점수 정체 → 학습 추천(추천만·사람 승인).
+        r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
+        # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
+        #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
+        attempts, _prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
+        r["attempts"] = attempts
+        stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
+                                      rsi_ceiling_flats())
+        r["stop_reason"] = stop_reason
+        if damaged or unreadable or state_unreadable or budget_bad:
+            r["budget_unknown"] = True        # ★N14 — 해석 불가한 저장 예산도 불확정이다
+        _save_state(state)
     entry = {"event": "progress", "round": a.round, **rec,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}

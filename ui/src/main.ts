@@ -3039,6 +3039,23 @@ async function awaitHandoffAck(
     "전출 진행 중",
     `인계 적재됨(항목 ${rec.entryId ?? "?"}${rec.durable === false ? " · 내구 미확정" : ""}) · 목적지 surface:${rec.destSid} 의 인수 확인 대기(최대 ${TRANSFER_ACK_WAIT_SECS}초)…`,
   );
+  // ★(0.14.31 · 성찰 확인 · major · 계획 C2) 보류·실패의 **단일 출구**.
+  //
+  // 【무엇이 틀렸었나】 기록은 인수 확인 직후 `in-progress` 로 올라가는데, 그 뒤의 **예외 경로가
+  // 기록을 되돌리지 않았다**. `close_surface` 가 일시 RPC 실패로 reject 하면(목적지는 인수했고
+  // 원본 pane 은 그대로 열려 있다) 예외가 이 함수를 그냥 빠져나가고 기록은 `in-progress` 로 남는다
+  // → 이후 모든 재시도가 [`transferRetryAction`] 에서 `busy`(무동작)로 끝난다. **아무 전출도 돌지
+  // 않는데** GUI 전출이 세션 내내 죽는다(C2 가 요구한 '재시도 가능한 인계' 의 정반대).
+  //
+  // 【규율】 이 함수의 모든 비정상 출구는 여기를 지난다 — 기록을 재시도 가능한 상태
+  // (`awaiting-ack`)로 되돌리거나(목적지 소멸이면 삭제) 하고, 사실을 말한다. 보류 토스트도
+  // 이 한 자리다(검체가 그 유일성을 핀한다).
+  const holdForRetry = (note: string, tail: string, drop = false) => {
+    if (drop) transfersInFlight.delete(recKey);
+    else transfersInFlight.set(recKey, { ...rec, state: "awaiting-ack" });
+    render();
+    toast("watchdog", "전출 보류", `${note} — ${tail}`);
+  };
   let verdict: CloseVerdict = { close: false, hold: "not-acked", gone: false, note: "관측 전" };
   try {
     const deadline = Date.now() + TRANSFER_ACK_WAIT_SECS * 1000;
@@ -3062,12 +3079,30 @@ async function awaitHandoffAck(
       if (Date.now() >= deadline) break;
       await new Promise((res) => setTimeout(res, 3000));
     }
+  } catch (e) {
+    // 관측 중 예외 — 기록을 `in-progress` 로 두고 나가면 재시도가 영영 `busy` 다.
+    dismissToast("transfer");
+    holdForRetry(
+      `인수 확인 관측 중 오류(${e})`,
+      `인계는 적재됐고 원본 pane 은 보존했습니다(다시 적재하지 않습니다). 같은 부서로 다시 전출하면 인수 확인만 다시 기다립니다. 목적지 surface:${rec.destSid} 를 확인하세요.`,
+    );
+    return;
   } finally {
     dismissToast("transfer");
   }
   if (verdict.close) {
     // ⑥ 인수 확인 + 좌석 수신 가능 재확인 뒤에만 원본 정리. 기록은 여기서 끝난다.
-    await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    try {
+      await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    } catch (e) {
+      // 목적지는 인수했고 원본은 **열린 채**다 — 되돌릴 것이 없으므로 인수 대기로 남겨 재시도가
+      // 종료만 다시 하게 한다(기동 0 · 적재 0). 여기서 나가면 그 pane 은 영영 `busy` 다.
+      holdForRetry(
+        `원본 pane 종료 실패(${e})`,
+        `인계는 적재됐고 목적지 surface:${rec.destSid} 는 인수했습니다. 원본 pane 은 열린 채이니, 같은 부서로 다시 전출하면 인수 확인 뒤 원본 종료만 재시도합니다(기동·적재 0).`,
+      );
+      return;
+    }
     transfersInFlight.delete(recKey);
     destroyPaneRuntime(sid, srcSock);
     if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
@@ -3081,17 +3116,14 @@ async function awaitHandoffAck(
     return;
   }
   const gone = verdict.hold === "destination" && verdict.gone;
-  if (gone) transfersInFlight.delete(recKey);
-  else transfersInFlight.set(recKey, { ...rec, state: "awaiting-ack" });
-  render();
-  toast(
-    "watchdog",
-    "전출 보류",
-    `${verdict.note} — 인계는 적재됐고 원본 pane 은 보존했습니다(다시 적재하지 않습니다). ` +
+  holdForRetry(
+    verdict.note,
+    `인계는 적재됐고 원본 pane 은 보존했습니다(다시 적재하지 않습니다). ` +
       (gone
         ? "목적지가 사라졌으므로 같은 pane 을 다시 전출하면 새로 기동합니다. "
         : "같은 부서로 다시 전출하면 인수 확인만 다시 기다립니다(기동·적재 0). ") +
       `목적지 surface:${rec.destSid} 를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${rec.launcherSid} 도 남아 있습니다.`,
+    gone,
   );
 }
 

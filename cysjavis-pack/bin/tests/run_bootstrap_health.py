@@ -11990,9 +11990,21 @@ def _u23_tick_violations(sup, main_rs, gov):
                 v.append("전용 스레드 watchdog 의 cadence sleep 이 "
                          "std::thread::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)) 이 아니다")
             # 스레드 생성 실패 폴백이 살아 있어야 한다 — 없으면 거버넌스가 **소멸**한다(최악).
-            if "AsyncFallback" not in gov_c:
-                v.append("전용 스레드 생성 실패 폴백(AsyncFallback)이 없다 — 스레드가 못 뜨면 "
+            # ★(성찰 확인 2026-09-10) 축을 **이름에서 숙주로** 옮긴다: 폴백이 있는 것만으로는
+            #   부족하고, 그 폴백이 **워커를 굶기지 않는 숙주**여야 한다. 종전 폴백은
+            #   `tokio::spawn` 이었는데 틱 본체는 `.await` 0(위 축이 그 사실을 핀한다) —
+            #   그 태스크는 한 번도 yield 하지 않고 워커를 프로세스 수명 내내 점유한다.
+            #   1코어면 accept 루프·RPC dispatch·이벤트 write 가 전부 멎는다(부트체인 전손).
+            fi = gov_c.find("fn spawn_governance_loop_with")   # 제네릭 `<F>` 가 붙는다
+            if fi < 0:
+                fi = gov_c.find("fn spawn_governance_loop")
+            fb = gov_c[fi:fi + 3000] if fi >= 0 else ""
+            if "Fallback" not in gov_c:
+                v.append("전용 스레드 생성 실패 폴백이 없다 — 스레드가 못 뜨면 "
                          "거버넌스가 데몬 수명 내내 조용히 사라진다")
+            elif "spawn_blocking(" not in fb:
+                v.append("watchdog 폴백이 블로킹 풀(spawn_blocking)이 아니다 — 동기 틱 본체를 "
+                         "런타임 워커에 얹으면 yield 가 0 이라 1코어에서 런타임이 정지한다")
         else:
             # tokio 태스크 숙주(구형·폴백) — 종전 계약 그대로.
             if n_await != 1:

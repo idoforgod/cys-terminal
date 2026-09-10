@@ -5272,9 +5272,12 @@ fn acquire_schedule_lock(
                     .ok()
                     .and_then(|t| t.elapsed().ok());
                 if age.is_some_and(|a| a >= stale) {
-                    // 죽은 writer 의 잔존 — 회수하고 다음 루프에서 재시도한다.
+                    // 죽은 writer 의 잔존 — 회수하고 아래의 **유계 대기**를 지나 재시도한다.
+                    // ★(0.14.31 · 성찰 확인 · blocking) 종전엔 여기서 `continue` 였다 — 회수가
+                    //   지속 실패하면(Windows sharing violation · 권한) deadline 검사와 sleep 을
+                    //   둘 다 건너뛰어 `cys schedule add` 가 영원히 돌았다(데몬 쪽 같은 결함의
+                    //   쌍둥이). 회수 실패는 유계 대기 뒤 **잠금 대기 초과**로 끝나야 한다.
                     let _ = std::fs::remove_dir_all(&dir);
-                    continue;
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(format!(

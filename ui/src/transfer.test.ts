@@ -344,4 +344,30 @@ describe("transferCrossDept wiring (source pin)", () => {
   test("보류 토스트는 한 자리(한 번)다", () => {
     expect(count(region, '"전출 보류"')).toBe(1);
   });
+  // ★(0.14.31 · 성찰 확인 · major · 계획 C2) **인계의 비정상 출구가 기록을 놓아준다.**
+  //
+  // 기록은 인수 확인 직후 `in-progress` 로 올라간다. 그 뒤 `close_surface` 가 일시 RPC 실패로
+  // reject 하면 종전에는 예외가 함수를 그냥 빠져나갔고 기록이 `in-progress` 로 남았다 —
+  // 목적지는 인수했고 원본 pane 은 열린 채인데, 이후 모든 재시도가 `transferRetryAction` 에서
+  // `busy`(무동작)로 끝난다(= 아무 전출도 돌지 않는데 GUI 전출이 세션 내내 죽는다).
+  test("C2: close_surface 실패는 busy 고착이 아니라 재시도 가능한 상태로 돌아간다", () => {
+    const at = ack.indexOf(CLOSE_ORIGIN);
+    expect(at).toBeGreaterThan(0);
+    const head = ack.slice(ack.indexOf("if (verdict.close) {"), at);
+    expect(head).toContain("try {"); // 원본 종료 호출이 감싸여 있다
+    const tail = ack.slice(at, ack.indexOf("transfersInFlight.delete(recKey);", at));
+    expect(tail).toContain("} catch (e) {");
+    expect(tail).toContain("holdForRetry(");
+  });
+  test("C2: 인수 확인 관측의 예외도 같은 출구로 나간다", () => {
+    const loop = ack.slice(ack.indexOf("for (;;) {"), ack.indexOf("if (verdict.close) {"));
+    expect(loop).toContain("} catch (e) {");
+    expect(loop).toContain("holdForRetry(");
+  });
+  test("C2: in-progress 표식은 진입 1회 · 되돌리기는 단일 출구다", () => {
+    expect(count(ack, 'state: "in-progress"')).toBe(1);
+    expect(count(ack, 'state: "awaiting-ack"')).toBe(1); // holdForRetry 안의 한 자리뿐
+    expect(ack).toContain("const holdForRetry = ("); // 단일 출구의 정의
+    expect(count(ack, "holdForRetry(")).toBe(3); // 출구 셋: 관측 예외 · 종료 실패 · 정상 보류
+  });
 });

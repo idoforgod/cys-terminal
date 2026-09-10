@@ -343,6 +343,63 @@ try:
     check("7g 소유권 표의 교집합이 0 이다",
           not (set(L.RSI_OWNED_ROUND_KEYS) & set(R.LEARN_OWNED_ROUND_KEYS)),
           repr(sorted(set(L.RSI_OWNED_ROUND_KEYS) & set(R.LEARN_OWNED_ROUND_KEYS))))
+    # ── 8. ★N7 잔여(성찰 확인 2026-09-10) — **세 writer 가 한 잠금을 공유한다** ────────────
+    #    재읽기(5절)는 "읽기 **앞**에 남이 썼다" 만 막는다. 읽기와 쓰기 **사이**에 남이 쓰면 그
+    #    쓰기는 통째로 사라지고 래치는 성공(True)을 반환한다 — 그 뒤 rollback 이 옛 커밋을 앵커로
+    #    잡는다(되돌리기 사고 방향 · §7 위험 ③). 계획 N7 이 요구한 것은 '별도 래치 저장' 또는
+    #    '세 writer 를 덮는 공유 트랜잭션 잠금' 이고, 여기서는 후자를 잰다.
+    #    측정 방법: **남이 잠금을 쥐고 있는 동안** 세 writer 가 각각 어떻게 끝나는가.
+    #    셋 다 (ⓐ 아무것도 쓰지 않고 ⓑ 그 사실을 말하며 ⓒ 재시도 가능하게) 끝나야 한다.
+    lock_root = os.path.join(_ROOT, "n7")
+    os.environ["CYS_ROUND_DIR"] = lock_root
+    os.environ["CYS_RSI_CEILING_FLATS"] = "1"
+    os.environ["CYS_RSI_MAX_ROUNDS"] = "99"
+    sp8 = os.path.join(R.rsi_dir(), "state.json")
+    seed8 = {"rounds": {"T8": {"round": "T8", "checkpoint_sha": "H2",
+                               "ref": "refs/rsi/ckpt/T8-b", "baseline_score": 1.0,
+                               "progress": [], "attempts": 42, "flat_streak": 0,
+                               "stop_reason": "open"}},
+             "current_round": "T8"}
+    write_json(sp8, seed8)
+    # ⓐ 잠금 **자리**가 셋 다 같은가 — state.json 옆 한 자리여야 한다(다른 자리면 상호배제 0).
+    check("8a 공용 잠금 자리는 state.json 하나다",
+          R._state_lock().path == sp8 + ".lock", R._state_lock().path)
+    # 대기 상한만 줄여 같은 자리를 쥔다(5초 × 3회를 기다리지 않기 위해서다 — 자리는 그대로).
+    _real_state_lock = R._state_lock
+    R._state_lock = lambda: R._best_effort_lock(sp8, wait=0.3)
+    holder = R._best_effort_lock(sp8, wait=0.3)
+    holder.__enter__()
+    try:
+        check("8b 전제: 검체가 잠금을 실제로 쥐었다", holder.held and not holder.blocked,
+              "held=%r blocked=%r unsupported=%r" % (holder.held, holder.blocked, holder.unsupported))
+        if not holder.held:
+            check("8c~8g 잠금을 못 쥐는 파일계 — 이 절은 건너뛴다", True, holder.unsupported or "")
+        else:
+            a8 = argparse.Namespace(round="T8", score=1.0, note="", tokens_saved=None)
+            rc_pr = R.cmd_progress(a8)
+            check("8c ★경합 중 progress 는 쓰지 않고 재시도 가능하게 끝난다",
+                  rc_pr == R.RSI_RC_BUSY, "rc=%r" % rc_pr)
+            check("8d 남의 checkpoint·attempts 가 그대로다(progress)",
+                  read_json(sp8) == seed8, json.dumps(read_json(sp8))[:200])
+            latched = R._latch_ceiling_recommended("T8", R.ceiling_digest_key("T8"))
+            check("8e ★경합 중 래치는 세우지 않는다(성공을 참칭하지 않는다)", latched is False,
+                  repr(latched))
+            check("8f 남의 상태가 그대로다(래치)", read_json(sp8) == seed8,
+                  json.dumps(read_json(sp8))[:200])
+            # checkpoint 는 git 을 만지므로 이 밀폐에서는 잠금 판정 지점까지만 잰다.
+            check("8g 세 writer 가 같은 잠금 함수를 지난다(소스 대조)",
+                  open(os.path.join(BIN, "javis_rsi.py"), encoding="utf-8").read().count(
+                      "with _state_lock() as lk:") == 3,
+                  "with _state_lock() 사용처 수")
+    finally:
+        holder.__exit__(None, None, None)
+        R._state_lock = _real_state_lock
+    # ⓑ 가용성 대조 — 잠금이 비면 같은 호출이 정상 진행한다(다 막으면 통과한다 ≠ 옳다).
+    rc_free = R.cmd_progress(argparse.Namespace(round="T8", score=2.0, note="", tokens_saved=None))
+    check("8h 잠금이 비면 progress 는 정상 진행한다(기아 대조군)", rc_free == 0, "rc=%r" % rc_free)
+    check("8i 그 진행이 실제로 기록됐다",
+          len(read_json(sp8)["rounds"]["T8"].get("progress") or []) == 1,
+          json.dumps(read_json(sp8)["rounds"]["T8"])[:200])
 finally:
     shutil.rmtree(_ROOT, ignore_errors=True)
 

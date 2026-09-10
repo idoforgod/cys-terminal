@@ -1691,20 +1691,33 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
 /// 이라 강한 증거가 선다 = 초안이 통째로 있는데 '편집 영역이 비었다'. 그 뒤는 R2 의 사슬 그대로다
 /// (`pending_input_bytes` 소거 → 큐 본문이 사람 초안과 한 줄로 합쳐 제출).
 ///
-/// 【장치】 고른 줄에서 **위로** 올라가며 같은 비공백 블록을 훑는다. 빈 줄이나 괘선(입력 상자
-/// 테두리)에서 멎고, 그 전에 **마커를 담은 줄**이 또 있으면 고른 줄은 이 composer 의 행이 아니다
-/// (진짜 composer 행이 위에 있고, 고른 것은 그 안의 초안이다).
+/// 【장치】 고른 줄에서 **위로** 올라가며 훑는다. 괘선(입력 상자 테두리)에서 멎고, 그 전에
+/// **마커를 담은 줄**이 또 있으면 고른 줄은 이 composer 의 행이 아니다(진짜 composer 행이 위에
+/// 있고, 고른 것은 그 안의 초안이다).
 ///
-/// 【실패 방향】 오탐(스크롤백 셸 프롬프트가 빈 줄 없이 마커 줄 바로 위에 붙은 pane)의 귀결은
-/// **강한 증거 불인정 = 보류**(리셋 안 함 · 배달 자격 없음)이고, 그것은 0.14.30 거동이다.
+/// ★(0.14.31 · 성찰 확인 · blocking) **빈 줄은 블록의 끝이 아니다.** 종전에는 빈 줄에서도 멎고
+/// 참을 돌려줬다 — 그러면 **문단이 둘 이상인 붙여넣기 초안**이 이 방어를 통째로 무력화한다:
+/// 사람이 전사(轉寫)를 붙여넣어 `❯ 초안 첫 문단` / `초안 둘째 줄` / **빈 줄**(문단 구분) /
+/// `❯`(전사 안의 프롬프트 줄) / 괘선 / 상태줄 이 되면, `rposition` 은 마지막 `❯` 를 고르고
+/// 위로 한 칸 올라가 **빈 줄에서 곧장 참**을 돌려준다. 진짜 composer 행(첫 문단이 붙어 있는 줄)은
+/// 보지도 않는다. 그 뒤는 R2 의 사슬 그대로다 — `composer_edit_region_empty` 가 참 →
+/// `governance::maybe_reset_stale_pending_input` 이 `pending_input_bytes` 를 0 으로 지움 →
+/// 다음 배달이 사람 초안과 **한 줄로 합쳐 제출**(R2 가 닫으려던 바로 그 교차오염).
+/// 편집 중인 입력 상자 **안**의 빈 줄은 편집 영역의 일부이지 경계가 아니다.
+///
+/// 【실패 방향】 오탐(스크롤백의 셸 프롬프트가 괘선 없이 마커 줄 위 어딘가에 있는 pane)의 귀결은
+/// **강한 증거 불인정 = 보류**(리셋 안 함 · 배달 자격 없음)이고, 그것은 0.14.30 거동이다. 실측
+/// 레이아웃은 조여지지 않는다 — 2.1.263 은 마커 **바로 위**가 상자 테두리라 첫 걸음에서 멎고
+/// (`LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT`), 2.1.241 은 꼬리가 비어 이 축을 지나지 않는다
+/// (`LIVE_TUI_AT_PROMPT`). 두 검체가 이 함수의 가용성 대조군이다.
 fn marker_row_is_composer_row(lines: &[&str], li: usize, marker: &str) -> bool {
     for k in (0..li).rev() {
         let l = lines[k];
-        if l.trim().is_empty() || is_rule_line(l) {
-            return true; // 블록의 끝 — 그 위는 이 입력 상자 밖이다
+        if is_rule_line(l) {
+            return true; // 입력 상자 테두리 — 그 위는 이 상자 밖이다
         }
         if l.contains(marker) || l.contains('❯') {
-            return false; // 같은 블록 안에 마커 줄이 또 있다 = 고른 줄은 초안 안이다
+            return false; // 같은 상자 안에 마커 줄이 또 있다 = 고른 줄은 초안 안이다
         }
     }
     true
@@ -3594,6 +3607,78 @@ mod tests {
         assert!(
             composer_edit_region_empty(fixtures::LIVE_TUI_AT_PROMPT, "❯", None),
             "실측 2.1.241 빈 composer 가 리셋 자격을 잃었다"
+        );
+    }
+
+    /// ★(0.14.31 · 성찰 확인 · blocking) **문단이 둘 이상인 붙여넣기 초안이 R2 방어를 뚫었다.**
+    ///
+    /// 【사슬】 `marker_row_is_composer_row` 는 고른 마커 줄에서 위로 훑다가 **첫 빈 줄**에서 멎고
+    /// "이 위는 입력 상자 밖" 이라고 참을 돌려줬다. 그런데 사람이 붙여넣는 초안에는 문단 구분
+    /// 빈 줄이 흔하다 — `❯ 초안 첫 문단` / `초안 둘째 줄` / **빈 줄** / `❯`(전사 안의 프롬프트) /
+    /// 괘선 / 상태줄. `rposition` 이 마지막 `❯` 를 고르고, 바로 위가 빈 줄이라 진짜 composer 행을
+    /// **보지도 않고** 강한 증거가 선다. 그 뒤는 R2 가 닫으려던 그대로다:
+    /// `composer_edit_region_empty`=참 → `maybe_reset_stale_pending_input` 이 `pending_input_bytes`
+    /// 를 0 으로 지움 → 다음 배달이 사람 초안과 한 줄로 합쳐 제출(교차오염).
+    ///
+    /// 상자가 있는 레이아웃(2.1.263)과 없는 레이아웃(2.1.241)에서 각각 잰다 — 두 갈래
+    /// (`trailer_is_closed_box` ⓐ·ⓑ)가 모두 이 구멍으로 열렸다.
+    #[test]
+    fn reflect_r2_blank_line_inside_a_pasted_draft_is_not_a_block_boundary() {
+        let rule = "─".repeat(PROMPT_TRAILER_RULE_MIN_RUN);
+        // ⓐ 상자 레이아웃 — 붙여넣은 전사의 마지막 줄이 빈 프롬프트이고, 그 위가 문단 구분 빈 줄이다.
+        let boxed = format!(
+            "  prev output\n{rule}\n❯ 아래는 붙여넣은 전사입니다\n  $ ls -la\n\n  ❯ \n{rule}\n  ⏵⏵ bypass permissions on\n"
+        );
+        // ⓑ 상자 없는 레이아웃(2.1.241 계열) — 꼬리가 상태줄 하나다.
+        let flat = "  prev output\n❯ \n  초안 첫 줄\n\n  ❯ \n  ? for shortcuts\n".to_string();
+        // ⓒ 빈 줄이 **공백만 있는 줄**이어도 같다(ConPTY 우측 패딩 렌더).
+        let padded = format!(
+            "  prev output\n{rule}\n❯ 초안\n   \n  ❯ \n{rule}\n  ⏵⏵ bypass permissions on\n"
+        );
+        // ⓓ CRLF 렌더에서도 같다.
+        let crlf = format!(
+            "  prev output\r\n{rule}\r\n❯ 초안\r\n\r\n  ❯ \r\n{rule}\r\n  ⏵⏵ bypass permissions on\r\n"
+        );
+        for (name, screen) in [
+            ("상자/문단 빈 줄", &boxed),
+            ("상자 없음/문단 빈 줄", &flat),
+            ("공백만 있는 줄", &padded),
+            ("CRLF", &crlf),
+        ] {
+            assert!(
+                !composer_edit_region_empty(screen, "❯", None),
+                "{name}: 붙여넣기 초안이 살아 있는데 '빈 편집 영역' 으로 읽힌다 — stale 리셋이 그것을 지우고 큐 본문과 합친다"
+            );
+            assert!(
+                !composer_layout_positive(screen, "❯", None),
+                "{name}: 초안 화면이 강한 레이아웃 증거로 세어졌다(alt-screen 배달 자격이 열린다)"
+            );
+        }
+        // ── 가용성 대조군(조이는 방향 하나인가) ────────────────────────────────────
+        // ① 마커 **위**가 상자 테두리면 그 위에 무엇이 있든 첫 걸음에서 멎는다(실측 2.1.263 형상).
+        let idle_with_blank_above =
+            format!("  prev output\n\n  붙여넣은 문단\n{rule}\n❯ \n{rule}\n  ⏵⏵ bypass permissions on\n");
+        assert!(
+            composer_edit_region_empty(&idle_with_blank_above, "❯", None),
+            "상자 테두리 위의 문면 때문에 빈 composer 가 리셋 자격을 잃었다(기아)"
+        );
+        // ② 실측 두 장은 그대로다.
+        assert!(
+            composer_edit_region_empty(fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT, "❯", None),
+            "실측 2.1.263 빈 composer 가 리셋 자격을 잃었다"
+        );
+        assert!(
+            composer_layout_positive(fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT, "❯", None),
+            "실측 2.1.263 상자가 강한 증거를 잃었다"
+        );
+        assert!(
+            composer_edit_region_empty(fixtures::LIVE_TUI_AT_PROMPT, "❯", None),
+            "실측 2.1.241 빈 composer 가 리셋 자격을 잃었다"
+        );
+        // ③ 마커가 하나뿐인 평범한 유휴 화면(빈 줄이 위에 있어도) — 그대로 참이다.
+        assert!(
+            composer_edit_region_empty("  prev output\n\n❯ \n  ? for shortcuts\n", "❯", None),
+            "마커가 하나뿐인 유휴 화면이 막혔다(기아)"
         );
     }
 
