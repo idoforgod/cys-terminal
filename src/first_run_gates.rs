@@ -112,9 +112,10 @@ pub struct GateAction {
     /// 선택할 항목(1-based · 화면에 보이는 번호).
     pub select_index: u8,
     /// 그 항목의 라벨. ★(0.14.31 · 리뷰 R3·R4) 종전엔 "사람 확인용 · 판정 근거 아님" 이었으나, 지금은
-    /// **자동확인의 양성 증거**다 — `inject_guard::confirm_allowed`(관문 확인 허가)와
-    /// `decide_allowing`(주입 허가의 allow 구멍)이 둘 다 커서가 이 라벨 전문 위에 있고 **활성 선택 블록에
-    /// 경쟁 커서가 없을 때만**(`readiness::cursor_resolves_to_label`) 그 관문의 Return 을 허용한다. 그러므로
+    /// **자동확인의 양성 증거**다 — `inject_guard::confirm_allowed`(관문 확인 허가)가 커서가 이 라벨 전문
+    /// 위에 있고 **활성 선택 블록에 경쟁 커서가 없을 때만**(`readiness::cursor_resolves_to_label`) 그 관문의
+    /// Return 을 허용한다(★성찰 R7: 종전엔 주입 허가의 allow 구멍도 같은 술어를 썼으나 그 구멍은 삭제됐다 —
+    /// 이 라벨을 읽는 판정은 **확인 경계 하나**다). 그러므로
     /// 이 값은 화면 실측 문면과 **글자 그대로** 같아야 하고, 틀리면 구멍이 닫히는 쪽(보류)으로 틀린다.
     /// 그 술어의 블록 경계는 이 관문의 [`Gate::needles`] 가 정한다(질문 문면이 SOT · 사본 0).
     pub label: String,
@@ -197,7 +198,18 @@ impl Gate {
     pub fn matches(&self, screen: &str) -> bool {
         let norm = normalize(screen);
         let flat = flatten(screen);
-        let hit = |s: &String| norm.contains(&normalize(s)) || flat.contains(&flatten(s));
+        // ★(0.14.31 · 성찰 R3 · blocking) **빈 문면은 아무것도 식별하지 않는다.** `normalize`/
+        //   `flatten` 은 공백뿐인 문자열을 빈 문자열로 만들고, `String::contains("")` 는 **모든**
+        //   화면에 참이다. 그래서 needle `"   "` 한 줄이 이 관문을 상시 참으로 만들었다 —
+        //   그 귀결은 ① `judge` 가 전 좌석·전 틱 `GateHeld`(디렉티브 영구 미주입 = 노드 0 +
+        //   고아 좌석) ② `inject_guard::decide` 가 항상 `Hold` ③ `CYS_GATE_PENDING_CLOSE=1`
+        //   기계에서 `boot_verdict_effective` 가 `LaunchFailed` 로 강등 = **모든 pane 사망**이다
+        //   (§7 부트체인 재난표). 파서([`str_vec`])가 이미 거르지만 판정부에도 벨트를 둔다 —
+        //   봉투를 거치지 않고 조립된 `Gate` 도 이 함수를 지난다.
+        let hit = |s: &String| {
+            let (n, f) = (normalize(s), flatten(s));
+            (!n.is_empty() && norm.contains(&n)) || (!f.is_empty() && flat.contains(&f))
+        };
         if !self.needles.iter().any(hit) {
             return false;
         }
@@ -599,7 +611,14 @@ pub fn gate_rule_violations(g: &Gate) -> Vec<String> {
 pub fn needle_non_gate_hits(needle: &str) -> Vec<&'static str> {
     let (nn, nf) = (normalize(needle), flatten(needle));
     if nf.is_empty() {
-        return Vec::new();
+        // ★(0.14.31 · 성찰 R3 · blocking) 종전에는 여기서 **면제**(빈 벡터 = 위반 없음)했다.
+        //   그런데 공백뿐인 needle 은 `contains("")` 로 **모든 화면**에 걸리는 문면이다 — 면제는
+        //   정확히 거꾸로였고, 그래서 `gate_rule_violations` 가 아무 말도 하지 않은 채
+        //   `repair_gate` 가 그 항목을 지나쳤다(그리고 `notes` 는 "needle 축은 정상 화면 대조를
+        //   이미 통과했다" 는 **정반대**를 찍었다). 전량을 돌려주면 사용자 신설 관문에서는 그
+        //   needle 만 제거되고 사유가 남으며(조용한 무력화 0), 빌트인 대응물이 있으면 정본
+        //   needle 로 복원된다 — 어느 쪽도 관문을 잃지 않는다(P4-10 보존 계약 무변).
+        return fixtures::NON_GATE_SCREENS.iter().map(|&(sid, _)| sid).collect();
     }
     fixtures::NON_GATE_SCREENS
         .iter()
@@ -725,8 +744,9 @@ impl PolicyEnforcement {
 /// 관문이 화면에 서지 않을 것 ① 코퍼스가 그 id 로 식별할 것 ② 커서가 종료 위가 아닐 것
 /// ③ 선언 시퀀스가 Return 한 발일 것(`down_presses()==Some(0)`) ④ 커서가 액션 라벨 전문 위일 것
 /// ⑤ **좌석이 밝힌 버전이 이 관문의 실측본과 다르지 않을 것**(이번에 더한 축) — 다섯이다.
-/// ⑤의 증거는 좌석 기동에 결속된 래치([`crate::inject_guard::Observed::cli_version`])와 지금
-/// 화면의 배너([`banner_versions`])의 **합집합**이고, 그중 하나라도 불일치면 보류다.
+/// ⑤의 증거는 좌석 기동에 결속된 래치([`crate::inject_guard::Observed::cli_versions`] — 이 부트에서
+/// 관측한 버전 **전량**의 단조 증가 합집합이지 값 하나가 아니다 · 수렴 R2)와 지금 화면의 배너
+/// ([`banner_versions`])의 **합집합**이고, 그중 하나라도 불일치면 보류다.
 /// **미상은 아직 통과한다** — `MEASURED_ON` 이 부분 실측이라(6관문 중 2관문) 미상까지 접으면
 /// 오늘 전 좌석이 매 부트마다 사람 1회를 요구한다(정본 §3-3 은 보류를 허용하지만 그 절단은
 /// 별도 결정이다). 그 결정이 서면 이 상수가 [`PolicyEnforcement::Full`] 로 간다.
@@ -815,6 +835,13 @@ pub fn banner_versions(text: &str) -> Vec<String> {
         let folded = fold_for_banner_scan(text);
         scan_banners(&folded, &flatten(BANNER_ANCHOR), &mut out);
     }
+    // ★(0.14.31 · 성찰 R4 · major) **둘째 벨트** — 다른 후보의 **점 접두**인 후보는 같은 배너의
+    //   잘린 판본이다(`"2.1"` ⊂ `"2.1.263"`). `take_dotted` 가 줄바꿈 절단을 이미 거르지만, 접기
+    //   패스와 원문 패스가 같은 배너를 다른 길이로 읽는 렌더(테두리가 점 사이에 낀 형상)가 남는다.
+    //   버리는 방향은 '보류를 줄이는' 쪽이라 근거가 필요하고, 그 근거가 **포함관계**다 —
+    //   claude 배너는 언제나 세 자리이므로 `2.1` 과 `2.1.263` 이 같은 화면에서 참일 수 없다.
+    let full = out.clone();
+    out.retain(|v| !full.iter().any(|o| o != v && o.starts_with(&format!("{v}."))));
     out
 }
 
@@ -856,11 +883,34 @@ fn is_box_border(c: char) -> bool {
 /// 한 화면에서 훑는 배너 상한(병적 입력에서 판정 시간이 화면 길이에 끌려가지 않게).
 pub const BANNER_SCAN_MAX: usize = 8;
 
+/// 앵커 뒤의 점숫자 런을 버전으로 읽는다.
+///
+/// ★(0.14.31 · 성찰 R4 · major) **줄바꿈으로 잘린 런은 채택하지 않는다.** 좁은 pane·ConPTY 에서
+/// 배너가 둘째 점 **바로 뒤**에서 접히면 런은 `2.1.` 이고, `trim_end_matches('.')` 가 그것을
+/// `"2.1"` 이라는 **정상 판독**으로 만들었다. 그 값은 접힌 배너 패스가 읽은 진짜 `2.1.263` 과
+/// **둘 다** 합집합 래치에 남고([`crate::inject_guard::latch_seat_versions`]), 확인 경계는 하나라도
+/// 불일치면 보류하므로 `MEASURED_ON` 과 **같은 버전 좌석까지** 영구 보류가 된다(무인 부트에서
+/// 노드 0). 게다가 진단 라벨이 "좌석이 밝힌 claude 버전(2.1)" 이라 **거짓을 단언**했다.
+///
+/// 【판정】 런이 `.` 으로 끝나고 그 다음 문자가 줄바꿈(`\n`·`\r`)이면 그것은 **잘린 렌더**이지
+/// 두 자리 버전이 아니다 → `None`. 접힌 배너의 진짜 값은 [`banner_versions`] 의 접기 패스가
+/// (공백·테두리를 지운 사본에서) 그대로 읽는다.
+///
+/// 【실패 방향】 못 읽으면 미상이고 미상은 오늘 확인을 막지 않는다(= 종전과 같음). 잘못 읽으면
+/// 영구 보류다 — 그래서 모호한 런은 버린다.
 fn take_dotted(s: &str) -> Option<String> {
     let head: String = s
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
         .collect();
+    if head.ends_with('.')
+        && s[head.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '\n' || c == '\r')
+    {
+        return None; // 줄바꿈으로 잘린 런 — 두 자리 버전이 아니다
+    }
     let trimmed = head.trim_end_matches('.');
     if trimmed.split('.').filter(|p| !p.is_empty()).count() >= 2
         && trimmed.starts_with(|c: char| c.is_ascii_digit())
@@ -1878,12 +1928,19 @@ fn kind_of(v: &Value) -> &'static str {
     }
 }
 
+/// 봉투의 문자열 배열 — **공백뿐인 항목은 버린다**.
+///
+/// ★(0.14.31 · 성찰 R3 · blocking) 종전 필터는 `!s.is_empty()` 였다. `"   "`·`"\t"`·NBSP 는
+/// 비어 있지 않으므로 통과했고, [`normalize`]/[`flatten`] 이 그것을 빈 문자열로 만든 뒤
+/// `contains("")` 가 **모든 화면에 참**이 되어 그 관문이 상시 성립했다(영구 부트 라이브락 →
+/// `CYS_GATE_PENDING_CLOSE=1` 이면 모든 pane 사망). `trim()` 은 유니코드 공백(NBSP 포함)을
+/// 벗기므로 세 변형이 여기서 함께 사라진다.
 fn str_vec(v: Option<&Value>) -> Option<Vec<String>> {
     let arr = v?.as_array()?;
     Some(
         arr.iter()
             .filter_map(|x| x.as_str())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string())
             .collect(),
     )
@@ -2760,6 +2817,82 @@ mod tests {
         );
         assert_eq!(g.passability, Passability::HumanOnly);
         assert!(g.action.is_none());
+    }
+
+    /// ★(0.14.31 · 성찰 R3 · blocking) **공백뿐인 needle 은 모든 화면을 관문으로 만들 수 없다.**
+    ///
+    /// 【사슬】 `"   "` needle → [`normalize`]/[`flatten`] 이 빈 문자열 → `contains("")` 가 **모든
+    /// 화면에 참** → `identify` 상시 참 → ① `judge` 가 전 좌석·전 틱 `GateHeld`(디렉티브 영구
+    /// 미주입 = 노드 0 + 고아 좌석) ② `inject_guard::decide` 가 항상 `Hold`(pack-update 재주입
+    /// 영구 미도달) ③ `CYS_GATE_PENDING_CLOSE=1` 기계에서 `boot_verdict_effective` 가
+    /// `LaunchFailed` 로 강등 = **모든 pane 사망**(§7 부트체인 재난표 전량).
+    /// 그리고 종전 `needle_non_gate_hits` 는 빈 문면을 **면제**했으므로 `notes` 가 정반대를
+    /// 찍었다("needle 축은 정상 화면 대조를 이미 통과했다").
+    ///
+    /// 【재는 것 — 셋 다 AND】 공백·탭·NBSP 3변형이
+    ///   ⓐ 파서에서 사라지거나(`str_vec` 의 `trim`), 남더라도
+    ///   ⓑ `matches(정상 화면) == false` 이고,
+    ///   ⓒ 규칙 위반으로 **말해진다**([`needle_non_gate_hits`] 가 대조군 전량을 돌려준다 →
+    ///      `gate_rule_violations` 비지 않음 → `repair_gate` 가 사유를 `notes` 에 남긴다).
+    #[test]
+    fn blank_needle_cannot_match_every_screen() {
+        const BLANKS: [(&str, &str); 3] = [("공백", "   "), ("탭", "\t\t"), ("NBSP", "\u{a0}\u{a0}")];
+        for (name, blank) in BLANKS {
+            // ⓒ 규칙 축 — 면제가 아니라 **대조군 전량**이 걸린다(수리가 그 항목만 지우는 근거).
+            assert_eq!(
+                needle_non_gate_hits(blank).len(),
+                fixtures::NON_GATE_SCREENS.len(),
+                "{name}: 공백 needle 이 규칙 위반으로 세어지지 않는다(종전 면제 회귀)"
+            );
+            // ⓑ 판정 축 — 손으로 조립한 관문(봉투를 거치지 않는 경로)도 정상 화면을 잡지 못한다.
+            let g = Gate {
+                needles: vec![blank.to_string()],
+                widget: Vec::new(),
+                ..builtin().into_iter().next().expect("코드 정본이 비었다")
+            };
+            for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+                assert!(
+                    !g.matches(screen),
+                    "{name}: 공백 needle 이 정상 화면 {sid} 를 관문으로 만든다(영구 부트 라이브락)"
+                );
+            }
+            // ⓐ 파서 축 — 공백 항목은 사라진다. 그것만 선언하면 신설 선언 자체가 거절된다.
+            let env = serde_json::json!({"gates": [
+                {"id": "blank-only", "title": "공백 needle 뿐", "needles": [blank]},
+                {"id": "blank-mixed", "title": "공백 + 실문면", "needles": [blank, "Do you trust the files in this folder"]},
+            ]});
+            let r = resolve_with(Some(&env), true);
+            assert!(
+                r.gates.iter().all(|g| g.id != "blank-only"),
+                "{name}: needle 이 공백뿐인 선언이 코퍼스에 들어왔다"
+            );
+            let mixed = r.gates.iter().find(|g| g.id == "blank-mixed").expect("혼합 선언이 사라졌다");
+            assert!(
+                mixed.needles.iter().all(|n| !n.trim().is_empty()),
+                "{name}: 혼합 선언에서 공백 needle 이 살아남았다: {:?}",
+                mixed.needles
+            );
+            // 그리고 그 관문은 여전히 **정상 화면을 잡지 않는다**(수리가 이빨을 남겼는지).
+            for &(sid, screen) in fixtures::NON_GATE_SCREENS {
+                assert!(
+                    !mixed.matches(screen),
+                    "{name}: 혼합 선언이 정상 화면 {sid} 를 관문으로 만든다"
+                );
+            }
+        }
+        // ★사유가 **말해진다** — 빌트인 id 로 공백 needle 을 덮으면 정본 needle 로 복원되고 note 가 남는다.
+        let victim = builtin().into_iter().next().expect("코드 정본이 비었다");
+        let mut notes = Vec::new();
+        let repaired = repair_gate(
+            Gate { needles: vec!["   ".to_string()], ..victim.clone() },
+            &builtin(),
+            &mut notes,
+        );
+        assert_eq!(repaired.needles, victim.needles, "빌트인 대응물의 정본 needle 로 복원되지 않았다");
+        assert!(
+            notes.iter().any(|n| n.contains(&victim.id)),
+            "공백 needle 을 고치고도 사유를 남기지 않았다(조용한 무력화): {notes:?}"
+        );
     }
 
     /// 위와 같은 축을 **판정 경로 그대로**(needle ∧ 위젯) 확인한다.
@@ -4864,6 +4997,28 @@ mod tests {
         // 앵커가 없으면 여전히 미상이다(추정 금지 — 접기 패스가 판독기를 넓히지 않는다).
         assert!(banner_versions("2.1.263 (Claude Code)\n").is_empty());
         assert!(banner_versions(fixtures::FOLDER_TRUST).is_empty());
+
+        // ★(0.14.31 · 성찰 R4 · major) **둘째 점 직후 접힘** 3변형 — 산출은 정확히 1건이어야 한다.
+        //
+        //   종전에는 원문 패스가 런 `2.1.` 을 `trim_end_matches('.')` 로 `"2.1"` 이라는 정상
+        //   판독으로 만들었고, 접기 패스가 읽은 진짜 `2.1.263` 과 **둘 다** 합집합 래치에 남았다.
+        //   확인 경계는 하나라도 불일치면 보류하므로 `MEASURED_ON`(2.1.241)과 같은 버전 좌석까지
+        //   영구 보류가 됐고(무인 부트에서 노드 0), 진단 라벨은 "좌석이 밝힌 claude 버전(2.1)"
+        //   이라 **거짓을 단언**했다. 처방 ②를 따르면 `measured_on:"2.1"` 이 되어 진짜 2.1.241
+        //   좌석 전량이 드리프트로 뒤집힌다.
+        for (name, folded) in [
+            ("LF", "│ ✻ Welcome to Claude Code v2.1.\n│ 263      │\n"),
+            ("CRLF", "│ ✻ Welcome to Claude Code v2.1.\r\n│ 263      │\r\n"),
+            ("테두리 낀 접힘", "│ Welcome to Claude Code v2.1.\n│ 263 · /help for help │\n"),
+        ] {
+            assert_eq!(
+                banner_versions(folded),
+                vec!["2.1.263".to_string()],
+                "{name}: 둘째 점 직후 접힘에서 가짜 버전이 함께 잡힌다(영구 보류 · 거짓 단언)"
+            );
+        }
+        // 그리고 **두 자리 버전 자체**는 여전히 읽는다(잘린 렌더가 아닐 때 — 조인 방향의 대조).
+        assert_eq!(banner_versions("Claude Code v2.1 (old)\n"), vec!["2.1".to_string()]);
     }
 
     /// ★(0.14.31 · 독립 재유도 H2-B · codex 설계 검토 3) 화면용 판독기와 `--version` 용 판독기를

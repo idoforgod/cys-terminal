@@ -7608,7 +7608,10 @@ fn maybe_reset_stale_pending_input(
         && quiet_for >= quiet
         && !obs.selector_row
         && !obs.busy_near_cursor
-        && cys::readiness::modal_signature(&obs.screen).is_none();
+        // ★(0.14.31 · 성찰 R5 · major) 모달 AND 항은 **어댑터 마커를 들고** 본다 — 종전 스캐너는
+        //   `'❯'` 리터럴 고정이라 codex(`›`)·사용자 어댑터에서 이 항이 상시 참이었다(= 모달 방어
+        //   부재). claude 는 두 값이 같아 거동 불변.
+        && cys::readiness::modal_signature_with_marker(&obs.screen, Some(marker)).is_none();
     let mut slot = s.pending_input_stale.lock().unwrap();
     if !contradiction {
         *slot = None;
@@ -11989,6 +11992,98 @@ mod tests {
             s.pending_input_bytes.load(AtomicOrdering::Relaxed),
             0,
             "정말 빈 편집 영역에서도 리셋이 안 되면 고착 수리가 죽는다(가용성 대조군)"
+        );
+    }
+
+    /// ★(0.14.31 · 성찰 R2 · blocking) **초안이 마커·괘선을 담고 있어도 지우지 않는다.**
+    ///
+    /// R2 의 1차 수리는 편집 영역의 부재를 `trailer[0]` **한 줄의 모양**으로 셌고, 마커 줄은
+    /// `rposition`(마지막 출현) 하나로 해소했다. 그래서 두 변이가 남았다 — 둘 다 상태줄 어휘를
+    /// 전혀 쓰지 않아 R1 의 상태줄 문법 수정이 한 글자도 닿지 않는다:
+    ///   ⓐ **변이 A** — 초안이 셸 전사(마지막 줄이 빈 프롬프트 `❯ `)다. `rposition` 이 초안 안의
+    ///      그 줄을 마커 줄로 고르고, 그 아래는 진짜 입력 상자라 강한 증거가 섰다.
+    ///   ⓑ **변이 B** — 초안 첫 행이 괘선(붙여넣은 표·박스)이다. `trailer[0]` 만 보고 섰다.
+    /// 어느 쪽이든 귀결은 같다: `pending_input_bytes` 가 0 으로 지워지고 다음 틱이 큐 본문을
+    /// 사람 초안과 **한 줄로 합쳐 제출**한다(fail-closed → fail-open 역전 · §3-3 위반).
+    ///
+    /// 재는 것 셋 — ① 계수 보존 ② `queue.input_pending_reset` 0 ③ 배달 0. 그리고 가용성
+    /// 대조군으로 실측 빈 composer 두 장(2.1.263 상자 · 사용자 statusLine 포함)의 리셋 자격을
+    /// 같은 자리에서 고정한다(조인 방향이 실측을 깨면 좌석이 영영 고착된다).
+    #[test]
+    fn reflect_r2_pasted_marker_and_rule_drafts_survive_the_stale_reset() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("paste-draft");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = wp5_seat("wp5-paste-draft", "claude");
+        let e = daemon.next_queue_entry("[보고] 큐 본문".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        // ⓐ 변이 A — 붙여넣은 셸 전사. 커서는 **진짜** 마커 줄(행 1)에 있다.
+        let variant_a: [&str; 8] = [
+            RULE,
+            "❯ ",
+            "  $ ls -la",
+            "  total 24",
+            "  ❯ ",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        // ⓑ 변이 B — 초안 첫 행이 괘선이고 그 아래로 초안이 이어진다.
+        let variant_b: [&str; 7] = [
+            RULE,
+            "❯ ",
+            RULE,
+            "  | 붙여넣은 표의 한 행 |",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        for (name, frame) in [("A/셸 전사", &variant_a[..]), ("B/괘선 초안", &variant_b[..])] {
+            s.set_pending_input(24);
+            *s.pending_input_stale.lock().unwrap() = None;
+            let before = daemon.bus.tail(80).len();
+            paint_screen(&s, frame, 1, 2, false);
+            quiet_since(&s, 10);
+            tick(&daemon); // 스탬프
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            paint_screen(&s, frame, 1, 2, false);
+            quiet_since(&s, 10);
+            tick(&daemon); // 창 경과 — 그래도 리셋하지 않는다
+            assert_eq!(
+                s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+                24,
+                "{name}: 초안이 살아 있는데 계수를 지웠다 — 다음 배달이 그 문장과 합쳐진다"
+            );
+            assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "{name}: 초안 위로 배달했다");
+            assert!(
+                !daemon
+                    .bus
+                    .tail(80)
+                    .into_iter()
+                    .skip(before.min(80))
+                    .any(|ev| ev["name"] == "queue.input_pending_reset"),
+                "{name}: 초안 화면에서 리셋 이벤트가 나갔다"
+            );
+        }
+        // 가용성 대조군 — 실측 2.1.263 빈 composer(사용자 statusLine 한 줄 포함)는 종전대로 리셋된다.
+        let idle: [&str; 5] = [RULE, "❯ ", RULE, STATUS1, STATUS2];
+        s.set_pending_input(24);
+        *s.pending_input_stale.lock().unwrap() = None;
+        paint_screen(&s, &idle, 1, 2, false);
+        quiet_since(&s, 10);
+        tick(&daemon); // 스탬프
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        paint_screen(&s, &idle, 1, 2, false);
+        quiet_since(&s, 10);
+        tick(&daemon); // 리셋(배달 없음)
+        assert_eq!(
+            s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+            0,
+            "실측 빈 composer 에서도 리셋이 안 되면 고착 수리가 죽는다(가용성 대조군)"
         );
     }
 

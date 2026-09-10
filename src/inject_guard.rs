@@ -247,18 +247,18 @@ impl Decision {
 }
 
 /// 주입·제출 가드. 어떤 관문도 통과 대상이 아니다(= 관문이 보이면 무조건 보류).
-pub fn decide(o: &Observed) -> Decision {
-    decide_allowing(o, None)
-}
-
-/// 위의 일반형 — `allow_gate_id` 로 지목한 관문 **하나**는 통과 대상으로 본다.
 ///
-/// ★왜 예외 구멍이 필요한가: 폴더신뢰 자동확인(U-15)은 **바로 그 관문을 통과시키려고** 키를
-///   보내는 동작이다. 예외가 없으면 자기 자신이 자기를 막아 자동확인 기능이 통째로 죽는다.
-///   반대로 예외를 '관문 전체' 로 열면 킬체인이 그대로 돌아온다 — 그래서 구멍은 **id 하나**이고,
-///   그 id 가 아닌 관문이 화면에 있으면(= 이미 다음 화면으로 넘어갔으면) 그대로 보류한다.
-///   실측 킬체인의 형태가 정확히 그것이다(신뢰 창인 줄 알고 눌렀는데 면책 창이었다).
-pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
+/// ★(0.14.31 · 성찰 R7 · major) **allow 구멍은 없다.** 종전 `decide_allowing(o, Some(id))` 는 지목한
+///   관문 하나를 통과 대상으로 보는 일반형이었고, R4 가 자동확인의 생산자를 [`confirm_denied`] 로
+///   옮긴 뒤 프로덕션 호출자가 0 이 됐는데도 `pub` 으로 남아 doc 이 그것을 자동확인 벨트로 지목했다.
+///   그 구멍은 확인 경계보다 벨트가 넷 적었다(⓪ 사람 1회 화면 봉인 · ③ Return 한 발 선언 ·
+///   ⑤ 버전 드리프트 · 미식별 + `readiness_legacy` 면 곧장 Send). 그 위에 새 자동통과 경로를 세우면
+///   미실측 버전 관문에 Return 이 나가고 기본 포커스는 `No, exit`(좌석 rc 1)이다. 그래서 인자를
+///   지웠다 — 이 술어는 **확인 벨트가 아니다**(주입 허가는 '모르면 보낸다' 로 접히고, 확인 허가는
+///   '모르면 안 보낸다' 로 접힌다 — 두 질문의 방향이 반대라 한 API 에 둘 수 없다). 확인 허가는
+///   [`confirm_denied`] 하나가 소유한다. 구 배선의 진리표는 검체의 계측 타당성 대조군
+///   (`tests::legacy_decide_allowing`)에만 남아 있다.
+pub fn decide(o: &Observed) -> Decision {
     // ★생애 창 상한 — 창이 닫혔거나(각성 완료) 재지 못했으면 스캔 자체를 하지 않는다.
     //   여기서 일찍 반환하는 것이 비용 방어이기도 하다(호출부가 화면 RPC 를 아예 생략한다).
     if o.awakened != Some(false) {
@@ -268,31 +268,14 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
     //   갈리면 "부트 폴링은 보류인데 주입 가드는 통과" 라는 반쪽 그물이 된다).
     let modal = crate::readiness::modal_signature(o.screen);
     let hit = match first_run_gates::identify(o.gates, o.screen) {
-        Some(g) => {
-            // 구멍은 **id 하나**다 — 그리고 그 관문이 떠 있어도 선택 커서가 **종료 선택지** 위에 있으면
-            // 구멍은 닫힌다(0.14.31): 그 Return 은 통과가 아니라 종료다(2.1.261 폴더신뢰의 기본 포커스가
-            // `No, exit` 로 실측됐다 — CONTRACTS B-7 · 종전 액션이면 좌석 사망). 조여지는 방향만.
-            let cursor_on_exit = modal.as_ref().is_some_and(|m| m.cursor_on_exit);
-            // ★(0.14.31 · 리뷰 R3 · codex blocking) 그리고 그 부정 증거만으로는 **부족하다**: 잘린 종료 라벨
-            //   (`❯ 2. No, exi` · 번호 없는 `❯ No, exi` · 붙은 `❯ 2.No, exi`)은 `cursor_on_exit=false` 인데
-            //   코퍼스는 그 화면을 여전히 폴더신뢰로 식별한다 → 구멍이 열리고 그 Return 이 종료를 누른다
-            //   (좌석 사망 · R2 가 남긴 blocking). 그래서 구멍의 조건을 **양성 증거**로 뒤집는다 —
-            //   커서가 코퍼스 액션 라벨(`Yes, I trust this folder`) **전문** 위에 있을 때만 연다.
-            //   판정기는 readiness 하나다(`cursor_resolves_to_label` — 모달 서명과 같은 스캐너 · 판정 분리 금지).
-            if allow_gate_id == Some(g.id.as_str())
-                && !cursor_on_exit
-                && action_label_selected(g, o.screen)
-            {
-                return Decision::Send;
-            }
-            GateHit {
-                id: g.id.clone(),
-                title: g.title.clone(),
-                human_only: g.passability == Passability::HumanOnly,
-            }
-        }
+        // 관문이 떠 있다 = 보류. 커서 위치·액션 라벨은 여기서 보지 않는다 — 그 벨트들은 **확인 경계**
+        // ([`confirm_denied`] ②·④)의 것이고, 주입 가드에는 통과시킬 관문이 없다(성찰 R7).
+        Some(g) => GateHit {
+            id: g.id.clone(),
+            title: g.title.clone(),
+            human_only: g.passability == Passability::HumanOnly,
+        },
         // 코퍼스가 모르는 화면 — 모달 어휘가 있으면 `unknown-modal` 로 보류한다(잘린 관문·새 관문).
-        // allow 구멍은 여기 **적용되지 않는다**(지목한 관문이 화면에 없다).
         // ★(리뷰 R2 · codex minor) 롤백 정합: 이 폴백은 WP-1 이 readiness 에 더한 모달 축의 **주입 가드 쪽 절반**
         //   이다. `CYS_READINESS_V1=1` 이 readiness 의 모달 축(`modal_on_screen`)을 끄면 여기도 함께 종전(Send)이어야
         //   "종전 판정 복귀" 가 반쪽이 아니다. 종전부터 있던 코퍼스 가드(위 Some 분기)는 U-14 축(`guard_off`)이
@@ -318,13 +301,13 @@ pub fn decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
     }
 }
 
-/// 이 관문의 **액션 라벨 위에 선택 커서가 있는가** — allow 구멍이 요구하는 양성 증거.
+/// 이 관문의 **액션 라벨 위에 선택 커서가 있는가** — 확인 경계([`confirm_denied`] ④)가 요구하는 양성 증거.
 ///
 /// 【왜 라벨 전량이 아니라 이 관문의 액션 라벨인가(codex 리뷰 R3)】 `Not now`·`Yes, I accept` 를 알아본 것은
-/// "Return 이 폴더신뢰를 승인한다" 는 증거가 아니다. 구멍이 겨냥한 관문의 **통과 동작이 지목한 그 라벨**만
+/// "Return 이 폴더신뢰를 승인한다" 는 증거가 아니다. 확인이 겨냥한 관문의 **통과 동작이 지목한 그 라벨**만
 /// 증거로 인정한다(문면 SOT 는 코퍼스 하나 · 사본 0).
 ///
-/// 【액션 선언이 없으면】 `false`(= 구멍이 닫힌다). 통과 동작이 선언되지 않은 관문을 기계가 통과시킬 근거는
+/// 【액션 선언이 없으면】 `false`(= 확인이 닫힌다). 통과 동작이 선언되지 않은 관문을 기계가 통과시킬 근거는
 /// 없고, 접기 방향은 보류다(좌석 보존 · 키 0).
 ///
 /// 【모호하면 닫힌다(리뷰 R3b · codex)】 술어는 액션 라벨 위 커서 **하나**로 만족하지 않는다 — 같은 화면에
@@ -340,7 +323,7 @@ fn action_label_selected(gate: &Gate, screen: &str) -> bool {
 }
 
 /// ★(0.14.31 · 리뷰 R4 · codex blocking) **관문 확인 키**를 지금 화면에 보내도 되는가 —
-/// 주입 허가([`decide_allowing`])와 **다른 술어**다.
+/// 주입 허가([`decide`])와 **다른 술어**다(성찰 R7 이후 주입 쪽에는 통과 대상 관문이 아예 없다).
 ///
 /// 【왜 나누는가】 자동확인은 "텍스트를 보내도 되는가" 가 아니라 "이 화면의 **선택을 확정**해도 되는가" 를
 /// 묻는다. 두 질문의 접기 방향이 반대다:
@@ -439,12 +422,18 @@ impl ConfirmDenied {
             ConfirmDenied::LabelUnresolved => {
                 "커서가 액션 라벨 전문 위가 아니거나 활성 선택 블록에 경쟁 커서가 있다(모호)".into()
             }
+            // ★(0.14.31 · 성찰 R4 · major) 종전 ②는 "실측한 뒤 measured_on 을 갱신하라" 였다.
+            //   그런데 `detected` 가 **접힌 배너의 잘린 판독**(`2.1`)일 수 있었고, 그 처방을
+            //   그대로 따르면 `measured_on:"2.1"` 이 되어 진짜 2.1.241 좌석 전량이 드리프트로
+            //   뒤집힌다. 처방은 화면 판독값을 **베끼라**가 아니라 **실측하라**여야 한다.
             ConfirmDenied::VersionDrift { measured_on, detected } => format!(
                 "좌석이 밝힌 claude 버전({detected})이 이 관문을 실측한 버전({measured_on})과 \
                  다르다 — 선언된 통과 액션이 이 버전에서 참이라는 근거가 없다. 탈출구 셋: \
-                 ① 사람 1회로 넘긴다 ② 실측한 뒤 agents.json 봉투의 measured_on 을 갱신한다 \
-                 ③ 이 축만 종전으로 되돌린다({ENV_VERSION_PIN}=0 — 마스터를 누르지 말 것: \
-                 마스터는 보류를 close 로 강등한다)"
+                 ① 사람 1회로 넘긴다 ② 이 값을 **베끼지 말고** 실측하라 — 접힌 배너의 잘린 \
+                 판독일 수 있다(`claude --version` · `cys gate-corpus --agent claude \
+                 --detected-version <실측값> --json`)—— 그 실측값이 다르면 agents.json 봉투의 \
+                 measured_on 을 그 값으로 갱신한다 ③ 이 축만 종전으로 되돌린다({ENV_VERSION_PIN}=0 \
+                 — 마스터를 누르지 말 것: 마스터는 보류를 close 로 강등한다)"
             ),
         }
     }
@@ -532,7 +521,8 @@ pub fn confirm_denied(o: &Observed, gate_id: &str) -> Option<ConfirmDenied> {
             }
         }
     }
-    // 술어는 `decide_allowing` 의 allow 구멍과 **같은 하나**다(사본 0 — 두 자리가 갈리면 구멍이 생긴다).
+    // 술어는 [`action_label_selected`] 하나다(사본 0 · 성찰 R7 이후 이 경계가 유일한 소비처 — 주입
+    // 가드의 allow 구멍은 삭제됐다).
     if action_label_selected(g, o.screen) {
         None
     } else {
@@ -730,6 +720,35 @@ mod tests {
         }
     }
 
+    /// ★(0.14.31 · 성찰 R7) **구 배선 재현** — 삭제된 `decide_allowing(o, allow_gate_id)` 의 진리표(R3 벨트
+    /// 포함)를 검체 안에서만 되살린다. 계측 타당성 대조군 전용이다(프로덕션 코드에서 부르면 이 함수가 아니라
+    /// [`decide`] 를 써야 한다 — 그것이 R7 이 인자를 지운 이유다).
+    fn legacy_decide_allowing(o: &Observed, allow_gate_id: Option<&str>) -> Decision {
+        if o.awakened != Some(false) {
+            return Decision::Send;
+        }
+        let modal = crate::readiness::modal_signature(o.screen);
+        let hit = match first_run_gates::identify(o.gates, o.screen) {
+            Some(g) => {
+                let cursor_on_exit = modal.as_ref().is_some_and(|m| m.cursor_on_exit);
+                if allow_gate_id == Some(g.id.as_str()) && !cursor_on_exit && action_label_selected(g, o.screen) {
+                    return Decision::Send;
+                }
+                GateHit { id: g.id.clone(), title: g.title.clone(), human_only: g.passability == Passability::HumanOnly }
+            }
+            None => {
+                if o.readiness_legacy {
+                    return Decision::Send;
+                }
+                match modal {
+                    Some(m) => GateHit { id: crate::readiness::MODAL_UNKNOWN_ID.to_string(), title: m.title(), human_only: false },
+                    None => return Decision::Send,
+                }
+            }
+        };
+        if o.guard_off { Decision::SendObserved(hit) } else { Decision::Hold(hit) }
+    }
+
     /// 실측 관문 6화면 — 문면은 U-12 정본의 픽스처를 **참조**한다(사본 0).
     const GATE_SCREENS: &[(&str, &str)] = &[
         ("theme", fixtures::THEME),
@@ -818,23 +837,39 @@ mod tests {
         assert!(trust_v1_from(Some("1")));
     }
 
-    /// 예외 구멍은 **id 하나**다 — 그 관문만 통과하고 나머지는 그대로 보류한다.
+    /// ★(0.14.31 · 성찰 R7) 주입 가드에는 **allow 구멍이 없다** — 폴더신뢰 화면에서도 [`decide`] 는 보류이고,
+    /// 자동확인의 허가는 별개 술어([`confirm_denied`])가 **그 id 하나**에만 연다(면책 창에서는 닫힌다).
+    /// 종전 구멍(`decide_allowing(.., Some(id))`)의 진리표는 대조군 `legacy_decide_allowing` 이 그대로 재현한다.
     #[test]
-    fn allow_hole_is_exactly_one_gate_and_never_the_disclaimer() {
+    fn injection_guard_has_no_allow_hole_and_confirmation_is_a_separate_belt() {
         let gs = gates();
+        match decide(&obs(fixtures::FOLDER_TRUST, &gs)) {
+            Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST),
+            other => panic!("주입 가드가 폴더신뢰 관문을 통과시켰다(구멍 부활): {other:?}"),
+        }
         assert_eq!(
-            decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)),
-            Decision::Send,
+            confirm_denied(&obs(fixtures::FOLDER_TRUST, &gs), GATE_FOLDER_TRUST),
+            None,
             "자동확인 대상 관문까지 막으면 폴더신뢰 자동확인이 통째로 죽는다"
         );
-        // ★킬체인 화면: 신뢰 에코가 남아 있어도 면책 창이므로 구멍이 열리지 않는다.
-        match decide_allowing(
-            &obs(fixtures::TRUST_ECHO_THEN_DISCLAIMER, &gs),
-            Some(GATE_FOLDER_TRUST),
-        ) {
-            Decision::Hold(h) => assert_eq!(h.id, "bypass-disclaimer"),
-            other => panic!("면책 창에 예외 구멍이 열렸다(킬 스텝): {other:?}"),
-        }
+        // ★킬체인 화면: 신뢰 에코가 남아 있어도 면책 창이므로 확인은 열리지 않는다.
+        assert_eq!(
+            confirm_denied(&obs(fixtures::TRUST_ECHO_THEN_DISCLAIMER, &gs), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::OtherGate("bypass-disclaimer".into())),
+            "면책 창에 확인이 열렸다(킬 스텝)"
+        );
+        // 계측 타당성 — 구 구멍은 같은 두 화면에서 Send / Hold(bypass-disclaimer) 였다.
+        assert_eq!(legacy_decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        assert!(matches!(
+            legacy_decide_allowing(&obs(fixtures::TRUST_ECHO_THEN_DISCLAIMER, &gs), Some(GATE_FOLDER_TRUST)),
+            Decision::Hold(h) if h.id == "bypass-disclaimer"
+        ));
+        // 소스 핀 — 라이브러리 본문(테스트 모듈 밖)에 allow 인자가 부활하지 않았다(컴파일러가 재는 것을
+        // 문자열로도 못박는다 — 같은 이름의 새 API 가 조용히 생기는 것까지 막는다).
+        let src = include_str!("inject_guard.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 경계")];
+        assert!(!body.contains("allow_gate_id"), "주입 가드에 allow 구멍 인자가 부활했다");
+        assert!(!body.contains("pub fn decide_allowing"), "삭제된 allow API 가 부활했다");
     }
 
     // ── needle 감지(U-15) ──────────────────────────────────────────────────
@@ -970,7 +1005,7 @@ mod tests {
                 // ★(리뷰 R4) 프로덕션과 **같은 생산자**를 쓴다 — 확인 허가는 주입 허가의 부정이 아니다.
                 //   `legacy_producer` 는 구 배선(주입 허가의 부정)을 그대로 재현하는 계측 타당성 대조군용.
                 let other_gate = if legacy_producer {
-                    decide_allowing(&o, Some(GATE_FOLDER_TRUST)).blocks()
+                    legacy_decide_allowing(&o, Some(GATE_FOLDER_TRUST)).blocks()
                 } else {
                     !confirm_allowed(&o, GATE_FOLDER_TRUST)
                 };
@@ -1149,23 +1184,32 @@ mod tests {
         assert!(matches!(decide(&obs(&nbsp_fore, &gs)), Decision::Hold(h) if h.id == crate::readiness::MODAL_UNKNOWN_ID));
     }
 
-    /// allow 구멍은 **커서가 종료 선택지 위**에 있으면 닫힌다 — 2.1.261 폴더신뢰(기본 포커스 `No, exit`)에
+    /// 확인 벨트는 **커서가 종료 선택지 위**에 있으면 닫힌다 — 2.1.261 폴더신뢰(기본 포커스 `No, exit`)에
     /// 종전 자동확인 Return 이 나가면 좌석이 죽는다(CONTRACTS B-7 · 재핀은 H-2 의 몫 · 이 벨트는 그 앞을 막는다).
+    /// ★(성찰 R7) 생산자는 [`confirm_denied`] 다 — 구 구멍(`legacy_decide_allowing`)도 같은 화면에서 닫혔음을
+    /// 대조군으로 함께 잰다(R3 벨트의 보존 · 삭제가 거동을 되돌리지 않았다).
     #[test]
-    fn allow_hole_closes_when_the_cursor_sits_on_the_exit_option() {
+    fn confirmation_closes_when_the_cursor_sits_on_the_exit_option() {
         let gs = gates();
-        // 2.1.241 형(커서=Yes) — 구멍은 그대로 열린다(자동확인 기능 보존).
-        assert_eq!(decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
-        // 커서만 `No, exit` 로 옮긴 같은 관문 — 같은 id 인데 Return 은 통과가 아니라 종료다 → 보류.
+        // 2.1.241 형(커서=Yes) — 확인은 열린다(자동확인 기능 보존).
+        assert_eq!(confirm_denied(&obs(fixtures::FOLDER_TRUST, &gs), GATE_FOLDER_TRUST), None);
+        // 커서만 `No, exit` 로 옮긴 같은 관문 — 같은 id 인데 Return 은 통과가 아니라 종료다 → 거부.
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
         let g = first_run_gates::identify(&gs, &on_exit).expect("커서 이동은 관문 식별을 바꾸지 않는다");
         assert_eq!(g.id, GATE_FOLDER_TRUST);
-        match decide_allowing(&obs(&on_exit, &gs), Some(GATE_FOLDER_TRUST)) {
-            Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST, "보류 id 는 식별된 관문 그대로"),
-            other => panic!("커서가 No, exit 위인데 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}"),
-        }
-        // 전송 정책 조립도 같은 결론 — `other_gate`(=blocks) 가 참이면 `trust_send` 는 쏘지 않는다.
-        let blocked = decide_allowing(&obs(&on_exit, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+        assert_eq!(
+            confirm_denied(&obs(&on_exit, &gs), GATE_FOLDER_TRUST),
+            Some(ConfirmDenied::CursorOnExit),
+            "커서가 No, exit 위인데 자동확인 Return 이 허용됐다(좌석 사망 경로)"
+        );
+        // 계측 타당성 — 구 구멍도 커서=Yes 면 열리고 커서=No, exit 면 닫혔다(R3 벨트).
+        assert_eq!(legacy_decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        assert!(matches!(
+            legacy_decide_allowing(&obs(&on_exit, &gs), Some(GATE_FOLDER_TRUST)),
+            Decision::Hold(h) if h.id == GATE_FOLDER_TRUST
+        ));
+        // 전송 정책 조립도 같은 결론 — `other_gate`(=확인 거부) 가 참이면 `trust_send` 는 쏘지 않는다.
+        let blocked = confirm_denied(&obs(&on_exit, &gs), GATE_FOLDER_TRUST).is_some();
         assert!(!trust_send(&TrustObserved {
             hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
             other_gate: blocked, legacy_v1: false,
@@ -1179,9 +1223,10 @@ mod tests {
     /// 없음 · 번호 행 없음 · 푸터 없음) → 종전 생산자(`decide_allowing(...).blocks()`)는 **Send**(=막지 않음)를
     /// 냈고, 그 Return 이 부분 렌더된 `No, exit` 을 눌러 좌석이 rc 1 로 죽는다.
     ///
-    /// 【무엇을 잰다】 ① 그 화면에서 `decide_allowing` 은 여전히 Send 다(전제가 살아 있어야 이 검체가 무언가를
-    /// 잰다) · ② `confirm_allowed` 는 거짓이다 · ③ 조립(`trust_send`)이 **0발**이다 · ④ 세 롤백 노브 조합
-    /// 어디에서도 0발이다(확인 벨트는 롤백으로 열리지 않는다).
+    /// 【무엇을 잰다】 ① 코퍼스가 그 화면을 **식별하지 못한다**(전제가 살아 있어야 이 검체가 미식별 축을
+    /// 잰다 — R3 당시 생산자가 여기서 Send 를 낸 이유가 바로 그 미식별이었고, 지금은 R5 의 모달 서명이
+    /// 같은 화면을 별도로 잡는다) · ② `confirm_allowed` 는 거짓이다 · ③ 조립(`trust_send`)이 **0발**이다 ·
+    /// ④ 세 롤백 노브 조합 어디에서도 0발이다(확인 벨트는 롤백으로 열리지 않는다).
     #[test]
     fn unidentified_clipped_screen_never_confirms_even_though_injection_is_permitted() {
         let gs = gates();
@@ -1231,11 +1276,11 @@ mod tests {
         let mut legacy = obs(clipped, &gs);
         legacy.readiness_legacy = true;
         assert_eq!(decide(&legacy), Decision::Send, "구 판정이 재현되지 않는다(계측 무효 · 롤백 반쪽)");
-        // 킬체인 전량: 주입 가드 · allow 구멍 · 확인 · 준비 판정 넷이 **모두** 닫힌다.
+        // 킬체인 전량: 주입 가드 · 확인 경계 · 준비 판정 셋이 **모두** 닫힌다(성찰 R7: allow 구멍은 삭제).
         assert!(decide(&obs(clipped, &gs)).blocks(), "잘린 선택기 화면에 본문이 주입된다");
         assert!(
-            decide_allowing(&obs(clipped, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
-            "allow 구멍이 미식별 잘린 선택기에서 열렸다"
+            confirm_denied(&obs(clipped, &gs), GATE_FOLDER_TRUST).is_some(),
+            "확인 경계가 미식별 잘린 선택기에서 열렸다"
         );
         // 정상 좌석 회귀 0 — 건강한 화면·확인 에코·빈 composer 는 그대로 통과한다.
         assert_eq!(decide(&obs(fixtures::READY_SHELL, &gs)), Decision::Send);
@@ -1271,8 +1316,8 @@ mod tests {
         assert!(!sig.cursor_on_exit, "전제: 종료 라벨 전문 위가 아니다");
         assert!(decide(&obs(trailing, &gs)).blocks(), "꼬리가 이어진 잘린 선택기 화면에 본문이 주입된다");
         assert!(
-            decide_allowing(&obs(trailing, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
-            "allow 구멍이 꼬리 이어진 잘린 선택기에서 열렸다"
+            confirm_denied(&obs(trailing, &gs), GATE_FOLDER_TRUST).is_some(),
+            "확인 경계가 꼬리 이어진 잘린 선택기에서 열렸다"
         );
         assert!(!confirm_allowed(&obs(trailing, &gs), GATE_FOLDER_TRUST));
         let mut trailing_legacy = obs(trailing, &gs);
@@ -1306,8 +1351,8 @@ mod tests {
                 "{label}: 잘린 경쟁 커서 화면에서 확인이 열렸다(그 Return 이 종료를 누른다)\n{screen}"
             );
             assert!(
-                decide_allowing(&obs(&screen, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
-                "{label}: 주입 가드의 allow 구멍도 열려 있다\n{screen}"
+                decide(&obs(&screen, &gs)).blocks(),
+                "{label}: 주입 가드가 잘린 경쟁 커서 화면에 본문을 넣는다\n{screen}"
             );
         }
         // 질문 재출현 잔상(codex R4 반례 ②) — 앞선 미해소 커서도 블록 안이다.
@@ -1326,10 +1371,11 @@ mod tests {
         }
     }
 
-    /// ★(리뷰 R2 · codex blocking) 접힌 종료 라벨(`No, ex⏎it` · CRLF)도 allow 구멍을 닫는다 — 코퍼스 식별
+    /// ★(리뷰 R2 · codex blocking) 접힌 종료 라벨(`No, ex⏎it` · CRLF)도 확인 경계를 닫는다 — 코퍼스 식별
     /// (평탄화)은 그 화면을 폴더신뢰로 읽으므로, 벨트가 접힘을 못 읽으면 `trust_send` 가 종료 위에 Return 을 쏜다.
+    /// (성찰 R7: 생산자는 [`confirm_denied`] — 삭제된 allow 구멍이 아니다.)
     #[test]
-    fn allow_hole_stays_closed_when_the_exit_label_is_wrapped() {
+    fn confirmation_stays_closed_when_the_exit_label_is_wrapped() {
         let gs = gates();
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
         for wrapped in [
@@ -1338,27 +1384,28 @@ mod tests {
         ] {
             let g = first_run_gates::identify(&gs, &wrapped).expect("전제: 코퍼스가 접힌 폴더신뢰를 식별한다");
             assert_eq!(g.id, GATE_FOLDER_TRUST);
-            match decide_allowing(&obs(&wrapped, &gs), Some(GATE_FOLDER_TRUST)) {
-                Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST),
-                other => panic!("접힌 `No, exit` 위 커서에 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}\n{wrapped}"),
-            }
-            let blocked = decide_allowing(&obs(&wrapped, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+            assert_eq!(
+                confirm_denied(&obs(&wrapped, &gs), GATE_FOLDER_TRUST),
+                Some(ConfirmDenied::CursorOnExit),
+                "접힌 `No, exit` 위 커서에 자동확인 Return 이 허용됐다(좌석 사망 경로)\n{wrapped}"
+            );
+            let blocked = confirm_denied(&obs(&wrapped, &gs), GATE_FOLDER_TRUST).is_some();
             assert!(!trust_send(&TrustObserved {
                 hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
                 other_gate: blocked, legacy_v1: false,
             }));
         }
-        // 대조군: 커서가 Yes 위인 접힌 화면은 구멍이 열린다(자동확인 기능 보존 · 라이브락 방향 회귀 없음).
+        // 대조군: 커서가 Yes 위인 접힌 화면은 확인이 열린다(자동확인 기능 보존 · 라이브락 방향 회귀 없음).
         let yes_wrapped = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
-        assert_eq!(decide_allowing(&obs(&yes_wrapped, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        assert_eq!(confirm_denied(&obs(&yes_wrapped, &gs), GATE_FOLDER_TRUST), None);
     }
 
-    /// ★(0.14.31 · 리뷰 R3 · codex blocking) allow 구멍은 **양성 증거**로만 열린다 — 커서가 코퍼스 액션 라벨
+    /// ★(0.14.31 · 리뷰 R3 · codex blocking) 확인 경계는 **양성 증거**로만 열린다 — 커서가 코퍼스 액션 라벨
     /// (`Yes, I trust this folder`) 전문 위에 있을 때만. R2 의 부정 증거(`!cursor_on_exit`)는 **잘린 종료 라벨**을
     /// 통과시켰다: 화면이 여전히 폴더신뢰로 식별되므로 구멍이 열리고, 그 Return 이 종료 선택지를 눌러 좌석이
     /// 죽는다(2.1.261 기본 포커스 = `No, exit`). 여기 반례 넷 전부 **보류**여야 한다.
     #[test]
-    fn allow_hole_needs_the_cursor_on_the_gate_action_label() {
+    fn confirmation_needs_the_cursor_on_the_gate_action_label() {
         let gs = gates();
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
         // ── 반례: 종료 라벨이 잘려 `cursor_on_exit=false` 인 렌더들(전부 코퍼스는 폴더신뢰로 읽는다) ──
@@ -1379,12 +1426,13 @@ mod tests {
                 !crate::readiness::modal_signature(screen).is_some_and(|m| m.cursor_on_exit),
                 "{label}: 전제 붕괴 — 종전 부정 증거만으로 이미 닫혔다면 이 반례는 아무것도 재지 못한다"
             );
-            match decide_allowing(&obs(screen, &gs), Some(GATE_FOLDER_TRUST)) {
-                Decision::Hold(h) => assert_eq!(h.id, GATE_FOLDER_TRUST, "{label}"),
-                other => panic!("{label}: 잘린/미관측 선택 증거에 자동확인 Return 이 허용됐다(좌석 사망 경로): {other:?}\n{screen}"),
-            }
-            // 조립도 같은 결론 — `other_gate`(=blocks) 가 참이면 `trust_send` 는 쏘지 않는다.
-            let blocked = decide_allowing(&obs(screen, &gs), Some(GATE_FOLDER_TRUST)).blocks();
+            let denied = confirm_denied(&obs(screen, &gs), GATE_FOLDER_TRUST);
+            assert!(
+                matches!(denied, Some(ConfirmDenied::LabelUnresolved)),
+                "{label}: 잘린/미관측 선택 증거에 자동확인 Return 이 허용됐다(좌석 사망 경로): {denied:?}\n{screen}"
+            );
+            // 조립도 같은 결론 — `other_gate`(=확인 거부) 가 참이면 `trust_send` 는 쏘지 않는다.
+            let blocked = denied.is_some();
             assert!(!trust_send(&TrustObserved {
                 hit: true, first: true, persisted: false, sends: 0, max_sends: 2,
                 other_gate: blocked, legacy_v1: false,
@@ -1402,14 +1450,14 @@ mod tests {
             "전제 붕괴 — 종전 부정 증거만으로 이미 닫혔다면 이 반례는 아무것도 재지 못한다"
         );
         assert!(
-            decide_allowing(&obs(&both_cursors, &gs), Some(GATE_FOLDER_TRUST)).blocks(),
+            confirm_denied(&obs(&both_cursors, &gs), GATE_FOLDER_TRUST).is_some(),
             "모호한 두 커서 화면에서 자동확인 Return 이 허용됐다(좌석 사망 경로)\n{both_cursors}"
         );
-        // ── 양성 대조군: 액션 라벨 전문 위 커서면 구멍은 열린다(자동확인 기능 보존 · 라이브락 회귀 0) ──
-        assert_eq!(decide_allowing(&obs(fixtures::FOLDER_TRUST, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        // ── 양성 대조군: 액션 라벨 전문 위 커서면 확인은 열린다(자동확인 기능 보존 · 라이브락 회귀 0) ──
+        assert_eq!(confirm_denied(&obs(fixtures::FOLDER_TRUST, &gs), GATE_FOLDER_TRUST), None);
         // 접힌 액션 라벨(단어 안 줄바꿈)도 평탄화 공간에서 전문으로 읽힌다.
         let wrapped_yes = fixtures::FOLDER_TRUST.replace("Yes, I trust this folder", "Yes, I tru\n   st this folder");
-        assert_eq!(decide_allowing(&obs(&wrapped_yes, &gs), Some(GATE_FOLDER_TRUST)), Decision::Send);
+        assert_eq!(confirm_denied(&obs(&wrapped_yes, &gs), GATE_FOLDER_TRUST), None);
         // ★H-2 결속: 2.1.261 형(기본 포커스 = 종료 · 액션 = 아래 1발) — 액션 **전**은 보류, 액션 **후**는 통과.
         //   벨트가 액션 뒤 화면까지 막으면 H-2 의 통과 경로가 통째로 죽는다(그 회귀를 여기서 잡는다).
         let v261_before = fixtures::FOLDER_TRUST
@@ -1417,20 +1465,20 @@ mod tests {
             .replace("\x20 2. No, exit", "❯ 1. No, exit")
             .replace(" 2. No, exit", "❯ 1. No, exit");
         assert!(v261_before.contains("❯ 1. No, exit"), "전제: 2.1.261 기본 포커스 재현\n{v261_before}");
-        assert!(decide_allowing(&obs(&v261_before, &gs), Some(GATE_FOLDER_TRUST)).blocks(), "2.1.261 기본 포커스에서 구멍이 열렸다");
+        assert!(confirm_denied(&obs(&v261_before, &gs), GATE_FOLDER_TRUST).is_some(), "2.1.261 기본 포커스에서 확인이 열렸다");
         let v261_after = v261_before
             .replace("❯ 1. No, exit", "  1. No, exit")
             .replace("  2. Yes, I trust this folder", "❯ 2. Yes, I trust this folder");
         assert_eq!(
-            decide_allowing(&obs(&v261_after, &gs), Some(GATE_FOLDER_TRUST)),
-            Decision::Send,
-            "액션(아래 1발) 뒤 화면에서도 구멍이 닫혀 있다 — WP-1 H-2 의 통과 경로가 죽는다\n{v261_after}"
+            confirm_denied(&obs(&v261_after, &gs), GATE_FOLDER_TRUST),
+            None,
+            "액션(아래 1발) 뒤 화면에서도 확인이 닫혀 있다 — WP-1 H-2 의 통과 경로가 죽는다\n{v261_after}"
         );
-        // 액션 선언이 없는 관문은 구멍이 열리지 않는다(순수 술어 직접 실행).
+        // 액션 선언이 없는 관문은 확인이 열리지 않는다(순수 술어 직접 실행).
         let mut no_action = gs.iter().find(|g| g.id == GATE_FOLDER_TRUST).cloned().expect("폴더신뢰");
         assert!(action_label_selected(&no_action, fixtures::FOLDER_TRUST), "전제: 선언이 있으면 양성");
         no_action.action = None;
-        assert!(!action_label_selected(&no_action, fixtures::FOLDER_TRUST), "액션 선언 부재인데 구멍이 열렸다");
+        assert!(!action_label_selected(&no_action, fixtures::FOLDER_TRUST), "액션 선언 부재인데 확인이 열렸다");
     }
 
     /// ★(리뷰 R2 · codex minor) 롤백 노브는 **자기 축만** 끈다 — `CYS_READINESS_V1=1`(readiness_legacy)은 WP-1 의
@@ -1460,15 +1508,27 @@ mod tests {
         // 마스터(둘 다): 모달 폴백은 Send(축 없음) · 코퍼스 가드는 SendObserved(종전 롤백 형태 그대로).
         assert_eq!(mk(&clipped, true, true), Decision::Send);
         assert!(matches!(mk(corpus_gate, true, true), Decision::SendObserved(_)));
-        // 벨트: V1 에는 열리지 않고(보류) 마스터(guard_off)에서만 관측 강등된다.
+        // 벨트: 확인 경계는 **어느 노브로도** 열리지 않는다(성찰 R7: 주입 가드의 allow 구멍은 삭제 — 커서-종료
+        //   벨트는 [`confirm_denied`] 소유이고, 종전 구멍이 `guard_off` 로 관측 강등되던 진리표는 대조군
+        //   `legacy_decide_allowing` 에만 남는다).
         let on_exit = with_cursor_on(fixtures::FOLDER_TRUST, 2);
-        let belt = |v1: bool, off: bool| decide_allowing(
+        let belt = |v1: bool, off: bool| confirm_denied(
+            &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_versions: &[], version_pin_legacy: false },
+            GATE_FOLDER_TRUST,
+        );
+        for (v1, off) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(
+                belt(v1, off),
+                Some(ConfirmDenied::CursorOnExit),
+                "노브(v1={v1} · off={off})가 커서-종료 벨트를 열었다(2.1.261 좌석 사망 경로)"
+            );
+        }
+        let legacy_belt = |v1: bool, off: bool| legacy_decide_allowing(
             &Observed { screen: &on_exit, gates: &gs, awakened: Some(false), guard_off: off, readiness_legacy: v1, cli_versions: &[], version_pin_legacy: false },
             Some(GATE_FOLDER_TRUST),
         );
-        assert!(belt(true, false).blocks(), "readiness 롤백이 커서-종료 벨트를 열었다(2.1.261 좌석 사망 경로)");
-        assert!(!belt(true, true).blocks(), "마스터 롤백이 벨트를 종전(관측 강등)으로 되돌리지 못한다");
-        assert!(matches!(belt(false, true), Decision::SendObserved(_)));
+        assert!(legacy_belt(true, false).blocks(), "계측: 구 구멍도 readiness 롤백에는 닫혀 있었다");
+        assert!(matches!(legacy_belt(false, true), Decision::SendObserved(_)), "계측: 구 구멍은 마스터 롤백에 관측 강등됐다");
     }
 
     /// 확인 에코·정상 프롬프트는 모달 폴백에도 걸리지 않는다(2026-07-29 킬체인 역방향 · 부트 창 안에서도).

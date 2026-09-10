@@ -2072,11 +2072,12 @@ fn run_gate_corpus(agent: &str, as_json: bool, detected: Option<&str>) -> i32 {
 /// 이유가 여기 있다 — 구 데몬은 `awakened_at` 키가 없어 `surface_awakened` 가 `None` 을 내고,
 /// 그러면 **가드가 가장 필요한 자리에서 조용히 꺼진다**.
 ///
-/// ★통과 예외(`decide_allowing` 의 구멍)를 인자로 받지 않는다: 이 자리에서 통과시켜도 되는
-///   관문은 **없다**(디렉티브를 어느 관문 창에 넣어도 옳지 않다). 유일한 예외 사용처인
-///   폴더신뢰 자동확인은 이미 화면(`text`)을 손에 들고 있어 이 함수의 화면 RPC 를 다시 칠
-///   이유가 없고, 그래서 그쪽은 `decide_allowing` 을 직접 부른다. 늘 `None` 인 인자를 남기면
-///   다음 읽는 사람이 "여기도 구멍이 있다"고 오독한다.
+/// ★통과 예외를 받지 않는다 — 이 자리에서 통과시켜도 되는 관문은 **없다**(디렉티브를 어느 관문
+///   창에 넣어도 옳지 않다). ★(0.14.31 · 성찰 R7) 주입 가드에는 이제 allow 구멍 자체가 없다
+///   (`decide_allowing` 은 삭제됐다 — 프로덕션 호출자 0 이면서 doc 이 그것을 자동확인 벨트로
+///   지목해 오도했다). 폴더신뢰 자동확인의 **확인 허가**는 별개 술어 `confirm_denied`(양성 증거
+///   전용 · 벨트 5개)가 소유하고, 그쪽은 이미 화면(`text`)을 손에 들고 있어 이 함수의 화면 RPC 를
+///   다시 치지 않는다.
 fn gate_guard_decide_in_boot(
     sid: u64,
     gates: &[cys::first_run_gates::Gate],
@@ -8615,15 +8616,35 @@ mod seat_latch_negation_tests {
             !matches!(recheck(passed, None), GateRecheck::StillHeld { .. }),
             "관문 부재 화면에서 관문 보류가 나왔다(판정 이원화)"
         );
-        // ②′ ★(0.14.31 · H-1) 밸브 창 재료가 없으면(구 데몬 `quiet_secs` 부재 · 아직 출력 중) 통과 화면도
-        //    **채택하지 않는다** — 귀결은 NoEvidence(보류 유지 · 스폰 0 · 파괴 0)이지 StillHeld 도 Adopt 도 아니다.
-        for quiet in [None, Some(false)] {
+        // ②′ ★(0.14.31 · H-1 / 성찰 R8) 밸브 창 재료의 **두 결측을 가른다** — 종전에는 둘 다
+        //    NoEvidence 였다.
+        //    · `Some(false)`(아직 출력 중) — 채택하지 않는다. H-1 의 본체는 그대로다.
+        //    · `None`(구 데몬 cysd 0.14.30 은 `quiet_secs` 키를 **낼 수 없다**) — 성찰 R8 이후 밸브가
+        //      연다. 그러지 않으면 그 좌석은 사람이 관문을 통과시켜 줘도 재관측이 **영원히** 채택되지
+        //      않는다(노드 0 · 근거 전문은 `readiness::positive_evidence` 의 밸브 창 doc).
+        //      ★파괴 방향은 여기서 열리지 않는다 — 프로덕션 재관측은 이 판정을 **그대로 쓰지 않고**
+        //      둘째 벨트(`gate_recheck_with_carry` → `gate_carry_ok` → `composer_layout_static_ok`)를
+        //      통과해야 하고, 그 벨트는 같은 결측에서 `CarryUnproven` 을 낸다(2.1.241 레이아웃의
+        //      '마커 위 상태줄' 은 **약한 증거**라 출력 정적과 AND 다). 그 사실을 같은 실행으로 잰다.
+        {
             let mut o = obs(passed, Some(true));
-            o.idle_quiet = quiet;
+            o.idle_quiet = Some(false);
             assert_eq!(
                 gate_pending_recheck(cys::readiness::judge(&o)),
                 GateRecheck::NoEvidence,
-                "quiet={quiet:?}: 창 재료 없이 밸브가 채택으로 갔다(아직 그리는 화면에 주입)"
+                "아직 그리는 화면(quiet=Some(false))에 밸브가 채택으로 갔다"
+            );
+            o.idle_quiet = None;
+            let adopted = gate_pending_recheck(cys::readiness::judge(&o));
+            assert_eq!(
+                adopted,
+                GateRecheck::Adopt(cys::readiness::Evidence::Valve),
+                "구 데몬(quiet 부재) 좌석의 재관측이 영구히 채택되지 않는다(성찰 R8 회귀 · 노드 0)"
+            );
+            assert_eq!(
+                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None),
+                GateRecheck::CarryUnproven,
+                "이월 벨트가 구 데몬 결측에서 열렸다 — 재도색 중 프레임에 붙여넣기 + Return 이 나간다"
             );
         }
         // ②″ 잘린 면책 창(커서=No, exit · 코퍼스 식별 불가)은 재관측에서도 보류다 — 채택 Return 이 좌석을 죽인다.
@@ -11922,8 +11943,8 @@ fn boot_agent_on_surface(
         // ★(U-15) 감지는 **누적 델타**에서 하지만 전송 판정은 **지금 화면**을 한 번 더 본다.
         //   신뢰 창을 통과한 뒤에도 델타에는 그 질문이 그대로 남아 있고(since_line 이후 전량),
         //   그때 화면은 이미 면책 창이다 — 종전 코드가 2발째를 그 화면에 쏜 경로가 정확히 이것이다.
-        //   `decide_allowing(..., Some(GATE_FOLDER_TRUST))` 의 구멍은 **폴더신뢰 하나**뿐이라
-        //   자동확인 기능은 살고 킬 스텝만 닫힌다.
+        //   확인 허가(`confirm_denied` — 그 id 로 식별된 폴더신뢰 **하나**에만 열린다)라
+        //   자동확인 기능은 살고 킬 스텝만 닫힌다(성찰 R7: 주입 가드의 allow 구멍은 삭제됐다).
         if trust_prompt_hit(
             trust_re.as_ref(),
             &gate_corpus.gates,
@@ -12371,7 +12392,8 @@ fn inject_directive_after_ready(
 ///   · 이 부트에서 관문을 **본 적이 없다**(건강한 부트 — 종전과 한 글자도 다르지 않다).
 ///   · composer 마커 좌석: 지금 화면이 **대기 프롬프트 레이아웃**이다(마커 줄이 빈 입력줄 — 어댑터
 ///     플레이스홀더도 빈 입력줄이다 — 이고, 그 아래·위에 입력 상자 괘선·상태줄이 **실제로 있다** —
-///     `composer_layout_positive` · WP-5 가 alt-screen 배달 자격에 쓰는 스캐너와 **같은 술어**).
+///     `composer_layout_static_ok`(강한 증거는 단독 · 약한 증거는 정적과 AND) · WP-5 가 alt-screen
+///     배달 자격에 쓰는 스캐너와 **같은 술어**).
 ///   · 마커 미정의 어댑터: 출력이 **정적**이다(`idle_quiet == Some(true)`). 미관측(`None`)은 참으로
 ///     접지 않는다('부재 ≠ 부정' — 조여지는 방향).
 ///
@@ -24992,10 +25014,35 @@ mod tests {
         }
     }
 
+    /// ★(0.14.31 · 성찰 R7) **R3 까지의 구 생산자 재현** — 주입 허가(`decide_allowing(o, Some(id)).blocks()`)의
+    /// 부정을 확인 허가로 쓰던 배선. 그 API 는 프로덕션 호출자 0 이라 라이브러리에서 지웠고(컴파일러가
+    /// 잰다), 계측 타당성 대조군은 공개 술어로 같은 진리표를 조립한다: 생애 창 밖이면 통과 · 식별된 관문이
+    /// 지목한 id 이고 커서가 종료 위가 아니며 액션 라벨 전문 위면 통과(구멍) · 다른 관문이면 보류 ·
+    /// 미식별이면 모달 어휘가 있을 때만 보류(`readiness_legacy` 면 통과) · `guard_off` 는 보류를 관측으로 강등.
+    fn legacy_r3_injection_permission_blocks(o: &cys::inject_guard::Observed, allow: &str) -> bool {
+        if o.awakened != Some(false) {
+            return false;
+        }
+        let modal = cys::readiness::modal_signature(o.screen);
+        let held = match cys::first_run_gates::identify(o.gates, o.screen) {
+            Some(g) => {
+                let cursor_on_exit = modal.as_ref().is_some_and(|m| m.cursor_on_exit);
+                let anchors: Vec<&str> = g.needles.iter().map(String::as_str).collect();
+                let label_ok = g
+                    .action
+                    .as_ref()
+                    .is_some_and(|a| cys::readiness::cursor_resolves_to_label(o.screen, &a.label, &anchors));
+                !(g.id == allow && !cursor_on_exit && label_ok)
+            }
+            None => !o.readiness_legacy && modal.is_some(),
+        };
+        held && !o.guard_off
+    }
+
     /// ★(U-15) 킬체인 e2e — 신뢰 → 면책 연쇄를 **루프가 실제로 쓰는 술어 조합**으로 모사한다.
     ///
     /// 위 `inject_guard` 의 진리표는 판정부 자체를 보고, 이 검체는 `trust_prompt_hit`(감지) →
-    /// `decide_allowing`(화면 재확인) → `trust_send`(전송) 세 술어의 **조립**을 본다.
+    /// `confirm_denied`(확인 허가) → `trust_send`(전송) 세 술어의 **조립**을 본다.
     /// 실측 순서: ①신뢰 창 → ②Return 1발 → ③확인 에코 + 면책 창(기본 포커스 `No, exit`).
     #[test]
     fn killchain_trust_then_disclaimer_sends_exactly_one_return_at_the_call_site_composition() {
@@ -25026,7 +25073,7 @@ mod tests {
                         version_pin_legacy: false,
                     };
                     let other_gate = if legacy_producer {
-                        cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
+                        legacy_r3_injection_permission_blocks(&o, cys::inject_guard::GATE_FOLDER_TRUST)
                     } else {
                         !cys::inject_guard::confirm_allowed(&o, cys::inject_guard::GATE_FOLDER_TRUST)
                     };
@@ -25073,7 +25120,7 @@ mod tests {
         assert!(!both_touched, "롤백 두 개로 면책 창에 Return 이 닿았다");
     }
 
-    /// ★(0.14.31 · 리뷰 R2 · codex blocking) 신뢰 자동확인 조립(`trust_prompt_hit` → `decide_allowing` → `trust_send`)이
+    /// ★(0.14.31 · 리뷰 R2 · codex blocking) 신뢰 자동확인 조립(`trust_prompt_hit` → `confirm_denied` → `trust_send`)이
     /// **접힌 종료 라벨 위 커서**에 Return 을 쏘지 않는다 — 첫 Return 전(0발)이 벨트를 직접 재고, 통과 뒤 전환(1발)과
     /// 대조군(마스터 롤백 = 벨트 관측 강등 → 1발)이 계측 타당성을 준다.
     #[test]
@@ -25112,7 +25159,7 @@ mod tests {
                     };
                     // ★(리뷰 R4) 프로덕션과 같은 생산자 — `legacy_producer` 만 구 배선을 재현한다.
                     let other_gate = if legacy_producer {
-                        cys::inject_guard::decide_allowing(&o, Some(cys::inject_guard::GATE_FOLDER_TRUST)).blocks()
+                        legacy_r3_injection_permission_blocks(&o, cys::inject_guard::GATE_FOLDER_TRUST)
                     } else {
                         !cys::inject_guard::confirm_allowed(&o, cys::inject_guard::GATE_FOLDER_TRUST)
                     };
