@@ -700,6 +700,128 @@ class LiveProcess(Base):
         self.assertEqual(cnt, 1, detail)
 
 
+class A2LinuxEnvDeniedShape(Base):
+    """★A2(v0.14.33 · 우분투 pack-artifacts 결정적 적색의 재현·수리 핀): `/proc/<pid>/environ` 이 EACCES 일 때
+    **cmdline 형상**으로 가른다. 종전 리눅스 갈래는 "같은 uid 인데 못 읽었다 = 미해결" 이라 무관한 프로세스 하나가
+    함대 시드를 늘 `REFUSE unverified` 로 돌렸다(darwin 갈래는 env 비노출 줄을 strict 형상으로만 세어 이미 정제돼
+    있었다 — **리눅스만 비대칭**). `cmdline` 은 ptrace 권한 없이 읽히므로 같은 규칙을 리눅스에 적용할 수 있다.
+    검체는 **가짜 /proc 트리 + open 주입**이라 macOS 에서도 그대로 돈다(`proc_root` 인자)."""
+
+    BENIGN = ("900", b"HOME=/w/hm\0LANG=C\0", b"/usr/bin/python3\0-m\0http.server\0")   # 읽히는 줄(스캔 0건 회피)
+
+    def _proc(self, entries):
+        """entries: (pid, environ|None(=EACCES 주입), cmdline|None(=파일 부재)) → (root, open 주입 컨텍스트)."""
+        root = os.path.join(self.tmp, "proc")
+        denied = set()
+        for pid, env_b, cmd_b in entries:
+            d = os.path.join(root, pid)
+            os.makedirs(d)
+            with open(os.path.join(d, "environ"), "wb") as f:      # 실제 /proc 도 파일은 **존재**한다(읽기만 거부)
+                f.write(env_b if env_b is not None else b"")
+            if env_b is None:
+                denied.add(os.path.join(d, "environ"))
+            if cmd_b is not None:
+                with open(os.path.join(d, "cmdline"), "wb") as f:
+                    f.write(cmd_b)
+        real_open = builtins.open
+
+        def denying(path, *a, **k):
+            if isinstance(path, (str, bytes)) and os.fspath(path) in denied:
+                raise PermissionError(errno.EACCES, "injected: environ 은 PTRACE_MODE_READ 를 요구한다")
+            return real_open(path, *a, **k)
+
+        return root, patch("builtins.open", denying)
+
+    def test_a2_unrelated_process_with_denied_environ_is_ignored(self):
+        """무관한 프로세스(systemd --user 류)의 env 거부는 **관측이 아니다** — 검증된 0 이어야 한다(이번 수리의 전부)."""
+        root, denying = self._proc([self.BENIGN,
+                                    ("101", None, b"/usr/lib/systemd/systemd\0--user\0"),
+                                    ("102", None, b"(sd-pam)\0"),
+                                    ("103", None, b"/usr/bin/tail\0-f\0/w/hm/logs/claude\0")])   # 인자 속 claude 도 형상 아님
+        with denying:
+            cnt, detail = pf._count_claude_procfs(self.cfg, root)
+        self.assertEqual(cnt, 0, detail)
+        self.assertIn("env 거부 무시 3", detail)
+
+    def test_a2_claude_shaped_with_denied_environ_stays_unresolved(self):
+        """진짜 claude 의 env 를 못 읽는 경우는 종전대로 fail-closed(미해결 = 강행도 넘지 못한다)."""
+        for cmd in (b"/usr/local/bin/claude\0--continue\0",
+                    b"node\0/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js\0"):
+            with self.subTest(cmd=cmd):
+                root, denying = self._proc([self.BENIGN, ("101", None, cmd)])
+                with denying, patch.object(pf.os, "getuid", return_value=os.stat(root).st_uid, create=True):
+                    cnt, detail = pf._count_claude_procfs(self.cfg, root)
+                self.assertIsNone(cnt, detail)
+                self.assertIn("미해결 1건", detail)
+                shutil.rmtree(root)
+
+    def test_a2_claude_with_readable_env_is_still_live(self):
+        """양성 경로 무변경 — env 가 읽히고 우리 config 를 가리키면 라이브다(수리가 관측을 삼키지 않았다)."""
+        root, denying = self._proc([self.BENIGN,
+                                    ("101", b"CLAUDE_CONFIG_DIR=" + self.cfg.encode() + b"\0HOME=/w/hm\0",
+                                     b"/usr/local/bin/claude\0"),
+                                    ("102", None, b"/usr/lib/systemd/systemd\0--user\0")])
+        with denying:
+            cnt, detail = pf._count_claude_procfs(self.cfg, root)
+        self.assertEqual(cnt, 1, detail)
+        self.untrusted_file('{"projects": {}}')      # ★R2: 프로브는 기존 문서가 있을 때 돈다(부재 = no-probe)
+        rc, verdict, reason = pf.seed_trust(self.cfg, self.ws, force_unverified=True,
+                                            proc_counter=lambda d: pf._count_claude_procfs(d, root))
+        self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
+
+    def test_a2_empty_cmdline_is_ignored_and_unreadable_cmdline_is_fail_closed(self):
+        """argv 없음(커널 스레드·좀비)은 살아 있는 claude 가 아니다 → 무시. 반대로 **형상 판정 자체가 불가**하면
+        (cmdline 도 못 읽는다) 종전 소유자 검사로 내려가 fail-closed 다 — 무시와 fail-closed 를 가르는 축."""
+        root, denying = self._proc([self.BENIGN, ("101", None, b""), ("102", None, b"\0\0")])
+        with denying:
+            cnt, detail = pf._count_claude_procfs(self.cfg, root)
+        self.assertEqual(cnt, 0, detail)
+        root2 = os.path.join(self.tmp, "proc2")
+        os.makedirs(os.path.join(root2, "101"))
+        for name in ("environ", "cmdline"):
+            with open(os.path.join(root2, "101", name), "wb") as f:
+                f.write(b"")
+        os.makedirs(os.path.join(root2, self.BENIGN[0]))
+        with open(os.path.join(root2, self.BENIGN[0], "environ"), "wb") as f:
+            f.write(self.BENIGN[1])
+        with open(os.path.join(root2, self.BENIGN[0], "cmdline"), "wb") as f:
+            f.write(self.BENIGN[2])
+        real_open = builtins.open
+
+        def both_denied(path, *a, **k):
+            if isinstance(path, (str, bytes)) and os.path.dirname(os.fspath(path)) == os.path.join(root2, "101"):
+                raise PermissionError(errno.EACCES, "injected: 형상 판정 불가")
+            return real_open(path, *a, **k)
+
+        with patch("builtins.open", both_denied), patch.object(pf.os, "getuid", return_value=os.stat(root2).st_uid, create=True):
+            cnt2, detail2 = pf._count_claude_procfs(self.cfg, root2)
+        self.assertIsNone(cnt2, detail2)
+        self.assertIn("미해결 1건", detail2)
+
+    def test_a2_denied_environ_then_vanished_process_is_not_counted(self):
+        """environ EACCES 뒤 cmdline 부재 = 두 호출 사이에 종료(ENOENT=무시 규약) — 경합이 미해결을 만들면 안 된다."""
+        root, denying = self._proc([self.BENIGN, ("101", None, None)])
+        with denying, patch.object(pf.os, "getuid", return_value=os.stat(root).st_uid, create=True):
+            cnt, detail = pf._count_claude_procfs(self.cfg, root)
+        self.assertEqual(cnt, 0, detail)
+
+    def test_a2_other_uid_claude_shape_stays_out_of_scope(self):
+        """다른 uid 의 claude 형상은 범위 밖(cys-dept 와 claude 는 같은 사용자) — 형상 게이트가 uid 게이트를 대체하지 않는다."""
+        root, denying = self._proc([self.BENIGN, ("101", None, b"/usr/local/bin/claude\0")])
+        real_stat = pf.os.stat
+
+        def other_owner(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            if isinstance(path, str) and path == os.path.join(root, "101"):
+                return type("S", (), {"st_uid": st.st_uid + 1, "st_dev": st.st_dev, "st_ino": st.st_ino})()
+            return st
+
+        with denying, patch.object(pf.os, "stat", other_owner), \
+                patch.object(pf.os, "getuid", return_value=os.stat(root).st_uid, create=True):
+            cnt, detail = pf._count_claude_procfs(self.cfg, root)
+        self.assertEqual(cnt, 0, detail)
+
+
 class Concurrent(Base):
     def setUp(self):
         super().setUp()
@@ -2897,6 +3019,10 @@ class CodexR1Counterexamples(unittest.TestCase):
         denied = os.path.join(root, "710011")
         readable = os.path.join(root, "710012")
         self.write(os.path.join(denied, "environ"), b"")
+        # ★A2(v0.14.33): env 거부 줄은 이제 **cmdline 형상**이 claude 일 때만 소유자 검사로 내려간다 — 이 검체의 축
+        #   (소유 불명을 '다른 사용자' 로 접지 않는다)을 유지하려면 픽스처가 형상 증거를 갖춰야 한다. 형상이 아닌 줄은
+        #   무시가 정답이고 그 축은 A2LinuxEnvDeniedShape 가 따로 잰다.
+        self.write(os.path.join(denied, "cmdline"), b"/usr/local/bin/claude\0")
         self.write(os.path.join(readable, "environ"), b"HOME=" + self.root.encode() + b"\0")
         self.write(os.path.join(readable, "cmdline"), b"python\0")
         real_open, real_stat = builtins.open, os.stat

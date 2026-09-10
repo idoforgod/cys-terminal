@@ -7370,9 +7370,11 @@ def _count_claude_in_ps_lines(lines, config_dir, self_pids=(), argv_lines=None, 
 
 
 def _count_claude_procfs(config_dir, proc_root="/proc"):
-    """linux /proc/<pid>/{environ,cmdline} 스캔 — (count|None, detail). 권한 밖(EACCES)은 **소유자를 확인**한다(codex R1):
-    같은 uid 인데 못 읽으면(비덤프 프로세스) 미해결 · 다른 uid 는 범위 외(cys-dept 와 claude 는 같은 사용자) · uid 판정 불가도
-    미해결. 스캔 중 종료(ENOENT)=무시 · 그 외 판독 실패=미해결. ★양성 관측 n>0 은 미해결보다 먼저 반환한다(--force-unverified 가
+    """linux /proc/<pid>/{environ,cmdline} 스캔 — (count|None, detail). 권한 밖(EACCES)은 **형상과 소유자를 함께**
+    확인한다(★A2 v0.14.33 · codex R1): `environ` 이 EACCES 면 world-readable 한 `cmdline` 을 읽어 **claude 형상일 때만**
+    미해결이고(같은 uid 또는 uid 판정 불가일 때 · 다른 uid 는 범위 외 — cys-dept 와 claude 는 같은 사용자), 무관한
+    프로세스는 무시한다. 형상 규칙은 darwin 갈래의 env 비노출 줄과 같다(strict). 스캔 중 종료(ENOENT)=무시 · 그 외
+    판독 실패=미해결. ★양성 관측 n>0 은 미해결보다 먼저 반환한다(--force-unverified 가
     관측된 라이브 claude 를 넘지 못하게)."""
     # ★R5(리뷰 codex D1): 표기 비교 하나가 아니라 3값 파일시스템 동일성(_same_dir) — 조회 불가(EACCES/ESTALE)는
     #   '다름' 이 아니라 **미해결**이다(검증된 0 금지). /proc 은 값 경계가 NUL 로 확정돼 있어 후보 열거는 필요 없다.
@@ -7384,7 +7386,7 @@ def _count_claude_procfs(config_dir, proc_root="/proc"):
     self_pids = {str(os.getpid()), str(os.getppid())}
     getuid = getattr(os, "getuid", None)
     my_uid = getuid() if getuid else None
-    n = scanned = unresolved = 0
+    n = scanned = unresolved = env_denied = 0        # env_denied = env 거부인데 claude 형상이 아니라 무시한 줄(진단용)
     for pid in names:
         if not pid.isdigit() or pid in self_pids:
             continue
@@ -7395,6 +7397,28 @@ def _count_claude_procfs(config_dir, proc_root="/proc"):
             with open(os.path.join(pdir, "cmdline"), "rb") as f:
                 cmd = f.read()
         except PermissionError:
+            # ★A2(v0.14.33 · 우분투 실측): `environ` 이 **정책상** 안 읽히는 일은 무관한 프로세스에서도 늘 일어난다 —
+            #   `kernel.yama.ptrace_scope=1`(우분투 기본)에서는 자손이 아닌 **같은 uid** 프로세스의 environ 이 EACCES 다.
+            #   종전엔 그 줄을 전부 미해결로 세어 시드가 항상 REFUSE 였다(release.yml `pack-artifacts` 잡 결정적 적색 ·
+            #   v0.14.32 에서 최초 노출). darwin 갈래는 이미 정제돼 있다(:7360 env 비노출 줄 = strict 형상만 미해결) —
+            #   **리눅스만 비대칭**이었다. 수리: world-readable 한 `cmdline` 으로 형상을 확인해 **같은 규칙**을 적용한다.
+            #     claude 형상  → 미해결(진짜 claude 의 env 를 못 읽는 경우는 종전대로 fail-closed · '검증된 0' 금지)
+            #     무관한 형상  → 무시(관측 대상이 아니다 — 여기가 이번 수리의 전부다)
+            #     argv 없음    → 무시(커널 스레드·좀비 · 살아 있는 claude 는 argv 가 비지 않는다)
+            #     cmdline 부재 → 무시(environ EACCES 뒤 ENOENT = 두 호출 사이에 종료 · 아래 FileNotFoundError 와 같은 규약)
+            #     cmdline 판독 실패 → 형상 판정 불가라 fail-closed(소유자 검사로 내려간다)
+            try:
+                with open(os.path.join(pdir, "cmdline"), "rb") as f:
+                    cmd = f.read()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                cmd = None
+            if cmd is not None:
+                shape_tokens = [os.fsdecode(t) for t in cmd.split(b"\0") if t]
+                if not shape_tokens or not _is_claude_command(shape_tokens, strict=True):
+                    env_denied += 1
+                    continue
             try:
                 owner = os.stat(pdir).st_uid
             except OSError:
@@ -7430,13 +7454,16 @@ def _count_claude_procfs(config_dir, proc_root="/proc"):
             n += 1
         elif default_verdict is None:
             unresolved += 1
+    # 진단(★A2): `env 거부 무시 N` 은 environ 이 EACCES 인데 cmdline 형상이 claude 가 아니라 **무시한** 줄 수다 —
+    #   우분투에서 이 값이 크고 미해결이 0 인 것이 정상이다(종전엔 이 N 이 그대로 미해결이 돼 시드가 늘 REFUSE 였다).
     if n > 0:
-        return n, "linux: /proc %d건(미해결 %d)" % (scanned, unresolved)
+        return n, "linux: /proc %d건(미해결 %d · env 거부 무시 %d)" % (scanned, unresolved, env_denied)
     if unresolved:
-        return None, "linux: /proc 미해결 %d건(판독 실패·같은 uid 권한 거부)" % unresolved
+        return None, ("linux: /proc 미해결 %d건(claude 형상인데 판독 실패·같은 uid 권한 거부 · 스캔 %d · env 거부 무시 %d)"
+                      % (unresolved, scanned, env_denied))
     if scanned == 0:
-        return None, "linux: /proc 판독 0건"
-    return 0, "linux: /proc %d건" % scanned
+        return None, "linux: /proc 판독 0건(env 거부 무시 %d)" % env_denied
+    return 0, "linux: /proc %d건(env 거부 무시 %d)" % (scanned, env_denied)
 
 
 def claude_procs_for_config(config_dir, runner=None, os_name=None, platform=None, proc_root="/proc"):
