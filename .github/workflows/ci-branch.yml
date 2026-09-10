@@ -78,6 +78,16 @@ jobs:
       #      비대칭으로 잡혀 ALLOWED 가 근거 없는 목록으로 썩는다. 그래서 아래 SUBSET_LANES 라는
       #      **방향성 있는 약한 계약**으로 편입한다(⊆ 검사 + 필수 보유 검사). 완전 레인이 아닌
       #      워크플로우는 앞으로도 이쪽에 등재하라.
+      #   ★A2 등재(2026-09-11 · v0.14.33 · "새 레인이 생기면 여기 먼저 등재하라" 의 이행): 이 파일에
+      #      **우분투 잡 `ubuntu-pack-suite`** 가 생겼다 — 태그 레인 `pack-artifacts` 의 파이썬 팩 루프를
+      #      문면 그대로 도는 **태그 전 리눅스 관문**이다(잡4 머리말 참조). LANES 에는 넣지 않는다:
+      #      새 **워크플로우**가 아니라 이미 등재된 ci-branch.yml 안의 새 **잡**이고, LANES 는 파일 단위라
+      #      넣을 자리가 없다.
+      #      ⚠그래서 이 게이트는 그 잡을 **따로 보지 못한다**(한계 2 의 실제 사례 1호) — 같은 파일 안
+      #      macOS 잡과 우분투 잡이 같은 이름을 쓰므로 "어느 잡이 도는가" 는 여기서 구분되지 않고,
+      #      우분투 잡의 루프가 태그 레인과 갈려도 비대칭 0 = 초록이다. 그 축은 **별도 기계**가 잰다:
+      #      `scripts/lane-parity-rehearsal.sh` 5단계(두 `for t in` 토큰 집합의 정확한 일치 · env 격리
+      #      동일성 · 변이 대조 2종 = 토큰 1개 제거 · 우분투 잡 소멸). 그 잡을 고칠 때는 5단계를 함께 돌려라.
       #   요약: 이건 **복제된 목록의 드리프트 조기 경보**이지 커버리지 증명이 아니다.
       # LANE-GATE-SELF-BEGIN
       - name: 팩 스위트 레인 대조 (ci-branch ⇔ release ⇔ pack-release 드리프트 차단 + windows-build 부분 레인 계약)
@@ -1274,3 +1284,95 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/tests/nsis-hook-model/model.py
+
+  # 잡4 — ubuntu: **태그 레인 `pack-artifacts`(ubuntu-latest)의 파이썬 팩 루프를 그대로** 돌린다.
+  # ★A2(2026-09-11 · v0.14.33 · 이 레인이 없어서 일어난 일): v0.14.32 태그런의 `pack-artifacts`
+  #   잡이 `test_trust_seed` 7건으로 죽었다 — 원인은 `javis_preflight.py` 리눅스 `/proc` 갈래의
+  #   잠복 비대칭(environ EACCES 를 전부 미해결로 계상)이었고, **리눅스에서 그 검체가 돌아본 것이
+  #   그때가 처음**이었다. 브랜치 CI 3잡이 전부 macOS 라 `/proc`·`renameat2`·리눅스 권한 갈래는
+  #   태그를 밀기 전까지 0회 실행이었다. 재태그는 금지(release-pipeline-map §10-10)이므로 그
+  #   적색의 대가는 **버전 하나를 버리는 것**이다(0.14.31 → 0.14.32 → 0.14.33 이 그 값이다).
+  #   이 잡의 명제는 하나다: **태그를 밀기 전에 우분투에서 같은 루프가 돈다.**
+  # ★"같은 루프" 의 정의 = release.yml `pack-artifacts` 의 `for t in … done` 블록을 **문면까지
+  #   그대로** 복사한다(토큰 집합·파일 존재 단언·env 격리 `CYS_PACK_DIR="$(mktemp -d)"` 동일).
+  #   두 블록의 diff 가 0 이어야 드리프트가 눈에 보인다 — 그래서 에러 문면의 '서명 전 차단' 도
+  #   고치지 않았다(그 문장은 태그 레인의 결과다 · 이 레인에서의 결과는 '태그 전 차단' 이고,
+  #   그 차이를 말하는 자리가 이 주석이다). 동일성은 손이 아니라 기계가 지킨다 —
+  #   `scripts/lane-parity-rehearsal.sh` 5단계가 두 토큰 집합의 **정확한 일치**를 잰다.
+  # ★범위(정직): 이 잡은 파이썬 루프만이다. `pack-artifacts` 의 2언어 파리티(rustc)·시크릿 스캔·
+  #   cargo 빌드·tar·서명은 여기서 돌지 않는다(그 표면은 이미 잡1·태그 레인이 잰다). 그래도
+  #   0.14.32 를 죽인 표면은 정확히 이 루프였다.
+  # ★`if:` 없음 · `continue-on-error` 없음 — 돌지 않는 초록도, 붉어도 통과하는 초록도 금지.
+  ubuntu-pack-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # 잡1·잡2·windows-health·release pack-artifacts 와 같은 핀(CONTRACTS E-4 ②). 러너 이미지
+      # 기본 python3 로 돌면 같은 스위트를 레인마다 다른 인터프리터로 재는 셈이고, 그 차이는
+      # 이미지 갱신 때 말없이 바뀐다.
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ★전제 실측(stageA §6-4 가 "측정하지 못한 것" 으로 남긴 바로 그 값). 위 결함의 기전 설명은
+      #   `kernel.yama.ptrace_scope` 와 `/proc/<pid>/environ` 권한에 기대고 있었는데 러너의 실값을
+      #   아무도 재지 않았다. 여기서 1회 찍는다 — 이 스텝은 **진단**이라 판정하지 않는다(항상 0).
+      #   판정은 아래 루프가 한다. 관측 함수는 생산 코드 그 자체를 부른다(모사 금지).
+      - name: 리눅스 프로세스 관측 전제 실측 (진단 · 판정 아님)
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "uid=$(id -u) · ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo '판독 불가')"
+          python3 - <<'PY'
+          import importlib.util, os, tempfile
+          spec = importlib.util.spec_from_file_location("pf", "cysjavis-pack/bin/javis_preflight.py")
+          pf = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(pf)
+          cnt, detail = pf._count_claude_procfs(os.path.join(tempfile.mkdtemp(), "no-such-config"))
+          print("[/proc 관측] count=%r · %s" % (cnt, detail))
+          print("[/proc 관측] 기대: count=0(검증된 음성) — None 이면 시드가 거부되고 팩 루프가 붉어진다")
+          PY
+          exit 0
+
+      - name: 팩 검체 — release pack-artifacts 파이썬 루프 그대로 (태그 전 우분투 관문)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== [pack][ubuntu] release.yml pack-artifacts 와 동일 토큰 집합 · 동일 env 격리 =="
+          for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
+                   test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
+                   test_bootstrap_chain test_snapshot \
+                   test_role_bootstrap_hook test_seat_latch_negation \
+                   test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
+                   test_preflight_c62_c68_ledger \
+                   test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
+                   test_pyseal_negative_specimen \
+                   test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root \
+                   test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
+                   test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_cso_directive_rev test_role_authority test_role_authority_shell \
+                   test_role_authority_triage \
+                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
+                   test_inject_context_role_seat test_carry_unproven_scope \
+                   test_wakeup_durable_receipt test_wakeup_park_failure \
+                   test_capgate_remeasure_order test_phoenix_p10_lease_split \
+                   test_preflight_only_dispatch test_preflight_settings_fifo \
+                   test_trust_seed_reflect \
+                   test_refl_axis_labels test_refl_fleet_argv_owner test_refl_fleet_latch_gen \
+                   test_refl_inject_context_role_canon test_refl_round_lock_ownership \
+                   test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
+                   test_refl_wakeup_expiry_attribution \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path; do
+            f="cysjavis-pack/bin/tests/$t.py"
+            [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+            echo "== [pack] declared-state test: $t =="
+            if ! CYS_PACK_DIR="$(mktemp -d)" python3 "$f"; then
+              echo "::error::[pack] 선언·유령집계 게이트 실패($t) — 배송 팩 회귀. 서명 전 차단." >&2
+              exit 1
+            fi
+          done

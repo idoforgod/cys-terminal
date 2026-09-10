@@ -339,10 +339,120 @@ else:
 PYEXIST
 }
 
+# 5단계(★A2 · 2026-09-11 · v0.14.33) — **우분투 사전 레인 ⇔ 태그 레인 pack-artifacts 루프 동일성**.
+#   왜 생겼는가: 브랜치 CI 3잡이 전부 macOS 라 리눅스 갈래(`/proc`·권한·renameat2)가 **태그를 밀기
+#   전까지 0회 실행**이었고, v0.14.32 태그런의 `pack-artifacts` 가 그때 처음 도는 검체에서 죽었다
+#   (재태그 금지 = 버전 하나를 버린다). 수리는 ci-branch.yml 에 우분투 잡을 두는 것인데, 그 잡이
+#   **태그 레인과 같은 루프를 도는가**는 손으로 맞춘 복제라 또 갈린다 — 이 리포가 반복해 당하는
+#   바로 그 형태다. 그래서 기계가 잰다: 두 `for t in … do` 의 **토큰 집합이 정확히 같은가**.
+#   판정: 같으면 0 · 갈리면 1(어느 쪽에 무엇이 더 있는지 출력) · 구조를 못 읽으면 3(도구를 고쳐라).
+#   레인 루트는 LANE_GATE_ROOT(자기 검체의 변이 사본) — 미설정이면 리포 루트.
+ubuntu_lane_axis() {
+python3 - <<'PYUBUNTU'
+import os, re, sys
+
+ROOT = os.environ.get("LANE_GATE_ROOT", ".")
+CI = os.path.join(ROOT, ".github/workflows/ci-branch.yml")
+REL = os.path.join(ROOT, ".github/workflows/release.yml")
+EXIT_STRUCT = 3
+
+def die(msg, rc=EXIT_STRUCT):
+    print("::error::%s" % msg, file=sys.stderr)
+    raise SystemExit(rc)
+
+def jobs(path):
+    """{잡 이름: (본문 줄들, runs-on 값|None)} — `jobs:` 아래 들여쓰기 2의 키가 잡 머리다."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError as e:
+        die("레인 파일을 읽지 못했다: %s (%s)" % (path, e))
+    heads = [i for i, l in enumerate(lines) if re.match(r"^  [A-Za-z0-9_-]+:\s*$", l)]
+    if not heads:
+        die("%s 에서 잡 머리를 0건 추출 — 워크플로 구조가 바뀌었다(이 추출기를 고쳐라)" % path)
+    out = {}
+    for k, i in enumerate(heads):
+        end = heads[k + 1] if k + 1 < len(heads) else len(lines)
+        body = lines[i + 1:end]
+        m = [re.match(r"^    runs-on:\s*(\S+)\s*$", l) for l in body]
+        runs = next((x.group(1) for x in m if x), None)
+        out[lines[i].strip().rstrip(":")] = (body, runs)
+    return out
+
+ANCHOR = "test_todo_decl"      # 팩 루프의 첫 토큰 — 같은 잡의 다른 `for t in`(자원 게이트·수용 검체)과 가른다
+
+
+def loop_tokens(body, label):
+    """그 잡 본문에서 **앵커 토큰을 품은** `for t in … ; do` 블록 → (토큰 집합, 원문). 역슬래시 연장을 잇는다."""
+    found = []
+    i = 0
+    while i < len(body):
+        if re.search(r"\bfor t in\b", body[i]):
+            buf = [body[i]]
+            while buf[-1].rstrip().endswith("\\") and i + 1 < len(body):
+                i += 1
+                buf.append(body[i])
+            text = " ".join(x.rstrip("\\").strip() for x in buf)
+            toks = frozenset(re.findall(r"\btest_[a-z0-9_]+", text))
+            if ANCHOR in toks:
+                found.append((toks, text))
+        i += 1
+    if len(found) != 1:
+        die("%s 에서 앵커 `%s` 를 품은 `for t in … do` 가 %d 개다(1 이어야 한다) — 잡이 바뀌었으면 "
+            "이 축을 고쳐라" % (label, ANCHOR, len(found)))
+    if not found[0][0]:
+        die("%s 의 루프에서 토큰 0건 — 잴 대상이 없으면 게이트가 아니다(D10 과 같은 규율)" % label)
+    return found[0]
+
+ci = jobs(CI)
+ubu = [n for n, (_b, r) in ci.items() if r == "ubuntu-latest"]
+if not ubu:
+    print("::error::ci-branch.yml 에 `runs-on: ubuntu-latest` 잡이 없다 — 태그 전 리눅스 관문이 "
+          "사라졌다. v0.14.32 를 버리게 한 그 사각이 그대로 돌아온다(잡을 되살려라).", file=sys.stderr)
+    raise SystemExit(1)
+if len(ubu) != 1:
+    die("ci-branch.yml 의 우분투 잡이 %d 개다(%s) — 어느 것이 태그 레인 대응인지 이 축이 "
+        "판별할 수 없다(도구를 고쳐라)" % (len(ubu), ", ".join(sorted(ubu))))
+ci_set, ci_text = loop_tokens(ci[ubu[0]][0], "ci-branch:%s" % ubu[0])
+
+rel = jobs(REL)
+if "pack-artifacts" not in rel:
+    die("release.yml 에 pack-artifacts 잡이 없다 — 대응할 태그 레인이 사라졌다")
+rel_set, rel_text = loop_tokens(rel["pack-artifacts"][0], "release:pack-artifacts")
+
+ISO = 'CYS_PACK_DIR="$(mktemp -d)" python3'
+for label, body in (("ci-branch:%s" % ubu[0], ci[ubu[0]][0]), ("release:pack-artifacts", rel["pack-artifacts"][0])):
+    if not any(ISO in l for l in body):
+        print("::error::%s 의 팩 루프에 env 격리 `%s` 가 없다 — 같은 루프가 아니다(라이브 상태 "
+              "오염 방향)." % (label, ISO), file=sys.stderr)
+        raise SystemExit(1)
+
+print("── 5단계: 우분투 사전 레인 ⇔ release pack-artifacts 루프 동일성(A2) ────────")
+extra, miss = sorted(ci_set - rel_set), sorted(rel_set - ci_set)
+print("[우분투 레인] ci-branch:%s=%d종 · release:pack-artifacts=%d종 · env 격리 동일"
+      % (ubu[0], len(ci_set), len(rel_set)))
+if extra or miss:
+    for n in miss:
+        print("::error::  %s — 태그 레인은 도는데 우분투 사전 레인은 돌지 않는다(그 검체의 리눅스 "
+              "회귀는 다시 태그런에서야 보인다)" % n, file=sys.stderr)
+    for n in extra:
+        print("::error::  %s — 우분투 사전 레인에만 있다(태그 레인과 다른 루프 = 사전 관문이 "
+              "증명하는 명제가 달라졌다)" % n, file=sys.stderr)
+    print("::error::우분투 사전 레인이 태그 레인 pack-artifacts 와 **다른 토큰 집합**을 돈다 — "
+          "두 블록은 문면까지 같은 복사본이어야 한다(ci-branch.yml 잡4 머리말).", file=sys.stderr)
+    raise SystemExit(1)
+print("[우분투 레인] 토큰 집합 정확히 일치 — 태그 전에 같은 루프가 리눅스에서 돈다")
+PYUBUNTU
+}
+
 echo
 existence_axes
 AX_RC=$?
 [ $AX_RC -eq 0 ] || exit $AX_RC
+
+echo
+ubuntu_lane_axis
+UB_RC=$?
+[ $UB_RC -eq 0 ] || exit $UB_RC
 
 if [ $SELF_TEST -eq 1 ]; then
   echo
@@ -486,4 +596,46 @@ t = t.replace(a, "", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
   mut_expect 1 "필터 가드 삭제(windows-health readiness::)" "cargo_filter_count --lib readiness::"
+
+  echo
+  echo "── 자기 검체 3: 5단계(우분투 사전 레인 동일성)의 변이 대조 ──────────────────"
+  # 5단계도 "다 통과시켜서" 만족될 수 있다 — 양성 대조(무변이 사본 rc=0) 옆에 실패 대조 둘을 둔다.
+  #   ①토큰 1개 제거(태그 레인은 도는데 사전 레인은 안 도는 상태) ②우분투 잡 소멸(관문 자체가 사라짐)
+  ub_expect() {   # $1=기대 rc · $2=라벨 · $3=사유 grep 패턴(고정 문자열)
+    export LANE_GATE_ROOT="$MUT_ROOT"
+    ubuntu_lane_axis > "$SELF_TMP/ub.log" 2>&1
+    local rc=$?
+    unset LANE_GATE_ROOT
+    if [ "$rc" -ne "$1" ]; then
+      cat "$SELF_TMP/ub.log"
+      echo "::error::자기 검체 3 실패 — $2: 기대 exit $1 · 실제 exit $rc" >&2
+      exit 1
+    fi
+    if ! grep -qF -- "$3" "$SELF_TMP/ub.log"; then
+      cat "$SELF_TMP/ub.log"
+      echo "::error::자기 검체 3 실패 — $2: exit 는 맞지만 사유 '$3' 가 로그에 없다(다른 이유로 붉어졌다)" >&2
+      exit 1
+    fi
+    echo "[자기 검체 3] $2 → exit $rc · 사유 일치"
+  }
+  mut_reset; ub_expect 0 "무변이 사본" "토큰 집합 정확히 일치"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "                   test_trust_seed test_capgate_registration test_capgate_hook_shell \\\n"
+j = t.index("  ubuntu-pack-suite:")            # 같은 줄이 잡1 루프에도 있다 — 우분투 잡 **안**에서만 자른다
+assert t.count(a, j) == 1, "변이 앵커 부재(우분투 루프 trust_seed 줄)"
+t = t[:j] + t[j:].replace(a, "                   test_capgate_registration test_capgate_hook_shell \\\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  ub_expect 1 "토큰 1개 제거(우분투 루프에서 test_trust_seed)" "test_trust_seed"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "  ubuntu-pack-suite:\n    runs-on: ubuntu-latest\n"
+assert t.count(a) == 1, "변이 앵커 부재(우분투 잡 머리)"
+t = t.replace(a, "  ubuntu-pack-suite:\n    runs-on: macos-latest\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  ub_expect 1 "우분투 잡 소멸(runs-on 을 macos 로)" "태그 전 리눅스 관문이 사라졌다"
 fi
