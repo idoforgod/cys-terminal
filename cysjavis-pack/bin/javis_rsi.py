@@ -74,12 +74,27 @@ RSI_STOP_REASONS = ("open", "stopped_budget", "stopped_stagnation")
 RSI_ATTEMPT_EVENTS = ("checkpoint", "progress")
 
 
+def _as_int_ok(v, default=0):
+    """느슨한 정수 해석 → `(값, 해석됨?)`. 결측(None)은 '값이 아니다' 라 `(default, True)` 다 —
+    '없음' 과 '읽었는데 쓸 수 없음' 을 가른다(후자만 예산 불확정으로 올린다).
+
+    ★성찰 R4 N14: 종전엔 `OverflowError` 를 잡지 않았다. `state.json` 의 `attempts: 1e999` 는
+      `json.load` 가 `inf`(float)로 읽고 `int(inf)` 가 OverflowError 를 던진다 — 그 예외가
+      `cmd_checkpoint`/`cmd_progress` 를 통째로 죽여 **복구·완료 경로가 traceback 으로 끝났다**
+      (`javis_learn.py:766` 이 rc≠0 을 fail(12)=일시 실패로 올려 끝난 평가가 재시도로 되돌아간다 ·
+      §7 위험 ③ 방향). 이제 해석 불가는 기본값 + `ok=False` 이고, 호출부가 `budget_unknown` 으로
+      **정직하게 표기**한다(모르는 것은 모른다 — 0 으로 조용히 접지 않는다)."""
+    if v is None:
+        return default, True
+    try:
+        return int(v), True
+    except (TypeError, ValueError, OverflowError):
+        return default, False
+
+
 def _as_int(v, default=0):
     """느슨한 정수 해석 — 손상된 state 값이 판정을 죽이지 않게(결측은 값이 아니다)."""
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+    return _as_int_ok(v, default)[0]
 
 
 def _env_int(key, default):
@@ -224,22 +239,91 @@ def _mirror_round_rec(rec):
     return out
 
 
+# ★미러가 **건드리면 안 되는** 키(성찰 R4 N1 · codex 설계 비평 2): 이 파일의 라운드 레코드는
+#   두 주인이 나눠 갖는다 — lifecycle(평가 결과)은 `javis_learn`/데몬 소유, RSI 계측은 RSI 소유다.
+#   `learn evaluate` 가 RSI 에 **같은 `--round`** 를 넘기므로 두 쪽의 라운드 id 공간은 실제로 겹친다.
+#   그래서 rid 단위 병합만으로는 부족하고, RSI 는 남의 필드를 **덮지도 지우지도 않는다**.
+LEARN_OWNED_ROUND_KEYS = frozenset((
+    "verdict", "stored", "harness", "items", "evaluator_hash", "schema",
+    "attempts",            # learn 의 judge-shopping 시도수(RSI 것은 `rsi_attempts` 로 개명된다)
+    "created_at",
+))
+LEARN_CANONICAL_STATE = "~/.cys/state"
+
+
+def _mirror_daemon_owned(d):
+    """미러 대상 디렉터리 `d` 가 **데몬 canonical 학습 디렉터리**인가(실경로 비교).
+
+    ★왜 `javis_learn._is_canonical` 의 '루트 비교' 를 그대로 베끼지 않는가(codex 설계 비평 1):
+      루트만 보면 **비canonical 루트 아래의 `learn` 만 canonical 로 심링크된** 형상을 통과시켜
+      정본을 그대로 덮는다. 그리고 `CYS_ROUND_DIR` 이 없을 때의 `<팩>/round/learn` 별칭도 놓친다.
+      여기서 지켜야 할 것은 '환경변수의 모양' 이 아니라 **쓰려는 자리가 데몬 것인가** 이므로
+      대상 경로의 실경로를 canonical 의 실경로와 비교한다(루트 비교를 포함한다).
+    ★판정 불가(OSError)는 **소유로 본다** — 데몬 파일일 수 있는 자리에 쓰지 않는 쪽이 안전 방향이다
+      (자가치유 상태 전손이 §7 위험 ③ 이고, 미러 누락은 CC 학습 탭의 가시성 손실뿐이다)."""
+    try:
+        canon = os.path.realpath(os.path.expanduser(
+            os.path.join(LEARN_CANONICAL_STATE, "learn")))
+        return os.path.realpath(d) == canon
+    except OSError:
+        return True
+
+
 def _mirror_learn_state(state):
-    """rounds/discovery를 데몬 가독 위치로 미러(best-effort) — 실패는 RSI 판정에 불간섭."""
+    """rounds 를 데몬 가독 위치로 미러(best-effort) — 실패는 RSI 판정에 불간섭.
+
+    ★성찰 R4 N1(blocking): 종전엔 payload 를 만들어 `os.replace` 로 **통째 치환**했다.
+      · 상시 잡이 `CYS_ROUND_DIR="${CYS_ROUND_DIR:-$HOME/.cys/state}"` 를 박으면 이 미러의 대상이
+        **데몬 canonical**(`~/.cys/state/learn/state.json`)이 된다. `javis_learn` 은 그 형상에서
+        미러 쓰기를 끊는데(`_is_canonical`) RSI 는 같은 프로세스 트리에서 덮었고, 데몬이
+        `daemon.learn_write` 락으로 지키던 lifecycle 라운드와 discovery 계수가 **전손**됐다
+        (실측: `rounds.L1`(verdict·stored·harness·evaluator_hash) 소멸 · discovery 전부 0).
+        프로세스 밖 `os.replace` 는 데몬 락이 막지 못한다.
+      · canonical 이 아니어도 이 파일에는 **남의 라운드**가 있다(`javis_learn` 세션 모드 미러가
+        같은 자리를 쓴다). 치환은 그것도 함께 지웠다.
+      수정: ⓐ 대상이 데몬 것이면 **쓰지 않는다**(전파는 데몬 RPC 소관) ⓑ 아니면 rid 단위 병합에
+      **필드 소유권**을 얹는다(위 `LEARN_OWNED_ROUND_KEYS`) ⓒ `discovery` 는 **보내지 않는다** —
+      RSI 는 그 값을 갱신하는 코드가 없어 늘 기본 0 이었고, 그 0 이 데몬이 세운 계수를 덮었다
+      (codex 설계 비평 2: 보존이 맞다 · 합은 재미러마다 중복 · 최대는 하향 정정을 봉쇄)
+      ⓓ 기존 파일을 **읽지 못하면 쓰지 않는다** — 판독 실패를 빈 상태로 접고 저장하면 그 자체가
+      새 전손 경로다(codex 설계 비평 4)."""
     try:
         d = _learn_state_dir()
+        if _mirror_daemon_owned(d):
+            return                       # 데몬 단일 writer 소유 — 미러 쓰기 금지(N1 ⓐ)
+        mp = os.path.join(d, "state.json")
+        cur = {}
+        if os.path.exists(mp):
+            try:
+                with open(mp, encoding="utf-8") as f:
+                    cur = json.load(f)
+            except (OSError, ValueError) as e:
+                print("[rsi] 주의: 학습 미러를 읽지 못해 이번 미러를 건너뛴다(%s) — 덮어쓰면 "
+                      "남의 라운드가 사라진다." % e, file=sys.stderr)
+                return                   # N1 ⓓ
+            if not isinstance(cur, dict):
+                print("[rsi] 주의: 학습 미러가 객체가 아니다 — 이번 미러를 건너뛴다.",
+                      file=sys.stderr)
+                return
+        out = dict(cur)
+        rounds_out = dict(out.get("rounds") or {}) if isinstance(out.get("rounds"), dict) else {}
+        mine = state.get("rounds", {})
+        for rid, rec in (mine.items() if isinstance(mine, dict) else []):
+            base = rounds_out.get(rid)
+            base = dict(base) if isinstance(base, dict) else {}
+            for k, v in (_mirror_round_rec(rec) or {}).items():
+                if k in LEARN_OWNED_ROUND_KEYS:
+                    continue             # 남의 필드는 덮지 않는다(N1 ⓑ)
+                base[k] = v
+            rounds_out[rid] = base
+        out["rounds"] = rounds_out
+        # ★discovery 는 **손대지 않는다**(N1 ⓒ): `out` 은 기존 파일의 사본이므로 있던 값이 그대로
+        #   남고, 없으면 만들지 않는다. RSI 가 기본 0 을 실어 데몬 계수를 0 으로 되돌리던 길이 닫힌다.
         os.makedirs(d, exist_ok=True)
-        rounds = state.get("rounds", {})
-        payload = {
-            "rounds": {k: _mirror_round_rec(v) for k, v in rounds.items()}
-                      if isinstance(rounds, dict) else {},
-            "discovery": state.get("discovery", {"capability": 0, "perspective": 0, "knowledge": 0}),
-        }
-        p = os.path.join(d, "state.json")
-        tmp = p + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False, indent=2))
-        os.replace(tmp, p)
-    except Exception:
+        tmp = mp + ".tmp"
+        open(tmp, "w", encoding="utf-8").write(json.dumps(out, ensure_ascii=False, indent=2))
+        os.replace(tmp, mp)
+    except Exception:                    # noqa: BLE001 — 미러 실패가 RSI 판정을 죽이지 않는다
         pass
 
 
@@ -251,6 +335,39 @@ def _save_state(state):
     open(tmp, "w", encoding="utf-8").write(json.dumps(state, ensure_ascii=False, indent=2))
     os.replace(tmp, p)
     _mirror_learn_state(state)  # CC 학습 탭 배선(B-10)
+
+
+def _latch_ceiling_recommended(rid, key):
+    """추천 래치 **두 필드만** 최신 상태 위에 얹는다(보조 저장) → 성공 여부.
+
+    ★성찰 R4 N7(major): 종전엔 이 자리에서 `_save_state(state)` 로 **함수 진입 때 읽은 상태 전체**
+      를 다시 썼다. A 가 progress 로 H1 을 읽고 → 그 사이 B 가 H2 checkpoint 를 성공시켜 저장 →
+      A 가 래치 두 필드를 세우려고 H1 전체를 재저장하면 `checkpoint_sha`·`ref`·attempts 가 H1 로
+      **후퇴한다**. rollback 앵커가 잘못된 커밋을 가리키는 것은 되돌리기 사고 방향이다(§7 위험 ③).
+      다른 rid·새 progress·`budget_unknown` 도 함께 잃었다(codex 설계 비평 3).
+    ★순서는 그대로 둔다(codex 설계 비평 3): 주 저장 → 주 ledger → 추천/보조 ledger → **이 래치**.
+      재읽기를 주 저장 앞으로 옮기면 메모리에만 있던 progress 가 단독 실행에서도 빠진다.
+    ★판독 실패면 **쓰지 않는다**(codex 설계 비평 4): `_read_state_file` 의 사유를 버리고 빈 상태로
+      접어 저장하면 그것이 새 전손 경로다. 래치는 편의(캐시)이고 내구 근거는 큐와 ledger 다.
+    ★어떤 실패도 예외로 올리지 않는다(N14): 보조 저장의 ENOSPC 가 주 평가의 rc 를 바꾸면
+      `javis_learn.py` 가 끝난 평가를 fail(12)(일시 실패)로 올려 재시도로 되돌린다."""
+    try:
+        cur, unreadable = _read_state_file()
+        if unreadable:
+            print("[rsi] 주의: 상태 판독 실패로 ceiling 래치를 남기지 못했다(%s) — 추천은 이미 "
+                  "나갔고 큐·ledger 가 중복을 막는다." % unreadable, file=sys.stderr)
+            return False
+        r = cur.get("rounds", {}).get(rid)
+        if not isinstance(r, dict):
+            return False                 # 그 라운드가 최신 상태에 없다 — 얹을 자리가 없다
+        r["ceiling_recommended"] = True
+        r["ceiling_recommended_key"] = key
+        _save_state(cur)
+        return True
+    except Exception as e:               # noqa: BLE001 — 보조 저장은 주 평가의 rc 를 바꾸지 않는다
+        print("[rsi] 주의: ceiling 래치 저장 실패(%s) — 큐·ledger 가 중복을 막는다." % e,
+              file=sys.stderr)
+        return False
 
 
 def _append_ledger(entry):
@@ -329,11 +446,16 @@ def _ledger_attempt_count(rid):
 
 def _next_attempt(state, rid):
     """이번 호출의 시도 번호 — max(state, ledger) + 1(양쪽 되돌리기 방어).
-    반환 (시도번호, 직전 라운드 레코드, 손상 줄 수, ledger 판독 불가 사유)."""
+    반환 (시도번호, 직전 라운드 레코드, 손상 줄 수, ledger 판독 불가 사유, 저장값 해석 불가?).
+
+    ★성찰 R4 N14: 저장된 `attempts` 가 **해석 불가**(비유한 수·문자열)면 ledger 계수만으로 세되
+      그 사실을 다섯째 값으로 올린다 — 호출부가 `budget_unknown` 을 세운다. 종전엔 그 값이
+      예외(OverflowError)로 터지거나 조용히 0 으로 접혀 예산이 되돌려졌다."""
     prev = state.get("rounds", {}).get(rid)
     prev = prev if isinstance(prev, dict) else {}
     led, damaged, unreadable = _ledger_attempt_count(rid)
-    return max(_as_int(prev.get("attempts"), 0), led) + 1, prev, damaged, unreadable
+    stored, ok = _as_int_ok(prev.get("attempts"), 0)
+    return max(stored, led) + 1, prev, damaged, unreadable, (not ok)
 
 
 # ── RSI 학습 자율추천의 배달 채널: feed(건별 승인 요청) → 주간 다이제스트 큐 ──
@@ -344,15 +466,37 @@ def _next_attempt(state, rid):
 #   코드를 정본에 맞춘 정합 수정이다(§3 도 같은 날 함께 개정).
 # ★큐 경로·레코드 모양은 javis_orchestra.py 의 동명 함수와 **동형**이어야 한다(같은 큐에 쓴다).
 #   패리티는 bin/tests/test_learn_digest_queue.py 가 기계 검증한다.
-#   경로 해소는 이 모듈의 기존 규약 `_learn_state_dir()` 을 그대로 쓴다 — 생산 형상에서는
-#   `<팩>/round/learn` 으로 orchestra 와 같고, `CYS_ROUND_DIR` 이 설정된 데몬 미러 형상에서만
-#   그 값을 따른다(이 모듈이 원래 갖고 있던 오버라이드 — 새로 만든 갈래가 아니다).
+# ★성찰 R4 N10 — 경로 해소를 `_learn_state_dir()`(= `CYS_ROUND_DIR/learn` 우선)에서 **팩 고정**으로
+#   되돌린다. 종전 주석은 "생산 형상에서는 orchestra 와 같다" 고 단언했지만 사실이 아니었다:
+#     · 상시 잡이 `CYS_ROUND_DIR="${CYS_ROUND_DIR:-$HOME/.cys/state}"` 를 박는 형상이 **생산**이다.
+#       그때 orchestra 는 `<팩>/round/learn/…` 에 적재하고 rsi 는 `<CYS_ROUND_DIR>/learn/…` 를 본다
+#       → RSI ceiling 추천이 **아무도 읽지 않는 파일**에 쌓이고, 멱등 조회(`digest_queue_has_key`)도
+#       그 파일만 봐서 같은 사유가 두 큐에 따로 쌓인다.
+#     · `_learn_state_dir()` 은 팩 env 를 `CYS_PACK_DIR` **한 키만** 본다 — 레거시 env 기계
+#       (`AITERM_PACK_DIR` 등)에서는 `CYS_ROUND_DIR` 이 없어도 두 모듈이 갈렸다(S19 계열).
+#   그래서 큐 경로는 orchestra 와 **같은 규칙**(`pack_dir()` = `PACK_DIR_ENV_KEYS` 4키)으로 고정한다.
+#   데몬 미러(`_mirror_learn_state`)는 여전히 `_learn_state_dir()` 이다 — 그쪽은 데몬이 읽는 자리이고
+#   이 큐와 목적이 다르다.
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
+def pack_dir():
+    """팩 경로 — 키 목록·순서는 `PACK_DIR_ENV_KEYS`(정본 `src/pack.rs` · 파리티는
+    `bin/tests/test_todo_shared_constants.py` S19 가 기계 대조한다)."""
+    for key in PACK_DIR_ENV_KEYS:
+        v = os.environ.get(key, "")
+        if v:
+            return v
+    return os.path.join(os.path.expanduser("~"), ".cys/pack")
+
+
 LEARN_DIGEST_QUEUE = "digest_queue.jsonl"
 
 
 def learn_digest_queue_path():
-    """주간 다이제스트 큐 파일 — `<팩>/round/learn/digest_queue.jsonl`."""
-    return os.path.join(_learn_state_dir(), LEARN_DIGEST_QUEUE)
+    """주간 다이제스트 큐 파일 — `<팩>/round/learn/digest_queue.jsonl`(레인별 유일).
+    ★`javis_orchestra.learn_digest_queue_path` 와 **같은 규칙**이어야 한다(같은 큐다 · N10)."""
+    return os.path.join(pack_dir(), "round", "learn", LEARN_DIGEST_QUEUE)
 
 
 def rsi_project_identity():
@@ -836,7 +980,7 @@ def cmd_checkpoint(a):
     # ★WP-6: 재checkpoint 는 라운드 레코드를 새로 쓰지만 **시도 이력은 이월한다**.
     #   (종전엔 통째 덮어쓰기라 같은 라운드를 다시 시작하면 상한이 리셋됐다 —
     #    ceiling 신호(flat_streak)도 같은 이유로 이월한다: 재시작이 정체를 지우면 안 된다.)
-    attempts, prev, damaged, unreadable = _next_attempt(state, a.round)
+    attempts, prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
     flat = _as_int(prev.get("flat_streak"), 0)
     stop_reason = rsi_stop_reason(attempts, flat, rsi_max_rounds(), rsi_ceiling_flats())
     rec = {
@@ -848,7 +992,9 @@ def cmd_checkpoint(a):
     }
     if prev.get("ceiling_recommended_key"):
         rec["ceiling_recommended_key"] = prev["ceiling_recommended_key"]
-    if damaged or unreadable or state_unreadable:
+    if damaged or unreadable or state_unreadable or budget_bad:
+        # ★N14: `budget_bad` = 저장된 `attempts` 를 **읽었는데 쓸 수 없었다**(비유한 수 등).
+        #   그것을 0 으로 접으면 예산이 조용히 되돌아가므로 불확정으로 표기한다.
         rec["budget_unknown"] = True      # 영속 state 에도 싣는다(다음 호출이 이어 읽는다)
     state.setdefault("rounds", {})[a.round] = rec
     state["current_round"] = a.round
@@ -857,14 +1003,14 @@ def cmd_checkpoint(a):
              "score": a.score, "ts": ts, "ref": ref,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
-    _mark_unknown(entry, damaged, unreadable, state_unreadable)
+    _mark_unknown(entry, damaged, unreadable, state_unreadable, budget_bad)
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
     _warn_stop(stop_reason, a.round, attempts, damaged, unreadable, state_unreadable)
     return 0
 
 
-def _mark_unknown(entry, damaged, unreadable="", state_unreadable=""):
+def _mark_unknown(entry, damaged, unreadable="", state_unreadable="", budget_bad=False):
     """예산 불확정 표기를 stdout JSON 레코드에 싣는다 — **기존 어휘 재사용**(소비자 개정 0).
 
     `budget_unknown` 은 이미 손상 줄 1개에 붙던 표기다(§8-1 M5). 전면 판독 불가(권한·I/O)와
@@ -876,6 +1022,10 @@ def _mark_unknown(entry, damaged, unreadable="", state_unreadable=""):
         entry["ledger_unreadable"], entry["budget_unknown"] = unreadable, True
     if state_unreadable:
         entry["state_unreadable"], entry["budget_unknown"] = state_unreadable, True
+    if budget_bad:
+        # ★성찰 R4 N14 — 저장된 `attempts` 를 읽었는데 쓸 수 없었다(비유한 수·문자열). 종전엔
+        #   `int(inf)` 가 OverflowError 로 명령 전체를 죽였다. 이제 사유를 남기고 계속 간다.
+        entry["state_attempts_unusable"], entry["budget_unknown"] = True, True
     return entry
 
 
@@ -937,18 +1087,18 @@ def cmd_progress(a):
     r["flat_streak"] = (_as_int(r.get("flat_streak"), 0) + 1) if v == "flat" else 0
     # ★WP-6: progress 도 **평가 시도**다(점수가 들어온 기록) — checkpoint 만 세면 상한이
     #   무력하다(javis_learn 정상 호출은 checkpoint 1회 + progress 반복).
-    attempts, _prev, damaged, unreadable = _next_attempt(state, a.round)
+    attempts, _prev, damaged, unreadable, budget_bad = _next_attempt(state, a.round)
     r["attempts"] = attempts
     stop_reason = rsi_stop_reason(attempts, r["flat_streak"], rsi_max_rounds(),
                                   rsi_ceiling_flats())
     r["stop_reason"] = stop_reason
-    if damaged or unreadable or state_unreadable:
-        r["budget_unknown"] = True
+    if damaged or unreadable or state_unreadable or budget_bad:
+        r["budget_unknown"] = True        # ★N14 — 해석 불가한 저장 예산도 불확정이다
     _save_state(state)
     entry = {"event": "progress", "round": a.round, **rec,
              "attempts": attempts, "max_rounds": rsi_max_rounds(),
              "stop_reason": stop_reason}
-    _mark_unknown(entry, damaged, unreadable, state_unreadable)
+    _mark_unknown(entry, damaged, unreadable, state_unreadable, budget_bad)
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
     _warn_stop(stop_reason, a.round, attempts, damaged, unreadable, state_unreadable)
@@ -982,15 +1132,18 @@ def cmd_progress(a):
                     print("[rsi] 주의: ceiling 추천의 ledger 래치를 메우지 못했다 — 추천은 이미 "
                           "나갔고(큐 또는 state), 다음 호출이 다시 시도한다.", file=sys.stderr)
             if not latched and (in_queue or in_ledger):
-                r["ceiling_recommended"] = True   # 이미 추천됨(다른 경로에서) — 래치 복원
-                r["ceiling_recommended_key"] = key
-                _save_state(state)
+                # 이미 추천됨(다른 경로에서) — 래치 복원. ★N7: 여기서 `state` 전체를 다시 쓰면
+                #   그 사이 남이 저장한 checkpoint 가 후퇴한다. 두 필드만 최신 상태에 얹는다.
+                if _latch_ceiling_recommended(a.round, key):
+                    r["ceiling_recommended"] = True
+                    r["ceiling_recommended_key"] = key
         elif _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round, key):
             if _safe_append_ledger({"event": "ceiling_recommend", "round": a.round,
                                     "key": key, "ts": time.time()}):
-                r["ceiling_recommended"] = True
-                r["ceiling_recommended_key"] = key
-                _save_state(state)
+                # ★N7: 두 필드만 최신 상태에 얹는다(전체 재저장 금지 — 위 헬퍼 주석 참조).
+                if _latch_ceiling_recommended(a.round, key):
+                    r["ceiling_recommended"] = True
+                    r["ceiling_recommended_key"] = key
     return 0
 
 
