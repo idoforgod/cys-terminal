@@ -4442,6 +4442,40 @@ fn queue_min_interval_secs() -> u64 {
         .unwrap_or(10)
 }
 
+/// ★(0.14.31 · 성찰 Q11) 축소된 최소 간격의 **하한**(초). 0 으로는 내려가지 않는다 — 0 은
+/// 폭주 완충의 부재이고, 그것은 이 축이 존재하는 이유 자체를 지운다. 기본 간격이 이보다 작게
+/// 설정돼 있으면(운영자 노브) 그 값이 그대로 하한이다.
+pub(crate) const QUEUE_MIN_INTERVAL_FLOOR_SECS: u64 = 1;
+
+/// ★(0.14.31 · 성찰 Q11 · 택1 ⓑ) **머리 대기가 임계를 넘으면 배달 최소 간격을 단계적으로 줄인다.**
+///
+/// 【무엇이 틀렸었나】 좌석당 최소 간격 10초는 상수였고 병합은 "머리와 **연속 동일** 발신자" 만
+/// 묶는다(발신자 간 FIFO 보존 · R1-blocking-3). 그래서 발신자가 교차하는 백로그 N 건의 꼬리는
+/// 언제나 `10·(N−1)`초를 기다린다 — N=61 이면 610초로 §9 수용 기준 "10분 초과 0" 을 **구조적으로**
+/// 위반한다(N=7 이면 60초로 p90 기준선도 넘는다). 0.14.30 은 최대 12건/분이었고 지금은 6건/분이다.
+///
+/// 【무엇을 바꾸는가】 이미 있는 **overdue 축**(`queue_max_wait_secs` · 기본 120s)을 간격에도 적용해,
+/// 머리가 임계의 k 배만큼 기다렸으면 간격을 `base >> k` 로 접는다(하한
+/// [`QUEUE_MIN_INTERVAL_FLOOR_SECS`]). 기본값(10/120)에서: 0~119s → 10s · 120~239s → 5s ·
+/// 240~359s → 2s · 360s 이상 → 1s. 발신자 6명이 교차하는 60건 백로그의 꼬리는 610s → **286s**.
+///
+/// 【왜 이것이 폭주 완충을 지우지 않는가 — 방향】 축소를 이끄는 것은 큐 **깊이**가 아니라 머리의
+/// **나이**다. 폭주(짧은 시간에 다량 유입)의 머리는 **젊다** — 그 상황에서는 간격이 기본값 그대로다.
+/// 반대로 오래 굶은 큐는 정의상 폭주가 아니다. 즉 이 완화는 "많이 쌓였을 때" 가 아니라 "오래
+/// 기다렸을 때" 만 열린다(검체 `q11_a_flood_with_a_young_head_keeps_the_full_interval` 이 핀).
+/// 축소는 **간격**만 건드린다 — 승인·모달·초안·pause·프롬프트 경계 게이트는 하나도 면제되지
+/// 않는다(§8-3: 새 신호로 게이트를 면제하지 않는다).
+///
+/// `base == 0`(롤백 스위치) · `max_wait == 0`(단계형 비활성)이면 종전 그대로 반환한다.
+pub(crate) fn effective_min_interval_secs(base: u64, head_wait_secs: u64, max_wait: u64) -> u64 {
+    if base == 0 || max_wait == 0 || head_wait_secs < max_wait {
+        return base;
+    }
+    let steps = u32::try_from(head_wait_secs / max_wait).unwrap_or(u32::MAX);
+    let shrunk = base.checked_shr(steps).unwrap_or(0);
+    shrunk.max(QUEUE_MIN_INTERVAL_FLOOR_SECS.min(base))
+}
+
 /// ★(0.14.31 · WP-5 M) 만료 큐(`Surface::expired_queue`) 상한 — 초과분은 가장 오래된 것부터
 /// 원장 묘비(`expired_evicted`) 기록 후 폐기한다(기록 실패 시 폐기하지 않는다).
 pub(crate) const QUEUE_EXPIRED_CAP: usize = 100;
@@ -5742,7 +5776,8 @@ pub(crate) fn deliver_head_locked(
 ) -> Option<Delivered> {
     let now = now_epoch();
     let default_ttl = crate::state::queue_ttl_default_secs();
-    let min_interval = queue_min_interval_secs();
+    let base_min_interval = queue_min_interval_secs();
+    let interval_max_wait = queue_max_wait_secs();
     // 배달 시점에 만료로 판정된 머리 — 락 밖에서 만료 큐 이동·통지 처리.
     let mut expired_head: Option<crate::state::QueueEntry> = None;
     // (영수증 재료) 선기록 시각 · 본문 sha · 발신 surface — try_send 성공 뒤 락 밖에서 기록.
@@ -5778,6 +5813,14 @@ pub(crate) fn deliver_head_locked(
         //   까지다(codex R6 ⓑ). 즉 수십 µs 가 아니라 최악 수백 ms 이고, 그 구간에 걸린 틱은 다음
         //   틱(≈1s)에 재시도한다 — 영구 보류가 아니며 `queue.starved`(머리 나이)가 만성 상태를
         //   드러낸다. 프레임 **불변**을 요구하지 않는 이유는 종전과 같다(연속 출력 노드의 기아 #1).
+        // ★(0.14.31 · 성찰 Q11) 간격은 상수가 아니라 **머리 나이의 함수**다(호출부 선판정과 같은
+        //   산식 · 권위는 여기). 머리는 여기서 훔쳐보기만 한다(제거는 결판 뒤 · 유실 창 봉인).
+        let head_wait_for_interval = q
+            .front()
+            .map(|e| queue_head_wait_secs(now, e.enqueued_at, daemon.started_at, s.created_at))
+            .unwrap_or(0);
+        let min_interval =
+            effective_min_interval_secs(base_min_interval, head_wait_for_interval, interval_max_wait);
         if min_interval > 0 {
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
                 if t.elapsed().as_secs() < min_interval {
@@ -7791,7 +7834,7 @@ fn deliver_queued(
     let quiet = queue_quiet_secs();
     let max_wait = queue_max_wait_secs();
     let overdue_quiet = queue_overdue_quiet_secs();
-    let min_interval = queue_min_interval_secs();
+    let base_min_interval = queue_min_interval_secs();
     // ★B1(0.14.30): 어댑터 정의는 **틱당 1회**만 읽는다(좌석마다 읽으면 같은 틱 안에서 판정이
     //   갈린다 — check_approvals 의 env 1회 로드 규약과 동형). 큐가 전부 비면 아래 루프가
     //   먼저 continue 하므로 평시 비용은 0 이다(지연 로드).
@@ -7879,6 +7922,9 @@ fn deliver_queued(
         }
         // ★(0.14.31 · WP-5) surface 당 배달 최소 간격 — 프롬프트 관측보다 **앞**(직전 배달의 에코·
         //   처리 화면을 초안·바쁨으로 오라벨하지 않는다). 선판정은 사유 라벨용 · 권위는 임계영역.
+        // ★(0.14.31 · 성찰 Q11) 선판정도 **같은 산식**을 쓴다 — 라벨과 권위가 갈리면 운영자가
+        //   보는 사유(`delivery_interval`)와 실제 보류 조건이 어긋난다.
+        let min_interval = effective_min_interval_secs(base_min_interval, head_wait, max_wait);
         if min_interval > 0 {
             let recent = s
                 .last_queue_delivery_at
@@ -17965,6 +18011,89 @@ mod reflect_queue_tests {
             .min()
             .unwrap();
         assert_eq!(min_idx, 200, "활성 그룹에서 가장 오래된 200행이 아니라 다른 것이 축출됐다");
+    }
+
+    /// ★(0.14.31 · 성찰 Q11) **머리가 임계를 넘게 기다렸으면 배달 최소 간격이 단계적으로 줄어든다.**
+    ///
+    /// 진리표(기본 10/120): 0~119s → 10 · 120~239s → 5 · 240~359s → 2 · 360~479s → 1 ·
+    /// 480s 이상 → 1(하한). 롤백 스위치(`base=0`)와 단계형 비활성(`max_wait=0`)은 종전 그대로.
+    #[test]
+    fn q11_interval_shrinks_stepwise_once_the_head_is_overdue() {
+        for (head_wait, want) in
+            [(0, 10), (119, 10), (120, 5), (239, 5), (240, 2), (359, 2), (360, 1), (10_000, 1)]
+        {
+            assert_eq!(
+                effective_min_interval_secs(10, head_wait, 120),
+                want,
+                "머리 대기 {head_wait}s 의 유효 간격이 {want}s 가 아니다"
+            );
+        }
+        // 롤백 스위치·단계형 비활성 — 축이 통째로 종전 거동이다.
+        assert_eq!(effective_min_interval_secs(0, 10_000, 120), 0, "base=0 롤백이 깨졌다");
+        assert_eq!(effective_min_interval_secs(10, 10_000, 0), 10, "max_wait=0 비활성이 깨졌다");
+        // 하한은 base 보다 크지 않다(운영자가 간격을 1s 미만으로 둘 수는 없지만, base 가 하한보다
+        // 작게 설정된 경우에도 축소가 **늘리는 방향**으로 뒤집히지 않는다).
+        assert!(
+            effective_min_interval_secs(1, 10_000, 120) <= 1,
+            "축소가 간격을 늘렸다(방향 역전)"
+        );
+    }
+
+    /// ★(0.14.31 · 성찰 Q11) **폭주 완충은 지워지지 않는다 — 축소를 여는 것은 깊이가 아니라 나이다.**
+    ///
+    /// 짧은 시간에 다량이 들어온 큐(폭주)의 머리는 젊다. 그 상황에서 간격이 줄면 완화가 아니라
+    /// 완충의 제거이고, 그것이 §7 봉인표 ①(폭주)이 막는 바로 그 방향이다. 이 검체는 "깊이 1,000
+    /// 인데 머리가 5초" 에서 간격이 기본값 그대로임을 고정한다 — 깊이는 산식의 입력이 아니다.
+    #[test]
+    fn q11_a_flood_with_a_young_head_keeps_the_full_interval() {
+        for head_wait in [0, 1, 5, 60, 119] {
+            assert_eq!(
+                effective_min_interval_secs(10, head_wait, 120),
+                10,
+                "머리가 젊은데(대기 {head_wait}s) 간격이 줄었다 — 폭주 완충이 열렸다"
+            );
+        }
+    }
+
+    /// ★(0.14.31 · 성찰 Q11) **발신자가 교차하는 백로그의 꼬리가 10분 안에 드레인된다**(가상 시계).
+    ///
+    /// 병합은 "머리와 **연속 동일** 발신자" 만 묶으므로(발신자 간 FIFO 보존 · R1-blocking-3),
+    /// 6명이 교차하는 백로그는 1건씩 나간다. 상수 간격 10초에서 꼬리는 `10·(N−1)` 초다 —
+    /// N=61 이면 610초로 §9 수용 기준 "10분 초과 0" 을 **구조적으로** 위반한다. 아래 음성 대조군
+    /// (`max_wait=0` = 축소 비활성 = 구 정책)이 그 610 을 그대로 재현하고, 같은 백로그가 새
+    /// 정책에서 10분 안에 끝나는 것을 함께 잰다.
+    #[test]
+    fn q11_cross_sender_backlog_drains_within_the_ten_minute_bound() {
+        /// 1초 해상도 가상 시계 드레인 — 전 항목이 t=0 에 enqueue 됐고 발신자가 교차해
+        /// 병합이 0 건인 최악 형상. 반환 = 마지막 항목의 배달 시각(초).
+        fn drain_tail_secs(n: usize, base: u64, max_wait: u64) -> u64 {
+            let mut t: u64 = 0;
+            let mut last: Option<u64> = None;
+            let mut delivered = 0usize;
+            loop {
+                let iv = effective_min_interval_secs(base, t, max_wait);
+                if last.is_none_or(|l| t - l >= iv) {
+                    delivered += 1;
+                    last = Some(t);
+                    if delivered == n {
+                        return t;
+                    }
+                }
+                t += 1;
+            }
+        }
+        // 음성 대조군 — 구 정책(축소 비활성)은 §9 "10분 초과 0" 을 위반한다.
+        assert_eq!(drain_tail_secs(61, 10, 0), 600, "구 정책 재현이 어긋났다(계측기 확인)");
+        // 새 정책 — 같은 백로그가 10분 안에 끝난다.
+        let tail = drain_tail_secs(61, 10, 120);
+        assert!(tail < 600, "꼬리 대기가 여전히 10분을 넘는다: {tail}s");
+        // 정본 §9 검체 문면 그대로(60건)도 함께 고정한다.
+        let tail60 = drain_tail_secs(60, 10, 120);
+        assert!(tail60 < 600, "60건 백로그의 꼬리가 10분을 넘는다: {tail60}s");
+        assert!(
+            tail60 < drain_tail_secs(60, 10, 0),
+            "새 정책이 구 정책보다 느리다(방향 역전)"
+        );
     }
 
     /// ★(0.14.31 · 성찰 Q14) **노브 롤아웃 문면이 실제 기본값과 같은가.**
