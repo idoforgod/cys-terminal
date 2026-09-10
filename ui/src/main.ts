@@ -7,7 +7,18 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
 import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
-import { destinationLooksAwake, pickLaunchedAgentSid, transferTrees, type SurfaceRow } from "./transfer";
+import {
+  handoffAckPath,
+  handoffInstruction,
+  originCloseVerdict,
+  parseEnqueueReceipt,
+  pickLaunchedAgentSid,
+  transferRetryAction,
+  transferTrees,
+  type CloseVerdict,
+  type SurfaceRow,
+  type TransferRecord,
+} from "./transfer";
 import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -2734,6 +2745,32 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     toast("watchdog", "전출 불가", "pane 상태를 확인할 수 없습니다(RPC 실패) — 원본은 그대로입니다");
     return;
   }
+  // ★(0.14.31 · 성찰 C2 · blocking) 같은 원본의 **재시도는 관측만 재개한다.** 종전에는 재시도마다 새
+  //   런처 셸 + `launch-agent`(멱등키 히트 → 목적지 확정 실패 → 셸 보존) 로 pane 이 하나씩 늘었고,
+  //   120s 뒤에는 `claim_denied` 로 영구 불능이었다. 인계가 이미 적재된 원본은 인수 확인만 다시 기다린다
+  //   (기동 0 · 적재 0 · 문서 0). 계획은 순수 함수(`transferRetryAction`)가 낸다.
+  const recKey = paneKey(sid, srcSock);
+  const prior = transfersInFlight.get(recKey);
+  switch (transferRetryAction(prior, destWs.socket)) {
+    case "busy":
+      toast("watchdog", "전출 진행 중", "이 pane 의 전출이 아직 진행 중입니다 — 중복 실행하지 않습니다");
+      return;
+    case "other-destination":
+      toast(
+        "watchdog",
+        "전출 불가",
+        `이 pane 은 앞선 전출이 다른 부서(surface:${prior?.destSid})에서 인수 확인 대기 중입니다 — 그쪽을 먼저 확인한 뒤 원본을 닫거나, 같은 부서로 다시 전출해 인수 확인을 재개하세요`,
+      );
+      return;
+    case "resume":
+      if (prior) {
+        await awaitHandoffAck(sid, srcWs, destWs, { ...prior, state: "in-progress" }, recKey);
+        return;
+      }
+      break;
+    case "fresh":
+      break;
+  }
   const isAgent = !!(me.role || me.agent);
   const cwd = me.live_cwd ?? null;
   // 부서 노드는 cwd가 "/"(루트)로 뜨는 경우가 실측됨 — 루트류(/·드라이브 루트)·미확보 cwd는
@@ -2766,6 +2803,22 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     "전출",
   );
   if (!ok) return;
+  // 전출 기록 — 진행 중 표식(중복 클릭 차단). 인계 적재 전에 끝나면 지운다(재시도 = 새 전출).
+  let reachedAwait = false;
+  if (isAgent) {
+    transfersInFlight.set(recKey, {
+      state: "in-progress",
+      destSocket: destWs.socket,
+      destSid: -1,
+      launcherSid: null,
+      handoffPath: "",
+      role: srcRole,
+      wantAgent,
+      entryId: null,
+      durable: null,
+      sinceMs: Date.now(),
+    });
+  }
   try {
     let handoffPath: string | null = null;
     if (isAgent) {
@@ -2875,80 +2928,45 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
             "전출 목적지 좌석을 확정하지 못했습니다(기동 실패·역할 미등록·같은 역할 좌석 다중)",
           );
         }
-        await invoke("send_input", {
-          socket: destWs.socket,
-          surfaceId: agentSid,
-          data: `너는 전출된 ${srcRole} 다. ${handoffPath} 를 읽고 작업을 이어가라.`,
-          queued: true,
-          // queued 는 배달자(Origin::Queue)가 별도로 기록하지만, 표식을 붙여 두면 경로가 바뀌어도
-          // "UI 가 만든 문안"이라는 사실이 유지된다(누락 재발 방지 규칙: UI 조립 = 표식).
-          machineOrigin: true,
-        });
+        // ★(성찰 C1) 큐 적재는 **정확히 한 번**이고, 데몬 응답(`queue_entry_id`·`durable`)을
+        //   영수증으로 읽는다(tauri `send_input` 이 응답을 그대로 돌려준다). 지시문은 수신자
+        //   인수 확인 파일 쓰기를 요구한다(`handoffInstruction` — 원본 종료의 유일한 신호).
+        const receipt = parseEnqueueReceipt(
+          await invoke("send_input", {
+            socket: destWs.socket,
+            surfaceId: agentSid,
+            data: handoffInstruction(srcRole, handoffPath!),
+            queued: true,
+            // queued 는 배달자(Origin::Queue)가 별도로 기록하지만, 표식을 붙여 두면 경로가 바뀌어도
+            // "UI 가 만든 문안"이라는 사실이 유지된다(누락 재발 방지 규칙: UI 조립 = 표식).
+            machineOrigin: true,
+          }),
+        );
         // ★(R2 · codex blocking) **런처 셸을 닫지 않는다.** `close_surface` 는 그 셸의 자손을
         //   전부 kill 하는데(governance), 그 자손에는 아직 돌고 있을 수 있는 `cys launch-agent`
         //   가 있다 — 그것을 기동 도중에 죽이면 **지침이 주입되지 않은 역할 좌석**이 남는다
         //   (치명위험 ③). 데몬은 "그 명령이 끝났는가"를 UI 에 말해 주지 않으므로, 우리가 알 수
         //   없는 것을 근거로 죽이지 않는다. 셸 하나가 남는 대가는 사람이 1초에 닫을 수 있다.
-        stickyToast("transfer", "feed", "전출 진행 중", "목적지 각성 확인 대기…");
-        // ★그리고 **각성 래치**가 설 때까지 기다린 뒤에만 원본을 닫는다: 프로세스가 살아 있어도
-        //   신뢰 관문에 앉아 있으면 인계를 아무도 읽지 않는다(생존 관측 ≠ 인계 수신 가능).
-        const awakeBy = Date.now() + 90_000;
-        let awake = false;
-        while (Date.now() < awakeBy) {
-          const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
-            surfaces: SurfaceRow[];
-          } | null;
-          if (
-            destinationLooksAwake(
-              rr?.surfaces?.find((x) => x.surface_id === agentSid),
-              srcRole,
-              wantAgent,
-            )
-          ) {
-            awake = true;
-            break;
-          }
-          await new Promise((res) => setTimeout(res, 3000));
-        }
-        if (!awake) {
-          // 목적지는 살아 있고 인계도 적재됐지만 **각성 증거가 없다** — 원본은 그대로 둔다.
-          // (살아있는 타 노드 종료는 승인 경계이므로 목적지도 닫지 않는다.)
-          toast(
-            "watchdog",
-            "전출 보류",
-            `목적지 surface:${agentSid} 가 아직 각성을 신고하지 않았습니다(90초) — 인계는 적재됐고 원본 pane 은 보존했습니다. 목적지를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${newSid} 도 남아 있습니다.`,
-          );
-          dismissToast("transfer");
-          render();
-          return;
-        }
+        // ⑤ 인계가 적재됐다 — 여기서부터는 **전출 기록**이 진실이다(재시도 = 관측 재개).
+        const rec: TransferRecord = {
+          state: "in-progress",
+          destSocket: destWs.socket,
+          destSid: agentSid,
+          launcherSid: newSid,
+          handoffPath: handoffPath!,
+          role: srcRole,
+          wantAgent,
+          entryId: receipt.entryId,
+          durable: receipt.durable,
+          sinceMs: Date.now(),
+        };
+        transfersInFlight.set(recKey, rec);
+        reachedAwait = true;
+        render();
+        await awaitHandoffAck(sid, srcWs, destWs, rec, recKey);
+        return;
       }
-      // ⑤ 목적지 확정 + 인계 적재 + **각성 확인** 후에만 원본 정리
-      // ★(독립 재유도 · codex blocking #3) 닫기 **직전에** 선택 술어를 그대로 다시 본다.
-      //   각성 래치는 한 번 서면 내려가지 않는 과거 사실이라, 폴링이 참이 된 뒤 목적지가
-      //   죽거나 역할을 잃어도 종전 코드는 그대로 원본을 닫았다(좌석 사망 + 인계 유실).
-      //   이 재평가가 거짓이면 **닫지 않는다** — 실패 방향은 언제나 '전출 안 함'이다.
-      if (isAgent) {
-        const fin = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
-          surfaces: SurfaceRow[];
-        } | null;
-        if (
-          !destinationLooksAwake(
-            fin?.surfaces?.find((x) => x.surface_id === agentSid),
-            srcRole,
-            wantAgent,
-          )
-        ) {
-          toast(
-            "watchdog",
-            "전출 보류",
-            `목적지 surface:${agentSid} 가 종료 직전 재확인에서 인계 가능 상태가 아닙니다(사망·역할 상실·종료) — 인계는 적재됐고 원본 pane 은 보존했습니다. 목적지를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${newSid} 도 남아 있습니다.`,
-          );
-          dismissToast("transfer");
-          render();
-          return;
-        }
-      }
+      // 셸 pane: 인계할 맥락이 없다 — 같은 경로의 새 셸이 만들어졌으므로 원본을 정리한다.
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 보상 롤백: 런처 셸은 **기동 명령을 보내지 않았을 때만** 회수한다.
@@ -2978,18 +2996,103 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
     if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
     render();
-    toast(
-      "feed",
-      "부서 전출 완료",
-      agentSid == null
-        ? `→ ${destWs.name || UNTITLED} (surface:${newSid})`
-        : `→ ${destWs.name || UNTITLED} (surface:${agentSid}) · 런처 셸 surface:${newSid} 는 남아 있습니다(기동 완료 후 닫으세요)`,
-    );
+    toast("feed", "부서 전출 완료", `→ ${destWs.name || UNTITLED} (surface:${newSid})`);
   } catch (e) {
     toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);
   } finally {
+    // 인계 적재에 이르지 못한 전출은 기록을 남기지 않는다(다음 시도는 새 전출). 적재 뒤에는
+    // `awaitHandoffAck` 가 기록의 다음 상태(해제·인수 대기)를 소유한다.
+    if (!reachedAwait) transfersInFlight.delete(recKey);
     dismissToast("transfer");
   }
+}
+
+/** 같은 원본 pane 의 진행 중 전출 기록(키 = `paneKey(sid, socket)`). 재시도는 이것으로 관측만 재개한다. */
+const transfersInFlight = new Map<string, TransferRecord>();
+/** 수신자 인수 확인 대기 상한 — 새 좌석이 전문 디렉티브를 읽고 프롬프트로 돌아온 뒤 큐가 배달되고
+ *  에이전트가 인계 문서를 읽기까지의 시간(큐 대기 기본 상한 120s + 판독 여유). 넘기면 보류(원본 보존). */
+const TRANSFER_ACK_WAIT_SECS = 180;
+
+/** ★(0.14.31 · 성찰 C1·C2) 수신자 인수 확인 대기 → 원본 종료 결정. 실패 방향은 언제나 '원본 보존'이다.
+ *
+ * 종료 조건은 [`originCloseVerdict`] 하나다: 인수 확인 파일(`<handoff>.received`) 실존 ∧ 목적지 좌석이
+ * **지금** 수신 가능(역할 · 생존 관측 · 종류 · 미종료 — 닫기 직전 재평가). 각성 래치(`awakened_at`)는
+ * 보지 않는다(리뷰어는 구조적으로 못 낸다). 배달 이벤트도 보지 않는다(PTY writer 의 claim 이지
+ * 에이전트의 소비가 아니다 — codex 설계 검토).
+ *
+ * 보류는 **인계를 다시 적재하지 않는다**: 기록을 `awaiting-ack` 로 남겨 다음 시도가 관측만 재개한다.
+ * 목적지가 확정적으로 사라진 경우(종료 통지 · 좌석 소멸)에만 기록을 지운다 — 그때의 재시도는 새 전출이다.
+ * 생존 미관측(null)·RPC 실패는 '모름'이라 기록을 보존한다(살아 있는 좌석 옆에 새 좌석을 띄우지 않는다). */
+async function awaitHandoffAck(
+  sid: number,
+  srcWs: Workspace,
+  destWs: Workspace,
+  rec: TransferRecord,
+  recKey: string,
+) {
+  const srcSock = srcWs.socket;
+  const ackPath = handoffAckPath(rec.handoffPath);
+  transfersInFlight.set(recKey, { ...rec, state: "in-progress" });
+  stickyToast(
+    "transfer",
+    "feed",
+    "전출 진행 중",
+    `인계 적재됨(항목 ${rec.entryId ?? "?"}${rec.durable === false ? " · 내구 미확정" : ""}) · 목적지 surface:${rec.destSid} 의 인수 확인 대기(최대 ${TRANSFER_ACK_WAIT_SECS}초)…`,
+  );
+  let verdict: CloseVerdict = { close: false, hold: "not-acked", gone: false, note: "관측 전" };
+  try {
+    const deadline = Date.now() + TRANSFER_ACK_WAIT_SECS * 1000;
+    for (;;) {
+      const head = (await invoke("read_text_head", { path: ackPath }).catch(() => null)) as string | null;
+      const acked = !!head && head.trim().length > 0;
+      const rr = (await invoke("list_surfaces", { socket: destWs.socket }).catch(() => null)) as {
+        surfaces: SurfaceRow[];
+      } | null;
+      verdict = originCloseVerdict({
+        row: rr?.surfaces?.find((x) => x.surface_id === rec.destSid),
+        rowsObserved: rr != null,
+        wantRole: rec.role,
+        wantAgent: rec.wantAgent,
+        entryId: rec.entryId,
+        durable: rec.durable,
+        acked,
+      });
+      if (verdict.close) break;
+      if (verdict.hold === "destination" && verdict.gone) break;
+      if (Date.now() >= deadline) break;
+      await new Promise((res) => setTimeout(res, 3000));
+    }
+  } finally {
+    dismissToast("transfer");
+  }
+  if (verdict.close) {
+    // ⑥ 인수 확인 + 좌석 수신 가능 재확인 뒤에만 원본 정리. 기록은 여기서 끝난다.
+    await invoke("close_surface", { socket: srcSock, surfaceId: sid });
+    transfersInFlight.delete(recKey);
+    destroyPaneRuntime(sid, srcSock);
+    if (srcWs.tree) srcWs.tree = replaceNode(srcWs.tree, sid, () => null);
+    if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+    render();
+    toast(
+      "feed",
+      "부서 전출 완료",
+      `→ ${destWs.name || UNTITLED} (surface:${rec.destSid}) · 런처 셸 surface:${rec.launcherSid} 는 남아 있습니다(기동 완료 후 닫으세요)`,
+    );
+    return;
+  }
+  const gone = verdict.hold === "destination" && verdict.gone;
+  if (gone) transfersInFlight.delete(recKey);
+  else transfersInFlight.set(recKey, { ...rec, state: "awaiting-ack" });
+  render();
+  toast(
+    "watchdog",
+    "전출 보류",
+    `${verdict.note} — 인계는 적재됐고 원본 pane 은 보존했습니다(다시 적재하지 않습니다). ` +
+      (gone
+        ? "목적지가 사라졌으므로 같은 pane 을 다시 전출하면 새로 기동합니다. "
+        : "같은 부서로 다시 전출하면 인수 확인만 다시 기다립니다(기동·적재 0). ") +
+      `목적지 surface:${rec.destSid} 를 확인한 뒤 원본을 닫으세요. 런처 셸 surface:${rec.launcherSid} 도 남아 있습니다.`,
+  );
 }
 
 /// sid pane을 트리에서 떼어 target pane의 side 쪽에 분할 삽입한다.

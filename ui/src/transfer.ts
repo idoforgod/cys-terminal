@@ -113,16 +113,19 @@ export function pickLaunchedAgentSid(
  *
  * ★왜 생존 관측만으로 부족한가(codex 적대검증 R2 blocking): 프로세스가 살아 있어도 신뢰
  * 관문·인증 화면에 앉아 있을 수 있다. 그 상태에서 원본을 닫으면 인계는 아무도 읽지 않는다.
- * 래치는 "노드가 지침을 읽고 스스로 신고했다"는 데몬의 단방향 사실이다(status.set 이 유일
- * write path). 서지 않으면 **원본을 닫지 않는다** — 목적지는 살아 있으니 사람이 판단한다.
  *
- * ★그리고 래치는 **필요조건이지 충분조건이 아니다**(독립 재유도 · codex blocking #3):
- * `awakened_at` 은 한 번 서면 내려가지 않는 **과거 사실**인데, 원본 종료의 유일한 관문이
- * 그것 하나였다. 각성 뒤에 에이전트가 죽거나(`agent_alive=false` — 셸만 남아 `exited=false`)
- * 역할을 잃은 좌석도 그대로 통과해, 그 상태에서 원본을 닫으면 **좌석 사망 + 인계 유실**이다.
- * 그래서 종료 직전 이 술어가 선택 때 쓴 축을 다시 본다: 역할 보유(요구하면 동일 역할) ·
- * 생존 **관측**(3값을 `true` 로만 좁힌다) · 시킨 종류 · 미종료 · 래치. 모르면 거짓이다. */
-export function destinationLooksAwake(
+ * ★(0.14.31 · 성찰 C2 · blocking) 종전 이 술어는 `awakened_at`(각성 래치)을 **필수**로 요구했다.
+ * 그 래치의 유일한 write path 는 `status.set` 이고 그것은 LLM 이 `cys set-status` 를 실행할 때만
+ * 난다 — 훅에는 호출이 0건이고 `REVIEWER_DIRECTIVE` 는 그 줄의 실행을 **금지**하며 gemini/codex 는
+ * Claude Code 훅도 돌지 않는다. 즉 리뷰어 좌석은 **구조적으로** 각성을 신고할 수 없어 리뷰어 전출은
+ * 영구 보류였고, 재시도마다 런처 셸 pane 이 하나씩 늘었다. 그래서 이 술어는 이제 **좌석 축**만 본다
+ * (역할 보유 · 생존 관측 · 시킨 종류 · 미종료). "인계를 실제로 받았는가" 는 별도의 **수신자 인수
+ * 확인**([`originCloseVerdict`] 의 `acked` — 목적지 에이전트가 쓰는 `<handoff>.received` 파일)이
+ * 잰다. 각성과 인수는 다른 축이고, 인수 파일은 어떤 CLI 든 쓸 수 있다.
+ *
+ * `awakened_at` 은 행에 남아 있지만 이 술어는 읽지 않는다(null 은 여전히 '말할 것 없음'이다).
+ * 모르면 거짓이다. */
+export function destinationCanReceive(
   row: SurfaceRow | undefined,
   wantRole?: string,
   wantAgent?: string,
@@ -135,5 +138,158 @@ export function destinationLooksAwake(
   if (row.agent_alive !== true) return false;
   // 종류 축: 시킨 CLI 가 아직 그 좌석의 것인가(호출부가 요구할 때만).
   if (wantAgent != null && row.agent !== wantAgent) return false;
-  return row.awakened_at != null;
+  return true;
+}
+
+/** 목적지가 **확정적으로** 사라졌는가(종료 통지 · 좌석 소멸). `null` 생존은 여기서도 '모름'이다 —
+ *  모름은 보류 사유이지 소멸 사유가 아니다(소멸로 읽으면 살아 있는 좌석 옆에 새 좌석을 띄운다). */
+export function destinationGone(row: SurfaceRow | undefined, rowsObserved: boolean): boolean {
+  if (!rowsObserved) return false;
+  if (!row) return true;
+  return row.exited === true || row.agent_alive === false;
+}
+
+// ── ★(0.14.31 · 성찰 C1·C2) 인계 적재 영수증 · 인수 확인 · 원본 종료 결정 ─────────────────────
+//
+// 【C1 · blocking】 종전 GUI 는 `send_input(queued)` 의 데몬 응답을 **버렸다**(tauri 가 `()` 로 접었다).
+// 데몬은 그 응답에 `queue_entry_id` 와 `durable`(큐 WAL 치환 성공 여부)을 싣는다 — `durable:false` 는
+// "이 항목은 아직 메모리에만 있다(데몬이 죽으면 사라진다)" 는 뜻인데, GUI 는 그 사실을 모른 채 원본을
+// 닫았다. 목적지 데몬이 그 사이 죽으면 인계는 **복구 불가**로 유실된다.
+//
+// 【C2 · blocking】 원본 종료의 관문이 `awakened_at` 하나였다(위 `destinationCanReceive` doc).
+//
+// 【설계 · codex 설계 검토(2026-09-10) 반영】 처음 설계는 데몬의 `queue.delivered` 이벤트를 인수 사실로
+// 쓰려 했다. codex 가 지적한 대로 그것은 **PTY writer 의 claim**(첫 바이트 전에 claim · 쓰기 실패는
+// 루프만 종료)이지 에이전트의 소비 확인이 아니다(governance.rs 의 배달자 · state.rs 의 writer). 그래서
+// 종료 조건은 **수신자 자신의 인수 확인**으로 바꿨다: 큐로 보내는 지시문이 "읽었으면 `<handoff>.received`
+// 파일을 써라" 를 포함하고, GUI 는 그 파일의 실존(비어 있지 않음)을 관측한다. 원본 쪽 5필드 파일 검증과
+// 대칭인 결정론 신호이고, `cys set-status` 와 달리 어떤 CLI 든 쓸 수 있다(리뷰어 포함). 인계 문서 경로가
+// 전출마다 유일하므로 파일은 그 전출에 결속된다.
+//
+// 【실패 방향】 어느 갈래든 '원본 보존'이다. 인수 확인 없음 · 목적지 미수신 · 관측 실패 전부 보류.
+// 보류는 **인계를 다시 적재하지 않는다**(중복 enqueue 0) — 재시도는 [`transferRetryAction`] 이 같은
+// 원본의 전출 기록으로 **관측만** 재개한다(런처 셸·좌석·인계 문서를 다시 만들지 않는다 = pane 증식 0).
+
+/** 데몬 `surface.send_text`(queued) 응답에서 GUI 가 소비하는 두 사실. 결측은 값이 아니다(`null`). */
+export type EnqueueReceipt = {
+  /** 큐 항목 id — 이후 관측의 조준점. `null` = 데몬이 돌려주지 않았다(구 데몬 · 적재 미확인). */
+  entryId: string | null;
+  /** WAL 치환 성공 여부. `false` = 메모리에만 있다. `null` = 데몬이 이 축을 말하지 않는다. */
+  durable: boolean | null;
+};
+
+export function parseEnqueueReceipt(v: unknown): EnqueueReceipt {
+  if (!v || typeof v !== "object") return { entryId: null, durable: null };
+  const o = v as Record<string, unknown>;
+  const id = o.queue_entry_id;
+  const durable = o.durable;
+  return {
+    entryId: typeof id === "string" && id.length > 0 ? id : typeof id === "number" ? String(id) : null,
+    durable: typeof durable === "boolean" ? durable : null,
+  };
+}
+
+/** 수신자 인수 확인 파일 — 인계 문서 옆, 같은 이름 + `.received`. 전출마다 유일(문서 경로가 유일). */
+export function handoffAckPath(handoffPath: string): string {
+  return `${handoffPath}.received`;
+}
+
+/** 목적지 좌석에 큐로 보내는 지시문 — 인수 확인 파일 쓰기를 **요구**한다(이 파일이 원본 종료의 유일한
+ *  신호다). 문안은 여기 하나다(테스트가 인수 요구를 핀한다). */
+export function handoffInstruction(role: string, handoffPath: string): string {
+  const ack = handoffAckPath(handoffPath);
+  return (
+    `너는 전출된 ${role} 다. ${handoffPath} 를 읽고 작업을 이어가라. ` +
+    `읽었으면 가장 먼저 ${ack} 파일에 "received" 한 줄을 써서 인수를 알려라` +
+    `(이 파일이 원본 pane 을 닫아도 된다는 유일한 신호다 — 쓰지 않으면 원본은 보존된다).`
+  );
+}
+
+/** 원본 종료 결정의 재료 — 전부 **관측된 사실**이다(추정 없음). */
+export type HandoffFacts = {
+  /** 목적지 좌석 행(`surface.list`). 관측 실패면 `undefined` + `rowsObserved:false`. */
+  row: SurfaceRow | undefined;
+  /** `surface.list` 응답을 받았는가(행 부재와 관측 실패를 가른다). */
+  rowsObserved: boolean;
+  wantRole?: string;
+  wantAgent?: string;
+  entryId: string | null;
+  durable: boolean | null;
+  /** 수신자 인수 확인 파일이 존재하고 비어 있지 않다. */
+  acked: boolean;
+};
+
+export type CloseVerdict =
+  | { close: true }
+  | {
+      close: false;
+      /** `destination` = 좌석이 수신 가능 상태가 아니다 · `not-acked` = 인수 확인이 아직 없다. */
+      hold: "destination" | "not-acked";
+      /** 목적지가 확정적으로 사라졌다(전출 기록을 지워도 되는 유일한 경우). */
+      gone: boolean;
+      note: string;
+    };
+
+/** 원본을 **지금** 닫아도 되는가. 닫는 조건은 인수 확인 ∧ 좌석 수신 가능 — 둘 다 관측된 사실이다.
+ *
+ * `durable`·`entryId` 는 결정을 바꾸지 않고 **보류 사유에 실린다**: 인수 확인은 배달·내구보다 강한
+ * 사실(소비)이므로 인수가 있으면 `durable:false` 여도 닫는다. 인수가 없으면 `durable:false` 는 "인계가
+ * 데몬 재기동에 유실될 수 있다" 는 경고로, `entryId:null` 은 "적재 자체가 미확인" 으로 문안에 남는다. */
+export function originCloseVerdict(f: HandoffFacts): CloseVerdict {
+  if (!destinationCanReceive(f.row, f.wantRole, f.wantAgent)) {
+    const gone = destinationGone(f.row, f.rowsObserved);
+    const why = !f.rowsObserved
+      ? "목적지 좌석을 관측하지 못했다(RPC 실패)"
+      : !f.row
+        ? "목적지 좌석이 사라졌다"
+        : f.row.exited
+          ? "목적지 좌석이 종료됐다"
+          : f.row.agent_alive === false
+            ? "목적지 에이전트가 죽었다(셸만 남음)"
+            : f.row.agent_alive == null
+              ? "목적지 에이전트의 생존이 관측되지 않았다"
+              : !f.row.role || (f.wantRole != null && f.row.role !== f.wantRole)
+                ? "목적지 좌석이 역할을 잃었다"
+                : "목적지 좌석의 에이전트 종류가 시킨 것과 다르다";
+    return { close: false, hold: "destination", gone, note: why };
+  }
+  if (!f.acked) {
+    let note = "목적지가 인수 확인 파일을 아직 쓰지 않았다";
+    if (f.durable === false) note += " · 큐 항목이 디스크에 확정되지 않았다(durable:false — 데몬 재기동 시 유실 가능)";
+    if (f.entryId == null) note += " · 데몬이 큐 항목 id 를 돌려주지 않았다(구 데몬 — 적재 미확인)";
+    return { close: false, hold: "not-acked", gone: false, note };
+  }
+  return { close: true };
+}
+
+/** 같은 원본 pane 의 진행 중 전출 기록 — 재시도는 이것으로 **관측만** 재개한다. */
+export type TransferRecord = {
+  state: "in-progress" | "awaiting-ack";
+  /** 목적지 부서 socket(부서 식별). 기본 데몬은 `undefined`. */
+  destSocket: string | undefined;
+  /** 목적지 에이전트 좌석(런처 셸이 아니다). */
+  destSid: number;
+  /** 런처 셸(기동이 진행 중일 수 있어 남긴다). */
+  launcherSid: number | null;
+  handoffPath: string;
+  role: string;
+  wantAgent: string;
+  entryId: string | null;
+  durable: boolean | null;
+  sinceMs: number;
+};
+
+export type RetryAction = "fresh" | "busy" | "resume" | "other-destination";
+
+/** 재시도 계획(순수). `fresh` 만 새 좌석을 만든다 — 나머지는 pane 을 하나도 늘리지 않는다.
+ *  · `busy`: 같은 원본의 전출이 아직 진행 중이다(중복 클릭) → 무동작.
+ *  · `resume`: 인계는 이미 적재됐다 → 인수 확인 관측만 다시 한다(적재 0 · 기동 0).
+ *  · `other-destination`: 앞선 전출이 다른 부서에 인수 대기 중이다 → 그쪽을 먼저 매듭짓는다. */
+export function transferRetryAction(
+  rec: TransferRecord | undefined,
+  destSocket: string | undefined,
+): RetryAction {
+  if (!rec) return "fresh";
+  if (rec.state === "in-progress") return "busy";
+  return rec.destSocket === destSocket ? "resume" : "other-destination";
 }
