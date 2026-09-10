@@ -3057,9 +3057,13 @@ def self_test():
             fails.append("FALSE-POSITIVE(%s): role=%s %s %r" % (r, role, tool, ti))
 
     # ── ② CSO 픽스처 ───────────────────────────────────────────────────────
+    # 합성 홈 루트는 `/w/hm` 이다 — 세그먼트를 `home` 으로 되돌리지 말 것(0.14.32).
+    # `scripts/scan-pack-secrets.sh` 규칙 2(리눅스 실홈경로)의 정규식은 경로 경계에 고정돼
+    # 있지 않아, 앞에 다른 세그먼트가 붙어 있어도 그 안의 리눅스 홈 표기를 부분일치로 잡는다
+    # (0.14.31 발행 차단 71건 중 18건이 이 픽스처였다 — 실누출 아님).
     PACK = "/w/pack"
-    HOME = "/w/home"
-    STATE = "/w/home/.cys/state"
+    HOME = "/w/hm"
+    STATE = "/w/hm/.cys/state"
     FILES = {
         PACK + "/round/CSO_TODO.md": "x" * 60000,
         PACK + "/round/SESSION_STATE.md": "s",
@@ -3082,7 +3086,7 @@ def self_test():
         ("Write", {"file_path": PACK + "/bin/javis_cso_probe.py", "content": "#!/usr/bin/env python3"},
          "bin 도구 신설"),
         ("mcp__computer-use__screenshot", {}, "computer-use 스크린샷"),
-        ("Edit", {"file_path": "/w/home/.cys/pack-dept-1/round/CSO_TODO.md",
+        ("Edit", {"file_path": "/w/hm/.cys/pack-dept-1/round/CSO_TODO.md",
                   "old_string": "a", "new_string": "b"}, "타 레인 TODO 편집"),
     ]
     for tool, ti, label in cso_transcript_denies:
@@ -3156,7 +3160,7 @@ def self_test():
 
 def self_test_contracts(fails):
     """★배선·경계 계약(codex 적대 반례 반영) — 순수 판정기로 잴 수 있는 것만 여기서 잰다."""
-    PACK, HOME, STATE = "/w/pack", "/w/home", "/w/home/.cys/state"
+    PACK, HOME, STATE = "/w/pack", "/w/hm", "/w/hm/.cys/state"
     FILES = {
         PACK + "/round/CSO_TODO.md": "x" * 60000,
         PACK + "/round/SESSION_STATE.md": "ab" * 10,
@@ -3257,7 +3261,7 @@ def self_test_contracts(fails):
     # 게이트 제어 상태·상한 우회.
     want(True, "Write", {"file_path": STATE + "/capgate/abc.count", "content": "0"},
          "예산 카운터 직접 쓰기")
-    want(True, "Bash", {"command": "echo 0 > /w/home/.cys/state/capgate/abc.count"},
+    want(True, "Bash", {"command": "echo 0 > /w/hm/.cys/state/capgate/abc.count"},
          "예산 카운터 리다이렉트")
     # ★R2(blocking · codex): 역할 권위 캐시 — CSO 는 /tmp 를 쓸 수 있지만 이 디렉터리만은 아니다.
     want(True, "Write", {"file_path": "/tmp/cys-role-authority.d/role-3-default", "content": "x"},
@@ -3349,7 +3353,7 @@ def self_test_r1(fails):
 
     여기 있는 검체는 전부 "고친 검사를 지우면 실패하는" 것들이다(공허한 음성 대조 금지).
     """
-    PACK, HOME, STATE = "/w/pack", "/w/home", "/w/home/.cys/state"
+    PACK, HOME, STATE = "/w/pack", "/w/hm", "/w/hm/.cys/state"
     FILES = {
         PACK + "/round/CSO_TODO.md": "x" * 60000,
         PACK + "/round/SESSION_STATE.md": "s",
@@ -3459,7 +3463,7 @@ def self_test_r1(fails):
     # ⑦ 대소문자·링크 별칭(codex blocking)
     want(True, "Write", {"file_path": STATE + "/CAPGATE/abc.calls", "content": "0"},
          "대문자 CAPGATE 로 카운터 쓰기")
-    want(True, "Bash", {"command": "echo 0 > /w/home/.cys/state/CapGate/abc.calls"},
+    want(True, "Bash", {"command": "echo 0 > /w/hm/.cys/state/CapGate/abc.calls"},
          "대소문자 섞은 카운터 리다이렉트")
     want(True, "Write", {"file_path": PACK + "/round/cso_todo.md", "content": "z" * 100000},
          "소문자 상태 파일도 64KB 상한 대상")
@@ -3467,7 +3471,7 @@ def self_test_r1(fails):
     # ⑧ 데몬 소유 상태(원장·부트·미션)는 허용 뿌리 안이라도 쓰기 금지
     want(True, "Write", {"file_path": STATE + "/delivery-base.jsonl", "content": "{}"},
          "배달 원장 Write")
-    want(True, "Bash", {"command": "cat /w/x >> /w/home/.cys/state/boot-last.json"},
+    want(True, "Bash", {"command": "cat /w/x >> /w/hm/.cys/state/boot-last.json"},
          "부트 상태 append")
     want(True, "Edit", {"file_path": STATE + "/mission.json", "old_string": "a",
                         "new_string": "b"}, "mission.json Edit")
@@ -3560,7 +3564,7 @@ def self_test_r1(fails):
         # 변수 확장은 값을 모르면 효과를 모른다(`${IFS}` 는 단어를 쪼갠다).
         ("deny", "Bash", {"command": "cys send --queued --to master ${IFS}--surface${IFS}7 x"},
          "${IFS} 단어 분리로 만든 --surface"),
-        ("deny", "Bash", {"command": "cys status > /w/home/.cys/state/${IFS}mission.json"},
+        ("deny", "Bash", {"command": "cys status > /w/hm/.cys/state/${IFS}mission.json"},
          "${IFS} 로 보호 파일명 검사 우회"),
         ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py $'--f\\x69x'"},
          "ANSI-C 인용으로 감춘 --fix"),
@@ -3590,13 +3594,13 @@ def self_test_r1(fails):
          "정규화 뒤 설치 팩 밖"),
         ("deny", "Write", {"file_path": "/w/pack/round-shadow/CSO_TODO.md", "content": "x"},
          "round 의 형제 디렉터리"),
-        ("deny", "Write", {"file_path": "/w/home/.cys/state/cso/../MiSsIoN.json", "content": "{}"},
+        ("deny", "Write", {"file_path": "/w/hm/.cys/state/cso/../MiSsIoN.json", "content": "{}"},
          "점 경로 + 대소문자 별칭으로 mission 보호 이탈"),
-        ("deny", "Write", {"file_path": "/w/home/.cys/state/FoRmAtIoN/seat.json", "content": "{}"},
+        ("deny", "Write", {"file_path": "/w/hm/.cys/state/FoRmAtIoN/seat.json", "content": "{}"},
          "formation 대소문자 별칭"),
         ("deny", "Write", {"file_path": "/w/tmp/CYS-CAPGATE-role-seat-cache", "content": "0 master"},
          "대문자 역할 캐시 파일명"),
-        ("allow", "Write", {"file_path": "/w/home/.cys/state/cso/../cso/audit.md", "content": "x"},
+        ("allow", "Write", {"file_path": "/w/hm/.cys/state/cso/../cso/audit.md", "content": "x"},
          "정규화 뒤 자기 작업 영역"),
         # cys 인자 계약.
         ("deny", "Bash", {"command": "cys approval sign --prefix 'cys kill 77' --ttl 30"},
@@ -3642,7 +3646,7 @@ def self_test_r1(fails):
 
 def self_test_r2(fails):
     """★R2(리뷰 반영 2차) 반례 배터리 — 리뷰어 둘이 **실증**한 우회·오탐을 하나씩 고정한다."""
-    PACK, HOME, STATE = "/w/pack", "/w/home", "/w/home/.cys/state"
+    PACK, HOME, STATE = "/w/pack", "/w/hm", "/w/hm/.cys/state"
     FILES = {
         PACK + "/round/CSO_TODO.md": "x" * 60000,
         PACK + "/round/SESSION_STATE.md": "s",
@@ -3676,12 +3680,12 @@ def self_test_r2(fails):
          "인용 안 중괄호는 확장이 아니다")
 
     # ② 글롭(codex blocking — `deliver[y]-base.jsonl` 이 실존 원장으로 확장됐다)
-    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/deliver[y]-base.jsonl"},
+    want(True, "Bash", {"command": "cat /dev/null > /w/hm/.cys/state/deliver[y]-base.jsonl"},
          "글롭 `[` 로 원장 절단")
-    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/deliver?-base.jsonl"},
+    want(True, "Bash", {"command": "cat /dev/null > /w/hm/.cys/state/deliver?-base.jsonl"},
          "글롭 `?`")
-    want(True, "Bash", {"command": "cat /dev/null > /w/home/.cys/state/*.jsonl"}, "글롭 `*`")
-    want(False, "Bash", {"command": "rg --glob='*.json' pat /w/home/.cys/state"},
+    want(True, "Bash", {"command": "cat /dev/null > /w/hm/.cys/state/*.jsonl"}, "글롭 `*`")
+    want(False, "Bash", {"command": "rg --glob='*.json' pat /w/hm/.cys/state"},
          "인용된 글롭은 도구 자신의 문법이다")
     want(False, "Bash", {"command": "grep -rn pat ."}, "글롭 문자가 없는 재귀 검색")
     # ★글롭 검사만이 막는 자리(다른 검사가 대신 막으면 음성 대조가 공허해진다)
@@ -3708,7 +3712,7 @@ def self_test_r2(fails):
     want(False, "Bash", {"command": 'python3 "$CYS_PACK_DIR/bin/javis_orchestra.py" check'},
          "큰따옴표 안 확장은 한 인자다")
     # ★큰따옴표 안이라 확장 하자드는 통과하고 **토큰 해소**만이 막는 자리(R1 ${IFS} 의 인용판)
-    want(True, "Bash", {"command": 'cys status > "/w/home/.cys/state/${IFS}mission.json"'},
+    want(True, "Bash", {"command": 'cys status > "/w/hm/.cys/state/${IFS}mission.json"'},
          "인용 안 미지 변수는 값 미상")
     want(True, "Bash", {"command": 'cys send --queued --to master "${IFS}--surface 7"'},
          "인용 안 미지 변수 본문")
@@ -3760,7 +3764,7 @@ def self_test_r2(fails):
          "state 자기 작업 트리")
     want(False, "Write", {"file_path": STATE + "/CSO_SCRATCH.md", "content": "x"},
          "state 바로 아래 자기 소유 상태 파일")
-    want(True, "Bash", {"command": "cat /w/x > /w/home/.cys/state/learn/a.json"},
+    want(True, "Bash", {"command": "cat /w/x > /w/hm/.cys/state/learn/a.json"},
          "state 허용목록: 셸 리다이렉트도 같은 판정")
 
     # ⑨ 변이 서브동사는 예산 **면제**가 아니다(claude minor)

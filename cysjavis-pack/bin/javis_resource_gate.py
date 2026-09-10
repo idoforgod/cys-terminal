@@ -1028,7 +1028,7 @@ def _fleet_owner(cmd):
             low = norm.lower()
             owner = FLEET_EXE_NAMES.get(base)
             if owner and _APP_BUNDLE_MARKER not in low:
-                return owner                          # 실측: `node /Users/user/.local/bin/codex …`
+                return owner                          # 실측: `node /Users/x/.local/bin/codex …`
             if js:
                 for marker, name in FLEET_JS_BUNDLE_MARKERS:
                     if marker in low and low.endswith(_JS_SUFFIXES):
@@ -3103,7 +3103,7 @@ def _self_test_body(fails):
     # (g) `_fleet_cpu_percent` 순수 핀 — 합산·무매칭 0.0·형상 불일치·함대 행 파손·NaN
     #     ★열 계약이 `pid pcpu command` 로 바뀌었다(자기 제외를 PID 로 하기 위해 · R1 blocking 1).
     L = ["  101  10.5 /usr/local/bin/cysd --socket /x",
-         "  102   4.5 /Users/user/.local/bin/claude --foo",
+         "  102   4.5 /Users/x/.local/bin/claude --foo",
          "  103   1.0 /usr/bin/mediaanalysisd",
          "  104   2.0 /opt/serena --transport stdio",
          "  105   9.9 python3 /w/bin/javis_resource_gate.py check"]
@@ -3146,7 +3146,7 @@ def _self_test_body(fails):
                       (" 7  99.0 python3 -c codex", "코드 문자열 codex"),
                       (" 7  99.0 /Applications/Claude.app/Contents/MacOS/Claude", "macOS GUI 앱 번들"),
                       (" 7  99.0 /opt/codex-report --x", "codex- 접두 남의 프로그램"),
-                      (" 7  99.0 python3 /home/u/.codex/report.py", "인자 속 .codex 경로"),
+                      (" 7  99.0 python3 /home/x/.codex/report.py", "인자 속 .codex 경로"),
                       # ★codex 위임 검체(R1 R2)가 찾아낸 오탐 — 데이터 인자·런처 옵션값·하위 명령
                       (" 7  99.0 node /tmp/report.js /tmp/codex", "데이터 인자를 실행 주체로 승격"),
                       (" 7  99.0 python3 -c print(1) /tmp/serena", "코드 문자열 모드 뒤 경로"),
@@ -3157,20 +3157,20 @@ def _self_test_body(fails):
         got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
         chk(got == (0.0, None), "B2 오탐 재발(%s): %r → %r" % (tag, cmd_, got))
     # (g4) ★진짜 함대 형상은 **전부 매칭**이어야 한다(과소계상 반대 방향의 음성 대조).
-    for cmd_, tag in ((" 8  10.0 /Users/user/.local/share/claude/versions/2.1.261 -p", "버전 경로 직접 exec"),
+    for cmd_, tag in ((" 8  10.0 /Users/x/.local/share/claude/versions/2.1.261 -p", "버전 경로 직접 exec"),
                       (" 8  10.0 node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                        "npm 번들 node 형상"),
-                      (" 8  10.0 /Users/user/.codex/bin/codex-darwin-arm64 --child", "codex vendor native"),
+                      (" 8  10.0 /Users/x/.codex/bin/codex-darwin-arm64 --child", "codex vendor native"),
                       (" 8  10.0 uvx --python 3.13 --from serena-agent==1.5.3 serena start-mcp-server",
                        "uvx 온디맨드 serena"),
                       (" 8  10.0 /usr/local/bin/cysd --socket /x", "데몬"),
                       # ★실측 형상(2026-09-08 이 기계) — 셋 다 R1 초안에서 **놓쳤던** 것들이다.
                       (" 8  10.0 /Applications/cys.app/Contents/MacOS/cysd",
                        "앱 번들 안의 우리 데몬(정확 이름이 번들 배제보다 우선)"),
-                      (" 8  10.0 node /Users/user/.local/bin/codex "
+                      (" 8  10.0 node /Users/x/.local/bin/codex "
                        "--dangerously-bypass-approvals-and-sandbox resume --last",
                        "node 래퍼가 실행하는 codex(비 .js 경로)"),
-                      (" 8  10.0 /Users/user/.local/lib/node_modules/@openai/codex/node_modules/"
+                      (" 8  10.0 /Users/x/.local/lib/node_modules/@openai/codex/node_modules/"
                        "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex-code-mode-host",
                        "codex vendor native(basename 이 codex 가 아니다)"),
                       (" 8  10.0 claude --dangerously-skip-permissions", "맨 claude"),
@@ -3179,9 +3179,9 @@ def _self_test_body(fails):
                       (" 8  10.0 uv run serena start-mcp-server", "런처 하위 명령 1회 건너뛰기"),
                       (" 8  10.0 uvx --from serena-agent==1.5.3 serena", "긴 옵션 값 건너뛰기"),
                       # ★실측 2차(2026-09-08) — R1 1차 조임이 **놓쳤던** 두 형상
-                      (" 8  10.0 node /Users/user/.local/bin/codex exec -m gpt-6-astra -s read-only",
+                      (" 8  10.0 node /Users/x/.local/bin/codex exec -m gpt-6-astra -s read-only",
                        "대상 프로그램의 인자에 -m 이 있는 형상(코드모드 판정은 순서를 본다)"),
-                      (" 8  10.0 /Users/user/.local/bin/uv tool uvx --python 3.13 "
+                      (" 8  10.0 /Users/x/.local/bin/uv tool uvx --python 3.13 "
                        "--from serena-agent==1.5.3 serena start-mcp-server",
                        "중첩 런처(uv → tool → uvx → serena)")):
         got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)

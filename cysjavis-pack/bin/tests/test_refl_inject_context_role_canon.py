@@ -58,7 +58,7 @@ class Seat(object):
         self.tmpdir = os.path.join(self.root, "tmp")
         for d in (self.bin, self.cwd, self.pack, self.tmpdir):
             os.makedirs(d, exist_ok=True)
-        rows = "".join("echo '%d claude /Users/user/.local/bin/claude --x'\n" % (9000 + i)
+        rows = "".join("echo '%d claude /Users/x/.local/bin/claude --x'\n" % (9000 + i)
                        for i in range(max(seats, 1)))
         _write_exec(os.path.join(self.bin, "ps"), "#!/bin/sh\n" + rows)
         _write_exec(os.path.join(self.bin, "lsof"),

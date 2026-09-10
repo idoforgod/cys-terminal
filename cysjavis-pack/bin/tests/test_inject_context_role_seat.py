@@ -69,7 +69,7 @@ def run_hook(tmp, seats, cys_mode, role_env=None, cys_present=True):
     for d in (bindir, pack, cwd):
         os.makedirs(d, exist_ok=True)
     # 스텁 ps — awk 가 comm=claude 로 잡는 형상(실측 ⓐ 런처 실행)
-    rows = "".join("echo '%d claude /Users/user/.local/bin/claude --x'\n" % (9000 + i)
+    rows = "".join("echo '%d claude /Users/x/.local/bin/claude --x'\n" % (9000 + i)
                    for i in range(max(seats, 1)))
     _write_exec(os.path.join(bindir, "ps"), "#!/bin/sh\n" + rows)
     # 스텁 lsof — 요청한 pid 집합에 대해 cwd 를 seats 번 낸다

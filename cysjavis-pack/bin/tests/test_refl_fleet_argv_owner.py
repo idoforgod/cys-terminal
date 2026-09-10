@@ -42,7 +42,7 @@ def owner(cmd):
 # ── ① 양성군: 반복 단축 옵션(N12 ⓐ) ─────────────────────────────────────────────────
 POS_REPEAT = [
     ("uv -vv run serena", "serena"),
-    ("/Users/user/.local/bin/uv -vvv run --active serena start-mcp-server", "serena"),
+    ("/Users/x/.local/bin/uv -vvv run --active serena start-mcp-server", "serena"),
     ("uv -qq run serena", "serena"),
     ("npx -qq codex", "codex"),
     ("npm -dd exec codex", "codex"),
@@ -65,21 +65,21 @@ NEW_BOOLS = ["--use-system-ca", "--trace-promises", "--permission", "--entry-url
              "--no-experimental-websocket", "--experimental-eventsource", "--v8-options",
              "--report-exclude-env", "--test-randomize", "--interpreted-frames-native-stack"]
 for flag in NEW_BOOLS:
-    cmd = "node %s /Users/user/.local/bin/codex" % flag
+    cmd = "node %s /Users/x/.local/bin/codex" % flag
     check("2 미등재 불리언 뒤의 CLI 가 소유자다 — %s" % flag, owner(cmd) == "codex",
           "got=%r" % (owner(cmd),))
 check("2b 여러 개 연속도 같다",
       owner("node --trace-promises --permission --use-system-ca "
-            "/Users/user/.local/bin/codex") == "codex")
+            "/Users/x/.local/bin/codex") == "codex")
 
 # ── ③ 음성군: 값·모드 이름은 편입하지 않았다(B2 오탐 재발 금지) ────────────────────
 NEG_VALUE = [
     # 값 표기가 붙은 별칭 — 편입 대상이 아니다(`--inspect-port=…`)
-    "node --debug-port 9229 /Users/user/.local/bin/codex",
+    "node --debug-port 9229 /Users/x/.local/bin/codex",
     # 뒤 토큰이 **자기 입력 파일**이다(V8 프로파일 로그)
     "node --prof-process /tmp/codex",
     # 값 표기가 붙은 별칭(`--experimental-config-file=…`)
-    "node --experimental-default-config-file /Users/user/.local/bin/codex",
+    "node --experimental-default-config-file /Users/x/.local/bin/codex",
 ]
 for cmd in NEG_VALUE:
     check("3 음성 대조 — 값·모드 이름은 여전히 포기 %r" % cmd, owner(cmd) is None,
@@ -98,7 +98,7 @@ for cmd in NEG_VALUE_NAME:
 # ── ④ CPU 합 — 양성군은 합에 들어가고 음성군은 안 들어간다 ──────────────────────────
 lines = [
     "  101   12.5 uv -vv run serena",
-    "  102    7.5 node --use-system-ca /Users/user/.local/bin/codex",
+    "  102    7.5 node --use-system-ca /Users/x/.local/bin/codex",
     "  103   99.0 node --cpu-prof-dir /tmp/codex /tmp/report.js",   # 음성 — 합에서 빠진다
     "  104   50.0 /bin/zsh -l",                                     # 함대 아님
 ]

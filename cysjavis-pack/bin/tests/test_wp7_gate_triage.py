@@ -25,10 +25,11 @@
 실행 규약: CYS_PACK_DIR="$(mktemp -d)" JAVIS_ROOT="$(mktemp -d)" python3 bin/tests/test_wp7_gate_triage.py
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 WP7-GATE-TRIAGE-OK.
 
-★워커 수정 1건(판정 의미 무관): 음성대조 명령줄의 `/Users/u/` → `/Users/user/`. `u` 는
-  `scripts/secret-scan.sh` 의 `dummy_names` 가 아니라 이 파일 자체가 `--all` 스캔(전 레인 발행
-  게이트)에서 2건으로 걸렸다 — 핀 ④가 막으려는 바로 그 회귀를 핀 자신이 만들던 상태다.
-  소유권 판정은 basename(`codex`)만 보므로 username 은 결과에 관여하지 않는다.
+★더미 username 은 `x` 로 못박는다(판정 의미 무관 · 0.14.32). 발행 경로에는 스캐너가 둘이고
+  더미 이름 목록이 서로 다르다 — `scripts/secret-scan.sh` 는 `dummy_names=user|x|youruser|
+  USERNAME|runner|home`, `scripts/scan-pack-secrets.sh` 는 `ph_re=^(x|you|NAME)$`. 교집합은
+  **`x` 하나뿐**이므로 `user`·`u`·`you` 는 한쪽 게이트에서 반드시 걸린다(0.14.31 pack-artifacts
+  적색 71건의 원인). 소유권 판정은 basename(`codex`)만 보므로 username 은 결과에 관여하지 않는다.
 """
 import os
 import re
@@ -119,9 +120,9 @@ for cmd, tag in _FP:
     got = G._fleet_owner(cmd)
     check("2-미계상:%s" % tag, got is None, "%r → %r (실행 대상이 아니다)" % (cmd, got))
 # 음성 대조(계측 타당성): 진짜 형상은 계속 잡혀야 한다 — 미계상 방향으로 과교정하면 축이 죽는다.
-for cmd, want in (("node /Users/user/.local/bin/codex exec", "codex"),
+for cmd, want in (("node /Users/x/.local/bin/codex exec", "codex"),
                   ("uv run serena start-mcp-server", "serena"),
-                  ("node --require /x/pre.js /Users/user/.local/bin/codex", "codex")):
+                  ("node --require /x/pre.js /Users/x/.local/bin/codex", "codex")):
     check("2-음성대조:%s" % want, G._fleet_owner(cmd) == want, "%r → %r" % (cmd, G._fleet_owner(cmd)))
 
 # ── ③ CI 레인 등재(reviewer-claude/codex major) ──────────────────────────────

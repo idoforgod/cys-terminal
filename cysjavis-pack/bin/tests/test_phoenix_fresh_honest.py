@@ -39,7 +39,7 @@ def main():
     try:
         # A: Rust claude_project_component의 ASCII 치환.
         for name, cwd, expected in (
-            ("Users example", "/Users/user/Desktop/ProjX", "-Users-user-Desktop-ProjX"),
+            ("Users example", "/Users/x/Desktop/ProjX", "-Users-x-Desktop-ProjX"),
             ("tmp example", "/tmp/a.b_c", "-tmp-a-b-c"),
             ("empty", "", ""),
             ("None", None, ""),

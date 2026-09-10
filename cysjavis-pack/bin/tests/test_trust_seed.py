@@ -629,7 +629,7 @@ class LiveProcess(Base):
 
     def test_3f_hidden_env_claude_shape_is_unresolved(self):
         """codex R1: env 세그먼트 없는 claude 형상 줄은 '검증된 0' 이 아니다 → None → REFUSE unverified(강행 시 통과) · 양성이 있으면 n."""
-        runner = _ps2("  7 /Users/user/.local/bin/claude --continue\n  8 python3 x.py\n")
+        runner = _ps2("  7 /Users/x/.local/bin/claude --continue\n  8 python3 x.py\n")
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=runner, os_name="posix", platform="darwin")
         self.assertIsNone(cnt, detail)
         self.assertIn("env 비노출", detail)
@@ -639,10 +639,10 @@ class LiveProcess(Base):
         self.assertEqual((rc, verdict), (2, "REFUSE"), reason)
         self.assertIn("unverified", reason)
         # ★R2: env 비노출이라도 인자 속 claude(tail/less)는 형상 아님 → 검증된 0
-        benign = _ps2("  7 tail -f /x/logs/claude\n  8 less /Users/user/.local/bin/claude\n  9 zsh -lc export X=1; claude\n")
+        benign = _ps2("  7 tail -f /x/logs/claude\n  8 less /Users/x/.local/bin/claude\n  9 zsh -lc export X=1; claude\n")
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=benign, os_name="posix", platform="darwin")
         self.assertEqual(cnt, 0, detail)
-        pos = _ps2("  7 /Users/user/.local/bin/claude\n  9 /Users/user/.local/bin/claude CLAUDE_CONFIG_DIR=%s\n" % self.cfg)
+        pos = _ps2("  7 /Users/x/.local/bin/claude\n  9 /Users/x/.local/bin/claude CLAUDE_CONFIG_DIR=%s\n" % self.cfg)
         cnt, detail = pf.claude_procs_for_config(self.cfg, runner=pos, os_name="posix", platform="darwin")
         self.assertEqual(cnt, 1, detail)
         # ★R3(codex major 재현): 인자 속 CLAUDE_CONFIG_DIR=/other 가 env 의 실제 값(우리 config)을 가리던 줄 → argv 대조로 양성

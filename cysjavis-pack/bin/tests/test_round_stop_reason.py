@@ -1107,7 +1107,7 @@ class RsiRoundBudget(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
         subprocess.run(["git", "init", "-q", "."], cwd=self.root, check=True)
-        for kv in (("user.email", "t@example.invalid"), ("user.name", "t")):
+        for kv in (("user.email", "x@example.com"), ("user.name", "t")):
             subprocess.run(["git", "config"] + list(kv), cwd=self.root, check=True)
         open(os.path.join(self.root, "a"), "w").write("x\n")
         subprocess.run(["git", "add", "a"], cwd=self.root, check=True)
@@ -1544,7 +1544,7 @@ class Wp6TriageRsiProjectScope(unittest.TestCase):
             d = os.path.join(self.root, name)
             os.makedirs(d)
             subprocess.run(["git", "init", "-q", "."], cwd=d, check=True)
-            for kv in (("user.email", "t@example.invalid"), ("user.name", "t")):
+            for kv in (("user.email", "x@example.com"), ("user.name", "t")):
                 subprocess.run(["git", "config"] + list(kv), cwd=d, check=True)
             open(os.path.join(d, "a"), "w").write("x\n")
             subprocess.run(["git", "add", "a"], cwd=d, check=True)
