@@ -22,13 +22,18 @@
 #   (게이트의 ALLOWED 와 같은 마찰 — "등재를 미룬다" 는 사유가 아니다). 이 축은 ci-branch 의
 #   '레인 예행 도구' 스텝이 게이트로 돌린다.
 #
+# 4단계(★D12 · 반성 라운드 2026-09-10)는 **문서**를 본다: 릴리스 노트가 백틱 안에서 이름 붙인
+#   저장소 상대 경로가 실재하는가. 릴리스 노트가 재측정 수집 도구를 `tools/queue_remeasure.py` 로
+#   안내했는데 저장소에 `tools/` 자체가 없었다 — 담당자가 도구를 못 찾으면 임의 집계로 대체하거나
+#   측정을 건너뛴다. 대상 문서는 `LANE_PARITY_DOCS`(os.pathsep 구분 · 기본값 = 릴리스 노트 1개)다.
+#
 # 사용:
 #   scripts/lane-parity-rehearsal.sh             # 예행(PENDING 은 통과 · 배너로 남김)
 #   scripts/lane-parity-rehearsal.sh --strict    # 머지 뒤 검증(PENDING 이 남아 있으면 실패)
-#   scripts/lane-parity-rehearsal.sh --self-test # 자기 검체 — 3단계가 임의 미등재 파일을 실제로 잡는가
+#   scripts/lane-parity-rehearsal.sh --self-test # 자기 검체 — 3·4단계가 실제로 잡는가(양성·음성 대조)
 #
-# 종료코드: 0=통과 · 1=계약 위반(등재 비대칭 · 등재됐는데 파일 없음 · 사유 없는 미등재 파일) ·
-#          3=구조 판별 실패(도구 수리)
+# 종료코드: 0=통과 · 1=계약 위반(등재 비대칭 · 등재됐는데 파일 없음 · 사유 없는 미등재 파일 ·
+#          사유 없는 부재 경로 인용) · 3=구조 판별 실패 또는 **잴 대상 0건**(도구 수리 · 조용한 초록 금지)
 set -uo pipefail
 
 STRICT=0
@@ -226,6 +231,87 @@ for n in orphans:
           "CI 밖이어도 되는 **사유**를 UNREGISTERED_OK 에 적어라(\"나중에\" 는 사유가 아니다)"
           % (n, disk[n]), file=sys.stderr)
 
+print()
+print("── 4단계: 릴리스 노트가 이름 붙인 저장소 경로의 실재(D12) ────────────────────")
+# ★D12(반성 라운드 2026-09-10): 릴리스 노트가 재측정 수집 도구를 `tools/queue_remeasure.py` 로
+#   안내했는데 저장소에 `tools/` 자체가 없었다 — 담당자가 도구를 못 찾으면 임의 집계로 대체하거나
+#   측정을 건너뛴다(§9 WP-5 '재측정 보고 선행' 붕괴). 이 축은 그 형태 **하나만** 판정한다:
+#   문서가 백틱 안에서 이름 붙인 **저장소 상대 경로가 실재하는가**.
+#
+# 추출 규약(거짓 양성을 만들지 않기 위한 보수적 규칙 · codex 설계 검토 반영):
+#   · 백틱 인라인 span 을 공백으로 쪼갠 **토큰의 맨 앞**이 접두로 시작할 때만 후보다. 그래서
+#     `~/…/tools/x.py`(저장소 밖 · 토큰이 `~` 로 시작) · `git show v0.14.30:src/bin/cys.rs`
+#     (과거 태그 트리 참조 · 토큰이 `v0.14.30:` 로 시작)는 후보가 아니다 — 저장소 밖·과거 트리를
+#     **정확히 설명한 문장**을 붉히지 않는다.
+#   · 경로 문자는 `[A-Za-z0-9._/+-]` 까지다 — 한국어 조사·괄호에서 끊긴다(`scripts/x.sh를 실행`).
+#   · 접두 뒤가 비면 단일 경로가 아니므로 '서식 인용' 으로 세기만 한다(`tools/` 디렉터리 언급 ·
+#     `docs/*.md` 글롭 · `scripts/{a,b}.sh` · `docs/<이름>.md` 자리표시자).
+#   · `hooks/…` **만** 팩 상대 표기이므로 `cysjavis-pack/` 폴백을 준다. 다른 접두에 폴백을 주면
+#     `scripts/x.py` 가 팩 안에만 있을 때 **틀린 실행 경로**를 정상으로 인정한다(codex).
+#
+# 이 축이 재지 못하는 것(정직한 한계 — 적어 두지 않으면 다음 사람이 보증으로 읽는다): 백틱 밖
+#   평문·마크다운 링크·`$VAR/…` 변수 표기·**파일명만** 적은 인용은 후보가 아니고, 파일이 있어도
+#   그것이 **배포 팩에 실렸는지**·안내한 옵션을 지원하는지는 `os.path.exists` 가 증명하지 못한다.
+#   이 축은 '안내가 옳다' 의 증명이 아니라 **D12 형태(실재하지 않는 저장소 경로 안내)의 재발 차단**이다.
+#
+# 왜 릴리스 노트 1개인가: 다른 docs 는 이 레인의 소유 밖이다 — 고칠 권한이 없는 문서의 과거·예시
+#   경로로 3레인을 막으면 복구 책임과 권한이 갈린다(codex). 확대는 소유자별 정리 뒤에 한다.
+DOCS = [d for d in os.environ.get(
+    "LANE_PARITY_DOCS", "docs/RELEASE_NOTES_0.14.31.md").split(os.pathsep) if d]
+DOC_PREFIXES = ("scripts/", "tools/", "src/", "docs/", "hooks/", "cysjavis-pack/")
+PACK_FALLBACK_PREFIX = "hooks/"      # 팩 상대 표기는 이것뿐이다(codex: 폴백을 넓히지 마라)
+# 의도적으로 실재하지 않는 경로의 허용 목록 — 값 = 사유(게이트 ALLOWED · UNREGISTERED_OK 와 같은
+#   마찰). "나중에 넣는다" 는 사유가 아니다. 실측 2026-09-10: 부재 0 이라 비어 있다.
+DOC_PATH_ALLOWED = {}
+
+def doc_candidates(text):
+    """(검사 후보, 서식 인용) — 위 추출 규약 그대로."""
+    checked, formatted = [], []
+    for span in re.findall(r"`([^`\n]+)`", text):
+        for tok in span.split():
+            m = re.match(r"[A-Za-z0-9._/+-]+", tok)
+            if not m:
+                continue
+            cand = m.group(0)
+            pre = next((p for p in DOC_PREFIXES if cand.startswith(p)), None)
+            if pre is None:
+                continue
+            (formatted if len(cand) == len(pre) else checked).append(cand)
+    return checked, formatted
+
+doc_missing, doc_checked, doc_formatted, doc_allowed = [], 0, 0, 0
+for doc in DOCS:
+    if not os.path.exists(doc):
+        print("::error::4단계 대상 문서가 없다: %s (LANE_PARITY_DOCS 를 확인하라)" % doc,
+              file=sys.stderr)
+        sys.exit(3)
+    checked, formatted = doc_candidates(open(doc, encoding="utf-8").read())
+    doc_formatted += len(formatted)
+    for rel in checked:
+        doc_checked += 1
+        probe = [rel] + ([os.path.join("cysjavis-pack", rel)]
+                         if rel.startswith(PACK_FALLBACK_PREFIX) else [])
+        if any(os.path.exists(c) for c in probe):
+            continue
+        if rel in DOC_PATH_ALLOWED:
+            doc_allowed += 1
+            continue
+        doc_missing.append((doc, rel))
+print("[문서 경로] %s · 검사 %d건 · 서식 인용 %d · 사유 있는 부재 %d · 사유 없는 부재 %d"
+      % (" · ".join(DOCS), doc_checked, doc_formatted, doc_allowed, len(doc_missing)))
+for rel in sorted(DOC_PATH_ALLOWED):
+    if os.path.exists(rel):
+        print("::warning::DOC_PATH_ALLOWED '%s' 이 이제 실재한다 — 목록에서 지워라" % rel)
+if doc_checked == 0:
+    print("::error::4단계가 잰 경로가 **0건**이다 — 문서가 저장소 경로 안내를 잃었거나 추출기가 "
+          "파손됐다. 0건은 초록이 아니다(D10 과 같은 규율 · 잴 대상이 없으면 게이트가 아니다).",
+          file=sys.stderr)
+    sys.exit(3)
+for doc, rel in doc_missing:
+    print("::error::  %s 가 인용한 `%s` 가 저장소에 없다 — 실재하는 경로로 고치거나, 저장소 밖임을 "
+          "문장으로 밝히거나(백틱 안에 저장소 상대 경로로 적지 마라), DOC_PATH_ALLOWED 에 사유와 "
+          "함께 등재하라" % (doc, rel), file=sys.stderr)
+
 if missing:
     print("::error::등재된 이름의 파일이 없다 — CI 런타임의 `[ -f \"$f\" ]` 단언이 붉어진다. "
           "파일을 커밋하거나(git add 누락) PENDING_MERGE 에 근거와 함께 등재하라.",
@@ -235,15 +321,21 @@ if orphans:
     print("::error::세 레인 모두에 없는 검체는 레인 대조 게이트의 union 밖이라 **비대칭 0 으로 초록**"
           "이다 — 안 도는 검체는 게이트가 아니다.", file=sys.stderr)
     sys.exit(1)
+if doc_missing:
+    print("::error::릴리스 노트가 실재하지 않는 저장소 경로를 안내한다(D12) — 재측정 담당자가 "
+          "도구를 못 찾으면 임의 집계로 대체하거나 측정을 건너뛴다.", file=sys.stderr)
+    sys.exit(1)
 if pending and STRICT:
     print("::error::--strict 인데 머지 대기 %d종이 남아 있다 — 팩 브랜치 머지가 끝나지 않았거나 "
           "PENDING_MERGE 를 청소하지 않았다." % len(pending), file=sys.stderr)
     sys.exit(1)
 if pending:
-    print("\n[예행 판정] 레인 대조 통과 · 파일 존재는 머지 대기 %d종을 제외하고 통과 · 역방향 통과."
+    print("\n[예행 판정] 레인 대조 통과 · 파일 존재는 머지 대기 %d종을 제외하고 통과 · 역방향 통과 "
+          "· 문서 경로 실재 통과."
           "\n            머지 후 `--strict` 로 다시 돌려라(그때 0 이어야 완결)." % len(pending))
 else:
-    print("\n[예행 판정] 레인 대조 통과 · 등재 전건 파일 확인 · 역방향(사유 없는 미등재 0) 통과.")
+    print("\n[예행 판정] 레인 대조 통과 · 등재 전건 파일 확인 · 역방향(사유 없는 미등재 0) 통과 "
+          "· 문서 경로 실재(사유 없는 부재 0) 통과.")
 PYEXIST
 }
 
@@ -275,6 +367,56 @@ if [ $SELF_TEST -eq 1 ]; then
     exit 1
   fi
   echo "[자기 검체] 미등재 $PROBE.py → exit 1 · 사유 일치 (역방향 축 살아 있음)"
+
+  # ── 4단계(D12) 대조 3종 — 축이 살아 있고, 정상 문서를 붉히지 않고, 0건이 초록이 아니다 ──
+  #   음성 대조만 있으면 "다 붉혀서" 도 만족되고, 양성 대조만 있으면 "다 통과시켜서" 도 만족된다.
+  #   rc 도 서로 다르다(부재=1 · 0건=3) — "exit 1 이면 4단계다" 로 읽는 오판을 막는다(codex).
+  DOC_DIR="$SELF_TMP/docs4"
+  mkdir -p "$DOC_DIR"
+
+  # ① 양성 대조: 한국어 조사·글롭·자리표시자·저장소 밖 절대경로·과거 태그 참조·디렉터리 언급이
+  #    섞인 **정상** 문서는 통과해야 한다. 여기서 붉어지면 이 축은 문서 편집에 물리는 세금이 된다.
+  cat > "$DOC_DIR/ok.md" <<'DOC_OK_EOF'
+- `scripts/lane-parity-rehearsal.sh` 를 돌리십시오.
+- `bash scripts/lane-parity-rehearsal.sh --strict` 로도 됩니다(명령 안에 박힌 경로).
+- 조사 붙임 `scripts/lane-parity-rehearsal.sh를` · 팩 상대 표기 `hooks/role-capability-gate.sh`
+- 서식 인용(단일 경로 아님): `docs/*.md` · `scripts/{a,b}.sh` · `docs/<문서명>.md` · `tools/` 폴더
+- 저장소 밖 · 과거 트리: `~/Desktop/CYSjavis/x/tools/zz.py` · `git show v0.14.30:src/bin/zz.rs`
+DOC_OK_EOF
+  LANE_PARITY_DOCS="$DOC_DIR/ok.md" existence_axes > "$SELF_TMP/doc-ok.log" 2>&1
+  DOC_OK_RC=$?
+  if [ $DOC_OK_RC -ne 0 ]; then
+    cat "$SELF_TMP/doc-ok.log"
+    echo "::error::자기 검체 실패 — 정상 문서(조사·글롭·저장소 밖 경로 혼재)에서 4단계가 exit $DOC_OK_RC 를 냈다(거짓 양성 · 정상 문서 편집이 3레인을 막는다)" >&2
+    exit 1
+  fi
+  echo "[자기 검체] 정상 문서(조사·글롭·저장소 밖·과거 트리 혼재) → exit 0 (거짓 양성 없음)"
+
+  # ② 음성 대조 A: 명령 **안에 박힌** 부재 경로 → exit 1 + 그 경로를 사유로 낸다.
+  #    (D12 의 실제 형태가 "수집 도구: `tools/queue_remeasure.py --since …`" 였다)
+  printf '%s\n' '수집 도구: `python3 tools/zz_no_such_tool.py --since <시각>`' > "$DOC_DIR/bogus.md"
+  LANE_PARITY_DOCS="$DOC_DIR/bogus.md" existence_axes > "$SELF_TMP/doc-bogus.log" 2>&1
+  DOC_RC=$?
+  if [ $DOC_RC -ne 1 ] \
+     || ! grep -qF -- 'tools/zz_no_such_tool.py' "$SELF_TMP/doc-bogus.log" \
+     || ! grep -qF -- '(D12)' "$SELF_TMP/doc-bogus.log"; then
+    cat "$SELF_TMP/doc-bogus.log"
+    echo "::error::자기 검체 실패 — 부재 경로를 인용한 문서에서 4단계가 exit 1 + 그 경로 사유를 내지 않았다(exit $DOC_RC)" >&2
+    exit 1
+  fi
+  echo "[자기 검체] 부재 경로 인용 문서 → exit 1 · 사유 일치 (문서 경로 축 살아 있음)"
+
+  # ③ 음성 대조 B: 잴 경로가 **0건**인 문서 → exit 3(폐쇄). 0건 초록은 D10 이 닫은 바로 그 구멍이다.
+  printf '%s\n' '이 문서는 저장소 경로를 하나도 이름 붙이지 않습니다 — `cys status --json` 뿐입니다.' \
+    > "$DOC_DIR/empty.md"
+  LANE_PARITY_DOCS="$DOC_DIR/empty.md" existence_axes > "$SELF_TMP/doc-empty.log" 2>&1
+  DOC_ZERO_RC=$?
+  if [ $DOC_ZERO_RC -ne 3 ] || ! grep -qF -- '0건' "$SELF_TMP/doc-empty.log"; then
+    cat "$SELF_TMP/doc-empty.log"
+    echo "::error::자기 검체 실패 — 인용 0건 문서에서 4단계가 exit 3 + '0건' 사유를 내지 않았다(측정 ≥1 폐쇄가 없다 · exit $DOC_ZERO_RC)" >&2
+    exit 1
+  fi
+  echo "[자기 검체] 인용 0건 문서 → exit 3 · 사유 일치 (측정 ≥1 폐쇄 살아 있음)"
 
   echo
   echo "── 자기 검체 2: 레인 대조 게이트의 변이 대조(워크플로 사본 · LANE_GATE_ROOT) ─────────"
