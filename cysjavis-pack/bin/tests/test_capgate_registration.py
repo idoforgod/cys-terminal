@@ -1010,9 +1010,12 @@ class ReflectHookCommandQuoting(_CapgateEnv):
         """안전 문자 경로(배포 기본형)는 종전 문자열 그대로 — preflight·Rust writer 와 byte-identical."""
         spec = {"script": "hooks/" + pf.CAPGATE_HOOK[0]}
         self.assertEqual(gr._command_str(spec, pf.pack_dir()), pf._cys_hook_cmd(pf.CAPGATE_HOOK[0]))
+        # ★계정명은 `user`(제네릭 더미)로 적는다 — `scripts/secret-scan.sh` 의 WIN-PATH·PATH 규칙은
+        #   `C:\Users\<이름>` 형태를 개인경로로 보고 PUBLIC 발행을 fail-closed 로 막는다(허용 더미:
+        #   user·x·youruser·USERNAME·runner·home). 한 글자 `u` 는 그 목록에 없어 적색이었다.
         with mock.patch.object(os, "name", "nt"):
-            self.assertEqual(gr._command_str(spec, "C:\\Users\\u\\.cys\\pack"),
-                             'bash "C:/Users/u/.cys/pack/hooks/%s"' % pf.CAPGATE_HOOK[0])
+            self.assertEqual(gr._command_str(spec, "C:\\Users\\user\\.cys\\pack"),
+                             'bash "C:/Users/user/.cys/pack/hooks/%s"' % pf.CAPGATE_HOOK[0])
 
     def test_registration_axis_mirrors_match_preflight(self):
         """G11: 미러 7종을 **전부** assertEqual 로 잰다(주석이 약속한 '파리티는 검체가 잰다')."""
