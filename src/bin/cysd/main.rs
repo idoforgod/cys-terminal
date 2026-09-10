@@ -2648,13 +2648,16 @@ async fn handle_connection_capped(
         //   `await` 로 그대로 직렬이고(요청 하나씩), 다른 커넥션·이벤트 스트림은 막히지 않는다.
         let dispatched = {
             let d = daemon.clone();
+            // ★(성찰 A15) `req` 는 클로저로 **이동**한다 — 패닉 응답이 그 id 를 잃으면 클라이언트는
+            //   어느 요청이 실패했는지 모른다(파이프라인 호출자는 응답을 id 로 짝짓는다). 미리 복사.
+            let req_id = req.id.clone();
             match tokio::task::spawn_blocking(move || handlers::dispatch(&d, req, caller_pid)).await
             {
                 Ok(r) => r,
                 // 블로킹 태스크 패닉 — 커넥션을 조용히 끊지 않고 사실을 답한다(종전에는 프로세스
                 // 전체가 그 패닉을 안았다 · 이 변경으로 나빠지지 않는다).
                 Err(e) => handlers::Reply::Single(cys::err_response(
-                    &serde_json::Value::Null,
+                    &req_id,
                     "internal_error",
                     &format!("dispatch task failed: {e}"),
                 )),

@@ -37,9 +37,20 @@ const FRESH_RECURRING_DEFAULT_TTL_SECS: u64 = 1800;
 /// 초안·alt-screen·승인대기·빈 좌석 게이트를 통과시킨 뒤에야 주입하므로, 0초 회수는 "적재하고
 /// 즉시 버린다" 와 같다.
 const QUEUED_CLOSE_MIN_TTL_SECS: u64 = 60;
-/// 적재된 항목의 **처분이 정해질 때까지** 회수를 미루는 상한(초). 무한 대기는 좌석 누수이므로
-/// 여기서 끊고 회수한다(그때는 `queue.dropped` 묘비가 남는다).
-const QUEUED_CLOSE_MAX_WAIT_SECS: u64 = FRESH_RECURRING_DEFAULT_TTL_SECS;
+/// ★(성찰 A4) **배달 유예의 안내 경계**(초) — *회수 시각이 아니다.*
+///
+/// 종전 이름은 `QUEUED_CLOSE_MAX_WAIT_SECS` 였고 값이
+/// [`FRESH_RECURRING_DEFAULT_TTL_SECS`] 와 **같은 상수**였다. 두 성질이 한 숫자에 묶여 있었다:
+/// '누수 방지 주기'(좌석을 언제까지 살려 두는가)와 '배달 유예'(적재된 일감의 처분을 얼마나
+/// 기다리는가). 그래서 승인 대기가 31분을 넘기면 활성 큐에 항목이 **남아 있는데도** 좌석이
+/// 닫혔고, 그 항목은 `record_active_drain(…, "surface_closed")` + `queue.dropped` 로 폐기됐다 —
+/// 잡의 일감은 끝내 실행되지 않는데 그 사실은 이미 `schedule.fired{detail:"queued"}`(성공)로
+/// 보고된 뒤다. 이제 이 경계는 **안내 이벤트를 내는 시각**일 뿐이고, 미완료 항목이 있으면
+/// 좌석을 닫지 않는다(대기의 실질 상한은 큐 항목 자신의 TTL 이 진다 — 배달·만료 어느 쪽이든
+/// 처분이 정해지면 그 즉시 회수된다).
+const QUEUED_DELIVERY_GRACE_SECS: u64 = 1800;
+/// 유예를 넘긴 뒤 안내를 **되풀이하는** 간격(초) — 매 폴링마다 발행하면 관측이 소음이 된다.
+const QUEUED_DEFER_NOTICE_INTERVAL_SECS: u64 = 900;
 /// 처분 확인 간격(초).
 const QUEUED_CLOSE_POLL_SECS: u64 = 5;
 
@@ -403,12 +414,19 @@ fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Val
 }
 
 /// schedule.json 원자 치환(tmp+rename) — 핫리로드 torn read 회피. 반환: 성공했는가.
+///
+/// ★(성찰 A11) tmp 이름은 **pid + nonce** 다. 종전의 고정 `schedule.json.tmp` 는 데몬의 세
+/// writer(`ensure_builtin_jobs` · 틱 핫리로드 정규화 · `remove_job_from_file`)와 CLI
+/// (`cys schedule add/rm`)가 **같은 이름**을 나눠 써, A 의 `rename` 이 B 가 반쯤 쓴 파일을
+/// `schedule.json` 자리에 놓을 수 있었다(부분 JSON → 손상 격리 → 빈 스케줄 → 전 builtin 침묵).
+/// 이름 분리는 torn 파일을 막고, **쓰기 순서**는 [`ScheduleFileLock`] 이 직렬화한다.
 fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bool {
     let Ok(body) = serde_json::to_string_pretty(root) else {
         return false;
     };
-    let tmp = path.with_extension("json.tmp");
+    let tmp = schedule_tmp_path(path);
     if std::fs::write(&tmp, body).is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
     if std::fs::rename(&tmp, path).is_err() {
@@ -416,6 +434,95 @@ fn write_schedule_atomic(path: &std::path::Path, root: &serde_json::Value) -> bo
         return false;
     }
     true
+}
+
+/// writer 별로 다른 임시 파일 — `schedule.json.<pid>.<nonce>.tmp`(같은 디렉터리 = 같은 볼륨 → rename 원자).
+fn schedule_tmp_path(path: &std::path::Path) -> PathBuf {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "schedule.json".into());
+    path.with_file_name(format!("{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// ★(성찰 A11) **schedule.json writer 잠금** — 디렉터리 잠금(`schedule.json.lock` 을 `create_dir`).
+///
+/// `create_dir` 은 POSIX·NTFS 모두에서 "있으면 실패" 가 **원자**라 Windows 에서 flock 없이
+/// 되는 유일한 상호배제 원시다(Git Bash `sh` · ConPTY 환경 포함). 보유자가 죽어 잠금이 남으면
+/// mtime 이 [`SCHEDULE_LOCK_STALE_SECS`] 를 넘긴 잠금을 **깨고** 진입한다(pid 검사는 Windows 에서
+/// 신뢰할 수 없어 쓰지 않는다). 대기는 [`SCHEDULE_LOCK_WAIT_MS`] 로 유계 — 못 잡으면 `None` 이고
+/// 호출부는 **이번 쓰기를 포기**한다(다음 틱이 다시 온다 · 잠금 없이 쓰는 경로는 없다).
+///
+/// 같은 프로토콜을 CLI(`cys.rs` 의 `schedule add/rm` 저장 — cli-boot C10)가 써야 직렬화가
+/// 완성된다: 잠금 = `<schedule.json>.lock` 디렉터리 · 획득 = `create_dir` · 대기 ≤ 2,000ms(10ms 간격) ·
+/// mtime 30s 초과 잠금은 깨도 된다 · tmp = `<schedule.json>.<pid>.<nonce>.tmp` + rename · 해제 = `remove_dir`.
+///
+/// **읽기는 잠그지 않는다**(CQS). 읽기가 보는 것은 언제나 rename 전이거나 후인 온전한 문서다.
+pub struct ScheduleFileLock {
+    dir: PathBuf,
+}
+
+/// 잠금 대기 상한(ms). 데몬 틱·CLI 의 쓰기는 수 ms 라 이 안에 언제나 풀린다.
+pub const SCHEDULE_LOCK_WAIT_MS: u64 = 2_000;
+/// 이보다 오래된 잠금은 죽은 보유자의 것이다(깨도 된다).
+pub const SCHEDULE_LOCK_STALE_SECS: u64 = 30;
+
+impl ScheduleFileLock {
+    pub fn lock_dir_for(path: &std::path::Path) -> PathBuf {
+        let name = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "schedule.json".into());
+        path.with_file_name(format!("{name}.lock"))
+    }
+
+    /// 프로덕션 진입점 — 기본 대기·부패 상한.
+    pub fn acquire(path: &std::path::Path) -> Option<Self> {
+        Self::acquire_with(
+            path,
+            Duration::from_millis(SCHEDULE_LOCK_WAIT_MS),
+            Duration::from_secs(SCHEDULE_LOCK_STALE_SECS),
+        )
+    }
+
+    /// 대기·부패 상한을 주입받는 본체(검체가 부패 잠금 깨기를 초 단위로 기다리지 않게).
+    pub fn acquire_with(path: &std::path::Path, wait: Duration, stale: Duration) -> Option<Self> {
+        let dir = Self::lock_dir_for(path);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Some(Self { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 죽은 보유자의 잠금인가 — mtime 이 부패 상한을 넘겼으면 깨고 다시 잡는다.
+                    let stale_now = std::fs::metadata(&dir)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > stale);
+                    if stale_now {
+                        let _ = std::fs::remove_dir(&dir);
+                        continue;
+                    }
+                }
+                Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for ScheduleFileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.dir);
+    }
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
@@ -532,8 +639,21 @@ fn apply_builtin_jobs(
 /// 파일 부재=빈 골격 생성 · 손상(파싱 실패)=무접촉(load_jobs 의 격리 경로가 별도 처리 — 여기서 덮어써 사용자 잡을
 /// 잃지 않는다) · 변경 있을 때만 원자적 재기록(핫 리로드 torn read 회피).
 pub fn ensure_builtin_jobs() {
-    let path = schedule_path();
-    let mut root: serde_json::Value = match std::fs::read_to_string(&path) {
+    ensure_builtin_jobs_at(&schedule_path());
+}
+
+/// 경로 주입판(검체 가능) — 위 함수의 본체. ★(성찰 A11) **writer 잠금** 아래에서 읽고·접고·쓴다.
+pub fn ensure_builtin_jobs_at(path: &std::path::Path) {
+    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+        eprintln!("[cysd] ensure_builtin_jobs: schedule.json writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 무접촉(다음 기회에 다시)");
+        return;
+    };
+    ensure_builtin_jobs_locked(path);
+}
+
+/// 잠금을 **이미 쥔** 호출자용 본체(손상 격리 직후 같은 틱의 복구가 여기로 온다).
+fn ensure_builtin_jobs_locked(path: &std::path::Path) {
+    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(c) => match serde_json::from_str(&c) {
             Ok(v) => v,
             Err(e) => {
@@ -584,7 +704,7 @@ pub fn ensure_builtin_jobs() {
         );
     }
     if changed {
-        if write_schedule_atomic(&path, &root) {
+        if write_schedule_atomic(path, &root) {
             eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
         } else {
             eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
@@ -608,9 +728,47 @@ fn quarantine_corrupt(path: &std::path::Path) -> Option<PathBuf> {
     std::fs::rename(path, &backup).ok().map(|_| backup)
 }
 
+/// ★(성찰 A11) **읽기 전용 로더**(CQS). `schedule.status`(`cys schedule list`)·`run_now` 가 쓴다 —
+/// 조회 RPC 는 디스크를 바꾸지 않는다. 손상도 **격리하지 않는다**(rename 은 쓰기다): loud 신호만
+/// 남기고 빈 스케줄을 돌려주며, 격리·복구는 30초 안에 오는 스케줄러 틱([`load_jobs_hot_reload`])의
+/// 소관이다. 메모리의 `Job` 은 serde 계층이 그대로 정규화하므로 뜻은 같다.
 pub fn load_jobs() -> Vec<Job> {
-    let path = schedule_path();
-    let content = match std::fs::read_to_string(&path) {
+    load_jobs_at(&schedule_path(), LoadMode::ReadOnly)
+}
+
+/// ★(성찰 A11) 스케줄러 틱 전용 **단일 writer 로더** — writer 잠금 아래에서 (a) 손상이면 격리하고
+/// **같은 틱에** builtin 을 복구하며 (b) 저장 표현을 정규형으로 접어 되쓴다(triage X8).
+/// 종전에는 `load_jobs()` 하나가 `status`·`run_now`·틱에서 전부 파일을 되썼다 — 잠금 없는 병렬
+/// writer 3개(`main.rs` 의 `spawn_blocking` 이 RPC 를 진짜 병렬로 만든다) + CLI 1개.
+pub fn load_jobs_hot_reload() -> Vec<Job> {
+    load_jobs_at(&schedule_path(), LoadMode::HotReload)
+}
+
+/// 로더의 두 모드 — **읽기**와 **쓰기 겸 읽기**를 자료형으로 가른다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadMode {
+    /// 파일을 바꾸지 않는다(격리도 정규화도 없음). 잠금을 잡지 않는다.
+    ReadOnly,
+    /// writer 잠금 아래에서 격리 + 같은 틱 builtin 복구 + 정규형 되쓰기.
+    HotReload,
+}
+
+/// 경로 주입판(검체 가능) — 두 로더의 본체.
+pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
+    // 쓰기 모드는 읽기 **전에** 잠근다 — 읽기와 치환 사이에 CLI 추가가 끼어들면 그 추가가
+    // 우리의 옛 문서로 덮여 사라진다(CLI 는 이미 성공을 출력한 뒤 = 거짓 성공).
+    let lock = match mode {
+        LoadMode::ReadOnly => None,
+        LoadMode::HotReload => match ScheduleFileLock::acquire(path) {
+            Some(l) => Some(l),
+            None => {
+                // 잠금을 못 잡았다 — 이번 틱은 **읽기만** 한다(쓰기 없는 경로로 강등 · 발화는 계속).
+                eprintln!("[cysd] schedule: writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 이번 틱은 읽기만 한다");
+                return load_jobs_at(path, LoadMode::ReadOnly);
+            }
+        },
+    };
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         // 부재 = 정상(스케줄 미설정). 빈 스케줄로 조용히 진행한다.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -627,19 +785,41 @@ pub fn load_jobs() -> Vec<Job> {
     let mut root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            let note = match quarantine_corrupt(&path) {
+            if lock.is_none() {
+                // 읽기 전용 경로는 격리하지 않는다(rename 은 쓰기다) — 틱이 30초 안에 처리한다.
+                eprintln!("[cysd] schedule.json 파싱 실패: {e} — 읽기 전용 경로라 격리하지 않는다(다음 틱이 격리·복구) · 빈 스케줄로 진행");
+                return Vec::new();
+            }
+            let note = match quarantine_corrupt(path) {
                 Some(b) => format!("손상본을 {}로 격리(데이터 보존)", b.display()),
                 None => "손상본 격리 실패".to_string(),
             };
-            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 빈 스케줄로 진행");
-            return Vec::new();
+            // ★(성찰 A11 ⓒ) 격리 뒤 **같은 틱에서** builtin 을 복구한다. 종전에는 `ensure_builtin_jobs`
+            //   가 부트에만 돌아 phoenix 스냅샷·learn 감사·cycle 틱·편성 심박·CSO 60분 점검이
+            //   **데몬 재시작까지 전부 정지**했다(코드 자신이 경고한 무발화 침묵).
+            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 같은 틱에서 built-in 잡을 복구한다");
+            ensure_builtin_jobs_locked(path);
+            return match std::fs::read_to_string(path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            {
+                Some(v) => jobs_of(&v),
+                None => Vec::new(),
+            };
         }
     };
     // ★(수렴 R2 · triage X8 잔여) **핫리로드도 파일을 접는다.** 종전에는 아래 serde 계층이
     //   메모리의 `Job` 만 정규화했고(`canonicalize_queue_action`), 디스크는 운영자가 손으로 넣은
     //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
-    //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음).
-    canonicalize_schedule_file(&path, &mut root);
+    //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음). ★(성찰 A11) 쓰기 모드에서만 · 잠금 아래에서.
+    if lock.is_some() {
+        canonicalize_schedule_file(path, &mut root);
+    }
+    jobs_of(&root)
+}
+
+/// 최상위 문서 → `Vec<Job>`(스키마 불일치는 loud + 빈 스케줄).
+fn jobs_of(root: &serde_json::Value) -> Vec<Job> {
     match root.get("jobs") {
         None => Vec::new(), // jobs 키 부재 = 빈 스케줄(정상)
         Some(j) => match serde_json::from_value::<Vec<Job>>(j.clone()) {
@@ -805,7 +985,7 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     if daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let jobs = load_jobs(); // 핫 리로드: CLI가 schedule.json만 고치면 됨
+    let jobs = load_jobs_hot_reload(); // 핫 리로드: CLI가 schedule.json만 고치면 됨 · 이 틱이 유일한 데몬 writer 자리다
     if jobs.is_empty() {
         return;
     }
@@ -978,8 +1158,16 @@ fn drop_job_and_canonicalize(root: &mut serde_json::Value, job_id: &str) {
 
 /// T3-10: 처리 완료된 원샷 job을 schedule.json에서 제거 (영구 잔존 차단)
 fn remove_job_from_file(job_id: &str) {
-    let path = schedule_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    remove_job_from_file_at(&schedule_path(), job_id);
+}
+
+/// 경로 주입판 — ★(성찰 A11) writer 잠금 아래에서 읽고·빼고·쓴다(읽기와 치환 사이의 CLI 추가 보존).
+fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
+    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+        eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 — writer 잠금을 잡지 못했다 · 다음 틱이 다시 시도한다");
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(path) else {
         return;
     };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -987,7 +1175,7 @@ fn remove_job_from_file(job_id: &str) {
     };
     drop_job_and_canonicalize(&mut root, job_id);
     // 원자 치환 — 부분 쓰기가 핫리로드에 잡히면 스케줄 전체가 빈 스케줄로 읽힌다.
-    if !write_schedule_atomic(&path, &root) {
+    if !write_schedule_atomic(path, &root) {
         eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 기록 실패 — 다음 틱이 다시 시도한다");
     }
 }
@@ -1215,18 +1403,12 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
             // ★(triage X9) 적재 성공(`"queued"`)은 **배달이 아니다**. 회수는 그 항목의 처분
-            //   (배달·만료·폐기)이 정해진 뒤에 한다 — 상한(QUEUED_CLOSE_MAX_WAIT_SECS)까지만.
+            //   (배달·만료·폐기)이 정해진 뒤에 한다.
             let await_disposition = matches!(delivered, Ok("queued"));
+            let job_id = job.id.clone();
+            let timing = ReapTiming::for_job(ttl);
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(ttl)).await;
-                if await_disposition {
-                    let mut waited = 0u64;
-                    while waited < QUEUED_CLOSE_MAX_WAIT_SECS && surface_queue_pending(&d, sid) {
-                        tokio::time::sleep(Duration::from_secs(QUEUED_CLOSE_POLL_SECS)).await;
-                        waited += QUEUED_CLOSE_POLL_SECS;
-                    }
-                }
-                let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
+                reap_fresh_seat(d, sid, job_id, timing, await_disposition).await;
             });
         }
         let how = delivered?;
@@ -1330,6 +1512,11 @@ fn deliver_push(
         SCHEDULE_QUEUE_ORIGIN,
         SCHEDULE_QUEUE_CAP,
         role_guard,
+        // ★(성찰 A14) 스케줄 push 는 **kill-switch 만** 늦은 동결로 본다. 좌석 pause(헬스 조치
+        //   `pause-queue`)는 배달을 미룰 뿐이고 항목은 큐에서 기다린다 — 그것을 실패로 접으면
+        //   이 회차가 `schedule.fired` 에서 에러로 종결돼 다음 주기까지 일감이 오지 않는다.
+        //   경보(`enqueue_alert`)는 반대다: 보류해도 잃지 않으므로 판정과 같은 술어를 쓴다.
+        crate::alert_route::FreezeGuard::Daemon,
     )
     .map(|_| "queued")
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
@@ -1357,6 +1544,92 @@ fn has_machine_label(text: &str) -> bool {
         return ch == '[' || ch == '\u{ff3b}';
     }
     false
+}
+
+/// ★(성찰 A4 · blocking) fresh 좌석의 **회수** — 미완료 항목이 있으면 닫지 않는다.
+///
+/// 종전 배선: `sleep(ttl)` → 처분을 최대 1,800초 기다림 → **무조건** `close_surface(Reap)`.
+/// 그 마지막 한 줄이 조건 없는 폐기였다. `push_queued + fresh:true + close_after_secs:0`
+/// (→ 하한 60초) 적재 후 승인 대기가 1,800초를 넘으면 활성 큐에 항목이 남아 있는데도 좌석이
+/// 닫히고, 그 항목은 `record_active_drain(…, "surface_closed")` + `queue.dropped` 로 폐기된다 —
+/// 잡의 일감은 끝내 실행되지 않는데 그 사실은 이미 `schedule.fired{detail:"queued"}`(성공)로
+/// 보고된 뒤다. 게다가 [`surface_queue_pending`] 은 좌석이 사라지면 `false` 라
+/// "처분이 정해졌다" 와 "좌석이 없어졌다" 가 **같은 모양**이었다.
+///
+/// 이제 시간 상한은 **회수 보류 + 안내 이벤트**다: 유예([`QUEUED_DELIVERY_GRACE_SECS`])를
+/// 넘기면 `schedule.fresh_reap_deferred` 를 한 번 내고(그 뒤로는
+/// [`QUEUED_DEFER_NOTICE_INTERVAL_SECS`] 간격으로 되풀이) **계속 기다린다**. 대기의 실질
+/// 상한은 큐 항목 자신의 TTL 이 진다 — 배달이든 만료든 처분이 정해지면 즉시 회수된다.
+/// 좌석이 이미 사라진 경우도 `close_surface` 가 멱등이라 그대로 지나간다.
+/// 회수 타이머의 **네 시간축** — 프로덕션은 상수에서, 검체는 같은 비율의 압축 시계에서 만든다
+/// (`tokio` 의 `test-util`(가상시간)은 이 크레이트의 feature 집합에 없다 — 축을 값으로 빼서
+///  같은 배선을 그대로 돌린다). 세 번째와 네 번째가 종전에 **한 상수**로 묶여 있었다.
+#[derive(Clone, Copy, Debug)]
+struct ReapTiming {
+    /// 좌석 회수까지의 기본 유예(잡의 `close_after_secs` · 큐 경유면 하한 60초).
+    ttl: Duration,
+    /// 처분 미정 상태에서 **안내를 내기 시작하는** 경계(회수 시각이 아니다).
+    grace: Duration,
+    /// 처분 확인 간격.
+    poll: Duration,
+    /// 유예를 넘긴 뒤 안내를 되풀이하는 간격.
+    notice: Duration,
+}
+
+impl ReapTiming {
+    fn for_job(ttl_secs: u64) -> Self {
+        Self {
+            ttl: Duration::from_secs(ttl_secs),
+            grace: Duration::from_secs(QUEUED_DELIVERY_GRACE_SECS),
+            poll: Duration::from_secs(QUEUED_CLOSE_POLL_SECS),
+            notice: Duration::from_secs(QUEUED_DEFER_NOTICE_INTERVAL_SECS),
+        }
+    }
+
+    /// 검체 전용 — **1000배 압축**(1초 → 1밀리초). 경계 건수·순서는 프로덕션과 동일하다.
+    #[cfg(test)]
+    fn compressed(ttl_secs: u64) -> Self {
+        Self {
+            ttl: Duration::from_millis(ttl_secs),
+            grace: Duration::from_millis(QUEUED_DELIVERY_GRACE_SECS),
+            poll: Duration::from_millis(QUEUED_CLOSE_POLL_SECS),
+            notice: Duration::from_millis(QUEUED_DEFER_NOTICE_INTERVAL_SECS),
+        }
+    }
+}
+
+async fn reap_fresh_seat(
+    d: Arc<Daemon>,
+    sid: u64,
+    job_id: String,
+    t: ReapTiming,
+    await_disposition: bool,
+) {
+    tokio::time::sleep(t.ttl).await;
+    if await_disposition {
+        let mut waited = Duration::ZERO;
+        let mut since_notice = t.notice;
+        // ★좌석 소멸과 처분 확정을 **가른다**: 좌석이 없어졌으면 더 기다릴 대상이 없다.
+        //   ([`surface_queue_pending`] 하나만 보면 두 사실이 같은 `false` 로 접힌다.)
+        while d.get_surface(sid).is_some() && surface_queue_pending(&d, sid) {
+            if waited >= t.grace && since_notice >= t.notice {
+                d.bus.publish(
+                    "schedule.fresh_reap_deferred",
+                    "schedule",
+                    Some(sid),
+                    json!({"job": job_id, "surface_id": sid,
+                           "waited_secs": waited.as_secs(), "waited_ms": waited.as_millis() as u64,
+                           "grace_secs": QUEUED_DELIVERY_GRACE_SECS,
+                           "note": "적재된 일감의 처분이 아직 정해지지 않았다 — 좌석을 회수하지 않는다(회수하면 그 일감이 폐기된다)"}),
+                );
+                since_notice = Duration::ZERO;
+            }
+            tokio::time::sleep(t.poll).await;
+            waited += t.poll;
+            since_notice += t.poll;
+        }
+    }
+    let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
 }
 
 /// 그 좌석의 활성 큐에 아직 배달되지 않은 항목이 남아 있는가(처분 미정) — 좌석이 없으면 false.
@@ -1765,7 +2038,7 @@ mod tests {
     }
 
     /// 테스트 전용 격리 데몬 — 고유 하위 디렉터리에 소켓을 둬 병렬 실행 시 상태가 섞이지 않게 한다.
-    fn test_daemon() -> Arc<Daemon> {
+    pub(super) fn test_daemon() -> Arc<Daemon> {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "cys-sched-test-{}-{}-{}",
@@ -2273,6 +2546,174 @@ mod tests {
         oneshot.at = Some(1_900_000_000);
         oneshot.fresh = true;
         assert_eq!(effective_close_ttl(&oneshot), None);
+    }
+
+    fn sched_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-sched-a11-{tag}-{}-{}-{n}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// ★(성찰 A11) **잠금 없는 병렬 writer 가 없다** — writer 셋이 각자 잠금 아래에서
+    /// 읽기→추가→원자 치환을 반복하는 동안 독립 reader 는 언제나 파싱 가능한 문서를 보고,
+    /// 끝난 뒤 문서에는 **모든 writer 의 모든 추가**가 남아 있다(읽기와 치환 사이에 낀 추가가
+    /// 옛 문서로 덮이지 않는다 = 완료된 `cys schedule add` 소멸 없음).
+    #[test]
+    fn schedule_writers_serialize_under_the_lock_and_no_add_is_lost() {
+        let dir = sched_dir("writers");
+        let path = dir.join("schedule.json");
+        std::fs::write(&path, r#"{"jobs": []}"#).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bad_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let (path, stop, bad) = (path.clone(), stop.clone(), bad_reads.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(c) = std::fs::read_to_string(&path) {
+                        reads += 1;
+                        if serde_json::from_str::<serde_json::Value>(&c).is_err() {
+                            bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+                reads
+            })
+        };
+        const WRITERS: usize = 3;
+        const ADDS: usize = 25;
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..ADDS {
+                        let _lock = ScheduleFileLock::acquire(&path).expect("writer 잠금");
+                        let mut root: serde_json::Value =
+                            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                        root["jobs"].as_array_mut().unwrap().push(json!({
+                            "id": format!("w{w}-{i}"), "action": "push", "via_queue": true,
+                            "to": "master", "text": "x", "every_minutes": 60}));
+                        assert!(write_schedule_atomic(&path, &root), "원자쓰기 실패");
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reads = reader.join().unwrap();
+        assert!(reads > 0, "reader 가 한 번도 읽지 못했다");
+        assert_eq!(bad_reads.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "reader 가 파싱 불가한(찢긴) schedule.json 을 봤다");
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["jobs"].as_array().unwrap().len(), WRITERS * ADDS,
+            "잠금 아래의 추가가 다른 writer 의 치환에 덮여 사라졌다");
+        // 잠금 디렉터리는 전부 해제됐고 tmp 잔재도 없다.
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists(), "잠금이 해제되지 않았다");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp 잔재: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(성찰 A11) 핫리로드(쓰기 모드)는 잠금을 **기다리고**, 읽기 전용 로더는 잠금 아래에서도
+    /// **기다리지 않는다**(CQS) — 그리고 읽기 전용은 파일을 바꾸지 않는다(구 표현 그대로).
+    #[test]
+    fn hot_reload_waits_for_the_writer_lock_but_read_only_never_does_and_never_writes() {
+        let dir = sched_dir("cqs");
+        let path = dir.join("schedule.json");
+        let legacy = r#"{"jobs": [{"id": "j", "action": "push", "via_queue": true, "to": "master",
+            "text": "x", "every_minutes": 60}]}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // 검체가 잠금을 쥔다(= CLI 가 쓰는 중).
+        let held = ScheduleFileLock::acquire(&path).expect("잠금");
+        // 읽기 전용: 즉시 돌아오고 파일은 바이트 동일.
+        let t0 = std::time::Instant::now();
+        let jobs = load_jobs_at(&path, LoadMode::ReadOnly);
+        assert_eq!(jobs.len(), 1);
+        assert!(t0.elapsed() < Duration::from_millis(500), "읽기 전용 로더가 잠금을 기다렸다");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy, "읽기 전용 로더가 파일을 바꿨다");
+        // 쓰기 모드: 잠금이 풀릴 때까지 기다린다(그 사이 파일 무접촉).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p2 = path.clone();
+        let hot = std::thread::spawn(move || {
+            let jobs = load_jobs_at(&p2, LoadMode::HotReload);
+            tx.send(()).unwrap();
+            jobs
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "핫리로드가 잠금을 기다리지 않았다");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy, "잠금 보유 중에 파일이 바뀌었다");
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(5)).expect("잠금 해제 뒤 핫리로드가 끝나야 한다");
+        let jobs = hot.join().unwrap();
+        assert_eq!(jobs.len(), 1);
+        // 잠금 아래에서 정규형으로 접혔다(triage X8 의 되쓰기는 유지된다 — 단일 writer 자리에서).
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["jobs"][0]["action"], json!(ACTION_PUSH_QUEUED));
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(성찰 A11 ⓒ) 손상 격리 뒤 **같은 틱에서** builtin 이 복구된다 — 종전에는 재기동까지 전
+    /// builtin(phoenix·learn·cycle·formation·promote) 이 침묵했다. 읽기 전용 로더는 격리하지 않는다.
+    #[test]
+    fn corrupt_schedule_is_quarantined_and_builtins_return_in_the_same_tick() {
+        let dir = sched_dir("corrupt");
+        let path = dir.join("schedule.json");
+        std::fs::write(&path, b"{ this is not valid json ]").unwrap();
+        // 읽기 전용: 격리하지 않는다(rename 은 쓰기다).
+        assert!(load_jobs_at(&path, LoadMode::ReadOnly).is_empty());
+        assert!(path.exists(), "읽기 전용 로더가 손상본을 격리(rename)했다");
+        // 핫리로드: 격리 + 같은 호출에서 builtin 복구.
+        let jobs = load_jobs_at(&path, LoadMode::HotReload);
+        let quarantined = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
+        assert!(quarantined, "손상본이 격리되지 않았다");
+        let builtin_ids: Vec<&str> = jobs.iter().map(|j| j.id.as_str()).collect();
+        let expected: Vec<String> = builtin_jobs()
+            .iter()
+            .filter_map(|j| j["id"].as_str().map(str::to_string))
+            .collect();
+        assert!(!expected.is_empty());
+        for id in &expected {
+            assert!(builtin_ids.contains(&id.as_str()), "같은 틱 복구에 builtin {id} 가 없다: {builtin_ids:?}");
+        }
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["jobs"].as_array().unwrap().len() >= expected.len());
+        assert!(!ScheduleFileLock::lock_dir_for(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 죽은 보유자의 잠금(부패 mtime)은 깨고 진입한다 · 살아있는 잠금은 대기 상한에서 `None`.
+    #[test]
+    fn stale_schedule_lock_is_broken_and_live_lock_times_out() {
+        let dir = sched_dir("stale");
+        let path = dir.join("schedule.json");
+        let lock_dir = ScheduleFileLock::lock_dir_for(&path);
+        std::fs::create_dir(&lock_dir).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        // 부패 상한 10ms → 30ms 된 잠금은 깨진다.
+        let got = ScheduleFileLock::acquire_with(&path, Duration::from_millis(200), Duration::from_millis(10));
+        assert!(got.is_some(), "부패 잠금을 깨지 못했다");
+        // 살아있는(방금 만든) 잠금은 대기 상한 안에 못 잡는다 — 잠금 없이 쓰는 경로는 없다.
+        let again = ScheduleFileLock::acquire_with(&path, Duration::from_millis(100), Duration::from_secs(30));
+        assert!(again.is_none(), "살아있는 잠금을 뚫었다");
+        drop(got);
+        assert!(!lock_dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2888,6 +3329,8 @@ mod tests {
 mod triage_schedule {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::Ordering;
+    use super::tests::test_daemon;
 
     /// [codex #8 blocking] 강등 안전이 builtin 만 덮고, **지원한다고 문서화한 opt-in 표현**은 덮지 않는다.
     ///
@@ -2928,6 +3371,109 @@ mod triage_schedule {
             effective_close_ttl(&job),
             Some(0),
             "큐 경유 배달은 준비 게이트를 기다리는데 회수는 즉시다 — 적재된 일감이 배달 전에 폐기된다"
+        );
+    }
+
+    /// ★(성찰 A4 · blocking) **보류 중인 fresh 작업을 좌석과 함께 회수하지 않는다.**
+    ///
+    /// 실행 반례(종전): `push_queued + fresh:true + close_after_secs:0`(→ 하한 60초) 적재 후
+    /// 승인 대기 1,800초가 지나면 활성 큐에 항목이 남아도 `close_surface(…, Reap)` 이 조건 없이
+    /// 돌아 그 항목이 `queue.dropped` 로 폐기됐다 — 잡의 일감은 끝내 실행되지 않는데 그 사실은
+    /// 이미 `schedule.fired{detail:"queued"}`(성공)로 보고된 뒤다.
+    ///
+    /// 전체 경로(60초 TTL + 1,800초 유예 = **1,860초**)를 1000배 압축 시계로 그대로 돈다
+    /// ([`ReapTiming::compressed`] — 경계 건수·순서는 프로덕션과 동일하다). 상수 자체의 값과
+    /// **분리**는 `fresh_reap_constants_separate_leak_period_from_delivery_grace` 가 핀한다.
+    #[tokio::test]
+    async fn triage_a4_a_pending_queue_item_defers_the_fresh_seat_reap() {
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("w-fresh-1".into()), 24, 80)
+            .expect("좌석 생성");
+        daemon.roles.lock().unwrap().insert("w-fresh-1".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        // 적재(승인 대기) — 배달자가 게이트를 통과시키기 전까지 이 항목은 활성 큐에 남는다.
+        let job: Job = serde_json::from_value(json!({
+            "id": "fresh-queued", "action": ACTION_PUSH_QUEUED, "to": "w", "text": "x",
+            "fresh": true, "close_after_secs": 0, "launch": {"role": "w", "agent": "claude"}
+        }))
+        .expect("스키마");
+        assert_eq!(effective_close_ttl(&job), Some(QUEUED_CLOSE_MIN_TTL_SECS), "전제: 하한 60초");
+        assert_eq!(
+            deliver_push(&daemon, &job, s.id, "[schedule fresh-queued] 본문", None),
+            Ok("queued")
+        );
+        let depth = || s.pending_queue.lock().unwrap().len();
+        assert_eq!(depth(), 1, "전제 불성립 — 적재되지 않았다");
+
+        let mut rx = daemon.bus.subscribe();
+        let d = Arc::clone(&daemon);
+        let sid = s.id;
+        let handle = tokio::spawn(async move {
+            reap_fresh_seat(d, sid, "fresh-queued".into(), ReapTiming::compressed(QUEUED_CLOSE_MIN_TTL_SECS), true).await;
+        });
+
+        // 유예 경계(60 + 1,800)에서 **전용 안내 이벤트 1건**이 나온다.
+        let notice = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let e = rx.recv().await.expect("버스");
+                if e["name"] == "schedule.fresh_reap_deferred" {
+                    return e;
+                }
+                assert_ne!(e["name"], "queue.dropped", "보류 중인 일감이 폐기됐다");
+            }
+        })
+        .await
+        .expect("유예 경계에서 안내 이벤트가 오지 않았다(조용히 회수했거나 영영 기다린다)");
+        assert_eq!(notice["payload"]["job"], json!("fresh-queued"));
+        assert_eq!(notice["payload"]["waited_ms"], json!(QUEUED_DELIVERY_GRACE_SECS),
+            "안내가 유예 경계가 아닌 곳에서 났다");
+        assert_eq!(notice["payload"]["grace_secs"], json!(QUEUED_DELIVERY_GRACE_SECS));
+        // ★그 순간의 사실(이 스레드는 await 하지 않았으므로 회수 태스크는 진행하지 않는다):
+        //   좌석 보존 · 항목 보존 · 주입 0.
+        assert!(daemon.get_surface(sid).is_some(), "미완료 항목이 있는데 좌석을 닫았다");
+        assert_eq!(depth(), 1, "미완료 항목이 큐에서 사라졌다(주입 또는 폐기)");
+
+        // 처분이 정해지면(배달·만료) 그때 회수된다 — 무한 보류가 아니다.
+        s.pending_queue.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("처분이 정해졌는데 회수가 끝나지 않았다")
+            .expect("회수 태스크 패닉");
+        assert!(
+            daemon.get_surface(sid).is_none_or(|x| x.exited.load(Ordering::Relaxed)),
+            "처분이 정해졌는데 좌석이 회수되지 않았다(누수)"
+        );
+    }
+
+    /// ★(성찰 A4) '누수 방지 주기' 와 '배달 유예' 는 **다른 상수**다 — 한 숫자로 묶여 있어서
+    /// 반복 fresh 잡의 기본 TTL 을 바꾸면 배달 유예가 함께 움직였다.
+    #[test]
+    fn fresh_reap_constants_separate_leak_period_from_delivery_grace() {
+        assert_eq!(FRESH_RECURRING_DEFAULT_TTL_SECS, 1800, "누수 방지 주기");
+        assert_eq!(QUEUED_DELIVERY_GRACE_SECS, 1800, "배달 유예 안내 경계");
+        assert_eq!(QUEUED_CLOSE_MIN_TTL_SECS, 60, "큐 경유 회수 하한");
+        // 실행 반례의 전체 경로: 60초 TTL + 1,800초 유예 = 1,860초.
+        assert_eq!(QUEUED_CLOSE_MIN_TTL_SECS + QUEUED_DELIVERY_GRACE_SECS, 1_860);
+        let src = include_str!("schedule.rs");
+        // ★needle 을 쪼개 조립한다 — `include_str!` 은 **이 검체 자신**도 읽으므로 통짜
+        //   리터럴을 쓰면 검체가 자기 문자열에 걸려 언제나 실패한다(자기참조 함정).
+        let fused = format!("{}{}", "QUEUED_CLOSE_MAX_WAIT_SECS: u64 = ", "FRESH_RECURRING_DEFAULT_TTL_SECS");
+        assert!(!src.contains(&fused), "두 성질이 다시 한 상수로 묶였다");
+        // 회수는 **조건부**다: 미완료 항목이 있으면 닫지 않는다.
+        let body = src
+            .split("async fn reap_fresh_seat(")
+            .nth(1)
+            .expect("회수 함수 소실");
+        let body = &body[..body.find("\n}\n").expect("함수 끝")];
+        assert!(
+            body.contains("while d.get_surface(sid).is_some() && surface_queue_pending(&d, sid)"),
+            "회수 대기가 '좌석 소멸'과 '처분 확정'을 다시 한 술어로 접었다"
+        );
+        assert!(
+            !body.contains("waited < QUEUED"),
+            "시간 상한이 다시 회수 조건이 됐다(미완료 항목이 좌석과 함께 폐기된다)"
         );
     }
 

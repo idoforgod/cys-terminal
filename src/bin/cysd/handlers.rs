@@ -224,8 +224,106 @@ fn record_create_caller(daemon: &Daemon, new_sid: u64, caller_pid: u32) {
 /// ★G4(W4-C) 권위 role 집합의 **단일 정의처** — authoritative_caller_ok(타이핑 가드 면제)·
 /// surface.reap(수동 좌석 회수)·queue.clear exited 예외(죽은 좌석 큐 정리)가 공유한다.
 /// 집합 변경 시 세 게이트가 갈라지지 않게 여기 한 곳만 고친다.
-fn privileged_role(r: &str) -> bool {
-    r == "master" || r == "cso"
+pub fn privileged_role(r: &str) -> bool {
+    // ★(성찰 A10) "cso" · "cso-2" · "cso-fresh-<epoch>" — 경보 라우팅과 **같은 범위**(접두).
+    //   종전의 정확 일치는 `claim_role(cso-2)` 를 비특권 latest-wins 로 흘려보내 임의 pane 이
+    //   자기 경보를 자기제외로 폐기시키고 CSO 부재 시 inbox 를 가져가게 했다. 정의처는 하나다:
+    //   `alert_route::is_cso_role`(라우팅) — 이 함수와 `reclaim::is_privileged_role` 은 그것을 쓴다.
+    r == "master" || crate::alert_route::is_cso_role(r)
+}
+
+/// ★(성찰 A5 · CONTRACTS §E-2) `queue.revive` 의 **권위 역할** — `privileged_role` 보다 좁다.
+///
+/// §E-2 는 "호출자는 **master 역할 좌석** 또는 원 발신 surface" 라고 못박았다. `cso` 를 여기
+/// 넣으면 CSO 좌석이 임의 좌석의 만료 항목을 그 좌석 활성 큐로 되살릴 수 있고, 그것은 WP-3A 의
+/// CSO 권한 **축소**와 반대 방향이다. drop(목적지 축)과 revive(발신 축)는 위협모델이 다르므로
+/// 술어도 다르다 — 종전에는 한 arm 을 공유해 `queue.clear` 의 목적지 소유권 모델을 물려받았다.
+fn revive_authority_role(r: &str) -> bool {
+    r == "master"
+}
+
+/// ★(성찰 A5) 그 항목의 **발신 표기**(`QueueEntry::from`)를 소재에서 읽는다.
+///
+/// 이 파일은 종전에 `from` 을 **한 번도 참조하지 않았다** — 그래서 revive 인가가 발신 축을
+/// 볼 재료 자체가 없었고, 목적지 축(`home.surface_id == caller`)으로 대신했다.
+/// 판독 실패·부재는 `None` 이고, 호출부는 그것을 허가가 아니라 **거부**로 읽는다.
+fn queue_entry_from_of(
+    daemon: &Arc<Daemon>,
+    home: &crate::governance::QueueEntryHome,
+    entry_id: &str,
+) -> Option<String> {
+    if let Some(s) = &home.surface {
+        if let Some(e) = s
+            .pending_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|e| e.id == entry_id)
+        {
+            return e.from.clone();
+        }
+        if let Some(e) = s
+            .expired_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|e| e.id == entry_id)
+        {
+            return e.from.clone();
+        }
+        return None;
+    }
+    // 복원분(살아있는 surface 없음) — WAL Value 행에서 읽는다.
+    let row_from = |rows: &Vec<Value>| -> Option<String> {
+        rows.iter()
+            .find(|it| {
+                it.get("id").and_then(|v| v.as_str()).or_else(|| it.get("mid").and_then(|v| v.as_str()))
+                    == Some(entry_id)
+            })
+            .and_then(|it| it.get("from").and_then(|v| v.as_str()).map(str::to_string))
+    };
+    row_from(&daemon.restored_queue.lock().unwrap_or_else(|e| e.into_inner()))
+        .or_else(|| row_from(&daemon.restored_expired.lock().unwrap_or_else(|e| e.into_inner())))
+}
+
+/// ★(성찰 A5) `queue.revive` 전용 인가(순수 · deny-by-default). `None` = 허용.
+///
+/// 계약 대조(§E-2) — 종전 배선은 세 축이 **전부** 어긋나 있었다:
+///   · A(원 발신 좌석) → 거부였다(자기 큐가 아니면 권위 역할을 요구했다) → **허용**
+///   · B(비발신 목적지 좌석) → 허용이었다(목적지 소유권 모델) → **거부**
+///   · cso → 허용이었다(`privileged_role`) → **거부**(master 만)
+///
+/// 발신 표기가 라벨(`daemon` · `schedule:*`)인 항목은 **되살릴 발신자가 없다** — master 전용이다.
+/// 발신 표기가 결측이어도 같다(결측은 값이 아니다 · 무증명은 허가가 아니다).
+fn revive_denial(
+    caller_pid: Option<u32>,
+    caller_sid: Option<u64>,
+    caller_role: Option<&str>,
+    entry_from: Option<&str>,
+) -> Option<&'static str> {
+    // ⓐ 발신 pid 자체가 없다 = 데몬 내부 · pane 밖 CLI(운영자 터미널). `queue.clear` 관례 그대로
+    //    통과한다 — 좌석 없는 호출자에게는 적용할 좌석 축이 없다.
+    let Some(_pid) = caller_pid else {
+        return None;
+    };
+    // ⓑ pid 는 있는데 좌석을 **해석하지 못했다**(성찰 A6): 이것은 '내부' 가 아니라 '모른다' 다.
+    //    revive 는 발신자임을 증명해야 하는 동사인데 증명의 재료가 없다 — 거부한다(막는 방향).
+    let Some(cs) = caller_sid else {
+        return Some("caller_unresolved");
+    };
+    if caller_role.is_some_and(revive_authority_role) {
+        return None;
+    }
+    match entry_from.map(cys::parse_surface_ref) {
+        // 원 발신 좌석 본인.
+        Some(Some(from_sid)) if from_sid == cs => None,
+        // 다른 좌석이 보낸 항목 — 목적지여도 되살릴 권한은 없다.
+        Some(Some(_)) => Some("not_the_sender"),
+        // 라벨 발신(daemon · schedule:*) — 되살릴 발신자가 없다.
+        Some(None) => Some("label_from_requires_master"),
+        // 발신 표기 결측.
+        None => Some("unknown_from_requires_master"),
+    }
 }
 
 /// ★G4(W4-C) 수동 reap(surface.reap) 순수 판정부 — **7조건 AND, 첫 미달에서 사유 코드 반환**
@@ -3651,7 +3749,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // (W2 · G14) announce 를 성공 아크로 미루므로 role 문자열도 상위 스코프에 보존한다.
             let role_for_announce = param_str(&params, "role").unwrap_or_default();
             if let Some(role) = param_str(&params, "role") {
-                if matches!(role.as_str(), "master" | "cso") {
+                if privileged_role(&role) {
                     // ★SEAT 승계(opt-in): 보유자가 '살아있으나 빈 좌석'(role 만 쥔 셸)이면 부활·부트가
                     // 영원히 잠긴다(2026-07-17 실사고). 승계는 **명시 요청(takeover_empty_seat)이 있고**
                     // 그 좌석이 결정론으로 Empty 일 때만 허용한다 — 파라미터가 없으면 아래 판정은
@@ -5213,7 +5311,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 판정 프로브(seat_claimable_now)는 전 프로세스 표를 refresh 하므로 **락 진입 전에**
             // 끝낸다: surfaces/roles 락을 쥔 채 수십 ms 를 태우면 데몬 전체가 그동안 정지한다.
             // 결과는 (승계 대상 surface_id) — 아래 임계영역이 이 판정만 소비한다(락 안 프로브 0).
-            let seat_takeover_ok: Option<u64> = if matches!(role.as_str(), "master" | "cso")
+            let seat_takeover_ok: Option<u64> = if privileged_role(&role)
                 && params
                     .get("takeover_empty_seat")
                     .and_then(|v| v.as_bool())
@@ -5258,7 +5356,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 이미 살아있는 다른 surface가 점유 중이면 재지정을 거부한다. 자기 surface가
                 // 이미 보유 중인 경우(idempotent re-claim)와 직전 보유자가 죽은(없거나 exited)
                 // 경우의 정당한 승계는 허용 — governance의 live 판정과 동일 기준.
-                if matches!(role.as_str(), "master" | "cso") {
+                if privileged_role(&role) {
                     if let Some(&holder) = roles.get(&role) {
                         // ★(W2 · G13) 임계영역 내 저비용 재검증 — 프로브↔여기 사이에 좌석이 다시
                         // 채워졌는지 값싼 사실(exited·agent_meta·last_human_input·seat_cache)로만
@@ -5317,7 +5415,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // **agent_alive 좌석 한정으로만** 보호한다. 살아 일하는 리뷰어의 역할 주소를 새
                 // pane 이 조용히 빼앗아 라우팅·알림·감시를 끊는 경로를 닫되, 죽은·행 걸린 좌석은
                 // 현행 latest-wins 를 그대로 둔다(그것이 사실상의 self-heal 경로 — 전면 제거 금지).
-                if !matches!(role.as_str(), "master" | "cso") {
+                if !privileged_role(&role) {
                     if let Some(&holder) = roles.get(&role) {
                         if holder != sid {
                             let protected = surfaces
@@ -7725,7 +7823,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 return Reply::Single(err_response(&id, "invalid_params", "missing entry_id"));
             };
             let hint = resolve_surface_id(&params);
-            let Some(home) = crate::governance::locate_queue_entry(daemon, &entry_id, hint) else {
+            // ★(성찰 A5) revive 는 힌트를 **탐색에 쓰지 않는다**: 힌트로 좁혀 찾으면 '다른
+            //   목적지를 지목한 되살림' 이 `not_found` 로 접혀 뜻이 숨는다(그리고 그 뜻은
+            //   §E-2 가 금지한 목적지 변경이다). 전수로 찾고 아래에서 명시 거절한다.
+            let locate_hint = if is_revive { None } else { hint };
+            let Some(home) = crate::governance::locate_queue_entry(daemon, &entry_id, locate_hint) else {
                 return Reply::Single(err_response(
                     &id,
                     "not_found",
@@ -7734,13 +7836,82 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             let deny_code = if is_revive { "revive_denied" } else { "drop_denied" };
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // ★(성찰 A6) `caller_sid == None` 은 **두 사실**이다: ⓐ 발신 pid 자체가 없다
+            //   (데몬 내부 · pane 밖 CLI) ⓑ pid 는 있는데 32단계 조상 추적이 실패했다
+            //   (Windows 래퍼 계층 · 재부모화 · `sysinfo` 경합). 종전에는 ACL 블록 전체가
+            //   `if let Some(cs)` 안이라 둘이 한 모양으로 접혀 ⓑ 의 워커 pane 이 오너 등급으로
+            //   통과했고, 하필 그때 §E-2 가 **필수**라고 못박은 `caller_surface` 가 null 이었다.
+            //   이제 그 차이를 감사에 남긴다(`queue.clear` :7869 의 근거 주석과 같은 규율).
+            let caller_resolution = match (caller_pid, caller_sid) {
+                (None, _) => "anonymous",
+                (Some(_), Some(_)) => "resolved",
+                (Some(_), None) => "unresolved",
+            };
+            if caller_resolution == "unresolved" {
+                daemon.bus.publish(
+                    "queue.caller_unresolved",
+                    "queue",
+                    home.surface_id,
+                    json!({"method": method, "entry_id": entry_id, "caller_pid": caller_pid,
+                           "caller_resolution": "unresolved", "requested_surface": home.surface_id,
+                           "note": "발신 pid 는 있는데 좌석을 해석하지 못했다 — 이것은 '내부 경로' 가 아니다"}),
+                );
+            }
+            // ★(성찰 A5) **동사별 인가**. revive 는 발신 축(내가 보낸 것을 되살린다), drop 은
+            //   목적지 축(그 좌석의 큐를 지운다)이라 위협모델이 다르다 — 한 arm 을 공유하던
+            //   종전 배선이 `queue.clear` 의 목적지 소유권 모델을 revive 에 물려줬다.
+            if is_revive {
+                let entry_from = queue_entry_from_of(daemon, &home, &entry_id);
+                let caller_role = caller_sid
+                    .and_then(|cs| daemon.get_surface(cs))
+                    .and_then(|s| s.role.lock().unwrap().clone());
+                if let Some(why) = revive_denial(
+                    caller_pid,
+                    caller_sid,
+                    caller_role.as_deref(),
+                    entry_from.as_deref(),
+                ) {
+                    daemon.bus.publish(
+                        "queue.revive_denied",
+                        "queue",
+                        home.surface_id,
+                        json!({"entry_id": entry_id, "reason": why,
+                               "caller_surface": caller_sid.map(surface_ref),
+                               "caller_pid": caller_pid, "caller_resolution": caller_resolution,
+                               "caller_role": caller_role, "entry_from": entry_from,
+                               "requested_surface": home.surface_id}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        deny_code,
+                        &format!(
+                            "queue.revive denied ({why}): 호출자는 master 역할 좌석이거나 그 항목의 \
+                             원 발신 surface 여야 한다(CONTRACTS §E-2)"
+                        ),
+                    ));
+                }
+                // ★목적지 변경 거부: `surface_id` 는 **탐색 힌트**일 뿐이고
+                //   `revive_queue_entry` 는 항목을 원 소재에서만 되살린다 — 힌트가 항목의
+                //   실제 소재와 다르면 그 호출은 '다른 좌석으로 되살려 달라' 는 뜻이므로
+                //   `not_found` 가 아니라 **거절**로 답한다(뜻을 숨기지 않는다).
+                if let Some(h) = hint {
+                    if home.surface_id != Some(h) {
+                        return Reply::Single(err_response(
+                            &id,
+                            deny_code,
+                            "queue.revive denied: 목적지 변경 금지 — 항목은 원 목적지 좌석에서만 되살아난다",
+                        ));
+                    }
+                }
+            }
             // ★(0.14.31 · 리뷰 R1 · codex blocking) 이 호출자가 "살아있는 타 좌석의 **활성** 항목"
             //   을 지울 권한이 있는가 — 아래 ACL 과 같은 규칙을 항목 상태와 **무관하게** 계산해
             //   `drop_queue_entry` 에 넘긴다. 인가는 `locate_queue_entry` 가 본 스냅샷(만료)으로
             //   나는데 실제 삭제는 그 뒤에 다시 찾은 위치에서 일어나므로, 그 사이 revive 가 끼면
             //   활성 항목이 지워졌다(경합). 판정을 삭제 임계영역 안에서 다시 집행하게 만든다.
             let mut deny_active = false;
-            if let Some(cs) = caller_sid {
+            // ★(성찰 A5) 아래 블록은 이제 **drop 전용**이다(현행 유지 — 목적지 소유권 모델).
+            if let Some(cs) = caller_sid.filter(|_| !is_revive) {
                 // 복원분(살아있는 surface 없음)은 '자기 큐' 가 아니다 — 권위 role 만 다룬다.
                 let own = !home.restored && home.surface_id == Some(cs);
                 if !own {
@@ -7799,18 +7970,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Ok((e, depth, already_active, sid)) => {
                         // 멱등 호출(이미 활성)은 상태 변화가 없다 — 이벤트·WAL 갱신 없음(소음 금지).
                         if !already_active {
-                            daemon.bus.publish(
-                                "queue.revived",
-                                "queue",
-                                sid,
-                                crate::state::queue_revived_payload(
-                                    sid.map(surface_ref).as_deref(),
-                                    &e,
-                                    depth,
-                                    already_active,
-                                    caller_sid,
-                                ),
+                            // ★(성찰 A5·A6 · §E-2) 감사 이벤트에 **호출자 좌석과 그 해석 상태**를
+                            //   싣는다. `by_surface`(state.rs 계약)만으로는 §E-2 가 필수라고
+                            //   못박은 `caller_surface` 가 원장에 남지 않는다.
+                            let mut payload = crate::state::queue_revived_payload(
+                                sid.map(surface_ref).as_deref(),
+                                &e,
+                                depth,
+                                already_active,
+                                caller_sid,
                             );
+                            if let Some(o) = payload.as_object_mut() {
+                                o.insert(
+                                    "caller_surface".into(),
+                                    caller_sid.map(surface_ref).map_or(Value::Null, Value::String),
+                                );
+                                o.insert("caller_pid".into(), json!(caller_pid));
+                                o.insert("caller_resolution".into(), json!(caller_resolution));
+                                o.insert("from".into(), json!(e.from));
+                            }
+                            daemon.bus.publish("queue.revived", "queue", sid, payload);
                             daemon.persist_queue_state();
                         }
                         Reply::Single(ok_response(
@@ -10300,6 +10479,187 @@ mod tests {
     /// 정본 §7 치명위험 ③의 "A만 배포" 다. 롤백 시 Rust 쪽 값은 `enabled:false` 로 정직하게
     /// 나오므로, 팩은 반드시 **값**을 본다.
     /// (정직한 범위: `enabled:true` 는 **기동 표식**이지 구독 태스크의 생존 증명은 아니다.)
+    /// ★(성찰 A5 · major) `queue.revive` 인가의 **세 축**이 CONTRACTS §E-2 와 반대였다.
+    ///
+    /// 종전(한 arm 을 drop 과 공유 · `queue.clear` 의 목적지 소유권 모델):
+    ///   A(원 발신 좌석)=거부 · B(비발신 목적지 좌석)=허용 · cso=허용.
+    /// §E-2: "호출자는 master 역할 좌석 또는 **원 발신 surface**, 목적지는 항목의 원 목적지
+    /// 좌석만, 감사 이벤트(caller_surface) 필수."
+    #[test]
+    fn revive_denial_follows_the_sender_axis_not_the_destination_axis() {
+        let a = 11u64;
+        let b = 22u64;
+        let from_a = cys::surface_ref(a);
+        let from_b = cys::surface_ref(b);
+        // A(원 발신) 허용.
+        assert_eq!(revive_denial(Some(7), Some(a), Some("worker"), Some(&from_a)), None);
+        // master 허용(권위).
+        assert_eq!(revive_denial(Some(7), Some(b), Some("master"), Some(&from_a)), None);
+        // B(비발신 목적지) 거부 — 종전에는 이것이 허용이었다.
+        assert_eq!(
+            revive_denial(Some(7), Some(b), Some("worker"), Some(&from_a)),
+            Some("not_the_sender")
+        );
+        // cso 거부 — `privileged_role` 을 그대로 쓰면 여기가 허용이 된다(WP-3A 와 반대 방향).
+        assert_eq!(
+            revive_denial(Some(7), Some(b), Some("cso"), Some(&from_a)),
+            Some("not_the_sender")
+        );
+        assert!(privileged_role("cso") && !revive_authority_role("cso"),
+            "revive 권위가 다시 privileged_role 로 넓어졌다");
+        // 라벨 발신(daemon · schedule:*)은 되살릴 발신자가 없다 — master 전용.
+        for label in ["daemon", "schedule:cso-alert-inbox-check-60m"] {
+            assert_eq!(
+                revive_denial(Some(7), Some(a), Some("worker"), Some(label)),
+                Some("label_from_requires_master")
+            );
+            assert_eq!(revive_denial(Some(7), Some(a), Some("master"), Some(label)), None);
+        }
+        // 발신 표기 결측은 허가가 아니다(결측은 값이 아니다).
+        assert_eq!(
+            revive_denial(Some(7), Some(a), Some("worker"), None),
+            Some("unknown_from_requires_master")
+        );
+        // ★(성찰 A6) `caller_sid == None` 의 두 사실을 가른다.
+        assert_eq!(revive_denial(None, None, None, Some(&from_a)), None, "내부·pane 밖 CLI 경로");
+        assert_eq!(
+            revive_denial(Some(7), None, None, Some(&from_a)),
+            Some("caller_unresolved"),
+            "추적 실패가 오너 등급으로 통과했다(§E-2 의 caller_surface 가 null 인 채로)"
+        );
+        // 자기 자신에게 보낸 항목(A→A)도 발신 축으로 통과한다.
+        assert_eq!(revive_denial(Some(7), Some(b), Some("worker"), Some(&from_b)), None);
+    }
+
+    /// ★(성찰 A5·A6) 실제 caller pid 로 도는 검체 — 순수 판정이 배선까지 닿았는지 본다.
+    #[test]
+    fn queue_revive_is_authorized_on_the_sender_axis_and_audits_the_caller() {
+        let dir = std::env::temp_dir()
+            .join(format!("cysd-revive-acl-{}-{:x}", std::process::id(), crate::state::now_epoch() as u64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let mk_seat = |role: &str| {
+            let s = daemon
+                .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
+                .expect("좌석");
+            daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+            daemon.roles.lock().unwrap().insert(role.into(), s.id);
+            s
+        };
+        let sender = mk_seat("worker");
+        let dest = mk_seat("worker-2");
+        let master = mk_seat("master");
+        let cso = mk_seat("cso");
+        let seed_pid = |pid: u32, sid: u64| {
+            daemon.caller_cache.lock().unwrap().insert(
+                pid,
+                crate::state::CallerCacheEntry::new(
+                    Some(sid),
+                    crate::state::now_epoch(),
+                    None,
+                    daemon.caller_gen.load(Ordering::Relaxed),
+                ),
+            );
+        };
+        let (pid_a, pid_b, pid_m, pid_c) = (900_101u32, 900_102, 900_103, 900_104);
+        seed_pid(pid_a, sender.id);
+        seed_pid(pid_b, dest.id);
+        seed_pid(pid_m, master.id);
+        seed_pid(pid_c, cso.id);
+
+        let now = crate::state::now_epoch();
+        let put_expired = |id: &str, from: Option<&str>| {
+            let e = crate::state::QueueEntry {
+                id: id.to_string(),
+                seq: 1,
+                text: "본문".into(),
+                enqueued_at: now - 9_000.0,
+                from: from.map(str::to_string),
+                origin: "send".into(),
+                ttl_secs: Some(60),
+                paused_total_secs: 0.0,
+                expired_at: Some(now - 3_600.0),
+                revived_at: None,
+                expired_notified: true,
+                expired_event_sent: true,
+            };
+            dest.expired_queue.lock().unwrap().push_back(e);
+        };
+        let revive = |entry: &str, pid: Option<u32>, extra: Value| {
+            let mut params = json!({"entry_id": entry});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    params[k] = v.clone();
+                }
+            }
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: "queue.revive".into(), params },
+                pid,
+            ) else {
+                panic!("single reply");
+            };
+            r
+        };
+        let sender_ref = cys::surface_ref(sender.id);
+
+        // ① B(비발신 목적지) 거부 — 종전에는 허용이었다.
+        put_expired("e-b", Some(&sender_ref));
+        let r = revive("e-b", Some(pid_b), json!({}));
+        assert_eq!(r["error"]["code"], json!("revive_denied"), "비발신 목적지가 되살렸다: {r}");
+        // ② cso 거부.
+        let r = revive("e-b", Some(pid_c), json!({}));
+        assert_eq!(r["error"]["code"], json!("revive_denied"), "cso 가 임의 항목을 되살렸다: {r}");
+        // ③ 목적지 변경 거부.
+        let r = revive("e-b", Some(pid_a), json!({"surface_id": sender.id}));
+        assert_eq!(r["error"]["code"], json!("revive_denied"), "목적지 변경이 통과했다: {r}");
+        // ④ A(원 발신) 허용 + 감사에 caller_surface.
+        let mut rx = daemon.bus.subscribe();
+        let r = revive("e-b", Some(pid_a), json!({}));
+        assert_eq!(r["result"]["revived"], json!(true), "원 발신자가 거부됐다: {r}");
+        let mut saw = false;
+        while let Ok(e) = rx.try_recv() {
+            if e["name"] == "queue.revived" {
+                assert_eq!(e["payload"]["caller_surface"], json!(sender_ref),
+                    "§E-2 필수 감사 필드 caller_surface 가 없다");
+                assert_eq!(e["payload"]["caller_resolution"], json!("resolved"));
+                saw = true;
+            }
+        }
+        assert!(saw, "되살림이 감사 이벤트 없이 일어났다");
+        // ⑤ master 허용(라벨 발신 항목).
+        put_expired("e-label", Some("daemon"));
+        let r = revive("e-label", Some(pid_a), json!({}));
+        assert_eq!(r["error"]["code"], json!("revive_denied"), "라벨 발신을 비-master 가 되살렸다: {r}");
+        let r = revive("e-label", Some(pid_m), json!({}));
+        assert_eq!(r["result"]["revived"], json!(true), "master 가 거부됐다: {r}");
+        // ⑥ (A6) 추적 실패 — 오너 등급으로 통과하지 않고 `caller_resolution` 이 감사에 남는다.
+        put_expired("e-unres", Some(&sender_ref));
+        let mut rx = daemon.bus.subscribe();
+        let r = revive("e-unres", Some(999_997), json!({}));
+        assert_eq!(r["error"]["code"], json!("revive_denied"), "추적 실패 호출자가 통과했다: {r}");
+        let mut audited = false;
+        while let Ok(e) = rx.try_recv() {
+            if e["name"] == "queue.caller_unresolved" {
+                assert_eq!(e["payload"]["caller_resolution"], json!("unresolved"));
+                assert_eq!(e["payload"]["caller_pid"], json!(999_997));
+                audited = true;
+            }
+        }
+        assert!(audited, "추적 실패가 감사에 남지 않았다(§E-2 caller_surface 결측의 원인)");
+        // ⑦ drop 은 현행 유지 — 목적지 축이다(같은 pid 로 자기 큐가 아닌 만료 항목을 지운다).
+        let Reply::Single(r) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "queue.drop".into(),
+                      params: json!({"entry_id": "e-unres"}) },
+            Some(pid_m),
+        ) else {
+            panic!("single reply");
+        };
+        assert!(r.get("error").is_none(), "drop 의 현행 인가가 함께 바뀌었다: {r}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn status_exposes_alert_route_contract_keys() {
         let dir = std::env::temp_dir().join(format!("cysd-alertroute-{:x}", std::process::id()));
@@ -13303,6 +13663,52 @@ mod tests {
             Some(master),
             "master 매핑이 공격자로 넘어갔다"
         );
+    }
+
+    /// ★(성찰 A10) 경보 라우팅은 `cso` 를 **접두**로 넓혔는데(`cso-2` 도 CSO 좌석) 특권 좌석 게이트는
+    /// 정확 일치였다 — `claim_role{"cso-2"}` 가 비특권 latest-wins 를 타 어떤 pane 이든 자기 좌석에
+    /// `cso-2` 를 박을 수 있었고, 그 순간부터 그 좌석의 `health.alert`·`context.threshold`·
+    /// `surface.exited` 는 자기제외로 **폐기**되며(①) CSO 부재 시 `live.first()` 가 그 좌석이라
+    /// inbox 를 가져갔다(②). 이제 특권 집합은 라우팅과 같은 범위이고, 명시 승계·죽은 보유자 승계는
+    /// 게이트가 닫지 않는다(자동 복구 경로 보존).
+    #[test]
+    fn claim_role_cso_variant_goes_through_the_privileged_gate() {
+        let daemon = claim_daemon();
+        // 살아있으나 **빈** cso-2 좌석(에이전트 미등록 = latest-wins 의 live-slot 보호 밖이었다).
+        let holder = make_surface(&daemon, Some("cso-2"));
+        daemon.roles.lock().unwrap().insert("cso-2".into(), holder);
+        let attacker = make_surface(&daemon, Some("worker-3"));
+        let pid = 990_301_u32;
+        bind_caller(&daemon, pid, attacker);
+        let resp = claim(&daemon, "cso-2", attacker, Some(pid));
+        assert_eq!(resp["ok"], json!(false), "빈 cso-2 좌석을 임의 pane 이 latest-wins 로 가져갔다: {resp}");
+        assert_eq!(resp["error"]["code"], json!("claim_denied"));
+        assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(holder), "cso-2 매핑이 넘어갔다");
+        // 대조 ①: **명시 승계**(`takeover_empty_seat`) 경로는 게이트가 닫지 않는다 — 답은 좌석
+        //   판정(`seat_claimable_now` · 이 프로세스 표의 Empty 여부)을 그대로 따른다.
+        let hs = daemon.get_surface(holder).unwrap();
+        let claimable = crate::governance::seat_claimable_now(&hs);
+        let req = Request { id: json!(1), method: "system.claim_role".into(),
+            params: json!({"role": "cso-2", "surface_id": attacker, "takeover_empty_seat": true}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else { panic!("single reply") };
+        assert_eq!(resp["ok"], json!(claimable),
+            "명시 승계 경로가 좌석 판정(claimable={claimable})과 다르게 답했다: {resp}");
+        if claimable {
+            assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
+            daemon.roles.lock().unwrap().insert("cso-2".into(), holder); // 대조 ② 는 원 보유자 기준
+        }
+        // 대조 ②: 죽은 보유자의 승계는 opt-in 없이 열린다(self-heal 보존 — 게이트가 기능을 닫지 않는다).
+        hs.exited.store(true, Ordering::Relaxed);
+        let resp = claim(&daemon, "cso-2", attacker, Some(pid));
+        assert_eq!(resp["ok"], json!(true), "죽은 cso-2 보유자의 승계가 막혔다: {resp}");
+        assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
+        // 특권 집합 ≡ 라우팅 범위.
+        for r in ["cso", "cso-2", "cso-fresh-1700000000", "master"] {
+            assert!(privileged_role(r), "{r} 가 특권 집합 밖이다");
+        }
+        for r in ["worker", "worker-2", "reviewer-codex", "planner", "csx"] {
+            assert!(!privileged_role(r), "{r} 가 특권 집합에 들어갔다");
+        }
     }
 
     fn create_surface_rpc(daemon: &Arc<Daemon>, role: Option<&str>, caller_pid: Option<u32>) -> Value {
