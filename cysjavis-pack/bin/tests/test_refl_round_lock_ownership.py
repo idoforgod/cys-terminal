@@ -120,7 +120,12 @@ with mod._best_effort_lock(base, wait=0.5, stale=300.0) as lk:
     if lk.held:                       # 임계구간 진입의 **관측 가능한 흔적**
         with open(base, "a", encoding="utf-8") as f:
             f.write("A\n")
-open(out, "w", encoding="utf-8").write(json.dumps(res))
+# ★A2(2026-09-11 · 부하 아래 실측 적색 1회): 부모의 배리어는 **파일 존재**를 기다린다 —
+#   `open(out,"w")` 는 내용을 쓰기 **전에** 빈 파일을 만들므로, 느린 기계에서 부모가 그 틈을 보고
+#   빈 문자열을 json.loads 해 `JSONDecodeError` 로 죽었다(순서 경합 · 제품 결함 아님).
+#   원자 교환으로 닫는다: 존재 = 완결이다(대기 상한을 늘려서는 못 고치는 자리).
+open(out + ".tmp", "w", encoding="utf-8").write(json.dumps(res))
+os.replace(out + ".tmp", out)
 '''
 
 for modname, mod in MODS:
