@@ -257,7 +257,7 @@ print("── 4단계: 릴리스 노트가 이름 붙인 저장소 경로의 실
 # 왜 릴리스 노트 1개인가: 다른 docs 는 이 레인의 소유 밖이다 — 고칠 권한이 없는 문서의 과거·예시
 #   경로로 3레인을 막으면 복구 책임과 권한이 갈린다(codex). 확대는 소유자별 정리 뒤에 한다.
 DOCS = [d for d in os.environ.get(
-    "LANE_PARITY_DOCS", "docs/RELEASE_NOTES_0.14.32.md").split(os.pathsep) if d]
+    "LANE_PARITY_DOCS", "docs/RELEASE_NOTES_0.14.33.md").split(os.pathsep) if d]
 DOC_PREFIXES = ("scripts/", "tools/", "src/", "docs/", "hooks/", "cysjavis-pack/")
 PACK_FALLBACK_PREFIX = "hooks/"      # 팩 상대 표기는 이것뿐이다(codex: 폴백을 넓히지 마라)
 # 의도적으로 실재하지 않는 경로의 허용 목록 — 값 = 사유(게이트 ALLOWED · UNREGISTERED_OK 와 같은
