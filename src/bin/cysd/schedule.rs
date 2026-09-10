@@ -455,9 +455,18 @@ fn schedule_tmp_path(path: &std::path::Path) -> PathBuf {
 /// 신뢰할 수 없어 쓰지 않는다). 대기는 [`SCHEDULE_LOCK_WAIT_MS`] 로 유계 — 못 잡으면 `None` 이고
 /// 호출부는 **이번 쓰기를 포기**한다(다음 틱이 다시 온다 · 잠금 없이 쓰는 경로는 없다).
 ///
-/// 같은 프로토콜을 CLI(`cys.rs` 의 `schedule add/rm` 저장 — cli-boot C10)가 써야 직렬화가
-/// 완성된다: 잠금 = `<schedule.json>.lock` 디렉터리 · 획득 = `create_dir` · 대기 ≤ 2,000ms(10ms 간격) ·
-/// mtime 30s 초과 잠금은 깨도 된다 · tmp = `<schedule.json>.<pid>.<nonce>.tmp` + rename · 해제 = `remove_dir`.
+/// 같은 프로토콜을 CLI(`cys.rs` 의 `schedule add/rm` 저장 — cli-boot C10)가 쓴다: 잠금 =
+/// `<schedule.json>.lock` 디렉터리 · 획득 = `create_dir` · 대기 ≤ [`SCHEDULE_LOCK_WAIT_MS`](10ms 간격) ·
+/// mtime [`SCHEDULE_LOCK_STALE_SECS`] 초과 잠금은 깨도 된다 · tmp = `<schedule.json>.<pid>.<nonce>.tmp`
+/// + rename · 해제 = `remove_dir`.
+///
+/// ★(통합 2026-09-10) 두 레인(A11 데몬 · C10 CLI)이 이 잠금을 **각자** 착지시켰고 값이 갈려
+/// 있었다(데몬 2,000ms/30s · CLI 3,000ms/60s). 부패 문턱이 갈리면 상호 배제가 무너진다 —
+/// 데몬이 30s 를 넘긴 **살아 있는** CLI 잠금을 깨고 같은 파일에 동시 진입한다(완료된
+/// `cys schedule add` 가 다시 사라지는 A11·C10 의 원래 사고 형상 그대로). 통일 방향은 **큰
+/// 쪽**이다: 문턱이 작으면 산 잠금을 깨고(정확성 손실), 크면 죽은 잠금 회수만 늦다(가용성 ·
+/// 데몬은 다음 틱이 있고 CLI 는 사람에게 사유를 낸다). 소스 대조 핀:
+/// `c10_cli_schedule_saves_go_through_the_canonicalizing_locked_atomic_transaction`.
 ///
 /// **읽기는 잠그지 않는다**(CQS). 읽기가 보는 것은 언제나 rename 전이거나 후인 온전한 문서다.
 pub struct ScheduleFileLock {
@@ -465,9 +474,11 @@ pub struct ScheduleFileLock {
 }
 
 /// 잠금 대기 상한(ms). 데몬 틱·CLI 의 쓰기는 수 ms 라 이 안에 언제나 풀린다.
-pub const SCHEDULE_LOCK_WAIT_MS: u64 = 2_000;
+/// **CLI `cys.rs::SCHEDULE_LOCK_WAIT_MS` 와 같은 값이어야 한다**(위 doc 참조).
+pub const SCHEDULE_LOCK_WAIT_MS: u64 = 3_000;
 /// 이보다 오래된 잠금은 죽은 보유자의 것이다(깨도 된다).
-pub const SCHEDULE_LOCK_STALE_SECS: u64 = 30;
+/// **CLI `cys.rs::SCHEDULE_LOCK_STALE_SECS` 와 같은 값이어야 한다** — 갈리면 상호 배제가 무너진다.
+pub const SCHEDULE_LOCK_STALE_SECS: u64 = 60;
 
 impl ScheduleFileLock {
     pub fn lock_dir_for(path: &std::path::Path) -> PathBuf {

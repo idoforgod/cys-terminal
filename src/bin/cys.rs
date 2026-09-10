@@ -8910,8 +8910,12 @@ mod seat_latch_negation_tests {
                 GateRecheck::Adopt(cys::readiness::Evidence::Valve),
                 "구 데몬(quiet 부재) 좌석의 재관측이 영구히 채택되지 않는다(성찰 R8 회귀 · 노드 0)"
             );
+            // ★(통합 2026-09-10) 여덟째 인자는 cli-boot C3 의 **능력 축**이다. 여기서는 시나리오와
+            //   같은 `Some(false)`(구 데몬 = 축을 낼 수 없음이 양성으로 증명됨)를 준다 — 그러면
+            //   이 단언은 "능력 부재가 **마커 팔**까지 열지는 않는다" 를 함께 잰다(C3 의 완화는
+            //   `marker == None` 팔 한정이라는 사실이 회귀 대상이 된다).
             assert_eq!(
-                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None),
+                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None, Some(false)),
                 GateRecheck::CarryUnproven,
                 "이월 벨트가 구 데몬 결측에서 열렸다 — 재도색 중 프레임에 붙여넣기 + Return 이 나간다"
             );
@@ -30979,6 +30983,44 @@ mod tests {
         assert!(
             refl_fn_body(src, "schedule_file_transaction").contains("cys::atomic_write_bytes(path, body.as_bytes())"),
             "트랜잭션이 원자 쓰기를 쓰지 않는다"
+        );
+        // ★(통합 2026-09-10) C10(CLI)·A11(데몬)이 **각자** 같은 이름의 디렉터리 잠금을 착지시켰다.
+        //   이름이 같아도 **부패 문턱이 갈리면 상호 배제가 무너진다**: 데몬이 30s 를 넘긴 살아 있는
+        //   CLI 잠금을 깨고 같은 파일에 동시 진입하면, 완료된 `cys schedule add` 가 데몬의 replace 로
+        //   다시 지워진다(A11·C10 의 원래 사고 형상). 세 상수를 **소스 대조**로 못박는다.
+        // 잠금 **이름**: 데몬은 `<파일명>.lock` 을 만든다 = CLI 미러 상수와 같은 문자열이어야 한다.
+        assert!(
+            sched.contains("path.with_file_name(format!(\"{name}.lock\"))")
+                && SCHEDULE_LOCK_DIRNAME == "schedule.json.lock",
+            "데몬 잠금 이름이 CLI 미러({SCHEDULE_LOCK_DIRNAME})와 갈렸다 — 이름이 갈리면 두 writer 가 서로를 못 본다"
+        );
+        // 잠금 **문턱**: 데몬 소스에서 실제 값을 읽어 CLI 상수와 대조한다(문자열 하드코딩 금지 —
+        // CLI 를 고치면 이 핀이 데몬도 함께 고치라고 붉어진다).
+        fn refl_daemon_u64(src: &str, name: &str) -> u64 {
+            let head = format!("pub const {name}: u64 = ");
+            let i = src.find(&head).unwrap_or_else(|| panic!("데몬에 {name} 이 없다"));
+            let rest = &src[i + head.len()..];
+            let lit: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '_')
+                .filter(|c| *c != '_')
+                .collect();
+            lit.parse().unwrap_or_else(|_| panic!("{name} 값을 읽지 못했다: {lit:?}"))
+        }
+        assert_eq!(
+            refl_daemon_u64(sched, "SCHEDULE_LOCK_WAIT_MS"),
+            SCHEDULE_LOCK_WAIT_MS,
+            "데몬 잠금 대기 상한이 CLI 와 갈렸다"
+        );
+        assert_eq!(
+            refl_daemon_u64(sched, "SCHEDULE_LOCK_STALE_SECS"),
+            SCHEDULE_LOCK_STALE_SECS,
+            "데몬 잠금 부패 문턱이 CLI 와 갈렸다 — 작은 쪽이 상대의 **산** 잠금을 깨고 같은 파일에 \
+             동시 진입한다(완료된 schedule add 가 다시 사라진다)"
+        );
+        assert!(
+            (SCHEDULE_LOCK_WAIT_MS / 1_000) < SCHEDULE_LOCK_STALE_SECS,
+            "대기 상한이 부패 문턱보다 길면 정상 대기자가 상대의 산 잠금을 깬다"
         );
     }
 }
