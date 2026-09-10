@@ -410,6 +410,11 @@ SEEN_STATE_EXPIRED = "expired"
 # W-id 는 영원히 inflight 로 남아 seen TTL 마다 낡은 wakeup_id 그대로 재enqueue 됐다
 # (wakeup 홍수). 만료와 같은 급의 종결이되 **배달이 아니다**(delivered 계수 불변).
 SEEN_STATE_DROPPED = "dropped"
+# ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #9) 데몬이 그 항목을 **보존·이동**했다 — 종결이 아니다.
+#   `queue.parked`(역할 좌석 종료 → 데몬 보존소) · `queue.rehomed`(보존소 → 같은 role 의 새 좌석).
+#   inflight 를 풀지 않고 **TTL 창만 되감는다**(`first_ts=now`): park 가 seen TTL(30분)을 넘겨도
+#   원본이 살아 있는데 같은 사건을 다시 enqueue 하지 않는다(중복 배달 차단). 조인 키는 `entry_ids`.
+SEEN_HOLD_EVENTS = ("queue.parked", "queue.rehomed")
 
 
 def _safe_key(key):
@@ -1737,6 +1742,7 @@ class Gate:
         try:
             ok, events, latest = fn(self._load_cursor(),
                                     ["queue.delivered", "queue.expired", "queue.dropped",
+                                     *SEEN_HOLD_EVENTS,
                                      "master.deadman", "master.idle"])
         except Exception:                       # noqa: BLE001 — 관측 실패가 판정을 죽이지 않는다
             return
@@ -1765,10 +1771,13 @@ class Gate:
                 if r.get("state") == SEEN_STATE_INFLIGHT and r.get("wakeup_id")]
         if not pend or not self._ack_ok:
             return
-        acked, expired, dropped = set(), set(), set()
+        acked, expired, dropped, held = set(), set(), set(), set()
         # ★(0.14.31 · 성찰 Q6) 종결은 셋이다 — 배달·만료·**폐기**. 조인 키는 셋 다 `entry_ids`
         #   (배달 원문에서 되읽은 W-id)이고, 그것이 이 상태머신의 유일한 조인 키다.
+        # ★(0.14.31 · 성찰 Q7) **보존·이동**(`SEEN_HOLD_EVENTS`)은 종결이 아니라 "아직 살아 있다" 다.
         _bucket = {"queue.delivered": acked, "queue.expired": expired, "queue.dropped": dropped}
+        for name in SEEN_HOLD_EVENTS:
+            _bucket[name] = held
         for ev in self._events:
             name = ev.get("name")
             if name not in _bucket:
@@ -1798,6 +1807,12 @@ class Gate:
                 seen_mark(self.state_dir, rec["key"], now_epoch,
                           state=SEEN_STATE_EXPIRED)
                 edge_fire(counters, "push_edge", rec["key"], now_epoch)
+            elif wid in held:
+                # ★(0.14.31 · 성찰 Q7) 데몬이 그 항목을 보존·이동했다(역할 좌석 종료 → 보존소 →
+                #   같은 role 의 새 좌석). 종결이 아니므로 상태는 inflight 그대로 두고 **TTL 창만
+                #   되감는다** — 그러지 않으면 park 가 30분을 넘길 때 `seen_claim` 이 만료로 보고
+                #   같은 사건을 다시 enqueue 한다(원본이 살아 있는데 중복 배달).
+                seen_mark(self.state_dir, rec["key"], now_epoch, first_ts=now_epoch)
 
     def _judge_and_route(self, shadow, counters):
         now_epoch = self.now_epoch_fn()

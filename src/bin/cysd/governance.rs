@@ -4219,6 +4219,15 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
             daemon.persist_queue_state();
         }
     }
+    // ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #2) Reap 이면 `restored_queue` 가드를 **맵 제거부터
+    //   park 까지** 쥔다 — persist 스냅샷(restored_queue → surfaces)이 그 사이에 끼어들면 항목이
+    //   맵에도 보존소에도 없는 파일이 디스크에 박히고 크래시가 그것을 유실로 만든다. 전역 락 순서
+    //   (restored_queue → surfaces → roles → surface.role → pending_queue)와 같은 방향이다.
+    let park_guard = if cause == CloseCause::Reap {
+        Some(daemon.restored_queue.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        None
+    };
     // 멤버십 제거 + 역할 정리를 surfaces 락 아래 한 임계영역에서 —
     // claim_role과 동일한 락 순서(surfaces → roles → surface.role)로 AB-BA 데드락 차단.
     let surface = {
@@ -4260,6 +4269,24 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         }
         surface
     };
+    // ★(0.14.31 · 성찰 Q7) Reap ∧ role 보유 = **park**(폐기 대신). 이 role 은 돌아온다고 바로 위에서
+    //   선언했다(묘비 없음). 데몬 재기동이었다면 같은 항목이 WAL → 복원 → rehome 으로 살아남는다 —
+    //   그 대칭을 reap 에도 준다. OwnerClose 는 종전대로 폐기한다(역할이 묘비에 올라 돌아오지 않는다).
+    let parked_active: Vec<crate::state::QueueEntry> = match park_guard {
+        Some(mut rq) => match surface.role.lock().unwrap().clone() {
+            Some(role) => {
+                let parked = park_active_into(&mut rq, &surface, &role);
+                drop(rq);
+                publish_parked(daemon, id, &role, "surface_reaped", &parked);
+                parked
+            }
+            None => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+    if !parked_active.is_empty() {
+        daemon.persist_queue_state();
+    }
     // ★D7(BOOTSTRAP_HARDENING WP-3): 묘비를 kill 루프 **이전**에 선영속 — 아래 kill 구간에서
     // 데몬이 SIGKILL/크래시로 죽으면 in-memory 묘비가 디스크에 없어 다음 콜드부트 phoenix가
     // "의도 삭제된 역할"을 부활시켰다. surfaces 락 해제 직후라 persist_topology 재진입 안전
@@ -4418,6 +4445,31 @@ fn queue_min_interval_secs() -> u64 {
 /// ★(0.14.31 · WP-5 M) 만료 큐(`Surface::expired_queue`) 상한 — 초과분은 가장 오래된 것부터
 /// 원장 묘비(`expired_evicted`) 기록 후 폐기한다(기록 실패 시 폐기하지 않는다).
 pub(crate) const QUEUE_EXPIRED_CAP: usize = 100;
+
+/// ★(0.14.31 · 성찰 Q16) 데몬 보존소 만료분(`restored_expired`) **전역** 상한. surface id 는 재사용되지
+/// 않으므로 돌아오지 않는 좌석(role 영구 부재 · `role:null`)마다 그룹 상한 100행이 영구 잔류하고,
+/// `persist_queue_state` 가 매 dirty 틱마다 그 전량을 write+fsync+rename 했다. 그룹 상한 뒤 이 상한을
+/// 한 번 더 집행한다 — 우선순위는 **① 활성 역할이 아닌 그룹 먼저(role 결측 ∨ roles 맵에 없음) ②
+/// 그 안에서 가장 오래된 것(`order_at`)**. 전용 틱 예산을 쓴다(그룹 축출이 예산을 다 써도 굶지 않는다
+/// · codex 설계 검토 #12).
+pub(crate) const QUEUE_EXPIRED_GLOBAL_CAP: usize = QUEUE_EXPIRED_CAP * 8;
+
+/// ★(0.14.31 · 성찰 Q12) **축출 후보 선정 — 순수 함수 하나.** `keys` = (순서 키 `order_at`, 원 인덱스).
+/// `len - cap` 만큼(≤ `budget`) **가장 오래된 것**부터 고른다(동률은 원 인덱스 = 등장순 · 결정적).
+/// 살아있는 좌석의 만료 큐와 데몬 보존소 두 경로가 이것을 공유한다 — 종전에는 좌석 경로가 "deque 앞 =
+/// 가장 오래된 것" 을 전제했고 그 전제는 rehome 뒤 거짓이었다(같은 항목 집합인데 저장 위치에 따라
+/// 운영자가 revive 할 수 있는 것이 달라졌다). 반환 인덱스는 락을 놓기 전에 id 로 바꿔 써야 한다.
+pub(crate) fn pick_evictions(keys: &[(f64, usize)], cap: usize, budget: usize) -> Vec<usize> {
+    if keys.len() <= cap || budget == 0 {
+        return Vec::new();
+    }
+    let over = keys.len() - cap;
+    let mut sorted: Vec<(f64, usize)> = keys.to_vec();
+    sorted.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+    });
+    sorted.into_iter().take(over.min(budget)).map(|(_, i)| i).collect()
+}
 
 /// ★(0.14.31 · 리뷰 R1 · codex) 한 틱에 축출하는 만료 항목 수 상한 — 묘비 append 가 fsync 를
 /// 동반하므로(내구성 수리) 무제한 축출은 watchdog 을 원장 I/O 에 묶는다. 초과분은 다음 틱.
@@ -6111,9 +6163,16 @@ fn enforce_expired_cap_budgeted(
         // ★(리뷰 R1 · codex D) **틱당 축출 상한** — 묘비는 fsync 를 동반한다(내구성 수리).
         //   150건 복원 백로그를 한 틱에 전부 축출하면 watchdog 이 그만큼 원장 I/O 에 묶인다.
         //   상한을 두면 몇 틱에 걸쳐 수렴하고(유계 · 5s 간격), 그동안 만료 큐는 상한 초과 상태로
-        //   **보존**된다(유실 아님). 만료 큐는 push_back 이므로 앞이 가장 오래된 것이다.
-        let over = x.len() - QUEUE_EXPIRED_CAP;
-        x.iter().take(over.min(*budget)).cloned().collect()
+        //   **보존**된다(유실 아님).
+        // ★(0.14.31 · 성찰 Q12) 후보는 "deque 앞" 이 아니라 **순서 키(`order_at`)** 로 고른다 —
+        //   rehome 이 만료 배치를 끼워 넣은 뒤에는 앞이 가장 오래된 것이 아니었다. 보존소 경로와
+        //   같은 순수 함수(`pick_evictions`)라 두 경로의 축출 집합이 같다.
+        let keys: Vec<(f64, usize)> =
+            x.iter().enumerate().map(|(i, e)| (e.order_at(), i)).collect();
+        pick_evictions(&keys, QUEUE_EXPIRED_CAP, *budget)
+            .into_iter()
+            .map(|i| x[i].clone())
+            .collect()
     };
     if candidates.is_empty() {
         return false;
@@ -6283,16 +6342,12 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
         let mut picked: Vec<(f64, usize)> = Vec::new();
         let mut groups: Vec<(Option<u64>, Vec<(f64, usize)>)> = by_sid.into_iter().collect();
         groups.sort_by_key(|(sid, _)| *sid);
-        for (_, mut rows) in groups {
-            if rows.len() <= QUEUE_EXPIRED_CAP {
-                continue;
+        for (_, rows) in groups {
+            // ★(0.14.31 · 성찰 Q12) 그룹 안의 후보 선정은 좌석 경로와 **같은 순수 함수**다
+            //   (오래된 것 먼저 · 동률은 파일 등장순). 예산 자르기는 아래 전체 나이순에서 한다.
+            for i in pick_evictions(&rows, QUEUE_EXPIRED_CAP, usize::MAX) {
+                picked.push(rows.iter().find(|(_, j)| *j == i).copied().expect("index from rows"));
             }
-            // 오래된 것 먼저(동률은 파일 등장순 — 결정적).
-            rows.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
-            });
-            let over = rows.len() - QUEUE_EXPIRED_CAP;
-            picked.extend(rows.iter().take(over).copied());
         }
         // ★(0.14.31 · triage 2026-09-08 · codex major M9) 예산 자르기는 **나이순** 위에서 한다.
         //   종전에는 여기서 `picked.sort_unstable()`(= 파일 등장순)로 되돌린 뒤 `take(budget)` 해서,
@@ -6314,6 +6369,65 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
             })
             .collect()
     };
+    evict_restored_expired(daemon, candidates, now, budget)
+}
+
+/// ★(0.14.31 · 성찰 Q16) **전역 상한 집행** — 그룹 상한(`enforce_restored_expired_cap`) 뒤에 돈다.
+/// 우선순위: ① 활성 역할이 아닌 그룹(role 결측 ∨ `Daemon::roles` 에 없음) 먼저 ② 그 안에서 가장
+/// 오래된 것(`order_at`). 전용 예산(`budget`)을 받는다 — 그룹 집행이 틱 예산을 다 써도 굶지 않는다.
+fn enforce_restored_expired_global_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    // roles 스냅샷은 보존소 락을 잡기 **전에** — 락 순서(restored_* → surfaces → roles)와 무관하게
+    //   두 락을 동시에 쥐지 않는다.
+    let active_roles: std::collections::HashSet<String> =
+        daemon.roles.lock().unwrap().keys().cloned().collect();
+    let candidates: Vec<(u64, crate::state::QueueEntry)> = {
+        let rx = daemon.restored_expired.lock().unwrap();
+        if rx.len() <= QUEUE_EXPIRED_GLOBAL_CAP {
+            return false;
+        }
+        let over = rx.len() - QUEUE_EXPIRED_GLOBAL_CAP;
+        // (역할 활성 여부, order_at, 등장순) — 비활성 먼저(false < true), 그 다음 오래된 것.
+        let mut keys: Vec<(bool, f64, usize)> = rx
+            .iter()
+            .enumerate()
+            .map(|(i, it)| {
+                let active = it
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|r| active_roles.contains(r));
+                (active, crate::state::queue_entry_from_row(it).order_at(), i)
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then(a.2.cmp(&b.2))
+        });
+        keys.into_iter()
+            .take(over.min(*budget))
+            .map(|(_, _, i)| {
+                let it = &rx[i];
+                (
+                    it.get("surface_id").and_then(|v| v.as_u64()).unwrap_or(0),
+                    crate::state::queue_entry_from_row(it),
+                )
+            })
+            .collect()
+    };
+    evict_restored_expired(daemon, candidates, now, budget)
+}
+
+/// 보존소 만료분 후보의 **실제 축출** — 이벤트(래치 앞) → 묘비(surface 별 배치) → 제거(id · 그 사이
+/// revive 된 것은 건드리지 않음) → `queue.dropped(expired_evicted)`. 그룹 상한·전역 상한이 공유한다.
+fn evict_restored_expired(
+    daemon: &Arc<Daemon>,
+    candidates: Vec<(u64, crate::state::QueueEntry)>,
+    now: f64,
+    budget: &mut usize,
+) -> bool {
     if candidates.is_empty() {
         return false;
     }
@@ -6391,6 +6505,68 @@ fn enforce_restored_expired_cap(daemon: &Arc<Daemon>, now: f64, budget: &mut usi
         crate::state::queue_dropped_payload("expired_evicted", &removed, None),
     );
     true
+}
+
+/// ★(0.14.31 · 성찰 Q7) 역할 좌석의 **미배달 활성 큐를 데몬 보존소(`restored_queue`)로 옮긴다.**
+///
+/// 【무엇이 틀렸었나】 `close_surface(Reap)` 은 한 줄 위에서 "이 role 은 돌아온다(묘비 없음 · phoenix
+/// 부활)" 고 선언하고 한 줄 아래에서 그 role 앞으로 온 미배달 작업만 지웠다. 대조군: 데몬 재기동이면
+/// 같은 항목이 WAL → `restored_queue` → rehome 으로 살아남는다. 발신자는 `queued:true` 를 받았고
+/// 남는 것은 `queue.dropped` 뿐이었다. 지금은 **같은 기제**를 쓴다 — 항목을 role 앵커 행으로 보존소에
+/// 두면 같은 role 의 다음 좌석이 rehome 으로 받는다(순서는 `order_at` 정렬 병합 · WAL 복원과 동형).
+///
+/// 반환 `None` = 역할이 없어 시도하지 않음(호출자가 종전 폐기 경로를 탄다), `Some(n)` = park 한 수.
+/// 인계 중(취소 불가 = writer 확정) 항목은 남긴다(codex 설계 검토 #4 — 구좌석·신좌석 이중 배달을
+/// 막는 것은 id dedup 이 아니라 예약 취소 규약이다). 락 순서: restored_queue → pending_queue.
+pub(crate) fn park_active_to_restored(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    reason: &str,
+) -> Option<usize> {
+    let role = s.role.lock().unwrap().clone()?;
+    let parked: Vec<crate::state::QueueEntry> = {
+        let mut rq = daemon.restored_queue.lock().unwrap();
+        park_active_into(&mut rq, s, &role)
+    };
+    publish_parked(daemon, s.id, &role, reason, &parked);
+    Some(parked.len())
+}
+
+/// `park_active_to_restored` 의 임계영역 본체 — 호출자가 `restored_queue` 가드를 쥐고 부른다
+/// (`close_surface` 는 그 가드를 **맵 제거까지** 걸쳐 쥔다 · codex 설계 검토 #2: 그 사이 persist
+/// 스냅샷이 끼어들면 항목이 어느 파일에도 없는 채 크래시할 수 있다).
+fn park_active_into(
+    rq: &mut Vec<Value>,
+    s: &Arc<crate::state::Surface>,
+    role: &str,
+) -> Vec<crate::state::QueueEntry> {
+    let taken = drain_active_except_inflight(s);
+    let role_opt = Some(role.to_string());
+    for e in &taken {
+        if rq.iter().any(|it| it.get("id").and_then(|v| v.as_str()) == Some(e.id.as_str())) {
+            continue;
+        }
+        rq.push(crate::state::queue_entry_row(s.id, &role_opt, e));
+    }
+    taken
+}
+
+fn publish_parked(
+    daemon: &Arc<Daemon>,
+    surface_id: u64,
+    role: &str,
+    reason: &str,
+    parked: &[crate::state::QueueEntry],
+) {
+    if parked.is_empty() {
+        return;
+    }
+    daemon.bus.publish(
+        "queue.parked",
+        "queue",
+        Some(surface_id),
+        crate::state::queue_parked_payload(reason, role, surface_id, parked),
+    );
 }
 
 /// ★(0.14.31 · 리뷰 R2 · codex blocking) 활성 큐를 비우되 **지금 인계 중인 항목은 남긴다.**
@@ -6572,6 +6748,20 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
     //   종전에는 좌석마다(그리고 좌석당 두 번) `QUEUE_EXPIRED_EVICT_PER_TICK` 을 새로 썼다 —
     //   좌석 100개면 한 틱에 2,000건 묘비 sync 가 가능했다(watchdog 이 원장 I/O 에 묶인다).
     let mut evict_budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+    // ★(0.14.31 · 성찰 Q5) **보존소도 같은 수명을 산다** — 좌석 순회 **앞**에서, 그리고 이 틱의 rehome
+    //   **앞**에서(호출부 순서 · codex 설계 검토 #5: 크레딧을 받기 전에 rehome 의 폴백 분류가 TTL
+    //   경계 행을 만료시키면 안 된다). 목적지 없는 항목(role 결측 · `null` · 무매칭)은 종전에
+    //   rehome 의 조기 return 으로 TTL 평가 전에 보존돼, 49h 가 지나도 만료·이벤트·통지·상한이 전부
+    //   없었다 → 소비자의 W-id 는 영원히 inflight → TTL 마다 재enqueue(폭주 ①).
+    changed |= restored_queue_lifecycle_pass(
+        daemon,
+        now,
+        delta,
+        daemon_paused,
+        default_ttl,
+        &mut expired_events,
+        &mut notices,
+    );
     for s in &surfaces {
         // ★(리뷰 R1 · codex D) 상한 집행은 **exited 조기 continue 앞**이다 — 종료 좌석도 reap
         //   (close_surface) 전까지 맵에 남아 그 만료 큐가 매 persist 마다 파일에 쓰인다.
@@ -6618,7 +6808,18 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
             // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중인 항목은 만료로 **옮기지 않는다** —
             //   취소에 성공하면 옮겨도 되고(주입 0), 실패하면 그 항목은 지금 배달 중이라 만료 큐로
             //   옮기는 순간 '배달됐는데 만료 큐에도 있다'(revive 하면 중복 배달)가 된다.
-            let inflight = s.cancel_inject_reservation();
+            // ★(0.14.31 · 성찰 Q13) 취소는 **만료 대상을 겨눈 예약만** — 종전에는 매 틱·모든 좌석에서
+            //   무조건 끊어, 무관한 항목 X 의 진행 중 인계가 매 틱 중단됐다(영수증 없는 원장 선기록).
+            let expiring: Vec<String> = q
+                .iter()
+                .filter(|e| crate::state::queue_entry_expired(e, now, default_ttl))
+                .map(|e| e.id.clone())
+                .collect();
+            let inflight = if expiring.is_empty() {
+                Vec::new()
+            } else {
+                s.cancel_inject_reservation_targeting(&expiring)
+            };
             let mut i = 0;
             while i < q.len() {
                 if inflight.iter().any(|k| *k == q[i].id) {
@@ -6694,6 +6895,9 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
     }
     // ★(리뷰 R1 · codex D) 살아있는 좌석이 없는 복원 만료분도 상한 안에 둔다(surface 순회 밖).
     changed |= enforce_restored_expired_cap(daemon, now, &mut evict_budget);
+    // ★(0.14.31 · 성찰 Q16) 전역 상한 — 전용 예산(그룹 축출이 틱 예산을 다 써도 굶지 않는다).
+    let mut global_budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+    changed |= enforce_restored_expired_global_cap(daemon, now, &mut global_budget);
     // 발행 → 그 **뒤에** 래치. 중간 크래시는 "이벤트는 나갔고 래치는 없다" = 재기동 후 한 번 더
     // 발행(중복 1줄 · 소비자는 entry_id 로 멱등)이고, 반대 방향(영구 누락)은 만들지 않는다.
     let mut sent_ids: Vec<String> = Vec::new();
@@ -6710,6 +6914,8 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
                 }
             }
         }
+        // ★(성찰 Q5) 보존소 행의 래치도 같은 자리에서(발행 **뒤**).
+        latch_restored_expired_rows(daemon, &sent_ids, "expired_event_sent");
     }
     // 발신 surface 큐로 1줄 — 살아 있고 상한 여유가 있을 때만. 성공한 항목만 표식.
     let mut notified_ids: Vec<String> = Vec::new();
@@ -6757,10 +6963,131 @@ pub(crate) fn queue_expiry_pass(daemon: &Arc<Daemon>) -> bool {
         //   메모리 큐에 남아 있고 다음 틱이 같은 결정적 id 로 다시 시도한다(멱등).
         if daemon.queue_wal_durable() {
             mark_expired_notified(&surfaces, &notified_ids);
+            latch_restored_expired_rows(daemon, &notified_ids, "expired_notified");
         }
         changed = true;
     }
     changed
+}
+
+/// ★(0.14.31 · 성찰 Q5) **보존소의 수명 패스** — 항목 수명(pause 크레딧 · TTL 스윕 · 만료 이벤트 ·
+/// 발신자 통지)을 **배달 목적지 결정(rehome)과 분리**한다. 좌석 경로의 4단과 같은 순서·같은 술어다.
+///
+///   ① 크레딧: 데몬 pause 중이면 활성 복원 행의 `paused_total_secs` 에 틱 델타를 더한다(항목이
+///      존재한 시간 이내로 클램프). 좌석 헬스 pause 는 없다 — 좌석이 소멸했으므로(codex #6 · 계약).
+///   ② 스윕: TTL 을 넘긴 활성 복원 행 → `restored_expired`(`expired_at=now` · id 중복 배제).
+///   ③ 이벤트: `restored_expired` **전 행** 중 `expired_event_sent` 가 아닌 것(이번에 만료된 것만이
+///      아니다 — 발행 전 크래시·통지 실패로 남은 행도 · codex #7)을 발행 후보로 모은다.
+///   ④ 통지: `expired_notified` 가 아닌 행의 발신 좌석(`surface:N` · 자기 자신 아님 · 통지 항목 아님)
+///      으로 1줄 — 발신자가 없으면 여기서 표식만 세운다. 발행·enqueue·래치는 호출자가 락 밖에서 한다.
+///
+/// 락: `restored_queue → restored_expired` 동시 보유(전역 순서) · 좌석 락 0 · I/O 0.
+fn restored_queue_lifecycle_pass(
+    daemon: &Arc<Daemon>,
+    now: f64,
+    delta: f64,
+    daemon_paused: bool,
+    default_ttl: u64,
+    expired_events: &mut Vec<(u64, String, Value)>,
+    notices: &mut HashMap<(u64, u64), (String, Vec<String>)>,
+) -> bool {
+    let mut changed = false;
+    let mut rq = daemon.restored_queue.lock().unwrap();
+    let mut rx = daemon.restored_expired.lock().unwrap();
+    if rq.is_empty() && rx.is_empty() {
+        return false;
+    }
+    let sid_of = |it: &Value| it.get("surface_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let role_of = |it: &Value| it.get("role").and_then(|v| v.as_str()).map(str::to_string);
+    // ① 크레딧 + ② 스윕 — 한 임계영역.
+    let mut moved: Vec<Value> = Vec::new();
+    rq.retain(|it| {
+        let sid = sid_of(it);
+        let role = role_of(it);
+        let mut e = crate::state::queue_entry_from_row(it);
+        if daemon_paused && delta > 0.0 {
+            let alive_for = (now - e.order_at()).max(0.0);
+            e.paused_total_secs += delta.min(alive_for);
+            changed = true;
+        }
+        if crate::state::queue_entry_expired(&e, now, default_ttl) {
+            e.expired_at = Some(now);
+            moved.push(crate::state::queue_entry_row(sid, &role, &e));
+            return false;
+        }
+        true
+    });
+    // 크레딧이 붙은 행은 다시 써야 한다(retain 은 제자리 수정을 허용하지 않는다 · 값 산식 하나).
+    if daemon_paused && delta > 0.0 {
+        for it in rq.iter_mut() {
+            let sid = sid_of(it);
+            let role = role_of(it);
+            let mut e = crate::state::queue_entry_from_row(it);
+            let alive_for = (now - e.order_at()).max(0.0);
+            e.paused_total_secs += delta.min(alive_for);
+            *it = crate::state::queue_entry_row(sid, &role, &e);
+        }
+    }
+    for it in moved {
+        let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !rx.iter().any(|o| o.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+            rx.push(it);
+        }
+        changed = true;
+    }
+    // ③ 이벤트 + ④ 통지 — 전 행.
+    for it in rx.iter_mut() {
+        let sid = sid_of(it);
+        let role = role_of(it);
+        let e = crate::state::queue_entry_from_row(it);
+        let target_ref = cys::surface_ref(sid);
+        if !e.expired_event_sent {
+            let mut payload =
+                crate::state::queue_expired_payload(&target_ref, role.clone(), &e, now, default_ttl);
+            payload["entry_ids"] = json!(wakeup_entry_ids(&e.text));
+            expired_events.push((sid, e.id.clone(), payload));
+            changed = true;
+        }
+        if e.expired_notified {
+            continue;
+        }
+        let sender = crate::delivery::split_queue_from(e.from.as_deref())
+            .0
+            .filter(|&n| n != sid && e.origin != QUEUE_NOTICE_ORIGIN);
+        match sender {
+            Some(n) => notices
+                .entry((n, sid))
+                .or_insert_with(|| (target_ref.clone(), Vec::new()))
+                .1
+                .push(e.id.clone()),
+            None => {
+                if let Some(o) = it.as_object_mut() {
+                    o.insert("expired_notified".into(), json!(true));
+                }
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 보존소 만료 행의 bool 래치(`expired_event_sent` / `expired_notified`)를 id 집합에 대해 세운다.
+fn latch_restored_expired_rows(daemon: &Arc<Daemon>, ids: &[String], field: &str) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut rx = daemon.restored_expired.lock().unwrap();
+    for it in rx.iter_mut() {
+        let hit = it
+            .get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| ids.iter().any(|k| k == id));
+        if hit {
+            if let Some(o) = it.as_object_mut() {
+                o.insert(field.to_string(), json!(true));
+            }
+        }
+    }
 }
 
 /// 만료 통지 항목의 **결정적 id** — (발신자, 대상, 정렬된 만료 id 집합)의 함수. 재기동 재시도가
@@ -6996,7 +7323,12 @@ pub(crate) fn drop_queue_entry(
         let mut x = s.expired_queue.lock().unwrap();
         // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중이면 먼저 취소한다 — 취소하지 못한(이미
         //   쓰기로 확정된) 항목은 폐기하지 않는다(폐기 보고 뒤 실제 주입 금지).
-        if s.cancel_inject_reservation().iter().any(|k| k == entry_id) {
+        // ★(0.14.31 · 성찰 Q13) 이 항목을 **겨눈** 예약만 끊는다 — 무관한 항목 X 의 인계는 계속된다.
+        if s
+            .cancel_inject_reservation_targeting(&[entry_id.to_string()])
+            .iter()
+            .any(|k| k == entry_id)
+        {
             return Err(QueueOpDenied::Inflight);
         }
         if let Some(pos) = q.iter().position(|e| e.id == entry_id) {
@@ -7416,9 +7748,12 @@ fn deliver_queued(
     // (Phase 3에서 restored_queue가 배달 경로에 미배선이라, 재기동 생존 메시지가 idle에도 미배달로
     // 잔존하던 갭을 닫는다 — role 앵커 재타겟.) ★(0.14.31) pause 중에도 재홈·만료 회계는 돈다 —
     // pause 는 배달 동결이지 큐 회계 동결이 아니다(pause 크레딧이 바로 여기서 쌓인다).
-    let mut persist = daemon.rehome_restored_queue() > 0;
-    // ★(0.14.31 · WP-5 M) TTL 스윕·pause 크레딧·만료 통지 — 배달 전, 재홈 뒤(복원분도 분류).
-    persist |= queue_expiry_pass(daemon);
+    // ★(0.14.31 · 성찰 Q5 · codex 설계 검토 #5) 순서가 바뀌었다: **수명 패스 → rehome**. 종전(rehome →
+    //   수명)에서는 데몬 pause 중 TTL 경계의 복원 행이 이번 틱 크레딧을 받기 **전에** rehome 의 폴백
+    //   분류로 만료됐다. 지금은 보존소가 먼저 크레딧·스윕을 받고, 그 뒤 rehome 이 목적지만 배정한다
+    //   (같은 틱 델타의 이중 적립도 없다 — rehome 된 행은 이 틱의 좌석 순회에 아직 없었다).
+    let mut persist = queue_expiry_pass(daemon);
+    persist |= daemon.rehome_restored_queue() > 0;
     // ★(0.14.31 · 리뷰 R1 · codex blocking) **미영속 재시도** — 직전 persist 가 어느 단계에서든
     //   실패했으면 큐 변경이 없어도 다시 쓴다. 종전에는 enqueue 가 `queued:true` 를 돌려준 뒤
     //   persist 가 실패하고 그 뒤 큐 변경이 없으면 재시도 기회가 영영 오지 않아, 데몬이 죽으면
@@ -17194,6 +17529,387 @@ mod reflect_queue_tests {
             "이미 확정된 쓰기를 '끊었다' 고 보고했다 — 폐기 통지 뒤 실제 주입이 된다"
         );
         let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// 역할 좌석 픽스처 — `cmd` 로 PTY 를 띄우고 roles·surfaces 맵에 등록한다.
+    fn role_seat(
+        daemon: &Arc<Daemon>,
+        role: &str,
+        cmd: &str,
+    ) -> Arc<crate::state::Surface> {
+        let s = daemon
+            .create_surface(None, Some(cmd.into()), None, Some(role.into()), 24, 80)
+            .expect("역할 좌석");
+        daemon.roles.lock().unwrap().insert(role.into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s
+    }
+
+    fn drain_bus(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// ★(0.14.31 · 성찰 Q7) **reap 은 활성 큐를 보존한다 — 데몬 재기동과 같은 기제로.**
+    ///
+    /// 종전 `close_surface(Reap)` 은 "이 role 은 돌아온다(묘비 없음)" 고 선언한 바로 아래에서 그 role
+    /// 앞으로 온 미배달 작업을 `queue.dropped(surface_closed)` 로 지웠다. 데몬 재기동이었다면 같은
+    /// 항목이 WAL → 복원 → rehome 으로 살아남는다. 지금은 `restored_queue` 로 park 하고, 같은 role 의
+    /// 새 좌석이 rehome 으로 **순서대로** 받는다. 대조군: OwnerClose 는 종전대로 폐기한다.
+    #[test]
+    fn q7_reap_parks_the_active_queue_for_the_returning_role() {
+        let (daemon, _s0, _pack) = probe_seat("q7");
+        let s = role_seat(&daemon, "worker-q7", "sleep 30");
+        let ids: Vec<String> = (0..3)
+            .map(|i| {
+                let e = daemon.next_queue_entry(
+                    format!("[wakeup W-0000a7000{i}] 작업 {i}"),
+                    None,
+                    "send",
+                );
+                let id = e.id.clone();
+                s.pending_queue.lock().unwrap().push_back(e);
+                id
+            })
+            .collect();
+        let mut rx = daemon.bus.subscribe();
+        s.exited.store(true, AtomicOrdering::Relaxed); // reap 전제(프로세스 사망)
+        close_surface(&daemon, s.id, CloseCause::Reap).expect("reap");
+        let evs = drain_bus(&mut rx);
+        let dropped: Vec<&Value> = evs
+            .iter()
+            .filter(|e| e["name"] == "queue.dropped" && e["payload"]["reason"] == "surface_closed")
+            .collect();
+        assert!(dropped.is_empty(), "reap 이 활성 큐를 폐기했다(재기동이라면 보존됐을 항목): {dropped:?}");
+        let parked: Vec<&Value> = evs.iter().filter(|e| e["name"] == "queue.parked").collect();
+        assert_eq!(parked.len(), 1, "queue.parked 가 정확히 1회가 아니다: {evs:?}");
+        assert_eq!(parked[0]["payload"]["count"], 3);
+        assert_eq!(parked[0]["payload"]["role"], "worker-q7");
+        assert_eq!(
+            parked[0]["payload"]["entry_ids"].as_array().map(|a| a.len()),
+            Some(3),
+            "W-id 에코가 없다 — 소비자가 inflight 를 되감지 못한다"
+        );
+        {
+            let rq = daemon.restored_queue.lock().unwrap();
+            assert_eq!(rq.len(), 3, "보존소에 3행이 아니다");
+            assert!(rq.iter().all(|it| it["role"] == "worker-q7"), "role 앵커가 없다: {rq:?}");
+        }
+        // 같은 role 의 새 좌석 → rehome → 순서대로.
+        let s2 = role_seat(&daemon, "worker-q7", "sleep 30");
+        assert_eq!(daemon.rehome_restored_queue(), 3, "rehome 이 3건을 옮기지 않았다");
+        let got: Vec<String> = s2.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(got, ids, "새 좌석의 순서가 원래 순서와 다르다");
+        // 대조군 — OwnerClose 는 폐기한다(역할이 묘비에 올라 돌아오지 않는다).
+        let s3 = role_seat(&daemon, "worker-q7-owner", "sleep 30");
+        s3.pending_queue
+            .lock()
+            .unwrap()
+            .push_back(daemon.next_queue_entry("[보고] 폐기 대조군".into(), None, "send"));
+        let mut rx2 = daemon.bus.subscribe();
+        close_surface(&daemon, s3.id, CloseCause::OwnerClose).expect("owner close");
+        let evs2 = drain_bus(&mut rx2);
+        assert!(
+            evs2.iter().any(|e| e["name"] == "queue.dropped" && e["payload"]["reason"] == "surface_closed"),
+            "OwnerClose 가 폐기하지 않았다(계약 변경): {evs2:?}"
+        );
+        assert!(!evs2.iter().any(|e| e["name"] == "queue.parked"), "OwnerClose 가 park 했다");
+        let _ = close_surface(&daemon, s2.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #1) **자력 종료(EOF) 경로도 같은 park 정책이다** — reap
+    /// 만 고치면 reader EOF 가 먼저 활성 큐를 비워 보존할 것이 없다.
+    #[test]
+    fn q7_process_exit_of_a_role_seat_parks_instead_of_dropping() {
+        let (daemon, _s0, _pack) = probe_seat("q7eof");
+        let mut rx = daemon.bus.subscribe();
+        let s = role_seat(&daemon, "worker-q7eof", "sleep 1");
+        let ids: Vec<String> = (0..2)
+            .map(|i| {
+                let e = daemon.next_queue_entry(format!("[wakeup W-0000a7e0f{i}] 작업"), None, "send");
+                let id = e.id.clone();
+                s.pending_queue.lock().unwrap().push_back(e);
+                id
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !s.exited.load(AtomicOrdering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(s.exited.load(AtomicOrdering::Relaxed), "전제: 좌석이 15초 안에 종료하지 않았다");
+        // reader 스레드의 후처리(park)가 끝날 때까지 잠깐.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while daemon.restored_queue.lock().unwrap().len() < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let rq: Vec<String> = daemon
+            .restored_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|it| it["id"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(rq, ids, "EOF 경로가 활성 큐를 보존소로 옮기지 않았다");
+        let evs = drain_bus(&mut rx);
+        assert!(
+            !evs.iter().any(|e| e["name"] == "queue.dropped" && e["payload"]["reason"] == "process_exited"),
+            "EOF 경로가 역할 좌석의 활성 큐를 폐기했다: {evs:?}"
+        );
+        let _ = close_surface(&daemon, s.id, CloseCause::Reap);
+    }
+
+    /// ★(0.14.31 · 성찰 Q5) **목적지 없는 복원 항목도 같은 수명을 산다** — role 결측 · `null` · 무매칭
+    /// 세 경우 모두 49h 항목이 (1) 활성 복원분에서 빠지고 (2) `queue.expired` 가 정확히 1회 나가며
+    /// (3) 발신 좌석이 살아 있으면 통지 1줄을 받는다. 종전에는 rehome 의 조기 return 이 TTL 평가
+    /// 전에 보존해 셋 다 없었다(소비자의 W-id 영구 inflight → TTL 마다 재enqueue).
+    #[test]
+    fn q5_restored_rows_without_a_destination_still_age_out_with_event_and_notice() {
+        let (daemon, sender, _pack) = probe_seat("q5");
+        let now = now_epoch();
+        let cases: Vec<(&str, Option<Value>)> =
+            vec![("none", None), ("null", Some(Value::Null)), ("ghost", Some(json!("ghost-role")))];
+        for (i, (tag, role)) in cases.iter().enumerate() {
+            let mut row = json!({
+                "id": format!("q5-{tag}"), "seq": 1, "surface_id": 900 + i as u64,
+                "text": format!("[wakeup W-0000a5{i:04}] 오래된 지시"),
+                "enqueued_at": now - 49.0 * 3600.0,
+                "from": format!("surface:{}", sender.id), "origin": "send",
+            });
+            if let Some(r) = role {
+                row["role"] = r.clone();
+            }
+            daemon.restored_queue.lock().unwrap().push(row);
+        }
+        let mut rx = daemon.bus.subscribe();
+        *daemon.queue_tick_at.lock().unwrap() = Some(now - 5.0);
+        assert!(queue_expiry_pass(&daemon), "수명 패스가 변경을 보고하지 않았다");
+        assert_eq!(daemon.restored_queue.lock().unwrap().len(), 0, "49h 항목이 활성 복원분에 남았다");
+        {
+            let rx_rows = daemon.restored_expired.lock().unwrap();
+            assert_eq!(rx_rows.len(), 3, "만료 복원분이 3행이 아니다: {rx_rows:?}");
+            assert!(rx_rows.iter().all(|it| it["expired_at"].is_number()), "expired_at 이 없다");
+            assert!(rx_rows.iter().all(|it| it["expired_event_sent"] == true), "이벤트 래치가 서지 않았다");
+        }
+        let evs = drain_bus(&mut rx);
+        let expired: Vec<&Value> = evs.iter().filter(|e| e["name"] == "queue.expired").collect();
+        assert_eq!(expired.len(), 3, "queue.expired 가 3회가 아니다: {evs:?}");
+        for e in &expired {
+            let ids = e["payload"]["entry_ids"].as_array().cloned().unwrap_or_default();
+            assert!(!ids.is_empty(), "W-id 에코가 없다: {e:?}");
+        }
+        // 발신 좌석 통지 — 살아 있으니 큐에 통지 항목이 들어간다(대상마다 1줄).
+        let notices: Vec<String> = sender
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.origin == QUEUE_NOTICE_ORIGIN)
+            .map(|e| e.text.clone())
+            .collect();
+        assert!(!notices.is_empty(), "발신 좌석이 통지를 받지 못했다");
+        for tag in ["q5-none", "q5-null", "q5-ghost"] {
+            assert!(notices.iter().any(|t| t.contains(tag)), "통지에 {tag} 가 없다: {notices:?}");
+        }
+        // 두 번째 패스 — 이벤트 재발행 0(래치) · 통지 표식.
+        *daemon.queue_tick_at.lock().unwrap() = Some(now_epoch() - 5.0);
+        queue_expiry_pass(&daemon);
+        let again = drain_bus(&mut rx);
+        assert!(
+            !again.iter().any(|e| e["name"] == "queue.expired"),
+            "래치가 있는데 queue.expired 가 재발행됐다: {again:?}"
+        );
+        assert!(
+            daemon.restored_expired.lock().unwrap().iter().all(|it| it["expired_notified"] == true),
+            "통지 표식이 서지 않았다"
+        );
+        let _ = close_surface(&daemon, sender.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q5) **pause 크레딧은 좌석 항목과 보존소 항목에 같은 값으로 붙는다.** 종전에는
+    /// 5시간 pause 뒤 좌석 항목은 살고 복원 항목은 그 자리에서 만료됐다(비대칭).
+    #[test]
+    fn q5_pause_credit_is_the_same_for_seat_and_restored_entries() {
+        let (daemon, s, _pack) = probe_seat("q5p");
+        let now = now_epoch();
+        let ttl = crate::state::queue_ttl_default_secs() as f64;
+        let at = now - (ttl - 100.0); // 100초 뒤 만료 — 200초 pause 크레딧이 붙으면 산다
+        let mut live = daemon.next_queue_entry("[보고] 좌석 항목".into(), None, "send");
+        live.enqueued_at = at;
+        let live_id = live.id.clone();
+        s.pending_queue.lock().unwrap().push_back(live);
+        daemon.restored_queue.lock().unwrap().push(json!({
+            "id": "q5p-restored", "seq": 1, "surface_id": 950, "role": "ghost",
+            "text": "[보고] 복원 항목", "enqueued_at": at, "origin": "send",
+        }));
+        daemon.paused.store(true, Ordering::Relaxed);
+        *daemon.queue_tick_at.lock().unwrap() = Some(now - 200.0);
+        queue_expiry_pass(&daemon);
+        daemon.paused.store(false, Ordering::Relaxed);
+        let seat_credit = s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == live_id)
+            .map(|e| e.paused_total_secs)
+            .expect("좌석 항목이 만료됐다(크레딧 없음)");
+        let restored_credit = daemon
+            .restored_queue
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|it| it["id"] == "q5p-restored")
+            .and_then(|it| it["paused_total_secs"].as_f64())
+            .expect("복원 항목이 만료됐다(크레딧 없음 — 비대칭)");
+        assert!((seat_credit - restored_credit).abs() < 1e-6, "크레딧이 다르다: 좌석 {seat_credit} · 복원 {restored_credit}");
+        assert!(restored_credit >= 199.0, "크레딧이 틱 델타에 미치지 못한다: {restored_credit}");
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q12) **두 경로의 축출 집합이 같다** — 만료 시각 순서와 등장 순서가 반대인
+    /// 130건을 ⓐ 좌석 만료 큐 ⓑ 보존소에 각각 넣고, 축출된 30건의 인덱스 집합이 일치하며 그것이
+    /// 가장 오래된 30건이다. 종전 좌석 경로는 "앞 = 가장 오래된 것" 을 전제해 최근 만료분을 먼저 버렸다.
+    #[test]
+    fn q12_eviction_picks_the_same_oldest_set_on_both_paths() {
+        let (daemon, s, _pack) = probe_seat("q12");
+        let now = now_epoch();
+        let n = QUEUE_EXPIRED_CAP + 30;
+        for i in 0..n {
+            // i=0 이 **가장 최근**, i=n-1 이 가장 오래됨 — 등장순과 나이순이 반대.
+            let mut e = daemon.next_queue_entry(format!("[보고] q12 {i}"), None, "send");
+            e.enqueued_at = now - 1000.0 - i as f64;
+            e.expired_at = Some(now - 1.0);
+            let mut r = e.clone();
+            r.id = format!("q12-rest-{i}");
+            e.id = format!("q12-live-{i}");
+            s.expired_queue.lock().unwrap().push_back(e);
+            daemon
+                .restored_expired
+                .lock()
+                .unwrap()
+                .push(crate::state::queue_entry_row(777, &Some("dead".into()), &r));
+        }
+        let mut b1 = 30usize;
+        assert!(enforce_expired_cap_budgeted(&daemon, &s, now, &mut b1), "좌석 경로가 축출하지 않았다");
+        let mut b2 = 30usize;
+        assert!(enforce_restored_expired_cap(&daemon, now, &mut b2), "보존소 경로가 축출하지 않았다");
+        let idx = |id: &str| id.rsplit('-').next().unwrap().parse::<usize>().unwrap();
+        let live_left: std::collections::BTreeSet<usize> =
+            s.expired_queue.lock().unwrap().iter().map(|e| idx(&e.id)).collect();
+        let rest_left: std::collections::BTreeSet<usize> = daemon
+            .restored_expired
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|it| idx(it["id"].as_str().unwrap()))
+            .collect();
+        assert_eq!(live_left, rest_left, "두 경로의 잔여 집합이 다르다");
+        let expect: std::collections::BTreeSet<usize> = (0..QUEUE_EXPIRED_CAP).collect();
+        assert_eq!(live_left, expect, "가장 오래된 30건(i≥100)이 아니라 다른 것이 축출됐다");
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q13) **처분자는 자기가 겨눈 인계만 끊는다** — X 인계 중 Y drop → X 유지 ·
+    /// 만료 스윕(만료 없음) → X 유지 · X 를 겨눈 drop 만 중단.
+    #[test]
+    fn q13_disposer_only_cancels_a_reservation_it_targets() {
+        let (daemon, s, _pack) = probe_seat("q13");
+        let x = daemon.next_queue_entry("[보고] X".into(), None, "send");
+        let y = daemon.next_queue_entry("[보고] Y".into(), None, "send");
+        let (xid, yid) = (x.id.clone(), y.id.clone());
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(x);
+            q.push_back(y);
+        }
+        let guard = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None,
+            s.output_gen.clone(),
+            false,
+            None,
+        ));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec![xid.clone()],
+            guard: guard.clone(),
+        });
+        let now = now_epoch();
+        drop_queue_entry(&daemon, &yid, None, now, false).expect("Y drop 은 성립해야 한다");
+        assert_eq!(
+            guard.state.load(Ordering::Acquire),
+            crate::state::INJECT_PENDING,
+            "무관한 Y 의 drop 이 X 의 인계를 끊었다"
+        );
+        *daemon.queue_tick_at.lock().unwrap() = Some(now - 5.0);
+        queue_expiry_pass(&daemon);
+        assert_eq!(
+            guard.state.load(Ordering::Acquire),
+            crate::state::INJECT_PENDING,
+            "만료 대상이 없는 스윕이 X 의 인계를 끊었다"
+        );
+        drop_queue_entry(&daemon, &xid, None, now, false).expect("X drop(미확정 인계는 끊고 처분)");
+        assert_eq!(guard.state.load(Ordering::Acquire), crate::state::INJECT_ABORTED, "X 를 겨눈 drop 이 인계를 끊지 않았다");
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.31 · 성찰 Q16) **전역 상한** — 죽은 surface 20그룹 × 100행(그룹 상한은 전부 통과)에서
+    /// 전역 상한(800) 뒤 잔여 800행이고, 축출은 **활성 역할이 아닌 그룹 먼저**(비활성 1000행 전부) 그
+    /// 다음 활성 그룹의 가장 오래된 200행이다 — 비활성 그룹이 더 최근이어도.
+    #[test]
+    fn q16_global_cap_bounds_restored_expired_and_evicts_inactive_roles_first() {
+        let (daemon, _s, _pack) = probe_seat("q16");
+        daemon.roles.lock().unwrap().insert("alive-role".into(), 1);
+        let now = now_epoch();
+        for g in 0..20u64 {
+            let active = g < 10;
+            let role = if active { "alive-role".to_string() } else { format!("dead-{g}") };
+            for i in 0..QUEUE_EXPIRED_CAP as u64 {
+                let mut e = daemon.next_queue_entry(format!("[보고] q16 {g}/{i}"), None, "send");
+                // 비활성 그룹이 **더 최근**이다(우선순위가 나이를 이기는지 본다).
+                e.enqueued_at = if active { now - 100_000.0 + (g * 100 + i) as f64 } else { now - 1_000.0 + (g * 100 + i) as f64 };
+                e.expired_at = Some(now - 1.0);
+                e.expired_event_sent = true;
+                e.expired_notified = true;
+                e.id = format!("q16-{g}-{i}");
+                daemon.restored_expired.lock().unwrap().push(crate::state::queue_entry_row(
+                    5_000 + g,
+                    &Some(role.clone()),
+                    &e,
+                ));
+            }
+        }
+        assert_eq!(daemon.restored_expired.lock().unwrap().len(), 2000, "전제");
+        let mut passes = 0;
+        loop {
+            let mut budget = QUEUE_EXPIRED_EVICT_PER_TICK;
+            let changed = enforce_restored_expired_global_cap(&daemon, now, &mut budget);
+            passes += 1;
+            if !changed || passes > 200 {
+                break;
+            }
+        }
+        let rows = daemon.restored_expired.lock().unwrap();
+        assert_eq!(rows.len(), QUEUE_EXPIRED_GLOBAL_CAP, "전역 상한 뒤 잔여 행수가 다르다(패스 {passes})");
+        assert!(
+            rows.iter().all(|it| it["role"] == "alive-role"),
+            "비활성 역할 그룹이 남았다(우선순위 위반)"
+        );
+        let min_idx = rows
+            .iter()
+            .map(|it| {
+                let id = it["id"].as_str().unwrap();
+                let mut parts = id.split('-').skip(1);
+                let g: u64 = parts.next().unwrap().parse().unwrap();
+                let i: u64 = parts.next().unwrap().parse().unwrap();
+                g * 100 + i
+            })
+            .min()
+            .unwrap();
+        assert_eq!(min_idx, 200, "활성 그룹에서 가장 오래된 200행이 아니라 다른 것이 축출됐다");
     }
 
     /// ★(0.14.31 · 성찰 Q14) **노브 롤아웃 문면이 실제 기본값과 같은가.**

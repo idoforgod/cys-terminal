@@ -852,5 +852,62 @@ class QueueDropTermination(unittest.TestCase):
                              "queue_entry_ids 로 조인했다 — 두 id 체계 혼선")
 
 
+class QueueHoldRefresh(unittest.TestCase):
+    """★(0.14.31 · 성찰 Q7 · codex 설계 검토 #9) **보존·이동은 종결이 아니다 — TTL 창을 되감는다.**
+
+    역할 좌석이 죽으면 데몬은 미배달 항목을 폐기하지 않고 보존소로 옮긴다(`queue.parked`) — 같은
+    role 의 새 좌석에 `queue.rehomed` 로 되돌아온다. 그 사이 소비자의 inflight 가 seen TTL(30분)을
+    넘기면 `seen_claim` 이 만료로 보고 같은 사건을 다시 enqueue 했다(원본이 살아 있는데 중복).
+    """
+
+    def _pend(self, t, wid, key, first_ts=1_000_000.0):
+        G.seen_claim(t, key, G.SEV_CRIT, first_ts)
+        G.seen_mark(t, key, first_ts, state=G.SEEN_STATE_INFLIGHT, wakeup_id=wid)
+
+    def test_hold_events_are_subscribed(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            g = gate(t, r)
+            g._poll_once()
+            for name in ("queue.parked", "queue.rehomed"):
+                self.assertIn(name, r.polls[0][1], "%s 를 구독하지 않는다" % name)
+
+    def test_held_wakeup_stays_inflight_with_a_refreshed_ttl_window(self):
+        for name in ("queue.parked", "queue.rehomed"):
+            with self.subTest(event=name), tempfile.TemporaryDirectory() as t:
+                r = FakeRunner()
+                key = G.seen_key("stall_confirmed", "s:w-hold", G.SEV_CRIT)
+                self._pend(t, "W-00000held1", key, first_ts=1_000_000.0)
+                r.events = [{"name": name,
+                             "payload": {"role": "worker", "entry_ids": ["W-00000held1"],
+                                         "queue_entry_ids": ["q9"], "count": 1}}]
+                g = gate(t, r)
+                g._poll_once()
+                counters = {}
+                now = 1_000_000.0 + G.SEEN_TTL_SECS - 10  # TTL 만료 10초 전
+                g._reconcile_inflight(counters, now)
+                with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                self.assertEqual(rec["state"], G.SEEN_STATE_INFLIGHT, "보존을 종결로 읽었다")
+                self.assertEqual(rec["first_ts"], now, "TTL 창을 되감지 않았다 — 30분 뒤 재enqueue")
+                # 되감긴 창 안에서는 재선점이 거부된다(= 같은 사건의 재enqueue 0).
+                claimed, _ = G.seen_claim(t, key, G.SEV_CRIT, 1_000_000.0 + G.SEEN_TTL_SECS + 5)
+                self.assertFalse(claimed, "원본이 보존 중인데 같은 사건을 다시 선점했다(중복)")
+
+    def test_unrelated_hold_leaves_other_work_untouched(self):
+        with tempfile.TemporaryDirectory() as t:
+            r = FakeRunner()
+            key = G.seen_key("stall_confirmed", "s:w-hold2", G.SEV_CRIT)
+            self._pend(t, "W-00000held2", key, first_ts=1_000_000.0)
+            r.events = [{"name": "queue.parked",
+                         "payload": {"entry_ids": ["W-00000other"]}}]
+            g = gate(t, r)
+            g._poll_once()
+            g._reconcile_inflight({}, 1_000_100.0)
+            with open(G.seen_path(t, key), encoding="utf-8") as fh:
+                rec = json.load(fh)
+            self.assertEqual(rec["first_ts"], 1_000_000.0, "무관한 보존이 내 TTL 창을 건드렸다")
+
+
 if __name__ == "__main__":
     unittest.main()

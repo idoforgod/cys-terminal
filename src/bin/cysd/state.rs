@@ -447,6 +447,40 @@ pub fn queue_rehomed_payload(role: &str, rehomed: &[QueueEntry], reordered: bool
         "queue_entry_ids": rehomed.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
         "role": role,
         "reordered": reordered,
+        // ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #9) W-id 에코(additive · `queue.delivered` 와 같은
+        //   계약) — 소비자(report_gate)가 "아직 살아서 이동 중" 을 알고 inflight TTL 을 되감는다.
+        //   그러지 않으면 park 가 seen TTL(30분)을 넘길 때 같은 사건이 다시 enqueue 된다(중복).
+        "entry_ids": wakeup_entry_ids_union(rehomed),
+    })
+}
+
+/// 항목 본문들에서 되읽은 W-id 합집합(등장순 · 중복 제거) — `queue.dropped`·`queue.parked`·
+/// `queue.rehomed` 의 `entry_ids` 산식 하나.
+pub fn wakeup_entry_ids_union(entries: &[QueueEntry]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        for w in crate::governance::wakeup_entry_ids(&e.text) {
+            if !out.contains(&w) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
+/// ★(0.14.31 · 성찰 Q7) `queue.parked` payload — 역할 좌석의 종료(reap · 자력 종료)가 미배달 활성
+/// 항목을 **데몬 보존소(`restored_queue`)로 옮겼다**(폐기 아님). 같은 role 의 다음 좌석에 rehome 되어
+/// 순서대로 배달된다. `entry_ids` 는 W-id 에코(소비자의 inflight 되감기 · 종결 아님).
+pub fn queue_parked_payload(reason: &str, role: &str, surface_id: u64, parked: &[QueueEntry]) -> Value {
+    json!({
+        "reason": reason,
+        "role": role,
+        "surface_ref": cys::surface_ref(surface_id),
+        "count": parked.len(),
+        "queue_entry_ids": parked.iter().map(|e| e.id.clone()).collect::<Vec<String>>(),
+        "entry_ids": wakeup_entry_ids_union(parked),
+        "hint": "역할 좌석이 종료됐다 — 미배달 항목을 데몬 보존소로 옮겼다(폐기 아님). 같은 role 의 \
+                 새 좌석에 rehome 되어 순서대로 배달되며 `cys queue list` 에 보인다 · TTL 은 계속 흐른다",
     })
 }
 
@@ -1394,6 +1428,25 @@ impl Surface {
         let slot = self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
         match slot.as_ref() {
             None => Vec::new(),
+            Some(r) if r.guard.abort_if_pending() => Vec::new(),
+            Some(r) => r.ids.clone(),
+        }
+    }
+
+    /// ★(0.14.31 · 성찰 Q13) **조준 취소** — 예약이 `ids` 중 하나라도 겨누고 있을 때만 중단한다.
+    ///
+    /// 반환 = 지금 인계 중(= 처분 금지)인 항목 id 들. 교집합이 없으면 예약을 **건드리지 않고** 그
+    /// id 들을 그대로 돌려준다(호출자는 그것을 처분 대상에서 뺀다 — 그 항목은 남의 인계다).
+    /// 교집합이 있으면 [`Self::cancel_inject_reservation`] 과 같다. 종전에는 무관한 항목 Y 의
+    /// drop·매 틱 만료 스윕이 진행 중인 X 의 인계를 통째로 끊어, 방향은 안전이었으나 영수증 없는
+    /// 원장 선기록(§9 sha 대조 잡음)과 운영자의 `Raced` 재시도가 쌓였다.
+    ///
+    /// 호출 규약: `pending_queue` 락을 쥔 채 부른다(형제 함수와 같다).
+    pub fn cancel_inject_reservation_targeting(&self, ids: &[String]) -> Vec<String> {
+        let slot = self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            None => Vec::new(),
+            Some(r) if !r.ids.iter().any(|k| ids.iter().any(|t| t == k)) => r.ids.clone(),
             Some(r) if r.guard.abort_if_pending() => Vec::new(),
             Some(r) => r.ids.clone(),
         }
@@ -4161,12 +4214,23 @@ impl Daemon {
             }
             // ★(0.14.31 · WP-5 M) 만료 복원분 → 대상 surface 의 expired_queue(등장순 · id 중복 배제).
             //   상한 초과 회계(묘비·폐기)는 governance::queue_expiry_pass 가 같은 틱에서 집행한다.
-            for (role, batch) in expired_batches {
+            // ★(0.14.31 · 성찰 Q12) 만료 큐도 **순서 키(`order_at`)로 정렬 병합**한다. 종전에는 파일
+            //   등장순으로 push_back 해서 "앞 = 가장 오래된 것" 이라는 좌석 상한 집행의 전제가 rehome
+            //   뒤에 거짓이 됐다(가장 최근 만료분을 먼저 버렸다 = M9 가 복원 경로에서 고친 정책
+            //   역전의 부활). 축출 후보 선정 자체도 이제 `order_at` 키의 순수 함수 하나가 한다.
+            for (role, mut batch) in expired_batches {
+                batch.sort_by(|a, b| {
+                    a.order_at()
+                        .partial_cmp(&b.order_at())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.seq.cmp(&b.seq))
+                });
                 let surf = &role_surface[&role];
                 let mut x = surf.expired_queue.lock().unwrap();
                 for entry in batch {
                     if !x.iter().any(|e| e.id == entry.id) {
-                        x.push_back(entry);
+                        let pos = queue_merge_insert_pos(&x, entry.order_at(), entry.seq);
+                        x.insert(pos, entry);
                     }
                 }
             }
@@ -4751,24 +4815,37 @@ impl Daemon {
                     let _ = child.try_wait();
                 }
             }
-            // 미배달 큐 폐기 통지 — queued:true 응답을 받은 발신자의 무음 메시지 유실 차단
-            // (★G1(W2-B): payload는 폐기 3발행처 공용 빌더 — 스키마 단일 소유).
-            // ★(0.14.31 · 리뷰 R2 · codex blocking) 인계 중 항목은 남긴다(폐기 통지 뒤 주입 금지).
-            let dropped: Vec<QueueEntry> = crate::governance::drain_active_except_inflight(&surf);
-            if !dropped.is_empty() {
-                // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치).
-                crate::governance::record_active_drain(
-                    &daemon,
-                    surf.id,
-                    &dropped,
-                    "process_exited",
-                );
-                daemon.bus.publish(
-                    "queue.dropped",
-                    "queue",
-                    Some(surf.id),
-                    queue_dropped_payload("process_exited", &dropped, None),
-                );
+            // ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #1) **역할 좌석의 자력 종료는 보존이다.** 이 역할은
+            //   reap 뒤 phoenix 가 되살리고(묘비 없음), 데몬 재기동이었다면 같은 항목이 WAL → 복원 →
+            //   rehome 으로 살아남았다. 종전에는 여기서 활성 큐를 폐기해 그 대칭이 깨졌다 — 그리고
+            //   reap(close_surface) 만 고치면 이 EOF 경로가 먼저 비워 버려 보존할 것이 없다. 그래서
+            //   여기서 `restored_queue` 로 park 한다(`queue.parked` · 폐기 아님). 역할 없는 좌석은
+            //   돌아올 주소가 없으므로 종전대로 폐기한다(인계 중 항목은 남긴다 — 폐기 통지 뒤 주입 금지).
+            match crate::governance::park_active_to_restored(&daemon, &surf, "process_exited") {
+                Some(n) => {
+                    if n > 0 {
+                        daemon.persist_queue_state();
+                    }
+                }
+                None => {
+                    let dropped: Vec<QueueEntry> =
+                        crate::governance::drain_active_except_inflight(&surf);
+                    if !dropped.is_empty() {
+                        // ★(0.14.31 · 리뷰 R2 · claude minor) 원장 묘비 먼저(최선 노력 · 배치).
+                        crate::governance::record_active_drain(
+                            &daemon,
+                            surf.id,
+                            &dropped,
+                            "process_exited",
+                        );
+                        daemon.bus.publish(
+                            "queue.dropped",
+                            "queue",
+                            Some(surf.id),
+                            queue_dropped_payload("process_exited", &dropped, None),
+                        );
+                    }
+                }
             }
             // ★(0.14.31 · WP-5 M) 만료 큐 drain — "삭제 없음" 약속은 **원장 기록**으로 정의한다:
             //   항목마다 원장에 `expired` 사유 레코드를 남긴 뒤 폐기(queue.dropped reason "expired").
