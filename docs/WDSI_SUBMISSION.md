@@ -121,3 +121,22 @@ Requesting removal of the false-positive detection.
 `impl/wdsi-0.14.31.md` §4에 버전 줄만 갱신해 이미 마련돼 있다. 사람이 Windows 기기에서
 실제 설치 → 탐지 관측(있다면) → 있을 때만 §3 절차대로 3분 안에 제출하면 된다.
 상세: `impl/release/wdsi-result.md`, `impl/release/stage2.md`.
+
+### v0.14.32 — 2026-09-11 — 제출하지 않음 (전제조건 미충족, blocked · v0.14.31과 동일 사유)
+
+`v0.14.31`을 재발행한 태그다(pack-artifacts 관문 실패로 v0.14.31 초안이 폐기되고 내용
+동일 + 수정 3건이 v0.14.32로 다시 태그됨). 위 v0.14.31 절의 차단 사유(Windows 기기 부재)가
+**환경 변화 없이 그대로** 적용된다 — 새 근거 없이 재시도해도 같은 결과이므로 재시도하지
+않았다(C3 §10: 탐지가 관측되지 않으면 제출 자체가 불요 · 1회 규칙 유지).
+
+대상 바이트(v0.14.31과 바이트가 다르다 — 별도 CI 빌드, sha256 재사용 금지):
+
+| 자산 | sha256 |
+|---|---|
+| `cys_0.14.32_x64-setup.exe` | `a87ba6af512bdae12f9af0dee94dbf937e4679d2fbb03d4936792a467eb15fdd` |
+| `cys_0.14.32_x64-setup.zip` | `09df5ecb3fc15f0dd3a94e2ea5bca5fdc18f3f6e114e07b9d5642a2f607bf38d` |
+
+제출 문안은 `impl/wdsi-0.14.31.md` §4의 "The submitted binaries are from release
+v0.14.31." 한 줄을 `v0.14.32`로 교체해 그대로 쓴다(C3 §9-6). 사람이 Windows 기기에서
+실제 설치 → 탐지 관측(있다면) → 있을 때만 §3 절차대로 제출.
+상세: `impl/release/wdsi-result.md`, `impl/release/stage2.md`.
