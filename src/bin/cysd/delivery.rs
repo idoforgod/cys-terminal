@@ -570,13 +570,24 @@ pub(crate) mod dir_sync_probe {
     use std::cell::Cell;
     thread_local! {
         static ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+        static REAL_ERRS: Cell<u64> = const { Cell::new(0) };
         static FAULT: Cell<bool> = const { Cell::new(false) };
     }
-    pub(crate) fn note_attempt() {
+    /// ★(0.14.31 · 성찰 Q10) **실제 `sync_all()` 이 반환한 뒤** 불린다 — 계수가 호출 앞에 있으면
+    /// 호출만 상수로 치운 변이가 계수를 그대로 통과한다. `real_err` 는 그 반환이 정말 실패였는지
+    /// (주입이 아니라)를 나눈다.
+    pub(crate) fn note_call(real_err: bool) {
         ATTEMPTS.with(|c| c.set(c.get().saturating_add(1)));
+        if real_err {
+            REAL_ERRS.with(|c| c.set(c.get().saturating_add(1)));
+        }
     }
     pub(crate) fn attempts() -> u64 {
         ATTEMPTS.with(Cell::get)
+    }
+    /// 주입이 아닌 **실제 syscall** 이 실패한 횟수.
+    pub(crate) fn real_errors() -> u64 {
+        REAL_ERRS.with(Cell::get)
     }
     pub(crate) fn fault_armed() -> bool {
         FAULT.with(Cell::get)
@@ -597,16 +608,25 @@ pub(crate) mod dir_sync_probe {
 }
 
 /// 열린 디렉터리 핸들의 실제 fsync — 시도 사실이 여기서 관측된다(위 `dir_sync_probe` 참조).
+///
+/// ★(0.14.31 · 성찰 Q10) **실제 syscall 이 언제나 먼저 돈다.** 관측(계수)도 실패 주입도 그
+/// **반환값에** 붙는다. 종전에는 둘 다 `f.sync_all()` **앞**에 있어서, 그 한 줄만 성공 상수로
+/// 치환하는 변이가 계수도 주입 분기도 그대로 통과했다 — F4 가 세운 seam 이 '호출했다' 가 아니라
+/// '이 함수에 들어왔다' 만 재고 있었다. 지금은 계수가 반환 뒤에 서고, 동기화가 원리상 불가능한
+/// fd 를 물린 검체([`tests::dir_sync_seam_makes_the_real_syscall_not_just_the_probe`])가 그 변이를
+/// 죽인다(변이는 그 fd 에서도 `Ok` 를 낸다). 주입은 실제 호출 **뒤** 결과만 갈아끼우므로
+/// '실패했을 때 무엇을 하는가' 축은 종전과 같다.
 #[cfg(unix)]
 fn fsync_dir_handle(f: &std::fs::File) -> std::io::Result<()> {
+    let real = f.sync_all();
     #[cfg(test)]
     {
-        dir_sync_probe::note_attempt();
+        dir_sync_probe::note_call(real.is_err());
         if dir_sync_probe::fault_armed() {
             return Err(std::io::Error::other("주입: 디렉터리 fsync 실패"));
         }
     }
-    f.sync_all()
+    real
 }
 
 /// 이 open 실패가 **능력 부재**인가(= 이 환경에는 디렉터리 내구화 축이 없다), 아니면 운영 오류인가.
@@ -1830,6 +1850,62 @@ pub(crate) mod tests {
             }
             // 주입 해제 뒤에는 다시 성공한다(RAII 가 실제로 풀렸는가 · 다른 검체 오염 방지).
             assert!(record_queue_tombstones(&daemon, 11, &[mk("f4-after")], "expired", 7.0));
+        });
+    }
+
+    /// ★(0.14.31 · 성찰 Q10) **seam 이 재는 것은 "실제 fsync 를 불렀다" 이지 "이 함수에 들어왔다"
+    /// 가 아니다.**
+    ///
+    /// 【무엇이 틀렸었나】 F4 가 세운 seam 은 계수와 실패 주입을 `f.sync_all()` **앞**에 두었다.
+    /// 그래서 그 한 줄만 성공 상수(`Ok(())`)로 치환하는 내구화 제거 변이가 시도 계수도(늘어난다)
+    /// 주입 분기도(그대로 산다) 통과했다 — 위 검체 ①②는 둘 다 초록을 받는다. 원장 줄은
+    /// `dir_sync_capable:true` 를 주장하는데 디렉터리 엔트리는 어디에도 flush 되지 않은 상태이고,
+    /// 그 상태에서 전원이 끊기면 **삭제만 남고 묘비는 사라진다**(이 축이 지키려던 바로 그 손실).
+    ///
+    /// 【무엇으로 잡는가】 동기화가 **원리상 불가능한 fd**(소켓 쌍의 한쪽)를 seam 에 물린다.
+    /// 실제 syscall 이 돌면 반드시 `Err` 이고(macOS EBADF · Linux EINVAL — 어느 쪽이든 오류),
+    /// 호출을 지운 변이는 `Ok` 를 낸다. 계수는 반환 **뒤에** 서므로 "실패도 실제 호출의 것"임을
+    /// `real_errors()` 로 함께 잰다(주입은 이 검체에서 무장하지 않는다).
+    ///
+    /// 대조군: 같은 seam 에 **진짜 디렉터리**를 물리면 성공한다 — 위 단언이 "무엇을 줘도 Err" 로
+    /// 만족되는 눈먼 계측기가 아님을 고정한다.
+    #[cfg(unix)]
+    #[test]
+    fn dir_sync_seam_makes_the_real_syscall_not_just_the_probe() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        with_state_dir(|dir| {
+            assert!(!dir_sync_probe::fault_armed(), "검체 전제: 주입이 무장돼 있지 않다");
+            let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            // SAFETY: `into_raw_fd` 로 소유권을 넘겨받은 fd 하나뿐이고, File 이 drop 에서 닫는다.
+            let sock = unsafe { std::fs::File::from_raw_fd(a.into_raw_fd()) };
+            let calls = dir_sync_probe::attempts();
+            let real_errs = dir_sync_probe::real_errors();
+            assert!(
+                fsync_dir_handle(&sock).is_err(),
+                "동기화할 수 없는 fd 인데 성공을 반환했다 — 실제 fsync 호출이 없다\
+                 (내구화 제거 변이가 seam 을 통과한다)"
+            );
+            assert_eq!(
+                dir_sync_probe::attempts(),
+                calls + 1,
+                "seam 계수가 실제 호출 뒤에 서지 않는다"
+            );
+            assert_eq!(
+                dir_sync_probe::real_errors(),
+                real_errs + 1,
+                "실패가 실제 syscall 의 것이 아니다(주입·조기 return 이 대신했다)"
+            );
+            // 대조군 — 진짜 디렉터리는 성공한다(계측기가 눈멀지 않았다).
+            let d = std::fs::File::open(dir).expect("상태 디렉터리 핸들");
+            assert!(
+                fsync_dir_handle(&d).is_ok(),
+                "정상 디렉터리 fsync 가 실패했다 — 이 검체의 계측기가 고장났다"
+            );
+            assert_eq!(
+                dir_sync_probe::real_errors(),
+                real_errs + 1,
+                "성공 호출이 실패 계수를 늘렸다"
+            );
         });
     }
 
