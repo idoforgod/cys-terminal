@@ -382,6 +382,27 @@ def _calls(tmp):
     return _read(os.path.join(tmp, "calls.log"))
 
 
+def _sh_which(cmd, path):
+    """POSIX `sh` 의 PATH 해소를 흉내낸다(확장자 불문 — PATHEXT 규칙과 무관).
+
+    ★왜 `shutil.which()` 로는 안 되는가(2026-09-10 · windows-health 첫 실기런 실측 ·
+      CPython `shutil.which` 소스 확인): win32 분기는 `X_OK`(기본 mode 에 포함)가 걸려
+      있으면 **PATHEXT 확장자가 붙은 후보만** 검색하고(`files = [cmd+ext for ext in
+      pathext]`), `cmd` 자신(확장자 없음)은 그 어떤 pathext 확장자로도 끝나지 않는 한
+      후보 목록에 **영원히** 들어가지 않는다. 즉 확장자 없는 목 스크립트(우리 목 `cys`
+      처럼)는 실행 환경·경합과 무관하게 **결정론적으로** `None` 이 나온다 — 정리 경합
+      플레이크가 아니라 검사기 자체의 사각이다. 반면 `session-start.sh`(H-WIN-7 이 실제로
+      재는 것)는 **Git Bash 의 `sh`** 로 실행되고, `sh` 의 PATH 해소는 POSIX 규약(확장자
+      무관 · 실행 비트만 본다)이라 이 함수가 그것을 더 정확히 흉내낸다."""
+    for d in (path or "").split(os.pathsep):
+        if not d:
+            continue
+        cand = os.path.join(d, cmd)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def _base_env(extra=None, drop=()):
     env = dict(os.environ)
     for k in ("CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_SOCKET", "CYS_PACK_DIR",
@@ -3827,9 +3848,17 @@ def h_win_7():
         # ★실패 방향 핀: 이 leg 가 실 `cys` 에 닿으면 안 된다. 누군가 다시 PATH 를 통째로
         #   갈아끼우면 여기서 **큰 소리로** 실패한다(종전엔 정리 경합 OSError 로 나타나 원인이
         #   가려졌다 — 게다가 tmp 밖 실 데몬·실 팩에 닿을 수 있는 형상이었다).
-        need(shutil.which("cys", path=env["PATH"]) == os.path.join(binp, "cys"),
-             "격리 파손: PATH 의 cys 가 목이 아니다(%r) — 실 바이너리가 fixture CYS_PACK_DIR 을 "
-             "자가치유 대상으로 삼는다" % shutil.which("cys", path=env["PATH"]))
+        # ★(2026-09-10 · windows-health 첫 실기런에서 발견) `shutil.which("cys", ...)` 자체를
+        #   판정에 직접 쓰지 않는다 — Windows 에서는 PATHEXT 규칙 때문에 확장자 없는 목 파일을
+        #   **구조적으로** 못 찾아 격리가 멀쩡해도 결정론적으로 None 이 나온다(`_sh_which` 주석
+        #   참조). 원 호출은 참고용으로 남겨 두고(H-META-ISO 의 소스 핀이 이 문자열을 찾는다),
+        #   실제 판정은 `session-start.sh` 를 구동하는 `sh` 와 같은 규약(확장자 무관)의
+        #   `_sh_which` 로 한다.
+        which_result = shutil.which("cys", path=env["PATH"])
+        sh_result = _sh_which("cys", env["PATH"])
+        need(sh_result == os.path.join(binp, "cys"),
+             "격리 파손: PATH 의 cys 가 목이 아니다(sh 해소=%r · shutil.which=%r) — 실 바이너리가 "
+             "fixture CYS_PACK_DIR 을 자가치유 대상으로 삼는다" % (sh_result, which_result))
         if shutil.which("cygpath", path=env["PATH"]):
             return ("cygpath 변환·인용 왕복 검증 · unix 대조 leg skip"
                     "(실행 환경에 cygpath 실재=전제 미충족 — 미측정이지 FAIL 아님)")
