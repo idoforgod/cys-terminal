@@ -9672,10 +9672,22 @@ def h_w5_c2():
         #   GC 가 만료분을 실제로 지우는가(무한 성장 차단)
         clk.t += ttl * 3
         _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        # ★성찰 R4 N8 — GC 의 계약이 **두 지평**으로 갈렸다. 억제 TTL 이 지나도 **미종결 wakeup id**
+        #   가 남아 있으면 레코드를 지우지 않는다(데몬 큐 TTL 6h 뒤에 오는 `queue.expired` 를 원
+        #   사건에 귀속시킬 자리 — 그 자리가 없으면 최초 사건이 영영 종결되지 않고 같은 사건이 TTL
+        #   마다 재enqueue 된다). 그래서 여기서는 **미종결이 없는** 만료분의 GC 를 못박고,
+        #   이어서 그 유예도 유계임을(보존 상한 뒤 GC) 함께 못박는다 — 무한 성장 차단은 그대로다.
         stale = [x for x in G.seen_iter(sd)
-                 if clk.now_epoch() - (x.get("first_ts") or 0) >= ttl * 2]
+                 if clk.now_epoch() - (x.get("first_ts") or 0) >= ttl * 2
+                 and not G.seen_pending_live(x, clk.now_epoch())]
         need(not stale, "만료 레코드가 GC 되지 않았다: %r" % stale)
-    return "단위 경계(±1s)·severity 우회·시계역행 · e2e 만료 전 0/후 1 · GC 동작"
+        clk.t += G.SEEN_PENDING_KEEP_SECS + ttl            # 미종결 보존 상한을 넘긴다
+        _w5_gate(G, sd, r, clk, seen_ttl=ttl).run()
+        left = [x for x in G.seen_iter(sd)
+                if clk.now_epoch() - (x.get("first_ts") or 0) >= ttl * 2]
+        need(not left, "보존 상한을 넘긴 미종결 레코드가 남았다(무한 성장): %r" % left)
+    return ("단위 경계(±1s)·severity 우회·시계역행 · e2e 만료 전 0/후 1 · "
+            "GC 두 지평(미종결 없음=TTL · 미종결 있음=보존 상한 · N8)")
 
 
 # ── C3 enqueue 성공 후 Inject 전 실패 ────────────────────────────────────
