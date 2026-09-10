@@ -19347,7 +19347,38 @@ mod tests {
                 .get_surface(sid)
                 .map(|s| governance::seat_claimable_now(&s))
                 .unwrap_or(false);
-            if claimable || std::time::Instant::now() >= deadline {
+            if claimable {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                // ★(2026-09-10 · 2차 CI 재현에서 2초 대기로도 안 풀림 실측) 여기서 그냥 조용히
+                //   반환하면 하류 단언이 "seat_not_claimable" 한 줄만 남기고 왜 안 풀렸는지는
+                //   영영 안 남는다 — 진단 채널을 이 자리로 옮긴다. 실패해도(테스트가 어차피 뒤에서
+                //   실패할 값이면) 원인 후보 셋(프로세스 존재·자손·메타)을 전부 stdout 에 남긴다
+                //   (cargo test 는 실패한 테스트의 stdout 만 CI 로그에 올린다 — `--nocapture` 불요).
+                if let Some(s) = daemon.get_surface(sid) {
+                    let mut sys = sysinfo::System::new();
+                    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                    let proc_exists = sys.process(sysinfo::Pid::from_u32(s.pid)).is_some();
+                    let descendants = governance::collect_descendants(&sys, s.pid);
+                    let has_meta = s.agent_meta.lock().unwrap().is_some();
+                    let human_recent = s
+                        .last_human_input
+                        .lock()
+                        .unwrap()
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(u64::MAX);
+                    println!(
+                        "[wait_seat_settled] 2s 뒤에도 미정착: sid={sid} pid={} exited={} \
+                         proc_exists={proc_exists} descendants={:?} has_meta={has_meta} \
+                         last_human_input_elapsed_secs={human_recent}",
+                        s.pid,
+                        s.exited.load(Ordering::Relaxed),
+                        descendants,
+                    );
+                } else {
+                    println!("[wait_seat_settled] 2s 뒤에도 미정착: sid={sid} — surface 자체가 사라짐");
+                }
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
