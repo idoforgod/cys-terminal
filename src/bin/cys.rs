@@ -2676,11 +2676,34 @@ fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<(
 /// 다음 수단은 이 flag 가 아니라 **job object 비상속**(`CREATE_BREAKAWAY_FROM_JOB` 등)이며,
 /// 그것은 이 단위의 범위 밖이고 **실기 검증 없이 손대지 않는다**(이 저장소는 Windows 크로스
 /// 타입체크조차 불가능하다 — 검증 없는 flag 추가는 개선이 아니라 미검증 변경이다).
+/// ★(0.14.31 · 성찰 P8) **좌석 신원 입력**의 전체 목록 — 데몬을 띄우기 전에 지워야 하는 키들.
+///
+/// 하나라도 남으면 그 데몬이 자기를 그 좌석이라고 답한다(판정이 뚫리는 축은 `CYS_ROLE` 하나가
+/// 아니다 — `CYS_SURFACE_ID` 만으로도 'master' 가 성립한다). 스케줄 승격 틱의 `env -u` 목록·
+/// `cys-dept` 의 cysd 스폰 4지점과 **같은 집합**이어야 한다(소스 대조 핀 `p8_…`).
+const SEAT_IDENTITY_ENV_KEYS: [&str; 5] = [
+    "CYS_ROLE",
+    "CYS_SURFACE_ID",
+    "CYS_SURFACE_REF",
+    "CYS_SEAT_TOKEN",
+    "CYS_DEPT_ROTATE",
+];
+
 fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
     use cys::SpawnPolicy;
     let mut cmd = std::process::Command::new(path);
     // ★G34: 스폰 전 (소켓,팩) 쌍 보증 — 거부 시 스폰 자체를 하지 않는다.
     ensure_daemon_lane_pack(&mut cmd)?;
+    // ★(0.14.31 · 성찰 P8 · 통합 2026-09-10) **좌석 신원을 물려주지 않는다.**
+    //   이 CLI 는 좌석 안에서 실행될 수 있고(역할 pane 이 `cys` 를 부른다), 그때 환경에는 그
+    //   좌석의 신원이 실려 있다. 그대로 물려받은 cysd 는 자기 신원 질의에 그 좌석 값을
+    //   **권위 있게** 답한다 — 그 데몬이 도는 동안 `cys-dept` 단일소유 가드가 승격을 exit 7 로
+    //   거부하고(10분마다 조용히), 역할 게이트가 엉뚱한 좌석을 master 로 읽는다.
+    //   데몬은 좌석이 아니다: 신원 5종을 전부 지우고 띄운다(`cys-dept` 의 4개 cysd 스폰 지점 ·
+    //   스케줄 승격 틱과 **같은 목록** — schedule.rs `BUILTIN_COMMAND_MIGRATIONS` P8 항목).
+    for k in SEAT_IDENTITY_ENV_KEYS {
+        cmd.env_remove(k);
+    }
     cmd.spawn_policy(cys::ChildLifetime::Survivor);
     cmd.spawn().map(|_| ())
 }
@@ -31021,6 +31044,48 @@ mod tests {
         assert!(
             (SCHEDULE_LOCK_WAIT_MS / 1_000) < SCHEDULE_LOCK_STALE_SECS,
             "대기 상한이 부패 문턱보다 길면 정상 대기자가 상대의 산 잠금을 깬다"
+        );
+    }
+
+    /// ★성찰 P8 — CLI 가 띄우는 데몬은 **좌석 신원을 물려받지 않는다**.
+    ///
+    /// 실패 방향: 역할 pane 안에서 `cys` 가 데몬을 자동 기동하면(온보딩④ sibling spawn) 그 cysd 가
+    /// 좌석 env 를 물려받고, 이후 자기 신원 질의에 그 좌석을 **권위 있게** 답한다 — `cys-dept`
+    /// 단일소유 가드가 승격을 exit 7 로 거부하고(10분마다 조용히) 역할 게이트가 엉뚱한 좌석을
+    /// master 로 읽는다. 세 집행 지점(CLI 스폰 · 스케줄 승격 틱 · `cys-dept`)이 **같은 목록**을
+    /// 써야 한다 — 하나만 짧으면 그 경로로 신원이 샌다.
+    #[test]
+    fn p8_daemon_spawn_scrubs_every_seat_identity_env() {
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "spawn_detached_daemon");
+        assert!(
+            body.contains("for k in SEAT_IDENTITY_ENV_KEYS") && body.contains("cmd.env_remove(k)"),
+            "스폰 경로가 좌석 신원을 지우지 않는다: {body}"
+        );
+        // ① 스케줄 승격 틱(데몬 레인)과 같은 집합인가 — 소스 대조.
+        let sched = include_str!("cysd/schedule.rs");
+        let i = sched.find("\"id\": \"ceo-promote-pending-tick\"").expect("승격 틱 잡이 없다");
+        // ※ 바이트 슬라이스는 멀티바이트 경계를 밟는다 — 줄 단위로 자른다.
+        let tick: String = sched[i..].lines().take(6).collect::<Vec<_>>().join("\n");
+        for k in SEAT_IDENTITY_ENV_KEYS {
+            assert!(
+                tick.contains(&format!("-u {k}")),
+                "승격 틱이 '{k}' 를 지우지 않는다 — CLI 와 집행 지점이 갈렸다"
+            );
+        }
+        // ② cys-dept 의 cysd 스폰 지점과 같은 집합인가.
+        let dept = include_str!("../../cysjavis-pack/bin/cys-dept");
+        for k in SEAT_IDENTITY_ENV_KEYS {
+            assert!(
+                dept.contains(&format!("-u {k}")),
+                "cys-dept 가 '{k}' 를 지우지 않는다 — 그 경로로 신원이 샌다"
+            );
+        }
+        // ③ 음성 대조 — 팩 경로 결정(`CYS_PACK_DIR`)까지 지우면 데몬이 레인을 잃는다(G34).
+        assert!(
+            !SEAT_IDENTITY_ENV_KEYS.contains(&"CYS_PACK_DIR")
+                && !SEAT_IDENTITY_ENV_KEYS.contains(&"CYS_SOCKET"),
+            "레인 결정 env 를 신원 목록에 넣었다 — 데몬이 짝 없는 팩으로 뜬다"
         );
     }
 }

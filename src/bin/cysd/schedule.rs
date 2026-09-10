@@ -198,6 +198,31 @@ const BUILTIN_JOBS_VERSION: u64 = 2;
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
 /// 담당). 각 항목에 `_builtin`/`_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의
 /// 미지 필드는 serde 가 무시). text_command 는 R-CLI-4 게이트가 이 코드 정의와의 정확 일치로 신뢰한다.
+/// ★(통합 2026-09-10 · 성찰 P3·P8) **표적 command 이관표** — `(id, 구 표현)`.
+///
+/// 왜 필요한가: `apply_builtin_jobs` 는 같은 id·같은 마커·**같은 `_builtin_version`** 이면
+/// **무접촉**이다(중복 생성 0 이 그 계약). 그래서 builtin 의 `command` 문자열만 고치면 그 수정은
+/// **기존 설치본에 영원히 닿지 않는다** — P3(편성 심박 `--cwd` 누락 = 에러 4 재발)·P8(승격 틱
+/// 좌석 신원 누출 = 10분마다 조용한 exit 7)이 신규 설치에서만 고쳐지고 실제 피해 함대에서는
+/// 그대로 남는다. 전역 `BUILTIN_JOBS_VERSION` 범프는 반대편 절벽이다: 그 순간 **모든** builtin 이
+/// 코드 정의로 통째 교체돼 운영자 수기 편집이 무언 소실된다(§B-5 금지).
+///
+/// 그래서 `action` 이관(위 X13 선례)과 **같은 규율**을 쓴다 — 이관 대상은 구 빌드가 심은
+/// **정확히 그 바이트열**뿐이고, 한 글자라도 다르면 운영자 편집으로 보고 건드리지 않는다.
+/// 실패 방향: 표에 없는 편집은 그대로 남는다(무접촉 = 종전 거동 · 침묵 소실 0).
+const BUILTIN_COMMAND_MIGRATIONS: &[(&str, &str)] = &[
+    // P3: `--cwd` 없이 편성을 재생성하던 심박(구 표현).
+    (
+        "formation-heartbeat",
+        "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" --json || true; done",
+    ),
+    // P8: `CYS_ROLE` 하나만 지우던 승격 틱(구 표현) — `CYS_SURFACE_ID` 로 좌석 신원이 샜다.
+    (
+        "ceo-promote-pending-tick",
+        "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
+    ),
+];
+
 fn builtin_jobs() -> Vec<serde_json::Value> {
     vec![
         json!({
@@ -305,7 +330,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "every_minutes": 10,
             "action": "command",
             "base_only": true,
-            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" --json || true; done",
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || true; done",
             "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -327,7 +352,7 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "every_minutes": 10,
             "action": "command",
             "base_only": true,
-            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE \"$pk/bin/cys-dept\" promote-if-pending",
             "_builtin": "promote",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -608,6 +633,28 @@ fn apply_builtin_jobs(
                                 cur_action.unwrap_or("(없음)")
                             );
                         }
+                    }
+                }
+                // ★(통합 2026-09-10 · P3·P8) **표적 command 이관** — 구 표현과 바이트 동일할
+                //   때만 코드 정의로 올린다(위 action 이관과 같은 규율). 동버전 무접촉 계약을
+                //   지키면서 기존 설치본에 두 수정을 실제로 닿게 하는 유일한 경로다.
+                if let (Some(want_cmd), Some(cur_cmd)) = (
+                    bj.get("command").and_then(|v| v.as_str()),
+                    jobs[pos].get("command").and_then(|v| v.as_str()),
+                ) {
+                    if cur_cmd != want_cmd
+                        && BUILTIN_COMMAND_MIGRATIONS
+                            .iter()
+                            .any(|(mid, old)| *mid == id.as_str() && *old == cur_cmd)
+                    {
+                        let want_cmd = want_cmd.to_string();
+                        if let Some(o) = jobs[pos].as_object_mut() {
+                            o.insert("command".into(), serde_json::json!(want_cmd));
+                        }
+                        changed = true;
+                        eprintln!(
+                            "[cysd] ensure_builtin_jobs: '{id}' 의 command 를 구 표현에서 이관 — 그 표현은 알려진 결함이다(P3 편성 cwd 누락 · P8 좌석 신원 누출)"
+                        );
                     }
                 }
                 let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
@@ -3625,5 +3672,130 @@ mod converge_schedule {
             Some(ACTION_PUSH_QUEUED),
             "원시 JSON 을 되쓰는 경로가 구 표현을 디스크에 다시 심었다"
         );
+    }
+}
+
+/// ★(통합 2026-09-10) 병합 뒤 남은 **교차 영역 잔여**(P3·P8)의 검체. 파일 끝에 모아 병합 충돌을
+/// 이 블록 하나로 국소화한다.
+#[cfg(test)]
+mod merge_residue_tests {
+    use super::*;
+
+    fn builtin(id: &str) -> serde_json::Value {
+        builtin_jobs()
+            .into_iter()
+            .find(|j| j["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("builtin '{id}' 이 없다"))
+    }
+
+    /// ★P3 — 편성 심박이 부서의 **확정 cwd** 를 넘긴다.
+    ///
+    /// 실패 방향: `--cwd` 없이 `javis_formation.py ensure` 를 부르면 좌석이 데몬 cwd 로 재생성되고
+    /// (launchd cwd=`/`), 시드한 (acctdir, cwd) 쌍과 어긋나 신뢰 관문이 다시 선다(에러 4 재발).
+    /// 반대 방향의 안전: `cys-dept cwd` 는 미등재·등재 cwd 부재에서 stdout 0 + 비0 exit 이라
+    /// `${c:+…}` 가 `--cwd` 를 **생략**한다 = 종전 동작(회귀 0 · 거짓 cwd 전파 0).
+    #[test]
+    fn p3_formation_heartbeat_passes_the_department_cwd() {
+        let cmd = builtin("formation-heartbeat")["command"].as_str().unwrap().to_string();
+        assert!(
+            cmd.contains(r#"c="$("$pk/bin/cys-dept" cwd "$d" 2>/dev/null)" || c="""#),
+            "부서 cwd 를 조회하지 않는다: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"ensure --socket "$s" ${c:+--cwd "$c"}"#),
+            "조회한 cwd 를 ensure 에 넘기지 않는다(또는 빈 값에서 --cwd 를 생략하지 않는다): {cmd}"
+        );
+        // 팩 쪽 두 계약이 실재해야 이 잡이 성립한다(소스 대조 — 팩은 다른 레인 소유다).
+        let dept = include_str!("../../../cysjavis-pack/bin/cys-dept");
+        assert!(dept.contains("\n  cwd)"), "cys-dept 에 cwd 동사가 없다");
+        let form = include_str!("../../../cysjavis-pack/bin/javis_formation.py");
+        assert!(form.contains(r#"if a == "--cwd""#), "javis_formation 이 --cwd 를 읽지 않는다");
+    }
+
+    /// ★P8 — 승격 틱은 **좌석 신원 전부**를 지운 role-less 집행자로 돈다.
+    ///
+    /// 실패 방향: `CYS_ROLE` 만 지우면 `CYS_SURFACE_ID` 를 물려받은 cysd 가 자기를 'master' 로
+    /// 권위 있게 답하고, cys-dept 단일소유 가드가 승격을 **exit 7 로 거부**한다 — 10분마다,
+    /// 조용히, 영구히(대기형 CEO 가 영원히 승격되지 않는다).
+    #[test]
+    fn p8_promote_tick_scrubs_every_seat_identity_input() {
+        let cmd = builtin("ceo-promote-pending-tick")["command"].as_str().unwrap().to_string();
+        for k in [
+            "CYS_ROLE",
+            "CYS_SURFACE_ID",
+            "CYS_SURFACE_REF",
+            "CYS_SEAT_TOKEN",
+            "CYS_DEPT_ROTATE",
+        ] {
+            assert!(
+                cmd.contains(&format!("-u {k}")),
+                "좌석 신원 입력 '{k}' 를 지우지 않는다 — 그 하나로 판정이 뚫린다: {cmd}"
+            );
+        }
+    }
+
+    /// ★이관 — 두 수정이 **기존 설치본**에 닿는다(동버전 무접촉 계약을 깨지 않고).
+    ///
+    /// 실패 방향(이 검체가 없을 때): builtin 의 command 만 고치면 `_builtin_version` 이 같아
+    /// `apply_builtin_jobs` 가 무접촉하고, 결함 있는 구 표현이 실제 함대에 영원히 남는다
+    /// (신규 설치에서만 고쳐진다 = 피해자에게 닿지 않는 수정).
+    #[test]
+    fn migration_upgrades_the_known_bad_command_but_never_an_operator_edit() {
+        // ① 표의 구 표현은 실제로 **지금 코드 정의와 다르다**(표가 죽은 항목이 아니다).
+        for (id, old) in BUILTIN_COMMAND_MIGRATIONS {
+            let want = builtin(id)["command"].as_str().unwrap().to_string();
+            assert_ne!(
+                &want, old,
+                "이관표의 '{id}' 구 표현이 코드 정의와 같다 — 표가 무의미하다(또는 수정이 사라졌다)"
+            );
+        }
+        // ② 구 표현 = 이관된다(동버전인데도).
+        let ver = builtin("formation-heartbeat")["_builtin_version"].as_u64().unwrap();
+        let mut jobs = vec![serde_json::json!({
+            "id": "formation-heartbeat",
+            "every_minutes": 10,
+            "action": "command",
+            "base_only": true,
+            "command": BUILTIN_COMMAND_MIGRATIONS[0].1,
+            "_builtin": "formation",
+            "_builtin_version": ver
+        })];
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
+        assert!(changed, "구 표현이 이관되지 않았다");
+        assert!(conflicts.is_empty(), "우리 잡이 선점 충돌로 보고됐다: {conflicts:?}");
+        let migrated = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("formation-heartbeat"))
+            .unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(migrated.contains("--cwd"), "이관 뒤에도 --cwd 가 없다: {migrated}");
+
+        // ③ 음성 대조 — **운영자 편집은 건드리지 않는다**(구 표현과 한 글자만 달라도).
+        let edited = format!("{} # 운영자 주석", BUILTIN_COMMAND_MIGRATIONS[0].1);
+        let mut jobs2 = vec![serde_json::json!({
+            "id": "formation-heartbeat",
+            "every_minutes": 10,
+            "action": "command",
+            "base_only": true,
+            "command": edited.clone(),
+            "_builtin": "formation",
+            "_builtin_version": ver
+        })];
+        let _ = apply_builtin_jobs(&mut jobs2);
+        assert_eq!(
+            jobs2
+                .iter()
+                .find(|j| j["id"].as_str() == Some("formation-heartbeat"))
+                .unwrap()["command"]
+                .as_str()
+                .unwrap(),
+            edited,
+            "운영자 수기 편집이 무언 소실됐다(§B-5 위반)"
+        );
+
+        // ④ 전역 버전은 이 이관으로 올라가지 않는다(범프 = 모든 builtin 통째 교체).
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
     }
 }

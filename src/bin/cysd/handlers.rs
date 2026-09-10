@@ -7628,17 +7628,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 = 신경 차단) ───
         "system.pause" => {
             let reason = param_str(&params, "reason").unwrap_or_default();
-            daemon.paused.store(true, Ordering::Relaxed);
+            // ★(0.14.31 · 성찰 Q2 · 통합 2026-09-10) kill-switch 전이는 `set_paused` 하나로 간다.
+            //   `paused.store(true)` 만 하면 **이미 결판을 기다리는 인계는 그대로 나간다** — 운영자가
+            //   `cys pause` 응답을 손에 쥔 뒤에도 본문+CR 이 좌석에 꽂힌다는 뜻이다. `set_paused` 는
+            //   플래그를 세우고 그 순간의 미확정 예약을 끊은 뒤, **끊지 못한**(writer 가 이미 쓰기로
+            //   확정한) 좌석 수를 돌려준다. 그 수를 응답에 실어야 호출자가 "완전히 0 이 아니다" 를
+            //   **알 수 있다**(침묵하면 0 이라고 읽는다 — 결측은 값이 아니다).
+            //   남는 창: 이미 CLAIMED/ACKED 인 쓰기(백로그 · writer fence).
+            let still_writing = daemon.set_paused(true);
             *daemon.pause_info.lock().unwrap() = Some((crate::state::now_epoch(), reason.clone()));
             daemon.persist_pause();
             daemon
                 .bus
                 .publish("autopilot.paused", "system", None, json!({"reason": reason}));
-            Reply::Single(ok_response(&id, json!({"paused": true})))
+            Reply::Single(ok_response(
+                &id,
+                json!({"paused": true, "still_writing": still_writing}),
+            ))
         }
 
         "system.resume" => {
-            daemon.paused.store(false, Ordering::Relaxed);
+            // ★(성찰 Q2 · 통합) 되돌리는 방향도 같은 진입점을 쓴다(전이 지점 단일화 · 반환 0).
+            //   `set_paused` 는 SeqCst 라, 배달 틱이 보는 플래그와 여기의 쓰기가 같은 순서를 갖는다.
+            let _ = daemon.set_paused(false);
             *daemon.pause_info.lock().unwrap() = None;
             daemon.persist_pause();
             // §2.6 O5: pause 중 동결된 채널 아웃바운드 이벤트 재발행 + 보류 inbox 드레인.
