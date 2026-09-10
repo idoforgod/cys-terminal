@@ -19431,6 +19431,79 @@ mod tests {
     /// 계정) · `Some(_)` = 명시 오버라이드(다른 계정 · 음성 대조용).
     /// ★cwd 는 **실제로 만든다** — 데몬은 좌석 셸의 *실제* cwd 를 축으로 쓰므로(R2), 존재하지
     ///   않는 디렉터리로 스폰하면 그 축이 셸 폴백값이 되어 검체가 사실을 재지 못한다.
+    /// PTY 획득 유한 재시도 상한 — 총 대기는 20+40+…+160 = **720ms 이내**로 묶는다.
+    const PTY_TRIES: usize = 8;
+
+    /// ★자원 고갈은 판정 대상이 아니다(2026-09-10 · 0.14.32).
+    ///
+    /// 좌석 검체의 `create_surface_with_env` 는 인자가 전부 상수(24×80)이므로 `openpty` 실패는
+    /// **오직 러너 사정**이다 — aarch64 CI 에서 관측된 ENXIO(`Device not configured`)가 그것이고,
+    /// EAGAIN·EMFILE 도 같은 갈래다. 종전에는 그 실패가 `.expect("create seat")` 로 곧장 적색이
+    /// 됐다 — 코드의 결함이 아닌 것을 결함으로 신고하던 자리다(실패 방향: 러너가 붐빌수록 적색).
+    ///
+    /// 여기서는 두 겹으로 막는다. ① 일시적 고갈은 **유한 재시도**로 넘긴다(무한 대기 금지).
+    /// ② 그래도 못 얻으면 호출부가 **SKIP 사유와 함께** 물러난다 — 없는 자원을 단언하지 않는다.
+    fn with_pty_retry<T>(mut f: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+        let mut last = String::new();
+        for i in 0..PTY_TRIES {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // `openpty failed:` 가 아니면 자원 문제가 아니다 — 즉시 올려보낸다(삼키지 않는다).
+                    if !e.starts_with("openpty failed") {
+                        return Err(e);
+                    }
+                    last = e;
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (i as u64 + 1)));
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// ★음성 대조 — 재시도 장치 자체가 판정을 삼키지 않는지 잰다(PTY 불요 · 순수 로직).
+    ///   실패 방향: ① 자원 아닌 실패를 재시도로 뭉개면 진짜 결함이 초록으로 숨는다.
+    ///   ② 상한이 없으면 고갈된 러너에서 검체가 영영 안 끝난다.
+    #[test]
+    fn pty_retry_is_bounded_and_never_swallows_a_real_error() {
+        // ① 자원 아닌 실패는 **한 번에** 올라온다(재시도 0회).
+        let mut calls = 0usize;
+        let r: Result<(), String> = with_pty_retry(|| {
+            calls += 1;
+            Err("계약 위반: role 이 없다".to_string())
+        });
+        assert_eq!(calls, 1, "자원 문제가 아닌 실패를 재시도했다 — 진짜 결함이 숨는다");
+        assert_eq!(r.unwrap_err(), "계약 위반: role 이 없다", "사유가 바뀌었다");
+
+        // ② 자원 실패는 정확히 PTY_TRIES 회에서 멈춘다(무한 대기 없음).
+        let mut calls = 0usize;
+        let r: Result<(), String> = with_pty_retry(|| {
+            calls += 1;
+            Err("openpty failed: Device not configured (os error 6)".to_string())
+        });
+        assert_eq!(calls, PTY_TRIES, "재시도 상한이 지켜지지 않았다");
+        assert!(r.unwrap_err().contains("Device not configured"), "마지막 사유를 잃었다");
+
+        // ③ 도중에 풀리면 그 값을 돌려준다(재시도가 성공을 버리지 않는다).
+        let mut calls = 0usize;
+        let r = with_pty_retry(|| {
+            calls += 1;
+            if calls < 3 { Err("openpty failed: EAGAIN".to_string()) } else { Ok(7u8) }
+        });
+        assert_eq!((calls, r), (3, Ok(7u8)));
+    }
+
+    /// 러너에 여유 PTY 가 있는지의 **사실 확인** — 하나 열어 보고 즉시 닫는다(유한 재시도).
+    /// Err 이면 그 사유 문자열이 SKIP 근거가 된다.
+    fn pty_available() -> Result<(), String> {
+        with_pty_retry(|| {
+            portable_pty::native_pty_system()
+                .openpty(portable_pty::PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .map(|_| ())
+                .map_err(|e| format!("openpty failed: {e}"))
+        })
+    }
+
     fn reclaim_seat(
         daemon: &Arc<Daemon>,
         role: &str,
@@ -19444,7 +19517,7 @@ mod tests {
         } else {
             vec![]
         };
-        let s = daemon
+        let s = with_pty_retry(|| daemon
             .create_surface_with_env(
                 Some(cwd.to_string()),
                 // ★(2026-09-10 · gh run 34466065884 진단 실측으로 확증) 예전에는 여기서
@@ -19471,7 +19544,7 @@ mod tests {
                 80,
                 &env,
                 cfg.map(|c| c.to_string()),
-            )
+            ))
             .expect("create seat");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         daemon.roles.lock().unwrap().insert(role.to_string(), s.id);
@@ -19494,7 +19567,7 @@ mod tests {
         //   유예 자체는 `reclaim_auto_excludes_freshly_spawned_seat` 가 **실제 값으로** 잰다.
         crate::reclaim::tests::set_grace_secs(0.0);
         let _ = std::fs::create_dir_all(cwd);
-        let s = daemon
+        let s = with_pty_retry(|| daemon
             .create_surface_with_env(
                 Some(cwd.to_string()),
                 Some("sleep 30".into()),
@@ -19504,7 +19577,7 @@ mod tests {
                 80,
                 &[],
                 None,
-            )
+            ))
             .expect("create caller");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         bind_caller(daemon, pid, s.id);
@@ -20301,6 +20374,15 @@ mod tests {
     /// 결합 판정에는 쓰이지 않는다 — 데몬이 그 이름의 **현재 보유자**를 조회할 뿐이다.)
     #[test]
     fn env_role_state_reports_who_actually_holds_the_role() {
+        // ★이 검체는 실 PTY 좌석 2개를 띄운다. 러너에 여유 PTY 가 없으면 잴 것이 없다 —
+        //   자원 고갈을 결함으로 신고하지 않고 사유를 남기고 물러난다(0.14.32 · aarch64 ENXIO).
+        if let Err(e) = pty_available() {
+            eprintln!(
+                "SKIP: env_role_state_reports_who_actually_holds_the_role — \
+                 러너에 여유 PTY 가 없다({e} · {PTY_TRIES}회 재시도 후). 자원 고갈은 판정 대상이 아니다."
+            );
+            return;
+        }
         let daemon = isolated_daemon();
         let holder = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
         let pid = 970_122_u32;

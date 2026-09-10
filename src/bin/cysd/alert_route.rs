@@ -6678,7 +6678,12 @@ mod reflect_a12 {
     use std::sync::{Arc, Mutex};
 
     /// 검체 전용 핸드셰이크 상한 — 이 시간을 넘으면 실행자가 멈춘 것이다(무한 대기 금지).
-    const HS: std::time::Duration = std::time::Duration::from_secs(5);
+    ///
+    /// ★이 값은 **판정 기준이 아니라 교착 탈출구**다. 판정은 전부 토큰 순서로 하고(아래
+    ///   `wake_is_a_signal_…` 참조) 이 상한에 걸리는 것은 실행자가 영영 진행하지 않을 때뿐이므로,
+    ///   느린 러너(aarch64 CI)에서 **여유가 클수록 안전**하다 — 5s 는 부하 높은 러너에서 정상
+    ///   진행을 멈춤으로 오판할 수 있어 60s 로 넓혔다(정상 경로 소요는 밀리초 단위다).
+    const HS: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// ★A12 의 핵심 핀: **Wake 는 이력이 아니라 신호**이고, 재평가는 기한당 정확히 한 번이다.
     ///
@@ -6690,69 +6695,98 @@ mod reflect_a12 {
     ///   ③ 다음 기한을 '직전 기한 + 주기' 로 잡으면 — 오래 밀린 뒤 밀린 만큼 연속 실행한다.
     ///
     /// 시간은 가짜 시계로, 진행은 핸드셰이크로 본다(sleep 경쟁 없음 · Windows 에서도 돈다).
+    ///
+    /// ★2026-09-10(0.14.32) 결정성 수리 — **핸드셰이크가 반복 한 바퀴를 다 덮지 못했다.**
+    ///   `drive_worker` 한 바퀴는 `on_job()` → **기한 검사(`clock()`)** 순서인데, 종전 검체는
+    ///   `on_job` 이 보낸 "job" 만 기다린 뒤 곧바로 시계를 앞당겼다. 그 사이 실행자가 아직
+    ///   같은 바퀴의 기한 검사를 하지 않았으면 **새 시계값을 읽어** 그 바퀴에서 재평가가 터진다
+    ///   (①의 `reevals==0` 직후 ②에서 "job" 대신 "reeval" 이 먼저 도착 → 적색). 느린 러너에서
+    ///   창이 넓어져 aarch64 CI 에서만 간헐 적색이던 원인이다. 시간 여유를 늘리는 것으로는
+    ///   못 고친다 — 순서 경합이지 지연이 아니다.
+    ///   수리: **시계 읽기 자체를 진행 신호로 만든다.** 그러면 한 바퀴의 끝(기한 검사)을 검체가
+    ///   관측할 수 있고, 시계는 실행자가 `blocking_recv` 로 되돌아간 뒤에만 바뀐다. 잠도 시간
+    ///   단언도 없다 — 판정은 오직 토큰 순서다.
+    ///   이 검체는 그 대가로 `drive_worker` 의 **시계 읽기 지점**을 못박는다(바퀴당 1회 +
+    ///   재평가마다 1회 + 기동 시 1회). 지점이 늘면 여기서 적색이 나는 것이 맞다.
     #[test]
     fn wake_is_a_signal_and_reevaluate_runs_once_per_deadline_from_completion() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Job>(64);
         let clock = Arc::new(Mutex::new(0.0f64));
         let jobs = Arc::new(AtomicUsize::new(0));
         let reevals = Arc::new(AtomicUsize::new(0));
-        // 실행자 → 검체 진행 신호("일감 하나 끝" / "재평가 하나 끝").
+        // 실행자 → 검체 진행 신호. "clock" 은 **기한 검사가 시계를 읽었다**는 뜻이다.
         let (sig, progress) = stdmpsc::channel::<&'static str>();
 
-        let (c, j, r, sig2) = (Arc::clone(&clock), Arc::clone(&jobs), Arc::clone(&reevals), sig.clone());
+        let (c, j, r) = (Arc::clone(&clock), Arc::clone(&jobs), Arc::clone(&reevals));
+        let (sig_clock, sig_job, sig_reeval) = (sig.clone(), sig.clone(), sig);
         let worker = std::thread::spawn(move || {
             let mut rx = rx;
-            let clock_fn = || *c.lock().unwrap();
+            let clock_fn = || {
+                let v = *c.lock().unwrap();
+                let _ = sig_clock.send("clock");
+                v
+            };
             let mut on_job = |_job: Job| {
                 j.fetch_add(1, Ordering::Relaxed);
-                let _ = sig2.send("job");
+                let _ = sig_job.send("job");
             };
             let mut on_reeval = || {
                 r.fetch_add(1, Ordering::Relaxed);
-                let _ = sig.send("reeval");
+                let _ = sig_reeval.send("reeval");
             };
             drive_worker(&mut rx, &clock_fn, &mut on_job, &mut on_reeval);
         });
         let ev = || Job::Event { event: json!({"seq": 1, "name": "x"}), whence: "test" };
         let send = |job| tx.blocking_send(job).expect("실행자가 이미 죽었다");
-        let wait = |what: &str| {
-            assert_eq!(progress.recv_timeout(HS).expect("실행자가 진행하지 않는다"), what)
+        // 기대한 토큰 열을 **그 순서 그대로** 받는다. 마지막 토큰이 "clock" 이면 실행자는
+        // 그 바퀴의 기한 검사를 마치고 `blocking_recv` 로 돌아간 것이므로 시계를 바꿔도 안전하다.
+        let step = |what: &[&'static str]| {
+            for (i, want) in what.iter().enumerate() {
+                let got = progress
+                    .recv_timeout(HS)
+                    .unwrap_or_else(|e| panic!("실행자가 진행하지 않는다({i}번째 {want} 대기): {e}"));
+                assert_eq!(got, *want, "{i}번째 진행 신호가 기대와 다르다");
+            }
         };
 
-        // ① 기한(0+30) 전: Wake 를 아무리 보내도 일감도 재평가도 없다.
+        // ⓪ 기동 시 기한을 잡는다(0+30=30) — 시계 읽기 1회.
+        step(&["clock"]);
+
+        // ① 기한(30) 전: Wake 를 아무리 보내도 일감도 재평가도 없다.
+        //    Wake 는 `on_job` 을 부르지 않으므로 바퀴마다 "clock" 하나만 남는다.
         send(Job::Wake);
         send(Job::Wake);
         send(Job::Wake);
         send(ev());
-        wait("job"); // FIFO 라 이 신호는 앞의 Wake 3건이 모두 소비됐다는 증거다
+        step(&["clock", "clock", "clock", "job", "clock"]);
         assert_eq!(reevals.load(Ordering::Relaxed), 0, "기한 전에 재평가가 돌았다");
         assert_eq!(jobs.load(Ordering::Relaxed), 1, "Wake 가 일감으로 처리됐다(신호가 아니다)");
 
         // ② 기한이 지나면 **일감 경계**에서 재평가가 한 번 — Wake 없이도.
+        //    재평가 뒤 다음 기한을 잡느라 시계를 한 번 더 읽는다(30+30=60).
         *clock.lock().unwrap() = 30.0;
         send(ev());
-        wait("job");
-        wait("reeval");
+        step(&["job", "clock", "reeval", "clock"]);
         assert_eq!(reevals.load(Ordering::Relaxed), 1);
 
-        // ③ 묵은 Wake 는 새 기한(30+30=60) 전이면 아무 일도 하지 않는다.
+        // ③ 묵은 Wake 는 새 기한(60) 전이면 아무 일도 하지 않는다.
         send(Job::Wake);
         send(Job::Wake);
         send(ev());
-        wait("job");
+        step(&["clock", "clock", "job", "clock"]);
         assert_eq!(reevals.load(Ordering::Relaxed), 1, "묵은 Wake 가 재평가를 다시 불렀다");
 
         // ④ idle 실행자를 Wake **하나만으로** 깨워 재평가시킨다(이벤트가 없어도 굶지 않는다).
         //    그리고 70초를 건너뛰어도 재평가는 **한 번**이다(밀린 만큼 연속 실행 금지).
         *clock.lock().unwrap() = 100.0;
         send(Job::Wake);
-        wait("reeval");
+        step(&["clock", "reeval", "clock"]);
         assert_eq!(reevals.load(Ordering::Relaxed), 2, "밀린 주기 수만큼 재평가가 연속 실행됐다");
 
-        // ⑤ 다음 기한은 **완료 시점**(100)부터다 — 129 에서는 돌지 않는다.
+        // ⑤ 다음 기한은 **완료 시점**(100)부터다 — 129 에서는 돌지 않는다(130 이 기한).
         *clock.lock().unwrap() = 129.0;
         send(ev());
-        wait("job");
+        step(&["job", "clock"]);
         assert_eq!(reevals.load(Ordering::Relaxed), 2, "기한이 완료 시점 기준이 아니다");
 
         // ⑥ 송신부가 사라지면 실행자는 남은 일감을 처리하고 정상 종료한다.
@@ -6763,20 +6797,38 @@ mod reflect_a12 {
 
     /// 실행자가 막혀 있어도 **인계는 계속된다** — 채널 용량만큼의 버스트를 ring 밖에 받아 둔다.
     /// (완충의 크기를 증명하는 검체가 아니라, 인계가 실행자의 I/O 에 **묶이지 않는다**는 핀이다.)
+    ///
+    /// ★2026-09-10(0.14.32) 결정성 수리 — 종전 검체는 **실행자가 아직 아무것도 집어 가지 않았다**
+    ///   고 가정하고 곧바로 `try_send` 를 `cap` 번 했다. 실행자가 그 사이 한 건을 집어 가면 자리
+    ///   하나가 비고, 이어지는 `try_send(Wake)` 가 **성공**해 `포화 채널이 Wake 를 받았다` 로 적색이
+    ///   된다(부하가 있을수록 잘 일어난다 — 로컬 macOS arm64 에서도 모듈 동시 실행 시 10회 중 3회
+    ///   재현 · aarch64 CI 간헐 적색의 실체). 자원 고갈·스케줄링을 단언하던 자리다.
+    ///   수리: 실행자가 **첫 일감을 이미 집어 가 막혀 있는 상태**를 핸드셰이크로 확정한 뒤 채우고
+    ///   센다. 그러면 채널은 비어 있는 상태에서 정확히 `cap` 건을 받고, 실행자는 파킹돼 있어
+    ///   자리를 비우지 못하므로 `Wake` 거절은 **결정적**이다. 잠·시간 단언 없음.
     #[test]
     fn handoff_continues_while_the_worker_is_blocked() {
         let cap = 8usize;
         let (tx, rx) = tokio::sync::mpsc::channel::<Job>(cap);
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let clock = Arc::new(Mutex::new(0.0f64));
+        // 실행자 → 검체: "첫 일감을 집어 가 막혔다"(파킹 확정).
+        let (parked_tx, parked) = stdmpsc::channel::<()>();
         let (c, g) = (Arc::clone(&clock), Arc::clone(&gate));
         let worker = std::thread::spawn(move || {
             let mut rx = rx;
             let clock_fn = || *c.lock().unwrap();
+            let mut first = true;
             let mut on_job = |_job: Job| {
                 // 첫 일감에서 멈춘다(= 원장 재작성·fsync 로 묶인 실행자의 모사).
                 let (m, cv) = &*g;
                 let mut open = m.lock().unwrap();
+                if first {
+                    first = false;
+                    // ★잠금을 쥔 채 알린다 — 검체가 이 신호를 받은 시점에 실행자는 이미
+                    //   `rx` 에서 한 건을 꺼내 여기 들어와 있고, 문이 열리기 전에는 못 나간다.
+                    let _ = parked_tx.send(());
+                }
                 while !*open {
                     open = cv.wait(open).unwrap();
                 }
@@ -6785,7 +6837,12 @@ mod reflect_a12 {
             drive_worker(&mut rx, &clock_fn, &mut on_job, &mut on_reeval);
         });
         let ev = || Job::Event { event: json!({"seq": 1}), whence: "test" };
-        // 실행자가 첫 일감을 집어 갈 때까지는 경합이 있으므로, 용량만큼은 **반드시** 들어간다.
+        // ① 첫 일감을 넣고 실행자가 **그것을 집어 가 막힐 때까지** 기다린다(경합 제거).
+        tx.blocking_send(ev()).expect("실행자가 이미 죽었다");
+        parked
+            .recv_timeout(HS)
+            .expect("실행자가 첫 일감을 집어 가지 않는다");
+        // ② 이제 채널은 비었고 실행자는 자리를 비우지 못한다 — 용량만큼 **전건** 들어간다.
         let mut accepted = 0usize;
         for _ in 0..cap {
             if tx.try_send(ev()).is_ok() {
@@ -6793,7 +6850,7 @@ mod reflect_a12 {
             }
         }
         assert_eq!(accepted, cap, "실행자가 막힌 동안 인계가 함께 막혔다(A12 재발)");
-        // Wake 는 포화에서 **버려진다**(backpressure 를 기다리지 않는다).
+        // ③ Wake 는 포화에서 **버려진다**(backpressure 를 기다리지 않는다).
         assert!(tx.try_send(Job::Wake).is_err(), "포화 채널이 Wake 를 받았다");
         let (m, cv) = &*gate;
         *m.lock().unwrap() = true;
