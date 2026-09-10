@@ -1114,6 +1114,14 @@ class RsiRoundBudget(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "init"], cwd=self.root, check=True)
         self.env = dict(os.environ)
         self.env["CYS_ROUND_DIR"] = os.path.join(self.root, "_round")
+        # ★성찰 R4 N10: 다이제스트 큐는 이제 **팩 고정**(`pack_dir()/round/learn`)이다 —
+        #   `javis_orchestra` 와 같은 규칙. 팩 env 를 임시로 못박지 않으면 이 스위트가
+        #   오너의 **라이브 팩**(`~/.cys/pack`)에 적재한다(밀폐 파괴).
+        self.pack = os.path.join(self.root, "pack")
+        self.env["CYS_PACK_DIR"] = self.pack
+        for _k in ("JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR"):
+            self.env.pop(_k, None)
+        self.queue = os.path.join(self.pack, "round", "learn", "digest_queue.jsonl")
         self.env.pop("CYS_RSI_MAX_ROUNDS", None)
         self.env.pop("CYS_RSI_CEILING_FLATS", None)
         self.state = os.path.join(self.root, "_round", "rsi", "state.json")
@@ -1183,7 +1191,7 @@ class RsiRoundBudget(unittest.TestCase):
         evs = [json.loads(l) for l in open(led, encoding="utf-8")]
         self.assertTrue(any(e.get("event") == "ceiling_recommend" and e.get("backfilled")
                             for e in evs), "ledger 래치가 메워지지 않았다")
-        q = os.path.join(self.root, "_round", "learn", "digest_queue.jsonl")
+        q = self.queue                # ★N10: 큐는 팩 고정(orchestra 와 같은 자리)
         open(q, "w", encoding="utf-8").write("")                  # 큐 회전
         os.remove(os.path.join(self.root, "_round", "rsi", "state.json"))
         self.rsi("checkpoint", "--round", "r1", "--score", "5.0")
@@ -1230,7 +1238,7 @@ class RsiRoundBudget(unittest.TestCase):
         for _ in range(4):
             last = json.loads(self.rsi("progress", "--round", "r1", "--score", "1.0").stdout)
         self.assertEqual(last["stop_reason"], "stopped_stagnation", last)
-        q = os.path.join(self.root, "_round", "learn", "digest_queue.jsonl")
+        q = self.queue                # ★N10: 큐는 팩 고정(orchestra 와 같은 자리)
         with open(q, encoding="utf-8") as f:
             recs = [json.loads(ln) for ln in f if ln.strip()]
         self.assertEqual(len(recs), 1, "정체 추천이 progress 마다 중복 적재됐다: %r" % recs)
@@ -1238,7 +1246,7 @@ class RsiRoundBudget(unittest.TestCase):
         self.assertEqual(recs[0]["source"], "rsi.ceiling")
 
     def queue_recs(self):
-        q = os.path.join(self.root, "_round", "learn", "digest_queue.jsonl")
+        q = self.queue                # ★N10: 큐는 팩 고정(orchestra 와 같은 자리)
         if not os.path.isfile(q):
             return []
         with open(q, encoding="utf-8") as f:
@@ -1275,7 +1283,7 @@ class RsiRoundBudget(unittest.TestCase):
         self.rsi("checkpoint", "--round", "r1", "--score", "1.0")
         self.flat_round()
         self.assertEqual(len(self.queue_recs()), 1)
-        os.remove(os.path.join(self.root, "_round", "learn", "digest_queue.jsonl"))
+        os.remove(self.queue)
         os.remove(self.state)
         self.rsi("checkpoint", "--round", "r1", "--score", "1.0")
         self.flat_round()
@@ -1486,27 +1494,30 @@ class Wp6TriageEmptyLockReclaim(unittest.TestCase):
 
     def test_ctrl_c_between_mkdir_and_owner_leaves_a_reclaimable_lock(self):
         """도달 경로: `KeyboardInterrupt` 는 `except OSError` 에 걸리지 않아 `__enter__` 밖으로
-        빠져나가고 `__exit__` 도 돌지 않는다 — **빈** 잠금이 남는다."""
-        import builtins
+        빠져나가고 `__exit__` 도 돌지 않는다 — **빈** 잠금이 남는다.
+
+        ★주입 지점은 `os.open`(소유권 배타 게시 · 성찰 R4 N6)이다. 종전에는 `builtins.open` 을
+        가로챘는데, 게시가 `O_EXCL` 로 바뀌면서 그 지점은 **되읽기**가 되어 owner 파일이 이미
+        생긴 뒤였다(빈 잠금이 아니라 owner 있는 잠금이 남아 전제가 깨졌다)."""
         mod = self.mods[0]
         base = os.path.join(self.root, "ctrlc")
         lock = base + ".lock"
-        real_open, hit = builtins.open, []
+        real_os_open, hit = os.open, []
 
         def interrupting_open(f, *a, **kw):
             if not hit and str(f) == os.path.join(lock, "owner"):
                 hit.append(True)
                 raise KeyboardInterrupt("Ctrl-C")
-            return real_open(f, *a, **kw)
+            return real_os_open(f, *a, **kw)
 
-        builtins.open = interrupting_open
+        os.open = interrupting_open
         try:
             with self.assertRaises(KeyboardInterrupt):
                 with mod._best_effort_lock(base, wait=1.0, stale=300.0):
                     pass
         finally:
-            builtins.open = real_open
-        self.assertTrue(hit, "전제 불성립: owner 쓰기 지점에 도달하지 못했다")
+            os.open = real_os_open
+        self.assertTrue(hit, "전제 불성립: owner 게시 지점에 도달하지 못했다")
         self.assertTrue(os.path.isdir(lock) and not os.listdir(lock),
                         "전제 불성립: 빈 잠금이 남지 않았다")
         old = time.time() - 4000

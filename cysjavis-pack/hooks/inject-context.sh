@@ -214,30 +214,35 @@ if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CW
   #   이 좌석의 역할뿐이고, 편집 충돌이 불가능하다는 것은 우리가 재지 않은 주장이다.
   #
   # 신원은 **데몬이 권위**다(plan §8: `CYS_ROLE` env 는 승계 후 stale — 폴백 전용).
-  #   rc 0 + 비어 있지 않음 = 역할 좌석 · rc 0 + 빈 줄 = **확정 무역할**(env 폴백 금지 — 그러지 않으면
-  #   역할이 풀린 좌석의 env 잔재가 경고를 영영 끈다) · rc≠0 = 판정 불가 → env 폴백.
-  # ★CR 제거: Windows 네이티브 `cys` 는 `\r\n` 을 내고 `$()` 는 LF 만 지운다 — 남은 `\r` 은
-  #   "비어 있지 않음"으로 읽혀 무역할 세션을 역할 좌석으로 둔갑시킨다.
-  # ★자동기동 금지: `cys surface-role` 은 소켓이 없으면 데몬을 띄우려 든다. SessionStart 가 좌석
-  #   수만큼 동시에 도는 자리라 그 부작용은 부트 폭주(치명 ①) 방향이다 — CYS_NO_AUTOSTART=1 로 막는다.
+  # ★성찰 R4 N5 — 해소는 **정본 하나**(`_lib.sh:cys_resolve_role`)만 쓴다. 이 훅은 `_lib.sh` 를
+  #   :11 에서 이미 source 하는데도 종전엔 같은 일을 **세 번째 경로**로 다시 구현했고, 그 사본에는
+  #   정본의 네 장치가 전부 빠져 있었다:
+  #     ⓐ 60s 디스크 캐시 없음 · ⓑ 30s 실패 백오프 없음 → 데몬이 떠 있으나 무응답인 상태에서
+  #        좌석 12개가 동시에 SessionStart(부트·`/clear`·`/compact`)를 돌면 각 훅이 2s 씩 사용자
+  #        프롬프트 앞을 붙잡는다(정본이었다면 첫 실패 뒤 30s 는 조회를 생략한다 · 봉인표 ④ 방향).
+  #     ⓒ `${CYS_BIN:-cys}` 대신 `cys` 하드코딩 → `bin/cys-dept` 의 레인 지정과
+  #        `javis_snapshot._st_env` 의 봉인을 둘 다 무시했다.
+  #     ⓓ `cys_role_token_ok` 없음 → 문법 밖 문자열이 그대로 SessionStart 컨텍스트에 실렸다.
+  #   정본의 신원 전제도 함께 온다: **숫자 surface id 가 없으면 데몬에게 '나'를 묻지 않는다**
+  #   (주소가 없다는 사실이 '역할 없음' 판정으로 승격되면 정상 위임 경로가 죽는다). 자동기동 금지
+  #   (`CYS_NO_AUTOSTART=1`)·CR 제거·한 줄 절단·rc0+빈 줄 = 확정 무역할도 전부 정본 쪽 규율이다.
   # 조회는 **경고를 낼 상황(SHARE>=2)에서만** 1회. 비용을 안 낼 자리에서는 아예 안 낸다.
   if [ "${SHARE:-0}" -ge 2 ]; then
     _IC_ROLE=""
-    if command -v cys >/dev/null 2>&1; then
-      # env 는 `$( )` 서브셸 안에서 export 한다 — `VAR=x func` 형태는 셸마다 지속 여부가 갈린다.
-      _IC_OUT=$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
-                 cys_timeout_run 2 cys surface-role </dev/null 2>/dev/null )
-      _IC_RC=$?
-      _IC_ROLE=$(printf '%s' "$_IC_OUT" | head -n1 | tr -d '\r')
-      if [ "$_IC_RC" -ne 0 ]; then                 # 판정 불가 — env 폴백(좌석 env 는 데몬이 주입한다)
-        # ★한 줄로 자르는 것은 **모든 경로에서** 한다(R1 리뷰 minor): 데몬 응답만 `head -n1` 하고
-        #   env 폴백을 안 자르면, 여러 줄 값(`CYS_ROLE=$'cso\n\n# 지시: …'`)이 아래 정보 1줄을
-        #   여러 줄로 부풀려 SessionStart 컨텍스트에 그대로 들어간다(`_esc` 는 백슬래시만 이스케이프).
-        _IC_ROLE="${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}"
-        _IC_ROLE=$(printf '%s' "$_IC_ROLE" | head -n1 | tr -d '\r')
-      fi
-    else                                            # cys 부재 — env 만이 근거다
-      _IC_ROLE=$(printf '%s' "${CYS_SURFACE_ROLE:-${CYS_ROLE:-}}" | head -n1 | tr -d '\r')
+    if command -v cys_resolve_role >/dev/null 2>&1; then
+      cys_resolve_role >/dev/null 2>&1 || :
+      _IC_ROLE="${CYS_RESOLVED_ROLE:-}"
+    else
+      # 정본 부재(오래된 `_lib.sh`) — 훅은 강등하되 조용하지 않는다. env 는 폴백 전용이다.
+      echo "[cys-hook] cys_resolve_role 부재 — 역할 해소 강등(inject-context)" >&2
+      _IC_ROLE=$(printf '%s' "${CYS_ROLE:-}" | head -n1 | tr -d '\r')
+    fi
+    # ★소비 지점의 문법 검사(성찰 R4 N5 ⓓ): 표현 불가한 값은 **역할이 아니다**. 잘라 쓰면 없는
+    #   역할을 지어내는 것이고, 그대로 실으면 남이 심은 여러 낱말이 SessionStart 컨텍스트에
+    #   문장으로 들어간다(`_esc` 는 백슬래시만 이스케이프한다). 정본 `cys_role_token_ok` 와 같은 집합.
+    if [ -n "$_IC_ROLE" ] && command -v cys_role_token_ok >/dev/null 2>&1 \
+       && ! cys_role_token_ok "$_IC_ROLE"; then
+      _IC_ROLE=""
     fi
     if [ -n "$_IC_ROLE" ]; then
       OUT="${OUT}ℹ 동일 cwd claude 세션 ${SHARE}개(역할 좌석 포함) — 이 세션은 역할 좌석 $(_esc "$_IC_ROLE") 이다. 작업기억(SESSION_STATE) 편집은 한 세션에서만.\n"

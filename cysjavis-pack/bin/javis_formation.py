@@ -11,8 +11,10 @@
              (리뷰어 없는 부서는 라운드 루프 불능 → complete 오판 금지·Sim S2-5).
   partial  = 설치된 부분만 기동 + 부족 CLI 목록(설치 시 자동 승급).
   pending-cli = CLI 전무 → 빈 셸 유지(온보딩 보존·기능1).
-  pending-resource = 자원 게이트 hard(servers/nodes/load_ratio/context_pct/formation_budget 중 하나 —
-             hard 로 판정된 축이 detail·상태파일 gate 키에 그대로 남는다) — 대기·자동 재시도.
+  pending-resource = 자원 게이트 hard(servers/nodes/fleet_cpu_ratio/context_pct/formation_budget 중
+             하나 — hard 로 판정된 축이 detail·상태파일 gate 키에 그대로 남는다) — 대기·자동 재시도.
+             ★0.14.31: `load_ratio` 는 **soft 전용**이라 이 목록에 없다(호스트 부하로 착수를 거부하지
+             않는다). CPU 로 착수를 막는 축은 `fleet_cpu_ratio` 하나다.
 
 ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 · paused·판정 불능 모두
     편성 보류 종료) ②소켓키 싱글플라이트 락
@@ -476,8 +478,9 @@ def _installed_clis():
     return {c for c in REQUIRED_CLIS if javis_cli_probe.probe_cli(c)}
 
 
-# ── ④ 자원 게이트(javis_resource_gate.py check — hard=pending-resource · 축 servers/nodes/load_ratio/
-#      context_pct + opt-in formation_budget(W6 접점 · env CYS_FORMATION_BUDGET 없으면 무발화)) ──
+# ── ④ 자원 게이트(javis_resource_gate.py check — hard=pending-resource · hard 축 servers/nodes/
+#      fleet_cpu_ratio/context_pct + opt-in formation_budget(W6 접점 · env CYS_FORMATION_BUDGET 없으면
+#      무발화) · `load_ratio` 는 soft 전용이라 hard 축이 아니다(0.14.31)) ──
 # 재시도(무플래그) 호출 timeout — 본 호출(30s)보다 짧게(R3-P03-1 권고 15s).
 RESOURCE_RETRY_TIMEOUT_S = 15
 
@@ -520,7 +523,8 @@ def _resource_verdict(socket):
     ★A2(SURVEY B2 · 2026-09-03): 종전 `_resource_ok` 는 `code, _out, err = _run(...)` 로 게이트 stdout
     (JSON `trips` = 어느 metric 이 hard 인지)을 **버려서**, ensure ④ 가 고정 문구 "곱셈 자원 예산 hard"
     를 상태파일·피드에 찍었다 — 곱셈 축은 env CYS_FORMATION_BUDGET 없이는 무발화라 기본 설치에서는
-    servers/nodes/load_ratio/context_pct 중 하나가 원인이고 그 문구는 항상 거짓 라벨이었다. 이 함수는
+    servers/nodes/fleet_cpu_ratio/context_pct 중 하나가 원인이고 그 문구는 항상 거짓 라벨이었다.
+    (0.14.31 부터 `load_ratio` 는 soft 전용 — hard 원인 후보가 아니다.) 이 함수는
     호출 형상·재시도·127 분기를 **한 줄도 바꾸지 않고** stdout 만 살려 돌려준다 — 판정(ok)은 종전과
     동일하다(self-test 의 `_resource_ok` 핀 ①~⑤ 무수정 통과가 그 증거).
 

@@ -739,8 +739,22 @@ class QueueExpiryTermination(unittest.TestCase):
                              "만료가 inflight 를 풀지 않았다 — TTL 마다 영구 재enqueue 된다")
             self.assertNotEqual(rec["state"], G.SEEN_STATE_DELIVERED,
                                 "만료를 배달로 셌다(배달되지 않은 일을 완료로 기록)")
-            self.assertFalse(counters.get("push_edge", {}).get(key, {}).get("armed", True),
-                             "엣지가 무장 해제되지 않아 같은 주기에 다시 발화한다")
+            # ★성찰 R4 N9 — 이 자리의 종전 단언은 "엣지가 무장 해제됐는가" 였다. 그것이 막으려던
+            #   것은 **같은 주기의 재발화**인데, 그 상한은 seen-store 가 이미 준다(state=expired 는
+            #   TTL 까지 재선점을 막는다). 엣지까지 내리면 대가가 셋이었다: 재통보 간격이 seen TTL
+            #   1800s → 쿨다운 7200s 로 4배 · `cooldown` 기본값 0 인 트리거는 **영구 침묵**(재무장은
+            #   '이번 주기에 없는 키' 에만 일어나는데 조건이 지속되면 키는 계속 있다) · 만료가
+            #   배지/이벤트로 남지 않아 "critical 이 미배달로 폐기됐다" 를 함대가 관측 못 함.
+            #   그래서 핀을 **실제로 지키려는 성질**로 바꾼다.
+            self.assertTrue(counters.get("push_edge", {}).get(key, {}).get("armed", True),
+                            "만료가 엣지 무장까지 풀었다 — 쿨다운 0 트리거가 영구 침묵한다(N9)")
+            claimed, _r = G.seen_claim(t, key, G.SEV_CRIT, 1_000_100.0)
+            self.assertFalse(claimed,
+                             "만료 직후 같은 주기에 재선점됐다 — seen TTL 상한이 무너졌다")
+            claimed, _r = G.seen_claim(t, key, G.SEV_CRIT, 1_000_000.0 + G.SEEN_TTL_SECS + 1)
+            self.assertTrue(claimed, "seen TTL 이 지났는데 재통보가 열리지 않는다(영구 침묵)")
+            self.assertEqual(counters.get("expired_undelivered"), 1,
+                             "미배달 폐기가 계수로 남지 않았다(조용한 유실)")
 
     def test_delivered_receipt_still_marks_delivered(self):
         """대조군 — 영수증 경로는 종전 그대로 `delivered` 다(만료 처리가 전면화되지 않았다)."""

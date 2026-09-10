@@ -2105,11 +2105,59 @@ def ledger_owner_mismatch(path, task):
                 "`round_path` 슬러그가 겹쳤다. 같은 장부를 이어 쓰려면 **장부 표기 그대로** "
                 "`--task` 를 주고, 다른 작업이면 겹치지 않는 이름을 써라."
                 % (tid[:12], task_id(task)[:12], disp))
-    if disp is not None and disp != str(task):
+    # ★성찰 R4 N18: **양쪽 같은 정규화**로 비교한다. 종전은 `disp`(장부에서 읽으며 `.strip()`
+    #   된 값) 대 `str(task)`(원문) 였다 — 후행 공백·탭·개행이 든 표기로 만든 구 장부에 **같은
+    #   표기로** append 해도 영원히 거부됐고(안내는 "장부 표기 그대로 `--task` 를 줘라" = 이미 한
+    #   일을 하라는 말이었다), 이 검사는 다른 무엇보다 먼저 도는데 override 경로가 없어 진행
+    #   중이던 라운드 장부가 업그레이드 순간 **append 불능**이 됐다(자율 루프 정지 방향).
+    #   신판 장부의 헤더는 `_audit_text(task)` 로 쓰므로 그 함수가 이 비교의 정본 정규화다.
+    if disp is not None and _audit_text(disp) != _audit_text(task):
         return ("이 장부는 다른 task 의 것으로 보인다(장부 표기 %r ≠ 이 호출 %r · 구 장부라 "
-                "task-id 가 없다) — 같은 장부를 이어 쓰려면 장부 표기 그대로 `--task` 를 줘라."
-                % (disp, task))
+                "task-id 가 없다) — 같은 장부를 이어 쓰려면 장부 표기 그대로 `--task` 를 주고, "
+                "표기를 헤더에 담을 수 없는 경우(개행 등)는 **헤더 줄을 직접 고쳐 이주하라**: "
+                "첫 줄을 `# ORCHESTRATION 라운드 장부 — %s` 로 바꾸거나 그 아래에 "
+                "`<!-- task-id: %s -->` 한 줄을 넣으면 그 뒤로는 신원이 정확히 비교된다."
+                % (disp, task, _audit_text(task), task_id(task)))
     return None
+
+
+def backfill_ledger_task_id(path, task):
+    """구 장부(0.14.30 · `task-id` 주석 없음)에 신원 주석을 **한 번** 심는다 — 반환 심었는지.
+
+    ★왜(성찰 R4 N18): 신원 비교가 **통과한 첫 기록** 때 정본 신원(sha256)을 심어 두면 다음
+      호출부터는 표시 문자열이 아니라 `task-id` 정확 비교로 넘어가 이주가 끝난다(표시 표기의
+      정규화 차이가 영구 거부를 만드는 길이 그 장부에서 닫힌다).
+    ★반드시 **잠금을 쥔 채** 부른다(`write_ledger_header` 와 같은 자리). 실패는 조용히 무시한다 —
+      심지 못해도 기록은 계속돼야 한다(이주 실패가 기록을 막으면 그것이 더 나쁘다).
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+            body = f.read()
+    except OSError:
+        return False
+    lines = body.split("\n")
+    hdr = None
+    for i, ln in enumerate(lines[:8]):
+        if LEDGER_TASKID_RE.match(ln.strip()):
+            return False                       # 이미 신원이 있다 — 이주 끝
+        if hdr is None and LEDGER_HEADER_RE.match(ln.strip()):
+            hdr = i
+    if hdr is None:
+        return False                           # 헤더가 없다(형상 미상) — 손대지 않는다
+    lines.insert(hdr + 1, "<!-- task-id: %s -->" % task_id(task))
+    tmp = "%s.mig.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("\n".join(lines))
+            _fsync(f)
+        os.replace(tmp, path)                  # 잠금 안이므로 남의 행을 덮지 않는다
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def ledger_header_text(task):
@@ -2135,6 +2183,8 @@ def write_ledger_header(path, task):
       파일은 '없음' 아니면 '완성' 둘 중 하나다.
     """
     if os.path.exists(path):
+        # 구 장부 이주(성찰 R4 N18) — 신원 비교를 이미 통과한 자리다. 실패해도 기록은 계속된다.
+        backfill_ledger_task_id(path, task)
         return True, ""
     tmp = "%s.init.%d.tmp" % (path, os.getpid())
     try:
@@ -2178,9 +2228,8 @@ def cmd_round_init(args, gate=True):
     #   잠금 밖에서 헤더를 쓰면, 그 사이 `round-log` 가 append 한 행을 헤더가 덮는다.
     with _best_effort_lock(p) as lk:
         if lk.blocked:
-            print("[round-init] 거부: 다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 "
-                  "헤더를 쓰면 이미 기록된 행을 덮는다. 잠시 뒤 다시 하라(고아 잠금은 %d초 뒤 "
-                  "자동 회수)." % (lk.path, int(WP6_LOCK_STALE)), file=sys.stderr)
+            print("[round-init] 거부: %s" % lock_blocked_reason(
+                lk, "직렬화 없이 헤더를 쓰면 이미 기록된 행을 덮는다."), file=sys.stderr)
             return 2
         if lk.unsupported:
             print("[round-init] 주의: 이 파일계에서 잠금을 만들 수 없다(%s) — 직렬화 없이 "
@@ -2258,6 +2307,19 @@ def _record_stagnation_stop(task, stop_round, requested_round, why, holding, eve
         return append_round_event(task, rec, lock=False)
 
 
+# ★성찰 R4 N3: 게이트가 **집행**하는 종료 사유 — `round_stop_reason` 의 우선순위 함수는
+#   `stopped_budget` 을 `stopped_stagnation` **앞에서** 반환한다(정본이 정한 순서다: 헌장의 하드
+#   상한이 정체보다 강하다). 그런데 게이트가 `stopped_stagnation` 하나만 집행하던 탓에, R10 에
+#   상한이 차는 순간 사유가 budget 으로 바뀌면서 **정체 종결이 통째로 무장 해제**됐다 — R11·R12
+#   가 rc 0 으로 열리고 `stagnation_stop` 은 0건인데 도구는 "무한 루프 금지" 를 출력했다(실측).
+#   두 사유 모두 종결이고 재개는 `--override "<사유>"` 하나뿐이므로, 집행 목록을 여기 한 곳에
+#   두고 게이트·문면이 그것을 공유한다(값 = 그 사유의 사람 문면 한 조각).
+ROUND_STOP_ENFORCED = {
+    "stopped_stagnation": "stopped_stagnation 은 종결이며",
+    "stopped_budget": "stopped_budget 은 헌장의 하드 상한(운영계약 §6-5)이며",
+}
+
+
 def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, holding=False):
     """`round-log` 의 WP-6 정체 종결 게이트 — 반환 (exit code|None, 보류 override|None).
 
@@ -2308,7 +2370,7 @@ def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, hold
         for n in (() if holding else notes):   # 잠금 안 재판정은 같은 안내를 두 번 내지 않는다
             print("[round-log] %s" % n, file=sys.stderr)
         reason, why = round_stop_reason(rows, evidence, row_damage=row_damage)
-    if blocked_round is None and reason != "stopped_stagnation":
+    if blocked_round is None and reason not in ROUND_STOP_ENFORCED:
         return None, None
     stop_round = blocked_round if blocked_round is not None else last
     raw = getattr(args, "override", None)
@@ -2323,15 +2385,16 @@ def stagnation_gate(args, path, rows, events, damage=None, row_damage=None, hold
                       file=sys.stderr)
         # 사유 표기는 **정직해야** 한다: 종결 이후 같은 라운드에 행이 더 붙어 지금 계산된
         # stop_reason 이 달라졌을 수 있다. 그 사실을 감추지 않고 둘 다 적는다.
-        if blocked_round is not None and reason != "stopped_stagnation":
-            print("[round-log] 거부(exit %d): 라운드 %d 에서 **정체 종결이 기록**됐다"
+        if blocked_round is not None and reason not in ROUND_STOP_ENFORCED:
+            print("[round-log] 거부(exit %d): 라운드 %d 에서 **종결이 기록**됐다"
                   "(사이드카 stagnation_stop). 그 뒤 기록으로 지금 계산된 stop_reason=%s 이지만, "
                   "재개 권한은 명시 override 까지 유지된다(종결 ≠ 합격)."
                   % (ROUND_LOG_EXIT_STAGNATION, stop_round, reason), file=sys.stderr)
         else:
-            print("[round-log] 거부(exit %d): stop_reason=stopped_stagnation — 라운드 %d 에서 "
-                  "종결됐다. stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계한다"
-                  "(종결 ≠ 합격)." % (ROUND_LOG_EXIT_STAGNATION, stop_round), file=sys.stderr)
+            print("[round-log] 거부(exit %d): stop_reason=%s — 라운드 %d 에서 종결됐다. "
+                  "%s minor 는 백로그 목록으로 인계한다(종결 ≠ 합격)."
+                  % (ROUND_LOG_EXIT_STAGNATION, reason, stop_round,
+                     ROUND_STOP_ENFORCED[reason]), file=sys.stderr)
         for w in why:
             print("  · %s" % w, file=sys.stderr)
         if raw is not None:
@@ -2440,10 +2503,8 @@ def commit_round_row(args, path, row, binding=None, rnd=None, std=None):
         return COMMIT_REFUSED, "round 디렉터리를 만들 수 없다(%s)" % e, None
     with _best_effort_lock(path) as lk:
         if lk.blocked:
-            return COMMIT_REFUSED, ("다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 쓰면 "
-                                    "행 서수·결속 세대가 겹쳐 남의 행에 내 증거가 묶인다. 잠시 뒤 "
-                                    "다시 기록하라(고아 잠금은 %d초 뒤 자동 회수)."
-                                    % (lk.path, int(WP6_LOCK_STALE))), None
+            return COMMIT_REFUSED, lock_blocked_reason(
+                lk, "직렬화 없이 쓰면 행 서수·결속 세대가 겹쳐 남의 행에 내 증거가 묶인다."), None
         if lk.unsupported:
             print("[round-log] 주의: 이 파일계에서 잠금을 만들 수 없다(%s) — 직렬화 없이 "
                   "진행한다(동시 writer 가 있으면 증거 결속이 섞일 수 있다)." % lk.unsupported,
@@ -3140,6 +3201,11 @@ class _best_effort_lock(object):
       명령을 세우지 않는다 — 무한대기는 부트체인 ④(전 pane 사망) 방향이다.
     ★잠금 파일은 **task 장부 하나**로 통일한다(사이드카·장부 공용) — 서로 다른 두 잠금을 쓰면
       한쪽만 쥔 writer 가 그 사이로 끼어든다.
+    ★이 클래스는 `javis_orchestra.py` 와 `javis_rsi.py` 에 **바이트 동형으로 복제**돼 있다
+      (`javis_rsi` 는 독립 실행 도구라 orchestra 대형 모듈을 import 하지 않는다 — 배포 누락·검색
+      경로라는 새 의존을 늘리지 않는 쪽을 골랐다). 복제가 갈리면 이번 라운드에 네 번 고쳐진 규율이
+      한쪽에만 남으므로, 동형은 `bin/tests/test_refl_round_lock_ownership.py` 의 **AST 해시 패리티**
+      가 기계로 잡고 **행동 검체는 두 판본에 각각** 돌린다(같은 결함은 패리티를 통과한다).
     """
 
     def __init__(self, path, wait=WP6_LOCK_WAIT, stale=WP6_LOCK_STALE):
@@ -3153,6 +3219,17 @@ class _best_effort_lock(object):
         # ★내 토큰을 **실제로 남겼는가**(주인님 규율 "쓰기 후 되읽기"): owner 쓰기가 성공했다면
         #   빈 owner 는 내 잠금이 아니다(회수 중이거나 남의 새 잠금이다) — 반납 대상이 아니다.
         self.wrote_owner = False
+        # ★게시 결과를 **네 상태로 가른다**(성찰 R4 N6 · codex (c) "서로 다른 상태를 False 하나로
+        #   합치지 마라"): "published"(내 토큰이 되읽기로 확인됨) · "unwritten"(파일을 못 만들었거나
+        #   못 썼다 — 이 파일계의 한계) · "lost"(**남의 토큰이 보인다 = 소유권 상실의 증거**) ·
+        #   ""(아직 시도하지 않음). `lost` 는 파일계 한계가 아니라 경합의 결과이므로 진입을 막는다.
+        self.owner_state = ""
+        # ★세대(보조 거부 전용 · codex (d)): `mkdir` 직후의 `(st_dev, st_ino)`. **신원 증명이
+        #   아니다** — `st_ino` 가 0 이거나 재사용되는 파일계가 있으므로 '같다'는 아무것도 증명하지
+        #   않는다. 유효한 값이 **다를 때만** '이 디렉터리는 내 것이 아니다' 로 읽어 삭제를 거부한다.
+        #   ctime 은 쓰지 않는다: owner 생성이 디렉터리 ctime 을 바꾸는 파일계에서 정상 소유자가
+        #   자기 잠금을 영영 반납하지 못한다(= 회수 불능 잔재 = 부트체인 ④ 방향).
+        self.gen = None
         # ★회수는 `__enter__` 당 **한 번**만 시도한다(독립 재유도 X-1): 회수 뒤에도 잠금이 살아
         #   있으면 그것은 고아가 아니라 **새 소유자**다. 연쇄 회수를 허용하면 대기 상한이 상한을
         #   넘긴 나이의 새 잠금까지 강탈해 두 writer 를 만든다(수리 전 실측 형상).
@@ -3192,6 +3269,88 @@ class _best_effort_lock(object):
         if rest.startswith("stale-"):
             return True
         return len(rest) == 8 and all(c in "0123456789abcdef" for c in rest)
+
+    def obstruction(self):
+        """이 자리가 **자동 회수될 수 없는 형상**인가 → `"file"` · `"contents"` · `""`.
+
+        ★왜(성찰 R4 N17): 안내문은 "고아 잠금은 300초 뒤 자동 회수" 라고 말하는데, `<장부>.lock`
+          자리에 **일반 파일**이 있거나 잠금 디렉터리에 **미지 내용물**이 있으면 두 회수 경로가
+          모두 손대지 않는다(보류 방향 — 옳다). 그러면 그 task 의 라운드 기록은 사람이 지울
+          때까지 영구 거부인데 조작자는 안내를 믿고 기다린다. 문면을 가르기 위한 판별이다.
+          · "file"     = 잠금 자리에 일반 파일(또는 비디렉터리)이 있다 — `mkdir` 이 영영 실패한다
+          · "contents" = 잠금 디렉터리에 청구 파일이 아닌 내용물이 있다 — 회수가 손대지 않는다
+          · ""         = 회수 가능한 형상(살아 있는 소유자 · 고아 · 빈 잠금)이거나 판독 불가
+        """
+        try:
+            names = os.listdir(self.path)
+        except NotADirectoryError:
+            return "file"
+        except OSError:
+            try:
+                if os.path.exists(self.path) and not os.path.isdir(self.path):
+                    return "file"
+            except OSError:
+                pass
+            return ""
+        for n in names:
+            if n != "owner" and not self._is_claim(n):
+                return "contents"
+        return ""
+
+    def _stat_gen(self):
+        """이 잠금 디렉터리의 세대 후보 `(st_dev, st_ino)` — 유효하지 않으면 None(순수하지 않음).
+        0 은 신원이 아니다(Windows·일부 파일계가 `st_ino` 를 0 으로 낸다)."""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        dev, ino = getattr(st, "st_dev", 0), getattr(st, "st_ino", 0)
+        return (dev, ino) if (dev and ino) else None
+
+    def _gen_ok(self):
+        """세대 **보조 거부**(codex (d)) — 유효한 신원이 **다르면** 남의 디렉터리다.
+        같거나 신원을 못 얻으면 여기서는 아무것도 증명하지 않는다(증거는 토큰이다)."""
+        if self.gen is None:
+            return True
+        cur = self._stat_gen()
+        return cur is None or cur == self.gen
+
+    def _publish_owner(self):
+        """소유권 **원자 게시** → `"published"` · `"lost"` · `"unwritten"`.
+
+        ★왜 `O_EXCL` 인가(성찰 R4 N6): 종전은 `mkdir` 직후 owner 를 **덮어썼다**. 그래서 A 가
+          `mkdir` 성공 뒤 owner 를 쓰기 전에 상한을 넘겨 지연되면 → B 가 빈 잠금을 회수·재획득해
+          자기 owner 를 게시하고 → 재개한 A 가 **B 의 잠금 안에** 자기 토큰을 덮어써서 되읽기까지
+          성공했다. 둘이 동시에 임계구간에 들고, A 의 반납이 B 의 잠금을 지웠다.
+          생성 배타(`O_EXCL`)는 그 창을 닫는다 — 게시에 성공한 **하나만** 소유자다.
+        ★되읽기가 **남의 토큰**이면 그것도 상실이다(codex (c) 반례): `O_EXCL` 에 성공하고 쓰기
+          전에 지연되면 B 가 그 빈 owner 를 회수해 갈 수 있다. 그때 A 의 쓰기는 이미 unlink 된
+          fd 로 가고 경로 되읽기에는 B 의 토큰이 보인다 — 진입하면 안 된다.
+        ★`unwritten` 은 파일계 한계다(만들 수도 쓸 수도 없다). 그 경우는 종전 표면을 유지한다 —
+          여기서 기록을 전면 거부하면 owner 파일을 못 만드는 파일계에서 라운드 기록이 영구
+          불능이 된다(부트체인 ④ 방향).
+        """
+        try:
+            fd = os.open(self._owner_file(), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return "lost"
+        except OSError:
+            return "unwritten"
+        try:
+            os.write(fd, self.token)
+        except OSError:
+            return "unwritten"
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        got = self._owner()
+        if got == self.token:
+            return "published"
+        if got == b"":
+            return "unwritten"
+        return "lost"
 
     def _abandoned_claim(self):
         """중단된 회수가 남긴 청구 파일 하나 — owner 가 없고 나이가 상한을 넘은 것만.
@@ -3233,6 +3392,9 @@ class _best_effort_lock(object):
         ★`os.rmdir` 는 디렉터리가 **비었을 때만** 성공하므로 원자성은 그대로다: 그 사이 누군가
           owner 를 썼다면 실패하고 우리는 아무것도 지우지 않는다. 나이도 다시 확인한다 —
           갓 만들어진 빈 잠금은 owner 를 쓰는 중인 **살아 있는** 소유자다.
+        ★그래도 '살아 있는 소유자를 회수해 버릴' 창은 남는다(codex: 회수 전 stat 은 삭제 권한을
+          예약하지 않는다). 그 잔여 창은 **피해자 쪽에서** 닫는다 — `_publish_owner` 의 배타
+          생성이 실패하면 그 프로세스는 자기가 잠금을 잃었음을 알고 임계구간에 들지 않는다.
         """
         try:
             if os.listdir(self.path):
@@ -3244,42 +3406,28 @@ class _best_effort_lock(object):
             return False
         return True
 
-    def _reclaim_orphan(self, seen):
-        """고아 잠금 회수 — **원자적 청구(rename)에 성공한 하나만** 회수자다. 반환 회수 여부.
+    def _claim_and_unlink(self, src, expect):
+        """`src` 를 **원자적으로 청구(rename)** 하고, 옮긴 그 바이트가 `expect` 일 때만 지운다.
+        반환 True = 지웠다. `expect is None` 이면 내용을 확인하지 않는다(이미 죽은 소유자의 잔재).
 
-        ★확인과 삭제가 원자적이지 않으면 확인 **뒤** 소유자가 바뀔 수 있다(독립 재유도 X-1):
-          종전엔 토큰을 두 번 읽고 지웠는데, 마지막 확인 뒤 새 소유자가 들어오면 그 잠금을
-          지우고 자기가 쥐었다 — 두 writer 가 동시에 임계구간에 들고, 최초 장부 생성 창에서는
-          뒤늦은 `os.replace` 가 먼저 커밋된 행을 **흔적 없이** 덮는다. 재확인을 늘리는 것은
-          창을 좁힐 뿐 닫지 못한다.
-        ★그래서 회수 권한을 **rename 으로 청구**한다: owner 파일을 `owner.stale-<내토큰>` 으로
-          옮기는 데 성공한 프로세스만 회수자이고, **옮긴 그 파일**에서 소유자를 확인한다
-          (읽는 바이트와 지우는 바이트가 같다). 내가 본 고아가 아니면 **되돌린다**.
-        ★마지막 `rmdir` 는 디렉터리가 **비었을 때만** 성공한다 — 그 사이 새 소유자가 들어와
-          owner 를 썼다면 실패하고, 우리는 아무것도 지우지 않는다.
-        ★남는 창(정직한 표기): 새 소유자가 `mkdir` 에 성공하고 owner 를 **쓰기 전**의 순간에
-          우리 `rmdir` 가 들어가면 여전히 겹칠 수 있다. mkdir 원자성만 쓰는 이 완충으로는 그
-          창을 닫을 수 없다 — 정합의 근거는 여전히 결속 sha·행 서수·손상 감지 셋이다.
+        ★읽는 바이트와 지우는 바이트를 같게 만드는 것이 이 함수의 존재 이유다: 경로 기반
+          `확인 → unlink` 는 확인 **뒤** 바뀐 소유자의 owner 를 지운다(codex "반납 TOCTOU").
+          내 것이 아니면 **되돌린다**.
         """
-        claim, src = self._claim_name(), self._owner_file()
-        if not os.path.exists(src):
-            src = self._abandoned_claim()      # 중단된 회수의 잔재 — 교착을 풀기 위한 유일한 길
-            if not src:
-                return self._reclaim_empty()   # owner 도 잔재도 없는 **빈** 잠금(영구 교착)
-            seen = None                        # 잔재의 내용은 이미 죽은 소유자의 토큰이다
+        claim = self._claim_name()
         try:
-            os.rename(src, claim)              # ★원자적 청구 — 성공한 하나만 회수자
+            os.rename(src, claim)
         except OSError:
             return False                       # 남이 먼저 청구했거나 소유자가 바뀌었다
-        if seen is not None:
+        if expect is not None:
             try:
                 with open(claim, "rb") as f:
                     got = f.read(200)
             except OSError:
                 got = None
-            if got != seen:                    # 내가 본 그 고아가 아니다 — 원상복구
+            if got != expect:
                 try:
-                    os.rename(claim, self._owner_file())
+                    os.rename(claim, src)
                 except OSError:
                     pass
                 return False
@@ -3289,9 +3437,36 @@ class _best_effort_lock(object):
             return False                       # 디렉터리가 통째로 바뀌었다 — 손대지 않는다
         except OSError:
             try:
-                os.rename(claim, self._owner_file())
+                os.rename(claim, src)
             except OSError:
                 pass
+            return False
+        return True
+
+    def _reclaim_orphan(self, seen):
+        """고아 잠금 회수 — **원자적 청구(rename)에 성공한 하나만** 회수자다. 반환 회수 여부.
+
+        ★확인과 삭제가 원자적이지 않으면 확인 **뒤** 소유자가 바뀔 수 있다(독립 재유도 X-1):
+          종전엔 토큰을 두 번 읽고 지웠는데, 마지막 확인 뒤 새 소유자가 들어오면 그 잠금을
+          지우고 자기가 쥐었다 — 두 writer 가 동시에 임계구간에 들고, 최초 장부 생성 창에서는
+          뒤늦은 `os.replace` 가 먼저 커밋된 행을 **흔적 없이** 덮는다. 재확인을 늘리는 것은
+          창을 좁힐 뿐 닫지 못한다.
+        ★그래서 회수 권한을 **rename 으로 청구**한다(`_claim_and_unlink`): owner 파일을 옮기는 데
+          성공한 프로세스만 회수자이고, **옮긴 그 파일**에서 소유자를 확인한다(읽는 바이트와
+          지우는 바이트가 같다). 내가 본 고아가 아니면 되돌린다.
+        ★마지막 `rmdir` 는 디렉터리가 **비었을 때만** 성공한다 — 그 사이 새 소유자가 들어와
+          owner 를 썼다면 실패하고, 우리는 아무것도 지우지 않는다.
+        ★남는 창(정직한 표기): 새 소유자가 `mkdir` 에 성공하고 owner 를 **게시하기 전**의 순간에
+          우리 `rmdir` 가 들어가면 여전히 겹칠 수 있다. 그 창은 이 완충으로 닫히지 않고, 피해자
+          쪽의 배타 게시 실패(`_publish_owner` → `lost`)가 진입을 막는 것으로 막는다.
+        """
+        src = self._owner_file()
+        if not os.path.exists(src):
+            src = self._abandoned_claim()      # 중단된 회수의 잔재 — 교착을 푸는 유일한 길
+            if not src:
+                return self._reclaim_empty()   # owner 도 잔재도 없는 **빈** 잠금(영구 교착)
+            seen = None                        # 잔재의 내용은 이미 죽은 소유자의 토큰이다
+        if not self._claim_and_unlink(src, seen):
             return False
         try:
             os.rmdir(self.path)                # 비어 있을 때만 성공한다
@@ -3304,21 +3479,25 @@ class _best_effort_lock(object):
         #   늘어난다("5초 상한" 이 깨진다). 대기·나이 판정 모두 monotonic 을 쓴다.
         deadline = time.monotonic() + self.wait
         while True:
+            made = False
             try:
                 os.mkdir(self.path)
-                self.held = True
-                try:                            # 소유자 토큰 — 남의 잠금을 지우지 않기 위한 표식
-                    with open(self._owner_file(), "wb") as f:
-                        f.write(self.token)
-                    self.wrote_owner = self._owner() == self.token     # 되읽어 확인한다
-                except OSError:
-                    pass
-                return self
+                made = True
             except FileExistsError:
                 pass
             except OSError as e:
                 self.unsupported = "%s" % e
                 return self                    # 잠글 수 없는 파일계 — 완충 없이 진행
+            if made:
+                # 세대는 **삭제 거부**에만 쓴다(보조) · 소유권은 배타 게시가 증명한다.
+                self.gen = self._stat_gen()
+                self.owner_state = self._publish_owner()
+                self.wrote_owner = self.owner_state == "published"
+                if self.owner_state != "lost":
+                    self.held = True
+                    return self
+                # 게시 경쟁에서 졌다 — 이 자리는 남의 잠금이다. 아무것도 지우지 않고 다시 기다린다.
+                self.gen = None
             if time.monotonic() >= deadline:
                 self.blocked = True            # 다른 writer 가 쥐고 있다(대기 상한)
                 return self                    # 멈추지 않는다 — 판단은 호출자 몫
@@ -3341,26 +3520,40 @@ class _best_effort_lock(object):
 
     def __exit__(self, *exc):
         if self.held:
-            # ★**내 잠금일 때만** 지운다(codex R2 major-6): 느린 소유자가 고아로 오인돼 회수된
-            #   뒤 그대로 rmdir 하면 **다음 소유자의 잠금**을 지워 둘이 동시에 임계구간에 든다.
-            # 토큰이 **비어 있으면**(owner 파일 쓰기 실패) 우리가 만든 것이므로 반납한다 —
-            # 아니면 아무도 못 푸는 잠금이 300초 남아 모든 기록을 막는다(부트체인 ④ 방향).
-            # ★단 내 토큰이 **되읽기로 확인**된 경우에는 빈 owner 를 내 것으로 보지 않는다
-            #   (codex 잔여 지적): 새 소유자가 mkdir 하고 owner 를 쓰기 **전**의 빈 상태를
-            #   옛 소유자가 자기 것으로 오인하면 남의 잠금을 지운다.
-            own = self._owner()
-            if own == self.token or (own == b"" and not self.wrote_owner):
-                try:
-                    os.unlink(self._owner_file())
-                except OSError:
-                    pass
-                try:
-                    os.rmdir(self.path)
-                except OSError:
-                    pass
+            self._release()
             self.held = False
         return False
 
+    def _release(self):
+        """반납 — **내 잠금일 때만** 지운다(codex R2 major-6).
+
+        느린 소유자가 고아로 오인돼 회수된 뒤 그대로 rmdir 하면 **다음 소유자의 잠금**을 지워
+        둘이 동시에 임계구간에 든다. 그래서 ①세대가 유효하게 다르면 손대지 않고 ②owner 삭제는
+        경로 unlink 가 아니라 **원자 청구 후 바이트 확인**으로 한다(확인과 삭제 사이에 소유자가
+        바뀌는 창을 닫는다 — codex "반납 TOCTOU").
+        토큰이 **비어 있으면**(owner 게시 실패) 우리가 만든 것이므로 반납한다 — 아니면 아무도
+        못 푸는 잠금이 상한만큼 남아 모든 기록을 막는다(부트체인 ④ 방향). 단 내 토큰이
+        **게시 확인**된 경우에는 빈 owner 를 내 것으로 보지 않는다(codex 잔여 지적): 새 소유자가
+        mkdir 하고 owner 를 쓰기 **전**의 빈 상태를 옛 소유자가 자기 것으로 오인하면 남의 잠금을
+        지운다.
+        """
+        if not self._gen_ok():
+            return                             # 세대가 다르다 — 이 디렉터리는 내 잠금이 아니다
+        own = self._owner()
+        if own == self.token:
+            if not self._claim_and_unlink(self._owner_file(), self.token):
+                return
+        elif own == b"" and self.owner_state != "published":
+            try:
+                os.unlink(self._owner_file())
+            except OSError:
+                pass
+        else:
+            return                             # 남의 토큰 — 손대지 않는다
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            pass
 
 def _fsync(f):
     """flush + fsync — 반환 True=내구 확인. 플랫폼·파일계가 거부해도 명령을 세우지 않는다.
@@ -3375,6 +3568,28 @@ def _fsync(f):
         return True
     except (OSError, ValueError, AttributeError):
         return False
+
+
+def lock_blocked_reason(lk, harm):
+    """잠금이 막혔을 때의 **안내 문면** — 회수 가능한 형상과 아닌 형상을 가른다.
+
+    ★왜(성찰 R4 N17): 종전 문면은 어떤 형상에서든 "고아 잠금은 300초 뒤 자동 회수" 라고 말했다.
+      그런데 `<장부>.lock` 자리에 **일반 파일**이 있거나(`: > …lock`) 잠금 디렉터리에 **미지
+      내용물**이 있으면 두 회수 경로가 모두 손대지 않는다(보류 방향 — 그 판단 자체는 옳다).
+      그 형상에서 안내는 **거짓말**이 되고, 조작자는 기다리는 동안 그 task 의 모든 라운드 기록이
+      막힌다(사람이 `rm` 할 때까지 · 자율 루프 정지 방향). 문면을 갈라 기다림과 개입을 구분한다.
+    `harm` 은 '직렬화 없이 쓰면 무엇이 깨지는가' 한 문장(호출자마다 다르다)."""
+    kind = lk.obstruction()
+    if kind == "file":
+        return ("잠금 자리가 잠금이 아니다 — `%s` 에 **일반 파일**이 있다. 회수 경로는 잠금 "
+                "디렉터리만 다루므로 이 형상은 기다려도 자동 회수되지 않는다. 내용을 확인한 뒤 "
+                "그 파일을 직접 제거하라." % lk.path)
+    if kind == "contents":
+        return ("잠금 자리에 **모르는 내용물**이 있다 — `%s` 안에 소유자 표식이 아닌 파일이 있어 "
+                "회수가 손대지 않는다(기다려도 자동 회수되지 않는다). 내용을 확인한 뒤 그 "
+                "디렉터리를 직접 제거하라." % lk.path)
+    return ("다른 writer 가 장부 잠금을 쥐고 있다(%s) — %s 잠시 뒤 다시 하라(고아 잠금은 %d초 뒤 "
+            "자동 회수)." % (lk.path, harm, int(WP6_LOCK_STALE)))
 
 
 def round_events_path(task):
@@ -4053,8 +4268,8 @@ def cmd_round_relocate(args):
         return 2
     with _best_effort_lock(round_path(args.task)) as lk:
         if lk.blocked:
-            print("[round-relocate] 거부: 다른 writer 가 장부 잠금을 쥐고 있다(%s) — 직렬화 없이 "
-                  "옮기면 최신 재평가를 덮는다. 잠시 뒤 다시 하라." % lk.path, file=sys.stderr)
+            print("[round-relocate] 거부: %s" % lock_blocked_reason(
+                lk, "직렬화 없이 옮기면 최신 재평가를 덮는다."), file=sys.stderr)
             return 2
         # ★커밋 경계 **안에서** 손상·세대를 다시 본다(codex R2 blocking-4).
         now, nd = read_round_events(args.task, with_damage=True)

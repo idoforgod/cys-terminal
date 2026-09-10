@@ -251,7 +251,10 @@ _real_open = os.open
 
 
 def _hooked_open(p, flags, *a, **k):
-    if str(p).endswith(".expired"):
+    # ★성찰 R4 N2 이후 만료 표식은 **세대별**이다(`<래치>.expired.<gen>` · 구 판은 `<래치>.expired`).
+    #   `endswith(".expired")` 로만 가로채면 새 형상에서 훅이 걸리지 않아 표식이 정상 생성되고,
+    #   이 검체가 재려던 '표식을 못 세운 상태' 자체가 만들어지지 않는다(핀이 조용히 무력해진다).
+    if ".expired" in os.path.basename(str(p)):
         raise OSError(28, "No space left on device")
     return _real_open(p, flags, *a, **k)
 
