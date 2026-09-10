@@ -340,7 +340,12 @@ def _role():
          이 파일의 지역 `_surface_id()` 는 JAVIS_ 키를 모르고 구두점을 지워
          `surface:unknown`·`surface:surface12` 같은 틀린 라벨을 냈다.
     """
-    _fallback = "surface:%s" % (_surface_id() or "unknown")
+    # ★0.14.31 성찰 G15(minor): 주소 라벨은 **두 갈래 모두** 해소기의 정규 신원으로 만든다.
+    #   종전은 권위 갈래만 `javis_role.surface_id()` 를 썼고 폴백 갈래는 지역 `_surface_id()` 라
+    #   `CYS_SURFACE_ID="surface:12"` 가 `surface:12` / `surface:surface12`, `"007"` 이 `surface:7` /
+    #   `surface:007` 로 갈렸다 — **데몬이 답했는지에 따라 같은 좌석이 두 행위자**로 원장에 남았다
+    #   (원장·라운드 판독이 이 라벨로 행위자를 센다). 지역 파서는 그 실패 시의 마지막 폴백이다.
+    _fallback = _canonical_surface_label()
     try:
         import javis_role as _rm
         role, src = _rm.resolve_role_detail()
@@ -349,10 +354,23 @@ def _role():
                 return role
             # 데몬이 '역할 없음'을 확정했다 — 그 자리에 stale env 를 되살리면 이 함수가 고치려는
             # 바로 그 오귀속이 남는다. 주소로 귀속한다(라벨은 비지 않는다).
-            return "surface:%s" % (_rm.surface_id() or _surface_id() or "unknown")
+            return _fallback
     except Exception:
         pass
     return os.environ.get("CYS_ROLE") or _fallback
+
+
+def _canonical_surface_label():
+    """`surface:<정규 신원>` — 해소기(`javis_role.surface_id()` · JAVIS_/AITERM_ 키·`surface:` 접두·
+    선두 0 을 Rust 규칙대로 해석)를 먼저 쓰고, 그 모듈이 없거나 신원을 못 내면 지역 `_surface_id()`,
+    그것도 비면 `unknown`(라벨은 비지 않는다 — 진단 식별자가 사라지면 누구 것인지 말할 수 없다)."""
+    sid = ""
+    try:
+        import javis_role as _rm
+        sid = _rm.surface_id() or ""
+    except Exception:
+        sid = ""
+    return "surface:%s" % (sid or _surface_id() or "unknown")
 
 
 def _esc_n():

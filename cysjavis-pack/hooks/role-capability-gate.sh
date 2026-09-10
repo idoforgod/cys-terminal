@@ -86,20 +86,35 @@
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)" >&2; exit 0; }
 
-# ── 역할 해소(데몬 권위 우선 · 60s 캐시) ────────────────────────────────────────
-# 캐시 파일 1줄 형식: `<epoch초> <역할>`. 키에 boot-epoch 를 넣어 데몬 재시작에 자동 무효화된다
-# (감독자가 꺼졌거나 Windows 파이프면 그 성분이 빠지고 TTL 60s 만 남는다 — 정직한 강등).
-capgate_slug() { printf '%s' "${1:-}" | tr -c 'A-Za-z0-9._-' '_' 2>/dev/null || printf 'x'; }
+# ── 역할 해소(데몬 권위 우선 · TTL 15s 캐시) ─────────────────────────────────────
+# ★캐시 **신원·레코드 문법·디렉터리**는 `_lib.sh` 공용층과 같은 것을 쓴다(0.14.31 성찰 G1·G7·G14).
+#   종전 자체 구현은 세 곳에서 공용층과 갈렸고, 그 셋이 각각 실패였다:
+#     ⓐ `capgate_slug` 는 손실 치환이라 `/tmp/a/b.sock` 과 `/tmp/a_b.sock` 이 같은 이름을 냈는데
+#        레코드가 `<ts> <역할>` 2필드라 **종단점 신원이 실려 있지 않았다** — 같은 uid·같은
+#        TMPDIR·같은 surface 번호의 두 데몬 좌석이 한 캐시 파일을 공유해, 앞 좌석의 `worker`
+#        레코드가 뒤 좌석(reviewer)의 fast-path 가 됐다(리뷰어가 데몬에 묻지도 않고 자기 산출물을
+#        고친다 = producer≠evaluator 의 기계 집행이 통째로 사라진다 · 로그에도 흔적이 없다).
+#     ⓑ 캐시가 TMPDIR **루트**라 이름이 완전히 예측 가능했다(공용층이 0700 전용 디렉터리로 옮긴
+#        이유가 게이트에서만 되돌아와 있었다).
+#     ⓒ 세대 성분을 `dirname "$CYS_SOCKET"/boot-epoch` 에서 **무계·무검증**으로 읽었다 — 유닉스
+#        `dirname '\\.\pipe\cys'` 는 `.` 이라 Windows 명명 파이프에서 **cwd** 의 `boot-epoch` 를
+#        열었고(cwd 마다 캐시가 갈린다), 저장소에 그 이름의 큰 파일이 있으면 캐시 이름이
+#        ENAMETOOLONG 이 되며, FIFO 가 있으면 **모든 도구 호출 앞에서** 열기에 매달렸다.
+#   공용화하는 것은 신원·문법·디렉터리·유계 판독뿐이다 — **TTL 15s·게이트대상 재조회 정책은
+#   capgate 가 계속 소유한다**(공용층은 60s 이고 소비 규칙도 다르다 · 두 해소기 공존은 의도다).
+#
+# 캐시 레코드 1줄 = `"<ts> <역할|-> <세대> <소켓신원>"`(공용 `cys_role_record` 문법과 동일).
+# 소켓 신원은 **원문 그대로** 실려 정확 비교된다 — 슬러그가 충돌해도 남의 레코드를 읽지 않는다.
+CAPGATE_CACHE_TTL=15         # 초 · 승계 반영 지연의 상한(명시적 수용 · 노브 없음 §3-4)
+CAPGATE_QUERY_BACKOFF=5      # 초 · 조회 실패 후 재조회 유예(폭주 차단 · 노브 없음)
 
-CAPGATE_CACHE_TTL="${CAPGATE_CACHE_TTL:-15}"   # 초 · 승계 반영 지연의 상한(명시적 수용)
-CAPGATE_QUERY_BACKOFF="${CAPGATE_QUERY_BACKOFF:-5}"   # 초 · 조회 실패 후 재조회 유예(폭주 차단)
+# 캐시 파일 basename 접두 — 파이썬 판정기의 `GATE_STATE_FILE_PREFIX` 와 **같은 문자열**이어야
+# 게이트 자기상태 보호(`_is_gate_state_path`)가 이 파일을 덮는다(공용 디렉터리 규칙과 이중).
+CAPGATE_CACHE_PREFIX="cys-capgate-role-"
 
-capgate_cache_write() {   # `<epoch> <역할|->` 1줄 · 0600 · 같은 디렉터리 원자 교체
-  [ -n "${CYS_SURFACE_ID:-}" ] || return 0
-  _cg_tmp="$CAPGATE_CACHE.$$"
-  ( umask 077; printf '%s %s\n' "$1" "$2" > "$_cg_tmp" ) 2>/dev/null || {
-    rm -f "$_cg_tmp" 2>/dev/null; return 0; }
-  mv -f "$_cg_tmp" "$CAPGATE_CACHE" 2>/dev/null || rm -f "$_cg_tmp" 2>/dev/null
+capgate_record_write() {   # $1=경로 $2=ts $3=역할|- · 공용 원자 교체(대상이 디렉터리면 안 쓴다)
+  [ -n "${1:-}" ] || return 0
+  cys_role_cache_write "$1" "$2 $3 ${CAPGATE_EPOCH:--} ${CAPGATE_SOCKID:-}"
   return 0
 }
 
@@ -114,40 +129,59 @@ capgate_resolve_role() {
   CAPGATE_ROLE_SOURCE="none"
   CYS_SURFACE_ROLE_RESOLVED=""
   CAPGATE_ROLE_ALT=""
+  CAPGATE_CACHE=""
+  CAPGATE_SOCKID=""
+  CAPGATE_EPOCH="-"
   _cg_now="$(date +%s 2>/dev/null || printf '0')"
-  case "$_cg_now" in ''|*[!0-9]*) _cg_now=0 ;; esac
-  _cg_epoch=""
-  if [ -n "${CYS_SOCKET:-}" ]; then
-    _cg_epoch_file="$(dirname "$CYS_SOCKET" 2>/dev/null)/boot-epoch"
-    [ -f "$_cg_epoch_file" ] && _cg_epoch="$(head -n1 "$_cg_epoch_file" 2>/dev/null)"
+  case "$_cg_now" in ''|0*|*[!0-9]*) _cg_now=0 ;; esac
+  [ "${#_cg_now}" -le 12 ] || _cg_now=0
+
+  # ── 캐시 신원(공용층과 같은 규칙) ──
+  #   하나라도 표현 불가면 **디스크 캐시를 끈다**(매번 데몬 조회 · 남의 레코드를 읽는 것보다 낫다).
+  #   `id -u` 는 여기서 한 번 — 서브셸 안에서 세우면 나오지 못해 해소마다 포크가 하나 더 든다.
+  cys_role_sock_id_init
+  CAPGATE_SOCKID="$CYS_ROLE_SOCK_ID"
+  CAPGATE_EPOCH="$(cys_role_epoch)"
+  [ -n "${CYS_ROLE_UID:-}" ] || CYS_ROLE_UID="$(id -u 2>/dev/null || printf '')"
+  _cg_sid="$(cys_role_surface_id)" || _cg_sid=""
+  if [ -n "$CAPGATE_SOCKID" ] && [ -n "$_cg_sid" ]; then
+    _cg_dir="$(cys_role_cache_dir)" || _cg_dir=""
+    if [ -n "$_cg_dir" ]; then
+      CAPGATE_CACHE="$_cg_dir/$CAPGATE_CACHE_PREFIX$(cys_role_slug "$_cg_sid")-$(cys_role_slug "$CAPGATE_SOCKID")"
+    fi
   fi
-  CAPGATE_CACHE="${TMPDIR:-/tmp}/cys-capgate-role-$(capgate_slug "${CYS_SURFACE_ID:-none}")-$(capgate_slug "${CYS_SOCKET:-none}")-$(capgate_slug "$_cg_epoch")"
 
   # env 힌트(폴백 전용 신원 · plan §8). 여기서의 쓰임은 두 가지뿐이다:
   #   ① 게이트 대상이면 캐시 fast-path 를 끈다(캐시 오염으로 게이트가 열리지 않게)
   #   ② 데몬 조회가 실패했을 때의 후보
+  # ★폴백 후보는 `CYS_ROLE` **하나뿐**이다(0.14.31 성찰 G6 · `javis_role.py:636`·`_lib.sh:678`
+  #   과 글자 그대로 같게). `CYS_SURFACE_ROLE` 은 이 훅이 해소 결과로 export 하는 **산출물**이지
+  #   신원 입력이 아니다 — 폴백 1순위로 두면 `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 한 줄로
+  #   `CronCreate`/`Task`/`WebSearch`(§1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은 절대
+  #   deny 집합)가 열린다. 자매 두 층은 그 경로를 **검체로 금지**했는데 게이트만 열려 있었다.
   _cg_env=""
-  [ -n "${CYS_SURFACE_ROLE:-}" ] && _cg_env="$CYS_SURFACE_ROLE"
-  [ -z "$_cg_env" ] && [ -n "${CYS_ROLE:-}" ] && _cg_env="$CYS_ROLE"
+  [ -n "${CYS_ROLE:-}" ] && _cg_env="$CYS_ROLE"
+  # ★fast-path 차단(①)은 **막는 축**이라 넓게 본다: 어느 힌트든 게이트 대상이라고 말하면
+  #   캐시를 권위로 쓰지 않고 데몬에 묻는다(오탐의 귀결이 '조회 1회'다).
   _cg_env_gated=0
-  capgate_gated_role "$_cg_env" && _cg_env_gated=1
+  if capgate_gated_role "$_cg_env" || capgate_gated_role "${CYS_SURFACE_ROLE:-}"; then
+    _cg_env_gated=1
+  fi
 
-  # 캐시 판독 — 정규 파일 · 비심링크 · 소유자 자신일 때만. 못 재면 **신뢰하지 않고 조회**한다
-  # (검사 실패를 '비대상 역할'로 읽지 않는다 · codex R1).
+  # 캐시 판독 — 공용 `cys_role_record`(정규 파일·비심링크·4KB 유계 판독·토큰 문법 검사 ·
+  # **세대와 소켓 신원 원문 정확 비교**). 못 재면 신뢰하지 않고 조회한다(codex R1).
   _cg_cached=""; _cg_fresh=0; _cg_cached_none=0
-  if [ -f "$CAPGATE_CACHE" ] && [ ! -L "$CAPGATE_CACHE" ] && [ -O "$CAPGATE_CACHE" ]; then
-    _cg_line="$(head -n1 "$CAPGATE_CACHE" 2>/dev/null)"
-    _cg_ts="${_cg_line%% *}"
-    _cg_cached="${_cg_line#* }"
-    [ "$_cg_ts" = "$_cg_line" ] && _cg_cached=""      # 구형·손상 형식은 무시
-    case "$_cg_ts" in ''|*[!0-9]*) _cg_ts=0 ;; esac
-    # 미래 시각(시계 역행)은 신선이 아니다 — 그러면 캐시가 무기한 유효해진다.
-    if [ "$_cg_now" -gt 0 ] && [ "$_cg_ts" -gt 0 ] && [ "$_cg_ts" -le "$_cg_now" ] \
-       && [ $(( _cg_now - _cg_ts )) -lt "$CAPGATE_CACHE_TTL" ]; then
-      _cg_fresh=1
-    fi
-    if [ "$_cg_cached" = "-" ]; then                  # 권위 있는 '역할 없음'
-      _cg_cached=""; _cg_cached_none=1
+  CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""
+  if [ -n "$CAPGATE_CACHE" ] && [ "$_cg_now" -gt 0 ] \
+     && cys_role_record "$CAPGATE_CACHE" "$CAPGATE_SOCKID" "$CAPGATE_EPOCH" \
+     && [ "$CYS_ROLE_REC_TS" -le "$_cg_now" ] \
+     && [ $(( _cg_now - CYS_ROLE_REC_TS )) -lt "$CAPGATE_CACHE_TTL" ]; then
+    # 미래 시각(시계 역행)은 위 `-le` 가 이미 거른다 — 그러지 않으면 캐시가 무기한 유효해진다.
+    _cg_fresh=1
+    if [ "$CYS_ROLE_REC_VAL" = "-" ]; then     # 권위 있는 '역할 없음'
+      _cg_cached_none=1
+    else
+      _cg_cached="$CYS_ROLE_REC_VAL"
     fi
   fi
 
@@ -170,34 +204,54 @@ capgate_resolve_role() {
   #   ★조회 실패 백오프(R1): 데몬이 죽거나 응답이 없으면 **모든 좌석이 도구 호출마다** 2s 를
   #     내는 폭풍이 된다(리뷰어 실측 우려 · 봉인표 ④ 방향). 실패를 짧게 기억해 그 창 동안은
   #     곧장 폴백으로 간다 — 폴백의 답은 어차피 그 조회가 줄 답과 같다(정지만 없앤다).
-  _cg_failmark="$CAPGATE_CACHE.fail"
+  #   ★백오프 표식도 **같은 신원 규칙**을 쓴다 — 신원 없는 표식이면 남의 종단점 실패가
+  #     이 좌석의 조회를 지운다(그 자리가 곧 캐시 충돌과 같은 구멍이다).
+  _cg_failmark=""
+  [ -n "$CAPGATE_CACHE" ] && _cg_failmark="$CAPGATE_CACHE.fail"
   _cg_skip_query=0
-  if [ -f "$_cg_failmark" ]; then
-    _cg_fts="$(head -n1 "$_cg_failmark" 2>/dev/null)"
-    case "$_cg_fts" in ''|*[!0-9]*) _cg_fts=0 ;; esac
-    if [ "$_cg_now" -gt 0 ] && [ "$_cg_fts" -gt 0 ] && [ "$_cg_fts" -le "$_cg_now" ] \
-       && [ $(( _cg_now - _cg_fts )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
-      _cg_skip_query=1
-    fi
+  CYS_ROLE_REC_TS=""; CYS_ROLE_REC_VAL=""
+  if [ -n "$_cg_failmark" ] && [ "$_cg_now" -gt 0 ] \
+     && cys_role_record "$_cg_failmark" "$CAPGATE_SOCKID" "$CAPGATE_EPOCH" \
+     && [ "$CYS_ROLE_REC_TS" -le "$_cg_now" ] \
+     && [ $(( _cg_now - CYS_ROLE_REC_TS )) -lt "$CAPGATE_QUERY_BACKOFF" ]; then
+    _cg_skip_query=1
   fi
+  # ★신원 전제(공용 `cys_resolve_role` 과 같은 규칙): 숫자 surface id 가 없으면 데몬에게 '나'를
+  #   물을 수 없다. 그때 Rust 는 rc 0 + 빈 줄을 낼 수 있는데 그것을 '권위 있는 무역할'로 채택하면
+  #   **주소가 없다는 사실이 역할이 없다는 판정으로 승격**된다(정상 위임 경로가 죽는다).
+  [ -n "$_cg_sid" ] || _cg_skip_query=1
   if [ "$_cg_skip_query" = "0" ] && command -v cys >/dev/null 2>&1; then
-    _cg_out="$(cys_timeout_run 2 cys surface-role 2>/dev/null)"; _cg_rc=$?
-    _cg_role="$(printf '%s' "$_cg_out" | head -n1 | tr -d '\r')"
+    # ★`CYS_NO_AUTOSTART=1`(0.14.31 성찰 G5): 소켓이 없으면 `cys` 는 autostart 경로를 타고
+    #   `connect()` 가 형제 `cysd` 를 detached 로 **스폰한 뒤** 폴링한다 — 밖의
+    #   `cys_timeout_run 2` 가 2s 에 죽여도 스폰은 이미 일어났다. 이 훅은 matcher 없이 전 도구에
+    #   붙고 게이트 대상 좌석은 캐시 fast-path 를 쓰지 않으므로, 데몬이 내려간 상태에서
+    #   **좌석당 5초에 한 번 cysd 기동 시도**가 된다(운영자가 의도적으로 내린 데몬이 도구 호출
+    #   하나로 되살아난다 · 봉인표 ① 방향). 역할을 묻는 행위가 데몬을 낳아서는 안 된다.
+    #   (봉인된 형제 `_lib.sh:768` 과 **글자 그대로 같은 형태** — 함수 앞 `VAR=1 func` 은 셸마다
+    #   '호출 후에도 남는가/자식에게 export 되는가'가 갈려서 서브셸 안 명시 export 로 닫는다.)
+    _cg_out="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+                cys_timeout_run 2 cys surface-role 2>/dev/null )"; _cg_rc=$?
+    _cg_role="$(cys_role_line "$_cg_out")"
+    # 표현 불가한 역할(공백 포함·64자 초과·문법 밖)은 **판정 불가**다 — 잘라 쓰면 없는 역할을
+    # 지어내는 것이고 레코드 문법도 깨진다(공용층 `cys_resolve_role` 과 같은 규칙).
+    if [ "$_cg_rc" -eq 0 ] && [ -n "$_cg_role" ] && ! cys_role_token_ok "$_cg_role"; then
+      _cg_rc=1
+    fi
     if [ "$_cg_rc" -eq 0 ] && [ -n "$_cg_role" ]; then
       CYS_SURFACE_ROLE_RESOLVED="$_cg_role"; CAPGATE_ROLE_SOURCE="daemon"
-      capgate_cache_write "$_cg_now" "$_cg_role"
-      rm -f "$_cg_failmark" 2>/dev/null || :
+      capgate_record_write "$CAPGATE_CACHE" "$_cg_now" "$_cg_role"
+      [ -n "$_cg_failmark" ] && { rm -f "$_cg_failmark" 2>/dev/null || :; }
       return 0
     fi
     # ★권위 있는 **역할 없음**(rc 0 · 빈 줄)도 사실이다 — `-` 로 캐시한다(옛 대상 캐시는 덮인다).
     if [ "$_cg_rc" -eq 0 ] && [ -z "$_cg_role" ]; then
-      capgate_cache_write "$_cg_now" "-"
-      rm -f "$_cg_failmark" 2>/dev/null || :
+      capgate_record_write "$CAPGATE_CACHE" "$_cg_now" "-"
+      [ -n "$_cg_failmark" ] && { rm -f "$_cg_failmark" 2>/dev/null || :; }
       CAPGATE_ROLE_SOURCE="daemon-none"
       return 0
     fi
     # 조회 실패 — 백오프 표시(같은 창의 다음 호출은 곧장 폴백으로 간다)
-    ( umask 077; printf '%s\n' "$_cg_now" > "$_cg_failmark" ) 2>/dev/null || :
+    capgate_record_write "$_cg_failmark" "$_cg_now" "-"
   fi
   # ③조회 실패 — 후보가 **갈리면 둘 다** 적용한다(정책 교집합 · codex R1).
   #   "게이트 대상을 먼저" 는 틀린 규칙이다: reviewer 와 CSO 의 허용 집합은 포함 관계가 아니라
@@ -214,10 +268,6 @@ capgate_resolve_role() {
   fi
   if [ -n "$_cg_c1" ]; then
     CYS_SURFACE_ROLE_RESOLVED="$_cg_c1"; CAPGATE_ROLE_SOURCE="cache-fallback"
-    return 0
-  fi
-  if [ -n "${CYS_SURFACE_ROLE:-}" ]; then
-    CYS_SURFACE_ROLE_RESOLVED="$CYS_SURFACE_ROLE"; CAPGATE_ROLE_SOURCE="env-surface-role"
     return 0
   fi
   if [ -n "${CYS_ROLE:-}" ]; then
@@ -269,14 +319,12 @@ else
   fi
   # ★역할 해소는 **인터프리터 판정보다 먼저** 한다 — python 부재 분기가 역할을 알아야
   #   reviewer(fail-closed exit 2)와 CSO(fail-open 강등)를 가를 수 있다.
-  if [ -z "${CYS_SURFACE_ROLE:-}" ] || [ -n "${CYS_SURFACE_ID:-}" ]; then
-    capgate_resolve_role
-    if [ -n "$CYS_SURFACE_ROLE_RESOLVED" ]; then
-      CYS_SURFACE_ROLE="$CYS_SURFACE_ROLE_RESOLVED"
-    elif [ "$CAPGATE_ROLE_SOURCE" = "daemon-none" ] || [ "$CAPGATE_ROLE_SOURCE" = "cache-none" ]; then
-      CYS_SURFACE_ROLE=""
-    fi
-  fi
+  # ★`CYS_SURFACE_ROLE` 은 **해소 산출물**이지 입력이 아니다(0.14.31 성찰 G6). 종전에는
+  #   `CYS_SURFACE_ROLE` 이 설정돼 있고 `CYS_SURFACE_ID` 가 없으면 해소기를 아예 부르지 않고
+  #   그 값을 그대로 판정기에 넘겼다 — 상속된 env 한 줄이 신원이 됐다. 항상 해소하고,
+  #   해소가 답을 주지 못하면 **비운다**(무역할 = 통과 · 무역할 pane 은 사람/일반 셸이다).
+  capgate_resolve_role
+  CYS_SURFACE_ROLE="$CYS_SURFACE_ROLE_RESOLVED"
   export CYS_SURFACE_ROLE
   export CAPGATE_ROLE_SOURCE
   export CAPGATE_ROLE_ALT
@@ -325,7 +373,41 @@ WRITE_SHELL_CMDS = {
     "ln", "mkdir", "rmdir", "touch", "sed",  # sed -i 등
 }
 # 패키지/빌드 설치자(상태 변형) — 대표만. git은 서브커맨드로 별도 판정(읽기 전용 다수).
-WRITE_SHELL_INSTALLERS = {"npm", "pip", "pip3", "make", "apt", "brew"}
+#   `uvx` 는 항상 패키지를 내려받아 실행한다(설치 없는 형태가 없다) → 통째로 막는다.
+WRITE_SHELL_INSTALLERS = {"pip", "pip3", "make", "apt", "brew", "uvx"}
+# ★패키지 관리자·러너는 **하위 명령으로** 가른다(0.14.31 성찰 G13 · cargo/go 와 같은 처리).
+#   종전 `WRITE_SHELL_INSTALLERS` 의 `npm` 한 항목은 이 저장소의 실제 JS 툴체인을 빗나갔다
+#   (ui/package.json: `bun test`·`bunx tsc`) — `bun add`·`bunx --yes <pkg>`·`uv pip install`·
+#   `pipx run` 은 전부 ALLOW(lockfile·캐시 변형 = producer≠evaluator 위반)였고, 정당한 검증
+#   `npm run typecheck` 는 DENY 였다. 완화의 뜻은 cargo/go 머리말과 같다 — 여기서 막는 것은
+#   **명령 수준의 설치·변형**뿐이고 `npm run <script>`·`bun test` 의 본문은 신뢰 실행이다
+#   (사후 diff 가 탐지 수단이지 예방 장치가 아니다). 목록 밖·하위 명령 없음은 거부 방향이다
+#   (`yarn` 단독 = install).
+PKG_TOOL_VERIFY_SUBS = {
+    "npm":  {"run", "run-script", "test", "t", "tst", "ls", "list", "ll", "view", "info", "show",
+             "v", "outdated", "explain", "why", "ping", "prefix", "root", "bin"},
+    "bun":  {"test", "run"},                      # `bun x` 는 아래 러너 축
+    "pnpm": {"run", "test", "t", "tst", "ls", "list", "why", "outdated"},
+    "yarn": {"run", "test", "why", "info", "list"},
+    "uv":   {"tree", "pip"},                      # `uv run`/`sync` 는 .venv·lock 동기화 = 쓰기
+    "pipx": {"list"},
+}
+# `uv pip <이것>` 만 조회다(`install`·`sync`·`uninstall`·`compile` 은 밖).
+UV_PIP_RO_SUBS = {"list", "freeze", "show", "check", "tree"}
+# 값을 먹는 **전역** 옵션(하위 명령 앞) — 값을 건너뛰지 않으면 그 값이 하위 명령으로 오인된다.
+PKG_TOOL_VALUE_OPTS = {
+    "npm":  {"--prefix", "-C", "--workspace", "-w", "--registry", "--loglevel", "--cache",
+             "--userconfig"},
+    "pnpm": {"-C", "--dir", "--filter", "-F"},
+    "yarn": {"--cwd"},
+    "bun":  {"--cwd", "--filter"},
+    "uv":   {"--directory", "--project", "--python", "-p"},
+}
+# ★러너(`npx`·`bunx`·`bun x`)는 하위 명령이 아니라 **실행 대상**을 받는다. 러너 자신의 옵션은
+#   실행 대상 **앞**에만 온다 — `npx tsc -p tsconfig.json` 의 `-p` 는 tsc 의 옵션이지 npx 의
+#   `--package` 가 아니다. 그래서 첫 비-옵션 토큰 앞의 설치 옵션만 본다.
+PKG_RUNNERS = {"npx", "bunx"}
+PKG_RUNNER_INSTALL_OPTS = ("--yes", "-y", "--package", "-p")
 # cargo/go 는 하위 명령으로 가른다(0.14.31 완화 — 아래 계약을 정확히 읽어라).
 WRITE_SHELL_BUILDERS = {"cargo", "go"}
 # ★reviewer 검증 실행 완화(0.14.31 · 별 커밋) — **완화의 뜻을 정직하게 적는다**:
@@ -417,6 +499,57 @@ BUILDER_SUB_WRITE_OPTS = {("go", "env"): ("-w", "-u"),
 BUILDER_SUB_REQUIRE_OPTS = {("cargo", "fmt"): ("--check",)}
 # 빌드 산출물을 **임의 경로로 내보내는** 옵션은 리다이렉트와 같은 부류다(대상이 허용 경로여야 한다).
 BUILDER_OUT_OPTS = ("-o", "--out-dir", "--output", "--target-dir")
+
+
+def _runner_installs(args):
+    """러너 인자열에서 **실행 대상 앞**의 설치 옵션(`--yes`·`-y`·`--package`·`-p`)이 있는가."""
+    for a in args:
+        if a == "--":
+            return False
+        if not a.startswith("-"):
+            return False                 # 실행 대상 — 그 뒤는 대상 프로그램의 옵션이다
+        if any(a == o or a.startswith(o + "=") for o in PKG_RUNNER_INSTALL_OPTS):
+            return True
+    return False
+
+
+def pkg_is_write(base, tokens, i):
+    """npm/bun/pnpm/yarn/uv/pipx/npx/bunx 세그먼트가 **명령 수준 설치·변형**인가(0.14.31 성찰 G13).
+    해석 불가·목록 밖 하위 명령·하위 명령 없음은 True(거부 방향)."""
+    value_opts = PKG_TOOL_VALUE_OPTS.get(base, frozenset())
+    n = len(tokens)
+    j = i + 1
+    sub = None
+    rest = []
+    while j < n:
+        t = tokens[j]
+        if is_separator(t) or _is_redirect_op(t):
+            break
+        if sub is None:
+            _gopt = next((o for o in value_opts if t == o or t.startswith(o + "=")), None)
+            if _gopt is not None:
+                j += 1 if "=" in t else 2    # 옵션 **값**은 하위 명령이 아니다
+                continue
+            if t.startswith("-") or t.startswith("+"):
+                j += 1
+                continue
+            sub = t
+        else:
+            rest.append(t)
+        j += 1
+    if base in PKG_RUNNERS:
+        return _runner_installs([tokens[k] for k in range(i + 1, j)])
+    if sub is None:
+        return True                      # `yarn`/`bun` 단독 = install
+    if base == "bun" and sub == "x":
+        return _runner_installs(rest)
+    subs = PKG_TOOL_VERIFY_SUBS.get(base)
+    if subs is None or sub not in subs:
+        return True
+    if base == "uv" and sub == "pip":
+        sub2 = next((r for r in rest if not r.startswith("-")), None)
+        return sub2 not in UV_PIP_RO_SUBS
+    return False
 
 
 def builder_is_write(base, tokens, i):
@@ -727,6 +860,11 @@ CSO_CYS_OPT_DENY = {
     # 효과가 **다른** 옵션(검증 생략·임의 clear 명령·수신자 우회)만 여기 남긴다.
     "cycle-agent": ("--force-no-verify", "--clear-cmd"),
     "send": ("--clear-first", "--surface"),
+    # ★0.14.31 성찰 G12: `cys set-status --surface <남의 좌석>` 은 자기 좌석 보고가 아니라 **다른
+    #   좌석의 상태를 바꾸는** 옵션이다(clap `Command::SetStatus` 가 `--surface` 를 받는다). 데몬이
+    #   peer-pid 로 막고 있어(handlers.rs) 심층 방어이지만, 게이트 자기 규칙("허용 동사라도 효과가
+    #   다른 옵션은 따로 막는다")과 어긋난 채 두지 않는다. 자기 좌석 보고(옵션 없음)는 그대로다.
+    "set-status": ("--surface",),
 }
 # ★효과가 아니라 **주소 방식**이 다른 옵션(R1 blocking): `cys cycle-agent --surface <id>` 는
 #   clap 정의상 `--role` 과 택일 주소일 뿐이다. 이것을 무조건 deny 하면 **역할이 유실된 pane**
@@ -1593,6 +1731,13 @@ def bash_write_reason(command, _depth=0):
                 cmd_pos = False
                 i += 1
                 continue
+            if base in PKG_TOOL_VERIFY_SUBS or base in PKG_RUNNERS:
+                if pkg_is_write(base, tokens, i):
+                    return True, ("패키지 도구 `%s` 세그먼트가 명령 수준 설치·변형이다(설치 하위 "
+                                  "명령·러너 설치 옵션·모르는 하위 명령)" % base)
+                cmd_pos = False
+                i += 1
+                continue
             if base in WRITE_SHELL_CMDS or base in WRITE_SHELL_INSTALLERS:
                 return True, "write-shell 명령 `%s`" % base
             if base == "git":
@@ -2092,7 +2237,24 @@ def _cys_segment_verdict(tokens, ctx, seg_command, n_segs=1):
         if any(t != "master" for t in tos):
             return False, ("`cys send` 의 수신자는 master 뿐이다(경계까지 대조 — "
                            "`--to master-shadow` 는 master 가 아니다): %s" % ", ".join(tos)), False
-        return True, "cys send --to master", True
+        # ★`--queued` 는 허용·예산 면제의 **선행 조건**이다(0.14.31 성찰 G2 · CSO_DIRECTIVE 머리글).
+        #   비큐 `cys send` 는 `surface.send_text` 만 부르고 **CR 을 보내지 않는다**
+        #   (src/bin/cys.rs Command::Send — 타이핑 가드가 걸렸을 때만 큐로 1회 전환된다). 그래서
+        #   ⓐ master 가 미제출 초안을 쥔 상태에서는 보고가 **그 초안에 합체**되고
+        #   ⓑ 조용한 pane 에서는 본문이 미제출 초안으로 남는데, 제출에 필요한
+        #     `cys send-key … Return` 은 CSO 허용 접두 밖이다 — 즉 CSO 는 지침을 정확히 따랐는데
+        #     보고가 도달할 방법이 없다("CSO 는 보고했다고 믿고 오너는 침묵을 본다").
+        #   `--queued` 배달은 출력이 조용해진 뒤 CR 을 **포함해** 주입하므로 두 실패가 함께 닫힌다.
+        #   ★옵션 종료 `--` **앞의 실제 토큰**만 인정한다(`args` 가 이미 그 경계다) — 본문 문자열
+        #     안의 `"--queued"` 는 옵션이 아니고, `--queued=…` 는 clap bool 플래그가 받지 않는다.
+        if "--queued" not in args:
+            return False, ("`cys send` 는 `--queued` 여야 한다(CSO_DIRECTIVE 머리글) — 비큐 send 는 "
+                           "CR 을 보내지 않아 조용한 pane 에서는 보고가 **미제출 초안**으로 남고, "
+                           "master 가 초안을 쥐고 있으면 그 초안에 합체된다. 제출에 필요한 "
+                           "`send-key Return` 은 CSO 접두 밖이므로 비큐 보고는 도달 경로가 없다. "
+                           "`cys send --queued --to master \"<보고>\"` 로 다시 내라(옵션 종료 "
+                           "`--` 앞의 실제 옵션이어야 한다)"), False
+        return True, "cys send --queued --to master", True
     if verb == "cycle-agent":
         return True, "cys cycle-agent(사이클 필수 도구)", True
     if verb in CSO_CYS_VERBS:
@@ -2225,16 +2387,33 @@ def cso_bash_verdict(command, ti, ctx):
         #   `NUL`)은 거부한다 — unix bash 는 그것으로 cwd 에 일반 파일을 만들거나 자른다.
         #   '폐기하려는 의도' 와 '파일을 만드는 사실' 이 갈리는 표기는 판정하지 않는다
         #   (`/dev/null` 로 적으면 된다). nt(Git Bash)에서는 이 목록이 공집합이다.
-        if _is_foreign_null(_txt(target)):
+        # ★리다이렉트 대상은 **변수를 해소한 뒤** 판정한다(0.14.31 성찰 G4 · major):
+        #   종전은 원 토큰을 그대로 `cso_path_allowed` 에 넘겼고, `_norm` 은 `$HOME` 을 전개하지
+        #   않아 `<cwd>/$HOME/…` 로 정규화했다 — 게이트가 본 경로 ≠ bash 가 쓰는 경로.
+        #   ⓐ 거부 방향(항상): `> "$HOME/Desktop/CYSjavis/cso/logs/s.txt"` 가 리터럴 경로와 달리
+        #      deny 됐다(지침 §1-1 문면 `cso_expansion_hazard` 가 **권장하는 철자**가 막혔다).
+        #   ⓑ 허용 방향(cwd 가 허용 뿌리일 때): `> "$HOME/.claude/settings.json"`(훅 등록 파일 =
+        #      게이트 자기 해제) · `> "$HOME/.cys/state/delivery-ledger.jsonl"` · `> "$CYS_PACK_DIR/
+        #      hooks/role-capability-gate.sh"` · `> "$HOME/.ssh/authorized_keys"` 가 전부 ALLOW 였다.
+        #   형제 `_ro_segment_verdict`·`_py_segment_verdict` 와 같은 철자(`_resolve_token`)로
+        #   해소하고, 그 값으로 폐기 장치·허용 경로·상태 파일 판정을 **전부** 다시 한다.
+        #   해소 불가(None)는 `cso_split` 이 이미 거부하지만 여기서도 거부다(심층 방어 · 값을
+        #   모르면 효과를 판정할 수 없다).
+        _rt = _resolve_token(target, ctx)
+        if _rt is None:
+            return True, ("출력 리다이렉트 대상 `%s` 의 변수를 해소할 수 없다 — 허용 표기는 "
+                          "`${CYS_PACK_DIR:-$HOME/.cys/pack}`·`$CYS_PACK_DIR`·`$HOME`·`~` 뿐이다"
+                          % _txt(target)), False
+        if _is_foreign_null(_txt(_rt)):
             return True, ("`%s` 는 이 플랫폼의 폐기 장치가 아니다 — %s 에서는 **평범한 파일**을 "
                           "만들거나 자른다(폐기하려면 `%s` 로 적어라)"
-                          % (_txt(target), os.name, SHELL_NULL_DEVICES[0])), False
-        ok, why = cso_path_allowed(target, ctx)
+                          % (_txt(_rt), os.name, SHELL_NULL_DEVICES[0])), False
+        ok, why = cso_path_allowed(_rt, ctx)
         if not ok:
-            return True, "출력 리다이렉트 대상 %r: %s" % (_txt(target), why), False
-        if is_cso_state_file(target):
+            return True, "출력 리다이렉트 대상 %r: %s" % (_txt(_rt), why), False
+        if is_cso_state_file(_rt):
             return True, ("상태 파일(%s)에 셸 리다이렉트로 쓰면 64KB 상한 검사를 건너뛴다 — "
-                          "Write/Edit 도구를 써라" % _txt(target)), False
+                          "Write/Edit 도구를 써라" % _txt(_rt)), False
     if not segs:
         return False, "실행 세그먼트 없음", False
     essential = True
@@ -2951,7 +3130,6 @@ def self_test():
                              "--save-file '/w/cwd/_round/SESSION_STATE.md' "
                              "--save-file '/w/pack/round/MASTER_TODO.md'"}),
         ("Bash", {"command": "cys cycle-agent --role master --verifier cso"}),
-        ("Bash", {"command": 'cys send --to master "예산 소진 보고"'}),
         ("Bash", {"command": 'cys send --queued --to master "예산 소진 보고"'}),
         ("Bash", {"command": "cys status --json"}),
         ("Bash", {"command": "cys queue list"}),
@@ -3004,7 +3182,7 @@ def self_test_contracts(fails):
     want(False, "Bash", {"command": 'cys send --queued --to master "1줄\n2줄"'},
          "인용 안 개행은 경계가 아니다")
     # 명령 치환·백그라운드·스트림.
-    want(True, "Bash", {"command": 'cys send --to master "결과: $(cys events)"'}, "명령 치환")
+    want(True, "Bash", {"command": 'cys send --queued --to master "결과: $(cys events)"'}, "명령 치환")
     want(True, "Bash", {"command": "cat `cys status`"}, "백틱 치환")
     want(True, "Bash", {"command": "cat <(cys status)"}, "프로세스 치환")
     want(True, "Bash", {"command": "cat < /w/x"}, "입력 리다이렉트")
@@ -3021,16 +3199,42 @@ def self_test_contracts(fails):
          "sqlite3 -readonly 없음")
     want(True, "Bash", {"command": "sed -n '1,80p' /w/x"}, "sed 는 CSO 접두 밖(좁히는 방향)")
     want(True, "Bash", {"command": "rg --pre /w/h pat /w/f"}, "rg --pre 외부 실행")
+    # ★`--queued` 축(0.14.31 성찰 G2) — 허용·예산 면제의 **선행 조건**이다.
+    #   비큐 send 는 CR 을 보내지 않아 ⓐ master 미제출 초안에 합체되고 ⓑ 조용한 pane 에서는
+    #   본문이 초안으로 남는데 제출용 `send-key Return` 은 CSO 접두 밖이다(도달 경로 0).
+    want(True, "Bash", {"command": 'cys send --to master "[CSO] 보고"'}, "큐 옵션 없음")
+    want(True, "Bash", {"command": 'cys send --to master "--queued 라고 적힌 본문"'},
+         "본문 문자열은 옵션이 아니다")
+    want(True, "Bash", {"command": 'cys send --to master -- --queued'},
+         "옵션 종료 `--` 뒤는 본문이다")
+    want(True, "Bash", {"command": 'cys send --to master "x" --queued=true'},
+         "clap bool 플래그가 받지 않는 표기는 큐가 아니다")
+    want(False, "Bash", {"command": 'cys send --queued --to master "[CSO] 보고"'},
+         "실제 큐 옵션")
+    want(False, "Bash", {"command": 'cys send --to master --queued "[CSO] 보고"'},
+         "실제 큐 옵션(수신자 뒤)")
+    want(True, "Bash", {"command": 'cys send --to master "[CSO] 예산 소진 보고"'},
+         "예산 소진 뒤에도 비큐 send 는 면제가 아니다(도달 경로가 없는 채널은 출구가 아니다)",
+         c=ctx(tool_calls=BUDGET_DENY + 5))
+    want(False, "Bash", {"command": 'cys send --queued --to master "[CSO] 예산 소진 보고"'},
+         "예산 소진 뒤 실제 큐 옵션은 면제(봉인표 ②)", c=ctx(tool_calls=BUDGET_DENY + 5))
     # `cys` 인자 계약.
     want(True, "Bash", {"command": "cys cycle-agent --role master --force-no-verify"},
          "--force-no-verify")
     want(True, "Bash", {"command": "cys cycle-agent --role master --clear-cmd 'x'"}, "--clear-cmd")
-    want(True, "Bash", {"command": 'cys send --to master-shadow "x"'}, "수신자 경계")
-    want(True, "Bash", {"command": 'cys send --to master --to worker "x"'}, "수신자 둘")
-    want(False, "Bash", {"command": 'cys send --to=master "x"'}, "--to=master 형태")
-    want(True, "Bash", {"command": 'cys send --to master --clear-first "x"'}, "--clear-first")
+    want(True, "Bash", {"command": 'cys send --queued --to master-shadow "x"'}, "수신자 경계")
+    want(True, "Bash", {"command": 'cys send --queued --to master --to worker "x"'}, "수신자 둘")
+    want(False, "Bash", {"command": 'cys send --queued --to=master "x"'}, "--to=master 형태")
+    want(True, "Bash", {"command": 'cys send --queued --to master --clear-first "x"'}, "--clear-first")
     want(True, "Bash", {"command": 'cys send --surface 7 "x"'}, "--surface 주소 우회")
-    want(False, "Bash", {"command": 'cys send --to master "본문에 --to master-shadow 문자열"'},
+    # ★G12(0.14.31 성찰): set-status 의 `--surface` 는 남의 좌석 상태 변경이다.
+    want(True, "Bash", {"command": "cys set-status --surface 12 busy"}, "G12 set-status --surface")
+    want(True, "Bash", {"command": "cys set-status --surface=12 busy"}, "G12 set-status --surface=")
+    want(False, "Bash", {"command": "cys set-status busy"}, "G12 자기 좌석 보고는 allow")
+    want(False, "Bash", {"command": "cys set-status '보고: --surface 12 를 확인했다'"},
+         "G12 인용 본문의 문자열은 옵션이 아니다")
+    want(False, "Bash",
+         {"command": 'cys send --queued --to master "본문에 --to master-shadow 문자열"'},
          "본문 문자열은 수신자가 아니다")
     want(True, "Bash", {"command": "cys events --category queue"}, "events 전 플래그 deny")
     want(True, "Bash", {"command": "cys events --reconnect"}, "events --reconnect deny")
@@ -3072,6 +3276,19 @@ def self_test_contracts(fails):
     want(True, "Bash", {"command": "cat /w/big > /w/pack/round/CSO_TODO.md"},
          "상태 파일 리다이렉트(상한 우회)")
     want(False, "Bash", {"command": "cys status > /dev/null"}, "/dev/null 싱크")
+    # ★G4(0.14.31 성찰): 리다이렉트 대상의 변수는 **해소한 뒤** 판정한다 — 지침 문면이 권장하는
+    #   철자가 리터럴 경로와 다른 판정을 받으면 CSO 는 "허용 경로에 로그를 남겨라" 를 따를 수 없다.
+    want(False, "Bash",
+         {"command": 'cys read-screen 7 > "$HOME/Desktop/CYSjavis/cso/logs/s.txt"'},
+         "G4 ⓐ `$HOME` 허용 뿌리 리다이렉트는 리터럴 경로와 같은 판정(오탐 금지)")
+    want(False, "Bash", {"command": 'cys status --json > "${HOME}/.cys/state/cso/status.json"'},
+         "G4 ⓐ `${HOME}` 자기 작업 트리도 같다")
+    want(False, "Bash", {"command": "cys status --json > ~/.cys/state/cso/status.json"},
+         "G4 ⓐ 인용 없는 `~/` 도 같다")
+    want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/delivery-base.jsonl"'},
+         "G4 ⓑ 해소된 경로로 데몬 소유 원장을 다시 판정한다(cwd 무관)")
+    want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/SESSION_STATE.md"'},
+         "G4 ⓑ 해소된 경로의 상태 파일 상한 우회도 잡는다")
     want(True, "Write", {"file_path": PACK + "/round/MASTER_TODO.md", "content": "x"},
          "같은 팩의 남의 TODO")
     # 64KB 상한 — UTF-8 바이트 · replace_all · MultiEdit 누적 · 축소 허용.
@@ -3160,7 +3377,7 @@ def self_test_r1(fails):
     want(True, "Bash", {"command": "cys status # x\ncys kill 12"}, "주석 뒤 무승인 kill")
     want(False, "Bash", {"command": "cys status   # 점검"}, "행 끝 주석 자체는 무해")
     # 단어 **안**의 `#` 는 주석이 아니다(bash 규칙) — 잘라내면 수신자 경계 검사가 무력해진다.
-    want(True, "Bash", {"command": 'cys send --to master#shadow "x"'},
+    want(True, "Bash", {"command": 'cys send --queued --to master#shadow "x"'},
          "단어 안 `#` 를 주석으로 잘라 수신자 경계를 지우지 않는다")
 
     # ①-2 주석 제거의 **동작 자체**를 잰다(판정 결과만으로는 이 검사가 지워져도 티가 안 난다)
@@ -3333,7 +3550,7 @@ def self_test_r1(fails):
         # 줄 이어붙이기(`\`+개행)는 셸이 둘 다 지운다 — 조각으로 보면 금지 플래그가 사라진다.
         ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --f\\\nix"},
          "줄 이어붙이기 뒤 --fix"),
-        ("deny", "Bash", {"command": "cys send --to master --clear-\\\nfirst x"},
+        ("deny", "Bash", {"command": "cys send --queued --to master --clear-\\\nfirst x"},
          "줄 이어붙이기 뒤 --clear-first"),
         ("allow", "Bash", {"command": "cys queue cl\\\near 77"},
          "줄 이어붙이기 뒤 queue clear 는 정상 청소"),
@@ -3341,7 +3558,7 @@ def self_test_r1(fails):
         ("deny", "Bash", {"command": "python3 /w/pack/bin/javis_preflight.py --{fix,seed-trust}"},
          "중괄호 확장"),
         # 변수 확장은 값을 모르면 효과를 모른다(`${IFS}` 는 단어를 쪼갠다).
-        ("deny", "Bash", {"command": "cys send --to master ${IFS}--surface${IFS}7 x"},
+        ("deny", "Bash", {"command": "cys send --queued --to master ${IFS}--surface${IFS}7 x"},
          "${IFS} 단어 분리로 만든 --surface"),
         ("deny", "Bash", {"command": "cys status > /w/home/.cys/state/${IFS}mission.json"},
          "${IFS} 로 보호 파일명 검사 우회"),
@@ -3354,9 +3571,9 @@ def self_test_r1(fails):
         ("deny", "Bash", {"command": "cys status > /w/t\u200bmp/a"}, "영폭 문자 tmp 동형"),
         # `--` 뒤는 본문이다(옵션으로 읽으면 오탐과 우회가 함께 생긴다).
         ("deny", "Bash", {"command": "cys send -- '--to=master'"}, "옵션 종료 뒤 본문을 수신자로 오인"),
-        ("allow", "Bash", {"command": "cys send --to master -- '--to=worker'"},
+        ("allow", "Bash", {"command": "cys send --queued --to master -- '--to=worker'"},
          "옵션 종료 뒤 본문은 수신자가 아니다"),
-        ("allow", "Bash", {"command": "cys send --to master -- '--clear-first'"},
+        ("allow", "Bash", {"command": "cys send --queued --to master -- '--clear-first'"},
          "옵션 종료 뒤 본문의 금지 철자"),
         # 리다이렉트 연산자 종류·경로 정규화.
         ("deny", "Bash", {"command": "cys status 2>&1 > /w/repo/a"},
@@ -3390,7 +3607,8 @@ def self_test_r1(fails):
          "승인 대상은 복합 실행 금지"),
         ("deny", "Bash", {"command": "cys send --to 'master ' x"}, "후행 공백 주소"),
         ("deny", "Bash", {"command": "cys send --to 'master\nworker' x"}, "인용 안 개행 주소"),
-        ("allow", "Bash", {"command": "cys send --to master '상태\n# 본문\ncys kill 77'"},
+        ("allow", "Bash",
+         {"command": "cys send --queued --to master '상태\n# 본문\ncys kill 77'"},
          "인용 안 개행·주석은 본문이다(경계가 아니다)"),
         # python 옵션.
         ("deny", "Bash", {"command": "python3 -IBcpass /w/pack/bin/javis_orchestra.py check"},
@@ -3454,7 +3672,7 @@ def self_test_r2(fails):
     want(True, "Bash", {"command": "cys cycle-agent --{s..s}urface 7"}, "중괄호 범위 --surface")
     want(True, "Bash", {"command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/'
                                    'javis_preflight.py" --{f..f}ix'}, "중괄호 범위 --fix")
-    want(False, "Bash", {"command": "cys send --to master 'a{b..c}d 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master 'a{b..c}d 는 본문이다'"},
          "인용 안 중괄호는 확장이 아니다")
 
     # ② 글롭(codex blocking — `deliver[y]-base.jsonl` 이 실존 원장으로 확장됐다)
@@ -3477,7 +3695,8 @@ def self_test_r2(fails):
          "작은따옴표 안 리터럴 `~` 경로")
     want(True, "Bash", {"command": "python3 \\~/.cys/pack/bin/javis_orchestra.py check"},
          "백슬래시 이스케이프된 `~`")
-    want(False, "Bash", {"command": "cys send --to master '설정에서 $HOME 을 확인했다'"},
+    want(False, "Bash",
+         {"command": "cys send --queued --to master '설정에서 $HOME 을 확인했다'"},
          "리터럴 `$` 는 **본문**이다(오탐 금지)")
     want(False, "Bash", {"command": "grep -n '^ctx$' /w/log"}, "정규식 안의 `$`")
 
@@ -3491,7 +3710,7 @@ def self_test_r2(fails):
     # ★큰따옴표 안이라 확장 하자드는 통과하고 **토큰 해소**만이 막는 자리(R1 ${IFS} 의 인용판)
     want(True, "Bash", {"command": 'cys status > "/w/home/.cys/state/${IFS}mission.json"'},
          "인용 안 미지 변수는 값 미상")
-    want(True, "Bash", {"command": 'cys send --to master "${IFS}--surface 7"'},
+    want(True, "Bash", {"command": 'cys send --queued --to master "${IFS}--surface 7"'},
          "인용 안 미지 변수 본문")
 
     # ⑤ `cys` 전역 옵션·대상 소켓(codex blocking — 동사 오인 · 대상 데몬 교체)
@@ -3562,7 +3781,8 @@ def self_test_r2(fails):
     _cr = "python3 \"/w/pack/bin/javis_pre\\" + "\r" + "flight.py\" --self-test"
     want(True, "Bash", {"command": _cr}, "CR 이어붙이기로 설치 팩 도구 위장")
     want(True, "Bash", {"command": "cys status\rcys kill 1"}, "인용 밖 생 CR")
-    want(False, "Bash", {"command": 'cys send --to master "1줄\n2줄"'}, "LF 본문은 그대로 통과")
+    want(False, "Bash", {"command": 'cys send --queued --to master "1줄\n2줄"'},
+         "LF 본문은 그대로 통과")
     for _c, _exp in (("cargo --config target.x.runner=['/tmp/r.sh'] test --offline", True),
                      ("cargo --config build.jobs=2 test", False),
                      ("cargo --config net.offline=true test", False),
@@ -3584,7 +3804,7 @@ def self_test_r2(fails):
         if not _b or "선행 환경 할당" not in _r:
             fails.append("R2[선행 env 할당]: `%s` → %s (%s)"
                          % (_c, "allow" if not _b else "deny", _r[:80]))
-    want(False, "Bash", {"command": "cys send --to master 'a=b 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master 'a=b 는 본문이다'"},
          "인용 안 `=` 는 본문이다")
 
     # ⑪ `_norm` 은 심링크를 따라간다(문서·코드가 갈리던 자리 · 음성 대조의 짝)
@@ -3691,12 +3911,59 @@ def self_test_r2(fails):
     rv(True, "cargo --config build.jobsX=2 test", "아는 키의 접두를 빌린 모르는 키")
     rv(True, "cargo --config=build.rustc-wrapper='/tmp/w' test", "결합 표기 래퍼 주입")
     # T2: 중첩 중괄호(안쪽 쌍이 바깥 쌍을 지우던 갈래)
-    want(True, "Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+    want(True, "Bash", {"command": "cys send --queued --to master --{clear-first,x{y}}"},
          "중첩 중괄호가 감춘 --clear-first")
     want(True, "Bash", {"command": "tail -{f,x{y}} /w/pack/round/SESSION_STATE.md"},
          "중첩 중괄호가 감춘 tail -f")
-    want(False, "Bash", {"command": "cys send --to master '{a,b} 는 본문이다'"},
+    want(False, "Bash", {"command": "cys send --queued --to master '{a,b} 는 본문이다'"},
          "인용 안 중괄호는 여전히 본문이다(오탐 금지)")
+    # ⑯ ★패키지 도구 하위 명령 축(0.14.31 성찰 G13) — 이 저장소의 실제 툴체인으로 잰다.
+    for _c, _exp, _lab in (
+            ("bun add left-pad", True, "bun add = lockfile 변형"),
+            ("bun install", True, "bun install"),
+            ("bun", True, "bun 단독"),
+            ("bunx --yes cowsay hi", True, "bunx --yes = 내려받아 실행"),
+            ("bun x --yes cowsay hi", True, "bun x --yes"),
+            ("npx --yes cowsay hi", True, "npx --yes"),
+            ("npx -y cowsay hi", True, "npx -y"),
+            ("npx --package=cowsay cowsay hi", True, "npx --package="),
+            ("npx -p cowsay cowsay hi", True, "npx -p"),
+            ("uv pip install requests", True, "uv pip install"),
+            ("uv run pytest", True, "uv run 은 .venv·lock 동기화"),
+            ("uv sync", True, "uv sync"),
+            ("uvx ruff check .", True, "uvx 는 항상 내려받는다"),
+            ("pipx run cowsay hi", True, "pipx run"),
+            ("pipx install cowsay", True, "pipx install"),
+            ("pnpm add left-pad", True, "pnpm add"),
+            ("pnpm dlx cowsay hi", True, "pnpm dlx"),
+            ("yarn", True, "yarn 단독 = install"),
+            ("yarn add left-pad", True, "yarn add"),
+            ("yarn dlx cowsay hi", True, "yarn dlx"),
+            ("npm install", True, "npm install(종전 배터리와 같은 방향)"),
+            ("npm i left-pad", True, "npm i"),
+            ("npm ci", True, "npm ci"),
+            ("npm audit fix", True, "npm audit fix"),
+            ("npm exec -- cowsay hi", True, "npm exec"),
+            ("npm version patch", True, "npm version 은 package.json 을 고친다"),
+            ("npm run typecheck", False, "npm run typecheck(정당한 검증)"),
+            ("npm test", False, "npm test"),
+            ("npm --prefix ui run typecheck", False, "값 옵션 뒤의 run"),
+            ("npm ls", False, "npm ls"),
+            ("bun test", False, "bun test"),
+            ("bun run typecheck", False, "bun run"),
+            ("bunx tsc -p tsconfig.check.json", False, "bunx tsc -p = tsc 의 -p 이지 npx --package 가 아니다"),
+            ("npx tsc --noEmit -p tsconfig.json", False, "npx tsc -p 도 같다"),
+            ("bun x tsc -p tsconfig.check.json", False, "bun x tsc -p"),
+            ("uv pip list", False, "uv pip list"),
+            ("uv tree", False, "uv tree"),
+            ("pipx list", False, "pipx list"),
+            ("pnpm run test", False, "pnpm run"),
+            ("pnpm test", False, "pnpm test"),
+            ("yarn test", False, "yarn test"),
+            ("yarn run lint", False, "yarn run"),
+            ("npm run build && bun add x", True, "복합: 뒤 세그먼트의 설치"),
+    ):
+        rv(_exp, _c, "G13 " + _lab)
     # T3: reviewer write-shell deny 에도 중괄호 술어를 태운다(거부 방향 전용)
     rv(True, "rm{,x} /w/repo/build", "중괄호로 감춘 rm")
     rv(True, "git{,x} commit -m x", "중괄호로 감춘 git commit")
@@ -3719,7 +3986,8 @@ def self_test_r2(fails):
     want(False, "Bash",
          {"command": "python3 ~/.cys/pack/bin/javis_preflight.py --self-test"},
          "인용 없는 `~/…` 는 확장된다(오탐 금지)", c=ctx_home_pack())
-    want(False, "Bash", {"command": "cys send --to master \"$HOME ~ 아래를 확인했다\""},
+    want(False, "Bash",
+         {"command": "cys send --queued --to master \"$HOME ~ 아래를 확인했다\""},
          "확장과 리터럴이 한 인자에 섞여도 본문은 본문이다(오탐 금지)")
     # T5: 인용된 리다이렉트 문자는 연산자가 아니라 인자다(다음 옵션을 삼키지 않는다).
     #     ★cwd 를 **허용 스크래치로 고정**해서 잰다 — 상대 경로 판정이 실행 위치에 따라 갈리면
@@ -3734,12 +4002,26 @@ def self_test_r2(fails):
         def ctx_scratch():
             return Ctx(pack=PACK, state=STATE, home=HOME, reader=reader, tempdir=_t5)
 
-        want(True, "Bash", {"command": "cys send --to master '>' --clear-first"},
+        want(True, "Bash", {"command": "cys send --queued --to master '>' --clear-first"},
              "인용된 `>` 가 삼킨 --clear-first", c=ctx_scratch())
-        want(True, "Bash", {"command": 'cys send --to master ">" --clear-first'},
+        want(True, "Bash", {"command": 'cys send --queued --to master ">" --clear-first'},
              "큰따옴표 판도 같다", c=ctx_scratch())
-        want(True, "Bash", {"command": "cys send --to master \\> --clear-first"},
+        want(True, "Bash", {"command": "cys send --queued --to master \\> --clear-first"},
              "이스케이프 판도 같다", c=ctx_scratch())
+        # ★G4 ⓑ(0.14.31 성찰 · 허용 방향): cwd 가 허용 뿌리(스크래치)일 때 종전 판정기는
+        #   `<cwd>/$HOME/…` 를 봤고 그것이 허용 뿌리 안이라 **전부 ALLOW** 였다 — bash 가 실제로
+        #   여는 파일은 훅 등록 파일·배달 원장·게이트 자신·authorized_keys 다. 4종 전부 deny.
+        want(True, "Bash", {"command": 'cys status > "$HOME/.claude/settings.json"'},
+             "G4 ⓑ 훅 등록 파일(게이트 자기 해제)", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$HOME/.cys/state/delivery-ledger.jsonl"'},
+             "G4 ⓑ 배달 원장", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$CYS_PACK_DIR/hooks/role-capability-gate.sh"'},
+             "G4 ⓑ 게이트 자신", c=ctx_scratch())
+        want(True, "Bash", {"command": 'cys status > "$HOME/.ssh/authorized_keys"'},
+             "G4 ⓑ authorized_keys", c=ctx_scratch())
+        # 양성 대조: 같은 cwd 에서 스크래치 상대 경로는 여전히 허용(해소가 오탐을 만들지 않는다).
+        want(False, "Bash", {"command": "cys status > ./probe.log"},
+             "G4 양성 대조: 스크래치 상대 경로", c=ctx_scratch())
     except OSError:
         pass
     finally:

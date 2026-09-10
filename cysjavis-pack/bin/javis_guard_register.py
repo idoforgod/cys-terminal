@@ -75,6 +75,7 @@ import inspect
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -330,8 +331,15 @@ def validate_targets_doc(doc):
         return None, "profiles 가 비어 있거나 배열이 아님"
     index = {}
     for ent in profiles:
-        if not isinstance(ent, dict) or not ent.get("basename"):
+        if not isinstance(ent, dict):
             return None, "profiles 항목 형식 오류: %r" % (ent,)
+        # ★0.14.31 성찰 G9: `basename` 의 **타입을 먼저** 검증한다. 배열·객체 basename 은 아래
+        #   `ent["basename"] in index` 에서 unhashable 예외를 내 C28 을 중단시켰고, 그러면 재시도
+        #   표식(미해소 기록)이 만들어지지 않아 다음 부팅이 재측정하지 않았다. 손상은 예외가
+        #   아니라 **err 문자열**로 나가야 한다 — preflight 는 그것을 UNKNOWN·표식으로 접는다.
+        _bn = ent.get("basename")
+        if not isinstance(_bn, str) or not _bn:
+            return None, "profiles 항목의 basename 이 비어 있거나 문자열이 아님: %r" % (_bn,)
         elig = ent.get("eligibility")
         if not isinstance(elig, dict):
             return None, "%s: eligibility 누락/형식 오류" % ent.get("basename")
@@ -399,13 +407,50 @@ def _now_tag():
     return datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
 
+# src/pack.rs pack_dir() 4단 폴백 미러 — `javis_preflight.PACK_DIR_ENV_KEYS` 와 **같은 순서**여야
+# 한다(파리티는 test_capgate_registration 이 assertEqual 로 잰다 · 0.14.31 성찰 G11).
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+
+
 def _pack_dir():
     """src/pack.rs pack_dir() 4단 폴백 미러(javis_preflight.PACK_DIR_ENV_KEYS 와 동일 순서)."""
-    for key in ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR"):
+    for key in PACK_DIR_ENV_KEYS:
         v = os.environ.get(key, "")
         if v:
             return v
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
+
+
+# ★훅 명령 문자열의 **인용 규율**(0.14.31 성찰 G3 · blocking): 종전 windows 갈래
+#   `'bash "%s"' % path` 는 큰따옴표 안에서 `$HOME`·`$(…)`·백틱·`"` 를 그대로 두어 **셸 확장·명령
+#   치환**이 성립했고, unix 갈래 `"sh %s"` 는 인용이 없어 공백 경로에서 훅이 실행되지 않았다.
+#   규칙: 안전 문자(shlex 의 POSIX 안전 집합)만이면 **그대로**(= 종전·preflight `_cys_hook_cmd`·
+#   Rust `hook_command_for` 와 byte-identical — 세 writer 의 멱등·해제 판정이 그 동일성에 선다),
+#   그 밖은 unix 작은따옴표 리터럴 / windows 큰따옴표 안 이스케이프(`\`·`"`·`$`·백틱).
+#   ★정직: 특수문자 경로에서는 preflight·Rust 가 아직 종전 문자열을 내므로 셋이 갈린다 — 그 두
+#     writer 가 같은 규칙을 채택해야 닫힌다(open item). 그 경로에서 종전 문자열은 어차피
+#     실행되지 않거나(공백) 다른 것을 실행했다(`$(…)`).
+_SH_SAFE_RE = re.compile(r"^[A-Za-z0-9@%+=:,./_-]+$")
+
+
+def _sh_word(path):
+    """unix `sh <이것>` — 안전 문자만이면 그대로, 아니면 작은따옴표 리터럴(`'` 은 `'\''`)."""
+    if _SH_SAFE_RE.match(path or ""):
+        return path
+    return "'" + (path or "").replace("'", "'\\''") + "'"
+
+
+def _bash_dq_literal(path):
+    """windows `bash "<이것>"` — 큰따옴표 안에서 뜻을 갖는 4자만 이스케이프(평범한 경로는 무변경)."""
+    return ((path or "").replace("\\", "\\\\").replace('"', '\\"')
+            .replace("$", "\\$").replace("`", "\\`"))
+
+
+def hook_command_str(script):
+    """설치 훅 실물 절대경로 → settings.json `command` 문자열(단일 규약 · 인용 규율은 위 머리주석)."""
+    if os.name == "nt":
+        return 'bash "%s"' % _bash_dq_literal(script.replace("\\", "/"))
+    return "sh %s" % _sh_word(script)
 
 
 def _command_str(spec, pack):
@@ -416,12 +461,9 @@ def _command_str(spec, pack):
       만들고, 실제 Bash 는 그 역슬래시를 escape 로 먹어 `C:UsersA` 처럼 **경로를 파괴**한다 —
       자격 검사는 통과하고 '등록됨' 을 보고하는데 훅은 실행되지 않는다(게이트 소실).
       정슬래시 + 따옴표가 유일하게 안전한 형태이고, 두 등록기가 같은 문자열을 내야 서로의
-      멱등·해제 판정이 성립한다.
+      멱등·해제 판정이 성립한다. 인용 규율은 `hook_command_str`(G3) 이 소유한다.
     """
-    script = os.path.join(pack, spec["script"])
-    if os.name == "nt":
-        return 'bash "%s"' % script.replace("\\", "/")
-    return "sh %s" % script
+    return hook_command_str(os.path.join(pack, spec["script"]))
 
 
 def _resolve_settings(profile):

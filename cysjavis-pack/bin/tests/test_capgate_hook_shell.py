@@ -49,9 +49,37 @@ SH = shutil.which("sh") or shutil.which("bash")
 NEED_SH = unittest.skipIf(not SH, "sh 부재 — 셸 종단 검체 실행 불가")
 
 
+CACHE_DIR_NAME = "cys-role-authority.d"
+CACHE_PREFIX = "cys-capgate-role-"
+
+
 def _slug(v):
-    """훅의 `capgate_slug`(`tr -c 'A-Za-z0-9._-' '_'`) 미러."""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", v or "")
+    """공용 `cys_role_slug`(`tr -cs 'A-Za-z0-9.-' '_'` + 80자 절단) 미러.
+
+    ★0.14.31 성찰 G1: 훅 전용 `capgate_slug`(손실 치환·절단 없음)를 없애고 공용층 규칙으로
+      접었다. 이 미러가 어긋나면 아래 캐시 검체가 **엉뚱한 파일**을 심어 조용히 통과한다.
+    """
+    return re.sub(r"[^A-Za-z0-9.-]+", "_", v or "")[:80]
+
+
+def _pct(v):
+    """공용 `cys_role_pct_esc` 미러(`%`→`%25` 먼저, `:`→`%3A`)."""
+    return (v or "").replace("%", "%25").replace(":", "%3A")
+
+
+def sock_id(env):
+    """공용 `cys_role_sock_id_init` 미러 — 캐시 레코드에 **원문 그대로** 실리는 종단점 신원."""
+    s = env.get("CYS_SOCKET") or env.get("JAVIS_SOCKET") or env.get("AITERM_SOCKET") or ""
+    if s:
+        if not (s.startswith("/") or (("/" not in s) and
+                                      (s.startswith("\\\\.\\pipe\\") or
+                                       s.startswith("\\\\?\\pipe\\")) and len(s) > 9)):
+            return ""
+    else:
+        s = "default:%s:%s" % (_pct(env.get("XDG_STATE_HOME", "")), _pct(env.get("HOME", "")))
+    if len(s.encode("utf-8")) > 512 or "\n" in s or "\r" in s:
+        return ""
+    return s
 
 
 class HookRun(object):
@@ -95,6 +123,7 @@ class _HookEnv(unittest.TestCase):
                   self.pack / "bin", self.fakebin):
             d.mkdir(parents=True, exist_ok=True)
         self.cyslog = self.root / "cys-calls.log"
+        self.cysenvlog = self.root / "cys-env.log"
         self.env = dict(os.environ)
         self.env.update({
             "HOME": str(self.home),
@@ -103,6 +132,7 @@ class _HookEnv(unittest.TestCase):
             "CYS_PACK_DIR": str(self.pack),
             "CYS_PY": sys.executable,
             "CYS_FAKE_LOG": str(self.cyslog),
+            "CYS_FAKE_ENV_LOG": str(self.cysenvlog),
             "PATH": os.pathsep.join([str(self.fakebin)] + self._clean_path()),
         })
         for k in ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SURFACE_ID", "CYS_SOCKET",
@@ -126,7 +156,10 @@ class _HookEnv(unittest.TestCase):
     def fake_cys(self, role="", rc=0):
         """PATH 위의 `cys` 스텁 — 호출을 기록하고 지정한 역할 1줄을 낸다."""
         p = self.fakebin / "cys"
-        body = ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$CYS_FAKE_LOG"']
+        body = ["#!/bin/sh", 'printf "%s\\n" "$*" >> "$CYS_FAKE_LOG"',
+                # ★스텁이 **받은 env** 를 기록한다 — 소스 문자열 핀이 아니라 실제 자식 환경으로
+                #   `CYS_NO_AUTOSTART` 봉인을 잰다(0.14.31 성찰 G5).
+                'printf "%s\\n" "${CYS_NO_AUTOSTART:-unset}" >> "$CYS_FAKE_ENV_LOG"']
         if role:
             body.append('printf "%s\\n"' % role)
         body.append("exit %d" % rc)
@@ -134,27 +167,52 @@ class _HookEnv(unittest.TestCase):
         p.chmod(0o755)
         return p
 
-    def cache_path(self, surface="7", socket=""):
-        return self.tmpdir / ("cys-capgate-role-%s-%s-%s"
-                              % (_slug(surface), _slug(socket or "none"), ""))
+    def cache_dir(self):
+        d = self.tmpdir / CACHE_DIR_NAME
+        d.mkdir(mode=0o700, exist_ok=True)
+        return d
 
-    def plant_cache(self, role, surface="7", age=0, socket=""):
+    def cache_path(self, surface="7", socket="", epoch=None):
+        """공용 캐시 디렉터리 안의 capgate 전용 레코드 경로(0.14.31 성찰 G1).
+
+        세대(boot-epoch)는 **파일명이 아니라 레코드**에 있다 — 재기동 고아가 남지 않는다.
+        """
+        env = dict(self.env)
+        if socket:
+            env["CYS_SOCKET"] = socket
+        sid = sock_id(env)
+        return self.cache_dir() / (CACHE_PREFIX + "%s-%s" % (_slug(surface), _slug(sid)))
+
+    def plant_cache(self, role, surface="7", age=0, socket="", epoch="-", sockid=None):
+        """`"<ts> <역할|-> <세대> <소켓신원>"` 4필드 레코드를 심는다."""
         import time
         p = self.cache_path(surface, socket)
-        p.write_text("%d %s\n" % (int(time.time()) - age, role), encoding="utf-8")
+        env = dict(self.env)
+        if socket:
+            env["CYS_SOCKET"] = socket
+        sid = sock_id(env) if sockid is None else sockid
+        p.write_text("%d %s %s %s\n" % (int(time.time()) - age, role, epoch, sid),
+                     encoding="utf-8")
         p.chmod(0o600)
         return p
 
     def calls_log(self):
         return self.cyslog.read_text(encoding="utf-8") if self.cyslog.exists() else ""
 
+    def calls_env(self):
+        """스텁 `cys` 가 실제로 받은 `CYS_NO_AUTOSTART` 값들."""
+        if not self.cysenvlog.exists():
+            return []
+        return self.cysenvlog.read_text(encoding="utf-8").split()
+
     # ── 실행 ────────────────────────────────────────────────────────────────
-    def run_hook(self, tool="Bash", tool_input=None, session_id="s-1", **envkw):
+    def run_hook(self, tool="Bash", tool_input=None, session_id="s-1", cwd=None, **envkw):
         env = dict(self.env)
         env.update({k: str(v) for k, v in envkw.items()})
         payload = json.dumps({"session_id": session_id, "tool_name": tool,
                               "tool_input": tool_input or {}})
         r = subprocess.run([SH, str(HOOK)], input=payload, env=env,
+                           cwd=str(cwd) if cwd else None,
                            capture_output=True, text=True, timeout=90)
         return HookRun(r.returncode, r.stdout, r.stderr)
 
@@ -374,27 +432,27 @@ class HookInputHandoff(_HookEnv):
         """
         self._break_cygpath()
         r = self.run_hook("Edit", {"file_path": "/nonexistent-repo/a.rs"},
-                          CYS_SURFACE_ROLE="reviewer-codex")
+                          CYS_ROLE="reviewer-codex")
         self.assertEqual(r.rc, 0, "인계 실패가 reviewer 좌석을 exit 2 로 죽였다: %s" % r.err)
         self.assertTrue(r.denied, "판정이 수행되지 않았다(집행 0): %r / %r" % (r.out, r.err))
 
     def test_broken_native_path_still_judges_cso(self):
         self._break_cygpath()
-        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("CronCreate", {}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertTrue(r.denied, "인계 실패로 CSO 게이트가 조용히 꺼졌다: %r / %r"
                         % (r.out, r.err))
 
     def test_broken_native_path_allows_normal_call(self):
         self._break_cygpath()
-        r = self.run_hook("Bash", {"command": "cys status --json"}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("Bash", {"command": "cys status --json"}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertFalse(r.denied, "정상 호출이 인계 실패로 막혔다: %s" % r.reason)
 
     def test_destroyed_input_small_payload_uses_env_fallback(self):
         """원본까지 사라져도 **소용량은 env 로도 실려 있다** — 판정이 계속된다."""
         self._destroy_input()
-        r = self.run_hook("CronCreate", {}, CYS_SURFACE_ROLE="cso")
+        r = self.run_hook("CronCreate", {}, CYS_ROLE="cso")
         self.assertEqual(r.rc, 0)
         self.assertTrue(r.denied, "env 폴백이 동작하지 않아 게이트가 꺼졌다: %r / %r"
                         % (r.out, r.err))
@@ -408,7 +466,7 @@ class HookInputHandoff(_HookEnv):
         self._destroy_input()
         r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
                                     "content": "x" * 70000},
-                          CYS_SURFACE_ROLE="reviewer-codex")
+                          CYS_ROLE="reviewer-codex")
         self.assertEqual(r.rc, 2, "판독 불능인데 대형 Write 가 통과했다: rc=%s %r"
                          % (r.rc, r.out))
 
@@ -417,14 +475,14 @@ class HookInputHandoff(_HookEnv):
         self._destroy_input()
         r = self.run_hook("Write", {"file_path": "/nonexistent-repo/a.rs",
                                     "content": "x" * 70000},
-                          CYS_SURFACE_ROLE="cso")
+                          CYS_ROLE="cso")
         self.assertEqual(r.rc, 0, "CSO 좌석이 판독 불능으로 죽었다: %s" % r.err)
         self.assertIn("게이트 강등", r.err)
 
     def test_no_temp_file_leftover_on_broken_conversion(self):
         """★`exec` 뒤에는 셸 trap 이 돌지 않는다 — 판정기가 **두 경로를 다** 지워야 한다."""
         self._break_cygpath()
-        self.run_hook("Bash", {"command": "cys status"}, CYS_SURFACE_ROLE="cso")
+        self.run_hook("Bash", {"command": "cys status"}, CYS_ROLE="cso")
         leftovers = [p.name for p in self.tmpdir.iterdir()
                      if p.name.startswith("cys-capgate-in.")]
         self.assertEqual(leftovers, [], "임시 입력 파일이 남았다: %s" % leftovers)
@@ -595,6 +653,19 @@ class NegativeControls(unittest.TestCase):
         ("옵션 종료 `--` 처리",
          '    args = raw_args[:raw_args.index("--")] if "--" in raw_args else raw_args',
          "    args = raw_args"),
+        # ★0.14.31 성찰 G4 — 리다이렉트 대상의 변수 해소를 지우면(원 토큰 판정) 게이트가 본
+        #   경로 ≠ bash 가 쓰는 경로로 돌아간다(거부 방향 오탐 + cwd 허용 뿌리에서의 허용 방향).
+        ("리다이렉트 대상 변수 해소(G4)",
+         "        _rt = _resolve_token(target, ctx)\n",
+         "        _rt = target\n"),
+        # ★0.14.31 성찰 G13 — 하위 명령 allowlist 를 지우면 `bun add` 가 다시 샌다.
+        ("패키지 도구 하위 명령 allowlist(G13)",
+         "    subs = PKG_TOOL_VERIFY_SUBS.get(base)\n    if subs is None or sub not in subs:\n",
+         "    subs = PKG_TOOL_VERIFY_SUBS.get(base)\n    if False:\n"),
+        # 러너 설치 옵션은 실행 대상 **앞**에서만 본다 — 그 검사를 지우면 `npx --yes` 가 샌다.
+        ("러너 설치 옵션(G13)",
+         "        if any(a == o or a.startswith(o + \"=\") for o in PKG_RUNNER_INSTALL_OPTS):\n            return True\n",
+         "        if False:\n            return True\n"),
     ]
 
     @NEED_SH
@@ -699,11 +770,11 @@ class TriageQuotingAndExpansion(_HookEnv):
         self.assertEqual(self.bash_words("'>' --clear-first"), [">", "--clear-first"],
                          "선행 사실: 인용된 `>` 는 인자다")
         deny_plain = self.run_hook_in(self.tmpdir, "Bash",
-                                      {"command": "cys send --to master --clear-first"},
+                                      {"command": "cys send --queued --to master --clear-first"},
                                       CYS_ROLE="cso")
         self.assertTrue(deny_plain.denied, "대조군: 인용 없는 --clear-first 는 이미 deny 다")
         r = self.run_hook_in(self.tmpdir, "Bash",
-                             {"command": "cys send --to master '>' --clear-first"},
+                             {"command": "cys send --queued --to master '>' --clear-first"},
                              CYS_ROLE="cso")
         self.assertTrue(r.denied,
                         "인용된 `>` 가 금지 옵션을 삼켜 통과했다: %r/%r" % (r.out, r.err))
@@ -718,7 +789,7 @@ class TriageQuotingAndExpansion(_HookEnv):
         self.assertEqual(self.bash_words("--{clear-first,x{y}}"),
                          ["--clear-first", "--x{y}"],
                          "선행 사실: 중첩 중괄호도 인자를 늘린다")
-        r = self.run_hook("Bash", {"command": "cys send --to master --{clear-first,x{y}}"},
+        r = self.run_hook("Bash", {"command": "cys send --queued --to master --{clear-first,x{y}}"},
                           CYS_ROLE="cso")
         self.assertTrue(r.denied,
                         "중첩 중괄호가 금지 옵션을 숨겼다: %r/%r" % (r.out, r.err))
@@ -929,6 +1000,229 @@ class TriageConvergenceR2(_HookEnv):
                         "혼합 토큰의 **리터럴 부분이 확장돼** 설치 팩 도구로 오인됐다"
                         "(동명 사본 실행): %r/%r" % (r.out, r.err))
 
+
+class HookCacheIdentity(_HookEnv):
+    """★0.14.31 성찰 G1·G7·G14 — 캐시 레코드의 **종단점 신원**과 세대 성분.
+
+    종전 훅은 캐시 파일명을 손실 슬러그로 만들고 레코드를 `<ts> <역할>` 2필드로 썼다:
+    슬러그가 충돌하는 두 소켓(`…/s/x.sock` ↔ `…/s_x.sock`)이 **한 파일**을 공유하는데
+    레코드에 신원이 없어 서로의 역할을 자기 것으로 읽었다. 그 방향은 **열림**이다 —
+    앞 좌석의 비대상 역할(worker)이 뒤 좌석(reviewer)의 fast-path 가 되어 리뷰어가
+    데몬에 묻지도 않고 자기 산출물을 고친다(로그에도 흔적이 없다).
+    """
+
+    def _colliding_sockets(self):
+        a = self.root / "s" / "x.sock"
+        b = self.root / "s_x.sock"
+        (self.root / "s").mkdir(exist_ok=True)
+        return str(a), str(b)
+
+    def test_colliding_socket_slugs_share_a_file_but_not_a_verdict(self):
+        """두 소켓이 **같은 캐시 파일**을 가리켜도 남의 레코드는 권위가 아니다."""
+        a, b = self._colliding_sockets()
+        pa, pb = self.cache_path(socket=a), self.cache_path(socket=b)
+        self.assertEqual(pa, pb, "선행 사실: 두 종단점의 슬러그가 충돌해야 이 검체가 뜻이 있다")
+        # A 좌석(worker)의 신선한 레코드를 심고 — B 좌석(reviewer)으로 도구를 부른다.
+        self.plant_cache("worker", socket=a)
+        self.fake_cys(role="reviewer-codex")
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7", CYS_SOCKET=b)
+        self.assertIn("surface-role", self.calls_log(),
+                      "남의 종단점 레코드를 fast-path 로 써서 데몬에 묻지 않았다(캐시 충돌)")
+        self.assertTrue(r.denied,
+                        "리뷰어가 캐시 충돌로 **구현 권한**을 얻었다: %r / %r" % (r.out, r.err))
+
+    def test_matching_socket_identity_is_still_a_fastpath(self):
+        """대조군 — 신원이 **맞으면** 종전대로 fast-path 다(비대상 좌석의 RPC 폭풍 방지)."""
+        a, _b = self._colliding_sockets()
+        self.plant_cache("worker", socket=a)
+        self.fake_cys(role="reviewer-codex")
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7", CYS_SOCKET=a)
+        self.assertEqual(self.calls_log(), "",
+                         "신원이 맞는 비대상 캐시가 fast-path 가 아니다: %r" % self.calls_log())
+        self.assertFalse(r.denied, "worker 좌석이 막혔다: %r" % r.out)
+
+    def test_legacy_two_field_record_is_not_authoritative(self):
+        """구형 `<ts> <역할>` 2필드 레코드(신원 없음)는 권위가 아니다 — 데몬에 묻는다."""
+        import time
+        self.fake_cys(role="reviewer-codex")
+        p = self.cache_path()
+        p.parent.mkdir(mode=0o700, exist_ok=True)
+        p.write_text("%d worker\n" % int(time.time()), encoding="utf-8")
+        p.chmod(0o600)
+        r = self.run_hook("Write", {"file_path": "/nonexistent-repo/out.md", "content": "x"},
+                          CYS_SURFACE_ID="7")
+        self.assertIn("surface-role", self.calls_log(),
+                      "신원 없는 구형 레코드를 권위로 읽었다")
+        self.assertTrue(r.denied, "구형 레코드가 리뷰어의 구현 권한을 열었다: %r" % r.out)
+
+    def test_cache_lives_in_the_shared_0700_directory(self):
+        """캐시는 TMPDIR **루트**가 아니라 공용 0700 전용 디렉터리 안이다(이름 예측·심기 차단)."""
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        d = self.tmpdir / CACHE_DIR_NAME
+        self.assertTrue(d.is_dir(), "공용 캐시 디렉터리가 없다")
+        self.assertEqual(d.stat().st_mode & 0o777, 0o700, "캐시 디렉터리가 0700 이 아니다")
+        stray = [p.name for p in self.tmpdir.iterdir()
+                 if p.is_file() and p.name.startswith("cys-capgate-role-")]
+        self.assertEqual(stray, [], "캐시가 TMPDIR 루트에 흩뿌려졌다: %s" % stray)
+        rec = self.cache_path().read_text(encoding="utf-8").split()
+        self.assertEqual(len(rec), 4, "레코드가 4필드(ts·역할·세대·신원)가 아니다: %r" % rec)
+        self.assertEqual(rec[1], "master")
+        self.assertEqual(rec[3], sock_id(self.env), "레코드에 종단점 신원이 원문으로 없다")
+
+    def test_named_pipe_endpoint_does_not_read_cwd_boot_epoch(self):
+        """★G7: 유닉스 `dirname '\\\\.\\pipe\\cys'` 는 `.` 이다 — cwd 의 `boot-epoch` 를 읽지 않는다.
+
+        읽으면 같은 좌석이 **cwd 마다** 캐시를 따로 갖고(도구 호출마다 RPC), 저장소에 그
+        이름의 파일이 있으면 전 pane 이 매 호출 2s 데드라인을 문다.
+        """
+        work = self.root / "repo"
+        work.mkdir(exist_ok=True)
+        (work / "boot-epoch").write_text("9999\n", encoding="utf-8")
+        pipe = "\\\\.\\pipe\\cys"
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=pipe, cwd=work)
+        p = self.cache_path(socket=pipe)
+        self.assertTrue(p.exists(), "명명 파이프 좌석이 캐시를 쓰지 않았다(백오프도 함께 꺼진다)")
+        rec = p.read_text(encoding="utf-8").split()
+        self.assertEqual(rec[2], "-",
+                         "cwd 의 boot-epoch 가 세대 성분으로 실렸다: %r" % rec)
+
+    def test_hostile_boot_epoch_folds_to_unknown(self):
+        """★G7: 거대한 한 줄·FIFO `boot-epoch` 에서 유계로 접힌다(훅이 매달리지 않는다)."""
+        import time
+        sockdir = self.root / "sock"
+        sockdir.mkdir(exist_ok=True)
+        sock = str(sockdir / "cys.sock")
+        self.fake_cys(role="master")
+        # ⓐ 거대한 한 줄 — 4KB 유계 판독 + 토큰 문법에서 접힌다(파일명 ENAMETOOLONG 방지).
+        (sockdir / "boot-epoch").write_text("A" * 200000, encoding="utf-8")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=sock)
+        rec = self.cache_path(socket=sock).read_text(encoding="utf-8").split()
+        self.assertEqual(rec[2], "-", "거대한 boot-epoch 가 그대로 세대 성분이 됐다: %r" % rec[2][:40])
+        # ⓑ FIFO — 열기에서 매달리면 **모든 도구 호출**이 멈춘다.
+        (sockdir / "boot-epoch").unlink()
+        try:
+            os.mkfifo(str(sockdir / "boot-epoch"))
+        except (AttributeError, OSError):
+            self.skipTest("mkfifo 불가 — FIFO 축을 잴 수 없다")
+        t0 = time.time()
+        r = self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7", CYS_SOCKET=sock)
+        self.assertEqual(r.rc, 0)
+        self.assertLess(time.time() - t0, 20,
+                        "FIFO `boot-epoch` 에서 PreToolUse 훅이 매달렸다")
+
+    def test_role_query_never_spawns_a_daemon(self):
+        """★G5: 역할을 묻는 행위가 **데몬을 낳지 않는다**(`CYS_NO_AUTOSTART=1`).
+
+        `cys` 는 소켓이 없으면 `connect()` 에서 형제 `cysd` 를 detached 로 **스폰한 뒤**
+        폴링한다 — 밖의 `cys_timeout_run 2` 가 2s 에 죽여도 스폰은 이미 일어났다. 이 훅은
+        matcher 없이 전 도구에 붙고 게이트 대상 좌석은 캐시 fast-path 를 쓰지 않으므로,
+        데몬이 내려간 상태에서 **좌석당 5초에 한 번** 기동 시도가 된다(운영자가 의도적으로
+        내린 데몬이 도구 호출 하나로 되살아난다 · 봉인표 ① 방향).
+        """
+        self.fake_cys(role="master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ID="7")
+        got = self.calls_env()
+        self.assertTrue(got, "데몬 조회가 나지 않아 봉인을 잴 수 없다(계측 불능)")
+        self.assertEqual(set(got), {"1"},
+                         "훅이 autostart 를 막지 않고 `cys` 를 불렀다: %r" % got)
+
+    def test_surface_role_env_is_an_output_not_an_identity(self):
+        """★G6: `CYS_SURFACE_ROLE` 한 줄로 **절대 deny 집합**이 열리지 않는다.
+
+        `CronCreate`/`Task`/`WebSearch` 는 §1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은
+        집합이다. 종전 게이트만 `CYS_SURFACE_ROLE` 을 폴백 **1순위**로 써서
+        `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 가 그 집합을 열었다 — 자매 두 층
+        (`javis_role.py:636` · `_lib.sh:678`)이 검체로 금지한 경로다.
+        """
+        self.fake_cys(role="", rc=2)          # 데몬 판정 불가
+        a = self.run_hook("CronCreate", {}, CYS_ROLE="cso", CYS_SURFACE_ID="7")
+        b = self.run_hook("CronCreate", {}, CYS_ROLE="cso", CYS_SURFACE_ROLE="master",
+                          CYS_SURFACE_ID="7")
+        self.assertTrue(a.denied, "선행 사실: A(단독 CYS_ROLE=cso)가 막혀야 이 검체가 뜻이 있다")
+        self.assertEqual(a.denied, b.denied,
+                         "env 한 줄(CYS_SURFACE_ROLE=master)이 절대 deny 집합을 열었다: %r"
+                         % b.out)
+
+    def test_surface_role_env_alone_is_not_a_seat_identity(self):
+        """`CYS_SURFACE_ROLE` 만 있고 `CYS_ROLE` 이 없으면 그것은 신원이 아니다(무역할=통과).
+
+        이 훅이 export 하는 **산출물**이 다음 프로세스의 신원으로 되돌아오면(상속·런처 export)
+        같은 변수가 입력이자 출력이 된다 — 그 고리를 끊는다.
+        """
+        self.fake_cys(role="", rc=2)
+        r = self.run_hook("Edit", {"file_path": "/nonexistent-repo/a.rs"},
+                          CYS_SURFACE_ROLE="reviewer-codex", CYS_SURFACE_ID="7")
+        self.assertFalse(r.denied,
+                         "산출물 변수가 신원으로 되돌아왔다: %r" % r.out)
+
+    def test_gated_surface_role_hint_still_forces_a_query(self):
+        """대조군 — 힌트가 **게이트 대상**이라고 말하면 캐시 fast-path 는 끈다(막는 축은 넓게)."""
+        self.fake_cys(role="master")
+        self.plant_cache("master")
+        self.run_hook("Bash", {"command": "ls"}, CYS_SURFACE_ROLE="cso", CYS_SURFACE_ID="7")
+        self.assertIn("surface-role", self.calls_log(),
+                      "게이트 대상 힌트가 있는데 캐시를 권위로 썼다(캐시 오염 경로)")
+
+    def test_cache_dirname_matches_both_sibling_layers(self):
+        """★G14: 역할 캐시 디렉터리 이름이 세 층에서 같은가(보호가 조용히 늙지 않게)."""
+        sys.path.insert(0, str(BIN))
+        try:
+            import javis_role
+        finally:
+            sys.path.pop(0)
+        hook = HOOK.read_text(encoding="utf-8")
+        lib = LIB.read_text(encoding="utf-8")
+        m = re.search(r'^ROLE_CACHE_DIRNAME = "([^"]+)"', hook, re.M)
+        self.assertTrue(m, "훅에 ROLE_CACHE_DIRNAME 상수가 없다")
+        ml = re.search(r'^CYS_ROLE_CACHE_DIRNAME="([^"]+)"', lib, re.M)
+        self.assertTrue(ml, "_lib.sh 에 CYS_ROLE_CACHE_DIRNAME 상수가 없다")
+        self.assertEqual(m.group(1), javis_role.CACHE_DIR_NAME,
+                         "게이트의 자기상태 보호가 파이썬 짝과 다른 이름을 본다")
+        self.assertEqual(ml.group(1), javis_role.CACHE_DIR_NAME,
+                         "공용 셸층이 파이썬 짝과 다른 이름을 쓴다")
+        self.assertEqual(m.group(1), CACHE_DIR_NAME, "이 검체의 미러가 낡았다")
+        # capgate 캐시 basename 은 게이트 자기상태 접두 안에 있어야 이중으로 보호된다.
+        mp = re.search(r'^CAPGATE_CACHE_PREFIX="([^"]+)"', hook, re.M)
+        mg = re.search(r'^GATE_STATE_FILE_PREFIX = "([^"]+)"', hook, re.M)
+        self.assertTrue(mp and mg)
+        self.assertTrue(mp.group(1).startswith(mg.group(1)),
+                        "capgate 캐시 이름이 게이트 자기상태 접두 밖이다: %r ⊄ %r"
+                        % (mp.group(1), mg.group(1)))
+
+
+
+class QueuedReportChannel(_HookEnv):
+    """★0.14.31 성찰 G2 — CSO 보고 채널은 `cys send --queued --to master` **하나**다(훅 종단).
+
+    비큐 `cys send` 는 `surface.send_text` 만 부르고 CR 을 보내지 않는다(src/bin/cys.rs
+    Command::Send). 조용한 pane 에서는 본문이 **미제출 초안**으로 남고, master 가 초안을 쥐고
+    있으면 그 초안에 합체된다. 제출에 필요한 `cys send-key … Return` 은 CSO 접두 밖이라
+    비큐 보고는 **도달 경로가 없다**("CSO 는 보고했다고 믿고 오너는 침묵을 본다").
+    그래서 게이트는 옵션 종료 `--` 앞의 **실제** `--queued` 토큰을 허용·예산 면제의 선행
+    조건으로 요구한다. 여기서는 훅을 실제로 실행해 deny 문면이 처방을 담는지까지 잰다.
+    """
+
+    def test_unqueued_report_is_denied_with_the_prescription(self):
+        r = self.run_hook("Bash", {"command": 'cys send --to master "[CSO] 보고"'}, CYS_ROLE="cso")
+        self.assertTrue(r.denied, "비큐 send 가 통과했다: %r/%r" % (r.out, r.err))
+        self.assertIn("--queued", r.reason, "deny 문면에 처방(`--queued`)이 없다: %r" % r.reason)
+
+    def test_queued_report_is_allowed(self):
+        r = self.run_hook("Bash", {"command": 'cys send --queued --to master "[CSO] 보고"'},
+                          CYS_ROLE="cso")
+        self.assertFalse(r.denied, "실제 큐 옵션이 거부됐다: %r" % r.reason)
+        self.assertEqual(r.rc, 0)
+
+    def test_queued_string_in_body_or_after_double_dash_is_not_the_option(self):
+        for cmd in ('cys send --to master "--queued 라고 적힌 본문"',
+                    "cys send --to master -- --queued"):
+            with self.subTest(cmd=cmd):
+                r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso")
+                self.assertTrue(r.denied, "본문의 `--queued` 문자열이 옵션으로 읽혔다: %r" % cmd)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

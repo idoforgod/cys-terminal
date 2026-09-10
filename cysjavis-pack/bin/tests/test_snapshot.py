@@ -71,7 +71,13 @@ def run(args, extra=None):
               "CYS_SOCKET", "JAVIS_ROOT", "CYS_STATE_DIR"):
         env.pop(k, None)
     env["CYS_BIN"] = _ABSENT_CYS
-    env["TMPDIR"] = _SEAL_TMP
+    # ★0.14.31 성찰 G10: 관측 훅은 **살아 있는 백오프**(이전 프로세스가 남긴 신선한 `.fail`) 안에서
+    #   생성을 보류한다(데몬 사망 중 매 훅 2s 타임아웃 반복 차단 · 생산 skip 이 선언된 실패 방향).
+    #   이 하네스는 `cys` 부재로 매 호출이 조회 실패이므로, 호출들이 TMPDIR 을 공유하면 첫 호출의
+    #   표식이 뒤 호출들을 보류시켜 단언과 무관한 이유로 파일이 없게 된다. 호출마다 밀폐 TMPDIR 을
+    #   주어 "판정 불가 → 종전 env 판정" 이라는 이 검체의 전제를 **호출 단위**로 유지한다(백오프
+    #   보류 자체는 test_role_authority G10-1~6 이 잰다). 단언은 한 줄도 바꾸지 않는다.
+    env["TMPDIR"] = tempfile.mkdtemp(prefix="run-", dir=_SEAL_TMP)
     if extra:
         env.update(extra)
     r = subprocess.run([sys.executable, MOD] + args, capture_output=True, text=True,
