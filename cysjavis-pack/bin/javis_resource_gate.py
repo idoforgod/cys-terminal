@@ -469,7 +469,28 @@ _JS_BOOL_LONG = frozenset((
     "--test-update-snapshots",
     # bun 고유(실측 형상 `bun --smol /x/bin/codex`) — 전부 값을 안 먹는다.
     "--smol", "--hot", "--bun", "--no-install", "--silent", "--minify",
-    "--no-clear-screen", "--no-summary"))
+    "--no-clear-screen", "--no-summary",
+    # ★성찰 R4 N12 — `node --help`(v24.20.0) 실측에서 **값 표기가 없는** 이름만 편입한다.
+    #   근거: 이 표에 없으면 `_fleet_opt_class` 가 `unknown` 을 내고 언랩을 포기해, 그 뒤의 진짜
+    #   관리 CLI 가 소유권 `None` 으로 접혀 **CPU 가 과소계상**된다(축이 조용히 얇아진다).
+    #   ★일괄 편입은 하지 않았다: 값 표기가 붙은 `--debug-port(, --inspect-port=…)` ·
+    #     `--experimental-default-config-file(, --experimental-config-file=…)` 과, 뒤 토큰이
+    #     **자기 입력 파일**인 `--prof-process` 는 뺐다(미상 옵션 값을 실행 주체로 오인하는
+    #     B2 오탐 재발 금지 · 그 셋은 종전대로 `unknown` = 포기).
+    "--allow-inspector", "--completion-bash", "--disable-sigusr1",
+    "--disable-wasm-trap-handler", "--enable-etw-stack-walking", "--entry-url",
+    "--experimental-eventsource", "--experimental-import-text",
+    "--experimental-inspector-network-resource", "--experimental-network-inspection",
+    "--experimental-print-required-tla", "--experimental-storage-inspection",
+    "--experimental-stream-iter", "--experimental-test-module-mocks",
+    "--experimental-worker-inspection", "--interpreted-frames-native-stack",
+    "--no-async-context-frame", "--no-experimental-global-navigator",
+    "--no-experimental-repl-await", "--no-experimental-sqlite",
+    "--no-experimental-websocket", "--no-extra-info-on-fatal-exception",
+    "--no-require-module", "--openssl-shared-config", "--permission", "--permission-audit",
+    "--report-exclude-env", "--report-exclude-network", "--test-randomize",
+    "--trace-env", "--trace-env-js-stack", "--trace-env-native-stack", "--trace-promises",
+    "--use-env-proxy", "--use-system-ca", "--v8-options"))
 _PY_BOOL_LONG = frozenset(("--help", "--version", "--help-env", "--help-xoptions",
                            "--help-all"))
 # 짧은 **불리언** 문자. 값 문자(`_*_VALUE_SHORT`)·코드 문자(`_*_CODE_MODE_LETTERS`)와 셋이
@@ -858,6 +879,26 @@ def _fleet_opt_class(tok, js):
     return "bool"
 
 
+def _fleet_runner_short_repeat_bool(tok, opts):
+    """`-vv`·`-qq`·`-vvv` 처럼 **하나의 알려진 불리언 문자가 반복된** 단축 옵션인가(순수 · N12).
+
+    ★왜 클러스터 일반화가 아닌가: 런처 옵션 표는 **이름 단위**이고 짧은 이름의 의미가 런처마다
+      다르다(`-p` = npx `--package`(값) · npm `--parseable`(불리언) · uv `--python`(값)). 서로 다른
+      문자를 묶어 해석하면 그 갈림이 되살아난다. 반복은 같은 옵션의 **강도**라 의미가 하나뿐이다.
+    ★값·중단 옵션의 문자는 제외한다: `-vv` 가 `-v <값 v>` 인 런처에서 불리언으로 읽으면 그 값이
+      실행 주체로 승격된다(B2 오탐 방향). 종전엔 `uv -vv run serena` 가 통째로 `unknown` 이라
+      serena 의 CPU 가 **미계상**됐다(반대 방향의 조용한 사고)."""
+    if not tok.startswith("-") or tok.startswith("--") or len(tok) < 3:
+        return False
+    body = tok[1:]
+    if len(set(body)) != 1:
+        return False
+    one = "-" + body[0]
+    if one in opts["value"] or one in opts["abort"]:
+        return False
+    return one in opts["bool"]
+
+
 def _fleet_runner_opt_class(tok, opts):
     """런처 옵션 토큰 → `"value"` · `"bool"` · `"abort"`(셸/명령 문자열 모드 — 언랩 종료) ·
     `"unknown"`(표에 없음 — 언랩 포기). 순수(R3 · codex "약어는 런처별이다").
@@ -869,6 +910,8 @@ def _fleet_runner_opt_class(tok, opts):
         return "bool" if (tok.startswith("--") and "=" in tok) else "value"
     if name in opts["bool"]:
         return "bool"
+    if _fleet_runner_short_repeat_bool(tok, opts):
+        return "bool"                         # ★N12 — 반복 단축 옵션(`-vv`)은 같은 불리언의 강도다
     if tok.startswith("--") and "=" in tok:
         # ★R2(수렴 · 리뷰 minor): 런처에서도 `=` 형은 값 소비가 끝난 자족적 형태다
         #   (`npx --loglevel=silly codex` · `pnpm dlx --reporter=silent codex`). 실행 자리를
