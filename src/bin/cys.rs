@@ -8616,15 +8616,35 @@ mod seat_latch_negation_tests {
             !matches!(recheck(passed, None), GateRecheck::StillHeld { .. }),
             "관문 부재 화면에서 관문 보류가 나왔다(판정 이원화)"
         );
-        // ②′ ★(0.14.31 · H-1) 밸브 창 재료가 없으면(구 데몬 `quiet_secs` 부재 · 아직 출력 중) 통과 화면도
-        //    **채택하지 않는다** — 귀결은 NoEvidence(보류 유지 · 스폰 0 · 파괴 0)이지 StillHeld 도 Adopt 도 아니다.
-        for quiet in [None, Some(false)] {
+        // ②′ ★(0.14.31 · H-1 / 성찰 R8) 밸브 창 재료의 **두 결측을 가른다** — 종전에는 둘 다
+        //    NoEvidence 였다.
+        //    · `Some(false)`(아직 출력 중) — 채택하지 않는다. H-1 의 본체는 그대로다.
+        //    · `None`(구 데몬 cysd 0.14.30 은 `quiet_secs` 키를 **낼 수 없다**) — 성찰 R8 이후 밸브가
+        //      연다. 그러지 않으면 그 좌석은 사람이 관문을 통과시켜 줘도 재관측이 **영원히** 채택되지
+        //      않는다(노드 0 · 근거 전문은 `readiness::positive_evidence` 의 밸브 창 doc).
+        //      ★파괴 방향은 여기서 열리지 않는다 — 프로덕션 재관측은 이 판정을 **그대로 쓰지 않고**
+        //      둘째 벨트(`gate_recheck_with_carry` → `gate_carry_ok` → `composer_layout_static_ok`)를
+        //      통과해야 하고, 그 벨트는 같은 결측에서 `CarryUnproven` 을 낸다(2.1.241 레이아웃의
+        //      '마커 위 상태줄' 은 **약한 증거**라 출력 정적과 AND 다). 그 사실을 같은 실행으로 잰다.
+        {
             let mut o = obs(passed, Some(true));
-            o.idle_quiet = quiet;
+            o.idle_quiet = Some(false);
             assert_eq!(
                 gate_pending_recheck(cys::readiness::judge(&o)),
                 GateRecheck::NoEvidence,
-                "quiet={quiet:?}: 창 재료 없이 밸브가 채택으로 갔다(아직 그리는 화면에 주입)"
+                "아직 그리는 화면(quiet=Some(false))에 밸브가 채택으로 갔다"
+            );
+            o.idle_quiet = None;
+            let adopted = gate_pending_recheck(cys::readiness::judge(&o));
+            assert_eq!(
+                adopted,
+                GateRecheck::Adopt(cys::readiness::Evidence::Valve),
+                "구 데몬(quiet 부재) 좌석의 재관측이 영구히 채택되지 않는다(성찰 R8 회귀 · 노드 0)"
+            );
+            assert_eq!(
+                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None),
+                GateRecheck::CarryUnproven,
+                "이월 벨트가 구 데몬 결측에서 열렸다 — 재도색 중 프레임에 붙여넣기 + Return 이 나간다"
             );
         }
         // ②″ 잘린 면책 창(커서=No, exit · 코퍼스 식별 불가)은 재관측에서도 보류다 — 채택 Return 이 좌석을 죽인다.

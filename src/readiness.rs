@@ -1843,11 +1843,48 @@ fn positive_evidence(o: &Observed) -> Option<Evidence> {
             //   거짓이므로 밸브가 열릴 이유가 없다. 그래서 `time_fallback_reached ∧ idle_quiet==Some(true)`
             //   를 AND 로 더한다 — 판정 조건이 **조여지는** 방향이고, 근거는 여전히 화면 텍스트가 아닌
             //   벽시계·데몬 회계(`quiet_secs`)다(B4 오탐 방향·화면 무의존 계약 무변).
-            //   `idle_quiet==None`(구 데몬 · 미관측)은 '부재 ≠ 부정' — 밸브는 닫히고 마커·시간 폴백
-            //   경로만 남는다. 롤백(`legacy_v1`)은 종전 밸브(창 없음)로 그대로 되돌린다(새 노브 0).
+            //   롤백(`legacy_v1`)은 종전 밸브(창 없음)로 그대로 되돌린다(새 노브 0).
             //   비용: 마커 델타 경로(정상 claude 부트)는 무변 · 밸브 단독 경로는 최대 +`quiet` 초 지연.
-            let valve_window_ok =
-                o.legacy_v1 || (o.time_fallback_reached && o.idle_quiet == Some(true));
+            //
+            // 【★0.14.31 · 성찰 R8 — `quiet` 계측이 **구조적으로 없는** 데몬】 이 자리에는 종전에
+            //   "`idle_quiet==None`(구 데몬 · 미관측)은 '부재 ≠ 부정' — 밸브는 닫힌다" 가 적혀 있었다.
+            //   그 규율 자체는 옳지만 **여기서는 적용이 틀렸다**: `quiet_secs` 는 cysd 0.14.31 이 신설한
+            //   키라 cysd 0.14.30 좌석에서는 `idle_quiet` 가 **부트 내내** `None` 이다. 즉 그 항을
+            //   요구하는 것은 그 좌석에서 밸브를 **삭제**하는 것과 같고, 삭제는 보수적 선택이 아니라
+            //   **다른 실패**다 — 밸브가 존재하는 이유가 바로 "델타 가정이 어떤 벤더/데몬 버전에서
+            //   깨져도 살아 있는 pane 이 전부 닫히는 방향으로 가지 않게" 하는 영구 오부정 차단이다.
+            //   남는 경로도 없다: 마커 화면 폴백([`Evidence::MarkerScreen`])은 `tail_ok`
+            //   (`tail_is_shell_prompt == Some(false)`)를 요구하는데 **라이브 claude 의 화면 꼬리는
+            //   `❯`** 라 그 술어가 참이 되지 않는다. 귀결은 그 좌석에 역할 디렉티브가 영원히 들어가지
+            //   않는 것(노드 0 · 고아 좌석)이고, `CYS_GATE_PENDING_CLOSE=1` 기계에서는 그 보류가
+            //   `LaunchFailed` 로 강등되어 **모든 pane 사망**까지 간다(§7 부트체인 재난표).
+            //
+            //   그래서 `None` 일 때는 **quiet 항 없이 시간 폴백만으로 창을 연다**. 미화하지 않고 적는다:
+            //   이것은 미관측을 판정에서 뺀 것이 아니라 **그 항의 통과를 허용한 것**이고, 확인된 정적
+            //   (`Some(true)`)과 같은 안전성을 갖지 않는다(codex 설계 검토 Q1·Q2). 받아들이는 위험은
+            //   하나다 — **부트 예산을 전부 쓰고도 아직 그리는 중인 화면**(느린 로딩·스피너)에 밸브가
+            //   열린다. 신형 데몬은 그 화면에서 `Some(false)` 를 내므로 H-1 의 본체(정적 요구)는 그대로
+            //   살아 있고, 노출은 ⓐ 구 데몬 좌석 전체와 ⓑ 신형 데몬에서 `quiet_secs` 가 한 틱 빠지거나
+            //   비수치인 경우로 한정된다(ⓑ 는 `idle_quiet_from` 이 NaN/∞ 를 `None` 으로 접기 때문에
+            //   생기는 잔여 — 그 정규화는 `idle_quiet_from_folds_missing_and_non_finite_to_unobserved`
+            //   가 박제한다). §3-3(막는 쪽으로만 틀린다)과 §7 재난의 우선순위는 이렇게 갈린다:
+            //   §3-3 은 **판정할 재료가 있을 때** 모호함을 보류로 접으라는 규율이고, 재료가 구조적으로
+            //   없는 축을 계속 요구하는 것은 보류가 아니라 §7 의 재난(영구 오부정 · 모든 pane 사망)이다.
+            //
+            //   `None` 에서도 살아 있는 벨트: ⓐ `agent_alive == Some(true)`(커널 사실) ·
+            //   ⓑ `bare_shell == Some(false)`(화면에 TUI 렌더 증거 — 맨 셸이면 여전히 닫힌다) ·
+            //   ⓒ `time_fallback_reached`(부트 예산 **전량** 소진 — 감사 에러 4 의 +9.1s 조기 발화는
+            //   이 항이 막는다) · ⓓ [`judge`] 의 공통 거부 둘(관문 코퍼스 식별 · 코퍼스 밖 모달 어휘).
+            //   ⓒ 만으로 R8 이 닫히지 않는 이유도 같은 자리에 적어 둔다: `CYS_GATE_PENDING_CLOSE`
+            //   강등을 거부하는 처방(cys.rs 소유)은 '모든 pane 사망' 만 막고 **노드 0 은 그대로 남긴다**
+            //   — 그것은 피해 완화이지 준비 판정의 영구 오부정 수리가 아니다(codex 설계 검토 Q3).
+            let valve_window_ok = o.legacy_v1
+                || match o.idle_quiet {
+                    Some(quiet) => o.time_fallback_reached && quiet,
+                    // 계측 부재 → 시간 폴백 단독으로 진행한다(영구 보류 방지). 위 문단이 근거이고
+                    // 대가다. 이 팔이 사라지면 구 데몬 좌석의 밸브가 통째로 죽는다.
+                    None => o.time_fallback_reached,
+                };
             if o.agent_alive == Some(true) && bare_shell_ok && valve_window_ok {
                 return Some(Evidence::Valve);
             }
@@ -4329,10 +4366,17 @@ mod tests {
         o.time_fallback_reached = false;
         o.idle_quiet = Some(true);
         assert_eq!(judge(&o), Verdict::NotYet, "시간 폴백 전에 밸브가 열렸다(감사 에러 4 재현)");
-        // 폴백 도달 · 미관측(구 데몬) — '부재 ≠ 부정'.
+        // 폴백 도달 · 미관측(구 데몬 `quiet_secs` 부재) — ★성찰 R8 이 여기를 **뒤집었다**.
+        //   종전 기대값은 `NotYet`('부재 ≠ 부정')이었는데, 그 축은 cysd 0.14.30 좌석에서 **부트 내내**
+        //   부재라 요구가 곧 밸브 삭제였다(영구 오부정 → 노드 0 → `CYS_GATE_PENDING_CLOSE=1` 에서
+        //   모든 pane 사망). 이제 quiet 항 없이 시간 폴백 단독으로 연다.
         o.time_fallback_reached = true;
         o.idle_quiet = None;
-        assert_eq!(judge(&o), Verdict::NotYet, "quiet 미관측인데 밸브가 열렸다");
+        assert_eq!(
+            judge(&o),
+            Verdict::Ready { evidence: Evidence::Valve },
+            "구 데몬 좌석에서 밸브가 영구히 닫힌다(R8 회귀 · 그 좌석은 디렉티브를 영영 못 받는다)"
+        );
         // 폴백 도달 · 아직 출력 중.
         o.idle_quiet = Some(false);
         assert_eq!(judge(&o), Verdict::NotYet, "출력이 흐르는 화면에 밸브가 열렸다");
@@ -4344,6 +4388,114 @@ mod tests {
         o.idle_quiet = None;
         o.legacy_v1 = true;
         assert_eq!(judge(&o), Verdict::Ready { evidence: Evidence::Valve }, "롤백이 종전 밸브를 되살리지 않는다");
+    }
+
+    /// ★(0.14.31 · 성찰 R8) **`quiet` 계측이 구조적으로 없는 데몬에서 밸브가 영구히 죽지 않는다.**
+    ///
+    /// 【사슬】 `quiet_secs` 는 cysd 0.14.31 이 신설한 키다. cysd 0.14.30 좌석에서는 `idle_quiet` 가
+    /// **부트 내내** `None` 이므로 종전 창(`time_fallback_reached ∧ idle_quiet==Some(true)`)이 영구
+    /// 거짓이고, 그러면 밸브가 그 좌석에서 통째로 삭제된 것과 같다. 남는 경로도 없다 — 마커 화면
+    /// 폴백([`Evidence::MarkerScreen`])은 `tail_is_shell_prompt==Some(false)` 를 요구하는데 **라이브
+    /// claude 의 화면 꼬리는 `❯`**(= 셸 프롬프트 끝문자 4종의 하나)라 그 술어가 참이 되지 않는다.
+    /// 귀결: 그 좌석에 역할 디렉티브가 영영 안 들어간다(노드 0) · `CYS_GATE_PENDING_CLOSE=1` 기계에서는
+    /// 그 보류가 `LaunchFailed` 로 강등돼 모든 pane 사망(§7 부트체인 재난표).
+    ///
+    /// 【무엇을 잰다 — codex 설계 검토 Q5 의 최소 집합】 ⓐ **결함 실재**(이 관측에서 종전 창 식이
+    /// 거짓이고 마커 두 경로도 닫혀 있다 — 다른 경로가 결함을 가리면 이 검체는 공허하다) ⓑ 수리
+    /// (미관측 + 예산 소진 → `Valve`) ⓒ **H-1 시간 보호**(예산 전에는 quiet 세 값 전부 닫힘 — 감사
+    /// 에러 4 의 +9.1s 조기 발화) ⓓ **H-1 정적 보호**(예산 후에도 `Some(false)` 는 닫힘 = 신형 데몬에서
+    /// 본체 보존 · `Some(true)` 는 열림) ⓔ 나머지 필수 조건 불변(커널 사실 · 맨 셸 축 — 미관측이 다른
+    /// 축까지 열지 않는다) ⓕ [`judge`] 의 공통 거부 둘 보존(관문 코퍼스 · 미등재 모달) ⓖ 롤백 불변.
+    /// `quiet_secs` → `idle_quiet` 정규화(부재·NaN·∞ → `None`)의 대조군은
+    /// `idle_quiet_from_folds_missing_and_non_finite_to_unobserved` 가 따로 박제한다(같은 모듈).
+    #[test]
+    fn reflect_r8_missing_quiet_axis_does_not_permanently_disarm_the_valve() {
+        let gates = first_run_gates::builtin();
+        let live = fixtures::LIVE_TUI_AT_PROMPT;
+        // 델타 가정이 깨진 **살아 있는 정상 pane** — 밸브가 지키는 바로 그 부류(델타 빈 문자열).
+        let mk = |quiet: Option<bool>, fallback: bool| {
+            let mut o = obs(live, "", &gates);
+            o.agent_alive = Some(true);
+            o.bare_shell = Some(false);
+            // 프로덕션과 **같은 값** — 라이브 claude 의 꼬리는 `❯` 라 이 술어가 참이다.
+            o.tail_is_shell_prompt = Some(live.trim_end().ends_with('❯'));
+            o.time_fallback_reached = fallback;
+            o.idle_quiet = quiet;
+            o
+        };
+
+        // ⓐ 전제(계측 타당성) — 마커 두 경로가 닫혀 있어 밸브가 유일한 통과 경로다.
+        let o = mk(None, true);
+        assert_eq!(o.tail_is_shell_prompt, Some(true), "전제 붕괴: 라이브 꼬리가 `❯` 가 아니면 마커 화면 폴백이 결함을 가린다");
+        assert!(!o.delta.contains('❯'), "전제 붕괴: 델타에 마커가 있으면 MarkerDelta 가 먼저 연다");
+        assert!(
+            first_run_gates::identify(&gates, live).is_none() && modal_signature(live).is_none(),
+            "전제 붕괴: 유휴 프롬프트가 관문/모달로 읽히면 공통 거부가 먼저 접는다"
+        );
+        // ⓐ′ 결함 실재 — 종전 창 식은 이 관측에서 거짓이었고, 그러면 판정은 `NotYet`(영구) 이었다.
+        assert!(
+            !(o.time_fallback_reached && o.idle_quiet == Some(true)),
+            "계측 무효: 종전 창이 이미 열려 있으면 이 검체는 아무것도 재지 못한다"
+        );
+
+        // ⓑ 수리 — 구 데몬 좌석도 예산을 다 쓰면 밸브가 연다.
+        assert_eq!(
+            judge(&o),
+            Verdict::Ready { evidence: Evidence::Valve },
+            "구 데몬(quiet 미관측) 좌석의 밸브가 영구히 닫혔다 — 그 좌석은 디렉티브를 영영 못 받는다"
+        );
+
+        // ⓒ H-1 시간 보호 — 예산 **전**에는 quiet 세 값 모두 닫힌다(미관측이 시간 축을 열지 않는다).
+        for quiet in [None, Some(false), Some(true)] {
+            assert_eq!(judge(&mk(quiet, false)), Verdict::NotYet, "예산 전에 밸브가 열렸다(quiet={quiet:?})");
+        }
+
+        // ⓓ H-1 정적 보호 — 예산 후에도 '아직 출력 중' 은 닫힌다(신형 데몬에서 H-1 본체가 산다).
+        assert_eq!(judge(&mk(Some(false), true)), Verdict::NotYet, "출력이 흐르는 화면에 밸브가 열렸다");
+        assert_eq!(judge(&mk(Some(true), true)), Verdict::Ready { evidence: Evidence::Valve });
+
+        // ⓔ 나머지 필수 조건 — 미관측이 **다른 축까지** 열지는 않는다.
+        for alive in [None, Some(false)] {
+            let mut bad = mk(None, true);
+            bad.agent_alive = alive;
+            assert_eq!(judge(&bad), Verdict::NotYet, "커널 사실 없이 밸브가 열렸다(agent_alive={alive:?})");
+        }
+        for bare in [None, Some(true)] {
+            let mut bad = mk(None, true);
+            bad.bare_shell = bare;
+            assert_eq!(judge(&bad), Verdict::NotYet, "맨 셸/미관측 화면에 밸브가 열렸다(bare_shell={bare:?})");
+        }
+
+        // ⓕ 공통 거부 둘 — 밸브 창이 열린 **같은 관측**이어도 관문·모달 화면은 보류다.
+        let trust_id = first_run_gates::identify(&gates, fixtures::FOLDER_TRUST)
+            .expect("전제: 코퍼스가 폴더신뢰를 식별한다")
+            .id
+            .clone();
+        let mut gated = mk(None, true);
+        gated.screen = fixtures::FOLDER_TRUST;
+        assert!(
+            held_as(&judge(&gated), &trust_id),
+            "quiet 미관측이 관문 화면까지 ready 로 만들었다(그 주입 Return 이 좌석을 죽인다): {:?}",
+            judge(&gated)
+        );
+        let clipped = clip_tail(fixtures::FOLDER_TRUST, 3);
+        assert!(first_run_gates::identify(&gates, &clipped).is_none(), "전제 붕괴: 잘린 관문을 코퍼스가 식별한다");
+        let mut modal = mk(None, true);
+        modal.screen = &clipped;
+        assert!(
+            held_as(&judge(&modal), MODAL_UNKNOWN_ID),
+            "quiet 미관측이 미등재 모달까지 ready 로 만들었다: {:?}",
+            judge(&modal)
+        );
+
+        // ⓖ 롤백 — 종전 밸브(창 없음)는 그대로다(새 노브 0 · 반쪽 롤백 없음).
+        let mut rolled = mk(Some(false), false);
+        rolled.legacy_v1 = true;
+        assert_eq!(
+            judge(&rolled),
+            Verdict::Ready { evidence: Evidence::Valve },
+            "롤백이 종전 밸브를 되살리지 않는다"
+        );
     }
 
     /// 정적 로딩 배너(아직 `❯` 없음) — 예산 전·출력 중에는 보류. 예산 소진 + 정적이면 밸브가 연다:
@@ -4363,8 +4515,18 @@ mod tests {
         o.time_fallback_reached = true;
         o.idle_quiet = Some(false);
         assert_eq!(judge(&o), Verdict::NotYet, "배너가 아직 그려지는데 ready");
+        // ★성찰 R8 이 명시적으로 **받아들인 잔여**(codex 설계 검토 Q1): 구 데몬에서는 이 배너가 아직
+        //   그려지는 중인지 알 방법이 없고, 그것을 이유로 밸브를 닫으면 그 좌석의 밸브가 통째로 죽는다.
+        //   예산 전(`time_fallback_reached=false`)에는 여전히 닫히는 것이 이 잔여의 상한이다.
         o.idle_quiet = None;
-        assert_eq!(judge(&o), Verdict::NotYet, "구 데몬(quiet 미관측)에서 밸브가 열렸다");
+        assert_eq!(
+            judge(&o),
+            Verdict::Ready { evidence: Evidence::Valve },
+            "구 데몬(quiet 미관측)에서 예산 소진 뒤에도 밸브가 닫혔다(R8 회귀)"
+        );
+        o.time_fallback_reached = false;
+        assert_eq!(judge(&o), Verdict::NotYet, "예산 전인데 quiet 미관측만으로 밸브가 열렸다(잔여의 상한이 깨졌다)");
+        o.time_fallback_reached = true;
         o.idle_quiet = Some(true);
         assert_eq!(judge(&o), Verdict::Ready { evidence: Evidence::Valve }, "정적·예산 소진 배너는 밸브의 대상이다");
     }
@@ -4393,9 +4555,12 @@ mod tests {
             held_as(&re(&clipped_disclaimer, Some(true)), MODAL_UNKNOWN_ID),
             "잘린 면책 창(커서=No, exit)이 재관측에서 채택됐다 — 그 주입 Return 이 좌석을 죽인다"
         );
-        // 사람이 통과시킨 뒤 — 프롬프트 화면. quiet 가 있어야 밸브가 열린다(없으면 보류 유지 · 파괴 0).
+        // 사람이 통과시킨 뒤 — 프롬프트 화면. 재관측은 `time_fallback_reached=true` 로 들어오므로
+        // 정적이면 열리고, **출력이 흐르는 중**(`Some(false)`)이면 닫힌다. 미관측(`None` · 구 데몬)은
+        // ★성찰 R8 이후 열린다 — 그러지 않으면 구 데몬 좌석의 관문 보류가 영원히 재관측을 통과하지
+        // 못한다(사람이 관문을 통과시켜 줬는데도 좌석이 영영 ready 가 되지 않는 자리다).
         assert_eq!(re(fixtures::LIVE_TUI_AT_PROMPT, Some(true)), Verdict::Ready { evidence: Evidence::Valve });
-        assert_eq!(re(fixtures::LIVE_TUI_AT_PROMPT, None), Verdict::NotYet);
+        assert_eq!(re(fixtures::LIVE_TUI_AT_PROMPT, None), Verdict::Ready { evidence: Evidence::Valve });
         assert_eq!(re(fixtures::LIVE_TUI_AT_PROMPT, Some(false)), Verdict::NotYet);
     }
 
