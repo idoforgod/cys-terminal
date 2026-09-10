@@ -301,6 +301,48 @@ try:
           len(rec3.get("progress") or []) == 1 and rec3.get("attempts") == 2, json.dumps(rec3)[:200])
     check("6g 보조 저장이 실패했으므로 래치는 서지 않는다(다음 호출이 다시 시도)",
           rec3.get("ceiling_recommended") is not True, repr(rec3.get("ceiling_recommended")))
+    # ── 7. ★N1 잔여(통합 2026-09-10) — **learn 쪽 미러도 같은 규율이어야 한다** ────────────
+    #    RSI 는 rid 단위 병합 + 필드 소유권으로 고쳐졌지만 `javis_learn._save_state` 의
+    #    세션 모드 미러는 여전히 통째 치환이었다. 그러면 RSI 가 체크포인트를 세운 직후 learn 이
+    #    저장하는 순간 그 라운드의 `checkpoint_sha`·`ref`·`progress` 가 **다시 사라진다**
+    #    (rollback 앵커 소실 = 되돌리기 사고 방향 · §7 위험 ③). 두 구현의 파리티를 잰다.
+    import javis_learn as L                                  # noqa: E402
+    mroot = tempfile.mkdtemp(prefix="refl-learn-mirror-", dir=_ROOT)
+    mp = os.path.join(mroot, "state.json")
+    # RSI 가 먼저 쓴 미러(그 라운드의 계측 + RSI 만 아는 라운드 하나)
+    write_json(mp, {"rounds": {
+        "H1": {"checkpoint_sha": "abc123", "ref": "refs/x", "progress": [{"score": 0.5}],
+               "flat_streak": 2, "stop_reason": "continue", "rsi_attempts": 3},
+        "ONLY_RSI": {"checkpoint_sha": "zzz"},
+    }, "discovery": {"n": 7}})
+    # learn 이 같은 rid 에 lifecycle 을 얹는다
+    L._mirror_state(mp, {"rounds": {"H1": {"verdict": "pass", "stored": ["a"], "attempts": 1}},
+                         "discovery": {"n": 9}})
+    got = read_json(mp)
+    h1 = got["rounds"]["H1"]
+    check("7a learn 미러가 RSI 소유 필드를 보존한다(checkpoint_sha·ref·progress)",
+          h1.get("checkpoint_sha") == "abc123" and h1.get("ref") == "refs/x"
+          and len(h1.get("progress") or []) == 1, json.dumps(h1)[:200])
+    check("7b RSI 계측 나머지도 보존한다(flat_streak·stop_reason·rsi_attempts)",
+          h1.get("flat_streak") == 2 and h1.get("stop_reason") == "continue"
+          and h1.get("rsi_attempts") == 3, json.dumps(h1)[:200])
+    check("7c learn 자신의 lifecycle 은 실제로 기록된다(무접촉으로 도망가지 않는다)",
+          h1.get("verdict") == "pass" and h1.get("stored") == ["a"] and h1.get("attempts") == 1,
+          json.dumps(h1)[:200])
+    check("7d RSI 만 아는 라운드는 사라지지 않는다",
+          (got["rounds"].get("ONLY_RSI") or {}).get("checkpoint_sha") == "zzz",
+          json.dumps(got["rounds"])[:200])
+    check("7e 최상위는 learn 소유다(discovery 갱신 도달)", got.get("discovery") == {"n": 9},
+          repr(got.get("discovery")))
+    # 판독 불가 = 무접촉(빈 상태로 접어 저장하면 그 자체가 새 전손 경로다)
+    open(mp, "w", encoding="utf-8").write("{ not json")
+    L._mirror_state(mp, {"rounds": {"H1": {"verdict": "pass"}}})
+    check("7f 미러를 읽지 못하면 쓰지 않는다(RSI ⓓ 와 같은 규율)",
+          open(mp, encoding="utf-8").read() == "{ not json", "손상 미러를 덮었다")
+    # 두 소유권 표가 서로를 덮지 않는가(교집합 0 이 계약이다)
+    check("7g 소유권 표의 교집합이 0 이다",
+          not (set(L.RSI_OWNED_ROUND_KEYS) & set(R.LEARN_OWNED_ROUND_KEYS)),
+          repr(sorted(set(L.RSI_OWNED_ROUND_KEYS) & set(R.LEARN_OWNED_ROUND_KEYS))))
 finally:
     shutil.rmtree(_ROOT, ignore_errors=True)
 

@@ -4906,24 +4906,41 @@ pub(crate) fn prompt_boundary_verdict(
 /// 두 어댑터 모두 `prompt_unknown` 영구 보류였다. 부트 readiness 마커는 건드리지 않는다(부트 모달
 /// 픽스처 없이 boot 판정을 넓히지 않는다 — codex 설계 검토 Q5).
 ///
-/// 해소 순서: 디스크 `prompt_marker` → 임베드 `prompt_marker`(`merged_approval_patterns` 와 같은
-/// 디스크 우선 규약 · 설치본 agents.json 은 사용자 소유라 신 키가 없어도 임베드 값이 즉시 닿는다).
-/// 빈 문자열은 **미정의와 동일**(readiness::marker_of).
+/// 해소 순서: 디스크 `prompt_marker` → 임베드 `prompt_marker` → 디스크 `ready_marker` → 임베드
+/// `ready_marker`(`merged_approval_patterns` 와 같은 디스크 우선 규약 · 설치본 agents.json 은 사용자
+/// 소유라 신 키가 없어도 임베드 값이 즉시 닿는다). 빈 문자열은 **미정의와 동일**(readiness::marker_of).
 ///
-/// ★(0.14.31 · 성찰 R6 · 통합 2026-09-10) `ready_marker` **폴백은 없다**. 종전에 이 데몬 사본만
-/// 폴백을 남기고 있었다 — `cysjavis-pack/agents.json` 의 `_doc` 과 CLI 사본
-/// (`cys.rs::composer_marker_of`)은 이미 폴백 0 이라, **셋 중 하나만** 어긋난 상태였다.
-/// 그 어긋남의 귀결: 오너가 `{"ready_marker": ">"}` 만 선언한 어댑터에서 `>` 가 composer 글리프로
-/// 채택되고, 에이전트가 죽은 뒤의 **맨 셸**(`user@mac ~ > ` · PS2 `> `)이 프롬프트 경계로 읽혀
-/// observe_prompt → Ready → 큐 본문 + Return 이 **셸에 꽂힌다**. gemini(`ready_marker` =
-/// `? for shortcuts`)도 상태줄 문면이 composer 글리프로 해소됐다. 출처로 가른다 — 선언이 없으면
-/// 마커도 없고, 마커가 없는 어댑터는 마커 축 대신 출력 정적 축으로 판정된다(`gate_carry_ok`).
+/// ★(통합 2026-09-10 · 성찰 R6 **기각** — 실측이 전제를 뒤집었다) R6 은 이 폴백을 **지우라**고
+/// 했다. 근거는 "CLI 사본(`cys.rs::composer_marker_of`)과 `agents.json` `_doc` 은 이미 폴백 0 이라
+/// 데몬 하나만 어긋나 있다" 였고 검체 예상은 "gemini 기존 검체 **불변**" 이었다. 실제로 지우고
+/// 재보니 그 예상이 틀렸다:
+///   `cargo test --bin cysd` →
+///   `governance::tests::wp5_r2_gemini_prompt_marker_is_not_enabled_without_a_measured_frame`
+///   FAILED (pending 0, 기대 1) — **gemini 좌석이 보류에서 배달로 뒤집혔다.**
+/// 기제: 마커가 `None` 이 되면 그 좌석은 마커 축을 잃고 **맨 셸용 quiet 폴백**
+/// ([`no_marker_gate`] + 출력 정적)으로 떨어진다. 즉 이 자리에서 폴백을 지우는 것은 판정을
+/// **조이는** 변경이 아니라 **여는** 변경이다(fail-closed → fail-open · §3-3 의 반대 방향).
+/// R6 이 막으려던 시나리오(`ready_marker` 만 선언한 어댑터 + 맨 셸 `> `)도 닫히지 않는다 —
+/// 폴백을 지워도 그 좌석은 quiet 폴백으로 **여전히 배달**된다(경로만 바뀐다).
+///
+/// 그래서 **폴백을 유지한다.** 두 사본이 다른 것은 소비자가 다르기 때문이다:
+///   · CLI `composer_marker_of` → 부트 관문 증거 **이월**(`gate_carry_ok`). 마커 부재는 그 자리에서
+///     '출력 정적 축' 이라는 **정의된 약한 등급**으로 내려간다(보류 방향).
+///   · 데몬 `merged_prompt_marker` → 큐 **배달 자격**. 마커 부재는 맨 셸 quiet 폴백(주입 방향)이다.
+/// 같은 결측이 한쪽에선 조이고 한쪽에선 연다 — 그래서 두 사본을 같은 규칙으로 맞추는 것 자체가
+/// 안전 방향이 아니다. 해소는 소비자별로 판단해야 한다(오너 결정 대상 · merge-notes 참조).
+/// 검체: [`merge_residue_tests::r6_refuted_daemon_keeps_the_ready_marker_fallback`].
 fn merged_prompt_marker(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,
 ) -> Option<String> {
-    for (v, key) in [(disk, "prompt_marker"), (embed, "prompt_marker")] {
+    for (v, key) in [
+        (disk, "prompt_marker"),
+        (embed, "prompt_marker"),
+        (disk, "ready_marker"),
+        (embed, "ready_marker"),
+    ] {
         if let Some(m) = v
             .get(agent)
             .and_then(|a| a.get(key))
@@ -18434,56 +18451,61 @@ mod reflect_queue_tests {
 mod merge_residue_tests {
     use super::*;
 
-    /// ★성찰 R6 — composer 글리프 해소에 `ready_marker` **폴백은 없다**.
+    /// ★성찰 R6 **기각**(통합 2026-09-10) — 데몬 사본은 `ready_marker` 폴백을 **유지한다**.
     ///
-    /// 실패 방향: 폴백이 있으면 `ready_marker` 만 선언한 어댑터에서 상태줄 문면·1글자 `>` 가
-    /// composer 글리프로 채택되고, 에이전트 사후의 **맨 셸**(`user@mac ~ > `)이 프롬프트 경계로
-    /// 읽혀 큐 본문 + Return 이 셸에 꽂힌다(부트체인 치명 — 노드가 셸에 명령을 친다).
-    /// 음성 대조를 함께 둔다: 폴백이 없다고 해서 `prompt_marker` 선언 좌석이 굳으면 안 된다.
+    /// R6 의 처방은 "이 폴백을 지워라 · CLI 사본과 팩 문서는 이미 폴백 0 이고 gemini 기존 검체는
+    /// 불변" 이었다. 지우고 실측하니 그 예상이 틀렸다 —
+    /// `wp5_r2_gemini_prompt_marker_is_not_enabled_without_a_measured_frame` 가 붉었고
+    /// (pending 0, 기대 1) gemini 좌석이 **보류에서 배달로 뒤집혔다**. 마커가 `None` 이 되면
+    /// 그 좌석은 마커 축을 잃고 맨 셸용 quiet 폴백(`no_marker_gate` + 출력 정적)으로 떨어지기
+    /// 때문이다. 이 자리에서 폴백을 지우는 것은 조이는 변경이 아니라 **여는** 변경이다.
+    ///
+    /// 이 검체가 재는 것: ⓐ 폴백이 산다 ⓑ 그런데도 **디스크·임베드의 `prompt_marker` 가 언제나
+    /// 먼저**다(우선순위가 뒤집히면 claude 처럼 두 값이 같은 어댑터에서 조용히 넘어간다)
+    /// ⓒ CLI 사본은 여전히 폴백 0 이다 — 두 사본의 **차이 자체가 계약**이고, 그 차이가 누군가
+    /// '정리' 로 지워지지 않도록 여기서 못박는다(소비자가 다르면 같은 결측의 안전 방향이 다르다).
     #[test]
-    fn r6_ready_marker_is_never_a_composer_glyph_fallback() {
+    fn r6_refuted_daemon_keeps_the_ready_marker_fallback() {
         let embed = serde_json::json!({
             "myagent": {"ready_marker": ">"},
             "gemini":  {"ready_marker": "? for shortcuts"},
             "claude":  {"prompt_marker": "❯", "ready_marker": "❯"},
+            "grok":    {},
         });
         let disk = serde_json::json!({});
 
-        // ① ready_marker 만 있는 어댑터 = 마커 없음(그 좌석은 출력 정적 축으로 판정된다).
-        assert_eq!(
-            merged_prompt_marker(&disk, &embed, "myagent"),
-            None,
-            "ready_marker 가 composer 글리프로 새어나갔다 — 맨 셸 PS2 `> ` 가 프롬프트 경계가 된다"
-        );
+        // ⓐ 폴백은 산다 — 지우면 그 좌석이 **맨 셸 quiet 폴백**으로 떨어져 배달이 열린다.
+        assert_eq!(merged_prompt_marker(&disk, &embed, "myagent"), Some(">".into()));
         assert_eq!(
             merged_prompt_marker(&disk, &embed, "gemini"),
-            None,
-            "상태줄 문면(`? for shortcuts`)이 composer 글리프로 해소됐다"
+            Some("? for shortcuts".into()),
+            "gemini 폴백을 지우면 `wp5_r2_gemini_…` 가 보류에서 배달로 뒤집힌다(실측)"
         );
-        // ② 음성 대조 — 선언이 있으면 그대로 쓴다(과잉 보류 0).
-        assert_eq!(merged_prompt_marker(&disk, &embed, "claude"), Some("❯".into()));
-        // ③ 디스크 우선 규약은 그대로.
+        // ⓑ 그래도 prompt_marker 가 먼저다(우선순위 회귀 방지).
         let disk2 = serde_json::json!({"claude": {"prompt_marker": "▶"}});
         assert_eq!(merged_prompt_marker(&disk2, &embed, "claude"), Some("▶".into()));
-        // ④ 빈 문자열은 미정의와 같다.
-        let disk3 = serde_json::json!({"claude": {"prompt_marker": ""}});
-        assert_eq!(merged_prompt_marker(&disk3, &embed, "claude"), Some("❯".into()));
+        assert_eq!(merged_prompt_marker(&disk, &embed, "claude"), Some("❯".into()));
+        let disk3 = serde_json::json!({"gemini": {"prompt_marker": ">"}});
+        assert_eq!(
+            merged_prompt_marker(&disk3, &embed, "gemini"),
+            Some(">".into()),
+            "운영자 선언이 폴백보다 뒤로 밀렸다 — 가용성 대조군(wp5_r2 ⓒ)이 죽는다"
+        );
+        // 마커가 하나도 없는 어댑터는 종전대로 `None`(맨 셸 quiet 폴백 등급) — grok 이 그 자리다.
+        assert_eq!(merged_prompt_marker(&disk, &embed, "grok"), None);
 
-        // ⑤ 세 사본의 규약이 하나여야 한다 — CLI 사본(`cys.rs::composer_marker_of`)과
-        //    팩 문서(`agents.json` `_doc`)는 이미 폴백 0 이다. 소스 대조로 못박는다.
+        // ⓒ CLI 사본은 폴백 0 이다 — **차이 자체가 계약**이라 소스 대조로 못박는다.
         let cli = include_str!("../cys.rs");
         let i = cli.find("fn composer_marker_of(").expect("CLI 사본이 없다");
-        let body = &cli[i..i + 240];
         assert!(
-            !body.contains("ready_marker"),
-            "CLI 사본에 ready_marker 폴백이 되살아났다 — 세 사본이 갈리면 데몬만 다른 좌석을 만든다"
+            !cli[i..i + 240].contains("ready_marker"),
+            "CLI 사본에 폴백이 생겼다 — 부트 이월 축은 결측의 안전 방향이 반대다(조임 · 보류)"
         );
         let this = include_str!("governance.rs");
         let j = this.find("fn merged_prompt_marker(").expect("데몬 사본이 없다");
-        let dbody = &this[j..j + 260];
         assert!(
-            !dbody.contains("ready_marker"),
-            "데몬 사본에 ready_marker 폴백이 되살아났다(R6 회귀)"
+            this[j..j + 400].contains("ready_marker"),
+            "데몬 폴백이 사라졌다 — 그 삭제는 배달을 **여는** 방향이다(R6 기각 근거 · 실측)"
         );
     }
 }

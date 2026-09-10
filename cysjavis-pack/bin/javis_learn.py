@@ -433,12 +433,72 @@ def _save_state(state):
     if _is_canonical():
         return  # ★P0-2 canonical 모드 — state.json 미러 금지(데몬 단일 writer·전파는 _push_checkpoint)
     try:  # 세션 모드 데몬 가독 미러(기존 표면) — 실패해도 사설 진실은 이미 기록됨.
-        mp = os.path.join(d, "state.json")
-        mtmp = mp + ".tmp"
-        open(mtmp, "w", encoding="utf-8").write(json.dumps(state, ensure_ascii=False, indent=2))
-        os.replace(mtmp, mp)
+        _mirror_state(os.path.join(d, "state.json"), state)
     except OSError:
         pass
+
+
+# ★성찰 N1(통합 2026-09-10) — 이 미러가 쓰는 `state.json` 은 **두 주인이 나눠 갖는다**:
+#   lifecycle(평가 결과)은 여기(`javis_learn`)가, RSI 계측은 `javis_rsi` 가 소유한다.
+#   `learn evaluate` 가 RSI 에 **같은 `--round`** 를 넘기므로 라운드 id 공간이 실제로 겹친다.
+#   RSI 쪽은 이미 이 규율로 고쳐졌지만(`javis_rsi._mirror_learn_state` · rid 단위 병합 + 필드
+#   소유권) 이쪽은 여전히 통째 치환이었다 — 그래서 RSI 가 체크포인트를 세운 직후 learn 이
+#   저장하면 그 라운드의 `checkpoint_sha`·`ref`·`progress` 가 **다시 사라졌다**(rollback 앵커
+#   소실 = 되돌리기 사고 방향 · §7 위험 ③). 두 구현은 같은 규율이어야 한다(파리티 검체 있음).
+RSI_OWNED_ROUND_KEYS = frozenset((
+    "checkpoint_sha", "ref", "baseline_score", "progress",
+    "rsi_attempts",           # RSI 의 시도수(개명본 — learn 의 `attempts` 와 다른 축이다)
+    "flat_streak", "stop_reason", "budget_unknown",
+    "ceiling_recommended", "ceiling_recommended_key",
+))
+
+
+def _mirror_merge(cur, state):
+    """미러 병합(순수) — rid 단위로 합치되 **RSI 소유 필드는 덮지도 지우지도 않는다**.
+
+    · `cur` 에만 있는 라운드(=RSI 만 아는 라운드)는 그대로 보존한다.
+    · 최상위 키는 이쪽이 소유한다(`discovery` 등) — RSI 미러는 그것을 보내지 않는다.
+    """
+    out = dict(cur) if isinstance(cur, dict) else {}
+    rounds_out = dict(out.get("rounds") or {}) if isinstance(out.get("rounds"), dict) else {}
+    mine = state.get("rounds") if isinstance(state, dict) else None
+    for rid, rec in (mine.items() if isinstance(mine, dict) else []):
+        base = rounds_out.get(rid)
+        base = dict(base) if isinstance(base, dict) else {}
+        if isinstance(rec, dict):
+            for k, v in rec.items():
+                if k in RSI_OWNED_ROUND_KEYS:
+                    continue              # 남의 필드는 덮지 않는다
+                base[k] = v
+        else:
+            base = rec
+        rounds_out[rid] = base
+    for k, v in (state.items() if isinstance(state, dict) else []):
+        if k != "rounds":
+            out[k] = v
+    out["rounds"] = rounds_out
+    return out
+
+
+def _mirror_state(mp, state):
+    """미러 1회 — 기존 파일을 **읽지 못하면 쓰지 않는다**(판독 실패를 빈 상태로 접고 저장하면
+    그 자체가 새 전손 경로다 · RSI 쪽 ⓓ 와 같은 규율)."""
+    cur = {}
+    if os.path.exists(mp):
+        try:
+            with open(mp, encoding="utf-8") as f:
+                cur = json.load(f)
+        except (OSError, ValueError) as e:
+            sys.stderr.write("[learn] 주의: 학습 미러를 읽지 못해 이번 미러를 건너뛴다(%s) — "
+                             "덮어쓰면 남의 라운드가 사라진다.\n" % e)
+            return
+        if not isinstance(cur, dict):
+            sys.stderr.write("[learn] 주의: 학습 미러가 객체가 아니다 — 이번 미러를 건너뛴다.\n")
+            return
+    mtmp = mp + ".tmp"
+    open(mtmp, "w", encoding="utf-8").write(
+        json.dumps(_mirror_merge(cur, state), ensure_ascii=False, indent=2))
+    os.replace(mtmp, mp)
 
 
 def _append_ledger(entry):

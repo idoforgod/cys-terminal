@@ -106,6 +106,10 @@ REGISTRATION_CONDITION_TOKENS = ("alert_route", "미등록", "등록 조건")
 ALERT_EVENTS = (
     "health.alert", "watchdog.*", "surface.exited", "context.threshold",
     "queue.starved", "queue.depth_high",
+    # ★(0.14.31 성찰 A9 · 통합 2026-09-10) 데몬 경보 엔진 접두. `alert_route::routable` 이
+    #   `ALERT_ENGINE_PREFIX`("alert.")를 라우팅 가능으로 열었다(crit 5종의 독자가 CSO 큐다).
+    #   지침이 그 사실을 적지 않으면 CSO 는 자기 inbox 로 오는 경보를 목록 밖으로 읽는다.
+    "alert.*",
 )
 ALERT_ROUTE_LITERALS = (
     "[alert] <이벤트명> surface:<id>", "5분 쿨다운", "시간당 20건", "300s",
@@ -2337,9 +2341,17 @@ class CsoDirectiveRevision(unittest.TestCase):
         self.assertEqual(wake, expected)
         # ★R3(codex F4): 종전 대조군은 **나열 순서까지** 문자열로 박아, 순서만 바꾸는 정당한 편집이
         # 붉어졌다. 이제 항목 하나를 순서와 무관하게 빼고/넣는다(집합 판정과 같은 층위).
-        dropped = self.body.replace("`queue.depth_high`·", "", 1)
-        if dropped == self.body:                       # 목록 끝에 있으면 앞의 구분자를 지운다
-            dropped = self.body.replace("·`queue.depth_high`", "", 1)
+        # ★(통합 2026-09-10) 그 치환을 **각성 목록 구간 안**에서만 한다. 종전엔 본문 전체의 첫
+        #   일치를 지웠는데, 같은 이름이 inbox 목록에도 있어 그쪽 구분자 배치가 바뀌면(A9 가
+        #   `alert.*` 를 더하며 그렇게 됐다) 대조군이 **엉뚱한 목록**을 건드려 붉어졌다 —
+        #   판정 대상이 아닌 곳을 바꾸는 대조군은 그 자체가 결함이다.
+        _wi = self.body.index(WAKE_LIST_START)
+        _wj = self.body.index(WAKE_LIST_END, _wi)
+        _seg = self.body[_wi:_wj]
+        _seg2 = _seg.replace("`queue.depth_high`·", "", 1)
+        if _seg2 == _seg:                              # 목록 끝에 있으면 앞의 구분자를 지운다
+            _seg2 = _seg.replace("·`queue.depth_high`", "", 1)
+        dropped = self.body[:_wi] + _seg2 + self.body[_wj:]
         self.assertNotEqual(dropped, self.body)
         self.assertEqual(event_names_between(dropped, WAKE_LIST_START, WAKE_LIST_END),
                          expected - {"queue.depth_high"})
