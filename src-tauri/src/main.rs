@@ -480,7 +480,7 @@ async fn send_input(
     // ★R5: 이 문안을 **UI 코드가 조립했는가**(전출 지시·재기동 명령·경로 삽입 = true) —
     // 사용자가 자판으로 친 실키(sendRaw/붙여넣기)는 false(미지정)다. 아래 본문 주석 참조.
     machine_origin: Option<bool>,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
     // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다.
     // queued=true(전출 복원 주입 등 후속 지시)는 사람 타이핑이 아니므로 human=false —
@@ -544,7 +544,12 @@ async fn send_input(
             params["operator_token"] = json!(t);
         }
     }
-    rpc_on(&sock, "surface.send_text", params).await.map(|_| ())
+    // ★(0.14.31 · 성찰 C1 · blocking) 데몬 응답을 **그대로** 돌려준다. 종전 `.map(|_| ())` 는 queued
+    //   적재 응답의 `queue_entry_id`·`durable`(큐 WAL 치환 성공 여부)을 여기서 버렸다 — GUI 는 내구
+    //   미확정(`durable:false` = 데몬이 죽으면 사라지는 항목) 인계 뒤에 원본을 닫아 인계를 복구 불가로
+    //   잃을 수 있었다. 응답·중간 반환형·종료 조건은 한 변경 단위다(ui/src/transfer.ts
+    //   `parseEnqueueReceipt` · `originCloseVerdict`). additive: 종전 호출부는 반환값을 쓰지 않는다.
+    rpc_on(&sock, "surface.send_text", params).await
 }
 
 /// 전출(F6-2) 핸드오프 폴백 경로용 홈 디렉토리 — cwd가 루트류(/·C:\)인 pane은
