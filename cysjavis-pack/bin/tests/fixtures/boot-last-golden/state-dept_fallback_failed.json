@@ -11,7 +11,7 @@
    "step": "③-d dept-alloc",
    "exit": 1,
    "detail": "<detail>",
-   "order": 10
+   "order": 11
   }
  ],
  "retry": {},
