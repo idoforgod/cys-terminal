@@ -95,6 +95,14 @@ def run_hook(tmp, seats, cys_mode, role_env=None, cys_present=True):
     #   `$HOME/.claude/soul.md` → `$HOME/.cys/pack/soul.md` 로 폴백한다 — 러너/오너 홈의 내용이
     #   판정에 섞이면 초록이 근거가 되지 못한다. `HOME` 을 임시로 고정하고 `CYS_SOUL` 상속도 끊는다.
     env["HOME"] = tmp
+    # ★성찰 R4 N5 이후: 훅은 역할 해소를 정본 `_lib.sh:cys_resolve_role` 에 위임한다. 정본의
+    #   **신원 전제** — 숫자 surface id 가 없으면 데몬에게 '나' 를 묻지 않는다(주소가 없다는 사실이
+    #   '역할 없음' 판정으로 승격되면 정상 위임 경로가 죽는다) — 때문에 실좌석이 언제나 갖는 이
+    #   변수를 픽스처도 갖춰야 한다(데몬이 좌석에 주입한다). 핀의 **단언은 하나도 바뀌지 않았다**.
+    env["CYS_SURFACE_ID"] = "7"
+    # 정본은 60s 디스크 캐시·30s 실패 백오프를 `$TMPDIR` 아래 uid 전용 디렉터리에 둔다 —
+    # 케이스마다 격리하지 않으면 앞 케이스의 캐시가 뒤 케이스의 판정을 정한다.
+    env["TMPDIR"] = tmp
     if role_env:
         env["CYS_ROLE"] = role_env
     payload = json.dumps({"source": "startup", "cwd": cwd})
