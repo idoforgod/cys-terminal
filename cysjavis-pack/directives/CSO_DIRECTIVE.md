@@ -170,9 +170,10 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   set-status|identify|status|list|read-screen|todo-path` · 하위 명령은
   `cys queue list|feed list|feed push|schedule list|approval check`
   (관측·저장·상신만이다 — 큐 항목을 **파기**하는 변이는 §1-1 허용이어도 면제가 아니다)
-  · **보고 채널은 `cys send --to master` 와 `cys send --queued --to master`
-  둘 다** — 면제 판정은 `--queued` 유무와 무관해야 한다(머리글이 의무화한 형태가 면제 밖이면 예산 소진
-  보고 자체가 막혀 사이클이 죽는다) · 다만 수신자 토큰은 경계까지 대조한다(`--to master-shadow` 같은
+  · **보고 채널은 `cys send --queued --to master` 하나다** — 머리글이 의무화한 그 형태이고, 허용도
+  면제도 `--queued` 를 **선행 조건**으로 한다(비큐 형태는 CR 을 보내지 않아 조용한 pane 에서 보고가
+  미제출 초안으로 남고, 제출에 필요한 Return 전송은 CSO 접두 밖이라 도달 경로가 0 이다) · 다만
+  수신자 토큰은 경계까지 대조한다(`--to master-shadow` 같은
   접두 확장은 면제가 아니다) · SESSION_STATE·CSO_TODO Write · `javis_cycle_autopilot.py`)
   — 이 목록은 훅의 면제 집합과 **집합으로 같아야 한다**(기계 대조 · 한쪽만 넓어지면 지침이 없는 출구를
   약속하거나 있는 출구를 없다고 적는다)

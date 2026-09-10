@@ -248,7 +248,10 @@ EXPECTED_BUDGET_EXEMPT = frozenset((
     "cys read-screen", "cys todo-path",
     "cys queue list", "cys feed list", "cys feed push", "cys schedule list",
     "cys approval check",
-    "cys send --to master", "cys send --queued --to master",
+    # ★(성찰 G2 · 통합 2026-09-10) 보고 채널은 **큐 형태 하나**다. 훅(`role-capability-gate.sh`)이
+    #   비큐 `cys send` 를 **거부**하므로(CR 미전송 → 조용한 pane 에서 미제출 초안 · 제출에 필요한
+    #   `send-key Return` 은 CSO 접두 밖) 비큐 형태를 면제로 적으면 **없는 출구를 약속**하게 된다.
+    "cys send --queued --to master",
 ))
 STRAY_EVENT_RE = re.compile(r"[a-z_]+(?:\.[a-z_*]+)+")
 AFFIRMATIVE_SUBSCRIPTION_PHRASES = (
@@ -284,9 +287,9 @@ SAFETY_CLAUSES = {
                     "  TTL 승인의 표현형(명령 접두)으로 표현되지 않는다 — 따라서 **게이트 등록 여부와 무관하게, 이미지\n"
                     "  1장도 예외가 아니다**(요청 문구도, TTL 승인도 이 문을 열지 못한다)."),
         ("스크린샷 증거", "증거는 **텍스트**다 — `cys read-screen` 출력의 **sha256 + 텍스트 요약 1줄**로\n  남긴다."),
-        ("예산 면제 형태", "**보고 채널은 `cys send --to master` 와 `cys send --queued --to master`\n"
-                     "  둘 다** — 면제 판정은 `--queued` 유무와 무관해야 한다(머리글이 의무화한 형태가 면제 밖이면 예산 소진\n"
-                     "  보고 자체가 막혀 사이클이 죽는다)"),
+        ("예산 면제 형태", "**보고 채널은 `cys send --queued --to master` 하나다** — 머리글이 의무화한 그 형태이고, 허용도\n"
+                     "  면제도 `--queued` 를 **선행 조건**으로 한다(비큐 형태는 CR 을 보내지 않아 조용한 pane 에서 보고가\n"
+                     "  미제출 초안으로 남고, 제출에 필요한 Return 전송은 CSO 접두 밖이라 도달 경로가 0 이다)"),
         # ★R2: 극성 반전("면제가 아니다"→"면제다")이 통과하던 자리 — 경계 대조 문장도 통째로 핀한다.
         ("면제 경계", "다만 수신자 토큰은 경계까지 대조한다(`--to master-shadow` 같은\n"
                   "  접두 확장은 면제가 아니다)"),
@@ -1426,7 +1429,7 @@ def hook_capability_model(text: str) -> dict[str, object] | None:
     """훅이 **코드로** 선언한 CSO 접두 모델(미배선이면 None).
 
     돌려주는 것: 허용 동사·허용 하위 명령·예산 면제 접두 집합·deny 동사·TTL 동사 · `send` 분기가
-    `--queued` 를 판정에 쓰는지 여부."""
+    `--queued` 를 **선행 조건으로 요구하는지** 여부(성찰 G2 이후의 계약)."""
     block = hook_python_block(text)
     tree = ast.parse(block)
     consts = _module_sets(tree, HOOK_CONST_NAMES)
@@ -1441,7 +1444,7 @@ def hook_capability_model(text: str) -> dict[str, object] | None:
                              "(1 이어야 한다) — 판정기를 고쳐라" % len(literal_verb_sets))
     branches = _verb_eq_branches(tree)
     branch_essential = _branch_essential_prefixes(branches)
-    send_uses_queued = any(
+    send_requires_queued = any(
         isinstance(c, ast.Constant) and isinstance(c.value, str) and "--queued" in c.value
         for verb, node in branches if verb == "send" for c in ast.walk(node))
     essential = {"cys %s" % v for v in literal_verb_sets[0]}
@@ -1453,19 +1456,18 @@ def hook_capability_model(text: str) -> dict[str, object] | None:
         "deny": set(consts["CSO_CYS_DENY_VERBS"]),
         "ttl": set(consts["CSO_CYS_TTL_VERBS"]),
         "essential": essential,
-        "send_uses_queued": send_uses_queued,
+        "send_requires_queued": send_requires_queued,
     }
 
 
 def directive_exempt_prefixes(body: str) -> set[str]:
     """지침 예산 면제 bullet 이 선언한 `cys …` 접두 **집합**.
 
-    `--queued` 는 같은 접두의 **형태**다(훅의 `send` 분기가 그 플래그를 보지 않는다) — 집합 대조에서는
-    한 값으로 접는다. 그 형태가 실제로 덮이는지는 `push_form_is_budget_exempt` 가 따로 잰다."""
-    out = set()
-    for prefix in budget_exempt_prefixes(body):
-        out.add(prefix.replace(" --queued", "", 1))
-    return out
+    ★(성찰 G2 · 통합 2026-09-10) 종전에는 `--queued` 를 **접어서** 한 값으로 봤다. 그 접기의 근거는
+    "훅의 `send` 분기가 그 플래그를 보지 않는다" 였는데, 그 전제가 사라졌다 — 훅은 이제 `--queued` 를
+    허용·면제의 **선행 조건**으로 요구한다(비큐 send 는 CR 미전송이라 도달 경로가 0 이기 때문). 접으면
+    지침이 '비큐도 면제' 라고 적어도 대조가 통과해 **없는 출구를 약속**하게 된다. 그래서 접지 않는다."""
+    return set(budget_exempt_prefixes(body))
 
 
 def gate_hook_contract_violations(hook_text: str | None = None,
@@ -1500,12 +1502,17 @@ def gate_hook_contract_violations(hook_text: str | None = None,
         out.append("훅에 `cys feed push` 허용이 없다 — §1-2 ②(오너 채널) 도달 불가")
     if "cys feed push" not in model["essential"]:
         out.append("훅의 예산 면제에 `cys feed push` 가 없다 — 예산 소진 ∧ master hang 에서 출구 0")
-    # ③ 머리글이 의무화한 push 형태는 `--queued` 유무와 무관하게 면제여야 한다.
-    if model["send_uses_queued"]:
-        out.append("훅의 `send` 분기가 `--queued` 를 판정에 쓴다 — 면제는 그 플래그와 무관해야 한다"
-                   "(머리글이 의무화한 형태가 면제 밖이면 예산 소진 보고 자체가 막힌다)")
-    if "cys send --to master" not in model["essential"]:
-        out.append("훅의 예산 면제에 `cys send --to master` 가 없다 — 보고 채널이 막힌다(봉인 ②)")
+    # ③ **머리글이 의무화한 형태가 면제여야 한다**(봉인 ②). 재는 것은 플래그의 유무가 아니라
+    #    '의무 형태 = 면제 형태' 라는 일치 자체다 — 성찰 G2 로 그 형태가 큐 단일화됐고, 종전 판정
+    #    ("면제는 `--queued` 와 무관해야 한다")은 그 순간 **정반대 방향**이 됐다(훅이 비큐를 거부하는데
+    #    지침·판정기는 비큐도 면제라고 적으면, 없는 출구를 약속한다).
+    if not model["send_requires_queued"]:
+        out.append("훅의 `send` 분기가 `--queued` 를 요구하지 않는다 — 비큐 send 는 CR 을 보내지 않아 "
+                   "조용한 pane 에서 보고가 미제출 초안으로 남고(제출에 필요한 `send-key Return` 은 "
+                   "CSO 접두 밖) 도달 경로가 0 이다")
+    if MANDATED_PUSH not in model["essential"]:
+        out.append("훅의 예산 면제에 `%s` 가 없다 — 머리글이 의무화한 보고 형태가 면제 밖이면 "
+                   "예산 소진 보고 자체가 막힌다(봉인 ②)" % MANDATED_PUSH)
     # ④ 지침 문면 ↔ 훅 접두 집합의 **기계 대조**(D1). 한쪽만 넓으면 지침이 없는 출구를 약속하거나
     #    있는 출구를 없다고 적는다 — 둘 다 §3-1(문장은 장치의 설명) 위반이다.
     if directive_body is None:
@@ -2192,12 +2199,23 @@ class CsoDirectiveRevision(unittest.TestCase):
     def test_negative_budget_exemption_controls(self):
         """면제 목록에서 `--queued` 형태를 지우면(개정 전 상태) 접두 대조가 실패해야 한다."""
         pre_fix = self.body.replace(
-            "**보고 채널은 `cys send --to master` 와 `cys send --queued --to master`",
-            "**보고 채널은 `cys send --to master`")
+            "**보고 채널은 `cys send --queued --to master` 하나다**",
+            "**보고 채널은 `cys send --to master` 하나다**")
         self.assertNotEqual(pre_fix, self.body)
         self.assertFalse(push_form_is_budget_exempt(pre_fix),
                          "`send --to master` 만으로 `--queued` 형태가 덮인다고 판정했다")
         self.assertEqual(budget_exempt_prefixes(""), [])
+        # ★(성찰 G2 · 통합) 반대 방향의 음성 대조 — 비큐 형태를 **되살리면** 훅과 갈린다.
+        #   훅이 비큐를 거부하므로 지침만 면제로 적는 것은 '없는 출구를 약속' 이다.
+        widened = self.body.replace(
+            "**보고 채널은 `cys send --queued --to master` 하나다**",
+            "**보고 채널은 `cys send --to master` 와 `cys send --queued --to master` 둘 다**")
+        self.assertNotEqual(widened, self.body)
+        self.assertIn("cys send --to master", directive_exempt_prefixes(widened),
+                      "`--queued` 를 접어 버리면 넓어진 지침이 훅과 같아 보인다(접기 회귀)")
+        self.assertTrue(
+            any("없는 출구" in v for v in gate_hook_contract_violations(directive_body=widened)),
+            "지침만 비큐를 면제로 적었는데 대조가 통과했다")
 
     def test_negative_override_carveout_controls(self):
         """★R2(codex 적대 탐색 · 실제로 27/27 을 통과했던 문장들): 조항을 남긴 채 **다른 문단에**
