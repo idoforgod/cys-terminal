@@ -8567,9 +8567,20 @@ mod tests {
         );
         assert_eq!(ev["payload"]["role"], json!("w2c-merge"));
         assert_eq!(ev["payload"]["reordered"], json!(true), "기존 라이브 항목이 뒤로 밀림");
+        // ★(0.14.31 · 성찰 Q7) `entry_ids` 는 additive **W-id 에코**다 — 소비자(report_gate)가
+        //   "폐기가 아니라 아직 살아서 이동 중" 을 알고 inflight 의 TTL 창을 되감는 조인 키다
+        //   (그러지 않으면 park·rehome 이 seen TTL 을 넘길 때 같은 사건이 다시 enqueue 된다).
+        //   명명 계약(성찰 BLOCKER)이 금지하는 것은 **키명 재사용** — 큐 항목 id 를 이 키에 싣는
+        //   것 — 이지 키의 존재가 아니다. 이 배치의 본문에는 W-id 가 없으므로 에코는 빈 배열이고,
+        //   큐 항목 id 는 어느 것도 여기 들어오지 않는다.
+        let echo = ev["payload"]["entry_ids"]
+            .as_array()
+            .cloned()
+            .expect("W-id 에코 키가 없다 — 소비자가 inflight 를 되감지 못한다");
+        assert!(echo.is_empty(), "W-id 없는 본문인데 에코가 비어 있지 않다: {echo:?}");
         assert!(
-            ev["payload"].get("entry_ids").is_none(),
-            "entry_ids 키명은 W-id 에코 전용 — 재사용 금지(성찰 BLOCKER)"
+            !echo.iter().any(|v| v == "qold.1" || v == "qold.2"),
+            "entry_ids 키명 재사용 금지(성찰 BLOCKER) — 큐 항목 id 가 W-id 에코 키에 실렸다"
         );
         {
             let mut child = s.child.lock().unwrap();
@@ -8629,7 +8640,25 @@ mod tests {
         assert_eq!(p["queue_entry_ids"], json!(["qr.1", "qr.2"]), "병합 삽입 순서 보존");
         assert_eq!(p["role"], json!("worker"));
         assert_eq!(p["reordered"], json!(true));
-        assert!(p.get("entry_ids").is_none(), "entry_ids 키명 재사용 금지(성찰 BLOCKER)");
+        // ★(0.14.31 · 성찰 Q7) `entry_ids` = additive **W-id 에코**(소비자의 inflight TTL 되감기).
+        //   명명 계약(성찰 BLOCKER)은 **키명 재사용** 금지다 — 아래 두 단언이 그것을 집행한다:
+        //   본문에 W-id 가 없으면 빈 배열이고, 있으면 그 W-id 만 담는다(큐 항목 id 는 절대 아니다).
+        assert_eq!(p["entry_ids"], json!([]), "W-id 없는 본문의 에코가 빈 배열이 아니다");
+        let mut wa = w2c_entry("qr.3", 3, 30.0);
+        wa.text = "[wakeup W-0000abc123] 지시".into();
+        let mut wb = w2c_entry("qr.4", 4, 40.0);
+        wb.text = "[wakeup W-0000abc123] 중복 · [wakeup W-0000def456] 둘째".into();
+        let pw = queue_rehomed_payload("worker", &[wa, wb], false);
+        assert_eq!(
+            pw["entry_ids"],
+            json!(["W-0000abc123", "W-0000def456"]),
+            "W-id 에코가 등장순·중복 제거가 아니다"
+        );
+        assert_eq!(
+            pw["queue_entry_ids"],
+            json!(["qr.3", "qr.4"]),
+            "두 id 체계가 한 키에 섞였다(성찰 BLOCKER)"
+        );
 
         let m = queue_migrated_payload(3, 7, "master", &batch);
         assert_eq!(m["from_surface"], json!(3));

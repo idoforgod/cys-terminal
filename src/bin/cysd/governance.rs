@@ -5912,6 +5912,12 @@ pub(crate) fn deliver_head_locked(
         //   마커는 `recheck` 가 실어 온 것을 그대로 쓴다(여기서 어댑터 정의를 다시 읽지 않는다 —
         //   틱은 어댑터를 **틱당 1회**만 읽는 것이 규약이고, 그 규약이 좌석마다 판정을 갈리게
         //   하지 않는다). `recheck` 가 없는 호출(구 호출부)은 마커 없는 게이트로 판정한다.
+        // ★불변식(0.14.31 · 성찰 Q1 재핀): **`recheck == None` ⟺ 마커 없는 좌석**이다 — 운영
+        //   호출부 두 곳(`deliver_queued` · `force_deliver`)이 둘 다 `marker.is_some()` 일 때만
+        //   `Some` 을 만든다. 이 불변식이 깨져 **마커 좌석에 `None`** 이 들어오면 탐침이
+        //   markerless 게이트로 내려가고, 그 게이트의 alt 축은 claude 2.1.26x 유휴 좌석
+        //   (alt-screen 상주 · CONTRACTS §B-1)에서 **상시** 참이다 = 그 좌석의 큐가 영구 보류된다
+        //   (기아 #1 재발 · 전 pane 무응답과 구별되지 않는다). 새 호출부를 만들 때 반드시 지켜라.
         let safety_probe = inject_safety_probe(
             daemon,
             s,
@@ -11874,23 +11880,54 @@ mod tests {
             gen_at_verdict: gen,
             approval_pending: approval,
         };
+        // ★(0.14.31 · 성찰 Q1 재핀) ⓐ·ⓑ 의 in-band 증명 축이 바뀌었다 — **막는 자리**로 가른다.
+        //   Q1 이전에는 "재평가를 넘기지 않으면 같은 프레임에서 **배달된다**" 가 적색 증명이었다.
+        //   Q1 이 writer 안전 탐침에 화면 축을 넣어 그 경로도 닫았으므로(다 그려진 모달에 본문+CR
+        //   을 꽂지 않는다 · §8) 그 문면은 더는 참이 아니다. 대신 두 경로가 **어디서** 멈추는지로
+        //   같은 것을 잰다 — ⓐ 는 임계영역에서 되돌아가 writer 를 아예 쥐지 않고(인계 0 =
+        //   `queue.inject_aborted` 0 · 영수증 없는 원장 줄 0), ⓑ 는 인계까지 갔다가 탐침에 끊긴다
+        //   (`queue.inject_aborted` 1). ⓐ 의 축이 죽으면 ⓐ 가 ⓑ 의 경로로 내려가 그 이벤트를
+        //   만들므로, 아래 "0 건" 단언이 계측 무효를 그대로 잡는다.
+        let aborted_since = |rx: &mut tokio::sync::broadcast::Receiver<Value>| {
+            let mut n = 0usize;
+            while let Ok(ev) = rx.try_recv() {
+                if ev["name"] == "queue.inject_aborted" {
+                    n += 1;
+                }
+            }
+            n
+        };
         // ⓐ 인계 전에 화면이 **완결된 채로** 모달이 됐다(짝수 → 짝수 · 홀수 축은 이것을 못 본다).
         refill("모달로 바뀜");
         paint_screen(&s, &modal, 1, 2, false);
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
         let now_gen = s.output_gen.load(AtomicOrdering::Acquire);
         assert_eq!(now_gen % 2, 0, "전제 붕괴: 발행 중(홀수)이면 종전 축이 이미 잡는다");
+        let mut bus_a = daemon.bus.subscribe();
         assert!(
             deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)))
                 .is_none(),
             "판정 이후 다 그려진 모달에 본문을 배달했다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부인데 항목이 사라졌다(유실)");
-        // ⓑ 적색 증명(in-band) — 재평가를 넘기지 않으면 **같은 프레임에서 배달된다**(R6 의 그 구멍).
-        assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_some(),
-            "계측 무효: 재평가가 없어도 막힌다면 이 검체는 M4 를 재지 못한다"
+        assert_eq!(
+            aborted_since(&mut bus_a),
+            0,
+            "계측 무효: ⓐ 가 임계영역이 아니라 writer 탐침에서 멈췄다 — 이 검체는 M4 를 재지 못한다"
         );
+        // ⓑ 적색 증명(in-band) — 재평가를 넘기지 않으면 임계영역은 **통과한다**(그 축이 없으므로).
+        //    멈추는 것은 writer 안전 탐침이고, 그 사실이 `queue.inject_aborted` 로 드러난다.
+        let mut bus_b = daemon.bus.subscribe();
+        assert!(
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
+            "재평가 없는 경로가 다 그려진 모달에 본문을 배달했다(Q1 탐침이 죽었다)"
+        );
+        assert_eq!(
+            aborted_since(&mut bus_b),
+            1,
+            "계측 무효: ⓑ 가 임계영역에서 멈췄다면 ⓐ 와 구별되지 않아 M4 축을 재지 못한다"
+        );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "탐침 중단인데 항목이 사라졌다(유실)");
         // ⓒ 가용성 — 화면이 그대로면 세대가 바뀌어도 배달된다(스트리밍 노드의 기아를 만들지 않는다).
         refill("스트리밍 중");
         paint_screen(&s, &idle, 3, 2, false);
@@ -12114,11 +12151,29 @@ mod tests {
             "expect_output_gen=None 경로가 발행 중(홀수) 인계를 통과시켰다"
         );
         // 가용성 대조군 — 짝수로 닫고 같은 값을 넘기면 **곧바로** 배달된다(축이 상시 닫히지 않는다).
+        // ★(0.14.31 · 성찰 Q1 재핀) 여기서는 `recheck` 를 **반드시** 넘긴다. 운영 경로의 불변식이
+        //   `recheck == None ⟺ 마커 없는 좌석`이고(두 호출부 모두 그렇게 만든다), Q1 의 writer
+        //   안전 탐침은 그 불변식을 근거로 `None` 이면 markerless 게이트를 돌린다. 마커 좌석
+        //   (claude · alt-screen 상주)에 `None` 을 넘기면 그 게이트의 alt 축이 **상시** 걸려
+        //   가용성 대조군이 거짓 적색을 낸다 — 검체가 운영에 없는 조합을 만들면 안 된다.
         s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
-        quiesce(&s);
+        // ★(0.14.31 · 성찰 Q1 재핀) 검체 재료 복원 — 앞선 인계 시도가 남긴 PTY 에코가 화면을
+        //   바꿨을 수 있다. Q1 이전에는 탐침이 화면을 보지 않아 이 복원 없이도 통과했지만, 이제
+        //   가용성 대조군은 **유효한 유휴 프레임 위에서** 재야 한다(위 ⓑ 구간과 같은 규율).
+        paint_claude_idle_alt(&s);
+        quiet_since(&s, 30);
+        s.set_pending_input(0);
         let even = s.output_gen.load(AtomicOrdering::Acquire);
+        assert_eq!(even % 2, 0, "전제 붕괴: 대조군 세대가 짝수가 아니다");
+        let rc_even = super::ScreenRecheck {
+            marker: Some("❯".to_string()),
+            placeholder: None,
+            gen_at_verdict: even,
+            approval_pending: false,
+        };
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), None).is_some(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), Some(&rc_even))
+                .is_some(),
             "발행이 끝난 프레임인데 인계가 거부했다(기아 — 축이 상시 닫혔다)"
         );
     }
