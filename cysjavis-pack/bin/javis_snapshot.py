@@ -181,6 +181,27 @@ def is_master():
       여전히 '생산 skip(exit 0)' 이다(§3-3 · 좌석 사망이 아니다). 검체 8i-1~8i-4."""
     _rm = _role_mod()
     if _rm is not None:
+        # ★0.14.31 성찰 G10(major): 데몬 사망 중 **매 훅 프로세스**가 직접 확인(`confirm_role_detail`
+        #   — 디스크 `.fail` 을 일부러 무시한다)으로 2s 타임아웃을 반복했다(Stop/PreCompact/
+        #   SessionStart 핫패스에서 매 턴 2s · base 는 30s 에 한 번). 관측 스냅샷은 살아 있는
+        #   백오프 안에서 **보류**한다(생산 skip = 이 함수의 선언된 실패 방향 · 좌석 사망 아님).
+        #   ★백오프는 **해소 전에** 잰다(codex 설계 비평 · blocking): 이 프로세스의 첫 실패가
+        #     만든 표식으로 자기 자신을 보류하면 8h("판정 불가 → 종전 env 절 통과")가 깨진다.
+        #     이전 프로세스가 남긴 **살아 있는** 백오프만 보류 근거다(그래서 술어는 프로세스
+        #     안 표식 `_LIVE_FAIL_MONO` 를 보지 않는다 — 그 표식으로 아끼는 타임아웃은 0 이고
+        #     판정만 뒤집는다 · codex 설계 비평 minor).
+        #   ★정직: 이 값은 **호출 시점의 스냅샷**이다 — 재는 순간 유효했던 표식이 아래 확인
+        #     지점에 닿기 전에 만료되면 한 번 더 보류한다(거부 방향 · 다음 훅이 재시도한다).
+        #   ★헬퍼 실패(구 javis_role · 예외)는 '백오프 아님' — 종전 확인 경로를 그대로 탄다.
+        #     아래 `except Exception: pass` 뒤의 env/대장 폴백으로 새지 않는다.
+        #   ★정직: 보류는 두 확인 지점에만 걸린다. 캐시 master + env master(종전 허용)와
+        #     대장 일치 절은 종전 그대로다(새 허용도 새 거부도 아니다).
+        _backoff = False
+        try:
+            _fba = getattr(_rm, "fail_backoff_active", None)
+            _backoff = bool(_fba()) if _fba is not None else False
+        except Exception:
+            _backoff = False
         try:
             _role, _src = _rm.resolve_role_detail()
             if _rm.is_authoritative_none(_src):
@@ -196,6 +217,8 @@ def is_master():
                     return True, "daemon role is master"
                 if (os.environ.get("CYS_ROLE", "") or "").strip().lower() == "master":
                     return True, "env CYS_ROLE=master"      # 종전 판정이 이미 허용 — 새 허용 아님
+                if _backoff:
+                    return False, "daemon query in backoff - snapshot deferred"
                 _role2, _src2 = _rm.confirm_role_detail()
                 if _src2 == _rm.SOURCE_DAEMON and _role2.strip().lower() == "master":
                     return True, "daemon role is master (confirmed)"
@@ -211,6 +234,9 @@ def is_master():
                 # ★수렴 R2(blocking 형제 조항 · org 와 같은 규율): 권위 있는 답이 없을 때
                 #   stale env 로 통과하기 전에 **살아 있는 데몬이 반박하지 않는지** 한 번 본다
                 #   (디스크 캐시·디스크 백오프를 건너뛴다). 데몬이 죽어 있으면 종전대로 통과한다.
+                #   ★G10: 살아 있는 백오프 안에서는 묻지 않고 보류한다(위 머리주석).
+                if _backoff:
+                    return False, "daemon query in backoff - snapshot deferred"
                 _role2, _src2 = _rm.confirm_role_detail()
                 if _rm.is_authoritative_none(_src2):
                     return False, "daemon knows no role for this seat"

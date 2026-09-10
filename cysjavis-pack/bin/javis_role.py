@@ -93,7 +93,7 @@ import tempfile
 import time
 
 __all__ = ["resolve_role", "resolve_role_detail", "reset_cache", "surface_id",
-           "is_authoritative", "is_authoritative_none",
+           "is_authoritative", "is_authoritative_none", "fail_backoff_active",
            "QUERY_TIMEOUT_S", "CACHE_TTL_S", "FAIL_BACKOFF_S"]
 
 # ★상수는 **고정**이다(R1 교정): 종전 셸 짝은 `CYS_ROLE_CACHE_TTL` 류 env 로 덮을 수 있었고
@@ -363,8 +363,14 @@ def _euid():
     return f() if f is not None else None
 
 
-def _cache_dir():
+def _cache_dir(create=True):
     """0700 전용 디렉터리 경로 또는 ""(캐시 사용 불가).
+
+    ★`create=False`(0.14.31 성찰 G10 · codex 설계 비평 minor): **디렉터리를 만들지 않는다** —
+      순수 판독 호출자(`fail_backoff_active`)가 "표식이 있는가" 를 묻는 것만으로 0700 디렉터리를
+      만들어 버리면 그 함수의 '조회 0 · 쓰기 0' 계약이 거짓이 된다. 없으면 ""(캐시 없음)이고
+      그 귀결은 '백오프 아님' = 호출자가 종전 확인 경로를 그대로 타는 것(거부 방향 아님).
+      소유자·모드 검증은 **두 갈래 모두** 그대로 건다(신뢰 규칙을 create 가 가르지 않는다).
 
     셸 짝과 **같은 규칙**: `TMPDIR` → `TEMP` → `TMP` 중 비어 있지 않은 첫 값(없으면
     파이썬은 `tempfile.gettempdir()`, 셸은 `/tmp`) 아래의 `cys-role-authority.d`.
@@ -385,12 +391,13 @@ def _cache_dir():
         except Exception:
             return ""
     d = os.path.join(base, CACHE_DIR_NAME)
-    try:
-        os.mkdir(d, 0o700)
-    except FileExistsError:
-        pass
-    except Exception:
-        return ""
+    if create:
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        except Exception:
+            return ""
     import stat as _stat
     try:
         st = os.lstat(d)
@@ -434,8 +441,10 @@ def _slug_legacy(s):
     return "".join(out)[:SLUG_MAX]
 
 
-def _cache_path(sid):
+def _cache_path(sid, create=True):
     """(surface, socket 슬러그)당 정확히 하나. 캐시 불가면 "".
+
+    ★`create=False` 는 `_cache_dir` 의 같은 갈래를 그대로 넘긴다(경로 계산만 · 디렉터리 생성 0).
 
     ★R2(codex 위임 차분 프로브 실측): 종전에는 **신원 미지(`_sock_id()==""`)에서도 경로를 만들어**
       `role-<sid>-` 를 냈다 — 셸 짝 `cys_role_cache_path` 는 같은 상황에서 rc 1(경로 없음)이라
@@ -444,7 +453,7 @@ def _cache_path(sid):
     """
     if not _sock_id():
         return ""
-    d = _cache_dir()
+    d = _cache_dir(create)
     if not d:
         return ""
     return os.path.join(d, "role-%s-%s" % (_slug(sid or "none"), _slug(_sock_id())))
@@ -824,6 +833,54 @@ def confirm_role_detail():
     """
     return _resolve_memoized(False)
 
+
+def fail_backoff_active(now=None):
+    """**이전 프로세스**가 남긴 조회 실패 백오프가 지금 살아 있는가 — 순수 판독(조회 0 · 쓰기 0 ·
+    디렉터리 생성 0 · 예외 0).
+
+    ★0.14.31 성찰 G10(major): 관측 훅(`javis_snapshot.is_master` — Stop/PreCompact/SessionStart
+      의 스냅샷 생성)이 데몬 사망 중 **매 훅 프로세스마다** 2s 타임아웃을 물었다. 일반 해소는
+      디스크 `.fail` 로 조회를 건너뛰는데, 직접 확인(`confirm_role_detail`)은 그 표식을 **일부러**
+      무시하므로(같은 uid 가 쓸 수 있는 한 줄이 판정을 바꾸면 안 된다 — R2a) 새 프로세스마다
+      확인이 타임아웃을 반복했다(base 는 30s 에 한 번). 관측 경로는 백오프 안에서 생성을
+      **보류**할 수 있어야 하고, 권한 변이 경로의 직접 확인은 그대로여야 한다 — 그래서 둘을
+      가르는 술어를 여기 둔다. 이 함수는 판정을 바꾸지 않는다: 소비처가 이것으로 할 수 있는
+      것은 '지금은 묻지 않고 보류한다'(거부 방향)뿐이다.
+    ★**프로세스 안 표식(`_LIVE_FAIL_MONO`)은 보지 않는다**(codex 설계 비평 minor 반영):
+      ⓐ 그 표식은 `_resolve_uncached` 가 **두 경로 모두**에서 이미 존중하므로(:702 부근) 여기서
+        또 봐도 아끼는 타임아웃이 **0** 이다 — 얻는 것 없이 판정만 True→False 로 뒤집는다
+        (장기 프로세스에서 첫 호출은 생산, 1초 뒤 재호출은 보류 — 종전에 없던 거부).
+      ⓑ 그 전역 표식에는 신원·세대가 없어 `A 소켓 실패 → B 소켓 전환` 뒤에도 살아 있다.
+        일반 해소의 비용 장치로는 감수할 수 있어도, **관측 거부**로 승격시킬 근거는 아니다.
+      그래서 이 술어의 근거는 신원·세대가 실린 디스크 레코드 하나뿐이고, 머리줄의 '이전
+      프로세스' 는 문자 그대로 참이다.
+    ★정직한 한계(codex 설계 비평): 위조·갱신되는 `.fail` 은 관측 스냅샷을 그 창(30s)마다
+      **보류**시킬 수 있다 — 가용성 비용이지 권한 상승이 아니다(보류 = 생산 skip). 그 표식은
+      게이트가 CSO·reviewer 의 쓰기를 막는 0700 캐시 디렉터리 안에 있고, 같은 uid 의 임의
+      코드에 대한 무결성 보장은 이 파일 전체의 근본한계와 같은 층이다. **다만 데몬이 실제로
+      오래 죽어 있으면 일반 해소가 30s 마다 표식을 새로 써서 관측이 무기한 보류된다** — 그
+      상한(짧은 데드라인 확인으로 바꾸는 대안)은 이 성찰 판의 범위 밖이고 open item 이다.
+    ★I2 이전 이름의 `.fail` 은 보지 않는다(해소기와 같은 규칙 — 그 표식은 첫 해소의 타임아웃도
+      막지 못하므로 여기서 봐도 얻는 것이 없다).
+    """
+    try:
+        now = int(time.time()) if now is None else int(now)
+        sid = surface_id()
+        if not sid:
+            return False
+        sockid = _sock_id()
+        if not sockid:
+            return False
+        cpath = _cache_path(sid, create=False)     # ★디렉터리를 만들지 않는다(순수 판독)
+        if not cpath:
+            return False
+        rec = _parse_record(_read_first_line(cpath + ".fail"), sockid, _boot_epoch())
+        if not rec:
+            return False                          # 문법·신원·세대 불일치 = 표식 없음
+        ts, _r = rec
+        return 0 < ts <= now and (now - ts) < FAIL_BACKOFF_S
+    except Exception:
+        return False          # 헬퍼 실패 = '백오프 아님' — 소비처는 종전 확인 경로를 그대로 탄다
 
 def resolve_role(default=""):
     """역할 문자열(없으면 `default`). 결정 지점의 **유일한 입구**."""

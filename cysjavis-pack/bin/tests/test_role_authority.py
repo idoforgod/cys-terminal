@@ -1096,6 +1096,143 @@ def test_convergence_r2_snapshot_none():
           rc == 1 and "daemon knows no role" in out, "rc=%s out=%r" % (rc, out.strip()))
 
 
+def test_reflect_g10_snapshot_backoff():
+    """★0.14.31 성찰 G10(major): 관측 훅(`is_master`)은 **살아 있는 백오프** 안에서 데몬 타임아웃을
+    반복하지 않는다(보류 = 생산 skip) · 위조 표식으로 권한 상승 0 · 표식 만료 뒤 정상 생성 ·
+    8h(첫 실패는 종전대로 env 절 통과)는 불변. 권한 변이 경로(require_cso)는 R2a-2 가 따로 핀한다."""
+    import json
+    state = os.path.join(_tmproot, "g10state")
+    os.makedirs(state, exist_ok=True)
+    with open(os.path.join(state, "mission.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema": 1, "mission": None, "surface": "7"}, f)
+    nostate = os.path.join(_tmproot, "g10state-empty")
+    os.makedirs(nostate, exist_ok=True)
+
+    def _fresh_fail(env, age=0):
+        cpath, _sk, _ep = _identity(env, "7")
+        _seed_record(env, "7", "-", ts=int(time.time()) - age, path=cpath + ".fail")
+
+    # (i) 살아 있는 백오프 + env master + 데몬 worker → 보류(조회 0 · 타임아웃 0 · 상승 0)
+    log = os.path.join(_tmproot, "g10-1.log")
+    env = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "worker\n", log=log))
+    _fresh_fail(env)
+    rc, out = _snapshot_rc(env, nostate)
+    check("G10-1 ★백오프 안 env master: 보류(rc 1 · 사유 backoff) · 데몬 조회 0",
+          rc == 1 and "backoff" in out and _qcount(log) == 0,
+          "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(log)))
+    # (ii) 위조 표식 + env master + 데몬이 master 라고 답할 상황 → **여전히 보류**(표식은 허용 근거가 아니다)
+    log2 = os.path.join(_tmproot, "g10-2.log")
+    env2 = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "master\n", log=log2))
+    _fresh_fail(env2)
+    rc, out = _snapshot_rc(env2, state)
+    check("G10-2 ★위조 표식은 통과 근거가 아니다(보류 · 조회 0)",
+          rc == 1 and "backoff" in out and _qcount(log2) == 0, "rc=%s out=%r" % (rc, out.strip()))
+    # (iii) 표식 만료(31s) + 데몬 master → 조회 1회 · 정상 생성(회복)
+    log3 = os.path.join(_tmproot, "g10-3.log")
+    env3 = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "master\n", log=log3))
+    _fresh_fail(env3, age=31)
+    rc, out = _snapshot_rc(env3, state)
+    check("G10-3 데몬 회복(표식 만료) → 조회 1회 · 정상 생성", rc == 0 and _qcount(log3) == 1,
+          "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(log3)))
+    # (iv) 권위 캐시 master + env 없음 + 살아 있는 백오프 → 확인 갈래 (a) 도 보류(조회 0)
+    log4 = os.path.join(_tmproot, "g10-4.log")
+    env4 = base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(0, "worker\n", log=log4))
+    _seed_record(env4, "7", "master")
+    _fresh_fail(env4)
+    rc, out = _snapshot_rc(env4, state)
+    check("G10-4 ★캐시 master 갈래도 백오프 안에서는 보류(조회 0 · 캐시는 통과 근거가 아니다)",
+          rc == 1 and "backoff" in out and _qcount(log4) == 0, "rc=%s out=%r" % (rc, out.strip()))
+    # (v) 8h 불변: 표식 없음 + env master + 데몬 판정 불가 → 첫 실패는 조회 1회 · 종전 env 절 통과
+    log5 = os.path.join(_tmproot, "g10-5.log")
+    env5 = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(2, "", log=log5))
+    rc, out = _snapshot_rc(env5, state)
+    check("G10-5 양성 대조(8h 불변): 표식 없는 첫 실패는 조회 1회 · env 절 통과",
+          rc == 0 and _qcount(log5) == 1, "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(log5)))
+    # (vi) 손상·미래·신원 불일치 표식은 백오프가 아니다(순수 판독의 검증 규율 · codex minor)
+    for _lab, _kw in (("미래 시각", {"ts": int(time.time()) + 3600}),
+                      ("신원 불일치", {"sockid": "/tmp/other.sock"}),
+                      ("세대 불일치", {"epoch": "zz"})):
+        _l = os.path.join(_tmproot, "g10-6-%s.log" % _lab)
+        _e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "worker\n", log=_l))
+        _cp, _sk, _ep = _identity(_e, "7")
+        _seed_record(_e, "7", "-", path=_cp + ".fail", **_kw)
+        rc, out = _snapshot_rc(_e, nostate)
+        check("G10-6 %s 표식은 백오프가 아니다(확인이 데몬에 묻는다 · 조회 1)" % _lab,
+              rc == 1 and "backoff" not in out and _qcount(_l) == 1,
+              "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(_l)))
+    # (vi-b) **문법이 깨진** 표식(옛 2필드 레코드·쓰레기 한 줄)도 백오프가 아니다 —
+    #   위 3종은 4필드 문법을 지키고 값만 틀린 것이라, 문법 축은 따로 잰다(codex minor).
+    for _lab, _raw in (("옛 2필드", "%d -\n" % int(time.time())),
+                       ("쓰레기 한 줄", "not a record at all\n"),
+                       ("빈 파일", "")):
+        _l = os.path.join(_tmproot, "g10-6b-%s.log" % _lab)
+        _e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(0, "worker\n", log=_l))
+        _cp, _sk, _ep = _identity(_e, "7")
+        with open(_cp + ".fail", "w", encoding="utf-8") as _f:
+            _f.write(_raw)
+        rc, out = _snapshot_rc(_e, nostate)
+        check("G10-6b %s 표식은 백오프가 아니다(조회 1)" % _lab,
+              rc == 1 and "backoff" not in out and _qcount(_l) == 1,
+              "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(_l)))
+
+    # (vii) ★훅의 실제 형상(codex 설계 비평 · 누락 검체): **같은 TMPDIR·같은 좌석**에서 새
+    #   프로세스 3회 — 첫 실패는 조회 1회·생성 / 30s 안 둘째는 조회 0회·보류(반복 타임아웃 0)
+    #   / 표식 만료 + 데몬 회복은 조회 1회·재생성. 종전 검체는 호출마다 TMPDIR 이 달라
+    #   "연속 훅 호출" 이라는 이 항목의 전제 자체를 재지 못했다.
+    shared = os.path.join(_tmproot, "g10-hookseq")
+    os.makedirs(shared, exist_ok=True)
+
+    def _seq_env(rc_, out_, tag):
+        _l = os.path.join(_tmproot, "g10-7%s.log" % tag)
+        _e = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_BIN=stub_dir(rc_, out_, log=_l))
+        _e["TMPDIR"] = shared                      # ★캐시 디렉터리를 세 호출이 공유한다
+        return _e, _l
+
+    e7a, l7a = _seq_env(2, "", "a")
+    rc, out = _snapshot_rc(e7a, state)
+    check("G10-7a 훅① 표식 없음 → 조회 1회 · 종전 env 판정으로 생성",
+          rc == 0 and _qcount(l7a) == 1, "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(l7a)))
+    e7b, l7b = _seq_env(2, "", "b")
+    rc, out = _snapshot_rc(e7b, state)
+    check("G10-7b 훅② 30s 안 → 조회 0회 · 보류(★반복 타임아웃 0 = 이 항목의 목적)",
+          rc == 1 and "backoff" in out and _qcount(l7b) == 0,
+          "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(l7b)))
+    _cp7, _sk7, _ep7 = _identity(e7b, "7")
+    _seed_record(e7b, "7", "-", ts=int(time.time()) - 31, path=_cp7 + ".fail")
+    e7c, l7c = _seq_env(0, "master\n", "c")
+    rc, out = _snapshot_rc(e7c, state)
+    check("G10-7c 훅③ 표식 만료 + 데몬 회복 → 조회 1회 · 재생성(복구가 막히지 않는다)",
+          rc == 0 and _qcount(l7c) == 1, "rc=%s out=%r q=%d" % (rc, out.strip(), _qcount(l7c)))
+
+    # (viii) ★순수 판독 계약(codex minor): 술어 호출만으로 0700 캐시 디렉터리를 **만들지 않는다**.
+    nomk = os.path.join(_tmproot, "g10-nomkdir")
+    os.makedirs(nomk, exist_ok=True)
+    e8 = base_env(CYS_SURFACE_ID="7", CYS_BIN=stub_dir(2, ""))
+    e8["TMPDIR"] = nomk
+    _code8 = ("import os, sys; sys.path.insert(0, %r); import javis_role as R;"
+              "print(R.fail_backoff_active());"
+              "print(os.path.isdir(os.path.join(os.environ['TMPDIR'], R.CACHE_DIR_NAME)))" % BIN)
+    _r8 = subprocess.run([sys.executable, "-c", _code8], capture_output=True, text=True,
+                         timeout=60, env=e8, cwd=BIN)
+    check("G10-8 ★술어는 순수 판독 — 표식 없음(False) · 캐시 디렉터리 생성 0",
+          (_r8.stdout or "").split() == ["False", "False"],
+          "%r %r" % ((_r8.stdout or "").strip(), (_r8.stderr or "")[-160:]))
+
+    # (ix) ★프로세스 안 표식(`_LIVE_FAIL_MONO`)을 술어에서 뺀 것의 회귀 핀(codex minor):
+    #   **신원을 표현할 수 없는** 좌석(상대 경로 소켓 = 디스크 표식이 아예 안 써진다)에서
+    #   같은 프로세스가 `is_master()` 를 두 번 불러도 판정은 종전 그대로다(True True).
+    #   종전 술어는 이 자리에서 둘째 호출을 **보류**시켰다 — 아끼는 타임아웃 0의 새 거부였다.
+    e9 = base_env(CYS_SURFACE_ID="7", CYS_ROLE="master", CYS_SOCKET="cys.sock",
+                  CYS_BIN=stub_dir(2, ""))
+    _code9 = ("import sys; sys.path.insert(0, %r); import javis_snapshot as S;"
+              "print(S.is_master()[0], S.is_master()[0])" % BIN)
+    _r9 = subprocess.run([sys.executable, "-c", _code9], capture_output=True, text=True,
+                         timeout=60, env=e9, cwd=BIN)
+    check("G10-9 ★신원 미표현 좌석의 같은 프로세스 재호출은 종전 판정 그대로(True True)",
+          (_r9.stdout or "").split() == ["True", "True"],
+          "%r %r" % ((_r9.stdout or "").strip(), (_r9.stderr or "")[-160:]))
+
+
 def main():
     try:
         test_three_states()
@@ -1122,6 +1259,7 @@ def main():
         test_convergence_r2_memo_key()
         test_convergence_r2_length_unit()
         test_convergence_r2_snapshot_none()
+        test_reflect_g10_snapshot_backoff()
     finally:
         shutil.rmtree(_tmproot, ignore_errors=True)
     if fails:
