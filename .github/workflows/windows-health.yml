@@ -173,7 +173,7 @@ jobs:
       - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test --lib factory_reset + readiness + inject_guard (Windows 실기)
+      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates (Windows 실기)
         shell: bash
         run: |
           set -euo pipefail
@@ -219,6 +219,16 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib readiness:: -- --test-threads=1 --nocapture
           cargo_filter_count --lib inject_guard::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib inject_guard:: -- --test-threads=1
+          # ★(0.14.31 성찰 R3·R4 · 통합 2026-09-10) 넷째 모듈 `first_run_gates::` 편입.
+          #   이 잡의 lib 필터는 종전 셋(factory_reset·readiness·inject_guard)뿐이라, 이번 판이
+          #   세운 두 검체군이 Windows 실기에서 **한 번도 돌지 않았다**:
+          #     R3 = 공백만 남은 needle(접힌 렌더에서 관문 문면이 공백으로 뭉개지는 축),
+          #     R4 = 접힌 배너의 버전 판독(줄바꿈이 배너를 가르는 축).
+          #   둘 다 ConPTY 접힘·렌더 축이고 Windows 가 정확히 그 축의 기계다 — mac 에서만
+          #   초록인 검체는 그 축의 증거가 아니다(정본 §8). 순수 판정자라 PTY 불요.
+          #   D10 '측정 ≥1 폐쇄' 와 한 스텝으로 묶어 0매치 초록도 차단한다.
+          cargo_filter_count --lib first_run_gates::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib first_run_gates:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
       #

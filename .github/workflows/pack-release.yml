@@ -239,6 +239,15 @@ jobs:
           #     게이트는 **토큰 집합** 대조라 그때도 통과했다. 머지 뒤 검증: `scripts/lane-parity-rehearsal.sh --strict`
           #     — ①레인 대조 파이썬을 ci-branch.yml 원본에서 추출해 그대로 돌리고(로직 복제 0)
           #       ②등재 이름의 파일 존재를 PENDING(머지 대기) 목록과 대조한다.
+          #   ★(0.14.31 성찰 반영 통합 2026-09-10) **13종 추가 등재** — 8개 병렬 레인이 만든 신규
+          #     검체다. 등재는 통합 단계 1회라는 이 블록의 규율(B-9) 그대로: 레인 워커는 파일만
+          #     인계했고 등재를 하지 않았으므로, 머지 직후 이 13종은 **0레인 실행**이었다
+          #     (`lane-parity-rehearsal.sh` 는 등재→파일 방향만 보므로 그 상태로도 적색이 아니다 —
+          #     즉 자동으로는 잡히지 않는 격차다).
+          #     pack-trust-preflight 5종 · pack-rounds-gate 8종. 실측 2026-09-10 · macOS arm64 ·
+          #     루프와 같은 env(CYS_PACK_DIR·JAVIS_ROOT·CYS_PROBE_RUNS 임시 주입) · 전건 rc=0 ·
+          #     합계 약 27s(settings_fifo 10s · inject_context_role_canon 7s ·
+          #     round_lock_ownership 7s · trust_seed_reflect 2s · axis_labels 1s · 나머지 8종 <1s).
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
                    test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
@@ -258,6 +267,13 @@ jobs:
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
                    test_inject_context_role_seat test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
+                   test_capgate_remeasure_order test_phoenix_p10_lease_split \
+                   test_preflight_only_dispatch test_preflight_settings_fifo \
+                   test_trust_seed_reflect \
+                   test_refl_axis_labels test_refl_fleet_argv_owner test_refl_fleet_latch_gen \
+                   test_refl_inject_context_role_canon test_refl_round_lock_ownership \
+                   test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
+                   test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
