@@ -1536,20 +1536,33 @@ pub fn cso_seats_detail(daemon: &Arc<Daemon>) -> (Vec<u64>, Vec<u64>, bool) {
 }
 
 /// 판정 재료를 데몬에서 뜬다(락은 각각 짧게 잡고 즉시 놓는다 — 어떤 락도 겹쳐 쥐지 않는다).
+/// ★(성찰 A14) **배달 동결의 정의처 하나** — 판정([`RouteCtx::delivery_frozen`])과 적재 직전의
+/// 늦은 재확인([`enqueue_into_seat`])이 같은 술어를 쓴다.
+///
+/// 종전에는 판정이 `daemon.paused ∨ 좌석 queue_paused_until` 이고 재확인은 `daemon.paused`
+/// 하나였다. 판정과 적재 사이에 **그 좌석만** pause 되면(헬스 조치 `pause-queue`) 항목이 큐에
+/// 들어갔다 — 주입은 배달 게이트가 막으므로 §8 위반은 아니지만, 그 경보는 시간당 예산과 쿨다운을
+/// 동결 구간에 태우고 보류 사유가 `Paused` 가 아니라 큐 적체(`QueueHeadroom`)로 보였다.
+/// 운영자가 잡을 손잡이가 `daemon.resume` 이 아니라 "큐를 비워라" 로 바뀐다(오도).
+fn seat_queue_paused(surface: &crate::state::Surface) -> bool {
+    surface
+        .queue_paused_until
+        .lock()
+        .unwrap()
+        .is_some_and(|t| t > std::time::Instant::now())
+}
+
+/// kill-switch(전역) ∨ 그 좌석의 헬스 pause. [`RouteCtx::delivery_frozen`] 의 정의다.
+fn delivery_frozen_for(daemon: &Arc<Daemon>, surface: &crate::state::Surface) -> bool {
+    daemon.paused.load(Ordering::Relaxed) || seat_queue_paused(surface)
+}
+
 pub fn route_ctx(daemon: &Arc<Daemon>, now: Now) -> RouteCtx {
     let (bound, live, empty_seat) = cso_seats_detail(daemon);
     let target = live.first().copied();
     let paused = daemon.paused.load(Ordering::Relaxed);
     let (seat_paused, depth) = match target.and_then(|sid| daemon.get_surface(sid)) {
-        Some(s) => {
-            let seat_paused = s
-                .queue_paused_until
-                .lock()
-                .unwrap()
-                .is_some_and(|t| t > std::time::Instant::now());
-            let depth = s.pending_queue.lock().unwrap().len();
-            (seat_paused, depth)
-        }
+        Some(s) => (seat_queue_paused(&s), s.pending_queue.lock().unwrap().len()),
         None => (false, 0),
     };
     RouteCtx {
@@ -1580,6 +1593,21 @@ impl RoleGuard<'_> {
             RoleGuard::Prefix(p) => role.starts_with(p),
         }
     }
+}
+
+/// ★(성찰 A14) 적재 직전 늦은 동결 재확인의 **범위**. 두 호출자의 위협모델이 다르다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeGuard {
+    /// kill-switch(`daemon.paused`)만 본다 — **스케줄 push 의 계약**이다. 좌석 pause 중이면
+    /// 항목은 큐에서 기다리다 pause 가 풀리면 배달된다(기다림은 실패가 아니다). 여기서
+    /// 좌석 pause 를 실패로 접으면 `schedule.fired` 가 그 회차를 **에러로 종결**해 버리고
+    /// 그 일감은 다음 주기까지 오지 않는다 — 나쁜 방향이다.
+    Daemon,
+    /// 판정([`RouteCtx::delivery_frozen`])과 **같은 술어**(kill-switch ∨ 그 좌석 pause) —
+    /// 경보 라우팅 전용이다. 경보는 큐에 넣지 않고 미해결 집합에 **보류**해도 잃지 않으므로
+    /// (그것이 이 모듈의 계약이다) 동결 구간에 예산·쿨다운을 태우지 않고 사유를 `Paused` 로
+    /// 정직하게 남기는 쪽이 낫다.
+    DaemonAndSeat,
 }
 
 /// 적재 실패 사유 — 전부 **보류로 되돌아간다**(폐기 아님).
@@ -1636,6 +1664,7 @@ pub fn enqueue_into_seat(
     origin: &str,
     cap: usize,
     role_guard: Option<RoleGuard<'_>>,
+    freeze_guard: FreezeGuard,
 ) -> Result<(String, usize), EnqueueErr> {
     let (entry, depth) = {
         let surfaces = daemon.surfaces.lock().unwrap();
@@ -1657,9 +1686,18 @@ pub fn enqueue_into_seat(
         if role_guard.is_some() && !seat_is_agent_backed(&surface) {
             return Err(EnqueueErr::EmptySeat);
         }
-        // ★판정과 적재 사이에 pause 가 켜지는 늦은 창을 여기서 한 번 더 닫는다(원자 1회 읽기).
+        // ★판정과 적재 사이에 pause 가 켜지는 늦은 창을 여기서 한 번 더 닫는다.
         //   기존 배달 게이트는 그대로 pause 를 존중하므로 이것은 심층 방어다(면제가 아니다).
-        if daemon.paused.load(Ordering::Relaxed) {
+        //   ★(성찰 A14) 범위는 호출자가 고른다 — 경보는 판정([`route_ctx`])과 **같은 술어**를
+        //   써야 사유가 `Paused` 로 정직하게 남는다(종전에는 여기만 `daemon.paused` 하나라
+        //   좌석 pause 가 켜진 늦은 창에서 항목이 큐로 들어갔다). 락 순서는 surfaces →
+        //   queue_paused_until 로 `org.status` 순회와 같은 방향이고, 이 락을 쥔 채 surfaces 를
+        //   잡는 경로는 없다(전부 잎이다) — AB-BA 없음.
+        let frozen = match freeze_guard {
+            FreezeGuard::Daemon => daemon.paused.load(Ordering::Relaxed),
+            FreezeGuard::DaemonAndSeat => delivery_frozen_for(daemon, &surface),
+        };
+        if frozen {
             return Err(EnqueueErr::Frozen);
         }
         let mut q = surface.pending_queue.lock().unwrap();
@@ -1684,8 +1722,15 @@ pub fn enqueue_into_seat(
 }
 
 /// alert 전용 래퍼 — 보호선([`CSO_QUEUE_HEADROOM`])까지만 쓴다(활성 큐 상한 100의 나머지는
-/// 사람·노드의 실제 보고 몫이다). 역할 가드는 `cso` 접두다.
-pub fn enqueue_alert(daemon: &Arc<Daemon>, cso_sid: u64, text: String) -> Result<String, EnqueueErr> {
+/// 사람·노드의 실제 보고 몫이다). 역할 가드는 `cso` 접두이고 동결 재확인은 판정과 같은 술어다.
+///
+/// 반환: `(entry_id, 적재 직후 큐 깊이)`. ★(성찰 A13) 깊이를 돌려주는 이유는 [`dispatch`] 가
+/// 루프마다 [`route_ctx`] 를 다시 뜨지 않고 **성공한 적재만큼** 보호선 판정을 갱신하기 위해서다.
+pub fn enqueue_alert(
+    daemon: &Arc<Daemon>,
+    cso_sid: u64,
+    text: String,
+) -> Result<(String, usize), EnqueueErr> {
     enqueue_into_seat(
         daemon,
         cso_sid,
@@ -1694,8 +1739,8 @@ pub fn enqueue_alert(daemon: &Arc<Daemon>, cso_sid: u64, text: String) -> Result
         ALERT_ORIGIN,
         CSO_QUEUE_HEADROOM,
         Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
+        FreezeGuard::DaemonAndSeat,
     )
-    .map(|(id, _)| id)
 }
 
 fn publish_route(daemon: &Arc<Daemon>, name: &str, payload: Value) {
@@ -3030,40 +3075,68 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
 /// 디스패치는 **보류를 다시 세지 않는다** — 같은 항목이 매 틱 suppressed 카운터를 부풀리면
 /// 관측이 거짓말을 한다(보류는 도착 때 한 번 세었다).
 ///
+/// ★(성찰 A13 ①) 이번 배차가 훑을 **나이 상위 K개**([`REEVAL_SCAN_MAX`])를 고른다.
+///
+/// 종전에는 미해결 집합 전량(최대 [`PENDING_ABSOLUTE_MAX`] = 4,096키)을 **통째로 복제**한 뒤
+/// 정렬하고 256으로 잘랐다 — 이벤트 1건마다 수 MB 할당이고, 그 느려짐이 곧 broadcast ring
+/// 퇴출(= 경보 자체의 유실)이다. 이 모듈이 스스로 지목한 자기증폭 경로다.
+/// 여기서는 **참조**만 모아 O(n) 부분 선택(`select_nth_unstable_by`)으로 K개를 가른 뒤 그
+/// K개만 복제한다. 고르는 집합도 그 안의 순서도 종전과 **같다**(같은 비교자 · 전순서).
+///
+/// 실패 방향: 비교자가 전순서가 아니면 `select_nth_unstable_by` 의 결과가 '가장 오래된 K개' 가
+/// 아니게 되어 **오래된 보류가 영영 훑히지 않는다**(기아). 그래서 f64 부분순서를
+/// `unwrap_or(Equal)` 로 접고 마지막 축을 키 사전순으로 못박는다 — 회귀 핀이 종전 구현과의
+/// 동치를 무작위 입력으로 대조한다.
+fn scan_batch(st: &RouteState) -> Vec<(AlertKey, PendingAlert)> {
+    // ★인계 중(`admitted_as`)인 항목은 **이미 큐에 사본이 있다** — 다시 배차하면 중복이다.
+    //   승인은 [`reconcile_admitted`] 가 따로 한다.
+    let mut refs: Vec<(&AlertKey, &PendingAlert)> = st
+        .pending
+        .iter()
+        .filter(|(_, p)| p.admitted_as.is_none())
+        .collect();
+    if refs.len() > REEVAL_SCAN_MAX {
+        // O(n) 부분 선택 — 앞 K 칸이 '가장 오래된 K개' 가 된다(그 안의 순서는 아직 미정).
+        refs.select_nth_unstable_by(REEVAL_SCAN_MAX, scan_order);
+        refs.truncate(REEVAL_SCAN_MAX);
+    }
+    refs.sort_by(scan_order);
+    refs.into_iter().map(|(k, p)| (k.clone(), p.clone())).collect()
+}
+
+/// 배차 순서의 **전순서** 비교자 — 나이(first_mono) → 복원 동률은 epoch → 키 사전순.
+///
+/// ★`partial_cmp(...).unwrap_or(Equal)` 이 아니라 [`f64::total_cmp`] 다. 종전 비교자는
+/// NaN 에서 **추이성이 깨진다**(NaN≡0.0 ∧ NaN≡5.0 인데 0.0<5.0) — 그것은 부분 선택의 전제를
+/// 무너뜨릴 뿐 아니라, 현재 rustc 의 정렬이 그 위반을 탐지하면 **패닉한다**. 지금은 NaN 이
+/// 도달 불가지만(단조 시각은 `Instant` 유래 · 복원분은 `0.0` · JSON 에 NaN 리터럴 없음)
+/// 비교자가 전순서가 아닌 채로 남아 있는 것 자체가 함정이라 여기서 닫는다. 도달 가능한
+/// 값에서는 `partial_cmp` 와 **완전히 같은 순서**다(NaN 과 ±0.0 부호에서만 갈린다).
+fn scan_order(a: &(&AlertKey, &PendingAlert), b: &(&AlertKey, &PendingAlert)) -> std::cmp::Ordering {
+    a.1.first_mono
+        .total_cmp(&b.1.first_mono)
+        // 복원분끼리는 단조 축이 합성값이라 동률이 날 수 있다 — 그때는 epoch 순서가
+        // 재기동 이전의 나이 순서를 지킨다(그 다음이 키 사전순 = 결정론).
+        .then_with(|| a.1.first_seen.total_cmp(&b.1.first_seen))
+        .then_with(|| a.0.cmp(&b.0))
+}
+
 /// 반환: 이번 호출에 적재된 건수.
 pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
-    let batch: Vec<(AlertKey, PendingAlert)> = {
-        let st = state_lock(daemon);
-        // ★인계 중(`admitted_as`)인 항목은 **이미 큐에 사본이 있다** — 다시 배차하면 중복이다.
-        //   승인은 [`reconcile_admitted`] 가 따로 한다.
-        let mut v: Vec<(AlertKey, PendingAlert)> = st
-            .pending
-            .iter()
-            .filter(|(_, p)| p.admitted_as.is_none())
-            .map(|(k, p)| (k.clone(), p.clone()))
-            .collect();
-        v.sort_by(|a, b| {
-            a.1.first_mono
-                .partial_cmp(&b.1.first_mono)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // 복원분끼리는 단조 축이 합성값이라 동률이 날 수 있다 — 그때는 epoch 순서가
-                // 재기동 이전의 나이 순서를 지킨다(그 다음이 키 사전순 = 결정론).
-                .then_with(|| {
-                    a.1.first_seen
-                        .partial_cmp(&b.1.first_seen)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        v.truncate(REEVAL_SCAN_MAX);
-        v
-    };
+    let batch = scan_batch(&state_lock(daemon));
     let mut routed = 0usize;
+    // ★(성찰 A13 ②) `route_ctx` 는 **루프 밖에서 한 번**. 종전에는 키마다 다시 떠서
+    //   `roles`→`surfaces`→`pending_queue` 3중 락을 최대 256회 잡았다(같은 자기증폭 경로).
+    //   루프 안에서 실제로 변하는 축은 **큐 깊이 하나**이고 그것은 우리 자신의 적재로만
+    //   변한다 — 적재가 성공할 때 그 반환 깊이로 갱신한다. 나머지 축(좌석 집합·동결·부재)이
+    //   그 사이에 바뀌는 경우는 [`enqueue_into_seat`] 의 같은 임계영역 재확인
+    //   (`RoleGuard`·`seat_is_agent_backed`·[`FreezeGuard`])이 잡아 **보류로** 되돌린다 —
+    //   즉 이 캐시는 낙관적이되 실패 방향이 안전하다(폐기가 아니라 보류).
+    let mut ctx = route_ctx(daemon, now);
     for (key, p) in batch {
         // 대기열 적재는 **키당 정확히 1건**이다(폭풍 N건이 N줄이 되지 않는다 — 병합 count 는
         // 문안의 `(반복 N건)` 으로만 실린다).
         let item = AlertItem { key, summary: p.summary.clone() };
-        let ctx = route_ctx(daemon, now);
         let verdict = {
             let st = state_lock(daemon);
             decide(&st, &item.key, &ctx)
@@ -3093,9 +3166,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
                 // ★(성찰 A3) `MemoryOnly`(영구 봉인)는 **배달을 막지 않는다**. 막으면 이 세대의
                 //   경보가 0건이 되고, 그 사실이 `status.enabled:true` 뒤에 숨는다.
                 match enqueue_alert(daemon, sid, render_text(&item, repeat)) {
-                    Ok(entry_id) => {
+                    Ok((entry_id, depth)) => {
                         commit_routed(daemon, &item, sid, &entry_id, repeat, now, true, budget);
                         routed += 1;
+                        // ★(성찰 A13 ②) 보호선 판정만 갱신한다 — 우리 적재가 유일한 증가원이다.
+                        ctx.cso_queue_depth = depth;
                     }
                     // 적재 실패 — pending 에 **그대로 남는다**(재보류 기록 없음). 예약도 되돌린다
                     // (적재가 없었으니 예산도 쓰지 않았다). 좌석·큐 상태는 전역 사정이므로 이번
@@ -4434,13 +4509,103 @@ mod drills {
     /// ★`enqueue_into_seat` 의 원자성 계약(회귀 핀): 좌석 조회·생존 판정·삽입이 **surfaces 맵
     /// 락 한 임계영역** 안에 있어야 한다. 이 배선이 풀리면 close 와의 경쟁에서 항목이 조용히
     /// 사라진다(그 실패는 런타임 경쟁이라 단위 검체로 재현이 어려워 소스 핀으로 박제한다).
+    /// ★(성찰 A14) 판정과 적재 **사이**에 그 좌석만 pause 되면 경보는 큐에 들어가지 않는다.
+    ///
+    /// 종전에는 늦은 재확인이 `daemon.paused`(kill-switch) 하나여서, 헬스 조치 `pause-queue` 가
+    /// 그 창에서 켜지면 항목이 큐에 들어갔다. 주입은 배달 게이트가 막으므로 §8 위반은 아니지만
+    /// 그 경보는 **시간당 예산과 쿨다운을 동결 구간에 태우고**, 보류 사유가 `Paused` 가 아니라
+    /// 큐 적체로 보여 운영자의 손잡이를 `resume` 에서 "큐를 비워라" 로 오도했다.
+    ///
+    /// 대조군이 이 검체의 절반이다: **스케줄 push 는 종전대로 통과해야 한다**(좌석 pause 중에도
+    /// 큐에서 기다린다 — 그것을 실패로 접으면 그 회차가 에러로 종결돼 다음 주기까지 안 온다).
+    #[test]
+    fn drill_late_seat_pause_refuses_the_alert_but_not_the_scheduled_push() {
+        let daemon = drill_daemon("a14-seatpause");
+        let cso = seat(&daemon, "cso");
+        let s = daemon.get_surface(cso).expect("좌석");
+        // 판정은 이미 끝났다고 보고(=경보가 Route 판정을 받았다) 그 뒤에 좌석만 pause 된다.
+        *s.queue_paused_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(!daemon.paused.load(Ordering::Relaxed), "전제: kill-switch 는 꺼져 있다");
+
+        let err = enqueue_alert(&daemon, cso, "[alert] health.alert surface:9 rule=x".into())
+            .expect_err("좌석 pause 중인데 경보가 큐에 들어갔다(A14 재발)");
+        assert_eq!(err, EnqueueErr::Frozen, "사유가 동결이 아니다");
+        assert_eq!(hold_reason_for(err), HoldReason::Paused, "보류 사유가 Paused 로 접히지 않는다");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 0, "거절했다면서 큐가 늘었다");
+
+        // 대조 ①: 스케줄 push 범위(`FreezeGuard::Daemon`)는 **같은 좌석·같은 순간**에 통과한다.
+        let (_, depth) = enqueue_into_seat(
+            &daemon,
+            cso,
+            "[schedule] 정기 점검".into(),
+            Some("schedule:x".into()),
+            "schedule",
+            50,
+            Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
+            FreezeGuard::Daemon,
+        )
+        .expect("좌석 pause 를 스케줄 push 의 실패로 접었다(일감이 다음 주기까지 사라진다)");
+        assert_eq!(depth, 1, "스케줄 push 가 큐에 들어가지 않았다");
+
+        // 대조 ②: kill-switch 는 **두 범위 모두** 막는다(종전 계약 불변).
+        daemon.paused.store(true, Ordering::Relaxed);
+        assert_eq!(
+            enqueue_into_seat(
+                &daemon,
+                cso,
+                "[schedule] 정기 점검".into(),
+                Some("schedule:x".into()),
+                "schedule",
+                50,
+                Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
+                FreezeGuard::Daemon,
+            )
+            .expect_err("kill-switch 가 스케줄 push 를 막지 못한다"),
+            EnqueueErr::Frozen
+        );
+        daemon.paused.store(false, Ordering::Relaxed);
+
+        // 대조 ③: pause 가 풀리면 경보도 그대로 들어간다(영구 봉인이 아니다).
+        *s.queue_paused_until.lock().unwrap() = None;
+        enqueue_alert(&daemon, cso, "[alert] health.alert surface:9 rule=x".into())
+            .expect("pause 해제 뒤에도 경보가 막힌다");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 2);
+    }
+
+    /// ★(성찰 A14) 판정(`RouteCtx::delivery_frozen`)과 늦은 재확인이 **같은 술어**를 쓴다 —
+    /// 정의처가 하나(`delivery_frozen_for`)임을 값으로 대조한다(소스 대조가 아니다).
+    #[test]
+    fn drill_route_ctx_and_the_late_recheck_share_one_freeze_predicate() {
+        let daemon = drill_daemon("a14-onepred");
+        let cso = seat(&daemon, "cso");
+        let s = daemon.get_surface(cso).expect("좌석");
+        let axes = [(false, false), (true, false), (false, true), (true, true)];
+        for (kill, seat_pause) in axes {
+            daemon.paused.store(kill, Ordering::Relaxed);
+            *s.queue_paused_until.lock().unwrap() = seat_pause
+                .then(|| std::time::Instant::now() + std::time::Duration::from_secs(60));
+            let judged = route_ctx(&daemon, after_grace(&daemon)).delivery_frozen;
+            let rechecked = delivery_frozen_for(&daemon, &s);
+            assert_eq!(
+                judged, rechecked,
+                "kill={kill} seat={seat_pause}: 판정과 재확인이 갈렸다(A14 의 두 술어 재발)"
+            );
+            assert_eq!(judged, kill || seat_pause, "동결 술어의 진리표가 바뀌었다");
+        }
+        daemon.paused.store(false, Ordering::Relaxed);
+    }
+
     #[test]
     fn source_pin_enqueue_holds_surfaces_lock_across_lookup_and_insert() {
         let src = include_str!("alert_route.rs");
         let at = src
             .find("pub fn enqueue_into_seat(")
             .expect("enqueue_into_seat 소실");
-        let body = &src[at..at + 3200];
+        // ★창을 **다음 항목 선언까지**로 잡는다(고정 바이트 수는 주석 한 줄에 깨진다 —
+        //   실제로 성찰 A14 의 주석이 `persist` 를 창 밖으로 밀어내 이 핀이 거짓 실패했다).
+        let end = at + src[at..].find("\n/// alert 전용 래퍼").expect("래퍼 경계 소실");
+        let body = &src[at..end];
         let lock = body
             .find("let surfaces = daemon.surfaces.lock().unwrap();")
             .expect("surfaces 맵 락을 잡지 않는다 — close 와의 경쟁에서 무음 유실");
@@ -6264,6 +6429,165 @@ mod pure_tests {
         }
     }
 
+}
+
+// ═══════════════ 성찰 A13 — 배차 선택의 비용과 동치(순수층) ═══════════════
+#[cfg(test)]
+mod reflect_a13 {
+    use super::*;
+
+    fn p(first_mono: f64, first_seen: f64, admitted: bool) -> PendingAlert {
+        PendingAlert {
+            first_seen,
+            last_seen: first_seen,
+            first_mono,
+            count: 1,
+            summary: "k=v".into(),
+            reason: "queued",
+            admitted_as: if admitted { Some("q-1".into()) } else { None },
+            admit_durable: false,
+        }
+    }
+
+    /// 종전 구현(전량 복제 → 정렬 → 자르기) — 동치 대조의 **기준선**이다.
+    fn legacy_batch(st: &RouteState) -> Vec<(AlertKey, PendingAlert)> {
+        let mut v: Vec<(AlertKey, PendingAlert)> = st
+            .pending
+            .iter()
+            .filter(|(_, p)| p.admitted_as.is_none())
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
+        v.sort_by(|a, b| {
+            a.1.first_mono
+                .partial_cmp(&b.1.first_mono)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.1.first_seen
+                        .partial_cmp(&b.1.first_seen)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        v.truncate(REEVAL_SCAN_MAX);
+        v
+    }
+
+    /// ★핵심 핀: 부분 선택이 종전 전량 정렬과 **같은 K개를 같은 순서로** 고른다.
+    ///
+    /// 실패 방향(이 검체가 막는 것): 비교자가 전순서가 아니거나 `select_nth_unstable_by` 의
+    /// 인덱스를 잘못 잡으면 '가장 오래된 K개' 가 아닌 집합이 뽑혀 **오래된 보류가 영영 훑히지
+    /// 않는다**(기아). 나이 동률·NaN·복원분(`first_mono == 0.0`)을 섞어 그 모서리를 함께 친다.
+    #[test]
+    fn scan_batch_picks_the_same_k_oldest_in_the_same_order_as_the_full_sort() {
+        for &n in &[0usize, 1, REEVAL_SCAN_MAX - 1, REEVAL_SCAN_MAX, REEVAL_SCAN_MAX + 1, 4_096] {
+            let mut st = RouteState::default();
+            for i in 0..n {
+                // 도달 가능한 정의역: 복원분(0.0) · 역순 · 동률 무더기. NaN 은 도달 불가이고
+                // 종전 비교자가 그 위에서 **패닉**하므로(추이성 위반 탐지) 동치 대조의 정의역이
+                // 아니다 — 전순서·무패닉은 아래 두 검체가 따로 친다.
+                let mono = match i % 3 {
+                    0 => 0.0,                        // 복원분 — 언제나 최우선
+                    1 => (n - i) as f64,             // 역순
+                    _ => ((n - i) / 7) as f64 * 7.0, // 동률 무더기
+                };
+                st.pending.insert(
+                    AlertKey::with_detail("health.alert", Some(i as u64 % 13), Some(format!("r{i:04}"))),
+                    // 10건에 1건은 인계 중 — 후보에서 빠져야 한다.
+                    p(mono, 1_000.0 + (i % 5) as f64, i % 10 == 3),
+                );
+            }
+            let got = scan_batch(&st);
+            let want = legacy_batch(&st);
+            assert_eq!(got.len(), want.len(), "n={n} 선택 건수가 종전과 다르다");
+            assert!(
+                got.iter().map(|(k, _)| k).eq(want.iter().map(|(k, _)| k)),
+                "n={n} 선택 집합·순서가 종전과 다르다(기아 위험)"
+            );
+            assert!(
+                got.iter().all(|(_, p)| p.admitted_as.is_none()),
+                "n={n} 인계 중인 항목이 배차 후보에 섞였다(중복 적재)"
+            );
+            assert!(got.len() <= REEVAL_SCAN_MAX, "n={n} 훑기 상한을 넘었다");
+        }
+    }
+
+    /// 배차 순서 비교자는 **전순서**여야 한다(부분 선택의 전제).
+    /// 반사·대칭·추이를 NaN 을 섞어 확인한다 — 여기가 깨지면 위 검체의 동치도 우연이다.
+    #[test]
+    fn scan_order_is_a_total_order_even_with_nan_ages() {
+        let keys: Vec<AlertKey> = (0..6)
+            .map(|i| AlertKey::with_detail("health.alert", Some(i), Some(format!("r{i}"))))
+            .collect();
+        let vals = [
+            p(0.0, 1.0, false),
+            p(f64::NAN, 1.0, false),
+            p(5.0, 1.0, false),
+            p(5.0, 2.0, false),
+            p(f64::NAN, 2.0, false),
+            p(0.0, 1.0, false),
+        ];
+        let items: Vec<(&AlertKey, &PendingAlert)> = keys.iter().zip(vals.iter()).collect();
+        for a in &items {
+            assert_eq!(scan_order(a, a), std::cmp::Ordering::Equal, "반사성 깨짐");
+            for b in &items {
+                assert_eq!(
+                    scan_order(a, b),
+                    scan_order(b, a).reverse(),
+                    "대칭성 깨짐"
+                );
+                for c in &items {
+                    if scan_order(a, b) != std::cmp::Ordering::Greater
+                        && scan_order(b, c) != std::cmp::Ordering::Greater
+                    {
+                        assert_ne!(
+                            scan_order(a, c),
+                            std::cmp::Ordering::Greater,
+                            "추이성 깨짐"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// NaN 나이가 섞여도 부분 선택이 **패닉하지 않는다**(종전 비교자는 rustc 의 전순서 위반
+    /// 탐지에 걸려 정렬 자리에서 패닉했다 — 그 패닉은 배차 태스크를 통째로 죽인다).
+    #[test]
+    fn scan_batch_does_not_panic_on_nan_ages() {
+        let mut st = RouteState::default();
+        for i in 0..(REEVAL_SCAN_MAX * 2) {
+            let mono = if i % 3 == 0 { f64::NAN } else { (i % 11) as f64 };
+            st.pending.insert(
+                AlertKey::with_detail("health.alert", Some(i as u64), Some(format!("r{i}"))),
+                p(mono, 1.0, false),
+            );
+        }
+        assert_eq!(scan_batch(&st).len(), REEVAL_SCAN_MAX);
+    }
+
+    /// ★(성찰 A13 ②) `dispatch` 는 `route_ctx` 를 **루프 밖에서 한 번**만 뜬다 — 배선 회귀 핀.
+    /// 종전에는 키마다 다시 떠서 `roles`→`surfaces`→`pending_queue` 3중 락을 최대 256회 잡았다.
+    /// 소스 대조는 성능의 증명이 아니라 **배선의 회귀**를 잡는 수단이다(그 한계를 명시한다).
+    #[test]
+    fn source_pin_dispatch_takes_route_ctx_once_outside_the_loop() {
+        let src = include_str!("alert_route.rs");
+        let i = src.find("pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {").expect("dispatch 소실");
+        let body = &src[i..i + 6_000];
+        let end = body.find("\npub fn reevaluate").unwrap_or(body.len());
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("route_ctx(daemon, now)").count(),
+            1,
+            "dispatch 가 route_ctx 를 두 번 이상 뜬다(키마다 3중 락 = A13 재발)"
+        );
+        let ctx_at = body.find("let mut ctx = route_ctx(daemon, now);").expect("루프 밖 ctx 소실");
+        let loop_at = body.find("for (key, p) in batch {").expect("배차 루프 소실");
+        assert!(ctx_at < loop_at, "ctx 획득이 루프 안으로 들어갔다");
+        assert!(
+            body.contains("ctx.cso_queue_depth = depth;"),
+            "적재 성공 시 보호선 깊이 갱신이 사라졌다(캐시가 낡아 보호선을 넘긴다)"
+        );
+    }
 }
 
 // ═════════════════ 독립 판정(triage R3-WP3B) — 잔여 지적 재현 검체 ═════════════════

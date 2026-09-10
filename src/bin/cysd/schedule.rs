@@ -1512,6 +1512,11 @@ fn deliver_push(
         SCHEDULE_QUEUE_ORIGIN,
         SCHEDULE_QUEUE_CAP,
         role_guard,
+        // ★(성찰 A14) 스케줄 push 는 **kill-switch 만** 늦은 동결로 본다. 좌석 pause(헬스 조치
+        //   `pause-queue`)는 배달을 미룰 뿐이고 항목은 큐에서 기다린다 — 그것을 실패로 접으면
+        //   이 회차가 `schedule.fired` 에서 에러로 종결돼 다음 주기까지 일감이 오지 않는다.
+        //   경보(`enqueue_alert`)는 반대다: 보류해도 잃지 않으므로 판정과 같은 술어를 쓴다.
+        crate::alert_route::FreezeGuard::Daemon,
     )
     .map(|_| "queued")
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
