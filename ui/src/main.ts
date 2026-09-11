@@ -5129,7 +5129,8 @@ let resetCompleted = false;
 // ★W-2 결정 A: start() 의 복원 구간(재설치 심문·레이아웃 복원·newSurface)이 열린 시각 · null = 구간 밖. 이
 // 구간과 겹친 완전 초기화는 죽은 데몬에 newSurface 를 보내 빈 화면을 남긴다(reviewer-codex R-1 MAJOR 3). 데몬을
 // 기다리는 구간은 이 값이 아니라 백엔드 부팅 관문이 지킨다(setup 태스크 전체에 가드가 걸려 있다).
-// 켜기=start() 의 데몬 대기 직후 · 끄기=start() 가 어떤 식으로든 끝날 때(맨 아래 start().finally).
+// 켜기=start() 의 데몬 대기 직후(재설치 안내창이 닫히면 다시 잰다 — W-3-b) · 끄기=start() 가 어떤 식으로든 끝날 때
+// (맨 아래 start().finally).
 // ★CEO 조건 (가): 불리언이 아니라 시각으로 두는 이유 — start() 가 멈춰 finally 에 닿지 못해도
 // resetGateVerdict 가 RESET_GATE_FAIL_OPEN_MS 뒤에는 막지 않는다(툴바 [완전 초기화] 영구 잠김 금지).
 let startRestoringSince: number | null = null;
@@ -6220,6 +6221,16 @@ function factoryResetConfirmModal(info: ResetPreview): Promise<boolean> {
   });
 }
 
+// ★CEO 조건 (나): 부팅 관문에 걸린 초기화 안내 — '고장'이 아니라 '잠시 후 다시'로 읽혀야 한다
+// (툴바 진입 관문 · 실행 직전 재조회 공용).
+function toastResetGateWait() {
+  toast(
+    "feed",
+    "⏳ 앱 시작을 마무리하는 중입니다",
+    "레이아웃·조직 복원 같은 시작 작업이 끝나면 완전 초기화를 쓸 수 있습니다 — 잠시 후 다시 눌러 주세요.",
+  );
+}
+
 // ★완전 초기화 실행 — 프리뷰(쓰기 0) → 문구 확인 → factory_reset_execute(코어=cys::factory_reset:
 // 데몬 전멸 하드 게이트 → cys-trash 격리+manifest → 훅·스킬링크 해제) → 종료 안내.
 // 완료 후 데몬이 없으므로 앱은 반쪽 상태 — 곧장 종료를 권한다(재실행 시 설치 온보딩).
@@ -6232,12 +6243,7 @@ async function factoryResetFlow() {
   if (daemonActionBlocked()) return;
   const gate = resetGateVerdict(await resetGateInput());
   if (gate !== "go") {
-    // ★CEO 조건 (나): '고장'이 아니라 '잠시 후 다시'로 읽혀야 한다.
-    toast(
-      "feed",
-      "⏳ 앱 시작을 마무리하는 중입니다",
-      "레이아웃·조직 복원 같은 시작 작업이 끝나면 완전 초기화를 쓸 수 있습니다 — 잠시 후 다시 눌러 주세요.",
-    );
+    toastResetGateWait();
     return;
   }
   let info: {
@@ -6291,6 +6297,12 @@ async function factoryResetFlow() {
   // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
   if (rotatingDaemon || purgingDept) {
     toast("feed", "작업 진행 중", "데몬 재시작 또는 부서 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  // ★W-3-b(reviewer-codex R3-M1): 실행 직전에 부팅 관문을 **다시 조회**한다 — 확인 창이 떠 있던 동안 복원·부팅 상태가
+  // 바뀌었을 수 있다(확인 창을 연 시점의 판정을 재사용하지 않는다). 백엔드 factory_reset_execute 도 같은 관문을 한 번 더 본다.
+  if (resetGateVerdict(await resetGateInput()) !== "go") {
+    toastResetGateWait();
     return;
   }
   factoryResetting = true;
@@ -6928,6 +6940,11 @@ async function start() {
   // 반쪽 상태·빈 화면을 남긴다. 기다림은 지금 시작하고(start() 가 도중에 실패해도 10분 상한으로 정직하게
   // 끝난다), 실제 확인 창은 관문이 열린 뒤에만 뜬다.
   const freshChoice = await freshStartFlow();
+  // ★W-3-b(reviewer-codex R3-M1): 안내창 체류는 복원 구간 상한(RESET_GATE_FAIL_OPEN_MS)에 넣지 않는다 — 사람이 안내창을
+  // 10분 넘게 열어 두면 상한이 복원을 시작하기도 전에 소진돼, 정상 복원 중에 초기화 확인 창이 열렸다. 상한 시계는 복원
+  // 작업이 실제로 시작되는 지금부터 다시 잰다(안내창이 떠 있는 동안에는 툴바가 모달에 가려지고 [새로 시작] 대기도 시작
+  // 전이라, 그 사이에 열리는 초기화 경로가 없다).
+  startRestoringSince = Date.now();
   if (startHaltedByReset(info)) return;
   if (freshChoice === "fresh") void deferredFreshReset();
 
@@ -7233,6 +7250,10 @@ async function start() {
     }
     // 등록된(또는 레지스트리 미조회) 부서 → 재-launch. ★시나리오4: rename으로 ws.name이 바뀌어도
     // socket(진짜 정체·불변)에서 원래 부서명을 역산해 호출 — '다른 소켓 새 데몬'이 원래 데몬을 고아화하지 않게.
+    // ★W-3-b(R3-M1): 한 번 확인하고 루프를 돌지 않는다 — 부서 데몬을 띄우기 **직전**마다 초기화 진행·완료를 다시 본다
+    // (위 daemon_status 를 기다리는 사이 초기화가 끝났을 수 있고, 그 뒤의 launch_dept_daemon 은 방금 멈춘 부서 데몬을
+    // 다시 띄울 수 있다).
+    if (startHaltedByReset(info)) return;
     try {
       const info = (await invoke("launch_dept_daemon", { name: deptNameFromSocket(ws.socket) ?? ws.name })) as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
@@ -7304,6 +7325,7 @@ async function start() {
     if (!lb || !lb.ok) continue;
     const ws = workspaces.find((w) => (w.socket ?? undefined) === (sk ?? undefined));
     for (const s of lb.list) {
+      if (startHaltedByReset(info)) return; // ★W-3-b(R3-M1): pane 을 붙이기 전마다 초기화 진행·완료를 다시 본다
       await makePane(s.surface_id, s.title, sk);
       if (ws && !collectSids(ws.tree).includes(s.surface_id)) {
         ws.tree = ws.tree
@@ -7318,6 +7340,9 @@ async function start() {
   // 재-launch된 경우)는 위 병합 루프가 못 채운다 — plain 셸 1개로 충전해 빈 탭 소실/고아 placeholder 방지.
   for (const ws of workspaces) {
     if (ws.tree || ws.socket == null || liveBySock.get(ws.socket)?.ok !== true) continue;
+    // ★W-3-b(R3-M1): 매 newSurface 앞에서 다시 본다 — 루프 앞 한 번의 확인으로는 루프 도중 끝난 초기화를 못 보고,
+    // 그 뒤의 newSurface 는 죽은 데몬에 surface 를 요청해 빈 화면을 남긴다.
+    if (startHaltedByReset(info)) return;
     const sid = await newSurface(null, ws.socket);
     ws.tree = { type: "pane", sid };
   }
@@ -7326,9 +7351,11 @@ async function start() {
     // 충전 루프는 ok!==true라 스킵) — 죽은 부서 socket에 newSurface하면 backend가 reject해 복원이 깨진다.
     // 기본 데몬(socket undefined·상시 가용)으로 폴백해 빈 화면/미처리 rejection을 막는다(정상 경로 불변).
     let sid: number;
+    if (startHaltedByReset(info)) return; // ★W-3-b(R3-M1): newSurface 앞 재확인
     try {
       sid = await newSurface(null, current().socket);
     } catch {
+      if (startHaltedByReset(info)) return; // ★W-3-b: 첫 시도가 실패하는 사이 초기화가 끝났을 수 있다
       sid = await newSurface(null, undefined);
     }
     current().tree = { type: "pane", sid };

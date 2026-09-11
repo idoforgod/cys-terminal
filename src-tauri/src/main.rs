@@ -3231,10 +3231,59 @@ fn gui_onboarded_path() -> std::path::PathBuf {
     cys::home_dir().join(".cys/.gui-onboarded")
 }
 
-/// GUI 온보딩 실행 여부 — 부작용 없는 순수 판정(단위테스트 대상). 마커 내용이 현재 바이너리
-/// 버전과 정확히 일치할 때만 스킵. 부재·불일치·읽기 실패 = 실행(fail-open — 치유 방향).
-fn needs_gui_onboard(marker: Option<&str>, current_version: &str) -> bool {
-    marker.map(str::trim) != Some(current_version)
+/// GUI 온보딩 실행 여부 — 부작용 없는 순수 판정(단위테스트 대상). 마커 내용이 현재 바이너리 버전과 정확히
+/// 일치하고 **온보딩의 결과(각성 훅)가 실제로 있을 때만** 스킵. 부재·불일치·읽기 실패·훅 부재 = 실행
+/// (fail-open — 치유 방향).
+/// ★W-3-a(2026-09-11 · reviewer-codex R3-B1): 마커는 '온보딩이 한 번 성공했다'는 기록일 뿐 지금 훅이 있다는
+/// 증거가 아니다. 완전 초기화와 늦게 끝난 온보딩이 어떤 순서로 겹쳐도 — 초기화 뒤에 마커가 다시 써지거나,
+/// 초기화가 목록을 뽑은 뒤 마커가 생겨 격리를 피하거나 — 남는 것은 '마커는 맞고 훅은 없는' 상태이고, 그 상태는
+/// 다음 기동에 온보딩을 다시 돌려 스스로 치유된다. 쓰는 순서를 락 없이 맞추려던 래치(W-2 A4)는 경쟁이 남아
+/// 버렸다 — 경쟁을 이기려 하지 않고 결과를 무해하게 만든다. 이 기능과 무관하게 이미 있던 '훅만 사후 유실
+/// (마커 무결)' 상태도 같은 길로 치유된다(종전엔 doctor --fix·버전 전이에 미뤘다).
+fn needs_gui_onboard(marker: Option<&str>, current_version: &str, hooks_installed: bool) -> bool {
+    !hooks_installed || marker.map(str::trim) != Some(current_version)
+}
+
+/// ★W-3-a: GUI 온보딩의 결과가 **실제로 있는가** — `cys init-pack`(src/bin/cys.rs run_init_pack)이 등록하는
+/// 것과 같은 대상·명령·집합을 본다: 홈 직하 개인 Claude 프로필(`~/.claude`·`~/.claude-*`) settings.json 전부
+/// (프로필이 하나도 없으면 init-pack 이 만드는 `~/.claude/settings.json`)에 각성 훅(`cys::pack::AWAKENING_HOOKS`)이
+/// 이 팩을 가리키는 명령 그대로 등재돼 있고, 그 훅 스크립트 파일이 팩에 있어야 '설치됨'이다. 부서 팩은 init-pack 이
+/// 개인 프로필에 훅을 쓰지 않으므로 판정 대상이 아니다(설치됨으로 본다).
+/// 등재는 command 축만 본다(`hook_registered_in` — `cys doctor`·부트 경고와 같은 관측 술어): timeout 만 달라진
+/// 설치를 '없음'으로 보면 매 기동 온보딩이 돈다.
+/// 비용(부팅마다 1회): 홈 디렉터리 목록 1회 + 프로필 수만큼 작은 JSON 읽기 + 훅 스크립트 stat 2회.
+fn gui_hooks_installed_under(home: &std::path::Path, pack: &std::path::Path) -> bool {
+    if cys::pack::dept_scope_of(pack).is_some() {
+        return true;
+    }
+    if !cys::pack::AWAKENING_HOOKS
+        .iter()
+        .all(|h| pack.join("hooks").join(h.script).is_file())
+    {
+        return false;
+    }
+    let mut targets: Vec<std::path::PathBuf> = cys::pack::personal_profile_dirs_under(home)
+        .into_iter()
+        .map(|d| d.join("settings.json"))
+        .collect();
+    if targets.is_empty() {
+        targets.push(home.join(".claude/settings.json"));
+    }
+    targets.iter().all(|settings| {
+        let Some(root) = std::fs::read_to_string(settings)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        else {
+            return false;
+        };
+        cys::pack::AWAKENING_HOOKS.iter().all(|h| {
+            cys::pack::hook_registered_in(&root, h.event, &cys::pack::hook_command_for(pack, h.script))
+        })
+    })
+}
+
+fn gui_hooks_installed() -> bool {
+    gui_hooks_installed_under(&cys::home_dir(), &cys::pack::pack_dir())
 }
 
 /// ★재설치 감지 마커 — "이 사용자 데이터를 마지막으로 본 **설치본**이 무엇인가". 앱 번들을 지웠다
@@ -5250,8 +5299,9 @@ static BOOT_WORK_LAST_START_MS: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// 왜 fail-open 인가: 관문이 닫힌 채 굳으면 툴바 [완전 초기화]가 **영구 잠김**이 된다. 완전 초기화는 부팅이
 /// 망가진 기계의 복구 수단이기도 해서, 영구 잠김은 이 관문이 막으려던 경쟁(부팅과 겹친 초기화)보다 나쁘다.
 /// 10분 = 정상 부팅의 가장 긴 경로(setup 의 데몬 재시도 20회×15초 ≈ 5분 + 온보딩·팩 반영·조직 복원)에 여유를
-/// 둔 값. 상한 뒤에 여는 초기화도 문구 타이핑 확인을 그대로 거치고, 그 틈에 늦게 끝난 온보딩이 완료 마커를
-/// 남기지 못하게 `record_gui_onboarded` 가 막는다(초기화가 시작된 프로세스는 마커를 쓰지 않는다).
+/// 둔 값. 상한 뒤에 여는 초기화도 문구 타이핑 확인을 그대로 거친다. 그 틈에 늦게 끝난 온보딩이 초기화 뒤에
+/// 완료 마커를 남겨도, 다음 기동의 `needs_gui_onboard` 가 훅 실재를 확인해 온보딩을 다시 돈다(W-3-a — 쓰는
+/// 순서를 맞추는 대신 결과를 무해하게 만든다).
 const BOOT_GATE_FAIL_OPEN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// 프로세스 안 단조 시계(ms) — 벽시계 조정에 흔들리지 않는 fail-open 기준.
@@ -5302,25 +5352,6 @@ fn reset_blocked_by_boot(in_flight: usize, since_last_start: std::time::Duration
 fn boot_gate_refusal() -> Option<String> {
     let (n, since) = boot_gate_snapshot();
     reset_blocked_by_boot(n, since)
-}
-
-/// ★W-2 A4: 완전 초기화가 이 프로세스에서 시작됐는가 — 되돌리지 않는 래치(프런트 `resetCompleted` 의 백엔드 짝).
-static RESET_STARTED_IN_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// GUI 온보딩 완료 마커(`.gui-onboarded`) 기록 — setup 의 윈도우·맥 온보딩이 이 한 곳으로만 쓴다.
-/// ★W-2 A4(reviewer-codex R-1 BLOCKER 2 의 기제 자체 봉쇄): 이 프로세스에서 완전 초기화가 시작됐으면 쓰지 않는다.
-/// 초기화가 팩·훅·이 마커를 걷어낸 **뒤에** 늦게 끝난 온보딩이 마커=현재버전을 남기면 다음 기동이 온보딩을
-/// 건너뛰어 훅 없는 영구 반쪽 상태가 된다(오너 위험 ③). 쓰지 않으면 다음 기동이 온보딩을 다시 돈다(init-pack
-/// 멱등 — 초기화 직후 원래 가야 할 상태). 부팅 관문이 닫혀 있는 동안에는 초기화가 시작될 수 없으므로 이 분기는
-/// fail-open 상한이 지난 뒤의 틈에서만 뜻이 있다.
-fn record_gui_onboarded() {
-    if RESET_STARTED_IN_PROCESS.load(std::sync::atomic::Ordering::SeqCst) {
-        eprintln!("[cys-app] 완전 초기화가 시작된 프로세스 — 온보딩 완료 마커를 쓰지 않는다(다음 기동이 온보딩을 다시 돈다)");
-        return;
-    }
-    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
-        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
-    }
 }
 
 /// 프런트 폴링용(쓰기 0) — 부팅 뒤로 미룬 [깨끗하게 새로 시작]과 툴바 초기화가 확인 창을 열어도 되는지 본다.
@@ -5436,9 +5467,6 @@ async fn factory_reset_execute(
         let mut progress = |phase: &str, detail: &str| {
             let _ = app.emit("reset-progress", json!({"phase": phase, "detail": detail}));
         };
-        // ★W-2 A4: 여기서부터 초기화가 실제로 시작된다 — 늦게 끝난 온보딩이 완료 마커를 남기지 않게 래치를 건다
-        // (record_gui_onboarded · 되돌리지 않는다: 초기화가 시작된 프로세스는 재실행 전까지 반쪽 상태다).
-        RESET_STARTED_IN_PROCESS.store(true, std::sync::atomic::Ordering::SeqCst);
         // ★P0-1: RAII 센티널 — 조기 return·패닉에도 Drop 이 해제한다(잔존 시 데몬 기동 불가).
         let _sentinel = cys::factory_reset::ResetSentinel::arm();
         cys::factory_reset::stop_daemons_and_unregister(&plan, &mut progress).map_err(|e| {
@@ -6196,11 +6224,13 @@ fn main() {
                 // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
                 // 게이트가 선점돼 ~/.claude hook이 영구 미설치됐다(0.12.52 cys-neo 실사고 — "너는
                 // 마스터다" 부트스트랩 무력화). 이 마커는 GUI 온보딩 성공 경로만 기록하므로 프로세스
-                // 순서와 무관하게 신선 머신 온보딩이 보장된다. 평시 부트 비용 = 마커 read 1회.
+                // 순서와 무관하게 신선 머신 온보딩이 보장된다. 평시 부트 비용 = 마커 read 1회 + 훅 실재 확인
+                // (홈 목록·작은 JSON 읽기·stat — W-3-a).
                 #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
                 let needs_onboard = needs_gui_onboard(
                     std::fs::read_to_string(gui_onboarded_path()).ok().as_deref(),
                     env!("CARGO_PKG_VERSION"),
+                    gui_hooks_installed(),
                 );
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
@@ -6269,15 +6299,20 @@ fn main() {
                 // 게이트(needs_onboard·위 캡처): 마커 부재(신선·직전 실패)·버전 불일치에만 실행 —
                 // 평시 부트의 사이드카 스폰+전량 스윕+schtasks 재등록 비용 제거(Win11 이슈 실측).
                 // 마커는 온보딩 **성공** 시에만 기록 — hook 등록 실패(init-pack rc=1)도 재시도로 수렴.
-                // hook만 사후 유실된 상태(마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
+                // hook만 사후 유실된 상태(마커 무결)는 needs_gui_onboard 의 훅 실재 확인이 다음 부트에 온보딩을
+                // 다시 돌려 치유한다(W-3-a · 종전엔 doctor --fix·버전 전이에 미뤘다).
                 #[cfg(windows)]
                 if needs_onboard && maybe_windows_onboard() {
-                    record_gui_onboarded(); // ★W-2 A4: 초기화가 시작된 프로세스는 마커를 쓰지 않는다
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
                 }
                 // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
                 if needs_onboard && maybe_macos_onboard() {
-                    record_gui_onboarded(); // ★W-2 A4: 초기화가 시작된 프로세스는 마커를 쓰지 않는다
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
@@ -6595,8 +6630,8 @@ mod tests {
     /// ★W-2 결정 A 배선 핀: 관문은 **실제 부팅 기계**에 무장돼 있어야 뜻이 있다(배선이 빠지면 관문은 늘 열려
     /// 있고 위 가드 테스트는 초록인 채로 무의미해진다). 같은 파일의 factory_reset_execute 트립와이어와 같은
     /// 방식으로 소스 구조를 잰다: setup·조직 복원은 spawn **전에**, 업데이트 팩 반영은 init-pack **전에** 가드를
-    /// 잡고, 초기화 실행은 데몬 정지 **전에** 관문을 본다. ★W-2 A4: 초기화 래치는 관문 뒤·데몬 정지 앞에 걸리고,
-    /// 온보딩 완료 마커는 래치를 보는 한 곳(record_gui_onboarded)으로만 쓴다.
+    /// 잡고, 초기화 실행은 데몬 정지 **전에** 관문을 본다. ★W-3-a: setup 의 온보딩 판정에는 훅 실재 확인이
+    /// 배선돼 있어야 한다(마커만 믿는 판정으로의 회귀 차단).
     #[test]
     fn boot_work_gate_is_armed_on_every_boot_task_and_checked_before_reset() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
@@ -6624,16 +6659,12 @@ mod tests {
         let gate = "boot_gate_refusal()";
         before(exec, gate, "stop_daemons_and_unregister", "초기화 실행");
         before(exec, gate, "spawn_blocking", "초기화 실행");
-        let latch = "RESET_STARTED_IN_PROCESS.store(true";
-        before(exec, gate, latch, "초기화 래치");
-        before(exec, latch, "stop_daemons_and_unregister", "초기화 래치");
+        // ★W-3-a(R3-B1): 온보딩 판정은 마커만이 아니라 훅 실재를 입력으로 받는다 — setup 이 그 값을 실제로 넘기는가.
+        let onboard_call = seg("let needs_onboard = needs_gui_onboard(", ");");
         assert!(
-            !setup.contains("std::fs::write(gui_onboarded_path()"),
-            "setup 이 온보딩 마커를 직접 쓴다 — 래치를 우회한다(record_gui_onboarded 를 거쳐라)"
+            onboard_call.contains("gui_hooks_installed()"),
+            "setup 의 온보딩 판정에 훅 실재 확인이 빠졌다 — 마커만 믿는 판정으로 회귀(R3-B1)"
         );
-        assert_eq!(setup.matches("record_gui_onboarded()").count(), 2, "윈도우·맥 온보딩 두 곳");
-        let rec = seg("fn record_gui_onboarded(", "\n}\n");
-        before(rec, "RESET_STARTED_IN_PROCESS.load(", "std::fs::write(gui_onboarded_path()", "온보딩 마커 기록");
         // CEO 조건 (나): 프런트가 거부를 '잠시 후 다시'로 알아보는 머리 문구가 두 언어에서 같다.
         let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/resetconfirm.ts");
         let ui_src = std::fs::read_to_string(&ui)
@@ -6644,11 +6675,124 @@ mod tests {
 
     #[test]
     fn needs_gui_onboard_only_skips_on_exact_version_match() {
-        assert!(needs_gui_onboard(None, "0.12.53"), "마커 부재 = 온보딩(신선·직전 실패)");
-        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53"), "정확 일치 = 스킵");
-        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53"), "개행 trim 후 일치 = 스킵");
-        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53"), "구버전 = 온보딩(업그레이드)");
-        assert!(needs_gui_onboard(Some("garbage"), "0.12.53"), "손상 = 온보딩(fail-open)");
+        assert!(needs_gui_onboard(None, "0.12.53", true), "마커 부재 = 온보딩(신선·직전 실패)");
+        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53", true), "정확 일치 = 스킵");
+        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53", true), "개행 trim 후 일치 = 스킵");
+        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53", true), "구버전 = 온보딩(업그레이드)");
+        assert!(needs_gui_onboard(Some("garbage"), "0.12.53", true), "손상 = 온보딩(fail-open)");
+        // ★W-3-a: 마커가 맞아도 훅이 실제로 없으면 온보딩한다(마커 ≠ 실재).
+        assert!(needs_gui_onboard(Some("0.12.53"), "0.12.53", false), "마커 일치 + 훅 부재 = 온보딩(자가 치유)");
+    }
+
+    /// ★W-3-a: 온보딩 결과(각성 훅)의 실재 확인은 `cys init-pack` 이 등록하는 대상·명령과 같아야 한다 — 정상 설치는
+    /// '설치됨'(평시 부트에 온보딩이 돌지 않는다), 완전 초기화의 실제 훅 해제 뒤에는 '없음'.
+    #[test]
+    fn gui_hooks_installed_follows_what_init_pack_registers() {
+        let home = std::env::temp_dir().join(format!("cys-w3-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pack = home.join(".cys/pack");
+        assert!(!gui_hooks_installed_under(&home, &pack), "팩 훅 스크립트 부재 = 설치 안 됨");
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        for h in cys::pack::AWAKENING_HOOKS.iter() {
+            std::fs::write(pack.join("hooks").join(h.script), "#!/bin/sh\n").unwrap();
+        }
+        // 프로필이 없으면 init-pack 이 만드는 ~/.claude/settings.json 이 대상이다 — 아직 없다.
+        assert!(!gui_hooks_installed_under(&home, &pack), "등록 대상 settings.json 부재 = 설치 안 됨");
+        let main_settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(main_settings.parent().unwrap()).unwrap();
+        cys::pack::merge_desired_hooks(&main_settings, &pack, &cys::pack::AWAKENING_HOOKS).unwrap();
+        assert!(gui_hooks_installed_under(&home, &pack), "init-pack 과 같은 등록 = 설치됨");
+        let cur = env!("CARGO_PKG_VERSION");
+        assert!(
+            !needs_gui_onboard(Some(cur), cur, gui_hooks_installed_under(&home, &pack)),
+            "정상 설치 + 현재 버전 마커 = 온보딩 안 함(평시 부트 비용 회귀 금지)"
+        );
+        // 프로필이 하나 더 생기면 init-pack 은 거기에도 등록한다 — 거기 없으면 설치 미완.
+        std::fs::create_dir_all(home.join(".claude-2")).unwrap();
+        assert!(!gui_hooks_installed_under(&home, &pack), "새 프로필에 훅 없음 = 설치 미완");
+        cys::pack::merge_desired_hooks(&home.join(".claude-2/settings.json"), &pack, &cys::pack::AWAKENING_HOOKS)
+            .unwrap();
+        assert!(gui_hooks_installed_under(&home, &pack));
+        // 완전 초기화가 쓰는 실제 훅 해제 함수가 걷어내면 '없음'.
+        cys::factory_reset::strip_cys_from_settings(&main_settings, &home.join(".cys")).unwrap();
+        assert!(!gui_hooks_installed_under(&home, &pack), "초기화의 훅 해제 뒤 = 설치 안 됨");
+        // 부서 팩은 init-pack 이 개인 프로필에 훅을 쓰지 않는다 — 판정 대상 아님.
+        assert!(gui_hooks_installed_under(&home, &home.join(".cys/pack-dept-x")));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ★W-3 게이트 9 — reviewer-codex R3-B1 검체의 동형 픽스처: 온보딩이 init-pack 을 마쳐 훅이 등록된 상태.
+    fn b1_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!("cys-w3-b1{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pack = home.join(".cys/pack");
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        for h in cys::pack::AWAKENING_HOOKS.iter() {
+            std::fs::write(pack.join("hooks").join(h.script), "#!/bin/sh\n").unwrap();
+        }
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        cys::pack::merge_desired_hooks(&settings, &pack, &cys::pack::AWAKENING_HOOKS).unwrap();
+        assert!(gui_hooks_installed_under(&home, &pack), "검체 전제: 온보딩이 훅 등록까지 마쳤다");
+        let marker = home.join(".cys/.gui-onboarded");
+        (home, pack, settings, marker)
+    }
+
+    /// 두 검체의 끝 상태 판정 — '마커는 현재 버전 · 훅은 없음'. 마커만 믿던 판정(7f1cf1f 까지의 needs_gui_onboard)은
+    /// 다음 기동 온보딩을 건너뛴다(= 훅 없는 영구 반쪽 · 위험 ③). W-3-a 판정은 온보딩을 다시 돌린다(= 자가 치유).
+    fn b1_assert_end_state_heals(home: &std::path::Path, pack: &std::path::Path, marker: &std::path::Path, tag: &str) {
+        let cur = env!("CARGO_PKG_VERSION");
+        let value = std::fs::read_to_string(marker).unwrap();
+        assert_eq!(value.trim(), cur, "B1({tag}) 끝 상태: 현재 버전 마커");
+        assert!(!gui_hooks_installed_under(home, pack), "B1({tag}) 끝 상태: 훅 없음");
+        let marker_only_would_skip = value.trim() == cur;
+        assert!(marker_only_would_skip, "B1({tag}) 반사실이 서지 않는다 — 검체가 위험 상태를 만들지 못했다");
+        assert!(
+            needs_gui_onboard(Some(&value), cur, gui_hooks_installed_under(home, pack)),
+            "B1({tag}) 끝 상태가 다음 기동에 치유되지 않는다"
+        );
+        println!(
+            "B1({tag}) 끝 상태: 마커={} · 훅 없음 · 마커만 믿던 판정=온보딩 건너뜀(위험 ③) · W-3-a 판정=온보딩(자가 치유)",
+            value.trim()
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// ★게이트 9-(a) R3-B1 (a) 동형: 온보딩이 init-pack 을 마치고 마커를 쓰기 직전에 멈춘 사이 완전 초기화가 마커를
+    /// 격리하고 훅을 걷어내고 팩을 격리한다 → 온보딩이 재개돼 현재 버전 마커를 다시 쓴다(A4 를 제거했으므로 가로막는
+    /// 래치가 없다). 초기화의 훅 해제는 실제 함수(strip_cys_from_settings), 격리는 rename 모형.
+    #[test]
+    fn b1_race_a_marker_rewritten_after_reset_heals_on_next_boot() {
+        let (home, pack, settings, marker) = b1_fixture("a");
+        std::fs::write(&marker, "0.14.33").unwrap(); // 업그레이드 온보딩 진행 중(옛 버전 마커)
+        let q = home.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::rename(&marker, q.join(".gui-onboarded")).unwrap();
+        cys::factory_reset::strip_cys_from_settings(&settings, &home.join(".cys")).unwrap();
+        std::fs::rename(&pack, q.join("pack")).unwrap();
+        std::fs::write(&marker, env!("CARGO_PKG_VERSION")).unwrap(); // setup 의 마커 기록과 같은 동작
+        b1_assert_end_state_heals(&home, &pack, &marker, "a");
+    }
+
+    /// ★게이트 9-(b) R3-B1 (b) 동형: 첫 온보딩 중(마커 없음) 초기화가 목록을 뽑아 계획을 세운 뒤 온보딩이 마커를 쓴다
+    /// → 초기화는 계획에 있는 것만 격리하고 훅을 걷어낸다 → 계획 밖 마커가 남는다.
+    #[test]
+    fn b1_race_b_marker_outside_reset_plan_heals_on_next_boot() {
+        let (home, pack, settings, marker) = b1_fixture("b");
+        let plan: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".cys"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(!plan.contains(&marker), "계획 수립 시점에는 마커가 없다");
+        std::fs::write(&marker, env!("CARGO_PKG_VERSION")).unwrap(); // 계획 수립 뒤 온보딩이 마커를 쓴다
+        let q = home.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        for item in &plan {
+            std::fs::rename(item, q.join(item.file_name().unwrap())).unwrap();
+        }
+        cys::factory_reset::strip_cys_from_settings(&settings, &home.join(".cys")).unwrap();
+        assert!(marker.exists(), "계획 밖이라 격리되지 않은 마커");
+        b1_assert_end_state_heals(&home, &pack, &marker, "b");
     }
 
     #[test]
