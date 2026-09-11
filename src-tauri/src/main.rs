@@ -3271,19 +3271,36 @@ fn current_install_stamp() -> Option<String> {
 /// 위 함수의 테스트 가능한 심장 — `current_exe()`·홈·버전을 주입받는다. 실제 설치 경로
 /// (`/Applications/cys.app/Contents/MacOS/<exe>`)가 통과하는지 테스트로 **고정**해, 훗날 경로
 /// 판정이 바뀌어 이 기능이 **조용히 죽는 것**(늘 `None` → 영영 안 물음)을 막는다.
+///
+/// ★W-1(2026-09-11 · v0.14.34 태그 레인 windows-latest 컴파일 실패 — E0433 `unix` · E0599 `dev`/`ino`):
+/// `(dev, ino)` 는 유닉스 전용 API 인데 cfg 없이 불러 Windows 빌드가 죽었다. 아이템은 모든 플랫폼에
+/// 두고 **본문 안에서** 가른다(`same_file_ident` 형태 · BLOCK-B 계약). 유닉스 밖은 `None`(= 묻지 않음):
+///  · 판정 대상은 macOS 앱 번들이다. 위 경로 게이트는 `…/cys.app/Contents/MacOS` 만 통과시키므로
+///    Windows 설치 경로에서는 원래부터 여기서 `None` 이었다 — dev/ino 줄은 Windows 에서 닿지 않는 코드였다.
+///  · Windows 의 대응 신원(`volume_serial_number`·`file_index`)은 stable 에 없다(`windows_by_handle` 불안정).
+///  · 판정 불능을 "묻지 않음"으로 닫는 것은 이 기능의 교리(미탐 = 종전 동작 · 오탐 = 데이터 격리)와 같은 방향이다.
 fn install_stamp_for(
     exe: &std::path::Path,
     home: &std::path::Path,
     version: &str,
 ) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let macos_dir = exe.parent()?;
-    if !strict_install_bundle_ok(macos_dir, home) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let macos_dir = exe.parent()?;
+        if !strict_install_bundle_ok(macos_dir, home) {
+            return None;
+        }
+        let bundle = macos_dir.parent()?.parent()?;
+        let md = std::fs::metadata(bundle).ok()?;
+        return Some(format!("{}:{}|{version}", md.dev(), md.ino()));
+    }
+    #[cfg(not(unix))]
+    {
+        // 유닉스 밖에는 번들 신원을 잴 stable API 가 없다 → 판정 불능 = 묻지 않음(위 교리).
+        let _ = (exe, home, version);
         return None;
     }
-    let bundle = macos_dir.parent()?.parent()?;
-    let md = std::fs::metadata(bundle).ok()?;
-    Some(format!("{}:{}|{version}", md.dev(), md.ino()))
 }
 
 /// 사용자가 앱을 휴지통에 넣었다는 증거 — **단, 마지막 기록 이후에 넣은 것만**.
@@ -6363,11 +6380,21 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("cys-stamp-{}", std::process::id()));
         let macos = tmp.join("Applications/cys.app/Contents/MacOS");
         std::fs::create_dir_all(&macos).unwrap();
-        let got = install_stamp_for(&macos.join("cys-app"), &tmp, "0.14.34").unwrap();
-        let (ident, ver) = split_install_stamp(&got);
-        assert_eq!(ver, Some("0.14.34"));
-        assert!(ident.contains(':') && ident.split(':').all(|p| p.parse::<u64>().is_ok()));
+        let got = install_stamp_for(&macos.join("cys-app"), &tmp, "0.14.34");
         std::fs::remove_dir_all(&tmp).ok();
+        // ★W-1: 플랫폼별 계약을 둘 다 고정한다 — 유닉스는 번들 신원을 재고, 그 밖은 번들 모양이어도
+        // 판정하지 않는다(= 묻지 않음). 한쪽만 고정하면 다른 쪽이 조용히 바뀌어도 초록이다.
+        #[cfg(unix)]
+        {
+            let got = got.expect("유닉스에서 번들 모양 경로는 스탬프가 나와야 한다");
+            let (ident, ver) = split_install_stamp(&got);
+            assert_eq!(ver, Some("0.14.34"));
+            assert!(ident.contains(':') && ident.split(':').all(|p| p.parse::<u64>().is_ok()));
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(got, None, "유닉스 밖은 판정 불능 = 묻지 않음");
+        }
     }
 
     #[test]
