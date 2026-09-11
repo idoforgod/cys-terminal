@@ -3393,6 +3393,7 @@ enum GuiOnboardPlan {
     RunCounted(u32),
     /// 상한 도달 — 더 시도하지 않는다. ★`Installed` 로 치는 것이 아니다: 마커를 쓰지 않고, 매 기동 다시 관측하고,
     /// 안내를 띄운다. 파일이 고쳐지면(사유가 바뀌거나 판정 불가가 사라지면) 기록이 초기화돼 다시 시도한다.
+    /// ★W-5: 시도 기록을 읽거나 남길 수 없을 때도 이것이다 — 몇 번 시도했는지 기억할 수 없으면 반복하지 않는다.
     Capped,
 }
 
@@ -3418,7 +3419,8 @@ fn gui_onboard_attempts_path() -> std::path::PathBuf {
 }
 
 /// 기록된 시도 수 — **같은 앱 버전·같은 사유**일 때만 이어 센다. 버전이 바뀌면(새 온보딩 코드·새 팩) 또는 사유가 바뀌면
-/// (파일이 달라졌다) 0 — 상태가 바뀌면 초기화. 기록 부재·손상도 0(모르면 시도 쪽 — 상한은 여전히 걸린다).
+/// (파일이 달라졌다) 0 — 상태가 바뀌면 초기화. 기록 부재·손상 내용도 0 — 이번 시도 직전에 새 기록으로 덮으므로 상한은 여전히
+/// 걸린다(덮지 못하면 그 기동은 `Capped` — W-5-a). 읽기 자체가 실패한 기록은 여기 오지 않는다(W-5-c · `gui_onboard_plan_under`).
 fn prior_gui_onboard_attempts(record: Option<&str>, version: &str, reason: &str) -> u32 {
     let Some(v) = record.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
         return 0;
@@ -3429,45 +3431,75 @@ fn prior_gui_onboard_attempts(record: Option<&str>, version: &str, reason: &str)
     v["attempts"].as_u64().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
-/// 한 기동의 계획(읽기만 — 기록 갱신은 실제 시도 직전의 `record_gui_onboard_attempt`).
+/// 한 기동의 계획(읽기만 — 기록 갱신은 실제 시도 직전의 `record_gui_onboard_attempt`). 반환 = (계획, 시도 기록을 기억할 수 없는 사유).
+/// ★W-5-b/c: 기록은 판정 불가일 때만 읽는다. **부재**는 신선 기계·첫 판정 불가의 정상 상태라 0 부터 센다. 그 밖의 읽기 실패는
+/// 몇 번 시도했는지 모른다는 뜻이다 — 0 으로 읽으면 매 기동이 첫 시도가 되어 상한이 오지 않는다(de6ef66 의 `.ok()`). 기억할 수
+/// 없으면 반복하지 않는다: `Capped` + 사유(상한 안내에 실린다). `Installed` 로 치는 것이 아니다.
 fn gui_onboard_plan_under(
     seen: &HookObservation,
     marker: Option<&str>,
     attempts_path: &std::path::Path,
     version: &str,
-) -> GuiOnboardPlan {
+) -> (GuiOnboardPlan, Option<String>) {
     let presence = seen.presence();
-    let prior = seen.undeterminable_reason().map_or(0, |why| {
-        prior_gui_onboard_attempts(std::fs::read_to_string(attempts_path).ok().as_deref(), version, &why)
-    });
-    plan_gui_onboard(needs_gui_onboard(marker, version, &presence), &presence, prior)
+    let prior = match &presence {
+        HookPresence::Undeterminable(why) => match std::fs::read_to_string(attempts_path) {
+            Ok(record) => prior_gui_onboard_attempts(Some(&record), version, why),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                eprintln!("[cys-app] onboarding attempts record unreadable — 이번 기동은 시도하지 않는다: {e}");
+                return (
+                    GuiOnboardPlan::Capped,
+                    Some(format!("시도 기록을 읽을 수 없어({} — {e})", attempts_path.display())),
+                );
+            }
+        },
+        _ => 0,
+    };
+    (plan_gui_onboard(needs_gui_onboard(marker, version, &presence), &presence, prior), None)
 }
 
-/// 시도 기록 갱신 — 판정 불가 대상이 없으면 지운다(상태가 바뀌었다 = 초기화) · `RunCounted(n)` 이면 n 을 쓴다.
+/// 시도 기록 갱신 — 판정 불가 대상이 없으면 지운다(상태가 바뀌었다 = 초기화) · `RunCounted(n)` 이면 n 을 쓴다. 반환 = 이 기동이
+/// 실제로 따를 (계획, 시도 기록을 기억할 수 없는 사유) — 들어온 그대로, 또는 아래 W-5-a.
+/// ★W-5-a(R5-M1): `RunCounted(n)` 을 남기지 못하면 그 기동은 `Capped`(시도 안 함) + 사유다. 상한은 이 기록에만 기대므로, 남기지
+/// 못한 채 시도하면 다음 기동이 또 첫 시도로 읽어 상한이 영영 오지 않는다(de6ef66: 5기동 5시도·안내 0). 기억할 수 없으면 반복하지
+/// 않는다 — `Installed` 로 치는 것이 아니다(마커 미기록 · 매 기동 재관측 · 안내). 부모 폴더 부재는 실패가 아니다(W-5-b — 팩이
+/// ~/.cys 밖이면 신선 기계에 ~/.cys 가 아직 없다): 만들고 쓴다.
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn record_gui_onboard_attempt(
     attempts_path: &std::path::Path,
     version: &str,
     seen: &HookObservation,
     plan: GuiOnboardPlan,
-) {
+    unrecorded: Option<String>,
+) -> (GuiOnboardPlan, Option<String>) {
     match (seen.undeterminable_reason(), plan) {
         (None, _) => {
             let _ = std::fs::remove_file(attempts_path);
         }
         (Some(why), GuiOnboardPlan::RunCounted(n)) => {
             let body = json!({"version": version, "reason": why, "attempts": n}).to_string();
-            if let Err(e) = std::fs::write(attempts_path, body) {
-                eprintln!("[cys-app] onboarding attempts record write failed: {e}");
+            let written = attempts_path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(attempts_path, body));
+            if let Err(e) = written {
+                eprintln!("[cys-app] onboarding attempts record write failed — 이번 기동은 시도하지 않는다: {e}");
+                return (
+                    GuiOnboardPlan::Capped,
+                    Some(format!("시도 기록을 남길 수 없어({} — {e})", attempts_path.display())),
+                );
             }
         }
         _ => {}
     }
+    (plan, unrecorded)
 }
 
 /// ★W-4-c/d: 한 기동의 온보딩 결과 중 사용자에게 보여야 하는 것(순수 — 단위 테스트 대상). `(kind, 본문)`.
-///  · "capped" — 판정 불가로 시도 상한에 닿았다(방금이 마지막 시도였거나 이미 상한). 어느 파일이 왜 문제인지·무엇을
-///    하면 되는지. 상한인 동안 **매 기동** 띄운다(한 번 띄우고 조용해지면 그것이 조용한 영구 반쪽이다).
+///  · "capped" — 판정 불가로 시도 상한에 닿았다(방금이 마지막 시도였거나 이미 상한 · 또는 시도 기록을 기억할 수 없어
+///    멈췄다 — W-5 `unrecorded`). 어느 파일이 왜 문제인지·무엇을 하면 되는지. 상한인 동안 **매 기동** 띄운다(한 번 띄우고
+///    조용해지면 그것이 조용한 영구 반쪽이다).
 ///  · "restored" — 온보딩을 마친 적이 있는데(마커 있음) 등재가 빠져 있던 settings 에 이번 기동이 훅을 다시 넣었다.
 ///    사용자가 손으로 지운 것을 되살렸을 수 있으므로 조용히 하지 않는다(영속 끄기는 이번 범위 밖 — 백로그).
 #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -3476,6 +3508,7 @@ fn gui_onboard_notices(
     before: &HookObservation,
     after: &HookObservation,
     had_marker: bool,
+    unrecorded: Option<&str>,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     let at_cap = match plan {
@@ -3484,14 +3517,19 @@ fn gui_onboard_notices(
         _ => false,
     };
     if let (true, Some(why)) = (at_cap, after.undeterminable_reason()) {
-        out.push((
-            "capped",
-            format!(
+        let message = match unrecorded {
+            // ★W-5: 시도 기록을 기억할 수 없어 멈췄다 — 몇 번 시도했는지는 모르므로 적지 않고, 그 사실(`unrecorded`)을 적는다.
+            Some(u) => format!(
+                "Claude 설정 파일에 cys 연결 설정(훅)을 넣을 수 없는 상태인데 {u} 자동 복구를 반복하지 않고 멈췄습니다. \
+                 문제 파일: {why}. 이 파일을 고치거나 지운 뒤 앱을 다시 여세요."
+            ),
+            None => format!(
                 "Claude 설정 파일에 cys 연결 설정(훅)을 넣지 못해 자동 복구를 멈췄습니다({}번 시도). 문제 파일: {why}. \
                  이 파일을 고치거나 지운 뒤 앱을 다시 여세요.",
                 GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS
             ),
-        ));
+        };
+        out.push(("capped", message));
     }
     if had_marker {
         let restored: Vec<String> = before
@@ -6484,16 +6522,17 @@ fn main() {
                 // ★W-4(R4-M1): 관측은 3상태 — 판정 불가(손상·읽기 불가·등재 없는 symlink 등)는 같은 버전·같은 사유 동안
                 // GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS 번까지만 실제로 돌리고(기록 = 마커 옆 .gui-onboard-attempts ·
                 // 실제 시도 직전에 쓴다), 상한에서는 멈추되 설치됨으로 치지 않는다(마커 미기록 · 매 기동 재관측 · 안내).
+                // ★W-5(R5-M1): 그 기록을 읽거나 남길 수 없으면 그 기동도 상한과 같다(Capped + 안내) — 기억할 수 없으면 반복하지
+                // 않는다. 둘째 값 = 그 사유(읽기 실패는 여기서 · 쓰기 실패는 아래 실제 시도 직전의 기록에서).
                 let onboard_marker = std::fs::read_to_string(gui_onboarded_path()).ok();
                 let onboard_seen = observe_gui_hooks();
-                let onboard_plan = gui_onboard_plan_under(
+                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
+                let (onboard_plan, onboard_unrecorded) = gui_onboard_plan_under(
                     &onboard_seen,
                     onboard_marker.as_deref(),
                     &gui_onboard_attempts_path(),
                     env!("CARGO_PKG_VERSION"),
                 );
-                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
-                let needs_onboard = matches!(onboard_plan, GuiOnboardPlan::Run | GuiOnboardPlan::RunCounted(_));
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
@@ -6564,13 +6603,17 @@ fn main() {
                 // hook만 사후 유실된 상태(마커 무결)는 needs_gui_onboard 의 훅 실재 확인이 다음 부트에 온보딩을
                 // 다시 돌려 치유한다(W-3-a · 종전엔 doctor --fix·버전 전이에 미뤘다).
                 // ★W-4-b: 판정 불가 시도는 **실제로 돌기 직전에** 센다(데몬이 못 떠 여기까지 못 오면 시도가 아니다).
+                // ★W-5-a: 이번 시도를 남기지 못하면 이 기동은 Capped 로 바뀐다 — 온보딩 여부는 반드시 기록 **뒤의** 계획으로 정한다.
                 #[cfg(any(windows, target_os = "macos"))]
-                record_gui_onboard_attempt(
+                let (onboard_plan, onboard_unrecorded) = record_gui_onboard_attempt(
                     &gui_onboard_attempts_path(),
                     env!("CARGO_PKG_VERSION"),
                     &onboard_seen,
                     onboard_plan,
+                    onboard_unrecorded,
                 );
+                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
+                let needs_onboard = matches!(onboard_plan, GuiOnboardPlan::Run | GuiOnboardPlan::RunCounted(_));
                 #[cfg(windows)]
                 let onboarded = needs_onboard && maybe_windows_onboard();
                 #[cfg(windows)]
@@ -6592,9 +6635,13 @@ fn main() {
                 #[cfg(any(windows, target_os = "macos"))]
                 {
                     let after = if needs_onboard { observe_gui_hooks() } else { onboard_seen.clone() };
-                    for (kind, message) in
-                        gui_onboard_notices(onboard_plan, &onboard_seen, &after, onboard_marker.is_some())
-                    {
+                    for (kind, message) in gui_onboard_notices(
+                        onboard_plan,
+                        &onboard_seen,
+                        &after,
+                        onboard_marker.is_some(),
+                        onboard_unrecorded.as_deref(),
+                    ) {
                         push_onboard_notice(&handle, kind, message);
                     }
                 }
@@ -6946,7 +6993,7 @@ mod tests {
         // ★W-3-a(R3-B1) + W-4-a: 온보딩 계획은 마커만이 아니라 실제 홈·팩의 훅 관측(3상태)을 입력으로 받는다.
         assert!(
             seg("let onboard_seen = ", ";").contains("observe_gui_hooks()")
-                && seg("let onboard_plan = gui_onboard_plan_under(", ");").contains("&onboard_seen")
+                && seg("let (onboard_plan, onboard_unrecorded) = gui_onboard_plan_under(", ");").contains("&onboard_seen")
                 && seg("fn observe_gui_hooks()", "\n}\n")
                     .contains("observe_gui_hooks_under(&cys::home_dir(), &cys::pack::pack_dir())"),
             "setup 의 온보딩 계획에 실제 홈·팩의 훅 관측이 빠졌다 — 마커만 믿는 판정으로 회귀(R3-B1)"
@@ -6954,6 +7001,8 @@ mod tests {
         // ★W-4-b: 판정 불가 시도 기록은 실제 온보딩 직전에 쓴다(맥·윈도우 둘 다).
         before(setup, "record_gui_onboard_attempt(", "maybe_macos_onboard()", "시도 기록 → macOS 온보딩");
         before(setup, "record_gui_onboard_attempt(", "maybe_windows_onboard()", "시도 기록 → Windows 온보딩");
+        // ★W-5-a: 온보딩 여부는 시도 기록 **뒤의** 계획으로 정한다 — 기록을 남기지 못한 기동은 Capped 로 바뀌어 시도하지 않는다.
+        before(setup, "record_gui_onboard_attempt(", "let needs_onboard", "시도 기록 결과 → 온보딩 여부");
         // ★W-4-c: 안내는 저장소에 먼저 쌓고 emit 한다 — 프런트의 listen 직후 pull 이 emit-before-listen 유실을 회수하는 전제.
         before(seg("fn push_onboard_notice(", "\n}\n"), "v.push((kind", "app.emit(\"onboard-notice\"", "안내 저장 → emit");
         // CEO 조건 (나): 프런트가 거부를 '잠시 후 다시'로 알아보는 머리 문구가 두 언어에서 같다.
@@ -7136,8 +7185,9 @@ mod tests {
         }
     }
 
-    /// GUI 기동 한 번을 setup 과 같은 순서로 돈다: 마커 읽기 → 관측 → 계획 → (실제 시도 직전) 시도 기록 → 온보딩(= init-pack 훅
-    /// 단계) → 성공이면 마커 → 재관측 → 안내. 반환 = (계획, 기동 시 관측 집계, 안내, 온보딩 결과(돌았을 때만)).
+    /// GUI 기동 한 번을 setup 과 같은 순서로 돈다: 마커 읽기 → 관측 → 계획 → (실제 시도 직전) 시도 기록(★W-5-a: 남기지 못하면 그
+    /// 기동은 Capped) → 기록 뒤의 계획으로 온보딩(= init-pack 훅 단계) → 성공이면 마커 → 재관측 → 안내. 반환 = (최종 계획, 기동 시
+    /// 관측 집계, 안내, 온보딩 결과(돌았을 때만)).
     fn w4_boot(
         home: &std::path::Path,
         pack: &std::path::Path,
@@ -7147,15 +7197,15 @@ mod tests {
         let attempts_path = home.join(".cys/.gui-onboard-attempts");
         let marker = std::fs::read_to_string(&marker_path).ok();
         let seen = observe_gui_hooks_under(home, pack);
-        let plan = gui_onboard_plan_under(&seen, marker.as_deref(), &attempts_path, cur);
-        record_gui_onboard_attempt(&attempts_path, cur, &seen, plan);
+        let (plan, unrecorded) = gui_onboard_plan_under(&seen, marker.as_deref(), &attempts_path, cur);
+        let (plan, unrecorded) = record_gui_onboard_attempt(&attempts_path, cur, &seen, plan, unrecorded);
         let needs = matches!(plan, GuiOnboardPlan::Run | GuiOnboardPlan::RunCounted(_));
         let result = needs.then(|| w4_init_pack_hooks(home, pack));
         if result == Some(Ok(())) {
             std::fs::write(&marker_path, cur).unwrap();
         }
         let after = if needs { observe_gui_hooks_under(home, pack) } else { seen.clone() };
-        let notices = gui_onboard_notices(plan, &seen, &after, marker.is_some());
+        let notices = gui_onboard_notices(plan, &seen, &after, marker.is_some(), unrecorded.as_deref());
         (plan, seen.presence(), notices, result)
     }
 
@@ -7409,6 +7459,304 @@ mod tests {
             println!("gate13 {scenario}: 실제 시도 {attempts}회 → 이후 안정(Skip)");
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    // ── ★W-5(R5-M1): 시도 기록을 기억할 수 없으면 반복하지 않는다 — 게이트 14·15·16 ──
+
+    /// ★W-5 공용 — 온보딩을 마친 홈(마커 = 현재 버전 · 훅 등록)에서 개인 프로필 settings 를 손상(`{bad`)시킨다 = R4-M1·R5-M1 전제.
+    fn w5_corrupt_home(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let (home, pack) = w4_home(tag);
+        let (p0, _, n0, r0) = w4_boot(&home, &pack);
+        assert_eq!((p0, r0, n0.len()), (GuiOnboardPlan::Run, Some(Ok(())), 0), "{tag}: 전제 — 신선 온보딩 성공·안내 없음");
+        let settings = home.join(".claude/settings.json");
+        std::fs::write(&settings, "{bad").unwrap();
+        (home, pack, settings)
+    }
+
+    /// ★W-5 공용 — `n` 번 기동하며 기동마다 한 줄씩 찍고 (계획, 관측, 실제 시도 여부, 상한 안내) 를 돌려준다. 단언은 부른 쪽이 전 기동을
+    /// 다 돈 **뒤에** 한다 — 수정 전 트리(음성 대조)에서도 전 기동이 로그에 남는다.
+    fn w5_boots(
+        tag: &str,
+        home: &std::path::Path,
+        pack: &std::path::Path,
+        n: u32,
+    ) -> Vec<(GuiOnboardPlan, HookPresence, bool, Option<String>)> {
+        (1..=n)
+            .map(|boot| {
+                let (plan, presence, notices, result) = w4_boot(home, pack);
+                let capped = notices.iter().find(|(k, _)| *k == "capped").map(|(_, m)| m.clone());
+                println!(
+                    "{tag} boot={boot} 관측={} 계획={plan:?} 시도={} installer={} 안내={}",
+                    w4_kind(&presence),
+                    if result.is_some() { "예" } else { "아니오" },
+                    result.as_ref().map_or("-".to_string(), |r| format!("{r:?}")),
+                    capped.as_deref().unwrap_or("-")
+                );
+                (plan, presence, result.is_some(), capped)
+            })
+            .collect()
+    }
+
+    /// ★W-5 공용 — 기록을 기억할 수 없던 기동들의 단언: 매 기동 관측 = 판정 불가(설치됨으로 뭉개지 않음) · 계획 = `Capped`(`Skip` 아님 ·
+    /// 시도 안 함) · 매 기동 안내(그 사실 `fact` + 기록 파일 경로 + 문제 파일 경로).
+    #[cfg(unix)]
+    fn w5_assert_stopped_with_notice(
+        tag: &str,
+        boots: &[(GuiOnboardPlan, HookPresence, bool, Option<String>)],
+        fact: &str,
+        rec: &std::path::Path,
+        settings: &std::path::Path,
+    ) {
+        for (i, (plan, presence, attempted, capped)) in boots.iter().enumerate() {
+            let boot = i + 1;
+            assert_eq!(w4_kind(presence), "Undeterminable", "{tag} boot={boot}: 설치됨으로 뭉개지 않는다 — {presence:?}");
+            assert_eq!(*plan, GuiOnboardPlan::Capped, "{tag} boot={boot}: 기억할 수 없으면 그 기동에서 멈춘다(Skip 아님)");
+            assert!(!attempted, "{tag} boot={boot}: 기억할 수 없으면 반복하지 않는다");
+            let m = capped.as_deref().unwrap_or_else(|| panic!("{tag} boot={boot}: 매 기동 안내가 있어야 한다"));
+            assert!(m.contains(fact), "{tag} boot={boot}: 안내에 '{fact}' — {m}");
+            assert!(m.contains(&rec.display().to_string()), "{tag}: 안내에 기록 파일 경로 — {m}");
+            assert!(m.contains(&settings.display().to_string()), "{tag}: 안내에 문제 파일 경로 — {m}");
+        }
+    }
+
+    /// ★W-5 공용 — 기록을 다시 읽고 쓸 수 있게 된 뒤: 기록된 수 `prior` 부터 이어 세어 상한에서 멈춘다(종전 안내 — 시도 기록 사유 없음).
+    /// 그다음 settings 를 고치면 1회 복구 뒤 안정 · 기록 삭제.
+    #[cfg(unix)]
+    fn w5_assert_recovers(tag: &str, home: &std::path::Path, pack: &std::path::Path, settings: &std::path::Path, prior: u32) {
+        let max = GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS;
+        let resumed = w5_boots(&format!("{tag} 기록 복구 뒤"), home, pack, max - prior + 1);
+        for (i, (plan, _, attempted, capped)) in resumed.iter().enumerate() {
+            let n = prior + i as u32 + 1;
+            let want = if n <= max { GuiOnboardPlan::RunCounted(n) } else { GuiOnboardPlan::Capped };
+            assert_eq!((*plan, *attempted), (want, n <= max), "{tag}: 기록 복구 뒤 {n}번째 — 기록된 수부터 이어 센다");
+            assert_eq!(capped.is_some(), n >= max, "{tag}: 상한 안내는 상한 기동부터");
+            if let Some(m) = capped {
+                assert!(!m.contains("시도 기록을"), "{tag}: 기록이 되면 종전 안내 — {m}");
+            }
+        }
+        std::fs::write(settings, "{}").unwrap();
+        let (pf, _, nf, rf) = w4_boot(home, pack);
+        assert_eq!((pf, rf), (GuiOnboardPlan::Run, Some(Ok(()))), "{tag}: settings 를 고치면 1회 복구");
+        assert!(nf.iter().all(|(k, _)| *k != "capped"), "{tag}: 복구 기동에 상한 안내 없음");
+        assert_eq!(w4_boot(home, pack).0, GuiOnboardPlan::Skip, "{tag}: 복구 뒤 안정");
+        assert!(!home.join(".cys/.gui-onboard-attempts").exists(), "{tag}: 판정 불가가 사라지면 기록 삭제");
+        println!("{tag}: 기록 복구 뒤 {}번 더 시도하고 상한 · settings 복구 1회 → Skip", max - prior);
+    }
+
+    /// ★게이트 14 — R5-M1: 시도 기록을 **쓸 수 없으면**(0400) — 상한이 기록 쓰기 성공에 기대던 de6ef66 은 같은 버전·같은 사유인데
+    /// 5기동 모두 `RunCounted(1)` · 실제 시도 5/5 · 안내 0 이었다(쓰기 실패를 stderr 에만 쓰고 온보딩을 계속). 이제 쓰지 못한 기동은
+    /// 그 자리에서 `Capped`(시도 안 함) + 안내("시도 기록을 남길 수 없어…") · 관측 = 판정 불가(설치됨 아님).
+    /// 고친 뒤: 기록을 쓸 수 있게 되돌리면 기록된 수부터 이어 세어 상한에서 멈추고, settings 를 고치면 1회 복구 뒤 안정.
+    #[cfg(unix)]
+    fn gate14_case(scenario: &str, prior: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let tag = format!("gate14 {scenario}");
+        let (home, pack, settings) = w5_corrupt_home(&format!("g14-{scenario}"));
+        let rec = home.join(".cys/.gui-onboard-attempts");
+        if prior == 0 {
+            std::fs::write(&rec, "{}").unwrap();
+        } else {
+            let (p, _, _, r) = w4_boot(&home, &pack);
+            assert_eq!(p, GuiOnboardPlan::RunCounted(1), "{tag}: 전제 — 첫 판정 불가 기동은 기록을 남기고 시도");
+            assert!(matches!(r, Some(Err(_))), "{tag}: 전제 — 병합기 거부 {r:?}");
+        }
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o400)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&rec).is_ok() {
+            println!("{tag}: 0400 이 쓰기를 막지 못한다(root 실행) — 쓰기 실패를 만들 수 없어 건너뜀");
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+        let boots = w5_boots(&tag, &home, &pack, 5);
+        let tried = boots.iter().filter(|b| b.2).count() as u32;
+        println!(
+            "{tag}: 0400 × 5기동 — 실제 시도 {tried}/5 · 누적 실제 시도 {} · 안내 {}/5",
+            prior + tried,
+            boots.iter().filter(|b| b.3.is_some()).count()
+        );
+        w5_assert_stopped_with_notice(&tag, &boots, "시도 기록을 남길 수 없어", &rec, &settings);
+        assert!(!hooks_installed(&home, &pack), "{tag}: 설치됨 아님");
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o600)).unwrap();
+        w5_assert_recovers(&tag, &home, &pack, &settings, prior);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 게이트 14 ① 리뷰어 원형(R5-M1 재현 그대로): 처음부터 `{}` · 0400. 기록은 실제 시도 **직전에** 쓰므로(W-4 순서) 첫 기동부터 시도 0.
+    #[cfg(unix)]
+    #[test]
+    fn gate14_unwritable_record_reviewer_r5m1() {
+        gate14_case("reviewer-r5m1", 0);
+    }
+
+    /// 게이트 14 ② 첫 판정 불가 기동은 기록을 정상으로 남기고 시도 → 그 뒤 0400 × 5기동: 실제 시도 1회에서 멈춘다.
+    #[cfg(unix)]
+    #[test]
+    fn gate14_unwritable_record_after_first_attempt() {
+        gate14_case("after-first", 1);
+    }
+
+    /// ★게이트 15 — 회귀 0(W-5-b): 기록 **부재**는 실패가 아니다 — 신선 기계·첫 판정 불가는 0 부터 센다. 부재를 실패로 읽어 첫 기동부터
+    /// `Capped` 가 되면 한 번도 고쳐 보지 못한다. 판정 불가 공용: 기록 없이 5기동 → 0 부터 세어 상한까지 시도하고 멈춘다 · 안내는
+    /// 상한 기동부터 종전 문구(시도 기록 사유 없음) · 기록이 생긴다.
+    fn gate15_counts_from_zero(tag: &str, home: &std::path::Path, pack: &std::path::Path, settings: &std::path::Path) {
+        let max = GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS;
+        let rec = home.join(".cys/.gui-onboard-attempts");
+        assert!(!rec.exists(), "{tag}: 전제 — 기록 부재");
+        let boots = w5_boots(tag, home, pack, 5);
+        let tried = boots.iter().filter(|b| b.2).count() as u32;
+        println!("{tag}: 5기동 실제 시도 {tried}/5 (상한 {max}) · 안내 {}/5", boots.iter().filter(|b| b.3.is_some()).count());
+        for (i, (plan, presence, attempted, capped)) in boots.iter().enumerate() {
+            let n = i as u32 + 1;
+            let want = if n <= max { GuiOnboardPlan::RunCounted(n) } else { GuiOnboardPlan::Capped };
+            assert_eq!(w4_kind(presence), "Undeterminable", "{tag} boot={n}: {presence:?}");
+            assert_eq!((*plan, *attempted), (want, n <= max), "{tag} boot={n}: 부재는 0 부터 — 상한까지 시도");
+            assert_eq!(capped.is_some(), n >= max, "{tag} boot={n}: 상한 안내는 상한 기동부터");
+            if let Some(m) = capped {
+                assert!(!m.contains("시도 기록을") && m.contains(&settings.display().to_string()), "{tag}: 종전 안내 — {m}");
+            }
+        }
+        assert_eq!(tried, max, "{tag}: 실제 시도 = 상한");
+        assert!(rec.is_file(), "{tag}: 시도 기록이 생겼다");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// 게이트 15 ① 신선 머신(마커·프로필·기록 없음): 1회 온보딩 성공 · 안내·기록 없음 → 이후 `Skip`.
+    #[test]
+    fn gate15_absent_record_fresh_machine() {
+        let (home, pack) = w4_home("g15-fresh");
+        let fresh = w5_boots("gate15 fresh", &home, &pack, 3);
+        let plans: Vec<GuiOnboardPlan> = fresh.iter().map(|b| b.0).collect();
+        assert_eq!(plans, [GuiOnboardPlan::Run, GuiOnboardPlan::Skip, GuiOnboardPlan::Skip], "gate15 fresh: 1회 온보딩 뒤 안정");
+        assert!(fresh.iter().all(|b| b.3.is_none()), "gate15 fresh: 상한 안내 없음");
+        assert!(hooks_installed(&home, &pack), "gate15 fresh: 설치됨");
+        assert!(!home.join(".cys/.gui-onboard-attempts").exists(), "gate15 fresh: 시도 기록 없음");
+        println!("gate15 fresh: 1회 온보딩 → Skip · 안내·시도 기록 없음");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 게이트 15 ② 판정 불가 + 기록 부재(= 게이트 12 손상 검체): 종전 그대로 상한까지 시도 · 안내는 종전 문구.
+    #[test]
+    fn gate15_absent_record_undeterminable() {
+        let (home, pack, settings) = w5_corrupt_home("g15-absent");
+        gate15_counts_from_zero("gate15 absent", &home, &pack, &settings);
+    }
+
+    /// 게이트 15 ③ 판정 불가 + 기록의 부모 폴더(~/.cys)까지 부재(팩이 ~/.cys 밖 — CYS_PACK_DIR): 폴더를 만들어 세고 상한까지.
+    #[test]
+    fn gate15_absent_record_no_parent_dir() {
+        let home = std::env::temp_dir().join(format!("cys-w5-g15-no-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pack = home.join("alt-pack");
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        for h in cys::pack::AWAKENING_HOOKS.iter() {
+            std::fs::write(pack.join("hooks").join(h.script), "#!/bin/sh\n").unwrap();
+        }
+        let settings = home.join(".claude/settings.json");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(&settings, "{bad").unwrap();
+        assert!(!home.join(".cys").exists(), "gate15 no-parent: 전제 — 부모 폴더 부재");
+        gate15_counts_from_zero("gate15 no-parent", &home, &pack, &settings);
+    }
+
+    /// ★게이트 16 — 시도 기록을 **읽을 수 없으면**(부재 아님) 몇 번 시도했는지 모른다. de6ef66 은 이것을 0 으로 읽어(`.ok()`) 매 기동을
+    /// 첫 시도로 셌다 — 쓰기는 되는 0200 이면 기록을 매번 1 로 덮어 영영 상한에 못 닿는다. 이제 그 기동은 `Capped`(시도 안 함) +
+    /// 안내("시도 기록을 읽을 수 없어…") · 관측 = 판정 불가(설치됨 아님). 첫 판정 불가 기동은 기록을 정상으로 남기고 시도 → 그 뒤
+    /// 읽기 불가 × 5기동: 실제 시도 1회에서 멈춘다. 고친 뒤: 읽을 수 있게 되돌리면 기록된 수부터 이어 세어 상한에서 멈춘다.
+    #[cfg(unix)]
+    fn gate16_case(scenario: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let tag = format!("gate16 {scenario}");
+        let (home, pack, settings) = w5_corrupt_home(&format!("g16-{scenario}"));
+        let rec = home.join(".cys/.gui-onboard-attempts");
+        let (p, _, _, r) = w4_boot(&home, &pack);
+        assert_eq!(p, GuiOnboardPlan::RunCounted(1), "{tag}: 전제 — 첫 판정 불가 기동은 기록을 남기고 시도");
+        assert!(matches!(r, Some(Err(_))), "{tag}: 전제 — 병합기 거부 {r:?}");
+        match scenario {
+            "write-only" => std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o200)).unwrap(),
+            "no-access" => std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o000)).unwrap(),
+            _ => {
+                std::fs::remove_file(&rec).unwrap();
+                std::fs::create_dir(&rec).unwrap();
+            }
+        }
+        if std::fs::read_to_string(&rec).is_ok() {
+            println!("{tag}: 권한이 읽기를 막지 못한다(root 실행) — 읽기 실패를 만들 수 없어 건너뜀");
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+        let boots = w5_boots(&tag, &home, &pack, 5);
+        let tried = boots.iter().filter(|b| b.2).count();
+        println!(
+            "{tag}: 읽기 불가 × 5기동 — 실제 시도 {tried}/5 · 누적 실제 시도 {} · 안내 {}/5",
+            1 + tried,
+            boots.iter().filter(|b| b.3.is_some()).count()
+        );
+        w5_assert_stopped_with_notice(&tag, &boots, "시도 기록을 읽을 수 없어", &rec, &settings);
+        assert!(!hooks_installed(&home, &pack), "{tag}: 설치됨 아님");
+        let prior = if scenario == "is-dir" {
+            std::fs::remove_dir(&rec).unwrap();
+            0
+        } else {
+            std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o600)).unwrap();
+            1
+        };
+        w5_assert_recovers(&tag, &home, &pack, &settings, prior);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// 게이트 16 ① 0200 — 쓰기는 된다(읽기 실패만 떼어 본다: de6ef66 은 매번 1 로 덮어쓰며 영영 센다).
+    #[cfg(unix)]
+    #[test]
+    fn gate16_unreadable_record_write_only() {
+        gate16_case("write-only");
+    }
+
+    /// 게이트 16 ② 0000 — 읽기·쓰기 모두 막힘.
+    #[cfg(unix)]
+    #[test]
+    fn gate16_unreadable_record_no_access() {
+        gate16_case("no-access");
+    }
+
+    /// 게이트 16 ③ 기록 자리가 폴더 — 권한과 무관한 읽기 오류(폴더를 치우면 부재 = 0 부터).
+    #[cfg(unix)]
+    #[test]
+    fn gate16_unreadable_record_is_dir() {
+        gate16_case("is-dir");
+    }
+
+    /// 게이트 16 ④ 읽기 실패여도 **고칠 수 있는 부재**의 복구는 막지 않는다 — W-4 집계(고칠 수 있는 부재 우선)를 그대로 둔다: 기록은
+    /// 집계가 판정 불가일 때만 읽는다. 손상 프로필 + 새 프로필 + 읽기 불가 기록(0000) → 그 기동은 세지 않고 돌아 새 프로필을 고치고,
+    /// 고칠 것이 없어진 다음 기동부터 `Capped` + 안내(반복 안 함).
+    #[cfg(unix)]
+    #[test]
+    fn gate16_unreadable_record_does_not_block_repair_of_missing_profile() {
+        use std::os::unix::fs::PermissionsExt;
+        let (home, pack, _) = w5_corrupt_home("g16-mixed");
+        let rec = home.join(".cys/.gui-onboard-attempts");
+        std::fs::write(&rec, "{}").unwrap();
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&rec).is_ok() {
+            println!("gate16 mixed: 권한이 읽기를 막지 못한다(root 실행) — 건너뜀");
+            std::fs::remove_dir_all(&home).ok();
+            return;
+        }
+        std::fs::create_dir_all(home.join(".claude-2")).unwrap();
+        let first = w5_boots("gate16 mixed", &home, &pack, 1);
+        let (plan, presence, attempted, capped) = &first[0];
+        assert_eq!(
+            (w4_kind(presence), *plan, *attempted),
+            ("Missing", GuiOnboardPlan::Run, true),
+            "gate16 mixed: 고칠 수 있는 부재가 있으면 기록과 무관하게 세지 않고 돈다"
+        );
+        assert!(capped.is_none(), "gate16 mixed: 복구 기동에 상한 안내 없음");
+        let fixed = classify_hook_settings(&home.join(".claude-2/settings.json"), &pack);
+        assert_eq!(fixed, HookPresence::Installed, "gate16 mixed: 새 프로필은 이번 기동에 복구");
+        let next = w5_boots("gate16 mixed 다음 기동", &home, &pack, 1);
+        assert_eq!((next[0].0, next[0].2), (GuiOnboardPlan::Capped, false), "gate16 mixed: 고칠 것이 없어지면 반복하지 않는다");
+        let m = next[0].3.as_deref().unwrap_or_default();
+        assert!(m.contains("시도 기록을 읽을 수 없어"), "gate16 mixed: 안내 — {m}");
+        std::fs::set_permissions(&rec, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
