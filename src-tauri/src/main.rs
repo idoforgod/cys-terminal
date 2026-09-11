@@ -3261,20 +3261,29 @@ fn install_identity_path() -> std::path::PathBuf {
 /// (Gatekeeper 가 앱을 무작위 읽기전용 경로에서 실행)에서 경로·inode 가 매 실행 달라져 매번 묻게
 /// 되는 것을 막는다. 판정 불능은 언제나 "묻지 않음"으로 닫힌다.
 fn current_install_stamp() -> Option<String> {
+    install_stamp_for(
+        &std::env::current_exe().ok()?,
+        &cys::home_dir(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// 위 함수의 테스트 가능한 심장 — `current_exe()`·홈·버전을 주입받는다. 실제 설치 경로
+/// (`/Applications/cys.app/Contents/MacOS/<exe>`)가 통과하는지 테스트로 **고정**해, 훗날 경로
+/// 판정이 바뀌어 이 기능이 **조용히 죽는 것**(늘 `None` → 영영 안 물음)을 막는다.
+fn install_stamp_for(
+    exe: &std::path::Path,
+    home: &std::path::Path,
+    version: &str,
+) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
-    let exe = std::env::current_exe().ok()?;
-    let macos_dir = exe.parent()?; // …/cys.app/Contents/MacOS
-    if !strict_install_bundle_ok(macos_dir, &cys::home_dir()) {
+    let macos_dir = exe.parent()?;
+    if !strict_install_bundle_ok(macos_dir, home) {
         return None;
     }
     let bundle = macos_dir.parent()?.parent()?;
     let md = std::fs::metadata(bundle).ok()?;
-    Some(format!(
-        "{}:{}|{}",
-        md.dev(),
-        md.ino(),
-        env!("CARGO_PKG_VERSION")
-    ))
+    Some(format!("{}:{}|{version}", md.dev(), md.ino()))
 }
 
 /// 사용자가 앱을 휴지통에 넣었다는 증거 — **단, 마지막 기록 이후에 넣은 것만**.
@@ -6323,6 +6332,44 @@ mod tests {
     /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
     /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
     /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
+    #[test]
+    fn install_stamp_is_alive_on_the_real_install_path_and_closed_elsewhere() {
+        use std::path::Path;
+        let home = Path::new("/Users/x");
+        // 실제 설치 경로는 **반드시** 통과해야 한다 — 여기가 막히면 기능이 조용히 죽는다.
+        assert!(strict_install_bundle_ok(
+            Path::new("/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        assert!(strict_install_bundle_ok(
+            Path::new("/Users/x/Applications/cys.app/Contents/MacOS"),
+            home
+        ));
+        // 개발 빌드·App Translocation — 매 실행 경로가 달라지므로 반드시 막혀야 한다.
+        assert!(!strict_install_bundle_ok(
+            Path::new("/Users/x/dev/cys-t1/target/debug"),
+            home
+        ));
+        assert!(!strict_install_bundle_ok(
+            Path::new("/private/var/folders/ab/AppTranslocation/XYZ/d/cys.app/Contents/MacOS"),
+            home
+        ));
+        // 막힌 경로에서는 스탬프가 없다(= 묻지 않음).
+        assert_eq!(
+            install_stamp_for(Path::new("/tmp/cys-app"), home, "0.14.34"),
+            None
+        );
+        // 실제 디스크의 번들 모양 디렉터리로 dev:ino|버전 형식을 확인한다.
+        let tmp = std::env::temp_dir().join(format!("cys-stamp-{}", std::process::id()));
+        let macos = tmp.join("Applications/cys.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let got = install_stamp_for(&macos.join("cys-app"), &tmp, "0.14.34").unwrap();
+        let (ident, ver) = split_install_stamp(&got);
+        assert_eq!(ver, Some("0.14.34"));
+        assert!(ident.contains(':') && ident.split(':').all(|p| p.parse::<u64>().is_ok()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn fresh_start_asks_on_reinstall_but_never_on_a_plain_upgrade() {
         use FreshStartPrompt::*;
