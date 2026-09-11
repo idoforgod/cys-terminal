@@ -129,6 +129,31 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 > `GetDLLVersion` 오라클(fail-closed = unverified)이라, 크로스 빌드 회귀로 버전 리소스가
 > 빠진 채 발행되면 **모든 기계의 설치가 exit 4 로 떨어지기 때문**이다.
 
+## 0-C. 태그 전 사전 게이트 (2026-09-11 · v0.14.34 윈도우 빌드 파손 재발 방지 — **3종 전부 rc=0 필수**)
+
+> ★왜: v0.14.34 는 브랜치 push(10:49:46Z) **58초 뒤** 태그됐다(10:50:44Z). 같은 커밋 88c1ca2 의 브랜치
+> `windows-build` 는 11:00:31Z 에 failure 였고(윈도우에서만 나는 컴파일 오류 3건 — `src-tauri/src/main.rs` 의
+> 유닉스 전용 dev/ino 가 cfg 밖), 태그 레인은 브랜치 런의 결과를 보지 않는다. macOS 레인(`ci-branch`)은 윈도우
+> cfg 를 컴파일하지 않고, `windows-health` 는 루트 크레이트만 컴파일해 cys-app 파손을 원리적으로 못 본다.
+> 그래서 파손본이 태그됐고 태그 레인의 윈도우 빌드에서야 드러났다.
+
+태그(`git tag`) 직전, **태그할 커밋에서** 아래 3종이 모두 rc=0 이어야 한다. 하나라도 아니면 태그하지 않는다.
+
+1. **버전 SOT 8곳** — `sh scripts/version-check.sh vX.Y.Z` (§0).
+2. **★윈도우 교차 타입체크** — `sh scripts/win-typecheck.sh` (로컬 · 이 맥 실측 콜드 약 3분 / 웜 수 초~십수 초).
+   - rc: 0 = 통과 · 1 = 윈도우 컴파일 오류(태그 금지) · 2 = 판정 불가(타깃·도구 부재·우회 실패 — **통과 아님**).
+   - 증명하는 것: cys-app 전체(bin·bin test + 의존 cys-terminal lib)가 `x86_64-pc-windows-msvc` cfg 로 타입체크·린트 통과.
+   - 증명하지 않는 것: 링크·NSIS 번들·런타임 — 그건 `windows-build`·`release` 레인(윈도우 실기) 몫이다.
+   - 사전: `rustup target add x86_64-pc-windows-msvc` (스크립트는 자동 설치하지 않고 rc=2 로 알린다).
+   - 같은 스크립트가 `ci-branch.yml` 의 macOS 잡에서도 돈다(실패 = 잡 실패) — 아래 3번이 그 결과를 태그 조건으로 묶는다.
+3. **★같은 SHA 의 브랜치 CI 초록** — `python3 scripts/pre-tag-ci-check.py --wait 30`
+   - 태그할 SHA(기본 HEAD)에서 `ci-branch` 와 `windows-build (feasibility)` 가 **둘 다 success** 여야 한다.
+     진행 중·런 없음·실패·취소는 전부 rc=1(태그 금지), 네트워크·API 한도는 rc=2(판정 불가 — 통과 아님).
+   - **gh 불필요**: 공개 저장소의 Actions 런·잡 목록은 인증 없이 조회된다(익명 한도 시간당 60회).
+     `--wait N` 은 진행 중인 런을 60초 간격으로 최대 N분 기다리고, 실패한 런은 잡·스텝·annotation 을 보여 준다.
+   - 순서: 브랜치를 먼저 push → 두 워크플로가 끝날 때까지(약 15~20분) 기다림 → 이 점검 rc=0 → 그다음에 태그.
+     **58초 태그 금지** — 태그 레인은 브랜치 CI 결과를 기다려 주지 않는다.
+
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 
 > **자동 업데이트가 켜져 있으므로(`createUpdaterArtifacts: true`) 빌드 시 서명 키가 필요합니다.**
@@ -419,6 +444,7 @@ git push -u origin main
 `latest.json`을 **항상 최신 릴리스에 포함**해야 updater가 찾습니다(endpoint가 `/releases/latest/`).
 
 ```sh
+# ★태그 전 사전 게이트 3종 rc=0 필수 — §0-C (version-check · win-typecheck · pre-tag-ci-check)
 # 태그
 git tag -a v0.2.0 -m "cys 0.2.0 — 자비스 네이티브 기능 19건 + zero-setup 온보딩 + 자동 업데이트"
 
@@ -452,6 +478,8 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
+- [ ] **★태그 전 사전 게이트 3종 rc=0 — §0-C** (version-check · `sh scripts/win-typecheck.sh` ·
+      `python3 scripts/pre-tag-ci-check.py --wait 30` = 같은 SHA 의 ci-branch·windows-build success)
       (범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
 - [ ] **★★실사용자 경로 게이트 — DMG 2종 전부 exit 0 (2026-08-01 신설 · 필수 · 생략 불가)**

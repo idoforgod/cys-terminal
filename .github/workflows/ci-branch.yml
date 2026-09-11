@@ -1140,6 +1140,24 @@ jobs:
                 src-tauri/resources/pack.tar.gz src-tauri/resources/pack-manifest.json
           CYS_PACK_DIR="$(mktemp -d)" cargo test -p cys-app --bins -- --test-threads=1
 
+      # ★윈도우 교차 타입체크(2026-09-11 · v0.14.34 윈도우 빌드 파손 재발 방지 · W-2-e/P1 · CEO 승인).
+      #   왜: 이 레인은 macOS 만 컴파일해 윈도우 cfg 파손(v0.14.34 — src-tauri/src/main.rs 의 유닉스 전용
+      #   dev/ino 가 cfg 밖)을 원리적으로 못 봤다. 태그 전 점검(docs/RELEASE.md §0-C · scripts/pre-tag-ci-check.py)이
+      #   같은 SHA 의 ci-branch 초록을 태그 조건으로 요구하므로, 여기 얹으면 윈도우 컴파일이 사람의 규율이 아니라
+      #   기계로 태그 전에 집행된다. 윈도우 러너 불요 — 맥에서 x86_64-pc-windows-msvc cfg 로 cargo check 한다
+      #   (네이티브 산출물 우회 4곳은 스크립트 머리말).
+      #   ★실패 = 잡 실패(경고로 흘리지 않는다) · 조용한 skip 없음: 스크립트 exit 2(판정 불가 — 타깃·도구 부재·
+      #     우회 실패·cys-app 미검사)도 실패다. `if:`·continue-on-error 를 달지 않는다(돌지 않는 초록 금지).
+      #   ⚠정직한 한계: 타입체크·린트만 증명한다 — 링크·NSIS·런타임은 windows-build·release 레인 몫이다.
+      #     이 스텝이 GitHub 러너에서 실제로 도는지는 이 스텝을 담은 커밋의 첫 push 에서 처음 확인된다
+      #     (작성 시점 실측은 로컬 macOS 뿐).
+      - name: 윈도우 교차 타입체크 (scripts/win-typecheck.sh · cys-app 전체 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc
+          sh scripts/win-typecheck.sh
+
   # ═══════════════════════════════════════════════════════════════════════════
   # 잡2 — 부트스트랩 건강성 러너 **전량**(macos-latest · 2026-08-24 M4)
   #
