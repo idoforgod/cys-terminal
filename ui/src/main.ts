@@ -6212,7 +6212,11 @@ function factoryResetConfirmModal(info: ResetPreview): Promise<boolean> {
 // ★완전 초기화 실행 — 프리뷰(쓰기 0) → 문구 확인 → factory_reset_execute(코어=cys::factory_reset:
 // 데몬 전멸 하드 게이트 → cys-trash 격리+manifest → 훅·스킬링크 해제) → 종료 안내.
 // 완료 후 데몬이 없으므로 앱은 반쪽 상태 — 곧장 종료를 권한다(재실행 시 설치 온보딩).
-async function factoryResetFlow() {
+// preConfirmed: 재설치 첫 기동 심문(freshStartFlow)이 규모를 고지하고 이미 동의를 받은 경로.
+// 그 경로에서만 문구 타이핑 확인을 생략한다 — 생초보가 "지우고 다시 깔았으니 깨끗해야 한다"고
+// 이미 판단해 들어온 흐름이고, 격리는(삭제가 아니라) 되돌릴 수 있기 때문이다. 툴바 버튼 경로는
+// 종전대로 타이핑 확인을 그대로 요구한다(기본값 false — 회귀 0).
+async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
   if (daemonActionBlocked()) return;
   let info: {
     quarantine_count?: number;
@@ -6260,7 +6264,7 @@ async function factoryResetFlow() {
     deptCount: info.dept_count ?? 0,
     interruptedPrior: info.interrupted_prior ?? [],
   };
-  const ok = await factoryResetConfirmModal(preview);
+  const ok = opts?.preConfirmed === true || (await factoryResetConfirmModal(preview));
   if (!ok) return;
   // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
   if (rotatingDaemon || purgingDept) {
@@ -6322,6 +6326,86 @@ async function factoryResetFlow() {
   } finally {
     factoryResetting = false;
   }
+}
+
+// ★재설치 첫 기동 심문 — 생초보의 "앱 지우고 다시 깔기" 의식과 실제 동작의 어긋남을 닫는다.
+// 데이터가 앱 번들 밖(~/.cys·~/.local/state)에 있어, 종전에는 지웠다 다시 깔아도 부서·대화기억·훅이
+// 전부 그대로 복원됐다("지웠는데 왜 똑같지?" → 더 위험한 수동 삭제 시도로 이어진다).
+//
+// ★리뷰 BLOCKER 시정(reviewer-codex·reviewer-gemini 독립 중복 지적): 기본 포커스는 **안전한 쪽**
+// (이어서 사용하기)에 둔다. 파괴적 선택지에 포커스를 두면 엔터 1타로 데이터가 격리된다 — 모달이
+// 떴다는 사실조차 못 읽은 사용자가 가장 먼저 하는 동작이 엔터다.
+// ★ESC·바깥 클릭은 **허용**한다(닫으면 미기록 → 다음 기동에 다시 묻는다). 종전 차단은 모달 트랩을
+// 만들고 `choice === null` 경로를 데드 코드로 만들었다(reviewer-gemini MAJOR).
+function freshStartModal(deptCount: number, totalBytes: number): Promise<"fresh" | "keep" | null> {
+  return new Promise((resolve) => {
+    const gb = totalBytes > 0 ? `${(totalBytes / 1024 / 1024 / 1024).toFixed(1)}GB` : "";
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.innerHTML =
+      `<div class="modal"><h3></h3>` +
+      `<p class="modal-label" style="white-space:pre-wrap;max-height:46vh;overflow-y:auto"></p>` +
+      `<div class="modal-btns">` +
+      `<button class="modal-no">깨끗하게 새로 시작</button>` +
+      `<button class="modal-yes">이어서 사용하기</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = "이전에 쓰시던 데이터가 남아 있습니다";
+    const scale = [deptCount > 0 ? `부서 ${deptCount}개` : "", gb && `대화 기록 ${gb}`]
+      .filter(Boolean)
+      .join(" · ");
+    (ov.querySelector(".modal-label") as HTMLElement).textContent =
+      `앱을 새로 설치하셨지만, 예전에 쓰시던 내용이 컴퓨터에 그대로 남아 있습니다.\n` +
+      (scale ? `\n남아 있는 것: ${scale}\n` : "") +
+      `\n● 이어서 사용하기\n` +
+      `   예전 부서와 대화 기록을 그대로 불러와 쓰던 대로 이어갑니다.\n` +
+      `\n● 깨끗하게 새로 시작\n` +
+      `   예전 내용을 보관 폴더로 옮기고 처음부터 시작합니다.\n` +
+      `   · 지우는 것이 아니라 옮기는 것이라, 끝난 뒤 보관 폴더 위치를 알려 드립니다.\n` +
+      `   · 앱을 계속 쓰시면 약 2주 뒤 자동으로 정리됩니다.\n` +
+      `   · 라이선스와 직접 넣으신 파일은 그대로 둡니다.\n` +
+      `\n지금 고르기 어려우시면 이 창을 닫으셔도 됩니다 — 다음에 다시 여쭙습니다.`;
+    const done = (v: "fresh" | "keep" | null) => {
+      ov.remove();
+      document.removeEventListener("keydown", onKey);
+      resolve(v);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") done(null);
+    };
+    ov.querySelector(".modal-yes")!.addEventListener("click", () => done("keep"));
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done("fresh"));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(null);
+    });
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(ov);
+    // 배치는 macOS 관례이자 이 앱의 기존 관례(.modal-no 좌 · .modal-yes 우)를 따른다 —
+    // 우측이 기본 동작 자리다. 여기서는 **안전한 쪽**을 그 자리에 놓아 관례와 안전이 일치한다.
+    // 포커스도 안전한 쪽에. 엔터 오타의 결과가 "그대로 쓰기"여야 한다.
+    setTimeout(() => (ov.querySelector(".modal-yes") as HTMLElement).focus(), 50);
+  });
+}
+
+async function freshStartFlow() {
+  let ask = false;
+  try {
+    ask = ((await invoke("fresh_start_check")) as { ask?: boolean }).ask === true;
+  } catch {
+    return; // 판정 실패는 무음 — 시작을 막지 않는다(fail-closed: 묻지 않음)
+  }
+  if (!ask) return;
+  // 규모 고지용 프리뷰(쓰기 0). 실패해도 모달은 띄운다 — 수치 없이라도 선택지를 줘야 한다.
+  let info: { dept_count?: number; total_bytes?: number } = {};
+  try {
+    info = (await invoke("factory_reset_preview", {})) as typeof info;
+  } catch {
+    /* 수치 없이 진행 */
+  }
+  const choice = await freshStartModal(info.dept_count ?? 0, Number(info.total_bytes ?? 0));
+  if (choice === null) return;
+  // ★기록은 초기화 **전에** — 초기화가 중간에 실패해도 같은 질문이 매 기동 반복되지 않게 한다
+  // (실패 자체는 factoryResetFlow 가 sticky 토스트로 정면 고지한다).
+  await invoke("fresh_start_ack").catch(() => {});
+  if (choice === "fresh") await factoryResetFlow({ preConfirmed: true });
 }
 
 // ---------- toasts (daemon push events) ----------
@@ -6705,6 +6789,10 @@ async function start() {
 
   const status = (await invoke("daemon_status")) as Record<string, unknown>;
   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
+
+  // ★재설치 첫 기동 심문 — 데몬 가동 확정 직후, 워크스페이스 복원 **전**에 묻는다(초기화를 고르면
+  // 복원할 것이 없어지므로 순서가 뒤바뀌면 지운 부서가 화면에 한 번 떴다 사라진다).
+  await freshStartFlow();
 
   // 버전 스큐 세대교체(메인 + 부서 데몬) — 시작 1회 + 5분 주기 재검(B). 무중단 rename-swap의 짝으로
   // 구 데몬(lame-duck) 스큐를 비차단 배지로 알리고, 잃을 세션 0인 노드는 무손실 자동 교대한다.

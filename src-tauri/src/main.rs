@@ -3237,6 +3237,138 @@ fn needs_gui_onboard(marker: Option<&str>, current_version: &str) -> bool {
     marker.map(str::trim) != Some(current_version)
 }
 
+/// ★재설치 감지 마커 — "이 사용자 데이터를 마지막으로 본 **설치본**이 무엇인가". 앱 번들을 지웠다
+/// 다시 깔면 번들이 새로 생성돼 이 스탬프가 달라진다. `.gui-onboarded`(버전 질문)·`.last-app-version`
+/// (복원 필요 질문)과 **질문도 작성자도 다르다 — 통합 금지**(위 마커들의 분리 교리와 동일 계열).
+/// 이 파일의 writer 는 아래 `fresh_start_ack` 단 하나다(사용자가 선택을 마친 순간에만 전진).
+fn install_identity_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.install-identity")
+}
+
+/// 현재 실행 중인 앱 **설치본의 신원** — `"<장치>:<inode>|<버전>"`.
+///
+/// ★리뷰 실측 반증(reviewer-codex): 처음엔 번들 **생성시각(birthtime)** 을 썼으나, 같은 tar 를 서로
+/// 다른 시각에 새 디렉터리로 풀어도 생성시각이 같았다 — "다시 설치하면 반드시 달라진다"는 가정이
+/// 성립하지 않았다(설치본이 아카이브의 시각을 그대로 들고 온다). `(장치, inode)` 로 바꾼다: 새로
+/// 복사된 번들은 **다른 파일 객체**이므로 inode 가 달라진다. inode 재사용으로 같아질 수는 있으나
+/// 그 결과는 "묻지 않음"(= 종전 동작)이라 안전한 방향이다.
+///
+/// 버전을 같은 문자열에 박제하는 이유: 업그레이드도 번들을 교체하므로 신원만 보면 정상 업데이트를
+/// 재설치로 오탐한다. `.pending-restore` 마커로 가르려던 첫 설계는 그 마커가 ①번들 교체 뒤
+/// best-effort 작성 ②복원 성공 시 제거 ③수동 업그레이드엔 부재 — 셋 다 오탐을 만들어 폐기했다.
+///
+/// **엄격 설치 경로가 아니면 `None`** — 개발 빌드(`cargo tauri dev`)와 **App Translocation**
+/// (Gatekeeper 가 앱을 무작위 읽기전용 경로에서 실행)에서 경로·inode 가 매 실행 달라져 매번 묻게
+/// 되는 것을 막는다. 판정 불능은 언제나 "묻지 않음"으로 닫힌다.
+fn current_install_stamp() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().ok()?;
+    let macos_dir = exe.parent()?; // …/cys.app/Contents/MacOS
+    if !strict_install_bundle_ok(macos_dir, &cys::home_dir()) {
+        return None;
+    }
+    let bundle = macos_dir.parent()?.parent()?;
+    let md = std::fs::metadata(bundle).ok()?;
+    Some(format!(
+        "{}:{}|{}",
+        md.dev(),
+        md.ino(),
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+/// 사용자가 앱을 휴지통에 넣었다는 증거 — **단, 마지막 기록 이후에 넣은 것만**.
+///
+/// ★리뷰 지적(reviewer-codex·reviewer-gemini 독립 중복): 맥 사용자는 휴지통을 몇 달씩 비우지 않는다.
+/// 존재 여부만 보면 오래된 cys 앱 한 개 때문에 **정상 업그레이드가 영구히 Ask 로 오탐**된다.
+/// 그래서 `.install-identity` 기록 시각보다 **나중에** 버려진 것만 센다 — 그때 이후의 삭제여야
+/// 이번 재설치의 증거다.
+fn app_trashed_since(identity_recorded_at: Option<std::time::SystemTime>) -> bool {
+    let Some(since) = identity_recorded_at else {
+        return false; // 기준 시각이 없으면 비교할 수 없다 → 증거로 쓰지 않는다
+    };
+    let Ok(rd) = std::fs::read_dir(cys::home_dir().join(".Trash")) else {
+        return false;
+    };
+    rd.filter_map(Result::ok).any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        if !(name.starts_with("cys") && name.ends_with(".app")) {
+            return false;
+        }
+        e.metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t > since)
+            .unwrap_or(false)
+    })
+}
+
+/// `"<신원>|<버전>"` → (신원, 버전). 버전 구분자가 없으면 구형식(신원만).
+fn split_install_stamp(s: &str) -> (&str, Option<&str>) {
+    match s.trim().rsplit_once('|') {
+        Some((ident, ver)) => (ident, Some(ver)),
+        None => (s.trim(), None),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FreshStartPrompt {
+    /// 묻지 않는다(최초 설치·개발 빌드·같은 설치본).
+    Skip,
+    /// 스탬프만 기록하고 넘어간다 — 도입 전 설치본·업그레이드는 **심문하지 않는다**.
+    Seed,
+    /// 재설치로 보인다 — 이전 데이터 처리를 묻는다.
+    Ask,
+}
+
+/// "이전 데이터를 어떻게 할지 물어볼 것인가" — 부작용 없는 순수 판정(단위테스트 대상).
+///
+/// 설계 원칙: **오탐(업데이트를 재설치로 오인)은 데이터 격리를 부르므로 치명적이고, 미탐(재설치를
+/// 못 알아봄)은 종전 동작(그대로 복원)일 뿐이다.** 그래서 모든 모호한 경우는 Skip 으로 닫는다.
+///
+///  · 이전 데이터 없음 / 스탬프 판정 불능        → Skip  (최초 설치·개발 빌드)
+///  · 기록 없음                                  → Seed  (이 기능 도입 전 설치본 — 소급 심문 금지)
+///  · 기록 == 현재                               → Skip  (같은 설치본을 계속 쓰는 중)
+///  · 신원 변경 + 버전 동일                      → Ask   (같은 버전인데 번들만 교체 = 재설치)
+///  · 신원 변경 + 버전 변경 + 최근 삭제 흔적     → Ask   (지우고 최신본을 새로 받았다)
+///  · 신원 변경 + 버전 변경                      → Seed  (★업그레이드 — 인앱·수동 모두. 묻지 않는다)
+fn decide_fresh_start_prompt(
+    prior_data_exists: bool,
+    recent_trash_evidence: bool,
+    recorded: Option<&str>,
+    current: Option<&str>,
+) -> FreshStartPrompt {
+    if !prior_data_exists {
+        return FreshStartPrompt::Skip;
+    }
+    let Some(current) = current else {
+        return FreshStartPrompt::Skip;
+    };
+    let Some(recorded) = recorded else {
+        return FreshStartPrompt::Seed;
+    };
+    if recorded.trim() == current {
+        return FreshStartPrompt::Skip;
+    }
+    let (_, rec_ver) = split_install_stamp(recorded);
+    let (_, cur_ver) = split_install_stamp(current);
+    match (rec_ver, cur_ver) {
+        // 같은 버전인데 번들이 다른 파일 객체 = 지웠다 다시 깔았다
+        (Some(r), Some(c)) if r == c => FreshStartPrompt::Ask,
+        // 버전이 올라갔다 = 업그레이드. 단 **기록 이후에** 앱을 버린 흔적이 있으면 그건
+        // "지우고 최신본을 새로 받았다"는 뜻이므로 묻는다(오래된 휴지통은 세지 않는다).
+        (Some(_), Some(_)) => {
+            if recent_trash_evidence {
+                FreshStartPrompt::Ask
+            } else {
+                FreshStartPrompt::Seed
+            }
+        }
+        // 구형식·손상 기록은 업그레이드 여부를 알 수 없다 — 안전한 쪽(Seed)으로 닫는다.
+        _ => FreshStartPrompt::Seed,
+    }
+}
+
 /// (T1) 재시작 후 팩반영·복원을 돌릴지 판정 — 부작용(파일·프로세스) 없는 순수 함수(단위테스트 대상).
 #[derive(Debug, PartialEq, Eq)]
 enum PendingUpdatePlan {
@@ -5055,6 +5187,45 @@ fn dept_purge_preview_by_socket(socket: String) -> Result<Value, String> {
 /// (같은 기능의 CLI `--plan` 은 전 경로를 찍는다 — 정보 비대칭). 이제 전 항목·강조 표식·
 /// report_only·사전점검·중단흔적·세션 수를 넘겨 모달이 승인 전에 다 보여준다.
 /// 또 `fn` 이라 대용량 재귀 stat 동안 창이 굳었다 — 실행 커맨드와 같은 `spawn_blocking` 으로.
+/// ★재설치 첫 기동 심문 — "앱을 지웠다 다시 깔았는데 이전 데이터가 그대로 남아 있다"를 감지해
+/// 프런트에 알린다. 초보 사용자의 삭제·재설치 의식은 **깨끗해졌다는 기대**를 동반하는데, 데이터가
+/// 앱 번들 밖(~/.cys·~/.local/state)에 있어 실제로는 전부 복원된다 — 그 어긋남을 여기서 닫는다.
+/// 쓰기 0(판정만) — 기록은 사용자가 고른 뒤 `fresh_start_ack` 이 한다.
+#[tauri::command]
+fn fresh_start_check() -> Value {
+    let prior_data_exists = cys::pack::pack_dir().join(".pack-version").exists()
+        || cys::home_dir().join(".cys/depts.json").exists();
+    let recorded = std::fs::read_to_string(install_identity_path()).ok();
+    let current = current_install_stamp();
+    let recorded_at = std::fs::metadata(install_identity_path())
+        .and_then(|m| m.modified())
+        .ok();
+    let verdict = decide_fresh_start_prompt(
+        prior_data_exists,
+        app_trashed_since(recorded_at),
+        recorded.as_deref(),
+        current.as_deref(),
+    );
+    // Seed 는 물어볼 일이 아니라 **조용히 기록만** 한다(이 기능 도입 전 설치본 소급 심문 금지).
+    if verdict == FreshStartPrompt::Seed {
+        if let Some(cur) = current.as_deref() {
+            let _ = std::fs::write(install_identity_path(), cur);
+        }
+    }
+    json!({ "ask": verdict == FreshStartPrompt::Ask })
+}
+
+/// 사용자가 선택을 마쳤다 — 현재 설치본을 "이 데이터를 본 설치본"으로 기록해 다음 기동에서 다시
+/// 묻지 않게 한다. "이어서 사용하기"는 이것만 부르고, "깨끗하게 새로 시작"은 초기화 **전에** 부른다
+/// (초기화가 중간에 실패해도 같은 질문이 무한 반복되지 않도록 — 실패는 토스트로 별도 고지된다).
+#[tauri::command]
+fn fresh_start_ack() -> Result<(), String> {
+    let Some(cur) = current_install_stamp() else {
+        return Ok(()); // 스탬프 판정 불능이면 기록할 것이 없다(다음 기동도 Skip 로 닫힌다)
+    };
+    std::fs::write(install_identity_path(), cur).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn factory_reset_preview() -> Result<Value, String> {
     let live_sessions = live_session_count().await.unwrap_or(0);
@@ -5831,6 +6002,8 @@ fn main() {
             stop_dept_daemon_by_socket,
             purge_dept_daemon_by_socket,
             dept_purge_preview_by_socket,
+            fresh_start_check,
+            fresh_start_ack,
             factory_reset_preview,
             factory_reset_execute,
             factory_reset_quit_app,
@@ -6150,6 +6323,34 @@ mod tests {
     /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
     /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
     /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
+    #[test]
+    fn fresh_start_asks_on_reinstall_but_never_on_a_plain_upgrade() {
+        use FreshStartPrompt::*;
+        let a1 = "16777232:100|0.14.33"; // 설치본 A, 버전 1
+        let b1 = "16777232:200|0.14.33"; // 설치본 B(다른 inode), 같은 버전 = 재설치
+        let b2 = "16777232:200|0.14.34"; // 설치본 B, 버전 2 = 업그레이드
+        // 물을 것이 없거나 판정 불능(개발 빌드·translocation) — 묻지 않는다
+        assert_eq!(decide_fresh_start_prompt(false, false, None, Some(a1)), Skip);
+        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), None), Skip);
+        // 도입 전 설치본 — 소급 심문 금지(기록만)
+        assert_eq!(decide_fresh_start_prompt(true, false, None, Some(a1)), Seed);
+        // 같은 설치본 계속 사용 — 매 기동 묻지 않는다
+        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(a1)), Skip);
+        // ★핵심 경로 — 지웠다 같은 버전을 다시 깔았다
+        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(b1)), Ask);
+        // ★BLOCKER 시정 — 인앱·수동 업그레이드를 재설치로 오탐하지 않는다
+        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(b2)), Seed);
+        // ★오탐 시정 — 오래된 휴지통(기록 이전)은 업그레이드를 흔들지 못한다.
+        //   기록 **이후**에 버린 흔적이 있을 때만 "지우고 최신본을 받았다"로 본다.
+        assert_eq!(decide_fresh_start_prompt(true, true, Some(a1), Some(b2)), Ask);
+        // 손상·구형식 기록은 업그레이드 여부를 알 수 없다 → 안전한 쪽
+        assert_eq!(decide_fresh_start_prompt(true, false, Some(" \n"), Some(a1)), Seed);
+        assert_eq!(
+            decide_fresh_start_prompt(true, false, Some("16777232:100"), Some(b2)),
+            Seed
+        );
+    }
+
     #[test]
     fn needs_gui_onboard_only_skips_on_exact_version_match() {
         assert!(needs_gui_onboard(None, "0.12.53"), "마커 부재 = 온보딩(신선·직전 실패)");
