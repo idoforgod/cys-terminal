@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ~/.cys 직하에서 격리하는 정확 이름. (pack·조직 레지스트리·상태·마커·토글 전부)
-const CYS_BASE_EXACT: [&str; 26] = [
+const CYS_BASE_EXACT: [&str; 27] = [
     "pack",
     "pack.prev",
     ".pack-download",
@@ -42,6 +42,7 @@ const CYS_BASE_EXACT: [&str; 26] = [
     "approvals.json",
     ".approval-secret",
     ".gui-onboarded",
+    ".gui-onboard-attempts", // W-4-b: .gui-onboarded 옆 판정 불가 시도 기록(src-tauri main.rs)
     ".last-app-version",
 ];
 

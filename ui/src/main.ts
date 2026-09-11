@@ -7146,6 +7146,24 @@ async function start() {
     /* 비-macOS·번들 밖 실행은 해당 없음 */
   }
 
+  // ★W-4-c/d(R4-M1): 온보딩 안내 — 판정 불가로 자동 복구를 멈춤(상한 · 어느 파일이 왜 문제인지) · 빠진 훅을 다시 넣음.
+  // 백엔드는 부팅 초기에 판정하므로 이 listen 등록보다 먼저 emit 할 수 있다(재설치 안내창이 떠 있는 동안 등) — 그래서
+  // 백엔드가 먼저 쌓고 emit 하며, 여기서는 listen 을 걸고 **직후** 한 번 당긴다(bundle-damaged 의 F3 재-pull 과 같은 봉합).
+  // 같은 kind 는 같은 토스트 id 라 push·pull 이 겹쳐도 한 줄이다.
+  const showOnboardNotice = (n: unknown): void => {
+    const { kind, message } = (n ?? {}) as { kind?: unknown; message?: unknown };
+    if (typeof message !== "string" || !message) return;
+    if (kind === "capped") stickyToast("onboard-capped", "health", "Claude 설정 파일을 고쳐 주세요", message);
+    else if (kind === "restored") stickyToast("onboard-restored", "health", "Claude 연결 설정을 다시 넣었습니다", message);
+  };
+  await listen("onboard-notice", (e) => showOnboardNotice(e.payload));
+  try {
+    const notices = await invoke("onboard_notices");
+    if (Array.isArray(notices)) notices.forEach((n) => showOnboardNotice(n));
+  } catch {
+    /* 커맨드 부재(구 백엔드) — 안내 없음 · 부팅 무영향 */
+  }
+
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);

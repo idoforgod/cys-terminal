@@ -55,7 +55,7 @@ hostinger-ftp.env·license.json)까지 파괴한다.
   claude, claude-*, state, state-generations, state-harness, _round, transfers,
   depts.json(+.lock), dept-catalog.json(+.lock), dept-missions, dept-snapshots,
   accounts.json, policy.json, profile.json, approvals.json, .approval-secret,
-  .master-bootstrapped*, .gui-onboarded, .last-app-version, .pending-restore,
+  .master-bootstrapped*, .gui-onboarded, .gui-onboard-attempts, .last-app-version, .pending-restore,
   ime-debug, allow-app-mouse, url-allow-hosts, harness-creator
 - `~/.local/state/`: cys, cys-dept-* (등록·고아 불문. cys-trash 제외 — 격리 목적지)
 - 프로젝트 작업기억: `~/_round`, `${CYS_ROOT:-~/Desktop/CYSjavis}/_round`, 그리고 그

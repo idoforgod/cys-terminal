@@ -3232,16 +3232,108 @@ fn gui_onboarded_path() -> std::path::PathBuf {
 }
 
 /// GUI 온보딩 실행 여부 — 부작용 없는 순수 판정(단위테스트 대상). 마커 내용이 현재 바이너리 버전과 정확히
-/// 일치하고 **온보딩의 결과(각성 훅)가 실제로 있을 때만** 스킵. 부재·불일치·읽기 실패·훅 부재 = 실행
-/// (fail-open — 치유 방향).
+/// 일치하고 **온보딩의 결과(각성 훅)가 실제로 있을 때만** 스킵. 부재·불일치·읽기 실패·훅 부재·판정 불가 = 실행
+/// 대상(fail-open — 치유 방향). 판정 불가(W-4-a)를 실제로 몇 번 돌릴지는 `plan_gui_onboard` 가 정한다(W-4-b).
 /// ★W-3-a(2026-09-11 · reviewer-codex R3-B1): 마커는 '온보딩이 한 번 성공했다'는 기록일 뿐 지금 훅이 있다는
 /// 증거가 아니다. 완전 초기화와 늦게 끝난 온보딩이 어떤 순서로 겹쳐도 — 초기화 뒤에 마커가 다시 써지거나,
 /// 초기화가 목록을 뽑은 뒤 마커가 생겨 격리를 피하거나 — 남는 것은 '마커는 맞고 훅은 없는' 상태이고, 그 상태는
 /// 다음 기동에 온보딩을 다시 돌려 스스로 치유된다. 쓰는 순서를 락 없이 맞추려던 래치(W-2 A4)는 경쟁이 남아
 /// 버렸다 — 경쟁을 이기려 하지 않고 결과를 무해하게 만든다. 이 기능과 무관하게 이미 있던 '훅만 사후 유실
 /// (마커 무결)' 상태도 같은 길로 치유된다(종전엔 doctor --fix·버전 전이에 미뤘다).
-fn needs_gui_onboard(marker: Option<&str>, current_version: &str, hooks_installed: bool) -> bool {
-    !hooks_installed || marker.map(str::trim) != Some(current_version)
+fn needs_gui_onboard(marker: Option<&str>, current_version: &str, presence: &HookPresence) -> bool {
+    *presence != HookPresence::Installed || marker.map(str::trim) != Some(current_version)
+}
+
+/// ★W-4-a(2026-09-11 · reviewer-codex R4-M1): 각성 훅 관측 3상태 — 대상 settings 하나에도, 한 기동의 집계에도 쓴다.
+///  · `Installed` — 등재가 있다(command 축 · `hook_registered_in`).
+///  · `Missing` — 등재가 없고 온보딩이 **고칠 수 있다**(파일·등재 부재 · 팩 훅 스크립트 부재).
+///  · `Undeterminable(사유)` — init-pack 의 병합기(`cys::pack::merge_desired_hooks`)가 **계약상 거부하는** 대상(손상 JSON·
+///    읽기 불가·등재 없는 symlink·형식 불일치)이라 온보딩을 몇 번 돌려도 상태가 바뀌지 않는다. 22b59ff 는 이것을 '없음'으로
+///    보고 매 GUI 실행마다 온보딩을 돌렸다(R4-M1). ★절대 `Installed` 로 뭉개지 않는다 — 모든 오류를 '설치됨'으로 보면 훅 없는
+///    영구 반쪽(R3-B1)이 조용히 돌아온다. 대신 시도 횟수를 제한하고(W-4-b) 상한에서 어느 파일이 왜 문제인지 보인다(W-4-c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookPresence {
+    Installed,
+    Missing,
+    Undeterminable(String),
+}
+
+/// 대상 settings 하나의 3상태 — `merge_desired_hooks` 가 거부하는 조건을 **같은 순서**로 본다(symlink → 읽기 → 파싱 →
+/// 루트 형식 → 추가할 자리의 형식). 등재가 이미 있으면 symlink 를 따라 읽었어도 `Installed` 다(Claude Code 는 링크를 따라
+/// 읽는다 — 병합기가 거부하는 것은 쓰기뿐이다). 빈 파일·파일 부재는 병합기가 새로 쓰므로 `Missing`.
+fn classify_hook_settings(settings: &std::path::Path, pack: &std::path::Path) -> HookPresence {
+    let is_link = std::fs::symlink_metadata(settings)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    let root: serde_json::Value = match std::fs::read_to_string(settings) {
+        Ok(s) if s.trim().is_empty() => json!({}),
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => return HookPresence::Undeterminable(format!("JSON 형식이 깨져 있습니다({e})")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !is_link => return HookPresence::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return HookPresence::Undeterminable("가리키는 파일이 없는 링크(심볼릭 링크)입니다".into())
+        }
+        Err(e) => return HookPresence::Undeterminable(format!("파일을 읽을 수 없습니다({e})")),
+    };
+    let unregistered: Vec<&cys::pack::DesiredHook> = cys::pack::AWAKENING_HOOKS
+        .iter()
+        .filter(|h| !cys::pack::hook_registered_in(&root, h.event, &cys::pack::hook_command_for(pack, h.script)))
+        .collect();
+    if unregistered.is_empty() {
+        return HookPresence::Installed;
+    }
+    if is_link {
+        return HookPresence::Undeterminable("다른 파일을 가리키는 링크(심볼릭 링크)라 cys 가 고쳐 쓰지 않습니다".into());
+    }
+    let Some(obj) = root.as_object() else {
+        return HookPresence::Undeterminable("맨 바깥이 JSON 객체({ … })가 아닙니다".into());
+    };
+    if let Some(hooks) = obj.get("hooks") {
+        if !hooks.is_object() {
+            return HookPresence::Undeterminable("\"hooks\" 항목이 JSON 객체가 아닙니다".into());
+        }
+        if let Some(h) = unregistered.iter().find(|h| hooks.get(h.event).is_some_and(|v| !v.is_array())) {
+            return HookPresence::Undeterminable(format!("\"hooks.{}\" 항목이 배열이 아닙니다", h.event));
+        }
+    }
+    HookPresence::Missing
+}
+
+/// 한 기동의 관측 — 팩 훅 스크립트 실재 + 대상 settings 별 3상태(W-4-a). 부서 팩은 대상이 없다(= `Installed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookObservation {
+    scripts_missing: bool,
+    targets: Vec<(std::path::PathBuf, HookPresence)>,
+}
+
+impl HookObservation {
+    /// 집계 3상태. 고칠 수 있는 부재(훅 스크립트·등재 누락)가 하나라도 있으면 `Missing` — 이번 온보딩이 그것을 고치므로
+    /// 시도 상한에 세지 않는다(판정 불가 프로필 하나 때문에 다른 프로필의 복구까지 멈추면 그 프로필이 조용한 영구 반쪽이
+    /// 된다). 고칠 것이 없고 판정 불가만 남으면 `Undeterminable`, 아무것도 없으면 `Installed`.
+    fn presence(&self) -> HookPresence {
+        if self.scripts_missing || self.targets.iter().any(|(_, s)| *s == HookPresence::Missing) {
+            return HookPresence::Missing;
+        }
+        match self.undeterminable_reason() {
+            Some(why) => HookPresence::Undeterminable(why),
+            None => HookPresence::Installed,
+        }
+    }
+
+    /// 판정 불가 대상 전부의 `<경로> — <사유>` — 시도 기록의 '같은 상태' 열쇠이자 상한 안내의 본문.
+    fn undeterminable_reason(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .targets
+            .iter()
+            .filter_map(|(p, s)| match s {
+                HookPresence::Undeterminable(why) => Some(format!("{} — {why}", p.display())),
+                _ => None,
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
 }
 
 /// ★W-3-a: GUI 온보딩의 결과가 **실제로 있는가** — `cys init-pack`(src/bin/cys.rs run_init_pack)이 등록하는
@@ -3251,17 +3343,15 @@ fn needs_gui_onboard(marker: Option<&str>, current_version: &str, hooks_installe
 /// 개인 프로필에 훅을 쓰지 않으므로 판정 대상이 아니다(설치됨으로 본다).
 /// 등재는 command 축만 본다(`hook_registered_in` — `cys doctor`·부트 경고와 같은 관측 술어): timeout 만 달라진
 /// 설치를 '없음'으로 보면 매 기동 온보딩이 돈다.
-/// 비용(부팅마다 1회): 홈 디렉터리 목록 1회 + 프로필 수만큼 작은 JSON 읽기 + 훅 스크립트 stat 2회.
-fn gui_hooks_installed_under(home: &std::path::Path, pack: &std::path::Path) -> bool {
+/// 비용(부팅마다 1회): 홈 디렉터리 목록 1회 + 프로필마다 lstat 1회·작은 JSON 읽기 + 훅 스크립트 stat 2회.
+/// ★W-4-a: 결과는 '있다/없다'가 아니라 3상태 관측(`HookObservation` · 대상별 분류 = `classify_hook_settings`)이다.
+fn observe_gui_hooks_under(home: &std::path::Path, pack: &std::path::Path) -> HookObservation {
     if cys::pack::dept_scope_of(pack).is_some() {
-        return true;
+        return HookObservation { scripts_missing: false, targets: Vec::new() };
     }
-    if !cys::pack::AWAKENING_HOOKS
+    let scripts_missing = !cys::pack::AWAKENING_HOOKS
         .iter()
-        .all(|h| pack.join("hooks").join(h.script).is_file())
-    {
-        return false;
-    }
+        .all(|h| pack.join("hooks").join(h.script).is_file());
     let mut targets: Vec<std::path::PathBuf> = cys::pack::personal_profile_dirs_under(home)
         .into_iter()
         .map(|d| d.join("settings.json"))
@@ -3269,21 +3359,185 @@ fn gui_hooks_installed_under(home: &std::path::Path, pack: &std::path::Path) -> 
     if targets.is_empty() {
         targets.push(home.join(".claude/settings.json"));
     }
-    targets.iter().all(|settings| {
-        let Some(root) = std::fs::read_to_string(settings)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        else {
-            return false;
-        };
-        cys::pack::AWAKENING_HOOKS.iter().all(|h| {
-            cys::pack::hook_registered_in(&root, h.event, &cys::pack::hook_command_for(pack, h.script))
+    let targets = targets
+        .into_iter()
+        .map(|settings| {
+            let state = classify_hook_settings(&settings, pack);
+            (settings, state)
         })
-    })
+        .collect();
+    HookObservation { scripts_missing, targets }
 }
 
-fn gui_hooks_installed() -> bool {
-    gui_hooks_installed_under(&cys::home_dir(), &cys::pack::pack_dir())
+fn observe_gui_hooks() -> HookObservation {
+    observe_gui_hooks_under(&cys::home_dir(), &cys::pack::pack_dir())
+}
+
+/// ★W-4-b: 판정 불가(`Undeterminable`)일 때 온보딩을 실제로 돌리는 상한 — 같은 앱 버전·같은 사유가 이어지는 동안.
+/// N=2 근거: ① 판정 불가 대상은 온보딩의 병합기가 계약상 거부하므로 재시도가 고칠 수 있는 것은 **일시 조건**뿐이다
+/// (다른 프로그램이 그 파일을 막 다시 쓰는 순간 반쪽을 읽음·잠깐의 권한 문제) — 그런 조건은 다음 실행 한 번이면
+/// 드러난다 ② 시도마다 init-pack 전체(팩 반영 + 훅 등록 · Windows 는 자동 시작 등록까지)가 돌아 앱이 늦게 뜬다 —
+/// 고칠 수 없는 시도는 사용자가 치르는 비용일 뿐이다 ③ 상한에서 안내가 뜬다(W-4-c) — 2 면 두 번째 실행에 원인과
+/// 처방을 본다(3 이면 이유 모르는 느린 실행을 한 번 더 겪는다).
+const GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS: u32 = 2;
+
+/// 한 기동의 온보딩 계획(W-4-b).
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiOnboardPlan {
+    /// 할 일 없음 — 훅 있음 + 현재 버전 마커.
+    Skip,
+    /// 온보딩 — 신선·업그레이드·고칠 수 있는 부재(종전 그대로 · 상한 없음).
+    Run,
+    /// 판정 불가 상태의 n번째 시도(n ≤ 상한) — 실제로 돌기 **직전에** 기록한다(도중에 죽어도 센다).
+    RunCounted(u32),
+    /// 상한 도달 — 더 시도하지 않는다. ★`Installed` 로 치는 것이 아니다: 마커를 쓰지 않고, 매 기동 다시 관측하고,
+    /// 안내를 띄운다. 파일이 고쳐지면(사유가 바뀌거나 판정 불가가 사라지면) 기록이 초기화돼 다시 시도한다.
+    Capped,
+}
+
+/// 순수 판정 — `needs` 는 `needs_gui_onboard`, `prior_attempts` 는 같은 버전·같은 사유로 이미 한 시도 수.
+fn plan_gui_onboard(needs: bool, presence: &HookPresence, prior_attempts: u32) -> GuiOnboardPlan {
+    if !needs {
+        return GuiOnboardPlan::Skip;
+    }
+    match presence {
+        HookPresence::Undeterminable(_) if prior_attempts >= GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS => {
+            GuiOnboardPlan::Capped
+        }
+        HookPresence::Undeterminable(_) => GuiOnboardPlan::RunCounted(prior_attempts + 1),
+        _ => GuiOnboardPlan::Run,
+    }
+}
+
+/// ★W-4-b: 판정 불가 시도 기록 — 마커(`.gui-onboarded`) 옆 별도 파일 `{"version","reason","attempts"}`. 마커는 '성공'만
+/// 기록하므로(질문이 다르다) 섞지 않는다. writer 는 setup 의 `record_gui_onboard_attempt` 하나다. 완전 초기화 인벤토리
+/// (src/factory_reset.rs CYS_BASE_EXACT)에 마커와 나란히 올라 있다 — 미등록 파일은 초기화가 '오너 파일'로 보존한다.
+fn gui_onboard_attempts_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.gui-onboard-attempts")
+}
+
+/// 기록된 시도 수 — **같은 앱 버전·같은 사유**일 때만 이어 센다. 버전이 바뀌면(새 온보딩 코드·새 팩) 또는 사유가 바뀌면
+/// (파일이 달라졌다) 0 — 상태가 바뀌면 초기화. 기록 부재·손상도 0(모르면 시도 쪽 — 상한은 여전히 걸린다).
+fn prior_gui_onboard_attempts(record: Option<&str>, version: &str, reason: &str) -> u32 {
+    let Some(v) = record.and_then(|s| serde_json::from_str::<Value>(s).ok()) else {
+        return 0;
+    };
+    if v["version"].as_str() != Some(version) || v["reason"].as_str() != Some(reason) {
+        return 0;
+    }
+    v["attempts"].as_u64().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// 한 기동의 계획(읽기만 — 기록 갱신은 실제 시도 직전의 `record_gui_onboard_attempt`).
+fn gui_onboard_plan_under(
+    seen: &HookObservation,
+    marker: Option<&str>,
+    attempts_path: &std::path::Path,
+    version: &str,
+) -> GuiOnboardPlan {
+    let presence = seen.presence();
+    let prior = seen.undeterminable_reason().map_or(0, |why| {
+        prior_gui_onboard_attempts(std::fs::read_to_string(attempts_path).ok().as_deref(), version, &why)
+    });
+    plan_gui_onboard(needs_gui_onboard(marker, version, &presence), &presence, prior)
+}
+
+/// 시도 기록 갱신 — 판정 불가 대상이 없으면 지운다(상태가 바뀌었다 = 초기화) · `RunCounted(n)` 이면 n 을 쓴다.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn record_gui_onboard_attempt(
+    attempts_path: &std::path::Path,
+    version: &str,
+    seen: &HookObservation,
+    plan: GuiOnboardPlan,
+) {
+    match (seen.undeterminable_reason(), plan) {
+        (None, _) => {
+            let _ = std::fs::remove_file(attempts_path);
+        }
+        (Some(why), GuiOnboardPlan::RunCounted(n)) => {
+            let body = json!({"version": version, "reason": why, "attempts": n}).to_string();
+            if let Err(e) = std::fs::write(attempts_path, body) {
+                eprintln!("[cys-app] onboarding attempts record write failed: {e}");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// ★W-4-c/d: 한 기동의 온보딩 결과 중 사용자에게 보여야 하는 것(순수 — 단위 테스트 대상). `(kind, 본문)`.
+///  · "capped" — 판정 불가로 시도 상한에 닿았다(방금이 마지막 시도였거나 이미 상한). 어느 파일이 왜 문제인지·무엇을
+///    하면 되는지. 상한인 동안 **매 기동** 띄운다(한 번 띄우고 조용해지면 그것이 조용한 영구 반쪽이다).
+///  · "restored" — 온보딩을 마친 적이 있는데(마커 있음) 등재가 빠져 있던 settings 에 이번 기동이 훅을 다시 넣었다.
+///    사용자가 손으로 지운 것을 되살렸을 수 있으므로 조용히 하지 않는다(영속 끄기는 이번 범위 밖 — 백로그).
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn gui_onboard_notices(
+    plan: GuiOnboardPlan,
+    before: &HookObservation,
+    after: &HookObservation,
+    had_marker: bool,
+) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let at_cap = match plan {
+        GuiOnboardPlan::Capped => true,
+        GuiOnboardPlan::RunCounted(n) => n >= GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS,
+        _ => false,
+    };
+    if let (true, Some(why)) = (at_cap, after.undeterminable_reason()) {
+        out.push((
+            "capped",
+            format!(
+                "Claude 설정 파일에 cys 연결 설정(훅)을 넣지 못해 자동 복구를 멈췄습니다({}번 시도). 문제 파일: {why}. \
+                 이 파일을 고치거나 지운 뒤 앱을 다시 여세요.",
+                GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS
+            ),
+        ));
+    }
+    if had_marker {
+        let restored: Vec<String> = before
+            .targets
+            .iter()
+            .filter(|(p, s)| {
+                *s == HookPresence::Missing
+                    && after.targets.iter().any(|(q, t)| q == p && *t == HookPresence::Installed)
+            })
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        if !restored.is_empty() {
+            out.push((
+                "restored",
+                format!(
+                    "Claude 설정 파일에 빠져 있던 cys 연결 설정(훅)을 다시 넣었습니다: {}. 직접 지우셨다면 앱을 열 때 다시 \
+                     들어갑니다(끄는 설정은 아직 없습니다).",
+                    restored.join(", ")
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// ★W-4-c/d: 온보딩 안내 저장소 — 프런트는 부팅 뒤(재설치 안내창이 닫힌 뒤)에야 listen 을 걸어서, 그 전에 나간 emit 은
+/// 유실된다(emit-before-listen — bundle-damaged 의 F3 격차와 같은 기제). 그래서 **먼저 여기 쌓고 emit** 하고, 프런트는
+/// listen 을 건 **직후** `onboard_notices` 로 한 번 당긴다(같은 kind = 같은 토스트 id 라 둘 다 와도 한 줄).
+static ONBOARD_NOTICES: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
+
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+fn push_onboard_notice(app: &AppHandle, kind: &'static str, message: String) {
+    if let Ok(mut v) = ONBOARD_NOTICES.lock() {
+        v.retain(|(k, _)| *k != kind);
+        v.push((kind, message.clone()));
+    }
+    let _ = app.emit("onboard-notice", json!({"kind": kind, "message": message}));
+}
+
+/// 프런트 pull — 이번 기동에 쌓인 온보딩 안내(없으면 빈 목록).
+#[tauri::command]
+fn onboard_notices() -> Vec<Value> {
+    ONBOARD_NOTICES
+        .lock()
+        .map(|v| v.iter().map(|(k, m)| json!({"kind": k, "message": m})).collect())
+        .unwrap_or_default()
 }
 
 /// ★재설치 감지 마커 — "이 사용자 데이터를 마지막으로 본 **설치본**이 무엇인가". 앱 번들을 지웠다
@@ -6176,6 +6430,7 @@ fn main() {
             boot_verdict,
             // ATOMIC-1 짝: 설치본이 '반쪽 번들'인지 기동 시 스스로 확인해 복구 절차를 준다.
             bundle_integrity,
+            onboard_notices,
             // INST-1(P4-4): claude CLI 미설치 온보딩 카드 pull(agent-detect 단일 오라클 소비).
             claude_missing_hint,
         ])
@@ -6226,12 +6481,19 @@ fn main() {
                 // 마스터다" 부트스트랩 무력화). 이 마커는 GUI 온보딩 성공 경로만 기록하므로 프로세스
                 // 순서와 무관하게 신선 머신 온보딩이 보장된다. 평시 부트 비용 = 마커 read 1회 + 훅 실재 확인
                 // (홈 목록·작은 JSON 읽기·stat — W-3-a).
-                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
-                let needs_onboard = needs_gui_onboard(
-                    std::fs::read_to_string(gui_onboarded_path()).ok().as_deref(),
+                // ★W-4(R4-M1): 관측은 3상태 — 판정 불가(손상·읽기 불가·등재 없는 symlink 등)는 같은 버전·같은 사유 동안
+                // GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS 번까지만 실제로 돌리고(기록 = 마커 옆 .gui-onboard-attempts ·
+                // 실제 시도 직전에 쓴다), 상한에서는 멈추되 설치됨으로 치지 않는다(마커 미기록 · 매 기동 재관측 · 안내).
+                let onboard_marker = std::fs::read_to_string(gui_onboarded_path()).ok();
+                let onboard_seen = observe_gui_hooks();
+                let onboard_plan = gui_onboard_plan_under(
+                    &onboard_seen,
+                    onboard_marker.as_deref(),
+                    &gui_onboard_attempts_path(),
                     env!("CARGO_PKG_VERSION"),
-                    gui_hooks_installed(),
                 );
+                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
+                let needs_onboard = matches!(onboard_plan, GuiOnboardPlan::Run | GuiOnboardPlan::RunCounted(_));
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
@@ -6301,17 +6563,39 @@ fn main() {
                 // 마커는 온보딩 **성공** 시에만 기록 — hook 등록 실패(init-pack rc=1)도 재시도로 수렴.
                 // hook만 사후 유실된 상태(마커 무결)는 needs_gui_onboard 의 훅 실재 확인이 다음 부트에 온보딩을
                 // 다시 돌려 치유한다(W-3-a · 종전엔 doctor --fix·버전 전이에 미뤘다).
+                // ★W-4-b: 판정 불가 시도는 **실제로 돌기 직전에** 센다(데몬이 못 떠 여기까지 못 오면 시도가 아니다).
+                #[cfg(any(windows, target_os = "macos"))]
+                record_gui_onboard_attempt(
+                    &gui_onboard_attempts_path(),
+                    env!("CARGO_PKG_VERSION"),
+                    &onboard_seen,
+                    onboard_plan,
+                );
                 #[cfg(windows)]
-                if needs_onboard && maybe_windows_onboard() {
+                let onboarded = needs_onboard && maybe_windows_onboard();
+                #[cfg(windows)]
+                if onboarded {
                     if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
                         eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
                     }
                 }
                 // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
-                if needs_onboard && maybe_macos_onboard() {
+                let onboarded = needs_onboard && maybe_macos_onboard();
+                #[cfg(target_os = "macos")]
+                if onboarded {
                     if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
                         eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
+                }
+                // ★W-4-c/d: 결과를 보이게 — 상한 안내(어느 파일·왜·무엇을) · 빠진 훅을 다시 넣었다는 안내.
+                #[cfg(any(windows, target_os = "macos"))]
+                {
+                    let after = if needs_onboard { observe_gui_hooks() } else { onboard_seen.clone() };
+                    for (kind, message) in
+                        gui_onboard_notices(onboard_plan, &onboard_seen, &after, onboard_marker.is_some())
+                    {
+                        push_onboard_notice(&handle, kind, message);
                     }
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
@@ -6659,12 +6943,19 @@ mod tests {
         let gate = "boot_gate_refusal()";
         before(exec, gate, "stop_daemons_and_unregister", "초기화 실행");
         before(exec, gate, "spawn_blocking", "초기화 실행");
-        // ★W-3-a(R3-B1): 온보딩 판정은 마커만이 아니라 훅 실재를 입력으로 받는다 — setup 이 그 값을 실제로 넘기는가.
-        let onboard_call = seg("let needs_onboard = needs_gui_onboard(", ");");
+        // ★W-3-a(R3-B1) + W-4-a: 온보딩 계획은 마커만이 아니라 실제 홈·팩의 훅 관측(3상태)을 입력으로 받는다.
         assert!(
-            onboard_call.contains("gui_hooks_installed()"),
-            "setup 의 온보딩 판정에 훅 실재 확인이 빠졌다 — 마커만 믿는 판정으로 회귀(R3-B1)"
+            seg("let onboard_seen = ", ";").contains("observe_gui_hooks()")
+                && seg("let onboard_plan = gui_onboard_plan_under(", ");").contains("&onboard_seen")
+                && seg("fn observe_gui_hooks()", "\n}\n")
+                    .contains("observe_gui_hooks_under(&cys::home_dir(), &cys::pack::pack_dir())"),
+            "setup 의 온보딩 계획에 실제 홈·팩의 훅 관측이 빠졌다 — 마커만 믿는 판정으로 회귀(R3-B1)"
         );
+        // ★W-4-b: 판정 불가 시도 기록은 실제 온보딩 직전에 쓴다(맥·윈도우 둘 다).
+        before(setup, "record_gui_onboard_attempt(", "maybe_macos_onboard()", "시도 기록 → macOS 온보딩");
+        before(setup, "record_gui_onboard_attempt(", "maybe_windows_onboard()", "시도 기록 → Windows 온보딩");
+        // ★W-4-c: 안내는 저장소에 먼저 쌓고 emit 한다 — 프런트의 listen 직후 pull 이 emit-before-listen 유실을 회수하는 전제.
+        before(seg("fn push_onboard_notice(", "\n}\n"), "v.push((kind", "app.emit(\"onboard-notice\"", "안내 저장 → emit");
         // CEO 조건 (나): 프런트가 거부를 '잠시 후 다시'로 알아보는 머리 문구가 두 언어에서 같다.
         let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/resetconfirm.ts");
         let ui_src = std::fs::read_to_string(&ui)
@@ -6675,13 +6966,17 @@ mod tests {
 
     #[test]
     fn needs_gui_onboard_only_skips_on_exact_version_match() {
-        assert!(needs_gui_onboard(None, "0.12.53", true), "마커 부재 = 온보딩(신선·직전 실패)");
-        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53", true), "정확 일치 = 스킵");
-        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53", true), "개행 trim 후 일치 = 스킵");
-        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53", true), "구버전 = 온보딩(업그레이드)");
-        assert!(needs_gui_onboard(Some("garbage"), "0.12.53", true), "손상 = 온보딩(fail-open)");
+        let (yes, no) = (&HookPresence::Installed, &HookPresence::Missing);
+        assert!(needs_gui_onboard(None, "0.12.53", yes), "마커 부재 = 온보딩(신선·직전 실패)");
+        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53", yes), "정확 일치 = 스킵");
+        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53", yes), "개행 trim 후 일치 = 스킵");
+        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53", yes), "구버전 = 온보딩(업그레이드)");
+        assert!(needs_gui_onboard(Some("garbage"), "0.12.53", yes), "손상 = 온보딩(fail-open)");
         // ★W-3-a: 마커가 맞아도 훅이 실제로 없으면 온보딩한다(마커 ≠ 실재).
-        assert!(needs_gui_onboard(Some("0.12.53"), "0.12.53", false), "마커 일치 + 훅 부재 = 온보딩(자가 치유)");
+        assert!(needs_gui_onboard(Some("0.12.53"), "0.12.53", no), "마커 일치 + 훅 부재 = 온보딩(자가 치유)");
+        // ★W-4-a: 판정 불가도 설치됨이 아니다(몇 번 돌릴지는 plan_gui_onboard — 상한 뒤에도 '설치됨'으로 바뀌지 않는다).
+        let undet = HookPresence::Undeterminable("x".into());
+        assert!(needs_gui_onboard(Some("0.12.53"), "0.12.53", &undet), "마커 일치 + 판정 불가 = 설치됨 아님");
     }
 
     /// ★W-3-a: 온보딩 결과(각성 훅)의 실재 확인은 `cys init-pack` 이 등록하는 대상·명령과 같아야 한다 — 정상 설치는
@@ -6691,33 +6986,33 @@ mod tests {
         let home = std::env::temp_dir().join(format!("cys-w3-hooks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let pack = home.join(".cys/pack");
-        assert!(!gui_hooks_installed_under(&home, &pack), "팩 훅 스크립트 부재 = 설치 안 됨");
+        assert!(!hooks_installed(&home, &pack), "팩 훅 스크립트 부재 = 설치 안 됨");
         std::fs::create_dir_all(pack.join("hooks")).unwrap();
         for h in cys::pack::AWAKENING_HOOKS.iter() {
             std::fs::write(pack.join("hooks").join(h.script), "#!/bin/sh\n").unwrap();
         }
         // 프로필이 없으면 init-pack 이 만드는 ~/.claude/settings.json 이 대상이다 — 아직 없다.
-        assert!(!gui_hooks_installed_under(&home, &pack), "등록 대상 settings.json 부재 = 설치 안 됨");
+        assert!(!hooks_installed(&home, &pack), "등록 대상 settings.json 부재 = 설치 안 됨");
         let main_settings = home.join(".claude/settings.json");
         std::fs::create_dir_all(main_settings.parent().unwrap()).unwrap();
         cys::pack::merge_desired_hooks(&main_settings, &pack, &cys::pack::AWAKENING_HOOKS).unwrap();
-        assert!(gui_hooks_installed_under(&home, &pack), "init-pack 과 같은 등록 = 설치됨");
+        assert!(hooks_installed(&home, &pack), "init-pack 과 같은 등록 = 설치됨");
         let cur = env!("CARGO_PKG_VERSION");
         assert!(
-            !needs_gui_onboard(Some(cur), cur, gui_hooks_installed_under(&home, &pack)),
+            !needs_gui_onboard(Some(cur), cur, &observe_gui_hooks_under(&home, &pack).presence()),
             "정상 설치 + 현재 버전 마커 = 온보딩 안 함(평시 부트 비용 회귀 금지)"
         );
         // 프로필이 하나 더 생기면 init-pack 은 거기에도 등록한다 — 거기 없으면 설치 미완.
         std::fs::create_dir_all(home.join(".claude-2")).unwrap();
-        assert!(!gui_hooks_installed_under(&home, &pack), "새 프로필에 훅 없음 = 설치 미완");
+        assert!(!hooks_installed(&home, &pack), "새 프로필에 훅 없음 = 설치 미완");
         cys::pack::merge_desired_hooks(&home.join(".claude-2/settings.json"), &pack, &cys::pack::AWAKENING_HOOKS)
             .unwrap();
-        assert!(gui_hooks_installed_under(&home, &pack));
+        assert!(hooks_installed(&home, &pack));
         // 완전 초기화가 쓰는 실제 훅 해제 함수가 걷어내면 '없음'.
         cys::factory_reset::strip_cys_from_settings(&main_settings, &home.join(".cys")).unwrap();
-        assert!(!gui_hooks_installed_under(&home, &pack), "초기화의 훅 해제 뒤 = 설치 안 됨");
+        assert!(!hooks_installed(&home, &pack), "초기화의 훅 해제 뒤 = 설치 안 됨");
         // 부서 팩은 init-pack 이 개인 프로필에 훅을 쓰지 않는다 — 판정 대상 아님.
-        assert!(gui_hooks_installed_under(&home, &home.join(".cys/pack-dept-x")));
+        assert!(hooks_installed(&home, &home.join(".cys/pack-dept-x")));
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -6733,7 +7028,7 @@ mod tests {
         let settings = home.join(".claude/settings.json");
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         cys::pack::merge_desired_hooks(&settings, &pack, &cys::pack::AWAKENING_HOOKS).unwrap();
-        assert!(gui_hooks_installed_under(&home, &pack), "검체 전제: 온보딩이 훅 등록까지 마쳤다");
+        assert!(hooks_installed(&home, &pack), "검체 전제: 온보딩이 훅 등록까지 마쳤다");
         let marker = home.join(".cys/.gui-onboarded");
         (home, pack, settings, marker)
     }
@@ -6744,11 +7039,11 @@ mod tests {
         let cur = env!("CARGO_PKG_VERSION");
         let value = std::fs::read_to_string(marker).unwrap();
         assert_eq!(value.trim(), cur, "B1({tag}) 끝 상태: 현재 버전 마커");
-        assert!(!gui_hooks_installed_under(home, pack), "B1({tag}) 끝 상태: 훅 없음");
+        assert!(!hooks_installed(home, pack), "B1({tag}) 끝 상태: 훅 없음");
         let marker_only_would_skip = value.trim() == cur;
         assert!(marker_only_would_skip, "B1({tag}) 반사실이 서지 않는다 — 검체가 위험 상태를 만들지 못했다");
         assert!(
-            needs_gui_onboard(Some(&value), cur, gui_hooks_installed_under(home, pack)),
+            needs_gui_onboard(Some(&value), cur, &observe_gui_hooks_under(home, pack).presence()),
             "B1({tag}) 끝 상태가 다음 기동에 치유되지 않는다"
         );
         println!(
@@ -6793,6 +7088,327 @@ mod tests {
         cys::factory_reset::strip_cys_from_settings(&settings, &home.join(".cys")).unwrap();
         assert!(marker.exists(), "계획 밖이라 격리되지 않은 마커");
         b1_assert_end_state_heals(&home, &pack, &marker, "b");
+    }
+
+    /// ★W-4 공용 — 관측 집계가 `Installed` 인가(W-3 테스트의 '설치됨' 단언을 3상태 위에서 그대로 읽는다).
+    fn hooks_installed(home: &std::path::Path, pack: &std::path::Path) -> bool {
+        observe_gui_hooks_under(home, pack).presence() == HookPresence::Installed
+    }
+
+    fn w4_kind(p: &HookPresence) -> &'static str {
+        match p {
+            HookPresence::Installed => "Installed",
+            HookPresence::Missing => "Missing",
+            HookPresence::Undeterminable(_) => "Undeterminable",
+        }
+    }
+
+    /// ★W-4 공용 픽스처 — 팩 훅 스크립트만 갖춘 빈 홈(프로필·마커 없음 = 신선 머신).
+    fn w4_home(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let home = std::env::temp_dir().join(format!("cys-w4-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let pack = home.join(".cys/pack");
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        for h in cys::pack::AWAKENING_HOOKS.iter() {
+            std::fs::write(pack.join("hooks").join(h.script), "#!/bin/sh\n").unwrap();
+        }
+        (home, pack)
+    }
+
+    /// init-pack 의 훅 단계와 같은 일(src/bin/cys.rs run_init_pack — 대상 = 개인 프로필 전부 · 없으면 ~/.claude/settings.json ·
+    /// 대상마다 부모 폴더를 만들고 merge_desired_hooks · 하나라도 실패하면 rc=1). 팩 반영(install_staged)은 픽스처가 갖췄다.
+    fn w4_init_pack_hooks(home: &std::path::Path, pack: &std::path::Path) -> Result<(), String> {
+        let mut dirs = cys::pack::personal_profile_dirs_under(home);
+        if dirs.is_empty() {
+            dirs.push(home.join(".claude"));
+        }
+        let mut errs = Vec::new();
+        for d in dirs {
+            let _ = std::fs::create_dir_all(&d);
+            if let Err(e) = cys::pack::merge_desired_hooks(&d.join("settings.json"), pack, &cys::pack::AWAKENING_HOOKS) {
+                errs.push(e);
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs.join(" | "))
+        }
+    }
+
+    /// GUI 기동 한 번을 setup 과 같은 순서로 돈다: 마커 읽기 → 관측 → 계획 → (실제 시도 직전) 시도 기록 → 온보딩(= init-pack 훅
+    /// 단계) → 성공이면 마커 → 재관측 → 안내. 반환 = (계획, 기동 시 관측 집계, 안내, 온보딩 결과(돌았을 때만)).
+    fn w4_boot(
+        home: &std::path::Path,
+        pack: &std::path::Path,
+    ) -> (GuiOnboardPlan, HookPresence, Vec<(&'static str, String)>, Option<Result<(), String>>) {
+        let cur = env!("CARGO_PKG_VERSION");
+        let marker_path = home.join(".cys/.gui-onboarded");
+        let attempts_path = home.join(".cys/.gui-onboard-attempts");
+        let marker = std::fs::read_to_string(&marker_path).ok();
+        let seen = observe_gui_hooks_under(home, pack);
+        let plan = gui_onboard_plan_under(&seen, marker.as_deref(), &attempts_path, cur);
+        record_gui_onboard_attempt(&attempts_path, cur, &seen, plan);
+        let needs = matches!(plan, GuiOnboardPlan::Run | GuiOnboardPlan::RunCounted(_));
+        let result = needs.then(|| w4_init_pack_hooks(home, pack));
+        if result == Some(Ok(())) {
+            std::fs::write(&marker_path, cur).unwrap();
+        }
+        let after = if needs { observe_gui_hooks_under(home, pack) } else { seen.clone() };
+        let notices = gui_onboard_notices(plan, &seen, &after, marker.is_some());
+        (plan, seen.presence(), notices, result)
+    }
+
+    /// ★W-4-b: 계획 진리표 + 시도 기록의 '같은 상태' 규칙(버전·사유가 같을 때만 이어 센다 · 손상·부재 = 0).
+    #[test]
+    fn w4_plan_and_attempt_record_rules() {
+        let undet = HookPresence::Undeterminable("a — b".into());
+        let max = GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS;
+        assert_eq!(plan_gui_onboard(false, &HookPresence::Installed, 0), GuiOnboardPlan::Skip);
+        assert_eq!(plan_gui_onboard(true, &HookPresence::Installed, 9), GuiOnboardPlan::Run, "업그레이드는 상한과 무관");
+        assert_eq!(plan_gui_onboard(true, &HookPresence::Missing, 9), GuiOnboardPlan::Run, "고칠 수 있는 부재는 상한과 무관");
+        assert_eq!(plan_gui_onboard(true, &undet, 0), GuiOnboardPlan::RunCounted(1));
+        assert_eq!(plan_gui_onboard(true, &undet, max - 1), GuiOnboardPlan::RunCounted(max));
+        assert_eq!(plan_gui_onboard(true, &undet, max), GuiOnboardPlan::Capped, "상한 = 멈춤");
+        assert_eq!(plan_gui_onboard(true, &undet, max + 7), GuiOnboardPlan::Capped);
+        let rec = r#"{"version":"1.0.0","reason":"a — b","attempts":2}"#;
+        assert_eq!(prior_gui_onboard_attempts(Some(rec), "1.0.0", "a — b"), 2);
+        assert_eq!(prior_gui_onboard_attempts(Some(rec), "1.0.1", "a — b"), 0, "버전이 바뀌면 초기화");
+        assert_eq!(prior_gui_onboard_attempts(Some(rec), "1.0.0", "a — c"), 0, "사유가 바뀌면 초기화");
+        assert_eq!(prior_gui_onboard_attempts(Some("{bad"), "1.0.0", "a — b"), 0, "손상 기록 = 0");
+        assert_eq!(prior_gui_onboard_attempts(None, "1.0.0", "a — b"), 0, "기록 없음 = 0");
+    }
+
+    /// ★W-4-a: 분류는 init-pack 의 병합기가 **실제로 하는 일**과 같다 — 표의 각 줄을 실제 `merge_desired_hooks` 로 확인한다:
+    /// `Missing` 이면 병합이 성공해 설치됨이 되고, `Undeterminable` 이면 병합이 거부한다(= 온보딩이 고칠 수 없는 상태).
+    #[cfg(unix)]
+    #[test]
+    fn w4_classification_matches_what_the_installer_does() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (home, pack) = w4_home("classify");
+        let reg = home.join("registered.json");
+        cys::pack::merge_desired_hooks(&reg, &pack, &cys::pack::AWAKENING_HOOKS).unwrap();
+        let write = |p: &std::path::Path, body: &str| std::fs::write(p, body).unwrap();
+        type Make<'a> = Box<dyn Fn(&std::path::Path) + 'a>;
+        let cases: Vec<(&str, Make<'_>, &str)> = vec![
+            ("파일 없음", Box::new(|_| {}), "Missing"),
+            ("빈 파일", Box::new(|p| write(p, "  \n")), "Missing"),
+            ("빈 객체", Box::new(|p| write(p, "{}")), "Missing"),
+            (
+                "다른 훅만",
+                Box::new(|p| write(p, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"x"}]}]}}"#)),
+                "Missing",
+            ),
+            ("등록됨", Box::new(|p| {
+                std::fs::copy(&reg, p).unwrap();
+            }), "Installed"),
+            ("손상 JSON", Box::new(|p| write(p, "{bad")), "Undeterminable"),
+            ("루트가 배열", Box::new(|p| write(p, "[]")), "Undeterminable"),
+            ("hooks 가 배열", Box::new(|p| write(p, r#"{"hooks":[]}"#)), "Undeterminable"),
+            ("hooks.SessionStart 가 객체", Box::new(|p| write(p, r#"{"hooks":{"SessionStart":{}}}"#)), "Undeterminable"),
+            ("읽기 불가", Box::new(|p| {
+                write(p, "{}");
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }), "Undeterminable"),
+            ("등재 없는 symlink", Box::new(|p| {
+                let d = p.with_extension("dest");
+                write(&d, "{}");
+                symlink(&d, p).unwrap();
+            }), "Undeterminable"),
+            ("대상 없는 symlink", Box::new(|p| symlink(p.with_extension("nowhere"), p).unwrap()), "Undeterminable"),
+            ("등재된 symlink", Box::new(|p| symlink(&reg, p).unwrap()), "Installed"),
+        ];
+        for (i, (name, make, want)) in cases.iter().enumerate() {
+            let dir = home.join(format!("case{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("settings.json");
+            make(&p);
+            if *name == "읽기 불가" && std::fs::read_to_string(&p).is_ok() {
+                println!("w4 분류 {name}: 권한 000 이 읽기를 막지 못한다(root 실행) — 건너뜀");
+                continue;
+            }
+            let got = classify_hook_settings(&p, &pack);
+            assert_eq!(w4_kind(&got), *want, "{name}: {got:?}");
+            let merged = cys::pack::merge_desired_hooks(&p, &pack, &cys::pack::AWAKENING_HOOKS);
+            match *want {
+                "Missing" => {
+                    assert!(merged.is_ok(), "{name}: Missing 은 병합기가 고친다 — {merged:?}");
+                    assert_eq!(classify_hook_settings(&p, &pack), HookPresence::Installed, "{name}: 병합 뒤 설치됨");
+                }
+                "Undeterminable" => assert!(merged.is_err(), "{name}: Undeterminable 은 병합기가 거부한다 — {merged:?}"),
+                _ => {}
+            }
+            println!(
+                "w4 분류 {name}: {got:?} · 병합기 {}",
+                match &merged {
+                    Ok(_) => "성공".to_string(),
+                    Err(e) => format!("거부({e})"),
+                }
+            );
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ★W-4-a 집계: 판정 불가 프로필 하나가 **다른 프로필의 복구를 막지 않는다** — 고칠 수 있는 부재가 있으면 그 기동은 세지
+    /// 않고 돌려서 고친다(Missing 우선). 고칠 것이 없어진 뒤부터 판정 불가 상한이 센다. 상한 뒤에 새 프로필이 생겨도 복구된다.
+    #[test]
+    fn w4_undeterminable_profile_does_not_block_repair_of_others() {
+        let (home, pack) = w4_home("mixed");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), "{bad").unwrap();
+        std::fs::create_dir_all(home.join(".claude-2")).unwrap();
+        let (p1, pr1, _, r1) = w4_boot(&home, &pack);
+        assert_eq!((p1, w4_kind(&pr1)), (GuiOnboardPlan::Run, "Missing"), "고칠 수 있는 부재가 있으면 세지 않고 돈다");
+        assert!(matches!(r1, Some(Err(_))), "손상 프로필은 여전히 거부 — {r1:?}");
+        assert_eq!(classify_hook_settings(&home.join(".claude-2/settings.json"), &pack), HookPresence::Installed, "다른 프로필은 이번 기동에 복구");
+        assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::RunCounted(1));
+        let (p3, _, n3, _) = w4_boot(&home, &pack);
+        assert_eq!(p3, GuiOnboardPlan::RunCounted(GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS));
+        assert!(n3.iter().any(|(k, _)| *k == "capped"), "상한 기동에 안내");
+        assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::Capped);
+        std::fs::create_dir_all(home.join(".claude-3")).unwrap();
+        assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::Run, "상한이어도 새로 생긴 부재는 고친다");
+        assert_eq!(classify_hook_settings(&home.join(".claude-3/settings.json"), &pack), HookPresence::Installed);
+        assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::Capped, "같은 사유는 다시 상한(시도 기록 유지)");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// ★게이트 12 — reviewer-codex R4-M1 검체(hooks-probe 동형): 온보딩을 마친 홈(마커 = 현재 버전 · 훅 등록)에서 개인 프로필
+    /// settings 를 ① 손상 JSON ② 읽기 불가 ③ 등재 없는 symlink 로 만든 뒤 5번 기동한다. 상한 없는 판정(22b59ff)이었다면 5번
+    /// 모두 온보딩한다(반사실 — 같은 관측으로 센다 · 리뷰어 hooks-probe.log 3/3 과 같은 기제). 이제: 실제 시도 = 상한 · 매 기동
+    /// 관측은 판정 불가(설치됨으로 뭉개지지 않음) · 상한 기동부터 매 기동 안내(문제 파일 경로 포함) · 파일을 고치면 기록이
+    /// 초기화돼 한 번 복구(등록이 살아 있으면 0회) 뒤 안정.
+    #[cfg(unix)]
+    #[test]
+    fn gate12_r4_m1_undeterminable_stops_within_cap_and_is_never_installed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let cur = env!("CARGO_PKG_VERSION");
+        let max = GUI_ONBOARD_MAX_UNDETERMINABLE_ATTEMPTS;
+        for scenario in ["corrupt", "unreadable", "symlink"] {
+            let (home, pack) = w4_home(&format!("g12-{scenario}"));
+            let (p0, _, n0, r0) = w4_boot(&home, &pack);
+            assert_eq!((p0, r0, n0.len()), (GuiOnboardPlan::Run, Some(Ok(())), 0), "{scenario}: 전제 — 신선 온보딩 성공·안내 없음");
+            assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::Skip, "{scenario}: 전제 — 평시 기동은 온보딩 안 함");
+            let settings = home.join(".claude/settings.json");
+            match scenario {
+                "corrupt" => std::fs::write(&settings, "{bad").unwrap(),
+                "unreadable" => std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap(),
+                _ => {
+                    let dest = home.join("dotfile.json");
+                    std::fs::write(&dest, "{}").unwrap();
+                    std::fs::remove_file(&settings).unwrap();
+                    symlink(&dest, &settings).unwrap();
+                }
+            }
+            if scenario == "unreadable" && std::fs::read_to_string(&settings).is_ok() {
+                println!("gate12 unreadable: 권한 000 이 읽기를 막지 못한다(root 실행) — 이 검체는 판정 불가를 만들 수 없어 건너뜀");
+                std::fs::remove_dir_all(&home).ok();
+                continue;
+            }
+            let (mut attempts, mut old_attempts) = (0u32, 0u32);
+            for boot in 1..=5u32 {
+                let marker = std::fs::read_to_string(home.join(".cys/.gui-onboarded")).ok();
+                let (plan, presence, notices, result) = w4_boot(&home, &pack);
+                assert_eq!(w4_kind(&presence), "Undeterminable", "{scenario} boot={boot}: 판정 불가여야 한다 — {presence:?}");
+                assert_eq!(marker.as_deref().map(str::trim), Some(cur), "{scenario}: 마커는 현재 버전 그대로(= R4-M1 전제)");
+                old_attempts += u32::from(needs_gui_onboard(marker.as_deref(), cur, &presence));
+                if let Some(r) = &result {
+                    attempts += 1;
+                    assert!(r.is_err(), "{scenario} boot={boot}: 병합기가 거부해야 한다(검체가 고칠 수 없는 상태) — {r:?}");
+                }
+                let capped = notices.iter().find(|(k, _)| *k == "capped").map(|(_, m)| m.clone());
+                assert_eq!(capped.is_some(), boot >= max, "{scenario} boot={boot}: 상한 안내는 상한 기동부터 매 기동");
+                if let Some(m) = &capped {
+                    assert!(m.contains(&settings.display().to_string()), "{scenario}: 안내에 문제 파일 경로 — {m}");
+                }
+                println!(
+                    "gate12 {scenario} boot={boot} 관측={} 계획={plan:?} 시도={} installer={} 안내={}",
+                    w4_kind(&presence),
+                    if result.is_some() { "예" } else { "아니오" },
+                    result.as_ref().map_or("-".to_string(), |r| format!("{r:?}")),
+                    capped.as_deref().unwrap_or("-")
+                );
+            }
+            assert_eq!(attempts, max, "{scenario}: 5기동 중 실제 시도 = 상한 {max}");
+            assert_eq!(old_attempts, 5, "{scenario}: 반사실 — 상한 없는 판정(22b59ff)은 5기동 모두 온보딩");
+            println!("gate12 {scenario}: 실제 시도 {attempts}/5 (상한 {max}) · 상한 없는 판정(22b59ff 기제) {old_attempts}/5");
+            match scenario {
+                "corrupt" => std::fs::write(&settings, "{}").unwrap(),
+                "unreadable" => std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap(),
+                _ => std::fs::remove_file(&settings).unwrap(),
+            }
+            let (pf, _, nf, rf) = w4_boot(&home, &pack);
+            let want = if scenario == "unreadable" { GuiOnboardPlan::Skip } else { GuiOnboardPlan::Run };
+            assert_eq!(pf, want, "{scenario}: 고친 뒤 첫 기동 — 기록 초기화(등록이 살아 있으면 0회)");
+            assert!(rf.is_none() || rf == Some(Ok(())), "{scenario}: 고친 뒤 복구 성공 — {rf:?}");
+            assert!(!home.join(".cys/.gui-onboard-attempts").exists(), "{scenario}: 판정 불가가 사라지면 시도 기록 삭제");
+            assert!(hooks_installed(&home, &pack), "{scenario}: 고친 뒤 설치됨");
+            for _ in 0..2 {
+                assert_eq!(w4_boot(&home, &pack).0, GuiOnboardPlan::Skip, "{scenario}: 복구 뒤 안정");
+            }
+            println!(
+                "gate12 {scenario} 고친 뒤: 계획={pf:?} installer={rf:?} 안내={:?} → 이후 2기동 Skip",
+                nf.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+            );
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// ★게이트 13 — 정상 경로 회귀 0(hooks-probe 동형): 온보딩을 마친 홈에서 ① settings 삭제 ② 초기화의 실제 훅 해제 함수로
+    /// 등재 제거(수동 삭제와 같은 끝 상태) → 다음 기동 1회 복구 + 복구 안내(W-4-d) 뒤 안정 ③ timeout 만 바뀐 등록 → 0회.
+    /// 정상 경로에는 시도 기록·상한 안내가 생기지 않는다.
+    #[test]
+    fn gate13_missing_and_manual_delete_recover_once_then_stable() {
+        for scenario in ["missing", "manual-delete", "timeout"] {
+            let (home, pack) = w4_home(&format!("g13-{scenario}"));
+            let (p0, _, n0, r0) = w4_boot(&home, &pack);
+            assert_eq!((p0, r0, n0.len()), (GuiOnboardPlan::Run, Some(Ok(())), 0), "{scenario}: 전제 — 신선 온보딩 성공·안내 없음");
+            let settings = home.join(".claude/settings.json");
+            match scenario {
+                "missing" => std::fs::remove_file(&settings).unwrap(),
+                "manual-delete" => {
+                    cys::factory_reset::strip_cys_from_settings(&settings, &home.join(".cys")).unwrap();
+                }
+                _ => {
+                    let mut v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+                    for (_, e) in v["hooks"].as_object_mut().unwrap() {
+                        for m in e.as_array_mut().unwrap() {
+                            for h in m["hooks"].as_array_mut().unwrap() {
+                                h["timeout"] = serde_json::json!(1);
+                            }
+                        }
+                    }
+                    std::fs::write(&settings, v.to_string()).unwrap();
+                }
+            }
+            let mut attempts = 0;
+            for boot in 1..=4u32 {
+                let (plan, presence, notices, result) = w4_boot(&home, &pack);
+                if let Some(r) = &result {
+                    attempts += 1;
+                    assert!(r.is_ok(), "{scenario} boot={boot}: 복구 성공 — {r:?}");
+                }
+                let restored = notices.iter().find(|(k, _)| *k == "restored").map(|(_, m)| m.clone());
+                assert_eq!(restored.is_some(), boot == 1 && scenario != "timeout", "{scenario} boot={boot}: 복구 안내는 복구한 기동에만");
+                if let Some(m) = &restored {
+                    assert!(m.contains(&settings.display().to_string()), "{scenario}: 복구 안내에 파일 경로 — {m}");
+                }
+                assert!(notices.iter().all(|(k, _)| *k != "capped"), "{scenario}: 정상 경로에 상한 안내 없음");
+                println!(
+                    "gate13 {scenario} boot={boot} 관측={} 계획={plan:?} installer={} 안내={}",
+                    w4_kind(&presence),
+                    result.as_ref().map_or("-".to_string(), |r| format!("{r:?}")),
+                    restored.as_deref().unwrap_or("-")
+                );
+            }
+            let want = if scenario == "timeout" { 0 } else { 1 };
+            assert_eq!(attempts, want, "{scenario}: 실제 시도 수");
+            assert!(!home.join(".cys/.gui-onboard-attempts").exists(), "{scenario}: 정상 경로에 시도 기록 없음");
+            println!("gate13 {scenario}: 실제 시도 {attempts}회 → 이후 안정(Skip)");
+            std::fs::remove_dir_all(&home).ok();
+        }
     }
 
     #[test]
