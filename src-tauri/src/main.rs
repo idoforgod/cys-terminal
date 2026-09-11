@@ -5254,11 +5254,17 @@ fn fresh_start_ack() -> Result<(), String> {
 
 #[tauri::command]
 async fn factory_reset_preview() -> Result<Value, String> {
-    let live_sessions = live_session_count().await.unwrap_or(0);
-    let dept_count = list_depts()
+    // ★W-1-b(2026-09-11): 조회 실패를 0 으로 접은 값만 넘기면 "없다"와 "못 셌다"가 구별되지 않는다.
+    // 재설치 첫 기동 경로는 '지금 끊길 것이 없다'가 **측정으로 확인될 때만** 문구 타이핑 확인을 생략하므로
+    // (ui/src/resetconfirm.ts `freshStartMaySkipTypedConfirm`) 측정 성공 여부를 따로 넘긴다. 표시값은 종전과 같다.
+    let live = live_session_count().await;
+    let live_sessions_known = live.is_ok();
+    let live_sessions = live.unwrap_or(0);
+    let depts = list_depts()
         .ok()
-        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()))
-        .unwrap_or(0);
+        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()));
+    let dept_count_known = depts.is_some();
+    let dept_count = depts.unwrap_or(0);
     tokio::task::spawn_blocking(move || {
         let roots =
             cys::factory_reset::ResetRoots::live().ok_or("홈 디렉토리를 해석할 수 없다")?;
@@ -5286,7 +5292,9 @@ async fn factory_reset_preview() -> Result<Value, String> {
             "strip_profiles": plan.strip_settings.len(),
             "report_only": plan.report_only,
             "live_sessions": live_sessions,
+            "live_sessions_known": live_sessions_known,
             "dept_count": dept_count,
+            "dept_count_known": dept_count_known,
             "trash_root_ready": plan.trash_root_ready.is_ok(),
             "trash_root_error": plan.trash_root_ready.as_ref().err(),
             "interrupted_prior": plan.interrupted_prior.iter()

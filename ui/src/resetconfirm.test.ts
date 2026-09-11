@@ -10,6 +10,8 @@ import {
   resetTopItems,
   resetResultTitle,
   resetResultBody,
+  freshStartMaySkipTypedConfirm,
+  freshStartLiveNotice,
   type ResetPreview,
 } from "./resetconfirm";
 
@@ -177,5 +179,43 @@ describe("resetResultTitle / resetResultBody", () => {
     });
     expect(body).toContain("cys factory-reset");
     expect(body).not.toContain("종료 후 다시 실행하면 정리됩니다");
+  });
+});
+
+// ★W-1-b(2026-09-11): 재설치 첫 기동 경로의 타이핑 확인 생략은 '끊길 것 없음'이 측정으로 확인될 때만.
+describe("freshStartMaySkipTypedConfirm", () => {
+  const quiet = { liveSessions: 0, liveSessionsKnown: true, deptCount: 0, deptCountKnown: true };
+  it("확인된 0세션·0부서일 때만 생략한다", () => {
+    expect(freshStartMaySkipTypedConfirm(quiet)).toBe(true);
+  });
+  it("실행 중 세션·부서가 하나라도 있으면 타이핑 확인을 거친다", () => {
+    expect(freshStartMaySkipTypedConfirm({ ...quiet, liveSessions: 1 })).toBe(false);
+    expect(freshStartMaySkipTypedConfirm({ ...quiet, deptCount: 2 })).toBe(false);
+  });
+  it("셀 수 없었으면(조회 실패를 0 으로 접은 값·필드 부재) 생략하지 않는다", () => {
+    expect(freshStartMaySkipTypedConfirm({ ...quiet, liveSessionsKnown: false })).toBe(false);
+    expect(freshStartMaySkipTypedConfirm({ ...quiet, deptCountKnown: false })).toBe(false);
+    expect(freshStartMaySkipTypedConfirm({ liveSessions: 0, deptCount: 0 })).toBe(false);
+    expect(freshStartMaySkipTypedConfirm({})).toBe(false);
+  });
+  it("생략이 거부되는 경우 이어지는 타이핑 모달의 첫 줄이 세션·부서 수를 고지한다", () => {
+    const first = resetNoticeLines(preview({ liveSessions: 3, deptCount: 2 }))[0];
+    expect(first).toContain("세션 3개");
+    expect(first).toContain("부서 2개");
+  });
+});
+
+describe("freshStartLiveNotice", () => {
+  it("실행 중 세션 수를 고르기 전에 알린다", () => {
+    const n = freshStartLiveNotice({ liveSessions: 3, liveSessionsKnown: true });
+    expect(n).toContain("3개");
+    expect(n).toContain("즉시 종료");
+  });
+  it("셀 수 없었으면 모른다고 말한다(0 으로 둔갑 금지)", () => {
+    expect(freshStartLiveNotice({ liveSessions: 0, liveSessionsKnown: false })).toContain("확인하지 못했습니다");
+    expect(freshStartLiveNotice({})).toContain("확인하지 못했습니다");
+  });
+  it("확인된 0세션이면 고지를 덧붙이지 않는다", () => {
+    expect(freshStartLiveNotice({ liveSessions: 0, liveSessionsKnown: true })).toBe("");
   });
 });

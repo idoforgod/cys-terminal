@@ -40,6 +40,8 @@ import {
   resetNoticeLines,
   resetResultTitle,
   resetResultBody,
+  freshStartMaySkipTypedConfirm,
+  freshStartLiveNotice,
   type ResetPreview,
   type ResetResult,
 } from "./resetconfirm";
@@ -6216,6 +6218,11 @@ function factoryResetConfirmModal(info: ResetPreview): Promise<boolean> {
 // 그 경로에서만 문구 타이핑 확인을 생략한다 — 생초보가 "지우고 다시 깔았으니 깨끗해야 한다"고
 // 이미 판단해 들어온 흐름이고, 격리는(삭제가 아니라) 되돌릴 수 있기 때문이다. 툴바 버튼 경로는
 // 종전대로 타이핑 확인을 그대로 요구한다(기본값 false — 회귀 0).
+// ★W-1-b(2026-09-11) 단, 생략은 **이 함수가 방금 받은 프리뷰**가 '끊길 것 없음'을 측정으로 확인할 때만
+// 허용한다(resetconfirm.ts freshStartMaySkipTypedConfirm). 실행 중 세션·부서가 있거나 셀 수 없었으면
+// preConfirmed 여도 툴바 경로와 같은 타이핑 확인 모달을 띄운다 — 그 모달 첫 줄이 세션·부서 수를 고지한다.
+// 종전에는 이 생략이 그 고지까지 지워, 재설치 오탐 시 살아 있는 에이전트가 무고지로 끊길 수 있었다.
+// 프리뷰를 여기서 다시 받으므로, 심문 모달이 열려 있던 동안 복원된 세션도 이 판정에 반영된다.
 async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
   if (daemonActionBlocked()) return;
   let info: {
@@ -6227,7 +6234,9 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
     strip_profiles?: number;
     report_only?: string[];
     live_sessions?: number;
+    live_sessions_known?: boolean;
     dept_count?: number;
+    dept_count_known?: boolean;
     trash_root_ready?: boolean;
     trash_root_error?: string | null;
     interrupted_prior?: string[];
@@ -6261,10 +6270,13 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
     items: info.quarantine ?? [],
     reportOnly: info.report_only ?? [],
     liveSessions: info.live_sessions ?? 0,
+    liveSessionsKnown: info.live_sessions_known === true,
     deptCount: info.dept_count ?? 0,
+    deptCountKnown: info.dept_count_known === true,
     interruptedPrior: info.interrupted_prior ?? [],
   };
-  const ok = opts?.preConfirmed === true || (await factoryResetConfirmModal(preview));
+  const skipTyped = opts?.preConfirmed === true && freshStartMaySkipTypedConfirm(preview);
+  const ok = skipTyped || (await factoryResetConfirmModal(preview));
   if (!ok) return;
   // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
   if (rotatingDaemon || purgingDept) {
@@ -6337,7 +6349,11 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
 // 떴다는 사실조차 못 읽은 사용자가 가장 먼저 하는 동작이 엔터다.
 // ★ESC·바깥 클릭은 **허용**한다(닫으면 미기록 → 다음 기동에 다시 묻는다). 종전 차단은 모달 트랩을
 // 만들고 `choice === null` 경로를 데드 코드로 만들었다(reviewer-gemini MAJOR).
-function freshStartModal(deptCount: number, totalBytes: number): Promise<"fresh" | "keep" | null> {
+function freshStartModal(
+  deptCount: number,
+  totalBytes: number,
+  liveNotice: string,
+): Promise<"fresh" | "keep" | null> {
   return new Promise((resolve) => {
     const gb = totalBytes > 0 ? `${(totalBytes / 1024 / 1024 / 1024).toFixed(1)}GB` : "";
     const ov = document.createElement("div");
@@ -6355,6 +6371,8 @@ function freshStartModal(deptCount: number, totalBytes: number): Promise<"fresh"
     (ov.querySelector(".modal-label") as HTMLElement).textContent =
       `앱을 새로 설치하셨지만, 예전에 쓰시던 내용이 컴퓨터에 그대로 남아 있습니다.\n` +
       (scale ? `\n남아 있는 것: ${scale}\n` : "") +
+      // ★W-1-b: 지금 끊기는 것(실행 중 세션)은 고르기 **전에** 보여 준다 — 종전 확인 모달이 하던 고지.
+      (liveNotice ? `\n${liveNotice}\n` : "") +
       `\n● 이어서 사용하기\n` +
       `   예전 부서와 대화 기록을 그대로 불러와 쓰던 대로 이어갑니다.\n` +
       `\n● 깨끗하게 새로 시작\n` +
@@ -6394,13 +6412,23 @@ async function freshStartFlow() {
   }
   if (!ask) return;
   // 규모 고지용 프리뷰(쓰기 0). 실패해도 모달은 띄운다 — 수치 없이라도 선택지를 줘야 한다.
-  let info: { dept_count?: number; total_bytes?: number } = {};
+  // (실패하면 세션 수를 '모름'으로 고지한다 — 0 으로 둔갑시키지 않는다.)
+  let info: {
+    dept_count?: number;
+    total_bytes?: number;
+    live_sessions?: number;
+    live_sessions_known?: boolean;
+  } = {};
   try {
     info = (await invoke("factory_reset_preview", {})) as typeof info;
   } catch {
     /* 수치 없이 진행 */
   }
-  const choice = await freshStartModal(info.dept_count ?? 0, Number(info.total_bytes ?? 0));
+  const liveNotice = freshStartLiveNotice({
+    liveSessions: info.live_sessions,
+    liveSessionsKnown: info.live_sessions_known === true,
+  });
+  const choice = await freshStartModal(info.dept_count ?? 0, Number(info.total_bytes ?? 0), liveNotice);
   if (choice === null) return;
   // ★기록은 초기화 **전에** — 초기화가 중간에 실패해도 같은 질문이 매 기동 반복되지 않게 한다
   // (실패 자체는 factoryResetFlow 가 sticky 토스트로 정면 고지한다).

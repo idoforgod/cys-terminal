@@ -76,7 +76,10 @@ export type ResetPreview = {
   items?: ResetPreviewItem[];
   reportOnly?: string[];
   liveSessions?: number;
+  // ★W-1-b: 세션·부서 수를 실제로 셌는가 — 백엔드가 조회 실패를 0 으로 접은 값과 구별한다(미상 = 모름).
+  liveSessionsKnown?: boolean;
   deptCount?: number;
+  deptCountKnown?: boolean;
   interruptedPrior?: string[];
 };
 
@@ -165,6 +168,34 @@ export function resetNoticeLines(info: ResetPreview): string[] {
   lines.push("완료 후 앱을 다시 실행하면 설치 온보딩이 처음부터 시작됩니다.");
   lines.push(`계속하려면 아래에 "${RESET_PHRASE}" 를 정확히 입력하세요.`);
   return lines;
+}
+
+// ★W-1-b(2026-09-11): 재설치 첫 기동 심문(main.ts freshStartFlow)은 문구 타이핑 확인을 생략할 수 있는
+// **유일한** 경로다. 생략은 "지금 끊길 것이 없다"가 **측정으로 확인됐을 때만** 허용한다 — 실행 중 세션·
+// 부서가 하나라도 있거나 셀 수 없었으면(조회 실패를 0 으로 접은 값 포함) 툴바 경로와 같은 타이핑 확인을
+// 거친다(그 모달의 첫 줄이 위 resetNoticeLines ① 의 세션·부서 수 고지다). 재설치 감지가 오탐하면(정상
+// 업그레이드를 재설치로 오인) 그 사용자는 대개 지금 쓰고 있는 사람이다 — 살아 있는 에이전트를 고지 없이
+// 끊지 않는 것이 이 판정의 목적이다.
+export function freshStartMaySkipTypedConfirm(
+  info: Pick<ResetPreview, "liveSessions" | "liveSessionsKnown" | "deptCount" | "deptCountKnown">,
+): boolean {
+  return (
+    info.liveSessionsKnown === true &&
+    info.liveSessions === 0 &&
+    info.deptCountKnown === true &&
+    info.deptCount === 0
+  );
+}
+
+// 재설치 심문 모달 본문의 '지금 끊기는 것' 고지 — 고르기 **전에** 보이게 한다. 확인된 0 세션이면 빈 문자열.
+export function freshStartLiveNotice(info: Pick<ResetPreview, "liveSessions" | "liveSessionsKnown">): string {
+  if (info.liveSessionsKnown !== true) {
+    return "⚠ 지금 실행 중인 세션이 있는지 확인하지 못했습니다 — 있다면 '깨끗하게 새로 시작'을 고르실 때 저장 신호 없이 즉시 종료됩니다.";
+  }
+  const live = info.liveSessions ?? 0;
+  return live > 0
+    ? `⚠ 지금 실행 중인 세션 ${live}개가 있습니다 — '깨끗하게 새로 시작'을 고르시면 저장 신호 없이 즉시 종료됩니다.`
+    : "";
 }
 
 export type ResetResult = {
