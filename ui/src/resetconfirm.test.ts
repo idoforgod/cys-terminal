@@ -10,8 +10,11 @@ import {
   resetTopItems,
   resetResultTitle,
   resetResultBody,
-  freshStartMaySkipTypedConfirm,
   freshStartLiveNotice,
+  resetGateVerdict,
+  RESET_GATE_FAIL_OPEN_MS,
+  BOOT_GATE_REFUSAL_LEAD,
+  isBootGateRefusal,
   type ResetPreview,
 } from "./resetconfirm";
 
@@ -182,34 +185,11 @@ describe("resetResultTitle / resetResultBody", () => {
   });
 });
 
-// ★W-1-b(2026-09-11): 재설치 첫 기동 경로의 타이핑 확인 생략은 '끊길 것 없음'이 측정으로 확인될 때만.
-describe("freshStartMaySkipTypedConfirm", () => {
-  const quiet = { liveSessions: 0, liveSessionsKnown: true, deptCount: 0, deptCountKnown: true };
-  it("확인된 0세션·0부서일 때만 생략한다", () => {
-    expect(freshStartMaySkipTypedConfirm(quiet)).toBe(true);
-  });
-  it("실행 중 세션·부서가 하나라도 있으면 타이핑 확인을 거친다", () => {
-    expect(freshStartMaySkipTypedConfirm({ ...quiet, liveSessions: 1 })).toBe(false);
-    expect(freshStartMaySkipTypedConfirm({ ...quiet, deptCount: 2 })).toBe(false);
-  });
-  it("셀 수 없었으면(조회 실패를 0 으로 접은 값·필드 부재) 생략하지 않는다", () => {
-    expect(freshStartMaySkipTypedConfirm({ ...quiet, liveSessionsKnown: false })).toBe(false);
-    expect(freshStartMaySkipTypedConfirm({ ...quiet, deptCountKnown: false })).toBe(false);
-    expect(freshStartMaySkipTypedConfirm({ liveSessions: 0, deptCount: 0 })).toBe(false);
-    expect(freshStartMaySkipTypedConfirm({})).toBe(false);
-  });
-  it("생략이 거부되는 경우 이어지는 타이핑 모달의 첫 줄이 세션·부서 수를 고지한다", () => {
-    const first = resetNoticeLines(preview({ liveSessions: 3, deptCount: 2 }))[0];
-    expect(first).toContain("세션 3개");
-    expect(first).toContain("부서 2개");
-  });
-});
-
 describe("freshStartLiveNotice", () => {
   it("실행 중 세션 수를 고르기 전에 알린다", () => {
     const n = freshStartLiveNotice({ liveSessions: 3, liveSessionsKnown: true });
     expect(n).toContain("3개");
-    expect(n).toContain("즉시 종료");
+    expect(n).toContain("종료");
   });
   it("셀 수 없었으면 모른다고 말한다(0 으로 둔갑 금지)", () => {
     expect(freshStartLiveNotice({ liveSessions: 0, liveSessionsKnown: false })).toContain("확인하지 못했습니다");
@@ -217,5 +197,53 @@ describe("freshStartLiveNotice", () => {
   });
   it("확인된 0세션이면 고지를 덧붙이지 않는다", () => {
     expect(freshStartLiveNotice({ liveSessions: 0, liveSessionsKnown: true })).toBe("");
+  });
+  // ★W-2 결정 A: 고르는 순간이 아니라 초기화를 **진행할 때** 종료된다(부팅 뒤 문구 확인을 거친다).
+  it("고르는 즉시 끊긴다고 말하지 않는다 — 초기화를 진행할 때 종료된다", () => {
+    for (const n of [freshStartLiveNotice({ liveSessions: 3, liveSessionsKnown: true }), freshStartLiveNotice({})]) {
+      expect(n).toContain("초기화를 진행");
+      expect(n).not.toContain("즉시 종료");
+    }
+  });
+});
+
+// ★W-2 결정 A(2026-09-11): 초기화 확인 창은 부팅(UI 복원 구간 + 백엔드 부팅 관문)과 겹치지 않을 때만 연다.
+describe("resetGateVerdict", () => {
+  const idle = { uiRestoringMs: null, bootGateClosed: false, busy: false, resetting: false, resetDone: false };
+  it("부팅과 겹치지 않을 때만 연다", () => {
+    expect(resetGateVerdict(idle)).toBe("go");
+  });
+  it("UI 시작 흐름이 복원 중이면 기다린다(빈 화면 경로 차단)", () => {
+    expect(resetGateVerdict({ ...idle, uiRestoringMs: 0 })).toBe("wait");
+    expect(resetGateVerdict({ ...idle, uiRestoringMs: RESET_GATE_FAIL_OPEN_MS - 1 })).toBe("wait");
+  });
+  it("백엔드 부팅 관문이 닫혀 있으면 기다린다(온보딩·업데이트 반영·조직 복원)", () => {
+    expect(resetGateVerdict({ ...idle, bootGateClosed: true })).toBe("wait");
+  });
+  // ★CEO 조건 (가): 관문은 반드시 언젠가 열린다 — 툴바 [완전 초기화] 영구 잠김 금지.
+  it("복원 구간이 멈춰 끝나지 않아도 상한이 지나면 막지 않는다(fail-open)", () => {
+    expect(resetGateVerdict({ ...idle, uiRestoringMs: RESET_GATE_FAIL_OPEN_MS })).toBe("go");
+    expect(resetGateVerdict({ ...idle, uiRestoringMs: RESET_GATE_FAIL_OPEN_MS * 5 })).toBe("go");
+  });
+  it("백엔드 관문 조회에 실패하면(모름) 막지 않는다 — 파괴 단계는 백엔드가 같은 관문으로 다시 거부한다", () => {
+    expect(resetGateVerdict({ ...idle, bootGateClosed: null })).toBe("go");
+  });
+  it("데몬 교대·부서 삭제 중이면 기다린다", () => {
+    expect(resetGateVerdict({ ...idle, busy: true })).toBe("wait");
+  });
+  it("초기화가 이미 진행 중이거나 끝났으면 미룬 요청을 버린다(부팅 중이어도)", () => {
+    expect(resetGateVerdict({ ...idle, resetting: true })).toBe("drop");
+    expect(resetGateVerdict({ ...idle, resetDone: true, uiRestoringMs: 0, bootGateClosed: true })).toBe("drop");
+  });
+});
+
+// ★CEO 조건 (나): 부팅 관문 거부는 '고장'이 아니라 '잠시 후 다시' 안내로 띄운다.
+describe("isBootGateRefusal", () => {
+  it("백엔드 부팅 관문 거부 문구를 알아본다", () => {
+    expect(isBootGateRefusal(`${BOOT_GATE_REFUSAL_LEAD} — 잠시 후 다시 시도해 주세요`)).toBe(true);
+  });
+  it("다른 실패는 실패로 둔다", () => {
+    expect(isBootGateRefusal("격리 폴더를 쓸 수 없어 초기화를 시작하지 않는다: EPERM")).toBe(false);
+    expect(isBootGateRefusal(new Error(BOOT_GATE_REFUSAL_LEAD))).toBe(false);
   });
 });

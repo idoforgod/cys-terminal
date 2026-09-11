@@ -76,10 +76,9 @@ export type ResetPreview = {
   items?: ResetPreviewItem[];
   reportOnly?: string[];
   liveSessions?: number;
-  // ★W-1-b: 세션·부서 수를 실제로 셌는가 — 백엔드가 조회 실패를 0 으로 접은 값과 구별한다(미상 = 모름).
+  // ★W-1-b: 세션 수를 실제로 셌는가 — 백엔드가 조회 실패를 0 으로 접은 값과 구별한다(미상 = 모름).
   liveSessionsKnown?: boolean;
   deptCount?: number;
-  deptCountKnown?: boolean;
   interruptedPrior?: string[];
 };
 
@@ -170,32 +169,53 @@ export function resetNoticeLines(info: ResetPreview): string[] {
   return lines;
 }
 
-// ★W-1-b(2026-09-11): 재설치 첫 기동 심문(main.ts freshStartFlow)은 문구 타이핑 확인을 생략할 수 있는
-// **유일한** 경로다. 생략은 "지금 끊길 것이 없다"가 **측정으로 확인됐을 때만** 허용한다 — 실행 중 세션·
-// 부서가 하나라도 있거나 셀 수 없었으면(조회 실패를 0 으로 접은 값 포함) 툴바 경로와 같은 타이핑 확인을
-// 거친다(그 모달의 첫 줄이 위 resetNoticeLines ① 의 세션·부서 수 고지다). 재설치 감지가 오탐하면(정상
-// 업그레이드를 재설치로 오인) 그 사용자는 대개 지금 쓰고 있는 사람이다 — 살아 있는 에이전트를 고지 없이
-// 끊지 않는 것이 이 판정의 목적이다.
-export function freshStartMaySkipTypedConfirm(
-  info: Pick<ResetPreview, "liveSessions" | "liveSessionsKnown" | "deptCount" | "deptCountKnown">,
-): boolean {
-  return (
-    info.liveSessionsKnown === true &&
-    info.liveSessions === 0 &&
-    info.deptCountKnown === true &&
-    info.deptCount === 0
-  );
-}
-
-// 재설치 심문 모달 본문의 '지금 끊기는 것' 고지 — 고르기 **전에** 보이게 한다. 확인된 0 세션이면 빈 문자열.
+// 재설치 심문 모달 본문의 '지금 실행 중인 것' 고지 — 고르기 **전에** 보이게 한다. 확인된 0 세션이면 빈 문자열.
+// ★W-2 결정 A: [깨끗하게 새로 시작]을 골라도 즉시 끊기지 않는다 — 부팅이 끝난 뒤 문구 확인 창을 통과해야
+// 초기화가 진행되고, 그때 세션이 종료된다. 고지문도 그 순서를 말한다.
 export function freshStartLiveNotice(info: Pick<ResetPreview, "liveSessions" | "liveSessionsKnown">): string {
   if (info.liveSessionsKnown !== true) {
-    return "⚠ 지금 실행 중인 세션이 있는지 확인하지 못했습니다 — 있다면 '깨끗하게 새로 시작'을 고르실 때 저장 신호 없이 즉시 종료됩니다.";
+    return "⚠ 지금 실행 중인 세션이 있는지 확인하지 못했습니다 — 있다면 '깨끗하게 새로 시작'으로 초기화를 진행할 때 저장 신호 없이 종료됩니다.";
   }
   const live = info.liveSessions ?? 0;
   return live > 0
-    ? `⚠ 지금 실행 중인 세션 ${live}개가 있습니다 — '깨끗하게 새로 시작'을 고르시면 저장 신호 없이 즉시 종료됩니다.`
+    ? `⚠ 지금 실행 중인 세션 ${live}개가 있습니다 — '깨끗하게 새로 시작'으로 초기화를 진행하면 저장 신호 없이 종료됩니다.`
     : "";
+}
+
+// ★W-2 결정 A(2026-09-11 · reviewer-codex R-1 BLOCKER 2·MAJOR 3): 완전 초기화는 **부팅과 겹치지 않을 때만**
+// 연다. 부팅 = UI 시작 흐름의 복원 구간(main.ts start() — 재설치 심문·레이아웃 복원·newSurface) + 백엔드 부팅
+// 작업(데몬 기동·GUI 온보딩·업데이트 팩 반영·조직 복원 — src-tauri BOOT_WORK_IN_FLIGHT). 하나라도 남아 있으면
+// 기다린다. 초기화가 이미 진행 중이거나 끝났으면 미뤄 둔 요청은 버린다. 툴바 경로와 부팅 뒤로 미룬
+// [새로 시작] 경로가 이 규칙 하나를 쓴다.
+// ★CEO 조건 (가)(2026-09-11) — 이 관문은 **반드시 언젠가 열린다(fail-open)**. 닫힌 채 굳으면 툴바
+// [완전 초기화]가 영구 잠김이 되고, 그건 막으려던 경쟁보다 나쁘다(완전 초기화는 망가진 부팅의 복구 수단이다).
+//   · UI 복원 구간: start() 가 끝나면 닫히고(finally), 멈춰서 끝나지 않아도 RESET_GATE_FAIL_OPEN_MS 뒤엔 막지 않는다.
+//   · 백엔드 관문: 백엔드가 같은 상한(src-tauri BOOT_GATE_FAIL_OPEN)까지 반영해 판정한 boot_gate_closed 를 그대로 쓴다.
+//   · 백엔드 관문을 모르면(조회 실패 = null) 막지 않는다 — 여기서 막으면 조회가 계속 실패하는 기계에서 영구
+//     잠김이 된다. 파괴 단계(factory_reset_execute)는 백엔드가 같은 관문으로 한 번 더 거부하므로 안전은 백엔드가 진다.
+export const RESET_GATE_FAIL_OPEN_MS = 10 * 60_000;
+
+export type ResetGateInput = {
+  uiRestoringMs: number | null; // start() 복원 구간이 열린 뒤 지난 ms · null = 복원 구간 밖
+  bootGateClosed: boolean | null; // 백엔드 부팅 관문(reset_gate_status) · null = 조회 실패(모름)
+  busy: boolean; // 데몬 교대·부서 삭제 진행 중
+  resetting: boolean;
+  resetDone: boolean;
+};
+
+export function resetGateVerdict(g: ResetGateInput): "go" | "wait" | "drop" {
+  if (g.resetting || g.resetDone) return "drop";
+  if (g.busy) return "wait";
+  if (g.uiRestoringMs !== null && g.uiRestoringMs < RESET_GATE_FAIL_OPEN_MS) return "wait";
+  if (g.bootGateClosed === true) return "wait";
+  return "go";
+}
+
+// ★CEO 조건 (나): 부팅 관문 거부는 '고장'이 아니라 '잠시 후 다시'다. 백엔드 거부 문구의 머리(src-tauri
+// BOOT_GATE_REFUSAL_LEAD — 같은 값인지 src-tauri 배선 핀이 잰다)로 알아보고, 실패 토스트 대신 안내 토스트를 띄운다.
+export const BOOT_GATE_REFUSAL_LEAD = "앱 시작을 마무리하는 중입니다";
+export function isBootGateRefusal(err: unknown): boolean {
+  return String(err).startsWith(BOOT_GATE_REFUSAL_LEAD);
 }
 
 export type ResetResult = {

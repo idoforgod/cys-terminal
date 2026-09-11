@@ -40,8 +40,10 @@ import {
   resetNoticeLines,
   resetResultTitle,
   resetResultBody,
-  freshStartMaySkipTypedConfirm,
   freshStartLiveNotice,
+  resetGateVerdict,
+  isBootGateRefusal,
+  type ResetGateInput,
   type ResetPreview,
   type ResetResult,
 } from "./resetconfirm";
@@ -5124,6 +5126,13 @@ let factoryResetting = false;
 // 다음 실행 온보딩이 살아있는 데몬 위로 겹쳐 돈다(설계 §4 계약 침식). 종료 전까지 데몬을
 // 생성·부활시키는 모든 경로를 영구 차단한다(플래그는 성공 경로에서 절대 해제되지 않는다).
 let resetCompleted = false;
+// ★W-2 결정 A: start() 의 복원 구간(재설치 심문·레이아웃 복원·newSurface)이 열린 시각 · null = 구간 밖. 이
+// 구간과 겹친 완전 초기화는 죽은 데몬에 newSurface 를 보내 빈 화면을 남긴다(reviewer-codex R-1 MAJOR 3). 데몬을
+// 기다리는 구간은 이 값이 아니라 백엔드 부팅 관문이 지킨다(setup 태스크 전체에 가드가 걸려 있다).
+// 켜기=start() 의 데몬 대기 직후 · 끄기=start() 가 어떤 식으로든 끝날 때(맨 아래 start().finally).
+// ★CEO 조건 (가): 불리언이 아니라 시각으로 두는 이유 — start() 가 멈춰 finally 에 닿지 못해도
+// resetGateVerdict 가 RESET_GATE_FAIL_OPEN_MS 뒤에는 막지 않는다(툴바 [완전 초기화] 영구 잠김 금지).
+let startRestoringSince: number | null = null;
 
 // 데몬 생성·부활 액션이 막힌 사유 — 세 진행 플래그·완료 래치를 하나의 안내 문구로.
 function daemonActionBlockedMsg(): string {
@@ -6214,17 +6223,23 @@ function factoryResetConfirmModal(info: ResetPreview): Promise<boolean> {
 // ★완전 초기화 실행 — 프리뷰(쓰기 0) → 문구 확인 → factory_reset_execute(코어=cys::factory_reset:
 // 데몬 전멸 하드 게이트 → cys-trash 격리+manifest → 훅·스킬링크 해제) → 종료 안내.
 // 완료 후 데몬이 없으므로 앱은 반쪽 상태 — 곧장 종료를 권한다(재실행 시 설치 온보딩).
-// preConfirmed: 재설치 첫 기동 심문(freshStartFlow)이 규모를 고지하고 이미 동의를 받은 경로.
-// 그 경로에서만 문구 타이핑 확인을 생략한다 — 생초보가 "지우고 다시 깔았으니 깨끗해야 한다"고
-// 이미 판단해 들어온 흐름이고, 격리는(삭제가 아니라) 되돌릴 수 있기 때문이다. 툴바 버튼 경로는
-// 종전대로 타이핑 확인을 그대로 요구한다(기본값 false — 회귀 0).
-// ★W-1-b(2026-09-11) 단, 생략은 **이 함수가 방금 받은 프리뷰**가 '끊길 것 없음'을 측정으로 확인할 때만
-// 허용한다(resetconfirm.ts freshStartMaySkipTypedConfirm). 실행 중 세션·부서가 있거나 셀 수 없었으면
-// preConfirmed 여도 툴바 경로와 같은 타이핑 확인 모달을 띄운다 — 그 모달 첫 줄이 세션·부서 수를 고지한다.
-// 종전에는 이 생략이 그 고지까지 지워, 재설치 오탐 시 살아 있는 에이전트가 무고지로 끊길 수 있었다.
-// 프리뷰를 여기서 다시 받으므로, 심문 모달이 열려 있던 동안 복원된 세션도 이 판정에 반영된다.
-async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
+// ★W-2 결정 A(2026-09-11): 이 함수가 완전 초기화의 **유일한** 실행 경로다 — 문구 타이핑 확인(첫 줄에 세션·
+// 부서 수 고지)을 건너뛰는 옵션은 없다(재설치 심문이 쓰던 '사전 동의로 확인 생략' 옵션 폐기). 그리고 부팅과 겹치면 열지 않는다
+// (resetGateVerdict): start() 의 복원 구간이나 백엔드 부팅 작업(데몬 기동·온보딩·업데이트 반영·조직 복원)이
+// 남아 있으면 안내만 하고 돌아간다. 백엔드 factory_reset_execute 도 같은 부팅 관문으로 한 번 더 거부한다.
+// 관문은 fail-open(부팅 작업이 멈춰도 10분 뒤 개방)이라 이 버튼이 영구히 잠기지 않는다(CEO 조건 가).
+async function factoryResetFlow() {
   if (daemonActionBlocked()) return;
+  const gate = resetGateVerdict(await resetGateInput());
+  if (gate !== "go") {
+    // ★CEO 조건 (나): '고장'이 아니라 '잠시 후 다시'로 읽혀야 한다.
+    toast(
+      "feed",
+      "⏳ 앱 시작을 마무리하는 중입니다",
+      "레이아웃·조직 복원 같은 시작 작업이 끝나면 완전 초기화를 쓸 수 있습니다 — 잠시 후 다시 눌러 주세요.",
+    );
+    return;
+  }
   let info: {
     quarantine_count?: number;
     total_bytes?: number;
@@ -6234,9 +6249,7 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
     strip_profiles?: number;
     report_only?: string[];
     live_sessions?: number;
-    live_sessions_known?: boolean;
     dept_count?: number;
-    dept_count_known?: boolean;
     trash_root_ready?: boolean;
     trash_root_error?: string | null;
     interrupted_prior?: string[];
@@ -6270,13 +6283,10 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
     items: info.quarantine ?? [],
     reportOnly: info.report_only ?? [],
     liveSessions: info.live_sessions ?? 0,
-    liveSessionsKnown: info.live_sessions_known === true,
     deptCount: info.dept_count ?? 0,
-    deptCountKnown: info.dept_count_known === true,
     interruptedPrior: info.interrupted_prior ?? [],
   };
-  const skipTyped = opts?.preConfirmed === true && freshStartMaySkipTypedConfirm(preview);
-  const ok = skipTyped || (await factoryResetConfirmModal(preview));
+  const ok = await factoryResetConfirmModal(preview);
   if (!ok) return;
   // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
   if (rotatingDaemon || purgingDept) {
@@ -6294,6 +6304,12 @@ async function factoryResetFlow(opts?: { preConfirmed?: boolean }) {
       rep = (await invoke("factory_reset_execute", { purgeLicense: false, purgeLocal: false })) as typeof rep;
     } catch (e) {
       dismissToast("factory-reset");
+      // ★CEO 조건 (나): 부팅 관문 거부(확인 창과 실행 사이에 시작 작업이 끼어든 드문 경우)는 실패가 아니다 —
+      // 아무것도 바꾸지 않았으므로 '잠시 후 다시' 안내로 띄운다.
+      if (isBootGateRefusal(e)) {
+        toast("feed", "⏳ 앱 시작을 마무리하는 중입니다", String(e));
+        return;
+      }
       stickyToast(failId, "watchdog", "완전 초기화 실패", `${e} — 아무것도(또는 일부만) 변경되지 않았을 수 있습니다. 재시도하거나 cys factory-reset --plan 으로 상태를 확인하세요.`);
       return;
     }
@@ -6380,6 +6396,8 @@ function freshStartModal(
       `   · 지우는 것이 아니라 옮기는 것이라, 끝난 뒤 보관 폴더 위치를 알려 드립니다.\n` +
       `   · 앱을 계속 쓰시면 약 2주 뒤 자동으로 정리됩니다.\n` +
       `   · 라이선스와 직접 넣으신 파일은 그대로 둡니다.\n` +
+      // ★W-2 결정 A: 고르는 순간 실행되지 않는다 — 부팅이 끝난 뒤 기존 초기화 확인 창을 거친다.
+      `   · 앱 시작이 모두 끝난 뒤 초기화 확인 창이 열리고, 거기서 안내 문구를 입력하셔야 실제로 진행됩니다.\n` +
       `\n지금 고르기 어려우시면 이 창을 닫으셔도 됩니다 — 다음에 다시 여쭙습니다.`;
     const done = (v: "fresh" | "keep" | null) => {
       ov.remove();
@@ -6403,14 +6421,16 @@ function freshStartModal(
   });
 }
 
-async function freshStartFlow() {
+// ★W-2 결정 A: 이 흐름은 **묻고 기록만** 한다 — 초기화를 실행하지 않는다. [깨끗하게 새로 시작]을 고르면
+// 선택만 돌려주고, start() 가 deferredFreshReset 으로 부팅이 끝난 뒤 기존 툴바 초기화 경로에 넘긴다.
+async function freshStartFlow(): Promise<"fresh" | "keep" | null> {
   let ask = false;
   try {
     ask = ((await invoke("fresh_start_check")) as { ask?: boolean }).ask === true;
   } catch {
-    return; // 판정 실패는 무음 — 시작을 막지 않는다(fail-closed: 묻지 않음)
+    return null; // 판정 실패는 무음 — 시작을 막지 않는다(fail-closed: 묻지 않음)
   }
-  if (!ask) return;
+  if (!ask) return null;
   // 규모 고지용 프리뷰(쓰기 0). 실패해도 모달은 띄운다 — 수치 없이라도 선택지를 줘야 한다.
   // (실패하면 세션 수를 '모름'으로 고지한다 — 0 으로 둔갑시키지 않는다.)
   let info: {
@@ -6429,11 +6449,90 @@ async function freshStartFlow() {
     liveSessionsKnown: info.live_sessions_known === true,
   });
   const choice = await freshStartModal(info.dept_count ?? 0, Number(info.total_bytes ?? 0), liveNotice);
-  if (choice === null) return;
-  // ★기록은 초기화 **전에** — 초기화가 중간에 실패해도 같은 질문이 매 기동 반복되지 않게 한다
-  // (실패 자체는 factoryResetFlow 가 sticky 토스트로 정면 고지한다).
-  await invoke("fresh_start_ack").catch(() => {});
-  if (choice === "fresh") await factoryResetFlow({ preConfirmed: true });
+  if (choice === null) return null;
+  // 기록은 고른 **즉시** — 초기화 확인 창에서 취소하거나 초기화가 실패해도 같은 질문이 매 기동 반복되지
+  // 않게 한다(툴바의 [완전 초기화]는 언제든 쓸 수 있다). ★W-2 결정 C: 기록 실패를 삼키지 않는다 —
+  // 기록하지 못했으면 다음 기동에 같은 질문이 다시 나올 수 있음을 보이게 알린다.
+  try {
+    await invoke("fresh_start_ack");
+  } catch (e) {
+    stickyToast(
+      "fresh-ack-fail",
+      "watchdog",
+      "선택을 기록하지 못했습니다",
+      `${e} — 다음 실행 때 같은 질문이 다시 나올 수 있습니다.`,
+    );
+  }
+  return choice;
+}
+
+// 백엔드 부팅 관문(src-tauri reset_gate_status — fail-open 상한까지 반영한 판정) · 조회 실패·형식 이상은 null(모름).
+async function bootGateClosed(): Promise<boolean | null> {
+  try {
+    const v = ((await invoke("reset_gate_status")) as { boot_gate_closed?: unknown }).boot_gate_closed;
+    return typeof v === "boolean" ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+// 툴바 경로와 부팅 뒤로 미룬 [새로 시작] 경로가 같은 관문 입력을 쓴다(resetconfirm.ts resetGateVerdict).
+async function resetGateInput(): Promise<ResetGateInput> {
+  const bootGate = await bootGateClosed();
+  return {
+    uiRestoringMs: startRestoringSince === null ? null : Date.now() - startRestoringSince,
+    bootGateClosed: bootGate,
+    busy: rotatingDaemon || purgingDept,
+    resetting: factoryResetting,
+    resetDone: resetCompleted,
+  };
+}
+
+// ★W-2 결정 A(2026-09-11): [깨끗하게 새로 시작]은 부팅이 끝난 뒤 기존 툴바 초기화 경로(factoryResetFlow —
+// 프리뷰·세션 수 고지·문구 타이핑 확인 그대로)로 넘긴다. 부팅 중에는 초기화를 실행하지 않는다 — 온보딩
+// (init-pack→.gui-onboarded)·업데이트 팩 반영·조직 복원·레이아웃 복원과 겹치면 훅 없는 영구 반쪽 상태·
+// 되살아난 부서·빈 화면이 남는다(reviewer-codex R-1 BLOCKER 2·MAJOR 3). 판정은 resetGateVerdict 한 규칙.
+// 기다림 상한 15분 = 부팅 관문 fail-open 상한(10분 · CEO 조건 가)보다 길게 — 부팅 쪽 관문은 대개 이 안에 열리므로
+// 상한에 닿는 것은 데몬 교대·부서 삭제 같은 작업이 오래 이어진 경우다(그때는 툴바로 안내하고 끝낸다 — 무한
+// 대기·무음 소실 금지).
+const FRESH_RESET_WAIT_MS = 15 * 60_000;
+async function deferredFreshReset() {
+  stickyToast(
+    "fresh-wait",
+    "feed",
+    "⟲ 새로 시작 준비 중",
+    "앱 시작 작업(레이아웃 복원·조직 복원 등)이 끝나면 초기화 확인 창이 열립니다 — 확인 창에서 안내 문구를 입력해야 실제로 진행됩니다.",
+  );
+  const deadline = Date.now() + FRESH_RESET_WAIT_MS;
+  while (Date.now() < deadline) {
+    const v = resetGateVerdict(await resetGateInput());
+    if (v === "drop") {
+      dismissToast("fresh-wait");
+      return;
+    }
+    if (v === "go") {
+      dismissToast("fresh-wait");
+      await factoryResetFlow();
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  dismissToast("fresh-wait");
+  // ★CEO 조건 (나): 고장이 아니다 — 다른 작업이 끝나기를 기다리다 멈췄을 뿐이고 아무것도 바꾸지 않았다.
+  stickyToast(
+    "fresh-timeout",
+    "feed",
+    "⏳ 새로 시작 확인 창을 아직 열지 않았습니다",
+    "시작 작업이나 데몬 교대·부서 삭제가 오래 이어져 기다림을 멈췄습니다(아무것도 바뀌지 않았습니다) — 끝난 뒤 툴바의 [완전 초기화]를 눌러 주세요.",
+  );
+}
+
+// ★W-2-d(reviewer-codex R-1 MAJOR 3): 완전 초기화가 진행 중이거나 끝났으면 start() 의 나머지(레이아웃 복원·
+// newSurface)를 하지 않는다 — 초기화로 죽은 데몬에 newSurface 를 보내 빈 화면이 되는 경로 차단. true=멈춤.
+function startHaltedByReset(info: HTMLElement): boolean {
+  if (!(factoryResetting || resetCompleted)) return false;
+  info.textContent = daemonActionBlockedMsg();
+  return true;
 }
 
 // ---------- toasts (daemon push events) ----------
@@ -6815,12 +6914,22 @@ async function start() {
     }, 300);
   });
 
+  // ★W-2-d: 데몬을 기다리는 동안 완전 초기화가 끝났으면(데몬이 뜨지 않는 기계의 복구 초기화) 복원하지 않는다.
+  if (startHaltedByReset(info)) return;
+  // ★W-2 결정 A: 여기부터 start() 가 끝날 때까지는 초기화와 겹치지 않는다(resetGateVerdict uiRestoringMs ·
+  // start() 가 멈추면 RESET_GATE_FAIL_OPEN_MS 뒤 fail-open).
+  startRestoringSince = Date.now();
   const status = (await invoke("daemon_status")) as Record<string, unknown>;
   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
 
-  // ★재설치 첫 기동 심문 — 데몬 가동 확정 직후, 워크스페이스 복원 **전**에 묻는다(초기화를 고르면
-  // 복원할 것이 없어지므로 순서가 뒤바뀌면 지운 부서가 화면에 한 번 떴다 사라진다).
-  await freshStartFlow();
+  // ★재설치 첫 기동 심문 — 데몬 가동 확정 직후, 워크스페이스 복원 **전**에 묻는다.
+  // ★W-2 결정 A: 여기서는 **묻고 기록만** 한다. [깨끗하게 새로 시작]은 부팅(이 복원 구간 + 백엔드의 온보딩·
+  // 업데이트 반영·조직 복원)이 끝난 뒤 기존 툴바 초기화 경로로 넘긴다 — 부팅과 겹친 초기화는 훅 없는 영구
+  // 반쪽 상태·빈 화면을 남긴다. 기다림은 지금 시작하고(start() 가 도중에 실패해도 10분 상한으로 정직하게
+  // 끝난다), 실제 확인 창은 관문이 열린 뒤에만 뜬다.
+  const freshChoice = await freshStartFlow();
+  if (startHaltedByReset(info)) return;
+  if (freshChoice === "fresh") void deferredFreshReset();
 
   // 버전 스큐 세대교체(메인 + 부서 데몬) — 시작 1회 + 5분 주기 재검(B). 무중단 rename-swap의 짝으로
   // 구 데몬(lame-duck) 스큐를 비차단 배지로 알리고, 잃을 세션 0인 노드는 무손실 자동 교대한다.
@@ -7039,6 +7148,8 @@ async function start() {
     }
   })();
 
+  // ★W-2-d: 위 리스너 등록·업데이트 확인을 기다리는 사이 초기화가 끝났으면 레이아웃 복원을 하지 않는다.
+  if (startHaltedByReset(info)) return;
   // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
   // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
   try {
@@ -7201,6 +7312,8 @@ async function start() {
       }
     }
   }
+  // ★W-2-d: newSurface 직전 — 초기화가 끝난 앱의 죽은 데몬에 surface 를 만들지 않는다.
+  if (startHaltedByReset(info)) return;
   // master 자동기동 제거 후: 데몬은 살아있으나(ok===true) 입양할 surface가 0개인 부서 ws(비활성 부서가
   // 재-launch된 경우)는 위 병합 루프가 못 채운다 — plain 셸 1개로 충전해 빈 탭 소실/고아 placeholder 방지.
   for (const ws of workspaces) {
@@ -7603,6 +7716,10 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-start().catch((e) => {
-  document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;
-});
+start()
+  .catch((e) => {
+    document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;
+  })
+  .finally(() => {
+    startRestoringSince = null; // ★W-2 결정 A: 복원 구간은 start() 가 끝나면(정상·예외·중단) 반드시 닫힌다
+  });

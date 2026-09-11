@@ -3303,32 +3303,6 @@ fn install_stamp_for(
     }
 }
 
-/// 사용자가 앱을 휴지통에 넣었다는 증거 — **단, 마지막 기록 이후에 넣은 것만**.
-///
-/// ★리뷰 지적(reviewer-codex·reviewer-gemini 독립 중복): 맥 사용자는 휴지통을 몇 달씩 비우지 않는다.
-/// 존재 여부만 보면 오래된 cys 앱 한 개 때문에 **정상 업그레이드가 영구히 Ask 로 오탐**된다.
-/// 그래서 `.install-identity` 기록 시각보다 **나중에** 버려진 것만 센다 — 그때 이후의 삭제여야
-/// 이번 재설치의 증거다.
-fn app_trashed_since(identity_recorded_at: Option<std::time::SystemTime>) -> bool {
-    let Some(since) = identity_recorded_at else {
-        return false; // 기준 시각이 없으면 비교할 수 없다 → 증거로 쓰지 않는다
-    };
-    let Ok(rd) = std::fs::read_dir(cys::home_dir().join(".Trash")) else {
-        return false;
-    };
-    rd.filter_map(Result::ok).any(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy().to_ascii_lowercase();
-        if !(name.starts_with("cys") && name.ends_with(".app")) {
-            return false;
-        }
-        e.metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t > since)
-            .unwrap_or(false)
-    })
-}
-
 /// `"<신원>|<버전>"` → (신원, 버전). 버전 구분자가 없으면 구형식(신원만).
 fn split_install_stamp(s: &str) -> (&str, Option<&str>) {
     match s.trim().rsplit_once('|') {
@@ -3350,17 +3324,23 @@ enum FreshStartPrompt {
 /// "이전 데이터를 어떻게 할지 물어볼 것인가" — 부작용 없는 순수 판정(단위테스트 대상).
 ///
 /// 설계 원칙: **오탐(업데이트를 재설치로 오인)은 데이터 격리를 부르므로 치명적이고, 미탐(재설치를
-/// 못 알아봄)은 종전 동작(그대로 복원)일 뿐이다.** 그래서 모든 모호한 경우는 Skip 으로 닫는다.
+/// 못 알아봄)은 종전 동작(그대로 복원)일 뿐이다.** 그래서 모든 모호한 경우는 묻지 않는 쪽으로 닫는다.
 ///
 ///  · 이전 데이터 없음 / 스탬프 판정 불능        → Skip  (최초 설치·개발 빌드)
 ///  · 기록 없음                                  → Seed  (이 기능 도입 전 설치본 — 소급 심문 금지)
 ///  · 기록 == 현재                               → Skip  (같은 설치본을 계속 쓰는 중)
 ///  · 신원 변경 + 버전 동일                      → Ask   (같은 버전인데 번들만 교체 = 재설치)
-///  · 신원 변경 + 버전 변경 + 최근 삭제 흔적     → Ask   (지우고 최신본을 새로 받았다)
-///  · 신원 변경 + 버전 변경                      → Seed  (★업그레이드 — 인앱·수동 모두. 묻지 않는다)
+///  · 신원 변경 + 버전 변경                      → Seed  (업그레이드 — 인앱·수동 모두. 묻지 않는다)
+///
+/// ★W-2 결정 B(2026-09-11 · reviewer-codex R-1 BLOCKER 1): '최근 휴지통 흔적'(~/.Trash 의 cys*.app mtime)
+/// 신호를 **버렸다.** ①mtime 은 휴지통에 넣은 시각이 아니다(옮겨도 보존된다) — 오래된 앱을 기록 이후에
+/// 버리면 놓치고 ②이름만 보므로 무관한 cys-*.app 사본 하나로 정상 업그레이드가 Ask 로 오탐됐다(데이터
+/// 격리 쪽 오류) ③~/.Trash 는 macOS 전체 디스크 접근(TCC) 보호 대상이라 권한 없는 프로세스의 읽기는
+/// EPERM 으로 조용히 꺼진다 — 기계마다 판정이 달라지는 신호였다. 그래서 "지우고 **새 버전**을 받은" 경우는
+/// 미탐(= 종전 동작)으로 둔다. 같은 버전을 덮어써 고친 설치(수리용 덮어쓰기)는 여전히 Ask 다 — 안전한 쪽
+/// 오탐이고, 기본 선택이 "이어서 사용하기"이며, [새로 시작]도 부팅 뒤 문구 확인을 거친다(결정 A).
 fn decide_fresh_start_prompt(
     prior_data_exists: bool,
-    recent_trash_evidence: bool,
     recorded: Option<&str>,
     current: Option<&str>,
 ) -> FreshStartPrompt {
@@ -3379,18 +3359,10 @@ fn decide_fresh_start_prompt(
     let (_, rec_ver) = split_install_stamp(recorded);
     let (_, cur_ver) = split_install_stamp(current);
     match (rec_ver, cur_ver) {
-        // 같은 버전인데 번들이 다른 파일 객체 = 지웠다 다시 깔았다
+        // 같은 버전인데 번들이 다른 파일 객체 = 지웠다 다시 깔았다(또는 같은 버전 덮어쓰기)
         (Some(r), Some(c)) if r == c => FreshStartPrompt::Ask,
-        // 버전이 올라갔다 = 업그레이드. 단 **기록 이후에** 앱을 버린 흔적이 있으면 그건
-        // "지우고 최신본을 새로 받았다"는 뜻이므로 묻는다(오래된 휴지통은 세지 않는다).
-        (Some(_), Some(_)) => {
-            if recent_trash_evidence {
-                FreshStartPrompt::Ask
-            } else {
-                FreshStartPrompt::Seed
-            }
-        }
-        // 구형식·손상 기록은 업그레이드 여부를 알 수 없다 — 안전한 쪽(Seed)으로 닫는다.
+        // 버전이 다르다 = 업그레이드(지우고 새 버전을 받은 경우와 구별할 신호가 없다 — 결정 B) ·
+        // 구형식·손상 기록 = 알 수 없다 → 둘 다 안전한 쪽(Seed)으로 닫는다.
         _ => FreshStartPrompt::Seed,
     }
 }
@@ -3438,6 +3410,8 @@ fn decide_pending_update(
 ///     init-pack 실패 시 마커·스탬프를 보존하고 복원을 보류해, 노드가 구 디렉티브로 조용히 각성하는
 ///     침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore).
 fn maybe_apply_pending_update(app: &AppHandle) {
+    // ★W-2 결정 A: 팩 반영(init-pack)이 도는 동안 초기화 관문을 닫는다 — setup 밖 호출(rotate_daemon)도 같은 관문.
+    let _boot_guard = BootWorkGuard::enter();
     let marker = pending_restore_path();
     let stamp_path = last_app_version_path();
     let current = env!("CARGO_PKG_VERSION");
@@ -3535,7 +3509,11 @@ fn nudge_folder_permissions(app: &AppHandle) {
 /// (launch_dept_daemon)로 재기동한다 — 재기동된 부서 데몬은 콜드부트 auto-restore로 노드를 되살린다
 /// (src/bin/cysd/main.rs). run_restore 멱등이라 콜드부트 복원과 겹쳐도 안전.
 fn spawn_org_restore(app: AppHandle) {
+    // ★W-2 결정 A: 조직 복원이 도는 동안 초기화 관문을 닫는다 — 초기화가 방금 죽인 부서 데몬을 복원이
+    // 되살리는 경합 차단(spawn 전에 무장 · 태스크가 끝나면 Drop).
+    let boot_guard = BootWorkGuard::enter();
     tauri::async_runtime::spawn(async move {
+        let _boot_guard = boot_guard;
         let _ = app.emit("restore-progress", json!({"phase": "start"}));
         // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
         let hq_ok = run_sidecar_restore(None).await;
@@ -5206,32 +5184,20 @@ fn dept_purge_preview_by_socket(socket: String) -> Result<Value, String> {
     }))
 }
 
-/// ★완전 초기화(팩토리 리셋) 프리뷰 — 읽기 전용(쓰기 0). 코어·인벤토리는 CLI `cys factory-reset`
-/// 과 동일한 `cys::factory_reset`(DESIGN-factory-reset.md) — GUI 는 표시·확인만 담당한다.
-/// 라이선스·미등록 파일(오너 배치 *.env 등) 보존이 코어 계약이라 GUI 가 따로 지킬 것이 없다.
-/// ★P0-2: 종전엔 집계 5개만 반환해 GUI 사용자가 **무엇이 사라지는지 볼 방법이 없었다**
-/// (같은 기능의 CLI `--plan` 은 전 경로를 찍는다 — 정보 비대칭). 이제 전 항목·강조 표식·
-/// report_only·사전점검·중단흔적·세션 수를 넘겨 모달이 승인 전에 다 보여준다.
-/// 또 `fn` 이라 대용량 재귀 stat 동안 창이 굳었다 — 실행 커맨드와 같은 `spawn_blocking` 으로.
 /// ★재설치 첫 기동 심문 — "앱을 지웠다 다시 깔았는데 이전 데이터가 그대로 남아 있다"를 감지해
 /// 프런트에 알린다. 초보 사용자의 삭제·재설치 의식은 **깨끗해졌다는 기대**를 동반하는데, 데이터가
 /// 앱 번들 밖(~/.cys·~/.local/state)에 있어 실제로는 전부 복원된다 — 그 어긋남을 여기서 닫는다.
-/// 쓰기 0(판정만) — 기록은 사용자가 고른 뒤 `fresh_start_ack` 이 한다.
+/// Ask 판정은 쓰기 0 — 기록은 사용자가 고른 뒤 `fresh_start_ack` 이 한다(Seed 만 여기서 조용히 기록).
+/// ★W-2 결정 A: 이 심문은 **묻기만** 한다. [깨끗하게 새로 시작]은 부팅이 끝난 뒤 기존 초기화 경로
+/// (프런트 factoryResetFlow → `factory_reset_execute` — 부팅 관문·문구 확인)로 넘어간다.
 #[tauri::command]
 fn fresh_start_check() -> Value {
     let prior_data_exists = cys::pack::pack_dir().join(".pack-version").exists()
         || cys::home_dir().join(".cys/depts.json").exists();
     let recorded = std::fs::read_to_string(install_identity_path()).ok();
     let current = current_install_stamp();
-    let recorded_at = std::fs::metadata(install_identity_path())
-        .and_then(|m| m.modified())
-        .ok();
-    let verdict = decide_fresh_start_prompt(
-        prior_data_exists,
-        app_trashed_since(recorded_at),
-        recorded.as_deref(),
-        current.as_deref(),
-    );
+    let verdict =
+        decide_fresh_start_prompt(prior_data_exists, recorded.as_deref(), current.as_deref());
     // Seed 는 물어볼 일이 아니라 **조용히 기록만** 한다(이 기능 도입 전 설치본 소급 심문 금지).
     if verdict == FreshStartPrompt::Seed {
         if let Some(cur) = current.as_deref() {
@@ -5242,29 +5208,151 @@ fn fresh_start_check() -> Value {
 }
 
 /// 사용자가 선택을 마쳤다 — 현재 설치본을 "이 데이터를 본 설치본"으로 기록해 다음 기동에서 다시
-/// 묻지 않게 한다. "이어서 사용하기"는 이것만 부르고, "깨끗하게 새로 시작"은 초기화 **전에** 부른다
-/// (초기화가 중간에 실패해도 같은 질문이 무한 반복되지 않도록 — 실패는 토스트로 별도 고지된다).
+/// 묻지 않게 한다. 두 선택 모두 고른 **즉시** 부른다. [깨끗하게 새로 시작]을 골라도 초기화는 부팅 뒤
+/// 문구 확인을 거쳐야 실행되므로(W-2 결정 A) 먼저 기록해도 그 확인을 건너뛰지 않는다 — 초기화가
+/// 성공하면 이 기록 파일도 함께 격리된다(src/factory_reset.rs CYS_BASE_EXACT `.install-identity`).
+/// ★W-2 결정 C(reviewer-codex R-1 MAJOR 4): 기록하지 못했으면 **실패로** 돌려준다. 종전에는 스탬프
+/// 판정 불능을 Ok 로 접고 프런트도 오류를 삼켜, 사용자가 골랐는데도 다음 기동에 같은 질문이 반복됐다.
 #[tauri::command]
 fn fresh_start_ack() -> Result<(), String> {
-    let Some(cur) = current_install_stamp() else {
-        return Ok(()); // 스탬프 판정 불능이면 기록할 것이 없다(다음 기동도 Skip 로 닫힌다)
-    };
-    std::fs::write(install_identity_path(), cur).map_err(|e| e.to_string())
+    record_install_identity(&install_identity_path(), current_install_stamp().as_deref())
 }
 
+/// `fresh_start_ack` 의 테스트 가능한 심장 — 기록 경로·스탬프를 주입받는다. 스탬프를 잴 수 없거나 쓰기가
+/// 실패하면 Err(사유) — 기록하지 못한 것을 성공으로 위장하지 않는다.
+fn record_install_identity(path: &std::path::Path, stamp: Option<&str>) -> Result<(), String> {
+    let Some(stamp) = stamp else {
+        return Err(
+            "이 설치본의 신원을 잴 수 없어 선택을 기록하지 못했습니다(앱이 정규 설치 위치 밖에서 실행 중일 수 있습니다)"
+                .into(),
+        );
+    };
+    std::fs::write(path, stamp)
+        .map_err(|e| format!("선택 기록 파일을 쓰지 못했습니다({}): {e}", path.display()))
+}
+
+/// ★W-2 결정 A(2026-09-11 · reviewer-codex R-1 BLOCKER 2): **파괴적 작업(완전 초기화)을 부팅 기계와 동시에
+/// 돌리지 않는다.** 실사고 기제: GUI 온보딩의 init-pack 이 훅을 등록한 뒤 `.gui-onboarded` 를 쓰기 **전에**
+/// 초기화가 팩·훅을 걷어내면, 늦게 재개된 온보딩이 마커=현재버전을 기록해 다음 기동이 온보딩을 건너뛴다 =
+/// 훅 없는 영구 반쪽 상태. 업데이트 뒤 조직 복원(spawn_org_restore)도 초기화와 겹치면 방금 죽인 부서 데몬을
+/// 되살린다. 그래서 부팅 태스크(setup 전체 — 데몬 기동·GUI 온보딩·업데이트 팩 반영)·업데이트 팩 반영
+/// (maybe_apply_pending_update)·조직 복원이 도는 동안 이 카운터가 0 보다 크고, `factory_reset_execute` 는
+/// 그동안 데몬을 건드리기 **전에** 거부한다. 프런트는 `reset_gate_status` 로 관문이 열리기를 기다렸다가 기존
+/// 초기화 확인 창을 연다.
+static BOOT_WORK_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 가장 최근 부팅 작업이 시작된 시각(`boot_clock_ms` 기준) — 아래 fail-open 상한의 기준점.
+static BOOT_WORK_LAST_START_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ★CEO 조건 (가)(2026-09-11) — 이 관문은 **반드시 언젠가 열린다(fail-open)**. 여는 길은 둘이다:
+///   ① 부팅 작업이 끝나면(정상 종료·조기 return·에러·패닉 되감기) 가드 Drop 이 카운터를 내린다(RAII).
+///   ② 끝나지 않는 부팅 작업(사이드카 무응답 등으로 멈춤)이 남아 있어도, **마지막 부팅 작업이 시작된 지 이
+///      시간이 지나면** 카운터와 무관하게 연다.
+/// 왜 fail-open 인가: 관문이 닫힌 채 굳으면 툴바 [완전 초기화]가 **영구 잠김**이 된다. 완전 초기화는 부팅이
+/// 망가진 기계의 복구 수단이기도 해서, 영구 잠김은 이 관문이 막으려던 경쟁(부팅과 겹친 초기화)보다 나쁘다.
+/// 10분 = 정상 부팅의 가장 긴 경로(setup 의 데몬 재시도 20회×15초 ≈ 5분 + 온보딩·팩 반영·조직 복원)에 여유를
+/// 둔 값. 상한 뒤에 여는 초기화도 문구 타이핑 확인을 그대로 거치고, 그 틈에 늦게 끝난 온보딩이 완료 마커를
+/// 남기지 못하게 `record_gui_onboarded` 가 막는다(초기화가 시작된 프로세스는 마커를 쓰지 않는다).
+const BOOT_GATE_FAIL_OPEN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// 프로세스 안 단조 시계(ms) — 벽시계 조정에 흔들리지 않는 fail-open 기준.
+fn boot_clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// 부팅 작업 1건의 수명 — 만들 때 +1, Drop(조기 return·패닉 되감기 포함)에 −1.
+struct BootWorkGuard;
+
+impl BootWorkGuard {
+    fn enter() -> Self {
+        // 시각을 먼저 적는다 — 카운터 증가를 본 쪽이 옛 시각으로 상한 경과를 오판하지 않게.
+        BOOT_WORK_LAST_START_MS.store(boot_clock_ms(), std::sync::atomic::Ordering::SeqCst);
+        BOOT_WORK_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        BootWorkGuard
+    }
+}
+
+impl Drop for BootWorkGuard {
+    fn drop(&mut self) {
+        BOOT_WORK_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// (진행 중인 부팅 작업 수, 마지막 부팅 작업이 시작된 뒤 지난 시간)
+fn boot_gate_snapshot() -> (usize, std::time::Duration) {
+    let n = BOOT_WORK_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+    let since =
+        boot_clock_ms().saturating_sub(BOOT_WORK_LAST_START_MS.load(std::sync::atomic::Ordering::SeqCst));
+    (n, std::time::Duration::from_millis(since))
+}
+
+/// 거부 안내의 머리 문구 — ★CEO 조건 (나): 프런트(ui/src/resetconfirm.ts `BOOT_GATE_REFUSAL_LEAD`)가 이 머리로
+/// 알아보고 '완전 초기화 실패'가 아니라 '잠시 후 다시' 안내로 띄운다(두 값은 배선 핀이 같은지 잰다).
+const BOOT_GATE_REFUSAL_LEAD: &str = "앱 시작을 마무리하는 중입니다";
+
+/// 순수 판정(단위테스트 대상) — 부팅 작업이 남아 있고 fail-open 상한 전이면 초기화를 시작하지 않는다(안내 문구).
+fn reset_blocked_by_boot(in_flight: usize, since_last_start: std::time::Duration) -> Option<String> {
+    (in_flight > 0 && since_last_start < BOOT_GATE_FAIL_OPEN).then(|| {
+        format!(
+            "{BOOT_GATE_REFUSAL_LEAD} — 레이아웃·조직 복원 같은 시작 작업이 끝나면 완전 초기화를 쓸 수 있습니다. 잠시 후 다시 시도해 주세요(아무것도 바뀌지 않았습니다)."
+        )
+    })
+}
+
+fn boot_gate_refusal() -> Option<String> {
+    let (n, since) = boot_gate_snapshot();
+    reset_blocked_by_boot(n, since)
+}
+
+/// ★W-2 A4: 완전 초기화가 이 프로세스에서 시작됐는가 — 되돌리지 않는 래치(프런트 `resetCompleted` 의 백엔드 짝).
+static RESET_STARTED_IN_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// GUI 온보딩 완료 마커(`.gui-onboarded`) 기록 — setup 의 윈도우·맥 온보딩이 이 한 곳으로만 쓴다.
+/// ★W-2 A4(reviewer-codex R-1 BLOCKER 2 의 기제 자체 봉쇄): 이 프로세스에서 완전 초기화가 시작됐으면 쓰지 않는다.
+/// 초기화가 팩·훅·이 마커를 걷어낸 **뒤에** 늦게 끝난 온보딩이 마커=현재버전을 남기면 다음 기동이 온보딩을
+/// 건너뛰어 훅 없는 영구 반쪽 상태가 된다(오너 위험 ③). 쓰지 않으면 다음 기동이 온보딩을 다시 돈다(init-pack
+/// 멱등 — 초기화 직후 원래 가야 할 상태). 부팅 관문이 닫혀 있는 동안에는 초기화가 시작될 수 없으므로 이 분기는
+/// fail-open 상한이 지난 뒤의 틈에서만 뜻이 있다.
+fn record_gui_onboarded() {
+    if RESET_STARTED_IN_PROCESS.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("[cys-app] 완전 초기화가 시작된 프로세스 — 온보딩 완료 마커를 쓰지 않는다(다음 기동이 온보딩을 다시 돈다)");
+        return;
+    }
+    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+    }
+}
+
+/// 프런트 폴링용(쓰기 0) — 부팅 뒤로 미룬 [깨끗하게 새로 시작]과 툴바 초기화가 확인 창을 열어도 되는지 본다.
+/// `boot_gate_closed` 는 fail-open 상한까지 반영한 판정이다(프런트는 이 값을 그대로 쓴다).
+#[tauri::command]
+fn reset_gate_status() -> Value {
+    let (n, since) = boot_gate_snapshot();
+    json!({
+        "boot_work_in_flight": n,
+        "boot_gate_closed": reset_blocked_by_boot(n, since).is_some(),
+    })
+}
+
+/// ★완전 초기화(팩토리 리셋) 프리뷰 — 읽기 전용(쓰기 0). 코어·인벤토리는 CLI `cys factory-reset`
+/// 과 동일한 `cys::factory_reset`(DESIGN-factory-reset.md) — GUI 는 표시·확인만 담당한다.
+/// 라이선스·미등록 파일(오너 배치 *.env 등) 보존이 코어 계약이라 GUI 가 따로 지킬 것이 없다.
+/// ★P0-2: 종전엔 집계 5개만 반환해 GUI 사용자가 **무엇이 사라지는지 볼 방법이 없었다**
+/// (같은 기능의 CLI `--plan` 은 전 경로를 찍는다 — 정보 비대칭). 이제 전 항목·강조 표식·
+/// report_only·사전점검·중단흔적·세션 수를 넘겨 모달이 승인 전에 다 보여준다.
+/// 또 `fn` 이라 대용량 재귀 stat 동안 창이 굳었다 — 실행 커맨드와 같은 `spawn_blocking` 으로.
 #[tauri::command]
 async fn factory_reset_preview() -> Result<Value, String> {
-    // ★W-1-b(2026-09-11): 조회 실패를 0 으로 접은 값만 넘기면 "없다"와 "못 셌다"가 구별되지 않는다.
-    // 재설치 첫 기동 경로는 '지금 끊길 것이 없다'가 **측정으로 확인될 때만** 문구 타이핑 확인을 생략하므로
-    // (ui/src/resetconfirm.ts `freshStartMaySkipTypedConfirm`) 측정 성공 여부를 따로 넘긴다. 표시값은 종전과 같다.
+    // ★W-1-b(2026-09-11): 조회 실패를 0 으로 접은 값만 넘기면 "없다"와 "못 셌다"가 구별되지 않는다 —
+    // 재설치 심문 모달은 셀 수 없었으면 '확인하지 못했다'고 고지한다(ui/src/resetconfirm.ts
+    // `freshStartLiveNotice`). 그래서 측정 성공 여부를 따로 넘긴다. 표시값은 종전과 같다.
     let live = live_session_count().await;
     let live_sessions_known = live.is_ok();
     let live_sessions = live.unwrap_or(0);
-    let depts = list_depts()
+    let dept_count = list_depts()
         .ok()
-        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()));
-    let dept_count_known = depts.is_some();
-    let dept_count = depts.unwrap_or(0);
+        .and_then(|r| r.get("depts").and_then(|d| d.as_object()).map(|o| o.len()))
+        .unwrap_or(0);
     tokio::task::spawn_blocking(move || {
         let roots =
             cys::factory_reset::ResetRoots::live().ok_or("홈 디렉토리를 해석할 수 없다")?;
@@ -5294,7 +5382,6 @@ async fn factory_reset_preview() -> Result<Value, String> {
             "live_sessions": live_sessions,
             "live_sessions_known": live_sessions_known,
             "dept_count": dept_count,
-            "dept_count_known": dept_count_known,
             "trash_root_ready": plan.trash_root_ready.is_ok(),
             "trash_root_error": plan.trash_root_ready.as_ref().err(),
             "interrupted_prior": plan.interrupted_prior.iter()
@@ -5325,6 +5412,12 @@ async fn factory_reset_execute(
                 .into(),
         );
     }
+    // ★W-2 결정 A: 부팅 기계(데몬 기동·온보딩·업데이트 반영·조직 복원)가 도는 동안은 거부한다 — 데몬을
+    // 건드리기 **전**에. 부팅과 겹친 초기화는 훅 없는 영구 반쪽 상태를 남긴다(BOOT_WORK_IN_FLIGHT 주석).
+    // 거부는 '잠시 후 다시' 안내다(아무것도 바꾸지 않았다) · 관문은 fail-open 상한 뒤 반드시 열린다.
+    if let Some(why) = boot_gate_refusal() {
+        return Err(why);
+    }
     tokio::task::spawn_blocking(move || {
         let roots =
             cys::factory_reset::ResetRoots::live().ok_or("홈 디렉토리를 해석할 수 없다")?;
@@ -5343,6 +5436,9 @@ async fn factory_reset_execute(
         let mut progress = |phase: &str, detail: &str| {
             let _ = app.emit("reset-progress", json!({"phase": phase, "detail": detail}));
         };
+        // ★W-2 A4: 여기서부터 초기화가 실제로 시작된다 — 늦게 끝난 온보딩이 완료 마커를 남기지 않게 래치를 건다
+        // (record_gui_onboarded · 되돌리지 않는다: 초기화가 시작된 프로세스는 재실행 전까지 반쪽 상태다).
+        RESET_STARTED_IN_PROCESS.store(true, std::sync::atomic::Ordering::SeqCst);
         // ★P0-1: RAII 센티널 — 조기 return·패닉에도 Drop 이 해제한다(잔존 시 데몬 기동 불가).
         let _sentinel = cys::factory_reset::ResetSentinel::arm();
         cys::factory_reset::stop_daemons_and_unregister(&plan, &mut progress).map_err(|e| {
@@ -6038,6 +6134,7 @@ fn main() {
             dept_purge_preview_by_socket,
             fresh_start_check,
             fresh_start_ack,
+            reset_gate_status,
             factory_reset_preview,
             factory_reset_execute,
             factory_reset_quit_app,
@@ -6056,7 +6153,12 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            // ★W-2 결정 A: 부팅 태스크 수명 동안 초기화 관문(BOOT_WORK_IN_FLIGHT)을 닫는다. spawn **전에**
+            // 무장해 프런트가 커맨드를 부를 수 있게 되기 전부터 닫혀 있게 한다 — 조기 return(안전모드·데몬
+            // 기동 실패)도 Drop 이 연다.
+            let boot_guard = BootWorkGuard::enter();
             tauri::async_runtime::spawn(async move {
+                let _boot_guard = boot_guard;
                 // ★T2 안전모드 게이트(translocation/비정규 경로 · 앱 자기삭제·"손상됨" 근본수리) —
                 // 데몬 기동·launchd 등록·팩/hook 쓰기 등 **자기경로 부수효과 전체보다 먼저** 실행 번들
                 // 위치를 판정한다. Canonical(정규 설치)이 아니면 부수효과를 전부 skip 하고 안내만 표시한
@@ -6170,16 +6272,12 @@ fn main() {
                 // hook만 사후 유실된 상태(마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
                 #[cfg(windows)]
                 if needs_onboard && maybe_windows_onboard() {
-                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
-                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
-                    }
+                    record_gui_onboarded(); // ★W-2 A4: 초기화가 시작된 프로세스는 마커를 쓰지 않는다
                 }
                 // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
                 if needs_onboard && maybe_macos_onboard() {
-                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
-                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
-                    }
+                    record_gui_onboarded(); // ★W-2 A4: 초기화가 시작된 프로세스는 마커를 쓰지 않는다
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
@@ -6409,28 +6507,139 @@ mod tests {
     fn fresh_start_asks_on_reinstall_but_never_on_a_plain_upgrade() {
         use FreshStartPrompt::*;
         let a1 = "16777232:100|0.14.33"; // 설치본 A, 버전 1
-        let b1 = "16777232:200|0.14.33"; // 설치본 B(다른 inode), 같은 버전 = 재설치
+        let b1 = "16777232:200|0.14.33"; // 설치본 B(다른 inode), 같은 버전 = 재설치(또는 같은 버전 덮어쓰기)
         let b2 = "16777232:200|0.14.34"; // 설치본 B, 버전 2 = 업그레이드
         // 물을 것이 없거나 판정 불능(개발 빌드·translocation) — 묻지 않는다
-        assert_eq!(decide_fresh_start_prompt(false, false, None, Some(a1)), Skip);
-        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), None), Skip);
+        assert_eq!(decide_fresh_start_prompt(false, None, Some(a1)), Skip);
+        assert_eq!(decide_fresh_start_prompt(true, Some(a1), None), Skip);
         // 도입 전 설치본 — 소급 심문 금지(기록만)
-        assert_eq!(decide_fresh_start_prompt(true, false, None, Some(a1)), Seed);
+        assert_eq!(decide_fresh_start_prompt(true, None, Some(a1)), Seed);
         // 같은 설치본 계속 사용 — 매 기동 묻지 않는다
-        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(a1)), Skip);
-        // ★핵심 경로 — 지웠다 같은 버전을 다시 깔았다
-        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(b1)), Ask);
-        // ★BLOCKER 시정 — 인앱·수동 업그레이드를 재설치로 오탐하지 않는다
-        assert_eq!(decide_fresh_start_prompt(true, false, Some(a1), Some(b2)), Seed);
-        // ★오탐 시정 — 오래된 휴지통(기록 이전)은 업그레이드를 흔들지 못한다.
-        //   기록 **이후**에 버린 흔적이 있을 때만 "지우고 최신본을 받았다"로 본다.
-        assert_eq!(decide_fresh_start_prompt(true, true, Some(a1), Some(b2)), Ask);
+        assert_eq!(decide_fresh_start_prompt(true, Some(a1), Some(a1)), Skip);
+        // ★핵심 경로 — 지웠다 같은 버전을 다시 깔았다. 같은 버전 '수리용 덮어쓰기'도 여기로 온다(결정 B 가
+        //   수용한 안전한 쪽 오탐: 기본 선택이 '이어서 사용하기'이고 [새로 시작]도 부팅 뒤 문구 확인을 거친다).
+        assert_eq!(decide_fresh_start_prompt(true, Some(a1), Some(b1)), Ask);
+        // ★업그레이드는 **언제나** 묻지 않는다 — 판정 입력에 휴지통·mtime 같은 외부 신호가 없으므로
+        //   reviewer-codex R-1 재현(무관한 cys-*.app 사본을 휴지통에 넣으면 업그레이드가 Ask)이 설 자리가 없다.
+        //   지우고 새 버전을 받은 경우도 여기로 온다 — 결정 B 의 의도된 미탐(= 종전 동작).
+        assert_eq!(decide_fresh_start_prompt(true, Some(a1), Some(b2)), Seed);
         // 손상·구형식 기록은 업그레이드 여부를 알 수 없다 → 안전한 쪽
-        assert_eq!(decide_fresh_start_prompt(true, false, Some(" \n"), Some(a1)), Seed);
-        assert_eq!(
-            decide_fresh_start_prompt(true, false, Some("16777232:100"), Some(b2)),
-            Seed
+        assert_eq!(decide_fresh_start_prompt(true, Some(" \n"), Some(a1)), Seed);
+        assert_eq!(decide_fresh_start_prompt(true, Some("16777232:100"), Some(b2)), Seed);
+    }
+
+    /// ★W-2 결정 C 회귀 핀(reviewer-codex R-1 MAJOR 4): 기록하지 못한 선택을 성공으로 보고하지 않는다.
+    #[test]
+    fn fresh_start_ack_never_reports_an_unrecorded_choice_as_success() {
+        let dir = std::env::temp_dir().join(format!("cys-ack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".install-identity");
+        // 스탬프를 잴 수 없으면 기록하지 못한 것이다 — 종전처럼 Ok 로 접으면 질문이 매 기동 반복된다.
+        assert!(record_install_identity(&path, None).is_err());
+        assert!(!path.exists(), "실패 경로가 파일을 남기면 안 된다");
+        // 쓰기 실패(부모 디렉터리 부재)도 실패로 돌려준다.
+        assert!(record_install_identity(&dir.join("no-such-dir/.install-identity"), Some("1:2|0.14.34")).is_err());
+        // 성공은 실제로 기록됐을 때만.
+        record_install_identity(&path, Some("1:2|0.14.34")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1:2|0.14.34");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ★W-2 결정 A 회귀 핀(reviewer-codex R-1 BLOCKER 2): 부팅 작업이 하나라도 살아 있으면 초기화는 거부된다 —
+    /// 가드 수명이 곧 관문이다(중첩·조기 return·패닉 되감기 모두 Drop 으로 닫힌다).
+    #[test]
+    fn factory_reset_is_refused_while_boot_work_is_in_flight() {
+        use std::time::Duration;
+        assert_eq!(reset_blocked_by_boot(0, Duration::ZERO), None);
+        let why = reset_blocked_by_boot(1, Duration::ZERO).expect("부팅 작업이 남아 있으면 거부");
+        // CEO 조건 (나): 거부는 '고장'이 아니라 '잠시 후 다시' 안내다 — 프런트는 이 머리로 안내 토스트를 고른다.
+        assert!(why.starts_with(BOOT_GATE_REFUSAL_LEAD) && why.contains("잠시 후 다시"), "{why}");
+        // 같은 전역을 만지는 다른 테스트가 없더라도 **증감**만 본다(병렬 실행에 강건).
+        let base = boot_gate_snapshot().0;
+        {
+            let _setup = BootWorkGuard::enter();
+            let (n, since) = boot_gate_snapshot();
+            assert_eq!(n, base + 1);
+            assert!(since < BOOT_GATE_FAIL_OPEN, "방금 시작한 부팅 작업은 상한 안이다");
+            assert!(boot_gate_refusal().is_some());
+            {
+                // setup 안에서 업데이트 팩 반영·조직 복원이 겹친다
+                let _restore = BootWorkGuard::enter();
+                assert_eq!(boot_gate_snapshot().0, base + 2);
+            }
+            assert_eq!(boot_gate_snapshot().0, base + 1);
+        }
+        assert_eq!(boot_gate_snapshot().0, base);
+        // 패닉으로 끝난 부팅 작업도 관문을 영구히 닫아 두지 않는다(되감기 Drop).
+        let r = std::panic::catch_unwind(|| {
+            let _g = BootWorkGuard::enter();
+            panic!("W-2 결정 A 가드 되감기 검체 — 의도된 패닉");
+        });
+        assert!(r.is_err());
+        assert_eq!(boot_gate_snapshot().0, base);
+    }
+
+    /// ★CEO 조건 (가) 회귀 핀: 끝나지 않는 부팅 작업이 있어도 관문은 상한 뒤 **반드시** 열린다(fail-open) —
+    /// 닫힌 채 굳으면 툴바 [완전 초기화]가 영구 잠김이 된다.
+    #[test]
+    fn boot_gate_fails_open_after_the_cap_even_if_a_boot_task_never_ends() {
+        use std::time::Duration;
+        let cap = BOOT_GATE_FAIL_OPEN;
+        assert!(reset_blocked_by_boot(1, cap - Duration::from_millis(1)).is_some(), "상한 직전까지는 닫혀 있다");
+        assert_eq!(reset_blocked_by_boot(1, cap), None, "상한에서 연다");
+        assert_eq!(reset_blocked_by_boot(7, cap * 3), None, "멈춘 작업이 여럿이어도 연다");
+        // 상한은 정상 부팅의 가장 긴 경로(setup 데몬 재시도 20회×15초)보다 길어야 정상 부팅 중에 열리지 않는다.
+        assert!(cap > Duration::from_secs(20 * 15));
+    }
+
+    /// ★W-2 결정 A 배선 핀: 관문은 **실제 부팅 기계**에 무장돼 있어야 뜻이 있다(배선이 빠지면 관문은 늘 열려
+    /// 있고 위 가드 테스트는 초록인 채로 무의미해진다). 같은 파일의 factory_reset_execute 트립와이어와 같은
+    /// 방식으로 소스 구조를 잰다: setup·조직 복원은 spawn **전에**, 업데이트 팩 반영은 init-pack **전에** 가드를
+    /// 잡고, 초기화 실행은 데몬 정지 **전에** 관문을 본다. ★W-2 A4: 초기화 래치는 관문 뒤·데몬 정지 앞에 걸리고,
+    /// 온보딩 완료 마커는 래치를 보는 한 곳(record_gui_onboarded)으로만 쓴다.
+    #[test]
+    fn boot_work_gate_is_armed_on_every_boot_task_and_checked_before_reset() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("main.rs 를 읽지 못했다({}): {e}", path.display()));
+        // 이 테스트 자신의 문자열에 걸리지 않도록 테스트 모듈 앞(본문)만 본다.
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let seg = |start: &str, end: &str| -> &str {
+            let s = body.find(start).unwrap_or_else(|| panic!("`{start}` 소실 — 배선 핀 재배선 필요"));
+            let rest = &body[s..];
+            &rest[..rest.find(end).unwrap_or(rest.len())]
+        };
+        let before = |seg: &str, first: &str, then: &str, what: &str| {
+            let a = seg.find(first).unwrap_or_else(|| panic!("{what}: `{first}` 없음"));
+            let b = seg.find(then).unwrap_or_else(|| panic!("{what}: `{then}` 없음"));
+            assert!(a < b, "{what}: `{first}` 가 `{then}` 보다 먼저 와야 한다");
+        };
+        let setup = seg(".setup(|app| {", ".run(tauri::generate_context!())");
+        before(setup, "BootWorkGuard::enter()", "tauri::async_runtime::spawn(", "setup 부팅 태스크");
+        let restore = seg("fn spawn_org_restore(", "\n}\n");
+        before(restore, "BootWorkGuard::enter()", "tauri::async_runtime::spawn(", "조직 복원");
+        let apply = seg("fn maybe_apply_pending_update(", "\n}\n");
+        before(apply, "BootWorkGuard::enter()", "sealed_sidecar_cys(", "업데이트 팩 반영");
+        let exec = seg("async fn factory_reset_execute(", "\n#[tauri::command]");
+        let gate = "boot_gate_refusal()";
+        before(exec, gate, "stop_daemons_and_unregister", "초기화 실행");
+        before(exec, gate, "spawn_blocking", "초기화 실행");
+        let latch = "RESET_STARTED_IN_PROCESS.store(true";
+        before(exec, gate, latch, "초기화 래치");
+        before(exec, latch, "stop_daemons_and_unregister", "초기화 래치");
+        assert!(
+            !setup.contains("std::fs::write(gui_onboarded_path()"),
+            "setup 이 온보딩 마커를 직접 쓴다 — 래치를 우회한다(record_gui_onboarded 를 거쳐라)"
         );
+        assert_eq!(setup.matches("record_gui_onboarded()").count(), 2, "윈도우·맥 온보딩 두 곳");
+        let rec = seg("fn record_gui_onboarded(", "\n}\n");
+        before(rec, "RESET_STARTED_IN_PROCESS.load(", "std::fs::write(gui_onboarded_path()", "온보딩 마커 기록");
+        // CEO 조건 (나): 프런트가 거부를 '잠시 후 다시'로 알아보는 머리 문구가 두 언어에서 같다.
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/resetconfirm.ts");
+        let ui_src = std::fs::read_to_string(&ui)
+            .unwrap_or_else(|e| panic!("resetconfirm.ts 를 읽지 못했다({}): {e}", ui.display()));
+        let want = format!("export const BOOT_GATE_REFUSAL_LEAD = \"{BOOT_GATE_REFUSAL_LEAD}\";");
+        assert!(ui_src.contains(&want), "프런트 거부 머리 문구가 백엔드와 다르다 — 기대: {want}");
     }
 
     #[test]
