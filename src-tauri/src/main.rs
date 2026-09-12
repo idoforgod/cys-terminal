@@ -11254,6 +11254,9 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             "maybe_macos_onboard",
             "onboard_init_pack",
             "maybe_windows_onboard",
+            // ★W-8a(F2) 윈도우 실기 검체 모듈 — `#[cfg(all(test, windows))]`. 부르는 쪽은 테스트
+            // 하네스뿐이라(모듈 밖 호출부 0) 지워져도 살아남는 호출부가 없다. 파일 끝 선언 참조.
+            "rotate_specimens",
         ];
 
         // ★MINOR-4(2026-08-25 7R) **`fn` 만 보던 스캐너를 아이템 전반으로 넓힌다.**
@@ -11346,3 +11349,8 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
     }
 
 }
+
+// ★W-8a(F2) 윈도우 실기 검체 D1–D10 — windows-build.yml T7 전용(#[ignore] · env 로 실제 구버전 cysd·
+//   가짜 taskkill 을 받는다). 파일 끝에 두는 이유: 맥에서 컴파일되는 줄의 번호를 밀지 않는다.
+#[cfg(all(test, windows))]
+mod rotate_specimens;

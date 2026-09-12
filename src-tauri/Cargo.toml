@@ -22,3 +22,8 @@ cys = { package = "cys-terminal", path = ".." }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# ★W-8a(F2): 윈도우 데몬 교대 결과 확인 — 연결한 pipe 의 서버 PID(GetNamedPipeServerProcessId)·
+#   프로세스 세대(GetProcessTimes 생성 시각)·종료 대기(WaitForSingleObject). 루트 크레이트와 같은 0.59.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }

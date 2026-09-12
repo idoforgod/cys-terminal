@@ -1198,3 +1198,117 @@ jobs:
           if ($code -ne 0) { throw "T6: 형제 import 가드 회귀 실패 (exit=$code) — 배송 런타임에서 팩 스크립트의 형제 import 가 깨진다" }
           Write-Host "OK: T6 형제 import 가드 회귀 통과 (동봉 embeddable python312._pth 실런타임 · 음성 대조 확인)"
           exit 0
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T7 W-8a(F2) 데몬 교대 결과 확인 검체 D1–D10 (설계 정본 D-1 §4.4 · 2026-09-12).
+      # 왜: 오너 윈도우 실기에서 수동 교대가 '✅ 교대 완료' 토스트를 띄웠는데 데몬은 바뀌지 않았다. 교대의
+      #   성공 판정이 '파이프에 붙었다'였기 때문이다(구 데몬에 다시 붙어도 성공). 기존 T4-10 은 PowerShell 이
+      #   구 데몬을 직접 죽이고 새로 띄워서 **실제 교대 코드**(taskkill 결과 처리·구 pipe 재접속)를 한 번도
+      #   재지 못했다. 이 스텝은 production 교대 경로를 실제 Win32 pipe·프로세스로 부른다.
+      # 검체·오라클 정본 = src-tauri/src/rotate_specimens.rs — 검체 수는 아래 EXPECTED 로 고정한다(필터가
+      #   조용히 비면 초록이 되는 것을 막는다).
+      # V_old = 공개 릴리스 v0.14.33 설치기에서 추출한 실제 cysd.exe(릴리스 SHA256SUMS·버전 리소스로 출처
+      #   확정) · V_target = 이 SHA 사이드카 · 가짜 taskkill = .NET Framework csc 로 만든 주입 지점(D2·D3·D4).
+      # ★음성 대조: 수정 전 트리(검체만 넣은 커밋)에서 이 스텝은 **붉어야 정상**이다 — 그 적색이 검체가
+      #   결함을 실제로 잡는다는 증거다(1회차 적색 없이 2회차 초록만 보고하지 않는다).
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T7 W-8a 검체 준비 (실제 구버전 cysd · 이 SHA 사이드카 · 가짜 taskkill)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $w = Join-Path $env:RUNNER_TEMP 'w8a'
+          Remove-Item -Recurse -Force $w -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $w 'old'), (Join-Path $w 'packs') | Out-Null
+          # ① V_old — 공개 릴리스 설치기(릴리스 SHA256SUMS 대조)에서 cysd.exe 추출 + 버전 리소스 확인
+          $oldVer = '0.14.33'
+          $base = "https://github.com/idoforgod/cys-terminal/releases/download/v$oldVer"
+          $setupName = "cys_${oldVer}_x64-setup.exe"
+          $setup = Join-Path $w $setupName
+          $sums = Join-Path $w 'SHA256SUMS.txt'
+          Invoke-WebRequest -UseBasicParsing -Uri "$base/$setupName" -OutFile $setup
+          Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS.txt" -OutFile $sums
+          $line = Select-String -Path $sums -Pattern ([regex]::Escape($setupName) + '$') | Select-Object -First 1
+          if (-not $line) { throw "T7: SHA256SUMS 에 $setupName 행이 없다" }
+          $want = $line.Line.Split(' ')[0].ToUpper()
+          $got = (Get-FileHash -Algorithm SHA256 $setup).Hash
+          if ($got -ne $want) { throw "T7: V_old 설치기 해시 불일치 — SUMS=$want · 실측=$got" }
+          & 7z e $setup "-o$(Join-Path $w 'old')" cysd.exe -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "T7: 7z 추출 실패(exit=$LASTEXITCODE)" }
+          $old = Join-Path $w 'old\cysd.exe'
+          if (-not (Test-Path $old)) { throw "T7: V_old cysd.exe 가 설치기에 없다" }
+          $pv = "$((Get-Item $old).VersionInfo.ProductVersion)"
+          Write-Host ("V_old: {0} · ProductVersion={1} · sha256={2} · 설치기 sha256={3}" -f $old, $pv, (Get-FileHash -Algorithm SHA256 $old).Hash, $got)
+          if (-not $pv.StartsWith($oldVer)) { throw "T7: V_old 버전 리소스 '$pv' ≠ $oldVer" }
+          # ② V_target — 이 SHA 의 사이드카
+          $tCysd = Get-ChildItem 'src-tauri/binaries/cysd-*.exe' | Select-Object -First 1
+          $tCys = Get-ChildItem 'src-tauri/binaries/cys-*.exe' | Select-Object -First 1
+          if (-not $tCysd -or -not $tCys) { throw "T7: 이 SHA 사이드카(src-tauri/binaries)를 못 찾음" }
+          # ③ 가짜 taskkill(주입 지점) — 모드는 env W8A_FAKE_TASKKILL_MODE(fail·lie·killfail)
+          $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw "T7: csc.exe 부재 — 가짜 taskkill 을 만들 수 없다(검체 불가 = 합격 아님)" }
+          $cs = Join-Path $w 'faketaskkill.cs'
+          Set-Content -Path $cs -Encoding utf8 -Value @'
+          using System;
+          using System.Diagnostics;
+          // W-8a T7 전용 가짜 taskkill — fail(비0·무종료) | lie(0·무종료) | killfail(종료 후 비0)
+          static class FakeTaskkill {
+              static int Main(string[] args) {
+                  string mode = Environment.GetEnvironmentVariable("W8A_FAKE_TASKKILL_MODE") ?? "fail";
+                  int pid = -1;
+                  for (int i = 0; i + 1 < args.Length; i++) {
+                      if (string.Equals(args[i], "/PID", StringComparison.OrdinalIgnoreCase)) { int.TryParse(args[i + 1], out pid); }
+                  }
+                  if (mode == "lie") {
+                      Console.WriteLine("SUCCESS: (fake) The process with PID " + pid + " has been terminated.");
+                      return 0;
+                  }
+                  if (mode == "killfail") {
+                      try { Process p = Process.GetProcessById(pid); p.Kill(); p.WaitForExit(5000); }
+                      catch (Exception e) { Console.Error.WriteLine("(fake) kill error: " + e.Message); }
+                      Console.Error.WriteLine("ERROR: (fake) reported failure after terminating PID " + pid);
+                      return 1;
+                  }
+                  Console.Error.WriteLine("ERROR: (fake) The process with PID " + pid + " could not be terminated. Reason: Access is denied.");
+                  return 1;
+              }
+          }
+          '@
+          $fake = Join-Path $w 'faketaskkill.exe'
+          & $csc /nologo /target:exe "/out:$fake" $cs
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fake)) { throw "T7: 가짜 taskkill 컴파일 실패(exit=$LASTEXITCODE)" }
+          @(
+            "W8A_OLD_CYSD=$old",
+            "W8A_TARGET_CYSD=$($tCysd.FullName)",
+            "W8A_TARGET_CYS=$($tCys.FullName)",
+            "W8A_FAKE_TASKKILL=$fake",
+            "W8A_PACK_ROOT=$(Join-Path $w 'packs')"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "OK: T7 준비 — V_old $pv · V_target $($tCysd.Name) · 가짜 taskkill $fake"
+
+      - name: T7 W-8a 데몬 교대 검증 검체 D1–D10 (production 교대 경로 · 실제 Win32)
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          set -uo pipefail
+          EXPECTED=18
+          # 컴파일은 따로 — 컴파일 실패가 '검체 0개'로 둔갑하지 않게 한다.
+          cargo test -p cys-app --bin cys-app --no-run || { echo "::error title=T7::검체 컴파일 실패"; exit 1; }
+          n=$(cargo test -p cys-app --bin cys-app w8a_ -- --ignored --list 2>/dev/null | grep -cE '^rotate_specimens::w8a_[a-z0-9_]+: test$')
+          if [ "$n" != "$EXPECTED" ]; then
+            echo "::error title=T7::검체 수 $n ≠ $EXPECTED — 필터가 조용히 비었거나 목록이 바뀌었다(돌지 않는 초록 금지)"
+            exit 1
+          fi
+          LOG="$(cygpath -u "$RUNNER_TEMP")/w8a/t7.log"
+          cargo test -p cys-app --bin cys-app w8a_ -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          echo "== W8A RESULT 표 =="
+          grep -E '^W8A (RESULT|NOTE)' "$LOG" || true
+          pass=$(grep -cE '^W8A RESULT: \S+ PASS$' "$LOG")
+          fail=$(grep -cE '^W8A RESULT: \S+ FAIL' "$LOG")
+          echo "T7 집계: PASS=$pass · FAIL=$fail · 기대 $EXPECTED"
+          if [ "$rc" -ne 0 ] || [ "$pass" -ne "$EXPECTED" ]; then
+            echo "::error title=T7::W-8a 검체 실패 — rc=$rc · PASS $pass/$EXPECTED"
+            exit 1
+          fi
+          echo "OK: T7 W-8a 검체 $pass/$EXPECTED 통과"
