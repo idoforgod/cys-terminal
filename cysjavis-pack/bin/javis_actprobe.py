@@ -14,6 +14,7 @@ probe 내부 예외는 반드시 3으로 수렴한다(침묵 통과 금지). 인
 
 영수증: 매 실행마다 append-only JSONL 1행 —
     {schema_version:1, ts, probe, target, exit, argv_digest, caller}
+ctx-compare는 diff·measured·reported·usage_source 필드를 추가한다(미측정은 null).
 경로 = --runs-path > env CYS_PROBE_RUNS > <pack>/state/probe_runs.jsonl.
 append-only·끝개행 보정·flock(단일 writer). 테스트는 반드시 _work 안 경로로(라이브 금지).
 
@@ -27,6 +28,7 @@ import argparse
 import getpass
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -454,8 +456,11 @@ def probe_ctx_compare(args):
     """자기보고 ctx% 맹신 차단(…false_clear_threshold, …semantic_contract).
 
     데몬 실측 usage.ctx_pct(source=statusline) ↔ 자기보고 status.context_pct 대조.
-    괴리 > 임계(기본 15)면 exit 2. usage null(예: gemini)/데몬 무응답이면 판정불가(3).
+    괴리 > 임계(기본 8)면 exit 2. usage null(예: gemini)/데몬 무응답이면 판정불가(3).
+    실패 방향: 한 축이라도 못 재면 exit 3 = 행동 금지 + 수동 확인(착수 허가 아님).
     """
+    # 두 값 반환 계약은 유지하고, 같은 판독의 진단 필드를 main 영수증으로 전달한다.
+    args.ctx_compare_fields = dict(diff=None, measured=None, reported=None, usage_source=None)
     try:
         data = _load_status(args)
     except (_ReadError, subprocess.SubprocessError) as e:
@@ -467,11 +472,16 @@ def probe_ctx_compare(args):
     status = s.get("status") or {}
     measured = usage.get("ctx_pct")
     reported = status.get("context_pct")
-    if not isinstance(measured, (int, float)):
+    args.ctx_compare_fields.update(measured=measured, reported=reported,
+                                   usage_source=usage.get("source"))
+    if (not isinstance(measured, (int, float)) or isinstance(measured, bool)
+            or not math.isfinite(measured)):
         return EXIT_INDET, f"measured usage.ctx_pct null/absent (e.g. gemini) for {args.surface}"
-    if not isinstance(reported, (int, float)):
+    if (not isinstance(reported, (int, float)) or isinstance(reported, bool)
+            or not math.isfinite(reported)):
         return EXIT_INDET, f"self-report status.context_pct absent — nothing to compare"
     diff = abs(float(reported) - float(measured))
+    args.ctx_compare_fields["diff"] = diff
     if diff > args.threshold:
         return EXIT_FAIL, (f"ctx divergence {diff:.1f} > {args.threshold} "
                            f"(measured {measured}, self-report {reported})")
@@ -561,7 +571,8 @@ def build_parser():
 
     c = sub.add_parser("ctx-compare", parents=[common], help="실측/자기보고 ctx-pct 대조")
     c.add_argument("--surface", required=True)
-    c.add_argument("--threshold", type=float, default=15.0)
+    c.add_argument("--threshold", type=float,
+                   default=os.environ.get("CYS_CTX_DIVERGENCE_PCT", 8.0))
     c.add_argument("--status-file", help="주입 status --json 파일")
 
     return p
@@ -603,6 +614,8 @@ def main(argv=None):
     }
     if args.task:  # 추가 필드는 하위호환 — 없으면 생략, schema_version 1 유지
         rec["task"] = args.task
+    if probe == "ctx-compare":
+        rec.update(args.ctx_compare_fields)
     try:
         _append_receipt(_runs_path(args), rec)
     except OSError as e:
@@ -613,6 +626,8 @@ def main(argv=None):
                "verdict": VERDICT_NAME[code], "reason": reason}
         if args.task:
             obj["task"] = args.task
+        if probe == "ctx-compare":
+            obj.update(args.ctx_compare_fields)
         print(json.dumps(obj, ensure_ascii=False))
     else:
         print(f"[{VERDICT_NAME[code]}] {probe} {target}: {reason}")

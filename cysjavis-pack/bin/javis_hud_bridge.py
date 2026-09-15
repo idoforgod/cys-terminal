@@ -64,6 +64,8 @@ REVIEW_KEEP = 10            # world.review.items 최신 유지 건수
 # ---------------------------------------------------------------- 판정 (§5)
 HOOK_ACTIVE_WINDOW = 30.0      # 최근 30s 내 도구 훅 → active
 SELF_REPORT_FRESH = 300.0      # 자기보고 신선 기준
+# Rust cys.rs `CTX_SELF_REPORT_MAX_AGE_SECS` · TS ctxpick.ts · Py javis_report.py 와 같은 값 — 바꿀 때 네 자리 함께
+CTX_SELF_REPORT_MAX_AGE_S = 300
 IDLE_WAITING = 300
 IDLE_DROWSY = 3600
 STATE_MAP = {"working": "active", "waiting": "waiting", "quiescing": "quiescing"}
@@ -102,13 +104,16 @@ def compute_activity(hook_count_60s, lines_per_sec):
 
 
 def pick_ctx(node):
-    """ctx% 선택: 실측(usage.ctx_pct·statusline) > 자기보고(status.context_pct)."""
+    """ctx% 선택: 실측(usage.ctx_pct·statusline) > 신선한 자기보고(status.context_pct)."""
     u = node.get("usage") or {}
     if isinstance(u.get("ctx_pct"), (int, float)):
         return u["ctx_pct"]
     st = node.get("status") or {}
-    if isinstance(st.get("context_pct"), (int, float)):
+    age = st.get("age_secs")
+    if (isinstance(st.get("context_pct"), (int, float)) and isinstance(age, int)
+            and age <= CTX_SELF_REPORT_MAX_AGE_S):
         return st["context_pct"]
+    # 실패 방향: 못 재면 None(HUD는 빈 칸/`?` — 값으로 위장하지 않음).
     return None
 
 

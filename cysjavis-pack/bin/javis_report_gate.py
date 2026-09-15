@@ -45,6 +45,7 @@ CLI:
 
 import argparse
 import json
+import math
 import os
 import re
 import socket
@@ -87,6 +88,7 @@ except Exception as _e:                       # noqa: BLE001
 # javis_report.py IDLE_ALERT_SECS와 동일(절대지침 B3: idle 5분+). 자기보고가 아닌 데몬 실측
 # idle_secs로만 판정한다(memory: stale self-report 함정). 여기 재정의(수집 실패 시에도 상수 필요).
 IDLE_ALERT_SECS = 300
+CTX_DIVERGENCE_ALERT_PCT = float(os.environ.get("CYS_CTX_DIVERGENCE_PCT", "8"))
 CYCLE_MINUTES_DEFAULT = 5      # schedule every_minutes=5
 STALL_CYCLES_DEFAULT = 6       # 6주기=30분 무진행 → stall 승격(DESIGN 미결 기본값)
 QUIET_CYCLES_DEFAULT = 12      # 12주기=60분 QUIET → 세션 주차 후보(P2·CSO 집행)
@@ -158,6 +160,7 @@ CHANNEL_POLICY = {
     "stall":           (SEV_WARN, (CH_LEDGER, CH_EVT, CH_BADGE)),
     "stall_confirmed": (SEV_CRIT, (CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH)),
     "context":         (SEV_INFO, (CH_LEDGER, CH_EVT)),
+    "ctx_divergence":  (SEV_WARN, (CH_LEDGER, CH_BADGE)),
     "feed":            (SEV_INFO, (CH_LEDGER, CH_EVT, CH_BADGE)),  # EVT 복원(master 검수): approval.needed는 HUD·음성 구독 토대(EVENT_CONTRACT) — 설계 표의 취지는 push 금지이지 EVT 제거가 아니다
     "collect":         (SEV_WARN, (CH_LEDGER, CH_BADGE)),
     "label_unjoined":  (SEV_WARN, (CH_LEDGER, CH_BADGE)),
@@ -902,12 +905,34 @@ def apply_policy(w):
     return w
 
 
+def ctx_divergence(nodes):
+    """두 축의 절대 괴리가 임계를 넘는 노드 — 부호는 자기보고 - 실측."""
+    diverged = []
+    for n in nodes or []:
+        m, s = n.get("usage_ctx_pct"), n.get("context_pct")
+        # 실패 방향: 한 축이라도 결측이면 괴리 판정 대상이 아니다(경보 없음 · 0으로 접지 않음).
+        if any(not isinstance(v, (int, float)) or isinstance(v, bool)
+               or not math.isfinite(v) for v in (m, s)):
+            continue
+        signed = float(s) - float(m)
+        if abs(signed) > CTX_DIVERGENCE_ALERT_PCT:
+            diverged.append({"role": n.get("role", "?"), "diff": abs(signed),
+                             "signed_diff": signed, "measured": m, "reported": s})
+    return diverged
+
+
+def _fmt_ctx_divergence(row):
+    return (f"{row['role']}: 자기보고 {row['reported']:g} vs 실측 {row['measured']:g}"
+            f" = {row['signed_diff']:+g}")
+
+
 # ── EVT payload 매핑 표(계약 SOT: _round/EVENT_CONTRACT.md · javis_event.SCHEMA) ──
 #   idle    → agent.silent {agent, silent_minutes, level=critical}
 #   feed    → approval.needed {agent, task, summary}
 #   stall   → agent.silent {agent, silent_minutes, level=critical}
 #   master_idle → agent.silent {agent, silent_minutes, level=critical} (격상층만 — 정보층은 EVT 0)
 #   context → EVT 매핑 없음(계약에 ctx 타입 부재) → 대장 전용
+#   ctx_divergence → EVT 매핑 없음 → 대장+badge
 #   collect → EVT 매핑 없음 → 대장+badge
 #   DELTA   → task_progress {task, stage, [pct]}
 #   날짜변경 → briefing {counts:{running,inbox,approvals,alerts}}
@@ -1009,6 +1034,18 @@ def extract_warnings(report, counters=None, now=0, edge_cooldown=EDGE_COOLDOWN_S
             "wake_body": "[gate] context: %s 컨텍스트 60%%+ — cycle-agent 집행 검토.%s" % (roles, tail),
             "evt_type": None, "evt_fields": None,
             "idem": "gate-context-%s" % ",".join(n.get("role", "?") for n, _p, _s in high),
+        }))
+    # ★WP6-3 — 원문 live_nodes의 두 축 대조(추가 RPC·프로세스 없음).
+    for row in ctx_divergence(report.get("live_nodes")):
+        detail = _fmt_ctx_divergence(row)
+        warns.append(apply_policy({
+            "trigger": "ctx_divergence",
+            "task": "gate-ctx-divergence-%s" % row["role"],
+            "reason": "ctx_divergence:%s" % detail,
+            "wake_body": "[gate] 컨텍스트 괴리: %s" % detail,
+            "evt_type": None, "evt_fields": None,
+            "idem": "gate-ctx-divergence-%s" % row["role"],
+            "badge_detail": row,
         }))
     feed = report.get("feed_pending")
     if isinstance(feed, int) and feed > 0:
@@ -1710,6 +1747,8 @@ class Gate:
                 "sampled_at": report.get("sampled_at"),
                 "measure_source": report.get("measure_source"),
                 "records": [ms[k] for k in sorted(ms)],
+                # report --json 산출기는 별도 파일. 게이트 관측 JSON에 매 주기 보존한다.
+                "ctx_divergence": ctx_divergence(report.get("live_nodes")),
             })
         except OSError:
             pass
