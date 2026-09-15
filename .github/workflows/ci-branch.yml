@@ -763,6 +763,11 @@ jobs:
           #     CYS_PROBE_RUNS 임시 주입) · 13종 전건 rc=0 · 합계 약 27s
           #     (settings_fifo 10s · inject_context_role_canon 7s · round_lock_ownership 7s ·
           #     trust_seed_reflect 2s · axis_labels 1s · 나머지 8종 <1s).
+          #   ★WP-6(2026-09-15) 4종 추가 등재 — test_report_ctx_axis(WP6-2 실측 ctx 축) ·
+          #     test_formation_tick_visibility(WP6-5 심박 흔적) · test_resource_gate_boot_anchor
+          #     (WP6-6 부트 유예 내용 앵커 · ⑧ 은 AF_UNIX 부재 시 자체 SKIP) · test_ctx_divergence
+          #     (WP6-3 괴리 임계). 실측 2026-09-15 · macOS arm64 · python 3.14.7 · 루프와 같은 env
+          #     (CYS_PACK_DIR 임시 + 격리 HOME/CYS_STATE_DIR) · 4종 전건 rc=0 · 합계 약 4s.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -787,7 +792,9 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path; do
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path \
+                   test_report_ctx_axis test_formation_tick_visibility \
+                   test_resource_gate_boot_anchor test_ctx_divergence; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== $t (mac) =="
@@ -1385,7 +1392,9 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path; do
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path \
+                   test_report_ctx_axis test_formation_tick_visibility \
+                   test_resource_gate_boot_anchor test_ctx_divergence; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack] declared-state test: $t =="
