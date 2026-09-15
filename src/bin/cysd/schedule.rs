@@ -221,6 +221,11 @@ const BUILTIN_COMMAND_MIGRATIONS: &[(&str, &str)] = &[
         "ceo-promote-pending-tick",
         "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
     ),
+    // WP6-5: ensure 비0 exit를 삼키던 심박(현재 builtin의 구 표현, 바이트 일치 이관).
+    (
+        "formation-heartbeat",
+        "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || true; done",
+    ),
 ];
 
 fn builtin_jobs() -> Vec<serde_json::Value> {
@@ -330,7 +335,8 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "every_minutes": 10,
             "action": "command",
             "base_only": true,
-            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || true; done",
+            // 실패 방향: 부서별 실패를 누적해 표면화하되 나머지 부서·다음 주기 복구는 계속한다.
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || rc=1; done; exit $rc",
             "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -3819,6 +3825,88 @@ mod merge_residue_tests {
         assert!(dept.contains("\n  cwd)"), "cys-dept 에 cwd 동사가 없다");
         let form = include_str!("../../../cysjavis-pack/bin/javis_formation.py");
         assert!(form.contains(r#"if a == "--cwd""#), "javis_formation 이 --cwd 를 읽지 않는다");
+    }
+
+    /// ★WP6-5 — ensure 실패를 누적하되 뒤 부서도 실행한다.
+    /// 실패 방향: 중간 부서 실패를 마지막 부서 성공으로 가리면 schedule.error가 사라진다.
+    #[test]
+    fn formation_heartbeat_surfaces_a_failing_ensure() {
+        let cmd = builtin("formation-heartbeat")["command"].as_str().unwrap().to_string();
+        assert!(!cmd.contains(concat!("--json ||", " true")), "ensure 실패를 삼킨다: {cmd}");
+        assert!(cmd.contains("--json || rc=1"), "부서별 실패를 누적하지 않는다: {cmd}");
+        assert!(cmd.contains("rc=0;") && cmd.trim_end().ends_with("exit $rc"),
+                "누적한 rc를 반환하지 않는다: {cmd}");
+        let form = include_str!("../../../cysjavis-pack/bin/javis_formation.py");
+        assert!(form.contains(r#"return 1 if state_kind(state) == "failed" else 0"#),
+                "failed 외의 비0은 평시 심박 소음이다");
+
+        // 실제 POSIX 셸로 중간 실패·후속 성공과 전부 성공을 잰다. 자식은 임시 스텁뿐이다.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!(
+                "cys-heartbeat-{}-{}", std::process::id(), now_epoch().to_bits()
+            ));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("cys-dept"), r#"#!/bin/sh
+case "$1" in
+    list) printf 'first\nlast\n' ;;
+    sock) printf '/tmp/%s.sock\n' "$2" ;;
+    cwd) printf '/tmp/department %s\n' "$2" ;;
+    *) exit 1 ;;
+esac
+"#).unwrap();
+            std::fs::write(bin.join("python3"), r#"#!/bin/sh
+printf '%s\n' "$4" >> "$CYS_PACK_DIR/seen"
+if [ "$4" = /tmp/first.sock ] && [ "$FAIL_FIRST" = 1 ]; then
+    printf 'ensure failed\n' >&2
+    exit 1
+fi
+exit 0
+"#).unwrap();
+            std::fs::write(bin.join("javis_formation.py"), "stub\n").unwrap();
+            for name in ["cys-dept", "python3"] {
+                std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            for (fail_first, expected) in [("1", 1), ("0", 0)] {
+                let out = std::process::Command::new("/bin/sh")
+                    .arg("-c").arg(&cmd).env_clear()
+                    .env("HOME", &root).env("CYS_PACK_DIR", &root)
+                    .env("PATH", &bin).env("FAIL_FIRST", fail_first)
+                    .output().unwrap();
+                assert_eq!(out.status.code(), Some(expected), "중간 실패 누적/성공 반환이 틀렸다");
+                assert_eq!(std::fs::read_to_string(root.join("seen")).unwrap(),
+                           "/tmp/first.sock\n/tmp/last.sock\n", "실패 뒤 부서가 실행되지 않았다");
+                assert_eq!(String::from_utf8_lossy(&out.stderr).contains("ensure failed"), expected == 1);
+                std::fs::remove_file(root.join("seen")).unwrap();
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// ★WP6-5 — 동버전 기존 설치본의 이번 구 표현을 이관하고 운영자 편집은 보존한다.
+    #[test]
+    fn heartbeat_fix_reaches_existing_installs_via_the_migration_table() {
+        let old = BUILTIN_COMMAND_MIGRATIONS.iter()
+            .find(|(id, old)| *id == "formation-heartbeat"
+                && old.contains("--cwd") && old.contains(concat!("--json ||", " true")))
+            .expect("현재 구 표현이 이관표에 없다 — P3 구 표현만으로는 기존 설치본에 안 닿는다");
+        let want = builtin("formation-heartbeat");
+        let mut existing = want.clone();
+        existing["command"] = json!(old.1);
+        existing["every_minutes"] = json!(17);
+        let mut jobs = vec![existing.clone()];
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
+        assert!(changed && conflicts.is_empty());
+        assert_eq!(jobs[0]["command"], want["command"]);
+        assert!(jobs[0]["command"].as_str().unwrap().contains("exit $rc"));
+        assert_eq!(jobs[0]["every_minutes"], 17, "command 외의 운영자 편집이 소실됐다");
+        existing["command"] = json!(format!("{} # 운영자 주석", old.1));
+        let mut edited = vec![existing.clone()];
+        let _ = apply_builtin_jobs(&mut edited);
+        assert_eq!(edited[0], existing, "구 표현과 다른 운영자 편집이 소실됐다");
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
     }
 
     /// ★P8 — 승격 틱은 **좌석 신원 전부**를 지운 role-less 집행자로 돈다.

@@ -44,6 +44,7 @@ CLI:
   python3 javis_formation.py classify --installed claude,agy --live master,cso [--no-resource]
   python3 javis_formation.py self-test
 """
+import contextlib
 import json
 import os
 import subprocess
@@ -233,8 +234,8 @@ def gate_check():
 try:
     import fcntl
 
-    def _lk(f):
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    def _lk(f, blocking=False):
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
 
     def _ulk(f):
         try:
@@ -245,8 +246,8 @@ except ImportError:  # Windows: fcntl 부재 → msvcrt 바이트락(파일 닫�
     try:
         import msvcrt
 
-        def _lk(f):
-            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        def _lk(f, blocking=False):
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
 
         def _ulk(f):
             try:
@@ -255,7 +256,7 @@ except ImportError:  # Windows: fcntl 부재 → msvcrt 바이트락(파일 닫�
             except OSError:
                 pass
     except ImportError:
-        def _lk(f):
+        def _lk(f, blocking=False):
             pass
 
         def _ulk(f):
@@ -777,6 +778,39 @@ def _ensure_master_seat(socket, cwd):
 
 
 # ── ⑦ 상태 파일 + feed 표면화(침묵 금지 C6) ──
+@contextlib.contextmanager
+def _state_write_lock(path, blocking=True):
+    """JSON 쓰기 구간만 직렬화한다 — 편성 싱글플라이트와 별개인 짧은 잠금.
+
+    os.replace만으로는 read→replace 사이 최신 판정 덮어쓰기를 막을 수 없다.
+    심박은 비블로킹 획득 실패 시 기록을 생략하고, 정상 기록은 이 짧은 구간 뒤에 쓴다.
+    """
+    with open(path + ".write-lock", "a+") as f:
+        f.seek(0)  # Windows 바이트락도 모든 writer가 같은 위치를 잠근다.
+        _lk(f, blocking=blocking)
+        try:
+            yield
+        finally:
+            _ulk(f)
+
+
+def _replace_state_obj(path, obj):
+    """상태 JSON의 tmp+os.replace 원자 교체 — 정상 기록·심박 기록 공용."""
+    import uuid
+    # 락 미획득 심박도 쓰므로 임시파일을 공유하면 다른 writer의 JSON을 바꿀 수 있다.
+    tmp = path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _write_state(socket, state, detail, roles_booted, attempts=None, gate=None, held=None):
     root = _state_root()
     try:
@@ -813,18 +847,40 @@ def _write_state(socket, state, detail, roles_booted, attempts=None, gate=None, 
         obj["gate"] = gate
     if held:
         obj["held"] = list(held)
-    tmp = path + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=1)
-            f.write("\n")
-        os.replace(tmp, path)
+        with _state_write_lock(path):
+            _replace_state_obj(path, obj)
     except OSError as e:
         # ★SF-4(P3 수정 라운드): 영속 실패가 침묵이면 다음 실행에서 원장 리셋(역할당 최대 3회
         #   추가 시도)이 무언 발생한다 — loud 1줄로 가시화(폭주 아님·유계는 락이 보장).
         sys.stderr.write("[formation] WARN: 상태파일 영속 실패(%s) — 시도 원장 리셋 가능성\n" % e)
         return None
     return path
+
+
+def _touch_state(socket, note):
+    """심박 도달만 기록한다 — 읽은 판정 키와 updated_at/updated_epoch는 불변.
+
+    last_tick만 움직이면 심박은 도달했으나 새 판정은 기록되지 않은 것이다.
+    상태파일이 없으면 생성하지 않고, 정상 기록 경로에는 last_tick 키를 넣지 않는다.
+    """
+    try:
+        if not _read_state_obj(socket):
+            return None
+        path = os.path.join(_state_root(), _sanitize_key(socket) + ".json")
+        with _state_write_lock(path, blocking=False):
+            obj = _read_state_obj(socket)
+            if not obj:
+                return None
+            obj["last_tick"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            obj["last_tick_epoch"] = time.time()
+            obj["last_tick_note"] = note
+            _replace_state_obj(path, obj)
+        return path
+    except Exception:
+        # 실패 방향: 관측 기록 실패는 조용히 무시한다(fail-open).
+        # 관측 보강이 유일한 자동 복구 경로의 반환·다음 심박을 막으면 안 된다.
+        return None
 
 
 def _feed(title, body, kind="formation"):
@@ -954,6 +1010,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
     # ② 싱글플라이트 락
     with _singleflight(socket) as lock:
         if not lock.acquired:
+            _touch_state(socket, "inflight: 다른 편성 진행 중(싱글플라이트) — no-op")
             return "partial:inflight", "다른 편성 진행 중(싱글플라이트) — no-op"
 
         # ③ CLI 가용성(로그인셸 우산 프로브 — 이 ensure 에서 1회만 수행하고 이하 전 경로가 재사용)
@@ -1383,6 +1440,7 @@ def _cmd_ensure(argv):
         state, detail = ensure(socket=socket, cwd=cwd, force_surface=force_surface)
     except Exception as e:  # 최후 graceful — 예외 스택 대신 명시 메시지
         state, detail = "failed:%s" % type(e).__name__, str(e)
+        _touch_state(socket, "failed:%s — %s" % (type(e).__name__, str(e)[:200]))
     summary = {"ok": state_kind(state) in ("complete", "partial"),
                "state": state, "kind": state_kind(state), "detail": detail,
                "socket": socket or ""}
