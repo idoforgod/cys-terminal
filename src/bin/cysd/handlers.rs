@@ -8944,8 +8944,9 @@ mod tests {
 
     /// session_detail 의 가림 적용 사실이 응답에 드러나야 한다(+ 타입 혼동은 거절).
     /// 종전에는 ① 가림 여부가 응답에 없고 ② `{"redact":"true"}` 가 조용히 off 로 접혔다.
-    /// analytics 커넥션이 없으면 arm 이 `json!({ session_id, timeline: [], summary: {} })` 로
-    /// 떨어지므로 DB 없이도 가림·에코·거절 경로를 그대로 잰다.
+    /// `Daemon::new` 가 소켓 부모 디렉터리(tmp 아래)에 `analytics.db` 를 열어(`crate::analytics::open`)
+    /// `Some(conn)` 경로를 탄다 — 빈 DB 라 timeline 은 비고, session_id 가 실재 파일이면
+    /// `transcript_excerpt` 가 꼬리를 읽는다. None 갈래도 `json!({...})` 객체라 단언은 동일 성립.
     #[test]
     fn session_detail_echoes_redacted_and_rejects_non_bool() {
         let _g = REDACT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -9016,6 +9017,42 @@ mod tests {
         };
         assert_eq!(bad2["ok"], json!(false), "sessions: 숫자 1 이 조용히 off 로 접혔다: {bad2}");
         assert_eq!(bad2["error"]["code"], json!("invalid_params"), "{bad2}");
+
+        // ⑤ 가림 갈래의 판별력: `pii` 는 실재 파일이 아니라 transcript_excerpt 가 redact 유무와
+        //    무관하게 [] 를 돌려 `detail["transcript"] = json!([])` 를 못 잰다. tmp 아래 실재 .jsonl
+        //    (transcript_excerpt 파서가 받는 모양: type=user/assistant · message.content 문자열 또는
+        //    text 블록 배열)을 session_id 로 주면 Some(conn) 경로가 꼬리를 실제로 읽는다.
+        let real = dir.join("real-transcript.jsonl");
+        std::fs::write(
+            &real,
+            concat!(
+                r#"{"type":"user","message":{"content":"hello"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("전사 픽스처 기록");
+        let real_sid = real.to_string_lossy().into_owned();
+        let open = call(json!({ "session_id": &real_sid, "redact": false }));
+        assert_eq!(open["ok"], json!(true), "{open}");
+        let n_turns = open["result"]["transcript"].as_array().map(|a| a.len()).unwrap_or(0);
+        assert!(
+            n_turns >= 1,
+            "실재 전사인데 redact=false 발췌가 비었다(픽스처가 파서 모양과 어긋남): {open}"
+        );
+        let shut = call(json!({ "session_id": &real_sid, "redact": true }));
+        assert_eq!(shut["ok"], json!(true), "{shut}");
+        assert_eq!(
+            shut["result"]["transcript"],
+            json!([]),
+            "redact=true 인데 전사 발췌가 응답에 남았다: {shut}"
+        );
+        let sid = shut["result"]["session_id"].as_str().unwrap_or("");
+        assert!(
+            sid.starts_with("sess-") && sid.len() == 13,
+            "가린 session_id 모양이 sess-<hex8>(13자) 이 아니다: {sid:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
