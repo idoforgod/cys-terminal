@@ -7658,6 +7658,31 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let reason = param_str(&params, "reason")
                 .map(|r| r.trim().to_string())
                 .filter(|r| !r.is_empty());
+            // ★(0.14.31 · 적대 리뷰 2026-09-15 · pause 순서 계약) **설정자 해소는 `set_paused(true)`
+            //   앞에서 끝낸다.** 순서: [actor 해소 = 조상 워크 + surfaces·caller_cache 락] →
+            //   [`PauseInfo` 완성(since 포함)] → [`set_paused(true)`] → [`pause_info` 대입 = 뮤텍스 1회
+            //   + 이동, I/O·워크 없음] → [`persist_pause`(정보가 완성된 뒤에만)].
+            //   종전에는 플래그를 먼저 세운 뒤 조상 워크를 돌았다 — 그 사이 `org.status` 를 읽은
+            //   `cys status` 는 `paused=true · pause_info=None` 을 받아, 사유가 **있는** pause 를
+            //   `(사유 미기재) · 설정자 미상` 으로 그렸다. 결측 표기는 기록의 사실이어야지 읽은 시점의
+            //   산물이면 안 된다. actor 는 수락 판정에 쓰이지 않으므로 앞으로 빼도 의미가 안 바뀐다.
+            //   실패 방향: 설정자 해소 실패는 정상 결측(None)이며 동결·caller_pid 는 그대로 남는다.
+            //   남는 창(정직): `set_paused` 반환 → `pause_info` 뮤텍스 획득 사이(마이크로초 단위)에
+            //   읽으면 여전히 `paused=true · pause_info=None` 이 보일 수 있다 — 0 은 아니고 워크·락
+            //   2~3회 만큼 좁힌 것이다. 락 규약: `resolve_caller_surface`·`get_surface` 는 자기 안에서
+            //   락을 풀고 나오므로 `set_paused`(surfaces → pending_queue) 와 중첩되지 않는다.
+            let actor_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let actor_role = actor_surface
+                .and_then(|sid| daemon.get_surface(sid))
+                .and_then(|s| s.role.lock().unwrap().clone());
+            // `since` 는 플래그 전환 직전에 찍는다 — 독자가 관측한 paused 시각보다 뒤설 수 없다.
+            let info = crate::state::PauseInfo {
+                since: crate::state::now_epoch(),
+                reason: reason.clone(),
+                actor_pid: caller_pid,
+                actor_surface,
+                actor_role,
+            };
             // ★(0.14.31 · 성찰 Q2 · 통합 2026-09-10) kill-switch 전이는 `set_paused` 하나로 간다.
             //   `paused.store(true)` 만 하면 **이미 결판을 기다리는 인계는 그대로 나간다** — 운영자가
             //   `cys pause` 응답을 손에 쥔 뒤에도 본문+CR 이 좌석에 꽂힌다는 뜻이다. `set_paused` 는
@@ -7666,19 +7691,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   **알 수 있다**(침묵하면 0 이라고 읽는다 — 결측은 값이 아니다).
             //   남는 창: 이미 CLAIMED/ACKED 인 쓰기(백로그 · writer fence).
             let still_writing = daemon.set_paused(true);
-            let since = crate::state::now_epoch();
-            // 실패 방향: 설정자 해소 실패는 정상 결측(None)이며 이미 건 동결과 caller_pid 는 보존한다.
-            let actor_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
-            let actor_role = actor_surface
-                .and_then(|sid| daemon.get_surface(sid))
-                .and_then(|s| s.role.lock().unwrap().clone());
-            *daemon.pause_info.lock().unwrap() = Some(crate::state::PauseInfo {
-                since,
-                reason: reason.clone(),
-                actor_pid: caller_pid,
-                actor_surface,
-                actor_role,
-            });
+            *daemon.pause_info.lock().unwrap() = Some(info);
             daemon.persist_pause();
             // 이벤트는 reason 키를 유지하되 결측은 null 로 보낸다.
             daemon
@@ -16036,7 +16049,8 @@ mod tests {
     }
 
     /// 빈 문자열뿐 아니라 공백뿐인 사유도 결측이며, 실제 사유는 trim 후 보존한다.
-    /// 실패 방향: 붉어지면 공백 사유가 값으로 남거나 실제 사유까지 소실되어 중단 원인을 잃는다.
+    /// 실패 방향: 붉어지면 공백 사유가 값으로 남거나 실제 사유까지 소실되어 중단 원인을 잃는다 —
+    /// 또는 RPC 응답 이후에도 `org.status` 가 사유 있는 pause 를 `pause_info` 없이(=미기재로) 낸다.
     #[test]
     fn pause_with_blank_reason_is_also_absence() {
         let dir = std::env::temp_dir().join(format!("cys-pause-blank-{}", std::process::id()));
@@ -16064,6 +16078,18 @@ mod tests {
         assert!(info.actor_pid.is_none());
         assert!(info.actor_surface.is_none());
         assert!(info.actor_role.is_none());
+        // ★(pause 순서 계약 핀) 응답이 돌아온 시점에는 `paused` 와 `pause_info` 가 **함께** 서 있다 —
+        //   status 가 사유 있는 pause 를 `(사유 미기재)` 로 그릴 근거가 남아 있으면 안 된다.
+        //   타이밍 검체가 아니다: 응답 이후의 정적 상태만 본다(동시 읽기 창은 주석으로만 남긴다).
+        let req = Request { id: json!(3), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(st) = dispatch(&daemon, req, Some(1)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(st["result"]["paused"], json!(true));
+        assert_eq!(
+            st["result"]["pause_info"]["reason"], json!("점검 중"),
+            "응답 이후 status 가 사유를 잃었다: {}", st["result"]["pause_info"]
+        );
         let p = crate::state::state_dir(&daemon.socket_path).join("autopilot.json");
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(v["reason"], json!("점검 중"));

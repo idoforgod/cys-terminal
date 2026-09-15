@@ -81,14 +81,23 @@ except Exception as _e:                       # noqa: BLE001
 #     `report_module_missing` 으로 드러난다(조용한 접힘 금지 · 0% 위장 금지).
 _REPORT_IMPORT_ERR = None
 try:
-    from javis_report import pick_node_ctx as _pick_node_ctx
+    from javis_report import pick_node_ctx as _pick_node_ctx, CTX_SELF_REPORT_MAX_AGE_S
 except Exception as _e:                       # noqa: BLE001
     _pick_node_ctx, _REPORT_IMPORT_ERR = None, str(_e)[:120]
+    CTX_SELF_REPORT_MAX_AGE_S = 300
 
 # javis_report.py IDLE_ALERT_SECS와 동일(절대지침 B3: idle 5분+). 자기보고가 아닌 데몬 실측
 # idle_secs로만 판정한다(memory: stale self-report 함정). 여기 재정의(수집 실패 시에도 상수 필요).
 IDLE_ALERT_SECS = 300
-CTX_DIVERGENCE_ALERT_PCT = float(os.environ.get("CYS_CTX_DIVERGENCE_PCT", "8"))
+ENV_ANOMALIES = []  # javis_mission 관례: (코드, 사유), 대장 reasons·badge로 가청화.
+try:
+    CTX_DIVERGENCE_ALERT_PCT = float(os.environ.get("CYS_CTX_DIVERGENCE_PCT", "8"))
+    if not math.isfinite(CTX_DIVERGENCE_ALERT_PCT) or CTX_DIVERGENCE_ALERT_PCT <= 0:
+        raise ValueError("threshold must be finite and positive")
+except (TypeError, ValueError, OverflowError):
+    CTX_DIVERGENCE_ALERT_PCT = 8.0
+    ENV_ANOMALIES.append(("ctx_divergence_env_invalid",
+                          "CYS_CTX_DIVERGENCE_PCT must be finite and positive; using 8.0"))
 CYCLE_MINUTES_DEFAULT = 5      # schedule every_minutes=5
 STALL_CYCLES_DEFAULT = 6       # 6주기=30분 무진행 → stall 승격(DESIGN 미결 기본값)
 QUIET_CYCLES_DEFAULT = 12      # 12주기=60분 QUIET → 세션 주차 후보(P2·CSO 집행)
@@ -905,15 +914,26 @@ def apply_policy(w):
     return w
 
 
-def ctx_divergence(nodes):
-    """두 축의 절대 괴리가 임계를 넘는 노드 — 부호는 자기보고 - 실측."""
+def ctx_divergence(nodes, stats=None):
+    """신선한 두 축의 괴리 목록. stats는 비교/신선도 불명·만료/축 결측 계수."""
     diverged = []
+    if stats is None:
+        stats = {}
+    stats.update(compared=0, skipped_stale=0, skipped_missing=0)
     for n in nodes or []:
         m, s = n.get("usage_ctx_pct"), n.get("context_pct")
         # 실패 방향: 한 축이라도 결측이면 괴리 판정 대상이 아니다(경보 없음 · 0으로 접지 않음).
         if any(not isinstance(v, (int, float)) or isinstance(v, bool)
                or not math.isfinite(v) for v in (m, s)):
+            stats["skipped_missing"] += 1
             continue
+        age = n.get("status_age_secs")
+        # 실패 방향: 신선도 미상·낡음 → 비교 제외(경보 없음 · skipped_stale로 표면화).
+        if (not isinstance(age, (int, float)) or isinstance(age, bool)
+                or not math.isfinite(age) or age > CTX_SELF_REPORT_MAX_AGE_S):
+            stats["skipped_stale"] += 1
+            continue
+        stats["compared"] += 1
         signed = float(s) - float(m)
         if abs(signed) > CTX_DIVERGENCE_ALERT_PCT:
             diverged.append({"role": n.get("role", "?"), "diff": abs(signed),
@@ -1740,6 +1760,8 @@ class Gate:
         """층4 — 판정에 쓴 **실측값**의 영속 수용처. BLACKLIST(diff 제외)와 역할이 다르다:
         diff 에서 빼는 것은 오탐 DELTA 방지이고, 여기 남기는 것은 사후 추적성 확보다."""
         ms = measurements(report)
+        ctx_stats = {}
+        diverged = ctx_divergence(report.get("live_nodes"), ctx_stats)
         try:
             _write_json_atomic(self.measure_path, {
                 "schema_version": SCHEMA_VERSION,
@@ -1748,7 +1770,8 @@ class Gate:
                 "measure_source": report.get("measure_source"),
                 "records": [ms[k] for k in sorted(ms)],
                 # report --json 산출기는 별도 파일. 게이트 관측 JSON에 매 주기 보존한다.
-                "ctx_divergence": ctx_divergence(report.get("live_nodes")),
+                "ctx_divergence": diverged,
+                "ctx_divergence_stats": ctx_stats,
             })
         except OSError:
             pass
@@ -1996,6 +2019,10 @@ class Gate:
             reasons.append("bootnode_module_missing")
         if _REPORT_IMPORT_ERR:                # ★WP6-2 — CTX 헬퍼 부재 = 컨텍스트 경보 판정 불가
             reasons.append("report_module_missing")
+        # 무효 환경설정은 판정을 WARN으로 바꾸거나 push하지 않고 관측 채널에만 남긴다.
+        for code, why in ENV_ANOMALIES:
+            reasons.append(code)
+            self._badge(code, SEV_WARN, why, {"threshold": CTX_DIVERGENCE_ALERT_PCT})
 
         # 수집 실패 = **대장+배지**(설계 §1-B N6a: push 0, 정상 state ledger `collect_fail`).
         # 종전에는 여기서 WARN push 가 나갔다 — 데몬이 잠깐 없을 때마다 master 를 두드리던 경로다.
@@ -2009,12 +2036,12 @@ class Gate:
             delivered = self._route_warn(warns, shadow, reasons, counters, now_epoch, set())
             self._flush_badges()
             ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
-                                           "verdict": VERDICT_WARN, "reasons": [w["reason"] for w in warns],
+                                           "verdict": VERDICT_WARN, "reasons": reasons + [w["reason"] for w in warns],
                                            "delta_fields": [], "delivered": delivered,
                                            "consecutive_nochg": counters.get("consecutive_nochg", 0),
                                            "consecutive_quiet": counters.get("consecutive_quiet", 0),
                                            "lane": lane_id(self.state_dir), "shadow": shadow})
-            self._summary(VERDICT_WARN, delivered, [w["reason"] for w in warns])
+            self._summary(VERDICT_WARN, delivered, reasons + [w["reason"] for w in warns])
             return report
 
         self._write_measurement(report)
@@ -2051,10 +2078,10 @@ class Gate:
                 self._write_counters(counters)
                 self._flush_badges()
                 ledger_append(self.state_dir, {"ts": now_iso, "ts_epoch": now_epoch,
-                                               "verdict": "GAP", "reasons": ["interval>3cycles"],
+                                               "verdict": "GAP", "reasons": reasons + ["interval>3cycles"],
                                                "delta_fields": [], "delivered": "none",
                                                "lane": lane_id(self.state_dir), "shadow": shadow})
-                self._summary("GAP", "none", ["interval>3cycles"])
+                self._summary("GAP", "none", reasons + ["interval>3cycles"])
                 return report
 
         if not report.get("status_available"):

@@ -244,6 +244,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   사실을 **정적이 아니라 실행으로** 재는 짝이다(정적 핀만 있을 때 남는 계급 — "env 를 실었다"와
     #   "실었는데 인터프리터가 무시한다"의 차이 — 을 닫는다).
     "cysjavis-pack/bin/tests/test_pyseal_negative_specimen.py",
+    # ★2026-09-15 WP6-6 등재 — 부트 유예 앵커 검체(0.14.31 감사 · 17bb59d 로 CI 이름 루프 5곳 등재 뒤
+    #   이 census 가 신규 검출). **봉인 점검 결과(등재 = 이 선언)**: 강제점 **아니다** — env 를 걸거나
+    #   벗기는 코드 줄이 0이다. 이 검체가 스폰하는 것은 가짜 `cys` 스텁(`#!/bin/sh`)과 게이트 자기호출
+    #   (`sys.executable` = 검체를 띄운 그 인터프리터 · env 는 `os.environ` 복사 + override 라 봉인이
+    #   **상속**된다 — 벗기지도 새로 걸지도 않음)뿐이라 번들 python 의 새 진입점도 아니다. 니들 보유는
+    #   docstring 의 실행 규약 예시 1줄(`… PYTHONDONTWRITEBYTECODE=1 \ python3 …`)뿐이다(성격 표기이지
+    #   누락이 아니다 — 지우면 검체 실행 규약 안내가 사라질 뿐 봉인은 그대로다).
+    "cysjavis-pack/bin/tests/test_resource_gate_boot_anchor.py",
     # ★2026-09-08 P6 등재 — 셸 역할 권위·단일소유 가드 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도 강제점도 아니다. 이 검체가 스폰하는 것은 `sh`/`bash`/`cys-dept`(bash)와
     #   가짜 `cys` 스텁(sh)뿐이다. 니들은 **밀폐 env 를 짜는 한 줄**에 있다 — 검체가 띄우는 셸이

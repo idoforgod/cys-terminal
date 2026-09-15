@@ -3,6 +3,8 @@
 """WP6-5 — 실제 락 경합·최후 예외의 심박 흔적과 정상 기록 바이트 규약.
 
 실패 방향: 관측 기록 실패는 복구 반환을 바꾸지 않는다. 상태가 없으면 만들지 않는다.
+정상 기록의 write-lock 대기는 유계다 — 보유자가 안 놓으면 STATE_WRITE_LOCK_WAIT_SEC 안에 loud WARN 으로
+return 하고(무기한 대기 금지 · 판정 1회 미영속), 보유자가 놓으면 다시 쓴다(4g·4h).
 리포 팩·임시 상태로 밀폐하고 subprocess를 차단한다(cys·cysd 실행 0).
 """
 import contextlib
@@ -14,6 +16,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from unittest import mock
 
 SELF = Path(__file__).resolve().parent
@@ -177,6 +180,46 @@ def main():
         check("4f 경쟁 쓰기 뒤 최신 판정 보존",
               serialized.get("state") == "complete" and serialized.get("detail") == "owner latest"
               and not tick_keys.intersection(serialized))
+
+        # ★WP6 리뷰(동시성): 다른 스레드가 write-lock 을 쥔 채 놓지 않으면 정상 기록은 상한 안에 loud WARN 으로
+        #   끝나야 한다(무기한 대기 = 싱글플라이트를 쥔 채 편성 자가치유 영구 정지). 실제 상수·실제 락으로 잰다.
+        cap = jf.STATE_WRITE_LOCK_WAIT_SEC
+        held_bytes = path.read_bytes()
+        holder_ready, holder_release = threading.Event(), threading.Event()
+
+        def hold_write_lock():
+            with jf._state_write_lock(str(path)):
+                holder_ready.set()
+                holder_release.wait(cap + 5)
+
+        holder = threading.Thread(target=hold_write_lock, daemon=True)
+        holder.start()
+        stderr = io.StringIO()
+        try:
+            check("4g0 보유자 스레드 write-lock 선점", holder_ready.wait(2))
+            t0 = time.monotonic()
+            with contextlib.redirect_stderr(stderr):
+                stuck = jf._write_state(sock, "partial:booting", "stuck holder", roles)
+            elapsed = time.monotonic() - t0
+        finally:
+            holder_release.set()
+            holder.join(2)
+        warn = stderr.getvalue()
+        check("4g 보유자 미해제 시 상한 안에 None 반환(대기는 상한까지 실제로 했다)",
+              stuck is None and cap * 0.9 <= elapsed < cap + 1.0,
+              "elapsed=%.2fs cap=%.1fs" % (elapsed, cap))
+        check("4h 판정 미영속은 loud WARN 1줄(버린 판정 명시)·원본 보존·임시파일 0",
+              warn.count("[formation] WARN:") == 1 and "write-lock 대기 상한" in warn
+              and "판정 partial:booting 미영속" in warn and path.read_bytes() == held_bytes
+              and not list(path.parent.glob("*.tmp")) and not holder.is_alive(),
+              warn.strip()[:160])
+        # 대조군(무너지는 방향): 보유자가 놓으면 같은 호출이 즉시 쓴다 — 상한은 보유자에 대한 것이지 락 고장이 아니다.
+        t0 = time.monotonic()
+        with contextlib.redirect_stderr(io.StringIO()):
+            resumed = jf._write_state(sock, "complete", "owner latest", roles)
+        check("4i 보유자 해제 뒤 정상 기록 즉시 재개",
+              resumed is not None and time.monotonic() - t0 < 1.0
+              and jf._read_state_obj(sock).get("detail") == "owner latest")
 
         # 상태가 없거나 손상됐으면 임의 상태를 만들어 판정하지 않는다.
         missing_root = str(Path(root) / "never-written")

@@ -104,7 +104,19 @@ def compute_activity(hook_count_60s, lines_per_sec):
 
 
 def pick_ctx(node):
-    """ctx% 선택: 실측(usage.ctx_pct·statusline) > 신선한 자기보고(status.context_pct)."""
+    """ctx% 선택: 실측(usage.ctx_pct·statusline) > 신선한 자기보고(status.context_pct).
+
+    ★실측 축의 낡음(0.14.31 감사 정정): 데몬(cysd usage.rs)이 낡은 실측을 None 으로 지우는 범위는
+      **휴리스틱 매핑뿐**이다 — `mapping_is_fresh` 는 등록 매핑(SessionStart 등록 = 통상의 claude 경로)의
+      나이를 보지 않고, `idle_stale_transition` 은 source=="statusline" 을 건드리지 않으며, `collect_tick`
+      은 exited·agent_meta 없는 좌석을 건너뛴다 → 등록·statusline·종료 좌석의 ctx_pct 는 마지막 값에
+      **동결**된 채 실린다. 실측에 300s 나이 게이트를 걸지 않는다(idle 이어도 산 좌석의 실측은 정확 ·
+      master 결정). 이 함수는 사망 신호를 읽지 않는다 — HUD 의 사망 축은 같은 노드 뷰(_node_view)의
+      `presence == "dead"`(judge_presence: exited ∨ agent_alive is False)가 담당한다.
+    ★실패 방향: 못 재면 None(HUD 는 빈 칸/`?` — 값으로 위장하지 않는다). 잔여 한계: 죽은 좌석의 동결
+      ctx 가 값으로 나와 `ctx_critical` 플래그(_node_view · ctx >= 90)를 올릴 수 있다 — presence 가
+      dead 인 노드의 ctx 는 동결값으로 읽어라(게이트는 이 함수 밖 · 이번 라운드 미적용).
+    """
     u = node.get("usage") or {}
     if isinstance(u.get("ctx_pct"), (int, float)):
         return u["ctx_pct"]

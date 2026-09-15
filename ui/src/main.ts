@@ -959,7 +959,8 @@ function taskRow(s: any, deptKey: string): string {
   // ★WP6-2 — 막대 값은 pickCtx 한 벌(실측 usage.ctx_pct > 신선한 자기보고 · 결측 null). 종전에는 자기보고
   //   전용이라 실측이 있어도 자기보고가 없으면 막대가 비었고, 낡은 자기보고를 그대로 그렸다.
   //   자기보고(src === "self")일 때만 추정 표식(≈ + 툴팁)을 단다. 색상 임계 60/80 은 불변.
-  //   실측 없음 + 자기보고 낡음/나이 미상(src === "stale")은 막대를 **없애지 않고** 값 자리에 `?` 를 그린다 —
+  //   실측 없음 + 자기보고 낡음/나이 미상, 또는 좌석 사망(exited ∨ agent_alive=false · 동결값)(src === "stale")은
+  //   막대를 **없애지 않고** 값 자리에 `?` 를 그린다 —
   //   오너 원칙 "없으면 없다고 표시하고 그 사실이 보이게 하라". 색상 중립(임계 미적용) · 판정(isHotCtx)은 false.
   //   자기보고도 실측도 없는 노드(src === "none")만 종전대로 빈 칸이다.
   const { pct: ctxPct, src: ctxSrc } = pickCtx(s);
@@ -968,7 +969,7 @@ function taskRow(s: any, deptKey: string): string {
     ctxPct != null
       ? `<span class="cc-tbar" style="max-width:130px"${ctxEst ? ' title="노드 자기보고(추정)"' : ""}><span class="cc-tbar-track"><span class="cc-tbar-fill ${ctxPct >= 80 ? "crit" : ctxPct >= 60 ? "warn" : ""}" style="width:${Math.min(100, ctxPct)}%"></span></span><span class="cc-tbar-pct">${ctxEst ? "≈" : ""}${ctxPct}%</span></span>`
       : ctxSrc === "stale"
-        ? `<span class="cc-tbar" style="max-width:130px" title="컨텍스트 판정 불가 — 실측 없음 · 자기보고 낡음/나이 미상"><span class="cc-tbar-track"><span class="cc-tbar-fill" style="width:0%"></span></span><span class="cc-tbar-pct" style="color:#94a3b8">?</span></span>`
+        ? `<span class="cc-tbar" style="max-width:130px" title="컨텍스트 판정 불가 — 좌석 종료/에이전트 사망(동결값) 또는 실측 없음 · 자기보고 낡음/나이 미상"><span class="cc-tbar-track"><span class="cc-tbar-fill" style="width:0%"></span></span><span class="cc-tbar-pct" style="color:#94a3b8">?</span></span>`
         : "";
   const age = selfReport ? ccAge(st.age_secs ?? 0) : `idle ${s.idle_secs ?? 0}s`;
   const stale = selfReport && (st.age_secs ?? 0) > 120 ? " stale" : "";

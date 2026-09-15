@@ -45,6 +45,7 @@ CLI:
   python3 javis_formation.py self-test
 """
 import contextlib
+import errno
 import json
 import os
 import subprocess
@@ -231,10 +232,18 @@ def gate_check():
 
 
 # ── ② 소켓키 싱글플라이트 락(fcntl/msvcrt — cys-dept reg_upsert 패턴 재사용·Sim S2-3/S2-6) ──
+# ★_lk 실패 방향 — 두 플랫폼이 **다르다**(WP6 리뷰 동시성 항목 · 2026-09-15):
+#   · POSIX fcntl.flock — blocking=False: 보유자 있으면 즉시 BlockingIOError(errno EAGAIN=EWOULDBLOCK).
+#     blocking=True: **무기한 대기**(보유자가 해제·fd 닫기·프로세스 사망할 때까지 — 멈춘 보유자 = 영원한 정지).
+#   · Windows msvcrt.locking — LK_NBLCK: 즉시 OSError(errno EACCES). LK_LOCK: 1초 간격 10회 재시도 뒤
+#     OSError(EDEADLOCK) = **≈10s 유한**. 즉 같은 blocking=True 가 POSIX 는 무기한, Windows 는 ≈10s 다.
+#   · 둘 다 부재(폴백): 무잠금 no-op — 항상 즉시 획득(직렬화 없음 · 실패 없음).
+#   따라서 대기가 필요한 호출부는 blocking=True 를 쓰지 말고 **비블로킹 + 유계 재시도**로 상한을 스스로
+#   정한다(_state_write_lock · STATE_WRITE_LOCK_WAIT_SEC). 현재 blocking=True 를 넘기는 호출부는 0 이다.
 try:
     import fcntl
 
-    def _lk(f, blocking=False):
+    def _lk(f, blocking=False):  # blocking=True 는 무기한(위 실패 방향 참조) — 호출부 0
         fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
 
     def _ulk(f):
@@ -246,7 +255,7 @@ except ImportError:  # Windows: fcntl 부재 → msvcrt 바이트락(파일 닫�
     try:
         import msvcrt
 
-        def _lk(f, blocking=False):
+        def _lk(f, blocking=False):  # LK_LOCK 은 ≈10s 유한(위 실패 방향 참조) — 호출부 0
             msvcrt.locking(f.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
 
         def _ulk(f):
@@ -778,16 +787,49 @@ def _ensure_master_seat(socket, cwd):
 
 
 # ── ⑦ 상태 파일 + feed 표면화(침묵 금지 C6) ──
+# ★WP6 리뷰(동시성 · 2026-09-15): 정상 기록의 write-lock 대기는 **유계**여야 한다. 종전 `_lk(blocking=True)`
+#   는 POSIX 에서 무기한 대기였고, 그 대기는 ensure 의 싱글플라이트 락을 **쥔 채** 일어나므로(③′·④·pending-cli·
+#   ⑦ 기록 4곳) 보유자 하나가 멈추면 그 소켓의 편성 자가치유가 영원히 선다(Windows 는 LK_LOCK ≈10s 뒤 예외라
+#   실패 방향이 갈렸다). 상한 = STATE_WRITE_LOCK_POLL_SEC × 40 = 2.0s — 정당한 보유는 JSON 수백 바이트의
+#   tmp+replace 또는 read→replace(ms 단위)뿐이고, 심박 주기(10분) ≫ 2s ≪ Windows ≈10s 라 두 플랫폼이 같은
+#   상한으로 수렴한다. 초과 = 이 판정 1회 미영속(loud WARN · 다음 ensure/심박이 재기록) — 침묵 드롭 아님.
+STATE_WRITE_LOCK_POLL_SEC = 0.05
+STATE_WRITE_LOCK_WAIT_SEC = 2.0
+# 비블로킹 획득의 "보유자 있음" errno — POSIX flock LOCK_NB: EAGAIN(=EWOULDBLOCK) · Windows LK_NBLCK: EACCES.
+# 그 외 errno(EBADF·EIO …)는 경합이 아니라 I/O 장애라 재시도 없이 즉시 던진다(호출부 WARN 경로).
+_LOCK_BUSY_ERRNOS = frozenset((errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN), errno.EACCES))
+
+
+class _StateWriteLockTimeout(OSError):
+    """write-lock 유계 대기 상한 초과(보유자 미해제) — _write_state 가 loud WARN 후 return 하는 신호."""
+
+
 @contextlib.contextmanager
 def _state_write_lock(path, blocking=True):
     """JSON 쓰기 구간만 직렬화한다 — 편성 싱글플라이트와 별개인 짧은 잠금.
 
     os.replace만으로는 read→replace 사이 최신 판정 덮어쓰기를 막을 수 없다.
-    심박은 비블로킹 획득 실패 시 기록을 생략하고, 정상 기록은 이 짧은 구간 뒤에 쓴다.
+    심박(blocking=False)은 획득 실패 시 즉시 포기(예외 → 호출부가 기록 생략)하고, 정상 기록(blocking=True)은
+    **유계 대기**(비블로킹 재시도 STATE_WRITE_LOCK_POLL_SEC 간격 · 상한 STATE_WRITE_LOCK_WAIT_SEC) 뒤에 쓴다 —
+    상한 초과면 _StateWriteLockTimeout(OSError) 을 던진다. 플랫폼 블로킹 락(_lk blocking=True)은 여기서 쓰지
+    않는다(POSIX 무기한 · Windows ≈10s 로 상한이 갈린다 — ② _lk 실패 방향 주석).
     """
     with open(path + ".write-lock", "a+") as f:
         f.seek(0)  # Windows 바이트락도 모든 writer가 같은 위치를 잠근다.
-        _lk(f, blocking=blocking)
+        deadline = time.monotonic() + (STATE_WRITE_LOCK_WAIT_SEC if blocking else 0.0)
+        while True:
+            try:
+                _lk(f, blocking=False)
+                break
+            except OSError as e:
+                busy = e.errno in _LOCK_BUSY_ERRNOS
+                if busy and blocking and time.monotonic() < deadline:
+                    time.sleep(STATE_WRITE_LOCK_POLL_SEC)
+                    continue
+                if busy and blocking:
+                    raise _StateWriteLockTimeout(
+                        e.errno, "write-lock 대기 상한 %.1fs 초과(보유자 미해제)" % STATE_WRITE_LOCK_WAIT_SEC)
+                raise  # 비블로킹 호출(심박) 즉시 포기 · 경합 아닌 I/O 장애는 재시도 없이 그대로
         try:
             yield
         finally:
@@ -850,6 +892,12 @@ def _write_state(socket, state, detail, roles_booted, attempts=None, gate=None, 
     try:
         with _state_write_lock(path):
             _replace_state_obj(path, obj)
+    except _StateWriteLockTimeout as e:
+        # ★WP6 리뷰(동시성): 유계 대기 초과 = 이 판정 1회 미영속. 침묵 드롭 금지 — 무엇을 버렸는지(state)
+        #   까지 loud 로 남기고 return 한다(싱글플라이트는 호출부 반환으로 즉시 풀려 다음 틱이 재기록).
+        sys.stderr.write("[formation] WARN: 상태파일 write-lock 대기 상한 초과(%s) — 판정 %s 미영속"
+                         "(시도 원장 리셋 가능성)\n" % (e, state))
+        return None
     except OSError as e:
         # ★SF-4(P3 수정 라운드): 영속 실패가 침묵이면 다음 실행에서 원장 리셋(역할당 최대 3회
         #   추가 시도)이 무언 발생한다 — loud 1줄로 가시화(폭주 아님·유계는 락이 보장).

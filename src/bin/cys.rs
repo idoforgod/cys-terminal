@@ -16454,20 +16454,42 @@ const CTX_SELF_REPORT_MAX_AGE_SECS: u64 = 300;
 /// CTX 칸 문자열 — 정본 규칙은 `cysjavis-pack/bin/javis_hud_bridge.py` 의 `def pick_ctx(node):`
 /// (실측 usage.ctx_pct > 자기보고 status.context_pct)와 **같다**. 두 화면이 다른 숫자를
 /// 내면 그것만으로 60% 판정이 갈린다.
+///   · 좌석 사망        → "?"        (`exited==true` ∨ `agent_alive==false` — 동결 실측을 산 값으로 읽지 않는다)
 ///   · 실측 있음        → "78%"      (데몬이 잰 값 · 표식 없음)
 ///   · 자기보고만 신선   → "78%~"     (~ = 자기보고 · 추정치라는 표식)
 ///   · 자기보고가 낡음   → "?"        (판정 불가 — 낡은 추정을 값으로 위장하지 않는다)
 ///   · 둘 다 없음        → "-"        (agy/gemini 는 ctx_pct=None 이라 여기 온다)
-/// 실측이 stale 이면 데몬이 이미 ctx_pct 를 None 으로 지운다(cysd/usage.rs:426-439) —
-/// 그래서 여기서 실측의 나이를 다시 볼 필요는 없다.
+///
+/// ★실측 축의 낡음 — 데몬이 낡은 실측을 None 으로 지우는 범위는 **휴리스틱 매핑뿐**이다(0.14.31
+///   감사 정정 · 종전 주석 "실측이 stale 이면 데몬이 이미 ctx_pct 를 None 으로 지운다"는 범위가 틀렸다):
+///   · cysd/usage.rs `mapping_is_fresh` 는 `heuristic=false`(SessionStart 등록 매핑 = 통상의 claude
+///     경로)면 나이를 보지 않고 항상 신선이고, `idle_stale_transition` 은 `source=="statusline"` 을
+///     건드리지 않는다 → 등록 매핑·statusline 값은 나이로 지워지지 않는다.
+///   · `collect_tick` 은 exited·agent_meta 없는 좌석을 건너뛴다 → 그 좌석의 `usage` 는 마지막 값에
+///     **동결**된 채 org.status 에 `"exited": true` 와 함께 실린다(`usage.updated_at` 도 실리지만
+///     여기서는 읽지 않는다).
+///   그래서 실측에 300s 나이 게이트를 걸지 **않는다** — idle 이어도 산 좌석의 실측은 정확하고, 걸면
+///   조용한 좌석 전부가 `?` 가 돼 오경보가 된다(master 결정). 대신 페이로드에 있는 사망 신호 두 축
+///   `exited`(pane 종료 · state.rs reader 가 EOF 에서 세운다)와 `agent_alive`(governance 워치독의 3상 ·
+///   `Some(false)` = 관측된 사망 확정만)로 막는다 — 워치독은 exited 좌석을 건너뛰어 agent_alive 가
+///   동결되므로 한 축만 보면 반쪽이다(0.14.31 후속 · 세 피커 대칭).
 ///
 /// 실패 방향(분기마다 한 줄):
-///   · 실측 분기 — 실측이 stale·결측이면 값이 아니라 **아래 자기보고 폴백**으로 내려간다
+///   · 사망 분기 — `exited == true` 또는 `agent_alive == false` 면 실측·자기보고가 있어도 `?`(판정
+///     불가). 키 부재·null·(exited=false / agent_alive=true) 는 게이트를 열지 않는다(구버전 데몬
+///     페이로드 무해 · null 은 "모른다"이지 "죽었다"가 아니다 · 값 쪽으로 접지 않는다).
+///   · 실측 분기 — 실측이 결측(휴리스틱 stale 로 지워진 형상 포함)이면 값이 아니라 **아래 자기보고 폴백**으로 내려간다
 ///     (구버전 데몬으로 `usage` 키 자체가 없어도 같은 폴백 · 무해 · 제거 금지).
 ///   · 자기보고 분기 — `age_secs` 가 상한을 넘거나 **결측**이면 `?`(판정 불가)로 무너진다.
 ///     결측은 "모른다"이지 "방금"이 아니다 — 값(`~`) 쪽으로 접지 않는다.
 ///   · 둘 다 없음 — `-`. 값이 아니므로 60% 임계 판정의 입력이 되지 않는다.
+///   · ★잔여 한계 — 에이전트가 한 번도 관측되지 않은 채(`agent_alive=null`) 죽은 좌석과, 사망 뒤
+///     워치독 틱이 돌기 전의 창은 잡히지 않는다(null 은 "모른다"라 게이트를 열지 않는다 · 의도).
 fn ctx_cell(s: &serde_json::Value) -> String {
+    // 사망 게이트 — 데몬 수집기가 건너뛰는 좌석의 동결 실측을 산 값으로 읽지 않는다(위 ★실측 축의 낡음).
+    if s["exited"].as_bool() == Some(true) || s["agent_alive"].as_bool() == Some(false) {
+        return "?".into();
+    }
     if let Some(v) = s["usage"]["ctx_pct"].as_u64() {
         return format!("{v}%");
     }
@@ -31209,6 +31231,8 @@ mod tests {
     /// ★WP6-1: CTX 칸은 **실측 우선**이고, 자기보고는 신선할 때만 값(`~` 표식)이다.
     /// 실패 방향: 실측이 없고 자기보고가 낡거나 `age_secs` 가 결측이면 `?`(판정 불가)로
     /// 무너진다 — 값 쪽으로 접히면 낡은 추정이 60% 임계 판정의 입력이 된다(그것이 이 검체가 막는 사고).
+    /// ⑦(0.14.31 감사): 종료 좌석(`exited=true`)의 동결 실측은 값이 아니라 `?` 다 — 데몬은 exited
+    /// 좌석의 usage 를 지우지 않는다(collect_tick 건너뜀). 값 쪽으로 접히면 죽은 좌석이 60% 목록에 남는다.
     #[test]
     fn ctx_cell_prefers_measured_and_degrades_stale_self_report() {
         use serde_json::json;
@@ -31227,10 +31251,28 @@ mod tests {
         assert_eq!(ctx_cell(&noage), "?");
         // ⑤ 둘 다 없음(agy/gemini: usage.ctx_pct=None · 자기보고 없음) → "-".
         assert_eq!(ctx_cell(&json!({"usage": {"ctx_pct": null}, "status": null})), "-");
-        // ⑥ 실측이 stale 로 지워진 형상(cysd/usage.rs:426-439) = ctx_pct null → 자기보고 경로.
+        // ⑥ 실측이 stale 로 지워진 형상(cysd/usage.rs B6 가드·`mapping_is_fresh` — **휴리스틱 매핑 한정**)
+        //    = ctx_pct null → 자기보고 경로.
         let cleared = json!({"usage": {"ctx_pct": null, "source": "transcript:heuristic:stale"},
                              "status": {"context_pct": 40, "age_secs": 5}});
         assert_eq!(ctx_cell(&cleared), "40%~");
+        // ⑦ 종료 좌석(exited=true) — 데몬 수집기(usage.rs collect_tick)는 exited 좌석을 건너뛰어 usage 가
+        //    마지막 값에 동결된다. 동결 실측 82(자기보고 70 신선)를 산 값으로 읽지 않는다 → "?"(판정 불가).
+        let exited = json!({"exited": true, "usage": {"ctx_pct": 82},
+                            "status": {"context_pct": 70, "age_secs": 1}});
+        assert_eq!(ctx_cell(&exited), "?");
+        // 음성 대조 — exited 가 false/null/부재면 게이트가 열리지 않는다(구버전 데몬 페이로드 무해).
+        assert_eq!(ctx_cell(&json!({"exited": false, "usage": {"ctx_pct": 82}})), "82%");
+        assert_eq!(ctx_cell(&json!({"exited": null, "usage": {"ctx_pct": 82}})), "82%");
+        assert_eq!(ctx_cell(&json!({"usage": {"ctx_pct": 82}})), "82%");
+        // ⑧ 에이전트 사망(agent_alive=false · pane 은 살아 exited=false) — 워치독이 확정한 사망. 동결 실측 82 →
+        //    "?"(판정 불가). 음성 대조 — agent_alive 가 null/부재/true 면 게이트가 열리지 않는다(null = 모른다).
+        let dead = json!({"exited": false, "agent_alive": false, "usage": {"ctx_pct": 82},
+                          "status": {"context_pct": 70, "age_secs": 1}});
+        assert_eq!(ctx_cell(&dead), "?");
+        assert_eq!(ctx_cell(&json!({"agent_alive": null, "usage": {"ctx_pct": 82}})), "82%");
+        assert_eq!(ctx_cell(&json!({"exited": false, "usage": {"ctx_pct": 82}})), "82%");
+        assert_eq!(ctx_cell(&json!({"agent_alive": true, "usage": {"ctx_pct": 82}})), "82%");
     }
 
     /// ★WP6-1 소스 대조 핀: CTX 칸 산출은 팩의 정본 선택기(`pick_ctx`)와 같은 규칙을 **헬퍼 하나**로

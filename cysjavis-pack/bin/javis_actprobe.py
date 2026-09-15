@@ -452,6 +452,14 @@ def _find_surface(data, ref):
     return None
 
 
+def _nonneg_float(text):
+    """자원 게이트와 같은 유한·비음수 임계 계약."""
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("threshold must be finite and nonnegative")
+    return value
+
+
 def probe_ctx_compare(args):
     """자기보고 ctx% 맹신 차단(…false_clear_threshold, …semantic_contract).
 
@@ -461,6 +469,15 @@ def probe_ctx_compare(args):
     """
     # 두 값 반환 계약은 유지하고, 같은 판독의 진단 필드를 main 영수증으로 전달한다.
     args.ctx_compare_fields = dict(diff=None, measured=None, reported=None, usage_source=None)
+    # argparse에서 변환하면 영수증 기록 전에 종료된다. 무효 env/인자는 여기서 exit 3으로 접는다.
+    try:
+        args.threshold = _nonneg_float(args.threshold)
+    except (TypeError, ValueError, OverflowError):
+        code = "threshold_env_invalid"
+        reason = "%s: threshold must be finite and nonnegative" % code
+        # javis_mission ENV_ANOMALIES와 같은 (코드, 사유) 기록 형식.
+        args.ctx_compare_fields.update(reason_code=code, anomalies=[(code, reason)])
+        return EXIT_INDET, reason
     try:
         data = _load_status(args)
     except (_ReadError, subprocess.SubprocessError) as e:
@@ -571,7 +588,7 @@ def build_parser():
 
     c = sub.add_parser("ctx-compare", parents=[common], help="실측/자기보고 ctx-pct 대조")
     c.add_argument("--surface", required=True)
-    c.add_argument("--threshold", type=float,
+    c.add_argument("--threshold",
                    default=os.environ.get("CYS_CTX_DIVERGENCE_PCT", 8.0))
     c.add_argument("--status-file", help="주입 status --json 파일")
 

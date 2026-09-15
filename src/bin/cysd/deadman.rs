@@ -50,7 +50,18 @@ pub fn heartbeat_stale(path: &Path, threshold: Duration) -> bool {
         //   종전 `unwrap_or(false)` 는 이 칸만 fail-open 이라 독 코멘트("조회 실패 = stale")와
         //   어긋났고, 무응답(hung) 홀더가 Healthy 로 읽혀 회수가 영영 안 됐다.
         //   실패 방향: 못 재면 **stale 쪽**. 산 데몬은 `judge_holder` 가 `responded` 를 먼저 보므로
-        //   이 값이 true 여도 오살되지 않는다(진리표 `Some(_) if responded => Healthy` 선행).
+        //   이 값이 true 여도 **응답하는 한** 오살되지 않는다(진리표 `Some(_) if responded => Healthy`
+        //   선행).
+        //   ★킬 창(정직 · 적대 리뷰 2026-09-15): 그 `responded` 는 main.rs 의 `probe_holder`
+        //   **단발 1회 · PROBE_TIMEOUT 2s** 값이다(재시도는 try_flock 에만 붙는다). 따라서 산 홀더가
+        //   SIGTERM→SIGKILL 대상이 되는 정확한 창은
+        //     [무응답 = 단발 2s 프로브 실패(부하·락 경합 등 일시 지연 포함)] × [미래 mtime]
+        //   이다. 종전(fail-open)에는 이 칸에서 신참이 그냥 exit 했으니, 이 수리는 "hung 홀더 영구
+        //   wedge" 를 없애는 대가로 "일시 무응답 산 홀더 오살" 가능성을 딱 이 창만큼 연다. 미래 mtime
+        //   은 heartbeat 신선도 증거를 통째로 버리므로(1초 전에 touch 했어도 stale) 이 창에서는 45s
+        //   임계가 보호를 못 하고 프로브 하나만 남는다. 로직은 그대로 둔다(WP-2-A 수리 유지 · §0-B ①).
+        //   다음 라운드로 미룬 완화 두 가지: ⓐ 회수 전 프로브 2차 시도, ⓑ "미래 skew > 임계" 만
+        //   stale 로 접기(임계 이하의 작은 역행은 신선으로 간주).
         Ok(mtime) => mtime.elapsed().map(|e| e > threshold).unwrap_or(true),
         Err(_) => true,
     }
@@ -344,7 +355,10 @@ mod tests {
             HolderVerdict::Dead,
             "무응답 + 미래 mtime 홀더는 Dead 여야 회수가 발화한다"
         );
-        // 산 데몬 무오살 핀: 같은 stale 값이라도 소켓에 응답하면 Healthy 다(진리표 선행 매치).
+        // 응답 홀더 무오살 핀: 같은 stale 값이라도 소켓에 응답하면 Healthy 다(진리표 선행 매치).
+        //   ★이 핀이 덮는 범위는 "응답한 홀더" 뿐이다 — `responded` 는 단발 2s 프로브 값이라,
+        //   [단발 프로브 실패] × [미래 mtime] 인 **산** 홀더는 이 단언이 아니라 바로 위 Dead 단언 쪽에
+        //   떨어진다(킬 창 · `heartbeat_stale` 의 `unwrap_or(true)` 주석 참조). "오살 없음" 이 아니다.
         assert_eq!(
             judge_holder(Some(9), true, heartbeat_stale(&hb, Duration::from_secs(45))),
             HolderVerdict::Healthy,
