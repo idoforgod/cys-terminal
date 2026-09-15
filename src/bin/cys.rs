@@ -6897,13 +6897,32 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         let mut removed = 0usize;
         let mut fail = 0usize;
         let mut skipped = 0usize;
+        let mut unmeasurable = 0usize;
         for p in &residue {
             // L5: 진행중(최근 N초 내 수정) staging은 삭제하지 않는다 — 무중단 배포/init 도중
-            // 스테이징을 파괴해 배포를 깨는 것을 방지(mtime 미상=보수적으로 삭제 진행).
+            // 스테이징을 파괴해 배포를 깨는 것을 방지.
+            // ★mtime 미상(= idle 측정 실패)도 **보호**한다 — 설계 결정 변경.
+            //   종전(d422e0b)은 mtime 미상=삭제 진행이었다. 2026-09-15 결정: 측정 불능은 통과가
+            //   아니다(CLAUDE.md §8) · 비가역 삭제는 denylist(설계 명제 ⑩). 측정 불능에서 파괴를
+            //   진행하는 것은 보수적이 아니다 — 보수적인 쪽은 지우지 않고 다음 라운드로 미루는 것이다.
+            //   (`staging_idle_secs` 는 metadata/modified 실패, 그리고 **미래 mtime**(시계 역행·
+            //    타임스탬프 보존 복원)에서 None 을 낸다.) 진행중 보호(skipped)와 따로 센다(unmeasurable)
+            //   — 운영자가 "아직 쓰는 중"과 "잴 수 없음"을 doctor 출력에서 구별하도록.
+            //   실패 방향: 못 재면 보호(skip) 쪽 — 잔재는 다음 라운드/보호 off(env=0)로 넘긴다.
+            //   `protect == 0`(보호 off)이면 바깥 if 가 건너뛰어 종전처럼 항상 삭제한다.
             let protect = staging_protect_secs();
-            if protect > 0 && staging_idle_secs(p).map(|s| s < protect).unwrap_or(false) {
-                skipped += 1;
-                continue;
+            if protect > 0 {
+                match staging_idle_secs(p) {
+                    None => {
+                        unmeasurable += 1;
+                        continue;
+                    }
+                    Some(s) if s < protect => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
             if std::fs::remove_dir_all(p).is_ok() {
                 removed += 1;
@@ -6913,16 +6932,21 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         }
         DiagItem {
             name: "staging-residue",
-            status: if fail == 0 && skipped == 0 {
+            status: if fail == 0 && skipped == 0 && unmeasurable == 0 {
                 DiagStatus::Ok
             } else {
                 DiagStatus::Warn
             },
             detail: format!("staging 잔재 {}건", residue.len()),
             action: format!(
-                "{removed}건 정리{}{}",
+                "{removed}건 정리{}{}{}",
                 if skipped > 0 {
                     format!(", {skipped}건 진행중 보호")
+                } else {
+                    String::new()
+                },
+                if unmeasurable > 0 {
+                    format!(", {unmeasurable}건 측정불능 보호(mtime 미상·미래)")
                 } else {
                     String::new()
                 },
@@ -26641,6 +26665,49 @@ mod tests {
         assert_eq!(d.status, DiagStatus::Warn, "진행중 staging은 보호되어 WARN: {}", d.action);
         assert!(base.join(".pack-staging").exists(), "진행중 staging은 삭제되지 않는다");
         assert!(d.action.contains("진행중 보호"), "보호 사유 보고: {}", d.action);
+        let _ = std::fs::remove_dir_all(&base);
+        // _env drop → 이전 값 복원.
+    }
+
+    /// L5 보호 가드의 **측정 실패** 갈래 — idle 을 못 재면 삭제가 아니라 skip 이어야 한다.
+    /// 발동 조건(미래 mtime)을 실제로 주입해서 잰다: staging 안 엔트리의 mtime 이 미래이면
+    /// `newest.elapsed()` 가 Err → `staging_idle_secs` = None → 종전 코드(d422e0b)는 remove_dir_all 로 갔다.
+    /// 실패 방향: 못 재면 보호(skip) 쪽 — 진행중 보호와 따로 "측정불능 보호"로 보고한다.
+    #[test]
+    fn doctor_staging_residue_skips_when_idle_unmeasurable() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "60"); // 보호 on(기본값)
+        let base = std::env::temp_dir().join(format!("cys-doc-stg-unmeas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        let stg = base.join(".pack-staging");
+        std::fs::create_dir_all(&stg).unwrap();
+        let marker = stg.join("payload");
+        std::fs::write(&marker, "in-progress").unwrap();
+        // 발동 조건 주입: 엔트리 mtime 을 미래로 → newest.elapsed() = Err.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+        // ★양성 대조 — 측정이 실제로 실패하는지 먼저 못박는다(아니면 이 검체는 아무것도 안 잰다).
+        assert_eq!(
+            staging_idle_secs(&stg),
+            None,
+            "미래 mtime 이면 idle 측정이 None 이어야 검체가 성립한다"
+        );
+
+        let d = diag_staging_residue(&ctx, true);
+        assert!(
+            stg.exists(),
+            "idle 측정 불능이면 삭제하지 않는다 — 측정 실패가 파괴로 미끄러졌다: {}",
+            d.action
+        );
+        assert_eq!(d.status, DiagStatus::Warn, "보호로 남은 잔재는 WARN: {}", d.action);
+        assert!(d.action.contains("측정불능 보호"), "측정불능 보호 사유 보고: {}", d.action);
         let _ = std::fs::remove_dir_all(&base);
         // _env drop → 이전 값 복원.
     }
