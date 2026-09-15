@@ -42,6 +42,29 @@ RE_DONE = re.compile(r"- \[[xX]\]")
 RE_OPEN = re.compile(r"- \[ \]")
 IDLE_ALERT_SECS = 300  # 절대지침 B3: idle 5분+ 즉시 조치 대상
 
+# ── CTX 축 선택 — 단일 정의(★WP6-2 · javis_report_gate 가 import 한다 · 중복 정의 금지) ──────
+# 정본 규칙은 javis_hud_bridge.pick_ctx 와 같다: 실측(usage.ctx_pct) > 자기보고(status.context_pct).
+# 자기보고는 **신선할 때만**(마지막 set-status 후 CTX_SELF_REPORT_MAX_AGE_S 이내) 보조 축이다 —
+# 값 자체에 유효기간이 없어 낡아도 그대로 남기 때문이다(handlers.rs status.set 은 상한만 자른다).
+# ⚠결측은 None 이지 0 이 아니다 — 0 으로 접으면 신고 없는 좌석(부팅 직후·죽은 좌석·agy)이
+#   "0%" 로 위장돼 60% 목록에서 조용히 빠진다.
+# ★실패 방향: 못 재면 목록에서 **빠진다**(경보 없음) — 0% 로 위장하지 않는다.
+# ★같은 수 300 이 세 언어에 흩어져 있다 — Rust(WP6-1 CTX_SELF_REPORT_MAX_AGE_SECS) ·
+#   TS(ui/src/ctxpick.ts CTX_SELF_REPORT_MAX_AGE_SECS) · 여기. 바꿀 때는 셋을 함께 고쳐라.
+CTX_SELF_REPORT_MAX_AGE_S = 300
+
+
+def pick_node_ctx(n):
+    """(pct, src) — 실측 > 자기보고(신선할 때만). 결측은 None 이며 0 이 아니다."""
+    m = n.get("usage_ctx_pct")
+    if isinstance(m, (int, float)):
+        return m, "measured"
+    s = n.get("context_pct")
+    age = n.get("status_age_secs")
+    if isinstance(s, (int, float)) and isinstance(age, int) and age <= CTX_SELF_REPORT_MAX_AGE_S:
+        return s, "self"
+    return None, "none"
+
 # ── 유령 todo 차단 (2026-07-26 결함 · 공유 폴더 유산 파일이 현재 편대 모수로 유입) ──
 # 근거: cwd/_round 스캔은 "cwd의 _round는 현재 편대 소유"를 가정하나, 역사 있는 공유 프로젝트
 # 폴더에서는 깨진다(07-11~07-20 종결 레인의 todo 4건이 07-26 편대 집계에 유입·301항목 오염).
@@ -795,6 +818,11 @@ def build_report(status, extra_dirs, now=None, sampled_at=None):
                 "agent_alive": s.get("agent_alive"),
                 "status_age_secs": age_secs if isinstance(age_secs, int) else None,
                 "usage_ctx_tokens": ctx_tokens if isinstance(ctx_tokens, int) else None,
+                # ★WP6-2 실측 축(정본) — javis_hud_bridge.pick_ctx 와 같은 규칙. 60% 판정은 이 값으로
+                #   한다(pick_node_ctx). 가산 키 — 기존 키·의미 무변(live_nodes 소비자가 gate 만이 아닐 수
+                #   있고, "비어 있으면 키를 넣지 않는다" 규율은 여기 적용되지 않는다: 이 엔트리는 종전부터
+                #   결측을 None 값으로 싣는 형태다). 미측정은 반드시 None 이다(0 으로 접지 않는다).
+                "usage_ctx_pct": us.get("ctx_pct") if isinstance(us.get("ctx_pct"), (int, float)) else None,
             }
             live_nodes.append(entry)
             if isinstance(idle_secs, int) and idle_secs >= IDLE_ALERT_SECS and s.get("agent_alive"):
@@ -967,10 +995,16 @@ def render_text(rep):
         if rep["idle_nodes"]:
             roles = ", ".join(n["role"] for n in rep["idle_nodes"])
             lines.append("  • ⚠ idle 5분+ 노드: %s — read-screen 확인·재지시 필요" % roles)
-        high_ctx = [n for n in rep["live_nodes"]
-                    if isinstance(n.get("context_pct"), int) and n["context_pct"] >= 60]
+        # ★WP6-2 — 60% 판정은 pick_node_ctx 한 벌(실측 > 신선한 자기보고 · 결측 None). 출처를 같이 찍는다.
+        #   낡은 자기보고가 더 이상 60% 를 못 울리므로 경보가 **줄 수 있다** — 의도한 감소다.
+        high_ctx = []
+        for n in rep["live_nodes"]:
+            p, src = pick_node_ctx(n)
+            if p is not None and p >= 60:
+                high_ctx.append((n, p, src))
         if high_ctx:
-            roles = ", ".join("%s(%d%%)" % (n["role"], n["context_pct"]) for n in high_ctx)
+            roles = ", ".join("%s(%d%% %s)" % (n["role"], p, "실측" if src == "measured" else "추정")
+                              for n, p, src in high_ctx)
             lines.append("  • ⚠ 컨텍스트 60%%+ 노드: %s — cycle-agent 집행 검토" % roles)
     return "\n".join(lines)
 

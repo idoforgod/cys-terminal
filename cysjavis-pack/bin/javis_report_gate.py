@@ -74,6 +74,15 @@ try:
     import javis_boot_node as _bn
 except Exception as _e:                       # noqa: BLE001
     _bn, _BOOTNODE_IMPORT_ERR = None, str(_e)[:120]
+#   javis_report.pick_node_ctx : ★WP6-2 CTX 축 선택(실측 > 신선한 자기보고 · 결측 None) — 정의는
+#     산출기에 **한 벌만** 두고 여기서는 소비만 한다(60% 판정선이 소비처마다 갈리던 결함의 재발 금지).
+#     부재(팩 부분갱신 스큐)는 판정 불가 = 컨텍스트 경보 **없음**이며 대장 reasons 에
+#     `report_module_missing` 으로 드러난다(조용한 접힘 금지 · 0% 위장 금지).
+_REPORT_IMPORT_ERR = None
+try:
+    from javis_report import pick_node_ctx as _pick_node_ctx
+except Exception as _e:                       # noqa: BLE001
+    _pick_node_ctx, _REPORT_IMPORT_ERR = None, str(_e)[:120]
 
 # javis_report.py IDLE_ALERT_SECS와 동일(절대지침 B3: idle 5분+). 자기보고가 아닌 데몬 실측
 # idle_secs로만 판정한다(memory: stale self-report 함정). 여기 재정의(수집 실패 시에도 상수 필요).
@@ -124,6 +133,9 @@ BLACKLIST_KEYS = frozenset({
     "idle_secs", "age_secs", "ts", "timestamp", "collected_at", "generated_at",
     "now", "uptime_secs", "last_seen", "seen_at", "mtime", "updated_at",
     "sampled_at", "status_age_secs", "usage_ctx_tokens",
+    # ★WP6-2: `usage_ctx_pct` 는 `usage_ctx_tokens` 의 백분율 파생값이라 같은 이유로 제외한다
+    #   (60% 판정은 정규화 '전' 원문 live_nodes 에서 하므로 감지 능력은 손실되지 않는다).
+    "usage_ctx_pct",
 })
 
 VERDICT_WARN, VERDICT_DELTA, VERDICT_QUIET, VERDICT_NOCHG = "WARN", "DELTA", "QUIET", "NOCHG"
@@ -978,17 +990,25 @@ def extract_warnings(report, counters=None, now=0, edge_cooldown=EDGE_COOLDOWN_S
                 "stamp": stamp,
             }))
 
-    high = [n for n in (report.get("live_nodes") or [])
-            if isinstance(n.get("context_pct"), int) and n["context_pct"] >= 60]
+    # ★WP6-2 — 60% 판정선은 javis_report.pick_node_ctx 한 벌(실측 > 신선한 자기보고 · 결측 None).
+    #   낡은 자기보고가 더 이상 60% 를 못 울리므로 경보가 **줄 수 있다** — 의도한 감소다(회귀 아님).
+    #   헬퍼 부재는 판정 불가 = 경보 없음(위 import 주석 · reasons `report_module_missing`).
+    high = []
+    if _pick_node_ctx is not None:
+        for n in (report.get("live_nodes") or []):
+            p, src = _pick_node_ctx(n)
+            if p is not None and p >= 60:
+                high.append((n, p, src))
     if high:
-        roles = ",".join("%s(%d%%)" % (n.get("role", "?"), n["context_pct"]) for n in high)
+        roles = ",".join("%s(%d%% %s)" % (n.get("role", "?"), p, "실측" if src == "measured" else "추정")
+                         for n, p, src in high)
         warns.append(apply_policy({
             "trigger": "context",
             "task": "gate-context",
             "reason": "ctx_60:%s" % roles,
             "wake_body": "[gate] context: %s 컨텍스트 60%%+ — cycle-agent 집행 검토.%s" % (roles, tail),
             "evt_type": None, "evt_fields": None,
-            "idem": "gate-context-%s" % ",".join(n.get("role", "?") for n in high),
+            "idem": "gate-context-%s" % ",".join(n.get("role", "?") for n, _p, _s in high),
         }))
     feed = report.get("feed_pending")
     if isinstance(feed, int) and feed > 0:
@@ -1935,6 +1955,8 @@ class Gate:
             reasons.append("lock_module_missing")
         if _BOOTNODE_IMPORT_ERR:
             reasons.append("bootnode_module_missing")
+        if _REPORT_IMPORT_ERR:                # ★WP6-2 — CTX 헬퍼 부재 = 컨텍스트 경보 판정 불가
+            reasons.append("report_module_missing")
 
         # 수집 실패 = **대장+배지**(설계 §1-B N6a: push 0, 정상 state ledger `collect_fail`).
         # 종전에는 여기서 WARN push 가 나갔다 — 데몬이 잠깐 없을 때마다 master 를 두드리던 경로다.

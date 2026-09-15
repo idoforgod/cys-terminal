@@ -48,6 +48,7 @@ import {
   type ResetResult,
 } from "./resetconfirm";
 import { ccEffectiveZoom } from "./ccscale";
+import { pickCtx, isHotCtx } from "./ctxpick";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
@@ -955,10 +956,20 @@ function taskRow(s: any, deptKey: string): string {
     ? `<span class="cc-trust-badge self" title="노드가 cys set-status로 직접 보고한 상태">📍자기보고</span>`
     : `<span class="cc-trust-badge derived" title="출력 활동에서 데몬이 추정한 상태(자기보고 없음)">⚙파생</span>`;
   const task = selfReport && st.task ? String(st.task) : "(업무 미보고)";
+  // ★WP6-2 — 막대 값은 pickCtx 한 벌(실측 usage.ctx_pct > 신선한 자기보고 · 결측 null). 종전에는 자기보고
+  //   전용이라 실측이 있어도 자기보고가 없으면 막대가 비었고, 낡은 자기보고를 그대로 그렸다.
+  //   자기보고(src === "self")일 때만 추정 표식(≈ + 툴팁)을 단다. 색상 임계 60/80 은 불변.
+  //   실측 없음 + 자기보고 낡음/나이 미상(src === "stale")은 막대를 **없애지 않고** 값 자리에 `?` 를 그린다 —
+  //   오너 원칙 "없으면 없다고 표시하고 그 사실이 보이게 하라". 색상 중립(임계 미적용) · 판정(isHotCtx)은 false.
+  //   자기보고도 실측도 없는 노드(src === "none")만 종전대로 빈 칸이다.
+  const { pct: ctxPct, src: ctxSrc } = pickCtx(s);
+  const ctxEst = ctxSrc === "self";
   const ctx =
-    selfReport && st.context_pct != null
-      ? `<span class="cc-tbar" style="max-width:130px"><span class="cc-tbar-track"><span class="cc-tbar-fill ${st.context_pct >= 80 ? "crit" : st.context_pct >= 60 ? "warn" : ""}" style="width:${Math.min(100, st.context_pct)}%"></span></span><span class="cc-tbar-pct">${st.context_pct}%</span></span>`
-      : "";
+    ctxPct != null
+      ? `<span class="cc-tbar" style="max-width:130px"${ctxEst ? ' title="노드 자기보고(추정)"' : ""}><span class="cc-tbar-track"><span class="cc-tbar-fill ${ctxPct >= 80 ? "crit" : ctxPct >= 60 ? "warn" : ""}" style="width:${Math.min(100, ctxPct)}%"></span></span><span class="cc-tbar-pct">${ctxEst ? "≈" : ""}${ctxPct}%</span></span>`
+      : ctxSrc === "stale"
+        ? `<span class="cc-tbar" style="max-width:130px" title="컨텍스트 판정 불가 — 실측 없음 · 자기보고 낡음/나이 미상"><span class="cc-tbar-track"><span class="cc-tbar-fill" style="width:0%"></span></span><span class="cc-tbar-pct" style="color:#94a3b8">?</span></span>`
+        : "";
   const age = selfReport ? ccAge(st.age_secs ?? 0) : `idle ${s.idle_secs ?? 0}s`;
   const stale = selfReport && (st.age_secs ?? 0) > 120 ? " stale" : "";
   return (
@@ -3505,7 +3516,7 @@ async function refreshSidebarStatus() {
         nodeSig.set(`${sock}#${n.surface_id}`, {
           role: n.role,
           state: n.status?.state ?? (n.idle_secs > 60 ? "idle" : "working"),
-          ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
+          ctx_pct: pickCtx(n).pct, // ★WP6-2 실측 > 신선한 자기보고 · 결측 null(종전은 자기보고 우선 = 정본 역순)
           idle_secs: n.idle_secs,
           agent_alive: n.agent_alive,
         });
@@ -5532,6 +5543,7 @@ interface OrgSurface {
   agent: string | null;
   agent_alive: boolean | null;
   status: { state: string; context_pct: number | null; task: string | null; age_secs: number } | null;
+  usage?: { ctx_pct: number | null } | null; // ★WP6-2 데몬 실측(org.status "usage" 키) — pickCtx 가 status 보다 먼저 읽는다
 }
 
 // 쿼리 문자가 순서대로 부분 등장하면 매치. 점수 = 연속 매치 보너스 + 시작 보너스(낮을수록 우위는 -로 정렬).
@@ -5607,7 +5619,7 @@ function cycleHotNodes(hot: OrgSurface[], socket?: string) {
   const s = hot[hotCycleCursor % hot.length];
   hotCycleCursor++;
   jumpToSurface(s.surface_id, socket);
-  toast("feed", "60% cycle", `${s.role} · ctx ${s.status?.context_pct}% (${hotCycleCursor % hot.length || hot.length}/${hot.length})`);
+  toast("feed", "60% cycle", `${s.role} · ctx ${pickCtx(s).pct}% (${hotCycleCursor % hot.length || hot.length}/${hot.length})`); // ★WP6-2 같은 축
 }
 
 // 재기동: role의 첫 surface로 명령+개행 주입(send_input human=true 재사용, data에 "\n"으로 원자 제출 — 계약 변경 금지).
@@ -5670,7 +5682,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   // ── (1) 노드 점프 행 ──
   for (const s of org.surfaces ?? []) {
     const role = s.role ?? "";
-    const ctx = s.status?.context_pct;
+    const ctx = pickCtx(s).pct; // ★WP6-2 실측 > 신선한 자기보고 · 결측 null
     const label = `${role || "(no role)"} · ${s.title ?? s.surface_ref}`;
     const sub =
       `${s.surface_ref} · idle ${s.idle_secs}s` +
@@ -5686,12 +5698,14 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   }
 
   // ── (2) 60% 노드 cycle ──
-  const hot = (org.surfaces ?? []).filter((s) => (s.status?.context_pct ?? 0) >= 60);
+  // ★WP6-2 — 종전의 `?? 0` 폴백은 자기보고 결측을 0 으로 접어 신고 없는 좌석을 목록에서 조용히 뺐다.
+  //   isHotCtx 는 결측=false(판정 불가)이고 실측을 자기보고보다 먼저 본다.
+  const hot = (org.surfaces ?? []).filter((s) => isHotCtx(s));
   if (hot.length > 0) {
     items.push({
       id: "act:cycle-60",
       title: `60% 노드 cycle (${hot.length})`,
-      subtitle: hot.map((s) => `${s.role}·${s.status?.context_pct}%`).join(", "),
+      subtitle: hot.map((s) => `${s.role}·${pickCtx(s).pct}%`).join(", "),
       keywords: "cycle context 60 hot 컨텍스트 순환",
       action: () => cycleHotNodes(hot, sock),
     });
@@ -6708,8 +6722,12 @@ function onDaemonEvent(event: Record<string, unknown>) {
   }
   if (name === "context.threshold") {
     toast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
-    if (Number(payload.context_pct ?? 0) >= 80)
-      osBanner(`🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
+    // ★WP6-2 — 결측을 0 으로 접지 않는다. 이 페이로드는 데몬 에지 게이트(handlers.rs maybe_fire_context_threshold)가
+    //   임계 교차를 이미 판정한 **단일값**(+source)이라 usage/status 축이 없어 pickCtx 대상이 아니다.
+    //   숫자가 아니면 배너를 안 띄운다(판정 불가 = 무발화 · "0%" 위장 없음). 80 임계는 불변.
+    const evPct = payload.context_pct;
+    if (typeof evPct === "number" && evPct >= 80)
+      osBanner(`🔋 컨텍스트 ${evPct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
     refreshSidebarStatus();
     return;
   }
