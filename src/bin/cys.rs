@@ -3699,7 +3699,12 @@ fn run(command: Command) -> i32 {
             return match request("system.gate_check", json!({})) {
                 Ok(r) => {
                     if r["paused"].as_bool() == Some(true) {
-                        println!("PAUSED (reason: {})", r["reason"].as_str().unwrap_or(""));
+                        // 실패 방향: 사유 부재·공백은 미기재로 표시하고 PAUSED 종료 코드 4 는 유지한다.
+                        let why = r["reason"]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or("(사유 미기재)");
+                        println!("PAUSED (reason: {why})");
                         4
                     } else {
                         println!("running");
@@ -16417,6 +16422,41 @@ fn run_drain_verify(timeout: u64) -> i32 {
     }
 }
 
+/// 자기보고 `status.context_pct` 를 값으로 인정하는 최대 나이(초). **새 매직넘버**다 —
+/// WP6-2 의 파이썬 소비자와 **같은 값**을 써야 두 화면이 또 갈라지지 않는다.
+/// (env 오버라이드를 붙인다면 이름은 `CYS_USAGE_MAX_SESSION_AGE_SECS` 관례를 따른다.)
+const CTX_SELF_REPORT_MAX_AGE_SECS: u64 = 300;
+
+/// CTX 칸 문자열 — 정본 규칙은 `cysjavis-pack/bin/javis_hud_bridge.py` 의 `def pick_ctx(node):`
+/// (실측 usage.ctx_pct > 자기보고 status.context_pct)와 **같다**. 두 화면이 다른 숫자를
+/// 내면 그것만으로 60% 판정이 갈린다.
+///   · 실측 있음        → "78%"      (데몬이 잰 값 · 표식 없음)
+///   · 자기보고만 신선   → "78%~"     (~ = 자기보고 · 추정치라는 표식)
+///   · 자기보고가 낡음   → "?"        (판정 불가 — 낡은 추정을 값으로 위장하지 않는다)
+///   · 둘 다 없음        → "-"        (agy/gemini 는 ctx_pct=None 이라 여기 온다)
+/// 실측이 stale 이면 데몬이 이미 ctx_pct 를 None 으로 지운다(cysd/usage.rs:426-439) —
+/// 그래서 여기서 실측의 나이를 다시 볼 필요는 없다.
+///
+/// 실패 방향(분기마다 한 줄):
+///   · 실측 분기 — 실측이 stale·결측이면 값이 아니라 **아래 자기보고 폴백**으로 내려간다
+///     (구버전 데몬으로 `usage` 키 자체가 없어도 같은 폴백 · 무해 · 제거 금지).
+///   · 자기보고 분기 — `age_secs` 가 상한을 넘거나 **결측**이면 `?`(판정 불가)로 무너진다.
+///     결측은 "모른다"이지 "방금"이 아니다 — 값(`~`) 쪽으로 접지 않는다.
+///   · 둘 다 없음 — `-`. 값이 아니므로 60% 임계 판정의 입력이 되지 않는다.
+fn ctx_cell(s: &serde_json::Value) -> String {
+    if let Some(v) = s["usage"]["ctx_pct"].as_u64() {
+        return format!("{v}%");
+    }
+    let Some(v) = s["status"]["context_pct"].as_u64() else {
+        return "-".into();
+    };
+    // age_secs 결측은 "모른다"이지 "방금"이 아니다 — 결측이면 판정 불가로 접는다.
+    match s["status"]["age_secs"].as_u64() {
+        Some(a) if a <= CTX_SELF_REPORT_MAX_AGE_SECS => format!("{v}%~"),
+        _ => "?".into(),
+    }
+}
+
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
 /// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다. 도달불가 부서는 표기.
 fn run_fleet(as_json: bool) -> i32 {
@@ -16481,17 +16521,14 @@ fn run_fleet(as_json: bool) -> i32 {
             } else {
                 s["status"]["state"].as_str().unwrap_or("·파생")
             };
-            let ctx = s["status"]["context_pct"]
-                .as_u64()
-                .map(|v| format!("{v}%"))
-                .unwrap_or_else(|| "-".into());
+            let ctx = ctx_cell(&s);
             let task = s["status"]["task"]
                 .as_str()
                 .filter(|t| !t.is_empty())
                 .or_else(|| s["title"].as_str())
                 .unwrap_or("(업무 미보고)");
             println!(
-                "   {:<14} {:<9} {:>4}  {}",
+                "   {:<14} {:<9} {:>5}  {}",
                 role,
                 state,
                 ctx,
@@ -16515,13 +16552,26 @@ fn run_status(as_json: bool) -> i32 {
         return 0;
     }
     if r["paused"].as_bool() == Some(true) {
+        // 실패 방향: 설정자를 못 읽으면 미상으로 표시하며 PAUSED 사실을 숨기지 않는다.
+        let who = match (
+            r["pause_info"]["actor_role"].as_str(),
+            r["pause_info"]["actor_pid"].as_u64(),
+        ) {
+            (Some(role), Some(pid)) => format!("설정자 {role}(pid {pid})"),
+            (None, Some(pid)) => format!("설정자 pid {pid}"),
+            _ => "설정자 미상".to_string(),
+        };
+        // 실패 방향: 사유 부재·공백은 미기재로 표시하며 빈 값을 사유로 제시하지 않는다.
+        let why = r["pause_info"]["reason"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("(사유 미기재)");
         println!(
-            "⛔ PAUSED — {} (cys resume로 해제; 큐·스케줄 동결 중, 실행 중 에이전트 행동은 계속)",
-            r["pause_info"]["reason"].as_str().unwrap_or("")
+            "⛔ PAUSED — {why} · {who} (cys resume로 해제; 큐·스케줄 동결 중, 실행 중 에이전트 행동은 계속)"
         );
     }
     let header = format!(
-        "{:<14} {:<12} {:<8} {:<9} {:>4} {:>7} {:>5}  {}",
+        "{:<14} {:<12} {:<8} {:<9} {:>5} {:>7} {:>5}  {}",
         "ROLE", "SURFACE", "AGENT", "STATE", "CTX", "IDLE", "QUEUE", "TASK/TITLE"
     );
     println!("{header}");
@@ -16534,10 +16584,7 @@ fn run_status(as_json: bool) -> i32 {
         } else {
             s["status"]["state"].as_str().unwrap_or("-").to_string()
         };
-        let ctx = s["status"]["context_pct"]
-            .as_u64()
-            .map(|v| format!("{v}%"))
-            .unwrap_or_else(|| "-".into());
+        let ctx = ctx_cell(&s);
         let task = s["status"]["task"]
             .as_str()
             .filter(|t| !t.is_empty())
@@ -16549,7 +16596,7 @@ fn run_status(as_json: bool) -> i32 {
             s["queue_depth"].as_u64().unwrap_or(0).to_string()
         };
         println!(
-            "{:<14} {:<12} {:<8} {:<9} {:>4} {:>7} {:>5}  {}",
+            "{:<14} {:<12} {:<8} {:<9} {:>5} {:>7} {:>5}  {}",
             s["role"].as_str().unwrap_or("-"),
             s["surface_ref"].as_str().unwrap_or("?"),
             s["agent"].as_str().unwrap_or("-"),
@@ -31090,5 +31137,50 @@ mod tests {
                 && !SEAT_IDENTITY_ENV_KEYS.contains(&"CYS_SOCKET"),
             "레인 결정 env 를 신원 목록에 넣었다 — 데몬이 짝 없는 팩으로 뜬다"
         );
+    }
+
+    /// ★WP6-1: CTX 칸은 **실측 우선**이고, 자기보고는 신선할 때만 값(`~` 표식)이다.
+    /// 실패 방향: 실측이 없고 자기보고가 낡거나 `age_secs` 가 결측이면 `?`(판정 불가)로
+    /// 무너진다 — 값 쪽으로 접히면 낡은 추정이 60% 임계 판정의 입력이 된다(그것이 이 검체가 막는 사고).
+    #[test]
+    fn ctx_cell_prefers_measured_and_degrades_stale_self_report() {
+        use serde_json::json;
+        // ① 실측이 있으면 자기보고가 아무리 커도 실측을 쓴다(9~16pt 괴리의 발동 조건 그 자체).
+        let both = json!({"usage": {"ctx_pct": 78},
+                          "status": {"context_pct": 95, "age_secs": 1}});
+        assert_eq!(ctx_cell(&both), "78%");
+        // ② 실측이 없고 자기보고가 신선하면 값 + 표식.
+        let fresh = json!({"usage": null, "status": {"context_pct": 61, "age_secs": 10}});
+        assert_eq!(ctx_cell(&fresh), "61%~");
+        // ③ 자기보고가 낡으면 값이 아니라 판정 불가 — 낡은 추정으로 60% 임계를 읽으면 안 된다.
+        let stale = json!({"usage": null, "status": {"context_pct": 61, "age_secs": 301}});
+        assert_eq!(ctx_cell(&stale), "?");
+        // ④ age_secs 결측 = "모른다" — "방금"으로 접지 않는다(결측은 값이 아니다).
+        let noage = json!({"usage": null, "status": {"context_pct": 61}});
+        assert_eq!(ctx_cell(&noage), "?");
+        // ⑤ 둘 다 없음(agy/gemini: usage.ctx_pct=None · 자기보고 없음) → "-".
+        assert_eq!(ctx_cell(&json!({"usage": {"ctx_pct": null}, "status": null})), "-");
+        // ⑥ 실측이 stale 로 지워진 형상(cysd/usage.rs:426-439) = ctx_pct null → 자기보고 경로.
+        let cleared = json!({"usage": {"ctx_pct": null, "source": "transcript:heuristic:stale"},
+                             "status": {"context_pct": 40, "age_secs": 5}});
+        assert_eq!(ctx_cell(&cleared), "40%~");
+    }
+
+    /// ★WP6-1 소스 대조 핀: CTX 칸 산출은 팩의 정본 선택기(`pick_ctx`)와 같은 규칙을 **헬퍼 하나**로
+    /// 쓴다. 실패 방향: 정본 규칙이 팩에서 사라지거나, CLI 표가 자기보고 전용 옛 형태로 되돌아가거나,
+    /// 두 자리 중 하나가 헬퍼를 우회하면 이 핀이 **먼저** 깨진다 — 두 구현이 조용히 갈라져 같은 좌석이
+    /// 두 화면에서 다른 숫자를 내는 것을 막는다(핀이 깨지면 빌드 실패 = fail-closed).
+    #[test]
+    fn ctx_column_uses_the_single_source_rule_from_the_pack() {
+        // 정본 규칙(pick_ctx)이 팩에서 사라지면 이 핀이 먼저 깨진다 — 두 구현이 조용히 갈라지는 것을 막는다.
+        let hud = include_str!("../../cysjavis-pack/bin/javis_hud_bridge.py");
+        assert!(hud.contains("def pick_ctx(node):"), "팩의 정본 ctx 선택기가 사라졌다");
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        // 옛 형태의 바늘은 조각으로 조립한다 — 이 검체 자체가 수용 기준 `git grep -c … → 0` 에 잡히지 않도록.
+        let old_form = ["let ctx = s[\"status\"]", "[\"context_pct\"]"].concat();
+        assert!(!prod.contains(&old_form), "CTX 열이 자기보고만 읽는 옛 형태로 되돌아갔다");
+        assert_eq!(prod.matches("ctx_cell(&s)").count(), 2,
+                   "CTX 칸 산출은 run_status·run_fleet 두 곳뿐이고 둘 다 헬퍼를 써야 한다");
     }
 }

@@ -2410,6 +2410,22 @@ mod dsr_tests {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PauseInfo {
+    pub since: f64,
+    /// 빈 문자열은 사유가 아니다 — 결측은 None 으로 남긴다.
+    /// 실패 방향: 결측 메타데이터는 JSON 키를 생략하며 kill-switch 동결은 유지한다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 설정자 — dispatch 의 caller_pid 와 그 pid 가 속한 좌석(있으면).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_surface: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_role: Option<String>,
+}
+
 pub struct Daemon {
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
@@ -2426,7 +2442,7 @@ pub struct Daemon {
     pub health_suppressed: Mutex<HashMap<(String, &'static str), u64>>,
     /// T4-15 kill-switch: pause 중에는 큐 배달·스케줄 발화가 동결된다 (직접 send는 통과)
     pub paused: AtomicBool,
-    pub pause_info: Mutex<Option<(f64, String)>>, // (since, reason)
+    pub pause_info: Mutex<Option<PauseInfo>>,
     /// T3-9 todo 워치: path → (done, total, mtime)
     pub todo_progress: Mutex<HashMap<String, (u64, u64, f64)>>,
     /// C2 선언 판정 캐시(Declared State): path → (mtime, verdict 케밥 문자열, 선언 owner).
@@ -3435,15 +3451,20 @@ impl Daemon {
             }
         }
         // T4-15 kill-switch 상태 복원 — 재부팅 후에도 pause는 유지된다 (명시 resume까지)
-        let pause_restored: Option<(f64, String)> = std::fs::read_to_string(dir.join("autopilot.json"))
+        let pause_restored: Option<PauseInfo> = std::fs::read_to_string(dir.join("autopilot.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .filter(|v| v["paused"].as_bool() == Some(true))
-            .map(|v| {
-                (
-                    v["since"].as_f64().unwrap_or_else(now_epoch),
-                    v["reason"].as_str().unwrap_or("").to_string(),
-                )
+            .map(|v| PauseInfo {
+                since: v["since"].as_f64().unwrap_or_else(now_epoch),
+                // 실패 방향: 구 포맷의 빈 사유·읽을 수 없는 설정자는 결측으로 복원하고 pause 는 유지한다.
+                reason: v["reason"]
+                    .as_str()
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty()),
+                actor_pid: v["actor_pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+                actor_surface: v["actor_surface"].as_u64(),
+                actor_role: v["actor_role"].as_str().map(str::to_string),
             });
         // ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 발급 — 소켓 listen 전(new 내부)에
         // 기동마다 재발급·덮어쓰기해 파일=메모리 정합을 데몬 재시작(churn)에도 유지한다. GUI(Tauri)가
@@ -5166,8 +5187,11 @@ impl Daemon {
             self.paused.load(Ordering::Relaxed),
             info,
         ) {
-            (true, Some((since, reason))) => {
-                json!({"paused": true, "since": since, "reason": reason})
+            (true, Some(p)) => {
+                // PauseInfo 의 결측 키 생략은 org.status·system.gate_check 와 같은 포맷이다.
+                let mut v = json!(p);
+                v["paused"] = json!(true);
+                v
             }
             _ => json!({"paused": false}),
         };

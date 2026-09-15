@@ -7220,8 +7220,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 &id,
                 json!({
                     "paused": daemon.paused.load(Ordering::Relaxed),
-                    "pause_info": pause_info.map(|(since, reason)|
-                        json!({"since": since, "reason": reason})),
+                    "pause_info": pause_info.map(|p| json!(p)),
                     "daemon": {"version": env!("CARGO_PKG_VERSION"),
                                "started_at": daemon.started_at,
                                "latest_seq": daemon.bus.latest_seq(),
@@ -7655,7 +7654,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 
         // ─── T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 = 신경 차단) ───
         "system.pause" => {
-            let reason = param_str(&params, "reason").unwrap_or_default();
+            // 실패 방향: 사유 부재·공백은 None 으로 기록하며 긴급 pause 요청은 수락한다.
+            let reason = param_str(&params, "reason")
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty());
             // ★(0.14.31 · 성찰 Q2 · 통합 2026-09-10) kill-switch 전이는 `set_paused` 하나로 간다.
             //   `paused.store(true)` 만 하면 **이미 결판을 기다리는 인계는 그대로 나간다** — 운영자가
             //   `cys pause` 응답을 손에 쥔 뒤에도 본문+CR 이 좌석에 꽂힌다는 뜻이다. `set_paused` 는
@@ -7664,8 +7666,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   **알 수 있다**(침묵하면 0 이라고 읽는다 — 결측은 값이 아니다).
             //   남는 창: 이미 CLAIMED/ACKED 인 쓰기(백로그 · writer fence).
             let still_writing = daemon.set_paused(true);
-            *daemon.pause_info.lock().unwrap() = Some((crate::state::now_epoch(), reason.clone()));
+            let since = crate::state::now_epoch();
+            // 실패 방향: 설정자 해소 실패는 정상 결측(None)이며 이미 건 동결과 caller_pid 는 보존한다.
+            let actor_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let actor_role = actor_surface
+                .and_then(|sid| daemon.get_surface(sid))
+                .and_then(|s| s.role.lock().unwrap().clone());
+            *daemon.pause_info.lock().unwrap() = Some(crate::state::PauseInfo {
+                since,
+                reason: reason.clone(),
+                actor_pid: caller_pid,
+                actor_surface,
+                actor_role,
+            });
             daemon.persist_pause();
+            // 이벤트는 reason 키를 유지하되 결측은 null 로 보낸다.
             daemon
                 .bus
                 .publish("autopilot.paused", "system", None, json!({"reason": reason}));
@@ -7692,12 +7707,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 
         "system.gate_check" => {
             let info = daemon.pause_info.lock().unwrap().clone();
-            Reply::Single(ok_response(
-                &id,
-                json!({"paused": daemon.paused.load(Ordering::Relaxed),
-                       "since": info.as_ref().map(|(s, _)| *s),
-                       "reason": info.map(|(_, r)| r)}),
-            ))
+            // 실패 방향: 정보가 없으면 사유·설정자 키를 생략하고 차단 판정은 기존 paused 플래그를 따른다.
+            let mut status = info.map(|p| json!(p)).unwrap_or_else(|| json!({"since": null}));
+            status["paused"] = json!(daemon.paused.load(Ordering::Relaxed));
+            Reply::Single(ok_response(&id, status))
         }
 
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
@@ -15943,6 +15956,144 @@ mod tests {
         assert_eq!(resp["ok"], json!(false), "pause 중 강제 배달이 통과했다 (응답: {resp})");
         assert_eq!(resp["error"]["code"], json!("paused"));
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "동결 중 배달 0건 — 큐 보존");
+    }
+
+    /// 인자 없는 pause 는 사유 결측과 실제 caller_pid 를 기록한다.
+    /// 실패 방향: 붉어지면 사유 없는 동결이 거부되거나 빈 사유·설정자 소실이 정상 값처럼 노출된다.
+    #[test]
+    fn pause_without_reason_records_absence_not_an_empty_string() {
+        let dir = std::env::temp_dir().join(format!("cys-pause-absence-{}", std::process::id()));
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let req = Request { id: json!(1), method: "system.pause".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(4242)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "사유 없는 pause 가 거부됐다: {resp}");
+        assert!(daemon.paused.load(Ordering::Relaxed));
+        let info = daemon.pause_info.lock().unwrap().clone().expect("pause_info 가 비었다");
+        assert!(info.reason.is_none(), "빈 사유가 값으로 들어갔다: {:?}", info.reason);
+        assert_eq!(info.actor_pid, Some(4242), "설정자 pid 가 안 남았다");
+        assert!(info.actor_surface.is_none(), "좌석 없는 caller 에게 좌석이 생겼다");
+        assert!(info.actor_role.is_none(), "좌석 없는 caller 에게 역할이 생겼다");
+
+        for method in ["org.status", "system.gate_check"] {
+            let req = Request { id: json!(2), method: method.into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(4242)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true));
+            assert_eq!(resp["result"]["paused"], json!(true));
+            let p = if method == "org.status" { &resp["result"]["pause_info"] } else { &resp["result"] };
+            assert_eq!(p["since"], json!(info.since), "{method}: since 키 불변");
+            assert!(p.get("reason").is_none(), "{method}: 결측 사유가 방출됐다: {p}");
+            assert_eq!(p["actor_pid"], json!(4242));
+            assert!(p.get("actor_surface").is_none());
+            assert!(p.get("actor_role").is_none());
+        }
+        let event = daemon.bus.tail(20).into_iter()
+            .find(|ev| ev["name"] == "autopilot.paused")
+            .expect("autopilot.paused 미발행");
+        assert_eq!(event["payload"].get("reason"), Some(&Value::Null));
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 빈 문자열뿐 아니라 공백뿐인 사유도 결측이며, 실제 사유는 trim 후 보존한다.
+    /// 실패 방향: 붉어지면 공백 사유가 값으로 남거나 실제 사유까지 소실되어 중단 원인을 잃는다.
+    #[test]
+    fn pause_with_blank_reason_is_also_absence() {
+        let dir = std::env::temp_dir().join(format!("cys-pause-blank-{}", std::process::id()));
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        for reason in ["", "   ", " \t\r\n "] {
+            let req = Request {
+                id: json!(1), method: "system.pause".into(), params: json!({"reason": reason}),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(1)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["ok"], json!(true), "공백 사유 pause 가 거부됐다: {resp}");
+            assert!(daemon.paused.load(Ordering::Relaxed));
+            assert!(daemon.pause_info.lock().unwrap().as_ref().unwrap().reason.is_none());
+        }
+        let req = Request {
+            id: json!(2), method: "system.pause".into(), params: json!({"reason": "  점검 중 \n"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "설정자 미상도 pause 를 수락한다: {resp}");
+        let info = daemon.pause_info.lock().unwrap().clone().unwrap();
+        assert_eq!(info.reason.as_deref(), Some("점검 중"));
+        assert!(info.actor_pid.is_none());
+        assert!(info.actor_surface.is_none());
+        assert!(info.actor_role.is_none());
+        let p = crate::state::state_dir(&daemon.socket_path).join("autopilot.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(v["reason"], json!("점검 중"));
+        assert!(v.get("actor_pid").is_none());
+        assert!(v.get("actor_surface").is_none());
+        assert!(v.get("actor_role").is_none());
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 결측 사유는 디스크 키 생략으로 남고, 신·구 포맷 모두 같은 소켓 경로에서 복원된다.
+    /// 실패 방향: 붉어지면 재시작이 동결·설정자를 잃거나 구 포맷의 빈 사유가 다시 사실로 적재된다.
+    #[test]
+    fn persisted_pause_omits_reason_when_absent_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("cys-pause-restart-{}", std::process::id()));
+        let socket_path = dir.join("cysd.sock");
+        let daemon = Daemon::new(socket_path.clone());
+        let req = Request { id: json!(1), method: "system.pause".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(7)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true));
+        let p = crate::state::state_dir(&socket_path).join("autopilot.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["paused"].as_bool(), Some(true));
+        assert!(v.get("reason").is_none(), "빈 사유가 디스크로 갔다: {v}");
+        assert_eq!(v["actor_pid"].as_u64(), Some(7));
+        assert!(v.get("actor_surface").is_none());
+        assert!(v.get("actor_role").is_none());
+        drop(daemon);
+
+        let restored = Daemon::new(socket_path.clone());
+        assert!(restored.paused.load(Ordering::Relaxed), "재시작이 동결을 풀었다");
+        let info = restored.pause_info.lock().unwrap().clone().unwrap();
+        assert!(info.reason.is_none());
+        assert_eq!(json!(info.since), v["since"]);
+        assert_eq!(info.actor_pid, Some(7));
+        assert!(info.actor_surface.is_none());
+        assert!(info.actor_role.is_none());
+        drop(restored);
+
+        // 구 포맷 하위호환: 빈 사유는 결측으로 복원되고 다음 영속부터 키가 사라진다.
+        std::fs::write(&p, r#"{"paused":true,"since":1.0,"reason":""}"#).unwrap();
+        let restored = Daemon::new(socket_path.clone());
+        assert!(restored.paused.load(Ordering::Relaxed));
+        let info = restored.pause_info.lock().unwrap().clone().unwrap();
+        assert_eq!(info.since, 1.0);
+        assert!(info.reason.is_none());
+        assert!(info.actor_pid.is_none());
+        assert!(info.actor_surface.is_none());
+        assert!(info.actor_role.is_none());
+        restored.persist_pause();
+        let converged: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(converged, json!({"paused": true, "since": 1.0}));
+        drop(restored);
+
+        // 값이 있는 필드의 보존 대조: 결측 처리 때문에 사유·설정자 전체가 사라지면 안 된다.
+        let populated = json!({"paused": true, "since": 2.0, "reason": "점검 중",
+                               "actor_pid": 7, "actor_surface": 42, "actor_role": "master"});
+        std::fs::write(&p, populated.to_string()).unwrap();
+        let restored = Daemon::new(socket_path);
+        assert!(restored.paused.load(Ordering::Relaxed));
+        restored.persist_pause();
+        let roundtrip: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(roundtrip, populated, "복원·영속 과정에서 실제 메타데이터가 소실됐다");
+        drop(restored);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// [게이트 ② 독립 핀] 발신 ACL = send 와 동일 권한 모델(check_send_acl 재사용 · 신규
