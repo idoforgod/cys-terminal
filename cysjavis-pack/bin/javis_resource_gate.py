@@ -34,8 +34,11 @@
            남기고 measure_errors 에 넣지 않는다 = exit 계약 불변. ps 는 있는데 조회가 깨진 것은
            측정 실패라 measure_errors 로 간다)
   context  soft 50 / hard 60    (60% 도달 전 저장 후 /clear 규칙)
-  ★부트 유예: 데몬 부트(`<state>/boot-epoch` mtime) 후 300초 안에는 **CPU 축(fleet_cpu·load)의 hard 만**
-    soft 로 내린다(다른 축 hard 는 유지). 근거를 못 읽으면 유예 없음(=종전 판정).
+  ★부트 유예: 데몬 부트 후 300초 안에는 **CPU 축(fleet_cpu·load)의 hard 만**
+    soft 로 내린다(다른 축 hard 는 유지). 부트 시각의 근거는 **내용 앵커 우선**(WP6-6 · `_boot_elapsed`):
+    안 A 데몬 `status --json` 의 `daemon.started_at` → 안 B `<state>/boot-epoch` **내용**(nonce) 세대
+    대조 → mtime 은 표기된 최후 폴백(`boot_grace_reason: mtime_fallback`). 근거를 못 읽으면 유예 없음
+    (=종전 판정).
 
 ★T9(P3-1·R3-P03-1) 곱셈 편성 예산 축(W6): check --formation-size <n> + env CYS_FORMATION_BUDGET.
   발화 조건은 **둘 다**다 — formation_size is not None ∧ CYS_FORMATION_BUDGET 정수 파싱 성공.
@@ -549,9 +552,16 @@ LOAD_HARD_RATIO_DEFAULT = 2.0
 #   반대로 CPU 는 부트 순간에만 치솟는 성분(좌석 스폰·인덱싱)이 크다.
 BOOT_GRACE_SECS = 300
 CPU_GRACE_AXES = ("fleet_cpu_ratio", "load_ratio")
-# 데몬이 부트마다 새로 내리는 파일(boot_supervisor::bump_boot_epoch) — **내용은 nonce 라 시각이
-# 아니고**, 부트 시각의 증거는 그 파일의 mtime 하나뿐이다.
+# 데몬이 부트마다 새로 내리는 파일(boot_supervisor::bump_boot_epoch) — **내용은 u64 nonce 라 시각은
+# 아니지만 세대 식별자로는 신뢰할 수 있다**(직전 값과 반드시 다른 값이 쓰인다 · 같으면 부팅을 막는다).
+# ★WP6-6: 부트 시각은 데몬 `status --json` 의 `daemon.started_at`(안 A) 또는 이 nonce 세대를 게이트가
+#   처음 본 시각(안 B · 게이트 자체 상태 `resource-gate/boot-nonce-<레인>.json`)에서 얻고, mtime 은
+#   표기된 최후 폴백이다 — mtime 은 내용의 대리값이 아니다(복사·동기화·touch 로 내용과 무관하게 움직인다).
 BOOT_EPOCH_BASENAME = "boot-epoch"
+BOOT_NONCE_BASENAME = "boot-nonce"      # 안 B 상태 파일 접두(`_boot_nonce_path` · 팩 상태 루트 아래)
+# `measured.boot_grace_reason` 의 **닫힌 값 집합** — 소비자는 이 밖의 값을 기대하지 않는다(`_boot_elapsed`).
+BOOT_GRACE_REASONS = ("override", "daemon_started_at", "nonce", "mtime_fallback",
+                      "epoch_missing", "epoch_unreadable", "clock_backwards")
 DEFAULT_STATE_DIR = "~/.local/state/cys"
 
 # ★2026-07-06 CSO 위임(master 승인): nodes hard_block 오탐 수정 — A(정적상향)+B(동적 부서가산).
@@ -618,13 +628,20 @@ def _socket_listening(path):
                 pass
 
 
-def _dept_roster(override=None):
+def _dept_roster(override=None, status_sink=None):
     """부서 로스터 — {"active": 응답 부서 수, "seats": Σ비-exited 좌석, "errors": ["dept(<이름>)", …],
     "depts": [{"name", "seats"}, …]}. 소켓 glob 마다 `cys status --json --socket <sock>` 를 묻는다.
     override(--dept-roster-override 로 파싱된 dict)가 있으면 라이브 조회를 전부 생략한다(테스트 주입 —
     self-test 가 이 머신의 라이브 소켓에 오염되지 않게). 실패한 부서는 errors 에만 남고 활성/좌석에
-    들어가지 않는다(조용한 0 좌석 금지)."""
+    들어가지 않는다(조용한 0 좌석 금지).
+    ★WP6-6(안 A): `status_sink`(dict)가 주어지면 **응답한 부서**의 `daemon.started_at` 을
+      `{정규화된 소켓 경로: float}` 로 거기 남긴다 — 부트 유예(`_boot_elapsed`)가 **같은 응답**을
+      재사용하기 위해서다(status 왕복 추가 0 · 반환 로스터의 모양은 불변). override 경로는
+      `override["started_at"]`({<sock>: epoch}) 를 같은 모양으로 옮긴다(테스트 주입 — 응답 대역)."""
     if override is not None:
+        if status_sink is not None and isinstance(override.get("started_at"), dict):
+            for _s, _v in override["started_at"].items():
+                _status_started_at_note(status_sink, _s, _v)
         return {"active": int(override.get("active", 0) or 0),
                 "seats": int(override.get("seats", 0) or 0),
                 "errors": list(override.get("errors") or []),
@@ -664,6 +681,12 @@ def _dept_roster(override=None):
         roster["active"] += 1
         roster["seats"] += seats
         roster["depts"].append({"name": name, "seats": seats})
+        if status_sink is not None:
+            # ★WP6-6 안 A: 이미 받은 응답에서 기동 시각만 더 꺼낸다(왕복 추가 0). 응답 실패한 부서는
+            #   위 continue 로 여기 오지 않는다 — 실패한 데몬의 시각으로 유예를 열지 않는다.
+            _daemon = doc.get("daemon")
+            _status_started_at_note(status_sink, sock,
+                                    _daemon.get("started_at") if isinstance(_daemon, dict) else None)
     return roster
 
 
@@ -1827,34 +1850,180 @@ def _boot_epoch_path():
     return os.path.join(os.path.expanduser(DEFAULT_STATE_DIR), BOOT_EPOCH_BASENAME)
 
 
-def _boot_elapsed(override=None):
+def _sock_key(sock):
+    """소켓 경로의 대조 키 — `~`·상대경로·심링크 차이를 지운다(안 A 의 응답↔레인 대조용 · 순수)."""
+    try:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(str(sock))))
+    except (OSError, ValueError):
+        return str(sock)
+
+
+def _status_started_at_note(sink, sock, value):
+    """`cys status --json` 응답의 `daemon.started_at`(f64 epoch · cysd handlers.rs)을 싱크에 남긴다.
+    숫자가 아니거나(bool 포함) 비유한이면 남기지 않는다 — 근거가 아닌 값으로 유예를 열지 않는다."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return
+    v = float(value)
+    if not math.isfinite(v):
+        return
+    sink[_sock_key(sock)] = v
+
+
+def _boot_nonce_path():
+    """안 B 상태(`{"boot_nonce", "first_seen"}`) 경로 — 레인별(`_fleet_hold_path` ① 과 같은 레인 키 ·
+    임계 접미는 없다: 부트 세대는 임계와 무관하다). 팩 상태 루트 아래라 데몬 디렉터리에는 쓰지 않는다."""
+    sock = _lane_socket()
+    key = "default"
+    if sock:
+        full = os.path.abspath(os.path.expanduser(sock))
+        name = re.sub(r"[^A-Za-z0-9._-]", "_",
+                      os.path.basename(os.path.dirname(full)) or "lane")[:40]
+        key = "%s-%s" % (name, hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()[:8])
+    return os.path.join(_pack_state_dir(), "resource-gate",
+                        "%s-%s.json" % (BOOT_NONCE_BASENAME, key))
+
+
+def _boot_nonce_read(path):
+    """안 B 상태 판독 → `(rec|None, why)`. why ∈ "ok" · "missing" · "corrupt" · "unreadable".
+    corrupt 는 '없음' 과 같이 다시 쓰고, unreadable(디렉터리가 자리를 차지 등)은 안 B 불능이다."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read(4096)
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, ValueError):
+        return None, "unreadable"
+    try:
+        doc = json.loads(raw)
+        nonce = doc.get("boot_nonce")
+        first = float(doc.get("first_seen"))
+        if not isinstance(nonce, str) or not math.isfinite(first):
+            raise ValueError("shape")
+        return {"boot_nonce": nonce, "first_seen": first}, "ok"
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        return None, "corrupt"
+
+
+def _boot_nonce_write(path, nonce, first_seen):
+    """안 B 상태 원자 기록 → 성공 여부(실패는 예외가 아니라 False — 판정을 죽이지 않는다)."""
+    tmp = None
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = "%s.%d.%s.tmp" % (path, os.getpid(), os.urandom(4).hex())
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"boot_nonce": nonce, "first_seen": float(first_seen)}) + "\n")
+        os.replace(tmp, path)            # Windows 에서도 원자 교체
+        return True
+    except (OSError, ValueError, TypeError):
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
+
+
+def _boot_elapsed(override=None, started_at_by_sock=None, now=None):
     """데몬 부트 후 경과초 → `(elapsed|None, reason)`. None = **유예 없음**(종전 판정 그대로).
 
-    reason ∈ "override" · "ok" · "epoch_missing" · "epoch_unreadable" · "clock_backwards".
-    ★근거는 `boot-epoch` 파일의 **mtime** 하나다. 파일 내용은 nonce(boot_supervisor::epoch_nonce —
-      시각이 아니라 해시)라 파싱해도 시각이 안 나온다. 그래서 이것은 '부트 시각' 이 아니라
-      **감독자가 그 파일을 마지막으로 내린 시각**이다. 어긋나는 형상과 그 방향(codex R1 #3):
-        · 감독자 off(`CYS_BOOT_GATES=0`)로 실제 재부트 → 파일이 낡음/부재 → **유예 부족(차단 과다)**
-        · 부서 레인이 부서 소켓을 가리킴 → 그 부서의 부트를 본다(이 레인의 판정으로는 옳다).
-          단 **다른 부서만 재시작**했는데 이 레인이 그 소켓을 가리키면 유예 과다(차단 못함)가 된다.
-        · 복사·동기화가 mtime 을 현재로 갱신 → **유예 과다** · 옛 mtime 보존 → **유예 부족**
-        · 시계 전진 → 조기 만료(유예 부족) · 시계 역행(mtime 이 미래) → None(유예 부족)
-      완화(유예)의 근거가 흔들릴 때는 **완화하지 않는 쪽**으로 접는다 — 근거 없는 완화는 게이트를
-      조용히 약하게 만들지만, 근거 없는 비완화는 종전 판정일 뿐이다. reason 은 `measured` 에 남겨
-      '왜 유예가 없었나'를 사후에 읽게 한다(조용한 실패 금지)."""
+    reason 은 닫힌 집합 `BOOT_GRACE_REASONS` 다(`measured.boot_grace_reason` 로 방출):
+      · "override"          — 주입(`--boot-elapsed-override`)
+      · "daemon_started_at" — 안 A: 데몬 자신이 말한 기동 시각(`status --json` 의 `daemon.started_at`)
+      · "nonce"             — 안 B: `boot-epoch` **내용**(u64 nonce) 세대를 처음 본 시각 기준
+      · "mtime_fallback"    — 최후 폴백: `boot-epoch` mtime(종전의 유일 근거 · 폴백 사용 사실을 표기)
+      · "epoch_missing" · "epoch_unreadable" · "clock_backwards" — 근거 없음 → None(유예 없음)
+
+    ★WP6-6: 종전 근거는 `boot-epoch` 파일의 **mtime 하나**였다. mtime 은 파일 내용이 아니라
+      복사·동기화·touch·백업 복원으로 내용과 무관하게 움직인다(현재로 갱신 → **유예 과다 = fail-open** ·
+      옛 값 보존 → 유예 부족). 그래서 내용 앵커를 앞세우고 mtime 은 표기된 폴백으로만 남긴다.
+      · 안 A(1차): 파일시스템 메타데이터가 아니라 **데몬이 말하는 기동 시각**. 새 왕복을 만들지
+        않고 `_dept_roster` 가 이미 부른 `cys status --json --socket <sock>` 응답(`started_at_by_sock`)
+        을 재사용한다 — 그래서 **레인 소켓이 부서 소켓 glob 안에 있을 때만**(부서 레인) 성립하고,
+        base 레인(`~/.local/state/cys/cys.sock`)은 그 glob 밖이라 안 B 로 간다. 새 왕복을 넣지 않는
+        이유: 게이트가 데몬을 자동기동시키는 자기모순 · 소켓 무응답 시 게이트 자체가 느려진다.
+      · 안 B(2차): `boot-epoch` 내용은 부팅마다 직전 값과 **반드시 다른** u64 nonce 다
+        (boot_supervisor::bump_boot_epoch) — 시각은 아니지만 **세대 식별자**로 신뢰할 수 있다.
+        게이트 자체 상태(`_boot_nonce_path` · `{"boot_nonce", "first_seen"}`)에 그 세대를 처음 본
+        시각을 적고 경과 = now − first_seen. nonce 가 같으면 mtime 이 아무리 밀려도 유예가 다시
+        열리지 않는다(발동 조건 ⓐ의 수리). 새 세대의 first_seen 은 `min(now, mtime)` — mtime 은
+        그 파일이 마지막으로 쓰인 시각이라 세대 시작의 **상한**이다(백업 복원으로 옛 nonce·옛 mtime
+        이 온 형상에서 now 를 쓰면 없는 부트에 유예가 선다). 안 A 가 있으면 그 시각으로 앞당긴다.
+        ★한계(fail-open 성분 · 그래서 A 가 1차다): 게이트가 부팅 직후에 한 번도 안 돌았으면
+          first_seen 이 실제 부팅보다 **늦어** 유예가 그만큼 길어진다(세대당 최대 한 창 300s).
+      · mtime 폴백(3차): 안 B 가 **불능**일 때만 — 내용이 nonce 형식이 아니거나(0바이트·파손)
+        게이트 상태를 읽고 쓸 수 없을 때. 그때는 reason 에 "mtime_fallback" 을 찍어 `measured` 로
+        내보낸다(조용한 완화 금지 · 사후에 '폴백이었다' 를 읽게 한다). 폴백 자체의 방향은 종전과
+        같다(mtime 이 현재로 밀리면 유예 과다) — 그래서 표기가 계약이다.
+      · 방향: 근거가 **없으면**(파일 부재·판독 불능·미래 시각) 유예를 주지 않는다(fail-closed —
+        근거 없는 완화는 게이트를 조용히 약하게 만들지만 근거 없는 비완화는 종전 판정일 뿐이다).
+        부서 레인이 부서 소켓을 가리키면 그 부서의 부트를 본다(이 레인의 판정으로는 옳다).
+    ★부작용 경계: `override` 가 주어지면 파일을 읽지도 쓰지도 않는다(self-test·검체 밀폐).
+      `now` 는 검체용 주입(기본 `time.time()`)."""
     if override is not None:
         return override, "override"
+    now = time.time() if now is None else now
     path = _boot_epoch_path()
+    # 안 A — 재사용된 status 응답에서 **이 레인 소켓**의 started_at 을 찾는다(새 왕복 0).
+    started_at = None
+    sock = _lane_socket()
+    if sock and started_at_by_sock:
+        started_at = started_at_by_sock.get(_sock_key(sock))
+    # `boot-epoch` 내용(nonce) — 안 B 의 세대 키. 부재·판독 불능은 아래 폴백까지 같은 사유다.
+    nonce, epoch_err = None, None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(64)             # u64 십진은 20자 이하 — 파일이 커도 통째로 읽지 않는다
+        if re.fullmatch(r"[0-9]{1,20}", raw.strip()):
+            nonce = raw.strip()
+    except FileNotFoundError:
+        epoch_err = "epoch_missing"
+    except (OSError, ValueError):
+        epoch_err = "epoch_unreadable"
+    if started_at is not None:
+        elapsed = now - started_at
+        if elapsed < 0:
+            return None, "clock_backwards"   # 미래 기동 시각 — '갓 부팅' 으로 읽지 않는다
+        if nonce is not None:
+            # 안 B 상태를 데몬의 시각으로 **앞당긴다**(더 이른 근거가 이긴다 = 유예가 줄어드는 방향).
+            rec, _ = _boot_nonce_read(_boot_nonce_path())
+            if rec is None or rec["boot_nonce"] != nonce or rec["first_seen"] > started_at:
+                _boot_nonce_write(_boot_nonce_path(), nonce, started_at)
+        return elapsed, "daemon_started_at"
+    if epoch_err is not None:
+        return None, epoch_err
+    if nonce is not None:
+        # 안 B — 세대 대조.
+        spath = _boot_nonce_path()
+        rec, why = _boot_nonce_read(spath)
+        if why != "unreadable":
+            if rec is not None and rec["boot_nonce"] == nonce:
+                first_seen = rec["first_seen"]
+            else:
+                first_seen = now
+                try:
+                    first_seen = min(now, os.path.getmtime(path))
+                except OSError:
+                    pass
+                if not _boot_nonce_write(spath, nonce, first_seen):
+                    first_seen = None    # 상태를 못 남기면 세대 대조가 성립하지 않는다 → 폴백
+            if first_seen is not None:
+                elapsed = now - first_seen
+                if elapsed < 0:
+                    return None, "clock_backwards"   # first_seen 이 미래(시계 역행) — 유예 없음
+                return elapsed, "nonce"
+    # 최후 폴백 — mtime(종전 유일 근거). 안 B 불능(내용 비-nonce · 상태 I/O 불능)일 때만 온다.
     try:
         mtime = os.path.getmtime(path)
     except FileNotFoundError:
         return None, "epoch_missing"
     except OSError:
         return None, "epoch_unreadable"
-    elapsed = time.time() - mtime
+    elapsed = now - mtime
     if elapsed < 0:
         return None, "clock_backwards"   # 미래 mtime. '갓 부팅' 으로 읽지 않는다
-    return elapsed, "ok"
+    return elapsed, "mtime_fallback"
 
 
 def measure(a):
@@ -1948,7 +2117,12 @@ def measure(a):
     # ★부트 유예 — CPU 축 hard→soft 창(300s). 근거 없음(None)은 유예 없음이다(_boot_elapsed).
     #   래치 호출 **앞에서** 계산한다(성찰 R4 N15): 유예 안의 hard 관측은 게이트가 막지 않는 구간이라
     #   보류 시계(`since`)를 유예 종료 무렵으로 미뤄야 상한 900s 가 유예 300s 를 같이 태우지 않는다.
-    boot_elapsed, boot_reason = _boot_elapsed(getattr(a, "boot_elapsed_override", None))
+    # ★WP6-6: 부서 로스터 조회를 여기로 당긴다 — 같은 `cys status --json` 응답의 `daemon.started_at`
+    #   을 부트 앵커(안 A)로 재사용하기 위해서다(왕복 추가 0). errors 합류·좌석 계산은 종전 자리 그대로.
+    _status_started_at = {}
+    roster = _dept_roster(getattr(a, "dept_roster_override", None), status_sink=_status_started_at)
+    boot_elapsed, boot_reason = _boot_elapsed(getattr(a, "boot_elapsed_override", None),
+                                              started_at_by_sock=_status_started_at)
     # 음수 경과초는 시각이 아니다(주입 오류·시계 이상) — 유예를 주지 않는다.
     boot_grace = boot_elapsed is not None and 0 <= boot_elapsed < BOOT_GRACE_SECS
     _hold_ovr = getattr(a, "fleet_cpu_hold_override", None)
@@ -1987,7 +2161,7 @@ def measure(a):
     # 조용한 allow 금지). --nodes-hard가 argparse 기본값(NODES_HARD_DEFAULT)에서 명시적으로 바뀌지
     # 않았으면 동적 계산 max(18, 12 + Σ좌석) 적용, 바뀌었으면(테스트 주입 등) 그 값 그대로 우선 —
     # 동적계산 생략(종전 규약 유지).
-    roster = _dept_roster(getattr(a, "dept_roster_override", None))
+    # (로스터 조회 자체는 부트 유예 앞으로 당겨졌다 — WP6-6 안 A 응답 재사용. 소비는 여기서.)
     active_depts = roster["active"]
     errors.extend(roster["errors"])
     if a.nodes_hard != NODES_HARD_DEFAULT:
@@ -2265,9 +2439,9 @@ def cmd_check(a):
                       "아니라 첫 관측 이후의 벽시계다."
                       % m.get("fleet_cpu_hold_reason")) if _stale else ""))
         if m.get("boot_grace") and any(c.get("boot_grace") for c in checks):
-            print("boot_grace: 데몬 부트 후 %ss(<%ds) — CPU 축 hard 를 soft 로 내렸다. "
+            print("boot_grace: 데몬 부트 후 %ss(<%ds · 근거 %s) — CPU 축 hard 를 soft 로 내렸다. "
                   "유예 밖이면 같은 값이 hard_block 이다."
-                  % (m.get("boot_elapsed"), BOOT_GRACE_SECS))
+                  % (m.get("boot_elapsed"), BOOT_GRACE_SECS, m.get("boot_grace_reason")))
         if worst == "hard":
             print("hard_block: 착수 거부 — 자원 정리(서버 kill·/clear·노드 회수) 후 재시도하거나 "
                   "master 승인으로 임계 상향. (사후 watchdog와 별개의 사전 게이트)")
@@ -2643,7 +2817,8 @@ def main(argv=None):
                         "래치 파일 무접촉)" % int(FLEET_CPU_HARD_MAX_HOLD_SECS))
     c.add_argument("--boot-elapsed-override", dest="boot_elapsed_override", type=_finite_float,
                    default=None,
-                   help="테스트 주입 — 데몬 부트 후 경과초(부트 유예 창 판정용 · boot-epoch mtime 대체)")
+                   help="테스트 주입 — 데몬 부트 후 경과초(부트 유예 창 판정용 · 부트 앵커 "
+                        "started_at/nonce/mtime 조회 전부 생략)")
     c.add_argument("--context-soft", type=_nonneg_float, default=50.0)
     c.add_argument("--context-hard", type=_nonneg_float, default=60.0)
     c.add_argument("--servers-override", type=int, default=None, help="테스트 주입")
@@ -2658,7 +2833,8 @@ def main(argv=None):
     c.add_argument("--dept-roster-override", dest="dept_roster_override", default=None,
                    type=_roster_override_arg,
                    help="테스트 주입 — 부서 로스터 JSON {active,seats,errors,depts}(라이브 "
-                        "`cys status --json --socket` 조회 전부 생략 · 잘못된 JSON=EX_USAGE 64)")
+                        "`cys status --json --socket` 조회 전부 생략 · 잘못된 JSON=EX_USAGE 64 · "
+                        "선택 started_at:{<sock>:epoch} = 부트 앵커 안 A 응답 대역)")
     c.add_argument("--rate-check", action="store_true",
                    help="opt-in: 5h rate 사용률 soft 경고 축 추가(env CYS_GATE_RATE=1과 동등)")
     c.add_argument("--rate-soft", type=_nonneg_float, default=80.0, help="rate 5h used_pct soft 임계")
@@ -3186,7 +3362,10 @@ def _self_test_body(fails):
                        "중첩 런처(uv → tool → uvx → serena)")):
         got = _fleet_cpu_percent(["  1   0.0 /sbin/init", cmd_], self_pid=999999)
         chk(got == (10.0, None), "진짜 함대 형상을 놓쳤다(%s): %r → %r" % (tag, cmd_, got))
-    # (h) `_boot_elapsed` 순수 핀 — 부재·미래 mtime·정상. 근거 없음은 **유예 없음**이다.
+    # (h) `_boot_elapsed` 순수 핀 — 부재·안 B(nonce 세대)·안 A(started_at)·mtime 폴백 표기·시계 역행.
+    #     근거 없음은 **유예 없음**이다. ★WP6-6: 종전 핀은 mtime 을 유일 근거로 읽었다(`why == "ok"`).
+    #     이제 내용 앵커가 앞서므로 **같은 nonce 에서 mtime 이 현재로 밀려도 유예가 다시 열리지 않는
+    #     것**을 핀한다(발동 조건 ⓐ 재현). 상태 파일은 self_test 가 고정한 임시 CYS_STATE_DIR 아래다.
     import shutil as _sh
     import tempfile as _tf
     _bd = _tf.mkdtemp()
@@ -3197,16 +3376,46 @@ def _self_test_body(fails):
         chk(el is None and why == "epoch_missing",
             "boot-epoch 부재가 '유예 없음(None)'이 아님: %r/%r" % (el, why))
         _bp = os.path.join(_bd, BOOT_EPOCH_BASENAME)
+        _t0 = 1_700_000_000.0
         with open(_bp, "w", encoding="utf-8") as f:
-            f.write("0\n")
-        os.utime(_bp, (time.time() + 3600, time.time() + 3600))
-        el, why = _boot_elapsed()
+            f.write("12345\n")
+        os.utime(_bp, (_t0 - 42, _t0 - 42))
+        el, why = _boot_elapsed(now=_t0)
+        chk(el is not None and abs(el - 42) < 1e-6 and why == "nonce",
+            "새 세대 첫 관측이 nonce 앵커(first_seen=min(now, mtime))로 안 나옴: %r/%r" % (el, why))
+        os.utime(_bp, (_t0 + 3600, _t0 + 3600))       # 동기화가 mtime 만 현재로 민 형상(ⓐ)
+        el, why = _boot_elapsed(now=_t0 + 3600)
+        chk(el is not None and abs(el - 3642) < 1e-6 and why == "nonce",
+            "같은 nonce 인데 mtime 이 밀리자 유예가 다시 열렸다(내용 앵커 미적용): %r/%r" % (el, why))
+        el, why = _boot_elapsed(now=_t0 - 100)          # 시계 역행: first_seen 이 미래
+        chk(el is None and why == "clock_backwards",
+            "시계 역행(first_seen 이 미래)이 '갓 부팅'으로 읽혀 유예가 열렸다: %r/%r" % (el, why))
+        # 안 A 가 있으면 데몬의 시각이 이긴다 — 그리고 안 B 상태(first_seen)를 그 시각으로 앞당긴다.
+        _k = _sock_key(os.environ["CYS_SOCKET"])
+        el, why = _boot_elapsed(started_at_by_sock={_k: _t0 - 1000}, now=_t0)
+        chk(el is not None and abs(el - 1000) < 1e-6 and why == "daemon_started_at",
+            "daemon.started_at 이 1차 근거로 안 쓰임: %r/%r" % (el, why))
+        el, why = _boot_elapsed(now=_t0 + 1)
+        chk(el is not None and abs(el - 1001) < 1e-6 and why == "nonce",
+            "안 A 의 시각이 안 B 상태(first_seen)로 앞당겨지지 않았다: %r/%r" % (el, why))
+        el, why = _boot_elapsed(started_at_by_sock={_k: _t0 + 50}, now=_t0)
+        chk(el is None and why == "clock_backwards",
+            "미래 started_at 이 '갓 부팅'으로 읽혀 유예가 열렸다: %r/%r" % (el, why))
+        # mtime 폴백은 안 B 불능(내용이 nonce 가 아님)일 때만 — 그리고 그 사실이 reason 에 남는다.
+        with open(_bp, "w", encoding="utf-8") as f:
+            f.write("not-a-nonce\n")
+        os.utime(_bp, (_t0 - 42, _t0 - 42))
+        el, why = _boot_elapsed(now=_t0)
+        chk(el is not None and abs(el - 42) < 1e-6 and why == "mtime_fallback",
+            "mtime 폴백이 표기되지 않았다(조용한 완화): %r/%r" % (el, why))
+        os.utime(_bp, (_t0 + 3600, _t0 + 3600))
+        el, why = _boot_elapsed(now=_t0)
         chk(el is None and why == "clock_backwards",
             "미래 mtime(시계 역행)이 '갓 부팅'으로 읽혀 유예가 열렸다: %r/%r" % (el, why))
-        os.utime(_bp, (time.time() - 42, time.time() - 42))
-        el, why = _boot_elapsed()
-        chk(el is not None and 41 <= el <= 60 and why == "ok",
-            "정상 mtime 에서 경과초가 안 나옴: %r/%r" % (el, why))
+        chk(all(_r in BOOT_GRACE_REASONS for _r in ("override", "daemon_started_at", "nonce",
+                                                     "mtime_fallback", "epoch_missing",
+                                                     "epoch_unreadable", "clock_backwards")),
+            "boot_grace_reason 닫힌 집합이 깨졌다: %r" % (BOOT_GRACE_REASONS,))
     finally:
         if saved_sock is None:
             os.environ.pop("CYS_SOCKET", None)
@@ -3711,8 +3920,9 @@ def _self_test_body(fails):
           " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
           "비정수 env 가청화·nodes 미측정 무예외)"
           " + WP-7 codex 위임 반례 4종(합계 오버플로·진단 예외 격리·override 밀폐 2)"
-          " + WP-7 함대CPU/부트유예 23종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
-          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 6종·boot-epoch 3종+기본경로 1)"
+          " + WP-7 함대CPU/부트유예 30종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
+          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 6종·boot-epoch 앵커 10종"
+          "(WP6-6: nonce 세대·started_at·mtime 폴백 표기·시계 역행)+기본경로 1)"
           " + ★R1 리뷰 반영 33종(argv0 소유권: B2 오탐 14 반례 + 진짜 형상 15 음성대조(실측 5 포함) ·"
           " PID 자기제외 2 · 보류 상한 4점+타축 불변+warnings 불변+래치 순수 10 ·"
           " nan/inf EX_USAGE 8+유한 정상 1 · MSYS/unsupported 3 · 무동작 고지 3 ·"
