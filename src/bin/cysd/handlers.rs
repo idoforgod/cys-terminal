@@ -116,6 +116,23 @@ fn param_dim(params: &Value, key: &str, fallback: u16, max: u64) -> Result<u16, 
     }
 }
 
+/// redact 플래그 판독(`control.sessions` · `control.session_detail` 공용) — **타입 혼동을 침묵으로
+/// 접지 않는다.** `Ok(bool)` = 확정 · `Err(msg)` = 키는 있는데 JSON bool 이 아님(호출자 계약 위반).
+/// 종전 `as_bool().unwrap_or(false)` 는 `"true"`·`1`·`["true"]` 를 전부 **조용한 off** 로 접어
+/// 가림 요청이 소리 없이 무시됐다(보안 축은 fail-closed 여야 한다 — 실패 방향: 못 읽으면 **거절**).
+/// `null`/키 부재는 off 다 — tauri 브리지가 `Option<bool>` 의 None 을 `null` 로 싣기 때문
+/// (src-tauri/src/main.rs `async fn control_sessions(window: Option<String>, redact: Option<bool>)`).
+/// 여기서 null 을 거절하면 UI 의 정상 호출이 깨진다.
+/// 환경변수 `CYS_CONTROL_REDACT=1` 은 파라미터와 OR 로 합쳐진다(전역 가림 운영 스위치 — 계약 불변).
+fn parse_redact_flag(params: &Value) -> Result<bool, &'static str> {
+    let explicit = match params.get("redact") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("redact must be a JSON boolean (got a non-boolean)"),
+    };
+    Ok(explicit || std::env::var("CYS_CONTROL_REDACT").map(|v| v == "1").unwrap_or(false))
+}
+
 /// feed.push 자동 request_id의 프로세스 내 유일성 보장 카운터
 static FEED_REQ_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -7455,8 +7472,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let window = param_str(&params, "window").unwrap_or_else(|| "7d".to_string());
             let since = crate::analytics::window_since(now, &window);
             // E9 RBAC: redact 파라미터 OR 환경변수 CYS_CONTROL_REDACT=1 → session_id(경로 PII) 가림(집계는 보존).
-            let redact = params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false)
-                || std::env::var("CYS_CONTROL_REDACT").map(|v| v == "1").unwrap_or(false);
+            // 타입 혼동(`"true"`·`1`)은 조용한 off 가 아니라 거절이다 — 가림 요청이 소리 없이
+            // 무시되면 PII 가 새고도 아무도 모른다.
+            let redact = match parse_redact_flag(&params) {
+                Ok(v) => v,
+                Err(msg) => return Reply::Single(err_response(&id, "invalid_params", msg)),
+            };
             let mut result = {
                 let guard = daemon.analytics.lock().unwrap();
                 match guard.as_ref() {
@@ -7486,12 +7507,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // E9 RBAC 대칭(B-8): sessions와 동일 기준으로 detail도 가린다 — 구 구현은
             // detail만 raw session_id(경로 PII)·전사를 그대로 노출했다.
-            let redact = params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false)
-                || std::env::var("CYS_CONTROL_REDACT").map(|v| v == "1").unwrap_or(false);
+            // 타입 혼동(`"true"`·`1`)은 조용한 off 가 아니라 거절이다(sessions arm 과 같은 판독기).
+            let redact = match parse_redact_flag(&params) {
+                Ok(v) => v,
+                Err(msg) => return Reply::Single(err_response(&id, "invalid_params", msg)),
+            };
             if redact {
                 detail["session_id"] = json!(crate::analytics::redact_session_id(&sid));
                 detail["transcript"] = json!([]);
             }
+            // control.sessions 의 `"redacted": redact` 와 **같은 모양**으로 적용 사실을 에코한다 —
+            // 가림 여부를 응답만 보고 판정할 수 있어야 반출 파이프라인이 그것을 게이트로 쓸 수 있다.
+            // (`detail` 은 두 갈래 모두 `json!({...})` 객체다 — analytics::session_detail 확인.)
+            detail["redacted"] = json!(redact);
             Reply::Single(ok_response(&id, detail))
         }
 
@@ -8849,6 +8877,134 @@ mod tests {
         // 단, 파싱 가능한 범위 밖 값은 fallback이 아니라 명시적 에러여야 한다 (DoS 게이트)
         assert!(param_dim(&json!({"rows": "0"}), "rows", 35, MAX_ROWS).is_err());
         assert!(param_dim(&json!({"rows": "99999"}), "rows", 35, MAX_ROWS).is_err());
+    }
+
+    /// `CYS_CONTROL_REDACT` 는 프로세스 전역 env 라 판독 윈도를 직렬화한다(BOOT_V2_ENV_LOCK 과 같은
+    /// 패턴). 이 env 를 만지는 검체는 아래 둘뿐이다 — 새로 추가하면 같은 락을 잡아라.
+    static REDACT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// redact 판독 진리표 — **발동 조건은 타입 혼동**이다.
+    /// 종전 `as_bool().unwrap_or(false)` 는 아래 Err 칸을 전부 조용한 off 로 접었다.
+    /// 변이 대조: `parse_redact_flag` 의 `Some(_) => Err(..)` 갈래를 `Some(_) => false` 로 되돌리면
+    /// 이 검체는 반드시 붉어야 한다.
+    #[test]
+    fn parse_redact_flag_truth_table() {
+        let _g = REDACT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 환경변수 오염 차단 — 이 검체는 파라미터 판독만 잰다(RAII 복원).
+        let _env = cys::pack::EnvGuard::remove("CYS_CONTROL_REDACT");
+        assert_eq!(parse_redact_flag(&json!({})), Ok(false), "키 부재=off");
+        assert_eq!(
+            parse_redact_flag(&json!({ "redact": null })),
+            Ok(false),
+            "null=off — tauri 브리지의 Option<bool>::None 이 이 모양으로 온다"
+        );
+        assert_eq!(parse_redact_flag(&json!({ "redact": true })), Ok(true));
+        assert_eq!(parse_redact_flag(&json!({ "redact": false })), Ok(false));
+        for bad in [
+            json!("true"),
+            json!("false"),
+            json!("1"),
+            json!(1),
+            json!(0),
+            json!(["true"]),
+            json!({ "v": true }),
+        ] {
+            assert!(
+                parse_redact_flag(&json!({ "redact": bad })).is_err(),
+                "타입 혼동은 조용한 off 가 아니라 거절이어야 한다: {bad}"
+            );
+        }
+        // 환경변수 경로는 파라미터와 OR 로 합쳐진다(기존 계약 불변).
+        let _on = cys::pack::EnvGuard::set("CYS_CONTROL_REDACT", "1");
+        assert_eq!(parse_redact_flag(&json!({})), Ok(true), "env=1 이면 파라미터 없어도 on");
+        assert_eq!(
+            parse_redact_flag(&json!({ "redact": false })),
+            Ok(true),
+            "env=1 은 파라미터 false 를 덮는다(OR)"
+        );
+        // env 가 켜져 있어도 타입 혼동은 여전히 거절이다 — env 가 오류를 가리면 안 된다.
+        assert!(
+            parse_redact_flag(&json!({ "redact": "true" })).is_err(),
+            "env=1 이 타입 혼동을 가리면 안 된다"
+        );
+    }
+
+    /// session_detail 의 가림 적용 사실이 응답에 드러나야 한다(+ 타입 혼동은 거절).
+    /// 종전에는 ① 가림 여부가 응답에 없고 ② `{"redact":"true"}` 가 조용히 off 로 접혔다.
+    /// analytics 커넥션이 없으면 arm 이 `json!({ session_id, timeline: [], summary: {} })` 로
+    /// 떨어지므로 DB 없이도 가림·에코·거절 경로를 그대로 잰다.
+    #[test]
+    fn session_detail_echoes_redacted_and_rejects_non_bool() {
+        let _g = REDACT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = cys::pack::EnvGuard::remove("CYS_CONTROL_REDACT");
+        let dir = std::env::temp_dir().join(format!(
+            "cys-redact-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let call = |params: Value| {
+            let req = Request {
+                id: json!(1),
+                method: "control.session_detail".into(),
+                params,
+            };
+            let Reply::Single(r) = dispatch(&daemon, req, None) else {
+                panic!("expected single reply")
+            };
+            r
+        };
+        // 세션 경로 모양의 더미(실경로 아님 — secret-scan 의 개인경로 패턴 `/Users/<이름>/.…` 을 피한다).
+        let pii = "/srv/example-home/projects/-srv-example-x/abcd.jsonl";
+
+        // ① redact=true → 가림 + 에코
+        let r = call(json!({ "session_id": pii, "redact": true }));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        assert_eq!(
+            r["result"]["redacted"],
+            json!(true),
+            "가림 적용 사실이 응답에 없다: {r}"
+        );
+        assert_ne!(
+            r["result"]["session_id"],
+            json!(pii),
+            "raw 경로 PII 가 응답에 남았다: {r}"
+        );
+
+        // ② redact 미지정 → off 이고, 그 사실도 에코된다(raw 는 그대로 — 기존 계약).
+        let r0 = call(json!({ "session_id": pii }));
+        assert_eq!(r0["ok"], json!(true), "{r0}");
+        assert_eq!(r0["result"]["redacted"], json!(false), "{r0}");
+        assert_eq!(r0["result"]["session_id"], json!(pii), "{r0}");
+
+        // ②' redact=null(tauri Option<bool>::None 의 모양) → 거절이 아니라 off.
+        let rn = call(json!({ "session_id": pii, "redact": null }));
+        assert_eq!(rn["ok"], json!(true), "null 은 정상 트래픽이다: {rn}");
+        assert_eq!(rn["result"]["redacted"], json!(false), "{rn}");
+
+        // ③ 발동 조건: 타입 혼동. 조용한 off 가 아니라 거절이어야 한다(WP-2-C 와 같은 핀).
+        let bad = call(json!({ "session_id": pii, "redact": "true" }));
+        assert_eq!(bad["ok"], json!(false), "문자열 \"true\" 가 조용히 off 로 접혔다: {bad}");
+        assert_eq!(bad["error"]["code"], json!("invalid_params"), "{bad}");
+        assert!(
+            bad.get("result").is_none() || bad["result"].is_null(),
+            "거절 응답에 세션 본문이 실리면 안 된다: {bad}"
+        );
+
+        // ④ sessions arm 도 같은 판독기다 — 타입 혼동 거절이 두 자리 모두에 걸려 있어야 한다.
+        let req = Request {
+            id: json!(2),
+            method: "control.sessions".into(),
+            params: json!({ "window": "all", "redact": 1 }),
+        };
+        let Reply::Single(bad2) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply")
+        };
+        assert_eq!(bad2["ok"], json!(false), "sessions: 숫자 1 이 조용히 off 로 접혔다: {bad2}");
+        assert_eq!(bad2["error"]["code"], json!("invalid_params"), "{bad2}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
