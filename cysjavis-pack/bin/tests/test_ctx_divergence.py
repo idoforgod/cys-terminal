@@ -7,6 +7,7 @@ test_report_gate의 FakeRunner/시계를 재사용한다. actprobe는 --status-f
 실행: python3 cysjavis-pack/bin/tests/test_ctx_divergence.py
 """
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -20,17 +21,12 @@ from unittest.mock import patch
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BIN)
 import javis_hud_bridge as HB
-from test_report_gate import G, FakeRunner, badges, gate, ledger_entries, report
+from test_report_gate import G, Clock, FakeRunner, badges, gate, ledger_entries, report
 
 
 def node(measured=78, reported=87, status_age_secs=10, **extra):
     return dict(role="worker", usage_ctx_pct=measured, context_pct=reported,
                 status_age_secs=status_age_secs, agent_alive=True, idle_secs=10, **extra)
-
-
-def divergence_warnings(nodes):
-    return [w for w in G.extract_warnings(report(live_nodes=nodes))
-            if w["trigger"] == "ctx_divergence"]
 
 
 class ReportDivergence(unittest.TestCase):
@@ -39,33 +35,35 @@ class ReportDivergence(unittest.TestCase):
         self.threshold.start()
         self.addCleanup(self.threshold.stop)
 
-    def test_nine_points_alert(self):
-        """9pt 괴리가 기본 임계(8)에서 잡힌다."""
-        self.assertEqual(len(divergence_warnings([node()])), 1)
-        self.assertEqual(G.ctx_divergence([node()])[0]["role"], "worker")
+    def test_nine_points_observed_without_warning(self):
+        """9pt 괴리는 관측에 남고 verdict를 움직이는 경고에는 없다."""
+        rows = G.ctx_divergence([node()])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["role"], "worker")
+        warns = G.extract_warnings(report(live_nodes=[node()]))
+        self.assertEqual([w["trigger"] for w in warns], ["context"])
 
     def test_old_default_missed_incident(self):
         """옛 기본값 15였다면 놓쳤을 사례임을 박제."""
         self.assertTrue(9.0 <= 87 - 78 <= 15.0)
         with patch.object(G, "CTX_DIVERGENCE_ALERT_PCT", 15.0):
-            self.assertEqual(divergence_warnings([node()]), [])
+            self.assertEqual(G.ctx_divergence([node()]), [])
 
     def test_missing_measured_is_not_comparable(self):
         """실측 없음(agy)은 괴리 판정 대상이 아니다."""
-        self.assertEqual(divergence_warnings([
+        self.assertEqual(G.ctx_divergence([
             {"role": "gemini", "usage_ctx_pct": None, "context_pct": 90}]), [])
 
     def test_signed_message(self):
         """부호를 문구에 남긴다: 자기보고 95 vs 실측 78 = +17."""
-        warning = divergence_warnings([node(reported=95)])[0]
-        self.assertIn("자기보고 95 vs 실측 78 = +17", warning["wake_body"])
-        self.assertIn("+17", warning["reason"])
+        row = G.ctx_divergence([node(reported=95)])[0]
+        self.assertIn("자기보고 95 vs 실측 78 = +17", G._fmt_ctx_divergence(row))
 
     def test_negative_sign_and_exact_threshold(self):
-        """음수 괴리도 경보, 정확히 8pt와 2pt는 경보 없음."""
-        warning = divergence_warnings([node(reported=69)])[0]
-        self.assertIn("자기보고 69 vs 실측 78 = -9", warning["wake_body"])
-        self.assertEqual(divergence_warnings([node(reported=86), node(reported=80)]), [])
+        """음수 괴리도 관측, 정확히 8pt와 2pt는 괴리 없음."""
+        row = G.ctx_divergence([node(reported=69)])[0]
+        self.assertIn("자기보고 69 vs 실측 78 = -9", G._fmt_ctx_divergence(row))
+        self.assertEqual(G.ctx_divergence([node(reported=86), node(reported=80)]), [])
 
     def test_both_axes_require_numbers(self):
         """어느 축이든 결측·비수치면 경보 없음, 실제 0은 숫자."""
@@ -74,32 +72,36 @@ class ReportDivergence(unittest.TestCase):
                 # NaN/Infinity는 정상 JSON 밖의 주입값: 괴리 술어의 방어를 직접 잰다.
                 self.assertEqual(G.ctx_divergence([node(measured=bad)]), [])
                 self.assertEqual(G.ctx_divergence([node(reported=bad)]), [])
-        self.assertEqual(divergence_warnings([{"context_pct": 90}]), [])
-        self.assertEqual(divergence_warnings([{"usage_ctx_pct": 90}]), [])
-        self.assertEqual(len(divergence_warnings([node(measured=0, reported=9)])), 1)
+        self.assertEqual(G.ctx_divergence([{"context_pct": 90}]), [])
+        self.assertEqual(G.ctx_divergence([{"usage_ctx_pct": 90}]), [])
+        self.assertEqual(len(G.ctx_divergence([node(measured=0, reported=9)])), 1)
 
     def test_cycle_persists_measurement_and_signed_badge(self):
         """합성 보고 주기: JSON 필드·대장·배지 기록, 회복 시 해소, push 0."""
         with tempfile.TemporaryDirectory() as t, \
                 patch.object(G, "foreign_daemon_verdict", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()):
-            runner = FakeRunner(rep=report(live_nodes=[node()]))
+            runner = FakeRunner(rep=report(live_nodes=[node(measured=20, reported=29)]))
             g = gate(t, runner)
             self.assertEqual(g.run(), 0)  # BASELINE도 관측 JSON을 쓴다.
             with open(g.measure_path, encoding="utf-8") as f:
                 measurement = json.load(f)
             row = measurement["ctx_divergence"][0]
             self.assertEqual(measurement["ctx_divergence_stats"],
-                             {"compared": 1, "skipped_stale": 0, "skipped_missing": 0})
+                             {"compared": 1, "skipped_stale": 0, "skipped_missing": 0,
+                              "skipped_dead": 0, "skipped_missing_module": 0})
             self.assertEqual(row, {"role": "worker", "diff": 9.0, "signed_diff": 9.0,
-                                   "measured": 78, "reported": 87})
+                                   "measured": 20, "reported": 29})
+            self.assertIn("+9", badges(t)["gate-ctx-divergence-worker"]["message"])
+            self.assertTrue(any(r.startswith("ctx_divergence:")
+                                for r in ledger_entries(t)[-1]["reasons"]))
             self.assertEqual(g.run(), 0)
-            self.assertEqual(ledger_entries(t)[-1]["verdict"], "WARN")
+            self.assertEqual(ledger_entries(t)[-1]["verdict"], "NOCHG")
             self.assertTrue(any("ctx_divergence:" in r and "+9" in r
                                 for r in ledger_entries(t)[-1]["reasons"]))
             self.assertIn("+9", badges(t)["gate-ctx-divergence-worker"]["message"])
             self.assertEqual(runner.enqueues + runner.drains + runner.sends + runner.emits, [])
-            runner.rep = report(live_nodes=[node(reported=80)])
+            runner.rep = report(live_nodes=[node(measured=20, reported=22)])
             self.assertEqual(g.run(), 0)
             with open(g.measure_path, encoding="utf-8") as f:
                 measurement = json.load(f)
@@ -115,7 +117,8 @@ class ReportDivergence(unittest.TestCase):
                 stats = {}
                 self.assertEqual(G.ctx_divergence([node(status_age_secs=age)], stats), [])
                 self.assertEqual(stats, {"compared": 0, "skipped_stale": 1,
-                                         "skipped_missing": 0})
+                                         "skipped_missing": 0, "skipped_dead": 0,
+                                         "skipped_missing_module": 0})
         missing_age = node()
         del missing_age["status_age_secs"]
         stats = {}
@@ -123,37 +126,123 @@ class ReportDivergence(unittest.TestCase):
                                  node(reported=80), missing_age,
                                  node(measured=None), node(reported="90")], stats)
         self.assertEqual(len(rows), 2)
-        self.assertEqual(stats, {"compared": 3, "skipped_stale": 1, "skipped_missing": 2})
-        self.assertEqual(divergence_warnings([missing_age, node(status_age_secs=99999)]), [])
+        self.assertEqual(stats, {"compared": 3, "skipped_stale": 1, "skipped_missing": 2,
+                                 "skipped_dead": 0, "skipped_missing_module": 0})
+        self.assertEqual(G.ctx_divergence([missing_age, node(status_age_secs=99999)]), [])
 
-    def test_stale_reports_allow_quiet_park_and_delta(self):
-        """낡음·age 결측은 WARN을 고정하지 않아 quiet 주차와 DELTA 라우팅이 살아 있다."""
-        for age in (99999, None):
-            with self.subTest(age=age), tempfile.TemporaryDirectory() as t, \
+    def test_persistent_divergence_allows_quiet_park_nochg_and_delta(self):
+        """지속 괴리·낡음·age 결측 모두 12주기 QUIET/NOCHG 수렴·주차·DELTA 도달."""
+        cases = [(age, idle) for age in (10, 99999, None) for idle in (600, 10)]
+        for age, idle in cases:
+            with self.subTest(age=age, idle=idle), tempfile.TemporaryDirectory() as t, \
                     patch.object(G, "foreign_daemon_verdict", return_value=None), \
                     contextlib.redirect_stdout(io.StringIO()):
                 n = node(measured=20, reported=95, status_age_secs=age)
                 if age is None:
                     del n["status_age_secs"]
-                n["idle_secs"] = 600
+                n["idle_secs"] = idle
                 runner = FakeRunner(rep=report(live_nodes=[n]))
-                g = gate(t, runner, quiet_cycles=3)
-                for _ in range(4):
+                clk = Clock(1_000_000)
+                g = gate(t, runner, clock=clk, quiet_cycles=12)
+                self.assertEqual(g.run(), 0)  # BASELINE 다음 12주기를 모두 검증한다.
+                for cycle in range(1, 13):
+                    clk.epoch += 300
                     self.assertEqual(g.run(), 0)
-                entry = ledger_entries(t)[-1]
-                self.assertEqual(entry["verdict"], "QUIET")
-                self.assertEqual(entry["consecutive_quiet"], 3)
-                self.assertIn("master-park", [e[1] for e in runner.enqueues])
+                    entry = ledger_entries(t)[-1]
+                    self.assertEqual(entry["verdict"], "QUIET" if idle == 600 else "NOCHG")
+                    self.assertEqual(entry["consecutive_quiet"], cycle if idle == 600 else 0)
+                    self.assertEqual(entry["consecutive_nochg"], cycle if idle == 10 else 0)
+                    self.assertEqual("gate-ctx-divergence-worker" in badges(t), age == 10)
+                    self.assertEqual(any(r.startswith("ctx_divergence:")
+                                         for r in entry["reasons"]), age == 10)
+                self.assertEqual([e[1] for e in runner.enqueues],
+                                 ["master-park"] if idle == 600 else [])
+                self.assertEqual(runner.drains + runner.sends + runner.emits, [])
+                with open(g.counters_path, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["consecutive_quiet"], 12 if idle == 600 else 0)
                 with open(g.measure_path, encoding="utf-8") as f:
                     measurement = json.load(f)
-                self.assertEqual(measurement["ctx_divergence"], [])
+                self.assertEqual(len(measurement["ctx_divergence"]), 1 if age == 10 else 0)
                 self.assertEqual(measurement["ctx_divergence_stats"],
-                                 {"compared": 0, "skipped_stale": 1, "skipped_missing": 0})
+                                 {"compared": int(age == 10), "skipped_stale": int(age != 10),
+                                  "skipped_missing": 0, "skipped_dead": 0,
+                                  "skipped_missing_module": 0})
                 runner.rep["overall_done"] = 1
                 with patch.object(g, "_route_delta", wraps=g._route_delta) as route:
                     self.assertEqual(g.run(), 0)
                     route.assert_called_once()
                 self.assertEqual(ledger_entries(t)[-1]["verdict"], "DELTA")
+
+    def test_missing_report_module_skips_both_axes_and_records_reason(self):
+        """실제 import 실패: 60%·괴리 비교 0, BASELINE/후속 대장 사유·누락 계수 보존."""
+        spec = importlib.util.spec_from_file_location("gate_without_report", G.__file__)
+        missing = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"javis_report": None}):
+            spec.loader.exec_module(missing)
+        self.assertIsNotNone(missing._REPORT_IMPORT_ERR)
+        self.assertIsNone(missing._pick_node_ctx)
+        self.assertIsNone(missing.CTX_SELF_REPORT_MAX_AGE_S)
+        rep = report(live_nodes=[node(), node(status_age_secs=99999)])
+        self.assertEqual(missing.extract_warnings(rep), [])
+        with tempfile.TemporaryDirectory() as t, \
+                patch.object(missing, "foreign_daemon_verdict", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            runner = FakeRunner(rep=rep)
+            g = missing.Gate(t, runner, now_epoch_fn=lambda: 1_000_000)
+            for verdict in ("BASELINE", "NOCHG"):
+                self.assertEqual(g.run(), 0)
+                entry = ledger_entries(t)[-1]
+                self.assertEqual(entry["verdict"], verdict)
+                self.assertIn("report_module_missing", entry["reasons"])
+                self.assertFalse(any(r.startswith("ctx_divergence:") for r in entry["reasons"]))
+                self.assertNotIn("gate-ctx-divergence-worker", badges(t))
+                with open(g.measure_path, encoding="utf-8") as f:
+                    measurement = json.load(f)
+                self.assertEqual(measurement["ctx_divergence"], [])
+                self.assertEqual(measurement["ctx_divergence_stats"],
+                                 {"compared": 0, "skipped_stale": 0, "skipped_missing": 0,
+                                  "skipped_dead": 0, "skipped_missing_module": 2})
+            self.assertEqual(runner.enqueues + runner.drains + runner.sends + runner.emits, [])
+
+    def test_dead_gate_matches_context_picker(self):
+        """exited/agent_alive 3상 조합·키 결측: 확정 사망만 skipped_dead, 미관측은 비교."""
+        for exited in (True, False, None):
+            for alive in (True, False, None):
+                with self.subTest(exited=exited, agent_alive=alive):
+                    n = dict(node(), exited=exited, agent_alive=alive)
+                    dead = exited is True or alive is False
+                    stats = {}
+                    self.assertEqual(len(G.ctx_divergence([n], stats)), 0 if dead else 1)
+                    self.assertEqual(G._pick_node_ctx(n)[1] == "dead", dead)
+                    self.assertEqual(stats, {"compared": int(not dead), "skipped_stale": 0,
+                                             "skipped_missing": 0, "skipped_dead": int(dead),
+                                             "skipped_missing_module": 0})
+        unknown = node()
+        del unknown["agent_alive"]
+        self.assertEqual(len(G.ctx_divergence([unknown])), 1)
+
+    def test_dead_node_clears_observation_and_records_skip(self):
+        """살아 있던 괴리 좌석의 사망 확정 → 동결값 배지·사유 해소, skipped_dead 기록."""
+        for death in ({"exited": True}, {"agent_alive": False}):
+            with self.subTest(death=death), tempfile.TemporaryDirectory() as t, \
+                    patch.object(G, "foreign_daemon_verdict", return_value=None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                n = node(measured=20, reported=95)
+                runner = FakeRunner(rep=report(live_nodes=[n]))
+                g = gate(t, runner)
+                self.assertEqual(g.run(), 0)
+                self.assertIn("gate-ctx-divergence-worker", badges(t))
+                n.update(death)
+                self.assertEqual(g.run(), 0)
+                self.assertNotIn("gate-ctx-divergence-worker", badges(t))
+                self.assertFalse(any(r.startswith("ctx_divergence:")
+                                     for r in ledger_entries(t)[-1]["reasons"]))
+                with open(g.measure_path, encoding="utf-8") as f:
+                    measurement = json.load(f)
+                self.assertEqual(measurement["ctx_divergence"], [])
+                self.assertEqual(measurement["ctx_divergence_stats"],
+                                 {"compared": 0, "skipped_stale": 0, "skipped_missing": 0,
+                                  "skipped_dead": 1, "skipped_missing_module": 0})
 
     def test_gate_env_override(self):
         """게이트도 CYS_CTX_DIVERGENCE_PCT 환경값을 소비한다."""
@@ -311,6 +400,24 @@ class HudContextFreshness(unittest.TestCase):
         self.assertIsNone(HB.pick_ctx({"status": {"context_pct": 95}}))
         self.assertEqual(HB.pick_ctx({"usage": {"ctx_pct": 0},
                                      "status": {"context_pct": 95, "age_secs": 301}}), 0)
+
+    def test_dead_seat_frozen_measurement_is_none(self):
+        """HUD 사망 게이트: exited True / agent_alive False 면 동결 실측·신선 자기보고 모두 None."""
+        for dead in ({"exited": True}, {"agent_alive": False}, {"exited": True, "agent_alive": False},
+                     {"exited": True, "agent_alive": True}, {"exited": False, "agent_alive": False}):
+            with self.subTest(dead=dead):
+                self.assertIsNone(HB.pick_ctx(dict(dead, usage={"ctx_pct": 95},
+                                                   status={"context_pct": 95, "age_secs": 10})))
+                self.assertIsNone(HB.pick_ctx(dict(dead, status={"context_pct": 95, "age_secs": 10})))
+
+    def test_null_or_absent_liveness_does_not_gate(self):
+        """HUD 사망 게이트: None/부재/exited False/agent_alive True 는 게이트를 열지 않는다(값 유지)."""
+        for alive in ({}, {"exited": None}, {"agent_alive": None}, {"exited": False},
+                      {"agent_alive": True}, {"exited": False, "agent_alive": None},
+                      {"exited": None, "agent_alive": True}, {"exited": False, "agent_alive": True}):
+            with self.subTest(alive=alive):
+                self.assertEqual(HB.pick_ctx(dict(alive, usage={"ctx_pct": 95})), 95)
+                self.assertEqual(HB.pick_ctx(dict(alive, status={"context_pct": 95, "age_secs": 10})), 95)
 
 
 class PassResult(unittest.TextTestResult):

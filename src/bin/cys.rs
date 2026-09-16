@@ -6849,12 +6849,36 @@ fn diag_stale_lock(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
 }
 
 /// L5 진행중 staging 보호 임계(초) — 이 시간 내 수정된 staging은 doctor --fix가 삭제하지 않는다.
-/// 기본 60초·env override(테스트는 0으로 보호 해제). 0이면 항상 삭제(보호 off).
+/// 기본 60초·env `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` override(테스트는 0으로 보호 해제).
+/// **0 = 진행중 보호뿐 아니라 측정불능 보호(mtime 미상·미래)까지 해제(탈출구)** — 미래 mtime 은
+/// 영구 상태일 수 있어(시계 역행·타임스탬프 보존 복원) `doctor`(WARN) ↔ `--fix`(보호) 왕복을 끊는
+/// 유일한 길이다. 그래서 무효 값(`off`·`-1`·빈 값)이 조용히 60 으로 떨어지면 탈출구가 막힌 채
+/// 침묵한다 → 파싱 실패/음수는 기본 60 을 쓰되 stderr 1줄로 가청화한다(앞뒤 공백은 허용: `"0 "` → 0).
+/// 실패 방향: 못 읽으면 보호 on(60) 쪽 — 삭제로 미끄러지지 않고, 침묵하지도 않는다.
 fn staging_protect_secs() -> u64 {
-    std::env::var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60)
+    let raw = std::env::var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS").ok();
+    let (secs, warn) = parse_staging_protect_secs(raw.as_deref());
+    if let Some(w) = warn {
+        eprintln!("{w}");
+    }
+    secs
+}
+
+/// `staging_protect_secs` 의 순수 파서 — (값, 무효 시 stderr 경고 1줄). `None`(env 부재) = 기본 60·경고 없음.
+/// 비음수 정수만 유효(u64 파싱이라 `-1` 은 무효) · 무효 → (60, Some(경고)). 검체가 stderr 캡처 없이 경고 문구를 못박는다.
+fn parse_staging_protect_secs(raw: Option<&str>) -> (u64, Option<String>) {
+    match raw {
+        None => (60, None),
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(v) => (v, None),
+            Err(_) => (
+                60,
+                Some(format!(
+                    "[doctor] CYS_DOCTOR_STAGING_MIN_IDLE_SECS='{s}' 무효(비음수 정수만) — 기본 60s(보호 on)"
+                )),
+            ),
+        },
+    }
 }
 
 /// staging 디렉토리(자신+직속 엔트리)의 최신 수정 후 경과 초(L5 진행중 보호용). 실패 시 None.
@@ -6898,19 +6922,21 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         let mut fail = 0usize;
         let mut skipped = 0usize;
         let mut unmeasurable = 0usize;
+        // 보호창은 루프 밖에서 한 번만 읽는다 — 무효 env 의 stderr 경고가 잔재 수만큼 반복되지 않게.
+        let protect = staging_protect_secs();
         for p in &residue {
             // L5: 진행중(최근 N초 내 수정) staging은 삭제하지 않는다 — 무중단 배포/init 도중
             // 스테이징을 파괴해 배포를 깨는 것을 방지.
             // ★mtime 미상(= idle 측정 실패)도 **보호**한다 — 설계 결정 변경.
             //   종전(d422e0b)은 mtime 미상=삭제 진행이었다. 2026-09-15 결정: 측정 불능은 통과가
-            //   아니다(CLAUDE.md §8) · 비가역 삭제는 denylist(설계 명제 ⑩). 측정 불능에서 파괴를
+            //   아니다(cysjavis-pack/directives/MASTER_DIRECTIVE.md "측정 불능은 어떤 게이트에서도
+            //   통과가 아니다" — 내용 앵커) · 비가역 삭제는 denylist(설계 명제 ⑩). 측정 불능에서 파괴를
             //   진행하는 것은 보수적이 아니다 — 보수적인 쪽은 지우지 않고 다음 라운드로 미루는 것이다.
             //   (`staging_idle_secs` 는 metadata/modified 실패, 그리고 **미래 mtime**(시계 역행·
             //    타임스탬프 보존 복원)에서 None 을 낸다.) 진행중 보호(skipped)와 따로 센다(unmeasurable)
             //   — 운영자가 "아직 쓰는 중"과 "잴 수 없음"을 doctor 출력에서 구별하도록.
             //   실패 방향: 못 재면 보호(skip) 쪽 — 잔재는 다음 라운드/보호 off(env=0)로 넘긴다.
             //   `protect == 0`(보호 off)이면 바깥 if 가 건너뛰어 종전처럼 항상 삭제한다.
-            let protect = staging_protect_secs();
             if protect > 0 {
                 match staging_idle_secs(p) {
                     None => {
@@ -6946,7 +6972,10 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                     String::new()
                 },
                 if unmeasurable > 0 {
-                    format!(", {unmeasurable}건 측정불능 보호(mtime 미상·미래)")
+                    // 미래 mtime 은 영구일 수 있다 — 탈출구를 문구 안에 적지 않으면 doctor↔--fix 무한 왕복.
+                    format!(
+                        ", {unmeasurable}건 측정불능 보호(mtime 미상·미래 — 영구면 CYS_DOCTOR_STAGING_MIN_IDLE_SECS=0 으로 보호 해제 후 --fix)"
+                    )
                 } else {
                     String::new()
                 },
@@ -6962,7 +6991,9 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             name: "staging-residue",
             status: DiagStatus::Warn,
             detail: format!("staging 잔재 {}건", residue.len()),
-            action: "cys doctor --fix 로 정리".into(),
+            // 진행중·측정불능(mtime 미상·미래) 잔재는 --fix 가 보호해 남긴다 — 미래 mtime 은 영구일 수 있어
+            // 탈출구를 여기에도 적는다(안 적으면 WARN → --fix → WARN 왕복에 출구 안내 0곳).
+            action: "cys doctor --fix 로 정리(진행중·측정불능 잔재는 보호되어 남는다 — 영구면 CYS_DOCTOR_STAGING_MIN_IDLE_SECS=0 으로 보호 해제 후 --fix)".into(),
         }
     }
 }
@@ -26660,8 +26691,14 @@ mod tests {
         std::fs::create_dir_all(base.join(".pack-staging")).unwrap();
         std::fs::create_dir_all(base.join("pack.prev")).unwrap();
         std::fs::write(base.join("pack.prev/x"), "keep").unwrap();
-        // 잔재 감지 → WARN
-        assert_eq!(diag_staging_residue(&ctx, false).status, DiagStatus::Warn);
+        // 잔재 감지 → WARN · 안내 문구에 탈출구(보호 해제 env) 병기 — 미래 mtime 영구 잔재의 왕복 출구.
+        let warn = diag_staging_residue(&ctx, false);
+        assert_eq!(warn.status, DiagStatus::Warn);
+        assert!(
+            warn.action.contains("CYS_DOCTOR_STAGING_MIN_IDLE_SECS=0"),
+            "비-fix 안내에 탈출구 병기: {}",
+            warn.action
+        );
         // --fix → 정리, .prev 보존
         assert_eq!(diag_staging_residue(&ctx, true).status, DiagStatus::Ok);
         assert!(!base.join(".pack-staging-init-999").exists());
@@ -26730,8 +26767,44 @@ mod tests {
         );
         assert_eq!(d.status, DiagStatus::Warn, "보호로 남은 잔재는 WARN: {}", d.action);
         assert!(d.action.contains("측정불능 보호"), "측정불능 보호 사유 보고: {}", d.action);
+        assert!(
+            d.action.contains("CYS_DOCTOR_STAGING_MIN_IDLE_SECS=0"),
+            "측정불능 보호 조각에 탈출구 병기(영구 미래 mtime 의 왕복 출구): {}",
+            d.action
+        );
         let _ = std::fs::remove_dir_all(&base);
         // _env drop → 이전 값 복원.
+    }
+
+    /// 탈출구 노브 `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` 파싱 — 무효 값(`off`·`-1`·빈 값·소수·단위)은
+    /// 조용히 60 이 아니라 **60 + stderr 경고 1줄**(가청화) · `"0"`(앞뒤 공백 허용)은 0(측정불능 보호까지 해제).
+    /// 실패 방향: 못 읽으면 보호 on(60) 쪽 — 삭제로 미끄러지지 않고, 침묵하지도 않는다.
+    #[test]
+    fn staging_protect_secs_invalid_is_audible_and_zero_is_escape_hatch() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 순수 파서: (값, 경고) 쌍을 직접 검사 — stderr 캡처 없이 경고 문구를 못박는다.
+        for bad in ["off", "-1", "", " ", "60s", "1.5"] {
+            let (v, w) = parse_staging_protect_secs(Some(bad));
+            assert_eq!(v, 60, "무효 값 {bad:?} 는 기본 60(보호 on)");
+            let w = w.unwrap_or_else(|| panic!("무효 값 {bad:?} 에 경고가 없다(조용한 복귀 금지)"));
+            assert!(w.starts_with("[doctor] CYS_DOCTOR_STAGING_MIN_IDLE_SECS="), "경고 접두: {w}");
+            assert!(w.contains("무효") && w.contains("기본 60"), "경고 본문(무효 · 기본 60): {w}");
+        }
+        for (ok, want) in [("0", 0u64), (" 0 ", 0), ("60", 60), ("3600", 3600)] {
+            let (v, w) = parse_staging_protect_secs(Some(ok));
+            assert_eq!(v, want, "유효 값 {ok:?}");
+            assert!(w.is_none(), "유효 값 {ok:?} 에 경고가 붙었다: {w:?}");
+        }
+        assert_eq!(parse_staging_protect_secs(None), (60, None), "env 부재 = 기본 60 · 경고 없음");
+        // env 경유 실제 판독 경로(EnvGuard 로 이전 값 복원).
+        {
+            let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "off");
+            assert_eq!(staging_protect_secs(), 60, "env 'off' → 60(보호 on)");
+        }
+        {
+            let _env = cys::pack::EnvGuard::set("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
+            assert_eq!(staging_protect_secs(), 0, "env '0' → 0(탈출구)");
+        }
     }
 
     #[test]

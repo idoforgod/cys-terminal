@@ -2443,6 +2443,10 @@ pub struct Daemon {
     /// T4-15 kill-switch: pause 중에는 큐 배달·스케줄 발화가 동결된다 (직접 send는 통과)
     pub paused: AtomicBool,
     pub pause_info: Mutex<Option<PauseInfo>>,
+    /// ★(성찰 2회 · 2/3) `persist_pause` 직렬화 락(`queue_persist_lock` 관례 동형) — `write_json_atomic`
+    ///   의 tmp 이름이 고정(`.autopilot.json.tmp`)이라 pause/resume 핸들러가 동시에 영속하면 tmp 를
+    ///   서로 덮어 찢어진 파일이 rename 될 수 있다. 실패 방향: 락 아래 마지막 쓰기가 최신 상태다.
+    pub pause_persist_lock: Mutex<()>,
     /// T3-9 todo 워치: path → (done, total, mtime)
     pub todo_progress: Mutex<HashMap<String, (u64, u64, f64)>>,
     /// C2 선언 판정 캐시(Declared State): path → (mtime, verdict 케밥 문자열, 선언 owner).
@@ -3451,21 +3455,47 @@ impl Daemon {
             }
         }
         // T4-15 kill-switch 상태 복원 — 재부팅 후에도 pause는 유지된다 (명시 resume까지)
-        let pause_restored: Option<PauseInfo> = std::fs::read_to_string(dir.join("autopilot.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .filter(|v| v["paused"].as_bool() == Some(true))
-            .map(|v| PauseInfo {
-                since: v["since"].as_f64().unwrap_or_else(now_epoch),
-                // 실패 방향: 구 포맷의 빈 사유·읽을 수 없는 설정자는 결측으로 복원하고 pause 는 유지한다.
-                reason: v["reason"]
-                    .as_str()
-                    .map(|r| r.trim().to_string())
-                    .filter(|r| !r.is_empty()),
-                actor_pid: v["actor_pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
-                actor_surface: v["actor_surface"].as_u64(),
-                actor_role: v["actor_role"].as_str().map(str::to_string),
-            });
+        // ★(성찰 2회 · 2/3) **손상 = fail-closed.** 종전에는 읽기·파싱 실패가 `.ok()` 로 접혀
+        //   paused=false 가 됐다 — 부분 쓰기(비원자 `fs::write` 시절)·빈 파일·손상이 kill-switch 를
+        //   조용히 풀었다(fail-open). 이제 파일이 **존재하는데** 읽을 수 없거나 JSON 이 아니거나
+        //   `paused` 불리언이 없으면 동결 유지(reason·설정자 None · since=now) + stderr 1줄.
+        //   부재(NotFound)만 "동결 없음" 이고, 명시 `{"paused":false}` 도 동결 없음이다.
+        //   실패 방향: 손상이면 **동결 쪽** — 운영자가 `cys resume` 으로 해제하면 `persist_pause` 가
+        //   완본을 다시 써 손상이 지워진다. 영속은 `write_json_atomic` 이라 새 손상은 생기지 않는다.
+        let corrupt_pause = |what: &str| -> Option<PauseInfo> {
+            eprintln!("[cysd] autopilot.json 손상 — 동결 유지 · cys resume 로 해제 ({what})");
+            Some(PauseInfo {
+                since: now_epoch(),
+                reason: None,
+                actor_pid: None,
+                actor_surface: None,
+                actor_role: None,
+            })
+        };
+        let pause_restored: Option<PauseInfo> =
+            match std::fs::read_to_string(dir.join("autopilot.json")) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => corrupt_pause(&format!("읽기 실패: {e}")),
+                Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+                    Err(e) => corrupt_pause(&format!("JSON 파싱 실패: {e}")),
+                    Ok(v) => match v["paused"].as_bool() {
+                        None => corrupt_pause("paused 불리언 부재"),
+                        Some(false) => None,
+                        Some(true) => Some(PauseInfo {
+                            since: v["since"].as_f64().unwrap_or_else(now_epoch),
+                            // 실패 방향: 구 포맷의 빈 사유·읽을 수 없는 설정자는 결측으로 복원하고
+                            // pause 는 유지한다.
+                            reason: v["reason"]
+                                .as_str()
+                                .map(|r| r.trim().to_string())
+                                .filter(|r| !r.is_empty()),
+                            actor_pid: v["actor_pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+                            actor_surface: v["actor_surface"].as_u64(),
+                            actor_role: v["actor_role"].as_str().map(str::to_string),
+                        }),
+                    },
+                },
+            };
         // ★GUI 오퍼레이터 승인(오너 2026-07-15): 오퍼레이터 토큰 발급 — 소켓 listen 전(new 내부)에
         // 기동마다 재발급·덮어쓰기해 파일=메모리 정합을 데몬 재시작(churn)에도 유지한다. GUI(Tauri)가
         // 이 파일을 매 호출 신선 재독해 feed.reply에 첨부. 실패는 비치명(로그만) — 부트체인 차단 금지.
@@ -3588,6 +3618,7 @@ impl Daemon {
             health_suppressed: Mutex::new(HashMap::new()),
             paused: AtomicBool::new(pause_restored.is_some()),
             pause_info: Mutex::new(pause_restored),
+            pause_persist_lock: Mutex::new(()),
             todo_progress: Mutex::new(HashMap::new()),
             todo_verdict: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
@@ -5180,7 +5211,13 @@ impl Daemon {
     }
 
     /// T4-15 pause 상태 영속 — 데몬 재시작 후에도 kill-switch가 유지된다.
+    /// ★(성찰 2회 · 2/3) **원자 교체**(`governance::write_json_atomic`: tmp 쓰기 → fsync → rename →
+    ///   dir fsync). 종전 `fs::write` 는 truncate 후 쓰기라 그 사이 크래시가 빈 파일·부분 파일을
+    ///   남겼고, 복원이 그것을 paused=false 로 접었다(fail-open). 이제 디스크에는 옛 완본 아니면 새
+    ///   완본만 있다. 실패 방향: 쓰기 실패면 옛 완본이 남는다(stderr 1줄) — 재시작은 직전 상태를
+    ///   복원한다(새 상태 소실은 있어도 손상은 없다). 직렬화: `pause_persist_lock`(tmp 이름 고정).
     pub fn persist_pause(&self) {
+        let _serial = self.pause_persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = state_dir(&self.socket_path);
         let info = self.pause_info.lock().unwrap().clone();
         let v = match (
@@ -5195,7 +5232,9 @@ impl Daemon {
             }
             _ => json!({"paused": false}),
         };
-        let _ = std::fs::write(dir.join("autopilot.json"), v.to_string());
+        if let Err(e) = crate::governance::write_json_atomic(&dir, "autopilot.json", &v.to_string()) {
+            eprintln!("[cysd] autopilot.json 영속 실패({e}) — 디스크에는 직전 완본이 남는다");
+        }
     }
 
     pub fn get_surface(&self, id: u64) -> Option<Arc<Surface>> {

@@ -1950,6 +1950,8 @@ def _boot_elapsed(override=None, started_at_by_sock=None, now=None):
         열리지 않는다(발동 조건 ⓐ의 수리). 새 세대의 first_seen 은 `min(now, mtime)` — mtime 은
         그 파일이 마지막으로 쓰인 시각이라 세대 시작의 **상한**이다(백업 복원으로 옛 nonce·옛 mtime
         이 온 형상에서 now 를 쓰면 없는 부트에 유예가 선다). 안 A 가 있으면 그 시각으로 앞당긴다.
+        ★미래 mtime(now + 1s 초과)은 근거가 아니다 → "clock_backwards"(유예 없음 · 상태 미기록) —
+          `min` 이 now 를 골라 경과 0 으로 창을 여는 fail-open(성찰2 리뷰 2/3)을 막는다.
         ★한계(fail-open 성분 · 그래서 A 가 1차다): 게이트가 부팅 직후에 한 번도 안 돌았으면
           first_seen 이 실제 부팅보다 **늦어** 유예가 그만큼 길어진다(세대당 최대 한 창 300s).
       · mtime 폴백(3차): 안 B 가 **불능**일 때만 — 내용이 nonce 형식이 아니거나(0바이트·파손)
@@ -2003,9 +2005,18 @@ def _boot_elapsed(override=None, started_at_by_sock=None, now=None):
             else:
                 first_seen = now
                 try:
-                    first_seen = min(now, os.path.getmtime(path))
+                    mtime = os.path.getmtime(path)
                 except OSError:
-                    pass
+                    mtime = None
+                if mtime is not None and mtime > now + 1.0:
+                    # ★성찰2(리뷰 2/3): **미래 mtime**(허용 오차 1s 초과)은 세대 first_seen 의 근거가
+                    #   아니다 — 종전 `min(now, mtime)` 은 now 를 골라 경과 0 = '갓 부팅' 으로 유예를
+                    #   열었다(fdd45f3 의 clock_backwards 에서 fail-open 회귀). 안 A(started_at)는 위에서
+                    #   이미 이겼으므로 여기는 근거 실패 = 유예 없음이고, 상태도 남기지 않는다(남기면
+                    #   다음 호출이 그 first_seen 으로 창을 연다). mtime 이 정상으로 돌아오면 그때 관측.
+                    return None, "clock_backwards"
+                if mtime is not None:
+                    first_seen = min(now, mtime)
                 if not _boot_nonce_write(spath, nonce, first_seen):
                     first_seen = None    # 상태를 못 남기면 세대 대조가 성립하지 않는다 → 폴백
             if first_seen is not None:
@@ -3370,6 +3381,10 @@ def _self_test_body(fails):
     import tempfile as _tf
     _bd = _tf.mkdtemp()
     saved_sock = os.environ.get("CYS_SOCKET")
+    # ★성찰2(리뷰 3/3): 레인 전용 변수 `CYS_GATE_LANE_SOCKET` 이 `CYS_SOCKET` 보다 우선한다
+    #   (`_lane_socket`) — (h2)처럼 실행 동안 떼어 두지 않으면 그 env 가 설정된 좌석에서 모든 핀이
+    #   `epoch_missing` 으로 거짓 실패한다(run_bootstrap_health H-EXIT-5 가 이 rc 를 요구).
+    saved_lane_h = os.environ.pop("CYS_GATE_LANE_SOCKET", None)
     try:
         os.environ["CYS_SOCKET"] = os.path.join(_bd, "cys.sock")
         el, why = _boot_elapsed()
@@ -3401,6 +3416,23 @@ def _self_test_body(fails):
         el, why = _boot_elapsed(started_at_by_sock={_k: _t0 + 50}, now=_t0)
         chk(el is None and why == "clock_backwards",
             "미래 started_at 이 '갓 부팅'으로 읽혀 유예가 열렸다: %r/%r" % (el, why))
+        # ★성찰2(리뷰 2/3): 새 세대 + **미래 mtime**(허용 오차 1s 초과) — 종전 `min(now, mtime)` 은
+        #   now 를 골라 경과 0 으로 유예를 열었다(fdd45f3 의 clock_backwards 에서 fail-open 회귀).
+        #   근거 실패 = 유예 없음이고 상태도 남기지 않아 **다음 호출**도 열리지 않는다. 오차 안(+0.5s)은
+        #   '갓 쓴 파일' 로 읽는다(파일시스템 시각 입도·미세 스큐).
+        with open(_bp, "w", encoding="utf-8") as f:
+            f.write("67890\n")
+        os.utime(_bp, (_t0 + 3600, _t0 + 3600))
+        el, why = _boot_elapsed(now=_t0)
+        chk(el is None and why == "clock_backwards",
+            "새 nonce + 미래 mtime 이 '갓 부팅'으로 읽혀 유예가 열렸다(안 B fail-open 회귀): %r/%r" % (el, why))
+        el, why = _boot_elapsed(now=_t0 + 10)
+        chk(el is None and why == "clock_backwards",
+            "미래 mtime 세대가 상태에 남아 다음 호출에 유예가 열렸다: %r/%r" % (el, why))
+        os.utime(_bp, (_t0 + 0.5, _t0 + 0.5))
+        el, why = _boot_elapsed(now=_t0)
+        chk(el is not None and abs(el) < 1e-6 and why == "nonce",
+            "허용 오차(1s) 안의 mtime 이 '갓 쓴 파일'로 안 읽힘: %r/%r" % (el, why))
         # mtime 폴백은 안 B 불능(내용이 nonce 가 아님)일 때만 — 그리고 그 사실이 reason 에 남는다.
         with open(_bp, "w", encoding="utf-8") as f:
             f.write("not-a-nonce\n")
@@ -3421,6 +3453,8 @@ def _self_test_body(fails):
             os.environ.pop("CYS_SOCKET", None)
         else:
             os.environ["CYS_SOCKET"] = saved_sock
+        if saved_lane_h is not None:
+            os.environ["CYS_GATE_LANE_SOCKET"] = saved_lane_h
         _sh.rmtree(_bd, ignore_errors=True)
     # (h2) ★R1 minor — 프로덕션 **기본 경로**(CYS_SOCKET 미설정)를 핀한다. 상수를 바꾸면 유예가
     #      조용히 `epoch_missing` 으로 사라진다(방향은 안전하나 봉인표 ③ 완화 장치가 없어진다).
@@ -3920,8 +3954,8 @@ def _self_test_body(fails):
           " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
           "비정수 env 가청화·nodes 미측정 무예외)"
           " + WP-7 codex 위임 반례 4종(합계 오버플로·진단 예외 격리·override 밀폐 2)"
-          " + WP-7 함대CPU/부트유예 30종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
-          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 6종·boot-epoch 앵커 10종"
+          " + WP-7 함대CPU/부트유예 33종(임계 3점·유예 4점+비CPU축 음성대조·load soft전용·"
+          "07:07 재생·ps부재 unavailable 4핀·ps실패 soft·순수 합산 6종·boot-epoch 앵커 13종"
           "(WP6-6: nonce 세대·started_at·mtime 폴백 표기·시계 역행)+기본경로 1)"
           " + ★R1 리뷰 반영 33종(argv0 소유권: B2 오탐 14 반례 + 진짜 형상 15 음성대조(실측 5 포함) ·"
           " PID 자기제외 2 · 보류 상한 4점+타축 불변+warnings 불변+래치 순수 10 ·"

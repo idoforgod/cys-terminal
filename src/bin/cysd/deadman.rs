@@ -7,7 +7,14 @@
 //!
 //! 안전 원칙:
 //! - **fail-closed**: 홀더 pid 미상(구 락파일)·프로세스명 검증 실패·판정 애매 = 어떤 개입도 없이 exit.
+//!   단, heartbeat **측정 불능**(파일 부재·미래 mtime = 시계 역행)은 '판정 애매' 가 아니라 **stale** 로
+//!   접힌다(`heartbeat_stale` — 수리 WP-2-A 유지). 그 칸에서 산 홀더를 지키는 것은 프로브 응답뿐이다.
 //! - **무손실**: 건강한 홀더는 버전이 낮아도 절대 인수하지 않는다(인수=PTY 전멸). 오직 dead일 때만.
+//!   **보증 범위 = 단발 2s 프로브(`PROBE_TIMEOUT` · main.rs `probe_holder` 1회)에 응답한 홀더**다.
+//!   응답 못 한 산 홀더는 heartbeat 신선도가 지키는데, 미래 mtime 은 그 증거를 통째로 버리므로
+//!   [단발 프로브 실패] × [미래 mtime] 창에서는 산 홀더도 회수 대상이다(정직 · `heartbeat_stale` 킬 창
+//!   주석). 살아서 tick 이 도는 데몬은 `HEARTBEAT_INTERVAL`(10s) 마다 `touch_heartbeat`(mtime=now) 하므로
+//!   미래 mtime 을 **10s 안에 스스로 해소**한다 — 그 창은 지속 상태가 아니라 한 틱 길이다.
 //! - **오살상 차단**: SIGTERM 전 pid의 프로세스명이 cysd인지 확인(pid 재사용 방어 — channels.rs MED-4 원칙).
 #![cfg(unix)]
 
@@ -40,9 +47,13 @@ pub fn touch_heartbeat(path: &Path) {
     let _ = std::fs::write(path, now.to_string());
 }
 
-/// heartbeat가 stale한가 — mtime이 now보다 threshold 이상 과거이면 true.
-/// 파일 부재·mtime 조회 실패 = stale로 간주(살아있는 데몬은 락 획득 직후 반드시 touch하므로
-/// 부재=비정상). 단, 데드맨은 [무응답 && stale] 교차조건이라, 방금 뜬 데몬은 probe 응답으로 걸러진다.
+/// heartbeat가 stale한가 — mtime이 now보다 threshold **초과** 과거이거나, **측정 불능**(파일 부재·
+/// mtime 조회 실패·미래 mtime = 시계 역행)이면 true.
+/// 파일 부재 = 비정상(살아있는 데몬은 락 획득 직후 반드시 touch). 미래 mtime 은 `elapsed()` 가 Err 라
+/// 조회 실패와 **같은 방향**(stale = fail-closed)으로 접는다. 단, 데드맨은 [무응답 && stale] 교차조건이라
+/// 방금 뜬 데몬은 probe 응답으로 걸러진다 — 그 보증 범위는 **단발 2s 프로브에 응답한 홀더**다.
+/// 살아서 tick 이 도는 데몬은 `HEARTBEAT_INTERVAL`(10s) 마다 touch(mtime=now) 하므로 미래 mtime 을
+/// 10s 안에 스스로 해소한다(미래 mtime 은 한 틱짜리 창이지 지속 상태가 아니다).
 pub fn heartbeat_stale(path: &Path, threshold: Duration) -> bool {
     match std::fs::metadata(path).and_then(|m| m.modified()) {
         // ★mtime 이 **미래**면 `elapsed()` 는 Err 다(시계 역행·미래 타임스탬프를 보존한 state 복원).

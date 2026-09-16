@@ -37,6 +37,11 @@ ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 ·
 저장: <state>/formation/<socket-key>.json  (state = CYS_STATE_DIR or ~/.cys/state — 기존 관례).
   선택 키(비어 있으면 생략 = 종전 레인 바이트 동일 규약): external_roles · attempts(시도 원장) ·
   gate(pending-resource 때 게이트 JSON 축약 verdict/trips/warnings/measured) · held(시도 원장 보류 목록).
+  심박 흔적 키(선택 · dcfc728 `_touch_state` 전용 · **판정 키 아님**): last_tick · last_tick_epoch ·
+  last_tick_note — 싱글플라이트 락 실패(partial:inflight)·`_cmd_ensure` 최후 예외 때만 **기존** 파일에
+  덧쓴다(파일 부재면 생성 안 함 · state/kind/updated_* 불변). 소멸 규칙(코드 확인): 정상 `_write_state` 는
+  이전 파일을 읽지 않고 새 dict 를 통째 교체(_replace_state_obj)하므로 다음 정상 판정 기록에서 세 키는
+  **지워진다**(보존 안 함). 세 키가 남아 있다 = 마지막 판정 이후 심박은 닿았으나 새 판정은 기록되지 않았다.
 
 CLI:
   python3 javis_formation.py ensure --socket <S> [--cwd D] [--json] [--force-surface]
@@ -884,7 +889,10 @@ def _write_state(socket, state, detail, roles_booted, attempts=None, gate=None, 
     # ★A2(SURVEY B2·B3): pending-resource 의 게이트 JSON 축약(gate) · 시도 원장 보류 목록(held) — 같은
     #   규약(비어 있으면 키 없음 = 종전 레인 바이트 동일). 게이트 JSON 이 파일에 남아야 "어느 축이 hard
     #   였나"를 사후에 알 수 있고(종전엔 미영속 — 게이트를 손으로 재실행하는 것이 유일한 경로였다),
-    #   held 가 남아야 소진 보류가 stderr 1줄(심박 명령 꼬리 `|| true` 가 삼킴) 밖으로 나온다.
+    #   held 가 남아야 소진 보류가 stderr 1줄 밖으로 나온다 — 심박 명령 꼬리는 dcfc728 이후 `|| rc=1 …
+    #   exit $rc`(부서별 rc 누적)이지만 `_cmd_ensure` 는 failed 만 exit 1 이고 스케줄러(schedule.rs
+    #   fire_command)는 exit 0 이면 stderr 를 버리므로(schedule.error 는 비0 에서만) held(exit 0) 의
+    #   stderr 1줄은 지금도 어디에도 남지 않는다 → 상태파일 held 키가 유일한 흔적.
     if gate:
         obj["gate"] = gate
     if held:
@@ -1150,9 +1158,11 @@ def ensure(socket=None, cwd=None, force_surface=False):
         # 표면화) 로 교체한다. 편성 ensure 가 스케줄 주기(10분)로 붙으면 매 틱마다 사용자에게 토스트가
         # 갔다. prev 는 ensure 진입부에서 읽은 직전 상태 — 동일 kind 면 _surface 계약대로 생략된다.
         _surface(socket, prev, state, force=force_surface)
-        # ★A2(SURVEY B3 Q2-①): 소진/쿨다운 보류는 종전 stderr 1줄뿐이라 심박 명령 꼬리의 `|| true` 가
-        #   삼켰다(어디에도 남지 않음). 상태파일 held 키(위) + 보류 목록이 **직전 상태파일과 달라졌을
-        #   때만** feed 1건 — 같은 보류가 유지되는 매 틱은 침묵(스팸 0) · 해소는 키 소멸로만 표기.
+        # ★A2(SURVEY B3 Q2-①): 소진/쿨다운 보류는 종전 stderr 1줄뿐이라 어디에도 남지 않았다 — 심박 명령
+        #   꼬리는 dcfc728 이후 `|| rc=1 … exit $rc`(부서별 rc 누적)로 바뀌었지만 held 는 exit 0(failed 만
+        #   1 · _cmd_ensure)이라 스케줄러가 stderr 를 버리는(schedule.error 는 비0 에서만) 사정은 지금도
+        #   같다. 상태파일 held 키(위) + 보류 목록이 **직전 상태파일과 달라졌을 때만** feed 1건 — 같은
+        #   보류가 유지되는 매 틱은 침묵(스팸 0) · 해소는 키 소멸로만 표기.
         if held and held != (prev_obj.get("held") or []):
             _feed(HELD_FEED_TITLE,
                   "%s — 쿨다운/소진 원장에 따라 자동 재시도(소진 래치는 역할 생존 관측 또는 %.0fs 경과 시 "
@@ -1469,6 +1479,17 @@ def self_test():
 
 
 def _cmd_ensure(argv):
+    """CLI `ensure` — stdout JSON 1줄 + exit 코드(심박 dcfc728 `|| rc=1 … exit $rc` 가 읽는 값).
+
+    exit 0 = complete · partial:*(booting·missing_clis·inflight·paused·gate-unknown) · pending-cli:* ·
+             pending-resource — held(시도 원장 보류)가 붙어 있어도 0.
+    exit 1 = state_kind == "failed" 뿐. `classify()` 는 `failed` 를 돌려주지 않고(반환 집합: pending-resource /
+             pending-cli:* / complete / partial:*), `ensure()` 의 모든 return 도 그 집합 안이다 — exit 1 에
+             닿는 길은 아래 최후 예외(catch-all · state="failed:<예외명>")뿐이며, 인터프리터 사고
+             (SystemExit·KeyboardInterrupt·구문 오류)는 이 return 에 닿지 않은 채 파이썬 자체 비0 으로 끝난다.
+    실패 방향: 예외 경로는 stdout JSON(ok=false)·상태파일 last_tick_note 에 남고 exit 1 → 심박 rc 누적으로
+      schedule.error 표면화. held·pending 은 exit 0 이라 rc 로는 보이지 않는다(상태파일 held/gate 키가 흔적).
+    """
     socket, cwd, as_json, force_surface = None, None, False, False
     i = 0
     while i < len(argv):

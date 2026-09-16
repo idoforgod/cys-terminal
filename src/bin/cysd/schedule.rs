@@ -198,7 +198,7 @@ const BUILTIN_JOBS_VERSION: u64 = 2;
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
 /// 담당). 각 항목에 `_builtin`/`_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의
 /// 미지 필드는 serde 가 무시). text_command 는 R-CLI-4 게이트가 이 코드 정의와의 정확 일치로 신뢰한다.
-/// ★(통합 2026-09-10 · 성찰 P3·P8) **표적 command 이관표** — `(id, 구 표현)`.
+/// ★(통합 2026-09-10 · 성찰 P3·P8) **표적 command 이관표** — `(id, 구 표현, 사유)`.
 ///
 /// 왜 필요한가: `apply_builtin_jobs` 는 같은 id·같은 마커·**같은 `_builtin_version`** 이면
 /// **무접촉**이다(중복 생성 0 이 그 계약). 그래서 builtin 의 `command` 문자열만 고치면 그 수정은
@@ -210,21 +210,33 @@ const BUILTIN_JOBS_VERSION: u64 = 2;
 /// 그래서 `action` 이관(위 X13 선례)과 **같은 규율**을 쓴다 — 이관 대상은 구 빌드가 심은
 /// **정확히 그 바이트열**뿐이고, 한 글자라도 다르면 운영자 편집으로 보고 건드리지 않는다.
 /// 실패 방향: 표에 없는 편집은 그대로 남는다(무접촉 = 종전 거동 · 침묵 소실 0).
-const BUILTIN_COMMAND_MIGRATIONS: &[(&str, &str)] = &[
+///
+/// ★(성찰 2회 · 3/3) 세 번째 원소 `사유` 는 이관 로그가 **맞은 항목의 결함**만 찍기 위한 것이다 —
+/// 종전엔 P3·P8 을 고정 나열해 WP6-5 이관에도 남의 사유가 찍혔다.
+///
+/// ★(성찰 2회 · 3/3) **dcfc728 의 중간 표현(`… --json || rc=1; done; exit $rc`)은 표에 넣지 않는다.**
+/// 그 표현은 어떤 태그에도 없다(`git tag --contains dcfc728` = 공집합 · 최신 태그 v0.14.33 의 조상
+/// 아님 · 이후 릴리스 범프 커밋 없음) = 미릴리스 — 설치본이 심은 적이 없는 바이트열은 이관 대상이
+/// 아니다(표는 "구 빌드가 실제로 심은 것" 만 담는다). 실패 방향: 그 표현을 손으로 심은 설치본이
+/// 있다면 무접촉(운영자 편집으로 취급 · 종전 거동 유지 · 소실 0).
+const BUILTIN_COMMAND_MIGRATIONS: &[(&str, &str, &str)] = &[
     // P3: `--cwd` 없이 편성을 재생성하던 심박(구 표현).
     (
         "formation-heartbeat",
         "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" --json || true; done",
+        "P3 편성 cwd 누락",
     ),
     // P8: `CYS_ROLE` 하나만 지우던 승격 틱(구 표현) — `CYS_SURFACE_ID` 로 좌석 신원이 샜다.
     (
         "ceo-promote-pending-tick",
         "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE \"$pk/bin/cys-dept\" promote-if-pending",
+        "P8 좌석 신원 누출",
     ),
     // WP6-5: ensure 비0 exit를 삼키던 심박(현재 builtin의 구 표현, 바이트 일치 이관).
     (
         "formation-heartbeat",
         "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || true; done",
+        "WP6-5 ensure 비0 exit 삼킴(부서 실패 불가시)",
     ),
 ];
 
@@ -336,7 +348,20 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "action": "command",
             "base_only": true,
             // 실패 방향: 부서별 실패를 누적해 표면화하되 나머지 부서·다음 주기 복구는 계속한다.
-            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || rc=1; done; exit $rc",
+            // ★(성찰 2회 · 3/3) 실패 **부서를 지목**한다 — `fire_command` 는 stderr 꼬리 200자만 남기므로
+            //   `rc=1` 만으로는 어느 부서가 실패했는지 알 수 없었다. 실패 분기에서 stderr 로
+            //   `formation-heartbeat: ensure failed dept=<부서>` 1줄을 낸다(팩의 예외 메시지 뒤에 붙어
+            //   꼬리 200자 안에 부서명이 남는다). 실패 방향: 여러 부서가 실패하면 꼬리에는 마지막
+            //   부서만 남을 수 있다(앞선 부서는 잘림) — 0 이 아니라 ≥1 을 지목한다.
+            // ★exit 1 도달 범위(정직 · 팩 `_cmd_ensure` 의 `return 1 if state_kind(state) == "failed" else 0` 과 정합): `javis_formation.py ensure`
+            //   는 `state_kind(state) == "failed"` 일 때만 1 을 돌리는데, `classify()`·`ensure()` 의
+            //   반환 집합은 complete / partial:* / pending-cli:* / pending-resource 뿐이라 `failed` 에 닿는
+            //   길은 **최후 catch-all(`except Exception` → state="failed:<예외명>")** 하나고, 그 밖의 비0
+            //   은 **인터프리터 사고**(python3 부재·구문 오류·SystemExit·시그널)다. held(시도 원장 보류)·
+            //   pending-*·partial:*(booting·inflight·paused·gate-unknown) 은 전부 **0** 이라 rc 로는 보이지
+            //   않는다(상태파일 held/gate 키가 흔적). 즉 이 잡의 exit 1 = "예외로 편성이 failed 로 확정"
+            //   또는 "파이썬이 못 돌았다" 이며, 평시 심박 소음이 아니다.
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || { rc=1; echo \"formation-heartbeat: ensure failed dept=$d\" >&2; }; done; exit $rc",
             "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -659,18 +684,24 @@ fn apply_builtin_jobs(
                     bj.get("command").and_then(|v| v.as_str()),
                     jobs[pos].get("command").and_then(|v| v.as_str()),
                 ) {
-                    if cur_cmd != want_cmd
-                        && BUILTIN_COMMAND_MIGRATIONS
+                    let known_bad = if cur_cmd != want_cmd {
+                        BUILTIN_COMMAND_MIGRATIONS
                             .iter()
-                            .any(|(mid, old)| *mid == id.as_str() && *old == cur_cmd)
-                    {
+                            .find(|(mid, old, _)| *mid == id.as_str() && *old == cur_cmd)
+                            .map(|(_, _, why)| *why)
+                    } else {
+                        None
+                    };
+                    if let Some(why) = known_bad {
                         let want_cmd = want_cmd.to_string();
                         if let Some(o) = jobs[pos].as_object_mut() {
                             o.insert("command".into(), serde_json::json!(want_cmd));
                         }
                         changed = true;
+                        // ★(성찰 2회) 사유는 **맞은 항목의 것**만 찍는다 — 종전엔 P3·P8 을 고정 나열해
+                        //   WP6-5 이관에도 남의 사유가 찍혔다(로그를 읽는 사람이 엉뚱한 결함을 찾는다).
                         eprintln!(
-                            "[cysd] ensure_builtin_jobs: '{id}' 의 command 를 구 표현에서 이관 — 그 표현은 알려진 결함이다(P3 편성 cwd 누락 · P8 좌석 신원 누출)"
+                            "[cysd] ensure_builtin_jobs: '{id}' 의 command 를 구 표현에서 이관 — 그 표현은 알려진 결함이다({why})"
                         );
                     }
                 }
@@ -3827,13 +3858,17 @@ mod merge_residue_tests {
         assert!(form.contains(r#"if a == "--cwd""#), "javis_formation 이 --cwd 를 읽지 않는다");
     }
 
-    /// ★WP6-5 — ensure 실패를 누적하되 뒤 부서도 실행한다.
-    /// 실패 방향: 중간 부서 실패를 마지막 부서 성공으로 가리면 schedule.error가 사라진다.
+    /// ★WP6-5 — ensure 실패를 누적하되 뒤 부서도 실행한다 · (성찰 2회) 실패 부서를 stderr 로 지목한다.
+    /// 실패 방향: 중간 부서 실패를 마지막 부서 성공으로 가리면 schedule.error가 사라진다 · 부서명이
+    /// 없으면 `rc=1` 만 남아 어느 부서를 봐야 하는지 모른다 · 성공 부서가 지목되면 오진이다.
     #[test]
     fn formation_heartbeat_surfaces_a_failing_ensure() {
         let cmd = builtin("formation-heartbeat")["command"].as_str().unwrap().to_string();
         assert!(!cmd.contains(concat!("--json ||", " true")), "ensure 실패를 삼킨다: {cmd}");
-        assert!(cmd.contains("--json || rc=1"), "부서별 실패를 누적하지 않는다: {cmd}");
+        assert!(
+            cmd.contains(r#"--json || { rc=1; echo "formation-heartbeat: ensure failed dept=$d" >&2; }"#),
+            "부서별 실패를 누적하지 않거나 실패 부서를 stderr 로 지목하지 않는다: {cmd}"
+        );
         assert!(cmd.contains("rc=0;") && cmd.trim_end().ends_with("exit $rc"),
                 "누적한 rc를 반환하지 않는다: {cmd}");
         let form = include_str!("../../../cysjavis-pack/bin/javis_formation.py");
@@ -3878,7 +3913,14 @@ exit 0
                 assert_eq!(out.status.code(), Some(expected), "중간 실패 누적/성공 반환이 틀렸다");
                 assert_eq!(std::fs::read_to_string(root.join("seen")).unwrap(),
                            "/tmp/first.sock\n/tmp/last.sock\n", "실패 뒤 부서가 실행되지 않았다");
-                assert_eq!(String::from_utf8_lossy(&out.stderr).contains("ensure failed"), expected == 1);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(stderr.contains("ensure failed"), expected == 1);
+                // (성찰 2회) 실패 부서 지목 — first 만, last 는 아니다.
+                assert_eq!(
+                    stderr.contains("formation-heartbeat: ensure failed dept=first"), expected == 1,
+                    "실패 부서 지목이 틀렸다(FAIL_FIRST={fail_first}): {stderr}"
+                );
+                assert!(!stderr.contains("dept=last"), "성공한 부서가 실패로 지목됐다: {stderr}");
                 std::fs::remove_file(root.join("seen")).unwrap();
             }
             std::fs::remove_dir_all(root).unwrap();
@@ -3889,7 +3931,7 @@ exit 0
     #[test]
     fn heartbeat_fix_reaches_existing_installs_via_the_migration_table() {
         let old = BUILTIN_COMMAND_MIGRATIONS.iter()
-            .find(|(id, old)| *id == "formation-heartbeat"
+            .find(|(id, old, _)| *id == "formation-heartbeat"
                 && old.contains("--cwd") && old.contains(concat!("--json ||", " true")))
             .expect("현재 구 표현이 이관표에 없다 — P3 구 표현만으로는 기존 설치본에 안 닿는다");
         let want = builtin("formation-heartbeat");
@@ -3901,6 +3943,11 @@ exit 0
         assert!(changed && conflicts.is_empty());
         assert_eq!(jobs[0]["command"], want["command"]);
         assert!(jobs[0]["command"].as_str().unwrap().contains("exit $rc"));
+        // (성찰 2회) 이관 결과에 실패 부서 지목이 실려 있다.
+        assert!(
+            jobs[0]["command"].as_str().unwrap().contains("ensure failed dept=$d"),
+            "이관 뒤 실패 부서 지목이 없다"
+        );
         assert_eq!(jobs[0]["every_minutes"], 17, "command 외의 운영자 편집이 소실됐다");
         existing["command"] = json!(format!("{} # 운영자 주석", old.1));
         let mut edited = vec![existing.clone()];
@@ -3939,12 +3986,14 @@ exit 0
     #[test]
     fn migration_upgrades_the_known_bad_command_but_never_an_operator_edit() {
         // ① 표의 구 표현은 실제로 **지금 코드 정의와 다르다**(표가 죽은 항목이 아니다).
-        for (id, old) in BUILTIN_COMMAND_MIGRATIONS {
+        for (id, old, why) in BUILTIN_COMMAND_MIGRATIONS {
             let want = builtin(id)["command"].as_str().unwrap().to_string();
             assert_ne!(
                 &want, old,
                 "이관표의 '{id}' 구 표현이 코드 정의와 같다 — 표가 무의미하다(또는 수정이 사라졌다)"
             );
+            // (성찰 2회) 항목마다 자기 사유가 있다 — 이관 로그가 남의 결함을 찍지 않는다.
+            assert!(!why.trim().is_empty(), "이관표 '{id}' 항목에 사유가 없다");
         }
         // ② 구 표현 = 이관된다(동버전인데도).
         let ver = builtin("formation-heartbeat")["_builtin_version"].as_u64().unwrap();

@@ -377,6 +377,13 @@ cys watch --surface surface:3 --until "DONE"   # scrollback이 regex에 맞을 �
 
 `read-screen --since N`은 단조 라인 커서로 델타만 읽습니다.
 
+`cys status`·`cys fleet` 사람용 표의 **CTX** 칸은 실측을 먼저 읽습니다(0.14.36 · `--json` 은 불변):
+
+- `78%` — 실측(데몬이 잰 `usage.ctx_pct`)
+- `78%~` — 자기보고·추정(실측 없음 · `set-status` 신고가 300초 이내로 신선)
+- `?` — 판정 불가(자기보고가 낡음/나이 미상 · 좌석 종료·에이전트 사망으로 동결된 값)
+- `-` — 없음(두 축 다 없음). agy/gemini 좌석은 실측이 없어 `~`/`?` 가 정상
+
 ### 5.5 자기보고 (권장 규약)
 
 에이전트는 화면 파싱 대신 스스로 신고합니다:
@@ -836,6 +843,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_AGENT_AUTORESTART` | 0 | 죽은 에이전트 자동 재기동 (3회 상한) |
 | `CYS_RECALL_RETAIN_DAYS` | 30 (0=무제한) | 전사 보존 |
 | `CYS_CONTROL_REDACT` | 0 | Control Center 세션 PII 가림 |
+| `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` | 60 (0=보호 off) | `cys doctor --fix` 의 staging 잔재 삭제 보호창(초) — 이 시간 안에 수정된 staging 은 지우지 않고, idle 을 **못 재는**(mtime 미상·미래) staging 도 지우지 않는다(0.14.36 · 출력에 "N건 측정불능 보호" 로 따로 보고). `0` 은 진행중 보호와 측정불능 보호를 **함께** 해제해 종전처럼 항상 삭제하는 탈출구. 무효 값(`off`·`-1`·빈 값 — 비음수 정수만 유효)은 stderr 경고 1줄 + 기본 60(보호 on) — 조용히 떨어지지 않는다 |
 | `CYS_TODO_DIRS` | — | todo 감시 추가 루트(콜론 구분) |
 | `CYS_NO_AUTOSTART` / `CYS_NO_AUTORESTORE` | — | 자동 기동/자동 복원 끄기 |
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
@@ -891,6 +899,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 |---|---|
 | `CYS_URL_ALLOW_HOSTS` | 외부 URL 허용 도메인 확장(또는 `~/.cys/url-allow-hosts` 파일) |
 | `CYS_WORKER_PROFILE_DIR` | 워커 프로필 경로(또는 `~/.cys/worker-profile-dir` 파일) |
+| `CYS_CTX_DIVERGENCE_PCT` | 실측·자기보고 컨텍스트% 괴리 임계(기본 8 · 0.14.36). 5분 보고 게이트(`javis_report_gate.py`)와 `javis_actprobe.py ctx-compare` 가 읽는다. 무효 값(빈 값·비숫자·nan·inf·범위 밖)은 조용히 넘어가지 않는다 — 게이트는 8.0 으로 동작하며 대장 사유 `ctx_divergence_env_invalid` 를 남기고, 프로브는 exit 3(`threshold_env_invalid`) |
 
 ---
 

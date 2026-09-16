@@ -84,7 +84,7 @@ try:
     from javis_report import pick_node_ctx as _pick_node_ctx, CTX_SELF_REPORT_MAX_AGE_S
 except Exception as _e:                       # noqa: BLE001
     _pick_node_ctx, _REPORT_IMPORT_ERR = None, str(_e)[:120]
-    CTX_SELF_REPORT_MAX_AGE_S = 300
+    CTX_SELF_REPORT_MAX_AGE_S = None  # 실패 방향: 측정 수단 부재 → 두 CTX 축 모두 판정 안 함.
 
 # javis_report.py IDLE_ALERT_SECS와 동일(절대지침 B3: idle 5분+). 자기보고가 아닌 데몬 실측
 # idle_secs로만 판정한다(memory: stale self-report 함정). 여기 재정의(수집 실패 시에도 상수 필요).
@@ -169,7 +169,6 @@ CHANNEL_POLICY = {
     "stall":           (SEV_WARN, (CH_LEDGER, CH_EVT, CH_BADGE)),
     "stall_confirmed": (SEV_CRIT, (CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH)),
     "context":         (SEV_INFO, (CH_LEDGER, CH_EVT)),
-    "ctx_divergence":  (SEV_WARN, (CH_LEDGER, CH_BADGE)),
     "feed":            (SEV_INFO, (CH_LEDGER, CH_EVT, CH_BADGE)),  # EVT 복원(master 검수): approval.needed는 HUD·음성 구독 토대(EVENT_CONTRACT) — 설계 표의 취지는 push 금지이지 EVT 제거가 아니다
     "collect":         (SEV_WARN, (CH_LEDGER, CH_BADGE)),
     "label_unjoined":  (SEV_WARN, (CH_LEDGER, CH_BADGE)),
@@ -915,12 +914,21 @@ def apply_policy(w):
 
 
 def ctx_divergence(nodes, stats=None):
-    """신선한 두 축의 괴리 목록. stats는 비교/신선도 불명·만료/축 결측 계수."""
+    """신선한 두 축의 괴리 관측. stats는 비교/신선도/결측/사망/모듈 부재 계수."""
     diverged = []
     if stats is None:
         stats = {}
-    stats.update(compared=0, skipped_stale=0, skipped_missing=0)
+    stats.update(compared=0, skipped_stale=0, skipped_missing=0,
+                 skipped_dead=0, skipped_missing_module=0)
+    # 실패 방향: 측정 수단 부재 → 비교 안 함 + 계수·대장 report_module_missing으로 가청화.
+    if _pick_node_ctx is None:
+        stats["skipped_missing_module"] = len(nodes or [])
+        return diverged
     for n in nodes or []:
+        # 실패 방향: 확정 사망 → 동결값 비교 제외 + skipped_dead(미관측 None은 사망 아님).
+        if n.get("exited") is True or n.get("agent_alive") is False:
+            stats["skipped_dead"] += 1
+            continue
         m, s = n.get("usage_ctx_pct"), n.get("context_pct")
         # 실패 방향: 한 축이라도 결측이면 괴리 판정 대상이 아니다(경보 없음 · 0으로 접지 않음).
         if any(not isinstance(v, (int, float)) or isinstance(v, bool)
@@ -1054,18 +1062,6 @@ def extract_warnings(report, counters=None, now=0, edge_cooldown=EDGE_COOLDOWN_S
             "wake_body": "[gate] context: %s 컨텍스트 60%%+ — cycle-agent 집행 검토.%s" % (roles, tail),
             "evt_type": None, "evt_fields": None,
             "idem": "gate-context-%s" % ",".join(n.get("role", "?") for n, _p, _s in high),
-        }))
-    # ★WP6-3 — 원문 live_nodes의 두 축 대조(추가 RPC·프로세스 없음).
-    for row in ctx_divergence(report.get("live_nodes")):
-        detail = _fmt_ctx_divergence(row)
-        warns.append(apply_policy({
-            "trigger": "ctx_divergence",
-            "task": "gate-ctx-divergence-%s" % row["role"],
-            "reason": "ctx_divergence:%s" % detail,
-            "wake_body": "[gate] 컨텍스트 괴리: %s" % detail,
-            "evt_type": None, "evt_fields": None,
-            "idem": "gate-ctx-divergence-%s" % row["role"],
-            "badge_detail": row,
         }))
     feed = report.get("feed_pending")
     if isinstance(feed, int) and feed > 0:
@@ -1775,6 +1771,7 @@ class Gate:
             })
         except OSError:
             pass
+        return diverged
 
     def _load_cursor(self):
         c = _load_json(self.cursor_path, None)
@@ -2044,7 +2041,16 @@ class Gate:
             self._summary(VERDICT_WARN, delivered, reasons + [w["reason"] for w in warns])
             return report
 
-        self._write_measurement(report)
+        diverged = self._write_measurement(report)
+        # 실패 방향: 측정 수단 부재 → 관측도 생략(위 reasons·관측 JSON 계수로 가청화).
+        if _pick_node_ctx is not None:
+            # 지속 괴리는 관측이다. WARN·quiet 카운터·DELTA 라우팅을 바꾸지 않고 매 주기 보존한다.
+            for row in diverged:
+                detail = _fmt_ctx_divergence(row)
+                reasons.append("ctx_divergence:%s" % detail)
+                self._badge("gate-ctx-divergence-%s" % row["role"], SEV_WARN,
+                            "[gate] 컨텍스트 괴리: %s" % detail,
+                            dict(row, trigger="ctx_divergence", stamp={}))
         new_snap = normalize(report)
         old_snap = self._load_snapshot()
 

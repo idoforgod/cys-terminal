@@ -2356,6 +2356,19 @@ fn threshold_from(raw: Option<String>) -> u8 {
 /// 발행하고, 임계 위 체류 중엔 재발행하지 않으며, 임계 아래로 내려가면 재무장된다. 경로마다
 /// 인라인 복제하면 같은 교차에 두 경로가 각각 발화해 master/CSO가 cycle-agent를 이중 집행한다.
 /// `source`=발화 출처("self-report"|"observed"|"statusline"), `agent`=관측·statusline 경로에서만 Some.
+///
+/// ★(0.14.31-audit · 성찰 2회 · 오너 앵커 ② 무clear 게이트) **축 우선순위 — 실측이 자기보고에 우선한다.**
+///   래치(`ctx_threshold_armed`)는 좌석당 **하나**다(이중 통보 금지 — 그 계약은 그대로). 두 축이 규칙
+///   없이 한 래치를 나눠 쓰면 승자가 도착 순서로 정해진다: 자기보고(LLM 이 적어 낸 숫자)가 먼저
+///   임계를 교차해 래치를 소진하면 실측(statusline/transcript 관측)의 교차는 영영 발화하지 않고,
+///   자기보고가 임계 아래 숫자를 대면 실측이 임계 위인데도 재무장돼 이중 발화한다(또는 그 역).
+///   · 그 좌석에 실측(`observed_usage.ctx_pct == Some`)이 있으면 **자기보고는 게이트 입력이 아니다**
+///     — 래치를 재무장하지도 소진하지도 않고 돌아간다(발화는 실측 경로 "observed"/"statusline" 담당).
+///   · 실측이 없으면 **자기보고가 유일 입력**이다(종전 거동 그대로 — 실측 없는 좌석에서 게이트가
+///     죽지 않는다).
+///   실패 방향: 실측 축이 낡은 `Some` 을 쥐고 있으면 자기보고가 아무리 높아도 발화하지 않는다 —
+///   그 낡음은 usage.rs `idle_stale_transition` 이 `ctx_pct` 를 `None` 으로 비워 자기보고에 입력을
+///   되돌리는 것으로 닫힌다(세션 파일 교체 때의 래치 재무장도 usage.rs 가 한다).
 pub(crate) fn maybe_fire_context_threshold(
     daemon: &Arc<Daemon>,
     surface: &Arc<crate::state::Surface>,
@@ -2363,6 +2376,19 @@ pub(crate) fn maybe_fire_context_threshold(
     source: &str,
     agent: Option<&str>,
 ) {
+    // ★축 우선순위(독 코멘트) — 래치를 건드리기 **전**에 판정한다. 재무장(`pct < threshold`)도
+    //   소진(swap)도 실측이 있는 좌석에서는 실측 축의 것이다.
+    //   실패 방향: 실측 Some 이면 자기보고는 게이트 입력이 아니다 · 실측 None 이면 자기보고가 유일 입력.
+    if source == "self-report"
+        && surface
+            .observed_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|u| u.ctx_pct.is_some())
+    {
+        return;
+    }
     let role = surface.role.lock().unwrap().clone();
     let threshold = pick_context_threshold(
         cys::overrides::context_clear_pct(role.as_deref().unwrap_or("")),
@@ -6513,6 +6539,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ctx_threshold_armed — 관측 경로(usage.rs)와 **공유**해 같은 교차의 이중 발화
             // (cycle-agent 이중 집행)를 차단한다. master/CSO는 이 이벤트(watchdog)를 받아
             // cycle-agent를 집행한다.
+            // ★축 우선순위(성찰 2회): 이 좌석에 실측(`observed_usage.ctx_pct`)이 있으면 이 호출은
+            //   게이트 입력이 아니다(함수 독 코멘트) — 실측 없는 좌석에서만 자기보고가 발화한다.
             if let Some(pct) = context_pct {
                 maybe_fire_context_threshold(daemon, &surface, pct, "self-report", None);
             }
@@ -7190,6 +7218,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .collect::<serde_json::Map<String, Value>>()
                     .into()
             };
+            // ★(성찰 2회 · 2/3 · 독자 순서 계약) **`paused` 를 먼저, `pause_info` 를 나중에** 읽는다.
+            //   쓰기 순서는 `system.pause` 의 [pause_info = Some(1차)] → [set_paused(true)] 다 — 독자가
+            //   같은 순서(pause_info → paused)로 읽으면 "pause_info 는 아직 None · paused 는 이미 true"
+            //   창이 독자 쪽에 남아 사유 있는 pause 가 `(사유 미기재)` 로 그려진다. 역순으로 읽으면
+            //   paused=true 를 본 시점에 pause_info 는 반드시 Some 이다(쓰기가 앞섰으므로).
+            //   실패 방향: paused=false 인데 pause_info=Some 인 스냅샷은 가능하다(pause 진행 중) —
+            //   소비자는 paused 를 판정 축으로 쓰고 pause_info 는 부속 정보로만 읽는다.
+            //   남는 창(정직): `system.resume` 은 [set_paused(false)] → [pause_info = None] 순서라
+            //   해제 도중 paused=true·pause_info=None 스냅샷이 잠깐 가능하다 — 풀리는 pause 의 사유가
+            //   한 번 비어 보이는 것으로, 서 있는 pause 의 사유가 비는 것과 급이 다르다.
+            let paused = daemon.paused.load(Ordering::Relaxed);
             let pause_info = daemon.pause_info.lock().unwrap().clone();
             // ★(0.14.31 · WP-3 B) alert 라우팅 관측(CONTRACTS §C: 최상위 키 `alert_route` ·
             //   정확히 enabled/routed_1h/suppressed_1h/pending 4키). 팩 preflight 의 A 게이트
@@ -7219,7 +7258,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(
                 &id,
                 json!({
-                    "paused": daemon.paused.load(Ordering::Relaxed),
+                    "paused": paused,
                     "pause_info": pause_info.map(|p| json!(p)),
                     "daemon": {"version": env!("CARGO_PKG_VERSION"),
                                "started_at": daemon.started_at,
@@ -7658,31 +7697,33 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let reason = param_str(&params, "reason")
                 .map(|r| r.trim().to_string())
                 .filter(|r| !r.is_empty());
-            // ★(0.14.31 · 적대 리뷰 2026-09-15 · pause 순서 계약) **설정자 해소는 `set_paused(true)`
-            //   앞에서 끝낸다.** 순서: [actor 해소 = 조상 워크 + surfaces·caller_cache 락] →
-            //   [`PauseInfo` 완성(since 포함)] → [`set_paused(true)`] → [`pause_info` 대입 = 뮤텍스 1회
-            //   + 이동, I/O·워크 없음] → [`persist_pause`(정보가 완성된 뒤에만)].
-            //   종전에는 플래그를 먼저 세운 뒤 조상 워크를 돌았다 — 그 사이 `org.status` 를 읽은
-            //   `cys status` 는 `paused=true · pause_info=None` 을 받아, 사유가 **있는** pause 를
-            //   `(사유 미기재) · 설정자 미상` 으로 그렸다. 결측 표기는 기록의 사실이어야지 읽은 시점의
-            //   산물이면 안 된다. actor 는 수락 판정에 쓰이지 않으므로 앞으로 빼도 의미가 안 바뀐다.
-            //   실패 방향: 설정자 해소 실패는 정상 결측(None)이며 동결·caller_pid 는 그대로 남는다.
-            //   남는 창(정직): `set_paused` 반환 → `pause_info` 뮤텍스 획득 사이(마이크로초 단위)에
-            //   읽으면 여전히 `paused=true · pause_info=None` 이 보일 수 있다 — 0 은 아니고 워크·락
-            //   2~3회 만큼 좁힌 것이다. 락 규약: `resolve_caller_surface`·`get_surface` 는 자기 안에서
-            //   락을 풀고 나오므로 `set_paused`(surfaces → pending_queue) 와 중첩되지 않는다.
-            let actor_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
-            let actor_role = actor_surface
-                .and_then(|sid| daemon.get_surface(sid))
-                .and_then(|s| s.role.lock().unwrap().clone());
-            // `since` 는 플래그 전환 직전에 찍는다 — 독자가 관측한 paused 시각보다 뒤설 수 없다.
-            let info = crate::state::PauseInfo {
-                since: crate::state::now_epoch(),
+            // ★(0.14.31-audit · 성찰 2회 · 3/3 · pause 순서 계약) **동결이 먼저, 설정자 해소는 뒤.**
+            //   d979ac4 는 `resolve_caller_surface`(전 프로세스 스냅샷 + 락 2~3 · poison 시 패닉 경로)를
+            //   `set_paused(true)` **앞**에 두었다 — kill-switch 동결이 프로세스 스캔이 끝난 뒤에야
+            //   걸렸다. kill-switch 는 가장 먼저 걸려야 하고, 설정자는 수락 판정에 쓰이지 않는 부속
+            //   정보다. 순서:
+            //     [1차 `pause_info` = since·reason·actor_pid (actor_surface/role 은 None)]
+            //     → [`set_paused(true)`] → [설정자 해소] → [`pause_info` 의 actor_* 만 2차 갱신 ·
+            //     같은 since 유지] → [`persist_pause`].
+            //   독자 계약: 1차 기록이 `set_paused` 보다 **앞**이므로 `paused` 먼저 → `pause_info` 나중
+            //   순서로 읽는 독자(org.status·system.gate_check)는 paused=true 를 본 시점에 pause_info 가
+            //   반드시 Some 이다 — 종전의 `paused=true · pause_info=None` 창이 독자 쪽에서 닫힌다.
+            //   `since` 는 플래그 전환 직전에 찍는다 — 독자가 관측한 paused 시각보다 뒤설 수 없다.
+            //   실패 방향: 설정자 해소가 실패(None)하거나 **패닉**해도 동결·사유·caller_pid 는 이미 서
+            //   있다 — 패닉은 `catch_unwind` 로 삼켜 actor_* 만 None 으로 남기고 영속·응답까지 간다
+            //   (삼키지 않으면 spawn_blocking 이 internal_error 를 답하고 `persist_pause` 가 안 돌아
+            //   재시작에 동결이 사라진다 · panic=unwind 빌드 · 패닉 훅 없음).
+            //   락 규약: `resolve_caller_surface`·`get_surface` 는 자기 안에서 락을 풀고 나오므로
+            //   `set_paused`(surfaces → pending_queue) 와 중첩되지 않는다. `pause_info` 는 리프 락이며
+            //   I/O·워크 없이 대입 1회씩만 쥔다.
+            let since = crate::state::now_epoch();
+            *daemon.pause_info.lock().unwrap() = Some(crate::state::PauseInfo {
+                since,
                 reason: reason.clone(),
                 actor_pid: caller_pid,
-                actor_surface,
-                actor_role,
-            };
+                actor_surface: None,
+                actor_role: None,
+            });
             // ★(0.14.31 · 성찰 Q2 · 통합 2026-09-10) kill-switch 전이는 `set_paused` 하나로 간다.
             //   `paused.store(true)` 만 하면 **이미 결판을 기다리는 인계는 그대로 나간다** — 운영자가
             //   `cys pause` 응답을 손에 쥔 뒤에도 본문+CR 이 좌석에 꽂힌다는 뜻이다. `set_paused` 는
@@ -7691,7 +7732,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   **알 수 있다**(침묵하면 0 이라고 읽는다 — 결측은 값이 아니다).
             //   남는 창: 이미 CLAIMED/ACKED 인 쓰기(백로그 · writer fence).
             let still_writing = daemon.set_paused(true);
-            *daemon.pause_info.lock().unwrap() = Some(info);
+            // 2차: 설정자 해소(스캔·락) — 동결 **뒤**. 패닉은 결측으로 접는다(위 실패 방향).
+            let (actor_surface, actor_role) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let actor_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+                    let actor_role = actor_surface
+                        .and_then(|sid| daemon.get_surface(sid))
+                        .and_then(|s| s.role.lock().unwrap().clone());
+                    (actor_surface, actor_role)
+                }))
+                .unwrap_or((None, None));
+            if actor_surface.is_some() || actor_role.is_some() {
+                let mut guard = daemon.pause_info.lock().unwrap();
+                // 같은 since 의 레코드에만 덧쓴다 — 그 사이 resume(None)·재pause(다른 since)가 끼었으면
+                // 그 레코드는 우리 것이 아니다(되살리지도 덮지도 않는다). 실패 방향: 결측(None) 유지.
+                if let Some(p) = guard.as_mut().filter(|p| p.since == since) {
+                    p.actor_surface = actor_surface;
+                    p.actor_role = actor_role;
+                }
+            }
             daemon.persist_pause();
             // 이벤트는 reason 키를 유지하되 결측은 null 로 보낸다.
             daemon
@@ -7719,10 +7778,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         }
 
         "system.gate_check" => {
+            // ★독자 순서 계약(org.status 와 동일 · 성찰 2회): 쓰기가 [pause_info → paused] 이므로 읽기는
+            //   그 역순 [paused → pause_info] — paused=true 를 본 시점에 pause_info 는 반드시 Some 이다.
+            let paused = daemon.paused.load(Ordering::Relaxed);
             let info = daemon.pause_info.lock().unwrap().clone();
             // 실패 방향: 정보가 없으면 사유·설정자 키를 생략하고 차단 판정은 기존 paused 플래그를 따른다.
             let mut status = info.map(|p| json!(p)).unwrap_or_else(|| json!({"since": null}));
-            status["paused"] = json!(daemon.paused.load(Ordering::Relaxed));
+            status["paused"] = json!(paused);
             Reply::Single(ok_response(&id, status))
         }
 
@@ -15227,6 +15289,107 @@ mod tests {
         );
     }
 
+    /// ★(성찰 2회 · 오너 앵커 ② 무clear 게이트 · 검체 a) **실측 축 우선** — 실측 82 가 먼저 서 있는
+    /// 좌석에서 자기보고 61 은 게이트 입력이 아니다: 실측 경로 1회, 자기보고 경로 0회. 그리고
+    /// 자기보고는 래치를 **재무장하지도** 못한다(10 → 90 을 대도 추가 발화 0) — 재무장·소진은 실측
+    /// 축의 것이고, 실측이 내려갔다 재교차하면 실측 경로가 재발화한다.
+    /// 실패 방향: 붉어지면 자기보고 숫자가 실측 좌석의 래치를 소진·재무장해 실측 교차가 미발화
+    /// (무clear 폭주)하거나 같은 교차에 두 경로가 각각 발화한다(cycle-agent 이중 집행).
+    #[test]
+    fn context_threshold_measured_axis_wins_over_self_report() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("worker-ctx-axis-a"));
+        // 실측 82(statusline 경로) → 실측 경로 1회.
+        usage_report(&daemon, node, json!({"ctx_pct": 82}), None);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 1, "실측 82 교차에서 1회 발화돼야 한다");
+        assert_eq!(evs[0]["payload"]["source"], json!("statusline"));
+        // 자기보고 61 → 0회(총 1).
+        status_set(&daemon, node, "working", 61, "t", None);
+        assert_eq!(
+            threshold_events(&daemon, node).len(), 1,
+            "실측이 있는 좌석에서 자기보고가 발화했다"
+        );
+        // 자기보고가 임계 아래→위를 오가도 래치는 실측 축의 것 — 추가 발화 0.
+        status_set(&daemon, node, "working", 10, "t", None);
+        status_set(&daemon, node, "working", 90, "t", None);
+        assert_eq!(
+            threshold_events(&daemon, node).len(), 1,
+            "실측이 있는 좌석에서 자기보고가 래치를 재무장·소진했다"
+        );
+        // 실측이 내려갔다 재교차 → 실측 경로 재발화(자기보고 90 이 래치를 소진해 두지 않았다는 증거).
+        usage_report(&daemon, node, json!({"ctx_pct": 20}), None);
+        usage_report(&daemon, node, json!({"ctx_pct": 70}), None);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "실측 재교차에서 재발화돼야 한다: {evs:?}");
+        assert!(
+            evs.iter().all(|e| e["payload"]["source"] != json!("self-report")),
+            "자기보고 경로가 발화했다: {evs:?}"
+        );
+    }
+
+    /// ★(검체 b) 실측이 **없는** 좌석에서는 자기보고가 유일 입력 — 61 에서 자기보고 경로 1회.
+    /// 실패 방향: 붉어지면 실측 없는 좌석(statusline 미배선·transcript 미발견)의 게이트가 죽어
+    /// 노드가 컨텍스트 100% 를 넘겨 끌고 간다.
+    #[test]
+    fn context_threshold_self_report_is_sole_input_without_measurement() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("worker-ctx-axis-b"));
+        assert!(
+            daemon.get_surface(node).unwrap().observed_usage.lock().unwrap().is_none(),
+            "전제: 실측 없음"
+        );
+        status_set(&daemon, node, "working", 61, "t", None);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 1, "실측 없는 좌석에서 자기보고 61 이 발화해야 한다");
+        assert_eq!(evs[0]["payload"]["source"], json!("self-report"));
+        assert_eq!(evs[0]["payload"]["context_pct"].as_u64(), Some(61));
+    }
+
+    /// ★(검체 c) 두 축의 도착 순서를 뒤집어도 같은 교차는 **총 1회** — 래치는 하나다(이중 통보 금지).
+    /// 자기보고→실측(statusline) · 실측(statusline)→자기보고 · 자기보고→관측("observed" 직접 호출)
+    /// 세 순서 모두 1회. 실패 방향: 붉어지면 도착 순서에 따라 0회(무clear) 또는 2회(이중 집행)가 된다.
+    #[test]
+    fn context_threshold_fires_once_regardless_of_axis_arrival_order() {
+        let daemon = claim_daemon();
+        // 순서 ①: 자기보고 61(실측 없음 → 발화) → 실측 82(래치 소진됨 → 0).
+        let n1 = make_surface(&daemon, Some("worker-ctx-axis-c1"));
+        status_set(&daemon, n1, "working", 61, "t", None);
+        usage_report(&daemon, n1, json!({"ctx_pct": 82}), None);
+        let evs = threshold_events(&daemon, n1);
+        assert_eq!(evs.len(), 1, "자기보고→실측 순서에서 총 1회여야 한다: {evs:?}");
+        assert_eq!(evs[0]["payload"]["source"], json!("self-report"));
+        // 순서 ②: 실측 82(발화) → 자기보고 61(게이트 입력 아님 → 0).
+        let n2 = make_surface(&daemon, Some("worker-ctx-axis-c2"));
+        usage_report(&daemon, n2, json!({"ctx_pct": 82}), None);
+        status_set(&daemon, n2, "working", 61, "t", None);
+        let evs = threshold_events(&daemon, n2);
+        assert_eq!(evs.len(), 1, "실측→자기보고 순서에서 총 1회여야 한다: {evs:?}");
+        assert_eq!(evs[0]["payload"]["source"], json!("statusline"));
+        // 순서 ③: 자기보고 61(발화) → transcript 관측 경로("observed") 82 — usage.rs 와 같은 순서로
+        //   observed_usage 를 먼저 세우고 공유 게이트를 부른다.
+        let n3 = make_surface(&daemon, Some("worker-ctx-axis-c3"));
+        let s3 = daemon.get_surface(n3).unwrap();
+        status_set(&daemon, n3, "working", 61, "t", None);
+        *s3.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
+            agent: "claude".into(),
+            ctx_tokens: Some(164_000),
+            ctx_window: Some(200_000),
+            ctx_pct: Some(82),
+            rate: vec![],
+            source: "transcript".into(),
+            session_file: String::new(),
+            updated_at: crate::state::now_epoch(),
+        });
+        maybe_fire_context_threshold(&daemon, &s3, 82, "observed", Some("claude"));
+        let evs = threshold_events(&daemon, n3);
+        assert_eq!(evs.len(), 1, "자기보고→관측 순서에서 총 1회여야 한다: {evs:?}");
+        // 그리고 그 뒤 자기보고는 입력이 아니다 — 10 → 90 에도 0.
+        status_set(&daemon, n3, "working", 10, "t", None);
+        status_set(&daemon, n3, "working", 90, "t", None);
+        assert_eq!(threshold_events(&daemon, n3).len(), 1, "관측이 선 뒤 자기보고가 래치를 만졌다");
+    }
+
     /// 회귀 핀: 임계 env 파싱 규칙 — 1~100만 유효, 그 외 전부 기본 60.
     #[test]
     fn threshold_from_parsing_rules() {
@@ -16156,6 +16319,134 @@ mod tests {
         let roundtrip: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(roundtrip, populated, "복원·영속 과정에서 실제 메타데이터가 소실됐다");
         drop(restored);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ★(성찰 2회 · 3/3 · pause 순서 계약) **동결이 먼저, 설정자 해소는 뒤** — dispatch 직후
+    /// pause_info 에 사유가 있고 paused=true 이며, actor_surface/role 은 2차 갱신으로 **채워지거나**
+    /// (caller 가 좌석에 귀속) None 이다(미귀속). 2차 갱신은 같은 since 를 유지하고 파일에도 같은
+    /// since 가 간다. 실패 방향: 붉어지면 2차 갱신이 레코드를 새로 만들어 since 가 바뀌거나, 좌석
+    /// 귀속 caller 의 actor 가 결측되거나, 두 독자가 paused=true 와 함께 사유를 내지 못한다.
+    #[test]
+    fn pause_freezes_before_actor_resolution_and_backfills_actor() {
+        let dir = std::env::temp_dir().join(format!("cys-pause-order-{}", std::process::id()));
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let sid = make_surface(&daemon, Some("master"));
+        let pid = 995_301_u32;
+        bind_caller(&daemon, pid, sid);
+        let before = crate::state::now_epoch();
+        let req = Request {
+            id: json!(1), method: "system.pause".into(), params: json!({"reason": "점검"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "pause 가 거부됐다: {resp}");
+        assert!(daemon.paused.load(Ordering::Relaxed), "dispatch 직후 paused 가 아니다");
+        let info = daemon
+            .pause_info
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("dispatch 직후 pause_info 가 비었다");
+        assert_eq!(info.reason.as_deref(), Some("점검"));
+        assert_eq!(info.actor_pid, Some(pid));
+        assert_eq!(
+            info.actor_surface, Some(sid),
+            "좌석 귀속 caller 의 actor_surface 가 2차 갱신되지 않았다"
+        );
+        assert_eq!(info.actor_role.as_deref(), Some("master"));
+        assert!(info.since >= before && info.since <= crate::state::now_epoch());
+        // 영속본도 같은 since·actor 를 가진다(2차 갱신 뒤에 persist) · 원자 교체 tmp 무잔존.
+        let p = crate::state::state_dir(&daemon.socket_path).join("autopilot.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["since"], json!(info.since));
+        assert_eq!(v["actor_surface"].as_u64(), Some(sid));
+        assert_eq!(v["actor_role"], json!("master"));
+        assert!(!p.with_file_name(".autopilot.json.tmp").exists(), "원자 교체 tmp 가 남았다");
+        // 독자 순서 계약: 두 독자 모두 paused=true 와 함께 사유·설정자를 낸다.
+        for method in ["org.status", "system.gate_check"] {
+            let req = Request { id: json!(2), method: method.into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
+                panic!("expected single reply");
+            };
+            assert_eq!(resp["result"]["paused"], json!(true), "{method}");
+            let pi = if method == "org.status" { &resp["result"]["pause_info"] } else { &resp["result"] };
+            assert_eq!(pi["reason"], json!("점검"), "{method}: 사유가 비었다: {pi}");
+            assert_eq!(pi["actor_surface"].as_u64(), Some(sid), "{method}");
+        }
+        drop(daemon);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ★(성찰 2회 · 2/3 · fail-closed 복원) autopilot.json 이 **존재하는데** 손상(부분 쓰기·빈 파일·
+    /// paused 불리언 부재)이면 복원은 **paused=true**(reason None) 다 — 종전 `.ok()` 폴백은 손상을
+    /// paused=false 로 접어 kill-switch 를 조용히 풀었다(fail-open). 부재는 종전대로 동결 없음이고,
+    /// 명시 `{"paused":false}` 도 동결 없음이다. 영속은 원자 교체라 tmp 가 남지 않고 결과 파일은
+    /// 항상 완본이며, `system.resume`(= `cys resume`)이 손상을 정상 해제본으로 되돌린다.
+    /// 실패 방향: 붉어지면 손상 파일이 동결을 풀거나(fail-open), 정상 파일·부재가 동결로 오판되거나
+    /// (fail-closed 과잉), 영속이 비원자로 돌아간다.
+    #[test]
+    fn corrupt_autopilot_file_restores_as_paused_fail_closed() {
+        let dir = std::env::temp_dir().join(format!("cys-pause-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("cysd.sock");
+        let p = crate::state::state_dir(&socket_path).join("autopilot.json");
+        // 부재 → 동결 없음.
+        let _ = std::fs::remove_file(&p);
+        let d = Daemon::new(socket_path.clone());
+        assert!(!d.paused.load(Ordering::Relaxed), "부재가 동결로 오판됐다");
+        assert!(d.pause_info.lock().unwrap().is_none());
+        drop(d);
+        // 명시 해제 → 동결 없음.
+        std::fs::write(&p, r#"{"paused":false}"#).unwrap();
+        let d = Daemon::new(socket_path.clone());
+        assert!(!d.paused.load(Ordering::Relaxed), "명시 paused=false 가 동결로 오판됐다");
+        drop(d);
+        // 손상 3종 → 동결 유지(reason None · 설정자 None).
+        for (label, body) in [
+            ("부분 쓰기", r#"{"paused":true,"since":1.0,"re"#),
+            ("빈 파일", ""),
+            ("paused 불리언 부재", r#"{"since":1.0}"#),
+        ] {
+            std::fs::write(&p, body).unwrap();
+            let d = Daemon::new(socket_path.clone());
+            assert!(d.paused.load(Ordering::Relaxed), "{label}: 손상이 동결을 풀었다(fail-open)");
+            let info = d
+                .pause_info
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| panic!("{label}: pause_info 가 비었다"));
+            assert!(info.reason.is_none(), "{label}: 손상 복원에 사유가 생겼다");
+            assert!(
+                info.actor_pid.is_none() && info.actor_surface.is_none() && info.actor_role.is_none(),
+                "{label}: 손상 복원에 설정자가 생겼다"
+            );
+            // 손상 복원 뒤 영속은 완본으로 수렴하고 tmp 가 남지 않는다(원자 교체).
+            d.persist_pause();
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap())
+                .unwrap_or_else(|e| panic!("{label}: 영속본이 완본이 아니다: {e}"));
+            assert_eq!(v["paused"], json!(true), "{label}");
+            assert!(
+                !p.with_file_name(".autopilot.json.tmp").exists(),
+                "{label}: 원자 교체 tmp 가 남았다"
+            );
+            drop(d);
+        }
+        // 손상 복원 뒤 `cys resume`(system.resume)이 파일을 정상 해제본으로 되돌린다.
+        std::fs::write(&p, r#"{"paused":true,"since":1.0,"re"#).unwrap();
+        let d = Daemon::new(socket_path.clone());
+        assert!(d.paused.load(Ordering::Relaxed));
+        let req = Request { id: json!(1), method: "system.resume".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&d, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "resume 이 거부됐다: {resp}");
+        assert!(!d.paused.load(Ordering::Relaxed));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v, json!({"paused": false}), "resume 이 손상을 해제본으로 되돌리지 못했다");
+        drop(d);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

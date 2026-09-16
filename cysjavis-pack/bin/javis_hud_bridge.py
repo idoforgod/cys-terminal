@@ -104,19 +104,28 @@ def compute_activity(hook_count_60s, lines_per_sec):
 
 
 def pick_ctx(node):
-    """ctx% 선택: 실측(usage.ctx_pct·statusline) > 신선한 자기보고(status.context_pct).
+    """ctx% 선택: 사망 게이트 → 실측(usage.ctx_pct·statusline) > 신선한 자기보고(status.context_pct).
 
     ★실측 축의 낡음(0.14.31 감사 정정): 데몬(cysd usage.rs)이 낡은 실측을 None 으로 지우는 범위는
       **휴리스틱 매핑뿐**이다 — `mapping_is_fresh` 는 등록 매핑(SessionStart 등록 = 통상의 claude 경로)의
       나이를 보지 않고, `idle_stale_transition` 은 source=="statusline" 을 건드리지 않으며, `collect_tick`
       은 exited·agent_meta 없는 좌석을 건너뛴다 → 등록·statusline·종료 좌석의 ctx_pct 는 마지막 값에
       **동결**된 채 실린다. 실측에 300s 나이 게이트를 걸지 않는다(idle 이어도 산 좌석의 실측은 정확 ·
-      master 결정). 이 함수는 사망 신호를 읽지 않는다 — HUD 의 사망 축은 같은 노드 뷰(_node_view)의
-      `presence == "dead"`(judge_presence: exited ∨ agent_alive is False)가 담당한다.
-    ★실패 방향: 못 재면 None(HUD 는 빈 칸/`?` — 값으로 위장하지 않는다). 잔여 한계: 죽은 좌석의 동결
-      ctx 가 값으로 나와 `ctx_critical` 플래그(_node_view · ctx >= 90)를 올릴 수 있다 — presence 가
-      dead 인 노드의 ctx 는 동결값으로 읽어라(게이트는 이 함수 밖 · 이번 라운드 미적용).
+      master 결정).
+    ★사망 게이트(성찰 2회 수정 · javis_report.pick_node_ctx / Rust ctx_cell / TS pickCtx 와 같은 규칙):
+      `exited is True`(pane 종료 · state.rs reader EOF) 또는 `agent_alive is False`(워치독 관측 사망 확정)
+      면 None(판정 불가) — 죽은 좌석의 동결 실측이 `ctx_critical`(_node_view · ctx >= 90)·"/clear 임박"
+      (office3d) 을 올리지 않는다. judge_presence 의 dead 판정과 같은 두 축이라 presence=dead 인 노드의
+      ctx 는 항상 None. None/부재(구버전 데몬 키 없음·미관측)·exited False·agent_alive True 는 게이트를
+      **열지 않는다** — null 을 사망으로 접으면 미관측 좌석 전부가 판정 불가가 된다.
+    ★실패 방향: 못 재면 None(HUD 는 빈 칸/`?` — 값으로 위장하지 않는다). 사망 게이트가 틀리면 '산 좌석의
+      ctx 가 빈 칸'(경보 누락) 쪽으로 무너지지, 죽은 좌석이 경보를 울리는 쪽으로는 무너지지 않는다.
+      잔여 한계: 한 번도 관측되지 않은 채(agent_alive None) 죽은 좌석과 사망 뒤 워치독 틱 전의 창은
+      잡히지 않는다(의도).
     """
+    # 사망 게이트 — 실패 방향: 산 좌석을 죽었다고 오판하면 ctx 빈 칸(경보 누락) 쪽으로 무너진다.
+    if node.get("exited") is True or node.get("agent_alive") is False:
+        return None
     u = node.get("usage") or {}
     if isinstance(u.get("ctx_pct"), (int, float)):
         return u["ctx_pct"]

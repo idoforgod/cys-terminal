@@ -22,7 +22,8 @@ mtime 은 내용이 아니라 복사·동기화·touch·백업 복원으로 내�
   ③ 폴백을 썼으면 산출물에 남는다 — 상태 I/O 불능 · 내용 비-nonce 두 경로 모두 `mtime_fallback`
   ④ 음성 대조 — 근거가 전혀 없으면 유예 없음(`epoch_missing`) · 판독 불능 · 미래 시각 3종
   ⑤ 세대 교체 — 새 nonce+옛 mtime(백업 복원)=유예 없음 · 새 nonce+갓 쓴 파일(실제 재부팅)=유예 ·
-     같은 nonce 에 옛 mtime 이 와도(cp -p) 유예는 유지(내용 앵커가 양방향으로 이긴다)
+     같은 nonce 에 옛 mtime 이 와도(cp -p) 유예는 유지(내용 앵커가 양방향으로 이긴다) ·
+     ★성찰2: 새 nonce+미래 mtime(시계 역행)=유예 없음(clock_backwards)·상태 미기록(다음 호출도 안 열림)
   ⑥ 문서화된 한계(fail-open 성분) — 게이트가 이 세대를 본 적 없고 mtime 이 밀렸으면 첫 관측에
      유예가 선다(그래서 안 A 가 1차다) — 행동을 핀해 두어 바뀌면 보이게 한다
   ⑦ 종단 `--json` 방출 — `--dept-roster-override` 의 `started_at` 주입 → measured/checks/exit 계약
@@ -254,6 +255,25 @@ try:
     rec = json.load(open(G._boot_nonce_path(), encoding="utf-8"))
     check("⑤ 게이트 상태 파일 모양 {boot_nonce, first_seen}",
           rec.get("boot_nonce") == "222" and isinstance(rec.get("first_seen"), float), repr(rec))
+    # ★성찰2(리뷰 2/3) — 새 nonce + **미래 mtime**(시계 역행 · 허용 오차 1s 초과): 종전 `min(now, mtime)`
+    #   은 now 를 골라 경과 0 = '갓 부팅' 으로 유예를 열었다(fdd45f3 의 clock_backwards 에서 fail-open
+    #   회귀). 근거 실패 = 유예 없음 · 상태 미기록(다음 호출도 안 열린다) · mtime 이 정상으로 돌아오면 그때 관측.
+    write_epoch("444", mtime=now + 3600)
+    m = measure()
+    check("⑤ 새 nonce + 미래 mtime(시계 역행) → 유예 없음(clock_backwards) — 종전 min(now, mtime) 의 fail-open 수리",
+          m["boot_grace"] is False and m["boot_elapsed"] is None
+          and m["boot_grace_reason"] == "clock_backwards",
+          "%r/%r" % (m.get("boot_grace_reason"), m.get("boot_elapsed")))
+    rec = json.load(open(G._boot_nonce_path(), encoding="utf-8"))
+    m = measure()
+    check("⑤ 미래 mtime 세대는 상태에 남지 않아(직전 세대 222 유지) 다음 호출에도 유예가 안 열린다",
+          rec.get("boot_nonce") == "222" and m["boot_grace"] is False
+          and m["boot_grace_reason"] == "clock_backwards", "%r/%r" % (rec, m.get("boot_grace_reason")))
+    os.utime(EPOCH, (now - 10_000, now - 10_000))       # mtime 이 과거로 돌아오면 그때가 첫 관측이다
+    m = measure()
+    check("⑤ mtime 이 정상(과거)으로 돌아오면 first_seen=min(now, mtime) 으로 관측(유예 없음 · nonce)",
+          m["boot_grace"] is False and m["boot_grace_reason"] == "nonce"
+          and 9_990 <= (m["boot_elapsed"] or 0) <= 10_100, "%r/%r" % (m.get("boot_grace_reason"), m.get("boot_elapsed")))
 
     # ── ⑥ 문서화된 한계(fail-open 성분) — 첫 관측이 늦으면 유예가 선다 ──
     reset_state()                                      # 게이트가 이 세대를 본 적이 없다
