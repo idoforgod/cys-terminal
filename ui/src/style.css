@@ -39,6 +39,14 @@ html, body {
   padding: 3px 10px; cursor: pointer; font-size: 12px;
 }
 #topbar button:hover { border-color: var(--accent); }
+/* 아이콘 버튼(New·Split·Close·Files) — 글자 대신 16px 인라인 SVG(index.html). 정사각에 가까운 28×26으로
+   글자 버튼(≈25px)과 높이를 맞추고, svg 는 stroke=currentColor 라 위 #topbar button 의 color(var(--text))를
+   그대로 따른다(--text 는 배경 테마 커스텀과 무관한 크롬 고정색 — applyBgColor 가 건드리지 않음). hover 는 위 규칙 상속. */
+#topbar button.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 26px; padding: 0; flex: none; line-height: 0;
+}
+#topbar button.icon-btn svg { width: 16px; height: 16px; display: block; pointer-events: none; }
 .badge {
   display: inline-block; min-width: 16px; padding: 0 4px;
   border-radius: 8px; background: var(--error); color: #fff;

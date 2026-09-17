@@ -4870,6 +4870,25 @@ async fn stop_dept_daemon(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// ★K2-03(2026-09-17 한글 사용자명 감사): 선두 UTF-8 BOM(U+FEFF)을 벗긴다. 한국어 Windows 편집기("UTF-8(BOM)")로
+/// 손질한 dept-catalog.json 은 BOM 을 달고 오는데 `serde_json` 은 그것을 문법 오류로 거부한다(src/bin/cys.rs
+/// read_hook_input 과 같은 결함 부류 · 그쪽 주석 참조). 판독 단일 지점에서만 벗기고 값 안의 바이트는 건드리지 않는다.
+fn strip_utf8_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
+}
+
+/// ★K2-03: 레지스트리/카탈로그 판독 실패를 **가시화**한다. 종전엔 `read_to_string` 의 Err(cp949 저장 = InvalidData 등)를
+/// 무음으로 빈 값에 접어, 팝업이 레거시만 보여도 원인을 알 길이 없었다. 부재(NotFound)는 정상 상태(아직 부서 없음)라
+/// 조용히 둔다. 반환값 정책(빈 값 대체)은 바꾸지 않는다 — 진단 한 줄만 더한다.
+fn warn_json_read_err(what: &str, path: &std::path::Path, e: &std::io::Error) {
+    if e.kind() != std::io::ErrorKind::NotFound {
+        eprintln!(
+            "[cys-app] {what} 판독 실패({}) — 빈 값으로 대체. UTF-8(BOM 없음)로 저장됐는지 확인: {e}",
+            path.display()
+        );
+    }
+}
+
 /// 부서 레지스트리(depts.json) 조회 — restore가 등록된 부서(진실원)와 대조해 죽은 socket의 유령 ws를
 /// 무비판 재-launch하지 않게 한다(옛 테스트 잔재·삭제된 부서 차단). 부재 시 빈 depts.
 #[tauri::command]
@@ -4880,8 +4899,11 @@ fn list_depts() -> Result<Value, String> {
             cys::home_dir().join(".cys/depts.json")
         });
     match std::fs::read_to_string(&reg) {
-        Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
-        Err(_) => Ok(json!({ "depts": {} })),
+        Ok(s) => serde_json::from_str::<Value>(strip_utf8_bom(&s)).map_err(|e| e.to_string()),
+        Err(e) => {
+            warn_json_read_err("depts.json", &reg, &e);
+            Ok(json!({ "depts": {} }))
+        }
     }
 }
 
@@ -4894,7 +4916,7 @@ fn dept_display_name(name: &str) -> Option<String> {
             cys::home_dir().join(".cys/depts.json")
         });
     let s = std::fs::read_to_string(&reg).ok()?;
-    let v: Value = serde_json::from_str(&s).ok()?;
+    let v: Value = serde_json::from_str(strip_utf8_bom(&s)).ok()?;
     v.get("depts")?
         .get(name)?
         .get("display_name")?
@@ -4913,8 +4935,11 @@ fn read_dept_catalog() -> Result<Value, String> {
                 .join(".cys/dept-catalog.json")
         });
     match std::fs::read_to_string(&cat) {
-        Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
-        Err(_) => Ok(json!({ "departments": {} })),
+        Ok(s) => serde_json::from_str::<Value>(strip_utf8_bom(&s)).map_err(|e| e.to_string()),
+        Err(e) => {
+            warn_json_read_err("dept-catalog.json", &cat, &e);
+            Ok(json!({ "departments": {} }))
+        }
     }
 }
 
@@ -6686,6 +6711,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★K2-03(2026-09-17 한글 사용자명 감사) 회귀 핀: UTF-8 BOM 이 붙은 카탈로그/레지스트리를 판독한다.
+    /// 한국어 Windows 편집기의 "UTF-8(BOM)" 저장이 `serde_json` 에서 문법 오류였다 — 벗기면 파싱되고,
+    /// BOM 뒤의 바이트(한글 표시명 포함)와 값 안의 U+FEFF 는 건드리지 않는다.
+    #[test]
+    fn k2_03_bom_catalog_is_readable_and_bytes_after_bom_are_untouched() {
+        let bom = "\u{FEFF}{\"departments\":{\"sales-kr\":{\"display\":\"영업부(한국)\"}}}";
+        assert!(
+            serde_json::from_str::<Value>(bom).is_err(),
+            "serde 가 BOM 을 받아들인다면 이 핀의 전제가 바뀐 것이다 — 헬퍼 필요성을 재검토"
+        );
+        let v: Value = serde_json::from_str(strip_utf8_bom(bom)).expect("BOM 을 벗기면 파싱된다");
+        assert_eq!(v["departments"]["sales-kr"]["display"], "영업부(한국)");
+        assert_eq!(strip_utf8_bom("{}"), "{}", "BOM 없는 입력은 그대로");
+        assert_eq!(strip_utf8_bom(""), "");
+        assert_eq!(strip_utf8_bom("a\u{FEFF}b"), "a\u{FEFF}b", "값 안의 U+FEFF 는 보존");
+        assert_eq!(strip_utf8_bom("\u{FEFF}\u{FEFF}x"), "\u{FEFF}x", "선두 1개만 벗긴다(그 뒤는 데이터)");
+    }
+
+    /// ★K2-03 배선 핀: 세 판독 지점(list_depts · dept_display_name · read_dept_catalog)이 전부 헬퍼를 지난다.
+    /// 한 곳만 원시 `from_str(&s)` 로 되돌아가면 같은 파일이 팝업에서는 보이고 복원에서는 안 보이는 식으로 갈린다.
+    #[test]
+    fn k2_03_every_registry_reader_strips_the_bom() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        for f in ["fn list_depts()", "fn dept_display_name(", "fn read_dept_catalog()"] {
+            let s = body.find(f).unwrap_or_else(|| panic!("`{f}` 소실"));
+            let seg: String = body[s..].chars().take(900).collect(); // 바이트 슬라이스 금지(한글 주석 경계 패닉)
+            assert!(seg.contains("strip_utf8_bom("), "{f}: BOM 을 벗기지 않는 원시 판독으로 되돌아갔다");
+        }
+    }
 
     /// ★SEAL-DIAG 스로틀 회귀 핀: **파손은 마커로 침묵시킬 수 없다.**
     /// 스로틀의 목적은 평시 `codesign --deep` 비용 절감이지 고장 은폐가 아니다 —

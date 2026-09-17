@@ -21,13 +21,21 @@
      미승격 머신은 무경보(위경보 금지).
  11) A11 — promote-if-pending --request-only가 미해결 동종(제목 'CEO 승격 대기') pending 존재 시
      push 생략(로그 1줄), 부재 시 발행.
+ 12) K2-07(2026-09-17 한글 사용자명 감사 · 2라운드) — unix 소켓 sun_path 초과는 **cysd 의 bind 가 판정**하고
+     cys-dept 는 "데몬 기동 실패" 에 사유(sock_len_diag)만 덧붙인다. 스폰 전 exit 2 가드는 이 하네스
+     (격리 HOME=mkdtemp → macOS /var/folders 50B 라 1글자 부서명도 105B · 목 cysd 는 bind 안 함)를
+     깨뜨렸던 결함 — mkdtemp HOME 이 상한을 넘어도 목 cysd 로 launch 가 완주한다(회귀 표본).
+ 13) CRLF 위생 census — `read < <(python3 …)` 파이프 소비자 전부 `| tr -d '\r'`(cys-dept:307-310 규칙).
+ 14) K2-03 범위 일치 — depts.json 판독 전 지점 utf-8-sig(BOM 레지스트리가 RMW 에서 비워지지 않는다).
 """
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 
 # ★T10(DCE-3) 픽스처 계약: CEO 템플릿 = MASTER 전문의 상위집합(합성 계약 동형) — 스왑 직전
 #   런타임 상위집합 검사를 통과해야 승격 계열 테스트가 승격 상태에 도달한다.
@@ -411,6 +419,136 @@ class FeedDedupe(Base):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("feed push --title CEO 승격 대기", self.calls(),
                       "무관 pending에 오-dedupe(제목 정합 검사 결여)")
+
+
+class SockLenDiag(Base):
+    """12) K2-07: sock_len_diag 는 진단 전용(항상 0 반환·스폰 전 거부 없음) — 상한은 OS 별(darwin/BSD 104 · Linux 108 ·
+    NUL 포함 = Rust std `UnixListener::bind` 의 "path must be shorter than SUN_LEN"). 제품 함수 **그 자체**를 소스에서
+    추출해 실행한다(javis_bootstrap self-test 의 dept_name_ok 소스 대조와 같은 방식 — 사본 금지)."""
+
+    def _func_src(self):
+        src = open(DEPT, encoding="utf-8").read()
+        m = re.search(r"^sock_len_diag\(\)\{\n.*?^\}\n", src, re.S | re.M)
+        self.assertIsNotNone(m, "cys-dept 에 sock_len_diag 정의 부재(K2-07 진단 소실)")
+        return m.group(0)
+
+    def _run_diag(self, path, uname):
+        env = dict(self.env)
+        bindir = os.path.join(self.tmp, "unamebin-" + uname.split("_")[0])
+        os.makedirs(bindir, exist_ok=True)
+        _write_exec(os.path.join(bindir, "uname"), "#!/bin/sh\necho %s\n" % uname)
+        env["PATH"] = bindir + os.pathsep + env["PATH"]
+        r = subprocess.run(["bash", "-c", self._func_src() + '\nsock_len_diag "$1"\n', "x", path],
+                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=30)
+        return r.returncode, r.stdout, r.stderr
+
+    @staticmethod
+    def _path_of_bytes(n):
+        head, tail = "/h/.local/state/cys-dept-", "/cys.sock"
+        p = head + "a" * (n - len(head) - len(tail)) + tail
+        assert len(p.encode("utf-8")) == n
+        return p
+
+    # 12) 순수 판정: 상한-1 무출력 / 상한 = 사유 1줄(바이트 수·상한 병기) · 두 OS · 항상 rc 0 · stdout 무오염
+    def test_pure_threshold_per_os(self):
+        for uname, lim in (("Darwin", 104), ("Linux", 108)):
+            rc, out, err = self._run_diag(self._path_of_bytes(lim - 1), uname)
+            self.assertEqual((rc, out, err), (0, "", ""), "%s: 상한-1 에서 오경보 (%r)" % (uname, err))
+            rc, out, err = self._run_diag(self._path_of_bytes(lim), uname)
+            self.assertEqual((rc, out), (0, ""), "%s: 진단이 rc/stdout 을 오염(rc=%d out=%r)" % (uname, rc, out))
+            self.assertIn("sun_path", err, "%s: 상한 도달인데 사유 부재" % uname)
+            self.assertIn("%dB ≥ %dB" % (lim, lim), err, "%s: 바이트 수·상한 병기 부재: %r" % (uname, err))
+
+    # 12) 문자 수가 아니라 **바이트** 수: NFD 한글 홈 + 40자(계약 상한 안) = 106B → darwin 사유
+    def test_nfd_home_counts_bytes_not_chars(self):
+        nfd = unicodedata.normalize("NFD", "홍길동")
+        self.assertNotEqual(nfd, "홍길동")   # 픽스처가 실제로 NFD 인지(핀 무효화 방지)
+        p = "/Users/" + nfd + "/.local/state/cys-dept-" + "a" * 40 + "/cys.sock"
+        self.assertEqual(len(p.encode("utf-8")), 106)
+        rc, out, err = self._run_diag(p, "Darwin")
+        self.assertEqual(rc, 0)
+        self.assertIn("106B ≥ 104B", err, "NFD 홈을 문자 수로 재어 사유를 놓침: %r" % err)
+        rc, out, err = self._run_diag(p, "Linux")
+        self.assertEqual((rc, err), (0, ""), "Linux(108) 에서 106B 를 오경보")
+
+    # 12) Windows named pipe 는 상한 없음 — 무출력
+    def test_named_pipe_never_flagged(self):
+        rc, out, err = self._run_diag("\\\\.\\pipe\\cys-dept-" + "a" * 200, "MINGW64_NT-10.0")
+        self.assertEqual((rc, out, err), (0, "", ""))
+
+    # 12) ★회귀 표본: 격리 HOME 아래 소켓이 상한을 넘어도(어떤 TMPDIR 이든 보장) 목 cysd 로 launch 완주 — 스폰 전 거부 금지
+    def test_mkdtemp_home_over_limit_is_not_rejected_before_spawn(self):
+        home, log, feedlist = make_home(os.path.join(self.tmp, "x" * 80))
+        env = make_env(home)
+        sock = os.path.join(home, ".local", "state", "cys-dept-a", "cys.sock")
+        self.assertGreaterEqual(len(sock.encode("utf-8")), 104, "픽스처가 상한을 넘지 않음")
+        write_reg(env, {})
+        rc, out, err = self.run_dept("launch", "a", env=env)          # 목 cysd 스폰 경로(bind 없이 touch)
+        self.assertEqual(rc, 0, "상한 초과 경로를 스폰 전에 거부(하네스 파손 회귀): exit=%d\n%s%s" % (rc, out, err))
+        self.assertNotIn("sun_path", err, "성공 경로에 소켓 길이 사유가 섞임")
+        self.assertIn("a", read_reg(env), "launch 완주인데 미등재")
+
+    # 12) 기동 실패 경로: 소켓을 만들지 않는 목 cysd(bind 실패 재현) → exit 1 · 등재 회수 · 상한 초과일 때만 사유
+    def test_daemon_start_failure_names_sock_len(self):
+        _write_exec(os.path.join(self.home, ".local", "bin", "cysd"), "#!/bin/sh\nexit 0\n")
+        write_reg(self.env, {})
+        sock = os.path.join(self.home, ".local", "state", "cys-dept-a", "cys.sock")
+        over = len(sock.encode("utf-8")) >= 104 and sys.platform != "linux"
+        rc, out, err = self.run_dept("launch", "a")
+        self.assertEqual(rc, 1, "기동 실패 exit 계약(1) 회귀: %d\n%s%s" % (rc, out, err))
+        self.assertIn("데몬 기동 실패", out + err)
+        if over:
+            self.assertIn("%dB" % len(sock.encode("utf-8")), err, "상한 초과 실패인데 소켓 길이 사유 부재: %r" % err)
+        else:
+            self.assertNotIn("sun_path", err, "상한 미만 실패에 소켓 길이 오진단")
+        self.assertNotIn("a", read_reg(self.env), "기동 실패인데 등재 잔존(롤백 회귀)")
+
+    # 12) 배선 census: "데몬 기동 실패" 를 내는 전 지점이 sock_len_diag 를 부른다 · 스폰 전 가드(assert_sock_len) 부활 금지
+    def test_failure_sites_wired_and_no_prespawn_guard(self):
+        src = open(DEPT, encoding="utf-8").read()
+        sites = [l for l in src.splitlines() if "데몬 기동 실패" in l and "echo" in l and not l.lstrip().startswith("#")]
+        self.assertGreaterEqual(len(sites), 3, "launch/allocate/create 기동 실패 지점 수 변동: %r" % sites)
+        for l in sites:
+            self.assertIn("sock_len_diag", l, "기동 실패 지점에 사유 배선 없음: %s" % l.strip())
+        self.assertIsNone(re.search(r"^\s*assert_sock_len\b", src, re.M),
+                          "스폰 전 소켓 길이 거부(assert_sock_len)가 부활 — 목 cysd 하네스·Linux 108 과 충돌")
+
+
+class CrlfHygiene(Base):
+    # 13) `read < <(python3 …)` 파이프 소비자는 전부 `| tr -d '\r'` — Windows 임베디드 python 의 \r\n(cys-dept:307-310 규칙)
+    def test_procsub_consumers_strip_cr(self):
+        src = open(DEPT, encoding="utf-8").read()
+        lines = [l for l in src.splitlines() if "< <(python3" in l and not l.lstrip().startswith("#")]
+        self.assertGreaterEqual(len(lines), 1, "process-substitution 소비자 0 — 검사 대상이 사라짐(census 갱신 필요)")
+        for l in lines:
+            self.assertIn("tr -d '\\r'", l, "\\r 미소거 파이프 소비자(create cwd 등재 \\r 오염 경로): %s" % l.strip())
+
+
+class RegistryBom(Base):
+    # 14) census: depts.json 판독에 encoding 없는 open 이 남아 있지 않다(RMW 지점의 `except → {'depts':{}}` 가 BOM 을 지운다)
+    def test_no_encoding_blind_registry_reader(self):
+        src = open(DEPT, encoding="utf-8").read()
+        blind = [l.strip() for l in src.splitlines()
+                 if re.search(r"json\.load\(open\((p|sys\.argv\[1\])\)\)", l) and not l.lstrip().startswith("#")]
+        self.assertEqual(blind, [], "encoding 없는 레지스트리 판독 잔존(K2-03 범위 회귀): %r" % blind)
+
+    # 14) 동작: BOM 달린 depts.json(기존 등재 1건) → list 에 보이고, 다른 이름 launch(reg_upsert RMW) 뒤에도 기존 등재·메타 보존
+    def test_bom_registry_survives_rmw(self):
+        keep_sock = seed_sock(self.home, "keep")
+        with open(self.env["CYS_DEPTS_JSON"], "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(
+                {"depts": {"keep": {"socket": keep_sock, "pack_dir": "", "display_name": "영업부(한국)"}}},
+                ensure_ascii=False).encode("utf-8"))
+        rc, out, err = self.run_dept("list")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("keep", out.split(), "BOM 레지스트리의 등재가 list 에 안 보임")
+        seed_sock(self.home, "newer")
+        rc, out, err = self.run_dept("launch", "newer")
+        self.assertEqual(rc, 0, "launch 실패\n%s%s" % (out, err))
+        reg = read_reg(self.env)
+        self.assertIn("newer", reg)
+        self.assertIn("keep", reg, "BOM 레지스트리가 RMW 에서 비워짐(기존 등재 소실 · K2-03 회귀)")
+        self.assertEqual(reg["keep"].get("display_name"), "영업부(한국)", "기존 메타 소실")
 
 
 if __name__ == "__main__":

@@ -153,6 +153,26 @@ describe("복원 배선 — 같은 소켓에 요청을 쌓지 않는다(폭주 �
   });
 });
 
+// ★K2-05(2026-09-17 한글 사용자명 감사) — 표시명(ws.name)이 `cys-dept launch` 인자로 흐르는 배선이 다시 생기지 않게.
+describe("부서 launch 배선 — 표시명은 절대 부서명 인자가 되지 않는다(K2-05)", () => {
+  it("launch_dept_daemon 호출부 어디에도 `?? ws.name` 폴백이 없다", () => {
+    const sites = [...code.matchAll(/invoke\("launch_dept_daemon"/g)].map((m) => m.index ?? -1);
+    expect(sites.length).toBeGreaterThanOrEqual(2); // '지금 켜기' + 복원 재-launch
+    for (const i of sites) {
+      const win = code.slice(i, i + 240);
+      expect(win).not.toContain("ws.name");
+      expect(win).toContain("launchName");
+    }
+    expect(code).not.toContain("deptNameFromSocket(ws.socket) ?? ws.name");
+  });
+  it("두 호출부 모두 deptLaunchName(소켓 → 레지스트리 키)의 산출값을 쓴다", () => {
+    expect(code.includes("deptLaunchName(ws.socket, null)")).toBe(true); // '지금 켜기': 소켓 먼저, 실패 시 list_depts 재조회
+    expect(code.includes("launchName = deptLaunchName(ws.socket, reg.depts)")).toBe(true);
+    expect(code.includes("deptLaunchName(ws.socket, regDepts)")).toBe(true); // 복원: 이미 조회한 레지스트리
+    expect(restoreSlice().includes("unnamedLaunch += 1")).toBe(true); // 무음 생략 금지 — 사유 집계
+  });
+});
+
 describe("복원 배선 — 묘비는 결측이면 닫는다(fail-closed)", () => {
   it("★묘비 조회 실패(null)에 부서를 만들지 않는다 — 순수부에 그 조항이 있다", () => {
     const ws = readFileSync(new URL("./wsreconcile.ts", import.meta.url), "utf-8");

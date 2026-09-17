@@ -31,6 +31,7 @@ import {
   isActiveDeptSocket,
   DEFAULT_SOCKET_KEY,
   deptNameFromSocket,
+  deptLaunchName,
   type DeptSwitchOutcome,
 } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
@@ -3382,9 +3383,22 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
     btn.textContent = "여는 중…";
     try {
       if (isDept) {
-        const r = (await invoke("launch_dept_daemon", {
-          name: deptNameFromSocket(ws.socket) ?? ws.name,
-        })) as { socket?: string; socket_slug?: string };
+        // ★K2-05(2026-09-17 한글 사용자명 감사): 표시명(ws.name · 한글 가능)은 부서명 인자가 아니다 — 소켓 → 레지스트리
+        //   순으로만 구하고, 둘 다 없으면 사유를 말하고 멈춘다(deptlabel.ts deptLaunchName 주석).
+        let launchName = deptLaunchName(ws.socket, null);
+        if (!launchName) {
+          const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+            depts?: Record<string, { socket?: string }>;
+          };
+          launchName = deptLaunchName(ws.socket, reg.depts);
+        }
+        if (!launchName) {
+          throw new Error(`이 탭의 소켓에서 부서명을 찾지 못했습니다(소켓 규약 불일치·레지스트리 미등재): ${ws.socket}`);
+        }
+        const r = (await invoke("launch_dept_daemon", { name: launchName })) as {
+          socket?: string;
+          socket_slug?: string;
+        };
         if (r?.socket_slug && r?.socket) socketForSlug.set(r.socket_slug, r.socket);
         if (r?.socket) ws.socket = r.socket;
         ws.autoCreated = undefined; // 사용자가 직접 켰다 — 다음 기동부터 회차 상한 면제
@@ -7479,12 +7493,15 @@ async function start() {
   // (order 8) 레지스트리 진실원 대조 — 죽은 socket이면서 레지스트리 미등록인 부서 ws는 유령(옛 테스트
   // 잔재·삭제된 부서)이므로 재-launch 안 하고 드롭. 조회 실패 시엔 보수적으로 전부 보존(기존 동작).
   let registered: Set<string> | null = null;
+  // ★K2-05: 재-launch 부서명의 2차 진실원(소켓 역산 실패 시 레지스트리 키) — 표시명은 인자가 되지 않는다.
+  let regDepts: Record<string, { socket?: string; display_name?: string }> | null = null;
   // ＋부서 자동화(패치5·§E-4): socket→display_name 맵 — 복원 시 부서 탭 표시명 회복(rename=표시명 레이어).
   const displayBySocket = new Map<string, string>();
   try {
     const reg = (await rpcT(invoke("list_depts"), T_REG)) as {
       depts?: Record<string, { socket?: string; display_name?: string }>;
     };
+    regDepts = reg.depts ?? {};
     registered = new Set(
       Object.values(reg.depts ?? {})
         .map((v) => v?.socket)
@@ -7563,6 +7580,7 @@ async function start() {
   let launched = 0;
   let cappedLaunch = 0; // 회차 상한으로 미룸(제품이 의도적으로 조절)
   let budgetLaunch = 0; // 복원 예산 소진으로 미룸(그 기계의 데몬이 느리다 — 원인이 다르다)
+  let unnamedLaunch = 0; // ★K2-05: 소켓·레지스트리 어디서도 부서명을 못 구함(표시명으로는 켜지 않는다)
   const deptWsList = workspaces.filter((w) => w.socket);
   for (let di = 0; di < deptWsList.length; di++) {
     const ws = deptWsList[di];
@@ -7620,13 +7638,21 @@ async function start() {
     // 그래서 **저장본에 있던 부서**(사용자가 실제로 쓰던 탭)를 먼저 확보하고, 그 밖은 회차당
     // 상한까지만 확보한다. 남은 부서는 탭이 이미 있으므로 화면에서 사라지지 않고, 다음 기동이
     // 이어서 확보한다(저장본에 남으므로 그때는 '쓰던 탭' 우선순위로 올라간다).
+    // ★K2-05(2026-09-17 한글 사용자명 감사): 표시명(ws.name)은 부서명 인자가 아니다 — 소켓 역산 → 레지스트리 키.
+    //   한글 표시명이 `cys-dept launch` 로 흐르면 validate_dept_name 이 exit 2 로 거부해 탭이 빈 채 남았다.
+    //   못 구하면 상한도 소모하지 않고 건너뛰되 아래에서 사유를 말한다(무음 생략 금지).
+    const launchName = deptLaunchName(ws.socket, regDepts);
+    if (!launchName) {
+      unnamedLaunch += 1;
+      continue;
+    }
     if (ws.autoCreated === true && launched >= MAX_DEPT_LAUNCH_PER_START) {
       cappedLaunch += 1;
       continue;
     }
     launched += 1;
     try {
-      const info = (await rpcT(invoke("launch_dept_daemon", { name: deptNameFromSocket(ws.socket) ?? ws.name }), T_LAUNCH)) as { socket: string; socket_slug?: string };
+      const info = (await rpcT(invoke("launch_dept_daemon", { name: launchName }), T_LAUNCH)) as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
       if (info.socket) ws.socket = info.socket; // 재-launch된 실제 socket 반영(이후 집계·prune·병합 정합)
     } catch {
@@ -7649,6 +7675,13 @@ async function start() {
       "watchdog",
       `부서 ${budgetLaunch}곳은 준비하지 못했습니다`,
       "데몬 응답이 느려 이번 기동에서는 시간 안에 켜지 못했습니다. 탭은 그대로 있으니 [지금 켜기]를 누르거나 앱을 다시 켜 주세요.",
+    );
+  }
+  if (unnamedLaunch > 0) {
+    toast(
+      "watchdog",
+      `부서 ${unnamedLaunch}곳은 이름을 확인하지 못했습니다`,
+      "탭의 소켓이 부서 규약과 맞지 않고 레지스트리에도 없어 켜지 않았습니다(표시명으로는 켜지 않습니다). 탭은 그대로 두었으니 부서 목록(cys-dept list)을 확인해 주세요.",
     );
   }
 

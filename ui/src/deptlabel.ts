@@ -4,6 +4,8 @@
 // pending 탭엔 "부서 제작 중…"을 표시해 진행 중임을 명시한다. 순수 함수라 pending/확정 라벨을
 // 결정론으로 회귀 테스트할 수 있다(deptlabel.test.ts).
 
+import { sameSocket } from "./wsreconcile";
+
 // pending 부서 탭에 표시할 진행 라벨(스피너 글리프는 CSS가 담당 — 여기선 텍스트만).
 export const DEPT_PENDING_LABEL = "부서 제작 중…";
 
@@ -107,4 +109,32 @@ export function deptNameFromSocket(sock: string | undefined): string | null {
   if (m) return m[1];
   const w = /^\\\\\.\\pipe\\cys-dept-(.+)$/.exec(sock ?? "");
   return w ? w[1] : null;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// ★K2-05(2026-09-17 한글 사용자명 감사) — `cys-dept launch <name>` 에 넘길 **부서명 인자**의 단일 산출 지점.
+//
+// 종전 main.ts 두 곳('지금 켜기'·복원 재-launch)은 `deptNameFromSocket(ws.socket) ?? ws.name` 이었다.
+// `ws.name` 은 create 표시명(한글 · main.ts addDeptWorkspace 의 display_name) 또는 사용자가 rename 한 탭
+// 이름이라, 소켓 역산이 null 이면 그 한글이 부서명 인자로 흘러 cys-dept `validate_dept_name` 에서 exit 2
+// ("부적격 부서명('영업부')") — 화면에는 "부서를 켜지 못했습니다" 만 남았다. 표시명은 라벨 레이어이지
+// 정체가 아니다. 정체의 진실원은 소켓, 그 다음이 레지스트리(list_depts 의 **키** = cys-dept 가 검증해 등재한
+// 부서명)다. 둘 다 실패하면 null 을 돌려주고 호출측이 사유를 말한다 — 이 함수는 표시명을 아예 받지 않으므로
+// 표시명이 인자가 되는 경로는 타입 수준에서 없다.
+//
+//   ① deptNameFromSocket(socket)                  — unix `…/cys-dept-<n>/cys.sock` · win `\\.\pipe\cys-dept-<n>`
+//   ② depts 의 항목 중 sameSocket(e.socket, socket) 인 키 — 표기만 다른 같은 소켓(win pipe 대소문자)도 받는다
+//   ③ null
+// ────────────────────────────────────────────────────────────────────────────
+export function deptLaunchName(
+  socket: string | undefined,
+  depts: Readonly<Record<string, { socket?: string } | undefined>> | null | undefined,
+): string | null {
+  const bySock = deptNameFromSocket(socket);
+  if (bySock) return bySock;
+  if (!socket) return null;
+  for (const [name, e] of Object.entries(depts ?? {})) {
+    if (name && e?.socket && sameSocket(e.socket, socket)) return name;
+  }
+  return null;
 }

@@ -10,7 +10,59 @@ import {
   pickDeptWorkspace,
   isActiveDeptSocket,
   DEFAULT_SOCKET_KEY,
+  deptNameFromSocket,
+  deptLaunchName,
 } from "./deptlabel";
+
+// ★K2-05(2026-09-17 한글 사용자명 감사) — `cys-dept launch <name>` 인자의 단일 산출 지점 핀.
+// 종전 `deptNameFromSocket(ws.socket) ?? ws.name` 은 소켓 역산이 null 이면 한글 표시명을 부서명으로
+// 넘겨 exit 2("부적격 부서명") 를 냈다. 이 함수는 표시명을 **받지 않는다** — 소켓 → 레지스트리 키 → null.
+describe("deptLaunchName — 표시명은 어떤 경우에도 launch 인자가 되지 않는다", () => {
+  const REG = {
+    "dept-1": { socket: "/Users/x/.local/state/cys-dept-dept-1/cys.sock", display_name: "영업부(한국)" },
+    "dept-2": { socket: "\\\\.\\pipe\\cys-dept-dept-2", display_name: "미래연구부" },
+    // ★2라운드 검증 적발: 역산 불가 소켓 항목에도 display_name(한글)을 둔다 — 변이 `return e.display_name ?? name` 이
+    //   이 픽스처 없이는 22/22 를 살아 통과했다(핀이 표제 주장을 실제로 잠그지 못했다).
+    "dept-3": { socket: "C:\\Users\\x\\.local\\state\\cys-dept-dept-3\\cys.sock", display_name: "총무부" },
+  };
+  it("① 규약 소켓은 레지스트리 없이도 소켓에서 역산(종전 동작 보존)", () => {
+    expect(deptLaunchName("/Users/x/.local/state/cys-dept-dept-1/cys.sock", null)).toBe("dept-1");
+    expect(deptLaunchName("\\\\.\\pipe\\cys-dept-sales", undefined)).toBe("sales");
+  });
+  it("① 한글 홈(NFC·NFD)·공백 경로에서도 부서명은 소켓 슬러그 그대로", () => {
+    const nfc = "/Users/x/Desktop/홍길동/.local/state/cys-dept-dept-1/cys.sock";
+    const nfd = "/Users/x/Desktop/" + "홍길동".normalize("NFD") + "/.local/state/cys-dept-dept-1/cys.sock";
+    expect(nfd).not.toBe(nfc); // 픽스처가 실제로 NFD 인지
+    expect(deptLaunchName(nfc, null)).toBe("dept-1");
+    expect(deptLaunchName(nfd, null)).toBe("dept-1");
+    expect(deptLaunchName("/Users/x/영업 팀/.local/state/cys-dept-sales-kr/cys.sock", null)).toBe("sales-kr");
+  });
+  it("② 역산 불가 소켓(Windows 파일경로형)은 레지스트리 **키** 로 — display_name 이 아니다", () => {
+    const sock = "C:\\Users\\x\\.local\\state\\cys-dept-dept-3\\cys.sock";
+    expect(deptNameFromSocket(sock)).toBeNull(); // 전제: 파서가 못 읽는 형태
+    expect(deptLaunchName(sock, REG)).toBe("dept-3");
+    expect(deptLaunchName(sock, REG)).not.toBe(REG["dept-3"].display_name); // 레지스트리 경로에서도 표시명은 돌아오지 않는다
+  });
+  it("② 표기만 다른 같은 named pipe(대소문자)도 레지스트리 키로 맞춘다(sameSocket 술어)", () => {
+    // `\\?\pipe\` 접두는 파서가 못 읽지만 sameSocket 도 다르게 보므로 null — 대소문자 차이만 흡수한다.
+    const reg = { "dept-2": { socket: "\\\\.\\pipe\\cys-dept-dept-2" } };
+    expect(deptLaunchName("\\\\.\\pipe\\cys-dept-DEPT-2", reg)).toBe("DEPT-2"); // 파서 우선(종전 순서 보존)
+    expect(deptLaunchName("\\\\?\\pipe\\cys-dept-dept-2", reg)).toBeNull();
+  });
+  it("③ 어디에도 없으면 null — 한글 display_name 은 결코 돌아오지 않는다", () => {
+    const orphan = "C:\\Users\\x\\elsewhere\\cys.sock";
+    expect(deptLaunchName(orphan, REG)).toBeNull();
+    expect(deptLaunchName(undefined, REG)).toBeNull();
+    expect(deptLaunchName("", REG)).toBeNull();
+    for (const s of [orphan, REG["dept-1"].socket, REG["dept-2"].socket, REG["dept-3"].socket]) {
+      const n = deptLaunchName(s, REG);
+      expect(n === null || /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(n)).toBe(true); // cys-dept dept_name_ok 집합
+    }
+  });
+  it("레지스트리 항목의 socket 이 비었거나 키가 비어도 매칭하지 않는다", () => {
+    expect(deptLaunchName("C:\\x\\cys.sock", { "": { socket: "C:\\x\\cys.sock" }, d: {}, e: undefined })).toBeNull();
+  });
+});
 
 describe("deptPlaceholderLabel — 부서 제작 중 표시", () => {
   it("pending 부서 탭은 '부서 제작 중' 표시", () => {

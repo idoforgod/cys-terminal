@@ -5,7 +5,7 @@
 exit: 0=성공 1=위반/실패 2=입출력 3=권한(CSO아님) 4=대상없음
 (org-audit 동사: 0=수렴 1=미수렴 2=입출력 — read-only 파생 집계·영속 0 · T10/P3-3)
 """
-import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil
+import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil, unicodedata
 
 # RC-6: OS중립 파일락 — unix는 fcntl.flock(제로 회귀·파일 닫힐 때 자동 해제), Windows는 fcntl
 # 부재라 msvcrt 바이트락으로 폴백(과거 top-level `import fcntl`이 Windows에서 즉시 ModuleNotFoundError로
@@ -49,7 +49,10 @@ def load_json(path, default=None):
     if not os.path.exists(path):
         if default is not None: return default
         raise FileNotFoundError(path)
-    with open(path, encoding="utf-8") as f:
+    # ★K2-03(2026-09-17 한글 사용자명 감사): utf-8-sig — 한국어 Windows 편집기("UTF-8(BOM)")로 저장한 카탈로그/매니페스트의
+    #   선두 U+FEFF 를 받아들인다(strict utf-8 은 JSONDecodeError "Unexpected UTF-8 BOM" — 감사 §5-(e) 재현은 cys-dept 쪽이지만
+    #   같은 파일(dept-catalog.json)을 catalog_upsert 가 여기로 읽는다). BOM 없는 파일엔 동일 동작 · cp949 는 여전히 거부.
+    with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
 def sha256_text(s): return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -128,6 +131,25 @@ def require_cso():
         sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). %sCSO에 위임하라.\n" % why)
         sys.exit(3)
 
+def _dept_key_ok(key):
+    """카탈로그 key 의 부서명 규약 판정 — 정본은 cys-dept::dept_name_ok, 파이썬 재수출은 javis_bootstrap.dept_name_ok
+    (단일 출처·사본 금지 — 두 소스의 정규식은 javis_bootstrap self-test 가 대조한다). 형제 모듈은 _audit_formation_mod 와
+    같은 지연 로드. 정본 미로드 시 진단만 생략(True) — cys-dept 가 create 진입부에서 여전히 exit 2 로 막으므로 게이트는
+    유지되고 조기 진단 층만 빠진다(리터럴 사본을 여기 두지 않는 이유).
+    ★알려진 부작용(2라운드 검증 적발): javis_bootstrap 은 import 시 sys.stdout/stderr 를 utf-8(errors=replace) 로
+    reconfigure 한다(그 파일 R3 주석 — 직접 실행 cp949 콘솔의 UnicodeEncodeError 방어). 제품 경로(cys-dept
+    PYTHONUTF8=1 · GUI inject_runtime_path ENV_PY_UTF8 · 좌석 env 주입)에선 이미 UTF-8 이라 무변경이고, PYTHONUTF8 없이
+    cp949 콘솔에서 직접 `javis_org.py apply` 를 칠 때만 한글 출력 바이트가 UTF-8 로 바뀐다(크래시 대신 mojibake —
+    javis_bootstrap 과 같은 선택). v_schema 가 key 를 볼 때만 로드되므로 status/list 계열은 영향 없음."""
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import javis_bootstrap
+        return bool(javis_bootstrap.dept_name_ok(key))
+    except Exception:
+        return True
+
 def v_schema(m):
     errs = []
     if not isinstance(m, dict): return ["매니페스트가 객체 아님"]
@@ -143,6 +165,11 @@ def v_schema(m):
     for i, d in enumerate(m.get("departments") or []):
         for f in ("key", "display", "account", "cwd", "mission_md", "source_quote"):
             if not d.get(f): errs.append(f"departments[{i}].{f} 누락")
+        # ★K2-04(2026-09-17 한글 사용자명 감사): key 는 `cys-dept create <key>` 의 부서명 인자(acctdir 접미·소켓·미션 경로 합성)라
+        #   cys-dept validate_dept_name 의 ASCII 화이트리스트가 적용된다. 한글 key('영업부')는 apply 단계에서 exit 2
+        #   "부적격 부서명" 으로 늦게 터지고 GUI 엔 "부서 런칭 실패" 로만 보였다 — 여기서 조기 진단한다(한글은 display 에).
+        if d.get("key") and not _dept_key_ok(d["key"]):
+            errs.append(f"departments[{i}].key 부적격({d['key']!r}) — key 는 영문·숫자·'_'·'-' 만(최대 40자 · 한글 등 표시명은 display 에)")
     for i, t in enumerate(m.get("tasks") or []):
         for f in ("dept", "task", "scope", "source_quote"):
             if not t.get(f): errs.append(f"tasks[{i}].{f} 누락")
@@ -188,7 +215,12 @@ def backfill_mission_key(depts_path, key, mission_key, display=None):
         reg = load_json(depts_path, {"depts":{}})
         for name, e in reg.get("depts", {}).items():
             cwd_base = os.path.basename(expand(e.get("cwd","")).rstrip("/"))
-            if cwd_base == display or cwd_base == key:  # 한글 display 1차·영문 key 레거시 2차
+            # ★K2-06(2026-09-17 한글 사용자명 감사): macOS 에서 등재 cwd 는 커널 표기(NFD)일 수 있다 — cys-dept
+            #   resolve_dept_cwd → `pwd -P` 가 NFD 를 돌려주는 것을 실측(Finder/Cocoa 생성 한글 폴더 = NFD). manifest
+            #   display 는 NFC 타이핑이라 바이트 정확일치가 실패해 backfill 이 누락됐다. **비교만** 양변 NFC 로 접는다
+            #   (등재값은 정규화하지 않는다 — claude 신뢰 키는 저장 표기가 정본 · javis_preflight claude_project_key R5).
+            nfc = lambda s: unicodedata.normalize("NFC", s)
+            if (display and nfc(cwd_base) == nfc(display)) or nfc(cwd_base) == nfc(key):  # 한글 display 1차·영문 key 레거시 2차
                 if not e.get("mission_key"):
                     e["mission_key"] = mission_key
         _atomic_write(depts_path, reg)
@@ -858,6 +890,34 @@ def self_test():
     r4 = json.load(open(dpath))
     chk("backfill-hangul-no-bleed", r4["depts"]["d4"].get("mission_key") != "future-research",
         "한글 display 부분문자열(구미래연구부) 오탐")
+    # --- K2-06(2026-09-17 한글 사용자명 감사): macOS NFD 등재 cwd ↔ NFC display 정확일치 회귀 핀 ---
+    _nfd = unicodedata.normalize("NFD", "미래연구부")
+    assert _nfd != "미래연구부" and len(_nfd.encode()) > len("미래연구부".encode())  # 픽스처 자체가 NFD 인지(핀 무효화 방지)
+    json.dump({"depts":{"d5":{"cwd":"$HOME/Desktop/CYSjavis/"+_nfd,"socket":"s5"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
+    r5 = json.load(open(dpath))
+    chk("backfill-nfd-cwd", r5["depts"]["d5"].get("mission_key") == "future-research",
+        "NFD 등재 cwd(커널 표기)가 NFC display 와 불일치로 backfill 누락(K2-06 회귀)")
+    json.dump({"depts":{"d6":{"cwd":"","socket":"s6"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "future-research", "future-research", None)
+    chk("backfill-empty-cwd-no-match", not json.load(open(dpath))["depts"]["d6"].get("mission_key"),
+        "빈 cwd 가 display=None 과 매칭(정규화 도입 회귀)")
+    # --- K2-04: 카탈로그 key 한글 → v_schema 조기 진단(cys-dept validate_dept_name 과 같은 집합 · 정본 javis_bootstrap) ---
+    m_ko = {**m_ok, "departments":[{**good_dept, "key":"영업부"}]}
+    chk("schema-key-hangul", any(".key 부적격" in e for e in v_schema(m_ko)),
+        "한글 key 가 v_schema 를 통과 — cys-dept create 에서 exit 2 로 늦게 터진다(K2-04)")
+    chk("schema-key-hangul-only", [e for e in v_schema(m_ko) if ".key" not in e] == [], "key 진단이 다른 필드를 오염")
+    m_key_ok = {**m_ok, "departments":[{**good_dept, "key":"Sales_KR-2"}]}
+    chk("schema-key-ascii", v_schema(m_key_ok) == [], f"정형 key 오탐: {v_schema(m_key_ok)}")
+    chk("schema-key-display-hangul-ok", v_schema(m_ok) == [], "한글 display 가 key 진단에 걸림(표시명은 한글 허용)")
+    # --- K2-03: UTF-8 BOM 카탈로그(한국어 Windows 편집기 'UTF-8(BOM)' 저장) 판독 ---
+    bpath = os.path.join(td, "bom-catalog.json")
+    with open(bpath, "wb") as f:
+        f.write(b"\xef\xbb\xbf" + json.dumps({"departments":{"sales-kr":{"display":"영업부(한국)"}}}, ensure_ascii=False).encode("utf-8"))
+    try:
+        chk("load-json-bom", load_json(bpath)["departments"]["sales-kr"]["display"] == "영업부(한국)", "BOM 카탈로그 내용 불일치")
+    except Exception as e:
+        chk("load-json-bom", False, f"BOM 카탈로그 판독 실패(K2-03 회귀): {e}")
     # --- R3-2: catalog display/cwd drift 거부 (기존 key 재할당 위장 차단) ---
     cat_drift = {"accounts":{"cysinsight":"x"},
                  "departments":{"future-research":{"display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}}}

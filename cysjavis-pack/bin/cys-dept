@@ -49,6 +49,26 @@ dept_sock(){
     *) echo "$HOME/.local/state/cys-dept-$1/cys.sock" ;;
   esac
 }
+# ★K2-07(2026-09-17 한글 사용자명 감사 · 2라운드 개정): unix 소켓 경로가 sun_path 상한(macOS/BSD 104B · Linux 108B ·
+#   NUL 포함 — Rust std `UnixListener::bind` 는 그 길이부터 "path must be shorter than SUN_LEN" 으로 거부)을 넘으면 cysd 가
+#   bind 에 실패하는데, 이 도구에는 "데몬 기동 실패"(exit 1)로만 보여 원인이 숨는다. 부서명 40자 상한(validate_dept_name)은
+#   ASCII 홈(/Users/cys) 가정이라 한글 홈은 NFD 등재 시 음절당 9B — `홍길동`(NFD)+40자 = 106B(감사 §5-(c) 실측).
+#   ★판정 주체는 bind 하는 cysd 자신이다 — 이 도구는 스폰 **전에 거부하지 않고**, ready() 실패 시 **사유만** 덧붙인다.
+#     1라운드의 스폰 전 exit 2 가드(assert_sock_len)는 목 cysd(bind 없이 소켓 파일만 touch)로 도는 기존 CI 하네스
+#     (bin/tests/test_dept_name_guard.py · 격리 HOME=tempfile.mkdtemp → macOS TMPDIR /var/folders/…/T/ 50B 라 1글자
+#     부서명도 105B)를 결정론으로 깨뜨렸고(2라운드 검증 실측 22 중 4 FAIL), 상한도 OS 별이라 여기서 못 박으면 거짓 거부다.
+#   `${#var}` 는 로케일에 따라 문자 수를 세므로 쓰지 않는다(printf|wc -c = 바이트 · macOS wc 의 선행 공백은 $((n)) 로 소거).
+#   Windows named pipe(백슬래시 선두)는 상한이 없어 무출력. 항상 0 반환(진단 전용 — set -e 아래 실패 블록 안에서 불린다).
+#   회귀 핀: bin/tests/test_dept_name_guard.py SockLenDiag(순수 함수 추출 실행 + 목 cysd 무-bind 기동 실패 경로 + 배선 census).
+sock_len_diag(){
+  local sock="$1" n lim
+  case "$sock" in \\*) return 0 ;; esac
+  case "$(uname -s 2>/dev/null)" in Linux) lim=108 ;; *) lim=104 ;; esac
+  n=$(printf %s "$sock" | wc -c); n=$((n))
+  [ "$n" -lt "$lim" ] && return 0
+  echo "[cys-dept] 원인 후보: 소켓 경로 ${n}B ≥ ${lim}B(unix sun_path 상한 · NUL 포함) — cysd 가 bind 하지 못한다. 홈 경로 또는 부서명을 줄여라: $sock" >&2
+  return 0
+}
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 # ★기능2: 부서 state 디렉토리(대화기억 transcripts.db 보관·실측 최대 324MB) = 소켓의 부모.
 # discover_depts(javis_phoenix.py:1082 glob `state_root/cys-dept-*`)와 동일 규약 — 이 경로가 사라지면
@@ -219,7 +239,8 @@ graceful_kill(){
 # ── ★D3(i) 부서명 검증 (v4 수리 스펙 — `launch --help` 유령부서→껍데기 CEO 승격 실사고 봉합) ──
 # 화이트리스트 ^[A-Za-z0-9][A-Za-z0-9_-]*$ — '.' 불허(Windows pipe_slug(state.rs:1133-1139)가 '.'을
 # 소거해 점만 다른 두 부서의 상태 디렉토리가 병합되는 격리 붕괴 봉합)·'-' 선두 불허(옵션 오파싱)·
-# 최대 40자(macOS unix 소켓 104B 한계 여유)·LC_ALL=C(로케일 무관 결정론).
+# 최대 40자(macOS unix 소켓 104B 한계 여유 — ★ASCII 홈 기준. 한글(NFD) 홈에선 40자 안에서도 초과할 수 있고 그때는
+#   cysd 의 bind 가 거부한다 → sock_len_diag 가 "데몬 기동 실패" 에 사유를 덧붙인다 · K2-07)·LC_ALL=C(로케일 무관 결정론).
 # 거부 exit=2(기존 usage 계열과 통일) 고정 — ★재사용 금지 집합={1,3,4,5,6,7,8,9}
 # (1=기동실패·3/4=카탈로그·5=계정·6=시드·7=단일소유·8=cap/미등재·9=rotate 미응답 — GUI 분기 오동작 방지).
 # ★중대(2026-08-22 검증리뷰): 종전 `printf | grep -Eq` 는 **줄 단위** 판정이라 여러 줄 중 한 줄만
@@ -240,7 +261,9 @@ validate_dept_name(){
   local name="$1" u="${2:-}" hint="${3:-}"
   dept_name_ok "$name" && return 0
   [ -n "$u" ] || return 1
-  echo "[cys-dept] 부적격 부서명('$name') — 허용 ^[A-Za-z0-9][A-Za-z0-9_-]*$ (최대 40자·빈이름/'.'포함/'-'선두 불가)" >&2
+  # ★K2-04(2026-09-17 한글 사용자명 감사): 한글 등 비ASCII 는 부서명/카탈로그 key 가 아니라 display(표시명) 자리다 —
+  #   진단 문구에 그 안내를 병기한다(javis_org.py v_schema 가 같은 집합으로 조기 진단한다).
+  echo "[cys-dept] 부적격 부서명('$name') — 허용 ^[A-Za-z0-9][A-Za-z0-9_-]*$ (최대 40자·빈이름/'.'포함/'-'선두 불가 · 한글 등 비ASCII 는 카탈로그 display(표시명)에만)" >&2
   echo "usage: cys-dept $u" >&2
   if [ -n "$hint" ]; then echo "[cys-dept] $hint" >&2; fi
   exit 2
@@ -286,8 +309,15 @@ usage: cys-dept <verb> ...
 USAGE
 }
 
+# ★K2-03(2026-09-17 한글 사용자명 감사 · 2라운드 범위 일치): 레지스트리(depts.json) 판독 **전 지점** 을 `encoding="utf-8-sig"`
+#   로 — 선두 UTF-8 BOM(한국어 Windows 편집기 "UTF-8(BOM)" 저장)을 받아들인다. 종전 `json.load(open(p))` 는 PYTHONUTF8=1 의
+#   엄격 UTF-8 에서 BOM 이 JSONDecodeError 라, RMW 지점(reg_upsert/reg_remove/reg_set_meta/reg_set_field/allocate·create 예약)의
+#   `except Exception: d={'depts':{}}` 가 **빈 레지스트리를 만든 뒤 os.replace 로 덮어써** 기존 등재 전부가 사라졌다 — GUI 의
+#   Rust list_depts(src-tauri/src/main.rs strip_utf8_bom)는 같은 파일을 정상으로 읽어 "팝업엔 보이는데 다음 cys-dept 쓰기에서
+#   사라지는" 비대칭이었다. 기계 기록(json.dump)은 BOM 을 쓰지 않으므로 정상 파일엔 동일 동작 · cp949 는 여전히 거부.
+#   회귀 핀: bin/tests/test_dept_name_guard.py RegistryBom(census + BOM 레지스트리 보존 동작).
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
-reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))['depts']))" "$REG" | tr -d '\r'; }
+reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.argv[1],encoding='utf-8-sig'))['depts']))" "$REG" | tr -d '\r'; }
 # ★CRLF 위생(2026-08-16 win T3-ng3 실증): Windows 임베디드 python 의 stdout 은 텍스트 모드라
 #   줄끝이 \r\n 이다. $(...) 캡처는 MSYS bash 가 \r 을 벗겨 안전(allocate 상시 green 이 실증)하나
 #   파이프 소비자(`reg_names | grep -Fxq -- name` — rotate 등재 게이트 L:rotate·TOCTOU 재확인)는
@@ -296,7 +326,7 @@ reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.
 #   실행 인자의 POSIX 경로만 Windows 경로로 자동 변환한다 — -c 코드 안의 '/c/Users/…' 는 미변환이라
 #   Windows python 이 FileNotFoundError 로 죽고, 파이프 소비자(rotate 등재 게이트)·reg_count 캡처
 #   ("부서 수" 산정·down 의 강등 판정)가 전부 빈 값이 됐다(win 잠복 결함).
-reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1]))['depts']]" "$REG" | tr -d '\r'; }
+reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1],encoding='utf-8-sig'))['depts']]" "$REG" | tr -d '\r'; }
 
 # ★A2(SURVEY B3): 등재(SOT=depts.json)에 없는데 **소켓 디렉터리만** 남은 부서를 stderr 로 고지한다.
 #   정상 teardown 은 상태 디렉터리를 TRASH_ROOT 로 격리하므로 이 형상은 **비정상 종료 잔재**다.
@@ -337,7 +367,7 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
 p,n,s,k=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     # F2(codex#2): full-replace 대신 merge — 기존 메타(display_name/account/mission_key) 보존.
     # launch 재진입 시 create가 심은 메타 소실 방지. 신규 엔트리는 3필드만(하위호환).
@@ -364,7 +394,7 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
 p,n=sys.argv[1:3]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     d.setdefault('depts',{}).pop(n,None)
     tmp=p+'.tmp.%d'%os.getpid()
@@ -390,7 +420,7 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
 p,n,disp,acct=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     e=d.setdefault('depts',{}).get(n)
     if e is None:   # ★fail-closed(CSO GAP①): create가 base 엔트리 선기록 → 부재=버그 → no-op 말고 에러
@@ -584,7 +614,7 @@ PY
 reg_get_field(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY' | tr -d '\r'
 import json,sys
 p,n,f=sys.argv[1:4]
-try: d=json.load(open(p))
+try: d=json.load(open(p, encoding="utf-8-sig"))
 except Exception: sys.exit(0)
 e=(d.get('depts') or {}).get(n) or {}
 print(e.get(f) or '')
@@ -607,7 +637,7 @@ except ImportError:
 p,n,k,v=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     e=d.setdefault('depts',{}).setdefault(n,{})
     e[k]=v
@@ -675,7 +705,11 @@ resolve_default_base(){
     b="$(python3 - "$cat" "$acct" <<'PY'
 import json,sys,os
 cat,acct=sys.argv[1:3]
-try: d=json.load(open(cat))
+# ★K2-03(2026-09-17 한글 사용자명 감사): utf-8-sig — 한국어 Windows 편집기("UTF-8(BOM)")로 저장한 카탈로그의 선두
+#   U+FEFF 를 받아들인다. PYTHONUTF8=1 의 엄격 UTF-8 에서 BOM 은 JSONDecodeError 라 여기서는 카탈로그 accounts 맵을
+#   **조용히 무시**하고 아래 규약 폴백($HOME/.cys/claude-<acct>)으로 빠졌고(계정 base 오지정), create(:1620 동형)는
+#   exit 4('카탈로그 키 미정의/손상')로 위장됐다(감사 §5-(e) 재현). BOM 없는 파일엔 동일 동작 · cp949 는 여전히 거부.
+try: d=json.load(open(cat, encoding="utf-8-sig"))
 except Exception: sys.exit(1)
 a=d.get('accounts',{}).get(acct)
 if not a: sys.exit(2)
@@ -1427,7 +1461,7 @@ launch_dept(){   # $1=name
       fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
-      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
+      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).
@@ -1470,7 +1504,7 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
 p=sys.argv[1]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     depts=d.setdefault('depts',{})
     home=os.path.expanduser('~')
@@ -1544,7 +1578,7 @@ PY
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
-      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
+      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
     # ★데몬 up 확정 후 실패 trap을 풀teardown(kill+소켓+reg)으로 업그레이드 — 이후 단계 set -e 종료 시 orphan 0.
     trap '"$0" down "$name" >/dev/null 2>&1 || true' EXIT
@@ -1593,10 +1627,15 @@ PY
     MISS="${CYS_DEPT_MISSIONS:-$HOME/.cys/dept-missions}"
     [ -f "$CAT" ] || { echo "[cys-dept] 카탈로그 부재: $CAT (GUI=레거시 allocate fallback)" >&2; exit 3; }  # fail-closed
     # 카탈로그 조회 + account dir 해석($HOME 전개). 파싱실패/키부재=fail-closed.
-    IFS=$'\t' read -r disp acctkey acctdir mkey cwd < <(python3 - "$CAT" "$key" <<'PY'
+    # ★CRLF 위생(2026-09-17 K3 2라운드 검증 적발): `read < <(python3 …)` 는 **파이프 소비자**라 $(...) 와 달리 MSYS 가 \r 을
+    #   벗겨 주지 않는다(:307-310 규칙 · reg_get_field:600 과 동형). 마지막 필드 cwd 에 \r 이 남으면 resolve_dept_cwd 의
+    #   `[ -d "$c" ]` 가 거짓 → WARN 후 $HOME 폴백(좌석·신뢰 시드·편성이 홈에서 뜨고 등재 cwd 에 \r 이 박힘) — exit 0 이라
+    #   GUI 는 성공으로 본다. Windows CI 는 allocate 만 돌리고 create 는 0회라 실기 미검증(추정) · 회귀 핀은
+    #   bin/tests/test_dept_name_guard.py CrlfHygiene(소스 census).
+    IFS=$'\t' read -r disp acctkey acctdir mkey cwd < <(python3 - "$CAT" "$key" <<'PY' | tr -d '\r'
 import json,sys,os
 cat,key=sys.argv[1:3]
-d=json.load(open(cat))                                   # 파싱실패=예외=비0=fail-closed
+d=json.load(open(cat, encoding="utf-8-sig"))              # 파싱실패=예외=비0=fail-closed · ★K2-03: BOM 허용(resolve_default_base 와 동형)
 dep=d['departments'].get(key)
 if not dep: sys.exit(4)
 acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
@@ -1655,7 +1694,7 @@ def alive_sock(sk):  # RC-6: AF_UNIX→cys ping(named pipe 대응·os.path.exist
     except Exception: return False
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     depts=d.setdefault('depts',{}); now=time.time()
     # 멱등(원자): 같은 mission_key 엔트리=청구됨 → REUSE. 死活+reserved_at grace로 3분기(CSO 봉인):
@@ -1722,7 +1761,7 @@ PY
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       disown
-      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
+      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
     # ★R3.1(CSO·codex R3-REG-SET-META-ORPHAN): 데몬 up 확정 후 실패 trap을 풀teardown(down=kill+소켓+reg)으로 업그레이드.
     #   이후 reg_set_meta fail-closed/시드/각성에서 set -e 종료해도 이미 뜬 데몬 orphan 0. NEW·REUSE_DEAD 공통.
@@ -1807,7 +1846,7 @@ PY
     name=$(reg_init; python3 - "$REG" "$sock" <<'PY'
 import json,sys
 p,s=sys.argv[1:3]
-d=json.load(open(p)).get('depts',{})
+d=json.load(open(p, encoding="utf-8-sig")).get('depts',{})
 for n,e in d.items():
     if e.get('socket')==s: print(n); break
 PY
@@ -1920,7 +1959,7 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
 p=sys.argv[1]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
-    try: d=json.load(open(p))
+    try: d=json.load(open(p, encoding="utf-8-sig"))
     except Exception: d={'depts':{}}
     for n,e in d.get('depts',{}).items():
         print("%s\t%s\t%s"%(n, e.get('socket',''), e.get('reserved_at',0) or 0))
