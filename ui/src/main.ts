@@ -39,6 +39,7 @@ import {
   missingKnownWorkspaces,
   deadLiveSids,
   advanceGhostStrikes,
+  scaleForPlatform,
 } from "./wsreconcile";
 import {
   RESET_PHRASE,
@@ -136,12 +137,16 @@ const invoke = (cmd: string, args?: Record<string, unknown>) => window.__TAURI__
 // ★상한 값은 리터럴로 흩뿌리지 않는다 — 값마다 '넘기면 무엇이 일어나는가'를 적는다(이 저장소 관례).
 // winScaled: 재부팅 직후 Windows 는 Defender 스캔·콜드 디스크·ConPTY 기동이 겹쳐 같은 일이 더 걸린다.
 // 맥 기준값을 그대로 쓰면 '살아 있는 데몬을 죽었다'고 오판하기 쉬우므로 그 축에서만 2배로 연다.
-const winScaled = (ms: number): number => (IS_WINDOWS ? ms * 2 : ms);
+const winScaled = (ms: number): number => scaleForPlatform(ms, IS_WINDOWS);
 const T_REG = winScaled(8_000); //  넘기면: 레지스트리 미조회 — 등재 부서 탭 보장이 이번 기동엔 안 걸린다(다음 기동 재시도)
 const T_LIST = winScaled(8_000); // 넘기면: 그 소켓은 ok:false — 탭은 보존되고 이번 회차 입양만 건너뛴다
 const T_STATUS = winScaled(10_000); // 넘기면: 생존 '판정 불가' — ★재기동하지 않고 보존한다(중복 launch 폭주 차단)
 const T_LAUNCH = winScaled(60_000); // 넘기면: 그 부서는 이번 기동에 확보 실패 — 빈 탭 보존·다음 기동 재시도
 const T_NEW = winScaled(15_000); //  넘기면: 그 탭은 빈 채로 남고 3초 틱·다음 기동이 받는다
+// ★호출당 상한만으로는 부족하다 — 복원 체인은 **직렬**이라 부서가 여럿이면 상한의 합만큼
+// 화면이 비어 있다(Windows 2배까지 겹치면 십수 분). 총량 데드라인을 넘기면 그 시점 상태로
+// 즉시 화면을 세우고 나머지는 3초 틱에 맡긴다 — '늦게라도 전부'보다 '지금 보이고 곧 채워짐'이 낫다.
+const START_BUDGET = winScaled(45_000);
 
 const rpcT = <T,>(pr: Promise<T>, ms: number): Promise<T> => {
   let t: ReturnType<typeof setTimeout> | undefined;
@@ -188,6 +193,14 @@ interface GroupMeta {
 }
 
 const LAYOUT_KEY = "cys-layout-v2";
+// ★저장본을 **실제로 읽은 뒤에만** 영속화를 허용하는 1비트 게이트(2026-09-16 성찰 2회 · blocker).
+// `workspaces` 의 모듈 초기값은 `[]` 이고 저장본은 start() 안쪽에서야 로드된다. 그 전에 무슨
+// 이유로든 render()→saveLayout() 이 돌면, 사용자의 **모든 탭·그룹·분할·이름이 빈 값으로 덮인다**
+// (LAYOUT_KEY 는 단일 키라 백업이 없다). 재부팅 후 배치 소실을 고치러 온 판이 같은 배치를 지우는
+// 경로를 열면 안 된다. 특히 start() 실패 복구 경로가 그 위험을 새로 만들었다.
+// 실패 방향: 이 값이 false 로 잘못 남으면 그 세션의 배치가 저장되지 않는다(다음 기동에 옛 배치).
+//           true 로 잘못 서면 빈 배치가 사용자 배치를 파괴한다 — 후자가 비가역이므로 닫는 쪽이 기본.
+let layoutLoaded = false;
 
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
@@ -1920,6 +1933,7 @@ function normalizeGroups(ws: Workspace[], gs: GroupMeta[]): GroupMeta[] {
 }
 
 function saveLayout() {
+  if (!layoutLoaded) return; // ★저장본을 아직 안 읽었다 — 덮어쓰면 사용자의 배치가 영구 소실된다
   const norm = normalizeWorkspaces(workspaces);
   const normG = normalizeGroups(norm, groups); // 06: norm 기준으로 그룹 청소
   groups = normG; // 06: 멤버0 그룹을 모듈 상태에서도 즉시 해체(유령 누적 방지 · 적대검증 교정)
@@ -2049,60 +2063,60 @@ async function refreshPaneTitles() {
       const flightKey = `list:${sk ?? ""}`;
       if (!claimFlight(flightKey)) continue; // 직전 요청이 아직 안 끝났다 — 쌓지 않는다
       try {
-      const listCall = invoke("list_surfaces", { socket: sk });
-      releaseFlightWhenSettled(flightKey, listCall);
-      const r = (await rpcT(listCall, T_LIST)) as {
-        surfaces: {
-          surface_id: number;
-          title: string;
-          role: string | null;
-          live_cwd: string | null;
-          exited: boolean;
-          usage?: ObservedUsage | null;
-        }[];
-      };
-      // ★유령 pane 수렴 — 판정은 wsreconcile.advanceGhostStrikes(순수·유닛 테스트가 고정),
-      // 여기는 배선이다. 데몬이 **기록 자체를 모르는** sid 만, **2연속 관측**일 때만 친다.
-      // 빈 목록(데몬이 성공적으로 0개를 돌려줌)이면 그 함수가 집행을 보류한다 — cysd 는 소켓
-      // accept 를 연 뒤 auto-restore 를 비동기로 돌리므로, 재기동 직후의 빈 목록을 '전부 죽었다'로
-      // 읽으면 복원이 끝나기 전에 트리를 통째로 지우고 그 공백을 디스크에 영속시킨다.
-      // ★호출 계약: 이 소켓의 **전 워크스페이스 트리 합집합**을 한 번에 넘긴다(소켓당 1회).
-      const knownIds = new Set(r.surfaces.map((s) => s.surface_id));
-      const sockSids: number[] = [];
-      for (const w of workspaces) {
-        if ((w.socket ?? undefined) !== (sk ?? undefined) || !w.tree) continue;
-        sockSids.push(...collectSids(w.tree));
-      }
-      const step = advanceGhostStrikes(ghostStrike, sockSids, knownIds, (sid) => paneKey(sid, sk), `${sk ?? ""}#`);
-      ghostStrike = step.next;
-      for (const sid of step.evict) {
-        detachPane(sid, sk);
-        adoptedWs = true;
-      }
-      for (const s of r.surfaces) {
-        const rt = panes.get(paneKey(s.surface_id, sk));
-        if (!rt) continue;
-        renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-        setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
-        if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
-        rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
-      }
-      // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
-      // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
-      // role 우선순위(master>cso>worker>reviewer) 정렬 — 부서 첫 입양 시 master가 첫 pane(좌측·focus)이 되도록.
-      const rolePri = (role: string | null): number =>
-        role === "master" ? 0 : role === "cso" ? 1 : role?.startsWith("worker") ? 2 : role?.startsWith("reviewer") ? 3 : 4;
-      for (const s of [...r.surfaces].sort((a, b) => rolePri(a.role) - rolePri(b.role))) {
-        if (s.exited || !s.role || panes.has(paneKey(s.surface_id, sk))) continue;
-        // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
-        const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
-        if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
-        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
-        ws.tree = ws.tree
-          ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
-          : { type: "pane", sid: s.surface_id };
-        adopted = true;
-      }
+        const listCall = invoke("list_surfaces", { socket: sk });
+        releaseFlightWhenSettled(flightKey, listCall);
+        const r = (await rpcT(listCall, T_LIST)) as {
+          surfaces: {
+            surface_id: number;
+            title: string;
+            role: string | null;
+            live_cwd: string | null;
+            exited: boolean;
+            usage?: ObservedUsage | null;
+          }[];
+        };
+        // ★유령 pane 수렴 — 판정은 wsreconcile.advanceGhostStrikes(순수·유닛 테스트가 고정),
+        // 여기는 배선이다. 데몬이 **기록 자체를 모르는** sid 만, **2연속 관측**일 때만 친다.
+        // 빈 목록(데몬이 성공적으로 0개를 돌려줌)이면 그 함수가 집행을 보류한다 — cysd 는 소켓
+        // accept 를 연 뒤 auto-restore 를 비동기로 돌리므로, 재기동 직후의 빈 목록을 '전부 죽었다'로
+        // 읽으면 복원이 끝나기 전에 트리를 통째로 지우고 그 공백을 디스크에 영속시킨다.
+        // ★호출 계약: 이 소켓의 **전 워크스페이스 트리 합집합**을 한 번에 넘긴다(소켓당 1회).
+        const knownIds = new Set(r.surfaces.map((s) => s.surface_id));
+        const sockSids: number[] = [];
+        for (const w of workspaces) {
+          if ((w.socket ?? undefined) !== (sk ?? undefined) || !w.tree) continue;
+          sockSids.push(...collectSids(w.tree));
+        }
+        const step = advanceGhostStrikes(ghostStrike, sockSids, knownIds, (sid) => paneKey(sid, sk), `${sk ?? ""}#`);
+        ghostStrike = step.next;
+        for (const sid of step.evict) {
+          detachPane(sid, sk);
+          adoptedWs = true;
+        }
+        for (const s of r.surfaces) {
+          const rt = panes.get(paneKey(s.surface_id, sk));
+          if (!rt) continue;
+          renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
+          setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
+          if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
+          rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
+        }
+        // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
+        // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
+        // role 우선순위(master>cso>worker>reviewer) 정렬 — 부서 첫 입양 시 master가 첫 pane(좌측·focus)이 되도록.
+        const rolePri = (role: string | null): number =>
+          role === "master" ? 0 : role === "cso" ? 1 : role?.startsWith("worker") ? 2 : role?.startsWith("reviewer") ? 3 : 4;
+        for (const s of [...r.surfaces].sort((a, b) => rolePri(a.role) - rolePri(b.role))) {
+          if (s.exited || !s.role || panes.has(paneKey(s.surface_id, sk))) continue;
+          // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
+          const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
+          if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
+          setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
+          ws.tree = ws.tree
+            ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
+            : { type: "pane", sid: s.surface_id };
+          adopted = true;
+        }
       } catch {
         /* 이 소켓만 이번 틱을 건너뛴다(다른 데몬의 입양은 계속된다) */
       }
@@ -3639,7 +3653,11 @@ async function refreshSidebarStatus() {
       /* 부서 데몬 일시 부재 */
     }
   }
-  pendingApprovals = pend;
+  // ★배지 합계는 지역 누산기가 아니라 **소켓별 마지막 성공값 맵**에서 낸다(2026-09-16 성찰 2회).
+  // 종전 `pend` 는 성공한 소켓만 더했으므로, in-flight 가드로 건너뛴 소켓이나 일시 실패한 소켓이
+  // **0으로 계상**돼 승인 대기 ⚠ 배지가 줄거나 사라졌다. 이 맵은 배너가 이미 쓰는 단일 진실원이고
+  // 실패 시 직전 성공값을 유지하므로(위 set 주석), 합계와 배너가 같은 값을 보게 된다.
+  pendingApprovals = [...pendingBySocket.values()].reduce((a, b) => a + b, 0);
   updatePendingBadges(pend); // CC 버튼·승인 Feed 탭 배지 동기
   renderWsTabs(); // 신호 반영 재렌더
 }
@@ -7075,14 +7093,25 @@ async function start() {
       );
     });
     listen("daemon-ready", () => dismissToast("daemon-hint"));
-    const probe = setInterval(async () => {
-      try {
-        await invoke("daemon_status");
-        clearInterval(probe);
-        resolve();
-      } catch {
-        /* not yet */
-      }
+    // ★프로브 회수·재진입 가드(2026-09-16 성찰 2회): 종전 `clearInterval` 은 **프로브 자신이
+    // 성공했을 때만** 돌았다. 대기를 먼저 푸는 경로(daemon-ready 리스너)로 빠지면 인터벌이 남고,
+    // 데몬이 먹통이면 300ms 마다 기본 소켓에 요청을 계속 얹는다 — Tauri 가 소켓별로 직렬화하므로
+    // 그대로 대기열이 된다(앱에서 가장 빠른 무가드 루프였다 · A① 폭주 축).
+    // 어느 경로로 풀리든 한 곳(stop)에서 회수하고, 직전 프로브가 안 끝났으면 이번 tick 은 쏘지 않는다.
+    let probe: ReturnType<typeof setInterval> | undefined;
+    const stop = () => {
+      if (probe !== undefined) clearInterval(probe);
+      probe = undefined;
+      resolve();
+    };
+    listen("daemon-ready", stop);
+    probe = setInterval(() => {
+      if (!claimFlight("probe:default")) return; // 직전 프로브가 아직 안 끝났다
+      const call = invoke("daemon_status");
+      releaseFlightWhenSettled("probe:default", call);
+      void call.then(stop, () => {
+        /* not yet — 다음 tick */
+      });
     }, 300);
   });
 
@@ -7091,8 +7120,19 @@ async function start() {
   // ★W-2 결정 A: 여기부터 start() 가 끝날 때까지는 초기화와 겹치지 않는다(resetGateVerdict uiRestoringMs ·
   // start() 가 멈추면 RESET_GATE_FAIL_OPEN_MS 뒤 fail-open).
   startRestoringSince = Date.now();
-  const status = (await invoke("daemon_status")) as Record<string, unknown>;
-  info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
+  // ★기본(본부) 데몬 왕복도 상한을 통과한다(2026-09-16 성찰 2회 · blocker). 종전에는 이 한 줄만
+  // 맨몸이었다 — `ensure_daemon` 은 **connect 성공**만으로 Ok 를 주고 백엔드가 곧바로 daemon-ready
+  // 를 쏘므로, bind·listen 은 됐지만 handler 가 먹통(accept 후 무응답)인 데몬에서는 위 대기가 풀린
+  // 뒤 여기서 **영원히** 멈췄다. 그러면 render() 도 `started = true` 도 못 가 화면 전체가 백지가 되고
+  // (A④) 3초 자가치유도 꺼진 채 남는다(A③). hang 이라 start() 의 catch 복구조차 돌지 않는다.
+  // 상한을 넘겨도 **복원은 계속한다** — 기본 소켓은 아래 소켓별 조회에서 ok:false 로 떨어져
+  // 기존 보존 경로를 타고, 살아 있는 부서 탭들은 정상 복원된다(USER-MANUAL 에 적은 계약 그대로).
+  try {
+    const status = (await rpcT(invoke("daemon_status"), T_STATUS)) as Record<string, unknown>;
+    info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
+  } catch {
+    info.textContent = "데몬 응답 없음 — 화면은 계속 사용할 수 있습니다(연결되면 자동으로 붙습니다)";
+  }
 
   // ★재설치 첫 기동 심문 — 데몬 가동 확정 직후, 워크스페이스 복원 **전**에 묻는다.
   // ★W-2 결정 A: 여기서는 **묻고 기록만** 한다. [깨끗하게 새로 시작]은 부팅(이 복원 구간 + 백엔드의 온보딩·
@@ -7360,6 +7400,11 @@ async function start() {
     workspaces = [];
     groups = []; // 06: 손상 저장본 폴백
   }
+  // 여기까지 왔으면 저장본을 읽어 본 것이다(내용이 없거나 손상이어도 '읽었다'는 사실은 같다) —
+  // 이제부터의 저장은 사용자의 배치를 덮는 것이 아니라 그 배치를 갱신하는 것이다.
+  layoutLoaded = true;
+  // 이 기동에서 '사용자가 쓰던 탭'의 소켓 집합 — 아래 데몬 자동 확보 우선순위에 쓴다.
+  const savedSockets = new Set(workspaces.map((w) => w.socket ?? ""));
   for (const ws of workspaces) ws.socket = ws.socket ?? undefined; // 하위호환 마이그레이션(기본 데몬)
   // socket 1:1 수렴 + id 중복 제거(중복 탭 증식 차단) — 복원 적재 직후 단일 게이트.
   workspaces = normalizeWorkspaces(workspaces);
@@ -7425,9 +7470,24 @@ async function start() {
     }
     workspaces.push(ws);
   }
+  // ★재결속 뒤 한 번 더 정규화한다 — 위쪽 normalizeGroups 는 이 루프보다 **먼저** 돌아서,
+  // 유일 멤버 부서 ws 가 저장본에서 빠진 그룹을 '멤버 0'으로 보고 이미 해체해 버린다.
+  // 그러면 방금 되붙인 groupId 가 죽은 그룹을 가리켜 다음 정규화에서 조용히 지워진다.
+  groups = normalizeGroups(workspaces, groups);
+
+  // ★탭을 먼저 세운다: 아래 데몬 왕복은 직렬이라 수십 초가 걸릴 수 있는데, 그 동안 사이드바까지
+  // 비어 있으면 사용자는 '앱이 멈췄다'고 읽는다. renderWsTabs 는 pane 영역을 건드리지 않고
+  // saveLayout 도 부르지 않으므로(= 저장본 무접촉) 이 시점에 안전하다.
+  renderWsTabs();
+  // ★복원 체인 총량 데드라인 — 여기서부터 잰다(위 레지스트리 조회까지는 짧고 상한이 있다).
+  const restoreDeadline = Date.now() + START_BUDGET;
 
   // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도(등록된) ws는 보존.
   const ghosts = new Set<number>();
+  // 회차당 새 부서 데몬 자동 확보 상한(저장본에 있던 부서는 이 상한을 쓰지 않는다).
+  const MAX_DEPT_LAUNCH_PER_START = 2;
+  let launched = 0;
+  let deferredLaunch = 0;
   for (const ws of workspaces.filter((w) => w.socket)) {
     // ★WP-3+R10: 묘비 검사를 생존 검사보다 **선행** — spawn_org_restore는 업데이트 후에만
     // 실행되므로(적대검증 보조 관찰), teardown 실패로 살아남은 묘비 데몬의 수렴 주체는 매 시작
@@ -7465,6 +7525,18 @@ async function start() {
     // (위 daemon_status 를 기다리는 사이 초기화가 끝났을 수 있고, 그 뒤의 launch_dept_daemon 은 방금 멈춘 부서 데몬을
     // 다시 띄울 수 있다).
     if (startHaltedByReset(info)) return;
+    // ★팬아웃 상한(2026-09-16 성찰 2회 · A① 폭주): `cys-dept launch` 한 번은 데몬 기동으로 끝나지
+    // 않는다 — CEO 승격·티켓 발급·묘비 해소에 이어 **5역할 편성 기동**까지 부수효과로 착수한다.
+    // 이번 판이 탭의 진실원을 레지스트리로 옮기면서, 등재만 돼 있고 한 번도 연 적 없는 부서까지
+    // 이 루프에 들어온다. 부서 N개면 앱 기동 한 번에 최대 5N 좌석이 백그라운드로 뜬다.
+    // 그래서 **저장본에 있던 부서**(사용자가 실제로 쓰던 탭)를 먼저 확보하고, 그 밖은 회차당
+    // 상한까지만 확보한다. 남은 부서는 탭이 이미 있으므로 화면에서 사라지지 않고, 다음 기동이
+    // 이어서 확보한다(저장본에 남으므로 그때는 '쓰던 탭' 우선순위로 올라간다).
+    if (!savedSockets.has(ws.socket ?? "") && launched >= MAX_DEPT_LAUNCH_PER_START) {
+      deferredLaunch += 1;
+      continue;
+    }
+    launched += 1;
     try {
       const info = (await rpcT(invoke("launch_dept_daemon", { name: deptNameFromSocket(ws.socket) ?? ws.name }), T_LAUNCH)) as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
@@ -7474,6 +7546,14 @@ async function start() {
     }
   }
   if (ghosts.size) workspaces = workspaces.filter((w) => !ghosts.has(w.id));
+  if (deferredLaunch > 0) {
+    // 무음 생략 금지 — 왜 그 탭이 비어 있는지 사용자가 알아야 한다.
+    toast(
+      "watchdog",
+      `부서 ${deferredLaunch}곳은 다음 기동에 켭니다`,
+      "한 번에 너무 많은 팀을 동시에 띄우지 않으려고 이번에는 미뤘습니다. 탭은 그대로 있고, 앱을 다시 켜면 이어서 준비됩니다.",
+    );
+  }
 
   // 소켓별 live 집계 — 데몬 미응답(ok=false) 소켓은 판정 보류(죽은 pane 제거 스킵, ws 보존).
   const sockets = [...new Set(workspaces.map((w) => w.socket))];
@@ -7481,7 +7561,13 @@ async function start() {
     string | undefined,
     { ids: Set<number>; ok: boolean; list: { surface_id: number; title: string }[] }
   >();
+  // ★전 소켓을 먼저 '판정 보류(ok:false)'로 시드한다 — 예산 소진으로 루프를 중단해도 항목이
+  // **없는** 소켓이 생기지 않는다. 항목이 없으면 keepWorkspaceOnRestore 가 그 빈 트리 ws 를
+  // 드롭해 버린다(= 이 판이 고치려던 바로 그 증상). '조회 안 함'과 '조회했는데 미응답'을
+  // 구분하는 판정이라, 중단 시에는 후자로 떨어뜨리는 것이 옳다.
+  for (const sk of sockets) liveBySock.set(sk, { ids: new Set(), ok: false, list: [] });
   for (const sk of sockets) {
+    if (Date.now() > restoreDeadline) break; // 예산 소진 — 나머지는 보류 상태 그대로 두고 화면을 먼저 세운다
     try {
       const r = (await rpcT(invoke("list_surfaces", { socket: sk }), T_LIST)) as {
         surfaces: { surface_id: number; title: string; exited: boolean }[];
@@ -7997,8 +8083,18 @@ start()
         workspaces = [{ id: wsCounter++, name: UNTITLED, tree: null }];
         activeWs = 0;
       }
-      render();
+      // ★`started = true` 가 **먼저**다(2026-09-16 성찰 2회). render() 뒤에 두면, 이 복구가
+      // 정확히 겨냥한 입력(손상된 트리)에서 render() 가 또 던져 자가치유까지 꺼진 채 브릭된다.
+      // 자가치유는 그리기 성공에 의존해서는 안 된다.
       started = true;
+      try {
+        render();
+      } catch {
+        // 마지막 그물: 손상된 트리를 버리고 빈 탭이라도 세운다(백지보다 빈 탭이 낫다).
+        workspaces = [{ id: wsCounter++, name: UNTITLED, tree: null }];
+        activeWs = 0;
+        render();
+      }
       refreshPaneTitles();
       toast(
         "health",

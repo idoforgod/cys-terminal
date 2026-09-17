@@ -13,13 +13,18 @@ import {
   deadLiveSids,
   advanceGhostStrikes,
   sameSocket,
+  scaleForPlatform,
   type ReconcileWs,
   type LiveProbe,
 } from "./wsreconcile";
 import { deptNameFromSocket } from "./deptlabel";
 
-const DEPT = "/Users/cys/.local/state/cys-dept-dept-1/cys.sock";
-const DEPT2 = "/Users/cys/.local/state/cys-dept-dept-2/cys.sock";
+// ★개인 경로를 박지 않는다 — 시크릿/PII 스캐너가 `/Users/<name>` 류를 발행 차단으로 잡는다
+// (scripts/secret-scan.sh PATH·PROFILE 규칙). 판정에 필요한 것은 `…/cys-dept-<name>/cys.sock`
+// 라는 **형태**뿐이므로 중립 접두를 쓴다.
+const STATE = "/state";
+const DEPT = `${STATE}/cys-dept-dept-1/cys.sock`;
+const DEPT2 = `${STATE}/cys-dept-dept-2/cys.sock`;
 const WINPIPE = "\\\\.\\pipe\\cys-dept-dept-1";
 
 // ★제품 함수를 그대로 쓴다(베껴 쓰지 않는다). 종전 이 파일은 같은 규칙을 **복사**해 뒀는데,
@@ -268,10 +273,24 @@ describe("deptNameFromSocket — 제품 파서(맥/윈도 양쪽)", () => {
     expect(deptNameFromSocket(WINPIPE)).toBe("dept-1");
   });
   it("부서 소켓이 아니면 null(본부 소켓·미정의 포함)", () => {
-    expect(deptNameFromSocket("/Users/cys/.local/state/cys/cys.sock")).toBeNull();
+    expect(deptNameFromSocket(`${STATE}/cys/cys.sock`)).toBeNull();
     expect(deptNameFromSocket(undefined)).toBeNull();
   });
   it("하이픈이 든 부서명도 끝까지 가져온다", () => {
     expect(deptNameFromSocket("/x/cys-dept-sales-eu/cys.sock")).toBe("sales-eu");
+  });
+});
+
+describe("scaleForPlatform — 이 판의 유일한 Windows 분기", () => {
+  it("★Windows 에서 2배(배율을 지우는 변이를 잡는다)", () => {
+    expect(scaleForPlatform(8_000, true)).toBe(16_000);
+    expect(scaleForPlatform(10_000, true)).toBe(20_000);
+  });
+  it("맥·리눅스는 그대로", () => {
+    expect(scaleForPlatform(8_000, false)).toBe(8_000);
+  });
+  it("0 과 큰 값에서도 단조", () => {
+    expect(scaleForPlatform(0, true)).toBe(0);
+    expect(scaleForPlatform(60_000, true)).toBeGreaterThan(scaleForPlatform(60_000, false));
   });
 });

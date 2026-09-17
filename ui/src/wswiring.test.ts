@@ -20,11 +20,25 @@ const code = src
   .map((l) => (l.trimStart().startsWith("//") ? "" : l.replace(/\s\/\/.*$/, "")))
   .join("\n");
 
-/** start() 의 세션 복원 블록만 잘라낸다 — 이 계약들은 그 구간에만 적용된다. */
+/** start() 의 세션 복원 블록만 잘라낸다 — 트리 재구성 계약은 그 구간에만 적용된다. */
 function restoreSlice(): string {
   const a = src.indexOf("// Session restore (멀티마스터 F4)");
   const b = src.indexOf("started = true;", a);
   expect(a).toBeGreaterThan(0); // 구간 앵커가 사라졌다 = 이 핀이 무엇도 지키지 않는다
+  expect(b).toBeGreaterThan(a);
+  return src.slice(a, b);
+}
+
+/**
+ * start() **전체**(머리부터 `started = true` 까지). 시간 상한 계약은 여기에 적용된다.
+ * ★왜 복원 블록만으로는 부족한가(2026-09-16 성찰 2회 blocker): 화면을 영구 백지로 만든 두 번째
+ * 무상한 왕복은 복원 블록 **직전**의 기본 소켓 `daemon_status` 였다. 좁은 슬라이스는 그 자리를
+ * 사정권 밖에 두었다 — 핀의 사정권이 결함의 사정권보다 좁으면 그 핀은 종이 방벽이다.
+ */
+function startSlice(): string {
+  const a = src.indexOf("async function start() {");
+  const b = src.indexOf("started = true;", a);
+  expect(a).toBeGreaterThan(0);
   expect(b).toBeGreaterThan(a);
   return src.slice(a, b);
 }
@@ -59,15 +73,49 @@ describe("복원 배선 — 체인의 모든 대기에 시간 상한이 있다",
     for (const l of lines) expect(l).toContain("T_NEW");
   });
 
-  it("★복원 구간의 데몬 invoke 는 전부 rpcT 를 통과한다", () => {
-    const slice = restoreSlice();
-    // 복원 체인이 직접 부르는 데몬 왕복만 본다(이름 목록이 계약이다 — 늘어나면 여기 추가).
-    for (const cmd of ["list_depts", "dept_tombstones", "daemon_status", "launch_dept_daemon", "list_surfaces"]) {
-      const re = new RegExp(`(\\w+)\\(invoke\\("${cmd}"`, "g");
-      const wrappers = [...slice.matchAll(re)].map((m) => m[1]);
-      expect(wrappers.length).toBeGreaterThan(0); // 그 호출이 사라졌으면 목록을 갱신하라
-      for (const w of wrappers) expect(w).toBe("rpcT");
+  // 기동 구간이 직접 부르는 **데몬 왕복** 목록(이름이 계약이다 — 늘어나면 여기 추가).
+  const DAEMON_CMDS = [
+    "list_depts",
+    "dept_tombstones",
+    "daemon_status",
+    "launch_dept_daemon",
+    "list_surfaces",
+    "create_surface",
+    "org_status",
+    "factory_reset_preview",
+  ];
+  // 상한 대신 **다른 방식으로 유계**임이 감사된 예외. 새로 추가하려면 여기에 이유와 함께 적어야 한다
+  // (= 사람이 한 번은 의식적으로 판단하게 만드는 것이 이 목록의 목적이다).
+  const AUDITED_UNBOUNDED = [
+    // 300ms 데몬 대기 프로브: rpcT 로 감싸지 않는 대신 claimFlight 재진입 가드로 동시 1건을
+    // 보장하고, 대기가 어떤 경로로 풀리든 stop() 이 인터벌을 회수한다(무계 적체 없음).
+    'const call = invoke("daemon_status");',
+  ];
+
+  it("★기동 구간의 데몬 invoke 는 **전수** 검사한다 — 맨몸 호출이 새로 들어와도 잡힌다", () => {
+    // ⚠종전 핀은 `(\w+)\(invoke\("cmd"` 로 **이미 감싸인 것만** 셌다. 래퍼가 아예 없는 줄은
+    // 매치 0건이라 배열에 들어가지도 않아, 같은 커맨드의 rpcT 판이 하나라도 있으면 초록이었다
+    // — 실제 blocker 가 정확히 그 모양으로 통과했다(돌연변이로 실증됨). 그래서 전수로 뒤집는다.
+    const slice = startSlice();
+    const bare: string[] = [];
+    for (const m of slice.matchAll(/invoke\("(\w+)"/g)) {
+      if (!DAEMON_CMDS.includes(m[1])) continue;
+      const before = slice.slice(Math.max(0, m.index! - 6), m.index!);
+      if (before.endsWith("rpcT(")) continue; // 상한 통과
+      const lineStart = slice.lastIndexOf("\n", m.index!) + 1;
+      const line = slice.slice(lineStart, slice.indexOf("\n", m.index!)).trim();
+      if (AUDITED_UNBOUNDED.some((a) => line.includes(a))) continue; // 감사된 예외
+      bare.push(line);
     }
+    // 여기서 실패했다면: 그 줄을 `rpcT(invoke(...), T_*)` 로 감싸거나, 다른 방식으로 유계임을
+    // 증명하고 AUDITED_UNBOUNDED 에 이유와 함께 등재하라. 조용히 목록에 넣지 마라.
+    expect(bare).toEqual([]);
+  });
+
+  it("전수 검사가 실제로 무언가를 세고 있다(핀 자체의 계측 타당성)", () => {
+    const slice = startSlice();
+    const all = [...slice.matchAll(/invoke\("(\w+)"/g)].filter((m) => DAEMON_CMDS.includes(m[1]));
+    expect(all.length).toBeGreaterThanOrEqual(6); // 0건이면 위 핀은 공회전이다
   });
 
   it("상한 값은 명명 상수다(리터럴 흩뿌리기 금지 · Windows 배율이 한 곳에서 걸린다)", () => {
@@ -115,5 +163,46 @@ describe("복원 배선 — 묘비는 결측이면 닫는다(fail-closed)", () =
     const b = src.indexOf("stop_dept_daemon_by_socket", a);
     expect(a).toBeGreaterThan(0);
     expect(src.slice(a, b).includes("dept_tombstone_by_socket")).toBe(true); // 묘비가 teardown 앞이다
+  });
+});
+
+describe("복원 배선 — 승인 대기 배지는 단일 진실원에서 낸다", () => {
+  it("★건너뛴 소켓이 배지 합계를 깎지 않는다(지역 누산기 금지)", () => {
+    // in-flight 가드로 건너뛴 소켓을 0으로 세면, 고장 난 데몬이 하나도 없는 정상 동시 호출에서도
+    // 승인 대기 ⚠ 배지가 사라진다 — CEO·마스터가 워커의 승인 대기를 화면에서 놓친다.
+    expect(code.includes("pendingApprovals = [...pendingBySocket.values()].reduce(")).toBe(true);
+    expect(code.includes("pendingApprovals = pend;")).toBe(false);
+  });
+});
+
+describe("복원 배선 — 저장본을 읽기 전에는 저장하지 않는다", () => {
+  it("★saveLayout 은 layoutLoaded 게이트를 먼저 통과한다(배치 영구 파괴 차단)", () => {
+    // start() 가 저장본 로드 **전에** 죽고 복구 경로가 render()→saveLayout() 을 부르면,
+    // 빈 workspaces 가 사용자의 모든 탭·그룹·분할을 단일 키에 덮어쓴다(백업 없음).
+    const i = code.indexOf("function saveLayout()");
+    expect(i).toBeGreaterThan(0);
+    const head = code.slice(i, i + 200);
+    expect(head.includes("if (!layoutLoaded) return;")).toBe(true);
+    // 게이트를 여는 곳은 저장본을 읽은 직후 한 곳뿐이어야 한다.
+    expect((code.match(/layoutLoaded = true/g) ?? []).length).toBe(1);
+  });
+
+  it("★기동 실패 복구는 `started = true` 를 render() 보다 먼저 세운다(자가치유가 그리기에 의존 금지)", () => {
+    const i = code.indexOf("startup failed:");
+    expect(i).toBeGreaterThan(0);
+    const tail = code.slice(i, i + 900);
+    expect(tail.indexOf("started = true")).toBeLessThan(tail.indexOf("render()"));
+  });
+});
+
+describe("복원 배선 — 부팅 1회의 부서 데몬 팬아웃에 상한이 있다", () => {
+  it("★등재만 된 부서까지 한꺼번에 띄우지 않는다(A① 폭주)", () => {
+    // `cys-dept launch` 한 번은 CEO 승격·티켓·5역할 편성 기동까지 부수효과로 착수한다.
+    expect(code.includes("MAX_DEPT_LAUNCH_PER_START")).toBe(true);
+    expect(code.includes("savedSockets.has(")).toBe(true);
+  });
+  it("복원 체인에 총량 데드라인이 있다(직렬 상한 합만큼 백지로 두지 않는다)", () => {
+    expect(code.includes("const START_BUDGET")).toBe(true);
+    expect(code.includes("Date.now() > restoreDeadline")).toBe(true);
   });
 });

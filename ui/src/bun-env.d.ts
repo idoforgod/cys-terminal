@@ -66,6 +66,7 @@ declare module "bun:test" {
     toBeNull(): void;
     toBeUndefined(): void;
     toBeGreaterThan(expected: number): void;
+    toBeGreaterThanOrEqual(expected: number): void;
     toBeLessThan(expected: number): void;
     toBeCloseTo(expected: number, numDigits?: number): void;
     toThrow(expected?: unknown): void;

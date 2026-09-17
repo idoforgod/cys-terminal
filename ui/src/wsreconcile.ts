@@ -206,3 +206,17 @@ export function advanceGhostStrikes(
   }
   return { next, evict };
 }
+
+/**
+ * 복원 경로 시간 상한의 **플랫폼 배율**.
+ *
+ * ★왜 Windows 만 키우나: 재부팅 직후 Windows 는 Defender 스캔·콜드 디스크·ConPTY 기동이 겹치고,
+ * named pipe 는 혼잡 시 `ERROR_PIPE_BUSY` 재시도로 연결 수립에만 수 초를 먹는다(src/lib.rs).
+ * 맥 기준값을 그대로 쓰면 **살아 있는 데몬을 죽었다고 오판**해 불필요한 재기동을 부른다.
+ *
+ * ★순수 함수로 둔 이유: 이 diff 의 유일한 Windows 분기인데, main.ts 안에 상수로 있으면 그 동작을
+ * 재는 테스트를 쓸 수 없다(이름의 존재만 확인하는 핀은 배율을 지우는 변이를 못 잡는다 — 실측 확인).
+ */
+export function scaleForPlatform(ms: number, isWindows: boolean): number {
+  return isWindows ? ms * 2 : ms;
+}
