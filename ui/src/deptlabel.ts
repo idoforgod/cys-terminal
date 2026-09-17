@@ -89,3 +89,22 @@ export function isActiveDeptSocket(
   const ws = list[activeIndex];
   return ws ? deptWsSocketKey(ws) === socket : false;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// 부서 socket 경로 → **원래 부서명** 역산 (main.ts 에서 이관 · 2026-09-16).
+//
+// ★왜 옮겼나: 같은 규약의 파서가 main.ts·여기·Rust 세 벌로 갈려 있었고, main.ts 안의
+// 모듈-private 함수라 **유닛 테스트가 닿지 못했다** — Windows named pipe 분기를 지키는 핀이
+// 0개인 채로 'Windows 대응 완료'라고 적혀 있었다(deptSlugOfSocket 이 정확히 그 상태에서 깨졌던
+// 전례가 이 파일 위쪽에 있다). 테스트가 **제품 함수 그 자체**를 부르게 하려고 여기로 옮긴다.
+//
+//   unix : `…/cys-dept-<name>/cys.sock`  → <name>
+//   win  : `\\.\pipe\cys-dept-<name>`    → <name>
+// 둘 다 아니면 null(= 부서 소켓이 아니다).
+// ────────────────────────────────────────────────────────────────────────────
+export function deptNameFromSocket(sock: string | undefined): string | null {
+  const m = /\/cys-dept-(.+?)\/cys\.sock$/.exec(sock ?? "");
+  if (m) return m[1];
+  const w = /^\\\\\.\\pipe\\cys-dept-(.+)$/.exec(sock ?? "");
+  return w ? w[1] : null;
+}
