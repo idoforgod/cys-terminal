@@ -3323,7 +3323,7 @@ function render() {
   const tree = ws?.tree;
   if (tree) root.appendChild(renderNode(tree));
   else if (ws?.pending) root.appendChild(renderDeptPending()); // WP-10: 부서 준비 중 빈 pane 스피너·안내
-  else if (ws?.socket) root.appendChild(renderDeptIdle(ws)); // 확보 못 한 부서 — 백지 대신 안내+손잡이
+  else if (ws) root.appendChild(renderIdleWorkspace(ws)); // pane 0개 — 백지 대신 안내+손잡이
   renderWsTabs();
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
@@ -3355,12 +3355,14 @@ function renderDeptPending(): HTMLElement {
   return host;
 }
 
-// 데몬을 아직 확보하지 못한 부서 탭(tree:null · pending 아님)에 그리는 안내 패널.
-// ★왜 필요한가(2026-09-17 성찰 3회): 이 상태로 떨어지는 길이 넷이다 — 회차 팬아웃 상한·복원
-// 예산 소진·launch 실패/타임아웃·데몬 무응답. 종전 render() 는 그 넷 모두에 **아무것도 그리지
-// 않았다.** 사용자에게는 완전한 백지이고, 그 세션 안에서 되살릴 손잡이도 없었다(앱 재시작뿐).
-// 이 판의 주제가 "화면에서 팀이 사라지지 않는다"인데 빈 탭이 백지면 체감은 같다.
-function renderDeptIdle(ws: Workspace): HTMLElement {
+// pane 이 하나도 없는 워크스페이스(tree:null · pending 아님)에 그리는 안내 패널 + 손잡이.
+// ★왜 필요한가(2026-09-17 성찰 3회): 이 상태로 떨어지는 길이 여럿이다 — 회차 팬아웃 상한,
+// 복원 총량 예산 소진, launch·셸 생성 실패/타임아웃, 데몬 무응답. 종전 render() 는 그 전부에
+// **아무것도 그리지 않았다.** 사용자에게는 완전한 백지이고, 그 세션 안에서 되살릴 손잡이도
+// 없었다(앱 재시작뿐). 이 판의 주제가 "화면에서 팀이 사라지지 않는다"인데 빈 탭이 백지면
+// 체감은 같다. 본부 탭도 예산이 바닥나면 같은 상태가 되므로 **두 종류 모두** 여기서 받는다.
+function renderIdleWorkspace(ws: Workspace): HTMLElement {
+  const isDept = !!ws.socket;
   const host = document.createElement("div");
   host.className = "pane dept-pending"; // 스피너 없는 같은 레이아웃(별도 CSS 불요)
   host.setAttribute("aria-live", "polite");
@@ -3368,27 +3370,36 @@ function renderDeptIdle(ws: Workspace): HTMLElement {
   box.className = "dept-pending-box";
   const msg = document.createElement("div");
   msg.className = "dept-pending-msg";
-  msg.textContent = "이 부서는 아직 켜지 않았습니다 — 아래 버튼을 누르거나, 앱을 다시 켜면 준비됩니다.";
+  msg.textContent = isDept
+    ? "이 부서는 아직 켜지 않았습니다 — 아래 버튼을 누르거나, 앱을 다시 켜면 준비됩니다."
+    : "이 워크스페이스에 아직 열린 창이 없습니다 — 아래 버튼을 누르면 새 셸이 열립니다.";
   const btn = document.createElement("button");
-  btn.className = "btn";
-  btn.textContent = "지금 켜기";
+  btn.className = "dept-idle-btn";
+  btn.textContent = isDept ? "지금 켜기" : "새 셸 열기";
   btn.addEventListener("click", async () => {
     if (btn.disabled) return;
     btn.disabled = true;
-    btn.textContent = "켜는 중…";
+    btn.textContent = "여는 중…";
     try {
-      const r = (await invoke("launch_dept_daemon", {
-        name: deptNameFromSocket(ws.socket) ?? ws.name,
-      })) as { socket?: string; socket_slug?: string };
-      if (r?.socket_slug && r?.socket) socketForSlug.set(r.socket_slug, r.socket);
-      if (r?.socket) ws.socket = r.socket;
-      ws.autoCreated = undefined; // 사용자가 직접 켰다 — 다음 기동부터 회차 상한 면제
-      render();
+      if (isDept) {
+        const r = (await invoke("launch_dept_daemon", {
+          name: deptNameFromSocket(ws.socket) ?? ws.name,
+        })) as { socket?: string; socket_slug?: string };
+        if (r?.socket_slug && r?.socket) socketForSlug.set(r.socket_slug, r.socket);
+        if (r?.socket) ws.socket = r.socket;
+        ws.autoCreated = undefined; // 사용자가 직접 켰다 — 다음 기동부터 회차 상한 면제
+        render();
+      } else {
+        const sid = await newSurface(null, ws.socket, T_NEW);
+        ws.tree = { type: "pane", sid };
+        render();
+        setFocus(sid);
+      }
       refreshPaneTitles(); // 노드가 뜨는 대로 입양
     } catch (e) {
       btn.disabled = false;
       btn.textContent = "다시 시도";
-      toast("watchdog", "부서를 켜지 못했습니다", String(e));
+      toast("watchdog", isDept ? "부서를 켜지 못했습니다" : "셸을 열지 못했습니다", String(e));
     }
   });
   box.append(msg, btn);

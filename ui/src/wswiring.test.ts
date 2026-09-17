@@ -216,10 +216,10 @@ describe("복원 배선 — 부팅 1회의 부서 데몬 팬아웃에 상한이 
     expect(code.includes("const START_BUDGET")).toBe(true);
     expect((code.match(/Date\.now\(\) > restoreDeadline/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
-  it("★확보 못 한 부서 탭은 백지가 아니라 안내+손잡이를 그린다", () => {
-    // 팬아웃 상한·예산 소진·launch 실패·데몬 무응답 넷 다 tree:null 로 떨어진다.
-    expect(code.includes("function renderDeptIdle(")).toBe(true);
-    expect(code.includes("root.appendChild(renderDeptIdle(ws))")).toBe(true);
+  it("★pane 0개 워크스페이스는 백지가 아니라 안내+손잡이를 그린다(본부·부서 공통)", () => {
+    // 팬아웃 상한·예산 소진·launch/셸 생성 실패·데몬 무응답이 전부 tree:null 로 떨어진다.
+    expect(code.includes("function renderIdleWorkspace(")).toBe(true);
+    expect(code.includes("root.appendChild(renderIdleWorkspace(ws))")).toBe(true);
   });
   it("미룬 사유를 하나로 뭉치지 않는다(제품의 조절 vs 이 기계가 느림)", () => {
     expect(code.includes("cappedLaunch")).toBe(true);

@@ -3876,21 +3876,17 @@ fn spawn_org_restore(app: AppHandle) {
                         a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
                     })
                 });
-        let tombs = match tombs {
-            Some(t) => t,
-            None => {
-                // 묘비를 못 읽었다 — 부서 순회 자체를 건너뛴다(본부 복원은 이미 위에서 끝났다).
-                let _ = app.emit(
-                    "restore-progress",
-                    json!({"phase": "skip", "detail": "삭제 기록을 읽지 못해 부서 재기동을 보류함 — 다음 기동에 재시도"}),
-                );
-                let _ = app.emit(
-                    "restore-progress",
-                    json!({"phase": "done", "hq_ok": hq_ok, "ok": 0, "fail": 0}),
-                );
-                return;
-            }
-        };
+        // ★보류 범위는 **되살리는 행위**로 좁힌다(성찰 3회 정밀화). 순회 자체를 건너뛰면 살아 있는
+        // 부서의 사이드카 복원까지 막는데, 그쪽은 부활이 아니라 이미 도는 데몬의 노드 복원이라
+        // 묘비와 무관하다. 막아야 할 것은 '죽은 부서를 다시 띄우는 것' 하나다.
+        let tomb_unknown = tombs.is_none();
+        if tomb_unknown {
+            let _ = app.emit(
+                "restore-progress",
+                json!({"phase": "skip", "detail": "삭제 기록을 읽지 못함 — 죽은 부서 재기동만 보류(살아 있는 부서는 그대로 복원 · 다음 기동 재시도)"}),
+            );
+        }
+        let tombs = tombs.unwrap_or_default();
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
         let mut ok = 0usize;
         let mut fail = 0usize;
@@ -3937,6 +3933,15 @@ fn spawn_org_restore(app: AppHandle) {
                         let _ = app.emit(
                             "restore-progress",
                             json!({"phase": "skip", "dept": name, "detail": detail}),
+                        );
+                        continue;
+                    }
+                    // ★묘비 미상이면 **죽은 부서를 되살리지 않는다**(부활은 비가역 — UI 쪽
+                    // missingKnownWorkspaces 와 같은 방향). 살아 있는 부서는 아래 정상 경로.
+                    if !alive && tomb_unknown {
+                        let _ = app.emit(
+                            "restore-progress",
+                            json!({"phase": "skip", "dept": name, "detail": "삭제 기록 미상 — 재기동 보류"}),
                         );
                         continue;
                     }

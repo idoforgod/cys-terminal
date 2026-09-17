@@ -702,6 +702,13 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
   animation: cc-sweep 0.9s linear infinite;
 }
 .dept-pending-msg { font-size: 13px; opacity: 0.8; }
+/* 확보 못 한 부서 탭의 '지금 켜기' — 모달 버튼과 같은 관용구(비활성 시각화 포함).
+   ★종전에는 이 상태가 아무것도 그리지 않는 백지였다(2026-09-17 성찰 3회). */
+.dept-idle-btn {
+  margin-top: 14px; padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; font-size: 13px;
+}
+.dept-idle-btn:disabled { opacity: .5; cursor: default; }
 @media (prefers-reduced-motion: reduce) {
   .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
 }

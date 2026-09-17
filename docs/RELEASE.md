@@ -44,7 +44,7 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 1. 버전 범프(§0) → `cargo build --release --bin cys` (Tauri 빌드 불요 — cys 단독).
 2. pack 3종 생성 — release.yml `pack-artifacts` 잡과 동일 파라미터(스캔 게이트 2종 선행 포함):
    `cys pack-manifest --key-id … --signed-at … --expires-at … --min-binary-version $PACK_MIN_BINARY > pack-manifest.json`
-   (`$PACK_MIN_BINARY` = release.yml `PACK_MIN_BINARY` env 와 **동일값** — 현행 0.14.29. 수기 리터럴 금지:
+   (`$PACK_MIN_BINARY` = release.yml `PACK_MIN_BINARY` env 와 **동일값** — 현행 0.14.31 — 2026-09-17 실측 재확인. 수기 리터럴 금지:
    두 레인 값보다 낮게 서명하면 아래 불변 규칙이 막은 스큐가 이 수동 문으로 재개방된다.)
    → 결정론 tar(`--mtime` 고정) → minisign 서명.
 3. **직전 릴리스의 latest.json + 바이너리 업데이트 자산을 그대로 동봉**해 새 릴리스를 만들고
@@ -63,6 +63,9 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
   (플래그·서브커맨드)을 추가하고 팩이 그것을 지시하면, 다음 pack 태그 전에 하한을 그 버전으로
   올려라.** 손대야 할 곳은 **두 곳(레인마다 하나)** 이다:
   - 본체 레인 — `.github/workflows/release.yml` 의 `PACK_MIN_BINARY`
+  - **이 문서 §0-A 2단계의 리터럴** — 위 두 값과 같은 커밋에서 갱신한다(2026-09-17 추가: 실제로
+    0.14.29 로 굳어 두 레인(0.14.31)보다 낮았다. 바로 그 아래 "수기 리터럴 금지" 경고가 막으려던
+    스큐를 이 문장 자신이 들고 있었다)
   - 팩-온리 레인 — `.github/workflows/pack-release.yml` 의 `PACK_MIN_BINARY_OVERRIDE`
     (비면 정책 스크립트 값 `0.12.48` 이 쓰인다)
 
