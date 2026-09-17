@@ -221,6 +221,33 @@ class DiagnoseFlagAbsencePins(unittest.TestCase):
             self.assertNotIn(flag, yml,
                              "release.yml 이 진단 전용 플래그를 실었다: %s" % flag)
 
+    def test_14b_every_workflow_carries_no_bypass_flag(self):
+        """★스캔 대상을 **전 워크플로**로 넓힌다(2026-09-17 · 성찰 지적 PP-3).
+
+        종전 핀의 실제 대상은 release.yml 하나뿐이었다. 그런데 게이트를 발행 차단 근거로
+        소비하는 자동 경로는 그 뒤로 늘었다(release-postprocess.yml). '금지'가 새 경로에
+        대해서는 주석 한 줄로만 지켜지고 있었다는 뜻이다 — 새 워크플로가 추가될 때마다
+        사람이 기억해야 하는 금지는 언젠가 잊힌다. 그래서 대상을 열거하지 않고 훑는다.
+
+        `--unsafe-skip-gatekeeper` 도 함께 본다: 종전 어느 검체도 워크플로에서 그 플래그의
+        부재를 보지 않았다(release-postprocess.py 소스에서 인자 파싱 존재만 확인했다).
+        """
+        wf_dir = os.path.join(_HERE, "..", "..", ".github", "workflows")
+        names = sorted(n for n in os.listdir(wf_dir) if n.endswith((".yml", ".yaml")))
+        self.assertTrue(names, "워크플로 디렉터리가 비었다 — 이 핀이 아무것도 지키지 않는다")
+        banned = tuple(self.DIAG_FLAGS) + ("--unsafe-skip-gatekeeper",)
+        for name in names:
+            with open(os.path.join(wf_dir, name), encoding="utf-8") as fh:
+                body = fh.read()
+            # 주석에서의 **금지 고지**는 허용한다 — 실제로 스크립트에 실렸는지만 본다.
+            code = "\n".join(
+                ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
+            )
+            for flag in banned:
+                self.assertNotIn(
+                    flag, code,
+                    "%s 가 게이트 우회 플래그를 실었다: %s" % (name, flag))
+
 
 class Seal2UniversalCheckTests(unittest.TestCase):
     """F1 적대 픽스처 — SEAL-2 전칭 검사(파일별 대응·고아·flags 전수)를 합성 트리로 박제.
