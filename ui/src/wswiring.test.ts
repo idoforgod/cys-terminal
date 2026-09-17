@@ -199,10 +199,30 @@ describe("복원 배선 — 부팅 1회의 부서 데몬 팬아웃에 상한이 
   it("★등재만 된 부서까지 한꺼번에 띄우지 않는다(A① 폭주)", () => {
     // `cys-dept launch` 한 번은 CEO 승격·티켓·5역할 편성 기동까지 부수효과로 착수한다.
     expect(code.includes("MAX_DEPT_LAUNCH_PER_START")).toBe(true);
-    expect(code.includes("savedSockets.has(")).toBe(true);
+    // ★면제 판정은 '저장본에 있었나'가 아니라 '사용자가 실제로 쓰는 탭인가'여야 한다 —
+    // 자동 생성된 탭도 곧바로 저장본에 기록되므로, 저장본 기준이면 상한이 1회짜리로 소멸한다.
+    expect(code.includes("ws.autoCreated === true && launched >= MAX_DEPT_LAUNCH_PER_START")).toBe(true);
+    expect(code.includes("savedSockets")).toBe(false);
+  });
+  it("★예산 검사가 가장 비싼 루프(부서 데몬 확보)에도 있다", () => {
+    // daemon_status(최대 10s·Win 20s) + launch(최대 60s·Win 120s)가 부서마다 직렬이다.
+    // 이 루프에 예산이 없으면 죽은 부서 여럿에서 분 단위로 화면이 비고 자가치유도 꺼진 채다.
+    const slice = restoreSlice();
+    const i = slice.indexOf("const deptWsList");
+    expect(i).toBeGreaterThan(0);
+    expect(slice.slice(i, i + 700).includes("Date.now() > restoreDeadline")).toBe(true);
   });
   it("복원 체인에 총량 데드라인이 있다(직렬 상한 합만큼 백지로 두지 않는다)", () => {
     expect(code.includes("const START_BUDGET")).toBe(true);
-    expect(code.includes("Date.now() > restoreDeadline")).toBe(true);
+    expect((code.match(/Date\.now\(\) > restoreDeadline/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+  it("★확보 못 한 부서 탭은 백지가 아니라 안내+손잡이를 그린다", () => {
+    // 팬아웃 상한·예산 소진·launch 실패·데몬 무응답 넷 다 tree:null 로 떨어진다.
+    expect(code.includes("function renderDeptIdle(")).toBe(true);
+    expect(code.includes("root.appendChild(renderDeptIdle(ws))")).toBe(true);
+  });
+  it("미룬 사유를 하나로 뭉치지 않는다(제품의 조절 vs 이 기계가 느림)", () => {
+    expect(code.includes("cappedLaunch")).toBe(true);
+    expect(code.includes("budgetLaunch")).toBe(true);
   });
 });

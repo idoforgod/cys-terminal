@@ -3859,8 +3859,15 @@ fn spawn_org_restore(app: AppHandle) {
         // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
         let hq_ok = run_sidecar_restore(None).await;
         // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서는 재기동에서 제외(+생존 시 reap).
-        // RPC 실패=빈 집합(보수적 fail-open: 묘비 부재=현행 거동 — 롤백 불변식 "부재=제약 없음").
-        let tombs: std::collections::HashSet<String> =
+        //
+        // ★fail-closed 전환(2026-09-17 · v0.14.37 성찰 3회). 종전 주석은 "RPC 실패=빈 집합(보수적
+        // fail-open)" 이었다. 그 방향이 보수적이 아니다 — 빈 집합이면 **삭제한 부서가 되살아나고**,
+        // 그 launch 는 성공 말미에 묘비까지 지운다(cysjavis-pack/bin/cys-dept). 즉 일시적 RPC 실패
+        // 한 번이 "지운 부서는 되살아나지 않는다"는 계약을 **영구히** 깨고 그 부서의 팀까지 다시
+        // 띄운다(비가역). 반대 방향의 대가는 "이번 복원에서 부서 재기동을 건너뛴다" 뿐이고,
+        // 그것은 다음 앱 기동이 그대로 회복한다. UI 쪽(ui/src/wsreconcile.ts missingKnownWorkspaces)
+        // 도 같은 판정으로 통일돼 있다 — 두 리바이버가 반대 방향이면 약한 쪽이 계약을 무효화한다.
+        let tombs: Option<std::collections::HashSet<String>> =
             rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({}))
                 .await
                 .ok()
@@ -3868,8 +3875,22 @@ fn spawn_org_restore(app: AppHandle) {
                     v.get("dept_tombstones").and_then(|a| a.as_array()).map(|a| {
                         a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
                     })
-                })
-                .unwrap_or_default();
+                });
+        let tombs = match tombs {
+            Some(t) => t,
+            None => {
+                // 묘비를 못 읽었다 — 부서 순회 자체를 건너뛴다(본부 복원은 이미 위에서 끝났다).
+                let _ = app.emit(
+                    "restore-progress",
+                    json!({"phase": "skip", "detail": "삭제 기록을 읽지 못해 부서 재기동을 보류함 — 다음 기동에 재시도"}),
+                );
+                let _ = app.emit(
+                    "restore-progress",
+                    json!({"phase": "done", "hq_ok": hq_ok, "ok": 0, "fail": 0}),
+                );
+                return;
+            }
+        };
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
         let mut ok = 0usize;
         let mut fail = 0usize;
