@@ -323,11 +323,44 @@ validate_dept_name(){
 # rotate 재귀가 전부 거부된다). 회귀 핀: 기존명 재-launch/rotate 통과. 검사 지점=reg_upsert 진입부와
 # allocate 예약 사후 assert 공통(+launch는 부작용-이전 조기 호출). 기존 충돌 쌍 가시화는 preflight 소관.
 dept_name_fold(){ printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | tr -d '.'; }
+# ★J4(2026-09-18 · 마스터 결재 (b)) — **rotate 재귀(kill 이후)의 레지스트리 판독 실패 관용**.
+#   근거: K8(bin/tests/test_role_authority_shell.py:470-479 "unreadable registry keeps the rotate
+#   exemption (no post-kill half-op)") · T11(성찰 2회가 고지한 '면제 정책 반전').
+#   `rotate` 는 데몬을 kill 하고 소켓을 지운 뒤 **이 프로세스 안에서** launch 본체를 다시 부른다
+#   (rotate 갈래의 `( _CYS_ROTATE_SELF=1; launch_dept "$name" )`). 그 지점 이후의 **어떤 새 거절도
+#   곧 '데몬은 죽고 등재만 남는' 반파괴**다 — 판독 실패는 재기동을 막지 못한다.
+#   ★쓰기 계약은 그대로다: `reg_*` 는 여전히 손상된 원본에 쓰지 않고 rc 10 을 낸다(바이트 보존).
+#   여기서 하는 일은 그 10 을 **데몬이 다시 뜨기 전에** 치명으로 승격시키지 않는 것뿐이고,
+#   데몬이 뜬 **뒤의** 10(말미 `reg_count` 등)은 그대로 전파된다 — 호출자는 rc 10 으로 복구 필요를
+#   알고, 부서는 살아 있다. 침묵하지 않는다(단계마다 사유 1줄).
+#   rc 0 = 관용(호출부가 폴백값으로 진행) · rc 1 = 그대로 전파(rotate 재귀가 아니거나 10 이 아님).
+rot_reg_degraded(){   # $1=rc · $2=생략되는 단계 이름
+  [ "${_CYS_ROTATE_SELF:-}" = "1" ] || return 1
+  [ "$1" = "10" ] || return 1
+  echo "[cys-dept] ${name:-?}: depts.json 판독 실패 — kill 이후이므로 재기동 진행(반파괴 차단): $2 생략(원본 미변경·바이트 보존) · 레지스트리 복구 뒤 cys-dept rotate 재실행" >&2
+  _ROT_DEGRADED_SEEN=1   # 아래 rot_reg_quiet 의 래치 — 같은 사유 줄의 반복을 막는다
+  return 0
+}
+
+# ★J4 소음 차단: 위 관용은 **한 호출에서 여러 단계**가 연달아 실패한다(등재 갱신·account_dir·cwd…).
+#   그때마다 `reg_*` 내부가 내는 "판독 실패 — 원본 보존: <경로>: <파싱오류>" 는 **바이트 동일**이라,
+#   그대로 두면 같은 줄이 대여섯 번 쌓여 정작 위의 단계별 고지를 덮는다(감사 낭비 패턴 '소음이 진짜
+#   요청을 가린다'). 첫 실패의 상세는 그대로 내고, 그 뒤 **중복만** 지운다 — 사유가 사라지는 게 아니다.
+#   ★적용 범위: `resolve_dept_cwd`·`resolve_lane_acctdir` 의 **1차 호출은 감싸지 않는다** —
+#     정적 핀이 리터럴 호출형을 본다(test_trust_seed.py:1968 `dept_cwd="$(resolve_dept_cwd `,
+#     run_bootstrap_health.py:7977 "resolve_lane_acctdir"). 배선을 핀에 맞춘 게 아니라, 소음
+#     차단이라는 부차 목적이 배선 핀을 흔들지 않게 한 것이다(사유 줄은 여전히 단계마다 난다).
+rot_reg_quiet(){
+  if [ "${_ROT_DEGRADED_SEEN:-0}" = "1" ]; then "$@" 2>/dev/null; else "$@"; fi
+}
+
 reject_slug_collision(){
-  local name="$1" fold ex names
+  local name="$1" fold ex names rc
   fold="$(dept_name_fold "$name")"
   # ★P1(2026-09-17 부트체인 감사): heredoc 안의 $(...) 실패는 while 이 삼킨다 — 먼저 받아 exit 10 전파.
-  names="$(reg_names)" || exit $?
+  # ★J4: 단, rotate 재귀(kill 이후)에서는 판독 실패가 치명이 아니다 — 대상은 이미 등재된 이름이라
+  #   충돌 검사는 자기 항목 제외로 늘 통과하던 자리다(검사 생략의 새 허용 0).
+  names="$(rot_reg_quiet reg_names)" || { rc=$?; rot_reg_degraded "$rc" "slug 충돌 검사" || exit "$rc"; names=""; }
   # 파이프 대신 heredoc(reap 관용) — 파이프 서브셸이면 exit 2가 스크립트를 못 끝낸다.
   while IFS= read -r ex; do
     [ -n "$ex" ] || continue
@@ -738,7 +771,14 @@ PY
 }
 
 # 부서 팩 agents.json 이 실제로 가리키는 계정 dir(=시드된 값) 출력. 없으면 빈 출력.
-pack_seeded_acct(){ python3 - "$1/agents.json" <<'PY'
+# ★J5 M3(codex 9차 major · cys-dept:1557): 이 폴백 출력에는 **CR 정규화가 없었다**. Windows
+#   PortableGit 의 네이티브 python 은 텍스트 모드라 `print()` 가 `\r\n` 을 낸다 — `reg_names`·
+#   `reg_get_field`·`reg_count` 는 전부 `| tr -d '\r'` 로 그것을 벗기는데(파일 상단 CRLF 위생 규칙 ·
+#   회귀 핀 test_dept_name_guard.py '13) CRLF 위생 census') 이 한 곳만 빠져 있었다.
+#   결과: `CYS_ACCOUNT_DIR` 없는 Windows 재기동에서 `acctdir='…\r'` 가 그대로 남아
+#   `[ -d "$acctdir" ]` 가 엉뚱한 경로를 보거나(또는 CR 달린 dir 을 새로 만들어) 계정격리가 어긋난다.
+#   같은 단일 지점 규칙을 여기에도 적용한다(rc 의미 변화 0 — 호출부가 이미 `| tail -1` 로 받는다).
+pack_seeded_acct(){ python3 - "$1/agents.json" <<'PY' | tr -d '\r'
 import json,sys,re
 try: d=json.load(open(sys.argv[1],encoding="utf-8"))
 except Exception: sys.exit(0)
@@ -1333,12 +1373,42 @@ case "$cmd" in --help|-h) usage; exit 0 ;; esac
 #   등재·데몬 스폰·CEO 승격까지 갈 수 있었다(면제가 '비파괴'라던 종전 노트 표현은 과했다).
 #   진짜 rotate 는 kill 이전에 등재 여부를 먼저 확인하므로(rotate 갈래), 면제도 같은 사실을 요구한다.
 #   레지스트리가 아직 없으면(첫 기동) 면제도 없다.
-#   ★P1(2026-09-17 부트체인 감사): 판독 불가는 면제 근거도 아니다 — 사유 1줄·exit 10 으로 접는다.
+#   ★P1 철회 / T11 정정(2026-09-17 · 성찰 2회가 '면제 정책 반전'으로 고지): P1 은 "판독 불가는
+#   면제 근거도 아니다 — 사유 1줄·exit 10 으로 접는다" 라고 적었고, 그 한 줄이 이 갈래의 계약을
+#   뒤집었다. **다른 쓰기 동사의 exit 10 은 옳고 그대로 둔다**(원본 보존·반쪽 쓰기 차단). 그러나
+#   여기는 rotate 가 **이미 데몬을 kill 하고 소켓을 지운 뒤** 스스로를 재귀 호출한 자리다(:2043
+#   `( _CYS_ROTATE_SELF=1; launch_dept "$name" )` 의 셸 밖 짝 — `launch <name> --rotate`).
+#   판독이 일시 실패했다고 여기서 **kill 뒤에** 재기동을 새로 거절하면 부서는 '데몬은 죽고 등재만
+#   남는' 반파괴로 끝난다 — 이 파일이 :1739 에서 일부러 피하는 바로 그 상태다.
+#   ★따라서 **판독 불가는 미등재가 아니다**(codex R2 · 회귀 핀 K8 —
+#     bin/tests/test_role_authority_shell.py:470-479 "unreadable registry keeps the rotate
+#     exemption (no post-kill half-op)" · 기대 rc=2, 즉 면제가 서고 이름 검증으로 떨어진다).
+#   그때는 **종전 조건(소켓 부재 + 레지스트리 파일 존재)만으로 면제를 유지**하고 사유 1줄만 남긴다.
+#   등재 확인은 면제를 '더 좁히는' 보강이지 면제의 전제가 아니다 — 판독이 되는 정상 상태에서는
+#   K7(미등재 부서는 면제 없음)이 그대로 산다. 이 갈래는 읽기만 하므로 원본은 손대지 않는다.
 _CYS_ROTATE_SELF=0
+# ★J6(2026-09-18 · codex 10차 minor · 보안축): 내부 표식은 **진입 시 전부 초기화**한다.
+#   `_CYS_ROTATE_SELF` 는 종전부터 `=0` 으로 덮였지만 `_CYS_ROTATE_ACCT`(J5 M2 ⓐ 선포착값)는
+#   초기화가 없었다 — 외부에서 그 이름을 export 한 채 손상 레지스트리로 `launch <B> --rotate` 를
+#   돌리면 **선포착을 한 번도 하지 않고** 외부 값이 자격증명 시드의 원천 계정으로 채택된다
+#   (실측: `_CYS_ROTATE_ACCT=POLLUTED_A` → "kill 이전에 확인한 등재 account('POLLUTED_A')로 진행").
+#   그 값이 정하는 것은 **누구의 `.credentials.json` 을 이 부서 dir 에 복사하는가** 이고,
+#   copy-if-absent 라 한 번 잘못 심기면 되돌릴 수 없다(J5 M2 와 같은 되돌릴 수 없는 축).
+#   `=""` 가 아니라 `unset` 인 이유: 값뿐 아니라 **export 속성**까지 지워야 한다. 대입은 기존
+#   export 속성을 그대로 물려받으므로, 초기화를 `=""` 로 하면 아래 rotate 의 선포착 재대입이
+#   여전히 exported 인 채로 남아 자식 cysd·좌석에까지 전달된다(정본 §3-4 '상속되는 노브 금지' ·
+#   `_CYS_ROTATE_SELF` 를 env 가 아니라 argv 표식으로 갈아탄 P6 R1 과 같은 이유).
+#   unset 뒤의 대입은 **비상속 셸 변수**다 — 자식에게 넘겨야 하는 값은 스폰 지점에서 명시 전달한다
+#   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
+unset _CYS_ROTATE_ACCT
 if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ] && [ -n "${2:-}" ]; then
   if [ ! -e "$(dept_sock "${2:-}")" ] && [ -f "$REG" ]; then
-    _cys_rot_names="$(reg_names)" || exit $?
-    if grep -Fxq -- "${2:-}" <<<"$_cys_rot_names"; then _CYS_ROTATE_SELF=1; fi
+    if _cys_rot_names="$(reg_names 2>/dev/null)"; then
+      if grep -Fxq -- "${2:-}" <<<"$_cys_rot_names"; then _CYS_ROTATE_SELF=1; fi
+    else
+      _CYS_ROTATE_SELF=1
+      echo "[cys-dept] ${2:-}: depts.json 판독 실패 — 면제 유지(반파괴 차단): rotate 재기동은 kill 뒤라 여기서 거절하면 데몬 사망·등재 잔존이 된다. 소켓 부재 조건만으로 진행($REG 를 UTF-8(BOM 허용)로 복구하라)" >&2
+    fi
   fi
 fi
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
@@ -1495,22 +1565,45 @@ launch_dept(){   # $1=name
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
-    reg_upsert "$name" "$sock" "$pack" || exit $?
+    # ★J4: rotate 재귀에서는 등재 갱신 실패가 재기동을 막지 못한다(등재는 kill 이전에 이미 확인됐고
+    #   이 호출은 socket/pack_dir 의 **갱신**이다 — 손상 원본에는 아무것도 쓰이지 않는다).
+    rot_reg_quiet reg_upsert "$name" "$sock" "$pack" || { _rc=$?; rot_reg_degraded "$_rc" "등재 갱신(reg_upsert)" || exit "$_rc"; }
     # ★G3(W3): 계정격리 복원 — rotate 가 이 경로를 재귀 호출하므로, 여기서 계정 dir 을 유도하지
     #   않으면 **재기동 한 번으로 격리가 조용히 풀린다**(데몬 env 소실 → 자식 claude 가 오너 base
     #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
-    acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)" || exit $?
-    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")" || exit $?   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
+    # ★J4: 판독 실패로 계정격리가 **조용히** 풀리지 않게, rotate 재귀에서는 기존 `--repair-read`
+    #   축(팩의 agents.json 시드에서 계정 문맥 복원)으로 한 번 더 유도한다(새 폴백 신설 0).
+    acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)" \
+      || { _rc=$?; rot_reg_degraded "$_rc" "등재 account_dir 판독(팩 시드로 복원 시도)" || exit "$_rc"; \
+           acctdir="$(rot_reg_quiet resolve_lane_acctdir "$name" "$pack" --repair-read | tail -1)" || acctdir=""; }
+    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")" \
+      || { _rc=$?; rot_reg_degraded "$_rc" "등재 cwd 판독(명시값 → \$HOME 으로 강등)" || exit "$_rc"; \
+           dept_cwd="$(rot_reg_quiet resolve_dept_cwd "${CYS_DEPT_CWD:-}" "")" || dept_cwd="$HOME"; }   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
     # ★성찰 P4 ⓐ: launch 는 종전에 cwd 를 **해소만 하고 기록하지 않았다** — `CYS_DEPT_CWD=/proj cys-dept launch d` 뒤의 다음
     #   launch/rotate(부트 체인·GUI 재기동)는 등재값이 없어 $HOME 으로 조용히 이주했고 `cys-dept cwd` 도 그 거짓값을 내줬다.
     #   확정값을 등재한다 — 단 ① 명시값이 **채택**됐을 때(확정값 = 명시값의 물리 경로) 또는 ② 등재값이 아예 없을 때만.
     #   등재값이 있는데 못 써서 $HOME 으로 폴백한 경우는 덮지 않는다(오설정을 영구화하지 않는다 · WARN 은 resolve_dept_cwd 가 낸다).
     _lc_expl="${CYS_DEPT_CWD:-}"
     case "$_lc_expl" in "~") _lc_expl="$HOME" ;; "~/"*) _lc_expl="$HOME/${_lc_expl#\~/}" ;; esac
-    _lc_registered="$(reg_get_field "$name" cwd | tail -1)" || exit $?
-    if { [ -n "$_lc_expl" ] && [ "$dept_cwd" = "$(_dept_cwd_canon "$_lc_expl")" ]; } \
-       || [ -z "$_lc_registered" ]; then
-      reg_set_field "$name" cwd "$dept_cwd" || { _rc=$?; [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2; }
+    # ★J4: rotate 재귀에서 판독이 깨졌으면 이 블록 **전체**를 건너뛴다. 확인(read)도 기록(write)도
+    #   할 수 없는 상태인데, `[ -z "$_lc_registered" ]`(=등재값 없음)로 접으면 곧바로 쓰기를 시도해
+    #   reg_set_field 의 rc 10 이 **데몬 재기동 이전에** 치명이 된다 — 그것이 곧 반파괴다.
+    _lc_regdead=0
+    _lc_registered="$(rot_reg_quiet reg_get_field "$name" cwd | tail -1)" \
+      || { _rc=$?; rot_reg_degraded "$_rc" "등재 cwd 확인·기록" || exit "$_rc"; _lc_registered=""; _lc_regdead=1; }
+    if [ "$_lc_regdead" = "0" ]; then
+      if { [ -n "$_lc_expl" ] && [ "$dept_cwd" = "$(_dept_cwd_canon "$_lc_expl")" ]; } \
+         || [ -z "$_lc_registered" ]; then
+        # ★J5 M1(codex 9차 major · cys-dept:1576): `_lc_regdead` 는 **조회** 실패만 덮는다. 조회가
+        #   성공한 뒤 기록 시점에 레지스트리가 손상되는 경합(둘 다 별도 python 호출이라 창이 실재한다)
+        #   에서는 `reg_set_field` **안쪽의 `exit 10` 이 이 셸을 그대로 끝낸다** — `|| rot_reg_degraded`
+        #   를 덧붙여도 소용없다(함수의 `exit` 는 호출부의 `||` 에 닿지 않는다). 그래서 **서브셸로
+        #   감싸** 그 exit 를 rc 로 받아낸다. 비-rotate 경로의 계약은 그대로다(아래 else 절이
+        #   종전 `[ "$_rc" = 10 ] && exit 10` · WARN 을 글자 그대로 유지한다).
+        ( reg_set_field "$name" cwd "$dept_cwd" ) \
+          || { _rc=$?; rot_reg_degraded "$_rc" "등재 cwd 기록(조회 성공 → 기록 시점 손상)" \
+               || { [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2; }; }
+      fi
     fi
     if [ -n "$acctdir" ]; then
       mkdir -p "$acctdir" 2>/dev/null || true
@@ -1521,10 +1614,28 @@ launch_dept(){   # $1=name
       #   계정의 base — 다계정 경계 보존(~/.claude 하드코딩 금지). rotate 재귀에서도 대상 기존재
       #   무동작(③)이 갱신 토큰을 지킨다.
       if [ "${CYS_DEPT_SEED_CREDS:-0}" = "1" ]; then
-        _credacct="$(reg_get_field "$name" account | tail -1)" || exit $?
-        [ -n "$_credacct" ] || _credacct="${CYS_DEPT_DEFAULT_ACCOUNT:-default}"
-        _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
-        seed_credentials_win "$_credbase" "$acctdir"
+        # ★J5 M2(codex 9차 major · cys-dept:1588): 판독 실패를 **기본계정으로 접으면 안 된다**.
+        #   조건(Windows · CYS_DEPT_SEED_CREDS=1 · 대상 계정 B 의 .credentials.json 부재 · 기본계정 A 의
+        #   토큰 존재)에서 `CYS_ACCOUNT_DIR` 로 B dir 을 지켜도 account 조회 실패가 원천을 A 로 바꿔
+        #   **A 의 토큰이 B 의 dir 에 copy-if-absent 로 심긴다**. ③ 멱등(기존재=무동작) 때문에 레지스트리를
+        #   복구해도 잘못 심긴 토큰은 남는다 — 되돌릴 수 없는 교차계정 자격증명 주입이다.
+        #   처방 2단: ⓐ kill **이전에** 선포착한 등재 account(`_CYS_ROTATE_ACCT`)가 있으면 그것으로
+        #   격리를 유지하고, ⓑ 그것마저 없으면 **시드를 생략**한다(경고 1줄). 시드는 복구 뒤 재기동의
+        #   몫이다 — 못 심는 것은 되돌릴 수 있고, 잘못 심는 것은 되돌릴 수 없다.
+        _cred_dead=0
+        _credacct="$(rot_reg_quiet reg_get_field "$name" account | tail -1)" \
+          || { _rc=$?; rot_reg_degraded "$_rc" "등재 account 판독" || exit "$_rc"; _credacct=""; _cred_dead=1; }
+        if [ "$_cred_dead" = "1" ] && [ -n "${_CYS_ROTATE_ACCT:-}" ]; then
+          _credacct="$_CYS_ROTATE_ACCT"; _cred_dead=0
+          echo "[cys-dept] $name 자격증명 시드: kill 이전에 확인한 등재 account('$_credacct')로 진행한다(기본계정 강등 없음·교차계정 주입 차단)" >&2
+        fi
+        if [ "$_cred_dead" = "1" ]; then
+          echo "[cys-dept] WARN: $name 자격증명 시드 생략 — 등재 account 를 확정하지 못했다(depts.json 판독 실패). 기본계정으로 접으면 **다른 계정의 .credentials.json** 이 이 부서 dir 에 심기고 copy-if-absent 라 복구 뒤에도 남는다. 레지스트리 복구 후 재기동에서 시드하라(부서 pane 수동 /login 도 가능)" >&2
+        else
+          [ -n "$_credacct" ] || _credacct="${CYS_DEPT_DEFAULT_ACCOUNT:-default}"
+          _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
+          seed_credentials_win "$_credbase" "$acctdir"
+        fi
       fi
       # ★WP-2: 계정 dir 확정 직후·데몬(→claude) 기동 前 — 그 acctdir 과 부서 cwd(resolve_dept_cwd · 편성과 같은 값) 한 쌍만
       #   (opt-in 무관).
@@ -2017,16 +2128,33 @@ PY
       echo "[cys-dept] $name pid 미확인 — rotate 중단(소유자 사망 미확인·유령 중복 방지)" >&2
       exit 9
     fi
+    # ★J5 M2 ⓐ: kill **이전**(레지스트리가 아직 읽히는 시점)에 등재 account 를 선포착한다 — kill 뒤
+    #   판독이 깨져도 자격증명 시드가 기본계정으로 강등돼 **다른 계정의 토큰을 심는** 일이 없게.
+    #   opt-in 이 꺼져 있으면 유도 자체를 하지 않는다(핫패스 python spawn 0 — 위 시드 블록과 같은 규율).
+    #   비상속 셸 변수다(자식 cysd·좌석에 새지 않는다 · `_CYS_ROTATE_SELF` 와 동형).
+    if [ "${CYS_DEPT_SEED_CREDS:-0}" = "1" ]; then
+      # ★J6: 진입부에서 `unset` 했으므로 이 대입은 export 속성 없는 **비상속 셸 변수**다
+      #   (자식 cysd·좌석 env 에 나타나지 않는다 — 회귀 핀 J6PreCaptureHygiene ⓑ).
+      _CYS_ROTATE_ACCT="$(reg_get_field "$name" account | tail -1)" || _CYS_ROTATE_ACCT=""
+    fi
     # 프로세스만 종료(down의 graceful_kill 재사용 — OS중립·Windows taskkill 분기 포함, 신설 분기 없음).
     # graceful_kill이 사망을 동기 확인하므로 아래 launch의 ready 프로브가 죽은 소켓을 새것으로 오인하지 않는다.
     graceful_kill "$pid"
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     # ★필수2(A·리뷰) TOCTOU 재확인: kill·rm 도중 CSO down(reg_remove+dept_tombstone)이 레이스로 끼어들어
     # 폐기됐으면 launch(부활) 금지 — 사전 게이트 이후 창을 최소화하려 launch 직전에 한 번 더 확인(미등재→exit 8).
-    _reg_names="$(reg_names)" || exit $?
-    if ! grep -Fxq -- "$name" <<<"$_reg_names"; then
-      echo "[cys-dept] $name 미등재(down됨·rotate 중 폐기) — rotate 중단(부활 금지)" >&2
-      exit 8
+    # ★J4(2026-09-18 · 마스터 결재 (b)): **이 확인은 kill·rm 이 끝난 뒤**다(바로 위 두 줄). 그래서
+    #   '미등재'(= CSO 가 정말 폐기했다)는 여전히 exit 8 이지만, **판독 실패는 미등재가 아니다** —
+    #   여기서 exit 10 으로 끊으면 데몬은 죽고 등재만 남는 반파괴가 된다(K8 —
+    #   bin/tests/test_role_authority_shell.py:470-479 · T11 '면제 정책 반전'). 판독 불가면 재기동을
+    #   진행한다. 손상 원본은 읽기만 했으므로 그대로 보존된다(쓰기는 여전히 rc 10 으로 거절된다).
+    if _reg_names="$(reg_names 2>/dev/null)"; then
+      if ! grep -Fxq -- "$name" <<<"$_reg_names"; then
+        echo "[cys-dept] $name 미등재(down됨·rotate 중 폐기) — rotate 중단(부활 금지)" >&2
+        exit 8
+      fi
+    else
+      echo "[cys-dept] $name: depts.json 판독 실패 — kill 이후이므로 재기동 진행(반파괴 차단): 폐기 재확인 생략(원본 미변경) · $REG 복구 뒤 재확인하라" >&2
     fi
     # launch 재귀 호출: 소켓이 죽었으니 새 바이너리로 재spawn. CYS_ROLE 그대로 상속(게이트 통과 주체 동일).
     # launch stdout은 로그로 흘리고, 아래서 새 버전을 확정 출력한다.

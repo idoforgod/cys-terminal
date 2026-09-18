@@ -285,6 +285,408 @@ class RotateGuard(Base):
         self.assertEqual(rc, 2, "CYS_DEPT_ROTATE=1에서 launch 검증 우회(exit=%d)" % rc)
 
 
+def _await_pid(pidfile, deadline=4.0):
+    """목 데몬이 자기 pid 를 적을 때까지 유계 대기(무한 대기 금지) — 빈 값이면 픽스처 결함이다."""
+    end = time.time() + deadline
+    while time.time() < end:
+        if os.path.exists(pidfile):
+            with open(pidfile, encoding="utf-8") as f:
+                v = f.read().strip()
+            if v:
+                return v
+        time.sleep(0.02)
+    return ""
+
+
+class RotatePostKillRegistryCorruption(Base):
+    """16) J4 — rotate 본체의 **kill 직후** 레지스트리 손상은 재기동을 막지 못한다(반파괴 차단).
+
+    근거: K8(bin/tests/test_role_authority_shell.py:470-479 "unreadable registry keeps the rotate
+    exemption (no post-kill half-op)") 과 T11('면제 정책 반전'). K8 은 재귀 `launch <name> --rotate`
+    의 **게이트 rc** 만 핀한다 — 게이트를 통과하고도 그 뒤 어느 단계든 판독 실패로 끊기면 결과는
+    똑같이 '데몬은 죽고 등재만 남는' 반파괴다. 그 구간을 여기서 **행동으로** 핀한다.
+
+    형상: 등재·가동 중 부서를 rotate → `graceful_kill` 이 보낸 SIGTERM 을 받은 목 데몬이 죽으면서
+    depts.json 을 손상시킨다(kill 이전 판독은 성공 · 이후 전부 실패 = 실제 경합의 최악 시점).
+
+    단언 3축:
+      ⓐ **데몬 재기동 완료** — 소켓이 다시 생기고 목 `cys ping`(파일 실존 프로브)이 0 을 낸다.
+         (mutation: cys-dept 의 kill 직후 TOCTOU 재확인을 `|| exit $?` 로 되돌리면 여기서 red)
+      ⓑ **rc 계약** — 손상 레지스트리라 마지막 조회가 실패하므로 rc 10(판독 실패)이다.
+         '미등재'(exit 8)로 오판하지 않는다 — 판독 불가는 미등재가 아니다.
+      ⓒ **원본 바이트 보존** — 손상된 파일에 아무것도 쓰이지 않는다(RegistryBom 과 같은 축).
+    """
+    CORRUPT = b'{"depts":{"d1":'
+
+    def _arm(self):
+        bindir = os.path.join(self.home, ".local", "bin")
+        pidfile = os.path.join(self.tmp, "victim.pid")
+        sock = seed_sock(self.home, "d1")
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": ""}})
+        with open(self.env["CYS_DEPTS_JSON"], "rb") as f:
+            before_ok = f.read()
+
+        # 목 데몬(실 프로세스): SIGTERM 에 레지스트리를 손상시키고 죽는다 = kill 직후 판독 실패.
+        victim = os.path.join(self.tmp, "victim.py")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, signal, sys, time\n"
+                "from pathlib import Path\n"
+                "def bye(*a):\n"
+                "    Path(sys.argv[2]).write_bytes(%r)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, bye)\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "while True: time.sleep(0.05)\n" % (self.CORRUPT,))
+        proc = subprocess.Popen([sys.executable, victim, pidfile, self.env["CYS_DEPTS_JSON"]])
+        self.addCleanup(lambda: (proc.poll() is None) and (proc.kill(), proc.wait()))
+        pid = _await_pid(pidfile)
+        self.assertTrue(pid, "픽스처 결함: 목 데몬 pid 미기록")
+
+        # ping=소켓 파일 실존(생사) · identify=살아 있는 목 데몬의 pid/version 을 낸다.
+        _write_exec(os.path.join(bindir, "cys"),
+                    '#!/bin/sh\n'
+                    'echo "cys $@" >> "%(log)s"\n'
+                    'case "$1" in\n'
+                    '  ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;\n'
+                    '  identify) printf \'{"daemon_pid":"%(pid)s","version":"0.0.1"}\\n\'; exit 0 ;;\n'
+                    'esac\nexit 0\n' % {"log": self.log, "pid": pid})
+        return sock, before_ok, proc
+
+    def test_post_kill_corruption_still_relaunches(self):
+        sock, before_ok, proc = self._arm()
+        rc, out, err = self.run_dept("rotate", "d1")
+        with open(self.env["CYS_DEPTS_JSON"], "rb") as f:
+            corrupted = f.read()
+
+        # 전제: 픽스처가 실제로 kill 직후 손상을 만들었다(안 그러면 아래 단언이 공허해진다).
+        self.assertNotEqual(corrupted, before_ok,
+                            "픽스처 전제 붕괴: 목 데몬이 SIGTERM 에 레지스트리를 손상시키지 않았다")
+        self.assertEqual(corrupted, self.CORRUPT, "픽스처 손상 바이트 불일치")
+
+        # ⓐ 데몬 재기동 완료 — 소켓 부활 + 목 ping 0. 이것이 반파괴(데몬 사망·등재 잔존)의 부정이다.
+        self.assertTrue(os.path.exists(sock),
+                        "★kill 뒤 판독 실패로 재기동이 끊겼다 — 데몬 사망·등재 잔존(반파괴)\nrc=%d\n%s"
+                        % (rc, err))
+        ping = subprocess.run(["bash", "-c", '"$0" ping', os.path.join(
+            self.home, ".local", "bin", "cys")],
+            env=dict(self.env, CYS_SOCKET=sock), capture_output=True, text=True, timeout=30)
+        self.assertEqual(ping.returncode, 0, "재기동 소켓이 응답하지 않는다")
+
+        # ⓑ rc 계약 — 판독 실패는 10. '미등재'(8)로 오판하지 않는다.
+        self.assertEqual(rc, 10, "판독 실패 rotate rc=%d(≠10)\n%s" % (rc, err))
+        self.assertNotIn("미등재(down됨·rotate 중 폐기)", err,
+                         "판독 불가를 '미등재'로 오판 — 판독 불가는 미등재가 아니다(K8)")
+        self.assertIn("kill 이후이므로 재기동 진행(반파괴 차단)", err,
+                      "kill 이후 진행 고지 부재(침묵한 강등 금지)")
+
+        # ⓒ 원본 바이트 보존 — 손상 파일에 아무것도 쓰이지 않는다.
+        with open(self.env["CYS_DEPTS_JSON"], "rb") as f:
+            self.assertEqual(f.read(), self.CORRUPT,
+                             "★손상 레지스트리가 재기록됐다(원본 보존 계약 위반)")
+
+    def test_post_kill_unregistered_still_exit8(self):
+        """음성 대조: 판독이 **되는데** 정말 폐기된 경우는 종전대로 exit 8(부활 금지) — 새 허용 0."""
+        bindir = os.path.join(self.home, ".local", "bin")
+        pidfile = os.path.join(self.tmp, "victim2.pid")
+        sock = seed_sock(self.home, "d1")
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": ""}})
+        victim = os.path.join(self.tmp, "victim2.py")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, signal, sys, time, json\n"
+                "from pathlib import Path\n"
+                "def bye(*a):\n"
+                "    Path(sys.argv[2]).write_text(json.dumps({'depts': {}}))\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, bye)\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "while True: time.sleep(0.05)\n")
+        proc = subprocess.Popen([sys.executable, victim, pidfile, self.env["CYS_DEPTS_JSON"]])
+        self.addCleanup(lambda: (proc.poll() is None) and (proc.kill(), proc.wait()))
+        pid = _await_pid(pidfile)
+        _write_exec(os.path.join(bindir, "cys"),
+                    '#!/bin/sh\n'
+                    'echo "cys $@" >> "%(log)s"\n'
+                    'case "$1" in\n'
+                    '  ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;\n'
+                    '  identify) printf \'{"daemon_pid":"%(pid)s","version":"0.0.1"}\\n\'; exit 0 ;;\n'
+                    'esac\nexit 0\n' % {"log": self.log, "pid": pid})
+        rc, out, err = self.run_dept("rotate", "d1")
+        self.assertEqual(rc, 8, "판독 가능한 '폐기됨'은 종전대로 exit 8 이어야 한다(rc=%d)\n%s" % (rc, err))
+        self.assertIn("미등재(down됨·rotate 중 폐기)", err, "폐기 사유 문면 소실")
+        self.assertFalse(os.path.exists(sock), "부활 금지인데 소켓이 다시 생겼다")
+
+
+class J5PyShim(Base):
+    """17) J5·J6 — codex 9차 major 3건 + 10차 minor 1건의 회귀 핀
+    (M1 기록시점 손상 · M2 교차계정 토큰 · M3 CRLF · J6 선포착 표식 위생).
+
+    공통 하네스: `$HOME/.local/bin/python3` **투명 shim**(PATH 1순위). 모든 호출을 로그에 적고
+    실 python 으로 exec 한다 — cys-dept 의 python 사용은 전부 그대로 동작한다. 세 축만 주입한다:
+      · `PYSHIM_CORRUPT_ON_SET_FIELD=<field>` — `reg_set_field`(=`python3 - <REG> <n> <f> <v>` · 인자 5개)
+        직전에 레지스트리를 손상시킨다 ⇒ **조회는 성공했고 기록 시점에 깨진** 경합의 결정론 재현.
+      · `PYSHIM_CRLF_AGENTS=1` — `pack_seeded_acct`(=`python3 - <pack>/agents.json` · 인자 2개) 출력만
+        CRLF 로 바꾼다 ⇒ Windows PortableGit 네이티브 python 의 텍스트 모드 재현.
+      · 로그(`self.pylog`)로 `resolve_default_base`(=`python3 - <catalog> <acct>`) 호출 여부·인자를 본다
+        ⇒ '어떤 계정이 자격증명 시드의 원천으로 결정됐는가' 를 macOS 에서도 관측한다.
+        (`seed_credentials_win` 본체는 uname 으로 Windows 한정이라 복사 자체는 여기서 안 일어난다 —
+         그래서 **복사를 결정하는 단계**를 본다. 양성 대조가 이 관측이 살아 있음을 증명한다.)
+    """
+    CORRUPT = b'{"depts":{"d1":'
+
+    def _shim(self):
+        bindir = os.path.join(self.home, ".local", "bin")
+        self.pylog = os.path.join(self.tmp, "py-calls.log")
+        _write_exec(os.path.join(bindir, "python3"),
+                    '#!/bin/sh\n'
+                    'echo "$*" >> "%(log)s"\n'
+                    'if [ -n "$PYSHIM_CORRUPT_ON_SET_FIELD" ] && [ "$#" -eq 5 ] \\\n'
+                    '   && [ "$1" = "-" ] && [ "$4" = "$PYSHIM_CORRUPT_ON_SET_FIELD" ]; then\n'
+                    '  printf %%s "$PYSHIM_CORRUPT_BYTES" > "$2"\n'
+                    'fi\n'
+                    'if [ -n "$PYSHIM_CRLF_AGENTS" ] && [ "$#" -eq 2 ] && [ "$1" = "-" ]; then\n'
+                    '  case "$2" in\n'
+                    '    *agents.json) "%(py)s" "$@" | awk \'{printf "%%s\\r\\n", $0}\'; exit 0 ;;\n'
+                    '  esac\n'
+                    'fi\n'
+                    'exec "%(py)s" "$@"\n' % {"log": self.pylog, "py": sys.executable})
+        self.env.setdefault("PYSHIM_CORRUPT_ON_SET_FIELD", "")
+        self.env.setdefault("PYSHIM_CORRUPT_BYTES", "")
+        self.env.setdefault("PYSHIM_CRLF_AGENTS", "")
+        return bindir
+
+    def _pycalls(self):
+        if not os.path.exists(self.pylog):
+            return []
+        with open(self.pylog, encoding="utf-8") as f:
+            return [l.rstrip("\n") for l in f if l.strip()]
+
+    def _assert_shim_alive(self):
+        """shim 이 실제로 끼어 있었는지 — 아니면 아래 '호출 0' 단언이 전부 공허해진다."""
+        self.assertTrue(self._pycalls(), "픽스처 결함: python3 shim 이 한 번도 불리지 않았다")
+
+    # ── M1: 조회 성공 → 기록 시점 손상 ───────────────────────────────────────
+    def test_m1_cwd_write_corruption_after_successful_read_still_spawns(self):
+        """★J5 M1 — `reg_get_field cwd` 성공 뒤 `reg_set_field` 의 판독 시점에 손상되면 setter
+        **안쪽의 `exit 10`** 이 셸을 끝내 스폰 전에 중단됐다(`|| rot_reg_degraded` 로는 못 잡는다).
+        서브셸 포착 뒤에는 재기동이 완주하고 rc 10·원본 보존만 남아야 한다.
+        (mutation: 서브셸 괄호를 벗기면 여기서 red)"""
+        self._shim()
+        sock = seed_sock(self.home, "d1")
+        os.remove(sock)                                   # rotate 가 rm 한 직후 형상
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": ""}})   # cwd 필드 없음 → setter 도달
+        self.env.update({"PYSHIM_CORRUPT_ON_SET_FIELD": "cwd",
+                         "PYSHIM_CORRUPT_BYTES": self.CORRUPT.decode()})
+        rc, out, err = self.run_dept("launch", "d1", "--rotate")
+        self._assert_shim_alive()
+
+        with open(self.env["CYS_DEPTS_JSON"], "rb") as f:
+            after = f.read()
+        self.assertEqual(after, self.CORRUPT,
+                         "★기록 시점 손상인데 setter 가 레지스트리를 다시 썼다(원본 보존 위반)")
+        self.assertTrue(os.path.exists(sock),
+                        "★조회 성공→기록 실패에서 재기동이 끊겼다 — 데몬 사망·등재 잔존(반파괴)\n"
+                        "rc=%d\n%s" % (rc, err))
+        self.assertEqual(rc, 10, "판독 실패 rc=%d(≠10)\n%s" % (rc, err))
+        self.assertIn("기록 시점 손상", err, "기록 시점 관용 고지 부재(침묵한 강등 금지)")
+
+    def test_m1_non_rotate_write_failure_keeps_exit10(self):
+        """음성 대조: **비-rotate** `launch` 에서는 종전 계약 그대로 exit 10(관용 누수 0)."""
+        self._shim()
+        write_reg(self.env, {"d1": {"socket": "", "pack_dir": ""}})
+        self.env.update({"PYSHIM_CORRUPT_ON_SET_FIELD": "cwd",
+                         "PYSHIM_CORRUPT_BYTES": self.CORRUPT.decode()})
+        rc, out, err = self.run_dept("launch", "d1")
+        self._assert_shim_alive()
+        self.assertEqual(rc, 10, "비-rotate 기록 실패가 exit 10 이 아니다(rc=%d) — 쓰기 계약 누수\n%s"
+                         % (rc, err))
+        self.assertNotIn("기록 시점 손상", err, "비-rotate 에 rotate 관용이 샜다")
+
+    # ── M2: 계정 판독 실패 → 교차계정 토큰 주입 ─────────────────────────────
+    def _creds_fixture(self, corrupt, keep_sock=False):
+        """B dir 을 CYS_ACCOUNT_DIR 로 고정하고(격리 유지) 기본계정 A 의 토큰을 심어 둔다.
+
+        `keep_sock=True` 는 소켓을 남겨 '이미 가동 중 — 재사용' 분기로 보낸다(자격증명 계정 결정은
+        데몬 스폰 **이전**이라 관측에 영향 0 · `ready` 의 12s 부재 프로브를 치르지 않는다).
+        손상 갈래는 rotate 면제 조건이 '소켓 부재'라 반드시 지운다."""
+        self._shim()
+        acct_b = os.path.join(self.tmp, "accounts", "B-d1")
+        os.makedirs(acct_b, exist_ok=True)
+        for key in ("default", "bkey"):
+            base = os.path.join(self.home, ".cys", "claude-%s" % key)
+            os.makedirs(base, exist_ok=True)
+            with open(os.path.join(base, ".credentials.json"), "w", encoding="utf-8") as f:
+                f.write('{"token":"%s"}' % key)
+        catalog = os.path.join(self.home, ".cys", "dept-catalog.json")
+        with open(catalog, "w", encoding="utf-8") as f:
+            json.dump({"accounts": {}}, f)
+        sock = seed_sock(self.home, "d1")
+        if not keep_sock:
+            os.remove(sock)
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": "", "account": "bkey"}})
+        if corrupt:
+            with open(self.env["CYS_DEPTS_JSON"], "wb") as f:
+                f.write(self.CORRUPT)
+        self.env.update({"CYS_DEPT_SEED_CREDS": "1", "CYS_ACCOUNT_DIR": acct_b,
+                         "CYS_DEPT_CATALOG": catalog, "CYS_DEPT_DEFAULT_ACCOUNT": "default"})
+        return sock, acct_b, catalog
+
+    def test_m2_positive_control_account_resolution_is_observable(self):
+        """양성 대조 — 레지스트리가 **읽히면** 등재 account('bkey')가 시드 원천으로 결정된다.
+        이 관측이 살아 있어야 아래 음성 단언('호출 0')이 공허하지 않다."""
+        sock, acct_b, catalog = self._creds_fixture(corrupt=False, keep_sock=True)
+        rc, out, err = self.run_dept("launch", "d1", "--rotate")
+        self._assert_shim_alive()
+        picked = [c for c in self._pycalls() if c.startswith("- %s " % catalog)]
+        self.assertTrue(picked, "양성 대조 붕괴: 시드 계정 해석(resolve_default_base)이 아예 안 불렸다\n%s" % err)
+        self.assertTrue(any(c.endswith(" bkey") for c in picked),
+                        "등재 account 가 아닌 값으로 시드 원천이 정해졌다: %r" % picked)
+
+    def test_m2_degraded_account_never_falls_back_to_default(self):
+        """★J5 M2 — 판독 실패에서 기본계정('default')으로 접으면 A 의 토큰이 B dir 에 심기고
+        copy-if-absent 라 **복구 뒤에도 남는다**. 확정 못 하면 시드를 생략해야 한다.
+        (mutation: 생략 분기를 없애고 기본계정 강등으로 되돌리면 여기서 red)"""
+        sock, acct_b, catalog = self._creds_fixture(corrupt=True)
+        rc, out, err = self.run_dept("launch", "d1", "--rotate")
+        self._assert_shim_alive()
+        picked = [c for c in self._pycalls() if c.startswith("- %s " % catalog)]
+        self.assertFalse(any(c.endswith(" default") for c in picked),
+                         "★판독 실패가 기본계정으로 접혔다 — 교차계정 토큰 주입 경로: %r" % picked)
+        self.assertIn("자격증명 시드 생략", err, "시드 생략 고지 부재(침묵한 강등 금지)")
+        self.assertFalse(os.path.exists(os.path.join(acct_b, ".credentials.json")),
+                         "★다른 계정의 .credentials.json 이 부서 dir 에 심겼다(복구 후에도 잔존)")
+        self.assertTrue(os.path.exists(sock), "시드 생략이 재기동까지 막았다(반파괴)")
+
+    def _arm_victim(self, corrupt_bytes):
+        """`graceful_kill` 의 SIGTERM 을 받고 죽으면서 레지스트리를 손상시키는 실 프로세스 +
+        그 pid 를 내는 목 `cys identify`. kill **이전** 판독은 성공하고 이후는 전부 실패한다."""
+        bindir = os.path.join(self.home, ".local", "bin")
+        pidfile = os.path.join(self.tmp, "victim-m2a.pid")
+        victim = os.path.join(self.tmp, "victim-m2a.py")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, signal, sys, time\n"
+                "from pathlib import Path\n"
+                "def bye(*a):\n"
+                "    Path(sys.argv[2]).write_bytes(%r)\n"
+                "    os._exit(0)\n"
+                "signal.signal(signal.SIGTERM, bye)\n"
+                "Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "while True: time.sleep(0.05)\n" % (corrupt_bytes,))
+        proc = subprocess.Popen([sys.executable, victim, pidfile, self.env["CYS_DEPTS_JSON"]])
+        self.addCleanup(lambda: (proc.poll() is None) and (proc.kill(), proc.wait()))
+        pid = _await_pid(pidfile)
+        self.assertTrue(pid, "픽스처 결함: 목 데몬 pid 미기록")
+        _write_exec(os.path.join(bindir, "cys"),
+                    '#!/bin/sh\n'
+                    'echo "cys $@" >> "%(log)s"\n'
+                    'case "$1" in\n'
+                    '  ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;\n'
+                    '  identify) printf \'{"daemon_pid":"%(pid)s","version":"0.0.1"}\\n\'; exit 0 ;;\n'
+                    'esac\nexit 0\n' % {"log": self.log, "pid": pid})
+
+    def test_m2a_precaptured_account_survives_post_kill_corruption(self):
+        """★J5 M2 ⓐ — `rotate` 본체는 kill **이전**(아직 읽히는 시점)에 등재 account 를 선포착한다.
+        그래서 kill 뒤 판독이 깨져도 시드 원천이 기본계정으로 강등되지 **않고** 등재 account('bkey')
+        그대로다 — 격리를 유지하면서 시드도 생략하지 않는다(ⓑ 생략보다 나은 결과).
+        (mutation: 선포착 블록을 지우면 ⓑ 로 떨어져 '시드 생략'이 되고 여기서 red)"""
+        sock, acct_b, catalog = self._creds_fixture(corrupt=False, keep_sock=True)
+        self._arm_victim(self.CORRUPT)
+        rc, out, err = self.run_dept("rotate", "d1")
+        self._assert_shim_alive()
+
+        with open(self.env["CYS_DEPTS_JSON"], "rb") as f:
+            self.assertEqual(f.read(), self.CORRUPT,
+                             "픽스처 전제 붕괴: kill 시점 손상이 일어나지 않았다")
+        picked = [c for c in self._pycalls() if c.startswith("- %s " % catalog)]
+        self.assertTrue(any(c.endswith(" bkey") for c in picked),
+                        "★선포착 account 가 재기동에 전달되지 않았다(시드 원천 결정 로그: %r)\n%s"
+                        % (picked, err))
+        self.assertFalse(any(c.endswith(" default") for c in picked),
+                         "★기본계정으로 강등됐다 — 교차계정 토큰 주입 경로: %r" % picked)
+        self.assertIn("kill 이전에 확인한 등재 account", err, "선포착 사용 고지 부재")
+        self.assertTrue(os.path.exists(sock), "재기동이 끊겼다(반파괴)\nrc=%d\n%s" % (rc, err))
+
+    # ── J6(codex 10차 minor · 보안축): 선포착 표식 `_CYS_ROTATE_ACCT` 위생 ──────
+    def test_j6_exported_marker_from_outside_is_not_adopted(self):
+        """★J6 ⓐ — 외부에서 `_CYS_ROTATE_ACCT` 를 export 한 채 손상 레지스트리로
+        `launch <name> --rotate` 를 돌리면, 선포착을 **한 번도 하지 않고** 그 외부 값이 자격증명
+        시드의 원천 계정으로 채택됐다(그 값이 '누구의 .credentials.json 을 복사하는가'를 정하고
+        copy-if-absent 라 되돌릴 수 없다). 진입부 `unset` 뒤에는 종전 생략 갈래로 떨어져야 한다.
+        (mutation: `unset _CYS_ROTATE_ACCT` 를 지우면 여기서 red)"""
+        sock, acct_b, catalog = self._creds_fixture(corrupt=True)
+        polluted = os.path.join(self.home, ".cys", "claude-POLLUTED")
+        os.makedirs(polluted, exist_ok=True)
+        with open(os.path.join(polluted, ".credentials.json"), "w", encoding="utf-8") as f:
+            f.write('{"token":"POLLUTED"}')
+        self.env["_CYS_ROTATE_ACCT"] = "POLLUTED"          # ← 오염(export)
+        rc, out, err = self.run_dept("launch", "d1", "--rotate")
+        self._assert_shim_alive()
+
+        picked = [c for c in self._pycalls() if c.startswith("- %s " % catalog)]
+        self.assertFalse(any(c.endswith(" POLLUTED") for c in picked),
+                         "★외부 export 표식이 시드 원천으로 채택됐다: %r" % picked)
+        self.assertFalse(picked,
+                         "선포착 없는 판독 실패인데 시드 계정 해석이 일어났다(생략이어야 한다): %r" % picked)
+        self.assertNotIn("kill 이전에 확인한 등재 account", err,
+                         "★하지도 않은 선포착을 했다고 보고했다(외부 값 채택)")
+        self.assertIn("자격증명 시드 생략", err, "시드 생략 고지 부재")
+        self.assertFalse(os.path.exists(os.path.join(acct_b, ".credentials.json")),
+                         "★오염 계정의 .credentials.json 이 부서 dir 에 심겼다")
+
+    def test_j6_marker_is_not_inherited_by_the_spawned_daemon(self):
+        """★J6 ⓑ — 선포착 대입이 **export 속성을 물려받지 않는다**(진입부가 `=""` 가 아니라
+        `unset` 인 이유). 외부가 export 해 둔 채 실 `rotate` 를 돌려도 자식 cysd env 에
+        `_CYS_ROTATE_ACCT` 가 없어야 한다 — 상속되는 노브는 그 부서에서 영구히 산다(P6 R1 의 교훈).
+        (mutation: `unset` 을 지우면 외부 export 가 재대입 뒤에도 남아 자식에게 전달돼 red)"""
+        sock, acct_b, catalog = self._creds_fixture(corrupt=False, keep_sock=True)
+        dump = os.path.join(self.tmp, "cysd-env.txt")
+        _write_exec(os.path.join(self.home, ".local", "bin", "cysd"),
+                    '#!/bin/sh\nenv > "%s"\n'
+                    'mkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n' % dump)
+        self._arm_victim(self.CORRUPT)
+        self.env["_CYS_ROTATE_ACCT"] = "POLLUTED"          # ← 오염(export)
+        rc, out, err = self.run_dept("rotate", "d1")
+
+        self.assertTrue(os.path.exists(dump),
+                        "픽스처 전제 붕괴: 자식 cysd 가 스폰되지 않아 env 를 못 봤다\nrc=%d\n%s" % (rc, err))
+        with open(dump, encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+        # 양성 대조 — env 덤프가 실제로 이 스폰의 것이다(이게 없으면 아래 '부재' 단언이 공허하다).
+        self.assertTrue(any(l.startswith("CYS_SOCKET=") for l in lines),
+                        "픽스처 결함: env 덤프에 스폰 env 가 없다")
+        self.assertFalse(any(l.startswith("_CYS_ROTATE_ACCT=") for l in lines),
+                         "★선포착 표식이 자식 cysd 에 상속됐다: %r"
+                         % [l for l in lines if l.startswith("_CYS_ROTATE_ACCT=")])
+
+    # ── M3: Windows 팩 시드 폴백의 CR ────────────────────────────────────────
+    def test_m3_pack_seeded_acct_strips_cr(self):
+        """★J5 M3 — Windows 네이티브 python 의 CRLF 가 `pack_seeded_acct` 폴백에만 남아
+        `acctdir='…\\r'` 가 됐다(`reg_get_field` 경로는 `tr -d '\\r'` 로 벗긴다).
+        (mutation: `| tr -d '\\r'` 를 지우면 여기서 red)"""
+        self._shim()
+        acct = os.path.join(self.tmp, "accounts", "packseed")
+        os.makedirs(acct, exist_ok=True)
+        pack = os.path.join(self.home, ".cys", "pack-dept-d1")
+        os.makedirs(pack, exist_ok=True)
+        with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
+            json.dump({"claude": {"env": {"CLAUDE_CONFIG_DIR": acct}}}, f)
+        # 계정 dir 유도는 데몬 스폰 이전이라 '재사용' 분기로 충분하다(ready 12s 부재 프로브 회피).
+        sock = seed_sock(self.home, "d1")
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": pack}})   # account_dir 없음 → 팩 폴백
+        self.env["PYSHIM_CRLF_AGENTS"] = "1"
+        self.env.pop("CYS_ACCOUNT_DIR", None)
+        rc, out, err = self.run_dept("launch", "d1")
+        self._assert_shim_alive()
+        self.assertEqual(rc, 0, "launch 실패(rc=%d)\n%s" % (rc, err))
+        m = re.search(r"acct=(\S*)", out)
+        self.assertIsNotNone(m, "확정 출력에 acct= 필드 부재\n%s" % out)
+        self.assertNotIn("\r", m.group(1), "★acctdir 에 CR 이 남았다: %r" % m.group(1))
+        self.assertEqual(m.group(1), acct, "acctdir 이 팩 시드값과 다르다: %r" % m.group(1))
+        self.assertFalse(os.path.exists(acct + "\r"), "★CR 달린 계정 dir 이 새로 만들어졌다")
+
+
 class PassthroughArm(Base):
     # 6) 실존(등재) 이름은 비정형이라도 통과 — 기존 부서 컨텍스트 실행 불차단(정리 동사형 규칙)
     def test_existing_nonconforming_passes(self):
