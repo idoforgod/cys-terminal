@@ -95,7 +95,7 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
     dj = depts_json or os.path.join(os.path.dirname(os.path.dirname(state_root)), ".cys", "depts.json")
     if os.path.isfile(dj):
         try:
-            reg = json.load(open(dj))
+            reg = json.load(open(dj, encoding="utf-8-sig"))
             for _name, meta in (reg.get("depts") or {}).items():
                 sock = (meta or {}).get("socket")
                 if sock:

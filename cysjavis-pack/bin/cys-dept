@@ -52,7 +52,7 @@ dept_sock(){
 # ★K2-07(2026-09-17 한글 사용자명 감사 · 2라운드 개정): unix 소켓 경로가 sun_path 상한(macOS/BSD 104B · Linux 108B ·
 #   NUL 포함 — Rust std `UnixListener::bind` 는 그 길이부터 "path must be shorter than SUN_LEN" 으로 거부)을 넘으면 cysd 가
 #   bind 에 실패하는데, 이 도구에는 "데몬 기동 실패"(exit 1)로만 보여 원인이 숨는다. 부서명 40자 상한(validate_dept_name)은
-#   ASCII 홈(/Users/cys) 가정이라 한글 홈은 NFD 등재 시 음절당 9B — `홍길동`(NFD)+40자 = 106B(감사 §5-(c) 실측).
+#   ASCII 홈(/Users/<user>) 가정이라 한글 홈은 NFD 등재 시 음절당 9B — `홍길동`(NFD)+40자 = 106B(감사 §5-(c) 실측).
 #   ★판정 주체는 bind 하는 cysd 자신이다 — 이 도구는 스폰 **전에 거부하지 않고**, ready() 실패 시 **사유만** 덧붙인다.
 #     1라운드의 스폰 전 exit 2 가드(assert_sock_len)는 목 cysd(bind 없이 소켓 파일만 touch)로 도는 기존 CI 하네스
 #     (bin/tests/test_dept_name_guard.py · 격리 HOME=tempfile.mkdtemp → macOS TMPDIR /var/folders/…/T/ 50B 라 1글자
@@ -64,7 +64,7 @@ sock_len_diag(){
   local sock="$1" n lim
   case "$sock" in \\*) return 0 ;; esac
   case "$(uname -s 2>/dev/null)" in Linux) lim=108 ;; *) lim=104 ;; esac
-  n=$(printf %s "$sock" | wc -c); n=$((n))
+  n=$(printf %s "$sock" | wc -c) || return 0; n=$((n))
   [ "$n" -lt "$lim" ] && return 0
   echo "[cys-dept] 원인 후보: 소켓 경로 ${n}B ≥ ${lim}B(unix sun_path 상한 · NUL 포함) — cysd 가 bind 하지 못한다. 홈 경로 또는 부서명을 줄여라: $sock" >&2
   return 0
@@ -236,13 +236,62 @@ graceful_kill(){
   esac
 }
 
+# create/allocate 실패 회수: 이번 호출의 $!만 소유한다. ready() 재사용은 PID가 비어 있어 무접촉.
+# rc 10에서는 down을 부르지 않는다(손상 레지스트리 재판독·묘비·CEO 변경 금지).
+# 성공 전까지 disown하지 않아 wait로 자식을 회수한다. Windows의 $!는 MSYS PID이므로
+# taskkill에는 ps의 WINPID를 넘긴다(identify가 가리키는 기존 데몬 PID를 채택하지 않는다).
+# 소켓/lock은 다른 스폰 경쟁 승자의 것일 수 있어 삭제하지 않는다.
+# 죽은 자식이 남긴 stale 소켓 처리는 cysd의 startup-lock 아래에 맡긴다.
+cleanup_owned_dept_spawn(){
+  local child="${_dept_spawn_pid:-}" native i
+  [ -n "$child" ] || return 0
+  if kill -0 "$child" 2>/dev/null; then
+    case "$(uname -s 2>/dev/null)" in
+      MINGW*|MSYS*|CYGWIN*)
+        native="$(ps -p "$child" 2>/dev/null | awk -v pid="$child" '
+          NR==1 { for(i=1;i<=NF;i++) { if($i=="PID") p=i; if($i=="WINPID") w=i }; next }
+          p && w && $p==pid { print $w; exit }')" || native=""
+        case "$native" in
+          ""|0|1|*[!0-9]*)
+            echo "[cys-dept] WARN: 신규 데몬 회수 실패(MSYS PID=$child · WINPID 미확인) — 해당 자식의 종료를 확인하라" >&2
+            return 0 ;;
+        esac
+        graceful_kill "$native" ;;
+      *) graceful_kill "$child" ;;
+    esac
+  fi
+  # taskkill 실패/종료 지연을 무제한 wait로 숨기지 않는다. 사망 미확인 시 소켓도 보존한다.
+  for i in 1 2 3 4 5 6; do kill -0 "$child" 2>/dev/null || break; sleep 0.3; done
+  if kill -0 "$child" 2>/dev/null; then
+    echo "[cys-dept] WARN: 신규 데몬 종료 미확인(PID=$child) — 소켓 보존·해당 자식의 종료를 확인하라" >&2
+    return 0
+  fi
+  wait "$child" 2>/dev/null || true
+  _dept_spawn_pid=""
+}
+
+# reserve=신규 예약만 회수, keep=기존 REUSE_DEAD 예약 보존, down=기동 후 종전 teardown.
+# 정리 자체가 rc 10을 만나도 owned PID는 회수하고 원본 레지스트리는 그대로 둔다.
+dept_creation_failed(){
+  local rc="$1" name="$2" mode="$3" cleanup_rc=0
+  if [ "$rc" = 10 ]; then cleanup_owned_dept_spawn; exit 10; fi
+  case "$mode" in
+    reserve) reg_remove "$name" || cleanup_rc=$? ;;
+    down) "$0" down "$name" >/dev/null || cleanup_rc=$? ;;
+  esac
+  if [ "$cleanup_rc" = 10 ]; then cleanup_owned_dept_spawn; exit 10; fi
+  # ready 실패 등 스폰 직후의 실패도 예약 회수만으로 프로세스를 남기지 않는다.
+  if [ "$mode" != down ]; then cleanup_owned_dept_spawn; fi
+  exit "$rc"
+}
+
 # ── ★D3(i) 부서명 검증 (v4 수리 스펙 — `launch --help` 유령부서→껍데기 CEO 승격 실사고 봉합) ──
 # 화이트리스트 ^[A-Za-z0-9][A-Za-z0-9_-]*$ — '.' 불허(Windows pipe_slug(state.rs:1133-1139)가 '.'을
 # 소거해 점만 다른 두 부서의 상태 디렉토리가 병합되는 격리 붕괴 봉합)·'-' 선두 불허(옵션 오파싱)·
 # 최대 40자(macOS unix 소켓 104B 한계 여유 — ★ASCII 홈 기준. 한글(NFD) 홈에선 40자 안에서도 초과할 수 있고 그때는
 #   cysd 의 bind 가 거부한다 → sock_len_diag 가 "데몬 기동 실패" 에 사유를 덧붙인다 · K2-07)·LC_ALL=C(로케일 무관 결정론).
-# 거부 exit=2(기존 usage 계열과 통일) 고정 — ★재사용 금지 집합={1,3,4,5,6,7,8,9}
-# (1=기동실패·3/4=카탈로그·5=계정·6=시드·7=단일소유·8=cap/미등재·9=rotate 미응답 — GUI 분기 오동작 방지).
+# 거부 exit=2(기존 usage 계열과 통일) 고정 — ★재사용 금지 집합={1,3,4,5,6,7,8,9,10}
+# (1=기동실패·3/4=카탈로그·5=계정·6=시드·7=단일소유·8=cap/미등재·9=rotate 미응답·10=레지스트리 판독 실패(원본 보존) — GUI 분기 오동작 방지).
 # ★중대(2026-08-22 검증리뷰): 종전 `printf | grep -Eq` 는 **줄 단위** 판정이라 여러 줄 중 한 줄만
 #   맞아도 성립했다 — `$'abc\nrm -rf /'`·`$'\nabc'`·`$'abc\n'`·`$'x\nAAAA'` 가 전부 통과했다.
 #   반면 발급기 `javis_bootstrap.py` 는 `DEPT_NAME_RE.fullmatch()` 로 **문자열 전체**를 요구한다 →
@@ -275,8 +324,10 @@ validate_dept_name(){
 # allocate 예약 사후 assert 공통(+launch는 부작용-이전 조기 호출). 기존 충돌 쌍 가시화는 preflight 소관.
 dept_name_fold(){ printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | tr -d '.'; }
 reject_slug_collision(){
-  local name="$1" fold ex
+  local name="$1" fold ex names
   fold="$(dept_name_fold "$name")"
+  # ★P1(2026-09-17 부트체인 감사): heredoc 안의 $(...) 실패는 while 이 삼킨다 — 먼저 받아 exit 10 전파.
+  names="$(reg_names)" || exit $?
   # 파이프 대신 heredoc(reap 관용) — 파이프 서브셸이면 exit 2가 스크립트를 못 끝낸다.
   while IFS= read -r ex; do
     [ -n "$ex" ] || continue
@@ -286,7 +337,7 @@ reject_slug_collision(){
       exit 2
     fi
   done <<EOF
-$(reg_names)
+$names
 EOF
 }
 # cmd 위치 --help/-h 전용 usage(stdout) — name 위치의 --help는 usage가 아니라 검증 거부(exit 2)다.
@@ -304,20 +355,37 @@ usage: cys-dept <verb> ...
   cys-dept promote-if-pending [--request-only]  보류 승격 해소(알림만=--request-only)
   cys-dept list                                 부서명 목록
   cys-dept sock <name>                          부서 소켓 경로 출력
-  cys-dept cwd <name>                           부서 좌석 등재 cwd 출력(절대·물리 · 읽기 전용 · 미등재 exit 3 · 등재 cwd 없음/사용 불가 exit 4 — $HOME 을 확정값으로 내지 않는다)
+  cys-dept cwd <name>                           부서 좌석 등재 cwd 출력(절대·물리 · 읽기 전용 · 미등재/판독 실패 exit 3 유지 · 등재 cwd 없음/사용 불가 exit 4 — $HOME 을 확정값으로 내지 않는다)
   cys-dept <name> -- <cmd>                      부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
+
+exit 코드: 0=성공, 1=기동 실패, 2=인자/부서명, 3/4=카탈로그·cwd 조회, 5=계정, 6=시드,
+           7=단일소유 거부, 8=cap/미등재, 9=rotate 미응답,
+           10=쓰기 동사의 depts.json 판독 실패 · 원본 보존(cwd는 3 유지; list는 조회 실패 10).
+  down의 10은 레지스트리 판독 실패로 종료 완료 미확인 — 이미 종료됐을 수 있음(kill·소켓 정리·묘비가 선행됐을 수 있다) · 레지스트리 복구 후 down 재시도.
+  rotate kill~launch 창의 10은 데몬 사망·등재 유지 — 레지스트리 복구 후 launch로 재시작.
+  passthrough는 수리 명령을 허용하며 자식 exit를 그대로 반환한다(자식의 10은 stderr로 출처를 구분).
+  depts.json 부재는 정상 빈 등재이며 읽기 전용 조회는 파일을 만들지 않는다.
 USAGE
 }
 
-# ★K2-03(2026-09-17 한글 사용자명 감사 · 2라운드 범위 일치): 레지스트리(depts.json) 판독 **전 지점** 을 `encoding="utf-8-sig"`
-#   로 — 선두 UTF-8 BOM(한국어 Windows 편집기 "UTF-8(BOM)" 저장)을 받아들인다. 종전 `json.load(open(p))` 는 PYTHONUTF8=1 의
-#   엄격 UTF-8 에서 BOM 이 JSONDecodeError 라, RMW 지점(reg_upsert/reg_remove/reg_set_meta/reg_set_field/allocate·create 예약)의
-#   `except Exception: d={'depts':{}}` 가 **빈 레지스트리를 만든 뒤 os.replace 로 덮어써** 기존 등재 전부가 사라졌다 — GUI 의
-#   Rust list_depts(src-tauri/src/main.rs strip_utf8_bom)는 같은 파일을 정상으로 읽어 "팝업엔 보이는데 다음 cys-dept 쓰기에서
-#   사라지는" 비대칭이었다. 기계 기록(json.dump)은 BOM 을 쓰지 않으므로 정상 파일엔 동일 동작 · cp949 는 여전히 거부.
-#   회귀 핀: bin/tests/test_dept_name_guard.py RegistryBom(census + BOM 레지스트리 보존 동작).
-reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
-reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.argv[1],encoding='utf-8-sig'))['depts']))" "$REG" | tr -d '\r'; }
+# ★K2-03/P1(2026-09-17 한글 사용자명·부트체인 감사): depts.json 판독은 전 지점 utf-8-sig(BOM 허용).
+#   부재(FileNotFoundError)만 빈 등재다. cp949·UTF-16·손상 JSON·I/O 오류는 stderr 1줄 + exit 10 으로
+#   쓰기 전에 중단한다 — 빈 등재 폴백은 다음 os.replace 에서 타 부서 display_name/account/mission_key/cwd 를 잃는다.
+#   내부 읽기 헬퍼도 10을 반환한다: reg_count 실패를 0개로 접으면 down/down-sock 가 CEO 를 거짓 강등한다.
+#   동사 계약은 호출부에서 구분한다 — cwd는 판독 실패 3, passthrough 수리는 fail-open.
+#   reg_init 은 부모만 준비한다. 빈 파일 선기록은 첫 생성자끼리의 RMW 락 밖 덮어쓰기 경합을 만든다.
+#   회귀 핀: bin/tests/test_dept_name_guard.py RegistryBom(오염 파일 바이트 보존·BOM RMW·전 판독 census).
+reg_init(){ mkdir -p "$(dirname "$REG")"; }
+reg_count(){ python3 - "$REG" <<'PY' | tr -d '\r'
+import json,sys
+p=sys.argv[1]
+try: d=json.load(open(p, encoding="utf-8-sig"))
+except FileNotFoundError: d={'depts':{}}
+except Exception as e:
+    sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
+print(len(d.get('depts',{})))
+PY
+}
 # ★CRLF 위생(2026-08-16 win T3-ng3 실증): Windows 임베디드 python 의 stdout 은 텍스트 모드라
 #   줄끝이 \r\n 이다. $(...) 캡처는 MSYS bash 가 \r 을 벗겨 안전(allocate 상시 green 이 실증)하나
 #   파이프 소비자(`reg_names | grep -Fxq -- name` — rotate 등재 게이트 L:rotate·TOCTOU 재확인)는
@@ -326,7 +394,16 @@ reg_count(){ reg_init; python3 -c "import json,sys;print(len(json.load(open(sys.
 #   실행 인자의 POSIX 경로만 Windows 경로로 자동 변환한다 — -c 코드 안의 '/c/Users/…' 는 미변환이라
 #   Windows python 이 FileNotFoundError 로 죽고, 파이프 소비자(rotate 등재 게이트)·reg_count 캡처
 #   ("부서 수" 산정·down 의 강등 판정)가 전부 빈 값이 됐다(win 잠복 결함).
-reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(open(sys.argv[1],encoding='utf-8-sig'))['depts']]" "$REG" | tr -d '\r'; }
+reg_names(){ python3 - "$REG" <<'PY' | tr -d '\r'
+import json,sys
+p=sys.argv[1]
+try: d=json.load(open(p, encoding="utf-8-sig"))
+except FileNotFoundError: d={'depts':{}}
+except Exception as e:
+    sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
+for n in d.get('depts',{}): print(n)
+PY
+}
 
 # ★A2(SURVEY B3): 등재(SOT=depts.json)에 없는데 **소켓 디렉터리만** 남은 부서를 stderr 로 고지한다.
 #   정상 teardown 은 상태 디렉터리를 TRASH_ROOT 로 격리하므로 이 형상은 **비정상 종료 잔재**다.
@@ -334,7 +411,7 @@ reg_names(){ reg_init; python3 -c "import json,sys;[print(k) for k in json.load(
 #   ★stdout 은 건드리지 않는다: 심박·fan-out 소비자(`for d in $(cys-dept list)`)의 계약이
 #   stdout 이라, 경고를 거기 섞으면 유령 이름이 부서명으로 소비된다. 경고는 stderr 전용이다.
 #   Windows named pipe(`\\.\pipe\cys-dept-<n>`)는 파일이 아니라 glob 대상이 아니므로 unix 한정
-#   (dept_sock:47 의 분기 관례 재사용 — Windows 거동 무변경).
+#   (dept_sock 의 분기 관례 재사용 — Windows 거동 무변경).
 dept_warn_unregistered_socks(){
   case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*) return 0 ;;
@@ -352,7 +429,7 @@ dept_warn_unregistered_socks(){
 }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
-reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY' || return $?
 import json,sys,os
 try:
     import fcntl
@@ -368,18 +445,20 @@ p,n,s,k=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     # F2(codex#2): full-replace 대신 merge — 기존 메타(display_name/account/mission_key) 보존.
     # launch 재진입 시 create가 심은 메타 소실 방지. 신규 엔트리는 3필드만(하위호환).
     e=d.setdefault('depts',{}).setdefault(n,{})
     e.update({'socket':s,'pack_dir':k,'role':'dept-master'})
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
 finally: _ulk(lf)
 PY
 }
-reg_remove(){ reg_init; python3 - "$REG" "$1" <<'PY'
+reg_remove(){ reg_init; python3 - "$REG" "$1" <<'PY' || return $?
 import json,sys,os
 try:
     import fcntl
@@ -395,17 +474,19 @@ p,n=sys.argv[1:3]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     d.setdefault('depts',{}).pop(n,None)
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
 finally: _ulk(lf)
 PY
 }
 # reg_set_meta: 기존 엔트리에 display_name·account·mission_key 를 merge(socket/pack_dir/role 보존).
 # reg_upsert 시그니처 불변(launch 회귀0) — ＋부서 자동화(cys-dept create)용 신설. flock RMW·원자교체.
-reg_set_meta(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+reg_set_meta(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY' || return $?
 import json,sys,os
 try:
     import fcntl
@@ -421,13 +502,15 @@ p,n,disp,acct=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     e=d.setdefault('depts',{}).get(n)
     if e is None:   # ★fail-closed(CSO GAP①): create가 base 엔트리 선기록 → 부재=버그 → no-op 말고 에러
         sys.stderr.write("reg_set_meta: 엔트리 부재 %s — fail-closed(예약 base 미기록=버그)\n"%n); sys.exit(1)
     e['display_name']=disp; e['account']=acct   # mission_key는 예약시 원자기록(중복 set 제거)
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
 finally: _ulk(lf)
 PY
@@ -610,19 +693,23 @@ PY
 #   ③부서 팩 agents.json 의 현재 CLAUDE_CONFIG_DIR. 유도값이 없으면 계정격리를 쓰지 않는 부서
 #   (구 launch 산출)이므로 **무동작**(회귀 0).
 # ★WP-2 R2(리뷰): `| tr -d '\r'` 를 정의 1지점에 — Windows 네이티브 python 은 \r\n 을 찍어 호출부의 `[ -d "$c" ]`·
-#   `[ -n ]` 비교가 조용히 어긋난다(reg_count/reg_names 는 이미 벗긴다 · 호출부 3곳 :631/:777/:1195 전부 이 한 곳으로 해결).
-reg_get_field(){ reg_init; python3 - "$REG" "$1" "$2" <<'PY' | tr -d '\r'
+#   `[ -n ]` 비교가 조용히 어긋난다(reg_count/reg_names 는 이미 벗긴다 · resolve_lane_acctdir/resolve_dept_cwd/launch_dept 전부 이 한 곳으로 해결).
+reg_get_field(){ python3 - "$REG" "$1" "$2" <<'PY' | tr -d '\r'
 import json,sys
 p,n,f=sys.argv[1:4]
 try: d=json.load(open(p, encoding="utf-8-sig"))
-except Exception: sys.exit(0)
+except FileNotFoundError: d={'depts':{}}
+except Exception as e:
+    sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
 e=(d.get('depts') or {}).get(n) or {}
 print(e.get(f) or '')
 PY
 }
 
 # 레지스트리 필드 1개 기록(flock RMW·원자 교체 — reg_set_meta 와 동일 규약, 임의 필드용).
-reg_set_field(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+# cwd 등재의 종전 WARN/fail-open 호출부에서도 판독 실패만은 쓰기 동사 전체를 중단한다.
+# Python 실패를 조건식으로 소비해도 exit 10은 삼킬 수 없게 이 RMW 경계에서 확정한다.
+reg_set_field(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY' || { _rc=$?; [ "$_rc" != 10 ] || exit 10; return "$_rc"; }
 import json,sys,os
 try:
     import fcntl
@@ -638,11 +725,13 @@ p,n,k,v=sys.argv[1:5]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     e=d.setdefault('depts',{}).setdefault(n,{})
     e[k]=v
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
 finally: _ulk(lf)
 PY
@@ -664,9 +753,10 @@ PY
 
 # 이 부서의 계정 dir 유도(위 3순위). 빈 출력 = 계정격리 미사용 부서.
 resolve_lane_acctdir(){
-  local name="$1" pack="$2" v
+  local name="$1" pack="$2" mode="${3:-}" v rc
   if [ -n "${CYS_ACCOUNT_DIR:-}" ]; then echo "$CYS_ACCOUNT_DIR"; return 0; fi
-  v="$(reg_get_field "$name" account_dir 2>/dev/null | tail -1)"
+  # passthrough 수리에서는 판독 불가여도 기존 agents.json 시드로 계정 문맥을 복원한다.
+  v="$(reg_get_field "$name" account_dir | tail -1)" || { rc=$?; [ "$mode" = --repair-read ] || return "$rc"; v=""; }
   [ -n "$v" ] && { echo "$v"; return 0; }
   v="$(pack_seeded_acct "$pack" 2>/dev/null | tail -1)"
   [ -n "$v" ] && { echo "$v"; return 0; }
@@ -707,7 +797,7 @@ import json,sys,os
 cat,acct=sys.argv[1:3]
 # ★K2-03(2026-09-17 한글 사용자명 감사): utf-8-sig — 한국어 Windows 편집기("UTF-8(BOM)")로 저장한 카탈로그의 선두
 #   U+FEFF 를 받아들인다. PYTHONUTF8=1 의 엄격 UTF-8 에서 BOM 은 JSONDecodeError 라 여기서는 카탈로그 accounts 맵을
-#   **조용히 무시**하고 아래 규약 폴백($HOME/.cys/claude-<acct>)으로 빠졌고(계정 base 오지정), create(:1620 동형)는
+#   **조용히 무시**하고 아래 규약 폴백($HOME/.cys/claude-<acct>)으로 빠졌고(계정 base 오지정), create 의 카탈로그 판독(동형)는
 #   exit 4('카탈로그 키 미정의/손상')로 위장됐다(감사 §5-(e) 재현). BOM 없는 파일엔 동일 동작 · cp949 는 여전히 거부.
 try: d=json.load(open(cat, encoding="utf-8-sig"))
 except Exception: sys.exit(1)
@@ -842,7 +932,10 @@ resolve_dept_cwd(){
     if [ "$src" = explicit ]; then
       [ "$mode" = "--registered-only" ] && continue
       c="$explicit"
-    else c="$( { [ -n "$name" ] && reg_get_field "$name" cwd 2>/dev/null | tail -1; } || true )"; fi
+    else
+      c=""
+      if [ -n "$name" ]; then c="$(reg_get_field "$name" cwd | tail -1)" || return $?; fi
+    fi
     [ -n "$c" ] || continue
     case "$c" in "~") c="$HOME" ;; "~/"*) c="$HOME/${c#\~/}" ;; esac
     _dept_cwd_is_root "$c" && c="$HOME"
@@ -880,7 +973,7 @@ PY
 # ★[6] pipefail+EPIPE 하드닝: dept_live_roles|grep -qx는 grep 조기종료 시 상류 python이 SIGPIPE→비0→
 #   pipefail이 매치(0)를 비0(미발견)로 오판할 수 있다. 출력을 변수로 받아 here-string grep(파이프 제거).
 dept_has_master(){
-  local roles; roles="$(dept_live_roles "$1")" || true
+  local roles; roles="$(dept_live_roles "$1" | tr -d '\r')" || true
   grep -qx "master" <<<"$roles"
 }
 
@@ -1233,26 +1326,19 @@ case "$cmd" in --help|-h) usage; exit 0 ;; esac
 #   그 부서에서 아래 `cysd_role_gate` 와 `dept_tombstone_remove` 를 **영구히 껐다**(라이브 실측).
 #   정본 §3-4 "게이트를 끄는 노브 없음" 위반이므로 상속되지 않는 표식으로 갈아탄다.
 #   ★추가 조임: 표식은 `launch` 에서만·**부서 소켓이 없을 때만** 인정한다. 진짜 rotate 는
-#   직전에 소켓을 `rm -f` 한 상태(:1740 부근)라 항상 참이고, 살아 있는 부서를 상대로 표식을
+#   직전에 rotate 가 소켓을 `rm -f` 한 상태라 항상 참이고, 살아 있는 부서를 상대로 표식을
 #   흉내내도 면제가 서지 않는다. (Windows 는 named pipe 라 `-e` 가 늘 거짓 → 면제 유지.)
 #   ★R2 조임(minor · reviewer-claude): 종전 조건(`launch` + `--rotate` + 소켓 부재)은 **아직 없는
 #   부서명 전부**에 대해 누구에게나 성립했다 — stale `CYS_ROLE=cso` 로도 데몬 절을 건너뛰고
 #   등재·데몬 스폰·CEO 승격까지 갈 수 있었다(면제가 '비파괴'라던 종전 노트 표현은 과했다).
-#   진짜 rotate 는 kill 이전에 **등재 여부를 먼저 확인**하므로(:1737 `reg_names | grep -Fxq`),
-#   면제도 그 사실을 같이 요구한다: 미등재 이름에는 면제가 서지 않는다(신규 생성 경로 봉쇄).
-#   레지스트리가 아직 없으면(첫 기동) 면제도 없다 — `[ -f "$REG" ]` 가 reg_init 의 파일 생성
-#   부작용까지 막는다(읽기만 한다).
-#   ★단, **판독 불가는 미등재가 아니다**(codex R2): 재귀 launch 에서 레지스트리 판독이 일시적으로
-#   실패했다고 kill 뒤의 재기동을 새로 거절하면, 이 파일이 :1739 에서 일부러 피하는 '데몬은 죽고
-#   등재만 남는' 반파괴가 된다. 그때는 종전 조건(소켓 부재)만으로 면제를 유지한다.
+#   진짜 rotate 는 kill 이전에 등재 여부를 먼저 확인하므로(rotate 갈래), 면제도 같은 사실을 요구한다.
+#   레지스트리가 아직 없으면(첫 기동) 면제도 없다.
+#   ★P1(2026-09-17 부트체인 감사): 판독 불가는 면제 근거도 아니다 — 사유 1줄·exit 10 으로 접는다.
 _CYS_ROTATE_SELF=0
 if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ] && [ -n "${2:-}" ]; then
   if [ ! -e "$(dept_sock "${2:-}")" ] && [ -f "$REG" ]; then
-    if _cys_rot_names="$(reg_names 2>/dev/null)"; then
-      if printf '%s\n' "$_cys_rot_names" | grep -Fxq -- "${2:-}"; then _CYS_ROTATE_SELF=1; fi
-    else
-      _CYS_ROTATE_SELF=1
-    fi
+    _cys_rot_names="$(reg_names)" || exit $?
+    if grep -Fxq -- "${2:-}" <<<"$_cys_rot_names"; then _CYS_ROTATE_SELF=1; fi
   fi
 fi
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
@@ -1340,7 +1426,7 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
     # ★수렴 R2(blocking · reviewer-codex): 면제 갈래에서도 **데몬이 방금 cso 라고 답하면 그 답이
     #   env 를 이긴다**. 종전에는 env 절만 남겨서, 승계로 정당하게 CSO 가 된 stale-env 좌석의
     #   `rotate` 가 **부모 통과(데몬 절) → 데몬 kill → 자식 거부(env 절)** 라는 반파괴를 100%
-    #   재현했다(부서는 정지·등재만 남는다 — 이 파일이 :1739 에서 일부러 피하는 그 상태다).
+    #   재현했다(부서는 정지·등재만 남는다 — rotate 갈래의 kill 뒤 launch에서 일부러 피하는 그 상태다).
     #   방향은 **허용 추가뿐**이다: 데몬이 비-cso 를 말하거나 답하지 못하면 종전 env 절이 그대로
     #   선다. 여기에 새 거부를 넣지 않는 이유도 같다 — kill 이 끝난 자리의 새 거부가 곧 반파괴다.
     #   (부모가 통과한 근거와 같은 데몬·같은 소켓을 묻는다. 부모 통과 후 데몬이 죽는 창은 남는
@@ -1409,21 +1495,22 @@ launch_dept(){   # $1=name
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
-    reg_upsert "$name" "$sock" "$pack"
+    reg_upsert "$name" "$sock" "$pack" || exit $?
     # ★G3(W3): 계정격리 복원 — rotate 가 이 경로를 재귀 호출하므로, 여기서 계정 dir 을 유도하지
     #   않으면 **재기동 한 번으로 격리가 조용히 풀린다**(데몬 env 소실 → 자식 claude 가 오너 base
     #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
-    acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)"
-    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")"   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
+    acctdir="$(resolve_lane_acctdir "$name" "$pack" | tail -1)" || exit $?
+    dept_cwd="$(resolve_dept_cwd "${CYS_DEPT_CWD:-}" "$name")" || exit $?   # ★WP-2 R1: 시드·편성 공통 cwd(명시 → 등재 → $HOME)
     # ★성찰 P4 ⓐ: launch 는 종전에 cwd 를 **해소만 하고 기록하지 않았다** — `CYS_DEPT_CWD=/proj cys-dept launch d` 뒤의 다음
     #   launch/rotate(부트 체인·GUI 재기동)는 등재값이 없어 $HOME 으로 조용히 이주했고 `cys-dept cwd` 도 그 거짓값을 내줬다.
     #   확정값을 등재한다 — 단 ① 명시값이 **채택**됐을 때(확정값 = 명시값의 물리 경로) 또는 ② 등재값이 아예 없을 때만.
     #   등재값이 있는데 못 써서 $HOME 으로 폴백한 경우는 덮지 않는다(오설정을 영구화하지 않는다 · WARN 은 resolve_dept_cwd 가 낸다).
     _lc_expl="${CYS_DEPT_CWD:-}"
     case "$_lc_expl" in "~") _lc_expl="$HOME" ;; "~/"*) _lc_expl="$HOME/${_lc_expl#\~/}" ;; esac
+    _lc_registered="$(reg_get_field "$name" cwd | tail -1)" || exit $?
     if { [ -n "$_lc_expl" ] && [ "$dept_cwd" = "$(_dept_cwd_canon "$_lc_expl")" ]; } \
-       || [ -z "$(reg_get_field "$name" cwd 2>/dev/null | tail -1)" ]; then
-      reg_set_field "$name" cwd "$dept_cwd" || echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2
+       || [ -z "$_lc_registered" ]; then
+      reg_set_field "$name" cwd "$dept_cwd" || { _rc=$?; [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2; }
     fi
     if [ -n "$acctdir" ]; then
       mkdir -p "$acctdir" 2>/dev/null || true
@@ -1434,7 +1521,7 @@ launch_dept(){   # $1=name
       #   계정의 base — 다계정 경계 보존(~/.claude 하드코딩 금지). rotate 재귀에서도 대상 기존재
       #   무동작(③)이 갱신 토큰을 지킨다.
       if [ "${CYS_DEPT_SEED_CREDS:-0}" = "1" ]; then
-        _credacct="$(reg_get_field "$name" account 2>/dev/null | tail -1)"
+        _credacct="$(reg_get_field "$name" account | tail -1)" || exit $?
         [ -n "$_credacct" ] || _credacct="${CYS_DEPT_DEFAULT_ACCOUNT:-default}"
         _credbase="$(resolve_default_base "$_credacct" 2>/dev/null)" || _credbase=""
         seed_credentials_win "$_credbase" "$acctdir"
@@ -1461,7 +1548,7 @@ launch_dept(){   # $1=name
       fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
-      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      ready "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).
@@ -1479,7 +1566,8 @@ launch_dept(){   # $1=name
     dept_issue_ceo_ticket "$name" "$_spawned"
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
     formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
-    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none} cwd=$dept_cwd). 부서 수=$(reg_count)"
+    _dept_count="$(reg_count)" || exit $?
+    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none} cwd=$dept_cwd). 부서 수=$_dept_count"
 }
 
 case "$cmd" in
@@ -1505,7 +1593,9 @@ p=sys.argv[1]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     depts=d.setdefault('depts',{})
     home=os.path.expanduser('~')
     # ★[2] hard cap(reserve flock 안 — 동시성·원자성 유지): 죽은(미reap) 등록은 빼고 ★살아있는 데몬만 카운트.
@@ -1531,14 +1621,15 @@ try:
     depts[name]={'socket':_dept_sk(N),  # RC-6: OS별 소켓 규약(Windows named pipe·unix .sock)
                  'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master'}
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
     print(name)
 finally: _ulk(lf)
 PY
 ) || exit $?   # ★cap 거부(exit 8)·예약 실패 코드 그대로 전파
     [ -n "$name" ] || { echo "[cys-dept] allocate: 번호 발급 실패" >&2; exit 1; }
-    trap 'reg_remove "$name" 2>/dev/null || true' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
+    _dept_spawn_pid=""
+    trap 'dept_creation_failed "$?" "$name" reserve' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
     # ★D3(i) 사후 assert: allocate name은 기계 생성(dept-N)이라 항상 정형이 정상 — 불변식 위반·
     #   slug 충돌(레거시 'DEPT-N' 등재 등)은 여기서 거부(exit 2·위 trap이 예약 회수). A2 공통 헬퍼.
     validate_dept_name "$name" "allocate"
@@ -1563,7 +1654,7 @@ PY
     # ★G3(W3): account_dir 을 레지스트리에 **기록**한다 — rotate/launch 가 계정격리를 복원할 때
     #   읽는 SOT 다(create 는 예약 시점에 이미 기록한다). 종전엔 allocate 산출 부서에 이 값이 없어
     #   유도 3순위(agents.json 잔존 시드)만이 유일한 흔적이었다.
-    reg_set_field "$name" account_dir "$acctdir" || true
+    reg_set_field "$name" account_dir "$acctdir" || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }
     # ★WP-2 R4(리뷰 minor · create 와 비대칭 교정): 확정 cwd 도 등재한다 — 이후 `cys-dept launch dept-N`(CYS_DEPT_CWD
     #   없음)·rotate 가 resolve_dept_cwd 의 ②등재 cwd 로 **같은 좌석 폴더**를 복원한다(종전엔 등재값이 없어 $HOME 으로
     #   이주 = 시드 쌍과 기동 쌍이 호출 간에 갈렸다 · 신뢰는 양쪽 다 시드돼 관문은 안 열리지만 좌석이 다른 폴더에 뜬다).
@@ -1577,19 +1668,21 @@ PY
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
-      disown
-      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      _dept_spawn_pid=$!
+      ready "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
-    # ★데몬 up 확정 후 실패 trap을 풀teardown(kill+소켓+reg)으로 업그레이드 — 이후 단계 set -e 종료 시 orphan 0.
-    trap '"$0" down "$name" >/dev/null 2>&1 || true' EXIT
+    # 데몬 up 이후 일반 실패는 teardown, 판독 실패 10은 이번 호출의 자식만 회수한다.
+    trap 'dept_creation_failed "$?" "$name" down' EXIT
     seed_schedule "$pack"
-    ceo_promote 1>&2   # ceo_promote의 승격 메시지를 stderr로 — allocate stdout은 name만(파서 오염 차단)
     # ★Fix1' 계정격리: agents.json CLAUDE_CONFIG_DIR 을 fork dir로 치환(F1). 실패=비격리 → fail-closed teardown.
     if ! seed_agents_account "$pack" "$acctdir"; then
       echo "[cys-dept] ERROR: $name agents.json 계정시드 실패 — fail-closed: 부트 중단·teardown" >&2
-      "$0" down "$name" >/dev/null 2>&1 || true; trap - EXIT; exit 6
+      "$0" down "$name" >/dev/null || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }; trap - EXIT; exit 6
     fi
+    # 시드 실패 뒤 down의 판독도 실패할 수 있다. 준비가 끝난 뒤 승격해 rc 10에 CEO 변경을 남기지 않는다.
+    ceo_promote 1>&2   # 승격 메시지는 stderr — allocate stdout은 name만(파서 오염 차단)
     trap - EXIT   # 격리 확정 — 회수 취소
+    if [ -n "$_dept_spawn_pid" ]; then disown "$_dept_spawn_pid" 2>/dev/null || true; fi
     # ★결함#1: CEO 승격·계정격리 확정 이후 티켓 자동 발급(fail-open). 빈 셸 생성 **이전**에 둔다 —
     #   오너가 그 셸에서 즉시 claude 를 띄워 선언해도 티켓이 이미 있어야 팀이 기동된다.
     #   trap 해제 이후 지점이라 발급 실패가 teardown 을 유발할 여지도 없다(fail-open 이중 보증).
@@ -1628,7 +1721,7 @@ PY
     [ -f "$CAT" ] || { echo "[cys-dept] 카탈로그 부재: $CAT (GUI=레거시 allocate fallback)" >&2; exit 3; }  # fail-closed
     # 카탈로그 조회 + account dir 해석($HOME 전개). 파싱실패/키부재=fail-closed.
     # ★CRLF 위생(2026-09-17 K3 2라운드 검증 적발): `read < <(python3 …)` 는 **파이프 소비자**라 $(...) 와 달리 MSYS 가 \r 을
-    #   벗겨 주지 않는다(:307-310 규칙 · reg_get_field:600 과 동형). 마지막 필드 cwd 에 \r 이 남으면 resolve_dept_cwd 의
+    #   벗겨 주지 않는다(reg_count/reg_names 의 CRLF 규칙 · reg_get_field 와 동형). 마지막 필드 cwd 에 \r 이 남으면 resolve_dept_cwd 의
     #   `[ -d "$c" ]` 가 거짓 → WARN 후 $HOME 폴백(좌석·신뢰 시드·편성이 홈에서 뜨고 등재 cwd 에 \r 이 박힘) — exit 0 이라
     #   GUI 는 성공으로 본다. Windows CI 는 allocate 만 돌리고 create 는 0회라 실기 미검증(추정) · 회귀 핀은
     #   bin/tests/test_dept_name_guard.py CrlfHygiene(소스 census).
@@ -1695,7 +1788,9 @@ def alive_sock(sk):  # RC-6: AF_UNIX→cys ping(named pipe 대응·os.path.exist
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     depts=d.setdefault('depts',{}); now=time.time()
     # 멱등(원자): 같은 mission_key 엔트리=청구됨 → REUSE. 死活+reserved_at grace로 3분기(CSO 봉인):
     #   UP=서빙중 즉시반환 / BOOTING=생성자 부팅중(grace내)→신뢰·반환(boot tail 안 함=더블각성·더블미션 봉인)
@@ -1708,7 +1803,7 @@ try:
         #   reserved_at=now 재청구 + cwd/account_dir 최신 catalog로 갱신 → 동시 follower=REUSE_BOOTING(더블부트 봉인)·메타 최신.
         e['reserved_at']=now; e['cwd']=cwd; e['account_dir']=acctdir
         tmp=p+'.tmp.%d'%os.getpid()
-        with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+        with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
         os.replace(tmp,p)
         print("REUSE_DEAD "+n); sys.exit(0)
     # ★[2] hard cap(NEW 분기만·reserve flock 안 — 동시성·원자성 유지): REUSE는 면제, 죽은(미reap) 등록은
@@ -1726,7 +1821,7 @@ try:
                  'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master',
                  'mission_key':mkey,'cwd':cwd,'account_dir':acctdir,'reserved_at':now}
     tmp=p+'.tmp.%d'%os.getpid()
-    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
     print("NEW "+name)
 finally: _ulk(lf)
@@ -1752,7 +1847,10 @@ PY
       *)             echo "[cys-dept] create: 미지 verb '$verb'" >&2; exit 1 ;;
     esac
     # ── ensure-up: 데몬 기동 + 시드 + 격리 + 부서장 (NEW · REUSE-사망 공통) ──
-    if [ "$verb" = "NEW" ]; then trap 'reg_remove "$name" 2>/dev/null || true' EXIT; fi  # NEW만 실패 시 예약회수(REUSE는 기존 보존)
+    _dept_spawn_pid=""
+    _creation_cleanup=keep
+    if [ "$verb" = "NEW" ]; then _creation_cleanup=reserve; fi
+    trap 'dept_creation_failed "$?" "$name" "$_creation_cleanup"' EXIT   # NEW만 예약회수, REUSE 등재 보존
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용·REUSE_DEAD 재기동 포함) — 티켓 발급 로그 문면 구분용
@@ -1760,22 +1858,22 @@ PY
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
-      disown
-      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      _dept_spawn_pid=$!
+      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
-    # ★R3.1(CSO·codex R3-REG-SET-META-ORPHAN): 데몬 up 확정 후 실패 trap을 풀teardown(down=kill+소켓+reg)으로 업그레이드.
-    #   이후 reg_set_meta fail-closed/시드/각성에서 set -e 종료해도 이미 뜬 데몬 orphan 0. NEW·REUSE_DEAD 공통.
-    trap '"$0" down "$name" >/dev/null 2>&1 || true' EXIT
+    # NEW·REUSE_DEAD 공통: rc 10에서는 재사용 데몬 보호·새 자식만 회수(원본/묘비/CEO 무변경).
+    trap 'dept_creation_failed "$?" "$name" down' EXIT
     seed_schedule "$pack"
-    ceo_promote 1>&2
     reg_set_meta "$name" "$disp" "$acctkey"   # display_name/account merge(mission_key는 예약시 원자기록·socket/role 보존)
     # F1(codex#1) ★fail-closed: agents.json 계정시드 실패 시 부트 안 함·teardown(비격리 부서장 금지·fail-open 차단).
     if ! seed_agents_account "$pack" "$acctdir"; then
       echo "[cys-dept] ERROR: $name agents.json 계정시드 실패 — fail-closed: 부트 중단·teardown" >&2
-      "$0" down "$name" >/dev/null 2>&1 || true
+      "$0" down "$name" >/dev/null || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }
       exit 6
     fi
+    ceo_promote 1>&2   # 메타 등재·계정시드 성공 뒤에만 승격(판독 실패에서 CEO 보존)
     trap - EXIT   # 격리 확정 — 이후 빈 셸 생성
+    if [ -n "$_dept_spawn_pid" ]; then disown "$_dept_spawn_pid" 2>/dev/null || true; fi
     # ★결함#1: allocate 와 동형 — CEO 승격·계정격리 확정 후, 빈 셸 생성 이전에 티켓 자동 발급(fail-open).
     #   REUSE_UP/REUSE_BOOTING 은 위에서 이미 exit 0 으로 빠졌다(신규 생성 아님 — 기존 부서 재사용).
     #   ★⑦: 여기 도달하는 REUSE_DEAD·기가동 재사용(_spawned=0)에서도 발급 — 근거는 함수 주석.
@@ -1813,6 +1911,8 @@ PY
       esac
     done
     [ -n "$name" ] || { echo "usage: cys-dept down <name> [--purge-state]" >&2; exit 2; }
+    # ★P1: 판독 실패를 kill/묘비/CEO 강등 뒤에 발견하지 않는다(읽기만·실패 exit 10).
+    reg_count >/dev/null || exit $?
     sock="$(dept_sock "$name")"
     # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
     # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
@@ -1832,27 +1932,32 @@ PY
     env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
       || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
     reg_remove "$name"
-    [ "$(reg_count)" = "0" ] && ceo_demote || true
+    _dept_count="$(reg_count)" || exit $?
+    [ "$_dept_count" = "0" ] && ceo_demote || true
     # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
     # 묘비는 영구 존치(위 dept_tombstone) — purge는 재발견 경로(state dir)를 끊어 부활을 봉인한다.
     if [ "$purge_state" = 1 ]; then
       dept_purge_state "$name" || { echo "[cys-dept] $name state 격리 실패(위 사유·teardown은 완료)" >&2; exit 3; }
     fi
-    echo "[cys-dept] $name 종료·정리 완료. 부서 수=$(reg_count)"
+    _dept_count="$(reg_count)" || exit $?
+    echo "[cys-dept] $name 종료·정리 완료. 부서 수=$_dept_count"
     ;;
   down-sock)
     # socket 기준 teardown — ws rename으로 name↔socket이 끊겨도 정확히 종료(레지스트리 역인덱스).
     sock="${2:?usage: cys-dept down-sock <socket>}"
-    name=$(reg_init; python3 - "$REG" "$sock" <<'PY'
+    name=$(python3 - "$REG" "$sock" <<'PY'
 import json,sys
 p,s=sys.argv[1:3]
-d=json.load(open(p, encoding="utf-8-sig")).get('depts',{})
-for n,e in d.items():
+try: d=json.load(open(p, encoding="utf-8-sig"))
+except FileNotFoundError: d={'depts':{}}
+except Exception as e:
+    sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
+for n,e in d.get('depts',{}).items():
     if e.get('socket')==s: print(n); break
 PY
 )
     if [ -z "$name" ]; then
-      # ★D8 봉쇄(BOOTSTRAP_HARDENING WP-3): 역인덱스 실패(rename 레이스·레지스트리 손상) 시
+      # ★D8 봉쇄(BOOTSTRAP_HARDENING WP-3): 역인덱스 미매칭(rename 레이스·미등재) 시
       # 소켓 슬러그(cys-dept-<name>[.sock 부모] · unix/named pipe 공통)에서 name을 파생 —
       # 종전엔 reg_remove·dept_tombstone이 통째로 스킵돼 '등재+미묘비' 부활 구멍이 남았다.
       # 파생 실패(비표준 소켓)면 종전과 동일(skip — 보수적).
@@ -1871,9 +1976,11 @@ PY
       env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
         || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
     fi
-    [ -n "$name" ] && reg_remove "$name" || true
-    [ "$(reg_count)" = "0" ] && ceo_demote || true
-    echo "[cys-dept] socket teardown 완료(name=${name:-미등록}). 부서 수=$(reg_count)"
+    if [ -n "$name" ]; then reg_remove "$name" || exit $?; fi
+    _dept_count="$(reg_count)" || exit $?
+    [ "$_dept_count" = "0" ] && ceo_demote || true
+    _dept_count="$(reg_count)" || exit $?
+    echo "[cys-dept] socket teardown 완료(name=${name:-미등록}). 부서 수=$_dept_count"
     ;;
   rotate)
     # ★버전 스큐 세대교체(재기동, ★폐기 아님): 데몬 프로세스만 정지→새 on-disk cysd로 재기동한다.
@@ -1884,13 +1991,14 @@ PY
     sock="$(dept_sock "$name")"
     # ★필수2(A·리뷰) 사전 게이트: 미등재(down됨/없음) 부서는 즉시 중단(exit 8·부활 금지). ping/identify(autostart
     # 부작용) 이전에 레지스트리(SOT)부터 확인해 side-effect 0으로 빠르게 거부한다. reg_names(SOT) 재사용.
-    if ! reg_names | grep -Fxq -- "$name"; then
+    _reg_names="$(reg_names)" || exit $?
+    if ! grep -Fxq -- "$name" <<<"$_reg_names"; then
       echo "[cys-dept] $name 미등재(down됨) — rotate 중단(부활 금지)" >&2
       exit 8
     fi
     # ★D3(i) 사전 검증(등재 게이트 직후·kill 이전): rotate 꼬리=생성 동사 launch 재귀라, 비정형 등재명은
     #   kill 후 launch 검증 거부 = 데몬 죽고 등재만 남는 반파괴 half-op이 된다 — kill 없이 여기서 exit 2.
-    #   grep `--`는 인자 위생(D3(i) — '-' 선두 등재명 옵션 오파싱 봉합, L974 재확인 게이트 동일).
+    #   grep `--`는 인자 위생(D3(i) — '-' 선두 등재명 옵션 오파싱 봉합, rotate 재확인 게이트 동일).
     validate_dept_name "$name" "rotate <name>" "비정형 등재 — kill 미수행(데몬 불변). 정리는 cys-dept down-sock <sock> 또는 D1(b) 수동 격리로."
     # ★필수4(B·리뷰): rotate 대상 데몬이 실제 살아있는지 ping으로 먼저 확인(autostart 없는 연결 프로브).
     # ★함정: `cys identify`는 죽은 소켓에서 cysd를 autostart하는 부작용이 있어(스모크 실증) pid가 항상 채워져
@@ -1915,7 +2023,8 @@ PY
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     # ★필수2(A·리뷰) TOCTOU 재확인: kill·rm 도중 CSO down(reg_remove+dept_tombstone)이 레이스로 끼어들어
     # 폐기됐으면 launch(부활) 금지 — 사전 게이트 이후 창을 최소화하려 launch 직전에 한 번 더 확인(미등재→exit 8).
-    if ! reg_names | grep -Fxq -- "$name"; then
+    _reg_names="$(reg_names)" || exit $?
+    if ! grep -Fxq -- "$name" <<<"$_reg_names"; then
       echo "[cys-dept] $name 미등재(down됨·rotate 중 폐기) — rotate 중단(부활 금지)" >&2
       exit 8
     fi
@@ -1931,7 +2040,7 @@ PY
     #   완결한다. 위조 가능한 env·argv 승인 표식은 추가하지 않는다 — 서브셸이 게이트를 다시 묻지 않을 뿐이고, `_CYS_ROTATE_SELF=1`
     #   은 묘비 불변(WP-3 `dept_tombstone_remove` no-op)의 내부 표식으로만 쓰인다(서브셸 지역 · 자식 cysd·좌석에 상속 0).
     #   서브셸인 이유: 본체의 `exit N` 이 이 프로세스를 끝내지 않게(실패 사유 1줄 + exit 1 은 종전과 같다).
-    ( _CYS_ROTATE_SELF=1; launch_dept "$name" ) || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
+    ( _CYS_ROTATE_SELF=1; launch_dept "$name" ) || { _rc=$?; [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
     newver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
     # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
     echo "rotated $name: v${oldver:-?}→v${newver:-?}"
@@ -1960,12 +2069,14 @@ p=sys.argv[1]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
-    except Exception: d={'depts':{}}
+    except FileNotFoundError: d={'depts':{}}
+    except Exception as e:
+        sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     for n,e in d.get('depts',{}).items():
         print("%s\t%s\t%s"%(n, e.get('socket',''), e.get('reserved_at',0) or 0))
 finally: _ulk(lf)
 PY
-) || { echo "[cys-dept] reap: 스냅샷 실패" >&2; exit 1; }
+) || { _rc=$?; [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] reap: 스냅샷 실패" >&2; exit 1; }
     # 분류+집행(flock 밖·probe). reg_remove/down-sock는 각자 자체 flock·원자. 현재 셸 루프(카운터 보존).
     nd=0; ni=0; ns=0
     while IFS=$'\t' read -r nm sk rat; do
@@ -1982,7 +2093,7 @@ PY
       # ★[5] TOCTOU 차단: kill(down-sock) 직전 원자 재검증 — 스냅샷 이후 master/agent가 붙었으면 회수 취소.
       recls="ACTIVE:gone"; sock_alive "$sk" && recls="$(dept_classify_idle "$sk" "$rat")"
       if [ "$recls" = "IDLE" ]; then
-        ni=$((ni+1)); echo "[cys-dept] reap: IDLE $nm → down-sock teardown"; "$0" down-sock "$sk" >/dev/null 2>&1 || true
+        ni=$((ni+1)); echo "[cys-dept] reap: IDLE $nm → down-sock teardown"; "$0" down-sock "$sk" >/dev/null || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }
       else
         ns=$((ns+1)); echo "[cys-dept] reap: SKIP $nm — 집행직전 재검증서 활동전환($recls), teardown 취소(TOCTOU 보호)" >&2
       fi
@@ -2001,7 +2112,8 @@ EOF
         else rm -rf "$_td" && nt=$((nt+1)) && echo "[cys-dept] reap: TRASH-EXPIRE $_td (>${ttl}d)"; fi
       done < <(find "$TRASH_ROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$ttl" 2>/dev/null)
     fi
-    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$(reg_count)"
+    _dept_count="$(reg_count)" || exit $?
+    echo "[cys-dept] reap 완료(dry=$dry): DEAD=$nd IDLE=$ni SKIP=$ns TRASH-EXPIRE=$nt. 부서 수=$_dept_count"
     ;;
   promote-ceo)
     # 오너 지명 경로(2026-07-14): 오너/CSO가 기본 데몬 master를 CEO로 직접 지명 — 호출 자체가 동의.
@@ -2026,7 +2138,8 @@ EOF
     # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격은 하지 않는다
     #   (부트와 자동 승격의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자동 승격, 제품 기본 정책) 경유.
     _pend_ok=0
-    [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$(reg_count)" -ge 1 ] && _pend_ok=1
+    _dept_count="$(reg_count)" || exit $?
+    [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$_dept_count" -ge 1 ] && _pend_ok=1
     if [ "${2:-}" = "--request-only" ]; then
       if [ "$_pend_ok" -eq 1 ]; then
         # ★A11 dedupe: 미해결 동종(pending·제목 'CEO 승격 대기')이 이미 있으면 push 생략(로그 1줄) —
@@ -2042,7 +2155,8 @@ EOF
           echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
         fi
       else
-        echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$(reg_count))"
+        _dept_count="$(reg_count)" || exit $?
+        echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$_dept_count)"
       fi
       exit 0
     fi
@@ -2063,7 +2177,7 @@ EOF
     #   resolve_dept_cwd 와 같은 값(등재 cwd → $HOME · 절대·물리 경로). 소비자 후보: formation-heartbeat 잡(schedule.rs ·
     #   Rust 레인 · 통합 단계)이 `javis_formation.py ensure --cwd "$(cys-dept cwd "$d")"` 로 넘긴다.
     #   읽기 전용 계약(codex R3): 레지스트리 파일이 없으면 만들지 않고(reg_init 경유 금지) exit 3 · 미등재 이름도 exit 3
-    #   (미지 부서에 $HOME 을 '행동 가능한 값' 으로 내주지 않는다) · 손상 레지스트리 exit 3 · stdout 은 성공 시 경로 1줄뿐.
+    #   (미지 부서에 $HOME 을 '행동 가능한 값' 으로 내주지 않는다) · 판독 실패도 exit 3 · stdout 은 성공 시 경로 1줄뿐.
     name="${2:-}"
     case "$name" in
       ""|-*)
@@ -2071,14 +2185,15 @@ EOF
         echo "usage: cys-dept cwd <name>" >&2
         exit 2 ;;
     esac
-    [ -f "$REG" ] || { echo "[cys-dept] cwd: 레지스트리 부재($REG) — 미등재" >&2; exit 3; }
-    if ! reg_names 2>/dev/null | grep -Fxq -- "$name"; then
-      echo "[cys-dept] cwd: 미등재 부서 '$name'(또는 레지스트리 판독 불가)" >&2; exit 3
+    _reg_names="$(reg_names)" || exit 3
+    if ! grep -Fxq -- "$name" <<<"$_reg_names"; then
+      echo "[cys-dept] cwd: 미등재 부서 '$name'" >&2; exit 3
     fi
     # ★성찰 P4: $HOME 폴백을 **확정값으로 내주지 않는다** — 등재 cwd 가 없거나 못 쓰면 exit 4(stdout 0). 소비자(편성 심박 · P3)는
     #   --cwd 를 생략해 종전 동작(데몬 cwd → 기동기 루트 교정)으로 떨어진다. launch 가 확정값을 등재하므로(P4 ⓐ) 한 번이라도 뜬
     #   부서는 여기서 값을 얻는다. 미등재 부서 exit 3 은 그대로.
-    if _c="$(resolve_dept_cwd "" "$name" --registered-only)" && [ -n "$_c" ]; then printf '%s\n' "$_c"; exit 0; fi
+    _c="$(resolve_dept_cwd "" "$name" --registered-only)" || { _rc=$?; [ "$_rc" != 10 ] || exit 3; }
+    if [ -n "$_c" ]; then printf '%s\n' "$_c"; exit 0; fi
     echo "[cys-dept] cwd: $name 등재 cwd 없음/사용 불가 — 확정값 없음(\$HOME 폴백은 launch 의 결정이지 이 verb 의 값이 아니다 · exit 4)" >&2
     exit 4 ;;
   sock)
@@ -2102,7 +2217,9 @@ EOF
     #   허용 — 기존 부서 컨텍스트 실행·잔재 정리를 불차단. 비실존+비정형=exit 2(verb 오타가 passthrough로
     #   흡수돼 하류 cys autostart가 무등재 유령 데몬·state dir을 만드는 사고 절반 봉합). 비실존·정형=
     #   허용하되 CYS_NO_AUTOSTART=1 동반 export(★G0 D10 확정) — 죽은 소켓에서 cysd 부활 차단.
-    if ! { reg_names | grep -Fxq -- "$name"; } \
+    # 레지스트리 손상 중에도 실존 state/pack의 doctor --fix 수리 경로는 열어 둔다.
+    _reg_names="$(reg_names)" || _reg_names=""
+    if ! grep -Fxq -- "$name" <<<"$_reg_names" \
        && [ ! -e "$(dept_state "$name")" ] && [ ! -e "$(dept_pack "$name")" ]; then
       validate_dept_name "$name" "<name> -- <cmd>" "비실존 부서 — verb 오타 의심. 신규 생성은 launch/create, 목록은 list."
       export CYS_NO_AUTOSTART=1
@@ -2127,7 +2244,7 @@ EOF
     # 부서 스코프 config 시드 표적은 ${CYS_ACCOUNT_DIR}(실소비 SOT · 폴백 dir 없음)이라, 이 주입이
     # 없으면 컨텍스트 CLI(init-pack 등)의 훅 시드가 생략(loud WARN)으로 접힌다. 유도 실패 = 계정격리
     # 미사용 부서 → 무주입(기존 거동 · 회귀 0).
-    _ctx_acct="$(resolve_lane_acctdir "$name" "$(dept_pack "$name")" | tail -1)"
+    _ctx_acct="$(resolve_lane_acctdir "$name" "$(dept_pack "$name")" --repair-read | tail -1)" || exit $?
     [ -n "$_ctx_acct" ] && export CYS_ACCOUNT_DIR="$_ctx_acct" || true   # set -e 안전(무주입=정상)
     exec "$@"
     ;;

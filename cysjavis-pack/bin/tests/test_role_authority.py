@@ -26,7 +26,7 @@
   ⑦ 신원 키 순서 CYS_→JAVIS_→AITERM_(Rust `env_compat` 미러) · 자릿수 상한 19
   ⑧ 소비처 단조 거부 — javis_org.require_cso · javis_snapshot.is_master · completion_guard._role
   ⑨ ★음성 대조: 부모 프로세스 env 는 조회로 오염되지 않는다(CYS_NO_AUTOSTART 누출 0)
-  ⑩ ★R1(blocking): **부모 허용 + 자식 거부 = 격리 0** — `cys-dept down` 이 거부 rc(7·2)로 끝나면
+  ⑩ ★R1(blocking): **부모 허용 + 자식 거부 = 격리 0** — `cys-dept down` 이 거부 rc(7·2·10)로 끝나면
      `javis_org.destroy_dept` 는 pack/workdir 을 **한 개도 옮기지 않는다**(살아 있는 부서의
      반파괴 봉인). 양성 대조(rc 0 → 실제로 옮긴다)를 같이 둬서 공허한 단언이 되지 않게 한다.
   ⑪ ★R1: 신원 문법이 Rust `parse_surface_ref` 의 **부분집합**이다 — 여러 줄·공백만·`+n` 은
@@ -617,7 +617,8 @@ def _destroy_rig(name, down_rc):
 
 
 def test_destroy_half_op():
-    for rc_in, label in ((7, "단일소유 거부"), (2, "인자 검증 거부")):
+    for rc_in, label in ((7, "단일소유 거부"), (2, "인자 검증 거부"),
+                         (10, "레지스트리 판독 실패(원본 보존)")):
         g = _destroy_rig("halfop%d" % rc_in, rc_in)
         ok = (g["pack_alive"] and g["work_alive"] and not g["trash"]
               and "quarantine_pack" not in g["actions"]
@@ -627,8 +628,20 @@ def test_destroy_half_op():
               % (rc_in, label, rc_in), ok,
               "actions=%s pack=%s work=%s trash=%s rc=%s"
               % (g["actions"], g["pack_alive"], g["work_alive"], g["trash"], g["rc"]))
-        check("10b-%d 거부 사유가 정직하게 보고된다" % rc_in,
-              "거부" in g["err"] and "살아 있다" in g["err"], g["err"].strip()[:200])
+        # ★8라운드(2026-09-17 · opus 7R blocker): 6라운드가 rc 10 문구를 rc 2·7 에서 분리했다
+        #   (javis_org.py:646-655) — rc 10 은 kill·소켓 정리·묘비가 **선행된 뒤** 의 reg_remove 재판독에서도
+        #   나므로 "거부했다 · 부서는 살아 있다" 가 거짓이 될 수 있다. 그래서 이 핀도 rc 별로 가른다:
+        #   rc 10 은 '종료 완료 미확인' 계약을 요구하고 '살아 있다' **부재**를 적극 단언한다
+        #   (javis_org.py self-test 의 destroy-registry-read-refusal-no-quarantine 과 같은 계약을 두 곳에서 본다).
+        #   문구를 옛 판으로 되돌리는 방향은 금지 — rc 10 수리를 무효화한다. 격리 중단 집합 (2,7,10)은 불변.
+        if rc_in == 10:
+            check("10b-%d 종료 완료 미확인이 정직하게 보고된다" % rc_in,
+                  "종료 완료 미확인" in g["err"]
+                  and "레지스트리 복구 후 down 재시도" in g["err"]
+                  and "살아 있다" not in g["err"], g["err"].strip()[:200])
+        else:
+            check("10b-%d 거부 사유가 정직하게 보고된다" % rc_in,
+                  "거부" in g["err"] and "살아 있다" in g["err"], g["err"].strip()[:200])
     # ★양성 대조 — 이 단언이 공허하지 않다는 증거(rc 0 이면 실제로 옮긴다)
     g = _destroy_rig("halfop0", 0)
     check("10c 양성 대조: down rc=0 이면 pack/workdir 은 실제로 격리된다",

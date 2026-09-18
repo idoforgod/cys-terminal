@@ -2457,7 +2457,10 @@ fn sibling_daemon_path() -> Option<std::path::PathBuf> {
 
 // ── Windows 진짜 KeepAlive 패리티(작업 스케줄러 RestartOnFailure) 헬퍼 (mac launchd KeepAlive 대응) ──
 // schtasks 명령줄 플래그엔 RestartOnFailure(사망 시 재기동)가 없어 태스크 XML 로만 설정 가능하다.
-// 아래 함수는 전부 #[cfg(windows)] — mac 빌드에선 컴파일되지 않는다(dead_code 없음).
+// 컴파일 범위(★3라운드 정정 · 렌즈 B 적발 "선재 주석이 거짓"): `xml_escape` · `cysd_task_xml` 은 #[cfg(windows)] 라
+// mac 빌드에서 컴파일되지 않는다. 반면 `current_user_id` · `task_user_id` 는 std 만 쓰는 순수 글루라 **모든 타깃**에서
+// 컴파일되고, 비-Windows 에선 호출부가 없어 `#[cfg_attr(not(windows), allow(dead_code))]` 로 미사용만 허용한다(맥의
+// `cargo test --bin cys k2_01` 이 그 본체의 타입·차용 검사를 대신한다 — 2라운드 B-3).
 
 #[cfg(windows)]
 fn xml_escape(s: &str) -> String {
@@ -2475,10 +2478,15 @@ fn xml_escape(s: &str) -> String {
 ///   한글 계정명을 U+FFFD 로 바꿔 존재하지 않는 UserId 가 XML 에 박혔다(`홍길동` cp949 = C8 AB B1 E6 B5 BF →
 ///   "ȫ�浿") → `schtasks /Create /XML` 실패 → `daemon install` rc≠0 → GUI 온보딩(maybe_windows_onboard)·phoenix
 ///   supervisor_ensure 가 매 부팅 반복 실패, 자동기동 영구 미등록. env `USERDOMAIN`/`USERNAME` 은 Rust 가 UTF-16 으로
-///   읽어 Unicode-정확하므로 그것을 우선하고, whoami 는 env 부재 시 **ASCII-clean 일 때만** 폴백으로 받는다(순수 판정은
-///   `task_user_id` — OS 무관 컴파일이라 맥에서 도는 회귀 핀의 대상). 채택된 값에 U+FFFD 가 실릴 경로는 이제 없다.
-///   ⚠ Windows 실기(cp949 콘솔의 whoami 바이트 · schtasks 오류 문구 · AAD/도메인 계정의 USERDOMAIN 표기)는 이 맥에서
-///   검증하지 못했다 — 판정은 감사 §5-(d) 의 cp949 바이트 재현으로만 잠갔다.
+///   읽어 Unicode-정확하므로 그것을 우선하고, whoami 는 **ASCII-clean 일 때만** 받는다(순수 판정은 `task_user_id` —
+///   OS 무관 컴파일이라 맥에서 도는 회귀 핀의 대상). 채택된 값에 U+FFFD 가 실릴 경로는 없다.
+///   ★3라운드(C3-a · codex minor "USERDOMAIN 부재 시 더 정확한 식별자를 버림"): 2라운드는 `USERNAME` 만 있으면 bare
+///   username 을 즉시 돌려 성공한 whoami 의 `DOMAIN\user` 를 버렸다(도메인 계정에서 USERDOMAIN 이 제거된 환경은 계정
+///   식별이 보장되지 않는다). 우선순위를 ① `USERDOMAIN`+`USERNAME` → ② whoami 성공·ASCII-clean(`DOMAIN\user`) →
+///   ③ `USERNAME` 단독 으로 바꾼다 — 한글 계정은 ②가 거부돼 ③(Unicode-정확한 bare user)으로 떨어지고, ASCII
+///   도메인 계정은 USERDOMAIN 이 없어도 ②로 `DOMAIN\user` 를 얻는다.
+///   ⚠ Windows 실기(cp949 콘솔의 whoami 바이트 · schtasks 오류 문구 · AAD/도메인 계정의 USERDOMAIN 표기 · bare
+///   username UserId 의 schtasks 수용)는 이 맥에서 검증하지 못했다 — 판정은 감사 §5-(d) 의 cp949 바이트 재현으로만 잠갔다.
 ///   ★2라운드(검증 적발 "미컴파일"): 이 본체는 std 만 쓰므로 `#[cfg(windows)]` 를 떼고 모든 타깃에서 컴파일한다 —
 ///   호출부(`daemon install` · cysd_task_xml)는 그대로 windows 한정이라 비-Windows 에선 dead_code 만 허용한다. 맥의
 ///   `cargo test --bin cys` 가 이 글루의 타입·차용 검사를 대신한다(Windows 타깃 cross-check 는 libsqlite3-sys 의 C 빌드에
@@ -2497,9 +2505,13 @@ fn current_user_id() -> Option<String> {
     task_user_id(domain.as_deref(), user.as_deref(), whoami)
 }
 
-/// K2-01 순수 판정(OS 무관 컴파일 = 회귀 핀 대상): env(Unicode-정확) 우선 → whoami 는 env 부재 시 **ASCII-clean**
-/// 일 때만. 무효 UTF-8(OEM 바이트)은 lossy 치환 없이 거부하고, UTF-8 로 유효해도 비ASCII 면 코드페이지를 판별할 수
-/// 없으므로(cp949 `홍` = C8 AB 는 UTF-8 로도 유효한 "ȫ" 다) 거부한다. whoami 는 필요할 때만 호출한다(FnOnce).
+/// K2-01 순수 판정(OS 무관 컴파일 = 회귀 핀 대상). 우선순위(★3라운드 C3-a):
+///   ① env `USERDOMAIN` + `USERNAME`(둘 다 비어 있지 않음) → `DOMAIN\user` (Unicode-정확 · whoami 미호출)
+///   ② whoami 성공 + **ASCII-clean** → 그 출력(보통 `DOMAIN\user`). 무효 UTF-8(OEM 바이트)은 lossy 치환 없이 거부하고,
+///      UTF-8 로 유효해도 비ASCII 면 코드페이지를 판별할 수 없으므로(cp949 `홍` = C8 AB 는 UTF-8 로도 유효한 "ȫ" 다) 거부
+///   ③ env `USERNAME` 단독(도메인 없음 · whoami 실패/비ASCII 인 한글 계정의 종착)
+///   ④ None — 호출부가 사유를 낸다
+/// whoami 는 ①이 성립하면 호출하지 않는다(FnOnce).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn task_user_id(
     env_domain: Option<&str>,
@@ -2510,19 +2522,20 @@ fn task_user_id(
         let t = s.trim();
         (!t.is_empty()).then(|| t.to_string())
     };
-    if let Some(u) = env_user.and_then(clean) {
-        return Some(match env_domain.and_then(clean) {
-            Some(d) => format!("{d}\\{u}"),
-            None => u,
-        });
+    let domain = env_domain.and_then(clean);
+    let user = env_user.and_then(clean);
+    if let (Some(d), Some(u)) = (&domain, &user) {
+        return Some(format!("{d}\\{u}"));
     }
-    let raw = whoami()?;
-    let s = clean(std::str::from_utf8(&raw).ok()?)?;
-    if s.is_ascii() {
-        Some(s)
-    } else {
-        None
+    if let Some(s) = whoami()
+        .as_deref()
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .and_then(clean)
+        .filter(|s| s.is_ascii())
+    {
+        return Some(s);
     }
+    user
 }
 
 /// cysd 작업 스케줄러 태스크 XML. LogonTrigger(현재 사용자) + RestartOnFailure(PT1M×10) +
@@ -16438,7 +16451,9 @@ fn drain_verify_targets() -> Vec<VerifyTarget> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
     if let Ok(s) = std::fs::read_to_string(&reg) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+        // ★C3-c(2026-09-17 3라운드): BOM 은 lib 공용 `strip_utf8_bom` 으로 벗긴다 — GUI(list_depts)는 읽는 파일을
+        //   CLI 집계가 못 읽어 부서가 빠지던 비대칭(codex minor) 해소. run_fleet 와 같은 판독 규약.
+        if let Ok(v) = serde_json::from_str::<Value>(cys::strip_utf8_bom(&s)) {
             if let Some(depts) = v["depts"].as_object() {
                 for (name, meta) in depts {
                     let sock = meta["socket"]
@@ -16586,7 +16601,8 @@ fn run_fleet(as_json: bool) -> i32 {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
     if let Ok(s) = std::fs::read_to_string(&reg) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+        // ★C3-c(2026-09-17 3라운드): BOM 은 lib 공용 `strip_utf8_bom` 으로 벗긴다(drain_verify_targets 와 같은 규약).
+        if let Ok(v) = serde_json::from_str::<Value>(cys::strip_utf8_bom(&s)) {
             if let Some(depts) = v["depts"].as_object() {
                 for (name, meta) in depts {
                     // RC-4: socket 필드 부재 시 공용 규약으로 폴백(Windows named pipe·unix .sock).
@@ -20953,28 +20969,46 @@ mod tests {
     fn k2_01_task_user_id_never_carries_oem_mojibake() {
         // 한국어 Windows 콘솔의 `whoami` 출력 = "DESKTOP-ABC\홍길동" 의 cp949 바이트 + CRLF
         let oem: &[u8] = b"DESKTOP-ABC\\\xc8\xab\xb1\xe6\xb5\xbf\r\n";
+        let ascii: &[u8] = b"DESKTOP-ABC\\hong\r\n";
         fn never() -> Option<Vec<u8>> {
-            panic!("env 가 있으면 whoami 를 부르지 않는다")
+            panic!("USERDOMAIN+USERNAME 이 있으면 whoami 를 부르지 않는다")
         }
+        // ① 도메인+사용자 env → 그대로(whoami 미호출)
         assert_eq!(
             task_user_id(Some("DESKTOP-ABC"), Some("홍길동"), never).as_deref(),
             Some("DESKTOP-ABC\\홍길동")
         );
-        assert_eq!(task_user_id(None, Some("홍길동"), never).as_deref(), Some("홍길동"), "도메인 없음 = user 만");
-        assert_eq!(task_user_id(Some(""), Some(" hong "), never).as_deref(), Some("hong"), "빈 도메인·공백 관용");
+        // ★3라운드 C3-a: USERDOMAIN 부재 → whoami 의 `DOMAIN\user` 를 **버리지 않는다**(2라운드는 bare user 즉시 반환)
+        assert_eq!(
+            task_user_id(None, Some("hong"), || Some(ascii.to_vec())).as_deref(),
+            Some("DESKTOP-ABC\\hong"),
+            "USERDOMAIN 없음 + ASCII whoami 성공 = whoami 의 DOMAIN\\user 채택"
+        );
+        assert_eq!(
+            task_user_id(Some(""), Some(" hong "), || Some(ascii.to_vec())).as_deref(),
+            Some("DESKTOP-ABC\\hong"),
+            "빈 도메인은 부재로 본다(공백 관용)"
+        );
+        // ③ 한글 계정: USERDOMAIN 부재 + OEM whoami(거부) → USERNAME 단독(Unicode-정확)
+        assert_eq!(task_user_id(None, Some("홍길동"), || Some(oem.to_vec())).as_deref(), Some("홍길동"));
+        assert_eq!(task_user_id(None, Some("홍길동"), || None).as_deref(), Some("홍길동"), "whoami 실패 = user 만");
+        assert_eq!(task_user_id(Some(""), Some(" hong "), || None).as_deref(), Some("hong"), "빈 도메인·공백 관용");
         // env 부재 + OEM whoami → None (lossy 치환값이 XML 로 가지 않는다)
         assert_eq!(task_user_id(None, None, || Some(oem.to_vec())), None);
         // env 부재 + UTF-8 로는 유효하지만 비ASCII(코드페이지 판별 불가) → None
         assert_eq!(task_user_id(None, None, || Some("DESKTOP\\홍길동\r\n".as_bytes().to_vec())), None);
-        // env 부재 + ASCII-clean whoami → 채택(종전 동작 보존)
+        // USERNAME 이 있어도 비ASCII whoami 는 채택하지 않는다(코드페이지 판별 불가) → USERNAME 단독
         assert_eq!(
-            task_user_id(None, None, || Some(b"DESKTOP-ABC\\hong\r\n".to_vec())).as_deref(),
-            Some("DESKTOP-ABC\\hong")
+            task_user_id(None, Some("hong"), || Some("DESKTOP\\홍길동\r\n".as_bytes().to_vec())).as_deref(),
+            Some("hong")
         );
+        // env 부재 + ASCII-clean whoami → 채택(종전 동작 보존)
+        assert_eq!(task_user_id(None, None, || Some(ascii.to_vec())).as_deref(), Some("DESKTOP-ABC\\hong"));
         assert_eq!(task_user_id(None, Some(""), || None), None, "전부 없음 = None(호출부가 사유를 낸다)");
         assert_eq!(task_user_id(None, None, || Some(b"  \r\n".to_vec())), None, "빈 whoami");
         for v in [
             task_user_id(Some("D"), Some("홍길동"), never),
+            task_user_id(None, Some("홍길동"), || Some(oem.to_vec())),
             task_user_id(None, None, || Some(oem.to_vec())),
         ] {
             assert!(!v.unwrap_or_default().contains('\u{FFFD}'), "U+FFFD 가 산출값에 실렸다");

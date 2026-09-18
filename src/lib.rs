@@ -356,6 +356,19 @@ pub fn env_compat(primary: &str) -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
+/// 선두 UTF-8 BOM(U+FEFF) **1개**를 벗긴다 — JSON 파일 판독기의 공용 전처리(C3-c · 2026-09-17 3라운드).
+///
+/// 왜 공용인가: `serde_json` 은 선두 U+FEFF 를 문법 오류로 거부하고, 한국어 Windows 편집기("UTF-8(BOM)")가
+/// 저장한 `depts.json`·`dept-catalog.json` 은 BOM 을 단다. 2라운드까지 GUI(src-tauri) 만 벗기고 CLI 판독기
+/// (cys.rs drain_verify_targets · run_fleet)는 원문을 그대로 넣어, 같은 파일이 GUI 에는 보이고 CLI 집계·검증에서는
+/// 부서가 빠졌다(codex minor). 판독기마다 사본을 두면 다시 갈리므로 구현은 여기 하나다.
+///
+/// 값 안의 U+FEFF 와 두 번째 이후의 BOM 은 데이터로 보존한다(선두 1개만). 입력이 `&str` 인 것은 의도다 —
+/// 무효 UTF-8(cp949 저장)은 `read_to_string` 단계에서 InvalidData 로 걸리며 그 처리는 호출측 정책이다.
+pub fn strip_utf8_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
+}
+
 /// Wire protocol: one JSON object per line (NDJSON), request/response with id echo.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -2689,6 +2702,25 @@ pub mod mousereport {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★C3-c(2026-09-17 3라운드) 공용 BOM 전처리 핀 — 선두 1개만 벗기고 나머지 바이트는 그대로.
+    /// (src-tauri 의 k2_03 핀과 같은 표본 — 그쪽은 이제 이 함수를 쓰므로 표본이 갈리면 여기서 먼저 red.)
+    #[test]
+    fn strip_utf8_bom_strips_exactly_one_leading_bom() {
+        let bom = "\u{FEFF}{\"depts\":{\"dept-1\":{\"display_name\":\"영업부\"}}}";
+        assert!(serde_json::from_str::<serde_json::Value>(bom).is_err(), "serde 가 BOM 을 받아들인다면 헬퍼 필요성을 재검토");
+        let v: serde_json::Value = serde_json::from_str(super::strip_utf8_bom(bom)).expect("BOM 을 벗기면 파싱된다");
+        assert_eq!(v["depts"]["dept-1"]["display_name"], "영업부");
+        assert_eq!(super::strip_utf8_bom("{}"), "{}", "BOM 없는 입력은 그대로");
+        assert_eq!(super::strip_utf8_bom(""), "");
+        assert_eq!(super::strip_utf8_bom("\u{FEFF}"), "", "BOM 만 있으면 빈 문자열");
+        assert_eq!(super::strip_utf8_bom("a\u{FEFF}b"), "a\u{FEFF}b", "값 안의 U+FEFF 는 보존");
+        assert_eq!(super::strip_utf8_bom("\u{FEFF}\u{FEFF}x"), "\u{FEFF}x", "선두 1개만 벗긴다(그 뒤는 데이터)");
+        // 수명: 반환 슬라이스는 입력을 빌린다(복사 없음) — 긴 파일에서도 비용 0.
+        let owned = String::from("\u{FEFF}{}");
+        let s: &str = super::strip_utf8_bom(&owned);
+        assert_eq!(s.as_ptr(), owned.as_ptr().wrapping_add(3), "BOM 3바이트 뒤를 가리키는 빌림이어야 한다");
+    }
 
     // ── ★(U-10) 좌석 제4 등급 `gate_pending` 축: 롤백 킬스위치 + wire 술어 순수 코어 ──
     //   env 를 만지는 래퍼가 아니라 **순수 코어**를 잰다(cargo test 는 스레드 병렬이라

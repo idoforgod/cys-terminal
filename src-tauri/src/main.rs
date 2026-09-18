@@ -3890,7 +3890,20 @@ fn spawn_org_restore(app: AppHandle) {
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
         let mut ok = 0usize;
         let mut fail = 0usize;
-        if let Ok(reg) = list_depts() {
+        // ★D5-b(2026-09-17 4라운드): 레지스트리 판독 실패(cp949·손상 JSON — C2 정책으로 Err)는 종전 `if let Ok` 로
+        // 부서 0개를 **무음** 순회했다. 데이터 손실은 없으나 '왜 부서가 하나도 복원되지 않았는지'가 어디에도 남지
+        // 않았다 — 전건 보류를 skip 이벤트(dept 없음)로 emit 한다(UI 가 토스트 1회 · 다음 기동 재시도).
+        let reg = match list_depts() {
+            Ok(reg) => reg,
+            Err(e) => {
+                let _ = app.emit(
+                    "restore-progress",
+                    json!({"phase": "skip", "detail": format!("부서 레지스트리(depts.json)를 읽지 못해 부서 복원을 전건 보류(원본 보존 · 다음 기동 재시도): {e}")}),
+                );
+                json!({ "depts": {} })
+            }
+        };
+        {
             if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
                 for (name, meta) in depts {
                     let sock = meta
@@ -3911,12 +3924,14 @@ fn spawn_org_restore(app: AppHandle) {
                     if tombs.contains(name.as_str()) {
                         let mut detail = "삭제-의도 묘비 — 재기동 제외".to_string();
                         if alive {
-                            let _ = stop_dept_daemon_by_socket(
+                            // ★D1(2026-09-17 4라운드): teardown 이 이제 비0 rc(rc 10 = 레지스트리 판독 실패 · kill 0)를
+                            // Err 로 준다 — 실패 사유를 skip 이벤트 detail 에 싣는다. 재프로브(★R4 D-IMPL-4)는 그대로
+                            // 유지한다: Ok 라도 실제 사망은 소켓으로 확인해야 하고, Err 라도 이미 죽었을 수 있다.
+                            let stop_err = stop_dept_daemon_by_socket(
                                 sock.to_string_lossy().to_string(),
                             )
-                            .await;
-                            // ★R4(D-IMPL-4): teardown 함수는 실패를 삼키므로(무조건 Ok) 재프로브로
-                            // 결과를 가시화 — 여전히 생존이면 WARN 라벨(차회 부팅 재시도가 수렴 경로).
+                            .await
+                            .err();
                             let still = tokio::time::timeout(
                                 std::time::Duration::from_secs(2),
                                 rpc_oneshot(&sock, "system.identify", json!({})),
@@ -3925,7 +3940,10 @@ fn spawn_org_restore(app: AppHandle) {
                             .map(|r| r.is_ok())
                             .unwrap_or(false);
                             detail = if still {
-                                "삭제-의도 묘비 — teardown 미확정(WARN·차회 시작 시 재시도)".into()
+                                format!(
+                                    "삭제-의도 묘비 — teardown 미확정(WARN·차회 시작 시 재시도){}",
+                                    stop_err.map(|e| format!(" · {e}")).unwrap_or_default()
+                                )
                             } else {
                                 "삭제-의도 묘비 — 잔존 데몬 정리 완료".into()
                             };
@@ -4493,7 +4511,7 @@ fn onboard_init_pack(cys: &std::path::Path) -> bool {
 /// Windows 첫 기동 온보딩(RC-1) — 순정 Windows엔 hook 자동등록 경로가 없어 "너는 마스터다"
 /// 부트스트랩(SessionStart hook)이 미발동했다(T1 증상①).
 /// ① `onboard_init_pack`: 팩 + Claude hook 등록(멱등).
-/// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
+/// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs `run_daemon_cmd` 의 `schtasks /Create /XML … /F` — 멱등).
 #[cfg(windows)]
 fn maybe_windows_onboard() -> bool {
     let cys = resolve_sidecar("cys.exe");
@@ -4855,68 +4873,167 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
     Ok(info)
 }
 
-/// 부서 workspace 닫기 = 부서 데몬 teardown. cys-dept down에 일임(SIGTERM·소켓 정리·레지스트리·CEO 강등).
-#[tauri::command]
-async fn stop_dept_daemon(name: String) -> Result<(), String> {
+/// ★D1(2026-09-17 4라운드 · codex 2차 ③ · 부트체인 must_fix B): `cys-dept down`/`down-sock` 의 **결과를 전달**하는 단일 실행기.
+///
+/// 무엇이 깨져 있었나: 두 stop 커맨드가 `let _ = …; Ok(())` 로 spawn 실패·JoinError·비0 status 를 전부 버렸다. 팩이
+/// `down` 을 "레지스트리 판독 먼저(실패 시 rc 10 · kill 0 · 등재 제거 0)" 로 바꾼 뒤에는 이 폐기가 곧 **무음 좀비**다 —
+/// GUI 는 탭을 이미 지웠고 성공으로 알며, 데몬·등재는 그대로 남고, UI 의 `.catch(e => toast)` 는 발화한 적이 없었다
+/// (그 문구 "부활은 차단됨(삭제 의도 기록됨)" 도 rc 10 에서는 거짓). 이제 `Err("cys-dept down(-sock) rc=<n>: <stderr>")` 로
+/// 사실을 돌려주고, 삼킬지는 호출측이 이유를 적고 정한다(spawn_org_restore 는 재프로브와 함께 detail 에 싣는다).
+async fn run_dept_teardown(verb: &'static str, arg: String) -> Result<(), String> {
     let tool = dept_tool();
-    let _ = tokio::task::spawn_blocking(move || {
+    let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
         inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
-        cmd.arg(&tool).arg("down").arg(&name);
+        cmd.arg(&tool).arg(verb).arg(&arg);
         no_console(&mut cmd);
         cmd.output()
     })
-    .await;
+    .await
+    .map_err(|e| format!("cys-dept {verb} join: {e}"))?
+    .map_err(|e| format!("cys-dept {verb} spawn: {e}"))?;
+    if !out.status.success() {
+        let rc = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("cys-dept {verb} rc={rc}: {stderr}"));
+    }
     Ok(())
+}
+
+/// 부서 workspace 닫기 = 부서 데몬 teardown. cys-dept down에 일임(SIGTERM·소켓 정리·레지스트리·CEO 강등).
+/// ★D1: 비0 rc·spawn·join 실패는 Err(run_dept_teardown) — rc 10 = 레지스트리 판독 실패로 **종료 완료 미확인**
+/// (이미 종료됐을 수 있다: 사전 조회뿐 아니라 kill·소켓 정리·묘비 **뒤**의 reg_remove 재판독에서도 10 이 난다).
+#[tauri::command]
+async fn stop_dept_daemon(name: String) -> Result<(), String> {
+    run_dept_teardown("down", name).await
 }
 
 /// ★K2-03(2026-09-17 한글 사용자명 감사): 선두 UTF-8 BOM(U+FEFF)을 벗긴다. 한국어 Windows 편집기("UTF-8(BOM)")로
 /// 손질한 dept-catalog.json 은 BOM 을 달고 오는데 `serde_json` 은 그것을 문법 오류로 거부한다(src/bin/cys.rs
 /// read_hook_input 과 같은 결함 부류 · 그쪽 주석 참조). 판독 단일 지점에서만 벗기고 값 안의 바이트는 건드리지 않는다.
-fn strip_utf8_bom(s: &str) -> &str {
-    s.strip_prefix('\u{FEFF}').unwrap_or(s)
-}
+/// ★3라운드(C3-c): 구현은 lib 공용 `cys::strip_utf8_bom` 하나다 — CLI 판독기(cys.rs drain_verify_targets · run_fleet)와
+/// 이 GUI 가 같은 함수를 쓴다(사본 금지 · 한쪽만 BOM-blind 로 갈리면 같은 파일이 GUI 엔 보이고 CLI 집계에선 빠진다).
+use cys::strip_utf8_bom;
 
 /// ★K2-03: 레지스트리/카탈로그 판독 실패를 **가시화**한다. 종전엔 `read_to_string` 의 Err(cp949 저장 = InvalidData 등)를
 /// 무음으로 빈 값에 접어, 팝업이 레거시만 보여도 원인을 알 길이 없었다. 부재(NotFound)는 정상 상태(아직 부서 없음)라
-/// 조용히 둔다. 반환값 정책(빈 값 대체)은 바꾸지 않는다 — 진단 한 줄만 더한다.
-fn warn_json_read_err(what: &str, path: &std::path::Path, e: &std::io::Error) {
-    if e.kind() != std::io::ErrorKind::NotFound {
-        eprintln!(
-            "[cys-app] {what} 판독 실패({}) — 빈 값으로 대체. UTF-8(BOM 없음)로 저장됐는지 확인: {e}",
-            path.display()
-        );
+/// 호출측이 이 함수를 부르지 않는다(read_json_or_empty 의 분기). ★3라운드: 세 판독 지점(list_depts · dept_display_name ·
+/// read_dept_catalog)이 전부 read_json_or_empty 를 지나므로 경고는 세 지점에서 빠짐없이 난다 — 2라운드까지는
+/// dept_display_name 만 `.ok()?` 로 침묵했다. Windows GUI(no_console)에선 stderr 가 보이지 않을 수 있다(2라운드 B-6 한계 유지).
+fn warn_json_read_err(what: &str, path: &std::path::Path, e: &dyn std::fmt::Display) {
+    let reason = e.to_string();
+    if !json_read_warn_first(path, &reason) {
+        return; // 같은 (경로, 사유) 는 이미 알렸다 — 복구(read_json_or_empty Ok)되면 json_read_warn_reset 이 지운다
+    }
+    eprintln!(
+        "[cys-app] {what} 판독 실패({}) — 호출측에 Err 로 전달(빈 값 대체 아님). UTF-8 로 저장됐는지 확인(BOM 은 허용): {reason}",
+        path.display()
+    );
+}
+
+/// ★D5-a(2026-09-17 4라운드 · 성찰 1회 minor): 판독 실패 경고의 **(경로, 사유) 단위 1회 dedupe**. 컨트롤센터가 5초마다
+/// `usage_accounts_all` → `list_depts` 를 부르므로, 레지스트리가 손상돼 있는 동안 같은 경고가 5초마다 stderr 에 쌓였다
+/// (기능 영향 0 · 로그 누적). 첫 발생만 알리고, 그 경로가 다시 정상 판독되면(`json_read_warn_reset`) 기억을 지워 다음
+/// 손상은 다시 알린다 — 사유가 바뀌면(cp949 → 절단) 별개로 알린다.
+static JSON_READ_WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+    std::sync::OnceLock::new();
+
+fn json_read_warned() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    JSON_READ_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 처음 보는 (경로, 사유) 면 true(= 알려라), 이미 알린 것이면 false.
+fn json_read_warn_first(path: &std::path::Path, reason: &str) -> bool {
+    let key = (path.display().to_string(), reason.to_string());
+    match json_read_warned().lock() {
+        Ok(mut set) => set.insert(key),
+        Err(_) => true, // 락 오염이면 dedupe 를 포기하고 알린다(경고 누락보다 반복이 낫다)
     }
 }
 
+/// 그 경로의 판독이 정상으로 돌아왔다 — 그 경로의 기억을 전부 지운다(다음 손상은 다시 알린다).
+fn json_read_warn_reset(path: &std::path::Path) {
+    let p = path.display().to_string();
+    if let Ok(mut set) = json_read_warned().lock() {
+        set.retain(|(kp, _)| *kp != p);
+    }
+}
+
+/// ★C2(2026-09-17 3라운드 · 부트체인 must_fix): JSON 파일 판독의 **단일 정책** — 부재(NotFound)만 `Ok(빈 값)`, 그 외
+/// 판독 실패(InvalidData = cp949/UTF-16 저장 · 권한 · 손상 JSON)는 `Err(사유)`.
+///
+/// 무엇이 깨져 있었나: 종전엔 모든 실패가 `Ok(빈 값)` 이라 UI 복원(main.ts)이 '못 읽음'을 '부서 0' 으로 읽어, 죽은 부서
+/// 탭을 미등재 유령으로 **드롭하고 저장본에서 지웠다**(레지스트리는 멀쩡한데 화면에서 부서가 사라진다). Err 면 UI 는
+/// `registered=null`(전부 보존 · 드롭 0) · '지금 켜기'는 사유에 '판독 실패' 명시 · ＋부서 팝업은 필터 없이 전체 제시 +
+/// 카탈로그 실패 토스트 — 전부 보수 경로다. Rust 내부 호출자(org_fleet · ensure_dept_forwarders · spawn_org_restore ·
+/// usage_accounts_all · dept_count 2곳)는 모두 `if let Ok`/`.ok()` 라 Err = 건너뜀(종전 serde 오류와 같은 형태 · 파괴 없음).
+fn read_json_or_empty(what: &str, path: &std::path::Path, empty: Value) -> Result<Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str::<Value>(strip_utf8_bom(&s))
+            .map(|v| {
+                json_read_warn_reset(path); // ★D5-a: 정상 판독 = 복구 — 경고 dedupe 기억을 지운다
+                v
+            })
+            .map_err(|e| {
+                warn_json_read_err(what, path, &e);
+                format!("{what} JSON 형식 오류({}): {e}", path.display())
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(empty),
+        Err(e) => {
+            warn_json_read_err(what, path, &e);
+            Err(format!("{what} 판독 실패({}): {e}", path.display()))
+        }
+    }
+}
+
+/// 부서 레지스트리(depts.json) 경로 — cys-dept 와 같은 규약(CYS_DEPTS_JSON 또는 $HOME/.cys/depts.json).
+fn depts_registry_path() -> std::path::PathBuf {
+    std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| cys::home_dir().join(".cys/depts.json"))
+}
+
 /// 부서 레지스트리(depts.json) 조회 — restore가 등록된 부서(진실원)와 대조해 죽은 socket의 유령 ws를
-/// 무비판 재-launch하지 않게 한다(옛 테스트 잔재·삭제된 부서 차단). 부재 시 빈 depts.
+/// 무비판 재-launch하지 않게 한다(옛 테스트 잔재·삭제된 부서 차단). 부재 시 빈 depts · **판독 실패는 Err**(C2 · 위 정책).
+/// ★D4: socket 필드가 없는 정상 등재에는 canonical `dept_socket_path(name)` 을 채워 돌려준다(아래 fill_canonical_dept_sockets).
 #[tauri::command]
 fn list_depts() -> Result<Value, String> {
-    let reg = std::env::var("CYS_DEPTS_JSON")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir().join(".cys/depts.json")
-        });
-    match std::fs::read_to_string(&reg) {
-        Ok(s) => serde_json::from_str::<Value>(strip_utf8_bom(&s)).map_err(|e| e.to_string()),
-        Err(e) => {
-            warn_json_read_err("depts.json", &reg, &e);
-            Ok(json!({ "depts": {} }))
+    let mut reg = read_json_or_empty("depts.json", &depts_registry_path(), json!({ "depts": {} }))?;
+    fill_canonical_dept_sockets(&mut reg);
+    Ok(reg)
+}
+
+/// ★D4(2026-09-17 4라운드 · codex 2차 ⑦): socket 필드가 **없거나 빈** 정상 등재에 canonical `dept_socket_path(name)` 을 채운다.
+///
+/// 무엇이 깨져 있었나: `{depts:{"dept-1":{display_name:"영업부"}}}` 같은 등재(표시명만 · socket 없음)에서 UI 의 `registered`
+/// (등재 socket 집합)·`displayBySocket`(새 탭 원천)이 비어, 저장된 canonical 소켓이 죽어 있으면 그 탭을 '미등재 유령'으로
+/// 드롭했다. Rust 복원기(spawn_org_restore · usage_accounts_all)는 같은 항목에 `unwrap_or_else(|| dept_socket_path(name))`
+/// 폴백을 이미 갖고 있어 두 소비자의 해석이 갈렸다 — 채움을 list_depts 한 곳에 두어 GUI·Rust 가 같은 등재를 본다.
+/// 값이 있는 socket 은 건드리지 않는다(레거시 파일경로형·다른 HOME 의 등재를 canonical 로 덮으면 그쪽이 유령이 된다).
+fn fill_canonical_dept_sockets(reg: &mut Value) {
+    let Some(depts) = reg.get_mut("depts").and_then(|d| d.as_object_mut()) else { return };
+    for (name, meta) in depts.iter_mut() {
+        let Some(obj) = meta.as_object_mut() else { continue };
+        let has_socket = obj
+            .get("socket")
+            .and_then(|s| s.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_socket {
+            obj.insert("socket".into(), json!(dept_socket_path(name).to_string_lossy()));
         }
     }
 }
 
 /// 부서 레지스트리(depts.json)에서 표시명 조회 — cys-dept reg_set_meta 가 기록한 display_name.
-/// create stdout 은 name only 이므로 표시명의 진실원은 레지스트리다. 부재/오류 시 None(=name 폴백).
+/// create stdout 은 name only 이므로 표시명의 진실원은 레지스트리다. 부재/오류 시 None(=name 폴백 · 반환 정책 무변경).
+/// ★3라운드: 종전 `.ok()?` 는 판독 실패를 침묵했다 — 이제 read_json_or_empty 가 경고를 낸 뒤 None 으로 접는다.
 fn dept_display_name(name: &str) -> Option<String> {
-    let reg = std::env::var("CYS_DEPTS_JSON")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir().join(".cys/depts.json")
-        });
-    let s = std::fs::read_to_string(&reg).ok()?;
-    let v: Value = serde_json::from_str(strip_utf8_bom(&s)).ok()?;
+    let v = read_json_or_empty("depts.json", &depts_registry_path(), json!({ "depts": {} })).ok()?;
     v.get("depts")?
         .get(name)?
         .get("display_name")?
@@ -4925,22 +5042,14 @@ fn dept_display_name(name: &str) -> Option<String> {
 }
 
 /// 부서 카탈로그(dept-catalog.json) 조회 — ＋부서 선택 팝업용. cys-dept 와 동일 경로 규약
-/// (CYS_DEPT_CATALOG 또는 $HOME/.cys/dept-catalog.json). 부재/손상 시 빈 departments 반환(팝업=레거시 폴백).
+/// (CYS_DEPT_CATALOG 또는 $HOME/.cys/dept-catalog.json). 부재 시 빈 departments(팝업=레거시 폴백) ·
+/// **판독 실패(손상·인코딩)는 Err**(C2 — UI 가 사유 토스트 뒤 레거시로 진행).
 #[tauri::command]
 fn read_dept_catalog() -> Result<Value, String> {
     let cat = std::env::var("CYS_DEPT_CATALOG")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            cys::home_dir()
-                .join(".cys/dept-catalog.json")
-        });
-    match std::fs::read_to_string(&cat) {
-        Ok(s) => serde_json::from_str::<Value>(strip_utf8_bom(&s)).map_err(|e| e.to_string()),
-        Err(e) => {
-            warn_json_read_err("dept-catalog.json", &cat, &e);
-            Ok(json!({ "departments": {} }))
-        }
-    }
+        .unwrap_or_else(|_| cys::home_dir().join(".cys/dept-catalog.json"));
+    read_json_or_empty("dept-catalog.json", &cat, json!({ "departments": {} }))
 }
 
 /// ★WP-3(BOOTSTRAP_HARDENING): 소켓 문자열에서 부서명 파생 — cys-dept-<name> 슬러그
@@ -4955,9 +5064,18 @@ fn dept_name_from_socket(sock: &str) -> Option<String> {
 /// ★WP-3 의도 선기록: 부서 삭제 클릭의 **제1행위** — base 데몬에 dept 묘비를 기록한다(견고
 /// writer=데몬 RPC·topology.json 영속). 이후의 teardown(bash→python 체인·reg_remove)이 무음
 /// 실패해도 리바이버(spawn_org_restore·프론트 복원)가 이 묘비를 게이트로 읽어 부활을 차단한다.
+/// ★G3-b(2026-09-17 10라운드 · codex 5차 ④): `name` 은 **프론트가 해소한 부서명**이다(등재 키 우선 —
+/// ui/src/deptlabel.ts deptLaunchName). 종전에는 이 함수가 소켓 파서로만 이름을 뽑았는데, 등재 키가
+/// `dept-2` 이고 저장 소켓이 `\\.\pipe\cys-dept-DEPT-2`(named pipe 는 대소문자 무구분 = 같은 파이프)면
+/// **기록자는 `DEPT-2`, 복원 판독기는 `dept-2`** 를 봐서 삭제 의도가 유실됐다(지운 부서가 되살아난다).
+/// 기록자와 판독기가 같은 식별자를 쓰게 인자로 받는다. 미지정·공백이면 종전대로 소켓에서 파생한다
+/// (계약 후퇴 없음 — 구 프론트·다른 호출자도 그대로 동작한다).
 #[tauri::command]
-async fn dept_tombstone_by_socket(socket: String) -> Result<Value, String> {
-    let name = dept_name_from_socket(&socket)
+async fn dept_tombstone_by_socket(socket: String, name: Option<String>) -> Result<Value, String> {
+    let name = name
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .or_else(|| dept_name_from_socket(&socket))
         .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
     rpc_oneshot(&cys::socket_path(), "dept_tombstone.set", json!({"name": name})).await
 }
@@ -5472,18 +5590,10 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
 
 /// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
 /// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
+/// ★D1: 비0 rc·spawn·join 실패는 Err(run_dept_teardown) — UI 탭 닫기 핸들러의 catch 가 사실 문구로 알린다.
 #[tauri::command]
 async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
-    let tool = dept_tool();
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("bash");
-        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
-        cmd.arg(&tool).arg("down-sock").arg(&socket);
-        no_console(&mut cmd);
-        cmd.output()
-    })
-    .await;
-    Ok(())
+    run_dept_teardown("down-sock", socket).await
 }
 
 /// ★기능2(2026-07-15): 부서 완전 폐역(purge) — teardown을 넘어 대화기억(state·transcripts.db)까지
@@ -6730,8 +6840,10 @@ mod tests {
         assert_eq!(strip_utf8_bom("\u{FEFF}\u{FEFF}x"), "\u{FEFF}x", "선두 1개만 벗긴다(그 뒤는 데이터)");
     }
 
-    /// ★K2-03 배선 핀: 세 판독 지점(list_depts · dept_display_name · read_dept_catalog)이 전부 헬퍼를 지난다.
-    /// 한 곳만 원시 `from_str(&s)` 로 되돌아가면 같은 파일이 팝업에서는 보이고 복원에서는 안 보이는 식으로 갈린다.
+    /// ★K2-03 배선 핀: 세 판독 지점(list_depts · dept_display_name · read_dept_catalog)이 전부 **단일 판독기**
+    /// read_json_or_empty 를 지나고, 그 판독기가 lib 공용 strip_utf8_bom 을 부른다(★3라운드 C2/C3-c 로 갱신).
+    /// 한 곳만 원시 `from_str(&s)`/`read_to_string(..).ok()?` 로 되돌아가면 같은 파일이 팝업에서는 보이고 복원에서는
+    /// 안 보이거나, 판독 실패가 다시 '부서 0' 으로 둔갑한다.
     #[test]
     fn k2_03_every_registry_reader_strips_the_bom() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
@@ -6739,9 +6851,209 @@ mod tests {
         let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
         for f in ["fn list_depts()", "fn dept_display_name(", "fn read_dept_catalog()"] {
             let s = body.find(f).unwrap_or_else(|| panic!("`{f}` 소실"));
-            let seg: String = body[s..].chars().take(900).collect(); // 바이트 슬라이스 금지(한글 주석 경계 패닉)
-            assert!(seg.contains("strip_utf8_bom("), "{f}: BOM 을 벗기지 않는 원시 판독으로 되돌아갔다");
+            let seg: String = body[s..].chars().take(700).collect(); // 바이트 슬라이스 금지(한글 주석 경계 패닉)
+            assert!(seg.contains("read_json_or_empty("), "{f}: 단일 판독기를 우회하는 원시 판독으로 되돌아갔다");
+            assert!(!seg.contains("from_str"), "{f}: 원시 serde 판독이 되살아났다(BOM·Err 정책 이탈)");
         }
+        let r = body.find("fn read_json_or_empty(").expect("read_json_or_empty 소실");
+        let seg: String = body[r..].chars().take(900).collect();
+        assert!(seg.contains("strip_utf8_bom("), "read_json_or_empty: BOM 을 벗기지 않는다");
+        assert!(seg.contains("ErrorKind::NotFound"), "read_json_or_empty: 부재/실패 분기가 사라졌다(C2)");
+        // 사본 금지: 이 파일에 strip_utf8_bom 의 **정의**가 다시 생기면 lib 와 갈린다.
+        assert!(!body.contains("fn strip_utf8_bom("), "strip_utf8_bom 사본이 되살아났다 — lib 공용 함수를 쓴다");
+        assert!(body.contains("use cys::strip_utf8_bom;"), "lib 공용 strip_utf8_bom 배선 소실");
+    }
+
+    /// ★C2(2026-09-17 3라운드 · 부트체인 must_fix) 판독 정책 경계 핀 — **부재만 빈 값**, 판독 실패는 Err.
+    ///   NotFound → Ok(빈 값) · InvalidData(cp949 바이트 = 무효 UTF-8) → Err · 손상 JSON → Err · BOM → Ok(정상 파싱).
+    /// 종전(전부 Ok(빈 값))이면 InvalidData 단언에서 red — UI 가 '못 읽음' 을 '부서 0' 으로 읽어 탭을 드롭하던 병인.
+    #[test]
+    fn k2_03_reader_policy_notfound_empty_invaliddata_err_bom_ok() {
+        let td = std::env::temp_dir().join(format!("cys-k2-03-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let empty = json!({ "depts": {} });
+
+        // NotFound → Ok(빈 값)
+        let missing = td.join("nope.json");
+        assert_eq!(read_json_or_empty("depts.json", &missing, empty.clone()).unwrap(), empty);
+
+        // InvalidData: cp949 로 저장된 한글(무효 UTF-8) → Err(빈 값 아님)
+        let cp949 = td.join("cp949.json");
+        std::fs::write(&cp949, b"{\"depts\":{\"dept-1\":{\"display_name\":\"\xc8\xab\xb1\xe6\xb5\xbf\"}}}").unwrap();
+        let e = read_json_or_empty("depts.json", &cp949, empty.clone()).expect_err("cp949 파일이 빈 값으로 둔갑했다");
+        assert!(e.contains("판독 실패"), "사유 문면: {e}");
+
+        // 손상 JSON(절단) → Err
+        let broken = td.join("broken.json");
+        std::fs::write(&broken, "{\"depts\":{\"dept-1\":").unwrap();
+        let e = read_json_or_empty("depts.json", &broken, empty.clone()).expect_err("손상 JSON 이 빈 값으로 둔갑했다");
+        assert!(e.contains("JSON 형식 오류"), "사유 문면: {e}");
+
+        // BOM → Ok(정상 · BOM 뒤 한글 보존)
+        let bom = td.join("bom.json");
+        std::fs::write(&bom, "\u{FEFF}{\"depts\":{\"dept-1\":{\"display_name\":\"영업부\",\"socket\":\"/x/cys-dept-dept-1/cys.sock\"}}}").unwrap();
+        let v = read_json_or_empty("depts.json", &bom, empty.clone()).expect("BOM 파일이 거부됐다");
+        assert_eq!(v["depts"]["dept-1"]["display_name"], "영업부");
+
+        // 실제 커맨드 경계(env 경로 주입 · `--test-threads=1` 러너 전제): list_depts 도 같은 정책이다.
+        std::env::set_var("CYS_DEPTS_JSON", &cp949);
+        assert!(list_depts().is_err(), "list_depts: cp949 레지스트리가 Ok(부서 0) 으로 둔갑했다");
+        assert!(dept_display_name("dept-1").is_none(), "dept_display_name: 반환 정책은 None 폴백 그대로");
+        std::env::set_var("CYS_DEPTS_JSON", &missing);
+        assert_eq!(list_depts().unwrap(), empty, "list_depts: 부재는 빈 값");
+        std::env::set_var("CYS_DEPTS_JSON", &bom);
+        assert_eq!(dept_display_name("dept-1").as_deref(), Some("영업부"), "BOM 레지스트리의 표시명");
+        std::env::remove_var("CYS_DEPTS_JSON");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★D1(2026-09-17 4라운드 · codex 2차 ③) 회귀 핀: `cys-dept down`/`down-sock` 의 비0 rc 는 **Err** 다.
+    /// 목 cys-dept(rc 10 + stderr 1줄)를 CYS_PACK_DIR/bin 에 두고 실제 커맨드를 부른다 — 종전 `let _ = …; Ok(())` 로
+    /// 되돌리면 첫 단언(expect_err)에서 red. rc 0 은 Ok, 도구 부재(bash 127)도 Err(spawn 실패 계열의 관측 가능 형태).
+    /// `--test-threads=1` 러너 전제(CYS_PACK_DIR 주입 · 끝나면 원복).
+    #[cfg(unix)]
+    #[test]
+    fn k2_03_d1_stop_dept_daemon_nonzero_rc_is_err_not_silent_ok() {
+        let td = std::env::temp_dir().join(format!("cys-k2-03-d1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let bin = td.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("cys-dept");
+        std::fs::write(
+            &tool,
+            "#!/bin/bash\necho \"[cys-dept] depts.json 판독 실패 — 원본 보존: mock ($1 $2)\" >&2\nexit 10\n",
+        )
+        .unwrap();
+        let prev = std::env::var("CYS_PACK_DIR").ok();
+        std::env::set_var("CYS_PACK_DIR", &td);
+        assert_eq!(dept_tool(), tool, "테스트 전제: dept_tool 이 목 cys-dept 를 가리킨다");
+
+        tauri::async_runtime::block_on(async {
+            let e = stop_dept_daemon("dept-1".into())
+                .await
+                .expect_err("rc 10 이 Ok(()) 로 둔갑했다 — 무음 좀비(탭 소실·데몬 생존) 경로 부활");
+            assert!(e.contains("cys-dept down rc=10"), "rc 가 문면에 없다: {e}");
+            assert!(e.contains("판독 실패") && e.contains("down dept-1"), "stderr 가 문면에 없다: {e}");
+            let e = stop_dept_daemon_by_socket("/x/cys-dept-dept-1/cys.sock".into())
+                .await
+                .expect_err("down-sock rc 10 이 Ok(()) 로 둔갑했다");
+            assert!(e.contains("cys-dept down-sock rc=10"), "{e}");
+            assert!(e.contains("down-sock /x/cys-dept-dept-1/cys.sock"), "{e}");
+
+            // rc 0 → Ok(정상 teardown 은 종전과 같다)
+            std::fs::write(&tool, "#!/bin/bash\nexit 0\n").unwrap();
+            assert!(stop_dept_daemon("dept-1".into()).await.is_ok());
+            assert!(stop_dept_daemon_by_socket("/x/cys-dept-dept-1/cys.sock".into()).await.is_ok());
+
+            // 도구 부재 → bash 127 → Err(무음 Ok 아님)
+            std::fs::remove_file(&tool).unwrap();
+            let e = stop_dept_daemon("dept-1".into()).await.expect_err("도구 부재가 Ok 로 둔갑했다");
+            assert!(e.contains("cys-dept down rc=127"), "{e}");
+        });
+
+        match prev {
+            Some(v) => std::env::set_var("CYS_PACK_DIR", v),
+            None => std::env::remove_var("CYS_PACK_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★D1/D5-b 배선 핀: spawn_org_restore 는 (a) teardown 의 Err 를 버리지 않고 detail 에 싣고(`let _ =` 폐기 부활 금지),
+    /// (b) list_depts Err 를 `if let Ok` 로 무음 skip 하지 않고 skip 이벤트로 emit 한다.
+    #[test]
+    fn k2_03_d1_d5b_org_restore_surfaces_teardown_err_and_registry_read_err() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let s = body.find("fn spawn_org_restore(").expect("spawn_org_restore 소실");
+        let seg = &body[s..s + body[s..].find("\n}\n").unwrap()];
+        assert!(!seg.contains("let _ = stop_dept_daemon_by_socket("), "teardown 결과 폐기(`let _ =`)가 되살아났다");
+        assert!(seg.contains("stop_dept_daemon_by_socket(") && seg.contains(".err();"), "teardown Err 수집 배선 소실");
+        assert!(!seg.contains("if let Ok(reg) = list_depts()"), "list_depts Err 무음 skip 이 되살아났다");
+        let m = seg.find("match list_depts()").expect("list_depts Err 분기 소실");
+        let after = &seg[m..];
+        assert!(after.contains("Err(e) =>") && after.contains("\"phase\": \"skip\"") && after.contains("전건 보류"),
+            "list_depts Err 가 skip 이벤트로 emit 되지 않는다");
+        // stop 두 커맨드는 단일 실행기를 지나고, 그 실행기는 join·spawn·status 세 실패를 모두 Err 로 만든다.
+        for f in ["async fn stop_dept_daemon(", "async fn stop_dept_daemon_by_socket("] {
+            let i = body.find(f).unwrap_or_else(|| panic!("`{f}` 소실"));
+            let seg: String = body[i..].chars().take(300).collect();
+            assert!(seg.contains("run_dept_teardown("), "{f}: 단일 실행기를 우회한다");
+            assert!(!seg.contains("let _ ="), "{f}: 결과 폐기가 되살아났다");
+        }
+        let r = body.find("async fn run_dept_teardown(").expect("run_dept_teardown 소실");
+        let seg: String = body[r..].chars().take(1200).collect();
+        assert!(seg.contains("join:") && seg.contains("spawn:") && seg.contains("rc={rc}"), "세 실패 경로 중 하나가 Err 가 아니다");
+    }
+
+    /// ★D4(2026-09-17 4라운드 · codex 2차 ⑦) 회귀 핀: socket 필드가 없거나 빈 정상 등재에 list_depts 가 canonical
+    /// `dept_socket_path(name)` 을 채운다 — `{depts:{"dept-1":{display_name:"영업부"}}}` 가 UI 에서 registered 비어 탭을
+    /// 드롭하던 병인. 값이 있는 socket(레거시 파일경로형)은 건드리지 않고, 비객체 항목에서 패닉하지 않는다.
+    /// `--test-threads=1` 러너 전제(CYS_DEPTS_JSON 주입).
+    #[test]
+    fn k2_03_d4_list_depts_fills_canonical_socket_only_where_missing() {
+        let td = std::env::temp_dir().join(format!("cys-k2-03-d4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let reg = td.join("depts.json");
+        std::fs::write(
+            &reg,
+            "{\"depts\":{\"dept-1\":{\"display_name\":\"영업부\"},\"dept-2\":{\"display_name\":\"x\",\"socket\":\"  \"},\
+             \"dept-3\":{\"socket\":\"C:\\\\Users\\\\x\\\\.local\\\\state\\\\cys-dept-dept-3\\\\cys.sock\"},\"bad\":null}}",
+        )
+        .unwrap();
+        let prev = std::env::var("CYS_DEPTS_JSON").ok();
+        std::env::set_var("CYS_DEPTS_JSON", &reg);
+        let v = list_depts().expect("정상 등재가 Err 로 둔갑했다");
+        let want1 = dept_socket_path("dept-1").to_string_lossy().to_string();
+        let want2 = dept_socket_path("dept-2").to_string_lossy().to_string();
+        assert_eq!(v["depts"]["dept-1"]["socket"], want1, "socket 없는 등재에 canonical 이 채워지지 않았다");
+        assert_eq!(v["depts"]["dept-1"]["display_name"], "영업부", "표시명은 보존");
+        assert_eq!(v["depts"]["dept-2"]["socket"], want2, "빈 socket 도 채운다");
+        assert_eq!(
+            v["depts"]["dept-3"]["socket"],
+            "C:\\Users\\x\\.local\\state\\cys-dept-dept-3\\cys.sock",
+            "값이 있는 socket(레거시)은 덮지 않는다"
+        );
+        assert!(v["depts"]["bad"].is_null(), "비객체 항목은 그대로(패닉 없음)");
+        assert!(want1.contains("cys-dept-dept-1"), "canonical 규약 확인: {want1}");
+        // 부재는 여전히 빈 값(채울 항목 없음) · 판독 실패는 여전히 Err(채움이 정책을 바꾸지 않는다).
+        std::env::set_var("CYS_DEPTS_JSON", td.join("nope.json"));
+        assert_eq!(list_depts().unwrap(), json!({ "depts": {} }));
+        std::fs::write(td.join("broken.json"), "{\"depts\":{").unwrap();
+        std::env::set_var("CYS_DEPTS_JSON", td.join("broken.json"));
+        assert!(list_depts().is_err());
+        match prev {
+            Some(p) => std::env::set_var("CYS_DEPTS_JSON", p),
+            None => std::env::remove_var("CYS_DEPTS_JSON"),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★D5-a(2026-09-17 4라운드) 핀: 판독 실패 경고는 (경로, 사유) 당 1회 — 5초 폴링(usage_accounts_all → list_depts)에서
+    /// 같은 경고가 반복되지 않는다. 사유가 바뀌면 다시 알리고, 정상 판독(reset)이 되면 같은 사유도 다시 알린다.
+    #[test]
+    fn k2_03_d5a_json_read_warn_dedupes_per_path_and_reason_until_recovery() {
+        let p = std::env::temp_dir().join(format!("cys-k2-03-d5a-{}.json", std::process::id()));
+        let q = std::env::temp_dir().join(format!("cys-k2-03-d5a-{}-other.json", std::process::id()));
+        json_read_warn_reset(&p);
+        json_read_warn_reset(&q);
+        assert!(json_read_warn_first(&p, "invalid utf-8"), "첫 발생은 알린다");
+        assert!(!json_read_warn_first(&p, "invalid utf-8"), "같은 (경로, 사유) 반복은 침묵");
+        assert!(!json_read_warn_first(&p, "invalid utf-8"));
+        assert!(json_read_warn_first(&p, "expected `,`"), "사유가 바뀌면 다시 알린다");
+        assert!(json_read_warn_first(&q, "invalid utf-8"), "다른 경로는 별개");
+        json_read_warn_reset(&p);
+        assert!(json_read_warn_first(&p, "invalid utf-8"), "복구 뒤 같은 사유는 다시 알린다");
+        assert!(!json_read_warn_first(&q, "invalid utf-8"), "다른 경로의 기억은 reset 대상이 아니다");
+        // 실제 판독기 경계: 정상 파일을 한 번 읽으면 그 경로의 기억이 지워진다.
+        std::fs::write(&p, "{}").unwrap();
+        assert!(read_json_or_empty("x", &p, json!({})).is_ok());
+        assert!(json_read_warn_first(&p, "expected `,`"), "정상 판독이 reset 을 부른다");
+        json_read_warn_reset(&p);
+        json_read_warn_reset(&q);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// ★SEAL-DIAG 스로틀 회귀 핀: **파손은 마커로 침묵시킬 수 없다.**

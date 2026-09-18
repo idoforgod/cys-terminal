@@ -71,3 +71,6 @@ pack-files.txt
 pack-manifest.*
 pack.tar.gz
 REVIEW-multimaster-*.md
+
+# 팩 실행 영수증(2026-09-17 감사): git add -A 로 배포본에 임베드하지 않는다.
+cysjavis-pack/state/*.jsonl

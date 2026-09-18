@@ -1530,7 +1530,7 @@ def discover_depts():
         pass
     if os.path.isfile(depts_json):
         try:
-            reg = json.load(open(depts_json))
+            reg = json.load(open(depts_json, encoding="utf-8-sig"))
             for dept, meta in (reg.get("depts") or {}).items():
                 info = found.setdefault(dept, {})
                 sock = (meta or {}).get("socket")

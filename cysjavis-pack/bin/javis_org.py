@@ -134,8 +134,8 @@ def require_cso():
 def _dept_key_ok(key):
     """카탈로그 key 의 부서명 규약 판정 — 정본은 cys-dept::dept_name_ok, 파이썬 재수출은 javis_bootstrap.dept_name_ok
     (단일 출처·사본 금지 — 두 소스의 정규식은 javis_bootstrap self-test 가 대조한다). 형제 모듈은 _audit_formation_mod 와
-    같은 지연 로드. 정본 미로드 시 진단만 생략(True) — cys-dept 가 create 진입부에서 여전히 exit 2 로 막으므로 게이트는
-    유지되고 조기 진단 층만 빠진다(리터럴 사본을 여기 두지 않는 이유).
+    같은 지연 로드. ★P2(2026-09-17 부트체인 감사): 정본 미로드도 거부(False) — create 이전에
+    apply_manifest 가 write_mission/ensure_dirs 로 key 기반 경로를 쓰므로 v_schema 에서 fail-closed 한다.
     ★알려진 부작용(2라운드 검증 적발): javis_bootstrap 은 import 시 sys.stdout/stderr 를 utf-8(errors=replace) 로
     reconfigure 한다(그 파일 R3 주석 — 직접 실행 cp949 콘솔의 UnicodeEncodeError 방어). 제품 경로(cys-dept
     PYTHONUTF8=1 · GUI inject_runtime_path ENV_PY_UTF8 · 좌석 env 주입)에선 이미 UTF-8 이라 무변경이고, PYTHONUTF8 없이
@@ -147,8 +147,10 @@ def _dept_key_ok(key):
             sys.path.insert(0, d)
         import javis_bootstrap
         return bool(javis_bootstrap.dept_name_ok(key))
-    except Exception:
-        return True
+    except Exception as e:
+        sys.stderr.write("[javis_org] 부서명 검증기 로드 실패 — key 거부: %s: %s\n"
+                         % (type(e).__name__, " ".join(str(e).splitlines())))
+        return False
 
 def v_schema(m):
     errs = []
@@ -628,10 +630,12 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     r = subprocess.run(down_cmd, capture_output=True, text=True,
                        env={**os.environ, "CYS_TRASH_STAMP": ts})
     actions.append(("down", r.returncode))
-    # ★0.14.31 P6 R1 (두 리뷰어 blocking): **거부(=부서 생존)** 는 부분 실패가 아니라 무효 조작이다.
-    #   `cys-dept down` 이 아래 rc 로 끝나면 teardown 은 **한 글자도 일어나지 않았다** —
+    # ★0.14.31 P6 R1 (두 리뷰어 blocking): 거부 또는 종료 완료 미확인 시 격리를 중단한다.
+    #   `cys-dept down` 의 아래 rc는 종료 완료의 근거가 될 수 없다 —
     #     7 = 단일소유 강제 거부(env 절 또는 데몬 권위 절 · cys-dept 가드)
     #     2 = 인자 검증 거부(미지 플래그·인자 과다·이름 없음 — 전부 teardown **이전**)
+    #    10 = 레지스트리 판독 실패(원본 보존) — 사전 조회 또는 kill·소켓 정리·묘비 뒤
+    #         reg_remove 재판독에서도 발생하므로 이미 종료됐을 수 있다.
     #   그런데도 아래 3)4)가 pack/workdir 을 격리하면 **살아 있는 부서의 팩·작업 폴더를 옮기는**
     #   반파괴(half-op)가 된다. 부모(require_cso)와 자식(cysd_role_gate)은 이제 각자 시각에
     #   데몬에 묻기 때문에 '부모 허용 + 자식 거부' 조합이 실제로 생길 수 있다(워크디렉터리
@@ -639,11 +643,16 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
     #   ★스냅샷(tar.gz)은 이미 만들어졌을 수 있으나 그것은 비파괴 백업이라 되돌릴 것이 없다.
     #   ★그 밖의 비0(예: 3 = teardown 은 끝났고 state 격리만 실패)은 종전 계약대로
     #   best-effort 격리를 계속한다(사용자 회수 표면 최대화 · 기존 핀 불변).
-    if r.returncode in (2, 7):
+    if r.returncode in (2, 7, 10):
+        reason = (
+            "레지스트리 판독 실패로 종료 완료 미확인 — 이미 종료됐을 수 있음"
+            "(kill·소켓 정리·묘비가 선행됐을 수 있다) · 레지스트리 복구 후 down 재시도"
+            if r.returncode == 10 else "조작을 **거부**했다 — 부서는 살아 있다"
+        )
         sys.stderr.write(
-            "[destroy] %s: cys-dept down 이 조작을 **거부**했다(rc=%d) — 부서는 살아 있다. "
+            "[destroy] %s: cys-dept down(rc=%d) — %s. "
             "pack/workdir 격리를 하지 않고 중단한다(반파괴 방지). %s\n"
-            % (name, r.returncode, (r.stderr or "").strip()[:300]))
+            % (name, r.returncode, reason, (r.stderr or "").strip()[:300]))
         return actions
     # ★F1(reviewer1): down 실패(특히 --purge-state의 state 격리 실패=exit 3)를 삼키지 않는다 —
     #   사유를 stderr로 정직 보고하고 최종 exit는 cmd_destroy가 비0으로 판정한다. 부분 실패라도
@@ -910,6 +919,48 @@ def self_test():
     m_key_ok = {**m_ok, "departments":[{**good_dept, "key":"Sales_KR-2"}]}
     chk("schema-key-ascii", v_schema(m_key_ok) == [], f"정형 key 오탐: {v_schema(m_key_ok)}")
     chk("schema-key-display-hangul-ok", v_schema(m_ok) == [], "한글 display 가 key 진단에 걸림(표시명은 한글 허용)")
+    # --- P2(2026-09-17 부트체인 감사): 검증기 import 실패는 경로 쓰기 전 schema/apply 거부 ---
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+    from unittest.mock import patch
+    # 정상 입력 대조를 먼저 세운다. 검증기만 fail-open 으로 바꾸면 apply 진입까지 도달해야
+    # 아래 no-write 핀이 red 가 된다(무관한 문서/quote 오류로 rc=1 이 되는 공허한 통과 방지).
+    validator_doc = os.path.join(td, "validator-design.md")
+    with open(validator_doc, "w", encoding="utf-8") as f:
+        f.write(doc)
+    validator_manifest = {**m_key_ok,
+        "source": {"design_doc": validator_doc, "design_doc_sha256": sha256_text(doc)},
+        "departments": [{**m_key_ok["departments"][0], "source_quote": d_ok["source_quote"]}]}
+    validator_catalog = {"accounts": cat["accounts"],
+                         "departments": {"Sales_KR-2": validator_manifest["departments"][0]}}
+    chk("apply-validator-positive-control", validate_manifest(
+        validator_manifest, doc_text=doc, catalog=validator_catalog) == [],
+        "검증기 정상일 때도 apply 입력이 거부되어 no-write 핀이 공허함")
+    validator_input = os.path.join(td, "selftest-import-failure.json")
+    def validator_load(path, default=None):
+        # CATALOG 는 객체형 departments, 매니페스트는 배열형 departments 이다. 경로를
+        # 구분해야 fail-open 변이가 AttributeError 대신 의도한 chk 로 실패한다.
+        if path == validator_input: return validator_manifest
+        if path == CATALOG: return validator_catalog
+        raise AssertionError("예상 밖 self-test JSON 경로: %s" % path)
+    diag = StringIO()
+    with patch.dict(sys.modules, {"javis_bootstrap": None}), redirect_stderr(diag):
+        chk("schema-key-validator-missing", not _dept_key_ok("Sales_KR-2"),
+            "검증기 import 실패인데 key 허용(fail-open)")
+        chk("schema-validator-missing", any(".key 부적격" in e for e in v_schema(m_key_ok)),
+            "검증기 import 실패가 v_schema 를 통과")
+        lines = diag.getvalue().splitlines()
+        chk("schema-validator-diagnostic", len(lines) == 2 and all(
+            "[javis_org] 부서명 검증기 로드 실패 — key 거부:" in line for line in lines),
+            "검증기 실패 사유가 호출당 stderr 1줄로 진단되지 않음")
+        # 권한/입력만 밀폐 주입하고 실제 validate_manifest → v_schema 순서는 유지한다.
+        with patch.object(sys.modules[__name__], "require_cso"), \
+             patch.object(sys.modules[__name__], "load_json", side_effect=validator_load), \
+             patch.object(sys.modules[__name__], "apply_manifest", return_value=[]) as apply_mock, \
+             redirect_stdout(StringIO()):
+            rc = cmd_apply(validator_input)
+        chk("apply-validator-missing-no-write", rc == 1 and not apply_mock.called,
+            "검증기 import 실패 뒤 write_mission/ensure_dirs 를 실행하는 apply_manifest 진입")
     # --- K2-03: UTF-8 BOM 카탈로그(한국어 Windows 편집기 'UTF-8(BOM)' 저장) 판독 ---
     bpath = os.path.join(td, "bom-catalog.json")
     with open(bpath, "wb") as f:
@@ -994,6 +1045,43 @@ def self_test():
         os.listdir = _real_ld
     chk("snap-exc-none", snapped is None, "읽기불가 예외인데 None 아님(traceback 전파 결함 재발)")
     chk("snap-exc-clean", not [f for f in _real_ld(td) if f.startswith("denytest-")], "실패 부분 tar 잔존")
+    # --- R6/S2: down rc=10 은 종료 완료 미확인(종료 후 판독 실패도 가능) — 격리 0 ---
+    # HOME/등재/팩/작업물 전부 td 내부. OS별 실행파일 형식에 기대지 않도록 CYS_DEPT_BIN 의
+    # 자식 결과만 목으로 주입하며, 스냅샷과 격리는 실제 함수로 관측한다.
+    refuse_home = os.path.join(td, "destroy-refuse-home")
+    refuse_name = "registry-refusal"
+    refuse_pack = os.path.join(refuse_home, ".cys", "pack-dept-" + refuse_name)
+    refuse_work = os.path.join(refuse_home, "workdir")
+    refuse_trash = os.path.join(refuse_home, ".local", "state", "cys-trash")
+    for p in (refuse_pack, refuse_work): os.makedirs(p, exist_ok=True)
+    refuse_reg = os.path.join(refuse_home, "depts.json")
+    with open(refuse_reg, "w", encoding="utf-8") as f:
+        json.dump({"depts": {refuse_name: {"cwd": refuse_work, "workdir_owned": True}}}, f)
+    with open(refuse_reg, "rb") as f: refuse_bytes = f.read()
+    refuse_bin = os.path.join(refuse_home, "cys-dept-mock")
+    with open(refuse_bin, "w", encoding="utf-8") as f: f.write("CYS_DEPT_BIN self-test fixture\n")
+    refuse_cmd = [refuse_bin, "down", refuse_name]
+    refuse_diag = StringIO()
+    with patch.multiple(sys.modules[__name__], HOME=refuse_home, DEPTS=refuse_reg,
+                        TRASH_ROOT=refuse_trash), \
+         patch.object(sys.modules[__name__], "require_cso"), \
+         patch.dict(os.environ, {"CYS_DEPT_BIN": refuse_bin}), \
+         patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+             refuse_cmd, 10, "", "registry read refused")) as down_mock, \
+         patch.object(sys.modules[__name__], "_quarantine", wraps=_quarantine) as quarantine_mock, \
+         redirect_stderr(refuse_diag):
+        refuse_actions = destroy_dept(refuse_name, None, purge=True, purge_workdir=True)
+    with open(refuse_reg, "rb") as f: refuse_after = f.read()
+    chk("destroy-registry-read-refusal-no-quarantine",
+        down_mock.call_count == 1 and down_mock.call_args[0][0] == refuse_cmd
+        and ("down", 10) in refuse_actions and any(a[0] == "snapshot" for a in refuse_actions)
+        and not quarantine_mock.called and os.path.isdir(refuse_pack) and os.path.isdir(refuse_work)
+        and not os.path.exists(refuse_trash) and refuse_after == refuse_bytes
+        and "레지스트리 판독 실패로 종료 완료 미확인 — 이미 종료됐을 수 있음" in refuse_diag.getvalue()
+        and "kill·소켓 정리·묘비가 선행됐을 수 있다" in refuse_diag.getvalue()
+        and "레지스트리 복구 후 down 재시도" in refuse_diag.getvalue()
+        and "부서는 살아 있다" not in refuse_diag.getvalue(),
+        "down rc=10 에서 pack/workdir 격리 또는 원본 변경·거부 사유 누락: %r" % refuse_actions)
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
