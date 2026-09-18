@@ -7988,9 +7988,24 @@ def h_seed_4():
     #   P1 이 그것을 서브셸 함수 호출로 바꿨다 — 자식 프로세스는 프리루드·단일소유 게이트를
     #   처음부터 다시 돌아 **자기 부서 rotate 가 자기 자신에게 막혔다**. 결박의 **뜻**(rotate 가
     #   launch 본체를 그대로 물려받는다)은 같고, 그 사실을 새 형상으로 잰다.
+    # ★K1(2026-09-18 · ci-branch 35372350037 적색 규명): 종전 `src[ri:ri+4000]` **고정 창**을
+    #   다른 팔과 같은 **'다음 case 팔 경계까지'** 로 정정한다. 계약·단언 문구는 불변이다.
+    #   실측 사실: 제품은 계약을 지키고 있었다 — rotate 팔(char 115795 · line 2095)은 여전히
+    #   `launch_dept "$name"`(char 120705 · line 2171)를 경유한다. 다만 J4/J5/J6 의 선포착 블록과
+    #   근거 주석이 그 호출을 팔 시작 기준 **offset 4910** 으로 밀어, 4000자 창 **밖**으로 나갔다.
+    #   (기준 480319b 에서는 3756 — 여유가 244자뿐이었다. 즉 이 창은 이미 임계에 있었고, 팔에
+    #    주석 한 문단만 더 붙어도 터지는 구조였다.) 붉은 것은 계약이 아니라 **자**였다.
+    #   같은 파일의 다른 팔은 전부 경계로 자른다(바로 아래 ⓒ 의 allocate: `src.find("\n  create)", ai)`)
+    #   — rotate 만 고정 길이라 취약했다. 동형화하면 창이 **넓어지므로 계약은 강화된다**(약화 아님):
+    #   종전에는 팔 안에 있어도 4000자 밖이면 못 봤고, 이제는 팔 안이면 전부 본다.
+    #   fallback: 다음 팔 이름이 바뀌어도 `esac` 까지는 반드시 팔 안이다(창이 사라져 공허해지지 않게).
     ri = src.find("\n  rotate)")
     need(ri > 0, "rotate 분기를 못 찾았다")
-    rbody = src[ri:ri + 4000]
+    rend = src.find("\n  reap)", ri)
+    if rend < 0:
+        rend = src.find("\nesac", ri)
+    need(rend > ri, "rotate 팔의 끝(다음 case 팔 `reap)` · 없으면 `esac`)을 못 찾았다")
+    rbody = src[ri:rend]
     need('launch_dept "$name"' in rbody or 'bash "$0" launch "$name"' in rbody,
          "rotate 가 launch 본체를 경유하지 않는다(복원 경로 결박 실패)")
     notes.append("rotate=launch 본체 경유(복원 상속)")
