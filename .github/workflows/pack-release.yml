@@ -288,7 +288,8 @@ jobs:
                    test_phoenix_fresh_honest test_phoenix_f1_production_path \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
-                   test_state_rotate; do
+                   test_state_rotate \
+                   test_dept_schedule_seed; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="
