@@ -816,12 +816,21 @@ verify_lane_account_seed(){
 }
 
 # 부서 schedule 시드 — owner-progress-report(5/15분 보고)는 최상위(owner/CEO) 데몬만 돌려야 한다.
-# pack install이 임베드 schedule.json(owner-보고 job)을 모든 pack에 깔므로, 부서 pack은 데몬 기동
-# 후 빈 jobs로 덮어쓴다(데몬 30초 내 핫리로드 + install은 user-modified 보존으로 영속). 부서마다
-# owner-보고가 N배 중복 실행되는 자원 낭비·노이즈 차단.
+#
+# ★결재 13 수리(2026-09-19): 종전엔 **빈 jobs 로 덮어써** owner 잡과 함께 **레인 지역 기계장치까지
+#   날아갔다.** 실측한 기제는 순서다 — cysd 는 부트 때 accept 루프 **이전에** ensure_builtin_jobs() 로
+#   builtin 잡(cso-alert-inbox-check-60m · cycle-autopilot-tick · cycle-verifier-watchdog ·
+#   phoenix-snapshot-6h …)을 넣는데, 이 함수가 **데몬 ready 이후** 빈 배열을 써서 그것을 지웠고
+#   핫리로드는 ensure 를 다시 돌리지 않는다. 실측: dept-1 jobs=1(owner 잡만 잔존) · dept-2 jobs=0.
+# ★처방: **덮어쓰지 않고 거른다** — 데몬이 넣어 둔 잡은 그대로 두고 **owner/CEO 스코프만** 뺀다.
+#   잡 정의를 여기 복제하지 않으므로 schedule.rs 의 BUILTIN_JOBS_VERSION 과 드리프트하지 않는다.
+#   base_only 잡(formation-heartbeat·ceo-promote-pending-tick)은 남겨도 데몬 관문이 부서 실행을
+#   막는다(schedule.rs base_only_blocked) — 이중으로 지우지 않는다.
 seed_schedule(){
   local pk="$1"; mkdir -p "$pk"
-  printf '{\n  "_doc": "부서 데몬 schedule — owner 진행보고는 최상위만. cys-dept가 빈 jobs로 시드(중복 실행 방지).",\n  "jobs": []\n}\n' > "$pk/schedule.json"
+  python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_dept_schedule.py" "$pk/schedule.json" \
+    || python3 "$(dirname "$0")/javis_dept_schedule.py" "$pk/schedule.json" \
+    || echo "[cys-dept] WARN: schedule 시드 실패 — 원본 무변경($pk/schedule.json)" >&2
 }
 
 # 부서 데몬은 첫 기동 시 pack install(수백 파일)로 listening까지 지연될 수 있어 폴링 간격을 둔다(최대 ~12s).
