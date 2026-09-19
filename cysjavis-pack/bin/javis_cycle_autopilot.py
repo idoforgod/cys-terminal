@@ -147,7 +147,9 @@ LOG_MAX_BYTES = 4096
 HEARTBEAT_MAX_AGE = 90.0      # 게이트6 — 검증자 워처 생존 판정 창
 HEARTBEAT_TOUCH_SECS = 30.0   # 워처 touch 주기
 STAGE2_WINDOW = 120.0         # cys cycle-agent --timeout 기본값 = 검증자 신선도 기준선 폭
-CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*2 + settle 75 + 검증 <= 510s)
+CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*2 + clear 실효 관측 75 + settle 75 + 검증 <= 585s)
+#   ★[결재 7ⓑ] cycle-agent 가 clear 뒤 실효 관측 창(러스트 CLEAR_VERIFY_SECS = 75)을 기다리므로 +75s.
+#   LEASE_TTL(900) 안이며, 인계는 'lease 갱신 없음 + pid 사망' 둘 다일 때만이라 산 실행은 뺏기지 않는다.
 VERIFIER_ROLE = "cycle-verifier"
 CYS = "cys"
 RUN_TIMEOUT = 25.0
@@ -492,6 +494,9 @@ IDLE_MIN_DEFAULT = 60.0
 OWNER_ACTIVE_WINDOW = 600.0       # $PACK/round/OWNER_ACTIVE mtime 10분
 COOLDOWN_SECS = 1200.0            # cleared_verified 후 20분
 SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
+# ★[결재 7ⓑ] 러스트 src/bin/cys.rs 의 CLEAR_VERIFY_SECS(cycle-agent clear 실효 관측 창)와 같은 값이어야
+#   한다 — 같은 증거(session_file 교체)를 같은 창에서 본다. 바꾸면 양쪽을 함께 바꿔라. 불일치는
+#   cargo 검체 t2_clear_verify_window_matches_autopilot_settle 가 잡는다(이 줄의 리터럴을 파싱한다).
 # [v2.1 ④] in-flight kill-switch 폴링 — 설계 v2 의 2~5s 를 **1s 로 격상**한다.
 # handshake~clear 구간만 격상해도 되지만, 외곽에서 stage 경계를 결정론으로 관측할 방법이 없어
 # (자식 stderr 문구 파싱 = 화면 오라클) 자식 수명 **전 구간**을 1s 로 돌린다(엄격측).

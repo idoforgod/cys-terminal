@@ -942,6 +942,77 @@ fn is_recover_refusal(e: &str) -> bool {
     e.starts_with(RECOVER_REFUSED_TOKEN)
 }
 
+/// [결재 7ⓑ] `cycle-agent` 의 clear 는 **송신(행위)과 실효(결과)가 다르다.**
+///
+/// 종전엔 `/clear` 키 입력을 보낸 직후 `cycle complete` + exit 0 을 냈다. 대상이 작업 중이면
+/// 그 입력은 대기 메시지로 들어가 명령으로 실행되지 않을 수 있고(claude 좌석엔 auto-compact
+/// 도 실재해 '토큰이 줄었다'는 증거가 못 된다), 수동 집행자는 exit 0 을 성공으로 읽었다.
+/// 이제 0 은 **실효 관측**(statusline `session_file` 교체 — autopilot 사후검증 ⓑ 와 같은 증거)
+/// 에만 쓰고, 비관측은 두 갈래로 나눠 **다른 코드**로 낸다(진단 가능성):
+///   80 = 전 값은 쟀는데 창 안에 교체가 **관측되지 않았다**(clear 가 먹지 않았을 가능성 — 실패 쪽)
+///   81 = 전 값을 **잴 수 없었다**(statusline 미보고 에이전트 · usage 부재) — 실패가 아니라
+///        측정 불능이다. 측정 불능은 통과도 아니므로 0 을 쓰지 않는다.
+/// 저장·검증 단계 실패(clear 미송신)는 종전대로 1 이다.
+/// ★자동 경로 영향 없음: javis_cycle_autopilot 은 이 rc 를 `child_rc` 로 **기록만** 하고 자체
+///   사후검증으로 종결한다(판정이 child_rc 에 의존하지 않음을 그쪽 self-test 가 고정한다).
+///
+/// 값 80·81: sysexits 예약대(64–78) **밖**이고 형제 코드(0·1·2·7·75·78·79)와 겹치지 않는다.
+const EXIT_CLEAR_UNVERIFIED: i32 = 80;
+const EXIT_CLEAR_UNMEASURABLE: i32 = 81;
+
+/// 머리표 — `RECOVER_REFUSED_TOKEN` 과 같은 순수 문자열 계약. 두 갈래를 섞지 않는다.
+const CLEAR_UNVERIFIED_TOKEN: &str = "clear-unverified:";
+const CLEAR_UNMEASURABLE_TOKEN: &str = "clear-unmeasurable:";
+
+/// clear 실효 관측 창(초). ★팩 `javis_cycle_autopilot.py` 의 `SETTLE_SECS` 와 **같은 값이어야
+/// 한다**(사후검증과 같은 창에서 같은 증거를 본다). 두 언어라 한 상수를 공유할 수 없어
+/// 양쪽에 서로를 가리키는 주석을 두고, 불일치는 이 파일의 cargo 검체
+/// `t2_clear_verify_window_matches_autopilot_settle` 가 잡는다(파이썬 원문을 include_str 로 대조).
+const CLEAR_VERIFY_SECS: u64 = 75;
+
+/// cycle-agent 결과 → exit code(순수 · 회귀 핀 대상). 머리표 없는 에러는 종전대로 1.
+fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) if e.starts_with(CLEAR_UNVERIFIED_TOKEN) => EXIT_CLEAR_UNVERIFIED,
+        Err(e) if e.starts_with(CLEAR_UNMEASURABLE_TOKEN) => EXIT_CLEAR_UNMEASURABLE,
+        Err(_) => 1,
+    }
+}
+
+/// clear 실효 판정 결과(순수).
+#[derive(Debug, PartialEq, Eq)]
+enum ClearEffect {
+    /// clear 전후 statusline session_file 이 달라졌다 — 새 대화가 시작됐다.
+    Verified,
+    /// 전 값은 있었으나 창 안에 교체가 관측되지 않았다.
+    Unverified,
+    /// clear 직전 값을 못 쟀다(statusline 없는 에이전트 · usage 부재) — 측정 불능은 통과가 아니다.
+    Unmeasurable,
+}
+
+/// surface 행의 statusline session_file(순수). source 가 statusline 이 아니면 None —
+/// transcript/rollout 류 추정치는 판정에 쓰지 않는다(autopilot measure() 와 같은 채택 규칙).
+fn statusline_session_file(entry: &Value) -> Option<String> {
+    let u = &entry["usage"];
+    if u["source"].as_str() != Some("statusline") {
+        return None;
+    }
+    u["session_file"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// clear 전후 session_file 로 실효를 판정한다(순수 · 회귀 핀 대상).
+fn clear_effect_verdict(pre: Option<&str>, post: Option<&str>) -> ClearEffect {
+    match (pre, post) {
+        (None, _) => ClearEffect::Unmeasurable,
+        (Some(a), Some(b)) if a != b => ClearEffect::Verified,
+        _ => ClearEffect::Unverified,
+    }
+}
+
 /// queue.deliver 거부 exit 판정(순수) — request() 에러 문자열("code: message")의 code 접두로
 /// '안전 게이트 거부'(exit 7)와 '오류'(exit 1)를 가른다. 게이트 코드 목록은 데몬
 /// governance::ForceDeliverDenied::code() + handlers "queue.deliver" 게이트 ①②와 1:1 계약 —
@@ -17213,6 +17284,12 @@ fn run_cycle_agent(
         // S5(§2.2): clear 직전 대상 surface를 quiescing으로 마킹 → 채널 inbox 주입이 clear·복원
         // 구간 동안 보류된다(C0 배달기가 이 상태를 읽음). autopilot 60% clear가 상시 조건이므로
         // 이게 채널×clear 레이스의 실질 봉합이다.
+        // [결재 7ⓑ] clear 실효 판정의 '전' 값 — clear 직전에 잰다(저장·handshake 대기 동안
+        // 세션이 바뀌었을 수 있으므로 함수 머리의 entry 를 재사용하지 않는다).
+        let pre_session_file = surface_entry(sid)
+            .ok()
+            .as_ref()
+            .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
         let clear_resume = (|| -> Result<(), String> {
             // 4) 입력 버퍼 정리 + clear
@@ -17244,16 +17321,50 @@ fn run_cycle_agent(
         // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제).
         let _ = set_surface_quiescing(sid, false);
         clear_resume?;
-        println!("cycle complete → surface:{sid} ({role_name})");
-        Ok(())
-    })();
-    match result {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("error: {e}");
-            1
+        // 6) [결재 7ⓑ] clear 실효 확인 — 키 입력 송신은 행위이고 결과가 아니다.
+        //    session_file 교체가 관측될 때만 exit 0. 미관측·측정 불능은 EXIT_CLEAR_UNVERIFIED.
+        let effect = match pre_session_file.as_deref() {
+            None => clear_effect_verdict(None, None),
+            Some(pre) => {
+                eprintln!("[cycle 6/6] clear 실효 확인 (statusline session_file 교체, 최대 {CLEAR_VERIFY_SECS}s)");
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(CLEAR_VERIFY_SECS);
+                loop {
+                    let post = surface_entry(sid)
+                        .ok()
+                        .as_ref()
+                        .and_then(statusline_session_file);
+                    let v = clear_effect_verdict(Some(pre), post.as_deref());
+                    if v == ClearEffect::Verified || std::time::Instant::now() >= deadline {
+                        break v;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        };
+        match effect {
+            ClearEffect::Verified => {
+                println!(
+                    "cycle complete → surface:{sid} ({role_name}) · clear 실효 확인(session_file 교체)"
+                );
+                Ok(())
+            }
+            ClearEffect::Unverified => Err(format!(
+                "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {CLEAR_VERIFY_SECS}s 안에 \
+                 session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
+                 중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). 성공으로 읽지 마라"
+            )),
+            ClearEffect::Unmeasurable => Err(format!(
+                "{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나 실효 측정 불능 — clear 직전 \
+                 statusline session_file 이 없다(statusline 미보고 에이전트 · usage 부재). \
+                 측정 불능은 통과가 아니다"
+            )),
         }
+    })();
+    if let Err(e) = &result {
+        eprintln!("error: {e}");
     }
+    cycle_agent_exit(&result)
 }
 
 /// T2-5 노드 복구: 죽은 에이전트를 같은 surface에서 재기동 + 지침 재주입 + 복원 포인터
@@ -30827,6 +30938,124 @@ mod tests {
     ///    지금은 표식(`GATE_ID_INJECT_HELD`) + `[RECOVER]` 이월 + rc 78 이다.
     /// ⓑ `agent_alive == Some(true)` 전처리 안전 거부도 rc 1 → kill 이었다(TOCTOU: 죽음 확정
     ///    스냅샷 뒤 사람이 다시 띄운 에이전트를 그 자기보호 규칙이 죽인다).
+    /// [결재 7ⓑ · T2] cycle-agent 종료코드 계약 — 검체 4종(CEO 조건 3):
+    /// ⓐ clear 실효 관측 → 0 ⓑ 미관측 → 80 ⓒ 측정 불능 → 81 ⓓ 종전 오류 경로 → 1 (회귀 0).
+    #[test]
+    fn t2_cycle_agent_exit_codes_split_verified_unverified_unmeasurable() {
+        // 코드 계약 — 서로 다르고 형제 exit 과 겹치지 않는다.
+        assert_eq!((EXIT_CLEAR_UNVERIFIED, EXIT_CLEAR_UNMEASURABLE), (80, 81));
+        for reserved in [
+            0,
+            1,
+            2,
+            EXIT_QUEUE_GATE_REFUSED,
+            EXIT_BOOT_BUSY,
+            cys::EXIT_GATE_PENDING,
+            EXIT_RECOVER_REFUSED,
+        ] {
+            assert_ne!(EXIT_CLEAR_UNVERIFIED, reserved, "80 이 형제 exit 과 충돌: {reserved}");
+            assert_ne!(EXIT_CLEAR_UNMEASURABLE, reserved, "81 이 형제 exit 과 충돌: {reserved}");
+        }
+        let (a, b) = ("/s/old.jsonl", "/s/new.jsonl");
+        // ⓐ clear 가 실제로 먹었다 = session_file 교체 → Verified → 0
+        assert_eq!(clear_effect_verdict(Some(a), Some(b)), ClearEffect::Verified);
+        assert_eq!(cycle_agent_exit(&Ok(())), 0);
+        // ⓑ 전 값은 있는데 교체 미관측(같은 파일 · 사후 값 소실) → Unverified → 80
+        assert_eq!(clear_effect_verdict(Some(a), Some(a)), ClearEffect::Unverified);
+        assert_eq!(clear_effect_verdict(Some(a), None), ClearEffect::Unverified);
+        assert_eq!(
+            cycle_agent_exit(&Err(format!("{CLEAR_UNVERIFIED_TOKEN} 교체 미관측"))),
+            80
+        );
+        // ⓒ 전 값을 못 쟀다 → Unmeasurable → 81 (사후 값이 있어도 '교체'를 말할 근거가 없다)
+        assert_eq!(clear_effect_verdict(None, None), ClearEffect::Unmeasurable);
+        assert_eq!(clear_effect_verdict(None, Some(b)), ClearEffect::Unmeasurable);
+        assert_eq!(
+            cycle_agent_exit(&Err(format!("{CLEAR_UNMEASURABLE_TOKEN} statusline 없음"))),
+            81
+        );
+        // ⓓ 종전 오류(저장 검증 실패 · 검증자 거부/timeout · 부재 surface)는 그대로 1 —
+        //    머리표가 없으면 새 코드로 새지 않는다. 두 머리표도 서로를 흡수하지 않는다.
+        for e in [
+            "저장 검증 실패 — 120s 내 파일 갱신 없음. cycle 중단 (clear 미실행)",
+            "검증자 응답 없음 (timeout) — clear 중단",
+            "surface:7 이미 종료됨",
+            "",
+        ] {
+            assert_eq!(cycle_agent_exit(&Err(e.to_string())), 1, "종전 경로 회귀: {e}");
+        }
+        assert!(!CLEAR_UNVERIFIED_TOKEN.starts_with(CLEAR_UNMEASURABLE_TOKEN));
+        assert!(!CLEAR_UNMEASURABLE_TOKEN.starts_with(CLEAR_UNVERIFIED_TOKEN));
+    }
+
+    /// [T2] statusline 채택 규칙 — source=statusline 인 session_file 만 판정에 쓴다.
+    #[test]
+    fn t2_statusline_session_file_adopts_only_statusline_source() {
+        let ok = json!({"usage": {"source": "statusline", "session_file": "/s/x.jsonl"}});
+        assert_eq!(statusline_session_file(&ok).as_deref(), Some("/s/x.jsonl"));
+        for bad in [
+            json!({"usage": {"source": "transcript", "session_file": "/s/x.jsonl"}}),
+            json!({"usage": {"source": "statusline", "session_file": ""}}),
+            json!({"usage": {"source": "statusline"}}),
+            json!({"usage": null}),
+            json!({}),
+        ] {
+            assert_eq!(statusline_session_file(&bad), None, "채택 금지 행: {bad}");
+        }
+    }
+
+    /// [T2] run_cycle_agent 배선 핀 — 'cycle complete'(성공 문면)는 Verified 팔에서만 나오고,
+    /// 전 값은 clear **직전**(quiescing 앞)에 재며, 종료코드는 순수 매퍼 한 곳에서만 정한다.
+    #[test]
+    fn t2_run_cycle_agent_reports_success_only_on_observed_clear() {
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "run_cycle_agent");
+        let pre = body.find("let pre_session_file").expect("clear 직전 전 값 측정 없음");
+        let quiesce = body
+            .find("set_surface_quiescing(sid, true)?;")
+            .expect("quiescing 배선 소실");
+        assert!(pre < quiesce, "전 값은 clear 직전(quiescing 앞)에 재야 한다");
+        let verified_arm = body
+            .find("ClearEffect::Verified => {")
+            .expect("Verified 팔 없음");
+        let complete = body.find("cycle complete").expect("성공 문면 소실");
+        assert!(complete > verified_arm, "성공 문면이 Verified 팔 밖에서 나온다");
+        assert_eq!(body.matches("cycle complete").count(), 1, "성공 문면이 두 곳 이상");
+        assert!(body.contains("{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나"));
+        assert!(body.contains("{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나"));
+        assert!(
+            body.trim_end().ends_with("cycle_agent_exit(&result)\n}")
+                || body.contains("cycle_agent_exit(&result)"),
+            "종료코드가 순수 매퍼를 거치지 않는다"
+        );
+        assert!(
+            !body.contains("=> 0,"),
+            "run_cycle_agent 안에 직접 0 을 내는 팔이 남아 있다(매퍼 우회)"
+        );
+    }
+
+    /// [T2 · CEO 조건 2] 관측 창 드리프트 검출 — 러스트 CLEAR_VERIFY_SECS 와 팩
+    /// javis_cycle_autopilot.py 의 SETTLE_SECS 는 같은 값이어야 한다(한 상수를 공유할 수 없는
+    /// 두 언어라 이 검체가 둘을 묶는다).
+    #[test]
+    fn t2_clear_verify_window_matches_autopilot_settle() {
+        let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let line = py
+            .lines()
+            .find(|l| l.starts_with("SETTLE_SECS = "))
+            .expect("autopilot 에 SETTLE_SECS 정의가 없다");
+        let val: f64 = line["SETTLE_SECS = ".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|t| t.parse().ok())
+            .expect("SETTLE_SECS 리터럴 파싱 실패");
+        assert_eq!(
+            val, CLEAR_VERIFY_SECS as f64,
+            "CLEAR_VERIFY_SECS({CLEAR_VERIFY_SECS}) ≠ autopilot SETTLE_SECS({val}) — 양쪽을 함께 바꿔라"
+        );
+        assert!(py.contains("CLEAR_VERIFY_SECS"), "파이썬 쪽 교차 주석 소실");
+    }
+
     #[test]
     fn c4_node_recover_nondestructive_reasons_do_not_reach_the_kill_path() {
         // ① 종료코드 계약 — 예약 exit·형제 코드와 겹치지 않는다.
