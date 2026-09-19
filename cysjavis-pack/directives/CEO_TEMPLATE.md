@@ -662,9 +662,16 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
      ②MASTER_TODO 갱신 ③진행 중 작업 로컬 커밋(push 금지 — denylist) ④checksum 산출 → CSO에
      "clear 준비 완료(SAVED+checksum)"를 push한다.
   4. **CSO 검증→집행(주인 대신)**: CSO가 SESSION_STATE를 재독·검증(checksum 대조·최신 mtime —
-     자연어 신뢰 금지·결정론) 후 `cys cycle-agent --role master --verifier <cso>`로 master surface에
+     자연어 신뢰 금지·결정론) 후 `cys cycle-agent`로 master surface에
      `/clear`+Enter를 주인 대신 집행한다(surface는 role 주소로 해소·하드코딩 금지·master role 확인 후·
      `--force-no-verify` 평시 금지).
+     호출 예: `cys cycle-agent --role <산출자역할> --verifier worker` . 규칙 4:
+     ①검증자 기본은 worker 다. ★CSO 를 검증자로 지정하지 마라 — role-capability-gate 의 feed 허용
+     동사에 reply 가 없어 구조적으로 판정을 낼 수 없다.
+     ②★호출자 ≠ 검증자. 자기가 호출하면서 자기를 검증자로 지정하면 동기 호출 중 블록돼 자기 inbox 의
+     handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 fail-closed 로 거부한다.
+     ③산출자 ≠ 검증자(producer≠evaluator).
+     ④산출자가 worker 인 경우 검증자는 ★다른 좌석을 지정한다 — 리뷰어 좌석 등, feed reply 권한 실측을 선행한다.
   5. **master 자동복구**: `/clear` 직후 SessionStart:clear hook이 SESSION_STATE·RECOVERY를 주입 →
      master는 즉시 자율 복구(RECOVERY 프로토콜·G2 실측 대조)하고 미해결 지점부터 재개한다.
   6. **🔴 무응답 정책(제품 기본 절차 = 독립검증 후 조건부 집행)**: master가 통보 후

@@ -262,7 +262,11 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   **전부** 충족되면 master 가 ack 를 보내지 못해도 §2 대로 집행한다 — ①데몬이 발화한
   `context.threshold`(60%) 수신 ②안전지점 확인(master 가 게이트·커밋 중간이 아님 · 오너 실시간 입력
   중 아님 · AUTOPILOT_PAUSED 아님) ③저장 상태의 **독립 검증**(checksum 대조·최신 mtime — master 의
-  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier <너>` **1콜**
+  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker` **1콜**
+  ★검증자에 ★너 자신(cso)을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중
+  블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82
+  verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼
+  수 없다.
   (`--force-no-verify` 금지 · 키를 손으로 치지 않는다). 넷 중 **하나라도 결측·판정 불능**이면 이 경계가
   아니라 ④의 보류이고, 낡음(미저장 위험)은 clear 금지 + 오너 escalation 이다(§2 무응답 정책 그대로 ·
   결측은 값이 아니다).
@@ -303,7 +307,11 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   (master가 게이트/커밋 중간 아님·오너 실시간 입력 중 아님) 확인 후 master에 "[CSO·주인 대신]
   clear 시점 — 세션 재개 준비하라" 통보 ③master가 SESSION_STATE(현재위치+다음액션큐)·TODO 갱신·
   로컬커밋·checksum 후 "준비 완료(SAVED+checksum)" ack ④**네가 재독·검증**(checksum 대조·최신
-  mtime — master 자연어 신뢰 금지·결정론) 후 `cys cycle-agent --role master --verifier <너>`로 주인
+  mtime — master 자연어 신뢰 금지·결정론) 후 `cys cycle-agent --role master --verifier worker`로 주인
+  ★검증자에 ★너 자신(cso)을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중
+  블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82
+  verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼
+  수 없다.
   대신 `/clear`+Enter 집행(surface는 role 주소 해소·하드코딩 금지·master role 확인 후·
   `--force-no-verify` 금지) ⑤SessionStart hook 복원·재개 확인 후 master에 결과 push. **🔴무응답
   정책(제품 기본 절차 = 독립검증 후 조건부 집행)**: master가 타임아웃(기본 120s) 내 ack 못

@@ -1490,6 +1490,52 @@ def release_quiesce(surface, cycle_id, role, reason, runner=run, log_path=None):
     return ok, "" if ok else "quiesce --off rc=%d" % rc
 
 
+def _sid_int(v):
+    """surface 식별자 정규화(순수) — int · "surface:N" · "N" → int. 그 밖은 None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        t = v.strip()
+        if t.startswith("surface:"):
+            t = t[len("surface:"):]
+        if t.isdigit():
+            return int(t)
+    return None
+
+
+def verifier_collision(caller_env, verifier_sid, target_sid):
+    """[결재 6 ⓑ] 호출자==검증자 / 대상==검증자 사전검사(순수) → (refuse, reason).
+
+    교착 기제(2026-09-17 1회차 실측): cycle-agent 는 **동기**로 검증자의 feed reply 를
+    기다린다. 호출자 pane 이 곧 검증자면 호출자는 그 대기 속에 블록돼 자기 inbox 의
+    handshake 에 답할 시점이 없다 → timeout. 대상이 검증자면 산출자가 자기 저장을
+    판정한다(§11 producer≠evaluator 위반).
+    ★fail-closed — 호출자가 pane 인데(CYS_SURFACE_ID 존재) 검증자 좌석을 해소하지 못하면
+      '겹치지 않는다'를 증명할 수 없으므로 거부한다. 호출자가 pane 이 아니면(데몬 스케줄 잡)
+      호출자 교착은 성립하지 않는다 — 검증자 부재는 cycle-agent 가 스스로 거부한다.
+    ★쓰기 동사(execute)에만 건다. 읽기 동사(status·audit·self-test)는 막지 않는다.
+    """
+    nxt = (" 다음 행동: execute 를 검증자 좌석이 아닌 곳(데몬 스케줄 잡·다른 pane)에서 실행하고, "
+           "검증자 좌석이 없으면 bootstrap-verifier --ensure 로 세워라")
+    raw = (caller_env or "").strip()
+    caller = _sid_int(raw) if raw else None
+    if raw and caller is None:
+        return True, "호출자 CYS_SURFACE_ID=%r 판독 불가 — 검증자와의 비중복을 증명할 수 없다.%s" % (raw, nxt)
+    vs = _sid_int(verifier_sid)
+    ts = _sid_int(target_sid)
+    if caller is not None and vs is None:
+        return True, ("호출자 surface:%d 는 pane 인데 검증자(%s) 좌석 해소 불가 — "
+                      "비중복 증명 불가.%s" % (caller, VERIFIER_ROLE, nxt))
+    if caller is not None and caller == vs:
+        return True, ("호출자 surface:%d == 검증자 surface:%d — 동기 대기 중 자기 handshake 에 "
+                      "답할 수 없다(교착).%s" % (caller, vs, nxt))
+    if vs is not None and ts is not None and ts == vs:
+        return True, "대상 surface:%d == 검증자 — 산출자가 자기 저장을 판정한다(§11 위반).%s" % (ts, nxt)
+    return False, ""
+
+
 def cmd_execute(args):
     cid, role = args.cycle_id, args.role
     with _StateLock():
@@ -1509,6 +1555,15 @@ def cmd_execute(args):
     if killed:
         _finalize(cid, role, surface, "failed", {"reason": "집행 직전 kill-switch: %s" % kreason})
         return EXIT_KILL
+
+    # 0-b) [결재 6 ⓑ] 호출자==검증자 · 대상==검증자 사전검사 — 선통보(첫 쓰기) **앞**에서 거부.
+    vrow = surface_row(fetch_status(), VERIFIER_ROLE)
+    refuse, why = verifier_collision(os.environ.get("CYS_SURFACE_ID"),
+                                     (vrow or {}).get("surface_id"), surface)
+    if refuse:
+        _finalize(cid, role, surface, "failed",
+                  {"reason": "검증자 충돌 사전검사 거부(fail-closed): %s" % why})
+        return EXIT_GATE
 
     # 1) 선통보 (설계 v2 문안 고정 — 사전 저장 유발 금지)
     ok, why = push_line(role, PRENOTICE_TEXT)
@@ -2715,6 +2770,28 @@ def cmd_self_test(args):
     ar2 = audit_records([{"ts": 10, "cycle_id": 5, "phase": "would_fire", "role": "w",
                           "detail": {}}])
     t.check("관측 미짝 → unpaired 계상", ar2["unpaired"] == 1)
+
+    # 9-b) ★[결재 6 ⓑ · T3] 호출자==검증자 · 대상==검증자 사전검사(쓰기 동사 execute 전용)
+    print("[9-b] 검증자 충돌 사전검사")
+    r, w = verifier_collision("26", 26, "surface:35")
+    t.check("★[6ⓑ] 호출자 == 검증자 → 거부(교착)", r and "교착" in w and "다음 행동" in w, w)
+    r, w = verifier_collision("41", 26, "surface:26")
+    t.check("★[6ⓑ] 대상 == 검증자 → 거부(producer≠evaluator)", r and "§11" in w, w)
+    r, w = verifier_collision("41", None, "surface:35")
+    t.check("★[6ⓑ] 호출자 pane + 검증자 해소 불능 → 거부(fail-closed)", r and "해소 불가" in w, w)
+    r, w = verifier_collision("x9", 26, "surface:35")
+    t.check("★[6ⓑ] 호출자 식별자 판독 불가 → 거부(fail-closed)", r, w)
+    t.check("★[6ⓑ] 정상(호출자·대상·검증자 상이) → 통과",
+            verifier_collision("41", 26, "surface:35") == (False, ""))
+    t.check("★[6ⓑ] 호출자 pane 아님(스케줄 잡) + 검증자 부재 → 통과(교착 불성립 · 범위 불확대)",
+            verifier_collision(None, None, "surface:35") == (False, "")
+            and verifier_collision("", None, "surface:35") == (False, ""))
+    _ex_src = _insp.getsource(cmd_execute)
+    t.check("★[6ⓑ] execute 에서 사전검사가 선통보(첫 쓰기) 앞",
+            0 <= _ex_src.find("verifier_collision(") < _ex_src.find("push_line(role, PRENOTICE_TEXT)"))
+    t.check("★[6ⓑ] 읽기 동사(status·audit)에는 사전검사 미배선(fail-closed 는 쓰기 동사만)",
+            "verifier_collision" not in _insp.getsource(cmd_status)
+            and "verifier_collision" not in _insp.getsource(cmd_audit))
 
     # 10) 계약 블록 동일성 (이음매 드리프트)
     print("[10] 두 스크립트 계약 블록 동일성")

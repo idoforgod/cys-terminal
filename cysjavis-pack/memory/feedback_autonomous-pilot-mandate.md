@@ -19,7 +19,11 @@ metadata:
 self-clear 절대 금지(자기참조 = 자기 전원 차단). 컨텍스트 clear는 **CSO가 "주인(오너)을
 대신하여"** 집행한다. 6단계: ①master 60% 자기보고 ②CSO 시점 판단·통보(개시) ③master
 준비(SESSION_STATE·TODO·로컬커밋·checksum)·"준비 완료" ack ④CSO 재독·검증 후
-`cys cycle-agent --role master --verifier <cso>`로 주인 대신 `/clear` ⑤master 자동복구.
+`cys cycle-agent --role master --verifier worker`로 주인 대신 `/clear` ⑤master 자동복구.
+★검증자에 CSO 자신을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중
+블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82
+verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼
+수 없다.
 무응답 시 CSO 독립검증 후 조건부 집행(신선=집행·낡음=오너 escalation). **축3** 작업 단위
 종료→`javis_orchestra.py next-action`으로 다음 미완 작업 자가 착수(완료 push/
 `cys schedule add --in` 원샷 웨이크업 트리거).
