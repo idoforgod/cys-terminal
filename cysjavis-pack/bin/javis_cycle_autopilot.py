@@ -513,6 +513,9 @@ PRENOTICE_TEXT = ("[CYCLE-PRE] 사이클 예정. **[CYCLE] 지시가 도착하�
                   "대상 파일을 내용이 최신이어도 물리적으로 재기록하라")
 RESUME_BASE = ("[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 "
                "직전 작업을 이어가라.")
+# [결재 7ⓒ] 재개 포인터는 하드코딩 경로가 아니라 **lease 에 실제로 해소된 복구 파일**을 싣는다.
+#   RESUME_BASE 는 파일 목록이 없을 때(구 호출자 호환)만 쓰는 폴백 문면이다.
+RESUME_FMT = "[RESUME] 컨텍스트 순환 완료. %s 를 읽고 직전 작업을 이어가라."
 
 
 def ctx_threshold(role, packdir=None):
@@ -693,7 +696,17 @@ def resolve_save_files(role, row, packdir=None, runner=run):
     """
     todo = role_todo_file(role, packdir)
     cwd, cwd_src = surface_cwd(row, runner)
-    rd, how = node_round_dir(cwd)
+    # [결재 7ⓐ·15] 팩 기준 우선 — `<pack>/round` 가 실재하면 그것이 1순위 정본이다.
+    #   종전엔 cwd 상향탐색이 1순위라, 복원 정본이 없는 **미끼 `_round`**(예: 홈의 `~/_round` —
+    #   save-state.sh 가 `.state_log` 만 쌓는 자리)가 하나라도 있으면 거기서 멈춰 SESSION_STATE
+    #   부재 경로를 lease 에 넣었다(에러 0 · 조용한 빈손). role_todo_file() 이 이미 쓰는 같은
+    #   `<pack>/round` 를 SESSION_STATE 해소에도 1순위로 써서 두 파일의 출처를 한 곳으로 모은다.
+    #   cwd 상향탐색(node_round_dir)은 팩 round/ 가 없을 때의 **폴백**으로 강등.
+    pack_round = os.path.join(packdir or pack_dir(), "round")
+    if os.path.isdir(pack_round):
+        rd, how = pack_round, "pack-round"
+    else:
+        rd, how = node_round_dir(cwd)
     fallback = rd is None
     if fallback:
         # [R2 유령 lease 수리·안A] 해석 실패 폴백 = 팩 정본(실존 출하 디렉터리) — 유령 경로 금지.
@@ -715,8 +728,13 @@ def resolve_save_files(role, row, packdir=None, runner=run):
             "cwd_source": cwd_src, "fallback": fallback}
 
 
-def resume_text(cycle_id):
-    return "%s (nonce=%s)" % (RESUME_BASE, nonce_for(cycle_id))
+def resume_text(cycle_id, files=None):
+    """재개 문면 — [결재 7ⓒ] `files`(lease 저장 목록)가 있으면 그 **실제 경로**를 싣는다.
+
+    nonce 접미 `(nonce=...)` 형식은 불변(_count_nonce 의 정확 문양 대조가 소비한다).
+    """
+    head = (RESUME_FMT % " · ".join(files)) if files else RESUME_BASE
+    return "%s (nonce=%s)" % (head, nonce_for(cycle_id))
 
 
 def build_cycle_agent_argv(role, cycle_id, files):
@@ -735,7 +753,7 @@ def build_cycle_agent_argv(role, cycle_id, files):
             "--role", role,
             "--verifier", VERIFIER_ROLE,
             "--timeout", str(CYCLE_AGENT_TIMEOUT),
-            "--resume-text", resume_text(cycle_id)] + \
+            "--resume-text", resume_text(cycle_id, files)] + \
         [x for f in files for x in ("--save-file", f)]
 
 
@@ -2410,8 +2428,9 @@ def cmd_self_test(args):
     t.check("ACTIVE_PROJECT 폴백 동작",
             rd6 == os.path.join(tmpd, "a", "_round") and how6 == "active-project", str(rd6))
 
-    # 7-b) ★R2 BLOCK 회귀 핀 — master cwd=홈이면 홈 정본이 나와야 한다
-    #   (핀 의도: 실존 _round 를 cwd-ascend 로 찾는 경로 — 폴백과 무관. 대상만 픽스처 홈.)
+    # 7-b) R2 핀 — **팩 round/ 가 없을 때의 폴백 계층**: master cwd=홈이면 홈 _round 가 나온다.
+    #   [결재 7ⓐ·15 이후] packdir="/PK" 는 round/ 가 실재하지 않는 경로라 팩 1순위를 건너뛰고
+    #   cwd-ascend 폴백을 탄다 — 이 핀은 이제 '폴백 계층이 살아 있다'를 고정한다(1순위는 7-b2).
     sfr_m = resolve_save_files("master", norow("master", FHOME, 198), packdir="/PK")
     t.check("★[R2-A] master(cwd=홈) save-file = 홈 _round 정본",
             sfr_m["files"] == [os.path.join(FHOME, "_round", "SESSION_STATE.md"),
@@ -2432,6 +2451,35 @@ def cmd_self_test(args):
     t.check("reviewer-codex → REVIEWER_CODEX_TODO.md",
             resolve_save_files("reviewer-codex", norow("reviewer-codex", FHOME),
                                packdir="/PK")["files"] == ["/PK/round/REVIEWER_CODEX_TODO.md"])
+
+    # 7-b2) ★[결재 7ⓐ·15] 미끼 `_round` 존재 회귀 — 이 버그가 오래 산 이유는 위 핀들이
+    #   전부 '팩 round/ 부재' 픽스처였기 때문이다. 실기 형상을 그대로 재현한다: cwd(홈)에
+    #   SESSION_STATE.md 가 **없는** `_round`(미끼 — .state_log 만 있음)가 있고, 팩 round/ 는 실재.
+    BAITHOME = os.path.join(tmpd, "baithome")
+    os.makedirs(os.path.join(BAITHOME, "_round"))
+    open(os.path.join(BAITHOME, "_round", ".state_log"), "w").write("bait\n")
+    BAITPACK = os.path.join(tmpd, "baitpack")
+    os.makedirs(os.path.join(BAITPACK, "round"))
+    sfr_bait = resolve_save_files("master", norow("master", BAITHOME, 198), packdir=BAITPACK)
+    t.check("★[7ⓐ] 미끼 _round 가 있어도 master SESSION_STATE = 팩 round 정본",
+            sfr_bait["files"] == [os.path.join(BAITPACK, "round", "SESSION_STATE.md"),
+                                  os.path.join(BAITPACK, "round", "MASTER_TODO.md")]
+            and sfr_bait["how"] == "pack-round" and sfr_bait["fallback"] is False,
+            str(sfr_bait))
+    t.check("★[7ⓐ] 미끼 경로는 lease 에 들어가지 않는다",
+            os.path.join(BAITHOME, "_round", "SESSION_STATE.md") not in sfr_bait["files"],
+            str(sfr_bait["files"]))
+    t.check("★[7ⓐ] 음성 대조: node_round_dir 단독은 여전히 미끼를 고른다(폴백 계층 거동 불변)",
+            node_round_dir(BAITHOME)[0] == os.path.join(BAITHOME, "_round"))
+    # 7-b3) ★[결재 7ⓒ] 재개 문면 = lease 실제 경로(하드코딩 `_round/SESSION_STATE.md` 아님)
+    argv_bait = build_cycle_agent_argv("master", 7654321, sfr_bait["files"])
+    rt_bait = argv_bait[argv_bait.index("--resume-text") + 1]
+    t.check("★[7ⓒ] resume-text 가 해소된 SESSION_STATE 절대경로를 싣는다",
+            os.path.join(BAITPACK, "round", "SESSION_STATE.md") in rt_bait, rt_bait)
+    t.check("★[7ⓒ] resume-text 에 하드코딩 '_round/SESSION_STATE.md' 없음",
+            "_round/SESSION_STATE.md" not in rt_bait, rt_bait)
+    t.check("★[7ⓒ] nonce 접미 형식 불변((nonce=...) 정확 문양)",
+            rt_bait.endswith("(nonce=%s)" % nonce_for(7654321)), rt_bait)
 
     # 7-c) cwd 해석 실패 → 팩 정본(pack/round) 폴백 + fallback 플래그 [R2 유령 lease 수리·안A]
     #   [픽스처] CYS_ROOT 를 _round 없는 tmpdir 로 못 박아 실HOME ACTIVE_PROJECT 폴백을

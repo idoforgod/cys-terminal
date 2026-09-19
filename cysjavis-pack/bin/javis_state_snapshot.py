@@ -127,19 +127,31 @@ def project_round_dir(env=None, cwd=None):
       ① JAVIS_ROOT 설정 → `<JAVIS_ROOT>/_round`  (종전 1순위 — 프로젝트 레인 거동 불변)
       ② 팩 env 키 중 **첫 비어있지 않은 값**의 `<pack>/round` 가 디렉터리로 실재 → 그것
          (키 순서·'첫 값이 이긴다' 계약은 PACK_DIR_ENV_KEYS 정본과 동일 — 뒤 키를 더 보지 않는다)
+      ②' ★[결재 15] 팩 env 키가 **하나도 없으면** `<HOME>/.cys/pack/round` 가 디렉터리로 실재할 때 그것
+         (팩 스크립트 기본값 `~/.cys/pack` 과 동일). 종전엔 여기서 곧장 ③으로 떨어져 cwd 가 홈이면
+         복원 정본이 없는 **미끼 `~/_round`**(save-state.sh 가 .state_log 만 쌓는 자리)를, cwd 가 `/` 면
+         `/_round` 를 골라 round 소스 0건이 됐다(실측 2026-09-19: env 有 round 7건 / 無 0건).
+         ★팩 키가 **설정돼 있는데** round/ 가 없을 때는 이 폴백을 타지 않는다 — 명시된 (부서)팩 대신
+         본부 팩을 담으면 레인 교차 오염이다(②의 '첫 값이 이긴다' 계약 보존).
       ③ 그 밖 → `<cwd>/_round`  (종전 폴백 그대로 — 사람이 프로젝트 루트에서 손으로 부르는 경우)
     env/cwd 주입은 self-test·bin/tests/test_state_snapshot_root.py 밀폐용(기본=실환경)."""
     env = os.environ if env is None else env
     root = env.get("JAVIS_ROOT")
     if root:
         return os.path.join(root, "_round")
+    pack_key_set = False
     for key in PACK_DIR_ENV_KEYS:
         pack = env.get(key)
         if pack:
+            pack_key_set = True
             cand = os.path.join(pack, "round")
             if os.path.isdir(cand):
                 return cand
             break
+    if not pack_key_set and env.get("HOME"):
+        cand = os.path.join(env["HOME"], ".cys", "pack", "round")
+        if os.path.isdir(cand):
+            return cand
     return os.path.join(cwd or os.getcwd(), "_round")
 
 

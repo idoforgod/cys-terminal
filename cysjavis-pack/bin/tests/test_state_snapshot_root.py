@@ -76,6 +76,23 @@ try:
           ss.project_round_dir({"CYS_PACK_DIR": "", "JAVIS_PACK_DIR": pack}, cwd="/") ==
           os.path.join(pack, "round"))
 
+    # ── A'. ★[결재 15] 팩 env 전무 + 미끼 `_round` 존재 — 기본 팩 폴백 ─────────────────
+    #   실기 형상: cwd=홈에 SESSION_STATE.md 없는 `_round`(save-state.sh 의 .state_log 자리)가 있다.
+    #   종전 ③폴백은 그 미끼를 골랐다(round 소스 0건). 기본 팩 `<HOME>/.cys/pack/round` 가 먼저다.
+    bhome = os.path.join(root, "bhome")
+    os.makedirs(os.path.join(bhome, "_round"))                    # 미끼
+    os.makedirs(os.path.join(bhome, ".cys", "pack", "round"))     # 기본 팩 정본
+    check("A8 ★팩 env 전무 + 미끼 _round → <HOME>/.cys/pack/round (미끼 불채택)",
+          ss.project_round_dir({"HOME": bhome}, cwd=bhome) ==
+          os.path.join(bhome, ".cys", "pack", "round"))
+    check("A9 ★팩 키가 설정돼 있으면(round 부재) 기본 팩으로 새지 않는다 — 레인 교차 오염 차단",
+          ss.project_round_dir({"HOME": bhome, "CYS_PACK_DIR": nopack}, cwd="/tmp") ==
+          os.path.join("/tmp", "_round"))
+    nohome = os.path.join(root, "nohome")
+    os.makedirs(nohome)
+    check("A10 기본 팩 round/ 도 없으면 cwd 폴백(존재하지 않는 경로 불채택)",
+          ss.project_round_dir({"HOME": nohome}, cwd="/tmp") == os.path.join("/tmp", "_round"))
+
     # ── B/C. 데몬 형상 e2e + 음성 대조 ──────────────────────────────────────────
     def run_snapshot(with_pack):
         """cwd '/' · JAVIS_ROOT 없음 형상으로 snapshot 1회 → (rc, 세대 manifest 파일명 집합)."""
@@ -128,10 +145,44 @@ try:
           "rc=%s names=%r out=%r" % (rc_n, sorted(names_n), out_n[-200:]))
     check("C4 양성 형상에도 무관 소스가 함께 담긴다(두 실행의 소스 집합 차이가 팩 round 뿐임을 고정)",
           any("topology.json" in n for n in names_p), repr(sorted(names_p)))
+
+    # ── D. ★[결재 15] e2e — 팩 env 전무 · cwd=홈 · 미끼 _round 존재(실기 phoenix 형상) ─────
+    home = tempfile.mkdtemp(prefix="snap-bait-", dir=root)
+    dp = os.path.join(home, ".cys", "pack", "round")
+    os.makedirs(dp)
+    with open(os.path.join(dp, "SESSION_STATE.md"), "w", encoding="utf-8") as f:
+        f.write("# 복원 정본\n")
+    with open(os.path.join(dp, "WORKER_TODO.md"), "w", encoding="utf-8") as f:
+        f.write("- [ ] 노드 할 일\n")
+    os.makedirs(os.path.join(home, "_round"))                   # 미끼(SESSION_STATE 없음)
+    with open(os.path.join(home, "_round", ".state_log"), "w", encoding="utf-8") as f:
+        f.write("bait\n")
+    st = os.path.join(home, ".local", "state", "cys")
+    os.makedirs(st)
+    with open(os.path.join(st, "topology.json"), "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+           "LANG": os.environ.get("LANG", "C.UTF-8")}
+    r = subprocess.run([PY, MOD, "snapshot"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env, cwd=home, timeout=120)
+    dnames = set()
+    gen_root = os.path.join(home, ".cys", "state-generations")
+    for g in sorted(os.listdir(gen_root)) if os.path.isdir(gen_root) else []:
+        mp = os.path.join(gen_root, g, "manifest.json")
+        if os.path.isfile(mp):
+            with open(mp, encoding="utf-8") as f:
+                for e in json.load(f).get("files", []):
+                    dnames.add(os.path.basename(e.get("source") or e.get("name") or ""))
+    check("D1 ★미끼 형상 실행 성공(팩 env 전무 · cwd=홈 · ~/_round 미끼)", r.returncode == 0,
+          "rc=%s out=%r" % (r.returncode, (r.stdout + r.stderr)[-200:]))
+    check("D2 ★미끼 형상에서도 SESSION_STATE.md 가 세대에 담긴다", "SESSION_STATE.md" in dnames,
+          repr(sorted(dnames)))
+    check("D3 ★미끼 형상에서도 WORKER_TODO.md 가 세대에 담긴다", "WORKER_TODO.md" in dnames,
+          repr(sorted(dnames)))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("\n=== %d/%d PASS ===" % (14 - len(fails), 14))
+print("\n=== %d/%d PASS ===" % (20 - len(fails), 20))
 if fails:
     print("FAIL: %s" % fails, file=sys.stderr)
     sys.exit(1)
