@@ -225,6 +225,13 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   자기가 검사할 대상을 오염시켜 '추가 파일' 오탐을 만든다(SEAL-1 과 같은 계급).
     ".github/workflows/release.yml",
     ".github/workflows/windows-build.yml",
+    # ★2026-09-22 통합(0.14.39 · WP-D-cli autopilot self-test) 등재. **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 강제점도 **아니다**. 니들은 이 모듈의 자기검체(`--self-test`)가 쓰는 **밀폐
+    #   env 한 줄**(`"PYTHONDONTWRITEBYTECODE": "1"`)이다 — javis_wakeup 배달 멱등키 전제를 셸 스텁
+    #   `cys` 로 재는 구간이라 `os.environ` 을 상속하지 않는 env 를 손으로 조립하고, 그 자리에서 봉인을
+    #   **벗기지 않고 상속 방향으로** 다시 건다(test_lane_redirect.py·test_role_authority_shell.py 와 같은 계급).
+    #   프로덕션 경로(틱·escalate)는 python 자식을 띄우지 않으므로 강제점 계수에 들어가지 않는다.
+    "cysjavis-pack/bin/javis_cycle_autopilot.py",
     # ★2026-09-08 P6 등재(0.14.31 · 역할 해소 단일 소유 모듈 신설). **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도, 강제점도 **아니다**. 이 모듈이 띄우는 자식은 Rust 바이너리 `cys` 하나뿐이고
     #   (`surface-role` 조회), 그 자식 env 는 부모 것을 그대로 복사해 넘긴다 — 즉 봉인을 **벗기지도
