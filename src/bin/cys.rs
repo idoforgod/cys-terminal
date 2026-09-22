@@ -17850,30 +17850,21 @@ fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> 
     Some(exact || relocated)
 }
 
-/// 이 트립이 **SessionStart 훅**의 것인가 — 표식은 레인당 1개라 모든 훅이 덮어쓴다.
-///
-/// ★(0.14.39 라운드3 · 성찰1 minor · 부트체인 minor) `script=` 를 보지 않으면 role-bootstrap.sh
-/// (UserPromptSubmit) 트립 하나가 24h 동안 SessionStart 선언을 강등해 그 좌석이 **상시 이중 주입**이
-/// 된다. 판독 불가(`unreadable`)와 `script=` 결측은 **보수적으로 강등**한다(결측은 값이 아니다 ·
-/// 실패 방향은 이중 주입 = 무해). 파이썬 정의처(`javis_preflight.lane_guard_tripped`)는 범용 진단용이라
-/// 그대로 두고 **소비처에서 거른다**.
-fn lane_trip_degrades_session_start(trip: &cys::pack::LaneGuardTrip) -> bool {
-    if trip.unreadable {
-        return true;
-    }
-    let script = trip.script.trim().replace('\\', "/");
-    let base = script.rsplit('/').next().unwrap_or("");
-    base.is_empty() || matches!(base, "session-start.sh" | "inject-context.sh")
-}
-
 /// 선언(agents.json) · 실설정 관측 · **레인 가드 조기 종료 표식**을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
 ///
 /// ★(0.14.39 · 부트체인 major ⓑ · 성찰2 major ⑥) 등록은 **실행 관측이 아니다**. `cys_lane_guard` 는
 /// 위임 대상이 absent·unreadable·no-redirect-line·already-redirected 면 훅 본문을 돌리지 않고 무발화
 /// exit 0 하며(cysjavis-pack/hooks/_lib.sh:345-408), 그 stderr 는 훅 프리루드의 `2>/dev/null` 이 삼킨다.
 /// 그 상태에서 '등록 사실' 만 보면 CLI 가 디렉티브를 생략해 **0회 주입**이 된다(오너 색인 🔒 축).
-/// 그래서 SessionStart 훅의 표식이 최근에 찍혀 있으면 선언을 강등한다 — 실패 방향은 **이중 주입(무해)** 쪽이고,
-/// 커밋이 선언한 비대칭("0회=치명 / 2회=무해")과 같은 방향이다.
+/// 그래서 어떤 훅이든 최근 레인 가드 트립 표식이 있으면 선언을 강등한다 — 실패 방향은 **이중 주입(무해)** 쪽이다.
+///
+/// ★(0.14.39 라운드4 · 부트체인 blocking/major) 라운드2 minor("role-bootstrap 트립으로 24h 이중 주입")는
+/// **기각**한다. 표식은 레인당 단일 슬롯이고 `cys_lane_mark` 가 덮어쓴다(cysjavis-pack/hooks/_lib.sh:297-308).
+/// 프리루드 소스마다 가드가 실행되므로(_lib.sh:911) `script=` 는 **마지막 기록자**일 뿐이다. 이것으로 거르면
+/// SessionStart 트립이 후속 훅에 덮인 좌석에서 CLI 주입까지 생략해 **0회 주입(치명)** 이 된다.
+/// 커밋이 선언한 비대칭("0회=치명 / 2회=무해")에서 그 minor 는 **무해 쪽**이었다. `script` 는 경고·진단에만 쓴다.
+/// 대안 ⓑ(`state/lane-guard-tripped.<script>` 훅별 표식)는 팩 변경 + 러스트 판독기 + `javis_preflight` 파리티 핀이
+/// 함께 움직여야 하므로 **이번 릴리스 범위 밖**임을 고지한다.
 fn effective_hooks_inject(
     declared: bool,
     observed: Option<bool>,
@@ -17881,7 +17872,7 @@ fn effective_hooks_inject(
 ) -> bool {
     declared
         && observed == Some(true)
-        && !lane_guard_trip.is_some_and(lane_trip_degrades_session_start)
+        && lane_guard_trip.is_none()
 }
 
 /// 훅 등록은 실행 완료 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 확인하게 한다.
@@ -18034,8 +18025,8 @@ fn run_cycle_agent(
             .flatten();
         let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());
         if declared_hooks_inject && !hooks_inject {
-            if let Some(trip) = lane_trip.as_ref().filter(|t| lane_trip_degrades_session_start(t)) {
-                eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — 레인 가드 조기 종료 표식(reason={} script={}) — 훅이 무발화 종료했을 수 있다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다", trip.reason, trip.script);
+            if let Some(trip) = lane_trip.as_ref() {
+                eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — 레인 가드 조기 종료 표식(reason={} script={}) — 훅이 무발화 종료했을 수 있다 · 표식은 레인당 1개라 script 는 마지막 기록자일 뿐이며 판정에 쓰지 않는다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다", trip.reason, trip.script);
             } else {
                 let path = hook_settings_path.as_ref()
                     .map(|path| path.display().to_string()).unwrap_or_else(|| "(설정 경로 없음)".into());

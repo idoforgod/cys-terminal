@@ -418,6 +418,9 @@ fn gate_on_screen<'a>(o: &Observed<'a>) -> Option<&'a Gate> {
 ///
 /// 그래서 부트 경로의 판정은 **한 톨도 약해지지 않는다**(아래 `Site::Boot => false`).
 /// 창이 닫히는 것은 재주입 경로에서, 그것도 **관문이 이미 지나갔음이 화면으로 증명될 때**뿐이다.
+/// ★(0.14.39 라운드4 · 관문 축 ① 이사) `src/readiness.rs:466` 의 줄 단위 완화는 데몬 `judge` 의
+/// `Site::Reinject` 에도 함께 적용된다. 부트는 이 함수의 `Site::Boot => false`(`:430`)에서
+/// 상수로 창을 열어 두므로 무영향이며, 전사된 관문·살아 있는 관문 모두 종전대로 보류한다.
 ///
 /// ★이상적인 축은 형제 축과 같은 `awakened` 래치다. 그것은 [`Observed`] 에 관측 필드를
 ///   하나 더 요구하고, 그 필드를 채우는 곳은 CLI(`cys.rs`)의 두 호출부다 — **이 단위의 반경
@@ -436,10 +439,19 @@ fn gate_axis_window_closed(o: &Observed, g: &Gate) -> bool {
 ///
 /// ★근거: 관문이 떠 있는 동안 마커(`❯`)는 그 관문의 **선택 커서**이고, 커서 뒤에는 아직 고르지
 ///   않은 선택지·확인 줄이 남아 있다. 관문을 통과해 노드가 앞으로 나아가면 그 뒤에 **자기 입력
-///   프롬프트**가 다시 그려지고, 그 프롬프트는 화면의 **맨 끝**에 서서 입력을 기다린다.
+///   프롬프트**가 다시 그려지고, 그 아래에는 입력 상자 괘선·상태줄만 남을 수 있다.
 ///   즉 "지나갔다"의 실측 서명은 두 가지가 **동시에** 참인 것이다 —
-///     ① 마커 뒤에 아무 문면도 없다(그 프롬프트가 지금 화면의 전경이다), 그리고
+///     ① 마커 뒤에 아무 문면도 없거나, 마커 행이 빈 대기 프롬프트이고 꼬리가 무해한 레이아웃이다,
 ///     ② 관문 블록의 끝이 그 마커보다 앞이다(블록은 그 프롬프트 위쪽의 역사다).
+///
+/// ★(0.14.39 라운드4 · ANCHOR ② 무clear) 종전 축 ①(`src/readiness.rs:466-482`)은 마커 뒤
+/// **화면 전체**가 공백이어야 했다. 라이브 claude 2.1.261 은 빈 composer 아래에도 괘선·상태줄을
+/// 그리므로 그 창이 닫히지 않았다. 모달 축이 이미 이사한 줄 단위 축 ①'
+/// (`src/readiness.rs:1281-1305`, `:1350` 의 [`waiting_prompt_with_harmless_trailer`])을 OR 로 받는다.
+/// CONTRACTS B-1 "판정 분리 금지"에 따라 같은 판정기를 소비하며, 축 ②와의 **AND 는 유지**한다.
+/// 비용 부호는 재주입·사이클에서 미탐 = 이미 지나간 관문 놓침, 오탐 = 영구 미주입·**영구 무clear**
+/// (ANCHOR ②)다. 데몬 `judge` 의 [`Site::Reinject`] 도 같은 창을 쓰되, 부트는
+/// [`gate_axis_window_closed`] 의 `Site::Boot => false`(`:430`)라 관문 보류가 그대로다.
 ///
 /// ## ★무엇이 틀렸었는가 — 커서 위치를 '역사'로 오독했다 (P4-11 · 2026-08-24 리뷰어 2인)
 ///
@@ -455,10 +467,11 @@ fn gate_axis_window_closed(o: &Observed, g: &Gate) -> bool {
 /// 않고, 리뷰어가 함께 제시한 둘째 방향 — **관문 문면이 화면 전경인가** — 을 축 ①로 세운다.
 /// 커서가 어디에 있든 그 뒤에 선택지가 남아 있으면 관문은 전경이고, 창은 열리지 않는다.
 ///
-/// 판정은 [`first_run_gates::flatten`] 공간 하나에서만 한다 — 정규화 공간의 매칭은 평탄화
-/// 공간의 매칭을 함의하므로(공백만 더 지운다) 평탄화 공간이 상위집합이고, 공간을 둘로 쓰면
-/// 인덱스 비교의 의미가 갈린다. 평탄화 공간에서 "마커 뒤가 비었다" 는 **공백만 남았다**와 같은
-/// 뜻이다(평탄화가 공백을 전부 지운다) — 프롬프트 뒤의 개행·패딩은 전경 판정을 바꾸지 않는다.
+/// 축 ②의 위치 비교와 축 ①의 종전 공백 판정은 [`first_run_gates::flatten`] 공간에서 한다 —
+/// 정규화 공간의 매칭은 평탄화 공간의 매칭을 함의하므로(공백만 더 지운다) 평탄화 공간이 상위집합이다.
+/// 위치 인덱스는 그 공간 안에서만 비교하고, 줄 단위 축 ①' 은 공유 판정기의 bool 만 받는다.
+/// 평탄화 공간에서 "마커 뒤가 비었다" 는 **공백만 남았다**와 같은 뜻이다(평탄화가 공백을 전부
+/// 지운다) — 프롬프트 뒤의 개행·패딩은 전경 판정을 바꾸지 않는다.
 ///
 /// **fail-closed**: 마커가 미정의(codex 등)거나 화면에 없거나 관문 문면을 평탄화 공간에서
 /// 찾지 못하면 창을 **닫지 않는다**(= 종전대로 관문 보류). 판정 불가는 통과가 아니다.
@@ -475,9 +488,13 @@ fn gate_block_left_behind(g: &Gate, screen: &str, marker: Option<&str>) -> bool 
     let Some(marker_last) = fs.rfind(fm.as_str()) else {
         return false;
     };
-    // ★축 ① — 마커 뒤에 남은 문면이 있으면 그 마커는 **선택 커서**이지 대기 중인 입력
-    //   프롬프트가 아니다. 관문은 아직 화면의 전경이므로 창을 닫지 않는다(P4-11).
-    if !fs[marker_last + fm.len()..].is_empty() {
+    // ★(0.14.39 라운드4 · 축 ①) 마커 뒤에 남은 문면이 있으면 그 마커는 **선택 커서**다(P4-11).
+    //   단 라이브 그리드는 입력 상자 **아래**에 괘선·상태줄을 그리므로(2.1.261) "화면 전체가 공백" 은
+    //   실좌석에서 영영 참이 되지 않았다 — 모달 축(`src/readiness.rs:1281-1305`)이 이미 이사한
+    //   줄 단위 축 ①'(waiting_prompt_with_harmless_trailer)을 OR 로 받는다. 그 술어는 마커 미정의·
+    //   부재·남은 꼬리의 증거 부재에서 **닫지 않으므로**(fail-closed) 선택 커서 행(같은 줄에 라벨)·
+    //   부분 렌더는 여전히 전경으로 남는다.
+    if !fs[marker_last + fm.len()..].is_empty() && !waiting_prompt_with_harmless_trailer(screen, m) {
         return false;
     }
     // 축 ② — 관문 블록의 끝 = 이 화면에서 관측된 needle·위젯 문면 중 **가장 뒤**의 끝 위치.
@@ -542,11 +559,12 @@ fn marker_of<'a>(o: &Observed<'a>) -> Option<&'a str> {
 // 【생애 창】 부트(`Site::Boot`)에서는 **상수로 열려 있다**(관문 축과 같은 근거 — 미탐 = 관문에 주입).
 // 재주입(`Site::Reinject`)에서는 **전경 판정**으로만 닫힌다: 축 ② 모달 문면 전량이 마커보다 앞(역사)
 // ∧ 축 ①' 마커의 마지막 **선두 후보 행**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고 그 아래 꼬리가
-// 입력 상자·상태줄 레이아웃이다([`waiting_prompt_with_harmless_trailer`] · 리뷰 R1). 관문 축
-// (`gate_block_left_behind`)의 축 ①은 "마커 뒤 화면 전체가 공백" 인데, 라이브 claude 2.1.261 그리드는
-// 입력 상자 **아래**에 상태줄을 그리므로(실측 2026-09-06 10:18) 그 축은 라이브 좌석에서 영영 닫히지
-// 않는다 — 관문 축은 needle ∧ 위젯이라 좁아 그대로 두고(P4-11 핀 · 백로그), needle 요구가 없어 훨씬
-// 넓은 이 축만 줄 단위로 재정의한다. 마커 미정의(codex)·마커 부재는 **닫지 않는다**(fail-closed).
+// 입력 상자·상태줄 레이아웃이다([`waiting_prompt_with_harmless_trailer`] · 리뷰 R1).
+// ★(0.14.39 라운드4 · 관문 축 ① 이사) 종전 `src/readiness.rs:545-549` 에서 백로그로 남긴 관문 축도
+// 이번에 같은 줄 단위 판정기로 이사했다(CONTRACTS B-1 "판정 분리 금지"). 라이브 claude 2.1.261 이
+// 입력 상자 **아래**에 그리는 상태줄(실측 2026-09-06 10:18) 때문에 "화면 전체가 공백" 이 되지 않아
+// 생기던 영구 무clear 를 푼다. 관문 블록 끝이 마커보다 앞이라는 축 ②와의 AND 와 부트 상수 개방은
+// 유지한다. 두 축 모두 마커 미정의(codex)·마커 부재는 **닫지 않는다**(fail-closed).
 //
 // 【받아들인 잔여】 부트 창 안에서 좌석이 이 어휘를 **본문으로** 출력하면(감사표를 cat 하는 등)
 // 보류로 접힌다 — 코퍼스 `BODY_TEXT_SCREENS` 와 같은 부류이고 귀결이 파괴가 아니라 보류라 받는다.
@@ -1285,6 +1303,8 @@ fn modal_window_closed(o: &Observed, sig: &ModalSignature) -> bool {
 /// 방향의 결함). 줄 단위 축 ①' 는 선택 커서(`❯ 1. Yes…` — 같은 줄에 라벨)와 대기 프롬프트(`❯ ` 뒤 공백만)를
 /// 정확히 가르고, 꼬리에는 **양성 레이아웃 증거**를 요구한다(codex 설계 검토: 빈 `❯` 줄 아래에 모달
 /// 본문이 이어지는 형상 — 부분 렌더·접힌 라벨·빈 텍스트 입력 필드 — 은 애매하므로 닫지 않는다).
+/// ★(0.14.39 라운드4 · 관문 축 ① 이사) `src/readiness.rs:466` 의 관문 축도 이번에 같은 줄 단위
+/// 판정기를 OR 로 받았다(CONTRACTS B-1 "판정 분리 금지"). 두 생애 창 모두 축 ②를 AND 로 유지한다.
 fn modal_left_behind(sig: &ModalSignature, screen: &str, marker: Option<&str>) -> bool {
     let Some(m) = marker else {
         return false;
@@ -2737,6 +2757,56 @@ mod tests {
             failures.push("마커 부재인데 관문 창이 닫혔다 — ANCHOR ② 무clear 수리의 fail-closed 회귀".to_string());
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(0.14.39 라운드4 · 데몬 재주입 파급) `src/readiness.rs:430-431` 의 `Site` 분기 핀.
+    /// 관문 축 ①(`:466-482`)이 모달 축(`:1281-1305`)과 같은 줄 단위 창으로 이사하면 데몬 `judge` 의
+    /// 재주입도 함께 풀린다. 살아 있는 관문은 계속 보류하고, 부트는 두 프레임 모두 종전대로 보류한다.
+    #[test]
+    fn judge_reinject_gate_axis_follows_the_line_level_window() {
+        let gates = first_run_gates::builtin();
+        for (gid, live) in [
+            ("theme", fixtures::THEME),
+            ("login-method", fixtures::LOGIN_METHOD),
+            ("oauth-code", fixtures::OAUTH_CODE),
+            ("folder-trust", fixtures::FOLDER_TRUST),
+            ("feature-announce-fullscreen", fixtures::FEATURE_FULLSCREEN),
+        ] {
+            let transcribed = format!(
+                "리뷰 결과: 관문 화면을 본문으로 전사한다.\n{live}\n\
+                 ────────────────────────────────────────────────────────────\n\
+                 ❯ \n\
+                 ────────────────────────────────────────────────────────────\n\
+                 \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n"
+            );
+            for (name, screen) in [("전사된 관문", transcribed.as_str()), ("살아 있는 관문", live)] {
+                let gate = first_run_gates::identify(&gates, screen)
+                    .unwrap_or_else(|| panic!("{gid}/{name}: 관문 식별 전제 소실 — 검체가 무효다"));
+                assert_eq!(gate.id, gid, "{gid}/{name}: 다른 관문으로 읽혔다");
+                assert!(
+                    held_as(&judge(&boot_all_open(screen, &gates)), gid),
+                    "{gid}/{name}: 부트의 상수 개방 창이 바뀌었다 — 관문 보류가 사라진다"
+                );
+            }
+
+            let mut history = obs(&transcribed, "", &gates);
+            history.site = Site::Reinject;
+            history.tail_is_shell_prompt = None;
+            history.bare_shell = None;
+            assert!(
+                !matches!(judge(&history), Verdict::GateHeld { .. }),
+                "{gid}: 빈 composer 아래 괘선·상태줄 때문에 데몬 재주입 관문 창이 닫히지 않는다"
+            );
+
+            let mut foreground = obs(live, "", &gates);
+            foreground.site = Site::Reinject;
+            foreground.tail_is_shell_prompt = None;
+            foreground.bare_shell = None;
+            assert!(
+                held_as(&judge(&foreground), gid),
+                "{gid}: 선택 커서 행의 라벨이 있는데 재주입 관문 보류가 사라졌다"
+            );
+        }
     }
 
     /// 생애 창 술어 자체의 진리표 — **판정 불가는 창을 닫지 않는다**(fail-closed).
