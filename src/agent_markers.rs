@@ -32,13 +32,32 @@ pub fn marker_candidates(v: Option<&Value>) -> Vec<String> {
 /// 반환 = (후보, 그 후보가 시작하는 byte index). 선두에 후보가 없으면 None — 출력 행 끝의 `->` 나
 /// 초안 속 글리프(`» abc » `)는 composer 가 아니다(리뷰 PROBE-A · 0.14.39 수정 라운드 1).
 pub fn pick_marker_leading<'a>(cands: &'a [String], row: &str) -> Option<(&'a str, usize)> {
-    let trimmed = row.trim_start();
-    let idx = row.len() - trimmed.len();
     cands
         .iter()
-        .filter(|marker| !marker.is_empty() && trimmed.starts_with(marker.as_str()))
+        .filter(|marker| leading_marker_index(marker, row).is_some())
         .max_by_key(|marker| marker.len())
-        .map(|marker| (marker.as_str(), idx))
+        .and_then(|marker| {
+            leading_marker_index(marker, row).map(|index| (marker.as_str(), index))
+        })
+}
+
+/// ★(0.14.39 · 성찰2 blocking ①) [`pick_marker_leading`] 의 **단일 후보판**(정의 1지점).
+///
+/// 후보 하나가 이 행의 **선두(공백 제외)** 에 오는가 — 오면 그 후보가 시작하는 byte index.
+/// 빈 후보는 어느 행에도 증거가 아니다(`readiness::marker_of` 규약과 같다).
+///
+/// 【왜 갈라 두나】 CLI 의 composer 행 해소(`scan_composer`·`marker_row_has_draft`)는 후보 **목록**이
+/// 아니라 이미 해소된 마커 **하나**를 들고 온다. 그 자리에서 데몬과 같은 규율(`pick_marker_leading`)을
+/// 쓰려면 단일 후보 판정이 필요하고, 구현을 복사하면 두 규율이 갈린다(이 저장소에서 살아남는 결함은
+/// 전부 그 이음매에 있다). 그래서 `pick_marker_leading` 이 이 함수를 쓴다(거동 불변).
+pub fn leading_marker_index(marker: &str, row: &str) -> Option<usize> {
+    if marker.is_empty() {
+        return None;
+    }
+    let trimmed = row.trim_start();
+    trimmed
+        .starts_with(marker)
+        .then(|| row.len() - trimmed.len())
 }
 
 /// 후보 중 `text` 에서 나오는 것(byte rfind 위치 우선(가장 뒤) · 같은 위치면 더 긴 후보). 하나도 없으면 None.
@@ -58,6 +77,30 @@ pub fn pick_marker_last<'a>(cands: &'a [String], text: &str) -> Option<&'a str> 
 /// 유지하여 보류하고 quiet 폴백으로 내려가지 않는다.
 pub fn pick_marker_for_screen<'a>(cands: &'a [String], text: &str) -> Option<&'a str> {
     pick_marker_last(cands, text).or_else(|| cands.first().map(String::as_str))
+}
+
+/// ★(0.14.39 · 성찰2 blocking ①) 화면에서 **composer 행**을 해소한다 — `trim_start()` 후 후보로
+/// 시작하는 **마지막 행**의 후보. 그런 행이 하나도 없으면 `None`.
+///
+/// 【[`pick_marker_for_screen`] 과 무엇이 다른가】 저쪽은 후보가 화면에 하나도 없어도 **첫 후보로
+/// 폴백**한다(= "선언했으니 마커 좌석" 이라는 등급 유지 장치). 그 폴백은 글리프가 희귀할 때의
+/// 편의였는데, 0.14.39 가 gemini 에 `>` 를 선언하면서 치명적이 됐다: `>` 는 셸 명령·리다이렉션·
+/// diff·인용·JSON·마크다운에 일상적으로 나오는 글자라 그 좌석은 **다시는 마커 축을 벗어나지
+/// 못하고**, 마커 축이 증거를 세우지 못하는 프레임에서 `gate_carry_ok` 가 영원히 거짓이 된다
+/// (= 관문을 한 번 본 `reviewer-gemini` 에 역할 디렉티브가 영영 주입되지 않는다 · 치명위험 ③).
+///
+/// 【장치】 데몬 `governance::observe_prompt` 와 **같은 규율**을 쓴다(판정 분리 금지) — composer
+/// 프롬프트 글리프는 세 TUI 모두 행 선두다. 출력 행의 `cat a > b`·푸터의 `[main] ~/dev > 62%`·
+/// 상태줄의 `‹ prev » next` 는 선두가 아니므로 composer 행이 아니다.
+///
+/// 【실패 방향】 해소 실패(`None`)의 귀결은 소비처에서 **마커 미선언 어댑터와 같은 등급**
+/// (출력 정적 `idle_quiet` 축)이다 — gemini 의 0.14.38 거동 그 자체라 회귀가 아니다.
+pub fn pick_marker_leading_on_screen<'a>(cands: &'a [String], screen: &str) -> Option<&'a str> {
+    screen
+        .lines()
+        .rev()
+        .find_map(|row| pick_marker_leading(cands, row))
+        .map(|(marker, _)| marker)
 }
 
 /// 알려진 옛 vendor 기본값 표 (agent, key, 옛 값). 정확히 이 문자열일 때만 옛 기본값이다.
@@ -178,6 +221,75 @@ mod tests {
         let markers = marker_candidates(Some(&json!(">")));
         assert_eq!(pick_marker_leading(&markers, ""), None);
         assert_eq!(pick_marker_leading(&markers, "  "), None);
+    }
+
+    #[test]
+    fn leading_marker_index_accepts_whitespace_and_returns_byte_index() {
+        assert_eq!(leading_marker_index(">", "> draft"), Some(0));
+        assert_eq!(leading_marker_index("›", " \t› draft"), Some(2));
+        assert_eq!(leading_marker_index("»", "\u{3000}» draft"), Some(3));
+        assert_eq!(leading_marker_index("❯", " \u{3000}\t❯ draft"), Some(5));
+    }
+
+    #[test]
+    fn leading_marker_index_rejects_nonleading_and_empty_markers() {
+        // 출력·상태줄의 글리프는 composer 가 아니며 빈 후보는 어느 행에도 증거가 아니다.
+        for row in ["cat a > b", "[main] ~/dev > 62%", "  out ->", "", " \t"] {
+            assert_eq!(leading_marker_index(">", row), None, "{row:?}");
+        }
+        for row in ["> draft", "", " \t"] {
+            assert_eq!(leading_marker_index("", row), None, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn leading_screen_resolution_prefers_longest_candidate_on_the_same_row() {
+        let markers = marker_candidates(Some(&json!([">", ">>>", ">>"])));
+        assert_eq!(
+            pick_marker_leading_on_screen(&markers, "출력\n \u{3000}>>> draft\n"),
+            Some(">>>")
+        );
+    }
+
+    #[test]
+    fn leading_screen_resolution_has_no_declared_candidate_fallback() {
+        let markers = marker_candidates(Some(&json!(["›", "»", ">"])));
+        for screen in ["", "…\n", "cat a > b\n‹ prev » next\n", " \t\n"] {
+            assert_eq!(pick_marker_leading_on_screen(&markers, screen), None);
+        }
+        assert_eq!(pick_marker_leading_on_screen(&[], "> \n"), None);
+        assert_eq!(
+            pick_marker_leading_on_screen(&[String::new()], "> \n"),
+            None
+        );
+    }
+
+    #[test]
+    fn leading_screen_resolution_prefers_the_last_leading_row() {
+        let markers = marker_candidates(Some(&json!(["›", "»", ">>>", ">"])));
+        // 긴 후보 우선은 같은 행 안의 규율이다. 화면에서는 가장 아래 선두 행이 먼저다.
+        assert_eq!(
+            pick_marker_leading_on_screen(&markers, ">>> old\n  › \n\t» \n"),
+            Some("»")
+        );
+        assert_eq!(
+            pick_marker_leading_on_screen(&markers, "» old\n> \n"),
+            Some(">")
+        );
+    }
+
+    #[test]
+    fn leading_screen_resolution_ignores_nonleading_footer_glyphs() {
+        let markers = marker_candidates(Some(&json!(["›", "»"])));
+        assert_eq!(
+            pick_marker_leading_on_screen(&markers, "› \n‹ prev » next\n"),
+            Some("›")
+        );
+        let markers = marker_candidates(Some(&json!([">"])));
+        assert_eq!(
+            pick_marker_leading_on_screen(&markers, "> \n[main] ~/dev/x > 62% ctx\n"),
+            Some(">")
+        );
     }
 
     #[test]

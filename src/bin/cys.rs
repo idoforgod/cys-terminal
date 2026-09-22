@@ -32601,6 +32601,69 @@ mod tests {
         assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
     }
 
+    /// ★성찰2 ②: composer 아래 푸터의 후보 글리프를 초안으로 읽으면 rc85 가 영구히 clear 를 막는다.
+    /// 선두 후보 행만 고르되, 권위 계수가 0 이어도 그 행의 실제 초안은 계속 보호한다.
+    #[test]
+    fn r1_cycle_target_ignores_footer_glyph_below_composer() {
+        let codex = vec!["›".to_string(), "»".to_string()];
+        let gemini = composer_marker_of(&embedded_agents_json().expect("임베드")["gemini"]);
+        assert!(gemini.iter().any(|marker| marker == ">"), "gemini 마커 선언 전제");
+        for (name, screen, candidates, expected_marker, has_draft, expected_state) in [
+            (
+                "#4 codex 푸터",
+                "› \n‹ prev » next\n",
+                codex.as_slice(),
+                "›",
+                false,
+                CycleTargetState::Idle,
+            ),
+            (
+                "#5 gemini 푸터",
+                "> \n[main] ~/dev/x > 62% ctx\n",
+                gemini.as_slice(),
+                ">",
+                false,
+                CycleTargetState::Idle,
+            ),
+            (
+                "gemini 실제 초안",
+                "> 사람이 치던 초안\n[main] ~/dev/x > 62% ctx\n",
+                gemini.as_slice(),
+                ">",
+                true,
+                CycleTargetState::HumanDraft,
+            ),
+        ] {
+            let marker = cys::agent_markers::pick_marker_leading_on_screen(candidates, screen);
+            assert_eq!(marker, Some(expected_marker), "{name}: 푸터는 composer 행이 아니다");
+            assert_eq!(
+                marker_row_has_draft(screen, marker.expect("선두 composer 마커"), None),
+                has_draft,
+                "{name}: 초안은 선두 마커 뒤 문면으로 판정한다",
+            );
+            assert_eq!(
+                cycle_target_state(&CycleTargetObs {
+                    screen: Some(screen),
+                    quiet: Some(true),
+                    marker,
+                    placeholder: None,
+                    pending_bytes: Some(0),
+                    human_bytes: Some(0),
+                }),
+                expected_state,
+                "{name}: 푸터 때문에 clear 를 영구 보류하면 안 된다",
+            );
+            let observed = cycle_target_observation(
+                Ok(json!({"text": screen, "quiet_secs": 5.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                candidates,
+                None,
+            );
+            assert_eq!(observed.state, expected_state, "{name}: 관측 경로도 같은 해소기를 쓴다");
+            assert!(observed.failure.is_none(), "{name}: 합성 관측은 성공 응답이다");
+        }
+    }
+
     /// 주석·다른 단계의 토큰으로 거짓 통과하지 않도록 clear 클로저의 송신 구간만 뽑는다.
     fn d16_clear_stage_source() -> String {
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
@@ -33251,12 +33314,14 @@ mod tests {
         assert!(!seg.contains("alive_on_recheck"), "79 분기가 원인을 agent_alive 로 단정한다:\n{seg}");
     }
 
-    /// ★C3: 마커 미선언 어댑터(gemini·grok)가 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
+    /// ★C3: 화면에 선두 후보 행이 없는 좌석이 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
     ///
     /// `idle_quiet == None` 을 두 사실로 가른다 — "이 틱에 못 쟀다"(보류 유지) vs
     /// "이 데몬은 이 축을 낼 수 없다"(능력 부재 → 그 좌석 한정 축 끄기 + 시끄러운 경고).
     /// 종전에는 둘이 한 값이라, cys 0.14.31 + cysd 0.14.30 조합에서 관문을 한 번 본 gemini
     /// 좌석에 역할 디렉티브가 **영원히** 들어가지 않았다(치명위험 ③).
+    /// 0.14.39 는 gemini 도 `>` 를 선언한다. None 을 하드코딩하면 그 선언 뒤의 회귀가 가려지므로,
+    /// 실제 임베드 후보를 화면에 해소한 결과로 quiet 축 진입을 잰다(선두 행 부재만 None).
     #[test]
     fn c3_marker_less_adapters_escape_carry_unproven_on_a_daemon_without_the_quiet_axis() {
         // ① 능력 판정은 **키의 실재**로 한다(값이 아니라 키 — 결측은 값이 아니다).
@@ -33266,22 +33331,27 @@ mod tests {
             "키는 있는데 값이 null = '이 틱에 못 쟀다' 이지 능력 부재가 아니다"
         );
         assert!(!quiet_axis_in_response(&json!({"text": "x"})), "구 데몬(키 부재)이 지원으로 읽혔다");
+        let gemini = composer_marker_of(&embedded_agents_json().expect("임베드")["gemini"]);
+        assert!(gemini.iter().any(|marker| marker == ">"), "gemini 마커 선언 전제");
+        let screen = "…\n";
+        let marker = cys::agent_markers::pick_marker_leading_on_screen(&gemini, screen);
+        assert_eq!(marker, None, "선언만으로 마커 축에 고정하지 않는다: 선두 후보 행이 없다");
         // ② 능력 있는 데몬: 종전 판정 그대로 — 미관측·출력 중은 보류다(회귀 방지).
         for q in [None, Some(false)] {
             assert!(
-                !gate_carry_ok(true, false, None, None, "…", q, Some(true)),
+                !gate_carry_ok(true, false, marker, None, screen, q, Some(true)),
                 "능력 있는 데몬에서 미관측이 열렸다: {q:?}"
             );
         }
-        assert!(gate_carry_ok(true, false, None, None, "…", Some(true), Some(true)));
-        // ③ 능력 **부재** 데몬 + 마커 미선언 어댑터: 이월 축을 끈다(관문 1회 뒤 ready 도달).
+        assert!(gate_carry_ok(true, false, marker, None, screen, Some(true), Some(true)));
+        // ③ 능력 **부재** 데몬 + 선두 후보 행 부재: 선언된 gemini 도 이월 축을 끈다.
         assert!(
-            gate_carry_ok(true, false, None, None, "…", None, Some(false)),
+            gate_carry_ok(true, false, marker, None, screen, None, Some(false)),
             "구 데몬 + gemini 좌석이 여전히 영구 보류다(디렉티브 미주입 · 치명위험 ③)"
         );
         // ④ 판정 유보(`None` = 아직 응답을 못 봤다)는 종전과 같이 **보류**다(조여지는 방향).
-        assert!(!gate_carry_ok(true, false, None, None, "…", None, None));
-        // ⑤ claude·codex 판정 **불변** — 마커 선언 어댑터는 이 분기에 오지 않는다.
+        assert!(!gate_carry_ok(true, false, marker, None, screen, None, None));
+        // ⑤ claude·codex 판정 **불변** — 선두 후보 행이 있는 화면은 마커 축을 유지한다.
         let live = cys::first_run_gates::fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
         for cap in [Some(true), Some(false), None] {
             assert!(

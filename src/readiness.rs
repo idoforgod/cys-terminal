@@ -3260,6 +3260,42 @@ mod tests {
         }
     }
 
+    /// ★(0.14.39 · 성찰2 blocking ①) 출력의 `>` 는 composer 행이 아니다.
+    /// 실측 A~E: D의 출력 행은 허용하되, C의 비위젯 꼬리와 E의 증거 부재는 보류한다.
+    /// claude 실측과 단독 마커도 함께 고정해 엄격판을 quiet 축으로 강등하는 회귀를 막는다.
+    #[test]
+    fn r1_composer_layout_uses_leading_marker_rows_without_weakening_evidence() {
+        for (name, screen, expected) in [
+            ("A", "? for shortcuts\n> \n", true),
+            ("B", "출력\n> \n? for shortcuts\n", true),
+            ("C", "출력\n> \n[main] ~/dev > 62%\n", false),
+            ("D", "cat a > b\n> \n? for shortcuts\n", true),
+            ("E", "> \n", false),
+        ] {
+            assert_eq!(
+                composer_layout_static_ok(screen, ">", None, Some(true)),
+                expected,
+                "gemini {name}: {screen:?}"
+            );
+        }
+        for (name, screen, expected) in [
+            ("2.1.241 실측", fixtures::LIVE_TUI_AT_PROMPT, true),
+            (
+                "2.1.261 실측",
+                fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT,
+                true,
+            ),
+            ("단독 마커", "❯ \n", false),
+            ("위 괘선뿐", "────\n❯ \n", false),
+        ] {
+            assert_eq!(
+                composer_layout_static_ok(screen, "❯", None, Some(true)),
+                expected,
+                "claude {name}: 엄격판 증거 등급이 바뀌었다"
+            );
+        }
+    }
+
     /// ★(0.14.31 · 리뷰 R2(R7회차) · codex blocking B2 + 리뷰어 2인 blocking) composer 레이아웃
     /// 증거의 **등급**과 어댑터 해소.
     ///
