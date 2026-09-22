@@ -32353,6 +32353,92 @@ mod tests {
         std::fs::remove_dir_all(&td).unwrap();
     }
 
+    /// ★(0.14.39 라운드3) 레인 공용 표식의 타 훅 트립은 SessionStart 주입 선언을 강등하지 않는다.
+    #[test]
+    fn effective_hooks_inject_only_degrades_on_a_session_start_hook_trip() {
+        let trip = |script: &str, unreadable: bool| cys::pack::LaneGuardTrip {
+            reason: if unreadable { "unreadable" } else { "absent" }.to_string(),
+            script: script.to_string(),
+            unreadable,
+        };
+        let mut failures: Vec<String> = Vec::new();
+        for (name, declared, observed, lane_guard_trip, expected) in [
+            ("표식 없음", true, Some(true), None, true),
+            ("session-start.sh", true, Some(true), Some(trip("session-start.sh", false)), false),
+            ("inject-context.sh", true, Some(true), Some(trip("inject-context.sh", false)), false),
+            ("role-bootstrap.sh", true, Some(true), Some(trip("role-bootstrap.sh", false)), true),
+            ("user-prompt-submit.sh", true, Some(true), Some(trip("user-prompt-submit.sh", false)), true),
+            ("판독 불가", true, Some(true), Some(trip("", true)), false),
+            ("절대경로 SessionStart", true, Some(true), Some(trip("/opt/cys/pack/hooks/session-start.sh", false)), false),
+            ("미등록", true, Some(false), None, false),
+            ("미선언", false, Some(true), None, false),
+        ] {
+            let actual = effective_hooks_inject(declared, observed, lane_guard_trip.as_ref());
+            if actual != expected {
+                let consequence = if expected { "부서 pane 상시 이중 주입" } else { "0회 주입" };
+                failures.push(format!(
+                    "{name}: declared={declared}, observed={observed:?}, trip={lane_guard_trip:?}, actual={actual}, expected={expected} — {consequence}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(0.14.39 라운드3) 실제 팩 훅의 인터프리터·인자 형식은 등록으로 인정한다.
+    #[test]
+    fn registered_pack_session_start_hook_accepts_interpreter_and_argument_forms() {
+        // 이 crate 는 tempfile 직접 의존성이 없으므로 기존 훅 검체의 std 임시 폴더 패턴을 따른다.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let td = std::env::temp_dir()
+            .join(format!("cys-hook-command-forms-{}-{nonce}", std::process::id()));
+        let hooks = td.join("hooks");
+        let nolib = td.join("nolib");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::create_dir_all(&nolib).unwrap();
+        let script = hooks.join("session-start.sh");
+        let other = hooks.join("other.sh");
+        let without_lib = nolib.join("session-start.sh");
+        for path in [&script, &other, &without_lib] {
+            std::fs::write(path, "#!/bin/sh\n").unwrap();
+        }
+        std::fs::write(hooks.join("_lib.sh"), "# pack hook library\n").unwrap();
+        let mut failures: Vec<String> = Vec::new();
+        for command in [
+            format!("sh {}", script.display()),
+            format!("bash \"{}\"", script.display()),
+            format!("sh {} \"$CLAUDE_PROJECT_DIR\"", script.display()),
+            format!("bash \"{}\" --lane dept", script.display()),
+            format!("/bin/sh {}", script.display()),
+            format!("/bin/bash \"{}\" --lane hq", script.display()),
+            format!("env CYS_PACK_DIR=/x sh {}", script.display()),
+        ] {
+            let actual = registered_pack_session_start_hook(&command);
+            if actual.as_deref() != Some(script.as_path()) {
+                failures.push(format!(
+                    "{command:?}: actual={actual:?} — 정상 등록형을 미인정 → 부서 pane 상시 이중 주입"
+                ));
+            }
+        }
+        for command in [
+            "sh $HOME/pack/hooks/session-start.sh".to_string(),
+            format!("sh {}", other.display()),
+            format!("sh {}", without_lib.display()),
+            String::new(),
+            format!("python3 {}", script.display()),
+        ] {
+            let actual = registered_pack_session_start_hook(&command);
+            if actual.is_some() {
+                failures.push(format!(
+                    "{command:?}: actual={actual:?} — 삭제된 팩·타 도구 훅을 인정 → 디렉티브 0회 주입(치명)"
+                ));
+            }
+        }
+        // RED 단언 전에 정리해 의도한 실패가 임시 파일을 남기지 않게 한다.
+        std::fs::remove_dir_all(&td).unwrap();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// 성찰2 major ③: 선언만 믿으면 좌석별 설정 누락에서 디렉티브가 0회 주입된다.
     #[test]
     fn r1_session_start_hook_registered_truth_table() {
@@ -34015,6 +34101,85 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// ★(0.14.39 라운드3 · 성찰1 blocking ① · 성찰2 major ⑤⑥ · 부트체인 blocking)
+    /// **음성 대조군** — 지나간 모달 어휘가 전사돼 있을 뿐 전경은 건강한 빈 composer 인 프레임은
+    /// 유휴다. 원시 술어(`modal_signature*`)와 전경 술어(`modal_foreground`)를 가르는 유일한 계급이고,
+    /// 이 검체가 없으면 두 술어가 구별되지 않는다(라운드2 성찰1 minor: 검체 공백).
+    /// 실패하면 그 좌석의 `/clear` 가 영원히 나가지 않는다(ANCHOR ② 무clear · rc84 무한 재시도).
+    #[test]
+    fn cycle_target_state_treats_a_transcribed_modal_label_over_a_healthy_composer_as_idle() {
+        use cys::first_run_gates::fixtures;
+
+        /// 워커가 관문 라벨을 **자기 출력으로 인용**한 뒤 다시 유휴로 돌아온 라이브 그리드(2.1.261).
+        const TRANSCRIBED_CHOICE_ROW_OVER_LIVE_GRID: &str = "\x20 리뷰 결과: 관문 라벨 목록을 인용한다.\n\
+            \x20   1. Yes, I trust this folder\n\
+            \x20   2. No, exit\n\
+            \n\
+            ✻ Churned for 3m 34s · done 오전 7:14\n\
+            ────────────────────────────────────────────────────────────\n\
+            ❯ \n\
+            ────────────────────────────────────────────────────────────\n\
+            \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n\
+            \x20 ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n";
+
+        /// 평시 대화 출력이 확인/취소 푸터 어휘를 **인용**한 프레임(모달 축 `confirm-cancel-footer`).
+        const TRANSCRIBED_CONFIRM_FOOTER_OVER_LIVE_GRID: &str = "\x20 설계 문서를 옮긴다: 모달은 보통\n\
+            \x20 Enter to confirm 과 Esc to cancel 두 줄을 아래에 그린다.\n\
+            \x20 우리 좌석에는 지금 그런 모달이 없다.\n\
+            \n\
+            ────────────────────────────────────────────────────────────\n\
+            ❯ \n\
+            ────────────────────────────────────────────────────────────\n\
+            \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n";
+
+        /// gemini 좌석(`prompt_marker` 에 `>` 신설)의 마크다운 인용 번호 목록.
+        const TRANSCRIBED_QUOTED_NUMBERED_LIST_GEMINI: &str = "\x20 인용한다:\n\
+            > 1. 첫째 항목\n\
+            > 2. 둘째 항목\n\
+            \n\
+            ────────────────────────────────────────────────────────────\n\
+            > \n\
+            ────────────────────────────────────────────────────────────\n\
+            ? for shortcuts                     Gemini 3.8 Flash · hig\n";
+
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        let gates = resolve_gate_corpus("claude").gates;
+        let embed = embedded_agents_json().expect("임베드");
+        let gemini = composer_marker_of(&embed["gemini"]);
+        let gemini_gates = resolve_gate_corpus("gemini").gates;
+        let mut failures: Vec<String> = Vec::new();
+        for (name, fixture, markers, corpus) in [
+            ("TRANSCRIBED_CHOICE_ROW_OVER_LIVE_GRID", TRANSCRIBED_CHOICE_ROW_OVER_LIVE_GRID, &claude, &gates),
+            ("TRANSCRIBED_CONFIRM_FOOTER_OVER_LIVE_GRID", TRANSCRIBED_CONFIRM_FOOTER_OVER_LIVE_GRID, &claude, &gates),
+            ("TRANSCRIBED_QUOTED_NUMBERED_LIST_GEMINI", TRANSCRIBED_QUOTED_NUMBERED_LIST_GEMINI, &gemini, &gemini_gates),
+        ] {
+            let state = cycle_target_observation(
+                Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                markers,
+                None,
+                corpus,
+            ).state;
+            if state != CycleTargetState::Idle {
+                failures.push(format!("{name}: {state:?} — 전사된 모달 어휘가 건강한 composer 를 막았다(ANCHOR ② 무clear)"));
+            }
+        }
+        // 양성 대조군: 관문 판정을 통째로 끄면 살아 있는 선택기에 clear 가 들어간다.
+        for (name, fixture) in [("FOLDER_TRUST", fixtures::FOLDER_TRUST), ("OAUTH_CODE", fixtures::OAUTH_CODE)] {
+            let state = cycle_target_observation(
+                Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                &claude,
+                None,
+                &gates,
+            ).state;
+            if matches!(state, CycleTargetState::Idle | CycleTargetState::MachineResidue) {
+                failures.push(format!("{name}: {state:?} — 살아 있는 관문에 clear 원자 송신이 열린다"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// ★목표 A: 비선두 글리프는 마커 좌석의 보류를 유지하고, quiet 폴백도 관문을 거부한다.
     /// 임베드 후보를 실제로 해소해 정상 composer·글리프 부재·구 데몬의 능력 부재를 함께 대조한다.
     #[test]
@@ -34056,6 +34221,23 @@ mod tests {
             "글리프 부재 + quiet 의 이월이 막혔다");
         assert!(!oauth_ok && !off_ok,
             "OAUTH_CODE={oauth_ok}: 관문 화면에서 이월이 풀렸다 — 디렉티브가 선택기에 붙는다; 비선두 글리프={off_ok}: 마커 좌석이 quiet 축으로 강등됐다");
+        // ★(0.14.39 라운드3 · 성찰2 major ⑤) 구 데몬(quiet_secs 미보고)도 관문을 우회하지 못한다 —
+        //   팔 1(`None if idle_axis_capable == Some(false)`)이 관문 AND 앞에 있으면 새 CLI × 옛 데몬
+        //   스큐(정상 이관 경로)에서 디렉티브가 선택기에 붙고 그 Return 이 `No, exit` 를 누른다
+        //   (readiness::MODAL_EXIT_LABEL · ANCHOR ④ pane 전멸).
+        for (name, fixture) in [("OAUTH_CODE", fixtures::OAUTH_CODE), ("THEME", fixtures::THEME)] {
+            let (lead, off) = resolve(fixture);
+            let gom = cys::readiness::gate_or_modal_present(fixture, &gates, &claude);
+            assert!(gom, "{name}: 관문 축 전제가 깨졌다");
+            assert!(
+                !gate_carry_ok(true, false, lead, None, fixture, Some(true), Some(false), off, gom),
+                "{name}: 구 데몬 팔이 관문 화면에서 이월을 풀었다 — 디렉티브가 선택기에 붙는다(ANCHOR ④)"
+            );
+            assert!(
+                !gate_carry_ok(true, false, lead, None, fixture, None, Some(false), off, gom),
+                "{name}: 구 데몬 팔 + quiet 미관측에서도 이월이 풀렸다"
+            );
+        }
     }
 
     /// ★C3: 화면에 선두 후보 행이 없는 좌석이 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
