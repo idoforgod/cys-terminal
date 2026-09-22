@@ -388,12 +388,13 @@ def escalate(text, runner=run):
 # ═══════════════════════ CONTRACT BLOCK v1 END ═══════════════════════
 
 
-# ★WP-D: 송신 0건 보류는 사이클을 종결하되 레인의 자동 재시도를 잠그지 않는다.
+# ★WP-D: clear 송신 0건 보류는 사이클을 종결하되 레인의 자동 재시도를 잠그지 않는다.
 #   검증자와 공유하는 v1 계약은 보존하고 autopilot 전용 전이만 확장한다.
 HELD_PHASE = "held_noop"
 HELD_RCS = (84, 85)
+# 자동 경로는 84/85 를 held_noop 으로 종결하고 held_cooldown_secs 뒤 자동 재시도 · 구조적(구 데몬) 보류만 HELD_RETRY_MAX 상한.
 # ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_TARGET_BUSY/EXIT_CYCLE_HUMAN_DRAFT 와 같은 값이어야
-#   한다 — 송신 0건 코드만. 86은 clear 가 이미 나갔으므로 반드시 사후검증한다.
+#   한다 — clear 송신 0건 코드만. 86은 clear 가 이미 나갔으므로 반드시 사후검증한다.
 PHASES = PHASES + (HELD_PHASE,)
 TERMINAL_PHASES = TERMINAL_PHASES + (HELD_PHASE,)
 PHASE_NEXT = dict(PHASE_NEXT, executor_exited=PHASE_NEXT["executor_exited"] + (HELD_PHASE,))
@@ -507,7 +508,11 @@ IDLE_MIN_DEFAULT = 60.0
 OWNER_ACTIVE_WINDOW = 600.0       # $PACK/round/OWNER_ACTIVE mtime 10분
 COOLDOWN_SECS = 1200.0            # cleared_verified 후 20분
 HELD_RETRY_COOLDOWN_SECS = 300.0   # 비파괴 보류 후 재시도 최소 간격
-HELD_RETRY_MAX = 3                # 같은 역할 연속 보류 상한 — 사람 확인 후 reset
+HELD_RETRY_MAX = 3                # 구조적 보류 상한 + 일반 보류 통지 주기
+QUIET_UNREPORTED_DIAG = "quiet_secs_unreported"
+# ★러스트 src/bin/cys.rs cycle_quiet_timeout_diagnostic 의 rc84 문면
+#   [diag=quiet_secs_unreported] 와 같은 토큰 — cargo 검체가 위 줄의 리터럴을 파싱한다.
+RESIDUAL_WINDOW_RE = re.compile(r"residual_window=(\d+\.\d+)s")
 SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
 # ★[결재 7ⓑ] 러스트 src/bin/cys.rs 의 CLEAR_VERIFY_SECS(cycle-agent clear 실효 관측 창)와 같은 값이어야
 #   한다 — 같은 증거(session_file 교체)를 같은 창에서 본다. 바꾸면 양쪽을 함께 바꿔라. 불일치는
@@ -516,7 +521,7 @@ SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
 # handshake~clear 구간만 격상해도 되지만, 외곽에서 stage 경계를 결정론으로 관측할 방법이 없어
 # (자식 stderr 문구 파싱 = 화면 오라클) 자식 수명 **전 구간**을 1s 로 돌린다(엄격측).
 # ★잔여 창(정직 표기): allow→clear 는 사전 턴 확인 대기 포함 최대 CYCLE_AGENT_TIMEOUT 이다.
-#   1s 폴링은 그 창을 줄일 뿐 없애지 못한다 — 원장 detail.residual_window 로 매 사이클 명기한다.
+#   1s 폴링은 그 창을 줄일 뿐 없애지 못한다 — 원장 detail.residual_window_secs(자식 실측 파싱 · 미보고면 null) + residual_window_note 로 매 사이클 명기한다.
 KILL_POLL_SECS = 1.0
 RESIDUAL_WINDOW_NOTE = ("allow→clear 구간(사전 턴 확인 대기 포함 최대 CYCLE_AGENT_TIMEOUT=%ds)은 "
                         "kill-switch 회수 불가 — 1s 폴링이 줄일 뿐(수용된 안전 한계 · 설계 v2.1 C1)"
@@ -537,6 +542,40 @@ RESUME_BASE = ("[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 
 # [결재 7ⓒ] 재개 포인터는 하드코딩 경로가 아니라 **lease 에 실제로 해소된 복구 파일**을 싣는다.
 #   RESUME_BASE 는 파일 목록이 없을 때(구 호출자 호환)만 쓰는 폴백 문면이다.
 RESUME_FMT = "[RESUME] 컨텍스트 순환 완료. %s 를 읽고 직전 작업을 이어가라."
+
+
+def held_cooldown_secs(streak):
+    """연속 비파괴 보류의 지수 쿨다운(순수) — 성공 쿨다운에서 포화한다."""
+    # min(HELD_RETRY_COOLDOWN_SECS * 2 ** max(streak - 1, 0), COOLDOWN_SECS)
+    # 과 동치. 포화 시 계산을 끝내 장기 보류에서도 거대 지수의 float overflow 를 막는다.
+    cooldown = HELD_RETRY_COOLDOWN_SECS
+    remaining = max(streak - 1, 0)
+    while remaining > 0 and cooldown < COOLDOWN_SECS:
+        cooldown *= 2
+        remaining -= 1
+    return min(cooldown, COOLDOWN_SECS)
+
+
+def held_classify(rc, tail):
+    """held 종료의 구조적 원인·생존 근거·키 송신을 분리한다(순수)."""
+    structural = rc == 84 and "[diag=%s]" % QUIET_UNREPORTED_DIAG in (tail or "")
+    alive_evidence = None
+    keys_sent = "0건"
+    if rc == 84 and not structural:
+        alive_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
+    elif rc == 85:
+        alive_evidence = "rc85: 사람 초안·입력 감지"
+        if "[cycle 5/7] 입력 버퍼 정리 + '/clear'" in (tail or ""):
+            keys_sent = "C-u 1건(타이핑 가드 거부 경로)"
+    return {"structural": structural, "alive_evidence": alive_evidence, "keys_sent": keys_sent}
+
+
+def parse_residual_window(text):
+    """자식이 보고한 마지막 allow→clear 실측 초(float), 미보고면 None."""
+    value = None
+    for match in RESIDUAL_WINDOW_RE.finditer(text or ""):
+        value = float(match.group(1))
+    return value
 
 
 def ctx_threshold(role, packdir=None):
@@ -828,7 +867,8 @@ def evaluate_gates(role, ctx, now_ts):
       killed(bool), kill_reason(str), row(dict|None), measure(dict),
       owner_active_mtime(float|None), heartbeat_mtime(float|None),
       cycle_agent_procs(int), ledger(dict: last_terminal_phase/last_terminal_ts/
-                                        cycles/incomplete/corrupt/held_streak), lease_free(bool)
+                                        cycles/incomplete/corrupt/held_streak/
+                                        held_structural_streak), lease_free(bool)
     반환: {"pass":bool, "exit":int, "gates":[{id,name,ok,detail}], "reason":str}
     """
     g = []
@@ -894,15 +934,18 @@ def evaluate_gates(role, ctx, now_ts):
                 % (last_phase, elapsed, RESET_COOLDOWN_SECS))
         elif last_phase == HELD_PHASE:
             streak = led.get("held_streak", 0)
-            if streak >= HELD_RETRY_MAX:
+            structural_streak = led.get("held_structural_streak", 0)
+            if structural_streak >= HELD_RETRY_MAX:
                 add(5, "쿨다운·짝짓기", False,
-                    "연속 보류 %d회 — 대상이 계속 바쁘다. 사람 확인 후 reset" % streak)
-                g[-1]["held_limit"] = True   # ★순수 판정 유지 — 통지는 tick 이 담당한다.
+                    "구조적 보류 %d회 — 데몬이 quiet_secs 를 보고하지 않는다(구 데몬). 데몬 갱신 후 reset"
+                    % structural_streak)
+                g[-1]["held_limit"] = True   # 원장·report 사유 표식 — 통지는 execute 에서만.
             else:
                 elapsed = now_ts - last_ts
-                add(5, "쿨다운·짝짓기", elapsed >= HELD_RETRY_COOLDOWN_SECS,
-                    "비파괴 보류 후 %.0fs (필요 %.0fs, 연속 %d/%d회) — reset 불필요"
-                    % (elapsed, HELD_RETRY_COOLDOWN_SECS, streak, HELD_RETRY_MAX))
+                cooldown = held_cooldown_secs(streak)
+                add(5, "쿨다운·짝짓기", elapsed >= cooldown,
+                    "비파괴 보류 후 %.0fs (필요 %.0fs, 연속 %d회 · 구조 %d회) — reset 불필요"
+                    % (elapsed, cooldown, streak, structural_streak))
         elif last_phase != SUCCESS_PHASE:
             add(5, "쿨다운·짝짓기", False,
                 "직전 사이클 종결=%s (%s 아님 → 발화 금지)" % (last_phase, SUCCESS_PHASE))
@@ -1106,9 +1149,10 @@ def ledger_view(records, role, bad_lines):
     - incomplete: 가장 최근 cycle_id 에 종결 phase 가 없다 = 미완결(fail-closed)
     - corrupt: 파싱 불가 라인 존재 또는 원장 읽기 불가
     - held_streak: 최신 cycle 부터 연속 held 종결 수(reset 이전 종결은 제외)
+    - held_structural_streak: 현재 held 구간에서 detail.structural is True 인 종결 수
     """
     view = {"cycles": 0, "last_terminal_phase": None, "last_terminal_ts": None,
-            "last_reset_ts": None, "held_streak": 0,
+            "last_reset_ts": None, "held_streak": 0, "held_structural_streak": 0,
             "incomplete": False, "incomplete_cycle": None,
             "corrupt": bool(bad_lines) and bad_lines != 0}
     if bad_lines and bad_lines != 0:
@@ -1152,6 +1196,9 @@ def ledger_view(records, role, bad_lines):
                 or (last.get("ts") or 0) < (view["last_reset_ts"] or 0)):
             break
         view["held_streak"] += 1
+        detail = last.get("detail")
+        if isinstance(detail, dict) and detail.get("structural") is True:
+            view["held_structural_streak"] += 1
     return view
 
 
@@ -1258,13 +1305,8 @@ def cmd_tick(args):
         verdict = evaluate_gates(role, ctx, now_ts)
         report.append({"role": role, "pass": verdict["pass"], "reason": verdict["reason"]})
         if not verdict["pass"]:
-            for gate in verdict["gates"]:
-                if gate.get("held_limit"):
-                    # ★같은 종결의 반복 tick 은 같은 본문/멱등키 — 새 큐·상태 파일 불필요.
-                    escalate("[CYCLE-AUTOPILOT] %s %s (직전 종결 ts=%s). 자동 재시도 중지. "
-                             "해제: javis_cycle_autopilot.py reset --role %s --reason '<사유>'"
-                             % (role, gate["detail"], ctx["ledger"]["last_terminal_ts"], role),
-                             task_key="autopilot-held-limit")
+            # held_limit 은 사유 표식만 유지한다. 멱등키가 배달 후 소멸하므로
+            # tick 재통지는 매분 홍수다 — cmd_execute 가 streak 당 유한 회만 통지한다.
             if verdict["exit"] in (EXIT_KILL, EXIT_LEDGER):
                 log_append({"ts": now_ts, "cycle_id": None, "phase": "skip", "role": role,
                             "surface": (ctx.get("row") or {}).get("surface_ref"),
@@ -1640,18 +1682,21 @@ def cmd_execute(args):
                {"argv": argv, "baseline": bl["path"], "file_set": bl["file_set"],
                 "save_files_origin": lease.get("save_files_origin"),
                 "started_at": start_ts, "poll_secs": KILL_POLL_SECS,
-                "residual_window": RESIDUAL_WINDOW_NOTE})
+                "residual_window_note": RESIDUAL_WINDOW_NOTE})
     ledger_append("cycle", "cycle-autopilot",
                   {"phase": "fired", "id": nonce_for(cid), "role": role})
     child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     # 자식 출력은 별도 스레드로 계속 빨아낸다 — 1s 폴링 루프가 PIPE 를 안 읽어 자식이
     # 블로킹되면 kill-switch 감시 자체가 무의미해진다.
-    sink = {"buf": []}
+    sink = {"buf": [], "residual": None}
 
     def _drain():
         try:
             for line in child.stdout:
+                residual = parse_residual_window(line)
+                if residual is not None:
+                    sink["residual"] = residual
                 sink["buf"].append(line)
                 if len(sink["buf"]) > 400:
                     del sink["buf"][:200]
@@ -1687,30 +1732,61 @@ def cmd_execute(args):
         release_quiesce(surface, cid, role, "in-flight kill-switch abort")
         _finalize(cid, role, surface, "failed",
                   {"reason": "in-flight kill-switch: %s" % aborted, "child_rc": rc,
-                   "tail": tail[-400:], "residual_window": RESIDUAL_WINDOW_NOTE})
+                   "tail": tail[-400:], "residual_window_note": RESIDUAL_WINDOW_NOTE})
         escalate("[CYCLE-AUTOPILOT] cycle-%d %s in-flight kill-switch 로 중단(%s)."
                  % (cid, role, aborted),
                  task_key="autopilot-killswitch")       # ★I3: 사건 종류별 병합 단위
         return EXIT_KILL
 
-    # 4) 자식 종료 = executor_exited (clear 성공을 뜻하지 않는다). 송신 0건 보류만 별도 종결.
+    # 4) 자식 종료 = executor_exited (clear 성공을 뜻하지 않는다). clear 송신 0건 보류만 별도 종결.
     _set_phase(cid, role, surface, "executor_exited",
-               {"child_rc": rc, "tail": tail[-800:], "started_at": start_ts})
+               {"child_rc": rc, "tail": tail[-800:], "started_at": start_ts,
+                "residual_window_secs": sink["residual"]})
     if rc in HELD_RCS:
         # ★84는 quiesce-on 전, 85는 자식이 off 했지만 abort 와 같은 멱등 안전망을 둔다.
         release_quiesce(surface, cid, role, "held noop child rc=%d" % rc)
-        retry_after_ts = time.time() + HELD_RETRY_COOLDOWN_SECS
+        classification = held_classify(rc, tail)
+        structural, keys_sent = classification["structural"], classification["keys_sent"]
+        records, bad = read_ledger()
+        # 이번 cycle 은 executor_exited 까지만 있어 미완결이다. 예측할 때만 제외하고,
+        # 종결 뒤에는 원장 전체를 재조회하여 이번 held 를 포함한 실값을 쓴다.
+        prev = ledger_view([r for r in records if r.get("cycle_id") != cid], role, bad)
+        continuing = (prev["last_terminal_phase"] == HELD_PHASE
+                      and (prev["last_reset_ts"] or 0) <= (prev["last_terminal_ts"] or 0))
+        streak = prev["held_streak"] + 1 if continuing else 1
+        structural_streak = ((prev["held_structural_streak"] if streak > 1 else 0)
+                             + (1 if structural else 0))
+        cooldown = held_cooldown_secs(streak)
+        retry_after_ts = time.time() + cooldown
         _finalize(cid, role, surface, HELD_PHASE,
                   {"child_rc": rc, "tail": tail[-800:],
-                   "reason": "비파괴 보류(clear 송신 0건)", "clear_sent": False,
+                   "reason": "비파괴 보류(clear 송신 0건 · 키 송신 %s)" % keys_sent,
+                   "clear_sent": False, "structural": structural,
+                   "alive_evidence": classification["alive_evidence"], "keys_sent": keys_sent,
+                   "residual_window_secs": sink["residual"],
+                   "held_streak": streak, "held_structural_streak": structural_streak,
+                   "cooldown_secs": cooldown,
                    "retry_after_ts": retry_after_ts})
+        records, bad = read_ledger()
+        current = ledger_view(records, role, bad)
+        if (streak, structural_streak) != (current["held_streak"], current["held_structural_streak"]):
+            print("⚠ [cycle-autopilot] cycle-%d held 예측(%d,%d) != 원장(%d,%d) — 원장 값으로 통지 판정"
+                  % (cid, streak, structural_streak,
+                     current["held_streak"], current["held_structural_streak"]), file=sys.stderr)
+        streak, structural_streak = current["held_streak"], current["held_structural_streak"]
+        cooldown = held_cooldown_secs(streak)
+        retry_after_ts = (current["last_terminal_ts"] or 0) + cooldown
         ledger_append("cycle", "cycle-autopilot",
                       {"phase": HELD_PHASE, "id": nonce_for(cid), "role": role})
-        escalate("[CYCLE-AUTOPILOT] cycle-%d %s 비파괴 보류(clear 송신 0건, rc=%d). "
-                 "%.0fs 쿨다운 뒤 다른 게이트 통과 시 자동 재시도(최소 시각=%.3f), reset 불필요. "
-                 "단, 연속 보류 %d회 도달 시 자동 재시도 중지·사람 확인 후 reset."
-                 % (cid, role, rc, HELD_RETRY_COOLDOWN_SECS, retry_after_ts, HELD_RETRY_MAX),
-                 task_key="autopilot-held")
+        if structural_streak == HELD_RETRY_MAX:
+            escalate("[CYCLE-AUTOPILOT] cycle-%d %s 구조적 보류 %d회 — 데몬이 quiet_secs 를 보고하지 않는다. "
+                     "데몬 갱신 후 reset --role %s. 자동 재시도 중지"
+                     % (cid, role, structural_streak, role), task_key="autopilot-held-limit")
+        elif streak == 1 or (streak > 0 and streak % HELD_RETRY_MAX == 0):
+            escalate("[CYCLE-AUTOPILOT] cycle-%d %s 비파괴 보류(clear 송신 0건 · 키 송신 %s, rc=%d) "
+                     "연속 %d회 · %.0fs 뒤 자동 재시도(최소 시각=%.3f) · reset 불필요"
+                     % (cid, role, keys_sent, rc, streak, cooldown, retry_after_ts),
+                     task_key="autopilot-held")
         return EXIT_ERR
     time.sleep(SETTLE_SECS)
     with _StateLock():
