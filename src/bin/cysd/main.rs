@@ -1083,7 +1083,6 @@ fn scrub_claude_session_env() {
 }
 
 /// cysd 명령줄 판정(순수 · argv[0] 제외).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum CysdCli {
     Run,
@@ -1092,30 +1091,64 @@ enum CysdCli {
     Unknown(String),
 }
 
-#[allow(dead_code)]
 fn parse_cysd_args<I: IntoIterator<Item = String>>(args: I) -> CysdCli {
-    let _ = args;
-    CysdCli::Run
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return CysdCli::Run;
+    };
+    let command = match first.as_str() {
+        "--version" | "-V" => CysdCli::Version,
+        "--help" | "-h" => CysdCli::Help,
+        _ => return CysdCli::Unknown(first),
+    };
+    match args.next() {
+        Some(extra) => CysdCli::Unknown(extra),
+        None => command,
+    }
 }
 
 /// `cysd <version> (build <id>)` 한 줄.
-#[allow(dead_code)]
 fn cysd_version_line() -> String {
-    String::new()
+    format!("cysd {} (build {})", env!("CARGO_PKG_VERSION"), cys::pack::build_id())
 }
 
 /// usage 본문 — `usage: cysd [--version|-V|--help|-h]` 로 시작하고 무인자만 데몬을 기동한다.
-#[allow(dead_code)]
 fn cysd_usage() -> String {
-    String::new()
+    concat!(
+        "usage: cysd [--version|-V|--help|-h]\n",
+        "  cysd            데몬을 기동한다(무인자만 기동 · 소켓은 CYS_SOCKET · 팩은 CYS_PACK_DIR)\n",
+        "  --version, -V   버전과 빌드 ID 를 stdout 에 내고 exit 0\n",
+        "  --help, -h      이 도움말 · exit 0\n",
+        "  그 밖의 인자    usage 를 stderr 에 내고 exit 2 — 데몬은 기동하지 않는다\n",
+    )
+    .to_string()
 }
 
+/// 종전에는 `src/bin/cysd/**` 에 `env::args` 가 없어 `cysd --version` 도 데몬을 기동했다
+/// (1차 검증 샌드박스 실사고). 인자를 먼저 판정하고 무인자만 데몬을 기동한다.
+///
 /// ★SEAL-1 층3 배선 지점(sync main). `#[tokio::main]` 은 `async_main` 으로 내려가 있고, 여기서
 /// **런타임(=워커 스레드)이 만들어지기 전에** 프로세스 env 를 봉인한다 — `set_var` 는 프로세스
 /// 전역이라 스레드가 살아 있는 동안 쓰면 경합한다(lib.rs `seal_python_bytecode_in_process` 계약).
 /// 이 한 줄로 데몬의 **모든** 자손이 덮인다: pane(층2 가 이미 명시 주입) + 층1·층2 가 닿지 않는
 /// 임의 명령 경로 — `channels::spawn_bridge`(사용자 bridge_cmd)·`accounts` cmd 어댑터(주기 폴링).
 fn main() {
+    match parse_cysd_args(std::env::args().skip(1)) {
+        CysdCli::Version => {
+            println!("{}", cysd_version_line());
+            std::process::exit(0);
+        }
+        CysdCli::Help => {
+            print!("{}", cysd_usage());
+            std::process::exit(0);
+        }
+        CysdCli::Unknown(a) => {
+            eprintln!("cysd: unknown argument '{a}'");
+            eprint!("{}", cysd_usage());
+            std::process::exit(2);
+        }
+        CysdCli::Run => {}
+    }
     cys::seal_python_bytecode_in_process();
     async_main();
 }

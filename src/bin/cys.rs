@@ -2629,6 +2629,8 @@ fn connect_raw() -> Result<std::fs::File, String> {
 
 /// 온보딩④: 자동 기동 허용 — ping(순수 프로브)·daemon status는 main()에서 끈다.
 static AUTOSTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// autostart 자격 거부: exit 2 + stderr 사유 1줄 + 처방(접속 실패 원문은 별도 출력).
+const EXIT_AUTOSTART_REFUSED: i32 = 2;
 /// 한 CLI 실행에서 spawn 시도는 1회만
 static AUTOSTART_TRIED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2815,7 +2817,6 @@ fn lane_pack_for_socket(socket: &std::path::Path) -> Option<std::path::PathBuf> 
 }
 
 /// autostart 레인 분류(순수).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutostartLane {
     /// 기본 base 소켓(launchd 위임 허용).
@@ -2827,26 +2828,62 @@ enum AutostartLane {
 }
 
 /// unix sockaddr_un.sun_path 상한(macOS/Linux 104 · NUL 포함) — 경로 바이트 길이는 이보다 작아야 한다.
-#[allow(dead_code)]
+#[cfg(unix)]
 const UNIX_SOCKET_PATH_MAX: usize = 104;
 
 /// autostart 자격 검사(순수 · connect() autostart 분기와 spawn_detached_daemon 이 공유).
 /// `socket` = 접속 소켓 · `default_base` = cys::default_socket_path() · `pack_env` = PACK_DIR_ENV_KEYS 첫 유효값.
 /// Ok(lane) = autostart 허용(레인 분류 동봉) · Err(사유 1줄 + 처방) = autostart 만 거부(접속 자체는 호출부가 종전대로).
-#[allow(dead_code)]
 fn autostart_eligibility(
     socket: &std::path::Path,
     default_base: &std::path::Path,
     pack_env: Option<&std::path::Path>,
 ) -> Result<AutostartLane, String> {
-    let _ = pack_env;
-    Ok(if socket == default_base {
+    let socket_text = socket.to_string_lossy();
+    let is_named_pipe = socket_text.starts_with(r"\\.\pipe\");
+    // 경로 자체에 개행이 있어도 호출부의 stderr 사유는 한 줄로 유지한다.
+    let one_line = |message: String| message.replace('\r', "\\r").replace('\n', "\\n");
+    if !socket.is_absolute() && !is_named_pipe {
+        return Err(one_line(format!(
+            "autostart 거부: 소켓 경로가 상대경로다({}) — 상대경로 접속은 허용하지만 데몬을 그 경로로 띄우면 cwd 에 bind 되는 고아 데몬이 된다. 처방: --socket/CYS_SOCKET 을 절대경로로 지정하거나 비워 기본 소켓을 쓰라",
+            socket.display()
+        )));
+    }
+    #[cfg(unix)]
+    if !is_named_pipe {
+        use std::os::unix::ffi::OsStrExt;
+        let len = socket.as_os_str().as_bytes().len();
+        if len >= UNIX_SOCKET_PATH_MAX {
+            return Err(format!(
+                "autostart 거부: 소켓 경로가 {len} 바이트로 unix 소켓 상한(104) 이상이다 — 데몬이 bind 하지 못한다. 처방: 짧은 절대경로"
+            ));
+        }
+    }
+    let lane = if socket == default_base {
         AutostartLane::Base
     } else if cys::is_dept_socket(socket) {
         AutostartLane::Dept
     } else {
         AutostartLane::Isolated
-    })
+    };
+    if let Some(pack) = pack_env {
+        if let Some(dept) = pack
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("pack-dept-"))
+            .filter(|name| !name.is_empty())
+        {
+            let expected = format!("cys-dept-{dept}");
+            if !socket_text.split(['/', '\\']).any(|part| part == expected) {
+                return Err(one_line(format!(
+                    "autostart 거부: 팩 env 가 부서 팩({} · pack-dept-{dept})인데 소켓({})에 {expected} 성분이 없다 — 이 조합의 데몬은 부서 부트를 영구 차단하고 본부 팩을 교차 서빙한다. 처방: 부서 데몬은 `cys-dept launch {dept}` 으로, 본부 명령은 CYS_PACK_DIR 을 비우고 실행",
+                    pack.display(),
+                    socket.display()
+                )));
+            }
+        }
+    }
+    Ok(lane)
 }
 
 /// ★G34(W3): (소켓, 팩) **쌍 보증** — 부서 소켓으로 데몬을 띄우면서 본부 팩을 물려주는 것을 막는다.
@@ -2856,13 +2893,26 @@ fn autostart_eligibility(
 /// F1 계정·레인 격리가 붕괴하며 schedule 이 중복 발화한다. 쌍 보증이 `cys-dept` 3지점에만 있었고
 /// CLI autostart 는 env 를 무스크럽 상속해 그 조합을 만들 수 있었다(부서 데몬 사망 후 임의 cys 명령).
 ///
-/// 판정(base 소켓은 무동작 — 기존 동작 100% 보존):
+/// 판정(공통 자격 검사 통과 후 base 소켓은 팩 주입 없이 통과):
+///  · 상대경로 소켓은 autostart 거부(Windows named pipe 접두는 절대경로로 인정).
+///  · unix 소켓 경로 바이트 길이가 SUN_LEN(104) 이상이면 거부(named pipe 제외).
+///  · 부서 팩 env 는 소켓에 같은 부서 성분이 있어야 한다(역검사).
 ///  · 팩 env 미설정 → 소켓에서 레인 팩을 유도해 **주입**(선택지 ①). 유도한 팩 디렉터리가 없으면
 ///    그 부서는 실재하지 않는 것이므로 거부(선택지 ② — 새 부서 팩을 자동 창설하지 않는다).
 ///  · 팩 env 설정 + 유도값과 불일치 → **거부**(선택지 ②): 명시 오설정이며, 그대로 띄우면 위 ①②가 확정된다.
 /// 거부는 조용하지 않다 — 호출부가 에러를 삼키므로 사유를 여기서 stderr 로 낸다.
 fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<()> {
     let socket = cys::socket_path();
+    let env_pack = cys::pack::PACK_DIR_ENV_KEYS
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from);
+    if let Err(msg) =
+        autostart_eligibility(&socket, &cys::default_socket_path(), env_pack.as_deref())
+    {
+        eprintln!("[cys] {msg}");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    }
     if !cys::is_dept_socket(&socket) {
         return Ok(());
     }
@@ -2878,9 +2928,6 @@ fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<(
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
         }
     };
-    let env_pack = cys::pack::PACK_DIR_ENV_KEYS
-        .iter()
-        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
     match env_pack {
         None => {
             if !derived.is_dir() {
@@ -2915,7 +2962,7 @@ fn ensure_daemon_lane_pack(cmd: &mut std::process::Command) -> std::io::Result<(
                  부서 부트를 영구 차단하고 본부 팩을 교차 서빙한다 — 부서 데몬은 \
                  `cys-dept launch <name>` 으로 기동하세요.",
                 socket.display(),
-                p,
+                p.display(),
                 derived.display()
             );
             eprintln!("[cys] {msg}");
@@ -2995,9 +3042,11 @@ fn poll_socket_ready() -> Option<ConnStream> {
 
 /// 온보딩④: 연결 실패 시 형제 cysd를 자동 기동 후 재시도 — 신규 머신 zero-setup.
 /// 옵트아웃: CYS_NO_AUTOSTART=1. (데몬 중복 기동은 cysd 자체의 flock이 차단)
-/// ★W3: macOS에서 launchd가 cysd를 소유(적재)하면 sibling spawn 대신 launchctl kickstart로
+/// autostart 자격(절대경로·unix SUN_LEN·부서 팩 env 역검사)을 위임/스폰 전에 검사한다.
+/// ★W3: 기본 base 소켓이며 macOS에서 launchd가 cysd를 소유(적재)하면 launchctl kickstart로
 /// 위임한다 — 구형 CLI가 자기 옆 구형 cysd를 띄워 startup lock을 선점하고 launchd 신형과
 /// crashloop 하는 경로를 원천 차단. kickstart 실패·폴링 타임아웃 시에만 sibling fallback(개발 환경).
+/// 부서·격리 소켓은 sibling spawn 으로만 기동한다.
 fn connect() -> Result<ConnStream, String> {
     match connect_raw() {
         Ok(s) => Ok(s),
@@ -3020,10 +3069,33 @@ fn connect() -> Result<ConnStream, String> {
                     "완전 초기화가 진행 중이라 데몬을 기동하지 않는다 — 끝난 뒤 다시 실행하라".into(),
                 );
             }
-            // launchd 위임 우선(macOS·적재 시). 실패 시 아래 sibling 경로로 폴백.
+            let socket = socket_path();
+            let pack_env = cys::pack::PACK_DIR_ENV_KEYS
+                .iter()
+                .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+                .map(std::path::PathBuf::from);
+            let lane = match autostart_eligibility(
+                &socket,
+                &cys::default_socket_path(),
+                pack_env.as_deref(),
+            ) {
+                Ok(lane) => lane,
+                Err(msg) => {
+                    eprintln!("[cys] {msg}");
+                    eprintln!("[cys] {first}");
+                    // 수백 개 호출부가 request() 에러를 exit 1 로 접으므로 토큰 매핑이
+                    // 불가능하다. 여기서 exit 2 를 보장하고 접속 실패 원문도 함께 낸다.
+                    std::process::exit(EXIT_AUTOSTART_REFUSED);
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let _ = lane;
+            // launchd 위임 우선(macOS·기본 base 소켓·적재 시). 실패 시 sibling 경로로 폴백.
             #[cfg(target_os = "macos")]
             {
-                if cys::launchd::should_delegate_autostart(cys::launchd::is_loaded()) {
+                if lane == AutostartLane::Base
+                    && cys::launchd::should_delegate_autostart(cys::launchd::is_loaded())
+                {
                     eprintln!("[cys] cysd not serving — delegating to launchd (launchctl kickstart)");
                     if cys::launchd::kickstart() {
                         if let Some(s) = poll_socket_ready() {
@@ -24540,6 +24612,42 @@ mod tests {
         assert_eq!(pairs, vec![("A".into(), "b".into()), ("CLAUDE_CONFIG_DIR".into(), "x".into())]); // 정렬
         let no_env = serde_json::json!({"cmd": "agy"});
         assert!(agent_env_pairs(&no_env).is_empty());
+    }
+
+    #[test]
+    fn d06_connect_checks_eligibility_before_launchd_delegation_source_pin() {
+        fn function_body<'a>(src: &'a str, anchor: &str) -> &'a str {
+            let start = src.find(anchor).expect("함수 앵커") + anchor.len();
+            let rest = &src[start..];
+            let end = ["\nfn ", "\ntype "]
+                .iter()
+                .filter_map(|boundary| rest.find(boundary))
+                .min()
+                .unwrap_or(rest.len());
+            &rest[..end]
+        }
+
+        let src = include_str!("cys.rs");
+        let connect = function_body(src, "\nfn connect()");
+        let eligibility = connect.find("autostart_eligibility(").expect("자격 검사 누락");
+        let delegation = connect
+            .find("launchd::should_delegate_autostart")
+            .expect("launchd 위임 조건 누락");
+        assert!(eligibility < delegation, "자격 검사가 launchd 위임보다 먼저여야 한다");
+        let condition_start = connect[..delegation].rfind("if ").expect("위임 if 조건");
+        let condition = &connect[condition_start..delegation];
+        assert!(
+            condition.contains("lane == AutostartLane::Base") && condition.contains("&&"),
+            "launchd 위임은 기본 base 소켓에만 허용해야 한다"
+        );
+        assert!(connect.contains("std::process::exit(EXIT_AUTOSTART_REFUSED)"));
+        let guard = function_body(src, "\nfn ensure_daemon_lane_pack(");
+        assert!(guard.contains("autostart_eligibility("), "sibling spawn 가드 자격 검사 누락");
+    }
+
+    #[test]
+    fn d06_exit_autostart_refused_is_2() {
+        assert_eq!(EXIT_AUTOSTART_REFUSED, 2);
     }
 
     #[test]
