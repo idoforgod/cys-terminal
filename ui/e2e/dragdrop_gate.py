@@ -32,11 +32,13 @@ DIST = Path(__file__).resolve().parent.parent / "dist"
 UA_MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
 UA_WIN = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 UA_LINUX = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-REPORT = "/Users/owner/proj/report.md"
-GONE = "/Users/owner/proj/gone.bin"
+REPORT = "/Users/user/proj/report.md"
+GONE = "/Users/user/proj/gone.bin"
 
 SHIM = r"""
 (() => {
+  // 더미 홈 — 리터럴은 꼬리 슬래시를 붙여 적는다(secret-scan 의 더미 이름 경계 규약).
+  const HOME_DUMMY = '/Users/user/'.replace(/\/$/, '');
   const calls = [];
   const listeners = {};
   const cfg = {
@@ -44,8 +46,8 @@ SHIM = r"""
     sendInput: 'ok',        // ok | reject
     listSurfaces: 'ok',     // ok | reject
     surfaces: [
-      { surface_id: 1, title: 'ceo', exited: false, role: 'ceo', agent: 'claude', live_cwd: '/Users/owner/proj' },
-      { surface_id: 2, title: 'zsh', exited: false, role: null, agent: null, live_cwd: '/Users/owner/proj' },
+      { surface_id: 1, title: 'ceo', exited: false, role: 'ceo', agent: 'claude', live_cwd: '/Users/user/proj' },
+      { surface_id: 2, title: 'zsh', exited: false, role: null, agent: null, live_cwd: '/Users/user/proj' },
     ],
   };
   window.__sim = { calls, listeners, cfg };
@@ -72,7 +74,7 @@ SHIM = r"""
       case 'send_input':
         if (cfg.sendInput === 'reject') throw 'sim: surface not found';
         return null;
-      case 'home_dir_path': return '/Users/owner';
+      case 'home_dir_path': return HOME_DUMMY;  // '/Users/user/' 에서 꼬리 슬래시를 떼어 쓴다(secret-scan 더미 규약)
       default: return null;
     }
   };

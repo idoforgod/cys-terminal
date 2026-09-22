@@ -117,7 +117,7 @@ describe("경로 검사 — 조회 실패와 항목 부재를 구분한다", () 
 });
 
 describe("경로 오류 토스트 — 제목·경로·다중 순번·원인을 보존한다", () => {
-  const p = "/Users/owner/proj/gone.bin";
+  const p = "/Users/user/proj/gone.bin";
   const kinds: Exclude<PathCheck, "ok">[] = ["unreadable", "missing"];
   test("조회 실패와 항목 부재의 제목이 서로 다르다", () => {
     const unreadable = pathCheckToast("unreadable", p, 0, 1);

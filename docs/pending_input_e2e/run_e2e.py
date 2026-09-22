@@ -290,7 +290,7 @@ def main():
         poll_once()
 
         # ───────── P1 ─────────
-        path_txt = "'/Users/cys/Desktop/some dir/file name.txt' "
+        path_txt = "'/Users/user/Desktop/some dir/file name.txt' "
         r = gui_inject(d, sP, path_txt)
         time.sleep(0.4)
         log("P1.a.idle", resp=short(r), rows=prompt_rows(d, sP), rx_hex_tail=rx_bytes(rxP)[-40:])
