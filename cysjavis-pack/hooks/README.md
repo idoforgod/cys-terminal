@@ -40,11 +40,24 @@ stdout 은 모델 컨텍스트로 주입된다) · `set -u` 안전 · 항상 0 �
 
 다른 레인의 팩에서 온 훅이 우연히 발화하는 것을 막는다. 발화 조건은 **양쪽이 모두 실제 팩일 때**다 —
 `$CYS_PACK_DIR/hooks/_lib.sh` 가 있고, 훅 자신의 팩 루트에도 `hooks/_lib.sh` 가 있으며, 두 경로가
-정규화 후 다를 때. 그 경우 stderr 1줄을 남기고 조용히 exit 0 한다.
+정규화 후 다를 때. 불일치 시 ① 자기 레인 팩의 같은 상대경로 훅이 있고 읽을 수 있으면 그 훅으로
+`exec` 한다(위임 · stdin/인자/stderr/exit 보존 · `CYS_LANE_REDIRECTED=1` 로 1회 한정).
+② 대응 훅이 없거나 판독 불가이면 `<레인 팩>/state/lane-guard-tripped` 표식을 남긴다(덮어쓰기).
+이 부재 갈래는 stdout 없이 exit 0 한다.
 
 판정이 서지 않으면(팩이 아닌 트리에서 실행 — 오버레이·테스트 스텁·팩 밖 복사본) **통과**한다.
 `~/.cys/local/hooks/` 에는 `_lib.sh` 가 없으므로 사용자 오버레이는 이 가드에 걸리지 않는다.
 일시적으로 끄려면 `CYS_HOOK_LANE_GUARD=0`.
+
+소비자는 preflight `C83.lane-guard-tripped`(24h 이내 표식 FAIL · 좌석 안 SessionStart 설정 대조 WARN)와
+`javis_bootstrap.py` 최종 JSON / `javis_mission.py status --json` 의 `hooks_effective` 다.
+
+훅 본문은 프리루드 줄 다음에 아래 한 줄을 둔다. census 검체(`test_lane_redirect.py` R-8)가
+전수를 잰다 — 새 훅을 만들면 이 줄을 넣어라.
+
+```sh
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
+```
 
 ## 3. completion-guard 의 이중 휴면 — "등록했는데 왜 안 도나"
 

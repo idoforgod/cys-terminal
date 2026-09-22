@@ -332,11 +332,16 @@ cys_lane_guard() {
   _cys_lg_name="${0##*/}"
   _cys_lg_target="$_cys_lg_lane/$_cys_lg_rel/$_cys_lg_name"
   CYS_LANE_REDIRECT=""
-  if [ -z "${CYS_LANE_REDIRECTED:-}" ] && [ -f "$_cys_lg_target" ] \
+  # 판독 불가 대상은 대응 훅 부재로 강등해 인터프리터 오류 대신 표식 + exit 0을 보존한다.
+  if [ -z "${CYS_LANE_REDIRECTED:-}" ] && [ -f "$_cys_lg_target" ] && [ -r "$_cys_lg_target" ] \
      && [ "$_cys_lg_target" != "$_cys_lg_d/$_cys_lg_name" ]; then
     CYS_LANE_REDIRECT="$_cys_lg_target"
     return 0
   fi
+  # ★고지의 가시성 한계(정직 기록): 훅의 프리루드 규약 문장은 `. "…/_lib.sh" 2>/dev/null` 이라
+  #   **source 명령 전체의 stderr 가 억제**된다 — 이 줄은 프리루드를 직접 로드하는 호출자
+  #   (하네스·수동 진단)에게만 보인다.
+  #   훅 경로에서 관측 가능한 계약은 '레인 대응 훅 부재 시 무발화·exit 0·stdout 0·표식 / 실재 시 위임' 이며 검체 H-LANE-GUARD-1·test_lane_redirect.py 가 잰다.
   cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name"
   echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
   exit 0

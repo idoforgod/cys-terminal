@@ -10,7 +10,7 @@ r"""test_lane_redirect.py — WP-B-hooks 레인 위임·공통 탐지 RED 검체
   ④ R-4 대응 훅 부재 → exit 0·stdout 0·표식 생성/덮어쓰기
   ⑤ R-5 같은 팩·성공 위임에서는 표식 무생성
   ⑥ R-6 표식 쓰기 불가에서도 exit 0·stdout 0
-  ⑦ R-7 이미 위임됨·심링크 변형에서 무한 위임 차단
+  ⑦ R-7 이미 위임됨·심링크 변형에서 무한 위임 차단 · 판독 불가 대상 → 표식+exit 0
   ⑧ R-8 전 프리루드 경유 훅의 redirect 호출 위치 census(런처·하위 훅 포함)
   ⑨ R-9 혼재 프로필: base→dept 1회 + dept 직접 1회 = 카운터 2.
      위임은 1:1이다. 프로필의 이중 실행 방지 정본은 C56 불변식(글로벌 프로필에
@@ -247,6 +247,19 @@ def r7(lab):
     lib.unlink()
     lib.symlink_to(lab.base / "hooks/_lib.sh")
     attempt("R-7b 프리루드 심링크에서도 60s 안에 종료", lambda: _symlink_run(lab))
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("SKIP R-7c chmod 판독 불가 — root는 권한 비트를 우회한다")
+    else:
+        marker = lab.dept / MARKER
+        marker.unlink(missing_ok=True)
+        try:
+            target.chmod(0o000)
+            r = lab.run(target.name)
+            check("R-7c 판독 불가 대상 → 표식+exit 0·stdout 0",
+                  r.returncode == 0 and r.stdout == "" and marker.is_file(),
+                  result(r) + " marker=%s" % marker.is_file())
+        finally:
+            target.chmod(0o755)
 
 
 def _symlink_run(lab):
