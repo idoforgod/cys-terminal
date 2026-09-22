@@ -79,6 +79,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 import tempfile
 
 EXIT_OK, EXIT_TARGET, EXIT_ARGS = 0, 1, 2

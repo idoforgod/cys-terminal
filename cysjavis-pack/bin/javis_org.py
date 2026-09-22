@@ -6,6 +6,7 @@ exit: 0=성공 1=위반/실패 2=입출력 3=권한(CSO아님) 4=대상없음
 (org-audit 동사: 0=수렴 1=미수렴 2=입출력 — read-only 파생 집계·영속 0 · T10/P3-3)
 """
 import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil, unicodedata
+sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 
 # RC-6: OS중립 파일락 — unix는 fcntl.flock(제로 회귀·파일 닫힐 때 자동 해제), Windows는 fcntl
 # 부재라 msvcrt 바이트락으로 폴백(과거 top-level `import fcntl`이 Windows에서 즉시 ModuleNotFoundError로

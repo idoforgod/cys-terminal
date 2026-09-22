@@ -12,6 +12,7 @@
 exit: 0=전량 통과 · 2=검증 실패(FAIL 사유 출력) · 3=입력 오류.
 """
 import argparse, json, os, sys
+sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 
 def _load_dept_roster_tombstones(path):
     """phoenix dept_roster.json 의 tombstones 집합. 파일 부재/손상=빈 집합(호출자가 필요성 판단)."""

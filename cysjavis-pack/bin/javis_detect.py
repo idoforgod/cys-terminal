@@ -31,7 +31,7 @@ bashism `${x:0:200}`)는 훅에서 **제거**된다 — 그게 G25 의 소멸 �
 
 사용:
   · 라이브러리(권장 — corpus 회귀는 이 함수를 직접 때린다):
-        import javis_detect; v = javis_detect.detect(prompt); v["fire"]
+        python3 -c 'import javis_detect; v = javis_detect.detect(prompt); print(v["fire"])'
   · 훅 게이트(1왕복 · stdin=UserPromptSubmit hook JSON):
         printf '%s' "$INPUT" | python3 javis_detect.py hook-gate
         exit 0=FIRE / 1=judged-no(선언 없음·침묵) / 3=선언 검출 후 **억제**(stderr 1줄 로그)
