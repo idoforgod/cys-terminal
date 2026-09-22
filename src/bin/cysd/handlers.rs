@@ -12470,6 +12470,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ────── ★V7 검증 검체(2026-09-21 · bugverify-3problems · **미커밋 RED 자산**) — 핸들러 수준 ──────
+    //
+    // `governance::tests` 의 순수 전이함수 검체가 '함수가 그렇게 센다' 를 보였다면, 이 블록은
+    // **실제 RPC 핸들러**(`dispatch` → `surface.send_text` / `surface.send_key`)를 지난 뒤
+    // `Surface.pending_input_bytes` 와 `last_human_input` 이 어떻게 남는지를 잰다.
+    // GUI 경로(tauri `send_input`)와 같은 파라미터 모양(`human:true`·`quiet:true`)을 쓴다.
+    // 수정 구현이 아니다 — 제품 코드는 건드리지 않는다.
+
+    /// GUI 가 올리는 사람 경로 1회 호출(= term.onData 1회 = RPC 1회). 호출 뒤 계수를 돌려준다.
+    fn v7_send_human(daemon: &Arc<Daemon>, sid: u64, pid: u32, text: &str) -> u64 {
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": sid, "text": text, "quiet": true, "human": true }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "전제: 전송 자체는 성공해야 한다 (응답: {resp})");
+        daemon.get_surface(sid).unwrap().pending_input_bytes.load(Ordering::Relaxed)
+    }
+
+    /// `cys send-key <key>` 경로 1회 호출. 타이핑 가드는 검체가 직접 식혀 둔다.
+    fn v7_send_key(daemon: &Arc<Daemon>, sid: u64, pid: u32, key: &str) -> u64 {
+        *daemon.get_surface(sid).unwrap().last_human_input.lock().unwrap() = None;
+        let req = Request {
+            id: json!(2),
+            method: "surface.send_key".into(),
+            params: json!({ "surface_id": sid, "key": key }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "전제: send_key 자체는 성공해야 한다 (응답: {resp})");
+        daemon.get_surface(sid).unwrap().pending_input_bytes.load(Ordering::Relaxed)
+    }
+
+    fn v7_pane(daemon: &Arc<Daemon>, role: &str, pid: u32) -> Arc<crate::state::Surface> {
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        bind_caller(daemon, pid, s.id);
+        s
+    }
+
+    /// 관측 전용(실패 0) — 핸들러를 지난 **실제 계수**를 `V7OBS` 줄로 찍는다.
+    #[test]
+    fn v7_probe_handler_observed_counts() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-probe", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_470_u32;
+
+        // D-01: pane 을 10번 클릭·이탈 — 타이핑 가드 시계와 계수를 **같은 호출에서** 나란히 본다.
+        let m = v7_pane(&daemon, "master", pid);
+        let mut last = 0;
+        for _ in 0..10 {
+            v7_send_human(&daemon, m.id, pid, "\u{1b}[I");
+            last = v7_send_human(&daemon, m.id, pid, "\u{1b}[O");
+        }
+        eprintln!(
+            "V7OBS handler.d01 ten_click_cycles last_human_input_is_none={} pending_input_bytes={last}",
+            m.last_human_input.lock().unwrap().is_none()
+        );
+
+        // D-02: 사람이 abc 를 치고 지운다(GUI 는 Backspace 를 0x7f 로 onData 에 낸다).
+        let p = v7_pane(&daemon, "worker-1", pid + 1);
+        let mut steps = Vec::new();
+        for t in ["a", "b", "c", "\u{7f}", "\u{7f}", "\u{7f}"] {
+            steps.push(v7_send_human(&daemon, p.id, pid + 1, t));
+        }
+        eprintln!("V7OBS handler.d02 gui abc+BSx3 steps={steps:?}");
+        let p2 = v7_pane(&daemon, "worker-2", pid + 2);
+        let mut steps = vec![v7_send_human(&daemon, p2.id, pid + 2, "abc")];
+        for _ in 0..3 {
+            steps.push(v7_send_key(&daemon, p2.id, pid + 2, "Backspace"));
+        }
+        eprintln!("V7OBS handler.d02 send_text abc + send_key Backspace x3 steps={steps:?}");
+        let p3 = v7_pane(&daemon, "worker-3", pid + 3);
+        let steps = vec![
+            v7_send_human(&daemon, p3.id, pid + 3, "abc"),
+            v7_send_key(&daemon, p3.id, pid + 3, "Escape"),
+        ];
+        eprintln!("V7OBS handler.d02 send_text abc + send_key Escape steps={steps:?}");
+
+        // D-03: 붙여넣기 1회 호출(GUI: xterm.js 가 \n→\r 정규화 · CLI inject_text: \n 그대로).
+        let p4 = v7_pane(&daemon, "worker-4", pid + 4);
+        let n = v7_send_human(&daemon, p4.id, pid + 4, "\u{1b}[200~a\nb\u{1b}[201~");
+        eprintln!("V7OBS handler.d03 paste a\\nb one_call pending={n}");
+        let p5 = v7_pane(&daemon, "worker-5", pid + 5);
+        let n = v7_send_human(&daemon, p5.id, pid + 5, "\u{1b}[200~a\rb\u{1b}[201~");
+        eprintln!("V7OBS handler.d03 paste a\\rb one_call pending={n}");
+
+        // 분할 붙여넣기(codex 시나리오): 호출 3번 vs 호출 1번.
+        let a = v7_pane(&daemon, "worker-6", pid + 6);
+        let steps_a: Vec<u64> = ["\u{1b}[200~", "\u{1b}[24;80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, a.id, pid + 6, t))
+            .collect();
+        let b = v7_pane(&daemon, "worker-7", pid + 7);
+        let one = v7_send_human(&daemon, b.id, pid + 7, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
+        let c = v7_pane(&daemon, "worker-8", pid + 8);
+        let steps_c: Vec<u64> = ["\u{1b}[200~\u{1b}[24", ";80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, c.id, pid + 8, t))
+            .collect();
+        eprintln!("V7OBS handler.split three_calls={steps_a:?} one_call={one} boundary_in_body={steps_c:?}");
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RED(D-01 · 핸들러 수준 비대칭): 같은 청크(`ESC[I`/`ESC[O`)를 타이핑 가드는 **면제**하는데
+    /// 미제출 입력 계수는 **면제하지 않는다**. 앞 assert(면제)는 통과하고 뒤 assert(계수 0)가 실패하면
+    /// 그것이 곧 비대칭의 실측이다.
+    #[test]
+    fn v7_d01_handler_exempts_typing_guard_but_still_counts_autoreply() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-d01", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_480_u32;
+        let m = v7_pane(&daemon, "master", pid);
+        let mut pending = 0;
+        for _ in 0..10 {
+            v7_send_human(&daemon, m.id, pid, "\u{1b}[I");
+            pending = v7_send_human(&daemon, m.id, pid, "\u{1b}[O");
+        }
+        let guard_untouched = m.last_human_input.lock().unwrap().is_none();
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("V7OBS v7_d01_handler guard_untouched={guard_untouched} pending_input_bytes={pending}");
+        assert!(guard_untouched, "전제: 자동응답은 타이핑 가드를 찍지 않는다(handlers.rs:4224 면제)");
+        assert_eq!(
+            pending, 0,
+            "같은 청크를 타이핑 가드는 기계로 보고 면제했는데 계수는 사람 입력으로 {pending}바이트 셌다(handlers.rs:4422)"
+        );
+    }
+
+    /// RED(분할 붙여넣기 · 핸들러 수준): 같은 바이트를 호출 3번으로 보낸 계수 == 호출 1번 계수.
+    #[test]
+    fn v7_split_paste_handler_call_boundary_must_not_change_count() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-split", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_490_u32;
+        let a = v7_pane(&daemon, "worker-1", pid);
+        let steps: Vec<u64> = ["\u{1b}[200~", "\u{1b}[24;80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, a.id, pid, t))
+            .collect();
+        let b = v7_pane(&daemon, "worker-2", pid + 1);
+        let one = v7_send_human(&daemon, b.id, pid + 1, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("V7OBS v7_split_paste_handler three_calls={steps:?} one_call={one}");
+        assert_eq!(
+            steps.last().copied(),
+            Some(one),
+            "호출 경계만으로 계수가 갈린다 — 호출3번={steps:?} 호출1번={one}"
+        );
+    }
+
     /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
     /// **전 경우**를 고정한다. 판정이 두 층으로 갈렸으므로 두 층을 함께 박는다 —
     ///   · 핸들러층 `submit_gap_for_key`: '이 키에 간격을 거는가' (잔여는 재지 않는다)

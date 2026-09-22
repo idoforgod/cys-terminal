@@ -11121,6 +11121,272 @@ mod tests {
         assert_eq!(input_line_state(0, Some(line)), InputLine::Empty);
     }
 
+    // ────── ★큐 기아 건 A 재현(2026-09-20 · 위임 티켓) — 계수가 0 으로 돌아오지 않는다 ──────
+    //
+    // 증상(실측): 본부 master(surface:2)에서 `queue.input_pending_reset` 9회
+    // (stale_bytes 386·469·804·590·6·1294·386·234·1558) · 본부 worker·cso 0회 ·
+    // dept-1 부서장 2회 · dept-1 cso 1회. CSO 제3자 관측 "화면 입력줄은 비었는데
+    // blocked_by=input_pending". 사람이 앉는 좌석에서만 난다.
+    //
+    // 기제: GUI 는 `term.onData` 의 **모든** 바이트를 `surface.send_text`(human=true) 로
+    // 올린다(ui/src/main.ts:2592 — 마우스 보고만 걸러내고 나머지는 forward). Claude Code 는
+    // 기동 시 포커스 보고(`ESC[?1004h`)를 켜므로 **오너가 pane 을 클릭·이탈할 때마다**
+    // `ESC[I`/`ESC[O` 가 그 경로로 흐른다. handlers.rs 는 같은 청크에 대해
+    //   · 4227행: `is_pure_terminal_autoreply` 면 `last_human_input` 을 **찍지 않는다**(면제)
+    //   · 4422행: 그런데 `pending_input_after` 계수는 **면제하지 않는다**
+    // 두 술어의 이 **비대칭**이 결함의 본체다. 계수는 CR·LF·Ctrl-U·Ctrl-C 네 바이트에서만
+    // 0 으로 돌아가므로, 자동응답 바이트는 한 번 들어오면 제출이 없는 한 영구히 남는다.
+    #[test]
+    fn qs_a_terminal_autoreply_must_not_accumulate_pending_input() {
+        // 전제 확인: 이 시퀀스들은 이미 제품이 '기계 자동응답' 으로 인정하는 것들이다.
+        for s in ["\u{1b}[I", "\u{1b}[O", "\u{1b}[24;80R", "\u{1b}[?1;2c"] {
+            assert!(
+                cys::mousereport::is_pure_terminal_autoreply(s),
+                "전제 붕괴 — {s:?} 가 자동응답 술어에서 거짓이면 이 검체의 기제 설명이 바뀐다"
+            );
+        }
+        // 오너가 master pane 을 10번 클릭·이탈한다(사람 글자 0 · 제출 0).
+        let mut pending = 0u64;
+        for _ in 0..10 {
+            pending = super::pending_input_after(pending, b"\x1b[I"); // focus in
+            pending = super::pending_input_after(pending, b"\x1b[O"); // focus out
+        }
+        assert_eq!(
+            pending, 0,
+            "터미널 자동응답(포커스 보고)이 '미제출 입력' 으로 계수됐다 — \
+             handlers.rs:4227 은 같은 청크를 면제하는데 4422 는 면제하지 않는다"
+        );
+    }
+
+    /// 위 계수가 곧바로 배달 보류로 번역된다 — **화면 입력줄이 비었는데** 점유 판정.
+    /// CSO 제3자 관측("입력줄은 비었는데 blocked_by=input_pending")이 이 한 줄이다.
+    #[test]
+    fn qs_a_empty_prompt_with_autoreply_residue_must_not_block_delivery() {
+        let mut pending = 0u64;
+        for _ in 0..10 {
+            pending = super::pending_input_after(pending, b"\x1b[I");
+            pending = super::pending_input_after(pending, b"\x1b[O");
+        }
+        let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        assert_eq!(
+            input_line_state(pending, Some(empty)),
+            InputLine::Empty,
+            "화면 입력줄이 비었는데 자동응답 잔여 계수 때문에 Occupied 로 떨어진다 = 큐 기아"
+        );
+        assert_eq!(
+            prompt_boundary_verdict(true, input_line_state(pending, Some(empty)), false, false),
+            PromptBoundary::Ready,
+            "네 축 중 입력줄 축만 거짓이라 배달 자격이 영구히 서지 않는다"
+        );
+    }
+
+    /// 가설 ⓐ(데몬 주입이 계수를 남긴다) 의 기계적 뒷받침 —
+    /// `inject_text`(cys.rs inject_text)는 `ESC[200~{본문}ESC[201~` 을 한 번에 보낸다. 태그(수리 전)
+    /// 에서는 본문 마지막 개행 이후 **괄호붙여넣기 끝표식 6바이트**만 남았다(실측 `stale_bytes=6`
+    /// · 배달 원장의 6바이트 write 는 전부 `ESC[201~` 의 마지막 part).
+    ///
+    /// ★v2 기대(설계 §5 D-01 v2 · D-03 흡수): 봉투 12바이트는 입력이 아니고, 봉투 **안**의 개행은
+    /// 제출이 아니라 줄바꿈이라 **본문 전체가 미제출 입력**으로 남는다(`abc\n` 이면 4). 그 뒤 제출
+    /// Return 이 오면 0 이다. 즉 "끝표식 6바이트가 남는다" 는 결함은 `pending != 6 && pending ==
+    /// body.len()` 으로 재고, 제출 뒤 0 이 되는 것까지 한 검체로 박는다.
+    #[test]
+    fn qs_a_bracketed_paste_envelope_is_not_input_but_body_is() {
+        let body = "# WORKER ABSOLUTE DIRECTIVE\n...본문...\n"; // 개행으로 끝나는 지침 본문
+        let wrapped = format!("\u{1b}[200~{body}\u{1b}[201~");
+        let pending = super::pending_input_after(0, wrapped.as_bytes());
+        assert_eq!(
+            pending,
+            body.len() as u64,
+            "봉투를 제외한 본문 전체가 미제출 입력이어야 한다 — 태그는 끝표식 6바이트만 남긴다(got={pending})"
+        );
+        let after_submit = super::pending_input_after(pending, b"\r");
+        assert_eq!(after_submit, 0, "제출 Return 뒤에는 0 이어야 한다(got={after_submit})");
+        let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        assert_eq!(input_line_state(after_submit, Some(empty)), InputLine::Empty);
+    }
+
+    // ────── ★V7 검증 검체(2026-09-21 · bugverify-3problems · **미커밋 RED 자산**) ──────
+    //
+    // 목적: '배포 소스(v0.14.38 = d20038f5)에 D-01·D-02·D-03 결함이 실재하는가' 와
+    // 'D-01 패치 v1(0194a195)의 codex 분할 붙여넣기 지적이 실제로 0 vs 8 을 내는가' 를 **잰다**.
+    // 수정 구현이 아니다 — 제품 코드는 한 줄도 건드리지 않는다.
+    //   · `v7_probe_*`  = 관측 전용(절대 실패하지 않는다). 실제 계수를 `V7OBS` 줄로 찍는다.
+    //   · `qs_a2_*`·`qs_a3_*`·`qs_a_split_*` = 설계문서가 적은 기대값을 assert 하는 RED/negative 검체.
+    // 청크 계약: 핸들러는 RPC 1회당 `pending_input_after(prev, 그 RPC 의 바이트)` 를 **1번** 부른다
+    // (handlers.rs:4422 send_text · :4634 send_key). 그래서 '호출 N번' 은 fold N번으로 모사한다.
+
+    /// 호출 1회 = 1청크. 단계별 계수를 돌려준다(마지막 원소가 최종 계수).
+    fn v7_steps(prev: u64, chunks: &[&[u8]]) -> Vec<u64> {
+        let mut p = prev;
+        chunks
+            .iter()
+            .map(|c| {
+                p = super::pending_input_after(p, c);
+                p
+            })
+            .collect()
+    }
+
+    fn v7_last(prev: u64, chunks: &[&[u8]]) -> u64 {
+        v7_steps(prev, chunks).last().copied().unwrap_or(prev)
+    }
+
+    const V7_OPEN: &[u8] = b"\x1b[200~";
+    const V7_CLOSE: &[u8] = b"\x1b[201~";
+    const V7_CPR: &[u8] = b"\x1b[24;80R"; // 8바이트 — codex 시나리오의 BODY
+
+    /// 관측 전용 — D-01/D-02/D-03/분할 붙여넣기의 **실제 계수**를 한 표로 찍는다(실패 0).
+    #[test]
+    fn v7_probe_observed_counts_table() {
+        let obs = |name: &str, steps: Vec<u64>| eprintln!("V7OBS {name} steps={steps:?} final={}", steps.last().copied().unwrap_or(0));
+        // ── D-01: 제품이 '기계 자동응답' 으로 인정한 시퀀스가 계수에 얼마를 더하는가
+        for (name, seq) in [
+            ("d01.focus_in ESC[I", &b"\x1b[I"[..]),
+            ("d01.focus_out ESC[O", &b"\x1b[O"[..]),
+            ("d01.cpr ESC[24;80R", V7_CPR),
+            ("d01.decxcpr ESC[?24;80R", &b"\x1b[?24;80R"[..]),
+            ("d01.da1 ESC[?62;1;6c", &b"\x1b[?62;1;6c"[..]),
+            ("d01.da2 ESC[>0;276;0c", &b"\x1b[>0;276;0c"[..]),
+            ("d01.xtversion", &b"\x1bP>|XTerm(370)\x1b\\"[..]),
+            ("d01.decrpm ESC[?2004;1$y", &b"\x1b[?2004;1$y"[..]),
+            ("d01.kitty ESC[?1u", &b"\x1b[?1u"[..]),
+            ("d01.osc11", &b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"[..]),
+            ("d01.sgr_mouse ESC[<0;5;7M", &b"\x1b[<0;5;7M"[..]),
+        ] {
+            let is_auto = std::str::from_utf8(seq).map(cys::mousereport::is_pure_terminal_autoreply).unwrap_or(false);
+            eprintln!(
+                "V7OBS {name} bytes={} is_pure_terminal_autoreply={is_auto} pending_after(prev=0)={}",
+                seq.len(),
+                super::pending_input_after(0, seq)
+            );
+        }
+        let mut clicks: Vec<&[u8]> = Vec::new();
+        for _ in 0..10 {
+            clicks.push(b"\x1b[I");
+            clicks.push(b"\x1b[O");
+        }
+        obs("d01.ten_click_cycles", v7_steps(0, &clicks));
+        obs("d01.inject_text_single_buffer(OPEN+body\\n+CLOSE)", v7_steps(0, &[b"\x1b[200~# D\nbody\n\x1b[201~"]));
+        // ── D-02: 편집키
+        obs("d02.abc_then_BSx3 (per-key chunks)", v7_steps(0, &[b"a", b"b", b"c", b"\x7f", b"\x7f", b"\x7f"]));
+        obs("d02.abc_then_BSx3 (one chunk)", v7_steps(0, &[b"abc\x7f\x7f\x7f"]));
+        obs("d02.abc_then_bare_ESC", v7_steps(0, &[b"a", b"b", b"c", b"\x1b"]));
+        obs("d02.abc_then_ESC[A (up arrow)", v7_steps(0, &[b"a", b"b", b"c", b"\x1b[A"]));
+        obs("d02.abc_then_ctrl_h_0x08 x3", v7_steps(0, &[b"abc", b"\x08", b"\x08", b"\x08"]));
+        let typed = vec![b'x'; 386];
+        let erased = vec![0x7fu8; 386];
+        obs("d02.386_chars_then_386_BS(final only)", vec![v7_last(0, &[&typed[..], &erased[..]])]);
+        // ── D-03: 붙여넣기 본문 안의 개행
+        obs("d03.paste a\\nb (one call)", v7_steps(0, &[b"\x1b[200~a\nb\x1b[201~"]));
+        obs("d03.paste a\\rb (one call · xterm.js 가 \\n→\\r 정규화)", v7_steps(0, &[b"\x1b[200~a\rb\x1b[201~"]));
+        obs("d03.paste abc\\n (trailing newline)", v7_steps(0, &[b"\x1b[200~abc\n\x1b[201~"]));
+        obs("d03.outside abc\\n", v7_steps(0, &[b"abc\n"]));
+        obs("d03.prev=5 then paste a\\nb", v7_steps(5, &[b"\x1b[200~a\nb\x1b[201~"]));
+        // ── 분할 붙여넣기(codex 시나리오)
+        obs("split.A three_calls OPEN/CPR/CLOSE", v7_steps(0, &[V7_OPEN, V7_CPR, V7_CLOSE]));
+        obs("split.B one_call OPEN+CPR+CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]));
+        obs("split.C boundary_in_body OPEN+ESC[24 / ;80R / CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24", b";80R", V7_CLOSE]));
+        obs("split.D two_calls OPEN+CPR / CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24;80R", V7_CLOSE]));
+        obs("split.E two_calls OPEN / CPR+CLOSE", v7_steps(0, &[V7_OPEN, b"\x1b[24;80R\x1b[201~"]));
+        obs("split.F three_calls OPEN/focus ESC[I/CLOSE", v7_steps(0, &[V7_OPEN, b"\x1b[I", V7_CLOSE]));
+        obs("split.G plain body three_calls OPEN/hello/CLOSE", v7_steps(0, &[V7_OPEN, b"hello", V7_CLOSE]));
+        obs("split.H plain body one_call", v7_steps(0, &[b"\x1b[200~hello\x1b[201~"]));
+        obs("split.I envelope cut mid-marker ESC[20 / 0~hello / ESC[201~", v7_steps(0, &[b"\x1b[20", b"0~hello", V7_CLOSE]));
+    }
+
+    // ── D-02 (설계문서 170~198행) ─────────────────────────────────────────────
+
+    /// RED(문서 기대): 사람이 "abc" 를 치고 Backspace 3회 → 입력줄은 비었다 → 기대 0.
+    #[test]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 가산은 의도된 fail-closed 이고 계수는 >0 불리언으로만 쓰인다. v2 출하 후 stale_bytes 분포를 보고 재판단 — 검체는 RED 자산으로 보존한다"]
+    fn qs_a2_backspace_must_decrement_pending_input() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x7f", b"\x7f", b"\x7f"]);
+        eprintln!("V7OBS qs_a2_backspace got={got} expected=0");
+        assert_eq!(got, 0, "Backspace(0x7f)가 가산이다 — 다 지운 빈 입력줄이 {got}바이트 점유로 남는다");
+    }
+
+    /// RED(문서 기대): "abc" + 순수 Esc(0x1b 단독) → Claude Code 는 입력줄을 비운다 → 기대 0.
+    #[test]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 순수 Esc 감산은 과소 계수(오주입) 방향 위험 — v2 출하 후 재판단 · RED 자산 보존"]
+    fn qs_a2_bare_escape_clears_pending_input() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x1b"]);
+        eprintln!("V7OBS qs_a2_bare_escape got={got} expected=0");
+        assert_eq!(got, 0, "순수 Esc 가 가산이다 — 비운 입력줄이 {got}바이트 점유로 남는다");
+    }
+
+    /// negative(문서): `ESC[A`(위 화살표)는 입력줄을 비우지 않는다 → **리셋되면 안 된다**.
+    #[test]
+    fn qs_a2_escape_sequence_must_not_clear() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x1b[A"]);
+        eprintln!("V7OBS qs_a2_escape_sequence got={got} expected>=3");
+        assert!(got >= 3, "화살표 시퀀스가 계수를 지웠다(got={got}) — 사람 글자 3개가 남아 있는데 빈 줄로 본다");
+    }
+
+    // ── D-03 (설계문서 202~231행) ─────────────────────────────────────────────
+
+    /// RED(문서 기대 3): 괄호붙여넣기 본문 `a\nb` — `\n` 은 제출이 아니라 줄바꿈이다.
+    #[test]
+    fn qs_a3_newline_inside_paste_must_not_reset() {
+        let got = v7_last(0, &[b"\x1b[200~a\nb\x1b[201~"]);
+        eprintln!("V7OBS qs_a3_newline_inside_paste got={got} expected=3");
+        assert_eq!(got, 3, "봉투 안의 \\n 을 제출로 오인했다(또는 봉투를 셌다) — got={got}");
+    }
+
+    /// RED(GUI 실경로 변형): xterm.js 5.5.0 `prepareTextForTerminal` 이 붙여넣기 본문의 `\r?\n` 을
+    /// `\r` 로 정규화한 뒤 봉투를 씌워 **onData 1회**로 낸다 → 데몬이 받는 본문 개행은 `\r` 이다.
+    #[test]
+    fn qs_a3_cr_inside_paste_must_not_reset() {
+        let got = v7_last(0, &[b"\x1b[200~a\rb\x1b[201~"]);
+        eprintln!("V7OBS qs_a3_cr_inside_paste got={got} expected=3");
+        assert_eq!(got, 3, "봉투 안의 \\r 을 제출로 오인했다(또는 봉투를 셌다) — got={got}");
+    }
+
+    /// negative(문서): 봉투 **밖** `"abc\n"` 은 종전대로 0 으로 리셋.
+    #[test]
+    fn qs_a3_newline_outside_paste_still_resets() {
+        let got = v7_last(0, &[b"abc\n"]);
+        eprintln!("V7OBS qs_a3_newline_outside_paste got={got} expected=0");
+        assert_eq!(got, 0);
+    }
+
+    // ── D-01 패치 v1 의 codex 지적(설계문서 131~141·155~157행) ────────────────
+
+    /// RED 1(codex 시나리오 그대로): prev=0 · OPEN / `ESC[24;80R` / CLOSE **호출 3번** 의 최종 계수가
+    /// 같은 바이트 **호출 1번** 의 계수와 같아야 한다(호출 경계가 계수를 바꾸면 안 된다).
+    #[test]
+    fn qs_a_split_paste_body_must_count_like_single_call() {
+        let split = v7_steps(0, &[V7_OPEN, V7_CPR, V7_CLOSE]);
+        let single = v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste three_calls={split:?} one_call={single:?}");
+        assert_eq!(
+            split.last(),
+            single.last(),
+            "같은 바이트인데 호출 경계만으로 계수가 갈린다 — 호출3번={split:?} 호출1번={single:?}"
+        );
+    }
+
+    /// RED 2(문서 157행): 분할 경계를 BODY 중간에 둔 변형도 호출 1번과 같아야 한다.
+    #[test]
+    fn qs_a_split_paste_boundary_inside_body_must_count_like_single_call() {
+        let split = v7_steps(0, &[b"\x1b[200~\x1b[24", b";80R", V7_CLOSE]);
+        let single = v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste_mid_body three_calls={split:?} one_call={single:?}");
+        assert_eq!(
+            split.last(),
+            single.last(),
+            "같은 바이트인데 호출 경계만으로 계수가 갈린다 — 분할={split:?} 단일={single:?}"
+        );
+    }
+
+    /// 문서 156행이 적은 절대값: 단일 호출 계수는 **8**(봉투 12바이트 제외 · BODY 8바이트).
+    /// 태그(수리 전)에서는 봉투까지 세므로 이 값부터 다르다 — 그 값을 기록하려고 분리했다.
+    #[test]
+    fn qs_a_split_paste_single_call_counts_body_only_eight() {
+        let single = v7_last(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste_single_call got={single} expected=8");
+        assert_eq!(single, 8, "단일 호출 계수가 BODY 8바이트가 아니다 — got={single}");
+    }
+
     /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).
     #[test]
     fn b1_prompt_boundary_is_conjunction_of_four_axes() {
