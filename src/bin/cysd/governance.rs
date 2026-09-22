@@ -4907,24 +4907,344 @@ pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine
     }
 }
 
-/// 미제출 입력 바이트 계수의 순수 전이함수 — `input_line_state` 의 1차 축을 만드는 자리.
+/// D-12 직접 입력 경로 — 본문 주입과 Return/Enter 제출·선정리는 계수 축이 다르다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectSendKind {
+    Text,
+    SubmitKey,
+    /// `cys send --clear-first` — Ctrl-U 선정리 + 본문 + CR 원자 주입.
+    /// C-u 가 지우는 것이 기계 잔여면 정상 용도이고 사람 초안이면 D-12 의 삭제 사고다.
+    /// `--clear-first` 는 계수가 0 이고 화면만 Occupied 인 좌석에서도 거부되며 CLI 에 `--queued`
+    /// 폴백이 없다(원자 주입은 큐와 결합 불가) — 데몬 재기동 직후처럼 계수가 휘발되면 하드 에러다.
+    /// 그 경우 사람 초안 여부를 확인한 뒤 원시 `cys send-key <좌석> C-u`(CancelKey 축 = 사람
+    /// 초안만 거부)로 수동 선정리할 수 있다.
+    ClearFirst,
+    /// `cys send-key C-u`/`C-c` 등 **원시 취소 키**, 그리고 `surface.send_text` 본문에 CR/LF 없이 0x15/0x03 만 실린 경로 — 둘 다 생성 바이트 축(정의처 `direct_send_text_gate_kind`·send_key 판정).
+    /// 사람 초안을 지우는 것만 막고 화면 축은 쓰지 않는다(무clear 방향 fail-open).
+    /// Backspace(0x7f)·C-w(0x17)·C-k(0x0b) 는 **넣지 않는다**(수정 라운드 3 · 적대 minor 결정):
+    /// ① CancelKey 의 정의는 '계수기가 줄 취소로 읽는 바이트'(pending_input_step 의 리셋 집합 0x15/0x03)와
+    ///    같은 축이어야 게이트와 계수가 한 정의처를 쓴다 — 부분 편집 키는 D-02(감산) 보류와 함께 계수 의미가 없다.
+    /// ② 기계가 Backspace 를 반복 송신해 초안을 지우는 것은 사고(자동 흐름의 연접·제출·선정리)가 아니라
+    ///    고의 경로이고 팩·GUI 호출자 0건(grep) — 그 방어는 ACL 층 몫이다.
+    /// ③ 부분 편집 바이트는 기계 출처로 **가산**되어 그 좌석행 이후 기계 Text/Return 이 더 강하게 막힌다(fail-closed).
+    CancelKey,
+}
+
+/// D-12 `surface.send_text` 의 게이트 kind 판정(순수 · 정의처 단일).
 ///
-/// 데몬이 소유한 PTY 로 나가는 모든 바이트는 핸들러(`surface.send_text`·`surface.send_key`)와
-/// 큐 배달(`WriteReq::Inject`)을 지난다. 그래서 '아직 제출되지 않은 입력이 얼마나 쌓였나' 는
-/// 화면을 보지 않고도 셀 수 있다. 고스트 텍스트(prompt suggestions)는 이 경로를 **지나지 않아**
-/// 원리상 계수되지 않는다 — 그것이 이 축을 1차로 두는 이유다.
+/// ★(수정 라운드 3 · 리뷰 major 2) 종전에는 자기신고 `human` 만 봐서 `{"human":true,"machine_origin":true}`
+/// 한 단어로 통째로 우회됐다(GUI `restartNode` 의 `cmd+"\n"` 이 남의 사람 초안과 한 줄로 제출됨 · 실측).
+/// `machine_origin` 은 GUI 가 **자기가 조립한 문안**에만 붙이는 표식이라(실키 sendRaw 무영향) 계수 축
+/// (`InputOrigin` 판정 `human && !machine_origin`)과 같은 술어를 쓰게 된다.
 ///
-/// 전이 규칙: 쓰인 바이트에 **제출·취소 제어문자**(CR `\r` · LF `\n` · Ctrl-U `0x15` ·
-/// Ctrl-C `0x03`)가 있으면 계수는 **마지막 그 문자 이후의 바이트 수**로 재시작한다(그 앞은
-/// 제출됐거나 지워졌다). 없으면 누적한다.
-pub(crate) fn pending_input_after(prev: u64, written: &[u8]) -> u64 {
-    match written
-        .iter()
-        .rposition(|b| matches!(b, b'\r' | b'\n' | 0x15 | 0x03))
-    {
-        Some(i) => (written.len() - i - 1) as u64,
-        None => prev.saturating_add(written.len() as u64),
+/// 다만 GUI 조립 문안 전부를 기계로 접지는 않는다 — `injectRawToPane`(경로 삽입 · 자동 Return 없음)은
+/// 오너가 **자기 초안에 이어 붙이려고** 클릭한 것이라 제출도 삭제도 아니다. 그래서 GUI 조립 문안은
+/// `clear_first`(삭제) 또는 본문에 CR/LF(자동 제출)가 있을 때만 게이트에 들어온다. 이 경우 kind 는
+/// SubmitKey 가 아니라 **Text** 다: SubmitKey 는 '자기 본문의 Return' 을 위해 기계 잔여를 통과시키지만,
+/// 재기동 명령이 남의 기계 잔여와 연접 제출되는 것도 사고이므로 기계 send 와 같은 pending>0 축으로 막는다.
+///
+/// 원시 소켓이 `machine_origin` 없이 `human:true` 를 위조하는 경로는 실키와 구별할 수 없다 —
+/// ACL 층 문제로 남긴다(리뷰 합의 · base 타이핑 가드와 같은 신뢰 등급).
+///
+/// ★(라운드 4 · 적대 minor) 바이트 축은 `surface.send_key` 와 **같은 정의**다 — 본문에 CR/LF 가 있으면
+/// 제출(Text · pending>0 축), CR/LF 없이 0x15/0x03 만 있으면 CancelKey(human 축만 · 화면 축 없음),
+/// clear_first 는 그 위에 우선한다. 종전엔 GUI 조립 문안의 0x15 가 게이트 밖이라 사람 초안을 지웠다(실측 ADV3GUICANCEL).
+/// 기계 본문(`human=false`)의 취소 바이트도 같은 축으로 접혀 기계 잔여 선정리는 통과하고 사람 초안은 거부된다
+/// (종전엔 Text 축이라 기계 잔여 앞에서도 거부 — 완화이지만 send-key C-u 와 동형이라 새 구멍이 아니다).
+pub(crate) fn direct_send_text_gate_kind(
+    human: bool,
+    machine_origin: bool,
+    clear_first: bool,
+    text_submits: bool,
+    text_cancels: bool,
+    exempt: bool,
+) -> Option<DirectSendKind> {
+    if exempt {
+        return None;
     }
+    let machine_like = !human || (machine_origin && (clear_first || text_submits || text_cancels));
+    if !machine_like {
+        return None;
+    }
+    Some(if clear_first {
+        DirectSendKind::ClearFirst
+    } else if text_submits {
+        DirectSendKind::Text
+    } else if text_cancels {
+        DirectSendKind::CancelKey
+    } else {
+        DirectSendKind::Text
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftGateDenied {
+    PendingInput { bytes: u64 },
+    HumanDraft { bytes: u64 },
+    ScreenOccupied,
+}
+
+impl DraftGateDenied {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::PendingInput { .. } => "pending_input",
+            Self::HumanDraft { .. } => "human_draft",
+            Self::ScreenOccupied => "screen_occupied",
+        }
+    }
+}
+
+/// D-12 순수 판정 — IO 없음.
+///
+/// Text 는 전체 pending, SubmitKey/ClearFirst 는 human_pending 을 우선한다. 자기 본문만 남은
+/// SubmitKey/ClearFirst 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
+/// ClearFirst 의 C-u 는 기계 잔여를 지우기 위한 것이므로 SubmitKey 와 같은 팔로 판정한다.
+/// SubmitKey/ClearFirst 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
+/// CancelKey 는 human_pending 만 검사해 사람 초안 삭제를 막으며 화면 축은 적용하지 않는다.
+/// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제는 핸들러가 적용한다.
+pub(crate) fn draft_gate_verdict(
+    kind: DirectSendKind,
+    pending: u64,
+    human_pending: u64,
+    line: Option<PromptLine<'_>>,
+    selector_row: bool,
+    approval_pending: bool,
+) -> Option<DraftGateDenied> {
+    match kind {
+        DirectSendKind::Text => {
+            if pending > 0 {
+                Some(DraftGateDenied::PendingInput { bytes: pending })
+            } else if !selector_row && input_line_state(0, line) == InputLine::Occupied {
+                Some(DraftGateDenied::ScreenOccupied)
+            } else {
+                None
+            }
+        }
+        DirectSendKind::SubmitKey | DirectSendKind::ClearFirst => {
+            if human_pending > 0 {
+                Some(DraftGateDenied::HumanDraft { bytes: human_pending })
+            } else if pending == 0
+                && !selector_row
+                && !approval_pending
+                && input_line_state(0, line) == InputLine::Occupied
+            {
+                Some(DraftGateDenied::ScreenOccupied)
+            } else {
+                None
+            }
+        }
+        // 취소 키를 화면 축으로도 막으면 cycle-agent 4단계의 `send_key C-u` 가 렌더 잔상 하나로
+        // 거부돼 `/clear` 가 실행되지 않는다 — 오너 ABSOLUTE ANCHOR ②(무clear) 방향의 사고다.
+        // 여기서 막는 것은 **사람 초안 삭제**뿐이고, 계수 없는 화면 잔여는 통과시킨다(fail-open · 의도).
+        DirectSendKind::CancelKey => {
+            if human_pending > 0 {
+                Some(DraftGateDenied::HumanDraft { bytes: human_pending })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// D-12 화면 축을 쓰는 kind 인가 — `draft_gate` 가 어댑터 로드·프롬프트 관측을 생략할지 정한다(순수).
+/// CancelKey 는 `draft_gate_verdict` 가 human_pending 만 보므로 화면을 관측해도 결과가 같다 —
+/// agents.json 디스크 읽기 + 임베드 파싱 + observe_prompt 를 헛되이 수행하던 부하(수정 라운드 3 · 감사 minor).
+pub(crate) fn draft_gate_uses_screen_axis(kind: DirectSendKind) -> bool {
+    !matches!(kind, DirectSendKind::CancelKey)
+}
+
+/// D-12 IO 래퍼 — 전체 계수는 미러, 사람 계수는 상태 Mutex 에서 읽는다.
+/// 화면은 마커 좌석의 observe_prompt 커서행이며 마커가 없으면 None/비선택기다.
+/// 계수만으로 거부가 확정되면 화면·승인 관측을 생략한다. 승인 축은
+/// approval_or_gate_pending 을 공유한다. 파서·pending_input leaf 락을 잠깐씩 쓰므로
+/// 호출자는 input_gate 밖에서 호출해야 한다.
+/// CancelKey 는 계수 판정 뒤 조기 반환한다(화면 축 없음 · 어댑터 로드 생략).
+/// agents.json 디스크 읽기+임베드 파싱을 마커 좌석에 한정(리뷰 minor · 부하).
+/// 캐시는 두지 않는다 — 틱이 이미 초당 1회 같은 로드를 하므로 직접 send 빈도는 그 아래이고,
+/// 배달 틱과 공유하는 함수에 신선도 창을 더하지 않는다.
+pub(crate) fn draft_gate(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    kind: DirectSendKind,
+) -> Option<DraftGateDenied> {
+    let pending = s.pending_input_bytes.load(Ordering::Relaxed);
+    let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
+    if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
+        return Some(why);
+    }
+    if !draft_gate_uses_screen_axis(kind) {
+        return None;
+    }
+    if s.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return None;
+    }
+    let adapters = load_adapter_defs();
+    let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));
+    let line = obs.as_ref().and_then(|obs| {
+        obs.line.as_ref().map(|(before, after)| PromptLine {
+            before_cursor: before,
+            at_or_after_cursor: after,
+        })
+    });
+    let selector_row = obs.as_ref().map_or(false, |obs| obs.selector_row);
+    let approval_pending = approval_or_gate_pending(daemon, s.id);
+    draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
+}
+
+/// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PendingInputState {
+    /// 미제출 입력 바이트(전 경로 · `Surface::pending_input_bytes` 미러의 원본).
+    pub count: u64,
+    /// 그중 **사람 경로**(surface.send_text human=true ∧ !machine_origin · GUI term.onData)로 들어온 바이트.
+    pub human: u64,
+    /// 괄호붙여넣기 봉투 안(ESC[200~ 뒤 · ESC[201~ 전).
+    pub in_paste: bool,
+    /// OPEN 을 본 시각(미종결 봉투 해제 TTL 의 기준).
+    pub paste_opened_at: Option<std::time::Instant>,
+    /// 청크 끝이 봉투 표식의 접두로 끝났을 때 다음 호출로 이월하는 ≤5 바이트.
+    pub tail: Vec<u8>,
+}
+
+/// 입력 바이트의 출처 — 사람(GUI 자기신고 human=true · !machine_origin) / 기계(그 밖 전부 · send_key 전부).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputOrigin {
+    Human,
+    Machine,
+}
+
+/// 미종결 봉투 해제 TTL(초) — OPEN 뒤 이 시간이 지난 새 청크는 봉투 밖으로 본다.
+pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
+
+/// ★(0.14.39 · WP-C-input) 미제출 입력 청크의 순수 전이 — 계수 규칙의 단일 정의처.
+///
+/// 괄호붙여넣기 OPEN/CLOSE 각 6바이트는 본문이 아니므로 제외한다. 종전에는 끝 개행 뒤
+/// CLOSE 만 남아 실측 `stale_bytes=6` 으로 배달을 막았다. 봉투 안에서는 CR/LF 도 가산하고
+/// 자동응답 면제를 끈다: 변형 F(OPEN/ESC[I/CLOSE 분할)가 한 호출과 같은 본문 계수를 가져야 한다.
+/// 봉투 밖의 순수 자동응답은 **세그먼트 단위**로 면제한다. CLOSE+ESC[I 를 한 청크로 받든
+/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 봉투 밖에서
+/// 2바이트, 봉투 안에서 1바이트 이상일 때 최대 5바이트까지 계수하지 않고 이월해 다음 청크와 합친다.
+///
+/// 미종결 봉투는 Ctrl-C/Ctrl-U 또는 OPEN 뒤 5초가 지난 호출에서 해제한다(시각 누락도 해제).
+/// 해제 자체는 입력이 비워졌다는 증거가 아니므로 계수를 감산하지 않는다(fail-closed).
+/// stale 리셋은 `Surface::clear_pending_input` 으로 봉투·이월 상태까지 함께 비운다.
+/// 봉투 밖에서는 마지막 CR/LF/Ctrl-U/Ctrl-C 뒤부터 두 계수를 재시작하되, 같은 청크에서 온
+/// ESC+CR 에만 Meta-Enter 줄바꿈 예외를 둔다(claude `/terminal-setup` 의 Shift+Enter 바인딩 `\e\r`).
+/// 단독 Esc 키(0x1b 청크) 뒤 Enter 는 제출이다(수정 라운드 1 · 리뷰 major).
+/// 사람·기계 본문은 모두 count 에 세고, 사람 본문만 human 에 센다(human <= count).
+///
+/// 한계: 백슬래시+Enter 줄바꿈은 리셋으로 읽힌다. 커서 줄 머리 이동은 화면 축의 한계로
+/// 남으며, D-02(Backspace/Delete) 감산은 보류한다. 봉투 밖에서 OPEN 의 첫 바이트(ESC) 경계로
+/// 절단된 붙여넣기는 여전히 이월하지 않아 봉투를 본문으로 센다(과대 · 본문에 CR/LF 가 있으면 그 자리에서
+/// 리셋돼 과소) — 제품 호출자(GUI onData 1회·inject_text 단일 버퍼)는 표식을 분할하지 않으므로
+/// 실경로가 아니며, 실경로인 단독 Esc 키를 지키는 쪽을 택했다(base 와 같은 거동).
+/// 봉투 안의 CLOSE 절단은 이번 라운드에 이월 하한 1바이트로 봉합했다.
+/// 이월된 tail 은 계수에 포함되지 않으므로 봉투 안에서 청크의 마지막 바이트가 단독 ESC 면 후속 청크가
+/// 올 때까지 1바이트 과소(fail-open · 비실경로 · 감사 minor 등재)다.
+/// OPEN 6바이트는 계수에서 빠지므로 OPEN 만 담긴 청크 뒤에는
+/// `pending_input_bytes == 0 ∧ in_paste == true` 인 창이 생겨 좌석이 게이트·배달에 '빈 입력줄'로
+/// 보인다(`in_paste` 는 진단 키로만 나가고 `input_line_state`·`draft_gate_verdict` 어디서도 읽지 않는다).
+/// 이 창의 봉투 상태는 OPEN 뒤 5초 TTL 이 지난 다음 청크에서 해제된다. 제품 호출자(GUI
+/// `term.onData` 1회 전달)는 봉투를 분할하지 않으므로 실경로가 아니다.
+/// 단독 Esc 키(0x1b)는 1바이트 초안으로 남는다 — 빈 줄에서 슬래시 메뉴 닫기·턴 중단으로
+/// Esc 한 번만 눌러도 CR·Ctrl-C/U 또는 stale 리셋(빈 화면+정적 5초)까지 Occupied 로 보인다.
+/// fail-closed 이고 base 와 같은 거동이지만, D-12 이후 그 좌석행 직접 send·Return 이 거부된다.
+pub(crate) fn pending_input_step(
+    prev: &PendingInputState,
+    chunk: &[u8],
+    origin: InputOrigin,
+    now: std::time::Instant,
+) -> PendingInputState {
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+
+    let carried = prev.tail.len();
+    let mut st = prev.clone();
+    let mut buf = std::mem::take(&mut st.tail);
+    buf.extend_from_slice(chunk);
+    if st.in_paste
+        && st.paste_opened_at.map_or(true, |opened_at| {
+            now.duration_since(opened_at).as_secs() >= PASTE_OPEN_TTL_SECS
+        })
+    {
+        st.in_paste = false;
+        st.paste_opened_at = None;
+    }
+
+    let is_human = origin == InputOrigin::Human;
+    let mut i = 0;
+    while i < buf.len() {
+        // ★(수정 라운드 2 · 리뷰 minor) 이월 하한은 봉투 **밖**에서만 2바이트다.
+        // 밖에서 단독 ESC 를 이월하면 뒤의 Enter 가 Meta-Enter 로 오독돼 미제출로 고착한다.
+        // 봉투 안에서는 Esc 가 제출 트리거가 아니므로 1바이트도 이월해 ESC 경계의 CLOSE 를 닫는다.
+        // 종전 `\x1b[200~abc\x1b` / `[201~` 는 count=9·in_paste=true 로 TTL 까지 고착해
+        // 자동응답 면제가 꺼지고 CR 이 리셋 대신 가산되어 D-01 이 재발했다.
+        // TTL 처리 뒤, 이 위치까지의 OPEN/CLOSE 를 반영한 상태를 읽어 같은 청크의 경계도 지킨다.
+        let carry_floor = if st.in_paste { 1 } else { 2 };
+        let remaining = &buf[i..];
+        if (carry_floor..OPEN.len()).contains(&remaining.len())
+            && (OPEN.starts_with(remaining) || CLOSE.starts_with(remaining))
+        {
+            st.tail = buf.split_off(i);
+            break;
+        }
+        if buf[i..].starts_with(OPEN) {
+            st.in_paste = true;
+            st.paste_opened_at = Some(now);
+            i += OPEN.len();
+        } else if buf[i..].starts_with(CLOSE) {
+            st.in_paste = false;
+            st.paste_opened_at = None;
+            i += CLOSE.len();
+        } else if st.in_paste {
+            if matches!(buf[i], 0x03 | 0x15) {
+                st.in_paste = false;
+                st.paste_opened_at = None;
+            } else {
+                st.count = st.count.saturating_add(1);
+                if is_human {
+                    st.human = st.human.saturating_add(1);
+                }
+            }
+            i += 1;
+        } else {
+            let start = i;
+            while i < buf.len()
+                && !buf[i..].starts_with(OPEN)
+                && !buf[i..].starts_with(CLOSE)
+                // 봉투 밖 세그먼트도 2바이트 이상 진접두 앞에서 멈춰 위 이월 판정으로 넘긴다.
+                && !((2..OPEN.len()).contains(&(buf.len() - i))
+                    && (OPEN.starts_with(&buf[i..]) || CLOSE.starts_with(&buf[i..])))
+            {
+                i += 1;
+            }
+            let seg = &buf[start..i];
+            if std::str::from_utf8(seg)
+                .map(cys::mousereport::is_pure_terminal_autoreply)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // carried 가드는 현재 봉투 밖 하한 2 아래에서는 도달 불가다(tail 의 끝은 ESC 가 아님).
+            // 하한을 1로 되돌리거나 봉투 안 이월이 밖으로 새면 활성된다 —
+            // `v2_carried_escape_then_cr_is_submit_not_meta_enter` 가 상태를 직접 만들어 고정한다.
+            let reset = seg.iter().enumerate().rposition(|(pos, &byte)| {
+                matches!(byte, b'\n' | 0x15 | 0x03)
+                    || (byte == b'\r'
+                        && !(pos > 0 && seg[pos - 1] == 0x1b && start + pos - 1 >= carried))
+            });
+            if let Some(pos) = reset {
+                st.count = (seg.len() - pos - 1) as u64;
+                st.human = if is_human { st.count } else { 0 };
+            } else {
+                st.count = st.count.saturating_add(seg.len() as u64);
+                if is_human {
+                    st.human = st.human.saturating_add(seg.len() as u64);
+                }
+            }
+        }
+    }
+    st
 }
 
 /// 프롬프트 경계 판정 결과.
@@ -8330,7 +8650,7 @@ fn maybe_reset_stale_pending_input(
         {
             return false;
         }
-        s.set_pending_input(0);
+        s.clear_pending_input();
     }
     daemon.bus.publish(
         "queue.input_pending_reset",
@@ -11077,9 +11397,156 @@ mod tests {
     // ─────────── ★B1(0.14.30): 프롬프트 경계 준비판정 — 순수 판정자 핀 ───────────
 
     use super::{
-        input_line_state, prompt_boundary_verdict, queue_starve_alert_secs, InputLine,
-        PromptBoundary, PromptLine,
+        draft_gate_verdict, input_line_state, prompt_boundary_verdict, queue_starve_alert_secs,
+        DirectSendKind, DraftGateDenied, InputLine, InputOrigin, PendingInputState, PromptBoundary,
+        PromptLine,
     };
+
+    // D-12 계약 검체: #4 는 거부 4건이 RED, #5 의 판정 구현에서 GREEN 으로 전환한다.
+    #[test]
+    fn d12_verdict_text_pending_input_denied() {
+        let denied = DraftGateDenied::PendingInput { bytes: 11 };
+        assert_eq!(denied.as_str(), "pending_input");
+        // 선택기·승인 예외는 화면 축뿐이며 전체 계수보다 앞서지 않는다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::Text, 11, 0, None, true, true),
+            Some(denied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_text_empty_line_passes() {
+        let line = PromptLine { before_cursor: " ", at_or_after_cursor: "ghost suggestion" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_text_screen_occupied_denied() {
+        let line = PromptLine { before_cursor: "owner draft", at_or_after_cursor: "" };
+        assert_eq!(DraftGateDenied::ScreenOccupied.as_str(), "screen_occupied");
+        // 승인 대기는 Text 화면 축의 면제가 아니다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), false, true),
+            Some(DraftGateDenied::ScreenOccupied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_text_selector_row_passes() {
+        let line = PromptLine { before_cursor: "1. Yes", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), true, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_text_unknown_line_passes() {
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, None, false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_human_draft_denied() {
+        let denied = DraftGateDenied::HumanDraft { bytes: 3 };
+        assert_eq!(denied.as_str(), "human_draft");
+        // 사람 초안은 선택기·승인 대기보다 우선하며, 전체 pending 대신 human 을 보고한다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::SubmitKey, 8, 3, None, true, true),
+            Some(denied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_own_pending_passes() {
+        let line = PromptLine { before_cursor: "hello", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 5, 0, Some(line), false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_screen_occupied_denied() {
+        let line = PromptLine { before_cursor: "owner draft", at_or_after_cursor: "" };
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), false, false),
+            Some(DraftGateDenied::ScreenOccupied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_approval_pending_passes() {
+        let line = PromptLine { before_cursor: "Allow execution", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), false, true), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_selector_row_passes() {
+        let line = PromptLine { before_cursor: "1. Yes", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), true, false), None);
+    }
+
+    /// D-12 CancelKey(원시 Ctrl-U/Ctrl-C) 순수 판정 — 사람 초안만 거부하고 화면 축은 쓰지 않는다.
+    #[test]
+    fn d12_verdict_cancel_key_denies_human_draft_only() {
+        // 통과 대조를 RED 단언보다 먼저 검증한다: 기계 잔여 선정리는 정상 용도다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 19, 0, None, false, false),
+            None,
+            "기계 잔여는 원시 취소 키로 정리할 수 있다"
+        );
+        // 취소 키를 화면 축으로 막으면 cycle-agent 의 C-u→/clear 가 막혀
+        // 오너 ABSOLUTE ANCHOR ② '무clear'를 건드린다. 사람 초안 삭제만 막는다.
+        let line = PromptLine { before_cursor: "draft", at_or_after_cursor: "" };
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 0, 0, Some(line), false, false),
+            None,
+            "화면이 Occupied 여도 사람 초안 계수가 없으면 취소 키는 통과한다"
+        );
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 19, 19, None, false, false),
+            Some(DraftGateDenied::HumanDraft { bytes: 19 }),
+            "RED: 원시 취소 키는 사람 초안 19바이트 삭제를 거부해야 한다"
+        );
+    }
+
+    #[test]
+    fn d12_text_gate_kind_uses_send_key_byte_axis() {
+        let cases = [
+            // (human, machine_origin, clear_first, text_submits, text_cancels, exempt, expected)
+            (false, false, false, false, false, false, Some(DirectSendKind::Text)),        // 기계 본문
+            (false, false, true,  false, false, false, Some(DirectSendKind::ClearFirst)),  // --clear-first
+            (false, false, false, false, true,  false, Some(DirectSendKind::CancelKey)),   // 기계 본문의 0x15/0x03 만 = send_key C-u 와 같은 축 (RED)
+            (false, false, false, true,  true,  false, Some(DirectSendKind::Text)),        // 취소+제출 = 제출 우선
+            (true,  false, false, true,  false, false, None),                              // 실키 CR
+            (true,  false, false, false, true,  false, None),                              // 실키 C-u
+            (true,  true,  false, false, false, false, None),                              // 순수 삽입
+            (true,  true,  false, true,  false, false, Some(DirectSendKind::Text)),        // GUI 자동 제출
+            (true,  true,  false, false, true,  false, Some(DirectSendKind::CancelKey)),   // GUI 조립 0x15 (RED · ADV3GUICANCEL)
+            (true,  true,  true,  false, false, false, Some(DirectSendKind::ClearFirst)),  // GUI clear_first
+            (true,  true,  true,  false, true,  false, Some(DirectSendKind::ClearFirst)),  // clear_first 우선
+            (false, false, false, true,  false, true,  None),                              // 면제
+        ];
+        for (human, machine_origin, clear_first, text_submits, text_cancels, exempt, expected) in cases {
+            assert_eq!(
+                super::direct_send_text_gate_kind(
+                    human,
+                    machine_origin,
+                    clear_first,
+                    text_submits,
+                    text_cancels,
+                    exempt,
+                ),
+                expected,
+                "human={human}, machine_origin={machine_origin}, clear_first={clear_first}, text_submits={text_submits}, text_cancels={text_cancels}, exempt={exempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn d12_cancel_key_skips_screen_axis_before_adapter_load() {
+        assert!(
+            !super::draft_gate_uses_screen_axis(DirectSendKind::CancelKey),
+            "CancelKey 는 화면 축을 쓰지 않으므로 draft_gate 가 agents.json 로드·observe_prompt 전에 조기 반환해야 한다(감사 minor · 부하)"
+        );
+        for kind in [DirectSendKind::Text, DirectSendKind::SubmitKey, DirectSendKind::ClearFirst] {
+            assert!(super::draft_gate_uses_screen_axis(kind), "{kind:?} 는 화면 축을 쓴다");
+        }
+    }
 
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
     /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
@@ -11119,6 +11586,580 @@ mod tests {
     fn b1_input_line_blank_before_cursor_is_empty() {
         let line = PromptLine { before_cursor: "   ", at_or_after_cursor: "" };
         assert_eq!(input_line_state(0, Some(line)), InputLine::Empty);
+    }
+
+    // ────── ★큐 기아 건 A 재현(2026-09-20 · 위임 티켓) — 계수가 0 으로 돌아오지 않는다 ──────
+    //
+    // 증상(실측): 본부 master(surface:2)에서 `queue.input_pending_reset` 9회
+    // (stale_bytes 386·469·804·590·6·1294·386·234·1558) · 본부 worker·cso 0회 ·
+    // dept-1 부서장 2회 · dept-1 cso 1회. CSO 제3자 관측 "화면 입력줄은 비었는데
+    // blocked_by=input_pending". 사람이 앉는 좌석에서만 난다.
+    //
+    // 기제: GUI 는 `term.onData` 의 **모든** 바이트를 `surface.send_text`(human=true) 로
+    // 올린다(ui/src/main.ts:2592 — 마우스 보고만 걸러내고 나머지는 forward). Claude Code 는
+    // 기동 시 포커스 보고(`ESC[?1004h`)를 켜므로 **오너가 pane 을 클릭·이탈할 때마다**
+    // `ESC[I`/`ESC[O` 가 그 경로로 흐른다. handlers.rs 는 같은 청크에 대해
+    //   · 4227행: `is_pure_terminal_autoreply` 면 `last_human_input` 을 **찍지 않는다**(면제)
+    //   · 4422행: 그런데 `pending_input_after` 계수는 **면제하지 않는다**
+    // 두 술어의 이 **비대칭**이 결함의 본체다. 계수는 CR·LF·Ctrl-U·Ctrl-C 네 바이트에서만
+    // 0 으로 돌아가므로, 자동응답 바이트는 한 번 들어오면 제출이 없는 한 영구히 남는다.
+    #[test]
+    fn qs_a_terminal_autoreply_must_not_accumulate_pending_input() {
+        // 전제 확인: 이 시퀀스들은 이미 제품이 '기계 자동응답' 으로 인정하는 것들이다.
+        for s in ["\u{1b}[I", "\u{1b}[O", "\u{1b}[24;80R", "\u{1b}[?1;2c"] {
+            assert!(
+                cys::mousereport::is_pure_terminal_autoreply(s),
+                "전제 붕괴 — {s:?} 가 자동응답 술어에서 거짓이면 이 검체의 기제 설명이 바뀐다"
+            );
+        }
+        // 오너가 master pane 을 10번 클릭·이탈한다(사람 글자 0 · 제출 0).
+        let mut chunks: Vec<&[u8]> = Vec::new();
+        for _ in 0..10 {
+            chunks.push(b"\x1b[I"); // focus in
+            chunks.push(b"\x1b[O"); // focus out
+        }
+        let pending = v7_last(0, &chunks);
+        assert_eq!(
+            pending, 0,
+            "터미널 자동응답(포커스 보고)이 '미제출 입력' 으로 계수됐다 — \
+             handlers.rs:4227 은 같은 청크를 면제하는데 4422 는 면제하지 않는다"
+        );
+    }
+
+    /// 위 계수가 곧바로 배달 보류로 번역된다 — **화면 입력줄이 비었는데** 점유 판정.
+    /// CSO 제3자 관측("입력줄은 비었는데 blocked_by=input_pending")이 이 한 줄이다.
+    #[test]
+    fn qs_a_empty_prompt_with_autoreply_residue_must_not_block_delivery() {
+        let mut chunks: Vec<&[u8]> = Vec::new();
+        for _ in 0..10 {
+            chunks.push(b"\x1b[I");
+            chunks.push(b"\x1b[O");
+        }
+        let pending = v7_last(0, &chunks);
+        let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        assert_eq!(
+            input_line_state(pending, Some(empty)),
+            InputLine::Empty,
+            "화면 입력줄이 비었는데 자동응답 잔여 계수 때문에 Occupied 로 떨어진다 = 큐 기아"
+        );
+        assert_eq!(
+            prompt_boundary_verdict(true, input_line_state(pending, Some(empty)), false, false),
+            PromptBoundary::Ready,
+            "네 축 중 입력줄 축만 거짓이라 배달 자격이 영구히 서지 않는다"
+        );
+    }
+
+    /// 가설 ⓐ(데몬 주입이 계수를 남긴다) 의 기계적 뒷받침 —
+    /// `inject_text`(cys.rs inject_text)는 `ESC[200~{본문}ESC[201~` 을 한 번에 보낸다. 태그(수리 전)
+    /// 에서는 본문 마지막 개행 이후 **괄호붙여넣기 끝표식 6바이트**만 남았다(실측 `stale_bytes=6`
+    /// · 배달 원장의 6바이트 write 는 전부 `ESC[201~` 의 마지막 part).
+    ///
+    /// ★v2 기대(설계 §5 D-01 v2 · D-03 흡수): 봉투 12바이트는 입력이 아니고, 봉투 **안**의 개행은
+    /// 제출이 아니라 줄바꿈이라 **본문 전체가 미제출 입력**으로 남는다(`abc\n` 이면 4). 그 뒤 제출
+    /// Return 이 오면 0 이다. 즉 "끝표식 6바이트가 남는다" 는 결함은 `pending != 6 && pending ==
+    /// body.len()` 으로 재고, 제출 뒤 0 이 되는 것까지 한 검체로 박는다.
+    #[test]
+    fn qs_a_bracketed_paste_envelope_is_not_input_but_body_is() {
+        let body = "# WORKER ABSOLUTE DIRECTIVE\n...본문...\n"; // 개행으로 끝나는 지침 본문
+        let wrapped = format!("\u{1b}[200~{body}\u{1b}[201~");
+        let steps = v7_steps(0, &[wrapped.as_bytes(), b"\r"]);
+        let pending = steps[0];
+        assert_eq!(
+            pending,
+            body.len() as u64,
+            "봉투를 제외한 본문 전체가 미제출 입력이어야 한다 — 태그는 끝표식 6바이트만 남긴다(got={pending})"
+        );
+        let after_submit = steps[1];
+        assert_eq!(after_submit, 0, "제출 Return 뒤에는 0 이어야 한다(got={after_submit})");
+        let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        assert_eq!(input_line_state(after_submit, Some(empty)), InputLine::Empty);
+    }
+
+    // ────── ★V7 검증 검체(2026-09-21 · bugverify-3problems · **미커밋 RED 자산**) ──────
+    //
+    // 목적: '배포 소스(v0.14.38 = d20038f5)에 D-01·D-02·D-03 결함이 실재하는가' 와
+    // 'D-01 패치 v1(0194a195)의 codex 분할 붙여넣기 지적이 실제로 0 vs 8 을 내는가' 를 **잰다**.
+    // 수정 구현이 아니다 — 제품 코드는 한 줄도 건드리지 않는다.
+    //   · `v7_probe_*`  = 관측 전용(절대 실패하지 않는다). 실제 계수를 `V7OBS` 줄로 찍는다.
+    //   · `qs_a2_*`·`qs_a3_*`·`qs_a_split_*` = 설계문서가 적은 기대값을 assert 하는 RED/negative 검체.
+    // 청크 계약: 핸들러는 RPC 1회당 `apply_pending_input` 으로 `pending_input_step` 을 **1번** 부른다
+    // (handlers.rs:4422 send_text · :4634 send_key). 그래서 '호출 N번' 은 fold N번으로 모사한다.
+
+    /// 호출 1회 = 1청크. 단계별 계수를 돌려준다(마지막 원소가 최종 계수).
+    fn v7_steps(prev: u64, chunks: &[&[u8]]) -> Vec<u64> {
+        let mut state = PendingInputState { count: prev, human: prev, ..Default::default() };
+        let now = std::time::Instant::now();
+        chunks
+            .iter()
+            .map(|c| {
+                state = super::pending_input_step(&state, c, InputOrigin::Human, now);
+                state.count
+            })
+            .collect()
+    }
+
+    fn v7_last(prev: u64, chunks: &[&[u8]]) -> u64 {
+        v7_steps(prev, chunks).last().copied().unwrap_or(prev)
+    }
+
+    /// 출처와 기준 시각으로부터의 초 오프셋을 적용한다 — TTL 을 잠들지 않고 검증한다.
+    fn v2_run(chunks: &[(&[u8], InputOrigin, u64 /* now 오프셋 초 */)]) -> PendingInputState {
+        let now = std::time::Instant::now();
+        chunks.iter().fold(PendingInputState::default(), |state, (chunk, origin, offset)| {
+            super::pending_input_step(
+                &state,
+                chunk,
+                *origin,
+                now + std::time::Duration::from_secs(*offset),
+            )
+        })
+    }
+
+    const V7_OPEN: &[u8] = b"\x1b[200~";
+    const V7_CLOSE: &[u8] = b"\x1b[201~";
+    const V7_CPR: &[u8] = b"\x1b[24;80R"; // 8바이트 — codex 시나리오의 BODY
+
+    /// 관측 전용 — D-01/D-02/D-03/분할 붙여넣기의 **실제 계수**를 한 표로 찍는다(실패 0).
+    #[test]
+    fn v7_probe_observed_counts_table() {
+        let obs = |name: &str, steps: Vec<u64>| eprintln!("V7OBS {name} steps={steps:?} final={}", steps.last().copied().unwrap_or(0));
+        // ── D-01: 제품이 '기계 자동응답' 으로 인정한 시퀀스가 계수에 얼마를 더하는가
+        for (name, seq) in [
+            ("d01.focus_in ESC[I", &b"\x1b[I"[..]),
+            ("d01.focus_out ESC[O", &b"\x1b[O"[..]),
+            ("d01.cpr ESC[24;80R", V7_CPR),
+            ("d01.decxcpr ESC[?24;80R", &b"\x1b[?24;80R"[..]),
+            ("d01.da1 ESC[?62;1;6c", &b"\x1b[?62;1;6c"[..]),
+            ("d01.da2 ESC[>0;276;0c", &b"\x1b[>0;276;0c"[..]),
+            ("d01.xtversion", &b"\x1bP>|XTerm(370)\x1b\\"[..]),
+            ("d01.decrpm ESC[?2004;1$y", &b"\x1b[?2004;1$y"[..]),
+            ("d01.kitty ESC[?1u", &b"\x1b[?1u"[..]),
+            ("d01.osc11", &b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"[..]),
+            ("d01.sgr_mouse ESC[<0;5;7M", &b"\x1b[<0;5;7M"[..]),
+        ] {
+            let is_auto = std::str::from_utf8(seq).map(cys::mousereport::is_pure_terminal_autoreply).unwrap_or(false);
+            eprintln!(
+                "V7OBS {name} bytes={} is_pure_terminal_autoreply={is_auto} pending_after(prev=0)={}",
+                seq.len(),
+                v7_last(0, &[seq])
+            );
+        }
+        let mut clicks: Vec<&[u8]> = Vec::new();
+        for _ in 0..10 {
+            clicks.push(b"\x1b[I");
+            clicks.push(b"\x1b[O");
+        }
+        obs("d01.ten_click_cycles", v7_steps(0, &clicks));
+        obs("d01.inject_text_single_buffer(OPEN+body\\n+CLOSE)", v7_steps(0, &[b"\x1b[200~# D\nbody\n\x1b[201~"]));
+        // ── D-02: 편집키
+        obs("d02.abc_then_BSx3 (per-key chunks)", v7_steps(0, &[b"a", b"b", b"c", b"\x7f", b"\x7f", b"\x7f"]));
+        obs("d02.abc_then_BSx3 (one chunk)", v7_steps(0, &[b"abc\x7f\x7f\x7f"]));
+        obs("d02.abc_then_bare_ESC", v7_steps(0, &[b"a", b"b", b"c", b"\x1b"]));
+        obs("d02.abc_then_ESC[A (up arrow)", v7_steps(0, &[b"a", b"b", b"c", b"\x1b[A"]));
+        obs("d02.abc_then_ctrl_h_0x08 x3", v7_steps(0, &[b"abc", b"\x08", b"\x08", b"\x08"]));
+        let typed = vec![b'x'; 386];
+        let erased = vec![0x7fu8; 386];
+        obs("d02.386_chars_then_386_BS(final only)", vec![v7_last(0, &[&typed[..], &erased[..]])]);
+        // ── D-03: 붙여넣기 본문 안의 개행
+        obs("d03.paste a\\nb (one call)", v7_steps(0, &[b"\x1b[200~a\nb\x1b[201~"]));
+        obs("d03.paste a\\rb (one call · xterm.js 가 \\n→\\r 정규화)", v7_steps(0, &[b"\x1b[200~a\rb\x1b[201~"]));
+        obs("d03.paste abc\\n (trailing newline)", v7_steps(0, &[b"\x1b[200~abc\n\x1b[201~"]));
+        obs("d03.outside abc\\n", v7_steps(0, &[b"abc\n"]));
+        obs("d03.prev=5 then paste a\\nb", v7_steps(5, &[b"\x1b[200~a\nb\x1b[201~"]));
+        // ── 분할 붙여넣기(codex 시나리오)
+        obs("split.A three_calls OPEN/CPR/CLOSE", v7_steps(0, &[V7_OPEN, V7_CPR, V7_CLOSE]));
+        obs("split.B one_call OPEN+CPR+CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]));
+        obs("split.C boundary_in_body OPEN+ESC[24 / ;80R / CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24", b";80R", V7_CLOSE]));
+        obs("split.D two_calls OPEN+CPR / CLOSE", v7_steps(0, &[b"\x1b[200~\x1b[24;80R", V7_CLOSE]));
+        obs("split.E two_calls OPEN / CPR+CLOSE", v7_steps(0, &[V7_OPEN, b"\x1b[24;80R\x1b[201~"]));
+        obs("split.F three_calls OPEN/focus ESC[I/CLOSE", v7_steps(0, &[V7_OPEN, b"\x1b[I", V7_CLOSE]));
+        obs("split.G plain body three_calls OPEN/hello/CLOSE", v7_steps(0, &[V7_OPEN, b"hello", V7_CLOSE]));
+        obs("split.H plain body one_call", v7_steps(0, &[b"\x1b[200~hello\x1b[201~"]));
+        obs("split.I envelope cut mid-marker ESC[20 / 0~hello / ESC[201~", v7_steps(0, &[b"\x1b[20", b"0~hello", V7_CLOSE]));
+    }
+
+    // ── D-02 (설계문서 170~198행) ─────────────────────────────────────────────
+
+    /// RED(문서 기대): 사람이 "abc" 를 치고 Backspace 3회 → 입력줄은 비었다 → 기대 0.
+    #[test]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 가산은 의도된 fail-closed 이고 계수는 >0 불리언으로만 쓰인다. v2 출하 후 stale_bytes 분포를 보고 재판단 — 검체는 RED 자산으로 보존한다"]
+    fn qs_a2_backspace_must_decrement_pending_input() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x7f", b"\x7f", b"\x7f"]);
+        eprintln!("V7OBS qs_a2_backspace got={got} expected=0");
+        assert_eq!(got, 0, "Backspace(0x7f)가 가산이다 — 다 지운 빈 입력줄이 {got}바이트 점유로 남는다");
+    }
+
+    /// RED(문서 기대): "abc" + 순수 Esc(0x1b 단독) → Claude Code 는 입력줄을 비운다 → 기대 0.
+    #[test]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 순수 Esc 감산은 과소 계수(오주입) 방향 위험 — v2 출하 후 재판단 · RED 자산 보존"]
+    fn qs_a2_bare_escape_clears_pending_input() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x1b"]);
+        eprintln!("V7OBS qs_a2_bare_escape got={got} expected=0");
+        assert_eq!(got, 0, "순수 Esc 가 가산이다 — 비운 입력줄이 {got}바이트 점유로 남는다");
+    }
+
+    /// negative(문서): `ESC[A`(위 화살표)는 입력줄을 비우지 않는다 → **리셋되면 안 된다**.
+    #[test]
+    fn qs_a2_escape_sequence_must_not_clear() {
+        let got = v7_last(0, &[b"a", b"b", b"c", b"\x1b[A"]);
+        eprintln!("V7OBS qs_a2_escape_sequence got={got} expected>=3");
+        assert!(got >= 3, "화살표 시퀀스가 계수를 지웠다(got={got}) — 사람 글자 3개가 남아 있는데 빈 줄로 본다");
+    }
+
+    // ── D-03 (설계문서 202~231행) ─────────────────────────────────────────────
+
+    /// RED(문서 기대 3): 괄호붙여넣기 본문 `a\nb` — `\n` 은 제출이 아니라 줄바꿈이다.
+    #[test]
+    fn qs_a3_newline_inside_paste_must_not_reset() {
+        let got = v7_last(0, &[b"\x1b[200~a\nb\x1b[201~"]);
+        eprintln!("V7OBS qs_a3_newline_inside_paste got={got} expected=3");
+        assert_eq!(got, 3, "봉투 안의 \\n 을 제출로 오인했다(또는 봉투를 셌다) — got={got}");
+    }
+
+    /// RED(GUI 실경로 변형): xterm.js 5.5.0 `prepareTextForTerminal` 이 붙여넣기 본문의 `\r?\n` 을
+    /// `\r` 로 정규화한 뒤 봉투를 씌워 **onData 1회**로 낸다 → 데몬이 받는 본문 개행은 `\r` 이다.
+    #[test]
+    fn qs_a3_cr_inside_paste_must_not_reset() {
+        let got = v7_last(0, &[b"\x1b[200~a\rb\x1b[201~"]);
+        eprintln!("V7OBS qs_a3_cr_inside_paste got={got} expected=3");
+        assert_eq!(got, 3, "봉투 안의 \\r 을 제출로 오인했다(또는 봉투를 셌다) — got={got}");
+    }
+
+    /// negative(문서): 봉투 **밖** `"abc\n"` 은 종전대로 0 으로 리셋.
+    #[test]
+    fn qs_a3_newline_outside_paste_still_resets() {
+        let got = v7_last(0, &[b"abc\n"]);
+        eprintln!("V7OBS qs_a3_newline_outside_paste got={got} expected=0");
+        assert_eq!(got, 0);
+    }
+
+    // ── D-01 패치 v1 의 codex 지적(설계문서 131~141·155~157행) ────────────────
+
+    /// RED 1(codex 시나리오 그대로): prev=0 · OPEN / `ESC[24;80R` / CLOSE **호출 3번** 의 최종 계수가
+    /// 같은 바이트 **호출 1번** 의 계수와 같아야 한다(호출 경계가 계수를 바꾸면 안 된다).
+    #[test]
+    fn qs_a_split_paste_body_must_count_like_single_call() {
+        let split = v7_steps(0, &[V7_OPEN, V7_CPR, V7_CLOSE]);
+        let single = v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste three_calls={split:?} one_call={single:?}");
+        assert_eq!(
+            split.last(),
+            single.last(),
+            "같은 바이트인데 호출 경계만으로 계수가 갈린다 — 호출3번={split:?} 호출1번={single:?}"
+        );
+    }
+
+    /// RED 2(문서 157행): 분할 경계를 BODY 중간에 둔 변형도 호출 1번과 같아야 한다.
+    #[test]
+    fn qs_a_split_paste_boundary_inside_body_must_count_like_single_call() {
+        let split = v7_steps(0, &[b"\x1b[200~\x1b[24", b";80R", V7_CLOSE]);
+        let single = v7_steps(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste_mid_body three_calls={split:?} one_call={single:?}");
+        assert_eq!(
+            split.last(),
+            single.last(),
+            "같은 바이트인데 호출 경계만으로 계수가 갈린다 — 분할={split:?} 단일={single:?}"
+        );
+    }
+
+    /// 문서 156행이 적은 절대값: 단일 호출 계수는 **8**(봉투 12바이트 제외 · BODY 8바이트).
+    /// 태그(수리 전)에서는 봉투까지 세므로 이 값부터 다르다 — 그 값을 기록하려고 분리했다.
+    #[test]
+    fn qs_a_split_paste_single_call_counts_body_only_eight() {
+        let single = v7_last(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
+        eprintln!("V7OBS qs_a_split_paste_single_call got={single} expected=8");
+        assert_eq!(single, 8, "단일 호출 계수가 BODY 8바이트가 아니다 — got={single}");
+    }
+
+    // ────── ★D-01 v2 상태기계 검체 — 스캐폴드에서는 출처 핀만 통과하고 나머지는 RED ──────
+
+    /// 설계 §5 D-01 v2 봉투 안 자동응답 항 — 분할 F 도 포커스 보고 본문 3바이트를 센다(RED).
+    #[test]
+    fn v2_split_f_focus_report_inside_paste_counts_like_single_call() {
+        let split = v2_run(&[
+            (V7_OPEN, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ]);
+        let single = v2_run(&[(
+            &[V7_OPEN, b"\x1b[I", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(split.count, single.count);
+        assert_eq!(single.count, 3);
+    }
+
+    /// 설계 §5 D-01 v2 봉투 표식 이월 항 — 분할 I 의 표식 중간 경계도 본문만 센다(RED).
+    #[test]
+    fn v2_split_i_envelope_cut_mid_marker_counts_like_single_call() {
+        let split = v2_run(&[
+            (b"\x1b[20", InputOrigin::Human, 0),
+            (b"0~hello", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ]);
+        let single = v2_run(&[(
+            &[V7_OPEN, b"hello", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(split.count, single.count);
+        assert_eq!(single.count, 5);
+    }
+
+    /// 설계 §5 D-01 v2 봉투 안 개행 항 — 끝 개행도 제출이 아닌 본문 1바이트다(RED).
+    #[test]
+    fn v2_trailing_newline_paste_keeps_body() {
+        let state = v2_run(&[(
+            &[V7_OPEN, b"abc\n", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(state.count, 4);
+    }
+
+    /// 설계 §5 D-01 v2 미종결 봉투 해제 항 — TTL 뒤 자동응답 면제는 복귀하되 계수는 줄이지 않는다(RED).
+    #[test]
+    fn v2_unterminated_paste_releases_after_ttl_and_keeps_count() {
+        let open_body = [V7_OPEN, b"abc"].concat();
+        let expired = super::PASTE_OPEN_TTL_SECS + 1;
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (&open_body, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, expired),
+            (b"\r", InputOrigin::Human, expired),
+        ];
+        let opened = v2_run(&chunks[..1]);
+        assert_eq!(opened.count, 3);
+        assert!(opened.in_paste);
+        let released = v2_run(&chunks[..2]);
+        assert!(!released.in_paste);
+        assert_eq!(released.count, 3);
+        assert_eq!(v2_run(chunks).count, 0);
+    }
+
+    /// 설계 §5 D-01 v2 미종결 봉투 해제 항 — 봉투 안 Ctrl-C 는 해제만 하고 바깥 CR 이 제출한다(RED).
+    #[test]
+    fn v2_unterminated_paste_released_by_ctrl_c_without_decrement() {
+        let open_body = [V7_OPEN, b"abc"].concat();
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (&open_body, InputOrigin::Human, 0),
+            (b"\x03", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ];
+        let released = v2_run(&chunks[..2]);
+        assert!(!released.in_paste);
+        assert_eq!(released.count, 3);
+        assert_eq!(v2_run(chunks).count, 0);
+    }
+
+    /// 설계 §5 D-01 v2 자동응답 면제 항 — 봉투 밖 기존 계수는 보존하고 안에서는 본문으로 센다(RED).
+    #[test]
+    fn v2_autoreply_exempt_outside_paste_only() {
+        let outside = v2_run(&[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(outside.count, 5);
+        let inside = v2_run(&[
+            (V7_OPEN, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(inside.count, 3);
+    }
+
+    /// Meta-Enter 예외는 같은 청크 안의 ESC+CR 에만 — 분할은 Esc 키 뒤 Enter(제출).
+    #[test]
+    fn v2_meta_enter_is_newline_not_submit() {
+        let single = v2_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b\r", InputOrigin::Human, 0),
+        ]);
+        let split = v2_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ]);
+        assert!(single.count >= 4, "Meta-Enter 가 제출로 계수를 지웠다: {single:?}");
+        assert!(
+            split.count == 0 && split.human == 0,
+            "분할 ESC·CR 은 Esc 키 뒤 Enter = 제출: {split:?}"
+        );
+    }
+
+    /// 리뷰 minor: 이월 tail 이 단독 ESC 로 끝나는 상태에서 온 CR 은 Meta-Enter 가 아니라 제출이다.
+    /// 현재 하한(2)에서는 이 상태가 자연 발생하지 않으므로 상태를 직접 만들어 가드를 고정한다.
+    /// 지금 HEAD 에서 PASS 여도 되는 회귀 방지 검체이며 RED 대상이 아니다.
+    #[test]
+    fn v2_carried_escape_then_cr_is_submit_not_meta_enter() {
+        let st = PendingInputState {
+            count: 5,
+            human: 5,
+            tail: vec![0x1b],
+            ..Default::default()
+        };
+        let next = super::pending_input_step(
+            &st,
+            b"\r",
+            InputOrigin::Human,
+            std::time::Instant::now(),
+        );
+        assert_eq!((next.count, next.human), (0, 0), "이월 ESC 뒤 CR 은 제출: {next:?}");
+
+        let same_chunk = v2_run(&[(b"ab\x1b\r", InputOrigin::Human, 0)]);
+        assert_eq!(same_chunk.count, 4, "같은 청크의 ESC+CR 은 Meta-Enter: {same_chunk:?}");
+    }
+
+    /// 리뷰 minor: 봉투 안에서 이월한 ESC 뒤 TTL 이 만료되면 다음 CR 은 제출이다.
+    #[test]
+    fn v2_carried_escape_inside_paste_then_ttl_expiry_then_cr_submits() {
+        let now = std::time::Instant::now();
+        let st = PendingInputState {
+            count: 3,
+            human: 3,
+            in_paste: true,
+            paste_opened_at: Some(now),
+            tail: vec![0x1b],
+        };
+        // TTL 만료 뒤 CR: 봉투가 먼저 닫히고(하한 2 복귀) 이월 ESC + CR 은 제출이다.
+        let expired = super::pending_input_step(
+            &st,
+            b"\r",
+            InputOrigin::Human,
+            now + std::time::Duration::from_secs(super::PASTE_OPEN_TTL_SECS),
+        );
+        assert_eq!(
+            (expired.count, expired.human),
+            (0, 0),
+            "TTL 만료로 봉투가 닫힌 뒤 이월 ESC + CR 은 제출: {expired:?}"
+        );
+        assert!(!expired.in_paste, "TTL 만료 뒤 봉투는 닫혀야 한다: {expired:?}");
+        assert!(expired.tail.is_empty(), "제출 뒤 이월 바이트가 없어야 한다: {expired:?}");
+
+        // 대조: TTL 안이면 봉투 안이라 ESC·CR 모두 가산(3+2=5) · in_paste 유지.
+        let inside = super::pending_input_step(&st, b"\r", InputOrigin::Human, now);
+        assert_eq!(
+            (inside.count, inside.human),
+            (5, 5),
+            "TTL 안의 봉투에서는 이월 ESC·CR 모두 본문으로 가산: {inside:?}"
+        );
+        assert!(inside.in_paste, "TTL 안에서는 봉투를 유지해야 한다: {inside:?}");
+    }
+
+    /// 리뷰 minor(RED): CLOSE 표식이 ESC 경계에서 잘려 와도 봉투는 닫혀야 한다.
+    #[test]
+    fn v2_close_marker_cut_at_escape_inside_paste_closes_envelope() {
+        // 라운드 1 회귀 방지 대조는 RED 단언 전에 검증한다.
+        let outside = v2_run(&[(b"hello\x1b", InputOrigin::Human, 0)]);
+        assert_eq!(outside.count, 6, "봉투 밖 단독 ESC 는 즉시 가산: {outside:?}");
+        assert!(outside.tail.is_empty(), "봉투 밖 단독 ESC 는 이월하지 않는다: {outside:?}");
+
+        let st = v2_run(&[
+            (b"\x1b[200~abc\x1b", InputOrigin::Human, 0),
+            (b"[201~", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(st.count, 3, "RED: 분할 CLOSE 는 본문 abc 만 남겨야 한다: {st:?}");
+        assert!(!st.in_paste, "분할 CLOSE 뒤 봉투가 닫혀야 한다: {st:?}");
+        assert!(st.tail.is_empty(), "완성된 CLOSE 표식은 이월하지 않는다: {st:?}");
+    }
+
+    /// 단독 Esc 키는 즉시 1바이트로 세고, 다음 청크의 CR 은 출처와 무관하게 제출한다(RED).
+    #[test]
+    fn v2_lone_escape_chunk_then_cr_submits() {
+        for origin in [InputOrigin::Human, InputOrigin::Machine] {
+            let submitted = v2_run(&[
+                (b"hello", InputOrigin::Human, 0),
+                (b"\x1b", InputOrigin::Human, 0),
+                (b"\r", origin, 0),
+            ]);
+            assert!(
+                submitted.count == 0 && submitted.human == 0,
+                "단독 ESC 뒤 {origin:?} CR 은 제출: {submitted:?}"
+            );
+        }
+
+        let escaped = v2_run(&[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            escaped.count == 6 && escaped.human == 6 && escaped.tail.is_empty(),
+            "단독 ESC 는 즉시 1바이트 가산하고 이월하지 않는다: {escaped:?}"
+        );
+    }
+
+    /// 단독 ESC 와 다음 청크의 포커스 보고를 합치지 않는다(RED · 리뷰 실측 count=4).
+    #[test]
+    fn v2_lone_escape_then_focus_report_is_not_merged() {
+        let state = v2_run(&[
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            state.count == 1 && state.tail.is_empty(),
+            "ESC 1바이트만 세고 포커스 보고는 세그먼트 면제: {state:?}"
+        );
+    }
+
+    /// 표식 접두는 2바이트부터 이월하고, 미완성 tail 뒤 CR 은 원래 제출 규칙을 따른다(RED).
+    #[test]
+    fn v2_tail_carry_requires_two_byte_marker_prefix() {
+        let lone = v2_run(&[(b"hello\x1b", InputOrigin::Human, 0)]);
+        assert!(
+            lone.tail.is_empty() && lone.count == 6,
+            "1바이트 표식 접두인 단독 ESC 는 이월하지 않는다: {lone:?}"
+        );
+
+        let partial = v2_run(&[(b"hello\x1b[", InputOrigin::Human, 0)]);
+        assert_eq!(partial.tail, b"\x1b[");
+        assert_eq!(partial.count, 5);
+
+        let completed = v2_run(&[
+            (b"hello\x1b[", InputOrigin::Human, 0),
+            (b"200~abc", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            completed.count == 8 && completed.in_paste && completed.tail.is_empty(),
+            "이월 tail 이 OPEN 으로 완성되면 본문 abc 3바이트만 가산: {completed:?}"
+        );
+
+        let submitted = v2_run(&[
+            (b"hello\x1b[", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(submitted.count, 0, "미완성 tail 의 [ 뒤 CR 은 Meta-Enter 가 아닌 제출");
+    }
+
+    /// 설계 §5 D-01 v2 봉투 표식 이월 항 — 접두 ≤5바이트는 계수 없이 보관하고 완성 뒤 비운다(RED).
+    #[test]
+    fn v2_tail_carry_is_bounded_and_uncounted() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"hello\x1b[20", InputOrigin::Human, 0),
+            (b"0~x", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ];
+        let partial = v2_run(&chunks[..1]);
+        assert_eq!(partial.count, 5);
+        assert_eq!(partial.tail, b"\x1b[20");
+        assert!(partial.tail.len() <= 5);
+        let completed = v2_run(chunks);
+        assert_eq!(completed.count, 6);
+        assert!(completed.tail.is_empty());
+    }
+
+    /// 설계 §5 D-01 v2 출처별 계수 항 — 스캐폴드에서도 통과하는 핀(RED 아님).
+    #[test]
+    fn v2_origin_split_tracks_human_bytes() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"abc", InputOrigin::Human, 0),
+            (b"xyz", InputOrigin::Machine, 0),
+            (b"\r", InputOrigin::Machine, 0),
+            (b"ab", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ];
+        for (i, expected) in [(3, 3), (6, 3), (0, 0), (2, 2), (0, 0)].into_iter().enumerate() {
+            let state = v2_run(&chunks[..=i]);
+            assert_eq!((state.count, state.human), expected, "출처 계수 단계 {}", i + 1);
+        }
     }
 
     /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).

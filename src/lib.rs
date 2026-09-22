@@ -626,6 +626,13 @@ pub fn wait_named_pipe(path: &Path, timeout: std::time::Duration) -> bool {
 /// 조용히 죽는다(RC1 문자열 계약 드리프트). 그래서 상수로 못박고 양쪽이 이것만 쓴다.
 pub const ERR_TYPING_GUARD: &str = "typing_guard";
 pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or use --queued";
+/// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
+pub const DRAFT_GATE_TAG: &str = "draft_gate";
+/// D-12 CancelKey(원시 Ctrl-U/Ctrl-C) 거부 문구 — `MSG_TYPING_GUARD` 와 달리 `--queued` 를
+/// 안내하지 않는다: 취소 키는 텍스트 큐에 실을 수 없어(send_key queued 는 Return/Enter 한정)
+/// 그 처방은 존재하지 않는 경로를 가리킨다(수정 라운드 3 · 감사 minor). 코드는 `ERR_TYPING_GUARD` 를 유지한다.
+pub const MSG_DRAFT_GATE_CANCEL_KEY: &str =
+    "human draft in this pane; cancel key refused (it would erase the draft) — wait for the human or let them clear the line";
 
 /// `cys boot` 가 **무스폰 skip**(다른 boot 가 락 보유)을 낼 때의 종료코드 — EX_TEMPFAIL(75).
 ///

@@ -1,6 +1,6 @@
 //! Method dispatch: NDJSON request → handler → single response or stream upgrade.
 
-use crate::governance;
+use crate::governance::{self, DirectSendKind, DraftGateDenied};
 use crate::state::{Daemon, FeedItem, HealthRule, LedgerEntry, DEFAULT_COLS, DEFAULT_ROWS};
 use cys::{err_response, ok_response, parse_surface_ref, surface_ref, Request};
 use serde_json::{json, Value};
@@ -2202,6 +2202,50 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// D-12 거부 관측·응답의 단일 경로. leaf 락을 놓은 뒤 이벤트를 1건 발행한다.
+fn draft_gate_denied_response(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    id: &Value,
+    kind: DirectSendKind,
+    why: DraftGateDenied,
+    verified_from: Option<u64>,
+    hint: Option<&str>,
+) -> Value {
+    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+    let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
+    daemon.bus.publish(
+        "queue.draft_gate_denied",
+        "queue",
+        Some(surface.id),
+        json!({
+            "surface_ref": cys::surface_ref(surface.id),
+            "kind": match kind {
+                DirectSendKind::Text => "text",
+                DirectSendKind::SubmitKey => "submit_key",
+                DirectSendKind::ClearFirst => "clear_first",
+                DirectSendKind::CancelKey => "cancel_key",
+            },
+            "reason": why.as_str(),
+            "pending_input_bytes": pending,
+            "pending_input_human_bytes": human,
+            "from": verified_from.map(cys::surface_ref),
+        }),
+    );
+    // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다(Text/SubmitKey/ClearFirst 접두 보존).
+    // CancelKey 는 큐에 실을 수 없어 `--queued` 처방이 거짓이므로 전용 문구를 쓴다(코드는 유지 · 수정 라운드 3).
+    let base = match kind {
+        DirectSendKind::CancelKey => cys::MSG_DRAFT_GATE_CANCEL_KEY,
+        _ => cys::MSG_TYPING_GUARD,
+    };
+    let mut message = format!("{base} [{}:{}]", cys::DRAFT_GATE_TAG, why.as_str());
+    if let Some(hint) = hint {
+        message.push(' ');
+        message.push_str(hint);
+    }
+    err_response(id, cys::ERR_TYPING_GUARD, &message)
+}
+
 /// ★B2(0.14.24) 프로그램 주입 직후 제출 CR 의 **최소 간격**(ms). 0 = 비활성
 /// (`typing_guard_secs` 와 같은 꼴 — env 로 끌 수 있어야 실기에서 되돌릴 수 있다).
 ///
@@ -2233,6 +2277,10 @@ fn cr_min_gap_ms() -> u64 {
 ///
 /// 조건 둘: key 가 제출 키(Return/Enter — 붙여넣기 삼킴은 CR 고유 문제다) · min_gap_ms > 0
 /// (env 비활성 스위치). 프로그램 주입이 선행했는지는 writer 가 판단하므로 여기서 보지 않는다.
+///
+/// 이 판정과 `cys.rs::should_queue_fallback_send_key` 는 **의도적으로 이름 축**(Return|Enter)이다 —
+/// 별칭(C-m/C-j/"\r")은 제품 경로가 아니고(팩 호출자 0건), B2′ 최소 간격·큐 폴백은 정상 경로의 안전장치다.
+/// 게이트만 바이트 축(우회 차단)이며, 별칭이 거부될 때는 문구가 `Return --queued` 를 처방한다(수정 라운드 3).
 fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
     (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
 }
@@ -4078,6 +4126,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             ),
                         )
                     };
+                    // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                    let (pending_input_human_bytes, input_paste_open) = {
+                        let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                        (input.human, input.in_paste)
+                    };
                     json!({
                         "surface_id": s.id,
                         "surface_ref": surface_ref(s.id),
@@ -4089,6 +4142,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pid": s.pid,
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                         // ★SEAT: 좌석 점유 사실(occupied|empty|unknown) — watchdog 캐시 소비(키 추가만).
                         // pack(phoenix)·CLI(restore)는 이 값을 **소비만** 한다. 각자 판정을 구현하면
                         // 판정 이원화로 오늘의 결함(빈 좌석을 생존으로 오인)이 다른 얼굴로 재발한다.
@@ -4304,11 +4360,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                            "queue_entry_id": entry.id, "durable": durable}),
                 ));
             }
+            let machine_origin = params
+                .get("machine_origin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
             // 무음 큐잉 대신 명시 에러 — 후속 send-key Return이 사람의 미완성 입력을
             // 실행해버리는 최악 경로를 차단한다 (--queued는 quiet 대기 배달이라 허용).
-            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
-            {
+            if !human && !exempt {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -4326,6 +4386,38 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             cys::MSG_TYPING_GUARD,
                         ));
                     }
+                }
+            }
+            // ★(0.14.39 · WP-C-input · D-12) 종전 가드는 3초 시계 하나뿐이라 시간이 지나면
+            // 사람 초안에 직접 본문이 연접됐다. 계수·화면도 검사한다(queued 는 위에서 반환했다).
+            // clear_first 는 사람 초안·미계수 화면 초안만 거부하고 기계 잔여는 C-u 대상이므로 통과한다.
+            // 명령 계약: --clear-first 는 사람 초안 앞에서는 실패하며 CLI 는 --queued 폴백이 없다
+            // (원자 주입은 큐와 결합 불가 · cys.rs should_queue_fallback_send).
+            // Return 은 human 축으로 검사해 관례적인 기계 send+Return 의 자기 본문 제출을
+            // 보호한다. inject_text/launch-agent 의 검증된 authoritative 경로는 의도된 예외다:
+            // cycle-agent D-16 ④는 C-u 전에 화면 초안을 스스로 검사한다.
+            // ★면제 범위 정정(수정 라운드 3 · 리뷰 major 2) — 정의처는 governance::direct_send_text_gate_kind 다.
+            //   ⓐ GUI 가 **조립한** 문안(전출 지시·launchCmd·restartNode·injectRawToPane)은
+            //      `machine_origin=true` 이고 clear_first 또는 자동 제출(CR/LF)이면 기계로 취급해
+            //      게이트에 들어온다(라운드 2 리뷰 major 2 · restartNode 가 남의 초안을 제출한 실측).
+            //      순수 삽입(injectRawToPane)만 자기 초안에 이어 붙이려는 오너 클릭으로 면제한다.
+            //   ⓑ 원시 소켓의 `human:true`(machine_origin 없음)는 지난다. 종전 fail-closed 설명은 틀렸다:
+            //      페이로드가 CR/LF·0x15/0x03 이면 누적 바이트 없이 그 자리에서 제출·삭제된다(실측 ADV2HUMANFLAG).
+            //      실키와 구별할 수 없으므로 ACL 층 문제로 남긴다.
+            //   `human_verified`(operator_token) 로 승격하는 방안은 토큰 없는 CLI 사람 경로를
+            //   전부 기계로 떨어뜨리므로 기각한다.
+            //   ⓒ (라운드 4) 본문의 0x15/0x03 은 send_key 와 같은 CancelKey 축 — text_cancels 로 정의처에 넘긴다.
+            // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
+            let text_submits = text.bytes().any(|b| matches!(b, b'\r' | b'\n'));
+            let text_cancels = text.bytes().any(|b| matches!(b, 0x15 | 0x03));
+            let gate_kind = governance::direct_send_text_gate_kind(
+                human, machine_origin, clear_first, text_submits, text_cancels, exempt,
+            );
+            if let Some(kind) = gate_kind {
+                if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, kind, why, verified_from, None,
+                    ));
                 }
             }
             // ★R1 배달 원장 — **주입보다 반드시 앞**(delivery.rs 불변식 ①). try_write 는 writer
@@ -4353,10 +4445,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   그래서 UI 가 **프로그램적으로 만든** 주입에는 `machine_origin` 표식을 달게 하고,
             //   표식이 있으면 토큰이 유효해도 **기록**한다(origin=gui_auto 로 감사에서 구별).
             //   ★불변식 ② 는 그대로다 — 표식 없는 실키 입력(sendRaw)은 여전히 무기록이다.
-            let machine_origin = params
-                .get("machine_origin")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             let human_verified = human && !machine_origin && operator_token_ok(daemon, &params);
             if human_verified && verified_from.is_some() {
                 // 오퍼레이터 토큰이 **pane 에서** 왔다. GUI(Tauri)는 어떤 surface 의 자손도 아니므로
@@ -4406,8 +4494,39 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
             //   락 순서 계약: pending_queue → input_gate. 여기서는 input_gate 하나만 잡고
-            //   그 안에서 다른 락을 잡지 않는다(사이클 없음).
+            //   그 안에서는 pending_input leaf 외의 락을 잡지 않는다(사이클 없음).
             let _gate = surface.input_gate.lock().unwrap();
+            // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
+            // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
+            // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
+            // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+            //
+            // ★★검체 없음 고지(수정 라운드 2 · 리뷰 minor · 리팩터 체크리스트 등재 대상):
+            //   이 2차 검사는 1차와 **같은 순수 함수**(draft_gate_verdict)를 부르므로 결정론
+            //   검체로 1차와 구별되지 않는다 — 고정하려면 '1차 통과 → 사람 키가 계수를 올림 →
+            //   2차 거부' 경합을 만들어야 하고, 그러려면 판정과 쓰기 사이에 주입 가능한 시임이
+            //   필요하다. 실측으로도 이 두 줄을 `.filter(|_| false)` 로 무력화하면 **0 FAILED**다.
+            //   ⇒ 이 코드를 지우면 **스위트가 초록인 채로** 사람 키와의 경합에서 계수 축
+            //      직렬화가 사라진다. 핸들러를 리팩터할 때 이 문단을 먼저 읽어라.
+            //
+            // ★유령 원장 행 고지: 위 `record_audited`(:4463)는 이 2차 검사보다 **앞**이다.
+            //   경합 창에서 2차 거부가 나면 일어나지 않은 배달이 원장에 남는다(훅의 층2 라벨
+            //   폴백이 읽는 그 원장이다). 기록을 이 아래로 옮기지 않은 이유: `record_audited` 는
+            //   원장 파일 append(디스크 IO)이고 `input_gate` 는 **큐 배달 틱도 잡는** 락이라,
+            //   그 임계영역에 파일 IO 를 넣으면 배달 경로에 디스크 지연이 들어온다. 같은 유령
+            //   행은 바로 아래 `try_write` 실패 경로에도 base 부터 존재했다(신규 노출 아님).
+            if let Some(kind) = gate_kind {
+                let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                if let Some(why) = governance::draft_gate_verdict(
+                    kind, pending, human.min(pending), None, false, false,
+                ) {
+                    drop(_gate);
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, kind, why, verified_from, None,
+                    ));
+                }
+            }
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
@@ -4416,16 +4535,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   하므로 계수는 0 이다. 그 외 본문(사람 키·프로그램 미제출 본문)은 누적한다 —
             //   제출 CR 이 별도 send_key 로 오기 전까지 그 줄은 점유 상태다.
             {
-                let next = if clear_first {
-                    0
-                } else {
-                    crate::governance::pending_input_after(
-                        surface.pending_input_bytes.load(Ordering::Relaxed),
-                        text.as_bytes(),
-                    )
-                };
                 // ★(0.14.31 · WP-5) 세대 동반 쓰기 — stale 리셋(governance)이 세대로 ABA 를 가른다.
-                surface.set_pending_input(next);
+                if clear_first {
+                    surface.clear_pending_input();
+                } else {
+                    // human 은 자기신고(타이핑 가드 :4224 와 같은 신뢰 등급) —
+                    // 출처 표식은 게이트 방향(fail-closed)으로만 쓰인다.
+                    let origin = if human && !machine_origin {
+                        crate::governance::InputOrigin::Human
+                    } else {
+                        crate::governance::InputOrigin::Machine
+                    };
+                    surface.apply_pending_input(text.as_bytes(), origin);
+                }
             }
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             if !human_verified {
@@ -4588,7 +4710,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .get("authoritative")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid)) {
+            let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
+            if !exempt {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -4608,6 +4731,37 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
+            // ★(0.14.39 · WP-C-input · D-12) 3초가 지나도 사람 초안은 제출하지 않는다.
+            // 계수는 human 축으로 검사해 기계 send+Return 과 기계 잔여 취소는 허용한다.
+            // send_text 와 같은 authoritative 예외, 같은 응답 접두·관측 헬퍼를 사용한다.
+            // ★(수정 라운드 2 · 리뷰 major) 판정 축은 키 **이름**이 아니라 **생성 바이트**다.
+            //   key_to_bytes 는 같은 바이트를 내는 별칭을 여럿 만든다 — `C-m`/"\r"→0x0d ·
+            //   `C-j`→0x0a · `C-u`→0x15 · `C-c`→0x03. 이름으로 판정하면 한 단어 치환
+            //   (`cys send-key --surface X C-m`)으로 게이트가 통째로 우회돼, WP-C2 가 막으려던
+            //   "오너의 미완성 초안이 기계에 의해 제출/삭제되는 사고"가 그대로 열린다(실측 확인).
+            //   이름 목록이 늘어나도(키 표 확장) 게이트가 저절로 따라오게 하는 유일한 축이다.
+            let gate_kind = if exempt {
+                None
+            } else if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+                Some(DirectSendKind::SubmitKey)
+            } else if bytes.iter().any(|b| matches!(b, 0x15 | 0x03)) {
+                Some(DirectSendKind::CancelKey)
+            } else {
+                None
+            };
+            // ★(수정 라운드 3 · 감사 minor) 별칭(C-m/C-j/"\r"…)은 CLI 의 --queued 1회 폴백(이름 축 Return|Enter)을
+            //   받지 못하고 데몬 큐도 Return/Enter 한정이라, 기본 문구의 "use --queued" 는 실행 불가 처방이다.
+            //   실행 가능한 처방을 덧붙인다. 정상 경로(Return/Enter)는 CLI 가 스스로 폴백하므로 덧붙이지 않는다.
+            let submit_alias_hint = (gate_kind == Some(DirectSendKind::SubmitKey)
+                && !matches!(key.as_str(), "Return" | "Enter"))
+                .then(|| format!("(key {key:?} cannot be queued: use `Return --queued`)"));
+            if let Some(kind) = gate_kind {
+                if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
+                    ));
+                }
+            }
             // ★B2′(codex 감사 R1 · 0.14.24 결함3 세 번째 층): 제출 Return 은 프로그램이 꽂은
             //   본문과 최소 간격만큼 떨어져야 한다 — 붙여넣기 처리 창 안에 떨어진 CR 은 TUI 가
             //   삼켜 미제출로 끝난다(본문은 들어갔는데 Enter 만 안 먹는 증상의 나머지 절반).
@@ -4622,19 +4776,35 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // ★(0.14.31 · WP-5 · codex Q4) send_text 와 같은 임계영역 규약 — writer 인계와 계수
             //   갱신을 `input_gate` 하나로 묶는다(종전엔 락 없이 갱신해 큐 배달의 0 쓰기와 교차하면
-            //   lost update 가 났다). 락 순서 계약: 여기서는 input_gate 만 잡는다.
+            //   lost update 가 났다). 락 순서 계약: input_gate 안에서는 pending_input leaf 만 잡는다.
             {
                 let _gate = surface.input_gate.lock().unwrap();
+                // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
+                // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
+                // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
+                // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+                // ★검체 없음 고지 — send_text 쪽 같은 자리(:4490)의 문단이 정본이다. 요지:
+                //   1차와 같은 순수 함수라 결정론 검체로 구별되지 않고, 무력화해도 0 FAILED 다.
+                //   지우면 스위트가 초록인 채로 계수 축 직렬화가 사라진다(리팩터 체크리스트).
+                if let Some(kind) = gate_kind {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                    if let Some(why) = governance::draft_gate_verdict(
+                        kind, pending, human.min(pending), None, false, false,
+                    ) {
+                        drop(_gate);
+                        return Reply::Single(draft_gate_denied_response(
+                            daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
+                        ));
+                    }
+                }
                 if let Some(err) = try_write(&surface, write_req, &id) {
                     return Reply::Single(err);
                 }
                 // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
                 //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
                 //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
-                surface.set_pending_input(crate::governance::pending_input_after(
-                    surface.pending_input_bytes.load(Ordering::Relaxed),
-                    &key_bytes,
-                ));
+                surface.apply_pending_input(&key_bytes, crate::governance::InputOrigin::Machine);
             }
             Reply::Single(ok_response(
                 &id,
@@ -7072,6 +7242,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             ),
                         )
                     };
+                    // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                    let (pending_input_human_bytes, input_paste_open) = {
+                        let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                        (input.human, input.in_paste)
+                    };
                     json!({
                         "surface_id": s.id,
                         "surface_ref": surface_ref(s.id),
@@ -7083,6 +7258,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
                         "queue_paused": queue_paused,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                         "agent": agent,
                         "agent_alive": agent_alive,
                         // ★SEAT: phoenix·restore 가 '살아있음'과 '좌석에 누가 앉아 있음'을 구분하는 근거.
@@ -7823,6 +8001,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Some((why, at)) => (json!(why), json!(at)),
                     None => (Value::Null, Value::Null),
                 };
+                // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                let (pending_input_human_bytes, input_paste_open) = {
+                    let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                    (input.human, input.in_paste)
+                };
                 let q = s.pending_queue.lock().unwrap();
                 for (i, e) in q.iter().enumerate() {
                     // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
@@ -7836,6 +8019,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "age_secs": (now - e.enqueued_at).max(0.0) as u64,
                         "from": e.from, "origin": e.origin,
                         "blocked_by": blocked_by, "blocked_since": blocked_since,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                     });
                     if full {
                         row["text"] = json!(e.text);
@@ -7857,6 +8043,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "paused_total_secs": e.paused_total_secs as u64,
                             "revived_at": e.revived_at,
                             "blocked_by": Value::Null, "blocked_since": Value::Null,
+                            "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                            "pending_input_human_bytes": pending_input_human_bytes,
+                            "input_paste_open": input_paste_open,
                         });
                         if full {
                             row["text"] = json!(e.text);
@@ -7895,6 +8084,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap_or(Value::Null),
                     "from": it.get("from").cloned().unwrap_or(Value::Null),
                     "origin": it.get("origin").cloned().unwrap_or(Value::Null),
+                    "pending_input_bytes": Value::Null,
+                    "pending_input_human_bytes": Value::Null,
+                    "input_paste_open": Value::Null,
                 });
                 if full {
                     row["text"] = json!(text);
@@ -7929,6 +8121,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "origin": it.get("origin").cloned().unwrap_or(Value::Null),
                         "expired_at": it.get("expired_at").cloned().unwrap_or(Value::Null),
                         "ttl_secs": it.get("ttl_secs").cloned().unwrap_or(Value::Null),
+                        "pending_input_bytes": Value::Null,
+                        "pending_input_human_bytes": Value::Null,
+                        "input_paste_open": Value::Null,
                     });
                     if full {
                         row["text"] = json!(text);
@@ -12470,6 +12665,937 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ────── ★V7 검증 검체(2026-09-21 · bugverify-3problems · **미커밋 RED 자산**) — 핸들러 수준 ──────
+    //
+    // `governance::tests` 의 순수 전이함수 검체가 '함수가 그렇게 센다' 를 보였다면, 이 블록은
+    // **실제 RPC 핸들러**(`dispatch` → `surface.send_text` / `surface.send_key`)를 지난 뒤
+    // `Surface.pending_input_bytes` 와 `last_human_input` 이 어떻게 남는지를 잰다.
+    // GUI 경로(tauri `send_input`)와 같은 파라미터 모양(`human:true`·`quiet:true`)을 쓴다.
+    // 수정 구현이 아니다 — 제품 코드는 건드리지 않는다.
+
+    /// GUI 가 올리는 사람 경로 1회 호출(= term.onData 1회 = RPC 1회). 호출 뒤 계수를 돌려준다.
+    fn v7_send_human(daemon: &Arc<Daemon>, sid: u64, pid: u32, text: &str) -> u64 {
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": sid, "text": text, "quiet": true, "human": true }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "전제: 전송 자체는 성공해야 한다 (응답: {resp})");
+        daemon.get_surface(sid).unwrap().pending_input_bytes.load(Ordering::Relaxed)
+    }
+
+    /// `cys send-key <key>` 경로 1회 호출. 타이핑 가드는 검체가 직접 식혀 둔다.
+    fn v7_send_key(daemon: &Arc<Daemon>, sid: u64, pid: u32, key: &str) -> u64 {
+        *daemon.get_surface(sid).unwrap().last_human_input.lock().unwrap() = None;
+        let req = Request {
+            id: json!(2),
+            method: "surface.send_key".into(),
+            params: json!({ "surface_id": sid, "key": key }),
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "전제: send_key 자체는 성공해야 한다 (응답: {resp})");
+        daemon.get_surface(sid).unwrap().pending_input_bytes.load(Ordering::Relaxed)
+    }
+
+    fn v7_pane(daemon: &Arc<Daemon>, role: &str, pid: u32) -> Arc<crate::state::Surface> {
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        bind_caller(daemon, pid, s.id);
+        s
+    }
+
+    /// 관측 전용(실패 0) — 핸들러를 지난 **실제 계수**를 `V7OBS` 줄로 찍는다.
+    #[test]
+    fn v7_probe_handler_observed_counts() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-probe", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_470_u32;
+
+        // D-01: pane 을 10번 클릭·이탈 — 타이핑 가드 시계와 계수를 **같은 호출에서** 나란히 본다.
+        let m = v7_pane(&daemon, "master", pid);
+        let mut last = 0;
+        for _ in 0..10 {
+            v7_send_human(&daemon, m.id, pid, "\u{1b}[I");
+            last = v7_send_human(&daemon, m.id, pid, "\u{1b}[O");
+        }
+        eprintln!(
+            "V7OBS handler.d01 ten_click_cycles last_human_input_is_none={} pending_input_bytes={last}",
+            m.last_human_input.lock().unwrap().is_none()
+        );
+
+        // D-02: 사람이 abc 를 치고 지운다(GUI 는 Backspace 를 0x7f 로 onData 에 낸다).
+        let p = v7_pane(&daemon, "worker-1", pid + 1);
+        let mut steps = Vec::new();
+        for t in ["a", "b", "c", "\u{7f}", "\u{7f}", "\u{7f}"] {
+            steps.push(v7_send_human(&daemon, p.id, pid + 1, t));
+        }
+        eprintln!("V7OBS handler.d02 gui abc+BSx3 steps={steps:?}");
+        let p2 = v7_pane(&daemon, "worker-2", pid + 2);
+        let mut steps = vec![v7_send_human(&daemon, p2.id, pid + 2, "abc")];
+        for _ in 0..3 {
+            steps.push(v7_send_key(&daemon, p2.id, pid + 2, "Backspace"));
+        }
+        eprintln!("V7OBS handler.d02 send_text abc + send_key Backspace x3 steps={steps:?}");
+        let p3 = v7_pane(&daemon, "worker-3", pid + 3);
+        let steps = vec![
+            v7_send_human(&daemon, p3.id, pid + 3, "abc"),
+            v7_send_key(&daemon, p3.id, pid + 3, "Escape"),
+        ];
+        eprintln!("V7OBS handler.d02 send_text abc + send_key Escape steps={steps:?}");
+
+        // D-03: 붙여넣기 1회 호출(GUI: xterm.js 가 \n→\r 정규화 · CLI inject_text: \n 그대로).
+        let p4 = v7_pane(&daemon, "worker-4", pid + 4);
+        let n = v7_send_human(&daemon, p4.id, pid + 4, "\u{1b}[200~a\nb\u{1b}[201~");
+        eprintln!("V7OBS handler.d03 paste a\\nb one_call pending={n}");
+        let p5 = v7_pane(&daemon, "worker-5", pid + 5);
+        let n = v7_send_human(&daemon, p5.id, pid + 5, "\u{1b}[200~a\rb\u{1b}[201~");
+        eprintln!("V7OBS handler.d03 paste a\\rb one_call pending={n}");
+
+        // 분할 붙여넣기(codex 시나리오): 호출 3번 vs 호출 1번.
+        let a = v7_pane(&daemon, "worker-6", pid + 6);
+        let steps_a: Vec<u64> = ["\u{1b}[200~", "\u{1b}[24;80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, a.id, pid + 6, t))
+            .collect();
+        let b = v7_pane(&daemon, "worker-7", pid + 7);
+        let one = v7_send_human(&daemon, b.id, pid + 7, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
+        let c = v7_pane(&daemon, "worker-8", pid + 8);
+        let steps_c: Vec<u64> = ["\u{1b}[200~\u{1b}[24", ";80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, c.id, pid + 8, t))
+            .collect();
+        eprintln!("V7OBS handler.split three_calls={steps_a:?} one_call={one} boundary_in_body={steps_c:?}");
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RED(D-01 · 핸들러 수준 비대칭): 같은 청크(`ESC[I`/`ESC[O`)를 타이핑 가드는 **면제**하는데
+    /// 미제출 입력 계수는 **면제하지 않는다**. 앞 assert(면제)는 통과하고 뒤 assert(계수 0)가 실패하면
+    /// 그것이 곧 비대칭의 실측이다.
+    #[test]
+    fn v7_d01_handler_exempts_typing_guard_but_still_counts_autoreply() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-d01", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_480_u32;
+        let m = v7_pane(&daemon, "master", pid);
+        let mut pending = 0;
+        for _ in 0..10 {
+            v7_send_human(&daemon, m.id, pid, "\u{1b}[I");
+            pending = v7_send_human(&daemon, m.id, pid, "\u{1b}[O");
+        }
+        let guard_untouched = m.last_human_input.lock().unwrap().is_none();
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("V7OBS v7_d01_handler guard_untouched={guard_untouched} pending_input_bytes={pending}");
+        assert!(guard_untouched, "전제: 자동응답은 타이핑 가드를 찍지 않는다(handlers.rs:4224 면제)");
+        assert_eq!(
+            pending, 0,
+            "같은 청크를 타이핑 가드는 기계로 보고 면제했는데 계수는 사람 입력으로 {pending}바이트 셌다(handlers.rs:4422)"
+        );
+    }
+
+    /// RED(분할 붙여넣기 · 핸들러 수준): 같은 바이트를 호출 3번으로 보낸 계수 == 호출 1번 계수.
+    #[test]
+    fn v7_split_paste_handler_call_boundary_must_not_change_count() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("v7-split", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_490_u32;
+        let a = v7_pane(&daemon, "worker-1", pid);
+        let steps: Vec<u64> = ["\u{1b}[200~", "\u{1b}[24;80R", "\u{1b}[201~"]
+            .iter()
+            .map(|t| v7_send_human(&daemon, a.id, pid, t))
+            .collect();
+        let b = v7_pane(&daemon, "worker-2", pid + 1);
+        let one = v7_send_human(&daemon, b.id, pid + 1, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("V7OBS v7_split_paste_handler three_calls={steps:?} one_call={one}");
+        assert_eq!(
+            steps.last().copied(),
+            Some(one),
+            "호출 경계만으로 계수가 갈린다 — 호출3번={steps:?} 호출1번={one}"
+        );
+    }
+
+    // ── D-12 직접 전송 초안 게이트: #4 RED 검체, 핸들러 배선은 #5 에서 구현 ──
+
+    fn d12_rpc(daemon: &Arc<Daemon>, pid: u32, method: &str, params: Value) -> Value {
+        let req = Request { id: json!(12), method: method.into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single D-12 reply");
+        };
+        resp
+    }
+
+    fn d12_input_counts(s: &Arc<crate::state::Surface>) -> (u64, u64, u64) {
+        let state = s.pending_input.lock().unwrap();
+        (s.pending_input_bytes.load(Ordering::Relaxed), state.count, state.human)
+    }
+
+    fn d12_assert_denied(resp: &Value, reason: &str) {
+        assert_eq!(resp["ok"], json!(false), "초안이 있는 직접 전송은 거부해야 한다: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD));
+        let message = resp["error"]["message"].as_str().expect("거부 메시지");
+        assert!(message.starts_with(cys::MSG_TYPING_GUARD), "기존 CLI 폴백 접두 유지: {message}");
+        assert!(message.contains(&format!("[draft_gate:{reason}]")), "초안 거부 사유: {message}");
+    }
+
+    fn d12_assert_cancel_denied(resp: &Value) {
+        assert_eq!(resp["ok"], json!(false), "사람 초안 앞 취소 키는 거부: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD));
+        let message = resp["error"]["message"].as_str().expect("거부 메시지");
+        assert!(message.starts_with(cys::MSG_DRAFT_GATE_CANCEL_KEY), "CancelKey 전용 문구: {message}");
+        assert!(message.contains("[draft_gate:human_draft]"), "초안 거부 사유: {message}");
+        assert!(!message.contains("--queued"), "취소 키에 큐 처방 금지: {message}");
+    }
+
+    /// 의도된 RED 단언 전에 정리해 실패가 다음 검체의 pack 환경·자식 프로세스에 새지 않게 한다.
+    fn d12_cleanup(daemon: &Arc<Daemon>, dir: &std::path::Path) {
+        for s in daemon.surfaces.lock().unwrap().values() {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn d12_direct_send_text_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-text-draft", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_510;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "owner half "), 11);
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let body = "[CYCLE] injected";
+        let denied = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": body, "human": false, "queued": false, "quiet": true,
+        }));
+        let after_direct = d12_input_counts(&target);
+        let queued = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": body, "human": false, "queued": true, "quiet": true,
+        }));
+        let after_queued = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        // 직접 경로가 RED 여도 기존 --queued 폴백 대조는 먼저 실행·검증한다.
+        assert_eq!(queued["ok"], json!(true), "큐 폴백 허용: {queued}");
+        assert_eq!(queued["result"]["queued"], json!(true));
+        assert_eq!(after_queued, after_direct, "큐 등록은 입력 계수를 바꾸지 않는다");
+        assert_eq!(before, (11, 11, 11));
+        d12_assert_denied(&denied, "pending_input");
+        assert_eq!(after_direct, before, "거부된 직접 전송은 미러·전체·사람 계수 불변");
+    }
+
+    #[test]
+    fn d12_direct_send_text_passes_on_empty_line() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-text-empty", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_512;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.last_human_input.lock().unwrap() = None;
+        assert_eq!(d12_input_counts(&target), (0, 0, 0));
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(resp["ok"], json!(true), "빈 입력줄은 직접 전송 허용: {resp}");
+        assert_eq!(after, (5, 5, 0));
+    }
+
+    #[test]
+    fn d12_autoreply_only_line_counts_as_empty() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-autoreply", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_514;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        for _ in 0..10 {
+            v7_send_human(&daemon, target.id, pid, "\u{1b}[I");
+            v7_send_human(&daemon, target.id, pid, "\u{1b}[O");
+        }
+        let before = d12_input_counts(&target);
+        let guard_untouched = target.last_human_input.lock().unwrap().is_none();
+        *target.last_human_input.lock().unwrap() = None;
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert!(guard_untouched, "자동 응답은 타이핑 가드 면제");
+        assert_eq!(before, (0, 0, 0), "C1: 포커스 자동 응답은 초안으로 세지 않는다");
+        assert_eq!(resp["ok"], json!(true), "자동 응답뿐인 입력줄은 직접 전송 허용: {resp}");
+        assert_eq!(after, (5, 5, 0));
+    }
+
+    #[test]
+    fn d12_send_key_return_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-return-draft", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_516;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "abc"), 3);
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        // v7_send_key 는 성공을 단언하므로, 거부 검체만 같은 RPC 를 직접 관측한다.
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "Return", "queued": false,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (3, 3, 3));
+        d12_assert_denied(&resp, "human_draft");
+        assert_eq!(after, (3, 3, 3), "남의 초안을 제출하지 않고 계수 3 유지");
+    }
+
+    /// ★리뷰 major: 제출 게이트는 키 이름이 아니라 생성 바이트로 판정해야 한다.
+    /// `C-m`/`"\r"` 는 CR, `C-j` 는 LF 를 만들어 Return 과 같은 제출 사고를 낸다.
+    #[test]
+    fn d12_submit_key_alias_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-submit-alias", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_550;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["Return", "Enter", "C-m", "C-j", "\r"] {
+            // RED 별칭이 초안을 제출했어도 다음 별칭은 같은 좌석의 사람 초안을 본다.
+            // 보존 여부는 재주입 전 after 로 기록하므로 이 복구가 결함을 숨기지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((key, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "key={key:?}: 모든 별칭에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "key={key:?}: 사람 초안 제출 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_denied(&resp, "human_draft");
+            assert_eq!(after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// ★리뷰 major(덤): 원시 Ctrl-U/Ctrl-C 는 사람 초안을 삭제한다 — 같은 바이트 축으로 막는다.
+    #[test]
+    fn d12_cancel_key_alias_denies_human_draft_but_passes_machine_residue() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-cancel-alias", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_554;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+
+        // 기계 잔여 선정리 대조를 먼저 실행한다: 사람 축 없는 Ctrl-U 는 계속 허용한다.
+        let machine_sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "hello", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": machine_target.id, "key": "C-u", "queued": false,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        let target = v7_pane(&daemon, "worker-3", pid + 2);
+        v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["C-u", "C-c"] {
+            // C-u 의 RED 삭제가 다음 C-c 를 빈 좌석에서 검사하게 만들지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid + 2, "\u{15}");
+                v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((key, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        // 의도한 사람 초안 RED 단언보다 기계 선정리 대조를 먼저 검증한다.
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (5, 5, 0));
+        assert_eq!(machine_clear["ok"], json!(true), "key=C-u: 기계 잔여 선정리 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "key=C-u: 기계 잔여는 정상 삭제");
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "key={key:?}: 모든 취소 키에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "key={key:?}: 사람 초안 삭제 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_cancel_denied(&resp);
+            assert_eq!(after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// ★리뷰 major 2(라운드2): GUI 가 조립한 자동 제출 문안(restartNode cmd+"\n" · launchCmd+"\r")은 human 자기신고와 무관하게 기계 취급 — 사람 초안을 제출하지 못한다.
+    #[test]
+    fn d12_gui_assembled_submit_payload_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-submit", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_560;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for text in ["claude --resume\n", "\r"] {
+            // RED 제출이 초안을 비웠어도 다음 페이로드는 같은 사람 초안에서 검사한다.
+            // 복구 전 after 를 기록해 초안 제출 결함을 숨기지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+                "surface_id": target.id, "text": text, "human": true,
+                "machine_origin": true, "queued": false, "quiet": true,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((text, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (text, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "text={text:?}: 모든 페이로드에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "text={text:?}: GUI 자동 제출 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_denied(&resp, "pending_input");
+            assert_eq!(after, before, "text={text:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// GUI 가 조립한 clear_first 문안도 등록된 에이전트 pane 의 사람 초안을 지우지 못한다.
+    #[test]
+    fn d12_gui_assembled_clear_first_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_562;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "handoff instruction", "human": true,
+            "machine_origin": true, "clear_first": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(false),
+            "GUI clear_first 는 사람 초안 삭제 거부; before={before:?} after={after:?} resp={resp}");
+        d12_assert_denied(&resp, "human_draft");
+        assert_eq!(after, before, "거부된 clear_first 는 사람 초안 계수를 보존한다");
+    }
+
+    /// ★적대 minor(라운드3 · ADV3GUICANCEL): GUI 조립 문안의 0x15/0x03 은 send_key C-u 와 같은 CancelKey 축 — 사람 초안 삭제 거부 · 기계 잔여 선정리 통과.
+    #[test]
+    fn d12_gui_assembled_cancel_byte_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-cancel-byte", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_574;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+
+        // 기계 잔여 대조를 먼저 실행한다: CancelKey 는 send_key C-u 와 같은 사람 축만 검사한다.
+        let machine_sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "foo", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "\u{15}", "human": true,
+            "machine_origin": true, "queued": false, "quiet": true,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        let target = v7_pane(&daemon, "worker-3", pid + 2);
+        v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for text in ["\u{15}", "\u{3}"] {
+            // RED 삭제 뒤에도 다음 바이트를 동일한 사람 초안에서 검사한다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid + 2, "\u{15}");
+                v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+                "surface_id": target.id, "text": text, "human": true,
+                "machine_origin": true, "queued": false, "quiet": true,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((text, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (3, 3, 0), "전제: 기계 잔여 3바이트");
+        assert_eq!(machine_clear["ok"], json!(true), "GUI 조립 C-u 는 기계 잔여 선정리 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "GUI 조립 C-u 는 기계 잔여를 정상 삭제");
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (text, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "text={text:?}: 모든 취소 바이트에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "text={text:?}: GUI 조립 취소 바이트 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_cancel_denied(&resp);
+            assert_eq!(after, before, "text={text:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// 오너가 자기 초안에 경로를 이어 붙이는 클릭(injectRawToPane) — 제출·삭제가 아니므로 게이트 밖.
+    #[test]
+    fn d12_gui_pure_insertion_without_newline_passes_into_own_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-insertion", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_564;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "/tmp/a.txt", "human": true,
+            "machine_origin": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(true), "개행 없는 GUI 경로 삽입은 허용: {resp}");
+        assert_eq!(after, (29, 29, 19), "기계 출처 10바이트만 가산하고 사람 초안 19바이트 유지");
+    }
+
+    /// 실키(sendRaw) 는 machine_origin 이 없다 — 원시 소켓의 human:true 위조는 ACL 층 문제로 남긴다(리뷰 합의).
+    #[test]
+    fn d12_real_human_return_without_machine_origin_passes() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-real-human-return", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_566;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "\r", "human": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(true), "실키 Return 은 자기 초안을 제출할 수 있다: {resp}");
+        assert_eq!(after, (0, 0, 0), "실키 제출 뒤 미제출 계수는 비워진다");
+    }
+
+    /// 검증된 권위 호출자(master/cso pane 자손 — 면제 술어 authoritative_caller_ok 의 (a) 축)의 C-u 는 CancelKey 도 면제된다. 면제의 다른 축 (b) restore-root 자손은 caller_in_restore_root 검체가 덮는다. 분리 호출자·role 없는 pane 은 면제되지 않는다(d12_detached_caller_authoritative_cancel_key_is_still_denied) — 그 거부는 cys.rs run_node_recover 가 rc 79 로 접는다.
+    #[test]
+    fn d12_authoritative_caller_cancel_key_exempt() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_568;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *sender.role.lock().unwrap() = Some("master".into());
+        v7_send_human(&daemon, target.id, pid, "owner half ");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let after = d12_input_counts(&target);
+
+        // 권위 호출이 초안을 비우지 못했어도 대조는 같은 11바이트 초안에서 시작한다.
+        v7_send_human(&daemon, target.id, pid, "\u{15}");
+        v7_send_human(&daemon, target.id, pid, "owner half ");
+        *target.last_human_input.lock().unwrap() = None;
+        let control_before = d12_input_counts(&target);
+        let denied = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u",
+        }));
+        let control_after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (11, 11, 11), "전제: 사람 초안 11바이트");
+        assert_eq!(resp["ok"], json!(true), "검증된 권위 호출자는 CancelKey 도 면제: {resp}");
+        assert_eq!(after, (0, 0, 0), "권위 C-u 는 사람 초안 선정리 허용");
+        assert_eq!(control_before, before, "대조도 같은 좌석의 사람 초안 11바이트");
+        d12_assert_cancel_denied(&denied);
+        assert_eq!(control_after, control_before, "authoritative 없는 C-u 는 사람 초안 보존");
+    }
+
+    /// ★음성 핀(라운드 4 · 감사 minor 2): authoritative 면제는 두 축뿐이다 — (a) 호출자 pane 의 role∈{master,cso} (b) phoenix restore-root 의 살아있는 자손. pane 무귀속 호출자(setsid 부트의 cys boot · GUI start_master 체인 · 데몬 watchdog 의 node-recover 자식)와 비권위/무 role pane 은 authoritative:true 를 실어도 거부된다. 이 거부는 cys.rs run_node_recover 가 RECOVER_REFUSED_TOKEN 으로 접어 rc 79(비파괴) 로 낸다 — 데몬 쪽 면제를 넓히지 않는다(리뷰 비권장).
+    #[test]
+    fn d12_detached_caller_authoritative_cancel_key_is_still_denied() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-detached-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_576;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+
+        // bind_caller 를 거치지 않은 가상 pid 는 pane·restore-root 어느 면제 축에도 속하지 않는다.
+        let detached_pid = 999_990;
+        let detached_surface = resolve_caller_surface(&daemon, detached_pid);
+        let restore_roots_empty = daemon.restore_roots.lock().unwrap().is_empty();
+        let detached_cancel = d12_rpc(&daemon, detached_pid, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let detached_cancel_after = d12_input_counts(&target);
+        let detached_boot = d12_rpc(&daemon, detached_pid, "surface.send_text", json!({
+            "surface_id": target.id, "text": "claude --resume", "human": false,
+            "queued": false, "quiet": true, "authoritative": true,
+        }));
+        let detached_boot_after = d12_input_counts(&target);
+
+        let worker_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let worker_after = d12_input_counts(&target);
+        *sender.role.lock().unwrap() = None;
+        let roleless_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let roleless_after = d12_input_counts(&target);
+
+        // 같은 sender pane 의 role 만 master 로 바꾸면 권위 C-u 선정리가 허용된다.
+        *sender.role.lock().unwrap() = Some("master".into());
+        let master_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let master_after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(detached_surface, None, "전제: 분리 호출자는 pane 무귀속");
+        assert!(restore_roots_empty, "전제: restore-root 면제 창이 비어 있다");
+        for (caller, resp, after) in [
+            ("detached", detached_cancel, detached_cancel_after),
+            ("worker-2", worker_cancel, worker_after),
+            ("no role", roleless_cancel, roleless_after),
+        ] {
+            assert_eq!(resp["ok"], json!(false),
+                "caller={caller}: authoritative 자기신고만으로 초안 삭제 불가; before={before:?} after={after:?} resp={resp}");
+            d12_assert_cancel_denied(&resp);
+            assert_eq!(after, before, "caller={caller}: 거부 뒤 사람 초안 계수 보존");
+        }
+        assert_eq!(detached_boot["ok"], json!(false), "분리 호출자의 기동 send 도 거부: {detached_boot}");
+        d12_assert_denied(&detached_boot, "pending_input");
+        assert_eq!(detached_boot_after, before, "거부된 기동 send 는 사람 초안 계수 보존");
+        assert_eq!(master_cancel["ok"], json!(true), "master role 의 authoritative C-u 는 허용: {master_cancel}");
+        assert_eq!(master_after, (0, 0, 0), "권위 C-u 는 사람 초안을 정상 선정리");
+    }
+
+    /// 제출 별칭 C-m 의 거부에는 실행 가능한 Return --queued 경로를 처방한다.
+    /// Return 자체는 CLI 가 --queued 로 폴백하므로 중복 처방하지 않는다.
+    #[test]
+    fn d12_submit_key_alias_denial_prescribes_return_queued() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-submit-alias-message", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_570;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["C-m", "Return"] {
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            observations.push((key, resp, probe_before, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (key, resp, probe_before, after) in &observations {
+            assert_eq!(*probe_before, before, "key={key:?}: 동일한 사람 초안에서 거부 검사");
+            d12_assert_denied(resp, "human_draft");
+            assert_eq!(*after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+        // RED 처방 단언 전에 정상 Return 의 불필요한 처방 부재를 먼저 확인한다.
+        let return_message = observations[1].1["error"]["message"].as_str().expect("Return 거부 메시지");
+        assert!(!return_message.contains("Return --queued"),
+            "Return 은 CLI 자체 폴백을 사용하므로 추가 처방 불요: {return_message}");
+        let alias_message = observations[0].1["error"]["message"].as_str().expect("C-m 거부 메시지");
+        assert!(alias_message.contains("Return --queued"),
+            "C-m 거부는 사용 가능한 Return --queued 를 처방해야 한다: {alias_message}");
+    }
+
+    /// C-u 는 큐에 실을 수 없으므로 거부 메시지가 존재하지 않는 --queued 경로를 처방하면 안 된다.
+    #[test]
+    fn d12_cancel_key_denial_does_not_prescribe_queued() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-cancel-message", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_572;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "queued": false,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(false), "C-u 는 사람 초안 삭제 거부: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD), "기존 거부 코드 유지: {resp}");
+        assert_eq!(after, before, "거부 뒤 사람 초안 계수 보존");
+        let message = resp["error"]["message"].as_str().expect("C-u 거부 메시지");
+        assert!(message.contains("[draft_gate:human_draft]"), "사람 초안 거부 사유 유지: {message}");
+        assert!(!message.contains("--queued"), "C-u 는 큐에 실을 수 없어 --queued 처방 금지: {message}");
+    }
+
+    /// 이름 축 잔재가 없는지: 취소·탐색 키는 사람 초안이 있어도 계속 통과한다(기존 계약).
+    /// 지금 HEAD 에서 PASS 해야 하는 과잉 차단 방지 대조다.
+    #[test]
+    fn d12_navigation_keys_stay_ungated_with_human_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-navigation", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_558;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["Up", "Escape", "Tab"] {
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            observations.push((key, resp));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp) in observations {
+            assert_eq!(resp["ok"], json!(true), "key={key:?}: 사람 초안이 있어도 탐색 허용: {resp}");
+        }
+    }
+
+    #[test]
+    fn d12_send_key_return_passes_after_own_direct_send() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-return-own", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_518;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.last_human_input.lock().unwrap() = None;
+        let sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after_send = d12_input_counts(&target);
+        let after_return = v7_send_key(&daemon, target.id, pid + 1, "Return");
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(sent["ok"], json!(true), "자기 본문 전송 성공: {sent}");
+        assert_eq!(after_send, (5, 5, 0), "기계 본문은 사람 초안이 아니다");
+        assert_eq!(after_return, 0, "자기 본문의 Return 제출은 허용");
+        assert_eq!(after, (0, 0, 0));
+    }
+
+    /// inject_text·launch-agent 의 authoritative 디렉티브 주입은 master 호출자에게 의도된 면제다.
+    #[test]
+    fn d12_authoritative_caller_exempt() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-authoritative", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_520;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *sender.role.lock().unwrap() = Some("master".into());
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "owner half "), 11);
+        *target.last_human_input.lock().unwrap() = None;
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "directive", "human": false,
+            "queued": false, "quiet": true, "authoritative": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(resp["ok"], json!(true), "검증된 권위 호출자는 초안 게이트 면제: {resp}");
+        assert_eq!(after, (20, 20, 11));
+    }
+
+    #[test]
+    fn d12_screen_axis_denies_text_when_count_zero_but_cursor_row_has_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-screen", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_522;
+        let _sender = v7_pane(&daemon, "worker-2", pid);
+        let mut observations = Vec::new();
+        for (offset, line) in [(1, "❯ "), (2, "❯ owner draft")] {
+            // 각각 새 pane: 직전 send 의 비동기 PTY 에코가 다음 화면 픽스처를 덮지 않는다.
+            let target = v7_pane(&daemon, "worker-1", pid + offset);
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+            {
+                // governance::tests::paint_screen 과 같은 파서 경로, 커서는 그 행 본문 끝.
+                let mut parser = target.parser.lock().unwrap();
+                parser.process(b"\x1b[2J\x1b[H");
+                parser.process(line.as_bytes());
+                parser.process(format!("\x1b[1;{}H", line.chars().count() + 1).as_bytes());
+            }
+            let before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid, "surface.send_text", json!({
+                "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+            }));
+            observations.push((resp, before, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        let (empty, empty_before, empty_after) = &observations[0];
+        assert_eq!(*empty_before, (0, 0, 0));
+        assert_eq!(empty["ok"], json!(true), "빈 마커 줄 대조는 통과: {empty}");
+        assert_eq!(*empty_after, (5, 5, 0));
+        let (draft, draft_before, draft_after) = &observations[1];
+        assert_eq!(*draft_before, (0, 0, 0), "계수와 독립적인 화면 축 검체");
+        d12_assert_denied(draft, "screen_occupied");
+        assert_eq!(*draft_after, (0, 0, 0), "화면 초안 거부도 계수 불변");
+    }
+
+    #[test]
+    fn d12_denials_publish_once_per_request_including_clear_first_and_enter() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-events", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_530;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner draft");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for (method, extra, kind, reason) in [
+            ("surface.send_text", json!({"text": "hello"}), "text", "pending_input"),
+            ("surface.send_text", json!({"text": "hello", "clear_first": true}), "clear_first", "human_draft"),
+            ("surface.send_key", json!({"key": "Return"}), "submit_key", "human_draft"),
+            ("surface.send_key", json!({"key": "Enter"}), "submit_key", "human_draft"),
+        ] {
+            let mut params = json!({"surface_id": target.id, "quiet": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let seq = daemon.bus.replay_after(0).last().unwrap()["seq"].as_u64().unwrap();
+            let response = d12_rpc(&daemon, pid + 1, method, params);
+            let events: Vec<_> = daemon.bus.replay_after(seq).into_iter()
+                .filter(|e| e["name"] == "queue.draft_gate_denied").collect();
+            observations.push((response, events, kind, reason, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        for (response, events, kind, reason, after) in observations {
+            d12_assert_denied(&response, reason);
+            assert_eq!(after, before, "거부는 사람 초안을 그대로 보존한다");
+            assert_eq!(events.len(), 1, "요청당 거부 이벤트는 정확히 1건");
+            assert_eq!(events[0]["category"], json!("queue"));
+            assert_eq!(events[0]["surface_id"], json!(target.id));
+            assert_eq!(events[0]["payload"], json!({
+                "surface_ref": cys::surface_ref(target.id),
+                "kind": kind,
+                "reason": reason,
+                "pending_input_bytes": 11,
+                "pending_input_human_bytes": 11,
+                "from": cys::surface_ref(sender.id),
+            }));
+        }
+    }
+
+    /// 비권위 clear_first 는 기계 잔여를 지우고 제출하되 사람 초안은 보존한다.
+    #[test]
+    fn d12_clear_first_passes_machine_residue_but_denies_human_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_540;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        let human_target = v7_pane(&daemon, "worker-3", pid + 2);
+        for target in [&machine_target, &human_target] {
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+        }
+
+        // (a) 기계 잔여: 별도 pid 의 비권위 clear_first 가 지우고 원자 제출한다.
+        let machine_sent = d12_rpc(&daemon, pid, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "hello", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "replace", "clear_first": true,
+            "human": false, "queued": false, "quiet": true,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        // (b) 독립 pane 의 사람 초안: (a) 의 RED 잔여가 이 시나리오에 섞이지 않는다.
+        let human_sent = v7_send_human(&daemon, human_target.id, pid + 2, "owner draft");
+        *human_target.last_human_input.lock().unwrap() = None;
+        let human_before = d12_input_counts(&human_target);
+        let human_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": human_target.id, "text": "replace", "clear_first": true,
+            "human": false, "queued": false, "quiet": true,
+        }));
+        let human_after = d12_input_counts(&human_target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (5, 5, 0));
+        assert_eq!(machine_clear["ok"], json!(true), "기계 잔여는 clear_first 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "원자 Inject 는 미제출 입력을 비운다");
+        assert_eq!(human_sent, 11);
+        assert_eq!(human_before, (11, 11, 11));
+        d12_assert_denied(&human_clear, "human_draft");
+        assert_eq!(human_after, (11, 11, 11), "거부된 clear_first 는 사람 초안 계수를 보존한다");
+    }
+
     /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
     /// **전 경우**를 고정한다. 판정이 두 층으로 갈렸으므로 두 층을 함께 박는다 —
     ///   · 핸들러층 `submit_gap_for_key`: '이 키에 간격을 거는가' (잔여는 재지 않는다)
@@ -16677,6 +17803,98 @@ mod tests {
         assert_eq!(after, 1, "이관 0건이면 이벤트도 없다");
     }
 
+    /// ★(0.14.39 · WP-C-input) 입력 진단 필드는 기존 큐 행에 가산된다.
+    #[test]
+    fn queue_list_exposes_pending_input_bytes_additive() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("pending-input-list", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_480_u32;
+        let s = v7_pane(&daemon, "worker", pid);
+        assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
+        let Reply::Single(enqueued) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": s.id, "text": "queued body", "queued": true}),
+            },
+            None,
+        ) else {
+            panic!("expected single enqueue reply");
+        };
+        assert_eq!(enqueued["ok"], json!(true), "enqueue 실패: {enqueued}");
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "queue.list".into(),
+                params: json!({"surface_id": s.id}),
+            },
+            None,
+        ) else {
+            panic!("expected single queue.list reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "queue.list 실패: {resp}");
+        let entries = resp["result"]["entries"].as_array().expect("entries 배열");
+        assert_eq!(entries.len(), 1, "enqueue한 활성 행이 있어야 한다");
+        let row = &entries[0];
+        assert_eq!(row["surface_id"], json!(s.id));
+        assert_eq!(row["pending_input_bytes"], json!(3));
+        assert_eq!(row["pending_input_human_bytes"], json!(3));
+        assert_eq!(row["input_paste_open"], json!(false));
+        for key in ["blocked_by", "preview", "id"] {
+            assert!(row.get(key).is_some(), "기존 키 {key} 결손");
+        }
+        assert_eq!(row["preview"], json!("queued body"));
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn org_status_and_surface_list_expose_pending_input_bytes() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("pending-input-status", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_481_u32;
+        let s = v7_pane(&daemon, "worker", pid);
+        assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
+        let mut observed = Vec::new();
+        for method in ["org.status", "surface.list"] {
+            let Reply::Single(resp) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: method.into(), params: json!({}) },
+                None,
+            ) else {
+                panic!("expected single reply for {method}");
+            };
+            assert_eq!(resp["ok"], json!(true), "{method} 실패: {resp}");
+            let row = resp["result"]["surfaces"]
+                .as_array()
+                .expect("surfaces 배열")
+                .iter()
+                .find(|row| row["surface_id"] == json!(s.id))
+                .expect("해당 surface 항목");
+            let values: Vec<Value> = ["pending_input_bytes", "pending_input_human_bytes", "input_paste_open"]
+                .iter()
+                .map(|key| row.get(*key).unwrap_or_else(|| panic!("{method} {key} 결손")).clone())
+                .collect();
+            assert_eq!(values, vec![json!(3), json!(3), json!(false)], "{method}");
+            observed.push(values);
+        }
+        assert_eq!(observed[0], observed[1], "두 RPC의 키·의미 동형성");
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★G1(W2-C) 비타입 감사 지점 ④ 핀 — queue.list의 restored 행도 라이브 행과 동일한
     /// 신규 열(id/seq/enqueued_at/age_secs/from/origin)을 노출한다. restored_queue는
     /// serde_json::Value 경로라 **컴파일러가 결손을 못 잡는다** — 이 핀이 유일한 강제다.
@@ -16700,11 +17918,16 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            dir.join("queue-expired.json"),
+            r#"[{"id":"qx.2","surface_id":13,"role":"w2c-expired","text":"만료 복원 본문","expired_at":1.0,"ttl_secs":10}]"#,
+        )
+        .unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
         let req = Request {
             id: json!(1),
             method: "queue.list".into(),
-            params: json!({}),
+            params: json!({"include_expired": true}),
         };
         let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
@@ -16727,6 +17950,12 @@ mod tests {
         assert!((49..=120).contains(&age), "age_secs ≈ 50 (실측 {age})");
         assert_eq!(row["from"], json!("surface:2"));
         assert_eq!(row["origin"], json!("send"));
+        assert_eq!(entries.len(), 2, "활성·만료 복원 행 모두 노출");
+        for row in entries {
+            for key in ["pending_input_bytes", "pending_input_human_bytes", "input_paste_open"] {
+                assert_eq!(row.get(key), Some(&Value::Null), "restored 행 {key}는 명시적 null");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19379,6 +20608,8 @@ mod tests {
         let sid = make_surface(&daemon, Some("worker"));
         let s = daemon.get_surface(sid).expect("surface 조회");
         let active = daemon.next_queue_entry("활성".into(), None, "send");
+        s.apply_pending_input(b"abc", crate::governance::InputOrigin::Human);
+        s.pending_input.lock().unwrap().in_paste = true;
         let mut expired = daemon.next_queue_entry("만료".into(), None, "send");
         expired.expired_at = Some(crate::state::now_epoch());
         expired.ttl_secs = Some(10);
@@ -19412,6 +20643,11 @@ mod tests {
                 "활성 행에 만료 표식 금지"
             );
             assert_eq!(live["index"], json!(0), "활성 큐 인덱스 유지");
+            for row in rows {
+                assert_eq!(row["pending_input_bytes"], json!(3));
+                assert_eq!(row["pending_input_human_bytes"], json!(3));
+                assert_eq!(row["input_paste_open"], json!(true));
+            }
             if expected_len == 2 {
                 let row = rows
                     .iter()
