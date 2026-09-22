@@ -13037,6 +13037,220 @@ mod tests {
         }
     }
 
+    /// ★리뷰 major 2(라운드2): GUI 가 조립한 자동 제출 문안(restartNode cmd+"\n" · launchCmd+"\r")은 human 자기신고와 무관하게 기계 취급 — 사람 초안을 제출하지 못한다.
+    #[test]
+    fn d12_gui_assembled_submit_payload_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-submit", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_560;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for text in ["claude --resume\n", "\r"] {
+            // RED 제출이 초안을 비웠어도 다음 페이로드는 같은 사람 초안에서 검사한다.
+            // 복구 전 after 를 기록해 초안 제출 결함을 숨기지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+                "surface_id": target.id, "text": text, "human": true,
+                "machine_origin": true, "queued": false, "quiet": true,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((text, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (text, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "text={text:?}: 모든 페이로드에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "text={text:?}: GUI 자동 제출 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_denied(&resp, "pending_input");
+            assert_eq!(after, before, "text={text:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// GUI 가 조립한 clear_first 문안도 등록된 에이전트 pane 의 사람 초안을 지우지 못한다.
+    #[test]
+    fn d12_gui_assembled_clear_first_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_562;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "handoff instruction", "human": true,
+            "machine_origin": true, "clear_first": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(false),
+            "GUI clear_first 는 사람 초안 삭제 거부; before={before:?} after={after:?} resp={resp}");
+        d12_assert_denied(&resp, "human_draft");
+        assert_eq!(after, before, "거부된 clear_first 는 사람 초안 계수를 보존한다");
+    }
+
+    /// 오너가 자기 초안에 경로를 이어 붙이는 클릭(injectRawToPane) — 제출·삭제가 아니므로 게이트 밖.
+    #[test]
+    fn d12_gui_pure_insertion_without_newline_passes_into_own_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-insertion", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_564;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "/tmp/a.txt", "human": true,
+            "machine_origin": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(true), "개행 없는 GUI 경로 삽입은 허용: {resp}");
+        assert_eq!(after, (29, 29, 19), "기계 출처 10바이트만 가산하고 사람 초안 19바이트 유지");
+    }
+
+    /// 실키(sendRaw) 는 machine_origin 이 없다 — 원시 소켓의 human:true 위조는 ACL 층 문제로 남긴다(리뷰 합의).
+    #[test]
+    fn d12_real_human_return_without_machine_origin_passes() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-real-human-return", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_566;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "\r", "human": true, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(true), "실키 Return 은 자기 초안을 제출할 수 있다: {resp}");
+        assert_eq!(after, (0, 0, 0), "실키 제출 뒤 미제출 계수는 비워진다");
+    }
+
+    /// `cys node-recover`(cys.rs:17494)의 선정리 C-u 가 이 면제를 쓴다 — boot_agent_on_surface 의 기동 send_text/Return(cys.rs:12426·12430)과 같은 축.
+    /// 면제가 없으면 사람 초안 앞에서 rc 1 → run_boot escalate_reclaim(파괴) 로 흐른다(리뷰 major 1).
+    #[test]
+    fn d12_authoritative_caller_cancel_key_exempt() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_568;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *sender.role.lock().unwrap() = Some("master".into());
+        v7_send_human(&daemon, target.id, pid, "owner half ");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let after = d12_input_counts(&target);
+
+        // 권위 호출이 초안을 비우지 못했어도 대조는 같은 11바이트 초안에서 시작한다.
+        v7_send_human(&daemon, target.id, pid, "\u{15}");
+        v7_send_human(&daemon, target.id, pid, "owner half ");
+        *target.last_human_input.lock().unwrap() = None;
+        let control_before = d12_input_counts(&target);
+        let denied = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u",
+        }));
+        let control_after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (11, 11, 11), "전제: 사람 초안 11바이트");
+        assert_eq!(resp["ok"], json!(true), "검증된 권위 호출자는 CancelKey 도 면제: {resp}");
+        assert_eq!(after, (0, 0, 0), "권위 C-u 는 사람 초안 선정리 허용");
+        assert_eq!(control_before, before, "대조도 같은 좌석의 사람 초안 11바이트");
+        d12_assert_denied(&denied, "human_draft");
+        assert_eq!(control_after, control_before, "authoritative 없는 C-u 는 사람 초안 보존");
+    }
+
+    /// 제출 별칭 C-m 의 거부에는 실행 가능한 Return --queued 경로를 처방한다.
+    /// Return 자체는 CLI 가 --queued 로 폴백하므로 중복 처방하지 않는다.
+    #[test]
+    fn d12_submit_key_alias_denial_prescribes_return_queued() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-submit-alias-message", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_570;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["C-m", "Return"] {
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            observations.push((key, resp, probe_before, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (key, resp, probe_before, after) in &observations {
+            assert_eq!(*probe_before, before, "key={key:?}: 동일한 사람 초안에서 거부 검사");
+            d12_assert_denied(resp, "human_draft");
+            assert_eq!(*after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+        // RED 처방 단언 전에 정상 Return 의 불필요한 처방 부재를 먼저 확인한다.
+        let return_message = observations[1].1["error"]["message"].as_str().expect("Return 거부 메시지");
+        assert!(!return_message.contains("Return --queued"),
+            "Return 은 CLI 자체 폴백을 사용하므로 추가 처방 불요: {return_message}");
+        let alias_message = observations[0].1["error"]["message"].as_str().expect("C-m 거부 메시지");
+        assert!(alias_message.contains("Return --queued"),
+            "C-m 거부는 사용 가능한 Return --queued 를 처방해야 한다: {alias_message}");
+    }
+
+    /// C-u 는 큐에 실을 수 없으므로 거부 메시지가 존재하지 않는 --queued 경로를 처방하면 안 된다.
+    #[test]
+    fn d12_cancel_key_denial_does_not_prescribe_queued() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-cancel-message", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_572;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "queued": false,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(resp["ok"], json!(false), "C-u 는 사람 초안 삭제 거부: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD), "기존 거부 코드 유지: {resp}");
+        assert_eq!(after, before, "거부 뒤 사람 초안 계수 보존");
+        let message = resp["error"]["message"].as_str().expect("C-u 거부 메시지");
+        assert!(message.contains("[draft_gate:human_draft]"), "사람 초안 거부 사유 유지: {message}");
+        assert!(!message.contains("--queued"), "C-u 는 큐에 실을 수 없어 --queued 처방 금지: {message}");
+    }
+
     /// 이름 축 잔재가 없는지: 취소·탐색 키는 사람 초안이 있어도 계속 통과한다(기존 계약).
     /// 지금 HEAD 에서 PASS 해야 하는 과잉 차단 방지 대조다.
     #[test]

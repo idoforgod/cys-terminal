@@ -4993,6 +4993,13 @@ pub(crate) fn draft_gate_verdict(
     }
 }
 
+/// D-12 화면 축을 쓰는 kind 인가 — `draft_gate` 가 어댑터 로드·프롬프트 관측을 생략할지 정한다(순수).
+pub(crate) fn draft_gate_uses_screen_axis(kind: DirectSendKind) -> bool {
+    // RED 스텁: GREEN 에서 CancelKey 를 false 로 바꾸고 draft_gate 에 배선한다.
+    let _ = kind;
+    true
+}
+
 /// D-12 IO 래퍼 — 전체 계수는 미러, 사람 계수는 상태 Mutex 에서 읽는다.
 /// 화면은 마커 좌석의 observe_prompt 커서행이며 마커가 없으면 None/비선택기다.
 /// 계수만으로 거부가 확정되면 화면·승인 관측을 생략한다. 승인 축은
@@ -11438,6 +11445,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn d12_cancel_key_skips_screen_axis_before_adapter_load() {
+        assert!(
+            !super::draft_gate_uses_screen_axis(DirectSendKind::CancelKey),
+            "CancelKey 는 화면 축을 쓰지 않으므로 draft_gate 가 agents.json 로드·observe_prompt 전에 조기 반환해야 한다(감사 minor · 부하)"
+        );
+        for kind in [DirectSendKind::Text, DirectSendKind::SubmitKey, DirectSendKind::ClearFirst] {
+            assert!(super::draft_gate_uses_screen_axis(kind), "{kind:?} 는 화면 축을 쓴다");
+        }
+    }
+
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
     /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
     #[test]
@@ -11897,6 +11915,42 @@ mod tests {
 
         let same_chunk = v2_run(&[(b"ab\x1b\r", InputOrigin::Human, 0)]);
         assert_eq!(same_chunk.count, 4, "같은 청크의 ESC+CR 은 Meta-Enter: {same_chunk:?}");
+    }
+
+    /// 리뷰 minor: 봉투 안에서 이월한 ESC 뒤 TTL 이 만료되면 다음 CR 은 제출이다.
+    #[test]
+    fn v2_carried_escape_inside_paste_then_ttl_expiry_then_cr_submits() {
+        let now = std::time::Instant::now();
+        let st = PendingInputState {
+            count: 3,
+            human: 3,
+            in_paste: true,
+            paste_opened_at: Some(now),
+            tail: vec![0x1b],
+        };
+        // TTL 만료 뒤 CR: 봉투가 먼저 닫히고(하한 2 복귀) 이월 ESC + CR 은 제출이다.
+        let expired = super::pending_input_step(
+            &st,
+            b"\r",
+            InputOrigin::Human,
+            now + std::time::Duration::from_secs(super::PASTE_OPEN_TTL_SECS),
+        );
+        assert_eq!(
+            (expired.count, expired.human),
+            (0, 0),
+            "TTL 만료로 봉투가 닫힌 뒤 이월 ESC + CR 은 제출: {expired:?}"
+        );
+        assert!(!expired.in_paste, "TTL 만료 뒤 봉투는 닫혀야 한다: {expired:?}");
+        assert!(expired.tail.is_empty(), "제출 뒤 이월 바이트가 없어야 한다: {expired:?}");
+
+        // 대조: TTL 안이면 봉투 안이라 ESC·CR 모두 가산(3+2=5) · in_paste 유지.
+        let inside = super::pending_input_step(&st, b"\r", InputOrigin::Human, now);
+        assert_eq!(
+            (inside.count, inside.human),
+            (5, 5),
+            "TTL 안의 봉투에서는 이월 ESC·CR 모두 본문으로 가산: {inside:?}"
+        );
+        assert!(inside.in_paste, "TTL 안에서는 봉투를 유지해야 한다: {inside:?}");
     }
 
     /// 리뷰 minor(RED): CLOSE 표식이 ESC 경계에서 잘려 와도 봉투는 닫혀야 한다.
