@@ -147,6 +147,7 @@ SERVER_EXCLUDE_PATTERNS = [
     r"tsserver", r"copilot",
 ]
 NODE_PATTERNS = [r"claude(\s|$)", r"\bagy\b", r"\bcodex\b", r"\bgemini\b"]
+NODE_OWNERS = frozenset(("claude", "agy", "codex", "gemini"))  # cysd·serena 는 함대지만 노드는 아니다.
 # ★2026-07-11 CSO(CEO B승인): codex 노드 1개 = node wrapper + darwin-arm64 vendor native 2프로세스가
 # 둘 다 \bcodex\b 매칭 → 이중계수. vendor native를 제외해 codex는 wrapper 1개만 계수(계수 인플레이션 차단).
 NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
@@ -188,13 +189,11 @@ NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
 #   그래서 이 축은 **자기 축 전용 소유권 규칙**을 갖는다(`_fleet_owner`): 명령줄의 아무 토큰이 아니라
 #   **실행 주체**(argv0, 인터프리터/런처면 그것이 실행하는 스크립트)의 basename·경로 세그먼트만 본다.
 #   자기 제외도 명령줄이 아니라 **PID**(`os.getpid()`)로 한다.
-#   ★nodes 축은 **무수정**이다(정본: 기존 오류·계수 경로 현행 유지) — 두 축이 다른 모집단을 세는 것은
-#     의도된 분기이고, 그 사실은 노트(§패턴 정밀도)와 아래 상수 주석에 남긴다. 계수 축(nodes)의
-#     과대계상은 종전부터 `hard-overcount` 밸브가 받아 주지만, CPU 축에는 그 밸브가 없어서
-#     오탐 하나가 곧바로 조직 기동 거부다 — 정밀도 요구가 애초에 다르다.
-#   ★틀리는 방향: 이 정밀화는 **과소계상**(모르는 실행 형상을 함대로 안 셈) 쪽으로 틀릴 수 있다.
-#     그 방향의 귀결은 '차단하지 않음' = 0.14.31 이전과 동일한 상태다. 반대로 과대계상의 귀결은
-#     조직 기동 거부(B2 재발)라 되돌리기가 훨씬 비싸다.
+#   ★D-11(2026-09-21): nodes 무수정 결정을 뒤집는다 — `_fleet_owner ∈ NODE_OWNERS`
+#     ∧ ¬NODE_EXCLUDE ∧ ¬앱 번들 argv0 로 계수하며, 명령줄의 javis_resource_gate 자기제외는 유지한다.
+#     F2 픽스처 21줄은 21→10, negatives/대조 13건으로 핀한다. servers 도 앱 번들 argv0 를 제외한다.
+#     `hard-overcount` 밸브는 유지한다. CPU 의 `_fleet_owner` 순서(cysd 정확 매칭 우선)는 불변이다.
+#   ★틀리는 방향: 모르는 실행 형상의 과소계상 = 차단 안 함 = 종전 상태다. 과대계상은 B2 재발이다.
 # ★하위호환 보존용(이 축은 **더 이상 이 패턴으로 판정하지 않는다** — `_fleet_owner` 가 판정한다).
 #   외부 임포터가 있을 수 있어 상수는 남기되, 여기 이름을 고쳐도 축의 판정은 바뀌지 않는다.
 FLEET_CPU_PATTERNS = NODE_PATTERNS + [r"(^|/)cysd(\s|$)", r"\bserena\b"]
@@ -738,6 +737,34 @@ def _count_matching(lines, patterns, exclude_patterns=()):
         if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
             n += 1
     return n
+
+
+def _is_app_bundle_argv0(cmd):
+    """첫 토큰이 macOS 앱 번들 안의 실행 파일인지 판정한다(순수 함수)."""
+    parts = (cmd or "").split(None, 1)
+    return bool(parts and _APP_BUNDLE_MARKER in parts[0].lower())
+
+
+def _node_procs(lines):
+    """노드 소유자 4종의 (pid, cmd) 목록 — 자기·중복 native·앱 번들은 제외한다."""
+    excl = [re.compile(p, re.IGNORECASE) for p in NODE_EXCLUDE_PATTERNS]
+    out = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        if "javis_resource_gate" in cmd:
+            continue
+        if (_fleet_owner(cmd) in NODE_OWNERS
+                and not any(r.search(cmd) for r in excl)
+                and not _is_app_bundle_argv0(cmd)):
+            out.append((pid, cmd))
+    return out
+
+
+def _count_nodes(lines):
+    return len(_node_procs(lines))
 
 
 # ── ★WP-7 N: 함대 CPU 측정(별 ps 스폰 · 기존 `_ps_lines` 오류 경로 무접촉) ──
@@ -2070,7 +2097,7 @@ def measure(a):
         errors.append("nodes(ps)")
         nodes = None
     else:
-        nodes = _count_matching(lines, NODE_PATTERNS, NODE_EXCLUDE_PATTERNS)
+        nodes = _count_nodes(lines)
 
     if a.load_override is not None:
         load1 = a.load_override
@@ -2474,11 +2501,11 @@ def cmd_check(a):
 
 
 def cmd_classify(a):
-    """stdin의 ps 형식 줄들을 패턴으로 분류(테스트·디버그용 결정론 경로)."""
+    """stdin의 ps 형식 줄들을 노드·서버 규칙으로 분류(테스트·디버그용 결정론 경로)."""
     lines = sys.stdin.read().splitlines()
     result = {
-        "servers": _count_matching(lines, SERVER_PATTERNS, SERVER_EXCLUDE_PATTERNS),
-        "nodes": _count_matching(lines, NODE_PATTERNS, NODE_EXCLUDE_PATTERNS),
+        "servers": len(_server_procs(lines, collapse=False)),
+        "nodes": _count_nodes(lines),
     }
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_ALLOW
@@ -2486,7 +2513,7 @@ def cmd_classify(a):
 
 # ── ★G12(cokacdir 성찰 2026-07-04): hard_block '판정'과 분리돼 있던 '집행' ──
 def _server_procs(lines=None, collapse=True):
-    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함).
+    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — 제외 패턴·앱 번들 argv0 는 배제한다.
 
     ★A3-b(2026-09-03 dept-1 실측): collapse=True 면 **체인 루트만** 남긴다 — 매칭된 프로세스의
       조상이 이미 매칭돼 있으면 그것은 같은 논리 서버의 자식이다(`cys run -- npm exec vite` →
@@ -2501,7 +2528,7 @@ def _server_procs(lines=None, collapse=True):
         if len(parts) != 2 or not parts[0].isdigit():
             continue
         pid, cmd = int(parts[0]), parts[1]
-        if "javis_resource_gate" in cmd:
+        if "javis_resource_gate" in cmd or _is_app_bundle_argv0(cmd):
             continue
         if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
             out.append((pid, cmd))
@@ -2922,6 +2949,13 @@ def _self_test_body(fails):
 
     import io
     import contextlib
+    # ★D-11: nodes 는 함대 소유권에 앱 번들 제외·기존 자기제외를 함께 적용한다(밀폐).
+    chk(_count_nodes(["1 /Applications/ChatGPT.app/Contents/Resources/codex app-server"]) == 0,
+        "D-11: 앱 번들 codex 가 노드에 계상됨")
+    chk(_count_nodes(["2 /Users/x/.local/share/claude/versions/2.1.261 --resume"]) == 1,
+        "D-11: 버전 경로 claude 가 노드에서 누락됨")
+    chk(_count_nodes(["3 claude javis_resource_gate check"]) == 0,
+        "D-11: 노드의 명령줄 자기제외 회귀")
     # ★A3: 모든 check 호출에 고정 로스터를 주입 — 이 머신의 라이브 부서 소켓(dept-1 등)이 판정에
     #   스며들면 self-test 가 비결정론이 된다(nodes hard 가 좌석 수에 따라 18·21·30… 으로 움직임).
     # ★WP-7 N 동형 밀폐: 신설 CPU 축·부트 유예도 라이브(이 기계의 ps·boot-epoch mtime)를 읽으면
@@ -3949,6 +3983,7 @@ def _self_test_body(fails):
         return 1
     print("javis_resource_gate self-test OK — A13 타입드 exit 9종"
           "(EX_USAGE 3·정상 2·EX_SOFTWARE 2·계약 채널 1·충돌 분리 1)"
+          " + D-11 nodes 3종(앱 번들 제외·버전 경로·자기제외)"
           " + B1 --require-context 5종(미제공 soft·trips 비오염·context 제공 allow/hard·"
           "무플래그 기본 동작 불변)"
           " + T9 편성 예산 축 6종(예산 내 allow·초과 hard·env/플래그 단독 무동작·"
