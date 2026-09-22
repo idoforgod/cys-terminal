@@ -1265,7 +1265,7 @@ fn cycle_quiet_timeout_diagnostic(
     if saw_read_text && !saw_quiet_secs {
         format!(" · 데몬이 quiet_secs 를 보고하지 않는다(구 데몬) — 데몬을 갱신하라(`cys daemon restart` 또는 팩 업그레이드) [diag={CYCLE_QUIET_UNREPORTED_DIAG}]")
     } else if saw_gate_or_modal {
-        format!(" · 대기 창 내내 화면 전경에 첫기동 관문·모달이 서 있었다(턴 중이 아니다) — 사람이 그 관문을 1회 통과시켜야 한다 [diag={CYCLE_GATE_MODAL_DIAG}]")
+        format!(" · 대기 창에서 첫기동 관문·모달 전경을 관측했다(한 프레임이라도 관측되면 선다) — 사람이 그 관문을 1회 통과시켜야 한다 [diag={CYCLE_GATE_MODAL_DIAG}]")
     } else {
         String::new()
     }
@@ -17782,7 +17782,7 @@ fn cycle_spec_or_explicit_clear(
 ///   앵커 절단은 공백 경로와 뒤따르는 인자를 **동시에** 가른다. `$` 배제는 그 경로 토큰에만 건다.
 fn registered_pack_session_start_hook(command: &str) -> Option<std::path::PathBuf> {
     const ANCHOR: &str = "hooks/session-start.sh";
-    // ① 앞머리의 `K=V` 대입과 인터프리터만 벗긴다(첫 비인터프리터 토큰에서 멈춘다).
+    // ① 앞머리의 `K=V` 대입·인터프리터·플래그를 벗긴다(첫 경로 토큰에서 멈춘다).
     let mut rest = command.trim();
     while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
         let bare = head.trim_matches(['"', '\'']);
@@ -17791,7 +17791,8 @@ fn registered_pack_session_start_hook(command: &str) -> Option<std::path::PathBu
         let env_assign = bare.split_once('=').is_some_and(|(key, _)| {
             !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         });
-        if env_assign || matches!(base, "env" | "sh" | "bash" | "dash" | "zsh") {
+        // 플래그 뒤에도 rest[..end] 전체가 실재 파일이고 형제 _lib.sh 가 있어야 인정한다.
+        if env_assign || bare.starts_with('-') || matches!(base, "env" | "sh" | "bash" | "dash" | "zsh") {
             rest = tail.trim_start();
             continue;
         }
@@ -32530,6 +32531,9 @@ mod tests {
         for command in [
             format!("sh {}", script.display()),
             format!("bash \"{}\"", script.display()),
+            format!("sh --norc {}", script.display()),
+            format!("bash -x \"{}\"", script.display()),
+            format!("env CYS_PACK_DIR=/x bash -x {}", script.display()),
             format!("sh {} \"$CLAUDE_PROJECT_DIR\"", script.display()),
             format!("bash \"{}\" --lane dept", script.display()),
             format!("/bin/sh {}", script.display()),
@@ -32545,6 +32549,8 @@ mod tests {
         }
         for command in [
             "sh $HOME/pack/hooks/session-start.sh".to_string(),
+            "sh -x".to_string(),
+            format!("sh --norc {}", other.display()),
             format!("sh {}", other.display()),
             format!("sh {}", without_lib.display()),
             String::new(),
@@ -33060,6 +33066,8 @@ mod tests {
         let diagnostic = cycle_quiet_timeout_diagnostic(true, true, true);
         assert!(diagnostic.contains("[diag=gate_or_modal_foreground]"), "{consequence}: {diagnostic}");
         assert!(!diagnostic.contains("[diag=quiet_secs_unreported]"), "{consequence}: {diagnostic}");
+        assert!(diagnostic.contains("한 프레임이라도 관측되면 선다"), "OR 래치의 관측 범위를 밝혀야 한다: {diagnostic}");
+        assert!(!diagnostic.contains("내내"), "OR 래치를 대기 창 전체의 전경으로 과장하면 안 된다: {diagnostic}");
         let old_daemon = cycle_quiet_timeout_diagnostic(true, false, true);
         assert!(old_daemon.contains("[diag=quiet_secs_unreported]"), "{consequence}: 구 데몬 우선순위 훼손: {old_daemon}");
         assert_eq!(cycle_quiet_timeout_diagnostic(true, true, false), "", "{consequence}");
@@ -33101,6 +33109,21 @@ mod tests {
             .and_then(|literal| literal.strip_suffix("\";"))
             .expect("러스트 CYCLE_QUIET_UNREPORTED_DIAG 줄 시작 문자열 리터럴");
         assert_eq!(rust_diag, python_diag, "구 데몬 진단 기계 토큰의 교차 언어 계약");
+
+        let python_gate_diag = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("GATE_MODAL_DIAG = \""))
+            .and_then(|literal| literal.strip_suffix('"'))
+            .expect("파이썬 GATE_MODAL_DIAG 줄 시작 문자열 리터럴");
+        let rust_gate_diag = prod
+            .lines()
+            .find_map(|line| line.strip_prefix("const CYCLE_GATE_MODAL_DIAG: &str = \""))
+            .and_then(|literal| literal.strip_suffix("\";"))
+            .expect("러스트 CYCLE_GATE_MODAL_DIAG 줄 시작 문자열 리터럴");
+        assert_eq!(rust_gate_diag, python_gate_diag, "관문·모달 진단 기계 토큰의 교차 언어 계약");
+        let consequence = "autopilot held_classify 가 일시 보류를 구조적으로 읽어 그 좌석이 3회 만에 영구 정지한다";
+        assert_ne!(rust_gate_diag, rust_diag, "러스트 진단 토큰이 같으면 {consequence}");
+        assert_ne!(python_gate_diag, python_diag, "파이썬 진단 토큰이 같으면 {consequence}");
     }
 
     #[test]
@@ -34242,8 +34265,9 @@ mod tests {
     }
 
     /// ★(0.14.39 라운드3 · 성찰1 minor ⓑ · 성찰2 notice) agent 메타 없는 수동 경로(`--clear-cmd`)는
-    /// 관문 코퍼스가 빈 배열이라 관문 축이 꺼진다 — **모달 축은 남는다**는 사실을 고정한다.
-    /// 이 검체가 깨지면 그 좌석은 살아 있는 모달 위로도 clear 원자 송신이 나간다.
+    /// 관문 코퍼스가 빈 배열이라 관문 축이 꺼진다 — oauth == Idle 은 정상 기대가 아닌 **고지된 잔여**다.
+    /// 코퍼스 폴백을 넣는 수리는 oauth 단언의 기대값도 같은 커밋에서 함께 뒤집어야 한다.
+    /// 별도의 모달 축 단언은 유지한다 — 그 회귀는 살아 있는 모달 위로 clear 원자 송신을 허용한다.
     #[test]
     fn cycle_target_state_keeps_the_modal_axis_without_an_agent_corpus() {
         use cys::first_run_gates::fixtures;
@@ -34271,7 +34295,7 @@ mod tests {
         assert_eq!(
             oauth,
             CycleTargetState::Idle,
-            "수동 경로 한정 잔여(고지) — 코퍼스가 붙는 정상 경로는 위 관문 검체가 막는다"
+            "정상 기대가 아닌 고지된 잔여: 수동 경로의 빈 관문 코퍼스 — 코퍼스 폴백 수리 시 이 단언도 같은 커밋에서 함께 뒤집어야 한다"
         );
         let idle = cycle_target_observation(
             Ok(json!({"text": fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": 120.0})),

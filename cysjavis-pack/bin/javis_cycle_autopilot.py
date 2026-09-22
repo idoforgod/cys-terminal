@@ -511,8 +511,11 @@ HELD_RETRY_COOLDOWN_SECS = 300.0   # 비파괴 보류 후 재시도 최소 간�
 HELD_RETRY_MAX = 3      # 구조적 보류(구 데몬) 하드 상한 — 게이트5 차단 · 사람 개입 시점
 HELD_NOTIFY_EVERY = 3   # 비구조 보류 digest 통지 주기(연속 1회째 + 이후 배수) — 큐 남발 방지 노브
 QUIET_UNREPORTED_DIAG = "quiet_secs_unreported"
+GATE_MODAL_DIAG = "gate_or_modal_foreground"
 # ★러스트 src/bin/cys.rs cycle_quiet_timeout_diagnostic 의 rc84 문면
-#   [diag=quiet_secs_unreported] 와 같은 토큰 — cargo 검체가 위 줄의 리터럴을 파싱한다.
+#   [diag=quiet_secs_unreported] 와 같은 토큰 — cargo 검체가 QUIET_UNREPORTED_DIAG 리터럴을 파싱한다.
+# GATE_MODAL_DIAG 는 러스트 CYCLE_GATE_MODAL_DIAG 와 같은 값 · 구조적 토큰과 달라야 한다.
+# 관문은 사람이 통과하면 사라지는 일시 상태라 무제한 재시도가 옳다.
 KEYS_SENT_MARKERS = ("C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '")
 # ★러스트 src/bin/cys.rs 의 rc85 거부 문면·5단계 문면 중 clear_cmd 에 의존하지 않는 부분 —
 #   어댑터 clear_cmd('/clear'·'/new'…)가 무엇이든 C-u 선행 송신을 읽는다.
@@ -572,7 +575,10 @@ def held_classify(rc, tail):
     alive_evidence = None
     keys_sent = "0건"
     if rc == 84 and not structural:
-        alive_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
+        if "[diag=%s]" % GATE_MODAL_DIAG in (tail or ""):
+            alive_evidence = "rc84: 관문·모달 전경으로 보류(사람이 1회 통과해야 한다)"
+        else:
+            alive_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
     elif rc == 85:
         alive_evidence = "rc85: 사람 초안·입력 감지"
         if any(marker in (tail or "") for marker in KEYS_SENT_MARKERS):
@@ -2690,6 +2696,9 @@ def cmd_self_test(args):
     print("[5-d] held 분류·residual_window 실측 파싱")
     t.check("QUIET_UNREPORTED_DIAG 기계 토큰 고정",
             globals().get("QUIET_UNREPORTED_DIAG") == "quiet_secs_unreported")
+    t.check("GATE_MODAL_DIAG 기계 토큰 고정 · 구조적 토큰과 다름",
+            globals().get("GATE_MODAL_DIAG") == "gate_or_modal_foreground"
+            and globals().get("GATE_MODAL_DIAG") != globals().get("QUIET_UNREPORTED_DIAG"))
     keys_sent_markers = globals().get("KEYS_SENT_MARKERS")
     t.check("KEYS_SENT_MARKERS: clear_cmd 무관 튜플·선행 C-u/입력 버퍼 문면",
             isinstance(keys_sent_markers, tuple)
@@ -2706,6 +2715,17 @@ def cmd_self_test(args):
              {"structural": False,
               "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
               "keys_sent": "0건"}),
+            ("rc84 관문·모달 전경", 84, "…[diag=gate_or_modal_foreground]…",
+             {"structural": False,
+              "alive_evidence": "rc84: 관문·모달 전경으로 보류(사람이 1회 통과해야 한다)",
+              "keys_sent": "0건"}),
+            ("rc84 관문·모달 접미 변형", 84, "[diag=gate_or_modal_foreground_x]",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc84 두 토큰 동시", 84,
+             "[diag=quiet_secs_unreported] [diag=gate_or_modal_foreground]",
+             {"structural": True, "alive_evidence": None, "keys_sent": "0건"}),
             ("rc85 키 송신 없음", 85, "[diag=quiet_secs_unreported] 사람 초안 감지",
              {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
               "keys_sent": "0건"}),
