@@ -11577,6 +11577,62 @@ mod tests {
         }
     }
 
+    /// ★(0.14.39 · 적대 major ②ⓒ) I-0 ① 의 핵심 불변식을 **순수 판정층**에서 잰다 —
+    /// "기계 잔여(pending>0) ∧ 사람 초안 없음(human=0) → `ClearFirst` 통과".
+    ///
+    /// 【왜 공백이었나】 종전 검체는 `kind` 판정표(`direct_send_kind`)와 `SubmitKey` 팔뿐이었고,
+    /// GUI 재기동이 죽은 셸의 기계 잔여를 **스스로 푼다**는 약속은 순수층에서 한 번도 재지
+    /// 않았다. 그 약속이 깨지면 좌석은 `[draft_gate:pending_input]` 에서 `clear_first` 거부로
+    /// 얼굴만 바뀐 채 영구 보류된다(④pane 전멸 인접 위험).
+    ///
+    /// 대조로 `CancelKey`(= cycle-agent 폴백 경로의 C-u)도 같은 두 계수에서 함께 박는다 —
+    /// 두 팔이 갈리면 "clear_first 는 통과시키는데 그 폴백인 C-u 는 막는다" 가 된다.
+    #[test]
+    fn r1_clear_first_passes_machine_residue_and_holds_human_draft() {
+        let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
+        let occupied = PromptLine { before_cursor: "사람이 치던 초안", at_or_after_cursor: "" };
+        for kind in [DirectSendKind::ClearFirst, DirectSendKind::CancelKey] {
+            // ⓐ 기계 잔여만 — 지우려고 보내는 것이므로 통과한다(화면이 점유로 보여도).
+            assert_eq!(
+                super::draft_gate_verdict(kind, 6, 0, Some(empty), false, false),
+                None,
+                "{kind:?}: 기계 잔여를 못 지우면 그 좌석은 스스로 풀리지 않는다"
+            );
+            assert_eq!(
+                super::draft_gate_verdict(kind, 6, 0, Some(occupied), false, false),
+                None,
+                "{kind:?}: pending>0 이면 화면 점유는 거부 사유가 아니다(그 줄이 지울 대상이다)"
+            );
+            // ⓑ 사람 초안은 어느 kind 에서도 보류다(소거 금지).
+            assert_eq!(
+                super::draft_gate_verdict(kind, 6, 3, Some(empty), false, false),
+                Some(DraftGateDenied::HumanDraft { bytes: 3 }),
+                "{kind:?}: 사람 초안 삭제를 열었다"
+            );
+        }
+        // ⓒ 계수가 0 일 때만 화면 축이 산다 — ClearFirst 는 거부, CancelKey 는 화면 축이 없다.
+        assert_eq!(
+            super::draft_gate_verdict(DirectSendKind::ClearFirst, 0, 0, Some(occupied), false, false),
+            Some(DraftGateDenied::ScreenOccupied),
+            "계수 0 + 미계수 화면 초안은 ClearFirst 도 보류한다"
+        );
+        assert_eq!(
+            super::draft_gate_verdict(DirectSendKind::CancelKey, 0, 0, Some(occupied), false, false),
+            None,
+            "CancelKey 는 화면 축을 쓰지 않는다(렌더 잔상 하나로 /clear 가 막히면 무clear 다)"
+        );
+        // ⓓ 선택기 행·승인 대기는 ClearFirst 의 화면 축을 면제한다(종전 계약 회귀 핀).
+        for (selector, approval) in [(true, false), (false, true)] {
+            assert_eq!(
+                super::draft_gate_verdict(
+                    DirectSendKind::ClearFirst, 0, 0, Some(occupied), selector, approval
+                ),
+                None,
+                "선택기/승인 대기에서 화면 축이 살아 있다: selector={selector}, approval={approval}"
+            );
+        }
+    }
+
     #[test]
     fn d12_cancel_key_skips_screen_axis_before_adapter_load() {
         assert!(

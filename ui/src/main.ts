@@ -21,7 +21,7 @@ import {
   type TransferRecord,
 } from "./transfer";
 import { updatePlan } from "./updateplan";
-import { planRestartInject } from "./restartplan";
+import { planRestartInject, restartInvokeFailureReason } from "./restartplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
@@ -6115,13 +6115,22 @@ async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], so
     toast("watchdog", "재기동 보류", plan.reason);
     return;
   }
-  await invoke("send_input", {
-    socket: socket ?? null,
-    surfaceId: target.surface_id,
-    data: plan.data,
-    clearFirst: plan.clearFirst,
-    machineOrigin: true,
-  });
+  // ★(0.14.39 · 적대 major ②ⓑ) 데몬 거부를 **삼키지 않는다**. 종전에는 try/catch 가 없어
+  //   `clear_first_unsupported`·초안 게이트 거부가 토스트 한 줄 없이 사라졌다(unhandled
+  //   rejection). 보류 팔에만 토스트가 있어, 기계가 막힌 경우에만 화면이 조용한 비대칭이었다.
+  //   여기서 삼키고 토스트만 내는 이유: 팔레트 `run` 의 catch 는 **그 밖의 액션**을 위한 그물이라,
+  //   여기서 rethrow 하면 같은 사고에 토스트가 둘 뜬다.
+  try {
+    await invoke("send_input", {
+      socket: socket ?? null,
+      surfaceId: target.surface_id,
+      data: plan.data,
+      clearFirst: plan.clearFirst,
+      machineOrigin: true,
+    });
+  } catch (e) {
+    toast("watchdog", "재기동 실패", restartInvokeFailureReason(e));
+  }
 }
 
 // feed 승인(팔레트 액션): **대상이 확정된 뒤에만** 노출한다 — 아래 buildPaletteItems 가
@@ -6367,7 +6376,14 @@ async function openPalette() {
   const run = async (it: PaletteItem) => {
     close(); // confirm 모달(z 1000)이 팔레트(z 1600) 아래로 가려지지 않게 먼저 닫음
     if (it.confirm && !(await confirmModal(it.confirm.title, it.confirm.body))) return;
-    await it.action();
+    // ★(0.14.39 · 적대 major ②ⓑ) 액션의 무음 실패 금지 — 종전에는 이 await 가 감싸이지 않아
+    //   어떤 팔레트 액션이든 실패가 unhandled rejection 으로 사라졌다. 자기 오류를 스스로
+    //   토스트로 내는 액션(restartNode)은 여기까지 오지 않으므로 이중 토스트가 되지 않는다.
+    try {
+      await it.action();
+    } catch (e) {
+      toast("feed", "액션 실패", restartInvokeFailureReason(e));
+    }
   };
   const onKey = (e: KeyboardEvent) => {
     if (e.isComposing || e.keyCode === 229) return; // 07: IME 조합 중 Enter가 액션 오발화 방지(적대검증 교정)

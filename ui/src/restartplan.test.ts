@@ -1,7 +1,7 @@
 // GUI 재기동 주입의 초안 보호·기계 잔여 정리·배선 계약 (bun test — DOM/Tauri 불요).
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { planRestartInject } from "./restartplan";
+import { planRestartInject, restartInvokeFailureReason } from "./restartplan";
 
 const cmd = "cys launch-agent --role worker --agent claude";
 const plain = { mode: "plain", data: cmd + "\n", clearFirst: false };
@@ -101,7 +101,7 @@ function functionSlice(name: string): string {
 describe("재기동 배선 — 순수 주입 계획이 실제 UI 전송을 결정한다", () => {
   test("재기동은 순수 모듈의 계획을 쓰고 명령에 개행을 직접 붙여 넘기지 않는다", () => {
     const body = functionSlice("restartNode");
-    expect(/import\s*\{\s*planRestartInject\s*\}\s*from\s*["']\.\/restartplan["']/.test(code)).toBe(true);
+    expect(/import\s*\{[^}]*\bplanRestartInject\b[^}]*\}\s*from\s*["']\.\/restartplan["']/.test(code)).toBe(true);
     expect(/planRestartInject\(\s*cmd\s*,\s*target\s*\)/.test(body)).toBe(true);
     expect(/data\s*:\s*cmd\s*\+\s*["']\\n["']/.test(body)).toBe(false);
   });
@@ -132,5 +132,64 @@ describe("재기동 배선 — 순수 주입 계획이 실제 UI 전송을 결�
     const jump = body.indexOf("jumpToSurface(target.surface_id, socket)");
     expect(jump).toBeGreaterThanOrEqual(0);
     expect(jump).toBeLessThan(body.indexOf("planRestartInject("));
+  });
+});
+
+// ★(0.14.39 · 적대 major ②ⓑ) 데몬 거부의 무음 실패 금지 — 사유 번역과 배선.
+describe("재기동 실패 — 데몬 거부를 한국어 처방으로 낸다", () => {
+  test("clear_first 미지원 좌석은 Ctrl-U 후 재시도를 안내한다", () => {
+    for (const err of [
+      "clear_first_unsupported: clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)",
+      new Error("clear_first_unsupported: ..."),
+    ]) {
+      expect(restartInvokeFailureReason(err)).toBe(
+        "이 좌석은 launch-agent 등록이 없어 자동 정리를 못 합니다 — 해당 pane 에서 Ctrl-U 후 재시도",
+      );
+    }
+  });
+
+  test("초안 게이트 거부는 초안 제출·삭제를 안내한다", () => {
+    for (const err of ["typing_guard: [draft_gate:pending_input] 24 bytes", "pending_input 24"]) {
+      expect(restartInvokeFailureReason(err)).toBe(
+        "대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도",
+      );
+    }
+  });
+
+  test("타이핑 가드 거부는 잠시 뒤 재시도를 안내한다", () => {
+    expect(restartInvokeFailureReason(new Error("typing_guard: human is typing"))).toBe(
+      "대상 pane 에 사람 입력이 감지돼 보류했습니다 — 잠시 뒤 재시도",
+    );
+  });
+
+  test("번역표에 없는 오류는 삼키지 않고 원문을 싣는다", () => {
+    expect(restartInvokeFailureReason(new Error("daemon unreachable"))).toBe("daemon unreachable");
+    expect(restartInvokeFailureReason("  socket closed  ")).toBe("socket closed");
+    for (const empty of ["", "   ", null, undefined]) {
+      expect(restartInvokeFailureReason(empty)).toBe("알 수 없는 오류");
+    }
+  });
+
+  test("재기동 전송은 try/catch 안에 있고 실패를 토스트로 낸다", () => {
+    const body = functionSlice("restartNode");
+    const tryAt = body.indexOf("try {");
+    const sendAt = body.indexOf('invoke("send_input"');
+    const catchAt = body.indexOf("} catch (");
+    expect(tryAt).toBeGreaterThanOrEqual(0);
+    expect(tryAt).toBeLessThan(sendAt);
+    expect(catchAt).toBeGreaterThan(sendAt);
+    const handler = body.slice(catchAt);
+    expect(handler).toContain("restartInvokeFailureReason(");
+    expect(handler).toContain('toast("watchdog", "재기동 실패"');
+  });
+
+  test("팔레트 액션 실행도 감싸여 무음으로 죽지 않는다", () => {
+    const runAt = code.indexOf("const run = async (it: PaletteItem)");
+    expect(runAt).toBeGreaterThanOrEqual(0);
+    const body = code.slice(runAt, code.indexOf("\n  };\n", runAt) + 5);
+    expect(body).toContain("try {");
+    expect(body).toContain("await it.action();");
+    expect(body).toContain("catch");
+    expect(body).toContain("restartInvokeFailureReason(");
   });
 });
