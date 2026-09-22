@@ -12663,6 +12663,218 @@ mod tests {
         );
     }
 
+    // ── D-12 직접 전송 초안 게이트: #4 RED 검체, 핸들러 배선은 #5 에서 구현 ──
+
+    fn d12_rpc(daemon: &Arc<Daemon>, pid: u32, method: &str, params: Value) -> Value {
+        let req = Request { id: json!(12), method: method.into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, Some(pid)) else {
+            panic!("expected single D-12 reply");
+        };
+        resp
+    }
+
+    fn d12_input_counts(s: &Arc<crate::state::Surface>) -> (u64, u64, u64) {
+        let state = s.pending_input.lock().unwrap();
+        (s.pending_input_bytes.load(Ordering::Relaxed), state.count, state.human)
+    }
+
+    fn d12_assert_denied(resp: &Value, reason: &str) {
+        assert_eq!(resp["ok"], json!(false), "초안이 있는 직접 전송은 거부해야 한다: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD));
+        let message = resp["error"]["message"].as_str().expect("거부 메시지");
+        assert!(message.starts_with(cys::MSG_TYPING_GUARD), "기존 CLI 폴백 접두 유지: {message}");
+        assert!(message.contains(&format!("[draft_gate:{reason}]")), "초안 거부 사유: {message}");
+    }
+
+    /// 의도된 RED 단언 전에 정리해 실패가 다음 검체의 pack 환경·자식 프로세스에 새지 않게 한다.
+    fn d12_cleanup(daemon: &Arc<Daemon>, dir: &std::path::Path) {
+        for s in daemon.surfaces.lock().unwrap().values() {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn d12_direct_send_text_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-text-draft", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_510;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "owner half "), 11);
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let body = "[CYCLE] injected";
+        let denied = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": body, "human": false, "queued": false, "quiet": true,
+        }));
+        let after_direct = d12_input_counts(&target);
+        let queued = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": body, "human": false, "queued": true, "quiet": true,
+        }));
+        let after_queued = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        // 직접 경로가 RED 여도 기존 --queued 폴백 대조는 먼저 실행·검증한다.
+        assert_eq!(queued["ok"], json!(true), "큐 폴백 허용: {queued}");
+        assert_eq!(queued["result"]["queued"], json!(true));
+        assert_eq!(after_queued, after_direct, "큐 등록은 입력 계수를 바꾸지 않는다");
+        assert_eq!(before, (11, 11, 11));
+        d12_assert_denied(&denied, "pending_input");
+        assert_eq!(after_direct, before, "거부된 직접 전송은 미러·전체·사람 계수 불변");
+    }
+
+    #[test]
+    fn d12_direct_send_text_passes_on_empty_line() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-text-empty", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_512;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.last_human_input.lock().unwrap() = None;
+        assert_eq!(d12_input_counts(&target), (0, 0, 0));
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(resp["ok"], json!(true), "빈 입력줄은 직접 전송 허용: {resp}");
+        assert_eq!(after, (5, 5, 0));
+    }
+
+    #[test]
+    fn d12_autoreply_only_line_counts_as_empty() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-autoreply", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_514;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        for _ in 0..10 {
+            v7_send_human(&daemon, target.id, pid, "\u{1b}[I");
+            v7_send_human(&daemon, target.id, pid, "\u{1b}[O");
+        }
+        let before = d12_input_counts(&target);
+        let guard_untouched = target.last_human_input.lock().unwrap().is_none();
+        *target.last_human_input.lock().unwrap() = None;
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert!(guard_untouched, "자동 응답은 타이핑 가드 면제");
+        assert_eq!(before, (0, 0, 0), "C1: 포커스 자동 응답은 초안으로 세지 않는다");
+        assert_eq!(resp["ok"], json!(true), "자동 응답뿐인 입력줄은 직접 전송 허용: {resp}");
+        assert_eq!(after, (5, 5, 0));
+    }
+
+    #[test]
+    fn d12_send_key_return_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-return-draft", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_516;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "abc"), 3);
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        // v7_send_key 는 성공을 단언하므로, 거부 검체만 같은 RPC 를 직접 관측한다.
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "Return", "queued": false,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (3, 3, 3));
+        d12_assert_denied(&resp, "human_draft");
+        assert_eq!(after, (3, 3, 3), "남의 초안을 제출하지 않고 계수 3 유지");
+    }
+
+    #[test]
+    fn d12_send_key_return_passes_after_own_direct_send() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-return-own", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_518;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.last_human_input.lock().unwrap() = None;
+        let sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+        }));
+        let after_send = d12_input_counts(&target);
+        let after_return = v7_send_key(&daemon, target.id, pid + 1, "Return");
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(sent["ok"], json!(true), "자기 본문 전송 성공: {sent}");
+        assert_eq!(after_send, (5, 5, 0), "기계 본문은 사람 초안이 아니다");
+        assert_eq!(after_return, 0, "자기 본문의 Return 제출은 허용");
+        assert_eq!(after, (0, 0, 0));
+    }
+
+    /// inject_text·launch-agent 의 authoritative 디렉티브 주입은 master 호출자에게 의도된 면제다.
+    #[test]
+    fn d12_authoritative_caller_exempt() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-authoritative", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_520;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *sender.role.lock().unwrap() = Some("master".into());
+        assert_eq!(v7_send_human(&daemon, target.id, pid, "owner half "), 11);
+        *target.last_human_input.lock().unwrap() = None;
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": "directive", "human": false,
+            "queued": false, "quiet": true, "authoritative": true,
+        }));
+        let after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(resp["ok"], json!(true), "검증된 권위 호출자는 초안 게이트 면제: {resp}");
+        assert_eq!(after, (20, 20, 11));
+    }
+
+    #[test]
+    fn d12_screen_axis_denies_text_when_count_zero_but_cursor_row_has_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-screen", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_522;
+        let _sender = v7_pane(&daemon, "worker-2", pid);
+        let mut observations = Vec::new();
+        for (offset, line) in [(1, "❯ "), (2, "❯ owner draft")] {
+            // 각각 새 pane: 직전 send 의 비동기 PTY 에코가 다음 화면 픽스처를 덮지 않는다.
+            let target = v7_pane(&daemon, "worker-1", pid + offset);
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+            {
+                // governance::tests::paint_screen 과 같은 파서 경로, 커서는 그 행 본문 끝.
+                let mut parser = target.parser.lock().unwrap();
+                parser.process(b"\x1b[2J\x1b[H");
+                parser.process(line.as_bytes());
+                parser.process(format!("\x1b[1;{}H", line.chars().count() + 1).as_bytes());
+            }
+            let before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid, "surface.send_text", json!({
+                "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
+            }));
+            observations.push((resp, before, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        let (empty, empty_before, empty_after) = &observations[0];
+        assert_eq!(*empty_before, (0, 0, 0));
+        assert_eq!(empty["ok"], json!(true), "빈 마커 줄 대조는 통과: {empty}");
+        assert_eq!(*empty_after, (5, 5, 0));
+        let (draft, draft_before, draft_after) = &observations[1];
+        assert_eq!(*draft_before, (0, 0, 0), "계수와 독립적인 화면 축 검체");
+        d12_assert_denied(draft, "screen_occupied");
+        assert_eq!(*draft_after, (0, 0, 0), "화면 초안 거부도 계수 불변");
+    }
+
     /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
     /// **전 경우**를 고정한다. 판정이 두 층으로 갈렸으므로 두 층을 함께 박는다 —
     ///   · 핸들러층 `submit_gap_for_key`: '이 키에 간격을 거는가' (잔여는 재지 않는다)

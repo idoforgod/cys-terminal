@@ -4907,6 +4907,72 @@ pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine
     }
 }
 
+/// D-12 직접 입력 경로 — 본문 주입과 Return/Enter 제출은 계수 축이 다르다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectSendKind {
+    Text,
+    SubmitKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftGateDenied {
+    PendingInput { bytes: u64 },
+    HumanDraft { bytes: u64 },
+    ScreenOccupied,
+}
+
+impl DraftGateDenied {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::PendingInput { .. } => "pending_input",
+            Self::HumanDraft { .. } => "human_draft",
+            Self::ScreenOccupied => "screen_occupied",
+        }
+    }
+}
+
+/// D-12 순수 판정 — IO 없음. #5 에서 구현: 이 스캐폴드는 항상 거부하지 않는다.
+///
+/// Text 는 전체 pending, SubmitKey 는 human_pending 을 우선한다. 자기 본문만 남은
+/// SubmitKey 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
+/// SubmitKey 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
+/// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제와 핸들러 배선도 #5 몫이다.
+pub(crate) fn draft_gate_verdict(
+    kind: DirectSendKind,
+    pending: u64,
+    human_pending: u64,
+    line: Option<PromptLine<'_>>,
+    selector_row: bool,
+    approval_pending: bool,
+) -> Option<DraftGateDenied> {
+    let _ = (kind, pending, human_pending, line, selector_row, approval_pending);
+    None
+}
+
+/// D-12 IO 래퍼 — 전체 계수는 미러, 사람 계수는 상태 Mutex 에서 읽는다.
+/// 화면은 마커 좌석의 observe_prompt 커서행이며 마커가 없으면 None/비선택기다.
+/// 승인 축은 approval_or_gate_pending 을 공유한다. #5 에서 구현할 순수 판정자에 위임하므로
+/// 현재는 항상 None 이며, 핸들러에서는 아직 호출하지 않는다.
+pub(crate) fn draft_gate(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    kind: DirectSendKind,
+) -> Option<DraftGateDenied> {
+    let pending = s.pending_input_bytes.load(Ordering::Relaxed);
+    let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let adapters = load_adapter_defs();
+    let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));
+    let line = obs.as_ref().and_then(|obs| {
+        obs.line.as_ref().map(|(before, after)| PromptLine {
+            before_cursor: before,
+            at_or_after_cursor: after,
+        })
+    });
+    let selector_row = obs.as_ref().map_or(false, |obs| obs.selector_row);
+    let approval_pending = approval_or_gate_pending(daemon, s.id);
+    draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
+}
+
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingInputState {
@@ -11180,9 +11246,88 @@ mod tests {
     // ─────────── ★B1(0.14.30): 프롬프트 경계 준비판정 — 순수 판정자 핀 ───────────
 
     use super::{
-        input_line_state, prompt_boundary_verdict, queue_starve_alert_secs, InputLine, InputOrigin,
-        PendingInputState, PromptBoundary, PromptLine,
+        draft_gate_verdict, input_line_state, prompt_boundary_verdict, queue_starve_alert_secs,
+        DirectSendKind, DraftGateDenied, InputLine, InputOrigin, PendingInputState, PromptBoundary,
+        PromptLine,
     };
+
+    // D-12 계약 검체: #4 는 거부 4건이 RED, #5 의 판정 구현에서 GREEN 으로 전환한다.
+    #[test]
+    fn d12_verdict_text_pending_input_denied() {
+        let denied = DraftGateDenied::PendingInput { bytes: 11 };
+        assert_eq!(denied.as_str(), "pending_input");
+        // 선택기·승인 예외는 화면 축뿐이며 전체 계수보다 앞서지 않는다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::Text, 11, 0, None, true, true),
+            Some(denied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_text_empty_line_passes() {
+        let line = PromptLine { before_cursor: " ", at_or_after_cursor: "ghost suggestion" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_text_screen_occupied_denied() {
+        let line = PromptLine { before_cursor: "owner draft", at_or_after_cursor: "" };
+        assert_eq!(DraftGateDenied::ScreenOccupied.as_str(), "screen_occupied");
+        // 승인 대기는 Text 화면 축의 면제가 아니다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), false, true),
+            Some(DraftGateDenied::ScreenOccupied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_text_selector_row_passes() {
+        let line = PromptLine { before_cursor: "1. Yes", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, Some(line), true, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_text_unknown_line_passes() {
+        assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, None, false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_human_draft_denied() {
+        let denied = DraftGateDenied::HumanDraft { bytes: 3 };
+        assert_eq!(denied.as_str(), "human_draft");
+        // 사람 초안은 선택기·승인 대기보다 우선하며, 전체 pending 대신 human 을 보고한다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::SubmitKey, 8, 3, None, true, true),
+            Some(denied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_own_pending_passes() {
+        let line = PromptLine { before_cursor: "hello", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 5, 0, Some(line), false, false), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_screen_occupied_denied() {
+        let line = PromptLine { before_cursor: "owner draft", at_or_after_cursor: "" };
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), false, false),
+            Some(DraftGateDenied::ScreenOccupied)
+        );
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_approval_pending_passes() {
+        let line = PromptLine { before_cursor: "Allow execution", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), false, true), None);
+    }
+
+    #[test]
+    fn d12_verdict_submit_key_selector_row_passes() {
+        let line = PromptLine { before_cursor: "1. Yes", at_or_after_cursor: "" };
+        assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), true, false), None);
+    }
 
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
     /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
