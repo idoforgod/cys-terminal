@@ -4686,7 +4686,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .get("authoritative")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid)) {
+            let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
+            if !exempt {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -4707,12 +4708,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             // ★(0.14.39 · WP-C-input · D-12) 3초가 지나도 사람 초안은 제출하지 않는다.
-            // 계수는 human 축으로 검사해 기계 send+Return 은 허용하고, 취소·탐색 키에는 미적용한다.
+            // 계수는 human 축으로 검사해 기계 send+Return 과 기계 잔여 취소는 허용한다.
             // send_text 와 같은 authoritative 예외, 같은 응답 접두·관측 헬퍼를 사용한다.
-            let gate_kind = if matches!(key.as_str(), "Return" | "Enter")
-                && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
-            {
+            // ★(수정 라운드 2 · 리뷰 major) 판정 축은 키 **이름**이 아니라 **생성 바이트**다.
+            //   key_to_bytes 는 같은 바이트를 내는 별칭을 여럿 만든다 — `C-m`/"\r"→0x0d ·
+            //   `C-j`→0x0a · `C-u`→0x15 · `C-c`→0x03. 이름으로 판정하면 한 단어 치환
+            //   (`cys send-key --surface X C-m`)으로 게이트가 통째로 우회돼, WP-C2 가 막으려던
+            //   "오너의 미완성 초안이 기계에 의해 제출/삭제되는 사고"가 그대로 열린다(실측 확인).
+            //   이름 목록이 늘어나도(키 표 확장) 게이트가 저절로 따라오게 하는 유일한 축이다.
+            let gate_kind = if exempt {
+                None
+            } else if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
                 Some(DirectSendKind::SubmitKey)
+            } else if bytes.iter().any(|b| matches!(b, 0x15 | 0x03)) {
+                Some(DirectSendKind::CancelKey)
             } else {
                 None
             };

@@ -4914,6 +4914,10 @@ pub(crate) enum DirectSendKind {
     SubmitKey,
     /// `cys send --clear-first` — Ctrl-U 선정리 + 본문 + CR 원자 주입.
     /// C-u 가 지우는 것이 기계 잔여면 정상 용도이고 사람 초안이면 D-12 의 삭제 사고다.
+    /// `--clear-first` 는 계수가 0 이고 화면만 Occupied 인 좌석에서도 거부되며 CLI 에 `--queued`
+    /// 폴백이 없다(원자 주입은 큐와 결합 불가) — 데몬 재기동 직후처럼 계수가 휘발되면 하드 에러다.
+    /// 그 경우 사람 초안 여부를 확인한 뒤 원시 `cys send-key <좌석> C-u`(CancelKey 축 = 사람
+    /// 초안만 거부)로 수동 선정리할 수 있다.
     ClearFirst,
     /// `cys send-key C-u`/`C-c` 등 **원시 취소 키** — 생성 바이트에 0x15/0x03 이 있는 경로.
     /// 사람 초안을 지우는 것만 막고 화면 축은 쓰지 않는다(무clear 방향 fail-open).
@@ -4943,6 +4947,7 @@ impl DraftGateDenied {
 /// SubmitKey/ClearFirst 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
 /// ClearFirst 의 C-u 는 기계 잔여를 지우기 위한 것이므로 SubmitKey 와 같은 팔로 판정한다.
 /// SubmitKey/ClearFirst 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
+/// CancelKey 는 human_pending 만 검사해 사람 초안 삭제를 막으며 화면 축은 적용하지 않는다.
 /// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제는 핸들러가 적용한다.
 pub(crate) fn draft_gate_verdict(
     kind: DirectSendKind,
@@ -4975,7 +4980,16 @@ pub(crate) fn draft_gate_verdict(
                 None
             }
         }
-        DirectSendKind::CancelKey => None, // ⑬ 에서 구현
+        // 취소 키를 화면 축으로도 막으면 cycle-agent 4단계의 `send_key C-u` 가 렌더 잔상 하나로
+        // 거부돼 `/clear` 가 실행되지 않는다 — 오너 ABSOLUTE ANCHOR ②(무clear) 방향의 사고다.
+        // 여기서 막는 것은 **사람 초안 삭제**뿐이고, 계수 없는 화면 잔여는 통과시킨다(fail-open · 의도).
+        DirectSendKind::CancelKey => {
+            if human_pending > 0 {
+                Some(DraftGateDenied::HumanDraft { bytes: human_pending })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -5044,8 +5058,8 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 /// CLOSE 만 남아 실측 `stale_bytes=6` 으로 배달을 막았다. 봉투 안에서는 CR/LF 도 가산하고
 /// 자동응답 면제를 끈다: 변형 F(OPEN/ESC[I/CLOSE 분할)가 한 호출과 같은 본문 계수를 가져야 한다.
 /// 봉투 밖의 순수 자동응답은 **세그먼트 단위**로 면제한다. CLOSE+ESC[I 를 한 청크로 받든
-/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 2바이트
-/// 이상일 때만 최대 5바이트까지 계수하지 않고 이월해 다음 청크와 합친 뒤 인식한다.
+/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 봉투 밖에서
+/// 2바이트, 봉투 안에서 1바이트 이상일 때 최대 5바이트까지 계수하지 않고 이월해 다음 청크와 합친다.
 ///
 /// 미종결 봉투는 Ctrl-C/Ctrl-U 또는 OPEN 뒤 5초가 지난 호출에서 해제한다(시각 누락도 해제).
 /// 해제 자체는 입력이 비워졌다는 증거가 아니므로 계수를 감산하지 않는다(fail-closed).
@@ -5056,10 +5070,19 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 /// 사람·기계 본문은 모두 count 에 세고, 사람 본문만 human 에 센다(human <= count).
 ///
 /// 한계: 백슬래시+Enter 줄바꿈은 리셋으로 읽힌다. 커서 줄 머리 이동은 화면 축의 한계로
-/// 남으며, D-02(Backspace/Delete) 감산은 보류한다. 표식이 1바이트(ESC) 경계에서 절단된
-/// 붙여넣기는 이월하지 않아 봉투를 본문으로 센다(과대 · 본문에 CR/LF 가 있으면 그 자리에서
+/// 남으며, D-02(Backspace/Delete) 감산은 보류한다. 봉투 밖에서 OPEN 의 첫 바이트(ESC) 경계로
+/// 절단된 붙여넣기는 여전히 이월하지 않아 봉투를 본문으로 센다(과대 · 본문에 CR/LF 가 있으면 그 자리에서
 /// 리셋돼 과소) — 제품 호출자(GUI onData 1회·inject_text 단일 버퍼)는 표식을 분할하지 않으므로
 /// 실경로가 아니며, 실경로인 단독 Esc 키를 지키는 쪽을 택했다(base 와 같은 거동).
+/// 봉투 안의 CLOSE 절단은 이번 라운드에 이월 하한 1바이트로 봉합했다.
+/// OPEN 6바이트는 계수에서 빠지므로 OPEN 만 담긴 청크 뒤에는
+/// `pending_input_bytes == 0 ∧ in_paste == true` 인 창이 생겨 좌석이 게이트·배달에 '빈 입력줄'로
+/// 보인다(`in_paste` 는 진단 키로만 나가고 `input_line_state`·`draft_gate_verdict` 어디서도 읽지 않는다).
+/// 이 창의 봉투 상태는 OPEN 뒤 5초 TTL 이 지난 다음 청크에서 해제된다. 제품 호출자(GUI
+/// `term.onData` 1회 전달)는 봉투를 분할하지 않으므로 실경로가 아니다.
+/// 단독 Esc 키(0x1b)는 1바이트 초안으로 남는다 — 빈 줄에서 슬래시 메뉴 닫기·턴 중단으로
+/// Esc 한 번만 눌러도 CR·Ctrl-C/U 또는 stale 리셋(빈 화면+정적 5초)까지 Occupied 로 보인다.
+/// fail-closed 이고 base 와 같은 거동이지만, D-12 이후 그 좌석행 직접 send·Return 이 거부된다.
 pub(crate) fn pending_input_step(
     prev: &PendingInputState,
     chunk: &[u8],
@@ -5082,16 +5105,23 @@ pub(crate) fn pending_input_step(
         st.paste_opened_at = None;
     }
 
-    if let Some(len) = (2..OPEN.len())
-        .rev()
-        .find(|&len| buf.ends_with(&OPEN[..len]) || buf.ends_with(&CLOSE[..len]))
-    {
-        st.tail = buf.split_off(buf.len() - len);
-    }
-
     let is_human = origin == InputOrigin::Human;
     let mut i = 0;
     while i < buf.len() {
+        // ★(수정 라운드 2 · 리뷰 minor) 이월 하한은 봉투 **밖**에서만 2바이트다.
+        // 밖에서 단독 ESC 를 이월하면 뒤의 Enter 가 Meta-Enter 로 오독돼 미제출로 고착한다.
+        // 봉투 안에서는 Esc 가 제출 트리거가 아니므로 1바이트도 이월해 ESC 경계의 CLOSE 를 닫는다.
+        // 종전 `\x1b[200~abc\x1b` / `[201~` 는 count=9·in_paste=true 로 TTL 까지 고착해
+        // 자동응답 면제가 꺼지고 CR 이 리셋 대신 가산되어 D-01 이 재발했다.
+        // TTL 처리 뒤, 이 위치까지의 OPEN/CLOSE 를 반영한 상태를 읽어 같은 청크의 경계도 지킨다.
+        let carry_floor = if st.in_paste { 1 } else { 2 };
+        let remaining = &buf[i..];
+        if (carry_floor..OPEN.len()).contains(&remaining.len())
+            && (OPEN.starts_with(remaining) || CLOSE.starts_with(remaining))
+        {
+            st.tail = buf.split_off(i);
+            break;
+        }
         if buf[i..].starts_with(OPEN) {
             st.in_paste = true;
             st.paste_opened_at = Some(now);
@@ -5113,7 +5143,13 @@ pub(crate) fn pending_input_step(
             i += 1;
         } else {
             let start = i;
-            while i < buf.len() && !buf[i..].starts_with(OPEN) && !buf[i..].starts_with(CLOSE) {
+            while i < buf.len()
+                && !buf[i..].starts_with(OPEN)
+                && !buf[i..].starts_with(CLOSE)
+                // 봉투 밖 세그먼트도 2바이트 이상 진접두 앞에서 멈춰 위 이월 판정으로 넘긴다.
+                && !((2..OPEN.len()).contains(&(buf.len() - i))
+                    && (OPEN.starts_with(&buf[i..]) || CLOSE.starts_with(&buf[i..])))
+            {
                 i += 1;
             }
             let seg = &buf[start..i];
@@ -5123,6 +5159,9 @@ pub(crate) fn pending_input_step(
             {
                 continue;
             }
+            // carried 가드는 현재 봉투 밖 하한 2 아래에서는 도달 불가다(tail 의 끝은 ESC 가 아님).
+            // 하한을 1로 되돌리거나 봉투 안 이월이 밖으로 새면 활성된다 —
+            // `v2_carried_escape_then_cr_is_submit_not_meta_enter` 가 상태를 직접 만들어 고정한다.
             let reset = seg.iter().enumerate().rposition(|(pos, &byte)| {
                 matches!(byte, b'\n' | 0x15 | 0x03)
                     || (byte == b'\r'
