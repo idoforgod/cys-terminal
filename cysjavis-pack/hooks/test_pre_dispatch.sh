@@ -20,6 +20,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(test_pre_dispatch)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 set -u
 
 REAL_HOOKS=${REAL_HOOKS:-$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)}

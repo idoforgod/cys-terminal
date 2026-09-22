@@ -50,6 +50,7 @@ _CYS_PRELUDE="${0%/*}/_lib.sh"
 if [ -r "$_CYS_PRELUDE" ]; then
   . "$_CYS_PRELUDE" 2>/dev/null || :
 fi
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 # ── ② 레인 가드 — 타 레인 팩의 훅이 이 레인에서 도는 것을 막는다 ─────────────────────────
 # 판정 불능은 전부 **통과**(fail-open)다 — 이 가드는 오살보다 오탐이 안전한 축이 아니다.

@@ -36,6 +36,7 @@ set -u
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(pre-dispatch)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || HOOK_DIR="."
 
 # 계약 ②: stdin 1회 버퍼링

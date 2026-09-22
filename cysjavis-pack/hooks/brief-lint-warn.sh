@@ -22,6 +22,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(brief-lint-warn)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 [ -n "${CYS_PY:-}" ] || exit 0        # G22 fail-open: python(3) 해소 불가
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || exit 0

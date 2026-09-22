@@ -17,6 +17,7 @@ set -u
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(actprobe-kill-gate)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 # ── 인터프리터 해석 (없으면 hook JSON 파싱 불가 = 인프라 fail-open) ───────────
 # G22: 후보에 python·py 추가(Windows는 python3 명령이 없다). 프리루드 해소값을 최우선 후보로.

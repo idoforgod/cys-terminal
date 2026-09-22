@@ -395,6 +395,41 @@ def capgate_unresolved(pack=None):
     return True, (doc if isinstance(doc, dict) else None)
 
 
+LANE_GUARD_TRIPPED_REL = os.path.join("state", "lane-guard-tripped")
+LANE_GUARD_RECENT_S = 24 * 3600
+
+
+def lane_guard_tripped_path(pack=None):
+    """레인 가드 조기 종료 표식 경로(팩 디렉터리가 곧 레인이다)."""
+    return os.path.join(pack or pack_dir(), LANE_GUARD_TRIPPED_REL)
+
+
+def lane_guard_tripped(pack=None, now=None):
+    """(recent: bool, info: dict|None) — 이 레인의 최근(24h) 조기 종료 표식.
+
+    info 는 path·age_s·mtime 과 표식 key=value(hook_root/lane_root/script/surface/ts).
+    증명된 부재만 (False, None) 이다. 판독 불가는 (True, {path, unreadable: True})로
+    막는다(결측은 값이 아니다). 셸 표식의 ts 대신 파일 mtime 으로 신선도를 판정한다.
+    """
+    path = lane_guard_tripped_path(pack)
+    if _lexists_strict(path) is False:
+        return False, None
+    raw = _read_text_tolerant(path)
+    if raw is None:
+        return True, {"path": path, "unreadable": True}
+    try:
+        mtime = os.stat(path).st_mtime
+    except (OSError, ValueError):
+        return True, {"path": path, "unreadable": True}
+    age_s = max(0.0, float(time.time() if now is None else now) - mtime)
+    info = {"path": path, "age_s": age_s, "mtime": mtime, "script": ""}
+    for line in raw.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key in ("hook_root", "lane_root", "script", "surface", "ts"):
+            info[key] = value
+    return age_s <= LANE_GUARD_RECENT_S, info
+
+
 def _no_autostart_env(base=None):
     """데몬을 **깨우지 않는** 조회용 env(`javis_guard_register.no_autostart_env` 미러).
 
@@ -6629,6 +6664,77 @@ class Preflight:
                  % (len(d["added"]), len(d["changed"]), len(d["missing"]),
                     ", ".join(sample), npm_hint, self.RUNTIME_SEAL_RECOVERY))
 
+    def c83_lane_guard_tripped(self):
+        """레인 훅 조기 종료 표식과 좌석의 SessionStart 설정을 읽기 전용으로 대조한다."""
+        cid = "C83.lane-guard-tripped"
+        if self.skipped(cid):
+            return
+        recent, info = lane_guard_tripped()
+        status = FAIL if recent else PASS
+        if recent:
+            info = info or {}
+            age = ("age_s=%.0f" % info["age_s"] if "age_s" in info
+                   else "age 판독 불가")
+            detail = ("레인 가드 조기 종료 표식: script=%s hook_root=%s lane_root=%s "
+                      "surface=%s %s path=%s%s — 이 레인 좌석의 훅이 타 레인 팩을 가리키고 "
+                      "레인 팩에 대응 훅이 없어 조기 종료됐다 — "
+                      "①좌석을 `CLAUDE_CONFIG_DIR=<레인 계정 폴더>` 로 재기동 "
+                      "②레인 팩 훅 결손이면 팩 재설치(cys init-pack) · "
+                      "표식은 다음 조기 종료 때 덮어써지며 24h 지나면 이 검사는 통과한다"
+                      % (info.get("script", ""), info.get("hook_root", ""),
+                         info.get("lane_root", ""), info.get("surface", ""), age,
+                         info.get("path", lane_guard_tripped_path()),
+                         " (표식 판독 불가)" if info.get("unreadable") else ""))
+        elif info is not None:
+            detail = "표식 있음(age %.1fh · 24h 초과 · 무시)" % (info["age_s"] / 3600)
+        else:
+            detail = "표식 없음"
+
+        if os.environ.get("CLAUDECODE"):
+            cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+            settings = _read_json_tolerant(os.path.join(cfg, "settings.json"))
+            axis_status = WARN
+            axis_detail = "실사용 설정 폴더 %s 의 settings.json 판독 불가" % cfg
+            try:
+                if not isinstance(settings, dict):
+                    raise ValueError("settings object 부재")
+                hooks = settings.get("hooks", {})
+                if not isinstance(hooks, dict):
+                    raise ValueError("hooks object 부재")
+                entries = hooks.get("SessionStart", [])
+                if not isinstance(entries, list):
+                    raise ValueError("SessionStart 배열 부재")
+                roots = set()
+                for entry in entries:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("hooks", []), list):
+                        raise ValueError("SessionStart 훅 형식 불일치")
+                    for hook in entry.get("hooks", []):
+                        if not isinstance(hook, dict):
+                            raise ValueError("훅 object 부재")
+                        command = hook.get("command", "")
+                        if not isinstance(command, str):
+                            raise ValueError("훅 command 문자열 부재")
+                        for path in _hook_cmd_paths(command):
+                            if "/hooks/" in path:
+                                roots.add(os.path.realpath(path.rsplit("/hooks/", 1)[0]))
+                if os.path.realpath(pack_dir()) in roots:
+                    axis_status = PASS
+                    axis_detail = "실사용 설정 폴더 %s 의 SessionStart 에 이 레인 팩 등록 일치" % cfg
+                elif roots:
+                    axis_detail = ("R안 위임으로 동작은 하나 설정 폴더 %s 의 SessionStart 가 "
+                                   "타 레인 팩(%s)을 가리킨다 — "
+                                   "CLAUDE_CONFIG_DIR=<계정 폴더> 재기동 권고"
+                                   % (cfg, ", ".join(sorted(roots))))
+                else:
+                    axis_detail = ("실사용 설정 폴더 %s 에 SessionStart 훅 0건"
+                                   "(미배선 · 등록은 C08 소관)" % cfg)
+            except (OSError, ValueError, TypeError) as exc:
+                axis_detail += "(%s)" % exc
+            if status == PASS:
+                status = axis_status
+            detail += " · " + axis_detail
+        self.add(cid, status, detail)
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -6683,6 +6789,8 @@ class Preflight:
             # C82(0.14.31 WP-1 H-2 · Pack 레인 소유) — 관문 코퍼스 실측 버전 드리프트.
             # WARN-only · 마지막 고정 슬롯(C62·C68) **앞**(§5-4 배선 규율).
             self.c82_gate_corpus_drift,
+            # C83 — 레인 훅 조기 종료·좌석 설정 대조(읽기 전용 · C62 앞).
+            self.c83_lane_guard_tripped,
             # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
             # C68은 C62 직후(원장 소비 강제 게이트 — 같은 런의 최신 원장 기준으로 기한 판정).
             self.c62_pack_heal_ledger,
@@ -10169,6 +10277,14 @@ def _self_test():
         check("C82 run() 배선(마지막 고정 슬롯 C62 앞)",
               "c82_gate_corpus_drift" in run_src2
               and run_src2.index("c82_gate_corpus_drift") < run_src2.index("c62_pack_heal_ledger"))
+        c83_src = _pin_src(Preflight.c83_lane_guard_tripped)
+        check("C83 은 읽기 전용(self.fix/self.repair/subprocess 0)",
+              all(token not in c83_src for token in ("self.fix", "self.repair", "subprocess")))
+        check("C83 run() 배선(C62 앞)",
+              "c83_lane_guard_tripped" in run_src2
+              and run_src2.index("c83_lane_guard_tripped") < run_src2.index("c62_pack_heal_ledger"))
+        check("lane_guard_tripped 부재→(False,None)",
+              lane_guard_tripped("/nonexistent/pack") == (False, None))
         # ── ★성찰(2026-09-10) 핀 — P14 축 1지점 · P15 처방 문면 · P17 FIFO 정지 하드닝 ──
         check("P14: C82 의 cys 해석은 **명시 오버라이드 우선** — _capgate_alert_axis 와 같은 순서(축 1지점)",
               'os.environ.get("CYS_BIN") or shutil.which("cys")' in c82_src

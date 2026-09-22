@@ -285,6 +285,24 @@ export PYTHONDONTWRITEBYTECODE
 #
 # 계약: POSIX sh · `set -u` 안전 · stdout 무출력 · 외부 명령 비의존(파라미터 확장 + cd/pwd
 # 빌트인만 — PATH 가 빈 훅 하네스에서도 오판하지 않는다) · opt-out `CYS_HOOK_LANE_GUARD=0`.
+# R안: 위 세 조건의 불일치 뒤 같은 상대경로의 레인 훅이 있으면 조기 종료 대신 위임을 예약한다.
+# CYS_LANE_REDIRECT는 예약 경로(비어 있으면 없음)이며, 훅 본문이 stderr 억제 밖에서 소비·비운다.
+# 자기 자신인 대상과 CYS_LANE_REDIRECTED가 이미 있는 경우는 재위임하지 않는다(최대 1회).
+# 조기 종료 때만 레인 state/lane-guard-tripped를 key=value로 덮어쓴다
+# (hook_root/lane_root/script/surface/ts). state 부재·쓰기 불가는 삼킨다.
+# date는 선택적인 표식 시각용이며 판정에는 쓰지 않아 외부 명령 비의존 계약을 유지한다.
+cys_lane_mark() {
+  _cys_lm_f="${2:-}/state/lane-guard-tripped"
+  _cys_lm_s="${CYS_SURFACE_ID:-${AITERM_SURFACE_ID:-}}"
+  _cys_lm_ts=""
+  if command -v date >/dev/null 2>&1; then _cys_lm_ts="$(date +%s 2>/dev/null)" || _cys_lm_ts=""; fi
+  {
+    printf 'hook_root=%s\nlane_root=%s\nscript=%s\nsurface=%s\n' "${1:-}" "${2:-}" "${3:-}" "$_cys_lm_s"
+    [ -n "$_cys_lm_ts" ] && printf 'ts=%s\n' "$_cys_lm_ts"
+  } > "$_cys_lm_f" 2>/dev/null || :
+  return 0
+}
+
 cys_lane_guard() {
   [ "${CYS_HOOK_LANE_GUARD:-1}" = "0" ] && return 0
   [ -n "${CYS_PACK_DIR:-}" ] || return 0
@@ -309,12 +327,28 @@ cys_lane_guard() {
   [ -n "$_cys_lg_lane" ] || return 0                         # 판정 불능 → 통과
   [ "$_cys_lg_root" = "$_cys_lg_lane" ] && return 0          # ③ 같은 팩 → 통과
 
-  # ★고지의 가시성 한계(정직 기록): 훅의 프리루드 규약 문장은 `. "…/_lib.sh" 2>/dev/null` 이라
-  #   **source 명령 전체의 stderr 가 억제**된다 — 이 줄은 프리루드를 직접 로드하는 호출자
-  #   (하네스·수동 진단)에게만 보인다. 훅 경로에서 관측 가능한 계약은 '무발화·exit 0·stdout 0'
-  #   이며 검체 H-LANE-GUARD-1 이 두 사실을 각각 잰다(stderr 억제 자체는 이 변경 범위 밖이다).
+  # 위임 대상: 레인 팩의 같은 상대경로 훅(hooks/<name> 또는 hooks/<sub>/<name>)
+  _cys_lg_rel="${_cys_lg_d#"$_cys_lg_root"/}"
+  _cys_lg_name="${0##*/}"
+  _cys_lg_target="$_cys_lg_lane/$_cys_lg_rel/$_cys_lg_name"
+  CYS_LANE_REDIRECT=""
+  if [ -z "${CYS_LANE_REDIRECTED:-}" ] && [ -f "$_cys_lg_target" ] \
+     && [ "$_cys_lg_target" != "$_cys_lg_d/$_cys_lg_name" ]; then
+    CYS_LANE_REDIRECT="$_cys_lg_target"
+    return 0
+  fi
+  cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name"
   echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
   exit 0
+}
+
+cys_lane_redirect() {
+  [ -n "${CYS_LANE_REDIRECT:-}" ] || return 0
+  _cys_lr_t="$CYS_LANE_REDIRECT"
+  CYS_LANE_REDIRECT=""
+  CYS_LANE_REDIRECTED=1
+  export CYS_LANE_REDIRECTED
+  exec "${BASH:-sh}" "$_cys_lr_t" "$@"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -804,7 +838,8 @@ cys_resolve_role() {
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :
 cys_fix_locale >/dev/null 2>&1 || :
-# ★레인 가드는 마지막이다 — 통과 판정이 나야 그 아래 훅 본체가 돈다(조기 종료는 exit 0).
+# ★레인 가드는 마지막이다 — 조기 종료(exit 0) 또는 위임 예약(CYS_LANE_REDIRECT 설정 후 return).
+# 실제 exec는 훅 본문의 `cys_lane_redirect "$@"` 줄이 프리루드 `2>/dev/null` 밖에서 한다.
 cys_lane_guard
 
 # ★반드시 0으로 끝난다(계약 ⓓ) — 비0이면 호출측 loud-skip이 오발동한다.
