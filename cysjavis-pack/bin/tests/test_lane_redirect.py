@@ -15,6 +15,7 @@ r"""test_lane_redirect.py — WP-B-hooks 레인 위임·공통 탐지 RED 검체
      R-7e 같은 팩에서도 env로 상속된 위임 예약 경로 무시
   ⑧ R-8 전 프리루드 경유 훅의 redirect 호출 위치 census(런처·하위 훅 포함)
   ⑨ R-9 혼재 프로필(base+dept 등록 공존) 이중 실행 0 — 가드가 좌석 설정에 대응 훅 등록을 보면 위임 생략 · 정본은 여전히 C56
+     R-9e 상대 CYS_PACK_DIR 원형 문자열은 등록 대조에 쓰지 않는다(base 등록 오인 방지)
   ⑩ P-1 읽기 전용 C83: 표식 나이·실사용 SessionStart 설정·fix 무변경·run 배선
   ⑪ P-2 공용 판독기 + bootstrap/mission hooks_effective additive 필드·exit 불변
   ⑫ R-10 redirect 줄 없는 훅은 본문 실행 없이 표식+exit 0
@@ -379,6 +380,20 @@ def r9(lab):
                 extra={"COUNT": str(count), "CLAUDE_CONFIG_DIR": str(cfg)})
     check("R-9d CYS_PACK_DIR 원형 경로 등록 = 위임 생략",
           r.returncode == 0 and read(count) == "", result(r) + " count=%r" % read(count))
+
+    # 상대 CYS_PACK_DIR(`base` — 훅 cwd 기준으로 dept 를 가리킴)의 원형 문자열
+    # `base/hooks/<hook>` 은 base 등록줄 `…/R-9/base/hooks/<hook>` 의 접미다. 원형 대조가
+    # 상대 경로까지 받으면 base 등록을 dept 등록으로 오인해 위임을 생략한다(표식도 없이
+    # 무음 종료 — 가장 나쁜 방향). 정규화 경로만 dept 이므로 위임 1:1 이어야 한다.
+    (lab.root / "work" / "base").symlink_to(lab.dept, target_is_directory=True)
+    profile(lab, [foreign], cfg, event="PreToolUse")
+    count = lab.root / "count-e"
+    write(count, "")
+    r = lab.run(hook, pack="base",
+                extra={"COUNT": str(count), "CLAUDE_CONFIG_DIR": str(cfg)})
+    check("R-9e 상대 CYS_PACK_DIR 원형은 등록 대조에 안 씀 = 위임 1:1·표식 없음",
+          r.returncode == 0 and read(count) == "x" and not (lab.dept / MARKER).exists(),
+          result(r) + " count=%r marker=%s" % (read(count), (lab.dept / MARKER).exists()))
 
 
 def r10(lab):
