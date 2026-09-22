@@ -2223,6 +2223,7 @@ fn draft_gate_denied_response(
                 DirectSendKind::Text => "text",
                 DirectSendKind::SubmitKey => "submit_key",
                 DirectSendKind::ClearFirst => "clear_first",
+                DirectSendKind::CancelKey => "cancel_key",
             },
             "reason": why.as_str(),
             "pending_input_bytes": pending,
@@ -12911,6 +12912,130 @@ mod tests {
         assert_eq!(before, (3, 3, 3));
         d12_assert_denied(&resp, "human_draft");
         assert_eq!(after, (3, 3, 3), "남의 초안을 제출하지 않고 계수 3 유지");
+    }
+
+    /// ★리뷰 major: 제출 게이트는 키 이름이 아니라 생성 바이트로 판정해야 한다.
+    /// `C-m`/`"\r"` 는 CR, `C-j` 는 LF 를 만들어 Return 과 같은 제출 사고를 낸다.
+    #[test]
+    fn d12_submit_key_alias_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-submit-alias", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_550;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["Return", "Enter", "C-m", "C-j", "\r"] {
+            // RED 별칭이 초안을 제출했어도 다음 별칭은 같은 좌석의 사람 초안을 본다.
+            // 보존 여부는 재주입 전 after 로 기록하므로 이 복구가 결함을 숨기지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid, "\u{15}");
+                v7_send_human(&daemon, target.id, pid, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((key, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "key={key:?}: 모든 별칭에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "key={key:?}: 사람 초안 제출 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_denied(&resp, "human_draft");
+            assert_eq!(after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// ★리뷰 major(덤): 원시 Ctrl-U/Ctrl-C 는 사람 초안을 삭제한다 — 같은 바이트 축으로 막는다.
+    #[test]
+    fn d12_cancel_key_alias_denies_human_draft_but_passes_machine_residue() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-cancel-alias", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_554;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+
+        // 기계 잔여 선정리 대조를 먼저 실행한다: 사람 축 없는 Ctrl-U 는 계속 허용한다.
+        let machine_sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "hello", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": machine_target.id, "key": "C-u", "queued": false,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        let target = v7_pane(&daemon, "worker-3", pid + 2);
+        v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["C-u", "C-c"] {
+            // C-u 의 RED 삭제가 다음 C-c 를 빈 좌석에서 검사하게 만들지 않는다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid + 2, "\u{15}");
+                v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((key, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        // 의도한 사람 초안 RED 단언보다 기계 선정리 대조를 먼저 검증한다.
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (5, 5, 0));
+        assert_eq!(machine_clear["ok"], json!(true), "key=C-u: 기계 잔여 선정리 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "key=C-u: 기계 잔여는 정상 삭제");
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "key={key:?}: 모든 취소 키에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "key={key:?}: 사람 초안 삭제 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_denied(&resp, "human_draft");
+            assert_eq!(after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
+    /// 이름 축 잔재가 없는지: 취소·탐색 키는 사람 초안이 있어도 계속 통과한다(기존 계약).
+    /// 지금 HEAD 에서 PASS 해야 하는 과잉 차단 방지 대조다.
+    #[test]
+    fn d12_navigation_keys_stay_ungated_with_human_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-navigation", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_558;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for key in ["Up", "Escape", "Tab"] {
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+                "surface_id": target.id, "key": key, "queued": false,
+            }));
+            observations.push((key, resp));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert!(before.0 > 0 && before.0 == before.1 && before.1 == before.2,
+            "전제: 사람 초안의 미러·전체·사람 계수: {before:?}");
+        for (key, resp) in observations {
+            assert_eq!(resp["ok"], json!(true), "key={key:?}: 사람 초안이 있어도 탐색 허용: {resp}");
+        }
     }
 
     #[test]

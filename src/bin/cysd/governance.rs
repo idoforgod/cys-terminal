@@ -4915,6 +4915,9 @@ pub(crate) enum DirectSendKind {
     /// `cys send --clear-first` — Ctrl-U 선정리 + 본문 + CR 원자 주입.
     /// C-u 가 지우는 것이 기계 잔여면 정상 용도이고 사람 초안이면 D-12 의 삭제 사고다.
     ClearFirst,
+    /// `cys send-key C-u`/`C-c` 등 **원시 취소 키** — 생성 바이트에 0x15/0x03 이 있는 경로.
+    /// 사람 초안을 지우는 것만 막고 화면 축은 쓰지 않는다(무clear 방향 fail-open).
+    CancelKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4972,6 +4975,7 @@ pub(crate) fn draft_gate_verdict(
                 None
             }
         }
+        DirectSendKind::CancelKey => None, // ⑬ 에서 구현
     }
 }
 
@@ -11371,6 +11375,30 @@ mod tests {
         assert_eq!(draft_gate_verdict(DirectSendKind::SubmitKey, 0, 0, Some(line), true, false), None);
     }
 
+    /// D-12 CancelKey(원시 Ctrl-U/Ctrl-C) 순수 판정 — 사람 초안만 거부하고 화면 축은 쓰지 않는다.
+    #[test]
+    fn d12_verdict_cancel_key_denies_human_draft_only() {
+        // 통과 대조를 RED 단언보다 먼저 검증한다: 기계 잔여 선정리는 정상 용도다.
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 19, 0, None, false, false),
+            None,
+            "기계 잔여는 원시 취소 키로 정리할 수 있다"
+        );
+        // 취소 키를 화면 축으로 막으면 cycle-agent 의 C-u→/clear 가 막혀
+        // 오너 ABSOLUTE ANCHOR ② '무clear'를 건드린다. 사람 초안 삭제만 막는다.
+        let line = PromptLine { before_cursor: "draft", at_or_after_cursor: "" };
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 0, 0, Some(line), false, false),
+            None,
+            "화면이 Occupied 여도 사람 초안 계수가 없으면 취소 키는 통과한다"
+        );
+        assert_eq!(
+            draft_gate_verdict(DirectSendKind::CancelKey, 19, 19, None, false, false),
+            Some(DraftGateDenied::HumanDraft { bytes: 19 }),
+            "RED: 원시 취소 키는 사람 초안 19바이트 삭제를 거부해야 한다"
+        );
+    }
+
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
     /// 이 한 줄이 2026-09-03 13:27~15:37 의 2h10m 영구 보류(PREP '백로그 #1 보정')를 막는다.
     #[test]
@@ -11807,6 +11835,46 @@ mod tests {
             split.count == 0 && split.human == 0,
             "분할 ESC·CR 은 Esc 키 뒤 Enter = 제출: {split:?}"
         );
+    }
+
+    /// 리뷰 minor: 이월 tail 이 단독 ESC 로 끝나는 상태에서 온 CR 은 Meta-Enter 가 아니라 제출이다.
+    /// 현재 하한(2)에서는 이 상태가 자연 발생하지 않으므로 상태를 직접 만들어 가드를 고정한다.
+    /// 지금 HEAD 에서 PASS 여도 되는 회귀 방지 검체이며 RED 대상이 아니다.
+    #[test]
+    fn v2_carried_escape_then_cr_is_submit_not_meta_enter() {
+        let st = PendingInputState {
+            count: 5,
+            human: 5,
+            tail: vec![0x1b],
+            ..Default::default()
+        };
+        let next = super::pending_input_step(
+            &st,
+            b"\r",
+            InputOrigin::Human,
+            std::time::Instant::now(),
+        );
+        assert_eq!((next.count, next.human), (0, 0), "이월 ESC 뒤 CR 은 제출: {next:?}");
+
+        let same_chunk = v2_run(&[(b"ab\x1b\r", InputOrigin::Human, 0)]);
+        assert_eq!(same_chunk.count, 4, "같은 청크의 ESC+CR 은 Meta-Enter: {same_chunk:?}");
+    }
+
+    /// 리뷰 minor(RED): CLOSE 표식이 ESC 경계에서 잘려 와도 봉투는 닫혀야 한다.
+    #[test]
+    fn v2_close_marker_cut_at_escape_inside_paste_closes_envelope() {
+        // 라운드 1 회귀 방지 대조는 RED 단언 전에 검증한다.
+        let outside = v2_run(&[(b"hello\x1b", InputOrigin::Human, 0)]);
+        assert_eq!(outside.count, 6, "봉투 밖 단독 ESC 는 즉시 가산: {outside:?}");
+        assert!(outside.tail.is_empty(), "봉투 밖 단독 ESC 는 이월하지 않는다: {outside:?}");
+
+        let st = v2_run(&[
+            (b"\x1b[200~abc\x1b", InputOrigin::Human, 0),
+            (b"[201~", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(st.count, 3, "RED: 분할 CLOSE 는 본문 abc 만 남겨야 한다: {st:?}");
+        assert!(!st.in_paste, "분할 CLOSE 뒤 봉투가 닫혀야 한다: {st:?}");
+        assert!(st.tail.is_empty(), "완성된 CLOSE 표식은 이월하지 않는다: {st:?}");
     }
 
     /// 단독 Esc 키는 즉시 1바이트로 세고, 다음 청크의 CR 은 출처와 무관하게 제출한다(RED).
