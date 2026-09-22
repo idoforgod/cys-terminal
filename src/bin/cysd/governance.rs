@@ -11774,7 +11774,7 @@ mod tests {
         assert_eq!(inside.count, 3);
     }
 
-    /// 설계 §5 D-01 v2 Meta-Enter 항 — ESC+CR 은 한 청크든 분할이든 제출이 아닌 줄바꿈이다(RED).
+    /// Meta-Enter 예외는 같은 청크 안의 ESC+CR 에만 — 분할은 Esc 키 뒤 Enter(제출).
     #[test]
     fn v2_meta_enter_is_newline_not_submit() {
         let single = v2_run(&[
@@ -11787,7 +11787,77 @@ mod tests {
             (b"\r", InputOrigin::Human, 0),
         ]);
         assert!(single.count >= 4, "Meta-Enter 가 제출로 계수를 지웠다: {single:?}");
-        assert!(split.count >= 4, "분할 Meta-Enter 가 제출로 계수를 지웠다: {split:?}");
+        assert!(
+            split.count == 0 && split.human == 0,
+            "분할 ESC·CR 은 Esc 키 뒤 Enter = 제출: {split:?}"
+        );
+    }
+
+    /// 단독 Esc 키는 즉시 1바이트로 세고, 다음 청크의 CR 은 출처와 무관하게 제출한다(RED).
+    #[test]
+    fn v2_lone_escape_chunk_then_cr_submits() {
+        for origin in [InputOrigin::Human, InputOrigin::Machine] {
+            let submitted = v2_run(&[
+                (b"hello", InputOrigin::Human, 0),
+                (b"\x1b", InputOrigin::Human, 0),
+                (b"\r", origin, 0),
+            ]);
+            assert!(
+                submitted.count == 0 && submitted.human == 0,
+                "단독 ESC 뒤 {origin:?} CR 은 제출: {submitted:?}"
+            );
+        }
+
+        let escaped = v2_run(&[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            escaped.count == 6 && escaped.human == 6 && escaped.tail.is_empty(),
+            "단독 ESC 는 즉시 1바이트 가산하고 이월하지 않는다: {escaped:?}"
+        );
+    }
+
+    /// 단독 ESC 와 다음 청크의 포커스 보고를 합치지 않는다(RED · 리뷰 실측 count=4).
+    #[test]
+    fn v2_lone_escape_then_focus_report_is_not_merged() {
+        let state = v2_run(&[
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            state.count == 1 && state.tail.is_empty(),
+            "ESC 1바이트만 세고 포커스 보고는 세그먼트 면제: {state:?}"
+        );
+    }
+
+    /// 표식 접두는 2바이트부터 이월하고, 미완성 tail 뒤 CR 은 원래 제출 규칙을 따른다(RED).
+    #[test]
+    fn v2_tail_carry_requires_two_byte_marker_prefix() {
+        let lone = v2_run(&[(b"hello\x1b", InputOrigin::Human, 0)]);
+        assert!(
+            lone.tail.is_empty() && lone.count == 6,
+            "1바이트 표식 접두인 단독 ESC 는 이월하지 않는다: {lone:?}"
+        );
+
+        let partial = v2_run(&[(b"hello\x1b[", InputOrigin::Human, 0)]);
+        assert_eq!(partial.tail, b"\x1b[");
+        assert_eq!(partial.count, 5);
+
+        let completed = v2_run(&[
+            (b"hello\x1b[", InputOrigin::Human, 0),
+            (b"200~abc", InputOrigin::Human, 0),
+        ]);
+        assert!(
+            completed.count == 8 && completed.in_paste && completed.tail.is_empty(),
+            "이월 tail 이 OPEN 으로 완성되면 본문 abc 3바이트만 가산: {completed:?}"
+        );
+
+        let submitted = v2_run(&[
+            (b"hello\x1b[", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(submitted.count, 0, "미완성 tail 의 [ 뒤 CR 은 Meta-Enter 가 아닌 제출");
     }
 
     /// 설계 §5 D-01 v2 봉투 표식 이월 항 — 접두 ≤5바이트는 계수 없이 보관하고 완성 뒤 비운다(RED).

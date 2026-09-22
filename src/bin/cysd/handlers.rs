@@ -12952,7 +12952,7 @@ mod tests {
         let mut observations = Vec::new();
         for (method, extra, kind, reason) in [
             ("surface.send_text", json!({"text": "hello"}), "text", "pending_input"),
-            ("surface.send_text", json!({"text": "hello", "clear_first": true}), "text", "pending_input"),
+            ("surface.send_text", json!({"text": "hello", "clear_first": true}), "clear_first", "human_draft"),
             ("surface.send_key", json!({"key": "Return"}), "submit_key", "human_draft"),
             ("surface.send_key", json!({"key": "Enter"}), "submit_key", "human_draft"),
         ] {
@@ -12981,6 +12981,53 @@ mod tests {
                 "from": cys::surface_ref(sender.id),
             }));
         }
+    }
+
+    /// 비권위 clear_first 는 기계 잔여를 지우고 제출하되 사람 초안은 보존한다.
+    #[test]
+    fn d12_clear_first_passes_machine_residue_but_denies_human_draft() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_540;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+        let human_target = v7_pane(&daemon, "worker-3", pid + 2);
+        for target in [&machine_target, &human_target] {
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+        }
+
+        // (a) 기계 잔여: 별도 pid 의 비권위 clear_first 가 지우고 원자 제출한다.
+        let machine_sent = d12_rpc(&daemon, pid, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "hello", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "replace", "clear_first": true,
+            "human": false, "queued": false, "quiet": true,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        // (b) 독립 pane 의 사람 초안: (a) 의 RED 잔여가 이 시나리오에 섞이지 않는다.
+        let human_sent = v7_send_human(&daemon, human_target.id, pid + 2, "owner draft");
+        *human_target.last_human_input.lock().unwrap() = None;
+        let human_before = d12_input_counts(&human_target);
+        let human_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": human_target.id, "text": "replace", "clear_first": true,
+            "human": false, "queued": false, "quiet": true,
+        }));
+        let human_after = d12_input_counts(&human_target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (5, 5, 0));
+        assert_eq!(machine_clear["ok"], json!(true), "기계 잔여는 clear_first 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "원자 Inject 는 미제출 입력을 비운다");
+        assert_eq!(human_sent, 11);
+        assert_eq!(human_before, (11, 11, 11));
+        d12_assert_denied(&human_clear, "human_draft");
+        assert_eq!(human_after, (11, 11, 11), "거부된 clear_first 는 사람 초안 계수를 보존한다");
     }
 
     /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
