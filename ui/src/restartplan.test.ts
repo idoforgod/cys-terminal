@@ -189,6 +189,31 @@ describe("재기동 실패 — 데몬 거부를 한국어 처방으로 낸다", 
     }
   });
 
+  // ★(0.14.39 라운드3 · 부트체인 notice) 위 PROD_* 는 손으로 옮긴 리터럴이다 — 정의처가 바뀌면
+  //   번역표는 그대로 통과하면서 실제 문면과 어긋나 **사유 축이 조용히 죽는다**(거부가 원문으로
+  //   떨어져 사람이 처방을 못 본다). 러스트 정의처를 읽어 대조해 그 무음 실패를 막는다.
+  test("거부 문면의 정의처(러스트 상수·리터럴)와 검체가 어긋나지 않는다", () => {
+    const lib = readFileSync(new URL("../../src/lib.rs", import.meta.url), "utf-8");
+    const constOf = (name: string): string => {
+      const line = lib.split("\n").find((l) => l.trimStart().startsWith(`pub const ${name}: &str = "`));
+      if (!line) throw new Error(`src/lib.rs 에 ${name} 정의가 없다 — 문면 축의 정의처가 사라졌다`);
+      return line.slice(line.indexOf('"') + 1, line.lastIndexOf('"'));
+    };
+    const errTyping = constOf("ERR_TYPING_GUARD");
+    const msgTyping = constOf("MSG_TYPING_GUARD");
+    const draftTag = constOf("DRAFT_GATE_TAG");
+    expect(PROD_TYPING_GUARD).toBe(`${errTyping}: ${msgTyping}`);
+    // draft_gate_denied_response: `{MSG_TYPING_GUARD} [{DRAFT_GATE_TAG}:{why}]` · code 는 ERR_TYPING_GUARD.
+    expect(PROD_DRAFT_GATE).toBe(`${errTyping}: ${msgTyping} [${draftTag}:pending_input]`);
+    const handlers = readFileSync(new URL("../../src/bin/cysd/handlers.rs", import.meta.url), "utf-8");
+    const [code, message] = PROD_CLEAR_FIRST_UNSUPPORTED.split(/: (.+)/);
+    if (!handlers.includes(`"${code}"`) || !handlers.includes(`"${message}"`)) {
+      throw new Error(
+        `handlers.rs 의 clear_first 거부 문면이 검체와 다르다 — 번역이 vacuous 가 된다: ${PROD_CLEAR_FIRST_UNSUPPORTED}`,
+      );
+    }
+  });
+
   test("번역표에 없는 오류는 삼키지 않고 원문을 싣는다", () => {
     expect(restartInvokeFailureReason(new Error("daemon unreachable"))).toBe("daemon unreachable");
     expect(restartInvokeFailureReason("  socket closed  ")).toBe("socket closed");
