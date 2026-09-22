@@ -1082,12 +1082,73 @@ fn scrub_claude_session_env() {
     }
 }
 
+/// cysd 명령줄 판정(순수 · argv[0] 제외).
+#[derive(Debug, PartialEq, Eq)]
+enum CysdCli {
+    Run,
+    Version,
+    Help,
+    Unknown(String),
+}
+
+fn parse_cysd_args<I: IntoIterator<Item = String>>(args: I) -> CysdCli {
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return CysdCli::Run;
+    };
+    let command = match first.as_str() {
+        "--version" | "-V" => CysdCli::Version,
+        "--help" | "-h" => CysdCli::Help,
+        _ => return CysdCli::Unknown(first),
+    };
+    match args.next() {
+        Some(extra) => CysdCli::Unknown(extra),
+        None => command,
+    }
+}
+
+/// `cysd <version> (build <id>)` 한 줄.
+fn cysd_version_line() -> String {
+    format!("cysd {} (build {})", env!("CARGO_PKG_VERSION"), cys::pack::build_id())
+}
+
+/// usage 본문 — `usage: cysd [--version|-V|--help|-h]` 로 시작하고 무인자만 데몬을 기동한다.
+fn cysd_usage() -> String {
+    concat!(
+        "usage: cysd [--version|-V|--help|-h]\n",
+        "  cysd            데몬을 기동한다(무인자만 기동 · 소켓은 CYS_SOCKET · 팩은 CYS_PACK_DIR)\n",
+        "  --version, -V   버전과 빌드 ID 를 stdout 에 내고 exit 0\n",
+        "  --help, -h      이 도움말 · exit 0\n",
+        "  그 밖의 인자    usage 를 stderr 에 내고 exit 2 — 데몬은 기동하지 않는다\n",
+    )
+    .to_string()
+}
+
+/// 종전에는 `src/bin/cysd/**` 에 `env::args` 가 없어 `cysd --version` 도 데몬을 기동했다
+/// (1차 검증 샌드박스 실사고). 인자를 먼저 판정하고 무인자만 데몬을 기동한다.
+///
 /// ★SEAL-1 층3 배선 지점(sync main). `#[tokio::main]` 은 `async_main` 으로 내려가 있고, 여기서
 /// **런타임(=워커 스레드)이 만들어지기 전에** 프로세스 env 를 봉인한다 — `set_var` 는 프로세스
 /// 전역이라 스레드가 살아 있는 동안 쓰면 경합한다(lib.rs `seal_python_bytecode_in_process` 계약).
 /// 이 한 줄로 데몬의 **모든** 자손이 덮인다: pane(층2 가 이미 명시 주입) + 층1·층2 가 닿지 않는
 /// 임의 명령 경로 — `channels::spawn_bridge`(사용자 bridge_cmd)·`accounts` cmd 어댑터(주기 폴링).
 fn main() {
+    match parse_cysd_args(std::env::args().skip(1)) {
+        CysdCli::Version => {
+            println!("{}", cysd_version_line());
+            std::process::exit(0);
+        }
+        CysdCli::Help => {
+            print!("{}", cysd_usage());
+            std::process::exit(0);
+        }
+        CysdCli::Unknown(a) => {
+            eprintln!("cysd: unknown argument '{a}'");
+            eprint!("{}", cysd_usage());
+            std::process::exit(2);
+        }
+        CysdCli::Run => {}
+    }
     cys::seal_python_bytecode_in_process();
     async_main();
 }
@@ -5657,5 +5718,92 @@ mod update_leftover_sweep_tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod cysd_args_tests {
+    use super::*;
+
+    #[test]
+    fn cysd_args_no_args_runs() {
+        assert_eq!(parse_cysd_args(Vec::<String>::new()), CysdCli::Run);
+    }
+
+    #[test]
+    fn cysd_args_version_flags() {
+        for flag in ["--version", "-V"] {
+            assert_eq!(parse_cysd_args([flag.to_string()]), CysdCli::Version, "{flag}");
+        }
+    }
+
+    #[test]
+    fn cysd_args_help_flags() {
+        for flag in ["--help", "-h"] {
+            assert_eq!(parse_cysd_args([flag.to_string()]), CysdCli::Help, "{flag}");
+        }
+    }
+
+    #[test]
+    fn cysd_args_unknown_is_rejected() {
+        for (args, unknown) in [
+            (vec!["--socket", "x"], "--socket"),
+            (vec!["foo"], "foo"),
+            (vec!["--version", "extra"], "extra"),
+        ] {
+            assert_eq!(
+                parse_cysd_args(args.into_iter().map(str::to_string)),
+                CysdCli::Unknown(unknown.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn cysd_args_version_line_has_version_and_build_id() {
+        let line = cysd_version_line();
+        assert!(line.starts_with("cysd "), "버전 출력 접두 누락: {line:?}");
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "패키지 버전 누락: {line:?}");
+        assert!(line.contains(cys::pack::build_id()), "빌드 ID 누락: {line:?}");
+    }
+
+    #[test]
+    fn cysd_args_usage_mentions_flags_and_daemon_start() {
+        let usage = cysd_usage();
+        assert!(
+            usage.lines().next().is_some_and(|line| line.starts_with("usage:")),
+            "usage 첫 줄 누락: {usage:?}"
+        );
+        for expected in ["--version", "--help", "cysd"] {
+            assert!(usage.contains(expected), "usage에 {expected} 누락: {usage:?}");
+        }
+    }
+
+    #[test]
+    fn cysd_args_main_dispatches_before_daemon_start_source_pin() {
+        let src = include_str!("main.rs");
+        let start = src.find("\nfn main() {").expect("main 함수 앵커") + "\nfn main() {".len();
+        let tail = &src[start..];
+        let end = ["\nfn ", "\n#[tokio::main]"]
+            .iter()
+            .filter_map(|boundary| tail.find(*boundary))
+            .min()
+            .expect("main 함수 다음 경계");
+        let body = &tail[..end];
+        let parse = body.find("parse_cysd_args(").expect("데몬 기동 전 인자 판정 누락");
+        let daemon = body.find("async_main()").expect("데몬 기동 호출 누락");
+        assert!(parse < daemon, "인자 판정이 데몬 기동보다 늦다");
+        assert!(body.contains("std::process::exit(2)"), "잘못된 인자의 종료 코드 2 누락");
+        assert!(body.contains("std::process::exit(0)"), "조회 인자의 종료 코드 0 누락");
+    }
+
+    #[test]
+    fn cysd_args_startup_marker_stays_first_in_async_main_source_pin() {
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("\nasync fn async_main() {")
+            .expect("async_main 함수 앵커")
+            .1;
+        let first_log = body.split_once("eprintln!(").expect("기동 로그 누락").1.trim_start();
+        assert!(first_log.starts_with("\"[cysd] v{} {}\""), "첫 기동 로그의 릴리스 게이트 마커 변경");
     }
 }

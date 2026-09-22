@@ -388,12 +388,17 @@ pub fn err_response(id: &Value, code: &str, message: &str) -> Value {
     serde_json::json!({"id": id, "ok": false, "error": {"code": code, "message": message}})
 }
 
-/// Default socket path: ~/.local/state/cys/cys.sock (unix),
-/// \\.\pipe\cys (windows). Overridable via CYS_SOCKET (legacy JAVIS_/AITERM_ honored).
+/// 접속 소켓 경로 — CYS_SOCKET(레거시 JAVIS_/AITERM_ 포함)이 우선이며, 없으면 기본 경로다.
 pub fn socket_path() -> PathBuf {
     if let Some(p) = env_compat(ENV_SOCKET) {
         return PathBuf::from(p);
     }
+    default_socket_path()
+}
+
+/// 소켓 override 환경변수를 보지 않는 기본 경로(순수 계산).
+/// unix 는 ~/.local/state/cys/cys.sock, windows 는 \\.\pipe\cys 규약을 그대로 따른다.
+pub fn default_socket_path() -> PathBuf {
     #[cfg(windows)]
     {
         PathBuf::from(r"\\.\pipe\cys")
@@ -2710,6 +2715,29 @@ pub mod mousereport {
 
 #[cfg(test)]
 mod tests {
+
+    /// 소켓 환경변수 변경은 --test-threads=1 로 직렬 실행하며, 실패해도 원래 값을 복원한다.
+    #[test]
+    fn d06_lib_default_socket_path_is_absolute_and_env_free() {
+        struct RestoreSocketEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreSocketEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(super::ENV_SOCKET, value),
+                    None => std::env::remove_var(super::ENV_SOCKET),
+                }
+            }
+        }
+        let _restore = RestoreSocketEnv(std::env::var_os(super::ENV_SOCKET));
+        let expected = super::default_socket_path();
+        assert!(expected.is_absolute(), "기본 소켓은 절대경로여야 한다: {expected:?}");
+        #[cfg(unix)]
+        assert!(expected.ends_with("cys/cys.sock"), "unix 기본 소켓 규약: {expected:?}");
+        for value in ["False", "./x.sock", "/h/isolated/cys.sock", ""] {
+            std::env::set_var(super::ENV_SOCKET, value);
+            assert_eq!(super::default_socket_path(), expected, "CYS_SOCKET={value:?} 를 보지 않아야 한다");
+        }
+    }
 
     /// ★C3-c(2026-09-17 3라운드) 공용 BOM 전처리 핀 — 선두 1개만 벗기고 나머지 바이트는 그대로.
     /// (src-tauri 의 k2_03 핀과 같은 표본 — 그쪽은 이제 이 함수를 쓰므로 표본이 갈리면 여기서 먼저 red.)

@@ -1277,6 +1277,26 @@ jobs:
             echo "::error::[pack] javis_detect self-test 실패 — 감지기 4축 억제 회귀. 서명 전 차단." >&2
             exit 1
           fi
+          # ★WP-D(2026-09-22 · v0.14.39 · 감사 major ①): 컨텍스트 사이클 autopilot·verifier self-test 가
+          #   3레인 어디에서도 0회 실행이었다(직전 보고 "이미 팩 스위트 진입점" 은 '서브커맨드 존재' 와
+          #   '레인 등재' 의 혼동). 봉인 대상: 게이트5 held_noop 분류·지수 쿨다운·구조적 보류 상한 ·
+          #   HELD_RCS↔러스트 84/85 이음매 · CONTRACT BLOCK v1 바이트 동일성(verifier) · held 통지 유한화
+          #   (tick 무통지 — javis_wakeup 멱등키 배달 후 소멸 전제 핀 [18-b]). 실측 0.1s · 격리 HOME 필수
+          #   (라이브 ~/.cys 접촉 금지) · 셸 스텁 cys 만 스폰(데몬 무접촉). 3완전 레인 동시·대칭 등재 —
+          #   self-test 는 `test_` 토큰이 아니라 레인 대조 게이트 시야 밖이다(대칭은 이 주석이 지킨다).
+          for c in javis_cycle_autopilot javis_cycle_verifier; do
+            g="cysjavis-pack/bin/$c.py"
+            [ -f "$g" ] || { echo "사이클 스크립트 누락: $g (git add 누락 의심)" >&2; exit 1; }
+            echo "== $c self-test [pack] =="
+            if ! env -u CYS_SOCKET -u CYS_GATE_LANE_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID \
+                   HOME="$(mktemp -d)" CYS_PACK_DIR="$(mktemp -d)" CYS_STATE_DIR="$(mktemp -d)" \
+                   JAVIS_ROOT="$(mktemp -d)" python3 "$g" self-test > "/tmp/wpd-$c.log" 2>&1; then
+              tail -40 "/tmp/wpd-$c.log"
+              echo "::error::[pack] $c self-test 실패 — 컨텍스트 사이클 autopilot/verifier 회귀(WP-D)." >&2
+              exit 1
+            fi
+            tail -3 "/tmp/wpd-$c.log"
+          done
           # ★W-CI2(2026-08-21): Wave 2 좌석 래치 회귀 핀 test_seat_latch_negation 편입(위 루프
           #   말미 · 실측 0.007s·19케이스 · 순수 픽스처·라이브 무접촉 — ci-branch·pack-release
           #   와 같은 커밋·3완전 레인 동시 대칭). 판정 원본 javis_orchestra.py·javis_boot_node.py

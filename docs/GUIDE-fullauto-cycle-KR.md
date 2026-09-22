@@ -20,7 +20,7 @@
 - kill-switch 4중: ①`cys pause`(스케줄 동결) ②`cys gate-check` ③`$CYS_PACK_DIR/AUTOPILOT_PAUSED` 또는 `<프로젝트>/_round/AUTOPILOT_PAUSED` 파일(하나라도 존재=무집행) ④집행 중 1~5s 폴링·감지 시 SIGTERM.
 - 검증자는 반드시 **별도 pane 포그라운드**로 상주(`bootstrap-verifier`가 생성). detached·데몬 스폰은 데몬의 self-approval 게이트가 범주적으로 거부한다. 맨 셸·LLM pane 금지.
 - 측정은 statusline 서버 진실만 판정 투입(claude 노드 한정). 자기보고·transcript 추정은 판정 금지.
-- 실패 종결 후 재발화는 운영자 `reset` + 쿨다운(180s)으로만. `--force-no-verify`는 어떤 경로로도 사용되지 않는다.
+- **실패**(`failed`·`failed_preclear`·`indeterminate`) 종결 후 재발화는 운영자 `reset` + 쿨다운(180s)으로만. **비파괴 보류**(`held_noop` · cycle-agent exit 84/85)는 실패가 아니라 자동 재시도 대상이다 — §4-b 표. `--force-no-verify`는 어떤 경로로도 사용되지 않는다.
 - 즉시 전체 무력화: 환경변수 `CYS_STATE_LEDGER_DISABLE=1`(원장 훅) + 스케줄 잡 제거 또는 `cys pause`.
 
 ## 3. 활성화 절차 (단계적 — 건너뛰지 말 것)
@@ -41,7 +41,21 @@
 ## 4. 관측·트러블슈팅
 
 - 원장: `<프로젝트>/_round/cycle_autopilot_log.jsonl`(사이클 phase 전이 전부)·`STATE_LEDGER.jsonl`(이벤트). `status`·`audit` 서브커맨드.
-- 사이클이 안 돈다 → 원장의 skip reason이 사실이다(측정 source·유휴·쿨다운·짝짓기·검증자 heartbeat). 직전 종결이 failed면 `reset --role <r> --reason "<사유>"` 후 180s.
+- 사이클이 안 돈다 → 원장의 skip reason이 사실이다(측정 source·유휴·쿨다운·짝짓기·검증자 heartbeat). 직전 종결이 failed면 `reset --role <r> --reason "<사유>"` 후 180s. 직전 종결이 `held_noop` 이면 reset 하지 마라 — 아래 §4-b 의 쿨다운이 지나면 스스로 다시 발화한다(구조적 보류 상한 도달만 예외).
+
+### 4-b. cycle-agent 종료코드 84·85·86 과 `held_noop` (v0.14.39 · WP-D)
+
+| exit | 뜻 | clear 송신 | autopilot 종결 | 운영자 조치 |
+|---|---|---|---|---|
+| 84 | 대상이 `--timeout` 안에 유휴(턴 종료·빈 composer)가 되지 않음 | **0건** | `held_noop` | 없음 — 자동 재시도 |
+| 85 | 사람 초안·미제출 입력 보호(사전 확인) 또는 데몬 타이핑 가드가 `/clear` 를 거부 | **0건**(타이핑 가드 거부 경로는 `C-u` 1키가 선행할 수 있다) | `held_noop` | 없음 — 자동 재시도 |
+| 86 | clear 는 **이미 실효**(session_file 교체 확인)했으나 재주입 직전 대상이 유휴가 안 됨 · RESUME 은 최선노력 송신 | **1건(발효)** | 사후검증(held 아님) | 손으로 다시 clear **금지** — 좌석에 [RESUME] 이 없으면 재주입만 |
+
+- **자동 재시도 규칙(게이트5)**: `held_noop` 뒤 쿨다운은 연속 보류 횟수에 따라 지수 증가 — 1회 300s → 2회 600s → 3회 이상 1200s(성공 사이클 쿨다운과 같은 상한). 대상이 살아서 턴을 도는 한(rc84 비구조 · rc85) **하드 정지 없음**. 다른 게이트(유휴·임계·오너 부재·single-flight·검증자 heartbeat)는 그대로 겹쳐 잡는다.
+- **구조적 보류 상한**: rc84 문면에 `[diag=quiet_secs_unreported]` 가 붙으면(데몬이 `quiet_secs` 를 보고하지 않는 구 데몬 · 재시도가 원리적으로 무의미) 그 보류만 세어 연속 3회(`HELD_RETRY_MAX`)에 도달하면 자동 재시도를 멈추고 `autopilot-held-limit` 통지 1회를 낸다. 해제 = 데몬 갱신(`cys daemon restart` 또는 팩 업그레이드) 후 `reset --role <r>`.
+- **통지는 보류 연속 구간당 유한**: `autopilot-held` 는 1회째와 `HELD_NOTIFY_EVERY`(=3)의 배수 회(3·6·9…)에서만, `autopilot-held-limit` 는 도달 순간 1회. tick 은 통지하지 않는다(javis_wakeup 멱등키는 배달 뒤 소멸하므로 tick 재통지 = 매분 홍수). ★통지 주기(`HELD_NOTIFY_EVERY`)와 구조적 보류 하드 상한(`HELD_RETRY_MAX`)은 **서로 다른 노브**다 — digest 가 잦아 주기를 늘려도 사람 개입 시점(상한)은 밀리지 않는다. 예외로 종결 뒤 원장 재조회 값이 예측과 어긋나면(경합 · 원장 손상) 주기와 무관하게 `autopilot-held` 1건을 반드시 내고 문면에 `원장 재조회 불일치(예측 N != 원장 M)` 를 싣는다(침묵 금지). 원장 `detail`: `held_streak`·`held_structural_streak`·`structural`·`alive_evidence`·`keys_sent`·`cooldown_secs`·`retry_after_ts`·`residual_window_secs`(검증자 allow→clear 실측 · 자식 stderr 파싱 · 미보고면 null).
+- **`keys_sent` 는 어댑터와 무관하게 읽는다**: rc85 타이핑 가드 거부 경로의 `C-u` 1건 선행 여부는 자식 문면의 `C-u 1건은 선행 송신됨`·`[cycle 5/7] 입력 버퍼 정리 + '` 로 판정한다 — `agents.json` 의 `clear_cmd` 가 `/clear` 든 `/new` 든 같게 기록된다(종전에는 `/clear` 좌석에서만 맞았다).
+- 84~86 을 **실패로 읽고 손으로 강제 clear 를 치는 것**이 이 장치가 막는 사고다. 원장 `phase` 가 `held_noop` 이면 기다려라.
 - 검증자 deny가 잦다 → 대상 턴 종료 리듬 대비 대기창(기본 108s·유휴 하한 5s) 점검.
 - 스케줄 `schedule.error`가 매분 뜬다 → 틱 자체 오류(정상 skip은 exit 0)다. 원장과 py_compile 확인.
 
