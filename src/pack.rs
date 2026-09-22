@@ -5053,6 +5053,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// D-04 ③: 옛 vendor agents.json 은 팩 갱신 시 보존되고, 마커만 읽기 시점에 승격된다.
+    #[test]
+    fn d04_pack_update_keeps_user_owned_agents_json_and_runtime_promotes_stale_marker() {
+        use crate::agent_markers::{marker_candidates, promote_stale_vendor_defaults};
+        use serde_json::json;
+
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("cys-pack-d04-marker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let td = root.join("pack-dept-1");
+        std::fs::create_dir_all(&td).unwrap();
+        let _env = set_pack_env(&td, td.join("cysclaude"));
+        // set_pack_env 는 경로만 격리한다. install 은 basename 으로 Dept 를 판정하며,
+        // 부서 스코프도 설치를 막지 않고 agents.json 의 User 소유권을 그대로 유지한다.
+        assert_eq!(pack_scope_of(&pack_dir()), PackScope::Dept);
+        assert_eq!(ownership_scoped("agents.json", PackScope::Dept), Ownership::User);
+
+        let embedded = PACK_ALL.iter().find(|(rel, _)| *rel == "agents.json")
+            .map(|(_, content)| *content).expect("팩에 agents.json 부재");
+        let embed: serde_json::Value = serde_json::from_str(embedded).unwrap();
+        let mut stale = embed.clone();
+        stale["codex"]["prompt_marker"] = json!("›");
+        stale["gemini"].as_object_mut().unwrap().remove("prompt_marker");
+        let old_vendor = serde_json::to_string_pretty(&stale).unwrap();
+        std::fs::write(td.join("agents.json"), &old_vendor).unwrap();
+        // 0.14.38 설치 형상 + 설치 당시 해시: 사용자가 수정하지 않은 옛 vendor 본이다.
+        let manifest = json!({"agents.json": content_hash(&old_vendor)});
+        std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
+
+        install(false, None).expect("install 실패");
+        let read = |rel: &str| std::fs::read(td.join(rel)).unwrap();
+        assert_eq!(read("agents.json"), old_vendor.as_bytes(), "옛 vendor 본도 user-owned 로 보존");
+        assert_eq!(read("agents.json.new"), embedded.as_bytes(), ".new = 임베드 신버전");
+        let pending = load_merge_pending(&td);
+        assert_eq!(pending.get("agents.json").and_then(|e| e["kind"].as_str()), Some("new-pending"));
+        assert_eq!(pending.get("agents.json").and_then(|e| e["side"].as_str()), Some("agents.json.new"));
+        assert_eq!(embed["codex"]["prompt_marker"], json!(["›", "»"]));
+        assert_eq!(embed["gemini"]["prompt_marker"], json!([">"]));
+
+        // 디스크 우선 읽기: 설치가 보존한 옛 codex 기본값은 메모리에서만 승격한다.
+        let disk: serde_json::Value = serde_json::from_slice(&read("agents.json")).unwrap();
+        let mut spec = disk["codex"].clone();
+        assert_eq!(
+            promote_stale_vendor_defaults("codex", &mut spec, Some(&embed["codex"])),
+            vec!["prompt_marker"]
+        );
+        assert_eq!(spec["prompt_marker"], json!(["›", "»"]));
+        // gemini 는 키 부재 → 후보 없음 → 데몬 merged_prompt_marker 순서상 임베드로 폴백.
+        assert!(disk["gemini"].get("prompt_marker").is_none());
+        assert!(marker_candidates(disk["gemini"].get("prompt_marker")).is_empty());
+        assert_eq!(marker_candidates(embed["gemini"].get("prompt_marker")), vec![">"]);
+        let mut custom = disk["codex"].clone();
+        custom["prompt_marker"] = json!("▶");
+        let custom_before = custom.clone();
+        assert!(
+            promote_stale_vendor_defaults("codex", &mut custom, Some(&embed["codex"])).is_empty()
+        );
+        assert_eq!(custom, custom_before, "사용자 커스텀은 승격하지 않는다");
+
+        // 재설치도 디스크·병치본·new-pending 항목을 보존하고 원장을 중복 계상하지 않는다.
+        install(false, None).expect("재실행 실패");
+        assert_eq!(read("agents.json"), old_vendor.as_bytes());
+        assert_eq!(read("agents.json.new"), embedded.as_bytes());
+        let pending_after = load_merge_pending(&td);
+        assert_eq!(pending_after.get("agents.json").and_then(|e| e["kind"].as_str()), Some("new-pending"));
+        assert_eq!(pending_after.get("agents.json"), pending.get("agents.json"));
+        assert_eq!(pending_after.len(), pending.len(), "원장 항목 수 불변");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// ★플랜=실제 무드리프트(④): plan_install 분류가 같은 픽스처의 install 실행 결과와 일치.
     #[test]
     fn plan_install_matches_actual_install_actions() {
