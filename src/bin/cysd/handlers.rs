@@ -4381,6 +4381,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // Return 은 human 축으로 검사해 관례적인 기계 send+Return 의 자기 본문 제출을
             // 보호한다. inject_text/launch-agent 의 검증된 authoritative 경로는 의도된 예외다:
             // cycle-agent D-16 ④는 C-u 전에 화면 초안을 스스로 검사한다.
+            // ★면제 범위 명시(수정 라운드 1 · 리뷰 minor) — 이 게이트는 `human` 자기신고를 믿는다.
+            //   ⓐ GUI 가 **조립한** 문안(전출 지시·launchCmd·restartNode·injectRawToPane)은
+            //      `machine_origin=true` 여도 `human: !queued`(src-tauri/src/main.rs:515) 로 오므로
+            //      게이트를 지난다 — base 타이핑 가드와 같은 규약이고 오너 클릭 발화라 의도된 면제다.
+            //      (배달 원장 기록 억제만 `machine_origin` 으로 갈린다 — 그 축과 섞지 말 것.)
+            //   ⓑ 원시 소켓이 `human:true` 로 신고하면 마찬가지로 지난다. 방향은 fail-closed 다:
+            //      그 바이트가 human 계수에 들어가 **그 좌석행 기계 Return 이 이후 거부**된다.
+            //   우회를 막으려면 origin 판정을 `human_verified`(operator_token) 로 승격해야 하는데,
+            //   그러면 토큰 없는 CLI 사람 경로가 전부 기계로 떨어진다 — 별도 결정 사항으로 남긴다.
             // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
             let gate_kind = if !human
                 && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
