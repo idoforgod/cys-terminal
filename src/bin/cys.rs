@@ -66,6 +66,8 @@ enum Command {
         #[arg(long)]
         queued: bool,
         /// 입력 버퍼 선정리(Ctrl-U) — launch-agent 등록 에이전트 pane 한정 (TUI별 의미 상이)
+        ///
+        /// 사람 초안(또는 미계수 화면 초안)이 있으면 typing_guard/draft_gate 로 거부되며 --queued 폴백은 없다(원자 주입은 큐와 결합 불가) — 기계 잔여만 지운다.
         #[arg(long)]
         clear_first: bool,
         /// ★B3 #4 본문을 표준입력 전문으로 받는다 — quoted heredoc(`<<'EOF'`)이면 발신 셸이

@@ -4907,11 +4907,14 @@ pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine
     }
 }
 
-/// D-12 직접 입력 경로 — 본문 주입과 Return/Enter 제출은 계수 축이 다르다.
+/// D-12 직접 입력 경로 — 본문 주입과 Return/Enter 제출·선정리는 계수 축이 다르다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectSendKind {
     Text,
     SubmitKey,
+    /// `cys send --clear-first` — Ctrl-U 선정리 + 본문 + CR 원자 주입.
+    /// C-u 가 지우는 것이 기계 잔여면 정상 용도이고 사람 초안이면 D-12 의 삭제 사고다.
+    ClearFirst,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4933,9 +4936,10 @@ impl DraftGateDenied {
 
 /// D-12 순수 판정 — IO 없음.
 ///
-/// Text 는 전체 pending, SubmitKey 는 human_pending 을 우선한다. 자기 본문만 남은
-/// SubmitKey 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
-/// SubmitKey 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
+/// Text 는 전체 pending, SubmitKey/ClearFirst 는 human_pending 을 우선한다. 자기 본문만 남은
+/// SubmitKey/ClearFirst 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
+/// ClearFirst 의 C-u 는 기계 잔여를 지우기 위한 것이므로 SubmitKey 와 같은 팔로 판정한다.
+/// SubmitKey/ClearFirst 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
 /// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제는 핸들러가 적용한다.
 pub(crate) fn draft_gate_verdict(
     kind: DirectSendKind,
@@ -4955,7 +4959,7 @@ pub(crate) fn draft_gate_verdict(
                 None
             }
         }
-        DirectSendKind::SubmitKey => {
+        DirectSendKind::SubmitKey | DirectSendKind::ClearFirst => {
             if human_pending > 0 {
                 Some(DraftGateDenied::HumanDraft { bytes: human_pending })
             } else if pending == 0
@@ -4976,6 +4980,9 @@ pub(crate) fn draft_gate_verdict(
 /// 계수만으로 거부가 확정되면 화면·승인 관측을 생략한다. 승인 축은
 /// approval_or_gate_pending 을 공유한다. 파서·pending_input leaf 락을 잠깐씩 쓰므로
 /// 호출자는 input_gate 밖에서 호출해야 한다.
+/// agents.json 디스크 읽기+임베드 파싱을 마커 좌석에 한정(리뷰 minor · 부하).
+/// 캐시는 두지 않는다 — 틱이 이미 초당 1회 같은 로드를 하므로 직접 send 빈도는 그 아래이고,
+/// 배달 틱과 공유하는 함수에 신선도 창을 더하지 않는다.
 pub(crate) fn draft_gate(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
@@ -4985,6 +4992,9 @@ pub(crate) fn draft_gate(
     let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
         return Some(why);
+    }
+    if s.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return None;
     }
     let adapters = load_adapter_defs();
     let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));

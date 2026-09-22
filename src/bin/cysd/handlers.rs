@@ -2212,7 +2212,7 @@ fn draft_gate_denied_response(
     verified_from: Option<u64>,
 ) -> Value {
     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
-    let human = surface.pending_input.lock().unwrap().human.min(pending);
+    let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     daemon.bus.publish(
         "queue.draft_gate_denied",
         "queue",
@@ -2222,6 +2222,7 @@ fn draft_gate_denied_response(
             "kind": match kind {
                 DirectSendKind::Text => "text",
                 DirectSendKind::SubmitKey => "submit_key",
+                DirectSendKind::ClearFirst => "clear_first",
             },
             "reason": why.as_str(),
             "pending_input_bytes": pending,
@@ -4373,17 +4374,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             // ★(0.14.39 · WP-C-input · D-12) 종전 가드는 3초 시계 하나뿐이라 시간이 지나면
-            // 사람 초안에 직접 본문이 연접됐다. 계수·화면도 검사하고, clear_first 의 Ctrl-U 가
-            // 초안을 삭제하는 경로 역시 거부한다(queued 는 위에서 반환했다).
+            // 사람 초안에 직접 본문이 연접됐다. 계수·화면도 검사한다(queued 는 위에서 반환했다).
+            // clear_first 는 사람 초안·미계수 화면 초안만 거부하고 기계 잔여는 C-u 대상이므로 통과한다.
+            // 명령 계약: --clear-first 는 사람 초안 앞에서는 실패하며 CLI 는 --queued 폴백이 없다
+            // (원자 주입은 큐와 결합 불가 · cys.rs should_queue_fallback_send).
             // Return 은 human 축으로 검사해 관례적인 기계 send+Return 의 자기 본문 제출을
             // 보호한다. inject_text/launch-agent 의 검증된 authoritative 경로는 의도된 예외다:
             // cycle-agent D-16 ④는 C-u 전에 화면 초안을 스스로 검사한다.
             // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
-            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
+            let gate_kind = if !human
+                && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
             {
-                if let Some(why) = governance::draft_gate(daemon, &surface, DirectSendKind::Text) {
+                let kind = if clear_first { DirectSendKind::ClearFirst } else { DirectSendKind::Text };
+                Some(kind)
+            } else {
+                None
+            };
+            if let Some(kind) = gate_kind {
+                if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, DirectSendKind::Text, why, verified_from,
+                        daemon, &surface, &id, kind, why, verified_from,
                     ));
                 }
             }
@@ -4465,8 +4475,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
             //   락 순서 계약: pending_queue → input_gate. 여기서는 input_gate 하나만 잡고
-            //   그 안에서 다른 락을 잡지 않는다(사이클 없음).
+            //   그 안에서는 pending_input leaf 외의 락을 잡지 않는다(사이클 없음).
             let _gate = surface.input_gate.lock().unwrap();
+            // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
+            // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
+            // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
+            // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+            if let Some(kind) = gate_kind {
+                let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                if let Some(why) = governance::draft_gate_verdict(
+                    kind, pending, human.min(pending), None, false, false,
+                ) {
+                    drop(_gate);
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, kind, why, verified_from,
+                    ));
+                }
+            }
             if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
@@ -4673,12 +4699,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★(0.14.39 · WP-C-input · D-12) 3초가 지나도 사람 초안은 제출하지 않는다.
             // 계수는 human 축으로 검사해 기계 send+Return 은 허용하고, 취소·탐색 키에는 미적용한다.
             // send_text 와 같은 authoritative 예외, 같은 응답 접두·관측 헬퍼를 사용한다.
-            if matches!(key.as_str(), "Return" | "Enter")
+            let gate_kind = if matches!(key.as_str(), "Return" | "Enter")
                 && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
             {
-                if let Some(why) = governance::draft_gate(daemon, &surface, DirectSendKind::SubmitKey) {
+                Some(DirectSendKind::SubmitKey)
+            } else {
+                None
+            };
+            if let Some(kind) = gate_kind {
+                if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, DirectSendKind::SubmitKey, why, verified_from,
+                        daemon, &surface, &id, kind, why, verified_from,
                     ));
                 }
             }
@@ -4696,9 +4727,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // ★(0.14.31 · WP-5 · codex Q4) send_text 와 같은 임계영역 규약 — writer 인계와 계수
             //   갱신을 `input_gate` 하나로 묶는다(종전엔 락 없이 갱신해 큐 배달의 0 쓰기와 교차하면
-            //   lost update 가 났다). 락 순서 계약: 여기서는 input_gate 만 잡는다.
+            //   lost update 가 났다). 락 순서 계약: input_gate 안에서는 pending_input leaf 만 잡는다.
             {
                 let _gate = surface.input_gate.lock().unwrap();
+                // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
+                // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
+                // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
+                // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+                if let Some(kind) = gate_kind {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                    if let Some(why) = governance::draft_gate_verdict(
+                        kind, pending, human.min(pending), None, false, false,
+                    ) {
+                        drop(_gate);
+                        return Reply::Single(draft_gate_denied_response(
+                            daemon, &surface, &id, kind, why, verified_from,
+                        ));
+                    }
+                }
                 if let Some(err) = try_write(&surface, write_req, &id) {
                     return Reply::Single(err);
                 }
