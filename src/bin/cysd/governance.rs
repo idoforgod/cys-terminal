@@ -5030,18 +5030,22 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 /// CLOSE 만 남아 실측 `stale_bytes=6` 으로 배달을 막았다. 봉투 안에서는 CR/LF 도 가산하고
 /// 자동응답 면제를 끈다: 변형 F(OPEN/ESC[I/CLOSE 분할)가 한 호출과 같은 본문 계수를 가져야 한다.
 /// 봉투 밖의 순수 자동응답은 **세그먼트 단위**로 면제한다. CLOSE+ESC[I 를 한 청크로 받든
-/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 최대
-/// 5바이트까지 계수하지 않고 이월해 다음 청크와 합친 뒤 인식한다.
+/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 2바이트
+/// 이상일 때만 최대 5바이트까지 계수하지 않고 이월해 다음 청크와 합친 뒤 인식한다.
 ///
 /// 미종결 봉투는 Ctrl-C/Ctrl-U 또는 OPEN 뒤 5초가 지난 호출에서 해제한다(시각 누락도 해제).
 /// 해제 자체는 입력이 비워졌다는 증거가 아니므로 계수를 감산하지 않는다(fail-closed).
 /// stale 리셋은 `Surface::clear_pending_input` 으로 봉투·이월 상태까지 함께 비운다.
-/// 봉투 밖에서는 마지막 CR/LF/Ctrl-U/Ctrl-C 뒤부터 두 계수를 재시작하되, `\x1b\r` 은
-/// Meta+Enter 줄바꿈 삽입이라 예외다(claude `/terminal-setup` 의 Shift+Enter 바인딩 `\e\r`).
+/// 봉투 밖에서는 마지막 CR/LF/Ctrl-U/Ctrl-C 뒤부터 두 계수를 재시작하되, 같은 청크에서 온
+/// ESC+CR 에만 Meta-Enter 줄바꿈 예외를 둔다(claude `/terminal-setup` 의 Shift+Enter 바인딩 `\e\r`).
+/// 단독 Esc 키(0x1b 청크) 뒤 Enter 는 제출이다(수정 라운드 1 · 리뷰 major).
 /// 사람·기계 본문은 모두 count 에 세고, 사람 본문만 human 에 센다(human <= count).
 ///
 /// 한계: 백슬래시+Enter 줄바꿈은 리셋으로 읽힌다. 커서 줄 머리 이동은 화면 축의 한계로
-/// 남으며, D-02(Backspace/Delete) 감산은 보류한다.
+/// 남으며, D-02(Backspace/Delete) 감산은 보류한다. 표식이 1바이트(ESC) 경계에서 절단된
+/// 붙여넣기는 이월하지 않아 봉투를 본문으로 센다(과대 · 본문에 CR/LF 가 있으면 그 자리에서
+/// 리셋돼 과소) — 제품 호출자(GUI onData 1회·inject_text 단일 버퍼)는 표식을 분할하지 않으므로
+/// 실경로가 아니며, 실경로인 단독 Esc 키를 지키는 쪽을 택했다(base 와 같은 거동).
 pub(crate) fn pending_input_step(
     prev: &PendingInputState,
     chunk: &[u8],
@@ -5051,6 +5055,7 @@ pub(crate) fn pending_input_step(
     const OPEN: &[u8] = b"\x1b[200~";
     const CLOSE: &[u8] = b"\x1b[201~";
 
+    let carried = prev.tail.len();
     let mut st = prev.clone();
     let mut buf = std::mem::take(&mut st.tail);
     buf.extend_from_slice(chunk);
@@ -5063,7 +5068,7 @@ pub(crate) fn pending_input_step(
         st.paste_opened_at = None;
     }
 
-    if let Some(len) = (1..OPEN.len())
+    if let Some(len) = (2..OPEN.len())
         .rev()
         .find(|&len| buf.ends_with(&OPEN[..len]) || buf.ends_with(&CLOSE[..len]))
     {
@@ -5106,7 +5111,8 @@ pub(crate) fn pending_input_step(
             }
             let reset = seg.iter().enumerate().rposition(|(pos, &byte)| {
                 matches!(byte, b'\n' | 0x15 | 0x03)
-                    || (byte == b'\r' && (pos == 0 || seg[pos - 1] != 0x1b))
+                    || (byte == b'\r'
+                        && !(pos > 0 && seg[pos - 1] == 0x1b && start + pos - 1 >= carried))
             });
             if let Some(pos) = reset {
                 st.count = (seg.len() - pos - 1) as u64;
