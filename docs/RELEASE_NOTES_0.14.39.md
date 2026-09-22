@@ -40,8 +40,9 @@
 | 문제 3 | 입력 계수·직접 주입·리뷰어 보류·사이클 맹목 주입·고아 데몬·자원 게이트 등 11항목 | 본체(`src/`·`src-tauri/`) · 팩 |
 | 기반 | v0.14.38 이후 미출하분(phoenix 스냅샷 정본 · 검증자 worker 고정 · 상태 회전기 · 부서 schedule 시드) 동반 출하 | 본체 · 팩 |
 
-전체 변경: v0.14.38 이후 **116 파일 · 커밋 82**(통합 merge 6 포함 · 버전 범프와 이 노트 자신의
-커밋은 제외한 실질 변경분).
+전체 변경: v0.14.38 이후 **123 파일 · 커밋 88**(통합 merge 6 포함 · 버전 범프와 이 노트 자신의
+커밋은 제외한 실질 변경분 · 산출법 = `git diff --name-only v0.14.38..HEAD` 에서 이 노트 파일을 뺀 수와
+`git log v0.14.38..HEAD` 에서 `7a8fe543`·`cd40ae34` 두 릴리스 준비 커밋을 뺀 수).
 
 ---
 
@@ -313,52 +314,42 @@ gemini·codex 좌석의 composer 글리프가 `agents.json` 의 단일 `prompt_m
 
 ## 11. 알려진 잔여 — 정직하게
 
-### ★ 이번 판에서 닫지 못한 결함 (릴리스 판단에 직접 걸립니다)
+### ★ 그 뒤 추가 수정 라운드에서 **닫았습니다** (이 절은 정정입니다)
 
-통합 뒤 적대 검증(reflect1) · 아키텍트 검증(reflect2) · 부트 체인 전용 검토가 **각각 독립으로** 같은
-자리를 지목했고, 수정 라운드 상한(2회)을 소진한 뒤에 나온 것이라 **이 판에는 들어가지 못했습니다.**
-수리안은 세 검토가 같은 것을 제시했고 실측으로 비-vacuous 까지 확인돼 있습니다.
+이 노트를 처음 쓸 때(커밋 `7a8fe543`)는 아래 두 건이 "이번 판에서 닫지 못한 결함" 이었습니다.
+그 뒤 수정 라운드 3·4 를 더 돌려 **둘 다 닫았습니다.** 판단이 바뀐 자리이므로 지우지 않고
+무엇을 어떻게 닫았는지 남깁니다.
 
-**① [blocking] 관문·모달 술어에 '생애 창' 이 없어, 지나간 화면 때문에 좌석의 `/clear` 가 영영 나가지
-않을 수 있습니다.**
+**① [blocking → 닫힘] 관문·모달 술어의 '생애 창'** — 지나간 화면 문면 때문에 좌석의 `/clear` 가
+영영 나가지 않던 것.
 
-- 자리: `src/readiness.rs:325` `gate_or_modal_present`(모달 축이 `modal_signature` /
-  `modal_signature_with_marker` 를 **날것으로** 씁니다) → `src/bin/cys.rs:1165` `cycle_target_observation`
-  → `cycle_target_state` 세 팔(`:1065` 이하) → `wait_cycle_target_idle("clear 직전")`.
-- 무슨 일이 벌어지나: 화면 **스크롤백에** 모달 어휘가 한 번 인쇄돼 있기만 하면(예: 워커가 관문 화면을
-  읽어 그 내용을 자기 출력으로 찍은 경우 — `1. Yes, I trust this folder` / `2. No, exit` 두 줄) 그 아래
-  composer 가 **비어 있고 출력이 120초째 조용해도** 대상이 "턴 중" 으로 판정됩니다. 같은 화면에서 저장소
-  자신의 전경 술어 `modal_foreground(screen, Some("❯"))` 는 `None`(= 이 문면은 역사)이라고 답합니다.
-- 귀결: 유휴 대기가 창 내내 실패 → rc 84 → autopilot 이 `held_noop` + 쿨다운으로 **무한 재시도**
-  (비구조 rc84 는 상한 밖). 그 문면은 새 출력이 밀어내야 사라지는데 **유휴 좌석에는 새 출력이 없습니다** —
-  조용한 자기잠금입니다. 게다가 진단 문구가 "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)" 이라
-  **유휴 좌석을 턴 중으로 오진** 해, 사람이 개입해도 엉뚱한 곳을 보게 됩니다.
-- 같은 등급의 평시 오탐도 실측됐습니다 — 본문에 `Enter to confirm` 과 `Esc to cancel` 이 함께 있는
-  프레임, gemini 좌석의 마크다운 인용 목록(`> 1. …`), `$ cat a > 1. txt` 같은 한 줄.
-- 수리안(실측 검증 완료): 관문 축(`first_run_gates::identify`)은 그대로 두고 **모달 축만**
-  `modal_foreground` 로 교체하거나, `gate_block_left_behind`/`modal_left_behind` 를 AND 한 재주입판
-  술어를 신설합니다. 13 픽스처(관문 7 · 건강 4 · 역사 2) 판정이 현행과 **전부 동일** 하고, 적용 후
-  `cargo test --bin cys` 354/0 · `--lib` 605/0 GREEN 입니다. 함께 '역사 모달 어휘 + 건강한 composer →
-  Idle' 음성 검체를 박아야 합니다(현행 검체 집합은 두 술어를 구별하지 못합니다).
-- **운영 회피책(수리 전까지):** 좌석 화면에 관문·모달 문면을 **인쇄하지 마십시오**(감사표 `cat` ·
-  관문 좌석 `read-screen` 출력 인용). 이미 걸린 좌석은 그 pane 에서 아무 출력이나 한 번 내어 문면을
-  밀어내면 풀립니다.
+- 화면 스크롤백에 관문·모달 어휘가 한 번 인쇄돼 있기만 하면(워커가 관문 화면을 자기 출력으로 전사한
+  경우 등) 그 아래 composer 가 비어 있고 출력이 120초째 조용해도 "턴 중" 으로 판정됐습니다.
+  귀결은 rc 84 무한 재시도 = **조용한 자기잠금**이었습니다.
+- 닫은 곳: `4c103232` 가 사이클 clear 의 유휴 판정을 데몬 `judge` 와 **같은 생애 창 술어**로 통일했고,
+  `8a4b88f1` 이 남은 절반 — `src/readiness.rs` 의 관문 축 ①(`gate_block_left_behind`) — 을 모달 축이
+  이미 쓰던 **줄 단위** 판정기(`waiting_prompt_with_harmless_trailer`)로 이사시켰습니다.
+  종전 축 ①은 "마커 뒤 **화면 전체**가 공백" 을 요구했는데, 라이브 claude 2.1.261 은 빈 입력 상자
+  아래에 괘선·상태줄을 그리므로 실좌석에서 **영영 참이 되지 않았습니다**.
+- 부트 경로는 한 톨도 약해지지 않았습니다 — `gate_axis_window_closed` 의 `Site::Boot => false` 가
+  그대로라 부트에서는 창이 상수로 열려 있고, 살아 있는 관문 7종은 종전대로 보류합니다.
+  데몬 `judge` 의 재주입(`Site::Reinject`) 경로도 같은 창으로 함께 정상화됐습니다.
+- 검체: 전사된 관문 needle + 건강한 composer + 상태줄 → Idle / 살아 있는 관문 → Busy 유지 /
+  `judge` 재주입 × 관문 5종 전용 검체 신설.
 
-**② [major] `gate_carry_ok` 의 첫 팔이 관문 부재를 보지 않고 이월을 풉니다(옛 데몬 한정).**
+**② [major → 닫힘] `gate_carry_ok` 첫 팔이 관문 부재를 보지 않고 이월을 풀던 것(옛 데몬 한정).**
 
-- 자리: `src/bin/cys.rs:13629` `None if idle_axis_capable == Some(false) => true` → 소비처
-  `boot_agent_on_surface`(:13241 부근) · `gate_pending_reobserve_once`(:13885 부근).
-- `quiet_secs` 를 보고하지 않는 옛 데몬(0.14.30 이하)에서는 팔 2·팔 3 의 방어(글리프 축 · 관문 AND)
-  앞에 이 팔이 있어, **관문 화면인데도 이월이 풀립니다**(실측: OAUTH_CODE·THEME·LOGIN_METHOD·
-  FOLDER_TRUST 에서 `carry_ok=true`). 도달 조건은 **새 CLI × 옛 데몬 스큐** = 옛 설치본 이관의 정상
-  경로입니다. 귀결은 디렉티브가 선택기에 붙고 Return 이 `No, exit` 를 누르는 것입니다.
-- 오늘 이 경로가 실제로 터지는지는 소비처에 달려 있습니다 — 두 소비처 모두 `Site::Boot` 라 데몬 judge 가
-  먼저 `GateHeld` 를 내는 것을 실측으로 확인했습니다(OAUTH_CODE·THEME·FOLDER_TRUST 전부). 즉 **오늘은
-  2차 방벽이 살아 있고, 소비처가 재주입 사이트로 늘어나는 순간 fail-open 이 됩니다.**
-- 수리안: `None if idle_axis_capable == Some(false) => !gate_or_modal`. '영구 보류' 회귀 우려는 이 AND
-  에는 성립하지 않습니다 — quiet 축 부재는 그 좌석의 구조적 결측이라 영원하지만, 관문 프레임은 사람이
-  통과하면 사라지는 일시 상태입니다. 검체는 기존 `gate_carry_ok_*` 에 `capable=Some(false)` ×
-  {OAUTH_CODE, THEME} 두 행을 더해 팔 순서 변경을 회귀 대상으로 만듭니다.
+- `quiet_secs` 를 보고하지 않는 옛 데몬(0.14.30 이하) × 새 CLI 스큐 — 즉 **옛 설치본 이관의 정상
+  경로** — 에서 관문 화면인데도 이월이 풀려, 디렉티브가 선택기에 붙고 그 Return 이 `No, exit` 를
+  누를 수 있었습니다(ANCHOR ④ pane 전멸).
+- 닫은 곳: `58295086`·`4c103232` — `src/bin/cys.rs:13667` 이 지금
+  `None if idle_axis_capable == Some(false) => !gate_or_modal` 입니다. 관문·모달 부재를 AND 합니다.
+- '영구 보류' 회귀는 이 AND 에 성립하지 않습니다 — quiet 축 부재는 그 좌석의 **구조적** 결측이라
+  영원하지만, 관문 프레임은 사람이 통과하면 사라지는 **일시** 상태입니다.
+- 검체: `capable=Some(false)` × {OAUTH_CODE, THEME} 두 행이 팔 순서 변경을 회귀 대상으로 잡습니다.
+
+**운영 회피책은 더 이상 필요 없습니다.** 종전에 안내드렸던 "좌석 화면에 관문·모달 문면을 인쇄하지
+마십시오" 는 ①이 닫히면서 불필요해졌습니다.
 
 ### 설계 단계에서 '이번 판 밖' 으로 결정한 것
 
@@ -373,20 +364,32 @@ gemini·codex 좌석의 composer 글리프가 `agents.json` 의 단일 `prompt_m
 
 ### 그 밖의 잔여(minor) · 고지
 
-1. **레인 가드 표식에 회복 신호가 없습니다.** 표식은 훅이 성공해도 지워지지 않고 레인당 1개라,
-   다른 훅(`user-prompt-submit.sh` 등)의 트립 하나가 24시간 동안 `session_start` 선언을 강등합니다 →
-   그동안 '훅 1회 + CLI 1회' 상시 이중 주입. 수리는 `LaneGuardTrip.script` 를 소비하는 한 줄입니다.
-   실패 방향은 무해 쪽(주입 0회가 아니라 2회)입니다.
+1. **레인 가드 표식에 회복 신호가 없습니다.** 표식(`<pack>/state/lane-guard-tripped`)은 훅이 성공해도
+   지워지지 않아 최대 24시간 남습니다. 그동안 그 좌석은 '훅 1회 + CLI 1회' **이중 주입**입니다
+   (무해 방향 — 주입 0회가 아니라 2회).
+   ★정정: 종전 판이 여기 적어 둔 수리안("표식의 `script=` 를 소비해 SessionStart 훅 트립만 강등한다")은
+   **불건전해 기각했습니다.** 표식은 레인당 파일 **하나**이고 `_lib.sh` 를 소스하는 팩 훅 23종 전부가
+   같은 파일을 덮어씁니다(`cys_lane_mark` 가 `>` 로 씁니다) — 즉 `script=` 는 '누가 트립했는가' 가
+   아니라 **마지막 기록자**일 뿐입니다. 그것으로 거르면 SessionStart 트립이 뒤 훅에 덮인 좌석에서
+   CLI 주입까지 생략돼 **디렉티브 0회 주입(치명)** 이 됩니다. 그래서 지금은 **어떤 훅의 트립이든
+   강등**합니다(`8a4b88f1` · `src/bin/cys.rs` `effective_hooks_inject`). `script` 는 경고 문면에만
+   싣습니다. 올바른 수리는 훅별 표식(`lane-guard-tripped.<script>`)이고, 팩·러스트 판독기·
+   `javis_preflight` 파리티가 함께 움직여야 해 **다음 판**으로 넘깁니다.
 2. **`gates` 는 agent 메타가 없으면 빈 배열** 이라 관문 축이 통째로 꺼집니다(`--clear-cmd` 수동 경로 한정).
+   ★이 잔여는 **검체가 기대값으로 박제**하고 있습니다 — `cycle_target_state_keeps_the_modal_axis_without_an_agent_corpus`
+   가 그 경로에서 `OAUTH_CODE → Idle` 을 단언합니다. 관문 코퍼스 폴백을 넣어 이 팔을 고칠 때는 그
+   단언도 **같은 커밋에서 함께 뒤집어야** 합니다(검체 주석에 그 문장을 박아 두었습니다).
 3. **`LIVE_PERMISSION_PROMPT` 는 보류로 분류** 됩니다 — 사람 승인을 오래 기다리는 좌석은 그동안 clear 가
-   나가지 않습니다(의도된 방향이나 위 ①과 인접).
-4. **거부 번역 문면에 정의처 핀이 없습니다** — `ui/src/restartplan.test.ts` 의 `PROD_*` 는 손으로 옮긴
-   리터럴이라, Rust 쪽 문면이 바뀌면 그 축이 조용히 죽습니다.
+   나가지 않습니다(의도된 방향이나 ANCHOR ② 무clear 와 인접 — 오너 협의 항목).
+4. **`cmd.exe /c sh <경로>` 형태의 훅 등록은 미인정** 입니다 — 인터프리터·플래그·`K=V` 앞머리는 벗기지만
+   `cmd.exe /c` 는 벗기지 않습니다. 방향은 무해(미인정 = CLI 이중 주입)이고 실측은 Windows 미검증입니다.
 5. **`bootstrap-backoff` 에 같은 통지 패턴이 선재** 합니다(워치독 10분 주기 × 60분 창 = 최대 6건/시간).
    이번 범위 밖 — 5절의 처방을 그대로 적용하면 닫힙니다.
 6. **에이전트 사망 후 맨 셸의 PS2 `> `** 는 행 선두라 gemini composer 와 구별되지 않습니다.
-7. **`cys::pack::LANE_GUARD_RECENT_SECS`(Rust)와 `javis_preflight.LANE_GUARD_RECENT_S`(Python)는 사본
-   2벌** 이고 파리티 핀이 없습니다.
+7. **~~레인 상수 사본 2벌에 파리티 핀 없음~~ — 닫혔습니다**(`c4873be1`).
+   `cys::pack::LANE_GUARD_RECENT_SECS`(Rust) ↔ `javis_preflight.LANE_GUARD_RECENT_S`(Python) 와
+   진단 토큰 2종(`quiet_secs_unreported` · `gate_or_modal_foreground`)이 교차 언어 핀으로 잠겼습니다.
+   같은 이유로 4항의 '거부 번역 문면 정의처 핀 부재' 도 `76ed721e` 에서 닫혀 목록에서 뺐습니다.
 8. **`PACK_MIN_BINARY` 상향 여부** — 이번 팩의 autopilot 은 본체의 새 종료코드(84/85/86)와 새 RPC
    필드를 **전제로 설계** 됐습니다. 옛 본체에 얹으면 그 코드가 아예 나오지 않으므로 팩은 종전 계약대로
    돌고(파괴적이지 않음) **D-16 이 고친 것이 그 좌석에는 도달하지 않습니다** — 즉 팩만 갱신해서는
@@ -403,23 +406,25 @@ gemini·codex 좌석의 composer 글리프가 `agents.json` 의 단일 `prompt_m
 ## 12. 검증
 
 전량을 CI 동형으로 돌렸습니다. 원출력은 증거 폴더
-`~/Desktop/CYSjavis/_evidence/impl-3problems-20260921/integ/` 에 있습니다.
+`~/Desktop/CYSjavis/_evidence/impl-3problems-20260921/integ/` 에 있습니다(수정 라운드 4 의 재측정은
+그 아래 `round4/`).
 
 | 스위트 | 결과 | 원출력 |
 |---|---|---|
-| `cargo test --bin cysd -- --test-threads=1 --skip hwmon` | **1387 passed / 0 failed / 3 ignored** (215.9s) | `boot3-03-cysd.log` |
-| `cargo test --lib -- --test-threads=1` | **605 / 0 / 1 ignored** (424.1s) | `boot3-02-lib.log` |
-| `cargo test --bin cys -- --test-threads=1` | **351 / 0** (103.1s) | `boot3-01-cys-bin.log` |
+| `cargo test --bin cysd -- --test-threads=1 --skip hwmon` | **1387 passed / 0 failed / 3 ignored** (207.5s) | `round4/minor-03-cysd.log` |
+| `cargo test --lib -- --test-threads=1` | **608 / 0 / 1 ignored** (247.0s) | `round4/minor-01-lib.log` |
+| `cargo test --bin cys -- --test-threads=1` | **358 / 0** (116.1s) | `round4/minor-02-cys.log` |
 | `cargo test -p cys-app --bins` | **135 / 0** | `r2b-04-cys-app.log` |
 | `run_bootstrap_health.py --json`(전량) | **GREEN · 151 pass / 0 fail / 1 skip** (344.8s) | `12-health-full.json` |
 | ubuntu-pack-suite 루프(`test_*` 전종) | **ALL PASS · fails=0** | `40-pack-suite.log` |
 | `test_pyseal_census.py` | **PYSEAL-CENSUS-OK** | `boot3-41-pyseal.log` |
-| `javis_cycle_autopilot self-test` | **PASS 324 / FAIL 0** | `boot3-63-autopilot-selftest.log` |
+| `javis_cycle_autopilot self-test` | **PASS 331 / FAIL 0** | `round4/minor-63-autopilot-selftest.log` |
 | `lane-parity-rehearsal.sh --strict` / `--self-test` | rc 0 / rc 0 | `30-`·`31-lane-parity-*.log` |
 | ci-branch 인라인 LANE-GATE(3레인 등재 대조) | 비대칭 0 · rc 0 | `32-lane-gate-inline.log` |
-| `ui: bun test` / `bunx tsc` / `ui/build.sh` | **994 pass / 0 fail** · rc 0 · rc 0 | `boot3-20`·`21-*`·`22-ui-build.log` |
+| `ui: bun test` / `bunx tsc` / `ui/build.sh` | **995 pass / 0 fail** · rc 0 · rc 0 | `round4/green-20-ui-bun.log`·`green-21-ui-tsc.log`·`22-ui-build.log` |
 | `secret-scan.sh --all` | **clean (1000 파일)** | `33-secret-scan.log` |
-| `win-typecheck.sh`(x86_64-pc-windows-msvc) | **판정 0 — 컴파일 오류 0**(경고 4 = 기존 dead_code) | `boot3-65-win-typecheck.log` |
+| `win-typecheck.sh`(x86_64-pc-windows-msvc) | **판정 0 — 컴파일 오류 0**(경고 4 = 기존 dead_code) | `round4/minor-65-win-typecheck.log` |
+| `cargo check --target …-msvc --bin cys --profile test`(우회 env) | **rc 0 · 오류 0**(경고 2 = 기존) | `round4/minor-66-win-check-bin-cys-tests.log` |
 | rc 79 자가치유 격리 데몬 E2E | `verdict pass=true` · 잔존 프로세스 0 | `60-rc79-e2e.log` |
 | 버전 SOT 8곳 | **✅ 8곳 일치: 0.14.39** | 이 커밋 |
 | 릴리스 레인 | **BINARY 레인**(팩 외 변경 26건 · `v0.14.38..HEAD`) | `70-release-lane-check.log` |
