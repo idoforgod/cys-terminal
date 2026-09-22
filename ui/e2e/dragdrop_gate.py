@@ -10,14 +10,18 @@
   6. 모든 컨텍스트 pageerror 0건. UA와 device_scale_factor를 명시해 호스트 독립.
 
 사전: sh ui/build.sh · pip install playwright · playwright install chromium
+      (저장소 밖 venv 를 쓰면 PLAYWRIGHT_BROWSERS_PATH 로 브라우저 캐시 위치를 지정한다)
 실행: python3 ui/e2e/dragdrop_gate.py   # exit 0 = PASS
-지정된 검증 환경:
-  PLAYWRIGHT_BROWSERS_PATH=/Users/cys/Desktop/CYSjavis/_evidence/bugverify-3problems-20260921/V2-P1-dragdrop-ui-sim/_sandbox/pw-browsers \
-  /Users/cys/Desktop/CYSjavis/_evidence/bugverify-3problems-20260921/V2-P1-dragdrop-ui-sim/_sandbox/venv/bin/python ui/e2e/dragdrop_gate.py
 
 ui/dist를 localhost로 서빙하고 __TAURI__ shim으로 두 pane을 부팅한다.
-V2-P1 harness/dragdrop_sim.py의 SHIM·JS_STATE·JS_DROP·boot·pane_points를 이식했다.
-실제 OS 드래그 대신 등록된 Tauri 이벤트 핸들러에 payload를 전달하는 UI 게이트다.
+실제 OS 드래그 대신 등록된 Tauri 이벤트 핸들러에 payload를 전달하는 UI 게이트다 —
+실기기 드롭의 payload.position 실측(오너 AC · 설계 §3-4)은 이 게이트가 대신하지 못한다.
+
+★좌표 단위 근거(2026-09-21 실측 · 이 게이트가 고정하는 사실): macOS 는 wry 0.55.1
+wkwebview/drag_drop.rs:85-87 이 draggingLocation(포인트)을 비환산으로 넘기고, Linux(webkitgtk)도
+GTK 논리 좌표다. Windows(webview2/drag_drop.rs:167 ScreenToClient)만 물리 px. 종전 UI 는 전
+플랫폼 /devicePixelRatio 라 Retina 맥에서 오른쪽 pane 중앙 드롭이 왼쪽 pane 으로 오배달됐다
+(케이스 1·3 이 RED, 2·4 가 회귀 핀). Cargo.lock 의 wry 핀을 올리면 이 게이트를 재실행한다.
 """
 import http.server
 import sys
