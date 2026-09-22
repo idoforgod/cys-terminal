@@ -9385,43 +9385,43 @@ mod seat_latch_negation_tests {
         //      `ready_marker` 와 다른 값 · 리뷰어 2인 blocking).
         let codex = json!({"ready_marker": "? for shortcuts", "prompt_marker": "›",
                            "composer_placeholder": "Ask Codex to do anything"});
-        assert_eq!(composer_marker_of(&codex).as_deref(), Some("›"));
+        assert_eq!(composer_marker_of(&codex), vec!["›"]);
         assert_eq!(composer_placeholder_of(&codex).as_deref(), Some("Ask Codex to do anything"));
         // ★(triage 2026-09-08) `ready_marker` 폴백 제거 — 그 키는 부트 judge 의 **화면 꼬리 토큰**
         //   이라 composer 행의 글리프가 아니다(gemini 에서 그 혼동이 영구 보류를 만들었다).
         let claude_legacy = json!({"ready_marker": "❯"});
         assert_eq!(
             composer_marker_of(&claude_legacy),
-            None,
+            Vec::<String>::new(),
             "ready_marker 만 있는 스펙이 composer 마커를 갖게 되면 gemini 결함이 되살아난다"
         );
         assert_eq!(composer_placeholder_of(&claude_legacy), None);
         // 가용성 대조 — claude 의 글리프는 임베드 정본이 `prompt_marker` 로 **명시**한다(계층 대상
         // 키라 기존 설치본 디스크 파일에 없어도 도달한다 · `fill_missing_fields`).
         assert_eq!(
-            composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]).as_deref(),
-            Some("❯"),
+            composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]),
+            vec!["❯"],
             "claude 좌석의 composer 마커가 사라졌다(이월 축이 idle_quiet 로 강등된다)"
         );
-        assert_eq!(composer_marker_of(&json!({"ready_marker": "", "prompt_marker": ""})), None, "빈 문자열 = 미정의");
+        assert_eq!(
+            composer_marker_of(&json!({"ready_marker": "", "prompt_marker": ""})),
+            Vec::<String>::new(),
+            "빈 문자열 = 미정의"
+        );
         // ④''' 임베드 어댑터 정본이 두 신 키를 실제로 들고 있는가(계층이 전달할 값이 없으면 무의미).
         let embed = embedded_agents_json().expect("임베드 agents.json");
-        assert_eq!(composer_marker_of(&embed["codex"]).as_deref(), Some("›"));
-        // ★(0.14.31 · 리뷰 R2 · claude major) gemini 는 **실측 프레임이 0건**이라 마커를 켜지 않는다
-        //   (1글자 `>` 는 셸 PS2·인용 행과 겹쳐 fail-open 이 된다 — 오탐 방향이 반대다 · §3-3).
-        //   기구가 죽은 것이 아니라 데이터를 켜지 않은 것이다: 디스크 선언은 그대로 먹는다.
-        assert!(embed["gemini"].get("prompt_marker").is_none(), "실측 없는 gemini 마커가 켜졌다");
-        // ★(triage 2026-09-08 · claude blocking) 선언이 없으면 **미정의**여야 한다. 종전에는
-        //   `ready_marker`(`? for shortcuts` = 상태줄 문면)로 떨어져 이월 축이 영구 거짓이었다.
+        assert_eq!(composer_marker_of(&embed["codex"]), vec!["›", "»"]);
+        // ★(0.14.39 · D-04) 2026-09-21 HQ surface:5 · dept-1 surface:9 실측으로
+        //   gemini composer `>` 선언 조건을 충족했다. 부트 상태줄 토큰과는 별도다.
+        assert_eq!(embed["gemini"]["prompt_marker"], json!([">"]));
         assert_eq!(
             composer_marker_of(&embed["gemini"]),
-            None,
-            "실측 없는 gemini 가 상태줄 문면을 composer 마커로 갖는다(carry-unproven 영구 보류)"
+            vec![">"],
+            "실측된 gemini composer 마커가 전달되지 않았다"
         );
         assert_eq!(
-            composer_marker_of(&json!({"ready_marker": "? for shortcuts", "prompt_marker": ">"}))
-                .as_deref(),
-            Some(">"),
+            composer_marker_of(&json!({"ready_marker": "? for shortcuts", "prompt_marker": ">"})),
+            vec![">"],
             "디스크 선언 해소 기구까지 죽었다"
         );
         assert!(composer_placeholder_of(&embed["codex"]).is_some(), "codex 플레이스홀더 정본이 없다");
@@ -9451,16 +9451,10 @@ mod seat_latch_negation_tests {
         );
     }
 
-    /// ★[triage · claude blocking] **gemini 좌석의 관문 증거 이월이 영구 거짓이다(치명위험 ③).**
-    ///
-    /// `composer_marker_of` 는 `prompt_marker → ready_marker` 순서로 해소한다. gemini 는 실측 프레임이
-    /// 없어 `prompt_marker` 를 선언하지 않았으므로(정당한 선택) 해소 결과는 **`? for shortcuts`**
-    /// — composer 행의 글리프가 아니라 **상태줄 문면**이다. 그러면 `scan_composer` 가 상태줄을 마커
-    /// 줄로 잡아 강한 증거(마커 **아래** 괘선·상태줄)도 약한 증거(마커 **위** 상태줄)도 설 수 없고,
-    /// `gate_carry_ok` 는 어떤 유휴 화면에서도 거짓이다. 관문·모달을 한 번이라도 본 gemini 좌석은
-    /// 그 부트에서도, `gate_pending` 재관측 채택에서도 영원히 `carry-unproven` 보류 = **역할
-    /// 디렉티브 미주입**(부트 체인 치명위험 ③). 검체는 codex 어댑터가 플레이스홀더로 이 자리를
-    /// 어떻게 닫았는지를 대조군으로 함께 잰다.
+    /// ★[triage · D-04] gemini 좌석이 관문 통과 뒤 composer 레이아웃으로 이월을 증명한다.
+    /// 종전 상태줄 폴백은 제거했고, 2026-09-21 실측으로 임베드 `prompt_marker: [">"]` 를 켰다.
+    /// 상태줄이 아래인 강한 증거와 위인 약한 증거(출력 정적 AND)가 모두 통과해야 한다.
+    /// codex 플레이스홀더를 대조군으로 유지해 상태줄 문면을 마커로 쓰던 영구 보류를 막는다.
     #[test]
     fn triage_wp5_gemini_seat_can_prove_carry_evidence_after_a_gate() {
         let embed = embedded_agents_json().expect("임베드 agents.json");
@@ -9471,7 +9465,15 @@ mod seat_latch_negation_tests {
         let above = "  각성 확인 완료.\n? for shortcuts                     Gemini 3.8 Flash · hig\n>\n";
         for (name, screen) in [("상태줄이 아래", below), ("상태줄이 위", above)] {
             assert!(
-                gate_carry_ok(true, false, marker.as_deref(), placeholder.as_deref(), screen, Some(true), Some(true)),
+                gate_carry_ok(
+                    true,
+                    false,
+                    cys::agent_markers::pick_marker_for_screen(&marker, screen),
+                    placeholder.as_deref(),
+                    screen,
+                    Some(true),
+                    Some(true),
+                ),
                 "{name}: 관문을 본 gemini 좌석이 정상 유휴 화면에서도 이월을 풀지 못한다 \
                  (carry-unproven 영구 보류 = 디렉티브 미주입 · 치명위험 ③)"
             );
@@ -9482,7 +9484,10 @@ mod seat_latch_negation_tests {
             gate_carry_ok(
                 true,
                 false,
-                composer_marker_of(&embed["codex"]).as_deref(),
+                cys::agent_markers::pick_marker_for_screen(
+                    &composer_marker_of(&embed["codex"]),
+                    codex_idle,
+                ),
                 composer_placeholder_of(&embed["codex"]).as_deref(),
                 codex_idle,
                 Some(true),
@@ -11230,7 +11235,9 @@ fn trust_prompt_hit(
     legacy_v1 && (delta_flat.contains("trustthisfolder") || delta_flat.contains("Doyoutrust"))
 }
 
-/// agents.json에서 어댑터 스펙 로드
+/// agents.json에서 어댑터 스펙 로드.
+/// ★(0.14.39 · D-04) 알려진 옛 vendor 마커만 필드 계층 뒤 메모리 승격한다(디스크 무접촉).
+/// 승격은 매 launch 에 반복될 수 있으므로 고지하지 않는다(신규 관문 키 보강과 같은 소음 규율).
 fn load_agent_spec(agent: &str) -> Result<Value, String> {
     let agents_path = cys::pack::pack_dir().join("agents.json");
     // agents.json 은 user 소유(★W-B) — 손상돼도 치유가 자동 복구하지 않으므로 부재/파싱 실패를
@@ -11253,6 +11260,11 @@ fn load_agent_spec(agent: &str) -> Result<Value, String> {
     if let Some(spec) = agents.get(agent) {
         let mut spec = spec.clone();
         fill_missing_fields(&mut spec, embedded_agents.as_ref().and_then(|v| v.get(agent)));
+        cys::agent_markers::promote_stale_vendor_defaults(
+            agent,
+            &mut spec,
+            embedded_agents.as_ref().and_then(|v| v.get(agent)),
+        );
         return Ok(spec);
     }
     // ★W-B 보완(성찰 2 적대검증 산물): user 승격의 대가 = 동결 — 사용자가 agents.json 을 수정해
@@ -11260,7 +11272,7 @@ fn load_agent_spec(agent: &str) -> Result<Value, String> {
     // "신규 CLI 지원했는데 안 됨"이 된다(schedule.json 은 데몬의 ensure_builtin_jobs 가 같은
     // 문제를 코드로 메우지만 agents.json 엔 그 보완이 없었다). 디스크에 없는 키만 **임베드
     // 어댑터로 폴백**해 '사용자 수정 보존'과 'vendor 신기능 즉시 사용'의 합집합을 만든다.
-    // (덮어쓰기 0 — 디스크 정의가 있으면 항상 디스크가 이긴다.)
+    // (디스크 덮어쓰기 0 — D-04 의 알려진 옛 vendor 마커만 읽기 시점에 메모리 승격한다.)
     if let Some(spec) = embedded_agents.as_ref().and_then(|v| v.get(agent)) {
         eprintln!(
             "[agents] '{agent}' 은 내 agents.json 에 없어 **내장 정의로 폴백**했다 \
@@ -11269,6 +11281,11 @@ fn load_agent_spec(agent: &str) -> Result<Value, String> {
         let mut spec = spec.clone();
         // 대칭 유지(경로별 특례 금지) — 같은 소스라 실제로 채울 것은 없다(no-op).
         fill_missing_fields(&mut spec, embedded_agents.as_ref().and_then(|v| v.get(agent)));
+        cys::agent_markers::promote_stale_vendor_defaults(
+            agent,
+            &mut spec,
+            embedded_agents.as_ref().and_then(|v| v.get(agent)),
+        );
         return Ok(spec);
     }
     Err(format!("unknown agent '{agent}' (agents.json에 정의 필요)"))
@@ -12740,7 +12757,7 @@ fn boot_agent_on_surface(
                 let carry_ok = gate_carry_ok(
                     gate_evidence_seen,
                     readiness_v1,
-                    composer_marker.as_deref(),
+                    cys::agent_markers::pick_marker_for_screen(&composer_marker, text),
                     composer_placeholder.as_deref(),
                     text,
                     obs.idle_quiet,
@@ -13072,7 +13089,7 @@ fn inject_directive_after_ready(
 ///     (codex·gemini = `? for shortcuts`), composer 행의 프롬프트 글리프는 `prompt_marker` 다
 ///     (`cysd::governance::merged_prompt_marker` 의 doc). 그래서 codex·gemini 좌석은 이 술어가
 ///     **영원히 거짓** → 관문을 한 번 본 뒤 `carry-unproven` 영구 보류 = 디렉티브 미주입(치명위험 ③).
-///     지금은 [`composer_marker_of`] 가 **선언된 `prompt_marker` 하나**로 해소한다(부트 `judge` 가
+///     지금은 [`composer_marker_of`] 의 **선언된 `prompt_marker` 후보**를 프레임마다 해소한다(부트 `judge` 가
 ///     보는 마커는 **그대로 `ready_marker`** — 부트 판정 폭은 한 글자도 넓히지 않는다).
 ///     ★(triage 2026-09-08) `ready_marker` 폴백은 **제거**했다: gemini 처럼 composer 글리프를
 ///     선언하지 않은 어댑터에서 그 폴백은 상태줄 문면을 마커로 만들어 이 축을 **영구 거짓**으로
@@ -13116,12 +13133,11 @@ fn gate_carry_ok(
     }
 }
 
-/// 이 어댑터의 **composer 행 프롬프트 글리프** — **선언된 `prompt_marker` 하나**다.
+/// 이 어댑터의 **composer 행 프롬프트 후보** — 선언된 `prompt_marker` 문자열 또는 문자열 목록이다.
 ///
 /// ★(0.14.31 · triage 2026-09-08 · claude blocking) 종전에는 `ready_marker` **폴백**이 있었다.
 /// 그 폴백은 claude 를 위한 편의였지만(두 값이 같아 무해했다) gemini 에서 치명적이었다:
-/// gemini 는 실측 프레임이 0건이라 `prompt_marker` 를 선언하지 않았고(1글자 `>` 는 셸 PS2 와
-/// 겹쳐 fail-open 이 되므로 그 선택 자체는 옳다), 그래서 해소 결과가 `? for shortcuts` —
+/// 당시 gemini 는 실측 프레임이 0건이라 `prompt_marker` 를 선언하지 않았고, 해소 결과가 `? for shortcuts` —
 /// **composer 행의 글리프가 아니라 상태줄 문면**이었다. `scan_composer` 는 그 상태줄을 마커
 /// 줄로 잡으므로 강한 증거(마커 아래 괘선·상태줄)도 약한 증거(마커 위 상태줄)도 설 수 없고,
 /// [`gate_carry_ok`] 는 **어떤 유휴 화면에서도 거짓**이 된다 = 관문을 한 번이라도 본 gemini
@@ -13129,12 +13145,14 @@ fn gate_carry_ok(
 /// **역할 디렉티브 미주입**(부트 체인 치명위험 ③). 사람이 관문을 통과시켜도 풀리지 않는다.
 ///
 /// 그래서 **출처로 가른다**(문자 모양이 아니라 — codex 보완 권고와 같다): 선언이 있으면 그것을
-/// 쓰고, 없으면 `None` 이다. `None` 인 어댑터는 마커 축 대신 **출력 정적**(`idle_quiet`) 축으로
+/// 쓰고, 없으면 빈 목록이다. 후보가 없는 어댑터는 마커 축 대신 **출력 정적**(`idle_quiet`) 축으로
 /// 판정한다(마커 미정의 어댑터의 종전 등급 그대로 · [`gate_carry_ok`]). claude 의 글리프는
 /// `agents.json` 이 `prompt_marker: "❯"` 로 **명시**한다(계층 대상 키라 기존 설치본에도 도달한다).
 /// 빈 문자열은 미정의와 같다(`readiness::marker_of` 규약).
-fn composer_marker_of(spec: &Value) -> Option<String> {
-    spec["prompt_marker"].as_str().filter(|m| !m.is_empty()).map(String::from)
+/// ★(0.14.39 · D-04) 목록은 프레임마다 가장 뒤 후보를 고르고, 화면에 없으면 첫 후보로
+/// 마커 좌석 등급을 유지한다. 실측 2026-09-21 로 codex `›`·`»`, gemini `>` 를 선언했다.
+fn composer_marker_of(spec: &Value) -> Vec<String> {
+    cys::agent_markers::marker_candidates(spec.get("prompt_marker"))
 }
 
 /// 이 어댑터의 **빈 composer 플레이스홀더**(codex `Ask Codex to do anything`). 없으면 `None`.
@@ -13345,7 +13363,7 @@ fn gate_pending_reobserve_once(sid: u64, agent: &str, marked_gate: Option<&str>)
         .as_ref()
         .and_then(|s| s["ready_marker"].as_str().map(|m| m.to_string()));
     // ★(0.14.31 · 리뷰 R2(R7회차)) 이월 축은 **composer 마커**로 잰다(`judge` 의 마커와 다른 값).
-    let composer_marker = spec.as_ref().and_then(composer_marker_of);
+    let composer_marker = spec.as_ref().map(composer_marker_of).unwrap_or_default();
     let composer_placeholder = spec.as_ref().and_then(composer_placeholder_of);
     let corpus = resolve_gate_corpus(agent);
     let obs = cys::readiness::Observed {
@@ -13367,7 +13385,7 @@ fn gate_pending_reobserve_once(sid: u64, agent: &str, marked_gate: Option<&str>)
         gate_pending_recheck(cys::readiness::judge(&obs)),
         gate_mark_saw_a_gate(marked_gate),
         cys::readiness::legacy_v1(),
-        composer_marker.as_deref(),
+        cys::agent_markers::pick_marker_for_screen(&composer_marker, &screen),
         composer_placeholder.as_deref(),
         &screen,
         idle_quiet,
@@ -22480,6 +22498,55 @@ mod tests {
         write_one(nulled);
         let got = load_agent_spec(&key).expect("로드");
         assert!(got["ready_marker"].is_null(), "명시 null 은 사용자 의도 — 보강 금지");
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+    }
+
+    /// ★(0.14.39 · D-04) 알려진 옛 vendor 기본값만 메모리에서 승격한다.
+    /// 사용자 문자열·목록과 부트 마커는 보존하고 agents.json 바이트는 쓰지 않는다(★W-B).
+    #[test]
+    fn d04_load_agent_spec_promotes_stale_codex_marker_in_memory() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-d04-agentmarkers-{}", std::process::id()));
+        std::fs::create_dir_all(&td).expect("임시 팩 생성");
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        let embed = embedded_agents_json().expect("임베드 agents.json 파싱");
+        for (name, disk_marker, expected) in [
+            ("옛 vendor 문자열 승격", json!("›"), json!(["›", "»"])),
+            ("사용자 문자열 보존", json!("▶"), json!("▶")),
+            ("새 목록 멱등", json!(["›", "»"]), json!(["›", "»"])),
+            ("옛 글리프도 목록이면 사용자 선언", json!(["›"]), json!(["›"])),
+        ] {
+            let mut spec = embed["codex"].clone();
+            spec["prompt_marker"] = disk_marker;
+            // 같은 옛 글리프라도 이 키는 승격 표에 없다(h_deliver_1 ④와 같은 경계).
+            spec["ready_marker"] = json!("›");
+            let disk = json!({"_schema": 3, "codex": spec});
+            let raw = serde_json::to_vec_pretty(&disk).expect("픽스처 직렬화");
+            let path = td.join("agents.json");
+            std::fs::write(&path, &raw).expect("임시 디스크 픽스처");
+
+            let got = load_agent_spec("codex").expect("디스크 어댑터 로드");
+            assert_eq!(got["prompt_marker"], expected, "{name}");
+            assert_eq!(
+                got["ready_marker"], json!("›"),
+                "{name}: 부트 마커는 승격 대상이 아니다"
+            );
+            assert_eq!(
+                load_agent_spec("codex").expect("반복 로드"), got,
+                "{name}: 반복 로드 멱등"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("디스크 원문"), raw,
+                "{name}: 디스크 바이트 무접촉"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&td);
         match saved {
