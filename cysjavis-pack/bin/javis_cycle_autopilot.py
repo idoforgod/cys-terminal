@@ -147,8 +147,9 @@ LOG_MAX_BYTES = 4096
 HEARTBEAT_MAX_AGE = 90.0      # 게이트6 — 검증자 워처 생존 판정 창
 HEARTBEAT_TOUCH_SECS = 30.0   # 워처 touch 주기
 STAGE2_WINDOW = 120.0         # cys cycle-agent --timeout 기본값 = 검증자 신선도 기준선 폭
-CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*2 + clear 실효 관측 75 + settle 75 + 검증 <= 585s)
-#   ★[결재 7ⓑ] cycle-agent 가 clear 뒤 실효 관측 창(러스트 CLEAR_VERIFY_SECS = 75)을 기다리므로 +75s.
+CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*3 + 75*2 + settle 75 + 검증 <= 780s)
+#   ★사전 턴 확인이 --timeout 한 벌, 재주입 직전 유휴 대기가 CLEAR_VERIFY_SECS(75) 한 벌을 더 쓴다.
+#   재주입 직전 유휴 대기로 quiescing 유지 구간도 길어진다.
 #   LEASE_TTL(900) 안이며, 인계는 'lease 갱신 없음 + pid 사망' 둘 다일 때만이라 산 실행은 뺏기지 않는다.
 VERIFIER_ROLE = "cycle-verifier"
 CYS = "cys"
@@ -387,6 +388,18 @@ def escalate(text, runner=run):
 # ═══════════════════════ CONTRACT BLOCK v1 END ═══════════════════════
 
 
+# ★WP-D: 송신 0건 보류는 사이클을 종결하되 레인의 자동 재시도를 잠그지 않는다.
+#   검증자와 공유하는 v1 계약은 보존하고 autopilot 전용 전이만 확장한다.
+HELD_PHASE = "held_noop"
+HELD_RCS = (84, 85)
+# ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_TARGET_BUSY/EXIT_CYCLE_HUMAN_DRAFT 와 같은 값이어야
+#   한다 — 송신 0건 코드만. 86은 clear 가 이미 나갔으므로 반드시 사후검증한다.
+PHASES = PHASES + (HELD_PHASE,)
+TERMINAL_PHASES = TERMINAL_PHASES + (HELD_PHASE,)
+PHASE_NEXT = dict(PHASE_NEXT, executor_exited=PHASE_NEXT["executor_exited"] + (HELD_PHASE,))
+PHASE_NEXT[HELD_PHASE] = ()
+
+
 # ── ★T-0147-2 층1 I3 — escalation 발행 경로를 javis_wakeup 큐로 수렴 ─────────────────
 #
 # 설계 정본: `_round/T-0147-2-DESIGN-wakeup-demotion.md` §2 층1(I3) · §8(R2-C2 수용).
@@ -493,6 +506,8 @@ IDLE_MIN = {"master": 180.0}      # 그 외 역할 = 60s
 IDLE_MIN_DEFAULT = 60.0
 OWNER_ACTIVE_WINDOW = 600.0       # $PACK/round/OWNER_ACTIVE mtime 10분
 COOLDOWN_SECS = 1200.0            # cleared_verified 후 20분
+HELD_RETRY_COOLDOWN_SECS = 300.0   # 비파괴 보류 후 재시도 최소 간격
+HELD_RETRY_MAX = 3                # 같은 역할 연속 보류 상한 — 사람 확인 후 reset
 SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
 # ★[결재 7ⓑ] 러스트 src/bin/cys.rs 의 CLEAR_VERIFY_SECS(cycle-agent clear 실효 관측 창)와 같은 값이어야
 #   한다 — 같은 증거(session_file 교체)를 같은 창에서 본다. 바꾸면 양쪽을 함께 바꿔라. 불일치는
@@ -500,11 +515,12 @@ SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
 # [v2.1 ④] in-flight kill-switch 폴링 — 설계 v2 의 2~5s 를 **1s 로 격상**한다.
 # handshake~clear 구간만 격상해도 되지만, 외곽에서 stage 경계를 결정론으로 관측할 방법이 없어
 # (자식 stderr 문구 파싱 = 화면 오라클) 자식 수명 **전 구간**을 1s 로 돌린다(엄격측).
-# ★잔여 창(정직 표기): 검증자 allow → cycle-agent 의 clear 타이핑 사이 수 초는 회수 불가다.
+# ★잔여 창(정직 표기): allow→clear 는 사전 턴 확인 대기 포함 최대 CYCLE_AGENT_TIMEOUT 이다.
 #   1s 폴링은 그 창을 줄일 뿐 없애지 못한다 — 원장 detail.residual_window 로 매 사이클 명기한다.
 KILL_POLL_SECS = 1.0
-RESIDUAL_WINDOW_NOTE = ("allow→clear 구간 수초는 kill-switch 회수 불가(수용된 안전 한계 · "
-                        "설계 v2.1 C1)")
+RESIDUAL_WINDOW_NOTE = ("allow→clear 구간(사전 턴 확인 대기 포함 최대 CYCLE_AGENT_TIMEOUT=%ds)은 "
+                        "kill-switch 회수 불가 — 1s 폴링이 줄일 뿐(수용된 안전 한계 · 설계 v2.1 C1)"
+                        % CYCLE_AGENT_TIMEOUT)
 RESET_COOLDOWN_SECS = 180.0       # 운영자 reset 후 재발화 최소 간격(무한 재시도 연타 방지)
 # [C2-④] bootstrap-verifier 백오프 — 워처 즉사 반복 병리에서 pane 무한 누적 차단.
 BOOTSTRAP_BACKOFF_WINDOW = 3600.0  # 시도 계수 창(60분)
@@ -812,7 +828,7 @@ def evaluate_gates(role, ctx, now_ts):
       killed(bool), kill_reason(str), row(dict|None), measure(dict),
       owner_active_mtime(float|None), heartbeat_mtime(float|None),
       cycle_agent_procs(int), ledger(dict: last_terminal_phase/last_terminal_ts/
-                                        cycles/incomplete/corrupt), lease_free(bool)
+                                        cycles/incomplete/corrupt/held_streak), lease_free(bool)
     반환: {"pass":bool, "exit":int, "gates":[{id,name,ok,detail}], "reason":str}
     """
     g = []
@@ -876,6 +892,17 @@ def evaluate_gates(role, ctx, now_ts):
             add(5, "쿨다운·짝짓기", elapsed >= RESET_COOLDOWN_SECS,
                 "직전=%s 이나 운영자 reset(%.0fs 전)이 종결보다 최신 — reset 쿨다운 %.0fs 적용"
                 % (last_phase, elapsed, RESET_COOLDOWN_SECS))
+        elif last_phase == HELD_PHASE:
+            streak = led.get("held_streak", 0)
+            if streak >= HELD_RETRY_MAX:
+                add(5, "쿨다운·짝짓기", False,
+                    "연속 보류 %d회 — 대상이 계속 바쁘다. 사람 확인 후 reset" % streak)
+                g[-1]["held_limit"] = True   # ★순수 판정 유지 — 통지는 tick 이 담당한다.
+            else:
+                elapsed = now_ts - last_ts
+                add(5, "쿨다운·짝짓기", elapsed >= HELD_RETRY_COOLDOWN_SECS,
+                    "비파괴 보류 후 %.0fs (필요 %.0fs, 연속 %d/%d회) — reset 불필요"
+                    % (elapsed, HELD_RETRY_COOLDOWN_SECS, streak, HELD_RETRY_MAX))
         elif last_phase != SUCCESS_PHASE:
             add(5, "쿨다운·짝짓기", False,
                 "직전 사이클 종결=%s (%s 아님 → 발화 금지)" % (last_phase, SUCCESS_PHASE))
@@ -1078,9 +1105,10 @@ def ledger_view(records, role, bad_lines):
     - last_terminal_phase/ts: 가장 최근 cycle_id 의 종결 phase
     - incomplete: 가장 최근 cycle_id 에 종결 phase 가 없다 = 미완결(fail-closed)
     - corrupt: 파싱 불가 라인 존재 또는 원장 읽기 불가
+    - held_streak: 최신 cycle 부터 연속 held 종결 수(reset 이전 종결은 제외)
     """
     view = {"cycles": 0, "last_terminal_phase": None, "last_terminal_ts": None,
-            "last_reset_ts": None,
+            "last_reset_ts": None, "held_streak": 0,
             "incomplete": False, "incomplete_cycle": None,
             "corrupt": bool(bad_lines) and bad_lines != 0}
     if bad_lines and bad_lines != 0:
@@ -1114,6 +1142,16 @@ def ledger_view(records, role, bad_lines):
     terminal.sort(key=lambda r: r.get("ts") or 0)
     view["last_terminal_phase"] = terminal[-1].get("phase")
     view["last_terminal_ts"] = terminal[-1].get("ts")
+    for cid in sorted(by_cycle, reverse=True):
+        terminal = [r for r in by_cycle[cid] if r.get("phase") in TERMINAL_PHASES]
+        if not terminal:
+            break
+        terminal.sort(key=lambda r: r.get("ts") or 0)
+        last = terminal[-1]
+        if (last.get("phase") != HELD_PHASE
+                or (last.get("ts") or 0) < (view["last_reset_ts"] or 0)):
+            break
+        view["held_streak"] += 1
     return view
 
 
@@ -1220,6 +1258,13 @@ def cmd_tick(args):
         verdict = evaluate_gates(role, ctx, now_ts)
         report.append({"role": role, "pass": verdict["pass"], "reason": verdict["reason"]})
         if not verdict["pass"]:
+            for gate in verdict["gates"]:
+                if gate.get("held_limit"):
+                    # ★같은 종결의 반복 tick 은 같은 본문/멱등키 — 새 큐·상태 파일 불필요.
+                    escalate("[CYCLE-AUTOPILOT] %s %s (직전 종결 ts=%s). 자동 재시도 중지. "
+                             "해제: javis_cycle_autopilot.py reset --role %s --reason '<사유>'"
+                             % (role, gate["detail"], ctx["ledger"]["last_terminal_ts"], role),
+                             task_key="autopilot-held-limit")
             if verdict["exit"] in (EXIT_KILL, EXIT_LEDGER):
                 log_append({"ts": now_ts, "cycle_id": None, "phase": "skip", "role": role,
                             "surface": (ctx.get("row") or {}).get("surface_ref"),
@@ -1648,9 +1693,25 @@ def cmd_execute(args):
                  task_key="autopilot-killswitch")       # ★I3: 사건 종류별 병합 단위
         return EXIT_KILL
 
-    # 4) [v2.1 ④] 자식 종료 = executor_exited (clear 성공을 뜻하지 않는다). exit code 는 기록만.
+    # 4) 자식 종료 = executor_exited (clear 성공을 뜻하지 않는다). 송신 0건 보류만 별도 종결.
     _set_phase(cid, role, surface, "executor_exited",
                {"child_rc": rc, "tail": tail[-800:], "started_at": start_ts})
+    if rc in HELD_RCS:
+        # ★84는 quiesce-on 전, 85는 자식이 off 했지만 abort 와 같은 멱등 안전망을 둔다.
+        release_quiesce(surface, cid, role, "held noop child rc=%d" % rc)
+        retry_after_ts = time.time() + HELD_RETRY_COOLDOWN_SECS
+        _finalize(cid, role, surface, HELD_PHASE,
+                  {"child_rc": rc, "tail": tail[-800:],
+                   "reason": "비파괴 보류(clear 송신 0건)", "clear_sent": False,
+                   "retry_after_ts": retry_after_ts})
+        ledger_append("cycle", "cycle-autopilot",
+                      {"phase": HELD_PHASE, "id": nonce_for(cid), "role": role})
+        escalate("[CYCLE-AUTOPILOT] cycle-%d %s 비파괴 보류(clear 송신 0건, rc=%d). "
+                 "%.0fs 쿨다운 뒤 다른 게이트 통과 시 자동 재시도(최소 시각=%.3f), reset 불필요. "
+                 "단, 연속 보류 %d회 도달 시 자동 재시도 중지·사람 확인 후 reset."
+                 % (cid, role, rc, HELD_RETRY_COOLDOWN_SECS, retry_after_ts, HELD_RETRY_MAX),
+                 task_key="autopilot-held")
+        return EXIT_ERR
     time.sleep(SETTLE_SECS)
     with _StateLock():
         st = load_state()
@@ -2280,6 +2341,14 @@ def cmd_self_test(args):
             phase_transition_ok("executor_exited", "failed_preclear"))
     t.check("executor_exited→indeterminate 합법",
             phase_transition_ok("executor_exited", "indeterminate"))
+    t.check("executor_exited→held_noop 합법", phase_transition_ok("executor_exited", HELD_PHASE))
+    t.check("held_noop→armed 불법(종결 재개)", not phase_transition_ok(HELD_PHASE, "armed"))
+    t.check("held_noop 진입은 executor_exited 에서만",
+            HELD_PHASE in PHASES and PHASE_NEXT[HELD_PHASE] == ()
+            and all(not phase_transition_ok(p, HELD_PHASE) for p in PHASES
+                    if p != "executor_exited"))
+    t.check("HELD_RCS = 송신 0건 84/85", HELD_RCS == (84, 85))
+    t.check("HELD_RCS 에 86 없음(clear 후 사후검증 필수)", 86 not in HELD_RCS)
     t.check("모든 비종결 phase→failed 합법",
             all(phase_transition_ok(p, "failed") for p in
                 ("armed", "prenotified", "fired", "executor_exited")))
@@ -2292,8 +2361,9 @@ def cmd_self_test(args):
     t.check("None→fired 불법", not phase_transition_ok(None, "fired"))
     t.check("SUCCESS_PHASE 만 성공 종결",
             SUCCESS_PHASE == "cleared_verified" and SUCCESS_PHASE in TERMINAL_PHASES
+            and HELD_PHASE != SUCCESS_PHASE
             and set(TERMINAL_PHASES) == {"cleared_verified", "failed_preclear",
-                                         "indeterminate", "failed"})
+                                         "indeterminate", "failed", "held_noop"})
 
     # 4) 측정 — 무효화 부재 규칙
     print("[4] 측정 신선도 = 무효화 부재")
@@ -2427,6 +2497,31 @@ def cmd_self_test(args):
                                                              "updated_at": now_ts}}), now_ts)
     t.check("비-statusline 측정 → skip", not v["pass"])
 
+    # 5-c) ★송신 0건 보류만 자동 재시도 — reset 우선·쿨다운 경계·연속 상한.
+    print("[5-c] held_noop 재시도 게이트")
+    held_led = {"cycles": 2, "last_terminal_phase": HELD_PHASE, "held_streak": 2,
+                "last_terminal_ts": now_ts - HELD_RETRY_COOLDOWN_SECS + 1,
+                "incomplete": False, "corrupt": False}
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("held + 299s → 게이트5 차단",
+            not v["pass"] and not next(g for g in v["gates"] if g["id"] == 5)["ok"])
+    held_led["last_terminal_ts"] = now_ts - HELD_RETRY_COOLDOWN_SECS
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("held + 300s → 게이트5 통과", v["pass"], v["reason"])
+    held_led["held_streak"] = HELD_RETRY_MAX
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("연속 보류 3회 → 차단 + reset 요구",
+            not v["pass"] and "연속 보류 3회" in v["reason"]
+            and "사람 확인 후 reset" in v["reason"]
+            and any(g.get("held_limit") for g in v["gates"]))
+    held_led["last_reset_ts"] = now_ts - RESET_COOLDOWN_SECS + 1
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("held 상한 뒤 reset + 179s → reset 쿨다운 차단",
+            not v["pass"] and not any(g.get("held_limit") for g in v["gates"]))
+    held_led["last_reset_ts"] = now_ts - RESET_COOLDOWN_SECS
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("held 상한 뒤 reset + 180s → 통과", v["pass"], v["reason"])
+
     # 6) 원장 뷰
     print("[6] 원장 뷰(짝짓기 입력)")
     recs = [{"ts": 100, "cycle_id": 1, "phase": "armed", "role": "worker"},
@@ -2448,6 +2543,39 @@ def cmd_self_test(args):
     t.check("타 역할 레코드는 무관", lv4["cycles"] == 0)
     lv5 = ledger_view([], "worker", 3)
     t.check("bad_lines>0 → corrupt", lv5["corrupt"])
+    held_recs = [{"ts": 100, "cycle_id": 1, "phase": HELD_PHASE, "role": "worker"},
+                 {"ts": 190, "cycle_id": 2, "phase": "executor_exited", "role": "worker"},
+                 {"ts": 200, "cycle_id": 2, "phase": HELD_PHASE, "role": "worker"},
+                 {"ts": 201, "cycle_id": 2, "phase": "quiesce_release", "role": "worker"},
+                 {"ts": 300, "cycle_id": 3, "phase": SUCCESS_PHASE, "role": "master"}]
+    lvh = ledger_view(held_recs, "worker", 0)
+    t.check("held_streak: 보류 2회(보조 phase·타 역할 제외)",
+            lvh["held_streak"] == 2 and not lvh["incomplete"]
+            and lvh["last_terminal_phase"] == HELD_PHASE)
+    held_recs.append({"ts": 400, "cycle_id": 4, "phase": SUCCESS_PHASE, "role": "worker"})
+    t.check("held_streak: 보류 2회 뒤 cleared_verified → 0",
+            ledger_view(held_recs, "worker", 0)["held_streak"] == 0)
+    held_recs.append({"ts": 500, "cycle_id": 5, "phase": HELD_PHASE, "role": "worker"})
+    t.check("held_streak: 성공 뒤 보류는 새 연속 1회",
+            ledger_view(held_recs, "worker", 0)["held_streak"] == 1)
+    for reset_ts, expected in ((150, 1), (200, 1), (250, 0)):
+        reset_recs = held_recs[:5] + [{"ts": reset_ts, "cycle_id": None,
+                                      "phase": "reset", "role": "worker"}]
+        t.check("held_streak: reset ts=%d 경계 → %d" % (reset_ts, expected),
+                ledger_view(reset_recs, "worker", 0)["held_streak"] == expected)
+    incomplete_held = held_recs[:5] + [{"ts": 400, "cycle_id": 4,
+                                       "phase": "armed", "role": "worker"}]
+    lvh = ledger_view(incomplete_held, "worker", 0)
+    t.check("held_streak: 최신 미완결은 보류로 세지 않음",
+            lvh["incomplete"] and lvh["held_streak"] == 0)
+    latest_terminal = held_recs[:5] + [{"ts": 202, "cycle_id": 2,
+                                       "phase": "failed", "role": "worker"}]
+    t.check("held_streak: 같은 cycle 의 최신 종결만 채택",
+            ledger_view(list(reversed(latest_terminal)), "worker", 0)["held_streak"] == 0)
+    latest_terminal[-1]["ts"] = 200
+    lvh = ledger_view(latest_terminal, "worker", 0)
+    t.check("held_streak: 종결 ts 동률은 원장 뒤쪽 기록 우선",
+            lvh["last_terminal_phase"] == "failed" and lvh["held_streak"] == 0)
 
     # 7) argv·저장세트 계약 — [R2-A] 대상 surface 기준 파생
     print("[7] save-file 대상 surface 파생 + argv 계약")
@@ -2800,8 +2928,12 @@ def cmd_self_test(args):
     t.check("자기 계약 블록 추출", bool(mine))
     if os.path.exists(sib):
         other = extract_contract_block(sib)
-        t.check("javis_cycle_verifier.py 와 바이트 동일", mine == other,
-                "" if mine == other else "블록 불일치 — 한쪽만 수정됨")
+        # ★예외를 두지 않는다 — 한쪽만 고치면 즉시 빨개지는 것이 이 검사의 존재 이유다.
+        #   (수정 라운드 1: 예산 주석을 autopilot 만 고치고 여기에 replace() 면제를 넣은
+        #    변형이 있었다. 그 면제는 verifier 자기 검사를 빨갛게 만들었고, 실제 해법은
+        #    양쪽 주석을 같은 문면으로 맞추는 것이다.)
+        t.check("javis_cycle_verifier.py 와 바이트 동일",
+                mine == other, "" if mine == other else "블록 불일치 — 양쪽을 함께 고쳐라")
     else:
         t.check("sibling 부재(SKIP 처리)", True, "(verifier 미배치)")
 
@@ -3075,6 +3207,80 @@ def cmd_self_test(args):
     t.check("_BootstrapLock 은 전용 락 파일(bootstrap.lock — state.json 락과 분리·lease 경로 비점유)",
             'os.path.join(STATE_DIR, "bootstrap.lock")' in _insp.getsource(_BootstrapLock)
             and "STATE_JSON" not in _insp.getsource(_BootstrapLock))
+
+    # 18) ★보류 종료 경로 — 실제 임시 lease/원장 + 자식·데몬 호출만 페이크(실송신 0).
+    print("[18] held 자식 종료·상한 통지 (데몬 없이 주입식)")
+    import io
+    from unittest.mock import Mock, patch
+    held_dir = os.path.join(tmpd, "held-execute")
+    os.makedirs(held_dir)
+    release_real = release_quiesce
+    for child_rc in (84, 85, 86):
+        cid = 8000 + child_rc
+        child = Mock(stdout=io.StringIO("held-fixture rc=%d\n" % child_rc))
+        child.poll.return_value = child_rc
+        sleeper, notifier, appender = Mock(), Mock(), Mock()
+        post = Mock(return_value={"verdict": "failed_preclear"})
+        qrunner = Mock(return_value=(0, "", ""))
+        paths = {"STATE_DIR": held_dir, "STATE_JSON": os.path.join(held_dir, "state.json"),
+                 "BASELINE_DIR": os.path.join(held_dir, "baselines"),
+                 "CYCLE_LOG": os.path.join(held_dir, "cycle-%d.jsonl" % cid)}
+        deps = dict(paths, mode=lambda: MODE_LIVE, kill_switch=lambda: (False, ""),
+                    fetch_status=lambda: {"surfaces": [{"role": VERIFIER_ROLE, "surface_id": 3}]},
+                    verifier_collision=lambda *a: (False, ""),
+                    push_line=lambda *a: (True, ""), escalate=notifier, ledger_append=appender,
+                    post_verify=post,
+                    release_quiesce=lambda *a: release_real(*a, runner=qrunner))
+        with patch.dict(globals(), deps), patch.object(subprocess, "Popen", return_value=child), \
+                patch.object(time, "sleep", sleeper):
+            save_state({"lease": {"cycle_id": cid, "role": "worker", "surface": "surface:9",
+                                  "phase": "armed", "save_files": [sess]}})
+            result = cmd_execute(argparse.Namespace(cycle_id=cid, role="worker"))
+            observed, bad = read_ledger()
+            final_state = load_state()
+        if child_rc in HELD_RCS:
+            terminal = observed[-1]
+            detail = terminal["detail"]
+            t.check("rc%d: held 종결·lease 해제·합법 전이" % child_rc,
+                    not bad and terminal["phase"] == HELD_PHASE and "lease" not in final_state
+                    and all("illegal_transition_from" not in r["detail"] for r in observed))
+            t.check("rc%d: settle/post_verify 0회 + EXIT_ERR" % child_rc,
+                    result == EXIT_ERR and not sleeper.called and not post.called)
+            t.check("rc%d: 송신 0건·tail·재시도 시각·종결 원장·전용 통지" % child_rc,
+                    detail["child_rc"] == child_rc and detail["clear_sent"] is False
+                    and "송신 0건" in detail["reason"] and "held-fixture" in detail["tail"]
+                    and abs(detail["retry_after_ts"] - terminal["ts"]
+                            - HELD_RETRY_COOLDOWN_SECS) < 1
+                    and appender.call_args.args == ("cycle", "cycle-autopilot",
+                        {"phase": HELD_PHASE, "id": nonce_for(cid), "role": "worker"})
+                    and notifier.call_args.kwargs == {"task_key": "autopilot-held"}
+                    and all(s in notifier.call_args.args[0]
+                            for s in ("비파괴 보류", "자동 재시도", "reset 불필요", "연속 보류 3회")))
+            t.check("rc%d: 기존 quiesce-off 멱등 안전망" % child_rc,
+                    qrunner.call_args.args[0] == [CYS, "quiesce", "--surface", "surface:9", "--off"])
+        else:
+            t.check("rc86: settle + post_verify 유지(held 우회 금지)",
+                    result == EXIT_ERR and sleeper.call_args.args == (SETTLE_SECS,)
+                    and post.call_count == 1 and not notifier.called and not qrunner.called
+                    and all(r["phase"] != HELD_PHASE for r in observed))
+
+    cap_ctx = ctx_of(ledger={"cycles": 3, "last_terminal_phase": HELD_PHASE,
+                            "last_terminal_ts": now_ts - 1000, "held_streak": 3})
+    notifier, spawner = Mock(), Mock()
+    with patch.dict(globals(), dict(paths, kill_switch=lambda: (False, ""),
+                    sweep_ledger=lambda: {}, fetch_status=lambda: {}, roles=lambda: ["worker"],
+                    read_ledger=lambda: ([], 0), _emit_observations=lambda *a: None,
+                    collect_ctx=lambda *a: cap_ctx, escalate=notifier, _spawn_executor=spawner)), \
+            patch.object(sys, "stdout", io.StringIO()):
+        save_state({})
+        cap_result = cmd_tick(argparse.Namespace())
+        cmd_tick(argparse.Namespace())
+    t.check("held 상한 tick: 스폰 0회·전용 escalation·reset 요구",
+            cap_result == EXIT_OK and not spawner.called and notifier.call_count == 2
+            and notifier.call_args.kwargs == {"task_key": "autopilot-held-limit"}
+            and "사람 확인 후 reset" in notifier.call_args.args[0])
+    t.check("held 상한 반복 tick: 통지 본문 고정(기존 멱등키 재사용)",
+            notifier.call_args_list[0] == notifier.call_args_list[1])
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

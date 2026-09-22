@@ -157,8 +157,9 @@ LOG_MAX_BYTES = 4096
 HEARTBEAT_MAX_AGE = 90.0      # 게이트6 — 검증자 워처 생존 판정 창
 HEARTBEAT_TOUCH_SECS = 30.0   # 워처 touch 주기
 STAGE2_WINDOW = 120.0         # cys cycle-agent --timeout 기본값 = 검증자 신선도 기준선 폭
-CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*2 + clear 실효 관측 75 + settle 75 + 검증 <= 585s)
-#   ★[결재 7ⓑ] cycle-agent 가 clear 뒤 실효 관측 창(러스트 CLEAR_VERIFY_SECS = 75)을 기다리므로 +75s.
+CYCLE_AGENT_TIMEOUT = 120     # --timeout (예산표: 120*3 + 75*2 + settle 75 + 검증 <= 780s)
+#   ★사전 턴 확인이 --timeout 한 벌, 재주입 직전 유휴 대기가 CLEAR_VERIFY_SECS(75) 한 벌을 더 쓴다.
+#   재주입 직전 유휴 대기로 quiescing 유지 구간도 길어진다.
 #   LEASE_TTL(900) 안이며, 인계는 'lease 갱신 없음 + pid 사망' 둘 다일 때만이라 산 실행은 뺏기지 않는다.
 VERIFIER_ROLE = "cycle-verifier"
 CYS = "cys"
