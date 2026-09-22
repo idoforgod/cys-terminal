@@ -1199,6 +1199,9 @@ pub struct Surface {
     /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     pub pending_input_bytes: AtomicU64,
+    /// 미제출 입력 상태기계의 surface 별 상태. count 의 SOT 는 미러 atomic `pending_input_bytes`
+    /// (락 없는 읽기 소비자·테스트 픽스처 직접 store 호환) · 나머지 필드의 SOT 는 이 Mutex.
+    pub pending_input: Mutex<crate::governance::PendingInputState>,
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **변이 세대** — 모든 쓰기(`set_pending_input`)
     /// 마다 +1. stale 리셋 판정이 "같은 바이트 수" 가 아니라 "같은 세대" 를 본다: 옛 초안을 제출하고
     /// 같은 길이의 새 초안을 친 ABA 를 바이트 수는 구분하지 못한다(codex 설계 검토 Q4).
@@ -1468,9 +1471,35 @@ impl Surface {
     /// (`input_gen`)를 올린다. 직접 `store` 하면 세대가 멈춰 stale 리셋이 ABA 를 놓친다(테스트 픽스처
     /// 조립은 예외). 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
     /// governance 배달 임계영역 · stale 리셋).
+    /// count 만 바꾸는 경로(큐 Inject·롤백)용 — 붙여넣기 상태는 건드리지 않는다.
     pub fn set_pending_input(&self, bytes: u64) {
         self.pending_input_bytes.store(bytes, Ordering::Relaxed);
         self.input_gen.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 청크 1개를 상태기계에 적용하고 미러·세대를 갱신한다. 새 상태를 돌려준다.
+    /// 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
+    /// governance 배달 임계영역 · stale 리셋).
+    pub fn apply_pending_input(
+        &self,
+        chunk: &[u8],
+        origin: crate::governance::InputOrigin,
+    ) -> crate::governance::PendingInputState {
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
+        let next = crate::governance::pending_input_step(&st, chunk, origin, std::time::Instant::now());
+        *st = next.clone();
+        drop(st);
+        self.set_pending_input(next.count);
+        next
+    }
+
+    /// 줄이 비워지고 제출된 사실(clear_first 원자 주입 · stale 리셋)을 반영 — 상태 전부 초기화 + 미러 0 + 세대 +1.
+    /// 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
+    /// governance 배달 임계영역 · stale 리셋).
+    pub fn clear_pending_input(&self) {
+        *self.pending_input.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        self.set_pending_input(0);
     }
 
     /// ★(U-10) `gate_pending` 축의 **유일한 직렬화 지점**. `surface.list`·`org.status`·
@@ -4593,6 +4622,7 @@ impl Daemon {
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             pending_input_bytes: AtomicU64::new(0),
+            pending_input: Mutex::new(Default::default()),
             input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
             queue_blocked: Mutex::new(None),

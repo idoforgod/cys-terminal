@@ -4416,16 +4416,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   하므로 계수는 0 이다. 그 외 본문(사람 키·프로그램 미제출 본문)은 누적한다 —
             //   제출 CR 이 별도 send_key 로 오기 전까지 그 줄은 점유 상태다.
             {
-                let next = if clear_first {
-                    0
-                } else {
-                    crate::governance::pending_input_after(
-                        surface.pending_input_bytes.load(Ordering::Relaxed),
-                        text.as_bytes(),
-                    )
-                };
                 // ★(0.14.31 · WP-5) 세대 동반 쓰기 — stale 리셋(governance)이 세대로 ABA 를 가른다.
-                surface.set_pending_input(next);
+                if clear_first {
+                    surface.clear_pending_input();
+                } else {
+                    // human 은 자기신고(타이핑 가드 :4224 와 같은 신뢰 등급) —
+                    // 출처 표식은 게이트 방향(fail-closed)으로만 쓰인다.
+                    let origin = if human && !machine_origin {
+                        crate::governance::InputOrigin::Human
+                    } else {
+                        crate::governance::InputOrigin::Machine
+                    };
+                    surface.apply_pending_input(text.as_bytes(), origin);
+                }
             }
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             if !human_verified {
@@ -4631,10 +4634,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
                 //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
                 //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
-                surface.set_pending_input(crate::governance::pending_input_after(
-                    surface.pending_input_bytes.load(Ordering::Relaxed),
-                    &key_bytes,
-                ));
+                surface.apply_pending_input(&key_bytes, crate::governance::InputOrigin::Machine);
             }
             Reply::Single(ok_response(
                 &id,

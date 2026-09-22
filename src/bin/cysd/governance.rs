@@ -4927,6 +4927,58 @@ pub(crate) fn pending_input_after(prev: u64, written: &[u8]) -> u64 {
     }
 }
 
+/// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PendingInputState {
+    /// 미제출 입력 바이트(전 경로 · `Surface::pending_input_bytes` 미러의 원본).
+    pub count: u64,
+    /// 그중 **사람 경로**(surface.send_text human=true ∧ !machine_origin · GUI term.onData)로 들어온 바이트.
+    pub human: u64,
+    /// 괄호붙여넣기 봉투 안(ESC[200~ 뒤 · ESC[201~ 전).
+    pub in_paste: bool,
+    /// OPEN 을 본 시각(미종결 봉투 해제 TTL 의 기준).
+    pub paste_opened_at: Option<std::time::Instant>,
+    /// 청크 끝이 봉투 표식의 접두로 끝났을 때 다음 호출로 이월하는 ≤5 바이트.
+    pub tail: Vec<u8>,
+}
+
+/// 입력 바이트의 출처 — 사람(GUI 자기신고 human=true · !machine_origin) / 기계(그 밖 전부 · send_key 전부).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputOrigin {
+    Human,
+    Machine,
+}
+
+/// 미종결 봉투 해제 TTL(초) — OPEN 뒤 이 시간이 지난 새 청크는 봉투 밖으로 본다.
+pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
+
+/// 입력 청크의 순수 전이 — 스캐폴드는 종전 계수 규칙을 유지하고 봉투 상태를 초기화한다.
+pub(crate) fn pending_input_step(
+    prev: &PendingInputState,
+    chunk: &[u8],
+    origin: InputOrigin,
+    now: std::time::Instant,
+) -> PendingInputState {
+    let _ = now; // 봉투 TTL 은 v2 구현에서 적용한다.
+    let human = match origin {
+        InputOrigin::Human => pending_input_after(prev.human, chunk),
+        InputOrigin::Machine => {
+            if chunk.iter().any(|b| matches!(b, b'\r' | b'\n' | 0x15 | 0x03)) {
+                0
+            } else {
+                prev.human
+            }
+        }
+    };
+    PendingInputState {
+        count: pending_input_after(prev.count, chunk),
+        human,
+        in_paste: false,
+        paste_opened_at: None,
+        tail: Vec::new(),
+    }
+}
+
 /// 프롬프트 경계 판정 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptBoundary {
@@ -8330,7 +8382,7 @@ fn maybe_reset_stale_pending_input(
         {
             return false;
         }
-        s.set_pending_input(0);
+        s.clear_pending_input();
     }
     daemon.bus.publish(
         "queue.input_pending_reset",
@@ -11077,8 +11129,8 @@ mod tests {
     // ─────────── ★B1(0.14.30): 프롬프트 경계 준비판정 — 순수 판정자 핀 ───────────
 
     use super::{
-        input_line_state, prompt_boundary_verdict, queue_starve_alert_secs, InputLine,
-        PromptBoundary, PromptLine,
+        input_line_state, prompt_boundary_verdict, queue_starve_alert_secs, InputLine, InputOrigin,
+        PendingInputState, PromptBoundary, PromptLine,
     };
 
     /// 커서 **뒤** 텍스트는 Claude Code prompt suggestions(고스트)다 — 입력 버퍼가 아니다.
@@ -11146,11 +11198,12 @@ mod tests {
             );
         }
         // 오너가 master pane 을 10번 클릭·이탈한다(사람 글자 0 · 제출 0).
-        let mut pending = 0u64;
+        let mut chunks: Vec<&[u8]> = Vec::new();
         for _ in 0..10 {
-            pending = super::pending_input_after(pending, b"\x1b[I"); // focus in
-            pending = super::pending_input_after(pending, b"\x1b[O"); // focus out
+            chunks.push(b"\x1b[I"); // focus in
+            chunks.push(b"\x1b[O"); // focus out
         }
+        let pending = v7_last(0, &chunks);
         assert_eq!(
             pending, 0,
             "터미널 자동응답(포커스 보고)이 '미제출 입력' 으로 계수됐다 — \
@@ -11162,11 +11215,12 @@ mod tests {
     /// CSO 제3자 관측("입력줄은 비었는데 blocked_by=input_pending")이 이 한 줄이다.
     #[test]
     fn qs_a_empty_prompt_with_autoreply_residue_must_not_block_delivery() {
-        let mut pending = 0u64;
+        let mut chunks: Vec<&[u8]> = Vec::new();
         for _ in 0..10 {
-            pending = super::pending_input_after(pending, b"\x1b[I");
-            pending = super::pending_input_after(pending, b"\x1b[O");
+            chunks.push(b"\x1b[I");
+            chunks.push(b"\x1b[O");
         }
+        let pending = v7_last(0, &chunks);
         let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
         assert_eq!(
             input_line_state(pending, Some(empty)),
@@ -11193,13 +11247,14 @@ mod tests {
     fn qs_a_bracketed_paste_envelope_is_not_input_but_body_is() {
         let body = "# WORKER ABSOLUTE DIRECTIVE\n...본문...\n"; // 개행으로 끝나는 지침 본문
         let wrapped = format!("\u{1b}[200~{body}\u{1b}[201~");
-        let pending = super::pending_input_after(0, wrapped.as_bytes());
+        let steps = v7_steps(0, &[wrapped.as_bytes(), b"\r"]);
+        let pending = steps[0];
         assert_eq!(
             pending,
             body.len() as u64,
             "봉투를 제외한 본문 전체가 미제출 입력이어야 한다 — 태그는 끝표식 6바이트만 남긴다(got={pending})"
         );
-        let after_submit = super::pending_input_after(pending, b"\r");
+        let after_submit = steps[1];
         assert_eq!(after_submit, 0, "제출 Return 뒤에는 0 이어야 한다(got={after_submit})");
         let empty = PromptLine { before_cursor: "", at_or_after_cursor: "" };
         assert_eq!(input_line_state(after_submit, Some(empty)), InputLine::Empty);
@@ -11212,23 +11267,37 @@ mod tests {
     // 수정 구현이 아니다 — 제품 코드는 한 줄도 건드리지 않는다.
     //   · `v7_probe_*`  = 관측 전용(절대 실패하지 않는다). 실제 계수를 `V7OBS` 줄로 찍는다.
     //   · `qs_a2_*`·`qs_a3_*`·`qs_a_split_*` = 설계문서가 적은 기대값을 assert 하는 RED/negative 검체.
-    // 청크 계약: 핸들러는 RPC 1회당 `pending_input_after(prev, 그 RPC 의 바이트)` 를 **1번** 부른다
+    // 청크 계약: 핸들러는 RPC 1회당 `apply_pending_input` 으로 `pending_input_step` 을 **1번** 부른다
     // (handlers.rs:4422 send_text · :4634 send_key). 그래서 '호출 N번' 은 fold N번으로 모사한다.
 
     /// 호출 1회 = 1청크. 단계별 계수를 돌려준다(마지막 원소가 최종 계수).
     fn v7_steps(prev: u64, chunks: &[&[u8]]) -> Vec<u64> {
-        let mut p = prev;
+        let mut state = PendingInputState { count: prev, human: prev, ..Default::default() };
+        let now = std::time::Instant::now();
         chunks
             .iter()
             .map(|c| {
-                p = super::pending_input_after(p, c);
-                p
+                state = super::pending_input_step(&state, c, InputOrigin::Human, now);
+                state.count
             })
             .collect()
     }
 
     fn v7_last(prev: u64, chunks: &[&[u8]]) -> u64 {
         v7_steps(prev, chunks).last().copied().unwrap_or(prev)
+    }
+
+    /// 출처와 기준 시각으로부터의 초 오프셋을 적용한다 — TTL 을 잠들지 않고 검증한다.
+    fn v2_run(chunks: &[(&[u8], InputOrigin, u64 /* now 오프셋 초 */)]) -> PendingInputState {
+        let now = std::time::Instant::now();
+        chunks.iter().fold(PendingInputState::default(), |state, (chunk, origin, offset)| {
+            super::pending_input_step(
+                &state,
+                chunk,
+                *origin,
+                now + std::time::Duration::from_secs(*offset),
+            )
+        })
     }
 
     const V7_OPEN: &[u8] = b"\x1b[200~";
@@ -11257,7 +11326,7 @@ mod tests {
             eprintln!(
                 "V7OBS {name} bytes={} is_pure_terminal_autoreply={is_auto} pending_after(prev=0)={}",
                 seq.len(),
-                super::pending_input_after(0, seq)
+                v7_last(0, &[seq])
             );
         }
         let mut clicks: Vec<&[u8]> = Vec::new();
@@ -11385,6 +11454,151 @@ mod tests {
         let single = v7_last(0, &[b"\x1b[200~\x1b[24;80R\x1b[201~"]);
         eprintln!("V7OBS qs_a_split_paste_single_call got={single} expected=8");
         assert_eq!(single, 8, "단일 호출 계수가 BODY 8바이트가 아니다 — got={single}");
+    }
+
+    // ────── ★D-01 v2 상태기계 검체 — 스캐폴드에서는 출처 핀만 통과하고 나머지는 RED ──────
+
+    /// 설계 §5 D-01 v2 봉투 안 자동응답 항 — 분할 F 도 포커스 보고 본문 3바이트를 센다(RED).
+    #[test]
+    fn v2_split_f_focus_report_inside_paste_counts_like_single_call() {
+        let split = v2_run(&[
+            (V7_OPEN, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ]);
+        let single = v2_run(&[(
+            &[V7_OPEN, b"\x1b[I", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(split.count, single.count);
+        assert_eq!(single.count, 3);
+    }
+
+    /// 설계 §5 D-01 v2 봉투 표식 이월 항 — 분할 I 의 표식 중간 경계도 본문만 센다(RED).
+    #[test]
+    fn v2_split_i_envelope_cut_mid_marker_counts_like_single_call() {
+        let split = v2_run(&[
+            (b"\x1b[20", InputOrigin::Human, 0),
+            (b"0~hello", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ]);
+        let single = v2_run(&[(
+            &[V7_OPEN, b"hello", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(split.count, single.count);
+        assert_eq!(single.count, 5);
+    }
+
+    /// 설계 §5 D-01 v2 봉투 안 개행 항 — 끝 개행도 제출이 아닌 본문 1바이트다(RED).
+    #[test]
+    fn v2_trailing_newline_paste_keeps_body() {
+        let state = v2_run(&[(
+            &[V7_OPEN, b"abc\n", V7_CLOSE].concat(),
+            InputOrigin::Human,
+            0,
+        )]);
+        assert_eq!(state.count, 4);
+    }
+
+    /// 설계 §5 D-01 v2 미종결 봉투 해제 항 — TTL 뒤 자동응답 면제는 복귀하되 계수는 줄이지 않는다(RED).
+    #[test]
+    fn v2_unterminated_paste_releases_after_ttl_and_keeps_count() {
+        let open_body = [V7_OPEN, b"abc"].concat();
+        let expired = super::PASTE_OPEN_TTL_SECS + 1;
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (&open_body, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, expired),
+            (b"\r", InputOrigin::Human, expired),
+        ];
+        let opened = v2_run(&chunks[..1]);
+        assert_eq!(opened.count, 3);
+        assert!(opened.in_paste);
+        let released = v2_run(&chunks[..2]);
+        assert!(!released.in_paste);
+        assert_eq!(released.count, 3);
+        assert_eq!(v2_run(chunks).count, 0);
+    }
+
+    /// 설계 §5 D-01 v2 미종결 봉투 해제 항 — 봉투 안 Ctrl-C 는 해제만 하고 바깥 CR 이 제출한다(RED).
+    #[test]
+    fn v2_unterminated_paste_released_by_ctrl_c_without_decrement() {
+        let open_body = [V7_OPEN, b"abc"].concat();
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (&open_body, InputOrigin::Human, 0),
+            (b"\x03", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ];
+        let released = v2_run(&chunks[..2]);
+        assert!(!released.in_paste);
+        assert_eq!(released.count, 3);
+        assert_eq!(v2_run(chunks).count, 0);
+    }
+
+    /// 설계 §5 D-01 v2 자동응답 면제 항 — 봉투 밖 기존 계수는 보존하고 안에서는 본문으로 센다(RED).
+    #[test]
+    fn v2_autoreply_exempt_outside_paste_only() {
+        let outside = v2_run(&[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(outside.count, 5);
+        let inside = v2_run(&[
+            (V7_OPEN, InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ]);
+        assert_eq!(inside.count, 3);
+    }
+
+    /// 설계 §5 D-01 v2 Meta-Enter 항 — ESC+CR 은 한 청크든 분할이든 제출이 아닌 줄바꿈이다(RED).
+    #[test]
+    fn v2_meta_enter_is_newline_not_submit() {
+        let single = v2_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b\r", InputOrigin::Human, 0),
+        ]);
+        let split = v2_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ]);
+        assert!(single.count >= 4, "Meta-Enter 가 제출로 계수를 지웠다: {single:?}");
+        assert!(split.count >= 4, "분할 Meta-Enter 가 제출로 계수를 지웠다: {split:?}");
+    }
+
+    /// 설계 §5 D-01 v2 봉투 표식 이월 항 — 접두 ≤5바이트는 계수 없이 보관하고 완성 뒤 비운다(RED).
+    #[test]
+    fn v2_tail_carry_is_bounded_and_uncounted() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"hello\x1b[20", InputOrigin::Human, 0),
+            (b"0~x", InputOrigin::Human, 0),
+            (V7_CLOSE, InputOrigin::Human, 0),
+        ];
+        let partial = v2_run(&chunks[..1]);
+        assert_eq!(partial.count, 5);
+        assert_eq!(partial.tail, b"\x1b[20");
+        assert!(partial.tail.len() <= 5);
+        let completed = v2_run(chunks);
+        assert_eq!(completed.count, 6);
+        assert!(completed.tail.is_empty());
+    }
+
+    /// 설계 §5 D-01 v2 출처별 계수 항 — 스캐폴드에서도 통과하는 핀(RED 아님).
+    #[test]
+    fn v2_origin_split_tracks_human_bytes() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"abc", InputOrigin::Human, 0),
+            (b"xyz", InputOrigin::Machine, 0),
+            (b"\r", InputOrigin::Machine, 0),
+            (b"ab", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ];
+        for (i, expected) in [(3, 3), (6, 3), (0, 0), (2, 2), (0, 0)].into_iter().enumerate() {
+            let state = v2_run(&chunks[..=i]);
+            assert_eq!((state.count, state.human), expected, "출처 계수 단계 {}", i + 1);
+        }
     }
 
     /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).
