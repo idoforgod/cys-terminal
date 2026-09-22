@@ -177,6 +177,7 @@ enum Command {
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
     /// 84·85 는 아무것도 보내지 않은 **비파괴 보류**다 — 대상 턴 종료 후 재시도하거나 --timeout 을 늘린다.
+    /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     CycleAgent {
         #[arg(long)]
         role: Option<String>,
@@ -980,6 +981,11 @@ const EXIT_CYCLE_TARGET_BUSY: i32 = 84;
 /// 사람 초안·미제출 입력 보호로 clear 보류(85). 초안을 제출·삭제한 뒤 재시도.
 /// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
+/// clear 는 **실효까지 확인**됐으나 재주입 시점에 대상이 유휴가 되지 않아 재주입을 접었다(86).
+/// 84·85 와 달리 **clear 는 이미 나갔다** — 손으로 다시 clear 하지 마라. RESUME 은 최선노력으로
+/// 송신하고(대기 메시지로 들어가도 새 세션이 읽는다), 사람 초안이 감지되면 송신 0건으로 보류한다.
+const EXIT_CYCLE_REINJECT_HELD: i32 = 86;
+const CYCLE_REINJECT_HELD_TOKEN: &str = "cycle-reinject-held:";
 /// 유휴 대기 만료 머리표. 대상 턴 종료 뒤 재시도 또는 --timeout 연장.
 /// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
@@ -1051,15 +1057,36 @@ fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -
         && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()))
 }
 
-/// 화면·정적 축 1회와 입력 버퍼 메타 1회로 대상 상태를 판정한다. 화면 미관측은 Busy다.
-fn observe_cycle_target(
-    sid: u64,
+/// 순수 상태 판정과 RPC 관측 실패를 분리한다. quiet_secs 는 성공 응답의 키 유무만 잰다.
+struct CycleTargetObservation {
+    state: CycleTargetState,
+    failure: Option<String>,
+    quiet_secs_reported: Option<bool>,
+}
+
+fn cycle_target_observation(
+    screen: Result<Value, String>,
+    entry: Result<Value, String>,
     marker: Option<&str>,
     placeholder: Option<&str>,
-) -> CycleTargetState {
-    let screen = request("surface.read_text", json!({"surface_id": sid})).ok();
-    let entry = surface_entry(sid).ok();
-    cycle_target_state(&CycleTargetObs {
+) -> CycleTargetObservation {
+    let mut failures = Vec::new();
+    let screen = match screen {
+        Ok(value) => Some(value),
+        Err(e) => {
+            failures.push(format!("surface.read_text: {e}"));
+            None
+        }
+    };
+    let entry = match entry {
+        Ok(value) => Some(value),
+        Err(e) => {
+            failures.push(format!("surface_entry: {e}"));
+            None
+        }
+    };
+    let quiet_secs_reported = screen.as_ref().map(|r| r.get("quiet_secs").is_some());
+    let state = cycle_target_state(&CycleTargetObs {
         screen: screen.as_ref().and_then(|r| r["text"].as_str()),
         quiet: cys::readiness::idle_quiet_from(
             screen.as_ref().and_then(|r| r["quiet_secs"].as_f64()),
@@ -1070,7 +1097,58 @@ fn observe_cycle_target(
         human_bytes: entry
             .as_ref()
             .and_then(|r| r["pending_input_human_bytes"].as_u64()),
-    })
+    });
+    let failure = (!failures.is_empty()).then(|| failures.join("; "));
+    CycleTargetObservation {
+        // 입력 버퍼 관측이 실패했는데 화면만 유휴여도 통과시키지 않는다. 초안 보호는 유지한다.
+        state: if failure.is_some() && state == CycleTargetState::Idle {
+            CycleTargetState::Busy
+        } else {
+            state
+        },
+        failure,
+        quiet_secs_reported,
+    }
+}
+
+/// 화면·정적 축 1회와 입력 버퍼 메타 1회로 대상 상태와 관측 메타를 얻는다.
+fn observe_cycle_target(
+    sid: u64,
+    marker: Option<&str>,
+    placeholder: Option<&str>,
+) -> CycleTargetObservation {
+    let screen = request("surface.read_text", json!({"surface_id": sid}));
+    let entry = surface_entry(sid);
+    cycle_target_observation(screen, entry, marker, placeholder)
+}
+
+/// 일시 RPC 실패는 재관측하되 3회 연속 실패는 Busy 머리표 없이 원 오류로 끝낸다.
+fn cycle_observation_failure_streak(
+    consecutive: &mut u8,
+    failure: Option<&str>,
+    sid: u64,
+    stage: &str,
+) -> Result<(), String> {
+    if let Some(reason) = failure {
+        *consecutive += 1;
+        if *consecutive >= 3 {
+            return Err(format!(
+                "{stage}: surface:{sid} 관측이 연속 {consecutive}회 실패했다 — {reason}"
+            ));
+        }
+    } else {
+        *consecutive = 0;
+    }
+    Ok(())
+}
+
+/// 성공한 read_text 응답 전부가 키를 빠뜨린 경우만 구 데몬 진단을 덧붙인다.
+fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> &'static str {
+    if saw_read_text && !saw_quiet_secs {
+        " · 데몬이 quiet_secs 를 보고하지 않는다(구 데몬) — 데몬을 갱신하라(`cys daemon restart` 또는 팩 업그레이드)"
+    } else {
+        ""
+    }
 }
 
 /// 2초마다 유휴를 관측하되 사람 초안은 즉시 거부한다(마지막 대기는 남은 예산 이내).
@@ -1085,20 +1163,42 @@ fn wait_cycle_target_idle(
         .saturating_duration_since(std::time::Instant::now())
         .as_secs_f64()
         .ceil() as u64;
+    let mut consecutive_failures = 0;
+    let mut warned_observation_failure = false;
+    let (mut saw_read_text, mut saw_quiet_secs) = (false, false);
     loop {
-        match observe_cycle_target(sid, marker, placeholder) {
+        let observed = observe_cycle_target(sid, marker, placeholder);
+        if let Some(reported) = observed.quiet_secs_reported {
+            saw_read_text = true;
+            saw_quiet_secs |= reported;
+        }
+        if let Some(reason) = observed.failure.as_deref() {
+            if !warned_observation_failure {
+                eprintln!("  {stage}: surface:{sid} 관측 실패 — 재시도한다: {reason}");
+                warned_observation_failure = true;
+            }
+        }
+        // 초안 증거는 RPC 연속 실패보다 우선한다. 일반 오류로 접으면 clear 뒤 최선노력 주입이 열린다.
+        match observed.state {
             CycleTargetState::Idle => return Ok(()),
             CycleTargetState::HumanDraft => {
                 return Err(format!(
-                    "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — clear 를 보내지 않는다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 재실행"
+                    "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — 입력을 보류한다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 해당 단계만 재시도"
                 ));
             }
             CycleTargetState::Busy => {}
         }
+        cycle_observation_failure_streak(
+            &mut consecutive_failures,
+            observed.failure.as_deref(),
+            sid,
+            stage,
+        )?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            let diagnostic = cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs);
             return Err(format!(
-                "{CYCLE_TARGET_BUSY_TOKEN} {stage}: surface:{sid} 가 {secs}s 안에 유휴(턴 종료·빈 composer)가 되지 않았다 — /clear 를 보내지 않는다(진행 중 턴에 대기 메시지로 들어가 거짓 성공이 된다). 처방: 대상 턴이 끝난 뒤 재실행 또는 --timeout 연장"
+                "{CYCLE_TARGET_BUSY_TOKEN} {stage}: surface:{sid} 가 {secs}s 안에 유휴(턴 종료·빈 composer)가 되지 않았다 — 유휴 확인 대기를 보류한다. 처방: 대상 턴 종료를 기다린 뒤 해당 단계만 재시도{diagnostic}"
             ));
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_secs(2)));
@@ -1106,16 +1206,19 @@ fn wait_cycle_target_idle(
 }
 
 /// clear 실효 관측 창 — 테스트 override(0=상수). 프로덕션은 항상 CLEAR_VERIFY_SECS.
+#[cfg(test)]
 static CLEAR_VERIFY_SECS_OVERRIDE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 fn clear_verify_secs() -> u64 {
-    let override_secs = CLEAR_VERIFY_SECS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if override_secs == 0 {
-        CLEAR_VERIFY_SECS
-    } else {
-        override_secs
+    #[cfg(test)]
+    {
+        let override_secs = CLEAR_VERIFY_SECS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if override_secs != 0 {
+            return override_secs;
+        }
     }
+    CLEAR_VERIFY_SECS
 }
 
 /// cycle-agent 결과 → exit code(순수 · 회귀 핀 대상). 머리표 없는 에러는 종전대로 1.
@@ -1126,6 +1229,7 @@ fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
         Err(e) if e.starts_with(CLEAR_UNMEASURABLE_TOKEN) => EXIT_CLEAR_UNMEASURABLE,
         Err(e) if e.starts_with(CYCLE_TARGET_BUSY_TOKEN) => EXIT_CYCLE_TARGET_BUSY,
         Err(e) if e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN) => EXIT_CYCLE_HUMAN_DRAFT,
+        Err(e) if e.starts_with(CYCLE_REINJECT_HELD_TOKEN) => EXIT_CYCLE_REINJECT_HELD,
         Err(e) if e.starts_with(VERIFIER_COLLISION_TOKEN) => EXIT_VERIFIER_COLLISION,
         Err(e) if e.starts_with(VERIFIER_UNRESOLVED_TOKEN) => EXIT_VERIFIER_UNRESOLVED,
         Err(_) => 1,
@@ -17410,7 +17514,8 @@ fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
 }
 
 /// RESUME 기본 문안(순수) — 파일 실재 기준으로 SESSION_STATE·역할 TODO 실경로를 채운다.
-/// 우선순위(파이썬 resolve_save_files 와 동형): pack_round 실재 → cwd_round 실재 → pack_round(폴백 · 부재여도).
+/// 파이썬 resolve_save_files 는 디렉터리 실재 기준 · 여기는 설계 정정에 따라 파일별 실재 기준(의도적 차이).
+/// 우선순위: pack_round 파일 실재 → cwd_round 파일 실재 → pack_round(폴백 · 부재여도).
 fn default_resume_text(
     cwd_round: &std::path::Path,
     pack_round: &std::path::Path,
@@ -17435,6 +17540,79 @@ fn default_resume_text(
     format!(
         "[RESUME] 컨텍스트 순환 완료. {} 를 읽고 직전 작업을 이어가라.",
         [ss, todo].join(" · ")
+    )
+}
+
+/// 명시 clear 명령이 있을 때만 손상·누락 어댑터를 우회한다. 관측 힌트·훅 표지는 모두 미선언으로 축소한다.
+fn cycle_spec_or_explicit_clear(
+    spec: Result<Option<Value>, String>,
+    clear_cmd: Option<&str>,
+) -> Result<Option<Value>, String> {
+    match spec {
+        Err(e) if clear_cmd.is_some() => {
+            eprintln!("[cycle] --clear-cmd 명시로 어댑터 로드 실패를 우회한다(마커·플레이스홀더 없음, 훅 생략 안 함): {e}");
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// 훅 선언은 설치 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 스스로 확인하게 한다.
+fn cycle_resume_with_hook_fallback(
+    mut resume: String,
+    directive_path: &std::path::Path,
+    hooks_inject: bool,
+) -> String {
+    if hooks_inject {
+        resume.push_str(&format!(
+            " 역할 디렉티브가 화면에 보이지 않으면 `{}` 를 먼저 읽어라.",
+            directive_path.display(),
+        ));
+    }
+    resume
+}
+
+/// clear 발효 뒤 보류는 전용 머리표로 접는다. 주입 실패가 이 계약을 덮어쓰면 이중 clear를 유발한다.
+/// 주입 Err는 붙여넣기 후 Return 실패일 수도 있어 송신 0건이라고 단정하지 않는다.
+fn cycle_reinject_held(
+    reason: &str,
+    hooks_inject: bool,
+    resume: &str,
+    compose: &mut dyn FnMut() -> Result<String, String>,
+    inject: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> String {
+    let sent = if reason.starts_with(CYCLE_HUMAN_DRAFT_TOKEN) {
+        "송신 0건(사람 초안 보호)".to_string()
+    } else {
+        let directive = if hooks_inject {
+            "디렉티브 생략(훅)".to_string()
+        } else {
+            match compose() {
+                Ok(text) => match inject(&text) {
+                    Ok(()) => "디렉티브 1건 송신".to_string(),
+                    Err(e) => {
+                        eprintln!("[cycle] clear 발효 뒤 디렉티브 최선노력 주입 실패: {e}");
+                        format!("디렉티브 주입 실패(부분 송신 가능: {e})")
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[cycle] clear 발효 뒤 디렉티브 합성 실패: {e}");
+                    format!("디렉티브 0건(합성 실패: {e})")
+                }
+            }
+        };
+        let resume_sent = match inject(resume) {
+            Ok(()) => "RESUME 1건 송신".to_string(),
+            Err(e) => {
+                eprintln!("[cycle] clear 발효 뒤 RESUME 최선노력 주입 실패: {e}");
+                format!("RESUME 주입 실패(부분 송신 가능: {e})")
+            }
+        };
+        format!("{resume_sent} · {directive}")
+    };
+    format!(
+        "{CYCLE_REINJECT_HELD_TOKEN} clear 는 실효 확인됨(session_file 교체) · 재주입 보류 사유: {reason} · \
+         실제 송신 내역(재주입): {sent}. 손으로 다시 clear 하지 마라 — 좌석에 [RESUME] 이 보이지 않으면 재주입만 하라"
     )
 }
 
@@ -17467,7 +17645,10 @@ fn run_cycle_agent(
         }
         // clear 명령 선확정 — 저장만 시키고 clear 못하는 어정쩡한 상태 방지
         let agent = entry["agent"].as_str().map(String::from);
-        let spec: Option<Value> = agent.as_deref().map(load_agent_spec).transpose()?;
+        let spec = cycle_spec_or_explicit_clear(
+            agent.as_deref().map(load_agent_spec).transpose(),
+            clear_cmd.as_deref(),
+        )?;
         let clear = match clear_cmd {
             Some(c) => c,
             None => {
@@ -17666,6 +17847,9 @@ fn run_cycle_agent(
         let resume_text = resume_text.unwrap_or_else(|| {
             default_resume_text(&cwd_round, &pack_round, &role_todo, &|p| p.exists())
         });
+        let directive_path = cys::pack::role_directive_path(&role_name)
+            .unwrap_or_else(|| cys::pack::pack_dir().join("directives/WORKER_DIRECTIVE.md"));
+        let resume_text = cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject);
 
         // S5(§2.2): clear 직전 대상 surface를 quiescing으로 마킹 → 채널 inbox 주입이 clear·복원
         // 구간 동안 보류된다(C0 배달기가 이 상태를 읽음). autopilot 60% clear가 상시 조건이므로
@@ -17722,24 +17906,34 @@ fn run_cycle_agent(
             match effect {
                 ClearEffect::Verified => {
                     // 새 세션 프롬프트와 SessionStart 훅이 끝나야 재주입할 수 있다.
-                    wait_cycle_target_idle(
+                    match wait_cycle_target_idle(
                         sid,
                         marker.as_deref(),
                         placeholder.as_deref(),
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
                         "재주입 직전",
-                    )?;
-                    eprintln!(
-                        "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
-                        if hooks_inject { "생략(훅이 주입)" } else { "주입" }
-                    );
-                    if !hooks_inject {
-                        inject_text(sid, &compose_directive(&role_name)?)?;
+                    ) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
+                                if hooks_inject { "생략(훅이 주입)" } else { "주입" }
+                            );
+                            if !hooks_inject {
+                                inject_text(sid, &compose_directive(&role_name)?)?;
+                            }
+                            let resume = resume_text.as_str();
+                            inject_text(sid, resume)?;
+                            Ok(())
+                        }
+                        Err(e) => Err(cycle_reinject_held(
+                            &e,
+                            hooks_inject,
+                            &resume_text,
+                            &mut || compose_directive(&role_name),
+                            &mut |text| inject_text(sid, text),
+                        )),
                     }
-                    let resume = resume_text.as_str();
-                    inject_text(sid, resume)?;
-                    Ok(())
                 }
                 ClearEffect::Unverified => Err(format!(
                     "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
@@ -31740,6 +31934,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn d16_exit_code_reinject_held_is_distinct_and_prefix_order_independent() {
+        let code = EXIT_CYCLE_REINJECT_HELD;
+        let token = CYCLE_REINJECT_HELD_TOKEN;
+        assert_eq!(code, 86);
+        assert!(![0, 1, 2, 7, 75, 78, 79, 80, 81, 82, 83, 84, 85].contains(&code));
+        for other in [RECOVER_REFUSED_TOKEN, cys::inject_guard::HOLD_TOKEN] {
+            assert!(!token.starts_with(other) && !other.starts_with(token), "형제 거부 머리표와 충돌");
+        }
+        let mut contracts = vec![
+            (CLEAR_UNVERIFIED_TOKEN, EXIT_CLEAR_UNVERIFIED),
+            (CLEAR_UNMEASURABLE_TOKEN, EXIT_CLEAR_UNMEASURABLE),
+            (CYCLE_TARGET_BUSY_TOKEN, EXIT_CYCLE_TARGET_BUSY),
+            (CYCLE_HUMAN_DRAFT_TOKEN, EXIT_CYCLE_HUMAN_DRAFT),
+            (VERIFIER_COLLISION_TOKEN, EXIT_VERIFIER_COLLISION),
+            (VERIFIER_UNRESOLVED_TOKEN, EXIT_VERIFIER_UNRESOLVED),
+            (token, code),
+        ];
+        for &(prefix, expected) in &contracts {
+            for &(other, _) in &contracts {
+                if prefix != other {
+                    assert!(!prefix.starts_with(other), "종료 토큰 접두 충돌: {prefix} / {other}");
+                }
+            }
+            let error = format!("{prefix} 재주입 보류 사유");
+            assert_eq!(cycle_agent_exit(&Err(error.clone())), expected);
+            assert_eq!(contracts.iter().find(|(p, _)| error.starts_with(*p)).map(|(_, c)| *c), Some(expected));
+        }
+        contracts.reverse();
+        for &(prefix, expected) in &contracts {
+            let error = format!("{prefix} 재주입 보류 사유");
+            assert_eq!(contracts.iter().find(|(p, _)| error.starts_with(*p)).map(|(_, c)| *c), Some(expected));
+        }
+    }
+
     /// 운영자가 읽는 `cys cycle-agent --help` 의 종료코드 표가 상수와 갈라지면 실패한다.
     /// 종전 문면은 종료코드를 한 줄도 적지 않았고 단계 수도 옛 5단계였다(D-16 리팩터에서 교정).
     #[test]
@@ -31752,6 +31981,7 @@ mod tests {
             EXIT_CLEAR_UNMEASURABLE,
             EXIT_CYCLE_TARGET_BUSY,
             EXIT_CYCLE_HUMAN_DRAFT,
+            EXIT_CYCLE_REINJECT_HELD,
         ] {
             assert!(doc.contains(&format!("{code}=")), "help 에 exit {code} 설명 없음");
         }
@@ -31761,6 +31991,199 @@ mod tests {
         }
         // 84·85 가 '아무것도 보내지 않았다' 는 성질은 운영 판단의 핵심이라 문면에 남긴다.
         assert!(doc.contains("비파괴"), "help 에 84·85 의 비파괴 성질 없음");
+        assert!(doc.contains("clear 는 이미"), "help 에 86 의 clear 발효 성질 없음");
+    }
+
+    #[test]
+    fn d16_reinject_held_protects_drafts_and_reports_successful_sends() {
+        let reason = format!("{CYCLE_HUMAN_DRAFT_TOKEN} 사람이 치던 초안");
+        let error = cycle_reinject_held(
+            &reason, false, "[RESUME] 이어가기",
+            &mut || panic!("초안 보호 중 디렉티브 합성 금지"),
+            &mut |_| panic!("초안 보호 중 송신 금지"),
+        );
+        assert_eq!(cycle_agent_exit(&Err(error.clone())), 86);
+        assert!(error.contains("송신 0건(사람 초안 보호)"));
+        assert!(error.contains(&reason));
+        for hooks_inject in [false, true] {
+            let mut sent = Vec::new();
+            let reason = format!("{CYCLE_TARGET_BUSY_TOKEN} 새 세션이 작업 중");
+            let error = cycle_reinject_held(
+                &reason, hooks_inject, "[RESUME] 이어가기",
+                &mut || {
+                    assert!(!hooks_inject, "훅 선언이면 디렉티브 생략");
+                    Ok("역할 디렉티브".into())
+                },
+                &mut |text| { sent.push(text.to_string()); Ok(()) },
+            );
+            let expected = if hooks_inject {
+                vec!["[RESUME] 이어가기"]
+            } else {
+                vec!["역할 디렉티브", "[RESUME] 이어가기"]
+            };
+            assert_eq!(sent, expected);
+            assert_eq!(cycle_agent_exit(&Err(error.clone())), 86);
+            assert!(error.contains("clear 는 실효 확인됨(session_file 교체)"));
+            assert!(error.contains(&reason));
+            assert!(error.contains("RESUME 1건 송신"));
+            assert!(error.contains(if hooks_inject { "디렉티브 생략(훅)" } else { "디렉티브 1건 송신" }));
+            assert!(error.contains("손으로 다시 clear 하지 마라 — 좌석에 [RESUME] 이 보이지 않으면 재주입만 하라"));
+        }
+    }
+
+    #[test]
+    fn d16_reinject_held_keeps_rc86_on_compose_and_inject_errors() {
+        for compose_fails in [false, true] {
+            let mut attempted = Vec::new();
+            let error = cycle_reinject_held(
+                "cycle-target-busy: 재주입 시간 만료", false, "[RESUME] 이어가기",
+                &mut || if compose_fails { Err("역할 파일 없음".into()) } else { Ok("역할 디렉티브".into()) },
+                &mut |text| { attempted.push(text.to_string()); Err("Return RPC 실패".into()) },
+            );
+            assert_eq!(cycle_agent_exit(&Err(error.clone())), 86, "주입 실패가 86 계약을 덮었다");
+            assert_eq!(attempted.last().map(String::as_str), Some("[RESUME] 이어가기"), "디렉티브 실패 뒤에도 RESUME 시도");
+            assert_eq!(attempted.len(), if compose_fails { 1 } else { 2 });
+            assert!(error.contains("RESUME 주입 실패(부분 송신 가능: Return RPC 실패)"));
+            if compose_fails {
+                assert!(error.contains("디렉티브 0건(합성 실패: 역할 파일 없음)"));
+            } else {
+                assert!(error.contains("디렉티브 주입 실패(부분 송신 가능: Return RPC 실패)"));
+            }
+        }
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let verified = body.split("ClearEffect::Verified => {").nth(1).unwrap()
+            .split("ClearEffect::Unverified =>").next().unwrap();
+        assert!(verified.contains("match wait_cycle_target_idle("));
+        assert!(verified.contains("Err(e) => Err(cycle_reinject_held("));
+    }
+
+    #[test]
+    fn d16_explicit_clear_cmd_tolerates_only_spec_load_errors() {
+        for reason in ["agents.json not found", "agents.json 파싱 실패"] {
+            assert!(cycle_spec_or_explicit_clear(Err(reason.into()), Some("/clear")).unwrap().is_none());
+            assert_eq!(cycle_spec_or_explicit_clear(Err(reason.into()), None).unwrap_err(), reason);
+        }
+        let spec = json!({"hooks_inject_directive": true, "clear_cmd": "/clear"});
+        assert_eq!(cycle_spec_or_explicit_clear(Ok(Some(spec.clone())), Some("/clear")).unwrap(), Some(spec));
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        assert!(body.contains("cycle_spec_or_explicit_clear("));
+        assert!(body.contains("agent.as_deref().map(load_agent_spec).transpose(),"));
+        assert!(body.contains("clear_cmd.as_deref(),"));
+    }
+
+    #[test]
+    fn d16_hook_resume_fallback_only_when_directive_is_skipped() {
+        let original = "[RESUME] 사용자 재개 문안";
+        let path = std::path::Path::new("/pack/directives/WORKER_DIRECTIVE.md");
+        assert_eq!(cycle_resume_with_hook_fallback(original.into(), path, false), original);
+        for name in ["MASTER_DIRECTIVE.md", "WORKER_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md"] {
+            let path = std::path::Path::new("/pack with spaces/directives").join(name);
+            let resume = cycle_resume_with_hook_fallback(original.into(), &path, true);
+            assert_eq!(resume, format!("{original} 역할 디렉티브가 화면에 보이지 않으면 `{}` 를 먼저 읽어라.", path.display()));
+            assert_eq!(resume.lines().count(), 1, "자가치유 문안은 한 줄");
+        }
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        assert!(body.contains("cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)"));
+        assert!(body.contains("cys::pack::role_directive_path(&role_name)"));
+        assert!(body.find("cycle_resume_with_hook_fallback(").unwrap() < body.find("match effect").unwrap());
+    }
+
+    #[test]
+    fn d16_target_observation_preserves_rpc_failures() {
+        let observed = cycle_target_observation(
+            Err("읽기 RPC: surface:7 이미 종료됨".into()),
+            Err("목록 RPC: connection reset".into()),
+            None,
+            None,
+        );
+        assert_eq!(observed.state, CycleTargetState::Busy);
+        let failure = observed.failure.expect("관측 실패 메타");
+        assert!(failure.contains("읽기 RPC: surface:7 이미 종료됨"), "{failure}");
+        assert!(failure.contains("목록 RPC: connection reset"), "{failure}");
+        assert_eq!(observed.quiet_secs_reported, None, "RPC 실패는 구 데몬 증거가 아니다");
+        let observed = cycle_target_observation(
+            Ok(json!({"text": "유휴 화면", "quiet_secs": 5.0})),
+            Err("입력 버퍼 관측 실패".into()),
+            None,
+            None,
+        );
+        assert_eq!(observed.state, CycleTargetState::Busy, "입력 버퍼 미관측은 유휴가 아니다");
+        assert_eq!(observed.quiet_secs_reported, Some(true));
+        assert!(observed.failure.unwrap().contains("입력 버퍼 관측 실패"));
+    }
+
+    #[test]
+    fn d16_target_observation_human_draft_precedes_rpc_failure() {
+        let buffer_draft = cycle_target_observation(
+            Err("화면 RPC 실패".into()),
+            Ok(json!({"pending_input_human_bytes": 3})),
+            Some("❯"),
+            None,
+        );
+        let screen_draft = cycle_target_observation(
+            Ok(json!({"text": "❯ 사람이 치던 초안\n", "quiet_secs": 5.0})),
+            Err("입력 버퍼 RPC 실패".into()),
+            Some("❯"),
+            None,
+        );
+        for observed in [buffer_draft, screen_draft] {
+            assert_eq!(observed.state, CycleTargetState::HumanDraft, "한 RPC 실패가 초안 증거를 덮으면 안 된다");
+            assert!(observed.failure.is_some(), "초안 보호와 관측 실패 기록은 공존한다");
+        }
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
+        let draft = body.find("CycleTargetState::HumanDraft =>").expect("초안 보호 분기");
+        let failure = body.find("cycle_observation_failure_streak(").expect("RPC 실패 분기");
+        assert!(draft < failure, "세 번째 RPC 실패에도 사람 초안을 먼저 보호해야 한다");
+        assert!(body[draft..failure].contains("return Err(format!("));
+        assert!(body[draft..failure].contains("CYCLE_HUMAN_DRAFT_TOKEN"));
+    }
+
+    #[test]
+    fn d16_target_observation_quiet_secs_metadata_requires_success() {
+        for (screen, want) in [
+            (json!({"text": "출력"}), false),
+            (json!({"text": "출력", "quiet_secs": 0.0}), true),
+            (json!({"text": "출력", "quiet_secs": null}), true),
+        ] {
+            let observed = cycle_target_observation(Ok(screen), Ok(json!({})), None, None);
+            assert_eq!(observed.quiet_secs_reported, Some(want));
+            assert!(observed.failure.is_none());
+        }
+    }
+
+    #[test]
+    fn d16_target_observation_fails_after_three_consecutive_errors() {
+        let mut consecutive = 0;
+        let reason = "surface.read_text: RPC peer disappeared";
+        for want in [1, 2] {
+            assert!(cycle_observation_failure_streak(&mut consecutive, Some(reason), 7, "대기").is_ok());
+            assert_eq!(consecutive, want);
+        }
+        assert!(cycle_observation_failure_streak(&mut consecutive, None, 7, "대기").is_ok());
+        assert_eq!(consecutive, 0, "성공 관측은 연속 실패를 끊는다");
+        for _ in 0..2 {
+            assert!(cycle_observation_failure_streak(&mut consecutive, Some(reason), 7, "대기").is_ok());
+        }
+        let error = cycle_observation_failure_streak(&mut consecutive, Some(reason), 7, "대기")
+            .expect_err("연속 3회면 timeout 이전에 종료");
+        assert!(error.contains(reason), "원 RPC 오류 누락: {error}");
+        assert!(error.contains("연속 3회"), "{error}");
+        assert_eq!(cycle_agent_exit(&Err(error)), 1, "관측 실패를 rc84로 오보하면 안 된다");
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
+        assert!(body.contains("cycle_observation_failure_streak("), "조기 종료 헬퍼 미배선");
+    }
+
+    #[test]
+    fn d16_quiet_timeout_diagnostic_only_when_never_reported() {
+        let diagnostic = cycle_quiet_timeout_diagnostic(true, false);
+        assert!(diagnostic.contains("데몬이 quiet_secs 를 보고하지 않는다(구 데몬)"));
+        assert!(diagnostic.contains("cys daemon restart") && diagnostic.contains("팩 업그레이드"));
+        for (saw_read_text, saw_quiet_secs) in [(false, false), (true, true), (false, true)] {
+            assert_eq!(cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs), "");
+        }
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
+        assert!(body.contains("saw_quiet_secs |= reported"), "한 번이라도 보고된 키를 기억해야 한다");
+        assert!(body.contains("cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs)"));
     }
 
     #[test]
@@ -31871,9 +32294,9 @@ mod tests {
     #[cfg(unix)]
     fn fake_daemon(
         rows: Value,
-        screen: &'static str,
-        quiet: f64,
+        screens: Vec<(&'static str, f64)>,
         session_files: Vec<&'static str>,
+        reports_usage: bool,
     ) -> (std::path::PathBuf, D16DaemonCalls, impl FnOnce()) {
         use std::io::{BufRead, BufReader, Write};
         use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
@@ -31889,6 +32312,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut sessions = session_files.into_iter();
             let mut current_session = sessions.next().unwrap_or("S1");
+            let mut screens = screens.into_iter();
+            let mut current_screen = screens.next().expect("화면 시나리오 1개 이상");
+            let mut clear_sent = false;
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
@@ -31905,14 +32331,29 @@ mod tests {
                     .push((method.clone(), req["params"].clone()));
                 let result = match method.as_str() {
                     "surface.list" => {
+                        // clear 전에는 S1을 유지한다 — 저장 주입 가드의 조회가 S2를 먼저 소비하면 안 된다.
+                        if clear_sent {
+                            current_session = sessions.next().unwrap_or(current_session);
+                        }
                         let mut surfaces = rows.clone();
                         for row in surfaces.as_array_mut().expect("surface 행 배열") {
-                            row["usage"] = json!({"source": "statusline", "session_file": current_session});
+                            if reports_usage {
+                                row["usage"] = json!({"source": "statusline", "session_file": current_session});
+                            } else {
+                                row.as_object_mut().expect("surface 객체").remove("usage");
+                            }
                         }
-                        current_session = sessions.next().unwrap_or(current_session);
                         json!({"surfaces": surfaces})
                     }
-                    "surface.read_text" => json!({"text": screen, "quiet_secs": quiet, "line_count": 40}),
+                    "surface.read_text" => {
+                        let (screen, quiet) = current_screen;
+                        current_screen = screens.next().unwrap_or(current_screen);
+                        json!({"text": screen, "quiet_secs": quiet, "line_count": 40})
+                    }
+                    "surface.send_text" if req["params"]["text"] == "/clear" => {
+                        clear_sent = true;
+                        json!({"ok": true})
+                    }
                     "system.resolve_role" => json!({"surface_id": 9}),
                     _ => json!({"ok": true}),
                 };
@@ -31995,19 +32436,33 @@ mod tests {
 
     #[cfg(unix)]
     fn d16_cycle_fixture_run(screen: &'static str, quiet: f64) -> (i32, Vec<(String, Value)>) {
+        d16_cycle_fixture_scenario(vec![(screen, quiet)], vec!["S1"], true, false)
+    }
+
+    #[cfg(unix)]
+    fn d16_cycle_fixture_scenario(
+        screens: Vec<(&'static str, f64)>,
+        session_files: Vec<&'static str>,
+        reports_usage: bool,
+        missing_spec: bool,
+    ) -> (i32, Vec<(String, Value)>) {
         let fixture = D16CycleFixture::new();
         let rows = json!([{
             "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
             "exited": false, "awakened_at": 1.0, "cwd": fixture.dir, "live_cwd": fixture.dir,
             "usage": {"source": "statusline", "session_file": "S1"}
         }]);
-        let (socket, calls, stop) = fake_daemon(rows, screen, quiet, vec!["S1"]);
+        if missing_spec {
+            std::fs::remove_file(fixture.dir.join("pack/agents.json")).unwrap();
+        }
+        let (socket, calls, stop) = fake_daemon(rows, screens, session_files, reports_usage);
         let stop = D16DaemonStop(Some(Box::new(stop)));
         std::env::set_var("CYS_SOCKET", &socket);
         // 디렉티브 파일 누락으로 조기 실패하면 순서 결함을 검증하지 못한다.
         let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
         assert!(directive.starts_with('W') && directive.ends_with('R'));
-        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+        let clear_cmd = missing_spec.then(|| "/clear".into());
+        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], clear_cmd, None, 3, true);
         drop(stop);
         let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         (exit, recorded)
@@ -32036,12 +32491,79 @@ mod tests {
         assert_eq!(calls.iter().filter(|(method, params)| method == "surface.send_text" && params["text"].as_str().is_some_and(|text| text.contains("[RESUME]"))).count(), 0);
     }
 
-    /// [T2] run_cycle_agent 배선 핀 — 'cycle complete'(성공 문면)는 Verified 팔에서만 나오고,
+    #[cfg(unix)]
+    fn d16_cycle_send_counts(calls: &[(String, Value)]) -> (usize, usize, usize, usize) {
+        let sends: Vec<&Value> = calls.iter().filter(|(method, _)| method == "surface.send_text")
+            .map(|(_, params)| params).collect();
+        let clear = sends.iter().filter(|p| p["text"] == "/clear").count();
+        let resume = sends.iter().filter(|p| p["text"].as_str().is_some_and(|t| t.contains("[RESUME]"))).count();
+        let directive = sends.iter().filter(|p| p["text"].as_str().is_some_and(|t| t.starts_with("\x1b[200~W"))).count();
+        let authoritative = sends.iter().filter(|p| p["authoritative"] == true).count();
+        (clear, resume, directive, authoritative)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_verified_clear_then_busy_holds_with_resume() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0), ("⠋ Thinking…\n", 0.2)],
+            vec!["S1", "S2"], true, false,
+        );
+        assert_eq!(exit, 86, "clear 발효 뒤 보류는 86이어야 한다");
+        assert!(![84, 85].contains(&exit), "clear 미송신 계약으로 오보고");
+        assert_eq!(d16_cycle_send_counts(&calls), (1, 1, 0, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_verified_clear_then_human_draft_sends_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0), ("❯ 사람이 치던 초안\n", 5.0)],
+            vec!["S1", "S2"], true, false,
+        );
+        assert_eq!(exit, 86, "clear 발효 뒤 초안 보호도 86이어야 한다");
+        assert_eq!(d16_cycle_send_counts(&calls), (1, 0, 0, 1), "초안 위에 디렉티브·RESUME이 나갔다");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_unmeasurable_clear_reinjects_and_keeps_rc81() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)],
+            vec!["S1"], false, false,
+        );
+        let counts = d16_cycle_send_counts(&calls);
+        eprintln!("[d16 실측] clear·RESUME·디렉티브·authoritative = {counts:?}");
+        assert_eq!(exit, 81, "화면 유휴 재주입이 실효 확인으로 둔갑하면 안 된다");
+        assert_eq!(counts.0, 1);
+        assert_eq!(counts.1, 1);
+        assert_eq!(counts.2, 0, "claude 훅 선언이면 디렉티브 생략");
+        assert_eq!(counts.3, 2, "authoritative는 저장 지시·RESUME 각 1건");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_explicit_clear_cmd_survives_missing_agent_spec() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)],
+            vec!["S1", "S2"], true, true,
+        );
+        assert_eq!(exit, 0, "명시 clear 명령이 agents.json 부재를 우회해야 한다");
+        assert_eq!(d16_cycle_send_counts(&calls), (1, 1, 1, 3), "훅 미선언으로 축소하여 디렉티브도 직접 주입");
+    }
+
+    /// [T2] run_cycle_agent 배선 핀 — 'cycle complete'(성공 문면)는 Verified 성공 뒤에만 나오고,
     /// 전 값은 clear **직전**(quiescing 앞)에 재며, 종료코드는 순수 매퍼 한 곳에서만 정한다.
     #[test]
     fn t2_run_cycle_agent_reports_success_only_on_observed_clear() {
         let src = include_str!("cys.rs");
-        let body = refl_fn_body(src, "run_cycle_agent");
+        let raw = refl_fn_body(src, "run_cycle_agent");
+        let body = strip_line_comments(raw);
+        let body = body.as_str();
         let pre = body.find("let pre_session_file").expect("clear 직전 전 값 측정 없음");
         let quiesce = body
             .find("set_surface_quiescing(sid, true)?;")
@@ -32051,6 +32573,7 @@ mod tests {
             .find("ClearEffect::Verified => {")
             .expect("Verified 팔 없음");
         let complete = body.find("cycle complete").expect("성공 문면 소실");
+        assert!(body.find("clear_result?").unwrap() < complete, "성공 문면이 실패 전파(clear_result?)보다 앞선다");
         assert!(complete > verified_arm, "성공 문면이 Verified 팔 밖에서 나온다");
         assert_eq!(body.matches("cycle complete").count(), 1, "성공 문면이 두 곳 이상");
         assert!(body.contains("{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나"));
@@ -32071,6 +32594,21 @@ mod tests {
     /// 두 언어라 이 검체가 둘을 묶는다).
     #[test]
     fn t2_clear_verify_window_matches_autopilot_settle() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // override 자체도 테스트 빌드에만 존재해야 하며, 미설정이면 상수 창을 쓴다.
+        let src = strip_line_comments(include_str!("cys.rs"));
+        let declaration = src.find("\nstatic CLEAR_VERIFY_SECS_OVERRIDE:")
+            .expect("테스트 override 선언 없음");
+        assert!(
+            src[..declaration].trim_end().ends_with("#[cfg(test)]"),
+            "override 선언이 #[cfg(test)] 밖에 있다 — 프로덕션 가변 창 금지"
+        );
+        let initializer = src[declaration..].split(';').next().expect("override 초기화식");
+        assert!(initializer.contains("AtomicU64::new(0)"), "override 기본값은 미설정(0)이어야 한다");
+        let previous = CLEAR_VERIFY_SECS_OVERRIDE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let default_window = clear_verify_secs();
+        CLEAR_VERIFY_SECS_OVERRIDE.store(previous, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(default_window, CLEAR_VERIFY_SECS, "override 미설정인데 관측 창이 상수와 다르다");
         let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
         let line = py
             .lines()
