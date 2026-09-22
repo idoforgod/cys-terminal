@@ -4300,6 +4300,38 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::*;
 
+    /// ★(0.14.39 라운드3 · 성찰2 notice) 레인 가드 표식의 경로·신선도 창은 러스트/파이썬 **사본 2벌**이다.
+    /// 드리프트하면 `cys cycle-agent` 와 `javis_preflight` 가 서로 다른 레인 상태를 보고,
+    /// 그 방향은 디렉티브 0회 주입(치명) 또는 상시 이중 주입(컨텍스트 급등) 어느 쪽으로도 갈 수 있다.
+    #[test]
+    fn lane_guard_constants_match_javis_preflight() {
+        let preflight = include_str!("../cysjavis-pack/bin/javis_preflight.py");
+        let rel = preflight
+            .lines()
+            .find_map(|line| line.strip_prefix("LANE_GUARD_TRIPPED_REL = "))
+            .expect("파이썬 LANE_GUARD_TRIPPED_REL 줄 시작 정의");
+        assert_eq!(
+            rel.trim(),
+            "os.path.join(\"state\", \"lane-guard-tripped\")",
+            "표식 상대경로의 교차 언어 계약이 깨졌다(러스트: {LANE_GUARD_TRIPPED_REL})"
+        );
+        assert_eq!(
+            LANE_GUARD_TRIPPED_REL,
+            "state/lane-guard-tripped",
+            "러스트 쪽 상수가 파이썬 os.path.join 조합과 다르다"
+        );
+        let recent = preflight
+            .lines()
+            .find_map(|line| line.strip_prefix("LANE_GUARD_RECENT_S = "))
+            .expect("파이썬 LANE_GUARD_RECENT_S 줄 시작 정의");
+        let secs: u64 = recent
+            .trim()
+            .split('*')
+            .map(|term| term.trim().parse::<u64>().expect("정수 리터럴 곱"))
+            .product();
+        assert_eq!(secs, LANE_GUARD_RECENT_SECS, "표식 신선도 창(24h)의 교차 언어 계약이 깨졌다");
+    }
+
     /// 레인 표식 검체마다 라이브 팩과 무관한 고유 임시 디렉터리를 만든다.
     fn lane_guard_test_pack(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()

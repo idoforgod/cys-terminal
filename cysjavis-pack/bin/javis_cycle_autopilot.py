@@ -3658,6 +3658,23 @@ def cmd_self_test(args):
             and "연속 4회" in fixture["notifier"].call_args.args[0]
             and "(예측 4 != 원장 0)" in fixture["notifier"].call_args.args[0])
 
+    # ★(0.14.39 라운드3 · D-cli 적대 minor 잔여) 불일치 분기의 **쿨다운 결정** 박제 —
+    # detail 에 이미 실린 예측 cooldown·retry_after_ts 를 유지하고(원장 뷰 불신),
+    # 통지 문면도 그 예측값을 말한다. 원장 실값(streak 0)으로 재계산하면 쿨다운이 300s 로
+    # 떨어져 보류 중인 좌석이 정상 cadence 보다 잦게 재시도된다(①큐 남발 인접).
+    for prior_len, predicted, cooldown in ((0, 1, 300), (1, 2, 600), (3, 4, 1200)):
+        fixture = execute_fixture(85, prior=(False,) * prior_len, bad_after=1)
+        detail, terminal = fixture["detail"], fixture["terminal"]
+        args = fixture["notifier"].call_args.args[0] if fixture["notifier"].call_args else ""
+        t.check("원장 불일치 %d회째: 쿨다운은 예측값 %ds 유지(재계산 금지)"
+                % (predicted, cooldown),
+                detail.get("held_streak") == predicted
+                and detail.get("cooldown_secs") == cooldown
+                and detail.get("retry_after_ts") == terminal.get("ts", 0) + cooldown
+                and "(예측 %d != 원장 0)" % predicted in args
+                and re.search(r"(?<![\d.])%d(?:\.0)?(?![\d.])" % cooldown, args) is not None,
+                "detail=%r args=%r" % (detail, args))
+
     child_rc = 86
     fixture = execute_fixture(child_rc)
     t.check("rc86: settle + post_verify 유지(held 우회 금지)",

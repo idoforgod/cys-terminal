@@ -9953,25 +9953,37 @@ mod seat_latch_negation_tests {
     /// 종전 상태줄 폴백은 제거했고, 2026-09-21 실측으로 임베드 `prompt_marker: [">"]` 를 켰다.
     /// 상태줄이 아래인 강한 증거와 위인 약한 증거(출력 정적 AND)가 모두 통과해야 한다.
     /// codex 플레이스홀더를 대조군으로 유지해 상태줄 문면을 마커로 쓰던 영구 보류를 막는다.
+    /// ★(라운드3) 해소기를 프로덕션 두 값(leading + glyph_off_composer)으로 맞췄다 — 이 검체가 해소기 변경을 함께 따라간다.
     #[test]
     fn triage_wp5_gemini_seat_can_prove_carry_evidence_after_a_gate() {
         let embed = embedded_agents_json().expect("임베드 agents.json");
         let marker = composer_marker_of(&embed["gemini"]);
         let placeholder = composer_placeholder_of(&embed["gemini"]);
+        let resolve: for<'a> fn(&'a [String], &str) -> (Option<&'a str>, bool) =
+            |candidates: &[String], screen: &str| {
+                let lead = cys::agent_markers::pick_marker_leading_on_screen(candidates, screen);
+                let glyph_off = lead.is_none()
+                    && cys::agent_markers::pick_marker_last(candidates, screen).is_some();
+                (lead, glyph_off)
+            };
         // gemini 유휴 화면 2형상(상태줄이 composer 아래 / 위) — 둘 다 사람이 볼 수 있는 정상 화면이다.
         let below = "  각성 확인 완료.\n────────────────────────\n>\n────────────────────────\n? for shortcuts                     Gemini 3.8 Flash · hig\n";
         let above = "  각성 확인 완료.\n? for shortcuts                     Gemini 3.8 Flash · hig\n>\n";
         for (name, screen) in [("상태줄이 아래", below), ("상태줄이 위", above)] {
+            let (lead, glyph_off) = resolve(&marker, screen);
+            let gate_or_modal = cys::readiness::gate_or_modal_present(screen, &[], &marker);
+            assert!(!gate_or_modal, "{name}: 이 검체의 화면은 관문·모달이 아니다");
             assert!(
                 gate_carry_ok(
                     true,
                     false,
-                    cys::agent_markers::pick_marker_for_screen(&marker, screen),
+                    lead,
                     placeholder.as_deref(),
                     screen,
                     Some(true),
                     Some(true),
-                    false, false,
+                    glyph_off,
+                    gate_or_modal,
                 ),
                 "{name}: 관문을 본 gemini 좌석이 정상 유휴 화면에서도 이월을 풀지 못한다 \
                  (carry-unproven 영구 보류 = 디렉티브 미주입 · 치명위험 ③)"
@@ -9979,19 +9991,21 @@ mod seat_latch_negation_tests {
         }
         // 대조군 — codex 는 같은 자리를 플레이스홀더로 닫았다(기구가 죽은 것이 아니라 데이터 문제다).
         let codex_idle = "• ACK\n\n────────────────────────\n\n\n› Ask Codex to do anything\n\n  gpt-6-astra medium · ~/dev\n";
+        let codex_marker = composer_marker_of(&embed["codex"]);
+        let (lead, glyph_off) = resolve(&codex_marker, codex_idle);
+        let gate_or_modal = cys::readiness::gate_or_modal_present(codex_idle, &[], &codex_marker);
+        assert!(!gate_or_modal, "codex 대조군의 화면은 관문·모달이 아니다");
         assert!(
             gate_carry_ok(
                 true,
                 false,
-                cys::agent_markers::pick_marker_for_screen(
-                    &composer_marker_of(&embed["codex"]),
-                    codex_idle,
-                ),
+                lead,
                 composer_placeholder_of(&embed["codex"]).as_deref(),
                 codex_idle,
                 Some(true),
                 Some(true),
-                false, false,
+                glyph_off,
+                gate_or_modal,
             ),
             "대조군 붕괴: codex 도 못 푼다면 이 검체는 gemini 고유의 결함을 재지 못한다"
         );
@@ -17978,6 +17992,13 @@ fn run_cycle_agent(
         // ★(0.14.39 통합) D-04 목록 허용과 합류 — 후보 목록을 그대로 들고 다니며 프레임마다 해소한다.
         let marker = spec.as_ref().map(composer_marker_of).unwrap_or_default();
         // ★(0.14.39 · 성찰1 blocking ①) clear 직전 유휴 판정도 관문·모달을 본다 — 데몬 judge 와 같은 코퍼스.
+        // ★(0.14.39 라운드3 고지 · 성찰1 minor ⓑ · 성찰2 notice) `agent` 메타가 없는 좌석
+        //   (= `--clear-cmd` 를 명시해 어댑터 로드를 우회한 **수동 경로** 한정)은 코퍼스가
+        //   **빈 배열**이라 관문 축이 통째로 꺼지고 **모달 축만** 남는다. 실측: 그 좌석에서
+        //   OAUTH_CODE 프레임은 유휴로 선언된다. 기본 코퍼스를 태우지 않는 이유는 어느
+        //   어댑터의 코퍼스인지 알 수 없어서다 — 남의 코퍼스를 태우면 그 좌석이 관문이 아닌
+        //   화면에서 영구 보류(ANCHOR ② 무clear)가 된다. 모달 축은 어댑터 무관이라 남는다.
+        //   검체: `cycle_target_state_keeps_the_modal_axis_without_an_agent_corpus`.
         let gate_corpus = agent.as_deref().map(resolve_gate_corpus);
         let gates: &[cys::first_run_gates::Gate] =
             gate_corpus.as_ref().map(|r| r.gates.as_slice()).unwrap_or(&[]);
@@ -34189,6 +34210,48 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(0.14.39 라운드3 · 성찰1 minor ⓑ · 성찰2 notice) agent 메타 없는 수동 경로(`--clear-cmd`)는
+    /// 관문 코퍼스가 빈 배열이라 관문 축이 꺼진다 — **모달 축은 남는다**는 사실을 고정한다.
+    /// 이 검체가 깨지면 그 좌석은 살아 있는 모달 위로도 clear 원자 송신이 나간다.
+    #[test]
+    fn cycle_target_state_keeps_the_modal_axis_without_an_agent_corpus() {
+        use cys::first_run_gates::fixtures;
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        for markers in [claude.as_slice(), &[]] {
+            let state = cycle_target_observation(
+                Ok(json!({"text": fixtures::LIVE_PERMISSION_PROMPT, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                markers,
+                None,
+                &[],
+            ).state;
+            assert!(
+                !matches!(state, CycleTargetState::Idle | CycleTargetState::MachineResidue),
+                "코퍼스가 없어도 모달 축은 남아야 한다 — 살아 있는 승인 모달에 clear 가 나간다"
+            );
+        }
+        let oauth = cycle_target_observation(
+            Ok(json!({"text": fixtures::OAUTH_CODE, "quiet_secs": 120.0})),
+            Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+            &claude,
+            None,
+            &[],
+        ).state;
+        assert_eq!(
+            oauth,
+            CycleTargetState::Idle,
+            "수동 경로 한정 잔여(고지) — 코퍼스가 붙는 정상 경로는 위 관문 검체가 막는다"
+        );
+        let idle = cycle_target_observation(
+            Ok(json!({"text": fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": 120.0})),
+            Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+            &claude,
+            None,
+            &[],
+        ).state;
+        assert_eq!(idle, CycleTargetState::Idle, "정상 유휴의 무clear 회귀");
     }
 
     /// ★(0.14.39 라운드3 · 성찰1 blocking ① · 성찰2 major ⑤⑥ · 부트체인 blocking)
