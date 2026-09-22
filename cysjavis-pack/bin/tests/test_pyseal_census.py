@@ -235,6 +235,14 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   따라서 새 python 진입점도 강제점도 아니다. 니들을 보유하는 이유는 단 하나, 프리루드의
     #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
     "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
+    # ★2026-09-21 WP-B-hooks 등재 — 레인 가드 위임(R안)·표식·C83 검체. **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 강제점도 **아니다**. 이 검체가 띄우는 것은 `sh <훅>`(훅이 `$CYS_PY` 로 python 을
+    #   exec 하는 능력 게이트 포함)과 `sys.executable` 로 도는 `javis_mission.py status --json` 뿐이고,
+    #   그 env 는 `os.environ` 을 **상속하지 않는 밀폐 env** 라 봉인을 검체가 직접 실어야 한다 — 니들은
+    #   그 밀폐 env 한 줄(`"PYTHONDONTWRITEBYTECODE": "1"`)이다(test_role_authority_shell 과 같은 계급 ·
+    #   벗기지 않고 상속 방향으로 건다). 실험실 팩(hooks/·bin/*.py 사본)에 `.pyc` 가 남으면 그 사본이
+    #   tempfile 과 함께 사라지므로 봉인 관측 축은 아니다.
+    "cysjavis-pack/bin/tests/test_lane_redirect.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
     # ★2026-09-08 통합 단계 등재(오너 참고1 · CONTRACTS §B-11 "음성 검체 1개 추가").
     #   **봉인 점검 결과(등재 = 이 선언)**: 새 python 진입점도 강제점도 **아니다** — 이 파일은

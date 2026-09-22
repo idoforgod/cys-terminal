@@ -8850,7 +8850,7 @@ def h_soul_lane_1():
 
 
 @specimen("H-LANE-GUARD-1", "W1a",
-          "레인 가드가 **타 팩** 훅만 조기 종료하고 같은 팩·비-팩 레인·opt-out·사용자 오버레이는 통과",
+          "레인 대응 훅 부재 시 무발화·exit 0·stdout 0·표식, 실재 시 위임 · 음성 4 통과",
           ["A4-16"])
 def h_lane_guard_1():
     lib = _read(os.path.join(HOOKS_DIR, "_lib.sh"))
@@ -8860,24 +8860,47 @@ def h_lane_guard_1():
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")
         proj = os.path.join(tmp, "proj")
+        bindir = os.path.join(tmp, "bin")
+        tmpdir = os.path.join(tmp, "tmp")
+        state = os.path.join(tmp, "state")
+        for directory in (home, bindir, tmpdir, state):
+            os.makedirs(directory, exist_ok=True)
+        os.symlink(sys.executable, os.path.join(bindir, "python3"))
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
         payload = json.dumps({"source": "clear", "cwd": proj})
         hook = _hook("inject-context.sh")
 
+        # 부모 환경을 상속하지 않는다. cys/cysd 없는 PATH·죽은 소켓·tmp HOME/상태만 허용한다.
+        isolated_env = {
+            "HOME": home, "PATH": bindir + os.pathsep + "/usr/bin:/bin",
+            "TMPDIR": tmpdir, "LANG": "en_US.UTF-8", "CYS_SURFACE_ID": "surface:99",
+            "CYS_SOCKET": os.path.join(tmp, "no-such.sock"), "CYS_NO_AUTOSTART": "1",
+            "CYS_STATE_DIR": state, "PYTHONDONTWRITEBYTECODE": "1",
+        }
+
         def run(pack, extra=None, path=hook):
-            e = {"HOME": home, "CYS_PACK_DIR": pack}
+            e = dict(isolated_env, CYS_PACK_DIR=pack)
             if extra:
                 e.update(extra)
-            return _run([BASH, path], env=_base_env(e), input=payload)
+            return _run([BASH, path], env=e, input=payload, cwd=proj)
 
-        # ① 양성 — 진짜 다른 팩(hooks/_lib.sh 실재) 레인에서 본부 훅이 발화 → 조기 종료
+        # ① 양성 — 다른 팩에 hooks/_lib.sh 만 있고 대응 inject-context.sh 는 없다.
+        #    이 부재 조건에서만 본부 훅은 무발화·exit 0·stdout 0 으로 조기 종료하고 표식을 쓴다.
         other = os.path.join(tmp, "otherpack")
         _w(os.path.join(other, "hooks", "_lib.sh"), lib, 0o644)
+        os.makedirs(os.path.join(other, "state"), exist_ok=True)
+        marker = os.path.join(other, "state", "lane-guard-tripped")
         r1 = run(other)
         need(r1.returncode == 0, "조기 종료가 exit 0 이 아니다(%d)" % r1.returncode)
         need(r1.stdout == "",
              "타 레인 팩 훅인데 가드가 발화하지 않았다(주입 누수): %r" % r1.stdout[:300])
+        # RED 에서 표식 실패가 기존 음성 대조와 신규 위임 검증을 가리지 않게 마지막에 합산한다.
+        new_failures = []
+        if not os.path.isfile(marker):
+            new_failures.append("대응 훅 부재로 조기 종료했지만 other/state/lane-guard-tripped 표식이 없다")
+        elif "reason=absent" not in _read(marker).splitlines():
+            new_failures.append("표식에 reason=absent 줄이 없다")
         # ①' stderr 문구는 **프리루드를 직접 로드하는** 경로에서 잰다 — 훅의 규약 문장은
         #    `. "…/_lib.sh" 2>/dev/null` 이라 source 명령 전체의 stderr 가 억제된다(그 억제는
         #    이 커밋 범위 밖의 기존 계약이다). 문구가 실재한다는 사실 자체는 여기서 못박는다.
@@ -8885,7 +8908,7 @@ def h_lane_guard_1():
         _w(os.path.join(hookpack, "hooks", "_lib.sh"), lib, 0o644)
         probe = os.path.join(hookpack, "hooks", "probe.sh")
         _w(probe, '#!/bin/sh\n. "$(dirname "$0")/_lib.sh"\necho REACHED >&2\n')
-        rp = _run(["sh", probe], env=_base_env({"HOME": home, "CYS_PACK_DIR": other}))
+        rp = _run(["sh", probe], env=dict(isolated_env, CYS_PACK_DIR=other), cwd=proj)
         need(MSG in rp.stderr, "가드 stderr 문구가 없다: %r" % rp.stderr[:300])
         need("REACHED" not in rp.stderr, "가드가 조기 종료시키지 않았다(호출측이 계속 돈다)")
         # ② 음성 — 같은 팩(자기 레인). ★라이브 PACK_DIR 을 CYS_PACK_DIR 로 주지 않는다:
@@ -8918,7 +8941,18 @@ def h_lane_guard_1():
              "사용자 로컬 오버레이 훅을 가드가 죽였다 — 업데이트 불가침 확장점 파괴: %r"
              % r5.stderr[:300])
         need(r5.stdout != "", "오버레이 훅 본체가 죽었다(2단 프리루드 폴백 경로)")
-    return "양성 1(조기 종료·stdout 0) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상)"
+        # ⑥ 양성 — 대응 훅이 실재하면 본부 훅은 레인 훅으로 1회 위임하고 표식을 만들지 않는다.
+        if os.path.exists(marker):
+            os.unlink(marker)
+        _w(os.path.join(other, "hooks", "inject-context.sh"), "#!/bin/sh\necho OTHER-LANE-RAN\n")
+        r6 = run(other)
+        if r6.returncode != 0 or "OTHER-LANE-RAN" not in r6.stdout:
+            new_failures.append("레인 대응 훅으로 위임되지 않았다: rc=%d stdout=%r stderr=%r"
+                                % (r6.returncode, r6.stdout[:300], r6.stderr[:300]))
+        if os.path.exists(marker):
+            new_failures.append("대응 훅 위임 시 lane-guard-tripped 표식이 생겼다")
+        need(not new_failures, " · ".join(new_failures))
+    return "양성 2(부재→조기 종료+표식 · 실재→위임) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상) · 표식 reason"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

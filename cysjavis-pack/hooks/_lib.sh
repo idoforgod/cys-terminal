@@ -277,15 +277,75 @@ export PYTHONDONTWRITEBYTECODE
 #   ① `$CYS_PACK_DIR/hooks/_lib.sh` 실재  = 레인 쪽이 진짜 팩인가
 #   ② `<훅 자기 루트>/hooks/_lib.sh` 실재 = 훅 쪽이 진짜 팩인가
 #   ③ 정규화(`pwd -P`) 후 두 루트가 상이
-# 셋이 모두 참일 때만 조기 종료한다. ②가 거짓이면 **판정 불능 → 통과**다 —
+# 셋이 모두 참일 때만 아래 불일치 갈래를 판정한다. ②가 거짓이면 **판정 불능 → 통과**다 —
 # `~/.cys/local/hooks/<이벤트>.d/` 오버레이·테스트 스텁·배선 하네스는 팩이 아닌 트리에서
 # 돌면서 프리루드를 2단(팩 경로)으로 집는 **정당한 경로**이고(계약 ⓔ 실측), 그 디렉터리에는
 # `_lib.sh` 가 없다. 한쪽만 보면 그 전부가 전면 무발동한다(업데이트 불가침 확장점 파괴).
 # 막으려는 것은 '팩 밖 정당 실행'이 아니라 **다른 팩의 훅**이 레인에 끼어드는 경우다.
 #
-# 계약: POSIX sh · `set -u` 안전 · stdout 무출력 · 외부 명령 비의존(파라미터 확장 + cd/pwd
-# 빌트인만 — PATH 가 빈 훅 하네스에서도 오판하지 않는다) · opt-out `CYS_HOOK_LANE_GUARD=0`.
+# 계약: POSIX sh · `set -u` 안전 · stdout 무출력 · 외부 명령 비의존(파라미터 확장·[·cd/pwd·
+# read·case 등 빌트인만 — PATH 가 빈 훅 하네스에서도 오판하지 않는다) · opt-out `CYS_HOOK_LANE_GUARD=0`.
+# R안: 불일치 뒤 같은 상대경로의 레인 훅이 읽을 수 있는 파일이면 위임을 예약한다. 단, 좌석의
+# 실사용 설정 4파일에 대상이 등록돼 있으면 레인 훅이 직접 실행되므로 표식 없이 조기 종료한다.
+# CYS_LANE_REDIRECT는 진입 시 상속값을 비우고 가드만 예약하며, 훅 본문이 stderr 억제 밖에서 소비한다.
+# CYS_LANE_REDIRECTED는 가드 첫 줄에서 읽고 즉시 unset한다(프리루드 1홉 소비·자손 상속 없음).
+# 이미 위임된 훅의 재불일치·자기 자신인 대상은 already-redirected, 대상 부재는 absent,
+# 판독 불가는 unreadable, 훅 본문에 소비 토큰이 없으면 no-redirect-line으로 표식 후 조기 종료한다.
+# 이 강등 갈래만 레인 state/lane-guard-tripped를 key=value로 덮어쓴다
+# (hook_root/lane_root/script/surface/reason/ts). state 부재·쓰기 불가는 삼킨다.
+# date는 선택적인 표식 시각용이며 판정에는 쓰지 않아 외부 명령 비의존 계약을 유지한다.
+cys_lane_mark() {
+  _cys_lm_f="${2:-}/state/lane-guard-tripped"
+  _cys_lm_s="${CYS_SURFACE_ID:-${AITERM_SURFACE_ID:-}}"
+  _cys_lm_ts=""
+  if command -v date >/dev/null 2>&1; then _cys_lm_ts="$(date +%s 2>/dev/null)" || _cys_lm_ts=""; fi
+  {
+    printf 'hook_root=%s\nlane_root=%s\nscript=%s\nsurface=%s\n' "${1:-}" "${2:-}" "${3:-}" "$_cys_lm_s"
+    printf 'reason=%s\n' "${4:-}"
+    [ -n "$_cys_lm_ts" ] && printf 'ts=%s\n' "$_cys_lm_ts"
+  } > "$_cys_lm_f" 2>/dev/null || :
+  return 0
+}
+
+# 이 좌석의 실사용 설정 4파일에 정규화 경로($1) 또는 원형 경로($2)가 등록됐는가 — read 빌트인만.
+# Windows 등록형(bash "C:/…/hooks/x.sh")도 msys /c/rest의 [A-Za-z]:/rest 패턴으로 본다.
+# ★원형($2)은 **절대 경로일 때만** 대조한다 — 상대 CYS_PACK_DIR(`base` 등)의 원형 `base/hooks/x.sh` 는
+#   타 레인 등록줄 `…/base/hooks/x.sh` 의 접미가 돼 '등록됨' 으로 오판(위임 생략·무표식 무음 종료 =
+#   가장 나쁜 방향)한다. 부분 일치는 절대 경로끼리만 안전하다(검체 R-9e).
+cys_lane_registered() {
+  _cys_lrg_cfg="${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}"
+  _cys_lrg_alt=""
+  case "${1:-}" in /[A-Za-z]/?*) _cys_lrg_alt="${1#/?/}" ;; esac
+  case "${2:-}" in /*|[A-Za-z]:*) ;; *) set -- "${1:-}" "" ;; esac
+  for _cys_lrg_f in "$_cys_lrg_cfg/settings.json" "$_cys_lrg_cfg/settings.local.json" \
+                    ".claude/settings.json" ".claude/settings.local.json"; do
+    [ -f "$_cys_lrg_f" ] && [ -r "$_cys_lrg_f" ] || continue
+    while IFS= read -r _cys_lrg_line || [ -n "$_cys_lrg_line" ]; do
+      if [ -n "${1:-}" ]; then
+        case "$_cys_lrg_line" in *"$1"*) return 0 ;; esac
+      fi
+      if [ -n "${2:-}" ]; then
+        case "$_cys_lrg_line" in *"$2"*) return 0 ;; esac
+      fi
+      [ -n "$_cys_lrg_alt" ] && case "$_cys_lrg_line" in *[A-Za-z]:/"$_cys_lrg_alt"*) return 0 ;; esac
+    done < "$_cys_lrg_f"
+  done
+  return 1
+}
+
+# 훅 본문($0)에 redirect 소비 토큰이 없으면 예약이 소비되지 않으므로 표식 후 종료해야 한다.
+cys_lane_has_redirect_line() {
+  [ -r "${0:-}" ] || return 1
+  while IFS= read -r _cys_lhr_line || [ -n "$_cys_lhr_line" ]; do
+    case "$_cys_lhr_line" in *cys_lane_redirect*) return 0 ;; esac
+  done < "$0"
+  return 1
+}
+
 cys_lane_guard() {
+  _cys_lg_redirected="${CYS_LANE_REDIRECTED:-}"           # 래치는 이 프로세스에서 소비한다(자손 상속 없음)
+  unset CYS_LANE_REDIRECTED 2>/dev/null || CYS_LANE_REDIRECTED=""
+  CYS_LANE_REDIRECT=""                                    # env 상속값 무시 — 예약은 이 가드만 한다
   [ "${CYS_HOOK_LANE_GUARD:-1}" = "0" ] && return 0
   [ -n "${CYS_PACK_DIR:-}" ] || return 0
   [ -f "${CYS_PACK_DIR}/hooks/_lib.sh" ] || return 0        # ① 레인 쪽이 진짜 팩인가
@@ -309,12 +369,54 @@ cys_lane_guard() {
   [ -n "$_cys_lg_lane" ] || return 0                         # 판정 불능 → 통과
   [ "$_cys_lg_root" = "$_cys_lg_lane" ] && return 0          # ③ 같은 팩 → 통과
 
+  # 위임 대상: 레인 팩의 같은 상대경로 훅(hooks/<name> 또는 hooks/<sub>/<name>)
+  _cys_lg_rel="${_cys_lg_d#"$_cys_lg_root"/}"
+  _cys_lg_name="${0##*/}"
+  _cys_lg_target="$_cys_lg_lane/$_cys_lg_rel/$_cys_lg_name"
   # ★고지의 가시성 한계(정직 기록): 훅의 프리루드 규약 문장은 `. "…/_lib.sh" 2>/dev/null` 이라
   #   **source 명령 전체의 stderr 가 억제**된다 — 이 줄은 프리루드를 직접 로드하는 호출자
-  #   (하네스·수동 진단)에게만 보인다. 훅 경로에서 관측 가능한 계약은 '무발화·exit 0·stdout 0'
-  #   이며 검체 H-LANE-GUARD-1 이 두 사실을 각각 잰다(stderr 억제 자체는 이 변경 범위 밖이다).
-  echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
-  exit 0
+  #   (하네스·수동 진단)에게만 보인다.
+  #   훅 경로에서 관측 가능한 계약은 '강등 시 무발화·exit 0·stdout 0·reason 표식 / 등록 시 무표식 종료 / 위임'이며 검체가 잰다.
+  if [ -n "$_cys_lg_redirected" ]; then
+    cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name" "already-redirected"
+    echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  if [ ! -f "$_cys_lg_target" ]; then
+    cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name" "absent"
+    echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  if [ ! -r "$_cys_lg_target" ]; then
+    cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name" "unreadable"
+    echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  if [ "$_cys_lg_target" = "$_cys_lg_d/$_cys_lg_name" ]; then
+    cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name" "already-redirected"
+    echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  if cys_lane_registered "$_cys_lg_target" "${CYS_PACK_DIR%/}/$_cys_lg_rel/$_cys_lg_name"; then
+    echo "[cys-hook] 레인 훅 등록 확인 — 위임 생략(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  if ! cys_lane_has_redirect_line; then
+    cys_lane_mark "$_cys_lg_root" "$_cys_lg_lane" "$_cys_lg_name" "no-redirect-line"
+    echo "[cys-hook] 타 레인 팩 훅 조기 종료(hook=$_cys_lg_root lane=$_cys_lg_lane)" >&2
+    exit 0
+  fi
+  CYS_LANE_REDIRECT="$_cys_lg_target"
+  return 0
+}
+
+cys_lane_redirect() {
+  [ -n "${CYS_LANE_REDIRECT:-}" ] || return 0
+  _cys_lr_t="$CYS_LANE_REDIRECT"
+  CYS_LANE_REDIRECT=""
+  CYS_LANE_REDIRECTED=1
+  export CYS_LANE_REDIRECTED
+  exec "${BASH:-/bin/sh}" "$_cys_lr_t" "$@"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -804,7 +906,8 @@ cys_resolve_role() {
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :
 cys_fix_locale >/dev/null 2>&1 || :
-# ★레인 가드는 마지막이다 — 통과 판정이 나야 그 아래 훅 본체가 돈다(조기 종료는 exit 0).
+# ★레인 가드는 마지막이다 — 조기 종료(exit 0) 또는 위임 예약(CYS_LANE_REDIRECT 설정 후 return).
+# 실제 exec는 훅 본문의 `cys_lane_redirect "$@"` 줄이 프리루드 `2>/dev/null` 밖에서 한다.
 cys_lane_guard
 
 # ★반드시 0으로 끝난다(계약 ⓓ) — 비0이면 호출측 loud-skip이 오발동한다.

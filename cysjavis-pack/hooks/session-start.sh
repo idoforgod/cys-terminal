@@ -7,6 +7,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(session-start)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 [ -d "$JARVIS_DIR" ] || exit 0

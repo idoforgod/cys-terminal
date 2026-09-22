@@ -85,6 +85,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 # ── 역할 해소(데몬 권위 우선 · TTL 15s 캐시) ─────────────────────────────────────
 # ★캐시 **신원·레코드 문법·디렉터리**는 `_lib.sh` 공용층과 같은 것을 쓴다(0.14.31 성찰 G1·G7·G14).

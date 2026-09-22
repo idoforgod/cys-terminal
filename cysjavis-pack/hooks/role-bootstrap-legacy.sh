@@ -126,6 +126,7 @@ set +e
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(role-bootstrap)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 # ── A2: surface 이중 게이트(최선두) — 비-cys 터미널은 무발화·무부작용 ──
 # 종전엔 게이트가 없어 임의 claude 세션에서 "너는 마스터다"를 치면 preflight 변형·데몬 autostart·

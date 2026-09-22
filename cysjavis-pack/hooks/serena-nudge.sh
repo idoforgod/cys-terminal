@@ -16,6 +16,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(serena-nudge)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 # G22: 인터프리터 경성 참조 제거. 미해소 = 넛지 불가 → 무해 통과(never-block 불변 유지).
 [ -n "${CYS_PY:-}" ] || exit 0
 

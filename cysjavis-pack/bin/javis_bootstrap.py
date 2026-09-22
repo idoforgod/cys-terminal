@@ -2740,6 +2740,15 @@ def _capgate_unresolved_state(pack):
             return True, path               # 조회 실패는 '없다' 가 아니다(막는 방향)
 
 
+def _hooks_effective(pack):
+    """최근 레인 가드 조기 종료가 없는가 — None=미측정(공용 판독 실패)."""
+    try:
+        import javis_preflight as _pf
+        return not _pf.lane_guard_tripped(pack)[0]
+    except Exception:                       # 진단 필드가 부트의 종료 코드를 바꾸지 않는다
+        return None
+
+
 def _cmd_run_chain(log):
     """부트 단계 체인(①~⑧) — 종료 기록은 호출자(cmd_run)의 try/finally 가 소유한다."""
 
@@ -3376,7 +3385,7 @@ def _cmd_run_chain(log):
                      "base 팩 cys-dept 부재 — 신호 생략(집행 틱이 base 부활 시 자가 치유)")
 
     # ⑧ 기계 요약 — master는 이 JSON을 인용해 '기동 완료'를 보고한다(다른 근거 인용 금지)
-    summary = {"ok": True, "marker": marker_note,
+    summary = {"ok": True, "marker": marker_note, "hooks_effective": _hooks_effective(PACK),
                "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
                "lane": log.lane, "boot_last": log.path}
     # ★A7 채널 보존: 완주는 stdout 최종 JSON(구 산문 계약의 유일한 인용 근거)이다.

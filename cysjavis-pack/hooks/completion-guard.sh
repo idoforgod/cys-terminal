@@ -5,6 +5,7 @@
 . "$(dirname "$0")/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(completion-guard)" >&2; exit 0; }
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 # ── 무장 스위치 선(先)판정(조건 37 강화 · E1-2) ──────────────────────────────
 # guard main() 첫 줄과 **같은 판정**을 셸에서 한 번 더 한다. 종전엔 미무장 pane 에서도

@@ -40,11 +40,39 @@ stdout 은 모델 컨텍스트로 주입된다) · `set -u` 안전 · 항상 0 �
 
 다른 레인의 팩에서 온 훅이 우연히 발화하는 것을 막는다. 발화 조건은 **양쪽이 모두 실제 팩일 때**다 —
 `$CYS_PACK_DIR/hooks/_lib.sh` 가 있고, 훅 자신의 팩 루트에도 `hooks/_lib.sh` 가 있으며, 두 경로가
-정규화 후 다를 때. 그 경우 stderr 1줄을 남기고 조용히 exit 0 한다.
+정규화 후 다를 때. 불일치 시 다음과 같이 처리한다.
+
+1. 자기 레인 팩의 같은 상대경로 훅이 있고 읽을 수 있으며, 아래 등록·강등 조건에 걸리지 않으면
+   그 훅으로 `exec` 한다(위임 · stdin/인자/stderr/exit 보존).
+2. 대응 훅이 이 좌석의 실사용 설정에 이미 등록돼 있으면 **표식 없이 위임을 생략하고 exit 0** 한다.
+   `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` 와 훅 cwd 의 `.claude` 아래 `settings.json`·
+   `settings.local.json` 4파일을 확인한다. 정규화 경로와 `$CYS_PACK_DIR` 원형 경로(절대 경로일 때만 —
+   상대 원형은 타 레인 등록줄의 접미가 돼 오판한다)를 보며, 레인 훅은 자기 등록으로 1회만 실행된다.
+3. 대응 훅 부재(`reason=absent`)·판독 불가(`reason=unreadable`)·위임된 훅의 재불일치 또는
+   대상이 자기 자신(`reason=already-redirected`)이면 `<레인 팩>/state/lane-guard-tripped` 표식을
+   남긴다(덮어쓰기). 등록 확인에도 걸리지 않고 발화한 훅 본문에 `cys_lane_redirect` 토큰이 없으면
+   `reason=no-redirect-line` 표식을 남긴다. 이 갈래들은 본문 실행과 stdout 없이 exit 0 한다.
+4. 위임 래치 `CYS_LANE_REDIRECTED=1` 은 **대상 프리루드 1홉에서 소비**한다. 프리루드가 환경에서
+   래치를 지우므로 자손 프로세스는 상속하지 않고, 자손의 다른 불일치 훅도 정상 위임할 수 있다.
+   위임 예약 변수 `CYS_LANE_REDIRECT` 도 가드 진입 시 초기화해 환경 상속값을 무시한다.
+
+표식 필드는 `hook_root`·`lane_root`·`script`·`surface`·`reason`·`ts` 이며 각 줄은 `key=value` 형식이다.
+원인에 맞게 팩·권한·훅 본문을 조치하고 확인한 뒤 `<레인 팩>/state/lane-guard-tripped` 표식을 삭제한다.
+표식은 24h 가 지나면 자동 통과한다.
 
 판정이 서지 않으면(팩이 아닌 트리에서 실행 — 오버레이·테스트 스텁·팩 밖 복사본) **통과**한다.
 `~/.cys/local/hooks/` 에는 `_lib.sh` 가 없으므로 사용자 오버레이는 이 가드에 걸리지 않는다.
 일시적으로 끄려면 `CYS_HOOK_LANE_GUARD=0`.
+
+소비자는 preflight `C83.lane-guard-tripped`(24h 이내 표식 FAIL · 좌석 안 SessionStart 설정 대조 WARN)와
+`javis_bootstrap.py` 최종 JSON / `javis_mission.py status --json` 의 `hooks_effective` 다.
+
+훅 본문은 프리루드 줄 다음에 아래 한 줄을 둔다. census 검체(`test_lane_redirect.py` R-8)가
+전수를 잰다 — 새 훅을 만들면 이 줄을 넣어라.
+
+```sh
+command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
+```
 
 ## 3. completion-guard 의 이중 휴면 — "등록했는데 왜 안 도나"
 
