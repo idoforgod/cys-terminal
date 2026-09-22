@@ -32094,17 +32094,11 @@ mod tests {
             .split_once("CLEAR_UNMEASURABLE_TOKEN")
             .expect("측정 불능 종료 토큰 없음")
             .0;
-        let propagating: Vec<&str> = [
-            "compose_directive(&role_name)?",
-            "inject_text(sid, &resume_text)?",
-        ]
-        .into_iter()
-        .filter(|call| arm.contains(*call))
-        .collect();
-        assert!(
-            propagating.is_empty(),
-            "Unmeasurable 재주입 실패는 rc81 을 유지해야 한다; ? 전파 잔존: {}",
-            propagating.join(", ")
+        let question_marks = arm.matches('?').count();
+        let return_errors = arm.matches("return Err(").count();
+        assert_eq!(
+            (question_marks, return_errors), (0, 0),
+            "Unmeasurable 팔은 재주입 실패를 전파하면 안 된다(rc81 유지); '?' {question_marks}건 · 'return Err(' {return_errors}건"
         );
     }
 
@@ -32797,6 +32791,44 @@ mod tests {
         assert_eq!(counts.1, 1);
         assert_eq!(counts.2, 0, "claude 훅 선언이면 디렉티브 생략");
         assert_eq!(counts.3, 2, "authoritative는 저장 지시·RESUME 각 1건");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_unmeasurable_then_busy_keeps_rc81() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0), ("⠋ Thinking…\n", 0.2)],
+            vec!["S1"], false, false,
+        );
+        let counts = d16_cycle_send_counts(&calls);
+        assert_eq!(counts.0, 1, "clear 1건은 이미 나갔다");
+        assert_eq!(counts.1, 0, "busy 대상에 RESUME 이 나갔다");
+        assert_eq!(counts.2, 0, "busy 대상에 디렉티브가 나갔다");
+        assert_eq!(
+            exit, 81,
+            "clear 가 나간 뒤 재주입 대기 실패는 rc84(clear 송신 0건 계약)로 새면 안 된다"
+        );
+        assert!(![84, 85].contains(&exit), "clear 송신 0건 계약으로 오보고 → autopilot 이중 clear");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_unmeasurable_then_human_draft_keeps_rc81() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_scenario(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0), ("❯ 사람이 치던 초안\n", 5.0)],
+            vec!["S1"], false, false,
+        );
+        let counts = d16_cycle_send_counts(&calls);
+        assert_eq!(counts.0, 1, "clear 1건은 이미 나갔다");
+        assert_eq!(counts.1, 0, "사람 초안에 RESUME 이 나갔다");
+        assert_eq!(counts.2, 0, "사람 초안에 디렉티브가 나갔다");
+        assert_eq!(
+            exit, 81,
+            "clear 가 나간 뒤 재주입 대기 실패는 rc84(clear 송신 0건 계약)로 새면 안 된다"
+        );
+        assert!(![84, 85].contains(&exit), "clear 송신 0건 계약으로 오보고 → autopilot 이중 clear");
     }
 
     #[cfg(unix)]
