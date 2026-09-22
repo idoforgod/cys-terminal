@@ -4950,8 +4950,10 @@ pub(crate) fn direct_send_text_gate_kind(
     machine_origin: bool,
     clear_first: bool,
     text_submits: bool,
+    text_cancels: bool,
     exempt: bool,
 ) -> Option<DirectSendKind> {
+    let _ = text_cancels; // RED 스텁 — GREEN 에서 바이트 축 합류
     if exempt {
         return None;
     }
@@ -11490,27 +11492,34 @@ mod tests {
     }
 
     #[test]
-    fn d12_text_gate_kind_treats_gui_assembled_submit_as_machine() {
+    fn d12_text_gate_kind_uses_send_key_byte_axis() {
         let cases = [
-            (false, false, false, false, false, Some(DirectSendKind::Text)),
-            (false, false, true, false, false, Some(DirectSendKind::ClearFirst)),
-            (true, false, false, true, false, None), // 실키 CR
-            (true, true, false, false, false, None), // 순수 삽입
-            (true, true, false, true, false, Some(DirectSendKind::Text)), // GUI 자동 제출
-            (true, true, true, false, false, Some(DirectSendKind::ClearFirst)), // GUI clear_first
-            (false, false, false, true, true, None), // 면제
+            // (human, machine_origin, clear_first, text_submits, text_cancels, exempt, expected)
+            (false, false, false, false, false, false, Some(DirectSendKind::Text)),        // 기계 본문
+            (false, false, true,  false, false, false, Some(DirectSendKind::ClearFirst)),  // --clear-first
+            (false, false, false, false, true,  false, Some(DirectSendKind::CancelKey)),   // 기계 본문의 0x15/0x03 만 = send_key C-u 와 같은 축 (RED)
+            (false, false, false, true,  true,  false, Some(DirectSendKind::Text)),        // 취소+제출 = 제출 우선
+            (true,  false, false, true,  false, false, None),                              // 실키 CR
+            (true,  false, false, false, true,  false, None),                              // 실키 C-u
+            (true,  true,  false, false, false, false, None),                              // 순수 삽입
+            (true,  true,  false, true,  false, false, Some(DirectSendKind::Text)),        // GUI 자동 제출
+            (true,  true,  false, false, true,  false, Some(DirectSendKind::CancelKey)),   // GUI 조립 0x15 (RED · ADV3GUICANCEL)
+            (true,  true,  true,  false, false, false, Some(DirectSendKind::ClearFirst)),  // GUI clear_first
+            (true,  true,  true,  false, true,  false, Some(DirectSendKind::ClearFirst)),  // clear_first 우선
+            (false, false, false, true,  false, true,  None),                              // 면제
         ];
-        for (human, machine_origin, clear_first, text_submits, exempt, expected) in cases {
+        for (human, machine_origin, clear_first, text_submits, text_cancels, exempt, expected) in cases {
             assert_eq!(
                 super::direct_send_text_gate_kind(
                     human,
                     machine_origin,
                     clear_first,
                     text_submits,
+                    text_cancels,
                     exempt,
                 ),
                 expected,
-                "human={human}, machine_origin={machine_origin}, clear_first={clear_first}, text_submits={text_submits}, exempt={exempt}"
+                "human={human}, machine_origin={machine_origin}, clear_first={clear_first}, text_submits={text_submits}, text_cancels={text_cancels}, exempt={exempt}"
             );
         }
     }

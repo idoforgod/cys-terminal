@@ -4408,8 +4408,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   전부 기계로 떨어뜨리므로 기각한다.
             // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
             let text_submits = text.bytes().any(|b| matches!(b, b'\r' | b'\n'));
+            let text_cancels = text.bytes().any(|b| matches!(b, 0x15 | 0x03));
             let gate_kind = governance::direct_send_text_gate_kind(
-                human, machine_origin, clear_first, text_submits, exempt,
+                human, machine_origin, clear_first, text_submits, text_cancels, exempt,
             );
             if let Some(kind) = gate_kind {
                 if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
@@ -13124,6 +13125,62 @@ mod tests {
         assert_eq!(after, before, "거부된 clear_first 는 사람 초안 계수를 보존한다");
     }
 
+    /// ★적대 minor(라운드3 · ADV3GUICANCEL): GUI 조립 문안의 0x15/0x03 은 send_key C-u 와 같은 CancelKey 축 — 사람 초안 삭제 거부 · 기계 잔여 선정리 통과.
+    #[test]
+    fn d12_gui_assembled_cancel_byte_denied_when_human_draft_pending() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-gui-cancel-byte", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_574;
+        let machine_target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "worker-2", pid + 1);
+
+        // 기계 잔여 대조를 먼저 실행한다: CancelKey 는 send_key C-u 와 같은 사람 축만 검사한다.
+        let machine_sent = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "foo", "human": false,
+            "queued": false, "quiet": true,
+        }));
+        let machine_before = d12_input_counts(&machine_target);
+        let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": machine_target.id, "text": "\u{15}", "human": true,
+            "machine_origin": true, "queued": false, "quiet": true,
+        }));
+        let machine_after = d12_input_counts(&machine_target);
+
+        let target = v7_pane(&daemon, "worker-3", pid + 2);
+        v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for text in ["\u{15}", "\u{3}"] {
+            // RED 삭제 뒤에도 다음 바이트를 동일한 사람 초안에서 검사한다.
+            if d12_input_counts(&target) != before {
+                v7_send_human(&daemon, target.id, pid + 2, "\u{15}");
+                v7_send_human(&daemon, target.id, pid + 2, "owner half sentence");
+            }
+            *target.last_human_input.lock().unwrap() = None;
+            let probe_before = d12_input_counts(&target);
+            let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+                "surface_id": target.id, "text": text, "human": true,
+                "machine_origin": true, "queued": false, "quiet": true,
+            }));
+            let after = d12_input_counts(&target);
+            observations.push((text, resp, probe_before, after));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(machine_sent["ok"], json!(true), "전제: 기계 잔여 생성 성공: {machine_sent}");
+        assert_eq!(machine_before, (3, 3, 0), "전제: 기계 잔여 3바이트");
+        assert_eq!(machine_clear["ok"], json!(true), "GUI 조립 C-u 는 기계 잔여 선정리 허용: {machine_clear}");
+        assert_eq!(machine_after, (0, 0, 0), "GUI 조립 C-u 는 기계 잔여를 정상 삭제");
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        for (text, resp, probe_before, after) in observations {
+            assert_eq!(probe_before, before, "text={text:?}: 모든 취소 바이트에 동일한 사람 초안");
+            assert_eq!(resp["ok"], json!(false),
+                "text={text:?}: GUI 조립 취소 바이트 거부; before={before:?} after={after:?} resp={resp}");
+            d12_assert_cancel_denied(&resp);
+            assert_eq!(after, before, "text={text:?}: 거부 뒤 사람 초안 계수 보존");
+        }
+    }
+
     /// 오너가 자기 초안에 경로를 이어 붙이는 클릭(injectRawToPane) — 제출·삭제가 아니므로 게이트 밖.
     #[test]
     fn d12_gui_pure_insertion_without_newline_passes_into_own_draft() {
@@ -13169,8 +13226,7 @@ mod tests {
         assert_eq!(after, (0, 0, 0), "실키 제출 뒤 미제출 계수는 비워진다");
     }
 
-    /// `cys node-recover`(cys.rs:17494)의 선정리 C-u 가 이 면제를 쓴다 — boot_agent_on_surface 의 기동 send_text/Return(cys.rs:12426·12430)과 같은 축.
-    /// 면제가 없으면 사람 초안 앞에서 rc 1 → run_boot escalate_reclaim(파괴) 로 흐른다(리뷰 major 1).
+    /// 검증된 권위 호출자(master/cso pane 자손 — 면제 술어 authoritative_caller_ok 의 (a) 축)의 C-u 는 CancelKey 도 면제된다. 면제의 다른 축 (b) restore-root 자손은 caller_in_restore_root 검체가 덮는다. 분리 호출자·role 없는 pane 은 면제되지 않는다(d12_detached_caller_authoritative_cancel_key_is_still_denied) — 그 거부는 cys.rs run_node_recover 가 rc 79 로 접는다.
     #[test]
     fn d12_authoritative_caller_cancel_key_exempt() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13204,6 +13260,71 @@ mod tests {
         assert_eq!(control_before, before, "대조도 같은 좌석의 사람 초안 11바이트");
         d12_assert_cancel_denied(&denied);
         assert_eq!(control_after, control_before, "authoritative 없는 C-u 는 사람 초안 보존");
+    }
+
+    /// ★음성 핀(라운드 4 · 감사 minor 2): authoritative 면제는 두 축뿐이다 — (a) 호출자 pane 의 role∈{master,cso} (b) phoenix restore-root 의 살아있는 자손. pane 무귀속 호출자(setsid 부트의 cys boot · GUI start_master 체인 · 데몬 watchdog 의 node-recover 자식)와 비권위/무 role pane 은 authoritative:true 를 실어도 거부된다. 이 거부는 cys.rs run_node_recover 가 RECOVER_REFUSED_TOKEN 으로 접어 rc 79(비파괴) 로 낸다 — 데몬 쪽 면제를 넓히지 않는다(리뷰 비권장).
+    #[test]
+    fn d12_detached_caller_authoritative_cancel_key_is_still_denied() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-detached-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_576;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner half sentence");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+
+        // bind_caller 를 거치지 않은 가상 pid 는 pane·restore-root 어느 면제 축에도 속하지 않는다.
+        let detached_pid = 999_990;
+        let detached_surface = resolve_caller_surface(&daemon, detached_pid);
+        let restore_roots_empty = daemon.restore_roots.lock().unwrap().is_empty();
+        let detached_cancel = d12_rpc(&daemon, detached_pid, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let detached_cancel_after = d12_input_counts(&target);
+        let detached_boot = d12_rpc(&daemon, detached_pid, "surface.send_text", json!({
+            "surface_id": target.id, "text": "claude --resume", "human": false,
+            "queued": false, "quiet": true, "authoritative": true,
+        }));
+        let detached_boot_after = d12_input_counts(&target);
+
+        let worker_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let worker_after = d12_input_counts(&target);
+        *sender.role.lock().unwrap() = None;
+        let roleless_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let roleless_after = d12_input_counts(&target);
+
+        // 같은 sender pane 의 role 만 master 로 바꾸면 권위 C-u 선정리가 허용된다.
+        *sender.role.lock().unwrap() = Some("master".into());
+        let master_cancel = d12_rpc(&daemon, pid + 1, "surface.send_key", json!({
+            "surface_id": target.id, "key": "C-u", "authoritative": true,
+        }));
+        let master_after = d12_input_counts(&target);
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(before, (19, 19, 19), "전제: 사람 초안 19바이트");
+        assert_eq!(detached_surface, None, "전제: 분리 호출자는 pane 무귀속");
+        assert!(restore_roots_empty, "전제: restore-root 면제 창이 비어 있다");
+        for (caller, resp, after) in [
+            ("detached", detached_cancel, detached_cancel_after),
+            ("worker-2", worker_cancel, worker_after),
+            ("no role", roleless_cancel, roleless_after),
+        ] {
+            assert_eq!(resp["ok"], json!(false),
+                "caller={caller}: authoritative 자기신고만으로 초안 삭제 불가; before={before:?} after={after:?} resp={resp}");
+            d12_assert_cancel_denied(&resp);
+            assert_eq!(after, before, "caller={caller}: 거부 뒤 사람 초안 계수 보존");
+        }
+        assert_eq!(detached_boot["ok"], json!(false), "분리 호출자의 기동 send 도 거부: {detached_boot}");
+        d12_assert_denied(&detached_boot, "pending_input");
+        assert_eq!(detached_boot_after, before, "거부된 기동 send 는 사람 초안 계수 보존");
+        assert_eq!(master_cancel["ok"], json!(true), "master role 의 authoritative C-u 는 허용: {master_cancel}");
+        assert_eq!(master_after, (0, 0, 0), "권위 C-u 는 사람 초안을 정상 선정리");
     }
 
     /// 제출 별칭 C-m 의 거부에는 실행 가능한 Return --queued 경로를 처방한다.

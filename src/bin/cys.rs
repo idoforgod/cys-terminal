@@ -944,6 +944,15 @@ fn is_recover_refusal(e: &str) -> bool {
     e.starts_with(RECOVER_REFUSED_TOKEN)
 }
 
+/// ★(0.14.39 · WP-C-input 라운드 4 · 리뷰 major) node-recover 의 선정리 C-u·기동 send 가 데몬의
+/// 타이핑 가드/초안 게이트(`typing_guard` 코드 · `[draft_gate:…]`)에 거부되면 그것은 **사람이 그 좌석에
+/// 앉아 있다는 관측**이지 파괴 근거가 아니다 — `RECOVER_REFUSED_TOKEN` 머리표로 접어 rc 79 로 낸다(순수).
+/// 다른 에러는 그대로 돌려준다.
+fn recover_refusal_from_input_guard(e: String) -> String {
+    // RED 스텁: GREEN 에서 is_typing_guard_err 분기를 배선한다.
+    e
+}
+
 /// [결재 7ⓑ] `cycle-agent` 의 clear 는 **송신(행위)과 실효(결과)가 다르다.**
 ///
 /// 종전엔 `/clear` 키 입력을 보낸 직후 `cycle complete` + exit 0 을 냈다. 대상이 작업 중이면
@@ -31232,6 +31241,48 @@ mod tests {
             json!(0),
             "안전 거부가 의무 실패로 집계된다"
         );
+    }
+
+    /// ★(라운드 4 · 리뷰 major) 분리 호출자(setsid 부트 · GUI start_master 체인 · 데몬 watchdog 자식)는
+    /// 데몬 면제(authoritative_caller_ok = master/cso pane 자손 ∨ restore-root 자손)를 받지 못한다 —
+    /// 그 C-u/기동 send 의 타이핑 가드·초안 게이트 거부가 rc 1 → run_boot escalate_reclaim(kill) 로 흐르면 안 된다.
+    #[test]
+    fn c4_node_recover_input_guard_refusal_is_nondestructive() {
+        // ① 순수 접기 — 타이핑 가드 코드(draft_gate 거부 포함)만 머리표를 단다. CLI request() 의 Err 은 "<code>: <message>".
+        let draft = format!("{}: {} [draft_gate:human_draft]", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD);
+        let folded = recover_refusal_from_input_guard(draft.clone());
+        assert!(is_recover_refusal(&folded), "draft_gate 거부가 비파괴 머리표로 접히지 않는다: {folded}");
+        assert!(folded.contains("[draft_gate:human_draft]"), "원문 사유가 보존돼야 진단 가능: {folded}");
+        let cancel = format!("{}: {} [draft_gate:human_draft]", cys::ERR_TYPING_GUARD, cys::MSG_DRAFT_GATE_CANCEL_KEY);
+        assert!(is_recover_refusal(&recover_refusal_from_input_guard(cancel)), "CancelKey 문구도 코드로 접힌다");
+        let plain = format!("{}: {}", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD);
+        assert!(is_recover_refusal(&recover_refusal_from_input_guard(plain)), "3초 타이핑 가드도 사람 관측 = 비파괴");
+        for other in ["surface:7 셸 자체가 종료됨", "", "acl_denied: not allowed"] {
+            assert_eq!(recover_refusal_from_input_guard(other.to_string()), other, "무관한 에러는 불변");
+            assert!(!is_recover_refusal(&recover_refusal_from_input_guard(other.to_string())));
+        }
+        assert!(!is_recover_refusal(&recover_refusal_from_input_guard(cys::inject_guard::HOLD_TOKEN.to_string())), "보류 머리표는 다른 축");
+        // ② 배선 — run_node_recover 의 C-u 와 boot_agent_on_surface 결과가 접기를 지난다(bare `?` 금지).
+        let src = include_str!("cys.rs");
+        let rec = refl_fn_body(src, "run_node_recover");
+        assert!(
+            !rec.contains(r#""key": "C-u", "authoritative": true}))?;"#),
+            "선정리 C-u 의 거부가 아직 bare `?` 로 흐른다 — 분리 호출자에서 rc 1 → escalate_reclaim(kill)"
+        );
+        let cu = rec.find(r#""key": "C-u""#).expect("선정리 C-u 호출부");
+        let boot = rec.find("boot_agent_on_surface(").expect("기동 호출부");
+        assert!(cu < boot, "C-u 가 기동보다 앞이어야 한다");
+        let folds: Vec<usize> = rec.match_indices("recover_refusal_from_input_guard").map(|(i, _)| i).collect();
+        assert!(folds.len() >= 2, "접기 배선이 2곳(C-u · 기동 send) 미만: {}", folds.len());
+        assert!(folds.iter().any(|&i| i > cu && i < boot), "C-u 의 map_err 접기가 없다");
+        assert!(folds.iter().any(|&i| i > boot), "boot_agent_on_surface 의 Err 접기가 없다");
+        // ③ run_boot 의 79 분기 문안이 agent_alive 만 말하지 않는다(사람 초안 보존도 같은 코드로 온다).
+        let rb = refl_fn_body(src, "run_boot");
+        let guard = rb.find("if rc == EXIT_RECOVER_REFUSED {").expect("run_boot 비파괴 분기");
+        let kill = rb.find("escalate_reclaim(role);").expect("escalate 호출부");
+        let seg = &rb[guard..kill];
+        assert!(seg.contains(r#""liveness": "recover_refused""#), "79 분기 라벨이 아직 alive_on_recheck 단일 원인이다:\n{seg}");
+        assert!(!seg.contains("alive_on_recheck"), "79 분기가 원인을 agent_alive 로 단정한다:\n{seg}");
     }
 
     /// ★C3: 마커 미선언 어댑터(gemini·grok)가 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
