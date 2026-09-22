@@ -4931,12 +4931,12 @@ impl DraftGateDenied {
     }
 }
 
-/// D-12 순수 판정 — IO 없음. #5 에서 구현: 이 스캐폴드는 항상 거부하지 않는다.
+/// D-12 순수 판정 — IO 없음.
 ///
 /// Text 는 전체 pending, SubmitKey 는 human_pending 을 우선한다. 자기 본문만 남은
 /// SubmitKey 는 통과하며, 화면 축은 선택기가 아닌 커서행의 Occupied 만 거부한다.
 /// SubmitKey 의 화면 축은 pending == 0 이고 승인·관문 대기가 아닐 때만 적용한다.
-/// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제와 핸들러 배선도 #5 몫이다.
+/// 마커/커서행 미관측(Unknown)은 거부하지 않는다. 호출자 면제는 핸들러가 적용한다.
 pub(crate) fn draft_gate_verdict(
     kind: DirectSendKind,
     pending: u64,
@@ -4945,21 +4945,47 @@ pub(crate) fn draft_gate_verdict(
     selector_row: bool,
     approval_pending: bool,
 ) -> Option<DraftGateDenied> {
-    let _ = (kind, pending, human_pending, line, selector_row, approval_pending);
-    None
+    match kind {
+        DirectSendKind::Text => {
+            if pending > 0 {
+                Some(DraftGateDenied::PendingInput { bytes: pending })
+            } else if !selector_row && input_line_state(0, line) == InputLine::Occupied {
+                Some(DraftGateDenied::ScreenOccupied)
+            } else {
+                None
+            }
+        }
+        DirectSendKind::SubmitKey => {
+            if human_pending > 0 {
+                Some(DraftGateDenied::HumanDraft { bytes: human_pending })
+            } else if pending == 0
+                && !selector_row
+                && !approval_pending
+                && input_line_state(0, line) == InputLine::Occupied
+            {
+                Some(DraftGateDenied::ScreenOccupied)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// D-12 IO 래퍼 — 전체 계수는 미러, 사람 계수는 상태 Mutex 에서 읽는다.
 /// 화면은 마커 좌석의 observe_prompt 커서행이며 마커가 없으면 None/비선택기다.
-/// 승인 축은 approval_or_gate_pending 을 공유한다. #5 에서 구현할 순수 판정자에 위임하므로
-/// 현재는 항상 None 이며, 핸들러에서는 아직 호출하지 않는다.
+/// 계수만으로 거부가 확정되면 화면·승인 관측을 생략한다. 승인 축은
+/// approval_or_gate_pending 을 공유한다. 파서·pending_input leaf 락을 잠깐씩 쓰므로
+/// 호출자는 input_gate 밖에서 호출해야 한다.
 pub(crate) fn draft_gate(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
     kind: DirectSendKind,
 ) -> Option<DraftGateDenied> {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
-    let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
+    if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
+        return Some(why);
+    }
     let adapters = load_adapter_defs();
     let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));
     let line = obs.as_ref().and_then(|obs| {

@@ -1,6 +1,6 @@
 //! Method dispatch: NDJSON request → handler → single response or stream upgrade.
 
-use crate::governance;
+use crate::governance::{self, DirectSendKind, DraftGateDenied};
 use crate::state::{Daemon, FeedItem, HealthRule, LedgerEntry, DEFAULT_COLS, DEFAULT_ROWS};
 use cys::{err_response, ok_response, parse_surface_ref, surface_ref, Request};
 use serde_json::{json, Value};
@@ -2202,6 +2202,42 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// D-12 거부 관측·응답의 단일 경로. leaf 락을 놓은 뒤 이벤트를 1건 발행한다.
+fn draft_gate_denied_response(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    id: &Value,
+    kind: DirectSendKind,
+    why: DraftGateDenied,
+    verified_from: Option<u64>,
+) -> Value {
+    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+    let human = surface.pending_input.lock().unwrap().human.min(pending);
+    daemon.bus.publish(
+        "queue.draft_gate_denied",
+        "queue",
+        Some(surface.id),
+        json!({
+            "surface_ref": cys::surface_ref(surface.id),
+            "kind": match kind {
+                DirectSendKind::Text => "text",
+                DirectSendKind::SubmitKey => "submit_key",
+            },
+            "reason": why.as_str(),
+            "pending_input_bytes": pending,
+            "pending_input_human_bytes": human,
+            "from": verified_from.map(cys::surface_ref),
+        }),
+    );
+    // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다.
+    // 접두를 보존하고 D-12 사유만 덧붙여 구버전 소비자도 폴백할 수 있게 한다.
+    err_response(
+        id,
+        cys::ERR_TYPING_GUARD,
+        &format!("{} [{}:{}]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG, why.as_str()),
+    )
+}
+
 /// ★B2(0.14.24) 프로그램 주입 직후 제출 CR 의 **최소 간격**(ms). 0 = 비활성
 /// (`typing_guard_secs` 와 같은 꼴 — env 로 끌 수 있어야 실기에서 되돌릴 수 있다).
 ///
@@ -4336,6 +4372,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
+            // ★(0.14.39 · WP-C-input · D-12) 종전 가드는 3초 시계 하나뿐이라 시간이 지나면
+            // 사람 초안에 직접 본문이 연접됐다. 계수·화면도 검사하고, clear_first 의 Ctrl-U 가
+            // 초안을 삭제하는 경로 역시 거부한다(queued 는 위에서 반환했다).
+            // Return 은 human 축으로 검사해 관례적인 기계 send+Return 의 자기 본문 제출을
+            // 보호한다. inject_text/launch-agent 의 검증된 authoritative 경로는 의도된 예외다:
+            // cycle-agent D-16 ④는 C-u 전에 화면 초안을 스스로 검사한다.
+            // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
+            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
+            {
+                if let Some(why) = governance::draft_gate(daemon, &surface, DirectSendKind::Text) {
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, DirectSendKind::Text, why, verified_from,
+                    ));
+                }
+            }
             // ★R1 배달 원장 — **주입보다 반드시 앞**(delivery.rs 불변식 ①). try_write 는 writer
             //   채널로 넘기고 실제 PTY 쓰기는 writer 스레드가 하므로, 여기서 기록하면
             //   기록 → try_send → 수신 → write 순서가 구조적으로 보장된다.
@@ -4617,6 +4668,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             cys::MSG_TYPING_GUARD,
                         ));
                     }
+                }
+            }
+            // ★(0.14.39 · WP-C-input · D-12) 3초가 지나도 사람 초안은 제출하지 않는다.
+            // 계수는 human 축으로 검사해 기계 send+Return 은 허용하고, 취소·탐색 키에는 미적용한다.
+            // send_text 와 같은 authoritative 예외, 같은 응답 접두·관측 헬퍼를 사용한다.
+            if matches!(key.as_str(), "Return" | "Enter")
+                && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
+            {
+                if let Some(why) = governance::draft_gate(daemon, &surface, DirectSendKind::SubmitKey) {
+                    return Reply::Single(draft_gate_denied_response(
+                        daemon, &surface, &id, DirectSendKind::SubmitKey, why, verified_from,
+                    ));
                 }
             }
             // ★B2′(codex 감사 R1 · 0.14.24 결함3 세 번째 층): 제출 Return 은 프로그램이 꽂은
@@ -12873,6 +12936,51 @@ mod tests {
         assert_eq!(*draft_before, (0, 0, 0), "계수와 독립적인 화면 축 검체");
         d12_assert_denied(draft, "screen_occupied");
         assert_eq!(*draft_after, (0, 0, 0), "화면 초안 거부도 계수 불변");
+    }
+
+    #[test]
+    fn d12_denials_publish_once_per_request_including_clear_first_and_enter() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("d12-events", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_530;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let sender = v7_pane(&daemon, "worker-2", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        v7_send_human(&daemon, target.id, pid, "owner draft");
+        *target.last_human_input.lock().unwrap() = None;
+        let before = d12_input_counts(&target);
+        let mut observations = Vec::new();
+        for (method, extra, kind, reason) in [
+            ("surface.send_text", json!({"text": "hello"}), "text", "pending_input"),
+            ("surface.send_text", json!({"text": "hello", "clear_first": true}), "text", "pending_input"),
+            ("surface.send_key", json!({"key": "Return"}), "submit_key", "human_draft"),
+            ("surface.send_key", json!({"key": "Enter"}), "submit_key", "human_draft"),
+        ] {
+            let mut params = json!({"surface_id": target.id, "quiet": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let seq = daemon.bus.replay_after(0).last().unwrap()["seq"].as_u64().unwrap();
+            let response = d12_rpc(&daemon, pid + 1, method, params);
+            let events: Vec<_> = daemon.bus.replay_after(seq).into_iter()
+                .filter(|e| e["name"] == "queue.draft_gate_denied").collect();
+            observations.push((response, events, kind, reason, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        for (response, events, kind, reason, after) in observations {
+            d12_assert_denied(&response, reason);
+            assert_eq!(after, before, "거부는 사람 초안을 그대로 보존한다");
+            assert_eq!(events.len(), 1, "요청당 거부 이벤트는 정확히 1건");
+            assert_eq!(events[0]["category"], json!("queue"));
+            assert_eq!(events[0]["surface_id"], json!(target.id));
+            assert_eq!(events[0]["payload"], json!({
+                "surface_ref": cys::surface_ref(target.id),
+                "kind": kind,
+                "reason": reason,
+                "pending_input_bytes": 11,
+                "pending_input_human_bytes": 11,
+                "from": cys::surface_ref(sender.id),
+            }));
+        }
     }
 
     /// ★B2′ 판정 표 박제(0.14.24 · codex 감사 R1 반영): 제출 CR 을 늦출지·얼마나 늦출지의
