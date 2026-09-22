@@ -970,17 +970,20 @@ const CLEAR_UNMEASURABLE_TOKEN: &str = "clear-unmeasurable:";
 /// `t2_clear_verify_window_matches_autopilot_settle` 가 잡는다(파이썬 원문을 include_str 로 대조).
 const CLEAR_VERIFY_SECS: u64 = 75;
 
-#[allow(dead_code)]
+/// 대상 턴·composer가 유휴가 되지 않아 clear 보류(84). 턴 종료 뒤 재시도 또는 --timeout 연장.
+/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const EXIT_CYCLE_TARGET_BUSY: i32 = 84;
-#[allow(dead_code)]
+/// 사람 초안·미제출 입력 보호로 clear 보류(85). 초안을 제출·삭제한 뒤 재시도.
+/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
-#[allow(dead_code)]
+/// 유휴 대기 만료 머리표. 대상 턴 종료 뒤 재시도 또는 --timeout 연장.
+/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
-#[allow(dead_code)]
+/// 사람 초안·미제출 입력 또는 데몬 타이핑 가드 거부 머리표. 초안을 제출·삭제한 뒤 재시도.
+/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
 const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
 
 /// 사이클 대상의 턴 상태(순수).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CycleTargetState {
     Idle,
@@ -989,7 +992,6 @@ enum CycleTargetState {
 }
 
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
-#[allow(dead_code)]
 struct CycleTargetObs<'a> {
     screen: Option<&'a str>,
     quiet: Option<bool>,
@@ -999,10 +1001,104 @@ struct CycleTargetObs<'a> {
     human_bytes: Option<u64>,
 }
 
-#[allow(dead_code)]
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
-    let _ = o;
-    CycleTargetState::Idle
+    if o.human_bytes.unwrap_or(0) > 0 || o.pending_bytes.unwrap_or(0) > 0 {
+        return CycleTargetState::HumanDraft;
+    }
+    let Some(screen) = o.screen else {
+        return CycleTargetState::Busy;
+    };
+    let Some(marker) = o.marker else {
+        return if o.quiet == Some(true) {
+            CycleTargetState::Idle
+        } else {
+            CycleTargetState::Busy
+        };
+    };
+    if marker_row_has_draft(screen, marker, o.placeholder) {
+        return if o.quiet == Some(true) {
+            CycleTargetState::HumanDraft
+        } else {
+            CycleTargetState::Busy
+        };
+    }
+    if cys::readiness::composer_edit_region_empty(screen, marker, o.placeholder)
+        && o.quiet == Some(true)
+    {
+        CycleTargetState::Idle
+    } else {
+        CycleTargetState::Busy
+    }
+}
+
+/// 마지막 마커 행의 마지막 마커 뒤에 초안이 있는가(공백 정규화한 플레이스홀더는 제외).
+/// 선택 커서 행(`❯ 1. Yes`)도 초안으로 읽힌다 — 귀결이 clear 보류(비파괴)라 받아들인다.
+fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some(row) = lines.iter().rposition(|line| line.contains(marker)) else {
+        return false;
+    };
+    let line = lines[row];
+    let Some(pos) = line.rfind(marker) else {
+        return false;
+    };
+    let tail = line[pos + marker.len()..].trim();
+    !tail.is_empty()
+        && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()))
+}
+
+/// 화면·정적 축 1회와 입력 버퍼 메타 1회로 대상 상태를 판정한다. 화면 미관측은 Busy다.
+fn observe_cycle_target(
+    sid: u64,
+    marker: Option<&str>,
+    placeholder: Option<&str>,
+) -> CycleTargetState {
+    let screen = request("surface.read_text", json!({"surface_id": sid})).ok();
+    let entry = surface_entry(sid).ok();
+    cycle_target_state(&CycleTargetObs {
+        screen: screen.as_ref().and_then(|r| r["text"].as_str()),
+        quiet: cys::readiness::idle_quiet_from(
+            screen.as_ref().and_then(|r| r["quiet_secs"].as_f64()),
+        ),
+        marker,
+        placeholder,
+        pending_bytes: entry.as_ref().and_then(|r| r["pending_input_bytes"].as_u64()),
+        human_bytes: entry
+            .as_ref()
+            .and_then(|r| r["pending_input_human_bytes"].as_u64()),
+    })
+}
+
+/// 2초마다 유휴를 관측하되 사람 초안은 즉시 거부한다(마지막 대기는 남은 예산 이내).
+fn wait_cycle_target_idle(
+    sid: u64,
+    marker: Option<&str>,
+    placeholder: Option<&str>,
+    deadline: std::time::Instant,
+    stage: &str,
+) -> Result<(), String> {
+    let secs = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs_f64()
+        .ceil() as u64;
+    loop {
+        match observe_cycle_target(sid, marker, placeholder) {
+            CycleTargetState::Idle => return Ok(()),
+            CycleTargetState::HumanDraft => {
+                return Err(format!(
+                    "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — clear 를 보내지 않는다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 재실행"
+                ));
+            }
+            CycleTargetState::Busy => {}
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{CYCLE_TARGET_BUSY_TOKEN} {stage}: surface:{sid} 가 {secs}s 안에 유휴(턴 종료·빈 composer)가 되지 않았다 — /clear 를 보내지 않는다(진행 중 턴에 대기 메시지로 들어가 거짓 성공이 된다). 처방: 대상 턴이 끝난 뒤 재실행 또는 --timeout 연장"
+            ));
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_secs(2)));
+    }
 }
 
 /// clear 실효 관측 창 — 테스트 override(0=상수). 프로덕션은 항상 CLEAR_VERIFY_SECS.
@@ -1024,6 +1120,8 @@ fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
         Ok(()) => 0,
         Err(e) if e.starts_with(CLEAR_UNVERIFIED_TOKEN) => EXIT_CLEAR_UNVERIFIED,
         Err(e) if e.starts_with(CLEAR_UNMEASURABLE_TOKEN) => EXIT_CLEAR_UNMEASURABLE,
+        Err(e) if e.starts_with(CYCLE_TARGET_BUSY_TOKEN) => EXIT_CYCLE_TARGET_BUSY,
+        Err(e) if e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN) => EXIT_CYCLE_HUMAN_DRAFT,
         Err(e) if e.starts_with(VERIFIER_COLLISION_TOKEN) => EXIT_VERIFIER_COLLISION,
         Err(e) if e.starts_with(VERIFIER_UNRESOLVED_TOKEN) => EXIT_VERIFIER_UNRESOLVED,
         Err(_) => 1,
@@ -11284,12 +11382,14 @@ fn fill_missing_fields(resolved: &mut Value, embedded: Option<&Value>) {
     //   둘 다 **신규 키**라 기존 설치본 디스크 파일에 없고(사용자 소유라 vendor 갱신이 도달하지 않는다),
     //   관문 증거 이월(`gate_carry_ok`)이 그 값으로 composer 를 식별한다. 못 받으면 codex·gemini 좌석이
     //   `carry-unproven` 영구 보류가 된다(치명위험 ③).
-    const LAYERED_KEYS: [&str; 5] = [
+    // D-16: SessionStart 훅 표지도 기존 설치본에 도달해야 clear 뒤 이중 주입을 막는다.
+    const LAYERED_KEYS: [&str; 6] = [
         "ready_marker",
         "approval_patterns",
         cys::first_run_gates::ADAPTER_KEY,
         "prompt_marker",
         "composer_placeholder",
+        "hooks_inject_directive",
     ];
     // 보강 사실을 사람에게 알릴 키. `first_run_gates` 는 제외한다 —
     //   ① 이 키는 **모든 기존 기계에서 매번** 결손이라 매 launch 마다 같은 줄이 나간다(순수 소음).
@@ -17307,17 +17407,36 @@ fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
 
 /// RESUME 기본 문안(순수) — 파일 실재 기준으로 SESSION_STATE·역할 TODO 실경로를 채운다.
 /// 우선순위(파이썬 resolve_save_files 와 동형): pack_round 실재 → cwd_round 실재 → pack_round(폴백 · 부재여도).
-#[allow(dead_code)]
 fn default_resume_text(
     cwd_round: &std::path::Path,
     pack_round: &std::path::Path,
     role_todo: &str,
     exists: &dyn Fn(&std::path::Path) -> bool,
 ) -> String {
-    let _ = (cwd_round, pack_round, role_todo, exists);
-    "[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 직전 작업을 이어가라.".into()
+    let resolve = |name: &str| {
+        let pack = pack_round.join(name);
+        let cwd = cwd_round.join(name);
+        if exists(&pack) {
+            pack
+        } else if exists(&cwd) {
+            cwd
+        } else {
+            pack
+        }
+        .to_string_lossy()
+        .into_owned()
+    };
+    let ss = resolve("SESSION_STATE.md");
+    let todo = resolve(role_todo);
+    format!(
+        "[RESUME] 컨텍스트 순환 완료. {} 를 읽고 직전 작업을 이어가라.",
+        [ss, todo].join(" · ")
+    )
 }
 
+/// 저장 지시 → 저장 검증 → handshake → 턴 종료·빈 composer 확인 → clear → 실효 관측 → 재주입.
+/// D-16 실측: 진행 중 턴에 /clear가 대기 메시지로 들어가 89KB가 옛 세션에 얹히며 거짓 성공했다.
+/// 따라서 clear 전 유휴, 재주입 전 session_file 교체와 새 프롬프트·SessionStart 훅 종료를 확인한다.
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -17344,26 +17463,34 @@ fn run_cycle_agent(
         }
         // clear 명령 선확정 — 저장만 시키고 clear 못하는 어정쩡한 상태 방지
         let agent = entry["agent"].as_str().map(String::from);
+        let spec: Option<Value> = agent.as_deref().map(load_agent_spec).transpose()?;
         let clear = match clear_cmd {
             Some(c) => c,
             None => {
-                let a = agent
-                    .clone()
+                let a = agent.as_deref()
                     .ok_or("agent 메타 없음 — --clear-cmd 명시 필요")?;
-                load_agent_spec(&a)?["clear_cmd"]
-                    .as_str()
+                spec.as_ref().and_then(|s| s["clear_cmd"].as_str())
                     .ok_or_else(|| {
                         format!("agents.json '{a}'에 clear_cmd 없음 — --clear-cmd 명시 필요")
                     })?
                     .to_string()
             }
         };
+        let marker = spec.as_ref().and_then(composer_marker_of);
+        let placeholder = spec.as_ref().and_then(composer_placeholder_of);
+        let hooks_inject = spec
+            .as_ref()
+            .and_then(|s| s["hooks_inject_directive"].as_bool())
+            .unwrap_or(false);
         // 저장 검증 파일 확정 (기본: <cwd>/_round/SESSION_STATE.md + *_TODO.md 자동 탐지)
         let cwd = entry["live_cwd"]
             .as_str()
             .or(entry["cwd"].as_str())
             .unwrap_or(".")
             .to_string();
+        let cwd_round = std::path::PathBuf::from(format!("{cwd}/_round"));
+        let pack_round = cys::pack::pack_dir().join("round");
+        let role_todo = format!("{}_TODO.md", role_name.to_uppercase().replace('-', "_"));
         let files: Vec<String> = if !save_files.is_empty() {
             save_files
         } else {
@@ -17372,7 +17499,6 @@ fn run_cycle_agent(
             // 검증 대상이다. 단 pack/round는 전 노드 공유 디렉터리라 다른 노드의 갱신이
             // 저장 게이트를 거짓 통과시킬 수 있어(타이밍 의존) 대상 역할 파일로 한정한다.
             let mut v = Vec::new();
-            let cwd_round = std::path::PathBuf::from(format!("{cwd}/_round"));
             let ss = cwd_round.join("SESSION_STATE.md");
             if ss.exists() {
                 v.push(ss.to_string_lossy().into_owned());
@@ -17394,11 +17520,6 @@ fn run_cycle_agent(
                     }
                 }
             }
-            let pack_round = cys::pack::pack_dir().join("round");
-            let role_todo = format!(
-                "{}_TODO.md",
-                role_name.to_uppercase().replace('-', "_")
-            );
             // ★C2: 기대 경로(지시문이 **생성을 명령하는** 파일)는 실존 여부와 무관하게 넣는다.
             // 종전 `pt.exists()` 가드가 만든 협로: 신설 노드는 아직 이 파일이 없어 게이트에서
             // 빠지고, 지시문은 바로 그 파일을 만들라고 시킨다 — 순응해 저장해도 아무도 안 보므로
@@ -17436,14 +17557,14 @@ fn run_cycle_agent(
         }
 
         // 1) 저장 지시
-        eprintln!("[cycle 1/5] 저장 지시 주입 → surface:{sid} ({role_name})");
+        eprintln!("[cycle 1/7] 저장 지시 주입 → surface:{sid} ({role_name})");
         // ★A′: 고정 산문 대신 감시 목록(files) 실경로 열거 — 지시 경로↔게이트 경로 정합.
         inject_text(sid, &cycle_save_directive(&role_name, &files))?;
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         match cycle_verify_plan(force_no_verify, baseline.len()) {
             CycleVerifyPlan::Wait => {
-                eprintln!("[cycle 2/5] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
+                eprintln!("[cycle 2/7] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
                 let mut verified = false;
                 while std::time::Instant::now() < deadline {
@@ -17462,18 +17583,18 @@ fn run_cycle_agent(
             }
             CycleVerifyPlan::SkipForced => {
                 eprintln!(
-                    "[cycle 2/5] ⚠ 저장 검증 **생략** (--force-no-verify) — 저장 지시는 주입했지만 \
+                    "[cycle 2/7] ⚠ 저장 검증 **생략** (--force-no-verify) — 저장 지시는 주입했지만 \
                      파일 갱신을 기다리지 않는다. 대상이 저장하지 못한 상태로 clear 될 수 있다."
                 );
             }
             CycleVerifyPlan::SkipNoFiles => {
-                eprintln!("[cycle 2/5] ⚠ 감시 대상 파일 없음 — 검증 생략");
+                eprintln!("[cycle 2/7] ⚠ 감시 대상 파일 없음 — 검증 생략");
             }
         }
 
         // 3) 2-phase handshake — 검증자 부재 시 clear 금지 (soul 규칙)
         if let Some(v) = &verifier {
-            eprintln!("[cycle 3/5] 검증자 '{v}' handshake");
+            eprintln!("[cycle 3/7] 검증자 '{v}' handshake");
             let vr = request("system.resolve_role", json!({"role": v}))
                 .map_err(|e| format!("검증자 '{v}' 부재 — clear 금지 (self-clear 차단): {e}"))?;
             let vsid = vr["surface_id"].as_u64().ok_or("bad verifier resolve")?;
@@ -17523,8 +17644,24 @@ fn run_cycle_agent(
                 None => return Err("검증자 응답 없음 (timeout) — clear 중단".into()),
             }
         } else {
-            eprintln!("[cycle 3/5] (검증자 미지정 — handshake 생략)");
+            eprintln!("[cycle 3/7] (검증자 미지정 — handshake 생략)");
         }
+
+        // 3.5) wait_cycle_target_idle → observe_cycle_target → cycle_target_state(...)로 판정한다.
+        // 저장 지시가 만든 턴까지 끝난 뒤 잰다. CYCLE_TARGET_BUSY_TOKEN(84)·초안(85)은
+        // quiescing·C-u보다 앞에서 거부하고, 재주입 전에도 같은 관측·대기 경로를 쓴다.
+        eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {timeout}s)");
+        wait_cycle_target_idle(
+            sid,
+            marker.as_deref(),
+            placeholder.as_deref(),
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout),
+            "clear 직전",
+        )?;
+        // 사용자 문안 또는 실경로 기본값을 clear 클로저 전에 한 번만 확정한다.
+        let resume_text = resume_text.unwrap_or_else(|| {
+            default_resume_text(&cwd_round, &pack_round, &role_todo, &|p| p.exists())
+        });
 
         // S5(§2.2): clear 직전 대상 surface를 quiescing으로 마킹 → 채널 inbox 주입이 clear·복원
         // 구간 동안 보류된다(C0 배달기가 이 상태를 읽음). autopilot 60% clear가 상시 조건이므로
@@ -17536,76 +17673,113 @@ fn run_cycle_agent(
             .as_ref()
             .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
-        let clear_resume = (|| -> Result<(), String> {
-            // 4) 입력 버퍼 정리 + clear
-            eprintln!("[cycle 4/5] 입력 버퍼 정리 + '{clear}'");
+        let clear_result = (|| -> Result<(), String> {
+            // 5) 입력 버퍼 정리 + clear
+            eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}'");
             request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
             std::thread::sleep(std::time::Duration::from_millis(200));
             request(
                 "surface.send_text",
                 json!({"surface_id": sid, "text": clear, "quiet": true}),
-            )?;
+            )
+            .map_err(|e| {
+                if is_typing_guard_err(&e) {
+                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부: 데몬이 사람 입력을 감지했다({e}) — 초안 소거 금지")
+                } else {
+                    e
+                }
+            })?;
             request(
                 "surface.send_key",
                 json!({"surface_id": sid, "key": "Return"}),
             )?;
-            std::thread::sleep(std::time::Duration::from_secs(4));
 
-            // 5) 디렉티브 재주입 + 재개 포인터
-            eprintln!("[cycle 5/5] 디렉티브 재주입 + 재개 포인터");
-            let directive = compose_directive(&role_name)?;
-            inject_text(sid, &directive)?;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let resume = resume_text.unwrap_or_else(|| {
-                "[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 직전 작업을 이어가라.".into()
-            });
-            inject_text(sid, &resume)?;
-            Ok(())
+            // 6) 실효를 먼저 확인한다. 키 송신만으로는 디렉티브·RESUME 재주입 자격이 없다.
+            let clear_verify_window = clear_verify_secs();
+            eprintln!("[cycle 6/7] clear 실효 확인 (statusline session_file 교체, 최대 {clear_verify_window}s)");
+            let effect = match pre_session_file.as_deref() {
+                None => clear_effect_verdict(None, None),
+                Some(pre) => {
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(clear_verify_window);
+                    loop {
+                        let post = surface_entry(sid)
+                            .ok()
+                            .as_ref()
+                            .and_then(statusline_session_file);
+                        let v = clear_effect_verdict(Some(pre), post.as_deref());
+                        if v == ClearEffect::Verified || std::time::Instant::now() >= deadline {
+                            break v;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                }
+            };
+            match effect {
+                ClearEffect::Verified => {
+                    // 새 세션 프롬프트와 SessionStart 훅이 끝나야 재주입할 수 있다.
+                    wait_cycle_target_idle(
+                        sid,
+                        marker.as_deref(),
+                        placeholder.as_deref(),
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(clear_verify_window),
+                        "재주입 직전",
+                    )?;
+                    eprintln!(
+                        "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
+                        if hooks_inject { "생략(훅이 주입)" } else { "주입" }
+                    );
+                    if !hooks_inject {
+                        inject_text(sid, &compose_directive(&role_name)?)?;
+                    }
+                    let resume = resume_text.as_str();
+                    inject_text(sid, resume)?;
+                    Ok(())
+                }
+                ClearEffect::Unverified => Err(format!(
+                    "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
+                     session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
+                     중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). \
+                     디렉티브·RESUME 을 재주입하지 않았다. 성공으로 읽지 마라"
+                )),
+                ClearEffect::Unmeasurable => {
+                    // statusline 미보고 어댑터는 화면 유휴로 부트 체인을 복원하되 rc81을 유지한다.
+                    match wait_cycle_target_idle(
+                        sid,
+                        marker.as_deref(),
+                        placeholder.as_deref(),
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs(clear_verify_window),
+                        "재주입 직전(측정 불능)",
+                    ) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
+                                if hooks_inject { "생략(훅이 주입)" } else { "주입" }
+                            );
+                            if !hooks_inject {
+                                inject_text(sid, &compose_directive(&role_name)?)?;
+                            }
+                            inject_text(sid, &resume_text)?;
+                            eprintln!("[cycle] 측정 불능 — 화면 유휴 관측 후 재주입은 했다(실효 미확인)");
+                        }
+                        Err(e) => eprintln!("[cycle] 측정 불능 + 재주입 보류: {e}"),
+                    }
+                    Err(format!(
+                        "{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나 실효 측정 불능 — clear 직전 \
+                         statusline session_file 이 없다(statusline 미보고 에이전트 · usage 부재). \
+                         측정 불능은 통과가 아니다"
+                    ))
+                }
+            }
         })();
         // 재개 성공/실패와 무관하게 quiescing 해제 — 실패로 master가 quiescing에 갇혀 채널이
         // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제).
         let _ = set_surface_quiescing(sid, false);
-        clear_resume?;
-        // 6) [결재 7ⓑ] clear 실효 확인 — 키 입력 송신은 행위이고 결과가 아니다.
-        //    session_file 교체가 관측될 때만 exit 0. 미관측·측정 불능은 EXIT_CLEAR_UNVERIFIED.
-        let clear_verify_window = clear_verify_secs();
-        let effect = match pre_session_file.as_deref() {
-            None => clear_effect_verdict(None, None),
-            Some(pre) => {
-                eprintln!("[cycle 6/6] clear 실효 확인 (statusline session_file 교체, 최대 {clear_verify_window}s)");
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(clear_verify_window);
-                loop {
-                    let post = surface_entry(sid)
-                        .ok()
-                        .as_ref()
-                        .and_then(statusline_session_file);
-                    let v = clear_effect_verdict(Some(pre), post.as_deref());
-                    if v == ClearEffect::Verified || std::time::Instant::now() >= deadline {
-                        break v;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-            }
-        };
-        match effect {
-            ClearEffect::Verified => {
-                println!(
-                    "cycle complete → surface:{sid} ({role_name}) · clear 실효 확인(session_file 교체)"
-                );
-                Ok(())
-            }
-            ClearEffect::Unverified => Err(format!(
-                "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
-                 session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
-                 중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). 성공으로 읽지 마라"
-            )),
-            ClearEffect::Unmeasurable => Err(format!(
-                "{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나 실효 측정 불능 — clear 직전 \
-                 statusline session_file 이 없다(statusline 미보고 에이전트 · usage 부재). \
-                 측정 불능은 통과가 아니다"
-            )),
-        }
+        clear_result?;
+        println!("cycle complete → surface:{sid} ({role_name}) · clear 실효 확인(session_file 교체)");
+        Ok(())
     })();
     if let Err(e) = &result {
         eprintln!("error: {e}");
@@ -31439,6 +31613,52 @@ mod tests {
         ] {
             assert_eq!(statusline_session_file(&bad), None, "채택 금지 행: {bad}");
         }
+    }
+
+    #[test]
+    fn d16_hooks_inject_directive_flag_claude_only_and_layered() {
+        let embed: Value = cys::pack::PACK_ALL
+            .iter()
+            .find(|(path, _)| *path == "agents.json")
+            .map(|(_, body)| serde_json::from_str(body).expect("임베드 agents.json 파싱"))
+            .expect("임베드 agents.json 존재");
+        assert_eq!(embed["claude"]["hooks_inject_directive"].as_bool(), Some(true));
+        for (agent, spec) in embed.as_object().expect("어댑터 객체") {
+            if !agent.starts_with('_') && agent != "claude" {
+                assert!(spec.get("hooks_inject_directive").is_none(), "{agent}는 훅 미선언");
+            }
+        }
+        for agent in ["codex", "gemini"] {
+            assert!(embed[agent].is_object(), "{agent} 어댑터 존재");
+            assert!(embed[agent].get("hooks_inject_directive").is_none());
+        }
+        let mut resolved = json!({});
+        fill_missing_fields(&mut resolved, Some(&embed["claude"]));
+        assert_eq!(resolved["hooks_inject_directive"].as_bool(), Some(true));
+        for value in [json!(false), Value::Null] {
+            let mut resolved = json!({"hooks_inject_directive": value});
+            fill_missing_fields(&mut resolved, Some(&embed["claude"]));
+            assert_eq!(resolved["hooks_inject_directive"], value, "사용자 선언 보존");
+        }
+    }
+
+    #[test]
+    fn d16_marker_row_draft_uses_last_row_and_last_marker() {
+        assert!(!marker_row_has_draft("출력만 있음", "❯", None));
+        assert!(!marker_row_has_draft("❯ 옛 초안\n❯ \t\n", "❯", None));
+        assert!(!marker_row_has_draft("❯ 인용 ❯ \t", "❯", None));
+        assert!(marker_row_has_draft("❯ \n❯ 새 초안", "❯", None));
+        assert!(marker_row_has_draft("❯ 1. Yes", "❯", None));
+        assert!(!marker_row_has_draft(
+            "› Ask\tCodex  to do anything  ",
+            "›",
+            Some(" Ask Codex to do anything "),
+        ));
+        assert!(marker_row_has_draft(
+            "› Ask Codex to do anything else",
+            "›",
+            Some("Ask Codex to do anything"),
+        ));
     }
 
     #[test]
