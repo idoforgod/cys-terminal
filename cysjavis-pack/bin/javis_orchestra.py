@@ -86,6 +86,7 @@ import re
 import shutil
 import subprocess
 import sys
+sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 import time
 
 # ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
@@ -1520,8 +1521,22 @@ def cmd_review_prompt(args):
     lines.append("verdict 정본 저장(필수 — 이 경로에 JSON 파일로 저장하라):")
     lines.append("  %s" % _vp)
     lines.append("  · 디렉터리가 없으면 먼저 만들어라: mkdir -p \"%s\"" % os.path.dirname(_vp))
-    lines.append("  · 스키마 = _round/REVIEWER_VERDICT_CONTRACT.md "
-                 "(verdict enum + evidence file:line · score(0-100) 금지).")
+    _contract_path = os.path.join(pack_dir(), "round", "REVIEWER_VERDICT_CONTRACT.md")
+    try:
+        import javis_verdict as _jv
+    except ImportError:
+        lines.append("  · 스키마 = %s (javis_verdict 미적재 — 계약 문서를 열어라)" % _contract_path)
+    else:
+        lines.append("  · 스키마 = %s "
+                     "(verdict enum + evidence file:line · score(0-100) 금지)." % _contract_path)
+        lines.append("  · 최상위 키: %s (필수: %s) · verdict enum: %s · severity: %s · "
+                     "evidence[]: {%s} · issues[]: {%s} · "
+                     "revision: 대상 커밋 해시(선택·리비전 바인딩)"
+                     % (" ".join(_jv.TOP_KEYS), " ".join(_jv.REQUIRED_TOP),
+                        "|".join(_jv.REVIEWER_ENUM), "|".join(_jv.SEVERITY_ENUM),
+                        " ".join(_jv.EVIDENCE_KEYS), " ".join(_jv.ISSUE_CONTRACT)))
+        lines.append("  · 빈 골격(이 형태 그대로 채워라):")
+        lines.append(json.dumps(_jv.skeleton(), ensure_ascii=False))
     lines.append("  · master 의 `javis_orchestra.py round-log --verdict-json <파일>` 은 **이 파일만** "
                  "받는다 — 산문 전사는 거부된다.")
     lines.append("  · 화면 출력·push 본문은 사본이다(pane 폭에서 잘리고 좌석이 정리되면 사라진다). "
@@ -1859,6 +1874,9 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
                      "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
                      "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
                      "`cys todo-path --emit-decl`로 다시 받아라." % why)
+    # ★D-14(2026-09-21 결정 · 코드 변경 0): `--queued` 회신 지시는 배포본 REVIEWER_DIRECTIVE:18-22 ·
+    #   WORKER_DIRECTIVE:136-139 와 정합한다 — 회신 소실의 실제 의존성은 D-04 가 아니라 D-01(master
+    #   좌석 큐 기아)이며, D-01 해소 후 무조치(설계 정본 §5 D-14). soul.md 5항(오너 로컬본)은 별도 규범 결정.
     lines.append("보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master \"[보고] ...\"` "
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
@@ -2633,7 +2651,7 @@ def cmd_round_log(args):
               "전사 금지(MASTER §14·G8). --from-cmd \"<명령>\"을 써라.", file=sys.stderr)
         return 2
     elif std in STAGNATION_REVIEWERS and skip_reason(verdict) is None:
-        # ★G8: 리뷰어 행은 타입 계약(_round/REVIEWER_VERDICT_CONTRACT.md) 강제 —
+        # ★G8: 리뷰어 행은 타입 계약(<pack>/round/REVIEWER_VERDICT_CONTRACT.md) 강제 —
         #   verdict JSON이 javis_verdict 스키마(enum·evidence·score 금지)를 통과할 때만 기록.
         #   산문 전사·스키마 미통과는 거부. SKIP 행("SKIPPED: 사유")은 3-state 게이트 경로라 예외.
         vj = getattr(args, "verdict_json", None)
@@ -4746,7 +4764,7 @@ def cmd_self_test(args):
                      "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
         # ★A8: verdict 파일 정본화 — 저장 지시·경로·파일 실재 성공기준이 항상 주입된다.
-        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "완료 기준(파일 실재)",
+        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "빈 골격", "완료 기준(파일 실재)",
                      "round/_reviews/"):
             assert must in out, "review-prompt에 A8 '%s' 누락" % must
         assert verdict_json_path("T", 2, "reviewer1") in out, "A8 저장 경로 불일치"

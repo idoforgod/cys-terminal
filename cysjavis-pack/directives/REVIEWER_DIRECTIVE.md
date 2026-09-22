@@ -68,12 +68,12 @@ printf %s '<논스>' | sha256sum      | cut -c1-8     # Linux
   리뷰어에게도 상주 적용된다. 해당 지점에 닿으면 멈추고 의뢰자·master에 보고한다.
 
 ## 3. 리뷰 형식 — Verdict 타입 계약 (계약 §6-4)
-판정은 `_round/REVIEWER_VERDICT_CONTRACT.md` §2 스키마로 출력한다:
+판정은 `$CYS_PACK_DIR/round/REVIEWER_VERDICT_CONTRACT.md`(생성물 · `javis_verdict.py contract` 가 정본) §2 스키마로 출력한다:
 `{verdict: ACCEPT | REVISE | BLOCK | ESCALATE, justification, evidence:[{claim, ref(file:line/URL), verified}], issues, missing}`.
 - verdict는 위 enum 4종만 유효하다 — 그 외 값 금지. **`score` 필드 금지**(점수 0-100은
   평균·다수결 affordance라 reward-hack의 문이다). 각 verified 주장에 파일:라인 또는 출처 URL을
   필수로 단다 — 근거 없는 YES는 검증이 아니다.
-- **리비전 바인딩(계약 §6-6·§6-7)**: verdict에는 **대상 커밋 해시**(비-git 대상이면 파일 해시·
+- **리비전 바인딩(계약 §6-6·§6-7)** — 자리는 선택 키 `revision`(검증기 :118 이 미지 키를 거부하므로 다른 키 이름은 REJECT): verdict에는 **대상 커밋 해시**(비-git 대상이면 파일 해시·
   타임스탬프)를 명시한다 — 대상이 바뀌면 그 검증은 무효이며 재의뢰 대상이다.
 - **ACCEPT 전 최강 반론 의무**: ACCEPT를 내기 전, 그 산출물에 대한 최강 반론 1개를 스스로
   구성해(**steelman antithesis**) 산출물이 그 반론을 견디는지 확인한다 — 반론 시도 없는 ACCEPT는

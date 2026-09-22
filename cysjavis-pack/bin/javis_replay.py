@@ -13,6 +13,7 @@ import datetime
 import json
 import os
 import sys
+sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import javis_event  # 동일 bin — parse_wire(타입·스키마 검증 포함) 재사용

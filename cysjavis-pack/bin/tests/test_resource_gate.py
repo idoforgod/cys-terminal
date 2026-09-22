@@ -35,6 +35,33 @@ if BIN not in sys.path:
 import javis_resource_gate as G  # noqa: E402
 
 
+# D-11(2026-09-21) F2: 실측 전체 명령줄 21건을 내장한다. 실행 시 증거 폴더는 읽지 않는다.
+# 개인 홈 경로는 /Users/x 로 정규화한다. 구 패턴 21건 대 신 계수 10건의 음성 대조.
+D11_F2_LINES = [
+    '58171 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service) --type=utility --utility-sub-type=network.mojom.NetworkService --lang=ko --service-sandbox-type=network --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --start-stack-profiler --shared-files --metrics-shmem-handle=1752395122,r,2692751949107476671,12768599372116323540,524288 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708989122997041 --seatbelt-client=36',
+    '58172 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service) --type=utility --utility-sub-type=storage.mojom.StorageService --lang=ko --service-sandbox-type=service --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --shared-files --metrics-shmem-handle=1752395122,r,5061064072548150196,6677807426747994426,524288 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708990060038890 --seatbelt-client=52',
+    '58197 /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server --analytics-default-enabled -c plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true',
+    '58199 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --start-stack-profiler --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=6 --launch-time-ticks=45900323387 --shared-files --metrics-shmem-handle=1752395122,r,16968341938639423066,6728901926046819387,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708991934122588 --seatbelt-client=146',
+    '58200 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=5 --launch-time-ticks=45900334679 --shared-files --metrics-shmem-handle=1752395122,r,5651116702591742481,17260541627774181799,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708990997080739 --seatbelt-client=146',
+    '58624 /Users/x/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService',
+    '58705 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=7 --launch-time-ticks=45908099493 --shared-files --metrics-shmem-handle=1752395122,r,16248302814944454045,2692841612274245482,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708992871164437 --seatbelt-client=219',
+    '58885 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=11 --launch-time-ticks=45911115397 --shared-files --metrics-shmem-handle=1752395122,r,10266836772381096156,9378534240464324199,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708996619331833 --seatbelt-client=226',
+    '58891 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=13 --launch-time-ticks=45911604047 --shared-files --metrics-shmem-handle=1752395122,r,5894132013019612249,6421934102185320443,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190708998493415531 --seatbelt-client=225',
+    '58922 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer --user-data-dir=/Users/x/Library/Application Support/Codex --standard-schemes=app,codex-sandbox --service-worker-schemes=codex-sandbox --secure-schemes=app,codex-sandbox --fetch-schemes=app,codex-sandbox --cors-schemes=codex-sandbox --streaming-schemes=app,codex-sandbox --owl-scoped-user-agent-additional-hosts=openai.com,chatgpt.com,chatgpt.site,chatgpt-team.site --owl-scoped-user-agent-prefix=CodexBrowser --disable-blink-features=ReplacedNormalFlowStackingInlinePaint --lang=ko --num-raster-threads=4 --enable-zero-copy --enable-gpu-memory-buffer-compositor-resources --enable-main-frame-before-activation --renderer-client-id=16 --launch-time-ticks=45912443463 --shared-files --metrics-shmem-handle=1752395122,r,16430811254882961904,7082447478479555967,1572864 --field-trial-handle=1718379636,r,12616881777964394902,13567951743176239646,262144 --enable-features=ReportStuckThrottle --disable-features=DropInputEventsWhilePaintHolding,WebUIOmniboxAimPopup,WebUIOmniboxPopup --variations-seed-version --pseudonymization-salt-handle=1935764596,r,6590047335584864123,2365698758266915550,4 --trace-process-track-uuid=3190709001304541078 --seatbelt-client=225',
+    '60758 /Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host',
+    '42792 /Users/x/.local/bin/claude --dangerously-skip-permissions',
+    '37787 claude --dangerously-skip-permissions',
+    '46773 /Users/x/.local/bin/agy --dangerously-skip-permissions',
+    '67471 claude --dangerously-skip-permissions --remote-control dept1-master',
+    '47782 node /Users/x/.local/bin/codex --dangerously-bypass-approvals-and-sandbox',
+    '40958 claude --dangerously-skip-permissions',
+    '80600 /Users/x/.local/bin/agy --dangerously-skip-permissions',
+    '34703 claude --dangerously-skip-permissions',
+    '79459 claude --dangerously-skip-permissions',
+    '82450 node /Users/x/.local/bin/codex --dangerously-bypass-approvals-and-sandbox',
+]
+
+
 def make_args(**over):
     """cmd_check가 받는 argparse Namespace의 테스트 대역 — 기본값은 argparse 정의와 동일."""
     a = types.SimpleNamespace(
@@ -569,25 +596,109 @@ class TestClaudeArgvForms(unittest.TestCase):
         self.assertEqual(G._count_matching(lines, G.NODE_PATTERNS, G.NODE_EXCLUDE_PATTERNS), 1)
 
     def test_versioned_binary_path_not_counted_characterization(self):
-        # ★특성화(characterization) 핀 — 의도 선언이 아니라 현행 동작의 기록.
-        # 형태3: argv0 이 버전 경로(`.../claude/versions/2.1.259 -p`) — 'claude' 뒤가 '/' 라
-        # 현행 NODE_PATTERNS[0] `claude(\s|$)` 에 매칭되지 않아 **계수 0** 이다.
-        # SURVEY F-a 4: 이 설치 형태는 실물 부재로 라이브 판정 불능(측정불능) · SURVEY B6-2/DESIGN A1:
-        # NODE_PATTERNS 는 이번 라운드 **무수정 결정**(라이브 과대계수 0 실측 · 패턴 확장은 오너 결정).
-        # 장래 패턴을 바꿔 이 형태를 계수하게 되면 이 핀을 **의도적으로** 1 로 갱신해야 한다(무언 변경 차단).
+        # D-11(2026-09-21) 로 버전경로 계수 편입 — 구 패턴 특성화에서 신 계수 계약으로 전환.
         lines = ["  302 /Users/x/.local/share/claude/versions/2.1.259 -p"]
-        self.assertEqual(G._count_matching(lines, G.NODE_PATTERNS, G.NODE_EXCLUDE_PATTERNS), 0)
+        self.assertTrue(callable(getattr(G, "_count_nodes", None)), "D11: _count_nodes 미구현")
+        self.assertEqual(G._count_nodes(lines), 1)
 
     def test_bare_claude_positive_control(self):
         lines = ["  303 claude --dangerously-skip-permissions"]
         self.assertEqual(G._count_matching(lines, G.NODE_PATTERNS, G.NODE_EXCLUDE_PATTERNS), 1)
 
     def test_three_forms_together(self):
-        # 형태1 + 형태3 + 맨 claude → 2 (형태3 만 빠짐 — 위 특성화 핀과 정합).
+        # D-11(2026-09-21) 로 버전경로 계수 편입 — 형태1 + 형태3 + 맨 claude 모두 계수 3.
         lines = ["  301 /Users/x/.local/bin/claude --flag",
                  "  302 /Users/x/.local/share/claude/versions/2.1.259 -p",
                  "  303 claude --dangerously-skip-permissions"]
-        self.assertEqual(G._count_matching(lines, G.NODE_PATTERNS, G.NODE_EXCLUDE_PATTERNS), 2)
+        self.assertTrue(callable(getattr(G, "_count_nodes", None)), "D11: _count_nodes 미구현")
+        self.assertEqual(G._count_nodes(lines), 3)
+
+
+class TestD11NodeAndServerAxes(unittest.TestCase):
+    """D-11: 함대 실행 주체·앱 번들 제외 규칙을 노드와 서버 소비 경로까지 고정한다."""
+
+    def _count_nodes(self, lines):
+        # 신 API 부재는 명시적 RED로 남기되 다른 검체의 실행은 계속한다.
+        self.assertTrue(callable(getattr(G, "_count_nodes", None)), "D11: _count_nodes 미구현")
+        return G._count_nodes(lines)
+
+    @staticmethod
+    def _server_lines():
+        # 실측 2026-09-21: 앱 내부 node 5건 + 일반 node 서버 1건(양성 대조).
+        return [
+            "  %d /Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node ./server.mjs" % pid
+            for pid in range(800, 805)
+        ] + ["  900 node ./server.mjs"]
+
+    def test_D11_node_owners_contract(self):
+        self.assertEqual(getattr(G, "NODE_OWNERS", None),
+                         frozenset({"claude", "agy", "codex", "gemini"}),
+                         "D11: CPU 함대와 구별되는 노드 소유자 4종")
+
+    def test_D11_node_procs_api(self):
+        self.assertTrue(callable(getattr(G, "_node_procs", None)), "D11: _node_procs 미구현")
+
+    def test_D11_F2_legacy_negative_control_counts_21(self):
+        self.assertEqual(len(D11_F2_LINES), 21, "D11-F2: 원본 21줄 보존")
+        self.assertEqual(G._count_matching(D11_F2_LINES, G.NODE_PATTERNS,
+                                         G.NODE_EXCLUDE_PATTERNS), 21,
+                         "D11-F2: 구 계수 21을 재현해야 유효한 음성 대조다")
+
+    def test_D11_F2_count_nodes_is_10(self):
+        self.assertEqual(self._count_nodes(D11_F2_LINES), 10,
+                         "D11-F2: 앱 프로세스 11건을 제외한 노드 10건")
+
+    def test_D11_single_command_controls(self):
+        cases = [
+            ("cysd", "/Applications/cys.app/Contents/MacOS/cysd", 0),
+            ("grep", "grep claude", 0),
+            ("tail", "tail -f /x/claude-code/debug.log", 0),
+            ("claude_version", "/Users/x/.local/share/claude/versions/2.1.261 --dangerously-skip-permissions", 1),
+            ("claude_app", "/Applications/Claude.app/Contents/MacOS/Claude", 0),
+            ("app_codex", "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server", 0),
+            ("code_mode_host", "/Applications/ChatGPT.app/Contents/Resources/codex-code-mode-host", 0),
+            ("renderer", "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/153.0.8010.48/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer", 0),
+            ("computer_use", "/Users/x/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService", 0),
+            ("codex_wrapper", "node /Users/x/.local/bin/codex --dangerously-bypass-approvals-and-sandbox", 1),
+            ("agy", "/Users/x/.local/bin/agy --dangerously-skip-permissions", 1),
+            ("claude", "claude --dangerously-skip-permissions", 1),
+            ("python_argument", "python3 /tmp/agy/report.py", 0),
+        ]
+        for name, cmd, expected in cases:
+            with self.subTest(D11=name, cmd=cmd):
+                self.assertEqual(self._count_nodes(["  700 " + cmd]), expected)
+
+    def test_D11_codex_wrapper_native_pair_is_one(self):
+        lines = ["  101 node /usr/local/bin/codex serve",
+                 "  102 /Users/x/.codex/bin/codex-darwin-arm64 --child"]
+        self.assertEqual(self._count_nodes(lines), 1, "D11: NODE_EXCLUDE_PATTERNS 유지")
+
+    def test_D11_gate_self_exclusion_is_preserved(self):
+        self.assertEqual(self._count_nodes(["  701 claude javis_resource_gate check"]), 0,
+                         "D11: 명령줄의 javis_resource_gate 자기제외 관례 유지")
+
+    def test_D11_app_bundle_servers_excluded(self):
+        procs = G._server_procs(self._server_lines(), collapse=False)
+        self.assertEqual([pid for pid, _cmd in procs], [900],
+                         "D11: 앱 내부 node 서버 5건 제외·일반 node 서버 보존")
+
+    def test_D11_classify_uses_new_nodes_and_servers(self):
+        with tempfile.TemporaryDirectory(prefix="d11-classify-") as pack:
+            env = os.environ.copy()
+            env["CYS_PACK_DIR"] = pack
+            cp = subprocess.run([sys.executable, os.path.join(BIN, "javis_resource_gate.py"),
+                                 "classify"], input="\n".join(D11_F2_LINES + self._server_lines()),
+                                text=True, capture_output=True, env=env, timeout=15)
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(json.loads(cp.stdout), {"servers": 1, "nodes": 10},
+                         "D11: classify 소비 경로도 앱 번들을 제외해야 한다")
+
+    def test_D11_measure_uses_new_nodes(self):
+        a = make_args(nodes_override=None, servers_override=0, load_override=0.0)
+        with mock.patch.object(G, "_ps_lines", return_value=D11_F2_LINES), \
+                mock.patch.object(G, "_dept_roster", return_value=roster()):
+            m = G.measure(a)
+        self.assertEqual(m["nodes"], 10, "D11-F2: measure 노드 소비 경로 교체")
 
 
 if __name__ == "__main__":

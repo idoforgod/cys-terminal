@@ -53,6 +53,8 @@ census 정의(CEO 승인 · 표는 전부 grep 실측값으로 고정 — 추정
           인자에 "py" 또는 줄에 "python" · `//` 줄 제외 · vendor/target 제외 · ASCII 소문자화)을 **그대로
           미러**해 {cys.rs 1 · boot_supervisor 1 · cysd/main 2 · tauri/main 4} 를 2언어로 핀 — cargo 를
           안 도는 레인에서도 같은 값이 같은 순간에 깨진다.
+     (iv) SEAL-1 층4 — bin/*.py 직속 파일의 첫 형제 import 앞에 `sys.dont_write_bytecode = True`
+          필수. 외부 호출자의 환경과 무관하게 팩 내부 캐시 쓰기를 막는다(+ 소비 파일 하한 30).
 
 종료 코드(run_bootstrap_health 규약과 동형): 0 = 전부 측정·통과(말미 `PYSEAL-CENSUS-OK`) ·
 1 = FAIL 1건 이상 · 2 = UNMEASURED(레포 루트에 src/lib.rs 부재 = 팩 단독 설치 — **측정 불능은 통과가
@@ -485,6 +487,41 @@ def check_rust_spawn():
                                 "(한쪽만 올리면 2언어 미러가 깨진 채 초록/적색이 갈린다)"))
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⓒ(iv) SEAL-1 층4 — 팩 밖 호출자의 환경과 무관하게 첫 형제 import 전에 캐시 쓰기 차단
+# ═══════════════════════════════════════════════════════════════════════════
+SIBLING_IMPORT_RE = re.compile(
+    r'^\s*(?:import|from)\s+javis_\w+|import_module\(\s*["\']javis_|spec_from_file_location\(')
+SEAL4_ASSIGN_RE = re.compile(r'^\s*sys\.dont_write_bytecode\s*=\s*True\s*(?:#.*)?$')
+SEAL4_CONSUMER_FLOOR = 30  # 2026-09-21 실측 33 — 술어 붕괴로 소비 파일이 0이 되는 공허 통과 차단
+
+
+def check_seal4():
+    bin_dir = os.path.join(ROOT, "cysjavis-pack", "bin")
+    if not os.path.isdir(bin_dir):
+        check("ⓒ(iv) SEAL-1 층4 bin 디렉토리", False,
+              "%s 부재 — 측정 불능은 통과가 아니다" % bin_dir)
+        return
+    consumers, unsealed = [], []
+    # 직속 *.py 만 순회하므로 tests/ 와 그 아래 검체는 소비 파일에 들어가지 않는다.
+    for name in sorted(os.listdir(bin_dir), key=str):
+        path = os.path.join(bin_dir, name)
+        if not name.endswith(".py") or not os.path.isfile(path):
+            continue
+        code = _code_lines(_read_text(path), "#")
+        first_import = next((i for i, line in code if SIBLING_IMPORT_RE.search(line)), None)
+        if first_import is None:
+            continue
+        consumers.append(name)
+        if not any(i < first_import and SEAL4_ASSIGN_RE.match(line) for i, line in code):
+            unsealed.append("%s:%d" % (name, first_import))
+    check("ⓒ(iv) SEAL-1 층4 소비 파일 하한 %d" % SEAL4_CONSUMER_FLOOR,
+          len(consumers) >= SEAL4_CONSUMER_FLOOR, "실측 %d" % len(consumers))
+    check("ⓒ(iv) SEAL-1 층4 첫 형제 import 전 봉인", not unsealed,
+          "소비 파일 %d · 위반 %d %s — 행번호는 첫 형제 import 위치" % (
+              len(consumers), len(unsealed), unsealed))
+
+
 def main():
     lib_rs = os.path.join(ROOT, "src", "lib.rs")
     if not os.path.isfile(lib_rs):
@@ -497,6 +534,7 @@ def main():
     check_hooks()
     check_bin()
     check_rust_spawn()
+    check_seal4()
     if fails:
         print("FAILED %d: %s" % (len(fails), "; ".join(fails)))
         return 1

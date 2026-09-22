@@ -79,7 +79,7 @@ orchestrate)는 vibecoding 파이프라인 **안에서 호출**된다. 트리거
 - **계획 리뷰 게이트는 필수 통과 관문이다.** 문서 세트(특히 spec·plan)가 완성되면 구현 위임 **전**에
   이종모델(agy·codex) 리뷰 라운드를 돌린다(§6 오케스트레이션). 리뷰 프롬프트에 엄격 제약(지정 파일만·
   무관 파일 배회 금지)을 강제한다.
-- 리뷰 verdict는 `_round/REVIEWER_VERDICT_CONTRACT.md` 타입(ACCEPT|REVISE|BLOCK|ESCALATE +
+- 리뷰 verdict는 `$CYS_PACK_DIR/round/REVIEWER_VERDICT_CONTRACT.md` 타입(ACCEPT|REVISE|BLOCK|ESCALATE +
   evidence:file:line)으로 받는다. score(0-100) 금지.
 - 계획 리뷰를 통과하지 못하면 구현에 **착수하지 않는다**. 이 게이트가 스코프 크립(헌법 5조)의
   1차 차단선이다.

@@ -17,6 +17,7 @@ fix 없는 BLOCK)을 exit-code로 차단한다. `javis_orchestra round-log --fro
 
 사용:
     python3 javis_verdict.py validate <FILE> [--json] [--lenient-issues]
+    python3 javis_verdict.py contract             # 상수에서 리뷰어 타입 계약 생성
     python3 javis_verdict.py --self-test          # 결정론 자기검증 (preflight C36)
 종료 코드: 0 계약 준수+비차단 · 1 스키마 위반 또는 차단 CHAI lint · 2 인자/입출력/JSON 파싱 오류
 의존성: 파이썬 표준 라이브러리만 (jsonschema 미사용·hand-roll·네트워크·LLM 없음·점수 미생성).
@@ -38,7 +39,7 @@ import sys
 _INLINE = {
     "VERDICT_ENUM": ["ACCEPT", "REVISE", "BLOCK", "ESCALATE", "INVESTIGATE"],
     "SEVERITY_ENUM": ["blocking", "major", "minor"],
-    "TOP_KEYS": ["verdict", "justification", "evidence", "issues", "missing"],
+    "TOP_KEYS": ["verdict", "justification", "evidence", "issues", "missing", "revision"],
     "REQUIRED_TOP": ["verdict", "justification", "evidence", "issues"],
     "EVIDENCE_KEYS": ["claim", "ref", "verified"],
     "ISSUE_CONTRACT": ["severity", "where", "what", "fix"],
@@ -70,15 +71,20 @@ def _load_consts():
         with open(_schema_path(), encoding="utf-8") as f:
             s = json.load(f)
         vals = {k: tuple(s[k]) for k in _INLINE}  # 모든 키 존재 필수 — 누락 시 KeyError→폴백
+        vals["REVIEWER_ENUM"] = tuple(s.get(
+            "reviewer_enum", [v for v in vals["VERDICT_ENUM"] if v != "INVESTIGATE"]))
         SCHEMA_LOADED = True
         return vals
     except (OSError, ValueError, KeyError, TypeError):
         SCHEMA_LOADED = False
-        return {k: tuple(v) for k, v in _INLINE.items()}
+        vals = {k: tuple(v) for k, v in _INLINE.items()}
+        vals["REVIEWER_ENUM"] = tuple(v for v in vals["VERDICT_ENUM"] if v != "INVESTIGATE")
+        return vals
 
 
 _C = _load_consts()
 VERDICT_ENUM = _C["VERDICT_ENUM"]
+REVIEWER_ENUM = _C["REVIEWER_ENUM"]
 SEVERITY_ENUM = _C["SEVERITY_ENUM"]
 TOP_KEYS = _C["TOP_KEYS"]
 REQUIRED_TOP = _C["REQUIRED_TOP"]
@@ -86,6 +92,77 @@ EVIDENCE_KEYS = _C["EVIDENCE_KEYS"]
 ISSUE_CONTRACT = _C["ISSUE_CONTRACT"]
 ISSUE_DRIFT = _C["ISSUE_DRIFT"]
 SCORE_KEY_RE = re.compile(r"score|grade|rating", re.I)
+
+
+def skeleton() -> dict:
+    """상수의 키를 그대로 노출하는 작성 골격 — 값 힌트는 제출 전에 채워야 한다."""
+    hints = {"verdict": "|".join(REVIEWER_ENUM), "severity": "|".join(SEVERITY_ENUM),
+             "ref": "file:line", "where": "file:line", "verified": False}
+
+    def value(key):
+        if key == "evidence":
+            return [{k: hints.get(k, "") for k in EVIDENCE_KEYS}]
+        if key == "issues":
+            return [{k: hints.get(k, "") for k in ISSUE_CONTRACT}]
+        if key == "missing":
+            return []
+        return hints.get(key, "")
+
+    return {key: value(key) for key in TOP_KEYS}
+
+
+def contract_markdown() -> str:
+    """검증기 상수에서 결정론으로 생성하는 동봉 리뷰어 계약(끝 개행 1개)."""
+    lines = [
+        "# REVIEWER_VERDICT_CONTRACT — 리뷰어 verdict 타입 계약(생성물 · 손편집 금지)",
+        "",
+        "생성 명령: `python3 javis_verdict.py contract`",
+        "",
+        "## §1 점수 금지",
+        "",
+        "어느 깊이든 점수류 키는 금지한다. SCORE_KEY_RE 패턴: `%s` (대소문자 무시)."
+        % SCORE_KEY_RE.pattern,
+        "score(0-100) 금지 · 0-1 점수도 금지한다.",
+        "",
+        "## §2 스키마",
+        "",
+        "| 최상위 키 | 필수 여부 | 설명 |",
+        "| --- | --- | --- |",
+    ]
+    for key in TOP_KEYS:
+        description = ("대상 커밋 해시(비-git 대상이면 파일 해시·타임스탬프) · "
+                       "REVIEWER_DIRECTIVE §3 리비전 바인딩"
+                       if key == "revision" else "")
+        lines.append("| `%s` | %s | %s |"
+                     % (key, "필수" if key in REQUIRED_TOP else "선택", description))
+    lines.extend([
+        "",
+        "리뷰어 verdict enum: `%s`" % " | ".join(REVIEWER_ENUM),
+        "",
+        "INVESTIGATE 는 검증기(CHAI R2) 전용이다. 실행가능 fix 없는 BLOCK/REVISE의 강등값이다.",
+        "",
+        "severity enum: `%s`" % " | ".join(SEVERITY_ENUM),
+        "",
+        "evidence[] 키: `{%s}` · ref는 file:line 근거를 기록한다." % ",".join(EVIDENCE_KEYS),
+        "",
+        "issues[] 계약 형태: `{%s}`" % ",".join(ISSUE_CONTRACT),
+        "",
+        "드리프트 형태 `{%s}`는 `--lenient-issues`에서만 수용한다. "
+        "fix가 없으면 CHAI R2가 발화한다." % ",".join(ISSUE_DRIFT),
+        "",
+        "## §3 빈 JSON 골격",
+        "",
+        "값 힌트를 실제 판정으로 채운다. 선택 키는 사용하지 않으면 생략한다.",
+        "",
+        "```json",
+        json.dumps(skeleton(), ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## §4 검증",
+        "",
+        "`javis_verdict.py validate <파일>`",
+    ])
+    return "\n".join(lines) + "\n"
 
 
 def assert_no_score(obj, path="$"):
@@ -132,6 +209,10 @@ def validate_verdict(obj, lenient=False):
     # justification
     if "justification" in obj and not str(obj.get("justification") or "").strip():
         schema_errors.append("justification 비어 있음")
+
+    # 선택 리비전 바인딩 — 제출했다면 대상 식별자를 채워야 한다.
+    if "revision" in obj and not str(obj["revision"]).strip():
+        schema_errors.append("revision 비어 있음 — 대상 커밋 해시(또는 파일 해시·타임스탬프)")
 
     # evidence[] — 각 항목 claim/ref/verified, ref 필수(R1)
     ev = obj.get("evidence")
@@ -253,6 +334,13 @@ def self_test():
 
     # 정상(계약 형태) → 통과
     check("happy", _v(), want_ok=True, want_verdict_out="ACCEPT")
+    # 골격의 키 집합은 스키마에서 파생한다(값은 작성 힌트라 검증 통과 대상 아님).
+    if set(skeleton()) != set(TOP_KEYS):
+        failures.append("skeleton 키 집합이 TOP_KEYS와 다름")
+    check("revision-present", _v(revision="3acb4c9d"), want_ok=True)
+    check("revision-empty", _v(revision=""), want_ok=False, want_schema_substr="revision 비어 있음")
+    check("revision-whitespace", _v(revision=" \t"), want_ok=False, want_schema_substr="revision 비어 있음")
+    check("revision-absent", _v(), want_ok=True)
     # 점수 금지: 최상위 score
     check("score-top", _v(score=87), want_ok=False, want_schema_substr="점수류 키")
     # 점수 금지: 중첩 score(재귀)
@@ -318,12 +406,16 @@ def main():
     v.add_argument("--lenient-issues", action="store_true",
                    help="드리프트 issues{severity,ref,issue} 수용(단 fix 없어 R2 발화)")
     v.add_argument("--json", action="store_true")
+    sub.add_parser("contract", help="상수에서 리뷰어 verdict 타입 계약 마크다운 생성")
 
     args = ap.parse_args()
     if args.self_test:
         return self_test()
     if args.cmd == "validate":
         return cmd_validate(args.file, args.lenient_issues, args.json)
+    if args.cmd == "contract":
+        print(contract_markdown(), end="")
+        return 0
     ap.print_help()
     return 2
 
