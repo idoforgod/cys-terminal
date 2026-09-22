@@ -4078,6 +4078,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             ),
                         )
                     };
+                    // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                    let (pending_input_human_bytes, input_paste_open) = {
+                        let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                        (input.human, input.in_paste)
+                    };
                     json!({
                         "surface_id": s.id,
                         "surface_ref": surface_ref(s.id),
@@ -4089,6 +4094,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pid": s.pid,
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                         // ★SEAT: 좌석 점유 사실(occupied|empty|unknown) — watchdog 캐시 소비(키 추가만).
                         // pack(phoenix)·CLI(restore)는 이 값을 **소비만** 한다. 각자 판정을 구현하면
                         // 판정 이원화로 오늘의 결함(빈 좌석을 생존으로 오인)이 다른 얼굴로 재발한다.
@@ -7072,6 +7080,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             ),
                         )
                     };
+                    // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                    let (pending_input_human_bytes, input_paste_open) = {
+                        let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                        (input.human, input.in_paste)
+                    };
                     json!({
                         "surface_id": s.id,
                         "surface_ref": surface_ref(s.id),
@@ -7083,6 +7096,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
                         "queue_paused": queue_paused,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                         "agent": agent,
                         "agent_alive": agent_alive,
                         // ★SEAT: phoenix·restore 가 '살아있음'과 '좌석에 누가 앉아 있음'을 구분하는 근거.
@@ -7823,6 +7839,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     Some((why, at)) => (json!(why), json!(at)),
                     None => (Value::Null, Value::Null),
                 };
+                // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
+                let (pending_input_human_bytes, input_paste_open) = {
+                    let input = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+                    (input.human, input.in_paste)
+                };
                 let q = s.pending_queue.lock().unwrap();
                 for (i, e) in q.iter().enumerate() {
                     // ★G1(W2-B): 기존 키 불변 + additive — 운영자가 강제 배달(queue.deliver)
@@ -7836,6 +7857,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "age_secs": (now - e.enqueued_at).max(0.0) as u64,
                         "from": e.from, "origin": e.origin,
                         "blocked_by": blocked_by, "blocked_since": blocked_since,
+                        "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                        "pending_input_human_bytes": pending_input_human_bytes,
+                        "input_paste_open": input_paste_open,
                     });
                     if full {
                         row["text"] = json!(e.text);
@@ -7857,6 +7881,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "paused_total_secs": e.paused_total_secs as u64,
                             "revived_at": e.revived_at,
                             "blocked_by": Value::Null, "blocked_since": Value::Null,
+                            "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
+                            "pending_input_human_bytes": pending_input_human_bytes,
+                            "input_paste_open": input_paste_open,
                         });
                         if full {
                             row["text"] = json!(e.text);
@@ -7895,6 +7922,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap_or(Value::Null),
                     "from": it.get("from").cloned().unwrap_or(Value::Null),
                     "origin": it.get("origin").cloned().unwrap_or(Value::Null),
+                    "pending_input_bytes": Value::Null,
+                    "pending_input_human_bytes": Value::Null,
+                    "input_paste_open": Value::Null,
                 });
                 if full {
                     row["text"] = json!(text);
@@ -7929,6 +7959,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "origin": it.get("origin").cloned().unwrap_or(Value::Null),
                         "expired_at": it.get("expired_at").cloned().unwrap_or(Value::Null),
                         "ttl_secs": it.get("ttl_secs").cloned().unwrap_or(Value::Null),
+                        "pending_input_bytes": Value::Null,
+                        "pending_input_human_bytes": Value::Null,
+                        "input_paste_open": Value::Null,
                     });
                     if full {
                         row["text"] = json!(text);
@@ -16837,6 +16870,98 @@ mod tests {
         assert_eq!(after, 1, "이관 0건이면 이벤트도 없다");
     }
 
+    /// ★(0.14.39 · WP-C-input) 입력 진단 필드는 기존 큐 행에 가산된다.
+    #[test]
+    fn queue_list_exposes_pending_input_bytes_additive() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("pending-input-list", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_480_u32;
+        let s = v7_pane(&daemon, "worker", pid);
+        assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
+        let Reply::Single(enqueued) = dispatch(
+            &daemon,
+            Request {
+                id: json!(1),
+                method: "surface.send_text".into(),
+                params: json!({"surface_id": s.id, "text": "queued body", "queued": true}),
+            },
+            None,
+        ) else {
+            panic!("expected single enqueue reply");
+        };
+        assert_eq!(enqueued["ok"], json!(true), "enqueue 실패: {enqueued}");
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request {
+                id: json!(2),
+                method: "queue.list".into(),
+                params: json!({"surface_id": s.id}),
+            },
+            None,
+        ) else {
+            panic!("expected single queue.list reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "queue.list 실패: {resp}");
+        let entries = resp["result"]["entries"].as_array().expect("entries 배열");
+        assert_eq!(entries.len(), 1, "enqueue한 활성 행이 있어야 한다");
+        let row = &entries[0];
+        assert_eq!(row["surface_id"], json!(s.id));
+        assert_eq!(row["pending_input_bytes"], json!(3));
+        assert_eq!(row["pending_input_human_bytes"], json!(3));
+        assert_eq!(row["input_paste_open"], json!(false));
+        for key in ["blocked_by", "preview", "id"] {
+            assert!(row.get(key).is_some(), "기존 키 {key} 결손");
+        }
+        assert_eq!(row["preview"], json!("queued body"));
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn org_status_and_surface_list_expose_pending_input_bytes() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("pending-input-status", r#"{ "default": "allow", "rules": [] }"#);
+        let pid = 999_481_u32;
+        let s = v7_pane(&daemon, "worker", pid);
+        assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
+        let mut observed = Vec::new();
+        for method in ["org.status", "surface.list"] {
+            let Reply::Single(resp) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: method.into(), params: json!({}) },
+                None,
+            ) else {
+                panic!("expected single reply for {method}");
+            };
+            assert_eq!(resp["ok"], json!(true), "{method} 실패: {resp}");
+            let row = resp["result"]["surfaces"]
+                .as_array()
+                .expect("surfaces 배열")
+                .iter()
+                .find(|row| row["surface_id"] == json!(s.id))
+                .expect("해당 surface 항목");
+            let values: Vec<Value> = ["pending_input_bytes", "pending_input_human_bytes", "input_paste_open"]
+                .iter()
+                .map(|key| row.get(*key).unwrap_or_else(|| panic!("{method} {key} 결손")).clone())
+                .collect();
+            assert_eq!(values, vec![json!(3), json!(3), json!(false)], "{method}");
+            observed.push(values);
+        }
+        assert_eq!(observed[0], observed[1], "두 RPC의 키·의미 동형성");
+        {
+            let mut child = s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★G1(W2-C) 비타입 감사 지점 ④ 핀 — queue.list의 restored 행도 라이브 행과 동일한
     /// 신규 열(id/seq/enqueued_at/age_secs/from/origin)을 노출한다. restored_queue는
     /// serde_json::Value 경로라 **컴파일러가 결손을 못 잡는다** — 이 핀이 유일한 강제다.
@@ -16860,11 +16985,16 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            dir.join("queue-expired.json"),
+            r#"[{"id":"qx.2","surface_id":13,"role":"w2c-expired","text":"만료 복원 본문","expired_at":1.0,"ttl_secs":10}]"#,
+        )
+        .unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
         let req = Request {
             id: json!(1),
             method: "queue.list".into(),
-            params: json!({}),
+            params: json!({"include_expired": true}),
         };
         let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
@@ -16887,6 +17017,12 @@ mod tests {
         assert!((49..=120).contains(&age), "age_secs ≈ 50 (실측 {age})");
         assert_eq!(row["from"], json!("surface:2"));
         assert_eq!(row["origin"], json!("send"));
+        assert_eq!(entries.len(), 2, "활성·만료 복원 행 모두 노출");
+        for row in entries {
+            for key in ["pending_input_bytes", "pending_input_human_bytes", "input_paste_open"] {
+                assert_eq!(row.get(key), Some(&Value::Null), "restored 행 {key}는 명시적 null");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19539,6 +19675,8 @@ mod tests {
         let sid = make_surface(&daemon, Some("worker"));
         let s = daemon.get_surface(sid).expect("surface 조회");
         let active = daemon.next_queue_entry("활성".into(), None, "send");
+        s.apply_pending_input(b"abc", crate::governance::InputOrigin::Human);
+        s.pending_input.lock().unwrap().in_paste = true;
         let mut expired = daemon.next_queue_entry("만료".into(), None, "send");
         expired.expired_at = Some(crate::state::now_epoch());
         expired.ttl_secs = Some(10);
@@ -19572,6 +19710,11 @@ mod tests {
                 "활성 행에 만료 표식 금지"
             );
             assert_eq!(live["index"], json!(0), "활성 큐 인덱스 유지");
+            for row in rows {
+                assert_eq!(row["pending_input_bytes"], json!(3));
+                assert_eq!(row["pending_input_human_bytes"], json!(3));
+                assert_eq!(row["input_paste_open"], json!(true));
+            }
             if expected_len == 2 {
                 let row = rows
                     .iter()

@@ -1488,6 +1488,8 @@ impl Surface {
     ) -> crate::governance::PendingInputState {
         let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
+        // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — human 은 D-12 Return 게이트 축이라 stale 하면 자기 본문 제출이 거부된다.
+        st.human = st.human.min(st.count);
         let next = crate::governance::pending_input_step(&st, chunk, origin, std::time::Instant::now());
         *st = next.clone();
         drop(st);
@@ -8021,6 +8023,33 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("cysd.sock")
+    }
+
+    #[test]
+    fn wp5_stale_pending_input_human_is_clamped_after_count_only_reset() {
+        use crate::governance::InputOrigin;
+
+        let sock = isolated_sock("wp5-stale-pending-human");
+        let daemon = Daemon::new(sock.clone());
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("surface 생성");
+        {
+            let _gate = s.input_gate.lock().unwrap_or_else(|e| e.into_inner());
+            let human = s.apply_pending_input(b"abc", InputOrigin::Human);
+            assert_eq!((human.count, human.human), (3, 3));
+
+            // 큐 Inject·롤백처럼 미러의 count 만 초기화한 뒤 Machine 입력을 적용한다.
+            s.set_pending_input(0);
+            let machine = s.apply_pending_input(b"x", InputOrigin::Machine);
+            assert_eq!((machine.count, machine.human), (1, 0));
+            assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 1);
+            let stored = s.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!((stored.count, stored.human), (1, 0));
+        }
+        crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose)
+            .expect("surface 종료 및 자식 프로세스 회수");
+        std::fs::remove_dir_all(sock.parent().unwrap()).expect("테스트 상태 디렉터리 정리");
     }
 
     fn sample_feed_item(id: &str, body: String) -> FeedItem {
