@@ -5872,7 +5872,14 @@ def h_pred_9():
     #   갱신한다(항 삭제 0 — 위 3키 조건은 그대로 남아 있다).
     for k in ("prompt_marker", "composer_placeholder"):
         need('"%s"' % k in seg, "계층 대상에 %s 누락 — 신 키가 기존 설치본에 도달하지 않는다" % k)
-    need("LAYERED_KEYS: [&str; 5]" in seg, "계층 대상 개수가 5가 아니다")
+    # ★(0.14.39 · D-16 · 핀 이사 계약 ①②) 5키 → **6키**. `hooks_inject_directive` 는 SessionStart 훅이
+    #   매 세션 시작마다 디렉티브를 주입하는 어댑터 표지이고, cycle-agent 가 그 값을 보고 clear 뒤
+    #   재주입을 생략한다(이중 주입 차단). 기존 설치본의 agents.json 은 사용자 소유라 이 신규 키가
+    #   디스크에 없다 — 계층에 없으면 그 기계에서 **영원히** false 로 읽혀 매 사이클 이중 주입이다.
+    #   개수 핀은 **조여지는 방향**으로만 갱신한다(위 5키 조건은 한 항도 삭제하지 않았다).
+    need('"hooks_inject_directive"' in seg,
+         "계층 대상에 hooks_inject_directive 누락 — 훅 주입 표지가 기존 설치본에 도달하지 않는다(D-16 이중 주입)")
+    need("LAYERED_KEYS: [&str; 6]" in seg, "계층 대상 개수가 6이 아니다")
     need("resolved.get(k).is_some()" in seg,
          "디스크 선언(명시 null 포함) 존중 규칙 부재 — 사용자 주권 침해")
     # 고지 규율: 신규 키는 **조용히** 채운다. 매 기존 기계에서 매번 결손이라 안내가 소음이 되고,
@@ -6018,7 +6025,8 @@ def h_deliver_1():
     need("cys::first_run_gates::ADAPTER_KEY" in cli,
          "LAYERED_KEYS 에 신규 키가 없다 — 봉투가 구 기계에 도달하지 않는다")
     # ★(0.14.31 · 리뷰 R7) 3키 → 5키(`prompt_marker`·`composer_placeholder` 편입 — H-PRED-9 와 같은 근거).
-    need("LAYERED_KEYS: [&str; 5]" in cli, "계층 대상이 5키가 아니다")
+    # ★(0.14.39 · D-16) 5키 → 6키(`hooks_inject_directive` 편입 — 같은 배달 근거 · H-PRED-9 주석 참조).
+    need("LAYERED_KEYS: [&str; 6]" in cli, "계층 대상이 6키가 아니다")
 
     # ⓒ 봉투가 임베드 팩에 실재하고 **코퍼스 사본이 아니다**(S-1 재발 차단).
     aj = json.loads(_read(os.path.join(PACK_DIR, "agents.json")))

@@ -178,7 +178,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(85 의 타이핑 가드 거부 경로는 C-u 1키가 선행할 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
+    /// 84·85 는 clear 송신 0건 비파괴 보류(85 의 타이핑 가드 거부 경로는 C-u 1키가 선행할 수 있고, Return 거부 시 clear 본문만 composer에 남아 다음 재시도의 C-u가 정리한다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     CycleAgent {
         #[arg(long)]
@@ -1105,10 +1105,15 @@ struct CycleTargetObservation {
     quiet_secs_reported: Option<bool>,
 }
 
+/// ★(0.14.39 통합 · D-04 ⇄ D-16 병합면) `marker` 는 **후보 목록**이다 — WP-F(D-04)가
+/// `prompt_marker` 를 목록 허용으로 바꿔 `composer_marker_of` 가 `Vec<String>` 을 낸다.
+/// 한 프레임의 화면을 들고 `pick_marker_for_screen`(가장 뒤 후보 → 없으면 첫 후보)으로 해소한다 —
+/// 기동 경로(`gate_carry_ok` 호출부)와 **같은 해소기**를 쓴다(판정 이원화 금지). 후보가 비었거나
+/// 화면을 못 읽었으면 None 이고, 그때의 거동은 종전(마커 없음 = quiet 축)과 같다.
 fn cycle_target_observation(
     screen: Result<Value, String>,
     entry: Result<Value, String>,
-    marker: Option<&str>,
+    marker: &[String],
     placeholder: Option<&str>,
 ) -> CycleTargetObservation {
     let mut failures = Vec::new();
@@ -1127,12 +1132,15 @@ fn cycle_target_observation(
         }
     };
     let quiet_secs_reported = screen.as_ref().map(|r| r.get("quiet_secs").is_some());
+    let screen_text = screen.as_ref().and_then(|r| r["text"].as_str());
+    let resolved_marker =
+        screen_text.and_then(|text| cys::agent_markers::pick_marker_for_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
-        screen: screen.as_ref().and_then(|r| r["text"].as_str()),
+        screen: screen_text,
         quiet: cys::readiness::idle_quiet_from(
             screen.as_ref().and_then(|r| r["quiet_secs"].as_f64()),
         ),
-        marker,
+        marker: resolved_marker,
         placeholder,
         pending_bytes: entry.as_ref().and_then(|r| r["pending_input_bytes"].as_u64()),
         human_bytes: entry
@@ -1155,7 +1163,7 @@ fn cycle_target_observation(
 /// 화면·정적 축 1회와 입력 버퍼 메타 1회로 대상 상태와 관측 메타를 얻는다.
 fn observe_cycle_target(
     sid: u64,
-    marker: Option<&str>,
+    marker: &[String],
     placeholder: Option<&str>,
 ) -> CycleTargetObservation {
     let screen = request("surface.read_text", json!({"surface_id": sid}));
@@ -1195,7 +1203,7 @@ fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> 
 /// 2초마다 유휴를 관측하되 사람 초안은 즉시 거부한다(마지막 대기는 남은 예산 이내).
 fn wait_cycle_target_idle(
     sid: u64,
-    marker: Option<&str>,
+    marker: &[String],
     placeholder: Option<&str>,
     deadline: std::time::Instant,
     stage: &str,
@@ -17722,7 +17730,8 @@ fn run_cycle_agent(
                     .to_string()
             }
         };
-        let marker = spec.as_ref().and_then(composer_marker_of);
+        // ★(0.14.39 통합) D-04 목록 허용과 합류 — 후보 목록을 그대로 들고 다니며 프레임마다 해소한다.
+        let marker = spec.as_ref().map(composer_marker_of).unwrap_or_default();
         let placeholder = spec.as_ref().and_then(composer_placeholder_of);
         let hooks_inject = spec
             .as_ref()
@@ -17905,7 +17914,7 @@ fn run_cycle_agent(
         eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {timeout}s)");
         wait_cycle_target_idle(
             sid,
-            marker.as_deref(),
+            &marker,
             placeholder.as_deref(),
             std::time::Instant::now() + std::time::Duration::from_secs(timeout),
             "clear 직전",
@@ -17934,8 +17943,15 @@ fn run_cycle_agent(
                 "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
                 allow_at.elapsed().as_secs_f64()
             );
+            request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))
+                .map_err(|e| {
+                    if is_typing_guard_err(&e) {
+                        format!("{CYCLE_HUMAN_DRAFT_TOKEN} 입력 버퍼 정리 거부(송신 0건): 데몬이 사람 초안을 감지했다({e}) — 소거 0 · 초안을 제출·삭제한 뒤 해당 단계만 재시도")
+                    } else {
+                        e
+                    }
+                })?;
             eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}'");
-            request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
             std::thread::sleep(std::time::Duration::from_millis(200));
             request(
                 "surface.send_text",
@@ -17951,7 +17967,14 @@ fn run_cycle_agent(
             request(
                 "surface.send_key",
                 json!({"surface_id": sid, "key": "Return"}),
-            )?;
+            )
+            .map_err(|e| {
+                if is_typing_guard_err(&e) {
+                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 제출 거부: 데몬이 사람 초안을 감지했다({e}) — clear 본문('{clear}')은 composer에 들어갔지만 제출되지 않았다 · 손으로 다시 clear 하지 마라 · 남은 clear 본문은 다음 재시도의 C-u가 지운다")
+                } else {
+                    e
+                }
+            })?;
 
             // 6) 실효를 먼저 확인한다. 키 송신만으로는 디렉티브·RESUME 재주입 자격이 없다.
             let clear_verify_window = clear_verify_secs();
@@ -17979,7 +18002,7 @@ fn run_cycle_agent(
                     // 새 세션 프롬프트와 SessionStart 훅이 끝나야 재주입할 수 있다.
                     match wait_cycle_target_idle(
                         sid,
-                        marker.as_deref(),
+                        &marker,
                         placeholder.as_deref(),
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
@@ -18016,7 +18039,7 @@ fn run_cycle_agent(
                     // statusline 미보고 어댑터는 화면 유휴로 부트 체인을 복원하되 rc81을 유지한다.
                     match wait_cycle_target_idle(
                         sid,
-                        marker.as_deref(),
+                        &marker,
                         placeholder.as_deref(),
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
@@ -32169,7 +32192,11 @@ mod tests {
         }
 
         let body = strip_line_comments(refl_fn_body(production, "run_cycle_agent"));
+        // C-u 자체의 거부는 송신 0건이다. 선행 송신 문면은 clear 본문 거부 분기에서 잰다.
         let refusal = body
+            .split_once("\"text\": clear")
+            .expect("clear 본문 송신 없음")
+            .1
             .split_once("if is_typing_guard_err(&e) {")
             .expect("typing_guard 거부 분기 없음")
             .1
@@ -32302,7 +32329,7 @@ mod tests {
         let observed = cycle_target_observation(
             Err("읽기 RPC: surface:7 이미 종료됨".into()),
             Err("목록 RPC: connection reset".into()),
-            None,
+            &[],
             None,
         );
         assert_eq!(observed.state, CycleTargetState::Busy);
@@ -32313,7 +32340,7 @@ mod tests {
         let observed = cycle_target_observation(
             Ok(json!({"text": "유휴 화면", "quiet_secs": 5.0})),
             Err("입력 버퍼 관측 실패".into()),
-            None,
+            &[],
             None,
         );
         assert_eq!(observed.state, CycleTargetState::Busy, "입력 버퍼 미관측은 유휴가 아니다");
@@ -32326,13 +32353,13 @@ mod tests {
         let buffer_draft = cycle_target_observation(
             Err("화면 RPC 실패".into()),
             Ok(json!({"pending_input_human_bytes": 3})),
-            Some("❯"),
+            &["❯".to_string()],
             None,
         );
         let screen_draft = cycle_target_observation(
             Ok(json!({"text": "❯ 사람이 치던 초안\n", "quiet_secs": 5.0})),
             Err("입력 버퍼 RPC 실패".into()),
-            Some("❯"),
+            &["❯".to_string()],
             None,
         );
         for observed in [buffer_draft, screen_draft] {
@@ -32354,7 +32381,7 @@ mod tests {
             (json!({"text": "출력", "quiet_secs": 0.0}), true),
             (json!({"text": "출력", "quiet_secs": null}), true),
         ] {
-            let observed = cycle_target_observation(Ok(screen), Ok(json!({})), None, None);
+            let observed = cycle_target_observation(Ok(screen), Ok(json!({})), &[], None);
             assert_eq!(observed.quiet_secs_reported, Some(want));
             assert!(observed.failure.is_none());
         }
@@ -32572,6 +32599,63 @@ mod tests {
         obs.marker = Some("›");
         obs.placeholder = Some("Ask Codex to do anything");
         assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
+    }
+
+    /// 주석·다른 단계의 토큰으로 거짓 통과하지 않도록 clear 클로저의 송신 구간만 뽑는다.
+    fn d16_clear_stage_source() -> String {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        body.split_once("let clear_result = (|| -> Result<(), String> {")
+            .expect("clear 클로저 없음").1
+            .split_once("let clear_verify_window =")
+            .expect("clear 실효 확인 경계 없음").0
+            .to_string()
+    }
+
+    /// 해당 키의 request부터 첫 오류 전파까지 한정해 send_text의 매핑을 잘못 세지 않는다.
+    fn d16_clear_key_request_source(key: &str) -> String {
+        let body = d16_clear_stage_source();
+        let key_at = body.find(&format!("\"key\": \"{key}\"")).expect("키 송신 없음");
+        let start = body[..key_at].rfind("request(").expect("키 요청 없음");
+        let end = key_at + body[key_at..].find("?;").expect("키 오류 전파 없음") + 2;
+        body[start..end].chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn d16_clear_cu_refusal_folds_to_human_draft() {
+        // 4→5단계 사이 사람 입력을 C-u가 거부하면 rc1 대신 rc85로 재시도해야 한다.
+        let call = d16_clear_key_request_source("C-u");
+        assert!(call.starts_with("request(\"surface.send_key\","), "C-u 요청 배선 없음");
+        assert!(
+            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
+            "C-u 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
+        );
+        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+    }
+
+    #[test]
+    fn d16_clear_submit_refusal_folds_to_human_draft() {
+        // 본문만 composer에 들어간 뒤 Return이 거부되어도 clear 미제출 보류다.
+        let call = d16_clear_key_request_source("Return");
+        assert!(call.starts_with("request(\"surface.send_key\","), "Return 요청 배선 없음");
+        assert!(
+            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
+            "Return 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
+        );
+        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+    }
+
+    #[test]
+    fn d16_keys_sent_marker_only_after_cu_success() {
+        // autopilot이 송신 0건을 1건으로 기록하지 않도록 C-u의 성공 경계 뒤에 찍는다.
+        let body = d16_clear_stage_source();
+        let cu = body.find("\"key\": \"C-u\"").expect("C-u 송신 없음");
+        let done = cu + body[cu..].find("?;").expect("C-u 오류 전파 없음") + 2;
+        let marker = body.find("eprintln!(\"[cycle 5/7] 입력 버퍼 정리 + '")
+            .expect("키 송신 마커 출력 없음");
+        assert!(done < marker, "키 송신 마커가 C-u 성공 전에 출력된다");
+        for literal in ["C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '"] {
+            assert!(!body[..done].contains(literal), "C-u 거부 경로에 키 송신 마커가 있다: {literal}");
+        }
     }
 
     #[test]

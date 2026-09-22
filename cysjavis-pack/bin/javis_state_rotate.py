@@ -58,6 +58,10 @@ def plan_keep(text, target):
     return kept
 
 
+# 사본 스테이징 접두 — 유일 tmp(mkstemp) 규약의 이름표. 자기검증 ⑥이 이 접두로 사본 단계를 잡는다.
+ARCHIVE_TMP_PREFIX = ".rot-arch-"
+
+
 def rotate(path, target=DEFAULT_TARGET, archive_dir=None, dry_run=False, now=None):
     """→ (exit_code, 메시지, 정보dict). 파일을 건드리는 유일한 경로."""
     if not os.path.isfile(path):
@@ -80,7 +84,12 @@ def rotate(path, target=DEFAULT_TARGET, archive_dir=None, dry_run=False, now=Non
             "size_before": size0, "size_after": kept_b, "archive": apath}
     os.makedirs(adir, exist_ok=True)
     # ① 사본 → ② 사본 무결 확인
-    tmp_a = apath + ".tmp"
+    # ★(0.14.39 통합) 종전 고정 이름 `apath + ".tmp"` 은 **공유 스테이징**이었다 — 같은 초에 두
+    #   회전기가 돌면(스케줄 잡 ∥ 사람) 같은 파일에 함께 써서 사본이 교차 파손되고, os.replace 의
+    #   원자성은 '발행'만 지켜 주지 그 스테이징을 지켜 주지 않는다. 아래 ④ 원자 교체가 이미
+    #   mkstemp 를 쓰던 것과 같은 규약으로 맞춘다(검체 H-CONC-3 · 팩 전수 census).
+    fd_a, tmp_a = tempfile.mkstemp(dir=adir, prefix=ARCHIVE_TMP_PREFIX)
+    os.close(fd_a)
     shutil.copyfile(path, tmp_a)
     if sha256(tmp_a) != h1:
         os.unlink(tmp_a)
@@ -137,9 +146,9 @@ def _self_test():
     open(p2, "w", encoding="utf-8").write(head + body)
     orig_sha = sha256
 
-    def racing_sha(path):                    # 사본 무결 확인(=.tmp 읽기) 직후에 원본을 키운다 →
+    def racing_sha(path):                    # 사본 무결 확인(=스테이징 사본 읽기) 직후에 원본을 키운다 →
         r = orig_sha(path)                   #   다음 호출인 '자르기 직전 재확인'이 변경을 봐야 한다
-        if str(path).endswith(".tmp"):
+        if os.path.basename(str(path)).startswith(ARCHIVE_TMP_PREFIX):
             with open(p2, "a", encoding="utf-8") as f:
                 f.write("남이 그 사이에 쓴 줄\n")
         return r
