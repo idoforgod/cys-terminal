@@ -75,6 +75,8 @@ pub fn pick_marker_last<'a>(cands: &'a [String], text: &str) -> Option<&'a str> 
 
 /// 화면용 해소: 가장 뒤 후보 → 없으면 첫 후보. 선언된 마커가 안 보여도 마커 좌석 등급을
 /// 유지하여 보류하고 quiet 폴백으로 내려가지 않는다.
+/// 데몬의 마지막 폴백은 이 함수를 유지한다. 관문 이월·사이클 판정은
+/// [`pick_marker_leading_on_screen`] 을 쓴다 — 출력·푸터의 비선두 글리프를 composer 로 읽지 않는다.
 pub fn pick_marker_for_screen<'a>(cands: &'a [String], text: &str) -> Option<&'a str> {
     pick_marker_last(cands, text).or_else(|| cands.first().map(String::as_str))
 }

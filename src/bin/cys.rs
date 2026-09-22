@@ -1052,6 +1052,9 @@ struct CycleTargetObs<'a> {
     human_bytes: Option<u64>,
 }
 
+/// 사이클 유휴 판정 — 계수된 미제출 입력·composer 행의 초안을 먼저 보호한다.
+/// 마커가 해소되면 빈 편집 영역의 화면 증거나 권위 계수 두 축의 명시적 0 보고에 출력 정적을 AND 한다.
+/// 계수 미보고는 0 보고가 아니다. 이 소비처의 추가 유휴 근거는 stale pending 리셋과 공유하지 않는다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     if o.human_bytes.unwrap_or(0) > 0 || o.pending_bytes.unwrap_or(0) > 0 {
         return CycleTargetState::HumanDraft;
@@ -1073,7 +1076,20 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
             CycleTargetState::Busy
         };
     }
-    if cys::readiness::composer_edit_region_empty(screen, marker, o.placeholder)
+    // ★(0.14.39 · 성찰2 major ②) 권위 계수가 **두 축 모두 0 을 보고**했고(= 이 데몬은 사람 축을
+    //   낼 수 있으며 이 좌석엔 계수된 미제출 입력이 없다) 출력이 정적이며 composer **행**에 문면이
+    //   없으면 유휴다. 엄격판(`composer_edit_region_empty`)은 stale 리셋용이라 마커 아래에 꼬리가
+    //   있으면 입력 상자 경계·상태줄 등의 증거를 요구한다. 그 증거 없는 문법 미등재 푸터
+    //   (`‹ prev » next` · `[main] ~/dev/x > 62% ctx`)는 유휴 프레임에서도 거짓이 되어 해당 좌석의
+    //   clear 가 영구 미발동했다(RED #4·#5 · ANCHOR ② 무clear). 엄격판 자체는 느슨하게 하지 않는다.
+    //   구 데몬(human 미보고 = None)은 이 추가 분기에 오지 않는다 — 종전 보수 판정 그대로다.
+    // 【실패 방향】 계수가 0 인데 화면 **아래 행**에만 미계수 초안이 있고 composer 행은 비어 있는
+    //   프레임(커서 Home 멀티라인)은 유휴로 열리는 잔여다. composer **행**의 초안은 위
+    //   `marker_row_has_draft` 가, 사람 축이 1바이트라도 계수되면 첫 분기가 계속 잡는다.
+    //   반대편의 확정 피해(문법 미등재 푸터 좌석의 영구 무clear)가 더 크다는 판단이다.
+    let counts_report_no_draft = o.pending_bytes == Some(0) && o.human_bytes == Some(0);
+    if (cys::readiness::composer_edit_region_empty(screen, marker, o.placeholder)
+        || counts_report_no_draft)
         && o.quiet == Some(true)
     {
         CycleTargetState::Idle
@@ -1082,15 +1098,19 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     }
 }
 
-/// 마지막 마커 행의 마지막 마커 뒤에 초안이 있는가(공백 정규화한 플레이스홀더는 제외).
+/// 마지막 **선두 후보 행**의 선두 마커 뒤에 초안이 있는가(공백 정규화한 플레이스홀더는 제외).
+/// 출력·푸터의 비선두 글리프는 행 후보가 아니고, 초안 안의 재출현 글리프는 초안 문면이다.
 /// 선택 커서 행(`❯ 1. Yes`)도 초안으로 읽힌다 — 귀결이 clear 보류(비파괴)라 받아들인다.
 fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
     let lines: Vec<&str> = screen.lines().collect();
-    let Some(row) = lines.iter().rposition(|line| line.contains(marker)) else {
+    let Some(row) = lines
+        .iter()
+        .rposition(|line| cys::agent_markers::leading_marker_index(marker, line).is_some())
+    else {
         return false;
     };
     let line = lines[row];
-    let Some(pos) = line.rfind(marker) else {
+    let Some(pos) = cys::agent_markers::leading_marker_index(marker, line) else {
         return false;
     };
     let tail = line[pos + marker.len()..].trim();
@@ -1107,9 +1127,9 @@ struct CycleTargetObservation {
 
 /// ★(0.14.39 통합 · D-04 ⇄ D-16 병합면) `marker` 는 **후보 목록**이다 — WP-F(D-04)가
 /// `prompt_marker` 를 목록 허용으로 바꿔 `composer_marker_of` 가 `Vec<String>` 을 낸다.
-/// 한 프레임의 화면을 들고 `pick_marker_for_screen`(가장 뒤 후보 → 없으면 첫 후보)으로 해소한다 —
+/// 한 프레임의 화면을 들고 `pick_marker_leading_on_screen`(마지막 선두 후보 행 → 없으면 None)으로 해소한다 —
 /// 기동 경로(`gate_carry_ok` 호출부)와 **같은 해소기**를 쓴다(판정 이원화 금지). 후보가 비었거나
-/// 화면을 못 읽었으면 None 이고, 그때의 거동은 종전(마커 없음 = quiet 축)과 같다.
+/// 선두 후보 행이 없으면 마커 없음 = quiet 축이다. 화면 관측 실패로 유휴를 선언하지 않는다.
 fn cycle_target_observation(
     screen: Result<Value, String>,
     entry: Result<Value, String>,
@@ -1134,7 +1154,7 @@ fn cycle_target_observation(
     let quiet_secs_reported = screen.as_ref().map(|r| r.get("quiet_secs").is_some());
     let screen_text = screen.as_ref().and_then(|r| r["text"].as_str());
     let resolved_marker =
-        screen_text.and_then(|text| cys::agent_markers::pick_marker_for_screen(marker, text));
+        screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
         screen: screen_text,
         quiet: cys::readiness::idle_quiet_from(
@@ -13170,7 +13190,7 @@ fn boot_agent_on_surface(
                 let carry_ok = gate_carry_ok(
                     gate_evidence_seen,
                     readiness_v1,
-                    cys::agent_markers::pick_marker_for_screen(&composer_marker, text),
+                    cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, text),
                     composer_placeholder.as_deref(),
                     text,
                     obs.idle_quiet,
@@ -13798,7 +13818,7 @@ fn gate_pending_reobserve_once(sid: u64, agent: &str, marked_gate: Option<&str>)
         gate_pending_recheck(cys::readiness::judge(&obs)),
         gate_mark_saw_a_gate(marked_gate),
         cys::readiness::legacy_v1(),
-        cys::agent_markers::pick_marker_for_screen(&composer_marker, &screen),
+        cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, &screen),
         composer_placeholder.as_deref(),
         &screen,
         idle_quiet,
@@ -32050,10 +32070,12 @@ mod tests {
     }
 
     #[test]
-    fn d16_marker_row_draft_uses_last_row_and_last_marker() {
+    fn d16_marker_row_draft_uses_last_row_and_leading_marker() {
         assert!(!marker_row_has_draft("출력만 있음", "❯", None));
         assert!(!marker_row_has_draft("❯ 옛 초안\n❯ \t\n", "❯", None));
-        assert!(!marker_row_has_draft("❯ 인용 ❯ \t", "❯", None));
+        // ★(0.14.39 · 성찰2 blocking ①) 종전 마지막 글리프 기준은 초안 속 `❯` 뒤 공백만 보고
+        //   빈 composer 로 오인했다. 선두 뒤 `인용 ❯` 는 사람 초안이므로 true 로 조인다(clear 보류).
+        assert!(marker_row_has_draft("❯ 인용 ❯ \t", "❯", None));
         assert!(marker_row_has_draft("❯ \n❯ 새 초안", "❯", None));
         assert!(marker_row_has_draft("❯ 1. Yes", "❯", None));
         assert!(!marker_row_has_draft(
@@ -32661,6 +32683,42 @@ mod tests {
             );
             assert_eq!(observed.state, expected_state, "{name}: 관측 경로도 같은 해소기를 쓴다");
             assert!(observed.failure.is_none(), "{name}: 합성 관측은 성공 응답이다");
+        }
+    }
+
+    /// ★성찰2 ②: 미등재 푸터의 유휴 허용은 명시적 0/0 보고와 정적 출력에만 연다.
+    /// 같은 화면을 stale 리셋용 엄격판까지 열거나, 구 데몬의 미보고를 0 으로 간주하면 안 된다.
+    #[test]
+    fn r1_cycle_footer_idle_requires_reported_zero_counts_and_quiet() {
+        for screen in ["› \n‹ prev » next\n", "> \n[main] ~/dev/x > 62% ctx\n"] {
+            let marker = if screen.starts_with('›') { "›" } else { ">" };
+            assert!(
+                !cys::readiness::composer_edit_region_empty(screen, marker, None),
+                "계수에 의한 사이클 유휴 허용이 stale 리셋의 화면 증거를 열면 안 된다",
+            );
+            for (pending_bytes, human_bytes, quiet, expected) in [
+                (Some(0), Some(0), Some(true), CycleTargetState::Idle),
+                (Some(0), None, Some(true), CycleTargetState::Busy),
+                (None, Some(0), Some(true), CycleTargetState::Busy),
+                (None, None, Some(true), CycleTargetState::Busy),
+                (Some(0), Some(0), Some(false), CycleTargetState::Busy),
+                (Some(0), Some(0), None, CycleTargetState::Busy),
+                (Some(1), Some(0), Some(true), CycleTargetState::HumanDraft),
+                (Some(0), Some(1), Some(true), CycleTargetState::HumanDraft),
+            ] {
+                assert_eq!(
+                    cycle_target_state(&CycleTargetObs {
+                        screen: Some(screen),
+                        quiet,
+                        marker: Some(marker),
+                        placeholder: None,
+                        pending_bytes,
+                        human_bytes,
+                    }),
+                    expected,
+                    "{screen:?}: pending={pending_bytes:?}, human={human_bytes:?}, quiet={quiet:?}",
+                );
+            }
         }
     }
 

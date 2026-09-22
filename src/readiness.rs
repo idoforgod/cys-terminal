@@ -471,7 +471,7 @@ fn marker_of<'a>(o: &Observed<'a>) -> Option<&'a str> {
 //
 // 【생애 창】 부트(`Site::Boot`)에서는 **상수로 열려 있다**(관문 축과 같은 근거 — 미탐 = 관문에 주입).
 // 재주입(`Site::Reinject`)에서는 **전경 판정**으로만 닫힌다: 축 ② 모달 문면 전량이 마커보다 앞(역사)
-// ∧ 축 ①' 마커의 마지막 출현 **줄**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고 그 아래 꼬리가
+// ∧ 축 ①' 마커의 마지막 **선두 후보 행**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고 그 아래 꼬리가
 // 입력 상자·상태줄 레이아웃이다([`waiting_prompt_with_harmless_trailer`] · 리뷰 R1). 관문 축
 // (`gate_block_left_behind`)의 축 ①은 "마커 뒤 화면 전체가 공백" 인데, 라이브 claude 2.1.261 그리드는
 // 입력 상자 **아래**에 상태줄을 그리므로(실측 2026-09-06 10:18) 그 축은 라이브 좌석에서 영영 닫히지
@@ -1231,7 +1231,7 @@ fn modal_left_behind(sig: &ModalSignature, screen: &str, marker: Option<&str>) -
     if sig.flat_end > marker_last {
         return false;
     }
-    // 축 ①' — 마커의 마지막 출현 줄이 빈 대기 프롬프트이고, 그 아래 꼬리가 무해한 레이아웃이다.
+    // 축 ①' — 마커의 마지막 선두 후보 행이 빈 대기 프롬프트이고, 그 아래 꼬리가 무해한 레이아웃이다.
     waiting_prompt_with_harmless_trailer(screen, m)
 }
 
@@ -1266,7 +1266,7 @@ fn is_numbered_item_row(line: &str) -> bool {
     rest.starts_with('.') && rest[1..].chars().next().is_none_or(|c| c == ' ')
 }
 
-/// 마커의 마지막 출현 **줄**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고, 그 아래 꼬리가 **입력
+/// 마커의 마지막 **선두 후보 행**이 빈 대기 프롬프트(마커 뒤 그 줄에 공백만)이고, 그 아래 꼬리가 **입력
 /// 상자·상태줄 레이아웃**인가(리뷰 R1 · 축 ①').
 ///
 /// 꼬리(마커 줄 아래의 비공백 줄들)의 판정:
@@ -1276,7 +1276,7 @@ fn is_numbered_item_row(line: &str) -> bool {
 ///     [`PROMPT_TRAILER_TOKENS`] 상태줄 어휘가 있다(2.1.241 `? for shortcuts` · 2.1.261 `⏵⏵ bypass
 ///     permissions on (shift+tab to cycle)`). 증거가 없으면 **닫지 않는다** — 빈 `❯` 줄 아래의 정체
 ///     모를 본문은 모달의 일부일 수 있다(빈 텍스트 입력 필드 · 그리는 중인 프레임).
-/// 마커가 화면에 없거나 줄 단위로 찾을 수 없으면(마커가 줄을 넘어 접힘) 참을 주장하지 않는다.
+/// 선두 후보 행이 없거나 마커를 줄 단위로 찾을 수 없으면(마커가 줄을 넘어 접힘) 참을 주장하지 않는다.
 fn waiting_prompt_with_harmless_trailer(screen: &str, marker: &str) -> bool {
     match scan_composer(screen, marker, None) {
         Some(sc) => sc.trailer_empty || sc.strong,
@@ -1607,7 +1607,7 @@ fn status_row_bound_to_composer(lines: &[&str], li: usize) -> bool {
     false
 }
 
-/// 한 화면의 composer 레이아웃 관측(판정은 소비처가 한다). `None` = 마커 부재 · 마커 줄에 문면 ·
+/// 한 화면의 composer 레이아웃 관측(판정은 소비처가 한다). `None` = 선두 후보 행 부재 · 마커 줄에 문면 ·
 /// 꼬리에 모달 형상(= 이 화면은 대기 프롬프트가 아니다).
 struct ComposerScan {
     /// 마커 줄 아래에 비공백 줄이 하나도 없다(vt100 후행 개행 절단 포함).
@@ -1618,11 +1618,17 @@ struct ComposerScan {
     weak: bool,
 }
 
+/// ★(0.14.39 · 성찰2 blocking ①) 공백을 걷은 뒤 마커로 **시작하는 마지막 행**을 관측한다.
+/// 종전 `contains` 는 출력의 `cat a > b`·푸터의 `‹ prev » next` 를 composer 행으로 골랐다.
+/// 마커 위치도 그 행의 선두 하나다 — 초안 안에서 다시 친 마커 뒤만 보면 앞 문면을 놓친다.
+/// 꼬리·강약 증거의 구조는 그대로 둔다 — 선두 후보 행만으로 강한 증거를 세우지 않는다.
 fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Option<ComposerScan> {
     let lines: Vec<&str> = screen.lines().collect();
-    let li = lines.iter().rposition(|l| l.contains(marker))?;
+    let li = lines
+        .iter()
+        .rposition(|l| crate::agent_markers::leading_marker_index(marker, l).is_some())?;
     let line = lines[li];
-    let mi = line.rfind(marker)?;
+    let mi = crate::agent_markers::leading_marker_index(marker, line)?;
     let rest = &line[mi + marker.len()..];
     // ★(리뷰 R2(R7회차)) 어댑터 플레이스홀더는 '빈 입력줄' 이고 **약한** 레이아웃 증거다.
     let placeholder_ok = placeholder
@@ -1659,11 +1665,16 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
     }
     // ★(0.14.31 · 리뷰 R1(R6회차) · claude 적대) 선택 커서 배제는 리터럴 `❯` 하나로 고정돼 있었다 —
     //   `prompt_marker` 가 `›`(codex)·`>`(gemini)인 어댑터에서는 꼬리의 선택기 행이 걸러지지 않았다.
-    //   **어댑터 마커도 함께** 본다(조여지는 방향 · claude 는 두 값이 같아 거동 불변).
-    if trailer
-        .iter()
-        .any(|l| l.contains('❯') || l.contains(marker) || is_numbered_item_row(l))
-    {
+    //   **어댑터 마커도 함께** 본다.
+    // ★(0.14.39 · 성찰2 blocking ①) 어댑터 마커 재출현은 **선두 후보 행**으로 좁힌다 — 푸터의
+    //   비선두 글리프는 선택 커서가 아니다. 리터럴 `❯` 의 contains 는 그대로 둔다: claude 는
+    //   marker=="❯" 이므로 이 배제식이 종전과 동등하고, 행 선택에서 건너뛴 아래쪽 비선두 `❯` 도
+    //   여기서 계속 None 으로 닫힌다. 위쪽 재출현 배제도 같은 대칭을 지킨다.
+    if trailer.iter().any(|l| {
+        l.contains('❯')
+            || crate::agent_markers::leading_marker_index(marker, l).is_some()
+            || is_numbered_item_row(l)
+    }) {
         return None;
     }
     // ★(0.14.31 · 리뷰 R2 · codex blocking) **첫 비공백 줄**이 경계여야 강한 증거다. 종전에는
@@ -1684,7 +1695,8 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
 }
 
 /// ★(0.14.31 · 성찰 R2 · blocking) **변이 A 차단** — [`scan_composer`] 가 `rposition` 으로 고른
-/// 마커 줄이 진짜 composer 행인가, 아니면 **초안 안에 붙여넣은 셸 전사**의 프롬프트 줄인가.
+/// 마지막 선두 후보 행이 진짜 composer 행인가, 아니면 **초안 안에 붙여넣은 셸 전사**의
+/// 프롬프트 줄인가.
 ///
 /// 【무엇이 틀렸었나】 마커 줄 해소가 "마커를 담은 **마지막** 줄" 하나였다. 사람이 셸 전사를
 /// 붙여넣으면(끝 줄이 빈 프롬프트 `  ❯ `) 그 줄이 선택되고, 그 아래는 진짜 입력 상자 괘선·상태줄
@@ -1692,8 +1704,10 @@ fn scan_composer(screen: &str, marker: &str, placeholder: Option<&str>) -> Optio
 /// (`pending_input_bytes` 소거 → 큐 본문이 사람 초안과 한 줄로 합쳐 제출).
 ///
 /// 【장치】 고른 줄에서 **위로** 올라가며 훑는다. 괘선(입력 상자 테두리)에서 멎고, 그 전에
-/// **마커를 담은 줄**이 또 있으면 고른 줄은 이 composer 의 행이 아니다(진짜 composer 행이 위에
-/// 있고, 고른 것은 그 안의 초안이다).
+/// **선두 후보 행**이 또 있으면 고른 줄은 이 composer 의 행이 아니다(진짜 composer 행이 위에
+/// 있고, 고른 것은 그 안의 초안이다). ★(0.14.39 · 성찰2 blocking ①) 비선두 어댑터 마커는
+/// `cat a > b` 같은 출력일 수 있어 재출현으로 세지 않는다. 리터럴 `❯` 는 위치와 무관하게
+/// 계속 배제한다 — claude 의 배제식은 종전과 동등하며, 꼬리 배제와 같은 대칭을 지킨다.
 ///
 /// ★(0.14.31 · 성찰 확인 · blocking) **빈 줄은 블록의 끝이 아니다.** 종전에는 빈 줄에서도 멎고
 /// 참을 돌려줬다 — 그러면 **문단이 둘 이상인 붙여넣기 초안**이 이 방어를 통째로 무력화한다:
@@ -1716,7 +1730,7 @@ fn marker_row_is_composer_row(lines: &[&str], li: usize, marker: &str) -> bool {
         if is_rule_line(l) {
             return true; // 입력 상자 테두리 — 그 위는 이 상자 밖이다
         }
-        if l.contains(marker) || l.contains('❯') {
+        if crate::agent_markers::leading_marker_index(marker, l).is_some() || l.contains('❯') {
             return false; // 같은 상자 안에 마커 줄이 또 있다 = 고른 줄은 초안 안이다
         }
     }
