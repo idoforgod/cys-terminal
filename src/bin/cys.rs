@@ -1047,6 +1047,8 @@ enum CycleTargetState {
 struct CycleTargetObs<'a> {
     screen: Option<&'a str>,
     quiet: Option<bool>,
+    /// 이 프레임에 첫기동 관문·모달이 서 있는가 — 참이면 어떤 축으로도 유휴를 선언하지 않는다.
+    gate_or_modal: bool,
     marker: Option<&'a str>,
     placeholder: Option<&'a str>,
     pending_bytes: Option<u64>,
@@ -1056,6 +1058,10 @@ struct CycleTargetObs<'a> {
 /// 사이클 유휴 판정 — 사람 초안은 보호하고, 사람 축이 명시적 0 인 기계 잔여는 별도로 분류한다.
 /// 마커가 해소되면 빈 편집 영역의 화면 증거나 권위 계수 두 축의 명시적 0 보고에 출력 정적을 AND 한다.
 /// 계수 미보고는 0 보고가 아니다. 이 소비처의 추가 유휴 근거는 stale pending 리셋과 공유하지 않는다.
+///
+/// 계수 0/0 + quiet 만으로 유휴를 선언하면 OAUTH_CODE 같은 관문 프레임에
+/// Ctrl-U→paste→CR 원자 송신이 나간다(면책 창 기본 포커스 = `No, exit` · 2026-08-23 실측 킬체인 ·
+/// ANCHOR ④ pane 전멸). 실패 방향은 보류(rc 84)이고 그 귀결은 다음 사이클 재시도다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
     if o.human_bytes.unwrap_or(0) > 0 {
@@ -1075,7 +1081,7 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
         return CycleTargetState::Busy;
     };
     let Some(marker) = o.marker else {
-        return if o.quiet == Some(true) {
+        return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
                 CycleTargetState::MachineResidue
             } else {
@@ -1086,7 +1092,8 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
         };
     };
     if marker_row_has_draft(screen, marker, o.placeholder) {
-        return if o.quiet == Some(true) {
+        // 선택기 라벨도 초안 문면으로 읽힌다 — 기계 잔여가 있어도 관문에는 clear 를 보내지 않는다.
+        return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
                 CycleTargetState::MachineResidue
             } else {
@@ -1111,6 +1118,7 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     if (cys::readiness::composer_edit_region_empty(screen, marker, o.placeholder)
         || counts_report_no_draft)
         && o.quiet == Some(true)
+        && !o.gate_or_modal
     {
         if machine_residue {
             CycleTargetState::MachineResidue
@@ -1159,6 +1167,7 @@ fn cycle_target_observation(
     entry: Result<Value, String>,
     marker: &[String],
     placeholder: Option<&str>,
+    gates: &[cys::first_run_gates::Gate],
 ) -> CycleTargetObservation {
     let mut failures = Vec::new();
     let screen = match screen {
@@ -1177,10 +1186,13 @@ fn cycle_target_observation(
     };
     let quiet_secs_reported = screen.as_ref().map(|r| r.get("quiet_secs").is_some());
     let screen_text = screen.as_ref().and_then(|r| r["text"].as_str());
+    let gate_or_modal = screen_text
+        .is_some_and(|t| cys::readiness::gate_or_modal_present(t, gates, marker));
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
         screen: screen_text,
+        gate_or_modal,
         quiet: cys::readiness::idle_quiet_from(
             screen.as_ref().and_then(|r| r["quiet_secs"].as_f64()),
         ),
@@ -1209,10 +1221,11 @@ fn observe_cycle_target(
     sid: u64,
     marker: &[String],
     placeholder: Option<&str>,
+    gates: &[cys::first_run_gates::Gate],
 ) -> CycleTargetObservation {
     let screen = request("surface.read_text", json!({"surface_id": sid}));
     let entry = surface_entry(sid);
-    cycle_target_observation(screen, entry, marker, placeholder)
+    cycle_target_observation(screen, entry, marker, placeholder, gates)
 }
 
 /// 일시 RPC 실패는 재관측하되 3회 연속 실패는 Busy 머리표 없이 원 오류로 끝낸다.
@@ -1250,6 +1263,7 @@ fn wait_cycle_target_idle(
     sid: u64,
     marker: &[String],
     placeholder: Option<&str>,
+    gates: &[cys::first_run_gates::Gate],
     deadline: std::time::Instant,
     stage: &str,
     allow_machine_residue: bool,
@@ -1262,7 +1276,7 @@ fn wait_cycle_target_idle(
     let mut warned_observation_failure = false;
     let (mut saw_read_text, mut saw_quiet_secs) = (false, false);
     loop {
-        let observed = observe_cycle_target(sid, marker, placeholder);
+        let observed = observe_cycle_target(sid, marker, placeholder, gates);
         if let Some(reported) = observed.quiet_secs_reported {
             saw_read_text = true;
             saw_quiet_secs |= reported;
@@ -9658,7 +9672,7 @@ mod seat_latch_negation_tests {
             //   이 단언은 "능력 부재가 **마커 팔**까지 열지는 않는다" 를 함께 잰다(C3 의 완화는
             //   `marker == None` 팔 한정이라는 사실이 회귀 대상이 된다).
             assert_eq!(
-                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None, Some(false)),
+                gate_recheck_with_carry(adopted, true, false, Some("❯"), None, passed, None, Some(false), false, false),
                 GateRecheck::CarryUnproven,
                 "이월 벨트가 구 데몬 결측에서 열렸다 — 재도색 중 프레임에 붙여넣기 + Return 이 나간다"
             );
@@ -9695,7 +9709,7 @@ mod seat_latch_negation_tests {
             "전제 붕괴: 모달 서명이 이미 잡는 화면이면 이 검체는 이월 축을 재지 못한다"
         );
         let carry = |v: GateRecheck, screen: &str| {
-            gate_recheck_with_carry(v, true, false, Some("❯"), None, screen, Some(true), Some(true))
+            gate_recheck_with_carry(v, true, false, Some("❯"), None, screen, Some(true), Some(true), false, false)
         };
         assert_eq!(
             carry(GateRecheck::Adopt(ev), repainting),
@@ -9734,7 +9748,8 @@ mod seat_latch_negation_tests {
                 Some("Ask Codex to do anything"),
                 &codex_idle,
                 Some(true),
-                Some(true)
+                Some(true),
+                false, false,
             ),
             GateRecheck::Adopt(ev),
             "codex 유휴 composer 가 영구 보류다(carry-unproven 에 탈출 경로가 없다 = 치명위험 ③)"
@@ -9748,14 +9763,15 @@ mod seat_latch_negation_tests {
                 None,
                 &codex_idle,
                 Some(true),
-                Some(true)
+                Some(true),
+                false, false,
             ),
             GateRecheck::CarryUnproven,
             "전제 붕괴: ready_marker 로도 통과하면 이 검체는 마커 해소를 재지 못한다"
         );
         // ②'''' 롤백 계약 — `legacy_v1` 이면 이 축 자체가 없다(정본 §4 WP-1).
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), true, true, Some("❯"), None, repainting, Some(true), Some(true)),
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), true, true, Some("❯"), None, repainting, Some(true), Some(true), false, false),
             GateRecheck::Adopt(ev),
             "롤백 스위치가 이 축을 끄지 못한다(되돌릴 수 없는 보류)"
         );
@@ -9764,7 +9780,7 @@ mod seat_latch_negation_tests {
         assert!(!gate_mark_saw_a_gate(None) && !gate_mark_saw_a_gate(Some(GATE_ID_UNIDENTIFIED)));
         assert!(gate_mark_saw_a_gate(Some("folder-trust")) && gate_mark_saw_a_gate(Some("unknown-modal")));
         assert_eq!(
-            gate_recheck_with_carry(GateRecheck::Adopt(ev), false, false, Some("❯"), None, repainting, Some(true), Some(true)),
+            gate_recheck_with_carry(GateRecheck::Adopt(ev), false, false, Some("❯"), None, repainting, Some(true), Some(true), false, false),
             GateRecheck::Adopt(ev),
             "관문을 본 적 없는 표식(readiness 타임아웃)이 재관측에서만 더 엄한 요구를 받는다(판정 분리)"
         );
@@ -9819,31 +9835,31 @@ mod seat_latch_negation_tests {
         // ① 관문을 본 적 없다 = 종전 그대로(어떤 화면이든 Ready 를 막지 않는다).
         for screen in ["❯ \n", live, ""] {
             assert!(
-                gate_carry_ok(false, false, Some("❯"), None, screen, None, Some(true)),
+                gate_carry_ok(false, false, Some("❯"), None, screen, None, Some(true), false, false),
                 "건강한 부트에 이월이 걸렸다(회귀): {screen:?}"
             );
         }
         // ② 관문을 봤다 + 라벨이 사라진 프레임 = **보류**(그 틈이 R5 blocking 의 자리다).
         for screen in ["❯ \n", "❯ ", "\n"] {
             assert!(
-                !gate_carry_ok(true, false, Some("❯"), None, screen, Some(true), Some(true)),
+                !gate_carry_ok(true, false, Some("❯"), None, screen, Some(true), Some(true), false, false),
                 "재도색 중 프레임에 주입이 열렸다: {screen:?}"
             );
         }
         // ③ 관문을 봤어도 **대기 프롬프트 레이아웃**이 관측되면 열린다(가용성 — 사람이 통과시킨 뒤).
         assert!(
-            gate_carry_ok(true, false, Some("❯"), None, live, None, Some(true)),
+            gate_carry_ok(true, false, Some("❯"), None, live, None, Some(true), false, false),
             "관문 통과 뒤 라이브 프롬프트에서도 이월이 안 풀린다(영구 보류)"
         );
         // ④ 마커 미정의 어댑터는 출력 정적으로 대신한다 — 미관측(None)은 참으로 접지 않는다.
-        assert!(gate_carry_ok(true, false, None, None, "…", Some(true), Some(true)));
+        assert!(gate_carry_ok(true, false, None, None, "…", Some(true), Some(true), false, false));
         for q in [None, Some(false)] {
-            assert!(!gate_carry_ok(true, false, None, None, "…", q, Some(true)), "미관측/출력 중에 열렸다: {q:?}");
+            assert!(!gate_carry_ok(true, false, None, None, "…", q, Some(true), false, false), "미관측/출력 중에 열렸다: {q:?}");
         }
         // ④' ★(리뷰 R2(R7회차)) 롤백(`legacy_v1`)이면 축 자체가 없다 — 어떤 화면·어떤 마커에서도 참.
         for screen in ["❯ \n", "", "────\n❯ "] {
             assert!(
-                gate_carry_ok(true, true, Some("❯"), None, screen, Some(false), Some(true)),
+                gate_carry_ok(true, true, Some("❯"), None, screen, Some(false), Some(true), false, false),
                 "롤백 스위치가 이 축을 끄지 못한다: {screen:?}"
             );
         }
@@ -9939,6 +9955,7 @@ mod seat_latch_negation_tests {
                     screen,
                     Some(true),
                     Some(true),
+                    false, false,
                 ),
                 "{name}: 관문을 본 gemini 좌석이 정상 유휴 화면에서도 이월을 풀지 못한다 \
                  (carry-unproven 영구 보류 = 디렉티브 미주입 · 치명위험 ③)"
@@ -9957,7 +9974,8 @@ mod seat_latch_negation_tests {
                 composer_placeholder_of(&embed["codex"]).as_deref(),
                 codex_idle,
                 Some(true),
-                Some(true)
+                Some(true),
+                false, false,
             ),
             "대조군 붕괴: codex 도 못 푼다면 이 검체는 gemini 고유의 결함을 재지 못한다"
         );
@@ -13223,14 +13241,18 @@ fn boot_agent_on_surface(
         match cys::readiness::judge(&obs) {
             cys::readiness::Verdict::Ready { evidence } => {
                 // ★(리뷰 R5) 관문 증거 이월 — 위 `gate_evidence_seen` 주석 참조.
+                let leading = cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, text);
                 let carry_ok = gate_carry_ok(
                     gate_evidence_seen,
                     readiness_v1,
-                    cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, text),
+                    leading,
                     composer_placeholder.as_deref(),
                     text,
                     obs.idle_quiet,
                     quiet_axis_supported(),
+                    leading.is_none()
+                        && cys::agent_markers::pick_marker_last(&composer_marker, text).is_some(),
+                    cys::readiness::gate_or_modal_present(text, &gate_corpus.gates, &composer_marker),
                 );
                 if !carry_ok {
                     if !carry_held_logged {
@@ -13550,8 +13572,9 @@ fn inject_directive_after_ready(
 ///     플레이스홀더도 빈 입력줄이다 — 이고, 그 아래·위에 입력 상자 괘선·상태줄이 **실제로 있다** —
 ///     `composer_layout_static_ok`(강한 증거는 단독 · 약한 증거는 정적과 AND) · WP-5 가 alt-screen
 ///     배달 자격에 쓰는 스캐너와 **같은 술어**).
-///   · 마커 미정의 어댑터: 출력이 **정적**이다(`idle_quiet == Some(true)`). 미관측(`None`)은 참으로
-///     접지 않는다('부재 ≠ 부정' — 조여지는 방향).
+///   · 선두 마커가 없고 정적 축 능력도 없는 구 데몬: 그 좌석 한정으로 이월 축을 끈다.
+///   · 그 밖에 선두 마커가 없는 프레임: 후보 글리프가 화면에 아예 없고, 출력이 **정적**이며
+///     (`idle_quiet == Some(true)`) 관문·모달도 없다. 미관측(`None`)은 참으로 접지 않는다.
 ///
 /// ★(0.14.31 · 리뷰 R2(R7회차) · 리뷰어 2인 공통 blocking) 두 가지가 틀려 있었다:
 ///   ⓐ 마커로 **`ready_marker`** 를 넣었다. 그 키는 부트 readiness 가 보는 **화면 꼬리 토큰**이고
@@ -13576,6 +13599,11 @@ fn gate_carry_ok(
     //   (구 데몬 · `quiet_secs` 키 자체가 없다) · `Some(true)` = 낼 수 있다 · `None` = 아직 판정
     //   못 함(보수적으로 '낼 수 있다' 와 같이 취급 = 종전 거동 · 보류 유지).
     idle_axis_capable: Option<bool>,
+    // ★(0.14.39 · 성찰2 major ⑤) 후보 글리프는 화면에 **있는데** 선두 행이 아니다
+    //   (= 해소기가 None 을 냈지만 이 좌석은 여전히 마커 좌석이다).
+    glyph_off_composer: bool,
+    // ★(0.14.39 · 성찰1 major ②) 이 프레임에 첫기동 관문·모달이 서 있다.
+    gate_or_modal: bool,
 ) -> bool {
     if legacy_v1 || !gate_evidence_seen {
         return true;
@@ -13596,9 +13624,16 @@ fn gate_carry_ok(
         //     `note_quiet_axis` 가 시끄럽게 남긴다 — 로스터 전체를 끄는 마스터 스위치
         //     (`CYS_BOOT_GATES=0`)를 사람에게 권하는 것보다 범위가 좁고, `approval sign --ttl` 이
         //     `approval.capabilities` 로 구 데몬을 먼저 가려낸 것과 **같은 패턴**이다.
-        //   claude(`❯`)·codex(`›`)는 `Some(m)` 팔이라 이 분기에 오지 않는다(판정 불변).
+        // ⓑ 능력 부재는 **그 좌석 한정으로 축을 끈다** — 이 팔이 맨 앞이어야 한다. 뒤로 밀면
+        //   구 데몬 + 출력에 `>` 한 글자가 섞인 gemini 좌석이 영구 보류에 갇힌다(치명위험 ③ 회귀 · C3 검체 ③).
         None if idle_axis_capable == Some(false) => true,
-        None => idle_quiet == Some(true),
+        // ★(0.14.39 · 성찰2 major ⑤) 글리프는 있는데 선두가 아니다 = 이 좌석은 마커 좌석인데 이 프레임이
+        //   composer 를 안 그렸다(출력·푸터에만 글리프가 있다). 종전 첫-후보 폴백이 claude·codex 에
+        //   보장하던 등급을 그대로 유지해 **보류**한다. quiet 폴백은 '후보 글리프가 화면에 아예 없다' 한 경우다.
+        None if glyph_off_composer => false,
+        // ★(0.14.39 · 성찰1 major ②) 마커 축이 증거를 못 세우는 프레임에서 quiet 하나로 이월을 풀면
+        //   관문 화면에 디렉티브가 붙고 그 Return 이 `No, exit` 를 누른다 — 관문·모달 부재를 AND 한다.
+        None => idle_quiet == Some(true) && !gate_or_modal,
     }
 }
 
@@ -13850,16 +13885,20 @@ fn gate_pending_reobserve_once(sid: u64, agent: &str, marked_gate: Option<&str>)
         idle_quiet,
         legacy_v1: cys::readiness::legacy_v1(),
     };
+    let leading = cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, &screen);
     gate_recheck_with_carry(
         gate_pending_recheck(cys::readiness::judge(&obs)),
         gate_mark_saw_a_gate(marked_gate),
         cys::readiness::legacy_v1(),
-        cys::agent_markers::pick_marker_leading_on_screen(&composer_marker, &screen),
+        leading,
         composer_placeholder.as_deref(),
         &screen,
         idle_quiet,
         // 위 `gate_guard_screen_with_quiet` 가 같은 응답에서 이미 래치했다(같은 관측 · 1지점).
         quiet_axis_supported(),
+        leading.is_none()
+            && cys::agent_markers::pick_marker_last(&composer_marker, &screen).is_some(),
+        cys::readiness::gate_or_modal_present(&screen, &corpus.gates, &composer_marker),
     )
 }
 
@@ -13901,6 +13940,8 @@ fn gate_recheck_with_carry(
     idle_quiet: Option<bool>,
     // ★(0.14.31 · 성찰 C3) 부트 폴링과 **같은 능력 축**(판정 분리 금지).
     idle_axis_capable: Option<bool>,
+    glyph_off_composer: bool,
+    gate_or_modal: bool,
 ) -> GateRecheck {
     match verdict {
         GateRecheck::Adopt(_)
@@ -13912,6 +13953,8 @@ fn gate_recheck_with_carry(
                 screen,
                 idle_quiet,
                 idle_axis_capable,
+                glyph_off_composer,
+                gate_or_modal,
             ) =>
         {
             GateRecheck::CarryUnproven
@@ -17681,6 +17724,35 @@ fn cycle_spec_or_explicit_clear(
     }
 }
 
+/// 등록 줄에서 **실재하는 팩 훅 스크립트**를 뽑는다. 없으면 `None`.
+///
+/// ★(0.14.39 · 성찰1 major ③ⓐ) 종전에는 "hooks/session-start.sh" 로 **끝나기만 하면** 등록으로 인정했다.
+/// 그 인정은 옛 팩·삭제된 팩·다른 도구의 훅 줄까지 통과시켰고, 그 좌석은 CLI 디렉티브 주입을 생략한 채
+/// 훅도 안 돌아 **0회 주입**이 된다. 커밋이 선언한 비대칭("0회=치명 / 2회=무해")과 반대 방향이다.
+///
+/// 【인정 조건】 ①따옴표·`sh `/`bash ` 접두를 벗긴 경로가 `hooks/session-start.sh` 로 끝나고
+/// ②그 파일이 **실재**하며 ③같은 디렉터리에 `_lib.sh` 가 있다(= 진짜 팩의 hooks 디렉터리 ·
+/// `cys_lane_guard` 의 ②번 검사 `[ -f "${_cys_lg_root}/hooks/_lib.sh" ]` 와 **같은 술어**).
+/// 셸 변수가 전개되지 않은 경로(`$HOME/...`)는 검증 불가 = 미인정(강등 = CLI 가 1회 주입 = 무해 쪽).
+fn registered_pack_session_start_hook(command: &str) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    let script = command.strip_prefix("sh ")
+        .or_else(|| command.strip_prefix("bash "))
+        .unwrap_or(command)
+        .trim_matches(['"', '\''])
+        .trim();
+    let normalized = script.replace('\\', "/");
+    if !normalized.ends_with("hooks/session-start.sh") || normalized.contains('$') {
+        return None;
+    }
+    let path = std::path::PathBuf::from(script);
+    if path.is_file() && path.parent()?.join("_lib.sh").is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// 이 좌석의 settings.json 에 cys SessionStart 훅이 등록돼 있는가.
 /// Some(true)=등록 · Some(false)=읽었으나 미등록 · None=읽기·파싱 실패로 판정 불능.
 fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> {
@@ -17693,25 +17765,36 @@ fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> 
     // 부서 pane 은 다른 팩의 훅을 등록한다. 이 팩과 정확 일치만 재면 실행 중인 훅을
     // 미등록으로 강등해 훅 1회 + CLI 1회 이중 주입한다. OS 경로 구분자·닫는 인용부호를
     // 정규화한 스크립트 접미사도 인정해 그 반대편 사고를 막는다.
+    // 정정(0.14.39 · 성찰1 major ③ⓐ): 접미사만 같으면 삭제된 팩·다른 도구도 통과해
+    // 디렉티브가 0회 주입될 수 있다. relocated 는 스크립트와 같은 디렉터리의 _lib.sh 가
+    // 모두 실재하는 팩 훅으로 좁힌다 — 검증 불가 시 CLI 이중 주입을 택하는 보수 판정이다.
     let relocated = root.get("hooks")
         .and_then(|hooks| hooks.get("SessionStart"))
         .and_then(Value::as_array)
         .is_some_and(|entries| entries.iter().any(|entry| {
             entry.get("hooks").and_then(Value::as_array)
                 .is_some_and(|hooks| hooks.iter().any(|hook| {
-                    hook.get("command").and_then(Value::as_str).is_some_and(|command| {
-                        command.trim().trim_end_matches(['\"', '\''])
-                            .replace('\\', "/").ends_with("hooks/session-start.sh")
-                    })
+                    hook.get("command").and_then(Value::as_str)
+                        .is_some_and(|command| registered_pack_session_start_hook(command).is_some())
                 }))
         }));
     Some(exact || relocated)
 }
 
-/// 선언(agents.json)과 실설정 관측을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
-/// 미등록·판정 불능이면 선언을 강등해 종전 CLI 주입으로 복귀한다 — 지침 0회 주입을 막는다.
-fn effective_hooks_inject(declared: bool, observed: Option<bool>) -> bool {
-    declared && observed == Some(true)
+/// 선언(agents.json) · 실설정 관측 · **레인 가드 조기 종료 표식**을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
+///
+/// ★(0.14.39 · 부트체인 major ⓑ · 성찰2 major ⑥) 등록은 **실행 관측이 아니다**. `cys_lane_guard` 는
+/// 위임 대상이 absent·unreadable·no-redirect-line·already-redirected 면 훅 본문을 돌리지 않고 무발화
+/// exit 0 하며(cysjavis-pack/hooks/_lib.sh:345-408), 그 stderr 는 훅 프리루드의 `2>/dev/null` 이 삼킨다.
+/// 그 상태에서 '등록 사실' 만 보면 CLI 가 디렉티브를 생략해 **0회 주입**이 된다(오너 색인 🔒 축).
+/// 그래서 표식이 최근에 찍혀 있으면 선언을 강등한다 — 실패 방향은 **이중 주입(무해)** 쪽이고,
+/// 커밋이 선언한 비대칭("0회=치명 / 2회=무해")과 같은 방향이다.
+fn effective_hooks_inject(
+    declared: bool,
+    observed: Option<bool>,
+    lane_guard_trip: Option<&cys::pack::LaneGuardTrip>,
+) -> bool {
+    declared && observed == Some(true) && lane_guard_trip.is_none()
 }
 
 /// 훅 등록은 실행 완료 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 확인하게 한다.
@@ -17821,6 +17904,10 @@ fn run_cycle_agent(
         };
         // ★(0.14.39 통합) D-04 목록 허용과 합류 — 후보 목록을 그대로 들고 다니며 프레임마다 해소한다.
         let marker = spec.as_ref().map(composer_marker_of).unwrap_or_default();
+        // ★(0.14.39 · 성찰1 blocking ①) clear 직전 유휴 판정도 관문·모달을 본다 — 데몬 judge 와 같은 코퍼스.
+        let gate_corpus = agent.as_deref().map(resolve_gate_corpus);
+        let gates: &[cys::first_run_gates::Gate] =
+            gate_corpus.as_ref().map(|r| r.gates.as_slice()).unwrap_or(&[]);
         let placeholder = spec.as_ref().and_then(composer_placeholder_of);
         let declared_hooks_inject = spec
             .as_ref()
@@ -17845,16 +17932,33 @@ fn run_cycle_agent(
             None => Err("좌석 claude_config_dir·팩 config_dir 모두 미보고: 판정 불능".into()),
         };
         let observed = session_start_hook_registered(hook_settings.as_ref().ok());
-        let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed);
+        // ★(0.14.39 · 부트체인 major ⓑ) 레인(팩)은 곧 이 프로세스의 CYS_PACK_DIR 이다 — 부서 pane 을
+        //   겨눈 cycle-agent 는 그 부서 레인에서 돈다(같은 소켓·같은 팩). 저장소에 이미 있는 결정론
+        //   관측자(javis_preflight.lane_guard_tripped)와 **같은 표식·같은 창**을 읽는다.
+        let lane_trip = declared_hooks_inject
+            .then(|| cys::pack::lane_guard_tripped(&cys::pack::pack_dir()))
+            .flatten();
+        let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());
         if declared_hooks_inject && !hooks_inject {
-            let path = hook_settings_path.as_ref()
-                .map(|path| path.display().to_string()).unwrap_or_else(|| "(설정 경로 없음)".into());
-            let reason = hook_settings.as_ref().err().map(String::as_str)
-                .unwrap_or("SessionStart 에 cys 훅 미등록");
-            eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — {path}: {reason} · 이번 사이클은 CLI가 디렉티브를 직접 주입한다");
+            if let Some(trip) = lane_trip.as_ref() {
+                eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — 레인 가드 조기 종료 표식(reason={} script={}) — 훅이 무발화 종료했을 수 있다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다", trip.reason, trip.script);
+            } else {
+                let path = hook_settings_path.as_ref()
+                    .map(|path| path.display().to_string()).unwrap_or_else(|| "(설정 경로 없음)".into());
+                let reason = hook_settings.as_ref().err().map(String::as_str)
+                    .unwrap_or("SessionStart 에 cys 훅 미등록");
+                eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — {path}: {reason} · 이번 사이클은 CLI가 디렉티브를 직접 주입한다");
+            }
         }
-        // 잔여 ⓑ: 등록된 훅도 B-hooks 레인 가드 absent/unreadable/no-redirect-line 에서
-        // 무발화 종료할 수 있다. 후속: 재주입 직후 directive.verify 의 directive_verified != Some(true) 확인.
+        // ★(0.14.39 · 기각 기록) 지적이 제시한 대안 "재주입 직후 `directive.verify` 의
+        //   `directive_verified != Some(true)` 면 1회 직접 주입" 은 **이 저장소에서 성립하지 않는다**:
+        //   ⓐ `directive.verify` 는 **pane 자칭을 거부**한다(src/bin/cysd/handlers.rs:6828-6841 —
+        //     caller 가 어느 pane 으로 해소되면 `verify_denied`). SessionStart 훅은 그 pane 안에서 도니
+        //     이 RPC 로 '발화했다'를 기록할 수 없다.
+        //   ⓑ 팩 어디에도 그 RPC 호출이 없다(`grep -rn "directive.verify" cysjavis-pack/` = 검체 4건뿐).
+        //   ∴ clear 뒤 읽는 `directive_verified` 는 **직전 launch-agent 부트가 남긴 낡은 래치**이지
+        //   이번 세션의 훅 발화 관측이 아니다. 그것으로 판정하면 vacuous(항상 true → 강등 0) 이거나
+        //   매 사이클 강등(항상 false)이 된다. 대신 훅이 **실제로 남기는** 표식을 읽는다(위 lane_trip).
         // 저장 검증 파일 확정 (기본: <cwd>/_round/SESSION_STATE.md + *_TODO.md 자동 탐지)
         let cwd = entry["live_cwd"]
             .as_str()
@@ -18034,6 +18138,7 @@ fn run_cycle_agent(
             sid,
             &marker,
             placeholder.as_deref(),
+            gates,
             std::time::Instant::now() + std::time::Duration::from_secs(timeout),
             "clear 직전",
             true,
@@ -18146,6 +18251,7 @@ fn run_cycle_agent(
                         sid,
                         &marker,
                         placeholder.as_deref(),
+                        gates,
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
                         "재주입 직전",
@@ -18184,6 +18290,7 @@ fn run_cycle_agent(
                         sid,
                         &marker,
                         placeholder.as_deref(),
+                        gates,
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
                         "재주입 직전(측정 불능)",
@@ -32193,16 +32300,79 @@ mod tests {
         }
     }
 
+    /// 훅 발화 가능성 진리표: 실재하는 팩 훅만 인정하고 최근 레인 가드 무발화는 CLI 주입으로 강등한다.
+    #[test]
+    fn hooks_inject_directive_demotes_when_the_hook_cannot_actually_fire() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let td = std::env::temp_dir()
+            .join(format!("cys-hook-can-fire-{}-{nonce}", std::process::id()));
+        let hooks = td.join("p/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let script = hooks.join("session-start.sh");
+        let lib = hooks.join("_lib.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::write(&lib, "# pack hook library\n").unwrap();
+        let settings = |command: String| json!({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": command}
+        ]}]}});
+        let root = settings(format!("sh {}", script.display()));
+        assert_eq!(session_start_hook_registered(Some(&root)), Some(true));
+        std::fs::remove_file(&lib).unwrap();
+        assert_eq!(session_start_hook_registered(Some(&root)), Some(false), "_lib.sh 없는 훅은 팩이 아니다");
+        for command in [
+            "sh /nope/hooks/session-start.sh",
+            "sh $HOME/.cys/pack/hooks/session-start.sh",
+        ] {
+            assert_eq!(session_start_hook_registered(Some(&settings(command.into()))), Some(false));
+        }
+        assert_eq!(session_start_hook_registered(Some(&json!({}))), Some(false));
+        assert_eq!(session_start_hook_registered(None), None);
+
+        let trip = cys::pack::LaneGuardTrip {
+            reason: "absent".into(),
+            script: "session-start.sh".into(),
+            unreadable: false,
+        };
+        assert!(effective_hooks_inject(true, Some(true), None));
+        assert!(!effective_hooks_inject(true, Some(true), Some(&trip)));
+        assert!(!effective_hooks_inject(true, Some(false), None));
+        assert!(!effective_hooks_inject(false, Some(true), None));
+
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for pin in [
+            "lane_guard_tripped(",
+            "effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref())",
+            "if !hooks_inject {",
+        ] {
+            assert!(compact.contains(pin),
+                "훅 발화 관측이 빠졌다 — 레인 가드 무발화 좌석에서 디렉티브가 0회 주입된다(오너 색인 🔒 축)");
+        }
+        std::fs::remove_dir_all(&td).unwrap();
+    }
+
     /// 성찰2 major ③: 선언만 믿으면 좌석별 설정 누락에서 디렉티브가 0회 주입된다.
     #[test]
     fn r1_session_start_hook_registered_truth_table() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let td = std::env::temp_dir()
+            .join(format!("cys-relocated-hook-{}-{nonce}", std::process::id()));
+        let hooks = td.join("department pack/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let script = hooks.join("session-start.sh");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        std::fs::write(hooks.join("_lib.sh"), "# pack hook library\n").unwrap();
         let exact = cys::pack::session_start_hook_command(&cys::pack::pack_dir());
         for command in [
             exact,
-            "sh /department/another-pack/hooks/session-start.sh".into(),
-            r"bash C:\department\another-pack\hooks\session-start.sh".into(),
-            "bash \"C:/department pack/hooks/session-start.sh\"".into(),
+            format!("sh {}", script.display()),
+            format!("bash \"{}\"", script.display()),
+            format!("  sh '{}'  ", script.display()),
+            format!("bash \"{}\"", script.to_string_lossy().replace('\\', "/")),
         ] {
             let root = json!({"hooks": {"SessionStart": [{"matcher": "startup|clear", "hooks": [
                 {"type": "command", "command": command}
@@ -32219,6 +32389,7 @@ mod tests {
             assert_eq!(session_start_hook_registered(Some(&root)), Some(false), "{root}");
         }
         assert_eq!(session_start_hook_registered(None), None, "읽기·파싱 실패는 미등록과 구별한다");
+        std::fs::remove_dir_all(&td).unwrap();
     }
 
     #[test]
@@ -32231,7 +32402,7 @@ mod tests {
             (false, Some(false), false),
             (false, None, false),
         ] {
-            assert_eq!(effective_hooks_inject(declared, observed), expected,
+            assert_eq!(effective_hooks_inject(declared, observed, None), expected,
                 "선언={declared} · 관측={observed:?}");
         }
     }
@@ -32247,10 +32418,11 @@ mod tests {
         assert!(compact.contains("std::fs::read_to_string("));
         assert!(compact.contains("serde_json::from_str"));
         assert!(compact.contains("session_start_hook_registered(hook_settings.as_ref().ok())"));
-        let effective = "let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed);";
-        let effective_at = compact.find(effective).expect("선언·실설정 관측을 합친 실효값 확정");
+        let effective = "let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());";
+        let effective_at = compact.find(effective).expect("선언·실설정·레인 가드 관측을 합친 실효값 확정");
         assert_eq!(compact.matches("let hooks_inject =").count(), 1, "실효값을 정적 선언으로 다시 덮지 않는다");
         assert!(compact.find("session_start_hook_registered(").unwrap() < effective_at);
+        assert!(compact.find("lane_guard_tripped(").unwrap() < effective_at);
         for consumer in [
             "cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)",
             "if !hooks_inject { inject_text(sid, &compose_directive(&role_name)?)?; }",
@@ -32552,6 +32724,7 @@ mod tests {
             Err("목록 RPC: connection reset".into()),
             &[],
             None,
+            &[],
         );
         assert_eq!(observed.state, CycleTargetState::Busy);
         let failure = observed.failure.expect("관측 실패 메타");
@@ -32563,6 +32736,7 @@ mod tests {
             Err("입력 버퍼 관측 실패".into()),
             &[],
             None,
+            &[],
         );
         assert_eq!(observed.state, CycleTargetState::Busy, "입력 버퍼 미관측은 유휴가 아니다");
         assert_eq!(observed.quiet_secs_reported, Some(true));
@@ -32576,12 +32750,14 @@ mod tests {
             Ok(json!({"pending_input_human_bytes": 3})),
             &["❯".to_string()],
             None,
+            &[],
         );
         let screen_draft = cycle_target_observation(
             Ok(json!({"text": "❯ 사람이 치던 초안\n", "quiet_secs": 5.0})),
             Err("입력 버퍼 RPC 실패".into()),
             &["❯".to_string()],
             None,
+            &[],
         );
         for observed in [buffer_draft, screen_draft] {
             assert_eq!(observed.state, CycleTargetState::HumanDraft, "한 RPC 실패가 초안 증거를 덮으면 안 된다");
@@ -32602,7 +32778,7 @@ mod tests {
             (json!({"text": "출력", "quiet_secs": 0.0}), true),
             (json!({"text": "출력", "quiet_secs": null}), true),
         ] {
-            let observed = cycle_target_observation(Ok(screen), Ok(json!({})), &[], None);
+            let observed = cycle_target_observation(Ok(screen), Ok(json!({})), &[], None, &[]);
             assert_eq!(observed.quiet_secs_reported, Some(want));
             assert!(observed.failure.is_none());
         }
@@ -32759,6 +32935,7 @@ mod tests {
     #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
+            gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(false),
             marker: Some("❯"),
@@ -32775,6 +32952,7 @@ mod tests {
     #[test]
     fn d16_target_state_idle_on_quiet_empty_composer() {
         let mut obs = CycleTargetObs {
+            gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(true),
             marker: Some("❯"),
@@ -32793,6 +32971,7 @@ mod tests {
     #[test]
     fn d16_target_state_human_draft() {
         let mut obs = CycleTargetObs {
+            gate_or_modal: false,
             screen: None,
             quiet: Some(false),
             marker: Some("❯"),
@@ -32842,6 +33021,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+                    gate_or_modal: false,
                     screen,
                     quiet,
                     marker: Some("❯"),
@@ -32861,6 +33041,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+                    gate_or_modal: false,
                     screen: Some("마커 없는 화면"),
                     quiet,
                     marker: None,
@@ -32942,6 +33123,7 @@ mod tests {
             );
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+                    gate_or_modal: false,
                     screen: Some(screen),
                     quiet: Some(true),
                     marker,
@@ -32957,6 +33139,7 @@ mod tests {
                 Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
                 candidates,
                 None,
+                &[],
             );
             assert_eq!(observed.state, expected_state, "{name}: 관측 경로도 같은 해소기를 쓴다");
             assert!(observed.failure.is_none(), "{name}: 합성 관측은 성공 응답이다");
@@ -32986,6 +33169,7 @@ mod tests {
             ] {
                 assert_eq!(
                     cycle_target_state(&CycleTargetObs {
+                        gate_or_modal: false,
                         screen: Some(screen),
                         quiet,
                         marker: Some(marker),
@@ -33778,6 +33962,102 @@ mod tests {
         assert!(!seg.contains("alive_on_recheck"), "79 분기가 원인을 agent_alive 로 단정한다:\n{seg}");
     }
 
+    /// ★목표 A: 계수 0/0·정적 출력이어도 첫기동 관문·모달에는 clear 를 보내지 않는다.
+    /// 실제 관측부와 임베드 마커 해소기를 함께 태우고, 건강한 네 화면의 무clear 회귀도 막는다.
+    #[test]
+    fn cycle_target_state_never_declares_idle_on_a_first_run_gate_or_modal_frame() {
+        use cys::first_run_gates::fixtures;
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        let gates = resolve_gate_corpus("claude").gates;
+        let mut failures = Vec::new();
+        for (id, fixture, should_be_idle) in [
+            ("THEME", fixtures::THEME, false),
+            ("LOGIN_METHOD", fixtures::LOGIN_METHOD, false),
+            ("OAUTH_CODE", fixtures::OAUTH_CODE, false),
+            ("FOLDER_TRUST", fixtures::FOLDER_TRUST, false),
+            ("TRUST_ECHO_THEN_DISCLAIMER", fixtures::TRUST_ECHO_THEN_DISCLAIMER, false),
+            ("FEATURE_FULLSCREEN", fixtures::FEATURE_FULLSCREEN, false),
+            ("LIVE_PERMISSION_PROMPT", fixtures::LIVE_PERMISSION_PROMPT, false),
+            ("HEALTHY_WELCOME_BOX", fixtures::HEALTHY_WELCOME_BOX, true),
+            ("LIVE_TUI_AT_PROMPT", fixtures::LIVE_TUI_AT_PROMPT, true),
+            ("CONFIG_THEME_SETTING", fixtures::CONFIG_THEME_SETTING, true),
+            ("ACCOUNT_STATUS_PANEL", fixtures::ACCOUNT_STATUS_PANEL, true),
+        ] {
+            let observed = cycle_target_observation(
+                Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                &claude,
+                None,
+                &gates,
+            );
+            let state = observed.state;
+            // 기계 잔여가 있어도 선택기 라벨을 초안으로 오인해 clear 대상으로 넘기지 않는다.
+            if !should_be_idle {
+                let residue = cycle_target_observation(
+                    Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                    Ok(json!({"pending_input_bytes": 8, "pending_input_human_bytes": 0})),
+                    &claude,
+                    None,
+                    &gates,
+                ).state;
+                if matches!(residue, CycleTargetState::Idle | CycleTargetState::MachineResidue) {
+                    failures.push(format!("{id}: {residue:?} — 기계 잔여가 관문·모달을 우회했다"));
+                }
+            }
+            if should_be_idle {
+                if state != CycleTargetState::Idle {
+                    failures.push(format!("{id}: {state:?} — 이 좌석은 영원히 clear 되지 않는다(ANCHOR ②)"));
+                }
+            } else if matches!(state, CycleTargetState::Idle | CycleTargetState::MachineResidue) {
+                failures.push(format!("{id}: {state:?} — 관문·모달 화면에 clear 원자 송신이 열린다"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★목표 A: 비선두 글리프는 마커 좌석의 보류를 유지하고, quiet 폴백도 관문을 거부한다.
+    /// 임베드 후보를 실제로 해소해 정상 composer·글리프 부재·구 데몬의 능력 부재를 함께 대조한다.
+    #[test]
+    fn gate_carry_ok_keeps_marker_seats_on_the_marker_axis_and_refuses_gate_frames() {
+        use cys::agent_markers::{pick_marker_last, pick_marker_leading_on_screen};
+        use cys::first_run_gates::fixtures;
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        assert!(claude.iter().any(|m| m == "❯"), "claude 마커 선언 전제");
+        let gates = resolve_gate_corpus("claude").gates;
+        let resolve = |s: &str| {
+            let lead = pick_marker_leading_on_screen(&claude, s);
+            (lead, lead.is_none() && pick_marker_last(&claude, s).is_some())
+        };
+        let (lead, off) = resolve(fixtures::OAUTH_CODE);
+        assert_eq!(lead, None, "OAUTH_CODE 에는 선두 후보 행이 없다");
+        let oauth_ok = gate_carry_ok(true, false, lead, None, fixtures::OAUTH_CODE, Some(true), Some(true), off,
+            cys::readiness::gate_or_modal_present(fixtures::OAUTH_CODE, &gates, &claude));
+        let (lead, off) = resolve(fixtures::LIVE_TUI_AT_PROMPT);
+        assert_eq!(lead, Some("❯"), "LIVE_TUI_AT_PROMPT 의 선두 후보 행");
+        assert!(gate_carry_ok(true, false, lead, None, fixtures::LIVE_TUI_AT_PROMPT, Some(true), Some(true), off,
+            cys::readiness::gate_or_modal_present(fixtures::LIVE_TUI_AT_PROMPT, &gates, &claude)),
+            "정상 프롬프트의 관문 이월이 막혔다");
+        let gemini = composer_marker_of(&embedded_agents_json().expect("임베드")["gemini"]);
+        let screen = "cat a.txt > b.txt\n\x20 done\n";
+        let lead = pick_marker_leading_on_screen(&gemini, screen);
+        let glyph_off_composer = lead.is_none() && pick_marker_last(&gemini, screen).is_some();
+        assert!(glyph_off_composer, "gemini 비선두 글리프 검체 전제");
+        let off_ok = gate_carry_ok(true, false, lead, None, screen, Some(true), Some(true), glyph_off_composer,
+            cys::readiness::gate_or_modal_present(screen, &[], &gemini));
+        assert!(gate_carry_ok(true, false, lead, None, screen, Some(true), Some(false), glyph_off_composer,
+            cys::readiness::gate_or_modal_present(screen, &[], &gemini)),
+            "능력 부재 + 비선두 글리프가 영구 보류다(C3 ③ · 치명위험 ③)");
+        let screen = "…\n";
+        let lead = pick_marker_leading_on_screen(&gemini, screen);
+        let glyph_off_composer = lead.is_none() && pick_marker_last(&gemini, screen).is_some();
+        assert!(!glyph_off_composer, "글리프 부재 검체 전제");
+        assert!(gate_carry_ok(true, false, lead, None, screen, Some(true), Some(true), glyph_off_composer,
+            cys::readiness::gate_or_modal_present(screen, &[], &gemini)),
+            "글리프 부재 + quiet 의 이월이 막혔다");
+        assert!(!oauth_ok && !off_ok,
+            "OAUTH_CODE={oauth_ok}: 관문 화면에서 이월이 풀렸다 — 디렉티브가 선택기에 붙는다; 비선두 글리프={off_ok}: 마커 좌석이 quiet 축으로 강등됐다");
+    }
+
     /// ★C3: 화면에 선두 후보 행이 없는 좌석이 `quiet_secs` 없는 데몬에서 **영구 보류**에 갇히지 않는다.
     ///
     /// `idle_quiet == None` 을 두 사실로 가른다 — "이 틱에 못 쟀다"(보류 유지) vs
@@ -33803,27 +34083,33 @@ mod tests {
         // ② 능력 있는 데몬: 종전 판정 그대로 — 미관측·출력 중은 보류다(회귀 방지).
         for q in [None, Some(false)] {
             assert!(
-                !gate_carry_ok(true, false, marker, None, screen, q, Some(true)),
+                !gate_carry_ok(true, false, marker, None, screen, q, Some(true), false, false),
                 "능력 있는 데몬에서 미관측이 열렸다: {q:?}"
             );
         }
-        assert!(gate_carry_ok(true, false, marker, None, screen, Some(true), Some(true)));
+        assert!(gate_carry_ok(true, false, marker, None, screen, Some(true), Some(true), false, false));
         // ③ 능력 **부재** 데몬 + 선두 후보 행 부재: 선언된 gemini 도 이월 축을 끈다.
         assert!(
-            gate_carry_ok(true, false, marker, None, screen, None, Some(false)),
+            gate_carry_ok(true, false, marker, None, screen, None, Some(false), false, false),
             "구 데몬 + gemini 좌석이 여전히 영구 보류다(디렉티브 미주입 · 치명위험 ③)"
         );
         // ④ 판정 유보(`None` = 아직 응답을 못 봤다)는 종전과 같이 **보류**다(조여지는 방향).
-        assert!(!gate_carry_ok(true, false, marker, None, screen, None, None));
+        assert!(!gate_carry_ok(true, false, marker, None, screen, None, None, false, false));
         // ⑤ claude·codex 판정 **불변** — 선두 후보 행이 있는 화면은 마커 축을 유지한다.
         let live = cys::first_run_gates::fixtures::LIVE_TUI_2_1_261_STATUS_BELOW_PROMPT;
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        let live_marker = cys::agent_markers::pick_marker_leading_on_screen(&claude, live);
+        let repaint = "❯ \n";
+        let repaint_marker = cys::agent_markers::pick_marker_leading_on_screen(&claude, repaint);
+        assert_eq!(live_marker, Some("❯"), "라이브 composer 해소 전제");
+        assert_eq!(repaint_marker, Some("❯"), "재도색 composer 해소 전제");
         for cap in [Some(true), Some(false), None] {
             assert!(
-                gate_carry_ok(true, false, Some("❯"), None, live, None, cap),
+                gate_carry_ok(true, false, live_marker, None, live, None, cap, false, false),
                 "claude 라이브 프롬프트 판정이 능력 축에 흔들렸다: {cap:?}"
             );
             assert!(
-                !gate_carry_ok(true, false, Some("❯"), None, "❯ \n", Some(false), cap),
+                !gate_carry_ok(true, false, repaint_marker, None, repaint, Some(false), cap, false, false),
                 "claude 재도색 프레임이 능력 축으로 열렸다: {cap:?}"
             );
         }
