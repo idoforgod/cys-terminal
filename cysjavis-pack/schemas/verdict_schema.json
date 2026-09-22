@@ -14,8 +14,9 @@
 
   "SEVERITY_ENUM": ["blocking", "major", "minor"],
 
-  "TOP_KEYS": ["verdict", "justification", "evidence", "issues", "missing"],
+  "TOP_KEYS": ["verdict", "justification", "evidence", "issues", "missing", "revision"],
   "REQUIRED_TOP": ["verdict", "justification", "evidence", "issues"],
+  "revision_binding": "선택 키 · 대상 커밋 해시(비-git 대상이면 파일 해시·타임스탬프) · REVIEWER_DIRECTIVE §3 리비전 바인딩의 합법 자리(D-13 2026-09-21)",
   "EVIDENCE_KEYS": ["claim", "ref", "verified"],
 
   "ISSUE_CONTRACT": ["severity", "where", "what", "fix"],

@@ -1520,8 +1520,22 @@ def cmd_review_prompt(args):
     lines.append("verdict 정본 저장(필수 — 이 경로에 JSON 파일로 저장하라):")
     lines.append("  %s" % _vp)
     lines.append("  · 디렉터리가 없으면 먼저 만들어라: mkdir -p \"%s\"" % os.path.dirname(_vp))
-    lines.append("  · 스키마 = _round/REVIEWER_VERDICT_CONTRACT.md "
-                 "(verdict enum + evidence file:line · score(0-100) 금지).")
+    _contract_path = os.path.join(pack_dir(), "round", "REVIEWER_VERDICT_CONTRACT.md")
+    try:
+        import javis_verdict as _jv
+    except ImportError:
+        lines.append("  · 스키마 = %s (javis_verdict 미적재 — 계약 문서를 열어라)" % _contract_path)
+    else:
+        lines.append("  · 스키마 = %s "
+                     "(verdict enum + evidence file:line · score(0-100) 금지)." % _contract_path)
+        lines.append("  · 최상위 키: %s (필수: %s) · verdict enum: %s · severity: %s · "
+                     "evidence[]: {%s} · issues[]: {%s} · "
+                     "revision: 대상 커밋 해시(선택·리비전 바인딩)"
+                     % (" ".join(_jv.TOP_KEYS), " ".join(_jv.REQUIRED_TOP),
+                        "|".join(_jv.REVIEWER_ENUM), "|".join(_jv.SEVERITY_ENUM),
+                        " ".join(_jv.EVIDENCE_KEYS), " ".join(_jv.ISSUE_CONTRACT)))
+        lines.append("  · 빈 골격(이 형태 그대로 채워라):")
+        lines.append(json.dumps(_jv.skeleton(), ensure_ascii=False))
     lines.append("  · master 의 `javis_orchestra.py round-log --verdict-json <파일>` 은 **이 파일만** "
                  "받는다 — 산문 전사는 거부된다.")
     lines.append("  · 화면 출력·push 본문은 사본이다(pane 폭에서 잘리고 좌석이 정리되면 사라진다). "
@@ -2633,7 +2647,7 @@ def cmd_round_log(args):
               "전사 금지(MASTER §14·G8). --from-cmd \"<명령>\"을 써라.", file=sys.stderr)
         return 2
     elif std in STAGNATION_REVIEWERS and skip_reason(verdict) is None:
-        # ★G8: 리뷰어 행은 타입 계약(_round/REVIEWER_VERDICT_CONTRACT.md) 강제 —
+        # ★G8: 리뷰어 행은 타입 계약(<pack>/round/REVIEWER_VERDICT_CONTRACT.md) 강제 —
         #   verdict JSON이 javis_verdict 스키마(enum·evidence·score 금지)를 통과할 때만 기록.
         #   산문 전사·스키마 미통과는 거부. SKIP 행("SKIPPED: 사유")은 3-state 게이트 경로라 예외.
         vj = getattr(args, "verdict_json", None)
@@ -4746,7 +4760,7 @@ def cmd_self_test(args):
                      "잠근 합격 기준의 미달 항목 0"):
             assert must in out, "review-prompt에 '%s' 누락" % must
         # ★A8: verdict 파일 정본화 — 저장 지시·경로·파일 실재 성공기준이 항상 주입된다.
-        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "완료 기준(파일 실재)",
+        for must in ("verdict 정본 저장", "REVIEWER_VERDICT_CONTRACT", "빈 골격", "완료 기준(파일 실재)",
                      "round/_reviews/"):
             assert must in out, "review-prompt에 A8 '%s' 누락" % must
         assert verdict_json_path("T", 2, "reviewer1") in out, "A8 저장 경로 불일치"

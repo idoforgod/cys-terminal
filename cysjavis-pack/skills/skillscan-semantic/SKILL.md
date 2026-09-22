@@ -7,7 +7,7 @@ description: 스킬 보안·품질의 시맨틱(LLM) 분석을 cys 워커로 수
 
 > 짝: `javis_skillscan.py`(정적·결정론·regex/AST/taint). **이 스킬 = 그 정적층이 구조적으로 못 닿는 의미 잔여만** Max 워커 LLM으로 판정. 종량제 API 호출 0(워커가 직접 추론).
 > 원천: NVIDIA SkillSpector `semantic_*`·`tool_poisoning TP4` 프롬프트 이식(Apache-2.0).
-> 출력 계약: `_round/REVIEWER_VERDICT_CONTRACT.md` 스키마(ACCEPT|REVISE|BLOCK, **score 금지**).
+> 출력 계약: `$CYS_PACK_DIR/round/REVIEWER_VERDICT_CONTRACT.md` 스키마(ACCEPT|REVISE|BLOCK, **score 금지**).
 
 ## 핵심 원칙 (먼저 읽어라)
 1. **정적층은 이미 키워드를 잡는다.** 너는 regex/AST가 못 잡는 *의미·의도·서사* 잔여만 본다. literal 패턴(영문 '이전 지시 무시'류 명령·하드코딩 exfil URL)은 보고하지 마라 — 중복.
