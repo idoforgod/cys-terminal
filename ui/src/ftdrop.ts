@@ -17,6 +17,27 @@ export function splitPath(p: string): { parent: string; name: string } {
 
 export const baseName = (p: string): string => splitPath(p).name;
 
+// 부모 폴더 조회 실패(권한·IO)와 정상 조회 뒤 항목 부재를 구분한다.
+export type PathCheck = "ok" | "unreadable" | "missing";
+
+export function classifyPathCheck(entries: { name: string }[] | null, name: string): PathCheck {
+  if (entries === null) return "unreadable";
+  return entries.some((entry) => entry.name === name) ? "ok" : "missing";
+}
+
+export function pathCheckToast(
+  kind: Exclude<PathCheck, "ok">,
+  p: string,
+  idx: number,
+  total: number,
+  err?: string,
+): { name: string; detail: string } {
+  const prefix = total > 1 ? `(${idx + 1}/${total}) ` : "";
+  return kind === "unreadable"
+    ? { name: "경로 확인 실패", detail: `${prefix}${p} — 폴더를 읽을 수 없음${err ? `: ${err}` : ""}` }
+    : { name: "경로가 더 이상 없음", detail: `${prefix}${p} — 트리를 새로고침합니다` };
+}
+
 // cwd 기준 상대화 — cwd 바깥 경로는 절대경로 유지(../ 사슬은 가독성·정확성을 해친다).
 export function relativize(abs: string, cwd: string | null): string {
   if (!cwd) return abs;
