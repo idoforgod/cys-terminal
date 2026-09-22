@@ -8899,6 +8899,8 @@ def h_lane_guard_1():
         new_failures = []
         if not os.path.isfile(marker):
             new_failures.append("대응 훅 부재로 조기 종료했지만 other/state/lane-guard-tripped 표식이 없다")
+        elif "reason=absent" not in _read(marker).splitlines():
+            new_failures.append("표식에 reason=absent 줄이 없다")
         # ①' stderr 문구는 **프리루드를 직접 로드하는** 경로에서 잰다 — 훅의 규약 문장은
         #    `. "…/_lib.sh" 2>/dev/null` 이라 source 명령 전체의 stderr 가 억제된다(그 억제는
         #    이 커밋 범위 밖의 기존 계약이다). 문구가 실재한다는 사실 자체는 여기서 못박는다.
@@ -8950,7 +8952,7 @@ def h_lane_guard_1():
         if os.path.exists(marker):
             new_failures.append("대응 훅 위임 시 lane-guard-tripped 표식이 생겼다")
         need(not new_failures, " · ".join(new_failures))
-    return "양성 2(부재→조기 종료+표식 · 실재→위임) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상)"
+    return "양성 2(부재→조기 종료+표식 · 실재→위임) · 음성 4(같은 팩·비-팩·opt-out·오버레이 형상) · 표식 reason"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

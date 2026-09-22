@@ -11,12 +11,14 @@ r"""test_lane_redirect.py — WP-B-hooks 레인 위임·공통 탐지 RED 검체
   ⑤ R-5 같은 팩·성공 위임에서는 표식 무생성
   ⑥ R-6 표식 쓰기 불가에서도 exit 0·stdout 0
   ⑦ R-7 이미 위임됨·심링크 변형에서 무한 위임 차단 · 판독 불가 대상 → 표식+exit 0
+     R-7d 위임된 훅의 자손에 래치 없음 · 자손의 불일치 훅도 위임·표식 무생성
+     R-7e 같은 팩에서도 env로 상속된 위임 예약 경로 무시
   ⑧ R-8 전 프리루드 경유 훅의 redirect 호출 위치 census(런처·하위 훅 포함)
-  ⑨ R-9 혼재 프로필: base→dept 1회 + dept 직접 1회 = 카운터 2.
-     위임은 1:1이다. 프로필의 이중 실행 방지 정본은 C56 불변식(글로벌 프로필에
-     dept 훅 등록 0)이며, 여기서 두 등록을 임의로 dedup하지 않는다.
+  ⑨ R-9 혼재 프로필(base+dept 등록 공존) 이중 실행 0 — 가드가 좌석 설정에 대응 훅 등록을 보면 위임 생략 · 정본은 여전히 C56
   ⑩ P-1 읽기 전용 C83: 표식 나이·실사용 SessionStart 설정·fix 무변경·run 배선
   ⑪ P-2 공용 판독기 + bootstrap/mission hooks_effective additive 필드·exit 불변
+  ⑫ R-10 redirect 줄 없는 훅은 본문 실행 없이 표식+exit 0
+  ⑬ R-11 PATH 빈 dash 하네스에서도 위임 · exec 인터프리터 절대경로 폴백
 
 밀폐: tempfile 아래 base/dept에 hooks 전체와 bin/*.py만 복사한다(tests 제외).
 os.environ을 상속하지 않는 env에 HOME/CYS_PACK_DIR/TMPDIR/state/socket을 가둔다.
@@ -136,11 +138,22 @@ def denied(r):
 
 def r1_r5(lab):
     hook = "role-capability-gate.sh"
+    target = lab.dept / "hooks" / hook
+    original = read(target)
+    needle = '"permissionDecision":"deny","permissionDecisionReason":"%s"}}'
+    replacement = '"permissionDecision":"deny","permissionDecisionReason":"%s [DEPT-COPY]"}}'
+    count = original.count(needle)
+    write(target, original.replace(needle, replacement))
+    check("R-1 dept 사본 식별 문자열 주입", count == 1)
     reviewer = {"CYS_ROLE": "reviewer-codex"}
     same = lab.run(hook, pack=lab.base, extra=reviewer)
-    check("R-1a 같은 팩 reviewer Write deny(계측 대조)", denied(same), result(same))
+    check("R-1a 같은 팩 reviewer Write deny(계측 대조)", denied(same)
+          and "[DEPT-COPY]" not in json.loads(same.stdout)["hookSpecificOutput"]["permissionDecisionReason"],
+          result(same))
     delegated = lab.run(hook, extra=reviewer)
-    check("R-1b 타 레인 reviewer Write deny 보존", denied(delegated), result(delegated))
+    check("R-1b 타 레인 reviewer Write deny 보존", denied(delegated)
+          and "[DEPT-COPY]" in json.loads(delegated.stdout)["hookSpecificOutput"]["permissionDecisionReason"],
+          result(delegated))
     for tag, pack in (("same", lab.base), ("redirect", lab.dept)):
         master = lab.run(hook, pack=pack, extra={"CYS_ROLE": "master"})
         check("R-1c %s master deny 없음" % tag,
@@ -193,7 +206,7 @@ def r4(lab):
     first = lab.run(hook)
     first_text = read(marker)
     expected = ["script=" + hook, "hook_root=" + str(lab.base.resolve()),
-                "lane_root=" + str(lab.dept.resolve()), "surface=surface:99"]
+                "lane_root=" + str(lab.dept.resolve()), "surface=surface:99", "reason=absent"]
     fields = first_text.splitlines()
     check("R-4a 대응 훅 부재 exit 0·stdout 0·표식 필드",
           first.returncode == 0 and first.stdout == "" and marker.is_file()
@@ -238,8 +251,27 @@ def r7(lab):
     write(target, '#!/bin/sh\nprintf \'%s\' MUST-NOT-REDIRECT\n')
     r = lab.run(target.name, extra={"CYS_LANE_REDIRECTED": "1"})
     check("R-7a 이미 위임됨 → 재위임 0·exit 0·표식",
-          r.returncode == 0 and r.stdout == "" and (lab.dept / MARKER).is_file(),
-          result(r) + " marker=%s" % (lab.dept / MARKER).is_file())
+          r.returncode == 0 and r.stdout == "" and (lab.dept / MARKER).is_file()
+          and "reason=already-redirected" in read(lab.dept / MARKER).splitlines(),
+          result(r) + " marker=%r" % read(lab.dept / MARKER))
+    write(lab.dept / "hooks/serena-nudge.sh",
+          '#!/bin/sh\n'
+          '. "${0%/*}/_lib.sh" 2>/dev/null || :\n'
+          'command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"\n'
+          'sh -c \'printf "latch=%s\\n" "${CYS_LANE_REDIRECTED:-unset}"\'\n'
+          'sh "$BASE_HOOKS/verify-reminder.sh"\n')
+    write(lab.dept / "hooks/verify-reminder.sh", "#!/bin/sh\nprintf 'DEPT-VERIFY-RAN\\n'\n")
+    marker = lab.dept / MARKER
+    marker.unlink(missing_ok=True)
+    r = lab.run("serena-nudge.sh", extra={"BASE_HOOKS": str(lab.base / "hooks")})
+    check("R-7d 위임된 훅의 자손에 래치 없음·자손의 불일치 훅도 위임·표식 무생성",
+          r.returncode == 0 and "latch=unset" in r.stdout.splitlines()
+          and "DEPT-VERIFY-RAN" in r.stdout.splitlines() and not marker.exists(),
+          result(r) + " marker=%s" % marker.exists())
+    evil = lab.root / "evil.sh"
+    write(evil, "#!/bin/sh\nprintf EVIL-RAN\n")
+    r = lab.run("grill-count.sh", pack=lab.base, extra={"CYS_LANE_REDIRECT": str(evil)})
+    check("R-7e 예약 변수 env 무시", "EVIL-RAN" not in r.stdout, result(r))
     # 프리루드 파일이 base를 가리켜도 $0의 dept 경로로 끝나야 한다.
     shutil.copy2(lab.base / "hooks/role-capability-gate.sh",
                  lab.dept / "hooks/role-capability-gate.sh")
@@ -256,8 +288,9 @@ def r7(lab):
             target.chmod(0o000)
             r = lab.run(target.name)
             check("R-7c 판독 불가 대상 → 표식+exit 0·stdout 0",
-                  r.returncode == 0 and r.stdout == "" and marker.is_file(),
-                  result(r) + " marker=%s" % marker.is_file())
+                  r.returncode == 0 and r.stdout == "" and marker.is_file()
+                  and "reason=unreadable" in read(marker).splitlines(),
+                  result(r) + " marker=%r" % read(marker))
         finally:
             target.chmod(0o755)
 
@@ -299,16 +332,85 @@ def r8():
 def r9(lab):
     hook = "role-capability-gate.sh"
     write(lab.dept / "hooks" / hook, '#!/bin/sh\ncat >/dev/null\nprintf x >> "$COUNT"\n')
-    count = lab.root / "count"
-    extra = {"COUNT": str(count)}
+    foreign, own = lab.base / "hooks" / hook, lab.dept / "hooks" / hook
+    cfg = lab.root / "cfg"
+    profile(lab, [foreign, own], cfg, event="PreToolUse")
+    count = lab.root / "count-a"
+    write(count, "")
+    extra = {"COUNT": str(count), "CLAUDE_CONFIG_DIR": str(cfg)}
     first = lab.run(hook, extra=extra)
     one = read(count)
+    marker_absent = not (lab.dept / MARKER).exists()
     second = lab.run(hook, source=lab.dept, extra=extra)
     two = read(count)
-    check("R-9 혼재 등록은 위임 1+직접 1=2회",
-          first.returncode == second.returncode == 0 and one == "x" and two == "xx",
-          "after_base=%r after_dept=%r rc=(%d,%d)" %
-          (one, two, first.returncode, second.returncode))
+    check("R-9a 혼재 등록 = 위임 생략 · 직접 1회 · 합계 1",
+          first.returncode == second.returncode == 0 and first.stdout == ""
+          and one == "" and two == "x" and marker_absent
+          and not (lab.dept / MARKER).exists(),
+          "after_base=%r after_dept=%r marker_absent=%s %s / %s" %
+          (one, two, marker_absent, result(first), result(second)))
+
+    profile(lab, [foreign], cfg, event="PreToolUse")
+    count = lab.root / "count-b"
+    write(count, "")
+    r = lab.run(hook, extra={"COUNT": str(count), "CLAUDE_CONFIG_DIR": str(cfg)})
+    check("R-9b base만 등록 = 위임 1:1 유지",
+          r.returncode == 0 and read(count) == "x", result(r) + " count=%r" % read(count))
+
+    profile(lab, [foreign], lab.root / "home/.claude", event="PreToolUse")
+    project_settings = profile(lab, [own], lab.root / "work/.claude", event="PreToolUse")
+    project_local = project_settings.with_name("settings.local.json")
+    project_settings.rename(project_local)
+    count = lab.root / "count-c"
+    write(count, "")
+    r = lab.run(hook, extra={"COUNT": str(count)})
+    check("R-9c 프로젝트 설정 등록 = 위임 생략",
+          r.returncode == 0 and r.stdout == "" and read(count) == "",
+          result(r) + " count=%r" % read(count))
+
+    # 프로젝트의 정규화 경로 등록이 원형 alias 경로 검증을 대신 통과시키지 않게 제거한다.
+    project_local.unlink()
+    alias = lab.root / "dept-alias"
+    alias.symlink_to(lab.dept, target_is_directory=True)
+    profile(lab, [alias / "hooks" / hook], cfg, event="PreToolUse")
+    count = lab.root / "count-d"
+    write(count, "")
+    r = lab.run(hook, pack=alias,
+                extra={"COUNT": str(count), "CLAUDE_CONFIG_DIR": str(cfg)})
+    check("R-9d CYS_PACK_DIR 원형 경로 등록 = 위임 생략",
+          r.returncode == 0 and read(count) == "", result(r) + " count=%r" % read(count))
+
+
+def r10(lab):
+    hook = "nolink-probe.sh"
+    write(lab.base / "hooks" / hook,
+          '#!/bin/sh\n. "${0%/*}/_lib.sh" 2>/dev/null || :\nprintf BODY-RAN\n')
+    write(lab.dept / "hooks" / hook, "#!/bin/sh\nprintf DEPT-RAN\n")
+    r = lab.run(hook)
+    marker = lab.dept / MARKER
+    check("R-10 redirect 줄 없는 훅 → 본문 실행 0·stdout 0·표식",
+          r.returncode == 0 and r.stdout == "" and marker.is_file()
+          and "reason=no-redirect-line" in read(marker).splitlines(),
+          result(r) + " marker=%r" % read(marker))
+
+
+def r11(lab):
+    if not Path("/bin/dash").is_file():
+        print("SKIP R-11 dash 부재")
+    else:
+        write(lab.dept / "hooks/grill-arm.sh", "#!/bin/sh\nprintf DEPT-RAN\n")
+        # dash는 누락된 source 파일에서 즉시 종료하므로, PATH가 비면 dirname 실패가
+        # exec 폴백 측정을 가린다. 임시 base 사본의 프리루드 경로만 셸 내장 확장으로 쓴다.
+        base_hook = lab.base / "hooks/grill-arm.sh"
+        write(base_hook, read(base_hook).replace(
+            '. "$(dirname "$0")/_lib.sh"', '. "${0%/*}/_lib.sh"', 1))
+        r = subprocess.run(["/bin/dash", str(base_hook)],
+                           env={**lab.env, "PATH": ""}, input=lab.payload,
+                           cwd=lab.root / "work", capture_output=True, text=True, timeout=60)
+        check("R-11 PATH 빈 dash 하네스 위임",
+              r.returncode == 0 and r.stdout == "DEPT-RAN", result(r))
+    check("R-11 exec 인터프리터 절대경로 폴백",
+          'exec "${BASH:-/bin/sh}"' in read(PACK / "hooks/_lib.sh"))
 
 
 @contextmanager
@@ -342,10 +444,11 @@ def snapshot(root):
             for p in root.rglob("*")}
 
 
-def seed_marker(lab, age=0):
+def seed_marker(lab, age=0, reason="absent"):
     marker = lab.dept / MARKER
     write(marker, "hook_root=%s\nlane_root=%s\nscript=grill-arm.sh\n"
-          "surface=surface:99\nts=%d\n" % (lab.base.resolve(), lab.dept.resolve(), time.time()))
+          "surface=surface:99\nts=%d\nreason=%s\n" %
+          (lab.base.resolve(), lab.dept.resolve(), time.time(), reason))
     stamp = time.time() - age
     os.utime(marker, (stamp, stamp))
     return marker
@@ -369,10 +472,10 @@ def c83(pf, lab, name, status, contains=(), fix=False, detail_test=None):
     attempt(name, action)
 
 
-def profile(lab, paths, cfg=None):
+def profile(lab, paths, cfg=None, event="SessionStart"):
     cfg = cfg or lab.root / "cfg"
     settings = cfg / "settings.json"
-    write(settings, json.dumps({"hooks": {"SessionStart": [
+    write(settings, json.dumps({"hooks": {event: [
         {"hooks": [{"type": "command", "command": 'sh "%s"' % path}]}
         for path in paths]}}, ensure_ascii=False, indent=2) + "\n")
     return settings
@@ -382,13 +485,17 @@ def p1(pf, lab):
     c83(pf, lab, "P-1a 표식 없음 → PASS", pf.PASS)
     marker = seed_marker(lab)
     c83(pf, lab, "P-1b 최근 표식 → FAIL·표식 인용·처방", pf.FAIL,
-        ("script=", "CLAUDE_CONFIG_DIR"))
+        ("script=", "reason=absent", "CLAUDE_CONFIG_DIR", "삭제"),
+        detail_test=lambda detail: str(lab.dept / MARKER) in detail)
     old = time.time() - 25 * 3600
     os.utime(marker, (old, old))
     c83(pf, lab, "P-1c 25h 표식 → PASS·나이 상세", pf.PASS,
         detail_test=lambda detail: bool(re.search(
             r"(?:\d+(?:\.\d+)?\s*(?:초|시간|일|[smhd]\b)|age(?:_s)?\s*[=:]\s*\d)",
             detail, re.IGNORECASE)))
+    seed_marker(lab, reason="no-redirect-line")
+    c83(pf, lab, "P-1g redirect 줄 없는 훅 표식 → FAIL·원인별 처방", pf.FAIL,
+        ("reason=no-redirect-line", "redirect 줄"))
     marker.unlink()
     os.environ.update(CLAUDECODE="1", CLAUDE_CONFIG_DIR=str(lab.root / "cfg"))
     foreign = lab.base / "hooks/inject-context.sh"
@@ -431,7 +538,7 @@ def p2(pf, lab):
     marker = lab.dept / MARKER
     marker.unlink(missing_ok=True)
 
-    def reader(name, recent, info_expected):
+    def reader(name, recent, info_expected, reason_expected=None):
         def action():
             before = snapshot(lab.root)
             try:
@@ -447,6 +554,8 @@ def p2(pf, lab):
                 and info.get("path") == str(marker)
                 and isinstance(info.get("age_s"), (float, int))
                 and (info["age_s"] >= 24 * 3600 if not recent else 0 <= info["age_s"] < 24 * 3600))
+            if reason_expected is not None:
+                valid = valid and info.get("reason") == reason_expected
             # 두 호출 사이 시간이 흐르므로 age_s의 숫자 자체를 동일시하지 않는다.
             valid = valid and default[0] is recent and (default[1] is None if not info_expected
                                                        else default[1].get("script") == "grill-arm.sh")
@@ -455,7 +564,7 @@ def p2(pf, lab):
 
     reader("P-2a 판독기 표식 없음 → (False, None)", False, False)
     seed_marker(lab)
-    reader("P-2b 판독기 최근 → (True, info)", True, True)
+    reader("P-2b 판독기 최근 → (True, info)", True, True, reason_expected="absent")
     seed_marker(lab, age=25 * 3600)
     reader("P-2c 판독기 오래됨 → (False, info)", False, True)
 
@@ -494,6 +603,17 @@ def p2(pf, lab):
         check("P-2f mission 표식 %s rc 불변·hooks_effective=%s" % (label, expected),
               r.returncode in (1, 2) and doc.get("hooks_effective") is expected, result(r))
 
+    for module in ("bootstrap", "mission"):
+        source = read(lab.dept / ("bin/javis_%s.py" % module))
+        node = next((node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "_hooks_effective"), None)
+        src = ast.get_source_segment(source, node) if node is not None else ""
+        forbidden = [token for token in ("24 * 3600", "24*3600", "86400", "getmtime")
+                     if token in src]
+        check("P-2g %s hooks_effective 미측정=None·24h 재구현 0" % module,
+              "return None" in src and not forbidden,
+              "return_None=%s forbidden=%r" % ("return None" in src, forbidden))
+
 
 def preflight_cases(lab):
     with sealed_process(lab.env, lab.root / "work"):
@@ -508,7 +628,8 @@ def main():
         root = Path(tmp)
         for name, action in (("R-1/R-5", r1_r5), ("R-2", r2), ("R-3", r3),
                              ("R-4", r4), ("R-6", r6), ("R-7", r7),
-                             ("R-9", r9), ("P-1/P-2", preflight_cases)):
+                             ("R-9", r9), ("R-10", r10), ("R-11", r11),
+                             ("P-1/P-2", preflight_cases)):
             attempt(name, lambda name=name, action=action:
                     action(Lab(root / name.replace("/", "-"))))
         attempt("R-8 census", r8)
