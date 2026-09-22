@@ -2497,9 +2497,20 @@ def cmd_self_test(args):
                                                              "updated_at": now_ts}}), now_ts)
     t.check("비-statusline 측정 → skip", not v["pass"])
 
-    # 5-c) ★송신 0건 보류만 자동 재시도 — reset 우선·쿨다운 경계·연속 상한.
+    # 5-c) 비파괴 보류는 감쇠 재시도 — reset 우선·지수 쿨다운·구조적 보류만 상한.
     print("[5-c] held_noop 재시도 게이트")
-    held_led = {"cycles": 2, "last_terminal_phase": HELD_PHASE, "held_streak": 2,
+    t.check("held 재시도 상수: 300s·구조 상한/통지 주기 3회·최대 1200s",
+            HELD_RETRY_COOLDOWN_SECS == 300.0 and HELD_RETRY_MAX == 3
+            and COOLDOWN_SECS == 1200)
+    held_cooldown_fn = globals().get("held_cooldown_secs")
+    for streak, expected in ((1, 300), (2, 600), (3, 1200), (4, 1200),
+                             (0, 300), (-1, 300)):
+        actual = held_cooldown_fn(streak) if callable(held_cooldown_fn) else None
+        t.check("held_cooldown_secs(%d) → %ds" % (streak, expected),
+                callable(held_cooldown_fn) and actual == expected,
+                "실제 %r (심볼 부재도 FAIL)" % actual)
+    held_led = {"cycles": 1, "last_terminal_phase": HELD_PHASE, "held_streak": 1,
+                "held_structural_streak": 0,
                 "last_terminal_ts": now_ts - HELD_RETRY_COOLDOWN_SECS + 1,
                 "incomplete": False, "corrupt": False}
     v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
@@ -2508,12 +2519,39 @@ def cmd_self_test(args):
     held_led["last_terminal_ts"] = now_ts - HELD_RETRY_COOLDOWN_SECS
     v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
     t.check("held + 300s → 게이트5 통과", v["pass"], v["reason"])
-    held_led["held_streak"] = HELD_RETRY_MAX
+    held_led.update({"cycles": 3, "held_streak": 3,
+                     "last_terminal_ts": now_ts - 1200})
     v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
-    t.check("연속 보류 3회 → 차단 + reset 요구",
-            not v["pass"] and "연속 보류 3회" in v["reason"]
-            and "사람 확인 후 reset" in v["reason"]
-            and any(g.get("held_limit") for g in v["gates"]))
+    t.check("비구조 연속 보류 3회 + 1200s → 통과(reset 불필요)",
+            v["pass"] and not any(g.get("held_limit") for g in v["gates"]),
+            v["reason"])
+    for streak, elapsed, expected_ok, cooldown in ((2, 599, False, 600),
+                                                  (2, 600, True, 600),
+                                                  (5, 1199, False, 1200),
+                                                  (5, 1200, True, 1200)):
+        held_led.update({"cycles": streak, "held_streak": streak,
+                         "last_terminal_ts": now_ts - elapsed})
+        v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+        gate5 = next(g for g in v["gates"] if g["id"] == 5)
+        t.check("held 연속 %d회 + %ds → 게이트5 %s(필요 %ds)"
+                % (streak, elapsed, "통과" if expected_ok else "차단", cooldown),
+                v["pass"] is expected_ok and gate5["ok"] is expected_ok
+                and not gate5.get("held_limit")
+                and "필요 %ds" % cooldown in gate5["detail"]
+                and "연속 %d회" % streak in gate5["detail"], gate5["detail"])
+    held_led.update({"cycles": 10, "held_streak": 10,
+                     "last_terminal_ts": now_ts - 1200})
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    t.check("비구조 연속 보류 10회 + 1200s → 통과(하드 정지 없음)",
+            v["pass"] and not any(g.get("held_limit") for g in v["gates"]),
+            v["reason"])
+    held_led.update({"cycles": 3, "held_streak": 3, "held_structural_streak": 3})
+    v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
+    gate5 = next(g for g in v["gates"] if g["id"] == 5)
+    t.check("구조적 보류 3회 → 게이트5 차단 + held_limit + 데몬/reset 진단",
+            not v["pass"] and not gate5["ok"] and gate5.get("held_limit") is True
+            and all(word in gate5["detail"] for word in ("구조적 보류", "데몬", "reset")),
+            gate5["detail"])
     held_led["last_reset_ts"] = now_ts - RESET_COOLDOWN_SECS + 1
     v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
     t.check("held 상한 뒤 reset + 179s → reset 쿨다운 차단",
@@ -2521,6 +2559,44 @@ def cmd_self_test(args):
     held_led["last_reset_ts"] = now_ts - RESET_COOLDOWN_SECS
     v = evaluate_gates("worker", ctx_of(ledger=held_led), now_ts)
     t.check("held 상한 뒤 reset + 180s → 통과", v["pass"], v["reason"])
+
+    # 5-d) 순수 분류·실측 파서 — 새 심볼이 없어도 이 검체만 FAIL, 뒤 검체는 계속 실행.
+    print("[5-d] held 분류·residual_window 실측 파싱")
+    t.check("QUIET_UNREPORTED_DIAG 기계 토큰 고정",
+            globals().get("QUIET_UNREPORTED_DIAG") == "quiet_secs_unreported")
+    held_classify_fn = globals().get("held_classify")
+    for label, rc, tail, expected in (
+            ("rc84 구조", 84, "[diag=quiet_secs_unreported]",
+             {"structural": True, "alive_evidence": None, "keys_sent": "0건"}),
+            ("rc84 비구조", 84, "대상이 유휴 대기 창 내내 턴 중",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc85 키 송신 없음", 85, "[diag=quiet_secs_unreported] 사람 초안 감지",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
+              "keys_sent": "0건"}),
+            ("rc85 타이핑 가드", 85, "[cycle 5/7] 입력 버퍼 정리 + '/clear'\n",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
+              "keys_sent": "C-u 1건(타이핑 가드 거부 경로)"})):
+        actual = held_classify_fn(rc, tail) if callable(held_classify_fn) else None
+        t.check("held_classify: %s" % label,
+                callable(held_classify_fn) and isinstance(actual, dict)
+                and actual == expected and actual.get("structural") is expected["structural"],
+                "실제 %r (심볼 부재도 FAIL)" % actual)
+    residual_re = globals().get("RESIDUAL_WINDOW_RE")
+    t.check("RESIDUAL_WINDOW_RE: 소수 초 기계 토큰 정규식",
+            getattr(residual_re, "pattern", None) == r"residual_window=(\d+\.\d+)s"
+            and callable(getattr(residual_re, "finditer", None)))
+    residual_parse_fn = globals().get("parse_residual_window")
+    for label, text, expected in (
+            ("여러 줄의 마지막 매치 → 12.3",
+             "앞 residual_window=3.4s 뒤\n앞 residual_window=12.3s 뒤", 12.3),
+            ("실측 없음 → None", "[cycle] 실측 없음\n", None)):
+        actual = residual_parse_fn(text) if callable(residual_parse_fn) else None
+        t.check("parse_residual_window: %s" % label,
+                callable(residual_parse_fn) and actual == expected
+                and (expected is None or isinstance(actual, float)),
+                "실제 %r (심볼 부재도 FAIL)" % actual)
 
     # 6) 원장 뷰
     print("[6] 원장 뷰(짝짓기 입력)")
@@ -2576,6 +2652,42 @@ def cmd_self_test(args):
     lvh = ledger_view(latest_terminal, "worker", 0)
     t.check("held_streak: 종결 ts 동률은 원장 뒤쪽 기록 우선",
             lvh["last_terminal_phase"] == "failed" and lvh["held_streak"] == 0)
+    structural_recs = [
+        {"ts": 100, "cycle_id": 1, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 84, "structural": True}},
+        {"ts": 200, "cycle_id": 2, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 85, "structural": False}},
+        {"ts": 300, "cycle_id": 3, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 84, "structural": True}}]
+    lvs = ledger_view(structural_recs, "worker", 0)
+    t.check("held_structural_streak: [84 구조][85][84 구조] → (3,2)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (3, 2))
+    success_recs = structural_recs + [
+        {"ts": 400, "cycle_id": 4, "phase": SUCCESS_PHASE, "role": "worker"}]
+    lvs = ledger_view(success_recs, "worker", 0)
+    t.check("held_structural_streak: 성공으로 보류 구간 단절 → (0,0)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (0, 0))
+    success_recs.append(
+        {"ts": 500, "cycle_id": 5, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 84, "structural": True}})
+    lvs = ledger_view(success_recs, "worker", 0)
+    t.check("held_structural_streak: 성공 뒤 구조 보류 1회 → (1,1)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (1, 1))
+    lvs = ledger_view(structural_recs + [
+        {"ts": 400, "cycle_id": 4, "phase": "failed", "role": "worker"}], "worker", 0)
+    t.check("held_structural_streak: failed 로 보류 구간 단절 → (0,0)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (0, 0))
+    lvs = ledger_view(structural_recs + [
+        {"ts": 400, "cycle_id": None, "phase": "reset", "role": "worker"}], "worker", 0)
+    t.check("held_structural_streak: reset 뒤 → (0,0)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (0, 0))
+    lvs = ledger_view(structural_recs[:1] + [
+        {"ts": 200, "cycle_id": 2, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 84, "structural": 1}},
+        {"ts": 300, "cycle_id": 3, "phase": "held_noop", "role": "worker",
+         "detail": {"rc": 84, "structural": "true"}}], "worker", 0)
+    t.check("held_structural_streak: structural is True 만 집계(1·문자열 제외)",
+            (lvs.get("held_streak"), lvs.get("held_structural_streak")) == (3, 1))
 
     # 7) argv·저장세트 계약 — [R2-A] 대상 surface 기준 파생
     print("[7] save-file 대상 surface 파생 + argv 계약")
@@ -3208,79 +3320,283 @@ def cmd_self_test(args):
             'os.path.join(STATE_DIR, "bootstrap.lock")' in _insp.getsource(_BootstrapLock)
             and "STATE_JSON" not in _insp.getsource(_BootstrapLock))
 
-    # 18) ★보류 종료 경로 — 실제 임시 lease/원장 + 자식·데몬 호출만 페이크(실송신 0).
-    print("[18] held 자식 종료·상한 통지 (데몬 없이 주입식)")
+    # 18) ★보류 종료 경로 — 실제 임시 lease/원장 + 자식·데몬 호출만 페이크.
+    print("[18] held 자식 종료·감쇠 재시도·유한 통지 (데몬 없이 주입식)")
     import io
     from unittest.mock import Mock, patch
     held_dir = os.path.join(tmpd, "held-execute")
     os.makedirs(held_dir)
     release_real = release_quiesce
-    for child_rc in (84, 85, 86):
-        cid = 8000 + child_rc
-        child = Mock(stdout=io.StringIO("held-fixture rc=%d\n" % child_rc))
-        child.poll.return_value = child_rc
+    finalize_real, read_real, view_real = _finalize, read_ledger, ledger_view
+    fixture_ids = iter(range(8084, 8184))
+    residual_line = "[cycle] residual_window=12.3s (검증자 allow→clear)\n"
+    typing_line = "[cycle 5/7] 입력 버퍼 정리 + '/clear'\n"
+    busy_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
+    draft_evidence = "rc85: 사람 초안·입력 감지"
+    typing_keys = "C-u 1건(타이핑 가드 거부 경로)"
+
+    def execute_fixture(child_rc, prior=(), output=None, abort=False):
+        cid = next(fixture_ids)
+        fixture_ts = now_ts + cid
+        if output is None:
+            output = ("held-fixture rc=%d\n" % child_rc) + residual_line
+            if child_rc == 85:
+                output += typing_line
+        child = Mock(stdout=io.StringIO(output))
+        if abort:
+            child.poll.side_effect = [None, child_rc]
+        else:
+            child.poll.return_value = child_rc
         sleeper, notifier, appender = Mock(), Mock(), Mock()
         post = Mock(return_value={"verdict": "failed_preclear"})
         qrunner = Mock(return_value=(0, "", ""))
+        events = []
+
+        def finalized(*a, **kw):
+            result = finalize_real(*a, **kw)
+            events.append("finalized")
+            return result
+
+        def reread(*a, **kw):
+            events.append("read_ledger")
+            return read_real(*a, **kw)
+
+        def reviewed(*a, **kw):
+            events.append("ledger_view")
+            return view_real(*a, **kw)
+
+        notifier.side_effect = lambda *a, **kw: events.append("notify")
         paths = {"STATE_DIR": held_dir, "STATE_JSON": os.path.join(held_dir, "state.json"),
                  "BASELINE_DIR": os.path.join(held_dir, "baselines"),
                  "CYCLE_LOG": os.path.join(held_dir, "cycle-%d.jsonl" % cid)}
-        deps = dict(paths, mode=lambda: MODE_LIVE, kill_switch=lambda: (False, ""),
+        killed = (Mock(side_effect=[(False, ""), (True, "fixture pause")])
+                  if abort else lambda: (False, ""))
+        deps = dict(paths, mode=lambda: MODE_LIVE, kill_switch=killed,
                     fetch_status=lambda: {"surfaces": [{"role": VERIFIER_ROLE, "surface_id": 3}]},
                     verifier_collision=lambda *a: (False, ""),
                     push_line=lambda *a: (True, ""), escalate=notifier, ledger_append=appender,
-                    post_verify=post,
+                    post_verify=post, _finalize=finalized, read_ledger=reread, ledger_view=reviewed,
                     release_quiesce=lambda *a: release_real(*a, runner=qrunner))
         with patch.dict(globals(), deps), patch.object(subprocess, "Popen", return_value=child), \
-                patch.object(time, "sleep", sleeper):
+                patch.object(time, "sleep", sleeper), \
+                patch.object(time, "time", return_value=fixture_ts):
+            # 서로 다른 cycle 종결을 실제 CYCLE_LOG 에 심는다(뷰·streak 자체는 모킹 금지).
+            for i, structural in enumerate(prior):
+                log_append({"ts": fixture_ts - 10000 + i,
+                            "cycle_id": cid - len(prior) + i, "phase": "held_noop",
+                            "role": "worker", "surface": "surface:9",
+                            "detail": {"child_rc": 84 if structural else 85,
+                                       "structural": structural}}, path=paths["CYCLE_LOG"])
             save_state({"lease": {"cycle_id": cid, "role": "worker", "surface": "surface:9",
                                   "phase": "armed", "save_files": [sess]}})
             result = cmd_execute(argparse.Namespace(cycle_id=cid, role="worker"))
-            observed, bad = read_ledger()
+            # 검체의 조회를 execute 의 종결 후 재조회로 오인하지 않게 실제 함수를 직접 호출.
+            observed, bad = read_real()
             final_state = load_state()
-        if child_rc in HELD_RCS:
-            terminal = observed[-1]
-            detail = terminal["detail"]
-            t.check("rc%d: held 종결·lease 해제·합법 전이" % child_rc,
-                    not bad and terminal["phase"] == HELD_PHASE and "lease" not in final_state
-                    and all("illegal_transition_from" not in r["detail"] for r in observed))
-            t.check("rc%d: settle/post_verify 0회 + EXIT_ERR" % child_rc,
-                    result == EXIT_ERR and not sleeper.called and not post.called)
-            t.check("rc%d: 송신 0건·tail·재시도 시각·종결 원장·전용 통지" % child_rc,
-                    detail["child_rc"] == child_rc and detail["clear_sent"] is False
-                    and "송신 0건" in detail["reason"] and "held-fixture" in detail["tail"]
-                    and abs(detail["retry_after_ts"] - terminal["ts"]
-                            - HELD_RETRY_COOLDOWN_SECS) < 1
-                    and appender.call_args.args == ("cycle", "cycle-autopilot",
-                        {"phase": HELD_PHASE, "id": nonce_for(cid), "role": "worker"})
-                    and notifier.call_args.kwargs == {"task_key": "autopilot-held"}
-                    and all(s in notifier.call_args.args[0]
-                            for s in ("비파괴 보류", "자동 재시도", "reset 불필요", "연속 보류 3회")))
-            t.check("rc%d: 기존 quiesce-off 멱등 안전망" % child_rc,
-                    qrunner.call_args.args[0] == [CYS, "quiesce", "--surface", "surface:9", "--off"])
-        else:
-            t.check("rc86: settle + post_verify 유지(held 우회 금지)",
-                    result == EXIT_ERR and sleeper.call_args.args == (SETTLE_SECS,)
-                    and post.call_count == 1 and not notifier.called and not qrunner.called
-                    and all(r["phase"] != HELD_PHASE for r in observed))
+        current = [r for r in observed if r.get("cycle_id") == cid]
+        terminal = next((r for r in reversed(current)
+                         if r.get("phase") in TERMINAL_PHASES), {})
+        exited = next((r.get("detail", {}) for r in current
+                       if r.get("phase") == "executor_exited"), {})
+        fired = next((r.get("detail", {}) for r in current if r.get("phase") == "fired"), {})
+        return {"cid": cid, "result": result, "observed": current, "bad": bad,
+                "terminal": terminal, "detail": terminal.get("detail", {}),
+                "exited": exited, "fired": fired, "state": final_state, "events": events,
+                "sleeper": sleeper, "notifier": notifier, "appender": appender,
+                "post": post, "qrunner": qrunner, "paths": paths}
+
+    def check_held_counts(name, fixture, streak, structural_streak, cooldown):
+        detail, terminal = fixture["detail"], fixture["terminal"]
+        t.check("%s: 이번 포함 streak=%d·구조=%d·쿨다운=%ds·재시도 시각" %
+                (name, streak, structural_streak, cooldown),
+                type(detail.get("held_streak")) is int and detail.get("held_streak") == streak
+                and type(detail.get("held_structural_streak")) is int
+                and detail.get("held_structural_streak") == structural_streak
+                and detail.get("cooldown_secs") == cooldown
+                and detail.get("retry_after_ts") == terminal.get("ts", 0) + cooldown)
+
+    def check_held_notice(name, fixture, expected_count, task_key="autopilot-held",
+                          streak=1, cooldown=300):
+        notifier = fixture["notifier"]
+        terms = (("구조적 보류", "데몬", "reset") if task_key == "autopilot-held-limit"
+                 else ("비파괴 보류", "자동 재시도", "reset 불필요"))
+        t.check("%s: %s 통지 %d회" % (name, task_key, expected_count),
+                notifier.call_count == expected_count
+                and (expected_count == 0 or
+                     (notifier.call_args.kwargs == {"task_key": task_key}
+                      and all(s in notifier.call_args.args[0] for s in terms)
+                      and (task_key == "autopilot-held-limit" or
+                           all(re.search(r"(?<![\d.])%d(?:\.0)?(?![\d.])" % value,
+                                         notifier.call_args.args[0])
+                               for value in (streak, cooldown))))))
+
+    # 상수 뮤테이션이 검체의 분기까지 바꾸지 못하도록 84/85 와 86 을 리터럴로 분리한다.
+    for child_rc in (84, 85):
+        fixture = execute_fixture(child_rc)
+        terminal, detail = fixture["terminal"], fixture["detail"]
+        notifier, appender = fixture["notifier"], fixture["appender"]
+        t.check("rc%d: held 종결·lease 해제·합법 전이" % child_rc,
+                not fixture["bad"] and terminal.get("phase") == HELD_PHASE
+                and "lease" not in fixture["state"]
+                and all("illegal_transition_from" not in r["detail"] for r in fixture["observed"]))
+        t.check("rc%d: settle/post_verify 0회 + EXIT_ERR" % child_rc,
+                fixture["result"] == EXIT_ERR and not fixture["sleeper"].called
+                and not fixture["post"].called)
+        t.check("rc%d: 송신 0건·tail·재시도 시각·종결 원장·전용 통지" % child_rc,
+                detail.get("child_rc") == child_rc and detail.get("clear_sent") is False
+                and "송신 0건" in detail.get("reason", "") and "held-fixture" in detail.get("tail", "")
+                and abs(detail.get("retry_after_ts", 0) - terminal.get("ts", 0) - 300) < 1
+                and appender.call_args is not None
+                and appender.call_args.args == ("cycle", "cycle-autopilot",
+                    {"phase": HELD_PHASE, "id": nonce_for(fixture["cid"]), "role": "worker"})
+                and notifier.call_count == 1
+                and notifier.call_args.kwargs == {"task_key": "autopilot-held"}
+                and all(s in notifier.call_args.args[0]
+                        for s in ("비파괴 보류", "자동 재시도", "reset 불필요")))
+        t.check("rc%d: 기존 quiesce-off 멱등 안전망" % child_rc,
+                fixture["qrunner"].call_args is not None
+                and fixture["qrunner"].call_args.args[0] ==
+                [CYS, "quiesce", "--surface", "surface:9", "--off"])
+        keys = "0건" if child_rc == 84 else typing_keys
+        t.check("rc%d: 비구조·생존 근거·키 송신·정확한 보류 사유" % child_rc,
+                detail.get("structural") is False
+                and detail.get("alive_evidence") == (busy_evidence if child_rc == 84 else draft_evidence)
+                and detail.get("keys_sent") == keys
+                and detail.get("reason") == "비파괴 보류(clear 송신 0건 · 키 송신 %s)" % keys)
+        check_held_counts("rc%d" % child_rc, fixture, 1, 0, 300)
+        check_held_notice("rc%d 첫 보류" % child_rc, fixture, 1)
+        t.check("rc%d: held·executor_exited 실측 residual_window_secs=12.3" % child_rc,
+                type(detail.get("residual_window_secs")) is float
+                and detail.get("residual_window_secs") == 12.3
+                and type(fixture["exited"].get("residual_window_secs")) is float
+                and fixture["exited"].get("residual_window_secs") == 12.3)
+        t.check("rc%d: fired 정적 문면은 residual_window_note" % child_rc,
+                fixture["fired"].get("residual_window_note") == RESIDUAL_WINDOW_NOTE
+                and "residual_window" not in fixture["fired"])
+        events = fixture["events"]
+        after = events[events.index("finalized") + 1:] if "finalized" in events else []
+        t.check("rc%d: _finalize 뒤 read_ledger→ledger_view 재조회 후 통지" % child_rc,
+                "read_ledger" in after and "ledger_view" in after and "notify" in after
+                and after.index("read_ledger") < after.index("ledger_view") < after.index("notify"))
+
+    child_rc = 86
+    fixture = execute_fixture(child_rc)
+    t.check("rc86: settle + post_verify 유지(held 우회 금지)",
+            fixture["result"] == EXIT_ERR and fixture["sleeper"].call_count == 1
+            and fixture["sleeper"].call_args.args == (SETTLE_SECS,)
+            and fixture["post"].call_count == 1 and not fixture["notifier"].called
+            and not fixture["qrunner"].called
+            and all(r["phase"] != "held_noop" for r in fixture["observed"]))
+    t.check("rc86: executor_exited 실측 residual_window_secs=12.3",
+            fixture["exited"].get("residual_window_secs") == 12.3)
+
+    for streak in (2, 3, 4, 5, 6, 7):
+        fixture = execute_fixture(85, prior=(False,) * (streak - 1))
+        cooldown = 600 if streak == 2 else 1200
+        name = "비구조 보류 %d회째" % streak
+        check_held_counts(name, fixture, streak, 0, cooldown)
+        check_held_notice(name, fixture, 1 if streak in (3, 6) else 0,
+                          streak=streak, cooldown=cooldown)
+
+    structural_output = "held-fixture rc=84 [diag=quiet_secs_unreported]\n" + residual_line
+    fixture = execute_fixture(84, output=structural_output)
+    detail = fixture["detail"]
+    t.check("구조 rc84: structural=True·alive_evidence=None·키 0건·사유",
+            detail.get("structural") is True and "alive_evidence" in detail
+            and detail.get("alive_evidence") is None and detail.get("keys_sent") == "0건"
+            and detail.get("reason") == "비파괴 보류(clear 송신 0건 · 키 송신 0건)")
+    check_held_counts("구조 보류 첫 회", fixture, 1, 1, 300)
+    check_held_notice("구조 보류 첫 회", fixture, 1)
+    for name, prior, structural_streak, notify_count in (
+            ("구조 보류 3회째", (True, True), 3, 1),
+            ("구조 보류 4회째(상한 통지 반복 금지)", (True, True, True), 4, 0),
+            ("혼합 held 4회째·구조 3회 도달", (True, False, True), 3, 1)):
+        fixture = execute_fixture(84, prior=prior, output=structural_output)
+        check_held_counts(name, fixture, len(prior) + 1, structural_streak, 1200)
+        check_held_notice(name, fixture, notify_count, task_key="autopilot-held-limit")
+
+    # 줄 단위 수치 보관: 최신 매치도 400줄 sink 절단과 최종 tail 절단에서 사라진다.
+    fixture = execute_fixture(84, output=("[cycle] residual_window=3.4s\n" + residual_line
+                              + "held-fixture padding\n" * 450))
+    t.check("held·executor_exited: 450줄 뒤 sink 절단에도 마지막 실측 12.3 보존",
+            "residual_window=" not in fixture["detail"].get("tail", "")
+            and fixture["detail"].get("residual_window_secs") == 12.3
+            and fixture["exited"].get("residual_window_secs") == 12.3)
+    fixture = execute_fixture(84, output="held-fixture 실측 없음\n")
+    t.check("held·executor_exited: 실측 없으면 수치 키 존재·None",
+            all("residual_window_secs" in d and d["residual_window_secs"] is None
+                for d in (fixture["detail"], fixture["exited"])))
+    fixture = execute_fixture(-15, abort=True)
+    t.check("in-flight abort: EXIT_KILL·정적 문면은 residual_window_note",
+            fixture["result"] == EXIT_KILL and fixture["terminal"].get("phase") == "failed"
+            and fixture["detail"].get("residual_window_note") == RESIDUAL_WINDOW_NOTE
+            and "residual_window" not in fixture["detail"])
 
     cap_ctx = ctx_of(ledger={"cycles": 3, "last_terminal_phase": HELD_PHASE,
-                            "last_terminal_ts": now_ts - 1000, "held_streak": 3})
+                            "last_terminal_ts": now_ts - 1000, "held_streak": 3,
+                            "held_structural_streak": 3})
     notifier, spawner = Mock(), Mock()
-    with patch.dict(globals(), dict(paths, kill_switch=lambda: (False, ""),
+    tick_output = io.StringIO()
+    with patch.dict(globals(), dict(fixture["paths"], kill_switch=lambda: (False, ""),
                     sweep_ledger=lambda: {}, fetch_status=lambda: {}, roles=lambda: ["worker"],
                     read_ledger=lambda: ([], 0), _emit_observations=lambda *a: None,
                     collect_ctx=lambda *a: cap_ctx, escalate=notifier, _spawn_executor=spawner)), \
-            patch.object(sys, "stdout", io.StringIO()):
+            patch.object(sys, "stdout", tick_output):
         save_state({})
         cap_result = cmd_tick(argparse.Namespace())
-        cmd_tick(argparse.Namespace())
-    t.check("held 상한 tick: 스폰 0회·전용 escalation·reset 요구",
-            cap_result == EXIT_OK and not spawner.called and notifier.call_count == 2
-            and notifier.call_args.kwargs == {"task_key": "autopilot-held-limit"}
-            and "사람 확인 후 reset" in notifier.call_args.args[0])
-    t.check("held 상한 반복 tick: 통지 본문 고정(기존 멱등키 재사용)",
-            notifier.call_args_list[0] == notifier.call_args_list[1])
+        cap_result2 = cmd_tick(argparse.Namespace())
+    t.check("held 구조 상한 tick 2회: 스폰 0회·escalate 0회",
+            cap_result == cap_result2 == EXIT_OK and spawner.call_count == 0
+            and notifier.call_count == 0)
+    cap_reports = [json.loads(line) for line in tick_output.getvalue().splitlines()]
+    t.check("held 구조 상한 tick 2회: skip report 에 사유 보존",
+            len(cap_reports) == 2 and all(r.get("result") == "skip"
+                and r.get("roles") and r["roles"][0].get("pass") is False
+                and r["roles"][0].get("reason") for r in cap_reports))
+
+    # 18-b) ★홍수 전제 핀: 실제 wakeup 은 배달 후 pending 과 그 멱등키를 함께 지운다.
+    print("[18-b] 실제 wakeup 배달 후 멱등키 소멸 (cys 셸 스텁)")
+    wake_dir = os.path.join(tmpd, "wakeup-delivered-idempotency")
+    stub_bin = os.path.join(wake_dir, "bin")
+    wake_root = os.path.join(wake_dir, "root")
+    for dirname in (stub_bin, wake_root, os.path.join(wake_dir, "home"),
+                    os.path.join(wake_dir, "pack"), os.path.join(wake_dir, "state")):
+        os.makedirs(dirname)
+    stub_cys = os.path.join(stub_bin, "cys")
+    stub_log = os.path.join(wake_dir, "cys-stub.log")
+    with open(stub_cys, "w", encoding="utf-8") as f:
+        f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$CYS_STUB_LOG"\nexit 0\n')
+    os.chmod(stub_cys, 0o755)
+    wake_env = {"HOME": os.path.join(wake_dir, "home"),
+                "CYS_PACK_DIR": os.path.join(wake_dir, "pack"),
+                "CYS_STATE_DIR": os.path.join(wake_dir, "state"), "JAVIS_ROOT": wake_root,
+                "JAVIS_WAKEUP_LIVENESS": "alive", "CYS_AUTOPILOT_NO_SEND": "0",
+                "CYS_STUB_LOG": stub_log, "PYTHONDONTWRITEBYTECODE": "1",
+                # wakeup 은 argv 의 literal cys 를 실행한다 — PATH 선두도 스텁에 고정.
+                "PATH": stub_bin + os.pathsep + os.environ.get("PATH", "")}
+    deliveries, pending_removed = [], []
+    pending_path = os.path.join(wake_root, "_round", "wakeups", "pending",
+                                "master__autopilot-held-limit.json")
+    with patch.dict(globals(), {"CYS": stub_cys}), patch.dict(os.environ, wake_env):
+        for _ in range(2):
+            deliveries.append(escalate("동일 본문", task_key="autopilot-held-limit"))
+            pending_removed.append(not os.path.exists(pending_path))
+    stub_calls = []
+    if os.path.exists(stub_log):
+        with open(stub_log, encoding="utf-8") as f:
+            stub_calls = [line.split()[0] for line in f if line.strip()]
+    send_count, send_key_count = stub_calls.count("send"), stub_calls.count("send-key")
+    wake_records = []
+    wake_log = os.path.join(wake_root, "_round", "wakeups", "queue.jsonl")
+    if os.path.exists(wake_log):
+        with open(wake_log, encoding="utf-8") as f:
+            wake_records = [json.loads(line) for line in f if line.strip()]
+    t.check("동일 held-limit 본문 2회: 실제 wakeup 배달 뒤 멱등키 소멸 → send 2회",
+            send_count == 2 and deliveries == [(True, ""), (True, "")]
+            and pending_removed == [True, True]
+            and [r.get("event") for r in wake_records] == ["queued", "delivered", "queued", "delivered"],
+            "send=%d send-key=%d deliveries=%r pending_removed=%r" %
+            (send_count, send_key_count, deliveries, pending_removed))
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:
