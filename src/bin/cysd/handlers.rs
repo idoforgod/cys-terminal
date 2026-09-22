@@ -4406,6 +4406,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //      실키와 구별할 수 없으므로 ACL 층 문제로 남긴다.
             //   `human_verified`(operator_token) 로 승격하는 방안은 토큰 없는 CLI 사람 경로를
             //   전부 기계로 떨어뜨리므로 기각한다.
+            //   ⓒ (라운드 4) 본문의 0x15/0x03 은 send_key 와 같은 CancelKey 축 — text_cancels 로 정의처에 넘긴다.
             // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
             let text_submits = text.bytes().any(|b| matches!(b, b'\r' | b'\n'));
             let text_cancels = text.bytes().any(|b| matches!(b, 0x15 | 0x03));

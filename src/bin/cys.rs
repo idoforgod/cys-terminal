@@ -933,6 +933,12 @@ const EXIT_QUEUE_GATE_REFUSED: i32 = 7;
 /// **부르지 않는 것**을 1선으로 두고(reclaim 헬퍼의 hold-first 는 2선으로 남는다), 이 값을 본
 /// `run_boot` 은 escalate 하지 않고 `skipped_unconfirmed` 로 계상한다(Fatal 집합 밖).
 ///
+/// ★(0.14.39 · WP-C-input 라운드 4) 두 번째 거부원: 선정리 C-u·기동 send 가 데몬 타이핑 가드/초안
+/// 게이트(D-12)에 거부되는 경우(`recover_refusal_from_input_guard`). 분리 호출자(setsid 부트 · GUI
+/// start_master 체인 · watchdog 자식)에서는 authoritative 면제가 없어 사람 초안이 남은 죽음 확정
+/// 좌석의 복구가 여기로 온다 — base 의 3초 가드만 있던 시절엔 오래된 초안이 지워졌지만, 이제는
+/// 지우지도 죽이지도 않고 사람 조치를 기다린다.
+///
 /// 값 79: sysexits 예약대(64–78) **밖**이고 형제 코드(0·1·2·7·75·78)와 겹치지 않는다.
 const EXIT_RECOVER_REFUSED: i32 = 79;
 
@@ -948,9 +954,21 @@ fn is_recover_refusal(e: &str) -> bool {
 /// 타이핑 가드/초안 게이트(`typing_guard` 코드 · `[draft_gate:…]`)에 거부되면 그것은 **사람이 그 좌석에
 /// 앉아 있다는 관측**이지 파괴 근거가 아니다 — `RECOVER_REFUSED_TOKEN` 머리표로 접어 rc 79 로 낸다(순수).
 /// 다른 에러는 그대로 돌려준다.
+///
+/// 왜 `[draft_gate:` 접미가 아니라 코드(`is_typing_guard_err`)로 접는가 — 3초 타이핑 가드(접미 없음)도
+/// '사람이 앉아 있다' 는 같은 관측이고, 어느 쪽이든 파괴의 근거가 될 수 없다. 면제 술어(데몬
+/// authoritative_caller_ok = master/cso pane 자손 ∨ restore-root 자손)는 분리 호출자(setsid 부트의
+/// `cys boot` · GUI start_master 체인 · watchdog 자식 node-recover)에서 거짓이라 이 접기가 호출자
+/// 무관한 1선 방어다.
 fn recover_refusal_from_input_guard(e: String) -> String {
-    // RED 스텁: GREEN 에서 is_typing_guard_err 분기를 배선한다.
-    e
+    if is_typing_guard_err(&e) && !is_recover_refusal(&e) {
+        format!(
+            "{RECOVER_REFUSED_TOKEN} 좌석 입력줄에 사람 활동(초안·타이핑) 관측 — 선정리·재기동 보류 \
+             (회수·파괴 0 · 사람이 그 pane 에서 줄을 비운 뒤(Ctrl-U) 재부트): {e}"
+        )
+    } else {
+        e
+    }
 }
 
 /// [결재 7ⓑ] `cycle-agent` 의 clear 는 **송신(행위)과 실효(결과)가 다르다.**
@@ -10863,16 +10881,17 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     // ★(0.14.31 · 성찰 C4ⓑ) 전처리 **안전 거부**(살아 있는 에이전트 관측)는
                     //   실패가 아니다 — 여기서 escalate 하면 그 거부가 곧 파괴 명령이 된다.
                     //   죽음 확정 스냅샷 이후 되살아난 좌석이므로 다음 틱 재관측에 맡긴다.
+                    //   (0.14.39) 거부원이 둘로 늘었다 — 사람 활동 관측(recover_refusal_from_input_guard)도 같은 코드
                     if rc == EXIT_RECOVER_REFUSED {
                         println!(
-                            "· {agent}: 역할 '{role}' node-recover 안전 거부(재관측에서 에이전트 생존) \
-                             — 회수·파괴·스폰 0(죽음 확정과 재관측 사이에 되살아났다)"
+                            "· {agent}: 역할 '{role}' node-recover 안전 거부(재관측에서 에이전트 생존 · 또는 좌석 입력줄의 사람 활동) \
+                             — 회수·파괴·스폰 0(원인은 위 'node-recover 안전 거부:' 줄)"
                         );
                         outcomes.push(json!({"role": role, "agent": agent,
                                              "outcome": "skipped_unconfirmed", "mandatory": mandatory,
-                                             "surface_ref": sref, "liveness": "alive_on_recheck",
-                                             "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측",
-                                             "hint": "죽음 확정 이후 되살아난 좌석 — 파괴·중복 스폰 금지(다음 부트가 재관측)"}));
+                                             "surface_ref": sref, "liveness": "recover_refused",
+                                             "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측 또는 좌석 입력줄의 사람 활동(타이핑 가드·초안 게이트)",
+                                             "hint": "파괴·중복 스폰 금지 — 되살아난 좌석이면 다음 부트가 재관측 · 사람 초안이면 그 pane 에서 줄을 비운 뒤(Ctrl-U) 재부트"}));
                         continue;
                     }
                     println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·hold-first 판정 내장)");
@@ -17500,14 +17519,16 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         let spec = load_agent_spec(&agent)?;
         eprintln!("[node-recover] surface:{sid} 위에 {agent} 재기동 (role={role_name})");
         // 셸 입력 잔재 정리 후 기동 (resume 플래그로 대화 기억 복원 시도)
-        // ★(0.14.39 · WP-C-input 라운드 3 · 리뷰 major 1) boot_agent_on_surface 의 기동 send 와 같은 권위 축 — 사람 초안 앞 CancelKey 거부가 rc 1 → run_boot escalate_reclaim(파괴) 로 흐르지 않게 한다.
-        request("surface.send_key", json!({"surface_id": sid, "key": "C-u", "authoritative": true}))?;
+        // ★(0.14.39 · WP-C-input 라운드 3→4 · 리뷰 major 1) authoritative 는 master/cso pane·phoenix 에서 부를 때 면제이고, 분리 호출자(setsid 부트·GUI 버튼 체인·watchdog 자식)에서는 면제가 없다 — 그 거부(타이핑 가드·초안 게이트 · 코드 typing_guard)는 사람 관측이지 파괴 근거가 아니므로 RECOVER_REFUSED_TOKEN 으로 접어 rc 79(run_boot skipped_unconfirmed) 로 낸다.
+        request("surface.send_key", json!({"surface_id": sid, "key": "C-u", "authoritative": true}))
+            .map_err(recover_refusal_from_input_guard)?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         // (4b) topology에 영속된 session_id가 있으면 정확한 세션 재개(없으면 fallback)
         let sess = entry["session_id"].as_str().map(String::from);
         // (W1) 같은 pane 재기동(restore=false → 인라인 없음)이나 resume 게이트엔 기록된 config_dir·cwd를 쓴다.
         let rec_cwd = entry["cwd"].as_str().map(String::from);
         let rec_cfg = entry["claude_config_dir"].as_str().map(String::from);
+        // 기동 send_text/Return 도 같은 접기 — C-u 는 지났는데 그 200ms 창에 사람이 치면 같은 코드로 거부된다.
         let verdict = boot_agent_on_surface(
             sid,
             &role_name,
@@ -17519,7 +17540,8 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             rec_cwd.as_deref(),
             rec_cfg.as_deref(),
             Some(recover_directive()),
-        )?;
+        )
+        .map_err(recover_refusal_from_input_guard)?;
         let verdict = match verdict {
             BootVerdict::Ready => {
                 // ★(0.14.31 · 성찰 C4ⓐ) 종전 `inject_text(...)?` 는 **주입 가드의 보류**

@@ -4919,7 +4919,7 @@ pub(crate) enum DirectSendKind {
     /// 그 경우 사람 초안 여부를 확인한 뒤 원시 `cys send-key <좌석> C-u`(CancelKey 축 = 사람
     /// 초안만 거부)로 수동 선정리할 수 있다.
     ClearFirst,
-    /// `cys send-key C-u`/`C-c` 등 **원시 취소 키** — 생성 바이트에 0x15/0x03 이 있는 경로.
+    /// `cys send-key C-u`/`C-c` 등 **원시 취소 키**, 그리고 `surface.send_text` 본문에 CR/LF 없이 0x15/0x03 만 실린 경로 — 둘 다 생성 바이트 축(정의처 `direct_send_text_gate_kind`·send_key 판정).
     /// 사람 초안을 지우는 것만 막고 화면 축은 쓰지 않는다(무clear 방향 fail-open).
     /// Backspace(0x7f)·C-w(0x17)·C-k(0x0b) 는 **넣지 않는다**(수정 라운드 3 · 적대 minor 결정):
     /// ① CancelKey 의 정의는 '계수기가 줄 취소로 읽는 바이트'(pending_input_step 의 리셋 집합 0x15/0x03)와
@@ -4945,6 +4945,12 @@ pub(crate) enum DirectSendKind {
 ///
 /// 원시 소켓이 `machine_origin` 없이 `human:true` 를 위조하는 경로는 실키와 구별할 수 없다 —
 /// ACL 층 문제로 남긴다(리뷰 합의 · base 타이핑 가드와 같은 신뢰 등급).
+///
+/// ★(라운드 4 · 적대 minor) 바이트 축은 `surface.send_key` 와 **같은 정의**다 — 본문에 CR/LF 가 있으면
+/// 제출(Text · pending>0 축), CR/LF 없이 0x15/0x03 만 있으면 CancelKey(human 축만 · 화면 축 없음),
+/// clear_first 는 그 위에 우선한다. 종전엔 GUI 조립 문안의 0x15 가 게이트 밖이라 사람 초안을 지웠다(실측 ADV3GUICANCEL).
+/// 기계 본문(`human=false`)의 취소 바이트도 같은 축으로 접혀 기계 잔여 선정리는 통과하고 사람 초안은 거부된다
+/// (종전엔 Text 축이라 기계 잔여 앞에서도 거부 — 완화이지만 send-key C-u 와 동형이라 새 구멍이 아니다).
 pub(crate) fn direct_send_text_gate_kind(
     human: bool,
     machine_origin: bool,
@@ -4953,15 +4959,22 @@ pub(crate) fn direct_send_text_gate_kind(
     text_cancels: bool,
     exempt: bool,
 ) -> Option<DirectSendKind> {
-    let _ = text_cancels; // RED 스텁 — GREEN 에서 바이트 축 합류
     if exempt {
         return None;
     }
-    let machine_like = !human || (machine_origin && (clear_first || text_submits));
+    let machine_like = !human || (machine_origin && (clear_first || text_submits || text_cancels));
     if !machine_like {
         return None;
     }
-    Some(if clear_first { DirectSendKind::ClearFirst } else { DirectSendKind::Text })
+    Some(if clear_first {
+        DirectSendKind::ClearFirst
+    } else if text_submits {
+        DirectSendKind::Text
+    } else if text_cancels {
+        DirectSendKind::CancelKey
+    } else {
+        DirectSendKind::Text
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
