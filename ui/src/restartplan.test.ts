@@ -136,30 +136,57 @@ describe("재기동 배선 — 순수 주입 계획이 실제 UI 전송을 결�
 });
 
 // ★(0.14.39 · 적대 major ②ⓑ) 데몬 거부의 무음 실패 금지 — 사유 번역과 배선.
+// 프로덕션 문면(정의처): src/bin/cysd/handlers.rs:4303-4308 (code=clear_first_unsupported)
+const PROD_CLEAR_FIRST_UNSUPPORTED =
+  "clear_first_unsupported: clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)";
+// 정의처: src/lib.rs:633-634 — ERR_TYPING_GUARD + MSG_TYPING_GUARD
+const PROD_TYPING_GUARD = "typing_guard: human is typing in this pane; retry later or use --queued";
+// 정의처: src/bin/cysd/handlers.rs:2241-2246 draft_gate_denied_response — code 는 typing_guard, message 에 [draft_gate:…] 태그
+const PROD_DRAFT_GATE =
+  "typing_guard: human is typing in this pane; retry later or use --queued [draft_gate:pending_input]";
+
 describe("재기동 실패 — 데몬 거부를 한국어 처방으로 낸다", () => {
-  test("clear_first 미지원 좌석은 Ctrl-U 후 재시도를 안내한다", () => {
-    for (const err of [
-      "clear_first_unsupported: clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)",
-      new Error("clear_first_unsupported: ..."),
-    ]) {
-      expect(restartInvokeFailureReason(err)).toBe(
-        "이 좌석은 launch-agent 등록이 없어 자동 정리를 못 합니다 — 해당 pane 에서 Ctrl-U 후 재시도",
-      );
+  for (const { label, error, reason } of [
+    {
+      label: "clear_first 미지원 좌석은 Ctrl-U 후 재시도를 안내한다",
+      error: PROD_CLEAR_FIRST_UNSUPPORTED,
+      reason: "이 좌석은 launch-agent 등록이 없어 자동 정리를 못 합니다 — 해당 pane 에서 Ctrl-U 후 재시도",
+    },
+    {
+      label: "초안 게이트 거부는 typing_guard보다 우선해 초안 제출·삭제를 안내한다",
+      error: PROD_DRAFT_GATE,
+      reason: "대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도",
+    },
+    {
+      label: "타이핑 가드 거부는 잠시 뒤 재시도를 안내한다",
+      error: PROD_TYPING_GUARD,
+      reason: "대상 pane 에 사람 입력이 감지돼 보류했습니다 — 잠시 뒤 재시도",
+    },
+  ]) {
+    for (const withCode of [true, false]) {
+      test(`${label} — ${withCode ? "코드 포함" : "코드가 유실된 message만"}`, () => {
+        const text = withCode ? error : error.slice(error.indexOf(": ") + 2);
+        for (const err of [text, new Error(text)]) {
+          expect(restartInvokeFailureReason(err)).toBe(reason);
+        }
+      });
     }
-  });
+  }
 
-  test("초안 게이트 거부는 초안 제출·삭제를 안내한다", () => {
-    for (const err of ["typing_guard: [draft_gate:pending_input] 24 bytes", "pending_input 24"]) {
-      expect(restartInvokeFailureReason(err)).toBe(
-        "대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도",
-      );
+  test("send_input은 rpc_full로 데몬 오류 코드를 UI까지 보존한다", () => {
+    const rust = readFileSync(new URL("../../src-tauri/src/main.rs", import.meta.url), "utf-8");
+    const start = rust.indexOf("async fn send_input(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = rust.indexOf("\n}", start);
+    expect(end).toBeGreaterThan(start);
+    const body = rust.slice(start, end + 2)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .split("\n")
+      .map((line) => line.trimStart().startsWith("//") ? "" : line.replace(/\s\/\/.*$/, ""))
+      .join("\n");
+    if (!body.includes("rpc_full(") || body.includes("rpc_on(")) {
+      throw new Error("send_input 이 rpc_on 으로 되돌아갔다 — error.code 가 유실돼 번역이 다시 vacuous 가 된다");
     }
-  });
-
-  test("타이핑 가드 거부는 잠시 뒤 재시도를 안내한다", () => {
-    expect(restartInvokeFailureReason(new Error("typing_guard: human is typing"))).toBe(
-      "대상 pane 에 사람 입력이 감지돼 보류했습니다 — 잠시 뒤 재시도",
-    );
   });
 
   test("번역표에 없는 오류는 삼키지 않고 원문을 싣는다", () => {
