@@ -2210,6 +2210,7 @@ fn draft_gate_denied_response(
     kind: DirectSendKind,
     why: DraftGateDenied,
     verified_from: Option<u64>,
+    hint: Option<&str>,
 ) -> Value {
     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
@@ -2231,13 +2232,18 @@ fn draft_gate_denied_response(
             "from": verified_from.map(cys::surface_ref),
         }),
     );
-    // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다.
-    // 접두를 보존하고 D-12 사유만 덧붙여 구버전 소비자도 폴백할 수 있게 한다.
-    err_response(
-        id,
-        cys::ERR_TYPING_GUARD,
-        &format!("{} [{}:{}]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG, why.as_str()),
-    )
+    // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다(Text/SubmitKey/ClearFirst 접두 보존).
+    // CancelKey 는 큐에 실을 수 없어 `--queued` 처방이 거짓이므로 전용 문구를 쓴다(코드는 유지 · 수정 라운드 3).
+    let base = match kind {
+        DirectSendKind::CancelKey => cys::MSG_DRAFT_GATE_CANCEL_KEY,
+        _ => cys::MSG_TYPING_GUARD,
+    };
+    let mut message = format!("{base} [{}:{}]", cys::DRAFT_GATE_TAG, why.as_str());
+    if let Some(hint) = hint {
+        message.push(' ');
+        message.push_str(hint);
+    }
+    err_response(id, cys::ERR_TYPING_GUARD, &message)
 }
 
 /// ★B2(0.14.24) 프로그램 주입 직후 제출 CR 의 **최소 간격**(ms). 0 = 비활성
@@ -2271,6 +2277,10 @@ fn cr_min_gap_ms() -> u64 {
 ///
 /// 조건 둘: key 가 제출 키(Return/Enter — 붙여넣기 삼킴은 CR 고유 문제다) · min_gap_ms > 0
 /// (env 비활성 스위치). 프로그램 주입이 선행했는지는 writer 가 판단하므로 여기서 보지 않는다.
+///
+/// 이 판정과 `cys.rs::should_queue_fallback_send_key` 는 **의도적으로 이름 축**(Return|Enter)이다 —
+/// 별칭(C-m/C-j/"\r")은 제품 경로가 아니고(팩 호출자 0건), B2′ 최소 간격·큐 폴백은 정상 경로의 안전장치다.
+/// 게이트만 바이트 축(우회 차단)이며, 별칭이 거부될 때는 문구가 `Return --queued` 를 처방한다(수정 라운드 3).
 fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
     (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
 }
@@ -4350,11 +4360,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                            "queue_entry_id": entry.id, "durable": durable}),
                 ));
             }
+            let machine_origin = params
+                .get("machine_origin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
             // 무음 큐잉 대신 명시 에러 — 후속 send-key Return이 사람의 미완성 입력을
             // 실행해버리는 최악 경로를 차단한다 (--queued는 quiet 대기 배달이라 허용).
-            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
-            {
+            if !human && !exempt {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -4382,28 +4396,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // Return 은 human 축으로 검사해 관례적인 기계 send+Return 의 자기 본문 제출을
             // 보호한다. inject_text/launch-agent 의 검증된 authoritative 경로는 의도된 예외다:
             // cycle-agent D-16 ④는 C-u 전에 화면 초안을 스스로 검사한다.
-            // ★면제 범위 명시(수정 라운드 1 · 리뷰 minor) — 이 게이트는 `human` 자기신고를 믿는다.
+            // ★면제 범위 정정(수정 라운드 3 · 리뷰 major 2) — 정의처는 governance::direct_send_text_gate_kind 다.
             //   ⓐ GUI 가 **조립한** 문안(전출 지시·launchCmd·restartNode·injectRawToPane)은
-            //      `machine_origin=true` 여도 `human: !queued`(src-tauri/src/main.rs:515) 로 오므로
-            //      게이트를 지난다 — base 타이핑 가드와 같은 규약이고 오너 클릭 발화라 의도된 면제다.
-            //      (배달 원장 기록 억제만 `machine_origin` 으로 갈린다 — 그 축과 섞지 말 것.)
-            //   ⓑ 원시 소켓이 `human:true` 로 신고하면 마찬가지로 지난다. 방향은 fail-closed 다:
-            //      그 바이트가 human 계수에 들어가 **그 좌석행 기계 Return 이 이후 거부**된다.
-            //   우회를 막으려면 origin 판정을 `human_verified`(operator_token) 로 승격해야 하는데,
-            //   그러면 토큰 없는 CLI 사람 경로가 전부 기계로 떨어진다 — 별도 결정 사항으로 남긴다.
+            //      `machine_origin=true` 이고 clear_first 또는 자동 제출(CR/LF)이면 기계로 취급해
+            //      게이트에 들어온다(라운드 2 리뷰 major 2 · restartNode 가 남의 초안을 제출한 실측).
+            //      순수 삽입(injectRawToPane)만 자기 초안에 이어 붙이려는 오너 클릭으로 면제한다.
+            //   ⓑ 원시 소켓의 `human:true`(machine_origin 없음)는 지난다. 종전 fail-closed 설명은 틀렸다:
+            //      페이로드가 CR/LF·0x15/0x03 이면 누적 바이트 없이 그 자리에서 제출·삭제된다(실측 ADV2HUMANFLAG).
+            //      실키와 구별할 수 없으므로 ACL 층 문제로 남긴다.
+            //   `human_verified`(operator_token) 로 승격하는 방안은 토큰 없는 CLI 사람 경로를
+            //   전부 기계로 떨어뜨리므로 기각한다.
             // 파서·pending_input leaf 를 관측하므로 아래 input_gate 를 잡기 전에 호출한다.
-            let gate_kind = if !human
-                && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
-            {
-                let kind = if clear_first { DirectSendKind::ClearFirst } else { DirectSendKind::Text };
-                Some(kind)
-            } else {
-                None
-            };
+            let text_submits = text.bytes().any(|b| matches!(b, b'\r' | b'\n'));
+            let gate_kind = governance::direct_send_text_gate_kind(
+                human, machine_origin, clear_first, text_submits, exempt,
+            );
             if let Some(kind) = gate_kind {
                 if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from,
+                        daemon, &surface, &id, kind, why, verified_from, None,
                     ));
                 }
             }
@@ -4432,10 +4443,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   그래서 UI 가 **프로그램적으로 만든** 주입에는 `machine_origin` 표식을 달게 하고,
             //   표식이 있으면 토큰이 유효해도 **기록**한다(origin=gui_auto 로 감사에서 구별).
             //   ★불변식 ② 는 그대로다 — 표식 없는 실키 입력(sendRaw)은 여전히 무기록이다.
-            let machine_origin = params
-                .get("machine_origin")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             let human_verified = human && !machine_origin && operator_token_ok(daemon, &params);
             if human_verified && verified_from.is_some() {
                 // 오퍼레이터 토큰이 **pane 에서** 왔다. GUI(Tauri)는 어떤 surface 의 자손도 아니므로
@@ -4514,7 +4521,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 ) {
                     drop(_gate);
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from,
+                        daemon, &surface, &id, kind, why, verified_from, None,
                     ));
                 }
             }
@@ -4740,10 +4747,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             } else {
                 None
             };
+            // ★(수정 라운드 3 · 감사 minor) 별칭(C-m/C-j/"\r"…)은 CLI 의 --queued 1회 폴백(이름 축 Return|Enter)을
+            //   받지 못하고 데몬 큐도 Return/Enter 한정이라, 기본 문구의 "use --queued" 는 실행 불가 처방이다.
+            //   실행 가능한 처방을 덧붙인다. 정상 경로(Return/Enter)는 CLI 가 스스로 폴백하므로 덧붙이지 않는다.
+            let submit_alias_hint = (gate_kind == Some(DirectSendKind::SubmitKey)
+                && !matches!(key.as_str(), "Return" | "Enter"))
+                .then(|| format!("(key {key:?} cannot be queued: use `Return --queued`)"));
             if let Some(kind) = gate_kind {
                 if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from,
+                        daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
                     ));
                 }
             }
@@ -4779,7 +4792,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ) {
                         drop(_gate);
                         return Reply::Single(draft_gate_denied_response(
-                            daemon, &surface, &id, kind, why, verified_from,
+                            daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
                         ));
                     }
                 }
@@ -12833,6 +12846,15 @@ mod tests {
         assert!(message.contains(&format!("[draft_gate:{reason}]")), "초안 거부 사유: {message}");
     }
 
+    fn d12_assert_cancel_denied(resp: &Value) {
+        assert_eq!(resp["ok"], json!(false), "사람 초안 앞 취소 키는 거부: {resp}");
+        assert_eq!(resp["error"]["code"], json!(cys::ERR_TYPING_GUARD));
+        let message = resp["error"]["message"].as_str().expect("거부 메시지");
+        assert!(message.starts_with(cys::MSG_DRAFT_GATE_CANCEL_KEY), "CancelKey 전용 문구: {message}");
+        assert!(message.contains("[draft_gate:human_draft]"), "초안 거부 사유: {message}");
+        assert!(!message.contains("--queued"), "취소 키에 큐 처방 금지: {message}");
+    }
+
     /// 의도된 RED 단언 전에 정리해 실패가 다음 검체의 pack 환경·자식 프로세스에 새지 않게 한다.
     fn d12_cleanup(daemon: &Arc<Daemon>, dir: &std::path::Path) {
         for s in daemon.surfaces.lock().unwrap().values() {
@@ -13032,7 +13054,7 @@ mod tests {
             assert_eq!(probe_before, before, "key={key:?}: 모든 취소 키에 동일한 사람 초안");
             assert_eq!(resp["ok"], json!(false),
                 "key={key:?}: 사람 초안 삭제 거부; before={before:?} after={after:?} resp={resp}");
-            d12_assert_denied(&resp, "human_draft");
+            d12_assert_cancel_denied(&resp);
             assert_eq!(after, before, "key={key:?}: 거부 뒤 사람 초안 계수 보존");
         }
     }
@@ -13180,7 +13202,7 @@ mod tests {
         assert_eq!(resp["ok"], json!(true), "검증된 권위 호출자는 CancelKey 도 면제: {resp}");
         assert_eq!(after, (0, 0, 0), "권위 C-u 는 사람 초안 선정리 허용");
         assert_eq!(control_before, before, "대조도 같은 좌석의 사람 초안 11바이트");
-        d12_assert_denied(&denied, "human_draft");
+        d12_assert_cancel_denied(&denied);
         assert_eq!(control_after, control_before, "authoritative 없는 C-u 는 사람 초안 보존");
     }
 

@@ -4921,7 +4921,45 @@ pub(crate) enum DirectSendKind {
     ClearFirst,
     /// `cys send-key C-u`/`C-c` 등 **원시 취소 키** — 생성 바이트에 0x15/0x03 이 있는 경로.
     /// 사람 초안을 지우는 것만 막고 화면 축은 쓰지 않는다(무clear 방향 fail-open).
+    /// Backspace(0x7f)·C-w(0x17)·C-k(0x0b) 는 **넣지 않는다**(수정 라운드 3 · 적대 minor 결정):
+    /// ① CancelKey 의 정의는 '계수기가 줄 취소로 읽는 바이트'(pending_input_step 의 리셋 집합 0x15/0x03)와
+    ///    같은 축이어야 게이트와 계수가 한 정의처를 쓴다 — 부분 편집 키는 D-02(감산) 보류와 함께 계수 의미가 없다.
+    /// ② 기계가 Backspace 를 반복 송신해 초안을 지우는 것은 사고(자동 흐름의 연접·제출·선정리)가 아니라
+    ///    고의 경로이고 팩·GUI 호출자 0건(grep) — 그 방어는 ACL 층 몫이다.
+    /// ③ 부분 편집 바이트는 기계 출처로 **가산**되어 그 좌석행 이후 기계 Text/Return 이 더 강하게 막힌다(fail-closed).
     CancelKey,
+}
+
+/// D-12 `surface.send_text` 의 게이트 kind 판정(순수 · 정의처 단일).
+///
+/// ★(수정 라운드 3 · 리뷰 major 2) 종전에는 자기신고 `human` 만 봐서 `{"human":true,"machine_origin":true}`
+/// 한 단어로 통째로 우회됐다(GUI `restartNode` 의 `cmd+"\n"` 이 남의 사람 초안과 한 줄로 제출됨 · 실측).
+/// `machine_origin` 은 GUI 가 **자기가 조립한 문안**에만 붙이는 표식이라(실키 sendRaw 무영향) 계수 축
+/// (`InputOrigin` 판정 `human && !machine_origin`)과 같은 술어를 쓰게 된다.
+///
+/// 다만 GUI 조립 문안 전부를 기계로 접지는 않는다 — `injectRawToPane`(경로 삽입 · 자동 Return 없음)은
+/// 오너가 **자기 초안에 이어 붙이려고** 클릭한 것이라 제출도 삭제도 아니다. 그래서 GUI 조립 문안은
+/// `clear_first`(삭제) 또는 본문에 CR/LF(자동 제출)가 있을 때만 게이트에 들어온다. 이 경우 kind 는
+/// SubmitKey 가 아니라 **Text** 다: SubmitKey 는 '자기 본문의 Return' 을 위해 기계 잔여를 통과시키지만,
+/// 재기동 명령이 남의 기계 잔여와 연접 제출되는 것도 사고이므로 기계 send 와 같은 pending>0 축으로 막는다.
+///
+/// 원시 소켓이 `machine_origin` 없이 `human:true` 를 위조하는 경로는 실키와 구별할 수 없다 —
+/// ACL 층 문제로 남긴다(리뷰 합의 · base 타이핑 가드와 같은 신뢰 등급).
+pub(crate) fn direct_send_text_gate_kind(
+    human: bool,
+    machine_origin: bool,
+    clear_first: bool,
+    text_submits: bool,
+    exempt: bool,
+) -> Option<DirectSendKind> {
+    if exempt {
+        return None;
+    }
+    let machine_like = !human || (machine_origin && (clear_first || text_submits));
+    if !machine_like {
+        return None;
+    }
+    Some(if clear_first { DirectSendKind::ClearFirst } else { DirectSendKind::Text })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4994,10 +5032,10 @@ pub(crate) fn draft_gate_verdict(
 }
 
 /// D-12 화면 축을 쓰는 kind 인가 — `draft_gate` 가 어댑터 로드·프롬프트 관측을 생략할지 정한다(순수).
+/// CancelKey 는 `draft_gate_verdict` 가 human_pending 만 보므로 화면을 관측해도 결과가 같다 —
+/// agents.json 디스크 읽기 + 임베드 파싱 + observe_prompt 를 헛되이 수행하던 부하(수정 라운드 3 · 감사 minor).
 pub(crate) fn draft_gate_uses_screen_axis(kind: DirectSendKind) -> bool {
-    // RED 스텁: GREEN 에서 CancelKey 를 false 로 바꾸고 draft_gate 에 배선한다.
-    let _ = kind;
-    true
+    !matches!(kind, DirectSendKind::CancelKey)
 }
 
 /// D-12 IO 래퍼 — 전체 계수는 미러, 사람 계수는 상태 Mutex 에서 읽는다.
@@ -5005,6 +5043,7 @@ pub(crate) fn draft_gate_uses_screen_axis(kind: DirectSendKind) -> bool {
 /// 계수만으로 거부가 확정되면 화면·승인 관측을 생략한다. 승인 축은
 /// approval_or_gate_pending 을 공유한다. 파서·pending_input leaf 락을 잠깐씩 쓰므로
 /// 호출자는 input_gate 밖에서 호출해야 한다.
+/// CancelKey 는 계수 판정 뒤 조기 반환한다(화면 축 없음 · 어댑터 로드 생략).
 /// agents.json 디스크 읽기+임베드 파싱을 마커 좌석에 한정(리뷰 minor · 부하).
 /// 캐시는 두지 않는다 — 틱이 이미 초당 1회 같은 로드를 하므로 직접 send 빈도는 그 아래이고,
 /// 배달 틱과 공유하는 함수에 신선도 창을 더하지 않는다.
@@ -5017,6 +5056,9 @@ pub(crate) fn draft_gate(
     let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
         return Some(why);
+    }
+    if !draft_gate_uses_screen_axis(kind) {
+        return None;
     }
     if s.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return None;
@@ -5082,6 +5124,8 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 /// 리셋돼 과소) — 제품 호출자(GUI onData 1회·inject_text 단일 버퍼)는 표식을 분할하지 않으므로
 /// 실경로가 아니며, 실경로인 단독 Esc 키를 지키는 쪽을 택했다(base 와 같은 거동).
 /// 봉투 안의 CLOSE 절단은 이번 라운드에 이월 하한 1바이트로 봉합했다.
+/// 이월된 tail 은 계수에 포함되지 않으므로 봉투 안에서 청크의 마지막 바이트가 단독 ESC 면 후속 청크가
+/// 올 때까지 1바이트 과소(fail-open · 비실경로 · 감사 minor 등재)다.
 /// OPEN 6바이트는 계수에서 빠지므로 OPEN 만 담긴 청크 뒤에는
 /// `pending_input_bytes == 0 ∧ in_paste == true` 인 창이 생겨 좌석이 게이트·배달에 '빈 입력줄'로
 /// 보인다(`in_paste` 는 진단 키로만 나가고 `input_line_state`·`draft_gate_verdict` 어디서도 읽지 않는다).
@@ -11443,6 +11487,32 @@ mod tests {
             Some(DraftGateDenied::HumanDraft { bytes: 19 }),
             "RED: 원시 취소 키는 사람 초안 19바이트 삭제를 거부해야 한다"
         );
+    }
+
+    #[test]
+    fn d12_text_gate_kind_treats_gui_assembled_submit_as_machine() {
+        let cases = [
+            (false, false, false, false, false, Some(DirectSendKind::Text)),
+            (false, false, true, false, false, Some(DirectSendKind::ClearFirst)),
+            (true, false, false, true, false, None), // 실키 CR
+            (true, true, false, false, false, None), // 순수 삽입
+            (true, true, false, true, false, Some(DirectSendKind::Text)), // GUI 자동 제출
+            (true, true, true, false, false, Some(DirectSendKind::ClearFirst)), // GUI clear_first
+            (false, false, false, true, true, None), // 면제
+        ];
+        for (human, machine_origin, clear_first, text_submits, exempt, expected) in cases {
+            assert_eq!(
+                super::direct_send_text_gate_kind(
+                    human,
+                    machine_origin,
+                    clear_first,
+                    text_submits,
+                    exempt,
+                ),
+                expected,
+                "human={human}, machine_origin={machine_origin}, clear_first={clear_first}, text_submits={text_submits}, exempt={exempt}"
+            );
+        }
     }
 
     #[test]

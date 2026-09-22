@@ -17491,7 +17491,8 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         let spec = load_agent_spec(&agent)?;
         eprintln!("[node-recover] surface:{sid} 위에 {agent} 재기동 (role={role_name})");
         // 셸 입력 잔재 정리 후 기동 (resume 플래그로 대화 기억 복원 시도)
-        request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
+        // ★(0.14.39 · WP-C-input 라운드 3 · 리뷰 major 1) boot_agent_on_surface 의 기동 send 와 같은 권위 축 — 사람 초안 앞 CancelKey 거부가 rc 1 → run_boot escalate_reclaim(파괴) 로 흐르지 않게 한다.
+        request("surface.send_key", json!({"surface_id": sid, "key": "C-u", "authoritative": true}))?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         // (4b) topology에 영속된 session_id가 있으면 정확한 세션 재개(없으면 fallback)
         let sess = entry["session_id"].as_str().map(String::from);
