@@ -1,8 +1,8 @@
 //! D-04 (0.14.39) — agents.json 마커 후보와 알려진 옛 vendor 기본값의 메모리 승격.
 //!
 //! 2026-09-21 실측에서 codex composer 는 버전에 따라 `›` 또는 `»`, gemini 는 `>` 로
-//! 확인됐다. 큐 관측기는 커서행의 커서 앞 후보 중 가장 뒤의 것을 채택하므로 스크롤백의
-//! 인용 글리프를 composer 로 오인하지 않는다. 이 모듈은 후보 해석·선택만 공유한다.
+//! 확인됐다. 큐 관측기는 커서행의 행 선두(공백 제외) 후보만 composer 로 채택하며,
+//! 같은 선두에 여러 후보가 맞으면 더 긴 것을 고른다. 이 모듈은 후보 해석·선택만 공유한다.
 //!
 //! agents.json 은 user-owned 파일이라 새 임베드 기본값만 배달하면 기존 디스크 값이 계속
 //! 우선한다. 따라서 데몬과 CLI 의 읽기 시점 병합기가 정확히 알려진 옛 기본값만 새 임베드
@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-/// agents.json 마커 값(`prompt_marker`·`ready_marker`)을 후보 목록으로 해석한다 — 문자열 또는 문자열 목록(additive).
+/// agents.json `prompt_marker` 값(문자열 또는 목록)을 후보 목록으로 해석한다.
 /// 빈 문자열·비문자열 항목은 버린다(빈 문자열 = 미정의 · `readiness::marker_of` 규약). 중복 제거(순서 보존).
 pub fn marker_candidates(v: Option<&Value>) -> Vec<String> {
     let values = match v {
@@ -27,7 +27,21 @@ pub fn marker_candidates(v: Option<&Value>) -> Vec<String> {
     candidates
 }
 
-/// 후보 중 `text` 에서 가장 뒤에 나오는 것(byte rfind 최대 · 동률이면 더 긴 후보). 하나도 없으면 None.
+/// 커서행의 **행 선두(공백 제외)** 에 오는 후보 — composer 프롬프트 글리프는 세 TUI 모두 행 선두다
+/// (claude `❯ ` · codex `› `/`» ` · gemini `>` 실측 col 0). 선두에 여러 후보가 맞으면 더 긴 후보.
+/// 반환 = (후보, 그 후보가 시작하는 byte index). 선두에 후보가 없으면 None — 출력 행 끝의 `->` 나
+/// 초안 속 글리프(`» abc » `)는 composer 가 아니다(리뷰 PROBE-A · 0.14.39 수정 라운드 1).
+pub fn pick_marker_leading<'a>(cands: &'a [String], row: &str) -> Option<(&'a str, usize)> {
+    let trimmed = row.trim_start();
+    let idx = row.len() - trimmed.len();
+    cands
+        .iter()
+        .filter(|marker| !marker.is_empty() && trimmed.starts_with(marker.as_str()))
+        .max_by_key(|marker| marker.len())
+        .map(|marker| (marker.as_str(), idx))
+}
+
+/// 후보 중 `text` 에서 나오는 것(byte rfind 위치 우선(가장 뒤) · 같은 위치면 더 긴 후보). 하나도 없으면 None.
 pub fn pick_marker_last<'a>(cands: &'a [String], text: &str) -> Option<&'a str> {
     cands
         .iter()
@@ -47,6 +61,7 @@ pub fn pick_marker_for_screen<'a>(cands: &'a [String], text: &str) -> Option<&'a
 }
 
 /// 알려진 옛 vendor 기본값 표 (agent, key, 옛 값). 정확히 이 문자열일 때만 옛 기본값이다.
+/// 문자열 `›` 는 항상 vendor 옛 기본값으로 취급한다 — 구버전 codex 에 고정하려면 목록 `["›"]` 로 선언(보존됨).
 pub const STALE_VENDOR_MARKER_DEFAULTS: &[(&str, &str, &str)] =
     &[("codex", "prompt_marker", "\u{203A}")];
 
@@ -133,6 +148,39 @@ mod tests {
     }
 
     #[test]
+    fn pick_leading_accepts_marker_after_leading_whitespace() {
+        let markers = marker_candidates(Some(&json!(["›", "»"])));
+        assert_eq!(pick_marker_leading(&markers, "» draft"), Some(("»", 0)));
+        assert_eq!(pick_marker_leading(&markers, "  › draft"), Some(("›", 2)));
+        assert_eq!(
+            pick_marker_leading(&markers, "\u{3000}» draft"),
+            Some(("»", 3))
+        );
+    }
+
+    #[test]
+    fn pick_leading_rejects_nonleading_marker() {
+        let markers = marker_candidates(Some(&json!(["»", ">"])));
+        assert_eq!(pick_marker_leading(&markers, "out » "), None);
+        assert_eq!(pick_marker_leading(&markers, "out ->"), None);
+    }
+
+    #[test]
+    fn pick_leading_prefers_longest_matching_candidate() {
+        let markers = marker_candidates(Some(&json!([">", ">>"])));
+        assert_eq!(pick_marker_leading(&markers, ">> x"), Some((">>", 0)));
+    }
+
+    #[test]
+    fn pick_leading_rejects_empty_candidates_and_rows() {
+        assert_eq!(pick_marker_leading(&[], ">"), None);
+        assert_eq!(pick_marker_leading(&[String::new()], ">"), None);
+        let markers = marker_candidates(Some(&json!(">")));
+        assert_eq!(pick_marker_leading(&markers, ""), None);
+        assert_eq!(pick_marker_leading(&markers, "  "), None);
+    }
+
+    #[test]
     fn pick_last_uses_text_position_not_candidate_order() {
         let markers = marker_candidates(Some(&json!(["›", "»"])));
         assert_eq!(pick_marker_last(&markers, "› 인용 » "), Some("»"));
@@ -142,7 +190,8 @@ mod tests {
     }
 
     #[test]
-    fn pick_last_breaks_equal_position_ties_by_length() {
+    fn pick_last_prefers_later_position_then_longer_candidate() {
+        // 첫 케이스는 더 뒤의 위치 우선, 둘째 케이스는 같은 위치에서 더 긴 후보 우선이다.
         let markers = marker_candidates(Some(&json!([">>", ">>>"])));
         assert_eq!(pick_marker_last(&markers, ">>>"), Some(">>"));
         let markers = marker_candidates(Some(&json!([">", "> abc"])));

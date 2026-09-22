@@ -4722,7 +4722,8 @@ impl Drop for TickSettleBudget {
 /// 보이면 출력이 잠시 멎었어도 턴이 끝난 것이 아니다(claude `✻ Thinking… (esc to interrupt)`).
 /// 화면 전체가 아니라 커서행 근방만 보는 이유: 본문(보고서)이 이 문구를 인용하는 좌석을 영구
 /// 보류로 접지 않기 위해서다(codex 설계 검토 Q1 — 2초 주기 스피너가 1s 임계를 지나치는 반례).
-pub(crate) const PROMPT_BUSY_TOKENS: [&str; 1] = ["esc to interrupt"];
+/// gemini(agy · Antigravity CLI 2026-09-20 빌드)는 작업 중 상태줄에 `esc to cancel`을 쓴다(바이너리 문자열 스캔 · 체인지로그 "statusline shortcut hints (`? for shortcuts`) and redundant escape hints (`Esc to cancel`)"); 유휴 실측 4장에는 없으며 소문자 대조라 `Esc to cancel`도 잡힌다.
+pub(crate) const PROMPT_BUSY_TOKENS: [&str; 2] = ["esc to interrupt", "esc to cancel"];
 /// 커서행 기준 위아래로 살피는 행 수.
 const PROMPT_BUSY_ROWS: u16 = 3;
 
@@ -4993,10 +4994,12 @@ pub(crate) fn prompt_boundary_verdict(
 /// 안전 방향이 아니다. 해소는 소비자별로 판단해야 한다(오너 결정 대상 · merge-notes 참조).
 /// 검체: [`merge_residue_tests::r6_refuted_daemon_keeps_the_ready_marker_fallback`].
 ///
-/// ★(0.14.39 · D-04) 마커는 문자열 또는 문자열 목록이다. 실측(2026-09-21)에 따라 codex 의
+/// ★(0.14.39 · D-04) 목록 허용은 `prompt_marker` 한정 · `ready_marker` 는 부트 readiness 와 같은 문자열 규약.
+/// 실측(2026-09-21)에 따라 codex 의
 /// 옛 vendor 기본값만 읽기 시점에 임베드 값으로 승격하며, 사용자 커스텀은 디스크 우선으로 보존한다.
 /// agents.json 은 user-owned 이라 팩 갱신은 Keep + `.new` 로 병치된다. 따라서 읽기 병합기에서
-/// 메모리만 승격하고 디스크는 쓰지 않는다(W-B). 커서행의 후보 선택은 같은 관측 프레임 안에서 한다.
+/// 메모리만 승격하고 디스크는 쓰지 않는다(W-B). 커서행의 composer 후보는 같은 관측 프레임에서
+/// 행 선두(공백 제외)에 맞는 후보 중 가장 긴 것을 택하고, 그 뒤의 글리프는 초안으로 보존한다.
 fn merged_prompt_marker(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
@@ -5014,7 +5017,16 @@ fn merged_prompt_marker(
         {
             continue;
         }
-        let markers = cys::agent_markers::marker_candidates(value);
+        let markers = if key == "ready_marker" {
+            value
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        } else {
+            cys::agent_markers::marker_candidates(value)
+        };
         if !markers.is_empty() {
             return Some(markers);
         }
@@ -5034,9 +5046,9 @@ pub(crate) struct PromptObs {
     pub(crate) marker: String,
     /// 화면 전량에 어댑터 마커가 보이는가.
     pub(crate) marker_seen: bool,
-    /// 커서 행이 마커를 담고 있으면 `(커서 앞, 커서 이후)` 문자열 쌍. 커서 행에 마커가 없으면
-    /// (프롬프트가 포커스를 잃었거나 다른 화면) `None` — 호출부는 `Unknown` 으로 받아 배달하지
-    /// 않는다(fail-closed).
+    /// 커서 행 선두(공백 제외)의 마커 뒤에 커서가 있으면 `(마커 뒤부터 커서 앞, 커서 이후)` 문자열 쌍.
+    /// 선두 마커가 없거나 커서가 마커 앞이면 `None` — 초안 속 글리프는 경계로 삼지 않으며,
+    /// 호출부는 `Unknown` 으로 받아 배달하지 않는다(fail-closed).
     pub(crate) line: Option<(String, String)>,
     /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`composer_layout_static_ok`).
     pub(crate) screen: String,
@@ -5113,24 +5125,31 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptO
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
     let row_all = screen.contents_between(cr, 0, cr, cols);
-    let marker = cys::agent_markers::pick_marker_last(markers, &before_all)
+    // ★(0.14.39 · 수정 라운드 1 · 리뷰 PROBE-A) composer 마커는 커서행 **선두** 후보만이다. 종전 '커서 앞
+    //   가장 뒤 후보(rfind)' 는 출력 행 끝의 `->` 와 초안 속 글리프(`» abc » `)를 빈 composer 로 읽었다.
+    let leading_row = cys::agent_markers::pick_marker_leading(markers, &row_all);
+    let marker = leading_row
+        .map(|(m, _)| m)
+        .or_else(|| cys::agent_markers::pick_marker_last(markers, &before_all))
         .or_else(|| cys::agent_markers::pick_marker_last(markers, &row_all))
         .or_else(|| cys::agent_markers::pick_marker_for_screen(markers, &contents))
         .expect("non-empty marker candidates");
-    let line = before_all.rfind(marker).map(|i| {
-        let before_cursor = before_all[i + marker.len()..].to_string();
-        // 커서 이후 구간은 관측·로그용이다(판정에 쓰지 않는다 — 고스트가 여기 산다).
-        let after = row_all
-            .strip_prefix(before_all.as_str())
-            .unwrap_or("")
-            .to_string();
-        (before_cursor, after)
-    });
+    // 커서 앞 구간이 같은 선두 후보로 시작해야 커서가 마커 뒤에 있는 것이다(커서가 마커 앞이면 None).
+    let line = cys::agent_markers::pick_marker_leading(markers, &before_all)
+        .filter(|(m, _)| *m == marker)
+        .map(|(m, idx)| {
+            let before_cursor = before_all[idx + m.len()..].to_string();
+            // 커서 이후 구간은 관측·로그용이다(판정에 쓰지 않는다 — 고스트가 여기 산다).
+            let after = row_all
+                .strip_prefix(before_all.as_str())
+                .unwrap_or("")
+                .to_string();
+            (before_cursor, after)
+        });
     // 선택기 행: 커서 행 전체에서 마커 뒤 텍스트가 `N. …` 이면 composer 가 아니다(커서 앞·뒤 무관 —
     // 커서가 라벨 앞에 있어 before_cursor 가 비어 보이는 잘린 선택기가 이 축의 존재 이유다).
-    let selector_row = row_all
-        .rfind(marker)
-        .map(|i| cys::readiness::numbered_item_row(&row_all[i + marker.len()..]))
+    let selector_row = leading_row
+        .map(|(m, idx)| cys::readiness::numbered_item_row(&row_all[idx + m.len()..]))
         .unwrap_or(false);
     let lo = cr.saturating_sub(PROMPT_BUSY_ROWS);
     let hi = (cr + PROMPT_BUSY_ROWS).min(rows.saturating_sub(1));
@@ -12047,6 +12066,11 @@ mod tests {
 
     /// 빈 `❯ ` 줄 아래에 레이아웃 양성 증거(괘선·상태줄)가 없으면 composer 가 아니다(codex Q2 반례:
     /// 잘린 무번호 선택기 + 낯선 라벨 + `Esc to cancel` 한 조각).
+    ///
+    /// ★(0.14.39 · D-04 수정 라운드 1) `esc to cancel` 이 작업 중 어휘([`PROMPT_BUSY_TOKENS`] · gemini
+    /// 실측 근거)에 편입되면서 그 조각이 든 프레임은 alt-screen 레이아웃 축보다 **앞**의 busy 축에서
+    /// 거부된다(거부는 그대로 · 라벨만 바뀐다). 종전 의도(레이아웃 증거 부재 = alt_screen 거부)는
+    /// 그 어휘가 없는 같은 모양의 프레임으로 계속 잰다.
     #[test]
     fn wp5_alt_screen_without_layout_evidence_is_refused() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -12055,6 +12079,12 @@ mod tests {
         let e = daemon.next_queue_entry("[보고] 레이아웃 없음".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Esc to cancel"], 0, 2, true);
+        quiet_since(&s, 5);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "Esc to cancel 조각은 작업 중 어휘로 먼저 거부된다");
+        *s.queue_blocked.lock().unwrap() = None;
+        paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Some other label"], 0, 2, true);
         quiet_since(&s, 5);
         tick(&daemon);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
