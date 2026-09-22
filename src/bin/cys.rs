@@ -178,7 +178,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(85 의 타이핑 가드 거부 경로는 C-u 1키가 선행할 수 있고, Return 거부 시 clear 본문만 composer에 남아 다음 재시도의 C-u가 정리한다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
+    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · launch-agent 미등록 좌석의 3분할 폴백에서만 C-u 1키가 선행하거나 Return 거부로 clear 본문이 composer에 남을 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     CycleAgent {
         #[arg(long)]
@@ -1040,6 +1040,7 @@ enum CycleTargetState {
     Idle,
     Busy,
     HumanDraft,
+    MachineResidue,
 }
 
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
@@ -1052,26 +1053,45 @@ struct CycleTargetObs<'a> {
     human_bytes: Option<u64>,
 }
 
-/// 사이클 유휴 판정 — 계수된 미제출 입력·composer 행의 초안을 먼저 보호한다.
+/// 사이클 유휴 판정 — 사람 초안은 보호하고, 사람 축이 명시적 0 인 기계 잔여는 별도로 분류한다.
 /// 마커가 해소되면 빈 편집 영역의 화면 증거나 권위 계수 두 축의 명시적 0 보고에 출력 정적을 AND 한다.
 /// 계수 미보고는 0 보고가 아니다. 이 소비처의 추가 유휴 근거는 stale pending 리셋과 공유하지 않는다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
-    if o.human_bytes.unwrap_or(0) > 0 || o.pending_bytes.unwrap_or(0) > 0 {
+    // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
+    if o.human_bytes.unwrap_or(0) > 0 {
         return CycleTargetState::HumanDraft;
     }
+    let machine_residue = if o.pending_bytes.unwrap_or(0) > 0 {
+        if o.human_bytes.is_none() {
+            return CycleTargetState::HumanDraft;
+        }
+        true
+    } else {
+        false
+    };
+    // ★B-1: send_text 뒤 Return 전에 멈춘 기계 잔여를 사람에게 치우라고 하면 무clear가 된다.
+    //   화면·정적 축을 통과한 뒤에만 clear 대상으로 넘긴다 — 출력 중인 턴을 소거하지 않는다.
     let Some(screen) = o.screen else {
         return CycleTargetState::Busy;
     };
     let Some(marker) = o.marker else {
         return if o.quiet == Some(true) {
-            CycleTargetState::Idle
+            if machine_residue {
+                CycleTargetState::MachineResidue
+            } else {
+                CycleTargetState::Idle
+            }
         } else {
             CycleTargetState::Busy
         };
     };
     if marker_row_has_draft(screen, marker, o.placeholder) {
         return if o.quiet == Some(true) {
-            CycleTargetState::HumanDraft
+            if machine_residue {
+                CycleTargetState::MachineResidue
+            } else {
+                CycleTargetState::HumanDraft
+            }
         } else {
             CycleTargetState::Busy
         };
@@ -1092,7 +1112,11 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
         || counts_report_no_draft)
         && o.quiet == Some(true)
     {
-        CycleTargetState::Idle
+        if machine_residue {
+            CycleTargetState::MachineResidue
+        } else {
+            CycleTargetState::Idle
+        }
     } else {
         CycleTargetState::Busy
     }
@@ -1221,12 +1245,14 @@ fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> 
 }
 
 /// 2초마다 유휴를 관측하되 사람 초안은 즉시 거부한다(마지막 대기는 남은 예산 이내).
+/// 기계 잔여는 clear 직전만 허용한다. 재주입 직전에는 없어야 하므로 Busy처럼 계속 관측한다.
 fn wait_cycle_target_idle(
     sid: u64,
     marker: &[String],
     placeholder: Option<&str>,
     deadline: std::time::Instant,
     stage: &str,
+    allow_machine_residue: bool,
 ) -> Result<(), String> {
     let secs = deadline
         .saturating_duration_since(std::time::Instant::now())
@@ -1250,12 +1276,16 @@ fn wait_cycle_target_idle(
         // 초안 증거는 RPC 연속 실패보다 우선한다. 일반 오류로 접으면 clear 뒤 최선노력 주입이 열린다.
         match observed.state {
             CycleTargetState::Idle => return Ok(()),
+            CycleTargetState::MachineResidue if allow_machine_residue => {
+                eprintln!("  {stage}: surface:{sid} 기계 잔여를 감지했다 — 사람 초안 없음·턴 종료 확인됨, clear의 Ctrl-U로 정리한다");
+                return Ok(());
+            }
             CycleTargetState::HumanDraft => {
                 return Err(format!(
                     "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — 입력을 보류한다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 해당 단계만 재시도"
                 ));
             }
-            CycleTargetState::Busy => {}
+            CycleTargetState::Busy | CycleTargetState::MachineResidue => {}
         }
         cycle_observation_failure_streak(
             &mut consecutive_failures,
@@ -2176,6 +2206,12 @@ fn extract_bin<'a>(cmd: &'a str, fallback: &'a str) -> &'a str {
 ///  그래도 둘 다 보는 이유는 미래에 코드가 전달되도록 바뀌어도 이 분기가 살아있게 하려는 것.)
 fn is_typing_guard_err(e: &str) -> bool {
     e.contains(cys::MSG_TYPING_GUARD) || e.contains(cys::ERR_TYPING_GUARD)
+}
+
+/// 데몬이 `clear_first` 를 지원하지 않는 좌석이라고 답했는가(원자 경로 → 3분할 폴백 신호).
+/// launch-agent 등록 소실 좌석의 영구 무clear를 막되, 초안 거부·전송 실패는 재송신하지 않는다.
+fn is_clear_first_unsupported_err(e: &str) -> bool {
+    e.contains("clear_first_unsupported")
 }
 
 /// ★B3(0.14.24) `cys send-key` 가 타이핑 가드 거부를 **큐로 1회 전환**해야 하는가(순수 판정).
@@ -17645,7 +17681,40 @@ fn cycle_spec_or_explicit_clear(
     }
 }
 
-/// 훅 선언은 설치 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 스스로 확인하게 한다.
+/// 이 좌석의 settings.json 에 cys SessionStart 훅이 등록돼 있는가.
+/// Some(true)=등록 · Some(false)=읽었으나 미등록 · None=읽기·파싱 실패로 판정 불능.
+fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> {
+    let root = settings_root?;
+    let exact = cys::pack::hook_registered_in(
+        root,
+        "SessionStart",
+        &cys::pack::session_start_hook_command(&cys::pack::pack_dir()),
+    );
+    // 부서 pane 은 다른 팩의 훅을 등록한다. 이 팩과 정확 일치만 재면 실행 중인 훅을
+    // 미등록으로 강등해 훅 1회 + CLI 1회 이중 주입한다. OS 경로 구분자·닫는 인용부호를
+    // 정규화한 스크립트 접미사도 인정해 그 반대편 사고를 막는다.
+    let relocated = root.get("hooks")
+        .and_then(|hooks| hooks.get("SessionStart"))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| entries.iter().any(|entry| {
+            entry.get("hooks").and_then(Value::as_array)
+                .is_some_and(|hooks| hooks.iter().any(|hook| {
+                    hook.get("command").and_then(Value::as_str).is_some_and(|command| {
+                        command.trim().trim_end_matches(['\"', '\''])
+                            .replace('\\', "/").ends_with("hooks/session-start.sh")
+                    })
+                }))
+        }));
+    Some(exact || relocated)
+}
+
+/// 선언(agents.json)과 실설정 관측을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
+/// 미등록·판정 불능이면 선언을 강등해 종전 CLI 주입으로 복귀한다 — 지침 0회 주입을 막는다.
+fn effective_hooks_inject(declared: bool, observed: Option<bool>) -> bool {
+    declared && observed == Some(true)
+}
+
+/// 훅 등록은 실행 완료 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 확인하게 한다.
 fn cycle_resume_with_hook_fallback(
     mut resume: String,
     directive_path: &std::path::Path,
@@ -17753,10 +17822,39 @@ fn run_cycle_agent(
         // ★(0.14.39 통합) D-04 목록 허용과 합류 — 후보 목록을 그대로 들고 다니며 프레임마다 해소한다.
         let marker = spec.as_ref().map(composer_marker_of).unwrap_or_default();
         let placeholder = spec.as_ref().and_then(composer_placeholder_of);
-        let hooks_inject = spec
+        let declared_hooks_inject = spec
             .as_ref()
             .and_then(|s| s["hooks_inject_directive"].as_bool())
             .unwrap_or(false);
+        // 성찰2 major ③: 선언만으로 생략하면 CLAUDE_CONFIG_DIR 격리 좌석의 훅 누락에서
+        // 디렉티브가 0회 주입된다. surface.list 가 보고한 실사용 경로를 우선하고,
+        // 미보고일 때만 팩 설정 경로를 쓴다(handlers.rs 의 claude_config_dir 노출 계약).
+        let hook_settings_path = if declared_hooks_inject {
+            entry["claude_config_dir"].as_str().filter(|dir| !dir.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(cys::pack::config_dir)
+                .map(|dir| dir.join("settings.json"))
+        } else {
+            None
+        };
+        let hook_settings: Result<Value, String> = match hook_settings_path.as_ref() {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| format!("설정 읽기 실패: {e}"))
+                .and_then(|text| serde_json::from_str(&text)
+                    .map_err(|e| format!("설정 JSON 파싱 실패: {e}"))),
+            None => Err("좌석 claude_config_dir·팩 config_dir 모두 미보고: 판정 불능".into()),
+        };
+        let observed = session_start_hook_registered(hook_settings.as_ref().ok());
+        let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed);
+        if declared_hooks_inject && !hooks_inject {
+            let path = hook_settings_path.as_ref()
+                .map(|path| path.display().to_string()).unwrap_or_else(|| "(설정 경로 없음)".into());
+            let reason = hook_settings.as_ref().err().map(String::as_str)
+                .unwrap_or("SessionStart 에 cys 훅 미등록");
+            eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — {path}: {reason} · 이번 사이클은 CLI가 디렉티브를 직접 주입한다");
+        }
+        // 잔여 ⓑ: 등록된 훅도 B-hooks 레인 가드 absent/unreadable/no-redirect-line 에서
+        // 무발화 종료할 수 있다. 후속: 재주입 직후 directive.verify 의 directive_verified != Some(true) 확인.
         // 저장 검증 파일 확정 (기본: <cwd>/_round/SESSION_STATE.md + *_TODO.md 자동 탐지)
         let cwd = entry["live_cwd"]
             .as_str()
@@ -17938,6 +18036,7 @@ fn run_cycle_agent(
             placeholder.as_deref(),
             std::time::Instant::now() + std::time::Duration::from_secs(timeout),
             "clear 직전",
+            true,
         )?;
         // 사용자 문안 또는 실경로 기본값을 clear 클로저 전에 한 번만 확정한다.
         let resume_text = resume_text.unwrap_or_else(|| {
@@ -17958,43 +18057,66 @@ fn run_cycle_agent(
             .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
         let clear_result = (|| -> Result<(), String> {
-            // 5) 입력 버퍼 정리 + clear
+            // 5) 입력 버퍼 정리 + clear를 한 writer arm에서 원자 송신한다.
+            // 종전 3분할은 본문 뒤 사람 입력이 끼어 Return만 거부되면 clear와 초안이 섞였다.
+            // ClearFirst 게이트 1회 → Ctrl-U·settle·paste·CR 순서를 데몬에 맡긴다(state.rs Inject).
             eprintln!(
                 "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
                 allow_at.elapsed().as_secs_f64()
             );
-            request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))
-                .map_err(|e| {
-                    if is_typing_guard_err(&e) {
-                        format!("{CYCLE_HUMAN_DRAFT_TOKEN} 입력 버퍼 정리 거부(송신 0건): 데몬이 사람 초안을 감지했다({e}) — 소거 0 · 초안을 제출·삭제한 뒤 해당 단계만 재시도")
+            match request(
+                "surface.send_text",
+                json!({"surface_id": sid, "text": clear, "clear_first": true, "quiet": true}),
+            ) {
+                Ok(_) => {
+                    // autopilot KEYS_SENT_MARKERS는 성공 응답 뒤에만 찍는다(송신 0건 오기록 금지).
+                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (원자 송신)");
+                }
+                Err(e) if is_clear_first_unsupported_err(&e) => {
+                    // 등록을 잃은 좌석은 원자 경로만 강제하면 영구 무clear가 된다(ANCHOR ②).
+                    // 이 팔에만 종전 3분할·오류 매핑을 보존한다. 본문 뒤 초안 혼합 위험도 잔여다.
+                    eprintln!("[cycle] 이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백 ({e})");
+                    request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))
+                        .map_err(|e| {
+                            if is_typing_guard_err(&e) {
+                                format!("{CYCLE_HUMAN_DRAFT_TOKEN} 입력 버퍼 정리 거부(송신 0건): 데몬이 사람 초안을 감지했다({e}) — 소거 0 · 초안을 제출·삭제한 뒤 해당 단계만 재시도")
+                            } else {
+                                e
+                            }
+                        })?;
+                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (3분할 폴백)");
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    request(
+                        "surface.send_text",
+                        json!({"surface_id": sid, "text": clear, "quiet": true}),
+                    )
+                    .map_err(|e| {
+                        if is_typing_guard_err(&e) {
+                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다({e}) — 추가 소거 금지")
+                        } else {
+                            e
+                        }
+                    })?;
+                    request(
+                        "surface.send_key",
+                        json!({"surface_id": sid, "key": "Return"}),
+                    )
+                    .map_err(|e| {
+                        if is_typing_guard_err(&e) {
+                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 제출 거부: 데몬이 사람 초안을 감지했다({e}) — clear 본문('{clear}')은 composer에 들어갔지만 제출되지 않았다 · 손으로 다시 clear 하지 마라 · 남은 clear 본문은 다음 재시도의 C-u가 지운다")
+                        } else {
+                            e
+                        }
+                    })?;
+                }
+                Err(e) => {
+                    return Err(if is_typing_guard_err(&e) {
+                        format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): 데몬이 사람 초안을 감지했다 — 초안을 제출·삭제한 뒤 해당 단계만 재시도 ({e})")
                     } else {
                         e
-                    }
-                })?;
-            eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}'");
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            request(
-                "surface.send_text",
-                json!({"surface_id": sid, "text": clear, "quiet": true}),
-            )
-            .map_err(|e| {
-                if is_typing_guard_err(&e) {
-                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다({e}) — 추가 소거 금지")
-                } else {
-                    e
+                    });
                 }
-            })?;
-            request(
-                "surface.send_key",
-                json!({"surface_id": sid, "key": "Return"}),
-            )
-            .map_err(|e| {
-                if is_typing_guard_err(&e) {
-                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 제출 거부: 데몬이 사람 초안을 감지했다({e}) — clear 본문('{clear}')은 composer에 들어갔지만 제출되지 않았다 · 손으로 다시 clear 하지 마라 · 남은 clear 본문은 다음 재시도의 C-u가 지운다")
-                } else {
-                    e
-                }
-            })?;
+            }
 
             // 6) 실효를 먼저 확인한다. 키 송신만으로는 디렉티브·RESUME 재주입 자격이 없다.
             let clear_verify_window = clear_verify_secs();
@@ -18027,6 +18149,7 @@ fn run_cycle_agent(
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
                         "재주입 직전",
+                        false,
                     ) {
                         Ok(()) => {
                             eprintln!(
@@ -18064,6 +18187,7 @@ fn run_cycle_agent(
                         std::time::Instant::now()
                             + std::time::Duration::from_secs(clear_verify_window),
                         "재주입 직전(측정 불능)",
+                        false,
                     ) {
                         Ok(()) => {
                             eprintln!(
@@ -32069,6 +32193,75 @@ mod tests {
         }
     }
 
+    /// 성찰2 major ③: 선언만 믿으면 좌석별 설정 누락에서 디렉티브가 0회 주입된다.
+    #[test]
+    fn r1_session_start_hook_registered_truth_table() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let exact = cys::pack::session_start_hook_command(&cys::pack::pack_dir());
+        for command in [
+            exact,
+            "sh /department/another-pack/hooks/session-start.sh".into(),
+            r"bash C:\department\another-pack\hooks\session-start.sh".into(),
+            "bash \"C:/department pack/hooks/session-start.sh\"".into(),
+        ] {
+            let root = json!({"hooks": {"SessionStart": [{"matcher": "startup|clear", "hooks": [
+                {"type": "command", "command": command}
+            ]}]}});
+            assert_eq!(session_start_hook_registered(Some(&root)), Some(true), "{root}");
+        }
+        for root in [
+            json!({"hooks": {"SessionStart": [{"hooks": [{"command": "echo other-hook"}]}]}}),
+            json!({"hooks": {"SessionStart": [{"hooks": [{"command": "sh /pack/hooks/session-start.sh.disabled"}]}]}}),
+            json!({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "sh /pack/hooks/session-start.sh"}]}]}}),
+            json!({"hooks": {"SessionStart": []}}),
+            json!({}),
+        ] {
+            assert_eq!(session_start_hook_registered(Some(&root)), Some(false), "{root}");
+        }
+        assert_eq!(session_start_hook_registered(None), None, "읽기·파싱 실패는 미등록과 구별한다");
+    }
+
+    #[test]
+    fn r1_effective_hooks_inject_requires_observed_registration() {
+        for (declared, observed, expected) in [
+            (true, Some(true), true),
+            (true, Some(false), false),
+            (true, None, false),
+            (false, Some(true), false),
+            (false, Some(false), false),
+            (false, None, false),
+        ] {
+            assert_eq!(effective_hooks_inject(declared, observed), expected,
+                "선언={declared} · 관측={observed:?}");
+        }
+    }
+
+    #[test]
+    fn r1_cycle_hooks_inject_observation_reaches_all_consumers_source_pin() {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(compact.contains("let declared_hooks_inject = spec"));
+        assert!(compact.contains("entry[\"claude_config_dir\"]"), "좌석이 실제로 쓰는 설정 경로 우선");
+        assert!(compact.contains(".or_else(cys::pack::config_dir)"), "좌석 경로 미보고 때만 팩 설정 폴백");
+        assert!(compact.contains(".join(\"settings.json\")"));
+        assert!(compact.contains("std::fs::read_to_string("));
+        assert!(compact.contains("serde_json::from_str"));
+        assert!(compact.contains("session_start_hook_registered(hook_settings.as_ref().ok())"));
+        let effective = "let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed);";
+        let effective_at = compact.find(effective).expect("선언·실설정 관측을 합친 실효값 확정");
+        assert_eq!(compact.matches("let hooks_inject =").count(), 1, "실효값을 정적 선언으로 다시 덮지 않는다");
+        assert!(compact.find("session_start_hook_registered(").unwrap() < effective_at);
+        for consumer in [
+            "cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)",
+            "if !hooks_inject { inject_text(sid, &compose_directive(&role_name)?)?; }",
+            "cycle_reinject_held( &e, hooks_inject,",
+            "cycle_best_effort_reinject( hooks_inject,",
+        ] {
+            assert!(compact.find(consumer).is_some_and(|at| effective_at < at),
+                "실효값의 소비처 배선 누락: {consumer}");
+        }
+    }
+
     #[test]
     fn d16_marker_row_draft_uses_last_row_and_leading_marker() {
         assert!(!marker_row_has_draft("출력만 있음", "❯", None));
@@ -32213,9 +32406,15 @@ mod tests {
             failures.push("CycleAgent doc 에 C-u 1키 선행 가능성 없음".to_string());
         }
 
-        let body = strip_line_comments(refl_fn_body(production, "run_cycle_agent"));
-        // C-u 자체의 거부는 송신 0건이다. 선행 송신 문면은 clear 본문 거부 분기에서 잰다.
-        let refusal = body
+        let (_, fallback, atomic_refusal) = d16_clear_atomic_and_fallback_source();
+        // 원자 거부는 송신 0건이고, C-u 선행 송신 문면은 미지원 폴백 본문 거부에만 남는다.
+        if !atomic_refusal.contains("송신 0건 · composer 무변경") {
+            failures.push("원자 clear 거부 문면에 송신 0건·composer 무변경 설명 없음".to_string());
+        }
+        if atomic_refusal.contains("C-u 1건은 선행 송신됨") {
+            failures.push("원자 clear 거부가 선행 송신을 거짓 보고".to_string());
+        }
+        let refusal = fallback
             .split_once("\"text\": clear")
             .expect("clear 본문 송신 없음")
             .1
@@ -32623,6 +32822,84 @@ mod tests {
         assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
     }
 
+    /// ★B-1: 사람 계수 0 인 기계 잔여는 clear 대상이지만 화면·정적 축을 우회하지 않는다.
+    /// 구 데몬의 사람 축 미보고와 계수 밖 실제 화면 초안은 종전처럼 사람 초안으로 보류한다.
+    #[test]
+    fn r1_cycle_target_splits_machine_residue_from_human_draft() {
+        let empty = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT;
+        let draft = empty.replace("❯ \n", "❯ 사람이 치던 초안\n");
+        assert!(draft.contains("❯ 사람이 치던 초안"), "화면 초안 픽스처 전제");
+        for (name, screen, quiet, pending_bytes, human_bytes, expected) in [
+            ("기계 잔여", Some(empty), Some(true), Some(6), Some(0), CycleTargetState::MachineResidue),
+            ("구 데몬", Some(empty), Some(true), Some(6), None, CycleTargetState::HumanDraft),
+            ("사람 계수 우선", Some(empty), Some(true), Some(6), Some(3), CycleTargetState::HumanDraft),
+            ("출력 중", Some(empty), Some(false), Some(6), Some(0), CycleTargetState::Busy),
+            ("정적 미보고", Some(empty), None, Some(6), Some(0), CycleTargetState::Busy),
+            ("화면 미관측", None, Some(true), Some(6), Some(0), CycleTargetState::Busy),
+            ("미계수 화면 초안", Some(draft.as_str()), Some(true), Some(0), Some(0), CycleTargetState::HumanDraft),
+            ("기계 잔여 화면 문면", Some(draft.as_str()), Some(true), Some(6), Some(0), CycleTargetState::MachineResidue),
+            ("기계 잔여 화면 출력 중", Some(draft.as_str()), Some(false), Some(6), Some(0), CycleTargetState::Busy),
+        ] {
+            assert_eq!(
+                cycle_target_state(&CycleTargetObs {
+                    screen,
+                    quiet,
+                    marker: Some("❯"),
+                    placeholder: None,
+                    pending_bytes,
+                    human_bytes,
+                }),
+                expected,
+                "{name}",
+            );
+        }
+        // 마커 없는 어댑터도 화면 관측+정적이 있어야 기계 잔여를 clear에 넘긴다.
+        for (quiet, expected) in [
+            (Some(true), CycleTargetState::MachineResidue),
+            (Some(false), CycleTargetState::Busy),
+            (None, CycleTargetState::Busy),
+        ] {
+            assert_eq!(
+                cycle_target_state(&CycleTargetObs {
+                    screen: Some("마커 없는 화면"),
+                    quiet,
+                    marker: None,
+                    placeholder: None,
+                    pending_bytes: Some(6),
+                    human_bytes: Some(0),
+                }),
+                expected,
+            );
+        }
+    }
+
+    /// 기계 잔여 통과는 clear 직전 한 곳뿐이다. 재주입 두 경로는 관측을 계속해야 한다.
+    #[test]
+    fn r1_cycle_machine_residue_allowed_only_before_clear_source_pin() {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let calls: Vec<String> = body.split("wait_cycle_target_idle(").skip(1).map(|tail| {
+            let mut depth = 1usize;
+            let end = tail.char_indices().find_map(|(i, c)| {
+                if c == '(' { depth += 1; }
+                if c == ')' { depth -= 1; }
+                (depth == 0).then_some(i)
+            }).expect("유휴 대기 호출 닫힘");
+            tail[..end].chars().filter(|c| !c.is_whitespace()).collect()
+        }).collect();
+        assert_eq!(calls.len(), 3, "clear 직전 1곳·재주입 직전 2곳의 정책을 모두 잰다");
+        assert!(calls[0].ends_with("\"clear직전\",true,"), "clear 직전만 기계 잔여를 허용한다: {}", calls[0]);
+        assert!(calls[1].ends_with("\"재주입직전\",false,"), "검증 뒤 재주입은 기계 잔여를 허용하지 않는다: {}", calls[1]);
+        assert!(calls[2].ends_with("\"재주입직전(측정불능)\",false,"), "측정 불능 재주입도 기계 잔여를 허용하지 않는다: {}", calls[2]);
+
+        let gate = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
+        let compact: String = gate.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("CycleTargetState::MachineResidueifallow_machine_residue=>{"), "허용 인자가 기계 잔여 분기를 통제해야 한다");
+        let allowed = compact.split_once("CycleTargetState::MachineResidueifallow_machine_residue=>{")
+            .expect("기계 잔여 허용 분기").1.split_once("CycleTargetState::HumanDraft=>").expect("사람 초안 분기").0;
+        assert!(allowed.contains("eprintln!(") && allowed.contains("returnOk(())"), "clear 직전 통과는 진단을 남기고 성공한다");
+        assert!(compact.contains("CycleTargetState::Busy|CycleTargetState::MachineResidue=>{}"), "재주입의 잔여는 Busy와 함께 계속 관측한다");
+    }
+
     /// ★성찰2 ②: composer 아래 푸터의 후보 글리프를 초안으로 읽으면 rc85 가 영구히 clear 를 막는다.
     /// 선두 후보 행만 고르되, 권위 계수가 0 이어도 그 행의 실제 초안은 계속 보호한다.
     #[test]
@@ -32703,7 +32980,8 @@ mod tests {
                 (None, None, Some(true), CycleTargetState::Busy),
                 (Some(0), Some(0), Some(false), CycleTargetState::Busy),
                 (Some(0), Some(0), None, CycleTargetState::Busy),
-                (Some(1), Some(0), Some(true), CycleTargetState::HumanDraft),
+                // 기계 잔여라도 미등재 푸터의 화면 gate와 0/0 조건을 우회하지 않는다.
+                (Some(1), Some(0), Some(true), CycleTargetState::Busy),
                 (Some(0), Some(1), Some(true), CycleTargetState::HumanDraft),
             ] {
                 assert_eq!(
@@ -32732,9 +33010,20 @@ mod tests {
             .to_string()
     }
 
-    /// 해당 키의 request부터 첫 오류 전파까지 한정해 send_text의 매핑을 잘못 세지 않는다.
-    fn d16_clear_key_request_source(key: &str) -> String {
+    /// 원자 성공·미지원 폴백·원자 거부를 분리해 다른 팔의 문면으로 거짓 통과하지 않는다.
+    fn d16_clear_atomic_and_fallback_source() -> (String, String, String) {
         let body = d16_clear_stage_source();
+        let (atomic, rest) = body
+            .split_once("Err(e) if is_clear_first_unsupported_err(&e) => {")
+            .expect("원자 미지원 폴백 팔 없음");
+        let (fallback, refusal) = rest.split_once("Err(e) => {")
+            .expect("원자 오류 전파 팔 없음");
+        (atomic.to_string(), fallback.to_string(), refusal.to_string())
+    }
+
+    /// 해당 키의 request부터 첫 오류 전파까지 한정해 폴백 send_text의 매핑을 잘못 세지 않는다.
+    fn d16_clear_key_request_source(key: &str) -> String {
+        let (_, body, _) = d16_clear_atomic_and_fallback_source();
         let key_at = body.find(&format!("\"key\": \"{key}\"")).expect("키 송신 없음");
         let start = body[..key_at].rfind("request(").expect("키 요청 없음");
         let end = key_at + body[key_at..].find("?;").expect("키 오류 전파 없음") + 2;
@@ -32743,7 +33032,13 @@ mod tests {
 
     #[test]
     fn d16_clear_cu_refusal_folds_to_human_draft() {
-        // 4→5단계 사이 사람 입력을 C-u가 거부하면 rc1 대신 rc85로 재시도해야 한다.
+        // 원자 clear 거부는 송신 0건·rc85, 미지원 폴백의 C-u도 같은 초안 토큰을 쓴다.
+        let (_, _, refusal) = d16_clear_atomic_and_fallback_source();
+        let compact: String = refusal.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("returnErr(ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
+        assert!(compact.contains("}else{e});"), "원자 경로의 가드 밖 오류는 원형 전파");
+        assert!(refusal.contains("clear 원자 송신 거부(송신 0건 · composer 무변경)"));
+        assert!(!refusal.contains("C-u 1건은 선행 송신됨"), "원자 거부는 선행 송신이 없다");
         let call = d16_clear_key_request_source("C-u");
         assert!(call.starts_with("request(\"surface.send_key\","), "C-u 요청 배선 없음");
         assert!(
@@ -32755,7 +33050,17 @@ mod tests {
 
     #[test]
     fn d16_clear_submit_refusal_folds_to_human_draft() {
-        // 본문만 composer에 들어간 뒤 Return이 거부되어도 clear 미제출 보류다.
+        // 원자 팔은 제출까지 한 번에 판정하고, 폴백 Return 거부도 rc85·원형 오류를 보존한다.
+        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
+        assert!(!atomic.contains("surface.send_key"), "원자 팔 뒤에 별도 제출 키가 있으면 안 된다");
+        assert!(refusal.contains("CYCLE_HUMAN_DRAFT_TOKEN"));
+        assert!(refusal.contains("송신 0건 · composer 무변경"));
+        assert!(!refusal.contains("들어갔지만 제출되지 않았다"));
+        let text = fallback.split_once("\"text\": clear").expect("폴백 본문 송신").1
+            .split_once("?;").expect("폴백 본문 오류 전파").0;
+        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(text.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
+        assert!(text.ends_with("}else{e}})"), "폴백 본문도 가드 밖 오류는 원형 전파");
         let call = d16_clear_key_request_source("Return");
         assert!(call.starts_with("request(\"surface.send_key\","), "Return 요청 배선 없음");
         assert!(
@@ -32767,8 +33072,16 @@ mod tests {
 
     #[test]
     fn d16_keys_sent_marker_only_after_cu_success() {
-        // autopilot이 송신 0건을 1건으로 기록하지 않도록 C-u의 성공 경계 뒤에 찍는다.
-        let body = d16_clear_stage_source();
+        // 원자 성공 팔·폴백 C-u 성공 뒤에만 마커를 찍어 송신 0건의 오기록을 막는다.
+        let (atomic, body, refusal) = d16_clear_atomic_and_fallback_source();
+        let (before_success, success) = atomic.split_once("Ok(_) => {").expect("원자 성공 팔");
+        let marker_literal = "[cycle 5/7] 입력 버퍼 정리 + '";
+        assert!(!before_success.contains(marker_literal));
+        assert!(success.contains(marker_literal), "원자 성공 뒤 송신 마커 누락");
+        assert!(success.contains("원자"), "5단계가 원자 경로임을 명시해야 한다");
+        for literal in ["C-u 1건은 선행 송신됨", marker_literal] {
+            assert!(!refusal.contains(literal), "원자 거부에 송신 마커가 있다: {literal}");
+        }
         let cu = body.find("\"key\": \"C-u\"").expect("C-u 송신 없음");
         let done = cu + body[cu..].find("?;").expect("C-u 오류 전파 없음") + 2;
         let marker = body.find("eprintln!(\"[cycle 5/7] 입력 버퍼 정리 + '")
@@ -32777,6 +33090,50 @@ mod tests {
         for literal in ["C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '"] {
             assert!(!body[..done].contains(literal), "C-u 거부 경로에 키 송신 마커가 있다: {literal}");
         }
+    }
+
+    /// ★적대 major ①: 원자 송신 1회 뒤 별도 키를 보내면 다시 사람 입력이 끼어드는 경로가 열린다.
+    #[test]
+    fn r1_cycle_clear_is_atomic_with_legacy_fallback_only_when_unsupported() {
+        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
+        assert_eq!(atomic.matches("request(").count(), 1, "원자 요청은 1회");
+        assert!(atomic.contains("match request("));
+        assert!(atomic.contains("\"surface.send_text\""));
+        assert!(atomic.contains("\"clear_first\": true"));
+        assert!(atomic.contains("\"text\": clear"));
+        assert!(atomic.contains("\"quiet\": true"));
+        assert!(!atomic.contains("surface.send_key") && !atomic.contains("sleep("));
+        assert!(!refusal.contains("request(") && !refusal.contains("sleep("));
+        assert_eq!(fallback.matches("request(").count(), 3, "미지원 팔에만 종전 3분할");
+        assert_eq!(fallback.matches("surface.send_key").count(), 2);
+        assert_eq!(fallback.matches("surface.send_text").count(), 1);
+        assert!(!fallback.contains("\"clear_first\": true"));
+        assert!(fallback.contains("이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백"));
+        let cu = fallback.find("\"key\": \"C-u\"").unwrap();
+        let settle = fallback.find("Duration::from_millis(200)").expect("종전 settle 보존");
+        let text = fallback.find("\"text\": clear").unwrap();
+        let submit = fallback.find("\"key\": \"Return\"").unwrap();
+        assert!(cu < settle && settle < text && text < submit);
+    }
+
+    #[test]
+    fn r1_clear_first_unsupported_err_truth_table_and_daemon_code_pin() {
+        for (error, expected) in [
+            ("clear_first_unsupported", true),
+            ("clear_first_unsupported: clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)", true),
+            ("clear_first requires a launch-agent-registered pane", false),
+            (cys::ERR_TYPING_GUARD, false),
+            (cys::MSG_TYPING_GUARD, false),
+            ("surface not found", false),
+            ("", false),
+        ] {
+            assert_eq!(is_clear_first_unsupported_err(error), expected, "{error}");
+        }
+        let handlers = strip_line_comments(include_str!("cysd/handlers.rs"));
+        assert!(handlers.contains("\"clear_first_unsupported\""), "데몬의 폴백 코드 계약 소실");
+        assert!(handlers.contains("clear_first requires a launch-agent-registered pane"));
+        let rpc = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "rpc_roundtrip<S: Read + Write>"));
+        assert!(rpc.contains("resp[\"error\"][\"code\"]"), "코드 토큰이 RPC 오류 문자열까지 보존돼야 한다");
     }
 
     #[test]
@@ -32790,9 +33147,14 @@ mod tests {
         let target = body.find("wait_cycle_target_idle(").expect("사전 턴 확인 호출 없음");
         let quiesce = body.find("set_surface_quiescing(sid, true)?;").expect("quiescing 없음");
         assert!(target < quiesce, "사전 턴 확인은 quiescing 앞이어야 한다");
+        let atomic = body.find("match request(").expect("원자 clear 송신 없음");
+        let fallback = body.find("Err(e) if is_clear_first_unsupported_err(&e) => {").expect("미지원 폴백 없음");
         let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
-        assert!(target < cu, "사전 턴 확인은 C-u(초안 소거) 앞이어야 한다");
+        assert!(quiesce < atomic && atomic < fallback && fallback < cu,
+            "유휴·quiescing 뒤 원자 송신, 미지원 팔 안에서만 C-u 순서여야 한다");
         let verdict = body.find("clear_effect_verdict(").expect("clear 실효 판정 없음");
+        let submit = body.find("\"key\": \"Return\"").expect("폴백 제출 없음");
+        assert!(cu < submit && submit < verdict, "폴백 송신도 실효 확인보다 앞이어야 한다");
         let directive = body.find("compose_directive(").expect("디렉티브 재주입 없음");
         assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
         let sent = body.find("\"text\": clear").expect("clear 송신 없음");
@@ -32828,8 +33190,9 @@ mod tests {
         // 보고 문면 바로 뒤에 실측식이 와야 한다(상수·정적 문면을 실측이라 부르지 못하게).
         let measured = body.find("allow_at.elapsed()").expect("잔여 창이 실측이 아니다");
         assert!(report < measured, "잔여 창 보고가 실측식보다 뒤에 있다");
-        let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
-        assert!(measured < cu, "잔여 창 보고는 첫 송신(C-u) 앞이어야 한다");
+        let atomic = body.find("match request(").expect("원자 clear 송신 없음");
+        let cu = body.find("\"key\": \"C-u\"").expect("폴백 입력버퍼 정리 없음");
+        assert!(measured < atomic && atomic < cu, "잔여 창 보고는 원자·폴백 첫 송신 앞이어야 한다");
         // 파이썬 쪽 문면도 실제 상한(사전 턴 확인 포함)을 적어야 한다 — 문면↔코드 드리프트 핀.
         // 한국어 본문을 바이트로 자르지 않도록 줄 단위로 읽는다.
         let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
@@ -32988,6 +33351,12 @@ mod tests {
             std::fs::write(dir.join("pack/agents.json"), agents).unwrap();
             std::fs::write(dir.join("pack/directives/WORKER_DIRECTIVE.md"), "W").unwrap();
             std::fs::write(dir.join("pack/directives/RSI_LEARNING_DIRECTIVE.md"), "R").unwrap();
+            // 실설정 검증 도입 후에도 기존 훅 성공 시나리오의 전제를 실제 등록으로 보존한다.
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            let hook = cys::pack::session_start_hook_command(&dir.join("pack"));
+            std::fs::write(dir.join("config/settings.json"), json!({
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": hook}]}]}
+            }).to_string()).unwrap();
             let saved = ["CYS_SOCKET", "CYS_NO_AUTOSTART", "CYS_PACK_DIR", "CYS_CONFIG_DIR", "CYS_LOCAL_DIR"]
                 .into_iter().map(|key| (key, std::env::var_os(key))).collect();
             let previous_verify_secs = CLEAR_VERIFY_SECS_OVERRIDE.swap(2, std::sync::atomic::Ordering::Relaxed);
@@ -33120,8 +33489,45 @@ mod tests {
         assert_eq!(exit, 81, "화면 유휴 재주입이 실효 확인으로 둔갑하면 안 된다");
         assert_eq!(counts.0, 1);
         assert_eq!(counts.1, 1);
-        assert_eq!(counts.2, 0, "claude 훅 선언이면 디렉티브 생략");
+        assert_eq!(counts.2, 0, "claude 훅 선언과 실제 등록이 있으면 디렉티브 생략");
         assert_eq!(counts.3, 2, "authoritative는 저장 지시·RESUME 각 1건");
+    }
+
+    /// 좌석별 미등록·읽기 실패·파싱 실패는 공용 설정의 등록 사실로 덮지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn r1_e2e_cycle_missing_pane_hook_reinjects_directive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for settings in [Some("{}"), Some("{"), None] {
+            let fixture = D16CycleFixture::new();
+            let pane_config = fixture.dir.join("pane-config");
+            std::fs::create_dir_all(&pane_config).unwrap();
+            if let Some(settings) = settings {
+                std::fs::write(pane_config.join("settings.json"), settings).unwrap();
+            }
+            let rows = json!([{
+                "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                "exited": false, "awakened_at": 1.0, "cwd": fixture.dir, "live_cwd": fixture.dir,
+                "claude_config_dir": pane_config
+            }]);
+            let (socket, calls, stop) = fake_daemon(rows,
+                vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)],
+                vec!["S1", "S2"], true);
+            let stop = D16DaemonStop(Some(Box::new(stop)));
+            std::env::set_var("CYS_SOCKET", &socket);
+            let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+            drop(stop);
+            let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert_eq!(exit, 0, "실효 clear 뒤 CLI 재주입: 설정={settings:?}");
+            assert_eq!(d16_cycle_send_counts(&recorded), (1, 1, 1, 3),
+                "훅 미등록·판정 불능이면 디렉티브가 정확히 1회 주입돼야 한다");
+            let resume = recorded.iter().find_map(|(method, params)| {
+                (method == "surface.send_text").then(|| params["text"].as_str()).flatten()
+                    .filter(|text| text.contains("[RESUME]"))
+            }).expect("RESUME 송신");
+            assert!(!resume.contains("역할 디렉티브가 화면에 보이지 않으면"),
+                "CLI가 주입한 사이클에는 훅 생략용 자연어 폴백을 붙이지 않는다");
+        }
     }
 
     #[cfg(unix)]
