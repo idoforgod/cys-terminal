@@ -1784,11 +1784,12 @@ def cmd_execute(args):
         mismatch = predicted != actual
         if mismatch:
             # 원장 재조회가 예측과 어긋나면(경합 · corrupt 원장 → streak 0) 이 보류가 통지 없이
-            # 조용히 지나간다. 큰 쪽을 쓰고 아래에서 통지를 최소 1회 보장한다.
+            # 조용히 지나간다. 큰 쪽을 쓰고 아래 `or mismatch` 로 통지를 최소 1회 보장한다.
+            # (예측 streak 는 prev+1 또는 1 이라 항상 ≥1 이므로 별도 하한은 두지 않는다.)
             # cooldown·retry_after_ts 는 detail 에 이미 실린 예측값을 유지한다(원장 뷰 불신).
             print("⚠ [cycle-autopilot] cycle-%d held 예측(%d,%d) != 원장(%d,%d) — 큰 쪽으로 통지 보장"
                   % (cid, streak, structural_streak, actual[0], actual[1]), file=sys.stderr)
-            streak = max(streak, actual[0], 1)
+            streak = max(streak, actual[0])
             structural_streak = max(structural_streak, actual[1])
         else:
             streak, structural_streak = actual
@@ -3645,8 +3646,17 @@ def cmd_self_test(args):
             fixture["notifier"].call_count == 1
             and fixture["notifier"].call_args.kwargs == {"task_key": "autopilot-held"}
             and "불일치" in fixture["notifier"].call_args.args[0]
+            and "연속 1회" in fixture["notifier"].call_args.args[0]
+            and "(예측 1 != 원장 0)" in fixture["notifier"].call_args.args[0]
             and all(s in fixture["notifier"].call_args.args[0]
                     for s in ("비파괴 보류", "자동 재시도", "reset 불필요")))
+    # 통지 주기에 걸리지 않는 streak(4회째)에서의 불일치 — 'or mismatch' 가 없으면 통지 0건이다.
+    fixture = execute_fixture(85, prior=(False,) * 3, bad_after=1)
+    t.check("원장 재조회 불일치 + 비통지 주기(4회째): 그래도 통지 1회",
+            fixture["notifier"].call_count == 1
+            and fixture["notifier"].call_args.kwargs == {"task_key": "autopilot-held"}
+            and "연속 4회" in fixture["notifier"].call_args.args[0]
+            and "(예측 4 != 원장 0)" in fixture["notifier"].call_args.args[0])
 
     child_rc = 86
     fixture = execute_fixture(child_rc)
