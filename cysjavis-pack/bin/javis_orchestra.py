@@ -1873,6 +1873,9 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
                      "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
                      "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
                      "`cys todo-path --emit-decl`로 다시 받아라." % why)
+    # ★D-14(2026-09-21 결정 · 코드 변경 0): `--queued` 회신 지시는 배포본 REVIEWER_DIRECTIVE:18-22 ·
+    #   WORKER_DIRECTIVE:136-139 와 정합한다 — 회신 소실의 실제 의존성은 D-04 가 아니라 D-01(master
+    #   좌석 큐 기아)이며, D-01 해소 후 무조치(설계 정본 §5 D-14). soul.md 5항(오너 로컬본)은 별도 규범 결정.
     lines.append("보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master \"[보고] ...\"` "
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
