@@ -172,7 +172,11 @@ enum Command {
         #[command(subcommand)]
         action: QueueAction,
     },
-    /// T2-4 컨텍스트 60% 사이클 집행기: 저장 지시→파일 검증→clear→지침 재주입→재개 포인터
+    /// T2-4 컨텍스트 60% 사이클 집행기 (7단계 · D-16): 저장 지시→파일 검증→검증자 handshake→
+    /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
+    /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
+    /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
+    /// 84·85 는 아무것도 보내지 않은 **비파괴 보류**다 — 대상 턴 종료 후 재시도하거나 --timeout 을 늘린다.
     CycleAgent {
         #[arg(long)]
         role: Option<String>,
@@ -31269,6 +31273,66 @@ mod tests {
         &rest[..end]
     }
 
+    /// 소스 핀 보조 — 줄 주석(`//`)을 걷어낸 본문. 핀이 **주석 문장**을 코드로 오인해 초록이 되는
+    /// 구멍을 막는다(D-16 리팩터: `cycle_target_state(` 핀이 3.5) 주석에 반응하던 사건).
+    /// 문자열 리터럴 안의 `//`(URL 등)는 보존한다. 원시 문자열(r"…")·블록 주석은 다루지 않는다 —
+    /// 쓰는 쪽(run_cycle_agent)에 둘 다 없음을 `strip_line_comments_keeps_string_slashes` 가 잰다.
+    fn strip_line_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let (mut in_str, mut esc, mut cut) = (false, false, None);
+            let b: Vec<char> = line.chars().collect();
+            for i in 0..b.len() {
+                if esc {
+                    esc = false;
+                } else if b[i] == '\\' && in_str {
+                    esc = true;
+                } else if b[i] == '"' {
+                    in_str = !in_str;
+                } else if !in_str && b[i] == '/' && b.get(i + 1) == Some(&'/') {
+                    cut = Some(i);
+                    break;
+                }
+            }
+            let keep: String = match cut {
+                Some(i) => b[..i].iter().collect(),
+                None => line.to_string(),
+            };
+            out.push_str(&keep);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn strip_line_comments_keeps_string_slashes() {
+        assert_eq!(strip_line_comments("let a = 1; // 주석\n"), "let a = 1; \n");
+        assert_eq!(
+            strip_line_comments("let u = \"https://x\"; // 꼬리\n"),
+            "let u = \"https://x\"; \n"
+        );
+        assert_eq!(strip_line_comments("// 통줄 주석\n"), "\n");
+        assert_eq!(strip_line_comments("let q = \"\\\"//\";\n"), "let q = \"\\\"//\";\n");
+        // 쓰는 쪽이 이 헬퍼의 한계(원시 문자열·블록 주석) 밖에 있음을 잰다.
+        // `r"` 단순 포함은 "worker" 같은 평범한 리터럴에도 걸린다(실측) — 앞 글자가 식별자가
+        // 아닐 때만 원시 문자열 접두다.
+        let has_raw = |s: &str| {
+            let b: Vec<char> = s.chars().collect();
+            (0..b.len()).any(|i| {
+                b[i] == 'r'
+                    && matches!(b.get(i + 1), Some('"') | Some('#'))
+                    && !b[..i].last().is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            })
+        };
+        assert!(!has_raw("let a = \"worker\";"), "평범한 리터럴을 원시 문자열로 오판");
+        assert!(has_raw("let p = r\"\\\\.\\pipe\\cys\";"), "원시 문자열을 못 본다");
+        for name in ["run_cycle_agent", "wait_cycle_target_idle"] {
+            let body = refl_fn_body(include_str!("cys.rs"), name);
+            assert!(!has_raw(body), "{name} 에 원시 문자열이 생겼다 — 핀 헬퍼 재검토");
+            assert!(!body.contains("/*"), "{name} 에 블록 주석이 생겼다 — 핀 헬퍼 재검토");
+        }
+    }
+
     #[test]
     fn d10_resume_text_uses_pack_round_when_present() {
         let cwd = std::path::Path::new("/project/_round");
@@ -31676,6 +31740,29 @@ mod tests {
         );
     }
 
+    /// 운영자가 읽는 `cys cycle-agent --help` 의 종료코드 표가 상수와 갈라지면 실패한다.
+    /// 종전 문면은 종료코드를 한 줄도 적지 않았고 단계 수도 옛 5단계였다(D-16 리팩터에서 교정).
+    #[test]
+    fn d16_cycle_agent_help_documents_exit_contract() {
+        let src = include_str!("cys.rs");
+        let at = src.find("\n    CycleAgent {").expect("CycleAgent 변형 없음");
+        let doc = &src[src[..at].rfind("\n    /// T2-4").expect("CycleAgent doc 없음")..at];
+        for code in [
+            EXIT_CLEAR_UNVERIFIED,
+            EXIT_CLEAR_UNMEASURABLE,
+            EXIT_CYCLE_TARGET_BUSY,
+            EXIT_CYCLE_HUMAN_DRAFT,
+        ] {
+            assert!(doc.contains(&format!("{code}=")), "help 에 exit {code} 설명 없음");
+        }
+        assert!(doc.contains("7단계"), "help 가 옛 단계 수를 적고 있다");
+        for stage in ["실효 확인", "빈 composer"] {
+            assert!(doc.contains(stage), "help 에 '{stage}' 단계 없음");
+        }
+        // 84·85 가 '아무것도 보내지 않았다' 는 성질은 운영 판단의 핵심이라 문면에 남긴다.
+        assert!(doc.contains("비파괴"), "help 에 84·85 의 비파괴 성질 없음");
+    }
+
     #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
@@ -31744,10 +31831,17 @@ mod tests {
 
     #[test]
     fn d16_run_cycle_agent_order_source_pin() {
-        let body = refl_fn_body(include_str!("cys.rs"), "run_cycle_agent");
-        let target = body.find("cycle_target_state(").expect("사전 턴 확인 호출 없음");
+        // ★핀 경화(리팩터 단계): 종전 핀은 `cycle_target_state(` 를 찾았는데 그 이름이 3.5) **주석**에도
+        //   있어, 실제 호출을 지워도 주석만 남으면 초록이었다(codex 자진 신고). 주석을 걷어낸 본문에서
+        //   실 호출 `wait_cycle_target_idle(` 을 찾는다 — 핀이 코드가 아니라 문장을 재던 구멍을 막는다.
+        let raw = refl_fn_body(include_str!("cys.rs"), "run_cycle_agent");
+        let body = strip_line_comments(raw);
+        let body = body.as_str();
+        let target = body.find("wait_cycle_target_idle(").expect("사전 턴 확인 호출 없음");
         let quiesce = body.find("set_surface_quiescing(sid, true)?;").expect("quiescing 없음");
         assert!(target < quiesce, "사전 턴 확인은 quiescing 앞이어야 한다");
+        let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
+        assert!(target < cu, "사전 턴 확인은 C-u(초안 소거) 앞이어야 한다");
         let verdict = body.find("clear_effect_verdict(").expect("clear 실효 판정 없음");
         let directive = body.find("compose_directive(").expect("디렉티브 재주입 없음");
         assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
@@ -31756,8 +31850,17 @@ mod tests {
         let resume = body[sent..].find("let resume").map(|i| sent + i).expect("RESUME 없음");
         assert!(!body[directive..resume].contains("Duration::from_secs(2))"), "재주입 사이 고정 2초 sleep 잔존");
         assert!(body.contains("hooks_inject_directive"), "SessionStart 훅 표지 배선 없음");
-        assert!(body.contains("CYCLE_HUMAN_DRAFT_TOKEN"), "사람 초안 거부 배선 없음");
-        assert!(body.contains("CYCLE_TARGET_BUSY_TOKEN"), "진행 중 턴 거부 배선 없음");
+        // 데몬 typing_guard 거부를 초안 토큰으로 접는 배선은 이 함수 안에 있다.
+        assert!(body.contains("CYCLE_HUMAN_DRAFT_TOKEN"), "typing_guard→초안 거부 배선 없음");
+        // ★두 토큰의 **발화처**는 wait_cycle_target_idle 이다. 종전 핀은 run_cycle_agent 의 3.5)
+        //   주석에 적힌 이름만 보고 초록이었다 — 발화처 본문에서 직접 잰다.
+        let gate = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
+        assert!(gate.contains("CYCLE_TARGET_BUSY_TOKEN"), "진행 중 턴 거부 배선 없음");
+        assert!(gate.contains("CYCLE_HUMAN_DRAFT_TOKEN"), "사람 초안 거부 배선 없음");
+        assert!(
+            gate.contains("observe_cycle_target(") && gate.contains("CycleTargetState::Idle"),
+            "유휴 판정이 관측을 거치지 않는다"
+        );
     }
 
     #[cfg(unix)]
