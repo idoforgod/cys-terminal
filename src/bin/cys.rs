@@ -176,7 +176,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 아무것도 보내지 않은 **비파괴 보류**다 — 대상 턴 종료 후 재시도하거나 --timeout 을 늘린다.
+    /// 84·85 는 clear 송신 0건 비파괴 보류(85 의 타이핑 가드 거부 경로는 C-u 1키가 선행할 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     CycleAgent {
         #[arg(long)]
@@ -976,10 +976,14 @@ const CLEAR_UNMEASURABLE_TOKEN: &str = "clear-unmeasurable:";
 const CLEAR_VERIFY_SECS: u64 = 75;
 
 /// 대상 턴·composer가 유휴가 되지 않아 clear 보류(84). 턴 종료 뒤 재시도 또는 --timeout 연장.
-/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
+/// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
+/// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
+/// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const EXIT_CYCLE_TARGET_BUSY: i32 = 84;
 /// 사람 초안·미제출 입력 보호로 clear 보류(85). 초안을 제출·삭제한 뒤 재시도.
-/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
+/// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
+/// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
+/// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
 /// clear 는 **실효까지 확인**됐으나 재주입 시점에 대상이 유휴가 되지 않아 재주입을 접었다(86).
 /// 84·85 와 달리 **clear 는 이미 나갔다** — 손으로 다시 clear 하지 마라. RESUME 은 최선노력으로
@@ -987,11 +991,19 @@ const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
 const EXIT_CYCLE_REINJECT_HELD: i32 = 86;
 const CYCLE_REINJECT_HELD_TOKEN: &str = "cycle-reinject-held:";
 /// 유휴 대기 만료 머리표. 대상 턴 종료 뒤 재시도 또는 --timeout 연장.
-/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
+/// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
+/// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
+/// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
 /// 사람 초안·미제출 입력 또는 데몬 타이핑 가드 거부 머리표. 초안을 제출·삭제한 뒤 재시도.
-/// 자동 경로(javis_cycle_autopilot)는 child_rc 로 기록만 하므로 사이클을 멈추지 않는다.
+/// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
+/// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
+/// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
+/// ★팩 `javis_cycle_autopilot.py` 의 `QUIET_UNREPORTED_DIAG` 와 같은 값이어야 한다
+/// (autopilot 이 rc84 를 '구조적(구 데몬) 보류' 로 분류하는 기계 토큰 · cargo 검체
+/// d16_held_rcs_and_diag_token_match_autopilot 가 파싱 대조).
+const CYCLE_QUIET_UNREPORTED_DIAG: &str = "quiet_secs_unreported";
 
 /// 사이클 대상의 턴 상태(순수).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1143,11 +1155,11 @@ fn cycle_observation_failure_streak(
 }
 
 /// 성공한 read_text 응답 전부가 키를 빠뜨린 경우만 구 데몬 진단을 덧붙인다.
-fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> &'static str {
+fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> String {
     if saw_read_text && !saw_quiet_secs {
-        " · 데몬이 quiet_secs 를 보고하지 않는다(구 데몬) — 데몬을 갱신하라(`cys daemon restart` 또는 팩 업그레이드)"
+        format!(" · 데몬이 quiet_secs 를 보고하지 않는다(구 데몬) — 데몬을 갱신하라(`cys daemon restart` 또는 팩 업그레이드) [diag={CYCLE_QUIET_UNREPORTED_DIAG}]")
     } else {
-        ""
+        String::new()
     }
 }
 
@@ -17572,8 +17584,33 @@ fn cycle_resume_with_hook_fallback(
     resume
 }
 
-/// clear 발효 뒤 보류는 전용 머리표로 접는다. 주입 실패가 이 계약을 덮어쓰면 이중 clear를 유발한다.
+/// 디렉티브 실패 뒤에도 RESUME을 시도하고 송신 내역만 반환해 호출자의 실효 판정을 유지한다.
 /// 주입 Err는 붙여넣기 후 Return 실패일 수도 있어 송신 0건이라고 단정하지 않는다.
+fn cycle_best_effort_reinject(
+    hooks_inject: bool,
+    resume: &str,
+    compose: &mut dyn FnMut() -> Result<String, String>,
+    inject: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> String {
+    let directive = if hooks_inject {
+        "디렉티브 생략(훅)".to_string()
+    } else {
+        match compose() {
+            Ok(text) => match inject(&text) {
+                Ok(()) => "디렉티브 1건 송신".to_string(),
+                Err(e) => format!("디렉티브 주입 실패(부분 송신 가능: {e})"),
+            },
+            Err(e) => format!("디렉티브 0건(합성 실패: {e})"),
+        }
+    };
+    let resume_sent = match inject(resume) {
+        Ok(()) => "RESUME 1건 송신".to_string(),
+        Err(e) => format!("RESUME 주입 실패(부분 송신 가능: {e})"),
+    };
+    format!("{resume_sent} · {directive}")
+}
+
+/// clear 발효 뒤 보류는 전용 머리표로 접는다. 주입 실패가 이 계약을 덮어쓰면 이중 clear를 유발한다.
 fn cycle_reinject_held(
     reason: &str,
     hooks_inject: bool,
@@ -17584,31 +17621,7 @@ fn cycle_reinject_held(
     let sent = if reason.starts_with(CYCLE_HUMAN_DRAFT_TOKEN) {
         "송신 0건(사람 초안 보호)".to_string()
     } else {
-        let directive = if hooks_inject {
-            "디렉티브 생략(훅)".to_string()
-        } else {
-            match compose() {
-                Ok(text) => match inject(&text) {
-                    Ok(()) => "디렉티브 1건 송신".to_string(),
-                    Err(e) => {
-                        eprintln!("[cycle] clear 발효 뒤 디렉티브 최선노력 주입 실패: {e}");
-                        format!("디렉티브 주입 실패(부분 송신 가능: {e})")
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[cycle] clear 발효 뒤 디렉티브 합성 실패: {e}");
-                    format!("디렉티브 0건(합성 실패: {e})")
-                }
-            }
-        };
-        let resume_sent = match inject(resume) {
-            Ok(()) => "RESUME 1건 송신".to_string(),
-            Err(e) => {
-                eprintln!("[cycle] clear 발효 뒤 RESUME 최선노력 주입 실패: {e}");
-                format!("RESUME 주입 실패(부분 송신 가능: {e})")
-            }
-        };
-        format!("{resume_sent} · {directive}")
+        cycle_best_effort_reinject(hooks_inject, resume, compose, inject)
     };
     format!(
         "{CYCLE_REINJECT_HELD_TOKEN} clear 는 실효 확인됨(session_file 교체) · 재주입 보류 사유: {reason} · \
@@ -17882,7 +17895,7 @@ fn run_cycle_agent(
             )
             .map_err(|e| {
                 if is_typing_guard_err(&e) {
-                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부: 데몬이 사람 입력을 감지했다({e}) — 초안 소거 금지")
+                    format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다({e}) — 추가 소거 금지")
                 } else {
                     e
                 }
@@ -17963,14 +17976,16 @@ fn run_cycle_agent(
                     ) {
                         Ok(()) => {
                             eprintln!(
-                                "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
+                                "[cycle 7/7] 재주입(측정 불능 · 최선노력) — 디렉티브 {} + 재개 포인터",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
                             );
-                            if !hooks_inject {
-                                inject_text(sid, &compose_directive(&role_name)?)?;
-                            }
-                            inject_text(sid, &resume_text)?;
-                            eprintln!("[cycle] 측정 불능 — 화면 유휴 관측 후 재주입은 했다(실효 미확인)");
+                            let sent = cycle_best_effort_reinject(
+                                hooks_inject,
+                                &resume_text,
+                                &mut || compose_directive(&role_name),
+                                &mut |text| inject_text(sid, text),
+                            );
+                            eprintln!("[cycle] 측정 불능 — 화면 유휴 관측 후 재주입(실효 미확인): {sent}");
                         }
                         Err(e) => eprintln!("[cycle] 측정 불능 + 재주입 보류: {e}"),
                     }
