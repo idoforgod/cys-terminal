@@ -32005,6 +32005,95 @@ mod tests {
     }
 
     #[test]
+    fn d16_exit_docs_state_autopilot_held_contract() {
+        let src = include_str!("cys.rs");
+        let production = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("tests 모듈 경계 없음")
+            .0;
+        let lines: Vec<&str> = production.lines().collect();
+        let mut failures = Vec::new();
+        for name in [
+            "EXIT_CYCLE_TARGET_BUSY",
+            "EXIT_CYCLE_HUMAN_DRAFT",
+            "CYCLE_TARGET_BUSY_TOKEN",
+            "CYCLE_HUMAN_DRAFT_TOKEN",
+        ] {
+            let declaration = format!("const {name}:");
+            let at = lines
+                .iter()
+                .position(|line| line.starts_with(&declaration))
+                .unwrap_or_else(|| panic!("{name} 선언 없음"));
+            let mut doc_lines: Vec<&str> = lines[..at]
+                .iter()
+                .rev()
+                .take_while(|line| line.starts_with("///"))
+                .copied()
+                .collect();
+            doc_lines.reverse();
+            let doc = doc_lines.join("\n");
+            if !doc.contains("held_noop") {
+                failures.push(format!("{name} doc 에 held_noop 계약 없음"));
+            }
+            if doc.contains("사이클을 멈추지 않는다") {
+                failures.push(format!("{name} doc 에 종전 사이클 미중단 설명 잔존"));
+            }
+        }
+
+        let at = production.find("\n    CycleAgent {").expect("CycleAgent 변형 없음");
+        let doc_start = production[..at]
+            .rfind("\n    /// T2-4")
+            .expect("CycleAgent doc 없음");
+        let held_line = production[doc_start..at]
+            .lines()
+            .find(|line| line.trim_start().starts_with("/// 84·85"))
+            .expect("CycleAgent doc 의 84·85 줄 없음");
+        if !held_line.contains("C-u 1키") {
+            failures.push("CycleAgent doc 에 C-u 1키 선행 가능성 없음".to_string());
+        }
+
+        let body = strip_line_comments(refl_fn_body(production, "run_cycle_agent"));
+        let refusal = body
+            .split_once("if is_typing_guard_err(&e) {")
+            .expect("typing_guard 거부 분기 없음")
+            .1
+            .split_once("} else {")
+            .expect("typing_guard 거부 분기 끝 없음")
+            .0;
+        if !refusal.contains("C-u 1건은 선행 송신됨") {
+            failures.push("typing_guard 거부 문면에 C-u 1건 선행 송신 설명 없음".to_string());
+        }
+        if refusal.contains("초안 소거 금지") {
+            failures.push("typing_guard 거부 문면에 종전 초안 소거 금지 설명 잔존".to_string());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn d16_unmeasurable_arm_never_propagates_inject_errors() {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let arm = body
+            .split_once("ClearEffect::Unmeasurable => {")
+            .expect("Unmeasurable 팔 없음")
+            .1
+            .split_once("CLEAR_UNMEASURABLE_TOKEN")
+            .expect("측정 불능 종료 토큰 없음")
+            .0;
+        let propagating: Vec<&str> = [
+            "compose_directive(&role_name)?",
+            "inject_text(sid, &resume_text)?",
+        ]
+        .into_iter()
+        .filter(|call| arm.contains(*call))
+        .collect();
+        assert!(
+            propagating.is_empty(),
+            "Unmeasurable 재주입 실패는 rc81 을 유지해야 한다; ? 전파 잔존: {}",
+            propagating.join(", ")
+        );
+    }
+
+    #[test]
     fn d16_reinject_held_protects_drafts_and_reports_successful_sends() {
         let reason = format!("{CYCLE_HUMAN_DRAFT_TOKEN} 사람이 치던 초안");
         let error = cycle_reinject_held(
@@ -32197,6 +32286,94 @@ mod tests {
     }
 
     #[test]
+    fn d16_quiet_timeout_diagnostic_carries_machine_token() {
+        let diagnostic = cycle_quiet_timeout_diagnostic(true, false);
+        assert!(
+            diagnostic.contains("[diag=quiet_secs_unreported]"),
+            "구 데몬 보류를 분류할 기계 토큰이 없다: {diagnostic}"
+        );
+        assert_eq!(cycle_quiet_timeout_diagnostic(true, true), "");
+        assert_eq!(cycle_quiet_timeout_diagnostic(false, false), "");
+
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        assert!(
+            prod.lines().any(|line| {
+                line == "const CYCLE_QUIET_UNREPORTED_DIAG: &str = \"quiet_secs_unreported\";"
+            }),
+            "기계 토큰 상수는 줄 시작 문자열 리터럴 선언이어야 한다"
+        );
+    }
+
+    #[test]
+    fn d16_held_rcs_and_diag_token_match_autopilot() {
+        let autopilot = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let held_literal = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("HELD_RCS = ("))
+            .and_then(|literal| literal.strip_suffix(')'))
+            .expect("파이썬 HELD_RCS 줄 시작 튜플 리터럴");
+        let held_rcs: Vec<i32> = held_literal
+            .split(',')
+            .map(|rc| rc.trim().parse().expect("HELD_RCS 정수 리터럴"))
+            .collect();
+        assert_eq!(held_rcs.len(), 2, "보류 코드는 84/85 두 개뿐이다");
+        assert_eq!(
+            (held_rcs[0], held_rcs[1]),
+            (EXIT_CYCLE_TARGET_BUSY, EXIT_CYCLE_HUMAN_DRAFT),
+            "러스트와 autopilot 의 clear 이전 보류 코드가 다르다"
+        );
+        assert!(
+            !held_rcs.contains(&EXIT_CYCLE_REINJECT_HELD),
+            "clear 이후 rc86은 HELD_RCS에 들어가면 안 된다"
+        );
+
+        let python_diag = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("QUIET_UNREPORTED_DIAG = \""))
+            .and_then(|literal| literal.strip_suffix('"'))
+            .expect("파이썬 QUIET_UNREPORTED_DIAG 줄 시작 문자열 리터럴");
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let rust_diag = prod
+            .lines()
+            .find_map(|line| line.strip_prefix("const CYCLE_QUIET_UNREPORTED_DIAG: &str = \""))
+            .and_then(|literal| literal.strip_suffix("\";"))
+            .expect("러스트 CYCLE_QUIET_UNREPORTED_DIAG 줄 시작 문자열 리터럴");
+        assert_eq!(rust_diag, python_diag, "구 데몬 진단 기계 토큰의 교차 언어 계약");
+    }
+
+    #[test]
+    fn d16_residual_window_format_matches_autopilot_regex() {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        assert!(
+            body.contains("residual_window={:.1}s"),
+            "실측 residual_window는 소수 한 자리 초 형식을 유지해야 한다"
+        );
+        let autopilot = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        assert!(
+            autopilot.lines().any(|line| {
+                line == r#"RESIDUAL_WINDOW_RE = re.compile(r"residual_window=(\d+\.\d+)s")"#
+            }),
+            "autopilot residual_window 파서 정규식이 달라졌다"
+        );
+        let rendered = format!("residual_window={:.1}s", 12.34f64);
+        assert_eq!(rendered, "residual_window=12.3s");
+        let seconds = rendered
+            .strip_prefix("residual_window=")
+            .and_then(|value| value.strip_suffix('s'))
+            .expect("residual_window 접두사와 초 접미사");
+        let (integer, fraction) = seconds.split_once('.').expect("소수점");
+        assert!(
+            !integer.is_empty()
+                && !fraction.is_empty()
+                && integer.bytes().all(|byte| byte.is_ascii_digit())
+                && fraction.bytes().all(|byte| byte.is_ascii_digit()),
+            "파이썬 정규식의 숫자+소수점+숫자 의미와 맞지 않는다: {rendered}"
+        );
+    }
+
+    #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
@@ -32341,6 +32518,18 @@ mod tests {
         session_files: Vec<&'static str>,
         reports_usage: bool,
     ) -> (std::path::PathBuf, D16DaemonCalls, impl FnOnce()) {
+        fake_daemon_with(rows, screens, session_files, reports_usage, false)
+    }
+
+    /// clear 뒤 authoritative 주입만 거부한다. 저장 지시·clear 및 기존 시나리오는 그대로다.
+    #[cfg(unix)]
+    fn fake_daemon_with(
+        rows: Value,
+        screens: Vec<(&'static str, f64)>,
+        session_files: Vec<&'static str>,
+        reports_usage: bool,
+        reject_authoritative_after_clear: bool,
+    ) -> (std::path::PathBuf, D16DaemonCalls, impl FnOnce()) {
         use std::io::{BufRead, BufReader, Write};
         use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
@@ -32372,6 +32561,14 @@ mod tests {
                 }
                 recorded.lock().unwrap_or_else(|e| e.into_inner())
                     .push((method.clone(), req["params"].clone()));
+                if reject_authoritative_after_clear && clear_sent
+                    && method == "surface.send_text" && req["params"]["authoritative"] == true
+                {
+                    // request → rpc_roundtrip 는 최상위 ok:false 를 Err 로 전환한다.
+                    let response = json!({"id": req["id"], "ok": false, "error": "stub: inject refused"});
+                    let _ = writeln!(stream, "{response}");
+                    continue;
+                }
                 let result = match method.as_str() {
                     "surface.list" => {
                         // clear 전에는 S1을 유지한다 — 저장 주입 가드의 조회가 S2를 먼저 소비하면 안 된다.
@@ -32585,6 +32782,43 @@ mod tests {
         assert_eq!(counts.1, 1);
         assert_eq!(counts.2, 0, "claude 훅 선언이면 디렉티브 생략");
         assert_eq!(counts.3, 2, "authoritative는 저장 지시·RESUME 각 1건");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_unmeasurable_reinject_failure_keeps_rc81() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = D16CycleFixture::new();
+        let rows = json!([{
+            "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+            "exited": false, "awakened_at": 1.0, "cwd": fixture.dir, "live_cwd": fixture.dir
+        }]);
+        let (socket, calls, stop) = fake_daemon_with(
+            rows,
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)],
+            vec!["S1"], false, true,
+        );
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
+        assert!(directive.starts_with('W') && directive.ends_with('R'));
+        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+        drop(stop);
+        let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let counts = d16_cycle_send_counts(&recorded);
+        assert_eq!(counts.0, 1, "재주입 거부 전에 /clear 1건이 송신돼야 한다");
+        let clear_at = recorded.iter().position(|(method, params)| {
+            method == "surface.send_text" && params["text"] == "/clear"
+        }).expect("clear 송신 기록");
+        let authoritative = |call: &(String, Value)| {
+            call.0 == "surface.send_text" && call.1["authoritative"] == true
+        };
+        assert_eq!(recorded[..clear_at].iter().filter(|call| authoritative(call)).count(), 1,
+            "clear 전 authoritative는 저장 지시 1건");
+        assert!(recorded[clear_at + 1..].iter().any(authoritative),
+            "clear 뒤 거부된 authoritative 재주입 시도가 기록돼야 한다");
+        assert!(counts.3 >= 2, "저장 지시 외에 authoritative 재주입 시도 1건 이상");
+        assert_eq!(exit, 81, "재주입 거부가 측정 불능 rc81을 rc1로 덮으면 안 된다");
     }
 
     #[cfg(unix)]
