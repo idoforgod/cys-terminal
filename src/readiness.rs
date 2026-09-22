@@ -314,6 +314,27 @@ pub fn judge(o: &Observed) -> Verdict {
     }
 }
 
+/// ★(0.14.39 · 성찰1 blocking ① · 성찰1 major ② · 성찰2 major ⑤) 화면에 **첫기동 관문·모달이 서 있는가**.
+///
+/// `judge` 의 두 공통 거부축(`first_run_gates::identify` ∨ `modal_signature_with_marker`)과 **같은 술어**를
+/// 쓰되, `Observed`(생애 창·밸브 재료)를 조립할 수 없는 소비처(사이클 clear 전 유휴 판정 · 관문 증거 이월의
+/// 마커 미해소 팔)를 위해 재료만 노출한다. 생애 창(`gate_axis_window_closed`·`modal_window_closed`)을
+/// 보지 않으므로 `judge` 보다 **더 자주 참**이고, 모든 소비처의 귀결은 보류(주입 0 · 키 0 · 파괴 0)다.
+///
+/// 마커 후보는 커서 스캐너(`cursor_rows`)가 `❯` 밖의 어댑터 글리프도 보게 한다 — 후보 전부에 OR 한다.
+pub fn gate_or_modal_present(screen: &str, gates: &[first_run_gates::Gate], markers: &[String]) -> bool {
+    if first_run_gates::identify(gates, screen).is_some() {
+        return true;
+    }
+    if modal_signature(screen).is_some() {
+        return true;
+    }
+    markers
+        .iter()
+        .filter(|m| !m.trim().is_empty())
+        .any(|m| modal_signature_with_marker(screen, Some(m)).is_some())
+}
+
 /// 관문 AND 항 — 지금 화면에 관문이 떠 있는가. 문면의 진실원천은 `first_run_gates` 하나다.
 ///
 /// ★왜 델타가 아니라 화면인가: 관문은 **떠 있는 동안 계속** 사람의 입력을 기다리는 상태이지

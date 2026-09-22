@@ -95,8 +95,14 @@ pub fn pick_marker_for_screen<'a>(cands: &'a [String], text: &str) -> Option<&'a
 /// 프롬프트 글리프는 세 TUI 모두 행 선두다. 출력 행의 `cat a > b`·푸터의 `[main] ~/dev > 62%`·
 /// 상태줄의 `‹ prev » next` 는 선두가 아니므로 composer 행이 아니다.
 ///
-/// 【실패 방향】 해소 실패(`None`)의 귀결은 소비처에서 **마커 미선언 어댑터와 같은 등급**
-/// (출력 정적 `idle_quiet` 축)이다 — gemini 의 0.14.38 거동 그 자체라 회귀가 아니다.
+/// 【실패 방향】 해소 실패(`None`)의 귀결은 소비처마다 다르고, **어댑터마다 비대칭**이다(정정 2026-09-22):
+///   · gemini(0.14.38 에 `prompt_marker` 선언 없음)에게는 종전 등급 그대로다 — 회귀가 아니다.
+///   · claude(`❯`)·codex(`›`·`»`)에게는 **강등**이다. 종전 [`pick_marker_for_screen`] 의 첫-후보 폴백이
+///     `Some(m)` 을 유지해 `composer_layout_static_ok` 가 보류시키던 프레임이, 폴백 없는 이 해소기에서는
+///     `None` 이 되어 출력 정적(`idle_quiet`) 축으로 내려간다. 그 강등은 0.14.38 거동이 아니다.
+///   그래서 소비처가 등급을 되살린다: 후보 글리프가 화면에 **있는데 선두가 아니면** 마커 축에 남겨
+///   보류하고(`gate_carry_ok` 의 `glyph_off_composer`), 글리프가 아예 없을 때만 quiet 축으로 내려간다.
+///   그 quiet 축에도 관문·모달 부재를 AND 로 건다(`readiness::gate_or_modal_present`).
 pub fn pick_marker_leading_on_screen<'a>(cands: &'a [String], screen: &str) -> Option<&'a str> {
     screen
         .lines()

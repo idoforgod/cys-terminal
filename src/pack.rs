@@ -115,6 +115,103 @@ pub fn pack_dir() -> PathBuf {
     }
 }
 
+/// 레인 가드 조기 종료 표식(`<pack>/state/lane-guard-tripped`)의 상대 경로.
+/// 정의처 동형: `cysjavis-pack/bin/javis_preflight.py` LANE_GUARD_TRIPPED_REL.
+pub const LANE_GUARD_TRIPPED_REL: &str = "state/lane-guard-tripped";
+/// 표식 신선도 창(초). 정의처 동형: 같은 파일 LANE_GUARD_RECENT_S.
+pub const LANE_GUARD_RECENT_SECS: u64 = 24 * 3600;
+
+/// 이 레인(팩)의 훅이 **무발화 조기 종료**한 적이 있는가.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneGuardTrip {
+    /// 표식의 `reason=` (absent·unreadable·no-redirect-line·already-redirected).
+    pub reason: String,
+    /// 표식의 `script=` (session-start.sh 등). 결측이면 빈 문자열.
+    pub script: String,
+    /// 표식이 있지만 판독 불가 — 결측은 값이 아니므로 **참(보수)**으로 접는다.
+    pub unreadable: bool,
+}
+
+/// 파이썬 `lane_guard_tripped`의 `(recent, info)`를 같은 3분기로 판정한다.
+/// 파일의 증명된 부재와 mtime 기준 24시간을 넘은 표식만 `None`이다.
+/// 판독 불가(권한·비정규 파일·mtime 없음)는 `Some`의 `unreadable: true`로 막는다.
+/// 본문은 Python `_read_text_tolerant`처럼 UTF-8 손상 바이트를 대체해 읽는다.
+pub fn lane_guard_tripped(pack_dir: &Path) -> Option<LaneGuardTrip> {
+    lane_guard_tripped_at(pack_dir, std::time::SystemTime::now())
+}
+
+/// 현재 시각만 주입해 신선도 경계와 시계 역전을 결정론적으로 검증한다.
+fn lane_guard_tripped_at(pack_dir: &Path, now: std::time::SystemTime) -> Option<LaneGuardTrip> {
+    use std::io::Read;
+
+    let path = pack_dir.join(LANE_GUARD_TRIPPED_REL);
+    let unreadable = || Some(LaneGuardTrip {
+        reason: String::new(),
+        script: String::new(),
+        unreadable: true,
+    });
+    // Python `_lexists_strict`와 동형: 끊어진 심링크도 존재하며, 조회 실패는 부재가 아니다.
+    if let Err(error) = std::fs::symlink_metadata(&path) {
+        let absent = matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) || path.as_os_str().as_encoded_bytes().contains(&0);
+        #[cfg(unix)]
+        let absent = absent
+            || error.raw_os_error().is_some_and(|code| {
+                [libc::ENOENT, libc::ENOTDIR, libc::ELOOP, libc::ENAMETOOLONG].contains(&code)
+            });
+        return if absent { None } else { unreadable() };
+    }
+
+    // Python `_open_unblocking_ro`와 같은 O_NONBLOCK + 열린 fd 정규파일 확인:
+    // writer 없는 FIFO와 lstat/open 사이 FIFO 교체도 cycle-agent를 멈추지 못한다.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(_) => return unreadable(),
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return unreadable(),
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return unreadable();
+    }
+    let mtime = match std::fs::metadata(&path).and_then(|metadata| metadata.modified()) {
+        Ok(mtime) => mtime,
+        Err(_) => return unreadable(),
+    };
+    let age = now.duration_since(mtime).unwrap_or_default();
+    if age > std::time::Duration::from_secs(LANE_GUARD_RECENT_SECS) {
+        return None;
+    }
+
+    let mut trip = LaneGuardTrip {
+        reason: String::new(),
+        script: String::new(),
+        unreadable: false,
+    };
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "reason" => trip.reason = value.to_owned(),
+            "script" => trip.script = value.to_owned(),
+            // Python의 나머지 인정 키도 읽되 현재 공개 결과에는 두 필드만 노출한다.
+            "hook_root" | "lane_root" | "surface" | "ts" => {}
+            _ => {}
+        }
+    }
+    Some(trip)
+}
+
 /// 소켓 경로 → 그 레인의 팩 경로(결정론 유도 · G34).
 ///
 /// 규약: 부서 소켓은 경로 성분(unix 부모 디렉터리 / windows 파이프명)에 `cys-dept-<name>` 을 갖고,
@@ -4202,6 +4299,131 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 레인 표식 검체마다 라이브 팩과 무관한 고유 임시 디렉터리를 만든다.
+    fn lane_guard_test_pack(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pack = std::env::temp_dir().join(format!(
+            "cys-lane-guard-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(pack.join("state")).unwrap();
+        pack
+    }
+
+    /// 증명된 표식 부재만 레인 가드 무발화 기록 없음으로 판정한다.
+    #[test]
+    fn lane_guard_tripped_absent_marker_is_none() {
+        let pack = lane_guard_test_pack("absent");
+        assert_eq!(lane_guard_tripped(&pack), None);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 방금 쓴 absent 표식은 판독 가능한 최근 조기 종료 기록이다.
+    #[test]
+    fn lane_guard_tripped_recent_marker_preserves_reason() {
+        let pack = lane_guard_test_pack("recent");
+        std::fs::write(pack.join(LANE_GUARD_TRIPPED_REL), "reason=absent\n").unwrap();
+        let trip = lane_guard_tripped(&pack).expect("최근 표식을 부재로 접었다");
+        assert_eq!(trip.reason, "absent");
+        assert_eq!(trip.script, "");
+        assert!(!trip.unreadable);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// mtime보다 25시간 뒤를 관측하면 낡은 표식은 오늘의 발화 판정에서 제외한다.
+    #[test]
+    fn lane_guard_tripped_stale_marker_is_none() {
+        let pack = lane_guard_test_pack("stale");
+        let marker = pack.join(LANE_GUARD_TRIPPED_REL);
+        std::fs::write(&marker, "reason=absent\n").unwrap();
+        let mtime = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let now = mtime + std::time::Duration::from_secs(25 * 3600);
+        assert_eq!(lane_guard_tripped_at(&pack, now), None);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 위임 줄 부재의 사유와 SessionStart 스크립트를 원문 그대로 읽는다.
+    #[test]
+    fn lane_guard_tripped_parses_reason_and_script() {
+        let pack = lane_guard_test_pack("fields");
+        std::fs::write(
+            pack.join(LANE_GUARD_TRIPPED_REL),
+            "hook_root=/old\nlane_root=/lane\nreason=no-redirect-line\nscript=session-start.sh\nsurface=claude\nts=0\n",
+        )
+        .unwrap();
+        let trip = lane_guard_tripped(&pack).unwrap();
+        assert_eq!(trip.reason, "no-redirect-line");
+        assert_eq!(trip.script, "session-start.sh");
+        assert!(!trip.unreadable);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 표식이 디렉터리여서 판독 불가하면 낡은 mtime으로도 무발화 기록을 지우지 않는다.
+    #[test]
+    fn lane_guard_tripped_unreadable_marker_is_conservative() {
+        let pack = lane_guard_test_pack("unreadable");
+        let marker = pack.join(LANE_GUARD_TRIPPED_REL);
+        std::fs::create_dir(&marker).unwrap();
+        let mtime = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let trip = lane_guard_tripped_at(&pack, mtime + std::time::Duration::from_secs(25 * 3600))
+            .expect("판독 불가를 부재나 낡은 표식으로 접었다");
+        assert!(trip.unreadable);
+        assert_eq!(trip.reason, "");
+        assert_eq!(trip.script, "");
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 신선도는 정확히 24시간까지 포함하며 미래 mtime의 음수 나이는 0으로 접는다.
+    #[test]
+    fn lane_guard_tripped_recent_window_includes_boundary_and_future() {
+        let pack = lane_guard_test_pack("clock");
+        let marker = pack.join(LANE_GUARD_TRIPPED_REL);
+        std::fs::write(&marker, "reason=already-redirected\n").unwrap();
+        let mtime = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        assert!(lane_guard_tripped_at(
+            &pack,
+            mtime + std::time::Duration::from_secs(LANE_GUARD_RECENT_SECS)
+        )
+        .is_some());
+        assert!(lane_guard_tripped_at(&pack, mtime - std::time::Duration::from_secs(1)).is_some());
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 빈 사유도 표식이며 미지 키는 무시하고 Python처럼 UTF-8 손상 바이트를 대체한다.
+    #[test]
+    fn lane_guard_tripped_empty_reason_and_lossy_text_remain_observed() {
+        let pack = lane_guard_test_pack("text");
+        std::fs::write(
+            pack.join(LANE_GUARD_TRIPPED_REL),
+            b"unknown=absent\n reason=not-a-key\nreason=\nscript=session-\xff.sh\n",
+        )
+        .unwrap();
+        let trip = lane_guard_tripped(&pack).unwrap();
+        assert_eq!(trip.reason, "");
+        assert_eq!(trip.script, "session-\u{fffd}.sh");
+        assert!(!trip.unreadable);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
+
+    /// 끊어진 심링크와 writer 없는 FIFO는 부재로 접거나 무한 대기하지 않고 판독 불가로 막는다.
+    #[cfg(unix)]
+    #[test]
+    fn lane_guard_tripped_dangling_link_and_fifo_are_unreadable() {
+        use std::os::unix::ffi::OsStrExt;
+        let pack = lane_guard_test_pack("nonregular");
+        let marker = pack.join(LANE_GUARD_TRIPPED_REL);
+        std::os::unix::fs::symlink(pack.join("missing"), &marker).unwrap();
+        assert!(lane_guard_tripped(&pack).unwrap().unreadable);
+        std::fs::remove_file(&marker).unwrap();
+        let fifo = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(lane_guard_tripped(&pack).unwrap().unreadable);
+        std::fs::remove_dir_all(pack).unwrap();
+    }
 
     /// 역할 → 디렉티브 파일명만 검증 (pack_dir 절대경로는 env 의존이라 비교하지 않음).
     fn dir_file(role: &str) -> Option<String> {
