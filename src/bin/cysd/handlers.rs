@@ -4491,6 +4491,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
             // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
             // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+            //
+            // ★★검체 없음 고지(수정 라운드 2 · 리뷰 minor · 리팩터 체크리스트 등재 대상):
+            //   이 2차 검사는 1차와 **같은 순수 함수**(draft_gate_verdict)를 부르므로 결정론
+            //   검체로 1차와 구별되지 않는다 — 고정하려면 '1차 통과 → 사람 키가 계수를 올림 →
+            //   2차 거부' 경합을 만들어야 하고, 그러려면 판정과 쓰기 사이에 주입 가능한 시임이
+            //   필요하다. 실측으로도 이 두 줄을 `.filter(|_| false)` 로 무력화하면 **0 FAILED**다.
+            //   ⇒ 이 코드를 지우면 **스위트가 초록인 채로** 사람 키와의 경합에서 계수 축
+            //      직렬화가 사라진다. 핸들러를 리팩터할 때 이 문단을 먼저 읽어라.
+            //
+            // ★유령 원장 행 고지: 위 `record_audited`(:4463)는 이 2차 검사보다 **앞**이다.
+            //   경합 창에서 2차 거부가 나면 일어나지 않은 배달이 원장에 남는다(훅의 층2 라벨
+            //   폴백이 읽는 그 원장이다). 기록을 이 아래로 옮기지 않은 이유: `record_audited` 는
+            //   원장 파일 append(디스크 IO)이고 `input_gate` 는 **큐 배달 틱도 잡는** 락이라,
+            //   그 임계영역에 파일 IO 를 넣으면 배달 경로에 디스크 지연이 들어온다. 같은 유령
+            //   행은 바로 아래 `try_write` 실패 경로에도 base 부터 존재했다(신규 노출 아님).
             if let Some(kind) = gate_kind {
                 let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
                 let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
@@ -4753,6 +4768,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
                 // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
                 // (base 타이핑 가드와 같은 구조적 한계 · 문서화).
+                // ★검체 없음 고지 — send_text 쪽 같은 자리(:4490)의 문단이 정본이다. 요지:
+                //   1차와 같은 순수 함수라 결정론 검체로 구별되지 않고, 무력화해도 0 FAILED 다.
+                //   지우면 스위트가 초록인 채로 계수 축 직렬화가 사라진다(리팩터 체크리스트).
                 if let Some(kind) = gate_kind {
                     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
                     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
