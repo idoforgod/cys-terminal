@@ -18,6 +18,9 @@
 #   반파 세대를 절대 보지 않는다. --self-test 가 SIGKILL 중단으로 이를 실증한다.
 #
 # GC 정책: 최근 48세대 + 일별 대표 14일 보관, 그 외 삭제(state-generations/ 내부만).
+# D-07: TODO glob 0건도 필수 누락으로 기록하고, autopilot.json 선택부재는 별도 계수한다.
+# D-07: dry-run 은 디렉터리 생성·임시 세대 청소 없이 보관 대상만 표시한다.
+# D-07: .tmp-* 는 살아 있는 pid 를 보호하고, 죽은 pid 는 60초·pid 불명은 3600초 후 청소한다.
 #
 # 사용:
 #   javis_state_snapshot.py snapshot [--dry-run]   # 세대 1건 생성 + GC
@@ -51,6 +54,8 @@ GEN_ROOT = os.path.join(HOME, ".cys", "state-generations")
 #   부서는 손 배선·부서명 하드코딩 없이 glob(cys-dept-*) ∪ depts.json 레지스트리로 발견된다
 #   (모든 사용자 동일 적용 — 개인 경로/계정 무첨가, HOME 파생 상대경로만).
 DECLARATIVE_BASENAMES = ["topology.json", "schedule_state.json", "autopilot.json", "event.seq"]
+# pause/resume 시 생성되는 선택 상태지만, 존재하면 반드시 보관해야 복원 시 pause 를 유지한다.
+OPTIONAL_BASENAMES = ("autopilot.json",)
 
 IS_WINDOWS = os.name == "nt"
 
@@ -182,7 +187,9 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     #   로 떨어져 5세대+ 누락되던 경로를 `<pack>/round` 폴백으로 닫는다(사유·순서는 그 docstring).
     proj_round = project_round_dir()
     srcs.append(os.path.join(proj_round, "SESSION_STATE.md"))
-    srcs.extend(sorted(_glob.glob(os.path.join(proj_round, "*_TODO.md"))))
+    # D-07: 종전엔 glob 0건이 조용한 0이라 phoenix 세대에서 노드 TODO 누락이 보이지 않았다.
+    todo_pattern = os.path.join(proj_round, "*_TODO.md")
+    srcs.extend(sorted(_glob.glob(todo_pattern)) or [todo_pattern])
     srcs.extend(sorted(_glob.glob(os.path.join(
         home, ".claude*", "projects", "*", "memory", "*.md"))))
     return srcs
@@ -193,6 +200,8 @@ KEEP_DAILY_DAYS = 14    # 최근 D일은 하루당 대표 1세대 보관
 
 GEN_NAME_RE = re.compile(r"^(\d{8}T\d{6}Z)(?:-(\d+))?$")  # 20260703T085230Z 또는 ...-1
 TMP_PREFIX = ".tmp-"
+TMP_MIN_AGE_SECS = 60
+TMP_STALE_AGE_SECS = 3600
 
 
 def _sha256(path):
@@ -248,15 +257,61 @@ def list_generations(gen_root=GEN_ROOT):
     return out
 
 
+def _pid_alive(pid):
+    """프로세스 생존 여부(판정 불가면 True). Windows 의 os.kill(pid, 0)은
+    TerminateProcess 를 호출하므로 금지하고, OpenProcess 조회 핸들만 사용한다."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.GetLastError.argtypes = []
+            kernel32.GetLastError.restype = wintypes.DWORD
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return kernel32.GetLastError() != 87  # ERROR_INVALID_PARAMETER 만 부재 확정
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+    return True
+
+
 def _cleanup_tmp(gen_root):
-    """이전 실행이 승격 전에 죽어 남긴 .tmp-* 잔재를 청소한다(반파 세대 제거)."""
+    """.tmp-* 잔재 중 죽은 pid(60초 이상) 또는 pid 불명(3600초 이상)만 청소한다."""
     removed = []
     if not os.path.isdir(gen_root):
         return removed
+    now = time.time()
     for name in os.listdir(gen_root):
         if name.startswith(TMP_PREFIX):
             p = os.path.join(gen_root, name)
             try:
+                pid = int(name[len(TMP_PREFIX):].split("-", 1)[0])
+                if pid <= 0:
+                    raise ValueError("pid must be positive")
+            except ValueError:
+                min_age = TMP_STALE_AGE_SECS
+            else:
+                if _pid_alive(pid):
+                    continue
+                min_age = TMP_MIN_AGE_SECS
+            try:
+                if not os.path.isdir(p) or now - os.path.getmtime(p) < min_age:
+                    continue
                 shutil.rmtree(p)
                 removed.append(name)
             except OSError:
@@ -267,13 +322,14 @@ def _cleanup_tmp(gen_root):
 def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None):
     """상태 파일 세대 1건을 원자적으로 생성한다. 생성된 세대 이름 반환(dry_run이면 None)."""
     sources = sources if sources is not None else default_sources()
-    os.makedirs(gen_root, exist_ok=True)
-
-    # 승격 전 죽은 잔재 청소
-    _cleanup_tmp(gen_root)
-
-    present = [s for s in sources if os.path.isfile(s)]
-    missing = [s for s in sources if not os.path.isfile(s)]
+    present, missing, optional_absent = [], [], []
+    for s in sources:
+        if os.path.isfile(s):
+            present.append(s)
+        elif os.path.basename(s) in OPTIONAL_BASENAMES:
+            optional_absent.append(s)
+        else:
+            missing.append(s)
 
     if dry_run:
         print(f"[dry-run] 세대 보관 대상 {len(present)}건:")
@@ -281,7 +337,14 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             print(f"  + {s}  ({os.path.getsize(s)}B)")
         for s in missing:
             print(f"  - (없음) {s}")
+        for s in optional_absent:
+            print(f"  - (선택·없음) {s}")
         return None
+
+    os.makedirs(gen_root, exist_ok=True)
+
+    # 승격 전 죽은 잔재 청소(dry-run 은 생성·청소 모두 무기록)
+    _cleanup_tmp(gen_root)
 
     if not present:
         print("[snapshot] 보관할 소스 파일이 하나도 없음 — 세대 미생성", file=sys.stderr)
@@ -297,6 +360,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
         "created_at_iso": dt.isoformat(),
         "generator": "javis_state_snapshot.py",
         "files": [],
+        "missing": sorted(missing),
+        "optional_absent": sorted(optional_absent),
     }
     try:
         for src in present:
@@ -347,7 +412,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     gen_name = os.path.basename(final_dir)
-    print(f"[snapshot] 세대 생성: {gen_name}  (파일 {len(present)}건, 누락 {len(missing)}건)")
+    print("[snapshot] 세대 생성: %s  (파일 %d건, 누락 %d건, 선택부재 %d건)" %
+          (gen_name, len(present), len(missing), len(optional_absent)))
 
     # 3) GC
     kept, deleted = do_gc(gen_root=gen_root, dry_run=False)
@@ -514,12 +580,25 @@ def do_self_test():
             tmp_leftover = [n for n in os.listdir(gen_root) if n.startswith(TMP_PREFIX)]
             print(f"  [PASS] T2 승격 직전 중단 → 최종 세대 미증가(반파 없음), .tmp 잔재 {len(tmp_leftover)}건")
 
-        # T3: 잔재 청소 — 다음 스냅샷이 .tmp-* 잔재 청소
+        # T3: 죽은 pid + 충분한 나이의 잔재 청소(방금 죽은 pid 는 D-07 최소 보존 시간 적용)
+        old_time = time.time() - 2 * 3600
+        for name in os.listdir(gen_root):
+            if name.startswith(TMP_PREFIX):
+                os.utime(os.path.join(gen_root, name), (old_time, old_time))
         do_snapshot(sources=sources, gen_root=gen_root)
         tmp_leftover2 = [n for n in os.listdir(gen_root) if n.startswith(TMP_PREFIX)]
         assert len(tmp_leftover2) == 0, "T3: .tmp 잔재 미청소"
         assert len(list_generations(gen_root)) == 2, "T3: 세대 수 이상"
         print("  [PASS] T3 다음 실행이 반파 .tmp 잔재 청소 + 정상 세대 추가")
+
+        # T3': 살아 있는 pid 는 오래된 잔재도 보호(fork 없이 Windows 에서도 실행)
+        live_tmp = tempfile.mkdtemp(prefix=f"{TMP_PREFIX}{os.getpid()}-", dir=gen_root)
+        os.utime(live_tmp, (old_time, old_time))
+        _cleanup_tmp(gen_root)
+        assert os.path.isdir(live_tmp), "T3': 살아 있는 pid 의 .tmp 잔재 삭제됨"
+        shutil.rmtree(live_tmp)
+        assert len(list_generations(gen_root)) == 2, "T3': 세대 수 이상"
+        print("  [PASS] T3' 살아 있는 pid 의 오래된 .tmp 잔재 보호")
 
         # T4: 원본 불파괴 불변식
         assert _sha256(src_file) == src_hash, "T4: 원본 변조됨(불변식 위반!)"
