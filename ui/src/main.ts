@@ -6,7 +6,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
-import { baseName, insertionText, isStreaming, splitPath } from "./ftdrop";
+import { baseName, insertionText, isStreaming, splitPath, classifyPathCheck, pathCheckToast } from "./ftdrop";
+import { dropPointToCss, dropPlatformFromUserAgent, dropDebugDetail, isDropDebugEnabled } from "./droppoint";
 import {
   handoffAckPath,
   handoffInstruction,
@@ -125,6 +126,7 @@ const IS_WINDOWS = /Windows/i.test(navigator.userAgent);
 // 셸 설치/해제 버튼은 macOS 전용(Rust install_cli_to_path 가 그 밖에서는 즉시 Err). 부정 판정
 // (!IS_WINDOWS)이면 Linux가 통과해 "보이는데 안 되는 버튼" 결함이 그대로 재현되므로 양성 판정을 쓴다.
 const IS_MACOS = isMacUserAgent(navigator.userAgent);
+const DROP_PLATFORM = dropPlatformFromUserAgent(navigator.userAgent);
 
 const invoke = (cmd: string, args?: Record<string, unknown>) => window.__TAURI__.core.invoke(cmd, args);
 // ★복원 경로 RPC 시간 상한(2026-09-16). Tauri invoke 에도 데몬 RPC 에도 상한이 없어서, 먹통(accept 후
@@ -3331,17 +3333,29 @@ function setFocus(sid: number) {
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
-// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 '직격'하는 pane만 찾는다.
+// 플랫폼별 단위(macOS·Linux=논리 px 그대로 · Windows=물리 px → /dpr) 환산은 droppoint.ts 단일 정의처.
+// 환산한 CSS px 지점을 '직격'하는 pane만 찾는다.
 // 폴백 없음 — 빗나간 드롭이 포커스 pane에 조용히 주입되던 오배달 footgun 제거.
 // 호출측이 undefined를 무동작+토스트로 처리한다(무음 실패 금지).
 function paneAtPointStrict(pos?: { x: number; y: number }): PaneRuntime | undefined {
   if (!pos) return undefined;
-  const dpr = window.devicePixelRatio || 1;
-  const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
+  const css = dropPointToCss(pos, window.devicePixelRatio || 1, DROP_PLATFORM);
+  const hit = document.elementFromPoint(css.x, css.y) as HTMLElement | null;
   const paneEl = hit?.closest(".pane") as HTMLElement | null;
   if (!paneEl) return undefined;
   for (const rt of panes.values()) if (rt.el === paneEl) return rt;
   return undefined;
+}
+
+// 오배달은 '성공 토스트가 뜨는데 목적지가 틀린' 결함이다. 놓기 전에 목적지를 보여
+// 사용자가 스스로 보정하게 한다(잔여 y 오프셋 tauri#10744 대비).
+let osDropOver: PaneRuntime | null = null;
+function setOsDropTarget(rt: PaneRuntime | undefined) {
+  const next = rt ?? null;
+  if (osDropOver === next) return;
+  osDropOver?.el.classList.remove("drop-target");
+  osDropOver = next;
+  osDropOver?.el.classList.add("drop-target");
 }
 
 // ---------- render ----------
@@ -4928,15 +4942,22 @@ function ftContextMenu(e: MouseEvent, full: string, isDir: boolean) {
 // F2: 경로 주입 파이프라인 — ①실존 재검증(스테일 트리 차단) ②스트리밍 가드 ③IME 가드
 // ④형식 결정(에이전트=@멘션/미등록=셸 인용) ⑤주입+피드백. 자동 Return 없음 — 전송은 사람 몫.
 async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
-  for (const p of paths) {
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
     // Windows OS 드롭 경로는 "\" 구분 — splitPath가 양쪽 구분자를 인식(POSIX-only 파싱 회귀 방지)
     const { parent, name } = splitPath(p);
-    const entries = (await invoke("list_dir", { path: parent }).catch(() => null)) as
-      | { name: string }[]
-      | null;
-    if (!entries || !entries.some((en) => en.name === name)) {
-      toast("watchdog", "경로가 더 이상 없음", `${p} — 트리를 새로고침합니다`);
-      void renderFileTree();
+    let entries: { name: string }[] | null = null;
+    let err: string | undefined;
+    try {
+      entries = (await invoke("list_dir", { path: parent })) as { name: string }[];
+    } catch (e) {
+      err = String(e);
+    }
+    const kind = classifyPathCheck(entries, name);
+    if (kind !== "ok") {
+      const t = pathCheckToast(kind, p, i, paths.length, err);
+      toast("watchdog", t.name, t.detail);
+      if (kind === "missing") void renderFileTree();
       return;
     }
   }
@@ -4952,9 +4973,15 @@ async function injectPathsToPane(rt: PaneRuntime, paths: string[]) {
     toast("watchdog", "한글 조합 중", "조합을 끝낸 뒤 다시 시도해 주세요");
     return;
   }
-  const r = (await invoke("list_surfaces", { socket: rt.socket }).catch(() => null)) as {
+  let r: {
     surfaces: { surface_id: number; live_cwd: string | null; role?: string | null; agent?: string | null }[];
   } | null;
+  try {
+    r = (await invoke("list_surfaces", { socket: rt.socket })) as typeof r;
+  } catch {
+    // 세션 목록 조회 실패 시 기존 셸 인용·절대경로 폴백을 유지한다.
+    r = null;
+  }
   const me = r?.surfaces.find((s) => s.surface_id === rt.sid);
   const agent = !!(me?.role || me?.agent);
   const isWin = /Windows/i.test(navigator.userAgent);
@@ -7444,14 +7471,34 @@ async function start() {
 
   // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 경로 주입(iTerm2 동작) ──
   // dragDropEnabled 기본 활성이라 Tauri가 OS 드롭을 가로채 tauri://drag-drop로 준다(HTML5 drop 미발화).
-  // payload.position=물리 픽셀. 전역 listen은 target=Any라 창 라벨로 emit된 이 이벤트를 수신한다
+  // payload.position 단위는 플랫폼별(macOS·Linux 논리 px · Windows 물리 px) — 환산은 paneAtPointStrict→droppoint.ts.
+  // 전역 listen은 target=Any라 창 라벨로 emit된 이 이벤트를 수신한다
   // (검증: tauri 2.11 event/listener.rs match_any_or_filter — listener.target==Any면 emit 타겟 무관 매칭).
   // F2: 트리 드래그와 동일 파이프라인(injectPathsToPane) — 재검증·스트리밍 가드·@멘션 형식 공유.
   // 직격 실패 시 무동작+토스트(포커스 pane 폴백 오배달 금지).
+  await listen("tauri://drag-enter", (e) => {
+    const p = (e.payload ?? {}) as { position?: { x: number; y: number } };
+    setOsDropTarget(paneAtPointStrict(p.position));
+  });
+  await listen("tauri://drag-over", (e) => {
+    const p = (e.payload ?? {}) as { position?: { x: number; y: number } };
+    setOsDropTarget(paneAtPointStrict(p.position));
+  });
+  await listen("tauri://drag-leave", () => setOsDropTarget(undefined));
   await listen("tauri://drag-drop", (e) => {
+    setOsDropTarget(undefined);
     const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
     const paths = p.paths ?? [];
     if (!paths.length) return;
+    try {
+      if (isDropDebugEnabled(localStorage.getItem("cysDropDebug")) && p.position) {
+        const dpr = window.devicePixelRatio || 1;
+        const css = dropPointToCss(p.position, dpr, DROP_PLATFORM);
+        toast("feed", "드롭 진단", dropDebugDetail(p.position, dpr, DROP_PLATFORM, css));
+      }
+    } catch {
+      // 저장소가 차단되어도 드롭 주입은 계속한다.
+    }
     const rt = paneAtPointStrict(p.position);
     if (!rt) {
       if (panes.size > 0) toast("watchdog", "드롭 취소", "pane 위에 놓아야 삽입됩니다");

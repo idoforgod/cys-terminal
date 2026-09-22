@@ -20,6 +20,8 @@ bash scripts/secret-scan.sh --all  # secret/PII gate (fail-closed)
 sh scripts/version-check.sh      # version SOT consistency (release PRs only)
 ```
 
+When upgrading `wry` in `Cargo.lock` (currently 0.55.1), rerun `ui/e2e/dragdrop_gate.py` to verify macOS/Linux drop coordinates still use logical px.
+
 ## Directive edits
 
 - **`cysjavis-pack/directives/CEO_TEMPLATE.md` is a generated file — never edit it
