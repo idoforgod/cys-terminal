@@ -46,8 +46,8 @@ stdout 은 모델 컨텍스트로 주입된다) · `set -u` 안전 · 항상 0 �
    그 훅으로 `exec` 한다(위임 · stdin/인자/stderr/exit 보존).
 2. 대응 훅이 이 좌석의 실사용 설정에 이미 등록돼 있으면 **표식 없이 위임을 생략하고 exit 0** 한다.
    `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` 와 훅 cwd 의 `.claude` 아래 `settings.json`·
-   `settings.local.json` 4파일을 확인한다. 정규화 경로와 `$CYS_PACK_DIR` 원형 경로를 모두 보며,
-   레인 훅은 자기 등록으로 1회만 실행된다.
+   `settings.local.json` 4파일을 확인한다. 정규화 경로와 `$CYS_PACK_DIR` 원형 경로(절대 경로일 때만 —
+   상대 원형은 타 레인 등록줄의 접미가 돼 오판한다)를 보며, 레인 훅은 자기 등록으로 1회만 실행된다.
 3. 대응 훅 부재(`reason=absent`)·판독 불가(`reason=unreadable`)·위임된 훅의 재불일치 또는
    대상이 자기 자신(`reason=already-redirected`)이면 `<레인 팩>/state/lane-guard-tripped` 표식을
    남긴다(덮어쓰기). 등록 확인에도 걸리지 않고 발화한 훅 본문에 `cys_lane_redirect` 토큰이 없으면

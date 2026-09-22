@@ -309,10 +309,14 @@ cys_lane_mark() {
 
 # 이 좌석의 실사용 설정 4파일에 정규화 경로($1) 또는 원형 경로($2)가 등록됐는가 — read 빌트인만.
 # Windows 등록형(bash "C:/…/hooks/x.sh")도 msys /c/rest의 [A-Za-z]:/rest 패턴으로 본다.
+# ★원형($2)은 **절대 경로일 때만** 대조한다 — 상대 CYS_PACK_DIR(`base` 등)의 원형 `base/hooks/x.sh` 는
+#   타 레인 등록줄 `…/base/hooks/x.sh` 의 접미가 돼 '등록됨' 으로 오판(위임 생략·무표식 무음 종료 =
+#   가장 나쁜 방향)한다. 부분 일치는 절대 경로끼리만 안전하다(검체 R-9e).
 cys_lane_registered() {
   _cys_lrg_cfg="${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}"
   _cys_lrg_alt=""
   case "${1:-}" in /[A-Za-z]/?*) _cys_lrg_alt="${1#/?/}" ;; esac
+  case "${2:-}" in /*|[A-Za-z]:*) ;; *) set -- "${1:-}" "" ;; esac
   for _cys_lrg_f in "$_cys_lrg_cfg/settings.json" "$_cys_lrg_cfg/settings.local.json" \
                     ".claude/settings.json" ".claude/settings.local.json"; do
     [ -f "$_cys_lrg_f" ] && [ -r "$_cys_lrg_f" ] || continue
