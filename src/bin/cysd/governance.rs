@@ -4907,26 +4907,6 @@ pub(crate) fn input_line_state(pending_input_bytes: u64, line: Option<PromptLine
     }
 }
 
-/// 미제출 입력 바이트 계수의 순수 전이함수 — `input_line_state` 의 1차 축을 만드는 자리.
-///
-/// 데몬이 소유한 PTY 로 나가는 모든 바이트는 핸들러(`surface.send_text`·`surface.send_key`)와
-/// 큐 배달(`WriteReq::Inject`)을 지난다. 그래서 '아직 제출되지 않은 입력이 얼마나 쌓였나' 는
-/// 화면을 보지 않고도 셀 수 있다. 고스트 텍스트(prompt suggestions)는 이 경로를 **지나지 않아**
-/// 원리상 계수되지 않는다 — 그것이 이 축을 1차로 두는 이유다.
-///
-/// 전이 규칙: 쓰인 바이트에 **제출·취소 제어문자**(CR `\r` · LF `\n` · Ctrl-U `0x15` ·
-/// Ctrl-C `0x03`)가 있으면 계수는 **마지막 그 문자 이후의 바이트 수**로 재시작한다(그 앞은
-/// 제출됐거나 지워졌다). 없으면 누적한다.
-pub(crate) fn pending_input_after(prev: u64, written: &[u8]) -> u64 {
-    match written
-        .iter()
-        .rposition(|b| matches!(b, b'\r' | b'\n' | 0x15 | 0x03))
-    {
-        Some(i) => (written.len() - i - 1) as u64,
-        None => prev.saturating_add(written.len() as u64),
-    }
-}
-
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingInputState {
@@ -4952,31 +4932,102 @@ pub(crate) enum InputOrigin {
 /// 미종결 봉투 해제 TTL(초) — OPEN 뒤 이 시간이 지난 새 청크는 봉투 밖으로 본다.
 pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 
-/// 입력 청크의 순수 전이 — 스캐폴드는 종전 계수 규칙을 유지하고 봉투 상태를 초기화한다.
+/// ★(0.14.39 · WP-C-input) 미제출 입력 청크의 순수 전이 — 계수 규칙의 단일 정의처.
+///
+/// 괄호붙여넣기 OPEN/CLOSE 각 6바이트는 본문이 아니므로 제외한다. 종전에는 끝 개행 뒤
+/// CLOSE 만 남아 실측 `stale_bytes=6` 으로 배달을 막았다. 봉투 안에서는 CR/LF 도 가산하고
+/// 자동응답 면제를 끈다: 변형 F(OPEN/ESC[I/CLOSE 분할)가 한 호출과 같은 본문 계수를 가져야 한다.
+/// 봉투 밖의 순수 자동응답은 **세그먼트 단위**로 면제한다. CLOSE+ESC[I 를 한 청크로 받든
+/// 두 청크로 받든 계수가 같아야 하는 호출 경계 불변식 때문이다. 표식의 진접두는 최대
+/// 5바이트까지 계수하지 않고 이월해 다음 청크와 합친 뒤 인식한다.
+///
+/// 미종결 봉투는 Ctrl-C/Ctrl-U 또는 OPEN 뒤 5초가 지난 호출에서 해제한다(시각 누락도 해제).
+/// 해제 자체는 입력이 비워졌다는 증거가 아니므로 계수를 감산하지 않는다(fail-closed).
+/// stale 리셋은 `Surface::clear_pending_input` 으로 봉투·이월 상태까지 함께 비운다.
+/// 봉투 밖에서는 마지막 CR/LF/Ctrl-U/Ctrl-C 뒤부터 두 계수를 재시작하되, `\x1b\r` 은
+/// Meta+Enter 줄바꿈 삽입이라 예외다(claude `/terminal-setup` 의 Shift+Enter 바인딩 `\e\r`).
+/// 사람·기계 본문은 모두 count 에 세고, 사람 본문만 human 에 센다(human <= count).
+///
+/// 한계: 백슬래시+Enter 줄바꿈은 리셋으로 읽힌다. 커서 줄 머리 이동은 화면 축의 한계로
+/// 남으며, D-02(Backspace/Delete) 감산은 보류한다.
 pub(crate) fn pending_input_step(
     prev: &PendingInputState,
     chunk: &[u8],
     origin: InputOrigin,
     now: std::time::Instant,
 ) -> PendingInputState {
-    let _ = now; // 봉투 TTL 은 v2 구현에서 적용한다.
-    let human = match origin {
-        InputOrigin::Human => pending_input_after(prev.human, chunk),
-        InputOrigin::Machine => {
-            if chunk.iter().any(|b| matches!(b, b'\r' | b'\n' | 0x15 | 0x03)) {
-                0
+    const OPEN: &[u8] = b"\x1b[200~";
+    const CLOSE: &[u8] = b"\x1b[201~";
+
+    let mut st = prev.clone();
+    let mut buf = std::mem::take(&mut st.tail);
+    buf.extend_from_slice(chunk);
+    if st.in_paste
+        && st.paste_opened_at.map_or(true, |opened_at| {
+            now.duration_since(opened_at).as_secs() >= PASTE_OPEN_TTL_SECS
+        })
+    {
+        st.in_paste = false;
+        st.paste_opened_at = None;
+    }
+
+    if let Some(len) = (1..OPEN.len())
+        .rev()
+        .find(|&len| buf.ends_with(&OPEN[..len]) || buf.ends_with(&CLOSE[..len]))
+    {
+        st.tail = buf.split_off(buf.len() - len);
+    }
+
+    let is_human = origin == InputOrigin::Human;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i..].starts_with(OPEN) {
+            st.in_paste = true;
+            st.paste_opened_at = Some(now);
+            i += OPEN.len();
+        } else if buf[i..].starts_with(CLOSE) {
+            st.in_paste = false;
+            st.paste_opened_at = None;
+            i += CLOSE.len();
+        } else if st.in_paste {
+            if matches!(buf[i], 0x03 | 0x15) {
+                st.in_paste = false;
+                st.paste_opened_at = None;
             } else {
-                prev.human
+                st.count = st.count.saturating_add(1);
+                if is_human {
+                    st.human = st.human.saturating_add(1);
+                }
+            }
+            i += 1;
+        } else {
+            let start = i;
+            while i < buf.len() && !buf[i..].starts_with(OPEN) && !buf[i..].starts_with(CLOSE) {
+                i += 1;
+            }
+            let seg = &buf[start..i];
+            if std::str::from_utf8(seg)
+                .map(cys::mousereport::is_pure_terminal_autoreply)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let reset = seg.iter().enumerate().rposition(|(pos, &byte)| {
+                matches!(byte, b'\n' | 0x15 | 0x03)
+                    || (byte == b'\r' && (pos == 0 || seg[pos - 1] != 0x1b))
+            });
+            if let Some(pos) = reset {
+                st.count = (seg.len() - pos - 1) as u64;
+                st.human = if is_human { st.count } else { 0 };
+            } else {
+                st.count = st.count.saturating_add(seg.len() as u64);
+                if is_human {
+                    st.human = st.human.saturating_add(seg.len() as u64);
+                }
             }
         }
-    };
-    PendingInputState {
-        count: pending_input_after(prev.count, chunk),
-        human,
-        in_paste: false,
-        paste_opened_at: None,
-        tail: Vec::new(),
     }
+    st
 }
 
 /// 프롬프트 경계 판정 결과.

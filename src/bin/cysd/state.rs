@@ -1196,8 +1196,9 @@ pub struct Surface {
     pub last_human_input: Mutex<Option<Instant>>,
     /// ★B1(0.14.30): 이 pane 에 쓰였으나 **제출(CR)·선정리(Ctrl-U/Ctrl-C)를 아직 보지 못한**
     /// 입력 바이트 수. 큐 배달의 '입력줄 점유' 1차 축이다(화면 무의존 결정론 신호 —
-    /// `governance::pending_input_after` 가 전이 규칙, `governance::input_line_state` 가 소비자).
+    /// `governance::pending_input_step` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
+    /// v2(0.14.39): 봉투 제외 · 봉투 안 개행 가산 · 봉투 밖 순수 자동응답 면제 · 표식 절단 이월 — 규칙은 governance::pending_input_step 하나.
     pub pending_input_bytes: AtomicU64,
     /// 미제출 입력 상태기계의 surface 별 상태. count 의 SOT 는 미러 atomic `pending_input_bytes`
     /// (락 없는 읽기 소비자·테스트 픽스처 직접 store 호환) · 나머지 필드의 SOT 는 이 Mutex.
