@@ -4722,7 +4722,8 @@ impl Drop for TickSettleBudget {
 /// 보이면 출력이 잠시 멎었어도 턴이 끝난 것이 아니다(claude `✻ Thinking… (esc to interrupt)`).
 /// 화면 전체가 아니라 커서행 근방만 보는 이유: 본문(보고서)이 이 문구를 인용하는 좌석을 영구
 /// 보류로 접지 않기 위해서다(codex 설계 검토 Q1 — 2초 주기 스피너가 1s 임계를 지나치는 반례).
-pub(crate) const PROMPT_BUSY_TOKENS: [&str; 1] = ["esc to interrupt"];
+/// gemini(agy · Antigravity CLI 2026-09-20 빌드)는 작업 중 상태줄에 `esc to cancel`을 쓴다(바이너리 문자열 스캔 · 체인지로그 "statusline shortcut hints (`? for shortcuts`) and redundant escape hints (`Esc to cancel`)"); 유휴 실측 4장에는 없으며 소문자 대조라 `Esc to cancel`도 잡힌다.
+pub(crate) const PROMPT_BUSY_TOKENS: [&str; 2] = ["esc to interrupt", "esc to cancel"];
 /// 커서행 기준 위아래로 살피는 행 수.
 const PROMPT_BUSY_ROWS: u16 = 3;
 
@@ -5312,24 +5313,42 @@ pub(crate) fn prompt_boundary_verdict(
 /// 같은 결측이 한쪽에선 조이고 한쪽에선 연다 — 그래서 두 사본을 같은 규칙으로 맞추는 것 자체가
 /// 안전 방향이 아니다. 해소는 소비자별로 판단해야 한다(오너 결정 대상 · merge-notes 참조).
 /// 검체: [`merge_residue_tests::r6_refuted_daemon_keeps_the_ready_marker_fallback`].
+///
+/// ★(0.14.39 · D-04) 목록 허용은 `prompt_marker` 한정 · `ready_marker` 는 부트 readiness 와 같은 문자열 규약.
+/// 실측(2026-09-21)에 따라 codex 의
+/// 옛 vendor 기본값만 읽기 시점에 임베드 값으로 승격하며, 사용자 커스텀은 디스크 우선으로 보존한다.
+/// agents.json 은 user-owned 이라 팩 갱신은 Keep + `.new` 로 병치된다. 따라서 읽기 병합기에서
+/// 메모리만 승격하고 디스크는 쓰지 않는다(W-B). 커서행의 composer 후보는 같은 관측 프레임에서
+/// 행 선두(공백 제외)에 맞는 후보 중 가장 긴 것을 택하고, 그 뒤의 글리프는 초안으로 보존한다.
 fn merged_prompt_marker(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,
-) -> Option<String> {
-    for (v, key) in [
-        (disk, "prompt_marker"),
-        (embed, "prompt_marker"),
-        (disk, "ready_marker"),
-        (embed, "ready_marker"),
+) -> Option<Vec<String>> {
+    for (v, key, is_disk) in [
+        (disk, "prompt_marker", true),
+        (embed, "prompt_marker", false),
+        (disk, "ready_marker", true),
+        (embed, "ready_marker", false),
     ] {
-        if let Some(m) = v
-            .get(agent)
-            .and_then(|a| a.get(key))
-            .and_then(|m| m.as_str())
-            .filter(|m| !m.is_empty())
+        let value = v.get(agent).and_then(|a| a.get(key));
+        if is_disk
+            && value.is_some_and(|v| cys::agent_markers::is_stale_vendor_marker_default(agent, key, v))
         {
-            return Some(m.to_string());
+            continue;
+        }
+        let markers = if key == "ready_marker" {
+            value
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        } else {
+            cys::agent_markers::marker_candidates(value)
+        };
+        if !markers.is_empty() {
+            return Some(markers);
         }
     }
     None
@@ -5343,11 +5362,13 @@ fn merged_prompt_marker(
 /// 임계영역에서 이 값이 그대로인지 재확인한다(`deliver_head_locked` 의 `expect_output_gen`).
 #[derive(Debug, Clone)]
 pub(crate) struct PromptObs {
+    /// 목록 어댑터에서 이 프레임이 채택한 글리프 — 판정 재료 전부가 이 하나를 쓴다.
+    pub(crate) marker: String,
     /// 화면 전량에 어댑터 마커가 보이는가.
     pub(crate) marker_seen: bool,
-    /// 커서 행이 마커를 담고 있으면 `(커서 앞, 커서 이후)` 문자열 쌍. 커서 행에 마커가 없으면
-    /// (프롬프트가 포커스를 잃었거나 다른 화면) `None` — 호출부는 `Unknown` 으로 받아 배달하지
-    /// 않는다(fail-closed).
+    /// 커서 행 선두(공백 제외)의 마커 뒤에 커서가 있으면 `(마커 뒤부터 커서 앞, 커서 이후)` 문자열 쌍.
+    /// 선두 마커가 없거나 커서가 마커 앞이면 `None` — 초안 속 글리프는 경계로 삼지 않으며,
+    /// 호출부는 `Unknown` 으로 받아 배달하지 않는다(fail-closed).
     pub(crate) line: Option<(String, String)>,
     /// 화면 전량(모달·레이아웃 판정 재료 — `readiness::modal_foreground`·`composer_layout_static_ok`).
     pub(crate) screen: String,
@@ -5390,7 +5411,7 @@ impl PromptObs {
     }
 }
 
-fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
+fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptObs {
     // ★(0.14.31 · 리뷰 R5 · codex major) 세대는 파서 락 **밖·앞**에서 읽는다. 락 안에서 읽으면
     //   "락을 기다리는 동안 reader 가 새 청크를 반영했다" 는 창이 관측에 흡수돼 보이지 않는다 —
     //   밖에서 읽으면 그 변화까지 세대 불일치로 **거부**되므로 엄밀히 더 보수적이다. 발행 중(홀수)도
@@ -5401,11 +5422,16 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
     let (rows, cols) = screen.size();
     let (cr, cc) = screen.cursor_position();
     let contents = screen.contents();
-    let marker_seen = contents.contains(marker);
-    if cr >= rows {
+    let marker_seen = markers.iter().any(|m| contents.contains(m.as_str()));
+    if cr >= rows || markers.is_empty() {
+        // 빈 목록은 호출부 불변식 위반이다. 빈 문자열로 contains/rfind 하지 않고 보류한다.
+        let marker = cys::agent_markers::pick_marker_for_screen(markers, &contents)
+            .unwrap_or("")
+            .to_string();
         drop(p);
         let (quiet_secs, alt_screen, output_gen_after) = observe_tail(s);
         return PromptObs {
+            marker,
             marker_seen,
             line: None,
             screen: contents,
@@ -5419,20 +5445,31 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
     let row_all = screen.contents_between(cr, 0, cr, cols);
-    let line = before_all.rfind(marker).map(|i| {
-        let before_cursor = before_all[i + marker.len()..].to_string();
-        // 커서 이후 구간은 관측·로그용이다(판정에 쓰지 않는다 — 고스트가 여기 산다).
-        let after = row_all
-            .strip_prefix(before_all.as_str())
-            .unwrap_or("")
-            .to_string();
-        (before_cursor, after)
-    });
+    // ★(0.14.39 · 수정 라운드 1 · 리뷰 PROBE-A) composer 마커는 커서행 **선두** 후보만이다. 종전 '커서 앞
+    //   가장 뒤 후보(rfind)' 는 출력 행 끝의 `->` 와 초안 속 글리프(`» abc » `)를 빈 composer 로 읽었다.
+    let leading_row = cys::agent_markers::pick_marker_leading(markers, &row_all);
+    let marker = leading_row
+        .map(|(m, _)| m)
+        .or_else(|| cys::agent_markers::pick_marker_last(markers, &before_all))
+        .or_else(|| cys::agent_markers::pick_marker_last(markers, &row_all))
+        .or_else(|| cys::agent_markers::pick_marker_for_screen(markers, &contents))
+        .expect("non-empty marker candidates");
+    // 커서 앞 구간이 같은 선두 후보로 시작해야 커서가 마커 뒤에 있는 것이다(커서가 마커 앞이면 None).
+    let line = cys::agent_markers::pick_marker_leading(markers, &before_all)
+        .filter(|(m, _)| *m == marker)
+        .map(|(m, idx)| {
+            let before_cursor = before_all[idx + m.len()..].to_string();
+            // 커서 이후 구간은 관측·로그용이다(판정에 쓰지 않는다 — 고스트가 여기 산다).
+            let after = row_all
+                .strip_prefix(before_all.as_str())
+                .unwrap_or("")
+                .to_string();
+            (before_cursor, after)
+        });
     // 선택기 행: 커서 행 전체에서 마커 뒤 텍스트가 `N. …` 이면 composer 가 아니다(커서 앞·뒤 무관 —
     // 커서가 라벨 앞에 있어 before_cursor 가 비어 보이는 잘린 선택기가 이 축의 존재 이유다).
-    let selector_row = row_all
-        .rfind(marker)
-        .map(|i| cys::readiness::numbered_item_row(&row_all[i + marker.len()..]))
+    let selector_row = leading_row
+        .map(|(m, idx)| cys::readiness::numbered_item_row(&row_all[idx + m.len()..]))
         .unwrap_or(false);
     let lo = cr.saturating_sub(PROMPT_BUSY_ROWS);
     let hi = (cr + PROMPT_BUSY_ROWS).min(rows.saturating_sub(1));
@@ -5441,6 +5478,7 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, marker: &str) -> PromptObs {
     drop(p);
     let (quiet_secs, alt_screen, output_gen_after) = observe_tail(s);
     PromptObs {
+        marker: marker.to_string(),
         marker_seen,
         line,
         screen: contents,
@@ -5638,7 +5676,7 @@ pub(crate) fn queue_injection_paused(daemon: &Arc<Daemon>, s: &Arc<crate::state:
 pub(crate) fn inject_safety_probe(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
-    marker: Option<String>,
+    marker: Option<Vec<String>>,
     placeholder: Option<String>,
 ) -> crate::state::SafetyProbe {
     let wd = Arc::downgrade(daemon);
@@ -5660,11 +5698,11 @@ pub(crate) fn inject_safety_probe(
             }
             // ⓒ·ⓓ 현재 프레임의 화면 — 판정은 틱과 **같은 함수**다(판정 분리 금지).
             match marker.as_deref() {
-                Some(m) => {
-                    let obs = observe_prompt(&s, m);
+                Some(markers) => {
+                    let obs = observe_prompt(&s, markers);
                     let input = prompt_gate_input_with_approval(
                         &s,
-                        m,
+                        obs.marker.as_str(),
                         placeholder.as_deref(),
                         &obs,
                         false, // ⓑ에서 이미 확인했다
@@ -5744,6 +5782,7 @@ fn prompt_gate_input_with_approval(
         //   아래 `quiet_for`/`quiet` 가 종전대로 노브로 잰다 — 노브를 **올린** 운영자는 배달이
         //   더 조여지고(하류 `quiet_for < quiet`), 판정 의미는 소비처 전체에서 하나로 남는다.
         layout_ok: alt_screen
+            && !marker.is_empty()
             && cys::readiness::composer_layout_static_ok(
                 &obs.screen,
                 marker,
@@ -6092,14 +6131,14 @@ fn handoff_gate_ok(
             return false; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
         }
         match rc.marker.as_deref() {
-            Some(marker) if now_gen != rc.gen_at_verdict => {
-                let obs = observe_prompt(s, marker);
+            Some(markers) if now_gen != rc.gen_at_verdict => {
+                let obs = observe_prompt(s, markers);
                 if !obs.frame_consistent() {
                     return false; // 재평가 관측이 한 프레임의 사실이 아니다
                 }
                 let again = prompt_gate_input_with_approval(
                     s,
-                    marker,
+                    obs.marker.as_str(),
                     rc.placeholder.as_deref(),
                     &obs,
                     rc.approval_pending,
@@ -6251,7 +6290,7 @@ pub(crate) struct ScreenRecheck {
     /// 이 좌석의 프롬프트 마커. `None` = 마커 없는 좌석(맨 셸·마커 미선언 어댑터) — 인계 시점
     /// 재판정은 순수 판정자 대신 [`no_marker_gate`](대체화면·모달·미제출 바이트·승인 대기)를
     /// 다시 돌린다. ★(리뷰 R1 · codex) 재판정 없는 경로가 있으면 그 경로가 곧 구멍이다.
-    pub(crate) marker: Option<String>,
+    pub(crate) marker: Option<Vec<String>>,
     pub(crate) placeholder: Option<String>,
     /// 판정이 본 출력 세대. 인계 시점에 이 값이 그대로면 재평가하지 않는다(같은 프레임).
     pub(crate) gen_at_verdict: u64,
@@ -8054,7 +8093,7 @@ fn merged_composer_placeholder(
 fn surface_prompt_marker(
     s: &Arc<crate::state::Surface>,
     adapters: &(serde_json::Value, serde_json::Value),
-) -> Option<(String, Option<String>)> {
+) -> Option<(Vec<String>, Option<String>)> {
     s.agent_meta
         .lock()
         .unwrap()
@@ -8160,7 +8199,7 @@ pub(crate) fn force_deliver_entry(
         Some((marker, placeholder)) => {
             // ★(리뷰 R5) 틱과 **같은 관측 규약** — quiet 는 화면과 한 창에서 뜬다.
             let obs = observe_prompt(s, &marker);
-            let input = prompt_gate_input(daemon, s, &marker, placeholder.as_deref(), &obs);
+            let input = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 return Err(ForceDeliverDenied::PromptGate(why));
             }
@@ -8452,10 +8491,11 @@ fn deliver_queued(
         //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
         //   마커 없는 quiet 폴백 경로도 같은 값을 쓴다(그 경로도 같은 writer 로 들어간다).
         let pending_at_verdict = s.pending_input_bytes.load(Ordering::Relaxed);
-        let (overdue, expect_gen, recheck) = if let Some((marker, placeholder)) = marker.as_ref() {
-            let (marker, placeholder) = (marker.as_str(), placeholder.as_deref());
+        let (overdue, expect_gen, recheck) = if let Some((markers, placeholder)) = marker.as_ref() {
+            let placeholder = placeholder.as_deref();
             // ★(리뷰 R5 · codex major) quiet 표본은 관측 **안**에서 뜬다(종전엔 관측 앞에서 따로 떴다).
-            let obs = observe_prompt(&s, marker);
+            let obs = observe_prompt(&s, markers);
+            let marker = obs.marker.as_str();
             // ★(0.14.31 · B-2②) input_pending 고착 수리 — 화면은 빈 프롬프트·정적·모달 없음인데
             //   데몬 계수만 >0 인 상태가 **같은 세대**로 quiet 임계 이상 지속되면 stale 로 리셋.
             //   리셋 틱에는 배달하지 않는다(다음 틱이 다시 관측한다).
@@ -8482,7 +8522,7 @@ fn deliver_queued(
                     //   **같은 순수 판정자**를 현재 프레임에 다시 돌린다(새 quiet 임계 0).
                     // ★(리뷰 R1 · codex) 승인 feed 재확인은 경로 무관이므로 **항상** 넘긴다.
                     let recheck = ScreenRecheck {
-                        marker: Some(marker.to_string()),
+                        marker: Some(markers.clone()),
                         placeholder: placeholder.map(str::to_string),
                         gen_at_verdict: obs.output_gen,
                         approval_pending: input.approval_pending,
@@ -12556,6 +12596,448 @@ mod tests {
         s.queue_blocked.lock().unwrap().as_ref().map(|(w, _)| w.clone()).unwrap_or_default()
     }
 
+    // D-04: 2026-09-21 HQ surface:6·5 / dept-1 surface:10·9 실측 원문.
+    // _evidence/bugverify-3problems-20260921/V8-rust-markers-alerts/D04-c2-*-screen.raw.txt
+    // 외부 증거 폴더 없이도 재현하도록 공백·개행을 보존해 인라인한다.
+    const D04_CODEX_HQ_S6: &str = "  src/bin/cysd/\n  governance.rs:4944,\n  Desktop/CYSjavis/\n  _worktrees/cys-\n  terminal-queue-starve/\n  src/bin/cysd/\n  handlers.rs:4422.\n\n  [논쟁점] K1·K3는 제공\n  로그상 충족합니다. 반\n  례는 정적 분석이며, 실\n  제 GUI 분할·TUI 처리·\n  잘못된 주입 발생은 확\n  인하지 않았습니다.\n\n  [다음 단계 조언] paste\n  상태를 호출 사이에 보\n  존하고 분할·단일 호출\n  의 본문 계수를 대조해\n  야 합니다. 빌드·테스트\n  ·대상 수정 없이\n  verdict JSON을 저장했\n  고, master 회신을 큐에\n  등록했습니다.\n\n  Worked for 5m 4s ·\n  done 1:38 PM\n \n \n» Ask Codex to do anyth\n \n  gpt-6-astra ultra · ~…\n";
+    const D04_CODEX_DEPT1_S10: &str = "• Ran cys identify\n  └ {\n      \"caller\": {\n    … +9 lines (ctrl + t to view transcript)\n      \"version\": \"0.14.38\"\n    }\n\n• Ran python3 - <<'PY'\n  │ import os, hashlib\n  │ nonce = os.environ.get('CYS_BOOT_NONCE')\n  │ … +4 lines\n  └ 논스 미수신\n\n• Ran python3 - <<'PY'\n  │ import datetime, json, pathlib, subprocess\n  │ root = pathlib.Path('/Users/cys/Desktop/CYSjavis/\n  │ … +28 lines\n  └ {\n      \"time_utc\": \"20260921T083843Z\",\n    … +33 lines (ctrl + t to view transcript)\n    reviewer-codex-session-20260920/\n    restoration-delivery-20260921T083843Z.json\n\n• [각성] 심층리서치부 검수자②(reviewer-codex)입니다 — 복\n  원 완료\n\n  done 1:38 AM\n \n \n» Ask Codex to do anything\n \n  gpt-6-astra ultra · ~ · SOT R1 리뷰 대기열을 검토하라\n";
+    const D04_GEMINI_HQ_S5: &str = "  ### [논쟁점]\n\n  A-8에 기술된\n  백스페이스/ESC\n  편집키의 감산 부재\n  및 붙여넣기 본문 내\n  \\n 계수 문제는 이번\n  패치 범위 밖이나,\n  실측 고착 요인으로\n  잔존하므로 분리\n  추적이 필요합니다.\n\n  ### [다음 단계     \n  조언]\n\n  1. 건 A 수리는 설계\n  의도와 방향\n  안전성을 충족하므로\n  본 브랜치\n  반영(ACCEPT)을\n  권고합니다.\n  2. 편집키 감산 미비\n  및 붙여넣기 본문 내\n  개행 처리는 별도\n  티켓으로 이관하여\n  백로그에서\n  관리하십시오.\n\n────────────────────────\n>\n────────────────────────\n? for shortcuts\n";
+    const D04_GEMINI_DEPT1_S9: &str = "      진영으로부터 \"근시안적 사후 대응\"이라는 비판을\n      받을 수 있음.\n      • 평가 및 논리적 방어력:\n      보고서는 RDM 분석(부록 F-2)을 통해 극단적 훈련\n      중단(G6)이 W-L(저위험) 세계에서 가져올 '큰\n      후회(혁신 상실, 독점 심화)'를 명확히\n      입증하였으며, S3/S4 신호가 현실화될 때 G6를\n      가동하는 '조건부 헤지' 전략을 취함으로써\n      파스칼적 비약에 빠지지 않고 가장 합리적인 자원\n      배분 경로를 입증해 냄.\n\n  ──────\n  ### [다음 단계 조언] (Actionable Advice for Step ⑦  \n  납품)\n\n  1. 오너 승인 상신 진입: 본 보고서는 SOT 루브릭 전\n  항목을 2점으로 완벽히 충족하였으므로, 부서장은\n  override 없이 즉시 ⑦ 납품(오너 승인 요청) 단계로\n  상신할 것.\n  2. 예측 대장 정식 등재: forecasts.json의 P-001~P-010\n  문항들을 부서 정본 예측 대장(forecast-registry.md)에\n  확정 추가(append-only)할 것.\n  3. cys-insight-report 산출물 최종 동봉: chrome\n  엔진으로 성공적으로 빌드된\n  R-20260920-01_AI인류멸망론.pdf (20쪽) 및 docx(표 9개\n  93행)가 완비되었으므로, 오너 최종 승인 패키지에 함께\n  전달할 것.\n\n─────────────────────────────────────────────────────────\n>\n─────────────────────────────────────────────────────────\n? for shortcuts                   Gemini 3.8 Flash · hig\n";
+
+    fn d04_seat(tag: &str, agent: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let s = daemon
+            .create_surface(None, Some("sleep 60".into()), None, None, 40, 100)
+            .expect("create D04 surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some((agent.to_string(), "worker".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        (daemon, s)
+    }
+
+    /// 각 단계에 큐 1건을 유지하고 직전 배달·PTY 에코의 상태를 새 프레임과 분리한다.
+    fn d04_tick_frame(
+        daemon: &Arc<Daemon>,
+        s: &Arc<crate::state::Surface>,
+        lines: &[&str],
+        row: usize,
+        col: u16,
+    ) {
+        if s.pending_queue.lock().unwrap().is_empty() {
+            let e = daemon.next_queue_entry("[D04] prompt marker 검체".into(), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        paint_screen(s, lines, row as u16, col, false);
+        quiet_since(s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        s.set_pending_input(0);
+        *s.queue_blocked.lock().unwrap() = None;
+        tick(daemon);
+    }
+
+    fn d04_assert_delivered(s: &Arc<crate::state::Surface>, case: &str) {
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            0,
+            "{case}: pending == 0 이어야 한다; blocked_reason={}",
+            blocked_reason(s)
+        );
+    }
+
+    fn d04_assert_blocked(s: &Arc<crate::state::Surface>, want: &str, case: &str) {
+        assert_eq!(
+            s.pending_queue.lock().unwrap().len(),
+            1,
+            "{case}: pending == 1 이어야 한다; blocked_reason={}",
+            blocked_reason(s)
+        );
+        assert_eq!(
+            blocked_reason(s),
+            want,
+            "{case}: blocked_reason={}",
+            blocked_reason(s)
+        );
+    }
+
+    #[test]
+    fn d04_embed_declares_marker_lists() {
+        let embed: Value = cys::pack::PACK_ALL
+            .iter()
+            .find(|(r, _)| *r == "agents.json")
+            .and_then(|(_, c)| serde_json::from_str(c).ok())
+            .expect("임베드 agents.json");
+        // 선언만 검사하므로 좌석/큐는 없다. blocked_reason 은 해당 없음으로 명시한다.
+        assert_eq!(
+            embed["claude"]["prompt_marker"],
+            json!("❯"),
+            "claude 문자열 불변; blocked_reason=N/A"
+        );
+        assert_eq!(
+            embed["codex"]["ready_marker"],
+            json!("? for shortcuts"),
+            "부트 마커 불변; blocked_reason=N/A"
+        );
+        assert_eq!(
+            embed["_schema"],
+            json!(3),
+            "additive 스키마 불변; blocked_reason=N/A"
+        );
+        assert_eq!(
+            embed["codex"]["prompt_marker"],
+            json!(["›", "»"]),
+            "codex 목록 선언; blocked_reason=N/A"
+        );
+        assert_eq!(
+            embed["gemini"]["prompt_marker"],
+            json!([">"]),
+            "gemini 목록 선언; blocked_reason=N/A"
+        );
+    }
+
+    fn d04_codex_live_frame(tag: &str, frame: &str) {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env(tag);
+        let (daemon, s) = d04_seat(tag, "codex");
+        let mut lines: Vec<&str> = frame.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        d04_assert_delivered(&s, "codex 실측 » 프레임은 임베드만으로 배달");
+
+        lines[row] = "» abc";
+        d04_tick_frame(&daemon, &s, &lines, row, 5);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "codex » 초안 보존");
+    }
+
+    #[test]
+    fn d04_codex_live_frame_hq_s6_delivers_with_embed_only() {
+        d04_codex_live_frame("d04-codex-hq-s6", D04_CODEX_HQ_S6);
+    }
+
+    #[test]
+    fn d04_codex_live_frame_dept1_s10_delivers_with_embed_only() {
+        d04_codex_live_frame("d04-codex-dept1-s10", D04_CODEX_DEPT1_S10);
+    }
+
+    fn d04_gemini_live_frame(tag: &str, frame: &str) {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env(tag);
+        let (daemon, s) = d04_seat(tag, "gemini");
+        let mut lines: Vec<&str> = frame.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('>'))
+            .expect("gemini composer 행");
+        for col in [1, 2] {
+            d04_tick_frame(&daemon, &s, &lines, row, col);
+            d04_assert_delivered(
+                &s,
+                &format!("gemini 실측 > 프레임은 임베드만으로 배달(col {col})"),
+            );
+        }
+        lines[row] = "> abc";
+        d04_tick_frame(&daemon, &s, &lines, row, 5);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "gemini > 초안 보존");
+
+        lines[row] = ">";
+        lines[0] = "  a -> b 인용 > 안내";
+        lines[1] = "  quoted body without a marker";
+        d04_tick_frame(&daemon, &s, &lines, row, 1);
+        d04_assert_delivered(&s, "본문 인용 > 가 있어도 composer 커서에서 배달");
+        // 인용 행 자체에는 > 가 있으므로 그 끝은 Occupied다. 다른 본문 행에 커서를
+        // 두어, 화면의 인용/실제 composer 마커를 커서행 경계로 오인하지 않는지 잰다.
+        d04_tick_frame(&daemon, &s, &lines, 1, lines[1].len() as u16);
+        d04_assert_blocked(
+            &s,
+            BLOCKED_PROMPT_UNKNOWN,
+            "마커 없는 본문 커서는 스크롤백 > 와 무관",
+        );
+    }
+
+    #[test]
+    fn d04_gemini_live_frame_hq_s5_delivers_with_embed_only() {
+        d04_gemini_live_frame("d04-gemini-hq-s5", D04_GEMINI_HQ_S5);
+    }
+
+    #[test]
+    fn d04_gemini_live_frame_dept1_s9_delivers_with_embed_only() {
+        d04_gemini_live_frame("d04-gemini-dept1-s9", D04_GEMINI_DEPT1_S9);
+    }
+
+    #[test]
+    fn d04_stale_vendor_default_on_disk_is_promoted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, _env) = wp5_env("d04-stale-vendor");
+        let disk = r#"{"codex": {"prompt_marker": "›"}}"#;
+        std::fs::write(pack.join("agents.json"), disk).expect("디스크 옛 vendor 기본값");
+        let (daemon, s) = d04_seat("d04-stale-vendor", "codex");
+        let lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        assert_eq!(
+            std::fs::read_to_string(pack.join("agents.json")).unwrap(),
+            disk,
+            "승격은 메모리에서만; blocked_reason={}",
+            blocked_reason(&s)
+        );
+        d04_assert_delivered(&s, "디스크 옛 vendor › 기본값은 임베드 새 목록으로 승격");
+    }
+
+    #[test]
+    fn d04_user_custom_marker_on_disk_is_preserved() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, _env) = wp5_env("d04-custom");
+        let disk = r#"{"codex": {"prompt_marker": "▶"}}"#;
+        std::fs::write(pack.join("agents.json"), disk).expect("디스크 사용자 마커");
+        let (daemon, s) = d04_seat("d04-custom", "codex");
+        let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        d04_assert_blocked(
+            &s,
+            BLOCKED_PROMPT_UNKNOWN,
+            "사용자 ▶ 선언은 vendor » 로 넓히지 않는다",
+        );
+        lines[row] = "▶ Ask Codex to do anything";
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        d04_assert_delivered(&s, "사용자 ▶ 마커는 계속 배달 자격");
+        assert_eq!(
+            std::fs::read_to_string(pack.join("agents.json")).unwrap(),
+            disk,
+            "사용자 디스크 불변; blocked_reason={}",
+            blocked_reason(&s)
+        );
+    }
+
+    #[test]
+    fn d04_new_default_on_disk_is_idempotent() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, _env) = wp5_env("d04-new-default");
+        let disk = r#"{"codex": {"prompt_marker": ["›", "»"]}}"#;
+        std::fs::write(pack.join("agents.json"), disk).expect("디스크 새 기본값");
+        let (daemon, s) = d04_seat("d04-new-default", "codex");
+        let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        for composer in [lines[row], "› Ask Codex to do anything"] {
+            lines[row] = composer;
+            d04_tick_frame(&daemon, &s, &lines, row, 2);
+            assert_eq!(
+                std::fs::read_to_string(pack.join("agents.json")).unwrap(),
+                disk,
+                "새 기본값 디스크 불변; blocked_reason={}",
+                blocked_reason(&s)
+            );
+            d04_assert_delivered(&s, &format!("새 디스크 목록으로 배달: {composer}"));
+        }
+    }
+
+    #[test]
+    fn d04_marker_list_accepts_any_leading_candidate_and_keeps_draft_glyphs() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-leading-marker");
+        std::fs::write(
+            _pack.join("agents.json"),
+            r#"{"codex": {"prompt_marker": ["›", "»"]}}"#,
+        )
+        .expect("디스크 마커 목록");
+        let (daemon, s) = d04_seat("d04r1-leading-marker", "codex");
+        let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        for composer in ["› ", "» "] {
+            lines[row] = composer;
+            d04_tick_frame(&daemon, &s, &lines, row, 2);
+            d04_assert_delivered(&s, &format!("선두 후보 모두 빈 입력이면 배달: {composer}"));
+        }
+        // 리뷰 PROBE-A와 초안 속 글리프가 마지막 후보 규칙의 오배달을 드러냈다.
+        // 행 선두 후보만 composer로 인정하고, 그 뒤의 다른 후보도 초안으로 보존한다.
+        lines[row] = "› 인용 » ";
+        // 인·용은 각각 2셀: 마지막 »는 col 7, 뒤 공백 끝은 col 9다(문자 수 7과 다름).
+        d04_tick_frame(&daemon, &s, &lines, row, 9);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "선두 › 뒤 인용과 »는 초안으로 보존");
+        lines[row] = "» abc ›def";
+        d04_tick_frame(&daemon, &s, &lines, row, 9);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "선두 » 뒤 abc와 ›def 초안은 보존");
+    }
+
+    #[test]
+    fn d04_observe_prompt_prioritizes_cursor_prefix_and_closes_empty_candidates() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-observe");
+        let (_daemon, s) = d04_seat("d04r1-observe", "codex");
+        let markers = vec!["›".to_string(), "»".to_string()];
+        // 커서 뒤·다른 행에 더 늦은 후보가 있어도 커서 앞의 후보를 먼저 채택한다.
+        paint_screen(&s, &["› »", "later »"], 0, 2, false);
+        let obs = super::observe_prompt(&s, &markers);
+        assert_eq!(obs.marker, "›");
+        assert!(obs.line.as_ref().is_some_and(|(before, after)| {
+            before.trim().is_empty() && after.contains('»')
+        }));
+        assert!(obs.marker_seen);
+
+        // 출력 행 중간의 후보는 보이더라도 composer 경계를 만들지 않는다.
+        paint_screen(&s, &["out » "], 0, 6, false);
+        let obs = super::observe_prompt(&s, &markers);
+        assert!(
+            obs.line.is_none(),
+            "선두가 아닌 »는 composer가 아니다; blocked_reason={}",
+            blocked_reason(&s)
+        );
+        assert!(
+            obs.marker_seen,
+            "출력 행의 »도 화면 마커 관측에는 남는다; blocked_reason={}",
+            blocked_reason(&s)
+        );
+
+        // 커서 앞에 없으면 커서행을 보되, 선택기 행을 빈 composer 로 오인하지 않는다.
+        paint_screen(&s, &["» 1. Yes", "later ›"], 0, 0, false);
+        let obs = super::observe_prompt(&s, &markers);
+        assert_eq!(obs.marker, "»");
+        assert!(obs.line.is_none());
+        assert!(obs.selector_row);
+
+        // 화면에도 없으면 첫 선언을 유지한다. 빈 후보 목록은 빈 문자열 매치를 만들지 않는다.
+        paint_screen(&s, &["plain output"], 0, 5, true);
+        let obs = super::observe_prompt(&s, &markers);
+        assert_eq!(obs.marker, "›");
+        assert!(!obs.marker_seen);
+        assert!(obs.line.is_none());
+        let empty = super::observe_prompt(&s, &[]);
+        assert!(empty.marker.is_empty());
+        assert!(!empty.marker_seen);
+        assert!(empty.line.is_none());
+        let input = super::prompt_gate_input_with_approval(
+            &s,
+            empty.marker.as_str(),
+            None,
+            &empty,
+            false,
+        );
+        assert!(!input.layout_ok);
+        assert_eq!(
+            prompt_gate_verdict(&input),
+            PromptGate::Blocked(super::BLOCKED_PROMPT_NOT_READY)
+        );
+    }
+
+    #[test]
+    fn d04r1_gemini_working_frame_esc_to_cancel_is_busy() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-gemini-cancel-busy");
+        let (daemon, s) = d04_seat("d04r1-gemini-cancel-busy", "gemini");
+        let mut lines = [
+            "  [리뷰] 검토 중…",
+            "",
+            "⠧ Working... (esc to cancel, 12s)",
+            RULE,
+            ">",
+            RULE,
+            "? for shortcuts                                   Gemini 3.8 Flash · hig",
+        ];
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_blocked(&s, BLOCKED_BUSY, "gemini esc to cancel 작업 중 프레임은 보류");
+
+        lines[2] = "  완료: 판정 ACCEPT";
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_delivered(&s, "gemini 작업 중 문구가 사라지면 빈 composer에서 배달");
+
+        lines[2] = "  Generating... (Enter/Esc to cancel)";
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_blocked(&s, BLOCKED_BUSY, "gemini Enter/Esc to cancel 대문자 변형도 보류");
+    }
+
+    #[test]
+    fn d04r1_gemini_output_row_ending_with_gt_at_cursor_is_unknown() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-gemini-output-gt");
+        let (daemon, s) = d04_seat("d04r1-gemini-output-gt", "gemini");
+        let lines = [
+            "  see a -> b and x ->",
+            "",
+            RULE,
+            ">",
+            RULE,
+            "? for shortcuts",
+        ];
+        d04_tick_frame(&daemon, &s, &lines, 0, lines[0].len() as u16);
+        d04_assert_blocked(
+            &s,
+            BLOCKED_PROMPT_UNKNOWN,
+            "출력 행 끝 >에 커서가 있어도 composer가 아니므로 보류",
+        );
+
+        d04_tick_frame(&daemon, &s, &lines, 3, 1);
+        d04_assert_delivered(&s, "실제 선두 > composer로 커서를 옮기면 배달");
+    }
+
+    #[test]
+    fn d04r1_draft_containing_marker_glyph_is_input_pending() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-draft-marker");
+        let (daemon, s) = d04_seat("d04r1-draft-marker-codex", "codex");
+        let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        lines[row] = "» abc » ";
+        d04_tick_frame(&daemon, &s, &lines, row, 8);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "codex 초안 속 » 뒤 공백도 초안 전체를 보존");
+
+        lines[row] = "» ";
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        d04_assert_delivered(&s, "codex 초안을 지우면 선두 » 뒤 빈 입력에서 배달");
+
+        let (daemon, s) = d04_seat("d04r1-draft-marker-gemini", "gemini");
+        let lines = [RULE, "> a > ", RULE, "? for shortcuts"];
+        d04_tick_frame(&daemon, &s, &lines, 1, 6);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "gemini 초안 속 > 뒤 공백도 초안 전체를 보존");
+    }
+
+    #[test]
+    fn d04r1_ready_marker_list_is_not_a_prompt_fallback() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-ready-marker-fallback");
+        let embed = json!({"myagent": {"ready_marker": "? for shortcuts"}});
+        let disk = json!({"myagent": {"ready_marker": [">", "$"]}});
+        // 선언 병합만 검사하므로 좌석/큐가 없으며 보류 사유는 해당 없음이다.
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec!["? for shortcuts".to_string()]),
+            "목록 ready_marker는 무시하고 임베드 문자열로 폴백한다; blocked_reason={}",
+            "N/A"
+        );
+
+        let disk = json!({"myagent": {"ready_marker": ">"}});
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec![">".to_string()]),
+            "문자열 ready_marker는 디스크 우선 폴백을 유지한다; blocked_reason={}",
+            "N/A"
+        );
+
+        let disk = json!({"myagent": {"prompt_marker": [">", "»"]}});
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec![">".to_string(), "»".to_string()]),
+            "prompt_marker는 목록 허용을 유지한다; blocked_reason={}",
+            "N/A"
+        );
+    }
+
     /// ★라이브 회귀의 본체: alt-screen 상주 claude 좌석의 유휴 `❯` 프롬프트는 배달 자격이다
     /// (0.14.30 은 2h 동안 prompt_not_ready 로 배달 0건 — hub 109·112·116 · dept-1 62 실측).
     #[test]
@@ -12625,6 +13107,11 @@ mod tests {
 
     /// 빈 `❯ ` 줄 아래에 레이아웃 양성 증거(괘선·상태줄)가 없으면 composer 가 아니다(codex Q2 반례:
     /// 잘린 무번호 선택기 + 낯선 라벨 + `Esc to cancel` 한 조각).
+    ///
+    /// ★(0.14.39 · D-04 수정 라운드 1) `esc to cancel` 이 작업 중 어휘([`PROMPT_BUSY_TOKENS`] · gemini
+    /// 실측 근거)에 편입되면서 그 조각이 든 프레임은 alt-screen 레이아웃 축보다 **앞**의 busy 축에서
+    /// 거부된다(거부는 그대로 · 라벨만 바뀐다). 종전 의도(레이아웃 증거 부재 = alt_screen 거부)는
+    /// 그 어휘가 없는 같은 모양의 프레임으로 계속 잰다.
     #[test]
     fn wp5_alt_screen_without_layout_evidence_is_refused() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -12633,6 +13120,12 @@ mod tests {
         let e = daemon.next_queue_entry("[보고] 레이아웃 없음".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Esc to cancel"], 0, 2, true);
+        quiet_since(&s, 5);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "Esc to cancel 조각은 작업 중 어휘로 먼저 거부된다");
+        *s.queue_blocked.lock().unwrap() = None;
+        paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Some other label"], 0, 2, true);
         quiet_since(&s, 5);
         tick(&daemon);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
@@ -12718,6 +13211,23 @@ mod tests {
         quiet_since(&s, 0);
         tick(&daemon);
         assert!(s.pending_queue.lock().unwrap().is_empty(), "codex composer 는 배달 자격: {}", blocked_reason(&s));
+
+        // D-04 · 2026-09-21 실측된 U+00BB 변형도 같은 composer 경계다.
+        let e = daemon.next_queue_entry("[리뷰 의뢰] codex »".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        paint_screen(
+            &s,
+            &["• DIRECTIVE-ACK-11137", "", RULE, "", "", "» Ask Codex to do anything", "", "  gpt-6-astra medium · ~/dev/cys-t1/src"],
+            5,
+            2,
+            false,
+        );
+        quiet_since(&s, 30);
+        *s.last_queue_delivery_at.lock().unwrap() = None;
+        s.set_pending_input(0);
+        *s.queue_blocked.lock().unwrap() = None;
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "codex » composer 는 배달 자격; blocked_reason={}", blocked_reason(&s));
     }
 
     /// ★(0.14.31 · 리뷰 R1 · claude minor 7) **codex 작업 중 프레임은 배달 자격이 아니다** —
@@ -12782,74 +13292,51 @@ mod tests {
         );
     }
 
-    /// ★(0.14.31 · 리뷰 R2 · claude major) **gemini 좌석은 실측 전까지 fail-closed 다.**
+    /// 2026-09-21 라이브 실측 프레임 확보(HQ surface:5 · dept-1 surface:9 ·
+    /// `_evidence/bugverify-3problems-20260921/V8-rust-markers-alerts/D04-c2-*`)
+    /// → 박제 조건 충족 → 임베드 gemini `prompt_marker=[">"]` 켬.
     ///
-    /// 【무엇이 틀렸었나】 임베드 어댑터가 `prompt_marker: ">"` 를 **실측 0건**으로 켜 두었다
-    /// (노트 §R1-3 스스로 "이 머신에 gemini CLI 없음 → 실측 불가" 라고 적었다). 그 한 글자는
-    /// `observe_prompt`(`contents.contains`)·`scan_composer`(`rposition(contains)`)가 그대로 쓰므로,
-    /// 셸 PS2(`> `)·인용 행·에이전트가 죽은 뒤의 맨 셸까지 "composer 행" 으로 읽힌다 — 종전
-    /// `prompt_unknown` **영구 보류**(fail-closed)가 alt-screen 양성 유휴 배달(fail-open)로 뒤집힌다.
-    /// 오탐의 귀결이 반대 방향이므로(§3-3) 어댑터에서 키를 **뺐다**.
-    ///
-    /// 【이 검체가 재는 것】 ⓐ 임베드 gemini 에 `prompt_marker` 가 없다 ⓑ 그래서 같은 유휴 프레임이
-    /// **보류**된다(ready_marker `? for shortcuts` 는 커서행에 없다 = prompt_unknown) ⓒ 그러나 기구는
-    /// 살아 있다 — 운영자가 디스크 `agents.json` 에 마커를 선언하면 **곧바로** 배달된다(가용성
-    /// 대조군 · 즉 이것은 코드 회귀가 아니라 '실측 없는 데이터를 켜지 않는다' 는 결정이다).
+    /// 종전에는 실측 없이 1글자 `>`를 켜면 셸 PS2·본문 인용을 composer로 오판할 수 있어
+    /// fail-closed로 두었다. 커서행·커서 앞에 한정한 경계 관측은 다른 행/스크롤백의 `>`를
+    /// 빈 입력으로 오인하는 경로를 닫는다. 현재 커서행의 PS2 `> ` 자체를 이 제한만으로
+    /// 구별한다는 뜻은 아니다. 이 검체는 gemini 메타가 있는 실측 composer와 초안을 잰다.
     #[test]
-    fn wp5_r2_gemini_prompt_marker_is_not_enabled_without_a_measured_frame() {
+    fn wp5_r2_gemini_prompt_marker_enabled_after_measured_frame_20260921() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let pack = empty_pack_dir("gemini-fc");
-        let _env = QueueEnvGuard::set(&[
-            ("CYS_PACK_DIR", pack.to_str().unwrap()),
-            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
-        ]);
-        // ⓐ 임베드 선언 — gemini 에는 prompt_marker 가 없다(codex 는 실측이라 있다).
-        let embed: serde_json::Value = cys::pack::PACK_ALL
+        let (_pack, _env) = wp5_env("gemini-measured");
+        let (daemon, s) = wp5_seat("wp5-gemini-measured", "gemini");
+        // ⓐ 실측된 두 어댑터의 목록 선언.
+        let embed: Value = cys::pack::PACK_ALL
             .iter()
             .find(|(r, _)| *r == "agents.json")
             .and_then(|(_, c)| serde_json::from_str(c).ok())
             .expect("임베드 agents.json");
-        assert!(
-            embed["gemini"].get("prompt_marker").is_none(),
-            "실측 0건인 gemini prompt_marker 가 다시 켜졌다(1글자 `>` = 셸 PS2 오판)"
+        assert_eq!(
+            embed["gemini"]["prompt_marker"],
+            json!([">"]),
+            "실측 gemini 목록 선언; blocked_reason={}",
+            blocked_reason(&s)
         );
-        assert_eq!(embed["codex"]["prompt_marker"], serde_json::json!("›"), "실측된 codex 마커까지 지웠다");
-        let (daemon, s) = wp5_seat("wp5-gemini-fc", "gemini");
-        let frame = [
+        assert_eq!(
+            embed["codex"]["prompt_marker"],
+            json!(["›", "»"]),
+            "실측 codex 목록 선언; blocked_reason={}",
+            blocked_reason(&s)
+        );
+        let mut frame = [
             "  [무push] reviewer-gemini 각성 확인 완료.",
             RULE,
             ">",
             RULE,
             "? for shortcuts                                   Gemini 3.8 Flash · hig",
         ];
-        let e = daemon.next_queue_entry("[리뷰 의뢰] gemini".into(), None, "test");
-        s.pending_queue.lock().unwrap().push_back(e);
-        paint_screen(&s, &frame, 2, 1, false);
-        quiet_since(&s, 30);
-        tick(&daemon);
-        // ⓑ 보류 — 커서행에 ready_marker 가 없으므로 프롬프트 경계 미확인이다.
-        assert_eq!(
-            s.pending_queue.lock().unwrap().len(),
-            1,
-            "실측 없는 마커로 gemini 좌석에 배달했다"
-        );
-        assert_eq!(blocked_reason(&s), BLOCKED_PROMPT_UNKNOWN, "사유가 경계 미확인이 아니다");
-        // ⓒ 가용성 대조군 — 운영자가 디스크에 선언하면 같은 프레임이 곧바로 배달된다.
-        std::fs::write(
-            pack.join("agents.json"),
-            serde_json::to_string(&serde_json::json!({"gemini": {"prompt_marker": ">"}})).unwrap(),
-        )
-        .expect("디스크 어댑터");
-        paint_screen(&s, &frame, 2, 1, false);
-        quiet_since(&s, 30);
-        *s.last_queue_delivery_at.lock().unwrap() = None;
-        s.set_pending_input(0);
-        tick(&daemon);
-        assert!(
-            s.pending_queue.lock().unwrap().is_empty(),
-            "디스크 선언으로도 열리지 않는다(기구가 죽었다): {}",
-            blocked_reason(&s)
-        );
+        // ⓑ 같은 유휴 프레임이 디스크 선언 없이 임베드만으로 배달된다.
+        d04_tick_frame(&daemon, &s, &frame, 2, 1);
+        d04_assert_delivered(&s, "실측 gemini 유휴 프레임은 임베드만으로 배달");
+        // ⓒ 마커 활성화가 커서 앞의 초안 보호를 열어서는 안 된다.
+        frame[2] = "> abc";
+        d04_tick_frame(&daemon, &s, &frame, 2, 5);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "실측 gemini > 초안 보존");
     }
 
     /// ★(0.14.31 · 리뷰 R2(R7회차) · claude minor) **codex alt-screen 좌석이 영구 보류가 아니다.**
@@ -12934,7 +13421,7 @@ mod tests {
         quiet_since(&s, 10);
         let gen = s.output_gen.load(AtomicOrdering::Acquire);
         let rc = |approval: bool| super::ScreenRecheck {
-            marker: Some("❯".to_string()),
+            marker: Some(vec!["❯".to_string()]),
             placeholder: None,
             gen_at_verdict: gen,
             approval_pending: approval,
@@ -12954,7 +13441,7 @@ mod tests {
         *s.last_queue_delivery_at.lock().unwrap() = None;
         let gen2 = s.output_gen.load(AtomicOrdering::Acquire);
         let rc2 = super::ScreenRecheck {
-            marker: Some("❯".to_string()),
+            marker: Some(vec!["❯".to_string()]),
             placeholder: None,
             gen_at_verdict: gen2,
             approval_pending: true,
@@ -13062,6 +13549,7 @@ mod tests {
         //    (종전 표현이면 노브 1·quiet 1 에서 참, 노브 30·quiet 5 에서 거짓이 되어 둘 다 깨진다.)
         let screen = idle.join("\n");
         let obs_at = |quiet_secs: u64| super::PromptObs {
+            marker: "›".to_string(),
             marker_seen: true,
             line: Some(("› ".to_string(), PH.to_string())),
             screen: screen.clone(),
@@ -13144,7 +13632,7 @@ mod tests {
         quiet_since(&s, 10);
         let gen0 = s.output_gen.load(AtomicOrdering::Acquire);
         let rc = |gen: u64, approval: bool| super::ScreenRecheck {
-            marker: Some("❯".to_string()),
+            marker: Some(vec!["❯".to_string()]),
             placeholder: None,
             gen_at_verdict: gen,
             approval_pending: approval,
@@ -13344,7 +13832,7 @@ mod tests {
         paint_claude_idle_alt(&s);
         quiet_since(&s, 30);
         // ⓐ 한 관측 — 발행 완료 ∧ 창 안에서 세대 불변 ∧ quiet 가 화면과 같은 시각의 사실이다.
-        let obs = super::observe_prompt(&s, "❯");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
         assert!(obs.frame_published(), "유휴 좌석의 프레임이 발행 중으로 읽힌다");
         assert!(obs.frame_consistent(), "유휴 좌석의 관측이 불일치로 읽힌다(상시 기아)");
         assert!(obs.quiet_secs >= 30, "quiet 표본이 관측 안에서 뜨지 않았다: {}", obs.quiet_secs);
@@ -13359,7 +13847,7 @@ mod tests {
         quiet_since(&s, 30);
         *s.last_queue_delivery_at.lock().unwrap() = None; // 배달 간격 게이트가 이 축을 가리지 않게
         s.output_gen.fetch_add(1, AtomicOrdering::AcqRel); // 홀수 = 반영 중
-        let mid = super::observe_prompt(&s, "❯");
+        let mid = super::observe_prompt(&s, &["❯".to_string()]);
         assert!(!mid.frame_published(), "홀수 세대가 발행 완료로 읽힌다");
         assert!(!mid.frame_consistent());
         tick(&daemon);
@@ -13435,7 +13923,7 @@ mod tests {
         let even = s.output_gen.load(AtomicOrdering::Acquire);
         assert_eq!(even % 2, 0, "전제 붕괴: 대조군 세대가 짝수가 아니다");
         let rc_even = super::ScreenRecheck {
-            marker: Some("❯".to_string()),
+            marker: Some(vec!["❯".to_string()]),
             placeholder: None,
             gen_at_verdict: even,
             approval_pending: false,
@@ -18826,7 +19314,7 @@ mod reflect_queue_tests {
         let (daemon, s, _pack) = probe_seat("q1");
         // ⓐ 대조군 — 정상 유휴 프롬프트(비-alt)는 통과한다(배달 유지).
         paint(&s, &["❯ "], 0, 2, false);
-        let probe = inject_safety_probe(&daemon, &s, Some("❯".into()), None);
+        let probe = inject_safety_probe(&daemon, &s, Some(vec!["❯".into()]), None);
         assert!(!probe(), "정상 유휴 프롬프트인데 탐침이 막았다 — 기아 #1 회귀");
         // ⓑ 같은 좌석에 **완성된 승인 모달**만 그린다(출력 세대 축은 비-alt 라 없다).
         paint(
@@ -18865,7 +19353,7 @@ mod reflect_queue_tests {
     fn q2_pause_is_re_read_by_the_writer_probe_and_the_handoff_gate() {
         let (daemon, s, _pack) = probe_seat("q2");
         paint(&s, &["❯ "], 0, 2, false);
-        let probe = inject_safety_probe(&daemon, &s, Some("❯".into()), None);
+        let probe = inject_safety_probe(&daemon, &s, Some(vec!["❯".into()]), None);
         assert!(!probe(), "정지 중이 아닌데 막혔다(대조군)");
         assert!(!queue_injection_paused(&daemon, &s), "정지 중이 아닌데 참이다");
         // ⓐ 데몬 kill-switch.
@@ -19651,21 +20139,21 @@ mod merge_residue_tests {
         let disk = serde_json::json!({});
 
         // ⓐ 폴백은 산다 — 지우면 그 좌석이 **맨 셸 quiet 폴백**으로 떨어져 배달이 열린다.
-        assert_eq!(merged_prompt_marker(&disk, &embed, "myagent"), Some(">".into()));
+        assert_eq!(merged_prompt_marker(&disk, &embed, "myagent"), Some(vec![">".into()]));
         assert_eq!(
             merged_prompt_marker(&disk, &embed, "gemini"),
-            Some("? for shortcuts".into()),
-            "gemini 폴백을 지우면 `wp5_r2_gemini_…` 가 보류에서 배달로 뒤집힌다(실측)"
+            Some(vec!["? for shortcuts".into()]),
+            "prompt_marker 없는 어댑터의 폴백을 지우면 보류에서 배달로 뒤집힌다(종전 gemini 실측)"
         );
         // ⓑ 그래도 prompt_marker 가 먼저다(우선순위 회귀 방지).
         let disk2 = serde_json::json!({"claude": {"prompt_marker": "▶"}});
-        assert_eq!(merged_prompt_marker(&disk2, &embed, "claude"), Some("▶".into()));
-        assert_eq!(merged_prompt_marker(&disk, &embed, "claude"), Some("❯".into()));
+        assert_eq!(merged_prompt_marker(&disk2, &embed, "claude"), Some(vec!["▶".into()]));
+        assert_eq!(merged_prompt_marker(&disk, &embed, "claude"), Some(vec!["❯".into()]));
         let disk3 = serde_json::json!({"gemini": {"prompt_marker": ">"}});
         assert_eq!(
             merged_prompt_marker(&disk3, &embed, "gemini"),
-            Some(">".into()),
-            "운영자 선언이 폴백보다 뒤로 밀렸다 — 가용성 대조군(wp5_r2 ⓒ)이 죽는다"
+            Some(vec![">".into()]),
+            "운영자 선언이 폴백보다 뒤로 밀렸다 — 가용성 대조군이 죽는다"
         );
         // 마커가 하나도 없는 어댑터는 종전대로 `None`(맨 셸 quiet 폴백 등급) — grok 이 그 자리다.
         assert_eq!(merged_prompt_marker(&disk, &embed, "grok"), None);
