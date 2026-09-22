@@ -32447,9 +32447,12 @@ mod tests {
         std::fs::remove_dir_all(&td).unwrap();
     }
 
-    /// ★(0.14.39 라운드3) 레인 공용 표식의 타 훅 트립은 SessionStart 주입 선언을 강등하지 않는다.
+    /// ★(0.14.39 라운드4 · 부트체인 blocking/major) 모든 레인 가드 트립은 CLI 주입으로 강등한다.
+    /// _lib.sh:297-308의 표식은 레인당 단일 슬롯이며 `>` 덮어쓰기로 마지막 작성자만 남는다.
+    /// _lib.sh:911은 프리루드 소스마다 가드를 호출하므로, 후속 훅이 SessionStart 트립을 덮을 수 있다.
+    /// 따라서 마지막 script로 거르는 것은 SessionStart 무발화를 부정할 수 없어 원리상 불건전하다.
     #[test]
-    fn effective_hooks_inject_only_degrades_on_a_session_start_hook_trip() {
+    fn effective_hooks_inject_degrades_on_any_lane_guard_trip() {
         let trip = |script: &str, unreadable: bool| cys::pack::LaneGuardTrip {
             reason: if unreadable { "unreadable" } else { "absent" }.to_string(),
             script: script.to_string(),
@@ -32460,8 +32463,8 @@ mod tests {
             ("표식 없음", true, Some(true), None, true),
             ("session-start.sh", true, Some(true), Some(trip("session-start.sh", false)), false),
             ("inject-context.sh", true, Some(true), Some(trip("inject-context.sh", false)), false),
-            ("role-bootstrap.sh", true, Some(true), Some(trip("role-bootstrap.sh", false)), true),
-            ("user-prompt-submit.sh", true, Some(true), Some(trip("user-prompt-submit.sh", false)), true),
+            ("role-bootstrap.sh", true, Some(true), Some(trip("role-bootstrap.sh", false)), false),
+            ("user-prompt-submit.sh", true, Some(true), Some(trip("user-prompt-submit.sh", false)), false),
             ("판독 불가", true, Some(true), Some(trip("", true)), false),
             ("절대경로 SessionStart", true, Some(true), Some(trip("/opt/cys/pack/hooks/session-start.sh", false)), false),
             ("미등록", true, Some(false), None, false),
@@ -32469,13 +32472,48 @@ mod tests {
         ] {
             let actual = effective_hooks_inject(declared, observed, lane_guard_trip.as_ref());
             if actual != expected {
-                let consequence = if expected { "부서 pane 상시 이중 주입" } else { "0회 주입" };
                 failures.push(format!(
-                    "{name}: declared={declared}, observed={observed:?}, trip={lane_guard_trip:?}, actual={actual}, expected={expected} — {consequence}"
+                    "{name}: declared={declared}, observed={observed:?}, trip={lane_guard_trip:?}, actual={actual}, expected={expected} — 0회 주입 = 오너 색인 🔒 워커 절대지침 미주입"
                 ));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(0.14.39 라운드4 · 부트체인 blocking/major) 후속 훅이 덮은 실표식도 CLI 주입으로 강등한다.
+    /// _lib.sh:297-308의 단일 슬롯 `>` 쓰기와 :911의 소스 시점 가드 호출을 재현한다.
+    /// 마지막 작성자만 남는 표식의 script 필터는 먼저 사라진 SessionStart 트립을 복원할 수 없다.
+    #[test]
+    fn a_later_hook_trip_overwriting_the_single_slot_marker_still_degrades_hooks_inject() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let td = std::env::temp_dir()
+            .join(format!("cys-lane-trip-overwrite-{}-{nonce}", std::process::id()));
+        let lane = td.join("lane");
+        let hook_root = td.join("pack");
+        std::fs::create_dir_all(lane.join("state")).unwrap();
+        let marker = lane.join("state/lane-guard-tripped");
+        let first_marker = format!(
+            "hook_root={}\nlane_root={}\nscript=session-start.sh\nsurface=s1\nreason=absent\n",
+            hook_root.display(), lane.display()
+        );
+        std::fs::write(&marker, &first_marker).unwrap();
+        let later_marker = format!(
+            "hook_root={}\nlane_root={}\nscript=role-bootstrap.sh\nsurface=s1\nreason=absent\n",
+            hook_root.display(), lane.display()
+        );
+        // 같은 파일에 두 번째 write를 하여 첫 SessionStart 기록을 지우는 last-writer-wins를 재현한다.
+        std::fs::write(&marker, &later_marker).unwrap();
+        let remaining_marker = std::fs::read_to_string(&marker).unwrap();
+        let trip = cys::pack::lane_guard_tripped(&lane);
+        // 의도한 RED 단언에서도 임시 폴더를 남기지 않는다.
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(trip.as_ref().map(|trip| trip.script.as_str()), Some("role-bootstrap.sh"),
+            "단일 슬롯의 마지막 작성자 전제가 깨졌다 — SessionStart 무발화 누락은 0회 주입으로 이어진다");
+        assert_eq!(remaining_marker, later_marker,
+            "두 번째 write가 첫 SessionStart 표식을 지워야 0회 주입 결함을 재현한다");
+        assert!(!effective_hooks_inject(true, Some(true), trip.as_ref()),
+            "SessionStart 트립 사실이 덮여 사라졌는데 CLI 가 디렉티브 주입을 생략했다 = 0회 주입");
     }
 
     /// ★(0.14.39 라운드3) 실제 팩 훅의 인터프리터·인자 형식은 등록으로 인정한다.
@@ -34328,6 +34366,77 @@ mod tests {
             ).state;
             if matches!(state, CycleTargetState::Idle | CycleTargetState::MachineResidue) {
                 failures.push(format!("{name}: {state:?} — 살아 있는 관문에 clear 원자 송신이 열린다"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(0.14.39 라운드4 · 부트체인 blocking/major) 관문 문면을 전사한 뒤 건강한 빈 composer 로
+    /// 돌아온 라이브 2.1.261 그리드는 유휴다. src/readiness.rs:466 의 관문 축 ①은 마커 뒤
+    /// 화면 전체가 공백이어야 해서 괘선·상태줄이 있으면 생애 창을 결코 닫지 못한다.
+    /// 같은 파일 :1281-1305/:1350 의 모달 축은 이미 줄 단위 대기 프롬프트를 인정한다.
+    /// src/bin/cys.rs:1196-1197 의 전경 판정이 Busy 를 고착시키는 귀결은 ANCHOR ② 무clear 다.
+    #[test]
+    fn transcribed_gate_needles_over_a_healthy_composer_stay_idle() {
+        use cys::first_run_gates::fixtures;
+
+        const LIVE_GRID_TAIL: &str = "────────────────────────────────────────────────────────────\n\
+            ❯ \n\
+            ────────────────────────────────────────────────────────────\n\
+            \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n";
+        // needle 문면을 복제하지 않고 기존 관문 검체를 워커 출력 본문으로 전사한다.
+        let transcribed_gate_needle_over_live_grid = format!(
+            " 리뷰 결과: 관문 화면을 본문으로 전사한다.\n{}\n{}",
+            fixtures::THEME, LIVE_GRID_TAIL,
+        );
+        let transcribed_cat_gate_corpus_over_live_grid = format!(
+            "{}\n{}", fixtures::CAT_GATE_CORPUS_SOURCE, LIVE_GRID_TAIL,
+        );
+        let claude = composer_marker_of(&embedded_agents_json().expect("임베드")["claude"]);
+        let gates = resolve_gate_corpus("claude").gates;
+        let mut failures: Vec<String> = Vec::new();
+        for (name, fixture) in [
+            ("TRANSCRIBED_GATE_NEEDLE_OVER_LIVE_GRID", transcribed_gate_needle_over_live_grid.as_str()),
+            ("TRANSCRIBED_CAT_GATE_CORPUS_OVER_LIVE_GRID", transcribed_cat_gate_corpus_over_live_grid.as_str()),
+        ] {
+            assert!(cys::first_run_gates::identify(&gates, fixture).is_some(),
+                "{name}: 관문 식별 전제가 사라져 ANCHOR ② 무clear 결함을 검증하지 못한다");
+            let state = cycle_target_observation(
+                Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                &claude,
+                None,
+                &gates,
+            ).state;
+            if state != CycleTargetState::Idle {
+                failures.push(format!(
+                    "{name}: actual={state:?}, expected=Idle — 전사된 관문 문면이 건강한 composer 를 막았다(ANCHOR ② 무clear)"
+                ));
+            }
+        }
+        // 양성 대조군은 살아 있는 관문과 건강한 composer 가 없는 코퍼스 cat 원본을 보류한다.
+        // 음성 실패를 모아 두므로 RED 여도 여섯 프레임의 Busy 회귀 핀을 모두 실행한다.
+        for (name, fixture) in [
+            ("THEME", fixtures::THEME),
+            ("LOGIN_METHOD", fixtures::LOGIN_METHOD),
+            ("OAUTH_CODE", fixtures::OAUTH_CODE),
+            ("FOLDER_TRUST", fixtures::FOLDER_TRUST),
+            ("FEATURE_FULLSCREEN", fixtures::FEATURE_FULLSCREEN),
+            ("CAT_GATE_CORPUS_SOURCE", fixtures::CAT_GATE_CORPUS_SOURCE),
+        ] {
+            assert!(cys::first_run_gates::identify(&gates, fixture).is_some(),
+                "{name}: ANCHOR ② 무clear 대조군의 관문 식별 전제가 사라졌다");
+            let state = cycle_target_observation(
+                Ok(json!({"text": fixture, "quiet_secs": 120.0})),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                &claude,
+                None,
+                &gates,
+            ).state;
+            if state != CycleTargetState::Busy {
+                failures.push(format!(
+                    "{name}: actual={state:?}, expected=Busy — ANCHOR ② 무clear 수리가 살아 있는 관문에 clear 를 열어서는 안 된다"
+                ));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));

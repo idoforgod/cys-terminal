@@ -2664,6 +2664,81 @@ mod tests {
         );
     }
 
+    /// ★(0.14.39 라운드4 · 부트체인 blocking/major) 관문 문면을 전사한 라이브 그리드의 생애 창.
+    /// `src/readiness.rs:466` 의 관문 축 ①은 마커 뒤 **화면 전체**가 비어야 닫히는데,
+    /// 라이브 2.1.261 은 빈 composer 아래에도 괘선·상태줄을 그린다. 같은 결함을 명시한
+    /// `src/readiness.rs:1281-1305` 의 모달 축은 `:1350` 의 줄 단위 축 ①' 로 옮겼다.
+    /// 관문 축만 남으면 전사된 needle 이 영구 전경으로 남아 ANCHOR ② 무clear 를 만든다.
+    #[test]
+    fn gate_block_left_behind_closes_on_a_live_grid_waiting_prompt() {
+        const LIVE_GRID_TAIL: &str = "────────────────────────────────────────────────────────────\n\
+            ❯ \n\
+            ────────────────────────────────────────────────────────────\n\
+            \x20 Opus 5 · CTX 35% · 5h 20% · 7d 33%                      /rc\n";
+        let transcribed_gate_needle_over_live_grid = format!(
+            "리뷰 결과: 관문 화면을 본문으로 전사한다.\n{}\n{LIVE_GRID_TAIL}",
+            fixtures::THEME
+        );
+        let transcribed_cat_gate_corpus_over_live_grid =
+            format!("{}\n{LIVE_GRID_TAIL}", fixtures::CAT_GATE_CORPUS_SOURCE);
+        let gates = first_run_gates::builtin();
+        let markers = ["❯".to_string()];
+        let mut failures = Vec::new();
+
+        // 음성 대조군: needle 은 코퍼스 정본에서 가져오며, 관문 식별 자체는 여전히 성립한다.
+        for (name, screen) in [
+            ("TRANSCRIBED_GATE_NEEDLE_OVER_LIVE_GRID", &transcribed_gate_needle_over_live_grid),
+            ("TRANSCRIBED_CAT_GATE_CORPUS_OVER_LIVE_GRID", &transcribed_cat_gate_corpus_over_live_grid),
+        ] {
+            assert!(
+                first_run_gates::identify(&gates, screen).is_some(),
+                "{name}: 관문 식별 전제 소실 — ANCHOR ② 무clear 검체가 무효다"
+            );
+            if !gate_or_modal_present(screen, &gates, &markers) {
+                failures.push(format!("{name}: 원시 관문 술어가 꺼졌다 — ANCHOR ② 무clear 수리가 부트 창을 바꾸면 안 된다"));
+            }
+            if gate_or_modal_foreground(screen, &gates, &markers) {
+                failures.push(format!("{name}: 건강한 빈 composer 아래의 괘선·상태줄 때문에 관문 창이 닫히지 않는다 — ANCHOR ② 무clear"));
+            }
+            // 마커 미정의는 건강한 꼬리가 있어도 판정 불가다. 창을 임의로 닫으면 안 된다.
+            if !gate_or_modal_foreground(screen, &gates, &[]) {
+                failures.push(format!("{name}: 마커 미정의인데 관문 창이 닫혔다 — ANCHOR ② 무clear 수리의 fail-closed 회귀"));
+            }
+        }
+
+        // 양성 대조군: 실제 관문과 건강한 composer 가 없는 코퍼스 cat 원본은 계속 전경이다.
+        for (name, screen) in [
+            ("THEME", fixtures::THEME),
+            ("LOGIN_METHOD", fixtures::LOGIN_METHOD),
+            ("OAUTH_CODE", fixtures::OAUTH_CODE),
+            ("FOLDER_TRUST", fixtures::FOLDER_TRUST),
+            ("FEATURE_FULLSCREEN", fixtures::FEATURE_FULLSCREEN),
+            ("CAT_GATE_CORPUS_SOURCE", fixtures::CAT_GATE_CORPUS_SOURCE),
+        ] {
+            assert!(
+                first_run_gates::identify(&gates, screen).is_some(),
+                "{name}: 관문 식별 전제 소실 — ANCHOR ② 무clear 회귀 핀이 무효다"
+            );
+            if !gate_or_modal_foreground(screen, &gates, &markers) {
+                failures.push(format!("{name}: 전경 관문 창이 닫혔다 — ANCHOR ② 무clear 수리 중 살아 있는 관문에 clear 가 열린다"));
+            }
+            if !gate_or_modal_present(screen, &gates, &markers) {
+                failures.push(format!("{name}: 원시 관문 술어가 꺼졌다 — ANCHOR ② 무clear 수리 중 부트 관문 보호가 사라진다"));
+            }
+        }
+
+        // 마커 부재도 판정 불가다. 선택 커서만 지우고 needle·위젯 문면은 그대로 남긴다.
+        let marker_absent = fixtures::THEME.replace('❯', "");
+        assert!(
+            first_run_gates::identify(&gates, &marker_absent).is_some(),
+            "마커 부재 화면의 관문 식별 전제 소실 — ANCHOR ② 무clear 검체가 무효다"
+        );
+        if !gate_or_modal_foreground(&marker_absent, &gates, &markers) {
+            failures.push("마커 부재인데 관문 창이 닫혔다 — ANCHOR ② 무clear 수리의 fail-closed 회귀".to_string());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// 생애 창 술어 자체의 진리표 — **판정 불가는 창을 닫지 않는다**(fail-closed).
     #[test]
     fn gate_lifetime_window_is_fail_closed_on_every_unmeasurable_axis() {
