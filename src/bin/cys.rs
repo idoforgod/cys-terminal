@@ -1033,6 +1033,11 @@ const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
 /// (autopilot 이 rc84 를 '구조적(구 데몬) 보류' 로 분류하는 기계 토큰 · cargo 검체
 /// d16_held_rcs_and_diag_token_match_autopilot 가 파싱 대조).
 const CYCLE_QUIET_UNREPORTED_DIAG: &str = "quiet_secs_unreported";
+/// ★(0.14.39 라운드3 · 부트체인 fix ③) rc84 가 **관문·모달 전경** 때문일 때의 진단 토큰.
+/// `CYCLE_QUIET_UNREPORTED_DIAG`(구 데몬 = **구조적** 보류 · autopilot 이 3회에서 정지)와 **다른 값**이어야
+/// 한다 — 관문·모달은 사람이 통과하면 사라지는 **일시** 상태라 재시도가 유의미하고, autopilot 의
+/// `held_classify` 가 이 토큰을 구조적으로 읽으면 그 좌석이 3회 만에 영구 정지한다.
+const CYCLE_GATE_MODAL_DIAG: &str = "gate_or_modal_foreground";
 
 /// 사이클 대상의 턴 상태(순수).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1155,6 +1160,7 @@ struct CycleTargetObservation {
     state: CycleTargetState,
     failure: Option<String>,
     quiet_secs_reported: Option<bool>,
+    gate_or_modal: bool,
 }
 
 /// ★(0.14.39 통합 · D-04 ⇄ D-16 병합면) `marker` 는 **후보 목록**이다 — WP-F(D-04)가
@@ -1186,8 +1192,9 @@ fn cycle_target_observation(
     };
     let quiet_secs_reported = screen.as_ref().map(|r| r.get("quiet_secs").is_some());
     let screen_text = screen.as_ref().and_then(|r| r["text"].as_str());
+    // ★(라운드3) 장수 좌석 = Site::Reinject — judge 와 같은 생애 창을 건다(전사된 문면은 역사다).
     let gate_or_modal = screen_text
-        .is_some_and(|t| cys::readiness::gate_or_modal_present(t, gates, marker));
+        .is_some_and(|t| cys::readiness::gate_or_modal_foreground(t, gates, marker));
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
@@ -1213,6 +1220,7 @@ fn cycle_target_observation(
         },
         failure,
         quiet_secs_reported,
+        gate_or_modal,
     }
 }
 
@@ -1248,10 +1256,16 @@ fn cycle_observation_failure_streak(
     Ok(())
 }
 
-/// 성공한 read_text 응답 전부가 키를 빠뜨린 경우만 구 데몬 진단을 덧붙인다.
-fn cycle_quiet_timeout_diagnostic(saw_read_text: bool, saw_quiet_secs: bool) -> String {
+/// 성공한 read_text 응답 전부의 키 결측을 우선 진단하고, 그 다음 관문·모달 전경을 진단한다.
+fn cycle_quiet_timeout_diagnostic(
+    saw_read_text: bool,
+    saw_quiet_secs: bool,
+    saw_gate_or_modal: bool,
+) -> String {
     if saw_read_text && !saw_quiet_secs {
         format!(" · 데몬이 quiet_secs 를 보고하지 않는다(구 데몬) — 데몬을 갱신하라(`cys daemon restart` 또는 팩 업그레이드) [diag={CYCLE_QUIET_UNREPORTED_DIAG}]")
+    } else if saw_gate_or_modal {
+        format!(" · 대기 창 내내 화면 전경에 첫기동 관문·모달이 서 있었다(턴 중이 아니다) — 사람이 그 관문을 1회 통과시켜야 한다 [diag={CYCLE_GATE_MODAL_DIAG}]")
     } else {
         String::new()
     }
@@ -1275,8 +1289,10 @@ fn wait_cycle_target_idle(
     let mut consecutive_failures = 0;
     let mut warned_observation_failure = false;
     let (mut saw_read_text, mut saw_quiet_secs) = (false, false);
+    let mut saw_gate_or_modal = false;
     loop {
         let observed = observe_cycle_target(sid, marker, placeholder, gates);
+        saw_gate_or_modal |= observed.gate_or_modal;
         if let Some(reported) = observed.quiet_secs_reported {
             saw_read_text = true;
             saw_quiet_secs |= reported;
@@ -1309,7 +1325,7 @@ fn wait_cycle_target_idle(
         )?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            let diagnostic = cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs);
+            let diagnostic = cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs, saw_gate_or_modal);
             return Err(format!(
                 "{CYCLE_TARGET_BUSY_TOKEN} {stage}: surface:{sid} 가 {secs}s 안에 유휴(턴 종료·빈 composer)가 되지 않았다 — 유휴 확인 대기를 보류한다. 처방: 대상 턴 종료를 기다린 뒤 해당 단계만 재시도{diagnostic}"
             ));
@@ -13626,7 +13642,15 @@ fn gate_carry_ok(
         //     `approval.capabilities` 로 구 데몬을 먼저 가려낸 것과 **같은 패턴**이다.
         // ⓑ 능력 부재는 **그 좌석 한정으로 축을 끈다** — 이 팔이 맨 앞이어야 한다. 뒤로 밀면
         //   구 데몬 + 출력에 `>` 한 글자가 섞인 gemini 좌석이 영구 보류에 갇힌다(치명위험 ③ 회귀 · C3 검체 ③).
-        None if idle_axis_capable == Some(false) => true,
+        // ★(0.14.39 라운드3 · 성찰2 major ⑤) 능력 부재라도 **관문 부재는 AND 한다**.
+        //   이 팔이 관문 AND 앞에 있어서 새 CLI × 옛 데몬(quiet_secs 미보고) 스큐 — 옛 설치본 이관의
+        //   정상 경로 — 에서 관문 화면의 이월이 통째로 풀렸다(실측: cap=Some(false)+OAUTH_CODE → true).
+        //   그 귀결이 이번 라운드가 닫으려던 킬체인이다(디렉티브가 선택기에 붙고 Return 이 `No, exit` 를
+        //   누른다 · `readiness::MODAL_EXIT_LABEL` · ANCHOR ④ pane 전멸).
+        //   ★영구 보류(치명위험 ③) 회귀는 이 AND 에 성립하지 않는다 — quiet 축 부재는 그 좌석의
+        //   **구조적 결측**이라 영원하지만, 관문 프레임은 사람이 통과하면 사라지는 **일시** 상태다.
+        //   C3 검체 화면(`cat a.txt > b.txt`)은 `gate_or_modal == false` 라 종전대로 열린다.
+        None if idle_axis_capable == Some(false) => !gate_or_modal,
         // ★(0.14.39 · 성찰2 major ⑤) 글리프는 있는데 선두가 아니다 = 이 좌석은 마커 좌석인데 이 프레임이
         //   composer 를 안 그렸다(출력·푸터에만 글리프가 있다). 종전 첫-후보 폴백이 claude·codex 에
         //   보장하던 등급을 그대로 유지해 **보류**한다. quiet 폴백은 '후보 글리프가 화면에 아예 없다' 한 경우다.
@@ -17730,19 +17754,50 @@ fn cycle_spec_or_explicit_clear(
 /// 그 인정은 옛 팩·삭제된 팩·다른 도구의 훅 줄까지 통과시켰고, 그 좌석은 CLI 디렉티브 주입을 생략한 채
 /// 훅도 안 돌아 **0회 주입**이 된다. 커밋이 선언한 비대칭("0회=치명 / 2회=무해")과 반대 방향이다.
 ///
-/// 【인정 조건】 ①따옴표·`sh `/`bash ` 접두를 벗긴 경로가 `hooks/session-start.sh` 로 끝나고
-/// ②그 파일이 **실재**하며 ③같은 디렉터리에 `_lib.sh` 가 있다(= 진짜 팩의 hooks 디렉터리 ·
-/// `cys_lane_guard` 의 ②번 검사 `[ -f "${_cys_lg_root}/hooks/_lib.sh" ]` 와 **같은 술어**).
-/// 셸 변수가 전개되지 않은 경로(`$HOME/...`)는 검증 불가 = 미인정(강등 = CLI 가 1회 주입 = 무해 쪽).
+/// 【인정 조건】 ①명령 앞머리의 `env K=V` 대입과 인터프리터(`sh`·`bash`·`/bin/sh`·`/bin/bash` 등)를
+/// 토큰 단위로 벗기고, 남은 문자열에서 **`hooks/session-start.sh` 앵커로 경로를 끊어** 그것이
+/// 온전한 토큰이며(뒤가 공백·따옴표·끝) ②그 파일이 실재하며 ③같은 디렉터리에 `_lib.sh` 가 있다
+/// (`cys_lane_guard` 의 ②번 검사 `[ -f "${_cys_lg_root}/hooks/_lib.sh" ]` 와 **같은 술어**).
+///
+/// ★(0.14.39 라운드3 · 성찰2 minor) 종전에는 **문자열 전체**를 봐서 인자가 붙은 정상 등록형
+/// (`sh <path> "$CLAUDE_PROJECT_DIR"` · `bash "<path>" --lane dept` · `/bin/sh <path>`)을 전부 미인정했고,
+/// `$` 배제도 명령 전체에 걸려 **인자에** `$` 가 있으면 경로가 실재해도 거부했다. 귀결은
+/// 부서 pane 상시 이중 주입 — 커밋이 `relocated` 삭제를 기각한 바로 그 사고다.
+/// ★단순 공백 토큰화를 쓰지 않는 이유: 이 저장소가 방출하는 경로에는 **공백이 들어갈 수 있다**
+///   (`…/department pack/hooks/session-start.sh` · `session_start_hook_command` 의 Windows quote 규약).
+///   앵커 절단은 공백 경로와 뒤따르는 인자를 **동시에** 가른다. `$` 배제는 그 경로 토큰에만 건다.
 fn registered_pack_session_start_hook(command: &str) -> Option<std::path::PathBuf> {
-    let command = command.trim();
-    let script = command.strip_prefix("sh ")
-        .or_else(|| command.strip_prefix("bash "))
-        .unwrap_or(command)
-        .trim_matches(['"', '\''])
-        .trim();
-    let normalized = script.replace('\\', "/");
-    if !normalized.ends_with("hooks/session-start.sh") || normalized.contains('$') {
+    const ANCHOR: &str = "hooks/session-start.sh";
+    // ① 앞머리의 `K=V` 대입과 인터프리터만 벗긴다(첫 비인터프리터 토큰에서 멈춘다).
+    let mut rest = command.trim();
+    while let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+        let bare = head.trim_matches(['"', '\'']);
+        let base = bare.rsplit(['/', '\\']).next().unwrap_or("");
+        // `K=V` 는 **키 쪽**으로만 판정한다 — 값에는 경로가 온다(`env CYS_PACK_DIR=/x sh …`).
+        let env_assign = bare.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if env_assign || matches!(base, "env" | "sh" | "bash" | "dash" | "zsh") {
+            rest = tail.trim_start();
+            continue;
+        }
+        break;
+    }
+    // ② 앵커로 경로를 끊는다. `\` 와 `/` 는 둘 다 1바이트라 정규화가 인덱스를 보존한다.
+    let normalized = rest.replace('\\', "/");
+    let end = normalized.find(ANCHOR)? + ANCHOR.len();
+    // 앵커 뒤가 곧바로 이어지면(`…/session-start.sh.disabled`) 그 토큰은 우리 훅이 아니다.
+    let after = &normalized[end..];
+    if !(after.is_empty()
+        || after.starts_with(char::is_whitespace)
+        || after.starts_with('"')
+        || after.starts_with('\''))
+    {
+        return None;
+    }
+    let script = rest[..end].trim_start_matches(['"', '\'']);
+    // ③ 전개되지 않은 셸 변수가 **경로 토큰에** 있으면 검증 불가 = 미인정(강등 = CLI 1회 주입 = 무해 쪽).
+    if script.contains('$') {
         return None;
     }
     let path = std::path::PathBuf::from(script);
@@ -17781,20 +17836,38 @@ fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> 
     Some(exact || relocated)
 }
 
+/// 이 트립이 **SessionStart 훅**의 것인가 — 표식은 레인당 1개라 모든 훅이 덮어쓴다.
+///
+/// ★(0.14.39 라운드3 · 성찰1 minor · 부트체인 minor) `script=` 를 보지 않으면 role-bootstrap.sh
+/// (UserPromptSubmit) 트립 하나가 24h 동안 SessionStart 선언을 강등해 그 좌석이 **상시 이중 주입**이
+/// 된다. 판독 불가(`unreadable`)와 `script=` 결측은 **보수적으로 강등**한다(결측은 값이 아니다 ·
+/// 실패 방향은 이중 주입 = 무해). 파이썬 정의처(`javis_preflight.lane_guard_tripped`)는 범용 진단용이라
+/// 그대로 두고 **소비처에서 거른다**.
+fn lane_trip_degrades_session_start(trip: &cys::pack::LaneGuardTrip) -> bool {
+    if trip.unreadable {
+        return true;
+    }
+    let script = trip.script.trim().replace('\\', "/");
+    let base = script.rsplit('/').next().unwrap_or("");
+    base.is_empty() || matches!(base, "session-start.sh" | "inject-context.sh")
+}
+
 /// 선언(agents.json) · 실설정 관측 · **레인 가드 조기 종료 표식**을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
 ///
 /// ★(0.14.39 · 부트체인 major ⓑ · 성찰2 major ⑥) 등록은 **실행 관측이 아니다**. `cys_lane_guard` 는
 /// 위임 대상이 absent·unreadable·no-redirect-line·already-redirected 면 훅 본문을 돌리지 않고 무발화
 /// exit 0 하며(cysjavis-pack/hooks/_lib.sh:345-408), 그 stderr 는 훅 프리루드의 `2>/dev/null` 이 삼킨다.
 /// 그 상태에서 '등록 사실' 만 보면 CLI 가 디렉티브를 생략해 **0회 주입**이 된다(오너 색인 🔒 축).
-/// 그래서 표식이 최근에 찍혀 있으면 선언을 강등한다 — 실패 방향은 **이중 주입(무해)** 쪽이고,
+/// 그래서 SessionStart 훅의 표식이 최근에 찍혀 있으면 선언을 강등한다 — 실패 방향은 **이중 주입(무해)** 쪽이고,
 /// 커밋이 선언한 비대칭("0회=치명 / 2회=무해")과 같은 방향이다.
 fn effective_hooks_inject(
     declared: bool,
     observed: Option<bool>,
     lane_guard_trip: Option<&cys::pack::LaneGuardTrip>,
 ) -> bool {
-    declared && observed == Some(true) && lane_guard_trip.is_none()
+    declared
+        && observed == Some(true)
+        && !lane_guard_trip.is_some_and(lane_trip_degrades_session_start)
 }
 
 /// 훅 등록은 실행 완료 관측이 아니다. 생략한 디렉티브는 합성기가 읽는 팩 실경로로 확인하게 한다.
@@ -17940,7 +18013,7 @@ fn run_cycle_agent(
             .flatten();
         let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());
         if declared_hooks_inject && !hooks_inject {
-            if let Some(trip) = lane_trip.as_ref() {
+            if let Some(trip) = lane_trip.as_ref().filter(|t| lane_trip_degrades_session_start(t)) {
                 eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — 레인 가드 조기 종료 표식(reason={} script={}) — 훅이 무발화 종료했을 수 있다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다", trip.reason, trip.script);
             } else {
                 let path = hook_settings_path.as_ref()
@@ -32894,26 +32967,31 @@ mod tests {
 
     #[test]
     fn d16_quiet_timeout_diagnostic_only_when_never_reported() {
-        let diagnostic = cycle_quiet_timeout_diagnostic(true, false);
+        let diagnostic = cycle_quiet_timeout_diagnostic(true, false, false);
         assert!(diagnostic.contains("데몬이 quiet_secs 를 보고하지 않는다(구 데몬)"));
         assert!(diagnostic.contains("cys daemon restart") && diagnostic.contains("팩 업그레이드"));
         for (saw_read_text, saw_quiet_secs) in [(false, false), (true, true), (false, true)] {
-            assert_eq!(cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs), "");
+            assert_eq!(cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs, false), "");
         }
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
         assert!(body.contains("saw_quiet_secs |= reported"), "한 번이라도 보고된 키를 기억해야 한다");
-        assert!(body.contains("cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs)"));
+        // ★(0.14.39 라운드3) 관문·모달 축이 세 번째 인자로 합류했다 — 래치도 함께 핀으로 잠근다.
+        assert!(body.contains("saw_gate_or_modal |= observed.gate_or_modal"),
+            "관문·모달 전경 관측을 대기 창 내내 기억해야 한다(rc84 진단 귀속)");
+        assert!(body.contains(
+            "cycle_quiet_timeout_diagnostic(saw_read_text, saw_quiet_secs, saw_gate_or_modal)"
+        ));
     }
 
     #[test]
     fn d16_quiet_timeout_diagnostic_carries_machine_token() {
-        let diagnostic = cycle_quiet_timeout_diagnostic(true, false);
+        let diagnostic = cycle_quiet_timeout_diagnostic(true, false, false);
         assert!(
             diagnostic.contains("[diag=quiet_secs_unreported]"),
             "구 데몬 보류를 분류할 기계 토큰이 없다: {diagnostic}"
         );
-        assert_eq!(cycle_quiet_timeout_diagnostic(true, true), "");
-        assert_eq!(cycle_quiet_timeout_diagnostic(false, false), "");
+        assert_eq!(cycle_quiet_timeout_diagnostic(true, true, false), "");
+        assert_eq!(cycle_quiet_timeout_diagnostic(false, false, false), "");
 
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
@@ -32923,6 +33001,18 @@ mod tests {
             }),
             "기계 토큰 상수는 줄 시작 문자열 리터럴 선언이어야 한다"
         );
+    }
+
+    #[test]
+    fn cycle_gate_modal_diag_token_is_not_the_structural_one() {
+        let consequence = "autopilot held_classify 가 일시 보류를 구조적으로 읽어 3회 만에 영구 정지한다";
+        assert_ne!(CYCLE_GATE_MODAL_DIAG, CYCLE_QUIET_UNREPORTED_DIAG, "{consequence}");
+        let diagnostic = cycle_quiet_timeout_diagnostic(true, true, true);
+        assert!(diagnostic.contains("[diag=gate_or_modal_foreground]"), "{consequence}: {diagnostic}");
+        assert!(!diagnostic.contains("[diag=quiet_secs_unreported]"), "{consequence}: {diagnostic}");
+        let old_daemon = cycle_quiet_timeout_diagnostic(true, false, true);
+        assert!(old_daemon.contains("[diag=quiet_secs_unreported]"), "{consequence}: 구 데몬 우선순위 훼손: {old_daemon}");
+        assert_eq!(cycle_quiet_timeout_diagnostic(true, true, false), "", "{consequence}");
     }
 
     #[test]

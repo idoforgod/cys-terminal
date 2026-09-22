@@ -322,6 +322,7 @@ pub fn judge(o: &Observed) -> Verdict {
 /// 보지 않으므로 `judge` 보다 **더 자주 참**이고, 모든 소비처의 귀결은 보류(주입 0 · 키 0 · 파괴 0)다.
 ///
 /// 마커 후보는 커서 스캐너(`cursor_rows`)가 `❯` 밖의 어댑터 글리프도 보게 한다 — 후보 전부에 OR 한다.
+/// 부트 판(창 없음). 재주입 소비처는 [`gate_or_modal_foreground`] 를 쓴다.
 pub fn gate_or_modal_present(screen: &str, gates: &[first_run_gates::Gate], markers: &[String]) -> bool {
     if first_run_gates::identify(gates, screen).is_some() {
         return true;
@@ -333,6 +334,54 @@ pub fn gate_or_modal_present(screen: &str, gates: &[first_run_gates::Gate], mark
         .iter()
         .filter(|m| !m.trim().is_empty())
         .any(|m| modal_signature_with_marker(screen, Some(m)).is_some())
+}
+
+/// ★(0.14.39 라운드3 · 성찰1 blocking ① · 성찰2 major ⑤⑥ · 부트체인 blocking) [`gate_or_modal_present`]의
+/// **재주입 판**([`Site::Reinject`]) — 두 축 모두에 `judge` 와 **같은 생애 창**을 건다.
+///
+/// | 축 | 원시(=`gate_or_modal_present`) | 이 술어 |
+/// |---|---|---|
+/// | 관문 | `first_run_gates::identify` | `identify` ∧ ![`gate_block_left_behind`] |
+/// | 모달 | `modal_signature`/`_with_marker` | [`modal_foreground`](= 서명 ∧ ![`modal_left_behind`]) |
+///
+/// ★왜 자리마다 창이 달라야 하는가는 [`gate_axis_window_closed`] 의 비용 부호표가 정본이다.
+/// 사이클 `/clear` 의 대상은 **이미 각성한 장수 좌석**이라 미탐("이미 지나간 관문을 놓침")의 비용보다
+/// 오탐("전사된 문면 때문에 영원히 clear 안 나감" = ANCHOR ② 무clear)의 비용이 크다 = 재주입 부호다.
+///
+/// **fail-closed 순서를 지킨다**: 마커 선언이 있으면 후보 전부에 OR(하나라도 전경이면 보류),
+/// 선언이 **없는** 좌석만 마커 없는 팔로 내려간다 — 두 창 술어는 마커 미정의·부재·빈 마커에서
+/// 창을 **닫지 않으므로**(`modal_left_behind`·`gate_block_left_behind` 의 `let Some(m) = marker else { return false }`)
+/// 선언 없는 어댑터의 보류는 한 톨도 느슨해지지 않는다.
+pub fn gate_or_modal_foreground(
+    screen: &str,
+    gates: &[first_run_gates::Gate],
+    markers: &[String],
+) -> bool {
+    let declared: Vec<&str> = markers
+        .iter()
+        .map(|m| m.as_str())
+        .filter(|m| !m.trim().is_empty())
+        .collect();
+    // 관문 축 — 후보 **전부**가 "이미 지나갔다" 고 말할 때만 창이 닫힌다(선언 없으면 마커 없는 팔).
+    if let Some(g) = first_run_gates::identify(gates, screen) {
+        let left_behind = if declared.is_empty() {
+            gate_block_left_behind(g, screen, None)
+        } else {
+            declared
+                .iter()
+                .all(|m| gate_block_left_behind(g, screen, Some(m)))
+        };
+        if !left_behind {
+            return true;
+        }
+    }
+    // 모달 축 — 후보 중 **하나라도** 전경이면 보류.
+    if declared.is_empty() {
+        return modal_foreground(screen, None).is_some();
+    }
+    declared
+        .iter()
+        .any(|m| modal_foreground(screen, Some(m)).is_some())
 }
 
 /// 관문 AND 항 — 지금 화면에 관문이 떠 있는가. 문면의 진실원천은 `first_run_gates` 하나다.
