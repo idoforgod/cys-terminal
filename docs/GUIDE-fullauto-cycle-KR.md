@@ -53,7 +53,8 @@
 
 - **자동 재시도 규칙(게이트5)**: `held_noop` 뒤 쿨다운은 연속 보류 횟수에 따라 지수 증가 — 1회 300s → 2회 600s → 3회 이상 1200s(성공 사이클 쿨다운과 같은 상한). 대상이 살아서 턴을 도는 한(rc84 비구조 · rc85) **하드 정지 없음**. 다른 게이트(유휴·임계·오너 부재·single-flight·검증자 heartbeat)는 그대로 겹쳐 잡는다.
 - **구조적 보류 상한**: rc84 문면에 `[diag=quiet_secs_unreported]` 가 붙으면(데몬이 `quiet_secs` 를 보고하지 않는 구 데몬 · 재시도가 원리적으로 무의미) 그 보류만 세어 연속 3회(`HELD_RETRY_MAX`)에 도달하면 자동 재시도를 멈추고 `autopilot-held-limit` 통지 1회를 낸다. 해제 = 데몬 갱신(`cys daemon restart` 또는 팩 업그레이드) 후 `reset --role <r>`.
-- **통지는 보류 연속 구간당 유한**: `autopilot-held` 는 1회째와 3의 배수 회(3·6·9…)에서만, `autopilot-held-limit` 는 도달 순간 1회. tick 은 통지하지 않는다(javis_wakeup 멱등키는 배달 뒤 소멸하므로 tick 재통지 = 매분 홍수). 원장 `detail`: `held_streak`·`held_structural_streak`·`structural`·`alive_evidence`·`keys_sent`·`cooldown_secs`·`retry_after_ts`·`residual_window_secs`(검증자 allow→clear 실측 · 자식 stderr 파싱 · 미보고면 null).
+- **통지는 보류 연속 구간당 유한**: `autopilot-held` 는 1회째와 `HELD_NOTIFY_EVERY`(=3)의 배수 회(3·6·9…)에서만, `autopilot-held-limit` 는 도달 순간 1회. tick 은 통지하지 않는다(javis_wakeup 멱등키는 배달 뒤 소멸하므로 tick 재통지 = 매분 홍수). ★통지 주기(`HELD_NOTIFY_EVERY`)와 구조적 보류 하드 상한(`HELD_RETRY_MAX`)은 **서로 다른 노브**다 — digest 가 잦아 주기를 늘려도 사람 개입 시점(상한)은 밀리지 않는다. 예외로 종결 뒤 원장 재조회 값이 예측과 어긋나면(경합 · 원장 손상) 주기와 무관하게 `autopilot-held` 1건을 반드시 내고 문면에 `원장 재조회 불일치(예측 N != 원장 M)` 를 싣는다(침묵 금지). 원장 `detail`: `held_streak`·`held_structural_streak`·`structural`·`alive_evidence`·`keys_sent`·`cooldown_secs`·`retry_after_ts`·`residual_window_secs`(검증자 allow→clear 실측 · 자식 stderr 파싱 · 미보고면 null).
+- **`keys_sent` 는 어댑터와 무관하게 읽는다**: rc85 타이핑 가드 거부 경로의 `C-u` 1건 선행 여부는 자식 문면의 `C-u 1건은 선행 송신됨`·`[cycle 5/7] 입력 버퍼 정리 + '` 로 판정한다 — `agents.json` 의 `clear_cmd` 가 `/clear` 든 `/new` 든 같게 기록된다(종전에는 `/clear` 좌석에서만 맞았다).
 - 84~86 을 **실패로 읽고 손으로 강제 clear 를 치는 것**이 이 장치가 막는 사고다. 원장 `phase` 가 `held_noop` 이면 기다려라.
 - 검증자 deny가 잦다 → 대상 턴 종료 리듬 대비 대기창(기본 108s·유휴 하한 5s) 점검.
 - 스케줄 `schedule.error`가 매분 뜬다 → 틱 자체 오류(정상 skip은 exit 0)다. 원장과 py_compile 확인.
