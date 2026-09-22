@@ -17832,6 +17832,12 @@ fn run_cycle_agent(
             eprintln!("[cycle 3/7] (검증자 미지정 — handshake 생략)");
         }
 
+        // [적대 minor ⑤] 잔여 창(검증자 allow → 실제 clear)의 상한이 3.5) 대기만큼 늘었다.
+        // 파이썬 RESIDUAL_WINDOW_NOTE 는 그 창을 '원장에 매 사이클 명기한다'고 약속하는데
+        // 종전에는 **정적 문면**만 실렸다. 여기서 실측해 stderr 로 내보내면 autopilot 이
+        // 자식 stderr 를 원장 tail 로 수집하므로 그 약속이 측정값으로 뒷받침된다.
+        let allow_at = std::time::Instant::now();
+
         // 3.5) wait_cycle_target_idle → observe_cycle_target → cycle_target_state(...)로 판정한다.
         // 저장 지시가 만든 턴까지 끝난 뒤 잰다. CYCLE_TARGET_BUSY_TOKEN(84)·초안(85)은
         // quiescing·C-u보다 앞에서 거부하고, 재주입 전에도 같은 관측·대기 경로를 쓴다.
@@ -17863,6 +17869,10 @@ fn run_cycle_agent(
         set_surface_quiescing(sid, true)?;
         let clear_result = (|| -> Result<(), String> {
             // 5) 입력 버퍼 정리 + clear
+            eprintln!(
+                "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
+                allow_at.elapsed().as_secs_f64()
+            );
             eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}'");
             request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -32283,6 +32293,39 @@ mod tests {
         assert!(
             gate.contains("observe_cycle_target(") && gate.contains("CycleTargetState::Idle"),
             "유휴 판정이 관측을 거치지 않는다"
+        );
+    }
+
+    /// [적대 minor ⑤] 잔여 창(검증자 allow→clear)을 **실측해** 원장에 싣는가. 파이썬
+    /// RESIDUAL_WINDOW_NOTE 가 "원장 detail.residual_window 로 매 사이클 명기한다"고
+    /// 약속하므로, 그 약속이 정적 문면이 아니라 측정값으로 뒷받침되는지 소스에서 잰다.
+    #[test]
+    fn d16_residual_window_is_measured_from_verifier_allow_to_clear() {
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
+        let body = body.as_str();
+        let start = body.find("let allow_at =").expect("잔여 창 시작 기준점 없음");
+        let wait = body.find("wait_cycle_target_idle(").expect("사전 턴 확인 호출 없음");
+        // 기준점은 handshake 뒤·3.5) 대기 **앞** — 대기 시간이 창에 포함돼야 한다.
+        assert!(start < wait, "잔여 창 기준점이 사전 턴 확인 뒤에 있다 — 대기가 빠진다");
+        let report = body.find("residual_window=").expect("잔여 창 실측 보고 없음");
+        // 보고 문면 바로 뒤에 실측식이 와야 한다(상수·정적 문면을 실측이라 부르지 못하게).
+        let measured = body.find("allow_at.elapsed()").expect("잔여 창이 실측이 아니다");
+        assert!(report < measured, "잔여 창 보고가 실측식보다 뒤에 있다");
+        let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
+        assert!(measured < cu, "잔여 창 보고는 첫 송신(C-u) 앞이어야 한다");
+        // 파이썬 쪽 문면도 실제 상한(사전 턴 확인 포함)을 적어야 한다 — 문면↔코드 드리프트 핀.
+        // 한국어 본문을 바이트로 자르지 않도록 줄 단위로 읽는다.
+        let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let note: String = py
+            .lines()
+            .skip_while(|l| !l.starts_with("RESIDUAL_WINDOW_NOTE = "))
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!note.is_empty(), "RESIDUAL_WINDOW_NOTE 가 사라졌다");
+        assert!(
+            note.contains("CYCLE_AGENT_TIMEOUT"),
+            "잔여 창 문면이 아직 상수 없는 '수초' 류 서술이다: {note}"
         );
     }
 
