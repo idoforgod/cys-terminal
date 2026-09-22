@@ -970,6 +970,54 @@ const CLEAR_UNMEASURABLE_TOKEN: &str = "clear-unmeasurable:";
 /// `t2_clear_verify_window_matches_autopilot_settle` 가 잡는다(파이썬 원문을 include_str 로 대조).
 const CLEAR_VERIFY_SECS: u64 = 75;
 
+#[allow(dead_code)]
+const EXIT_CYCLE_TARGET_BUSY: i32 = 84;
+#[allow(dead_code)]
+const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
+#[allow(dead_code)]
+const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
+#[allow(dead_code)]
+const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
+
+/// 사이클 대상의 턴 상태(순수).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleTargetState {
+    Idle,
+    Busy,
+    HumanDraft,
+}
+
+/// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
+#[allow(dead_code)]
+struct CycleTargetObs<'a> {
+    screen: Option<&'a str>,
+    quiet: Option<bool>,
+    marker: Option<&'a str>,
+    placeholder: Option<&'a str>,
+    pending_bytes: Option<u64>,
+    human_bytes: Option<u64>,
+}
+
+#[allow(dead_code)]
+fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
+    let _ = o;
+    CycleTargetState::Idle
+}
+
+/// clear 실효 관측 창 — 테스트 override(0=상수). 프로덕션은 항상 CLEAR_VERIFY_SECS.
+static CLEAR_VERIFY_SECS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn clear_verify_secs() -> u64 {
+    let override_secs = CLEAR_VERIFY_SECS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_secs == 0 {
+        CLEAR_VERIFY_SECS
+    } else {
+        override_secs
+    }
+}
+
 /// cycle-agent 결과 → exit code(순수 · 회귀 핀 대상). 머리표 없는 에러는 종전대로 1.
 fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
     match result {
@@ -2764,6 +2812,41 @@ fn task_has_restart_on_failure(task: &str) -> bool {
 /// 여기 남은 얇은 별칭은 이 파일의 기존 호출부·회귀 테스트를 그대로 유지하기 위한 것이다.
 fn lane_pack_for_socket(socket: &std::path::Path) -> Option<std::path::PathBuf> {
     cys::pack::lane_pack_for_socket(socket)
+}
+
+/// autostart 레인 분류(순수).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutostartLane {
+    /// 기본 base 소켓(launchd 위임 허용).
+    Base,
+    /// 부서 소켓(cys-dept-<n>).
+    Dept,
+    /// 격리 소켓(phoenix 하네스·테스트 — sibling spawn 만).
+    Isolated,
+}
+
+/// unix sockaddr_un.sun_path 상한(macOS/Linux 104 · NUL 포함) — 경로 바이트 길이는 이보다 작아야 한다.
+#[allow(dead_code)]
+const UNIX_SOCKET_PATH_MAX: usize = 104;
+
+/// autostart 자격 검사(순수 · connect() autostart 분기와 spawn_detached_daemon 이 공유).
+/// `socket` = 접속 소켓 · `default_base` = cys::default_socket_path() · `pack_env` = PACK_DIR_ENV_KEYS 첫 유효값.
+/// Ok(lane) = autostart 허용(레인 분류 동봉) · Err(사유 1줄 + 처방) = autostart 만 거부(접속 자체는 호출부가 종전대로).
+#[allow(dead_code)]
+fn autostart_eligibility(
+    socket: &std::path::Path,
+    default_base: &std::path::Path,
+    pack_env: Option<&std::path::Path>,
+) -> Result<AutostartLane, String> {
+    let _ = pack_env;
+    Ok(if socket == default_base {
+        AutostartLane::Base
+    } else if cys::is_dept_socket(socket) {
+        AutostartLane::Dept
+    } else {
+        AutostartLane::Isolated
+    })
 }
 
 /// ★G34(W3): (소켓, 팩) **쌍 보증** — 부서 소켓으로 데몬을 띄우면서 본부 팩을 물려주는 것을 막는다.
@@ -17150,6 +17233,19 @@ fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
     }
 }
 
+/// RESUME 기본 문안(순수) — 파일 실재 기준으로 SESSION_STATE·역할 TODO 실경로를 채운다.
+/// 우선순위(파이썬 resolve_save_files 와 동형): pack_round 실재 → cwd_round 실재 → pack_round(폴백 · 부재여도).
+#[allow(dead_code)]
+fn default_resume_text(
+    cwd_round: &std::path::Path,
+    pack_round: &std::path::Path,
+    role_todo: &str,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> String {
+    let _ = (cwd_round, pack_round, role_todo, exists);
+    "[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 직전 작업을 이어가라.".into()
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -17400,12 +17496,13 @@ fn run_cycle_agent(
         clear_resume?;
         // 6) [결재 7ⓑ] clear 실효 확인 — 키 입력 송신은 행위이고 결과가 아니다.
         //    session_file 교체가 관측될 때만 exit 0. 미관측·측정 불능은 EXIT_CLEAR_UNVERIFIED.
+        let clear_verify_window = clear_verify_secs();
         let effect = match pre_session_file.as_deref() {
             None => clear_effect_verdict(None, None),
             Some(pre) => {
-                eprintln!("[cycle 6/6] clear 실효 확인 (statusline session_file 교체, 최대 {CLEAR_VERIFY_SECS}s)");
+                eprintln!("[cycle 6/6] clear 실효 확인 (statusline session_file 교체, 최대 {clear_verify_window}s)");
                 let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(CLEAR_VERIFY_SECS);
+                    + std::time::Duration::from_secs(clear_verify_window);
                 loop {
                     let post = surface_entry(sid)
                         .ok()
@@ -17427,7 +17524,7 @@ fn run_cycle_agent(
                 Ok(())
             }
             ClearEffect::Unverified => Err(format!(
-                "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {CLEAR_VERIFY_SECS}s 안에 \
+                "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
                  session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
                  중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). 성공으로 읽지 마라"
             )),
@@ -22338,7 +22435,7 @@ mod tests {
     //   뒤 검체는 자기 값을 다시 `set_var` 하므로 poison 을 무시하는 것이 정확하다.
     //   ★규약: 이 파일의 env 뮤텍스는 **전부** `unwrap_or_else(|e| e.into_inner())` 를 쓴다
     //   (소스 핀 `env_mutexes_are_poison_tolerant_source_pin` 이 집행).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -24443,6 +24540,57 @@ mod tests {
         assert_eq!(pairs, vec![("A".into(), "b".into()), ("CLAUDE_CONFIG_DIR".into(), "x".into())]); // 정렬
         let no_env = serde_json::json!({"cmd": "agy"});
         assert!(agent_env_pairs(&no_env).is_empty());
+    }
+
+    #[test]
+    fn d06_relative_socket_refuses_autostart() {
+        let base = std::path::Path::new("/h/.local/state/cys/cys.sock");
+        for socket in ["False", "./x.sock"] {
+            let reason = autostart_eligibility(std::path::Path::new(socket), base, None)
+                .expect_err("상대경로 소켓의 autostart 를 거부해야 한다");
+            assert!(reason.contains("상대경로"), "상대경로 사유 누락: {reason}");
+            assert!(reason.contains("절대경로") && reason.contains("지정"), "절대경로 지정 처방 누락: {reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d06_sun_len_overflow_refuses_autostart() {
+        let base = std::path::Path::new("/h/.local/state/cys/cys.sock");
+        let overflow = format!("/{}", "a".repeat(110));
+        let reason = autostart_eligibility(std::path::Path::new(&overflow), base, None)
+            .expect_err("104 바이트 이상 소켓의 autostart 를 거부해야 한다");
+        assert!(reason.contains("104"), "sun_path 상한 사유 누락: {reason}");
+        let boundary = format!("/{}", "a".repeat(102));
+        assert_eq!(boundary.len(), UNIX_SOCKET_PATH_MAX - 1);
+        assert_eq!(autostart_eligibility(std::path::Path::new(&boundary), base, None), Ok(AutostartLane::Isolated));
+    }
+
+    #[test]
+    fn d06_dept_pack_env_requires_matching_dept_socket() {
+        use std::path::Path;
+        let base = Path::new("/h/.local/state/cys/cys.sock");
+        let pack = Some(Path::new("/h/.cys/pack-dept-dept-1"));
+        let reason = autostart_eligibility(Path::new("/nonexistent/whatever.sock"), base, pack)
+            .expect_err("임의 소켓과 부서 팩 조합은 거부해야 한다");
+        assert!(reason.contains("pack-dept-dept-1") && reason.contains("cys-dept-dept-1"), "팩과 기대 소켓을 함께 안내해야 한다: {reason}");
+        assert!(autostart_eligibility(Path::new("/h/.local/state/cys-dept-dept-2/cys.sock"), base, pack).is_err(), "서로 다른 부서 소켓과 팩을 거부해야 한다");
+        assert_eq!(autostart_eligibility(Path::new("/h/.local/state/cys-dept-dept-1/cys.sock"), base, pack), Ok(AutostartLane::Dept));
+        assert!(autostart_eligibility(base, base, pack).is_err(), "본부 소켓과 부서 팩을 거부해야 한다");
+    }
+
+    #[test]
+    fn d06_negatives_pass() {
+        use std::path::Path;
+        let base = Path::new("/h/.local/state/cys/cys.sock");
+        let base_pack = Path::new("/h/.cys/pack");
+        assert_eq!(autostart_eligibility(base, base, None), Ok(AutostartLane::Base));
+        assert_eq!(autostart_eligibility(base, base, Some(base_pack)), Ok(AutostartLane::Base));
+        let harness = Path::new("/h/.cys/state-harness/cys.sock");
+        assert_eq!(autostart_eligibility(harness, base, None), Ok(AutostartLane::Isolated));
+        assert_eq!(autostart_eligibility(harness, base, Some(base_pack)), Ok(AutostartLane::Isolated));
+        // 실재 여부는 확인하지 않는다 — 절대경로 기본 소켓의 첫 기동도 허용한다.
+        assert_eq!(autostart_eligibility(Path::new("/h/.local/state/cys/cys.sock"), base, None), Ok(AutostartLane::Base));
     }
 
     /// ★G34(W3) — 소켓에서 **레인 팩을 결정론 유도**한다(cys-dept 명명 규약 미러).
@@ -30839,6 +30987,61 @@ mod tests {
         &rest[..end]
     }
 
+    #[test]
+    fn d10_resume_text_uses_pack_round_when_present() {
+        let cwd = std::path::Path::new("/project/_round");
+        let pack = std::path::Path::new("/pack/round");
+        let session = pack.join("SESSION_STATE.md");
+        let todo = pack.join("WORKER_TODO.md");
+        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| {
+            p == session || p == todo
+        });
+        assert!(text.contains(session.to_str().unwrap()), "팩 SESSION_STATE 실경로 누락: {text}");
+        assert!(text.contains(todo.to_str().unwrap()), "팩 WORKER_TODO 실경로 누락: {text}");
+        assert!(!text.contains("_round/SESSION_STATE.md와"));
+        assert!(!text.contains("(nonce="));
+        assert!(text.starts_with("[RESUME]"));
+    }
+
+    #[test]
+    fn d10_resume_text_project_seat_keeps_cwd_session_state() {
+        let cwd = std::path::Path::new("/project/_round");
+        let pack = std::path::Path::new("/pack/round");
+        let session = cwd.join("SESSION_STATE.md");
+        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| p == session);
+        assert!(text.contains(session.to_str().unwrap()), "프로젝트 SESSION_STATE 실경로 누락: {text}");
+        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+        assert!(!text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()));
+    }
+
+    #[test]
+    fn d10_resume_text_falls_back_to_pack_round_when_nothing_exists() {
+        let pack = std::path::Path::new("/pack/round");
+        let text = default_resume_text(
+            std::path::Path::new("/project/_round"), pack, "WORKER_TODO.md", &|_| false,
+        );
+        assert!(text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()), "팩 SESSION_STATE 폴백 누락: {text}");
+        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+    }
+
+    #[test]
+    fn d10_resume_text_master_todo_name() {
+        let text = default_resume_text(
+            std::path::Path::new("/project/_round"),
+            std::path::Path::new("/pack/round"),
+            "MASTER_TODO.md",
+            &|_| false,
+        );
+        assert!(text.contains("MASTER_TODO.md"), "역할 TODO 파일명 누락: {text}");
+    }
+
+    #[test]
+    fn d10_run_cycle_agent_uses_default_resume_text_source_pin() {
+        let body = refl_fn_body(include_str!("cys.rs"), "run_cycle_agent");
+        assert!(body.contains("default_resume_text("), "RESUME 기본 문안 헬퍼 미배선");
+        assert!(!body.contains("_round/SESSION_STATE.md와 자기 TODO"));
+    }
+
     /// ★C12: 기동 로그의 readiness 예산 문구가 **판정과 같은 값 1지점**에서 나온다.
     ///
     /// 종전 `delay.max(30) * 2` 는 `budget_readiness_max` 를 우회한 마지막 하드코딩 사본이라
@@ -31128,6 +31331,278 @@ mod tests {
         ] {
             assert_eq!(statusline_session_file(&bad), None, "채택 금지 행: {bad}");
         }
+    }
+
+    #[test]
+    fn d16_exit_codes_target_busy_and_human_draft() {
+        for code in [EXIT_CYCLE_TARGET_BUSY, EXIT_CYCLE_HUMAN_DRAFT] {
+            assert!(![0, 1, 2, 7, 75, 78, 79, 80, 81, 82, 83].contains(&code));
+        }
+        assert_eq!(
+            cycle_agent_exit(&Err(format!("{CYCLE_TARGET_BUSY_TOKEN} x"))),
+            84,
+        );
+        assert_eq!(
+            cycle_agent_exit(&Err(format!("{CYCLE_HUMAN_DRAFT_TOKEN} x"))),
+            85,
+        );
+    }
+
+    #[test]
+    fn d16_target_state_busy_when_output_streaming() {
+        let mut obs = CycleTargetObs {
+            screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
+            quiet: Some(false),
+            marker: Some("❯"),
+            placeholder: None,
+            pending_bytes: None,
+            human_bytes: None,
+        };
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Busy);
+        obs.screen = None;
+        obs.quiet = Some(true);
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Busy, "미관측은 유휴가 아니다");
+    }
+
+    #[test]
+    fn d16_target_state_idle_on_quiet_empty_composer() {
+        let mut obs = CycleTargetObs {
+            screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
+            quiet: Some(true),
+            marker: Some("❯"),
+            placeholder: None,
+            pending_bytes: None,
+            human_bytes: None,
+        };
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
+        obs.marker = None;
+        obs.screen = Some("anything");
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
+        obs.quiet = Some(false);
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Busy);
+    }
+
+    #[test]
+    fn d16_target_state_human_draft() {
+        let mut obs = CycleTargetObs {
+            screen: None,
+            quiet: Some(false),
+            marker: Some("❯"),
+            placeholder: None,
+            pending_bytes: None,
+            human_bytes: Some(3),
+        };
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::HumanDraft);
+        obs.human_bytes = None;
+        obs.pending_bytes = Some(1);
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::HumanDraft);
+
+        let draft = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT
+            .replace("❯ \n", "❯ 사람이 치던 초안\n");
+        assert!(draft.contains("❯ 사람이 치던 초안"), "초안 픽스처 전제");
+        obs.screen = Some(&draft);
+        obs.quiet = Some(true);
+        obs.pending_bytes = None;
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::HumanDraft);
+        obs.quiet = Some(false);
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Busy, "출력 중 초안 단정 금지");
+
+        obs.screen = Some("› Ask Codex to do anything\n");
+        obs.quiet = Some(true);
+        obs.marker = Some("›");
+        obs.placeholder = Some("Ask Codex to do anything");
+        assert_eq!(cycle_target_state(&obs), CycleTargetState::Idle);
+    }
+
+    #[test]
+    fn d16_run_cycle_agent_order_source_pin() {
+        let body = refl_fn_body(include_str!("cys.rs"), "run_cycle_agent");
+        let target = body.find("cycle_target_state(").expect("사전 턴 확인 호출 없음");
+        let quiesce = body.find("set_surface_quiescing(sid, true)?;").expect("quiescing 없음");
+        assert!(target < quiesce, "사전 턴 확인은 quiescing 앞이어야 한다");
+        let verdict = body.find("clear_effect_verdict(").expect("clear 실효 판정 없음");
+        let directive = body.find("compose_directive(").expect("디렉티브 재주입 없음");
+        assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
+        let sent = body.find("\"text\": clear").expect("clear 송신 없음");
+        assert!(!body[sent..].contains("Duration::from_secs(4)"), "clear 뒤 고정 4초 sleep 잔존");
+        let resume = body[sent..].find("let resume").map(|i| sent + i).expect("RESUME 없음");
+        assert!(!body[directive..resume].contains("Duration::from_secs(2))"), "재주입 사이 고정 2초 sleep 잔존");
+        assert!(body.contains("hooks_inject_directive"), "SessionStart 훅 표지 배선 없음");
+        assert!(body.contains("CYCLE_HUMAN_DRAFT_TOKEN"), "사람 초안 거부 배선 없음");
+        assert!(body.contains("CYCLE_TARGET_BUSY_TOKEN"), "진행 중 턴 거부 배선 없음");
+    }
+
+    #[cfg(unix)]
+    type D16DaemonCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// 프로덕션 request 경로용 NDJSON 가짜 데몬. 메서드와 매개변수를 함께 기록한다.
+    /// 실제 데몬을 spawn 하지 않으며 소켓은 워크트리 안의 짧은 절대경로에만 만든다.
+    #[cfg(unix)]
+    fn fake_daemon(
+        rows: Value,
+        screen: &'static str,
+        quiet: f64,
+        session_files: Vec<&'static str>,
+    ) -> (std::path::PathBuf, D16DaemonCalls, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        let socket = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".d16-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("가짜 소켓 bind");
+        let calls: D16DaemonCalls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let server = std::thread::spawn(move || {
+            let mut sessions = session_files.into_iter();
+            let mut current_session = sessions.next().unwrap_or("S1");
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut line = String::new();
+                if BufReader::new(&mut stream).read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                recorded.lock().unwrap_or_else(|e| e.into_inner())
+                    .push((method.clone(), req["params"].clone()));
+                let result = match method.as_str() {
+                    "surface.list" => {
+                        let mut surfaces = rows.clone();
+                        for row in surfaces.as_array_mut().expect("surface 행 배열") {
+                            row["usage"] = json!({"source": "statusline", "session_file": current_session});
+                        }
+                        current_session = sessions.next().unwrap_or(current_session);
+                        json!({"surfaces": surfaces})
+                    }
+                    "surface.read_text" => json!({"text": screen, "quiet_secs": quiet, "line_count": 40}),
+                    "system.resolve_role" => json!({"surface_id": 9}),
+                    _ => json!({"ok": true}),
+                };
+                let response = json!({"id": req["id"], "ok": true, "result": result});
+                let _ = writeln!(stream, "{response}");
+            }
+        });
+        let stop_socket = socket.clone();
+        let stop = move || {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&stop_socket) {
+                let _ = writeln!(stream, "{}", json!({"id": 0, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_socket);
+        };
+        (socket, calls, stop)
+    }
+
+    /// RED 패닉이어도 가짜 데몬을 정지하고 파일을 정리한다.
+    #[cfg(unix)]
+    struct D16DaemonStop(Option<Box<dyn FnOnce()>>);
+
+    #[cfg(unix)]
+    impl Drop for D16DaemonStop {
+        fn drop(&mut self) {
+            if let Some(stop) = self.0.take() {
+                stop();
+            }
+        }
+    }
+
+    /// ENV_LOCK 안에서만 사용한다. RED 패닉에도 env·관측 창을 먼저 복원한다.
+    #[cfg(unix)]
+    struct D16CycleFixture {
+        dir: std::path::PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        previous_verify_secs: u64,
+    }
+
+    #[cfg(unix)]
+    impl D16CycleFixture {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "d16-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            ));
+            std::fs::create_dir_all(dir.join("pack/directives")).unwrap();
+            std::fs::create_dir_all(dir.join("pack/round")).unwrap();
+            let agents = cys::pack::PACK_ALL.iter().find(|(path, _)| *path == "agents.json")
+                .map(|(_, body)| *body).expect("임베드 agents.json");
+            std::fs::write(dir.join("pack/agents.json"), agents).unwrap();
+            std::fs::write(dir.join("pack/directives/WORKER_DIRECTIVE.md"), "W").unwrap();
+            std::fs::write(dir.join("pack/directives/RSI_LEARNING_DIRECTIVE.md"), "R").unwrap();
+            let saved = ["CYS_SOCKET", "CYS_NO_AUTOSTART", "CYS_PACK_DIR", "CYS_CONFIG_DIR", "CYS_LOCAL_DIR"]
+                .into_iter().map(|key| (key, std::env::var_os(key))).collect();
+            let previous_verify_secs = CLEAR_VERIFY_SECS_OVERRIDE.swap(2, std::sync::atomic::Ordering::Relaxed);
+            let fixture = Self { dir, saved, previous_verify_secs };
+            std::env::set_var("CYS_NO_AUTOSTART", "1");
+            std::env::set_var("CYS_PACK_DIR", fixture.dir.join("pack"));
+            std::env::set_var("CYS_CONFIG_DIR", fixture.dir.join("config"));
+            std::env::set_var("CYS_LOCAL_DIR", fixture.dir.join("local"));
+            fixture
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for D16CycleFixture {
+        fn drop(&mut self) {
+            CLEAR_VERIFY_SECS_OVERRIDE.store(self.previous_verify_secs, std::sync::atomic::Ordering::Relaxed);
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(unix)]
+    fn d16_cycle_fixture_run(screen: &'static str, quiet: f64) -> (i32, Vec<(String, Value)>) {
+        let fixture = D16CycleFixture::new();
+        let rows = json!([{
+            "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+            "exited": false, "awakened_at": 1.0, "cwd": fixture.dir, "live_cwd": fixture.dir,
+            "usage": {"source": "statusline", "session_file": "S1"}
+        }]);
+        let (socket, calls, stop) = fake_daemon(rows, screen, quiet, vec!["S1"]);
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        // 디렉티브 파일 누락으로 조기 실패하면 순서 결함을 검증하지 못한다.
+        let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
+        assert!(directive.starts_with('W') && directive.ends_with('R'));
+        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+        drop(stop);
+        let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (exit, recorded)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_busy_target_never_receives_clear() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_run("⠋ Thinking…\n  작업 중 출력 줄\n", 0.2);
+        let clear = calls.iter().filter(|(method, params)| method == "surface.send_text" && params["text"] == "/clear").count();
+        let erase = calls.iter().filter(|(method, params)| method == "surface.send_key" && params["key"] == "C-u").count();
+        let quiesce = calls.iter().filter(|(method, params)| method == "surface.quiesce" && params["on"] == true).count();
+        assert_eq!((exit, clear, erase, quiesce), (84, 0, 0, 0), "진행 중 대상에 /clear·C-u·quiescing이 나갔다");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d16_e2e_unverified_clear_sends_no_directive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (exit, calls) = d16_cycle_fixture_run(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0);
+        assert_eq!(exit, 80, "S1 불변이면 clear 실효 미확인");
+        assert_eq!(calls.iter().filter(|(method, params)| method == "surface.send_text" && params["text"] == "/clear").count(), 1);
+        let authoritative = calls.iter().filter(|(method, params)| method == "surface.send_text" && params["authoritative"] == true).count();
+        assert_eq!(authoritative, 1, "clear 미발효인데 디렉티브·RESUME이 나갔다(저장 지시 1건만 허용)");
+        assert_eq!(calls.iter().filter(|(method, params)| method == "surface.send_text" && params["text"].as_str().is_some_and(|text| text.contains("[RESUME]"))).count(), 0);
     }
 
     /// [T2] run_cycle_agent 배선 핀 — 'cycle complete'(성공 문면)는 Verified 팔에서만 나오고,
@@ -31827,5 +32302,114 @@ mod tests {
         assert!(!prod.contains(&old_form), "CTX 열이 자기보고만 읽는 옛 형태로 되돌아갔다");
         assert_eq!(prod.matches("ctx_cell(&s)").count(), 2,
                    "CTX 칸 산출은 run_status·run_fleet 두 곳뿐이고 둘 다 헬퍼를 써야 한다");
+    }
+}
+
+// V9 D-06 관측 핀 이식. env 는 공용 ENV_LOCK 과 --test-threads=1 로 직렬화한다.
+// Command 는 구성만 하며 아무 프로세스도 spawn 하지 않는다.
+#[cfg(test)]
+mod d06_regression {
+    use super::*;
+
+    const KEYS: [&str; 9] = [
+        "CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET",
+        "CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR",
+        "CYS_NO_AUTOSTART", "HOME",
+    ];
+
+    fn with_env<R>(set: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 의도적인 RED 패닉 뒤에도 다음 검체가 격리를 유지하도록 V9 헬퍼에 RAII 복원을 더한다.
+        struct RestoreEnv {
+            saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+            fixture_home: std::path::PathBuf,
+        }
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.saved {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                let _ = std::fs::remove_dir(&self.fixture_home);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let fixture_home = std::env::temp_dir()
+            .join(format!("cys-d06-home-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&fixture_home).unwrap();
+        let _restore = RestoreEnv {
+            saved: KEYS.iter().map(|&k| (k, std::env::var_os(k))).collect(),
+            fixture_home,
+        };
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        // 부서 팩 canonicalize 양성 대조군도 실제 사용자 ~/.cys 를 조회하지 않는다.
+        std::env::set_var("HOME", &_restore.fixture_home);
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        for (key, value) in set {
+            std::env::set_var(key, value);
+        }
+        f()
+    }
+
+    fn cmd_envs(cmd: &std::process::Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .collect()
+    }
+
+    /// socket_path 는 상대경로를 보존한다. 거부는 autostart 층의 책임이다.
+    #[test]
+    fn bugverify_d06_socket_path_accepts_relative_false() {
+        with_env(&[("CYS_SOCKET", "False")], || {
+            let p = cys::socket_path();
+            assert_eq!(p, std::path::PathBuf::from("False"));
+            assert!(p.is_relative());
+        });
+        // 빈 문자열은 env_compat 의 filter 로 걸러져 기본 경로로 간다(대조군).
+        with_env(&[("CYS_SOCKET", "")], || {
+            assert!(cys::socket_path().is_absolute());
+        });
+    }
+
+    /// is_dept_socket("False") == false 관측 핀.
+    #[test]
+    fn bugverify_d06_is_dept_socket_false_for_garbage() {
+        for socket in ["False", "True", "0", "./x.sock", "/abs/whatever.sock"] {
+            assert!(!cys::is_dept_socket(std::path::Path::new(socket)));
+        }
+        assert!(cys::is_dept_socket(std::path::Path::new(
+            "/h/.local/state/cys-dept-dept-1/cys.sock"
+        )));
+    }
+
+    /// 부서 팩과 임의 소켓 조합은 autostart 거부이며 명령 환경변수는 건드리지 않아야 한다.
+    #[test]
+    fn d06_lane_guard_refuses_arbitrary_socket_with_dept_pack() {
+        // 양성 대조군을 먼저 실행한다 — RED 가 나도 기존 부서 소켓 + 본부 팩 거부를 관측한다.
+        with_env(
+            &[
+                ("CYS_SOCKET", "/nonexistent-bugverify/.local/state/cys-dept-dept-1/cys.sock"),
+                ("CYS_PACK_DIR", "/nonexistent-bugverify/.cys/pack"),
+            ],
+            || {
+                let mut cmd = std::process::Command::new("/usr/bin/true");
+                let result = ensure_daemon_lane_pack(&mut cmd);
+                assert!(result.is_err(), "양성 대조군 실패 — 가드가 부서 소켓+본부 팩을 통과시켰다");
+            },
+        );
+        let dept_pack = "/nonexistent-bugverify/.cys/pack-dept-dept-1";
+        for socket in ["False", "/nonexistent-bugverify/whatever.sock"] {
+            with_env(&[("CYS_SOCKET", socket), ("CYS_PACK_DIR", dept_pack)], || {
+                let mut cmd = std::process::Command::new("/usr/bin/true");
+                let result = ensure_daemon_lane_pack(&mut cmd);
+                assert!(cmd_envs(&cmd).is_empty(), "가드가 env 를 만졌다");
+                assert!(result.is_err(), "부서 팩 + 임의 소켓({socket})의 autostart 를 거부해야 한다");
+            });
+        }
     }
 }
