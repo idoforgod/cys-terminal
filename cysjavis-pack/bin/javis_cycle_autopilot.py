@@ -508,10 +508,15 @@ IDLE_MIN_DEFAULT = 60.0
 OWNER_ACTIVE_WINDOW = 600.0       # $PACK/round/OWNER_ACTIVE mtime 10분
 COOLDOWN_SECS = 1200.0            # cleared_verified 후 20분
 HELD_RETRY_COOLDOWN_SECS = 300.0   # 비파괴 보류 후 재시도 최소 간격
-HELD_RETRY_MAX = 3                # 구조적 보류 상한 + 일반 보류 통지 주기
+HELD_RETRY_MAX = 3      # 구조적 보류(구 데몬) 하드 상한 — 게이트5 차단 · 사람 개입 시점
+HELD_NOTIFY_EVERY = 3   # 비구조 보류 digest 통지 주기(연속 1회째 + 이후 배수) — 큐 남발 방지 노브
 QUIET_UNREPORTED_DIAG = "quiet_secs_unreported"
 # ★러스트 src/bin/cys.rs cycle_quiet_timeout_diagnostic 의 rc84 문면
 #   [diag=quiet_secs_unreported] 와 같은 토큰 — cargo 검체가 위 줄의 리터럴을 파싱한다.
+KEYS_SENT_MARKERS = ("C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '")
+# ★러스트 src/bin/cys.rs 의 rc85 거부 문면·5단계 문면 중 clear_cmd 에 의존하지 않는 부분 —
+#   어댑터 clear_cmd('/clear'·'/new'…)가 무엇이든 C-u 선행 송신을 읽는다.
+#   cargo 검체 d16_keys_sent_markers_are_clear_cmd_agnostic 가 위 줄의 리터럴을 파싱해 대조한다.
 RESIDUAL_WINDOW_RE = re.compile(r"residual_window=(\d+\.\d+)s")
 SETTLE_SECS = 75.0                # 자식 종료 후 안정화 대기
 # ★[결재 7ⓑ] 러스트 src/bin/cys.rs 의 CLEAR_VERIFY_SECS(cycle-agent clear 실효 관측 창)와 같은 값이어야
@@ -556,6 +561,11 @@ def held_cooldown_secs(streak):
     return min(cooldown, COOLDOWN_SECS)
 
 
+def held_notify_due(streak):
+    """비구조 보류 digest 통지 시점(순수) — 연속 1회째와 HELD_NOTIFY_EVERY 배수."""
+    return streak == 1 or (streak > 0 and streak % HELD_NOTIFY_EVERY == 0)
+
+
 def held_classify(rc, tail):
     """held 종료의 구조적 원인·생존 근거·키 송신을 분리한다(순수)."""
     structural = rc == 84 and "[diag=%s]" % QUIET_UNREPORTED_DIAG in (tail or "")
@@ -565,7 +575,7 @@ def held_classify(rc, tail):
         alive_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
     elif rc == 85:
         alive_evidence = "rc85: 사람 초안·입력 감지"
-        if "[cycle 5/7] 입력 버퍼 정리 + '/clear'" in (tail or ""):
+        if any(marker in (tail or "") for marker in KEYS_SENT_MARKERS):
             keys_sent = "C-u 1건(타이핑 가드 거부 경로)"
     return {"structural": structural, "alive_evidence": alive_evidence, "keys_sent": keys_sent}
 
@@ -1769,23 +1779,33 @@ def cmd_execute(args):
                    "retry_after_ts": retry_after_ts})
         records, bad = read_ledger()
         current = ledger_view(records, role, bad)
-        if (streak, structural_streak) != (current["held_streak"], current["held_structural_streak"]):
-            print("⚠ [cycle-autopilot] cycle-%d held 예측(%d,%d) != 원장(%d,%d) — 원장 값으로 통지 판정"
-                  % (cid, streak, structural_streak,
-                     current["held_streak"], current["held_structural_streak"]), file=sys.stderr)
-        streak, structural_streak = current["held_streak"], current["held_structural_streak"]
-        cooldown = held_cooldown_secs(streak)
-        retry_after_ts = (current["last_terminal_ts"] or 0) + cooldown
+        actual = (current["held_streak"], current["held_structural_streak"])
+        predicted = (streak, structural_streak)
+        mismatch = predicted != actual
+        if mismatch:
+            # 원장 재조회가 예측과 어긋나면(경합 · corrupt 원장 → streak 0) 이 보류가 통지 없이
+            # 조용히 지나간다. 큰 쪽을 쓰고 아래에서 통지를 최소 1회 보장한다.
+            # cooldown·retry_after_ts 는 detail 에 이미 실린 예측값을 유지한다(원장 뷰 불신).
+            print("⚠ [cycle-autopilot] cycle-%d held 예측(%d,%d) != 원장(%d,%d) — 큰 쪽으로 통지 보장"
+                  % (cid, streak, structural_streak, actual[0], actual[1]), file=sys.stderr)
+            streak = max(streak, actual[0], 1)
+            structural_streak = max(structural_streak, actual[1])
+        else:
+            streak, structural_streak = actual
+            cooldown = held_cooldown_secs(streak)
+            retry_after_ts = (current["last_terminal_ts"] or 0) + cooldown
         ledger_append("cycle", "cycle-autopilot",
                       {"phase": HELD_PHASE, "id": nonce_for(cid), "role": role})
         if structural_streak == HELD_RETRY_MAX:
             escalate("[CYCLE-AUTOPILOT] cycle-%d %s 구조적 보류 %d회 — 데몬이 quiet_secs 를 보고하지 않는다. "
                      "데몬 갱신 후 reset --role %s. 자동 재시도 중지"
                      % (cid, role, structural_streak, role), task_key="autopilot-held-limit")
-        elif streak == 1 or (streak > 0 and streak % HELD_RETRY_MAX == 0):
-            escalate("[CYCLE-AUTOPILOT] cycle-%d %s 비파괴 보류(clear 송신 0건 · 키 송신 %s, rc=%d) "
-                     "연속 %d회 · %.0fs 뒤 자동 재시도(최소 시각=%.3f) · reset 불필요"
-                     % (cid, role, keys_sent, rc, streak, cooldown, retry_after_ts),
+        elif held_notify_due(streak) or mismatch:
+            escalate(("[CYCLE-AUTOPILOT] cycle-%d %s 비파괴 보류(clear 송신 0건 · 키 송신 %s, rc=%d) "
+                      "연속 %d회 · %.0fs 뒤 자동 재시도(최소 시각=%.3f) · reset 불필요"
+                      % (cid, role, keys_sent, rc, streak, cooldown, retry_after_ts))
+                     + (" · 원장 재조회 불일치(예측 %d != 원장 %d) — 통지 보장"
+                        % (predicted[0], actual[0]) if mismatch else ""),
                      task_key="autopilot-held")
         return EXIT_ERR
     time.sleep(SETTLE_SECS)
