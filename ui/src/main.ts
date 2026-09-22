@@ -21,6 +21,7 @@ import {
   type TransferRecord,
 } from "./transfer";
 import { updatePlan } from "./updateplan";
+import { planRestartInject } from "./restartplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
@@ -6015,6 +6016,8 @@ interface OrgSurface {
   idle_secs: number;
   agent: string | null;
   agent_alive: boolean | null;
+  pending_input_bytes?: number | null;
+  pending_input_human_bytes?: number | null;
   status: { state: string; context_pct: number | null; task: string | null; age_secs: number } | null;
   usage?: { ctx_pct: number | null } | null; // ★WP6-2 데몬 실측(org.status "usage" 키) — pickCtx 가 status 보다 먼저 읽는다
 }
@@ -6095,7 +6098,9 @@ function cycleHotNodes(hot: OrgSurface[], socket?: string) {
   toast("feed", "60% cycle", `${s.role} · ctx ${pickCtx(s).pct}% (${hotCycleCursor % hot.length || hot.length}/${hot.length})`); // ★WP6-2 같은 축
 }
 
-// 재기동: role의 첫 surface로 명령+개행 주입(send_input human=true 재사용, data에 "\n"으로 원자 제출 — 계약 변경 금지).
+// 재기동: role의 첫 surface로 주입. 사람 초안은 보류하고, 전체 잔여가 있으면 clear_first로
+// 선정리한다(사람 축 미보고 시 데몬이 재검사). 데몬이 CR을 붙이므로 본문은 개행 없이 보낸다.
+// 전체 잔여가 0·미보고이면 종전 명령+개행 경로를 유지한다(launch-agent 미등록 pane 호환).
 // ★R5 machineOrigin: 이 명령문은 UI 코드가 만든 것이므로 배달 원장에 기록돼야 한다(자동 제출까지
 // 하므로 대상 pane 의 훅이 그대로 프롬프트로 본다 — 표식이 없으면 오너 임무로 기록된다).
 async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], socket?: string) {
@@ -6105,10 +6110,16 @@ async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], so
     return;
   }
   jumpToSurface(target.surface_id, socket);
+  const plan = planRestartInject(cmd, target);
+  if (plan.mode === "refuse") {
+    toast("watchdog", "재기동 보류", plan.reason);
+    return;
+  }
   await invoke("send_input", {
     socket: socket ?? null,
     surfaceId: target.surface_id,
-    data: cmd + "\n",
+    data: plan.data,
+    clearFirst: plan.clearFirst,
     machineOrigin: true,
   });
 }
