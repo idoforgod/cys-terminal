@@ -11783,34 +11783,41 @@ mod tests {
     }
 
     #[test]
-    fn d04_marker_list_picks_last_on_cursor_row() {
+    fn d04_marker_list_accepts_any_leading_candidate_and_keeps_draft_glyphs() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (pack, _env) = wp5_env("d04-last-marker");
+        let (_pack, _env) = wp5_env("d04r1-leading-marker");
         std::fs::write(
-            pack.join("agents.json"),
+            _pack.join("agents.json"),
             r#"{"codex": {"prompt_marker": ["›", "»"]}}"#,
         )
         .expect("디스크 마커 목록");
-        let (daemon, s) = d04_seat("d04-last-marker", "codex");
+        let (daemon, s) = d04_seat("d04r1-leading-marker", "codex");
         let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
         let row = lines
             .iter()
             .rposition(|l| l.starts_with('»'))
             .expect("codex composer 행");
+        for composer in ["› ", "» "] {
+            lines[row] = composer;
+            d04_tick_frame(&daemon, &s, &lines, row, 2);
+            d04_assert_delivered(&s, &format!("선두 후보 모두 빈 입력이면 배달: {composer}"));
+        }
+        // 리뷰 PROBE-A와 초안 속 글리프가 마지막 후보 규칙의 오배달을 드러냈다.
+        // 행 선두 후보만 composer로 인정하고, 그 뒤의 다른 후보도 초안으로 보존한다.
         lines[row] = "› 인용 » ";
         // 인·용은 각각 2셀: 마지막 »는 col 7, 뒤 공백 끝은 col 9다(문자 수 7과 다름).
         d04_tick_frame(&daemon, &s, &lines, row, 9);
-        d04_assert_delivered(&s, "커서 앞 가장 뒤 후보 » 이후 빈 입력이면 배달");
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "선두 › 뒤 인용과 »는 초안으로 보존");
         lines[row] = "» abc ›def";
         d04_tick_frame(&daemon, &s, &lines, row, 9);
-        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "마지막 후보 › 뒤 초안은 보존");
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "선두 » 뒤 abc와 ›def 초안은 보존");
     }
 
     #[test]
     fn d04_observe_prompt_prioritizes_cursor_prefix_and_closes_empty_candidates() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_pack, _env) = wp5_env("d04-observe");
-        let (_daemon, s) = d04_seat("d04-observe", "codex");
+        let (_pack, _env) = wp5_env("d04r1-observe");
+        let (_daemon, s) = d04_seat("d04r1-observe", "codex");
         let markers = vec!["›".to_string(), "»".to_string()];
         // 커서 뒤·다른 행에 더 늦은 후보가 있어도 커서 앞의 후보를 먼저 채택한다.
         paint_screen(&s, &["› »", "later »"], 0, 2, false);
@@ -11820,6 +11827,20 @@ mod tests {
             before.trim().is_empty() && after.contains('»')
         }));
         assert!(obs.marker_seen);
+
+        // 출력 행 중간의 후보는 보이더라도 composer 경계를 만들지 않는다.
+        paint_screen(&s, &["out » "], 0, 6, false);
+        let obs = super::observe_prompt(&s, &markers);
+        assert!(
+            obs.line.is_none(),
+            "선두가 아닌 »는 composer가 아니다; blocked_reason={}",
+            blocked_reason(&s)
+        );
+        assert!(
+            obs.marker_seen,
+            "출력 행의 »도 화면 마커 관측에는 남는다; blocked_reason={}",
+            blocked_reason(&s)
+        );
 
         // 커서 앞에 없으면 커서행을 보되, 선택기 행을 빈 composer 로 오인하지 않는다.
         paint_screen(&s, &["» 1. Yes", "later ›"], 0, 0, false);
@@ -11849,6 +11870,111 @@ mod tests {
         assert_eq!(
             prompt_gate_verdict(&input),
             PromptGate::Blocked(super::BLOCKED_PROMPT_NOT_READY)
+        );
+    }
+
+    #[test]
+    fn d04r1_gemini_working_frame_esc_to_cancel_is_busy() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-gemini-cancel-busy");
+        let (daemon, s) = d04_seat("d04r1-gemini-cancel-busy", "gemini");
+        let mut lines = [
+            "  [리뷰] 검토 중…",
+            "",
+            "⠧ Working... (esc to cancel, 12s)",
+            RULE,
+            ">",
+            RULE,
+            "? for shortcuts                                   Gemini 3.8 Flash · hig",
+        ];
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_blocked(&s, BLOCKED_BUSY, "gemini esc to cancel 작업 중 프레임은 보류");
+
+        lines[2] = "  완료: 판정 ACCEPT";
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_delivered(&s, "gemini 작업 중 문구가 사라지면 빈 composer에서 배달");
+
+        lines[2] = "  Generating... (Enter/Esc to cancel)";
+        d04_tick_frame(&daemon, &s, &lines, 4, 1);
+        d04_assert_blocked(&s, BLOCKED_BUSY, "gemini Enter/Esc to cancel 대문자 변형도 보류");
+    }
+
+    #[test]
+    fn d04r1_gemini_output_row_ending_with_gt_at_cursor_is_unknown() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-gemini-output-gt");
+        let (daemon, s) = d04_seat("d04r1-gemini-output-gt", "gemini");
+        let lines = [
+            "  see a -> b and x ->",
+            "",
+            RULE,
+            ">",
+            RULE,
+            "? for shortcuts",
+        ];
+        d04_tick_frame(&daemon, &s, &lines, 0, lines[0].len() as u16);
+        d04_assert_blocked(
+            &s,
+            BLOCKED_PROMPT_UNKNOWN,
+            "출력 행 끝 >에 커서가 있어도 composer가 아니므로 보류",
+        );
+
+        d04_tick_frame(&daemon, &s, &lines, 3, 1);
+        d04_assert_delivered(&s, "실제 선두 > composer로 커서를 옮기면 배달");
+    }
+
+    #[test]
+    fn d04r1_draft_containing_marker_glyph_is_input_pending() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-draft-marker");
+        let (daemon, s) = d04_seat("d04r1-draft-marker-codex", "codex");
+        let mut lines: Vec<&str> = D04_CODEX_HQ_S6.lines().collect();
+        let row = lines
+            .iter()
+            .rposition(|l| l.starts_with('»'))
+            .expect("codex composer 행");
+        lines[row] = "» abc » ";
+        d04_tick_frame(&daemon, &s, &lines, row, 8);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "codex 초안 속 » 뒤 공백도 초안 전체를 보존");
+
+        lines[row] = "» ";
+        d04_tick_frame(&daemon, &s, &lines, row, 2);
+        d04_assert_delivered(&s, "codex 초안을 지우면 선두 » 뒤 빈 입력에서 배달");
+
+        let (daemon, s) = d04_seat("d04r1-draft-marker-gemini", "gemini");
+        let lines = [RULE, "> a > ", RULE, "? for shortcuts"];
+        d04_tick_frame(&daemon, &s, &lines, 1, 6);
+        d04_assert_blocked(&s, BLOCKED_INPUT_PENDING, "gemini 초안 속 > 뒤 공백도 초안 전체를 보존");
+    }
+
+    #[test]
+    fn d04r1_ready_marker_list_is_not_a_prompt_fallback() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("d04r1-ready-marker-fallback");
+        let embed = json!({"myagent": {"ready_marker": "? for shortcuts"}});
+        let disk = json!({"myagent": {"ready_marker": [">", "$"]}});
+        // 선언 병합만 검사하므로 좌석/큐가 없으며 보류 사유는 해당 없음이다.
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec!["? for shortcuts".to_string()]),
+            "목록 ready_marker는 무시하고 임베드 문자열로 폴백한다; blocked_reason={}",
+            "N/A"
+        );
+
+        let disk = json!({"myagent": {"ready_marker": ">"}});
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec![">".to_string()]),
+            "문자열 ready_marker는 디스크 우선 폴백을 유지한다; blocked_reason={}",
+            "N/A"
+        );
+
+        let disk = json!({"myagent": {"prompt_marker": [">", "»"]}});
+        assert_eq!(
+            super::merged_prompt_marker(&disk, &embed, "myagent"),
+            Some(vec![">".to_string(), "»".to_string()]),
+            "prompt_marker는 목록 허용을 유지한다; blocked_reason={}",
+            "N/A"
         );
     }
 
