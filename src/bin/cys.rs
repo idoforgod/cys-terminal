@@ -32353,6 +32353,31 @@ mod tests {
     }
 
     #[test]
+    fn d16_keys_sent_markers_are_clear_cmd_agnostic() {
+        let autopilot = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let markers_literal = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("KEYS_SENT_MARKERS = ("))
+            .and_then(|literal| literal.strip_suffix(')'))
+            .expect("파이썬 KEYS_SENT_MARKERS 줄 시작 튜플 리터럴");
+        let markers: Vec<&str> = markers_literal.split('"').skip(1).step_by(2).collect();
+        assert!(markers.len() >= 2, "키 송신 마커 문자열 리터럴은 두 개 이상이어야 한다");
+
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        for marker in markers {
+            assert!(
+                !marker.contains("/clear"),
+                "키 송신 마커는 어댑터 clear_cmd에 종속되면 안 된다: {marker}"
+            );
+            assert!(
+                prod.contains(marker),
+                "autopilot 키 송신 마커가 러스트 프로덕션 문면에서 사라졌다: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn d16_residual_window_format_matches_autopilot_regex() {
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
         assert!(

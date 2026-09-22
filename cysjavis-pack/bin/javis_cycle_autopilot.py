@@ -2575,9 +2575,38 @@ def cmd_self_test(args):
 
     # 5-c) 비파괴 보류는 감쇠 재시도 — reset 우선·지수 쿨다운·구조적 보류만 상한.
     print("[5-c] held_noop 재시도 게이트")
-    t.check("held 재시도 상수: 300s·구조 상한/통지 주기 3회·최대 1200s",
+    t.check("held 재시도 상수: 300s·구조 하드 상한 3회·비구조 통지 주기 3회·최대 1200s",
             HELD_RETRY_COOLDOWN_SECS == 300.0 and HELD_RETRY_MAX == 3
+            and globals().get("HELD_NOTIFY_EVERY") == 3
             and COOLDOWN_SECS == 1200)
+    held_notify_fn = globals().get("held_notify_due")
+    for streak, expected in ((1, True), (2, False), (3, True), (4, False),
+                             (6, True), (0, False), (-1, False), (9, True)):
+        actual = held_notify_fn(streak) if callable(held_notify_fn) else None
+        t.check("held_notify_due(%d) → %s" % (streak, expected),
+                callable(held_notify_fn) and actual is expected,
+                "실제 %r (심볼 부재도 FAIL)" % actual)
+    from unittest.mock import patch
+    notify_split_name = "HELD_NOTIFY_EVERY=2: held_notify_due(2)=True·(3)=False"
+    gate_split_name = "HELD_NOTIFY_EVERY=2: 구조 보류 3회는 게이트5 차단 유지"
+    retry_split_name = "HELD_RETRY_MAX=5: held_notify_due(3)=True 유지"
+    if callable(held_notify_fn) and globals().get("HELD_NOTIFY_EVERY") is not None:
+        with patch.dict(globals(), {"HELD_NOTIFY_EVERY": 2}):
+            t.check(notify_split_name,
+                    held_notify_fn(2) is True and held_notify_fn(3) is False)
+            split_led = {"cycles": 3, "last_terminal_phase": HELD_PHASE, "held_streak": 3,
+                         "held_structural_streak": 3, "last_terminal_ts": now_ts - 1200,
+                         "incomplete": False, "corrupt": False}
+            v = evaluate_gates("worker", ctx_of(ledger=split_led), now_ts)
+            gate5 = next(g for g in v["gates"] if g["id"] == 5)
+            t.check(gate_split_name,
+                    not v["pass"] and not gate5["ok"] and gate5.get("held_limit") is True,
+                    gate5["detail"])
+        with patch.dict(globals(), {"HELD_RETRY_MAX": 5}):
+            t.check(retry_split_name, held_notify_fn(3) is True)
+    else:
+        for name in (notify_split_name, gate_split_name, retry_split_name):
+            t.check(name, False, "심볼 부재")
     held_cooldown_fn = globals().get("held_cooldown_secs")
     for streak, expected in ((1, 300), (2, 600), (3, 1200), (4, 1200),
                              (0, 300), (-1, 300)):
@@ -2640,6 +2669,14 @@ def cmd_self_test(args):
     print("[5-d] held 분류·residual_window 실측 파싱")
     t.check("QUIET_UNREPORTED_DIAG 기계 토큰 고정",
             globals().get("QUIET_UNREPORTED_DIAG") == "quiet_secs_unreported")
+    keys_sent_markers = globals().get("KEYS_SENT_MARKERS")
+    t.check("KEYS_SENT_MARKERS: clear_cmd 무관 튜플·선행 C-u/입력 버퍼 문면",
+            isinstance(keys_sent_markers, tuple)
+            and "C-u 1건은 선행 송신됨" in keys_sent_markers
+            and "[cycle 5/7] 입력 버퍼 정리 + '" in keys_sent_markers
+            and all(isinstance(marker, str) and "/clear" not in marker and "/new" not in marker
+                    for marker in keys_sent_markers),
+            "실제 %r (심볼 부재도 FAIL)" % (keys_sent_markers,))
     held_classify_fn = globals().get("held_classify")
     for label, rc, tail, expected in (
             ("rc84 구조", 84, "[diag=quiet_secs_unreported]",
@@ -2653,7 +2690,29 @@ def cmd_self_test(args):
               "keys_sent": "0건"}),
             ("rc85 타이핑 가드", 85, "[cycle 5/7] 입력 버퍼 정리 + '/clear'\n",
              {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
-              "keys_sent": "C-u 1건(타이핑 가드 거부 경로)"})):
+              "keys_sent": "C-u 1건(타이핑 가드 거부 경로)"}),
+            ("rc84 대괄호 없음", 84, "quiet_secs_unreported",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc84 접미 변형", 84, "[diag=quiet_secs_unreported_x]",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc84 접두 변형", 84, "[diag=x_quiet_secs_unreported]",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc85 타이핑 가드 /new", 85, "[cycle 5/7] 입력 버퍼 정리 + '/new'\n",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
+              "keys_sent": "C-u 1건(타이핑 가드 거부 경로)"}),
+            ("rc85 러스트 거부 문면", 85,
+             "error: cycle-human-draft: clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
+              "keys_sent": "C-u 1건(타이핑 가드 거부 경로)"}),
+            ("rc85 키 송신 없음(문면 무관)", 85, "사람 초안 감지",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지",
+              "keys_sent": "0건"})):
         actual = held_classify_fn(rc, tail) if callable(held_classify_fn) else None
         t.check("held_classify: %s" % label,
                 callable(held_classify_fn) and isinstance(actual, dict)
@@ -3411,7 +3470,7 @@ def cmd_self_test(args):
     draft_evidence = "rc85: 사람 초안·입력 감지"
     typing_keys = "C-u 1건(타이핑 가드 거부 경로)"
 
-    def execute_fixture(child_rc, prior=(), output=None, abort=False):
+    def execute_fixture(child_rc, prior=(), output=None, abort=False, bad_after=0):
         cid = next(fixture_ids)
         fixture_ts = now_ts + cid
         if output is None:
@@ -3435,7 +3494,8 @@ def cmd_self_test(args):
 
         def reread(*a, **kw):
             events.append("read_ledger")
-            return read_real(*a, **kw)
+            records, bad = read_real(*a, **kw)
+            return records, bad_after if "finalized" in events else bad
 
         def reviewed(*a, **kw):
             events.append("ledger_view")
@@ -3555,6 +3615,19 @@ def cmd_self_test(args):
                 "read_ledger" in after and "ledger_view" in after and "notify" in after
                 and after.index("read_ledger") < after.index("ledger_view") < after.index("notify"))
 
+    fixture = execute_fixture(85, output=("held-fixture rc=85\n" + residual_line
+                                         + "[cycle 5/7] 입력 버퍼 정리 + '/new'\n"))
+    t.check("rc85 clear_cmd='/new': keys_sent 는 어댑터 무관",
+            fixture["detail"].get("keys_sent") == typing_keys
+            and fixture["detail"].get("reason") == "비파괴 보류(clear 송신 0건 · 키 송신 %s)" % typing_keys)
+    fixture = execute_fixture(85, bad_after=1)
+    t.check("원장 재조회 불일치(corrupt→streak 0): 통지 최소 1회 보장",
+            fixture["notifier"].call_count == 1
+            and fixture["notifier"].call_args.kwargs == {"task_key": "autopilot-held"}
+            and "불일치" in fixture["notifier"].call_args.args[0]
+            and all(s in fixture["notifier"].call_args.args[0]
+                    for s in ("비파괴 보류", "자동 재시도", "reset 불필요")))
+
     child_rc = 86
     fixture = execute_fixture(child_rc)
     t.check("rc86: settle + post_verify 유지(held 우회 금지)",
@@ -3566,13 +3639,18 @@ def cmd_self_test(args):
     t.check("rc86: executor_exited 실측 residual_window_secs=12.3",
             fixture["exited"].get("residual_window_secs") == 12.3)
 
+    held_notify_every = globals().get("HELD_NOTIFY_EVERY")
     for streak in (2, 3, 4, 5, 6, 7):
         fixture = execute_fixture(85, prior=(False,) * (streak - 1))
         cooldown = 600 if streak == 2 else 1200
         name = "비구조 보류 %d회째" % streak
         check_held_counts(name, fixture, streak, 0, cooldown)
-        check_held_notice(name, fixture, 1 if streak in (3, 6) else 0,
-                          streak=streak, cooldown=cooldown)
+        if type(held_notify_every) is int and held_notify_every > 0:
+            check_held_notice(name, fixture, 1 if streak % held_notify_every == 0 else 0,
+                              streak=streak, cooldown=cooldown)
+        else:
+            t.check("%s: HELD_NOTIFY_EVERY 통지 주기" % name, False,
+                    "심볼 부재" if held_notify_every is None else "통지 주기는 양의 정수여야 한다")
 
     structural_output = "held-fixture rc=84 [diag=quiet_secs_unreported]\n" + residual_line
     fixture = execute_fixture(84, output=structural_output)
