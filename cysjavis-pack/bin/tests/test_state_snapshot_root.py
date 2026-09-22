@@ -25,10 +25,13 @@
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
@@ -39,9 +42,12 @@ import javis_state_snapshot as ss  # noqa: E402 — 순수 함수 직접 핀(서
 
 PY = sys.executable or "python3"
 fails = []
+checks = 0
 
 
 def check(name, cond, detail=""):
+    global checks
+    checks += 1
     print("%s %s%s" % ("PASS" if cond else "FAIL", name, (" — " + detail) if detail else ""))
     if not cond:
         fails.append(name)
@@ -179,10 +185,165 @@ try:
           repr(sorted(dnames)))
     check("D3 ★미끼 형상에서도 WORKER_TODO.md 가 세대에 담긴다", "WORKER_TODO.md" in dnames,
           repr(sorted(dnames)))
+
+    # ── E. D-07(2026-09-21) 잔여 계약 — TODO 누락·선택 상태·무기록·청소 보호 ───────
+    def run_d07_snapshot(todo=True, autopilot=False, round_exists=True, dry_run=False):
+        """필수 누락은 schedule_state.json 한 건으로 고정한 밀폐 형상이다."""
+        h = tempfile.mkdtemp(prefix="snap-d07-", dir=root)
+        p = os.path.join(h, "pack")
+        rd = os.path.join(p, "round")
+        localappdata = os.path.join(h, "AppData", "Local")
+        st = (os.path.join(localappdata, "cys") if os.name == "nt"
+              else os.path.join(h, ".local", "state", "cys"))
+        os.makedirs(st)
+        os.makedirs(os.path.join(h, ".cys"))
+        for basename in ("topology.json", "event.seq"):
+            with open(os.path.join(st, basename), "w", encoding="utf-8") as f:
+                f.write("{}\n")
+        with open(os.path.join(h, ".cys", "depts.json"), "w", encoding="utf-8") as f:
+            json.dump({"depts": {}}, f)
+        if round_exists:
+            os.makedirs(rd)
+            with open(os.path.join(rd, "SESSION_STATE.md"), "w", encoding="utf-8") as f:
+                f.write("# D-07 복원 정본\n")
+            if todo:
+                with open(os.path.join(rd, "WORKER_TODO.md"), "w", encoding="utf-8") as f:
+                    f.write("- [ ] D-07 검체\n")
+        ap = os.path.join(st, "autopilot.json")
+        if autopilot:
+            with open(ap, "w", encoding="utf-8") as f:
+                f.write("{}\n")
+        # Windows 의 expanduser·상태 루트도 같은 임시 HOME 안으로 밀폐한다.
+        env = {"HOME": h, "USERPROFILE": h, "LOCALAPPDATA": localappdata,
+               "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "LANG": os.environ.get("LANG", "C.UTF-8"), "CYS_PACK_DIR": p}
+        # round 부재 형상은 폴백 목적지도 밀폐 HOME 안으로 고정한다.
+        if not round_exists:
+            env["JAVIS_ROOT"] = h
+            rd = os.path.join(h, "_round")
+        args = [PY, MOD, "snapshot"] + (["--dry-run"] if dry_run else [])
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", env=env, cwd=h, timeout=120)
+        manifests = []
+        gr = os.path.join(h, ".cys", "state-generations")
+        for name in sorted(os.listdir(gr)) if os.path.isdir(gr) else []:
+            mp = os.path.join(gr, name, "manifest.json")
+            if os.path.isfile(mp):
+                with open(mp, encoding="utf-8") as f:
+                    manifests.append(json.load(f))
+        return result, manifests, rd, st, ap
+
+    r0, _, rd0, _, _ = run_d07_snapshot(todo=False, dry_run=True)
+    todo_pattern = os.path.join(rd0, "*_TODO.md")
+    check("E1-D07-TODO-0 glob 0건도 dry-run 누락 패턴으로 표시",
+          r0.returncode == 0 and any(
+              "(없음)" in line and todo_pattern in line for line in r0.stdout.splitlines()),
+          "rc=%s out=%r" % (r0.returncode, r0.stdout + r0.stderr))
+    r1, _, rd1, _, _ = run_d07_snapshot(todo=True, dry_run=True)
+    check("E2-D07-TODO-1 음성 대조: TODO 실재 시 누락 패턴 없음",
+          r1.returncode == 0 and os.path.join(rd1, "WORKER_TODO.md") in r1.stdout
+          and not any("(없음)" in line and "*_TODO.md" in line
+                      for line in r1.stdout.splitlines()),
+          "rc=%s out=%r" % (r1.returncode, r1.stdout + r1.stderr))
+    rn, _, rdn, _, _ = run_d07_snapshot(round_exists=False, dry_run=True)
+    round_missing = [line for line in rn.stdout.splitlines()
+                     if "(없음)" in line and rdn + os.sep in line]
+    check("E3-D07-ROUND-0 round 자체 부재 시 SESSION_STATE·TODO 패턴 최소 2건 누락",
+          rn.returncode == 0 and len(round_missing) >= 2
+          and any("SESSION_STATE.md" in line for line in round_missing)
+          and any("*_TODO.md" in line for line in round_missing), repr(round_missing))
+
+    check("E4-D07-OPTIONAL-CONST autopilot 은 선택 소스이면서 선언 소스에 잔류",
+          getattr(ss, "OPTIONAL_BASENAMES", None) == ("autopilot.json",)
+          and "autopilot.json" in ss.DECLARATIVE_BASENAMES,
+          repr(getattr(ss, "OPTIONAL_BASENAMES", None)))
+    ra, ma, _, sta, apa = run_d07_snapshot(autopilot=False)
+    manifest_a = ma[0] if len(ma) == 1 else {}
+    check("E5-D07-OPTIONAL-ABSENT 미생성 autopilot 은 manifest 선택부재에 기록",
+          ra.returncode == 0 and manifest_a.get("optional_absent") == [apa],
+          "rc=%s optional_absent=%r" % (ra.returncode, manifest_a.get("optional_absent")))
+    check("E6-D07-OPTIONAL-MISSING manifest 누락은 필수 소스만 계수",
+          manifest_a.get("missing") == [os.path.join(sta, "schedule_state.json")],
+          "missing=%r autopilot=%r" % (manifest_a.get("missing"), apa))
+    missing_count = re.search(r"누락 (\d+)건", ra.stdout)
+    check("E7-D07-OPTIONAL-COUNT stdout 누락 1건은 autopilot 을 제외한 수치",
+          ra.returncode == 0 and missing_count is not None
+          and int(missing_count.group(1)) == 1, repr(ra.stdout + ra.stderr))
+    optional_count = re.search(r"선택부재 (\d+)건", ra.stdout)
+    check("E8-D07-OPTIONAL-SUMMARY stdout 에 선택부재 1건을 별도 표시",
+          ra.returncode == 0 and optional_count is not None
+          and int(optional_count.group(1)) == 1, repr(ra.stdout + ra.stderr))
+    rp, mp, _, _, app = run_d07_snapshot(autopilot=True)
+    manifest_p = mp[0] if len(mp) == 1 else {}
+    check("E9a-D07-OPTIONAL-PRESENT 양성 대조: autopilot 실재 시 보관",
+          rp.returncode == 0
+          and any(entry.get("source") == app for entry in manifest_p.get("files", [])),
+          repr(manifest_p))
+    check("E9b-D07-OPTIONAL-PRESENT 선택부재 목록도 빈 배열로 명시",
+          manifest_p.get("optional_absent") == [], repr(manifest_p.get("optional_absent")))
+
+    # 소스와 gen_root 를 명시해 직접 호출도 라이브 HOME 파생 경로에 닿지 않게 한다.
+    dry_new = os.path.join(root, "d07-dry-new")
+    ss.do_snapshot(sources=[], gen_root=dry_new, dry_run=True)
+    check("E10-D07-DRY-MKDIR dry-run 은 없던 gen_root 를 만들지 않음",
+          not os.path.exists(dry_new), dry_new)
+    dry_existing = os.path.join(root, "d07-dry-existing")
+    dry_tmp = os.path.join(dry_existing, ".tmp-%d-x" % os.getpid())
+    os.makedirs(dry_tmp)
+    # 살아 있는 pid 보호만 구현해도 초록이 되지 않도록 청소 호출 자체도 감시한다.
+    with mock.patch.object(ss, "_cleanup_tmp", wraps=ss._cleanup_tmp) as cleanup:
+        ss.do_snapshot(sources=[], gen_root=dry_existing, dry_run=True)
+    check("E11-D07-DRY-CLEANUP dry-run 은 자기 pid 임시 세대를 삭제하지 않음",
+          os.path.isdir(dry_tmp) and not cleanup.called,
+          "%s, 청소 호출=%d" % (dry_tmp, cleanup.call_count))
+
+    check("E12-D07-TMP-AGE-CONST 임시 세대 최소 보존 시간은 60초",
+          getattr(ss, "TMP_MIN_AGE_SECS", None) == 60,
+          repr(getattr(ss, "TMP_MIN_AGE_SECS", None)))
+    cleanup_root = os.path.join(root, "d07-cleanup")
+    live_name = ".tmp-%d-a" % os.getpid()
+    live_tmp = os.path.join(cleanup_root, live_name)
+    os.makedirs(live_tmp)
+    old_time = time.time() - 3600
+    os.utime(live_tmp, (old_time, old_time))
+    dead_pid = None
+    if os.name != "nt":
+        # 프로세스를 만들거나 신호를 보내지 않고, 실제 부재가 확인된 pid 만 고른다.
+        for candidate in range(99990, 0, -1):
+            try:
+                os.kill(candidate, 0)
+            except ProcessLookupError:
+                dead_pid = candidate
+                break
+            except PermissionError:
+                continue
+        if dead_pid is None:
+            raise RuntimeError("D-07 검체용 죽은 pid 를 찾지 못함")
+        old_name = ".tmp-%d-b" % dead_pid
+        fresh_name = ".tmp-%d-c" % dead_pid
+        old_tmp = os.path.join(cleanup_root, old_name)
+        fresh_tmp = os.path.join(cleanup_root, fresh_name)
+        os.makedirs(old_tmp)
+        os.utime(old_tmp, (old_time, old_time))
+        os.makedirs(fresh_tmp)
+        now = time.time()
+        os.utime(fresh_tmp, (now, now))
+    removed = ss._cleanup_tmp(cleanup_root)
+    check("E13-D07-TMP-LIVE 살아 있는 pid 는 mtime 1시간 전이어도 보호",
+          os.path.isdir(live_tmp), "removed=%r" % removed)
+    if os.name == "nt":
+        print("SKIP E14~E16-D07-TMP-DEAD Windows 는 os.kill(pid, 0) 부재 탐색 제외")
+    else:
+        check("E14-D07-TMP-DEAD-OLD 죽은 pid 의 1시간 전 임시 세대는 삭제",
+              not os.path.exists(old_tmp), "removed=%r" % removed)
+        check("E15-D07-TMP-DEAD-FRESH 죽은 pid 라도 60초 미만은 보호",
+              os.path.isdir(fresh_tmp), "removed=%r" % removed)
+        check("E16-D07-TMP-REMOVED 반환 목록에는 죽은 pid 의 오래된 b 만 포함",
+              removed == [old_name], repr(removed))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
-print("\n=== %d/%d PASS ===" % (20 - len(fails), 20))
+print("\n=== %d/%d PASS ===" % (checks - len(fails), checks))
 if fails:
     print("FAIL: %s" % fails, file=sys.stderr)
     sys.exit(1)
