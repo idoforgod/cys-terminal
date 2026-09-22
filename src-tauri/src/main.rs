@@ -549,7 +549,20 @@ async fn send_input(
     //   미확정(`durable:false` = 데몬이 죽으면 사라지는 항목) 인계 뒤에 원본을 닫아 인계를 복구 불가로
     //   잃을 수 있었다. 응답·중간 반환형·종료 조건은 한 변경 단위다(ui/src/transfer.ts
     //   `parseEnqueueReceipt` · `originCloseVerdict`). additive: 종전 호출부는 반환값을 쓰지 않는다.
-    rpc_on(&sock, "surface.send_text", params).await
+    // ★(0.14.39 · 성찰2 major) 데몬 `error.code` 를 UI 까지 올린다 — `rpc_on` 은 message 만 승격해
+    //   `restartInvokeFailureReason` 의 코드 기반 번역이 실기에서 한 번도 발화하지 못했다(vacuous).
+    //   `feed_reply` 가 쓰는 `"{code}: {message}"` 와 **같은 형식**이다(형식 1지점). additive —
+    //   기존 message 기반 호출부는 접미 매칭이라 그대로 통과한다.
+    let resp = rpc_full(&sock, "surface.send_text", params).await?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(format!(
+            "{}: {}",
+            resp["error"]["code"].as_str().unwrap_or("error"),
+            resp["error"]["message"].as_str().unwrap_or("unknown error")
+        ))
+    }
 }
 
 /// 전출(F6-2) 핸드오프 폴백 경로용 홈 디렉토리 — cwd가 루트류(/·C:\)인 pane은

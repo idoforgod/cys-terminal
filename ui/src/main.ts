@@ -2384,10 +2384,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   //   입력이 죽는다 — 무음 삼킴을 고치려던 코드가 정확히 그 결함보다 나쁜 결함을 만드는 셈이다.
   //   현재 stickyToast 경로가 실제로 throw 하지는 않지만(#toasts 는 index.html 에 정적으로 존재),
   //   불변식이 **외부 DOM 의 존재**에만 의존하게 두지 않는다.
-  // ★사유는 원문 그대로 보인다: send_input 은 rpc_on 경로라 데몬의 error.code 가 UI 까지 오지
-  //   않고 message 만 온다(src-tauri/src/main.rs 의 rpc_on — error.message 만 String 으로 승격).
-  //   ∴ feedReplyErrorText 같은 코드 기반 분류를 쓸 수 없다. 대신 데몬 메시지가 이미 자기설명적이다
-  //   ("surface process has exited" / "surface input channel full (pane not consuming input)" 등).
+  // ★사유 표기(정정 2026-09-22): send_input 은 **rpc_full** 경로라 데몬 `error.code` 가
+  //   `"{code}: {message}"` 로 UI 까지 온다(src-tauri/src/main.rs send_input · feed_reply 와 같은 형식).
+  //   재기동 경로는 restartplan.ts 의 `restartInvokeFailureReason` 이 그 코드를 한국어 처방으로 번역한다.
+  //   이 pane 입력 실패 토스트는 분류 없이 **원문 그대로** 보인다 — 데몬 메시지가 이미 자기설명적이기
+  //   때문이다("surface process has exited" / "surface input channel full (pane not consuming input)").
   //   ★상한값 3초의 근거(임의 수가 아니다): ①이 창이 곧 표시 상한을 정의한다 — 표시는 창당
   //   1회이므로 **3초에 1회(≈0.33건/초)·pane 당**이 실제 상한이고, 화면에 남는 줄은 아래
   //   sendFailToastId 고정 재사용으로 언제나 1줄이다. ②창은 '합산이 실제로 일어나는' 길이여야
