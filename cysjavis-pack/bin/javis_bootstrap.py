@@ -2741,16 +2741,12 @@ def _capgate_unresolved_state(pack):
 
 
 def _hooks_effective(pack):
-    """최근 레인 가드 조기 종료가 없는가 — 공용 판독 실패 시 mtime 으로 폴백한다."""
+    """최근 레인 가드 조기 종료가 없는가 — None=미측정(공용 판독 실패)."""
     try:
         import javis_preflight as _pf
         return not _pf.lane_guard_tripped(pack)[0]
     except Exception:                       # 진단 필드가 부트의 종료 코드를 바꾸지 않는다
-        try:
-            path = os.path.join(pack, "state", "lane-guard-tripped")
-            return time.time() - os.path.getmtime(path) > 24 * 3600
-        except Exception:
-            return True
+        return None
 
 
 def _cmd_run_chain(log):

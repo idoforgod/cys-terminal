@@ -407,7 +407,7 @@ def lane_guard_tripped_path(pack=None):
 def lane_guard_tripped(pack=None, now=None):
     """(recent: bool, info: dict|None) — 이 레인의 최근(24h) 조기 종료 표식.
 
-    info 는 path·age_s·mtime 과 표식 key=value(hook_root/lane_root/script/surface/ts).
+    info 는 path·age_s·mtime 과 표식 key=value(hook_root/lane_root/script/surface/reason/ts).
     증명된 부재만 (False, None) 이다. 판독 불가는 (True, {path, unreadable: True})로
     막는다(결측은 값이 아니다). 셸 표식의 ts 대신 파일 mtime 으로 신선도를 판정한다.
     """
@@ -425,7 +425,7 @@ def lane_guard_tripped(pack=None, now=None):
     info = {"path": path, "age_s": age_s, "mtime": mtime, "script": ""}
     for line in raw.splitlines():
         key, sep, value = line.partition("=")
-        if sep and key in ("hook_root", "lane_root", "script", "surface", "ts"):
+        if sep and key in ("hook_root", "lane_root", "script", "surface", "reason", "ts"):
             info[key] = value
     return age_s <= LANE_GUARD_RECENT_S, info
 
@@ -6675,16 +6675,24 @@ class Preflight:
             info = info or {}
             age = ("age_s=%.0f" % info["age_s"] if "age_s" in info
                    else "age 판독 불가")
+            reason = info.get("reason", "")
+            cause = {
+                "absent": "레인 팩에 대응 훅이 없어(팩 결손·스큐)",
+                "unreadable": "대응 훅을 읽을 수 없어(권한)",
+                "already-redirected": "위임된 훅이 다시 불일치(심링크 hooks 디렉터리 등)",
+                "no-redirect-line": "훅 본문에 redirect 줄이 없어(사용자 수정 훅·부분 갱신 — census R-8 참조)",
+            }.get(reason, "사유 미기록(구 표식)")
+            marker_path = info.get("path", lane_guard_tripped_path())
             detail = ("레인 가드 조기 종료 표식: script=%s hook_root=%s lane_root=%s "
-                      "surface=%s %s path=%s%s — 이 레인 좌석의 훅이 타 레인 팩을 가리키고 "
-                      "레인 팩에 대응 훅이 없어 조기 종료됐다 — "
+                      "surface=%s reason=%s %s path=%s%s — %s — "
                       "①좌석을 `CLAUDE_CONFIG_DIR=<레인 계정 폴더>` 로 재기동 "
-                      "②레인 팩 훅 결손이면 팩 재설치(cys init-pack) · "
-                      "표식은 다음 조기 종료 때 덮어써지며 24h 지나면 이 검사는 통과한다"
+                      "②레인 팩 훅 결손이면 팩 재설치(cys init-pack) "
+                      "③조치 확인 후 표식 `%s` 삭제(표식은 24h 지나면 자동 통과)"
                       % (info.get("script", ""), info.get("hook_root", ""),
-                         info.get("lane_root", ""), info.get("surface", ""), age,
-                         info.get("path", lane_guard_tripped_path()),
-                         " (표식 판독 불가)" if info.get("unreadable") else ""))
+                         info.get("lane_root", ""), info.get("surface", ""), reason,
+                         age, marker_path,
+                         " (표식 판독 불가)" if info.get("unreadable") else "",
+                         cause, marker_path))
         elif info is not None:
             detail = "표식 있음(age %.1fh · 24h 초과 · 무시)" % (info["age_s"] / 3600)
         else:
@@ -10285,6 +10293,8 @@ def _self_test():
               and run_src2.index("c83_lane_guard_tripped") < run_src2.index("c62_pack_heal_ledger"))
         check("lane_guard_tripped 부재→(False,None)",
               lane_guard_tripped("/nonexistent/pack") == (False, None))
+        check("lane_guard_tripped 표식 reason 파싱",
+              '"reason"' in _pin_src(lane_guard_tripped))
         # ── ★성찰(2026-09-10) 핀 — P14 축 1지점 · P15 처방 문면 · P17 FIFO 정지 하드닝 ──
         check("P14: C82 의 cys 해석은 **명시 오버라이드 우선** — _capgate_alert_axis 와 같은 순서(축 1지점)",
               'os.environ.get("CYS_BIN") or shutil.which("cys")' in c82_src

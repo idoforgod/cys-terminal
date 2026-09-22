@@ -2074,17 +2074,13 @@ def _record_step(parsed):
 
 
 def _hooks_effective():
-    """이 레인 팩의 최근 레인 가드 조기 종료 여부를 읽는 진단 전용 필드."""
+    """이 레인 팩의 최근 레인 가드 조기 종료 여부를 읽는 진단 전용 필드(None=미측정)."""
     pack = os.environ.get("CYS_PACK_DIR") or os.path.expanduser("~/.cys/pack")
     try:
         import javis_preflight as _pf
         return not _pf.lane_guard_tripped(pack)[0]
     except Exception:                       # 임무 게이트 판정·종료 코드는 그대로 보존한다
-        try:
-            path = os.path.join(pack, "state", "lane-guard-tripped")
-            return time.time() - os.path.getmtime(path) > 24 * 3600
-        except Exception:
-            return True
+        return None
 
 
 def cmd_status(argv):
