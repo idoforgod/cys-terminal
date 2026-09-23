@@ -268,6 +268,10 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
 START_GATE_EXCEPTION_TOKENS = [
     "[CYCLE-PRE]", "[CYCLE]", "[CYCLE-VERIFY]", "[DRAIN]", "[DRAIN-VERIFY]",
     "각성 메시지", "지침 각성 확인 핑", "각성 ACK", "승인",
+    # ★성찰 C(부트체인·온보딩) minor: CSO 운영 경고(서버·중복 프로세스 정리 — CSO_DIRECTIVE
+    #   watchdog.duplicate_procs 등)가 예외 목록·지시 출처 어느 쪽에도 없었다. 팀원이 미루면
+    #   CSO 의 cys kill 폴백으로 넘어간다(사고는 아니지만 운영 낭비).
+    "CSO 운영 경고",
 ]
 RESTORE_PRIORITY_RE = re.compile(r"\[RESTORE\][^\n]{0,100}우선")
 
