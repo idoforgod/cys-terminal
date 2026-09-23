@@ -469,13 +469,21 @@ BOOT_FATAL_OUTCOMES = ("failed", "missing")
 # 제3 상태의 outcome 값(정본 = Rust `cys::GATE_PENDING_KEY`).
 BOOT_GATE_PENDING_OUTCOME = "gate_pending"
 
+# ★관문 기본 포커스 경고 — 사람용 처방 4곳(아래 기본·사유별 2종·부서장 폴백)의 **단일 문장**.
+#   0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): 2.1.261+ 는 **폴더신뢰 창도** 선택지가 `[No, exit, Yes, I trust
+#   this folder]` 이고 기본 포커스가 `No, exit` 다(cancelFirst · focus=cancel — 조사 U7 §1.4 바이너리 판독).
+#   종전 문안은 면책 창만 경고해서, 첫기동 순서(… 폴더신뢰 → 면책 …)대로 폴더신뢰 창에서 Return 을 누르면 좌석이
+#   죽었다(새 설치의 첫 마스터가 바로 이 창을 만난다). 바꾸는 것은 **문안뿐**이다 — 코퍼스(approval_patterns.
+#   trust-prompt · MEASURED_ON · default_index)는 무접촉(설계 §3 U7 금지선: 바꾸면 Return 자동확인이 다시 무장된다).
+_GATE_FOCUS_WARNING = ("★폴더신뢰(2.1.261+)·면책 창 **둘 다** 기본 포커스가 `No, exit` 이므로 그대로 "
+                       "Return 하면 노드가 종료된다(아래 방향키 1회 뒤 Return)")
+
 # 관문 보류 처방 문안(단일 출처) — launch-agent 소비부(U-11)와 **같은 사실을 같은 말로** 낸다.
-# ★면책 창 경고를 반드시 동봉한다: 실측상 기본 포커스가 `No, exit` 이라 그대로 Return 하면
+# ★기본 포커스 경고를 반드시 동봉한다: 실측상 기본 포커스가 `No, exit` 이라 그대로 Return 하면
 #   좌석이 죽는다(2026-07-29 실사고 형태 · e2e 오라클 H-FAKE-2 가 rc 1 로 박제한 그 축).
 _GATE_PENDING_PRESCRIPTION = (
     "→ 그 pane 에서 첫기동 관문(테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)을 "
-    "1회 통과시켜라. ★면책 창의 기본 포커스는 `No, exit` 이므로 그대로 Return 하면 노드가 "
-    "종료된다(아래 방향키 1회 뒤 Return). 좌석과 프로세스는 살아 있으므로 **회수·재기동·kill 은 "
+    "1회 통과시켜라. " + _GATE_FOCUS_WARNING + ". 좌석과 프로세스는 살아 있으므로 **회수·재기동·kill 은 "
     "하지 마라** — 재부트가 스폰 없이 그 좌석을 채택한다."
 )
 
@@ -499,16 +507,16 @@ _GATE_REASON_PRESCRIPTION = {
     ),
     GATE_REASON_RECHECK_UNOBSERVED: (
         "→ 관문이 아직 떠 있는지 **관측하지 못했다**(화면 읽기 실패). 먼저 `cys read-screen "
-        "--surface <ref>` 로 화면을 1회 확인하라 — 관문이 있으면 통과시키고(★면책 창의 기본 "
-        "포커스는 `No, exit` 이므로 아래 방향키 1회 뒤 Return), 없으면 재부트가 스폰 없이 그 "
+        "--surface <ref>` 로 화면을 1회 확인하라 — 관문이 있으면 통과시키고(" + _GATE_FOCUS_WARNING
+        + "), 없으면 재부트가 스폰 없이 그 "
         "좌석을 채택한다. 좌석과 프로세스는 살아 있으므로 회수·재기동·kill 은 하지 마라."
     ),
     GATE_REASON_CARRY_UNPROVEN: (
         "→ 관문 통과 여부가 **미확정**이다: 화면은 읽었고 관문 문면도 없었지만, 그 화면이 입력창"
         "(입력 상자 괘선·상태줄·어댑터 플레이스홀더)이라는 **양성 증거가 없다** — 선택지 라벨이 "
         "아직 안 그려진 관문일 수 있어 주입 0 · 키 0 으로 보류했다. ⓐ먼저 `cys read-screen "
-        "--surface <ref>` 로 화면을 1회 확인하라 — 관문이면 통과시킨다(★면책 창의 기본 포커스는 "
-        "`No, exit` 이므로 아래 방향키 1회 뒤 Return). ⓑ화면이 **정상 입력창인데도** 다음 부트가 "
+        "--surface <ref>` 로 화면을 1회 확인하라 — 관문이면 통과시킨다(" + _GATE_FOCUS_WARNING
+        + "). ⓑ화면이 **정상 입력창인데도** 다음 부트가 "
         "같은 판정을 내면 그 레이아웃은 이 축의 양성 어휘 밖이다 — 마지막 수단이 "
         "`CYS_BOOT_GATES=0 cys boot` 이다. ★그러나 이것은 **좌석 1개짜리 손잡이가 아니다**: "
         "`cys boot` 은 로스터 전체를 돌고 이 스위치는 **그 부트의 모든 좌석**에서 관문·모달 거부를 "
@@ -1935,9 +1943,8 @@ def _dept_fallback(log, claim_out):
             return log.fail(STEP.DEPT_FB_MASTER, code,
                             "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있다"
                             "(%s · 좌석은 닫지 않았다). 그 pane 에서 관문을 1회 통과시킨 뒤 재시도하라 —"
-                            " ★면책 창의 기본 포커스는 `No, exit` 이므로 그대로 Return 하면 노드가"
-                            " 종료된다(아래 방향키 1회 뒤 Return).\n%s%s"
-                            % (name, out[-800:], err[-800:]),
+                            " %s.\n%s%s"
+                            % (name, _GATE_FOCUS_WARNING, out[-800:], err[-800:]),
                             EXIT_BOOT, ok=None, state="dept_fallback_gate_pending")
         if code != 0:
             return log.fail(STEP.DEPT_FB_MASTER, code,

@@ -2748,6 +2748,15 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
     }
 }
 
+/// ★관문 기본 포커스 경고 — 사람용 처방 두 지점(주입 가드 Hold `gate_hold_message` · 부트 GatePending
+/// `print_gate_pending_prescription`)이 **같은 한 문장**으로 낸다.
+/// 0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): 2.1.261+ 는 **폴더신뢰 창도** 선택지가 `[No, exit, Yes, I trust
+/// this folder]` 이고 기본 포커스가 `No, exit` 다(cancelFirst · focus=cancel · `src/first_run_gates.rs` 코퍼스
+/// 주석 "2.1.261 폴더신뢰는 0=No, exit" 와 같은 사실). 종전 문안은 면책 창만 경고해 첫기동 순서(… 폴더신뢰 → 면책
+/// …)대로 폴더신뢰 창에서 Return 을 누르면 노드가 rc 1 로 죽었다. 바꾸는 것은 문안뿐이다 — 코퍼스
+/// (`approval_patterns.trust-prompt`·`MEASURED_ON`·`default_index`)는 무접촉(설계 §3 U7 금지선).
+const GATE_DEFAULT_FOCUS_WARNING: &str = "★폴더신뢰(2.1.261+)·면책(Bypass) 창 **둘 다** 기본 포커스가 `No, exit` 다 — 그대로 Return 하면 노드가 종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라.";
+
 /// 보류 사유 + 처방(에러 본문). 머리표로 시작한다 — 호출부의 유일한 분류 근거다.
 ///
 /// 처방에 면책 창의 기본 포커스를 **반드시** 적는다: 그 한 줄이 없으면 사람이 pane 을 보고
@@ -2775,8 +2784,7 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
         )
     } else {
         format!(
-            "사람 조치: `cys read-screen --surface {}` 로 확인 → ★면책(Bypass) 창의 기본 \
-             포커스는 `No, exit` 다(그대로 Return 하면 노드가 종료된다 — 아래 1회 뒤 Return 또는 숫자 `2`).",
+            "사람 조치: `cys read-screen --surface {}` 로 확인 → {GATE_DEFAULT_FOCUS_WARNING}",
             surface_ref(sid)
         )
     };
@@ -12826,6 +12834,8 @@ fn gate_close_override_once() -> bool {
 /// 실측(2026-08-23 · macOS Claude Code 2.1.241 · 격리 프로필 PTY 캡처)으로 확정된 사실만 적는다:
 /// 관문 순서와 **면책 창의 기본 포커스가 `No, exit`** 라는 것. 이 두 줄이 없으면 사용자는
 /// pane 을 보고 Return 을 눌러 스스로 노드를 종료시킨다(rc 1) — 처방이 곧 킬 스텝이 된다.
+/// ★0.14.41 U7(WP-C1): 2.1.261+ 는 **폴더신뢰 창도** 기본 포커스가 `No, exit` 다 — 경고 문장은
+/// `GATE_DEFAULT_FOCUS_WARNING` 하나이고 주입 가드 처방(`gate_hold_message`)과 같은 말이다.
 fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str, tail: &str) {
     // ★(0.14.31 · H-1) 코퍼스 밖 모달 보류는 처방이 다르다 — 관문 순서 안내가 아니라 "화면의 선택지를
     //   사람이 고르라" 이고, 커서가 종료 선택지 위일 수 있음을 먼저 경고한다(Return 이 곧 종료).
@@ -12842,8 +12852,7 @@ fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str
          사람이 1회 조치하면 이 좌석을 그대로 쓴다:\n\
          \x20 1) `cys read-screen --surface {}` 로 화면을 확인하라 — 첫기동 관문 순서는 \
          테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내다.\n\
-         \x20 2) ★면책(Bypass) 창의 기본 포커스는 `No, exit` 다 — 그대로 Return 하면 노드가 \
-         종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라.\n\
+         \x20 2) {GATE_DEFAULT_FOCUS_WARNING}\n\
          \x20 3) 통과한 뒤 `cys boot` 을 다시 실행하면 이 좌석이 그대로 쓰인다 — 재부트가 \
          **스폰 없이**(read_text 1회 + 판정 1회) 관문 통과를 확인하고 이 좌석에 절대지침을 \
          주입한다(M2 재관측 경로). **새 pane 을 만들지 마라**(역할은 이미 이 좌석이 쥐고 있어 \

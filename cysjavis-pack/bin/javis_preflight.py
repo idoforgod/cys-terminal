@@ -19,6 +19,7 @@ import errno
 import hashlib
 import json
 import math
+import ntpath
 import os
 import re
 import shlex
@@ -6919,7 +6920,8 @@ class Preflight:
 # 실패 방향: 전부 REFUSE(rc 2)/ERROR(rc 1) — 부분 쓰기 0 · 좌석 접촉 0. 호출자(cys-dept)는 fail-open(WARN 1줄 + 계속):
 #   거부된 시드 = 종전과 같은 상태이고 2차 방어(restore 준비 판정의 관문 보류)가 뒤에 있다.
 # 키 정책(R1 · codex): claude 가 읽는 키는 process.cwd() = getcwd() **정확 문자열 하나**(POSIX 심링크 해소 물리 경로 =
-#   realpath · Windows abspath) = claude_project_key(cwd). 꼬리 슬래시·심링크 별칭 키는 claude 가 읽지 않으므로 '이미
+#   realpath · Windows = abspath 를 Claude 표기(슬래시)로 · 0.14.41 U7) = claude_project_key(cwd). 꼬리 슬래시·심링크
+#   별칭 키는 claude 가 읽지 않으므로 '이미
 #   신뢰' 판정에도 쓰지 않고 손대지도 않는다(종전 '동일성 같은 기존 키 재사용' 은 claude 가 안 읽는 키를 true 로 만들고
 #   정확 키를 false 로 남겼다). 파일시스템 동일성(_path_identity·_same_dir)은 **레지스트리 등재 판정·프로세스 env 대조**
 #   전용. ★R5(리뷰 codex major): macOS 의 `realpath` 는 **저장된 표기**를 돌려주지 않는다(대소문자 별칭 · 유니코드 정규화
@@ -7091,8 +7093,22 @@ def _same_path_shape(a, b):
     return True
 
 
+def claude_key_nt(cwd):
+    """★0.14.41 U7(WP-C1): Windows 에서 claude 가 `.claude.json` projects 에 쓰고 **읽는** 키 — 순수 함수(ntpath 의미론 ·
+    전 플랫폼에서 같은 답 · 진리표 검체가 맥에서도 잰다).
+    Claude Code 2.1.280 의 키 함수 `V$` 는 `path.normalize(cwd)` 뒤 `\\`→`/` 로 바꾼 **슬래시 표기**다(바이너리 판독
+    @171064536 · 조사 U7 §3). 프로젝트 항목 접근 20곳이 전부 이 키만 읽고 역슬래시 폴백·키 이주는 없다(반박 §1-7).
+    종전 cys 는 `os.path.abspath`(역슬래시 `C:\\Users\\x`)를 키로 써서 ⓐ 사전 등록이 claude 에게 inert 였고
+    ⓑ 사람이 한 번 수락해 claude 가 슬래시 키를 써도 already-trusted·C58 갭 판정이 역슬래시 키만 봐 영구 갭이었다.
+    규칙: `ntpath.abspath`(= Windows 의 os.path.abspath · GetFullPathNameW 정규화 — `..`·`.`·꼬리 구분자 정리) 뒤 `\\`→`/`.
+    드라이브 문자 대소문자는 **보존**한다(normalize 도 바꾸지 않는다 · 실 `process.cwd()` 의 드라이브 표기는 윈도우 실기
+    미측정 [가설]). UNC `\\\\srv\\share` 는 `//srv/share`(normalize 뒤 치환과 같은 결과)."""
+    return ntpath.abspath(cwd).replace("\\", "/")
+
+
 def claude_project_key(cwd):
-    """claude 가 .claude.json projects 에 쓰는 정확한 키 — getcwd() 규약: POSIX realpath · Windows abspath.
+    """claude 가 .claude.json projects 에 쓰는 정확한 키 — getcwd() 규약: POSIX realpath · Windows = abspath 의 Claude 표기
+    (슬래시 · `claude_key_nt` · 0.14.41 U7 — 종전 역슬래시 키는 claude 가 읽지 않았다).
     ★R5(리뷰 codex major D1): macOS 에서 `realpath` 는 **저장된 표기**를 돌려주지 않는다(대소문자 별칭·유니코드 정규화 차)
     — 그런 cwd 로 좌석을 띄우면 자식의 `getcwd()`(= claude 가 쓰는 키)는 저장 표기라서 우리가 박은 키를 **claude 가 읽지
     않았다**(기능이 조용히 inert · 관문이 다시 뜬다). darwin 은 `F_GETPATH` 오라클로 표기를 되살리되, **구조가 같을 때만**
@@ -7102,7 +7118,7 @@ def claude_project_key(cwd):
     전용 open 이 EACCES 라 오라클을 못 얻는다 → 그 별칭에서는 종전 표기로 시드한다(claude 가 안 읽는 키 = 관문이 다시
     뜬다 = **거부 방향**이지 좌석 사망이 아니다). 그런 워크스페이스에서는 claude 자신도 파일을 못 읽는다."""
     if os.name == "nt":
-        return os.path.abspath(cwd)
+        return claude_key_nt(cwd)
     physical = os.path.realpath(cwd)
     got = _fgetpath(physical)
     if not got or not os.path.isabs(got) or got == physical or not _same_path_shape(got, physical):
@@ -7161,11 +7177,26 @@ def _try_lock_nb(f):
         return None
 
 
-def trust_plan(data, cwd_key):
+def _trust_key_aliases(cwd_key, os_name=None):
+    """★0.14.41 U7(WP-C1): 시드가 주 키(Claude 표기) **옆에 덧붙이는** 구 표기 키 목록 — 순수.
+    Windows(nt) 만 역슬래시 표기 1개(구 cys 가 심던 표기 · 구 판 도구·검사와의 호환 · 설계 §3 U7 '두 표기 등록').
+    맥·리눅스는 빈 목록(바이트 동일). claude 는 모르는 키를 무시하므로 덧붙이기는 회귀 방향이 없다."""
+    if (os_name or os.name) != "nt" or not isinstance(cwd_key, str) or "/" not in cwd_key:
+        return []
+    alt = cwd_key.replace("/", "\\")
+    return [alt] if alt != cwd_key else []
+
+
+def trust_plan(data, cwd_key, os_name=None):
     """순수 계획 — (new_data, changed, used_key). projects[cwd_key].hasTrustDialogAccepted=True **정확 키 하나만** 건드린다
     (온보딩 플래그·다른 항목·별칭 키 무접촉 · 깊은 복사 후 변경). `projects` 키 부재면 생성 · 항목 부재면 생성. 이미 정확 키가
     dict 이고 True 면 changed=False. 비-dict 최상위 / **존재하는** 비-object projects(명시 null 포함) / 존재하는 비-object 항목
-    (명시 null 포함) → ValueError(호출자 ERROR · 무쓰기). 부재 파일은 호출자가 {} 를 넘긴다(None 은 '있는 비-object')."""
+    (명시 null 포함) → ValueError(호출자 ERROR · 무쓰기). 부재 파일은 호출자가 {} 를 넘긴다(None 은 '있는 비-object').
+    ★0.14.41 U7(WP-C1): '이미 신뢰' 판정과 쓰기의 주 키는 언제나 cwd_key(= Claude 가 읽는 표기)다. 쓰기가 일어날 때만
+    Windows 구 표기 별칭(`_trust_key_aliases` · 역슬래시)을 **부재일 때만** 함께 심는다 — 이미 있는 별칭 항목은 값·형상
+    무관하게 무접촉(덧붙이기만 · 설계 §3 U7). 주 키가 이미 true 면 별칭이 없어도 쓰지 않는다(무쓰기 불변). 별칭은
+    이 함수 한 곳에서만 정해지므로 잔재·교환 증명(`_planned_payload_bytes`)의 재계획도 같은 바이트를 만든다.
+    맥·리눅스는 별칭 0 = 종전과 바이트 동일."""
     if not isinstance(data, dict):
         raise ValueError("최상위 비-object")
     new = json.loads(json.dumps(data))
@@ -7184,6 +7215,9 @@ def trust_plan(data, cwd_key):
     if ent.get("hasTrustDialogAccepted") is True:
         return new, False, cwd_key
     ent["hasTrustDialogAccepted"] = True
+    for alt in _trust_key_aliases(cwd_key, os_name):
+        if alt not in projs:
+            projs[alt] = {"hasTrustDialogAccepted": True}
     return new, True, cwd_key
 
 

@@ -5125,12 +5125,14 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
     //   주입하는데, 관문 창에 붙여넣는 순간 그 Return 이 실측상 면책 창의 `No, exit` 을 눌러
     //   마스터를 종료시킨다. 좌석은 이미 보존됐으니(닫지 않았다) 사람이 그 pane 에서 관문을
     //   통과시키면 그대로 쓴다 — 사용자에게는 그 처방만 올린다.
+    //   ★0.14.41 U7(WP-C1 · 반박 M1): 2.1.261+ 는 폴더신뢰 창도 기본 선택이 `No, exit` 다 — 처방이 두 창을
+    //   함께 경고한다(문안만 · 코퍼스·자동확인 무접촉 · 핀 = tests::u7_gate_pending_prescriptions_…).
     if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
         return Err(format!(
             "마스터 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
              닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — 순서는 \
-             테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★면책 창의 기본 \
-             선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★폴더신뢰(2.1.261+)·면책 \
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -5584,8 +5586,8 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
     if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
         return Err(format!(
             "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
-             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★면책 창의 \
-             기본 선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★폴더신뢰(2.1.261+)·면책 \
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
