@@ -118,6 +118,16 @@ import {
   formatAlarmTime,
   type AlarmRecord,
 } from "./toastttl";
+import {
+  permWarningToast,
+  cwdBlockedNotices,
+  collectCwdBlocked,
+  loginItemsGuide,
+  isMacFolderPermissionError,
+  FT_BLOCKED_TEXT,
+  type CwdBlockedEntry,
+  type PrivacyTarget,
+} from "./folderaccess";
 
 declare global {
   interface Window {
@@ -2083,10 +2093,13 @@ function releaseFlightWhenSettled(key: string, p: Promise<unknown>): void {
   const done = () => void inFlight.delete(key);
   void p.then(done, done); // then(onOk, onErr) — 파생 promise 의 미처리 거부를 만들지 않는다
 }
+// ★(0.14.41 · U18) 좌석 작업 폴더 막힘 — 이미 알린 좌석(scope|role|path). 판정·문구는 folderaccess.ts.
+let cwdBlockedSeen: ReadonlySet<string> = new Set<string>();
 async function refreshPaneTitles() {
   if (!started || refreshing) return; // 겹친 호출의 이중 입양 방지
   refreshing = true;
   let adoptedWs = false; // 이번 틱에서 워크스페이스/트리를 고쳤는가(render 필요 판정)
+  const blockedTick: CwdBlockedEntry[] = []; // 이번 틱에 모든 소켓에서 모은 cwd_blocked
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
     // ★최후 방어선: 탭이 **하나도** 없으면(= 화면 전체 백지) 본부 탭을 즉시 되살린다.
@@ -2115,8 +2128,10 @@ async function refreshPaneTitles() {
             live_cwd: string | null;
             exited: boolean;
             usage?: ObservedUsage | null;
+            cwd_blocked?: unknown;
           }[];
         };
+        blockedTick.push(...collectCwdBlocked(r.surfaces, sk ?? ""));
         // ★유령 pane 수렴 — 판정은 wsreconcile.advanceGhostStrikes(순수·유닛 테스트가 고정),
         // 여기는 배선이다. 데몬이 **기록 자체를 모르는** sid 만, **2연속 관측**일 때만 친다.
         // 빈 목록(데몬이 성공적으로 0개를 돌려줌)이면 그 함수가 집행을 보류한다 — cysd 는 소켓
@@ -2181,6 +2196,15 @@ async function refreshPaneTitles() {
     /* 데몬 일시 미응답은 다음 틱에 */
   } finally {
     refreshing = false;
+  }
+  // ★(0.14.41 · U18) 폴더별 고정 토스트 — 새 좌석이 있을 때만 띄운다(3초마다 같은 id 재표시 금지 ·
+  //   TTL 무한 연장 금지). 순수 판정이라 throw 가 없지만, 표시 실패가 루프를 멈추지 않게 가둔다.
+  try {
+    const step = cwdBlockedNotices(cwdBlockedSeen, blockedTick);
+    cwdBlockedSeen = step.seen;
+    for (const n of step.notices) stickyToast(n.id, "health", n.title, n.detail, () => openPrivacySettings(n.target));
+  } catch {
+    /* 안내 실패는 무음 — 다음 새 좌석에서 다시 시도한다 */
   }
   updateFtRoot(); // cd 추적 — 파일 트리 루트도 따라간다
 }
@@ -4837,7 +4861,19 @@ async function buildDirNodes(dir: string, depth: number): Promise<DocumentFragme
   let entries: { name: string; is_dir: boolean }[] = [];
   try {
     entries = (await invoke("list_dir", { path: dir })) as { name: string; is_dir: boolean }[];
-  } catch {
+  } catch (e) {
+    // ★(0.14.41 · U18) macOS 폴더 접근 권한으로 막힌 폴더를 **빈 폴더처럼** 보이지 않게 한다(조용한
+    //   실패 — 조사 U14 A5 · 반박 U18 M-3). 표시 전용 한 줄이고 누르면 「파일 및 폴더」를 연다.
+    //   다른 오류(부재·EACCES·Windows)는 종전대로 빈 목록이다.
+    if (IS_MACOS && isMacFolderPermissionError(e)) {
+      const row = document.createElement("div");
+      row.className = "ft-row ft-blocked";
+      row.style.paddingLeft = `${8 + depth * 14 + 14}px`;
+      row.textContent = FT_BLOCKED_TEXT;
+      row.title = dir;
+      row.addEventListener("click", () => openPrivacySettings("files"));
+      frag.appendChild(row);
+    }
     return frag;
   }
   for (const ent of entries) {
@@ -7129,7 +7165,11 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
 // TTL이 최후 방어선으로 화면을 정리한다(구 구현은 타이머가 없어 영구 잔존했다).
 const stickyToasts = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
 
-function stickyToast(id: string, category: string, name: string, detail: string) {
+/// `onClick`(선택) — 본문을 눌렀을 때의 동작. ★(0.14.41 · U14) **대입**(`el.onclick =`)으로 건다:
+/// 같은 id 는 요소를 재사용하므로 addEventListener 로 붙이면 다시 띄울 때마다 처리기가 쌓여
+/// 한 번 클릭에 동작이 n번 나간다(반박 M6). 대입은 매번 **교체**이고, onClick 없이 다시 띄우면 걷힌다.
+/// 닫기(×)는 제외한다(toast 와 같은 규칙 — 닫기 버튼은 자체 stopPropagation 도 한다).
+function stickyToast(id: string, category: string, name: string, detail: string, onClick?: () => void) {
   recordAlarm(category, name, detail, id);
   const box = document.getElementById("toasts")!;
   const prev = stickyToasts.get(id);
@@ -7148,6 +7188,13 @@ function stickyToast(id: string, category: string, name: string, detail: string)
   el.className = toastClassName(category);
   (el.querySelector(".toast-name") as HTMLElement).textContent = name;
   (el.querySelector(".toast-detail") as HTMLElement).textContent = detail;
+  el.style.cursor = onClick ? "pointer" : "";
+  el.onclick = onClick
+    ? (e: MouseEvent) => {
+        if ((e.target as HTMLElement | null)?.closest?.(".toast-x")) return; // 닫기(×)는 제외
+        onClick();
+      }
+    : null;
   const timer = setTimeout(() => {
     dismissToast(id);
     // 고위험 실패(purge-fail-* 등)는 조용히 사라지지 않는다 — OS 배너로 1회 보강(D2b 계승).
@@ -7157,6 +7204,12 @@ function stickyToast(id: string, category: string, name: string, detail: string)
     }
   }, plan.ttlMs);
   stickyToasts.set(id, { el, timer });
+}
+
+/// ★(0.14.41 · U14) 시스템 설정의 해당 화면 열기 — target 은 고정 목록(Rust 쪽 고정 URL 표와 짝).
+/// 실패(비-macOS·구 백엔드)는 조용히 무시한다 — 안내 문구는 이미 화면에 있다.
+function openPrivacySettings(target: PrivacyTarget): void {
+  void invoke("open_privacy_settings", { target }).catch(() => {});
 }
 
 function dismissToast(id: string) {
@@ -7439,12 +7492,14 @@ async function start() {
     });
     // ★신선 머신 부트 수리 짝(오너 2026-07-15): 백엔드 재시도 4회째 발화 — 상단바 텍스트는
     // 초보자가 놓치므로 sticky 토스트로 로그인 항목 승인 안내(데몬이 뜨면 daemon-ready가 진행).
+    // ★(0.14.41 · U14) 목록에 실제로 보이는 두 줄(「cys」·개발자 이름)을 말하고, 누르면 그 화면을 연다(맥).
     listen("daemon-retry-hint", () => {
       stickyToast(
         "daemon-hint",
         "health",
         "데몬 시작 대기 중",
-        "백그라운드 서비스(cysd) 시작을 기다리고 있습니다. 계속 이 상태면: 시스템 설정 → 일반 → 로그인 항목에서 cys 관련 항목을 허용해 주세요. 허용 즉시 자동으로 연결됩니다.",
+        loginItemsGuide(IS_MACOS),
+        IS_MACOS ? () => openPrivacySettings("login") : undefined,
       );
     });
     listen("daemon-ready", () => dismissToast("daemon-hint"));
@@ -7629,16 +7684,30 @@ async function start() {
   // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
   // ★TCC 처방(오너 2026-07-15): macOS 폴더 권한 거부 감지 → 안내(EPERM 실사고 — CLI 자식은
   // 팝업 없이 조용히 거부되므로 GUI가 유일한 안내 주체다).
-  await listen("perm-warning", (e) => {
-    const p = (e.payload ?? {}) as { folder?: string };
-    const f = p.folder === "Documents" ? "문서" : "데스크탑";
-    stickyToast(
-      `perm-${p.folder ?? "folder"}`,
-      "health",
-      `⚠ macOS ${f} 폴더 접근 차단`,
-      `pane 안의 claude 등이 EPERM으로 꺼질 수 있습니다 — 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더(또는 전체 디스크 접근 권한)에서 cys를 허용한 뒤 앱을 재시작하세요.`,
-    );
-  });
+  // ★(0.14.41 · U14) 문구는 SOT(folderaccess.ts) — 두 문장(무엇이 막혔나 + 누르면 설정 열림).
+  //   백엔드는 **쌓고 나서** emit 한다(PERM_WARNINGS). 평소 재시작에서는 백엔드 점검이 이 listen 보다
+  //   먼저 끝나 emit 이 유실됐다(emit-before-listen · 반박 §1-2) — 그래서 listen 직후 한 번 당긴다.
+  //   ★당김은 **await 하지 않는다**: 이 아래로 리스너 등록이 줄줄이 이어진다. 여기서 멈추거나 던지면
+  //   그 뒤 화면 기능이 끊긴다(④). 같은 폴더 = 같은 토스트 id 라 emit·pull 이 겹쳐도 한 장이다.
+  // ★(리뷰1 m7) emit(백엔드 push)과 pull(perm_warnings 당김)이 같은 경고를 둘 다 전할 수 있다
+  //   (listen 이 emit 보다 먼저 붙은 기동). 같은 id 는 토스트 한 장이지만 stickyToast 는 호출마다
+  //   recordAlarm 을 부르므로 그대로 두면 알람 탭에 같은 경고가 2건 쌓인다 — 이번 기동에 이미
+  //   보인 폴더는 다시 recordAlarm/stickyToast 하지 않는다(폴더가 다시 막히는 다음 기동에는 재알림).
+  const permWarningShown = new Set<string>();
+  const showPermWarning = (payload: unknown): void => {
+    const t = permWarningToast(((payload ?? {}) as { folder?: unknown }).folder);
+    if (!t || permWarningShown.has(t.id)) return;
+    permWarningShown.add(t.id);
+    stickyToast(t.id, "health", t.title, t.detail, () => openPrivacySettings(t.target));
+  };
+  await listen("perm-warning", (e) => showPermWarning(e.payload));
+  void invoke("perm_warnings")
+    .then((list) => {
+      if (Array.isArray(list)) list.forEach((w) => showPermWarning(w));
+    })
+    .catch(() => {
+      /* 커맨드 부재(구 백엔드)·비-macOS — 안내 없음 · 부팅 무영향 */
+    });
   // 완전 초기화 진행 이벤트 — sticky toast 본문을 단계 상세로 갱신(결과는 invoke 반환이 정본).
   await listen("reset-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; detail?: string };

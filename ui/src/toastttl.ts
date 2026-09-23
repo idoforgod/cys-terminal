@@ -25,6 +25,17 @@ export const STICKY_TTL_MS = 60_000;
  */
 export const PROGRESS_TTL_MS = 180_000;
 
+/**
+ * ★(0.14.41 · U14) 폴더 접근 안내(sticky id 접두 `perm-`) 수명 — 10분.
+ *
+ * 왜 필요한가: 이 안내는 사람이 시스템 설정의 여러 단계를 따라가는 동안 **보고 있어야 하는** 것이다.
+ * 60초면 설정 화면을 여는 사이에 사라졌다(phase1 U14 반박 M4). 여전히 유한하다(오너 요구 =
+ * 종류 불문 소멸 — 무한 불변식 테스트가 이 id 도 함께 잰다). 접두는 folderaccess.ts 의
+ * PERM_TOAST_PREFIX 와 같다(모듈 결합을 피하려 값만 같게 둔다 — 테스트가 두 값을 함께 잰다).
+ */
+export const GUIDE_TTL_MS = 600_000;
+const GUIDE_STICKY_PREFIX = "perm-";
+
 /** 알람 이력 링버퍼 보관 건수. */
 export const ALARM_HISTORY_CAP = 200;
 
@@ -51,6 +62,7 @@ export type ToastKind = "volatile" | "sticky";
 export function toastTtl(kind: ToastKind, id?: string): { ttlMs: number } {
   if (kind === "volatile") return { ttlMs: VOLATILE_TTL_MS };
   if (id && (PROGRESS_STICKY_IDS as readonly string[]).includes(id)) return { ttlMs: PROGRESS_TTL_MS };
+  if (id && id.startsWith(GUIDE_STICKY_PREFIX)) return { ttlMs: GUIDE_TTL_MS };
   return { ttlMs: STICKY_TTL_MS };
 }
 

@@ -4197,6 +4197,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // "관문에 안 갇혔음" 이 아니다 — 소비자는 null 에서 이 항을 통째로 생략한다.
                         // 이 단위에는 writer 가 없어 실제 값은 항상 null 이다(생산은 U-11/U-13).
                         (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
+                        // ★(0.14.41 · U18) 작업 폴더 읽기 막힘 — org.status 와 **같은 키·같은 의미**
+                        // (동형성 핀). object = 생성 시 EPERM 관측 · null = 막힘 아님 또는 관측 안 함.
+                        // GUI 3초 루프가 당겨 폴더별 고정 토스트를 띄운다(이벤트 없음 · pull 전용).
+                        "cwd_blocked": s.cwd_blocked.as_ref().map(|b| b.to_wire()),
                         // ★(W2 · B4) 단조 라인 커서 — launch-agent 가 기동 send **직전** 스냅샷을 떠
                         // readiness/실패/주입검증 매칭을 '커서 이후 신규 출현분'으로 한정한다(잔존 ❯
                         // 오탐 차단). org.status 가 이미 같은 키를 노출하며, 여기 추가는 순수 additive.
@@ -7307,6 +7311,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // 팩 부트 체인(javis_boot_node.cys_status → `cys status --json`)이 소비하는
                         // 정본 status 채널이라, 이 키가 여기 빠지면 python 미러가 축을 영영 못 본다.
                         (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
+                        // ★(0.14.41 · U18) 작업 폴더 읽기 막힘 — surface.list 와 **같은 키·같은 의미**(동형성 핀).
+                        "cwd_blocked": s.cwd_blocked.as_ref().map(|b| b.to_wire()),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),
@@ -18238,6 +18244,15 @@ mod tests {
                     "{method}: 관측 축 {axis_key} 의 대조군 값이 다르다(동형성 붕괴): {bare_e}"
                 );
             }
+            // ★(0.14.41 · U18) `cwd_blocked` 는 생성 시 1회 관측이라 여기서 값을 심을 수 없다 —
+            //   **키의 존재**를 양쪽에서 잰다(값 동형성은 맥 실측 검체
+            //   `u18_cwd_blocked_observed_under_sandbox_read_deny` 가 두 메서드 모두에서 잰다).
+            for (sid_e, tag) in [(surface_entry(&resp, key, live), "live"), (bare_e, "bare")] {
+                assert!(
+                    sid_e.as_object().map(|o| o.contains_key("cwd_blocked")).unwrap_or(false),
+                    "{method}: {tag} 항목에 cwd_blocked 키가 없다(동형성 붕괴): {sid_e}"
+                );
+            }
         }
     }
 
@@ -22968,6 +22983,170 @@ mod tests {
         match prev_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
+        }
+    }
+
+
+    // ── ★(0.14.41 · U18) 읽기 거부 작업 폴더 관측 — 실측 검체(맥 전용) ─────────────────────
+    //
+    // 【무엇을 재나】 macOS 가 폴더 접근 권한(TCC)으로 막은 폴더는 **stat·chdir 은 통과하고
+    //   목록·열기만 EPERM** 이다(착수 실험 · 반박 보고서 R1). 그래서 좌석 셸은 그 폴더 안에서
+    //   뜨고 아무도 원인을 모른다. 이 검체는 그 조건을 `sandbox-exec (deny file-read-data)` 로
+    //   **데몬 프로세스째** 재현한다 — 바깥 테스트가 이 테스트 바이너리 자신을 샌드박스 안에서
+    //   다시 띄워 안쪽 검체 하나만 돌린다(TCC 는 테스트에서 조작할 수 없다 · tccutil 금지).
+    // 【계약】 ①역할 좌석 + 막힌 폴더 → surface.list/org.status 의 `cwd_blocked` 가 object
+    //   (path = 요청 폴더) · 좌석 env `CYS_CWD_BLOCKED` = 그 폴더 ②스폰 동작 불변(셸은 요청
+    //   폴더에서 뜨고 `cwd` 도 요청값) ③읽히는 폴더 → null · env 없음 ④역할 없는 일반 pane →
+    //   null · env 없음(사람이 연 셸은 관측 대상이 아니다).
+    // 【리뷰1 m2】 이 데몬 프로세스 자신에게도 밖에서 `CYS_CWD_BLOCKED=/bogus/inherited` 를
+    //   물려준다(막힌 좌석 안에서 뜬 부서 데몬을 흉내) — ③④ 의 기존 `U18ENV=[]` 단언이
+    //   `create_surface_with_env` 의 `env_remove(ENV_CWD_BLOCKED)` 가드를 실제로 잰다.
+    // 【측정 불능은 통과가 아니다】 sandbox-exec 부재·안쪽 검체 미실행(0 passed)은 실패다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn u18_cwd_blocked_observed_under_sandbox_read_deny() {
+        let sbx = std::path::Path::new("/usr/bin/sandbox-exec");
+        assert!(sbx.exists(), "측정 불능: macOS 에 /usr/bin/sandbox-exec 가 없다(통과로 접지 않는다)");
+        let root = std::env::temp_dir().join(format!(
+            "cys-u18-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch().to_bits()
+        ));
+        std::fs::create_dir_all(root.join("blocked")).unwrap();
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::write(root.join("blocked/f.txt"), "x").unwrap();
+        std::fs::write(root.join("open/f.txt"), "x").unwrap();
+        // 샌드박스 규칙은 실경로로 비교한다(/var → /private/var).
+        let root = std::fs::canonicalize(&root).unwrap();
+        let blocked = root.join("blocked").to_string_lossy().into_owned();
+        let open = root.join("open").to_string_lossy().into_owned();
+        let profile = format!(
+            "(version 1)(allow default)(deny file-read-data (subpath \"{blocked}\"))\
+             (deny file-write* (subpath \"{blocked}\"))"
+        );
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(sbx)
+            .arg("-p")
+            .arg(&profile)
+            .arg(&exe)
+            .args([
+                "--exact",
+                "handlers::tests::u18_inner_sandboxed_cwd_probe",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CYS_U18_BLOCKED", &blocked)
+            .env("CYS_U18_OPEN", &open)
+            // ★리뷰1 m2: 밖에서 물려주는 **가짜 상속 값** — 막힌 좌석 안에서 뜬 부서 데몬이라면
+            //   이 env 를 이미 물려받았을 수 있다. `create_surface_with_env` 의
+            //   `env_remove(ENV_CWD_BLOCKED)` 가드가 없으면 읽히는(open)·일반(plain) 좌석까지
+            //   이 거짓 값을 그대로 물려받아 "U18ENV=[/bogus/inherited]" 가 된다(거짓 고지).
+            //   가드가 있으면 아래 open/plain 의 기존 `U18ENV=[]` 단언이 그대로 지킨다.
+            .env(crate::cwd_probe::ENV_CWD_BLOCKED, "/bogus/inherited")
+            .env_remove("CYS_CWD_PROBE")
+            .env_remove(cys::ENV_BOOT_GATES)
+            .output()
+            .expect("sandbox-exec 실행");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            out.status.success() && text.contains("1 passed"),
+            "샌드박스 안쪽 검체 실패 또는 미실행(측정 불능 = 실패):\n{text}"
+        );
+    }
+
+    /// 바깥 검체가 sandbox-exec 안에서만 부른다(직접 실행하면 경로 env 가 없어 실패한다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "u18_cwd_blocked_observed_under_sandbox_read_deny 가 sandbox-exec 안에서 부른다"]
+    fn u18_inner_sandboxed_cwd_probe() {
+        let blocked = std::env::var("CYS_U18_BLOCKED").expect("바깥 검체가 넘기는 막힌 폴더");
+        let open = std::env::var("CYS_U18_OPEN").expect("바깥 검체가 넘기는 열린 폴더");
+        // 전제 확인(계측 타당성): 이 프로세스에서 막힌 폴더는 stat 은 되고 목록은 EPERM 이어야 한다.
+        assert!(std::path::Path::new(&blocked).is_dir(), "계측 무효: 막힌 폴더 stat 이 실패한다");
+        let rd = std::fs::read_dir(&blocked).map(|_| ());
+        assert_eq!(
+            rd.as_ref().err().and_then(|e| e.raw_os_error()),
+            Some(1),
+            "계측 무효: 샌드박스가 read_dir 을 EPERM 으로 막지 않았다: {rd:?}"
+        );
+        assert!(std::fs::read_dir(&open).is_ok(), "계측 무효: 열린 폴더도 읽히지 않는다");
+
+        let daemon = isolated_daemon();
+        let cmd = "printf 'U18ENV=[%s] U18PWD=[%s]\\n' \"$CYS_CWD_BLOCKED\" \"$PWD\"; sleep 20";
+        let mk = |cwd: &str, role: Option<&str>| -> u64 {
+            let mut params = json!({"cmd": cmd, "cwd": cwd, "cols": 400, "rows": 10});
+            if let Some(r) = role {
+                params["role"] = json!(r);
+            }
+            let req = Request { id: json!(1), method: "surface.create".into(), params };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else { panic!("single") };
+            assert_eq!(resp["ok"], json!(true), "surface.create 실패: {resp}");
+            resp["result"]["surface_id"].as_u64().unwrap()
+        };
+        let seat_blocked = mk(&blocked, Some("worker"));
+        let seat_open = mk(&open, Some("cso"));
+        let plain_blocked = mk(&blocked, None);
+
+        // 좌석 출력(자식 env·실제 cwd)을 기다린다.
+        let screen = |sid: u64| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let s = daemon.get_surface(sid).expect("surface");
+                let txt = s.parser.lock().unwrap().screen().contents();
+                if txt.contains("U18PWD=[") || std::time::Instant::now() > deadline {
+                    return txt.replace('\n', "");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+        let out_blocked = screen(seat_blocked);
+        let out_open = screen(seat_open);
+        let out_plain = screen(plain_blocked);
+
+        // ② 스폰 동작 불변 — 셸은 요청 폴더에서 떴다(홈 대체 없음).
+        assert!(
+            out_blocked.contains(&format!("U18PWD=[{blocked}]")),
+            "스폰 cwd 가 바뀌었다(동작 불변 위반): {out_blocked}"
+        );
+        assert!(out_plain.contains(&format!("U18PWD=[{blocked}]")), "{out_plain}");
+        // ① 역할 좌석에는 막힌 폴더가 env 로 실린다.
+        assert!(
+            out_blocked.contains(&format!("U18ENV=[{blocked}]")),
+            "막힌 폴더의 역할 좌석 env 에 CYS_CWD_BLOCKED 가 없다: {out_blocked}"
+        );
+        // ③④ 읽히는 폴더·일반 pane 에는 env 가 없다.
+        assert!(out_open.contains("U18ENV=[]"), "읽히는 폴더 좌석에 env 가 실렸다: {out_open}");
+        assert!(out_plain.contains("U18ENV=[]"), "일반 pane 에 env 가 실렸다: {out_plain}");
+
+        for method in ["surface.list", "org.status"] {
+            let req = Request { id: json!(1), method: method.into(), params: json!({}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else { panic!("single") };
+            let entry = |sid: u64| -> Value {
+                resp["result"]["surfaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["surface_id"].as_u64() == Some(sid))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{method}: sid {sid} 없음"))
+            };
+            let b = entry(seat_blocked);
+            assert!(
+                b["cwd_blocked"].is_object(),
+                "{method}: 막힌 폴더 역할 좌석의 cwd_blocked 가 object 가 아니다: {b}"
+            );
+            assert_eq!(b["cwd_blocked"]["path"], json!(blocked), "{method}: {b}");
+            if method == "surface.list" {
+                assert_eq!(b["cwd"], json!(blocked), "cwd 는 요청값 그대로(동작 불변): {b}");
+            }
+            assert!(entry(seat_open)["cwd_blocked"].is_null(), "{method}: 읽히는 폴더가 막힘으로 기록됐다");
+            assert!(entry(plain_blocked)["cwd_blocked"].is_null(), "{method}: 일반 pane 이 관측됐다");
         }
     }
 

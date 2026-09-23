@@ -1394,6 +1394,14 @@ pub struct Surface {
     /// 정의상 프로세스가 살아 있어 그 게이트를 통과할 수 없고(=파괴 대상이 될 수 없고),
     /// 반대로 여기에 새 hold 항을 더하면 stale 보류가 reclaim 을 영구 마비시킨다.
     pub gate_pending: Mutex<Option<GatePending>>,
+    /// ★(0.14.41 · U18) 이 좌석이 생성될 때 작업 폴더 목록 읽기가 **EPERM**(macOS 폴더 접근 권한)
+    /// 이었는가. `None` = 막힘 아님 **또는 관측 안 함**(비-mac · 역할 없는 pane · 시한 초과 · 롤백
+    /// 스위치) — '모름'과 '안 막힘'을 가르지 않는다(소비자는 알림 여부만 정한다).
+    /// 단일 write path = `create_surface_with_env` 의 관측 1회(생성 후 불변 · 영속·하이드레이션 없음 —
+    /// 재기동하면 다시 잰다). 소비 = `surface.list`·`org.status` **양쪽 동일 키** `cwd_blocked`
+    /// (동형성 핀) → GUI 폴더별 고정 토스트. **스폰 동작은 이 값과 무관하다**(cwd 대체 없음).
+    /// 판정·상한·롤백 규약은 `cwd_probe.rs` 머리말이 정본이다.
+    pub cwd_blocked: Option<crate::cwd_probe::CwdBlocked>,
 }
 
 /// ★(U-10) 관문 보류 좌석의 근거. `surface.list`·`org.status`·`topology.json` 에 **object**
@@ -4597,6 +4605,30 @@ impl Daemon {
         for (k, v) in env {
             builder.env(k, v);
         }
+        // ★(0.14.41 · U18) 작업 폴더 읽기 관측 — **맥 한정 · 역할 좌석만 · 스폰 동작 불변**.
+        // · 자리: 호출자 env 오버레이 **뒤**(호출자·상속 env 가 이 키를 위조·잔존시키지 못하게 먼저
+        //   걷는다 — 부서 데몬이 막힌 좌석 안에서 떴다면 그 env 를 물려받았을 수 있다), 스폰 **앞**
+        //   (env 는 스폰 전에만 실린다). 이 함수의 유일한 프로덕션 호출부(handlers surface.create)는
+        //   락 미보유 구간이고 spawn_blocking 위다 — 최대 `CWD_PROBE_TIMEOUT` 기다려도 데몬은 멈추지 않는다.
+        // · 결과는 사실 기록 + env 1쌍뿐이다. 시한 초과·패닉·스레드 실패는 None(= 종전과 동일).
+        // · 비-mac 은 이 블록 전체가 상수 거짓 분기다(IO 0 · env 조작 0 — Windows 스폰 경로 무변경).
+        let cwd_blocked = if cfg!(target_os = "macos") {
+            builder.env_remove(crate::cwd_probe::ENV_CWD_BLOCKED);
+            let observed = crate::cwd_probe::observe(role.as_deref(), &cwd_str);
+            if let Some(b) = &observed {
+                builder.env(crate::cwd_probe::ENV_CWD_BLOCKED, &b.path);
+                eprintln!(
+                    "cysd: 좌석 작업 폴더 읽기 막힘(role={} · {}) — EPERM(macOS 폴더 접근 권한) · \
+                     스폰은 그대로 · 좌석 env {} 와 surface.list cwd_blocked 로 알린다",
+                    role.as_deref().unwrap_or("-"),
+                    b.path,
+                    crate::cwd_probe::ENV_CWD_BLOCKED
+                );
+            }
+            observed
+        } else {
+            None
+        };
         // ★(P1) 좌석 토큰 주입 — 데몬 발급 비밀을 pane PTY env 로만 배달한다(§Surface.seat_token).
         // · 주입 위치 계약: **호출자 지정 env 오버레이 이후**(바로 위 루프 다음) — surface.create
         //   arm 이 호출자 env 의 CYS_SEAT_TOKEN 키를 제거하지만(이중 방어 1층 — handlers.rs),
@@ -4782,6 +4814,8 @@ impl Daemon {
             // ★(U-10) 관문 보류는 항상 None 으로 시작한다 — 생성 시점엔 관문 관측 자체가 없다.
             //   restore 하이드레이션도 하지 않는다(필드 doc 의 A1 라이브락 사유).
             gate_pending: Mutex::new(None),
+            // ★(0.14.41 · U18) 생성 시 관측 1회의 결과(불변) — 위 관측 블록 참조.
+            cwd_blocked,
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.

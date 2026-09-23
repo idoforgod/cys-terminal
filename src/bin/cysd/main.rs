@@ -17,6 +17,7 @@ mod caps;
 mod channels;
 mod classifier;
 mod cost;
+mod cwd_probe;
 mod deadman;
 mod delivery;
 mod events;

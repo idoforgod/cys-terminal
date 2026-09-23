@@ -483,6 +483,8 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .ft-row:hover { background: #21262d; }
 .ft-row.dir { color: #79b8ff; }
+/* ★(0.14.41 · U18) macOS 폴더 접근 권한으로 막힌 폴더 — 빈 폴더처럼 보이지 않게 경고색 한 줄(표시 전용) */
+.ft-row.ft-blocked { color: #d29922; white-space: normal; }
 /* 승인 Feed — Control Center 탭으로 편입(독립 패널 폐기) */
 #cc-feed-items { display: flex; flex-direction: column; gap: 8px; }
 .feed-item {
