@@ -259,6 +259,11 @@ describe("보류 기한 — 데몬이 젊을 때만 · 기한 뒤엔 화면에�
     expect(plan?.boundHole).toBe(-3);
     close(W(plan!.tree, 9), MASTER_FRAC);
   });
+  it("nodeShown 은 **음수 숫자 sid 만** 숨길 수 있다 — 그 밖의 모양(비정수·문자열 sid)은 종전 렌더러처럼 보인다(④ 방향 보수)", () => {
+    for (const sid of [1, 0, 2.5, "3", null]) expect(nodeShown({ type: "pane", sid }, () => false)).toBe(true);
+    expect(nodeShown({ type: "pane", sid: -1, role: "master" }, () => false)).toBe(false);
+    expect(nodeShown({ type: "split", dir: "row", a: { type: "pane", sid: "7" }, b: { type: "pane", sid: -2, role: "x" } }, () => false)).toBe(true);
+  });
   it("구멍만 남은 트리는 '보이는 칸 0' — 렌더러는 idle 패널(셸 손잡이)을 그린다(④ 백지 금지)", () => {
     const t: LNode = { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: -1, role: "master" }, b: { type: "pane", sid: -2, role: "cso" } };
     expect(nodeShown(t, () => false)).toBe(false);

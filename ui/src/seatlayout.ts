@@ -174,8 +174,9 @@ export function nodeShown(t: unknown, holeShown: (sid: number) => boolean): bool
     const o = asObj(v);
     if (!o || depth > MAX_DEPTH) return false;
     if (o.type === "pane") {
-      if (typeof o.sid !== "number") return false;
-      if (o.sid >= 0) return true;
+      // 숨길 수 있는 것은 **음수 숫자 sid(구멍)** 뿐이다 — 그 밖의 모양은 종전 렌더러처럼 보이게 둔다
+      // (틀리게 숨기면 산 칸이 idle 패널 뒤로 사라진다 · ④ 쪽으로 무너지지 않게 보수적으로).
+      if (typeof o.sid !== "number" || !(o.sid < 0)) return true;
       try {
         return holeShown(o.sid) === true;
       } catch {
