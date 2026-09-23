@@ -2112,12 +2112,16 @@ fn run_capture_with_timeout_in(
     ));
     let sink = std::fs::File::create(&out_path)
         .map_err(|e| format!("{program} 출력 임시파일 생성 실패({}): {e}", out_path.display()))?;
-    let spawned = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(sink))
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // ★U5(0.14.41): 호출자가 지금은 macOS 전용이지만, 콘솔 없는 cys-app 의 콘솔 자식은 예외 없이
+    // 창 정책을 건다(lib.rs census `consoleless_spawns_carry_window_policy`). 비 Windows 무동작.
+    no_console(&mut command);
+    let spawned = command.spawn();
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {

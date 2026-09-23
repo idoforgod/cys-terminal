@@ -796,7 +796,14 @@ fn discover_claude_transcript(cwd: &str, created_at: f64) -> Option<PathBuf> {
 
 /// codex 결정론: 에이전트 프로세스가 열어둔 rollout 파일 fd를 lsof로 직독 (unix 전용 —
 /// 실패·미설치 시 None → 휴리스틱 폴백)
+///
+/// ★U5(0.14.41): Windows 는 **스폰 0** 으로 조기 반환한다. 동봉 PortableGit·MSYS2 에 lsof 가 없어
+/// 원래도 실행 실패(None)였고, PATH 에 lsof.exe 가 있는 기계에서만 콘솔 없는 cysd 가 창 정책 없이
+/// 띄워 창이 번쩍였다. 결과는 종전 Windows 기본 동작(None → 휴리스틱 폴백)과 같다.
 fn discover_codex_rollout_lsof(pid: u32) -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
     let out = std::process::Command::new("lsof")
         .args(["-p", &pid.to_string(), "-Fn"])
         .output()
@@ -1223,7 +1230,14 @@ pub fn parse_agy_quota(v: &Value) -> Vec<RateWindow> {
 }
 
 /// agy 프로세스가 LISTEN하는 127.0.0.1/localhost 포트 목록 (lsof — codex 패턴 동형, 와일드카드 제외).
+///
+/// ★U5(0.14.41): Windows 는 **스폰 0** 으로 조기 반환한다 — lsof 가 없어 원래도 빈 목록이었고
+/// (= Windows 의 agy 쿼터 수집은 종전부터 불능), lsof.exe 가 PATH 에 있는 기계에서만 콘솔 없는
+/// cysd 가 15초마다 창 정책 없이 띄워 창이 번쩍였다. 결과는 종전 Windows 기본 동작과 같다.
 async fn agy_listen_ports(pid: u32) -> Vec<u16> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
     let Ok(out) = tokio::process::Command::new("lsof")
         .args(["-nP", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-Fn"])
         .output()

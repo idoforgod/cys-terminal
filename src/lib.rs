@@ -197,6 +197,13 @@ pub const NO_AUTOSTART_ON: &str = "1";
 const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// Windows `CREATE_NO_WINDOW` — 콘솔 자식에게 새 콘솔 창을 할당하지 않는다.
 /// 콘솔 없는 프로세스(cysd·cys-app)가 콘솔 자식을 낳을 때 빈 검은 창이 뜨는 실사고(2026-07-10) 차단.
+///
+/// ★스폰 규칙(U5 · 0.14.41 · Microsoft conhost `srvinit.cpp`/`IoDispatchers.cpp` 근거):
+/// ① 콘솔 없는 cysd·cys-app 이 **직접** 낳는 콘솔 자식(루트)에는 반드시 등급(→ 이 flag)을 건다 —
+///    누락은 `spawn_policy_tests::consoleless_spawns_carry_window_policy` 가 적색으로 잡는다.
+/// ② 그 아래 자손은 손대지 않는다 — 숨은 콘솔을 물려받아 창이 없다.
+/// ③ `DETACHED_PROCESS`·`CREATE_NEW_CONSOLE` 는 어느 층에서도 쓰지 않는다(자손이 매번 새 창을 받는다).
+/// ④ ConPTY(pane) 자식에는 **절대 걸지 않는다** — 검은 pane(22ff28f6 · `conpty_children_never_get_create_no_window`).
 #[cfg(windows)]
 const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 

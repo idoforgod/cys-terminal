@@ -76,6 +76,20 @@ except ImportError:  # Windows
 
     fcntl = _FcntlShim()
 
+# ★U5(0.14.41 · 윈도우 "1분마다 검은 창") — 1분 사슬 **캡처 전용** 호출의 창 정책.
+#   이 스크립트는 cysd 의 1분 builtin 잡(`cycle-autopilot-tick`: cysd → bash → python → cys.exe)으로
+#   pane 밖에서 돈다. 저장소의 유일한 실기 관측(737af2a7 · 2026-07-11 오너)이 가리킨 고리가
+#   숨긴 python → cys.exe 라, 그 캡처 호출(run · run_wakeup = stdout·stderr 파이프)에만
+#   CREATE_NO_WINDOW 를 건다(설계 §3 U5 · 반박 D1 · 선례 javis_hud_bridge.py NOWIN). 출력은 파이프로
+#   받으므로 소실이 없다.
+#   ⚠전역 적용 금지: stdio 를 지정하지 않은 호출(훅·부트 출력)에 걸면 자식이 새 숨은 콘솔에 붙어
+#     출력을 잃는다(②③④). pane(ConPTY) 자식에도 걸지 않는다(검은 pane).
+#   ⚠이 이름은 아래 CONTRACT BLOCK 의 run() 이 쓴다 — javis_cycle_verifier.py 도 **반드시** 같은 이름을
+#     블록 밖에 정의해야 한다(verifier 는 pane 거주라 빈 dict). 한쪽이 빠지면 run() 이 NameError →
+#     rc 127 → kill_switch fail-closed 로 사이클이 조용히 멈춘다(② 무clear). 값·존재·범위·실스폰은
+#     run_bootstrap_health.py H-WIN-13 이 잰다.
+_CAPTURE_SPAWN_KW = {"creationflags": 0x08000000} if os.name == "nt" else {}
+
 # ═══════════════════════ CONTRACT BLOCK v1 START ═══════════════════════
 # ★이 블록은 javis_cycle_autopilot.py / javis_cycle_verifier.py 에 **바이트 동일**하게 존재한다.
 # 한쪽만 고치면 양쪽 self-test 의 contract-parity 검사가 즉시 실패한다(이음매 드리프트 차단).
@@ -190,8 +204,9 @@ def new_cycle_id():
 def run(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     """subprocess 러너 — (rc, stdout, stderr). 예외도 rc!=0 로 정규화(fail-soft)."""
     try:
+        # 창 정책은 블록 밖 `_CAPTURE_SPAWN_KW`(파일별 정의 — autopilot=nt NOWIN · verifier=빈 dict).
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text)
+                           timeout=timeout, input=stdin_text, **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
         return 127, "", "runner error: %s" % e
@@ -456,7 +471,8 @@ def run_wakeup(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     """
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text, env=wakeup_env())
+                           timeout=timeout, input=stdin_text, env=wakeup_env(),
+                           **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
         return 127, "", "runner error: %s" % e

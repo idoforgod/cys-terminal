@@ -10,7 +10,7 @@
 //!
 //! 잠금 순서 불변식: accounts → (해제) → analytics. 역순 금지(교착).
 
-use crate::state::Daemon;
+use crate::state::{Daemon, HideConsole};
 use crate::usage::RateWindow;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -397,10 +397,15 @@ pub fn spawn_custom_adapters(daemon: Arc<Daemon>) {
         tokio::spawn(async move {
             loop {
                 // 플랫폼별 셸 위임 — Windows는 sh 부재(cmd /C). 실패는 무해(다음 주기 재시도).
+                // ★U5(0.14.41): 콘솔 없는 cysd(GUI 서브시스템)가 콘솔 자식(cmd.exe)을 창 정책 없이
+                //   띄우면 **주기마다 새 콘솔 창이 번쩍인다**(interval_secs 하한 60초 · 이 루프는
+                //   홈 공용 accounts.json 을 읽는 모든 cysd = 본부 + 부서 데몬마다 돈다). hide_console =
+                //   등급 Attached(CREATE_NO_WINDOW 단독 · unix 무동작) — 출력은 `.output()` 파이프로 받으므로
+                //   흐름 무변경. 두 분기 모두 건다(census `consoleless_spawns_carry_window_policy`).
                 let fut = if cfg!(windows) {
-                    tokio::process::Command::new("cmd").args(["/C", &cmd]).output()
+                    tokio::process::Command::new("cmd").args(["/C", &cmd]).hide_console().output()
                 } else {
-                    tokio::process::Command::new("sh").args(["-c", &cmd]).output()
+                    tokio::process::Command::new("sh").args(["-c", &cmd]).hide_console().output()
                 };
                 if let Ok(Ok(out)) =
                     tokio::time::timeout(std::time::Duration::from_secs(10), fut).await
