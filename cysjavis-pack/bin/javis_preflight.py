@@ -2153,7 +2153,7 @@ class Preflight:
         ★최상위가 객체가 아닌 JSON(배열·숫자)은 settings 형상이 아니다 → None(종전엔 `.get` 에서
           AttributeError 로 검사 자체가 죽었다)."""
         try:
-            with open(settings_path) as f:
+            with open(settings_path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except FileNotFoundError:
             return {}
@@ -2186,7 +2186,7 @@ class Preflight:
     def _strip_dept_hooks(self, settings_path):
         """백업 후 dept 훅 제거(base 보존·빈 블록 제거·원자적). 반환 (removed, err)."""
         try:
-            with open(settings_path) as f:
+            with open(settings_path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except Exception as e:
             return (0, str(e))
@@ -2310,7 +2310,7 @@ class Preflight:
     def _strip_temp_hooks(self, settings_path):
         """백업 후 temp 훅 제거(비-temp 보존·빈 블록 제거·원자적). 반환 (removed, err)."""
         try:
-            with open(settings_path) as f:
+            with open(settings_path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except Exception as e:
             return (0, str(e))

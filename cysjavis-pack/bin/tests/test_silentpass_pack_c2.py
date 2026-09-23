@@ -127,6 +127,19 @@ try:
     r = _c5657([listy])
     check("2g 최상위가 객체 아닌 JSON → C56 WARN(크래시·PASS 아님)",
           r.get("C56.dept-hook-leak", ("?",))[0] == pf.WARN, repr(r.get("C56.dept-hook-leak")))
+
+    # ★성찰 B(minor) — 인코딩 미지정 open() 은 윈도우 편집기가 쓴 UTF-8 BOM settings.json 을
+    #   '판독 불가'(WARN)로 오판한다(Claude 는 BOM 을 정상 읽는 파일인데 이 스캐너만 못 읽는다) —
+    #   드러내기 의도와 반대인 거짓 경보. encoding='utf-8-sig' 로 BOM 을 흡수해야 한다.
+    bomdir = os.path.join(tmp, ".claude-7", "settings.json")
+    os.makedirs(os.path.dirname(bomdir), exist_ok=True)
+    with open(bomdir, "wb") as f:
+        f.write(b"\xef\xbb\xbf" + json.dumps(CLEAN).encode("utf-8"))
+    r = _c5657([bomdir])
+    check("2j UTF-8 BOM 정상 settings → C56 PASS(WARN 아님 — utf-8-sig)",
+          r.get("C56.dept-hook-leak", ("?",))[0] == pf.PASS, repr(r.get("C56.dept-hook-leak")))
+    check("2k UTF-8 BOM 정상 settings → C57 PASS", r.get("C57.temp-hook-leak", ("?",))[0] == pf.PASS,
+          repr(r.get("C57.temp-hook-leak")))
     r = _c5657([broken, leak])
     c56 = r.get("C56.dept-hook-leak", ("?", ""))
     check("2h 누수 + 판독 불가 → FAIL(누수) 유지 + 판독 불가 병기",
