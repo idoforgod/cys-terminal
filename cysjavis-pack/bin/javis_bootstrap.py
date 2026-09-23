@@ -475,8 +475,13 @@ BOOT_GATE_PENDING_OUTCOME = "gate_pending"
 #   종전 문안은 면책 창만 경고해서, 첫기동 순서(… 폴더신뢰 → 면책 …)대로 폴더신뢰 창에서 Return 을 누르면 좌석이
 #   죽었다(새 설치의 첫 마스터가 바로 이 창을 만난다). 바꾸는 것은 **문안뿐**이다 — 코퍼스(approval_patterns.
 #   trust-prompt · MEASURED_ON · default_index)는 무접촉(설계 §3 U7 금지선: 바꾸면 Return 자동확인이 다시 무장된다).
+#   ★리뷰1 I-6(minor · 문안 병기 · 동작 변경 0): 방향키 처방은 2.1.261+ 위치 기준이다. 2.1.241~260 은
+#   순서가 반대(`1. Yes, I trust this folder` 가 포커스)라 그대로 따르면 좌석이 죽는다 — 라벨 기준
+#   문장을 추가한다(방향키 처방은 지우지 않는다).
 _GATE_FOCUS_WARNING = ("★폴더신뢰(2.1.261+)·면책 창 **둘 다** 기본 포커스가 `No, exit` 이므로 그대로 "
-                       "Return 하면 노드가 종료된다(아래 방향키 1회 뒤 Return)")
+                       "Return 하면 노드가 종료된다(아래 방향키 1회 뒤 Return). 버전을 모르면 라벨로 "
+                       "확인하라: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 Return — "
+                       "`No, exit` 위에서는 Return 금지")
 
 # 관문 보류 처방 문안(단일 출처) — launch-agent 소비부(U-11)와 **같은 사실을 같은 말로** 낸다.
 # ★기본 포커스 경고를 반드시 동봉한다: 실측상 기본 포커스가 `No, exit` 이라 그대로 Return 하면
@@ -3642,7 +3647,10 @@ def cmd_self_test():
         #   `No, exit` 다(첫기동 GUI 마스터가 바로 이 창을 만난다). 종전 문안은 면책 창만 경고해 사람이
         #   안내대로 폴더신뢰 창에서 Enter 를 누르면 좌석이 죽었다. 사람용 처방 4곳이 **같은 한 문장**
         #   (`_GATE_FOCUS_WARNING`)을 싣는지, 그리고 구 단독 경고가 남지 않았는지 잰다(동작 변경 0 · 문안만).
-        for _tok in ("폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return"):
+        # ★리뷰1 I-6(minor · 문안 병기): 방향키 처방(2.1.261+ 전용) 옆에 라벨 기준 문장도 있어야
+        #   한다 — 사람은 자기 Claude 버전을 모르는 경우가 흔하다(동작 변경 0 · 병기만).
+        for _tok in ("폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return",
+                    "Yes, I trust this folder", "Yes, I accept"):
             assert _tok in _GATE_FOCUS_WARNING, "관문 기본 포커스 경고 문안에 %r 가 없다" % _tok
         for _lbl, _txt in (("관문 보류 기본", _GATE_PENDING_PRESCRIPTION),
                            ("화면 미관측", _GATE_REASON_PRESCRIPTION[GATE_REASON_RECHECK_UNOBSERVED]),

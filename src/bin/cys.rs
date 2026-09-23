@@ -2755,7 +2755,11 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
 /// 주석 "2.1.261 폴더신뢰는 0=No, exit" 와 같은 사실). 종전 문안은 면책 창만 경고해 첫기동 순서(… 폴더신뢰 → 면책
 /// …)대로 폴더신뢰 창에서 Return 을 누르면 노드가 rc 1 로 죽었다. 바꾸는 것은 문안뿐이다 — 코퍼스
 /// (`approval_patterns.trust-prompt`·`MEASURED_ON`·`default_index`)는 무접촉(설계 §3 U7 금지선).
-const GATE_DEFAULT_FOCUS_WARNING: &str = "★폴더신뢰(2.1.261+)·면책(Bypass) 창 **둘 다** 기본 포커스가 `No, exit` 다 — 그대로 Return 하면 노드가 종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라.";
+/// ★리뷰1 I-6(minor · 문안 병기 · 동작 변경 0): 위 방향키 처방은 **2.1.261+ 위치 기준**이다.
+/// 2.1.241~260 은 폴더신뢰 창의 선택지 순서가 반대라(`1. Yes, I trust this folder`가 포커스) 그
+/// 처방을 그대로 따르면 좌석이 죽는다 — 사람은 자기 Claude 버전을 모르는 경우가 많으므로 라벨
+/// 기준 문장을 **추가**한다(방향키 처방을 지우지 않는다 · 새 approval_patterns·판정 로직 0).
+const GATE_DEFAULT_FOCUS_WARNING: &str = "★폴더신뢰(2.1.261+)·면책(Bypass) 창 **둘 다** 기본 포커스가 `No, exit` 다 — 그대로 Return 하면 노드가 종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라. 버전을 모르면 라벨로 확인하라: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 Return — `No, exit` 위에서는 Return 금지.";
 
 /// 보류 사유 + 처방(에러 본문). 머리표로 시작한다 — 호출부의 유일한 분류 근거다.
 ///
@@ -27216,7 +27220,10 @@ mod tests {
     /// 부트 GatePending)이 **둘 다** 경고하는지 잰다. 동작 변경 0 — 문안만(코퍼스·MEASURED_ON·default_index 무접촉).
     #[test]
     fn u7_gate_prescriptions_warn_folder_trust_and_disclaimer_both_default_no_exit() {
-        let toks = ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return"];
+        // ★리뷰1 I-6(minor · 문안 병기): 방향키 처방(2.1.261+ 전용) 옆에 라벨 기준 문장도 있어야
+        //   한다 — 사람은 자기 Claude 버전을 모르는 경우가 흔하다(동작 변경 0 · 병기만).
+        let toks = ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return",
+                   "Yes, I trust this folder", "Yes, I accept"];
         let hit = cys::inject_guard::GateHit {
             id: "folder-trust".to_string(),
             title: "폴더 신뢰".to_string(),

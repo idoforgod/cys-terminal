@@ -5132,7 +5132,9 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
             "마스터 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
              닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — 순서는 \
              테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★폴더신뢰(2.1.261+)·면책 \
-             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter). \
+             버전을 모르면 라벨로 확인하세요: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 \
+             Enter — `No, exit` 위에서는 Enter 금지.\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -5587,7 +5589,9 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
         return Err(format!(
             "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
              닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★폴더신뢰(2.1.261+)·면책 \
-             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter). \
+             버전을 모르면 라벨로 확인하세요: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 \
+             Enter — `No, exit` 위에서는 Enter 금지.\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -11768,7 +11772,10 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             let seg = &body[i..i + body[i..].find(".trim()").expect("처방 끝 경계")];
             // 소스의 줄 잇기(`\` + 개행 + 들여쓰기)는 문자열에서 사라진다 — 공백을 접어 실제 문안으로 잰다.
             let flat = seg.replace("\\\n", "").split_whitespace().collect::<Vec<_>>().join(" ");
-            for tok in ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Enter"] {
+            // ★리뷰1 I-6(minor · 문안 병기): 방향키 처방(2.1.261+ 전용) 옆에 라벨 기준 문장도 있어야
+            //   한다 — 사람은 자기 Claude 버전을 모르는 경우가 흔하다(동작 변경 0 · 병기만).
+            for tok in ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Enter",
+                       "Yes, I trust this folder", "Yes, I accept"] {
                 assert!(flat.contains(tok), "{anchor} 처방에 {tok:?} 가 없다: {flat}");
             }
             // 구 단독 경고(면책 창만) 문장이 남지 않았다 — 바늘은 이어 붙여 만든다(자기 매치 방지).
