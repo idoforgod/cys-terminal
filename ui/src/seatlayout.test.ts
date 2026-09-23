@@ -22,6 +22,7 @@ import {
   liveSidsOf,
   looksManual,
   placeSeat,
+  placeSeatFallbackCount,
   placeSeatSafe,
   roleLayout,
   sanitizeRole,
@@ -496,5 +497,68 @@ describe("안전 래퍼 — 어떤 입력에도 던지지 않고 잃지 않는�
       const anch = anchorHeadSafe(out, mapRole(role)) as LNode;
       expect(sids(anch).sort((a, b) => a - b)).toEqual(want);
     }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// ★리뷰1 F8(minor) — 순수부 생존 뮤테이션 6종 중 이 파일 소관 4종(P9·P15·P17 · F6 진단 카운터).
+// P12·P35 는 seatbind.test.ts(restoreTree·adoptSeat 문맥). P31 은 실제로 트리거되는 입력을 찾지
+// 못해(placeSeat 이 멤버를 보존하도록 구성돼 있어 sameMembers 가 거짓이 되는 도달 가능한 경로가
+// 없다) 제외한다 — WORKLOG "제외" 절에 이유를 남긴다.
+describe("리뷰1 F8 — 생존 뮤테이션 보강", () => {
+  it("isValidTree: 같은 sid 가 두 번 있으면 거짓이다(중복 방어 · P17)", () => {
+    expect(
+      isValidTree({ type: "split", dir: "row", a: { type: "pane", sid: 1 }, b: { type: "pane", sid: 1 } }),
+    ).toBe(false);
+  });
+
+  it("master 없이 cso 만 있으면, 두 번째 cso 는 대표 컬럼(세로 쌓기)을 세우지 않는다(WORKLOG #13 · P9)", () => {
+    const roleOf = mapRole(new Map<number, string | null>([[1, "cso"], [2, "cso"]]));
+    const out = placeSeat({ type: "pane", sid: 1, role: "cso" }, 2, roleOf, false) as any;
+    // dir:"col" 이면 master 없이 cso 가 대표 컬럼을 세운 것(appendCell) — 마스터 재기동 공백을
+    // cso 가 가로채지 않는다는 약속이 깨진다. 종전 규칙은 가로(row) 부착이다.
+    expect(out.type).toBe("split");
+    expect(out.dir).toBe("row");
+  });
+
+  it("colsVis 는 구멍만 있는 컬럼을 보이는 컬럼으로 세지 않는다(rebalanceRow 가 폭을 뭉개지 않는다 · P15)", () => {
+    const roleOf = mapRole(new Map<number, string | null>([[1, "master"], [5, "worker"]]));
+    const t: LNode = {
+      type: "split", dir: "row", ratio: 0.5,
+      a: { type: "pane", sid: 1, role: "master" }, // 대표 컬럼 — anchoredCore 가 참이 되게 한다
+      b: {
+        type: "split", dir: "row", ratio: 0.9, // 의도적으로 균등이 아닌 값 — 재분배되면 값이 바뀐다
+        a: { type: "pane", sid: 5, role: "worker" }, // 산 칸 — 보이는 컬럼 1
+        b: { type: "pane", sid: -7, role: "worker-2" }, // 구멍뿐인 컬럼 — 보이는 컬럼 0 이어야 한다
+      },
+    };
+    const out = anchorHeadSafe(t, roleOf) as any;
+    // 구멍뿐인 컬럼을 1로 세면(P15) ca=cb=1 → 균등(0.5)으로 재분배돼 0.9 가 사라진다.
+    expect(out.b.ratio).toBe(0.9);
+  });
+
+  it("appendColumn: 오른쪽이 구멍뿐이면(n=0) 절반을 주지 않는다 — 기억한 비율을 짓누르지 않는다(리뷰1 F4)", () => {
+    // probe M(review1-probe-out.txt) 축소판 — 수동 탭이 경로 B(복원 중 앱 시작)로 재기동한 모양.
+    const tree: LNode = {
+      type: "split", dir: "row", ratio: 0.25,
+      a: { type: "pane", sid: -1, role: "master" },
+      b: {
+        type: "split", dir: "row", ratio: 0.5,
+        a: { type: "pane", sid: -2, role: "worker" },
+        b: { type: "pane", sid: -3, role: "worker-2" },
+      },
+    };
+    const roleOf = mapRole(new Map<number, string | null>([[99, null]]));
+    const out = placeSeat(tree, 99, roleOf, true) as any; // manual=true — 충전 셸이 한 칸 곁에 붙는다
+    // 고쳐지기 전(0.5)엔 방금 붙는 빈 셸이 보류 구멍들의 자리를 절반이나 가져간다(probe M: worker
+    // 0.25→0.125). 구멍 쪽(기존)이 0.85, 셸이 0.15 — 결속되면 제 비율로 돌아온다.
+    expect(out.b.ratio).toBeCloseTo(0.85, 9);
+  });
+
+  it("손상 트리 → legacyAppend 폴백은 조용히 지나가지 않는다 — 진단 카운터가 오른다(리뷰1 F6)", () => {
+    const before = placeSeatFallbackCount();
+    const dup: LNode = { type: "split", dir: "row", a: { type: "pane", sid: 1 }, b: { type: "pane", sid: 1 } };
+    placeSeatSafe(dup, 2, () => undefined, false);
+    expect(placeSeatFallbackCount()).toBe(before + 1);
   });
 });
