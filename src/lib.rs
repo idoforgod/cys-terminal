@@ -25,6 +25,10 @@ pub mod inject_guard;
 /// python(`javis_lane`) 셋이 같은 규칙을 써야 하고, 사본이 갈리면 층1 판정이 조용히 무력화된다.
 pub mod lane;
 pub mod license;
+/// U15(0.14.41) — 개발자 도구(CLT) 없는 맥의 `/usr/bin/python3` 셔임 회피 SOT. 판정은 파일 존재만
+/// 보고(셔임 실행 0), 소비자 셋(스폰 env ⑦ · 부트 감독 자식 PATH · 회수 자식 PATH)이 같은 한 판정을
+/// 거친다 — CLT 있는 맥·윈도우·리눅스는 출력이 종전과 바이트 동일하다(조건부 쌍 규율).
+pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
 /// 프로필 인증 전제 판정기(U-17) — "이 프로필로 좌석을 만들면 로그인 관문 앞에 서는가".
@@ -1696,6 +1700,13 @@ pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
 ///    ★Windows 실기 검증은 이 커밋 범위 밖이다(mac 개발기에서 실기 재현 불가). 여기서
 ///    증명된 것은 ⓐ경로 선택 규약 ⓑ불가침 계약 ⓒ타 플랫폼 미주입 셋뿐이고, 실제 훅이 뜨는가는
 ///    `feat/**` 브랜치 windows-health 잡과 실기 재현의 몫이다 — 과장하지 않는다.
+/// ⑦ CYS_PY + CYS_PY_ORIGIN(U15 · 0.14.41 · **macOS·CLT 부재 전용 조건부 쌍**): 개발자 도구(CLT) 없는
+///    맥에서 좌석은 `zsh -l` 이라 path_helper 가 `/usr/bin` 을 동봉 runtime 앞으로 되돌리고, 훅이 PATH 첫
+///    `python3` = 셔임(설치 창 + 비0)을 불렀다. 판정은 [`macos_devtools::clt_absent_bundled_python`] 하나
+///    (macOS ∧ 롤백 아님 ∧ 동봉 python3 실재 ∧ CLT python3 부재 — 셔임 실행 0, stat 만)이고, 사용자
+///    프로세스 env 에 `CYS_PY` 가 있으면 덮지 않는다. 훅 프리루드 `cys_resolve_py` 첫 갈래가 미리 설정된
+///    값을 존중하므로 이 한 쌍으로 좌석 훅 전체가 동봉 python 을 쓴다. 마커는 `cys-dept` 헤더가 소비한다.
+///    ⑤·⑥ 과 같이 조건 미충족이면 아무것도 얹지 않는다 — CLT 있는 맥·윈도우·리눅스는 **바이트 동일**.
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
@@ -1709,6 +1720,34 @@ pub fn spawn_env_pairs(
     current_path: &str,
     home: Option<&str>,
     userprofile: Option<&str>,
+) -> Vec<(String, String)> {
+    // ⑦ 의 판정(macOS·CLT 부재·동봉 실재·사용자 무설정)만 여기서 실측(디스크 stat + 프로세스 env
+    // 판독)하고, 나머지 전부는 [`spawn_env_pairs_with`] 가 순수하게 조립한다 — 리뷰1 MAJOR-1(⑦ 배선
+    // 핀이 호스트 판정에 갇혀 CI 의 어느 레인에서도 양성 갈래를 돌리지 못했다)에 대응해, 그 순수 틈이
+    // 가짜 판정을 주입받아 호스트와 무관하게 배선을 잴 수 있게 만들었다(테스트는 macos_devtools.rs
+    // `spawn_env_pairs_with_wires_seventh_pair_regardless_of_host` 참고).
+    spawn_env_pairs_with(
+        exe_dir,
+        current_path,
+        home,
+        userprofile,
+        macos_devtools::clt_absent_bundled_python(exe_dir).as_deref(),
+        std::env::var_os(macos_devtools::ENV_CYS_PY).is_some(),
+    )
+}
+
+/// [`spawn_env_pairs`] 의 순수 조립부 — ⑦ 의 CLT-부재 판정(`clt_absent_bundled`)과 사용자 `CYS_PY`
+/// 존재 여부(`user_has_cys_py`)를 **인자로 받는다**(디스크 stat·프로세스 env 판독은 호출부의 몫이다).
+/// 운영 경로는 항상 [`spawn_env_pairs`] 를 거쳐 실제 호스트로 이 값들을 채운다 — 이 함수를 직접
+/// 부르는 것은 테스트뿐이고, 그 목적은 가짜 판정(`Some(..)`)을 주입해 **어느 호스트에서든** ⑦ 배선을
+/// 잴 수 있게 하는 것이다(호스트가 어떻든 결과가 같아야 하는 순수 함수라 회귀 위험이 없다).
+pub fn spawn_env_pairs_with(
+    exe_dir: &Path,
+    current_path: &str,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    clt_absent_bundled: Option<&Path>,
+    user_has_cys_py: bool,
 ) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(newp) = runtime_prefixed_path(exe_dir, current_path) {
@@ -1748,6 +1787,9 @@ pub fn spawn_env_pairs(
         &npm_config_prefix_verdict_from_process(exe_dir),
         boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
     );
+    // ⑦ U15(0.14.41): CLT 없는 맥에서만 동봉 python 을 훅에 명시한다(판정·롤백은 단일 판정이 소유 ·
+    //    비-macOS 는 디스크 stat 0 으로 None). 조건 미충족 = 쌍 0개 = 종전과 바이트 동일.
+    macos_devtools::inject_cys_py_for(&mut env, clt_absent_bundled, user_has_cys_py);
     env
 }
 

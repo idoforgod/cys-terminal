@@ -489,9 +489,21 @@ if [ -n "$CYS_UNJUDGED_RC" ]; then
   if ! _maybe_declaration; then
     echo "[cys-hook] role-bootstrap: 판정 불가($CYS_UNJUDGED_WHY) — 선언 토큰 없어 침묵 종료(judged-no)" >&2
   elif _cys_notice_latch_ok "surface-role-unjudged"; then
+    # ★U15(0.14.41 · 반박 M6): 문안은 OS 별이다. Defender 격리 복구는 **윈도우 원인**이라 맥에서 그 문안을
+    #   실으면 오진이다(맥 사용자·모델이 없는 Windows 보안 메뉴를 찾는다). darwin 은 맥 확인 순서를 싣고,
+    #   그 밖(윈도우·리눅스)의 문안은 **한 글자도 바꾸지 않는다**(검체 H-VOICE-U29 가 msys 에서 그대로 단언).
+    case "${OSTYPE:-}" in
+      darwin*)
+        MSG="$CYS_UNJUDGED_WHY. 좌석 역할을 판정할 수 없어 마스터 부트를 발화하지 않았습니다(팀 미기동). 확인 순서: 먼저 터미널에서 command -v cys 로 cys 명령이 보이는지 확인하고(없으면 응용 프로그램 폴더의 cys 앱을 한 번 열어 명령줄 연결을 복구), 보이면 cys status 로 데몬 응답을 확인한 뒤 다시 선언하세요. 개발자 도구 설치 창이 함께 떴다면 나중에를 눌러도 됩니다."
+        _notify_bg "부트스트랩 판정 불가(좌석 역할 조회 실패)" "$MSG"
+        _static_ctx "[결정론 부트스트랩 판정 불가 - 좌석 역할 조회 실패] $CYS_UNJUDGED_WHY. 이것은 선언 아님이 아니라 판정 불가다 - 팀은 뜨지 않았다. 부트가 시작됐다고 보고하지 마라. 조치(macOS): (1) cys가 PATH에 있는지(command -v cys) 확인하라 - 없으면 응용 프로그램 폴더의 cys.app을 한 번 열어 명령줄 연결을 복구한다. (2) 있다면 데몬 응답 상태(cys status)를 확인한 뒤 다시 선언하라. (3) 명령어 라인 개발자 도구(CLT)가 없는 맥에서 python3 설치 창이 함께 떴다면 그 창은 나중에를 눌러도 된다 - cys 훅은 앱에 들어 있는 python을 쓴다. 승인 Feed에도 알림을 시도했다. 이 안내는 반복 폭주를 막기 위해 시간당 1회만 나온다."
+        ;;
+      *)
     MSG="$CYS_UNJUDGED_WHY. 좌석 역할을 판정할 수 없어 마스터 부트를 발화하지 않았습니다(팀 미기동). 가장 흔한 원인은 Windows Defender의 cys.exe 격리입니다 - 복구는 순서가 생명입니다: 먼저 제외 항목에 LOCALAPPDATA 아래 cys 폴더를 등록하고, 그 다음 보호 기록에서 격리된 cys.exe를 복원하세요."
     _notify_bg "부트스트랩 판정 불가(좌석 역할 조회 실패)" "$MSG"
     _static_ctx "[결정론 부트스트랩 판정 불가 - 좌석 역할 조회 실패] $CYS_UNJUDGED_WHY. 이것은 선언 아님이 아니라 판정 불가다 - 팀은 뜨지 않았다. 부트가 시작됐다고 보고하지 마라. 조치: (1) 가장 흔한 원인은 Windows Defender가 cys.exe를 격리한 것이다. 복구는 순서가 생명이다 - 먼저 Windows 보안 > 바이러스 및 위협 방지 > 설정 관리 > 제외 항목 추가로 LOCALAPPDATA 아래 cys 폴더를 등록하고, 그 다음 보호 기록에서 격리된 cys.exe를 복원하라(순서를 바꾸면 실시간 보호가 복원 직후 다시 격리한다). (2) 격리가 아니라면 cys가 PATH에 있는지(command -v cys) 확인하고, 있다면 데몬 응답 상태(cys status)를 확인한 뒤 다시 선언하라. 승인 Feed에도 알림을 시도했다. 이 안내는 반복 폭주를 막기 위해 시간당 1회만 나온다."
+        ;;
+    esac
   else
     echo "[cys-hook] role-bootstrap: 판정 불가($CYS_UNJUDGED_WHY) — 통보 래치 창 안이라 억제(무발화는 종전과 동일)" >&2
   fi

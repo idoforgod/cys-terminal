@@ -124,7 +124,11 @@ jobs:
           #   WP-C1 이 먼저 병합돼 H-WIN-13 을 선점했다): ④′ 부하 재확인 루프(30초 간격·최대 3분)가
           #   Windows 에서 **구조적으로 켜지지 않음**을 실기에서 확인한다 — 호스트 판정 가드가 실제로
           #   물리는지와, 실제 게이트 형상(measure_errors·fleet_cpu_reason)을 detail 에 박제한다.
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
+          # ★H-CLT-2 편입(2026-09-23 · 0.14.41 WP-C3 · U15): 개발자 도구(CLT) 없는 맥의 셔임 회피 논리가 공유
+          #   훅 `_lib.sh` 에 들어갔다. 새 논리는 전부 `case $OSTYPE in darwin*` 안이라는 것 — Git Bash 실기에서
+          #   CYS_PY 해소값이 종전 규칙(PATH 첫 python3→python→py)과 같고 셔임 분류·폴백 제거 조건이 거짓임 —
+          #   을 이 레인만 실측할 수 있다(맥 러너의 msys 모의는 OSTYPE 주입일 뿐 플랫폼 증명이 아니다).
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
           #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은

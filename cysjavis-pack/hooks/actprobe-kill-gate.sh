@@ -22,11 +22,20 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 # ── 인터프리터 해석 (없으면 hook JSON 파싱 불가 = 인프라 fail-open) ───────────
 # G22: 후보에 python·py 추가(Windows는 python3 명령이 없다). 프리루드 해소값을 최우선 후보로.
 PYBIN=""
+# ★U15(0.14.41): 개발자 도구(CLT) 없는 맥의 /usr/bin/python3 셔임은 후보에서 뺀다(프리루드 `cys_py_is_shim`
+#   — darwin 밖·CLT 있는 맥은 항상 거짓 = 종전 후보 그대로). 셔임밖에 없으면 아래 종전 'python 부재'
+#   fail-open 갈래 — 셔임 실행 때의 PARSEERR fail-open 과 같은 판정이다(설치 창만 사라진다).
 for c in "${CYS_PY:-python3}" python3 python py \
          /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
   [ -n "$c" ] || continue
-  if command -v "$c" >/dev/null 2>&1; then PYBIN="$(command -v "$c")"; break; fi
-  [ -x "$c" ] && { PYBIN="$c"; break; }
+  if command -v "$c" >/dev/null 2>&1; then
+    PYBIN="$(command -v "$c")"
+    if command -v cys_py_is_shim >/dev/null 2>&1 && cys_py_is_shim "$PYBIN"; then PYBIN=""; continue; fi
+    break
+  fi
+  if [ -x "$c" ] && ! { command -v cys_py_is_shim >/dev/null 2>&1 && cys_py_is_shim "$c"; }; then
+    PYBIN="$c"; break
+  fi
 done
 if [ -z "$PYBIN" ]; then
   echo "kill-gate: WARN python(3) 부재 — hook JSON 파싱 불가 · fail-open" >&2

@@ -1686,6 +1686,30 @@ fn path_with_exe_dir_first(exe_dir: &Path, current: Option<std::ffi::OsString>) 
     std::env::join_paths(parts).unwrap_or_else(|_| exe_dir.as_os_str().to_os_string())
 }
 
+/// ★(U15 · 0.14.41 · 반박 M3·M4) 부트 체인 자식 PATH.
+///
+/// 데몬 env PATH 는 launchd plist 값이라 동봉 runtime 이 없다(`…:/usr/bin:/bin:…` 실측). 부트 python 자체는
+/// 동봉 절대경로라 안전하지만 그 **자손**(`bash cys-dept promote-if-pending` 의 `python3 -` heredoc ·
+/// `cys boot` 회수 · `["python3", …]` 리터럴)은 PATH 로 `python3` 를 풀어, 개발자 도구(CLT) 없는 맥에서
+/// 마스터 부트마다 셔임(설치 창 + 비0)을 불렀다. 그 기계에서만 `py_dir`(동봉 python 디렉터리)를 exe_dir
+/// **바로 뒤**에 둔다(python 만 — 동봉 git 은 올리지 않는다: GIT_EXEC_PATH 결함 RC5 · 설계 §2 Phase B 제외).
+/// `py_dir == None`(윈도우·리눅스·CLT 있는 맥·롤백)이면 [`path_with_exe_dir_first`] 와 **바이트 동일**하다.
+fn boot_child_path(
+    exe_dir: &Path,
+    py_dir: Option<&Path>,
+    current: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    let Some(py) = py_dir else {
+        return path_with_exe_dir_first(exe_dir, current);
+    };
+    let mut parts: Vec<PathBuf> = vec![exe_dir.to_path_buf(), py.to_path_buf()];
+    if let Some(cur) = current.as_ref() {
+        parts.extend(std::env::split_paths(cur));
+    }
+    // join 실패(성분에 분리자 — 동봉 경로에선 비실재)는 종전 규칙으로 접는다: 'cys 해소 보장' 이 우선이다.
+    std::env::join_paths(parts).unwrap_or_else(|_| path_with_exe_dir_first(exe_dir, current))
+}
+
 /// boot-supervisor.log 의 **경로 규약 단일 소유자**(★R2 note — 사본 금지).
 ///
 /// 스풀의 부모 = 데몬 상태 디렉터리(`state_dir(socket)` — unix 는 소켓의 부모, Windows 는
@@ -1783,7 +1807,13 @@ fn run_ensure_team(
         // SEAL-1: 번들 python 이 `.pyc` 를 쓰면 코드서명 봉인이 깨진다.
         .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
         // ★(P2 · R3-P2-1/ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
-        .env("PATH", path_with_exe_dir_first(&exe_dir, std::env::var_os("PATH")))
+        // ★(U15 · 0.14.41) CLT 없는 맥에서만 그 바로 뒤에 동봉 python 디렉터리(자손의 `python3` 셔임 회피).
+        //   판정은 lib 단일 판정 — 그 밖의 기계는 종전과 바이트 동일(boot_child_path 주석).
+        .env("PATH", boot_child_path(
+            &exe_dir,
+            cys::macos_devtools::clt_absent_bundled_python(&exe_dir).as_deref().and_then(Path::parent),
+            std::env::var_os("PATH"),
+        ))
         .stdin(std::process::Stdio::null());
     // ── ★(R2 · 2026-08-26) provenance 상속 절단 — **주지 않기로 한 값 = 없는 값** ──────────
     // 【무엇이 틀렸었는가】 아래 주입은 **조건부**인데, 조건이 거짓일 때 상속값을 지우지 않았다.
@@ -5428,6 +5458,61 @@ mod tests {
             std::env::split_paths(&alone).next().as_ref(),
             Some(&exe),
             "PATH 부재에서 exe_dir 단독 주입이 안 됐다"
+        );
+    }
+
+    /// ★(U15 · 0.14.41) CLT 있는 맥·윈도우·리눅스(= py_dir None)의 부트 자식 PATH 는 종전과 **바이트 동일**.
+    #[test]
+    fn boot_child_path_is_byte_identical_without_bundled_python() {
+        let exe = std::env::temp_dir().join("cys_bsup_exedir");
+        for cur in [
+            Some(std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap()),
+            Some(std::ffi::OsString::new()),
+            None,
+        ] {
+            assert_eq!(
+                boot_child_path(&exe, None, cur.clone()),
+                path_with_exe_dir_first(&exe, cur.clone()),
+                "동봉 python 디렉터리가 없는데 부트 자식 PATH 가 종전과 달라졌다(바이트 동일 계약): {cur:?}"
+            );
+        }
+    }
+
+    /// ★(U15 · 0.14.41 · 반박 M3) CLT 없는 맥 — 동봉 python 디렉터리가 exe_dir **바로 뒤**(= launchd PATH 의
+    /// /usr/bin 앞)에 온다. 그래야 체인 자손(`bash cys-dept` heredoc `python3 -` · `cys boot` 회수 · 리터럴
+    /// `python3` 인자)이 셔임(설치 창 + 비0)이 아니라 동봉본으로 풀린다. 나머지 순서는 보존한다.
+    #[test]
+    fn boot_child_path_puts_bundled_python_right_after_exe_dir() {
+        let exe = std::env::temp_dir().join("cys_bsup_exedir");
+        let py = Path::new("/App/cys.app/Contents/Resources/runtime/python/bin");
+        let old = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let parts: Vec<PathBuf> =
+            std::env::split_paths(&boot_child_path(&exe, Some(py), Some(old))).collect();
+        assert_eq!(
+            parts,
+            vec![exe.clone(), py.to_path_buf(), PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+            "동봉 python 이 exe_dir 바로 뒤에 오지 않거나 기존 순서가 깨졌다"
+        );
+        // PATH 부재(최소 env 데몬)에서도 exe_dir·동봉 python 두 조각은 남는다.
+        let alone: Vec<PathBuf> = std::env::split_paths(&boot_child_path(&exe, Some(py), None)).collect();
+        assert_eq!(alone, vec![exe, py.to_path_buf()]);
+    }
+
+    /// ★(U15) 생산 배선 소스 핀 — run_ensure_team 이 자식 PATH 를 `boot_child_path` 로 만들고, 그 python
+    /// 디렉터리를 lib 단일 판정(`clt_absent_bundled_python`)에서 받는다(판정 사본 금지 · 조건부 쌍 규율).
+    #[test]
+    fn run_ensure_team_wires_boot_child_path_through_single_verdict() {
+        let src = include_str!("boot_supervisor.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let i = prod.find("fn run_ensure_team(").expect("run_ensure_team 소실");
+        let body = &prod[i..prod[i..].find("\n}\n").map(|e| i + e).unwrap_or(prod.len())];
+        assert!(
+            body.contains(".env(\"PATH\", boot_child_path("),
+            "부트 자식 PATH 가 boot_child_path 를 거치지 않는다 — CLT 없는 맥에서 체인 자손이 셔임을 부른다"
+        );
+        assert!(
+            body.contains("macos_devtools::clt_absent_bundled_python("),
+            "동봉 python 디렉터리를 lib 단일 판정 밖에서 정한다(판정 사본 = 조건 드리프트)"
         );
     }
 

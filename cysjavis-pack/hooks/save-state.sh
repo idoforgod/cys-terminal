@@ -15,7 +15,9 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 INPUT=$(cat 2>/dev/null)
 # 인터프리터 해소는 프리루드(python3→python→py) — 기존 계약(비어 있으면 안 됨)은 명시 폴백.
-[ -n "$CYS_PY" ] || CYS_PY="python3"
+# ★U15(0.14.41): 개발자 도구(CLT) 없는 맥(`cys_py_shim_risk`)에서는 폴백하지 않는다(그 `python3` 는 설치 창
+#   셔임 — 빈 값 호출은 graceful 갈래) · 윈도우·리눅스·CLT 있는 맥은 종전 폴백 그대로.
+[ -n "$CYS_PY" ] || { command -v cys_py_shim_risk >/dev/null 2>&1 && cys_py_shim_risk; } || CYS_PY="python3"
 # ★CR 제거(2026-08-10 Windows 실기 H-WIN-5): 네이티브 python 은 파이프에도 \r\n 을 쓴다 —
 #   꼬리 CR 이 cwd 상향탐색·이벤트 완전일치를 무너뜨린다(unix 무변 · inject-context 동일 규약).
 CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys

@@ -22,17 +22,24 @@ MAX_LINES = 6
 MAX_BYTES = 1024
 
 _pack = os.environ.get('CYS_PACK_DIR') or os.path.expanduser('~/.cys/pack')
-DEFAULT_PREFLIGHT = f'python3 {_pack}/bin/javis_preflight.py'
+# ★U15(0.14.41 · 반박 M2·M8): 기본 preflight 는 **이 인터프리터 + 인자 리스트**로 돈다(셸 무경유).
+#   종전 `shell=True` 문자열(`python3 <pack>/…`)은 ① 셸이 PATH 첫 python3 를 풀어, 개발자 도구(CLT)
+#   없는 맥에서 /usr/bin 셔임(설치 창 + exit 1)을 SessionStart 마다 불렀고 ② `_pack` 무인용이라 공백 든
+#   경로(윈도우 사용자 프로필)에서 깨졌다. 이 파일을 부르는 훅은 이미 해소된 인터프리터(CYS_PY)로
+#   부르므로 sys.executable 이 곧 그 인터프리터다. `--preflight-cmd "<문자열>"` 명시 호환은 셸 그대로.
+DEFAULT_PREFLIGHT = [sys.executable or 'python3',
+                     os.path.join(_pack, 'bin', 'javis_preflight.py')]
 
 
 def run_preflight(cmd, timeout=PREFLIGHT_TIMEOUT):
     """preflight를 subprocess로 실행. (exit_code, 마지막 비어있지 않은 줄) 반환.
 
+    cmd 가 리스트면 인자 그대로(셸 무경유 · 기본값), 문자열이면 셸 명령(`--preflight-cmd` 호환).
     타임아웃 → ('timeout', None), 실행 자체 불가(OSError 등) → (None, None).
     어떤 경우에도 예외를 밖으로 던지지 않는다(크래시 금지).
     """
     try:
-        proc = subprocess.run(cmd, shell=True, capture_output=True,
+        proc = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
                               text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return ('timeout', None)

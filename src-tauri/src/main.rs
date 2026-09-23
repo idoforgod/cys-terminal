@@ -3582,6 +3582,59 @@ fn push_onboard_notice(app: &AppHandle, kind: &'static str, message: String) {
     let _ = app.emit("onboard-notice", json!({"kind": kind, "message": message}));
 }
 
+/// ★U15(0.14.41) 개발자 도구(CLT) 없는 맥 안내의 onboard-notice kind — 프런트 `showOnboardNotice` 가 **같은
+/// 문자열**로 분기한다(배선 3자 핀 `devtools_notice_is_wired_backend_setup_and_frontend`).
+///
+/// 채널 선택: 재설치 채널(bundle-damaged)이 아니다 — 고장이 아니라 **환경 안내**다. 기존 onboard-notice 는
+/// "먼저 쌓고 emit + 프런트 listen 직후 pull" 이라 emit-before-listen 유실이 구조적으로 없다(봉인 자가진단의
+/// pull 백스톱과 같은 틀 · 반박 D-3: 데몬이 UI 보다 먼저 뜨는 cysd 에 두면 1회성 알림이 유실된다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DEVTOOLS_NOTICE_KIND: &str = "devtools-missing";
+
+/// 버전당 1회 스로틀 마커 — `~/.cys/state/devtools-notice-<version>`(봉인 자가진단 마커와 같은 자리·같은 규약:
+/// 업데이트되면 새 번들이므로 다시 본다).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn devtools_notice_marker() -> std::path::PathBuf {
+    cys::home_dir()
+        .join(".cys/state")
+        .join(format!("devtools-notice-{}", env!("CARGO_PKG_VERSION")))
+}
+
+/// 안내를 낼 차례인가(순수 — 회귀 핀 대상). macOS 이고 이 버전에서 아직 알리지 않았고 CLT 도구가 빠졌을 때만
+/// 안내문. 문구는 lib 정본(`macos_devtools::devtools_missing_notice`) 그대로다(사본 금지).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn devtools_notice_due(
+    os: &str,
+    already_shown: bool,
+    python_present: bool,
+    git_present: bool,
+) -> Option<String> {
+    if os != "macos" || already_shown {
+        return None;
+    }
+    cys::macos_devtools::devtools_missing_notice(python_present, git_present)
+}
+
+/// setup(macOS 블록)에서 부른다 — 판정은 파일 stat 몇 번(셔임 실행 0)이라 부트 무차단이다. 마커 쓰기는
+/// best-effort(실패해도 다음 기동에 한 번 더 알릴 뿐 — 무해). 에이전트 큐(`cys send`)로는 보내지 않는다(①폭주 무관).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn maybe_push_devtools_notice(handle: &AppHandle) {
+    let marker = devtools_notice_marker();
+    let Some(msg) = devtools_notice_due(
+        std::env::consts::OS,
+        marker.exists(),
+        cys::macos_devtools::clt_tool_present("python3"),
+        cys::macos_devtools::clt_tool_present("git"),
+    ) else {
+        return;
+    };
+    push_onboard_notice(handle, DEVTOOLS_NOTICE_KIND, msg);
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&marker, "shown");
+}
+
 /// 프런트 pull — 이번 기동에 쌓인 온보딩 안내(없으면 빈 목록).
 #[tauri::command]
 fn onboard_notices() -> Vec<Value> {
@@ -6692,6 +6745,9 @@ fn main() {
                     // (advisory 전용 · 어떤 판정도 기동을 막지 않는다). 버전당 1회 스로틀,
                     // 단 파손 확인 시에는 고쳐질 때까지 매 기동 다시 본다(spawn_seal_selfdiag).
                     spawn_seal_selfdiag(handle.clone());
+                    // ★U15(0.14.41): 개발자 도구(CLT) 없는 맥 안내 — 버전당 1회 · onboard-notice 채널(pull 회수).
+                    //   stat 몇 번(셔임 실행 0)이라 부트를 기다리게 하지 않는다. CLT 가 있으면 아무 말도 없다.
+                    maybe_push_devtools_notice(&handle);
                 }
                 // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
                 // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
@@ -7132,6 +7188,59 @@ mod tests {
             cys::app_bundle::seal_broken_notice(bundle, &culprits, true),
             "push(emit)와 pull(캐시) 문구가 갈라졌다 — 이원화 금지 계약 위반"
         );
+    }
+
+    /// ★U15(0.14.41) 개발자 도구(CLT) 없는 맥 안내의 **배선 3자 핀**(소스 대조 — 심볼 무의존).
+    ///
+    /// 새 알림 종류는 "백엔드가 쌓는다 → 프런트가 같은 문자열로 분기한다"가 **둘 다** 있어야 뜬다.
+    /// 한쪽만 있으면 알림이 **조용히 사라진다**(이 파일 SEAL-DIAG 주석이 경고한 바로 그 형태).
+    ///   ① 백엔드: 기존 `onboard-notice` 채널(push + `onboard_notices` pull)에 kind 로 싣는다 —
+    ///      재설치 채널(bundle-damaged)과 섞지 않는다(고장이 아니다).
+    ///   ② setup: macOS 블록에서 봉인 자가진단 뒤에 부른다(부트 무차단 · stat 만).
+    ///   ③ 프런트: `showOnboardNotice` 가 같은 kind 를 토스트로 낸다.
+    #[test]
+    fn devtools_notice_is_wired_backend_setup_and_frontend() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let kind = concat!("\"devtools", "-missing\"");
+        assert!(
+            prod.contains(&format!("const DEVTOOLS_NOTICE_KIND: &str = {kind};")),
+            "백엔드 kind 상수 부재 — 알림을 쌓는 쪽이 없다"
+        );
+        assert!(
+            prod.contains("push_onboard_notice(handle, DEVTOOLS_NOTICE_KIND,"),
+            "안내가 onboard-notice 채널(push + pull 회수)로 나가지 않는다"
+        );
+        let sd = prod.find("spawn_seal_selfdiag(handle.clone());").expect("setup 봉인 자가진단 호출 소실");
+        let dn = prod.find("maybe_push_devtools_notice(&handle);").expect("setup 에서 CLT 안내를 부르지 않는다");
+        assert!(sd < dn, "CLT 안내 호출이 macOS setup 블록(봉인 자가진단 뒤)에 있지 않다");
+        let ui = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/main.ts"),
+        )
+        .expect("ui/src/main.ts 를 읽지 못했다 — 측정 불능은 통과가 아니다");
+        assert!(
+            ui.contains(&format!("kind === {kind}")),
+            "프런트 showOnboardNotice 가 {kind} 를 모른다 — 백엔드가 쌓아도 알림이 조용히 사라진다"
+        );
+    }
+
+    /// ★U15 안내 판정 진리표 — macOS ∧ 이 버전 미고지 ∧ 도구 결손일 때만 · 문구는 lib 정본 그대로.
+    #[test]
+    fn devtools_notice_due_truth_table() {
+        let full = devtools_notice_due("macos", false, false, false).expect("CLT 없는 맥에 안내가 없다");
+        assert_eq!(
+            Some(full.clone()),
+            cys::macos_devtools::devtools_missing_notice(false, false),
+            "GUI 안내가 lib 정본 문구와 갈라졌다(사본 금지)"
+        );
+        assert_eq!(devtools_notice_due("macos", true, false, false), None, "버전당 1회 스로틀이 없다");
+        assert_eq!(devtools_notice_due("macos", false, true, true), None, "CLT 있는 맥에서 안내가 떴다");
+        for os in ["windows", "linux", ""] {
+            assert_eq!(devtools_notice_due(os, false, false, false), None, "{os} 에서 맥 안내가 떴다");
+        }
+        assert!(devtools_notice_marker()
+            .to_string_lossy()
+            .ends_with(&format!("devtools-notice-{}", env!("CARGO_PKG_VERSION"))));
     }
 
     /// ★SEAL-DIAG pull 캐시 회귀 핀 ②(F3 격차1): 합산은 **어느 파손 판정도 떨어뜨리지

@@ -7808,8 +7808,13 @@ fn diag_legacy_config(_ctx: &DoctorCtx) -> DiagItem {
 /// `X.app/Contents/MacOS/<exe>` 를 조상 방향으로 거슬러 올라가되, `Contents/Info.plist`
 /// 존재로 **진짜 번들임을 확증**한다(이름만 `.app` 인 디렉토리에 속지 않는다).
 /// 번들 밖 실행(cargo run·비번들 설치)이면 None → 호출부가 Skip 으로 강등한다.
-/// ★심링크: `current_exe()` 는 이미 realpath 라 `/usr/local/bin/cys → 번들 안 실체`로 불러도
-///   번들이 정상 탐지된다(심링크 경로를 그대로 쓰면 탐지 실패했을 자리).
+/// ★심링크 정정(2026-09-23 리뷰1 rustc 프로브 실측 — 이 주석은 예전에 반대로 적혀 있었다):
+///   `current_exe()` 는 macOS 에서 심링크를 **풀지 않는다**. 그래서 `/usr/local/bin/cys → 번들
+///   안 실체` 처럼 심링크로 불렸을 때 이 함수에 그 심링크 경로가 그대로 들어오면, 조상 어디에도
+///   `.app` 세그먼트가 없어 탐지에 **실패한다**(호출부가 Skip 으로 강등 — 이 함수 자신은
+///   canonicalize 를 하지 않는다). 심링크-안전 탐지가 필요한 호출부는 먼저 경로를 정규화해야
+///   한다(예: `escalate_reclaim` 이 쓰는 [`cys::macos_devtools::canonicalized_exe_parent`] — 다만
+///   그건 exe_dir 을 원하는 소비자용이고, 번들 루트가 필요하면 canonicalize 후 이 함수를 부른다).
 fn detect_app_bundle(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     for anc in exe.ancestors() {
         let looks_app = anc
@@ -11607,7 +11612,25 @@ fn escalate_reclaim(role: &str) {
     }
     // ★SEAL-1: PATH 선두가 동봉 runtime 이면 이 `python3` 는 앱 번들 안의 인터프리터다 —
     // 팩토리가 PYTHONDONTWRITEBYTECODE 를 얹어 `.pyc` 번들 오염(코드서명 봉인 파손)을 막는다.
-    match cys::python_command("python3")
+    let mut cmd = cys::python_command("python3");
+    // ★U15(0.14.41 · 반박 M4): 개발자 도구(CLT) 없는 맥에서는 이 `python3` 가 PATH 의 /usr/bin 셔임(설치 창
+    //   + 비0 · stdout 빈 값)으로 풀려 죽은 좌석이 영영 회수되지 않았다(재부팅 뒤 대표 자리·빈 자리 복구 불능).
+    //   인터프리터 이름·스폰 지점은 그대로 두고(아래 Windows 보수 판정) **자식 PATH 선두**만 동봉 python
+    //   디렉터리로 바꾼다 — 그 이름이 동봉본으로 풀린다. None(윈도우·리눅스·CLT 있는 맥)이면 무접촉이다.
+    // ★리뷰1 MAJOR-2 실측: current_exe() 는 macOS 에서 심링크를 풀지 않는다 — `/usr/local/bin/cys`
+    //   심링크로 불리면(좌석 Bash·session-start.sh BOOT_CMD·role-bootstrap-legacy.sh spawn 폴백이
+    //   전부 이 경로로 부른다) `.parent()` 가 `/usr/local/bin` 이 되어 번들 탐지가 무력화된다.
+    //   `canonicalized_exe_parent` 로 심링크를 실체까지 푼 뒤 부모를 구한다(자세한 사실·근거는
+    //   그 함수 문서).
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(cys::macos_devtools::canonicalized_exe_parent)
+        .and_then(|d| cys::macos_devtools::clt_absent_child_path(&d, std::env::var_os("PATH").as_deref()))
+    {
+        cmd.env("PATH", path);
+    }
+    match cmd
         .arg(&helper)
         .args(["--reclaim", "--role", role])
         .output()
@@ -28030,6 +28053,39 @@ mod tests {
         assert!(
             !doctor_pid_is_cysd(std::process::id()),
             "테스트 바이너리(cys-<hash>) ≠ cysd"
+        );
+    }
+
+    /// ★U15(0.14.41 · 반박 M4) `cys boot` 회수 에스컬레이션 — CLT 없는 맥에서 PATH 의 `python3` 가
+    /// /usr/bin 셔임(설치 창 + 비0)으로 풀려 죽은 좌석이 영영 회수되지 않던 경로의 배선 핀.
+    ///
+    /// 두 계약을 **동시에** 못박는다:
+    ///   ⓐ 파괴 경로의 인터프리터 후보를 넓히지 않는다(건강성 H-SAFE-W ⓔ — 프로그램 이름 `python3`
+    ///      단일 · 스폰 사이트 1개). 그래서 치환은 후보 목록이 아니라 **자식 PATH 선두**로만 한다.
+    ///   ⓑ 그 PATH 는 lib 단일 판정(`macos_devtools::clt_absent_child_path`)에서만 온다 — 윈도우·리눅스·
+    ///      CLT 있는 맥은 None 이라 `.env("PATH", …)` 자체가 호출되지 않는다(종전 자식 env 와 동일).
+    #[test]
+    fn escalate_reclaim_fixes_shim_by_child_path_not_by_widening() {
+        let src = include_str!("cys.rs");
+        let i = src.find("fn escalate_reclaim(").expect("escalate_reclaim 소실");
+        let body = &src[i..i + src[i..].find("\n}\n").expect("본문 끝 소실")];
+        assert!(
+            body.contains("cys::python_command(\"python3\")"),
+            "회수 인터프리터 이름이 python3 단일이 아니다(Windows 보수 판정 이탈)"
+        );
+        // 자기참조 회피: lib 의 python 직스폰 전수 열거 핀이 이 파일을 줄 단위로 스캔하므로
+        // 스폰 니들은 조각 결합으로만 만든다(한 줄에 니들 + 'python' 이 같이 있으면 지점으로 세어진다).
+        let spawn_needle = concat!("Command", "::", "new(");
+        let factory_needle = concat!("python", "_command(");
+        let sites = body.matches(factory_needle).count() + body.matches(spawn_needle).count();
+        assert_eq!(sites, 1, "회수 스폰 사이트가 1개가 아니다 — 인터프리터 후보를 넓혔다");
+        assert!(
+            body.contains("macos_devtools::clt_absent_child_path("),
+            "CLT 없는 맥 회수 자식 PATH 치환이 배선되지 않았다 — 셔임이 회수를 막는다(M4)"
+        );
+        assert!(
+            body.contains("cmd.env(\"PATH\","),
+            "자식 PATH 를 실제로 얹는 자리가 없다"
         );
     }
 
