@@ -148,6 +148,93 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 }
 #btn-ws-new:hover { color: var(--accent); }
 
+/* ───── 사이드바 바닥 공용 꼬리(#wsbar-foot · U1 사용량 → U6 피드백 → U17 전문가용) ─────
+   #ws-tabs(flex:1) 다음 형제. 꼬리가 늘어도 워크스페이스 목록이 0px 로 눌려 '탭이 사라진' 것처럼 보이지 않게
+   목록에 하한을 두고(글자 배율 연동), 꼬리 묶음은 상한을 넘으면 스스로 스크롤한다(min-height:0 = flex 수축 허용).
+   크롬 표면이라 크롬 토큰(--text·--hairline·--ok/warn/error)만 쓴다 — --canvas-text(배경 테마 연동) 금지.
+   이모지·아이콘 폰트 금지 관례(index.html) — 접기 표시는 그룹 헤더와 같은 ▸/▾ 글리프. */
+#ws-tabs { min-height: calc(96px * var(--wsbar-font, 1)); }
+/* 꼬리는 세로 flex — 상한(50vh)에 닿으면 **사용량 상세만** 줄어들며 스스로 스크롤하고, 사용량 요약 줄·피드백 슬롯·
+   전문가용 토글은 늘 보인다(실측: 176px·배율 2.2 에서 사용량 패널 531px 이 전문가용 칸을 꼬리 밖으로 밀어냈다).
+   꼬리 자체의 overflow-y 는 줄어들 수 없는 칸들만으로도 상한을 넘는 극단(펼친 전문가용·큰 배율·낮은 창)의 안전판이다. */
+#wsbar-foot {
+  flex: 0 1 auto; min-height: 0; max-height: 50vh; overflow-y: auto;
+  display: flex; flex-direction: column;
+  border-top: 1px solid var(--hairline); padding: 4px 10px 6px;
+}
+#wsbar-foot > * { flex: none; }
+/* 피드백 단추(U6·A3 소유 #btn-feedback)는 이 꼬리의 가로 여백(10px) 안에 들어온다 — 단추 자체의 가로 여백까지 더하면
+   18px 로 이중 들여쓰기돼 사용량·전문가용과 줄이 어긋난다(리뷰1 M11). 배치는 꼬리 소유(A2)라 여기서 가로 여백만 걷는다.
+   ID 2개 선택자라 단추 쪽 규칙(ID 1개)보다 우선한다 · 단추가 없으면 아무 효과 없음. 세로 여백은 단추 규칙 그대로. */
+#wsbar-feedback-slot > #btn-feedback { width: 100%; margin-left: 0; margin-right: 0; }
+/* 짝 규칙(Directive): display 를 명시한 칸은 [hidden] 이 무력화되지 않게 짝을 단다. */
+#wsbar-foot[hidden], #wsbar-foot > #wsbar-usage[hidden] { display: none; }
+/* U1 사용량 패널 — 표시 전용(textContent). 폭 176px·배율 2.2 에서도 가로 넘침 없이 말줄임·줄바꿈. */
+/* 하한 = 머리줄(요약) 한 줄 높이(1.4em 줄높이 + 위아래 3px 패딩 + 여유) — 그 아래로 줄면 머리줄이 칸 밖으로 새어
+   옆 칸(피드백·전문가용)을 덮는다(실측: 창 높이 420·배율 2.2·전문가용 펼침에서 4px 까지 눌림). 넘치는 상세는 본문이 스크롤. */
+#wsbar-foot > #wsbar-usage {
+  flex: 0 1 auto; min-height: calc(1.4em + 8px); overflow: hidden; display: flex; flex-direction: column;
+  font-size: calc(11px * var(--wsbar-font, 1)); color: var(--text); padding-bottom: 4px;
+}
+#wsbar-usage .usage-head { flex: none; }
+#wsbar-usage .usage-body { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+#wsbar-usage .usage-body[hidden] { display: none; }
+#wsbar-usage .usage-head, #btn-expert-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0;
+  background: none; border: none; padding: 3px 0; margin: 0; cursor: pointer; text-align: left;
+  font: inherit; font-weight: 700; letter-spacing: .04em; color: #6e7681;
+}
+#wsbar-usage .usage-head:hover, #btn-expert-toggle:hover { color: var(--text); }
+#wsbar-usage .usage-chev, #btn-expert-toggle .expert-chev { flex: none; width: 10px; }
+#wsbar-usage .usage-title { flex: none; }
+#wsbar-usage .usage-sum {
+  flex: 1; min-width: 0; text-align: right; font-weight: 400; letter-spacing: 0; color: #8b949e;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#wsbar-usage .usage-sum.warn { color: var(--warn); }
+#wsbar-usage .usage-acct { font-weight: 600; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-usage .usage-win { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; min-width: 0; }
+#wsbar-usage .usage-win-lab { flex: none; width: 2.2em; color: #8b949e; }
+#wsbar-usage .usage-win-pct { flex: none; font-weight: 600; }
+#wsbar-usage .usage-win-reset {
+  flex: 1; min-width: 0; text-align: right; color: #8b949e;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#wsbar-usage .usage-gauge { height: 4px; margin-top: 2px; border-radius: 2px; background: #21262d; overflow: hidden; }
+#wsbar-usage .usage-gauge-fill { display: block; height: 100%; background: var(--ok); }
+#wsbar-usage .warn { color: var(--warn); }
+#wsbar-usage .crit { color: var(--error); }
+#wsbar-usage .usage-gauge-fill.warn { background: var(--warn); }
+#wsbar-usage .usage-gauge-fill.crit { background: var(--error); }
+#wsbar-usage .usage-note, #wsbar-usage .usage-msg, #wsbar-usage .usage-unobs, #wsbar-usage .usage-more {
+  margin-top: 3px; color: #8b949e; overflow-wrap: anywhere;
+}
+#wsbar-usage .usage-exhaust { margin-top: 3px; color: var(--warn); overflow-wrap: anywhere; }
+#wsbar-usage .usage-foot { margin-top: 4px; color: var(--warn); overflow-wrap: anywhere; }
+#wsbar-usage .usage-others { margin-top: 5px; padding-top: 4px; border-top: 1px solid var(--hairline); }
+#wsbar-usage .usage-other { display: flex; gap: 6px; min-width: 0; margin-top: 2px; }
+#wsbar-usage .usage-other-lab { flex: none; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-usage .usage-other-txt {
+  flex: 1; min-width: 0; text-align: right; color: #8b949e;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#wsbar-usage .dim { opacity: .55; }
+/* U17 전문가용 칸 — 토글(기본 접힘) + 본문(팀 직접 만들기). 본문은 hidden 으로 접는다. */
+#wsbar-expert { font-size: calc(11px * var(--wsbar-font, 1)); border-top: 1px solid var(--hairline); padding-top: 2px; }
+#btn-expert-toggle .expert-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-expert-body { padding: 4px 0 2px 16px; }
+/* 짝 규칙(Directive): 본문에 display 를 명시하게 되면 [hidden](UA display:none)이 무력화돼 '기본 접힘'이 조용히
+   무너진다 — 지금은 display 를 주지 않지만, 누가 주더라도 접힘이 살도록 짝을 미리 단다(expertwiring.test.ts 핀). */
+#wsbar-expert-body[hidden] { display: none; }
+#btn-ws-dept {
+  width: 100%; text-align: left; white-space: normal; cursor: pointer;
+  background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 8px; font-size: calc(12px * var(--wsbar-font, 1));
+}
+#btn-ws-dept:hover { border-color: var(--accent); }
+/* 확인 창 본문의 공백 없는 긴 경로(윈도우 작업 폴더 등)가 가로로 넘치지 않게 — 모든 모달에 무해. */
+.modal p { overflow-wrap: anywhere; }
+
 /* 06: 워크스페이스 그룹 헤더·body (기존 .ws-tab 변수·팔레트 재사용) */
 .ws-group { display: flex; flex-direction: column; }
 .ws-group-head {

@@ -129,6 +129,8 @@ import {
 } from "./seatsig";
 import { makeAlertsTracker, readAlerts, makeFeedSwitchScheduler, type AlertsView } from "./probefail";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import { buildUsageBarModel, shouldFetchAccounts } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정)
+import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
@@ -761,13 +763,10 @@ function tickCc() {
 async function refreshControlCenter() {
   if (!ccOpen) return;
   // 계정 Rate Limit(전 조직 병합) — Live KPI/게이지가 이 데이터를 쓰므로 대시보드 렌더 전에 최신화.
-  if (ccTab === "live") {
-    try {
-      ccAccounts = ((await invoke("usage_accounts_all")) as any)?.accounts ?? [];
-    } catch {
-      /* 데몬 일시 부재 — 직전 스냅샷 유지, 다음 틱 재시도 */
-    }
-  }
+  // ★U1: 사이드바 사용량 패널과 **같은 공유 fetcher**(refreshAccountsShared)를 쓴다. force 는 사이드바의
+  //   부팅 유예·30초 간격만 건너뛰고(종전 5초 주기 보존) in-flight 가드는 지킨다 — 종전 직접 invoke 는
+  //   5초마다 가드 없이 겹쳐 쌓였다(조사 §8-③). 실패는 fetcher 가 삼키고 직전 스냅샷을 유지한다.
+  if (ccTab === "live") await refreshAccountsShared(true);
   try {
     renderControlCenter(await invoke("control_dashboard"));
     ccFailStreak = 0;
@@ -4083,6 +4082,197 @@ async function refreshSidebarStatus() {
   // '합계는 맞는데 배지는 사라지는' 절반 수리가 된다(승인 도착 순간 배지가 깜빡 사라진다).
   updatePendingBadges(pendingApprovals); // CC 버튼·승인 Feed 탭 배지 동기
   renderWsTabs(); // 신호 반영 재렌더
+  // ★U1 사용량 패널 — 새 타이머 없이 이 10초 틱(과 이벤트 구동 호출)에 얹는다. 조회는 부팅 유예·30초 간격·
+  //   in-flight 가드 뒤에서만 나가므로 대부분 즉시 반환한다(status.changed 폭주에도 RPC 0).
+  //   반드시 **void(비대기)** — ceoIsActivelyGenerating 이 이 함수를 await 하므로, 여기서 조회를 기다리면
+  //   승인 자동전환 판정이 부서 소켓 수만큼 늦어진다. 렌더는 '관측 N분 전'·리셋 지남을 조회 없이 전진시킨다.
+  void refreshAccountsShared(false);
+  renderUsageBar();
+}
+
+// ---------- U1 사이드바 사용량 패널 (#wsbar-usage) ----------
+// 판정·표기는 usagebar.ts(순수 · usagebar.test.ts), 여기는 조회·DOM 배선만(usagewiring.test.ts 가 배선 핀).
+// ★표시 전용: 에이전트 입력 경로(send·queue·send-key)·statusline 파서·nodeSig 폴백을 만들지 않는다(설계 금지).
+const ACCT_FLIGHT_KEY = "acct:all"; // claimFlight 키 — 기존 `list:`·`org:` 키와 겹치지 않는다
+// 넘기면: 이번 회차 사용량 조회를 JS 쪽에서 포기 — 직전 값 유지·실패 1회 계상(3회 연속이면 '데몬 응답 없음').
+//   Rust usage_accounts_all 은 소켓마다 2초 상한으로 **순차** 순회하므로 부서가 여럿이면 합이 T_LIST(8초)를
+//   넘을 수 있다(그러면 부분 성공 결과를 버린다) — 그래서 따로 넉넉히 잡는다. in-flight 는 원 호출이 실제로
+//   끝날 때 풀리므로(releaseFlightWhenSettled) 여기서 포기해도 같은 데몬에 요청이 쌓이지 않는다.
+const T_ACCT = winScaled(20_000); // 넘기면: 위 주석 — 값 유지·실패 계상(재시도는 다음 틱)
+// 복원 완료를 처음 본 뒤 이 시간 동안은 사이드바 경로로 조회하지 않는다 — Windows 기동 직후의 named pipe
+// fan-out(PIPE_BUSY 231 실사고)에 조회를 얹지 않기 위해서다. CC Live(force)는 사람이 연 것이라 예외.
+const ACCT_BOOT_GRACE_MS = winScaled(15_000);
+const ACCT_SIDEBAR_MIN_MS = 30_000; // 사이드바 경로 최소 조회 간격(CC Live 가 열려 있으면 그쪽 5초 조회를 공유)
+let acctStartedAtMs: number | null = null;
+let acctLastAttemptAtMs: number | null = null;
+let acctOkAtMs: number | null = null;
+let acctFailStreak = 0;
+// 직전에 그린 본문 모델의 직렬화 — 같으면 본문을 다시 만들지 않는다(리뷰1 M5). refreshSidebarStatus 는 10초 틱 말고도
+// 이벤트(status.changed 등)로 수시로 불리는데, 그때마다 replaceChildren 으로 갈아 끼우면 호버 중인 계정 툴팁
+// (이메일·집계 범위)이 사라진다. 모델에는 '관측 N분 전'·리셋 지남이 들어 있어 값이 바뀌면 그대로 다시 그린다.
+let usageBodySig = "";
+const USAGE_COLLAPSED_KEY = "cys-wsbar-usage-collapsed"; // 뷰어별 편의 설정(접힘) — 저장 실패는 무시
+let usageCollapsed = false;
+try {
+  usageCollapsed = localStorage.getItem(USAGE_COLLAPSED_KEY) === "1";
+} catch {
+  /* 저장소 차단 — 펼친 채로 시작 */
+}
+
+/** 계정 사용량 공유 fetcher — 사이드바 10초 틱(void)과 Control Center Live(force·await) 두 곳에서만 부른다.
+ *  어떤 오류도 던지지 않는다(표시 전용 — 호출측 틱·CC 갱신으로 새지 않게). */
+async function refreshAccountsShared(force: boolean): Promise<void> {
+  try {
+    const now = Date.now();
+    if (started && acctStartedAtMs === null) acctStartedAtMs = now;
+    const go = shouldFetchAccounts(now, {
+      started,
+      startedAtMs: acctStartedAtMs,
+      lastAttemptAtMs: acctLastAttemptAtMs,
+      force,
+      graceMs: ACCT_BOOT_GRACE_MS,
+      minIntervalMs: ACCT_SIDEBAR_MIN_MS,
+    });
+    if (!go) return;
+    if (!claimFlight(ACCT_FLIGHT_KEY)) return; // 직전 조회가 아직 안 끝났다 — 쌓지 않는다
+    acctLastAttemptAtMs = now;
+    try {
+      const call = invoke("usage_accounts_all");
+      releaseFlightWhenSettled(ACCT_FLIGHT_KEY, call);
+      const r = (await rpcT(call, T_ACCT)) as { accounts?: unknown } | null;
+      ccAccounts = Array.isArray(r?.accounts) ? (r!.accounts as any[]) : [];
+      acctOkAtMs = Date.now();
+      acctFailStreak = 0;
+    } catch {
+      acctFailStreak++; // 직전 스냅샷 유지 — 3회 연속이면 패널이 '데몬 응답 없음 — HH:MM 기준 값'
+    }
+    renderUsageBar();
+  } catch {
+    /* 표시 전용 — 삼킨다 */
+  }
+}
+
+function setUsageCollapsed(v: boolean): void {
+  usageCollapsed = v;
+  try {
+    localStorage.setItem(USAGE_COLLAPSED_KEY, v ? "1" : "0");
+  } catch {
+    /* 저장소 차단 — 이번 실행 동안만 유지 */
+  }
+  renderUsageBar();
+}
+
+/** #wsbar-usage 렌더 — 모델(usagebar.ts)을 textContent 로만 옮긴다. 머리(접기 버튼)는 한 번 만들고 재사용해
+ *  10초마다 다시 그려도 키보드 포커스가 날아가지 않는다. 어떤 오류도 삼킨다(표시 전용). */
+function renderUsageBar(): void {
+  try {
+    const host = document.getElementById("wsbar-usage");
+    if (!host) return;
+    let head = host.querySelector(".usage-head") as HTMLButtonElement | null;
+    let body = host.querySelector(".usage-body") as HTMLElement | null;
+    if (!head || !body) {
+      usageBodySig = ""; // 칸을 새로 만들면 본문도 반드시 다시 그린다
+      host.replaceChildren();
+      head = document.createElement("button");
+      head.type = "button";
+      head.className = "usage-head";
+      const chev = document.createElement("span");
+      chev.className = "usage-chev";
+      chev.setAttribute("aria-hidden", "true");
+      const title = document.createElement("span");
+      title.className = "usage-title";
+      title.textContent = "사용량";
+      const sum = document.createElement("span");
+      sum.className = "usage-sum";
+      head.append(chev, title, sum);
+      head.addEventListener("click", () => setUsageCollapsed(!usageCollapsed));
+      body = document.createElement("div");
+      body.className = "usage-body";
+      host.append(head, body);
+    }
+    const model = buildUsageBarModel(
+      ccAccounts,
+      Date.now() / 1000,
+      { everOk: acctOkAtMs !== null, failStreak: acctFailStreak, okAtSec: acctOkAtMs === null ? null : acctOkAtMs / 1000 },
+      ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁에만 나온다
+      ccAcctRedact, // 🔒 가림이면 툴팁의 설정 폴더도 끝 이름만(윈도우 절대경로의 OS 사용자명 — 리뷰1 M9)
+    );
+    // 머리줄은 값이 바뀔 때만 건드린다(같은 값 재대입도 호버 중인 요소의 텍스트 노드를 갈아 끼운다).
+    const setText = (el: HTMLElement, t: string) => {
+      if (el.textContent !== t) el.textContent = t;
+    };
+    head.setAttribute("aria-expanded", usageCollapsed ? "false" : "true");
+    const headTitle = `계정별 5시간·7일 한도 사용률 — 눌러서 ${usageCollapsed ? "펼치기" : "접기"}. 자세히는 Control Center > Live.`;
+    if (head.title !== headTitle) head.title = headTitle;
+    setText(head.querySelector(".usage-chev") as HTMLElement, usageCollapsed ? "▸" : "▾");
+    const sumEl = head.querySelector(".usage-sum") as HTMLElement;
+    // 조회 연속 실패면 요약 줄에도 표시한다(접힌 채로도 보이게) — 첫 조회 전 실패는 headline 자체가 "응답 없음"이다.
+    setText(sumEl, model.footer && model.headline !== "응답 없음" ? `${model.headline} · 응답 없음` : model.headline);
+    sumEl.classList.toggle("warn", !!model.footer);
+    host.classList.toggle("collapsed", usageCollapsed);
+    body.hidden = usageCollapsed;
+    const sig = JSON.stringify(model);
+    if (sig === usageBodySig) return; // 본문 모델이 직전과 같다 — 다시 만들지 않는다(호버 툴팁 유지 · 리뷰1 M5)
+    const kids: HTMLElement[] = [];
+    const el = (cls: string, text: string, title?: string): HTMLElement => {
+      const d = document.createElement("div");
+      d.className = cls;
+      d.textContent = text;
+      if (title) d.title = title;
+      return d;
+    };
+    const p = model.primary;
+    if (p) {
+      const box = el("usage-primary" + (p.fresh.level === "stale" ? " dim" : ""), "", p.tooltip);
+      box.appendChild(el("usage-acct", p.label));
+      for (const w of p.windows) {
+        const row = el("usage-win", "");
+        const lab = document.createElement("span");
+        lab.className = "usage-win-lab";
+        lab.textContent = w.label;
+        const pct = document.createElement("span");
+        pct.className = "usage-win-pct" + (w.sev ? ` ${w.sev}` : "");
+        pct.textContent = w.text;
+        const rs = document.createElement("span");
+        rs.className = "usage-win-reset";
+        rs.textContent = w.resetText;
+        row.append(lab, pct, rs);
+        box.appendChild(row);
+        const gauge = el("usage-gauge", "");
+        const fill = document.createElement("span");
+        fill.className = "usage-gauge-fill" + (w.sev ? ` ${w.sev}` : "");
+        fill.style.width = `${w.pct ?? 0}%`;
+        gauge.appendChild(fill);
+        box.appendChild(gauge);
+      }
+      if (p.fresh.note) box.appendChild(el("usage-note", p.fresh.note));
+      if (p.exhaust) box.appendChild(el("usage-exhaust", p.exhaust));
+      kids.push(box);
+    }
+    if (model.message) kids.push(el("usage-msg", model.message));
+    if (model.others.length || model.moreCount) {
+      const box = el("usage-others", "");
+      for (const o of model.others) {
+        const row = el("usage-other" + (o.dim ? " dim" : ""), "", o.tooltip);
+        const lab = document.createElement("span");
+        lab.className = "usage-other-lab";
+        lab.textContent = o.label;
+        const txt = document.createElement("span");
+        txt.className = "usage-other-txt";
+        txt.textContent = o.text;
+        row.append(lab, txt);
+        box.appendChild(row);
+      }
+      if (model.moreCount) box.appendChild(el("usage-more", `외 ${model.moreCount}개 — Control Center > Live`));
+      kids.push(box);
+    }
+    if (model.unobservedCount) kids.push(el("usage-unobs", `관측 없음 ${model.unobservedCount}개`, model.unobservedTooltip));
+    if (model.footer) kids.push(el("usage-foot", model.footer));
+    body.replaceChildren(...kids);
+    usageBodySig = sig; // 다 그린 뒤에만 기록 — 중간에 던지면 다음 호출이 다시 그린다
+  } catch {
+    /* 표시 전용 — 사이드바 틱·CC 갱신으로 새지 않는다 */
+  }
 }
 
 // 승인 대기 건수 배지 — 상단 Control Center 버튼 + 편입된 '승인 Feed' 탭 둘 다 갱신.
@@ -6782,7 +6972,9 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:equalize", title: "역할별 정렬 (대표 1/3)", keywords: "equalize 균등 정렬 layout 대표", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
-    { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => { if (daemonActionBlocked()) return; void addDeptWorkspace(); } },
+    // ★U17: 전문가용 칸 버튼과 **같은 흐름**(확인 창 1회·재진입 가드·started/리셋 가드). 종전에는 확인·가드 없이
+    //   `void addDeptWorkspace()` 로 실패(상한 exit 8 등)까지 삼켰다(조사 F1) — 이제 run() 의 try/catch 가 받는다.
+    { id: "act:dept", title: "팀 직접 만들기 (전문가용)", subtitle: "독립 부서장·전용 데몬 — 만들기 전에 확인 창이 한 번 뜹니다", keywords: "dept team workspace 부서 팀 부서장 master 만들기 전문가 expert 부서 워크스페이스 추가 ＋부서 +부서", action: async () => { await openTeamCreateFlow({ anchor: null }); } },
   );
   return items;
 }
@@ -8987,6 +9179,7 @@ acctRedactBtn.addEventListener("click", (e) => {
   localStorage.setItem("cys-cc-acct-redact", ccAcctRedact ? "1" : "0");
   (e.currentTarget as HTMLElement).classList.toggle("active", ccAcctRedact);
   refreshControlCenter();
+  renderUsageBar(); // U1: 사이드바 사용량 패널 툴팁의 이메일도 같은 가림을 따른다
 });
 // 스킬 보드 검색 — 카탈로그 버튼 필터(재fetch 없이 renderBoardDomains 재렌더).
 document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
@@ -9000,7 +9193,7 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );
 // 역할 분리(오너 2026-06-29 결정): "새 워크스페이스"(btn-ws-new) = 기본/현재 데몬의 일반 워크스페이스
-// (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 "+부서"(btn-ws-dept→addDeptWorkspace) 전담.
+// (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 전문가용 칸 "팀 직접 만들기"(btn-ws-dept→openTeamCreateFlow) 전담.
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
 document.getElementById("btn-ws-new")!.addEventListener("click", () => {
@@ -9080,20 +9273,111 @@ function applyWsbarFontStep(dir: number) {
 }
 document.getElementById("btn-ws-font-minus")?.addEventListener("click", () => applyWsbarFontStep(-1));
 document.getElementById("btn-ws-font-plus")?.addEventListener("click", () => applyWsbarFontStep(+1));
-// 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
-const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
-// 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.
-// ⑤(gemini R2): invoke 실패 reject 를 try/catch 로 받아 토스트+버튼 disabled 해제(버튼 freeze 방지).
+// ---------- U17 「전문가용」 칸 · 팀 직접 만들기(만들기 전 확인 창 1회) ----------
+// 오너 지시(2026-09-23): 팀(부서)을 직접 만드는 메뉴는 사이드바 바닥 「전문가용」 칸 안으로, 만들기 전 확인 창 1회.
+// 종전 ＋부서는 머리줄 ＋(새 워크스페이스) 바로 옆이라 잘못 누르기 쉬웠고, 카탈로그가 없으면 클릭 1회에 곧바로
+// 새 데몬·CEO 승격·티켓·편성 최대 5석까지 만들었다. 팔레트 act:dept 는 확인·가드 없이 `void addDeptWorkspace()` 로
+// 실패까지 삼켰다(조사 F1). 이제 두 입구 모두 openTeamCreateFlow → confirmAndCreateTeam → launchDept 한 길이다.
+// 판정·문구는 deptcreate.ts(순수 · deptcreate.test.ts), 배선 핀은 expertwiring.test.ts.
+// ★index.html 의 #wsbar-expert 는 **빈 칸**이다 — A2·A3 가 공용 꼬리(#wsbar-foot) 마크업을 바이트 그대로 공유해
+//   병합 충돌을 없애기 위해서다. 토글·본문·버튼은 여기서 만든다. id `btn-ws-dept` 는 유지(style.css :disabled 규칙).
+// ★부서 생성은 사람(오너)이 누르는 경로다 — 에이전트가 부를 수 있는 새 단축로를 만들지 않는다(역할 분리 불변).
+
+/** 흐름 결과 — U16(말로 팀 만들기) 카드가 created 일 때만 후속 처리(feed 해소)를 하도록 돌려준다. */
+type TeamCreateOutcome = "created" | "cancelled" | "busy" | "blocked" | "failed" | "menu";
+/** 입구에서 한 번 읽은 레지스트리·카탈로그 — 확인 창 문구와 exit 3 재확인이 같은 스냅샷을 본다. */
+interface TeamCreateCtx {
+  catalog: DeptCatalog | null;
+  registry: DeptRegistry | null; // null = 조회 실패(확인 창이 단정하지 않는 문구를 쓴다)
+  allRunning: boolean;
+  catalogUnreadable: boolean;
+}
+
+let expertOpen = false; // 앱이 켜져 있는 동안만 기억(다시 켜면 접힘 — 설계 D2 · 저장소 미사용)
+const deptBtnEl = (): HTMLButtonElement | null => document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
+
+function setExpertOpen(open: boolean): void {
+  expertOpen = open;
+  const body = document.getElementById("wsbar-expert-body");
+  const toggle = document.getElementById("btn-expert-toggle");
+  if (body) body.hidden = !open;
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    const chev = toggle.querySelector(".expert-chev");
+    if (chev) chev.textContent = open ? "▾" : "▸";
+  }
+}
+
+/** #wsbar-expert 안에 토글 + 기본 접힘 본문(팀 직접 만들기)을 만든다. 멱등 · 널 안전(칸이 없으면 아무것도 안 한다).
+ *  ★접힌 본문은 `hidden` 이다 — style.css 가 #wsbar-expert-body 에 display 를 주면 짝 규칙([hidden]{display:none})이
+ *  함께 있어야 기본 접힘이 조용히 무너지지 않는다(반박 D4 · expertwiring.test.ts 핀). */
+function mountExpertSection(): void {
+  const host = document.getElementById("wsbar-expert");
+  if (!host || document.getElementById("btn-ws-dept")) return;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.id = "btn-expert-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", "wsbar-expert-body");
+  toggle.title = "전문가용 — 팀을 메뉴로 직접 만들기 등";
+  const chev = document.createElement("span");
+  chev.className = "expert-chev";
+  chev.setAttribute("aria-hidden", "true");
+  chev.textContent = "▸"; // 그룹 헤더와 같은 글리프(윈도우 폰트 추가 의존 없음 · 이모지 금지 관례)
+  const label = document.createElement("span");
+  label.className = "expert-label";
+  label.textContent = "전문가용";
+  toggle.append(chev, label);
+  const body = document.createElement("div");
+  body.id = "wsbar-expert-body";
+  body.hidden = true;
+  const dept = document.createElement("button");
+  dept.type = "button";
+  dept.id = "btn-ws-dept";
+  dept.textContent = "팀 직접 만들기";
+  dept.title = "팀(독립 부서장·전용 데몬) 직접 만들기 — 만들기 전에 확인 창이 한 번 뜹니다";
+  body.appendChild(dept);
+  host.replaceChildren(toggle, body);
+  toggle.addEventListener("click", () => setExpertOpen(!expertOpen));
+  dept.addEventListener("click", () => {
+    openTeamCreateFlow({ anchor: dept }).catch((e) => toast("watchdog", "팀 만들기 실패", String(e)));
+  });
+}
+try {
+  mountExpertSection();
+} catch {
+  /* 칸을 못 만들어도 앱은 뜬다 — 명령 팔레트(⌘K) '팀 직접 만들기'가 같은 흐름을 연다 */
+}
+// U1: 사용량 패널 초기 렌더('사용량 확인 대기 중') — start() 와 무관하게 여기서 1회. 복원이 길거나 start() 가
+// 실패해도(그 경로엔 10초 틱이 없다) 빈 섹션이 남지 않는다(반박 D4·D5). 스스로 오류를 삼킨다.
+// 대기 문구는 무기한 남아도 참인 말이다('바로 보려면 Control Center > Live' — 그 경로도 force 조회라 된다 · 리뷰1 M8).
+renderUsageBar();
+
+// 진행 중 가드 — DOM 버튼(disabled)이 아니라 모듈 변수다(조사 F4: 버튼이 옮겨지거나 없으면 모든 생성이 조용한 no-op).
+let deptLaunchInFlight = false;
+// 부서 런칭 실행(공통) — placeholder 탭·in-flight 가드. catalogKey=undefined → 번호 팀(레거시 dept-N).
+// ⑤(gemini R2): invoke 실패 reject 를 try/catch 로 받아 토스트 + 버튼 해제(버튼 freeze 방지).
 // ①(gemini R2 ★BLOCKER): create exit code 별 분기 — exit5(account dir 미존재=계정누수)는 레거시 폴백 절대 금지.
-async function launchDept(catalogKey?: string) {
-  if (daemonActionBlocked()) return; // ★A4: 리셋 진행/완료 중 부서 데몬 spawn 차단
-  if (!deptBtn || deptBtn.disabled) return; // 연타 차단 — in-flight launch 중 재실행 방지
-  const prevLabel = deptBtn.textContent;
-  deptBtn.disabled = true;
-  deptBtn.textContent = "…"; // 진행 표시 — launch await 동안(placeholder 탭은 즉시 보임)
+// ★U17: exit3(카탈로그 부재)도 더는 번호 팀을 **자동으로** 만들지 않는다 — 대상이 바뀌었으므로 새 대상에 대한 확인 창을
+//   한 번 더 띄운다(설계 D5 · 윈도우에서 HOME≠USERPROFILE 이면 GUI 와 cys-dept 가 다른 카탈로그를 보는 경로도 닫힌다).
+async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, displayName?: string): Promise<TeamCreateOutcome> {
+  if (daemonActionBlocked()) return "blocked"; // ★A4: 리셋 진행/완료 중 부서 데몬 spawn 차단 — 확인 창 대기 중 상태 변화 대비 재검사
+  if (deptLaunchInFlight) {
+    notifyTeamFlowBusy(); // 연타·중복 생성 차단 — 조용히 끝내지 않는다
+    return "busy";
+  }
+  deptLaunchInFlight = true;
+  const btn = deptBtnEl(); // 표시 전용(없어도 가드는 동작)
+  const prevLabel = btn?.textContent || "팀 직접 만들기";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "만드는 중…"; // 진행 표시 — launch await 동안(placeholder 탭은 즉시 보임)
+  }
   let fallbackLegacy = false;
+  let outcome: TeamCreateOutcome = "failed";
   try {
     await addDeptWorkspace(catalogKey);
+    outcome = "created";
   } catch (e) {
     // main.rs 가 create 실패를 'dept-create:<code>:<stderr>' 로 전달(레거시 allocate 실패는 평문).
     const msg = String(e);
@@ -9105,66 +9389,130 @@ async function launchDept(catalogKey?: string) {
     } else if (code === 4) {
       // 카탈로그에 정의되지 않은 키 → 에러(레거시 폴백 안 함 — 의도치 않은 무명 부서 방지).
       toast("watchdog", "부서 생성 실패(카탈로그 키)", "카탈로그 미정의 부서 — 레거시 폴백 안 함.");
-    } else if (code === 3) {
-      // 카탈로그 파일 부재(비격리 위험 없음·번호만) → 레거시 dept-N 허용.
-      toast("watchdog", "카탈로그 없음", "레거시 dept-N 으로 생성합니다.");
-      fallbackLegacy = true;
+    } else if (code === 3 && catalogKey !== undefined) {
+      fallbackLegacy = true; // 카탈로그 파일 부재(비격리 위험 없음·번호만) — 아래에서 새 대상 재확인
     } else {
-      toast("watchdog", "부서 런칭 실패", msg);
+      toast("watchdog", "팀 만들기 실패", msg);
     }
   } finally {
-    deptBtn.disabled = false; // 버튼 freeze 방지 — 성공/실패 무관 항상 해제
-    deptBtn.textContent = prevLabel;
+    deptLaunchInFlight = false; // 성공/실패 무관 항상 해제(버튼 freeze·영구 busy 방지)
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
   }
-  // exit3(카탈로그 부재)만 레거시 폴백 — 버튼 재활성 후 호출해 disabled 가드 통과(exit4/5 는 폴백 없음).
-  if (fallbackLegacy) await launchDept(undefined);
+  if (fallbackLegacy) {
+    const plan = buildDeptCreatePlan({ key: undefined, catalog: null, registry: ctx.registry, fallbackFrom: displayName ?? catalogKey });
+    if (!(await confirmModal(plan.title, plan.body, plan.yesLabel, plan.noLabel))) return "cancelled";
+    return await launchDept(undefined, ctx, plan.displayName); // 번호 팀은 exit 3 을 내지 않는다(재귀 1단 상한)
+  }
+  return outcome;
 }
-// 클릭 → 부서 선택 팝업(카탈로그 미사용 부서 + 레거시 dept-N). 선택 후 부서 데몬 런칭.
-deptBtn?.addEventListener("click", async () => {
-  if (deptBtn.disabled) return; // 연타 차단
-  if (!started) return; // ★시나리오3: 복원 진행 중 발급 금지(레지스트리 미확정 윈도우 회피)
-  // 현재 열린 부서 탭의 mission_key 집계 → '미사용 부서'만 제시. 레지스트리 socket↔mission_key 대조(데몬 호출 없음·경량).
-  const openSockets = new Set(workspaces.map((w) => w.socket).filter((s): s is string => !!s));
-  const runningKeys = new Set<string>();
+
+// 팀 만들기 흐름 재진입 가드 — ★첫 await **앞**에서 세우고 finally 로 푼다(반박 D1 major).
+// 목록 조회 await 중에 포커스가 남은 버튼으로 Enter/Space 가 다시 들어오면 확인 창이 겹쳐 뜨고, 둘 다 승인하면
+// 팀이 2개 생긴다 — clipath.test.ts '재진입 차단이 첫 await 앞' 과 같은 계열이다.
+let teamFlowBusy = false;
+
+/** 팀 만들기가 이미 진행 중일 때의 안내 1줄(리뷰1 M4) — 생성이 도는 약 12초 동안 팔레트로 다시 누르면 버튼 라벨
+ *  ('만드는 중…')이 안 보이는 곳이라 아무 반응이 없었다. 결과 "busy" 를 받는 호출측(U16 카드 등)은 따로 알릴 필요 없다. */
+function notifyTeamFlowBusy(): void {
+  toast(
+    "watchdog",
+    "팀 만들기 진행 중",
+    deptLaunchInFlight ? "팀을 만드는 중입니다 — 끝난 뒤 다시 시도하세요" : "열려 있는 팀 만들기 창을 먼저 마치거나 닫아 주세요",
+  );
+}
+
+/** 확인 창 1회 → 생성. U16(말로 팀 만들기) 카드도 이 함수를 재사용할 수 있다(키와 조회 스냅샷만 넘기면 된다).
+ *  반환: created · cancelled(아무것도 안 만듦) · busy(다른 흐름 진행 중) · blocked(리셋·교대 중) · failed. */
+async function confirmAndCreateTeam(key: string | undefined, ctx: TeamCreateCtx): Promise<TeamCreateOutcome> {
+  if (teamFlowBusy) {
+    notifyTeamFlowBusy();
+    return "busy";
+  }
+  teamFlowBusy = true;
   try {
-    const reg = (await invoke("list_depts")) as {
-      depts?: Record<string, { socket?: string; mission_key?: string }>;
-    };
-    for (const e of Object.values(reg.depts ?? {})) {
-      if (e?.mission_key && e.socket && openSockets.has(e.socket)) runningKeys.add(e.mission_key);
-    }
-  } catch {
-    /* 레지스트리 미조회 — 필터 없이 전체 제시 */
+    if (daemonActionBlocked()) return "blocked";
+    const plan = buildDeptCreatePlan({
+      key,
+      catalog: ctx.catalog,
+      registry: ctx.registry,
+      allRunning: ctx.allRunning,
+      catalogUnreadable: ctx.catalogUnreadable,
+    });
+    // 기본 포커스는 [취소](confirmModal) — 무심코 친 Enter 가 생성을 승인하지 않는다.
+    if (!(await confirmModal(plan.title, plan.body, plan.yesLabel, plan.noLabel))) return "cancelled";
+    return await launchDept(key, ctx, plan.displayName);
+  } finally {
+    teamFlowBusy = false;
   }
-  let cat: { departments?: Record<string, { display?: string; mission_key?: string }> } = {};
+}
+
+/** 입구(전문가용 버튼·명령 팔레트) — 레지스트리·카탈로그를 읽어 고를 팀이 있으면 메뉴, 번호 팀만 남으면 곧바로 확인 창.
+ *  메뉴를 띄우면 "menu" 를 돌려주고, 고른 뒤의 확인·생성은 confirmAndCreateTeam 이 같은 가드로 잇는다. */
+async function openTeamCreateFlow(opts: { anchor?: HTMLElement | null } = {}): Promise<TeamCreateOutcome> {
+  if (teamFlowBusy) {
+    notifyTeamFlowBusy();
+    return "busy";
+  }
+  teamFlowBusy = true;
+  let direct: TeamCreateCtx | null = null;
   try {
-    cat = (await invoke("read_dept_catalog")) as typeof cat;
-  } catch (e) {
-    // ★C2(2026-09-17 3라운드): read_dept_catalog 는 이제 **부재만** 빈 값이고 판독 실패(cp949·손상 JSON)는 Err 다.
-    //   종전엔 둘 다 빈 카탈로그로 접혀 팝업이 말없이 레거시로 떨어졌다 — 카탈로그가 있는데 못 읽은 것이므로 사유를 말한다.
-    //   동작은 종전과 같다(레거시 dept-N 으로 진행 · 크래시·드롭 없음).
-    cat = {};
-    toast("watchdog", "부서 카탈로그를 읽지 못했습니다", `레거시 dept-N 으로 진행합니다. 사유: ${String(e).slice(0, 300)}`);
-  }
-  const items: { label: string; action: () => void }[] = [];
-  for (const [key, d] of Object.entries(cat.departments ?? {})) {
-    if (d.mission_key && runningKeys.has(d.mission_key)) continue; // 미사용 부서만
-    items.push({ label: d.display ?? key, action: () => launchDept(key) });
-  }
-  items.push({ label: "직접 입력(레거시 dept-N)", action: () => launchDept(undefined) });
-  // 미사용 부서가 하나도 없어 레거시만 남으면(카탈로그 부재/손상 OR 6부서 전부 가동중) 팝업 없이 바로 레거시
-  // — '버튼 한 번' 유지(클릭 추가 0)·버튼 브릭 방지. 단 카탈로그엔 부서가 있는데 전부 가동중이면
-  //   침묵 생성이 혼란스러우므로 토스트로 사유를 알린다(클릭은 여전히 한 번).
-  if (items.length === 1) {
-    if (Object.keys(cat.departments ?? {}).length > 0) {
-      toast("watchdog", "모든 부서 가동 중", "레거시 dept-N 워크스페이스를 생성합니다.");
+    if (!started) {
+      // ★시나리오3: 복원 진행 중 발급 금지(레지스트리 미확정 윈도우 회피) — 조용히 무시하지 않고 안내한다(조사 F6).
+      toast("watchdog", "복원 중입니다", "화면 복원이 끝난 뒤 다시 눌러 주세요.");
+      return "blocked";
     }
-    launchDept(undefined);
-    return;
+    if (daemonActionBlocked()) return "blocked";
+    // 현재 열린 부서 탭의 mission_key 집계 → '미사용 팀'만 제시. 레지스트리 socket↔mission_key 대조(데몬 호출 없음·경량).
+    const openSockets = new Set(workspaces.map((w) => w.socket).filter((s): s is string => !!s));
+    const runningKeys = new Set<string>();
+    let registry: DeptRegistry | null = null;
+    try {
+      // 둘 다 로컬 파일 판독이지만 상한을 둔다 — 넘기면 이 가드가 영구히 잡혀 팀 만들기가 죽기 때문이다(T_REG: 넘기면 미조회로 진행).
+      registry = (await rpcT(invoke("list_depts"), T_REG)) as DeptRegistry;
+      for (const e of Object.values(registry?.depts ?? {})) {
+        if (e?.mission_key && e.socket && openSockets.has(e.socket)) runningKeys.add(e.mission_key);
+      }
+    } catch {
+      registry = null; // 레지스트리 미조회 — 필터 없이 전체 제시 · 확인 창은 단정하지 않는 문구
+    }
+    let catalog: DeptCatalog | null = null;
+    let catalogUnreadable = false;
+    try {
+      catalog = (await rpcT(invoke("read_dept_catalog"), T_REG)) as DeptCatalog;
+    } catch (e) {
+      // ★C2(2026-09-17 3라운드): read_dept_catalog 는 **부재만** 빈 값이고 판독 실패(cp949·손상 JSON)는 Err 다.
+      //   카탈로그가 있는데 못 읽은 것이므로 사유를 말한다. 동작은 종전과 같다(번호 팀으로 진행 · 크래시·드롭 없음).
+      catalog = null;
+      catalogUnreadable = true;
+      toast("watchdog", "부서 카탈로그를 읽지 못했습니다", `번호 팀으로 진행합니다. 사유: ${String(e).slice(0, 300)}`);
+    }
+    const ctx: TeamCreateCtx = { catalog, registry, allRunning: false, catalogUnreadable };
+    const items: { label: string; action: () => void }[] = [];
+    for (const [key, d] of Object.entries(catalog?.departments ?? {})) {
+      if (d?.mission_key && runningKeys.has(d.mission_key)) continue; // 미사용 팀만
+      items.push({ label: d?.display || key, action: () => void confirmAndCreateTeam(key, ctx).catch((e) => toast("watchdog", "팀 만들기 실패", String(e))) });
+    }
+    if (items.length) {
+      const legacy = predictLegacyDeptName(registry) ?? "dept-N";
+      items.push({ label: `번호로 새 팀 만들기(${legacy})`, action: () => void confirmAndCreateTeam(undefined, ctx).catch((e) => toast("watchdog", "팀 만들기 실패", String(e))) });
+      // 팔레트로 들어왔는데 전문가용 칸이 접혀 있으면 버튼 rect 가 0 이다 → (0,0)·상단바 위가 아니라 창 가운데에(반박 D3).
+      const r = (opts.anchor ?? deptBtnEl())?.getBoundingClientRect();
+      if (r && r.width > 0 && r.height > 0) showCtxMenu(r.left, r.bottom, items);
+      else showCtxMenu(Math.max(4, Math.round(window.innerWidth / 2 - 120)), Math.max(4, Math.round(window.innerHeight / 3)), items);
+      return "menu";
+    }
+    // 고를 카탈로그 팀이 없다(카탈로그 부재·손상 OR 전부 열림) → 메뉴 없이 번호 팀 확인 창으로 곧장(종전 '클릭 1회 = 즉시 생성' 폐지).
+    ctx.allRunning = Object.keys(catalog?.departments ?? {}).length > 0;
+    direct = ctx;
+  } finally {
+    teamFlowBusy = false;
   }
-  const r = deptBtn.getBoundingClientRect();
-  showCtxMenu(r.left, r.bottom, items);
-});
+  // 가드를 푼 **직후 동기적으로** 확인 창 함수가 다시 잡는다(사이에 await 0 → 재진입 창 없음).
+  return direct ? await confirmAndCreateTeam(undefined, direct) : "failed";
+}
 
 window.addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // IME 조합 중 무시

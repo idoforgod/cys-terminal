@@ -7,6 +7,11 @@
   3. 더블클릭=기본폭 복귀.
   4. A−/A＋ 버튼으로 --wsbar-font 배율 증감·영속·클램프(0.8~2.2).
   5. 콘솔 에러 0.
+  6. (0.14.41 U1·U17) 바닥 공용 꼬리(#wsbar-foot): 최소폭 176·배율 2.2·낮은 창에서도 가로 넘침 0,
+     워크스페이스 목록이 0px 로 눌리지 않음, 사용량 요약 줄·전문가용 토글이 스크롤 없이 보임,
+     전문가용 본문 hidden 시작 → 토글로 펼침, start() 와 무관한 사용량 초기 문구('대기 중').
+     (아래 SHIM 의 invoke 는 영구 pending 이라 start() 가 끝나지 않는다 — 사용량 **데이터가 채워진** 상태의
+      레이아웃·흐름은 이 게이트의 범위 밖이다. 그 실측은 증거 폴더 layout-probe·DOM 스모크가 맡았다.)
 (pane 재적합은 기존 pane별 ResizeObserver→fitPane 경로 + 드래그 종료 refitAllPanes —
  PTY 없는 브라우저 하네스에선 코드 경로가 unittest·리뷰로 커버되므로 여기선 폭·배율만 단언.)
 
@@ -103,6 +108,31 @@ def main() -> int:
                 pg.click("#btn-ws-font-minus")
             f3 = pg.evaluate("getComputedStyle(document.documentElement).getPropertyValue('--wsbar-font').trim()")
             check(f3 == "0.8", f"하한 클램프 0.8 (got {f3})")
+
+            # 6. 바닥 공용 꼬리(U1·U17) — 최소폭·최대 배율·낮은 창의 극단에서
+            pg.evaluate("localStorage.setItem('cys-wsbar-w','176'); localStorage.setItem('cys-wsbar-font','2.2')")
+            pg.set_viewport_size({"width": 1400, "height": 480})
+            pg.reload(); pg.wait_for_timeout(400)
+            foot = pg.evaluate("""(() => { const q = (s) => document.querySelector(s); const R = (s) => q(s).getBoundingClientRect();
+              const f = R('#wsbar-foot'), t = R('#ws-tabs'), e = R('#btn-expert-toggle'), u = R('#wsbar-usage .usage-head');
+              return { inNav: !!q('#wsbar #wsbar-foot'), tabsH: t.height, footTop: f.top, footBottom: f.bottom,
+                       eTop: e.top, eBottom: e.bottom, uTop: u.top, uBottom: u.bottom,
+                       navSW: q('#wsbar').scrollWidth, navCW: q('#wsbar').clientWidth,
+                       footSW: q('#wsbar-foot').scrollWidth, footCW: q('#wsbar-foot').clientWidth,
+                       usageText: q('#wsbar-usage').textContent, bodyHidden: q('#wsbar-expert-body').hidden,
+                       deptInHead: !!q('#wsbar-head #btn-ws-dept') }; })()""")
+            check(foot["inNav"], "#wsbar-foot 가 #wsbar 안")
+            check(foot["tabsH"] >= 96 * 2.2 - 1, f"목록 하한 유지 ≥211px (got {foot['tabsH']:.0f})")
+            check(foot["navSW"] <= foot["navCW"] + 1 and foot["footSW"] <= foot["footCW"] + 1,
+                  f"가로 넘침 0 (nav {foot['navSW']}/{foot['navCW']} · foot {foot['footSW']}/{foot['footCW']})")
+            check(foot["uTop"] >= foot["footTop"] - 1 and foot["eBottom"] <= foot["footBottom"] + 1,
+                  "사용량 요약 줄·전문가용 토글이 스크롤 없이 꼬리 안")
+            check("대기 중" in (foot["usageText"] or ""), f"사용량 초기 문구 — start() 무관 ({foot['usageText']!r})")
+            check(foot["bodyHidden"] and not foot["deptInHead"], "전문가용 본문 hidden 시작 · 머리줄에 팀 버튼 없음")
+            pg.click("#btn-expert-toggle"); pg.wait_for_timeout(100)
+            opened = pg.evaluate("(() => { const b = document.querySelector('#btn-ws-dept'); return { hidden: document.querySelector('#wsbar-expert-body').hidden, h: b.getBoundingClientRect().height, exp: document.querySelector('#btn-expert-toggle').getAttribute('aria-expanded') }; })()")
+            check(not opened["hidden"] and opened["h"] > 0 and opened["exp"] == "true", f"토글로 펼침 ({opened})")
+            pg.evaluate("localStorage.setItem('cys-wsbar-w','216'); localStorage.setItem('cys-wsbar-font','1')")
 
             check(not errs, f"콘솔 pageerror 0건 (got {errs})")
             b.close()

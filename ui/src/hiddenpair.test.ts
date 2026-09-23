@@ -143,7 +143,29 @@ export function mainHiddenElements(main: string, html: string): El[] {
       out.push({ tag: c[2], id, classes: cls.split(/\s+/).filter(Boolean), where: `main.ts:${i + 1}` });
     }
   }
-  return out;
+  // ★교차 WP 결합 수리(0.14.41 통합 · A2↔A4): 같은 id 를 ①②(getElementById — 정적 HTML 에 없으면
+  // 태그 불명 폴백)와 ③(createElement — 태그 확정)이 **서로 다른 위치**(`where`)에서 각자 잡으면
+  // 위 `add()` 의 (id,where) 중복 제거를 피해가 태그 불명 항목이 그대로 남는다. 그러면
+  // `subjectMatches` 의 "모르는 태그는 보수적으로 매치" 규칙이 이 요소와 무관한 전역 태그 셀렉터
+  // (예: `#topbar button.icon-btn svg`)에도 거짓 위반을 낸다 — A2 의 `mountExpertSection`
+  // (createElement("div") 로 확정)과 `setExpertOpen`(getElementById 로 재조회)이 같은
+  // `#wsbar-expert-body` 를 이렇게 이중으로 남겼다(실측). id 가 같으면 태그가 밝혀진 항목으로
+  // 병합한다 — 그 요소가 실제로 걸리는 셀렉터 판정은 그대로 정확해지고, 사정권이 줄지 않는다
+  // (병합은 정보를 버리지 않고 더 정확한 쪽을 택할 뿐이다).
+  const merged: El[] = [];
+  for (const el of out) {
+    if (el.id === null) {
+      merged.push(el);
+      continue;
+    }
+    const i = merged.findIndex((m) => m.id === el.id);
+    if (i < 0) {
+      merged.push(el);
+    } else if (!merged[i].tag && el.tag) {
+      merged[i] = el; // 태그 불명 항목을 태그가 밝혀진 항목으로 교체
+    }
+  }
+  return merged;
 }
 
 export type Violation = { el: string; display: string; value: string };
