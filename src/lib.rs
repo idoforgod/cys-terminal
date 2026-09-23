@@ -25,6 +25,10 @@ pub mod inject_guard;
 /// python(`javis_lane`) 셋이 같은 규칙을 써야 하고, 사본이 갈리면 층1 판정이 조용히 무력화된다.
 pub mod lane;
 pub mod license;
+/// U15(0.14.41) — 개발자 도구(CLT) 없는 맥의 `/usr/bin/python3` 셔임 회피 SOT. 판정은 파일 존재만
+/// 보고(셔임 실행 0), 소비자 셋(스폰 env ⑦ · 부트 감독 자식 PATH · 회수 자식 PATH)이 같은 한 판정을
+/// 거친다 — CLT 있는 맥·윈도우·리눅스는 출력이 종전과 바이트 동일하다(조건부 쌍 규율).
+pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
 /// 프로필 인증 전제 판정기(U-17) — "이 프로필로 좌석을 만들면 로그인 관문 앞에 서는가".

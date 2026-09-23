@@ -7128,6 +7128,40 @@ mod tests {
         );
     }
 
+    /// ★U15(0.14.41) 개발자 도구(CLT) 없는 맥 안내의 **배선 3자 핀**(소스 대조 — 심볼 무의존).
+    ///
+    /// 새 알림 종류는 "백엔드가 쌓는다 → 프런트가 같은 문자열로 분기한다"가 **둘 다** 있어야 뜬다.
+    /// 한쪽만 있으면 알림이 **조용히 사라진다**(이 파일 SEAL-DIAG 주석이 경고한 바로 그 형태).
+    ///   ① 백엔드: 기존 `onboard-notice` 채널(push + `onboard_notices` pull)에 kind 로 싣는다 —
+    ///      재설치 채널(bundle-damaged)과 섞지 않는다(고장이 아니다).
+    ///   ② setup: macOS 블록에서 봉인 자가진단 뒤에 부른다(부트 무차단 · stat 만).
+    ///   ③ 프런트: `showOnboardNotice` 가 같은 kind 를 토스트로 낸다.
+    #[test]
+    fn devtools_notice_is_wired_backend_setup_and_frontend() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let kind = concat!("\"devtools", "-missing\"");
+        assert!(
+            prod.contains(&format!("const DEVTOOLS_NOTICE_KIND: &str = {kind};")),
+            "백엔드 kind 상수 부재 — 알림을 쌓는 쪽이 없다"
+        );
+        assert!(
+            prod.contains("push_onboard_notice(handle, DEVTOOLS_NOTICE_KIND,"),
+            "안내가 onboard-notice 채널(push + pull 회수)로 나가지 않는다"
+        );
+        let sd = prod.find("spawn_seal_selfdiag(handle.clone());").expect("setup 봉인 자가진단 호출 소실");
+        let dn = prod.find("maybe_push_devtools_notice(&handle);").expect("setup 에서 CLT 안내를 부르지 않는다");
+        assert!(sd < dn, "CLT 안내 호출이 macOS setup 블록(봉인 자가진단 뒤)에 있지 않다");
+        let ui = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/main.ts"),
+        )
+        .expect("ui/src/main.ts 를 읽지 못했다 — 측정 불능은 통과가 아니다");
+        assert!(
+            ui.contains(&format!("kind === {kind}")),
+            "프런트 showOnboardNotice 가 {kind} 를 모른다 — 백엔드가 쌓아도 알림이 조용히 사라진다"
+        );
+    }
+
     /// ★SEAL-DIAG pull 캐시 회귀 핀 ②(F3 격차1): 합산은 **어느 파손 판정도 떨어뜨리지
     /// 않는다.** 둘 다 참이면 봉인 쪽을 돌려준다 — push 에서 codesign(초 단위)이 나중에
     /// 도착해 토스트를 덮는 순서의 pull 판 보존(덮어쓰기 의미론 계약 · 결론은 양쪽 다

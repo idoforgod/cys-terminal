@@ -4392,6 +4392,459 @@ def h_pyseal_1():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 5-U15. H-CLT — 개발자 도구(CLT) 없는 맥의 /usr/bin/python3 셔임 회피 (0.14.41 · WP-C3)
+# ═══════════════════════════════════════════════════════════════════════════
+# 사실(조사 U15 · 반박 U15.refute): CLT 도 Xcode.app 도 없는 맥의 `/usr/bin/python3` 는 "개발자 도구를
+# 설치하라" 창을 띄우고 비0으로 끝나는 **껍데기(셔임)** 다. 좌석은 `zsh -l` 이라 path_helper 가 `/usr/bin`
+# 을 동봉 runtime 앞으로 되돌리고, 훅 프리루드(`_lib.sh` `cys_resolve_py`)는 PATH 첫 `python3` = 셔임을
+# 골랐다. 그 결과 ① `cys_timeout_run`(timeout·gtimeout 없는 순정 맥의 정상 경로 = CYS_PY 실행기)이
+# 감싼 `cys surface-role`·`cys claim-role` 을 **한 번도 실행하지 못했고**(M1 — 선언이 팀을 띄우지 않음)
+# ② 체크리스트가 `shell=True` 로 `python3 …/javis_preflight.py` 를 셔임으로 불렀고(M2) ③ reviewer 능력
+# 게이트가 셔임 비0 으로 fail-open 됐다(RC4).
+# ★하네스 규약: **가짜 셔임**(실행되면 기록 파일에 한 줄 남기고 rc 1)을 PATH 선두에 두고, CLT 판정 루트를
+#   `CYS_DEVTOOLS_ROOTS`(빈 가짜 루트 = CLT 부재) · 셔임 위치를 `CYS_DEVTOOLS_SHIM_DIR` 로 바꿔 끼운다.
+#   단언은 전부 "**셔임 실행 0회**"(기록 파일 부재)로 한다 — 창을 띄우지 않았다는 것의 기계 등가물이다.
+#   `OSTYPE` 는 명시 주입한다(bash 는 상속된 OSTYPE 을 그대로 쓴다 — 실측) — 리눅스 러너에서도
+#   darwin 갈래를 결정론으로 재고, 윈도우·리눅스 갈래의 무변경도 같은 하네스로 잰다.
+# ★timeout·gtimeout 은 도구 팜에서 **의도적으로 뺀다**: 순정 맥에는 coreutils 가 없어 ③갈래가 정상 경로다.
+_U15_BASE_REF = "126cfdd0"      # v0.14.40 — U15 수리 직전 트리(계측 대조 기준 · env 스위치 아님)
+_U15_TOOLS = ("sh", "bash", "cat", "grep", "printf", "tr", "head", "tail", "date", "mkdir", "rm", "ls",
+              "ln", "sleep", "dirname", "basename", "sed", "awk", "env", "cut", "wc", "sort", "uname",
+              "mktemp", "chmod", "stat", "id", "touch", "mv", "cp", "tee", "find", "xargs", "locale",
+              "ps", "kill", "jq", "setsid", "readlink", "expr", "od", "shasum", "lsof", "pgrep")
+
+
+def _u15_sandbox(tmp, *, ostype="darwin24", clt_present=False, cys_role=None, pack=None):
+    """U15 격리 환경. 반환 dict — env · marker(셔임 실행 기록) · shim · bundled · pydir · binp · home.
+
+    PATH 순서 = [가짜 셔임, 도구 팜, (cys 스텁), 가짜 동봉 python] — 실좌석과 같은 모양이다
+    (셔임이 들어 있는 /usr/bin 이 동봉 runtime 보다 **앞**). 가짜 동봉 python 은 `…/runtime/python/bin`
+    레이아웃에 두어 프리루드의 PATH 순회 발견 규칙(심링크 함정 회피)까지 그대로 잰다."""
+    if os.name == "nt":
+        raise Skip("U15 는 macOS 셔임 결함이다 — 윈도우 러너에서는 무변경 핀(H-CLT-2)만 잰다")
+    shimd = os.path.join(tmp, "fakeshim")
+    marker = os.path.join(tmp, "shim-exec.log")
+    _w(os.path.join(shimd, "python3"),
+       '#!/bin/sh\nprintf "%%s %%s\\n" "$0" "$*" >> "%s"\nexit 1\n' % marker)
+    pydir = os.path.join(tmp, "app", "Contents", "Resources", "runtime", "python", "bin")
+    bundled = os.path.join(pydir, "python3")
+    _w(bundled, '#!/bin/sh\nexec "%s" "$@"\n' % PY)
+    binp = os.path.join(tmp, "onlybin")
+    os.makedirs(binp, exist_ok=True)
+    for tool in _U15_TOOLS:
+        src = shutil.which(tool)
+        if src and not os.path.exists(os.path.join(binp, tool)):
+            os.symlink(src, os.path.join(binp, tool))
+    need(shutil.which("python3", path=binp) is None, "도구 팜에 python3 가 섞였다(계측 무효)")
+    need(shutil.which("timeout", path=binp) is None and shutil.which("gtimeout", path=binp) is None,
+         "도구 팜에 timeout/gtimeout 이 섞였다 — 순정 맥의 ③갈래(CYS_PY 실행기)를 재지 못한다")
+    roots = os.path.join(tmp, "devroots")
+    if clt_present:
+        _w(os.path.join(roots, "CommandLineTools", "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+    bins = [shimd, binp]
+    if cys_role is not None:
+        cysbin = os.path.join(tmp, "cysbin")
+        _w(os.path.join(cysbin, "cys"),
+           '#!/bin/sh\ncase "$1" in surface-role) printf "%%s\\n" "%s"; exit 0 ;; esac\nexit 0\n'
+           % cys_role)
+        bins.append(cysbin)
+    home = os.path.join(tmp, "home")
+    state = os.path.join(home, ".cys", "state")
+    tdir = os.path.join(tmp, "t")
+    for d in (home, state, tdir):
+        os.makedirs(d, exist_ok=True)
+    env = _base_env({"HOME": home, "CYS_STATE_DIR": state, "TMPDIR": tdir, "OSTYPE": ostype,
+                     "CYS_DEVTOOLS_ROOTS": os.path.join(roots, "CommandLineTools"),
+                     "CYS_DEVTOOLS_SHIM_DIR": shimd},
+                    drop=("CYS_PY", "CYS_PY_ORIGIN", "DEVELOPER_DIR", "CYS_BIN"))
+    if pack:
+        env["CYS_PACK_DIR"] = pack
+    env["PATH"] = os.pathsep.join(bins + [pydir])
+    return {"env": env, "marker": marker, "shim": os.path.join(shimd, "python3"),
+            "bundled": bundled, "pydir": pydir, "binp": binp, "home": home, "tmp": tmp}
+
+
+def _u15_shim_runs(sb):
+    """가짜 셔임이 실행된 기록(없으면 빈 문자열)."""
+    p = sb["marker"]
+    return _read(p) if os.path.isfile(p) else ""
+
+
+def _u15_resolve(lib, env, preset=None):
+    """프리루드 source 후 CYS_PY 해소값(stderr 한 줄로 회수 — 프리루드 stdout 무출력 계약 보존)."""
+    e = dict(env)
+    if preset is None:
+        e.pop("CYS_PY", None)
+    else:
+        e["CYS_PY"] = preset
+    r = _run(["sh", "-c", '. "$1" || exit 4; printf "CYS_PY=%s\\n" "${CYS_PY:-}" >&2', "_", lib], env=e)
+    need(r.returncode == 0, "프리루드 source 실패 rc=%d: %r" % (r.returncode, r.stderr[-300:]))
+    m = re.search(r"^CYS_PY=(.*)$", r.stderr, re.M)
+    need(m, "해소값 회수 실패: %r" % r.stderr[-300:])
+    return m.group(1)
+
+
+def _u15_fixture_pack(tmp, name="pack"):
+    """체크리스트가 부르는 preflight 를 **스텁**으로 바꾼 최소 팩(실 preflight 는 HOME·데몬을 본다)."""
+    pack = os.path.join(tmp, name)
+    _w(os.path.join(pack, "bin", "javis_preflight.py"),
+       "print('PREFLIGHT-STUB-OK')\n", 0o644)
+    shutil.copy2(os.path.join(BIN_DIR, "javis_checklist.py"), os.path.join(pack, "bin", "javis_checklist.py"))
+    return pack
+
+
+@specimen("H-CLT-1", "W6",
+          "CLT 없는 맥 — 훅 해소기·데드라인 실행기·체크리스트·능력 게이트가 셔임을 한 번도 부르지 않는다",
+          ["U15", "U15-M1", "U15-M2", "U15-RC4", "U15-M5"])
+def h_clt_1():
+    """U15 핵심 축(반박 M1·M2·M5·RC4). 가짜 셔임이 PATH 선두·CLT 판정 루트가 빈 darwin 좌석에서:
+      ⓐ 프리루드가 CYS_PY 로 **동봉 python** 을 고른다(미설정 · `python3` 사전설정 · 셔임 절대경로 사전설정
+         셋 다 — 사전설정이 셔임이면 거부한다).
+      ⓑ `cys_timeout_run` 이 감싼 명령을 **실제로 실행**한다(M1 — 종전엔 셔임이 Popen 전에 죽어 0회).
+      ⓒ inject-context(SessionStart·/clear)가 작업기억을 주입하고, 체크리스트의 preflight 가 셔임이 아니라
+         동봉 python 으로 돈다(M2).
+      ⓓ save-state·guard·actprobe 독립 해소기가 셔임을 고르지 않는다(M5).
+      ⓔ reviewer 능력 게이트가 변형 도구를 **실제로 막는다**(RC4 — 종전 셔임 비0 = 비차단 오류 = fail-open).
+    최종 단언: 셔임 실행 기록 0줄. 계측 타당성: 구 트리(v0.14.40)의 프리루드+inject-context 는 같은
+    조건에서 셔임을 실행해야 한다."""
+    notes = []
+    lib = os.path.join(HOOKS_DIR, "_lib.sh")
+    with tempfile.TemporaryDirectory() as tmp:
+        pack = _u15_fixture_pack(tmp)
+        sb = _u15_sandbox(tmp, pack=pack, cys_role="reviewer-codex")
+        env = sb["env"]
+        # ⓐ 해소 — 세 가지 사전설정.
+        for label, preset in (("미설정", None), ("python3", "python3"), ("셔임 절대경로", sb["shim"])):
+            got = _u15_resolve(lib, env, preset)
+            need(got == sb["bundled"],
+                 "CLT 없는 맥에서 프리루드가 동봉 python 이 아닌 %r 를 골랐다(사전설정 %s) — 셔임이면 "
+                 "훅마다 설치 창 + 조용한 실패" % (got, label))
+        need(not _u15_shim_runs(sb), "해소 과정에서 셔임이 실행됐다: %r" % _u15_shim_runs(sb))
+        notes.append("해소 3종 → 동봉 python")
+        # ⓑ 데드라인 실행기 — 감싼 명령이 실제로 돈다.
+        r = _run(["sh", "-c", '. "$1" || exit 4; cys_timeout_run 5 sh -c "echo U15-RAN-OK"', "_", lib],
+                 env=env)
+        need(r.returncode == 0 and "U15-RAN-OK" in r.stdout,
+             "cys_timeout_run 이 감싼 명령을 실행하지 못했다(rc=%d · M1 — 선언이 팀을 못 띄운다): %r"
+             % (r.returncode, (r.stdout + r.stderr)[-300:]))
+        notes.append("cys_timeout_run 실행")
+        # ⓒ inject-context + 체크리스트(preflight 스텁).
+        proj = os.path.join(tmp, "proj")
+        _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "# S\nU15-STATE-MARKER\n", 0o644)
+        payload = json.dumps({"source": "clear", "cwd": proj, "hook_event_name": "PreCompact"})
+        r = _run([BASH, _hook("inject-context.sh")], input=payload, env=env)
+        need(r.returncode == 0, "inject-context exit=%d" % r.returncode)
+        need("U15-STATE-MARKER" in r.stdout, "inject-context 가 작업기억을 주입하지 않았다: %r" % r.stdout[-300:])
+        need("PREFLIGHT-STUB-OK" in r.stdout,
+             "체크리스트 preflight 가 동봉 python 으로 돌지 않았다(M2 — 셔임 실행이면 exit 1): %r"
+             % r.stdout[-400:])
+        notes.append("inject-context·체크리스트 정상")
+        # ⓓ save-state · guard · actprobe.
+        r = _run([BASH, _hook("save-state.sh")], input=payload, env=env)
+        need(r.returncode == 0, "save-state exit=%d" % r.returncode)
+        need("PreCompact" in _read(os.path.join(proj, "_round", ".state_log")),
+             "save-state 가 .state_log 를 남기지 않았다(파싱 실패 = 셔임?)")
+        bash_ls = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls -la"}})
+        for hk in ("guard.sh", "actprobe-kill-gate.sh"):
+            r = _run([BASH, _hook(hk)], input=bash_ls, env=env)
+            need(r.returncode == 0, "%s 가 무해 명령을 막았다(exit=%d): %r" % (hk, r.returncode, r.stderr[-200:]))
+        notes.append("save-state·guard·actprobe 정상")
+        # ⓔ reviewer 능력 게이트 — 변형 도구 차단이 살아 있다(fail-open 역전 없음).
+        edit = json.dumps({"session_id": "s-u15", "tool_name": "Edit",
+                           "tool_input": {"file_path": "/nonexistent-repo/a.rs"}})
+        e2 = dict(env, CYS_SURFACE_ID="7")
+        r = _run([BASH, _hook("role-capability-gate.sh")], input=edit, env=e2)
+        try:
+            decision = (json.loads(r.stdout or "{}").get("hookSpecificOutput") or {}).get("permissionDecision")
+        except ValueError:
+            decision = None
+        need(decision == "deny" or r.returncode == 2,
+             "reviewer 변형 차단이 풀렸다(rc=%d · decision=%r) — CLT 없는 맥에서 역할 분리가 fail-open: %r"
+             % (r.returncode, decision, (r.stdout + r.stderr)[-300:]))
+        notes.append("reviewer 변형 차단 유지")
+        runs = _u15_shim_runs(sb)
+        need(not runs, "셔임이 실행됐다(설치 창 %d회 상당):\n%s" % (len(runs.splitlines()), runs[:600]))
+        notes.append("셔임 실행 0회")
+        # 계측 타당성 — 구 트리는 같은 조건에서 셔임을 실행한다(결함 재현).
+        calib = "skip(no-git)"
+        old_lib = _git_show("cysjavis-pack/hooks/_lib.sh", ref=_U15_BASE_REF)
+        old_ic = _git_show("cysjavis-pack/hooks/inject-context.sh", ref=_U15_BASE_REF)
+        if old_lib is not None and old_ic is not None:
+            od = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(od, "_lib.sh"), old_lib, 0o644)
+            _w(os.path.join(od, "inject-context.sh"), old_ic)
+            need(_u15_resolve(os.path.join(od, "_lib.sh"), env) == sb["shim"],
+                 "계측 타당성 실패: 구 프리루드가 이 조건에서 셔임을 고르지 않는다(결함 재현 불가)")
+            _run([BASH, os.path.join(od, "inject-context.sh")], input=payload, env=env)
+            need(_u15_shim_runs(sb), "계측 타당성 실패: 구 inject-context 가 셔임을 실행하지 않는다")
+            calib = "구 트리(%s) 셔임 선택·실행 재현" % _U15_BASE_REF
+    return " · ".join(notes) + " · 계측검증=" + calib
+
+
+@specimen("H-CLT-2", "W6",
+          "무변경 핀 — CLT 있는 맥·윈도우·리눅스의 CYS_PY 해소는 종전 규칙(PATH 첫 python3)과 같다",
+          ["U15", "U15-WIN-NOCHANGE"])
+def h_clt_2():
+    """원칙 2(CLT 가 있는 기계는 한 바이트도 바꾸지 않는다) · 원칙 5(윈도우 무접촉)의 기계 집행자.
+
+    ⓐ **실기(호스트 그대로)**: 프리루드가 고른 CYS_PY == 같은 셸의 `command -v python3 || python || py`
+       (= 종전 규칙). 윈도우 러너(windows-health)에서도 이 축이 돈다 — 공유 훅 `_lib.sh` 의 새 논리가
+       `case $OSTYPE in darwin*` 안에만 있다는 것의 실측이다. (CLT 없는 mac 호스트면 이 축은 **기대상 다르다**
+       — 그때는 적용 불가로 적는다.)
+    ⓑ **모의(비-윈도우 호스트)**: 가짜 셔임·빈 CLT 루트라는 **최악 조건**을 그대로 두고 OSTYPE 만
+       msys·linux-gnu 로 바꾸면 해소값이 종전 규칙대로 셔임 경로다(새 논리가 새지 않는다). darwin 이라도
+       CLT 가 있으면(가짜 CLT 루트에 python3) 역시 종전 규칙대로다 — 오너 기계 무변경.
+    ⓒ 사전설정 CYS_PY 존중(종전 첫 갈래)도 같은 조건에서 그대로다."""
+    notes = []
+    lib = os.path.join(HOOKS_DIR, "_lib.sh")
+    need(os.path.isfile(lib), "_lib.sh 부재")
+    libp = lib.replace("\\", "/")
+    # ⓐ 실기
+    env = _base_env(drop=("CYS_PY", "CYS_PY_ORIGIN", "CYS_DEVTOOLS_ROOTS", "CYS_DEVTOOLS_SHIM_DIR"))
+    r = _run(["sh", "-c",
+              '. "$1" || exit 4; printf "NEW=%s\\n" "${CYS_PY:-}"; '
+              'printf "OLD=%s\\n" "$(command -v python3 2>/dev/null || command -v python 2>/dev/null '
+              '|| command -v py 2>/dev/null || printf %s "")"; '
+              'if command -v cys_clt_tool_present >/dev/null 2>&1 && cys_clt_tool_present python3; '
+              'then echo CLT=1; else echo CLT=0; fi; printf "OS=%s\\n" "${OSTYPE:-}"', "_", libp], env=env)
+    need(r.returncode == 0, "실기 프로브 rc=%d: %r" % (r.returncode, r.stderr[-300:]))
+    kv = dict(l.split("=", 1) for l in r.stdout.replace("\r", "").splitlines() if "=" in l)
+    host_darwin = kv.get("OS", "").startswith("darwin")
+    if host_darwin and kv.get("CLT") == "0" and kv.get("OLD") in ("/usr/bin/python3", "/usr/bin/python"):
+        notes.append("실기=적용 불가(이 mac 호스트는 CLT 가 없어 셔임을 피하는 것이 기대 동작)")
+    else:
+        need(kv.get("NEW") == kv.get("OLD"),
+             "호스트(OSTYPE=%s)에서 해소값이 종전 규칙과 다르다: NEW=%r OLD=%r — 공유 훅의 새 논리가 "
+             "darwin/CLT 부재 밖으로 샜다" % (kv.get("OS"), kv.get("NEW"), kv.get("OLD")))
+        notes.append("실기(OSTYPE=%s) 해소=종전 %r" % (kv.get("OS") or "?", kv.get("NEW")))
+    if os.name == "nt":
+        return " · ".join(notes) + " · 모의 축은 비-윈도우 호스트 몫"
+    # ⓑⓒ 모의 — 최악 조건(가짜 셔임 선두 · CLT 판정상 부재)에서 OS·CLT 만 바꾼다.
+    with tempfile.TemporaryDirectory() as tmp:
+        for ostype, clt in (("msys", False), ("linux-gnu", False), ("darwin24", True)):
+            sub = os.path.join(tmp, "%s-%d" % (ostype, clt))
+            os.makedirs(sub)
+            sb = _u15_sandbox(sub, ostype=ostype, clt_present=clt)
+            for label, preset, want in (("미설정", None, sb["shim"]),
+                                        ("python3", "python3", "python3"),
+                                        ("동봉 절대경로", sb["bundled"], sb["bundled"])):
+                got = _u15_resolve(lib, sb["env"], preset)
+                need(got == want,
+                     "OSTYPE=%s·CLT=%s 에서 해소값이 종전과 다르다(사전설정 %s): got=%r want=%r"
+                     % (ostype, clt, label, got, want))
+            need(not _u15_shim_runs(sb), "해소 과정에서 셔임을 실행했다(판정은 stat 만 해야 한다)")
+            notes.append("%s%s 종전 동일" % (ostype, "+CLT" if clt else ""))
+    return " · ".join(notes)
+
+
+@specimen("H-CLT-3", "W6",
+          "CLT 판정(파일 존재만) 행렬 + 셔임 분류 — libxcselect 순서 · 선택은 하나 · 비-darwin 항상 거짓",
+          ["U15", "U15-SOT"])
+def h_clt_3():
+    """`cys_clt_tool_present`(판정) · `cys_py_is_shim`(분류) · `cys_py_shim_risk`(폴백 제거 조건) 의 셸 행렬.
+    Rust 정본(`src/macos_devtools.rs`)과 같은 규칙이다 — 후보 표 문면 파리티는 Rust 테스트
+    `shell_twin_uses_the_same_candidate_table` 가 잰다. 외부 명령 0 · 셔임 실행 0 을 함께 단언한다."""
+    lib = os.path.join(HOOKS_DIR, "_lib.sh")
+    body = _read(lib)
+    for fn in ("cys_clt_tool_present()", "cys_py_is_shim()", "cys_py_shim_risk()"):
+        need(fn in body, "프리루드에 %s 가 없다" % fn)
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        sb = _u15_sandbox(tmp)
+        env = sb["env"]
+        r0 = os.path.join(tmp, "r")
+        link, xcode, clt = (os.path.join(r0, n) for n in ("link", "Xcode", "CLT"))
+        roots = ":".join((link, xcode, clt))
+
+        def present(tool="python3", devdir=None, rts=roots):
+            e = dict(env, CYS_DEVTOOLS_ROOTS=rts)
+            if devdir is not None:
+                e["DEVELOPER_DIR"] = devdir
+            rr = _run(["sh", "-c", '. "$1" || exit 4; cys_clt_tool_present "$2"', "_", lib, tool], env=e)
+            need(rr.returncode in (0, 1), "판정 함수 rc=%d: %r" % (rr.returncode, rr.stderr[-200:]))
+            return rr.returncode == 0
+
+        need(not present(), "빈 맥을 present 로 판정했다")
+        _w(os.path.join(clt, "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+        need(present(), "CLT python3 를 못 봤다")
+        need(not present("git"), "없는 git 을 present 로 판정했다")
+        os.makedirs(xcode)
+        need(not present(), "선택된 Xcode 에 도구가 없는데 뒤 CLT 로 넘어갔다(선택은 하나)")
+        target = os.path.join(r0, "link-target")
+        os.makedirs(target)
+        os.symlink(target, link)
+        need(not present(), "선택 링크 대상에 도구가 없는데 present")
+        _w(os.path.join(target, "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+        need(present(), "선택 링크를 따라가지 못했다")
+        dd = os.path.join(r0, "custom")
+        os.makedirs(dd)
+        need(not present(devdir=dd), "DEVELOPER_DIR 선택을 무시했다")
+        need(present(devdir=os.path.join(r0, "nope")), "디렉터리 아닌 DEVELOPER_DIR 에서 후보 표로 내려가지 않았다")
+        os.chmod(os.path.join(target, "usr", "bin", "python3"), 0o644)
+        need(not present(), "실행 비트 없는 파일을 도구로 셌다")
+        need(not present("../bin/python3"), "구분자 든 이름을 도구로 셌다")
+        notes.append("판정 행렬 10축")
+
+        def shim(path, ostype="darwin24", clt_ok=False):
+            rts = os.path.join(tmp, "cltok") if clt_ok else os.path.join(tmp, "nocl")
+            if clt_ok:
+                _w(os.path.join(rts, "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+            e = dict(env, OSTYPE=ostype, CYS_DEVTOOLS_ROOTS=rts)
+            rr = _run(["sh", "-c", '. "$1" || exit 4; cys_py_is_shim "$2"', "_", lib, path], env=e)
+            return rr.returncode == 0
+
+        need(shim(sb["shim"]), "darwin·CLT 부재에서 셔임 위치의 python3 를 셔임으로 보지 않았다")
+        alias = os.path.join(tmp, "alias-bin", "python3")
+        os.makedirs(os.path.dirname(alias))
+        os.symlink(sb["shim"], alias)
+        need(shim(alias), "셔임을 가리키는 심링크를 셔임으로 보지 않았다(-ef)")
+        need(not shim(sb["bundled"]), "동봉 python 을 셔임으로 봤다")
+        need(not shim(sb["shim"], clt_ok=True), "CLT 가 있는데 셔임으로 봤다(오너 기계 변경)")
+        for ost in ("msys", "linux-gnu", "cygwin", ""):
+            need(not shim(sb["shim"], ostype=ost), "OSTYPE=%r 에서 셔임 분류가 켜졌다(윈도우·리눅스 누수)" % ost)
+        rr = _run(["sh", "-c", '. "$1" || exit 4; cys_py_shim_risk', "_", lib], env=env)
+        need(rr.returncode == 0, "darwin·CLT 부재에서 폴백 제거 조건이 거짓")
+        rr = _run(["sh", "-c", '. "$1" || exit 4; cys_py_shim_risk', "_", lib], env=dict(env, OSTYPE="msys"))
+        need(rr.returncode == 1, "msys 에서 폴백 제거 조건이 참(윈도우 python3 폴백 소실)")
+        notes.append("셔임 분류 9축")
+        need(not _u15_shim_runs(sb), "판정·분류 중 셔임을 실행했다")
+    return " · ".join(notes) + " · 셔임 실행 0"
+
+
+@specimen("H-CLT-4", "W6",
+          "체크리스트 preflight 는 sys.executable 인자 리스트로 — 셸·PATH python3 무경유(공백 경로 포함)",
+          ["U15", "U15-M2", "U15-M8"])
+def h_clt_4():
+    """반박 M2: `javis_checklist.py` 가 `shell=True` 로 `python3 <pack>/bin/javis_preflight.py` 를 돌려
+    SessionStart 마다 셔임을 불렀다(\"자동 점검이 조용히 멈추고 설치 창\"의 가장 문자 그대로의 경로).
+    M8: `_pack` 무인용이라 공백 든 경로(윈도우 사용자 프로필)에서 preflight 가 깨졌다.
+    ⓐ 가짜 셔임이 PATH 첫 python3 이고 팩 경로에 공백이 있어도 preflight 가 exit 0 으로 돈다 · 셔임 0회.
+    ⓑ `--preflight-cmd "<문자열>"` 명시 호환(셸 문자열 계약)은 그대로다."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sb = _u15_sandbox(tmp)
+        pack = _u15_fixture_pack(tmp, "pack dir")
+        chk = os.path.join(pack, "bin", "javis_checklist.py")
+        env = dict(sb["env"], CYS_PACK_DIR=pack)
+        st = os.path.join(tmp, "st", "SESSION_STATE.md")
+        _w(st, "# S\n", 0o644)
+        r = _run([PY, chk, "--state", st, "--round-dir", os.path.dirname(st)], env=env)
+        need(r.returncode == 0, "체크리스트 rc=%d: %r" % (r.returncode, r.stderr[-300:]))
+        need("preflight: exit 0 | PREFLIGHT-STUB-OK" in r.stdout,
+             "preflight 가 인터프리터 직접 실행으로 돌지 않았다(셸·셔임·공백 경로): %r" % r.stdout)
+        need(not _u15_shim_runs(sb), "체크리스트가 셔임을 실행했다: %r" % _u15_shim_runs(sb))
+        r2 = _run([PY, chk, "--state", st, "--round-dir", os.path.dirname(st),
+                   "--preflight-cmd", "echo CUSTOM-CMD-OK"], env=env)
+        need("preflight: exit 0 | CUSTOM-CMD-OK" in r2.stdout,
+             "--preflight-cmd 문자열 호환이 깨졌다: %r" % r2.stdout)
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/bin/javis_checklist.py", ref=_U15_BASE_REF)
+        if old is not None:
+            oldchk = os.path.join(pack, "bin", "old_checklist.py")
+            _w(oldchk, old, 0o644)
+            ro = _run([PY, oldchk, "--state", st, "--round-dir", os.path.dirname(st)], env=env)
+            need(_u15_shim_runs(sb) or "exit 0 | PREFLIGHT-STUB-OK" not in ro.stdout,
+                 "계측 타당성 실패: 구 체크리스트가 이 조건에서 셔임을 부르지 않는다")
+            calib = "구 체크리스트 셔임 경유 재현(%s)" % ro.stdout.strip().splitlines()[1][:60]
+    return "sys.executable 직접 실행 · 공백 경로 · 셔임 0 · 문자열 호환 · 계측검증=" + calib
+
+
+@specimen("H-CLT-5", "W6",
+          "cys-dept — 마커(CYS_PY_ORIGIN) 있을 때만 CYS_PY 디렉터리를 PATH 선두에(heredoc python3 40곳)",
+          ["U15", "U15-D7"])
+def h_clt_5():
+    """`cys-dept` 의 `python3 - <<'PY'` heredoc 40여 곳은 PATH 첫 python3 를 쓴다. 좌석(마커 있음)에서
+    부르면 셔임이다. ⓐ darwin + 마커 + 실행 가능 절대경로 CYS_PY → 셔임 0회. ⓑ 마커 없음(= CLT 있는 기계·
+    사용자 venv CYS_PY) → PATH 무변경(D-7: 사용자 CYS_PY 로 부서 데몬 PATH 를 바꾸지 않는다).
+    ⓒ msys(윈도우) → 무변경. ⓓ 콜론 든 경로·실행 불가 경로 → 무변경(PATH 파손 금지).
+    무변경은 **기록자 python3**(`$HOME/.local/bin` — cys-dept 가 스스로 PATH 1순위로 올리는 자리)가
+    실행되는지로 잰다."""
+    dept = os.path.join(BIN_DIR, "cys-dept")
+    need(os.path.isfile(dept), "cys-dept 부재")
+    with tempfile.TemporaryDirectory() as tmp:
+        sb = _u15_sandbox(tmp)
+        hp = os.path.join(sb["home"], ".local", "bin", "python3")
+        _w(hp, '#!/bin/sh\nprintf "%%s\\n" "HOME-PY $*" >> "%s"\nexit 1\n' % sb["marker"])
+        badd = os.path.join(tmp, "a:b")
+        _w(os.path.join(badd, "python3"), '#!/bin/sh\nexec "%s" "$@"\n' % PY)
+
+        def run(ostype, marker, cys_py, d=dept):
+            try:
+                os.remove(sb["marker"])
+            except OSError:
+                pass
+            e = dict(sb["env"], OSTYPE=ostype, CYS_DEPTS_JSON=os.path.join(tmp, "depts.json"))
+            if marker:
+                e["CYS_PY_ORIGIN"] = "bundled-clt-absent"
+            if cys_py is not None:
+                e["CYS_PY"] = cys_py
+            r = _run([BASH, d, "list"], env=e)
+            return r, _u15_shim_runs(sb)
+
+        r, runs = run("darwin24", True, sb["bundled"])
+        need(r.returncode == 0 and not runs,
+             "마커가 있는데 cys-dept heredoc 이 동봉 python 을 쓰지 않았다(rc=%d): %r" % (r.returncode, runs))
+        for label, args in (("마커 없음", ("darwin24", False, sb["bundled"])),
+                            ("msys", ("msys", True, sb["bundled"])),
+                            ("콜론 경로", ("darwin24", True, os.path.join(badd, "python3"))),
+                            ("실행 불가 경로", ("darwin24", True, os.path.join(tmp, "nope", "python3")))):
+            _r, runs = run(*args)
+            need("HOME-PY" in runs, "%s 인데 cys-dept PATH 가 바뀌었다(무변경 계약 위반)" % label)
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/bin/cys-dept", ref=_U15_BASE_REF)
+        if old is not None:
+            od = os.path.join(tmp, "old-cys-dept")
+            _w(od, old)
+            _r, runs = run("darwin24", True, sb["bundled"], d=od)
+            need("HOME-PY" in runs, "계측 타당성 실패: 구 cys-dept 가 마커 조건에서도 PATH python3 를 안 쓴다")
+            calib = "구 cys-dept PATH python3 재현"
+    return "마커 ⇒ 동봉 · 무마커/msys/콜론/실행불가 ⇒ 무변경 · 계측검증=" + calib
+
+
+@specimen("H-CLT-6", "W6",
+          "맥의 '좌석 역할 조회 실패' 통보가 Windows Defender 로 오진하지 않는다(윈도우 문안은 그대로)",
+          ["U15", "U15-M6"])
+def h_clt_6():
+    """반박 M6: 판정 불가 통보(U-29)는 rc 가 124·127 이 아니면 "가장 흔한 원인은 Windows Defender 의
+    cys.exe 격리" 라는 고정 문안을 **맥에서도** 모델 컨텍스트에 실었다. darwin 에서는 맥의 확인 순서
+    (command -v cys → cys status)와 CLT 설치 창 안내를 싣고, 비-darwin 문안은 한 글자도 바꾸지 않는다
+    (H-VOICE-U29 가 msys 에서 그 문안을 그대로 단언한다)."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        cl = os.path.join(tmp, "cltroot")
+        _w(os.path.join(cl, "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+        env, _state = _u29_nocys_sandbox(tmp, "mac", ostype="darwin24")
+        env["CYS_DEVTOOLS_ROOTS"] = cl
+        r = _run_rb(env)
+        need(r.returncode == 0, "통보 경로가 훅을 비0 종료(exit=%d)" % r.returncode)
+        need(r.stdout.strip(), "cys 부재인데 맥에서 통보가 없다(침묵 종료)")
+        ctx = _u29_ctx(r.stdout)
+        need("Defender" not in ctx and "cys.exe" not in ctx,
+             "맥 통보에 윈도우 원인(Defender·cys.exe)이 실렸다 — 오진: %r" % ctx[:300])
+        for needle in ("판정 불가", "rc=127", "보고하지 마라", "command -v cys", "cys status", "개발자 도구"):
+            need(needle in ctx, "맥 통보에 %r 가 없다: %r" % (needle, ctx[:400]))
+        notes.append("darwin 문안: 오진 0 · 조치 3단")
+        env2, _s2 = _u29_nocys_sandbox(tmp, "linux", ostype="linux-gnu")
+        ctx2 = _u29_ctx(_run_rb(env2).stdout)
+        need("Defender" in ctx2, "비-darwin 문안이 바뀌었다(윈도우 무변경 계약): %r" % ctx2[:200])
+        notes.append("비-darwin 문안 불변")
+        calib = "skip(no-git)"
+        old_leg = _git_show("cysjavis-pack/hooks/role-bootstrap-legacy.sh", ref=_U15_BASE_REF)
+        old_rb = _git_show("cysjavis-pack/hooks/role-bootstrap.sh", ref=_U15_BASE_REF)
+        if old_leg is not None and old_rb is not None:
+            od = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(od, "role-bootstrap-legacy.sh"), old_leg)
+            _w(os.path.join(od, "role-bootstrap.sh"), old_rb)
+            _w(os.path.join(od, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            env3, _s3 = _u29_nocys_sandbox(tmp, "mac-old", ostype="darwin24")
+            ro = _run([BASH, os.path.join(od, "role-bootstrap.sh")],
+                      input=json.dumps({"prompt": "너는 마스터다"}), env=env3)
+            need(ro.stdout.strip() and "Defender" in _u29_ctx(ro.stdout),
+                 "계측 타당성 실패: 구 훅이 맥에서 Defender 문안을 싣지 않는다(결함 재현 불가)")
+            calib = "구 훅 맥 Defender 오진 재현"
+    return " · ".join(notes) + " · 계측검증=" + calib
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 6. H-PRED / H-TIME / H-DOC / H-SEED / H-LIFE / H-OBS
 # ═══════════════════════════════════════════════════════════════════════════
 def _shared_pred():
@@ -10704,12 +11157,17 @@ _U29_VOICE_TOOLS = ("bash", "sh", "cat", "grep", "printf", "tr", "head", "date",
                     "python3", "env", "timeout", "cygpath", "locale")
 
 
-def _u29_nocys_sandbox(tmp, name):
+def _u29_nocys_sandbox(tmp, name, ostype="msys"):
     """`cys` 가 **PATH 에 없는** role-bootstrap 실행 환경. 반환 (env, state_dir).
 
     ★`cys` 부재는 이 저장소에서 가장 빈도 근거가 강한 실패 모드다 — Defender 격리가 릴리스
       노트의 **상설 섹션**이다(docs/RELEASE_NOTES_0.14.21.md:127-135 ·
       docs/WDSI_SUBMISSION.md:42-47 에 실측 복구 명령).
+    ★`ostype` 기본값 msys(U15 · 0.14.41 · 반박 M6): 통보 문안이 **OS 별**로 갈라졌다 — Defender 격리
+      복구 문안은 윈도우 원인이라 비-darwin 갈래에 그대로 남고, darwin 은 맥 확인 순서를 싣는다
+      (H-CLT-6). H-VOICE-U29 의 Defender·복구 순서 단언은 **그 문안이 사는 플랫폼**(msys)에서 한
+      글자도 바꾸지 않고 그대로 잰다 — 판정 조건을 완화한 것이 아니라 측정 대상 플랫폼을 명시한 것이다
+      (bash 는 상속된 OSTYPE 을 그대로 쓴다 — 실측). 계측 대조(ⓕ 구 훅)는 OSTYPE 을 보지 않는다.
     """
     sb = os.path.join(tmp, name)
     env, home, _p, _b, state = _rb_sandbox(sb)
@@ -10721,6 +11179,7 @@ def _u29_nocys_sandbox(tmp, name):
             os.symlink(src, os.path.join(binp, tool))
     need(not os.path.exists(os.path.join(binp, "cys")), "샌드박스 PATH 에 cys 가 있다(계측 무효)")
     env["PATH"] = binp
+    env["OSTYPE"] = ostype
     return env, state
 
 

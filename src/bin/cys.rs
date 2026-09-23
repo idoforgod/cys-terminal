@@ -27964,6 +27964,39 @@ mod tests {
         );
     }
 
+    /// ★U15(0.14.41 · 반박 M4) `cys boot` 회수 에스컬레이션 — CLT 없는 맥에서 PATH 의 `python3` 가
+    /// /usr/bin 셔임(설치 창 + 비0)으로 풀려 죽은 좌석이 영영 회수되지 않던 경로의 배선 핀.
+    ///
+    /// 두 계약을 **동시에** 못박는다:
+    ///   ⓐ 파괴 경로의 인터프리터 후보를 넓히지 않는다(건강성 H-SAFE-W ⓔ — 프로그램 이름 `python3`
+    ///      단일 · 스폰 사이트 1개). 그래서 치환은 후보 목록이 아니라 **자식 PATH 선두**로만 한다.
+    ///   ⓑ 그 PATH 는 lib 단일 판정(`macos_devtools::clt_absent_child_path`)에서만 온다 — 윈도우·리눅스·
+    ///      CLT 있는 맥은 None 이라 `.env("PATH", …)` 자체가 호출되지 않는다(종전 자식 env 와 동일).
+    #[test]
+    fn escalate_reclaim_fixes_shim_by_child_path_not_by_widening() {
+        let src = include_str!("cys.rs");
+        let i = src.find("fn escalate_reclaim(").expect("escalate_reclaim 소실");
+        let body = &src[i..i + src[i..].find("\n}\n").expect("본문 끝 소실")];
+        assert!(
+            body.contains("cys::python_command(\"python3\")"),
+            "회수 인터프리터 이름이 python3 단일이 아니다(Windows 보수 판정 이탈)"
+        );
+        // 자기참조 회피: lib 의 python 직스폰 전수 열거 핀이 이 파일을 줄 단위로 스캔하므로
+        // 스폰 니들은 조각 결합으로만 만든다(한 줄에 니들 + 'python' 이 같이 있으면 지점으로 세어진다).
+        let spawn_needle = concat!("Command", "::", "new(");
+        let factory_needle = concat!("python", "_command(");
+        let sites = body.matches(factory_needle).count() + body.matches(spawn_needle).count();
+        assert_eq!(sites, 1, "회수 스폰 사이트가 1개가 아니다 — 인터프리터 후보를 넓혔다");
+        assert!(
+            body.contains("macos_devtools::clt_absent_child_path("),
+            "CLT 없는 맥 회수 자식 PATH 치환이 배선되지 않았다 — 셔임이 회수를 막는다(M4)"
+        );
+        assert!(
+            body.contains("cmd.env(\"PATH\","),
+            "자식 PATH 를 실제로 얹는 자리가 없다"
+        );
+    }
+
 
     /// ★`runtime-seal` 3분류 — master 판정 2026-09-04("doctor 라벨"의 받는 자리 신설).
     /// preflight C80 이 WARN 으로 적고 "상세 진단은 `cys doctor`" 로 넘기는데, 여기 항목이
