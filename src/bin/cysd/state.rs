@@ -3055,12 +3055,50 @@ pub struct RestoredFeedReconcile {
 }
 
 /// ★U10(0.14.41 · D3a/D4) **복원 직후·서빙 전** feed 재시작 정리(순수 · 패닉 0 · allow 0).
+///
+/// 규칙(pending 항목만 · 그 밖 불변 · 결정은 두 비허가 사유뿐):
+///  ① 데몬 발행(`is_daemon_issued`) + kind ∈ {approval, first_run_gate} → resolved / [`FEED_RESTART_STALE_DECISION`].
+///     근거: 화면 감지 항목이 가리키는 옛 PTY 는 데몬과 함께 죽었고, 새 데몬의 surface 번호는 옛 번호와 맞지
+///     않아(transcripts.db 최대값+1 부터) 살아 있는 surface 순회 정리(stale-clear·gate-window-closed)에 영영 안
+///     걸린다 → 재시작마다 '승인 방치' 재발화(RC4-c)·번호 겹침 시 큐 주입 가드 오차단(RC4-e). 화면에 창이 남은
+///     새 좌석은 다음 스캔에서 **새 번호로** 다시 감지된다(정당한 승인 요청의 소실 0).
+///  ② 정보성 kind([`is_notice_feed_kind`]) + 나이 > TTL(초 · 0=끔) → resolved / [`FEED_NOTICE_EXPIRED_DECISION`].
+///     나이는 두 시각이 **유한**하고 created_at ≤ now 일 때만 잰다(시계 역행·비유한 값 = 만료 아님 = 보존).
+///  ③ 그 밖(결정성 kind · 클라이언트 발행 approval · 데몬 발행 learn_proposal …) = **무접촉**(추측 금지).
+/// 해소 시각은 now 가 유한할 때만 기록한다(JSON 직렬화 불가 값 방지). unwrap 0 · 인덱싱 0.
 pub fn reconcile_restored_feed(
-    _items: &mut [FeedItem],
-    _now: f64,
-    _notice_ttl_secs: u64,
+    items: &mut [FeedItem],
+    now: f64,
+    notice_ttl_secs: u64,
 ) -> RestoredFeedReconcile {
-    RestoredFeedReconcile::default()
+    let mut rep = RestoredFeedReconcile::default();
+    for it in items.iter_mut() {
+        if it.status != "pending" {
+            continue;
+        }
+        let orphan_screen_item = is_daemon_issued(&it.request_id)
+            && (it.kind == "approval" || it.kind == crate::governance::GATE_FEED_KIND);
+        let expired_notice = !orphan_screen_item
+            && notice_ttl_secs > 0
+            && is_notice_feed_kind(&it.kind)
+            && now.is_finite()
+            && it.created_at.is_finite()
+            && it.created_at <= now
+            && (now - it.created_at) > notice_ttl_secs as f64;
+        let decision = if orphan_screen_item {
+            rep.stale_restart += 1;
+            FEED_RESTART_STALE_DECISION
+        } else if expired_notice {
+            rep.expired_notice += 1;
+            FEED_NOTICE_EXPIRED_DECISION
+        } else {
+            continue;
+        };
+        it.status = "resolved".into();
+        it.decision = Some(decision.to_string());
+        it.resolved_at = if now.is_finite() { Some(now) } else { None };
+    }
+    rep
 }
 
 pub fn now_epoch() -> f64 {
@@ -3490,6 +3528,11 @@ impl Daemon {
         let feed_path = dir.join("feed.jsonl");
         if let Ok(content) = std::fs::read_to_string(&feed_path) {
             let mut by_id: HashMap<String, FeedItem> = HashMap::new();
+            // ★U10(0.14.41): 파싱 불가 줄(찢긴 append·구조가 다른 레코드)은 **원문 그대로 보존**한다 — 재시작
+            //   정리가 도는 이 재기록이 해석하지 못한 기록을 지우지 않는다(추측 금지 · 판독자 python 은 줄 단위
+            //   try/except 라 무해). 유계: 가장 최근 FEED_UNPARSED_KEEP 줄만(손상 누적의 상한).
+            const FEED_UNPARSED_KEEP: usize = 200;
+            let mut unparsed: Vec<&str> = Vec::new();
             for line in content.lines() {
                 if let Ok(item) = serde_json::from_str::<FeedItem>(line) {
                     match by_id.get(&item.request_id) {
@@ -3498,7 +3541,12 @@ impl Daemon {
                             by_id.insert(item.request_id.clone(), item);
                         }
                     }
+                } else if !line.trim().is_empty() {
+                    unparsed.push(line);
                 }
+            }
+            if unparsed.len() > FEED_UNPARSED_KEEP {
+                unparsed.drain(..unparsed.len() - FEED_UNPARSED_KEEP);
             }
             restored = by_id.into_values().collect();
             restored.sort_by(|a, b| {
@@ -3506,6 +3554,19 @@ impl Daemon {
                     .partial_cmp(&b.created_at)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            // ★U10(0.14.41 · D3a/D4): 서빙 전 재시작 정리 — 이벤트 0(구독자 없음)·allow 0·순수 함수.
+            //   아래 보존 한도·압축 재기록 **전에** 적용해 정리 결과가 디스크에도 남는다(다음 기동 멱등).
+            let rec = reconcile_restored_feed(
+                &mut restored,
+                now_epoch(),
+                feed_notice_ttl_from(std::env::var("CYS_FEED_NOTICE_TTL_SECS").ok().as_deref()),
+            );
+            if rec != RestoredFeedReconcile::default() {
+                eprintln!(
+                    "[cysd] feed 재시작 정리: 고아 화면감지 {}건(stale-restart) · 만료 알림 {}건(expired-notice) — 서빙 전·allow 0",
+                    rec.stale_restart, rec.expired_notice
+                );
+            }
             // 보존 한도: pending 전부 + 종결 항목 최근 1000건 (메모리·디스크 무한 누적 차단)
             const FEED_RETAIN: usize = 1000;
             let resolved_count = restored.iter().filter(|i| i.status != "pending").count();
@@ -3524,6 +3585,13 @@ impl Daemon {
             let tmp = dir.join("feed.jsonl.tmp");
             if let Ok(mut f) = std::fs::File::create(&tmp) {
                 let mut ok = true;
+                // ★U10: 보존한 파싱 불가 줄을 **먼저** 쓴다 — 뒤따르는 정상 레코드가 last-wins 로 우선한다.
+                for raw in &unparsed {
+                    if writeln!(f, "{raw}").is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
                 for item in &restored {
                     if let Ok(line) = serde_json::to_string(item) {
                         if writeln!(f, "{line}").is_err() {
@@ -10750,6 +10818,32 @@ mod u10_feed_restart_tests {
         let done = find(&items, "r-hm-done");
         assert_eq!((done.status.as_str(), done.decision.as_deref()), ("resolved", None), "종결 항목을 바꿨다");
         drop(d);
+        cleanup(&td, &sock);
+    }
+
+    /// 손상 줄(찢긴 append·구조가 다른 레코드)이 섞인 feed.jsonl — 패닉 0 · 정상 항목은 정리 · 파싱 불가 줄은
+    /// 원문 그대로 보존(재시작 정리의 재기록이 해석 못 한 기록을 지우지 않는다) · 재기동해도 같은 결과(멱등).
+    #[test]
+    fn u10_restart_with_corrupt_lines_preserves_them_and_still_reconciles() {
+        let (td, sock) = scratch_sock("corrupt");
+        let feed = state_dir(&sock).join("feed.jsonl");
+        let good = serde_json::to_string(&item("daemon-5-0", "approval", "pending", now_epoch())).unwrap();
+        let torn = r#"{"request_id":"daemon-5-1","kind":"approval","status":"pend"#;
+        let alien = r#"{"hello":"world"}"#;
+        let bin = "\u{1}garbage \u{FFFD}";
+        std::fs::write(&feed, format!("{torn}\n{good}\n\n{alien}\n{bin}\n")).unwrap();
+        for round in 0..2 {
+            let d = Daemon::new(sock.clone());
+            let items = d.feed_items.lock().unwrap().clone();
+            assert_eq!(items.len(), 1, "round {round}");
+            assert_eq!(items[0].decision.as_deref(), Some(FEED_RESTART_STALE_DECISION), "round {round}");
+            drop(d);
+            let disk = std::fs::read_to_string(&feed).unwrap();
+            for raw in [torn, alien, bin] {
+                assert_eq!(disk.matches(raw).count(), 1, "round {round}: 파싱 불가 줄 보존 실패/중복: {raw:?}");
+            }
+            assert!(!disk.contains("\n\n"), "빈 줄은 보존 대상이 아니다");
+        }
         cleanup(&td, &sock);
     }
 

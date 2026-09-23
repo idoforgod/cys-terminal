@@ -626,8 +626,34 @@ pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) 
 /// 그쪽은 바이트 동등이 계약이다(느슨한 매칭이 '이미 있음'과 '없음'을 뒤섞으면 재등록이 중복 append
 /// 폭주 방향으로 간다: 위 `hook_registered_in` 주석). 이 함수의 소비자는 기동 경고
 /// (`cys launch-agent` 의 각성 훅 미등록 판정) 하나다.
-pub fn normalize_hook_command_for_compare(cmd: &str, _windows_rules: bool) -> String {
-    cmd.to_string()
+///
+/// 규칙(양쪽 문자열에 똑같이 적용 — 결정론):
+///  ① 따옴표(`"`·`'`) 제거 ② `\` → `/` ③ 공백열 1칸으로 · 앞뒤 공백 제거
+///  ④(windows 규칙만) 토큰 머리의 `//?/`(= `\\?\` 확장 경로 접두) 제거 · 토큰 머리의 MSYS 드라이브
+///    `/c/…` → `c:/…` · 전체 소문자(NTFS 경로·`bash` 모두 대소문자 무시).
+/// 윈도우 표기가 섞이는 근거: 쓰는 쪽(`hook_command_for` = `C:/…` · preflight `_cys_hook_cmd`)과 부서 팩 값이
+/// 오는 쪽(cys-dept `$HOME` = Git Bash `/c/…` → MSYS 변환)이 다를 수 있다 — 저장소는 이미 `/c/rest` ↔ `C:/rest`
+/// 를 같은 등록으로 인정한다(`hooks/_lib.sh cys_lane_registered`). 유닉스 규칙은 ①~③만(대소문자 구분 유지).
+pub fn normalize_hook_command_for_compare(cmd: &str, windows_rules: bool) -> String {
+    let unquoted: String = cmd
+        .chars()
+        .filter(|c| *c != '"' && *c != '\'')
+        .map(|c| if c == '\\' { '/' } else { c })
+        .collect();
+    let tokens = unquoted.split_whitespace().map(|tok| {
+        if !windows_rules {
+            return tok.to_string();
+        }
+        let tok = tok.strip_prefix("//?/").unwrap_or(tok);
+        let b = tok.as_bytes();
+        let t = if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b'/' {
+            format!("{}:{}", &tok[1..2], &tok[2..])
+        } else {
+            tok.to_string()
+        };
+        t.to_lowercase()
+    });
+    tokens.collect::<Vec<_>>().join(" ")
 }
 
 /// settings.json 의 특정 이벤트에 desired 명령이 **표기 정규화 후** 등록돼 있는가(관측 전용·순수).
@@ -4409,13 +4435,14 @@ mod tests {
     /// 윈도우 규칙: 드라이브 대소문자·역슬래시·MSYS(`/c/`)·`\\?\` 접두·따옴표 차이를 같은 경로로 본다.
     #[test]
     fn u10_hook_compare_windows_forms_are_equal() {
-        let want = r#"bash "C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#;
+        // ★경로의 사용자명은 secret-scan 더미(`user`)만 쓴다(개인경로 오탐 차단 — scripts/secret-scan.sh dummy_names).
+        let want = r#"bash "C:/Users/user/.cys/pack-dept-a/hooks/session-start.sh""#;
         for got in [
-            r#"bash "c:\Users\X\.cys\pack-dept-a\hooks\session-start.sh""#,
-            r#"bash "/c/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#,
-            r#"bash "\\?\C:\Users\X\.cys\pack-dept-a\hooks\session-start.sh""#,
-            r#"bash C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh"#,
-            r#"BASH  "C:/USERS/x/.cys/pack-dept-a/hooks/session-start.sh""#,
+            r#"bash "c:\Users\user\.cys\pack-dept-a\hooks\session-start.sh""#,
+            r#"bash "/c/Users/user/.cys/pack-dept-a/hooks/session-start.sh""#,
+            r#"bash "\\?\C:\Users\user\.cys\pack-dept-a\hooks\session-start.sh""#,
+            r#"bash C:/Users/user/.cys/pack-dept-a/hooks/session-start.sh"#,
+            r#"BASH  "c:/USERS/user/.CYS/pack-dept-a/HOOKS/session-start.sh""#,
         ] {
             assert_eq!(
                 normalize_hook_command_for_compare(got, true),
@@ -4425,10 +4452,10 @@ mod tests {
             let s = u10_settings(&[("SessionStart", got)]);
             assert!(hook_registered_normalized_in(&s, "SessionStart", want, true), "{got}");
         }
-        // 공백 포함 사용자명(따옴표 필수 형상)도 같은 규칙.
+        // 공백 포함 경로(따옴표 필수 형상)도 같은 규칙.
         assert_eq!(
-            normalize_hook_command_for_compare(r#"bash "/c/Users/x y/.cys/pack/hooks/a.sh""#, true),
-            normalize_hook_command_for_compare(r#"bash "C:\Users\X Y\.cys\pack\hooks\a.sh""#, true),
+            normalize_hook_command_for_compare(r#"bash "/c/Users/user/My Docs/.cys/pack/hooks/a.sh""#, true),
+            normalize_hook_command_for_compare(r#"bash "C:\Users\user\my docs\.cys\pack\hooks\a.sh""#, true),
         );
     }
 
@@ -4437,13 +4464,13 @@ mod tests {
     fn u10_hook_compare_does_not_merge_distinct_commands() {
         let w = |s: &str| normalize_hook_command_for_compare(s, true);
         assert_ne!(
-            w(r#"bash "C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#),
-            w(r#"bash "C:/Users/X/.cys/pack/hooks/session-start.sh""#),
+            w(r#"bash "C:/Users/user/.cys/pack-dept-a/hooks/session-start.sh""#),
+            w(r#"bash "C:/Users/user/.cys/pack/hooks/session-start.sh""#),
             "다른 팩"
         );
         assert_ne!(
-            w(r#"bash "C:/Users/X/.cys/pack/hooks/session-start.sh""#),
-            w(r#"bash "C:/Users/X/.cys/pack/hooks/role-bootstrap.sh""#),
+            w(r#"bash "C:/Users/user/.cys/pack/hooks/session-start.sh""#),
+            w(r#"bash "C:/Users/user/.cys/pack/hooks/role-bootstrap.sh""#),
             "다른 스크립트"
         );
         assert_ne!(
@@ -4452,7 +4479,7 @@ mod tests {
             "다른 드라이브"
         );
         let u = |s: &str| normalize_hook_command_for_compare(s, false);
-        assert_ne!(u("sh /Users/X/.cys/pack/hooks/a.sh"), u("sh /users/x/.cys/pack/hooks/a.sh"), "유닉스는 대소문자 구분");
+        assert_ne!(u("sh /Users/user/.cys/Pack/hooks/a.sh"), u("sh /Users/user/.cys/pack/hooks/a.sh"), "유닉스는 대소문자 구분");
         assert_ne!(u("sh /c/x/hooks/a.sh"), u("sh c:/x/hooks/a.sh"), "유닉스는 MSYS 변환 없음");
         // 빈 문자열·이상 입력에서 패닉 0.
         for odd in ["", " ", "\"", "\\\\?\\", "/c", "/", "//?/", "bash \"\""] {

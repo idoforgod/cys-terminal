@@ -74,6 +74,6 @@ export function isNoticeFeedKind(kind: unknown): boolean {
 export const FEED_TOAST_NOTICE_TITLE = "ℹ 알림";
 export const FEED_TOAST_APPROVAL_TITLE = "📥 승인 요청";
 
-export function feedCreatedToastTitle(_kind: unknown): string {
-  return FEED_TOAST_APPROVAL_TITLE;
+export function feedCreatedToastTitle(kind: unknown): string {
+  return isNoticeFeedKind(kind) ? FEED_TOAST_NOTICE_TITLE : FEED_TOAST_APPROVAL_TITLE;
 }

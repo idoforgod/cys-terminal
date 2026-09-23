@@ -172,6 +172,15 @@ class FormationLane(_Home):
         _, rec2 = self.launch(CYS_PACK_DIR=custom)
         self.assertEqual(rec2["pack"], custom, "폴백이 호출자 팩을 바꿨다")
 
+    def test_1c_caller_pack_kill_switch_keeps_old_env(self):
+        # 호출자(본부) 팩의 kill-switch 파일은 종전에 부서 편성도 멈췄다(javis_formation paused_paths =
+        # $PACK_DIR/AUTOPILOT_PAUSED) — 부서 팩 전환이 그 정지를 우회하면 안 된다.
+        self.install_dept_pack_bin()
+        _write(os.path.join(self.hq, "AUTOPILOT_PAUSED"), "")
+        r, rec = self.launch()
+        self.assertEqual(rec["pack"], "<unset>", "본부 kill-switch 중인데 부서 팩으로 전환했다(정지 우회): %s" % rec)
+        self.assertIn("kill-switch", r.stderr)
+
 
 class FormationLaneWindows(FormationLane):
     WINDOWS_MOCK = True
