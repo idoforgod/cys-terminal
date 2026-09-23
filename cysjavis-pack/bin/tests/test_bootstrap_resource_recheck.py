@@ -173,8 +173,7 @@ class Rig:
                     "PATH": self.mockbin + os.pathsep + os.environ.get("PATH", ""),
                     "CYS_BOOT_CHECK_RETRIES": "1", "CYS_BOOT_CHECK_INTERVAL_S": "0",
                     "CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S": str(INTERVAL),
-                    "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S": str(TOTAL),
-                    "PYTHONDONTWRITEBYTECODE": "1"})
+                    "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S": str(TOTAL)})
         if surface:
             env["CYS_SURFACE_ID"] = surface
         env.update(extra or {})
@@ -424,10 +423,10 @@ if imported:
 def _consts(env_over):
     env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_BOOT_RESOURCE")}
     env.update(env_over)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
     code = ("import sys; sys.path.insert(0, %r); import javis_bootstrap as B; "
             "print(B.RESOURCE_RECHECK_TOTAL_S, B.RESOURCE_RECHECK_INTERVAL_S)" % BIN)
-    r = subprocess.run([PY, "-c", code], capture_output=True, text=True, env=env, timeout=60)
+    # -B: 이 import 가 bin/ 에 캐시를 남기지 않게(팩 봉인 SEAL-1 정신 — 모듈 자신의 봉인은 import 뒤다)
+    r = subprocess.run([PY, "-B", "-c", code], capture_output=True, text=True, env=env, timeout=60)
     try:
         a, b = r.stdout.split()
         return float(a), float(b)

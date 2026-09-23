@@ -53,7 +53,6 @@ def _w(path, body, mode=0o644):
 def _clean_env(extra=None):
     env = {k: v for k, v in os.environ.items()
            if not (k.startswith("CYS_") or k.startswith("JAVIS_") or k.startswith("AITERM_"))}
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.update(extra or {})
     return env
 
