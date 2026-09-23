@@ -586,6 +586,10 @@ _SECRET_CLEAN = (
     "docs    C:\\Users\\...\\AppData (문서의 생략 표기)\n"
     "brand   cysinsight — LICENSE·README·홈페이지 URL 의 공개 브랜드다(개인정보 아님)\n"
     "prompt  user@host:~/dev$\n"
+    # ★성찰 A·B(minor): 공개 연락처 주소는 **주소 단위**로 허용된다(파일명 무관 — 아래 h_secret_1
+    #   의 feedback.rs 동명 파일 검체가 그 반대편, "이 주소가 아닌 다른 이메일은 여전히 잡힌다"를 잰다).
+    #   ★조각화(이 파일 자신이 scan-pack-secrets.sh 대상이다 — 리터럴로 적으면 그 게이트가 FIRE):
+    "mail    contact: %s@%s.com\n" % ("cysinsight", "gmail")
 )
 
 
@@ -656,6 +660,20 @@ def h_secret_1():
         need(cr.returncode == 0,
              "음성 대조가 차단됐다 — 승인된 더미·공개 브랜드까지 잡는 스캐너는 곧 꺼진다:\n%s"
              % (cr.stdout + cr.stderr)[-1200:])
+
+        # ★성찰 A·B(minor) 회귀 핀: 종전에는 `src-tauri/src/feedback.rs`(파일명 통째)가 이메일
+        #   스캔에서 면제됐다 — 그 파일에 다른 실주소가 섞여도 조용히 통과했다. 지금은 주소
+        #   단위로만 허용하므로, **같은 파일명**이라도 승인된 주소가 아닌 다른 이메일은 잡혀야
+        #   한다(면제가 파일에서 리터럴 주소로 좁아졌다는 것을 직접 증명).
+        fb_like = os.path.join(tmp, "feedback.rs")
+        with open(fb_like, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write('pub const STRAY: &str = "%s@%s.dev";\n' % ("probe" + "leak", "acme"))
+        fbr = _scan(fb_like)
+        need(fbr.returncode == 1,
+             "feedback.rs 동명 파일의 다른 이메일이 차단되지 않았다(exit=%d) — 파일 단위 면제가 "
+             "되살아났다: %r" % (fbr.returncode, (fbr.stdout + fbr.stderr)[-400:]))
+        need("EMAIL" in _labels(fbr.stdout),
+             "feedback.rs 동명 파일의 다른 이메일이 EMAIL 규칙으로 잡히지 않았다: %r" % fbr.stdout[-400:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     need(not os.path.isdir(tmp), "합성 표본 임시 디렉터리가 남았다: %s" % tmp)

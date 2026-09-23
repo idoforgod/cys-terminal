@@ -68,11 +68,16 @@ dummy_user_re='/Users/('"$dummy_names"')(/|"|$)'
 # Windows 홈의 더미 판 — `C:\Users\x\…`·`C:\Users\x>`. 경계는 '이름 문자가 아닌 것'으로 본다
 # (뒤에 `\`·`>`·공백·따옴표 등 무엇이 오든 이름 자체가 더미면 통과).
 win_dummy_user_re='[A-Za-z]:\\+Users\\+('"$dummy_names"')([^A-Za-z0-9._-]|$)'
-# 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함).
-# ★(0.14.41 · U6 통합) src-tauri/src/feedback.rs::FEEDBACK_TO 도 같은 공개 주소(README·SECURITY 와
-#   동일 문자열 — feedbackwiring.test.ts 가 두 문서와 대조)의 **단일 정의처**라 같은 예외를 받는다.
-email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md|src-tauri/src/feedback\.rs)$'
-email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@'
+# 이메일 허용 — ★성찰 A·B(minor): 종전에는 README·SECURITY·feedback.rs **파일 전체**를 이메일
+#   스캔에서 뺐다(`email_allow_re` 파일 단위 skip). FEEDBACK_TO 한 줄(28행)을 허용하려고
+#   1,439행짜리 feedback.rs(테스트 포함) 전체가 면제돼, 앞으로 그 파일에 실수로 들어오는
+#   다른 실주소(디버그 프린트·오타 픽스처 등)를 H-SECRET 게이트가 조용히 통과시킨다 — 파일
+#   단위 skip 자체가 오탐(false-negative) 확대 경로다. 네 파일 모두 **같은 공개 주소**
+#   (cysinsight@gmail.com — README·SECURITY 취약점 신고 연락처 = feedback.rs FEEDBACK_TO,
+#   feedbackwiring.test.ts 가 두 문서와 대조)뿐이므로, 파일을 통째로 빼는 대신 **그 주소 하나만**
+#   전역 오탐 목록(email_fp_re)에 올린다 — 이 네 파일을 포함해 저장소 어디서든 다른 실주소는
+#   그대로 잡힌다(허용 폭이 파일에서 리터럴 주소로 좁아졌다).
+email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@|cysinsight@gmail\.com'
 # 개인 계정 핸들 denylist(맨몸) — /Users·.claude- 접두 없이 계정키·설정값으로 박힌 개인 핸들도 차단한다.
 # 넓은 패턴 대신 '알려진 개인 핸들'만 명시 등재해 제네릭 영어단어 오탐을 배제한다(deny-by-default 유지).
 # ysfuture = 오너 개인 alias·이메일 prefix. 부분일치라 'claude-ysfuture'·'ysfuture@…'도 함께 걸린다.
@@ -119,11 +124,9 @@ for f in "${files[@]}"; do
   #    종전 `/Users/cys` 는 정슬래시 전용이라 Windows 표기의 같은 계정을 통과시켰다(사각 ②).
   g "$f" -nE '\.claude-(ysfuture|cysinsight|cysfuturist)|[/\\]Users[/\\]+cys' \
     | sed "s|^|PROFILE\t$f:|" >> "$findings" || true
-  # 3) 이메일 (허용 문서·오탐 제외)
-  if ! printf '%s' "$f" | grep -qE "$email_allow_re"; then
-    g "$f" -nE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|net|org|io|dev)' \
-      | grep -vEi "$email_fp_re" | sed "s|^|EMAIL\t$f:|" >> "$findings" || true
-  fi
+  # 3) 이메일 (오탐 제외 — 파일 단위 면제 없음, 모든 파일을 같은 규칙으로 스캔)
+  g "$f" -nE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.(com|net|org|io|dev)' \
+    | grep -vEi "$email_fp_re" | sed "s|^|EMAIL\t$f:|" >> "$findings" || true
   # 4) 자격증명/토큰/개인키. 일반 keyword 규칙은 *따옴표 친 리터럴 값*만(>=12자) 매칭한다 —
   #    'api_key = resolve_api_key()' 같은 함수호출·변수참조(따옴표 없음) 오탐을 배제한다.
   g "$f" -nE 'sk-ant-[A-Za-z0-9]|sk-[A-Za-z0-9]{20}|ghp_[A-Za-z0-9]{10}|github_pat_[A-Za-z0-9]|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9]|-----BEGIN [A-Z ]*PRIVATE KEY-----|(password|passwd|secret|api[_-]?key|access[_-]?token)["'"'"' ]*[:=][ ]*["'"'"'][A-Za-z0-9/+=_-]{12,}' \
