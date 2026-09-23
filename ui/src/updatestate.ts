@@ -321,9 +321,21 @@ export function deriveUpdateView(st: UpdateState, fmt: (ms: number) => string): 
     };
   }
   if (refused) {
+    // 리뷰1 F1: GUI(classify_pack_check)는 공개 base 가 pro 디스크 base 보다 strictly-newer 일
+    // 때만 channel-refused 를 돌려준다(그 밖엔 packRow 에서 none 으로 조용히 끝난다). 그래도 이
+    // 상태는 "설치할 수 없다"는 안내이지 경보가 아니다 — pro 사용자에게는 앱이 애초에 pro 업데이트를
+    // 확인하지 않는다는 사실을 알려줄 뿐, "업데이트가 있지만"이라고 말하지 않는다(빨강 아님).
     return {
-      badge: { text: "!", tone: "alert", title: "팩: pro 채널 — 공개 팩은 적용 대상 아님(눌러서 자세히)" + again, hidden: false },
-      headline: "업데이트가 있지만 앱 안에서 바로 설치할 수 없습니다",
+      badge: {
+        // 텍스트는 종전대로 '막힘' 계열 기호 !(설계 §3 U9 주석 "막힘(본체 필요·채널 거부 !)")를
+        // 유지하되, 톤만 warn(호박색)으로 낮춘다 — alert(빨강)는 "지금 조치가 필요하다"는 뜻인데
+        // pro 사용자에게는 조치할 것이 없다(앱이 애초에 pro 업데이트를 확인하지 않는다).
+        text: "!",
+        tone: "warn",
+        title: "팩: pro 채널 — 앱은 pro 업데이트를 확인하지 않습니다(공개 팩은 적용 대상 아님 · 눌러서 자세히)" + again,
+        hidden: false,
+      },
+      headline: "공개 팩 업데이트는 pro 설치에 적용되지 않습니다 — 앱은 pro 업데이트를 확인하지 않습니다",
       isLatest: false,
       rows,
       meta,
