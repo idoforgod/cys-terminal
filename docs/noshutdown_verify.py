@@ -215,21 +215,31 @@ REINJECT_RESULT_PREFIX = "PACK_UPDATE_RESULT"  # src/pack.rs::REINJECT_RESULT_PR
 def parse_pack_update_result(stdout):
     """pack-update stdout의 안정 토큰 1줄을 파싱 → counts dict 또는 None(토큰 부재).
 
-    토큰: `PACK_UPDATE_RESULT pack_version=X injected=N skipped=N deferred=N failed=N`
-    (src/pack.rs / src-tauri parse_reinject_counts와 동일 토큰). 사람용 메시지와 독립한
-    안정 토큰만 신뢰한다 — 카운트 파싱 실패 토큰은 0으로 보수 처리.
+    토큰(수치 팔): `PACK_UPDATE_RESULT pack_version=X injected=N skipped=N deferred=N failed=N`
+    (src/pack.rs / src-tauri parse_reinject_counts와 동일 토큰).
+    토큰(스킵 팔 · U4-B2③ · review1 M1 FIX): `PACK_UPDATE_RESULT pack_version=X reinject=skipped
+    reason=Y` — 재주입 RPC 자체가 실패해 수치를 재지 못한 경우(`failed=`/`deferred=` 키가 없다).
+    `reinject`/`reason` 키를 실어 반환하고, 수치 키는 종전대로 기본값 0으로 채운다 — 이 dict 만 보고
+    "failed=0 deferred=0 이니 성공"으로 오판하지 않도록 `awaken_gate_failures`가 `reinject=="skipped"`를
+    별도로 검사한다(수치 0 을 성공으로 읽지 않는다). 사람용 메시지와 독립한 안정 토큰만 신뢰한다 —
+    카운트 파싱 실패 토큰은 0으로 보수 처리.
     """
     for line in stdout.splitlines():
         line = line.strip()
         if line.startswith(REINJECT_RESULT_PREFIX):
             rest = line[len(REINJECT_RESULT_PREFIX):]
-            out = {"pack_version": None, "injected": 0, "skipped": 0, "deferred": 0, "failed": 0}
+            out = {
+                "pack_version": None, "injected": 0, "skipped": 0, "deferred": 0, "failed": 0,
+                "reinject": None, "reason": None,
+            }
             for tok in rest.split():
                 k, sep, v = tok.partition("=")
                 if not sep:
                     continue
                 if k == "pack_version":
                     out["pack_version"] = v
+                elif k in ("reinject", "reason"):
+                    out[k] = v
                 elif k in ("injected", "skipped", "deferred", "failed"):
                     try:
                         out[k] = int(v)
@@ -271,6 +281,15 @@ def awaken_gate_failures(pack_result, directive_changed, markers_available, bump
     # ① PACK_UPDATE_RESULT: failed==0 AND deferred==0 — deferred-only/미각성 통과 차단.
     if pack_result is None:
         fails.append("PACK_UPDATE_RESULT 토큰 없음(구버전 사이드카·reinject 미실행 — 각성 증명 불가)")
+    elif pack_result.get("reinject") == "skipped":
+        # ★review1 M1 FIX(blocking): 재주입 RPC 자체가 실패한 B2 Err 팔은 `reinject=skipped`
+        # 토큰을 찍되 `failed=`/`deferred=`는 싣지 않는다(재지 않은 수치를 0으로 위장하지 않음 —
+        # cys.rs pack_update_reinject_skipped_line). 이 dict 의 failed/deferred 기본값 0 을 그대로
+        # "완전 성공"으로 읽으면 v0.14.40 에서는 FAIL 이었던 것이 B2 에서 조용히 PASS 로 샌다
+        # (실측: skill-only 팩이면 ② 축이 조기 반환해 게이트 전체가 PASS). reinject=skipped 는
+        # failed/deferred 수치와 무관하게 그 자체로 "각성 증명 불가"다.
+        reason = pack_result.get("reason") or "unknown"
+        fails.append(f"reinject skipped(reason={reason}) — 재주입 RPC 실패로 각성 증명 불가(디스크만 갱신, 라이브 노드 미확인)")
     else:
         if pack_result["failed"] != 0:
             fails.append(f"reinject failed={pack_result['failed']}")
@@ -317,6 +336,22 @@ def run_self_test():
     expect("failed>0 → FAIL",
            awaken_gate_failures(failed, False, True, 1, "1.2.3") != [])
     expect("토큰 부재 → FAIL", awaken_gate_failures(None, False, True, 0, "1.2.3") != [])
+    # ★review1 M1 FIX(blocking) 회귀 핀: reinject=skipped 팔(재주입 RPC 실패 — cys.rs
+    # pack_update_reinject_skipped_line)은 failed=/deferred= 없이 토큰만 찍는다. 파서가 그 결측을
+    # 0으로 채워도(else 분기가 아니라 skipped 분기로 갈라져야) 게이트가 통과시키면 안 된다 — 개정 전
+    # 코드에서는 이 자리가 PASS(적색이어야 할 자리에서 초록)였다.
+    skipped_tok = parse_pack_update_result(
+        "[pack-update] reinject 스킵(데몬 점검 필요): 연결 실패\n"
+        "PACK_UPDATE_RESULT pack_version=1.2.3 reinject=skipped reason=daemon_rpc_failed")
+    expect("parse reinject=skipped 토큰 부재 아님(값 존재)", skipped_tok is not None)
+    expect("parse reinject=skipped 필드", skipped_tok["reinject"] == "skipped")
+    expect("parse reason=daemon_rpc_failed 필드", skipped_tok["reason"] == "daemon_rpc_failed")
+    expect("parse reinject=skipped 는 failed/deferred 를 0 그대로 둔다(재지 않음)",
+           skipped_tok["failed"] == 0 and skipped_tok["deferred"] == 0)
+    expect("reinject=skipped → FAIL(각성 증명 불가 — v0.14.40 은 토큰 부재로 FAIL 이었다)",
+           awaken_gate_failures(skipped_tok, False, True, 0, "1.2.3") != [])
+    expect("reinject=skipped + directive_changed=True 여도 FAIL(①이 먼저 걸린다)",
+           awaken_gate_failures(skipped_tok, True, True, 0, "1.2.3") != [])
     expect("directive_changed=None + 마커 무변경(bump=0) → FAIL(명시 신호 없는 무변경 통과 금지)",
            awaken_gate_failures(clean, None, True, 0, "1.2.3") != [])
     expect("directive_changed=True + bump>=1 → PASS",
