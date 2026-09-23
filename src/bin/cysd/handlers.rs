@@ -13546,6 +13546,60 @@ mod tests {
         assert_eq!(ret["ok"], json!(true), "승인 창의 Return(SubmitKey)은 종전대로 통과해야 한다(X2): {ret}");
     }
 
+    /// ★(0.14.41-fix1 · REVIEW1 F1) 모달 축은 **에이전트 생존이 관측된 좌석에만** 걸린다 — 질문·권한
+    /// 창을 띄운 채 죽은 좌석(크래시·강제 종료)의 잔상 위로는 node-recover 의 재기동 Text(authoritative ·
+    /// `claude --resume …`)가 통과해야 한다(③ 자가치유 회귀 차단 · REVIEW1 실측 탐침
+    /// `r1-probe-dead-seat-current.log` 를 정식 검체로 승격). 살아있는 좌석(agent_exit_notified=false ·
+    /// SEAT≠Empty)은 종전대로 계속 거부된다(회귀 방지 대조군).
+    #[test]
+    fn u8_p1_fix1_dead_seat_relaunch_passes_modal_axis_but_live_seat_still_denied() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("u8-p1-fix1-dead-seat", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_650;
+        let _sender = v7_pane(&daemon, "worker-2", pid);
+        let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+        let relaunch = json!({
+            "text": "claude --resume abc --dangerously-skip-permissions",
+            "human": false, "queued": false, "authoritative": true,
+        });
+        // (이름, 좌석을 죽은 것으로 관측시키는 준비, 기대 결과)
+        let cases: Vec<(&str, fn(&Arc<crate::state::Surface>), bool)> = vec![
+            ("live agent (control)", |_s| {}, false),
+            ("dead agent (agent_exit_notified)", |s| {
+                s.agent_exit_notified.store(true, Ordering::Relaxed);
+            }, true),
+            ("dead agent (seat_cache=Empty)", |s| {
+                s.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
+            }, true),
+        ];
+        let mut observations = Vec::new();
+        for (i, (name, prep, expect_pass)) in cases.iter().enumerate() {
+            let target = v7_pane(&daemon, "worker-1", pid + 1 + i as u32);
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+            prep(&target);
+            {
+                let mut parser = target.parser.lock().unwrap();
+                parser.process(b"\x1b[2J\x1b[H");
+                parser.process(modal.as_bytes());
+            }
+            let mut params = json!({"surface_id": target.id, "quiet": true});
+            params.as_object_mut().unwrap().extend(relaunch.as_object().unwrap().clone());
+            let resp = d12_rpc(&daemon, pid, "surface.send_text", params);
+            observations.push((name.to_string(), resp, *expect_pass));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        for (name, resp, expect_pass) in observations {
+            if expect_pass {
+                assert_eq!(resp["ok"], json!(true), "{name}: 죽은 좌석의 재기동 Text 는 통과해야 한다: {resp}");
+            } else {
+                d12_assert_denied(&resp, "modal");
+                let _ = name;
+            }
+        }
+    }
+
     #[test]
     fn d12_denials_publish_once_per_request_including_clear_first_and_enter() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

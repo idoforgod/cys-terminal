@@ -5132,9 +5132,20 @@ pub(crate) fn draft_gate(
     let selector_row = obs.as_ref().map_or(false, |obs| obs.selector_row);
     // ★(0.14.41 · U8 P1) Text 팔의 현재 화면 모달 축 — 화면 점유 축보다 **앞**(선택기 행이 먼저 통과되던 구멍).
     //   술어는 큐 배달 게이트 ②와 같다(readiness 의 전경 모달 서명 ∨ 선택기 행 — `obs_modal_foreground` 한 곳).
+    // ★(0.14.41-fix1 · REVIEW1 F1) 모달 축은 **에이전트 생존이 관측된 좌석**에만 건다. 데몬은 에이전트가
+    //   죽어도 agent_meta 를 지우지 않으므로(위의 `.is_none()` 조기반환은 "등록된 적 있는가"만 본다),
+    //   질문·권한 창을 띄운 채 죽은 좌석(크래시·강제 종료)은 그 잔상 아래에 셸 프롬프트가 붙는다 — 화면상
+    //   `modal_foreground=Some` 이 되어 node-recover(`run_node_recover` → `boot_agent_on_surface`)의 재기동
+    //   Text 를 매 부트 틱마다 거부했다(rc 79 `skipped_unconfirmed` 반복 · ③ 자가치유 회귀 · 실측 탐침
+    //   r1-probe-dead-seat-current.log). `seat_is_agent_backed` 가 이미 "등록 ∧ ¬exit_notified ∧ SEAT≠Empty"
+    //   를 판정하는 단일 술어다(alert_route — schedule::deliver_push 와 같은 곳) — 그 좌석에서만 모달 축을
+    //   적용한다. 셸이 전경이면(죽은 좌석) 모달은 역사이므로 화면 점유 축(아래 `draft_gate_verdict`)으로
+    //   넘긴다.
     let modal_foreground = obs.as_ref().map_or(false, obs_modal_foreground);
-    if let Some(why) = draft_gate_modal_verdict(kind, modal_foreground, selector_row) {
-        return Some(why);
+    if crate::alert_route::seat_is_agent_backed(s) {
+        if let Some(why) = draft_gate_modal_verdict(kind, modal_foreground, selector_row) {
+            return Some(why);
+        }
     }
     let approval_pending = approval_or_gate_pending(daemon, s.id);
     draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
