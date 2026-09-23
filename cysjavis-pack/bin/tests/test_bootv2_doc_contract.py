@@ -20,6 +20,11 @@
      데몬이 무시하거나, 더 나쁘게는 각성 없이 각성 신고가 성립한다. 그 줄은 **없어야** 한다.
   ⑤ **CEO_TEMPLATE 손편집 드리프트**. CEO_TEMPLATE 은 100% 생성물(fragment + 구분선 +
      MASTER_DIRECTIVE 바이트 무수정)인데 손편집이 실재했다(2026-09-04 워크트리 실측).
+  ⑦ **U13 착수 게이트 정본 공백**(0.14.41 WP-C1 · 리뷰1 I-1). 정본 절(WORKER §0 ·
+     REVIEWER §1-2)이 테스트 핀 0 이었다 — 두 절을 통째로 지워도(뮤테이션 MU10) 이 축
+     신설 전에는 관련 스위트 전부가 통과했다. 절 헤더 실재 · 운영 절차 예외 토큰 전수 ·
+     부트 턴 '단독' 정의 · `[RESTORE]`/`[RECOVER]` 가 `[RESUME]` 보다 우선한다는 규정 ·
+     CSO·MASTER 지침에는 이 절이 **없다**(대상 무변경)를 잰다.
 
 밀폐: `tempfile.mkdtemp()` + `CYS_PACK_DIR`/`JAVIS_ROOT` env 덮어쓰기 — 라이브 팩·데몬·홈
 무접촉. 읽는 것은 **이 repo 트리의 파일뿐**이고 쓰기는 임시 디렉터리의 변조 사본뿐이다.
@@ -31,6 +36,8 @@
   ④ session-start.sh 에 ack 줄 **부재**(T1-8 · 음성 방향)
   ⑤ CEO_TEMPLATE == 생성기 합성식 출력(바이트 등가)
   ⑥ ★음성 대조(계측 타당성) — 위 다섯 축을 각각 무력화한 **변조 사본**은 통과하지 못한다
+  ⑦ U13 착수 게이트 정본(WORKER §0 · REVIEWER §1-2) 실재 + CSO·MASTER 무접촉(회귀 핀) +
+     그 축의 음성 대조(MU10 재현 — 절 삭제 사본은 반드시 FAIL)
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 BOOTV2-DOC-CONTRACT-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_bootv2_doc_contract.py
 """
@@ -51,6 +58,8 @@ SCRIPTS = os.path.join(REPO, "scripts")
 
 REVIEWER_MD = os.path.join(DIRECTIVES, "REVIEWER_DIRECTIVE.md")
 MASTER_MD = os.path.join(DIRECTIVES, "MASTER_DIRECTIVE.md")
+WORKER_MD = os.path.join(DIRECTIVES, "WORKER_DIRECTIVE.md")
+CSO_MD = os.path.join(DIRECTIVES, "CSO_DIRECTIVE.md")
 CEO_MD = os.path.join(DIRECTIVES, "CEO_TEMPLATE.md")
 FRAGMENT = os.path.join(SCRIPTS, "ceo_template_header.md")
 SESSION_START = os.path.join(HOOKS, "session-start.sh")
@@ -253,6 +262,31 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
     return []
 
 
+# ⑦ U13 착수 게이트 정본(0.14.41 WP-C1 · 리뷰1 I-1) — 저장소 수준 문안 핀. 런타임
+#   CONTENT_PINS 가 아니다(`.new` 미병합 기존 설치를 C03 FAIL 시키지 않는다 — 이 파일이
+#   읽는 것은 repo 트리의 `directives/*.md` 뿐이고 팩 배포본 무접촉).
+START_GATE_EXCEPTION_TOKENS = [
+    "[CYCLE-PRE]", "[CYCLE]", "[CYCLE-VERIFY]", "[DRAIN]", "[DRAIN-VERIFY]",
+    "각성 메시지", "지침 각성 확인 핑", "각성 ACK", "승인",
+]
+RESTORE_PRIORITY_RE = re.compile(r"\[RESTORE\][^\n]{0,100}우선")
+
+
+def start_gate_missing(text, header):
+    """U13 착수 게이트 정본 절 — 부재 목록(빈 목록 = 통과).
+    header = 그 문서의 절 헤더 리터럴. 헤더가 없으면(MU10 재현) 이하 토큰 검사는 생략하고
+    헤더 부재 하나만 보고한다 — 절 자체가 없으니 토큰이 빠진 개수를 세는 것은 의미가 없다."""
+    if header not in text:
+        return ["절 헤더 부재: %r" % header]
+    bad = [("운영 절차 예외 토큰 부재: %s" % tok)
+           for tok in START_GATE_EXCEPTION_TOKENS if tok not in text]
+    if "단독" not in text:
+        bad.append("부트 턴 정의('단독') 부재")
+    if not RESTORE_PRIORITY_RE.search(text):
+        bad.append("[RESTORE] 가 [RESUME] 보다 우선한다는 규정 부재")
+    return bad
+
+
 root = tempfile.mkdtemp()
 try:
     # 밀폐: 라이브 팩·라운드 무접촉(이 검체는 repo 트리만 읽지만 계약을 지킨다)
@@ -266,6 +300,8 @@ try:
     hook = read(SESSION_START)
     orchestra_src = read(ORCHESTRA_PY)
     bootstrap_src = read(BOOTSTRAP_PY)
+    worker = read(WORKER_MD)
+    cso = read(CSO_MD) if os.path.exists(CSO_MD) else ""
 
     # ─────────── ① ACK 규약 문안 실재 (게이트↔지침 짝 결속) ───────────
     check("1a 코드 쪽 ACK 게이트 실재(짝의 반대편)",
@@ -337,6 +373,18 @@ try:
         print("SKIP 5 CEO_TEMPLATE 합성 대조 — fragment 부재(배포 팩 트리 · repo 전용 축)")
         gen = None
 
+    # ─────────── ⑦ U13 착수 게이트 정본 실재(0.14.41 WP-C1 · 리뷰1 I-1) ───────────
+    w_bad = start_gate_missing(worker, "## 0. ★착수 게이트")
+    check("7a WORKER_DIRECTIVE §0 착수 게이트 절 실재 + 예외 토큰·부트 턴·RESTORE 우선 전수",
+          not w_bad, "부재: %s" % w_bad)
+    r_bad = start_gate_missing(reviewer, "## 1-2. 착수 게이트")
+    check("7b REVIEWER_DIRECTIVE §1-2 착수 게이트 절 실재 + 예외 토큰·부트 턴·RESTORE 우선 전수",
+          not r_bad, "부재: %s" % r_bad)
+    check("7c CSO_DIRECTIVE 무변경(착수 게이트 절이 새지 않았다)",
+          "착수 게이트" not in cso, "CSO 문서에 착수 게이트 절이 발견됐다 — 대상 확산")
+    check("7d MASTER_DIRECTIVE 무변경(착수 게이트 절이 새지 않았다 — master 는 §0-C 임무 게이트가 별도)",
+          "착수 게이트" not in master, "MASTER 문서에 착수 게이트 절이 발견됐다 — 대상 확산")
+
     # ─────────── ⑥ ★음성 대조(계측 타당성) ───────────
     # 각 축을 무력화한 변조 사본이 **같은 판정 함수**에서 실패해야 한다.
     m_rev = re.sub(r"## 1-1\..*?(?=## 2\. 엄격 제약)", "", reviewer, flags=re.S)
@@ -393,6 +441,24 @@ try:
         check("6k 변조⑦ 매뉴얼에서 kind 1종을 바꾸면 교차 결박이 잡는다",
               [k for k in TERMINAL_KINDS if k not in _mut_manual] == ["attempts_exhausted"],
               "매뉴얼 드리프트가 무측정이면 이 축은 장식이다")
+
+    # ─────────── 변조⑧ MU10 재현 — §0/§1-2 절 통째 삭제는 ⑦ 축을 통과 못 함 ───────────
+    m_worker_mu10 = re.sub(r"## 0\. ★착수 게이트.*?(?=\n## 1\. )", "", worker, flags=re.S)
+    check("6l 변조⑧ 앵커 실재(WORKER §0 삭제가 실제로 텍스트를 바꿨다)",
+          m_worker_mu10 != worker and "## 0. ★착수 게이트" not in m_worker_mu10)
+    check("6m 변조⑧ WORKER §0 통째 삭제본(MU10 재현)은 ⑦ 축을 통과 못 함",
+          bool(start_gate_missing(m_worker_mu10, "## 0. ★착수 게이트")),
+          "변조본이 통과했다(계측 무효 — I-1 재발)")
+    m_reviewer_mu10 = re.sub(r"## 1-2\. 착수 게이트.*?(?=\n## 2\. 엄격 제약)", "", reviewer, flags=re.S)
+    check("6n 변조⑧ 앵커 실재(REVIEWER §1-2 삭제가 실제로 텍스트를 바꿨다)",
+          m_reviewer_mu10 != reviewer and "## 1-2. 착수 게이트" not in m_reviewer_mu10)
+    check("6o 변조⑧ REVIEWER §1-2 통째 삭제본(MU10 재현)은 ⑦ 축을 통과 못 함",
+          bool(start_gate_missing(m_reviewer_mu10, "## 1-2. 착수 게이트")),
+          "변조본이 통과했다(계측 무효 — I-1 재발)")
+    m_cso_leak = cso + "\n## 99. 착수 게이트 (변조 유입)\n" if cso else ""
+    if m_cso_leak:
+        check("6p 변조⑨ CSO 에 '착수 게이트' 문자열이 섞이면 7c 가 잡는다",
+              "착수 게이트" in m_cso_leak, "변조 자체가 무효")
 
 finally:
     shutil.rmtree(root, ignore_errors=True)

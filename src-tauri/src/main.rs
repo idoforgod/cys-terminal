@@ -5125,12 +5125,16 @@ async fn start_master(app: AppHandle) -> Result<(), String> {
     //   주입하는데, 관문 창에 붙여넣는 순간 그 Return 이 실측상 면책 창의 `No, exit` 을 눌러
     //   마스터를 종료시킨다. 좌석은 이미 보존됐으니(닫지 않았다) 사람이 그 pane 에서 관문을
     //   통과시키면 그대로 쓴다 — 사용자에게는 그 처방만 올린다.
+    //   ★0.14.41 U7(WP-C1 · 반박 M1): 2.1.261+ 는 폴더신뢰 창도 기본 선택이 `No, exit` 다 — 처방이 두 창을
+    //   함께 경고한다(문안만 · 코퍼스·자동확인 무접촉 · 핀 = tests::u7_gate_pending_prescriptions_…).
     if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
         return Err(format!(
             "마스터 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
              닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — 순서는 \
-             테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★면책 창의 기본 \
-             선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내이고, ★폴더신뢰(2.1.261+)·면책 \
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter). \
+             버전을 모르면 라벨로 확인하세요: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 \
+             Enter — `No, exit` 위에서는 Enter 금지.\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -5584,8 +5588,10 @@ async fn start_dept_master(app: AppHandle, socket: String) -> Result<(), String>
     if out.status.code() == Some(cys::EXIT_GATE_PENDING) {
         return Err(format!(
             "부서장 pane 은 떴고 프로세스도 살아 있으나 **첫기동 관문**에 갇혀 있습니다(pane 은 \
-             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★면책 창의 \
-             기본 선택은 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter).\n{}",
+             닫지 않았습니다). 그 pane 에서 관문을 1회 통과시킨 뒤 다시 시작하세요 — ★폴더신뢰(2.1.261+)·면책 \
+             창 **둘 다** 기본 선택이 `No, exit` 이라 그대로 Enter 를 누르면 종료됩니다(아래 방향키 1회 뒤 Enter). \
+             버전을 모르면 라벨로 확인하세요: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 \
+             Enter — `No, exit` 위에서는 Enter 금지.\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -11751,6 +11757,31 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             .filter(|l| l.starts_with("#[cfg(") && (l.contains("unix") || l.contains("target_os") || l.contains("windows")))
             .count();
         assert!(counted >= 10, "스캐너가 최상위 cfg 속성을 못 찾고 있다(counted={counted})");
+    }
+
+    /// ★0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): GUI 가 올리는 관문 보류 처방(본부 마스터·부서장)은
+    /// **폴더신뢰(2.1.261+)와 면책 창 둘 다** 기본 선택이 `No, exit` 임을 경고해야 한다. 새 설치의 GUI 첫
+    /// 마스터가 바로 폴더신뢰 창을 만나는데, 종전 문안은 면책 창만 경고해 안내대로 Enter 를 누르면 마스터가
+    /// 죽었다. 문안만 바꾼다(동작 변경 0).
+    #[test]
+    fn u7_gate_pending_prescriptions_warn_folder_trust_and_disclaimer_both_no_exit() {
+        let src = include_str!("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        for anchor in ["\"마스터 pane 은 떴고", "\"부서장 pane 은 떴고"] {
+            let i = body.find(anchor).unwrap_or_else(|| panic!("처방 앵커 소실: {anchor}"));
+            let seg = &body[i..i + body[i..].find(".trim()").expect("처방 끝 경계")];
+            // 소스의 줄 잇기(`\` + 개행 + 들여쓰기)는 문자열에서 사라진다 — 공백을 접어 실제 문안으로 잰다.
+            let flat = seg.replace("\\\n", "").split_whitespace().collect::<Vec<_>>().join(" ");
+            // ★리뷰1 I-6(minor · 문안 병기): 방향키 처방(2.1.261+ 전용) 옆에 라벨 기준 문장도 있어야
+            //   한다 — 사람은 자기 Claude 버전을 모르는 경우가 흔하다(동작 변경 0 · 병기만).
+            for tok in ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Enter",
+                       "Yes, I trust this folder", "Yes, I accept"] {
+                assert!(flat.contains(tok), "{anchor} 처방에 {tok:?} 가 없다: {flat}");
+            }
+            // 구 단독 경고(면책 창만) 문장이 남지 않았다 — 바늘은 이어 붙여 만든다(자기 매치 방지).
+            let old = ["★면책 창의 기본", " 선택은 `No, exit` 이라"].concat();
+            assert!(!flat.contains(&old), "{anchor}: 면책 창 단독 경고가 남았다");
+        }
     }
 
 }

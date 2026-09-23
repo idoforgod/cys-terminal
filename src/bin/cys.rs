@@ -2748,6 +2748,19 @@ fn gate_guard_check(sid: u64, stage: &str) -> Result<(), String> {
     }
 }
 
+/// ★관문 기본 포커스 경고 — 사람용 처방 두 지점(주입 가드 Hold `gate_hold_message` · 부트 GatePending
+/// `print_gate_pending_prescription`)이 **같은 한 문장**으로 낸다.
+/// 0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): 2.1.261+ 는 **폴더신뢰 창도** 선택지가 `[No, exit, Yes, I trust
+/// this folder]` 이고 기본 포커스가 `No, exit` 다(cancelFirst · focus=cancel · `src/first_run_gates.rs` 코퍼스
+/// 주석 "2.1.261 폴더신뢰는 0=No, exit" 와 같은 사실). 종전 문안은 면책 창만 경고해 첫기동 순서(… 폴더신뢰 → 면책
+/// …)대로 폴더신뢰 창에서 Return 을 누르면 노드가 rc 1 로 죽었다. 바꾸는 것은 문안뿐이다 — 코퍼스
+/// (`approval_patterns.trust-prompt`·`MEASURED_ON`·`default_index`)는 무접촉(설계 §3 U7 금지선).
+/// ★리뷰1 I-6(minor · 문안 병기 · 동작 변경 0): 위 방향키 처방은 **2.1.261+ 위치 기준**이다.
+/// 2.1.241~260 은 폴더신뢰 창의 선택지 순서가 반대라(`1. Yes, I trust this folder`가 포커스) 그
+/// 처방을 그대로 따르면 좌석이 죽는다 — 사람은 자기 Claude 버전을 모르는 경우가 많으므로 라벨
+/// 기준 문장을 **추가**한다(방향키 처방을 지우지 않는다 · 새 approval_patterns·판정 로직 0).
+const GATE_DEFAULT_FOCUS_WARNING: &str = "★폴더신뢰(2.1.261+)·면책(Bypass) 창 **둘 다** 기본 포커스가 `No, exit` 다 — 그대로 Return 하면 노드가 종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라. 버전을 모르면 라벨로 확인하라: `Yes, I trust this folder`/`Yes, I accept` 위에 커서를 두고 Return — `No, exit` 위에서는 Return 금지.";
+
 /// 보류 사유 + 처방(에러 본문). 머리표로 시작한다 — 호출부의 유일한 분류 근거다.
 ///
 /// 처방에 면책 창의 기본 포커스를 **반드시** 적는다: 그 한 줄이 없으면 사람이 pane 을 보고
@@ -2775,8 +2788,7 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
         )
     } else {
         format!(
-            "사람 조치: `cys read-screen --surface {}` 로 확인 → ★면책(Bypass) 창의 기본 \
-             포커스는 `No, exit` 다(그대로 Return 하면 노드가 종료된다 — 아래 1회 뒤 Return 또는 숫자 `2`).",
+            "사람 조치: `cys read-screen --surface {}` 로 확인 → {GATE_DEFAULT_FOCUS_WARNING}",
             surface_ref(sid)
         )
     };
@@ -12826,6 +12838,8 @@ fn gate_close_override_once() -> bool {
 /// 실측(2026-08-23 · macOS Claude Code 2.1.241 · 격리 프로필 PTY 캡처)으로 확정된 사실만 적는다:
 /// 관문 순서와 **면책 창의 기본 포커스가 `No, exit`** 라는 것. 이 두 줄이 없으면 사용자는
 /// pane 을 보고 Return 을 눌러 스스로 노드를 종료시킨다(rc 1) — 처방이 곧 킬 스텝이 된다.
+/// ★0.14.41 U7(WP-C1): 2.1.261+ 는 **폴더신뢰 창도** 기본 포커스가 `No, exit` 다 — 경고 문장은
+/// `GATE_DEFAULT_FOCUS_WARNING` 하나이고 주입 가드 처방(`gate_hold_message`)과 같은 말이다.
 fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str, tail: &str) {
     // ★(0.14.31 · H-1) 코퍼스 밖 모달 보류는 처방이 다르다 — 관문 순서 안내가 아니라 "화면의 선택지를
     //   사람이 고르라" 이고, 커서가 종료 선택지 위일 수 있음을 먼저 경고한다(Return 이 곧 종료).
@@ -12842,8 +12856,7 @@ fn print_gate_pending_prescription(sid: u64, role: &str, agent: &str, gate: &str
          사람이 1회 조치하면 이 좌석을 그대로 쓴다:\n\
          \x20 1) `cys read-screen --surface {}` 로 화면을 확인하라 — 첫기동 관문 순서는 \
          테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내다.\n\
-         \x20 2) ★면책(Bypass) 창의 기본 포커스는 `No, exit` 다 — 그대로 Return 하면 노드가 \
-         종료된다. 아래 방향키 1회 뒤 Return(또는 숫자 `2`)으로 통과하라.\n\
+         \x20 2) {GATE_DEFAULT_FOCUS_WARNING}\n\
          \x20 3) 통과한 뒤 `cys boot` 을 다시 실행하면 이 좌석이 그대로 쓰인다 — 재부트가 \
          **스폰 없이**(read_text 1회 + 판정 1회) 관문 통과를 확인하고 이 좌석에 절대지침을 \
          주입한다(M2 재관측 경로). **새 pane 을 만들지 마라**(역할은 이미 이 좌석이 쥐고 있어 \
@@ -17564,6 +17577,13 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
     out
 }
 
+/// ★0.14.41 U13(WP-C1): 착수 게이트 대상 좌석 = master·cso* 가 **아닌** 역할(worker* · reviewer* · planner ·
+/// 비표준 역할 — compose_directive 의 WORKER_DIRECTIVE 폴백과 같은 범위). 셸 짝 = `hooks/_lib.sh:cys_start_gate_is_lead`
+/// (`master|cso*` — session-start.sh `cso*)` 와 같은 접두 규칙). lead(master·cso*)의 문안은 바이트 동일로 둔다.
+fn start_gate_member_role(role: &str) -> bool {
+    role != "master" && !role.starts_with("cso")
+}
+
 /// ★A′ — [CYCLE] 저장 지시문 생성(순수): 지시문이 안내하는 경로 = 게이트가 감시하는 경로.
 ///
 /// 종전 고정 산문("~/.cys/pack/round/<역할>_TODO.md" 틸드 하드코딩 + "_round/ 또는 pack
@@ -17579,10 +17599,17 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
 /// ② CYCLE-SAVED 마커 문장(plain 한 줄)은 종전 계약 그대로 보존한다.
 ///
 /// [codex R1 수용 2026-08-20] 역할 인지형 개정 — "네 역할 소관"의 해석을 LLM 에 맡기지 않고 role 인자로 소관을 문구에 결정론 명시한다(비master 노드의 공유 SESSION_STATE 오재기록 차단).
+///
+/// ★0.14.41 U13(WP-C1 · 설계 §3 U13 · 반박 M3/D2): 팀원(`start_gate_member_role`)의 '다음 액션' 에는 **배정
+/// 출처**(보낸 역할·시각·티켓 경로)를 함께 적게 한다 — 출처가 없으면 다음 세션에서 배정된 일과 스스로 고른 일을
+/// 구별할 수 없다(착수 게이트의 '지시' 는 출처로 정의된다). 바이너리 문안이라 지침 파일(사용자 소유 · seed-once)과
+/// 달리 기존 설치에도 즉시 닿는다. master·cso* 는 **바이트 동일**(CSO 는 착수 게이트 대상 밖).
 fn cycle_save_directive(role: &str, files: &[String]) -> String {
     let scope = if role == "master" {
         // master 소관 = 자기 TODO + SESSION_STATE (종전 취지 유지).
         "이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장)."
+    } else if start_gate_member_role(role) {
+        "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 다음 액션에는 그 일을 배정한 **배정 출처**(보낸 역할·시각·티켓 경로)를 함께 적어라 — 다음 세션은 출처가 기록된 배정만 이어간다(착수 게이트). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율)."
     } else {
         "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율)."
     };
@@ -17721,7 +17748,12 @@ fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
 /// RESUME 기본 문안(순수) — 파일 실재 기준으로 SESSION_STATE·역할 TODO 실경로를 채운다.
 /// 파이썬 resolve_save_files 는 디렉터리 실재 기준 · 여기는 설계 정정에 따라 파일별 실재 기준(의도적 차이).
 /// 우선순위: pack_round 파일 실재 → cwd_round 파일 실재 → pack_round(폴백 · 부재여도).
+/// ★0.14.41 U13(WP-C1 · 반박 M6/D9): 팀원(`start_gate_member_role`)은 **자기 TODO 만** 가리킨다 — 종전은 master 의
+/// SESSION_STATE(부서장 '다음 액션' 큐)까지 읽고 "직전 작업을 이어가라" 였다(팀원에게 master 큐를 넘기는 문안).
+/// master·cso* 는 종전 문안 바이트 동일. 자동 순환(javis_cycle_autopilot)은 lease 의 역할 소관 파일로 자기 문안을
+/// 만들므로 이 기본 문안을 쓰지 않는다(수동 `cys cycle-agent` 에 `--resume-text` 가 없을 때만 쓰인다).
 fn default_resume_text(
+    role: &str,
     cwd_round: &std::path::Path,
     pack_round: &std::path::Path,
     role_todo: &str,
@@ -17740,8 +17772,11 @@ fn default_resume_text(
         .to_string_lossy()
         .into_owned()
     };
-    let ss = resolve("SESSION_STATE.md");
     let todo = resolve(role_todo);
+    if start_gate_member_role(role) {
+        return format!("[RESUME] 컨텍스트 순환 완료. {todo} 를 읽고 직전 작업을 이어가라.");
+    }
+    let ss = resolve("SESSION_STATE.md");
     format!(
         "[RESUME] 컨텍스트 순환 완료. {} 를 읽고 직전 작업을 이어가라.",
         [ss, todo].join(" · ")
@@ -18231,7 +18266,7 @@ fn run_cycle_agent(
         )?;
         // 사용자 문안 또는 실경로 기본값을 clear 클로저 전에 한 번만 확정한다.
         let resume_text = resume_text.unwrap_or_else(|| {
-            default_resume_text(&cwd_round, &pack_round, &role_todo, &|p| p.exists())
+            default_resume_text(&role_name, &cwd_round, &pack_round, &role_todo, &|p| p.exists())
         });
         let directive_path = cys::pack::role_directive_path(&role_name)
             .unwrap_or_else(|| cys::pack::pack_dir().join("directives/WORKER_DIRECTIVE.md"));
@@ -27178,6 +27213,40 @@ mod tests {
         assert!(pb.contains("cys::readiness::MODAL_UNKNOWN_ID") && pb.contains("코퍼스 관문에만"));
     }
 
+    /// ★0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): 2.1.261+ 는 **폴더신뢰 창도** 기본 포커스가 `No, exit` 다
+    /// (선택지 `[No, exit, Yes, I trust this folder]` · `cancelFirst` · focus=cancel). 종전 처방은 면책 창만
+    /// 경고했고 관문 순서가 "… 폴더신뢰 → 면책 …" 이라, 사람이 안내대로 폴더신뢰 창에서 Return 을 누르면
+    /// 노드가 rc 1 로 죽었다(새 설치의 GUI 첫 마스터가 바로 이 창을 만난다). 두 처방 지점(주입 가드 Hold ·
+    /// 부트 GatePending)이 **둘 다** 경고하는지 잰다. 동작 변경 0 — 문안만(코퍼스·MEASURED_ON·default_index 무접촉).
+    #[test]
+    fn u7_gate_prescriptions_warn_folder_trust_and_disclaimer_both_default_no_exit() {
+        // ★리뷰1 I-6(minor · 문안 병기): 방향키 처방(2.1.261+ 전용) 옆에 라벨 기준 문장도 있어야
+        //   한다 — 사람은 자기 Claude 버전을 모르는 경우가 흔하다(동작 변경 0 · 병기만).
+        let toks = ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return",
+                   "Yes, I trust this folder", "Yes, I accept"];
+        let hit = cys::inject_guard::GateHit {
+            id: "folder-trust".to_string(),
+            title: "폴더 신뢰".to_string(),
+            human_only: false,
+        };
+        let msg = gate_hold_message(7, &hit, "디렉티브 주입");
+        for t in toks {
+            assert!(msg.contains(t), "주입 가드 처방에 {t:?} 가 없다: {msg}");
+        }
+        // 부트 처방은 stderr 함수라 소스로 잰다(같은 토큰 · 함수 본문 한정).
+        let src = include_str!("cys.rs");
+        let p = src.find("fn print_gate_pending_prescription(").expect("부트 처방");
+        let end = src[p..].find("fn boot_agent_on_surface(").expect("다음 함수 경계");
+        let pb = &src[p..p + end];
+        assert!(
+            pb.contains("GATE_DEFAULT_FOCUS_WARNING"),
+            "부트 처방이 공통 경고 상수를 싣지 않는다(두 처방 지점 문안 갈림)"
+        );
+        // 구 단독 경고(면책 창만) 문안이 두 처방 어디에도 남지 않는다.
+        let old = ["★면책(Bypass) 창의 기본 ", "포커스는 `No, exit` 다"].concat();
+        assert!(!msg.contains(&old) && !pb.contains(&old), "면책 창 단독 경고 문안이 남았다");
+    }
+
     /// ★(리뷰 R1) 재주입 생애 창의 괘선 자(`readiness::PROMPT_TRAILER_RULE_MIN_RUN`)는 맨 셸 술어의 프레임 자
     /// (`TUI_FRAME_RUN_MIN`)와 같은 값이다 — 한쪽만 바뀌면 "괘선" 의 뜻이 두 판정기에서 갈린다.
     #[test]
@@ -30063,6 +30132,76 @@ mod tests {
         assert!(cycle_save_directive("worker", &one).contains("/w/pack/round/WORKER_TODO.md"));
     }
 
+    /// ★0.14.41 U13(WP-C1 · 반박 M3/D2): 팀원(비-master·비-cso)의 [CYCLE] 저장 지시는 '다음 액션'에
+    /// **배정 출처**(보낸 역할·시각·티켓 경로)를 함께 적게 한다 — 출처가 없으면 다음 세션에서 배정된 일과
+    /// 스스로 고른 일을 구별할 수 없다(착수 게이트의 '지시' 정의가 출처 기반이다). master·cso 는
+    /// **바이트 동일**(CSO 는 착수 게이트 대상 밖 — 상시 임무·clear 집행 · master 는 §0-C 임무 게이트).
+    #[test]
+    fn u13_cycle_save_directive_member_records_assignment_source_lead_bytes_unchanged() {
+        let files = vec![
+            "/p/round/SESSION_STATE.md".to_string(),
+            "/p/round/WORKER_TODO.md".to_string(),
+        ];
+        for role in ["worker", "worker-2", "reviewer-codex", "reviewer-gemini", "planner"] {
+            let d = cycle_save_directive(role, &files);
+            assert!(d.contains("배정 출처"), "{role}: 배정 출처 기록 지시가 없다: {d}");
+            assert!(d.contains("보낸 역할·시각·티켓 경로"), "{role}: 출처 필드 3종이 없다: {d}");
+            // 종전 계약(소관 한정·쓰기 금지·마커)은 그대로다.
+            assert!(d.contains("자기 역할 TODO 파일만") && d.contains("쓰기 금지"), "{role}: {d}");
+            assert!(d.contains("plain 한 줄로 CYCLE-SAVED"), "{role}: 마커 계약 소실: {d}");
+            assert!(!d.contains('\n'), "{role}: [CYCLE] 지시문이 한 줄이 아니다");
+        }
+        let joined = files.join(" · ");
+        let legacy_member = "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율).";
+        let legacy_master = "이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장).";
+        let want = |scope: &str| {
+            format!(
+                "[CYCLE] 컨텍스트 순환 절차 개시. ① 아래는 저장 검증이 감시하는 파일 경로 목록이다 — {scope} 목록 밖 경로에 저장하면 검증에 인정되지 않는다: {joined} ② 저장 완료 후 다른 출력 없이 plain 한 줄로 CYCLE-SAVED 를 출력하라."
+            )
+        };
+        for role in ["cso", "cso-1"] {
+            assert_eq!(cycle_save_directive(role, &files), want(legacy_member), "{role} 바이트 변경");
+        }
+        assert_eq!(cycle_save_directive("master", &files), want(legacy_master), "master 바이트 변경");
+    }
+
+    /// ★0.14.41 U13(WP-C1 · 반박 M6/D9): 팀원 좌석의 기본 [RESUME] 은 **자기 TODO 만** 가리킨다 — 종전은
+    /// master 의 SESSION_STATE(부서장 '다음 액션' 큐)까지 읽고 "직전 작업을 이어가라" 였다(팀원에게 master 큐를
+    /// 넘기는 문안). master·cso 는 종전 그대로(SESSION_STATE · 자기 TODO).
+    #[test]
+    fn u13_default_resume_text_member_points_only_to_own_todo() {
+        let cwd = std::path::Path::new("/project/_round");
+        let pack = std::path::Path::new("/pack/round");
+        for (role, todo) in [
+            ("worker", "WORKER_TODO.md"),
+            ("worker-2", "WORKER_2_TODO.md"),
+            ("reviewer-codex", "REVIEWER_CODEX_TODO.md"),
+            ("planner", "PLANNER_TODO.md"),
+        ] {
+            let text = default_resume_text(role, cwd, pack, todo, &|_| true);
+            assert!(text.starts_with("[RESUME]"), "{role}: {text}");
+            assert!(text.contains(&format!("/pack/round/{todo}")), "{role}: 자기 TODO 가 빠졌다: {text}");
+            assert!(!text.contains("SESSION_STATE"), "{role}: 팀원 [RESUME] 이 master SESSION_STATE 를 가리킨다: {text}");
+            assert!(!text.contains('\n'), "{role}: [RESUME] 이 한 줄이 아니다");
+        }
+        // lead(master·cso*) 는 종전 문안 그대로(SESSION_STATE · 자기 TODO) — 바이트 동일.
+        for (role, todo) in [("master", "MASTER_TODO.md"), ("cso", "CSO_TODO.md"), ("cso-1", "CSO_1_TODO.md")] {
+            let text = default_resume_text(role, cwd, pack, todo, &|_| true);
+            assert_eq!(
+                text,
+                format!("[RESUME] 컨텍스트 순환 완료. /pack/round/SESSION_STATE.md · /pack/round/{todo} 를 읽고 직전 작업을 이어가라."),
+                "{role} 바이트 변경"
+            );
+        }
+        // 술어 짝 — 셸 `cys_start_gate_is_lead`(master|cso*)와 같은 경계.
+        for r in ["master", "cso", "cso-1", "cso-dept-3"] {
+            assert!(!start_gate_member_role(r), "{r} 가 착수 게이트 대상으로 잡혔다");
+        }
+        for r in ["worker", "worker-2", "reviewer-gemini", "reviewer-claude-1", "planner", "role-fresh-1"] {
+            assert!(start_gate_member_role(r), "{r} 가 착수 게이트 대상에서 빠졌다");
+        }
+    }
+
     // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
 
     /// ★E3 회귀 핀: `--force-no-verify` 는 死플래그가 아니다.
@@ -32017,13 +32156,14 @@ mod tests {
     fn d10_resume_text_uses_pack_round_when_present() {
         let cwd = std::path::Path::new("/project/_round");
         let pack = std::path::Path::new("/pack/round");
+        // ★0.14.41 U13: SESSION_STATE 경로 해소 축은 그것을 싣는 역할(master)로 잰다 — 팀원은 자기 TODO 만(아래 u13 검체).
         let session = pack.join("SESSION_STATE.md");
-        let todo = pack.join("WORKER_TODO.md");
-        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| {
+        let todo = pack.join("MASTER_TODO.md");
+        let text = default_resume_text("master", cwd, pack, "MASTER_TODO.md", &|p| {
             p == session || p == todo
         });
         assert!(text.contains(session.to_str().unwrap()), "팩 SESSION_STATE 실경로 누락: {text}");
-        assert!(text.contains(todo.to_str().unwrap()), "팩 WORKER_TODO 실경로 누락: {text}");
+        assert!(text.contains(todo.to_str().unwrap()), "팩 MASTER_TODO 실경로 누락: {text}");
         assert!(!text.contains("_round/SESSION_STATE.md와"));
         assert!(!text.contains("(nonce="));
         assert!(text.starts_with("[RESUME]"));
@@ -32034,9 +32174,9 @@ mod tests {
         let cwd = std::path::Path::new("/project/_round");
         let pack = std::path::Path::new("/pack/round");
         let session = cwd.join("SESSION_STATE.md");
-        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| p == session);
+        let text = default_resume_text("master", cwd, pack, "MASTER_TODO.md", &|p| p == session);
         assert!(text.contains(session.to_str().unwrap()), "프로젝트 SESSION_STATE 실경로 누락: {text}");
-        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+        assert!(text.contains(pack.join("MASTER_TODO.md").to_str().unwrap()));
         assert!(!text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()));
     }
 
@@ -32044,15 +32184,16 @@ mod tests {
     fn d10_resume_text_falls_back_to_pack_round_when_nothing_exists() {
         let pack = std::path::Path::new("/pack/round");
         let text = default_resume_text(
-            std::path::Path::new("/project/_round"), pack, "WORKER_TODO.md", &|_| false,
+            "master", std::path::Path::new("/project/_round"), pack, "MASTER_TODO.md", &|_| false,
         );
         assert!(text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()), "팩 SESSION_STATE 폴백 누락: {text}");
-        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+        assert!(text.contains(pack.join("MASTER_TODO.md").to_str().unwrap()));
     }
 
     #[test]
     fn d10_resume_text_master_todo_name() {
         let text = default_resume_text(
+            "master",
             std::path::Path::new("/project/_round"),
             std::path::Path::new("/pack/round"),
             "MASTER_TODO.md",
