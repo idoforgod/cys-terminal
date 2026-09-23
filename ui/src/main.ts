@@ -111,6 +111,7 @@ import {
 import {
   permWarningToast,
   cwdBlockedNotices,
+  collectCwdBlocked,
   loginItemsGuide,
   isMacFolderPermissionError,
   FT_BLOCKED_TEXT,
@@ -2120,9 +2121,7 @@ async function refreshPaneTitles() {
             cwd_blocked?: unknown;
           }[];
         };
-        for (const s of r.surfaces) {
-          if (!s.exited && s.cwd_blocked) blockedTick.push({ scope: sk ?? "", role: s.role, cwd_blocked: s.cwd_blocked });
-        }
+        blockedTick.push(...collectCwdBlocked(r.surfaces, sk ?? ""));
         // ★유령 pane 수렴 — 판정은 wsreconcile.advanceGhostStrikes(순수·유닛 테스트가 고정),
         // 여기는 배선이다. 데몬이 **기록 자체를 모르는** sid 만, **2연속 관측**일 때만 친다.
         // 빈 목록(데몬이 성공적으로 0개를 돌려줌)이면 그 함수가 집행을 보류한다 — cysd 는 소켓
@@ -7662,9 +7661,16 @@ async function start() {
   //   먼저 끝나 emit 이 유실됐다(emit-before-listen · 반박 §1-2) — 그래서 listen 직후 한 번 당긴다.
   //   ★당김은 **await 하지 않는다**: 이 아래로 리스너 등록이 줄줄이 이어진다. 여기서 멈추거나 던지면
   //   그 뒤 화면 기능이 끊긴다(④). 같은 폴더 = 같은 토스트 id 라 emit·pull 이 겹쳐도 한 장이다.
+  // ★(리뷰1 m7) emit(백엔드 push)과 pull(perm_warnings 당김)이 같은 경고를 둘 다 전할 수 있다
+  //   (listen 이 emit 보다 먼저 붙은 기동). 같은 id 는 토스트 한 장이지만 stickyToast 는 호출마다
+  //   recordAlarm 을 부르므로 그대로 두면 알람 탭에 같은 경고가 2건 쌓인다 — 이번 기동에 이미
+  //   보인 폴더는 다시 recordAlarm/stickyToast 하지 않는다(폴더가 다시 막히는 다음 기동에는 재알림).
+  const permWarningShown = new Set<string>();
   const showPermWarning = (payload: unknown): void => {
     const t = permWarningToast(((payload ?? {}) as { folder?: unknown }).folder);
-    if (t) stickyToast(t.id, "health", t.title, t.detail, () => openPrivacySettings(t.target));
+    if (!t || permWarningShown.has(t.id)) return;
+    permWarningShown.add(t.id);
+    stickyToast(t.id, "health", t.title, t.detail, () => openPrivacySettings(t.target));
   };
   await listen("perm-warning", (e) => showPermWarning(e.payload));
   void invoke("perm_warnings")

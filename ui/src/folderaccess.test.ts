@@ -16,6 +16,7 @@ import {
   folderLabel,
   permWarningToast,
   cwdBlockedNotices,
+  collectCwdBlocked,
   loginItemsGuide,
   isMacFolderPermissionError,
 } from "./folderaccess";
@@ -155,6 +156,34 @@ describe("cwdBlockedNotices — 좌석 작업 폴더 막힘(U18) 폴더별 1장 
   });
 });
 
+// 리뷰1 M1: 3초 루프의 **수집 단계**를 main.ts 밖으로 뽑아 여기서 직접 잰다. 이전엔 이 수집이
+// main.ts 의 for 문에 박혀 있어, 통째로 지워도(UI-1) 어떤 스위트도 잡지 못했다.
+describe("collectCwdBlocked — 3초 루프 수집(순수) — exited/미막힘 제외 · scope 전달", () => {
+  const blocked = { path: "/Users/user/Desktop/proj", folder: "Desktop" };
+  it("살아 있고 막힌 좌석만 모은다", () => {
+    const out = collectCwdBlocked(
+      [
+        { role: "worker-2", exited: false, cwd_blocked: blocked },
+        { role: "cso", exited: false, cwd_blocked: null },
+        { role: "master", exited: false },
+      ],
+      "hq",
+    );
+    expect(out).toEqual([{ scope: "hq", role: "worker-2", cwd_blocked: blocked }]);
+  });
+  it("exited 좌석은 막혔어도 건너뛴다", () => {
+    const out = collectCwdBlocked([{ role: "worker-2", exited: true, cwd_blocked: blocked }], "hq");
+    expect(out).toEqual([]);
+  });
+  it("scope 를 호출자 값 그대로 붙인다(부서 소켓 구분)", () => {
+    const out = collectCwdBlocked([{ role: "worker-2", exited: false, cwd_blocked: blocked }], "dept-1");
+    expect(out[0].scope).toBe("dept-1");
+  });
+  it("빈 목록은 빈 목록(throw 0)", () => {
+    expect(collectCwdBlocked([], "hq")).toEqual([]);
+  });
+});
+
 describe("loginItemsGuide — 로그인 항목 목록에 실제로 보이는 두 줄", () => {
   it("「cys」와 개발자 이름 줄을 모두 말한다", () => {
     const g = loginItemsGuide();
@@ -168,6 +197,15 @@ describe("loginItemsGuide — 로그인 항목 목록에 실제로 보이는 두
     const g = loginItemsGuide(false);
     expect(g).not.toContain("누르면");
     expect(g).toContain(`「${PRIVACY_APP_NAME}」`);
+  });
+  it("클릭이 붙지 않는 곳(비-macOS)은 macOS 로그인 항목·서명자 이름을 아예 말하지 않는다(리뷰1 m6)", () => {
+    // 예전엔 '누르면' 문장만 뺐지 "시스템 설정→로그인 항목→백그라운드에서 허용"·서명자 이름은
+    // 그대로 남아 윈도우 사용자에게 macOS 전용 처방을 내렸다.
+    const g = loginItemsGuide(false);
+    expect(g).not.toContain(SIGNER_DISPLAY_NAME);
+    expect(g).not.toContain("백그라운드에서 허용");
+    expect(g).not.toContain("로그인 항목");
+    expect(g).not.toContain("시스템 설정");
   });
   it("Rust 데몬 실패 문구도 같은 두 이름을 쓴다(교차 파리티 · 측정 불능은 실패)", () => {
     const rs = readFileSync(new URL("../../src-tauri/src/main.rs", import.meta.url), "utf-8");

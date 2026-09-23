@@ -77,6 +77,29 @@ export interface CwdBlockedEntry {
   cwd_blocked: unknown;
 }
 
+/** `list_surfaces` 응답 1건 중 이 모듈이 쓰는 필드만(구조는 main.ts 가 넓게 갖는다 — 여긴 부분집합). */
+export interface SurfaceLike {
+  role: string | null | undefined;
+  exited: boolean;
+  cwd_blocked?: unknown;
+}
+
+/**
+ * 3초 목록 루프의 **수집 단계**(순수) — `surfaces` 에서 살아 있고 막힌 좌석만 골라 `CwdBlockedEntry` 로 만든다.
+ * 리뷰1 M1: 이전엔 이 수집이 main.ts 안 for 문에 직접 박혀 있어, 수집 자체를 지워도(또는 조건을 뒤집어도)
+ * 잰 곳이 없었다(UI-1 뮤테이션 — bun test 1024/1024 무변화). 여기로 뽑아 folderaccess.test.ts 가 직접 잰다.
+ *   · `exited` 좌석은 건너뛴다(종료된 자리에 알림을 띄우지 않는다).
+ *   · `cwd_blocked` 가 없거나 falsy(null 포함)면 건너뛴다.
+ *   · `scope` 는 호출자(그 틱의 소켓 키)를 그대로 붙인다.
+ */
+export function collectCwdBlocked(surfaces: readonly SurfaceLike[], scope: string): CwdBlockedEntry[] {
+  const out: CwdBlockedEntry[] = [];
+  for (const s of surfaces) {
+    if (!s.exited && s.cwd_blocked) out.push({ scope, role: s.role, cwd_blocked: s.cwd_blocked });
+  }
+  return out;
+}
+
 interface BlockedFact {
   path: string;
   folder: string | null;
@@ -154,18 +177,23 @@ export function cwdBlockedNotices(
 
 /**
  * 데몬 대기 안내(로그인 항목) — 목록에 실제로 보이는 두 줄을 말한다.
- * `clickable` = 이 알림에 '설정 열기' 클릭이 붙었는가(macOS 만). 붙지 않았으면 그 문장을 말하지 않는다
- * (이 안내는 모든 OS 에서 뜨는 경로라, 클릭이 없는 곳에서 "누르면 열린다"고 말하면 거짓이 된다).
+ * `clickable` = 이 알림에 '설정 열기' 클릭이 붙었는가(macOS 만 — 호출부는 `loginItemsGuide(IS_MACOS)`).
+ * 붙지 않은 곳(윈도우 등)은 macOS 「시스템 설정 → 로그인 항목 → 백그라운드에서 허용」·서명자 이름
+ * 줄을 통째로 말하지 않는다 — 그 화면·그 이름은 그 OS 에 없다(리뷰1 m6: 예전엔 클릭 문장만 뺐고
+ * macOS 전용 설정 경로·서명자 이름은 모든 OS 에 그대로 남아 윈도우 사용자에게 틀린 안내가 됐다).
  */
 export function loginItemsGuide(
   clickable: boolean = true,
   appName: string = PRIVACY_APP_NAME,
   signer: string = SIGNER_DISPLAY_NAME,
 ): string {
+  if (!clickable) {
+    return `백그라운드 서비스(cysd) 시작을 기다리고 있습니다. 계속 이 상태면 「${appName}」 앱을 완전히 종료했다가 다시 여세요.`;
+  }
   return (
     `백그라운드 서비스(cysd) 시작을 기다리고 있습니다. 계속 이 상태면 시스템 설정 → 일반 → 로그인 항목의 ` +
     `「백그라운드에서 허용」에서 「${appName}」와 개발자 이름 줄(「${signer}」)을 모두 켜 주세요 — ` +
-    (clickable ? `이 알림을 누르면 그 화면이 열리고, ` : ``) +
+    `이 알림을 누르면 그 화면이 열리고, ` +
     `허용 즉시 자동으로 연결됩니다.`
   );
 }

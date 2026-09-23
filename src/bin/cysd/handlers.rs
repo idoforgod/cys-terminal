@@ -22902,6 +22902,9 @@ mod tests {
     //   (path = 요청 폴더) · 좌석 env `CYS_CWD_BLOCKED` = 그 폴더 ②스폰 동작 불변(셸은 요청
     //   폴더에서 뜨고 `cwd` 도 요청값) ③읽히는 폴더 → null · env 없음 ④역할 없는 일반 pane →
     //   null · env 없음(사람이 연 셸은 관측 대상이 아니다).
+    // 【리뷰1 m2】 이 데몬 프로세스 자신에게도 밖에서 `CYS_CWD_BLOCKED=/bogus/inherited` 를
+    //   물려준다(막힌 좌석 안에서 뜬 부서 데몬을 흉내) — ③④ 의 기존 `U18ENV=[]` 단언이
+    //   `create_surface_with_env` 의 `env_remove(ENV_CWD_BLOCKED)` 가드를 실제로 잰다.
     // 【측정 불능은 통과가 아니다】 sandbox-exec 부재·안쪽 검체 미실행(0 passed)은 실패다.
     #[cfg(target_os = "macos")]
     #[test]
@@ -22939,6 +22942,12 @@ mod tests {
             ])
             .env("CYS_U18_BLOCKED", &blocked)
             .env("CYS_U18_OPEN", &open)
+            // ★리뷰1 m2: 밖에서 물려주는 **가짜 상속 값** — 막힌 좌석 안에서 뜬 부서 데몬이라면
+            //   이 env 를 이미 물려받았을 수 있다. `create_surface_with_env` 의
+            //   `env_remove(ENV_CWD_BLOCKED)` 가드가 없으면 읽히는(open)·일반(plain) 좌석까지
+            //   이 거짓 값을 그대로 물려받아 "U18ENV=[/bogus/inherited]" 가 된다(거짓 고지).
+            //   가드가 있으면 아래 open/plain 의 기존 `U18ENV=[]` 단언이 그대로 지킨다.
+            .env(crate::cwd_probe::ENV_CWD_BLOCKED, "/bogus/inherited")
             .env_remove("CYS_CWD_PROBE")
             .env_remove(cys::ENV_BOOT_GATES)
             .output()

@@ -3618,10 +3618,15 @@ fn stash_perm_warning(v: &mut Vec<String>, folder: &str) {
 /// 프런트 pull — 이번 기동에 쌓인 폴더 접근 경고(비-macOS 는 항상 빈 목록).
 #[tauri::command]
 fn perm_warnings() -> Vec<Value> {
-    PERM_WARNINGS
-        .lock()
-        .map(|v| v.iter().map(|f| json!({"folder": f})).collect())
-        .unwrap_or_default()
+    PERM_WARNINGS.lock().map(|v| perm_warnings_from(&v)).unwrap_or_default()
+}
+
+/// `perm_warnings()` 의 pull 본체(순수) — 저장소 내용을 `[{folder}]` 모양으로 옮긴다.
+/// 리뷰1 m1: `perm_warnings()` 자체는 락 해제만 하고 이 함수에 위임한다 — U14 R5(유실 방지)의
+/// 핵심인 "저장된 경고가 실제로 나온다"를 여기서 직접 잰다(예전엔 `take(0)` 뮤테이션이
+/// cys-app 138/138·permwiring 9/9 를 모두 통과했다 — 무검체).
+fn perm_warnings_from(v: &[String]) -> Vec<Value> {
+    v.iter().map(|f| json!({"folder": f})).collect()
 }
 
 /// ★(0.14.41 · U14) 시스템 설정 화면 고정 URL 표(순수 · 모든 OS 컴파일). UI 는 target 이름만 넘기고
@@ -6830,10 +6835,15 @@ fn main() {
                 }
                 if let Err(e) = result {
                     // ★P1-3: 리셋 중이면 원인이 다르다 — 처방도 달라야 한다.
+                    // ★리뷰1 m6: 로그인 항목·개발자 이름 서명자 줄은 macOS 「시스템 설정」 용어다 —
+                    //   윈도우에는 그 화면도 그 이름도 없다. `cfg!(target_os="macos")` 로 문구만
+                    //   가른다(윈도우 거동은 무변경 — 재시도 루프·이벤트 이름 동일).
                     let msg = if cys::factory_reset::reset_in_progress() {
                         "완전 초기화가 진행 중입니다 — 끝난 뒤 앱을 종료했다가 다시 실행하세요.".to_string()
-                    } else {
+                    } else if cfg!(target_os = "macos") {
                         format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목의 「백그라운드에서 허용」에서 「cys」와 개발자 이름 줄(「yoonsik choi」)을 모두 켠 뒤 앱을 다시 여세요.")
+                    } else {
+                        format!("{e} — 데몬을 시작하지 못했습니다. 앱을 다시 여세요.")
                     };
                     let _ = handle.emit("daemon-error", msg);
                     return;
@@ -11855,6 +11865,18 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         stash_perm_warning(&mut v, "Documents");
         stash_perm_warning(&mut v, "Desktop");
         assert_eq!(v, vec!["Documents".to_string(), "Desktop".to_string()]);
+    }
+
+    /// `perm_warnings()` 의 pull 본체(리뷰1 m1) — `[{folder}]` 모양을 잰다. 저장소 내용을
+    /// 무시하고 빈 목록을 돌려주는 `take(0)` 류 뮤테이션이 여기서 즉시 FAIL 한다.
+    #[test]
+    fn perm_warnings_from_returns_folder_shape() {
+        let v = vec!["Desktop".to_string(), "Documents".to_string()];
+        assert_eq!(
+            perm_warnings_from(&v),
+            vec![json!({"folder": "Desktop"}), json!({"folder": "Documents"})]
+        );
+        assert_eq!(perm_warnings_from(&[]), Vec::<Value>::new());
     }
 
 }

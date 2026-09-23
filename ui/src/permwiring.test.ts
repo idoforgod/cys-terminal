@@ -76,12 +76,33 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
     const st = body(mainCode, "function stickyToast(", /\nfunction /);
     expect(/onClick\?\s*:/.test(st)).toBe(true);
     expect(st).toContain(".onclick =");
-    expect(st).not.toContain('addEventListener("click"');
+    // ★리뷰1 m4: 옛 핀은 큰따옴표만 봤다(`'addEventListener("click"'`) — 작은따옴표·백틱으로
+    //   우회하면 통과했다(UI-3). 인용부호 3종을 모두 죄는 정규식으로 바꾼다.
+    expect(/addEventListener\(\s*["'`]click/.test(st)).toBe(false);
   });
-  it("좌석 막힘(U18)은 3초 목록 루프가 cwd_blocked 를 모아 cwdBlockedNotices 로 넘긴다", () => {
+  it("좌석 막힘(U18)은 3초 목록 루프가 collectCwdBlocked 로 실제 수집해 cwdBlockedNotices 로 넘긴다", () => {
+    // ★리뷰1 M1: 옛 핀은 loop 본문에 문자열 "cwd_blocked" 가 있는가만 봤다 — 응답 타입 주석
+    //   `cwd_blocked?: unknown;` 이 이미 그 문자열을 만족시켜서, 실제 수집(blockedTick.push(...))을
+    //   지우거나 뒤집어도(UI-1 뮤테이션) bun test 1024/1024 가 그대로 통과했다. 이제는 수집이
+    //   collectCwdBlocked(folderaccess.ts SOT)를 실제로 호출해 blockedTick 에 펼치는지,
+    //   그 blockedTick 이 실제로 cwdBlockedNotices 에 넘어가는지를 정규식으로 죈다.
     const loop = body(mainCode, "async function refreshPaneTitles(", /\nsetInterval\(refreshPaneTitles/);
-    expect(loop).toContain("cwd_blocked");
-    expect(loop).toContain("cwdBlockedNotices(");
+    expect(/blockedTick\.push\(\s*\.\.\.collectCwdBlocked\(\s*r\.surfaces\s*,/.test(loop)).toBe(true);
+    expect(/cwdBlockedNotices\(\s*cwdBlockedSeen\s*,\s*blockedTick\s*\)/.test(mainCode)).toBe(true);
+  });
+  it("수집은 collectCwdBlocked 하나가 SOT — main.ts 가 옛 인라인 for 문을 되살리지 않는다", () => {
+    // 옛 구현: `for (const s of r.surfaces) { if (!s.exited && s.cwd_blocked) blockedTick.push({...}) }`.
+    // 이 패턴이 다시 나타나면 수집 로직이 두 곳(main.ts·folderaccess.ts)에 흩어진 것이므로 잡는다.
+    expect(/blockedTick\.push\(\{[^}]*cwd_blocked:\s*s\.cwd_blocked/.test(mainCode)).toBe(false);
+  });
+  it("파일 트리 막힘 행(m3)은 macOS EPERM 만 걸러 FT_BLOCKED_TEXT 를 보이고 설정(files)을 연다", () => {
+    // ★리뷰1 m3: "문자열이 있는가"만 보는 핀은 `if (false && IS_MACOS && …)` 로 분기를 죽여도
+    //   (UI-2 뮤테이션) 그대로 통과했다(bun test 1024/1024) — 문구가 죽은 코드에도 남기 때문이다.
+    //   그래서 `if (` 바로 뒤에 그 조건이 **그대로** 오는지(앞에 아무것도 안 끼는지)를 잰다.
+    const fn = body(mainCode, "async function buildDirNodes(", /\n(async )?function /);
+    expect(fn).toContain("if (IS_MACOS && isMacFolderPermissionError(e)) {");
+    expect(fn).toContain("FT_BLOCKED_TEXT");
+    expect(fn).toContain('openPrivacySettings("files")');
   });
   it("설정 열기는 한 곳(타입이 고정 목록인 헬퍼)에서만 invoke 하고, 호출부는 고정 target 만 넘긴다", () => {
     const calls = mainCode.match(/invoke\("open_privacy_settings"/g) ?? [];
