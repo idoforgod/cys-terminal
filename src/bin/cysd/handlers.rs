@@ -4197,6 +4197,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // "관문에 안 갇혔음" 이 아니다 — 소비자는 null 에서 이 항을 통째로 생략한다.
                         // 이 단위에는 writer 가 없어 실제 값은 항상 null 이다(생산은 U-11/U-13).
                         (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
+                        // ★(0.14.41 · U18) 작업 폴더 읽기 막힘 — org.status 와 **같은 키·같은 의미**
+                        // (동형성 핀). object = 생성 시 EPERM 관측 · null = 막힘 아님 또는 관측 안 함.
+                        // GUI 3초 루프가 당겨 폴더별 고정 토스트를 띄운다(이벤트 없음 · pull 전용).
+                        "cwd_blocked": s.cwd_blocked.as_ref().map(|b| b.to_wire()),
                         // ★(W2 · B4) 단조 라인 커서 — launch-agent 가 기동 send **직전** 스냅샷을 떠
                         // readiness/실패/주입검증 매칭을 '커서 이후 신규 출현분'으로 한정한다(잔존 ❯
                         // 오탐 차단). org.status 가 이미 같은 키를 노출하며, 여기 추가는 순수 additive.
@@ -7307,6 +7311,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // 팩 부트 체인(javis_boot_node.cys_status → `cys status --json`)이 소비하는
                         // 정본 status 채널이라, 이 키가 여기 빠지면 python 미러가 축을 영영 못 본다.
                         (cys::GATE_PENDING_KEY): s.gate_pending_wire(),
+                        // ★(0.14.41 · U18) 작업 폴더 읽기 막힘 — surface.list 와 **같은 키·같은 의미**(동형성 핀).
+                        "cwd_blocked": s.cwd_blocked.as_ref().map(|b| b.to_wire()),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),
@@ -18140,6 +18146,15 @@ mod tests {
                 assert_eq!(
                     bare_e[axis_key], want_bare,
                     "{method}: 관측 축 {axis_key} 의 대조군 값이 다르다(동형성 붕괴): {bare_e}"
+                );
+            }
+            // ★(0.14.41 · U18) `cwd_blocked` 는 생성 시 1회 관측이라 여기서 값을 심을 수 없다 —
+            //   **키의 존재**를 양쪽에서 잰다(값 동형성은 맥 실측 검체
+            //   `u18_cwd_blocked_observed_under_sandbox_read_deny` 가 두 메서드 모두에서 잰다).
+            for (sid_e, tag) in [(surface_entry(&resp, key, live), "live"), (bare_e, "bare")] {
+                assert!(
+                    sid_e.as_object().map(|o| o.contains_key("cwd_blocked")).unwrap_or(false),
+                    "{method}: {tag} 항목에 cwd_blocked 키가 없다(동형성 붕괴): {sid_e}"
                 );
             }
         }

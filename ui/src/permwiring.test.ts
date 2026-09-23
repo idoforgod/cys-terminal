@@ -46,8 +46,8 @@ describe("백엔드(Rust) — 쌓고 나서 쏜다 · 설정 열기는 고정 �
     const i = rustCode.indexOf("generate_handler![");
     expect(i).toBeGreaterThan(0);
     const reg = rustCode.slice(i, rustCode.indexOf("]", i));
-    expect(reg).toMatch(/\bperm_warnings\b/);
-    expect(reg).toMatch(/\bopen_privacy_settings\b/);
+    expect(/\bperm_warnings\b/.test(reg)).toBe(true);
+    expect(/\bopen_privacy_settings\b/.test(reg)).toBe(true);
   });
   it("open_privacy_settings 는 /usr/bin/open 절대경로 + 고정 URL 표만 쓴다(임의 URL 0)", () => {
     const f = body(rustCode, "fn open_privacy_settings(", /\n(#\[|fn |\/\/\/)/);
@@ -64,8 +64,8 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
     expect(li).toBeGreaterThan(0);
     const pull = mainCode.indexOf('invoke("perm_warnings")', li);
     expect(pull).toBeGreaterThan(li);
-    expect(mainCode).not.toMatch(/await\s+invoke\("perm_warnings"\)/);
-    expect(mainCode).toMatch(/void\s+invoke\("perm_warnings"\)/);
+    expect(/await\s+invoke\("perm_warnings"\)/.test(mainCode)).toBe(false);
+    expect(/void\s+invoke\("perm_warnings"\)/.test(mainCode)).toBe(true);
   });
   it("perm-warning 렌더는 문구 SOT(folderaccess)를 쓴다 — 하드코딩 문구 0", () => {
     expect(mainCode).toContain("permWarningToast(");
@@ -74,7 +74,7 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
   });
   it("stickyToast 는 onClick 을 받아 **대입**으로 건다(addEventListener 누적 금지)", () => {
     const st = body(mainCode, "function stickyToast(", /\nfunction /);
-    expect(st).toMatch(/onClick\?\s*:/);
+    expect(/onClick\?\s*:/.test(st)).toBe(true);
     expect(st).toContain(".onclick =");
     expect(st).not.toContain('addEventListener("click"');
   });
@@ -83,9 +83,15 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
     expect(loop).toContain("cwd_blocked");
     expect(loop).toContain("cwdBlockedNotices(");
   });
-  it("설정 열기는 고정 target 문자열만 넘긴다", () => {
-    const calls = mainCode.match(/invoke\("open_privacy_settings",\s*\{[^}]*\}\)/g) ?? [];
-    expect(calls.length).toBeGreaterThan(0);
-    for (const c of calls) expect(c).toMatch(/target:\s*(t\.target|n\.target|"files"|"login")/);
+  it("설정 열기는 한 곳(타입이 고정 목록인 헬퍼)에서만 invoke 하고, 호출부는 고정 target 만 넘긴다", () => {
+    const calls = mainCode.match(/invoke\("open_privacy_settings"/g) ?? [];
+    expect(calls.length).toBe(1);
+    const helper = body(mainCode, "function openPrivacySettings(", /\nfunction /);
+    expect(mainCode).toContain("function openPrivacySettings(target: PrivacyTarget)");
+    expect(helper).toContain('invoke("open_privacy_settings", { target })');
+    const uses = mainCode.match(/openPrivacySettings\(([^)]*)\)/g) ?? [];
+    const callers = uses.filter((u) => !u.includes("target: PrivacyTarget"));
+    expect(callers.length).toBeGreaterThan(0);
+    for (const c of callers) expect(/openPrivacySettings\((t\.target|n\.target|"files"|"login")\)/.test(c)).toBe(true);
   });
 });

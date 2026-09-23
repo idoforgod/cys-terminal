@@ -3591,6 +3591,74 @@ fn onboard_notices() -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// ★(0.14.41 · U14) macOS 폴더 접근 경고 저장소 — 온보딩 안내(ONBOARD_NOTICES)와 **같은 기제**를
+/// 같은 이유로 쓴다. 평소 재시작에서 백엔드 점검(`nudge_folder_permissions`)은 daemon-ready 직후
+/// 수 ms 안에 끝나고, 프런트는 await 사슬을 한참 지나서야 `perm-warning` 을 listen 한다 — 맨 emit 은
+/// 그 사이에 사라졌다(emit-before-listen · phase1 U14 반박 §1-2). 그래서 **먼저 쌓고 emit** 하고,
+/// 프런트는 listen 직후 `perm_warnings` 로 한 번 당긴다(같은 폴더 = 같은 토스트 id 라 둘 다 와도 한 장).
+/// 폴더당 1건(중복 제거) — 기동 1회 점검이라 커질 수 없다.
+/// ⚠ 기존 `onboard-notice` 경로에 태우지 않는다: 그 프런트 처리기는 capped/restored 두 kind 만
+/// 그리고 나머지를 버린다(반박 U18 R6 — 태우면 경고가 0건이 된다).
+static PERM_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn push_perm_warning(app: &AppHandle, folder: &str) {
+    if let Ok(mut v) = PERM_WARNINGS.lock() {
+        stash_perm_warning(&mut v, folder);
+    }
+    let _ = app.emit("perm-warning", json!({"folder": folder}));
+}
+
+/// 폴더당 1건 — 같은 폴더는 최신 1건으로 바꿔 넣는다(순수 · 테스트 핀).
+fn stash_perm_warning(v: &mut Vec<String>, folder: &str) {
+    v.retain(|f| f != folder);
+    v.push(folder.to_string());
+}
+
+/// 프런트 pull — 이번 기동에 쌓인 폴더 접근 경고(비-macOS 는 항상 빈 목록).
+#[tauri::command]
+fn perm_warnings() -> Vec<Value> {
+    PERM_WARNINGS
+        .lock()
+        .map(|v| v.iter().map(|f| json!({"folder": f})).collect())
+        .unwrap_or_default()
+}
+
+/// ★(0.14.41 · U14) 시스템 설정 화면 고정 URL 표(순수 · 모든 OS 컴파일). UI 는 target 이름만 넘기고
+/// URL 을 만들 수 없다 — 기존 `open_url` 화이트리스트(https 전용)와 별개의 닫힌 목록이다.
+/// 전체 디스크 접근 앵커는 넣지 않는다: 이 기계의 설정 확장에서 문자열이 확인되지 않았고(조사 §2-3),
+/// 자율 에이전트 앱에 권할 권한도 아니다(반박 D2 — 매뉴얼의 최후 수단으로만).
+fn privacy_settings_url(target: &str) -> Option<&'static str> {
+    match target {
+        "files" => Some("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"),
+        "login" => Some("x-apple.systempreferences:com.apple.LoginItems-Settings.extension"),
+        _ => None,
+    }
+}
+
+/// 시스템 설정의 해당 화면을 연다(macOS 전용 — 그 밖은 Err). `/usr/bin/open` 절대경로(PATH 무의존)
+/// · 클릭 1회 = 실행 1회 · 자식은 별도 스레드가 거둔다(좀비 0).
+#[tauri::command]
+fn open_privacy_settings(target: String) -> Result<(), String> {
+    let url = privacy_settings_url(&target).ok_or_else(|| format!("unknown target: {target}"))?;
+    #[cfg(target_os = "macos")]
+    let r: Result<(), String> = std::process::Command::new("/usr/bin/open")
+        .arg(url)
+        .spawn()
+        .map(|mut child| {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        })
+        .map_err(|e| e.to_string());
+    #[cfg(not(target_os = "macos"))]
+    let r: Result<(), String> = {
+        let _ = url;
+        Err("macOS 전용".to_string())
+    };
+    r
+}
+
 /// ★재설치 감지 마커 — "이 사용자 데이터를 마지막으로 본 **설치본**이 무엇인가". 앱 번들을 지웠다
 /// 다시 깔면 번들이 새로 생성돼 이 스탬프가 달라진다. `.gui-onboarded`(버전 질문)·`.last-app-version`
 /// (복원 필요 질문)과 **질문도 작성자도 다르다 — 통합 금지**(위 마커들의 분리 교리와 동일 계열).
@@ -3851,7 +3919,8 @@ fn nudge_folder_permissions(app: &AppHandle) {
             .await
             .unwrap_or(false);
             if denied {
-                let _ = app.emit("perm-warning", json!({"folder": folder}));
+                // ★(0.14.41 · U14) 쌓고 나서 쏜다(PERM_WARNINGS doc) — 맨 emit 은 평소 재시작에서 유실됐다.
+                push_perm_warning(&app, folder);
             }
         }
     });
@@ -6643,6 +6712,8 @@ fn main() {
             // ATOMIC-1 짝: 설치본이 '반쪽 번들'인지 기동 시 스스로 확인해 복구 절차를 준다.
             bundle_integrity,
             onboard_notices,
+            perm_warnings,
+            open_privacy_settings,
             // INST-1(P4-4): claude CLI 미설치 온보딩 카드 pull(agent-detect 단일 오라클 소비).
             claude_missing_hint,
         ])
@@ -6762,7 +6833,7 @@ fn main() {
                     let msg = if cys::factory_reset::reset_in_progress() {
                         "완전 초기화가 진행 중입니다 — 끝난 뒤 앱을 종료했다가 다시 실행하세요.".to_string()
                     } else {
-                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목에서 cys 백그라운드 항목을 허용한 뒤 앱을 다시 여세요.")
+                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목의 「백그라운드에서 허용」에서 「cys」와 개발자 이름 줄(「yoonsik choi」)을 모두 켠 뒤 앱을 다시 여세요.")
                     };
                     let _ = handle.emit("daemon-error", msg);
                     return;
@@ -11751,6 +11822,39 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             .filter(|l| l.starts_with("#[cfg(") && (l.contains("unix") || l.contains("target_os") || l.contains("windows")))
             .count();
         assert!(counted >= 10, "스캐너가 최상위 cfg 속성을 못 찾고 있다(counted={counted})");
+    }
+
+
+    /// ★(0.14.41 · U14) 설정 열기 URL 은 **닫힌 표**다 — 고정 target 2개만 URL 을 얻고, 그 밖(임의
+    /// 스킴·경로·주입 문자열·대소문자 변형·전체 디스크 접근)은 전부 None 이다.
+    #[test]
+    fn privacy_settings_url_is_a_closed_table() {
+        for t in ["files", "login"] {
+            let u = privacy_settings_url(t).unwrap_or_else(|| panic!("{t} 가 표에 없다"));
+            assert!(u.starts_with("x-apple.systempreferences:com.apple."), "{u}");
+            assert!(!u.contains(' ') && !u.contains(';') && !u.contains('&'), "{u}");
+        }
+        for bad in ["", "fda", "FILES", "https://x", "files;rm -rf /", "files ", "../files", "login\n"] {
+            assert_eq!(privacy_settings_url(bad), None, "{bad:?} 가 URL 을 얻었다");
+        }
+    }
+
+    /// 모르는 target 은 **스폰 전에** 거부된다(모든 OS) — 테스트는 유효 target 을 부르지 않는다
+    /// (맥에서 실제 설정 창이 열린다).
+    #[test]
+    fn open_privacy_settings_rejects_unknown_target_before_spawn() {
+        let e = open_privacy_settings("https://evil.example".into()).unwrap_err();
+        assert!(e.contains("unknown target"), "{e}");
+    }
+
+    /// 경고 저장소는 폴더당 1건이다(emit 과 pull 이 겹쳐도, 점검이 두 번 돌아도 한 장).
+    #[test]
+    fn perm_warning_stash_dedupes_per_folder() {
+        let mut v = Vec::new();
+        stash_perm_warning(&mut v, "Desktop");
+        stash_perm_warning(&mut v, "Documents");
+        stash_perm_warning(&mut v, "Desktop");
+        assert_eq!(v, vec!["Documents".to_string(), "Desktop".to_string()]);
     }
 
 }

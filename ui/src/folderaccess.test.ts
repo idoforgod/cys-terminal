@@ -92,11 +92,11 @@ describe("permWarningToast — GUI 자체 점검(앱 기동 시 데스크탑·�
 });
 
 describe("cwdBlockedNotices — 좌석 작업 폴더 막힘(U18) 폴더별 1장 · 재알림 억제", () => {
-  const desk = { path: "/Users/u/Desktop/proj", folder: "Desktop" };
+  const desk = { path: "/Users/user/Desktop/proj", folder: "Desktop" };
   it("같은 폴더의 좌석들은 한 장으로 묶이고 역할이 나열된다", () => {
     const r = cwdBlockedNotices(new Set(), [
       { scope: "hq", role: "worker-2", cwd_blocked: desk },
-      { scope: "hq", role: "worker-3", cwd_blocked: { path: "/Users/u/Desktop/other", folder: "Desktop" } },
+      { scope: "hq", role: "worker-3", cwd_blocked: { path: "/Users/user/Desktop/other", folder: "Desktop" } },
       { scope: "hq", role: "cso", cwd_blocked: null },
     ]);
     expect(r.notices.length).toBe(1);
@@ -162,6 +162,12 @@ describe("loginItemsGuide — 로그인 항목 목록에 실제로 보이는 두
     expect(g).toContain(SIGNER_DISPLAY_NAME);
     expect(g).toContain("백그라운드에서 허용");
     expect(g).not.toContain("관련 항목");
+    expect(g).toContain("누르면");
+  });
+  it("클릭이 붙지 않는 곳(비-macOS)에서는 '누르면 열린다'고 말하지 않는다", () => {
+    const g = loginItemsGuide(false);
+    expect(g).not.toContain("누르면");
+    expect(g).toContain(`「${PRIVACY_APP_NAME}」`);
   });
   it("Rust 데몬 실패 문구도 같은 두 이름을 쓴다(교차 파리티 · 측정 불능은 실패)", () => {
     const rs = readFileSync(new URL("../../src-tauri/src/main.rs", import.meta.url), "utf-8");

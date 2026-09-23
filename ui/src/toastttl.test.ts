@@ -8,6 +8,7 @@ import {
   VOLATILE_TTL_MS,
   STICKY_TTL_MS,
   PROGRESS_TTL_MS,
+  GUIDE_TTL_MS,
   ALARM_HISTORY_CAP,
   toastTtl,
   toastTimerPlan,
@@ -17,6 +18,7 @@ import {
   formatAlarmTime,
   type AlarmRecord,
 } from "./toastttl";
+import { PERM_TOAST_PREFIX } from "./folderaccess";
 
 describe("toastTtl — 종류 불문 유한 수명", () => {
   it("volatile은 구 하드코딩 8초를 승계(회귀 0)", () => {
@@ -30,7 +32,8 @@ describe("toastTtl — 종류 불문 유한 수명", () => {
     expect(STICKY_TTL_MS).toBe(60000);
     expect(toastTtl("sticky").ttlMs).toBe(60000);
     // 실제로 영구 잔존했던 id들이 모두 유한 수명을 받는다
-    for (const id of ["boot-warn", "safe-mode", "perm-Documents", "purge-fail-/tmp/x.sock"]) {
+    // (0.14.41 · U14) perm-* 는 아래 전용 테스트(10분)로 옮겼다 — 여전히 유한 수명이다.
+    for (const id of ["boot-warn", "safe-mode", "purge-fail-/tmp/x.sock"]) {
       expect(toastTtl("sticky", id).ttlMs).toBe(STICKY_TTL_MS);
     }
   });
@@ -46,6 +49,9 @@ describe("toastTtl — 종류 불문 유한 수명", () => {
     for (const id of ["perm-Desktop", "perm-Documents", "perm-seat-Desktop", "perm-seat-/Volumes/X"]) {
       expect(toastTtl("sticky", id).ttlMs).toBe(600_000);
     }
+    expect(GUIDE_TTL_MS).toBe(600_000);
+    // 접두는 문구 SOT(folderaccess.ts)의 토스트 id 접두와 같다.
+    expect(toastTtl("sticky", `${PERM_TOAST_PREFIX}Desktop`).ttlMs).toBe(GUIDE_TTL_MS);
     // 접두가 우연히 겹치는 다른 id 는 연장하지 않는다(정확히 "perm-" 접두만).
     expect(toastTtl("sticky", "permission").ttlMs).toBe(STICKY_TTL_MS);
     expect(toastTtl("volatile", "perm-Desktop").ttlMs).toBe(VOLATILE_TTL_MS);
