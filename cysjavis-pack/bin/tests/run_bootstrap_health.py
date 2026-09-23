@@ -11291,6 +11291,30 @@ def h_meta_off():
         #   그 사실을 그대로 적는다(오염원 검체가 바뀌면 다른 오염원으로 교체하라).
         notes.append("⚠오염원 검체 H-W5-N1 status=%s · stderr 오염 %d건 — stdout 순수 축은 "
                      "이번 실행에서 공허했다(오염원 교체 검토)" % (st, rj.stderr.count("verdict=")))
+
+    # ⓕ ★유령 ID(U4 C4-③ · 2026-09-23) — `--only` 로 **등재에 없는** ID 를 고르면 그 몫은 아무것도
+    #   재지 않았다. 종전 러너는 그 ID 를 조용히 버리고 나머지(또는 0건)로 GREEN·exit 0 을 냈다 —
+    #   `H-SECRET-1` 이 개명되면 발행 레인 4곳의 '스캐너가 살아 있는가' 메타 검사가 0건 실행·초록이
+    #   되는 형태다. 계약: 유령 ID 가 하나라도 있으면 **UNMEASURED·exit 2** + 이름 명시(unknown_ids).
+    #   ⓓ 와 같은 대조군(clean env)에서 잰다 — 판정 차이의 원인이 유령 ID 하나뿐이게.
+    ghost = "H-ZZ-GHOST-1"
+    need(ghost not in {sid for sid, _w, _t, _d, _f in _REG},
+         "전제 붕괴: 유령 표본 ID %s 가 실제로 등재돼 있다 — 표본 ID 를 바꿔라" % ghost)
+    rg, dg = _self(clean, "--only", "H-CI-TAG-1," + ghost)
+    sg = dg["summary"]
+    need(rg.returncode == 2 and sg["verdict"] == "UNMEASURED",
+         "유령 ID 섞인 선택이 %s·exit %d 다 — 선택했는데 존재하지 않는 검체를 조용히 버렸다"
+         "(재지 않은 것을 통과로 접는다 · UNMEASURED·exit 2 여야 한다)" % (sg["verdict"], rg.returncode))
+    need(sg.get("unknown_ids") == [ghost],
+         "요약이 유령 ID 를 이름으로 밝히지 않는다: unknown_ids=%r" % sg.get("unknown_ids"))
+    need(sg["pass"] >= 1,
+         "유령 ID 옆의 실재 검체(H-CI-TAG-1)까지 버렸다 — 진단 가치가 사라진다: %r"
+         % {k: sg[k] for k in ("pass", "fail", "skip", "disabled", "pending")})
+    ra, da = _self(clean, "--only", ghost)
+    need(ra.returncode == 2 and da["summary"]["verdict"] == "UNMEASURED" and da["summary"]["total"] == 0,
+         "전부 유령인 선택이 %s·exit %d·total %d 다 — 0건 실행이 초록으로 접힌다"
+         % (da["summary"]["verdict"], ra.returncode, da["summary"]["total"]))
+    notes.append("유령 ID: 혼합→UNMEASURED/exit2(실재분 실행) · 전부 유령→UNMEASURED/exit2(0건)")
     return " · ".join(notes)
 
 
@@ -12872,6 +12896,12 @@ def h_ci_cover_1():
          dict(files, **{"windows-health.yml":
                         files.get("windows-health.yml", "").replace(
                             'WIN_SPECIMENS="', 'WIN_SPECIMENS_X="')})),
+        # ★U4 C4-③(2026-09-23): `--only` 목록 안의 **유령 ID**(등재에 없음). 차집합(등재 − 실행)은
+        #   합집합만 보므로 이 변조를 원리적으로 못 본다 — 커버리지는 그대로이고 실행 0건이 늘 뿐이다.
+        ("windows 레인 목록에 유령 ID 주입",
+         dict(files, **{"windows-health.yml":
+                        files.get("windows-health.yml", "").replace(
+                            'WIN_SPECIMENS="', 'WIN_SPECIMENS="H-ZZ-GHOST-1,')})),
     ]
     blind = [b for b in (_blind(lbl, mut) for lbl, mut in mutants) if b]
     need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
