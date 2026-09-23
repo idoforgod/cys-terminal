@@ -617,15 +617,20 @@ t = t.replace(a, "  ui-check:\n    runs-on: macos-latest\n    if: false\n", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
   mut_expect 1 "UI 잡 소등(ci-branch ui-check 잡 수준 if: false)" "잡 수준 false"
+  # ★U4 C4 리뷰1 MAJOR-1 수정(2026-09-23): ⑤ 와 같은 모양으로 — **실행 줄 1개만** 지우고 count==1 로
+  #   앵커를 강제한다(스텝 이름은 손대지 않는다). 종전 replace-all 은 스텝 이름의 `tsc -p
+  #   tsconfig.check.json` 문면까지 함께 지워버려 "필수 명령이 사라졌다"는 더 흔한 회귀(실행 줄만 소거·
+  #   스텝 이름은 그대로)를 검체가 가렸다(review1-gate-mutA-tsc-runline-only.log: 실행 줄만 지우면
+  #   원본 게이트가 rc=0). 이 변이는 실행 줄만 지워 그 실측 회귀를 재현한다.
   mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
 import sys
 p = sys.argv[1]; t = open(p, encoding="utf-8").read()
-a = "tsc -p tsconfig.check.json"
-assert t.count(a) >= 1, "변이 앵커 부재(ci-branch 타입체크 실행 줄)"
-t = t.replace(a, "tsc --version")
+a = "          bunx -p typescript@7.0.2 tsc -p tsconfig.check.json\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch 타입체크 실행 줄)"
+t = t.replace(a, "          echo skipped-typecheck\n", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
-  mut_expect 1 "UI 타입체크 소거(ci-branch tsc -p tsconfig.check.json)" "tsc -p tsconfig.check.json"
+  mut_expect 1 "UI 타입체크 실행 줄만 소거(ci-branch tsc -p tsconfig.check.json · 스텝 이름은 유지)" "typescript@7.0.2 tsc -p tsconfig.check.json"
 
   echo
   echo "── 자기 검체 3: 5단계(우분투 사전 레인 동일성)의 변이 대조 ──────────────────"

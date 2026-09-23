@@ -163,6 +163,15 @@ jobs:
           #   등재한다. 전자는 태그 레인에서만 돌던 것을 브랜치 잡5(ui-check)에도 세운 **쌍**이라 두 레인
           #   모두에 핀한다(한쪽이 조용히 빠지면 그 레인의 초록이 거짓 신호) — pack-release 는 UI 를 빌드하지
           #   않으므로 등재 대상이 아니다. 음성 대조는 예행 도구 자기 검체 2 의 변이 ⑤~⑦.
+          # ★U4 C4 리뷰1 MAJOR-1 수정(2026-09-23): 타입체크 토큰을 `tsc -p tsconfig.check.json`(그대로)
+          #   대신 `typescript@7.0.2 tsc -p tsconfig.check.json`(실행 줄에만 있는 형태)로 둔다.
+          #   code_lines() 는 주석만 지우고 `- name:` 줄은 그대로 코드 줄로 세므로, 토큰이 아래 ui-check
+          #   스텝 이름(`UI 타입체크 (tsc -p tsconfig.check.json · typescript 7.0.2 고정 · 설치 후)`) 문면에도
+          #   들어 있으면 실행 줄을 지워도(스텝 이름은 그대로) 게이트가 "필수 명령이 있다"고 오판한다
+          #   (실측: rc=0 · review1-gate-mutA-tsc-runline-only.log). 새 토큰은 실행 줄
+          #   `bunx -p typescript@7.0.2 tsc -p tsconfig.check.json` 에만 있고 스텝 이름에는 없다
+          #   (이름은 `typescript 7.0.2`— `@` 없이 · 어순도 다르다). 예행 도구 변이 ⑦ 도 같은 라운드에서
+          #   실행 줄 1개만 지우는 모양으로 고쳤다(release 변이 ⑤ 와 같은 형태).
           MUST_RUN_TOKENS = {
               "ci-branch": {
                   "cargo test --bin cysd":
@@ -171,9 +180,12 @@ jobs:
                   "cd ui && bun test":
                       "UI 회귀(한글 IME 리듀서·드래그·마우스 필터 등 27파일)의 브랜치 조기 경보. 없으면 UI "
                       "회귀가 태그(불변 · 버전 소모) 뒤 build 레그에서야 드러난다.",
-                  "tsc -p tsconfig.check.json":
+                  "typescript@7.0.2 tsc -p tsconfig.check.json":
                       "UI 타입체크 — `bun build` 는 트랜스파일만 해 타입을 보지 않는다(ui/tsconfig.check.json "
-                      "_why). 이 줄이 빠지면 타입 오류는 어느 레인에서도 드러나지 않는다.",
+                      "_why). 이 줄이 빠지면 타입 오류는 어느 레인에서도 드러나지 않는다. 토큰이 "
+                      "`typescript@7.0.2 tsc -p tsconfig.check.json` 인 것은 실행 줄에만 있고 스텝 이름에는 "
+                      "없게 하기 위해서다(위 리뷰1 MAJOR-1 주석 참조) — 단순 `tsc -p tsconfig.check.json` "
+                      "이면 스텝 이름 문면만으로도 '있음' 판정이 나 실행 줄 소거를 놓친다.",
               },
               "release": {
                   "cd ui && bun test":
@@ -1488,8 +1500,11 @@ jobs:
   # ★별도 잡인 이유: 잡1 은 set -e 사슬이라 앞 스텝이 붉으면 UI 는 아예 재지 않게 된다(잡2 머리말 ⓐ).
   #   우분투가 아니라 macOS 인 이유: 태그 레인의 bun test 가 도는 러너(macos-latest)와 같게 — 그리고
   #   레인 예행 도구 5단계가 ci-branch 의 우분투 잡을 **정확히 1개**로 요구한다(2개면 판별 불가 exit 3).
-  # ★`if:` 없음 · `continue-on-error` 없음 — 레인 대조 게이트 MUST_RUN_TOKENS 가 두 실행 줄의 존재와
-  #   무조건 실행(잡 수준 조건 포함)을 핀한다.
+  # ★`if:` 없음 · `continue-on-error` 없음. 다만 두 안전장치의 계급은 다르다(U4 C4 리뷰1 NOTE 반영):
+  #   `if:`(스텝·잡 수준 조건)는 레인 대조 게이트 MUST_RUN_TOKENS 가 실행 줄의 존재와 함께 **핀한다**
+  #   (등재되지 않은 조건이 붙으면 게이트가 붉어진다). `continue-on-error` 는 그 핀의 사정거리 **밖**이다
+  #   (게이트는 텍스트만 읽고 실행 결과 흡수는 보지 않는다 — 반박 F3 잡 수준 전수 스캔은 설계 §2 제외 ·
+  #   보류). 이 줄이 없는 것은 사람이 지키는 불변식이지, 게이트가 강제하는 불변식이 아니다.
   ui-check:
     runs-on: macos-latest
     timeout-minutes: 15
