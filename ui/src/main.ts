@@ -284,6 +284,22 @@ const bareSeat =
   (x) =>
     x === sid ? null : undefined;
 
+// ★F3(0.14.41 · 리뷰1 minor): 사용자·전출이 **의도적으로** 닫는 sid — close_surface RPC 의 await 가
+// 끝나기 전에 데몬의 PTY reader(자식이 먼저 죽는 경로)가 surface.exited 를 먼저 밀어 넣을 수 있다.
+// 그 창에서 removeDeadPane 이 역할 칸을 구멍으로 보류하면, RPC 가 끝난 뒤의 로컬 정리(replaceNode)는
+// 이미 구멍(음수 sid)이 된 자리를 못 찾아 아무 일도 하지 않는다 — 사용자가 닫은 칸이 "복원을 기다리는
+// 중" 스피너로 최대 240/480s 남는다. invoke 직전에 표시해 두고, 그 사이의 exited 는 종전(closed)대로
+// 뗀다. 정리 누락에 대비한 안전망(15s)도 둔다 — 영구히 남아 새 surface 의 보류를 오판하지 않게.
+const closingSids = new Set<string>();
+function markClosing(sid: number, socket?: string): void {
+  const k = paneKey(sid, socket);
+  closingSids.add(k);
+  setTimeout(() => closingSids.delete(k), 15000);
+}
+function isClosingSid(sid: number, socket?: string): boolean {
+  return closingSids.has(paneKey(sid, socket));
+}
+
 interface PaneRuntime {
   sid: number;
   socket?: string;
@@ -2346,6 +2362,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       }, 2500);
       return;
     }
+    markClosing(sid, socket); // ★F3: RPC 대기 중 도착하는 exited 를 종전(closed)대로 처리한다
     await invoke("close_surface", { socket, surfaceId: sid }).catch(() => {});
     destroyPaneRuntime(sid, socket);
     const ws = current();
@@ -3264,6 +3281,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         return;
       }
       // 셸 pane: 인계할 맥락이 없다 — 같은 경로의 새 셸이 만들어졌으므로 원본을 정리한다.
+      markClosing(sid, srcSock); // ★F3: 전출 원본 정리 — exited 경합이 구멍을 만들지 않게
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 보상 롤백: 런처 셸은 **기동 명령을 보내지 않았을 때만** 회수한다.
@@ -3273,6 +3291,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
       //   (성공 경로만 고쳤다면 같은 치명 경로가 catch 로 이사했을 뿐이다).
       //   런치를 보낸 뒤에는 셸을 남기고 사람에게 알린다 — 우리가 모르는 것을 죽이지 않는다.
       if (!launchSent) {
+        markClosing(newSid, destWs.socket); // ★F3
         await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
         destroyPaneRuntime(newSid, destWs.socket);
         if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
@@ -3390,6 +3409,7 @@ async function awaitHandoffAck(
   if (verdict.close) {
     // ⑥ 인수 확인 + 좌석 수신 가능 재확인 뒤에만 원본 정리. 기록은 여기서 끝난다.
     try {
+      markClosing(sid, srcSock); // ★F3: 전출(핸드오프) 원본 정리
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 목적지는 인수했고 원본은 **열린 채**다 — 되돌릴 것이 없으므로 인수 대기로 남겨 재시도가
@@ -4158,6 +4178,7 @@ function buildTab(ws: Workspace): HTMLElement {
       }
       for (const sid of collectSids(ws.tree)) {
         // pane 개별 close 실패는 관용(묘비가 이미 부활 차단 — per-pane 토스트는 스팸).
+        markClosing(sid, ws.socket); // ★F3: 탭 삭제 — exited 경합이 구멍을 만들지 않게
         await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
         destroyPaneRuntime(sid, ws.socket);
       }
@@ -4444,6 +4465,7 @@ async function confirmDeleteGroup(g: GroupMeta) {
     const stopFailed: string[] = []; // ★D1: 종료 실패를 부서마다 토스트하지 않고 그룹 단위로 모아 1회
     for (const ws of members) {
       for (const sid of collectSids(ws.tree)) {
+        markClosing(sid, ws.socket); // ★F3: 그룹 삭제 — exited 경합이 구멍을 만들지 않게
         await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
         destroyPaneRuntime(sid, ws.socket);
       }
@@ -4769,6 +4791,7 @@ async function actionClose() {
   const ws = current();
   if (focusedSid == null || !ws.tree) return;
   const sid = focusedSid;
+  markClosing(sid, ws.socket); // ★F3: exited 경합이 구멍을 만들지 않게
   await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
   destroyPaneRuntime(sid, ws.socket);
   ws.tree = replaceNode(ws.tree, sid, () => null);
@@ -6897,6 +6920,7 @@ async function purgeDept(ws: Workspace) {
     toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
     // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
     for (const sid of collectSids(ws.tree)) {
+      markClosing(sid, ws.socket); // ★F3
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
@@ -7553,7 +7577,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
     const sock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;
     if (event.socket_slug && !sock) return; // slug 명시됐는데 미해결 → 기본 데몬 폴백 금지(타부서 동일 sid 오제거 방지)
-    removeDeadPane(Number(sid), sock, name !== "surface.closed");
+    removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));
   }
 }
 
