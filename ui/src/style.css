@@ -52,8 +52,14 @@ html, body {
   border-radius: 8px; background: var(--error); color: #fff;
   font-size: 10px; text-align: center;
 }
-/* 업데이트 배지 "0"(최신 확인) — 경고색 대신 중립(확인 완료·대기 0건의 안심 신호) */
+/* 업데이트 배지 중립(최신 확인 ✓ · 확인 중 …) — 경고색 대신 중립(확인 완료·대기 0건의 안심 신호) */
 .badge.ok { background: #21262d; color: #8b949e; border: 1px solid var(--border); }
+/* ★짝 규칙(Directive · 아래 #cc-panel 주석과 같은 함정): 위 .badge 의 display:inline-block 이 HTML hidden
+   (UA [hidden]{display:none} · 명시도 열세)을 이겨, 코드가 badge.hidden=true 를 해도 화면에 남았다(첫 커밋부터).
+   그래서 Control Center 옆 빨간 0(승인 대기 0건)이 늘 보였고, Update 옆 '!'·'↻'가 확인 전·팩 설치 뒤에도 남아
+   "숫자가 떠 있는데 눌러 보면 최신"이 됐다(U9 · 0.14.41). 이 짝으로 세 배지(update·cc-pending·feed 탭)의
+   숨김이 코드 의도대로 작동한다 — 승인 대기 0건이면 빨간 0 이 사라지는 것이 의도다. 핀: hiddenpair.test.ts */
+.badge[hidden] { display: none; }
 
 /* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
