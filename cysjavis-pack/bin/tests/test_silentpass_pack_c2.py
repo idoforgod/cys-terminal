@@ -20,6 +20,7 @@
 """
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -216,6 +217,40 @@ try:
     check("3k 미측정 0 이면 '미측정 0'(형식 일관 · 경보 피로 없음)", "미측정 0" in last, repr(last))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ═══════════════ ③′ unmeasured=True 표지 20곳 소스 핀(리뷰1 MC4·MC4b 방어) ═══════════════
+# ★위 3e 는 C12 자리 **하나**만 런타임으로 실측한다. `javis_preflight.py` 전체에는 SKIP 을
+#   `add(..., unmeasured=True)` 로 표지하는 자리가 20곳 있는데, C12 밖 19곳은 아무 검체도
+#   보지 않았다(리뷰1: C76 codesign 3곳(MC4) · C81 npm-prefix status rc 포함 4곳(MC4b) 이
+#   표지를 빼도 통과). 자리마다 런타임 유도(권한 파일·codesign 부재·네트워크 등)는 비용이
+#   크므로, **소스 핀**으로 전량을 한 번에 지킨다 — 표지 문자열이 20곳 밖에서 늘거나
+#   줄면(=어느 자리에서든 빠지면) 즉시 적색이다. C76·C81 은 자리 수까지 개별 핀한다.
+with open(pf.__file__, encoding="utf-8") as _f:
+    _pf_src = _f.read()
+
+
+def _pf_method_body(name):
+    m = re.search(r"    def %s\(self\):.*?(?=\n    def |\Z)" % re.escape(name), _pf_src, re.S)
+    return m.group(0) if m else ""
+
+
+    # ★"unmeasured=True)" (닫는 괄호 포함)로 센다 — 1334행 주석("`unmeasured=True` = **재지
+    #   못한**…")이 콜사이트가 아닌데도 순진한 부분문자열 카운트에 섞여 21로 잡히는 것을 막는다.
+_total_unmeasured = _pf_src.count("unmeasured=True)")
+check("u1 unmeasured=True 표지 수 소스 핀(20곳 — 어느 자리에서 빠져도 개수가 움직인다)",
+      _total_unmeasured == 20, "count=%d" % _total_unmeasured)
+
+_c76_body = _pf_method_body("c76_app_seal")
+check("u2 C76(codesign) 판정불가 3자리(도구 부재·시간초과·실행 실패) 전부 unmeasured=True"
+      "(MC4 방어)", _c76_body.count("unmeasured=True)") == 3,
+      "count=%d body_found=%s" % (_c76_body.count("unmeasured=True)"), bool(_c76_body)))
+
+_c81_body = _pf_method_body("c81_npm_prefix_polluted")
+check("u3 C81(npm-prefix) 판정불가 5자리(cys 부재·status 실행불가·status rc≠0·JSON 판독불가·"
+      "daemon 키 부재) 전부 unmeasured=True(MC4b 방어 — status rc 자리 포함)",
+      _c81_body.count("unmeasured=True)") == 5,
+      "count=%d body_found=%s" % (_c81_body.count("unmeasured=True)"), bool(_c81_body)))
 
 
 # ═══════════════════════ ④ bootstrap preflight 부재 → preflight_state='absent' ═══════════════════════
