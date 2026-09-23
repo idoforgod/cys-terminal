@@ -4162,17 +4162,25 @@ def _u20_violations(lib_src):
 
     # ⑤⑥ 실배선: 세 스폰 경로의 공용 규약이 해소기·주입기를 실제로 부르고, 사용자 프로세스 env
     #     와 마스터 스위치를 읽는가. 배선이 없으면 위 셋이 전부 사문(死文)이다.
+    # ★U15 MAJOR-1(0.14.41 · 리뷰1) 이후: `spawn_env_pairs` 는 실제 호스트 판독(exe_dir·PATH·env)만
+    #   하고, 조립 본체는 순수 함수 `spawn_env_pairs_with` 로 옮겨졌다(⑦ CYS_PY 배선을 호스트와
+    #   무관하게 테스트하기 위한 순수 틈). U-20 배선은 여전히 이 두 함수를 합쳐야만 보인다 — 배선
+    #   우회(호출 자체가 끊기는 변이)는 별도로 잡는다.
     sb = _body("pub fn spawn_env_pairs(")
+    swb = _body("pub fn spawn_env_pairs_with(")
     if sb is None:
         v.append("spawn_env_pairs 정의를 찾지 못했다(계측 불능)")
     else:
-        if "bundled_git_bash_path_for(" not in sb:
+        if swb is not None and "spawn_env_pairs_with(" not in sb:
+            v.append("spawn_env_pairs 가 spawn_env_pairs_with 를 거치지 않는다(U-20 배선이 끊길 수 있다)")
+        combined = sb + "\n" + (swb or "")
+        if "bundled_git_bash_path_for(" not in combined:
             v.append("spawn_env_pairs 가 해소기를 부르지 않는다")
-        if "inject_claude_code_git_bash_path_for(" not in sb:
+        if "inject_claude_code_git_bash_path_for(" not in combined:
             v.append("spawn_env_pairs 가 주입기를 부르지 않는다 — 세 스폰 경로 전부 미배선")
-        if "std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH)" not in sb:
+        if "std::env::var_os(ENV_CLAUDE_CODE_GIT_BASH_PATH)" not in combined:
             v.append("spawn_env_pairs 가 프로세스 env 의 사용자 값을 관측하지 않는다(덮어쓰기 위험)")
-        if "boot_gates_master_off_from(" not in sb:
+        if "boot_gates_master_off_from(" not in combined:
             v.append("spawn_env_pairs 가 마스터 롤백 스위치(CYS_BOOT_GATES)를 읽지 않는다")
     return v
 
@@ -4521,6 +4529,29 @@ def h_clt_1():
                  "훅마다 설치 창 + 조용한 실패" % (got, label))
         need(not _u15_shim_runs(sb), "해소 과정에서 셔임이 실행됐다: %r" % _u15_shim_runs(sb))
         notes.append("해소 3종 → 동봉 python")
+        # ★리뷰1 MINOR-2: bundled-first 우선순위가 실제로 재는지 — 기본 샌드박스는 셔임 말고는
+        #   다른 python3 후보가 없어서, `_cys_py_avoid_shim` 의 "bundled" 모드를 지워도 남은
+        #   "python3" 모드가 결국 같은 동봉본을 찾아 우선순위 삭제가 관측되지 않았다(뮤테이션 X1
+        #   생존). 여기서는 셔임이 아닌 **다른** python3 를 동봉 디렉터리보다 PATH 앞에 두고도
+        #   동봉본이 이기는지를 단언한다 — "bundled" 모드가 없으면 "python3" 모드가 이 다른
+        #   python3 를 먼저 찾아 값이 갈린다.
+        other_py_dir = os.path.join(tmp, "other-python")
+        other_py = os.path.join(other_py_dir, "python3")
+        _w(other_py, '#!/bin/sh\nprintf "%%s\\n" "OTHER-PY $*" >> "%s"\nexit 1\n' % sb["marker"])
+        env_prio = dict(env)
+        env_prio["PATH"] = os.pathsep.join(
+            [os.path.dirname(sb["shim"]), other_py_dir, sb["binp"], sb["pydir"]])
+        try:
+            os.remove(sb["marker"])
+        except OSError:
+            pass
+        got_prio = _u15_resolve(lib, env_prio)
+        need(got_prio == sb["bundled"],
+             "PATH 선두 쪽에 셔임 아닌 다른 python3(%s) 가 동봉 디렉터리보다 먼저 있는데 프리루드가 "
+             "그걸 골랐다(bundled-first 우선순위 미측정): 골라진 값=%r" % (other_py_dir, got_prio))
+        need(not _u15_shim_runs(sb),
+             "우선순위 대조 중 셔임이나 그 다른 python3 가 실행됐다: %r" % _u15_shim_runs(sb))
+        notes.append("동봉 우선순위(bundled-first) 확인")
         # ⓑ 데드라인 실행기 — 감싼 명령이 실제로 돈다.
         r = _run(["sh", "-c", '. "$1" || exit 4; cys_timeout_run 5 sh -c "echo U15-RAN-OK"', "_", lib],
                  env=env)
@@ -4715,7 +4746,20 @@ def h_clt_3():
         os.chmod(os.path.join(target, "usr", "bin", "python3"), 0o644)
         need(not present(), "실행 비트 없는 파일을 도구로 셌다")
         need(not present("../bin/python3"), "구분자 든 이름을 도구로 셌다")
-        notes.append("판정 행렬 10축")
+        # ★리뷰1 MINOR-4: DEVELOPER_DIR 이 Xcode **앱 번들 루트**(Contents/Developer 자체가 아님)여도,
+        # 그 안의 Contents/Developer 가 실재하면 변환해 선택한다(man xcode-select 셔임 변환 규약 —
+        # Rust 짝 `selected_developer_dir_in` 의 같은 축과 동형). 이 축 없으면 앱 루트를 쓰는 CLT
+        # 기계를 부재로 오판해 불필요하게 동봉 python 을 주입한다.
+        app_root = os.path.join(r0, "Xcode-beta.app")
+        app_dev = os.path.join(app_root, "Contents", "Developer")
+        _w(os.path.join(app_dev, "usr", "bin", "python3"), "#!/bin/sh\nexit 0\n")
+        need(present(devdir=app_root),
+             "Xcode 앱 번들 루트로 DEVELOPER_DIR 를 준 CLT 기계를 부재로 오판했다")
+        bare_app_root = os.path.join(r0, "Xcode-bare.app")
+        os.makedirs(bare_app_root)
+        need(not present(devdir=bare_app_root),
+             "Contents/Developer 가 없는 앱 루트에서 도구를 present 로 오판했다")
+        notes.append("판정 행렬 10축 + 앱 루트 DEVELOPER_DIR 변환")
 
         def shim(path, ostype="darwin24", clt_ok=False):
             rts = os.path.join(tmp, "cltok") if clt_ok else os.path.join(tmp, "nocl")
@@ -4794,10 +4838,20 @@ def h_clt_5():
     need(os.path.isfile(dept), "cys-dept 부재")
     with tempfile.TemporaryDirectory() as tmp:
         sb = _u15_sandbox(tmp)
-        hp = os.path.join(sb["home"], ".local", "bin", "python3")
-        _w(hp, '#!/bin/sh\nprintf "%%s\\n" "HOME-PY $*" >> "%s"\nexit 1\n' % sb["marker"])
+        home_bin = os.path.join(sb["home"], ".local", "bin")
+        hp = os.path.join(home_bin, "python3")
+        # ★리뷰1 MINOR-1: 실행 여부(어떤 python3 가 도는가)만으로는 콜론 경로·실행 불가 경로 가드가
+        #   빠져도 관측되지 않는다(가드가 없어도 bash 자신이 콜론으로 쪼개진 조각·비실행 파일을 건너뛰어
+        #   결국 이 기록자에 도달하기 때문). 그래서 기록자가 **PATH 를 통째로 함께 적어** 가드가 PATH
+        #   선두에 무언가를 더 얹었는지 자체를 직접 대조한다(리뷰1 제안 ①).
+        _w(hp, '#!/bin/sh\nprintf "%%s\\n" "HOME-PY $* PATH=$PATH" >> "%s"\nexit 1\n' % sb["marker"])
         badd = os.path.join(tmp, "a:b")
         _w(os.path.join(badd, "python3"), '#!/bin/sh\nexec "%s" "$@"\n' % PY)
+        # 존재하되 실행 비트가 없는 CYS_PY(리뷰1 실측: 예전 픽스처는 **존재조차 하지 않는** 경로라
+        # `-f` 만으로도 가드가 막혀 `-x` 가드 삭제(X8)가 죽지 않았다 — 여기서는 `-f` 는 참, `-x` 만
+        # 거짓이게 만든다).
+        noexec = os.path.join(tmp, "noexec", "python3")
+        _w(noexec, "#!/bin/sh\nexit 0\n", mode=0o644)
 
         def run(ostype, marker, cys_py, d=dept):
             try:
@@ -4812,15 +4866,31 @@ def h_clt_5():
             r = _run([BASH, d, "list"], env=e)
             return r, _u15_shim_runs(sb)
 
+        def leading_path(runs):
+            """기록자가 함께 적은 `PATH=...` 에서 선두 성분만 뽑는다(없으면 None)."""
+            m = re.search(r"PATH=(.*)$", runs, re.M)
+            if not m:
+                return None
+            val = m.group(1)
+            return val.split(os.pathsep, 1)[0] if val else None
+
         r, runs = run("darwin24", True, sb["bundled"])
         need(r.returncode == 0 and not runs,
              "마커가 있는데 cys-dept heredoc 이 동봉 python 을 쓰지 않았다(rc=%d): %r" % (r.returncode, runs))
         for label, args in (("마커 없음", ("darwin24", False, sb["bundled"])),
                             ("msys", ("msys", True, sb["bundled"])),
                             ("콜론 경로", ("darwin24", True, os.path.join(badd, "python3"))),
-                            ("실행 불가 경로", ("darwin24", True, os.path.join(tmp, "nope", "python3")))):
+                            ("실행 불가 경로", ("darwin24", True, noexec))):
             _r, runs = run(*args)
-            need("HOME-PY" in runs, "%s 인데 cys-dept PATH 가 바뀌었다(무변경 계약 위반)" % label)
+            need("HOME-PY" in runs, "%s 인데 cys-dept heredoc 이 기록자 python3 를 쓰지 않았다" % label)
+            if label in ("콜론 경로", "실행 불가 경로"):
+                # ★리뷰1 MINOR-1 핵심 축: 어떤 python3 가 실행됐는지가 아니라 PATH 선두 성분
+                #   **자체**를 직접 대조한다 — 가드가 빠지면(X7·X8) 실행 결과는 같아도 PATH 는
+                #   CYS_PY 디렉터리로 바뀌어 있다.
+                lead = leading_path(runs)
+                need(lead == home_bin,
+                     "%s 인데 PATH 선두가 CYS_PY 디렉터리로 바뀌었다(가드 무력화 — 간접 실행 관측만으론 "
+                     "못 잡는 결함): 선두=%r 기대=%r" % (label, lead, home_bin))
         calib = "skip(no-git)"
         old = _git_show("cysjavis-pack/bin/cys-dept", ref=_U15_BASE_REF)
         if old is not None:
@@ -4855,6 +4925,45 @@ def h_clt_6():
         for needle in ("판정 불가", "rc=127", "보고하지 마라", "command -v cys", "cys status", "개발자 도구"):
             need(needle in ctx, "맥 통보에 %r 가 없다: %r" % (needle, ctx[:400]))
         notes.append("darwin 문안: 오진 0 · 조치 3단")
+
+        # ★리뷰1 MINOR-3: 위 단언은 **모델 컨텍스트**(_static_ctx)만 본다 — 실제 Feed 알림
+        #   (MSG → `_notify_bg` → `cys feed push --body`)의 본문은 한 번도 검사되지 않아서, 그
+        #   darwin MSG 에 Windows Defender 문구를 다시 넣는 변이(X14)도 이 검체를 통과했다.
+        #   `cys` 스텁을 PATH 에 두어 실제 notify 호출 인자를 가로채 직접 검사한다: `surface-role`
+        #   호출은 여전히 rc=127 을 흉내 내(위 축과 동형 조건 유지) '판정 불가' 갈래를 그대로
+        #   타지만, `feed push` 호출만 가로채 본문을 로그에 남긴다.
+        notify_log = os.path.join(tmp, "notify-args.log")
+        cys_stub = os.path.join(tmp, "cysbin-notify", "cys")
+        _w(cys_stub,
+           '#!/bin/sh\n'
+           'case "$1" in\n'
+           '  surface-role) exit 127 ;;\n'
+           '  feed|send) shift; printf "%%s\\n" "$*" >> "%s"; exit 0 ;;\n'
+           '  *) exit 0 ;;\n'
+           'esac\n' % notify_log)
+        # ★독립 상태 dir: `env` 를 그대로 재사용하면 위 첫 호출이 이미 새긴 통보 래치(창당 1회)가
+        #   이 두 번째 호출을 조용히 억제해 "배선이 죽었다"로 오판한다 — 이름을 바꿔 새 상태 dir 을 쓴다.
+        env_nb, _s_nb = _u29_nocys_sandbox(tmp, "mac-notify", ostype="darwin24")
+        env_nb["CYS_DEVTOOLS_ROOTS"] = cl
+        env_nb["PATH"] = os.path.dirname(cys_stub) + os.pathsep + env_nb["PATH"]
+        r_nb = _run_rb(env_nb)
+        need(r_nb.returncode == 0, "notify 계측 경로가 훅을 비0 종료(exit=%d)" % r_nb.returncode)
+        deadline = time.time() + 1.0
+        body = ""
+        while time.time() < deadline:
+            body = _read(notify_log) if os.path.isfile(notify_log) else ""
+            if body:
+                break
+            time.sleep(0.02)
+        need(body, "맥 Feed 알림(cys feed push)이 호출되지 않았다 — notify 배선 자체가 죽었다")
+        need("--body" in body, "feed push 호출에 --body 인자가 없다: %r" % body[:300])
+        need("Defender" not in body and "cys.exe" not in body,
+             "맥 Feed 알림 **본문**에 윈도우 원인(Defender·cys.exe)이 실렸다(모델 컨텍스트만 검사해서는 "
+             "못 잡는 결함 — 뮤테이션 X14): %r" % body[:400])
+        need("command -v cys" in body and "cys status" in body,
+             "맥 Feed 알림 본문이 맥 확인 순서를 담지 않는다: %r" % body[:400])
+        notes.append("Feed 알림(MSG) 본문 직접 검사: 오진 0")
+
         env2, _s2 = _u29_nocys_sandbox(tmp, "linux", ostype="linux-gnu")
         ctx2 = _u29_ctx(_run_rb(env2).stdout)
         need("Defender" in ctx2, "비-darwin 문안이 바뀌었다(윈도우 무변경 계약): %r" % ctx2[:200])
