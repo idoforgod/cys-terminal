@@ -289,13 +289,19 @@ rig.cleanup()
 GATE_DELAY_B9 = 0.15
 rig9 = Rig([fleet_hard()], gate_delay=GATE_DELAY_B9).run()
 calls9 = rig9.gate_calls()
+# ★CI 러너 지터(2026-09-23 · ci-branch run 35884936211): 판정을 '최대 편차'로 두면 느린 러너에서
+#   한 회차만 늦게 뜬 스폰 지터(starts=[0, .534, 1.166, 1.537] — 2회차만 +0.166s, 3회차는 +0.037s 로
+#   제자리 복귀)가 RED 를 만든다. 절대 스케줄의 지터는 **회차마다 독립·비누적**이고 상대 스케줄(MU3)의
+#   드리프트는 **누적**(≈k×게이트: .15/.30/.45)이므로, 재확인 회차(k≥1) 편차의 **중앙값**으로 가른다 —
+#   지터 1회는 흡수하고 MU3 는 중앙값 .30 ≥ 문턱이라 그대로 떨어진다(판별력 유지).
 if len(calls9) >= 2:
     first9 = calls9[0][1]
     starts9 = [c[1] - first9 for c in calls9]
-    drift9 = max(abs(s - k * INTERVAL) for k, s in enumerate(starts9))
+    drifts9 = sorted(abs(s - k * INTERVAL) for k, s in enumerate(starts9) if k >= 1)
+    med9 = drifts9[len(drifts9) // 2]
     thresh9 = 0.5 * GATE_DELAY_B9
-    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 최대 편차 %.3fs < %.3fs=0.5×게이트소요)"
-          % (GATE_DELAY_B9, drift9, thresh9), drift9 < thresh9,
+    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 재확인 편차 중앙값 %.3fs < %.3fs=0.5×게이트소요 · 최대 %.3fs)"
+          % (GATE_DELAY_B9, med9, thresh9, drifts9[-1]), med9 < thresh9,
           "starts=%r" % [round(s, 3) for s in starts9])
 else:
     check("b9 절대 스케줄(측정 불충분)", False, "calls=%d" % len(calls9))
