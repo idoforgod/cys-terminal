@@ -85,8 +85,80 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ];
   OUT="${OUT}\n"
 fi
 
+# ---------- 좌석 역할 해소(정본 1회 · 아래 복원 신호 분기와 동일 cwd 세션 줄이 공유) ----------
+# 신원은 **데몬이 권위**다(plan §8: `CYS_ROLE` env 는 승계 후 stale — 폴백 전용).
+# ★성찰 R4 N5 — 해소는 **정본 하나**(`_lib.sh:cys_resolve_role`)만 쓴다. 이 훅은 `_lib.sh` 를
+#   :11 에서 이미 source 하는데도 종전엔 같은 일을 **세 번째 경로**로 다시 구현했고, 그 사본에는
+#   정본의 네 장치가 전부 빠져 있었다:
+#     ⓐ 60s 디스크 캐시 없음 · ⓑ 30s 실패 백오프 없음 → 데몬이 떠 있으나 무응답인 상태에서
+#        좌석 12개가 동시에 SessionStart(부트·`/clear`·`/compact`)를 돌면 각 훅이 2s 씩 사용자
+#        프롬프트 앞을 붙잡는다(정본이었다면 첫 실패 뒤 30s 는 조회를 생략한다 · 봉인표 ④ 방향).
+#     ⓒ `${CYS_BIN:-cys}` 대신 `cys` 하드코딩 → `bin/cys-dept` 의 레인 지정과
+#        `javis_snapshot._st_env` 의 봉인을 둘 다 무시했다.
+#     ⓓ `cys_role_token_ok` 없음 → 문법 밖 문자열이 그대로 SessionStart 컨텍스트에 실렸다.
+#   정본의 신원 전제도 함께 온다: **숫자 surface id 가 없으면 데몬에게 '나'를 묻지 않는다**
+#   (주소가 없다는 사실이 '역할 없음' 판정으로 승격되면 정상 위임 경로가 죽는다). 자동기동 금지
+#   (`CYS_NO_AUTOSTART=1`)·CR 제거·한 줄 절단·rc0+빈 줄 = 확정 무역할도 전부 정본 쪽 규율이다.
+# ★0.14.41 U13: 해소는 **훅 1회당 최대 1회**다(`_IC_ROLE_DONE` 래치) — 복원 신호 분기와 동일 cwd 세션 줄이
+#   같은 답을 쓴다(두 번 묻지 않는다).
+_IC_ROLE=""; _IC_ROLE_DONE=""
+_ic_resolve_role() {
+  [ -n "$_IC_ROLE_DONE" ] && return 0
+  _IC_ROLE_DONE=1
+  _IC_ROLE=""
+  if command -v cys_resolve_role >/dev/null 2>&1; then
+    cys_resolve_role >/dev/null 2>&1 || :
+    _IC_ROLE="${CYS_RESOLVED_ROLE:-}"
+  else
+    # 정본 부재(오래된 `_lib.sh`) — 훅은 강등하되 조용하지 않는다. env 는 폴백 전용이다.
+    echo "[cys-hook] cys_resolve_role 부재 — 역할 해소 강등(inject-context)" >&2
+    _IC_ROLE=$(printf '%s' "${CYS_ROLE:-}" | head -n1 | tr -d '\r')
+  fi
+  # ★소비 지점의 문법 검사(성찰 R4 N5 ⓓ): 표현 불가한 값은 **역할이 아니다**. 잘라 쓰면 없는
+  #   역할을 지어내는 것이고, 그대로 실으면 남이 심은 여러 낱말이 SessionStart 컨텍스트에
+  #   문장으로 들어간다(`_esc` 는 백슬래시만 이스케이프한다). 정본 `cys_role_token_ok` 와 같은 집합.
+  if [ -n "$_IC_ROLE" ] && command -v cys_role_token_ok >/dev/null 2>&1 \
+     && ! cys_role_token_ok "$_IC_ROLE"; then
+    _IC_ROLE=""
+  fi
+  return 0
+}
+
+# ---------- ★U13 착수 게이트(0.14.41 · 오너 지시 2026-09-23 · 설계 §3 U13 · 반박 D1): 좌석 분류 ----------
+# 이 훅의 복원 신호('▶ 작업 계속 … 이어서 진행' · '▶ 복원 모드 … 미해결 게이트부터 재개')는 역할과 무관하게
+# **모든 좌석**에 나갔고, 부서 레인에서는 부서장 SESSION_STATE('다음 액션' 큐)까지 팀원 좌석에 실렸다 —
+# 팀원에게 스스로 착수를 권하는 가장 직접적인 제품 문안이었다(반박 M1·M2 · 세션 기록 실측). 지침 파일
+# (WORKER §0 · REVIEWER §1-2 = 정본)은 사용자 소유라 기존 설치에 닿지 않으므로 이 훅(팩 소유)이 배달한다.
+#   lead    = master · cso*        → 종전 출력 **바이트 동일**(문안·본문·체크리스트 전부)
+#   member  = 역할이 확정된 그 밖   → 중립 문안(`cys_start_gate_note` 단일 원본) + 부서 레인은 부서장 본문 대신 1줄
+#   unknown = 판별 실패             → 중립 문안 · 작업기억 본문은 **유지**(그 좌석이 부서장 자신일 수 있다 —
+#                                    작업기억은 복원 생명선이고, 본문은 '배경 컨텍스트' 머리글 아래 실린다)
+# 판별 순서: ① env `CYS_ROLE` 이 lead 면 그대로 lead — 조회 0(lead 좌석의 비용·출력 불변을 구조로 보장한다.
+#   env 가 낡았더라도 귀결은 종전 문안 = 현행 동작이다) ② 그 밖은 정본 해소(위 `_ic_resolve_role`).
+# 프리루드에 문안 함수가 없으면(부분 갱신) 종전 출력 그대로 — 모르는 상태를 새 거동으로 바꾸지 않는다.
+_IC_GATE="lead"
+if command -v cys_start_gate_is_lead >/dev/null 2>&1 && command -v cys_start_gate_note >/dev/null 2>&1; then
+  # env 는 첫 줄 + 양끝 공백 트림(정본 `cys_role_line` · 외부 명령 0 — CR 도 여기서 끊긴다).
+  _IC_ENV_ROLE=""
+  command -v cys_role_line >/dev/null 2>&1 && _IC_ENV_ROLE="$(cys_role_line "${CYS_ROLE:-}")"
+  if cys_start_gate_is_lead "$_IC_ENV_ROLE"; then
+    _IC_GATE="lead"
+  else
+    _ic_resolve_role
+    if cys_start_gate_is_lead "$_IC_ROLE"; then
+      _IC_GATE="lead"
+    elif [ -n "$_IC_ROLE" ]; then
+      _IC_GATE="member"
+    else
+      _IC_GATE="unknown"
+    fi
+  fi
+else
+  echo "[cys-hook] 착수 게이트 문안 부재(구 _lib.sh) — 종전 복원 신호 유지(inject-context)" >&2
+fi
+
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
-DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""
+DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""; DEPT_STATE_WITHHELD=""
 # ── G4+G20: 부서 레인 감지 글롭 수리 (명명 부서 + Windows 파이프·백슬래시) ──
 # 종전 글롭 `*/pack-dept-dept-*` · `*/cys-dept-dept-*` 는 부서명이 문자 그대로 `dept-N` 인
 # 경우만 매칭했다 → **명명 부서**(pack-dept-sales)는 부서 컨텍스트로 인식되지 않아 메인 레인
@@ -106,7 +178,16 @@ if [ -n "$DEPT_CTX" ]; then
     *)            DEPT_NO_STATE=1 ;;
   esac
   if [ -n "$DEPT_ROUND" ] && [ -f "$DEPT_ROUND/SESSION_STATE.md" ]; then
-    STATE="$DEPT_ROUND/SESSION_STATE.md"; STATE_DIR="$DEPT_ROUND"
+    if [ "$_IC_GATE" = "member" ]; then
+      # ★U13: 부서 round SESSION_STATE 는 부서장(master) 소관이다(cys.rs cycle_save_directive: 팀원에게는
+      #   '감시 대상일 뿐 쓰기 금지'). 팀원 좌석에는 본문 대신 경로 1줄만 준다 — 본문의 '다음 액션' 이
+      #   팀원 컨텍스트에서 착수 권고로 읽혔다(반박 M2 실측). STATE 를 비우므로 그 본문을 대조하는 실측
+      #   체크리스트·RSI 헤드·주입량 계측도 이 좌석에서는 돌지 않는다(부서 레인 SessionStart 약 9초 지연의
+      #   원인이던 체크리스트가 빠져 전달 경합(반박 M4)도 이 좌석에서 줄어든다 — 부수 효과).
+      DEPT_STATE_WITHHELD="$DEPT_ROUND/SESSION_STATE.md"
+    else
+      STATE="$DEPT_ROUND/SESSION_STATE.md"; STATE_DIR="$DEPT_ROUND"
+    fi
   else
     DEPT_NO_STATE=1
   fi
@@ -149,6 +230,8 @@ if [ -n "$STATE" ]; then
   else
     OUT="${OUT}$(cat "$STATE" | _gate | sed 's/\\/\\\\/g')\n\n"
   fi
+elif [ -n "$DEPT_STATE_WITHHELD" ]; then
+  OUT="${OUT}■ 부서장 작업기억(SESSION_STATE)은 master 소관이라 이 좌석에 싣지 않는다 — 네 작업 목록이 아니다(필요하면 읽기만: $(_esc "$DEPT_STATE_WITHHELD")). 네 일은 자기 TODO(cys todo-path)와 이 세션에 배달된 지시가 정한다.\n\n"
 else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
 fi
@@ -214,37 +297,11 @@ if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CW
   # ★"레인 격리됨" 같은 미검증 문구는 쓰지 않는다(codex O): 이 훅이 아는 사실은 세션 수와
   #   이 좌석의 역할뿐이고, 편집 충돌이 불가능하다는 것은 우리가 재지 않은 주장이다.
   #
-  # 신원은 **데몬이 권위**다(plan §8: `CYS_ROLE` env 는 승계 후 stale — 폴백 전용).
-  # ★성찰 R4 N5 — 해소는 **정본 하나**(`_lib.sh:cys_resolve_role`)만 쓴다. 이 훅은 `_lib.sh` 를
-  #   :11 에서 이미 source 하는데도 종전엔 같은 일을 **세 번째 경로**로 다시 구현했고, 그 사본에는
-  #   정본의 네 장치가 전부 빠져 있었다:
-  #     ⓐ 60s 디스크 캐시 없음 · ⓑ 30s 실패 백오프 없음 → 데몬이 떠 있으나 무응답인 상태에서
-  #        좌석 12개가 동시에 SessionStart(부트·`/clear`·`/compact`)를 돌면 각 훅이 2s 씩 사용자
-  #        프롬프트 앞을 붙잡는다(정본이었다면 첫 실패 뒤 30s 는 조회를 생략한다 · 봉인표 ④ 방향).
-  #     ⓒ `${CYS_BIN:-cys}` 대신 `cys` 하드코딩 → `bin/cys-dept` 의 레인 지정과
-  #        `javis_snapshot._st_env` 의 봉인을 둘 다 무시했다.
-  #     ⓓ `cys_role_token_ok` 없음 → 문법 밖 문자열이 그대로 SessionStart 컨텍스트에 실렸다.
-  #   정본의 신원 전제도 함께 온다: **숫자 surface id 가 없으면 데몬에게 '나'를 묻지 않는다**
-  #   (주소가 없다는 사실이 '역할 없음' 판정으로 승격되면 정상 위임 경로가 죽는다). 자동기동 금지
-  #   (`CYS_NO_AUTOSTART=1`)·CR 제거·한 줄 절단·rc0+빈 줄 = 확정 무역할도 전부 정본 쪽 규율이다.
-  # 조회는 **경고를 낼 상황(SHARE>=2)에서만** 1회. 비용을 안 낼 자리에서는 아예 안 낸다.
+  # 신원은 **데몬이 권위**다 — 해소는 위 `_ic_resolve_role`(정본 `cys_resolve_role` 1회 · 래치)이 한다.
+  #   (성찰 R4 N5 의 네 장치 ⓐ캐시 ⓑ백오프 ⓒCYS_BIN ⓓ문법 검사와 신원 전제는 그 함수 머리 주석에 있다.)
+  # 조회는 **경고를 낼 상황(SHARE>=2)에서만** 1회 — 단 복원 신호 분기(U13)가 이미 해소했으면 그 답을 쓴다.
   if [ "${SHARE:-0}" -ge 2 ]; then
-    _IC_ROLE=""
-    if command -v cys_resolve_role >/dev/null 2>&1; then
-      cys_resolve_role >/dev/null 2>&1 || :
-      _IC_ROLE="${CYS_RESOLVED_ROLE:-}"
-    else
-      # 정본 부재(오래된 `_lib.sh`) — 훅은 강등하되 조용하지 않는다. env 는 폴백 전용이다.
-      echo "[cys-hook] cys_resolve_role 부재 — 역할 해소 강등(inject-context)" >&2
-      _IC_ROLE=$(printf '%s' "${CYS_ROLE:-}" | head -n1 | tr -d '\r')
-    fi
-    # ★소비 지점의 문법 검사(성찰 R4 N5 ⓓ): 표현 불가한 값은 **역할이 아니다**. 잘라 쓰면 없는
-    #   역할을 지어내는 것이고, 그대로 실으면 남이 심은 여러 낱말이 SessionStart 컨텍스트에
-    #   문장으로 들어간다(`_esc` 는 백슬래시만 이스케이프한다). 정본 `cys_role_token_ok` 와 같은 집합.
-    if [ -n "$_IC_ROLE" ] && command -v cys_role_token_ok >/dev/null 2>&1 \
-       && ! cys_role_token_ok "$_IC_ROLE"; then
-      _IC_ROLE=""
-    fi
+    _ic_resolve_role
     if [ -n "$_IC_ROLE" ]; then
       OUT="${OUT}ℹ 동일 cwd claude 세션 ${SHARE}개(역할 좌석 포함) — 이 세션은 역할 좌석 $(_esc "$_IC_ROLE") 이다. 작업기억(SESSION_STATE) 편집은 한 세션에서만.\n"
     else
@@ -272,11 +329,22 @@ if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
 fi
 
 # ---------- 복원 모드 신호 (순환의존 해소 — 모순 1) ----------
+# ★U13(0.14.41): lead(master·cso*)는 종전 문안 **바이트 동일** · member·역할 미상은 착수 게이트 1줄(단일 원본
+#   `_lib.sh:cys_start_gate_note`). compact(자동 압축 직후)는 진행 중 턴의 연속이지 새 착수가 아니므로
+#   역할 무관 종전 문안이다.
+if [ "$_IC_GATE" = "lead" ]; then
 case "$SOURCE" in
   startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): RECOVERY.md 절차 실행 → G2 실측 대조(git·pane·server) → 배달 원장 다이제스트(BOOT_SNAPSHOT.md 있으면 그것 · 귀속 판별은 MASTER_DIRECTIVE '귀속 판별' 절(절이 없으면 constitution 병합 대기 — cys pack-merge 승인 필요)) → 미해결 게이트부터 재개.\n";;
   clear)          OUT="${OUT}▶ 작업 계속(source=clear): 위 작업기억 이어서 진행.\n";;
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac
+else
+case "$SOURCE" in
+  startup|resume) OUT="${OUT}▶ 복원 모드(source=$SOURCE): $(cys_start_gate_note)\n";;
+  clear)          OUT="${OUT}▶ 컨텍스트 순환 직후(source=clear): $(cys_start_gate_note)\n";;
+  compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
+esac
+fi
 
 # ---------- RSI 자산 자동 주입 (오너 자동트리거 · startup/resume · master 결정 D1=4·D2=포인터) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]; then

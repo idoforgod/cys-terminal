@@ -902,6 +902,38 @@ cys_resolve_role() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 10. 착수 게이트 — 역할별 복원 신호 문안의 단일 원본 (0.14.41 U13 · WP-C1 소유)
+# ─────────────────────────────────────────────────────────────────────────────
+# 오너 지시(2026-09-23): 팀원 자리는 지시를 받기 전에 스스로 일을 시작하지 않는다.
+# 규칙의 **정본**은 WORKER_DIRECTIVE §0 · REVIEWER_DIRECTIVE §1-2 다. 그런데 지침 파일은 사용자 소유
+# (src/pack.rs `is_constitution_file` → Ownership::User · 디스크≠임베드면 `.new` 병치 + `cys pack-merge`
+# 대기)라 팩 갱신이 **기존 설치에 닿지 않는다**. 기존 설치에 닿는 문안은 팩 소유(System) 훅이 싣고,
+# 그 문안의 원본은 여기 한 곳이다 — 소비처: hooks/inject-context.sh(복원 신호 줄) · (WP-E U16 팀 소개가
+# 참조 — 새 사본을 만들지 말고 이 함수를 부른다).
+#
+# 대상 구분(설계 §3 U13 · 반박 D1):
+#   lead   = master · cso*  → 종전 문안 **바이트 동일**(master 는 §0-C 임무 게이트, CSO 는 상시 임무·clear
+#            집행 — 이 게이트를 CSO 에 걸면 master clear(②)·자가치유(③)가 멈출 수 있다 · CSO 제외).
+#            접두 `cso*` 는 session-start.sh `cso*)` 와 글자 그대로 같은 규칙이다(재발명 금지).
+#   member = 역할이 **확정된** 그 밖의 좌석(worker* · reviewer* · planner · 비표준 역할) → 아래 문안.
+#   역할 미상(판별 실패) = 문안은 member 쪽(중립)이다 — 판정은 소비처가 한다.
+#
+# 문안 계약: ⓐ 외부 명령 0(printf 만) · 호출했을 때만 stdout ⓑ 한 줄 · 백슬래시 0(소비처가 `printf '%b'`
+#   로 낸다) ⓒ `set-status`·`--ack`·`CYS_BOOT_NONCE` 낱말 0(session-start.sh 의 ack 줄 부재 계약 —
+#   test_bootv2_doc_contract ④ 가 WP-E 소비처에서 이 문안을 만날 수 있다) ⓓ '부트 브리지' 낱말 0
+#   (test_session_start_hook 2x2) ⓔ 운영 절차 메시지는 **예외로 명시**한다 — 빠지면 워커가 [CYCLE] 저장
+#   지시를 '티켓 아님' 으로 미뤄 clear 가 영영 안 된다(무clear ②). 검체 = test_inject_context_role_seat ⑮.
+cys_start_gate_is_lead() {   # $1=역할 · rc 0 = 종전 문안 유지 대상(master · cso*)
+  case "${1-}" in master|cso*) return 0 ;; esac
+  return 1
+}
+
+cys_start_gate_note() {      # stdout: 착수 게이트 1줄(개행 없음) — member·역할 미상 공통
+  printf '%s' "착수 게이트 — 위 작업기억·TODO 는 배경 참고이지 지시가 아니다. 일의 착수·재개는 이 세션에 배달된 지시가 정한다: [RESUME] 이면 배정 출처가 기록된 작업(순환 직전까지 하던 배정 포함)을 이어가고, [RESTORE]·[RECOVER] 가 오면 재개하지 말고 master 지시를 기다린다. master(부서장)·CEO·오너의 티켓·리뷰 의뢰가 곧 지시다. 지시가 없으면 상태만 확인해 '대기'로 자기보고하고 턴을 끝낸다. 운영 절차([CYCLE-PRE]·[CYCLE]·[CYCLE-VERIFY]·[DRAIN]·[DRAIN-VERIFY]·지침 각성 확인 핑·각성 ACK·승인 응답)는 예외 — 받는 즉시 수행한다."
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
 cys_resolve_py >/dev/null 2>&1 || :

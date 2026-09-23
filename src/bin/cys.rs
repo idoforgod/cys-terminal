@@ -17573,6 +17573,13 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
     out
 }
 
+/// ★0.14.41 U13(WP-C1): 착수 게이트 대상 좌석 = master·cso* 가 **아닌** 역할(worker* · reviewer* · planner ·
+/// 비표준 역할 — compose_directive 의 WORKER_DIRECTIVE 폴백과 같은 범위). 셸 짝 = `hooks/_lib.sh:cys_start_gate_is_lead`
+/// (`master|cso*` — session-start.sh `cso*)` 와 같은 접두 규칙). lead(master·cso*)의 문안은 바이트 동일로 둔다.
+fn start_gate_member_role(role: &str) -> bool {
+    role != "master" && !role.starts_with("cso")
+}
+
 /// ★A′ — [CYCLE] 저장 지시문 생성(순수): 지시문이 안내하는 경로 = 게이트가 감시하는 경로.
 ///
 /// 종전 고정 산문("~/.cys/pack/round/<역할>_TODO.md" 틸드 하드코딩 + "_round/ 또는 pack
@@ -17588,10 +17595,17 @@ fn cycle_gate_files(detected: Vec<String>, expected: Vec<std::path::PathBuf>) ->
 /// ② CYCLE-SAVED 마커 문장(plain 한 줄)은 종전 계약 그대로 보존한다.
 ///
 /// [codex R1 수용 2026-08-20] 역할 인지형 개정 — "네 역할 소관"의 해석을 LLM 에 맡기지 않고 role 인자로 소관을 문구에 결정론 명시한다(비master 노드의 공유 SESSION_STATE 오재기록 차단).
+///
+/// ★0.14.41 U13(WP-C1 · 설계 §3 U13 · 반박 M3/D2): 팀원(`start_gate_member_role`)의 '다음 액션' 에는 **배정
+/// 출처**(보낸 역할·시각·티켓 경로)를 함께 적게 한다 — 출처가 없으면 다음 세션에서 배정된 일과 스스로 고른 일을
+/// 구별할 수 없다(착수 게이트의 '지시' 는 출처로 정의된다). 바이너리 문안이라 지침 파일(사용자 소유 · seed-once)과
+/// 달리 기존 설치에도 즉시 닿는다. master·cso* 는 **바이트 동일**(CSO 는 착수 게이트 대상 밖).
 fn cycle_save_directive(role: &str, files: &[String]) -> String {
     let scope = if role == "master" {
         // master 소관 = 자기 TODO + SESSION_STATE (종전 취지 유지).
         "이 중 **네 역할 소관 파일**(자기 TODO·자기 SESSION_STATE)을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장)."
+    } else if start_gate_member_role(role) {
+        "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 다음 액션에는 그 일을 배정한 **배정 출처**(보낸 역할·시각·티켓 경로)를 함께 적어라 — 다음 세션은 출처가 기록된 배정만 이어간다(착수 게이트). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율)."
     } else {
         "네 소관은 **자기 역할 TODO 파일만**이다 — 그것을 지금 즉시 물리적으로 재기록하라(현재 작업 상태·미해결 게이트·다음 액션 저장). 목록의 SESSION_STATE·타 역할 TODO는 감시(관찰) 대상일 뿐 **쓰기 금지**(단일 스레드 쓰기 규율)."
     };
@@ -17730,7 +17744,12 @@ fn cycle_receipt_ok(item: &Value, vsid: u64) -> Result<(), String> {
 /// RESUME 기본 문안(순수) — 파일 실재 기준으로 SESSION_STATE·역할 TODO 실경로를 채운다.
 /// 파이썬 resolve_save_files 는 디렉터리 실재 기준 · 여기는 설계 정정에 따라 파일별 실재 기준(의도적 차이).
 /// 우선순위: pack_round 파일 실재 → cwd_round 파일 실재 → pack_round(폴백 · 부재여도).
+/// ★0.14.41 U13(WP-C1 · 반박 M6/D9): 팀원(`start_gate_member_role`)은 **자기 TODO 만** 가리킨다 — 종전은 master 의
+/// SESSION_STATE(부서장 '다음 액션' 큐)까지 읽고 "직전 작업을 이어가라" 였다(팀원에게 master 큐를 넘기는 문안).
+/// master·cso* 는 종전 문안 바이트 동일. 자동 순환(javis_cycle_autopilot)은 lease 의 역할 소관 파일로 자기 문안을
+/// 만들므로 이 기본 문안을 쓰지 않는다(수동 `cys cycle-agent` 에 `--resume-text` 가 없을 때만 쓰인다).
 fn default_resume_text(
+    role: &str,
     cwd_round: &std::path::Path,
     pack_round: &std::path::Path,
     role_todo: &str,
@@ -17749,8 +17768,11 @@ fn default_resume_text(
         .to_string_lossy()
         .into_owned()
     };
-    let ss = resolve("SESSION_STATE.md");
     let todo = resolve(role_todo);
+    if start_gate_member_role(role) {
+        return format!("[RESUME] 컨텍스트 순환 완료. {todo} 를 읽고 직전 작업을 이어가라.");
+    }
+    let ss = resolve("SESSION_STATE.md");
     format!(
         "[RESUME] 컨텍스트 순환 완료. {} 를 읽고 직전 작업을 이어가라.",
         [ss, todo].join(" · ")
@@ -18240,7 +18262,7 @@ fn run_cycle_agent(
         )?;
         // 사용자 문안 또는 실경로 기본값을 clear 클로저 전에 한 번만 확정한다.
         let resume_text = resume_text.unwrap_or_else(|| {
-            default_resume_text(&cwd_round, &pack_round, &role_todo, &|p| p.exists())
+            default_resume_text(&role_name, &cwd_round, &pack_round, &role_todo, &|p| p.exists())
         });
         let directive_path = cys::pack::role_directive_path(&role_name)
             .unwrap_or_else(|| cys::pack::pack_dir().join("directives/WORKER_DIRECTIVE.md"));
@@ -30143,10 +30165,34 @@ mod tests {
     fn u13_default_resume_text_member_points_only_to_own_todo() {
         let cwd = std::path::Path::new("/project/_round");
         let pack = std::path::Path::new("/pack/round");
-        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|_| true);
-        assert!(text.starts_with("[RESUME]"), "{text}");
-        assert!(text.contains("/pack/round/WORKER_TODO.md"), "자기 TODO 가 빠졌다: {text}");
-        assert!(!text.contains("SESSION_STATE"), "팀원 [RESUME] 이 master SESSION_STATE 를 가리킨다: {text}");
+        for (role, todo) in [
+            ("worker", "WORKER_TODO.md"),
+            ("worker-2", "WORKER_2_TODO.md"),
+            ("reviewer-codex", "REVIEWER_CODEX_TODO.md"),
+            ("planner", "PLANNER_TODO.md"),
+        ] {
+            let text = default_resume_text(role, cwd, pack, todo, &|_| true);
+            assert!(text.starts_with("[RESUME]"), "{role}: {text}");
+            assert!(text.contains(&format!("/pack/round/{todo}")), "{role}: 자기 TODO 가 빠졌다: {text}");
+            assert!(!text.contains("SESSION_STATE"), "{role}: 팀원 [RESUME] 이 master SESSION_STATE 를 가리킨다: {text}");
+            assert!(!text.contains('\n'), "{role}: [RESUME] 이 한 줄이 아니다");
+        }
+        // lead(master·cso*) 는 종전 문안 그대로(SESSION_STATE · 자기 TODO) — 바이트 동일.
+        for (role, todo) in [("master", "MASTER_TODO.md"), ("cso", "CSO_TODO.md"), ("cso-1", "CSO_1_TODO.md")] {
+            let text = default_resume_text(role, cwd, pack, todo, &|_| true);
+            assert_eq!(
+                text,
+                format!("[RESUME] 컨텍스트 순환 완료. /pack/round/SESSION_STATE.md · /pack/round/{todo} 를 읽고 직전 작업을 이어가라."),
+                "{role} 바이트 변경"
+            );
+        }
+        // 술어 짝 — 셸 `cys_start_gate_is_lead`(master|cso*)와 같은 경계.
+        for r in ["master", "cso", "cso-1", "cso-dept-3"] {
+            assert!(!start_gate_member_role(r), "{r} 가 착수 게이트 대상으로 잡혔다");
+        }
+        for r in ["worker", "worker-2", "reviewer-gemini", "reviewer-claude-1", "planner", "role-fresh-1"] {
+            assert!(start_gate_member_role(r), "{r} 가 착수 게이트 대상에서 빠졌다");
+        }
     }
 
     // ── E3/E8: cycle-agent 저장 검증 단계 ─────────────────────────────────────
@@ -32103,13 +32149,14 @@ mod tests {
     fn d10_resume_text_uses_pack_round_when_present() {
         let cwd = std::path::Path::new("/project/_round");
         let pack = std::path::Path::new("/pack/round");
+        // ★0.14.41 U13: SESSION_STATE 경로 해소 축은 그것을 싣는 역할(master)로 잰다 — 팀원은 자기 TODO 만(아래 u13 검체).
         let session = pack.join("SESSION_STATE.md");
-        let todo = pack.join("WORKER_TODO.md");
-        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| {
+        let todo = pack.join("MASTER_TODO.md");
+        let text = default_resume_text("master", cwd, pack, "MASTER_TODO.md", &|p| {
             p == session || p == todo
         });
         assert!(text.contains(session.to_str().unwrap()), "팩 SESSION_STATE 실경로 누락: {text}");
-        assert!(text.contains(todo.to_str().unwrap()), "팩 WORKER_TODO 실경로 누락: {text}");
+        assert!(text.contains(todo.to_str().unwrap()), "팩 MASTER_TODO 실경로 누락: {text}");
         assert!(!text.contains("_round/SESSION_STATE.md와"));
         assert!(!text.contains("(nonce="));
         assert!(text.starts_with("[RESUME]"));
@@ -32120,9 +32167,9 @@ mod tests {
         let cwd = std::path::Path::new("/project/_round");
         let pack = std::path::Path::new("/pack/round");
         let session = cwd.join("SESSION_STATE.md");
-        let text = default_resume_text(cwd, pack, "WORKER_TODO.md", &|p| p == session);
+        let text = default_resume_text("master", cwd, pack, "MASTER_TODO.md", &|p| p == session);
         assert!(text.contains(session.to_str().unwrap()), "프로젝트 SESSION_STATE 실경로 누락: {text}");
-        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+        assert!(text.contains(pack.join("MASTER_TODO.md").to_str().unwrap()));
         assert!(!text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()));
     }
 
@@ -32130,15 +32177,16 @@ mod tests {
     fn d10_resume_text_falls_back_to_pack_round_when_nothing_exists() {
         let pack = std::path::Path::new("/pack/round");
         let text = default_resume_text(
-            std::path::Path::new("/project/_round"), pack, "WORKER_TODO.md", &|_| false,
+            "master", std::path::Path::new("/project/_round"), pack, "MASTER_TODO.md", &|_| false,
         );
         assert!(text.contains(pack.join("SESSION_STATE.md").to_str().unwrap()), "팩 SESSION_STATE 폴백 누락: {text}");
-        assert!(text.contains(pack.join("WORKER_TODO.md").to_str().unwrap()));
+        assert!(text.contains(pack.join("MASTER_TODO.md").to_str().unwrap()));
     }
 
     #[test]
     fn d10_resume_text_master_todo_name() {
         let text = default_resume_text(
+            "master",
             std::path::Path::new("/project/_round"),
             std::path::Path::new("/pack/round"),
             "MASTER_TODO.md",
