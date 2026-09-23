@@ -4338,8 +4338,17 @@ async fn feed_reply(request_id: String, decision: String) -> Result<(), String> 
         rpc_full(&default_socket(), "feed.reply", params).await
     }
     let mut resp = call(&request_id, &decision).await?;
+    // ★REVIEW1 m4: `owner_gui_required` 도 같은 좁은 창(토큰 회전 경합)에서 난다 — 팀 제안
+    // 해소는 operator token 전용(team_spec::reply_allowed)이라, 첫 호출의 파일 읽기와 데몬
+    // 재시작(토큰 회전)이 겹치면 방금 읽은 토큰이 이미 낡아 이 코드로 떨어진다. 그대로 두면
+    // "팀은 만들었으나 제안 정리 실패" 로만 보여 오너가 재시도 필요성을 모른다(팀 생성 자체는
+    // allocate 가 이미 끝낸 뒤라 이 재시도는 순수 해소 재시도이고, allocate 를 다시 부르지
+    // 않는다 — 멱등 우려 없음).
     if resp["ok"].as_bool() != Some(true)
-        && resp["error"]["code"].as_str() == Some("self_approval_denied")
+        && matches!(
+            resp["error"]["code"].as_str(),
+            Some("self_approval_denied") | Some("owner_gui_required")
+        )
     {
         // 첫 호출의 파일 읽기와 데몬 재시작(토큰 회전)이 겹친 좁은 창 — 신선 재독으로 1회만 재시도.
         resp = call(&request_id, &decision).await?;
@@ -4832,6 +4841,11 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
 ///   ③ **생성 직전 대조** — 기본 데몬 feed.list 에서 같은 id 가 아직 pending 이고 본문이 오너가 본 것과
 ///      같은가(확인 창이 떠 있는 동안 제안이 거둬지거나 바뀌었으면 만들지 않는다 — TOCTOU · fail-closed)
 ///   ④ 인자는 URL-safe b64(ASCII) — 한글이 argv·코드페이지·MSYS 경로 변환을 지나지 않는다.
+///   ⑤ **REVIEW1 M-1 — 팩 버전 어긋남 fail-closed**: 스폰 **전** `dept_tool_supports_team_spec` 으로
+///      설치된 cys-dept 가 이 인자를 아는지 정적 확인(구버전이면 거부) · 스폰 **뒤**
+///      `dept_team_proposal_id(name) == spec.id` 로 레지스트리가 실제로 이 제안으로 등재됐는지
+///      대조(아니면 실패 — 팩이 조용히 "보통 팀"을 만든 것을 성공으로 보고하지 않는다). 표시명
+///      폴백은 이 사후 조건을 통과했을 때만 쓴다.
 ///   실패는 카탈로그 경로와 같은 `dept-create:<code>:` 형식(UI 가 사유를 분류해 보인다).
 ///   feed 응답(allow)은 여기서 하지 않는다 — UI 가 **생성 성공 뒤에만** 보낸다(실패 시 카드 pending 유지).
 #[tauri::command]
@@ -4847,6 +4861,15 @@ async fn allocate_dept_daemon(
                 return Err("dept-create:2:catalog_key 와 team_spec 은 함께 쓸 수 없다".into());
             }
             cys::team_spec::validate(spec).map_err(|e| format!("dept-create:2:{e}"))?;
+            // ★REVIEW1 M-1 ①(스폰 전 능력 확인·fail-closed): 앱과 설치된 팩이 어긋나면(팩이
+            //   구버전) cys-dept 가 `--team-spec-b64` 를 모른 채 인자를 무시하고 rc=0 으로
+            //   "보통 팀"을 만든다 — 팀 소개·셋-부재 번호 보호가 조용히 빠지고 Tauri 가 성공으로
+            //   잘못 읽는다(fail-open). 부작용 0 인 정적 확인으로 여기서 먼저 막는다.
+            dept_tool_supports_team_spec(&dept_tool()).map_err(|e| {
+                format!(
+                    "dept-create:2:팩이 구버전이라 팀 제안을 만들 수 없다({e}) — 앱을 다시 시작해 팩을 갱신하라"
+                )
+            })?;
             let list = rpc("feed.list", json!({"status": null}))
                 .await
                 .map_err(|e| format!("dept-create:1:팀 제안을 확인하지 못했다(기본 데몬 응답 없음): {e}"))?;
@@ -4907,19 +4930,57 @@ async fn allocate_dept_daemon(
         obj.insert("socket".into(), json!(sock.to_string_lossy()));
         obj.insert("socket_slug".into(), json!(sock_slug(&sock)));
         obj.insert("name".into(), json!(name));
-        // ＋부서 자동화: create 경로면 레지스트리(cys-dept reg_set_meta 가 기록)에서 display_name 조회 →
-        // 탭 표시명. create stdout 은 name only(cys-dept 코어 재구현 금지)이므로 depts.json 이 표시명 진실원.
-        if catalog_key.is_some() || team_spec.is_some() {
-            // ★U16: 팀 제안 경로도 cys-dept 가 예약과 같은 원자 기록으로 display_name 을 등재한다 —
-            //   판독 실패 시 오너가 확인 창에서 본 이름으로 대신한다(같은 값).
-            let disp = dept_display_name(&name)
-                .or_else(|| team_spec.as_ref().map(|s| s.display.clone()));
-            if let Some(disp) = disp {
+        if let Some(spec) = &team_spec {
+            // ★REVIEW1 M-1 ②(사후 조건·fail-closed): 레지스트리의 name 항목이 **이** 제안
+            //   (team_proposal_id == spec.id)으로 만들어졌다는 표지가 없으면 실패로 판정한다.
+            //   ①의 정적 확인을 지나쳤더라도(예: 팩이 새 문자열은 갖고 있으나 다른 이유로
+            //   등재를 안 한 경우) 여기서 다시 막는다 — 표시명 폴백은 검증을 통과했을 때만
+            //   쓴다(폴백이 실패를 가리는 것을 반박 M-1 이 지적했다).
+            match dept_team_proposal_id(&name) {
+                Some(tpid) if tpid == spec.id => {
+                    // ★U16: cys-dept 가 예약과 같은 원자 기록으로 display_name 을 등재한다 —
+                    //   판독 실패 시 오너가 확인 창에서 본 이름으로 대신한다(같은 값).
+                    let disp = dept_display_name(&name).unwrap_or_else(|| spec.display.clone());
+                    obj.insert("display_name".into(), json!(disp));
+                }
+                _ => {
+                    return Err(format!(
+                        "dept-create:2:팀 '{name}' 이 이 제안으로 만들어지지 않았다(레지스트리에 team_proposal_id 표지가 없다) — 팩이 구버전일 수 있다. 앱을 다시 시작해 팩을 갱신하라"
+                    ));
+                }
+            }
+        } else if catalog_key.is_some() {
+            // ＋부서 자동화: create 경로면 레지스트리(cys-dept reg_set_meta 가 기록)에서 display_name 조회 →
+            // 탭 표시명. create stdout 은 name only(cys-dept 코어 재구현 금지)이므로 depts.json 이 표시명 진실원.
+            if let Some(disp) = dept_display_name(&name) {
                 obj.insert("display_name".into(), json!(disp));
             }
         }
     }
     Ok(info)
+}
+
+/// ★REVIEW1 M-1 ①: cys-dept 파일이 팀 제안 인자(`--team-spec-b64`)를 아는지 정적으로 확인한다
+/// (부작용 0 · spawn 없음). 구버전 cys-dept 에는 이 리터럴이 없어 인자를 조용히 무시하고
+/// rc=0 으로 "보통 팀"을 만든다(fail-open) — 그 사고를 스폰 이전에 막는 가벼운 결정론 게이트다.
+fn dept_tool_supports_team_spec(tool: &std::path::Path) -> Result<(), String> {
+    let src = std::fs::read_to_string(tool).map_err(|e| format!("cys-dept 판독 실패: {e}"))?;
+    if src.contains("--team-spec-b64") {
+        Ok(())
+    } else {
+        Err("설치된 cys-dept 에 팀 제안 지원(--team-spec-b64)이 없다".into())
+    }
+}
+
+/// ★REVIEW1 M-1 ②: 레지스트리에서 이 부서가 어느 팀 제안(team_proposal_id)으로 만들어졌는지
+/// 조회 — 사후 조건 확인용(dept_display_name 과 같은 판독 규약: 부재는 None).
+fn dept_team_proposal_id(name: &str) -> Option<String> {
+    let v = read_json_or_empty("depts.json", &depts_registry_path(), json!({ "depts": {} })).ok()?;
+    v.get("depts")?
+        .get(name)?
+        .get("team_proposal_id")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// ★D1(2026-09-17 4라운드 · codex 2차 ③ · 부트체인 must_fix B): `cys-dept down`/`down-sock` 의 **결과를 전달**하는 단일 실행기.
@@ -6908,6 +6969,55 @@ mod tests {
         assert!(f.contains("cys::team_spec::to_b64("), "b64 인코더(lib SOT) 우회");
         assert!(!f.contains("feed.reply"), "생성 커맨드가 feed 응답까지 하면 실패 시 카드가 사라진다");
         assert!(f.contains("catalog_key.is_some() || team_spec.is_some()"), "팀 경로 실패 코드 형식(dept-create:) 누락");
+    }
+
+    /// ★REVIEW1 M-1(major): 팩 버전 어긋남 fail-open 수리 배선 핀. 스폰 **전** 능력 확인
+    /// (`dept_tool_supports_team_spec`)과 스폰 **뒤** 사후 조건(`dept_team_proposal_id` ==
+    /// spec.id)이 둘 다 있어야, 구버전 cys-dept 가 `--team-spec-b64` 를 무시하고 rc=0 으로
+    /// "보통 팀"을 만들어도 이 함수가 성공으로 잘못 보고하지 않는다. 표시명 폴백도 사후 조건이
+    /// 통과했을 때만 쓴다(폴백이 실패를 가리는 것을 반박 M-1 이 지적했다).
+    #[test]
+    fn u16_m1_pack_version_skew_checked_before_and_after_spawn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let a = body.find("async fn allocate_dept_daemon(").expect("allocate_dept_daemon 소실");
+        let end = a + body[a..].find("\n}\n").expect("함수 끝");
+        let f = &body[a..end];
+        let sp = f.find("spawn_blocking").expect("spawn 부재");
+        let cap = f
+            .find("dept_tool_supports_team_spec(")
+            .expect("스폰 전 능력 확인 부재(REVIEW1 M-1 ① — 팩이 구버전이면 여기서 막아야 한다)");
+        assert!(cap < sp, "능력 확인이 스폰보다 뒤에 있다 — TOCTOU 로 무의미해진다");
+        let post = f
+            .find("dept_team_proposal_id(")
+            .expect("사후 조건 확인 부재(REVIEW1 M-1 ② — 등재의 team_proposal_id 대조가 없다)");
+        assert!(post > sp, "사후 조건은 스폰 **뒤** 등재를 봐야 하므로 스폰보다 앞이면 안 된다");
+        let post_seg = &f[post..];
+        assert!(post_seg.contains("tpid == spec.id"), "레지스트리 team_proposal_id 를 이 제안 id 와 대조하지 않는다");
+        assert!(
+            post_seg.find("dept_display_name(").map(|i| i < post_seg.find("_ =>").unwrap_or(usize::MAX)).unwrap_or(false),
+            "표시명 판독이 사후 조건 성공 분기 밖(폴백이 실패를 가릴 수 있다)"
+        );
+        assert!(
+            post_seg.contains("dept-create:2:"),
+            "사후 조건 실패가 dept-create: 형식 오류로 UI 에 전달되지 않는다"
+        );
+    }
+
+    /// ★REVIEW1 m4: feed_reply 재시도 조건 배선 핀. 팀 제안 해소는 operator token 전용(team_spec::
+    /// reply_allowed)이라 토큰 회전 경합에서 `self_approval_denied` 대신 `owner_gui_required` 를
+    /// 받는다 — 재시도 조건이 그 코드를 몰라 "팀은 만들었으나 제안 정리 실패"만 뜨던 결함의 수리.
+    #[test]
+    fn u16_m4_feed_reply_retries_owner_gui_required_too() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let a = body.find("async fn feed_reply(").expect("feed_reply 소실");
+        let end = a + body[a..].find("\n}\n").expect("함수 끝");
+        let f = &body[a..end];
+        assert!(f.contains(r#"Some("self_approval_denied")"#), "기존 재시도 사유 소실");
+        assert!(f.contains(r#"Some("owner_gui_required")"#), "owner_gui_required 재시도 사유 부재(REVIEW1 m4)");
     }
 
     /// ★K2-03 배선 핀: 세 판독 지점(list_depts · dept_display_name · read_dept_catalog)이 전부 **단일 판독기**
