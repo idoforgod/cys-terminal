@@ -11171,7 +11171,7 @@ def h_meta_off():
     전부 지우고도 `GREEN — 발효 0 PASS / 0 FAIL / 5 SKIP` · **exit 0** 을 냈다. Skip 문구는
     스스로 "이것은 통과가 아니라 미측정" 이라 말하는데 요약과 종료코드는 통과라고 말한 것이다 —
     이 저장소가 반복해서 낸 사고의 형태를 계측기가 재현한 자리다.
-    이 검체가 그 수리의 **기계 집행자**이며 다섯 축으로 본다:
+    이 검체가 그 수리의 **기계 집행자**이며 여섯 축으로 본다:
       ⓐ 등재소 형태(두 종류 · 중복 0 · `off_switch()` 경유 등재).
       ⓑ 모듈 레벨 env 독취 **전수** == 등재 집합 — 등재 없는 새 스위치가 조용히 생기면 적색.
       ⓒ 판정 배선(소스 핀): `Disabled` 를 `Skip` **보다 먼저** 잡는가 · GREEN 박탈 · exit 2 ·
@@ -11180,6 +11180,7 @@ def h_meta_off():
          끈 런이 `GREEN`·exit 0 인지 잰다(소스 핀만으로는 "쓰여 있다" 밖에 증명하지 못한다).
       ⓔ `--json` stdout 순수 — 실제 오염원 검체를 태워 stdout 이 JSON 한 덩어리인지,
          오염분이 stderr 로 갔는지 잰다.
+      ⓕ `--only` 유령 ID(등재에 없음) → UNMEASURED·exit 2 + unknown_ids 명시(U4 C4-③).
     ★이 검체는 어떤 판정도 완화하지 않는다. 기존 need 를 대체하지 않고 새 축만 추가한다."""
     import inspect
     notes = []
@@ -12819,6 +12820,18 @@ def _u28_runner_lanes(files):
     return lanes
 
 
+def _u28_ghosts(lanes):
+    """`--only` 목록 안의 **유령 ID**(등재에 없음) → [(파일, 정렬된 유령 ID 목록)].
+
+    ★U4 C4-③(2026-09-23): 차집합(등재 − 실행)은 합집합만 보므로 목록 안의 유령 ID 를 원리적으로
+      못 본다 — 커버리지는 그대로이고 실행 0건이 늘 뿐이다. 러너 자신도 유령 ID 를 UNMEASURED(exit 2)
+      로 막지만, 그 적색은 **그 레인이 돌 때**(release.yml 은 태그 시점)에야 뜬다. 이 정적 축은
+      브랜치 전량 레인에서 태그 **전에** 같은 사실을 드러낸다."""
+    all_ids = {sid for sid, _w, _t, _d, _f in _REG}
+    return [(fname, sorted(ids - all_ids)) for fname, kind, ids in lanes
+            if kind == "only" and ids - all_ids]
+
+
 def _u28_uncovered(files):
     """(레인 목록, 어느 레인에서도 돌지 않는 검체 집합, full 레인 파일 목록)."""
     all_ids = {sid for sid, _w, _t, _d, _f in _REG}
@@ -12863,6 +12876,11 @@ def h_ci_cover_1():
          "어느 CI 레인에서도 돌지 않는 검체 %d건: %s%s — '안 도는 검체는 게이트가 아니다'"
          % (len(uncovered), ", ".join(sorted(uncovered)[:12]),
             " …" if len(uncovered) > 12 else ""))
+    ghosts = _u28_ghosts(lanes)
+    need(not ghosts,
+         "`--only` 목록에 등재되지 않은 검체 ID: %s — 그 몫은 아무것도 재지 않는다(러너는 그 레인에서 "
+         "UNMEASURED·exit 2 로 막는다 · 개명·삭제됐다면 호출부 목록을 고쳐라)"
+         % "; ".join("%s: %s" % (f, ", ".join(g)) for f, g in ghosts))
     # ★비용 경계 — 전량 레인은 Windows 러너가 아니어야 한다(트리거 확대 = 예산 폭발).
     need("windows-health.yml" not in fulls,
          "전량 실행이 Windows 실기 레인에 붙었다 — 매 push 마다 windows 러너가 전량을 돈다(예산 위반)")
@@ -12881,7 +12899,7 @@ def h_ci_cover_1():
             _lanes, unc, ful = _u28_uncovered(mutated)
         except Fail:
             return None                     # 적발(해소 불가를 적색으로 낸 경우)
-        return None if (unc or not ful) else label
+        return None if (unc or not ful or _u28_ghosts(_lanes)) else label
 
     full_file = fulls[0]
     mutants = [
@@ -12905,7 +12923,7 @@ def h_ci_cover_1():
     ]
     blind = [b for b in (_blind(lbl, mut) for lbl, mut in mutants) if b]
     need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
-    return ("등재 %d종 · CI 레인 %d개(전량 %s · 부분 %s) · 미실행 0 · 합성 변조 %d종 전건 적발"
+    return ("등재 %d종 · CI 레인 %d개(전량 %s · 부분 %s) · 미실행 0 · 유령 ID 0 · 합성 변조 %d종 전건 적발"
             % (len(_REG), len(lanes), ",".join(fulls),
                ",".join("%s:%d종" % (f, len(i)) for f, k, i in lanes if k != "full") or "없음",
                len(mutants)))
@@ -13225,6 +13243,11 @@ def main(argv=None):
         return 0
 
     only = {s.strip() for s in args.only.split(",") if s.strip()}
+    # ★유령 ID(U4 C4-③ · 2026-09-23): `--only` 에 **등재에 없는** ID 가 있으면 그 몫은 아무것도 재지
+    #   않았다. 종전엔 아래 루프가 그 ID 를 조용히 건너뛰어, 전부 유령이면 0건 실행 GREEN·exit 0 이었다
+    #   (`H-SECRET-1` 개명 = 발행 레인 4곳의 스캐너 생존 메타 검사가 0건 초록). 실재 ID 는 그대로
+    #   실행해 진단 가치를 남기고, 판정만 UNMEASURED(exit 2)로 박탈한다 — '재지 않았다' 계급이다.
+    unknown_ids = sorted(only - {sid for sid, _w, _t, _d, _f in _REG})
     rows = []
     t0 = time.time()
     # ★스위치 상태는 **검체 실행 전에** 스냅샷한다 — 일부 검체가 실행 중 os.environ 을 임시로
@@ -13323,14 +13346,25 @@ def main(argv=None):
         verdict = "UNMEASURED"
     else:
         verdict = "GREEN"
+    # ★유령 ID(U4 C4-③)도 GREEN 을 박탈한다 — 위 분기 문면(H-META-OFF ⓒ 소스 핀)은 그대로 두고
+    #   덧붙인다. 실재 검체가 fail 이면 RED 가 우선이다('틀렸다' 가 '안 쟀다' 보다 강한 신호).
+    if verdict == "GREEN" and unknown_ids:
+        verdict = "UNMEASURED"
     summary = {"verdict": verdict, "landed_waves": list(LANDED_WAVES),
                "pass": len(passed), "fail": len(failed), "skip": len(skipped),
                "disabled": len(disabled), "pending": len(pend), "total": len(rows),
                "off_switches_engaged": [{"kind": k, "env": e, "value": val, "scope": sc}
                                         for k, e, val, sc in engaged],
+               "unknown_ids": unknown_ids,
                "elapsed_secs": round(time.time() - t0, 1),
                "calibration_ref": CALIBRATION_REF}
 
+    if unknown_ids:
+        # stderr 로도 낸다 — `--json` 소비자(CI 판독 블록)는 stdout 을 JSON 으로만 읽고 rc≠0 사유를
+        # 따로 찾지 않으므로, 러너 로그에 이름이 한 줄 남아야 원인이 역추적된다.
+        sys.stderr.write("★--only 에 등재되지 않은 검체 ID %d건: %s — 선택했는데 존재하지 않는 검체는 "
+                         "재지 않은 것이다(UNMEASURED · exit 2). 개명·삭제됐다면 호출부 목록을 고쳐라.\n"
+                         % (len(unknown_ids), ", ".join(unknown_ids)))
     if args.json:
         print(json.dumps({"summary": summary, "specimens": rows}, ensure_ascii=False, indent=1))
     else:
@@ -13347,6 +13381,9 @@ def main(argv=None):
               "미발효 %d PEND · %.1fs (발효 웨이브 %s)"
               % (verdict, len(passed), len(failed), len(skipped), len(disabled), len(pend),
                  summary["elapsed_secs"], ",".join(LANDED_WAVES)))
+        if unknown_ids:
+            print("\n★--only 에 등재되지 않은 검체 ID — 이 결과는 통과가 아니다(exit 2): %s"
+                  % ", ".join(unknown_ids))
         if engaged:
             print("\n★측정 축이 꺼져 있다 — 이 결과는 통과가 아니다(exit 2):")
             for kind, env, val, scope in engaged:
