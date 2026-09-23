@@ -133,10 +133,18 @@ describe("회귀 — 신선한 신호의 종전 3값은 그대로", () => {
 });
 
 describe("U12 — 이름표만 남은 빈 자리는 초록이 아니라 ○빈자리", () => {
-  test("빈 자리(role·agent_alive null·seat empty·무출력 유예 경과) → hollow", () => {
+  test("빈 자리(role·등록 에이전트·agent_alive null·seat empty·무출력 유예 경과) → hollow", () => {
     expect(isHollowSeat(row())).toBe(true);
-    // 역할만 쥔 셸(메타 없음 · 온보딩 CLI 미설치 master 셸)도 '빈 자리' 사실은 같다 — 다만 빨간 점·토스트는 없다(아래 dot 검사).
-    expect(isHollowSeat(row({ agent: null }))).toBe(true);
+    expect(isHollowSeat(row({ agent: "agy", role: "reviewer-gemini" }))).toBe(true);
+  });
+  test("등록 에이전트가 없는 역할 좌석은 판정하지 않는다 — 루트가 셸이 아닌 pane 의 거짓 빈 자리 차단", () => {
+    // `cys new-surface --cmd <watcher> --role cycle-verifier` → zsh -lc 암묵 exec → 루트=워처 · 자손 0 · agent 없음.
+    //   살아 일하는 pane 인데 seat=empty 다. 데몬 응답엔 '루트가 셸인가'가 없으므로 UI 는 이 부류를 빈 자리로 부르지 않는다.
+    expect(isHollowSeat(row({ role: "cycle-verifier", agent: null, idle_secs: 999 }))).toBe(false);
+    // 온보딩 CLI 미설치 master 셸(formation new-surface --role master)도 같은 부류 — 종전 표시(반박 D4).
+    expect(isHollowSeat(row({ agent: null }))).toBe(false);
+    expect(isHollowSeat(row({ agent: "" }))).toBe(false);
+    expect(isHollowSeat(row({ agent: undefined }))).toBe(false); // 구 데몬
   });
   test("진리표 — 한 항이라도 어긋나면 빈 자리가 아니다(종전 동작 유지 · 구 데몬 무해)", () => {
     expect(isHollowSeat(row({ role: null }))).toBe(false); // 역할 없는 '내 자리' 빈 창
@@ -161,7 +169,7 @@ describe("U12 — 이름표만 남은 빈 자리는 초록이 아니라 ○빈�
     expect(s.title).toContain("빈 자리 1");
     expect(s.title).toContain("master");
   });
-  test("빈 자리는 빨간 사망 점이 아니다(온보딩 CLI 미설치 master 셸) — ❌ 와 섞지 않는다", () => {
+  test("빈 자리는 빨간 사망 점이 아니다 — ❌ 와 섞지 않는다(반박 D4·D6)", () => {
     const s = summarizeWsSigs([sig({ hollow: true, agent_alive: null })], NOW);
     expect(s.dot).toBe("hollow");
     expect(s.dead).toBe(0);

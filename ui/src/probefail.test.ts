@@ -97,7 +97,7 @@ describe("U4 A5③ — 승인 자동 전환: feed_list 조회 실패", () => {
   });
   test("재시도 간격은 짧다(유예를 통째로 다시 기다리지 않는다)", () => {
     expect(FEED_LOOKUP_RETRY_MS).toBeGreaterThan(0);
-    expect(FEED_LOOKUP_RETRY_MS).toBeLessThanOrEqual(10_000);
+    expect(FEED_LOOKUP_RETRY_MS).toBeLessThan(10_001);
   });
 });
 
