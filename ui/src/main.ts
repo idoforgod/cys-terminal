@@ -6547,7 +6547,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:split-row", title: "가로 분할", keywords: "split row 분할", action: () => actionSplit("row") },
     { id: "act:split-col", title: "세로 분할", keywords: "split col 분할", action: () => actionSplit("col") },
     { id: "act:close", title: "패널 닫기", keywords: "close 닫기", action: () => actionClose() },
-    { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
+    { id: "act:equalize", title: "역할별 정렬 (대표 1/3)", keywords: "equalize 균등 정렬 layout 대표", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
     { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => { if (daemonActionBlocked()) return; void addDeptWorkspace(); } },

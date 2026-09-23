@@ -25,6 +25,11 @@
 //   ① keepWorkspaceOnRestore  — 본부·부서 **대칭** 판정(소켓 유무로 차별하지 않는다).
 //   ② missingKnownWorkspaces  — 저장본은 '배치 기억'이지 '존재 진실원'이 아니다. 본부와
 //      레지스트리 등재 부서는 저장본에 없어도 탭을 만든다(유실·초기화·GUI 밖 생성까지 덮는다).
+//
+// ★경계(0.14.41 U2·U3): 이 모듈은 **탭의 존재·유령 sid** 만 판정한다. 탭 **안에서** 새 좌석을 어느 칸에
+// 둘지(대표 1/3)와 재부팅 뒤 같은 역할의 새 창을 원래 칸에 다시 넣는 결속(역할 기억·구멍)은 seatlayout.ts
+// 소관이다. 복원 순서: seatlayout.restoreTree(역할 칸 → 구멍) → 여기 deadLiveSids(나머지 죽은 칸 제거) →
+// keepWorkspaceOnRestore → seatlayout.adoptSeat(결속 → 대표 1/3 배치) → seatlayout.anchorHeadSafe(S5).
 // ────────────────────────────────────────────────────────────────────────────
 
 /** 소켓별 live 조회 결과 중 이 판정에 필요한 최소 필드(main.ts 의 liveBySock 값). */
