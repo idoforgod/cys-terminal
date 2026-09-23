@@ -432,6 +432,33 @@ dept_case("K3 --rotate is launch-only (down still denied)",
 # rc 하나로 면제 여부가 읽힌다.
 dept_case("K4 launch denied at the gate before name validation",
           {"CYS_ROLE": "cso", "STUB_OUT": "worker"}, True, 1, args=("launch", "bad name"))
+
+
+# ★성찰 U16-A1(major): 생성 동사(launch·allocate·create)의 거부 문면은 더 이상 CSO 를 가리키지
+#   않는다 — CSO 도구 게이트가 부서 생성 동사를 막아서 그 경로가 죽어 있다(0.14.41 U16 조사 F1).
+#   종료·정리 동사(down 등)는 CSO 가 실제로 집행할 수 있으므로 종전 안내를 그대로 유지한다.
+@case("U16-A1 launch denial points to team-propose/GUI, not CSO")
+def _check_launch_guidance(box):
+    box.configure(CYS_ROLE="cso", STUB_OUT="worker")
+    result = box.run(["/bin/bash", str(DEPT), "launch", "bad name"])
+    equal(result.returncode, 7, f"launch 거부; stderr={result.stderr!r}")
+    equal("team-propose" in result.stderr, True,
+          "생성 동사는 team-propose 안내를 포함해야 한다")
+    equal("전문가용" in result.stderr, True,
+          "생성 동사는 오너 GUI 전문가용 경로도 안내해야 한다")
+    equal("CSO에 요청하라" in result.stderr, False,
+          "생성 동사는 죽은 CSO 경로를 더 이상 안내하지 않는다")
+
+
+@case("U16-A1 down denial keeps CSO guidance unchanged")
+def _check_down_guidance(box):
+    box.configure(CYS_ROLE="cso", STUB_OUT="worker")
+    result = box.run(["/bin/bash", str(DEPT), "down", "some-dept"])
+    equal(result.returncode, 7, f"down 거부; stderr={result.stderr!r}")
+    equal("CSO에 요청하라" in result.stderr, True,
+          "종료·정리 동사는 CSO 안내를 그대로 유지해야 한다(CSO 가 실제로 집행 가능)")
+
+
 def _register_bad_name(box):
     """`bad name` 을 레지스트리에 심는다 — R2 부터 면제는 **등재된 부서**에만 선다."""
     box.registry.write_text('{"depts":{"bad name":{}}}', encoding="utf-8")

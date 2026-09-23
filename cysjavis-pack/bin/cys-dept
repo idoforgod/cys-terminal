@@ -1563,15 +1563,19 @@ cysd_resolved_role() {   # stdout: "<역할>\t<출처>" · 실패해도 항상 r
 # ★종전 env 절(무변경) — **데몬 권위가 없을 때만** 도달한다(I5 수렴). 종전에는 이 절이
 #   `cysd_role_gate` 보다 **앞**에 있어서 stale `CYS_ROLE=worker` 하나로 데몬에게 묻지도 못하고
 #   죽었다(판정관 T3g: `surface-role` 조회 0회). 정본 §8 이 겨냥한 그 길이다.
-cysd_env_clause() {   # $1=안내 문구 접두
+cysd_env_clause() {   # $1=안내 문구 접두 $2=안내 문장(생략 시 'CSO에 요청하라.' — 종전 문면 그대로)
+  # ★성찰 U16-A1: $2 는 새 선택 인자다 — 부재 호출(구 caller·직접 테스트)은 종전과 바이트 동일한
+  #   'CSO에 요청하라.' 로 떨어진다(허용 추가뿐, 기존 CSO 경로 무변경).
+  _cec_guidance="${2:-CSO에 요청하라.}"
   if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
-    echo "[cys-dept] ★단일소유 강제: $1(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
+    echo "[cys-dept] ★단일소유 강제: $1(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). ${_cec_guidance}" >&2
     exit 7
   fi
   return 0
 }
 
-cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, 없으면 종전 env 절로 강등한다.
+cysd_role_gate() {   # $1=안내 문구 접두 $2=안내 문장(생략 시 CSO 안내). 데몬 권위가 결정하고, 없으면 종전 env 절로 강등한다.
+  _crg_guidance="${2:-CSO에 요청하라.}"
   # ★rotate 재귀 재기동(`launch <name> --rotate` · 소켓 부재)은 **데몬 절만** 면제한다: 그 시점은
   #   이미 데몬을 죽인 뒤라 여기서 거절하면 '데몬은 죽고 등재만 남는' 반파괴가 된다 — 이 파일이
   #   validate_dept_name 을 kill **이전**에 두는 것과 같은 규율. 표식은 argv 라 상속되지 않는다
@@ -1591,7 +1595,7 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
     _cdrg_role="${_cdrg_out%%	*}"
     _cdrg_src="${_cdrg_out#*	}"
     if [ "$_cdrg_src" = "daemon" ] && [ "$_cdrg_role" = "cso" ]; then return 0; fi
-    cysd_env_clause "$1"
+    cysd_env_clause "$1" "${2:-}"
     return 0
   fi
   _cdrg_out="$(cysd_resolved_role)" || _cdrg_out=""
@@ -1602,14 +1606,14 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
     daemon)
       # ★I5: 데몬이 **방금** cso 라고 답했다 → stale env 를 이긴다(env 절을 건너뛴다).
       [ "$_cdrg_role" = "cso" ] && return 0
-      echo "[cys-dept] ★단일소유 강제: $1 — 데몬 권위 역할=$_cdrg_role (env 가 아니라 데몬이 신원의 정본이다·plan §8). CSO에 요청하라." >&2
+      echo "[cys-dept] ★단일소유 강제: $1 — 데몬 권위 역할=$_cdrg_role (env 가 아니라 데몬이 신원의 정본이다·plan §8). ${_crg_guidance}" >&2
       exit 7 ;;
     cache)
       # 캐시는 **거부 방향으로만** 권위다. 통과가 필요하면 `cysd_resolved_role` 이 이미
       # `--no-cache` 로 직접 확인을 시도했고 그래도 캐시면 데몬이 답하지 못한 것이다 →
       # 종전 env 절로 강등한다(새 허용 없음 · 거부 방향).
-      [ "$_cdrg_role" = "cso" ] && { cysd_env_clause "$1"; return 0; }
-      echo "[cys-dept] ★단일소유 강제: $1 — 데몬 권위 역할=$_cdrg_role (env 가 아니라 데몬이 신원의 정본이다·plan §8). CSO에 요청하라." >&2
+      [ "$_cdrg_role" = "cso" ] && { cysd_env_clause "$1" "${2:-}"; return 0; }
+      echo "[cys-dept] ★단일소유 강제: $1 — 데몬 권위 역할=$_cdrg_role (env 가 아니라 데몬이 신원의 정본이다·plan §8). ${_crg_guidance}" >&2
       exit 7 ;;
     daemon-none|cache-none)
       # env 가 비었으면 GUI·오너 직접 실행(종전 면제 그대로)이고, env 가 역할을 주장하는데
@@ -1620,7 +1624,7 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
       #   되는 명령을 권하지 않는다: 실제 id 를 지목하거나 CONTRACTS §C 의 `reclaim-role --auto` 를 쓴다.
       echo "[cys-dept] ★단일소유 강제: $1 — 데몬이 이 좌석의 역할을 모른다(CYS_ROLE=$CYS_ROLE · CYS_SURFACE_ID=${CYS_SURFACE_ID:-없음} 는 stale — 데몬 목록에 없는 신원). 복구: \`cys reclaim-role --auto\` 또는 \`cys claim-role cso --surface <cys list 로 확인한 실제 id>\` (--surface 없는 claim-role 은 같은 stale 신원을 다시 쓴다)." >&2
       exit 7 ;;
-    *) cysd_env_clause "$1"; return 0 ;;   # 판정 불가·주소 없음·프리루드 부재 → 종전 env 판정만
+    *) cysd_env_clause "$1" "${2:-}"; return 0 ;;   # 판정 불가·주소 없음·프리루드 부재 → 종전 env 판정만
   esac
 }
 
@@ -1629,7 +1633,14 @@ cysd_role_gate() {   # $1=안내 문구 접두. 데몬 권위가 결정하고, �
 #   (SessionStart 는 부모 env 를 못 고친다) lifecycle 경로를 **영구히** 못 썼다(판정관 T3g).
 #   게이트는 데몬 권위가 있으면 그것으로 결정하고, 없으면 `cysd_env_clause` 로 강등한다.
 case "$cmd" in
-  launch|allocate|create|down|down-sock|rotate|reap|promote-ceo)
+  launch|allocate|create)
+    # ★성찰 U16-A1(major): 생성 동사는 CSO 가 만들 수 없다(부서 생성 동사는 CSO 도구 게이트가 막는다
+    #   — 0.14.41 U16 조사 F1). '종전 CSO에 요청하라' 안내는 대표에게 죽은 경로를 가리켰다.
+    #   실제 생성 경로 둘(본부 대표 `cys team-propose` · 오너 GUI 전문가용 › 팀 직접 만들기)로 교체.
+    cysd_role_gate "부서 생성은 CSO/GUI 전용" \
+      "cys team-propose(본부 대표) 또는 오너 GUI 전문가용 › 팀 직접 만들기를 이용하라." ;;
+  down|down-sock|rotate|reap|promote-ceo)
+    # 종료·정리·회전·승격은 CSO 안내를 그대로 유지한다(생성과 달리 CSO 가 실제로 집행할 수 있다).
     cysd_role_gate "부서 lifecycle mutation은 CSO/GUI 전용" ;;
   promote-if-pending)
     # --request-only는 무변조(조건 확인+알림 재발행뿐)라 가드 면제 — 부트 스크립트 ⑦(master 세션)이
