@@ -5140,7 +5140,9 @@ fn run_team_propose(
     };
     let sid = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
     match request("feed.push", cys::team_spec::push_params(&spec, sid)) {
-        Ok(r) if r["team_gate"].as_u64() == Some(1) => {
+        // ★REVIEW1 m1(b): 판정은 lib 공용 순수 함수(team_gate_ok) — cysd team_gate_tests.rs 가
+        // 실제 데몬 응답 모양으로 이 함수를 대조하므로, 표지가 응답에서 빠지는 회귀는 거기서 잡힌다.
+        Ok(r) if cys::team_spec::team_gate_ok(&r) => {
             println!("{}", spec.id);
             println!("팀 만들기 제안 등록: '{}' ({})", spec.display, spec.id);
             println!("오너에게 1줄로 알려라: \"제어 센터 승인 탭의 '팀 만들기 제안' 카드에서 [확인 창 열기] → [만들기]를 눌러 주세요.\"");

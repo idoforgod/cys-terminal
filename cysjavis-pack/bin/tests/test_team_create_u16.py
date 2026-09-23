@@ -46,6 +46,7 @@ DEPT = os.path.join(BIN, "cys-dept")
 HOOK = os.path.join(PACK_SRC, "hooks", "session-start.sh")
 LIB = os.path.join(PACK_SRC, "hooks", "_lib.sh")
 TEAM_SPEC_RS = os.path.join(REPO, "src", "team_spec.rs")
+TEAMPROPOSAL_TS = os.path.join(REPO, "ui", "src", "teamproposal.ts")
 
 # 로컬 오버레이 필터(session-start.sh)와 같은 권위어 집합 — C 절이 Rust SOT 와 대조한다.
 FORBIDDEN = ["denylist", "deny list", "recovery", "kill-switch", "killswitch", "kill switch",
@@ -205,6 +206,12 @@ class A2Malformed(DeptBase):
             dict(good_spec(), purpose="가" * 2001),
             dict(good_spec(), purpose="일\u0000"),
             {"v": 1, "id": "tp-x-0001", "display": "팀"},  # purpose 누락
+            # ★REVIEW1 m1(c): 보이지 않는 서식·양방향 제어 문자 — 확인 창 스푸핑(Trojan-source) 차단.
+            dict(good_spec(), display="팀‮둘"),  # RLO(U+202E) — 화면에서 순서가 뒤집혀 보인다
+            dict(good_spec(), display="팀​둘"),  # ZERO WIDTH SPACE(U+200B) — 눈에 안 보이는 글자 삽입
+            # ★REVIEW1 m3: U+2028/U+2029(Zl/Zp) — Cc 가 아니라서 "줄바꿈 금지"를 우회하던 통로.
+            dict(good_spec(), display="팀 둘"),
+            dict(good_spec(), display="팀 둘"),
         ]
         for obj in bad:
             with self.subTest(obj=str(obj)[:60]):
@@ -449,6 +456,41 @@ class C1RustParity(unittest.TestCase):
         self.assertIn("40", dept)
         self.assertRegex(dept, r"len\(disp\)\s*>\s*40|len\(disp\)<=40|<=\s*40")
         self.assertRegex(dept, r"2000")
+
+    def test_invisible_char_ranges_match_across_rust_ts_python(self):
+        """★REVIEW1 m3: Rust INVISIBLE · ui/teamproposal.ts INVISIBLE · cys-dept INVIS 의 코드포인트
+        범위 집합이 셋 다 같은가 — U+2028/U+2029 추가가 한 곳만 됐다면 이 대조가 잡는다."""
+        rs = _read(TEAM_SPEC_RS)
+        m = re.search(r"const INVISIBLE: &\[\(char, char\)\] = &\[(.*?)\];", rs, re.S)
+        self.assertIsNotNone(m, "Rust INVISIBLE 상수 부재")
+        rust_ranges = sorted(
+            (int(a, 16), int(b, 16))
+            for a, b in re.findall(r"\('\\u\{([0-9A-Fa-f]+)\}', '\\u\{([0-9A-Fa-f]+)\}'\)", m.group(1))
+        )
+        self.assertTrue(rust_ranges, "Rust INVISIBLE 범위 파싱 실패")
+
+        dept = _read(DEPT)
+        m = re.search(r"INVIS = \((.*?)\)\n", dept, re.S)
+        self.assertIsNotNone(m, "cys-dept INVIS 튜플 부재")
+        py_ranges = sorted(
+            (int(a, 16), int(b, 16))
+            for a, b in re.findall(r"\(0x([0-9A-Fa-f]+), 0x([0-9A-Fa-f]+)\)", m.group(1))
+        )
+        self.assertEqual(py_ranges, rust_ranges, "cys-dept INVIS 범위가 Rust SOT 와 갈렸다")
+
+        ts = _read(TEAMPROPOSAL_TS)
+        m = re.search(r"const INVISIBLE = /\[(.*?)\]/;", ts)
+        self.assertIsNotNone(m, "teamproposal.ts INVISIBLE 정규식 부재")
+        body = m.group(1)
+        self.assertNotRegex(body, r"[^\x00-\x7f]", "INVISIBLE 정규식에 이스케이프 아닌 리터럴 문자가 남았다(REVIEW1 m2)")
+        toks = re.findall(r"\\u([0-9A-Fa-f]{4})(?:-\\u([0-9A-Fa-f]{4}))?", body)
+        ts_ranges = sorted((int(a, 16), int(b, 16) if b else int(a, 16)) for a, b in toks)
+        self.assertEqual(ts_ranges, rust_ranges, "teamproposal.ts INVISIBLE 범위가 Rust SOT 와 갈렸다")
+        for lo, hi in rust_ranges:
+            if lo <= 0x2028 <= hi and lo <= 0x2029 <= hi:
+                break
+        else:
+            self.fail("U+2028/U+2029 가 Rust SOT 범위에 없다(REVIEW1 m3 미반영)")
 
 
 if __name__ == "__main__":

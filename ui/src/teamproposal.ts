@@ -25,7 +25,10 @@ export interface TeamSpec {
 export type TeamParse = { ok: true; spec: TeamSpec } | { ok: false; reason: string };
 
 // Rust INVISIBLE 과 같은 집합 — 보이지 않는 서식·양방향 제어(확인 창 스푸핑 차단).
-const INVISIBLE = /[​-‏‪-‮⁠-⁤⁦-⁩﻿]/;
+// ★REVIEW1 m2: 리터럴 양방향 제어·BOM 문자 대신 \u 이스케이프로 적는다(Trojan-source 위생 —
+// 바로 아래 CONTROL 과 같은 관례). ★REVIEW1 m3: U+2028/U+2029(Zl/Zp — "줄바꿈 금지" 우회 통로,
+// Rust team_spec.rs 와 parity)도 넣는다.
+const INVISIBLE = /[\u200b-\u200f\u2028-\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 // Rust char::is_control() = 일반 범주 Cc(U+0000–001F · U+007F–009F).
 const CONTROL = /[\u0000-\u001F\u007F-\u009F]/;
 const CONTROL_EXCEPT_NL_TAB = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;

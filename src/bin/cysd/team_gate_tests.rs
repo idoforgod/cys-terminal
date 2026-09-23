@@ -43,6 +43,18 @@ fn tmp_daemon(tag: &str, dept_lane: bool) -> Arc<Daemon> {
     Daemon::new(sock)
 }
 
+/// ★REVIEW1 m1(a): `tmp_daemon` 과 같지만 `CYS_APPROVE_AUTO_ROUTE=1` 로 Config 를 캡처한다
+/// (Config::from_env 는 Daemon::new 안에서 한 번만 읽으므로 생성 **전**에 세워야 한다).
+/// env 변수는 전역이라 `governance::PACK_ENV_LOCK`(handlers.rs 의 w3 계열 테스트와 같은 락)으로
+/// 감싸 병행 테스트와의 경합을 막는다.
+fn tmp_daemon_auto_route_on(tag: &str, dept_lane: bool) -> Arc<Daemon> {
+    let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("CYS_APPROVE_AUTO_ROUTE", "1");
+    let d = tmp_daemon(tag, dept_lane);
+    std::env::remove_var("CYS_APPROVE_AUTO_ROUTE"); // config 캡처 후 즉시 정리
+    d
+}
+
 /// 역할을 가진 좌석 1개 + 그 좌석에 귀속되는 synthetic 발신 pid.
 fn seat(daemon: &Arc<Daemon>, role: &str, pid: u32) -> u64 {
     let s = daemon
@@ -121,6 +133,37 @@ fn u16_base_master_can_propose_and_tier_is_pinned_d() {
     let it = items.iter().find(|i| i.request_id == "tp-ok-1").expect("항목");
     assert_eq!(it.tier.as_deref(), Some("d"), "팀 제안의 tier 는 데몬이 d 로 고정해야 한다(원격 미러 금지)");
     assert!(!it.auto_route, "팀 제안은 CEO 자동결재 대상이 아니다");
+    assert_eq!(it.status, "pending");
+}
+
+/// ★REVIEW1 m1(a): 위 테스트(`…tier_is_pinned_d`)의 `assert!(!it.auto_route)` 는 테스트 데몬이
+/// `approve_auto_route` 기본 OFF 라 공허하다(그 게이트 자체가 이미 auto_route 를 false 로 만든다 —
+/// handlers.rs `auto_route = !team_proposal && daemon.config.approve_auto_route && …`에서
+/// `!team_proposal` 항 두 곳(M-E 뮤테이션)을 지워도 이 조건이 여전히 OFF 로 막혀 안 걸린다).
+/// 여기서는 **flag ON + AutoEligible 서술 + 발행자 귀속**까지 셋을 전부 참으로 만들어, 남은
+/// 변수가 `team_proposal` 배제 그 자체뿐인 상태에서 대조한다 — `!team_proposal` 이 없으면
+/// 이 테스트가 반드시 깨진다.
+#[test]
+fn u16_team_proposal_excluded_from_ceo_auto_route_even_when_flag_on() {
+    let d = tmp_daemon_auto_route_on("autoon", false);
+    seat(&d, "master", 710_005);
+    // approval_risk::AUTO_MARKERS 의 "학습추천" — title_for(spec) 가 아니라 body(JSON 원문)에
+    // 실려 derive_risk 가 AutoEligible 로 분류한다(정규화는 공백·중점만 벗기고 한글은 보존).
+    let r = push(
+        &d,
+        Some(710_005),
+        "tp-auto-1",
+        &body("tp-auto-1", "학습팀", "학습추천 콘텐츠를 만든다"),
+        json!({}),
+    );
+    assert_eq!(r["ok"], json!(true), "본부 master 의 정상 제안이 거부됐다: {r}");
+    let items = d.feed_items.lock().unwrap();
+    let it = items.iter().find(|i| i.request_id == "tp-auto-1").expect("항목");
+    assert_eq!(it.risk_class.as_deref(), Some("auto"), "AutoEligible 서술이 auto 로 안 분류됐다(계측 무효)");
+    assert!(
+        !it.auto_route,
+        "flag ON + AutoEligible 인데도 team_proposal 은 CEO 자동결재 대상이면 안 된다(M-E 뮤테이션 생존 지점)"
+    );
     assert_eq!(it.status, "pending");
 }
 
@@ -277,4 +320,37 @@ fn u16_other_kinds_unaffected() {
     assert_eq!(x["ok"], json!(true), "다른 좌석의 일반 승인 흐름이 깨졌다: {x}");
     let items = d.feed_items.lock().unwrap();
     assert_eq!(items.iter().find(|i| i.request_id == "p-1").unwrap().tier.as_deref(), Some("c"));
+}
+
+/// ★REVIEW1 m1(b): CLI(`cys team-propose`)가 부르는 `cys::team_spec::team_gate_ok` 를 **실제
+/// 데몬 응답 모양**(이 파일의 `dispatch` 경로 — handlers.rs feed.push 가 만드는 그 JSON)과
+/// 맞대 본다. `src/bin/cys.rs` 의 `rpc_roundtrip` 은 `resp["result"]` 를 벗겨 돌려주므로,
+/// CLI 가 실제로 보는 것은 `["result"]` 안쪽이다 — 그 껍질을 그대로 재현한다. handlers.rs 가
+/// `team_gate: 1` 표지를 빠뜨리는 회귀(뮤테이션 M-G)가 나면 이 테스트가 깨진다(종전에는
+/// `cys.rs` 쪽 파싱 테스트만 있어 이 표지 자체를 잰 적이 없었다 — REVIEW1 뮤테이션 생존).
+#[test]
+fn u16_daemon_response_shape_satisfies_cli_team_gate_ok() {
+    let d = tmp_daemon("gate-shape", false);
+    seat(&d, "master", 710_050);
+    let r = push(&d, Some(710_050), "tp-shape-1", &body("tp-shape-1", "팀", "일"), json!({}));
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert!(
+        cys::team_spec::team_gate_ok(&r["result"]),
+        "실제 데몬 응답이 CLI 의 team_gate_ok 를 통과 못 한다(표지 소실): {r}"
+    );
+    // 대조군: kind 가 team-create-request 가 아니면 이 표지가 없다(다른 kind 무변경 확인).
+    let worker = 710_051;
+    seat(&d, "worker", worker);
+    let req = Request {
+        id: json!(9),
+        method: "feed.push".into(),
+        params: json!({"kind": "permission", "title": "t", "body": "b", "request_id": "p-shape-1",
+                       "wait": false, "tier": "c"}),
+    };
+    let Reply::Single(other) = dispatch(&d, req, Some(worker)) else { panic!("single") };
+    assert_eq!(other["ok"], json!(true), "{other}");
+    assert!(
+        !cys::team_spec::team_gate_ok(&other["result"]),
+        "team-create-request 가 아닌 kind 에도 team_gate 표지가 붙었다: {other}"
+    );
 }

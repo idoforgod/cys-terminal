@@ -1715,7 +1715,10 @@ if d.get("v") != 1 or isinstance(d.get("v"), bool): die("스키마 버전 1 아�
 i, disp, purp = d.get("id"), d.get("display"), d.get("purpose")
 if not all(isinstance(x, str) for x in (i, disp, purp)): die("id·display·purpose 는 문자열")
 if not re.fullmatch(r"tp-[A-Za-z0-9_\-]{1,61}", i): die("제안 id 형식")
-INVIS = ((0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF))
+# ★REVIEW1 m3: (0x2028, 0x2029) = U+2028/U+2029(Zl/Zp) — unicodedata.category() 가 "Cc" 가
+# 아니라서 아래 bad() 의 Cc 검사만으로는 안 잡힌다("이름에 줄바꿈 금지" 우회 통로). Rust
+# team_spec.rs INVISIBLE·teamproposal.ts INVISIBLE 과 parity.
+INVIS = ((0x200B, 0x200F), (0x2028, 0x2029), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF))
 def bad(c, nl):
     o = ord(c)
     if any(a <= o <= z for a, z in INVIS): return True

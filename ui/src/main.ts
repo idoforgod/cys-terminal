@@ -4484,7 +4484,11 @@ async function addWorkspace(): Promise<Workspace> {
 // ★U16(0.14.41): teamSpec = 오너가 팀 제안 확인 창에서 [만들기]를 누른 팀(이름·하는 일). 새 생성 경로가
 //   아니라 같은 allocate_dept_daemon 에 인자 하나를 더한다(Tauri 가 feed 대조·검증 후 cys-dept allocate
 //   --team-spec-b64). 호출처는 runTeamProposalFlow 하나(teamproposal.test.ts 배선 핀).
-async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promise<Workspace> {
+// ★REVIEW1 m5: 반환이 `null` 이면 "placeholder 탭이 생성 도중 닫혀 새 데몬을 회수했다"는 뜻
+// (아래 "탭 ×로 닫혔으면" 분기) — 팀이 안 만들어진 게 아니라 오너가 스스로 취소한 경우지만,
+// 호출측(runTeamProposalFlow)이 이 경우까지 성공("✅ 팀을 만들었습니다")으로 알리고 feed_reply
+// allow 를 보내면 사실과 다른 카드 소각이 된다.
+async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promise<Workspace | null> {
   // ★A4(성찰 확정): 이 경로는 **새 부서 cysd 를 spawn** 한다(allocate_dept_daemon→cys-dept launch) —
   // 리셋 진행/완료 중이면 격리 게이트를 Err 로 만들어 리셋을 반토막 내거나, 격리로 옮겨지는
   // ~/.cys·state 밑에 레지스트리를 재생성한다. 그래서 **모든 호출부가 daemonActionBlocked()로
@@ -4516,7 +4520,10 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
       //   실패한 데몬은 등재된 채 살아 있으므로 다음 시작의 레지스트리 대조(missingKnownWorkspaces)가 탭으로 되살려
       //   보이게 한다(조용히 사라지는 경로가 아니다).
       if (!dup && info.socket) await invoke("stop_dept_daemon_by_socket", { socket: info.socket }).catch(() => {});
-      return dup ?? ws;
+      // ★REVIEW1 m5: dup(다른 탭이 같은 소켓을 이미 물고 있음)이면 그 탭을 진짜 결과로 돌려주고,
+      // 아니면(방금 만든 데몬을 여기서 회수했다) null 로 "회수됨"을 알린다 — 종전에는 지워진
+      // placeholder(ws)를 그대로 돌려줘 호출측이 성공과 구분할 수 없었다.
+      return dup ?? null;
     }
     if (dup) {
       const pi = workspaces.indexOf(ws);
@@ -4594,10 +4601,17 @@ async function runTeamProposalFlow(item: FeedItem): Promise<void> {
       deptBtn.disabled = true; // ＋부서 경로와 동시 생성 차단(표시 겸용 · 가드 본체는 teamProposalInFlight)
       lockedDeptBtn = true;
     }
+    let created: Workspace | null;
     try {
-      await addDeptWorkspace(undefined, parsed.spec);
+      created = await addDeptWorkspace(undefined, parsed.spec);
     } catch (e) {
       toast("health", "팀 만들기 실패 — 제안은 그대로 남아 있습니다", teamCreateErrorText(e));
+      return;
+    }
+    if (!created) {
+      // ★REVIEW1 m5: 생성 도중 placeholder 탭을 닫아 새 데몬을 회수한 경우 — allow 를 보내지
+      // 않는다(카드는 pending 유지). 다시 열면 addDeptWorkspace 의 멱등 경로가 같은 팀을 돌려준다.
+      toast("health", "팀 만들기 취소됨", "생성 중 탭을 닫아 되돌렸습니다 — 제안은 그대로 남아 있습니다(카드에서 다시 여세요).");
       return;
     }
     try {
@@ -5144,6 +5158,11 @@ function feedReplyErrorText(e: unknown): string {
   const s = String(e);
   if (s.includes("self_approval_denied"))
     return "자기승인 차단(§3.2) — 발행자와 같은 프로세스의 승인은 거부됩니다. 데몬이 구버전이면 업데이트 후 다시 시도하세요.";
+  // ★REVIEW1 m4: operator token 회전 경합(팩 재시작 등)에서 나는 코드 — Tauri 가 1회 재시도해도
+  // 좁은 창을 못 넘기면 여기로 온다. 팀 제안처럼 "앱에서만 처리할 수 있는 항목"이면 재클릭이
+  // 새 토큰으로 다시 붙는다(allocate 는 멱등이라 팀이 이미 만들어졌어도 다시 만들지 않는다).
+  if (s.includes("owner_gui_required"))
+    return "앱에서만 처리할 수 있는 항목입니다 — 다시 눌러 주세요(데몬 토큰이 막 바뀌었을 수 있습니다).";
   if (s.includes("not_found")) return "항목을 찾을 수 없습니다(만료·삭제되었을 수 있음).";
   if (s.includes("already resolved")) return "이미 처리된 항목입니다.";
   return `전송 오류: ${s}`;

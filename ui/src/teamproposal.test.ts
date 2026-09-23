@@ -41,6 +41,10 @@ describe("parseTeamProposal — 데몬 본문 스키마(v1)의 UI 쪽 재검증"
       { ...good, display: "" },
       { ...good, display: "가".repeat(TEAM_DISPLAY_MAX + 1) },
       { ...good, display: "팀\n둘" },
+      { ...good, display: "팀\u202e둘" }, // REVIEW1 m1(c) invisible: RLO reorders on screen
+      { ...good, display: "팀\u200b둘" }, // REVIEW1 m1(c) invisible: zero width space
+      { ...good, display: "팀\u2028둘" }, // REVIEW1 m3: U+2028 line separator (Zl, bypassed old CONTROL-only check)
+      { ...good, display: "팀\u2029둘" }, // REVIEW1 m3: U+2029 paragraph separator (Zp)
       { ...good, display: " 앞공백" },
       { ...good, purpose: "" },
       { ...good, purpose: "가".repeat(TEAM_PURPOSE_MAX + 1) },
@@ -157,6 +161,18 @@ describe("main.ts 배선 핀", () => {
     expect(seg).toContain('decision: "deny"');
     expect(seg).toContain("runTeamProposalFlow(");
     expect(seg).not.toContain('"Allow"');
+  });
+
+  test("REVIEW1 m5: 생성 도중 탭을 닫아 회수됐으면(addDeptWorkspace→null) allow 를 보내지 않는다", () => {
+    const a = fnBody("addDeptWorkspace");
+    expect(a).toContain("return dup ?? null");
+    const f = fnBody("runTeamProposalFlow");
+    const chk = f.indexOf("if (!created)");
+    const y = f.indexOf('decision: "allow"');
+    expect(chk).toBeGreaterThan(0);
+    expect(y).toBeGreaterThan(chk);
+    const guardSeg = f.slice(chk, f.indexOf("\n    }", chk));
+    expect(guardSeg).toContain("return");
   });
 
   test("자동 팝업 없음: feed.item.created 경로는 확인 창을 열지 않는다", () => {

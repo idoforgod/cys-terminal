@@ -74,8 +74,11 @@ pub const FORBIDDEN_TERMS: &[&str] = &[
 
 /// 보이지 않는 서식·양방향 제어 문자 — 확인 창에서 '원문 그대로'를 보여도 눈에 보이는 순서·
 /// 내용이 실제와 달라질 수 있어(스푸핑) 받지 않는다. UI 사본(`teamproposal.ts`)과 같은 집합.
+/// ★REVIEW1 m3: U+2028(LINE SEPARATOR)·U+2029(PARAGRAPH SEPARATOR)도 넣는다 — 이 둘은 일반
+/// 범주 Zl/Zp 라 `char::is_control()`(Cc 만) 로는 안 잡혀 "이름에 줄바꿈 금지" 규칙을 우회했다.
 const INVISIBLE: &[(char, char)] = &[
     ('\u{200B}', '\u{200F}'),
+    ('\u{2028}', '\u{2029}'),
     ('\u{202A}', '\u{202E}'),
     ('\u{2060}', '\u{2064}'),
     ('\u{2066}', '\u{2069}'),
@@ -254,6 +257,15 @@ pub fn push_params(spec: &TeamSpec, surface_id: Option<u64>) -> Value {
     })
 }
 
+/// ★REVIEW1 m1(b): `cys team-propose` 의 데몬 스큐 판정을 CLI 파일에서 떼어 낸 순수 함수 —
+/// `feed.push` 응답에 이 잠금을 아는 데몬만 붙이는 `team_gate: 1` 표지가 있는지 본다. 표지가
+/// 없으면 이 데몬은 잠금을 모르는 구버전이고, 호출측은 스스로 제안을 거둬야 한다(fail-closed).
+/// 이 함수를 CLI(`src/bin/cys.rs`)와 테스트(`cysd` 쪽 `team_gate_tests.rs`)가 같이 부른다 —
+/// 한쪽만 부르면 표지가 응답에서 빠지는 회귀(뮤테이션 M-G)를 CLI 파싱 테스트만으로는 못 잡는다.
+pub fn team_gate_ok(response: &Value) -> bool {
+    response["team_gate"].as_u64() == Some(1)
+}
+
 /// ① 제안자 판정 — 본부(base) 레인 데몬 ∧ 발행 좌석 역할 = `master`.
 pub fn publisher_ok(is_dept_lane: bool, publisher_role: Option<&str>) -> Result<(), String> {
     if is_dept_lane {
@@ -368,6 +380,8 @@ mod tests {
         assert!(validate_display(" 팀").is_err());
         assert!(validate_display("팀\n둘").is_err());
         assert!(validate_display("팀\u{202E}둘").is_err(), "양방향 제어(스푸핑)");
+        assert!(validate_display("팀\u{2028}둘").is_err(), "U+2028(Zl) — REVIEW1 m3: 줄바꿈 금지 우회 통로였다(Cc 아님)");
+        assert!(validate_display("팀\u{2029}둘").is_err(), "U+2029(Zp) — REVIEW1 m3");
         assert!(validate_purpose(&"가".repeat(PURPOSE_MAX_CHARS)).is_ok());
         assert!(validate_purpose(&"가".repeat(PURPOSE_MAX_CHARS + 1)).is_err());
         assert!(validate_purpose("줄1\n\t줄2").is_ok());
@@ -447,5 +461,16 @@ mod tests {
         assert!(match_pending(&list("pending", to_body(&other)), &s).is_err(), "내용 변경");
         assert!(match_pending(&json!({"items": []}), &s).is_err(), "항목 없음");
         assert!(match_pending(&json!({}), &s).is_err(), "목록 판독 불가");
+    }
+
+    /// ★REVIEW1 m1(b): CLI(`cys team-propose`)가 부르는 판정의 lib 쪽 단위 대조.
+    #[test]
+    fn team_gate_ok_reads_the_marker() {
+        assert!(team_gate_ok(&json!({"team_gate": 1, "request_id": "tp-1", "status": "pending"})));
+        assert!(!team_gate_ok(&json!({"request_id": "tp-1", "status": "pending"})), "표지 없음(구 데몬)");
+        assert!(!team_gate_ok(&json!({"team_gate": 0})), "표지 값이 1 이 아니다");
+        assert!(!team_gate_ok(&json!({"team_gate": "1"})), "표지가 숫자가 아니다(문자열 위장)");
+        assert!(!team_gate_ok(&json!({})), "빈 응답");
+        assert!(!team_gate_ok(&json!(null)), "null 응답");
     }
 }
