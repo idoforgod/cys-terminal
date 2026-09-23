@@ -417,7 +417,10 @@ def _base_env(extra=None, drop=()):
               #   `CYS_U26_OFF` 와 같은 계열의 구멍이다. 검체가 이 축을 시험할 때는 `extra` 로
               #   **명시 주입**하므로(strip 은 extra 적용 **전**이다) 그 경로는 영향받지 않는다.
               "CYS_BOOT_GATES", "CYS_GATE_PENDING", "CYS_GATE_PENDING_CLOSE",
-              "CYS_INJECT_GATE_GUARD"):
+              "CYS_INJECT_GATE_GUARD",
+              # ★(U11 · 0.14.41) ④′ 부하 재확인 예산 손잡이 — 줄이기만 되는 롤백 스위치다(0=종전
+              #   1회). 운영자 셸에 남아 있으면 부트를 모는 검체가 **재확인이 꺼진 제품**을 잰다.
+              "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S", "CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S"):
         env.pop(k, None)
     for k in drop:
         env.pop(k, None)
@@ -4095,6 +4098,91 @@ def h_win_12():
              "System32 timeout 함정에서 BOOT_SNAPSHOT.md 미생성 — cys_timeout_run GNU 판별 회귀")
         need("BOOT_SNAPSHOT" in _read(snap), "스냅샷 본문 판독 불가: %r" % _read(snap)[:120])
     return "System32 스텁(timeout·gtimeout) 하 save-state exit 0 + BOOT_SNAPSHOT.md 실재"
+
+
+@specimen("H-WIN-13", "W6", "U11 부하 재확인 루프 윈도우 무진입(구조 가드 + 실측 게이트 형상 박제)",
+          ["U11-WIN"])
+def h_win_13():
+    """U11(0.14.41): ④′ 자원 게이트가 fleet_cpu 단독 hard 면 30초 간격·최대 3분 다시 잰다.
+    윈도우에서는 그 루프가 **절대 켜지면 안 된다** — 켜지면 매 회차 python·ps·cys 자식이
+    콘솔 없는 데몬 자식에서 뜨고(U5 콘솔 번쩍임 계열), 게이트가 윈도우에서 fleet_cpu 를 못 재는
+    지금의 간접 사실 하나가 바뀌는 날 부트가 3분씩 늘어난다(반박 D-h).
+      ⓐ 구조 가드: 합성 fleet 단독 hard 에서 `_resource_recheckable(windows=False)` 는 True(술어가
+         살아 있다 — 가드가 공허하지 않음) · `windows=True` 는 False(구조적 무진입).
+      ⓑ 윈도우 호스트 판정: 윈도우 실기에서 `_recheck_windows_host()` 가 True(가드가 실제로 물린다).
+      ⓒ 실측 게이트 형상(윈도우 실기만): 격리 HOME 에서 실제 `javis_resource_gate.py check --json`
+         을 돌려 호스트 판정 기준 재확인 진입이 False 임을 확인하고, `measure_errors`·
+         `fleet_cpu_reason` 실측값을 detail 에 박제한다(원 조사의 '윈도우는 늘 soft' 가설의 실측
+         확정 수단). 게이트 자체의 실행 실패·시간초과는 U11 의 판정 대상이 아니므로 **기록만** 한다
+         (릴리스 결박 레인을 이 항목 밖 사유로 세우지 않는다) — 가드(ⓐⓑ)가 무진입의 근거다."""
+    probe = r'''
+import json, os, subprocess, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import javis_bootstrap as B
+fleet = {"trips": [{"metric": "fleet_cpu_ratio", "level": "hard", "value": 1.3}],
+         "measured": {"fleet_cpu_reason": "ok", "fleet_cpu_ratio": 1.3}}
+out = {"host": bool(B._recheck_windows_host()),
+       "pred_live": B._resource_recheckable("hard-block", fleet, windows=False),
+       "pred_guard": B._resource_recheckable("hard-block", fleet, windows=True),
+       "real": None}
+if out["host"]:
+    gate = os.path.join(sys.argv[1], "javis_resource_gate.py")
+    home = tempfile.mkdtemp(prefix="hwin13-")
+    env = dict(os.environ)
+    env.update({"HOME": home, "USERPROFILE": home,
+                "CYS_STATE_DIR": os.path.join(home, "state"), "PYTHONDONTWRITEBYTECODE": "1"})
+    for k in ("CYS_SOCKET", "CYS_GATE_LANE_SOCKET", "CYS_FORMATION_BUDGET"):
+        env.pop(k, None)
+    real = {}
+    try:
+        r = subprocess.run([sys.executable, gate, "check", "--json"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=90, env=env)
+        real["exit"] = r.returncode
+        try:
+            gj = json.loads((r.stdout or "").strip())
+        except ValueError:
+            gj = None
+        verdict = B._resource_gate_decision(r.returncode, gj, None)[0]
+        m = (gj or {}).get("measured") if isinstance(gj, dict) else None
+        real.update({"verdict": verdict,
+                     "guarded": B._resource_recheckable(verdict, gj),
+                     "unguarded": B._resource_recheckable(verdict, gj, windows=False),
+                     "measure_errors": (m or {}).get("measure_errors") if isinstance(m, dict) else None,
+                     "fleet_cpu_reason": (m or {}).get("fleet_cpu_reason") if isinstance(m, dict) else None,
+                     "stderr_tail": (r.stderr or "")[-200:]})
+    except Exception as e:
+        real["error"] = "%s: %s" % (type(e).__name__, e)
+    out["real"] = real
+print(json.dumps(out, ensure_ascii=False))
+'''
+    r = _run([PY, "-c", probe, BIN_DIR], env=_base_env({"PYTHONDONTWRITEBYTECODE": "1"}),
+             timeout=180)
+    need(r.returncode == 0, "탐침 실패 rc=%d stderr=%r" % (r.returncode, r.stderr[-400:]))
+    try:
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise Fail("탐침 출력 판독 불가: %r" % r.stdout[-300:])
+    need(d.get("pred_live") is True,
+         "합성 fleet 단독 hard 에서 재확인 술어가 False — 가드 검사가 공허하다(술어 고장)")
+    need(d.get("pred_guard") is False,
+         "windows=True 인데 재확인 진입 True — 윈도우 구조적 무진입 가드 붕괴(U11)")
+    is_win = os.name == "nt" or sys.platform in ("msys", "cygwin")
+    if is_win:
+        need(d.get("host") is True,
+             "윈도우 실기에서 _recheck_windows_host()=False — 가드가 물리지 않는다(U11)")
+    real = d.get("real")
+    if real is None:
+        return ("구조 가드 성립(술어 live=True · windows 가드=False) · 비윈도우 호스트(host=%s) — "
+                "실측 게이트 형상 축은 윈도우 실기(windows-health)에서만 잰다" % d.get("host"))
+    if "error" in real:
+        return ("구조 가드 성립 · host=True · ⚠실측 게이트 실행 실패(%s) — U11 판정 밖(기록만)"
+                % real["error"])
+    need(real.get("guarded") is False,
+         "윈도우 실측 게이트 형상에서 재확인 진입 True — 무진입 붕괴: %r" % real)
+    return ("구조 가드 성립 · host=True · 실측 게이트 exit=%s verdict=%s fleet_cpu_reason=%s "
+            "measure_errors=%s · 호스트 가드 진입=%s(가드 제외 시=%s)"
+            % (real.get("exit"), real.get("verdict"), real.get("fleet_cpu_reason"),
+               real.get("measure_errors"), real.get("guarded"), real.get("unguarded")))
 
 
 # ── U-20: CLAUDE_CODE_GIT_BASH_PATH 배선 탐지기 ──────────────────────────────
