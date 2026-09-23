@@ -32,8 +32,11 @@ mod state;
 mod undo;
 mod usage;
 // ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).
-#[cfg(test)]
-mod team_gate_tests;
+// 선언은 파일 맨 끝(다른 테스트 전용(cfg-gated) 모듈들 뒤)에 있다 — REVIEW1 B-1: 부트스트랩
+// 건강성 러너(run_bootstrap_health.py _rs_prod())는 파일에서 그 cfg 속성 문자열이 처음
+// 나타나는 지점 뒤를 전부 잘라 프로덕션 창으로 본다. 그 속성이 맨 위에 있으면
+// boot_supervisor::spawn( 호출이 그 창에서 사라져 H-TICK-ALIVE(감독자 기동 지점 검체)가
+// 오탐 실패한다. 그래서 이 주석에도 그 속성 문자열을 그대로 적지 않는다.
 
 use cys::Request;
 use handlers::Reply;
@@ -5810,3 +5813,10 @@ mod cysd_args_tests {
         assert!(first_log.starts_with("\"[cysd] v{} {}\""), "첫 기동 로그의 릴리스 게이트 마커 변경");
     }
 }
+
+// ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).
+// 파일 맨 끝에 둔다(REVIEW1 B-1) — 부트스트랩 건강성 러너가 첫 #[cfg(test)] 뒤를
+// "프로덕션 창"에서 제외하므로, 이 선언이 앞쪽에 있으면 boot_supervisor::spawn(
+// 호출이 안 보여 H-TICK-ALIVE가 오탐 실패한다.
+#[cfg(test)]
+mod team_gate_tests;
