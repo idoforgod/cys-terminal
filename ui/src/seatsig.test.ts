@@ -447,6 +447,11 @@ describe("배선 핀 — main.ts", () => {
     ).toBe(true);
     expect(body.includes("wsSubBits(")).toBe(true);
     expect(code.includes(j('(dead ? "error" : idleN ? "idle" : ', '"working")'))).toBe(false);
+    // ★성찰 A(major): 위 두 핀은 summarizeWsSigsSafe 가 **불리는가**만 본다. 결과(sum.dot)를
+    //   버리고 `dot.className = "ws-dot working"` 로 상수화하는 뮤턴트는 호출도 그대로 있고
+    //   옛 산식도 없으니 둘 다 통과한다 — 탭 점이 상태와 무관하게 늘 초록으로 굳는다. 대입식
+    //   자체가 sum.dot 을 실제로 쓰는지 죈다.
+    expect(body.includes(j('dot.className = "ws-dot " + sum.dot'))).toBe(true);
   });
   test("CEO 활성 판정: 신호 재갱신 뒤 ceoActiveFromSigs(nodeSig, 지금, 배율 창) 한 줄", () => {
     const body = sliceBody("async function ceoIsActivelyGenerating", "\n}\n");

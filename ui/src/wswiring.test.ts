@@ -925,6 +925,23 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
     );
   });
 
+  // ★성찰 A(major) — 위 W3 핀은 restoreTree 의 **인자**만 죈다. 결과를 버리는 뮤턴트
+  //   `void restoreTree(ws.tree, {...})`(ws.tree 를 갱신하지 않는다 — 대표 자리 기억이 통째로
+  //   무효화된다)도 같은 인자 리터럴을 포함하므로 W3 를 그대로 통과한다. 대입식 자체를 죈다.
+  it("★(U16-A5-1) restoreTree 결과가 실제로 ws.tree 에 대입된다(결과를 버리는 뮤턴트 차단)", () => {
+    const s = startSlice();
+    expect(s).toContain("ws.tree = restoreTree(ws.tree, {");
+  });
+
+  // ★성찰 A(major) — S5 도 같은 결함류: `void anchorHeadSafe(ws.tree, ...)` 는 W20 가드 핀
+  //   ("ws.layoutManual || !ws.tree" 가 그대로 있다)과 무관하게 통과한다. 대입식을 직접 죈다.
+  it("★(U16-A5-2) S5 anchorHeadSafe 결과가 실제로 ws.tree 에 대입된다(결과를 버리는 뮤턴트 차단)", () => {
+    const s = startSlice();
+    expect(s).toContain(
+      "ws.tree = anchorHeadSafe(ws.tree, (x) => (roles && roles.has(x) ? roles.get(x) : undefined));",
+    );
+  });
+
   it("★(W4) 수동 표식 1회 추정 가드 — 이미 boolean 이면 다시 추정하지 않는다(매 기동 재추정 금지)", () => {
     const s = startSlice();
     expect(s).toContain(
@@ -1064,6 +1081,17 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
 
   it("보류 기한은 winScaled(Windows ×2 = 480s) 한 곳", () => {
     expect(code).toContain("const ROLE_SLOT_GRACE = winScaled(ROLE_SLOT_GRACE_MS)");
+  });
+
+  // ★성찰 A(major) — 위 테스트는 renderRoleSlot **함수 정의**의 본문만 죈다. 호출부
+  //   `if (node.sid < 0) return renderRoleSlot(node);` 를 `return document.createElement("div")`
+  //   (빈 div)로 바꾸는 뮤턴트는 renderRoleSlot 정의 자체는 그대로 두므로 위 테스트를 그대로
+  //   통과한다 — 실제 화면은 구멍마다 빈 칸이 뜬다. 호출부를 직접 죈다.
+  it("★(U16-A5-3) renderNode 는 구멍을 실제로 renderRoleSlot 에 넘긴다(빈 div 로 바꿔치기 차단)", () => {
+    const i = code.indexOf("function renderNode(");
+    expect(i).toBeGreaterThan(0);
+    const seg = code.slice(i, code.indexOf("\n}\n", i));
+    expect(seg).toContain("if (node.sid < 0) return renderRoleSlot(node);");
   });
 });
 

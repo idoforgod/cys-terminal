@@ -26,6 +26,16 @@ function fnBody(name: string): string {
 }
 
 describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => {
+  // ★성찰 A(major): renderUpdateBadge **정의**의 body(위 두 it)는 실제로 옳아도, renderUpdateAll
+  //   본체가 그 함수를 부르는 줄 자체가 지워지면(호출 제거 뮤턴트) 배지가 다시는 갱신되지 않는다
+  //   — 오너 증상(초록 점·배지 불일치)의 재발 형태다. 기존 핀은 "update-badge 를 쓰는 곳은
+  //   renderUpdateBadge 하나"만 세므로 호출 제거에는 반응하지 않는다(정의 안의 "update-badge"
+  //   문자열은 여전히 1건). 호출부를 직접 죈다.
+  it("★(U16-A5-4) renderUpdateAll 은 실제로 renderUpdateBadge(deriveUpdateView(...)) 를 부른다(호출 제거 뮤턴트 차단)", () => {
+    const b = fnBody("renderUpdateAll");
+    expect(b).toContain("renderUpdateBadge(deriveUpdateView(updState, updClock));");
+  });
+
   it("★update-badge 를 쓰는 곳은 renderUpdateBadge 하나뿐", () => {
     const hits = code.split('"update-badge"').length - 1;
     expect(hits).toBe(1);

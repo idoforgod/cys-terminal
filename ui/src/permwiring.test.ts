@@ -72,6 +72,13 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
     expect(mainCode).not.toContain("전체 디스크 접근 권한)에서 cys를 허용");
     expect(mainCode).not.toContain("로그인 항목에서 cys 관련 항목을 허용");
   });
+  // ★성찰 A(major): 위 핀은 permWarningToast **호출**만 본다. showPermWarning 이 그 결과(t)를
+  //   실제로 stickyToast 에 넘기는 줄이 지워져도(발행 제거 뮤턴트) 통과한다 — 판정은 계산되지만
+  //   화면엔 아무것도 뜨지 않는다. 발행 줄 자체를 죈다.
+  it("★(U16-A5-5) showPermWarning 은 판정 결과를 실제로 stickyToast 로 발행한다(발행 제거 뮤턴트 차단)", () => {
+    const sh = body(mainCode, "const showPermWarning = (payload: unknown): void => {", /\n  \};\n/);
+    expect(sh).toContain('stickyToast(t.id, "health", t.title, t.detail, () => openPrivacySettings(t.target));');
+  });
   it("stickyToast 는 onClick 을 받아 **대입**으로 건다(addEventListener 누적 금지)", () => {
     const st = body(mainCode, "function stickyToast(", /\nfunction /);
     expect(/onClick\?\s*:/.test(st)).toBe(true);
@@ -89,6 +96,12 @@ describe("프런트(main.ts) — listen 직후 비차단 pull · 클릭 1회 = �
     const loop = body(mainCode, "async function refreshPaneTitles(", /\nsetInterval\(refreshPaneTitles/);
     expect(/blockedTick\.push\(\s*\.\.\.collectCwdBlocked\(\s*r\.surfaces\s*,/.test(loop)).toBe(true);
     expect(/cwdBlockedNotices\(\s*cwdBlockedSeen\s*,\s*blockedTick\s*\)/.test(mainCode)).toBe(true);
+    // ★성찰 A(major): 위 핀은 cwdBlockedNotices 가 **불리는가**만 본다. 그 결과(step.notices)를
+    //   실제로 stickyToast 로 발행하는 for 문이 지워져도(발행 제거 뮤턴트) 통과한다 — 판정은
+    //   계산되지만 좌석 막힘 안내가 화면에 뜨지 않는다. 발행 줄 자체를 죈다.
+    expect(loop).toContain(
+      "for (const n of step.notices) stickyToast(n.id, \"health\", n.title, n.detail, () => openPrivacySettings(n.target));",
+    );
   });
   it("수집은 collectCwdBlocked 하나가 SOT — main.ts 가 옛 인라인 for 문을 되살리지 않는다", () => {
     // 옛 구현: `for (const s of r.surfaces) { if (!s.exited && s.cwd_blocked) blockedTick.push({...}) }`.
