@@ -289,19 +289,22 @@ rig.cleanup()
 GATE_DELAY_B9 = 0.15
 rig9 = Rig([fleet_hard()], gate_delay=GATE_DELAY_B9).run()
 calls9 = rig9.gate_calls()
-# ★CI 러너 지터(2026-09-23 · ci-branch run 35884936211): 판정을 '최대 편차'로 두면 느린 러너에서
-#   한 회차만 늦게 뜬 스폰 지터(starts=[0, .534, 1.166, 1.537] — 2회차만 +0.166s, 3회차는 +0.037s 로
-#   제자리 복귀)가 RED 를 만든다. 절대 스케줄의 지터는 **회차마다 독립·비누적**이고 상대 스케줄(MU3)의
-#   드리프트는 **누적**(≈k×게이트: .15/.30/.45)이므로, 재확인 회차(k≥1) 편차의 **중앙값**으로 가른다 —
-#   지터 1회는 흡수하고 MU3 는 중앙값 .30 ≥ 문턱이라 그대로 떨어진다(판별력 유지).
+# ★CI 러너 지터·고정 지연(2026-09-23 · ci-branch run 35884936211 · 35891677759): 느린 러너에서 두 패턴을
+#   관측했다 — ⓐ 한 회차만 늦게 뜬 독립 스폰 지터(starts=[0, .534, 1.166, 1.537]) ⓑ 회차마다 거의 같은
+#   고정 지연(starts=[0, .67, 1.114, 1.676] — 재확인 직전 진행 기록 쓰기 등 회차당 고정 비용). 둘 다 **누적하지
+#   않는다** = 절대 스케줄 정상. 상대 스케줄(MU3)은 회차마다 (게이트+고정 비용)이 **누적**된다(.15/.30/.45…).
+#   그래서 판정 모델을 '절대 스케줄 + 회차 공통 상수 지연 c' 로 두고, c(=재확인 편차의 중앙값)를 뺀 잔차의
+#   **중앙값**으로 가른다 — ⓐ·ⓑ 는 잔차 중앙값≈0 으로 통과, MU3 는 잔차 [.15, 0, .15] 의 중앙값 .15 로 떨어진다.
 if len(calls9) >= 2:
     first9 = calls9[0][1]
     starts9 = [c[1] - first9 for c in calls9]
-    drifts9 = sorted(abs(s - k * INTERVAL) for k, s in enumerate(starts9) if k >= 1)
-    med9 = drifts9[len(drifts9) // 2]
+    offs9 = [s - k * INTERVAL for k, s in enumerate(starts9) if k >= 1]
+    c9 = sorted(offs9)[len(offs9) // 2]
+    resid9 = sorted(abs(o - c9) for o in offs9)
+    med9 = resid9[len(resid9) // 2]
     thresh9 = 0.5 * GATE_DELAY_B9
-    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 재확인 편차 중앙값 %.3fs < %.3fs=0.5×게이트소요 · 최대 %.3fs)"
-          % (GATE_DELAY_B9, med9, thresh9, drifts9[-1]), med9 < thresh9,
+    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 공통 지연 %.3fs 제거 후 잔차 중앙값 %.3fs < %.3fs=0.5×게이트소요 · 최대 %.3fs)"
+          % (GATE_DELAY_B9, c9, med9, thresh9, resid9[-1]), med9 < thresh9,
           "starts=%r" % [round(s, 3) for s in starts9])
 else:
     check("b9 절대 스케줄(측정 불충분)", False, "calls=%d" % len(calls9))
