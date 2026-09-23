@@ -132,7 +132,7 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 > `GetDLLVersion` 오라클(fail-closed = unverified)이라, 크로스 빌드 회귀로 버전 리소스가
 > 빠진 채 발행되면 **모든 기계의 설치가 exit 4 로 떨어지기 때문**이다.
 
-## 0-C. 태그 전 사전 게이트 (2026-09-11 · v0.14.34 윈도우 빌드 파손 재발 방지 — **3종 전부 rc=0 필수**)
+## 0-C. 태그 전 사전 게이트 (2026-09-11 · v0.14.34 윈도우 빌드 파손 재발 방지 — **4종 전부 rc=0 필수**)
 
 > ★왜: v0.14.34 는 브랜치 push(10:49:46Z) **58초 뒤** 태그됐다(10:50:44Z). 같은 커밋 88c1ca2 의 브랜치
 > `windows-build` 는 11:00:31Z 에 failure 였고(윈도우에서만 나는 컴파일 오류 3건 — `src-tauri/src/main.rs` 의
@@ -140,7 +140,16 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
 > cfg 를 컴파일하지 않고, `windows-health` 는 루트 크레이트만 컴파일해 cys-app 파손을 원리적으로 못 본다.
 > 그래서 파손본이 태그됐고 태그 레인의 윈도우 빌드에서야 드러났다.
 
-태그(`git tag`) 직전, **태그할 커밋에서** 아래 3종이 모두 rc=0 이어야 한다. 하나라도 아니면 태그하지 않는다.
+> ★왜 4번째가 생겼나(2026-09-23 · v0.14.40 릴리스 수리): v0.14.39 는 위 3종이 전부 rc=0 이고 브랜치 CI 도
+> 초록이었는데 **태그 레인에서 죽었다**. `pack-artifacts` 잡의 step[9] `Scan pack content (pre-build hard-gate)`
+> = `scripts/scan-pack-secrets.sh` 가 팩 검체의 `@` 한 글자(ChatGPT.app 의 Codex MCP 플러그인 설정 키)를
+> 이메일로 오인해 비0 로 끝났다. 그 게이트는 그때까지 **태그 레인과 팩-only 레인에만** 있었고 브랜치 레인에는
+> 없었다 — 즉 태그 전에는 원리적으로 알 수 없는 실패였다. 공증까지 마친 build 3잡(약 40분)이 성공한 뒤였고,
+> draft 릴리스에 자산이 9/12 만 올라간 채 멈췄으며 **태그는 불변**이라 버전 범프(0.14.40)로만 회복됐다.
+> 그래서 ① 같은 스텝을 `ci-branch.yml` 의 macOS 잡에 편입하고(그러면 3번 점검이 이 결과를 태그 조건으로 묶는다)
+> ② 로컬에서도 태그 전에 직접 돌리도록 여기 4번으로 등재한다.
+
+태그(`git tag`) 직전, **태그할 커밋에서** 아래 4종이 모두 rc=0 이어야 한다. 하나라도 아니면 태그하지 않는다.
 
 1. **버전 SOT 8곳** — `sh scripts/version-check.sh vX.Y.Z` (§0).
 2. **★윈도우 교차 타입체크** — `sh scripts/win-typecheck.sh` (로컬 · 이 맥 실측 콜드 약 3분 / 웜 수 초~십수 초).
@@ -156,6 +165,17 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
      `--wait N` 은 진행 중인 런을 60초 간격으로 최대 N분 기다리고, 실패한 런은 잡·스텝·annotation 을 보여 준다.
    - 순서: 브랜치를 먼저 push → 두 워크플로가 끝날 때까지(약 15~20분) 기다림 → 이 점검 rc=0 → 그다음에 태그.
      **58초 태그 금지** — 태그 레인은 브랜치 CI 결과를 기다려 주지 않는다.
+4. **★팩 콘텐츠 발행 hard-gate** — `bash scripts/scan-pack-secrets.sh` (rc=0 = `OK`).
+   - 증명하는 것: git-추적 `cysjavis-pack` 전 트리에 개인 홈경로(`/Users/<실유저>`·`/home/<user>`)·이메일·
+     키/토큰 형태의 문자열이 **없다**. 그 트리는 build.rs 가 `cys` 바이너리에 통째로 임베드하고
+     `pack.tar.gz` 로도 배송되므로, 여기서 못 막으면 발행 뒤에는 회수할 수 없다.
+   - rc: 0 = clean · 1 = 발견(`file:line` 출력 — 태그 금지) · 2 = 환경 오류(git 리포 아님 · 인덱스 부재 — **통과 아님**).
+   - **걸렸을 때 스캐너를 완화하지 마라**(fail-closed 유지). 팩 콘텐츠 쪽을 placeholder 규약으로 정규화한다 —
+     홈경로는 `/Users/x/`, 이메일로 읽히는 `@` 는 `_at_`(v0.14.40 의 D-11 픽스처 선례) 또는 제거.
+     허용 목록(`ph_re`·`email_allow_re`) 확장은 **오너 결정 사항**이지 워커의 회피 수단이 아니다.
+   - 같은 스크립트가 태그 레인(`release.yml:1126`·`:1546`)·팩-only 레인(`pack-release.yml:153`·`:539`)과
+     **브랜치 레인**(`ci-branch.yml` macOS 잡 · 2026-09-23 편입)에서 같은 호출 형태로 돈다(실패 = 잡 실패) —
+     위 3번이 그 브랜치 결과를 태그 조건으로 묶으므로, 이 4번은 push 전에 미리 아는 로컬 사본이다.
 
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 
@@ -447,7 +467,7 @@ git push -u origin main
 `latest.json`을 **항상 최신 릴리스에 포함**해야 updater가 찾습니다(endpoint가 `/releases/latest/`).
 
 ```sh
-# ★태그 전 사전 게이트 3종 rc=0 필수 — §0-C (version-check · win-typecheck · pre-tag-ci-check)
+# ★태그 전 사전 게이트 4종 rc=0 필수 — §0-C (version-check · win-typecheck · pre-tag-ci-check · scan-pack-secrets)
 # 태그
 git tag -a v0.2.0 -m "cys 0.2.0 — 자비스 네이티브 기능 19건 + zero-setup 온보딩 + 자동 업데이트"
 
@@ -481,8 +501,9 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
-- [ ] **★태그 전 사전 게이트 3종 rc=0 — §0-C** (version-check · `sh scripts/win-typecheck.sh` ·
-      `python3 scripts/pre-tag-ci-check.py --wait 30` = 같은 SHA 의 ci-branch·windows-build success)
+- [ ] **★태그 전 사전 게이트 4종 rc=0 — §0-C** (version-check · `sh scripts/win-typecheck.sh` ·
+      `python3 scripts/pre-tag-ci-check.py --wait 30` = 같은 SHA 의 ci-branch·windows-build success ·
+      `bash scripts/scan-pack-secrets.sh` = 팩 콘텐츠 clean)
       (범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
 - [ ] **★★실사용자 경로 게이트 — DMG 2종 전부 exit 0 (2026-08-01 신설 · 필수 · 생략 불가)**

@@ -571,6 +571,28 @@ jobs:
           bash scripts/lane-parity-rehearsal.sh --strict
           bash scripts/lane-parity-rehearsal.sh --self-test
 
+      # ★★팩 콘텐츠 발행 hard-gate 를 **브랜치 레인에도** 건다 (2026-09-23 · v0.14.40 릴리스 수리).
+      #   **왜 지금 생기는가 — 커버리지 공백의 실측 사고**: `scripts/scan-pack-secrets.sh` 는 여태
+      #   태그 레인(release.yml:1126·1546)과 팩-only 레인(pack-release.yml:153·539)에만 걸려 있었고
+      #   **브랜치 레인에는 없었다**. 그래서 v0.14.39 는 태그 전 브랜치 CI 가 전부 초록이었는데도
+      #   태그 레인 `pack-artifacts` 잡 step[9]("Scan pack content (pre-build hard-gate)")에서 죽었다 —
+      #   `cysjavis-pack/bin/tests/test_resource_gate.py:43` 의 D-11 픽스처에 든 `@` 를 이메일로
+      #   오인한 것이다. build 3잡(공증 포함 · 약 40분)은 이미 success 였고 draft 릴리스에 자산이
+      #   9/12 만 올라간 채 멈췄다. **태그는 불변**이라 그 실패는 버전 범프로만 회복된다 — 즉
+      #   이 게이트가 브랜치에서 1초에 알려줬을 것을, 태그 레인이 40분 뒤에 비가역으로 알려줬다.
+      #   이것이 이 리포가 반복해 당하는 '레인 하나를 빼먹음'(위 레인 대조 스텝 머리말)의 또 다른 판본이고,
+      #   그 스텝은 **팩 검체 이름 집합**만 대조하므로 이 종류의 비대칭(게이트 스크립트 자체의 누락)은
+      #   원리적으로 보지 못한다.
+      #   호출 형태는 release.yml:1126 과 **한 글자도 다르지 않게** 유지한다(같은 게이트가 두 레인에서
+      #   다르게 도는 것이 곧 드리프트다). 비0 = 잡 실패 = 브랜치 초록 부인.
+      #   위치 근거: 레인 대조 게이트 바로 뒤 · setup-python/Rust **앞**. 이 스크립트는 git·grep·bash 만
+      #   쓰므로 툴체인 설치를 기다릴 이유가 없고, 앞 스텝과 같은 '1초 안에 알 수 있어야 한다' 예산에 든다.
+      #   ⚠정직한 한계: 정적 패턴 매칭이라 난독화·신종 토큰·이미지 내 텍스트는 못 잡는다(스크립트 머리말).
+      #   그리고 이 스텝은 **오탐도 그대로 빨강**이다 — 그게 fail-closed 의 값이다. 걸리면 스캐너를
+      #   완화하지 말고 팩 콘텐츠 쪽을 placeholder 규약으로 정규화하라.
+      - name: 팩 콘텐츠 발행 hard-gate (태그 레인과 동일 호출 · 브랜치 선행)
+        run: bash scripts/scan-pack-secrets.sh
+
       # ★(0.14.31 통합 · CONTRACTS E-4 ②) 이 잡의 python3 를 3.12 로 **고정**한다.
       #   종전엔 이 잡만 setup-python 이 없어 러너 이미지 기본 python3 를 썼다 — 잡2
       #   (boot-health-full)·windows-health.yml 은 이미 3.12 다. 즉 세 잡이 서로 다른
