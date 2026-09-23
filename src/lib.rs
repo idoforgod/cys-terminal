@@ -1700,6 +1700,13 @@ pub fn windows_runtime_damage_notice(missing: &[String]) -> Option<String> {
 ///    ★Windows 실기 검증은 이 커밋 범위 밖이다(mac 개발기에서 실기 재현 불가). 여기서
 ///    증명된 것은 ⓐ경로 선택 규약 ⓑ불가침 계약 ⓒ타 플랫폼 미주입 셋뿐이고, 실제 훅이 뜨는가는
 ///    `feat/**` 브랜치 windows-health 잡과 실기 재현의 몫이다 — 과장하지 않는다.
+/// ⑦ CYS_PY + CYS_PY_ORIGIN(U15 · 0.14.41 · **macOS·CLT 부재 전용 조건부 쌍**): 개발자 도구(CLT) 없는
+///    맥에서 좌석은 `zsh -l` 이라 path_helper 가 `/usr/bin` 을 동봉 runtime 앞으로 되돌리고, 훅이 PATH 첫
+///    `python3` = 셔임(설치 창 + 비0)을 불렀다. 판정은 [`macos_devtools::clt_absent_bundled_python`] 하나
+///    (macOS ∧ 롤백 아님 ∧ 동봉 python3 실재 ∧ CLT python3 부재 — 셔임 실행 0, stat 만)이고, 사용자
+///    프로세스 env 에 `CYS_PY` 가 있으면 덮지 않는다. 훅 프리루드 `cys_resolve_py` 첫 갈래가 미리 설정된
+///    값을 존중하므로 이 한 쌍으로 좌석 훅 전체가 동봉 python 을 쓴다. 마커는 `cys-dept` 헤더가 소비한다.
+///    ⑤·⑥ 과 같이 조건 미충족이면 아무것도 얹지 않는다 — CLT 있는 맥·윈도우·리눅스는 **바이트 동일**.
 ///
 /// ★T-0147-7 W1a(A17): 이 함수는 `schedule.rs` 의 private fn 이었다. **pane 스폰 경로
 ///   (state.rs)에는 같은 backfill 이 없어** Windows 에서 pane 속 훅·python 이 `$HOME` 붕괴로
@@ -1751,6 +1758,13 @@ pub fn spawn_env_pairs(
         &mut env,
         &npm_config_prefix_verdict_from_process(exe_dir),
         boot_gates_master_off_from(std::env::var(ENV_BOOT_GATES).ok().as_deref()),
+    );
+    // ⑦ U15(0.14.41): CLT 없는 맥에서만 동봉 python 을 훅에 명시한다(판정·롤백은 단일 판정이 소유 ·
+    //    비-macOS 는 디스크 stat 0 으로 None). 조건 미충족 = 쌍 0개 = 종전과 바이트 동일.
+    macos_devtools::inject_cys_py_for(
+        &mut env,
+        macos_devtools::clt_absent_bundled_python(exe_dir).as_deref(),
+        std::env::var_os(macos_devtools::ENV_CYS_PY).is_some(),
     );
     env
 }

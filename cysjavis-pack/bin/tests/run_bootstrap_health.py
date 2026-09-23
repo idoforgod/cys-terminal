@@ -4565,6 +4565,23 @@ def h_clt_1():
         runs = _u15_shim_runs(sb)
         need(not runs, "셔임이 실행됐다(설치 창 %d회 상당):\n%s" % (len(runs.splitlines()), runs[:600]))
         notes.append("셔임 실행 0회")
+        # ⓕ 동봉 python 도 PATH 에 없는 맥(셔임뿐 — 손상 번들·데몬 밖 실행) — 프리루드가 빈 값을 남긴
+        #   뒤의 **독립 해소기**(guard·actprobe 후보 루프)와 **`python3` 명시 폴백**(inject-context·
+        #   save-state)이 셔임을 다시 고르지 않는다(M5). 판정은 종전 'python 부재' 갈래 그대로다
+        #   (guard LOOSE 백스톱 exit 0 · actprobe fail-open exit 0 · 두 영속 훅 graceful exit 0).
+        e_nb = dict(env)
+        e_nb["PATH"] = os.pathsep.join([os.path.dirname(sb["shim"]), sb["binp"]])
+        need(_u15_resolve(lib, e_nb) == "", "셔임밖에 없는 맥에서 프리루드가 빈 값이 아닌 값을 골랐다")
+        r = _run(["sh", "-c", '. "$1" || exit 4; cys_timeout_run 5 sh -c "echo U15-RAN-OK"', "_", lib],
+                 env=e_nb)
+        need("U15-RAN-OK" in r.stdout, "python 없는 맥에서 cys_timeout_run 이 감싼 명령을 실행하지 않았다(④ 직접 실행 갈래)")
+        for hk, inp in (("inject-context.sh", payload), ("save-state.sh", payload),
+                        ("guard.sh", bash_ls), ("actprobe-kill-gate.sh", bash_ls)):
+            r = _run([BASH, _hook(hk)], input=inp, env=e_nb)
+            need(r.returncode == 0, "셔임뿐인 맥에서 %s exit=%d: %r" % (hk, r.returncode, r.stderr[-200:]))
+        runs = _u15_shim_runs(sb)
+        need(not runs, "셔임뿐인 맥에서 독립 해소기·명시 폴백이 셔임을 실행했다(M5):\n%s" % runs[:600])
+        notes.append("동봉 부재 맥: 독립 해소기·폴백도 셔임 0회")
         # 계측 타당성 — 구 트리는 같은 조건에서 셔임을 실행한다(결함 재현).
         calib = "skip(no-git)"
         old_lib = _git_show("cysjavis-pack/hooks/_lib.sh", ref=_U15_BASE_REF)
@@ -4606,10 +4623,19 @@ def h_clt_2():
               'printf "OLD=%s\\n" "$(command -v python3 2>/dev/null || command -v python 2>/dev/null '
               '|| command -v py 2>/dev/null || printf %s "")"; '
               'if command -v cys_clt_tool_present >/dev/null 2>&1 && cys_clt_tool_present python3; '
-              'then echo CLT=1; else echo CLT=0; fi; printf "OS=%s\\n" "${OSTYPE:-}"', "_", libp], env=env)
+              'then echo CLT=1; else echo CLT=0; fi; printf "OS=%s\\n" "${OSTYPE:-}"; '
+              'if cys_py_is_shim "$(command -v python3 2>/dev/null)"; then echo SHIM=1; else echo SHIM=0; fi; '
+              'if cys_py_shim_risk; then echo RISK=1; else echo RISK=0; fi', "_", libp], env=env)
     need(r.returncode == 0, "실기 프로브 rc=%d: %r" % (r.returncode, r.stderr[-300:]))
     kv = dict(l.split("=", 1) for l in r.stdout.replace("\r", "").splitlines() if "=" in l)
     host_darwin = kv.get("OS", "").startswith("darwin")
+    if not host_darwin:
+        # 윈도우·리눅스 실기: 독립 해소기(guard·actprobe)의 셔임 필터와 `python3` 폴백 제거 조건이 **항상 거짓**
+        # 이어야 한다 — 그래야 그 훅들의 후보 선택·폴백이 종전과 같다.
+        need(kv.get("SHIM") == "0" and kv.get("RISK") == "0",
+             "비-darwin 호스트(OSTYPE=%s)에서 셔임 분류(%s)·폴백 제거 조건(%s)이 켜졌다 — 윈도우 훅 후보·"
+             "폴백이 바뀐다" % (kv.get("OS"), kv.get("SHIM"), kv.get("RISK")))
+        notes.append("실기 셔임 분류·폴백 제거 조건 = 거짓")
     if host_darwin and kv.get("CLT") == "0" and kv.get("OLD") in ("/usr/bin/python3", "/usr/bin/python"):
         notes.append("실기=적용 불가(이 mac 호스트는 CLT 가 없어 셔임을 피하는 것이 기대 동작)")
     else:
@@ -4632,6 +4658,12 @@ def h_clt_2():
                 need(got == want,
                      "OSTYPE=%s·CLT=%s 에서 해소값이 종전과 다르다(사전설정 %s): got=%r want=%r"
                      % (ostype, clt, label, got, want))
+            # 독립 해소기 필터(guard·actprobe)·폴백 제거 조건도 최악 조건에서 거짓이어야 종전과 같다.
+            rr = _run(["sh", "-c", '. "$1" || exit 4; cys_py_is_shim "$2" && echo SHIM; '
+                       'cys_py_shim_risk && echo RISK; echo END', "_", lib, sb["shim"]], env=sb["env"])
+            need(rr.stdout.strip() == "END",
+                 "OSTYPE=%s·CLT=%s 에서 셔임 분류·폴백 제거 조건이 켜졌다(%r) — guard·actprobe 후보·"
+                 "inject-context/save-state 폴백이 종전과 달라진다" % (ostype, clt, rr.stdout.strip()))
             need(not _u15_shim_runs(sb), "해소 과정에서 셔임을 실행했다(판정은 stat 만 해야 한다)")
             notes.append("%s%s 종전 동일" % (ostype, "+CLT" if clt else ""))
     return " · ".join(notes)

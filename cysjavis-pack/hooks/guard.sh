@@ -65,11 +65,21 @@ INPUT="$(cat)"
 # 경우가 흔하다. 후보 **순서 = 우선순위**이고 절대경로 후보(homebrew·/usr/bin)는 PATH 빈곤 환경
 # (GUI 기동)의 belt-and-braces다. 프리루드가 해소한 CYS_PY를 최우선 후보로 둔다(단일 SOT).
 PYBIN=""
+# ★U15(0.14.41): 개발자 도구(CLT) 없는 맥의 /usr/bin/python3 셔임(실행 = 설치 창 + 비0)은 후보에서 뺀다
+#   (프리루드 `cys_py_is_shim` — darwin 밖·CLT 있는 맥은 항상 거짓 = 종전과 같은 후보). 셔임밖에 없으면
+#   PYBIN 이 비고 아래 종전 'python 부재' 갈래(STRICT deny · LOOSE 백스톱)로 간다 — 셔임 실행 때의
+#   parser 크래시 갈래와 **같은 판정**이다(설치 창만 사라진다).
 for c in "${CYS_PY:-python3}" python3 python py \
          /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3; do
   [ -n "$c" ] || continue
-  if command -v "$c" >/dev/null 2>&1; then PYBIN="$(command -v "$c")"; break; fi
-  [ -x "$c" ] && PYBIN="$c" && break
+  if command -v "$c" >/dev/null 2>&1; then
+    PYBIN="$(command -v "$c")"
+    if command -v cys_py_is_shim >/dev/null 2>&1 && cys_py_is_shim "$PYBIN"; then PYBIN=""; continue; fi
+    break
+  fi
+  if [ -x "$c" ] && ! { command -v cys_py_is_shim >/dev/null 2>&1 && cys_py_is_shim "$c"; }; then
+    PYBIN="$c"; break
+  fi
 done
 # 테스트 전용(GUARD_TEST_MODE): python 부재 시뮬레이션으로 잔여5(STRICT fail-closed) 검증
 [ "${GUARD_TEST_MODE:-0}" = "1" ] && [ "${GUARD_FORCE_NOPY:-0}" = "1" ] && PYBIN=""

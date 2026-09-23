@@ -11595,7 +11595,20 @@ fn escalate_reclaim(role: &str) {
     }
     // ★SEAL-1: PATH 선두가 동봉 runtime 이면 이 `python3` 는 앱 번들 안의 인터프리터다 —
     // 팩토리가 PYTHONDONTWRITEBYTECODE 를 얹어 `.pyc` 번들 오염(코드서명 봉인 파손)을 막는다.
-    match cys::python_command("python3")
+    let mut cmd = cys::python_command("python3");
+    // ★U15(0.14.41 · 반박 M4): 개발자 도구(CLT) 없는 맥에서는 이 `python3` 가 PATH 의 /usr/bin 셔임(설치 창
+    //   + 비0 · stdout 빈 값)으로 풀려 죽은 좌석이 영영 회수되지 않았다(재부팅 뒤 대표 자리·빈 자리 복구 불능).
+    //   인터프리터 이름·스폰 지점은 그대로 두고(아래 Windows 보수 판정) **자식 PATH 선두**만 동봉 python
+    //   디렉터리로 바꾼다 — 그 이름이 동봉본으로 풀린다. None(윈도우·리눅스·CLT 있는 맥)이면 무접촉이다.
+    if let Some(path) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .and_then(|d| cys::macos_devtools::clt_absent_child_path(d, std::env::var_os("PATH").as_deref()))
+    {
+        cmd.env("PATH", path);
+    }
+    match cmd
         .arg(&helper)
         .args(["--reclaim", "--role", role])
         .output()

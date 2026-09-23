@@ -18,6 +18,20 @@ set -euo pipefail
 # 수동 실행 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·빈 셸·
 # 그 아래 사용자가 실행하는 claude)이 상속하도록 단일 지점에서 로그인 셸 표준 경로를 prepend.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
+# ★U15(0.14.41): 개발자 도구(CLT) 없는 맥의 좌석에서 부르면 아래 `python3 - <<'PY'` heredoc 40여 곳이
+#   PATH 첫 python3 = /usr/bin 셔임(설치 창 + 비0)으로 풀린다. cysd 는 **그 기계에서만** pane env 에
+#   `CYS_PY=<동봉 python>` 과 마커 `CYS_PY_ORIGIN=bundled-clt-absent` 를 싣는다(src/macos_devtools.rs).
+#   마커가 정확히 일치할 때만 그 디렉터리를 PATH 맨 앞에 둔다. 마커 없는 CYS_PY(사용자 venv 등 — 반박 D-7)
+#   · 윈도우 · 콜론 든 경로(PATH 파손) · 실행 불가 경로는 무변경이다.
+case "${OSTYPE:-}" in
+  darwin*)
+    if [ "${CYS_PY_ORIGIN:-}" = "bundled-clt-absent" ] && [ -f "${CYS_PY:-}" ] && [ -x "${CYS_PY:-}" ]; then
+      case "${CYS_PY:-}" in
+        *:*) ;;
+        /*/*) export PATH="${CYS_PY%/*}:$PATH" ;;
+      esac
+    fi ;;
+esac
 
 REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"
 PACK_DEFAULT="$HOME/.cys/pack"

@@ -1686,14 +1686,28 @@ fn path_with_exe_dir_first(exe_dir: &Path, current: Option<std::ffi::OsString>) 
     std::env::join_paths(parts).unwrap_or_else(|_| exe_dir.as_os_str().to_os_string())
 }
 
-/// ★(U15 · 0.14.41) 부트 체인 자식 PATH — `py_dir` 이 None 이면 [`path_with_exe_dir_first`] 와 **바이트 동일**.
+/// ★(U15 · 0.14.41 · 반박 M3·M4) 부트 체인 자식 PATH.
+///
+/// 데몬 env PATH 는 launchd plist 값이라 동봉 runtime 이 없다(`…:/usr/bin:/bin:…` 실측). 부트 python 자체는
+/// 동봉 절대경로라 안전하지만 그 **자손**(`bash cys-dept promote-if-pending` 의 `python3 -` heredoc ·
+/// `cys boot` 회수 · `["python3", …]` 리터럴)은 PATH 로 `python3` 를 풀어, 개발자 도구(CLT) 없는 맥에서
+/// 마스터 부트마다 셔임(설치 창 + 비0)을 불렀다. 그 기계에서만 `py_dir`(동봉 python 디렉터리)를 exe_dir
+/// **바로 뒤**에 둔다(python 만 — 동봉 git 은 올리지 않는다: GIT_EXEC_PATH 결함 RC5 · 설계 §2 Phase B 제외).
+/// `py_dir == None`(윈도우·리눅스·CLT 있는 맥·롤백)이면 [`path_with_exe_dir_first`] 와 **바이트 동일**하다.
 fn boot_child_path(
     exe_dir: &Path,
     py_dir: Option<&Path>,
     current: Option<std::ffi::OsString>,
 ) -> std::ffi::OsString {
-    let _ = py_dir; // RED 스텁: 종전과 동일(동봉 python 디렉터리 미주입)
-    path_with_exe_dir_first(exe_dir, current)
+    let Some(py) = py_dir else {
+        return path_with_exe_dir_first(exe_dir, current);
+    };
+    let mut parts: Vec<PathBuf> = vec![exe_dir.to_path_buf(), py.to_path_buf()];
+    if let Some(cur) = current.as_ref() {
+        parts.extend(std::env::split_paths(cur));
+    }
+    // join 실패(성분에 분리자 — 동봉 경로에선 비실재)는 종전 규칙으로 접는다: 'cys 해소 보장' 이 우선이다.
+    std::env::join_paths(parts).unwrap_or_else(|_| path_with_exe_dir_first(exe_dir, current))
 }
 
 /// boot-supervisor.log 의 **경로 규약 단일 소유자**(★R2 note — 사본 금지).
@@ -1793,7 +1807,13 @@ fn run_ensure_team(
         // SEAL-1: 번들 python 이 `.pyc` 를 쓰면 코드서명 봉인이 깨진다.
         .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
         // ★(P2 · R3-P2-1/ANCHOR-1 ④) PATH 선두 = 데몬 exe_dir — bare "cys" 해소 보장.
-        .env("PATH", path_with_exe_dir_first(&exe_dir, std::env::var_os("PATH")))
+        // ★(U15 · 0.14.41) CLT 없는 맥에서만 그 바로 뒤에 동봉 python 디렉터리(자손의 `python3` 셔임 회피).
+        //   판정은 lib 단일 판정 — 그 밖의 기계는 종전과 바이트 동일(boot_child_path 주석).
+        .env("PATH", boot_child_path(
+            &exe_dir,
+            cys::macos_devtools::clt_absent_bundled_python(&exe_dir).as_deref().and_then(Path::parent),
+            std::env::var_os("PATH"),
+        ))
         .stdin(std::process::Stdio::null());
     // ── ★(R2 · 2026-08-26) provenance 상속 절단 — **주지 않기로 한 값 = 없는 값** ──────────
     // 【무엇이 틀렸었는가】 아래 주입은 **조건부**인데, 조건이 거짓일 때 상속값을 지우지 않았다.

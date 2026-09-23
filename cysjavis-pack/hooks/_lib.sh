@@ -134,16 +134,134 @@ cys_shquote() {
 # 인터프리터'가 마치 해소된 것처럼 보여 실패 원인이 소실된다.
 # ※기존 계약 보존: 비어 있으면 안 되는 호출부는 `[ -n "$CYS_PY" ] || CYS_PY=python3` 로
 #   자기 자리에서 명시 폴백한다(계약 무변경 · 인터프리터 해소만 추가).
+# ★U15(0.14.41): 아래 두 줄(`_cys_py_preset_is_shim` · `_cys_py_avoid_shim`)은 **darwin 밖에서 즉시
+#   빠져나온다**(외부 명령·서브셸 0) — 윈도우·리눅스·CLT 있는 맥의 해소 결과는 종전과 같다(4-b 절).
 cys_resolve_py() {
   if [ -n "${CYS_PY:-}" ]; then
     if [ -x "${CYS_PY}" ] || command -v "${CYS_PY}" >/dev/null 2>&1; then
-      export CYS_PY
-      return 0
+      if ! _cys_py_preset_is_shim; then
+        export CYS_PY
+        return 0
+      fi
     fi
   fi
   CYS_PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || printf '%s' '')"
+  _cys_py_avoid_shim
   export CYS_PY
   [ -n "${CYS_PY:-}" ]
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4-b. 개발자 도구(CLT) 없는 맥의 python3 셔임 회피 (U15 · 0.14.41 · WP-C3)
+# ─────────────────────────────────────────────────────────────────────────────
+# 사실(조사 U15 · 반박 U15.refute): CLT 도 Xcode.app 도 없는 맥의 `/usr/bin/python3` 는 "개발자 도구를
+#   설치하라" 창을 띄우고 비0으로 끝나는 **껍데기(셔임)** 다. 좌석은 `zsh -l` 이라 path_helper 가
+#   /usr/bin 을 동봉 runtime 앞으로 되돌려 위 해소가 셔임을 골랐다 → 훅마다 설치 창 + 조용한 실패
+#   (아래 cys_timeout_run ③ 이 감싼 `cys surface-role`·`cys claim-role` 이 **한 번도** 실행되지 않아
+#   "너는 마스터다" 가 팀을 띄우지 못함 · 체크리스트·reviewer 능력 게이트 fail-open).
+# 규칙(정본 = src/macos_devtools.rs · 후보 표 문면 파리티는 그 파일의 Rust 테스트가 대조):
+#   ① 판정은 **파일 존재만** 본다 — 셔임을 실행하지 않는다(실행 = 설치 창). 빌트인 `[`·`case` 만 쓴다.
+#   ② `case $OSTYPE in darwin*` 밖(윈도우 Git Bash·리눅스)은 모든 함수가 즉시 "아니다" 다 — 해소 결과가
+#      종전과 **바이트 동일**하다(검체 H-CLT-2 가 윈도우 실기에서도 잰다).
+#   ③ CLT 가 있는 맥도 종전과 같다 — 그 기계의 셔임은 CLT python 으로 넘겨 주므로 피할 이유가 없다.
+#   ④ 대체 python 은 **PATH 순회**로 찾는다(먼저 `*/runtime/python/bin` 동봉본). `command -v cys` +
+#      `pwd -P` 로 번들을 역산하면 `/usr/local/bin/cys` 파일 심링크를 못 풀어 `/usr/local/Resources/…`
+#      가 된다(반박 D-4). 셔임은 **절대 고르지 않는다** — 없으면 빈 값(호출부 cannot-judge·강등 갈래).
+#   ⑤ 테스트 전용 오버라이드: `CYS_DEVTOOLS_ROOTS`(CLT 후보 표 · 콜론 목록) · `CYS_DEVTOOLS_SHIM_DIR`
+#      (셔임이 사는 디렉터리 · 기본 /usr/bin). 운영 기계에는 없다 — 설정돼도 결과는 "동봉·다른 python 을
+#      쓴다" 또는 "종전과 같다" 둘 중 하나라 위험 방향이 없다.
+#   ⑥ cysd 가 CLT 없는 맥의 pane 에 `CYS_PY=<동봉>` 을 미리 싣는다(src/lib.rs spawn_env_pairs ⑦) — 위 첫
+#      갈래가 그것을 존중하므로 이 절은 **버전 스큐(새 팩 + 구 앱)·데몬 밖 실행** 의 이중 방어다.
+
+# 선택된 개발자 디렉터리(DEVELOPER_DIR → select link → Xcode.app → CLT 중 **처음 실재하는 하나**)의
+# usr/bin/$1 이 실행 가능 파일이면 0. OS 는 묻지 않는다(소비자가 darwin 갈래에서만 부른다).
+cys_clt_tool_present() {
+  _cys_ct_t="${1:-}"
+  case "$_cys_ct_t" in ''|*/*) return 1 ;; esac
+  _cys_ct_sel=""
+  if [ -n "${DEVELOPER_DIR:-}" ] && [ -d "${DEVELOPER_DIR:-}" ]; then
+    _cys_ct_sel="${DEVELOPER_DIR:-}"
+  else
+    _cys_ct_rest="${CYS_DEVTOOLS_ROOTS:-/var/db/xcode_select_link:/Applications/Xcode.app/Contents/Developer:/Library/Developer/CommandLineTools}:"
+    while [ -n "$_cys_ct_rest" ]; do
+      _cys_ct_d="${_cys_ct_rest%%:*}"
+      _cys_ct_rest="${_cys_ct_rest#*:}"
+      [ -n "$_cys_ct_d" ] || continue
+      if [ -d "$_cys_ct_d" ]; then
+        _cys_ct_sel="$_cys_ct_d"
+        break
+      fi
+    done
+  fi
+  [ -n "$_cys_ct_sel" ] || return 1
+  [ -f "$_cys_ct_sel/usr/bin/$_cys_ct_t" ] && [ -x "$_cys_ct_sel/usr/bin/$_cys_ct_t" ]
+}
+
+# darwin ∧ CLT python3 부재 — PATH 의 python3 가 셔임일 수 있는 기계면 0. 소비자: 인터프리터 `python3`
+# 명시 폴백을 거두는 자리(inject-context·save-state). 비-darwin 은 1(= 종전 폴백 유지).
+cys_py_shim_risk() {
+  case "${OSTYPE:-}" in darwin*) ;; *) return 1 ;; esac
+  cys_clt_tool_present python3 && return 1
+  return 0
+}
+
+# $1(해소된 인터프리터 경로)이 CLT 없는 맥의 python 셔임이면 0 — 셔임 디렉터리(기본 /usr/bin)의
+# python3·python 이거나 그것을 가리키는 별칭(`-ef` = 심링크·하드링크 · `//` 같은 표기 차이 포함).
+cys_py_is_shim() {
+  case "${OSTYPE:-}" in darwin*) ;; *) return 1 ;; esac
+  _cys_sh_p="${1:-}"
+  [ -n "$_cys_sh_p" ] || return 1
+  _cys_sh_d="${CYS_DEVTOOLS_SHIM_DIR:-/usr/bin}"
+  case "$_cys_sh_p" in
+    "$_cys_sh_d/python3"|"$_cys_sh_d/python") ;;
+    *)
+      if [ -e "$_cys_sh_d/python3" ] && [ "$_cys_sh_p" -ef "$_cys_sh_d/python3" ]; then
+        :
+      elif [ -e "$_cys_sh_d/python" ] && [ "$_cys_sh_p" -ef "$_cys_sh_d/python" ]; then
+        :
+      else
+        return 1
+      fi ;;
+  esac
+  cys_py_shim_risk
+}
+
+# 사전설정 CYS_PY 가 셔임을 가리키는가(비-darwin 은 즉시 1 — 서브셸 0).
+_cys_py_preset_is_shim() {
+  case "${OSTYPE:-}" in darwin*) ;; *) return 1 ;; esac
+  case "${CYS_PY:-}" in
+    */*) cys_py_is_shim "${CYS_PY:-}" ;;
+    *) cys_py_is_shim "$(command -v "${CYS_PY:-}" 2>/dev/null)" ;;
+  esac
+}
+
+# 해소값이 셔임이면 대체를 PATH 순회로 찾는다: ① 동봉 python(`*/runtime/python/bin/python3`)
+# ② 셔임 아닌 첫 python3 ③ 같은 규칙의 python. 없으면 빈 값 — 셔임은 고르지 않는다.
+_cys_py_avoid_shim() {
+  case "${OSTYPE:-}" in darwin*) ;; *) return 0 ;; esac
+  cys_py_is_shim "${CYS_PY:-}" || return 0
+  for _cys_as_mode in bundled python3 python; do
+    _cys_as_rest="${PATH:-}:"
+    while [ -n "$_cys_as_rest" ]; do
+      _cys_as_d="${_cys_as_rest%%:*}"
+      _cys_as_rest="${_cys_as_rest#*:}"
+      [ -n "$_cys_as_d" ] || continue
+      case "$_cys_as_mode" in
+        bundled)
+          case "$_cys_as_d" in
+            */runtime/python/bin|*/runtime/python/bin/) _cys_as_c="${_cys_as_d%/}/python3" ;;
+            *) continue ;;
+          esac ;;
+        *) _cys_as_c="${_cys_as_d%/}/$_cys_as_mode" ;;
+      esac
+      if [ -f "$_cys_as_c" ] && [ -x "$_cys_as_c" ] && ! cys_py_is_shim "$_cys_as_c"; then
+        CYS_PY="$_cys_as_c"
+        return 0
+      fi
+    done
+  done
+  CYS_PY=""
+  return 0
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

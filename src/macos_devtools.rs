@@ -73,8 +73,13 @@ pub fn selected_developer_dir_in(
     developer_dir_env: Option<&OsStr>,
     candidates: &[PathBuf],
 ) -> Option<PathBuf> {
-    let _ = (developer_dir_env, candidates);
-    None // RED 스텁: 판정 없음
+    if let Some(d) = developer_dir_env.filter(|d| !d.is_empty()) {
+        let p = PathBuf::from(d);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    candidates.iter().find(|c| c.is_dir()).cloned()
 }
 
 /// `tool` 이 선택된 개발자 디렉터리의 `usr/bin` 에 실행 가능 파일로 있는가(순수 코어 — 테스트 대상).
@@ -86,8 +91,12 @@ pub fn clt_tool_present_in(
     candidates: &[PathBuf],
     tool: &str,
 ) -> bool {
-    let _ = (developer_dir_env, candidates, tool);
-    true // RED 스텁: 종전 암묵 가정(도구가 있다)
+    if tool.is_empty() || tool.contains('/') || tool.contains('\\') {
+        return false;
+    }
+    selected_developer_dir_in(developer_dir_env, candidates)
+        .map(|d| is_executable_file(&d.join("usr").join("bin").join(tool)))
+        .unwrap_or(false)
 }
 
 /// [`clt_tool_present_in`] 을 **이 프로세스의 `DEVELOPER_DIR`** 와 고정 후보 표로 부른다(관측 층).
@@ -100,8 +109,10 @@ pub fn clt_tool_present(tool: &str) -> bool {
 /// 동봉 python3 절대경로 — `runtime_bin_dirs`(mac: `Contents/Resources/runtime/python/bin` 등)에서
 /// 실행 가능한 `python3` 를 처음 찾은 것. 없으면 None(개발 빌드·손상 번들 — 종전 동작 유지).
 pub fn bundled_python3_path(exe_dir: &Path) -> Option<PathBuf> {
-    let _ = exe_dir;
-    None // RED 스텁
+    crate::runtime_bin_dirs(exe_dir)
+        .into_iter()
+        .map(|d| d.join("python3"))
+        .find(|p| is_executable_file(p))
 }
 
 /// ★U15 **단일 판정**(순수 — OS·롤백·동봉 경로·CLT 관측을 인자로 받는다).
@@ -118,8 +129,14 @@ pub fn clt_absent_bundled_python_for(
     bundled: Option<&Path>,
     clt_python_present: impl FnOnce() -> bool,
 ) -> Option<PathBuf> {
-    let _ = (os, master_off, bundled, clt_python_present);
-    None // RED 스텁: 치환 없음(종전)
+    if os != "macos" || master_off {
+        return None;
+    }
+    let b = bundled?;
+    if clt_python_present() {
+        return None;
+    }
+    Some(b.to_path_buf())
 }
 
 /// [`clt_absent_bundled_python_for`] 를 **현재 프로세스**(OS·`CYS_BOOT_GATES`·`DEVELOPER_DIR`)로 부른다.
@@ -149,14 +166,34 @@ pub fn inject_cys_py_for(
     bundled_when_clt_absent: Option<&Path>,
     user_has_cys_py: bool,
 ) {
-    let _ = (env_pairs, bundled_when_clt_absent, user_has_cys_py); // RED 스텁: 무주입(종전)
+    if user_has_cys_py {
+        return;
+    }
+    let Some(p) = bundled_when_clt_absent else {
+        return;
+    };
+    if env_pairs
+        .iter()
+        .any(|(k, _)| k == ENV_CYS_PY || k == ENV_CYS_PY_ORIGIN)
+    {
+        return;
+    }
+    env_pairs.push((ENV_CYS_PY.to_string(), p.to_string_lossy().into_owned()));
+    env_pairs.push((
+        ENV_CYS_PY_ORIGIN.to_string(),
+        CYS_PY_ORIGIN_CLT_ABSENT.to_string(),
+    ));
 }
 
 /// `dir` 을 PATH **맨 앞**에 얹은 값(순수). 기존 성분은 순서 그대로 뒤에 보존한다.
 /// join 실패(성분에 구분자 포함 — 동봉 경로에선 비실재)는 `current` 를 그대로 돌려준다(무변경 = 안전측).
 pub fn path_with_dir_first(dir: &Path, current: Option<&OsStr>) -> OsString {
-    let _ = dir;
-    current.map(OsStr::to_os_string).unwrap_or_default() // RED 스텁: 무변경
+    let mut parts: Vec<PathBuf> = vec![dir.to_path_buf()];
+    if let Some(cur) = current {
+        parts.extend(std::env::split_paths(cur));
+    }
+    std::env::join_paths(parts)
+        .unwrap_or_else(|_| current.map(OsStr::to_os_string).unwrap_or_default())
 }
 
 /// `cys boot` 회수 자식(`escalate_reclaim`)의 PATH — CLT 없는 맥에서만 Some(동봉 python 디렉터리 선두).
@@ -167,8 +204,9 @@ pub fn path_with_dir_first(dir: &Path, current: Option<&OsStr>) -> OsString {
 /// 찾는다 — 아래 테스트 `child_path_governs_program_lookup` 이 실측으로 못박는다). None 이면 호출부가
 /// PATH 를 건드리지 않는다(윈도우·리눅스·CLT 있는 맥 = 종전과 동일).
 pub fn clt_absent_child_path(exe_dir: &Path, current: Option<&OsStr>) -> Option<OsString> {
-    let _ = (exe_dir, current);
-    None // RED 스텁
+    let py = clt_absent_bundled_python(exe_dir)?;
+    let dir = py.parent()?;
+    Some(path_with_dir_first(dir, current))
 }
 
 /// Tauri 기동 안내 문구(순수). 두 도구가 모두 있으면 None(정상 맥은 말이 없어야 한다).
@@ -177,8 +215,26 @@ pub fn clt_absent_child_path(exe_dir: &Path, current: Option<&OsStr>) -> Option<
 /// 직접 치는 `python3`·`git`, Claude Code 자신의 git 확인)을 **둘 다** 말한다. "전부 정상"이라고 말하면
 /// 그 뒤에 뜨는 설치 창이 거짓 안내가 된다. 재설치 채널(bundle-damaged)과 섞지 않는다 — 고장이 아니다.
 pub fn devtools_missing_notice(python_present: bool, git_present: bool) -> Option<String> {
-    let _ = (python_present, git_present);
-    None // RED 스텁: 안내 없음(종전)
+    if python_present && git_present {
+        return None;
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    if !python_present {
+        missing.push("python3");
+    }
+    if !git_present {
+        missing.push("git");
+    }
+    Some(format!(
+        "이 맥에는 '명령어 라인 개발자 도구'(Command Line Tools)가 없습니다 — 없는 도구: {}. \
+         이 맥의 /usr/bin/python3·/usr/bin/git 은 '개발자 도구를 설치하라'는 창을 띄우는 껍데기라서, \
+         cys 는 훅·부트 점검·자동 복구를 앱에 들어 있는 python 으로 돌립니다. \
+         다만 에이전트가 직접 python3·git 명령을 칠 때와 Claude Code 가 git 을 확인할 때는 그 설치 창이 \
+         뜰 수 있습니다 — '나중에'를 눌러도 cys 는 계속 동작합니다. \
+         git 원격 기능(자기개선 push 등)까지 쓰려면 그 창의 '설치'를 누르거나 터미널에서 \
+         xcode-select --install 을 실행하세요.",
+        missing.join("·")
+    ))
 }
 
 #[cfg(test)]

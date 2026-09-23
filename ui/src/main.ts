@@ -7720,6 +7720,8 @@ async function start() {
     if (typeof message !== "string" || !message) return;
     if (kind === "capped") stickyToast("onboard-capped", "health", "Claude 설정 파일을 고쳐 주세요", message);
     else if (kind === "restored") stickyToast("onboard-restored", "health", "Claude 연결 설정을 다시 넣었습니다", message);
+    // ★U15(0.14.41): 개발자 도구(CLT) 없는 맥 — 고장이 아니라 환경 안내(버전당 1회 · src-tauri DEVTOOLS_NOTICE_KIND 와 같은 문자열).
+    else if (kind === "devtools-missing") stickyToast("onboard-devtools", "health", "개발자 도구 없이 동작 중입니다", message);
   };
   await listen("onboard-notice", (e) => showOnboardNotice(e.payload));
   try {

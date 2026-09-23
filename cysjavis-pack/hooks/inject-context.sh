@@ -16,7 +16,10 @@ INPUT=$(cat 2>/dev/null)
 [ -z "$INPUT" ] && exit 0
 # 인터프리터 해소는 프리루드(python3→python→py). 이 훅의 기존 계약(비어 있으면 안 됨)은
 # 자기 자리에서 명시 폴백한다 — 계약 무변경(미해소 시 graceful degrade).
-[ -n "$CYS_PY" ] || CYS_PY="python3"
+# ★U15(0.14.41): 개발자 도구(CLT) 없는 맥(프리루드 `cys_py_shim_risk`)에서는 폴백하지 않는다 — 그 기계의
+#   `python3` 는 설치 창 셔임이다. 빈 값의 `"$CYS_PY"` 호출은 아래 전부가 이미 견디는 graceful 갈래다
+#   (셔임 실행의 비0 과 같은 결과 · 설치 창만 없다). 윈도우·리눅스·CLT 있는 맥은 종전 폴백 그대로다.
+[ -n "$CYS_PY" ] || { command -v cys_py_shim_risk >/dev/null 2>&1 && cys_py_shim_risk; } || CYS_PY="python3"
 
 # JSON stdin 을 python 1회 스폰으로 source·cwd 동시 파싱(콜드스타트 절감 — 기존 2회 스폰 병합).
 # __CYS_END__ sentinel 로 cwd 공백 시에도 필드 경계를 결정론 보존($()가 후행 개행을 삭제해도
