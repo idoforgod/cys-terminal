@@ -52,8 +52,17 @@ html, body {
   border-radius: 8px; background: var(--error); color: #fff;
   font-size: 10px; text-align: center;
 }
-/* 업데이트 배지 "0"(최신 확인) — 경고색 대신 중립(확인 완료·대기 0건의 안심 신호) */
+/* 업데이트 배지 중립(최신 확인 ✓ · 확인 중 …) — 경고색 대신 중립(확인 완료·대기 0건의 안심 신호) */
 .badge.ok { background: #21262d; color: #8b949e; border: 1px solid var(--border); }
+/* ★짝 규칙(Directive · 아래 #cc-panel 주석과 같은 함정): 위 .badge 의 display:inline-block 이 HTML hidden
+   (UA [hidden]{display:none} · 명시도 열세)을 이겨, 코드가 badge.hidden=true 를 해도 화면에 남았다(첫 커밋부터).
+   그래서 Control Center 옆 빨간 0(승인 대기 0건)이 늘 보였고, Update 옆 '!'·'↻'가 확인 전·팩 설치 뒤에도 남아
+   "숫자가 떠 있는데 눌러 보면 최신"이 됐다(U9 · 0.14.41). 이 짝으로 세 배지(update·cc-pending·feed 탭)의
+   숨김이 코드 의도대로 작동한다 — 승인 대기 0건이면 빨간 0 이 사라지는 것이 의도다. 핀: hiddenpair.test.ts */
+.badge[hidden] { display: none; }
+/* 업데이트 배지 '?'(최신 여부 확인 불가 — 확인 실패·팩 정보 해석 불가·설치된 팩 상태 불명) — 빨강(조치 필요)도
+   회색(최신)도 아닌 주황 중립. 눌러서 창의 사유를 읽게 한다(U9 · 0.14.41). */
+.badge.warn { background: rgba(210,153,34,.15); color: var(--warn); border: 1px solid rgba(210,153,34,.45); }
 
 /* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
@@ -580,6 +589,24 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 /* ★D3a(purge-safety 2026-07-16): 비활성이 활성과 픽셀 동일해 "눌러도 무반응"으로 오인되던 실사고 —
    #btn-ws-dept:disabled(위 113행)와 동일 관용구로 모달 버튼 전체에 비활성 시각화. */
 .modal-btns button:disabled { opacity: .5; cursor: default; }
+/* U9 업데이트 상태 창(Update 클릭) — 본체·팩 두 행(현재→새 버전·실패 사유) + 마지막 확인 시각. .modal 재사용.
+   글자색은 상태 톤(최신 초록 · 설치 가능 빨강 · 불명 주황 · 미확인 회색). 행 레이아웃은 2열 격자. */
+.modal.upd-panel { min-width: min(440px, 92vw); max-width: min(560px, 92vw); }
+.modal .upd-headline { margin: 0 0 12px; font-weight: 600; white-space: normal; }
+.modal .upd-headline.ok { color: var(--ok); }
+.modal .upd-headline.alert { color: var(--error); }
+.modal .upd-headline.warn { color: var(--warn); }
+/* 리뷰1 F3: 미확인·확인 중('아직 확인 전'·'확인 중…')은 '최신'(ok=초록)과 다른 색이어야 한다. */
+.modal .upd-headline.muted { color: #8b949e; }
+.upd-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
+.upd-row { display: contents; }
+.upd-k { color: #8b949e; white-space: nowrap; }
+.upd-v { overflow-wrap: anywhere; }
+.upd-row.ok .upd-v { color: var(--ok); }
+.upd-row.alert .upd-v { color: var(--error); }
+.upd-row.warn .upd-v { color: var(--warn); }
+.upd-row.muted .upd-v { color: #8b949e; }
+.modal .upd-meta { margin: 0 0 14px; font-size: 11px; color: #8b949e; white-space: normal; }
 /* 완전삭제 확인 입력의 불일치 실시간 힌트(modal-trust 계열 경고색·빈 상태 높이 예약) */
 .modal-hint { font-size: 11px; color: #f59e0b; margin: 6px 0 0; min-height: 14px; }
 

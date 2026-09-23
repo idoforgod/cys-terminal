@@ -20,7 +20,19 @@ import {
   type SurfaceRow,
   type TransferRecord,
 } from "./transfer";
-import { updatePlan } from "./updateplan";
+import {
+  INITIAL_UPDATE_STATE,
+  binFromCheck,
+  packFromCheck,
+  packAfterInstalled,
+  packAfterUpToDate,
+  binActionable,
+  packActionable,
+  deriveUpdateView,
+  type CheckResult,
+  type UpdateState,
+  type UpdateView,
+} from "./updatestate";
 import { planRestartInject, restartInvokeFailureReason } from "./restartplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -5481,106 +5493,205 @@ async function refreshFeed() {
 }
 
 // ---------- 자동 업데이트 ----------
+//
+// ★U9(0.14.41 · 설계 §3 U9): 배지·클릭 창·토스트는 **한 상태**(updState)에서 파생된 **한 보기**
+// (updatestate.ts deriveUpdateView)만 그린다. 종전에는 전역 두 개(updateAvailable·packUpdateAvailable)와
+// 즉석 판정이 갈라져 ↻ 배지인데 클릭은 본체 창부터 열렸고(R3), 팩 확인 실패는 catch {} 로 삼켜졌으며(R2),
+// 판독 실패는 '최신'으로 접혔다(R4). 이제 '최신'은 본체·팩 두 확인이 모두 성공했을 때만 나온다.
+// 배지 DOM 을 쓰는 곳은 renderUpdateBadge 하나뿐이다(updatewiring.test.ts 가 센다).
+let updState: UpdateState = INITIAL_UPDATE_STATE;
+// 단일 비행 — 시작 확인·6시간 폴링·클릭·[다시 확인]이 겹쳐도 curl·업데이터 확인은 한 번만 돈다.
+let updRefreshInFlight: Promise<void> | null = null;
+// 확인 1회(본체·팩 각각)의 상한. 넘기면: 그 확인은 '실패(응답 시간 초과)'로 기록된다 — '최신'이라 말하지 않고
+// 단일 비행이 풀려 다음 확인(클릭·[다시 확인]·6시간)이 다시 시도한다. curl 에 --max-time 이 없어 멈춘 연결이
+// 단일 비행을 영구히 붙잡는 것을 막는다. check_update·check_pack_update 는 부작용 없는 조회라 rpcT 의 전제를
+// 지킨다(진 쪽이 뒤늦게 끝나도 상태를 바꾸지 않는다 — 결과는 버려진다).
+const T_UPD_CHECK = winScaled(60_000);
+let updAppVersion = "";
+// 클릭 창(열려 있을 때만 존재) — 확인이 끝나면 같은 창을 다시 그린다(창 1개 상한).
+let updPanel: HTMLElement | null = null;
 
-// invoke 응답의 신뢰 모양 — **명명 타입으로 둔다**(인라인 금지). 아래 checkForUpdate 가
-// `as typeof bin` 으로 단언하던 자리에서 TS2339('… does not exist on type never')가 7건 났던
-// 원인이 이것이다: `as typeof X` 는 선언 타입이 아니라 **그 지점의 좁혀진 타입**을 가리키는데,
-// 바로 위에서 null 로 초기화했으므로 typeof X = null 이 되고 → 대입 후 X 는 null 로 좁혀지며
-// → `X && X.version` 의 truthy 분기가 never 가 된다. 명명 별칭은 좁혀지지 않으므로 원래 의도
-// (응답을 이 모양으로 신뢰)를 그대로 표현하면서 게이트(bunx tsc -p tsconfig.check.json)를 통과한다.
-type BinUpdateInfo = { version: string; current?: string; notes?: string };
-type PackUpdateInfo = { pack_version: string; manifest_url: string; binary_too_old: boolean };
-
-let updateAvailable: { version: string; notes?: string } | null = null;
-// 무중단 팩 업데이트(check_pack_update) 결과 — 팩만 변경 시 세션·데몬 유지 경로(install_pack_update).
-let packUpdateAvailable: PackUpdateInfo | null = null;
-
-/// 업데이트 확인. silent=true면 시작 시 백그라운드 체크(결과 없으면 조용히).
-/// 바이너리(check_update·재시작)와 무중단 팩(check_pack_update·세션 유지)을 둘 다 확인해 분기한다.
-async function checkForUpdate(silent: boolean) {
-  // 1) 바이너리 업데이트(Tauri updater latest.json) — 재시작 경로.
-  let bin: BinUpdateInfo | null = null;
-  let binCheckFailed = false;
+function updClock(ms: number): string {
   try {
-    bin = (await invoke("check_update")) as BinUpdateInfo | null;
-  } catch (e) {
-    // ★early-return 안 함(팩 체크는 계속) — 단, 바이너리 상태 불명을 기억해 아래 '최신' 단정을 억제한다.
-    binCheckFailed = true;
-    if (!silent) toast("health", "업데이트 확인 실패", String(e));
-  }
-  // 2) 무중단 팩 업데이트(pack-manifest.json) — 세션·데몬 유지 경로. 실패는 조용히(폴링).
-  let pack: PackUpdateInfo | null = null;
-  let packCheckFailed = false;
-  try {
-    pack = (await invoke("check_pack_update")) as PackUpdateInfo | null;
+    return new Date(ms).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
   } catch {
-    /* 팩 체크 실패(네트워크·부재) = 조용히 무시 */
-    packCheckFailed = true;
+    return "";
   }
+}
 
-  // ★fail-safe: 체크가 성공했을 때만 상태를 갱신한다. 일시 네트워크/업데이터 장애로 체크가 실패하면
-  // 마지막으로 검증된 상태(있던 업데이트 배지)를 보존한다 — 장애로 배지가 사라져 "업데이트 없음"으로
-  // 오인하는 것을 막는다(fresh 성공 시에만 갱신·해제).
-  if (!binCheckFailed) {
-    updateAvailable = bin && bin.version ? { version: bin.version, notes: bin.notes } : null;
+async function updCurrentVersion(): Promise<string> {
+  if (updAppVersion) return updAppVersion;
+  try {
+    updAppVersion = String((await invoke("app_version")) ?? "");
+  } catch {
+    /* 구 백엔드 — 현재 버전 표시만 빠진다 */
   }
-  if (!packCheckFailed) {
-    packUpdateAvailable =
-      pack && pack.pack_version
-        ? { pack_version: pack.pack_version, manifest_url: pack.manifest_url, binary_too_old: pack.binary_too_old }
-        : null;
-  }
+  return updAppVersion;
+}
 
-  const badge = document.getElementById("update-badge")!;
-  // 분기 판정은 순수 함수(updateplan.ts — 옵션 2·오너 승인 2026-07-14)로 일원화.
-  // 기존 4분기 배지·문구는 updateplan.test.ts가 문자열 단위로 핀(회귀 0) — 신설은
-  // pack-and-binary(본체+팩 동시·호환 시 팩 무중단을 가리지 않음·T5 불변) 하나뿐이다.
-  const plan = updatePlan({
-    binVersion: updateAvailable ? updateAvailable.version : null,
-    packVersion: packUpdateAvailable ? packUpdateAvailable.pack_version : null,
-    binaryTooOld: packUpdateAvailable ? packUpdateAvailable.binary_too_old : false,
-    binCheckFailed,
-    packCheckFailed,
+/// 배지 DOM 을 쓰는 **유일한** 자리. hidden 은 style.css .badge[hidden] 짝 규칙이 있어야 실제로 숨는다.
+function renderUpdateBadge(v: UpdateView) {
+  const badge = document.getElementById("update-badge");
+  if (!badge) return;
+  badge.hidden = v.badge.hidden;
+  badge.textContent = v.badge.text;
+  badge.classList.toggle("ok", v.badge.tone === "ok");
+  badge.classList.toggle("warn", v.badge.tone === "warn");
+  badge.title = v.badge.title;
+}
+
+/// 상태가 바뀔 때마다 배지와(열려 있으면) 창을 다시 그린다. 렌더 예외가 부팅·폴링을 죽이지 않게 가둔다.
+function renderUpdateAll() {
+  try {
+    renderUpdateBadge(deriveUpdateView(updState, updClock));
+    renderUpdatePanel();
+  } catch (e) {
+    console.warn("[update] render 실패", e);
+  }
+}
+
+/// 업데이트 확인. silent=true = 시작 1회·6시간 폴링(토스트만 · 창 금지 — 온보딩 화면 가림 방지 불변식).
+/// 본체(check_update · 재시작 경로)와 무중단 팩(check_pack_update · 세션 유지)을 둘 다 확인해 상태에 쓴다.
+/// 실패는 삼키지 않고 상태에 기록한다(직전 검증 상태는 '직전 확인 기준'으로만 보존 — fail-safe).
+function refreshUpdateState(silent: boolean): Promise<void> {
+  if (updRefreshInFlight) return updRefreshInFlight;
+  updRefreshInFlight = (async () => {
+    updState = { ...updState, checking: true };
+    renderUpdateAll();
+    const why = (e: unknown): string =>
+      e instanceof Error && e.message === "rpc timeout" ? `응답 시간 초과(${Math.round(T_UPD_CHECK / 1000)}초)` : String(e);
+    // 리뷰1 F4(선택 · 안전·저비용): 두 invoke 를 동시에 띄운다 — 순차면 둘 다 멈춘 연결일 때 최악
+    // 2×T_UPD_CHECK(윈도우 4×)를 기다렸다. 각자 독립 try/catch 로 실패를 삼키지 않는 것은 그대로다
+    // (단일 비행·확인마다 상한도 무변경 — updRefreshInFlight·rpcT 래핑 자체는 손대지 않는다).
+    const binCheck = async (): Promise<CheckResult> => {
+      try {
+        return { ok: true, value: await rpcT(invoke("check_update"), T_UPD_CHECK) };
+      } catch (e) {
+        return { ok: false, error: why(e) };
+      }
+    };
+    const packCheck = async (): Promise<CheckResult> => {
+      try {
+        return { ok: true, value: await rpcT(invoke("check_pack_update"), T_UPD_CHECK) };
+      } catch (e) {
+        return { ok: false, error: why(e) };
+      }
+    };
+    const [binR, packR] = await Promise.all([binCheck(), packCheck()]);
+    const current = await updCurrentVersion();
+    const now = Date.now();
+    updState = {
+      bin: binFromCheck(updState.bin, binR, current, now),
+      pack: packFromCheck(updState.pack, packR, now),
+      checking: false,
+    };
+    renderUpdateAll();
+    if (silent) {
+      const t = deriveUpdateView(updState, updClock).silentToast;
+      if (t) toast("feed", t.title, t.msg);
+    }
+  })()
+    .catch((e) => {
+      updState = { ...updState, checking: false };
+      renderUpdateAll();
+      console.warn("[update] 확인 실패", e);
+    })
+    .finally(() => {
+      updRefreshInFlight = null;
+    });
+  return updRefreshInFlight;
+}
+
+function closeUpdatePanel() {
+  if (!updPanel) return;
+  updPanel.remove();
+  updPanel = null;
+}
+
+/// 클릭 창 — 본체·팩 각 행(현재→새 버전 · 실패 사유), 마지막 확인 시각, 설치 버튼(팩 먼저), [다시 확인]·[닫기].
+/// 설치는 기존 경로(promptPackInstall·promptBinaryPatch)를 그대로 쓴다 — 설치 로직 무변경.
+function openUpdatePanel() {
+  if (updPanel) {
+    renderUpdatePanel();
+    return;
+  }
+  const ov = document.createElement("div");
+  ov.className = "modal-overlay";
+  ov.innerHTML =
+    `<div class="modal upd-panel"><h3>업데이트</h3><p class="upd-headline"></p>` +
+    `<div class="upd-rows"></div><p class="upd-meta"></p><div class="modal-btns"></div></div>`;
+  ov.addEventListener("click", (e) => {
+    if (e.target === ov) closeUpdatePanel();
   });
-  if (plan.kind !== "unknown") {
-    // unknown = 체크 실패·보존 상태 없음 → 배지 유지('최신' 오단정 금지, 종전 fail-safe).
-    badge.hidden = false;
-    badge.textContent = plan.badge;
-    if (plan.ok) badge.classList.add("ok");
-    else badge.classList.remove("ok");
-    badge.title = plan.title;
+  ov.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Escape") closeUpdatePanel();
+  });
+  document.body.appendChild(ov);
+  updPanel = ov;
+  renderUpdateAll(); // try/catch 안에서 그린다(렌더 예외가 클릭 처리를 죽이지 않게)
+}
+
+function renderUpdatePanel() {
+  const ov = updPanel;
+  if (!ov) return;
+  const v = deriveUpdateView(updState, updClock);
+  const head = ov.querySelector(".upd-headline") as HTMLElement | null;
+  if (head) {
+    head.textContent = v.headline;
+    // 리뷰1 F3: 미확인·확인 중 상태의 badge.tone 은 "ok"(색 없음을 뜻하는 중립)이지만, isLatest 가
+    // 아닌데 "ok" 클래스를 그대로 쓰면 확인 전·확인 중 문구가 '최신'과 같은 초록으로 보인다.
+    // isLatest 일 때만 ok(초록) — 그 밖의 "ok" 톤(미확인·확인 중)은 muted(회색)로 낮춘다.
+    const cls = v.isLatest ? "ok" : v.actions.length > 0 ? "alert" : v.badge.tone === "ok" ? "muted" : v.badge.tone;
+    head.className = "upd-headline " + cls;
   }
-  switch (plan.kind) {
-    case "pack-and-binary":
-      // ★옵션 2: 팩 무중단이 실행 가능한 액션 — 모달은 팩 하나만(silent 불변식: 모달 금지는
-      // silent 경로에만 해당·비silent도 모달 1개 상한), 본체는 토스트로 병행 안내(T5 경로 유지).
-      if (!silent) {
-        promptPackInstall();
-        toast("feed", "🔄 새 본체도 있음", `새 본체 ${updateAvailable!.version} — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)`);
-      } else toast("feed", "↻ 무중단 팩 + 새 본체", plan.toastMsg);
-      break;
-    case "binary":
-      // 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15) 재배선(구 T5 홈페이지 전용의 실험적 개정).
-      if (!silent) promptBinaryPatch();
-      else toast("feed", "🔄 새 본체 버전", plan.toastMsg);
-      break;
-    case "pack":
-      // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
-      if (!silent) promptPackInstall();
-      else toast("feed", "↻ 무중단 팩 업데이트", plan.toastMsg);
-      break;
-    case "binary-required":
-      // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
-      if (!silent) toast("health", "본체 업데이트 필요", plan.toastMsg);
-      else toast("feed", "⚠ 업데이트 있음", plan.toastMsg);
-      break;
-    case "none":
-      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시. 중립 스타일(.ok)로 경고색 회피.
-      if (!silent) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
-      break;
-    case "unknown":
-      break;
+  const rowsEl = ov.querySelector(".upd-rows") as HTMLElement | null;
+  if (rowsEl) {
+    rowsEl.textContent = "";
+    for (const r of v.rows) {
+      const row = document.createElement("div");
+      row.className = "upd-row " + r.tone;
+      const k = document.createElement("span");
+      k.className = "upd-k";
+      k.textContent = r.label;
+      const t = document.createElement("span");
+      t.className = "upd-v";
+      t.textContent = r.text;
+      row.append(k, t);
+      rowsEl.appendChild(row);
+    }
   }
+  const meta = ov.querySelector(".upd-meta") as HTMLElement | null;
+  if (meta) meta.textContent = v.meta;
+  const btns = ov.querySelector(".modal-btns") as HTMLElement | null;
+  if (!btns) return;
+  btns.textContent = "";
+  const mk = (label: string, cls: string, fn: () => void, disabled = false) => {
+    const b = document.createElement("button");
+    b.className = cls;
+    b.textContent = label;
+    b.disabled = disabled;
+    b.addEventListener("click", fn);
+    btns.appendChild(b);
+    return b;
+  };
+  const closeBtn = mk("닫기", "modal-no", () => closeUpdatePanel());
+  mk(updState.checking ? "확인 중…" : "다시 확인", "modal-no", () => void refreshUpdateState(false), updState.checking);
+  for (const a of v.actions) {
+    if (a === "pack-install")
+      mk("팩 무중단 적용", "modal-yes", () => {
+        closeUpdatePanel();
+        void promptPackInstall();
+      });
+    else
+      mk("본체 패치 설치", "modal-yes", () => {
+        closeUpdatePanel();
+        void promptBinaryPatch();
+      });
+  }
+  // 기본 포커스는 안전한 쪽(닫기) — confirmModal 관례(무심코 친 Enter 가 설치를 승인하지 않게).
+  // 다시 그리면서 포커스 버튼이 지워졌으면(포커스가 body 로 빠짐) 창 안으로 되돌린다 — 키 입력이 창 밖
+  // (터미널)으로 새지 않게.
+  if (!ov.contains(document.activeElement)) closeBtn.focus();
 }
 
 /// 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15)로 인앱 install_update 재배선(구 T5 홈페이지
@@ -5591,11 +5702,14 @@ async function promptBinaryPatch() {
   // ★A7(성찰 확정): install_update 는 앱을 교체·재시작한다 — 리셋 실행 중이면 격리 스레드가
   // 중도 사멸해 manifest(복구 지도) 없는 반쪽 격리가 남는다. 완료 래치 상태에서도 무의미하다.
   if (daemonActionBlocked()) return;
-  if (!updateAvailable) {
-    await checkForUpdate(false);
+  const ba = binActionable(updState);
+  if (!ba) {
+    // 창 밖에서 불렸는데 설치할 본체가 없다 — 다시 확인하고 창으로 보여 준다(설치 창을 헛열지 않음).
+    openUpdatePanel();
+    await refreshUpdateState(false);
     return;
   }
-  const v = updateAvailable.version;
+  const v = ba.version;
   const ok = await confirmModal(
     `새 본체 버전 ${v} — 패치 설치`,
     `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
@@ -6017,15 +6131,17 @@ async function checkVersionSkew() {
 async function promptPackInstall() {
   // ★A7: 팩 설치는 격리로 이동 중인 ~/.cys/pack 을 재생성한다 — 리셋 진행/완료 중 금지.
   if (daemonActionBlocked()) return;
-  if (!packUpdateAvailable) {
-    await checkForUpdate(false);
+  const pa = packActionable(updState);
+  if (!pa) {
+    openUpdatePanel();
+    await refreshUpdateState(false);
     return;
   }
-  const pv = packUpdateAvailable.pack_version;
+  const pv = pa.version;
   // 지속형 토스트: pack-progress 리스너가 갱신하고 pack-updated/update-warning이 dismiss한다.
   stickyToast("upd-pack", "feed", "↻ 무중단 팩 업데이트", `팩 ${pv} 적용 중… 세션·데몬 유지(재시작 없음).`);
   try {
-    await invoke("install_pack_update", { manifestUrl: packUpdateAvailable.manifest_url });
+    await invoke("install_pack_update", { manifestUrl: pa.manifestUrl || undefined });
     // 성공(또는 degraded)은 pack-updated/update-warning 리스너가 후속 처리(sticky도 거기서 dismiss).
   } catch (e) {
     dismissToast("upd-pack"); // 완료 이벤트 없이 reject된 경로 — 진행 토스트를 내린다.
@@ -6034,12 +6150,11 @@ async function promptPackInstall() {
   }
 }
 
-/// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 본체(바이너리)=패치 설치(오너 2026-07-15 재배선·재시작+자동복원) → 무중단 팩 → 미확인 시 수동 재확인.
+/// Update 버튼 — ★U9: 클릭하면 **늘** 상태 창을 연다(캐시로 본체 설치 창부터 열던 R3 제거). 창을 먼저
+/// 띄우고('확인 중…') 다시 확인이 끝나면 같은 창을 새 결과로 그린다. 설치는 창의 버튼으로만(창 1개 상한).
 async function onUpdateButton() {
-  if (updateAvailable) return promptBinaryPatch();
-  if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
-  return checkForUpdate(false);
+  openUpdatePanel();
+  await refreshUpdateState(false);
 }
 
 /// 간단한 확인 모달 (WKWebView confirm 회피). resolve(true/false).
@@ -7639,16 +7754,19 @@ async function start() {
       stickyToast("upd-pack", "feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
   });
   await listen("pack-updated", (e) => {
+    // ★통합 0.14.41(A4↔B2): A4 가 구 전역(updateAvailable·packUpdateAvailable)을 단일 updState 로
+    // 대체하면서 `packUpdateAvailable = null;` 대입은 없앴다(그 변수 자체가 더 이상 없다) — B2 가
+    // 추가한 `reinject_skipped` 필드만 타입에 살린다(아래에서 실사용 — '완료' 오판 방지).
     const p = (e.payload ?? {}) as {
       pack_version?: string;
       reinject_failed?: number;
       reinject_deferred?: number;
       reinject_skipped?: boolean; // ★U4-B2③ 재주입 자체를 못 함 — '완료' 단정 금지
     };
-    packUpdateAvailable = null;
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 완료 토스트로 교대.
-    const badge = document.getElementById("update-badge")!;
-    if (!updateAvailable) badge.hidden = true; // 바이너리 업데이트가 별도로 남아있지 않으면 배지 해제
+    // ★U9: 배지를 직접 만지지 않는다 — 상태만 바꾸고 보기에서 다시 그린다(본체 업데이트가 남아 있으면 '!').
+    updState = { ...updState, pack: packAfterInstalled(p.pack_version ?? "", Date.now()) };
+    renderUpdateAll();
     // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
     const failed = p.reinject_failed ?? 0;
     const deferred = p.reinject_deferred ?? 0;
@@ -7674,6 +7792,22 @@ async function start() {
         `팩 ${p.pack_version ?? ""} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`,
       );
     }
+  });
+  // ★U9(R5): CLI 가 반영 없이 끝남(no-op) — "완료"라고 말하지 않는다. 브리지가 확인한 경우(disk_parse=ok ∧
+  // disk ≥ remote)만 '이미 적용돼 있음', 아니면 '팩 상태 불명'(디스크 판독 실패도 CLI 는 no-op 로 끝난다).
+  await listen("pack-uptodate", (e) => {
+    const p = (e.payload ?? {}) as { confirmed?: boolean; disk_version?: string; remote_version?: string };
+    dismissToast("upd-pack");
+    updState = { ...updState, pack: packAfterUpToDate(p, Date.now()) };
+    renderUpdateAll();
+    if (p.confirmed === true)
+      toast("watchdog", "ℹ 이미 적용돼 있음", `팩 ${p.disk_version ?? ""} — 반영할 것이 없습니다(이미 최신).`);
+    else
+      toast(
+        "health",
+        "팩 상태 불명",
+        `설치된 팩 버전을 확인하지 못해 반영하지 않았습니다(디스크 ${p.disk_version ?? "?"} · 공개 ${p.remote_version ?? "?"}). Update 창에서 다시 확인하세요.`,
+      );
   });
   await listen("update-warning", (e) => {
     const p = (e.payload ?? {}) as { message?: string };
@@ -7829,8 +7963,8 @@ async function start() {
   }
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
-  checkForUpdate(true);
-  setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
+  refreshUpdateState(true);
+  setInterval(() => refreshUpdateState(true), 6 * 3600 * 1000);
 
   // 테스트 전용(패치 채널 E2E — 오너 2026-07-15): CYS_AUTOTEST_PATCH_INSTALL=1 env 기동이면 기동
   // 직후 패치 설치를 무클릭 자동 발화(Finder 런칭엔 env 부재 → 프로덕션 무영향). install_update가

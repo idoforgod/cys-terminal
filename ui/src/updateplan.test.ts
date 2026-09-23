@@ -45,10 +45,13 @@ describe("updatePlan — 옵션 2 분기 판정(문자열 핀 = 회귀 0 증명)
     );
   });
 
-  test("업데이트 없음 + 양쪽 체크 성공 → '0' 배지(종전)", () => {
+  // ★의도적 계약 변경(U9 · 0.14.41 · 설계 §3 U9): 최신 표시 '0' → '✓'. 오너 증상("업데이트 숫자 vs
+  // 「최신입니다」")의 한 뿌리가 둥근 알약 '0'을 알림 개수로 읽는 것이었다. 2026-07-03 지시의 목적
+  // ('확인 전'과 '확인됐고 대기 0건'의 구별)은 그대로 지킨다 — 확인 전은 숨김/'…', 확인 뒤는 '✓'.
+  test("업데이트 없음 + 양쪽 체크 성공 → '✓' 배지(숫자 금지 · U9)", () => {
     const p = updatePlan({ ...base, binVersion: null, packVersion: null });
     expect(p.kind).toBe("none");
-    expect(p.badge).toBe("0");
+    expect(p.badge).toBe("✓");
     expect(p.ok).toBe(true);
     expect(p.title).toBe("최신 버전 — 대기 중인 업데이트 없음");
   });

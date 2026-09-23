@@ -14,6 +14,44 @@ pub const EXIT_REINJECT_DEGRADED: i32 = 3;
 /// run_pack_update가 reinject 집계를 stdout에 구조화 출력할 때 쓰는 줄 접두사. 호출자(Tauri
 /// 브리지)가 failed/deferred를 정확히 파싱하도록 사람용 메시지와 별개의 안정 토큰으로 둔다.
 pub const REINJECT_RESULT_PREFIX: &str = "PACK_UPDATE_RESULT";
+/// `cys pack-update` 가 **반영하지 않고 끝난 판정**(UpToDate · no-op · exit 0)을 호출자에게 알리는 줄
+/// 접두사(U9 · 0.14.41). 종전에는 no-op 도 exit 0 이라 GUI 브리지가 "✅ 팩 업데이트 완료"라고 말했다.
+/// 형식(ASCII 한 줄 · 공백 구분 · CRLF 안전하게 trim 파싱):
+///   `PACK_UPDATE_OUTCOME gate=up-to-date remote=<manifest pack_version> disk=<.pack-version> disk_parse=ok|fail`
+/// CLI UpToDate 는 "원격 ≤ 디스크"뿐 아니라 **디스크 판독 실패**(parse 실패 = fail-CLOSED)에서도 나오므로
+/// disk·disk_parse 를 함께 싣는다 — 호출자는 disk_parse=ok ∧ disk ≥ remote 일 때만 "이미 적용됨"이라 말한다.
+pub const PACK_UPDATE_OUTCOME_PREFIX: &str = "PACK_UPDATE_OUTCOME";
+
+/// 토큰 값 정규화 — 공백·비ASCII 가 섞이면 줄 파싱이 깨지므로 안전 문자만 그대로, 빈 값은 `-`, 그 외 `?`.
+fn outcome_token_value(v: &str) -> String {
+    let v = v.trim();
+    if v.is_empty() {
+        "-".to_string()
+    } else if v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_')) {
+        v.to_string()
+    } else {
+        "?".to_string()
+    }
+}
+
+/// PACK_UPDATE_OUTCOME 한 줄을 만든다(순수). `disk_raw` = `.pack-version` 원문(읽기 실패면 None).
+pub fn format_pack_update_outcome(gate: &str, remote: &str, disk_raw: Option<&str>) -> String {
+    let disk = disk_raw.map(str::trim).unwrap_or("");
+    let disk_parse = if parse_semver(disk).is_some() { "ok" } else { "fail" };
+    format!(
+        "{PACK_UPDATE_OUTCOME_PREFIX} gate={} remote={} disk={} disk_parse={disk_parse}",
+        outcome_token_value(gate),
+        outcome_token_value(remote),
+        outcome_token_value(disk),
+    )
+}
+
+/// `cys pack-update` UpToDate 분기가 찍는 결과 줄 — 디스크 `.pack-version` 을 **지금** 읽어 싣는다
+/// (판정에 쓴 값과 같은 파일 · pack_update_from_dir 와 같은 pack_dir()). 읽기만 하고 쓰지 않는다.
+pub fn pack_update_uptodate_line(remote: &str) -> String {
+    let disk = std::fs::read_to_string(pack_dir().join(PACK_VERSION_FILE)).ok();
+    format_pack_update_outcome("up-to-date", remote, disk.as_deref())
+}
 
 // cysjavis-pack의 git-추적 전체 트리는 build.rs가 `git ls-files cysjavis-pack` 소싱으로
 // 컴파일 타임 자동 임베드한다(PACK_ALL — README·directives·bin·hooks·schemas·skills 등 전체). 새
@@ -4486,6 +4524,60 @@ mod tests {
             let _ = w(odd);
             let _ = u(odd);
         }
+    }
+
+    /// U9(0.14.41): pack-update no-op 결과 토큰 — GUI 브리지(src-tauri parse_pack_update_outcome)와의 계약.
+    #[test]
+    fn pack_update_outcome_token_format() {
+        assert_eq!(
+            format_pack_update_outcome("up-to-date", "0.14.40", Some("0.14.40\n")),
+            "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.40 disk=0.14.40 disk_parse=ok"
+        );
+        // 디스크 판독 실패·빈 값·해석 불가 — CLI 는 UpToDate 지만 호출자가 '이미 적용됨'이라 말하면 안 된다.
+        assert_eq!(
+            format_pack_update_outcome("up-to-date", "0.14.40", None),
+            "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.40 disk=- disk_parse=fail"
+        );
+        assert_eq!(
+            format_pack_update_outcome("up-to-date", "0.14.40", Some("garbage")),
+            "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.40 disk=garbage disk_parse=fail"
+        );
+        // 공백·비ASCII·BOM 이 섞인 값은 한 토큰으로 유지한다(줄 파싱 보호).
+        let l = format_pack_update_outcome("up-to-date", "0.14.40", Some("\u{feff}0.14.40 x"));
+        assert_eq!(l, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.40 disk=? disk_parse=fail");
+        assert!(l.is_ascii());
+        assert_eq!(l.split_whitespace().count(), 5);
+    }
+
+    /// ★리뷰1 F2(MR3 공허) — `pack_update_outcome_token_format`은 포맷 함수(`format_pack_update_outcome`)
+    /// 만 본다. 실제로 디스크를 읽는 `pack_update_uptodate_line`은 어떤 lib 테스트도 부르지 않아서,
+    /// 그 함수가 엉뚱한 파일을 읽거나(`.pack-state.json` 등) 항상 판독 실패를 반환해도 전 테스트가
+    /// 녹색이었다. 임시 CYS_PACK_DIR 에 `.pack-version`을 직접 써 두고 그 값이 그대로 실리는지 본다
+    /// (판정에 쓴 것과 같은 파일 · 같은 pack_dir()).
+    #[test]
+    fn pack_update_uptodate_line_reads_live_disk_pack_version() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!("cys-pack-uptodate-line-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let _env = EnvGuard::set("CYS_PACK_DIR", td.to_str().unwrap());
+
+        // ① .pack-version 이 아직 없음 → 판독 실패(disk=- disk_parse=fail). 엉뚱한 파일을 읽어도
+        //    이 값으로 우연히 맞을 수 있으므로 ②·③ 대조가 핵심이다.
+        let line0 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line0, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=- disk_parse=fail");
+
+        // ② .pack-version 에 쓴 값이 그대로 실린다 — 다른 파일을 읽으면(MR3) 여기서 불일치.
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.14.40").unwrap();
+        let line1 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line1, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=0.14.40 disk_parse=ok");
+
+        // ③ 다시 쓰면(CRLF 포함) 캐시된 옛 값이 아니라 **지금** 디스크 값을 다시 읽는다.
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.14.42\r\n").unwrap();
+        let line2 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line2, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=0.14.42 disk_parse=ok");
+
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     /// ★(0.14.39 라운드3 · 성찰2 notice) 레인 가드 표식의 경로·신선도 창은 러스트/파이썬 **사본 2벌**이다.
