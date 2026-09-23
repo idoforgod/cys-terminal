@@ -36,10 +36,14 @@
        안내까지 지운다. 그 회귀는 ⓐ·ⓒ만으로는 통과해 버리므로 ⓑ 로 0건을 즉시 잡는다.
      ★⑤(다운로드 페이지 Defender 섹션)와 **다른 페이지·다른 축**이다 — 어느 쪽도 약화시키지 않는다.
 
-사용: python3 scripts/verify-release-remote.py 0.14.5 [이전버전]
-      (이전버전 생략 시 ① 은 건너뛴다)
-      python3 scripts/verify-release-remote.py --self-test   # ⑦ 집계 로직 셀프테스트(무접촉)
-종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완)
+사용: python3 scripts/verify-release-remote.py <신버전> <구버전>      # 정본 — 8축(①~⑧)
+      python3 scripts/verify-release-remote.py <신버전> --no-prev     # 구버전이 없을 때만(① SKIP 명시)
+      python3 scripts/verify-release-remote.py --self-test             # 판정·인자 셀프테스트(무접촉)
+      ★구버전 생략은 **--no-prev 로만** 허용한다(U4 C4-⑦ · 2026-09-23). 종전엔 구버전을 빼먹으면
+        ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈는데, 그 분모가 오너 문서의 합격 문구와 같아
+        **빼먹은 실행이 합격으로 읽혔다**(구버전 문자열 잔존 = 홈페이지 옛 다운로드 링크 사고를 놓침).
+        이제 플래그 없는 생략은 원격 수신 **전에** exit 2 이고, --no-prev 실행은 요약 줄에 "①SKIP" 을 병기한다.
+종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완) · 2 = 인자 오류(원격 무접촉)
 """
 import hashlib
 import json
@@ -270,14 +274,39 @@ def self_test():
     return 0 if tally["fail"] == 0 else 1
 
 
+def parse_args(argv):
+    """argv → (ver, prev, no_prev) 또는 문자열(인자 오류 사유). 순수함수 — 원격 무접촉."""
+    args = argv[1:]
+    flags = [a for a in args if a.startswith("--")]
+    pos = [a for a in args if not a.startswith("--")]
+    unknown = [f for f in flags if f != "--no-prev"]
+    if unknown:
+        return "모르는 플래그: %s" % " ".join(unknown)
+    no_prev = "--no-prev" in flags
+    if not pos:
+        return "신버전 인자가 없다"
+    if len(pos) > 2:
+        return "위치 인자는 <신버전> <구버전> 둘까지다(받은 것: %s)" % " ".join(pos)
+    ver = pos[0]
+    prev = pos[1] if len(pos) > 1 else None
+    if prev and no_prev:
+        return "구버전(%s)과 --no-prev 를 함께 줬다 — 모순이다(둘 중 하나만)" % prev
+    if not prev and not no_prev:
+        return ("구버전 인자가 없다 — ① 구버전 문자열 0 검사를 조용히 빼고 분모 7 로 합격처럼 보이는 "
+                "실행을 막는다. `<신버전> <구버전>` 으로 돌리거나, 구버전이 정말 없으면 --no-prev 를 명시하라")
+    return ver, prev, no_prev
+
+
 def main(argv):
     if "--self-test" in argv[1:]:
         return self_test()
-    if len(argv) < 2:
-        print(__doc__.strip(), file=sys.stderr)
+    parsed = parse_args(argv)
+    if isinstance(parsed, str):
+        print("✗ 인자 오류(원격 무접촉 · exit 2): %s\n" % parsed, file=sys.stderr)
+        doc = __doc__.strip()
+        print(doc[doc.find("사용:"):] if "사용:" in doc else doc, file=sys.stderr)
         return 2
-    ver = argv[1]
-    prev = argv[2] if len(argv) > 2 else None
+    ver, prev, no_prev = parsed
     four = ["cys_%s_aarch64.dmg" % ver, "cys_%s_x64.dmg" % ver,
             "cys_%s_x64-setup.exe" % ver, "cys_%s_x64-setup.zip" % ver]
 
@@ -291,7 +320,7 @@ def main(argv):
         n = main_html.count(prev)
         check("① 구버전 문자열 0 (%s)" % prev, n == 0, "발견 %d개" % n)
     else:
-        print("SKIP ① 구버전 미지정")
+        print("SKIP ① 구버전 미지정(--no-prev 명시) — 구버전 문자열 잔존은 이 실행에서 재지 않았다")
 
     # ② 신버전 9
     n = main_html.count(ver)
@@ -412,7 +441,8 @@ def main(argv):
     check("⑧ 무버전 자산 버전 결속(latest.json·팩 미러)", ok8, detail8)
 
     npass = sum(1 for r in results if r)
-    print("\n=== %d/%d PASS ===" % (npass, len(results)))
+    print("\n=== %d/%d PASS%s ===" % (npass, len(results),
+                                     " · ①SKIP(--no-prev) — 8축 중 7축만 쟀다" if no_prev else ""))
     return 0 if npass == len(results) else 1
 
 
