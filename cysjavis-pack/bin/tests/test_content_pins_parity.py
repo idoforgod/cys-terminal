@@ -99,5 +99,40 @@ class ContentPinsParity(unittest.TestCase):
         self.assertNotIn(CEO_WAVE2_PIN, pf.MARKER_PINS)
 
 
+class Wave2PinRemovalMutation(unittest.TestCase):
+    """★뮤테이션(U4 C4-④ · 2026-09-23): **임시 사본**의 CEO_TEMPLATE.md 에서 Wave2 핀
+    (오너 절대 규칙 'CEO·마스터는 직접 구현하지 않는다' 의 주입 문면)을 지우면 CEO 핀 검사가
+    **실패**해야 한다 — skip 이면 3레인 전부 초록으로 그 문면 소실을 통과시킨다.
+
+    대상 검사 둘을 unittest 로 실제 실행해 결과 종류(failure/skip)를 잰다. 리포 트리·라이브 팩
+    무접촉 — 임시 디렉터리 사본만 변조하고 모듈 전역 DIRECTIVES_DIR 은 finally 에서 되돌린다."""
+
+    def test_pin_removal_in_temp_copy_is_failure_not_skip(self):
+        import shutil
+        import tempfile
+        mod = sys.modules[ContentPinsParity.__module__]
+        src = os.path.join(mod.DIRECTIVES_DIR, "CEO_TEMPLATE.md")
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(CEO_WAVE2_PIN, text, "전제: 리포 템플릿에 Wave2 핀이 실재해야 변조가 의미를 갖는다")
+        tmp = tempfile.mkdtemp(prefix="cys-pins-mut-")
+        saved = mod.DIRECTIVES_DIR
+        try:
+            with open(os.path.join(tmp, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+                f.write(text.replace(CEO_WAVE2_PIN, ""))
+            mod.DIRECTIVES_DIR = tmp
+            for name in ("test_ceo_pins_shipped", "test_ceo_wave2_preface_pin"):
+                res = unittest.TestResult()
+                ContentPinsParity(name).run(res)
+                self.assertEqual(
+                    (len(res.failures), len(res.skipped), len(res.errors)), (1, 0, 0),
+                    "%s: Wave2 핀을 지운 사본에서 failure 1 이어야 한다 — 실제 failures=%d skipped=%d "
+                    "errors=%d (skip 이면 오너 절대 규칙 문면 소실이 3레인 초록으로 통과한다)"
+                    % (name, len(res.failures), len(res.skipped), len(res.errors)))
+        finally:
+            mod.DIRECTIVES_DIR = saved
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
