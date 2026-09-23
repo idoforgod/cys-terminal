@@ -662,7 +662,8 @@ def h_secret_1():
 
 
 @specimen("H-SECRET-2", "W0",
-          "발행 게이트 스캐너의 '대상 0건·판독 실패 = 초록' 폐쇄 — 비-git·--all 0건·부재 경로·grep 판독 실패 → exit 2",
+          "발행 게이트 스캐너의 '대상 0건·판독 실패 = 초록' 폐쇄 — 비-git·--all 0건·부재 경로·grep 판독 실패 → exit 2"
+          " · 비ASCII 파일명 누락 회귀(-z 목록) → exit 1",
           ["U4-C4-⑤", "측정불능=통과", "CI-only-게이트"])
 def h_secret_2():
     """H-SECRET-1 은 '규칙이 살아 있는가'(합성 양성 7종 FIRE)와 '산 트리 clean' 을 잰다. 이 검체는
@@ -675,6 +676,12 @@ def h_secret_2():
       ⓒ 명시 경로 모드의 **부재 경로** — 종전 `[ -f ] || continue` 로 조용히 건너뛰고 clean.
       ⓓ **판독 실패**(grep rc=2 · 읽기 권한 없음) — 종전 `2>/dev/null … || true` 가 삼켜 clean.
       ⓔ 양성 대조 — 읽을 수 있는 깨끗한 파일은 exit 0(모든 것에 2 를 내는 고장난 스캐너 배제).
+      ⓕ **비ASCII 파일명**(U4 C4 리뷰1 MINOR-1 · 2026-09-23) — `--all`/staged 목록을 줄 단위로 읽으면
+         git 이 비ASCII 경로를 8진 이스케이프로 따옴표 인용해(`core.quotepath`) `[ -f ]` 가 거짓이
+         되고 그 파일이 목록에서 **조용히** 빠진다(같은 '못 본 것=clean' 계급). 한글 파일명 파일에
+         이메일 1줄을 커밋해 `--all` 이 exit 1·EMAIL 라벨로 적발하는지 잰다. NUL 구분(`-z`)이
+         되돌려지면(읽기를 줄 단위로 바꾸면) 이 축만 조용히 exit 0 이 된다 — 종료코드·라벨 축이지
+         ⓐ~ⓓ 의 '측정불능→exit 2' 계약과는 다른 계급이라 별도 축으로 둔다.
 
     ★임시 디렉터리는 저장소 밖(`tempfile`) · HOME 은 임시 경로로 격리(git 설정 무접촉) ·
       `GIT_CEILING_DIRECTORIES` 로 상위 저장소 탐색을 막는다(임시 경로가 어떤 저장소 안이어도 비-git 이다).
@@ -737,6 +744,31 @@ def h_secret_2():
                 _expect("판독 실패(chmod 000)", _scan(REPO_DIR, locked), 2)
             finally:
                 os.chmod(locked, 0o600)
+
+        # ⓕ 비ASCII 파일명(U4 C4 리뷰1 MINOR-1) — 임시 git 저장소에 한글 파일명 + 이메일 1줄을
+        #   커밋(정확히는 add — `git ls-files` 는 인덱스만 보므로 커밋 없이도 추적 파일이다)하고
+        #   `--all` 이 그 파일을 놓치지 않는지 잰다.
+        nonascii_repo = os.path.join(tmp, "nonascii")
+        os.makedirs(nonascii_repo)
+        gi_na = _run(["git", "init", "-q", nonascii_repo], env=env, timeout=60)
+        need(gi_na.returncode == 0, "전제 붕괴: 비ASCII 축 임시 git 저장소 생성 실패(rc=%d): %s"
+             % (gi_na.returncode, (gi_na.stdout + gi_na.stderr)[-300:]))
+        nonascii_name = "고객목록.txt"
+        with open(os.path.join(nonascii_repo, nonascii_name), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("contact: %s\n" % ("probe2" + "@" + "acme-corp.dev"))
+        ga = _run(["git", "add", "--", nonascii_name], cwd=nonascii_repo, env=env, timeout=60)
+        need(ga.returncode == 0, "전제 붕괴: 비ASCII 파일 git add 실패(rc=%d): %s"
+             % (ga.returncode, (ga.stdout + ga.stderr)[-300:]))
+        r_na = _scan(nonascii_repo, "--all")
+        need(r_na.returncode == 1,
+             "비ASCII 파일명(%s) 안 이메일이 --all 에서 적발되지 않았다(exit=%d) — NUL 구분(-z) "
+             "목록이 되돌려지면(줄 단위 읽기) 이 파일이 목록에서 조용히 빠진다:\n%s"
+             % (nonascii_name, r_na.returncode, (r_na.stdout + r_na.stderr)[-800:]))
+        labels_na = {ln.split("\t", 1)[0] for ln in r_na.stdout.splitlines() if "\t" in ln}
+        need("EMAIL" in labels_na,
+             "비ASCII 파일명 이메일이 적발됐지만 라벨이 EMAIL 이 아니다(잡힌 라벨=%s)"
+             % (sorted(labels_na) or "없음"))
+        notes.append("비ASCII 파일명 EMAIL→%d" % r_na.returncode)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     need(not os.path.isdir(tmp), "임시 디렉터리가 남았다: %s" % tmp)
