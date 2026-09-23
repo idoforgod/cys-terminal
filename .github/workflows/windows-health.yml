@@ -120,7 +120,11 @@ jobs:
           #   읽는데 cys 의 Windows 분기(nt)는 역슬래시였다 — trust 검체가 이 레인에 0건이라 그 분기가 실기에서
           #   한 번도 돈 적이 없던 것이 잠복 원인이다(반박 M7). H-WIN-14 는 SessionStart 복원 신호의 역할 분기
           #   (팀원 중립·부서장 작업기억 비주입)를 Git Bash 실기로 잰다(POSIX 전용 스위트가 닿지 않는 자리).
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
+          # ★H-WIN-15 편입(2026-09-23 · 0.14.41 U11 · WP-C2, 통합 시 H-WIN-13→H-WIN-15 재번호 —
+          #   WP-C1 이 먼저 병합돼 H-WIN-13 을 선점했다): ④′ 부하 재확인 루프(30초 간격·최대 3분)가
+          #   Windows 에서 **구조적으로 켜지지 않음**을 실기에서 확인한다 — 호스트 판정 가드가 실제로
+          #   물리는지와, 실제 게이트 형상(measure_errors·fleet_cpu_reason)을 detail 에 박제한다.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
           #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은

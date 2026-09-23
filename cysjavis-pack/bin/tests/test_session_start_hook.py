@@ -504,5 +504,85 @@ shutil.rmtree(tmp)
 check("19f 예산 상수가 훅에 선언돼 있다(바닥 = CLI 내부 총예산 10s)",
       "CYS_SS_ROLE_BUDGET_S=12" in _code and "CYS_SS_RECLAIM_MIN_S=10" in _code)
 
+# ── 20. ★(0.14.41 U4 C2 ①) 역할이 확정됐는데 지침을 못 읽으면 **stdout 사실 고지** · exit 0 ──
+#   종전: `[ -f "$D" ] || exit 0` · `[ -d "$JARVIS_DIR" ] || exit 0` 가 한 글자 없이 끝났다 —
+#   /clear·compact 뒤 좌석이 지침 없이 앉고 모델은 그 사실조차 모른다(치명위험 ③ 바보 좌석).
+#   고지는 **사실만**이다: 보고 지시·push·작업 금지 지시 없음(반박 D8 — clear 주기마다 전 좌석이
+#   같은 보고를 push 하는 약한 ① 경로 · master 좌석의 부트 브리지 이탈 방지). stderr 는 쓰지
+#   않는다(종료코드 0 훅의 stderr 는 누구에게도 보이지 않는다 — 반박 R13).
+def _calls(tmp):
+    p = os.path.join(tmp, "calls.log")
+    return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+
+
+tmp = tempfile.mkdtemp(prefix="hook-t20a-")
+env = setup(tmp, "ok")
+os.remove(os.path.join(env["CYS_PACK_DIR"], "directives", "WORKER_DIRECTIVE.md"))
+code, out, err = run_hook(env, role="worker")
+check("20a 지침 파일 부재 → exit 0(훅 무해)", code == 0, "rc=%s" % code)
+check("20b stdout 사실 고지(역할 지침 미주입 + 파일 경로)",
+      "역할 지침을 주입하지 못했다" in out and "WORKER_DIRECTIVE.md" in out, out[-400:])
+check("20c 각성 머리줄 없음(지침 없이 각성했다고 믿지 않게)", "역할 각성" not in out, out[-300:])
+check("20d 보고 지시·push 없음(사실만)",
+      "보고하라" not in out and "cys feed push" not in _calls(tmp) and "cys send" not in _calls(tmp),
+      out[-300:])
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t20b-")
+env = setup(tmp, "ok")
+open(os.path.join(env["CYS_PACK_DIR"], "directives", "REVIEWER_DIRECTIVE.md"), "w").close()
+code, out, _ = run_hook(env, role="reviewer-gemini")
+check("20e 0바이트 지침 → 같은 고지(머리줄만 찍고 본문 없는 각성 금지)",
+      code == 0 and "역할 지침을 주입하지 못했다" in out and "역할 각성" not in out, out[-300:])
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t20c-")
+env = setup(tmp, "ok")
+_bs = os.path.join(env["CYS_PACK_DIR"], "bin")
+os.makedirs(_bs, exist_ok=True)
+open(os.path.join(_bs, "javis_bootstrap.py"), "w", encoding="utf-8").write("# stub\n")
+os.remove(os.path.join(env["CYS_PACK_DIR"], "directives", "MASTER_DIRECTIVE.md"))
+code, out, _ = run_hook(env, role="master")
+check("20f master 지침 부재 → 고지 · 작업 금지 지시 없음 · exit 0",
+      code == 0 and "역할 지침을 주입하지 못했다" in out and "시작하지 말" not in out, out[-400:])
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t20d-")
+env = setup(tmp, "ok")
+env["CYS_PACK_DIR"] = os.path.join(tmp, "no-such-pack")
+code, out, _ = run_hook(env, role="worker")
+check("20g 팩 폴더 부재 + cys pane + 역할 → 고지 · exit 0",
+      code == 0 and "역할 지침을 주입하지 못했다" in out and "no-such-pack" in out, out[-300:])
+code, out, _ = run_hook(env)
+check("20h 팩 폴더 부재 + 역할 없음 → 무출력(종전 계약)", code == 0 and out.strip() == "", repr(out[-200:]))
+e2 = dict(env)
+e2.pop("CYS_SURFACE_ID", None)
+r2 = subprocess.run(["sh", HOOK], capture_output=True, text=True, encoding="utf-8",
+                    env=dict(e2, CYS_ROLE="worker"), stdin=subprocess.DEVNULL, timeout=30)
+check("20i 팩 폴더 부재 + cys pane 밖 → 무출력(종전 — 밖에서 떠들지 않는다)",
+      r2.returncode == 0 and r2.stdout.strip() == "", repr(r2.stdout[-200:]))
+shutil.rmtree(tmp)
+
+tmp = tempfile.mkdtemp(prefix="hook-t20e-")
+env = setup(tmp, "ok", reclaim_mode="taken")
+os.remove(os.path.join(env["CYS_PACK_DIR"], "directives", "WORKER_DIRECTIVE.md"))
+code, out, _ = run_hook(env, role="worker")
+check("20j 강등 대상(other_live) + 지침 부재 → 강등 문안이 우선(지침 부재 고지 아님)",
+      code == 0 and "역할 주소 상실" in out and "역할 지침을 주입하지 못했다" not in out, out[-300:])
+shutil.rmtree(tmp)
+
+# 경로 줄은 printf — macOS /bin/sh(xpg_echo)가 백슬래시를 먹지 않게(G8 · 윈도우 경로 동형)
+tmp = tempfile.mkdtemp(prefix="hook-t20f-")
+env = setup(tmp, "ok")
+odd = os.path.join(tmp, "pack\\nwin")
+shutil.move(env["CYS_PACK_DIR"], odd)
+env["CYS_PACK_DIR"] = odd
+os.remove(os.path.join(odd, "directives", "CSO_DIRECTIVE.md"))
+code, out, _ = run_hook(env, role="cso-1")
+check("20k 경로의 백슬래시가 그대로 찍힌다(printf · G8)", "pack\\nwin" in out, repr(out[-300:]))
+shutil.rmtree(tmp)
+check("20l 고지 경로 줄은 printf 로만 찍는다(소스 핀)",
+      "역할 지침을 주입하지 못했다" in _code and "printf '  지침 위치: %s" in _code, "")
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

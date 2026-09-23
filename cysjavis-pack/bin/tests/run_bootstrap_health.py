@@ -422,7 +422,10 @@ def _base_env(extra=None, drop=()):
               #   `CYS_U26_OFF` 와 같은 계열의 구멍이다. 검체가 이 축을 시험할 때는 `extra` 로
               #   **명시 주입**하므로(strip 은 extra 적용 **전**이다) 그 경로는 영향받지 않는다.
               "CYS_BOOT_GATES", "CYS_GATE_PENDING", "CYS_GATE_PENDING_CLOSE",
-              "CYS_INJECT_GATE_GUARD"):
+              "CYS_INJECT_GATE_GUARD",
+              # ★(U11 · 0.14.41) ④′ 부하 재확인 예산 손잡이 — 줄이기만 되는 롤백 스위치다(0=종전
+              #   1회). 운영자 셸에 남아 있으면 부트를 모는 검체가 **재확인이 꺼진 제품**을 잰다.
+              "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S", "CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S"):
         env.pop(k, None)
     for k in drop:
         env.pop(k, None)
@@ -948,7 +951,7 @@ def g_dispatch():
     56/56 → 10/56 로 무너졌다. 그 표면을 지키는 유일한 검체다."""
     h = os.path.join(HOOKS_DIR, "test_pre_dispatch.sh")
     if not os.path.isfile(h):
-        raise Skip("test_pre_dispatch.sh 부재")
+        _absent(os.path.join("cysjavis-pack", "hooks", "test_pre_dispatch.sh"))
     env = _base_env({"REAL_GUARD": _hook("guard.sh"), "REAL_HOOKS": HOOKS_DIR})
     r = _run(["sh", h], env=env, timeout=300)
     m = re.search(r"결과: PASS=(\d+) FAIL=(\d+)", r.stdout)
@@ -3992,7 +3995,7 @@ def h_win_7():
 def h_win_8():
     lib = os.path.join(REPO_DIR, "src", "lib.rs")
     if not os.path.isfile(lib):
-        raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        _absent(os.path.join("src", "lib.rs"), "배포 팩 — Rust 소스 부재")
     body = _read(lib)
     need(body.count("pub fn spawn_env_pairs(") == 1, "lib.rs 에 spawn_env_pairs 단일 정의가 아니다")
     need("pub fn spawn_env_pairs_from_process(" in body, "프로세스 env 래퍼 부재")
@@ -4032,7 +4035,7 @@ def h_win_9():
     python detect_reviewer 가 같은 판정을 받으려면)."""
     src = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
     if not os.path.isfile(src):
-        raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        _absent(os.path.join("src", "bin", "cys.rs"), "배포 팩 — Rust 소스 부재")
     body = _read(src)
     # ① 후보 순회가 존재하고 단일 오라클(detect_agent_binary)이 그것을 통과한다
     need("fn windows_agent_candidates(" in body, "Windows 후보 순회 함수 부재(B8 미수리)")
@@ -4352,6 +4355,93 @@ def h_win_14():
             calib = "기준 %s 훅 팀원 '이어서 진행' FIRE" % PRE_U13_REF
         notes.append("계측검증=%s" % calib)
     return " · ".join(notes)
+
+
+@specimen("H-WIN-15", "W6", "U11 부하 재확인 루프 윈도우 무진입(구조 가드 + 실측 게이트 형상 박제)",
+          ["U11-WIN"])
+def h_win_15():
+    """U11(0.14.41): ④′ 자원 게이트가 fleet_cpu 단독 hard 면 30초 간격·최대 3분 다시 잰다.
+    윈도우에서는 그 루프가 **절대 켜지면 안 된다** — 켜지면 매 회차 python·ps·cys 자식이
+    콘솔 없는 데몬 자식에서 뜨고(U5 콘솔 번쩍임 계열), 게이트가 윈도우에서 fleet_cpu 를 못 재는
+    지금의 간접 사실 하나가 바뀌는 날 부트가 3분씩 늘어난다(반박 D-h).
+      ⓐ 구조 가드: 합성 fleet 단독 hard 에서 `_resource_recheckable(windows=False)` 는 True(술어가
+         살아 있다 — 가드가 공허하지 않음) · `windows=True` 는 False(구조적 무진입).
+      ⓑ 윈도우 호스트 판정: 윈도우 실기에서 `_recheck_windows_host()` 가 True(가드가 실제로 물린다).
+      ⓒ 실측 게이트 형상(윈도우 실기만): 격리 HOME 에서 실제 `javis_resource_gate.py check --json`
+         을 돌려 호스트 판정 기준 재확인 진입이 False 임을 확인하고, `measure_errors`·
+         `fleet_cpu_reason` 실측값을 detail 에 박제한다(원 조사의 '윈도우는 늘 soft' 가설의 실측
+         확정 수단). 게이트 자체의 실행 실패·시간초과는 U11 의 판정 대상이 아니므로 **기록만** 한다
+         (릴리스 결박 레인을 이 항목 밖 사유로 세우지 않는다) — 가드(ⓐⓑ)가 무진입의 근거다."""
+    probe = r'''
+import json, os, shutil, subprocess, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+import javis_bootstrap as B
+fleet = {"trips": [{"metric": "fleet_cpu_ratio", "level": "hard", "value": 1.3}],
+         "measured": {"fleet_cpu_reason": "ok", "fleet_cpu_ratio": 1.3}}
+out = {"host": bool(B._recheck_windows_host()),
+       "pred_live": B._resource_recheckable("hard-block", fleet, windows=False),
+       "pred_guard": B._resource_recheckable("hard-block", fleet, windows=True),
+       "real": None}
+if out["host"]:
+    gate = os.path.join(sys.argv[1], "javis_resource_gate.py")
+    home = tempfile.mkdtemp(prefix="hwin13-")
+    env = dict(os.environ)
+    env.update({"HOME": home, "USERPROFILE": home,
+                "CYS_STATE_DIR": os.path.join(home, "state"), "PYTHONDONTWRITEBYTECODE": "1"})
+    for k in ("CYS_SOCKET", "CYS_GATE_LANE_SOCKET", "CYS_FORMATION_BUDGET"):
+        env.pop(k, None)
+    real = {}
+    try:
+        r = subprocess.run([sys.executable, gate, "check", "--json"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=90, env=env)
+        real["exit"] = r.returncode
+        try:
+            gj = json.loads((r.stdout or "").strip())
+        except ValueError:
+            gj = None
+        verdict = B._resource_gate_decision(r.returncode, gj, None)[0]
+        m = (gj or {}).get("measured") if isinstance(gj, dict) else None
+        real.update({"verdict": verdict,
+                     "guarded": B._resource_recheckable(verdict, gj),
+                     "unguarded": B._resource_recheckable(verdict, gj, windows=False),
+                     "measure_errors": (m or {}).get("measure_errors") if isinstance(m, dict) else None,
+                     "fleet_cpu_reason": (m or {}).get("fleet_cpu_reason") if isinstance(m, dict) else None,
+                     "stderr_tail": (r.stderr or "")[-200:]})
+    except Exception as e:
+        real["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)   # 리뷰1 사소 지적: hwin13-* 임시 디렉터리 미정리
+    out["real"] = real
+print(json.dumps(out, ensure_ascii=False))
+'''
+    r = _run([PY, "-c", probe, BIN_DIR], env=_base_env({"PYTHONDONTWRITEBYTECODE": "1"}),
+             timeout=180)
+    need(r.returncode == 0, "탐침 실패 rc=%d stderr=%r" % (r.returncode, r.stderr[-400:]))
+    try:
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise Fail("탐침 출력 판독 불가: %r" % r.stdout[-300:])
+    need(d.get("pred_live") is True,
+         "합성 fleet 단독 hard 에서 재확인 술어가 False — 가드 검사가 공허하다(술어 고장)")
+    need(d.get("pred_guard") is False,
+         "windows=True 인데 재확인 진입 True — 윈도우 구조적 무진입 가드 붕괴(U11)")
+    is_win = os.name == "nt" or sys.platform in ("msys", "cygwin")
+    if is_win:
+        need(d.get("host") is True,
+             "윈도우 실기에서 _recheck_windows_host()=False — 가드가 물리지 않는다(U11)")
+    real = d.get("real")
+    if real is None:
+        return ("구조 가드 성립(술어 live=True · windows 가드=False) · 비윈도우 호스트(host=%s) — "
+                "실측 게이트 형상 축은 윈도우 실기(windows-health)에서만 잰다" % d.get("host"))
+    if "error" in real:
+        return ("구조 가드 성립 · host=True · ⚠실측 게이트 실행 실패(%s) — U11 판정 밖(기록만)"
+                % real["error"])
+    need(real.get("guarded") is False,
+         "윈도우 실측 게이트 형상에서 재확인 진입 True — 무진입 붕괴: %r" % real)
+    return ("구조 가드 성립 · host=True · 실측 게이트 exit=%s verdict=%s fleet_cpu_reason=%s "
+            "measure_errors=%s · 호스트 가드 진입=%s(가드 제외 시=%s)"
+            % (real.get("exit"), real.get("verdict"), real.get("fleet_cpu_reason"),
+               real.get("measure_errors"), real.get("guarded"), real.get("unguarded")))
 
 
 # ── U-20: CLAUDE_CODE_GIT_BASH_PATH 배선 탐지기 ──────────────────────────────
@@ -6108,7 +6198,7 @@ def h_pred_9():
     (사람 판단이 필요한 tool-permission 류 자동응답은 절대 금지 — 그게 열리면 승인 게이트 소멸)."""
     src = os.path.join(REPO_DIR, "src", "bin", "cys.rs")
     if not os.path.isfile(src):
-        raise Skip("레포 체크아웃 아님(배포 팩) — Rust 소스 부재")
+        _absent(os.path.join("src", "bin", "cys.rs"), "배포 팩 — Rust 소스 부재")
     body = _read(src)
     # ① 필드 계층: 결손 키만 vendor 임베드로 보강, 디스크 파일 무접촉(★W-B)
     need("fn fill_missing_fields(" in body, "필드 계층 함수 부재(agents.json 동결 미해소)")
@@ -6817,10 +6907,30 @@ _CLAUDE_MD_COPIES = ("CLAUDE.md", os.path.join("cysjavis-pack", "CLAUDE.md.templ
 _HOOK_FIRED_MARK = "[결정론 부트스트랩 발화됨 — 하네스 강제]"
 
 
+def _repo_checkout(repo_dir=None):
+    """레포 체크아웃인가 — **`Cargo.toml` 실재**. H-META-PIN ⓑ·H-DELIVER 계열이 이미 쓰는 판별자다
+    (반박 U4c D6 — `_is_git_checkout()`(git 서브프로세스)과 다른 두 번째 축을 새로 만들지 않는다)."""
+    return os.path.isfile(os.path.join(REPO_DIR if repo_dir is None else repo_dir, "Cargo.toml"))
+
+
+def _absent(what, pack_reason="배포 팩 실행", repo_dir=None):
+    """레포 파일 부재의 **단일 처리**(0.14.41 U4 C2 ⑥) — 체크아웃이면 Fail, 배포 팩이면 Skip.
+
+    ★종전엔 '파일 없음 = 배포 팩' 으로 읽어 전부 Skip(=GREEN 중립)이었다. 체크아웃 안에서 대상이
+      옮겨지거나 지워지면 그 검체가 조용히 빠지고 요약은 GREEN 이었다(v0.14.40 실측 skip 1 에 새
+      skip 이 섞여도 초록). 레포인데 파일이 없다 = 삭제·이사다 → 적색. 이것은 엄격해지는 방향이라
+      헤더 '핀 이사 계약 ②(판정 완화 금지)' 에 저촉되지 않는다.
+    ★배포 팩(Cargo.toml 부재)에서는 종전 그대로 Skip — 거기엔 잴 소스가 애초에 없다."""
+    if _repo_checkout(repo_dir):
+        raise Fail("레포 체크아웃(Cargo.toml 실재)인데 %s 부재(또는 빈 파일) — 삭제·이사됐다"
+                   "(핀 이사 계약 ①: 검체가 보는 경로를 새 위치로 옮겨라)" % what)
+    raise Skip("레포 파일 부재(%s): %s" % (pack_reason, what))
+
+
 def _repo_file(rel):
     p = os.path.join(REPO_DIR, rel)
     if not os.path.isfile(p):
-        raise Skip("레포 파일 부재(배포 팩 실행): %s" % rel)
+        _absent(rel)
     return _read(p)
 
 
@@ -7477,7 +7587,7 @@ def h_doc_8():
     gui_rel = os.path.join("src-tauri", "src", "main.rs")
     gui_path = os.path.join(REPO_DIR, gui_rel)
     if not os.path.isfile(gui_path):
-        raise Skip("레포 체크아웃 아님(배포 팩) — GUI 소스 부재")
+        _absent(gui_rel, "배포 팩 — GUI 소스 부재")
     gui = _read(gui_path)
     seg = gui[gui.index("fn spawn_orchestra_boot"):]
     seg = seg[:seg.index("\nfn emit_boot_signal")]
@@ -11327,6 +11437,122 @@ def h_meta_pin():
     return " · ".join(notes)
 
 
+@specimen("H-META-ABSENT", "W6",
+          "레포 파일 부재 판정 단일 규약 — 체크아웃(Cargo.toml)=Fail · 배포 팩=Skip",
+          ["U4C2-F5"])
+def h_meta_absent():
+    """0.14.41 U4 C2 ⑥(조사 U4c F5 · 반박 D6·M4): 파일 부재를 '배포 팩'으로 읽어 Skip(=GREEN 중립)
+    하던 자리들이 체크아웃 안에서 대상이 옮겨지거나 지워지면 조용히 빠졌다. `_absent` 가 그 판정의
+    단일 소유자다. 이 검체는 그 판별이 **실행으로** 갈리는지 잰다(계측기 자기검증):
+      ⓐ 배포 팩 모사(임시 디렉터리 · Cargo.toml 부재) → Skip
+      ⓑ 체크아웃 모사(같은 디렉터리 + Cargo.toml) → Fail
+      ⓒ 소스 핀: `_repo_file` 이 `_absent` 를 경유하고, 판별자 없는 무조건-Skip 부재 문면이 남아
+         있지 않다(남는 것은 바로 앞에서 Cargo.toml 을 먼저 본 자리뿐)."""
+    def _verdict(repo_dir):
+        try:
+            _absent(os.path.join("src", "h-meta-absent-probe.rs"), repo_dir=repo_dir)
+        except Fail:
+            return "fail"
+        except Skip:
+            return "skip"
+        return "none"
+    with tempfile.TemporaryDirectory() as tmp:
+        v_pack = _verdict(tmp)
+        open(os.path.join(tmp, "Cargo.toml"), "w").close()
+        v_repo = _verdict(tmp)
+    need(v_pack == "skip", "배포 팩 모사(Cargo.toml 부재)에서 %s — Skip 이어야 한다" % v_pack)
+    need(v_repo == "fail",
+         "체크아웃 모사(Cargo.toml 실재)에서 %s — 파일 부재가 GREEN 에 묻힌다" % v_repo)
+    runner = _read(os.path.abspath(__file__))
+    body = runner[runner.index("def _repo_file(rel):"):]
+    body = body[:body.index("\ndef ", 1)]
+    need("_absent(" in body and "raise Skip" not in body,
+         "_repo_file 이 단일 규약(_absent)을 경유하지 않는다")
+    pat = re.compile(r'raise Skip\("(?:레포 체크아웃 아님\(배포 팩\) — (?:Rust|GUI) 소스 부재'
+                     r'|배포 팩\(Rust 소스 부재\)[^"]*|test_pre_dispatch\.sh 부재|레포 파일 부재[^"]*)"')
+    a0 = runner.index("def _absent(")
+    a1 = runner.index("\ndef ", a0 + 1)            # 단일 소유자 본문(그 안의 Skip 은 규약 자체다)
+    bare = []
+    for m in pat.finditer(runner):
+        if a0 <= m.start() < a1:
+            continue
+        head = runner[max(0, m.start() - 260):m.start()]
+        if 'os.path.join(REPO_DIR, "Cargo.toml")' not in head:
+            bare.append(runner.count("\n", 0, m.start()) + 1)
+    need(not bare, "판별자 없이 파일 부재를 Skip 으로 접는 자리 %d곳(행 %s) — `_absent` 로 옮겨라"
+         % (len(bare), bare))
+    guarded = sum(1 for m in pat.finditer(runner) if not (a0 <= m.start() < a1))
+
+    # ★MC8b 방어(리뷰1 — 2026-09-23) — 위 `pat` 은 문면 4종에 묶여 있어 **다른 문장으로 쓴**
+    #   맨 raise Skip 은 애초에 매치가 안 되므로 bare 로도 안 걸린다(regex 가 못 보면 판정 자체가
+    #   없다). 문면이 아니라 **구조**로 다시 본다: 대상 파일 하나만 보는
+    #   `if not os.path.isfile(os.path.join(REPO_DIR, <target>)):` 블록의 **바로 다음 줄**이
+    #   Cargo.toml 중첩 가드이거나 `_absent(` 경유가 아니면 — 그 안 raise Skip 문면이 무엇이든 —
+    #   bare 다. (독립형 진입 가드 — Cargo.toml/`.git`/`_is_git_checkout()` 를 **자기 조건**으로
+    #   직접 쓰는 자리들은 대상이 리터럴이라 이 패턴에 안 걸린다 — 범위 밖: 판별자가 조건
+    #   자체이므로 문면과 무관하게 이미 안전하다.)
+    target_guard_re = re.compile(
+        r'if not os\.path\.isfile\(os\.path\.join\(REPO_DIR,\s*([A-Za-z_]\w*)\)\):[ \t]*\n'
+        r'[ \t]+(.*)\n')
+    bare2 = []
+    for m in target_guard_re.finditer(runner):
+        nxt = m.group(2).strip()
+        if nxt.startswith('if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):'):
+            continue
+        if nxt.startswith("_absent("):
+            continue
+        bare2.append((runner.count("\n", 0, m.start()) + 1, m.group(1), nxt[:60]))
+    need(not bare2,
+         "대상 파일별 부재 판정 %d곳이 Cargo.toml 체크아웃 가드(또는 _absent())를 거치지 않는다 "
+         "— 문면과 무관하게 구조로 적발(MC8b 방어): %s" % (len(bare2), bare2))
+
+    # ★MC8c 방어(리뷰1) — `h_meta_read` 의 `if missing and _repo_checkout(): _absent(...)` 분기가
+    #   꺼져도(예: 조건이 항상 False 로 뭉개져도) 대상이 **전량** 없으면 그 아래 `if not sizes:`
+    #   분기가 대신 Fail 을 내 위장한다. 그래서 "대부분 있고 하나만 없는" 상태를 만들어야 두
+    #   분기가 갈린다 — `_CLAUDE_MD_COPIES`·directive 2종은 복제하지 않아 자연히 missing 에
+    #   들어가고, 러너가 스스로 수확하는 `_repo_file` 리터럴 호출(os.path.join 인자)의 대상은 전량
+    #   복제해 sizes 를 비우지 않는다. `REPO_DIR` 을 이 임시 트리로 잠깐 바꿔 `h_meta_read()` 를
+    #   **직접** 호출한다(데코레이터는 등록만 하고 실행을 감싸지 않는다 — raise 가 그대로 올라온다).
+    lits_e = re.findall(r"_repo_file\(os\.path\.join\(([^)]*)\)\)", runner)
+    rel_targets = []
+    for arg in lits_e:
+        parts = re.findall(r'"([^"]*)"', arg)
+        if parts:
+            rel_targets.append(os.path.join(*parts))
+    present = [rel for rel in dict.fromkeys(rel_targets)
+               if os.path.isfile(os.path.join(REPO_DIR, rel))]
+    need(present, "h_meta_read missing-분기 검체: 실 레포에 _repo_file 리터럴 대상이 하나도 없다"
+                  "(측정 불능 — 대상 목록 수확 정규식이 깨졌을 수 있다)")
+    global REPO_DIR
+    saved_repo_dir = REPO_DIR
+    try:
+        with tempfile.TemporaryDirectory() as tmp2:
+            open(os.path.join(tmp2, "Cargo.toml"), "w").close()
+            for rel in present:
+                src = os.path.join(REPO_DIR, rel)
+                dst = os.path.join(tmp2, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            REPO_DIR = tmp2
+            try:
+                h_meta_read()
+                raised = "none"
+            except Fail:
+                raised = "fail"
+            except Skip:
+                raised = "skip"
+    finally:
+        REPO_DIR = saved_repo_dir
+    need(raised == "fail",
+         "h_meta_read 가 부분 부재(체크아웃 모사 · _repo_file 리터럴 대상 전량 복제 · "
+         "CLAUDE.md/directive 2종만 누락)에서 Fail 을 내지 않았다(%s) — "
+         "missing→_absent 분기가 꺼졌다(MC8c 회귀)" % raised)
+
+    return ("배포 팩 모사=Skip · 체크아웃 모사=Fail · _repo_file 경유 · 무조건-Skip 부재 문면 0"
+            "(Cargo.toml 선확인 자리 %d곳 유지 · 구조 가드 위반 0 · h_meta_read missing-분기 확인)"
+            % guarded)
+
+
 # ★등록 위치가 곧 실행 순서다 — 이 검체는 **맨 마지막**에 두어, 앞선 모든 검체가 실제로 읽은
 #   경로 관측(`_READ_OBSERVED`)까지 함께 본다. 단독 실행(`--only H-META-READ`) 에서도
 #   정적 대상 목록만으로 자립 판정한다.
@@ -11376,15 +11602,18 @@ def h_meta_read():
     notes.append("대상 %d경로 수확(리터럴 %d·변수 %d)" % (len(targets), len(lits), len(dyn)))
 
     # ⓑ 실제 크기 < 상한 = hard fail · 여유 배수는 판정 조건이 아니라 아래의 ⚠조기경보뿐
-    sizes = {}
+    sizes, missing = {}, []
     for rel in sorted(targets):
         p = os.path.join(REPO_DIR, rel)
         if not os.path.isfile(p):
-            continue                    # 배포 팩 실행 — 해당 검체들은 _repo_file 이 Skip 한다
+            missing.append(rel)         # 배포 팩이면 정상 — 체크아웃이면 아래에서 적색(U4 C2 ⑥)
+            continue
         with open(p, encoding="utf-8", errors="replace") as f:
             sizes[rel] = len(f.read())
+    if missing and _repo_checkout():
+        _absent("크기 상한 대상 %d건(%s)" % (len(missing), ", ".join(missing[:5])))
     if not sizes:
-        raise Skip("레포 파일 부재(배포 팩 실행) — 대상 0건")
+        _absent("크기 상한 대상 전량(0건 판독)")
     over = ["%s=%d자" % (r, n) for r, n in sorted(sizes.items()) if n >= READ_LIMIT_CHARS]
     need(not over,
          "_repo_file 대상이 읽기 상한(%d자)에 도달한다 = 조용한 절단 재발: %s"
@@ -11834,7 +12063,7 @@ def h_hook_decide_1():
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
     sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
-        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+        _absent("%s · %s" % (_U22_RS_CLI, _U22_RS_DAEMON), "배포 팩 — Rust 소스 부재")
     need(sh, "role-bootstrap.sh 를 읽지 못했다(계측 불능)")
     v = _u22_violations(cli, daemon, sh)
     need(not v, "U-22 배선 위반 %d건: %s" % (len(v), " / ".join(v)))
@@ -11890,7 +12119,7 @@ def h_hook_decide_2():
     daemon = _read(os.path.join(REPO_DIR, _U22_RS_DAEMON))
     sh = _read(os.path.join(HOOKS_DIR, ROLE_BODY))   # 판독 규칙은 본체에 산다(A2 분할)
     if not cli or not daemon:
-        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+        _absent("%s · %s" % (_U22_RS_CLI, _U22_RS_DAEMON), "배포 팩 — Rust 소스 부재")
     # ① contract_version 3중 일치
     def _cv(src):
         m = re.search(r"const HOOK_DECIDE_CONTRACT_V: u64 = (\d+);", src)
@@ -12556,7 +12785,7 @@ def h_tick_alive():
     main_rs = _read(os.path.join(REPO_DIR, _U23_RS_MAIN))
     gov = _read(os.path.join(REPO_DIR, _U23_RS_GOV))
     if not main_rs or not gov:
-        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+        _absent("%s · %s" % (_U23_RS_MAIN, _U23_RS_GOV), "배포 팩 — Rust 소스 부재")
     v = _u23_tick_violations(sup, main_rs, gov)
     need(not v, "U-23 틱 계약 위반 %d건: %s" % (len(v), " / ".join(v)))
     # ★계측 타당성 ① 기준 커밋 대조 — 그 트리엔 감독자가 아예 없다(R3 그 자체).
@@ -12596,7 +12825,7 @@ def h_boot_sup_1():
     sup = _read(os.path.join(REPO_DIR, _U23_RS_SUP))
     delivery = _read(os.path.join(REPO_DIR, _U23_RS_DEL))
     if not delivery:
-        raise Skip("배포 팩(Rust 소스 부재) — 소스 배선 검체 적용 불가")
+        _absent(_U23_RS_DEL, "배포 팩 — Rust 소스 부재")
     v = _u23_bound_violations(sup, delivery)
     need(not v, "U-23 안전 계약 위반 %d건: %s" % (len(v), " / ".join(v)))
     # ★계측 타당성 ① 기준 커밋 대조(감독자 부재 = 위반).

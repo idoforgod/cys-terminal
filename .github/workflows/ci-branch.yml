@@ -846,7 +846,7 @@ jobs:
                    test_phoenix_fresh_honest test_phoenix_f1_production_path \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
-                   test_state_rotate \
+                   test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \
                    test_dept_schedule_seed \
                    test_lane_redirect; do
             f="cysjavis-pack/bin/tests/$t.py"
@@ -1469,7 +1469,7 @@ jobs:
                    test_phoenix_fresh_honest test_phoenix_f1_production_path \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
-                   test_state_rotate \
+                   test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \
                    test_dept_schedule_seed \
                    test_lane_redirect; do
             f="cysjavis-pack/bin/tests/$t.py"

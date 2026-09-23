@@ -10,7 +10,29 @@
 command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
-[ -d "$JARVIS_DIR" ] || exit 0
+# ── ★(0.14.41 U4 C2 ①) 역할 지침 미주입 **사실 고지** ─────────────────────────────────────
+# 역할이 확정된 좌석인데 지침을 못 읽으면 종전엔 한 글자 없이 exit 0 이었다 — /clear·compact 뒤
+# 좌석이 지침 없이 앉고 모델은 그 사실조차 모른다(치명위험 ③ 바보 좌석). 이제 stdout(=모델
+# 컨텍스트)에 **사실만** 남긴다. exit 0 은 그대로다(훅 비0 은 세션 시작 오류로 번질 수 있다).
+#   · 보고 지시·push 를 하지 않는다: clear 주기마다 전 좌석이 같은 보고를 밀면 약한 ① 폭주 경로가
+#     되고, master 좌석에게 "보고하라"는 자기 참조다(반박 D8-b·c).
+#   · stderr 에 쓰지 않는다: 종료코드 0 훅의 stderr 는 사람에게도 모델에게도 보이지 않는다(R13).
+#   · 경로 줄은 printf 만(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
+cys_ss_directive_absent() {   # $1=지침 위치 · $2=사유
+  printf '■ 고지: 역할 지침을 주입하지 못했다(CYS_ROLE=%s) — 이 세션은 역할 지침 없이 시작됐다.\n' "${CYS_ROLE:-}"
+  printf '  지침 위치: %s (%s)\n' "$1" "$2"
+  echo "  팩 설치 상태는 preflight C01(팩 폴더)·C02(지침 4종)가 판정한다."
+}
+if [ ! -d "$JARVIS_DIR" ]; then
+  # 팩 폴더 부재(부서 팩 결손·재설치 중 — 레인 가드는 레인 팩이 없으면 그냥 통과시킨다). 고지는
+  # **cys pane 안 + 지침 역할군**일 때만: 밖(일반 터미널)·무역할 세션은 종전대로 침묵이 안전선이다.
+  if command -v cys_have_surface >/dev/null 2>&1 && cys_have_surface; then
+    case "${CYS_ROLE:-}" in
+      master|worker*|cso*|reviewer*) cys_ss_directive_absent "$JARVIS_DIR" "팩 폴더 없음" ;;
+    esac
+  fi
+  exit 0
+fi
 # cys 터미널 surface 안에서만 발동 (cysd가 CYS_SURFACE_ID를 주입한다).
 # 밖(외부·일반 터미널)에서 cys 환경선언을 주입하면 역혼란 — 침묵이 안전선.
 # ★게이트 술어는 프리루드 단일 소유(cys_require_surface) — role-bootstrap.sh와 동일 규약(A2).
@@ -392,7 +414,10 @@ case "$CYS_ROLE" in
   reviewer*)   D="$JARVIS_DIR/directives/REVIEWER_DIRECTIVE.md" ;;
   *) exit 0 ;;
 esac
-[ -f "$D" ] || exit 0
+# ★(0.14.41 U4 C2 ①) 지침 판독 가능성은 **강등 판정 뒤**에 본다(반박 D8-d): 강등 대상 좌석에게
+#   '지침 부재' 고지가 나가면 안 되고(그 좌석은 역할이 아니다), 강등 문안은 지침 파일이 없어도
+#   낼 수 있다. 종전 `[ -f "$D" ] || exit 0` 은 강등 좌석까지 무음으로 삼켰다. 판독 조건은
+#   존재·읽기 권한·비어 있지 않음 셋이다 — 0바이트 지침은 머리줄만 찍고 본문 없이 '각성'시킨다.
 # ── ★(0.14.31 · WP-4 R1) stale 각성 강등 — 데몬이 "그 역할은 지금 **다른 산 좌석**이 쥐었다"고
 #    답한 경우에만 여기 온다(`env_role=other_live`). 승계는 데몬 상태만 바꿀 뿐 전임자 셸의
 #    `CYS_ROLE` 을 지울 수 없어서, 이 문이 없으면 두 세션이 같은 역할로 행동한다(적대검증 major).
@@ -441,6 +466,19 @@ case "$CYS_ROLE" in
     fi
     ;;
 esac
+# ★(0.14.41 U4 C2 ①) 지침 판독 가능성 — 강등(위 두 문)이 먼저 판정된 뒤에만 본다.
+if [ ! -f "$D" ]; then
+  cys_ss_directive_absent "$D" "파일 없음"
+  exit 0
+fi
+if [ ! -r "$D" ]; then
+  cys_ss_directive_absent "$D" "읽기 권한 없음"
+  exit 0
+fi
+if [ ! -s "$D" ]; then
+  cys_ss_directive_absent "$D" "빈 파일"
+  exit 0
+fi
 echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):

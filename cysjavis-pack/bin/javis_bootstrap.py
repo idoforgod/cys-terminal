@@ -284,6 +284,61 @@ PING_RETRY_TOTAL_S = max(0.0, float(os.environ.get(
 PING_RETRY_INTERVAL_S = max(0.05, float(os.environ.get(
     "CYS_BOOT_PING_RETRY_INTERVAL_S", str(_budget_leaf("CYS_PING_RETRY_INTERVAL_S", 3)))))
 
+# ── ④′ 부하 재확인 예산(U11 · 오너 2026-09-23 "30초 간격으로 최대 3분 재확인") ──
+# ★왜: 자원 게이트가 우리 프로그램 CPU 합(fleet_cpu_ratio)으로 hard 를 내면 종전엔 **한 번 재고**
+#   exit 9 로 팀 기동을 포기했다. CPU 스파이크(첫 실행·인덱싱)는 1~2분이면 내려가는데, 그 한 번에
+#   걸리면 사람이 선언을 다시 쳐야 했다. 그래서 **그 축 하나만** 벽시계 상한 안에서 다시 잰다.
+# ★상한이지 하한이 아니다: javis_budget 의 LEAF_FLOORS 는 '냉시작 실측 하한 · 감액 금지 · env 는
+#   올리기만' 이다. 오너의 3분은 **상한**("최대 3분")이라 성격이 반대다 — 그래서 여기 정책 상수로
+#   두고 env 는 **줄이기만** 한다(min(env, 상한)). 늘릴 수 있으면 그만큼 레인 싱글플라이트 락을
+#   쥐어 그 사이 재선언이 전부 exit 11 로 접힌다(치명 앵커 ③ 자가치유 봉쇄 방향).
+# ★최악 벽시계 = TOTAL + 마지막 게이트 1회 상한(RPC_SLACK_S×3) (+ 다른 축으로 바뀐 회차에서만
+#   `cys list` 교차확인 1회). 재측정 회차 수 = int(TOTAL/INTERVAL + 1e-9)(부동소수 함정 제거 —
+#   파이썬 `0.3 // 0.05 == 5.0`).
+# ★롤백·테스트 손잡이: `CYS_BOOT_RESOURCE_RECHECK_TOTAL_S=0` → 종전 1회 판정 그대로.
+RESOURCE_RECHECK_TOTAL_CAP_S = 180.0
+RESOURCE_RECHECK_INTERVAL_CAP_S = 30.0
+RESOURCE_RECHECK_INTERVAL_FLOOR_S = 0.05     # 0 간격 = 게이트 스폰 폭주(앵커 ①) — 하한
+
+
+def _env_capped_seconds(name, cap, floor=0.0):
+    """env 초 값 → [floor, cap]. 미설정·빈 값·비수치·nan·inf 는 cap(=기본값) — **줄이기만** 허용.
+    부트 경로의 모듈 최상위라 어떤 입력에도 던지지 않는다(크래시 = 팀 0)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return cap
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return cap
+    if v != v or v in (float("inf"), float("-inf")):
+        return cap
+    return max(floor, min(v, cap))
+
+
+RESOURCE_RECHECK_TOTAL_S = _env_capped_seconds(
+    "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S", RESOURCE_RECHECK_TOTAL_CAP_S, 0.0)
+RESOURCE_RECHECK_INTERVAL_S = _env_capped_seconds(
+    "CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S", RESOURCE_RECHECK_INTERVAL_CAP_S,
+    RESOURCE_RECHECK_INTERVAL_FLOOR_S)
+
+
+def _recheck_rounds(total, interval):
+    """U11 재확인 최대 회차 수 = int(TOTAL/INTERVAL + 1e-9)(부동소수 함정 제거).
+
+    ★리뷰1(2026-09-23) MU13 방어: `+1e-9` 를 지우고 `//`(내림 나눗셈)로 바꿔도 테스트 값
+      1.5/0.5 는 딱 나누어떨어져(둘 다 3) 구분되지 않았다. 파이썬에서 `0.3/0.05` 는 부동소수
+      표현상 5.999999999999999 라 `int(0.3/0.05)`(=`//` 취지)는 **5** 가 나오지만, 실제 의도한
+      회차 수는 **6** 이다 — `+1e-9` 가 그 경계를 밀어 올린다. self-test 가 `(0.3, 0.05) == 6`
+      을 직접 단언해 이 상수를 핀한다(아래 `--self-test`)."""
+    if interval <= 0:
+        return 0
+    return int(total / interval + 1e-9)
+# 재확인 대상 축 — **fleet_cpu_ratio 단일**. 게이트의 CPU_GRACE_AXES 에는 load_ratio 도 있지만 그
+# 축은 0.14.31 부터 hard 가 없어(soft 전용) 여기 넣으면 사문 멤버가 된다. servers·nodes·context·
+# formation_budget 은 기다려도 풀리지 않는 개수/자기보고 축이라 3분을 버리지 않는다(즉시 exit 9).
+RESOURCE_RECHECK_AXES = ("fleet_cpu_ratio",)
+
 # ── ③ 선행 claim 결박 신선도의 시간 기준(P0-1 — CLM-2 라이브락 절단) ──
 # ★런 시작 시각 1회 캡처: 결박 나이(_pre_age)의 기준점이다. 종전엔 **소비 시각**(time.time())
 #   기준이라 ①preflight(상한 300s)·②ping(상한 ~45s)의 in-run 소요가 신선도 창(기본 300s)과
@@ -1163,6 +1218,16 @@ class _Log:
                                  % (name, idx, self._last_step_order))
             self._last_step_order = max(self._last_step_order, idx)
         self.data["steps"].append(rec)
+        self._persist()
+
+    def progress(self, info):
+        """진행 표시(U11 · ④′ 부하 재확인) — boot-last **최상위** `progress` 를 갱신한다.
+
+        ★result 는 건드리지 않는다: §0-A 판독 규약의 `result.state` 는 닫힌 집합이고(진행 중 =
+          `running`), 대기 중이라는 사실을 새 state 로 만들면 모든 판독자의 분기표가 갈린다.
+          그래서 진행은 옆 필드로만 싣는다 — 판독자는 `result.state == running` 이면 `progress`
+          를 보고 "기다리는 중(스폰 0)"을 알 수 있다. 쓰기 실패는 `_persist` 가 흡수한다."""
+        self.data["progress"] = dict(info or {})
         self._persist()
 
     def result(self, **kw):
@@ -2441,29 +2506,231 @@ def _fatal_detail(bad, out):
     return "의무(Fatal) 역할 기동 실패: %s\n%s" % (detail, out)
 
 
-def _run_resource_gate(py, log):
-    """결손>0 확정 후의 자원 사전 게이트(호출부가 결손 0이면 이 함수를 호출하지 않는다).
-    반환: None=진행 / 9=hard-block(팀 기동 0·CEO escalation)."""
-    gate = os.path.join(PACK, "bin", "javis_resource_gate.py")
-    if not os.path.isfile(gate):
-        log.step(STEP.RESOURCE_GATE_ABSENT, 0, "결손>0이나 resource_gate 부재 — 게이트 생략(계속)")
-        return None
-    # ★A13 잠복 경로 차단(착수 전 재검증 산물): 종전 호출은 `_run`(stdout+stderr **병합**)의
-    #   병합 텍스트를 json.loads 에 넣었다. 게이트가 stderr 를 한 줄이라도 흘리는 날(파이썬 경고·
-    #   미래 진단 로그) 파싱이 깨져 `gate_json=None` 이 되고, exit 2 + json None 은
-    #   nodes 과계수 무효화(hard-overcount)를 성립 불가로 만들어 **건강한 기계를 hard-block(exit 9)**
-    #   시킨다. 실측으로 재현 가능한 인접 결함이므로(원 메커니즘 판정은 기각) 채널을 분리한다:
-    #   **계약 채널은 stdout 뿐**이고 stderr 는 진단으로만 남긴다.
+def _recheck_windows_host():
+    """이 부트가 **Windows 호스트** 위인가 — `javis_resource_gate._is_windows_host` 와 같은 규칙.
+
+    ★사본인 이유: 게이트 모듈은 javis_preflight(1만 행)를 끌어온다. 부트 경로에서 그 import 가
+      실패하면 새 크래시 지점이 된다. 규칙이 갈리지 않았다는 보증은 검체
+      `test_bootstrap_resource_recheck` i12(env 5조합 대조)가 진다.
+    ★U11 재확인 루프의 **구조적 무진입** 근거다(반박 D-h): 현 게이트는 윈도우에서 fleet_cpu hard 를
+      낼 수 없지만(ps 부재·MSYS ps 미지원 → absent/unsupported), 그 간접 사실 하나에만 기대면
+      다른 항목이 윈도우 측정을 바꾸는 순간 루프가 켜지고 매 회차 콘솔 자식이 뜬다(U5 계열)."""
+    if os.name == "nt":
+        return True
+    if sys.platform in ("msys", "cygwin"):
+        return True
+    if not os.environ.get("MSYSTEM"):
+        return False
+    return any(os.environ.get(k) for k in ("WINDIR", "SYSTEMROOT")) \
+        or os.environ.get("OS", "").lower() == "windows_nt"
+
+
+def _hard_trips_fleet_only(gate_json):
+    """순수: 게이트 JSON 의 hard 트립이 **하나 이상이고 전부** 재확인 축(fleet_cpu)인가."""
+    if not isinstance(gate_json, dict):
+        return False
+    trips = gate_json.get("trips")
+    if not isinstance(trips, list):
+        return False
+    hard = [t for t in trips if isinstance(t, dict) and t.get("level") == "hard"]
+    return bool(hard) and all(t.get("metric") in RESOURCE_RECHECK_AXES for t in hard)
+
+
+def _resource_recheckable(verdict, gate_json, windows=None):
+    """순수: 이 게이트 판정이 **기다리면 풀릴 수 있는 부하**인가(U11 재확인 진입 조건).
+
+    전부 참이어야 한다 — ① verdict == hard-block ② 비윈도우 호스트 ③ hard 트립이 전부 fleet_cpu
+    ④ fleet_cpu 가 **실제로 재어졌다**(`measured.fleet_cpu_reason == "ok"` — override·absent·
+    unsupported·측정 실패는 부하 사실이 아니다). 축을 모르는 hard(JSON 파싱 실패)는 부하라고
+    단정할 근거가 없으므로 False(종전대로 즉시 exit 9).
+    ★soft 는 절대 재확인하지 않는다: 윈도우 게이트는 getloadavg 부재로 **항상 soft** 라, soft 를
+      재확인하면 윈도우 부트가 매번 3분 늦어진다(치명 회귀). `windows` 는 테스트 주입용."""
+    if verdict != "hard-block":
+        return False
+    if windows is None:
+        windows = _recheck_windows_host()
+    if windows:
+        return False
+    if not _hard_trips_fleet_only(gate_json):
+        return False
+    measured = gate_json.get("measured")
+    return isinstance(measured, dict) and measured.get("fleet_cpu_reason") == "ok"
+
+
+def _gate_fleet_value(gate_json):
+    """게이트 JSON 의 fleet_cpu_ratio(소수 셋째 자리) — 없으면 None. 추이 기록용(판정 입력 아님)."""
+    m = gate_json.get("measured") if isinstance(gate_json, dict) else None
+    v = m.get("fleet_cpu_ratio") if isinstance(m, dict) else None
+    return round(float(v), 3) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _measure_resource_gate(py, gate, recheck=False):
+    """게이트 1회 측정 → (code, gate_json, verdict, why, out). 최초 측정은 종전 본문 그대로다.
+
+    ★A13 잠복 경로 차단(착수 전 재검증 산물): 종전 호출은 `_run`(stdout+stderr **병합**)의
+      병합 텍스트를 json.loads 에 넣었다. 게이트가 stderr 를 한 줄이라도 흘리는 날(파이썬 경고·
+      미래 진단 로그) 파싱이 깨져 `gate_json=None` 이 되고, exit 2 + json None 은
+      nodes 과계수 무효화(hard-overcount)를 성립 불가로 만들어 **건강한 기계를 hard-block(exit 9)**
+      시킨다. 실측으로 재현 가능한 인접 결함이므로(원 메커니즘 판정은 기각) 채널을 분리한다:
+      **계약 채널은 stdout 뿐**이고 stderr 는 진단으로만 남긴다.
+    ★(U11) recheck=True(재확인 회차): hard 트립이 fleet_cpu 단독이면 `cys list` 교차확인을
+      생략한다 — 그 교차확인은 **nodes 단독 hard 의 과계수 판정 전용**이라 fleet 단독 판정의
+      입력이 아니다. 회차마다 붙이면 최악 +15s 씩 쌓여 3분 상한이 깨진다(반박 D-a)."""
     code, gout, gerr = _run_split([py, gate, "check", "--json"],
                                   timeout=_budget_leaf("RPC_SLACK_S", 10) * 3)
     try:
         gate_json = json.loads((gout or "").strip())
     except (ValueError, TypeError):
         gate_json = None
-    live = _live_node_count() if code == 2 else None
+    live = None
+    if code == 2 and not (recheck and _hard_trips_fleet_only(gate_json)):
+        live = _live_node_count()
     verdict, why = _resource_gate_decision(code, gate_json, live)
     out = (gout or "") + (("\n[stderr] " + gerr.strip()) if (gerr or "").strip() else "")
+    return code, gate_json, verdict, why, out
+
+
+def _fmt_trail(trail):
+    return "→".join("?" if v is None else ("%.2f" % v) for v in trail) or "?"
+
+
+def _resource_wait(py, gate, log, t0, first, sleeper=None, clock=None):
+    """④′ 부하 재확인 루프(U11) — 관측만 반복한다(스폰 0 · 큐 0 · Feed 0).
+
+    t0 = 최초 측정 **직전**의 monotonic 시각. k 번째 재측정은 **t0 + k×INTERVAL** 에 예정한다
+    (절대 스케줄 — '측정 뒤 INTERVAL 잠' 이면 느린 게이트만큼 일정이 밀린다). 벽시계 마감
+    t0+TOTAL 을 넘기면 남은 회차가 있어도 멈춘다(B17 카운트 회계 금지 · javis_budget 교리) —
+    그래서 최악 = TOTAL + 진입한 마지막 측정 1회다.
+    이탈: 재확인 조건이 깨지면(해소·soft·다른 축 hard·측정 불능) 그 회차의 판정을 그대로 돌려준다.
+    회차마다 boot-last `progress` 와 stderr 진행 1줄을 남긴다(사람·master 가 '멈춤'으로 오인하지
+    않게 · 반박 D-c). 알림은 여기서 **하지 않는다** — 최종 판정의 분기가 1회만 낸다.
+    반환: ((code, gate_json, verdict, why, out), wait_info)."""
+    sleeper = sleeper or time.sleep
+    clock = clock or time.monotonic
+    total, interval = RESOURCE_RECHECK_TOTAL_S, RESOURCE_RECHECK_INTERVAL_S
+    n_max = _recheck_rounds(total, interval)
+    deadline = t0 + total
+    cur = first
+    trail = [_gate_fleet_value(first[1])]
+    checks = 1
+    outcome = "exhausted"
+    for k in range(1, n_max + 1):
+        now = clock()
+        if now >= deadline:
+            break                                   # 벽시계 마감이 횟수보다 우선
+        due = min(t0 + k * interval, deadline)
+        wait_s = max(0.0, due - now)
+        info = {"phase": "resource_wait", "state": "waiting", "checks": checks,
+                "next_check": checks + 1, "of": n_max + 1, "interval_s": interval,
+                "total_s": total, "next_in_s": round(wait_s, 1),
+                "until_epoch": round(time.time() + (deadline - now), 1), "trail": list(trail),
+                "note": "부하 재확인 대기 중 — 스폰·큐·알림 0. 손으로 팀을 기동하지 말고 결과를 기다려라."}
+        log.progress(info)
+        _progress("④′ 컴퓨터가 잠시 바쁩니다(우리 프로그램 CPU %s · 기준 1.00=전 코어 100%%) — "
+                  "%.0f초 뒤 다시 확인(%d/%d · 최대 %.0f초 · 그동안 팀 기동 0)"
+                  % (_fmt_trail(trail[-1:]), wait_s, checks + 1, n_max + 1, total))
+        if wait_s > 0:
+            sleeper(wait_s)
+        cur = _measure_resource_gate(py, gate, recheck=True)
+        checks += 1
+        trail.append(_gate_fleet_value(cur[1]))
+        log.step(STEP.RESOURCE_GATE, cur[0], "재확인 %d/%d · verdict=%s · %s\n%s"
+                 % (checks, n_max + 1, cur[2], cur[3], cur[4]), suffix="#%d" % checks)
+        if not _resource_recheckable(cur[2], cur[1]):
+            outcome = "resolved" if cur[2] in ("allow", "soft") else "changed"
+            break
+    info = {"phase": "resource_wait", "state": "done", "outcome": outcome, "checks": checks,
+            "of": n_max + 1,
+            "interval_s": interval, "total_s": total,
+            "waited_s": round(max(0.0, clock() - t0), 1), "trail": trail,
+            "final_verdict": cur[2]}
+    log.progress(info)
+    return cur, info
+
+
+def _fleet_hard_prescription(gate_json, wait):
+    """fleet_cpu hard 의 사람용 처방(Feed 본문) — **살아 있는 좌석을 닫게 만들지 않는다**.
+
+    ★종전 문안 "자원 정리(서버 kill·/clear·노드 회수)" 는 fleet_cpu 원인일 때 틀린 처방이었고
+      (서버·clear 는 이 축과 무관), '노드 회수'·게이트의 '위 프로세스를 회수하면 풀린다' 는 CPU 상위
+      기여자 = **살아 있는 에이전트 좌석**을 죽이라는 뜻으로 읽힐 수 있다(치명 위험 ④ 방향 · 반박
+      D-g). 부하는 기다리면 내려간다 — 처방은 '기다렸다가 재선언' 하나다."""
+    measured = gate_json.get("measured") if isinstance(gate_json, dict) else None
+    top = (measured or {}).get("fleet_cpu_top") if isinstance(measured, dict) else None
+    tops = ", ".join("pid %s %s %.0f%%" % (r.get("pid"), r.get("exe") or "?",
+                                           float(r.get("pcpu") or 0.0))
+                     for r in (top or [])[:3] if isinstance(r, dict)) or "(상위 프로세스 미수집)"
+    if wait:
+        head = ("컴퓨터가 계속 바빠 팀 기동을 멈췄습니다 — %.0f초 동안 %.0f초 간격으로 %d회 확인했지만 "
+                "우리 프로그램 CPU 사용이 기준(전 코어 100%%)을 넘었습니다(추이 %s)."
+                % (wait.get("waited_s") or 0, wait.get("interval_s") or 0,
+                   wait.get("checks") or 0, _fmt_trail(wait.get("trail") or [])))
+    else:
+        head = ("컴퓨터가 바빠 팀 기동을 멈췄습니다 — 우리 프로그램 CPU 사용이 기준(전 코어 100%%)을 "
+                "넘었습니다(%s)." % _fmt_trail([_gate_fleet_value(gate_json)]))
+    return (head + " CPU 를 많이 쓰는 우리 프로세스: %s. ★살아 있는 좌석(마스터·팀원 창)은 닫지 "
+            "마세요 — 닫아도 부하가 곧바로 줄지 않고 팀만 잃습니다. 무거운 작업이 끝나 컴퓨터가 "
+            "한가해지면 마스터 창에 '너는 마스터다'를 다시 입력하세요(이미 떠 있는 자리는 그대로 "
+            "둡니다)." % tops)
+
+
+def _post_wait_master_check(log, wait):
+    """대기(U11)를 거친 뒤 ④ 진입 **직전** master 결속 재확인 — None=계속 / EXIT_CLAIM_DENIED=중단.
+
+    ★왜(반박 D-e): 종전 ③→④ 창은 수 초였다. 재확인이 그 창을 최대 수 분으로 늘리므로, 그 사이
+      master 창이 닫히면 ④ 가 **지휘자 없는 팀**을 띄운다. 판정은 ③ claim 과 **같은 기준**
+      (`_live_master_from_status` — roles 의 master 보유 surface 가 exited 가 아닌가)을 쓴다.
+    ★세 갈래:
+      · 살아 있는 master 가 **있다**(자기든 다른 창이든) → 계속. 다른 창으로 옮겨진 경우도 계속인
+        이유: 그 창의 선언은 이 런이 락을 쥔 동안 exit 11 로 접혔다 — 여기서 멈추면 그 선언의 팀은
+        아무도 띄우지 않는다.
+      · **없다**(판독 성공 · master 보유자 0) → 스폰 0 · result `declined`(exit 7 — "이 surface 는
+        master 가 아님", 새 state 0) · reason=master_gone · 알림 1회.
+      · 판독 불가(데몬 무응답·스키마 불일치) → 종전 동작 그대로 계속(재확인은 추가 안전장치일 뿐
+        — 측정 실패로 팀 기동을 새로 막지 않는다)."""
+    live, why = _live_master_from_status(_cys_status_json(), exclude_sid=None)
+    if live is False:
+        detail = ("대기 뒤 master 결속 재확인: %s — 부하 대기(%s초) 사이 master 좌석이 사라졌다. "
+                  "지휘자 없는 팀을 띄우지 않는다(스폰 0)." % (why, wait.get("waited_s")))
+        log.step(STEP.RESOURCE_GATE, EXIT_CLAIM_DENIED, detail, suffix="#bind")
+        _progress("✗ ④′ " + detail)
+        notified = _notify_loud(
+            "부하 대기 뒤 팀 기동 생략(마스터 자리 없음)",
+            "부하가 내려가기를 기다리는 동안(%s초) 마스터 창이 닫혀 팀을 띄우지 않았습니다. "
+            "살아 있는 좌석은 그대로 둡니다. 마스터 창을 열고 '너는 마스터다'를 입력하면 팀이 "
+            "기동됩니다." % wait.get("waited_s"))
+        log.step(STEP.RESOURCE_GATE_NOTIFY, 0, "알림 채널: %s" % notified)
+        log.result(ok=None, state="declined", failed_step="resource-gate", reason="master_gone",
+                   exit=EXIT_CLAIM_DENIED, resource_wait=wait)
+        return EXIT_CLAIM_DENIED
+    log.step(STEP.RESOURCE_GATE, 0,
+             "대기 뒤 master 결속 재확인: %s — 팀 기동 계속"
+             % (why if live else "판정 불가(%s) — 종전 동작대로 계속" % why), suffix="#bind")
+    return None
+
+
+def _run_resource_gate(py, log):
+    """결손>0 확정 후의 자원 사전 게이트(호출부가 결손 0이면 이 함수를 호출하지 않는다).
+    반환: None=진행 / 9=hard-block(팀 기동 0·CEO escalation) /
+          7=(U11) 부하 대기 뒤 master 좌석 부재(팀 기동 0 · 지휘자 없는 팀 방지)."""
+    gate = os.path.join(PACK, "bin", "javis_resource_gate.py")
+    if not os.path.isfile(gate):
+        log.step(STEP.RESOURCE_GATE_ABSENT, 0, "결손>0이나 resource_gate 부재 — 게이트 생략(계속)")
+        return None
+    t0 = time.monotonic()
+    code, gate_json, verdict, why, out = _measure_resource_gate(py, gate)
     log.step(STEP.RESOURCE_GATE, code, "결손>0 · verdict=%s · %s\n%s" % (verdict, why, out))
+    # ★U11 — 부하(fleet_cpu 단독 hard)만 벽시계 상한 안에서 다시 잰다. 그 밖(soft·다른 축 hard·
+    #   측정 불능·윈도우)은 종전 1회 판정 그대로다(TOTAL=0 롤백도 같은 길).
+    wait = None
+    if RESOURCE_RECHECK_TOTAL_S > 0 and _resource_recheckable(verdict, gate_json):
+        (code, gate_json, verdict, why, out), wait = _resource_wait(
+            py, gate, log, t0, (code, gate_json, verdict, why, out))
+        if verdict != "hard-block":
+            # 이어서 ④ 로 간다 — 그 전에 결속 재확인(중단이면 알림 1회는 그 안에서 끝났다).
+            bind_rc = _post_wait_master_check(log, wait)
+            if bind_rc is not None:
+                return bind_rc
     if verdict in ("usage-error", "unknown-exit"):
         # ★조용한 allow 금지 — 측정 실패는 시끄럽게(loud) 남기고 진행한다(fail-open 제거).
         _progress("⚠ 자원 게이트 측정 실패(%s) — 자원 판정 없이 진행: %s" % (verdict, why))
@@ -2471,11 +2738,16 @@ def _run_resource_gate(py, log):
         return None
     if verdict == "hard-block":
         _progress("✗ 자원 hard_block — 팀 기동 0·CEO escalation: " + why)
-        notified = _notify_loud("자원 hard_block(부트 중단)",
-                                "%s. 자원 정리(서버 kill·/clear·노드 회수) 후 재선언하라." % why)
+        if _hard_trips_fleet_only(gate_json):
+            notified = _notify_loud("컴퓨터가 계속 바빠 팀 기동을 멈췄습니다",
+                                    _fleet_hard_prescription(gate_json, wait))
+        else:
+            notified = _notify_loud("자원 hard_block(부트 중단)",
+                                    "%s. 자원 정리(서버 kill·/clear·노드 회수) 후 재선언하라." % why)
         log.step(STEP.RESOURCE_GATE_NOTIFY, 0, "알림 채널: %s" % notified)
+        extra = {"resource_wait": wait} if wait else {}
         log.result(ok=False, state="failed", failed_step="resource-gate",
-                   exit=EXIT_RESOURCE_HARD)
+                   exit=EXIT_RESOURCE_HARD, **extra)
         return EXIT_RESOURCE_HARD
     if verdict == "hard-overcount":
         _progress("⚠ 자원 nodes hard(과계수 결함으로 판단) — cys list 교차확인 후 1회 경고·진행: " + why)
@@ -2855,6 +3127,11 @@ def _cmd_run_chain(log):
         if code != 0:
             _progress("⚠ preflight 잔여 FAIL(비치명) — 팀 부팅 계속·진짜 게이트는 ⑤ check. 상세 boot-last.json")
     else:
+        # ★(0.14.41 U4 C2 ④) rc 0 · 비치명 계약은 그대로다. 다만 boot-last 최종 요약의
+        #   `steps: [(step, exit)]` 튜플만 보면 '부재 생략'과 '통과'가 같은 0 으로 보이므로, 기계
+        #   필드(preflight_state)와 사람용 ⚠ 한 줄로 **드러낸다**(판정은 바꾸지 않는다).
+        log.data["preflight_state"] = "absent"
+        _progress("⚠ ① preflight 스크립트 부재(%s) — 팩 불완전 가능 · 부트는 계속(비치명)" % preflight)
         log.step(STEP.PREFLIGHT, 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)
@@ -3139,7 +3416,9 @@ def _cmd_run_chain(log):
     if has_deficit:
         gate_rc = _run_resource_gate(py, log)
         if gate_rc is not None:
-            return gate_rc  # EXIT_RESOURCE_HARD(9) = 자원 hard_block(팀 기동 0·escalation)
+            # EXIT_RESOURCE_HARD(9) = 자원 hard_block(팀 기동 0·escalation) ·
+            # EXIT_CLAIM_DENIED(7) = (U11) 부하 대기 뒤 master 좌석 부재(팀 기동 0)
+            return gate_rc
 
         # ④ 4종 의무 노드 기동 — 결손>0에서만 호출(결손 0=스폰 경로 미진입)
         boot_budget = _budget_derived("cys_boot_outer_s", 300)
@@ -3552,6 +3831,28 @@ def cmd_self_test():
                            {"metric": "servers", "level": "hard", "value": 5}],
                  "measured": {"nodes_hard_effective": 18}}
         assert _resource_gate_decision(2, mixed, 5)[0] == "hard-block", "복합 hard가 과계수로 오무효화"
+        # ★U11: 부하 재확인 진입 조건(순수) — fleet 단독 hard · 비윈도우 · 측정 성공일 때만.
+        fleet_hard = {"trips": [{"metric": "fleet_cpu_ratio", "level": "hard", "value": 1.3}],
+                      "measured": {"fleet_cpu_reason": "ok", "fleet_cpu_ratio": 1.3}}
+        assert _resource_recheckable("hard-block", fleet_hard, windows=False), "U11 fleet 단독 미진입"
+        assert not _resource_recheckable("hard-block", fleet_hard, windows=True), \
+            "U11 윈도우 호스트에서 재확인 진입(구조적 무진입 붕괴)"
+        assert not _resource_recheckable("soft", fleet_hard, windows=False), "U11 soft 재확인(윈도우 상시 soft)"
+        assert not _resource_recheckable("hard-block", srv_hard, windows=False), "U11 servers 재확인"
+        assert not _resource_recheckable("hard-block", mixed, windows=False), "U11 복합 hard 재확인"
+        assert not _resource_recheckable("hard-block", None, windows=False), "U11 축 미상 재확인"
+        assert RESOURCE_RECHECK_TOTAL_S <= RESOURCE_RECHECK_TOTAL_CAP_S \
+            and RESOURCE_RECHECK_INTERVAL_S <= RESOURCE_RECHECK_INTERVAL_CAP_S \
+            and RESOURCE_RECHECK_INTERVAL_S >= RESOURCE_RECHECK_INTERVAL_FLOOR_S, \
+            "U11 재확인 예산이 오너 상한(180s·30s)/간격 하한을 벗어났다"
+        # ★리뷰1 MU13 방어: `_recheck_rounds` 의 `+1e-9` 부동소수 보정을 직접 핀한다.
+        #   `0.3/0.05` 는 파이썬에서 5.999999999999999 이므로 보정 없이 `//`(또는 `int()`)만
+        #   쓰면 5 가 나온다 — 의도한 값 6 과 다르다(테스트값 1.5/0.5 는 둘 다 3 이라 못 가른다).
+        assert _recheck_rounds(0.3, 0.05) == 6, \
+            "U11 재확인 회차 수 부동소수 함정 회귀(0.3/0.05 는 int()/// 로는 5 — +1e-9 보정 소실)"
+        assert _recheck_rounds(1.5, 0.5) == 3, "U11 재확인 회차 수(정수배 케이스) 회귀"
+        assert _recheck_rounds(180.0, 30.0) == 6, "U11 재확인 회차 수(기본 예산) 회귀"
+        assert _recheck_rounds(1.0, 0.0) == 0, "U11 재확인 회차 수: 간격 0 은 0 회차(0 나눗셈 방지)"
         # ★A13(W2): 미지 exit 의 fail-open 제거 — 'allow' 로 접히지 않고 타입으로 분리된다.
         assert _resource_gate_decision(3, None, None)[0] == "unknown-exit", \
             "미지 exit 이 여전히 allow 로 접힘(fail-open 잔존 — 판정불가↔allow 융합)"

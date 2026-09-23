@@ -2287,9 +2287,17 @@ EOF
              | awk -F'\t' '$4=="CEO 승격 대기"{found=1} END{exit !found}'; then
           echo "[cys-dept] CEO 승격 대기 알림 이미 pending — 재발행 생략(A11 dedupe)"
         else
+          # ★(0.14.41 U4 C2 ⑤) push 실패를 '발행' 으로 적지 않는다 — 종전 `|| true` 뒤 무조건
+          #   "발행" 한 줄은 데몬 미기동·거부에서도 발행으로 보고됐다(boot-last ⑦ detail 에 거짓 기록).
+          #   exit 0 은 유지(부트 ⑦ 무차단 · 다음 부트가 재발행). 실패 사실만 rc 와 함께 stderr 로.
+          _push_rc=0
           env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
-            --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." >/dev/null 2>&1 || true
-          echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
+            --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." >/dev/null 2>&1 || _push_rc=$?
+          if [ "$_push_rc" -eq 0 ]; then
+            echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
+          else
+            echo "[cys-dept] CEO 승격 대기 알림 발행 실패(rc=$_push_rc · 데몬 미기동?) — 승격 대기(PENDING)는 유지되고 다음 부트가 재시도한다" >&2
+          fi
         fi
       else
         _dept_count="$(reg_count)" || exit $?
