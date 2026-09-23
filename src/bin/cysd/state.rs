@@ -3012,6 +3012,57 @@ pub fn is_daemon_issued(request_id: &str) -> bool {
     request_id.starts_with(DAEMON_REQ_PREFIX)
 }
 
+/// ★U10(0.14.41) **정보성 알림 kind 허용목록** — 대기자·결정권자가 없는 안내문(발행자가 결정을 기다리지 않는다).
+///
+/// 소비자 둘: ①재시작 정리([`reconcile_restored_feed`])의 TTL 만료 대상 ②UI 토스트 제목 분류
+/// (사본: `ui/src/feedclass.ts` `NOTICE_FEED_KINDS` — `feedclass.test.ts` 가 이 리터럴과 대조한다).
+/// ★여기 없는 kind(`permission`·`approval`·`first_run_gate`·`cycle-verify`·`learn_proposal`·`mission-set`·
+/// `ceo-promote-request` …)는 **결정성**으로 취급한다 — 모르면 결정 대기로 남기는 쪽이 안전하다(추측 금지).
+pub const NOTICE_FEED_KINDS: &[&str] = &[
+    "hook-missing",
+    "bootstrap-fail",
+    "warn",
+    "error",
+    "formation",
+    "ceo-notice",
+];
+/// 정보성 kind 접두(javis_formation `_STATE_FEED_KIND` 의 `formation-complete|partial|pending|failed`).
+pub const NOTICE_FEED_KIND_PREFIXES: &[&str] = &["formation-"];
+
+/// 이 kind 가 정보성 알림인가(순수).
+pub fn is_notice_feed_kind(kind: &str) -> bool {
+    NOTICE_FEED_KINDS.contains(&kind) || NOTICE_FEED_KIND_PREFIXES.iter().any(|p| kind.starts_with(p))
+}
+
+/// 재시작 정리 결정 — 데몬 발행 화면 감지 항목(옛 세대 PTY 는 데몬과 함께 죽었다).
+pub const FEED_RESTART_STALE_DECISION: &str = "stale-restart";
+/// 재시작 정리 결정 — TTL 을 넘긴 정보성 알림.
+pub const FEED_NOTICE_EXPIRED_DECISION: &str = "expired-notice";
+/// 정보성 알림 TTL 기본값(초) — `CYS_FEED_NOTICE_TTL_SECS` 로 조정 · `0` = 만료 끔(롤백 손잡이).
+pub const FEED_NOTICE_TTL_DEFAULT_SECS: u64 = 86_400;
+
+/// `CYS_FEED_NOTICE_TTL_SECS` 값 해석(순수) — 부재·해석 불가 = 기본값(24h) · `0` = 끔.
+pub fn feed_notice_ttl_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(FEED_NOTICE_TTL_DEFAULT_SECS)
+}
+
+/// 재시작 정리 집계(로그 1줄용).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RestoredFeedReconcile {
+    pub stale_restart: usize,
+    pub expired_notice: usize,
+}
+
+/// ★U10(0.14.41 · D3a/D4) **복원 직후·서빙 전** feed 재시작 정리(순수 · 패닉 0 · allow 0).
+pub fn reconcile_restored_feed(
+    _items: &mut [FeedItem],
+    _now: f64,
+    _notice_ttl_secs: u64,
+) -> RestoredFeedReconcile {
+    RestoredFeedReconcile::default()
+}
+
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -10576,5 +10627,264 @@ mod reflect_queue_tests {
             queue_row_transition_at(&json!({"expired_at": serde_json::Value::Null})),
             f64::NEG_INFINITY
         );
+    }
+}
+
+/// ★U10(0.14.41) 켤 때마다 승인 알림 누적 — 재시작 정리 회귀 핀.
+#[cfg(test)]
+mod u10_feed_restart_tests {
+    use super::*;
+
+    /// 테스트 전용 고유 소켓 — unix 는 부모 dir, windows 는 슬러그(LOCALAPPDATA/cys/<slug>)가 고유해진다.
+    fn scratch_sock(tag: &str) -> (PathBuf, PathBuf) {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let td = std::env::temp_dir().join(format!("cys-u10-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&td).unwrap();
+        let sock = td.join(format!("u10{tag}{}x{n}.sock", std::process::id()));
+        let _ = std::fs::create_dir_all(state_dir(&sock));
+        (td, sock)
+    }
+
+    fn cleanup(td: &std::path::Path, sock: &std::path::Path) {
+        let sd = state_dir(sock);
+        if sd != td {
+            let _ = std::fs::remove_dir_all(&sd);
+        }
+        let _ = std::fs::remove_dir_all(td);
+    }
+
+    fn item(rid: &str, kind: &str, status: &str, created_at: f64) -> FeedItem {
+        // created_at 은 JSON 으로 표현할 수 없는 값(NaN·±inf)도 속성 검사에 넣으므로 필드에 직접 쓴다.
+        let mut it: FeedItem = serde_json::from_value(json!({
+            "request_id": rid, "kind": kind, "title": format!("t-{rid}"), "body": "b",
+            "surface_id": 7, "status": status, "decision": null,
+            "created_at": 0.0, "resolved_at": null
+        }))
+        .expect("FeedItem");
+        it.created_at = created_at;
+        it
+    }
+
+    fn find<'a>(items: &'a [FeedItem], rid: &str) -> &'a FeedItem {
+        items.iter().find(|i| i.request_id == rid).unwrap_or_else(|| panic!("항목 소실: {rid}"))
+    }
+
+    /// RC4-a/c/e: 데몬 발행 화면 감지 항목(approval·first_run_gate)은 재시작 뒤 옛 surface 를 가리키는
+    /// 고아다 → 서빙 전 stale-restart 로 닫힌다(재시작마다 '승인 방치' 재발화·겹친 번호 큐 차단 제거).
+    /// 데몬 발행이어도 결정 대기(learn_proposal)는 그대로 둔다.
+    #[test]
+    fn u10_restart_closes_orphan_daemon_approval_and_gate() {
+        let (td, sock) = scratch_sock("orphan");
+        {
+            let d1 = Daemon::new(sock.clone());
+            d1.push_feed_notification("approval", "claude 승인 대기 감지 (surface:7)", "b", Some(7));
+            d1.push_feed_notification(crate::governance::GATE_FEED_KIND, "관문 감지 (surface:8)", "b", Some(8));
+            d1.push_feed_notification("learn_proposal", "[RSI 학습 추천] 막힘", "b", Some(9));
+        }
+        let d2 = Daemon::new(sock.clone());
+        let items = d2.feed_items.lock().unwrap().clone();
+        let by_kind = |k: &str| items.iter().find(|i| i.kind == k).cloned().expect(k);
+        for k in ["approval", crate::governance::GATE_FEED_KIND] {
+            let it = by_kind(k);
+            assert_eq!(it.status, "resolved", "{k} 고아가 재시작 뒤에도 pending");
+            assert_eq!(it.decision.as_deref(), Some(FEED_RESTART_STALE_DECISION), "{k}");
+        }
+        assert_eq!(by_kind("learn_proposal").status, "pending", "결정 대기(learn_proposal)를 닫았다");
+        assert!(items.iter().all(|i| i.decision.as_deref() != Some("allow")), "자동 종결이 allow 를 만들었다");
+        drop(d2);
+        // 영속: 압축 재기록이 정리 결과를 디스크에 남긴다(3번째 기동도 같은 사실).
+        let d3 = Daemon::new(sock.clone());
+        let pend: Vec<String> = d3
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.status == "pending")
+            .map(|i| i.kind.clone())
+            .collect();
+        assert_eq!(pend, vec!["learn_proposal".to_string()]);
+        drop(d3);
+        cleanup(&td, &sock);
+    }
+
+    /// D4: 정보성 kind(허용목록)만 TTL(24h) 초과 시 expired-notice · 결정성 kind·신선 항목·종결 항목 불변.
+    #[test]
+    fn u10_restart_expires_only_allowlisted_old_notices() {
+        let (td, sock) = scratch_sock("ttl");
+        let now = now_epoch();
+        let old = now - 2.0 * 86_400.0;
+        let lines: Vec<FeedItem> = vec![
+            item("r-hm-old", "hook-missing", "pending", old),
+            item("r-bf-old", "bootstrap-fail", "pending", old),
+            item("r-fp-old", "formation-partial", "pending", old),
+            item("r-ceo-old", "ceo-notice", "pending", old),
+            item("r-warn-old", "warn", "pending", old),
+            item("r-perm-old", "permission", "pending", old),
+            item("r-ms-old", "mission-set", "pending", old),
+            item("r-cv-old", "cycle-verify", "pending", old),
+            item("r-cpr-old", "ceo-promote-request", "pending", old),
+            item("r-hm-fresh", "hook-missing", "pending", now - 60.0),
+            item("r-hm-done", "hook-missing", "resolved", old),
+        ];
+        let feed = state_dir(&sock).join("feed.jsonl");
+        let body: String = lines
+            .iter()
+            .map(|i| serde_json::to_string(i).unwrap() + "\n")
+            .collect();
+        std::fs::write(&feed, body).unwrap();
+        let d = Daemon::new(sock.clone());
+        let items = d.feed_items.lock().unwrap().clone();
+        for rid in ["r-hm-old", "r-bf-old", "r-fp-old", "r-ceo-old", "r-warn-old"] {
+            let it = find(&items, rid);
+            assert_eq!(it.status, "resolved", "{rid} 가 만료되지 않았다");
+            assert_eq!(it.decision.as_deref(), Some(FEED_NOTICE_EXPIRED_DECISION), "{rid}");
+        }
+        for rid in ["r-perm-old", "r-ms-old", "r-cv-old", "r-cpr-old", "r-hm-fresh"] {
+            let it = find(&items, rid);
+            assert_eq!(it.status, "pending", "{rid} 를 닫았다(결정성 kind 또는 신선 항목)");
+            assert_eq!(it.decision, None, "{rid}");
+        }
+        let done = find(&items, "r-hm-done");
+        assert_eq!((done.status.as_str(), done.decision.as_deref()), ("resolved", None), "종결 항목을 바꿨다");
+        drop(d);
+        cleanup(&td, &sock);
+    }
+
+    /// 순수부 계약 — 결정 테이블 + 멱등 + TTL 0 = 끔.
+    #[test]
+    fn u10_reconcile_decision_table() {
+        let now = 1_900_000_000.0;
+        let old = now - 90_000.0;
+        let mut v = vec![
+            item("daemon-1-0", "approval", "pending", now),
+            item("daemon-1-1", crate::governance::GATE_FEED_KIND, "pending", now),
+            item("client-approval", "approval", "pending", old), // 클라이언트 발행 approval 은 대상 아님
+            item("daemon-1-2", "learn_proposal", "pending", old),
+            item("daemon-1-3", "warn", "pending", old),
+            item("r-f", "formation", "pending", old),
+            item("r-fx", "formationX", "pending", old), // 접두 규칙은 'formation-' 뿐
+            item("r-future", "hook-missing", "pending", now + 99_999.0), // 시계 역행 = 만료 아님
+        ];
+        let rep = reconcile_restored_feed(&mut v, now, FEED_NOTICE_TTL_DEFAULT_SECS);
+        let dec = |rid: &str| find(&v, rid).decision.clone();
+        assert_eq!(dec("daemon-1-0").as_deref(), Some(FEED_RESTART_STALE_DECISION));
+        assert_eq!(dec("daemon-1-1").as_deref(), Some(FEED_RESTART_STALE_DECISION));
+        assert_eq!(dec("client-approval"), None);
+        assert_eq!(dec("daemon-1-2"), None);
+        assert_eq!(dec("daemon-1-3").as_deref(), Some(FEED_NOTICE_EXPIRED_DECISION));
+        assert_eq!(dec("r-f").as_deref(), Some(FEED_NOTICE_EXPIRED_DECISION));
+        assert_eq!(dec("r-fx"), None);
+        assert_eq!(dec("r-future"), None);
+        assert_eq!(rep, RestoredFeedReconcile { stale_restart: 2, expired_notice: 2 });
+        assert!(v.iter().filter(|i| i.decision.is_some()).all(|i| i.status == "resolved" && i.resolved_at == Some(now)));
+        // 멱등: 두 번째 적용은 아무것도 바꾸지 않는다.
+        let snap = serde_json::to_string(&v).unwrap();
+        assert_eq!(reconcile_restored_feed(&mut v, now, FEED_NOTICE_TTL_DEFAULT_SECS), RestoredFeedReconcile::default());
+        assert_eq!(serde_json::to_string(&v).unwrap(), snap);
+        // TTL 0 = 만료 끔(재시작 고아 정리는 유지).
+        let mut w = vec![item("r-hm", "hook-missing", "pending", 0.0), item("daemon-9-9", "approval", "pending", 0.0)];
+        let rep0 = reconcile_restored_feed(&mut w, now, 0);
+        assert_eq!(rep0, RestoredFeedReconcile { stale_restart: 1, expired_notice: 0 });
+        assert_eq!(w[0].status, "pending");
+    }
+
+    #[test]
+    fn u10_notice_kind_allowlist_and_ttl_env() {
+        for k in ["hook-missing", "bootstrap-fail", "warn", "error", "formation", "ceo-notice",
+                  "formation-complete", "formation-partial", "formation-pending", "formation-failed"] {
+            assert!(is_notice_feed_kind(k), "{k}");
+        }
+        for k in ["permission", "approval", "first_run_gate", "cycle-verify", "learn_proposal",
+                  "mission-set", "ceo-promote-request", "question", "", "formationX", "Hook-Missing"] {
+            assert!(!is_notice_feed_kind(k), "{k}");
+        }
+        assert_eq!(feed_notice_ttl_from(None), 86_400);
+        assert_eq!(feed_notice_ttl_from(Some("0")), 0);
+        assert_eq!(feed_notice_ttl_from(Some(" 3600 ")), 3600);
+        assert_eq!(feed_notice_ttl_from(Some("abc")), 86_400);
+        assert_eq!(feed_notice_ttl_from(Some("-5")), 86_400);
+    }
+
+    /// ★속성 검사(오너 지시: 어떤 입력에도 패닉 없음) — 결정론 의사난수(xorshift64*)로 20,000 벡터.
+    /// 불변식: ①패닉 0 ②길이·순서 보존 ③pending 이 아니던 항목 불변 ④바뀐 항목은 resolved + 두 정리 결정 중
+    /// 하나 ⑤allow 산출 0 ⑥집계 = 바뀐 수 ⑦멱등.
+    #[test]
+    fn u10_reconcile_property_never_panics_never_allows() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+                &xs[(self.next() % xs.len() as u64) as usize]
+            }
+        }
+        let kinds = [
+            "approval", "first_run_gate", "hook-missing", "bootstrap-fail", "warn", "error",
+            "formation", "formation-", "formation-failed", "ceo-notice", "permission", "cycle-verify",
+            "learn_proposal", "mission-set", "", "승인", "APPROVAL", "formation\u{0}", "hook-missing ",
+        ];
+        let statuses = ["pending", "resolved", "timeout", "", "PENDING", "pending ", "대기"];
+        let rids = ["daemon-", "daemon-1-2", "daemon-\u{FFFF}", "d", "", "req-1", "DAEMON-1", "daemon"];
+        let floats = [
+            0.0, -0.0, 1.0, -1.0, 1.7e9, 1.9e9, 1e300, -1e300, f64::MAX, f64::MIN, f64::MIN_POSITIVE,
+            f64::EPSILON, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 86_400.0, 86_401.0,
+        ];
+        let ttls = [0u64, 1, 60, 86_400, u64::MAX, u64::MAX / 2];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let n = (rng.next() % 12) as usize;
+            let mut v: Vec<FeedItem> = (0..n)
+                .map(|i| {
+                    let mut it = item(rng.pick(&rids), rng.pick(&kinds), rng.pick(&statuses), *rng.pick(&floats));
+                    it.request_id = format!("{}{i}", it.request_id);
+                    if rng.next() % 3 == 0 {
+                        it.decision = Some((*rng.pick(&["allow", "deny", "x"])).to_string());
+                    }
+                    it
+                })
+                .collect();
+            let now = *rng.pick(&floats);
+            let ttl = *rng.pick(&ttls);
+            let before: Vec<(String, String, Option<String>, String)> = v
+                .iter()
+                .map(|i| (i.request_id.clone(), i.status.clone(), i.decision.clone(), format!("{i:?}")))
+                .collect();
+            let rep = reconcile_restored_feed(&mut v, now, ttl);
+            assert_eq!(v.len(), before.len(), "길이 변경");
+            let mut changed = 0usize;
+            for (it, (rid, st, dec, dbg)) in v.iter().zip(before.iter()) {
+                assert_eq!(&it.request_id, rid, "순서·식별자 변경");
+                if st != "pending" {
+                    assert_eq!(&format!("{it:?}"), dbg, "pending 이 아닌 항목을 바꿨다");
+                    continue;
+                }
+                if it.decision != *dec || it.status != *st {
+                    changed += 1;
+                    assert_eq!(it.status, "resolved");
+                    let d = it.decision.as_deref().unwrap_or("");
+                    assert!(
+                        d == FEED_RESTART_STALE_DECISION || d == FEED_NOTICE_EXPIRED_DECISION,
+                        "허용되지 않은 자동 결정: {d}"
+                    );
+                }
+                assert!(
+                    it.decision.as_deref() != Some("allow") || dec.as_deref() == Some("allow"),
+                    "자동 정리가 allow 를 만들었다"
+                );
+            }
+            assert_eq!(rep.stale_restart + rep.expired_notice, changed, "집계 불일치");
+            let snap = format!("{v:?}");
+            assert_eq!(reconcile_restored_feed(&mut v, now, ttl), RestoredFeedReconcile::default(), "멱등 위반");
+            assert_eq!(format!("{v:?}"), snap, "멱등 위반(내용)");
+        }
     }
 }

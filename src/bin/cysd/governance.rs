@@ -1548,7 +1548,7 @@ const ENV_GATE_SCAN: &str = "CYS_GATE_SCAN";
 /// 관문 feed 항목의 `kind`. approval 네임스페이스와 **다른 문자열**인 것이 오염 차단의 핵심이다
 /// — `has_pending_daemon_approval`·approval stale-clear 는 `kind == "approval"` 로 거르므로
 /// 두 스캐너의 생명주기가 서로를 종결시키지 않는다.
-const GATE_FEED_KIND: &str = "first_run_gate";
+pub(crate) const GATE_FEED_KIND: &str = "first_run_gate";
 
 /// 관문 격상 디바운스 창(초). approval 디바운스(60초)와 **같은 값·다른 축**이다.
 const GATE_SCAN_DEBOUNCE_SECS: f64 = 60.0;
@@ -10000,6 +10000,40 @@ mod tests {
         daemon.resolve_feed_item(&rid, "allow");
         super::check_approval_stall(&daemon, &mut fired);
         assert!(fired.is_empty(), "해소 항목 키 회수");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★U10(D3c) 고아 승인 항목(surface 가 맵에 없음 — 재시작 전 세대·이미 사라진 pane)은 '승인 방치'
+    /// (approval.stalled → UI 토스트 + OS 배너 + 패널 가로채기)를 울리지 않는다. 종전: watchdog 지역
+    /// 1회 집합이 데몬 수명마다 비어 **켤 때마다** 항목당 한 번씩 다시 울렸다.
+    #[test]
+    fn u10_approval_stall_skips_orphan_surface() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys_u10_stall_orphan_{}_{}",
+            std::process::id(),
+            crate::state::now_epoch().to_bits()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join(format!("u10orphan{}.sock", std::process::id())));
+        let mut rx = daemon.bus.subscribe();
+        daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:4242)", "b", Some(4242));
+        daemon.push_feed_notification("approval", "surface 미상 승인", "b", None);
+        {
+            let mut items = daemon.feed_items.lock().unwrap();
+            for it in items.iter_mut() {
+                it.created_at -= 400.0;
+            }
+        }
+        let mut fired = std::collections::HashSet::new();
+        super::check_approval_stall(&daemon, &mut fired);
+        super::check_approval_stall(&daemon, &mut fired);
+        let mut stalled = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("approval.stalled") {
+                stalled += 1;
+            }
+        }
+        assert_eq!(stalled, 0, "살아 있지 않은 surface 의 승인 항목이 '승인 방치' 를 울렸다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

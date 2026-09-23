@@ -620,6 +620,69 @@ pub fn hook_registered_in(root: &serde_json::Value, event: &str, desired: &str) 
     hook_registered_with_timeout_in(root, event, desired, None)
 }
 
+/// ★U10(0.14.41) **관측 전용** hook 명령 비교 정규화(순수).
+///
+/// ★집행 경로(`merge_desired_hooks`·`verify_desired_hooks_registered`)에는 **절대 쓰지 않는다** —
+/// 그쪽은 바이트 동등이 계약이다(느슨한 매칭이 '이미 있음'과 '없음'을 뒤섞으면 재등록이 중복 append
+/// 폭주 방향으로 간다: 위 `hook_registered_in` 주석). 이 함수의 소비자는 기동 경고
+/// (`cys launch-agent` 의 각성 훅 미등록 판정) 하나다.
+pub fn normalize_hook_command_for_compare(cmd: &str, _windows_rules: bool) -> String {
+    cmd.to_string()
+}
+
+/// settings.json 의 특정 이벤트에 desired 명령이 **표기 정규화 후** 등록돼 있는가(관측 전용·순수).
+/// command 축 단독(timeout 미고려) — [`hook_registered_in`] 과 같은 축이고 비교만 정규화한다.
+pub fn hook_registered_normalized_in(
+    root: &serde_json::Value,
+    event: &str,
+    desired: &str,
+    windows_rules: bool,
+) -> bool {
+    let want = normalize_hook_command_for_compare(desired, windows_rules);
+    root.get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|m| {
+                m.get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| normalize_hook_command_for_compare(c, windows_rules) == want)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// ★U10(0.14.41) 각성 훅 누락 목록 — **레인 팩 하나**를 기대값으로 삼는다(관측 전용·순수).
+///
+/// 합집합(본부 팩 ∪ 레인 팩)을 쓰지 않는 이유: 부서 계정 settings 에 본부 팩 훅이 교차 등록된 경우를
+/// '등록됨' 으로 통과시키면 레인 가드 위임 실패(훅이 조용히 조기 종료하는 형상)가 가려진다(U10 반박 DD1).
+pub fn awakening_hooks_missing_in(
+    root: &serde_json::Value,
+    lane_pack: &Path,
+    windows_rules: bool,
+) -> Vec<&'static str> {
+    AWAKENING_HOOKS
+        .iter()
+        .filter(|h| {
+            !hook_registered_normalized_in(
+                root,
+                h.event,
+                &hook_command_for(lane_pack, h.script),
+                windows_rules,
+            )
+        })
+        .map(|h| h.script)
+        .collect()
+}
+
 /// **불일치 엔트리 교체 경로**(U-21) — 이미 등록된 우리 hook 객체의 `timeout` 만 선언값으로 올린다.
 ///
 /// 안전 계약(오살 금지 — 이 함수가 이 단위에서 가장 위험한 코드다):
@@ -4299,6 +4362,104 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ★U10(0.14.41) 각성 훅 경고 — 레인 팩 단독 기대값 · 표기 정규화(관측 전용) ─────────────
+    fn u10_settings(cmds: &[(&str, &str)]) -> serde_json::Value {
+        let mut hooks = serde_json::Map::new();
+        for (event, cmd) in cmds {
+            let arr = hooks
+                .entry(event.to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            arr.as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"hooks": [{"type": "command", "command": cmd}]}));
+        }
+        serde_json::json!({ "hooks": hooks })
+    }
+
+    /// 부서 계정 settings 에 부서 팩 훅이 정상 등록 → 레인(부서) 팩 기대값으로 누락 0 (U10 RC2 오탐 제거).
+    #[test]
+    fn u10_awakening_missing_dept_lane_registered_is_clean() {
+        let dept = Path::new("/h/.cys/pack-dept-a");
+        let s = u10_settings(&[
+            ("SessionStart", &hook_command_for(dept, "session-start.sh")),
+            ("UserPromptSubmit", &hook_command_for(dept, "role-bootstrap.sh")),
+        ]);
+        assert!(awakening_hooks_missing_in(&s, dept, cfg!(windows)).is_empty());
+    }
+
+    /// 합집합 금지 — 본부 팩 훅만 교차 등록된 부서 settings 는 부서 레인 기대값에서 **둘 다 누락**이다.
+    #[test]
+    fn u10_awakening_missing_has_no_union_with_hq_pack() {
+        let hq = Path::new("/h/.cys/pack");
+        let dept = Path::new("/h/.cys/pack-dept-a");
+        let s = u10_settings(&[
+            ("SessionStart", &hook_command_for(hq, "session-start.sh")),
+            ("UserPromptSubmit", &hook_command_for(hq, "role-bootstrap.sh")),
+        ]);
+        assert_eq!(
+            awakening_hooks_missing_in(&s, dept, cfg!(windows)),
+            vec!["session-start.sh", "role-bootstrap.sh"],
+            "본부 팩 훅이 부서 레인에서 '등록됨' 으로 통과했다(합집합 금지 위반)"
+        );
+        // 대칭: 본부 레인 기대값에서는 등록됨.
+        assert!(awakening_hooks_missing_in(&s, hq, cfg!(windows)).is_empty());
+    }
+
+    /// 윈도우 규칙: 드라이브 대소문자·역슬래시·MSYS(`/c/`)·`\\?\` 접두·따옴표 차이를 같은 경로로 본다.
+    #[test]
+    fn u10_hook_compare_windows_forms_are_equal() {
+        let want = r#"bash "C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#;
+        for got in [
+            r#"bash "c:\Users\X\.cys\pack-dept-a\hooks\session-start.sh""#,
+            r#"bash "/c/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#,
+            r#"bash "\\?\C:\Users\X\.cys\pack-dept-a\hooks\session-start.sh""#,
+            r#"bash C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh"#,
+            r#"BASH  "C:/USERS/x/.cys/pack-dept-a/hooks/session-start.sh""#,
+        ] {
+            assert_eq!(
+                normalize_hook_command_for_compare(got, true),
+                normalize_hook_command_for_compare(want, true),
+                "윈도우 표기 차이를 다른 명령으로 읽었다: {got}"
+            );
+            let s = u10_settings(&[("SessionStart", got)]);
+            assert!(hook_registered_normalized_in(&s, "SessionStart", want, true), "{got}");
+        }
+        // 공백 포함 사용자명(따옴표 필수 형상)도 같은 규칙.
+        assert_eq!(
+            normalize_hook_command_for_compare(r#"bash "/c/Users/x y/.cys/pack/hooks/a.sh""#, true),
+            normalize_hook_command_for_compare(r#"bash "C:\Users\X Y\.cys\pack\hooks\a.sh""#, true),
+        );
+    }
+
+    /// 정규화가 **다른 명령을 같게 만들지 않는다**(느슨함의 상한) · 유닉스 규칙은 대소문자·MSYS 무변환.
+    #[test]
+    fn u10_hook_compare_does_not_merge_distinct_commands() {
+        let w = |s: &str| normalize_hook_command_for_compare(s, true);
+        assert_ne!(
+            w(r#"bash "C:/Users/X/.cys/pack-dept-a/hooks/session-start.sh""#),
+            w(r#"bash "C:/Users/X/.cys/pack/hooks/session-start.sh""#),
+            "다른 팩"
+        );
+        assert_ne!(
+            w(r#"bash "C:/Users/X/.cys/pack/hooks/session-start.sh""#),
+            w(r#"bash "C:/Users/X/.cys/pack/hooks/role-bootstrap.sh""#),
+            "다른 스크립트"
+        );
+        assert_ne!(
+            w(r#"bash "C:/p/hooks/a.sh""#),
+            w(r#"bash "D:/p/hooks/a.sh""#),
+            "다른 드라이브"
+        );
+        let u = |s: &str| normalize_hook_command_for_compare(s, false);
+        assert_ne!(u("sh /Users/X/.cys/pack/hooks/a.sh"), u("sh /users/x/.cys/pack/hooks/a.sh"), "유닉스는 대소문자 구분");
+        assert_ne!(u("sh /c/x/hooks/a.sh"), u("sh c:/x/hooks/a.sh"), "유닉스는 MSYS 변환 없음");
+        // 빈 문자열·이상 입력에서 패닉 0.
+        for odd in ["", " ", "\"", "\\\\?\\", "/c", "/", "//?/", "bash \"\""] {
+            let _ = w(odd);
+            let _ = u(odd);
+        }
+    }
 
     /// ★(0.14.39 라운드3 · 성찰2 notice) 레인 가드 표식의 경로·신선도 창은 러스트/파이썬 **사본 2벌**이다.
     /// 드리프트하면 `cys cycle-agent` 와 `javis_preflight` 가 서로 다른 레인 상태를 보고,

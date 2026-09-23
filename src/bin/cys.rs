@@ -6350,6 +6350,14 @@ fn discover_claude_settings() -> Vec<String> {
 /// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다 —
 /// 같은 표면·같은 술어여야 두 채널의 보고가 갈리지 않는다.
 /// 비치명: 경고만 하고 부트는 계속한다(위경고 모드·부트 봉쇄 회귀 금지 — 금지 방향 ③ 정신).
+/// ★U10(0.14.41) 각성 훅 경고의 **기대 팩 = 이 소켓 레인의 팩**(순수 · 소켓·env 팩 주입형).
+///
+/// 부서 소켓이면 그 부서 팩(`lane_pack_for_socket` — cys-dept `dept_pack` 과 같은 규칙), 그 밖(본부)
+/// 이면 env 팩(`pack_dir()`). 부서명을 유도하지 못하는 불량 부서 소켓은 env 팩으로 접는다(종전 거동).
+fn awakening_expected_pack(_socket: &std::path::Path, env_pack: std::path::PathBuf) -> std::path::PathBuf {
+    env_pack
+}
+
 fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: &str) {
     // claude 계열만 대상(agy·codex 는 Claude-config 노드가 아니다 — preflight discover 와 동일 규약).
     if !agent.starts_with("claude") {
@@ -6412,6 +6420,43 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
         "feed.push",
         json!({"kind": "hook-missing", "title": "각성 훅 미등록(노드 기동)", "body": body}),
     );
+}
+
+/// ★U10(0.14.41 · D5/DD6) cycle-verify **자기 요청 종결 가드** — feed.push 성공 뒤의 모든 조기 반환
+/// (검증자 주입 실패 · 폴링 중 feed.list 실패 · 시간초과)에서 자기가 올린 항목을 비허가 결정
+/// [`CYCLE_VERIFY_ABORT_DECISION`] 으로 닫는다(종전: pending 으로 영구 잔존 → 배지 누적).
+///
+/// 계약: ①성공·판정 수신(Some 영수증) 경로에서만 `disarm` — 그 경로의 거동은 바이트 동일하다
+/// ②닫기는 best-effort(실패는 무시 — 반환 Err 문구·clear 판정 무변경 = 무clear 축 ② 무영향)
+/// ③결정은 `allow` 가 아니다 → 자기승인 가드(§3.2 `is_self_approval`)에 걸리지 않고 clear 를
+/// 열지도 않는다(clear 는 여전히 지정 검증자 allow + 영수증에서만). 늦게 온 검증자 응답은
+/// "item already resolved" — 이미 중단된 사이클이므로 올바르다.
+const CYCLE_VERIFY_ABORT_DECISION: &str = "cycle-timeout";
+
+struct CycleVerifyCloser<F: FnMut(&str, &str)> {
+    req_id: String,
+    armed: bool,
+    close: F,
+}
+
+impl<F: FnMut(&str, &str)> CycleVerifyCloser<F> {
+    fn new(req_id: String, close: F) -> Self {
+        let armed = !req_id.is_empty();
+        CycleVerifyCloser { req_id, armed, close }
+    }
+    /// 항목이 이미 종결됐거나(판정 수신) 성공 경로 — 더 닫을 것이 없다.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<F: FnMut(&str, &str)> Drop for CycleVerifyCloser<F> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            (self.close)(&self.req_id, CYCLE_VERIFY_ABORT_DECISION);
+        }
+    }
 }
 
 /// ★★M5(2026-08-24) — 각성 훅 **설치 표적 ≠ 실소비 SOT** 의 loud WARN(기동 1회).
@@ -35235,5 +35280,131 @@ mod d06_regression {
                 assert!(result.is_err(), "부서 팩 + 임의 소켓({socket})의 autostart 를 거부해야 한다");
             });
         }
+    }
+}
+
+/// ★U10(0.14.41) 켤 때마다 승인 알림 누적 — cys CLI 쪽 회귀 핀(레인 팩 기대값 · cycle-verify 자기 요청 종결 ·
+/// 부서 소켓 launch-agent 의 부서 팩 지침 합성).
+#[cfg(test)]
+mod u10_notice_lane {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn function_body<'a>(src: &'a str, anchor: &str) -> &'a str {
+        let start = src.find(anchor).expect("함수 앵커") + anchor.len();
+        let rest = &src[start..];
+        let end = ["\nfn ", "\nconst ", "\nstruct ", "\nimpl"]
+            .iter()
+            .filter_map(|b| rest.find(b))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 기대 팩 = 소켓 레인의 팩 — 부서 소켓(unix 부모 dir · windows 파이프명)은 부서 팩, 본부는 env 팩.
+    #[test]
+    fn u10_expected_pack_is_lane_pack_for_dept_socket() {
+        let home = dirs::home_dir().expect("home");
+        let env_pack = std::path::PathBuf::from("/hq/.cys/pack");
+        let want = home.join(".cys").join("pack-dept-a");
+        let dept_unix = home.join(".local/state/cys-dept-a/cys.sock");
+        assert_eq!(awakening_expected_pack(&dept_unix, env_pack.clone()), want, "unix 부서 소켓");
+        let dept_pipe = std::path::Path::new(r"\\.\pipe\cys-dept-a");
+        assert_eq!(awakening_expected_pack(dept_pipe, env_pack.clone()), want, "windows 부서 파이프");
+        let base = home.join(".local/state/cys/cys.sock");
+        assert_eq!(awakening_expected_pack(&base, env_pack.clone()), env_pack, "본부 소켓 = env 팩(종전)");
+        let bad = std::path::Path::new("/x/cys-dept-/cys.sock");
+        assert_eq!(awakening_expected_pack(bad, env_pack.clone()), env_pack, "불량 부서 소켓 = env 팩(종전)");
+    }
+
+    /// 경고 판정부는 레인 팩 하나 + 표기 정규화 비교만 쓴다(바이트 비교·합집합 금지).
+    #[test]
+    fn u10_warn_uses_lane_pack_only_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = function_body(src, "\nfn warn_if_awakening_hooks_missing(");
+        assert!(body.contains("awakening_expected_pack("), "레인 팩 기대값 미사용");
+        assert!(body.contains("awakening_hooks_missing_in("), "정규화 판정 미사용");
+        assert!(!body.contains("hook_registered_in("), "본부 팩 바이트 비교 경로가 남았다");
+    }
+
+    /// ★회귀 핀(U10 반박 M1): 부서 편성(cys-dept → javis_formation → javis_boot_node → `cys launch-agent`)이
+    /// 싣는 env(부서 소켓 + 부서 팩)에서 launch-agent 의 주입 지침은 **부서 팩**에서 합성된다 — 본부 팩의
+    /// CEO 지침·MEMORY 가 부서 좌석에 새지 않는다.
+    #[test]
+    fn u10_dept_socket_launch_agent_composes_dept_pack_directive() {
+        let _env = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-u10-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let hq = td.join(".cys").join("pack");
+        let dept = td.join(".cys").join("pack-dept-u10");
+        for (p, mark) in [(&hq, "HQ-CEO-DIRECTIVE"), (&dept, "DEPT-CSO-DIRECTIVE")] {
+            std::fs::create_dir_all(p.join("directives")).unwrap();
+            std::fs::create_dir_all(p.join("memory")).unwrap();
+            std::fs::write(p.join("directives/CSO_DIRECTIVE.md"), format!("# {mark}\n")).unwrap();
+            std::fs::write(p.join("memory/MEMORY.md"), format!("{mark}-MEMORY\n")).unwrap();
+        }
+        let sock = td.join(".local/state/cys-dept-u10/cys.sock");
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &dept);
+        let _s = cys::pack::EnvGuard::set("CYS_SOCKET", &sock);
+        let out = boot_directive_for("cso", false).expect("compose");
+        let _ = std::fs::remove_dir_all(&td);
+        assert!(out.contains("DEPT-CSO-DIRECTIVE"), "부서 팩 지침 미합성");
+        assert!(out.contains("DEPT-CSO-DIRECTIVE-MEMORY"), "부서 팩 MEMORY 미합성");
+        assert!(!out.contains("HQ-CEO-DIRECTIVE"), "본부 팩 지침·기억이 부서 좌석에 샜다");
+    }
+
+    /// 가드 의미: 무장 상태로 drop(= ? 조기 반환·return Err) → 비허가 결정으로 1회 닫기 · disarm → 0회 ·
+    /// 빈 request_id(push 응답에 id 없음) → 0회.
+    #[test]
+    fn u10_cycle_verify_closer_closes_on_every_abort_path() {
+        let calls: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+        let rec = |r: &str, d: &str| calls.borrow_mut().push((r.to_string(), d.to_string()));
+        fn flow<F: FnMut(&str, &str)>(fail_at: u8, rec: F) -> Result<(), String> {
+            let mut g = CycleVerifyCloser::new("req-1".to_string(), rec);
+            if fail_at == 1 {
+                Err("inject_text 실패".to_string())?;
+            }
+            if fail_at == 2 {
+                Err("feed.list 실패".to_string())?;
+            }
+            if fail_at == 3 {
+                return Err("검증자 응답 없음 (timeout) — clear 중단".into());
+            }
+            g.disarm();
+            Ok(())
+        }
+        for fail_at in 1..=3u8 {
+            calls.borrow_mut().clear();
+            assert!(flow(fail_at, rec).is_err());
+            assert_eq!(
+                *calls.borrow(),
+                vec![("req-1".to_string(), CYCLE_VERIFY_ABORT_DECISION.to_string())],
+                "조기 반환 {fail_at} 에서 자기 요청을 닫지 않았다"
+            );
+        }
+        calls.borrow_mut().clear();
+        assert!(flow(0, rec).is_ok());
+        assert!(calls.borrow().is_empty(), "성공 경로에서 닫았다(거동 변경)");
+        {
+            let _g = CycleVerifyCloser::new(String::new(), rec);
+        }
+        assert!(calls.borrow().is_empty(), "빈 request_id 를 닫으려 했다");
+        assert_ne!(CYCLE_VERIFY_ABORT_DECISION, "allow", "자동 종결은 절대 allow 가 아니다");
+    }
+
+    /// 배선 핀: 가드는 push 직후(첫 조기 반환 지점인 검증자 주입 **전**) 무장되고, 영수증 수신 분기에서 해제된다.
+    #[test]
+    fn u10_cycle_agent_arms_closer_right_after_push_source_pin() {
+        let src = include_str!("cys.rs");
+        let push = src
+            .find(r#"json!({"kind": "cycle-verify","#)
+            .expect("cycle-verify push");
+        let rest = &src[push..];
+        let arm = rest.find("CycleVerifyCloser::new(").expect("가드 무장 부재");
+        let inject = rest.find("inject_text(vsid").expect("검증자 주입");
+        assert!(arm < inject, "가드가 검증자 주입보다 늦게 무장됐다(주입 실패 시 고아)");
+        let m = rest.find("match receipt {").expect("영수증 분기");
+        let arms = &rest[m..m + rest[m..].find("\n            }\n").expect("match 끝")];
+        assert!(arms.contains("disarm()"), "영수증 수신 분기에서 해제하지 않는다");
     }
 }
