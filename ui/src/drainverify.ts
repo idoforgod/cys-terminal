@@ -43,6 +43,8 @@ export type DrainUnreachable = {
   detail?: string;
 };
 
-export function drainVerifyUnresponsiveLines(_unreachable: DrainUnreachable[] | undefined): string[] {
-  return []; // RED 골격 — GREEN 커밋에서 구현
+export function drainVerifyUnresponsiveLines(unreachable: DrainUnreachable[] | undefined): string[] {
+  return (unreachable ?? [])
+    .filter((u) => u.kind === "unresponsive")
+    .map((u) => `• ${u.department || u.dept}: 데몬 응답 없음(연결은 됐으나 무응답) — 그 안의 노드는 저장 신호를 받지 못했습니다`);
 }

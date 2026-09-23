@@ -24,7 +24,12 @@ import { updatePlan } from "./updateplan";
 import { planRestartInject, restartInvokeFailureReason } from "./restartplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
-import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainverify";
+import {
+  classifyDrainVerifyFallback,
+  drainVerifyFallbackToast,
+  drainVerifyUnresponsiveLines,
+  type DrainUnreachable,
+} from "./drainverify";
 import { classifyPendingFeed, CYCLE_VERIFY_NOTE, CYCLE_VERIFY_DISMISS_TITLE } from "./feedclass";
 import {
   deptPlaceholderLabel,
@@ -5778,6 +5783,7 @@ type DrainVerifyReport = {
   summary: { saved: number; timeout: number; delivery_failed: number; unverifiable: number; skipped_restoring: number };
   nodes: DrainVerifyNode[];
   pending_loss_warning?: { role: string; surface: string; pending_undelivered: number }[];
+  unreachable?: DrainUnreachable[]; // ★U4-B2②(가산 필드 · 구버전 cys 는 부재)
 };
 
 // ★[F2] 검증은 nonce '마커 기입'만 확인한다 — 노드가 마커 앞에서 SESSION_STATE 내용을 실제로 최신화했는지는
@@ -5796,6 +5802,8 @@ function drainVerifyReportText(r: DrainVerifyReport): string {
   const lines = bad.map(
     (n) => `• ${n.department ? n.department + " / " : ""}${n.role} (${n.surface}): ${OUTCOME_LABEL[n.outcome] ?? n.outcome}`,
   );
+  // ★U4-B2②: 연결은 됐는데 응답 없던 데몬(unresponsive)도 저장 미확인 사유다(down 은 정보성 — 제외).
+  lines.push(...drainVerifyUnresponsiveLines(r.unreachable));
   return (
     `${r.total}개 노드 중 ${r.summary.saved}개만 체크포인트 마커가 확인됐습니다.\n\n` +
     `${lines.join("\n")}\n\n` +
@@ -7570,7 +7578,12 @@ async function start() {
       stickyToast("upd-pack", "feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
   });
   await listen("pack-updated", (e) => {
-    const p = (e.payload ?? {}) as { pack_version?: string; reinject_failed?: number; reinject_deferred?: number };
+    const p = (e.payload ?? {}) as {
+      pack_version?: string;
+      reinject_failed?: number;
+      reinject_deferred?: number;
+      reinject_skipped?: boolean; // ★U4-B2③ 재주입 자체를 못 함 — '완료' 단정 금지
+    };
     packUpdateAvailable = null;
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 완료 토스트로 교대.
     const badge = document.getElementById("update-badge")!;
@@ -7578,7 +7591,7 @@ async function start() {
     // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
     const failed = p.reinject_failed ?? 0;
     const deferred = p.reinject_deferred ?? 0;
-    if (failed > 0 || deferred > 0) {
+    if (failed > 0 || deferred > 0 || p.reinject_skipped === true) {
       toast(
         "watchdog",
         "✅ 팩 디스크 반영 완료",

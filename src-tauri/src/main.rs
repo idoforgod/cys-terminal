@@ -6436,8 +6436,29 @@ async fn install_pack_update(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     // 사이드카 구조화 출력에서 reinject failed/deferred 집계 — 라이브 미각성을 사용자에게 경고.
-    let (failed, deferred) = parse_reinject_counts(&stdout);
-    if failed > 0 || deferred > 0 {
+    // ★U4-B2③ 3상 판독: 재주입 자체를 못 한 스킵을 (0,0)=완전 성공으로 읽지 않는다.
+    let reinject = parse_reinject_result(&stdout);
+    let (failed, deferred) = match &reinject {
+        ReinjectResult::Measured { failed, deferred } => (*failed, *deferred),
+        ReinjectResult::Skipped { .. } | ReinjectResult::Absent => (0, 0),
+    };
+    let reinject_skipped = matches!(reinject, ReinjectResult::Skipped { .. });
+    if let ReinjectResult::Skipped { reason } = &reinject {
+        let _ = app.emit(
+            "update-warning",
+            json!({
+                "phase": "pack-update",
+                "pack_version": pack_version,
+                "reinject_skipped": true,
+                "reinject_skip_reason": reason,
+                "message": format!(
+                    "디스크 팩은 {pack_version} 로 갱신됐으나 라이브 노드 재주입을 하지 못했습니다(데몬 응답 없음: \
+                     {reason}) — 떠 있는 노드는 이전 지침으로 동작 중입니다(라이브 무중단 유지, 재시작 안 함). \
+                     데몬 상태를 점검한 뒤 다시 업데이트하면 재주입됩니다."
+                ),
+            }),
+        );
+    } else if failed > 0 || deferred > 0 {
         // ★성공으로만 포장 금지 — 디스크는 갱신됐으나 라이브 노드 일부 미각성/보류를 경고한다.
         //   (app.restart는 여전히 미호출 — 무중단 불변식 유지.)
         let _ = app.emit(
@@ -6460,6 +6481,7 @@ async fn install_pack_update(
             "pack_version": pack_version,
             "reinject_failed": failed,
             "reinject_deferred": deferred,
+            "reinject_skipped": reinject_skipped,
         }),
     );
     Ok(pack_version)
@@ -6475,18 +6497,32 @@ enum ReinjectResult {
     Absent,
 }
 
-/// RED 골격: 종전 의미(토큰이 있으면 수치 · 없으면 부재) — `reinject=skipped` 를 모른다.
+/// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다. `reinject=skipped` 가
+/// 있으면 수치와 무관하게 스킵이다(구 CLI 는 이 키를 찍지 않으므로 종전 판독과 충돌하지 않는다).
+/// 노드 카운트 `skipped=N`(해시 동일로 건너뛴 노드 수)과 키가 다르다 — 혼동 금지.
 fn parse_reinject_result(stdout: &str) -> ReinjectResult {
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(cys::pack::REINJECT_RESULT_PREFIX) {
             let (mut failed, mut deferred) = (0u64, 0u64);
+            let mut skipped = false;
+            let mut reason = String::from("unknown");
             for tok in rest.split_whitespace() {
                 if let Some(v) = tok.strip_prefix("failed=") {
                     failed = v.parse().unwrap_or(0);
                 } else if let Some(v) = tok.strip_prefix("deferred=") {
                     deferred = v.parse().unwrap_or(0);
+                } else if tok == "reinject=skipped" {
+                    skipped = true;
+                } else if let Some(v) = tok.strip_prefix("reason=") {
+                    if !v.is_empty() {
+                        // 표시용 — 길이 상한(외부 문자열 방어).
+                        reason = v.chars().take(64).collect();
+                    }
                 }
+            }
+            if skipped {
+                return ReinjectResult::Skipped { reason };
             }
             return ReinjectResult::Measured { failed, deferred };
         }
@@ -6497,22 +6533,13 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
 /// 사이드카(cys pack-update) stdout에서 `PACK_UPDATE_RESULT … failed=N deferred=N` 토큰을 파싱해
 /// (failed, deferred)를 돌려준다. 토큰 부재(구버전 사이드카·reinject 스킵 등)면 (0,0) — 보수적.
 /// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다.
+/// (U4-B2③) 3상 판독의 수치 투영 — 스킵·부재는 수치가 아니므로 (0,0). 스킵 여부는
+/// `parse_reinject_result` 가 따로 말한다(이 함수만 보고 '완전 성공'을 판정하지 마라).
 fn parse_reinject_counts(stdout: &str) -> (u64, u64) {
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix(cys::pack::REINJECT_RESULT_PREFIX) {
-            let (mut failed, mut deferred) = (0u64, 0u64);
-            for tok in rest.split_whitespace() {
-                if let Some(v) = tok.strip_prefix("failed=") {
-                    failed = v.parse().unwrap_or(0);
-                } else if let Some(v) = tok.strip_prefix("deferred=") {
-                    deferred = v.parse().unwrap_or(0);
-                }
-            }
-            return (failed, deferred);
-        }
+    match parse_reinject_result(stdout) {
+        ReinjectResult::Measured { failed, deferred } => (failed, deferred),
+        ReinjectResult::Skipped { .. } | ReinjectResult::Absent => (0, 0),
     }
-    (0, 0)
 }
 
 /// `ledger.list` 응답에서 scoped 프로세스 pid만 추린다.
