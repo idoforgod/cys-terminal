@@ -3823,6 +3823,10 @@ let acctStartedAtMs: number | null = null;
 let acctLastAttemptAtMs: number | null = null;
 let acctOkAtMs: number | null = null;
 let acctFailStreak = 0;
+// 직전에 그린 본문 모델의 직렬화 — 같으면 본문을 다시 만들지 않는다(리뷰1 M5). refreshSidebarStatus 는 10초 틱 말고도
+// 이벤트(status.changed 등)로 수시로 불리는데, 그때마다 replaceChildren 으로 갈아 끼우면 호버 중인 계정 툴팁
+// (이메일·집계 범위)이 사라진다. 모델에는 '관측 N분 전'·리셋 지남이 들어 있어 값이 바뀌면 그대로 다시 그린다.
+let usageBodySig = "";
 const USAGE_COLLAPSED_KEY = "cys-wsbar-usage-collapsed"; // 뷰어별 편의 설정(접힘) — 저장 실패는 무시
 let usageCollapsed = false;
 try {
@@ -3883,6 +3887,7 @@ function renderUsageBar(): void {
     let head = host.querySelector(".usage-head") as HTMLButtonElement | null;
     let body = host.querySelector(".usage-body") as HTMLElement | null;
     if (!head || !body) {
+      usageBodySig = ""; // 칸을 새로 만들면 본문도 반드시 다시 그린다
       host.replaceChildren();
       head = document.createElement("button");
       head.type = "button";
@@ -3906,16 +3911,24 @@ function renderUsageBar(): void {
       Date.now() / 1000,
       { everOk: acctOkAtMs !== null, failStreak: acctFailStreak, okAtSec: acctOkAtMs === null ? null : acctOkAtMs / 1000 },
       ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁에만 나온다
+      ccAcctRedact, // 🔒 가림이면 툴팁의 설정 폴더도 끝 이름만(윈도우 절대경로의 OS 사용자명 — 리뷰1 M9)
     );
+    // 머리줄은 값이 바뀔 때만 건드린다(같은 값 재대입도 호버 중인 요소의 텍스트 노드를 갈아 끼운다).
+    const setText = (el: HTMLElement, t: string) => {
+      if (el.textContent !== t) el.textContent = t;
+    };
     head.setAttribute("aria-expanded", usageCollapsed ? "false" : "true");
-    head.title = `계정별 5시간·7일 한도 사용률 — 눌러서 ${usageCollapsed ? "펼치기" : "접기"}. 자세히는 Control Center > Live.`;
-    (head.querySelector(".usage-chev") as HTMLElement).textContent = usageCollapsed ? "▸" : "▾";
+    const headTitle = `계정별 5시간·7일 한도 사용률 — 눌러서 ${usageCollapsed ? "펼치기" : "접기"}. 자세히는 Control Center > Live.`;
+    if (head.title !== headTitle) head.title = headTitle;
+    setText(head.querySelector(".usage-chev") as HTMLElement, usageCollapsed ? "▸" : "▾");
     const sumEl = head.querySelector(".usage-sum") as HTMLElement;
     // 조회 연속 실패면 요약 줄에도 표시한다(접힌 채로도 보이게) — 첫 조회 전 실패는 headline 자체가 "응답 없음"이다.
-    sumEl.textContent = model.footer && model.headline !== "응답 없음" ? `${model.headline} · 응답 없음` : model.headline;
+    setText(sumEl, model.footer && model.headline !== "응답 없음" ? `${model.headline} · 응답 없음` : model.headline);
     sumEl.classList.toggle("warn", !!model.footer);
     host.classList.toggle("collapsed", usageCollapsed);
     body.hidden = usageCollapsed;
+    const sig = JSON.stringify(model);
+    if (sig === usageBodySig) return; // 본문 모델이 직전과 같다 — 다시 만들지 않는다(호버 툴팁 유지 · 리뷰1 M5)
     const kids: HTMLElement[] = [];
     const el = (cls: string, text: string, title?: string): HTMLElement => {
       const d = document.createElement("div");
@@ -3972,6 +3985,7 @@ function renderUsageBar(): void {
     if (model.unobservedCount) kids.push(el("usage-unobs", `관측 없음 ${model.unobservedCount}개`, model.unobservedTooltip));
     if (model.footer) kids.push(el("usage-foot", model.footer));
     body.replaceChildren(...kids);
+    usageBodySig = sig; // 다 그린 뒤에만 기록 — 중간에 던지면 다음 호출이 다시 그린다
   } catch {
     /* 표시 전용 — 사이드바 틱·CC 갱신으로 새지 않는다 */
   }
@@ -6505,7 +6519,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
     // ★U17: 전문가용 칸 버튼과 **같은 흐름**(확인 창 1회·재진입 가드·started/리셋 가드). 종전에는 확인·가드 없이
     //   `void addDeptWorkspace()` 로 실패(상한 exit 8 등)까지 삼켰다(조사 F1) — 이제 run() 의 try/catch 가 받는다.
-    { id: "act:dept", title: "팀 직접 만들기 (전문가용)", subtitle: "독립 부서장·전용 데몬 — 만들기 전에 확인 창이 한 번 뜹니다", keywords: "dept team workspace 부서 팀 부서장 master 만들기 전문가 expert", action: async () => { await openTeamCreateFlow({ anchor: null }); } },
+    { id: "act:dept", title: "팀 직접 만들기 (전문가용)", subtitle: "독립 부서장·전용 데몬 — 만들기 전에 확인 창이 한 번 뜹니다", keywords: "dept team workspace 부서 팀 부서장 master 만들기 전문가 expert 부서 워크스페이스 추가 ＋부서 +부서", action: async () => { await openTeamCreateFlow({ anchor: null }); } },
   );
   return items;
 }
@@ -8720,6 +8734,7 @@ try {
 }
 // U1: 사용량 패널 초기 렌더('사용량 확인 대기 중') — start() 와 무관하게 여기서 1회. 복원이 길거나 start() 가
 // 실패해도(그 경로엔 10초 틱이 없다) 빈 섹션이 남지 않는다(반박 D4·D5). 스스로 오류를 삼킨다.
+// 대기 문구는 무기한 남아도 참인 말이다('바로 보려면 Control Center > Live' — 그 경로도 force 조회라 된다 · 리뷰1 M8).
 renderUsageBar();
 
 // 진행 중 가드 — DOM 버튼(disabled)이 아니라 모듈 변수다(조사 F4: 버튼이 옮겨지거나 없으면 모든 생성이 조용한 no-op).
@@ -8731,7 +8746,10 @@ let deptLaunchInFlight = false;
 //   한 번 더 띄운다(설계 D5 · 윈도우에서 HOME≠USERPROFILE 이면 GUI 와 cys-dept 가 다른 카탈로그를 보는 경로도 닫힌다).
 async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, displayName?: string): Promise<TeamCreateOutcome> {
   if (daemonActionBlocked()) return "blocked"; // ★A4: 리셋 진행/완료 중 부서 데몬 spawn 차단 — 확인 창 대기 중 상태 변화 대비 재검사
-  if (deptLaunchInFlight) return "busy"; // 연타·중복 생성 차단
+  if (deptLaunchInFlight) {
+    notifyTeamFlowBusy(); // 연타·중복 생성 차단 — 조용히 끝내지 않는다
+    return "busy";
+  }
   deptLaunchInFlight = true;
   const btn = deptBtnEl(); // 표시 전용(없어도 가드는 동작)
   const prevLabel = btn?.textContent || "팀 직접 만들기";
@@ -8780,10 +8798,23 @@ async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, di
 // 팀이 2개 생긴다 — clipath.test.ts '재진입 차단이 첫 await 앞' 과 같은 계열이다.
 let teamFlowBusy = false;
 
+/** 팀 만들기가 이미 진행 중일 때의 안내 1줄(리뷰1 M4) — 생성이 도는 약 12초 동안 팔레트로 다시 누르면 버튼 라벨
+ *  ('만드는 중…')이 안 보이는 곳이라 아무 반응이 없었다. 결과 "busy" 를 받는 호출측(U16 카드 등)은 따로 알릴 필요 없다. */
+function notifyTeamFlowBusy(): void {
+  toast(
+    "watchdog",
+    "팀 만들기 진행 중",
+    deptLaunchInFlight ? "팀을 만드는 중입니다 — 끝난 뒤 다시 시도하세요" : "열려 있는 팀 만들기 창을 먼저 마치거나 닫아 주세요",
+  );
+}
+
 /** 확인 창 1회 → 생성. U16(말로 팀 만들기) 카드도 이 함수를 재사용할 수 있다(키와 조회 스냅샷만 넘기면 된다).
  *  반환: created · cancelled(아무것도 안 만듦) · busy(다른 흐름 진행 중) · blocked(리셋·교대 중) · failed. */
 async function confirmAndCreateTeam(key: string | undefined, ctx: TeamCreateCtx): Promise<TeamCreateOutcome> {
-  if (teamFlowBusy) return "busy";
+  if (teamFlowBusy) {
+    notifyTeamFlowBusy();
+    return "busy";
+  }
   teamFlowBusy = true;
   try {
     if (daemonActionBlocked()) return "blocked";
@@ -8805,7 +8836,10 @@ async function confirmAndCreateTeam(key: string | undefined, ctx: TeamCreateCtx)
 /** 입구(전문가용 버튼·명령 팔레트) — 레지스트리·카탈로그를 읽어 고를 팀이 있으면 메뉴, 번호 팀만 남으면 곧바로 확인 창.
  *  메뉴를 띄우면 "menu" 를 돌려주고, 고른 뒤의 확인·생성은 confirmAndCreateTeam 이 같은 가드로 잇는다. */
 async function openTeamCreateFlow(opts: { anchor?: HTMLElement | null } = {}): Promise<TeamCreateOutcome> {
-  if (teamFlowBusy) return "busy";
+  if (teamFlowBusy) {
+    notifyTeamFlowBusy();
+    return "busy";
+  }
   teamFlowBusy = true;
   let direct: TeamCreateCtx | null = null;
   try {

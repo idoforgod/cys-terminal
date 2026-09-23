@@ -145,7 +145,7 @@ describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", 
   });
   it("진행 중 알림은 토스트 1줄(리뷰1 M4 — 생성이 도는 동안 팔레트로 눌러도 반응이 있다)", () => {
     const b = fnBody("notifyTeamFlowBusy");
-    expect(b).toContain('toast("watchdog", "팀 만들기 진행 중"');
+    expect(/toast\(\s*"watchdog",\s*"팀 만들기 진행 중"/.test(b)).toBe(true);
     const l = fnBody("launchDept");
     expect(/if \(deptLaunchInFlight\) \{\s*notifyTeamFlowBusy\(\);\s*return "busy";\s*\}/.test(l)).toBe(true);
   });

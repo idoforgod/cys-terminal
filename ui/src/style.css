@@ -150,6 +150,10 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   border-top: 1px solid var(--hairline); padding: 4px 10px 6px;
 }
 #wsbar-foot > * { flex: none; }
+/* 피드백 단추(U6·A3 소유 #btn-feedback)는 이 꼬리의 가로 여백(10px) 안에 들어온다 — 단추 자체의 가로 여백까지 더하면
+   18px 로 이중 들여쓰기돼 사용량·전문가용과 줄이 어긋난다(리뷰1 M11). 배치는 꼬리 소유(A2)라 여기서 가로 여백만 걷는다.
+   ID 2개 선택자라 단추 쪽 규칙(ID 1개)보다 우선한다 · 단추가 없으면 아무 효과 없음. 세로 여백은 단추 규칙 그대로. */
+#wsbar-feedback-slot > #btn-feedback { width: 100%; margin-left: 0; margin-right: 0; }
 /* 짝 규칙(Directive): display 를 명시한 칸은 [hidden] 이 무력화되지 않게 짝을 단다. */
 #wsbar-foot[hidden], #wsbar-foot > #wsbar-usage[hidden] { display: none; }
 /* U1 사용량 패널 — 표시 전용(textContent). 폭 176px·배율 2.2 에서도 가로 넘침 없이 말줄임·줄바꿈. */

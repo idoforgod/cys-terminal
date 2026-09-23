@@ -73,6 +73,15 @@ export function hhmm(epochSec: number): string {
 export function normalizeProfile(p: string): string {
   return p.replace(/\\/g, "/").replace(/\/+$/, "");
 }
+/** 🔒 가림용 짧은 표기 — 좌석·부서 폴더는 `.cys/<이름>`, 그 밖은 끝 이름(`.claude-2`). 윈도우에서 프로필이
+ *  절대경로(`C:\Users\<OS 사용자명>\…`)로 오면 원문 그대로는 사용자명이 툴팁에 찍힌다(리뷰1 M9). */
+export function profileTail(p: string): string {
+  const n = normalizeProfile(p);
+  const cys = /(?:^|\/)(\.cys\/[^/]+)$/.exec(n);
+  if (cys) return cys[1];
+  const i = n.lastIndexOf("/");
+  return i >= 0 ? n.slice(i + 1) : n;
+}
 export function normalizeProfiles(ps: unknown): string[] {
   if (!Array.isArray(ps)) return [];
   const set = new Set<string>();
@@ -255,12 +264,20 @@ export interface UsageFetchState {
 export const USAGE_SCOPE_NOTE =
   "집계 범위: cys 창 안에서 계정 전용 설정 폴더(CLAUDE_CONFIG_DIR)로 띄운 세션만 계정에 모입니다 — 기본 claude·외부 터미널 세션은 빠집니다.";
 
-function tooltipFor(a: AcctRow, views: WindowView[], fr: Freshness, redactEmail: (s: string) => string): string {
+function tooltipFor(
+  a: AcctRow,
+  views: WindowView[],
+  fr: Freshness,
+  redactEmail: (s: string) => string,
+  hidePaths: boolean,
+): string {
   const lines: string[] = [];
-  const who = typeof a.label === "string" && a.label ? redactEmail(a.label) : String(a.account_id ?? "");
-  lines.push(`${providerLabel(a.provider)} 계정 — ${who}`);
+  // 신원 줄 — 라벨(이메일)이 비면 account_id 가 나오므로 그것도 가림 함수를 거친다(CC 계정 섹션과 같은 규칙).
+  const whoRaw = typeof a.label === "string" && a.label ? a.label : String(a.account_id ?? "");
+  lines.push(`${providerLabel(a.provider)} 계정 — ${whoRaw ? redactEmail(whoRaw) : "?"}`);
   if (typeof a.plan === "string" && a.plan) lines.push(`요금제: ${a.plan}`);
-  const profs = normalizeProfiles(a.profiles);
+  // 🔒 가림이면 경로는 끝 이름만(가린 뒤 같아진 줄은 다시 접는다) — 사이드바는 늘 화면에 떠 있어 공유 화면에 찍힌다.
+  const profs = hidePaths ? normalizeProfiles(normalizeProfiles(a.profiles).map(profileTail)) : normalizeProfiles(a.profiles);
   if (profs.length) lines.push(`설정 폴더: ${profs.join(", ")}`);
   const u = finiteNum(a.updated_at);
   if (u !== null && u > 0) lines.push(`관측: ${String(a.source || "?")} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
@@ -269,12 +286,14 @@ function tooltipFor(a: AcctRow, views: WindowView[], fr: Freshness, redactEmail:
   return lines.join("\n");
 }
 
-/** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다. */
+/** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다.
+ *  redactEmail = CC 🔒 가림 함수(신원 줄) · hidePaths = 🔒 가림 상태(설정 폴더를 끝 이름으로 — 리뷰1 M9). */
 export function buildUsageBarModel(
   accounts: AcctRow[],
   nowSec: number,
   fetch: UsageFetchState,
   redactEmail: (s: string) => string,
+  hidePaths = false,
 ): UsageBarModel {
   const list = (Array.isArray(accounts) ? accounts : []).filter(isObj) as AcctRow[];
   const failing = fetch.failStreak >= USAGE_FAIL_STREAK_WARN;
@@ -296,7 +315,9 @@ export function buildUsageBarModel(
   if (!fetch.everOk) {
     return failing
       ? { ...empty, headline: "응답 없음" }
-      : { ...empty, headline: "대기 중", message: "사용량 확인 대기 중 — 화면 복원 뒤 표시됩니다" };
+      : // 기한 없이 남아도 참인 말만 쓴다 — start() 실패 경로엔 10초 틱이 없어 '복원 뒤 표시' 는 거짓 약속이 된다
+        // (리뷰1 M8 · 반박 D5). Control Center Live 는 force 조회라 그 경로에서도 값을 가져와 이 칸까지 채운다.
+        { ...empty, headline: "대기 중", message: "사용량 확인 대기 중 — 바로 보려면 Control Center > Live" };
   }
 
   // 라벨: 겹치면 결정론 꼬리표로 구분(둘 다 "Claude" 로 보이지 않게).
@@ -332,7 +353,7 @@ export function buildUsageBarModel(
   const ex = finiteNum(primaryAcct.exhaust_at);
   const primary: UsagePrimary = {
     label: labels.get(primaryAcct)!,
-    tooltip: tooltipFor(primaryAcct, pv, pf, redactEmail),
+    tooltip: tooltipFor(primaryAcct, pv, pf, redactEmail, hidePaths),
     windows: pv,
     fresh: pf,
     exhaust: ex !== null && ex > nowSec && (pf.level === "fresh" || pf.level === "recent") ? `이 속도면 ${hhmm(ex)} 소진` : "",
@@ -352,7 +373,7 @@ export function buildUsageBarModel(
     return {
       label: labels.get(a)!,
       text: f.note && f.level !== "fresh" ? `${txt} (${f.note})` : txt,
-      tooltip: tooltipFor(a, v, f, redactEmail),
+      tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
       dim: f.level === "stale",
     };
   });
