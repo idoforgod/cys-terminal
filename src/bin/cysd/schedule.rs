@@ -1510,6 +1510,9 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
             let d = Arc::clone(daemon);
             // ★(triage X9) 적재 성공(`"queued"`)은 **배달이 아니다**. 회수는 그 항목의 처분
             //   (배달·만료·폐기)이 정해진 뒤에 한다.
+            // ★(0.14.41 · U8 P1) 직접 push 잡이 모달 때문에 우회 적재된 경우(`"queued(modal)"`)는 **종전 회수
+            //   시각을 유지**한다 — 처분 대기로 늘리면 관문(모달)에 갇힌 fresh 좌석이 항목 TTL(6h)까지 살아 반복
+            //   잡마다 누적될 수 있다(자원 상한 ①). 회수가 먼저 오면 그 항목은 `queue.dropped` 로 정직하게 남는다.
             let await_disposition = matches!(delivered, Ok("queued"));
             let job_id = job.id.clone();
             let timing = ReapTiming::for_job(ttl);
@@ -1603,9 +1606,29 @@ fn deliver_push(
         //   ★정직한 한계: PTY 쓰기까지 락을 쥘 수는 없으므로(원장 I/O·writer 채널) 검증
         //   **직후**의 인계는 여전히 지나간다. 큐 경유 경로도 삽입 이후에는 같은 성질이다.
         let surface = resolve_push_target(daemon, sid, role_guard)?;
+        // ★(0.14.41 · U8 P1) 질문·선택 창(모달)이 전경이면 **직접 주입하지 않고** 좌석 큐로 우회한다.
+        //   종전 이 분기는 게이트가 전혀 없어(`guard: None`) 하트비트·wakeup 문안이 오너의 AskUserQuestion·
+        //   권한 창에 타이핑됐고, 동봉 CR 이 기본 선택지를 눌렀다(조사 RC4 · 반박 §4 P1). 판정 술어는 큐 배달
+        //   게이트 ②와 같아서 적재된 항목은 모달이 닫힌 뒤 배달된다(새 폭주 경로 0 — 1발화 = 큐 1항목 ·
+        //   같은 잡 발신은 병합 · 좌석 큐 상한 `SCHEDULE_QUEUE_CAP`). 모달이 아니면 종전과 byte-identical.
+        //   맨 셸·마커 미정의 좌석은 판정이 `false` 라 종전 직접 주입 그대로다.
+        if crate::governance::seat_modal_foreground(&surface) {
+            return enqueue_schedule_push(daemon, job, sid, text, role_guard).map(|_| "queued(modal)");
+        }
         inject_on(daemon, &surface, text)?;
         return Ok("pushed");
     }
+    enqueue_schedule_push(daemon, job, sid, text, role_guard).map(|_| "queued")
+}
+
+/// 스케줄 발화의 **좌석 큐 적재** 한 벌 — 큐 경유 잡과 모달 우회(U8 P1)가 같은 인자·같은 동결 규약을 쓴다.
+fn enqueue_schedule_push(
+    daemon: &Arc<Daemon>,
+    job: &Job,
+    sid: u64,
+    text: &str,
+    role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+) -> Result<(), String> {
     crate::alert_route::enqueue_into_seat(
         daemon,
         sid,
@@ -1624,7 +1647,7 @@ fn deliver_push(
         //   경보(`enqueue_alert`)는 반대다: 보류해도 잃지 않으므로 판정과 같은 술어를 쓴다.
         crate::alert_route::FreezeGuard::Daemon,
     )
-    .map(|_| "queued")
+    .map(|_| ())
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
 }
 

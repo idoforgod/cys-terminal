@@ -4983,6 +4983,8 @@ pub(crate) enum DraftGateDenied {
     PendingInput { bytes: u64 },
     HumanDraft { bytes: u64 },
     ScreenOccupied,
+    /// ★(0.14.41 · U8 P1) 질문·선택 창(모달)이 화면 전경이다 — Text 팔 전용(본문을 쓰지 않는다).
+    Modal,
 }
 
 impl DraftGateDenied {
@@ -4991,8 +4993,48 @@ impl DraftGateDenied {
             Self::PendingInput { .. } => "pending_input",
             Self::HumanDraft { .. } => "human_draft",
             Self::ScreenOccupied => "screen_occupied",
+            Self::Modal => "modal",
         }
     }
+}
+
+/// ★(0.14.41 · U8 P1 · 반박 X2) D-12 **Text 팔 전용** 현재 화면 모달 축(순수).
+///
+/// 【왜】 Text 팔은 선택기 행이면 화면 축을 건너뛰었고 승인 축도 보지 않았다 — 감독자 지시가 AskUserQuestion·
+/// 권한 창 위에 타이핑되고(글자가 선택지를 고르거나 버려진다) 뒤따르는 `send-key Return` 은 그대로 통과해 창을
+/// 닫았다. 09-21 23:07Z 실사례: CEO→부서장 지시 1,234자가 send OK·send-key OK 였는데 트랜스크립트 어디에도
+/// 없다(조사 RC4). 거부는 **쓰기 전**이라 바이트 0 이고, 문면이 MSG_TYPING_GUARD 접두라 CLI 가 본문 전체를
+/// `--queued` 로 1회 넘긴다 — 큐 배달 게이트(`prompt_gate_verdict` ②)가 **같은 술어**로 모달이 닫힌 뒤 배달한다.
+///
+/// 【범위 — 좁게】 Text 만이다. SubmitKey(`send-key Return`)는 **무변경**: 화면 감지 승인은 대기자가 없어
+/// feed allow 가 효과가 없고 master 의 Return 이 유일한 승인 수단이다(막으면 워커 hang). ClearFirst 는
+/// cycle-agent `/clear` 의 원자 경로라 모달 축을 걸면 ② 무clear 가 된다(cycle 은 자체 유휴 관측이 관문·모달을
+/// 이미 본다). CancelKey 는 사람 초안만 막는 축 그대로다. feed 기반 승인 축은 쓰지 않는다(15초 주기라 낡을 수
+/// 있다 · X2) — **지금 화면**의 서명만 본다.
+pub(crate) fn draft_gate_modal_verdict(
+    kind: DirectSendKind,
+    modal_foreground: bool,
+    selector_row: bool,
+) -> Option<DraftGateDenied> {
+    (kind == DirectSendKind::Text && (modal_foreground || selector_row)).then_some(DraftGateDenied::Modal)
+}
+
+/// ★(0.14.41 · U8 P1) 좌석 화면에 질문·선택 창이 **전경**인가 — 큐 배달 게이트 ②와 같은 술어
+/// (`readiness::modal_foreground` ∨ 커서행 선택기). 마커 미정의·어댑터 미등록 좌석(맨 셸)은 `false`
+/// (종전 거동 — 셸에 치는 팩 경로·phoenix 스텁을 막지 않는다). 파서·agent_meta leaf 락만 잠깐 쓴다.
+pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
+    let adapters = load_adapter_defs();
+    let Some((markers, _)) = surface_prompt_marker(s, &adapters) else {
+        return false;
+    };
+    let obs = observe_prompt(s, &markers);
+    obs_modal_foreground(&obs)
+}
+
+fn obs_modal_foreground(obs: &PromptObs) -> bool {
+    obs.selector_row
+        || (!obs.marker.is_empty()
+            && cys::readiness::modal_foreground(&obs.screen, Some(obs.marker.as_str())).is_some())
 }
 
 /// D-12 순수 판정 — IO 없음.
@@ -5088,6 +5130,12 @@ pub(crate) fn draft_gate(
         })
     });
     let selector_row = obs.as_ref().map_or(false, |obs| obs.selector_row);
+    // ★(0.14.41 · U8 P1) Text 팔의 현재 화면 모달 축 — 화면 점유 축보다 **앞**(선택기 행이 먼저 통과되던 구멍).
+    //   술어는 큐 배달 게이트 ②와 같다(readiness 의 전경 모달 서명 ∨ 선택기 행 — `obs_modal_foreground` 한 곳).
+    let modal_foreground = obs.as_ref().map_or(false, obs_modal_foreground);
+    if let Some(why) = draft_gate_modal_verdict(kind, modal_foreground, selector_row) {
+        return Some(why);
+    }
     let approval_pending = approval_or_gate_pending(daemon, s.id);
     draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
 }
@@ -11502,10 +11550,32 @@ mod tests {
             .find("draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)")
             .expect("화면 축 판정");
         assert!(modal_at < screen_at, "모달 축이 화면 점유 축보다 뒤다(선택기 행이 먼저 통과된다)");
+        assert!(body.contains("obs.as_ref().map_or(false, obs_modal_foreground)"), "draft_gate 가 모달 술어를 부르지 않는다");
+        // 술어 본문(주석 제외)이 큐 게이트 ②와 같은 두 축을 쓴다.
+        let pred: String = src
+            .split("\nfn obs_modal_foreground(")
+            .nth(1)
+            .expect("obs_modal_foreground 소실")
+            .split("\n}\n")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            body.contains("cys::readiness::modal_foreground("),
-            "모달 축이 큐 게이트와 같은 술어(modal_foreground)를 쓰지 않는다"
+            pred.contains("cys::readiness::modal_foreground(") && pred.contains("obs.selector_row"),
+            "모달 축이 큐 게이트와 같은 술어(modal_foreground ∨ selector_row)를 쓰지 않는다:\n{pred}"
         );
+        // 순수 판정 — Text 만 거부하고 SubmitKey·ClearFirst·CancelKey 는 무변경(X2 · ② 무clear 금지선).
+        use super::draft_gate_modal_verdict as v;
+        assert_eq!(v(DirectSendKind::Text, true, false), Some(DraftGateDenied::Modal));
+        assert_eq!(v(DirectSendKind::Text, false, true), Some(DraftGateDenied::Modal));
+        assert_eq!(v(DirectSendKind::Text, false, false), None);
+        for kind in [DirectSendKind::SubmitKey, DirectSendKind::ClearFirst, DirectSendKind::CancelKey] {
+            assert_eq!(v(kind, true, true), None, "{kind:?} 에 모달 축이 걸렸다(승인 Return·cycle /clear 차단)");
+        }
+        assert_eq!(DraftGateDenied::Modal.as_str(), "modal");
     }
 
     #[test]
