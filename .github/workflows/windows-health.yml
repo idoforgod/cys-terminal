@@ -295,13 +295,34 @@ jobs:
       #   ⚠ **영구 면제가 아니다.** 완주(초록)가 관측되면 continue-on-error 를 **제거**하고
       #      차단 게이트로 승격하라.
       #   근거: IG-31 · run 33939844471 이 30.1분 절단 · 그 판독이 익명 REST 로 불가(로그 403).
+      # ★(0.14.41 · U4 C4-①) **실발생 기록**: v0.14.40 태그 런 35823637490 에서 이 스텝이 30분 08초 돌고
+      #   (상한 30분) 잘렸는데 스텝·잡·런 모두 success 였고 릴리스 보고서는 "실패 스텝 0" 이라 적었다 —
+      #   위 '판독 함정' 이 그대로 실현됐다. 그래서 결과를 **다음 스텝(판독)** 이 annotation·STEP_SUMMARY
+      #   로 드러낸다(프로세스가 달라 절단에도 돈다 · ci-branch 'cys 리허설 실패 판독' 과 같은 분리 패턴).
+      #   ★차단 승격은 하지 않는다(설계 §3 U4 C4-① · 절단 원인 = 검체 수 vs hang vs ConPTY 종료 지연 미판명).
+      #   continue-on-error·timeout-minutes 는 **그대로**다 — 잡 55분·release windows-health-gate 45분 상한과
+      #   얽히므로 원인 판명 전에는 건드리지 않는다(반박 §3-3).
+      #   ⚠ 명령에 축 필터가 **없다**(전량 `--bin cysd`) — 위 '★범위는 축 필터로 시작한다' 는 약속과 명령이
+      #     어긋난 상태다. 필터 도입은 차단 승격과 한 묶음의 별도 결정이다(판독 스텝 요약이 그 근거 자료다).
       - name: cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31 · 비차단 A10 1단계)
+        id: cysd_win
         continue-on-error: true
         timeout-minutes: 30
         shell: bash
         run: |
+          # ★-e 를 명시적으로 끈다(U4 C4-①). GitHub `shell: bash` 는 `bash -eo pipefail` 로 돌고
+          #   `set -uo pipefail` 은 -e 를 끄지 않는다 — 종전엔 cargo 가 비0 이면 파이프 직후 그 자리에서
+          #   스텝이 끝나 아래 `::error` 판독 코드가 **도달 불가**였다(위 '-e 를 빼고 rc 를 잡은 뒤' 의도와
+          #   코드의 불일치 · 로컬 하네스 실측: rc 101 인데 주석 0줄). 판정(스텝 rc)은 그대로다.
+          set +e
           set -uo pipefail
-          LOG="$(mktemp)"
+          # 스텝 사이 전달용 **고정 경로**(다음 '판독' 스텝이 읽는다 — mktemp 값은 스텝을 넘지 못한다).
+          #   rc 파일은 cargo 가 **끝났을 때만** 생긴다 — 그 부재가 곧 '절단(강제 종료)' 의 표지다.
+          CYSD_DIR="${RUNNER_TEMP:-/tmp}/cysd-win"
+          rm -rf "$CYSD_DIR"
+          mkdir -p "$CYSD_DIR"
+          date +%s > "$CYSD_DIR/start"
+          LOG="$CYSD_DIR/cargo.log"
           # ★절단 대비 트랩 — ★★실측으로 **발동하지 않았다**(run 33944971633 · 30.1분 절단 ·
           #   주석은 GitHub 자체 "timed out after 30 minutes" 한 줄뿐 · 아래 on_cut 산출 0건).
           #   기전 추정: GitHub 의 타임아웃은 프로세스(그룹)를 강하게 죽이고, bash 트랩은 **명령
@@ -326,6 +347,7 @@ jobs:
           #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon:: 2>&1 | tee "$LOG"
           rc="${PIPESTATUS[0]}"
+          echo "$rc" > "$CYSD_DIR/rc"
           [ "$rc" -eq 0 ] && exit 0
           echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
           tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
@@ -340,6 +362,96 @@ jobs:
             echo "::error title=cysd-win 테스트 실패::failed=$failed — $names"
           fi
           exit "$rc"
+
+      # ★cysd 스텝 결과 판독(0.14.41 · U4 C4-① · 설계 §3 "드러내기 · 차단 승격 없음").
+      #   위 스텝은 continue-on-error 라 실패·**절단**도 스텝·잡·런 conclusion 이 success 다(v0.14.40 실발생).
+      #   이 스텝은 그 **진짜 결과**를 네 갈래로 가려 annotation(익명 REST 로 읽히는 유일한 채널)과
+      #   GITHUB_STEP_SUMMARY(런 페이지 요약) 두 곳에 남긴다:
+      #     완주·통과(notice) · 완주·실패(error) · 절단 = rc 표지 없음(error · 경과·마지막으로 시작한 검체) ·
+      #     미실행 = 앞 스텝 실패로 skipped(warning).
+      #   ★판정 근거는 outcome 하나가 아니다 — 타임아웃 스텝의 outcome 이 failure 인지 cancelled 인지에
+      #     기대지 않도록 **rc 표지 파일의 유무**(cargo 가 끝났을 때만 생김)를 주 신호로 쓴다.
+      #   ★이 스텝은 **자기가 실패하지 않는다**(exit 0 · `-e` 끔) — 판독자가 죽어 잡을 붉히면 '드러내기만'
+      #     이 차단으로 바뀐다. 파일·환경이 없으면 '측정 불가' 로 적고 끝낸다.
+      #   ★`if: always()` = 앞 스텝이 어떻게 끝났든(절단 포함) 돈다. 잡 수준 조건이 아니다(H-WIN-11 규율).
+      #   ★`continue-on-error: true` 는 **보고자 안전띠**다(게이트 관용이 아니다): 이 스텝은 판정을 하지 않는
+      #     보고 전용이고, Windows Git Bash 에서의 첫 실행은 로컬에서 재현할 수 없다(하네스는 macOS bash).
+      #     보고자가 뜻밖의 이유(파싱·러너 이상)로 죽어도 잡 판정이 **이 변경 전과 한 글자도 다르지 않게**
+      #     — 즉 release windows-health-gate 가 새 차단원을 얻지 않게 — 한다. 그 경우에도 스텝 자체는 빨간
+      #     스텝으로 런 페이지에 남는다(조용히 사라지지 않는다).
+      #   ★U4 C4 리뷰1 MINOR-2 수정(2026-09-23): `timeout-minutes: 2`. `continue-on-error` 는 스텝
+      #     **실패**만 흡수하고 **멈춤**은 흡수하지 않는다 — 판독자가 뜻밖에 걸리면 잡 상한(55분)까지
+      #     소비하고, 그러면 잡 자체가 failure 로 끝나 release windows-health-gate 가 BAD 가 된다(반박
+      #     §3-3 이 지적한 타임아웃 결합이 판독 스텝 쪽에 그대로 남는 경로). 이 판독 스텝은 파일 읽기·
+      #     문자열 가공뿐 입력 대기·네트워크가 없어 2분이면 넉넉하다.
+      - name: cysd-win 결과 판독 (비차단 · annotation + STEP_SUMMARY · 절단 표지)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          CYSD_OUTCOME: ${{ steps.cysd_win.outcome }}
+          CYSD_CONCLUSION: ${{ steps.cysd_win.conclusion }}
+        run: |
+          set +e
+          D="${RUNNER_TEMP:-/tmp}/cysd-win"
+          LOG="$D/cargo.log"
+          SUM="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          outcome="${CYSD_OUTCOME:-unknown}"
+          start="$(cat "$D/start" 2>/dev/null)"
+          rc="$(cat "$D/rc" 2>/dev/null)"
+          if [ -n "$start" ]; then
+            el_s=$(( $(date +%s) - start ))
+            el="$(( el_s / 60 ))분 $(( el_s % 60 ))초"
+          else
+            el="측정 불가(시작 표지 없음)"
+          fi
+          summary=""; failed=""; passed=""; names=""; last=""
+          if [ -f "$LOG" ]; then
+            summary="$(grep -E '^test result:' "$LOG" | tail -1)"
+            passed="$(printf '%s' "$summary" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')"
+            failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')"
+            names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | head -20 | tr '\n' ' ')"
+            # --test-threads=1 --nocapture: libtest 가 검체명을 실행 **전에** 찍는다 → 마지막 'test X ...' = 멈춘 자리
+            last="$(grep -E '^test [^ ]+ \.\.\.' "$LOG" | tail -1 | sed -E 's/^test ([^ ]+) \.\.\..*/\1/')"
+          fi
+          if [ "$outcome" = "skipped" ]; then
+            kind="미실행"; level="warning"
+            msg="앞 스텝 실패로 cysd 스텝이 건너뛰어졌다 — 이 런의 cysd Windows 검체는 무측정이다(통과 아님)"
+          elif [ "$rc" = "0" ]; then
+            kind="완주·통과"; level="notice"
+            msg="rc=0 · ${summary:-요약 없음} · 경과 ${el} — 차단 승격(continue-on-error 제거) 판단의 근거 1회"
+          elif [ -n "$rc" ]; then
+            kind="완주·실패"; level="error"
+            msg="rc=${rc} · failed=${failed:-?} passed=${passed:-?} · 경과 ${el} · 실패 검체: ${names:-없음(하네스 이상 · 101=러스트 패닉 가능)} — 비차단이라 런은 초록이다"
+          elif [ "$outcome" = "success" ]; then
+            kind="판정 불가"; level="error"
+            msg="outcome=success 인데 rc 표지가 없다 — 스텝 구조가 바뀌었거나 표지 쓰기가 실패했다(통과로 읽지 마라)"
+          else
+            kind="절단"; level="error"
+            msg="rc 표지 없음(cargo 가 끝나기 전에 종료) · outcome=${outcome} · 경과 ${el}(상한 30분) · 마지막으로 시작한 검체: ${last:-판독 불가} — 비차단이라 런은 초록이다"
+          fi
+          # 워크플로 명령 이스케이프(% · CR · LF) — 로그에서 온 문자열이 주석을 깨지 않게.
+          esc() { printf '%s' "$1" | sed -e 's/%/%25/g' | tr -d '\r' | awk 'BEGIN{ORS="%0A"}{print}' | sed -e 's/%0A$//'; }
+          echo "::${level} title=cysd-win ${kind}(비차단)::$(esc "$msg")"
+          if [ "$level" != "notice" ] && [ -f "$LOG" ]; then
+            echo "::${level} title=cysd-win 로그 꼬리(비차단)::$(esc "$(tail -8 "$LOG")")"
+          fi
+          {
+            echo "### cysd Windows 실기 (IG-31 · 비차단) — ${kind}"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|---|---|"
+            echo "| 스텝 outcome / conclusion | ${outcome} / ${CYSD_CONCLUSION:-?} — continue-on-error 라 실패·절단도 conclusion 은 success |"
+            echo "| cargo rc | ${rc:-없음(rc 표지 없음 — 미실행이거나 끝나기 전에 종료됨)} |"
+            echo "| 경과 | ${el} (스텝 상한 30분) |"
+            echo "| test result | ${summary:-없음} |"
+            echo "| 실패 검체 | ${names:-없음} |"
+            echo "| 마지막으로 시작한 검체 | ${last:-없음} |"
+            echo ""
+            echo "> 이 스텝은 **비차단**이다. 잡·런이 초록이어도 판정이 '완주·통과' 가 아니면 cysd Windows 검체는 통과가 아니다 — 초록을 셀 때 종류를 병기하라."
+          } >> "$SUM" 2>/dev/null
+          exit 0
 
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()

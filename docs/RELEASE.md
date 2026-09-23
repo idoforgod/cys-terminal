@@ -613,6 +613,9 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             ```sh
             # 정본 = 기계 검사. 6항목 전부를 한 번에 돌린다(⑤ 포함).
             python3 scripts/verify-release-remote.py <신버전> <구버전>
+            #   ★구버전은 필수다(0.14.41 · U4 C4-⑦) — 빼면 원격 수신 전에 exit 2. 종전엔 ① 을 조용히
+            #     빼고 분모 7 로 'N/7 PASS' 를 냈다. 두 인자를 준 정상 실행의 합격은 **8/8 PASS** 다.
+            #     구버전이 정말 없을 때만 `--no-prev` 를 명시한다(요약 줄에 ①SKIP 병기).
 
             # 손으로 볼 때(참고용) — 대상은 루트가 아니라 /downloads/ 다.
             curl -s https://www.cysinsight.com/downloads/ \

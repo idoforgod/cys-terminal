@@ -445,15 +445,37 @@ jobs:
           try { $py = Join-Path $dir 'runtime\python\python3.exe'; $rp = Bx $py @('-c','print(1)') 15000; Rec 13 ($rp.Code -eq 0 -and (Test-Path $py)) "python3=$py code=$($rp.Code)" } catch { Rec 13 $false "$_" }
 
           # ── T3-3(env주입 메커니즘·스텁): claude 실로그인 불가 → 스텁 에이전트로 env 주입만 검증(전부 바운드) ──
+          # ★하네스 수리(0.14.41 · U4 C4-② · 반박 보고 §1-2·§2-1). 2릴리스 연속 FAIL('화면에 CCDFRESH= 자체가
+          #   없다')의 기전은 제품 결함이 아니라 **하네스 × 디렉티브 주입**이다(로그의 `>>` 연속 프롬프트 = 확정 ·
+          #   인과 = 강한 가설): launch-agent 는 ready 뒤 **무조건** WORKER 디렉티브를 붙여넣는다
+          #   (src/bin/cys.rs `inject_directive_after_ready`). 스텁은 claude 가 아니라 pane 의 PowerShell 에서 한 줄을
+          #   실행한 것이라, 디렉티브 본문(백틱·짝 안 맞는 따옴표·중괄호)이 PowerShell 입력이 되어 미완결 다중행
+          #   (`>>`)에 갇히고 뒤이은 프로브 send 가 그 입력에 흡수됐다. 같은 런의 크리티컬 PTY 스모크는
+          #   send → ConPTY → 셸 실행 왕복을 통과했다(전송 경로는 산다).
+          #   수리: 스텁이 ready 표지(CCDPROOF=) 출력 뒤 **Read-Host 루프**로 입력을 한 줄씩 소비한다 — 디렉티브는
+          #   실행되지 않고 읽혀 버려지며, 프로브 토큰(CCDPROBE)을 받은 줄에서만 CCDFRESH=<주입값> 을 찍고 끝난다.
+          #   · 상한(폭주 방지 · 코드 상한): 최대 20000줄 · 입력 EOF($null)면 즉시 종료 → 콘솔이 닫혀도 헛돌지 않는다.
+          #   · 에코 오판 방지: 스텁 문면은 'CCD'+'FRESH=' 로 나눠 적고, 프로브 토큰엔 '=' 가 없다 — 에코만으로는
+          #     아래 CCDFRESH= 판별자에 걸리지 않는다. 토큰은 인용이 필요 없어 Bx(바운드 실행)로 보낸다(rc 채집).
+          #   · 스텁 명령은 python 의 argv 로 넘긴다 — 파이썬 문자열 안에 PowerShell 따옴표를 겹쳐 적지 않는다.
+          #   · 로컬 재현(macOS pwsh 7.4 · pty · 증거 폴더 C4/t33_pty.py): 구 스텁 = 프로브가 `>>` 입력에 흡수돼
+          #     FAIL · 새 스텁 = CCDFRESH=ENVINJECT_OK 관측. Windows ConPTY·powershell.exe 5.1 실측은 fix/** push 몫.
+          # ★금지선(명문화): 이 행의 수리는 **이 하네스 블록 안에서만** 한다. launch-agent 디렉티브 주입 경로에
+          #   '셸 스텁이면 주입 생략' 같은 제품 분기를 넣지 마라 — 실 claude 좌석이 그 분기로 오판되면 **디렉티브
+          #   없는 에이전트**(치명 ③ 자가치유 전멸 계급)가 생긴다. 역할 주소 send·ConPTY 입력 경로도 이 행을
+          #   이유로 고치지 마라(제품 코드 무접촉).
+          # ★비크리티컬 유지: 아래 $crit 에 '3' 을 넣지 않는다 — 이 수리가 fix/** 러너에서 초록으로 관측된 뒤에만
+          #   승격을 별도로 결정한다(원인 확인 전 승격 = windows-build 상시 적색 → 태그 전 점검 봉쇄).
           try {
             $py = Join-Path $dir 'runtime\python\python3.exe'
             $aj = Join-Path $userHome '.cys\pack\agents.json'
-            $pyprog = 'import json,sys; aj=sys.argv[1]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":"Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR","env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
+            $stubCmd = 'Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR; for ($i = 0; $i -lt 20000; $i++) { $l = Read-Host; if ($null -eq $l) { break }; if ($l -match ''CCDPROBE'') { Write-Host (''CCD'' + ''FRESH='' + $env:CLAUDE_CONFIG_DIR); break } }'
+            $pyprog = 'import json,sys; aj=sys.argv[1]; cmd=sys.argv[2]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":cmd,"env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
             # 복잡인자(공백·$·따옴표)는 Bx(Start-Process 재-quoting)가 깨뜨림 → 직접 & 호출(빠른 파일쓰기·hang 무).
-            & $py -c $pyprog $aj | Out-Host
+            & $py -c $pyprog $aj $stubCmd | Out-Host
             (Bx $cys @('launch-agent','--role','worker','--agent','stubenv') 90000).Out | Out-Host
-            & $cys send --to worker 'Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR' 2>&1 | Out-Null
-            & $cys send-key --to worker Return 2>&1 | Out-Null
+            $sr = Bx $cys @('send','--to','worker','CCDPROBE') 30000
+            $kr = Bx $cys @('send-key','--to','worker','Return') 30000
             $envProof=$false; $scr=''
             $deadline=(Get-Date).AddSeconds(40)
             while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(Bx $cys @('read-screen','--to','worker') 15000).Out; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
@@ -469,9 +491,13 @@ jobs:
                 $why = ' — 스텁 화면이 비었다(에이전트 미기동 의심 · launch-agent 90s + 폴링 40s 타이밍 축)'
               } elseif ($scr -match 'CCDFRESH=\S*') {
                 $why = ' — 주입은 됐으나 값이 기대와 다르다: ' + $Matches[0]
+              } elseif ($scr -match '(?m)^>> ') {
+                $why = ' — 화면에 CCDFRESH= 가 없고 PowerShell 연속 프롬프트(>>)가 보인다(스텁 루프 미기동 → 디렉티브가 셸 입력으로 들어감 · 하네스 축)'
               } else {
                 $why = ' — 화면에 CCDFRESH= 자체가 없다(send/send-key 미도달 또는 셸 미기동)'
               }
+              # 판독 보조(판정 아님): 프로브 전송 rc · 초기 표지(CCDPROOF=주입값)의 화면 잔존 여부(스크롤로 사라질 수 있다).
+              $why += (' · send rc={0} · send-key rc={1} · CCDPROOF=ENVINJECT_OK 화면 잔존={2}' -f $sr.Code, $kr.Code, ($scr -match 'CCDPROOF=ENVINJECT_OK'))
             }
             Rec 3 $envProof ("env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 오너 실기 마커)" + $why)
           } catch { Rec 3 $false "$_" }

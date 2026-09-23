@@ -661,6 +661,120 @@ def h_secret_1():
             % (scanned, len(fired), len(_SECRET_PROBES), " ".join(fired)))
 
 
+@specimen("H-SECRET-2", "W0",
+          "발행 게이트 스캐너의 '대상 0건·판독 실패 = 초록' 폐쇄 — 비-git·--all 0건·부재 경로·grep 판독 실패 → exit 2"
+          " · 비ASCII 파일명 누락 회귀(-z 목록) → exit 1",
+          ["U4-C4-⑤", "측정불능=통과", "CI-only-게이트"])
+def h_secret_2():
+    """H-SECRET-1 은 '규칙이 살아 있는가'(합성 양성 7종 FIRE)와 '산 트리 clean' 을 잰다. 이 검체는
+    그 반대편 — **스캐너가 아무것도 못 봤는데 clean 이라고 답하는 경로**를 잰다(U4 C4-⑤ · 2026-09-23).
+
+      ⓐ 비-git 작업 디렉터리 — 종전 `cd "$(git rev-parse …)" || exit 2` 가드는 **죽은 코드**였다:
+         `cd ""` 가 bash 에서 성공해, `--all` 이 `git ls-files` 실패 → 0건 → `✓ 스캔 대상 없음` exit 0.
+      ⓑ git 저장소인데 추적 파일 0건(`--all`) — 종전 `✓ 스캔 대상 없음` exit 0(형제 스캐너
+         `scan-pack-secrets.sh` 는 같은 상황에서 exit 2 — 비대칭).
+      ⓒ 명시 경로 모드의 **부재 경로** — 종전 `[ -f ] || continue` 로 조용히 건너뛰고 clean.
+      ⓓ **판독 실패**(grep rc=2 · 읽기 권한 없음) — 종전 `2>/dev/null … || true` 가 삼켜 clean.
+      ⓔ 양성 대조 — 읽을 수 있는 깨끗한 파일은 exit 0(모든 것에 2 를 내는 고장난 스캐너 배제).
+      ⓕ **비ASCII 파일명**(U4 C4 리뷰1 MINOR-1 · 2026-09-23) — `--all`/staged 목록을 줄 단위로 읽으면
+         git 이 비ASCII 경로를 8진 이스케이프로 따옴표 인용해(`core.quotepath`) `[ -f ]` 가 거짓이
+         되고 그 파일이 목록에서 **조용히** 빠진다(같은 '못 본 것=clean' 계급). 한글 파일명 파일에
+         이메일 1줄을 커밋해 `--all` 이 exit 1·EMAIL 라벨로 적발하는지 잰다. NUL 구분(`-z`)이
+         되돌려지면(읽기를 줄 단위로 바꾸면) 이 축만 조용히 exit 0 이 된다 — 종료코드·라벨 축이지
+         ⓐ~ⓓ 의 '측정불능→exit 2' 계약과는 다른 계급이라 별도 축으로 둔다.
+
+    ★임시 디렉터리는 저장소 밖(`tempfile`) · HOME 은 임시 경로로 격리(git 설정 무접촉) ·
+      `GIT_CEILING_DIRECTORIES` 로 상위 저장소 탐색을 막는다(임시 경로가 어떤 저장소 안이어도 비-git 이다).
+    ★ⓓ 는 권한으로 읽기 실패를 만든다 — Windows(chmod 무력)·root(권한 무시)에서는 만들 수 없으므로
+      그 축만 '이 플랫폼 측정 불가' 로 detail 에 **명시**하고 나머지 축은 그대로 판정한다."""
+    scan = os.path.join(REPO_DIR, "scripts", "secret-scan.sh")
+    if not os.path.isfile(scan):
+        if _is_git_checkout():
+            raise Fail("레포 체크아웃인데 발행 게이트 스캐너가 없다: %s" % scan)
+        raise Skip("레포 체크아웃이 아니다(배포 팩 실행) — 발행 게이트 스캐너 부재")
+    tmp = tempfile.mkdtemp(prefix="cys-secret-fc-")
+    notes = []
+    try:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        env = _base_env({"HOME": home, "GIT_CEILING_DIRECTORIES": tmp, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def _scan(cwd, *args):
+            return _run([BASH, scan] + list(args), cwd=cwd, env=env, timeout=120)
+
+        def _expect(label, r, want):
+            need(r.returncode == want,
+                 "%s: exit %d(기대 %d) — 스캐너가 못 본 것을 clean 으로 접었다\n%s"
+                 % (label, r.returncode, want, (r.stdout + r.stderr)[-800:]))
+            if want == 2:
+                need("✓" not in r.stdout,
+                     "%s: exit 2 인데 stdout 에 통과 표지(✓)가 남았다: %r" % (label, r.stdout[-300:]))
+            notes.append("%s→%d" % (label, r.returncode))
+
+        # ⓐ 비-git 작업 디렉터리
+        nogit = os.path.join(tmp, "nogit")
+        os.makedirs(nogit)
+        _expect("비-git --all", _scan(nogit, "--all"), 2)
+        _expect("비-git staged", _scan(nogit), 2)
+
+        # ⓑ 추적 파일 0건 git 저장소(--all)
+        empty = os.path.join(tmp, "emptyrepo")
+        os.makedirs(empty)
+        gi = _run(["git", "init", "-q", empty], env=env, timeout=60)
+        need(gi.returncode == 0, "전제 붕괴: 임시 git 저장소 생성 실패(rc=%d): %s"
+             % (gi.returncode, (gi.stdout + gi.stderr)[-300:]))
+        _expect("--all 0건", _scan(empty, "--all"), 2)
+
+        # ⓔ 양성 대조 + ⓒ 부재 경로(명시 경로 모드 · cwd = 저장소 루트 = 실사용 형태)
+        clean = os.path.join(tmp, "clean.txt")
+        with open(clean, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("nothing to see here\n")
+        _expect("양성 대조(깨끗한 파일)", _scan(REPO_DIR, clean), 0)
+        _expect("부재 경로", _scan(REPO_DIR, os.path.join(tmp, "no-such-file.txt")), 2)
+
+        # ⓓ 판독 실패(grep rc=2)
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            notes.append("판독 실패 축=이 플랫폼 측정 불가(%s)" % ("nt" if os.name == "nt" else "root"))
+        else:
+            locked = os.path.join(tmp, "locked.txt")
+            with open(locked, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("unreadable\n")
+            os.chmod(locked, 0)
+            try:
+                _expect("판독 실패(chmod 000)", _scan(REPO_DIR, locked), 2)
+            finally:
+                os.chmod(locked, 0o600)
+
+        # ⓕ 비ASCII 파일명(U4 C4 리뷰1 MINOR-1) — 임시 git 저장소에 한글 파일명 + 이메일 1줄을
+        #   커밋(정확히는 add — `git ls-files` 는 인덱스만 보므로 커밋 없이도 추적 파일이다)하고
+        #   `--all` 이 그 파일을 놓치지 않는지 잰다.
+        nonascii_repo = os.path.join(tmp, "nonascii")
+        os.makedirs(nonascii_repo)
+        gi_na = _run(["git", "init", "-q", nonascii_repo], env=env, timeout=60)
+        need(gi_na.returncode == 0, "전제 붕괴: 비ASCII 축 임시 git 저장소 생성 실패(rc=%d): %s"
+             % (gi_na.returncode, (gi_na.stdout + gi_na.stderr)[-300:]))
+        nonascii_name = "고객목록.txt"
+        with open(os.path.join(nonascii_repo, nonascii_name), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("contact: %s\n" % ("probe2" + "@" + "acme-corp.dev"))
+        ga = _run(["git", "add", "--", nonascii_name], cwd=nonascii_repo, env=env, timeout=60)
+        need(ga.returncode == 0, "전제 붕괴: 비ASCII 파일 git add 실패(rc=%d): %s"
+             % (ga.returncode, (ga.stdout + ga.stderr)[-300:]))
+        r_na = _scan(nonascii_repo, "--all")
+        need(r_na.returncode == 1,
+             "비ASCII 파일명(%s) 안 이메일이 --all 에서 적발되지 않았다(exit=%d) — NUL 구분(-z) "
+             "목록이 되돌려지면(줄 단위 읽기) 이 파일이 목록에서 조용히 빠진다:\n%s"
+             % (nonascii_name, r_na.returncode, (r_na.stdout + r_na.stderr)[-800:]))
+        labels_na = {ln.split("\t", 1)[0] for ln in r_na.stdout.splitlines() if "\t" in ln}
+        need("EMAIL" in labels_na,
+             "비ASCII 파일명 이메일이 적발됐지만 라벨이 EMAIL 이 아니다(잡힌 라벨=%s)"
+             % (sorted(labels_na) or "없음"))
+        notes.append("비ASCII 파일명 EMAIL→%d" % r_na.returncode)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    need(not os.path.isdir(tmp), "임시 디렉터리가 남았다: %s" % tmp)
+    return " · ".join(notes)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 0. 베이스라인 (결정론 회귀 — 재감사 부채 V3)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -11171,7 +11285,7 @@ def h_meta_off():
     전부 지우고도 `GREEN — 발효 0 PASS / 0 FAIL / 5 SKIP` · **exit 0** 을 냈다. Skip 문구는
     스스로 "이것은 통과가 아니라 미측정" 이라 말하는데 요약과 종료코드는 통과라고 말한 것이다 —
     이 저장소가 반복해서 낸 사고의 형태를 계측기가 재현한 자리다.
-    이 검체가 그 수리의 **기계 집행자**이며 다섯 축으로 본다:
+    이 검체가 그 수리의 **기계 집행자**이며 여섯 축으로 본다:
       ⓐ 등재소 형태(두 종류 · 중복 0 · `off_switch()` 경유 등재).
       ⓑ 모듈 레벨 env 독취 **전수** == 등재 집합 — 등재 없는 새 스위치가 조용히 생기면 적색.
       ⓒ 판정 배선(소스 핀): `Disabled` 를 `Skip` **보다 먼저** 잡는가 · GREEN 박탈 · exit 2 ·
@@ -11180,6 +11294,7 @@ def h_meta_off():
          끈 런이 `GREEN`·exit 0 인지 잰다(소스 핀만으로는 "쓰여 있다" 밖에 증명하지 못한다).
       ⓔ `--json` stdout 순수 — 실제 오염원 검체를 태워 stdout 이 JSON 한 덩어리인지,
          오염분이 stderr 로 갔는지 잰다.
+      ⓕ `--only` 유령 ID(등재에 없음) → UNMEASURED·exit 2 + unknown_ids 명시(U4 C4-③).
     ★이 검체는 어떤 판정도 완화하지 않는다. 기존 need 를 대체하지 않고 새 축만 추가한다."""
     import inspect
     notes = []
@@ -11291,6 +11406,30 @@ def h_meta_off():
         #   그 사실을 그대로 적는다(오염원 검체가 바뀌면 다른 오염원으로 교체하라).
         notes.append("⚠오염원 검체 H-W5-N1 status=%s · stderr 오염 %d건 — stdout 순수 축은 "
                      "이번 실행에서 공허했다(오염원 교체 검토)" % (st, rj.stderr.count("verdict=")))
+
+    # ⓕ ★유령 ID(U4 C4-③ · 2026-09-23) — `--only` 로 **등재에 없는** ID 를 고르면 그 몫은 아무것도
+    #   재지 않았다. 종전 러너는 그 ID 를 조용히 버리고 나머지(또는 0건)로 GREEN·exit 0 을 냈다 —
+    #   `H-SECRET-1` 이 개명되면 발행 레인 4곳의 '스캐너가 살아 있는가' 메타 검사가 0건 실행·초록이
+    #   되는 형태다. 계약: 유령 ID 가 하나라도 있으면 **UNMEASURED·exit 2** + 이름 명시(unknown_ids).
+    #   ⓓ 와 같은 대조군(clean env)에서 잰다 — 판정 차이의 원인이 유령 ID 하나뿐이게.
+    ghost = "H-ZZ-GHOST-1"
+    need(ghost not in {sid for sid, _w, _t, _d, _f in _REG},
+         "전제 붕괴: 유령 표본 ID %s 가 실제로 등재돼 있다 — 표본 ID 를 바꿔라" % ghost)
+    rg, dg = _self(clean, "--only", "H-CI-TAG-1," + ghost)
+    sg = dg["summary"]
+    need(rg.returncode == 2 and sg["verdict"] == "UNMEASURED",
+         "유령 ID 섞인 선택이 %s·exit %d 다 — 선택했는데 존재하지 않는 검체를 조용히 버렸다"
+         "(재지 않은 것을 통과로 접는다 · UNMEASURED·exit 2 여야 한다)" % (sg["verdict"], rg.returncode))
+    need(sg.get("unknown_ids") == [ghost],
+         "요약이 유령 ID 를 이름으로 밝히지 않는다: unknown_ids=%r" % sg.get("unknown_ids"))
+    need(sg["pass"] >= 1,
+         "유령 ID 옆의 실재 검체(H-CI-TAG-1)까지 버렸다 — 진단 가치가 사라진다: %r"
+         % {k: sg[k] for k in ("pass", "fail", "skip", "disabled", "pending")})
+    ra, da = _self(clean, "--only", ghost)
+    need(ra.returncode == 2 and da["summary"]["verdict"] == "UNMEASURED" and da["summary"]["total"] == 0,
+         "전부 유령인 선택이 %s·exit %d·total %d 다 — 0건 실행이 초록으로 접힌다"
+         % (da["summary"]["verdict"], ra.returncode, da["summary"]["total"]))
+    notes.append("유령 ID: 혼합→UNMEASURED/exit2(실재분 실행) · 전부 유령→UNMEASURED/exit2(0건)")
     return " · ".join(notes)
 
 
@@ -12795,6 +12934,18 @@ def _u28_runner_lanes(files):
     return lanes
 
 
+def _u28_ghosts(lanes):
+    """`--only` 목록 안의 **유령 ID**(등재에 없음) → [(파일, 정렬된 유령 ID 목록)].
+
+    ★U4 C4-③(2026-09-23): 차집합(등재 − 실행)은 합집합만 보므로 목록 안의 유령 ID 를 원리적으로
+      못 본다 — 커버리지는 그대로이고 실행 0건이 늘 뿐이다. 러너 자신도 유령 ID 를 UNMEASURED(exit 2)
+      로 막지만, 그 적색은 **그 레인이 돌 때**(release.yml 은 태그 시점)에야 뜬다. 이 정적 축은
+      브랜치 전량 레인에서 태그 **전에** 같은 사실을 드러낸다."""
+    all_ids = {sid for sid, _w, _t, _d, _f in _REG}
+    return [(fname, sorted(ids - all_ids)) for fname, kind, ids in lanes
+            if kind == "only" and ids - all_ids]
+
+
 def _u28_uncovered(files):
     """(레인 목록, 어느 레인에서도 돌지 않는 검체 집합, full 레인 파일 목록)."""
     all_ids = {sid for sid, _w, _t, _d, _f in _REG}
@@ -12839,6 +12990,11 @@ def h_ci_cover_1():
          "어느 CI 레인에서도 돌지 않는 검체 %d건: %s%s — '안 도는 검체는 게이트가 아니다'"
          % (len(uncovered), ", ".join(sorted(uncovered)[:12]),
             " …" if len(uncovered) > 12 else ""))
+    ghosts = _u28_ghosts(lanes)
+    need(not ghosts,
+         "`--only` 목록에 등재되지 않은 검체 ID: %s — 그 몫은 아무것도 재지 않는다(러너는 그 레인에서 "
+         "UNMEASURED·exit 2 로 막는다 · 개명·삭제됐다면 호출부 목록을 고쳐라)"
+         % "; ".join("%s: %s" % (f, ", ".join(g)) for f, g in ghosts))
     # ★비용 경계 — 전량 레인은 Windows 러너가 아니어야 한다(트리거 확대 = 예산 폭발).
     need("windows-health.yml" not in fulls,
          "전량 실행이 Windows 실기 레인에 붙었다 — 매 push 마다 windows 러너가 전량을 돈다(예산 위반)")
@@ -12857,7 +13013,7 @@ def h_ci_cover_1():
             _lanes, unc, ful = _u28_uncovered(mutated)
         except Fail:
             return None                     # 적발(해소 불가를 적색으로 낸 경우)
-        return None if (unc or not ful) else label
+        return None if (unc or not ful or _u28_ghosts(_lanes)) else label
 
     full_file = fulls[0]
     mutants = [
@@ -12872,10 +13028,16 @@ def h_ci_cover_1():
          dict(files, **{"windows-health.yml":
                         files.get("windows-health.yml", "").replace(
                             'WIN_SPECIMENS="', 'WIN_SPECIMENS_X="')})),
+        # ★U4 C4-③(2026-09-23): `--only` 목록 안의 **유령 ID**(등재에 없음). 차집합(등재 − 실행)은
+        #   합집합만 보므로 이 변조를 원리적으로 못 본다 — 커버리지는 그대로이고 실행 0건이 늘 뿐이다.
+        ("windows 레인 목록에 유령 ID 주입",
+         dict(files, **{"windows-health.yml":
+                        files.get("windows-health.yml", "").replace(
+                            'WIN_SPECIMENS="', 'WIN_SPECIMENS="H-ZZ-GHOST-1,')})),
     ]
     blind = [b for b in (_blind(lbl, mut) for lbl, mut in mutants) if b]
     need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
-    return ("등재 %d종 · CI 레인 %d개(전량 %s · 부분 %s) · 미실행 0 · 합성 변조 %d종 전건 적발"
+    return ("등재 %d종 · CI 레인 %d개(전량 %s · 부분 %s) · 미실행 0 · 유령 ID 0 · 합성 변조 %d종 전건 적발"
             % (len(_REG), len(lanes), ",".join(fulls),
                ",".join("%s:%d종" % (f, len(i)) for f, k, i in lanes if k != "full") or "없음",
                len(mutants)))
@@ -13195,6 +13357,11 @@ def main(argv=None):
         return 0
 
     only = {s.strip() for s in args.only.split(",") if s.strip()}
+    # ★유령 ID(U4 C4-③ · 2026-09-23): `--only` 에 **등재에 없는** ID 가 있으면 그 몫은 아무것도 재지
+    #   않았다. 종전엔 아래 루프가 그 ID 를 조용히 건너뛰어, 전부 유령이면 0건 실행 GREEN·exit 0 이었다
+    #   (`H-SECRET-1` 개명 = 발행 레인 4곳의 스캐너 생존 메타 검사가 0건 초록). 실재 ID 는 그대로
+    #   실행해 진단 가치를 남기고, 판정만 UNMEASURED(exit 2)로 박탈한다 — '재지 않았다' 계급이다.
+    unknown_ids = sorted(only - {sid for sid, _w, _t, _d, _f in _REG})
     rows = []
     t0 = time.time()
     # ★스위치 상태는 **검체 실행 전에** 스냅샷한다 — 일부 검체가 실행 중 os.environ 을 임시로
@@ -13293,14 +13460,25 @@ def main(argv=None):
         verdict = "UNMEASURED"
     else:
         verdict = "GREEN"
+    # ★유령 ID(U4 C4-③)도 GREEN 을 박탈한다 — 위 분기 문면(H-META-OFF ⓒ 소스 핀)은 그대로 두고
+    #   덧붙인다. 실재 검체가 fail 이면 RED 가 우선이다('틀렸다' 가 '안 쟀다' 보다 강한 신호).
+    if verdict == "GREEN" and unknown_ids:
+        verdict = "UNMEASURED"
     summary = {"verdict": verdict, "landed_waves": list(LANDED_WAVES),
                "pass": len(passed), "fail": len(failed), "skip": len(skipped),
                "disabled": len(disabled), "pending": len(pend), "total": len(rows),
                "off_switches_engaged": [{"kind": k, "env": e, "value": val, "scope": sc}
                                         for k, e, val, sc in engaged],
+               "unknown_ids": unknown_ids,
                "elapsed_secs": round(time.time() - t0, 1),
                "calibration_ref": CALIBRATION_REF}
 
+    if unknown_ids:
+        # stderr 로도 낸다 — `--json` 소비자(CI 판독 블록)는 stdout 을 JSON 으로만 읽고 rc≠0 사유를
+        # 따로 찾지 않으므로, 러너 로그에 이름이 한 줄 남아야 원인이 역추적된다.
+        sys.stderr.write("★--only 에 등재되지 않은 검체 ID %d건: %s — 선택했는데 존재하지 않는 검체는 "
+                         "재지 않은 것이다(UNMEASURED · exit 2). 개명·삭제됐다면 호출부 목록을 고쳐라.\n"
+                         % (len(unknown_ids), ", ".join(unknown_ids)))
     if args.json:
         print(json.dumps({"summary": summary, "specimens": rows}, ensure_ascii=False, indent=1))
     else:
@@ -13317,6 +13495,9 @@ def main(argv=None):
               "미발효 %d PEND · %.1fs (발효 웨이브 %s)"
               % (verdict, len(passed), len(failed), len(skipped), len(disabled), len(pend),
                  summary["elapsed_secs"], ",".join(LANDED_WAVES)))
+        if unknown_ids:
+            print("\n★--only 에 등재되지 않은 검체 ID — 이 결과는 통과가 아니다(exit 2): %s"
+                  % ", ".join(unknown_ids))
         if engaged:
             print("\n★측정 축이 꺼져 있다 — 이 결과는 통과가 아니다(exit 2):")
             for kind, env, val, scope in engaged:

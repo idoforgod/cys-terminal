@@ -128,6 +128,49 @@ def main():
         if not ok:
             fails.append("양성 대조 실패 — 무변조 사본이 통과하지 않는다: %r" % out[-400:])
 
+        # ── ★추출 실패 음성 대조(U4 C4-⑥ · 2026-09-23) — 8곳의 selector 가 **전부 빗나가면**(키 개명 ·
+        #   패키지 개명) 빈 값 8개가 `sort -u` 로 1종이 되어 "✅ 8곳 일치: " rc 0 이 났다(무인자 모드 —
+        #   release.yml workflow_dispatch·로컬 경로. 태그 인자 모드는 기대값 대조가 따로 잡는다).
+        #   E1 = 8곳 파일 전부 부재 · E2 = 8곳 selector 전부 빗나감(파일은 있고 키 이름만 바뀜).
+        #   둘 다 무인자·태그 인자 모두 비영 종료여야 한다.
+        empties = []
+        e1 = os.path.join(tmp, "extract_E1")
+        seed(e1)
+        for rel in NEEDED:
+            if rel != SCRIPT:
+                os.remove(os.path.join(e1, rel))
+        empties.append(("E1", "8곳 파일 전부 부재", e1))
+        e2 = os.path.join(tmp, "extract_E2")
+        seed(e2)
+        for rel, pairs in (
+                ("Cargo.toml", None), ("src-tauri/Cargo.toml", None),
+                ("src-tauri/tauri.conf.json", [('"version"', '"xversion"')]),
+                ("ui/package.json", [('"version"', '"xversion"')]),
+                ("dist-win/cys.wxs", [("Product", "Prodxct")]),
+                ("dist-win/cys-x64.wxs", [("Product", "Prodxct")]),
+                ("Cargo.lock", [('name = "cys-terminal"\n', 'name = "cys-terminal-x"\n'),
+                                ('name = "cys-app"\n', 'name = "cys-app-x"\n')])):
+            path = os.path.join(e2, rel)
+            body = open(path, encoding="utf-8").read()
+            if pairs is None:   # Cargo.toml 류 — `^version` 으로 시작하는 줄 전부를 개명
+                body = "\n".join(("x" + l) if l.startswith("version") else l for l in body.split("\n"))
+            else:
+                for old_s, new_s in pairs:
+                    if old_s not in body:
+                        raise SystemExit("E2 변조 앵커 부재: %s (%r) — 파일 구조 변경 의심(fail-closed)"
+                                         % (rel, old_s))
+                    body = body.replace(old_s, new_s)
+            open(path, "w", encoding="utf-8").write(body)
+        empties.append(("E2", "8곳 selector 전부 빗나감", e2))
+        for eid, what, work in empties:
+            rc, out = run(work)
+            rct, _ = run(work, "v" + new)
+            nonzero = rc != 0 and rct != 0
+            print("  [음성] %s %-28s rc=%d rc(tag)=%d → %s" % (eid, what, rc, rct, "ok" if nonzero else "FAIL"))
+            if not nonzero:
+                fails.append("%s(%s): 추출 실패인데 게이트가 통과했다(rc=%d rc_tag=%d) — %r"
+                             % (eid, what, rc, rct, out[-300:]))
+
         # ── 음성 대조 8종: 하나씩 구버전으로 되돌리면 전부 비영 종료해야 한다 ──
         for sid, label, rel, rule in MUTATIONS:
             work = os.path.join(tmp, "mut_" + sid)
@@ -153,7 +196,8 @@ def main():
             print("FAIL " + f)
         print("=== %d건 어긋남 ===" % len(fails))
         return 1
-    print("=== 양성 1 + 음성 8 = 9건 전건 기대대로 (8곳 중 어느 하나가 누락돼도 게이트가 죽는다) ===")
+    print("=== 양성 1 + 음성 8 + 추출 실패 2 = 11건 전건 기대대로 (8곳 중 어느 하나가 누락되거나 "
+          "전부 추출에 실패해도 게이트가 죽는다) ===")
     return 0
 
 

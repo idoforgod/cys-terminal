@@ -30,8 +30,10 @@ import javis_preflight as pf  # noqa: E402 — 핀의 SOT 는 preflight 모듈(�
 # repo 임베드 디렉티브(출하 원본) — 라이브 ~/.cys/pack 이 아니라 repo 트리를 대조한다.
 DIRECTIVES_DIR = os.path.join(os.path.dirname(BIN), "directives")
 
-# Wave2 대기 핀: D2 합성 서문(gen_ceo_template.py 재합성)이 넣을 문구 — 재합성 착지 전에는
-# repo 템플릿에 없는 것이 정상이라 부재 시 skip(착지 후에는 자동으로 상주 단언이 된다).
+# Wave2 핀: D2 합성 서문(gen_ceo_template.py 재합성) 문구 = 오너 절대 규칙 'CEO·마스터는 직접
+# 구현하지 않는다' 의 주입 문면. ★착지 완료(18dc9a6b · 2026-08-16) — 종전의 '부재 시 skip(착지 대기)'
+# 분기는 착지 뒤에는 해가 됐다: 이 문장이 편집·재합성으로 사라지면 실패가 아니라 skip → 3레인
+# 전부 초록(U4 C4-④ · 2026-09-23 제거). 이제 다른 CEO 핀과 똑같이 **무조건 단언**이다.
 CEO_WAVE2_PIN = "직접 구현은 §1-A 사소 예외 없이 금지"
 
 
@@ -44,11 +46,11 @@ class ContentPinsParity(unittest.TestCase):
         with open(p, encoding="utf-8") as f:   # encoding 명시(계약 — 로케일 비의존)
             return f.read()
 
-    def _assert_pins(self, fname, exclude=()):
-        """부재 핀을 **전수 목록**으로 보고한다(1개씩 죽는 단언 금지 — 정확 보고 임무)."""
+    def _assert_pins(self, fname):
+        """부재 핀을 **전수 목록**으로 보고한다(1개씩 죽는 단언 금지 — 정확 보고 임무).
+        ★면제(exclude) 인자는 없앴다 — 면제 경로가 있으면 '착지 대기' 같은 한시 사유가 영구 사각이 된다."""
         text = self._text(fname)
-        missing = [(pin, label) for pin, label in pf.CONTENT_PINS[fname]
-                   if pin not in exclude and pin not in text]
+        missing = [(pin, label) for pin, label in pf.CONTENT_PINS[fname] if pin not in text]
         self.assertFalse(
             missing,
             "핀↔디렉티브 패리티 붕괴 — %s 에 부재 %d건:\n%s"
@@ -68,16 +70,19 @@ class ContentPinsParity(unittest.TestCase):
         self._assert_pins("REVIEWER_DIRECTIVE.md")
 
     def test_ceo_pins_shipped(self):
-        """CEO 템플릿 핀 — Wave2 대기 핀만 제외한 나머지(표지 3핀)는 지금 실존해야 한다."""
-        self._assert_pins("CEO_TEMPLATE.md", exclude=(CEO_WAVE2_PIN,))
+        """CEO 템플릿 핀 전수(표지 3핀 + Wave2 서문 핀) — 면제 없음."""
+        self._assert_pins("CEO_TEMPLATE.md")
 
     def test_ceo_wave2_preface_pin(self):
-        """Wave2 합성 서문 핀 — 부재 = skip(재합성 대기·정상), 존재 = 상주 단언(자동 승격)."""
-        if CEO_WAVE2_PIN not in self._text("CEO_TEMPLATE.md"):
-            self.skipTest("Wave2 재합성 대기: CEO_TEMPLATE.md 에 %r 부재 — D2 재합성"
-                          "(gen_ceo_template.py) 착지 후 이 skip 은 자동으로 상주 단언이 된다"
-                          % CEO_WAVE2_PIN)
-        # 존재하면 그 자체가 단언 통과 — 별도 assert 불요(위 멤버십 검사가 곧 검증).
+        """Wave2 합성 서문 핀 — **무조건 상주 단언**(skip 분기 없음 · U4 C4-④).
+        CONTENT_PINS 등재까지 함께 단언한다: 등재에서 빠지면 위 전수 검사가 이 핀을 보지 않는다."""
+        self.assertIn(CEO_WAVE2_PIN, [pin for pin, _ in pf.CONTENT_PINS["CEO_TEMPLATE.md"]],
+                      "Wave2 핀이 preflight CONTENT_PINS['CEO_TEMPLATE.md'] 에서 빠졌다 — "
+                      "런타임 C03.pin.ceo 와 이 패리티가 그 문면을 더 이상 보지 않는다")
+        self.assertIn(CEO_WAVE2_PIN, self._text("CEO_TEMPLATE.md"),
+                      "CEO_TEMPLATE.md 에 Wave2 서문 핀 %r 부재 — 오너 절대 규칙(CEO·마스터 직접 구현 "
+                      "금지)의 주입 문면이 사라졌다. gen_ceo_template.py 재합성 결과를 확인하라"
+                      % CEO_WAVE2_PIN)
 
     def test_marker_pins_exist_in_live_template(self):
         """표지 핀 불변식의 신판 축: MARKER_PINS 는 repo(신) 템플릿에 전수 실존해야 한다.
@@ -97,6 +102,41 @@ class ContentPinsParity(unittest.TestCase):
     def test_wave2_pin_not_in_marker_pins(self):
         """Wave2 핀은 표지 술어 편입 금지(R3 A7 — 구 템플릿 부재라 구판 표지가 사멸)."""
         self.assertNotIn(CEO_WAVE2_PIN, pf.MARKER_PINS)
+
+
+class Wave2PinRemovalMutation(unittest.TestCase):
+    """★뮤테이션(U4 C4-④ · 2026-09-23): **임시 사본**의 CEO_TEMPLATE.md 에서 Wave2 핀
+    (오너 절대 규칙 'CEO·마스터는 직접 구현하지 않는다' 의 주입 문면)을 지우면 CEO 핀 검사가
+    **실패**해야 한다 — skip 이면 3레인 전부 초록으로 그 문면 소실을 통과시킨다.
+
+    대상 검사 둘을 unittest 로 실제 실행해 결과 종류(failure/skip)를 잰다. 리포 트리·라이브 팩
+    무접촉 — 임시 디렉터리 사본만 변조하고 모듈 전역 DIRECTIVES_DIR 은 finally 에서 되돌린다."""
+
+    def test_pin_removal_in_temp_copy_is_failure_not_skip(self):
+        import shutil
+        import tempfile
+        mod = sys.modules[ContentPinsParity.__module__]
+        src = os.path.join(mod.DIRECTIVES_DIR, "CEO_TEMPLATE.md")
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn(CEO_WAVE2_PIN, text, "전제: 리포 템플릿에 Wave2 핀이 실재해야 변조가 의미를 갖는다")
+        tmp = tempfile.mkdtemp(prefix="cys-pins-mut-")
+        saved = mod.DIRECTIVES_DIR
+        try:
+            with open(os.path.join(tmp, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+                f.write(text.replace(CEO_WAVE2_PIN, ""))
+            mod.DIRECTIVES_DIR = tmp
+            for name in ("test_ceo_pins_shipped", "test_ceo_wave2_preface_pin"):
+                res = unittest.TestResult()
+                ContentPinsParity(name).run(res)
+                self.assertEqual(
+                    (len(res.failures), len(res.skipped), len(res.errors)), (1, 0, 0),
+                    "%s: Wave2 핀을 지운 사본에서 failure 1 이어야 한다 — 실제 failures=%d skipped=%d "
+                    "errors=%d (skip 이면 오너 절대 규칙 문면 소실이 3레인 초록으로 통과한다)"
+                    % (name, len(res.failures), len(res.skipped), len(res.errors)))
+        finally:
+            mod.DIRECTIVES_DIR = saved
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

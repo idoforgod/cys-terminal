@@ -36,10 +36,14 @@
        안내까지 지운다. 그 회귀는 ⓐ·ⓒ만으로는 통과해 버리므로 ⓑ 로 0건을 즉시 잡는다.
      ★⑤(다운로드 페이지 Defender 섹션)와 **다른 페이지·다른 축**이다 — 어느 쪽도 약화시키지 않는다.
 
-사용: python3 scripts/verify-release-remote.py 0.14.5 [이전버전]
-      (이전버전 생략 시 ① 은 건너뛴다)
-      python3 scripts/verify-release-remote.py --self-test   # ⑦ 집계 로직 셀프테스트(무접촉)
-종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완)
+사용: python3 scripts/verify-release-remote.py <신버전> <구버전>      # 정본 — 8축(①~⑧)
+      python3 scripts/verify-release-remote.py <신버전> --no-prev     # 구버전이 없을 때만(① SKIP 명시)
+      python3 scripts/verify-release-remote.py --self-test             # 판정·인자 셀프테스트(무접촉)
+      ★구버전 생략은 **--no-prev 로만** 허용한다(U4 C4-⑦ · 2026-09-23). 종전엔 구버전을 빼먹으면
+        ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈는데, 그 분모가 오너 문서의 합격 문구와 같아
+        **빼먹은 실행이 합격으로 읽혔다**(구버전 문자열 잔존 = 홈페이지 옛 다운로드 링크 사고를 놓침).
+        이제 플래그 없는 생략은 원격 수신 **전에** exit 2 이고, --no-prev 실행은 요약 줄에 "①SKIP" 을 병기한다.
+종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완) · 2 = 인자 오류(원격 무접촉)
 """
 import hashlib
 import json
@@ -227,19 +231,82 @@ def self_test():
     v, d = versionless_verdict(mk(OLD, OLD), man, True, V)
     ok("⑧ⓖ ★무버전 자산만 구버전인 형상은 반드시 실패", not v, d)
 
+    # ── 인자 계약: 구버전 생략은 명시 플래그로만 (U4 C4-⑦ · 2026-09-23) ──
+    # 종전엔 구버전을 빼먹으면 ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈다 — 오너 문서의 합격
+    # 문구("7/7 PASS")와 정확히 일치해 **빼먹은 실행이 합격으로 읽혔다**(홈페이지 옛 링크 잔존 사고를 놓침).
+    # 여기서는 main() 을 실제로 부르되 네트워크 함수를 **트립와이어**로 바꿔, 인자 오류가 수신 **전에**
+    # exit 2 로 끝나는지 잰다(트립와이어가 울리면 = 인자 검사 없이 원격으로 나갔다 = 실패).
+    g = globals()
+    saved = {k: g[k] for k in ("get", "get_json", "clen", "code")}
+    calls = []
+
+    def _trip(*a, **k):
+        calls.append(a[:1])
+        raise RuntimeError("tripwire: 인자 검사 전에 원격 수신을 시도했다")
+    try:
+        for k in saved:
+            g[k] = _trip
+        for label, argv, want in (
+                ("⑨ⓐ 구버전 생략(플래그 없음)은 수신 전 exit 2", ["x", V], 2),
+                ("⑨ⓑ 구버전 + --no-prev 동시 지정은 모순 — 수신 전 exit 2", ["x", V, OLD, "--no-prev"], 2),
+                ("⑨ⓒ 모르는 플래그는 수신 전 exit 2", ["x", V, OLD, "--bogus"], 2),
+                ("⑨ⓓ 위치 인자 3개 이상은 수신 전 exit 2", ["x", V, OLD, "1.2.3"], 2)):
+            del calls[:]
+            try:
+                rc = main(argv)
+            except RuntimeError as e:
+                rc = "원격 수신 시도(%s)" % e
+            ok(label, rc == want and not calls, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
+        # 양성 대조 — 정상 인자(구버전 명시 · --no-prev 명시)는 인자 검사를 **통과**해 수신 단계로 간다.
+        for label, argv in (("⑨ⓔ 구버전 명시는 수신 단계로 진행", ["x", V, OLD]),
+                            ("⑨ⓕ --no-prev 명시는 수신 단계로 진행", ["x", V, "--no-prev"])):
+            del calls[:]
+            try:
+                rc = main(argv)
+            except RuntimeError:
+                rc = "tripwire"
+            ok(label, rc == "tripwire" and len(calls) == 1, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
+    finally:
+        g.update(saved)
+
     total = tally["pass"] + tally["fail"]
     print("\n=== self-test %d/%d PASS (실패 %d건) ===" % (tally["pass"], total, tally["fail"]))
     return 0 if tally["fail"] == 0 else 1
 
 
+def parse_args(argv):
+    """argv → (ver, prev, no_prev) 또는 문자열(인자 오류 사유). 순수함수 — 원격 무접촉."""
+    args = argv[1:]
+    flags = [a for a in args if a.startswith("--")]
+    pos = [a for a in args if not a.startswith("--")]
+    unknown = [f for f in flags if f != "--no-prev"]
+    if unknown:
+        return "모르는 플래그: %s" % " ".join(unknown)
+    no_prev = "--no-prev" in flags
+    if not pos:
+        return "신버전 인자가 없다"
+    if len(pos) > 2:
+        return "위치 인자는 <신버전> <구버전> 둘까지다(받은 것: %s)" % " ".join(pos)
+    ver = pos[0]
+    prev = pos[1] if len(pos) > 1 else None
+    if prev and no_prev:
+        return "구버전(%s)과 --no-prev 를 함께 줬다 — 모순이다(둘 중 하나만)" % prev
+    if not prev and not no_prev:
+        return ("구버전 인자가 없다 — ① 구버전 문자열 0 검사를 조용히 빼고 분모 7 로 합격처럼 보이는 "
+                "실행을 막는다. `<신버전> <구버전>` 으로 돌리거나, 구버전이 정말 없으면 --no-prev 를 명시하라")
+    return ver, prev, no_prev
+
+
 def main(argv):
     if "--self-test" in argv[1:]:
         return self_test()
-    if len(argv) < 2:
-        print(__doc__.strip(), file=sys.stderr)
+    parsed = parse_args(argv)
+    if isinstance(parsed, str):
+        print("✗ 인자 오류(원격 무접촉 · exit 2): %s\n" % parsed, file=sys.stderr)
+        doc = __doc__.strip()
+        print(doc[doc.find("사용:"):] if "사용:" in doc else doc, file=sys.stderr)
         return 2
-    ver = argv[1]
-    prev = argv[2] if len(argv) > 2 else None
+    ver, prev, no_prev = parsed
     four = ["cys_%s_aarch64.dmg" % ver, "cys_%s_x64.dmg" % ver,
             "cys_%s_x64-setup.exe" % ver, "cys_%s_x64-setup.zip" % ver]
 
@@ -253,7 +320,7 @@ def main(argv):
         n = main_html.count(prev)
         check("① 구버전 문자열 0 (%s)" % prev, n == 0, "발견 %d개" % n)
     else:
-        print("SKIP ① 구버전 미지정")
+        print("SKIP ① 구버전 미지정(--no-prev 명시) — 구버전 문자열 잔존은 이 실행에서 재지 않았다")
 
     # ② 신버전 9
     n = main_html.count(ver)
@@ -374,7 +441,15 @@ def main(argv):
     check("⑧ 무버전 자산 버전 결속(latest.json·팩 미러)", ok8, detail8)
 
     npass = sum(1 for r in results if r)
-    print("\n=== %d/%d PASS ===" % (npass, len(results)))
+    # ★U4 C4 리뷰1 MINOR-3 수정(2026-09-23): --no-prev 요약은 "N/N PASS" 형태로 쓰지 않는다.
+    #   오너 문서(저장소 밖)의 합격 문구가 정확히 "7/7 PASS" 라 --no-prev 실행(측정 7축)의 요약이
+    #   우연히 그 문구와 접두가 일치했다 — 인자 오류 메시지가 "구버전이 정말 없으면 --no-prev 를
+    #   명시하라"고 안내하므로, 이 플래그 한 개로 무플래그 생략(exit 2 로 막힌 그 경로)과 같은
+    #   오독이 재현될 수 있었다. 정상(구버전 포함) 실행만 "N/N PASS" 를 쓴다.
+    if no_prev:
+        print("\n=== ①SKIP · %d축 통과(8축 중) — 정본 합격 8/8 아님 ===" % npass)
+    else:
+        print("\n=== %d/%d PASS ===" % (npass, len(results)))
     return 0 if npass == len(results) else 1
 
 

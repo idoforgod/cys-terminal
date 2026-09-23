@@ -596,6 +596,41 @@ t = t.replace(a, "", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
   mut_expect 1 "필터 가드 삭제(windows-health readiness::)" "cargo_filter_count --lib readiness::"
+  # ★U4 C4-⑧(2026-09-23): UI 회귀·타입 게이트의 필수 명령 토큰(D4 MUST_RUN_TOKENS 확장)이 살아 있는가.
+  #   ⑤태그 레인 `cd ui && bun test` 실행 줄 소거 ⑥브랜치 레인 UI 잡에 잡 수준 `if: false`(스텝 조건이
+  #   아니라 **잡**이 꺼지는 형태 — G1) ⑦브랜치 레인 타입체크 실행 줄 소거.
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/release.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "        run: cd ui && bun test\n"
+assert t.count(a) == 1, "변이 앵커 부재(release UI bun test 실행 줄)"
+t = t.replace(a, "        run: cd ui && echo 'UI 테스트 생략'\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 회귀 소거(release cd ui && bun test)" "cd ui && bun test"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "  ui-check:\n    runs-on: macos-latest\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch ui-check 잡 머리)"
+t = t.replace(a, "  ui-check:\n    runs-on: macos-latest\n    if: false\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 잡 소등(ci-branch ui-check 잡 수준 if: false)" "잡 수준 false"
+  # ★U4 C4 리뷰1 MAJOR-1 수정(2026-09-23): ⑤ 와 같은 모양으로 — **실행 줄 1개만** 지우고 count==1 로
+  #   앵커를 강제한다(스텝 이름은 손대지 않는다). 종전 replace-all 은 스텝 이름의 `tsc -p
+  #   tsconfig.check.json` 문면까지 함께 지워버려 "필수 명령이 사라졌다"는 더 흔한 회귀(실행 줄만 소거·
+  #   스텝 이름은 그대로)를 검체가 가렸다(review1-gate-mutA-tsc-runline-only.log: 실행 줄만 지우면
+  #   원본 게이트가 rc=0). 이 변이는 실행 줄만 지워 그 실측 회귀를 재현한다.
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "          bunx -p typescript@7.0.2 tsc -p tsconfig.check.json\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch 타입체크 실행 줄)"
+t = t.replace(a, "          echo skipped-typecheck\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 타입체크 실행 줄만 소거(ci-branch tsc -p tsconfig.check.json · 스텝 이름은 유지)" "typescript@7.0.2 tsc -p tsconfig.check.json"
 
   echo
   echo "── 자기 검체 3: 5단계(우분투 사전 레인 동일성)의 변이 대조 ──────────────────"
