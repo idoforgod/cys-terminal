@@ -40,8 +40,18 @@ describe("toastTtl — 종류 불문 유한 수명", () => {
       expect(toastTtl("sticky", id).ttlMs).toBe(PROGRESS_TTL_MS);
     }
   });
+  it("★(0.14.41 · U14) 폴더 접근 안내(perm-*)는 10분 — 설정 화면을 따라가는 동안 사라지지 않는다", () => {
+    // 60초면 사람이 시스템 설정의 여러 단계를 따라가는 동안 안내가 먼저 사라졌다(반박 M4).
+    // 여전히 유한하다(오너 요구 = 종류 불문 소멸) — 무한 불변식 테스트가 이 id 도 함께 잰다.
+    for (const id of ["perm-Desktop", "perm-Documents", "perm-seat-Desktop", "perm-seat-/Volumes/X"]) {
+      expect(toastTtl("sticky", id).ttlMs).toBe(600_000);
+    }
+    // 접두가 우연히 겹치는 다른 id 는 연장하지 않는다(정확히 "perm-" 접두만).
+    expect(toastTtl("sticky", "permission").ttlMs).toBe(STICKY_TTL_MS);
+    expect(toastTtl("volatile", "perm-Desktop").ttlMs).toBe(VOLATILE_TTL_MS);
+  });
   it("어떤 조합도 무한(0·Infinity)이 아니다 — 오너 요구의 하드 불변식", () => {
-    const ids = [undefined, "boot-warn", "safe-mode", "restore", "purge-fail-x", "unknown-id"];
+    const ids = [undefined, "boot-warn", "safe-mode", "restore", "purge-fail-x", "unknown-id", "perm-Desktop", "perm-seat-x"];
     for (const kind of ["volatile", "sticky"] as const) {
       for (const id of ids) {
         const { ttlMs } = toastTtl(kind, id);

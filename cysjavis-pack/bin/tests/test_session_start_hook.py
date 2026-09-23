@@ -504,5 +504,39 @@ shutil.rmtree(tmp)
 check("19f 예산 상수가 훅에 선언돼 있다(바닥 = CLI 내부 총예산 10s)",
       "CYS_SS_ROLE_BUDGET_S=12" in _code and "CYS_SS_RECLAIM_MIN_S=10" in _code)
 
+# ── 20. ★(0.14.41 · U18) 작업 폴더 읽기 막힘 고지 ──
+#   데몬(cysd)은 macOS 에서 **역할 좌석**을 만들 때 작업 폴더 목록 읽기를 한 번 재고, EPERM(폴더
+#   접근 권한 거부)이면 pane env `CYS_CWD_BLOCKED=<그 폴더>` 를 싣는다(스폰 동작은 그대로 — 셸은
+#   그 폴더에서 뜬다). 좌석은 그 사실을 모르면 읽기·쓰기 실패를 제멋대로 해석한다(다른 폴더에 대신
+#   저장 · 마스터에게 자발 보고 폭주). 훅은 **1줄**만 말한다: 무엇이 막혔나 + 그 폴더가 필요한
+#   지시를 받으면 그 회신에만 적는다 · 자발 push 금지 · 대신 저장 금지. /clear 마다 반복돼도 1줄이다.
+tmp = tempfile.mkdtemp(prefix="hook-t20-")
+env = setup(tmp, "ok")
+env_b = dict(env)
+env_b["CYS_CWD_BLOCKED"] = "/Users/x/Desktop/proj"
+code, out, _ = run_hook(env_b, role="worker")
+_lines = [l for l in out.splitlines() if "고지(작업 폴더)" in l]
+check("20a 막힌 폴더 좌석: 고지 정확히 1줄", len(_lines) == 1, repr(_lines))
+_l = _lines[0] if _lines else ""
+check("20b 고지에 그 폴더 경로가 실린다", "/Users/x/Desktop/proj" in _l, _l)
+check("20c '그 지시의 회신에만' + '자발 보고·push 금지' 문안", "회신에만" in _l and "자발" in _l, _l)
+check("20d 다른 폴더에 대신 저장 금지 문안", "대신 저장" in _l, _l)
+check("20e 디렉티브 주입은 그대로(고지는 추가일 뿐) · exit 0",
+      "DIRECTIVE-BODY-WORKER" in out and code == 0, "rc=%s" % code)
+code, out2, _ = run_hook(env, role="worker")
+check("20f env 없으면 고지 0줄(무회귀)", "고지(작업 폴더)" not in out2)
+code, out3, _ = run_hook(env_b)
+check("20g 무역할 세션(사람이 연 셸)은 고지하지 않는다", "고지(작업 폴더)" not in out3)
+env_w = dict(env)
+env_w["CYS_CWD_BLOCKED"] = "C:\\Users\\x\\Desktop\\new"
+code, out4, _ = run_hook(env_w, role="worker")
+check("20h 경로 원문 보존(printf — /bin/sh xpg_echo 가 백슬래시를 먹지 않는다 · G8 동형)",
+      "C:\\Users\\x\\Desktop\\new" in out4, out4[:400])
+env_e = dict(env)
+env_e["CYS_CWD_BLOCKED"] = ""
+code, out5, _ = run_hook(env_e, role="worker")
+check("20i 빈 값이면 고지 0줄", "고지(작업 폴더)" not in out5)
+shutil.rmtree(tmp)
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)
