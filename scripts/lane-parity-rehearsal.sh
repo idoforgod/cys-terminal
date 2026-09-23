@@ -596,6 +596,36 @@ t = t.replace(a, "", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
   mut_expect 1 "필터 가드 삭제(windows-health readiness::)" "cargo_filter_count --lib readiness::"
+  # ★U4 C4-⑧(2026-09-23): UI 회귀·타입 게이트의 필수 명령 토큰(D4 MUST_RUN_TOKENS 확장)이 살아 있는가.
+  #   ⑤태그 레인 `cd ui && bun test` 실행 줄 소거 ⑥브랜치 레인 UI 잡에 잡 수준 `if: false`(스텝 조건이
+  #   아니라 **잡**이 꺼지는 형태 — G1) ⑦브랜치 레인 타입체크 실행 줄 소거.
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/release.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "        run: cd ui && bun test\n"
+assert t.count(a) == 1, "변이 앵커 부재(release UI bun test 실행 줄)"
+t = t.replace(a, "        run: cd ui && echo 'UI 테스트 생략'\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 회귀 소거(release cd ui && bun test)" "cd ui && bun test"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "  ui-check:\n    runs-on: macos-latest\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch ui-check 잡 머리)"
+t = t.replace(a, "  ui-check:\n    runs-on: macos-latest\n    if: false\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 잡 소등(ci-branch ui-check 잡 수준 if: false)" "잡 수준 false"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "tsc -p tsconfig.check.json"
+assert t.count(a) >= 1, "변이 앵커 부재(ci-branch 타입체크 실행 줄)"
+t = t.replace(a, "tsc --version")
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "UI 타입체크 소거(ci-branch tsc -p tsconfig.check.json)" "tsc -p tsconfig.check.json"
 
   echo
   echo "── 자기 검체 3: 5단계(우분투 사전 레인 동일성)의 변이 대조 ──────────────────"
