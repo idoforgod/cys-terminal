@@ -49,3 +49,31 @@ export const CYCLE_VERIFY_DISMISS_TITLE =
   "이 알림 항목만 목록에서 지웁니다 — 판정이 아닙니다(decision=dismissed).\n" +
   "⚠ 이 요청을 기다리는 cycle-agent가 아직 돌고 있으면 '검증자 거부(dismissed)'로 " +
   "안전 중단됩니다(clear 미실행) — 검증자 응답 timeout·pane 사망 뒤 잔존 항목의 정리에 쓰세요.";
+
+// ★U10(0.14.41) 새 feed 항목 토스트 제목 — 정보성 알림과 승인 요청을 가른다.
+//   종전: 모든 feed.item.created 가 "📥 승인 요청" 이라, 대기자 없는 안내문(각성 훅 경고·부트 실패·
+//   편성 상태·CEO 알림)까지 켤 때마다 '승인 알림' 으로 쌓여 보였다.
+//   정보성 kind 의 정본은 데몬 `src/bin/cysd/state.rs` NOTICE_FEED_KINDS / NOTICE_FEED_KIND_PREFIXES 다 —
+//   아래는 그 사본이고 feedclass.test.ts 가 두 리터럴을 대조한다(드리프트 = 테스트 적색).
+//   모르는 kind 는 승인 요청으로 둔다(안내문을 승인으로 보이는 것보다 승인을 안내문으로 숨기는 쪽이 위험).
+export const NOTICE_FEED_KINDS: readonly string[] = [
+  "hook-missing",
+  "bootstrap-fail",
+  "warn",
+  "error",
+  "formation",
+  "ceo-notice",
+];
+export const NOTICE_FEED_KIND_PREFIXES: readonly string[] = ["formation-"];
+
+export function isNoticeFeedKind(kind: unknown): boolean {
+  if (typeof kind !== "string") return false;
+  return NOTICE_FEED_KINDS.indexOf(kind) >= 0 || NOTICE_FEED_KIND_PREFIXES.some((p) => kind.startsWith(p));
+}
+
+export const FEED_TOAST_NOTICE_TITLE = "ℹ 알림";
+export const FEED_TOAST_APPROVAL_TITLE = "📥 승인 요청";
+
+export function feedCreatedToastTitle(kind: unknown): string {
+  return isNoticeFeedKind(kind) ? FEED_TOAST_NOTICE_TITLE : FEED_TOAST_APPROVAL_TITLE;
+}

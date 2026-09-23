@@ -238,6 +238,12 @@ const BUILTIN_COMMAND_MIGRATIONS: &[(&str, &str, &str)] = &[
         "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || true; done",
         "WP6-5 ensure 비0 exit 삼킴(부서 실패 불가시)",
     ),
+    // ★U10(0.14.41): 부서 편성을 본부 팩 env 로 돌리던 심박(0.14.40 builtin 의 바이트 정확 사본).
+    (
+        "formation-heartbeat",
+        "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || { rc=1; echo \"formation-heartbeat: ensure failed dept=$d\" >&2; }; done; exit $rc",
+        "U10 부서 편성이 본부 팩으로 돎(부서 좌석에 본부 지침 주입·각성 훅 오탐 누적)",
+    ),
 ];
 
 fn builtin_jobs() -> Vec<serde_json::Value> {
@@ -361,7 +367,14 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             //   pending-*·partial:*(booting·inflight·paused·gate-unknown) 은 전부 **0** 이라 rc 로는 보이지
             //   않는다(상태파일 held/gate 키가 흔적). 즉 이 잡의 exit 1 = "예외로 편성이 failed 로 확정"
             //   또는 "파이썬이 못 돌았다" 이며, 평시 심박 소음이 아니다.
-            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || { rc=1; echo \"formation-heartbeat: ensure failed dept=$d\" >&2; }; done; exit $rc",
+            // ★U10(0.14.41 · 반박 M1/DD1): 부서마다 **그 부서 팩**으로 편성을 돌린다(`lp` · cys-dept `dept_pack` 과
+            //   같은 규칙 `$HOME/.cys/pack-dept-<d>`). 종전엔 본부 데몬 env 의 팩으로 돌아, 죽은 부서 좌석을 되살릴
+            //   때마다 본부 지침·MEMORY 를 부서 좌석에 주입하고 각성 훅 경고를 오탐으로 쌓았다. 부서 팩이 설치
+            //   전(boot_node 부재)이면 `$pk`(종전 값)로 접는다 — 편성이 'boot_node 부재' 실패로 번지지 않는다(③).
+            //   본부 팩에 kill-switch 파일(AUTOPILOT_PAUSED)이 있어도 `$pk` 로 접는다 — 종전엔 그 파일이 부서 편성도
+            //   멈췄다(javis_formation paused_paths = `$PACK_DIR/AUTOPILOT_PAUSED`) · 팩 전환이 정지를 우회하지 않는다.
+            //   CYS_STATE_DIR 무접촉(편성 싱글플라이트 락 불변식). 기존 설치본은 아래 이관표(U10 항목)로 닿는다.
+            "command": "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; lp=\"$HOME/.cys/pack-dept-$d\"; { [ -f \"$lp/bin/javis_boot_node.py\" ] && [ ! -e \"$pk/AUTOPILOT_PAUSED\" ]; } || lp=\"$pk\"; CYS_PACK_DIR=\"$lp\" python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || { rc=1; echo \"formation-heartbeat: ensure failed dept=$d\" >&2; }; done; exit $rc",
             "_builtin": "formation",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
@@ -4136,6 +4149,107 @@ exit 0
         let _ = apply_builtin_jobs(&mut edited);
         assert_eq!(edited[0], existing, "구 표현과 다른 운영자 편집이 소실됐다");
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
+    }
+
+    /// ★U10(0.14.41) 0.14.40 설치본이 심은 편성 심박 command — **바이트 정확 사본**(이관표 대조용).
+    const U10_PRE_HEARTBEAT: &str = "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; python3 \"$pk/bin/javis_formation.py\" ensure --socket \"$s\" ${c:+--cwd \"$c\"} --json || { rc=1; echo \"formation-heartbeat: ensure failed dept=$d\" >&2; }; done; exit $rc";
+
+    /// ★U10(0.14.41 · 반박 M1/DD1) 편성 심박은 부서마다 **그 부서 팩**(cys-dept `dept_pack` 과 같은 규칙)으로
+    /// 편성을 돌린다 — 본부 팩 env 로 돌면 새로 띄운 부서 좌석에 본부 지침·MEMORY 가 주입되고 각성 훅 경고가
+    /// 켤 때마다 오탐으로 쌓인다. 부서 팩이 설치 전(boot_node 부재)이면 종전 팩(`$pk`)으로 접는다(자가치유
+    /// 전멸 방지 — 편성 실패로 번지지 않는다). CYS_STATE_DIR 는 건드리지 않는다(싱글플라이트 락 불변식).
+    #[test]
+    fn u10_formation_heartbeat_runs_each_dept_in_its_lane_pack() {
+        let cmd = builtin("formation-heartbeat")["command"].as_str().unwrap().to_string();
+        assert!(
+            cmd.contains(r#"lp="$HOME/.cys/pack-dept-$d"; { [ -f "$lp/bin/javis_boot_node.py" ] && [ ! -e "$pk/AUTOPILOT_PAUSED" ]; } || lp="$pk";"#),
+            "부서 레인 팩 유도(+설치 전·본부 kill-switch 폴백)가 없다: {cmd}"
+        );
+        assert!(
+            cmd.contains(r#"CYS_PACK_DIR="$lp" python3 "$pk/bin/javis_formation.py" ensure --socket "$s""#),
+            "편성에 레인 팩을 싣지 않는다: {cmd}"
+        );
+        assert!(!cmd.contains("CYS_STATE_DIR"), "편성 락 불변식 위반 — CYS_STATE_DIR 를 재설정했다: {cmd}");
+        let dept = include_str!("../../../cysjavis-pack/bin/cys-dept");
+        assert!(
+            dept.contains(r#"dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }"#),
+            "cys-dept 의 부서 팩 규칙과 심박 규칙이 갈렸다"
+        );
+        assert!(
+            BUILTIN_COMMAND_MIGRATIONS
+                .iter()
+                .any(|(id, old, _)| *id == "formation-heartbeat" && *old == U10_PRE_HEARTBEAT),
+            "0.14.40 설치본의 심박이 이관표에 없다 — 기존 함대에 닿지 않는다"
+        );
+        let mut jobs = vec![{
+            let mut j = builtin("formation-heartbeat");
+            j["command"] = json!(U10_PRE_HEARTBEAT);
+            j
+        }];
+        let (changed, conflicts, _) = apply_builtin_jobs(&mut jobs);
+        assert!(changed && conflicts.is_empty(), "0.14.40 심박이 이관되지 않았다");
+        assert_eq!(jobs[0]["command"].as_str(), Some(cmd.as_str()));
+
+        // 실제 POSIX 셸: 부서 팩 설치됨 → 그 팩 · 미설치 → $pk · CYS_STATE_DIR 통과.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let root = std::env::temp_dir().join(format!(
+                "cys-u10-hb-{}-{}", std::process::id(), now_epoch().to_bits()
+            ));
+            let bin = root.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(root.join(".cys/pack-dept-first/bin")).unwrap();
+            std::fs::write(root.join(".cys/pack-dept-first/bin/javis_boot_node.py"), "stub\n").unwrap();
+            std::fs::write(bin.join("cys-dept"), r#"#!/bin/sh
+case "$1" in
+    list) printf 'first\nlast\n' ;;
+    sock) printf '/tmp/%s.sock\n' "$2" ;;
+    cwd) exit 4 ;;
+    *) exit 1 ;;
+esac
+"#).unwrap();
+            std::fs::write(bin.join("python3"), r#"#!/bin/sh
+printf '%s %s %s\n' "$4" "$CYS_PACK_DIR" "${CYS_STATE_DIR:-unset}" >> "$HOME/seen"
+exit 0
+"#).unwrap();
+            std::fs::write(bin.join("javis_formation.py"), "stub\n").unwrap();
+            for name in ["cys-dept", "python3"] {
+                std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c").arg(&cmd).env_clear()
+                .env("HOME", &root).env("CYS_PACK_DIR", &root)
+                .env("CYS_STATE_DIR", "/tmp/u10-state")
+                .env("PATH", &bin)
+                .output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            let seen = std::fs::read_to_string(root.join("seen")).unwrap();
+            assert_eq!(
+                seen,
+                format!(
+                    "/tmp/first.sock {}/.cys/pack-dept-first /tmp/u10-state\n/tmp/last.sock {} /tmp/u10-state\n",
+                    root.display(),
+                    root.display()
+                ),
+                "부서 레인 팩 선택 또는 미설치 폴백이 틀렸다"
+            );
+            // 본부 팩 kill-switch 파일 → 부서 팩으로 전환하지 않는다(종전 정지 범위 유지).
+            std::fs::remove_file(root.join("seen")).unwrap();
+            std::fs::write(root.join("AUTOPILOT_PAUSED"), "").unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c").arg(&cmd).env_clear()
+                .env("HOME", &root).env("CYS_PACK_DIR", &root)
+                .env("PATH", &bin)
+                .output().unwrap();
+            assert_eq!(out.status.code(), Some(0));
+            let seen = std::fs::read_to_string(root.join("seen")).unwrap();
+            assert!(
+                seen.lines().all(|l| l.split(' ').nth(1) == Some(root.to_str().unwrap())),
+                "본부 kill-switch 중인데 부서 팩으로 전환했다(정지 우회): {seen}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// ★P8 — 승격 틱은 **좌석 신원 전부**를 지운 role-less 집행자로 돈다.

@@ -6376,6 +6376,69 @@ fn discover_claude_settings() -> Vec<String> {
         .collect()
 }
 
+/// ★U10(0.14.41) 각성 훅 경고의 **기대 팩 = 이 소켓 레인의 팩**(순수 · 소켓·env 팩 주입형).
+///
+/// 부서 소켓이면 그 부서 팩(`lane_pack_for_socket` — cys-dept `dept_pack` 과 같은 규칙), 그 밖(본부)
+/// 이면 env 팩(`pack_dir()`). 부서명을 유도하지 못하는 불량 부서 소켓은 env 팩으로 접는다(종전 거동).
+///
+/// ★리뷰1 m4: 이 doc 은 종전엔 `warn_if_awakening_hooks_missing` 의 doc 주석 **뒤**에 잘못 끼어들어
+/// (Rust doc 은 바로 다음 항목에 붙는다) 그 함수 자신이 무주석이 됐었다. 이 함수 고유의 결정 하나
+/// (기대 팩 선택)만 여기 남기고, 경고 함수의 doc 은 그 함수 바로 위로 되돌렸다.
+fn awakening_expected_pack(socket: &std::path::Path, env_pack: std::path::PathBuf) -> std::path::PathBuf {
+    if cys::is_dept_socket(socket) {
+        if let Some(lane) = cys::pack::lane_pack_for_socket(socket) {
+            // env 팩이 **같은 레인**(같은 `pack-dept-<부서>` 이름)이면 그 표기를 쓴다 — 부서 팩 경로는 cys-dept 가
+            // `$HOME` 으로 만들고(Git Bash HOME) 유도값은 `dirs::home_dir()`(Windows USERPROFILE)이라, 두 홈 표기가
+            // 다른 기계에서 같은 팩을 다른 팩으로 읽는 오탐을 막는다. 다른 레인(본부 팩 등)이면 레인 팩.
+            if env_pack.file_name().is_some() && env_pack.file_name() == lane.file_name() {
+                return env_pack;
+            }
+            return lane;
+        }
+    }
+    env_pack
+}
+
+/// ★U10(0.14.41) 부서 소켓인데 env 팩이 그 레인 팩이 아니면 **stderr 1줄만**(드러내기 · feed 0 · 부트 무영향).
+///
+/// 이 좌석의 지침·soul·MEMORY 는 env 팩에서 합성되므로(`compose_directive`) 어긋나면 다른 레인의 지침이
+/// 주입된 것이다(U10 반박 M1 — 편성이 본부 팩 env 로 돌던 경로). 원인은 cys-dept 편성 env 에서 고쳤고,
+/// 이 줄은 구 팩·다른 호출 경로가 남긴 재발을 로그(formation.log 등)에 남기는 관측점이다.
+/// 비교는 각성 훅과 같은 표기 정규화(윈도우 `C:\`·`C:/`·`/c/` 동일시)로 한다.
+fn note_lane_pack_mismatch(role: &str) {
+    let socket = cys::socket_path();
+    let env_pack = cys::pack::pack_dir();
+    let lane = awakening_expected_pack(&socket, env_pack.clone());
+    let norm = |p: &std::path::Path| {
+        cys::pack::normalize_hook_command_for_compare(&p.display().to_string(), cfg!(windows))
+    };
+    if norm(&lane) != norm(&env_pack) {
+        eprintln!(
+            "[launch-agent] ⚠ 레인 팩 불일치 — socket={} 의 레인 팩은 {} 인데 이 기동의 팩(CYS_PACK_DIR)은 {} \
+             (role={role}) — 지침·soul·MEMORY 가 다른 레인에서 합성됐다. 부서 좌석은 `cys-dept <부서> -- …` \
+             문맥(부서 팩)에서 띄워야 한다.",
+            socket.display(),
+            lane.display(),
+            env_pack.display()
+        );
+    }
+}
+
+/// ★리뷰1 m1: `awakening_expected_pack`(기대 팩 선택) + `pack::awakening_hooks_missing_in`(누락 계산)을
+/// 하나로 묶는 순수 함수 — 이 결합(경고 함수의 실제 배선)이 되돌려지는 뮤테이션(예: 기대 팩을 계산만
+/// 하고 실제 판정은 `pack_dir()`로 되돌리는 것)을 행동 검체로 잡기 위해 존재한다. 디스크·소켓을
+/// 읽지 않는다(호출자가 이미 읽은 값만 받는다) · `warn_if_awakening_hooks_missing` 의 유일한 판정 경로.
+fn awakening_missing_for(
+    socket: &std::path::Path,
+    env_pack: std::path::PathBuf,
+    settings_root: &Value,
+    windows: bool,
+) -> (std::path::PathBuf, Vec<&'static str>) {
+    let pack = awakening_expected_pack(socket, env_pack);
+    let missing = cys::pack::awakening_hooks_missing_in(settings_root, &pack, windows);
+    (pack, missing)
+}
+
 /// Claude Code settings.json에 **소망 훅 집합**(SessionStart + UserPromptSubmit)을 등록한다.
 ///
 /// ★W3 A9: 종전엔 SessionStart **하나만** 등록했다 — init-pack 을 거친 기계도 각성 훅
@@ -6392,8 +6455,11 @@ fn discover_claude_settings() -> Vec<String> {
 /// 왜: 노드는 정상 기동하지만 그 config 계급에 훅이 없으면 ①`/clear` 후 지침 재주입(SessionStart)과
 /// ②마스터 선언 부트 발화(UserPromptSubmit)가 **둘 다 사라진다**. 종전엔 어떤 채널에도 신호가 없어
 /// "떠 있는데 각성만 안 되는" 침묵 고장이었다(등록≠가동 갭 — A21 재검증).
-/// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다 —
-/// 같은 표면·같은 술어여야 두 채널의 보고가 갈리지 않는다.
+/// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다.
+/// ★리뷰1 m4 정정: "같은 표면·같은 술어여야"는 더 이상 맞지 않는다 — 매니페스트(훅 집합)는
+/// C28 과 같지만, **술어는 이번 U10 수정으로 갈라졌다**. 이 경고는 관측 전용이라 레인 팩 하나 +
+/// 표기 정규화(윈도우 `C:\`·`C:/`·`/c/` 동일시)로 완화했고, C28 과 `merge_desired_hooks` 등
+/// **집행 경로는 여전히 바이트 동등**을 엄격히 지킨다(설계가 승인한 의도적 분기 — U10 §3).
 /// 비치명: 경고만 하고 부트는 계속한다(위경고 모드·부트 봉쇄 회귀 금지 — 금지 방향 ③ 정신).
 fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: &str) {
     // claude 계열만 대상(agy·codex 는 Claude-config 노드가 아니다 — preflight discover 와 동일 규약).
@@ -6406,14 +6472,13 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .unwrap_or_else(|| json!({}));
-    let pack = cys::pack::pack_dir();
-    let missing: Vec<&str> = cys::pack::AWAKENING_HOOKS
-        .iter()
-        .filter(|h| {
-            !cys::pack::hook_registered_in(&root, h.event, &cys::pack::hook_command_for(&pack, h.script))
-        })
-        .map(|h| h.script)
-        .collect();
+    // ★U10(0.14.41): 기대값 = **이 소켓 레인의 팩 하나**(합집합 금지) · 비교 = 표기 정규화(관측 전용 —
+    //   집행 경로의 바이트 동등은 무변경). 종전엔 CLI 의 `pack_dir()`(편성 경로에서는 본부 팩)로 부서 계정
+    //   settings 를 대조해, 부서 팩 훅이 멀쩡히 등록된 부서 좌석마다 켤 때마다 hook-missing 오탐이 쌓였다.
+    //   ★리뷰1 m1: 기대 팩 선택과 누락 계산을 **잇는 선**(배선) 자체가 U10 오탐 제거의 실제 수정이라,
+    //   그 결합을 `awakening_missing_for` 순수 함수 하나로 뽑아 배선이 끊기는 뮤테이션을 행동으로 잡는다.
+    let (pack, missing) =
+        awakening_missing_for(&cys::socket_path(), cys::pack::pack_dir(), &root, cfg!(windows));
     if missing.is_empty() {
         return;
     }
@@ -6428,12 +6493,25 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
     let mismatch = install_target
         .as_deref()
         .and_then(|t| cys::pack::config_target_mismatch(Some(t), std::path::Path::new(cfg)));
-    let action = match &mismatch {
-        None => format!(
+    // ★U10: 부서 레인이면 처방도 부서 문맥(`cys-dept <부서> -- …` = 부서 소켓 + 부서 팩)으로 안내한다 —
+    //   본부 문맥의 같은 명령은 본부 팩·본부 설치 표적에 써서 이 경고를 해소하지 못한다(DD5).
+    let dept_ctx = pack
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("pack-dept-"))
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let action = match (&mismatch, &dept_ctx) {
+        (None, Some(d)) => format!(
+            "조치(부서 문맥): `cys-dept {d} -- python3 {}/bin/javis_preflight.py --fix`(C28) 또는 \
+             `cys-dept {d} -- cys init-pack`.",
+            pack.display()
+        ),
+        (None, None) => format!(
             "조치: `python3 {}/bin/javis_preflight.py --fix`(C28) 또는 `cys init-pack`.",
             pack.display()
         ),
-        Some((target, consumed)) => format!(
+        (Some((target, consumed)), _) => format!(
             "★이 상태에서는 `cys init-pack` 도 `javis_preflight.py --fix` 도 **이 경고를 해소하지 \
              못합니다** — 두 명령의 설치 표적은 {}(팩 위치에서 파생)인데, 이 노드가 실제로 읽는 \
              dir 는 {}({} 해소)라 서로 다른 폴더입니다. 조치: ①`cys doctor`(config-dir-target 항목)로 \
@@ -6457,6 +6535,43 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
         "feed.push",
         json!({"kind": "hook-missing", "title": "각성 훅 미등록(노드 기동)", "body": body}),
     );
+}
+
+/// ★U10(0.14.41 · D5/DD6) cycle-verify **자기 요청 종결 가드** — feed.push 성공 뒤의 모든 조기 반환
+/// (검증자 주입 실패 · 폴링 중 feed.list 실패 · 시간초과)에서 자기가 올린 항목을 비허가 결정
+/// [`CYCLE_VERIFY_ABORT_DECISION`] 으로 닫는다(종전: pending 으로 영구 잔존 → 배지 누적).
+///
+/// 계약: ①성공·판정 수신(Some 영수증) 경로에서만 `disarm` — 그 경로의 거동은 바이트 동일하다
+/// ②닫기는 best-effort(실패는 무시 — 반환 Err 문구·clear 판정 무변경 = 무clear 축 ② 무영향)
+/// ③결정은 `allow` 가 아니다 → 자기승인 가드(§3.2 `is_self_approval`)에 걸리지 않고 clear 를
+/// 열지도 않는다(clear 는 여전히 지정 검증자 allow + 영수증에서만). 늦게 온 검증자 응답은
+/// "item already resolved" — 이미 중단된 사이클이므로 올바르다.
+const CYCLE_VERIFY_ABORT_DECISION: &str = "cycle-timeout";
+
+struct CycleVerifyCloser<F: FnMut(&str, &str)> {
+    req_id: String,
+    armed: bool,
+    close: F,
+}
+
+impl<F: FnMut(&str, &str)> CycleVerifyCloser<F> {
+    fn new(req_id: String, close: F) -> Self {
+        let armed = !req_id.is_empty();
+        CycleVerifyCloser { req_id, armed, close }
+    }
+    /// 항목이 이미 종결됐거나(판정 수신) 성공 경로 — 더 닫을 것이 없다.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<F: FnMut(&str, &str)> Drop for CycleVerifyCloser<F> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            (self.close)(&self.req_id, CYCLE_VERIFY_ABORT_DECISION);
+        }
+    }
 }
 
 /// ★★M5(2026-08-24) — 각성 훅 **설치 표적 ≠ 실소비 SOT** 의 loud WARN(기동 1회).
@@ -16327,6 +16442,7 @@ fn run_launch_agent_opts(
         //   이 노드는 뜨지만 `/clear` 후 지침 재주입도, 마스터 선언 부트도 발화하지 않는다 —
         //   종전엔 그 사실이 어디에도 나타나지 않아 "노드는 살아있는데 각성만 안 되는" 침묵 고장이 됐다.
         warn_if_awakening_hooks_missing(recorded_cfg.as_deref(), role, agent);
+        note_lane_pack_mismatch(role); // ★U10: 레인 팩 어긋남 드러내기(stderr 1줄 · feed 0)
         let verdict = boot_agent_on_surface(
             sid,
             role,
@@ -18558,6 +18674,11 @@ fn run_cycle_agent(
                        "body": body, "surface_id": sid, "wait": false}),
             )?;
             let req_id = push["request_id"].as_str().unwrap_or("").to_string();
+            // ★U10(D5/DD6): 여기부터의 모든 조기 반환(주입 실패 · 폴링 중 feed.list 실패 · 시간초과)은 자기 요청을
+            //   비허가 결정으로 닫는다(best-effort) — 종전엔 pending 으로 영구 잔존했다. 판정 수신 분기에서만 해제.
+            let mut verify_closer = CycleVerifyCloser::new(req_id.clone(), |rid: &str, decision: &str| {
+                let _ = request("feed.reply", json!({"request_id": rid, "decision": decision}));
+            });
             inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
             // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
@@ -18582,13 +18703,21 @@ fn run_cycle_agent(
                     }
                 }
             };
+            // ★U10: Some(_) = 항목이 이미 resolved(판정 수신) — 더 닫을 것이 없다(두 분기 모두 가드 해제).
             match receipt {
-                Some(Ok(())) => eprintln!(
-                    "[cycle] 검증자 승인 — 영수증 확인(resolver=surface:{vsid}) → clear 진행"
-                ),
+                Some(Ok(())) => {
+                    verify_closer.disarm();
+                    eprintln!(
+                        "[cycle] 검증자 승인 — 영수증 확인(resolver=surface:{vsid}) → clear 진행"
+                    )
+                }
                 // 영수증 불충족(거부·구 데몬·비-pane 해소·제3자 스탬프) — 사유는 stderr 로
                 // 그대로 전파되고(run_cycle_agent 말미 eprintln) clear 는 실행되지 않는다.
-                Some(Err(e)) => return Err(e),
+                Some(Err(e)) => {
+                    verify_closer.disarm();
+                    return Err(e);
+                }
+                // ★U10: 가드가 drop 에서 자기 요청을 cycle-timeout 으로 닫는다(반환 문구 무변경).
                 None => return Err("검증자 응답 없음 (timeout) — clear 중단".into()),
             }
         } else {
@@ -36181,5 +36310,181 @@ mod d06_regression {
                 assert!(result.is_err(), "부서 팩 + 임의 소켓({socket})의 autostart 를 거부해야 한다");
             });
         }
+    }
+}
+
+/// ★U10(0.14.41) 켤 때마다 승인 알림 누적 — cys CLI 쪽 회귀 핀(레인 팩 기대값 · cycle-verify 자기 요청 종결 ·
+/// 부서 소켓 launch-agent 의 부서 팩 지침 합성).
+#[cfg(test)]
+mod u10_notice_lane {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn function_body<'a>(src: &'a str, anchor: &str) -> &'a str {
+        let start = src.find(anchor).expect("함수 앵커") + anchor.len();
+        let rest = &src[start..];
+        let end = ["\nfn ", "\nconst ", "\nstruct ", "\nimpl"]
+            .iter()
+            .filter_map(|b| rest.find(b))
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 기대 팩 = 소켓 레인의 팩 — 부서 소켓(unix 부모 dir · windows 파이프명)은 부서 팩, 본부는 env 팩.
+    #[test]
+    fn u10_expected_pack_is_lane_pack_for_dept_socket() {
+        let home = dirs::home_dir().expect("home");
+        let env_pack = std::path::PathBuf::from("/hq/.cys/pack");
+        let want = home.join(".cys").join("pack-dept-a");
+        let dept_unix = home.join(".local/state/cys-dept-a/cys.sock");
+        assert_eq!(awakening_expected_pack(&dept_unix, env_pack.clone()), want, "unix 부서 소켓");
+        let dept_pipe = std::path::Path::new(r"\\.\pipe\cys-dept-a");
+        assert_eq!(awakening_expected_pack(dept_pipe, env_pack.clone()), want, "windows 부서 파이프");
+        let base = home.join(".local/state/cys/cys.sock");
+        assert_eq!(awakening_expected_pack(&base, env_pack.clone()), env_pack, "본부 소켓 = env 팩(종전)");
+        let bad = std::path::Path::new("/x/cys-dept-/cys.sock");
+        assert_eq!(awakening_expected_pack(bad, env_pack.clone()), env_pack, "불량 부서 소켓 = env 팩(종전)");
+        // 같은 레인(같은 부서 팩 이름)의 env 팩은 그 표기를 쓴다(홈 표기 차이 오탐 방지) · 다른 부서 팩이면 레인 팩.
+        let same_lane = std::path::PathBuf::from("/other-home/.cys/pack-dept-a");
+        assert_eq!(awakening_expected_pack(&dept_unix, same_lane.clone()), same_lane, "같은 레인 env 팩");
+        let other_lane = std::path::PathBuf::from("/h/.cys/pack-dept-b");
+        assert_eq!(awakening_expected_pack(&dept_unix, other_lane), want, "다른 부서 팩 = 레인 팩");
+    }
+
+    /// 경고 판정부는 레인 팩 하나 + 표기 정규화 비교만 쓴다(바이트 비교·합집합 금지) — **소스 존재만**
+    /// 보는 약한 핀(리뷰1 m1 지적: 이 조건을 지키면서도 실제 판정을 `pack_dir()` 로 되돌리는 뮤테이션이
+    /// 통과했다). 배선 자체의 강한 핀은 아래 `u10_warn_wiring_uses_lane_pack_end_to_end`(행동 검체).
+    #[test]
+    fn u10_warn_uses_lane_pack_only_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = function_body(src, "\nfn warn_if_awakening_hooks_missing(");
+        assert!(body.contains("awakening_missing_for("), "레인 팩 결합 판정부(awakening_missing_for) 미사용");
+        assert!(!body.contains("hook_registered_in("), "본부 팩 바이트 비교 경로가 남았다");
+    }
+
+    /// ★리뷰1 m1 처방: `awakening_expected_pack`(기대 팩 선택)과 `awakening_hooks_missing_in`(누락 계산)을
+    /// **잇는 선**(`awakening_missing_for`)을 행동으로 잰다 — 소스 문자열 존재만 보는 위 핀은 그 결합
+    /// 자체가 끊기는 뮤테이션(예: 결합을 인라인하면서 판정 기준을 `pack_dir()` 로 되돌리는 것)을
+    /// 잡지 못했다.
+    ///   · 부서 소켓 + 본부 env 팩 + **부서 팩** 훅이 등록된 settings → 누락 0(레인 팩 기준 채택 확인).
+    ///   · 같은 조건에서 **본부 팩** 훅만 등록 → 누락 2(합집합으로 완화되지 않았음 확인 — U10 반박 DD1).
+    #[test]
+    fn u10_warn_wiring_uses_lane_pack_end_to_end() {
+        let home = dirs::home_dir().expect("home");
+        let dept_sock = home.join(".local/state/cys-dept-w1/cys.sock");
+        let dept_pack = home.join(".cys").join("pack-dept-w1");
+        let hub_pack = home.join(".cys").join("pack");
+        let settings_with = |registered: &std::path::Path| {
+            json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command",
+                        "command": cys::pack::hook_command_for(registered, "session-start.sh")}]}],
+                    "UserPromptSubmit": [{"hooks": [{"type": "command",
+                        "command": cys::pack::hook_command_for(registered, "role-bootstrap.sh")}]}]
+                }
+            })
+        };
+        let dept_settings = settings_with(&dept_pack);
+        let (pack1, missing1) =
+            awakening_missing_for(&dept_sock, hub_pack.clone(), &dept_settings, cfg!(windows));
+        assert_eq!(pack1, dept_pack, "기대 팩이 부서 팩으로 선택되지 않았다");
+        assert!(missing1.is_empty(), "부서 팩 훅이 등록됐는데 누락으로 잡혔다: {missing1:?}");
+
+        let hub_settings = settings_with(&hub_pack);
+        let (pack2, missing2) =
+            awakening_missing_for(&dept_sock, hub_pack.clone(), &hub_settings, cfg!(windows));
+        assert_eq!(pack2, dept_pack, "기대 팩 선택이 settings 내용에 흔들렸다");
+        assert_eq!(
+            missing2.len(),
+            2,
+            "본부 팩 훅만 등록됐는데 누락 0(뮤테이션 9 재발 — 판정이 pack_dir() 로 되돌아갔다): {missing2:?}"
+        );
+    }
+
+    /// ★기존 거동 고정 핀(U10 반박 M1 · 리뷰1 m3 재표기): env(CYS_SOCKET=부서 소켓 · CYS_PACK_DIR=부서 팩)를
+    /// **직접 주입**해 `boot_directive_for` 가 그 값을 존중하는지만 잰다 — RED 커밋(U10 변경 전)에서도
+    /// 통과하므로 U10 이 새로 만든 것(cys-dept → javis_formation → `_boot_node` 로 이어지는 env **상속**
+    /// 구간)은 재지 않는다. 그 상속 구간의 회귀 핀은
+    /// `cysjavis-pack/bin/tests/test_dept_notice_lane.py::FormationBootNodeEnvInheritance`
+    /// (cys-dept→javis_formation 홉) + `FormationLane.test_1_*`(편성→boot_node 홉)에 있다. 이 Rust 검체는
+    /// "env 가 이미 맞게 도착했다면 지침 합성은 그 env 를 그대로 존중한다"는 **다른**(여전히 유효한) 계약만
+    /// 지킨다.
+    #[test]
+    fn u10_dept_socket_launch_agent_composes_dept_pack_directive() {
+        let _env = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-u10-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let hq = td.join(".cys").join("pack");
+        let dept = td.join(".cys").join("pack-dept-u10");
+        for (p, mark) in [(&hq, "HQ-CEO-DIRECTIVE"), (&dept, "DEPT-CSO-DIRECTIVE")] {
+            std::fs::create_dir_all(p.join("directives")).unwrap();
+            std::fs::create_dir_all(p.join("memory")).unwrap();
+            std::fs::write(p.join("directives/CSO_DIRECTIVE.md"), format!("# {mark}\n")).unwrap();
+            std::fs::write(p.join("memory/MEMORY.md"), format!("{mark}-MEMORY\n")).unwrap();
+        }
+        let sock = td.join(".local/state/cys-dept-u10/cys.sock");
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &dept);
+        let _s = cys::pack::EnvGuard::set("CYS_SOCKET", &sock);
+        let out = boot_directive_for("cso", false).expect("compose");
+        let _ = std::fs::remove_dir_all(&td);
+        assert!(out.contains("DEPT-CSO-DIRECTIVE"), "부서 팩 지침 미합성");
+        assert!(out.contains("DEPT-CSO-DIRECTIVE-MEMORY"), "부서 팩 MEMORY 미합성");
+        assert!(!out.contains("HQ-CEO-DIRECTIVE"), "본부 팩 지침·기억이 부서 좌석에 샜다");
+    }
+
+    /// 가드 의미: 무장 상태로 drop(= ? 조기 반환·return Err) → 비허가 결정으로 1회 닫기 · disarm → 0회 ·
+    /// 빈 request_id(push 응답에 id 없음) → 0회.
+    #[test]
+    fn u10_cycle_verify_closer_closes_on_every_abort_path() {
+        let calls: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+        let rec = |r: &str, d: &str| calls.borrow_mut().push((r.to_string(), d.to_string()));
+        fn flow<F: FnMut(&str, &str)>(fail_at: u8, rec: F) -> Result<(), String> {
+            let mut g = CycleVerifyCloser::new("req-1".to_string(), rec);
+            if fail_at == 1 {
+                Err("inject_text 실패".to_string())?;
+            }
+            if fail_at == 2 {
+                Err("feed.list 실패".to_string())?;
+            }
+            if fail_at == 3 {
+                return Err("검증자 응답 없음 (timeout) — clear 중단".into());
+            }
+            g.disarm();
+            Ok(())
+        }
+        for fail_at in 1..=3u8 {
+            calls.borrow_mut().clear();
+            assert!(flow(fail_at, rec).is_err());
+            assert_eq!(
+                *calls.borrow(),
+                vec![("req-1".to_string(), CYCLE_VERIFY_ABORT_DECISION.to_string())],
+                "조기 반환 {fail_at} 에서 자기 요청을 닫지 않았다"
+            );
+        }
+        calls.borrow_mut().clear();
+        assert!(flow(0, rec).is_ok());
+        assert!(calls.borrow().is_empty(), "성공 경로에서 닫았다(거동 변경)");
+        {
+            let _g = CycleVerifyCloser::new(String::new(), rec);
+        }
+        assert!(calls.borrow().is_empty(), "빈 request_id 를 닫으려 했다");
+        assert_ne!(CYCLE_VERIFY_ABORT_DECISION, "allow", "자동 종결은 절대 allow 가 아니다");
+    }
+
+    /// 배선 핀: 가드는 push 직후(첫 조기 반환 지점인 검증자 주입 **전**) 무장되고, 영수증 수신 분기에서 해제된다.
+    #[test]
+    fn u10_cycle_agent_arms_closer_right_after_push_source_pin() {
+        let src = include_str!("cys.rs");
+        let push = src
+            .find(r#"json!({"kind": "cycle-verify","#)
+            .expect("cycle-verify push");
+        let rest = &src[push..];
+        let arm = rest.find("CycleVerifyCloser::new(").expect("가드 무장 부재");
+        let inject = rest.find("inject_text(vsid").expect("검증자 주입");
+        assert!(arm < inject, "가드가 검증자 주입보다 늦게 무장됐다(주입 실패 시 고아)");
+        let m = rest.find("match receipt {").expect("영수증 분기");
+        let arms = &rest[m..m + rest[m..].find("\n            }\n").expect("match 끝")];
+        assert!(arms.contains("disarm()"), "영수증 수신 분기에서 해제하지 않는다");
     }
 }

@@ -30,7 +30,12 @@ import {
   drainVerifyUnresponsiveLines,
   type DrainUnreachable,
 } from "./drainverify";
-import { classifyPendingFeed, CYCLE_VERIFY_NOTE, CYCLE_VERIFY_DISMISS_TITLE } from "./feedclass";
+import {
+  classifyPendingFeed,
+  CYCLE_VERIFY_NOTE,
+  CYCLE_VERIFY_DISMISS_TITLE,
+  feedCreatedToastTitle,
+} from "./feedclass";
 import {
   deptPlaceholderLabel,
   deptSlugOfSocket,
@@ -7323,7 +7328,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
     toast("watchdog", `🐕 ${name}`, detail);
   } else if (category === "feed") {
     if (name === "feed.item.created") {
-      toast("feed", "📥 승인 요청", String(payload.title ?? ""));
+      // ★U10(0.14.41): 정보성 kind(각성 훅·부트 실패·편성·CEO 알림 등)는 'ℹ 알림', 그 밖은 '📥 승인 요청'.
+      toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
       // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.

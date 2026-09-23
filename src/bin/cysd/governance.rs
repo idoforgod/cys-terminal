@@ -1548,7 +1548,7 @@ const ENV_GATE_SCAN: &str = "CYS_GATE_SCAN";
 /// 관문 feed 항목의 `kind`. approval 네임스페이스와 **다른 문자열**인 것이 오염 차단의 핵심이다
 /// — `has_pending_daemon_approval`·approval stale-clear 는 `kind == "approval"` 로 거르므로
 /// 두 스캐너의 생명주기가 서로를 종결시키지 않는다.
-const GATE_FEED_KIND: &str = "first_run_gate";
+pub(crate) const GATE_FEED_KIND: &str = "first_run_gate";
 
 /// 관문 격상 디바운스 창(초). approval 디바운스(60초)와 **같은 값·다른 축**이다.
 const GATE_SCAN_DEBOUNCE_SECS: f64 = 60.0;
@@ -2292,7 +2292,25 @@ fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::Hash
         (pend, st)
     };
     fired.retain(|id| pending_ids.contains(id)); // 해소된 항목 키 회수(맵 누수 차단)
+    if stalled.is_empty() {
+        return;
+    }
+    // ★U10(0.14.41 · D3c): 살아 있는 surface 의 항목에만 발화한다 — 고아(맵에 없음·exited·surface 미상)는
+    //   사람이 볼 화면이 없는 항목이라 '승인 방치' OS 배너·패널 가로채기가 켤 때마다 되풀이될 뿐이다.
+    //   ★락 규율: feed_items 락은 위 블록에서 이미 놓았다 — surfaces 락은 **따로** 잡고 곧바로 놓는다
+    //   (중첩 0 · watchdog 틱 계약 "락을 겹쳐 잡지 않는다"). 스냅샷은 id 집합뿐이다.
+    let live: std::collections::HashSet<u64> = daemon
+        .surfaces
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| !s.exited.load(Ordering::Relaxed))
+        .map(|s| s.id)
+        .collect();
     for (rid, title, age, sid) in stalled {
+        if !approval_stall_target_live(sid, &live) {
+            continue; // 고아 — 발화 0(재시작 정리 D3a 가 서빙 전에 닫는 것의 방어심화)
+        }
         if !fired.insert(rid.clone()) {
             continue; // 항목당 1회
         }
@@ -2304,6 +2322,11 @@ fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::Hash
                    "surface_ref": sid.map(cys::surface_ref)}),
         );
     }
+}
+
+/// ★U10(D3c) '승인 방치' 발화 대상 판정(순수) — surface 가 살아 있는 항목만. surface 미상(None)은 고아로 본다.
+fn approval_stall_target_live(sid: Option<u64>, live: &std::collections::HashSet<u64>) -> bool {
+    sid.map_or(false, |id| live.contains(&id))
 }
 
 /// L4 백로그 임계 에지 판정(순수) — 임계 이상으로 '처음' 넘어설 때만 true, 임계 미만으로
@@ -9977,8 +10000,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cys_stall_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        // ★U10(D3c): 발화 대상은 **살아 있는 surface** 의 항목뿐이다 — 실 PTY 좌석을 하나 띄워 맵에 올린다.
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let sid = s.id;
         let mut rx = daemon.bus.subscribe();
-        daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:7)", "b", Some(7));
+        daemon.push_feed_notification("approval", &format!("claude 승인 대기 감지 (surface:{sid})"), "b", Some(sid));
         // 인위 노화: created_at을 임계(기본 300s) 밖으로 이동
         {
             let mut items = daemon.feed_items.lock().unwrap();
@@ -9991,15 +10020,92 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             if ev["name"].as_str() == Some("approval.stalled") {
                 stalled_events += 1;
-                assert_eq!(ev["payload"]["surface_ref"].as_str(), Some("surface:7"));
+                assert_eq!(ev["payload"]["surface_ref"].as_str(), Some(format!("surface:{sid}").as_str()));
             }
         }
         assert_eq!(stalled_events, 1, "항목당 1회만 발화");
         // 해소 후 fired 집합 회수
-        let rid = daemon.pending_daemon_approvals(7).pop().unwrap();
+        let rid = daemon.pending_daemon_approvals(sid).pop().unwrap();
         daemon.resolve_feed_item(&rid, "allow");
         super::check_approval_stall(&daemon, &mut fired);
         assert!(fired.is_empty(), "해소 항목 키 회수");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★U10(D3c) 발화 대상 순수 판정 — 살아 있는 id 만 참 · surface 미상(None) = 고아.
+    #[test]
+    fn u10_approval_stall_target_live_table() {
+        let live: std::collections::HashSet<u64> = [3u64, 9].into_iter().collect();
+        assert!(super::approval_stall_target_live(Some(3), &live));
+        assert!(!super::approval_stall_target_live(Some(4), &live));
+        assert!(!super::approval_stall_target_live(None, &live));
+        assert!(!super::approval_stall_target_live(Some(3), &std::collections::HashSet::new()));
+    }
+
+    /// ★U10(D3c) exited 좌석의 승인 항목도 발화하지 않는다(맵에는 있으나 죽은 pane).
+    #[test]
+    fn u10_approval_stall_skips_exited_surface() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys_u10_stall_exited_{}_{}",
+            std::process::id(),
+            crate::state::now_epoch().to_bits()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join(format!("u10exited{}.sock", std::process::id())));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.exited.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut rx = daemon.bus.subscribe();
+        daemon.push_feed_notification("approval", "승인 대기 (exited)", "b", Some(s.id));
+        {
+            let mut items = daemon.feed_items.lock().unwrap();
+            items.last_mut().unwrap().created_at -= 400.0;
+        }
+        let mut fired = std::collections::HashSet::new();
+        super::check_approval_stall(&daemon, &mut fired);
+        let mut stalled = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("approval.stalled") {
+                stalled += 1;
+            }
+        }
+        assert_eq!(stalled, 0, "exited 좌석의 승인 항목이 '승인 방치' 를 울렸다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★U10(D3c) 고아 승인 항목(surface 가 맵에 없음 — 재시작 전 세대·이미 사라진 pane)은 '승인 방치'
+    /// (approval.stalled → UI 토스트 + OS 배너 + 패널 가로채기)를 울리지 않는다. 종전: watchdog 지역
+    /// 1회 집합이 데몬 수명마다 비어 **켤 때마다** 항목당 한 번씩 다시 울렸다.
+    #[test]
+    fn u10_approval_stall_skips_orphan_surface() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys_u10_stall_orphan_{}_{}",
+            std::process::id(),
+            crate::state::now_epoch().to_bits()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join(format!("u10orphan{}.sock", std::process::id())));
+        let mut rx = daemon.bus.subscribe();
+        daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:4242)", "b", Some(4242));
+        daemon.push_feed_notification("approval", "surface 미상 승인", "b", None);
+        {
+            let mut items = daemon.feed_items.lock().unwrap();
+            for it in items.iter_mut() {
+                it.created_at -= 400.0;
+            }
+        }
+        let mut fired = std::collections::HashSet::new();
+        super::check_approval_stall(&daemon, &mut fired);
+        super::check_approval_stall(&daemon, &mut fired);
+        let mut stalled = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("approval.stalled") {
+                stalled += 1;
+            }
+        }
+        assert_eq!(stalled, 0, "살아 있지 않은 surface 의 승인 항목이 '승인 방치' 를 울렸다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

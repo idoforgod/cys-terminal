@@ -146,8 +146,29 @@ dept_tombstone_remove(){
 #   _ensure_master_seat/_boot_node --cwd → cys launch-agent --cwd). 종전엔 --cwd 없이 불러 launch-agent 가 **호출자 cwd**
 #   (cys.rs run_launch_agent_opts: 미지정=호출 폴더)를 썼다 — 다른 프로젝트 폴더에서 cys-dept 를 부르면 시드는 $HOME,
 #   claude 는 그 폴더에서 떠 관문이 다시 열린다. cwd 빈값이면 종전 동작(미전달).
+# ★U10(0.14.41 · 반박 M1/DD1): 부서 소켓 편성은 **그 부서 팩**으로 돈다 — 종전엔 호출자(GUI·본부) env 의
+#   CYS_PACK_DIR(본부 팩)을 그대로 물려 javis_formation → javis_boot_node → `cys launch-agent` 가 부서 좌석에
+#   **본부 지침·soul·MEMORY**(CEO 로 승격된 본부면 CEO 지침)를 합성해 주입했고, 각성 훅 경고가 본부 팩 기준으로
+#   켤 때마다 오탐(hook-missing)을 쌓았다. 값은 launch_dept 가 cysd 에 싣는 것과 **같은 형식**(`dept_pack`)이라
+#   새 표기를 만들지 않는다(Windows 는 MSYS 가 네이티브 python 에 넘길 때 변환하는 기존 경로 그대로).
+#   ★부서 소켓일 때만(아래 소켓 대조) · 부서 팩이 아직 설치 전(boot_node 부재 = 부서 cysd 자동설치 실패/미도달)
+#   이면 **종전 팩으로 접는다** — 편성이 'javis_boot_node.py 부재' 로 실패해 부서 자가치유가 끊기는 방향을 막는다.
+#   CYS_STATE_DIR 는 건드리지 않는다(편성 싱글플라이트 락 루트 불변식 — javis_formation _state_root 주석).
+#   ★kill-switch 무약화: 편성은 `$PACK_DIR/AUTOPILOT_PAUSED` 를 본다(javis_formation paused_paths). 종전엔 호출자
+#   팩(본부)의 그 파일이 부서 편성도 멈췄다 — 호출자 팩에 그 파일이 있으면 env 를 바꾸지 않아 **종전 정지 범위를
+#   그대로** 유지한다(부서 팩 전환이 본부 kill-switch 를 우회하는 길 0). 부서 데몬 gate-check·_round 경로는 불변.
+#   stdout = 편성에 실을 팩(빈 줄 = env 무변경).
+formation_lane_pack(){  # $1=name $2=sock
+  local lp
+  lp="$(dept_pack "$1")"
+  if [ "$2" = "$(dept_sock "$1")" ] && [ -f "$lp/bin/javis_boot_node.py" ] \
+     && [ ! -e "${CYS_PACK_DIR:-$PACK_DEFAULT}/AUTOPILOT_PAUSED" ]; then
+    printf '%s\n' "$lp"
+  fi
+  return 0
+}
 formation_ensure_async(){
-  local name="$1" sock="$2" cwd="${3:-}" fm log logdir
+  local name="$1" sock="$2" cwd="${3:-}" fm log logdir lp lpnote
   fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
   if [ ! -f "$fm" ]; then
     echo "[cys-dept] WARN: $name 편성 ensure 생략(javis_formation.py 부재) — base 스케줄 심박이 후속 수렴" >&2
@@ -158,13 +179,24 @@ formation_ensure_async(){
   #   심박이 후속 수렴하므로 로그 소실은 저위험).
   logdir="$(dept_logdir "$name")"; log="$logdir/formation.log"
   mkdir -p "$logdir" 2>/dev/null || log=/dev/null
-  if [ -n "$cwd" ]; then
-    ( python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+  lp="$(formation_lane_pack "$name" "$sock")"
+  if [ -n "$lp" ]; then
+    lpnote="팩=부서 팩($lp)"
+    if [ -n "$cwd" ]; then
+      ( CYS_PACK_DIR="$lp" python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+    else
+      ( CYS_PACK_DIR="$lp" python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+    fi
   else
-    ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+    lpnote="팩=종전 팩(${CYS_PACK_DIR:-$PACK_DEFAULT} — 부서 팩 $(dept_pack "$name") 설치 전 또는 호출자 팩 kill-switch)"
+    if [ -n "$cwd" ]; then
+      ( python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+    else
+      ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+    fi
   fi
   disown 2>/dev/null || true
-  echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open · cwd=${cwd:-호출자}) — 로그: $log" >&2
+  echo "[cys-dept] $name 상비편성 ensure 착수(백그라운드·fail-open · cwd=${cwd:-호출자} · $lpnote) — 로그: $log" >&2
 }
 
 # ★기능2 프리미티브: 부서 state 디렉토리(대화기억 transcripts.db) 격리(mv→trash). down 기본 체인 뒤
@@ -1142,18 +1174,47 @@ if not ref:
 sys.exit(0 if ref.replace(b"\r\n", b"\n") in ceo.replace(b"\r\n", b"\n") else 1)
 PY
 }
+# ★U10(0.14.41): 승격 성공 = '보류/대기' 알림의 사유 소멸 → 그 제목의 pending 항목을 **비허가 결정**으로 닫는다.
+#   종전엔 승격이 끝나도 닫는 코드가 없어(cys-dept·GUI feed reply 0건) '📥 승인 요청' 으로 영구 잔존했다(U10 반박 M2).
+#   결정 = ceo-promoted(allow 아님 → §3.2 자기승인 가드 무관 · 승인 게이트 약화 0). 제목 완전일치만(무관 항목 무접촉) ·
+#   상한 20건(유계) · 조회 실패(데몬 미기동) = 무동작(fail-open — 다음 lifecycle·재시작 TTL 이 받는다).
+CEO_NOTICE_CLOSE_DECISION="ceo-promoted"
+ceo_notices_close(){
+  local ids id n=0
+  ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
+    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"){print $1}')" \
+    || return 0
+  for id in $ids; do
+    [ "$n" -lt 20 ] || break
+    env -u CYS_SOCKET "$CYS" feed reply "$id" "$CEO_NOTICE_CLOSE_DECISION" >/dev/null 2>&1 || true
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "[cys-dept] CEO 알림 ${n}건 종결(승격 완료 — decision=$CEO_NOTICE_CLOSE_DECISION)" >&2
+  return 0
+}
 ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자동 승격 알림 생략
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
-  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; return 0; }
+  # ★리뷰1 M1: '이미 승격됨'(md==ceo) 분기는 launch_dept 가 켤 때마다 통과하는 상시 경로다.
+  #   승격 성공 시 닫기는 종전엔 :1301(전이 성공 분기)에서만 돌아, 0.14.40 이하에서 이미
+  #   승격까지 끝난 기계에 쌓인 '보류/대기' 더미(구 kind=permission, 24h 만료 대상 아님)가
+  #   업그레이드 후에도 닫히는 경로 0개로 영구 잔존했다(재현: probe_already_promoted.py).
+  #   여기서도 부르면 켤 때마다(상시 경로) 돌아 20건 상한을 여러 번 넘겨 결국 전건 닫힌다.
+  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; ceo_notices_close; return 0; }
   if [ ! -f "$md.pre-ceo" ] && [ ! -f "$BOOT_MARKER" ]; then
     # PENDING: 부서 생성 자체는 성공 유지(return 0). 침묵 금지 — feed(비대기·보조)+stderr 고지,
     # GUI 상시 배지는 ceo-pending 파일 존재로 렌더(WP-2/T6). 해소=부트 ⑦ one-shot 또는 차기 lifecycle.
     mkdir -p "$(dirname "$CEO_PENDING")"
     printf 'pending since %s\n' "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$CEO_PENDING"
-    env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(부트 필요)" \
-      --body "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다." >/dev/null 2>&1 || true
+    # ★U10(0.14.41): 켤 때마다(GUI 가 부서마다 launch) 1건씩 쌓이던 경로 — 제목 완전일치 dedupe(A11 동형 ·
+    #   구 kind=permission 잔존 항목도 제목으로 잡는다) + kind=ceo-notice(**기존** --kind 플래그 — 구 바이너리도 앎 →
+    #   모르는 플래그 폴백 폭주 0). 조회 실패(데몬 미기동) = fail-open(종전대로 발행).
+    if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
+         | awk -F'\t' '$4=="CEO 승격 보류(부트 필요)"{found=1} END{exit !found}'; then
+      env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(부트 필요)" \
+        --body "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다." --kind ceo-notice >/dev/null 2>&1 || true
+    fi
     echo "[cys-dept] CEO 승격 보류(PENDING) — base master 미부트(.master-bootstrapped 부재)" >&2
     return 0
   fi
@@ -1248,7 +1309,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
       if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
            | awk -F'\t' '$4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"{found=1} END{exit !found}'; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(템플릿 상위집합 검사 실패)" \
-          --body "CEO_TEMPLATE.md 가 표준 MASTER_DIRECTIVE.md 전문(현행 md·vendor 신본 .new·백업 .pre-ceo 어느 쪽도)을 포함하지 않아 승격을 보류했습니다(스텁 교체 = 반쪽마스터 재발 경로 차단). 해소: ①스텁이면 팩 갱신 또는 gen_ceo_template.py 재합성 ②.pre-ceo 만 낡은 형상이면 .pre-ceo 를 현행 표준 전문으로 갱신 후 재시도 ③팩 업데이트 직후의 교차버전 형상(이미 CEO 로 승격된 기계는 MASTER_DIRECTIVE.md 가 user 소유라 갱신되지 않고 신본이 .new 로만 병치됩니다)이면 그 .new 실재를 확인하십시오 — 없으면 cys init-pack 으로 재생성. 승격 대기(PENDING)는 유지됩니다." >/dev/null 2>&1 || true
+          --body "CEO_TEMPLATE.md 가 표준 MASTER_DIRECTIVE.md 전문(현행 md·vendor 신본 .new·백업 .pre-ceo 어느 쪽도)을 포함하지 않아 승격을 보류했습니다(스텁 교체 = 반쪽마스터 재발 경로 차단). 해소: ①스텁이면 팩 갱신 또는 gen_ceo_template.py 재합성 ②.pre-ceo 만 낡은 형상이면 .pre-ceo 를 현행 표준 전문으로 갱신 후 재시도 ③팩 업데이트 직후의 교차버전 형상(이미 CEO 로 승격된 기계는 MASTER_DIRECTIVE.md 가 user 소유라 갱신되지 않고 신본이 .new 로만 병치됩니다)이면 그 .new 실재를 확인하십시오 — 없으면 cys init-pack 으로 재생성. 승격 대기(PENDING)는 유지됩니다." --kind ceo-notice >/dev/null 2>&1 || true
       fi
     else
       echo "[cys-dept] WARN: CEO 승격 스왑 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 디스크/권한 점검 후 재시도." >&2
@@ -1256,6 +1317,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     return 0
   fi
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
+  ceo_notices_close   # ★U10: 사유가 소멸한 '보류/대기' 알림을 닫는다(비허가 결정 · fail-open)
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
   if [ "$_auto" -eq 1 ]; then
@@ -1265,7 +1327,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
     #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 .pre-ceo
     #   백업을 복원한다(수동 강등 명령은 없음 — 환각 금지).
     env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 완료(자동)" \
-      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. 가역: 부서를 모두 정리해 0개가 되면 자동으로 표준 master로 강등(원복)됩니다(.pre-ceo 백업 복원)." >/dev/null 2>&1 \
+      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. 가역: 부서를 모두 정리해 0개가 되면 자동으로 표준 master로 강등(원복)됩니다(.pre-ceo 백업 복원)." --kind ceo-notice >/dev/null 2>&1 \
       || echo "[cys-dept] 승격 완료 알림 push 실패(데몬 미기동?) — 승격 자체는 완료됨" >&2
   fi
 }
@@ -1283,7 +1345,7 @@ ceo_demote(){
     if cmp -s "$md" "$ceo" 2>/dev/null || [ -f "$receipt" ]; then
       echo "[cys-dept] WARN: CEO 강등 불능 — 복원 백업(.pre-ceo) 부재(비가역 상태). preflight C03 안내(.pristine 재건/pack-merge)로 MASTER_DIRECTIVE.md 복원 필요" >&2
       env -u CYS_SOCKET "$CYS" feed push --title "CEO 강등 불능(.pre-ceo 부재)" \
-        --body "부서 0개 도달로 CEO 강등을 시도했으나 복원 백업(MASTER_DIRECTIVE.md.pre-ceo)이 없어 표준 master로 원복하지 못했습니다. preflight C03 안내에 따라 .pristine 재건 또는 pack-merge로 MASTER_DIRECTIVE.md를 복원하십시오." >/dev/null 2>&1 \
+        --body "부서 0개 도달로 CEO 강등을 시도했으나 복원 백업(MASTER_DIRECTIVE.md.pre-ceo)이 없어 표준 master로 원복하지 못했습니다. preflight C03 안내에 따라 .pristine 재건 또는 pack-merge로 MASTER_DIRECTIVE.md를 복원하십시오." --kind ceo-notice >/dev/null 2>&1 \
         || echo "[cys-dept] WARN: 강등 불능 알림 push 실패(데몬 미기동?) — 위 stderr 경보가 유일 흔적" >&2
     fi
     return 0
@@ -2304,9 +2366,12 @@ EOF
           # ★(0.14.41 U4 C2 ⑤) push 실패를 '발행' 으로 적지 않는다 — 종전 `|| true` 뒤 무조건
           #   "발행" 한 줄은 데몬 미기동·거부에서도 발행으로 보고됐다(boot-last ⑦ detail 에 거짓 기록).
           #   exit 0 은 유지(부트 ⑦ 무차단 · 다음 부트가 재발행). 실패 사실만 rc 와 함께 stderr 로.
+          # ★(0.14.41 U10 B1) --kind ceo-notice: 정보성 kind로 분류해 재시작 정리(stale-restart)·
+          #   토스트 제목('ℹ 알림') 분기가 이 알림을 승인형(approval)이 아니라 정보성으로 다룬다.
           _push_rc=0
           env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
-            --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." >/dev/null 2>&1 || _push_rc=$?
+            --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. 명령 팔레트의 'CEO 승격 진행' 또는 다음 부서 이벤트에서 자동 승격됩니다(제품 기본 정책)." \
+            --kind ceo-notice >/dev/null 2>&1 || _push_rc=$?
           if [ "$_push_rc" -eq 0 ]; then
             echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
           else

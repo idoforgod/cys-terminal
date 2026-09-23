@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   classifyPendingFeed,
   CYCLE_VERIFY_NOTE,
   CYCLE_VERIFY_DISMISS_TITLE,
+  feedCreatedToastTitle,
+  FEED_TOAST_APPROVAL_TITLE,
+  FEED_TOAST_NOTICE_TITLE,
+  NOTICE_FEED_KIND_PREFIXES,
+  NOTICE_FEED_KINDS,
 } from "./feedclass";
 
 describe("classifyPendingFeed — pending 조작면 분류(패널·팔레트 공용 단일 술어)", () => {
@@ -58,5 +64,40 @@ describe("cycle-verify 안내 문구 — 문자열 핀(기만·무고지 금지)
     expect(CYCLE_VERIFY_DISMISS_TITLE).toContain("판정이 아닙니다");
     expect(CYCLE_VERIFY_DISMISS_TITLE).toContain("dismissed");
     expect(CYCLE_VERIFY_DISMISS_TITLE).toContain("안전 중단");
+  });
+});
+
+// ★U10(0.14.41) 토스트 제목 분리 — 정보성 kind 는 'ℹ 알림', 그 밖(승인·결정성·미지)은 '📥 승인 요청'.
+describe("feedCreatedToastTitle — 정보성 알림 vs 승인 요청", () => {
+  test("정보성 kind(허용목록·formation-* 접두) → ℹ 알림", () => {
+    for (const k of ["hook-missing", "bootstrap-fail", "warn", "error", "formation", "ceo-notice",
+                     "formation-complete", "formation-partial", "formation-pending", "formation-failed"]) {
+      expect(feedCreatedToastTitle(k)).toBe(FEED_TOAST_NOTICE_TITLE);
+    }
+  });
+  test("승인·결정성·미지 kind → 📥 승인 요청(모르면 승인 쪽)", () => {
+    for (const k of ["permission", "approval", "first_run_gate", "cycle-verify", "learn_proposal",
+                     "mission-set", "ceo-promote-request", "question", "", "formationX", "Hook-Missing",
+                     undefined, null, 7]) {
+      expect(feedCreatedToastTitle(k)).toBe(FEED_TOAST_APPROVAL_TITLE);
+    }
+  });
+  test("데몬 정본(state.rs NOTICE_FEED_KINDS·PREFIXES)과 사본이 같다", () => {
+    const rs = readFileSync(new URL("../../src/bin/cysd/state.rs", import.meta.url), "utf-8");
+    const grab = (name: string): string[] => {
+      const m = rs.match(new RegExp("pub const " + name + ": &\\[&str\\] = &\\[([^\\]]*)\\]"));
+      expect(m).not.toBeNull();
+      return Array.from((m as RegExpMatchArray)[1].matchAll(/"([^"]*)"/g), (x) => x[1]);
+    };
+    expect([...grab("NOTICE_FEED_KINDS")].sort()).toEqual([...NOTICE_FEED_KINDS].sort());
+    expect([...grab("NOTICE_FEED_KIND_PREFIXES")].sort()).toEqual([...NOTICE_FEED_KIND_PREFIXES].sort());
+  });
+  test("main.ts 배선 — feed.item.created 토스트가 분류 함수를 쓴다(고정 '📥 승인 요청' 리터럴 제거)", () => {
+    const main = readFileSync(new URL("./main.ts", import.meta.url), "utf-8");
+    const at = main.indexOf('if (name === "feed.item.created") {');
+    expect(at).toBeGreaterThan(0);
+    const branch = main.slice(at, at + 400);
+    expect(branch).toContain("feedCreatedToastTitle(payload.kind)");
+    expect(branch).not.toContain('"📥 승인 요청"');
   });
 });
