@@ -4116,7 +4116,7 @@ def h_win_13():
          확정 수단). 게이트 자체의 실행 실패·시간초과는 U11 의 판정 대상이 아니므로 **기록만** 한다
          (릴리스 결박 레인을 이 항목 밖 사유로 세우지 않는다) — 가드(ⓐⓑ)가 무진입의 근거다."""
     probe = r'''
-import json, os, subprocess, sys, tempfile
+import json, os, shutil, subprocess, sys, tempfile
 sys.path.insert(0, sys.argv[1])
 import javis_bootstrap as B
 fleet = {"trips": [{"metric": "fleet_cpu_ratio", "level": "hard", "value": 1.3}],
@@ -4152,6 +4152,8 @@ if out["host"]:
                      "stderr_tail": (r.stderr or "")[-200:]})
     except Exception as e:
         real["error"] = "%s: %s" % (type(e).__name__, e)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)   # 리뷰1 사소 지적: hwin13-* 임시 디렉터리 미정리
     out["real"] = real
 print(json.dumps(out, ensure_ascii=False))
 '''
