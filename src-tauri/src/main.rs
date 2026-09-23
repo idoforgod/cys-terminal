@@ -11753,4 +11753,26 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         assert!(counted >= 10, "스캐너가 최상위 cfg 속성을 못 찾고 있다(counted={counted})");
     }
 
+    /// ★0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): GUI 가 올리는 관문 보류 처방(본부 마스터·부서장)은
+    /// **폴더신뢰(2.1.261+)와 면책 창 둘 다** 기본 선택이 `No, exit` 임을 경고해야 한다. 새 설치의 GUI 첫
+    /// 마스터가 바로 폴더신뢰 창을 만나는데, 종전 문안은 면책 창만 경고해 안내대로 Enter 를 누르면 마스터가
+    /// 죽었다. 문안만 바꾼다(동작 변경 0).
+    #[test]
+    fn u7_gate_pending_prescriptions_warn_folder_trust_and_disclaimer_both_no_exit() {
+        let src = include_str!("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        for anchor in ["\"마스터 pane 은 떴고", "\"부서장 pane 은 떴고"] {
+            let i = body.find(anchor).unwrap_or_else(|| panic!("처방 앵커 소실: {anchor}"));
+            let seg = &body[i..i + body[i..].find(".trim()").expect("처방 끝 경계")];
+            // 소스의 줄 잇기(`\` + 개행 + 들여쓰기)는 문자열에서 사라진다 — 공백을 접어 실제 문안으로 잰다.
+            let flat = seg.replace("\\\n", "").split_whitespace().collect::<Vec<_>>().join(" ");
+            for tok in ["폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Enter"] {
+                assert!(flat.contains(tok), "{anchor} 처방에 {tok:?} 가 없다: {flat}");
+            }
+            // 구 단독 경고(면책 창만) 문장이 남지 않았다 — 바늘은 이어 붙여 만든다(자기 매치 방지).
+            let old = ["★면책 창의 기본", " 선택은 `No, exit` 이라"].concat();
+            assert!(!flat.contains(&old), "{anchor}: 면책 창 단독 경고가 남았다");
+        }
+    }
+
 }

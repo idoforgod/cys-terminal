@@ -156,6 +156,11 @@ PRE_U24_REF = os.environ.get("CYS_HEALTH_PRE_U24_REF", "985093d")
 # W0 이 아니다(그 트리엔 H-WIN-7 자체가 없다) — 잘못된 기준의 '탐지 실패'는 탐지기 파손이 아니라
 # 기준 선택 오류이므로(러너 헤더 규약) 이 축만의 고정 해시를 따로 둔다.
 PRE_ISO_REF = os.environ.get("CYS_HEALTH_PRE_ISO_REF", "085041a")
+# 0.14.41 U7·U13(WP-C1) **이전** 트리 = v0.14.40 릴리스 커밋. H-WIN-13(Windows 신뢰 키 표기)·H-WIN-14(복원
+# 신호 역할 분기)의 계측 대조 기준이다 — 그 트리의 탐지 대상(역슬래시 키 · 역할 무관 '이어서 진행')이 이
+# 기준에서 FIRE 해야 신 코드의 PASS 가 의미를 갖는다. env 덮어쓰기를 두지 않는다(측정 핀 교체 스위치를
+# 새로 만들지 않는다 — MEASUREMENT_PIN_OVERRIDES 등재 대상이 늘지 않게).
+PRE_U13_REF = "126cfdd0"
 
 # ★U-0(2026-08-23 · 계측 타당성 복원) — `_read` 의 읽기 상한(문자 수).
 #   구 값 400,000자는 검체가 읽는 실제 파일보다 **작았다**. `f.read(limit)` 은 초과분을 말없이
@@ -4095,6 +4100,144 @@ def h_win_12():
              "System32 timeout 함정에서 BOOT_SNAPSHOT.md 미생성 — cys_timeout_run GNU 판별 회귀")
         need("BOOT_SNAPSHOT" in _read(snap), "스냅샷 본문 판독 불가: %r" % _read(snap)[:120])
     return "System32 스텁(timeout·gtimeout) 하 save-state exit 0 + BOOT_SNAPSHOT.md 실재"
+
+
+@specimen("H-WIN-13", "W6",
+          "Windows 폴더 신뢰 키 = Claude 표기(슬래시) · 시드 두 표기 · 이미 신뢰·갭 판정 슬래시 키(0.14.41 U7)",
+          ["U7-WIN-KEY", "U7-M7"])
+def h_win_13():
+    """0.14.41 U7(WP-C1 · 설계 §3 U7 · 조사 U7 §3 · 반박 R2/R4/M7): Claude Code 2.1.280 은 `.claude.json` 프로젝트 키를
+    `path.normalize` 뒤 `\\`→`/` 한 **슬래시 표기**로만 읽는다(20개 접근 지점 · 역슬래시 폴백 0). cys 는 Windows 에서
+    `os.path.abspath`(역슬래시)로 키를 만들어 ⓐ 사전 등록이 claude 에게 inert 였고 ⓑ 사람이 한 번 수락해 claude 가 슬래시
+    키를 써도 already-trusted·C58 이 역슬래시만 봐서 **영구 갭**이었다. 이 결함이 잠복한 이유는 trust 검체가 Windows
+    레인에 0건이었기 때문이다(반박 M7) — 이 검체는 windows-health 에서 실기로 돈다.
+      · 전 플랫폼: 순수 함수 진리표(ntpath 의미론) · 계획 두 표기 · 기존 역슬래시 항목 무접촉 · 슬래시 키 판정 ·
+        posix 계획 바이트 동일
+      · 실 시더(문서 부재 → link 경로 · 임시 config · 라이브 무접촉): Windows = 실 `os.path` 키가 슬래시·드라이브이고
+        두 표기가 착지 · POSIX = 단일 키(바이트 동일) · 2회차는 양쪽 다 already-trusted(무쓰기)
+    ★범위 고지(반박 R4): Windows 의 **기존** 문서는 원자 교환 기구가 없어 종전대로 REFUSE(exchange-unavailable)다 —
+      이 교정이 새로 닿는 것은 ①새 설정 폴더(새 설치·새 부서)의 사전 등록 ②사람이 수락한 뒤의 already-trusted·갭 판정이다."""
+    PF = _preflight_mod()
+    for fn in ("claude_key_nt", "_trust_key_aliases"):
+        need(hasattr(PF, fn), "javis_preflight.%s 부재 — U7 교정 미착지" % fn)
+    K = PF.claude_key_nt
+    table = ((r"C:\Users\x", "C:/Users/x"), ("C:\\Users\\x\\", "C:/Users/x"), (r"C:\a\..\b", "C:/b"),
+             (r"c:\users\x", "c:/users/x"), ("C:\\", "C:/"), (r"\\srv\share\d", "//srv/share/d"),
+             (r"C:/Users\x", "C:/Users/x"))
+    for raw, want in table:
+        need(K(raw) == want, "nt 키 표기 %r → %r (기대 %r — Claude V$ 표기)" % (raw, K(raw), want))
+    new, ch, used = PF.trust_plan({}, "C:/Users/x", os_name="nt")
+    need(ch and used == "C:/Users/x" and sorted(new.get("projects", {})) == ["C:/Users/x", "C:\\Users\\x"],
+         "nt 시드 계획이 두 표기(슬래시 주 키 + 역슬래시 별칭)가 아니다: %r" % new)
+    keep = {"projects": {"C:\\Users\\x": {"hasTrustDialogAccepted": False, "k": 1}}}
+    new2, _c2, _k2 = PF.trust_plan(keep, "C:/Users/x", os_name="nt")
+    need(new2["projects"]["C:\\Users\\x"] == {"hasTrustDialogAccepted": False, "k": 1},
+         "기존 역슬래시 항목을 건드렸다(덧붙이기만 계약 위반)")
+    need(not PF.trust_plan({"projects": {"C:/Users/x": {"hasTrustDialogAccepted": True}}}, "C:/Users/x",
+                           os_name="nt")[1], "슬래시 키가 이미 true 인데 쓰기 계획이 섰다(already-trusted 판정 키 오류)")
+    need(PF.trust_plan({"projects": {"C:\\Users\\x": {"hasTrustDialogAccepted": True}}}, "C:/Users/x",
+                       os_name="nt")[1], "역슬래시만 true(claude 가 안 읽는 키)를 신뢰로 인정했다 — 조용한 통과")
+    need(PF.trust_plan({}, "/w/a", os_name="posix")[0] == {"projects": {"/w/a": {"hasTrustDialogAccepted": True}}},
+         "posix 계획 바이트 변경(맥·리눅스 불변 계약 위반)")
+    notes = ["진리표 %d · 계획 두 표기 · 역슬래시 무접촉 · 슬래시 판정 · posix 동일" % len(table)]
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = os.path.join(tmp, "ws")
+        cfg = os.path.join(tmp, "cfg")
+        os.makedirs(ws, exist_ok=True)
+        key = PF.claude_project_key(ws)
+        rc, verdict, why = PF.seed_trust(cfg, ws)
+        need(rc == 0 and "seeded" in why, "실 시더 실패(문서 부재 경로): rc=%s %s %s" % (rc, verdict, why))
+        with open(os.path.join(cfg, ".claude.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        projs = sorted((doc.get("projects") or {}).keys())
+        need(PF._trusted_exact(doc, key), "claude 가 읽는 키(%r)에 신뢰가 없다: %r" % (key, projs))
+        rc2, _v2, why2 = PF.seed_trust(cfg, ws)
+        need(rc2 == 0 and "already-trusted" in why2, "2회차가 already-trusted(무쓰기)가 아니다: %s" % why2)
+        if os.name == "nt":
+            need("\\" not in key and re.match(r"^[A-Za-z]:/", key) is not None,
+                 "Windows 실 키가 Claude 표기(드라이브 + 슬래시)가 아니다: %r" % key)
+            need(projs == sorted([key, key.replace("/", "\\")]),
+                 "Windows 실 시드가 두 표기가 아니다: %r" % projs)
+            notes.append("Windows 실기: 키 %s · 두 표기 착지 · 2회차 already-trusted" % key)
+        else:
+            need(projs == [key], "POSIX 실 시드에 별칭 키가 생겼다(바이트 동일 위반): %r" % projs)
+            notes.append("POSIX 실 시드 단일 키 · 2회차 already-trusted (Windows 실기 = windows-health)")
+    # 계측 타당성 — 기준 트리의 nt 분기는 역슬래시(abspath) 키였다: 같은 탐지 술어가 거기서 FIRE 해야 한다.
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_preflight.py", ref=PRE_U13_REF)
+    if old is not None:
+        i = old.find("def claude_project_key(cwd):")
+        seg = old[i:old.find("physical = os.path.realpath(cwd)", i)] if i >= 0 else ""
+        need("return os.path.abspath(cwd)" in seg and "claude_key_nt(cwd)" not in seg,
+             "계측 타당성 실패: 기준 트리(%s)의 nt 분기에서 역슬래시 키를 재현하지 못한다" % PRE_U13_REF)
+        calib = "기준 %s nt 분기 = abspath(역슬래시) FIRE" % PRE_U13_REF
+    notes.append("계측검증=%s" % calib)
+    return " · ".join(notes)
+
+
+@specimen("H-WIN-14", "W6",
+          "SessionStart 복원 신호 역할 분기(착수 게이트 · 0.14.41 U13) — 팀원 중립·부서장 작업기억 비주입·lead 불변",
+          ["U13-START-GATE", "U13-M1", "U13-M2"])
+def h_win_14():
+    """0.14.41 U13(WP-C1 · 반박 M1/M2 · 설계 §3 U13): `inject-context.sh` 는 역할과 무관하게 모든 좌석에
+    '▶ 작업 계속(source=clear): 위 작업기억 이어서 진행.'·'▶ 복원 모드(…) … 미해결 게이트부터 재개.' 를 넣었고, 부서
+    레인에서는 부서장 SESSION_STATE('다음 액션' 큐)까지 팀원 좌석에 실었다 — 팀원에게 스스로 착수를 권하는 가장
+    직접적인 제품 문안이다. 이 훅은 Windows 에서도 `bash "…/inject-context.sh"` 로 상시 등록되므로(pack.rs
+    hook_command_for · SELFCORR_HOOKS) POSIX 전용 검체(test_inject_context_role_seat)가 닿지 않는 Git Bash 실기를
+    여기서 잰다. 역할은 env `CYS_ROLE` 로만 준다 — 신원(surface id)이 없으므로 데몬 조회 0(러너 호스트 무접촉)."""
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = os.path.join(tmp, "proj")
+        _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "HUB-GATE-MARKER\n", 0o644)
+        dept = os.path.join(tmp, "pack-dept-gate")
+        _w(os.path.join(dept, "round", "SESSION_STATE.md"), "DEPT-GATE-MARKER\n다음 액션: X 착수\n", 0o644)
+        nopack = os.path.join(tmp, "nopack")
+
+        def run(role, source, pack, hook=None):
+            env = _base_env({"HOME": os.path.join(tmp, "home"), "CYS_PACK_DIR": pack})
+            if role:
+                env["CYS_ROLE"] = role
+            return _run([BASH, hook or _hook("inject-context.sh")], env=env, cwd=tmp,
+                        input=json.dumps({"source": source, "cwd": proj}))
+
+        legacy_clear = "▶ 작업 계속(source=clear): 위 작업기억 이어서 진행."
+        for role, src in (("worker", "clear"), ("reviewer-codex", "startup"), ("worker-2", "resume")):
+            r = run(role, src, nopack)
+            need(r.returncode == 0, "%s/%s exit=%d %r" % (role, src, r.returncode, r.stderr[-200:]))
+            need("착수 게이트" in r.stdout, "%s/%s 에 착수 게이트 문안이 없다: %r" % (role, src, r.stdout[-300:]))
+            need("이어서 진행" not in r.stdout and "미해결 게이트부터 재개" not in r.stdout,
+                 "%s/%s 에 자율 착수 문안이 남았다" % (role, src))
+            need("HUB-GATE-MARKER" in r.stdout, "%s/%s 본부 작업기억 본문이 사라졌다(설계: 대체는 부서만)" % (role, src))
+        notes.append("팀원 3역할 중립")
+        for role, src, want in (("master", "clear", legacy_clear), ("cso", "startup", "미해결 게이트부터 재개.")):
+            r = run(role, src, nopack)
+            need(want in r.stdout and "착수 게이트" not in r.stdout, "lead %s/%s 종전 문안 변경: %r"
+                 % (role, src, r.stdout[-300:]))
+        notes.append("lead 종전 문안")
+        r = run("worker", "clear", dept)
+        need("DEPT-GATE-MARKER" not in r.stdout and "X 착수" not in r.stdout,
+             "부서 팀원에게 부서장 작업기억 본문이 실렸다: %r" % r.stdout[:300])
+        need("master 소관" in r.stdout, "부서 팀원 'master 소관' 안내 1줄 부재: %r" % r.stdout[:300])
+        r = run("master", "clear", dept)
+        need("DEPT-GATE-MARKER" in r.stdout, "부서장 자신의 작업기억이 사라졌다(복원 생명선)")
+        r = run(None, "clear", dept)
+        need("DEPT-GATE-MARKER" in r.stdout and "착수 게이트" in r.stdout,
+             "역할 미상 좌석: 본문 유지 + 중립 문안이 아니다: %r" % r.stdout[:300])
+        notes.append("부서: 팀원 비주입·부서장 유지·미상 유지")
+        # 계측 타당성 — 기준 트리의 훅(역할 무관 '이어서 진행')에 같은 픽스처를 돌리면 탐지기가 FIRE 해야 한다.
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh", ref=PRE_U13_REF)
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r0 = run("worker", "clear", nopack, hook=os.path.join(oldd, "inject-context.sh"))
+            need(legacy_clear in r0.stdout and "착수 게이트" not in r0.stdout,
+                 "계측 타당성 실패: 기준 트리(%s) 훅이 팀원에게 '이어서 진행' 을 내지 않는다 — 목이 결함을 "
+                 "재현하지 못한다: %r" % (PRE_U13_REF, r0.stdout[-300:]))
+            calib = "기준 %s 훅 팀원 '이어서 진행' FIRE" % PRE_U13_REF
+        notes.append("계측검증=%s" % calib)
+    return " · ".join(notes)
 
 
 # ── U-20: CLAUDE_CODE_GIT_BASH_PATH 배선 탐지기 ──────────────────────────────

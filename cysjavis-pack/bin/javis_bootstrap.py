@@ -3631,6 +3631,24 @@ def cmd_self_test():
         # ⓔ 선언 순서 = 실행 순서: 보류 단계는 busy 뒤·Degrade 앞이다.
         assert (STEP_INDEX[STEP.BOOT_BUSY] < STEP_INDEX[STEP.BOOT_GATE_PENDING]
                 < STEP_INDEX[STEP.BOOT_DEGRADE]), "④ 보류 단계 선언 순서 이탈"
+        # ⓕ ★0.14.41 U7(WP-C1 · 반박 M1 · 온보딩 치명): 2.1.261+ 는 **폴더신뢰 창도** 기본 포커스가
+        #   `No, exit` 다(첫기동 GUI 마스터가 바로 이 창을 만난다). 종전 문안은 면책 창만 경고해 사람이
+        #   안내대로 폴더신뢰 창에서 Enter 를 누르면 좌석이 죽었다. 사람용 처방 4곳이 **같은 한 문장**
+        #   (`_GATE_FOCUS_WARNING`)을 싣는지, 그리고 구 단독 경고가 남지 않았는지 잰다(동작 변경 0 · 문안만).
+        for _tok in ("폴더신뢰(2.1.261+)", "면책", "둘 다", "No, exit", "아래 방향키 1회 뒤 Return"):
+            assert _tok in _GATE_FOCUS_WARNING, "관문 기본 포커스 경고 문안에 %r 가 없다" % _tok
+        for _lbl, _txt in (("관문 보류 기본", _GATE_PENDING_PRESCRIPTION),
+                           ("화면 미관측", _GATE_REASON_PRESCRIPTION[GATE_REASON_RECHECK_UNOBSERVED]),
+                           ("입력창 증거 부재", _GATE_REASON_PRESCRIPTION[GATE_REASON_CARRY_UNPROVEN])):
+            assert _GATE_FOCUS_WARNING in _txt, "%s 처방이 폴더신뢰·면책 공통 경고를 싣지 않는다" % _lbl
+        # 부서장 폴백 보류 처방은 함수 안의 인라인 문안이라 소스로 잰다. ★바늘은 이어 붙여 만든다 —
+        #   리터럴 그대로 쓰면 이 검사문 자신이 매치돼 항진명제가 된다(계측 타당성).
+        with open(os.path.abspath(__file__), encoding="utf-8") as _f:
+            _src_u7 = _f.read()
+        assert ("% (name, " + "_GATE_FOCUS_WARNING") in _src_u7, \
+            "부서장 폴백 보류 처방이 공통 경고 상수를 싣지 않는다"
+        assert _src_u7.count("★면책 창의 기본 포커스는 " + "`No, exit` 이므로") == 0, \
+            "면책 창 단독 경고(폴더신뢰 누락 문안)가 남았다"
 
         # ── t4′: 러너 `cys boot-run` exit 파리티(부트 v2 명세 §4 · BUILD_PLAN A4) ──
         # ★무엇을 막는가: 명세가 러너 종료 대수에 13·14·15 를 새로 얹었는데 python 쪽에는 그

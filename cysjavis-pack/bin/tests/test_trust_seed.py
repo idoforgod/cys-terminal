@@ -6158,5 +6158,87 @@ class TriageConvergence(TriageP1WP2Trust):
                 self.assertEqual(got is not None, ok, (tmp, got))
 
 
+class U7WindowsClaudeKeyForm(unittest.TestCase):
+    """★0.14.41 U7(WP-C1 · 설계 §3 U7 · 조사 U7 §3 + 반박 R2/R4/M7): Windows 폴더 신뢰 키 표기 교정.
+
+    Claude Code 2.1.280 의 프로젝트 키 `V$` 는 `path.normalize` 뒤 `\\`→`/` 로 바꾼 **슬래시 표기**이고 20개 접근
+    지점 전부가 그 키만 읽는다(역슬래시 폴백·키 이주 0). cys 는 Windows 에서 `os.path.abspath`(역슬래시)로 키를
+    만들어 ⓐ 사전 등록이 claude 에게 inert 였고 ⓑ 사람이 한 번 수락해 claude 가 슬래시 키를 써도 already-trusted·C58
+    갭 판정이 역슬래시 키만 봐서 **영구 갭 WARN** 이었다. 교정: ① 키 = Claude 표기(슬래시) ② 시드는 두 표기 등록
+    (역슬래시 = 구 표기 호환 · 덧붙이기만 · 기존 역슬래시 항목 무접촉) ③ 이미 신뢰·갭 판정 = 슬래시 키 ④ 맥·리눅스 바이트
+    동일. 순수 함수는 ntpath 의미론이라 전 플랫폼에서 잰다 — Windows 실기(실 `os.path` + 실 시드)는 건강성 러너
+    H-WIN-13(windows-health)이 잰다. 드라이브 문자 대소문자는 **보존**한다(Claude 도 normalize 가 대소문자를
+    바꾸지 않는다 — 실 `process.cwd()` 의 드라이브 표기는 윈도우 실기 미측정 [가설] · WORKLOG 미결)."""
+
+    def test_nt_key_truth_table(self):
+        K = pf.claude_key_nt
+        for raw, want in ((r"C:\Users\x", "C:/Users/x"),
+                          ("C:\\Users\\x\\", "C:/Users/x"),              # 꼬리 구분자
+                          (r"C:\Users\x\..\y", "C:/Users/y"),            # `..` 정규화
+                          (r"C:\Users\.\x", "C:/Users/x"),
+                          (r"c:\users\x", "c:/users/x"),                 # 드라이브 대소문자 보존
+                          ("C:\\", "C:/"),                               # 드라이브 루트
+                          (r"C:/Users\x", "C:/Users/x"),                 # 혼합 구분자(Git Bash 인자 변환 산물)
+                          (r"\\srv\share\d", "//srv/share/d"),           # UNC
+                          ("C:\\사용자\\문서", "C:/사용자/문서")):         # 비 ASCII 홈
+            with self.subTest(raw=raw):
+                self.assertEqual(K(raw), want)
+                self.assertNotIn("\\", K(raw))
+
+    def test_nt_branch_of_project_key_uses_claude_form(self):
+        src = inspect.getsource(pf.claude_project_key)
+        nt = src[src.index('if os.name == "nt":'):src.index("physical = os.path.realpath(cwd)")]
+        self.assertIn("claude_key_nt(cwd)", nt, "Windows 분기가 Claude 표기 함수를 쓰지 않는다")
+        self.assertNotIn("return os.path.abspath(cwd)", nt, "구 역슬래시 키가 되살아났다")
+
+    def test_alias_is_legacy_backslash_form_on_nt_only(self):
+        A = pf._trust_key_aliases
+        self.assertEqual(A("C:/Users/x", os_name="nt"), ["C:\\Users\\x"])
+        self.assertEqual(A("//srv/share/d", os_name="nt"), ["\\\\srv\\share\\d"])
+        self.assertEqual(A("/w/a", os_name="posix"), [])
+        self.assertEqual(A("C:/Users/x", os_name="posix"), [], "맥·리눅스에 별칭이 새로 생겼다(바이트 동일 위반)")
+
+    def test_seed_plan_registers_both_forms_on_nt(self):
+        new, changed, used = pf.trust_plan({}, "C:/Users/x", os_name="nt")
+        self.assertTrue(changed)
+        self.assertEqual(used, "C:/Users/x", "주 키는 Claude 표기(슬래시)다")
+        self.assertEqual(new, {"projects": {"C:/Users/x": {"hasTrustDialogAccepted": True},
+                                            "C:\\Users\\x": {"hasTrustDialogAccepted": True}}})
+
+    def test_existing_backslash_entry_is_never_touched(self):
+        data = {"projects": {"C:\\Users\\x": {"hasTrustDialogAccepted": False, "allowedTools": ["a"]}}}
+        new, changed, _k = pf.trust_plan(data, "C:/Users/x", os_name="nt")
+        self.assertTrue(changed)
+        self.assertEqual(new["projects"]["C:\\Users\\x"], {"hasTrustDialogAccepted": False, "allowedTools": ["a"]})
+        self.assertIs(new["projects"]["C:/Users/x"]["hasTrustDialogAccepted"], True)
+        self.assertIs(data["projects"]["C:\\Users\\x"]["hasTrustDialogAccepted"], False, "입력 문서가 변경됐다(깊은 복사 위반)")
+        # 비-object 역슬래시 항목(명시 null)도 무접촉 · 예외 0 — 우리 주 키가 아니다(주 키의 손상 거부 규칙은 그대로)
+        new2, ch2, _k2 = pf.trust_plan({"projects": {"C:\\Users\\x": None}}, "C:/Users/x", os_name="nt")
+        self.assertTrue(ch2)
+        self.assertIsNone(new2["projects"]["C:\\Users\\x"])
+        with self.assertRaises(ValueError):
+            pf.trust_plan({"projects": {"C:/Users/x": None}}, "C:/Users/x", os_name="nt")
+
+    def test_already_trusted_and_gap_are_judged_by_slash_key(self):
+        # 슬래시 키 true = already-trusted(무쓰기) — 역슬래시 별칭이 없어도 그것을 덧붙이려고 쓰지 않는다
+        data = {"projects": {"C:/Users/x": {"hasTrustDialogAccepted": True}}}
+        new, changed, _k = pf.trust_plan(data, "C:/Users/x", os_name="nt")
+        self.assertFalse(changed)
+        self.assertEqual(new, data)
+        # 역슬래시만 true(구 cys 시드) = 갭 — claude 가 읽지 않는 키다(C58 이 조용히 통과시키던 형상)
+        data2 = {"projects": {"C:\\Users\\x": {"hasTrustDialogAccepted": True}}}
+        self.assertTrue(pf.trust_plan(data2, "C:/Users/x", os_name="nt")[1])
+        self.assertFalse(pf._trusted_exact(data2, "C:/Users/x"))
+
+    def test_posix_plan_is_byte_identical(self):
+        want = {"projects": {"/w/a": {"hasTrustDialogAccepted": True}}}
+        self.assertEqual(pf.trust_plan({}, "/w/a", os_name="posix")[0], want)
+        if os.name != "nt":
+            self.assertEqual(pf.trust_plan({}, "/w/a")[0], want, "기본(os.name) 경로에서 맥·리눅스 계획이 바뀌었다")
+            self.assertEqual(pf._planned_payload_bytes(os.path.join(tempfile.gettempdir(), "no-such-cfg-u7", ".claude.json"),
+                                                       "/w/a"),
+                             pf._serialize_payload(want)[0], "재계획 증명 payload 가 맥·리눅스에서 바뀌었다")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
