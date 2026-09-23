@@ -10,7 +10,15 @@
 #
 # ★증명하는 것 / 못 하는 것(과신 금지):
 #   증명 — cys-app 의 bin·bin test 와 그 의존(루트 cys-terminal lib 포함) Rust 코드 전부가 윈도우 cfg 로
-#          타입체크·린트를 통과한다.
+#          타입체크·린트를 통과한다. ★그리고 루트 크레이트(cys-terminal)의 --all-targets — lib test ·
+#          bin(cys·cysd) · bin test — 도 윈도우 cfg 로 검사한다(2026-09-23 · 아래 ★범위 확장).
+#
+# ★범위 확장(2026-09-23 · v0.14.41 태그 전): 종전 이 스크립트는 루트 lib 을 **cys-app 의 의존으로만**
+#   컴파일해 루트 크레이트의 #[cfg(test)] 코드와 cys·cysd bin 을 윈도우 cfg 로 한 번도 보지 않았다.
+#   그래서 src/macos_devtools.rs 테스트의 std::os::unix(런타임 `if !cfg!(unix)` 가드 — 컴파일은 된다)가
+#   로컬 rc=0 · 브랜치 ci-branch 초록을 지나 windows-health(run 35886871808) lib test 빌드에서야
+#   E0433/E0599 로 드러났다. '윈도우 컴파일 검사 통과' 라는 이름 아래 루트 테스트 코드가 조용히 빠져 있던
+#   것이다(U4 조용한 통과 계열). 이제 루트 lib test 가 검사되지 않으면 판정 2(계측 무효)다.
 #   못 함 — 링크·NSIS 번들·런타임 동작. C 코드(ring·sqlite)와 리소스 컴파일은 아래처럼 우회하므로 그건
 #          windows-build·release 레인(윈도우 실기)이 담당한다.
 #
@@ -62,6 +70,11 @@ chmod +x "$WORK/fake-windres"
 LINKS=$(cargo metadata --format-version 1 --manifest-path src-tauri/Cargo.toml --filter-platform "$TARGET" 2>"$WORK/metadata.err" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted({p["links"] for p in d["packages"] if p["name"] == "ring" and p.get("links")})))') \
   || { echo "win-typecheck: 판정 불가 — cargo metadata 실패" >&2; cat "$WORK/metadata.err" >&2; exit 2; }
+# 루트 크레이트 그래프의 ring links 도 합친다(루트 bin 만 쓰는 의존이 다른 ring 버전을 끌어올 수 있다).
+LINKS_ROOT=$(cargo metadata --format-version 1 --manifest-path Cargo.toml --filter-platform "$TARGET" 2>>"$WORK/metadata.err" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(sorted({p["links"] for p in d["packages"] if p["name"] == "ring" and p.get("links")})))') \
+  || { echo "win-typecheck: 판정 불가 — cargo metadata(루트) 실패" >&2; cat "$WORK/metadata.err" >&2; exit 2; }
+LINKS=$(printf '%s\n' $LINKS $LINKS_ROOT | sort -u | tr '\n' ' ')
 set --
 for l in $LINKS; do
   set -- "$@" --config "target.$TARGET.$l.rustc-link-lib=[]"
@@ -74,6 +87,10 @@ JSON="$WORK/cargo-messages.json"
 echo "win-typecheck: $TARGET · HEAD $(git rev-parse --short HEAD) · 미커밋 $(git status --porcelain | wc -l | tr -d ' ')건 · ring override: ${LINKS:-없음}"
 cargo check --target "$TARGET" --manifest-path src-tauri/Cargo.toml --all-targets "$@" --message-format=json >"$JSON" 2>"$WORK/cargo.stderr"
 RC=$?
+# ★범위 확장: 루트 크레이트 --all-targets(lib test · cys/cysd bin · bin test) — 같은 우회·같은 JSON.
+cargo check --target "$TARGET" --manifest-path Cargo.toml --all-targets "$@" --message-format=json >>"$JSON" 2>>"$WORK/cargo.stderr"
+RC_ROOT=$?
+[ "$RC" -ne 0 ] || RC=$RC_ROOT
 python3 - "$JSON" "$ROOT" "$RC" "$WORK/cargo.stderr" <<'PY'
 import json, os, sys
 
@@ -83,6 +100,7 @@ app = pre + "/src-tauri#"
 gha = os.environ.get("GITHUB_ACTIONS") == "true"
 arts, msgs = set(), []
 app_normal = app_test = False
+root_lib_test = False   # ★범위 확장 — 루트 크레이트 lib 의 test 프로필이 윈도우 cfg 로 실제 검사됐는가
 for line in open(path, encoding="utf-8", errors="replace"):
     try:
         d = json.loads(line)
@@ -99,6 +117,8 @@ for line in open(path, encoding="utf-8", errors="replace"):
         if pid.startswith(app):
             app_normal |= prof == "normal"
             app_test |= prof == "test"
+        elif pid.startswith(pre + "#") and prof == "test" and "lib" in tgt.get("kind", []):
+            root_lib_test = True
     elif d.get("reason") == "compiler-message":
         m = d.get("message", {})
         lvl, text = m.get("level"), m.get("message", "")
@@ -140,6 +160,11 @@ if not (app_normal and app_test):
     print("판정: 2 — cys-app 의 bin·bin test 가 검사되지 않았다(계측 무효 — 통과 아님)")
     if gha:
         print("::error title=win-typecheck 판정 불가::cys-app 타깃이 검사되지 않았다")
+    sys.exit(2)
+if not root_lib_test:
+    print("판정: 2 — 루트 크레이트(cys-terminal) lib test 가 윈도우 cfg 로 검사되지 않았다(계측 무효 — 통과 아님)")
+    if gha:
+        print("::error title=win-typecheck 판정 불가::루트 크레이트 lib test 가 검사되지 않았다")
     sys.exit(2)
 print("판정: 0 — 통과(윈도우 컴파일 오류 0)")
 PY
