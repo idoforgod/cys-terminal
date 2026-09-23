@@ -259,10 +259,14 @@ export function evenComb(nodes: LNode[], dir: "row" | "col"): LNode {
   return acc;
 }
 
-/** 새 컬럼을 균등 몫으로 덧붙인다(기존 컬럼끼리의 상대 비율 유지 · 새 컬럼 = 1/(n+1)). */
+/** 새 컬럼을 균등 몫으로 덧붙인다(기존 컬럼끼리의 상대 비율 유지 · 새 컬럼 = 1/(n+1)).
+ * ★F4(리뷰1 minor): 기존 쪽이 **구멍만**(n=0 — 전부 복원 대기 칸)이면 절반을 주지 않는다. 구멍은
+ * 접힐 예정이 아니라 기한 전까지는 화면에 보류 스피너로 보이므로(nodeShown), 절반을 주면 방금 붙는
+ * 충전 셸이 기억한 자리를 짓누른다(probe M: worker 0.25 → 0.125). 구멍 쪽을 넓게 두어(0.85) 결속되면
+ * 제 비율로 돌아온다(리뷰1 반박 제안 "오른쪽 끝, 좁게"). */
 function appendColumn(t: LNode, p: LNode): LNode {
   const n = colsVis(t);
-  return { type: "split", dir: "row", ratio: n > 0 ? n / (n + 1) : 0.5, a: t, b: p };
+  return { type: "split", dir: "row", ratio: n > 0 ? n / (n + 1) : 0.85, a: t, b: p };
 }
 /** 대표 컬럼 아래에 칸을 쌓는다(master:cso = 3:1, 그 뒤는 균등 몫). */
 function appendCell(t: LNode, p: LNode): LNode {
@@ -400,6 +404,15 @@ function sameMembers(before: LNode | null, after: unknown, added?: number): bool
   return got.length === want.size && got.every((s) => want.has(s));
 }
 
+// ★F6(리뷰1 minor): 손상 트리(sid 중복·ratio 0/1·깊이 초과)나 불변식 위반으로 이 탭이 legacyAppend
+// 종전 규칙(역할 기억 없음)에 **영구히·조용히** 떨어진 횟수. U4(조용한 통과 차단)와 같은 결 — 알림은
+// 호출측(main.ts) 몫이고, 여기는 **판독 가능한 신호 하나**만 낸다(부작용 0 · 전역 카운터일 뿐).
+const placeSeatFallbackState = { count: 0 };
+/** placeSeatSafe 가 legacyAppend 로 떨어진 누적 횟수(진단용). 전역. */
+export function placeSeatFallbackCount(): number {
+  return placeSeatFallbackState.count;
+}
+
 /**
  * placeSeat 의 안전 래퍼 — 예외·불변식 위반(sid 손실·중복·손상 트리) 이면 **종전 오른쪽 부착**으로.
  * 새 규칙이 틀려도 결과는 "예전처럼 절반" 으로만 떨어진다(③ 자가치유·④ 빈 칸 방어).
@@ -413,6 +426,7 @@ export function placeSeatSafe(tree: LNode | null, sid: number, roleOf: RoleOf, m
   } catch {
     /* 아래 종전 규칙 */
   }
+  placeSeatFallbackState.count++;
   return legacyAppend(tree, sid, safeRole(roleOf, sid));
 }
 
