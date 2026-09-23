@@ -502,7 +502,11 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
         } else unlisteners.push(un);
       })
       .catch(() => {
-        /* 구독 실패 — 파일 고르기·붙여넣기는 그대로 쓸 수 있다 */
+        // 구독 실패 — 창이 떠 있는 동안 pane 드롭 리스너는 가드로 빠지므로 드롭은 무시된다.
+        // 조용히 두지 않는다: 다른 첨부 방법을 창 안에 알린다.
+        if (name === "tauri://drag-drop" && !closedFlag) {
+          setStatus(`끌어다 놓기를 쓸 수 없습니다 — [파일 고르기] 또는 ${pasteKey} 붙여넣기를 써 주세요.`, "error");
+        }
       });
   };
   const unlistenAll = () => {
