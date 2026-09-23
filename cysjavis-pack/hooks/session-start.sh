@@ -21,7 +21,7 @@ JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 cys_ss_directive_absent() {   # $1=지침 위치 · $2=사유
   printf '■ 고지: 역할 지침을 주입하지 못했다(CYS_ROLE=%s) — 이 세션은 역할 지침 없이 시작됐다.\n' "${CYS_ROLE:-}"
   printf '  지침 위치: %s (%s)\n' "$1" "$2"
-  echo "  팩 설치 상태는 preflight C01(팩 폴더)·C02(지침 4종)가 판정한다(기본 팩 복구: \`cys init-pack\`)."
+  echo "  팩 설치 상태는 preflight C01(팩 폴더)·C02(지침 4종)가 판정한다."
 }
 if [ ! -d "$JARVIS_DIR" ]; then
   # 팩 폴더 부재(부서 팩 결손·재설치 중 — 레인 가드는 레인 팩이 없으면 그냥 통과시킨다). 고지는
