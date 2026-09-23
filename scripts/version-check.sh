@@ -23,6 +23,12 @@
 #   sh scripts/version-check.sh v0.4.1     # 그 값(태그)과도 일치 검사 (발행 직전 단언)
 #
 # 종료코드: 0=일치, 1=불일치(또는 추출 실패)
+#
+# ★추출 실패는 실패다(U4 C4-⑥ · 2026-09-23). 종전엔 8곳의 selector 가 **전부** 빗나가면(키·패키지
+#   개명 · 파일 이사) 빈 값 8개가 `sort -u` 로 1종이 되어 "✅ 8곳 일치: "(빈 버전) rc 0 이었다 —
+#   무인자 모드(release.yml workflow_dispatch·로컬)에서 그대로 통과한다. 이제 8값 각각이 버전
+#   형식(`N.N.N[.N][-+접미]`)이어야 하고, 하나라도 아니면 '추출 실패' 로 rc 1 이다.
+#   음성 대조: scripts/tests/test_version_sot_mutation.py E1(파일 부재)·E2(selector 전부 빗나감).
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -32,6 +38,8 @@ row() { printf '  %-30s %s\n' "$1" "$2"; }
 # `name = "…"` 다음 줄이 `version = "…"` 이므로 name 매치 후 첫 version 필드를 취한다.
 # 추출 실패(빈 문자열)는 아래 NUNIQ 비교에서 자동으로 불일치로 떨어진다(fail-closed).
 lockver() {
+  # 파일 부재는 set -e 무언 사망(rc 2 · 사유 0줄)이 아니라 빈 값 → 아래 '추출 실패' 로 사유를 낸다.
+  [ -f Cargo.lock ] || return 0
   awk -v pkg="$1" '
     $0 == "name = \"" pkg "\"" { f = 1; next }
     f && $1 == "version" { gsub(/[",]/, "", $3); print $3; exit }
@@ -48,15 +56,32 @@ V_LOCK_ROOT=$(lockver 'cys-terminal')
 V_LOCK_APP=$(lockver 'cys-app')
 
 echo "버전 SOT 8곳:"
-row "Cargo.toml"                "$V_CARGO"
-row "src-tauri/Cargo.toml"      "$V_TCARGO"
-row "src-tauri/tauri.conf.json" "$V_CONF"
-row "ui/package.json"           "$V_PKG"
-row "dist-win/cys.wxs"          "$V_WXS"
-row "dist-win/cys-x64.wxs"      "$V_WXS64"
+row "Cargo.toml"                "${V_CARGO:-<추출 실패>}"
+row "src-tauri/Cargo.toml"      "${V_TCARGO:-<추출 실패>}"
+row "src-tauri/tauri.conf.json" "${V_CONF:-<추출 실패>}"
+row "ui/package.json"           "${V_PKG:-<추출 실패>}"
+row "dist-win/cys.wxs"          "${V_WXS:-<추출 실패>}"
+row "dist-win/cys-x64.wxs"      "${V_WXS64:-<추출 실패>}"
 row "Cargo.lock [cys-terminal]" "${V_LOCK_ROOT:-<추출 실패>}"
 row "Cargo.lock [cys-app]"      "${V_LOCK_APP:-<추출 실패>}"
 echo ""
+
+# ★8값 각각의 형식 검사 — 빈 값뿐 아니라 selector 가 줄 전체를 흘린 경우(sed 미매치 = 원문 통과)도 잡는다.
+BAD=""
+check_ver() {
+  if ! printf '%s' "$2" | grep -Eq '^[0-9]+(\.[0-9]+){2,3}([-+][0-9A-Za-z.+-]+)?$'; then
+    BAD="$BAD
+   - $1: '${2}'"
+  fi
+}
+check_ver "Cargo.toml"                "$V_CARGO"
+check_ver "src-tauri/Cargo.toml"      "$V_TCARGO"
+check_ver "src-tauri/tauri.conf.json" "$V_CONF"
+check_ver "ui/package.json"           "$V_PKG"
+check_ver "dist-win/cys.wxs"          "$V_WXS"
+check_ver "dist-win/cys-x64.wxs"      "$V_WXS64"
+check_ver "Cargo.lock [cys-terminal]" "$V_LOCK_ROOT"
+check_ver "Cargo.lock [cys-app]"      "$V_LOCK_APP"
 
 NUNIQ=$(printf '%s\n' "$V_CARGO" "$V_TCARGO" "$V_CONF" "$V_PKG" "$V_WXS" "$V_WXS64" \
                       "$V_LOCK_ROOT" "$V_LOCK_APP" | sort -u | wc -l | tr -d ' ')
@@ -64,6 +89,10 @@ UNIQ=$(printf '%s\n' "$V_CARGO" "$V_TCARGO" "$V_CONF" "$V_PKG" "$V_WXS" "$V_WXS6
                      "$V_LOCK_ROOT" "$V_LOCK_APP" | sort -u | tr '\n' ' ')
 
 rc=0
+if [ -n "$BAD" ]; then
+  echo "❌ 버전 추출 실패 — 아래 SOT 의 버전을 읽지 못했다(파일 부재·키 개명·형식 변경). 읽지 못한 값끼리의 '일치' 는 근거가 아니다:$BAD"
+  rc=1
+fi
 if [ "$NUNIQ" != "1" ]; then
   echo "❌ 버전 불일치 — 8곳이 갈렸다: [ $UNIQ]"
   # Cargo.lock 만 갈렸으면 원인은 거의 항상 "범프 후 lock 미재생성"이다. 손편집 금지 —
@@ -74,7 +103,7 @@ if [ "$NUNIQ" != "1" ]; then
     echo "   ↳ 이걸 방치하면 x64·Windows 레그가 20분 뒤 --locked 에서 죽고 로그가 원인을 감춘다."
   fi
   rc=1
-else
+elif [ "$rc" -eq 0 ]; then
   echo "✅ 8곳 일치: $V_CARGO"
 fi
 
