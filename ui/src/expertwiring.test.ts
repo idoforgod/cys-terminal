@@ -49,7 +49,9 @@ function guardBeforeFirstAwait(name: string) {
   expect({ 함수: name, 가드: g >= 0, 첫_await: aw >= 0, 가드가_먼저: g >= 0 && aw >= 0 && g < aw, finally_해제: fin > g && b.indexOf("teamFlowBusy = false;", fin) > fin }).toEqual({
     함수: name, 가드: true, 첫_await: true, 가드가_먼저: true, finally_해제: true,
   });
-  expect(b.slice(0, g)).toContain("if (teamFlowBusy) return");
+  // 진행 중이면 조용히 끝내지 않는다 — 팔레트로 누르면 아무 반응이 없던 것(리뷰1 M4): 토스트 1줄 후 "busy".
+  const busy = b.slice(0, g);
+  expect({ 함수: name, 진행중_분기: /if \(teamFlowBusy\) \{\s*notifyTeamFlowBusy\(\);\s*return "busy";\s*\}/.test(busy) }).toEqual({ 함수: name, 진행중_분기: true });
 }
 
 describe("전문가용 칸 — 버튼 위치·기본 접힘", () => {
@@ -77,6 +79,11 @@ describe("전문가용 칸 — 버튼 위치·기본 접힘", () => {
   it("배선부에서 한 번 마운트된다(최상위 호출 · 예외 격리)", () => {
     const tops = enclosingFns("mountExpertSection();");
     expect(tops.includes("<top>")).toBe(true);
+    // ★예외 격리(리뷰1 V4): 최상위 호출이 `try {` 안이어야 한다 — 빼면 마운트 예외가 main.js 평가를 끊어 전 pane 백지(④).
+    expect(tops.filter((t) => t === "<top>").length).toBe(1);
+    expect(/\ntry \{\n\s*mountExpertSection\(\);\n\} catch/.test(code)).toBe(true);
+    const bare = code.split("\n").filter((l) => l === "mountExpertSection();");
+    expect({ 맨몸_최상위_호출: bare.length }).toEqual({ 맨몸_최상위_호출: 0 });
   });
   it("펼침 상태는 앱이 켜져 있는 동안만 기억(저장소 미사용 — 설계 D2)", () => {
     expect(fnBody("setExpertOpen").includes("localStorage")).toBe(false);
@@ -121,6 +128,26 @@ describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", 
     expect(b).toContain("deptLaunchInFlight");
     expect(b.includes("deptBtn.disabled) return")).toBe(false);
     expect(b.includes("disabled) return")).toBe(false);
+    expect(/\nlet deptLaunchInFlight = false;/.test(code)).toBe(true);
+    // ★세우고·푸는 자리(리뷰1 V3): 이름만 세면 `= true` 를 지워도(가드 소멸 → 중복 생성) finally 의 `= false` 를
+    //   지워도(두 번째 생성부터 영구 busy) 초록이었다. 검사 → 대입 → 첫 await, finally 안에서 해제를 못박는다.
+    const iChk = b.indexOf("if (deptLaunchInFlight) {");
+    const iSet = b.indexOf("deptLaunchInFlight = true;");
+    const iAw = b.indexOf("await ");
+    const iFin = b.indexOf("} finally {");
+    const iClr = b.indexOf("deptLaunchInFlight = false;");
+    const iAfter = b.indexOf("if (fallbackLegacy)");
+    expect({
+      검사가_대입보다_먼저: iChk >= 0 && iChk < iSet,
+      대입이_첫_await_보다_먼저: iSet >= 0 && iSet < iAw,
+      finally_안에서_해제: iFin > iAw && iClr > iFin && iClr < iAfter,
+    }).toEqual({ 검사가_대입보다_먼저: true, 대입이_첫_await_보다_먼저: true, finally_안에서_해제: true });
+  });
+  it("진행 중 알림은 토스트 1줄(리뷰1 M4 — 생성이 도는 동안 팔레트로 눌러도 반응이 있다)", () => {
+    const b = fnBody("notifyTeamFlowBusy");
+    expect(b).toContain('toast("watchdog", "팀 만들기 진행 중"');
+    const l = fnBody("launchDept");
+    expect(/if \(deptLaunchInFlight\) \{\s*notifyTeamFlowBusy\(\);\s*return "busy";\s*\}/.test(l)).toBe(true);
   });
   it("exit 3(카탈로그 부재)는 자동 생성하지 않고 새 대상 재확인 창을 거친다(F3)", () => {
     const b = fnBody("launchDept");
@@ -130,6 +157,8 @@ describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", 
     expect({ 재확인_문구: f >= 0, 확인창: c > f, 확인창이_먼저: c > f && l > c }).toEqual({
       재확인_문구: true, 확인창: true, 확인창이_먼저: true,
     });
+    // 재귀 1단 상한 — 번호 팀(catalogKey 없음)의 exit 3 은 다시 재확인하지 않는다(무한 확인 창 차단).
+    expect(b).toContain("code === 3 && catalogKey !== undefined");
   });
   it("복원 중(!started)이면 조용히 무시하지 않고 안내한다(F6) · 리셋/교대 중 차단", () => {
     const b = fnBody("openTeamCreateFlow");
@@ -148,6 +177,15 @@ describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", 
     const b = fnBody("openTeamCreateFlow");
     expect(b).toContain('rpcT(invoke("list_depts")');
     expect(b).toContain('rpcT(invoke("read_dept_catalog")');
+  });
+  it("옛 팔레트 이름('부서 워크스페이스 추가'·'＋부서')으로 찾아도 나온다(리뷰1 M6 — 옛 안내 문구가 남은 동안)", () => {
+    // 팔레트 검색은 title·subtitle·keywords 를 이은 문자열에 대한 서브시퀀스 매치(fuzzyScore)다 — 부분 문자열로
+    // 들어 있으면 반드시 매치된다. 에이전트·사용자 안내(cys.rs claim-role · javis_bootstrap.py)가 옛 이름을 가리킨다.
+    const i = code.indexOf('id: "act:dept"');
+    const seg = code.slice(i, code.indexOf("},", i) + 2);
+    const kw = /keywords: "([^"]*)"/.exec(seg);
+    expect(kw).not.toBeNull();
+    for (const old of ["부서 워크스페이스 추가", "＋부서"]) expect({ 옛이름: old, 있음: kw![1].includes(old) }).toEqual({ 옛이름: old, 있음: true });
   });
   it("메뉴 문구 '직접 입력(레거시 dept-N)'(입력칸 없음) 을 고쳤다", () => {
     expect(code.includes("직접 입력(레거시 dept-N)")).toBe(false);

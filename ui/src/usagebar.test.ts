@@ -16,6 +16,7 @@ import {
   pickPrimaryAccount,
   buildUsageBarModel,
   shouldFetchAccounts,
+  profileTail,
   USAGE_OTHERS_MAX,
   type AcctRow,
 } from "./usagebar";
@@ -148,6 +149,20 @@ describe("주 계정 — 관측 출처 기준(반박 D1) · 경로는 동률 해
     const never = acct({ account_id: "seat-never", profiles: [".cys/claude"], updated_at: null });
     expect(pickPrimaryAccount([never, a], NOW)?.account_id).toBe("cat");
   });
+  it("★좌석이 아닌 라이브 고사용 계정이 좌석 저사용 계정을 이긴다(좌석 우선으로 되돌리면 빨강 — 리뷰1 V2)", () => {
+    // 반박 D1 이 기각한 '좌석 경로 우선'으로 비교 순서를 바꿔도 종전 사례들은 초록이었다 — 정면 대결 사례.
+    const cat = acct({ account_id: "cat-hi", profiles: [".claude-2"], rate: [win("5h", 60)] });
+    const seat = acct({ account_id: "seat-lo", profiles: [".cys/claude"], rate: [win("5h", 10)] });
+    expect(pickPrimaryAccount([seat, cat], NOW)?.account_id).toBe("cat-hi");
+    expect(pickPrimaryAccount([cat, seat], NOW)?.account_id).toBe("cat-hi");
+    // 좌석이 더 최근에 관측됐어도(최신 관측도 5h 뒤의 동률 해소용) 5h 가 먼저다.
+    seat.updated_at = NOW - 1;
+    cat.updated_at = NOW - 600;
+    expect(pickPrimaryAccount([seat, cat], NOW)?.account_id).toBe("cat-hi");
+    // 윈도우 좌석 경로(역슬래시·절대경로)여도 같다.
+    const wseat = acct({ account_id: "wseat-lo", profiles: ["C:\\Users\\x\\.cys\\claude"], rate: [win("5h", 10)] });
+    expect(pickPrimaryAccount([wseat, cat], NOW)?.account_id).toBe("cat-hi");
+  });
   it("라이브끼리는 5h 사용률이 높은 쪽(한도 임박 경보 목적 · CC KPI '최고 사용 계정'과 같은 축)", () => {
     const lo = acct({ account_id: "lo", rate: [win("5h", 10), win("7d", 90)] });
     const hi = acct({ account_id: "hi", rate: [win("5h", 60), win("7d", 5)] });
@@ -183,6 +198,13 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(m.primary).toBeNull();
     expect(m.message).toContain("대기");
     expect(m.footer).toBe("");
+  });
+  it("대기 문구는 기한 없이 떠 있어도 참이다 — '화면 복원 뒤 표시' 같은 약속 금지(리뷰1 M8 · 반박 D5)", () => {
+    // start() 실패 경로에는 10초 틱이 없어 이 문구가 무기한 남을 수 있다. Control Center Live 는 force 조회라 그 경로에서도 된다.
+    const m = buildUsageBarModel([], NOW, { everOk: false, failStreak: 0, okAtSec: null }, noRedact);
+    expect(m.message.includes("복원 뒤")).toBe(false);
+    expect(m.message.includes("표시됩니다")).toBe(false);
+    expect(m.message).toContain("Control Center");
   });
   it("조회 성공·계정 0 → '아직 관측된 사용량 없음'", () => {
     const m = buildUsageBarModel([], NOW, ok, noRedact);
@@ -229,6 +251,37 @@ describe("패널 모델 — 정직한 공백", () => {
     const plain = buildUsageBarModel([a], NOW, ok, noRedact);
     expect(plain.primary!.tooltip).toContain("boss@corp.example");
     expect(plain.primary!.label.includes("@")).toBe(false);
+  });
+  it("🔒 가림이면 툴팁의 설정 폴더도 끝 이름만 — 윈도우 절대경로의 OS 사용자명 비노출(리뷰1 M9)", () => {
+    const a = acct({
+      account_id: "acc-uuid-77",
+      label: "",
+      profiles: ["C:\\Users\\bob\\.cys\\claude", "/Users/bob/.claude-2", "C:/Users/bob/.cys/claude"],
+      rate: [win("5h", 5)],
+    });
+    const red = buildUsageBarModel([a], NOW, ok, (s) => `#${s.length}`, true).primary!.tooltip;
+    expect(red.includes("bob")).toBe(false);
+    expect(red.includes("Users")).toBe(false);
+    const folders = red.split("\n").find((l) => l.startsWith("설정 폴더:"))!;
+    expect(folders).toBe("설정 폴더: .claude-2, .cys/claude"); // 가린 뒤에도 중복은 접는다
+    // 라벨이 비면 account_id 가 신원 줄에 나온다 — 그것도 가림 함수를 거친다(CC 계정 섹션과 같은 규칙).
+    expect(red.includes("acc-uuid-77")).toBe(false);
+    const plain = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
+    expect(plain).toContain("C:/Users/bob/.cys/claude"); // 가림을 끄면 정규화한 원래 경로
+    expect(plain).toContain("acc-uuid-77");
+    // 다른 계정 줄의 툴팁도 같은 규칙.
+    const other = acct({ account_id: "o2", profiles: ["/home/alice/.claude-9"], rate: [win("5h", 1)] });
+    const m = buildUsageBarModel([a, other], NOW, ok, (s) => `#${s.length}`, true);
+    const tips = [m.primary!.tooltip, ...m.others.map((o) => o.tooltip)].join("\n");
+    expect(tips.includes("alice")).toBe(false);
+    expect(tips).toContain(".claude-9");
+  });
+  it("profileTail — 좌석·부서 폴더는 `.cys/<이름>`, 그 밖은 끝 이름", () => {
+    expect(profileTail("C:\\Users\\bob\\.cys\\claude")).toBe(".cys/claude");
+    expect(profileTail("/Users/bob/.cys/claude-sales/")).toBe(".cys/claude-sales");
+    expect(profileTail("/Users/bob/.claude-4")).toBe(".claude-4");
+    expect(profileTail(".claude-1")).toBe(".claude-1");
+    expect(profileTail("")).toBe("");
   });
   it("툴팁은 집계 범위를 정직하게 적는다(기본 claude·외부 터미널은 빠진다 — 반박 §5-8)", () => {
     const a = acct({ rate: [win("5h", 5)] });

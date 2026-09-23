@@ -73,6 +73,12 @@ describe("사이드바 바닥 공용 꼬리 컨테이너(#wsbar-foot) — A2·A3
     expect(foot![1]).toContain("overflow-y: auto");
     expect(foot![1]).toContain("min-height: 0");
   });
+  it("피드백 단추(A3)는 꼬리 여백 안에서 가로 여백을 걷는다 — 사용량·전문가용과 같은 선(리뷰1 M11 · 이중 들여쓰기 차단)", () => {
+    const flat = css.replace(/\s+/g, " ");
+    const r = /#wsbar-feedback-slot > #btn-feedback \{([^}]*)\}/.exec(flat);
+    expect(r).not.toBeNull();
+    for (const decl of ["margin-left: 0", "margin-right: 0", "width: 100%"]) expect(r![1]).toContain(decl);
+  });
 });
 
 describe("사용량 조회 — 공유 fetcher 하나 · in-flight 가드 · 전용 상한", () => {
@@ -85,6 +91,34 @@ describe("사용량 조회 — 공유 fetcher 하나 · in-flight 가드 · 전�
     const b = fnBody("refreshAccountsShared");
     for (const needle of ["claimFlight(", "releaseFlightWhenSettled(", "rpcT(", "T_ACCT", "shouldFetchAccounts("])
       expect({ 배선: needle, 있음: b.includes(needle) }).toEqual({ 배선: needle, 있음: true });
+    // ★순서(리뷰1 V1): 이름만 세면 `if (!go) return;` 을 지워도(부팅 유예·30초 간격·이벤트 폭주 방어가 통째로
+    //   사라짐) 초록이었다. 판정 → 판정 결과로 반환 → in-flight 획득 → 시도 시각 기록 → 호출 순서를 못박는다.
+    const at = (s: string) => b.indexOf(s);
+    const seq = [
+      "if (started && acctStartedAtMs === null) acctStartedAtMs = now;", // 유예 앵커 — 없으면 사이드바 조회 영구 0회
+      "const go = shouldFetchAccounts(now,",
+      "if (!go) return;",
+      "if (!claimFlight(ACCT_FLIGHT_KEY)) return;",
+      "acctLastAttemptAtMs = now;",
+      'invoke("usage_accounts_all")',
+    ];
+    const pos = seq.map(at);
+    expect({ 위치: seq.map((s, i) => [s, pos[i] >= 0]) }).toEqual({ 위치: seq.map((s) => [s, true]) });
+    expect({ 순서대로: pos.every((p, i) => i === 0 || pos[i - 1] < p) }).toEqual({ 순서대로: true });
+  });
+  it("스로틀 판정에 실제 상태를 넘긴다(상수·null 로 바꿔치면 조회가 영구 0회 또는 무제한 — 리뷰1 V1)", () => {
+    const b = fnBody("refreshAccountsShared");
+    const gate = b.slice(b.indexOf("shouldFetchAccounts("), b.indexOf("});", b.indexOf("shouldFetchAccounts(")));
+    for (const needle of ["started,", "startedAtMs: acctStartedAtMs,", "lastAttemptAtMs: acctLastAttemptAtMs,", "force,", "graceMs: ACCT_BOOT_GRACE_MS,", "minIntervalMs: ACCT_SIDEBAR_MIN_MS,"])
+      expect({ 인자: needle, 있음: gate.includes(needle) }).toEqual({ 인자: needle, 있음: true });
+  });
+  it("성공하면 연속 실패를 0 으로, 실패하면 +1 — '데몬 응답 없음'이 한 번 뜨면 영영 남는 되돌림 차단", () => {
+    const b = fnBody("refreshAccountsShared");
+    const iRpc = b.indexOf("await rpcT(call, T_ACCT)");
+    const iOk = b.indexOf("acctFailStreak = 0;");
+    const iCatch = b.indexOf("catch", iRpc);
+    const iInc = b.indexOf("acctFailStreak++", iCatch);
+    expect({ 성공_리셋: iOk > iRpc && iOk < iCatch, 실패_증가: iInc > iCatch }).toEqual({ 성공_리셋: true, 실패_증가: true });
   });
   it("T_ACCT 는 winScaled 명명 상수(넘기면 무엇이 일어나는지 주석)", () => {
     expect(/const T_ACCT = winScaled\(\d[\d_]*\);/.test(code)).toBe(true);
@@ -142,6 +176,30 @@ describe("사용량 렌더 — 백지(④) 차단", () => {
   });
   it("렌더는 스스로 오류를 삼킨다(표시 전용 — 호출측 틱으로 새지 않는다)", () => {
     expect(fnBody("renderUsageBar")).toContain("catch");
+  });
+  it("본문 모델이 직전과 같으면 본문을 다시 만들지 않는다(이벤트 구동 재렌더에 호버 툴팁이 사라지지 않게 — 리뷰1 M5)", () => {
+    const b = fnBody("renderUsageBar");
+    const iReset = b.indexOf('usageBodySig = "";'); // 머리·본문을 새로 만들면 반드시 다시 그린다
+    const iSig = b.indexOf("const sig = JSON.stringify(model);");
+    const iSkip = b.indexOf("if (sig === usageBodySig) return;");
+    const iRebuild = b.indexOf("body.replaceChildren(");
+    const iStore = b.indexOf("usageBodySig = sig;");
+    expect({ 새칸_초기화: iReset >= 0 && iReset < iSig, 비교가_재구성보다_먼저: iSig >= 0 && iSig < iSkip && iSkip < iRebuild, 재구성_뒤_기록: iStore > iRebuild }).toEqual({
+      새칸_초기화: true, 비교가_재구성보다_먼저: true, 재구성_뒤_기록: true,
+    });
+    // 선언은 초기 렌더(배선부 최상위 호출)보다 앞 — TDZ 면 renderUsageBar 가 catch 로 삼켜 패널이 빈 채로 남는다.
+    const decl = code.indexOf('let usageBodySig = "";');
+    const firstTop = code.indexOf("\nrenderUsageBar();");
+    expect({ 선언: decl >= 0, 선언이_먼저: decl >= 0 && decl < firstTop }).toEqual({ 선언: true, 선언이_먼저: true });
+  });
+  it("최상위 접힘 판독(localStorage)은 try 안 — 저장소 차단이 main.js 평가를 끊지 않게(④)", () => {
+    expect(/\ntry \{\n\s*usageCollapsed = localStorage\.getItem\(USAGE_COLLAPSED_KEY\) === "1";\n\} catch/.test(code)).toBe(true);
+  });
+  it("🔒 가림 상태를 모델에 넘긴다(툴팁의 설정 폴더 경로도 가린다 — 리뷰1 M9)", () => {
+    const b = fnBody("renderUsageBar");
+    const call = b.slice(b.indexOf("buildUsageBarModel("), b.indexOf(");", b.indexOf("ccAcctLabel,")) + 2);
+    expect(call).toContain("ccAcctLabel,");
+    expect(call).toContain("ccAcctRedact");
   });
   it("초기 렌더는 start() 와 무관한 배선부에서 1회(복원 중·start 실패에도 빈 섹션이 남지 않게 — 반박 D4·D5)", () => {
     const at = src.indexOf("// ---------- ui wiring ----------");
