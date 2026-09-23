@@ -11482,6 +11482,32 @@ mod tests {
         assert_eq!(draft_gate_verdict(DirectSendKind::Text, 0, 0, None, false, false), None);
     }
 
+    /// ★(0.14.41 · U8 P1 · 반박 X2) Text 팔에만 **현재 화면 모달 축**이 있다 — 질문·선택 창(AskUserQuestion·
+    /// 권한 창)이 전경이면 직접 send 는 본문을 쓰지 않고 거부한다(CLI 가 본문 전체를 `--queued` 로 1회 넘기고,
+    /// 큐 배달 게이트가 같은 술어로 모달이 닫힌 뒤 배달한다). 술어는 큐 게이트와 **같은 것**이다
+    /// (`readiness::modal_foreground` ∨ `selector_row` — 판정 분리 금지). SubmitKey·ClearFirst·CancelKey 는
+    /// 무변경이다(승인 대기 중 master 의 Return 허용 설계 · cycle `/clear` 보존 = ② 무clear 금지선).
+    #[test]
+    fn u8_p1_text_arm_holds_on_a_foreground_modal_source_pin() {
+        let src = include_str!("governance.rs");
+        let body = src
+            .split("\npub(crate) fn draft_gate(")
+            .nth(1)
+            .expect("draft_gate 소실")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let modal_at = body.find("draft_gate_modal_verdict(").expect("draft_gate 가 모달 축을 부르지 않는다");
+        let screen_at = body
+            .find("draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)")
+            .expect("화면 축 판정");
+        assert!(modal_at < screen_at, "모달 축이 화면 점유 축보다 뒤다(선택기 행이 먼저 통과된다)");
+        assert!(
+            body.contains("cys::readiness::modal_foreground("),
+            "모달 축이 큐 게이트와 같은 술어(modal_foreground)를 쓰지 않는다"
+        );
+    }
+
     #[test]
     fn d12_verdict_submit_key_human_draft_denied() {
         let denied = DraftGateDenied::HumanDraft { bytes: 3 };

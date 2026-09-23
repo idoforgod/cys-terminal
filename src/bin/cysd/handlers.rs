@@ -13504,6 +13504,48 @@ mod tests {
         assert_eq!(*draft_after, (0, 0, 0), "화면 초안 거부도 계수 불변");
     }
 
+    /// ★(0.14.41 · U8 P1 · 반박 X2) 질문·선택 창(모달)이 전경인 좌석에는 직접 **본문**을 쓰지 않는다 —
+    /// 종전 Text 팔은 선택기 행이면 화면 축을 건너뛰어, 감독자 지시가 AskUserQuestion 위에 타이핑되고 조용히
+    /// 사라졌다(09-21 23:07Z 실사례 · 조사 RC4). 거부 사유는 `[draft_gate:modal]` 이고 문면은 CLI `--queued`
+    /// 폴백 접두(MSG_TYPING_GUARD)를 유지한다. 같은 화면의 `send-key Return`(SubmitKey)은 **무변경**으로
+    /// 통과한다 — 화면 감지 승인은 대기자가 없어 master 의 Return 이 유일한 승인 수단이다(워커 hang 금지).
+    #[test]
+    fn u8_p1_text_denied_on_foreground_modal_but_submit_key_unchanged() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("u8-p1-modal", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_640;
+        let _sender = v7_pane(&daemon, "worker-2", pid);
+        let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+        let mut observations = Vec::new();
+        for (offset, method, extra) in [
+            (1, "surface.send_text", json!({"text": "[CEO 지시] 즉시 정지", "human": false, "queued": false})),
+            (2, "surface.send_key", json!({"key": "Return"})),
+        ] {
+            // 각각 새 pane: 직전 send 의 비동기 PTY 에코가 다음 화면 픽스처를 덮지 않는다.
+            let target = v7_pane(&daemon, "worker-1", pid + offset);
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+            {
+                let mut parser = target.parser.lock().unwrap();
+                parser.process(b"\x1b[2J\x1b[H");
+                parser.process(modal.as_bytes());
+            }
+            let before = d12_input_counts(&target);
+            let mut params = json!({"surface_id": target.id, "quiet": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let resp = d12_rpc(&daemon, pid, method, params);
+            observations.push((resp, before, d12_input_counts(&target)));
+        }
+        d12_cleanup(&daemon, &dir);
+
+        let (text, text_before, text_after) = &observations[0];
+        assert_eq!(*text_before, (0, 0, 0), "계수와 독립적인 화면 모달 축 검체");
+        d12_assert_denied(text, "modal");
+        assert_eq!(*text_after, (0, 0, 0), "모달 거부는 본문을 한 바이트도 쓰지 않는다");
+        let (ret, _, _) = &observations[1];
+        assert_eq!(ret["ok"], json!(true), "승인 창의 Return(SubmitKey)은 종전대로 통과해야 한다(X2): {ret}");
+    }
+
     #[test]
     fn d12_denials_publish_once_per_request_including_clear_first_and_enter() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

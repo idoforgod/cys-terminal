@@ -88,7 +88,8 @@ def scenario(name):
                 stdout = "restored worker-1 surface:7"
             elif verb == "reinject":
                 assert args[:6] == ("reinject", "--check", "--role", "worker-1", "--surface", "surface:7")
-                assert args[6:] in (("--timeout", "6"), ("--timeout", "4"))
+                # ★U8 P0-M2(0.14.41): G2 는 재주입 없는 ACK 확인 전용(`--ack-only`) — stage_reinject(6)만 재주입 자격이 있다.
+                assert args[6:] in (("--timeout", "6"), ("--timeout", "4", "--ack-only")), args
                 with open(journal_path, encoding="utf-8") as f:
                     snapshots.append(json.load(f))
                 state["checks"] += 1

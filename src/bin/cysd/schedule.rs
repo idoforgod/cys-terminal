@@ -3446,6 +3446,43 @@ mod tests {
         let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::Reap);
     }
 
+    /// ★(0.14.41 · U8 P1) 스케줄 **직접 push** 도 대상 좌석 화면에 질문·선택 창(모달)이 전경이면 본문을
+    /// 쓰지 않고 좌석 큐로 우회한다 — 종전에는 게이트가 전혀 없어 하트비트·wakeup 문안이 오너의 질문 창에
+    /// 타이핑됐다(그 CR 이 기본 선택지를 누를 수 있다 · 조사 RC4). 판정 술어는 큐 배달 게이트와 같은
+    /// 것이라(`modal_foreground` ∨ 선택기 행) 적재된 항목은 모달이 닫힌 뒤에 배달된다. 모달이 아니면
+    /// 종전과 같은 직접 주입이다(`deliver_push_branches_are_observable` 가 그 대조군).
+    #[test]
+    fn u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal() {
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("cso".into()), 24, 80)
+            .expect("좌석 생성");
+        daemon.roles.lock().unwrap().insert("cso".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        let screen = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+        {
+            let mut p = s.parser.lock().unwrap();
+            p.process(b"\x1b[2J\x1b[H");
+            p.process(screen.as_bytes());
+        }
+        let direct: Job = serde_json::from_value(json!({
+            "id": "direct", "action": "push", "to": "cso", "text": "x"
+        }))
+        .unwrap();
+        assert!(!direct.uses_queue());
+        assert_eq!(
+            deliver_push(&daemon, &direct, s.id, "[heartbeat] 5분 보고", None),
+            Ok("queued(modal)"),
+            "권한 창이 전경인데 직접 주입했다(본문·CR 이 선택지를 누른다)"
+        );
+        let q = s.pending_queue.lock().unwrap().clone();
+        assert_eq!(q.len(), 1, "모달 우회가 좌석 큐에 적재하지 않았다");
+        assert_eq!(q[0].origin, "schedule");
+        assert_eq!(q[0].from.as_deref(), Some("schedule:direct"));
+        let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::Reap);
+    }
+
     /// ★강등 실행 검체(리뷰 R1 · codex blocking): 구 데몬의 `fire()` 는 action 을
     /// `push`·`command` 로만 분기하고 나머지는 `unknown action` 에러다. 이 잡의 action 이
     /// 그 집합에 들어가는 순간 **롤백한 데몬이 게이트 없이 주입한다**.

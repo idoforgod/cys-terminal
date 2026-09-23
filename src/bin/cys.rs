@@ -10064,7 +10064,10 @@ mod seat_latch_negation_tests {
         // 세 발신자가 지시를 넘긴다: restore in-seat · node-recover · restore 경유 launch-agent.
         assert!(fn_body("run_restore").contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
         assert!(fn_body("run_node_recover").contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
-        assert!(fn_body("run_node_recover").contains("inject_text(sid, recover_directive())"), "node-recover Ready 경로가 사본 문자열을 쓴다");
+        // ★(0.14.41 · U8 P0-M1) node-recover 의 [RECOVER] 는 부트 공용 함수가 디렉티브 뒤에 **한 제출**로
+        //   잇는다(`adoption_payload(&directive, followup)`) — Ready 팔의 두 번째 `inject_text` 는 사라졌다.
+        assert!(!fn_body("run_node_recover").contains("inject_text(sid, recover_directive())"),
+                "node-recover 가 [RECOVER] 를 아직 두 번째 제출로 보낸다(큐 선두 차단)");
         assert!(fn_body("run_launch_agent_opts").contains("if restore { Some(restore_directive(role)) } else { None },"),
                 "restore 경유 launch-agent 가 지시를 넘기지 않는다");
         // 주입 절반의 두 보류 지점이 지시를 재표식에 다시 싣는다(다음 관문이 지시를 지우지 않게).
@@ -32640,13 +32643,79 @@ mod tests {
         assert!(compact.find("lane_guard_tripped(").unwrap() < effective_at);
         for consumer in [
             "cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)",
-            "if !hooks_inject { inject_text(sid, &compose_directive(&role_name)?)?; }",
+            // ★(0.14.41 · U8 P0-M1) 종전 핀은 이중 제출(`if !hooks_inject { inject_text(디렉티브) }` 뒤
+            //   `inject_text(resume)`)을 **문자 그대로** 박제했다. 새 의도: 디렉티브 뒤 RESUME 을 채택 경로와
+            //   같은 규약(`adoption_payload`)으로 **한 제출**. 훅 좌석은 종전대로 RESUME 하나다.
+            "inject_text(sid, &cycle_reinject_payload(hooks_inject, &resume_text, &mut || compose_directive(&role_name))?)?;",
             "cycle_reinject_held( &e, hooks_inject,",
             "cycle_best_effort_reinject( hooks_inject,",
         ] {
             assert!(compact.find(consumer).is_some_and(|at| effective_at < at),
                 "실효값의 소비처 배선 누락: {consumer}");
         }
+        // 되돌림 뮤테이션(두 제출 복귀)을 잡는 축 — Verified 팔의 재주입 제출 호출은 정확히 1곳이다.
+        let verified = compact.split("ClearEffect::Verified => {").nth(1).expect("Verified 팔")
+            .split("ClearEffect::Unverified =>").next().expect("Verified 팔 끝");
+        let ok_arm = verified.split("Ok(()) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
+            .split("Err(e) => Err(cycle_reinject_held(").next().expect("Ok 팔 끝");
+        assert_eq!(ok_arm.matches("inject_text(sid,").count(), 1,
+            "Verified 재주입이 한 제출이 아니다(디렉티브·RESUME 두 제출 = Claude 큐 선두 차단):\n{ok_arm}");
+        assert!(!compact.contains("inject_text(sid, resume)?;"), "RESUME 단독 두 번째 제출이 되살아났다");
+    }
+
+    /// ★(0.14.41 · U8 P0-M1) 직접 Ready 경로(restore in-seat · restore fresh · node-recover)도 디렉티브와
+    /// 복원 연속 지시를 **한 제출**로 보낸다 — 부트 공용 함수가 `adoption_payload(&directive, followup)` 을
+    /// 조립하고, 세 호출부는 두 번째 `inject_text` 를 하지 않는다(채택 경로와 한 규약 · 사본 금지).
+    #[test]
+    fn u8_m1_direct_ready_paths_submit_directive_and_followup_once_source_pin() {
+        let src = include_str!("cys.rs");
+        let boot = strip_line_comments(refl_fn_body(src, "boot_agent_on_surface"));
+        assert!(boot.contains("let payload = adoption_payload(&directive, followup);"),
+            "부트 공용 함수가 한 제출 페이로드를 조립하지 않는다");
+        assert!(boot.contains("inject_directive_after_ready(\n        sid,\n        agent,\n        &payload,"),
+            "주입 절반에 한 제출 페이로드가 넘어가지 않는다");
+        // 세 호출부는 지시를 표식 이월용으로 **넘기되**(보류 시 채택이 다시 싣는다) 따로 제출하지 않는다.
+        let restore = strip_line_comments(refl_fn_body(src, "run_restore"));
+        assert!(restore.contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
+        assert_eq!(restore.matches("inject_text(").count(), 0,
+            "restore 가 복원 지시를 두 번째 제출로 보낸다(in-seat·fresh):\n{restore}");
+        let recover = strip_line_comments(refl_fn_body(src, "run_node_recover"));
+        assert!(recover.contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
+        assert_eq!(recover.matches("inject_text(").count(), 0,
+            "node-recover 가 [RECOVER] 를 두 번째 제출로 보낸다");
+        let launch = strip_line_comments(refl_fn_body(src, "run_launch_agent_opts"));
+        assert!(launch.contains("if restore { Some(restore_directive(role)) } else { None },"),
+            "restore 경유 launch-agent 가 지시를 넘기지 않는다(fresh 복원 지시 유실 = ③)");
+    }
+
+    /// ★(0.14.41 · U8 P0-M2) `reinject --check` 는 각성 핑이 **에이전트 큐에 회색 대기**면 그것을 'ACK 없음 =
+    /// 드리프트' 로 읽지 않는다(09-23 실측: 워커 +2회 · CEO +3회 전문 재주입 → 5분 뒤 ctx 64% 강제 clear).
+    /// 판정은 세션 기록(데몬 usage 수집기가 해소한 `usage.session_file`)으로 하고, 판정 불가·바쁨·ack 전용은
+    /// 재주입하지 않으며, 재주입은 좌석·세션당 멱등 키로 1회다. phoenix G2 단계는 ACK 전용 호출이다.
+    #[test]
+    fn u8_m2_reinject_check_does_not_reinject_a_queued_ping_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = strip_line_comments(refl_fn_body(src, "run_reinject"));
+        for anchor in [
+            "ping_fate_from_entry(",
+            "reinject_check_action(",
+            "reinject_check_claim(",
+            "ack_only",
+        ] {
+            assert!(body.contains(anchor), "run_reinject 배선 결손: {anchor}");
+        }
+        let decide = body.find("reinject_check_action(").expect("판정");
+        let compose = body.find("compose_directive(&role_name)?").expect("전문 조립");
+        assert!(decide < compose, "핑 운명 판정이 전문 재주입보다 뒤다");
+        let claim = body.find("reinject_check_claim(").expect("멱등 키");
+        assert!(claim < compose, "멱등 키 확보가 전문 재주입보다 뒤다");
+        let clap = src.split("    Reinject {").nth(1).expect("Reinject 서브커맨드").split("},").next().unwrap();
+        assert!(clap.contains("ack_only: bool"), "--ack-only 플래그가 없다(phoenix G2 가 재주입 없는 ACK 확인을 못 한다)");
+        let phoenix = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack/bin/javis_phoenix.py"),
+        ).expect("javis_phoenix.py");
+        let g2 = phoenix.split("def stage_g2_ack(").nth(1).expect("stage_g2_ack").split("\ndef ").next().unwrap();
+        assert!(g2.contains("\"--ack-only\""), "phoenix G2 가 아직 재주입까지 하는 check 를 부른다");
     }
 
     #[test]
@@ -32860,17 +32929,23 @@ mod tests {
                 },
                 &mut |text| { sent.push(text.to_string()); Ok(()) },
             );
+            // ★(0.14.41 · U8 P0-M1) 디렉티브와 RESUME 은 **한 제출**이다(채택 경로 `adoption_payload` 규약).
+            //   종전 두 제출은 두 번째가 Claude 큐 선두에 끼어 턴 중에 접히지 않고, 뒤따르는 감독자 지시를
+            //   7~17분 막았다(반박 검증 M1 · 좌석 트랜스크립트 473건 전수).
             let expected = if hooks_inject {
-                vec!["[RESUME] 이어가기"]
+                vec!["[RESUME] 이어가기".to_string()]
             } else {
-                vec!["역할 디렉티브", "[RESUME] 이어가기"]
+                vec![adoption_payload("역할 디렉티브", Some("[RESUME] 이어가기"))]
             };
-            assert_eq!(sent, expected);
+            assert_eq!(sent, expected, "재주입 제출 수가 1이 아니다(두 제출 = 큐 선두 차단)");
             assert_eq!(cycle_agent_exit(&Err(error.clone())), 86);
             assert!(error.contains("clear 는 실효 확인됨(session_file 교체)"));
             assert!(error.contains(&reason));
-            assert!(error.contains("RESUME 1건 송신"));
-            assert!(error.contains(if hooks_inject { "디렉티브 생략(훅)" } else { "디렉티브 1건 송신" }));
+            assert!(error.contains(if hooks_inject {
+                "RESUME 1건 송신 · 디렉티브 생략(훅)"
+            } else {
+                "디렉티브+RESUME 한 제출 1건 송신"
+            }), "{error}");
             assert!(error.contains("손으로 다시 clear 하지 마라 — 좌석에 [RESUME] 이 보이지 않으면 재주입만 하라"));
         }
     }
@@ -32885,13 +32960,23 @@ mod tests {
                 &mut |text| { attempted.push(text.to_string()); Err("Return RPC 실패".into()) },
             );
             assert_eq!(cycle_agent_exit(&Err(error.clone())), 86, "주입 실패가 86 계약을 덮었다");
-            assert_eq!(attempted.last().map(String::as_str), Some("[RESUME] 이어가기"), "디렉티브 실패 뒤에도 RESUME 시도");
-            assert_eq!(attempted.len(), if compose_fails { 1 } else { 2 });
-            assert!(error.contains("RESUME 주입 실패(부분 송신 가능: Return RPC 실패)"));
+            assert_eq!(attempted.last().map(String::as_str), Some("[RESUME] 이어가기"), "한 제출 실패 뒤에도 RESUME 시도");
+            // ★(0.14.41 · U8 P0-M1) 첫 시도는 **한 제출**(디렉티브+RESUME)이다. 그것이 실패했을 때만
+            //   RESUME 단독 1회(최선노력 · 제출이 성립하지 않았으므로 두 제출 머리가 생기지 않는다).
+            if compose_fails {
+                assert_eq!(attempted, vec!["[RESUME] 이어가기".to_string()]);
+            } else {
+                assert_eq!(
+                    attempted,
+                    vec![adoption_payload("역할 디렉티브", Some("[RESUME] 이어가기")), "[RESUME] 이어가기".to_string()],
+                    "첫 시도가 한 제출이 아니다"
+                );
+            }
+            assert!(error.contains("RESUME 주입 실패(부분 송신 가능: Return RPC 실패)"), "{error}");
             if compose_fails {
                 assert!(error.contains("디렉티브 0건(합성 실패: 역할 파일 없음)"));
             } else {
-                assert!(error.contains("디렉티브 주입 실패(부분 송신 가능: Return RPC 실패)"));
+                assert!(error.contains("디렉티브+RESUME 한 제출 실패(부분 송신 가능: Return RPC 실패)"), "{error}");
             }
         }
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
@@ -34140,14 +34225,23 @@ mod tests {
             !rec.contains("inject_text(sid, recover_directive())?;"),
             "Ready 팔이 아직 보류를 `?` 로 흘린다 — rc 1 → escalate_reclaim(kill)"
         );
+        // ★(0.14.41 · U8 P0-M1) [RECOVER] 는 이제 디렉티브와 **한 제출**이라 주입·보류 접기가 주입 절반
+        //   (`inject_directive_after_ready`) 한 곳에 있다 — 종전 Ready 팔의 사본 접기(is_hold_error ·
+        //   GATE_ID_INJECT_HELD · gate_close_override_once)는 그 절반의 같은 배선으로 이사했다.
+        //   node-recover 는 지시를 넘기고(표식 이월 재료) 보류 판정을 전용 exit 로 낸다.
+        assert!(rec.contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
+        assert!(!rec.contains("inject_text("), "node-recover 가 두 번째 제출을 한다");
+        let half = refl_fn_body(src, "inject_directive_after_ready");
         for anchor in [
             "cys::inject_guard::is_hold_error(&e)",
             "GATE_ID_INJECT_HELD",
-            "Some(recover_directive()),",
-            "gate_close_override_once(),",
+            "followup,",
+            "directive_held,",
         ] {
-            assert!(rec.contains(anchor), "보류 접기 배선 결손: {anchor}");
+            assert!(half.contains(anchor), "주입 절반의 보류 접기 배선 결손: {anchor}");
         }
+        assert!(rec.contains("BootVerdict::GatePending { gate, tail } => {"),
+            "node-recover 가 보류 판정을 처방·전용 exit 로 가르지 않는다");
         // ③ⓑ 전처리 안전 거부가 머리표를 달고 전용 코드로 나간다.
         assert!(rec.contains("{RECOVER_REFUSED_TOKEN} agent"), "안전 거부에 머리표가 없다");
         assert!(rec.contains("EXIT_RECOVER_REFUSED"), "안전 거부가 전용 코드로 나가지 않는다");

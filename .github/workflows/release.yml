@@ -485,7 +485,7 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate \
@@ -1250,7 +1250,7 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate \
