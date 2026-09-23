@@ -299,6 +299,9 @@ jobs:
 
       # UI 회귀 게이트 — 한글 IME 리듀서(ui/src/ime.ts) 프로필 A/B/C/Windows 시퀀스 테스트.
       # 실패=릴리스 차단. 배경: WKWebView 프로필별 자모 유출·이중전송 재발 방지(fix/ime-hybrid-profile).
+      # ★(0.14.41 · U4 C4-⑧) 이 실행 줄(`cd ui && bun test`)은 ci-branch 레인 대조 게이트의
+      #   MUST_RUN_TOKENS['release'] 가 존재·무조건 실행을 핀한다 — 브랜치 잡5 ui-check 와 **쌍**이다.
+      #   문면을 바꾸면 그 게이트와 예행 도구 자기 검체(변이 ⑤)를 함께 고쳐라.
       - name: UI 회귀 테스트 (bun test)
         shell: bash
         run: cd ui && bun test
