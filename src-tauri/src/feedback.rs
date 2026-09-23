@@ -1336,6 +1336,78 @@ mod tests {
         assert_eq!(args, vec!["mailto:x".to_string()], "대상 하나만 — 셸·추가 인자 없음");
     }
 
+    /// 리뷰1 minor #1 — 개인정보 고지("(동의하신 경우) 앱·운영체제 버전… 체크를 끄면 넣지 않습니다")와
+    /// 실제 메일 본문이 같아야 한다. 진단을 끄면 본문에 앱·OS 줄이 없고, 켜면 있다.
+    #[test]
+    fn mail_body_env_line_follows_diag_consent() {
+        let root = tmp_root("consent");
+        let env_line = pct(&format!("앱: cys {} · {} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH));
+        // 끔
+        let id = create_draft_in(&root).unwrap();
+        submit_in(&root, &id, "진단 없이 보내는 피드백", false, None, &[], "0.14.41", 0).unwrap();
+        let off = mailto_for_bundle(&root, &id, 8000).unwrap();
+        assert!(off.contains(&pct(&format!("묶음 번호: {id}"))), "묶음 번호는 늘 들어간다");
+        assert!(!off.contains(&pct("앱: cys")), "진단을 끄면 앱 버전 줄을 넣지 않는다: {off}");
+        assert!(!off.contains(std::env::consts::ARCH), "진단을 끄면 CPU 종류를 넣지 않는다");
+        // 켬
+        let id2 = create_draft_in(&root).unwrap();
+        submit_in(&root, &id2, "진단과 함께 보내는 피드백", true, Some("{\"schema\": 1}".into()), &[], "0.14.41", 0).unwrap();
+        let on = mailto_for_bundle(&root, &id2, 8000).unwrap();
+        assert!(on.contains(&env_line), "진단을 켜면 앱·OS 줄이 들어간다: {on}");
+        assert!(on.contains(DIAG_FILE), "진단 파일을 첨부 목록에 안내한다");
+        // 길어서 줄이는 경로도 같은 규칙
+        let id3 = create_draft_in(&root).unwrap();
+        submit_in(&root, &id3, &"가".repeat(3000), false, None, &[], "0.14.41", 0).unwrap();
+        let cut = mailto_for_bundle(&root, &id3, 2000).unwrap();
+        assert!(cut.contains("description.txt") && !cut.contains(&pct("앱: cys")), "{cut}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 리뷰1 R16 — 묶음 폴더 자리가 심볼릭 링크면(누가 `~/.cys/feedback/<번호>` 를 다른 곳으로 걸어 둠)
+    /// 첨부·버리기가 링크 너머 폴더에 쓰거나 지우지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn bundle_dir_rejects_symlinked_bundle_folder() {
+        let root = tmp_root("symlink");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"k").unwrap();
+        let id = "fb-20260923-113456-ab12";
+        std::os::unix::fs::symlink(&outside, root.join(id)).unwrap();
+        let s = src_file(&root, "a.png", b"x");
+        assert!(attach_path_in(&root, id, &s).unwrap_err().contains("묶음 폴더가 아닙니다"));
+        assert!(attach_begin_in(&root, id, "b.png", 1).unwrap_err().contains("묶음 폴더가 아닙니다"));
+        assert!(discard_in(&root, id).unwrap_err().contains("묶음 폴더가 아닙니다"));
+        assert!(submit_in(&root, id, "다섯 글자 이상", false, None, &[], "0.14.41", 0).is_err());
+        let left: Vec<String> =
+            std::fs::read_dir(&outside).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, vec!["keep.txt".to_string()], "링크 너머에 쓰지도 지우지도 않는다");
+        assert!(std::fs::symlink_metadata(root.join(id)).unwrap().file_type().is_symlink(), "링크 자체도 그대로");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 리뷰1 minor #5 — 결과 화면·메일 꼬리의 폴더 표기는 그 OS 사용자가 알아보는 모양이고, 사용자 이름을 드러내지 않는다.
+    #[test]
+    fn bundle_folder_display_is_platform_native_and_hides_user() {
+        let root = tmp_root("display");
+        let id = create_draft_in(&root).unwrap();
+        let s = src_file(&root, "a.png", b"x");
+        attach_path_in(&root, &id, &s).unwrap();
+        let r = submit_in(&root, &id, "폴더 표기 확인용 설명", false, None, &[], "0.14.41", 0).unwrap();
+        #[cfg(windows)]
+        let want = format!("%USERPROFILE%\\.cys\\feedback\\{id}");
+        #[cfg(not(windows))]
+        let want = format!("~/.cys/feedback/{id}");
+        assert_eq!(r.folder, want);
+        let url = mailto_for_bundle(&root, &id, 8000).unwrap();
+        assert!(url.contains(&pct(&want)), "메일 꼬리도 같은 표기: {url}");
+        let home = cys::home_dir().to_string_lossy().into_owned();
+        if home.chars().count() >= 3 {
+            assert!(!r.folder.contains(&home) && !url.contains(&pct(&home)), "홈 절대경로(사용자 이름) 비노출");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn report_shape_is_stable_for_the_ui() {
         let r = BundleReport {

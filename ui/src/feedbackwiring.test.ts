@@ -13,6 +13,7 @@ const css = read("./style.css");
 const modalSrc = read("./feedbackmodal.ts");
 const pureSrc = read("./feedback.ts");
 const guardSrc = read("./modalguard.ts");
+const flowSrc = read("./feedbackflow.ts");
 const mainRs = read("../../src-tauri/src/main.rs");
 const fbRs = read("../../src-tauri/src/feedback.rs");
 
@@ -81,10 +82,30 @@ function topLevelStatements(src: string): string[] {
 
 describe("① setFocus 포커스 가드 (반박 D2 · blocking)", () => {
   const body = stripComments(fnBody(main, "function setFocus(sid: number)"));
-  it("term.focus() 는 모달 층 판정 뒤에서만 불린다", () => {
+  it("term.focus() 는 모달 층 판정 뒤에서만 불린다 — 가드 줄은 글자 그대로(`|| true` 같은 무력화도 RED)", () => {
     const lines = body.split("\n").filter((l) => l.includes("term.focus()"));
     expect(lines.length).toBe(1);
-    expect(lines[0]).toContain("!modalLayerOpen(document)");
+    expect(lines[0].trim()).toBe("if (!modalLayerOpen(document)) panes.get(key)?.term.focus();");
+    // xterm 포커스를 주는 곳은 파일 전체에서 이 한 줄뿐이다(다른 자리에서 우회하면 가드가 무의미).
+    expect(stripComments(main).split("term.focus()").length - 1).toBe(1);
+  });
+  it("건너뛴 포커스는 모달이 닫힌 뒤 되살린다(리뷰 minor #3) — 가드 바로 다음 줄이 else 분기", () => {
+    const lines = body.split("\n").map((l) => l.trim());
+    const i = lines.indexOf("if (!modalLayerOpen(document)) panes.get(key)?.term.focus();");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(lines[i + 1]).toBe("else deferPaneFocusUntilModalsClose();");
+  });
+  it("되살리기는 호이스팅되는 함수 선언이고 절대 던지지 않는다(setFocus·3초 틱 보호) — body 직계 자식만 지켜본다", () => {
+    const fn = stripComments(fnBody(main, "function deferPaneFocusUntilModalsClose() {"));
+    expect(/^function deferPaneFocusUntilModalsClose\(\) \{\s*try \{\s*armDeferredPaneFocus\(\{/.test(fn)).toBe(true);
+    expect(fn).toContain("} catch {");
+    expect(fn).toContain("layerOpen: () => modalLayerOpen(document),");
+    expect(fn).toContain("return a == null || a === document.body;"); // 다른 칸이 가진 포커스는 빼앗지 않는다
+    expect(fn).toContain("if (focusedSid != null) setFocus(focusedSid);");
+    expect(fn).toContain("mo.observe(document.body, { childList: true });");
+    expect(fn).toContain("return () => mo.disconnect();");
+    expect(fn).toContain("later: (fn) => void setTimeout(fn, 0),"); // 닫는 키의 남은 이벤트가 pane 으로 가지 않게
+    expect(/import \{[^}]*armDeferredPaneFocus[^}]*\} from "\.\/modalguard";/.test(main)).toBe(true);
   });
   it("focused 표시·focusedSid 갱신은 가드와 무관하게 유지된다(탭 강조가 사라지지 않게)", () => {
     expect(body).toContain("focusedSid = sid;");
@@ -142,8 +163,35 @@ describe("④ 피드백 창 수명 — 리스너는 finally 에서 반드시 걷
     expect(fin).toContain('window.removeEventListener("keydown", onKey, true)');
     expect(code).toContain('document.addEventListener("focusin", onFocusIn, true)');
     expect(fin).toContain('document.removeEventListener("focusin", onFocusIn, true)');
-    expect(fin).toContain("unlistenAll()");
+    expect(fin).toContain("listeners.dispose()");
     expect(fin).toContain("ov.remove()");
+  });
+  // ── 행동은 feedbackflow.ts(행동 검체 feedbackflow.test.ts)에 있다. 여기서는 창이 그것을 **실제로** 쓰는지 본다.
+  //    한 줄이라도 다른 것으로 바뀌면(무력화·우회) RED — 리뷰1 변이 M5·M7·M11·M13·M14 가 GREEN 이던 자리.
+  it("Esc: IME 가드·맨 위 층 판정을 가진 makeEscHandler 를 쓴다(M14 · 리뷰 minor #4)", () => {
+    expect(code).toContain("const onKey = makeEscHandler(() => isTopModalLayer(document, ov), requestClose);");
+  });
+  it("focusin 되찾기: makeFocusReclaimer 로 모달 층 밖 포커스를 창의 기본 칸으로(M5 · 반박 D2 이중 방어)", () => {
+    expect(code).toContain(
+      "const onFocusIn = makeFocusReclaimer({ closed: () => closedFlag, home: () => (done ? closeBtn : desc) });",
+    );
+  });
+  it("드롭 구독: 창 수명 구독(scopedListener)만 쓴다 — 늦게 풀린 구독도 해제(M11)", () => {
+    expect(code).toContain("const listeners = scopedListener(deps.listen);");
+    const subs = [...code.matchAll(/listeners\.sub\("([a-z:/-]+)"/g)].map((m) => m[1]);
+    expect(subs.sort()).toEqual(["tauri://drag-drop", "tauri://drag-enter", "tauri://drag-leave"]);
+    expect(code.includes("deps.listen(")).toBe(false); // 창 수명 밖 구독 우회 0
+  });
+  it("버리기: 창을 닫으면(묶음 전) 줄 선 첨부 뒤 초안을 지운다(M7)", () => {
+    const fin = stripComments(fnBody(modalSrc, "const finish = () =>"));
+    expect(fin).toContain("chain = discardDraftAfter(chain, { draft: draftP, bundled: done }, deps.invoke);");
+    expect(fin.indexOf("discardDraftAfter(")).toBeLessThan(fin.indexOf("resolveClose();"));
+  });
+  it("보내기: 폴더 → 메일 순서는 openBundleForMail 한 곳(M13)", () => {
+    const sub = stripComments(fnBody(modalSrc, "const submit = async () =>"));
+    expect(sub).toContain("const { folderErr, mailErr } = await openBundleForMail(rep, tryInvoke);");
+    expect(sub).toContain("showDone(rep, mailErr, folderErr);");
+    expect(sub.includes('"feedback_reveal"') || sub.includes('"feedback_open_mail"')).toBe(false); // 순서 우회 0
   });
   it("열 때 재진입 가드가 첫 await 앞에 있다 + 다른 모달·팔레트가 떠 있으면 열지 않는다(중첩 금지)", () => {
     const body = stripComments(fnBody(modalSrc, "export async function openFeedbackModal("));
@@ -161,6 +209,7 @@ describe("⑤ 새 모듈 위생", () => {
     ["feedback.ts", pureSrc],
     ["modalguard.ts", guardSrc],
     ["feedbackmodal.ts", modalSrc],
+    ["feedbackflow.ts", flowSrc],
   ];
   it("최상위 부수효과 0 — 최상위 문장은 import·선언만", () => {
     for (const [name, src] of mods) {
@@ -190,9 +239,10 @@ describe("⑤ 새 모듈 위생", () => {
     }
   });
   it("피드백 창은 feedback_* 커맨드만 부른다 — 데몬·에이전트 큐·PTY 로 가는 경로 0(원문 자동 주입 금지)", () => {
-    const code = stripComments(modalSrc);
-    const cmds = [...code.matchAll(/invoke(?:Raw)?\("([a-z_]+)"/g)].map((m) => m[1]);
-    expect(cmds.length).toBeGreaterThan(5);
+    // 창과 그 수명 동작 모듈 둘 다 — invoke·invokeRaw·tryInvoke 호출을 모두 센다.
+    const code = stripComments(modalSrc) + "\n" + stripComments(flowSrc);
+    const cmds = [...code.matchAll(/[iI]nvoke(?:Raw)?\("([a-z_]+)"/g)].map((m) => m[1]);
+    expect(cmds.length).toBeGreaterThan(8);
     for (const c of cmds) expect(c.startsWith("feedback_")).toBe(true);
     for (const bad of ["send_input", "send_text", "channel", "org_status", "feed_"]) {
       expect(code.includes(bad)).toBe(false);
