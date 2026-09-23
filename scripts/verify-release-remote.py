@@ -227,6 +227,44 @@ def self_test():
     v, d = versionless_verdict(mk(OLD, OLD), man, True, V)
     ok("⑧ⓖ ★무버전 자산만 구버전인 형상은 반드시 실패", not v, d)
 
+    # ── 인자 계약: 구버전 생략은 명시 플래그로만 (U4 C4-⑦ · 2026-09-23) ──
+    # 종전엔 구버전을 빼먹으면 ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈다 — 오너 문서의 합격
+    # 문구("7/7 PASS")와 정확히 일치해 **빼먹은 실행이 합격으로 읽혔다**(홈페이지 옛 링크 잔존 사고를 놓침).
+    # 여기서는 main() 을 실제로 부르되 네트워크 함수를 **트립와이어**로 바꿔, 인자 오류가 수신 **전에**
+    # exit 2 로 끝나는지 잰다(트립와이어가 울리면 = 인자 검사 없이 원격으로 나갔다 = 실패).
+    g = globals()
+    saved = {k: g[k] for k in ("get", "get_json", "clen", "code")}
+    calls = []
+
+    def _trip(*a, **k):
+        calls.append(a[:1])
+        raise RuntimeError("tripwire: 인자 검사 전에 원격 수신을 시도했다")
+    try:
+        for k in saved:
+            g[k] = _trip
+        for label, argv, want in (
+                ("⑨ⓐ 구버전 생략(플래그 없음)은 수신 전 exit 2", ["x", V], 2),
+                ("⑨ⓑ 구버전 + --no-prev 동시 지정은 모순 — 수신 전 exit 2", ["x", V, OLD, "--no-prev"], 2),
+                ("⑨ⓒ 모르는 플래그는 수신 전 exit 2", ["x", V, OLD, "--bogus"], 2),
+                ("⑨ⓓ 위치 인자 3개 이상은 수신 전 exit 2", ["x", V, OLD, "1.2.3"], 2)):
+            del calls[:]
+            try:
+                rc = main(argv)
+            except RuntimeError as e:
+                rc = "원격 수신 시도(%s)" % e
+            ok(label, rc == want and not calls, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
+        # 양성 대조 — 정상 인자(구버전 명시 · --no-prev 명시)는 인자 검사를 **통과**해 수신 단계로 간다.
+        for label, argv in (("⑨ⓔ 구버전 명시는 수신 단계로 진행", ["x", V, OLD]),
+                            ("⑨ⓕ --no-prev 명시는 수신 단계로 진행", ["x", V, "--no-prev"])):
+            del calls[:]
+            try:
+                rc = main(argv)
+            except RuntimeError:
+                rc = "tripwire"
+            ok(label, rc == "tripwire" and len(calls) == 1, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
+    finally:
+        g.update(saved)
+
     total = tally["pass"] + tally["fail"]
     print("\n=== self-test %d/%d PASS (실패 %d건) ===" % (tally["pass"], total, tally["fail"]))
     return 0 if tally["fail"] == 0 else 1
