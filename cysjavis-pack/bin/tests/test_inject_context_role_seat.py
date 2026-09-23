@@ -34,6 +34,9 @@
      ⑭ compact(자동 압축 직후)는 역할 무관 종전 문안(진행 중 턴의 연속이지 새 착수가 아니다)
      ⑮ 단일 원본 문안 계약 — 비어 있지 않음 · 백슬래시 0(`printf '%b'` 소비) · `set-status`·`--ack`·
         `CYS_BOOT_NONCE`·'부트 브리지' 낱말 0(session-start.sh 소비처 계약 · WP-E 가 참조한다)
+     ⑮b ★부트 체인 안전(속행 · WP-C1 471d08b2 직후 발견): 운영 절차 예외 목록에 `javis_boot_node.py
+        awaken_message`("즉시 각성하라")도 들어있다 — 없으면 신규 좌석 부트 주입이 착수 게이트에
+        '배경 참고'로 읽혀 ①claim-role ②set-status ③TODO 확인 ④각성 보고가 멈출 수 있다(온보딩 위험)
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 INJECT-CONTEXT-ROLE-SEAT-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_inject_context_role_seat.py
 해석기: 훅의 shebang(`#!/bin/bash`)을 따라 **bash** 로 부른다 — Ubuntu 의 `/bin/sh`(dash)는 훅 :34 의
@@ -323,6 +326,10 @@ try:
           all(t in NOTE for t in ("[RESUME]", "[RESTORE]", "[CYCLE]", "[CYCLE-VERIFY]", "[DRAIN]", "대기")),
           NOTE)
     check("15e 문안 자체가 자율 착수 낱말을 싣지 않는다", all(w not in NOTE for w in SELF_START), NOTE)
+    check("15f ★부트 체인 안전 — 운영 절차 예외에 '각성 메시지'가 있다"
+          "(javis_boot_node.awaken_message '즉시 각성하라'가 착수 게이트에 막혀 신규 좌석"
+          " claim-role·set-status·TODO 확인·각성 보고가 멎는 온보딩 회귀를 막는다)",
+          "각성 메시지" in NOTE, NOTE)
 
     # ⑨ member — 본부 레인(작업기억 있음) · clear / startup · 비표준 역할
     for tag, role, daemon, src, lead_line in (
