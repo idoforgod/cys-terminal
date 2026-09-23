@@ -245,9 +245,9 @@ check("a4 재확인은 같은 단계의 #N 접미로 기록(새 단계 라벨 0)
       and "④′resource-gate#3" in rig.steps(), "steps=%r" % rig.steps())
 check("a5 해소(allow)면 Feed 알림 0", len(_feed_bodies(rig)) == 0, "feed=%r" % _feed_bodies(rig))
 prog = (rig.data or {}).get("progress") or {}
-check("a6 boot-last progress 기록(phase=resource_wait · 종료 state=resolved · checks=3)",
-      prog.get("phase") == "resource_wait" and prog.get("state") == "resolved"
-      and prog.get("checks") == 3, "progress=%r" % prog)
+check("a6 boot-last progress 기록(phase=resource_wait · 종료 state=done · outcome=resolved · checks=3)",
+      prog.get("phase") == "resource_wait" and prog.get("state") == "done"
+      and prog.get("outcome") == "resolved" and prog.get("checks") == 3, "progress=%r" % prog)
 check("a7 result.state 새 값 없음(완주=completed)",
       rig.result().get("state") == "completed", "result=%r" % rig.result())
 check("a8 대기 뒤 master 결속 재확인 흔적(#bind · 살아 있는 master)",
