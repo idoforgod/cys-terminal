@@ -559,6 +559,26 @@ edge를 1회성으로 노출하는 신호(예 `pane.ready` push)를 도입하면
 | ⑥ | `docs`/검증 스크립트 | RPC 기반 동등성 diff(`system.identify`·`surface.list`·`control.dashboard`) |
 | ①⑦⑩ | `.github/workflows/release.yml` | **신규**: `pack.tar.gz` + `pack-manifest.json`(+`key_id`·`signed_at`·`expires_at`) 생성·업로드, `pack-manifest.json.minisig` 서명, **embed `PACK` 해시 vs standalone manifest 동일성 게이트**(불일치=빌드 FAIL, §5-1) |
 
+### ⑫ GUI 가용성 판정의 타입 있는 결과 + no-op 결과 토큰 (0.14.41 · U9 · 의도적 계약 변경)
+
+**문제**(오너 보고 "업데이트 숫자 vs 「최신입니다」" · 조사 R2~R7 · 반박 D2·D3·D7): `check_pack_update` 가
+① 매니페스트 해석 실패 ② 디스크 `.pack-version` 부재·해석 실패를 `Ok(None)`(= '확인된 새 팩 없음')으로 접어
+UI 가 '최신'을 말했다. ①은 codex R2 #1 로 **'확정 거부'** 라는 문서화된 계약이었다 — 거부로서는 옳으나 UI 가
+그것을 '최신'으로 읽었다. 또 GUI 는 semver 만 비교해 CLI(튜플·채널·state 검사)와 판정이 갈렸고, CLI 의
+no-op(UpToDate · exit 0)을 GUI 가 "✅ 팩 업데이트 완료"로 보고했다.
+
+**계약(변경 후)**:
+
+| 항목 | 내용 |
+|---|---|
+| `check_pack_update` 반환 | `Ok({status, …})` — `available · none · binary-too-old · channel-refused · manifest-unreadable · disk-unknown(reason)` · `Err` = 일시 fetch 장애만. **'팩 최신'은 `none` 하나뿐**이다. |
+| 판정 순서 | CLI `pack_update_from_dir` 와 같다: 매니페스트 해석 → state 손상/불일치 → pro→free 거부 → (GUI 표시 정직화: 디스크·원격 버전 해석 불가 = 불명) → 튜플 strictly-newer → min_binary. **CLI 코드는 옮기지 않는다**(③ 자가치유 경로 리팩터 금지) — GUI 가 lib 공개 부품(`read_pack_state`·`remote_is_newer_tuple`·`parse_semver`)으로 같은 순서를 밟고, 파리티 테스트가 CLI `version_gates` 단위테스트 행을 소스에서 직접 읽어 대조한다(`src-tauri` `u9_classify_parity_with_cli_version_gates_table`). |
+| 설치 안 함의 경계 | 불변. `manifest-unreadable`·`disk-unknown`·`channel-refused` 는 설치 버튼을 띄우지 않는다(보안 경계 fail-closed 유지) — 다만 '최신'이라 말하지 않는다. |
+| no-op 결과 토큰 | `cys pack-update` UpToDate 분기가 `PACK_UPDATE_OUTCOME gate=up-to-date remote=<manifest> disk=<.pack-version> disk_parse=ok\|fail` 한 줄을 추가로 찍는다(`cys::pack::PACK_UPDATE_OUTCOME_PREFIX` · ASCII · CRLF 안전). **종료코드 0 불변.** 브리지는 이 줄이 있으면 `pack-updated` 대신 `pack-uptodate{confirmed}` 를 보내고, `confirmed` 는 `disk_parse=ok ∧ disk ≥ remote` 일 때만 참이다(CLI UpToDate 는 디스크 판독 실패에서도 나오므로 — 반박 D3). 줄이 없으면(구 사이드카) 종전 경로. |
+
+**하지 않은 것**: 판정 함수의 lib 이동(D2 — 별도 릴리스), `boot-busy` 재시도(D4 — 새 주기 작업 0 유지), 부서 팩
+(`pack-dept-*`) 표시(R9 — 오너 결정 대기), 팩 매니페스트 URL 테스트 오버라이드 env.
+
 ---
 
 ## 부록 A — 실측 근거 인덱스 (file:line)
