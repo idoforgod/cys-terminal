@@ -4331,6 +4331,132 @@ def h_cycle_1():
             "— 전 플랫폼 주입식 판정")
 
 
+# ★U5(0.14.41 · 윈도우 "1분마다 검은 창") — 1분 사슬 캡처 호출의 창 정책 검체.
+_U5_NOWIN = 0x08000000          # Windows CREATE_NO_WINDOW
+
+
+def _u5_capture_spreads(path):
+    """(`**_CAPTURE_SPAWN_KW` 를 펼친 호출 목록, 위반 목록) — AST 로 판정(주석·문자열 무관).
+
+    규칙: ① 펼침은 `subprocess.run(…, capture_output=True, …)` 에만 ② 어느 호출도 `creationflags=`
+    를 직접 쓰지 않는다(정책의 단일 출처는 모듈 상수 하나)."""
+    import ast
+    tree = ast.parse(_read(path), filename=path)
+    spreads, bad = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        kws = node.keywords
+        if any(k.arg == "creationflags" for k in kws):
+            bad.append("%s:%d creationflags 직접 지정" % (os.path.basename(path), node.lineno))
+        if not any(k.arg is None and isinstance(k.value, ast.Name) and k.value.id == "_CAPTURE_SPAWN_KW"
+                   for k in kws):
+            continue
+        spreads.append(node.lineno)
+        f = node.func
+        is_run = (isinstance(f, ast.Attribute) and f.attr == "run"
+                  and isinstance(f.value, ast.Name) and f.value.id == "subprocess")
+        cap = any(k.arg == "capture_output" and isinstance(k.value, ast.Constant) and k.value.value is True
+                  for k in kws)
+        if not (is_run and cap):
+            bad.append("%s:%d 창 정책 펼침이 캡처 전용 subprocess.run 이 아닌 호출에 있다"
+                       % (os.path.basename(path), node.lineno))
+    return spreads, bad
+
+
+@specimen("H-WIN-13", "W6",
+          "U5 1분 사슬 캡처 호출 창 정책 — NOWIN 은 캡처 전용 호출에만 · 실스폰 tick 이 gate-check rc=0 으로 "
+          "킬스위치를 통과(② 무clear 방지)",
+          ["U5-WIN-FLASH"])
+def h_win_13():
+    """U5: 윈도우에서 1분 주기 builtin 잡 `cycle-autopilot-tick`(cysd → bash → python → cys.exe)의
+    캡처 호출에 CREATE_NO_WINDOW 를 건다(설계 §3 U5 · 반박 D1 — 오너 실기 관측 737af2a7 이 가리키는 고리가
+    python → cys.exe 다). 그 대가로 지켜야 할 것 셋을 잰다.
+
+    ① 범위: NOWIN 은 autopilot 의 **캡처 전용** `subprocess.run(capture_output=True)` 두 곳(run · run_wakeup)
+       에만 있다. 파이썬 전역 NOWIN 은 금지다 — stdio 를 지정하지 않은 호출(훅·부트 출력)은 새 숨은
+       콘솔로 출력이 새어 사라진다(②③④ 위험). verifier 는 **pane(ConPTY) 거주**라 자식이 pane 콘솔을
+       물려받아 창이 없다 → 빈 dict(ConPTY 쪽 NO_WINDOW 금지 규칙의 파이썬 짝).
+    ② 계약 블록: run() 은 verifier 와 **바이트 동일** CONTRACT BLOCK 안에 있다 — 두 파일이 같은 이름의
+       상수를 **블록 밖에** 각자 정의해야 한다(한쪽이 빠지면 run() 이 NameError → rc 127 → kill_switch
+       fail-closed → 사이클이 조용히 영영 멈춘다 = ② 무clear). 그래서 값과 존재를 둘 다 잰다.
+    ③ 실스폰: 격리 env 로 **실제 tick** 을 돌려(CYS=스텁 CLI · CYS_AUTOPILOT_NO_SEND=1) 실제 run() 이
+       gate-check 를 띄워 rc=0 으로 킬스위치를 통과하고 status 까지 나아가는지 본다. 윈도우 러너에서는
+       이 스폰이 곧 NOWIN 스폰이다(맥에서는 같은 경로의 비-NOWIN 대조).
+    ★한계(정직): 이 검체는 NOWIN 이 사슬을 **깨지 않음**을 증명한다. Win11+WT 대화형 세션에서 창이
+      실제로 사라지는지는 CI 러너가 재지 못한다(conhost 위임은 대화형 세션 전제 — 반박 D4). 자식의
+      GetConsoleWindow 값은 참고로만 기록한다(판정 아님)."""
+    if BIN_DIR not in sys.path:
+        sys.path.insert(0, BIN_DIR)
+    import importlib
+    A = importlib.import_module("javis_cycle_autopilot")
+    V = importlib.import_module("javis_cycle_verifier")
+    want = {"creationflags": _U5_NOWIN} if os.name == "nt" else {}
+    need(getattr(A, "_CAPTURE_SPAWN_KW", None) == want,
+         "autopilot 캡처 창 정책 값 위반: %r (기대 %r · nt 에서만 NOWIN)" % (getattr(A, "_CAPTURE_SPAWN_KW", None), want))
+    need(getattr(V, "_CAPTURE_SPAWN_KW", "부재") == {},
+         "verifier 는 pane(ConPTY) 거주라 NOWIN 금지 — 빈 dict 여야 한다: %r" % (getattr(V, "_CAPTURE_SPAWN_KW", "부재"),))
+    a_sp, a_bad = _u5_capture_spreads(os.path.join(BIN_DIR, "javis_cycle_autopilot.py"))
+    v_sp, v_bad = _u5_capture_spreads(os.path.join(BIN_DIR, "javis_cycle_verifier.py"))
+    need(not (a_bad or v_bad), "창 정책 범위 위반: %s" % (a_bad + v_bad))
+    need(len(a_sp) == 2, "autopilot 캡처 창 정책 펼침 %d곳(기대 2 = run · run_wakeup): 행 %s" % (len(a_sp), a_sp))
+    need(len(v_sp) == 1, "verifier 펼침 %d곳(기대 1 = 계약 블록 run — 블록 바이트 동일 짝): 행 %s" % (len(v_sp), v_sp))
+    # ③ 실스폰 tick — 격리 HOME·팩·상태·프로젝트(라이브 무접촉). CYS 를 python 인터프리터로 바꿔
+    #   `python gate-check` · `python status --json` 이 cwd 의 스텁 스크립트를 실행하게 한다(.exe 없이
+    #   윈도우 CreateProcess 가 찾을 수 있는 유일한 실행 파일이 인터프리터다).
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.path.join(tmp, "stubcwd")
+        home = os.path.join(tmp, "home")
+        proj = os.path.join(tmp, "proj")
+        for d in (cwd, home, os.path.join(proj, "_round"), os.path.join(tmp, "pack"), os.path.join(tmp, "state")):
+            os.makedirs(d, exist_ok=True)
+        log = os.path.join(tmp, "calls.log")
+        probe = ("import os, sys\n"
+                 "hwnd = -1\n"
+                 "if os.name == 'nt':\n"
+                 "    try:\n"
+                 "        import ctypes\n"
+                 "        hwnd = int(ctypes.windll.kernel32.GetConsoleWindow() or 0)\n"
+                 "    except Exception:\n"
+                 "        hwnd = -2\n"
+                 "with open(%r, 'a', encoding='utf-8') as f:\n"
+                 "    f.write('%%s hwnd=%%d\\n' %% (os.path.basename(sys.argv[0]), hwnd))\n") % log
+        _w(os.path.join(cwd, "gate-check"), probe + "print('running')\n", 0o644)
+        _w(os.path.join(cwd, "status"), probe + "print('{\"surfaces\": []}')\n", 0o644)
+        env = _base_env({"HOME": home, "USERPROFILE": home, "CYS_PACK_DIR": os.path.join(tmp, "pack"),
+                         "CYS_STATE_DIR": os.path.join(tmp, "state"), "JAVIS_ROOT": proj,
+                         "CYS_PROJECT_ROOT": proj, "CYS_AUTOPILOT_NO_SEND": "1",
+                         "CYS_AUTOPILOT_ROLES": "worker"},
+                        drop=("AITERM_SOCKET", "CYS_GATE_LANE_SOCKET", "AITERM_SURFACE_ID"))
+        boot = ("import sys; sys.path.insert(0, %r)\n"
+                "import javis_cycle_autopilot as A\n"
+                "A.CYS = sys.executable\n"
+                "sys.exit(A.main(['tick']))\n") % BIN_DIR
+        r = _run([PY, "-c", boot], env=env, cwd=cwd, timeout=180)
+        calls = _read(log) if os.path.isfile(log) else ""
+        need(r.returncode == 0, "tick rc=%d (정상 skip 도 0 계약): %s" % (r.returncode, (r.stderr or r.stdout)[-400:]))
+        need("gate-check" in calls,
+             "실스폰 gate-check 가 돌지 않았다 — run() 이 자식을 띄우지 못했다(NOWIN 스폰 파손 = ② 무clear): "
+             "stdout=%r stderr=%r" % (r.stdout[-300:], r.stderr[-300:]))
+        last = [ln for ln in r.stdout.splitlines() if ln.strip().startswith("{")]
+        need(last, "tick 이 판정 JSON 을 내지 않았다: %r" % r.stdout[-300:])
+        verdict = json.loads(last[-1])
+        need(verdict.get("result") != "kill-switch",
+             "gate-check 가 rc≠0 으로 읽혀 kill-switch 로 떨어졌다 — 캡처 창 정책이 사슬을 끊었다: %r" % verdict)
+        need("status" in calls, "tick 이 status 조회까지 나아가지 않았다: %r · 호출기록=%r" % (verdict, calls))
+        need(not (verdict.get("result") == "skip" and "status" in str(verdict.get("reason", ""))),
+             "status --json 캡처가 파싱되지 않았다(조회 불가 skip): %r" % verdict)
+        # ④ 입력 파이프 — run(stdin_text=…) 가 창 정책 하에서도 자식 stdin 에 닿는다 · run_wakeup 도 실스폰.
+        rc, out, err = A.run([PY, "-c", "import sys; sys.stdout.write(sys.stdin.read())"], stdin_text="ping-u5")
+        need((rc, out) == (0, "ping-u5"), "run(stdin_text) 왕복 실패: rc=%r out=%r err=%r" % (rc, out, err[-200:]))
+        rc2, out2, err2 = A.run_wakeup([PY, "-c", "print('ok-u5')"])
+        need(rc2 == 0 and out2.strip() == "ok-u5", "run_wakeup 실스폰 실패: rc=%r out=%r err=%r" % (rc2, out2, err2[-200:]))
+        hw = sorted(set(re.findall(r"hwnd=(-?\d+)", calls)))
+    return ("범위(캡처 run 2 · verifier 0 NOWIN) · 실스폰 tick result=%s(gate-check rc=0 통과) · stdin 왕복 · "
+            "run_wakeup · 플랫폼=%s NOWIN=%s · 자식 GetConsoleWindow=%s(참고)"
+            % (verdict.get("result"), os.name, bool(want), ",".join(hw) or "-"))
+
+
 @specimen("H-PYSEAL-1", "W6",
           "훅 셸 층 SEAL-1 — 프리루드 source 만으로 PYTHONDONTWRITEBYTECODE=1 무조건 export",
           ["SEAL-1-HOOK"])
