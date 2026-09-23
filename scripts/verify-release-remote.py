@@ -441,8 +441,15 @@ def main(argv):
     check("⑧ 무버전 자산 버전 결속(latest.json·팩 미러)", ok8, detail8)
 
     npass = sum(1 for r in results if r)
-    print("\n=== %d/%d PASS%s ===" % (npass, len(results),
-                                     " · ①SKIP(--no-prev) — 8축 중 7축만 쟀다" if no_prev else ""))
+    # ★U4 C4 리뷰1 MINOR-3 수정(2026-09-23): --no-prev 요약은 "N/N PASS" 형태로 쓰지 않는다.
+    #   오너 문서(저장소 밖)의 합격 문구가 정확히 "7/7 PASS" 라 --no-prev 실행(측정 7축)의 요약이
+    #   우연히 그 문구와 접두가 일치했다 — 인자 오류 메시지가 "구버전이 정말 없으면 --no-prev 를
+    #   명시하라"고 안내하므로, 이 플래그 한 개로 무플래그 생략(exit 2 로 막힌 그 경로)과 같은
+    #   오독이 재현될 수 있었다. 정상(구버전 포함) 실행만 "N/N PASS" 를 쓴다.
+    if no_prev:
+        print("\n=== ①SKIP · %d축 통과(8축 중) — 정본 합격 8/8 아님 ===" % npass)
+    else:
+        print("\n=== %d/%d PASS ===" % (npass, len(results)))
     return 0 if npass == len(results) else 1
 
 
