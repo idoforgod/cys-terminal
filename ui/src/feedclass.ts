@@ -21,7 +21,12 @@
 // ※ 특례 보존: ceo-promote-request 는 kind 가 달라 "standard" — Allow 경로 그대로
 //   (main.ts 의 CEO 승격 Allow 분기 참조).
 
-export type PendingFeedClass = "cycle-verify" | "daemon-detected" | "standard";
+// [U16 · 0.14.41] "team-create" 분류 신설 근거:
+//   팀 만들기 제안(kind=team-create-request)의 일반 Allow 는 **팀을 만들지 않고** 항목만 소각하는
+//   기만 버튼이다(생성은 확인 창 [만들기] → addDeptWorkspace 뒤에만 일어난다). 그래서 Allow/Deny 를
+//   내리고 카드 전용 두 버튼([확인 창 열기]·[만들지 않기])만 둔다. 팔레트 'feed 승인'은 "standard" 만
+//   고르므로 이 분류는 자동으로 제외된다(같은 술어 공유).
+export type PendingFeedClass = "cycle-verify" | "daemon-detected" | "team-create" | "standard";
 
 export function classifyPendingFeed(i: {
   kind: string;
@@ -32,6 +37,7 @@ export function classifyPendingFeed(i: {
   // daemon_issued 와 실제로 겹치지 않지만, 겹치더라도 '버튼을 내리는' 분류가 이기는
   // 순서가 안전 방향이다(오판이 Allow 를 살리는 쪽으로 나지 않게).
   if (i.kind === "cycle-verify") return "cycle-verify";
+  if (i.kind === "team-create-request") return "team-create";
   if (i.kind === "approval" && (i.daemon_issued ?? i.request_id.startsWith("daemon-")))
     return "daemon-detected";
   return "standard";

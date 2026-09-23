@@ -4825,10 +4825,38 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
 /// lowest-unused 재사용 + 멀티창 충돌0을 보장한다. stdout 마지막 줄이 확정 name(dept-N).
 /// ＋부서 자동화(패치5): `catalog_key`=Some(k) → `cys-dept create <k>`(카탈로그 기반 부서명·계정·미션·각성),
 /// None → `cys-dept allocate`(레거시 무변경). create 경로는 레지스트리에서 display_name 을 조회해 반환한다.
+///
+/// ★U16(0.14.41) `team_spec`=Some — 오너가 팀 제안 카드의 확인 창에서 [만들기]를 누른 팀(이름·하는 일).
+///   새 생성 경로가 아니다: 같은 `cys-dept allocate` 에 인자 하나(`--team-spec-b64`)를 더할 뿐이다.
+///   ① catalog_key 와 동시 지정 거부 ② lib `cys::team_spec::validate`(한도·제어문자·권위어)
+///   ③ **생성 직전 대조** — 기본 데몬 feed.list 에서 같은 id 가 아직 pending 이고 본문이 오너가 본 것과
+///      같은가(확인 창이 떠 있는 동안 제안이 거둬지거나 바뀌었으면 만들지 않는다 — TOCTOU · fail-closed)
+///   ④ 인자는 URL-safe b64(ASCII) — 한글이 argv·코드페이지·MSYS 경로 변환을 지나지 않는다.
+///   실패는 카탈로그 경로와 같은 `dept-create:<code>:` 형식(UI 가 사유를 분류해 보인다).
+///   feed 응답(allow)은 여기서 하지 않는다 — UI 가 **생성 성공 뒤에만** 보낸다(실패 시 카드 pending 유지).
 #[tauri::command]
-async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Result<Value, String> {
+async fn allocate_dept_daemon(
+    app: AppHandle,
+    catalog_key: Option<String>,
+    team_spec: Option<cys::team_spec::TeamSpec>,
+) -> Result<Value, String> {
+    let team_b64 = match &team_spec {
+        None => None,
+        Some(spec) => {
+            if catalog_key.is_some() {
+                return Err("dept-create:2:catalog_key 와 team_spec 은 함께 쓸 수 없다".into());
+            }
+            cys::team_spec::validate(spec).map_err(|e| format!("dept-create:2:{e}"))?;
+            let list = rpc("feed.list", json!({"status": null}))
+                .await
+                .map_err(|e| format!("dept-create:1:팀 제안을 확인하지 못했다(기본 데몬 응답 없음): {e}"))?;
+            cys::team_spec::match_pending(&list, spec).map_err(|e| format!("dept-create:2:{e}"))?;
+            Some(cys::team_spec::to_b64(spec))
+        }
+    };
     let tool = dept_tool();
     let ck = catalog_key.clone();
+    let tb = team_b64.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
         inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
@@ -4839,6 +4867,10 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
             } // ＋부서 자동화: 카탈로그 키 기반 생성(stdout 마지막 줄=name)
             None => {
                 cmd.arg("allocate");
+                // ★U16: 팀 제안이면 인자 하나만 더한다(없으면 레거시 바이트 무변경).
+                if let Some(b) = &tb {
+                    cmd.arg("--team-spec-b64").arg(b);
+                }
             } // 레거시: 번호만 발급(회귀 무변경)
         }
         no_console(&mut cmd);
@@ -4852,7 +4884,7 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
         // ＋부서 자동화(gemini R2 ①): create 경로는 exit code 를 'dept-create:<code>:<stderr>' 로 GUI 에 전달해
         //   보안 분기를 가능케 한다 — exit5(account dir 미존재)=계정누수 → 레거시 폴백 절대 금지(하드 에러)·
         //   exit4(키 부재)=에러·exit3(카탈로그 부재)=레거시 허용. 레거시 allocate(None) 경로는 평문 stderr 유지.
-        if catalog_key.is_some() {
+        if catalog_key.is_some() || team_spec.is_some() {
             let code = out.status.code().unwrap_or(-1);
             return Err(format!("dept-create:{code}:{stderr}"));
         }
@@ -4877,8 +4909,12 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
         obj.insert("name".into(), json!(name));
         // ＋부서 자동화: create 경로면 레지스트리(cys-dept reg_set_meta 가 기록)에서 display_name 조회 →
         // 탭 표시명. create stdout 은 name only(cys-dept 코어 재구현 금지)이므로 depts.json 이 표시명 진실원.
-        if catalog_key.is_some() {
-            if let Some(disp) = dept_display_name(&name) {
+        if catalog_key.is_some() || team_spec.is_some() {
+            // ★U16: 팀 제안 경로도 cys-dept 가 예약과 같은 원자 기록으로 display_name 을 등재한다 —
+            //   판독 실패 시 오너가 확인 창에서 본 이름으로 대신한다(같은 값).
+            let disp = dept_display_name(&name)
+                .or_else(|| team_spec.as_ref().map(|s| s.display.clone()));
+            if let Some(disp) = disp {
                 obj.insert("display_name".into(), json!(disp));
             }
         }
@@ -6851,6 +6887,27 @@ mod tests {
         assert_eq!(strip_utf8_bom(""), "");
         assert_eq!(strip_utf8_bom("a\u{FEFF}b"), "a\u{FEFF}b", "값 안의 U+FEFF 는 보존");
         assert_eq!(strip_utf8_bom("\u{FEFF}\u{FEFF}x"), "\u{FEFF}x", "선두 1개만 벗긴다(그 뒤는 데이터)");
+    }
+
+    /// ★U16(0.14.41) 배선 핀: 팀 제안 생성은 ①lib 검증 ②기본 데몬 feed.list 대조(match_pending)를
+    /// **스폰 전에** 끝내고 ③같은 `cys-dept allocate` 에 `--team-spec-b64` 하나만 더한다. 이 커맨드는
+    /// feed 응답을 하지 않는다(allow 는 UI 가 생성 성공 뒤에만 — 실패 시 카드 pending 유지).
+    #[test]
+    fn u16_team_spec_allocate_verifies_before_spawn() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        let src = std::fs::read_to_string(&path).expect("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let a = body.find("async fn allocate_dept_daemon(").expect("allocate_dept_daemon 소실");
+        let end = a + body[a..].find("\n}\n").expect("함수 끝");
+        let f = &body[a..end];
+        let v = f.find("cys::team_spec::validate(").expect("lib 검증 부재");
+        let m = f.find("cys::team_spec::match_pending(").expect("생성 직전 feed 대조 부재(TOCTOU)");
+        let sp = f.find("spawn_blocking").expect("spawn 부재");
+        assert!(v < sp && m < sp, "검증·대조가 스폰보다 뒤에 있다");
+        assert!(f.contains("\"--team-spec-b64\""), "allocate 인자 부재");
+        assert!(f.contains("cys::team_spec::to_b64("), "b64 인코더(lib SOT) 우회");
+        assert!(!f.contains("feed.reply"), "생성 커맨드가 feed 응답까지 하면 실패 시 카드가 사라진다");
+        assert!(f.contains("catalog_key.is_some() || team_spec.is_some()"), "팀 경로 실패 코드 형식(dept-create:) 누락");
     }
 
     /// ★K2-03 배선 핀: 세 판독 지점(list_depts · dept_display_name · read_dept_catalog)이 전부 **단일 판독기**
