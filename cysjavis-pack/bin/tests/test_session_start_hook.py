@@ -582,7 +582,7 @@ code, out, _ = run_hook(env, role="cso-1")
 check("20k 경로의 백슬래시가 그대로 찍힌다(printf · G8)", "pack\\nwin" in out, repr(out[-300:]))
 shutil.rmtree(tmp)
 check("20l 고지 경로 줄은 printf 로만 찍는다(소스 핀)",
-      "역할 지침을 주입하지 못했다" in _code and "printf '  지침 파일: %s" in _code, "")
+      "역할 지침을 주입하지 못했다" in _code and "printf '  지침 위치: %s" in _code, "")
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

@@ -3102,6 +3102,11 @@ def _cmd_run_chain(log):
         if code != 0:
             _progress("⚠ preflight 잔여 FAIL(비치명) — 팀 부팅 계속·진짜 게이트는 ⑤ check. 상세 boot-last.json")
     else:
+        # ★(0.14.41 U4 C2 ④) rc 0 · 비치명 계약은 그대로다. 다만 boot-last 최종 요약의
+        #   `steps: [(step, exit)]` 튜플만 보면 '부재 생략'과 '통과'가 같은 0 으로 보이므로, 기계
+        #   필드(preflight_state)와 사람용 ⚠ 한 줄로 **드러낸다**(판정은 바꾸지 않는다).
+        log.data["preflight_state"] = "absent"
+        _progress("⚠ ① preflight 스크립트 부재(%s) — 팩 불완전 가능 · 부트는 계속(비치명)" % preflight)
         log.step(STEP.PREFLIGHT, 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)

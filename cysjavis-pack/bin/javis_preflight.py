@@ -1071,6 +1071,17 @@ def _discover_isolation_block():
     return (None, None)
 
 
+def _leak_unreadable_note(unreadable):
+    """C56·C57 공용 — 판독 불가 settings 목록을 사람이 읽는 한 구절로(U4 C2 ②).
+    'PASS 아님' 을 문면에 박는다: 판정부 소비자(사람·master)가 WARN 을 '경미한 누수' 로 읽지
+    않고 '재지 못했다' 로 읽게 한다."""
+    names = ", ".join("%s/%s" % (os.path.basename(os.path.dirname(t)), os.path.basename(t))
+                      for t in unreadable[:5])
+    more = " 외 %d" % (len(unreadable) - 5) if len(unreadable) > 5 else ""
+    return ("%d개 settings 판독 불가(파싱·권한 실패: %s%s) — 누수 판정 불가(PASS 아님)"
+            % (len(unreadable), names, more))
+
+
 def discover_claude_settings():
     """$HOME 직하 .claude* **프로필 디렉터리**의 settings.json 전부(사전순) + 실사용 config dir.
 
@@ -1316,15 +1327,21 @@ class Preflight:
         wanted = {self._cid_family(x) for x in self.only}
         return [c for c in checks if self._check_family(c) in wanted]
 
-    def add(self, cid, status, detail):
+    def add(self, cid, status, detail, unmeasured=False):
         # ★triage T11 `--only`: 표적 밖 행은 **기록도 하지 않는다**. `skipped()` 는 검사 진입을
         #   막지만 조기 반환(예: C03 의 부서 팩 면제)은 그 앞에서 행을 남긴다 — 두 지점을 함께
         #   막아야 "무엇이 다시 측정됐는가" 가 출력 하나로 읽힌다.
+        # ★(0.14.41 U4 C2 ③) `unmeasured=True` = **재지 못한** SKIP(판정 불가·미측정·실행 실패)의
+        #   표지다. '해당 없음'(macOS 아님·대상 없음) SKIP 과 같은 칸에 담기면 요약 READY 가 둘을
+        #   구분하지 못한다. 행 키는 True 일 때만 추가한다(기존 행 형상 불변 — 소비자 무영향).
         if self.only and not self._only_match(cid):
             return
         sink = getattr(self._local, "sink", None)
         target = self.results if sink is None else sink
-        target.append({"id": cid, "status": status, "detail": detail})
+        row = {"id": cid, "status": status, "detail": detail}
+        if unmeasured:
+            row["unmeasured"] = True
+        target.append(row)
 
     def skipped(self, cid):
         if self.only and not self._only_match(cid):
@@ -2122,15 +2139,35 @@ class Preflight:
     # invariant: 비-부서 글로벌 settings(discover_claude_settings 반환)에 pack-dept-* 훅은 0이어야.
     # 부서 config는 discover의 _acct/_pack 가드가 애초에 제외 → 자기 dept 훅은 안전(검사 대상 아님).
     # report=FAIL(누수 N 탐지) · fix=청소(base 보존·빈 블록 제거·백업·원자적 쓰기). 수동 #2의 코드화.
-    def _dept_hooks_in(self, settings_path):
-        """결정론: settings.json hooks command 경로에 '/pack-dept-' 포함한 (event,bi,hi) 목록.
-        마커는 예방 가드(discover/_pack_is_dept)의 'pack-dept-'와 동일 — 명명부서(pack-dept-<custom>)도
-        탐지(가드의 짝). 경로경계 '/' 앵커로 비앵커 substring 오탐 제거. base(/pack/)·CEO(/pack-ceo/) 미매치."""
+    @staticmethod
+    def _settings_for_leak_scan(settings_path):
+        """C56·C57 누수 스캐너 공용 판독 — dict | {}(파일 부재) | None(판독·파싱 불가).
+
+        ★(0.14.41 U4 C2 ②) '나쁜 것이 없음을 증명하는' 검사가 파일을 못 읽으면 종전엔 빈 목록 =
+          '누수 0 · invariant 충족 PASS' 로 접혔다. 이제 판독 실패는 **None** 으로 구분해 판정부가
+          WARN 으로 드러낸다(측정 불능은 통과가 아니다).
+        ★단 **파일 부재(ENOENT)는 판독 실패가 아니다**: discover_claude_settings 는 G7 규약으로
+          settings.json 이 아직 없는 프로필 디렉터리도 대상에 넣는다 — 부재 = 훅 0개가 정답이고,
+          여기서 WARN 을 내면 새 프로필마다 오경보가 난다(반박 D1).
+        ★최상위가 객체가 아닌 JSON(배열·숫자)은 settings 형상이 아니다 → None(종전엔 `.get` 에서
+          AttributeError 로 검사 자체가 죽었다)."""
         try:
             with open(settings_path) as f:
                 data = json.load(f)
+        except FileNotFoundError:
+            return {}
         except Exception:
-            return []
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _dept_hooks_in(self, settings_path):
+        """결정론: settings.json hooks command 경로에 '/pack-dept-' 포함한 (event,bi,hi) 목록.
+        마커는 예방 가드(discover/_pack_is_dept)의 'pack-dept-'와 동일 — 명명부서(pack-dept-<custom>)도
+        탐지(가드의 짝). 경로경계 '/' 앵커로 비앵커 substring 오탐 제거. base(/pack/)·CEO(/pack-ceo/) 미매치.
+        ★(U4 C2 ②) 판독·파싱 불가면 **None**(누수 0 이 아니다) — 파일 부재는 [](훅 0개)."""
+        data = self._settings_for_leak_scan(settings_path)
+        if data is None:
+            return None
         hroot = data.get("hooks")
         if not isinstance(hroot, dict):  # 청소기와 대칭(무raise 계약·malformed 입력 부트크래시 방지)
             return []
@@ -2204,14 +2241,22 @@ class Preflight:
         if not targets:
             self.add(cid, WARN, "~/.claude*/settings.json 미발견")
             return
-        leaks = {t: self._dept_hooks_in(t) for t in targets}
-        leaks = {t: v for t, v in leaks.items() if v}
+        scanned = {t: self._dept_hooks_in(t) for t in targets}
+        unreadable = [t for t, v in scanned.items() if v is None]
+        ur_note = _leak_unreadable_note(unreadable)
+        leaks = {t: v for t, v in scanned.items() if v}
         if not leaks:
+            if unreadable:
+                # ★(U4 C2 ②) 판독 불가가 섞이면 '누수 0 PASS' 가 아니다 — 재지 못한 대상이 있다.
+                self.add(cid, WARN, "%s · 판독된 %d개에는 dept 훅 누수 0"
+                         % (ur_note, len(targets) - len(unreadable)))
+                return
             self.add(cid, PASS, "%d개 글로벌 settings에 dept 훅 누수 0 (invariant 충족)" % len(targets))
             return
         total = sum(len(v) for v in leaks.values())
         summary = ", ".join("%s:%d" % (os.path.basename(os.path.dirname(t)), len(v))
                             for t, v in leaks.items())
+        tail = (" · " + ur_note) if unreadable else ""
         if self.fix:
             done, errs = [], []
             for t in leaks:
@@ -2221,14 +2266,18 @@ class Preflight:
                 else:
                     done.append("%s(-%d)" % (os.path.basename(os.path.dirname(t)), n))
             if errs:
-                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s"
-                         % ("; ".join(errs), ", ".join(done)))
+                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s%s"
+                         % ("; ".join(errs), ", ".join(done), tail))
+            elif unreadable:
+                # 청소는 됐지만 재지 못한 대상이 남았다 — FIXED(완결)로 접지 않는다.
+                self.add(cid, WARN, "dept 훅 누수 %d개 제거(base 보존·백업): %s — ★claude 재시작 후 적용%s"
+                         % (total, ", ".join(done), tail))
             else:
                 self.add(cid, FIXED, "dept 훅 누수 %d개 제거(base 보존·백업): %s — ★claude 재시작 후 적용"
                          % (total, ", ".join(done)))
         else:
-            self.add(cid, FAIL, "글로벌 settings dept 훅 누수 %d개 탐지: %s (--fix로 청소)"
-                     % (total, summary))
+            self.add(cid, FAIL, "글로벌 settings dept 훅 누수 %d개 탐지: %s (--fix로 청소)%s"
+                     % (total, summary, tail))
 
     # ── C57 temp-pack hook 누수 invariant (C56 dept 누수의 짝 — 2026-07-02 근본복원) ──
     # invariant: 어떤 settings(hooks)에도 command 경로가 임시 디렉터리(/tmp·$TMPDIR·/var/folders)인
@@ -2236,12 +2285,11 @@ class Preflight:
     # /tmp 세션훅이 temp dir이 비거나 사라지며 SessionStart "No such file" 무한재발한 계열의 코드화 청소.
     # 예방(discover_claude_settings temp 가드)의 짝 — 이미 누수된 잔해를 제거한다. report=FAIL·fix=청소.
     def _temp_hooks_in(self, settings_path):
-        """결정론: settings.json hooks command 의 sh|bash 스크립트 경로가 temp dir 아래인 (event,bi,hi)."""
-        try:
-            with open(settings_path) as f:
-                data = json.load(f)
-        except Exception:
-            return []
+        """결정론: settings.json hooks command 의 sh|bash 스크립트 경로가 temp dir 아래인 (event,bi,hi).
+        ★(U4 C2 ②) 판독·파싱 불가면 **None**(누수 0 이 아니다) — 파일 부재는 [](훅 0개)."""
+        data = self._settings_for_leak_scan(settings_path)
+        if data is None:
+            return None
         hroot = data.get("hooks")
         if not isinstance(hroot, dict):
             return []
@@ -2315,14 +2363,22 @@ class Preflight:
         if not targets:
             self.add(cid, WARN, "~/.claude*/settings.json 미발견(temp-pack 컨텍스트면 정상)")
             return
-        leaks = {t: self._temp_hooks_in(t) for t in targets}
-        leaks = {t: v for t, v in leaks.items() if v}
+        scanned = {t: self._temp_hooks_in(t) for t in targets}
+        unreadable = [t for t, v in scanned.items() if v is None]
+        ur_note = _leak_unreadable_note(unreadable)
+        leaks = {t: v for t, v in scanned.items() if v}
         if not leaks:
+            if unreadable:
+                # ★(U4 C2 ②) 판독 불가가 섞이면 '누수 0 PASS' 가 아니다 — 재지 못한 대상이 있다.
+                self.add(cid, WARN, "%s · 판독된 %d개에는 temp 훅 누수 0"
+                         % (ur_note, len(targets) - len(unreadable)))
+                return
             self.add(cid, PASS, "%d개 settings에 temp 훅 누수 0 (invariant 충족)" % len(targets))
             return
         total = sum(len(v) for v in leaks.values())
         summary = ", ".join("%s:%d" % (os.path.basename(os.path.dirname(t)), len(v))
                             for t, v in leaks.items())
+        tail = (" · " + ur_note) if unreadable else ""
         if self.fix:
             done, errs = [], []
             for t in leaks:
@@ -2332,14 +2388,17 @@ class Preflight:
                 else:
                     done.append("%s(-%d)" % (os.path.basename(os.path.dirname(t)), n))
             if errs:
-                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s"
-                         % ("; ".join(errs), ", ".join(done)))
+                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s%s"
+                         % ("; ".join(errs), ", ".join(done), tail))
+            elif unreadable:
+                self.add(cid, WARN, "temp 훅 누수 %d개 제거(비-temp 보존·백업): %s — ★claude 재시작 후 적용%s"
+                         % (total, ", ".join(done), tail))
             else:
                 self.add(cid, FIXED, "temp 훅 누수 %d개 제거(비-temp 보존·백업): %s — ★claude 재시작 후 적용"
                          % (total, ", ".join(done)))
         else:
-            self.add(cid, FAIL, "글로벌 settings temp 훅 누수 %d개 탐지: %s (--fix로 청소)"
-                     % (total, summary))
+            self.add(cid, FAIL, "글로벌 settings temp 훅 누수 %d개 탐지: %s (--fix로 청소)%s"
+                     % (total, summary, tail))
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -2541,7 +2600,7 @@ class Preflight:
             return
         cys = shutil.which("cys")
         if not cys:
-            self.add(cid, SKIP, "cys 부재로 판정 불가 (C11 먼저)")
+            self.add(cid, SKIP, "cys 부재로 판정 불가 (C11 먼저)", unmeasured=True)
             return
 
         def ping():
@@ -5042,7 +5101,7 @@ class Preflight:
                          % (stats, " | ".join(residual), tail))
                 return
             self.add(cid, SKIP, "cysjavis 레지스트리에 판정할 (config, cwd) 쌍 0(%s) — 트러스트 판정 불가(PASS 아님 · 데몬이 "
-                     "claude 좌석을 기록한 뒤 재판정)%s" % (stats, tail))
+                     "claude 좌석을 기록한 뒤 재판정)%s" % (stats, tail), unmeasured=True)
             return
         targets = []
         missing_cfg = []
@@ -5367,14 +5426,14 @@ class Preflight:
         cys = os.environ.get("CYS_BIN") or shutil.which("cys")
         if not cys:
 
-            self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가")
+            self.add(cid, SKIP, "cys 바이너리 미발견 — 코퍼스 실측 버전 조회 불가", unmeasured=True)
             return
         try:
             # WARN-only 축이라 부트 창에서 오래 붙잡지 않는다(15s→6s · R1 minor).
             r = subprocess.run([cys, "gate-corpus", "--json"], capture_output=True,
                                text=True, timeout=6)
         except (OSError, subprocess.SubprocessError) as e:
-            self.add(cid, SKIP, "cys gate-corpus 호출 불가(%s)" % e)
+            self.add(cid, SKIP, "cys gate-corpus 호출 불가(%s)" % e, unmeasured=True)
             return
         blob = (r.stdout or "") + (r.stderr or "")
         _now0 = time.strftime("%Y-%m-%d %H:%M:%S%z")
@@ -5388,7 +5447,7 @@ class Preflight:
                 self.add(cid, SKIP,
                          "`cys gate-corpus` 동사 부재(구 바이너리 · rc=%d · 서명 %r · 측정 %s) — "
                          "코퍼스 드리프트를 잴 수 없다(SKIP 은 '드리프트 없음'이 아니다)"
-                         % (r.returncode, _sig.group(0)[:40], _now0))
+                         % (r.returncode, _sig.group(0)[:40], _now0), unmeasured=True)
             else:
                 self.add(cid, WARN,
                          "`cys gate-corpus` 비정상 종료(rc=%d · 측정 %s) — 동사 부재의 서명이 "
@@ -5421,7 +5480,7 @@ class Preflight:
         if live is None:
             self.add(cid, SKIP,
                      "claude --version 조회 불가 — 코퍼스 measured_on=%s (관문 %d · 측정 %s)"
-                     % (measured, n_gates, now))
+                     % (measured, n_gates, now), unmeasured=True)
             return
         if live == measured.strip():
             self.add(cid, PASS,
@@ -5740,14 +5799,14 @@ class Preflight:
             return
         launchctl = shutil.which("launchctl")
         if not launchctl:
-            self.add(cid, SKIP, "launchctl 부재 — 판정 불가")
+            self.add(cid, SKIP, "launchctl 부재 — 판정 불가", unmeasured=True)
             return
         label = "gui/%d/com.cysjavis.cysd" % os.getuid()
         try:
             r = subprocess.run([launchctl, "print", label],
                                capture_output=True, timeout=10, env=_utf8_env())
         except Exception as e:
-            self.add(cid, SKIP, "launchctl print 실행 실패 — 판정 불가: %s" % e)
+            self.add(cid, SKIP, "launchctl print 실행 실패 — 판정 불가: %s" % e, unmeasured=True)
             return
         out = ((r.stdout or b"").decode("utf-8", "replace")
                + (r.stderr or b"").decode("utf-8", "replace"))
@@ -5805,7 +5864,7 @@ class Preflight:
             data = json.load(open(p, encoding="utf-8"))
         except (OSError, ValueError) as e:
             # 부재·손상 수리는 C05 의 책임(백업·복원 경로 보유) — 여기서 중복 수리하지 않는다.
-            self.add(cid, SKIP, "agents.json 로드 불가(%s) — C05 먼저 해결" % e)
+            self.add(cid, SKIP, "agents.json 로드 불가(%s) — C05 먼저 해결" % e, unmeasured=True)
             return
         if not isinstance(data, dict):
             self.add(cid, FAIL, "agents.json 최상위가 객체가 아니다(%s)" % type(data).__name__)
@@ -6360,26 +6419,26 @@ class Preflight:
             return
         cys = shutil.which("cys")
         if not cys:
-            self.add(cid, SKIP, "PATH 에 cys 없음 — 데몬 판정 조회 불가(C11 소관)")
+            self.add(cid, SKIP, "PATH 에 cys 없음 — 데몬 판정 조회 불가(C11 소관)", unmeasured=True)
             return
         try:
             r = subprocess.run([cys, "status", "--json"], capture_output=True,
                                text=True, timeout=15, env=_utf8_env())
         except Exception as e:  # noqa: BLE001
-            self.add(cid, SKIP, "cys status --json 실행 불가(%s) — 미측정" % e)
+            self.add(cid, SKIP, "cys status --json 실행 불가(%s) — 미측정" % e, unmeasured=True)
             return
         if r.returncode != 0:
-            self.add(cid, SKIP, "cys status --json rc=%d — 미측정(데몬 미가동 가능)" % r.returncode)
+            self.add(cid, SKIP, "cys status --json rc=%d — 미측정(데몬 미가동 가능)" % r.returncode, unmeasured=True)
             return
         try:
             payload = json.loads(r.stdout or "{}")
         except Exception:  # noqa: BLE001
-            self.add(cid, SKIP, "cys status --json 판독 불가(JSON 아님) — 미측정")
+            self.add(cid, SKIP, "cys status --json 판독 불가(JSON 아님) — 미측정", unmeasured=True)
             return
         daemon = (payload.get("result") or {}).get("daemon") or {}
         if "npm_prefix_polluted" not in daemon:
             self.add(cid, SKIP, "daemon.npm_prefix_polluted 키 부재 — 구 데몬·부트 v2 미배선(미측정). "
-                                "키 부재를 '깨끗함'으로 접지 않는다")
+                                "키 부재를 '깨끗함'으로 접지 않는다", unmeasured=True)
             return
         if daemon.get("npm_prefix_polluted") is True:
             self.add(cid, WARN, NPM_PREFIX_BUNDLE_WARNING)
@@ -6449,7 +6508,7 @@ class Preflight:
             return
         tool = "/usr/bin/codesign"
         if not os.path.exists(tool):
-            self.add(cid, SKIP, "%s 부재 — 판정 불가" % tool)
+            self.add(cid, SKIP, "%s 부재 — 판정 불가" % tool, unmeasured=True)
             return
         # --verify --strict = Gatekeeper 가 보는 최상위 봉인 판정. --verbose 는 **필수**:
         # 없으면 "a sealed resource is missing or invalid" 한 줄뿐이라 원인 파일을 못 말한다(실측).
@@ -6458,10 +6517,10 @@ class Preflight:
             r = subprocess.run([tool, "--verify", "--strict", "--verbose", bundle],
                                capture_output=True, timeout=60, env=_utf8_env())
         except subprocess.TimeoutExpired:
-            self.add(cid, SKIP, "codesign 시간초과(60s) — 판정 불가")
+            self.add(cid, SKIP, "codesign 시간초과(60s) — 판정 불가", unmeasured=True)
             return
         except Exception as e:  # noqa: BLE001
-            self.add(cid, SKIP, "codesign 실행 실패(%s) — 판정 불가" % e)
+            self.add(cid, SKIP, "codesign 실행 실패(%s) — 판정 불가" % e, unmeasured=True)
             return
         if r.returncode == 0:
             self.add(cid, PASS, "코드서명 봉인 무결 — %s" % bundle)
@@ -6615,7 +6674,7 @@ class Preflight:
         try:
             import javis_runtime_seal as _seal
         except Exception as e:  # noqa: BLE001
-            self.add(cid, SKIP, "javis_runtime_seal 판독 불가(%s) — 판정 불가" % e)
+            self.add(cid, SKIP, "javis_runtime_seal 판독 불가(%s) — 판정 불가" % e, unmeasured=True)
             return
         man, root = self._find_runtime_seal_pair()
         if not root:
@@ -6628,7 +6687,7 @@ class Preflight:
             expected = self._runtime_seal_expected(ver)
             if expected is None:
                 self.add(cid, SKIP, "runtime-manifest 부재 + 설치본 버전 판독 불가(%s) — "
-                                    "판정 불가(통과가 아니다) · 트리: %s" % (where, root))
+                                    "판정 불가(통과가 아니다) · 트리: %s" % (where, root), unmeasured=True)
                 return
             if not expected:
                 self.add(cid, SKIP, "runtime-manifest 부재 — 설치본 %s 는 봉인 도입(v%s) 이전이라 "
@@ -6645,7 +6704,7 @@ class Preflight:
             m = _seal.load_manifest(man)
             d = _seal.classify(m, root)
         except Exception as e:  # noqa: BLE001
-            self.add(cid, SKIP, "봉인 대조 실패(%s) — 판정 불가" % e)
+            self.add(cid, SKIP, "봉인 대조 실패(%s) — 판정 불가" % e, unmeasured=True)
             return
         total = len(d["missing"]) + len(d["added"]) + len(d["changed"])
         if total == 0:
@@ -10386,6 +10445,9 @@ def main():
     fails = sum(1 for r in results if r["status"] == FAIL)
 
     warns = sum(1 for r in results if r["status"] == WARN)
+    # ★(0.14.41 U4 C2 ③) 재지 못한 SKIP(판정 불가·미측정)의 수 — '해당 없음' SKIP 과 구분한다.
+    #   **exit code 는 바꾸지 않는다**(① 비치명 계약·`--only` rc 2 계약 불변). 드러내기만 한다.
+    unmeasured = [r for r in results if r["status"] == SKIP and r.get("unmeasured")]
     # dry/safe: "변경했나"가 아니라 "변경이 필요한가"를 보고 — planned 비어있지 않으면 변경 예정.
     planned_change = any(p["cid"] for p in pf.planned)
 
@@ -10393,7 +10455,9 @@ def main():
         print(json.dumps(
             {"ok": fails == 0, "fails": fails, "warns": warns,
              "mode": mode, "planned": pf.planned,
-             "pack_dir": pack_dir(), "checks": results},
+             "pack_dir": pack_dir(), "checks": results,
+             # 추가 전용 키(기존 키 불변) — 재지 못한 검사 id. READY 여부(`ok`)와 별개 축이다.
+             "unmeasured": [r["id"] for r in unmeasured]},
             ensure_ascii=False, indent=2,
         ))
     else:
@@ -10402,18 +10466,26 @@ def main():
         print("─" * 60)
         if mode in ("dry", "safe"):
             tag = "DRY-RUN(미리보기)" if mode == "dry" else "SAFE(무변경 진단)"
-            print("preflight[%s]: 비가역 외부설치 예정 %d건 · FAIL %d · WARN %d · 검사 %d"
-                  % (tag, len(pf.planned), fails, warns, len(results)))
+            print("preflight[%s]: 비가역 외부설치 예정 %d건 · FAIL %d · WARN %d · 미측정 %d · 검사 %d"
+                  % (tag, len(pf.planned), fails, warns, len(unmeasured), len(results)))
             if pf.planned:
                 print("위 [DRYRUN]/[SAFE-GAP] 항목 = 비가역 external_install 변경 대상(--allow-irreversible 주의).")
             print("※ 가역 로컬 변경(soul/hook/settings/todo 등)은 이 모드에서 self.fix=False 로 "
                   "일괄 비집행 — 개별 미리보기는 비가역 외부설치 항목에 한정된다.")
         else:
             verdict = "READY (프로젝트 시작 준비 완료)" if fails == 0 else "NOT READY"
-            print("preflight: %s — FAIL %d · WARN %d · 검사 %d"
-                  % (verdict, fails, warns, len(results)))
+            # ★요약 줄은 **항상 마지막 줄**이다(0.14.41 U4 C2 ③ · 반박 M6·D2): javis_checklist 가
+            #   이 출력의 마지막 비어 있지 않은 줄을 SessionStart 컨텍스트에 싣는다. 종전엔 FAIL 이
+            #   있으면 마지막 줄이 아래 안내 문장이라 판정·개수가 컨텍스트에서 사라졌다. 그래서
+            #   미측정 id 목록과 FAIL 안내를 **요약 앞**에 찍고, 개수는 요약 줄 안에만 넣는다.
+            if unmeasured:
+                print("※ 미측정 %d건 — 통과가 아니다('해당 없음' SKIP 과 다르다): %s"
+                      % (len(unmeasured), "; ".join("%s(%s)" % (r["id"], str(r["detail"])[:80])
+                                                     for r in unmeasured)))
             if fails:
                 print("FAIL 항목을 수리하고 재실행하라. 이 출력 외의 추론으로 READY를 선언하지 마라.")
+            print("preflight: %s — FAIL %d · WARN %d · 미측정 %d · 검사 %d"
+                  % (verdict, fails, warns, len(unmeasured), len(results)))
     # 종료코드: dry/safe = 0(변경 불필요)·2(변경 예정)·1(진단 FAIL). report/fix = 기존 계약 불변.
     if mode in ("dry", "safe"):
         if fails:
