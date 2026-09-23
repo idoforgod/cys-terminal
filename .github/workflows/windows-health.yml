@@ -374,8 +374,14 @@ jobs:
       #   ★이 스텝은 **자기가 실패하지 않는다**(exit 0 · `-e` 끔) — 판독자가 죽어 잡을 붉히면 '드러내기만'
       #     이 차단으로 바뀐다. 파일·환경이 없으면 '측정 불가' 로 적고 끝낸다.
       #   ★`if: always()` = 앞 스텝이 어떻게 끝났든(절단 포함) 돈다. 잡 수준 조건이 아니다(H-WIN-11 규율).
+      #   ★`continue-on-error: true` 는 **보고자 안전띠**다(게이트 관용이 아니다): 이 스텝은 판정을 하지 않는
+      #     보고 전용이고, Windows Git Bash 에서의 첫 실행은 로컬에서 재현할 수 없다(하네스는 macOS bash).
+      #     보고자가 뜻밖의 이유(파싱·러너 이상)로 죽어도 잡 판정이 **이 변경 전과 한 글자도 다르지 않게**
+      #     — 즉 release windows-health-gate 가 새 차단원을 얻지 않게 — 한다. 그 경우에도 스텝 자체는 빨간
+      #     스텝으로 런 페이지에 남는다(조용히 사라지지 않는다).
       - name: cysd-win 결과 판독 (비차단 · annotation + STEP_SUMMARY · 절단 표지)
         if: always()
+        continue-on-error: true
         shell: bash
         env:
           CYSD_OUTCOME: ${{ steps.cysd_win.outcome }}
