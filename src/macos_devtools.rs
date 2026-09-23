@@ -67,14 +67,26 @@ fn is_executable_file(p: &Path) -> bool {
 
 /// libxcselect 탐색 모사 — **선택된** 개발자 디렉터리(순수: env·후보를 인자로 받고 디스크 stat 만 한다).
 ///
-/// `DEVELOPER_DIR` 가 비어 있지 않고 디렉터리면 그것, 아니면 후보 중 **처음 실재하는 디렉터리 하나**.
-/// 하나도 없으면 None(= CLT·Xcode 둘 다 없는 맥 — 셔임이 설치 창을 띄우는 바로 그 상태).
+/// `DEVELOPER_DIR` 가 비어 있지 않으면: ★MINOR-4(리뷰1 · `man xcode-select` ENVIRONMENT 절 실측) —
+/// 이 값은 실제 Developer contents 디렉터리여도 되고, **Xcode 앱 번들 루트**(예:
+/// `/Applications/Xcode-beta.app`)여도 된다. 후자는 xcode-select 가 설치하는 셔임들이 내부에서
+/// `Contents/Developer` 로 **자동 변환**한다("the xcode-select provided shims will automatically
+/// convert to the full Developer contents subdirectory"). 그래서 먼저 `<DEVELOPER_DIR>/Contents/
+/// Developer` 가 디렉터리면 그것을 고르고(앱 루트 케이스 — 이 축 없으면 앱 루트를 쓰는 개발자
+/// 기계를 "CLT 없음"으로 오판해 불필요하게 동봉 python 을 주입한다), 아니면 값을 있는 그대로 쓴다
+/// (이미 `…/Contents/Developer` 이거나 CLT 루트인 정상 케이스). 둘 다 아니면 후보 중 **처음 실재
+/// 하는 디렉터리 하나**. 하나도 없으면 None(= CLT·Xcode 둘 다 없는 맥 — 셔임이 설치 창을 띄우는
+/// 바로 그 상태). 셸 짝은 `_lib.sh` `cys_clt_tool_present`(같은 순서).
 pub fn selected_developer_dir_in(
     developer_dir_env: Option<&OsStr>,
     candidates: &[PathBuf],
 ) -> Option<PathBuf> {
     if let Some(d) = developer_dir_env.filter(|d| !d.is_empty()) {
         let p = PathBuf::from(d);
+        let converted = p.join("Contents").join("Developer");
+        if converted.is_dir() {
+            return Some(converted);
+        }
         if p.is_dir() {
             return Some(p);
         }
@@ -194,6 +206,25 @@ pub fn path_with_dir_first(dir: &Path, current: Option<&OsStr>) -> OsString {
     }
     std::env::join_paths(parts)
         .unwrap_or_else(|_| current.map(OsStr::to_os_string).unwrap_or_default())
+}
+
+/// `exe` 의 **정규화된** 부모 디렉터리(리뷰1 MAJOR-2 실측 대응).
+///
+/// ★사실(2026-09-23 리뷰1 rustc 프로브 실측): macOS 의 `std::env::current_exe()` 는 심링크를
+/// **풀지 않는다** — 절대경로로 불러도 PATH 탐색으로 불러도 같다(`cys.rs` 옛 주석 "이미 realpath"는
+/// 거짓이었다). 이 기계엔 앱이 까는 루트 심링크 `/usr/local/bin/cys → …/cys.app/Contents/MacOS/cys`
+/// 가 있고, 좌석 Bash·`session-start.sh` BOOT_CMD·`role-bootstrap-legacy.sh` spawn 폴백이 모두
+/// PATH 로 그 심링크를 고른다. 심링크 경로를 그대로 `.parent()` 하면 `/usr/local/bin` 이 나와
+/// [`bundled_python3_path`] 가 `None`(번들 레이아웃이 아니므로) → [`clt_absent_child_path`] 가
+/// 무력화된다(회수 자식이 여전히 `/usr/bin/python3` 셔임을 부른다). `canonicalize` 로 심링크를
+/// 실체까지 푼 뒤 부모를 구하면 `…/Contents/MacOS` 가 나와 번들 탐지가 다시 선다.
+///
+/// canonicalize 실패(대상이 이미 사라졌거나 권한 문제 — 드묾)는 **원래 경로로 폴백**한다(에러로
+/// 죽지 않는다 · 실패측은 종전 동작인 "무접촉"으로 자연히 수렴한다 — `clt_absent_child_path` 가
+/// 그 경로에서 번들을 못 찾으면 None 을 돌려줄 뿐이다).
+pub fn canonicalized_exe_parent(exe: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    resolved.parent().map(Path::to_path_buf)
 }
 
 /// `cys boot` 회수 자식(`escalate_reclaim`)의 PATH — CLT 없는 맥에서만 Some(동봉 python 디렉터리 선두).
@@ -326,6 +357,32 @@ mod tests {
             selected_developer_dir_in(Some(OsStr::new("")), &cands),
             Some(xcode.clone())
         );
+
+        // ④' ★MINOR-4(리뷰1): DEVELOPER_DIR 이 Xcode **앱 번들 루트**(Contents/Developer 자체가
+        //    아님)여도, 그 안의 Contents/Developer 가 실재하면 그것으로 변환해 선택한다(man
+        //    xcode-select 셔임 변환 규약 — 이 축 없으면 앱 루트를 쓰는 CLT 기계를 부재로 오판한다).
+        let app_root = base.join("Xcode-beta.app");
+        let app_dev = app_root.join("Contents").join("Developer");
+        plant_tool(&app_dev, "python3");
+        assert_eq!(
+            selected_developer_dir_in(Some(app_root.as_os_str()), &cands),
+            Some(app_dev.clone()),
+            "Xcode 앱 번들 루트를 Contents/Developer 로 변환하지 않았다"
+        );
+        assert!(
+            clt_tool_present_in(Some(app_root.as_os_str()), &cands, "python3"),
+            "앱 번들 루트로 DEVELOPER_DIR 를 준 CLT 기계를 부재로 오판했다"
+        );
+        // 앱 루트 안에 Contents/Developer 가 없으면(라이선스 미동의 등) 변환하지 않고 값을 그대로
+        // 쓴다(기존 계약 유지 — usr/bin 이 없으니 도구는 결국 부재로 판정된다).
+        let bare_app_root = base.join("Xcode-bare.app");
+        std::fs::create_dir_all(&bare_app_root).unwrap();
+        assert_eq!(
+            selected_developer_dir_in(Some(bare_app_root.as_os_str()), &cands),
+            Some(bare_app_root.clone()),
+            "Contents/Developer 가 없는 앱 루트에서 값을 그대로 쓰지 않았다"
+        );
+        assert!(!clt_tool_present_in(Some(bare_app_root.as_os_str()), &cands, "python3"));
 
         // ⑤ 실행 비트 없는 파일·이름에 구분자 → 부재.
         #[cfg(unix)]
@@ -479,6 +536,77 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// ★생산 배선 핀(호스트 무관 · 리뷰1 MAJOR-1 대응) — `spawn_env_pairs_with` 에 가짜 ⑦ 판정을
+    /// 주입해, 리눅스·윈도우·CLT 있는 맥·이 개발기를 포함한 **어느 CI 레인에서든** 양성 갈래(두 쌍
+    /// 주입)와 음성 갈래(무주입) 를 둘 다 실행·단언한다. 위 `spawn_env_pairs_wires_seventh_pair_…`
+    /// 는 실제 호스트 판정을 재는 통합 핀으로 남기고, 이 테스트가 ⑦ 배선 자체의 1차 방어선이다.
+    /// ⑦ 호출이 통째로 지워지는 회귀(리뷰1 실측 뮤테이션 R1)는 `expect_on` 분기 없이 이 테스트
+    /// 하나로 즉사한다.
+    #[test]
+    fn spawn_env_pairs_with_wires_seventh_pair_regardless_of_host() {
+        let py = Path::new("/App/cys.app/Contents/Resources/runtime/python/bin/python3");
+        let exe_dir = Path::new("/irrelevant-for-this-test/Contents/MacOS");
+
+        // 양성: 판정이 Some 이고 사용자 CYS_PY 가 없다 → 두 쌍이 정확히 실린다(호스트 무관).
+        let on = crate::spawn_env_pairs_with(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py), false);
+        let got: Vec<(String, String)> = on
+            .iter()
+            .filter(|(k, _)| k == ENV_CYS_PY || k == ENV_CYS_PY_ORIGIN)
+            .cloned()
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ENV_CYS_PY.to_string(), py.to_string_lossy().into_owned()),
+                (ENV_CYS_PY_ORIGIN.to_string(), CYS_PY_ORIGIN_CLT_ABSENT.to_string()),
+            ],
+            "판정이 Some 인데 spawn_env_pairs_with 가 ⑦ 두 쌍을 정확히 싣지 않았다 \
+             (⑦ 호출이 지워졌거나 값이 갈렸다면 여기서 잡힌다 — 호스트 무관)"
+        );
+
+        // 음성 ⓐ: 판정이 None(동봉 python 없음·CLT 있음 등) → ⑦ 키가 0개(바이트 동일 계약).
+        let off = crate::spawn_env_pairs_with(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, None, false);
+        assert!(
+            !off.iter().any(|(k, _)| k == ENV_CYS_PY || k == ENV_CYS_PY_ORIGIN),
+            "판정이 None 인데 ⑦ 키가 실렸다: {off:?}"
+        );
+
+        // 음성 ⓑ: 판정은 Some 이지만 사용자가 이미 CYS_PY 를 설정했다 → 덮지 않는다(불가침 계약).
+        let user = crate::spawn_env_pairs_with(exe_dir, "/usr/bin:/bin", Some("/Users/user"), None, Some(py), true);
+        assert!(
+            !user.iter().any(|(k, _)| k == ENV_CYS_PY || k == ENV_CYS_PY_ORIGIN),
+            "사용자 CYS_PY 가 있는데 ⑦ 이 덮었다: {user:?}"
+        );
+    }
+
+    /// ★생산 배선 소스 핀(리뷰1 MAJOR-1 최소 방어선) — `spawn_env_pairs`(공용 스폰 규약의 유일
+    /// 생산 진입점)가 실제 호스트 판정을 `spawn_env_pairs_with` 에 넘기고, 그 판정이 이 모듈의
+    /// 단일 판정 함수(`clt_absent_bundled_python`)에서 온다. 위 배선 핀들이 죽어도(예: 둘 다 통째로
+    /// 지워지는 변이) 이 소스 대조가 독립적으로 잡는다 — `boot_child_path`(부트 감독)·
+    /// `clt_absent_child_path`(회수) 소비자와 같은 급의 소스 핀이다.
+    #[test]
+    fn spawn_env_pairs_wires_seventh_verdict_through_single_source_source_pin() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let i = prod.find("pub fn spawn_env_pairs(").expect("spawn_env_pairs 소실");
+        let body = &prod[i..prod[i..].find("\n}\n").map(|e| i + e).unwrap_or(prod.len())];
+        assert!(
+            body.contains("spawn_env_pairs_with("),
+            "spawn_env_pairs 가 순수 조립부(spawn_env_pairs_with)를 거치지 않는다"
+        );
+        assert!(
+            body.contains("macos_devtools::clt_absent_bundled_python(exe_dir)"),
+            "⑦ 판정을 이 모듈의 단일 판정(clt_absent_bundled_python) 밖에서 구한다(판정 사본 = 조건 드리프트)"
+        );
+
+        let j = prod.find("pub fn spawn_env_pairs_with(").expect("spawn_env_pairs_with 소실");
+        let with_body = &prod[j..prod[j..].find("\n}\n").map(|e| j + e).unwrap_or(prod.len())];
+        assert!(
+            with_body.contains("macos_devtools::inject_cys_py_for(&mut env, clt_absent_bundled, user_has_cys_py)"),
+            "spawn_env_pairs_with 가 ⑦ 주입 코어(inject_cys_py_for)를 인자 그대로 부르지 않는다"
+        );
+    }
+
     /// 자식 PATH 합성 — 동봉 디렉터리 선두 + 나머지 순서 보존 · PATH 부재에서도 선두 한 조각.
     #[test]
     fn path_with_dir_first_keeps_rest_in_order() {
@@ -502,6 +630,84 @@ mod tests {
             clt_absent_child_path(Path::new("/nonexistent-exe-dir-for-pin"), Some(cur.as_os_str())),
             None
         );
+    }
+
+    /// ★리뷰1 MAJOR-2 회귀 — 가짜 번들 + 심링크. `/usr/local/bin/cys → 번들 안 실체` 와 동형인
+    /// 심링크를 만들어 두 가지를 못박는다: ① `canonicalized_exe_parent` 는 어느 unix 호스트에서도
+    /// 심링크를 실체 부모까지 푼다(canonicalize 는 OS 중립). ② (macOS 호스트에 한해) 그 정규화된
+    /// 부모에서만 [`bundled_python3_path`] 가 동봉 python 을 찾고, **심링크 디렉터리 자체**에서는
+    /// 못 찾는다(= 수리 전 버그의 실측 재현 — [`runtime_bin_dirs`](crate::runtime_bin_dirs) 가
+    /// macOS 에서만 `Contents/Resources/runtime` 레이아웃을 스캔하므로 다른 호스트에선 애초에
+    /// 둘 다 None 이다).
+    #[test]
+    fn canonicalized_exe_parent_resolves_symlinked_launcher_to_bundled_python() {
+        if !cfg!(unix) {
+            return; // 심링크·실행비트 의미론은 unix 전용(윈도우 무접촉 계약 — 이 파일의 다른 unix 게이트 테스트와 동형).
+        }
+        // canonicalize the scratch root itself — on macOS `$TMPDIR` lives under a symlink
+        // (`/var` → `/private/var`), so comparing against a non-canonicalized `base` would fail
+        // for the wrong reason (a *different* symlink than the one this test means to exercise).
+        let base = std::fs::canonicalize(scratch("symlink-major2")).unwrap();
+
+        // 가짜 앱 번들: <base>/Contents/MacOS/cys(실행파일) + …/Resources/runtime/python/bin/python3.
+        let macos_dir = base.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos_dir).unwrap();
+        let real_exe = macos_dir.join("cys");
+        std::fs::write(&real_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        let pybin = base
+            .join("Contents")
+            .join("Resources")
+            .join("runtime")
+            .join("python")
+            .join("bin");
+        std::fs::create_dir_all(&pybin).unwrap();
+        let fake_py = pybin.join("python3");
+        std::fs::write(&fake_py, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&fake_py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 루트 심링크: <base>/usr-local-bin/cys → 위 실행파일(오너 기계의 /usr/local/bin/cys 와 동형).
+        let link_dir = base.join("usr-local-bin");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join("cys");
+        std::os::unix::fs::symlink(&real_exe, &link).unwrap();
+
+        // ① canonicalize 는 어느 unix 호스트에서도 심링크를 실체 부모까지 푼다.
+        let resolved = canonicalized_exe_parent(&link).expect("심링크 부모 해소 실패");
+        assert_eq!(resolved, macos_dir, "canonicalize 결과가 실제 MacOS 디렉터리가 아니다");
+
+        // canonicalize 실패(대상 소실) → 원래 경로로 폴백(에러로 죽지 않는다).
+        let ghost_parent = base.join("nonexistent-parent-for-fallback");
+        let ghost = ghost_parent.join("cys");
+        assert_eq!(
+            canonicalized_exe_parent(&ghost),
+            Some(ghost_parent),
+            "canonicalize 실패에서 원래 부모로 폴백하지 않았다"
+        );
+
+        // ② macOS 호스트에서만: 정규화된 부모는 동봉 python 을 찾고, 심링크 디렉터리 자체는 못 찾는다
+        //    (= MAJOR-2 버그의 실측 재현 — 수리 전에는 escalate_reclaim 이 후자를 썼다).
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                bundled_python3_path(&link_dir),
+                None,
+                "심링크 디렉터리에서 번들 python 을 찾았다 — 이 검체의 버그 재현 전제가 깨졌다"
+            );
+            assert_eq!(
+                bundled_python3_path(&resolved),
+                Some(fake_py.clone()),
+                "canonicalize 된 exe_dir 에서 동봉 python 을 찾지 못했다 — MAJOR-2 수리가 무효다"
+            );
+        } else {
+            // 다른 호스트는 runtime_bin_dirs 가 이 레이아웃을 아예 스캔하지 않는다(cfg 게이트) —
+            // 둘 다 None 이 정상이고, 이 축의 회귀 방어는 macOS 호스트의 몫이다.
+            assert_eq!(bundled_python3_path(&resolved), None);
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// ★전제 실측 — unix `Command` 는 **자식 env 의 PATH** 로 프로그램을 찾는다(회수 수리의 기전).

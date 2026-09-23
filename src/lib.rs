@@ -1721,6 +1721,34 @@ pub fn spawn_env_pairs(
     home: Option<&str>,
     userprofile: Option<&str>,
 ) -> Vec<(String, String)> {
+    // ⑦ 의 판정(macOS·CLT 부재·동봉 실재·사용자 무설정)만 여기서 실측(디스크 stat + 프로세스 env
+    // 판독)하고, 나머지 전부는 [`spawn_env_pairs_with`] 가 순수하게 조립한다 — 리뷰1 MAJOR-1(⑦ 배선
+    // 핀이 호스트 판정에 갇혀 CI 의 어느 레인에서도 양성 갈래를 돌리지 못했다)에 대응해, 그 순수 틈이
+    // 가짜 판정을 주입받아 호스트와 무관하게 배선을 잴 수 있게 만들었다(테스트는 macos_devtools.rs
+    // `spawn_env_pairs_with_wires_seventh_pair_regardless_of_host` 참고).
+    spawn_env_pairs_with(
+        exe_dir,
+        current_path,
+        home,
+        userprofile,
+        macos_devtools::clt_absent_bundled_python(exe_dir).as_deref(),
+        std::env::var_os(macos_devtools::ENV_CYS_PY).is_some(),
+    )
+}
+
+/// [`spawn_env_pairs`] 의 순수 조립부 — ⑦ 의 CLT-부재 판정(`clt_absent_bundled`)과 사용자 `CYS_PY`
+/// 존재 여부(`user_has_cys_py`)를 **인자로 받는다**(디스크 stat·프로세스 env 판독은 호출부의 몫이다).
+/// 운영 경로는 항상 [`spawn_env_pairs`] 를 거쳐 실제 호스트로 이 값들을 채운다 — 이 함수를 직접
+/// 부르는 것은 테스트뿐이고, 그 목적은 가짜 판정(`Some(..)`)을 주입해 **어느 호스트에서든** ⑦ 배선을
+/// 잴 수 있게 하는 것이다(호스트가 어떻든 결과가 같아야 하는 순수 함수라 회귀 위험이 없다).
+pub fn spawn_env_pairs_with(
+    exe_dir: &Path,
+    current_path: &str,
+    home: Option<&str>,
+    userprofile: Option<&str>,
+    clt_absent_bundled: Option<&Path>,
+    user_has_cys_py: bool,
+) -> Vec<(String, String)> {
     let mut env = Vec::new();
     if let Some(newp) = runtime_prefixed_path(exe_dir, current_path) {
         env.push(("PATH".to_string(), newp));
@@ -1761,11 +1789,7 @@ pub fn spawn_env_pairs(
     );
     // ⑦ U15(0.14.41): CLT 없는 맥에서만 동봉 python 을 훅에 명시한다(판정·롤백은 단일 판정이 소유 ·
     //    비-macOS 는 디스크 stat 0 으로 None). 조건 미충족 = 쌍 0개 = 종전과 바이트 동일.
-    macos_devtools::inject_cys_py_for(
-        &mut env,
-        macos_devtools::clt_absent_bundled_python(exe_dir).as_deref(),
-        std::env::var_os(macos_devtools::ENV_CYS_PY).is_some(),
-    );
+    macos_devtools::inject_cys_py_for(&mut env, clt_absent_bundled, user_has_cys_py);
     env
 }
 

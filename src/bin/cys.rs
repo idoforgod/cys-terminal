@@ -7796,8 +7796,13 @@ fn diag_legacy_config(_ctx: &DoctorCtx) -> DiagItem {
 /// `X.app/Contents/MacOS/<exe>` 를 조상 방향으로 거슬러 올라가되, `Contents/Info.plist`
 /// 존재로 **진짜 번들임을 확증**한다(이름만 `.app` 인 디렉토리에 속지 않는다).
 /// 번들 밖 실행(cargo run·비번들 설치)이면 None → 호출부가 Skip 으로 강등한다.
-/// ★심링크: `current_exe()` 는 이미 realpath 라 `/usr/local/bin/cys → 번들 안 실체`로 불러도
-///   번들이 정상 탐지된다(심링크 경로를 그대로 쓰면 탐지 실패했을 자리).
+/// ★심링크 정정(2026-09-23 리뷰1 rustc 프로브 실측 — 이 주석은 예전에 반대로 적혀 있었다):
+///   `current_exe()` 는 macOS 에서 심링크를 **풀지 않는다**. 그래서 `/usr/local/bin/cys → 번들
+///   안 실체` 처럼 심링크로 불렸을 때 이 함수에 그 심링크 경로가 그대로 들어오면, 조상 어디에도
+///   `.app` 세그먼트가 없어 탐지에 **실패한다**(호출부가 Skip 으로 강등 — 이 함수 자신은
+///   canonicalize 를 하지 않는다). 심링크-안전 탐지가 필요한 호출부는 먼저 경로를 정규화해야
+///   한다(예: `escalate_reclaim` 이 쓰는 [`cys::macos_devtools::canonicalized_exe_parent`] — 다만
+///   그건 exe_dir 을 원하는 소비자용이고, 번들 루트가 필요하면 canonicalize 후 이 함수를 부른다).
 fn detect_app_bundle(exe: &std::path::Path) -> Option<std::path::PathBuf> {
     for anc in exe.ancestors() {
         let looks_app = anc
@@ -11600,11 +11605,16 @@ fn escalate_reclaim(role: &str) {
     //   + 비0 · stdout 빈 값)으로 풀려 죽은 좌석이 영영 회수되지 않았다(재부팅 뒤 대표 자리·빈 자리 복구 불능).
     //   인터프리터 이름·스폰 지점은 그대로 두고(아래 Windows 보수 판정) **자식 PATH 선두**만 동봉 python
     //   디렉터리로 바꾼다 — 그 이름이 동봉본으로 풀린다. None(윈도우·리눅스·CLT 있는 맥)이면 무접촉이다.
+    // ★리뷰1 MAJOR-2 실측: current_exe() 는 macOS 에서 심링크를 풀지 않는다 — `/usr/local/bin/cys`
+    //   심링크로 불리면(좌석 Bash·session-start.sh BOOT_CMD·role-bootstrap-legacy.sh spawn 폴백이
+    //   전부 이 경로로 부른다) `.parent()` 가 `/usr/local/bin` 이 되어 번들 탐지가 무력화된다.
+    //   `canonicalized_exe_parent` 로 심링크를 실체까지 푼 뒤 부모를 구한다(자세한 사실·근거는
+    //   그 함수 문서).
     if let Some(path) = std::env::current_exe()
         .ok()
         .as_deref()
-        .and_then(std::path::Path::parent)
-        .and_then(|d| cys::macos_devtools::clt_absent_child_path(d, std::env::var_os("PATH").as_deref()))
+        .and_then(cys::macos_devtools::canonicalized_exe_parent)
+        .and_then(|d| cys::macos_devtools::clt_absent_child_path(&d, std::env::var_os("PATH").as_deref()))
     {
         cmd.env("PATH", path);
     }

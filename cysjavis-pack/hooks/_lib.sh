@@ -179,7 +179,14 @@ cys_clt_tool_present() {
   _cys_ct_t="${1:-}"
   case "$_cys_ct_t" in ''|*/*) return 1 ;; esac
   _cys_ct_sel=""
-  if [ -n "${DEVELOPER_DIR:-}" ] && [ -d "${DEVELOPER_DIR:-}" ]; then
+  # ★MINOR-4(리뷰1 · man xcode-select ENVIRONMENT 절): DEVELOPER_DIR 는 실제 Developer contents
+  # 디렉터리여도 되고, **Xcode 앱 번들 루트**(예: /Applications/Xcode-beta.app)여도 된다 — 후자는
+  # xcode-select 셔임이 내부에서 Contents/Developer 로 자동 변환한다. 그 변환된 경로가 실재하면
+  # 먼저 그것을 고르고(앱 루트 케이스), 아니면 값을 있는 그대로 쓴다(이미 …/Contents/Developer 나
+  # CLT 루트인 정상 케이스) — Rust 짝 `selected_developer_dir_in` 과 같은 순서.
+  if [ -n "${DEVELOPER_DIR:-}" ] && [ -d "${DEVELOPER_DIR:-}/Contents/Developer" ]; then
+    _cys_ct_sel="${DEVELOPER_DIR:-}/Contents/Developer"
+  elif [ -n "${DEVELOPER_DIR:-}" ] && [ -d "${DEVELOPER_DIR:-}" ]; then
     _cys_ct_sel="${DEVELOPER_DIR:-}"
   else
     _cys_ct_rest="${CYS_DEVTOOLS_ROOTS:-/var/db/xcode_select_link:/Applications/Xcode.app/Contents/Developer:/Library/Developer/CommandLineTools}:"
