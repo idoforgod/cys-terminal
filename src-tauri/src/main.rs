@@ -11,6 +11,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+// ★U6(0.14.41) 피드백 1단계 — 로컬 묶음 + 메일 앱 + 폴더 열기(서버 전송 없음). 계약은 모듈 머리말.
+mod feedback;
+
 type Stream = Box<dyn AsyncReadWrite>;
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
@@ -6604,6 +6607,19 @@ fn main() {
             read_text_head,
             home_dir_path,
             open_url,
+            // ★U6(0.14.41) 피드백 1단계(src-tauri/src/feedback.rs) — 등재 누락은 ui feedbackwiring 핀이 잡는다.
+            feedback::feedback_draft_new,
+            feedback::feedback_attach_path,
+            feedback::feedback_attach_begin,
+            feedback::feedback_attach_chunk,
+            feedback::feedback_attach_commit,
+            feedback::feedback_detach,
+            feedback::feedback_discard,
+            feedback::feedback_diag_preview,
+            feedback::feedback_submit,
+            feedback::feedback_open_mail,
+            feedback::feedback_reveal,
+            feedback::feedback_open_mail_app,
             send_key,
             read_board_catalog,
             make_ticket,

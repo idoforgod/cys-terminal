@@ -108,11 +108,21 @@ import {
   formatAlarmTime,
   type AlarmRecord,
 } from "./toastttl";
+// ★U6(0.14.41) 피드백 보내기 — 모달 층 판정(setFocus·드롭 가드)과 작성 창(의존성 주입 · 최상위 부수효과 0).
+import { modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
+import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
 
 declare global {
   interface Window {
     __TAURI__: {
-      core: { invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> };
+      core: {
+        // args 는 JSON 객체 또는 원시 바이트(Uint8Array — U6 피드백 첨부 조각). options.headers 는 원시 IPC 메타.
+        invoke: (
+          cmd: string,
+          args?: Record<string, unknown> | Uint8Array,
+          options?: { headers?: Record<string, string> },
+        ) => Promise<unknown>;
+      };
       event: {
         listen: (
           name: string,
@@ -3331,7 +3341,10 @@ function setFocus(sid: number) {
   focusedSid = sid;
   const key = paneKey(sid, current()?.socket);
   for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
-  panes.get(key)?.term.focus();
+  // ★U6(0.14.41 · 반박 D2 blocking): 모달·팔레트가 떠 있으면 xterm 에 키보드 포커스를 주지 않는다.
+  // 3초 틱의 자동 입양·surface.exited 가 여기를 부르면, 사용자가 모달 입력칸에 쓰던 글과 Enter 가
+  // 뒤에 가려진 pane(주로 마스터) PTY 로 들어갔다. 표시(focused)·focusedSid 는 그대로 갱신한다.
+  if (!modalLayerOpen(document)) panes.get(key)?.term.focus();
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
@@ -7514,6 +7527,7 @@ async function start() {
   });
   await listen("tauri://drag-leave", () => setOsDropTarget(undefined));
   await listen("tauri://drag-drop", (e) => {
+    if (feedbackOverlayOpen(document)) return; // ★U6: 피드백 창이 떠 있으면 드롭은 그 창의 첨부다(pane 주입·'드롭 취소' 토스트 금지)
     setOsDropTarget(undefined);
     const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
     const paths = p.paths ?? [];
@@ -8328,6 +8342,42 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     b.disabled = false;
   }
 });
+
+// ★U6(0.14.41) 「피드백 보내기」 — 사이드바 바닥 공용 칸(#wsbar-foot · A2 소유)의 둘째 자리에 단추를 단다.
+// ⚠모듈 최상위·start() 밖이다: start() 가 멈춘 기계(피드백이 가장 필요한 순간)에서도 동작해야 한다.
+// ⚠슬롯 조회는 `!` 단정 금지 — null 이면 main.js 전체가 죽어 모든 pane 이 백지가 된다(mountFeedbackButton 이 null 안전).
+mountFeedbackButton(document.getElementById("wsbar-feedback-slot"), () => void openFeedbackModal(feedbackDeps()));
+function feedbackDeps() {
+  return {
+    invoke,
+    invokeRaw: (cmd: string, bytes: Uint8Array, headers: Record<string, string>) =>
+      window.__TAURI__.core.invoke(cmd, bytes, { headers }),
+    listen,
+    // 진단에 넣을 앱 안 경량 사실 — 데몬은 식별 RPC 1회(상한 있음 · 기동하지 않는다), 나머지는 메모리 값.
+    facts: async (): Promise<FeedbackFacts> => {
+      let daemon = "응답 없음";
+      let daemonVersion: string | null = null;
+      try {
+        const r = (await rpcT(invoke("daemon_status", { socket: null }), winScaled(3_000))) as { version?: unknown };
+        daemon = "응답함";
+        if (typeof r?.version === "string") daemonVersion = r.version;
+      } catch {
+        /* 응답 없음 그대로 */
+      }
+      return {
+        user_agent: navigator.userAgent,
+        daemon,
+        daemon_version: daemonVersion,
+        workspaces: workspaces.length,
+        panes: panes.size,
+      };
+    },
+    restoreFocus: () => {
+      if (focusedSid != null) setFocus(focusedSid);
+    },
+    platform: (IS_MACOS ? "mac" : IS_WINDOWS ? "win" : "other") as "mac" | "win" | "other",
+  };
+}
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );

@@ -39,18 +39,43 @@ function fnBody(src: string, header: string): string {
   throw new Error(`unbalanced: ${header}`);
 }
 
-/** 모듈 최상위(중괄호 깊이 0)에 놓인 줄만 — '최상위 부수효과 0' 판정용. */
-function topLevelLines(src: string): string[] {
+/**
+ * 모듈 최상위(괄호 깊이 0) **문장**들 — '최상위 부수효과 0' 판정용. 여러 줄에 걸친 상수 초기화
+ * (`const X = "…" +\n "…";`)는 한 문장이다. 문장 경계 = 깊이 0 의 `;` 또는 줄 끝에서 깊이 0 으로 돌아오는 `}`.
+ * 함수·클래스 본문(깊이 > 0)은 모으지 않는다 — 그 안의 호출은 부수효과가 아니라 정의다.
+ */
+function topLevelStatements(src: string): string[] {
+  const code = stripComments(src)
+    .split("\n")
+    .map((l) => l.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, '""'))
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\//g, ""); // 블록 주석(JSDoc) — 문자열을 걷은 뒤라 문자열 속 `/*` 에 속지 않는다
   const out: string[] = [];
   let depth = 0;
-  for (const raw of stripComments(src).split("\n")) {
-    const line = raw.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, '""');
-    if (depth === 0 && line.trim()) out.push(line.trim());
-    for (const ch of line) {
-      if (ch === "{" || ch === "(" || ch === "[") depth++;
-      else if (ch === "}" || ch === ")" || ch === "]") depth--;
+  let cur = "";
+  const flush = () => {
+    const t = cur.replace(/\s+/g, " ").trim();
+    if (t && t !== ";") out.push(t);
+    cur = "";
+  };
+  for (let i = 0; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === "{" || ch === "(" || ch === "[") {
+      if (depth === 0) cur += ch;
+      depth++;
+    } else if (ch === "}" || ch === ")" || ch === "]") {
+      depth--;
+      if (depth === 0) {
+        cur += ch;
+        // 줄 끝에서 닫히는 `}` 만 문장 끝(함수·인터페이스 선언). `import { a } from` 의 `}` 는 아니다.
+        if (ch === "}" && /^[ \t]*(\n|$)/.test(code.slice(i + 1, i + 40))) flush();
+      }
+    } else if (depth === 0) {
+      cur += ch;
+      if (ch === ";") flush();
     }
   }
+  flush();
   return out;
 }
 
@@ -66,7 +91,7 @@ describe("① setFocus 포커스 가드 (반박 D2 · blocking)", () => {
     expect(body).toContain('classList.toggle("focused"');
   });
   it("판정은 modalguard 모듈에서 들여온다(인라인 복제 금지)", () => {
-    expect(main).toMatch(/import \{[^}]*modalLayerOpen[^}]*\} from "\.\/modalguard";/);
+    expect(/import \{[^}]*modalLayerOpen[^}]*\} from "\.\/modalguard";/.test(main)).toBe(true);
   });
 });
 
@@ -109,7 +134,7 @@ describe("④ 피드백 창 수명 — 리스너는 finally 에서 반드시 걷
   const code = stripComments(modalSrc);
   it("오버레이는 modal-overlay 층을 쓴다(전역 단축키 차단 상속 · z 1000 — 위에 뜨는 확인 창이 밑에 깔리지 않게)", () => {
     expect(code).toContain('"modal-overlay feedback-overlay"');
-    expect(css).not.toMatch(/\.feedback-overlay\s*\{[^}]*z-index/);
+    expect(/\.feedback-overlay\s*\{[^}]*z-index/.test(css)).toBe(false);
   });
   it("keydown 캡처·focusin 되찾기·드롭 구독은 finally 에서 해제된다", () => {
     const fin = code.slice(code.lastIndexOf("} finally {"));
@@ -127,7 +152,7 @@ describe("④ 피드백 창 수명 — 리스너는 finally 에서 반드시 걷
     expect(guard).toBeGreaterThan(0);
     expect(firstAwait).toBeGreaterThan(guard);
     expect(body).toContain("modalLayerOpen(document)");
-    expect(body).toMatch(/finally \{\s*feedbackOpen = false;/);
+    expect(/finally \{\s*feedbackOpen = false;/.test(body)).toBe(true);
   });
 });
 
@@ -137,14 +162,24 @@ describe("⑤ 새 모듈 위생", () => {
     ["modalguard.ts", guardSrc],
     ["feedbackmodal.ts", modalSrc],
   ];
-  it("최상위 부수효과 0 — 최상위에는 import·선언만", () => {
+  it("최상위 부수효과 0 — 최상위 문장은 import·선언만", () => {
     for (const [name, src] of mods) {
-      for (const l of topLevelLines(src)) {
-        const ok = /^(import |export |const |let |function |async function |type |interface |\}|\)|\])/.test(l);
-        expect(`${name}: ${ok ? "ok" : l}`).toBe(`${name}: ok`);
-        expect(/\b(document|window)\.|setInterval\(|setTimeout\(|addEventListener\(|listen\(|invoke\(/.test(l)).toBe(false);
+      const stmts = topLevelStatements(src);
+      expect(stmts.length).toBeGreaterThan(3); // 수집기가 아무것도 못 봤다 = 핀이 무력
+      for (const st of stmts) {
+        const ok = /^(import |export |const |let |function |async function |type |interface |declare )/.test(st);
+        expect(`${name}: ${ok ? "ok" : st}`).toBe(`${name}: ok`);
+        const fx = /\b(document|window|navigator)\.|setInterval\(|setTimeout\(|addEventListener\(|listen\(|invoke\(/.test(st);
+        expect(`${name}: ${fx ? st : "no-fx"}`).toBe(`${name}: no-fx`);
       }
     }
+  });
+  it("수집기 자기검증 — 최상위 호출·DOM 접근을 실제로 잡는다", () => {
+    const bad = 'import { a } from "./x";\nconst A = "x" +\n  "y";\nfunction f() {\n  document.body;\n}\nf();\nconst B = document.getElementById("z");\n';
+    const st = topLevelStatements(bad);
+    expect(st).toContain("f();");
+    expect(st.some((x) => x.startsWith("const B") && x.includes("document."))).toBe(true);
+    expect(st.some((x) => x.includes("document.body"))).toBe(false); // 함수 본문은 정의
   });
   it("구형 WKWebView 비호환 문법 0", () => {
     for (const [name, src] of mods) {
@@ -161,6 +196,19 @@ describe("⑤ 새 모듈 위생", () => {
     for (const c of cmds) expect(c.startsWith("feedback_")).toBe(true);
     for (const bad of ["send_input", "send_text", "channel", "org_status", "feed_"]) {
       expect(code.includes(bad)).toBe(false);
+    }
+  });
+  it("창이 찾는 모든 클래스가 고정 틀(MODAL_HTML)에 있다 — 오타 하나면 여는 순간 예외로 창이 안 뜬다", () => {
+    const code = stripComments(modalSrc);
+    const tplStart = code.indexOf("const MODAL_HTML =");
+    const tplEnd = code.indexOf("function errText(");
+    expect(tplStart).toBeGreaterThan(0);
+    expect(tplEnd).toBeGreaterThan(tplStart);
+    const tpl = code.slice(tplStart, tplEnd);
+    const sels = [...code.matchAll(/q<[A-Za-z]+>\("\.([a-z-]+)"\)/g)].map((m) => m[1]);
+    expect(sels.length).toBeGreaterThan(15);
+    for (const cls of new Set(sels)) {
+      expect(`${cls}:${new RegExp(`class="[^"]*\\b${cls}\\b`).test(tpl)}`).toBe(`${cls}:true`);
     }
   });
   it("innerHTML 에는 사용자 값이 들어가지 않는다(고정 틀만 · 값은 textContent)", () => {
@@ -180,7 +228,7 @@ describe("⑥ Rust 배선 — 등록·창 정책·전송 부재", () => {
       expect(n.startsWith("feedback_")).toBe(true);
       expect(`${n}:${mainRs.includes(`feedback::${n},`)}`).toBe(`${n}:true`);
     }
-    expect(mainRs).toMatch(/^mod feedback;/m);
+    expect(/^mod feedback;/m.test(mainRs)).toBe(true);
   });
   it("자식 프로세스를 만드는 함수는 전부 창 정책(no_console)을 건다 — 윈도우 검은 창 0", () => {
     const chunks = rs.split(/\n(?=(?:pub(?:\(crate\))? )?(?:async )?fn )/);
