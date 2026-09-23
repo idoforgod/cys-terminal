@@ -2459,6 +2459,8 @@ mod tests {
         touch(&r.cys_base.join(".master-bootstrapped"), "x");
         touch(&r.cys_base.join(".master-bootstrapped-dept-1"), "x");
         mk(&r.cys_base.join("transfers"));
+        // ★U6(0.14.41): 피드백 묶음(설명·스크린샷·영상·진단 — 비밀이 찍힌 화면일 수 있다).
+        mk(&r.cys_base.join("feedback/fb-20260923-120000-ab12"));
         touch(&r.cys_base.join("apple-notary.env"), "SECRET");
         touch(&r.cys_base.join(crate::license::LICENSE_BASENAMES[0]), "{}");
         touch(&r.cys_base.join(crate::license::LICENSE_BASENAMES[1]), "sig");
@@ -2494,6 +2496,7 @@ mod tests {
             ".cys/.master-bootstrapped-dept-1",
             ".cys/state-generations",
             ".cys/transfers",
+            ".cys/feedback",
             ".local/state/cys",
             ".local/state/cys-dept-dept-1",
             "_round",
