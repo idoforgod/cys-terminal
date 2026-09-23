@@ -195,6 +195,18 @@ describe("기억이 없는 경우 · 부분 복원 · 1:1", () => {
     expect(holeSidsOf(plan.tree)).toEqual([-1]);
     expect(plan.tree.type === "split" && sids(plan.tree.a).includes(7)).toBe(true); // master 구멍 = 대표 칸 → cso 는 그 아래
   });
+  // ★리뷰1 F8 P12 — 저장본에 이미 있던(이전 세션의) 역할 없는 구멍은 복원에서 남기지 않는다.
+  // 남으면 영원히 채워지지 않는 빈 자리가 트리에 쌓인다(구멍 상한·위생과 별개로 restoreTree 자체가 거른다).
+  it("역할 없는 구멍은 복원에서 걸러진다(P12) — 역할 있는 구멍은 그대로 남는다", () => {
+    const roleless: LNode = { type: "pane", sid: -5, role: undefined };
+    expect(
+      restoreTree(roleless, { genChanged: false, isLive: () => false, liveRole: () => undefined, roleConflictIsDead: false, allocHole: () => -99 }),
+    ).toBeNull();
+    const rolefull: LNode = { type: "pane", sid: -6, role: "worker" };
+    expect(
+      restoreTree(rolefull, { genChanged: false, isLive: () => false, liveRole: () => undefined, roleConflictIsDead: false, allocHole: () => -99 }),
+    ).toEqual(rolefull);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -224,6 +236,28 @@ describe("세대(daemonEpoch) — 옛 sid 를 믿지 않는다(반박 U2 major �
     const t = ws.tree as LNode;
     expect((t as any).a).toEqual({ type: "pane", sid: 9, role: "master" });
     expect(sids(t).sort()).toEqual([5, 6, 9]); // 역할 없는 5 는 사라지지 않고 오른쪽에 붙는다
+  });
+
+  // ★리뷰1 F2(major) — 위 검체는 **공허**했다(review1-mutation-harness.py.txt P5): 충돌 검사 줄을
+  // 지워도 U3 배치가 우연히 master 를 좌상단에 놓아 144/144 가 그대로 초록이었다(부서 탭은 재부팅마다
+  // 세대가 '모름' 이라 이 검사가 유일한 sid 재사용 방어 — main.ts:8239). restoreTree **하나**만 불러
+  // 그 줄이 실제로 하는 일(재사용된 sid 를 기억한 칸에 남기지 않고 구멍으로 바꾼다)을 직접 본다 —
+  // adoptSeat 의 뒤이은 배치가 우연히 정답을 만드는 경로를 거치지 않는다(seatlayout.ts:582-585).
+  it("★restoreTree 단독: 세대 모름 + 역할 불일치 → 그 칸은 **원래 sid 를 그대로 둔 채** 살지 않는다 — 구멍으로 바뀐다(P5)", () => {
+    const t = SAVED(); // a: sid5=master(기억) · b: sid6=worker(기억)
+    const out = restoreTree(t, {
+      genChanged: false,
+      isLive: (s) => s === 5 || s === 6, // 둘 다 살아는 있다(재부팅 뒤 새 세대가 재사용한 번호)
+      liveRole: (s) => (s === 5 ? "worker" : s === 6 ? "worker" : undefined), // 그러나 sid5 의 **지금** 역할은 worker
+      roleConflictIsDead: true,
+      allocHole: () => -7,
+    }) as LNode;
+    // 충돌 검사가 살아 있으면: 기억(master) ≠ 지금(worker) → sid5 자리는 구멍(-7)으로 바뀐다.
+    // 검사를 지우면(P5): dead 가 갱신되지 않아 `if (!dead) return n;` 이 sid5 를 **그대로** 돌려준다
+    // (여전히 master 자리에 sid5 가 산 칸으로 남는다) — 아래 단언이 그 차이를 직접 잡는다.
+    expect((out as any).a).toEqual({ type: "pane", sid: -7, role: "master" });
+    // 대조: 지금 역할이 기억과 같은 sid6 은(워커=워커) 충돌이 아니므로 산 칸 그대로 — 회귀 없음 확인.
+    expect((out as any).b).toEqual({ type: "pane", sid: 6, role: "worker" });
   });
   it("generationChanged / daemonIdentOf", () => {
     expect(generationChanged(undefined, "1-2")).toBeNull();
@@ -356,6 +390,16 @@ describe("입양 대상 탭 · 소켓 격리(반박 U2 §2-4·§3-3 · U3 M1)", 
     expect(dept?.idx).toBe(0);
     expect(dept?.boundHole).toBe(-1);
     expect(adoptSeat(wss, "/nope.sock", 12, "master", () => "master")).toBeNull();
+  });
+  // ★리뷰1 F8 P35 — pickAdoptIndex 가 고른 target 탭(master 가 있어 먼저 뽑힌다)에 맞는 역할 구멍이
+  // 없어도, **같은 소켓의 다른 탭**에 있는 구멍을 봐야 결속된다(대상 탭 먼저 · 이어 탭 순서 · DFS 순).
+  it("★결속은 대상 탭만 보지 않는다 — 다른 탭의 같은 역할 구멍도 본다(P35)", () => {
+    const wsA: WsView = { socket: "s", tree: m(1, "master") }; // pickAdoptIndex 가 target 으로 고른다(master 있음)
+    const wsB: WsView = { socket: "s", tree: m(-1, "cso") }; // cso 구멍은 A 가 아니라 B 에 있다
+    const roleOf = mapRole(new Map<number, string | null>([[1, "master"], [7, "cso"]]));
+    const plan = adoptSeat([wsA, wsB], "s", 7, "cso", roleOf)!;
+    expect(plan.idx).toBe(1); // target(0)만 봤다면 구멍을 못 찾아 U3 배치로 0번에 붙었을 것
+    expect(plan.boundHole).toBe(-1);
   });
 });
 
