@@ -10385,9 +10385,13 @@ def _self_test():
 def _only_usage_exit(json_mode, mode, detail):
     """`--only` 사용법 오류 1줄 출력 → rc 2. READY/ok:true 를 **내지 않는다**(성찰 P5)."""
     if json_mode:
+        # ★리뷰1(2026-09-23) 사소한 지적: 정상 경로 JSON(§3 U4 C2)은 항상 `unmeasured` 키를
+        #   낸다 — 소비자가 매번 `.get("unmeasured", …)` 없이 키를 그대로 읽을 수 있게, 사용법
+        #   오류 경로도 같은 스키마를 지킨다(검사 0건이니 빈 목록).
         print(json.dumps({"ok": False, "fails": 0, "warns": 0, "mode": mode,
                           "error": "only-no-match", "detail": detail,
-                          "planned": [], "pack_dir": pack_dir(), "checks": []},
+                          "planned": [], "pack_dir": pack_dir(), "checks": [],
+                          "unmeasured": []},
                          ensure_ascii=False, indent=2))
     else:
         print("preflight: 사용법 오류(--only) — %s" % detail)
