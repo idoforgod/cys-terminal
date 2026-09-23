@@ -321,6 +321,8 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .cc-dot.idle { background: #64748b; }
 .cc-dot.error { background: #ef4444; animation: cc-blink 1.4s infinite; }
 .cc-dot.offline { background: #1e293b; }
+/* ★0.14.41(U12 · 리뷰1 #2) CC Tasks 행의 빈 자리 — 사이드바 .ws-dot.hollow 와 같은 노란 테두리 원(빨간 사망 점과 섞지 않는다). */
+.cc-dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--warn); }
 @keyframes cc-blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 .cc-fleet-state { font-size: 12px; color: #94a3b8; min-width: 46px; }
 .cc-tbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 12px; }
