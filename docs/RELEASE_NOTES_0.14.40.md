@@ -1,4 +1,23 @@
-# v0.14.39 — 사람이 쓰던 줄을 기계가 지우지 않고, 좌석이 조용히 멈추지 않습니다
+# v0.14.40 — 사람이 쓰던 줄을 기계가 지우지 않고, 좌석이 조용히 멈추지 않습니다
+
+> ### 번호가 0.14.39 에서 0.14.40 으로 건너뛴 이유
+>
+> **`v0.14.39` 태그는 발행되지 않았습니다.** 태그 레인의 `pack-artifacts` 잡이 팩 콘텐츠 발행
+> 게이트(`scripts/scan-pack-secrets.sh`)에서 멈췄기 때문입니다 — 팩 테스트 픽스처에 들어 있던
+> 실측 명령줄 한 줄의 `@` 한 글자(ChatGPT.app 의 Codex MCP 플러그인 설정 키 —
+> 지금은 `plugins.codex-app-tools_at_openai-bundled.…` 로 정규화돼 있고 `_at_` 자리에 원래 `@` 가
+> 있었습니다)를 게이트의 이메일 정규식이 **이메일로 오인**했습니다.
+> 실제 누출은 0건, 순수한 오탐입니다. 앱 빌드 3종(공증 포함)은 이미 성공한 뒤여서 초안 릴리스에
+> 자산 9종만 올라간 채 멈췄고(팩 3종 누락), **태그는 불변**이므로 되감지 않고 번호를 올립니다.
+> **0.14.40 은 0.14.39 가 실으려던 내용을 그대로 싣습니다** — 아래 본문 전체가 그 내용입니다.
+>
+> 이번 판이 그 위에 더한 수리는 두 가지입니다. ① **픽스처 정규화** — 게이트를 느슨하게 푸는 대신
+> (fail-closed 유지) 검체 쪽 `@` 를 `_at_` 로 바꿨습니다. 그 픽스처의 판정은 명령줄의 **첫 토큰
+> (argv0)** 하나로 내려지고 인자 문자열은 분류에 쓰이지 않으므로, 검체가 재는 것은 그대로입니다.
+> ② **커버리지 공백 봉합** — 이 게이트는 여태 태그 레인과 팩 전용 레인에만 걸려 있어서 태그를 찍기
+> 전에는 원리적으로 알 수 없었습니다. 같은 스텝을 브랜치 레인(`ci-branch.yml`)에 편입하고,
+> `docs/RELEASE.md` 의 「태그 전 사전 게이트」를 3종에서 **4종**으로 늘렸습니다. 같은 사고가 다시
+> 나면 40분짜리 태그 런이 아니라 브랜치 CI 가 1초 만에 알려 줍니다.
 
 이번 판을 한 문장으로 줄이면 이렇습니다 — **파일을 놓은 자리에 파일이 들어가고, 부서 좌석의 훅이
 조용히 꺼지지 않고, 사람이 입력줄에 쓰던 글자를 자동화가 지우거나 그 위에 끼어들지 않고, 자동
@@ -485,7 +504,7 @@ master·CSO 에게 **알림만** 올림 ⓒ 승인 대기 좌석에 한해 clear
 8. **`PACK_MIN_BINARY` 상향 여부** — 이번 팩의 autopilot 은 본체의 새 종료코드(84/85/86)와 새 RPC
    필드를 **전제로 설계** 됐습니다. 옛 본체에 얹으면 그 코드가 아예 나오지 않으므로 팩은 종전 계약대로
    돌고(파괴적이지 않음) **D-16 이 고친 것이 그 좌석에는 도달하지 않습니다** — 즉 팩만 갱신해서는
-   '빈손 성공' 이 닫히지 않습니다. 하한을 0.14.39 로 올리면 이 스큐가 구조적으로 막히지만, 하한 상향은
+   '빈손 성공' 이 닫히지 않습니다. 하한을 0.14.40 으로 올리면 이 스큐가 구조적으로 막히지만, 하한 상향은
    옛 본체 사용자를 팩 갱신에서 잘라내는 쪽이기도 합니다. 판별기는 경로만 보므로 이것은 **사람 판단**
    항목입니다(`scripts/release-lane-check.sh:9`).
 9. **옛 설치본의 msys 훅 등록형**(`/c/Users/…`)은 실재 판정에서 미인정 → 강등(이중 주입 · 무해 방향 ·
@@ -516,9 +535,32 @@ master·CSO 에게 **알림만** 올림 ⓒ 승인 대기 좌석에 한해 clear
 | `test_pyseal_census.py` | **GREEN — PYSEAL-CENSUS-OK**(핀 28 고정 · 소비 훅 29 전수 `_lib.sh` source · SEAL-1 층4 소비 파일 32 · 봉인 위반 0 · 판독 실패 0) | <1s | `41-pyseal-census.log` |
 | `ui: bun test` / `bunx tsc` / `ui/build.sh` | **GREEN — 995 pass / 0 fail**(27 파일 · 3366 expect) · tsc rc 0 · build.sh rc 0(31 모듈 번들 · `main.js` 0.49MB) | 11s | `20-ui-bun-test.log` · `21-ui-tsc.log` · `22-ui-build.log` |
 | `secret-scan.sh --all` | **GREEN — clean**(mode `--all` · 1001 파일) | 27s | `33-secret-scan.log` |
-| `cargo check -p cys-app` | **GREEN — 오류 0**(cys-terminal·cys-app 0.14.39 컴파일 완료) | 7s | `06-cargo-check-cys-app.log` |
-| **[릴리스]** `version-check.sh v0.14.39` | **GREEN — 버전 SOT 8곳 전부 0.14.39 일치 · rc 0** | <1s | `71-version-check.log` |
-| **[릴리스]** `release-lane-check.sh v0.14.38`(기준태그 명시 = 정본) | **GREEN — 본체(BINARY) 레인** · `v0.14.38..HEAD` 변경 124건 중 팩 외 34건 · 버전 충돌 가드 충족(0.14.39 > 최신 `pack-v0.12.92`) · rc 0 | <1s | `70b-release-lane-check-v0.14.38.log` |
+| `cargo check -p cys-app` | **GREEN — 오류 0**(cys-terminal·cys-app 0.14.40 컴파일 완료) | 16s | `release/F-04b-cargo-check-cys-app.txt` |
+| **[릴리스]** `version-check.sh v0.14.40` | **GREEN — 버전 SOT 8곳 전부 0.14.40 일치 · rc 0** | <1s | `release/F-03-version-bump.txt` |
+| **[릴리스]** `release-lane-check.sh v0.14.38`(기준태그 명시 = 정본) | **GREEN — 본체(BINARY) 레인** · 팩 외 변경 34건 · 버전 충돌 가드 충족(0.14.40 > 최신 `pack-v0.12.92`) · rc 0 | <1s | `release/F-03-version-bump.txt` |
+
+> **위 세 줄(그리고 아래 「0.14.40 수리 재검증」)의 원출력만 `release/` 폴더**에 있습니다 —
+> 0.14.40 범프 뒤에 다시 돌린 것들이라 `integ/final/` 의 0.14.39 시점 수치를 그대로 두지 않고
+> 재측정값으로 갈아 끼웠습니다. 나머지 행은 `integ/final/` 그대로입니다(범프가 그 경로의
+> 판정을 바꾸지 않습니다).
+
+### 12-a. 0.14.40 수리 재검증 (픽스처 정규화 · 브랜치 레인 스캐너 편입 뒤)
+
+원출력은 `~/Desktop/CYSjavis/_evidence/impl-3problems-20260921/release/` 입니다.
+
+| 스위트 | 결과 | 원출력 |
+|---|---|---|
+| `scan-pack-secrets.sh` (수리 **전** 재현) | **RED — 1건 · rc 1**(`test_resource_gate.py:43`) | `F-00-preflight.txt` |
+| `scan-pack-secrets.sh` (수리 후) | **GREEN — `OK` · rc 0** | `F-04a-scanners-and-fixture.txt` |
+| `secret-scan.sh --all` | **GREEN — clean**(1001 파일) | `F-04a-scanners-and-fixture.txt` |
+| `test_resource_gate.py`(격리 `CYS_PACK_DIR`) | **GREEN — 63 OK / 0 fail** | `F-04a-scanners-and-fixture.txt` |
+| argv0 앵커 대조(원본 `@` / 정규화 `_at_` / 인자없음) | **GREEN — 3형태 판정 동일**(`_fleet_owner=codex` · `_is_app_bundle_argv0=True` · `_count_nodes=0` · 구 계수 1) | `F-01-fixture-normalize.txt` |
+| `lane-parity-rehearsal.sh --strict` / `--self-test` | **GREEN — rc 0 / rc 0** | `F-02-ci-branch-scan-step.txt` |
+| ci-branch 인라인 LANE-GATE(원본 추출 실행) | **GREEN — 비대칭 0**(ci-branch 80 / pack-release 77 / release 81 · 공통 77 — 스텝 추가 전후 동일) | `F-04f-lanegate-and-ui.txt` |
+| ubuntu-pack-suite 루프 69종(각각 격리 `CYS_PACK_DIR`) | **GREEN — 69/69 · 실패 0 · 파일 누락 0** | `F-04e-pack-suite.txt` |
+| `win-typecheck.sh`(x86_64-pc-windows-msvc) | **GREEN — 판정 0 · 오류 0**(경고 4 = 전부 기존 dead_code) | `F-04c-win-typecheck.txt` |
+| `cargo test --bin cys -- --test-threads=1` | **GREEN — 358 passed / 0 failed**(버전 문자열 핀 파손 0) | `F-04d-cargo-test-bin-cys.txt` |
+| `ui: bun test` | **GREEN — 995 pass / 0 fail**(27 파일 · 3366 expect) | `F-04f-lanegate-and-ui.txt` |
 
 > **`release-lane-check` 를 인자 없이 돌리실 때의 주의(고지).** 기본 기준태그가 릴리스 태그가 아니라
 > `sealed/p1-codex-master/2026-09-20/r1-converged` 로 집힙니다(그 경우 변경 131건 · 팩 외 41건).
