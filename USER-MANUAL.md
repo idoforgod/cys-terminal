@@ -570,6 +570,12 @@ cys schedule list / remove <id> / run <id>
   진행 보고·비용 다이제스트·채널 헬스 잡이 들어 있습니다.
 - `--fresh --agent claude`: 매 발화마다 새 surface를 띄워 과업을 주입(권한·컨텍스트 상속
   차단), `--close-after`로 TTL 정리.
+- `schedule list` 각 줄 끝의 `result=` 칸은 **데몬 기동 이후 마지막 발화 결과**입니다(0.14.41):
+  `ok`·`skipped`(대상 부재 등으로 건너뜀)·`queued`(큐 적재만 — 배달 전)·`error`·`timeout`, 그리고
+  연속 실패 `FAILING×N` · 마지막 `ok` 이후 연속으로 일을 안 한 횟수 `non_ok×N`. `last_fired` 는
+  **발화 시각**(발화 전에 기록)이지 성공 여부가 아닙니다 — 두 칸을 함께 봐야 "제때 돌았는데 매번
+  실패"를 구분합니다. 결과 기록은 데몬 메모리에만 있어 데몬을 다시 켜면 비고(`result=-`), 구버전
+  데몬이면 `result=?`(판정 불가)로 보입니다.
 
 ---
 
@@ -644,6 +650,10 @@ cys skill list / show <name> / run <name> / new   # 경험을 스킬로 영속·
   병합합니다.
 - 진단·수리: `cys doctor [--fix]` — 팩 스큐·stale lock·고아 소켓·훅 등록을 진단하고,
   `--fix`는 사용자 데이터·팩 본체·DB를 건드리지 않는 범위만 수리합니다.
+  훅 등록(`hook`)은 cys 좌석이 **실제로 읽는** 설정 폴더(`${CYS_ACCOUNT_DIR:-~/.cys/claude}`)를
+  기준으로 봅니다(0.14.41 — 결손은 WARN, 파일을 읽지 못하면 SKIP=판정 불가). 이 폴더는 `--fix` 가
+  쓰지 않습니다 — 데몬 재기동(부팅 시 자동 재병합) 또는 `cys init-pack` 으로 복구합니다. 검사하지
+  못한 항목(윈도우의 socket·startup-lock 등)은 OK 가 아니라 SKIP 으로 표시됩니다.
 - **완전 초기화(팩토리 리셋)**: 연습으로 쌓인 부서·세션·대화기억·작업기억·훅을 한 번에
   정리하고 "설치 초기 상태"로 되돌리려면 topbar **완전 초기화** 버튼 또는
   `cys factory-reset`(미리보기 `--plan`, 쓰기 0). 즉시 삭제가 아니라
