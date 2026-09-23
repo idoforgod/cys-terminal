@@ -4361,6 +4361,37 @@ mod tests {
         assert_eq!(l.split_whitespace().count(), 5);
     }
 
+    /// ★리뷰1 F2(MR3 공허) — `pack_update_outcome_token_format`은 포맷 함수(`format_pack_update_outcome`)
+    /// 만 본다. 실제로 디스크를 읽는 `pack_update_uptodate_line`은 어떤 lib 테스트도 부르지 않아서,
+    /// 그 함수가 엉뚱한 파일을 읽거나(`.pack-state.json` 등) 항상 판독 실패를 반환해도 전 테스트가
+    /// 녹색이었다. 임시 CYS_PACK_DIR 에 `.pack-version`을 직접 써 두고 그 값이 그대로 실리는지 본다
+    /// (판정에 쓴 것과 같은 파일 · 같은 pack_dir()).
+    #[test]
+    fn pack_update_uptodate_line_reads_live_disk_pack_version() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!("cys-pack-uptodate-line-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let _env = EnvGuard::set("CYS_PACK_DIR", td.to_str().unwrap());
+
+        // ① .pack-version 이 아직 없음 → 판독 실패(disk=- disk_parse=fail). 엉뚱한 파일을 읽어도
+        //    이 값으로 우연히 맞을 수 있으므로 ②·③ 대조가 핵심이다.
+        let line0 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line0, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=- disk_parse=fail");
+
+        // ② .pack-version 에 쓴 값이 그대로 실린다 — 다른 파일을 읽으면(MR3) 여기서 불일치.
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.14.40").unwrap();
+        let line1 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line1, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=0.14.40 disk_parse=ok");
+
+        // ③ 다시 쓰면(CRLF 포함) 캐시된 옛 값이 아니라 **지금** 디스크 값을 다시 읽는다.
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.14.42\r\n").unwrap();
+        let line2 = pack_update_uptodate_line("0.14.41");
+        assert_eq!(line2, "PACK_UPDATE_OUTCOME gate=up-to-date remote=0.14.41 disk=0.14.42 disk_parse=ok");
+
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// ★(0.14.39 라운드3 · 성찰2 notice) 레인 가드 표식의 경로·신선도 창은 러스트/파이썬 **사본 2벌**이다.
     /// 드리프트하면 `cys cycle-agent` 와 `javis_preflight` 가 서로 다른 레인 상태를 보고,
     /// 그 방향은 디렉티브 0회 주입(치명) 또는 상시 이중 주입(컨텍스트 급등) 어느 쪽으로도 갈 수 있다.
