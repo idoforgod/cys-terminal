@@ -9,6 +9,8 @@ name: ci-branch
 #   원 레인의 나머지 스텝(bundle-prep·cargo check --workspace·능력 파리티 7종·C03 전핀·
 #   bun UI 잡·Windows 잡)은 이 브랜치의 범위가 아니어서 **의도적으로 가져오지 않았다**.
 #   그것들을 나중에 편입할 때는 아래 레인 대조 게이트의 ALLOWED 도 함께 갱신해야 한다.
+#   ★(0.14.41 · U4 C4-⑧) 그중 **bun UI 잡**은 잡5 `ui-check` 로 편입했다 — UI 회귀 테스트가 태그
+#     레인에서만 돌아 UI 회귀가 **태그(불변) 뒤에야** 드러났고, 타입체크는 어느 레인에서도 돌지 않았다.
 # ★W8(2026-08-16 · v4-repair): 이 레인에 세 가지를 추가했다 —
 #   ①신설 팩 스위트 3종(부서 이름검증·C03 상태기계·핀 패리티)을 3완전 레인 **동시** 등재
 #     (대칭 = 정본 · ALLOWED 등재 불요 — 2026-08-12 부트체인 편입과 같은 형태)
@@ -157,11 +159,26 @@ jobs:
           #   단위 검체 1,228종이 브랜치 push 에서 0회 실행이었고 컴파일 실패조차 안 잡혔다. 값 =
           #   {레인: {토큰: 사유}}. 토큰은 주석·SELF 표식 밖의 코드 줄에 있어야 하고 그 스텝은 등재된
           #   레그 고정 외의 조건이 없어야 한다.
+          # ★U4 C4-⑧(2026-09-23): UI 회귀(`cd ui && bun test`)·타입체크(`tsc -p tsconfig.check.json`)를
+          #   등재한다. 전자는 태그 레인에서만 돌던 것을 브랜치 잡5(ui-check)에도 세운 **쌍**이라 두 레인
+          #   모두에 핀한다(한쪽이 조용히 빠지면 그 레인의 초록이 거짓 신호) — pack-release 는 UI 를 빌드하지
+          #   않으므로 등재 대상이 아니다. 음성 대조는 예행 도구 자기 검체 2 의 변이 ⑤~⑦.
           MUST_RUN_TOKENS = {
               "ci-branch": {
                   "cargo test --bin cysd":
                       "데몬 단위 검체(alert_route·governance·state·delivery)의 브랜치 조기 경보. 태그 push "
                       "에서 처음 붉어지면 pack-artifacts 미실행 → 팩 자산 0 → 발행 0 이다.",
+                  "cd ui && bun test":
+                      "UI 회귀(한글 IME 리듀서·드래그·마우스 필터 등 27파일)의 브랜치 조기 경보. 없으면 UI "
+                      "회귀가 태그(불변 · 버전 소모) 뒤 build 레그에서야 드러난다.",
+                  "tsc -p tsconfig.check.json":
+                      "UI 타입체크 — `bun build` 는 트랜스파일만 해 타입을 보지 않는다(ui/tsconfig.check.json "
+                      "_why). 이 줄이 빠지면 타입 오류는 어느 레인에서도 드러나지 않는다.",
+              },
+              "release": {
+                  "cd ui && bun test":
+                      "UI 회귀 게이트(발행 직전 최종선) — 브랜치 ui-check 와 쌍이다. 빠지면 브랜치 초록만 "
+                      "믿고 태그한 빌드가 UI 회귀를 싣고 나간다.",
               },
           }
 
@@ -1451,3 +1468,48 @@ jobs:
               exit 1
             fi
           done
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡5 — UI 회귀 테스트 + 타입체크 (macos-latest · 0.14.41 U4 C4-⑧ · 2026-09-23)
+  #
+  # ★무엇이 결함이었나: `cd ui && bun test`(IME 리듀서·드래그·마우스 필터 등 27파일 995건)는
+  #   **태그 레인(release.yml build 3레그)에서만** 돌았다 — 브랜치 CI 는 UI 를 전혀 재지 않아 UI 회귀가
+  #   태그(불변 · 버전 소모)를 민 뒤에야 드러났다. 타입체크(`ui/tsconfig.check.json` · `bun build` 는
+  #   타입을 보지 않는다)는 **어느 레인에서도** 돌지 않았다(재현 명령만 있고 배선이 없었다).
+  # ★조건을 태그 레인과 맞춘다: bun test 는 **node_modules 없이** 돈다(release.yml 의 bun test 스텝은
+  #   `bun install` 전에 돈다 — build.sh 의 install 은 그 뒤 tauri beforeBuildCommand 에서 온다).
+  #   로컬 실측 2026-09-23(bun 1.4.0): install 전·후 모두 995 pass / 0 fail.
+  # ★타입체크는 설치 **뒤**에 돈다 — 설치 없이는 @xterm·@tauri 타입 부재로 8건(TS2307 3 · TS7006 5)이
+  #   상시 적색이다(실측). `bun install --frozen-lockfile` 은 bun.lock 을 바꾸지 않는다(오프라인 빌드
+  #   계약의 lockfile 은 그대로 · 설치 산출 node_modules 는 .gitignore). 설치 후 오류 **0**(실측) 이므로
+  #   설계 조건('실측 0 이면 고정 버전으로 편입')대로 **차단**으로 편입한다.
+  # ★typescript 버전 고정(typescript@7.0.2): 무고정 `bunx tsc` 는 신판 배포 시점에 판정이 **조용히**
+  #   바뀐다(반박 보고 §3-8). 올릴 때는 이 한 줄과 로컬 실측을 함께 바꾼다.
+  # ★별도 잡인 이유: 잡1 은 set -e 사슬이라 앞 스텝이 붉으면 UI 는 아예 재지 않게 된다(잡2 머리말 ⓐ).
+  #   우분투가 아니라 macOS 인 이유: 태그 레인의 bun test 가 도는 러너(macos-latest)와 같게 — 그리고
+  #   레인 예행 도구 5단계가 ci-branch 의 우분투 잡을 **정확히 1개**로 요구한다(2개면 판별 불가 exit 3).
+  # ★`if:` 없음 · `continue-on-error` 없음 — 레인 대조 게이트 MUST_RUN_TOKENS 가 두 실행 줄의 존재와
+  #   무조건 실행(잡 수준 조건 포함)을 핀한다.
+  ui-check:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: UI 회귀 테스트 (bun test · 태그 레인과 같은 조건 = node_modules 없이)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui && bun test
+
+      - name: UI 타입체크 (tsc -p tsconfig.check.json · typescript 7.0.2 고정 · 설치 후)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          bun install --frozen-lockfile
+          bunx -p typescript@7.0.2 tsc -v
+          bunx -p typescript@7.0.2 tsc -p tsconfig.check.json
