@@ -232,6 +232,10 @@ enum Command {
         check: bool,
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// ACK 확인 전용(--check 필수) — 핑·ACK 판정만 하고 **어떤 경우에도 전문을 재주입하지 않는다**
+        /// (phoenix G2 단계 · 0.14.41 U8 P0-M2: 같은 좌석에 check 가 두 번 돌아 전문이 두 번 들어가던 폭주 차단)
+        #[arg(long, requires = "check")]
+        ack_only: bool,
     },
     /// T3-14 완료 대기: scrollback 라인이 regex에 매칭될 때까지 블로킹 (plain-line 마커 규약)
     Watch {
@@ -2238,6 +2242,17 @@ fn is_typing_guard_err(e: &str) -> bool {
     e.contains(cys::MSG_TYPING_GUARD) || e.contains(cys::ERR_TYPING_GUARD)
 }
 
+/// ★(0.14.41-fix1 · REVIEW1 F6) 타이핑 가드 거부가 **모달(질문·선택 창) 전경** 사유인가 —
+/// `[draft_gate:modal]` 태그로만 판정한다(사람 초안·화면 점유·미제출 바이트와 구별). 왜 필요한가:
+/// `cys send` 의 `--queued` 1회 전환은 어느 사유든 안전하지만(큐 배달이 CR 을 포함), 그 뒤에 오는
+/// **관례적** `cys send-key Return`(SubmitKey)은 P1 설계상 모달 축이 걸리지 않는다(승인 대기 중
+/// master 의 Return 을 막으면 워커가 hang 한다) — 그래서 모달이 아직 전경이면 그 Return 이 창의
+/// 기본 선택지를 그대로 누른다(RC4 잔여 위험 · 09-21 23:07Z 실사례). 다른 사유(사람 초안 등)에서는
+/// 빈 프롬프트의 Enter 라 무해하다는 기존 안내가 그대로 맞다 — 그래서 모달일 때만 별도 경고한다.
+fn is_modal_draft_gate_err(e: &str) -> bool {
+    e.contains(&format!("[{}:modal]", cys::DRAFT_GATE_TAG))
+}
+
 /// 데몬이 `clear_first` 를 지원하지 않는 좌석이라고 답했는가(원자 경로 → 3분할 폴백 신호).
 /// launch-agent 등록 소실 좌석의 영구 무clear를 막되, 초안 거부·전송 실패는 재송신하지 않는다.
 fn is_clear_first_unsupported_err(e: &str) -> bool {
@@ -4186,6 +4201,21 @@ fn run(command: Command) -> i32 {
                                 "[send] 사람 입력 감지 — 본문을 큐로 전환(QUEUED depth {depth}) surface={}",
                                 surface_ref(sid)
                             );
+                            // ★(0.14.41-fix1 · REVIEW1 F6) 모달(질문·선택 창)이 원인이면 관례적
+                            //   `cys send-key Return` 이 더 이상 "빈 프롬프트의 무해한 Enter" 가 아니다 —
+                            //   SubmitKey 는 P1 모달 축 밖이라(설계상 무변경) 그 Return 이 창의 기본
+                            //   선택지를 그대로 누른다. 큐 배달이 이미 CR 을 포함하므로 뒤따르는
+                            //   send-key 는 애초에 불필요하다는 것까지 명시한다.
+                            if is_modal_draft_gate_err(&e) {
+                                eprintln!(
+                                    "[send] ⚠ 모달 전경([draft_gate:modal]) — 뒤따르는 `cys send-key {} Return` 을 \
+                                     보내지 마라. 그 Return 은 빈 프롬프트의 Enter 가 아니라 이 화면의 질문·선택 \
+                                     창의 **기본 선택지를 그대로 누른다**(SubmitKey 는 모달 축 밖 · 설계상 무변경). \
+                                     큐 배달이 이미 CR 을 포함하므로 모달이 닫힌 뒤 자동 제출된다 — 추가 Return 은 \
+                                     불필요하다.",
+                                    surface_ref(sid)
+                                );
+                            }
                             warn_if_daemon_paused();
                             println!("QUEUED (depth {depth}){}{tag}", queue_durable_suffix(&r2));
                             continue;
@@ -4580,8 +4610,8 @@ fn run(command: Command) -> i32 {
             return run_restore(cwd, include_master, no_resume)
         }
 
-        Command::Reinject { role, surface, check, timeout } => {
-            return run_reinject(role, surface, check, timeout)
+        Command::Reinject { role, surface, check, timeout, ack_only } => {
+            return run_reinject(role, surface, check, timeout, ack_only)
         }
 
         Command::Watch { surface, to, until, timeout, since } => {
@@ -10411,7 +10441,10 @@ mod seat_latch_negation_tests {
         // 세 발신자가 지시를 넘긴다: restore in-seat · node-recover · restore 경유 launch-agent.
         assert!(fn_body("run_restore").contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
         assert!(fn_body("run_node_recover").contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
-        assert!(fn_body("run_node_recover").contains("inject_text(sid, recover_directive())"), "node-recover Ready 경로가 사본 문자열을 쓴다");
+        // ★(0.14.41 · U8 P0-M1) node-recover 의 [RECOVER] 는 부트 공용 함수가 디렉티브 뒤에 **한 제출**로
+        //   잇는다(`adoption_payload(&directive, followup)`) — Ready 팔의 두 번째 `inject_text` 는 사라졌다.
+        assert!(!fn_body("run_node_recover").contains("inject_text(sid, recover_directive())"),
+                "node-recover 가 [RECOVER] 를 아직 두 번째 제출로 보낸다(큐 선두 차단)");
         assert!(fn_body("run_launch_agent_opts").contains("if restore { Some(restore_directive(role)) } else { None },"),
                 "restore 경유 launch-agent 가 지시를 넘기지 않는다");
         // 주입 절반의 두 보류 지점이 지시를 재표식에 다시 싣는다(다음 관문이 지시를 지우지 않게).
@@ -12752,7 +12785,8 @@ fn apply_resume_suffix(cmd: &mut String, resolved: Option<&str>) -> bool {
 /// WORKER/REVIEWER_DIRECTIVE가 들어 있어, 전문 재주입은 토큰 2배·중복 지침 혼선 + 거대 주입으로
 /// resume 직후 컨텍스트 임계(clear)를 유발한다(적대검증 serious). resume 시엔 짧은 복귀 가드만.
 /// 접미가 붙지 않은 좌석(세션 없음·파일 없음·빈 인자)은 완전히 새 대화라 **전문**(`compose_directive`)이다 —
-/// `[RESTORE]`/`[RECOVER]` 연속 지시는 호출부가 뒤에 붙인다(보류 좌석은 데몬 표식의 `followup` 으로 이월).
+/// `[RESTORE]`/`[RECOVER]` 연속 지시는 부트 공용 함수가 이 결과 뒤에 **한 제출**로 잇는다(`adoption_payload` ·
+/// 0.14.41 U8 P0-M1 — 보류 좌석은 데몬 표식의 `followup` 으로 이월돼 채택이 같은 한 제출을 싣는다).
 fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, String> {
     if effective_resume {
         Ok(format!(
@@ -13235,8 +13269,10 @@ fn boot_agent_on_surface(
     // config_dir=None이면 게이트가 cys::resolve_claude_config_dir()로 best-effort 해소한다.
     cwd: Option<&str>,
     config_dir: Option<&str>,
-    // ★(0.14.31 · 리뷰 R2) 복원 연속 지시([RESTORE]/[RECOVER]) — Ready 면 호출부가 종전대로 뒤에 주입하고,
-    //   보류(GatePending)면 첫 표식과 함께 데몬에 실려 `cys boot` 의 채택이 전문 디렉티브 뒤에 잇는다.
+    // ★(0.14.31 · 리뷰 R2) 복원 연속 지시([RESTORE]/[RECOVER]) — 보류(GatePending)면 첫 표식과 함께 데몬에
+    //   실려 `cys boot` 의 채택이 전문 디렉티브 뒤에 잇는다.
+    // ★(0.14.41 · U8 P0-M1) Ready 면 **이 함수가** 디렉티브 뒤에 한 제출로 잇는다(`adoption_payload`) —
+    //   호출부는 두 번째 제출을 하지 않는다(큐 선두 차단 봉인).
     followup: Option<&str>,
 ) -> Result<BootVerdict, String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
@@ -13264,7 +13300,7 @@ fn boot_agent_on_surface(
     if requested_resume && !effective_resume {
         eprintln!(
             "[launch-agent] fresh 각성(role={role} · agent={agent}): resume 이 요청됐으나 이어받을 \
-             세션이 없다 — 전문 디렉티브를 주입한다([RESTORE] 복원 지시는 호출부가 뒤에 붙인다)"
+             세션이 없다 — 전문 디렉티브를 주입한다([RESTORE] 복원 지시는 전문 뒤에 한 제출로 잇는다)"
         );
     }
     let delay = spec["inject_delay_secs"].as_u64().unwrap_or(12);
@@ -13730,10 +13766,18 @@ fn boot_agent_on_surface(
     //   `cys boot` 의 관문 보류 재관측 경로(`gate_pending_reobserve`)가 **스폰 0** 으로
     //   같은 절반(표식 해제 + 주입 + ack 검증)을 그대로 태운다. 사본을 만들면 그 순간
     //   '주입 경로가 둘' 이 되고, 한쪽만 고쳐지는 것이 이 저장소가 반복해 맞은 형태다.
+    // ★(0.14.41 · U8 P0-M1) 복원 연속 지시([RESTORE]/[RECOVER])는 디렉티브 뒤에 **한 제출**로 잇는다 —
+    //   채택 경로(`gate_pending_adopt`)와 같은 `adoption_payload` 규약이다. 종전 직접 Ready 경로 셋
+    //   (restore in-seat · restore fresh · node-recover)은 여기서 디렉티브만 넣고 호출부가 지시를 **두 번째
+    //   제출**로 보냈는데, 그 두 번째가 Claude 큐 선두에 끼어 감독자 지시를 막았다(반박 검증 M1).
+    //   `followup = None`(일반 launch-agent)이면 페이로드는 디렉티브와 **byte-identical** 이다.
+    //   보류로 접히면 `followup` 은 종전대로 재표식에 이월되고(주입 절반의 두 보류 지점), 다음 채택이
+    //   같은 한 제출을 다시 싣는다 — 지시는 관문·실패를 넘어 살아남는다.
+    let payload = adoption_payload(&directive, followup);
     inject_directive_after_ready(
         sid,
         agent,
-        &directive,
+        &payload,
         &gate_corpus.gates,
         gate_close_override,
         since_line,
@@ -14537,8 +14581,14 @@ fn gate_followup_malformed(row: &Value) -> bool {
     !(f.is_null() || f.is_string())
 }
 
-/// ★(0.14.31 · 리뷰 R2) 채택 페이로드 — 전문 디렉티브 뒤에 복원 연속 지시를 **한 제출**로 잇는다. 직접 Ready
-/// 경로(restore in-seat · node-recover · restore fresh)는 종전대로 두 제출(N7 · 유실은 stderr 로 정직 보고)이다.
+/// ★(0.14.31 · 리뷰 R2) 채택 페이로드 — 전문 디렉티브 뒤에 복원 연속 지시를 **한 제출**로 잇는다.
+///
+/// ★(0.14.41 · U8 P0-M1) 이제 **모든** 재주입 경로의 단일 규약이다: 채택 · 직접 Ready 경로 셋(restore in-seat ·
+/// restore fresh · node-recover — `boot_agent_on_surface` 가 조립) · cycle-agent clear 뒤 재주입
+/// (`cycle_reinject_payload`). 종전 직접 Ready·cycle 경로의 **두 제출**은 두 번째가 Claude 큐 선두에 끼어
+/// 턴 중 도구 경계에서 접히지 않고 뒤따르는 감독자 지시를 7~17분 막았다(반박 검증 M1 · 좌석 트랜스크립트 전수).
+/// 제출 바이트 규약은 `inject_text` 하나(괄호붙여넣기 → 800ms → Return · 타이핑 가드면 원문 큐 1회)라 OS 분기가
+/// 없다 — 페이로드 안의 `\n\n` 은 디렉티브 본문이 이미 싣는 줄바꿈과 같은 바이트 계급이다.
 fn adoption_payload(directive: &str, followup: Option<&str>) -> String {
     match followup {
         Some(f) if !f.trim().is_empty() => format!("{}\n\n{}", directive.trim_end(), f.trim()),
@@ -18392,27 +18442,58 @@ fn cycle_resume_with_hook_fallback(
     resume
 }
 
+/// ★(0.14.41 · U8 P0-M1) clear 뒤 재주입 **한 제출** 페이로드(순수 · 채택 경로와 같은 규약).
+///
+/// 【왜】 종전 재주입은 디렉티브(약 58KB)를 넣고 800ms 뒤 Return 을 보낸 다음 곧바로 `[RESUME]` 을
+/// **두 번째 제출**로 보냈다. Claude 가 59KB 붙여넣기를 프롬프트로 기록하기까지 약 5.6초가 걸리는데
+/// 두 번째 제출은 2.8초 뒤에 떨어져 **큐 선두 항목**이 됐고, 그 머리는 턴 중 도구 경계에서 접히지 않아
+/// 뒤따르는 부서장 지시("즉시 정지" 383s · "6단계 승인" 879s)를 그 턴이 끝날 때까지 막았다(반박 검증 M1 —
+/// 5분 넘게 붙어 있던 7건 중 6건). 채택 경로(`gate_pending_adopt`)는 이미 `adoption_payload` 로 한 제출이다
+/// — 같은 함수를 쓴다(사본 금지).
+///
+/// 훅 좌석(`hooks_inject`)은 SessionStart 훅이 디렉티브를 넣으므로 종전대로 RESUME 하나다(바이트 불변).
+/// 합성 실패는 `Err` 로 올린다 — 호출부가 그 사실을 판정·보고한다(조용한 전문 누락 금지).
+fn cycle_reinject_payload(
+    hooks_inject: bool,
+    resume: &str,
+    compose: &mut dyn FnMut() -> Result<String, String>,
+) -> Result<String, String> {
+    if hooks_inject {
+        return Ok(resume.to_string());
+    }
+    Ok(adoption_payload(&compose()?, Some(resume)))
+}
+
 /// 디렉티브 실패 뒤에도 RESUME을 시도하고 송신 내역만 반환해 호출자의 실효 판정을 유지한다.
 /// 주입 Err는 붙여넣기 후 Return 실패일 수도 있어 송신 0건이라고 단정하지 않는다.
+///
+/// ★(0.14.41 · U8 P0-M1) 첫 시도는 **한 제출**(`cycle_reinject_payload` — 디렉티브 뒤 RESUME)이다.
+/// RESUME 단독 재시도는 그 한 제출이 **실패했을 때만**(또는 합성 실패로 디렉티브가 없을 때만) 1회다 —
+/// 제출이 성립하지 않았으므로 두 제출 머리(큐 선두 차단)가 생기지 않고, 종전 계약("디렉티브 실패 뒤에도
+/// RESUME 시도" — 지침 없는 좌석(③) 방지의 최소 포인터)은 유지된다. 재시도 상한은 코드로 1회다.
 fn cycle_best_effort_reinject(
     hooks_inject: bool,
     resume: &str,
     compose: &mut dyn FnMut() -> Result<String, String>,
     inject: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> String {
-    let directive = if hooks_inject {
-        "디렉티브 생략(훅)".to_string()
-    } else {
-        match compose() {
-            Ok(text) => match inject(&text) {
-                Ok(()) => "디렉티브 1건 송신".to_string(),
-                Err(e) => format!("디렉티브 주입 실패(부분 송신 가능: {e})"),
-            },
-            Err(e) => format!("디렉티브 0건(합성 실패: {e})"),
-        }
+    if hooks_inject {
+        let resume_sent = match inject(resume) {
+            Ok(()) => "RESUME 1건 송신".to_string(),
+            Err(e) => format!("RESUME 주입 실패(부분 송신 가능: {e})"),
+        };
+        return format!("{resume_sent} · 디렉티브 생략(훅)");
+    }
+    let directive = match cycle_reinject_payload(false, resume, compose) {
+        Ok(payload) => match inject(&payload) {
+            Ok(()) => return "디렉티브+RESUME 한 제출 1건 송신".to_string(),
+            Err(e) => format!("디렉티브+RESUME 한 제출 실패(부분 송신 가능: {e})"),
+        },
+        Err(e) => format!("디렉티브 0건(합성 실패: {e})"),
     };
+    // 여기 도달 = 한 제출이 성립하지 않았다 → RESUME 단독 1회(상한 1 · 코드 고정).
     let resume_sent = match inject(resume) {
-        Ok(()) => "RESUME 1건 송신".to_string(),
+        Ok(()) => "RESUME 1건 송신(단독 · 최선노력)".to_string(),
         Err(e) => format!("RESUME 주입 실패(부분 송신 가능: {e})"),
     };
     format!("{resume_sent} · {directive}")
@@ -18433,7 +18514,10 @@ fn cycle_reinject_held(
     };
     format!(
         "{CYCLE_REINJECT_HELD_TOKEN} clear 는 실효 확인됨(session_file 교체) · 재주입 보류 사유: {reason} · \
-         실제 송신 내역(재주입): {sent}. 손으로 다시 clear 하지 마라 — 좌석에 [RESUME] 이 보이지 않으면 재주입만 하라"
+         실제 송신 내역(재주입): {sent}. 손으로 다시 clear 하지 마라 — ★(REVIEW1 F4) [RESUME] 은 이제 \
+         디렉티브와 한 제출로 합쳐져 58KB 붙여넣기 안에 접히므로 화면에 별도로 보이지 않는다(정상). \
+         화면 재주입 여부는 `cys status --json` 의 이 좌석 `awakened_at`/세션 파일 교체로 확인하고, \
+         그것으로 이미 나간 재주입이 확인되면 다시 재주입하지 마라(중복 재주입 방지)"
     )
 }
 
@@ -18859,14 +18943,13 @@ fn run_cycle_agent(
                     ) {
                         Ok(()) => {
                             eprintln!(
-                                "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터",
+                                "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터(한 제출)",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
                             );
-                            if !hooks_inject {
-                                inject_text(sid, &compose_directive(&role_name)?)?;
-                            }
-                            let resume = resume_text.as_str();
-                            inject_text(sid, resume)?;
+                            // ★(0.14.41 · U8 P0-M1) 디렉티브 뒤 RESUME 을 **한 제출**로 — 두 번째 제출이
+                            //   Claude 큐 선두에 끼어 감독자 지시를 막던 경로(반박 M1)를 닫는다.
+                            //   합성 실패는 종전대로 `?` 로 올린다(판정·보고 계약 불변).
+                            inject_text(sid, &cycle_reinject_payload(hooks_inject, &resume_text, &mut || compose_directive(&role_name))?)?;
                             Ok(())
                         }
                         Err(e) => Err(cycle_reinject_held(
@@ -19001,62 +19084,17 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         )
         .map_err(recover_refusal_from_input_guard)?;
         let verdict = match verdict {
+            // ★(0.14.41 · U8 P0-M1) [RECOVER] 는 `boot_agent_on_surface` 가 디렉티브 뒤에 **한 제출**로
+            //   이미 넣었다(`adoption_payload(&directive, followup)` — 채택 경로와 같은 규약). 종전 Ready 팔은
+            //   여기서 `inject_text(recover_directive())` 를 **두 번째 제출**로 보냈고, 그 두 번째가 Claude 큐
+            //   선두에 끼어 감독자 지시를 막았다(반박 검증 M1). 보류 접기(성찰 C4ⓐ — 보류는 파괴 근거가 아니다 ·
+            //   지시 이월 · rc 78)는 이제 그 한 제출을 하는 주입 절반(`inject_directive_after_ready`)의 두 보류
+            //   지점이 `followup` 과 함께 수행하고, 그 결과가 아래 `GatePending` 팔로 온다(같은 처방 · 같은 exit).
+            //   주입 실패 조건은 종전 디렉티브 제출과 같은 한 번의 `inject_text` 라 rc 1 로 가는 경우의 집합은
+            //   늘지 않는다(두 번째 제출의 연성 실패 경로가 사라졌을 뿐이다).
             BootVerdict::Ready => {
-                // ★(0.14.31 · 성찰 C4ⓐ) 종전 `inject_text(...)?` 는 **주입 가드의 보류**
-                //   (`HOLD_TOKEN`)를 클로저 밖으로 던져 rc 1 을 냈고, `run_boot` 은 그 값을
-                //   `escalate_reclaim`(kill)으로 번역했다 — 정상 복구된 좌석을 죽이려 들고,
-                //   2선 방어가 그것을 막으면 이번엔 `outcome:"failed"`(의무면 fatal) 라는
-                //   **거짓 보고**가 남았다. 게다가 판정이 `Ready` 였으므로 `mark_gate_pending`
-                //   은 호출되지 않았고 `inject_directive_after_ready` 는 이미
-                //   `clear_gate_pending` 했다 — `[RECOVER]` 는 **유실**됐다.
-                //   같은 구문이 `run_restore` 두 자리에서는 이미 `if let Err(e)` + 경고로
-                //   고쳐져 있다(N7). 여기만 종전 `?` 를 유지했다 — 같은 철자로 맞춘다.
-                //   U-11 계약: `Err` 머리표가 `HOLD_TOKEN` 이면 그것은 **보류이지 파괴 근거가
-                //   아니다**. 보류는 표식으로 접어 지시를 이월시키고 rc 78 을 낸다.
-                match inject_text(sid, recover_directive()) {
-                    Ok(()) => {
-                        println!("recovered surface:{sid} ({agent})");
-                        BootVerdict::Ready
-                    }
-                    Err(e) if cys::inject_guard::is_hold_error(&e) => {
-                        eprintln!("[node-recover] {e}");
-                        // 진단 문안 전용 — 판정이 아니라 에러 본문이라 관측 실패의 빈 문자열이 정확하다.
-                        let tail =
-                            screen_tail_lines(&gate_guard_screen(sid).unwrap_or_default(), 5);
-                        let v = settle_gate_pending(
-                            sid,
-                            GATE_ID_INJECT_HELD,
-                            tail,
-                            gate_close_override_once(),
-                            // ★[RECOVER] 를 표식에 **이월**한다 — 그러지 않으면 다음 부트가
-                            //   `already_alive` 로 접어 이 노드는 복구 프로토콜 지시를 한 번도
-                            //   받지 못한다.
-                            Some(recover_directive()),
-                            // ★(성찰 C6) 여기 도달했다는 것은 `boot_agent_on_surface` 가 `Ready` 를
-                            //   냈다는 뜻이다 = 이 좌석은 **지침을 이미 받았다**(전문이든 [RESUME]
-                            //   이든). 채택이 전문을 다시 넣으면 정확히 C6 가 막으려는 사고다.
-                            true,
-                        );
-                        if let BootVerdict::GatePending { gate, tail } = &v {
-                            print_gate_pending_prescription(sid, &role_name, &agent, gate, tail);
-                            println!(
-                                "gate-pending surface:{sid} ({agent}) — 재기동은 됐고 주입만 보류 \
-                                 · [RECOVER] 이월 · 회수 0 · 파괴 0(사람 1회 조치 대기)"
-                            );
-                        }
-                        v
-                    }
-                    Err(e) => {
-                        // 보류가 아닌 주입 실패는 정직히 알리되 **파괴로 번역하지 않는다**
-                        //  — 좌석은 살아 있고 재기동 자체는 성공했다(run_restore 와 같은 철자).
-                        eprintln!(
-                            "· {role_name}: 재기동은 됐으나 **복구 디렉티브 미주입** \
-                             (좌석 보존 · 회수 0) — {e}"
-                        );
-                        println!("recovered surface:{sid} ({agent}) — 디렉티브 미주입");
-                        BootVerdict::Ready
-                    }
-                }
+                println!("recovered surface:{sid} ({agent})");
+                BootVerdict::Ready
             }
             // ★(U-11) 이 호출부의 귀결은 launch 와 **다르다** — 여기엔 닫을 새 surface 가 없다.
             //   대신 이 경로의 실패는 `run_boot` 에서 `escalate_reclaim`(=kill)으로 자동
@@ -19250,15 +19288,10 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                 ) {
                     Ok(BootVerdict::Ready) => {
                         ok += 1;
-                        let directive = restore_directive(role);
-                        // ★(N7) 좌석 내 재연결은 성공했어도 복원 디렉티브가 유실될 수 있다 —
-                        //   종전엔 그 유실이 조용해서 '재기동 ok' 로만 집계됐다. 방향은 무변.
-                        if let Err(e) = inject_text(sid, directive) {
-                            eprintln!(
-                                "· {role}: 좌석 내 재연결은 됐으나 **복원 디렉티브 미주입** \
-                                 (좌석 보존 · 계속 진행) — {e}"
-                            );
-                        }
+                        // ★(0.14.41 · U8 P0-M1) [RESTORE] 는 `boot_agent_on_surface` 가 디렉티브 뒤에 **한
+                        //   제출**로 이미 넣었다(위 인자 `Some(restore_directive(role))` → `adoption_payload`).
+                        //   종전의 두 번째 `inject_text(restore_directive)` 는 Claude 큐 선두에 끼어 감독자 지시를
+                        //   막았다(반박 검증 M1). 한 제출이 보류·실패하면 그 판정이 아래 GatePending/Err 팔로 온다.
                         continue;
                     }
                     // ★(U-11) 이 호출부의 귀결은 앞의 둘과 또 다르다 — **fresh 폴백을 하지 않는다**.
@@ -19307,13 +19340,10 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                                 json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
                             );
                         }
-                        // ★(N7) 재기동 뒤 복원 디렉티브 유실도 조용하지 않다(방향 무변).
-                        if let Err(e) = inject_text(sid, restore_directive(role)) {
-                            eprintln!(
-                                "· {role}: 재기동은 됐으나 **복원 디렉티브 미주입** \
-                                 (좌석 보존 · 계속 진행) — {e}"
-                            );
-                        }
+                        // ★(0.14.41 · U8 P0-M1) [RESTORE] 는 `run_launch_agent_opts(…, restore=true, …)` 가
+                        //   부트 공용 함수에 지시를 넘겨 디렉티브 뒤에 **한 제출**로 이미 넣었다. 종전 두 번째
+                        //   제출(`inject_text(restore_directive)`)은 큐 선두 차단의 원인이라 없앴다(반박 M1).
+                        //   rc 0 = 그 한 제출까지 성공(주입 Err 는 rc 1 → else 팔 실패 계상 · 보류는 78 → 위 보류 계상).
                     }
                 }
             } else {
@@ -19355,11 +19385,332 @@ fn reinject_check_should_skip_bare_shell(entry: &Value) -> bool {
     !(agent_present && not_exited && agent_live)
 }
 
+/// ★(0.14.41 · U8 P0-M2) 각성 핑의 **운명** — 좌석의 세션 기록(Claude 트랜스크립트)에서 읽은 사실.
+///
+/// 【왜 필요한가】 `reinject --check` 는 핑을 넣고 화면에서 ACK 를 짧게(phoenix 6s/4s) 기다린 뒤, 못 보면
+/// "드리프트" 로 판정해 58KB 전문을 재주입했다. 그런데 에이전트가 턴을 도는 중이면 Claude 는 핑을 **자기 큐에
+/// 회색으로** 붙여 두고(2.1.275+ `queue-operation enqueue`) 다음 도구 경계나 턴 끝에 받는다 — ACK 가 없는 것은
+/// 지침이 없어서가 아니라 **아직 못 받아서**다. 09-23 실측: 워커 +2회 · CEO +3회 전문 재주입 → 5분 뒤 ctx 64%
+/// 강제 clear(반박 검증 M2 · 폭주 ① + 무clear ② 결합). 그래서 ACK 부재를 곧바로 드리프트로 읽지 않고, 세션
+/// 기록에서 **핑이 어떻게 됐는지**를 먼저 본다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PingFate {
+    /// 에이전트가 ACK 토큰을 냈다(화면 매칭은 놓쳤지만 세션 기록에는 있다) — 드리프트 아님.
+    Acked,
+    /// 핑이 에이전트 큐에 들어갔다(`queue-operation enqueue` · 턴 중 흡수 `queued_command`) — 전달됨·바쁨.
+    QueuedInAgent,
+    /// 핑이 유휴 프롬프트로 수신됐고 그 뒤 응답이 있는데 ACK 가 없다 — **드리프트**(재주입 자격).
+    ReceivedNoAck,
+    /// 핑이 프롬프트로 수신됐지만 아직 응답이 기록되지 않았다(생성 중) — 판정 불가.
+    ReceivedPending,
+    /// 세션 기록에 핑 흔적이 없다(미전달 · 다른 파일 · 기록 지연) — 판정 불가.
+    NotSeen,
+}
+
+impl PingFate {
+    fn label(&self) -> &'static str {
+        match self {
+            PingFate::Acked => "ACK 관측(세션 기록)",
+            PingFate::QueuedInAgent => "핑 전달됨·대상 바쁨",
+            PingFate::ReceivedNoAck => "핑 수신·응답에 ACK 없음",
+            PingFate::ReceivedPending => "핑 수신됨·응답 생성 중",
+            PingFate::NotSeen => "세션 기록에 핑 흔적 없음",
+        }
+    }
+}
+
+/// 각성 핑의 머리 문구 — 세션 기록에서 핑을 식별하는 두 조각 중 하나(다른 하나는 nonce).
+const REINJECT_PING_HEAD: &str = "지침 각성 확인 핑:";
+/// 세션 기록 꼬리 판독 상한(바이트). 핑은 방금 넣은 것이라 꼬리에 있다 — 59KB 디렉티브 줄이 몇 개 끼어도 충분한 폭.
+const SESSION_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// check 재주입 멱등 키의 보존 기한(초). 지나면 표식을 치운다 — 그 세션이 아직 살아 있으면 1회 더 허용될 뿐이다(유계).
+const REINJECT_CLAIM_TTL_SECS: u64 = 7 * 24 * 3600;
+/// 멱등 표식 정리 1회당 훑는 항목 상한(디렉터리가 비정상적으로 커도 check 가 느려지지 않게).
+const REINJECT_CLAIM_PRUNE_SCAN: usize = 512;
+
+/// 핑 nonce — pid + 밀리초 3자리. 같은 세션 기록 안의 **이전 핑**과 섞이지 않게 pid 단독보다 좁힌다
+/// (숫자만 — 에이전트가 이어붙여 출력할 ACK 토큰이 된다).
+fn reinject_ping_nonce() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis())
+        .unwrap_or(0);
+    format!("{}{:03}", std::process::id(), ms)
+}
+
+/// 각성 핑 문안(종전 문안과 nonce 외 바이트 동일). 마커를 통째로 넣지 않는다 — 터미널 에코가 `wait_for` 에
+/// 매칭되는 자기-에코 오탐 차단(토큰 분리 조합 지시).
+fn reinject_ping_text(nonce: &str) -> String {
+    format!(
+        "{REINJECT_PING_HEAD} 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 \
+         한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '{nonce}'"
+    )
+}
+
+/// 이 텍스트가 **그 핑**인가(머리 문구 ∧ 따옴표로 감싼 nonce).
+fn text_carries_ping(text: &str, nonce: &str) -> bool {
+    text.contains(REINJECT_PING_HEAD) && text.contains(&format!("'{nonce}'"))
+}
+
+/// 트랜스크립트 `type=user` 줄의 **사람/프롬프트 텍스트**만 — `tool_result` 블록은 빼낸다(에이전트가
+/// `read-screen` 으로 읽은 핑 문면을 '핑 수신' 으로 오인하지 않게).
+fn transcript_user_text(v: &Value) -> Option<String> {
+    let c = &v["message"]["content"];
+    if let Some(s) = c.as_str() {
+        return Some(s.to_string());
+    }
+    let mut out = String::new();
+    for b in c.as_array()? {
+        if b["type"].as_str() == Some("text") {
+            if let Some(t) = b["text"].as_str() {
+                out.push_str(t);
+                out.push('\n');
+            }
+        }
+    }
+    Some(out)
+}
+
+/// assistant 줄이 **답**(비어 있지 않은 text 블록 또는 tool_use 블록)을 담았는가 — thinking 블록만이면 거짓.
+fn transcript_assistant_answered(v: &Value) -> bool {
+    let c = &v["message"]["content"];
+    if let Some(s) = c.as_str() {
+        return !s.trim().is_empty();
+    }
+    c.as_array().is_some_and(|blocks| {
+        blocks.iter().any(|b| match b["type"].as_str() {
+            Some("text") => b["text"].as_str().is_some_and(|t| !t.trim().is_empty()),
+            Some("tool_use") => true,
+            _ => false,
+        })
+    })
+}
+
+/// ★(U8 P0-M2) 세션 기록 줄들에서 핑의 운명을 판정한다(순수 · 결정론).
+///
+/// 규칙(순서 = 우선순위):
+///   ① 사이드체인이 아닌 assistant 줄에 `DIRECTIVE-ACK-<nonce>` → `Acked`.
+///   ② 핑이 `queue-operation enqueue` 또는 턴 중 흡수(`attachment.queued_command`)로 기록 → `QueuedInAgent`
+///      (그 뒤 프롬프트로 빠져 나왔어도 '바쁜 좌석이 방금 받았다' 이므로 재주입하지 않는다 — 보수).
+///   ③ 핑이 `type=user` 프롬프트로 기록되고 **그 뒤** assistant 줄이 있다 → `ReceivedNoAck`(드리프트).
+///   ④ 프롬프트만 있고 응답 없음 → `ReceivedPending` · ⑤ 흔적 없음 → `NotSeen`.
+fn classify_ping_fate(lines: &[String], nonce: &str) -> PingFate {
+    let ack = format!("DIRECTIVE-ACK-{nonce}");
+    let (mut enqueued, mut prompt_seen, mut responded) = (false, false, false);
+    for line in lines {
+        let hit_nonce = line.contains(nonce);
+        if !hit_nonce && !prompt_seen {
+            continue; // 핑과 무관하고 핑 뒤도 아닌 줄 — 파싱 비용 0.
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue; // 쓰는 중인 마지막 줄·손상 줄은 사실이 아니다.
+        };
+        match v["type"].as_str().unwrap_or("") {
+            "assistant" => {
+                if v["isSidechain"].as_bool() == Some(true) {
+                    continue;
+                }
+                if hit_nonce && line.contains(&ack) {
+                    return PingFate::Acked;
+                }
+                // 응답 = 텍스트·도구 호출 블록이 있는 assistant 줄. 사고(thinking) 블록만 있는 줄은 **아직 답이
+                // 아니다** — 확장 사고 모델은 사고 블록을 먼저 기록하므로 그것을 '응답에 ACK 없음' 으로 읽으면
+                // 생성 중인 좌석을 드리프트로 오판한다(판정 불가 쪽으로 접는다).
+                if prompt_seen && transcript_assistant_answered(&v) {
+                    responded = true;
+                }
+            }
+            "queue-operation" => {
+                if v["operation"].as_str() == Some("enqueue")
+                    && v["content"].as_str().is_some_and(|c| text_carries_ping(c, nonce))
+                {
+                    enqueued = true;
+                }
+            }
+            "attachment" => {
+                let a = &v["attachment"];
+                if a["type"].as_str() == Some("queued_command")
+                    && a["prompt"].as_str().is_some_and(|p| text_carries_ping(p, nonce))
+                {
+                    enqueued = true;
+                }
+            }
+            "user" => {
+                if v["isMeta"].as_bool() == Some(true) {
+                    continue;
+                }
+                if transcript_user_text(&v).is_some_and(|t| text_carries_ping(&t, nonce)) {
+                    prompt_seen = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if enqueued {
+        PingFate::QueuedInAgent
+    } else if prompt_seen && responded {
+        PingFate::ReceivedNoAck
+    } else if prompt_seen {
+        PingFate::ReceivedPending
+    } else {
+        PingFate::NotSeen
+    }
+}
+
+/// 세션 기록 파일의 꼬리 줄들(최대 `max_bytes`). 잘린 첫 줄은 버리고 CRLF 는 정규화한다
+/// (데몬 usage 수집기 `read_new_lines` 와 같은 줄 규약 — Windows 네이티브 JSONL 의 `\r` 잔류 제거).
+fn read_session_tail_lines(path: &std::path::Path, max_bytes: u64) -> Result<Vec<String>, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("세션 기록 열기 실패({}): {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| format!("세션 기록 메타 실패: {e}"))?.len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start)).map_err(|e| format!("세션 기록 탐색 실패: {e}"))?;
+    let mut buf = Vec::new();
+    f.take(max_bytes)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("세션 기록 읽기 실패: {e}"))?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut parts = text.split('\n');
+    if start > 0 {
+        let _ = parts.next(); // 꼬리 창의 첫 조각은 잘린 줄이다.
+    }
+    Ok(parts
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// 좌석 행(`surface.list`)에서 핑의 운명을 읽는다 — 세션 파일은 **데몬 usage 수집기가 해소한 값**
+/// (`usage.session_file` · 등록 > lsof > 휴리스틱 · statusline 은 Claude 의 transcript_path)을 그대로 쓴다
+/// (발견 로직 사본 금지). Claude 트랜스크립트 계열(`transcript*`·`statusline`)만 읽을 줄 안다 — 그 밖
+/// (codex rollout·agy·미수집)은 `Err`(판정 불가 → 재주입하지 않는다).
+fn ping_fate_from_entry(entry: &Value, nonce: &str) -> Result<(PingFate, String), String> {
+    let u = &entry["usage"];
+    let source = u["source"].as_str().unwrap_or("");
+    if !(source.starts_with("transcript") || source == "statusline") {
+        return Err(format!(
+            "세션 기록 형식 미지원·미관측(usage.source={})",
+            if source.is_empty() { "부재" } else { source }
+        ));
+    }
+    let path = u["session_file"]
+        .as_str()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| "usage.session_file 부재".to_string())?;
+    let lines = read_session_tail_lines(std::path::Path::new(path), SESSION_TAIL_MAX_BYTES)?;
+    Ok((classify_ping_fate(&lines, nonce), path.to_string()))
+}
+
+/// ★(U8 P0-M2) ACK 대기 뒤의 처분(순수) — **판정 불가는 재주입하지 않는다**(폭주 차단 · 보고만).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReinjectCheckAction {
+    /// 세션 기록에 ACK 가 있다 — 재주입 불필요.
+    AckInTranscript,
+    /// 핑이 에이전트 큐에 대기 중 — 전달됨·바쁨(재주입 금지).
+    Busy,
+    /// 판정 불가(사유) — 재주입 금지·보고만.
+    Undetermined(String),
+    /// ack-only 호출의 ACK 미수신(사유) — 재주입 금지.
+    AckOnlyMiss(String),
+    /// 드리프트 확정 — 멱등 키를 확보하면 1회 재주입.
+    Reinject,
+}
+
+fn reinject_check_action(fate: &Result<PingFate, String>, ack_only: bool) -> ReinjectCheckAction {
+    if let Ok(PingFate::Acked) = fate {
+        return ReinjectCheckAction::AckInTranscript;
+    }
+    let why = match fate {
+        Ok(f) => f.label().to_string(),
+        Err(e) => e.clone(),
+    };
+    if ack_only {
+        return ReinjectCheckAction::AckOnlyMiss(why);
+    }
+    match fate {
+        Ok(PingFate::QueuedInAgent) => ReinjectCheckAction::Busy,
+        Ok(PingFate::ReceivedNoAck) => ReinjectCheckAction::Reinject,
+        _ => ReinjectCheckAction::Undetermined(why),
+    }
+}
+
+/// ★(U8 P0-M2) check 재주입 **좌석·세션당 1회** 멱등 키(원자 생성 · `create_new`).
+/// `Ok(true)` = 이번이 첫 재주입(키 확보) · `Ok(false)` = 이 좌석·세션에 이미 1회 소진 · `Err` = 기록 불가
+/// (멱등을 보장할 수 없으면 재주입하지 않는다 — 호출부가 판정 불가로 접는다).
+/// 키 = (surface id, 세션 기록 경로) — `/clear` 로 새 세션이 되면 새 키다(새 세션의 드리프트는 1회 치유 가능).
+/// 두 check 가 동시에 와도 `create_new` 는 한쪽만 성공한다(경합 안전).
+fn reinject_check_claim(
+    dir: &std::path::Path,
+    sid: u64,
+    session_file: &str,
+    now: std::time::SystemTime,
+) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    reinject_claim_prune(dir, now);
+    let key: String = Sha256::digest(session_file.as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = dir.join(format!("s{sid}-{key}.claim"));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{session_file}");
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// ★(0.14.41-fix1 · U8 P0-M2 · REVIEW1 F7) 멱등 키 소진 뒤(=`reinject_check_claim` 이 `Ok(true)` 를
+/// 반환한 뒤) compose·inject 가 실패하면 그 사실을 **문면에 명시**한다(순수). 키는 지우지 않는다 —
+/// 지우고 재시도를 열면 좌석·세션 1회 상한(폭주 차단의 핵심)이 실패-재시도 루프로 사문화된다. 대신
+/// "이 세션은 check 치유가 소진됐다"를 사람·자동화가 읽게 한다(리뷰1 권고 두 번째 안 — 더 안전한 쪽).
+fn reinject_claim_exhausted_hint(e: String, claimed: bool) -> String {
+    if claimed {
+        format!(
+            "{e} · ★(REVIEW1 F7) 이 좌석·세션의 check 재주입 멱등 키는 이미 소진됐다(TTL 7일) — \
+             이 실패 뒤로는 `--check` 로 다시 시도해도 재주입되지 않는다. 강제 재주입(`--check` 미지정) \
+             또는 사람 확인이 필요하다."
+        )
+    } else {
+        e
+    }
+}
+
+/// 보존 기한이 지난 멱등 표식 정리(최선노력 · 상한 있는 1회 훑기).
+fn reinject_claim_prune(dir: &std::path::Path, now: std::time::SystemTime) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten().take(REINJECT_CLAIM_PRUNE_SCAN) {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("claim") {
+            continue;
+        }
+        let expired = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|d| d.as_secs() > REINJECT_CLAIM_TTL_SECS);
+        if expired {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 fn run_reinject(
     role: Option<String>,
     surface: Option<String>,
     check: bool,
     timeout: u64,
+    // ★(0.14.41 · U8 P0-M2) ACK 확인 전용 — 어떤 결과에서도 전문을 재주입하지 않는다(phoenix G2).
+    ack_only: bool,
 ) -> i32 {
     let result = (|| -> Result<(), String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
@@ -19368,6 +19719,12 @@ fn run_reinject(
             .clone()
             .or_else(|| entry["role"].as_str().map(String::from))
             .ok_or("role 미상 — --role 지정 필요")?;
+        // ★(0.14.41-fix1 · REVIEW1 F7) 멱등 키는 compose·inject **앞**에서 소비된다(좌석·세션 1회 상한을
+        //   지키려면 주입 시도 자체가 아니라 '드리프트로 확정됐다'는 사실만으로 키를 태워야 한다 — 아니면
+        //   실패마다 재시도가 가능해져 상한이 무의미해진다). 그래서 그 한 번(합성·주입)이 실패하면 같은
+        //   좌석·세션은 TTL 7일 동안 check 재주입을 다시 받지 못한다(③ 방향이지만 폭주 방향으로는 안전).
+        //   키를 지우는 대신(재시도를 열면 좌석·세션 상한이 사문화된다) 실패 문면에 **명시**한다.
+        let mut reinject_claim_consumed = false;
         if check {
             // ── Tier R gate(에러①): 빈 셸(라이브 에이전트 부재)이면 핑·fall-through 주입 둘 다 skip. ──
             // 크래시투셸(exited=true)·미부팅 bare 셸에 디렉티브 전문을 뿌리는 소음/오염을 차단한다.
@@ -19379,12 +19736,13 @@ fn run_reinject(
             }
             // 마커를 핑 텍스트에 통째로 넣지 않는다 — 주입 텍스트의 터미널 에코가
             // wait_for에 매칭되는 false ACK(자기-에코 오탐)를 차단 (토큰 분리 조합 지시)
-            let marker = format!("DIRECTIVE-ACK-{}", std::process::id());
+            let nonce = reinject_ping_nonce();
+            let marker = format!("DIRECTIVE-ACK-{nonce}");
             let cursor = request("surface.read_text", json!({"surface_id": sid}))?
                 ["latest_cursor"]
                 .as_u64()
                 .unwrap_or(0);
-            inject_text(sid, &format!("지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '{}'", std::process::id()))?;
+            inject_text(sid, &reinject_ping_text(&nonce))?;
             let r = request(
                 "surface.wait_for",
                 json!({"surface_id": sid, "pattern": marker,
@@ -19394,10 +19752,82 @@ fn run_reinject(
                 println!("디렉티브 생존 확인 (ACK 수신) — 재주입 불필요");
                 return Ok(());
             }
-            eprintln!("[reinject] ACK 없음 ({timeout}s) — 드리프트 판정, 재주입 진행");
+            // ★(0.14.41 · U8 P0-M2) 화면에서 ACK 를 못 봤다고 곧 드리프트가 아니다 — 핑이 에이전트 큐에 회색
+            //   대기 중일 수 있다(09-23 폭주 실측). 세션 기록(데몬 usage 수집기가 해소한 파일)으로 핑의 운명을
+            //   먼저 읽는다. 판정 불가·바쁨·ack 전용은 **재주입하지 않는다**(rc 0 · 보고만 · phoenix 단계가
+            //   재시도 루프를 만들지 않도록 성공 종료). 지침 주입 자체는 fresh·복원 경로가 보장한다(③ 보존).
+            let fate = surface_entry(sid).and_then(|e| ping_fate_from_entry(&e, &nonce));
+            let session_file = fate.as_ref().ok().map(|(_, p)| p.clone());
+            let fate = fate.map(|(f, _)| f);
+            let action = reinject_check_action(&fate, ack_only);
+            if action == ReinjectCheckAction::AckInTranscript {
+                println!(
+                    "디렉티브 생존 확인 (ACK 수신) — 재주입 불필요(화면 미매칭 · 세션 기록에서 관측) surface:{sid}"
+                );
+                return Ok(());
+            }
+            let fate_label = match &fate {
+                Ok(f) => f.label().to_string(),
+                Err(e) => e.clone(),
+            };
+            eprintln!("[reinject] ACK 없음 ({timeout}s) — 핑 배달 판정(세션 기록): {fate_label}");
+            match action {
+                ReinjectCheckAction::AckInTranscript => unreachable!("위에서 반환"),
+                ReinjectCheckAction::Busy => {
+                    println!(
+                        "재주입 보류(핑 전달됨·대상 바쁨 · queued_in_agent) — surface:{sid} ({role_name}) · \
+                         에이전트 큐에 대기 중인 핑을 '미배달'로 읽지 않는다(폭주 차단)"
+                    );
+                    return Ok(());
+                }
+                ReinjectCheckAction::Undetermined(why) => {
+                    println!(
+                        "재주입 보류(핑 배달 판정 불가: {why}) — surface:{sid} ({role_name}) · \
+                         판정 불가는 재주입하지 않는다(폭주 차단 · 보고만)"
+                    );
+                    return Ok(());
+                }
+                ReinjectCheckAction::AckOnlyMiss(why) => {
+                    println!("재주입 생략(ack-only · ACK 미수신: {why}) — surface:{sid} ({role_name})");
+                    return Ok(());
+                }
+                ReinjectCheckAction::Reinject => {
+                    let Some(session_file) = session_file else {
+                        println!(
+                            "재주입 보류(핑 배달 판정 불가: 세션 기록 경로 부재) — surface:{sid} ({role_name}) · \
+                             판정 불가는 재주입하지 않는다(폭주 차단 · 보고만)"
+                        );
+                        return Ok(());
+                    };
+                    let dir = cys::pack::pack_dir().join("state").join("reinject-check");
+                    match reinject_check_claim(&dir, sid, &session_file, std::time::SystemTime::now()) {
+                        Ok(true) => {
+                            reinject_claim_consumed = true;
+                            eprintln!(
+                                "[reinject] 드리프트 판정(핑 수신·응답에 ACK 없음) — 이 좌석·세션 1회 재주입(멱등 키 확보)"
+                            );
+                        }
+                        Ok(false) => {
+                            println!(
+                                "재주입 보류(이 세션 check 재주입 1회 소진 · 좌석당 멱등) — surface:{sid} ({role_name})"
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            println!(
+                                "재주입 보류(핑 배달 판정 불가: 멱등 키 기록 실패 {e}) — surface:{sid} ({role_name}) · \
+                                 판정 불가는 재주입하지 않는다(폭주 차단 · 보고만)"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
-        let directive = compose_directive(&role_name)?;
-        inject_text(sid, &directive)?;
+        let directive = compose_directive(&role_name)
+            .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
+        inject_text(sid, &directive)
+            .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
         println!(
             "reinjected {} bytes → surface:{sid} ({role_name})",
             directive.len()
@@ -26310,6 +26740,42 @@ mod tests {
         }
     }
 
+    /// ★(0.14.41-fix1 · REVIEW1 F6) 모달 사유 판정은 `[draft_gate:modal]` 태그에만 반응한다 — 다른
+    /// draft_gate 사유(사람 초안·화면 점유·미제출 바이트)나 무관 거부는 걸리지 않는다.
+    #[test]
+    fn modal_draft_gate_err_matches_only_modal_tag() {
+        assert!(is_modal_draft_gate_err(&format!(
+            "{} [{}:modal]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG
+        )));
+        for other in [
+            format!("{} [{}:human_draft]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG),
+            format!("{} [{}:screen_occupied]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG),
+            format!("{} [{}:pending_input]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG),
+            "acl_denied: external→worker deny".to_string(),
+        ] {
+            assert!(!is_modal_draft_gate_err(&other), "무관 사유가 모달 경고를 유발: {other}");
+        }
+    }
+
+    /// `cys send` 의 큐 폴백 분기가 모달 판정을 실제로 부르고, 모달 전용 경고에서 뒤따르는
+    /// `send-key Return` 을 보내지 말라고 명시하는지(F6) 배선 핀.
+    #[test]
+    fn send_queue_fallback_wires_modal_specific_warning() {
+        let src = include_str!("cys.rs");
+        let body = src
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .nth(1)
+            .expect("cys send 큐 폴백 분기 소실")
+            .split("\n                        }\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("is_modal_draft_gate_err(&e)"), "모달 판정을 부르지 않는다: {body}");
+        assert!(
+            body.contains("send-key") && body.contains("보내지 마라"),
+            "모달 경고가 뒤따르는 send-key Return 을 보내지 말라고 안내하지 않는다"
+        );
+    }
+
     #[test]
     fn install_claude_hook_skips_backup_when_already_installed() {
         // RC-1 회귀 핀(D2 master 조건): 온보딩이 매 기동 init-pack을 호출(멱등)해도,
@@ -26761,23 +27227,27 @@ mod tests {
              밖에서 보이지 않는다(그물이 없는 것과 눈을 감은 것이 구별되지 않는다)"
         );
         // ★'지우기' 로 통과하는 경로 차단 — 호출 자체를 없애도 위 0 은 만족되므로,
-        //   사유를 내는 형태의 **실측 개수를 동결**한다. 5 = 이번에 고친 셋 + 종전부터
-        //   옳게 처리하던 둘(부트 주입 직후 · 사이클 재주입).
+        //   사유를 내는 형태의 **실측 개수를 동결**한다.
+        // ★(0.14.41 · U8 P0-M1) 동결값 5 → 3: restore 의 두 지점(좌석 내 재연결 뒤 · fresh 재기동 뒤
+        //   `[RESTORE]` 두 번째 제출)은 **지점 자체가 사라졌다** — `[RESTORE]` 는 부트 공용 함수가 디렉티브 뒤에
+        //   한 제출로 넣고(`adoption_payload`), 그 한 제출의 보류·실패 사유는 부트 판정(GatePending 처방 ·
+        //   in-seat Err 폴백 문안 · fresh rc 1 '기동 실패')으로 밖에 나간다(아래 이사 핀). 남은 셋 = [DRAIN]
+        //   브로드캐스트 · 부트 주입 직후 · 팩 업데이트 재주입.
         assert_eq!(
             prod.matches("if let Err(e) = inject_text(").count(),
-            5,
-            "주입 사유를 남기는 지점 수가 동결값(5)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
+            3,
+            "주입 사유를 남기는 지점 수가 동결값(3)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
         );
-        // 그리고 이번에 고친 **세 지점**이 각자 자기 사유를 낸다(개수만으로는 이사를 못 잡는다).
+        assert!(prod.contains("저장 신호 미전달(계속 진행)"), "Hold 사유 문안이 사라졌다: [DRAIN]");
+        // 이사 핀 — restore 의 [RESTORE] 한 제출 결과가 사유를 달고 밖으로 나간다(침묵 0).
+        let restore = strip_line_comments(refl_fn_body(src, "run_restore"));
         for marker in [
-            "저장 신호 미전달(계속 진행)",
-            "좌석 내 재연결은 됐으나 **복원 디렉티브 미주입**",
-            "재기동은 됐으나 **복원 디렉티브 미주입**",
+            "좌석 내 재연결 보류(관문 gate={gate})",
+            "좌석 내 재연결 실패({e}) — fresh 기동으로 폴백",
+            "기동 실패 — 나머지 역할 계속 진행",
+            "관문 보류 — 좌석 보존 · 주입 0",
         ] {
-            assert!(
-                prod.contains(marker),
-                "Hold 사유 문안이 사라졌다: {marker:?}"
-            );
+            assert!(restore.contains(marker), "restore 한 제출 결과의 사유 문안이 사라졌다: {marker:?}");
         }
     }
 
@@ -33103,11 +33573,16 @@ mod tests {
         for pin in [
             "lane_guard_tripped(",
             "effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref())",
-            "if !hooks_inject {",
+            // ★(0.14.41 · U8 P0-M1) 종전 `if !hooks_inject {` 분기는 한 제출 조립기로 이사했다 — 실효값이
+            //   그 조립기로 들어가는가(아래 조립기 본문 핀 + `u8_m1_cycle_reinject_payload_…` 행동 검체).
+            "cycle_reinject_payload(hooks_inject, &resume_text,",
         ] {
             assert!(compact.contains(pin),
                 "훅 발화 관측이 빠졌다 — 레인 가드 무발화 좌석에서 디렉티브가 0회 주입된다(오너 색인 🔒 축)");
         }
+        let payload = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "cycle_reinject_payload"));
+        assert!(payload.contains("if hooks_inject {") && payload.contains("adoption_payload(&compose()?, Some(resume))"),
+            "강등된 좌석(실효 hooks_inject=false)에 디렉티브가 조립되지 않는다 — 0회 주입(③)");
         std::fs::remove_dir_all(&td).unwrap();
     }
 
@@ -33312,13 +33787,290 @@ mod tests {
         assert!(compact.find("lane_guard_tripped(").unwrap() < effective_at);
         for consumer in [
             "cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)",
-            "if !hooks_inject { inject_text(sid, &compose_directive(&role_name)?)?; }",
+            // ★(0.14.41 · U8 P0-M1) 종전 핀은 이중 제출(`if !hooks_inject { inject_text(디렉티브) }` 뒤
+            //   `inject_text(resume)`)을 **문자 그대로** 박제했다. 새 의도: 디렉티브 뒤 RESUME 을 채택 경로와
+            //   같은 규약(`adoption_payload`)으로 **한 제출**. 훅 좌석은 종전대로 RESUME 하나다.
+            "inject_text(sid, &cycle_reinject_payload(hooks_inject, &resume_text, &mut || compose_directive(&role_name))?)?;",
             "cycle_reinject_held( &e, hooks_inject,",
             "cycle_best_effort_reinject( hooks_inject,",
         ] {
             assert!(compact.find(consumer).is_some_and(|at| effective_at < at),
                 "실효값의 소비처 배선 누락: {consumer}");
         }
+        // 되돌림 뮤테이션(두 제출 복귀)을 잡는 축 — Verified 팔의 재주입 제출 호출은 정확히 1곳이다.
+        let verified = compact.split("ClearEffect::Verified => {").nth(1).expect("Verified 팔")
+            .split("ClearEffect::Unverified =>").next().expect("Verified 팔 끝");
+        let ok_arm = verified.split("Ok(()) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
+            .split("Err(e) => Err(cycle_reinject_held(").next().expect("Ok 팔 끝");
+        assert_eq!(ok_arm.matches("inject_text(sid,").count(), 1,
+            "Verified 재주입이 한 제출이 아니다(디렉티브·RESUME 두 제출 = Claude 큐 선두 차단):\n{ok_arm}");
+        assert!(!compact.contains("inject_text(sid, resume)?;"), "RESUME 단독 두 번째 제출이 되살아났다");
+    }
+
+    /// ★(0.14.41 · U8 P0-M1) 직접 Ready 경로(restore in-seat · restore fresh · node-recover)도 디렉티브와
+    /// 복원 연속 지시를 **한 제출**로 보낸다 — 부트 공용 함수가 `adoption_payload(&directive, followup)` 을
+    /// 조립하고, 세 호출부는 두 번째 `inject_text` 를 하지 않는다(채택 경로와 한 규약 · 사본 금지).
+    #[test]
+    fn u8_m1_direct_ready_paths_submit_directive_and_followup_once_source_pin() {
+        let src = include_str!("cys.rs");
+        let boot = strip_line_comments(refl_fn_body(src, "boot_agent_on_surface"));
+        let decl_at = boot.find("let payload = adoption_payload(&directive, followup);")
+            .expect("부트 공용 함수가 한 제출 페이로드를 조립하지 않는다");
+        let call_marker = "inject_directive_after_ready(\n        sid,\n        agent,\n        &payload,";
+        let call_at = boot.find(call_marker).expect("주입 절반에 한 제출 페이로드가 넘어가지 않는다");
+        // ★(0.14.41-fix1 · REVIEW1 F3) 리터럴 두 앵커만 보면 그 **사이**에서 `payload` 를 그림자
+        //   재선언·재대입해 followup 을 조용히 빼는 뮤턴트가 잡히지 않는다(핀 문자열은 그대로 둔 채
+        //   실제 제출 바이트만 디렉티브 단독으로 되돌리는 수법 · r1-mut-M1-boot-followup-dropped.log
+        //   가 366/366 통과했다). 선언과 호출 사이 구간에 `payload` 재대입이 **없어야** 한다.
+        let between = &boot[decl_at + "let payload = adoption_payload(&directive, followup);".len()..call_at];
+        assert!(
+            !between.contains("payload ="),
+            "선언과 제출 사이에서 payload 가 재대입된다(followup 이 조용히 빠질 수 있다):\n{between}"
+        );
+        // 세 호출부는 지시를 표식 이월용으로 **넘기되**(보류 시 채택이 다시 싣는다) 따로 제출하지 않는다.
+        let restore = strip_line_comments(refl_fn_body(src, "run_restore"));
+        assert!(restore.contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
+        assert_eq!(restore.matches("inject_text(").count(), 0,
+            "restore 가 복원 지시를 두 번째 제출로 보낸다(in-seat·fresh):\n{restore}");
+        let recover = strip_line_comments(refl_fn_body(src, "run_node_recover"));
+        assert!(recover.contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
+        assert_eq!(recover.matches("inject_text(").count(), 0,
+            "node-recover 가 [RECOVER] 를 두 번째 제출로 보낸다");
+        let launch = strip_line_comments(refl_fn_body(src, "run_launch_agent_opts"));
+        assert!(launch.contains("if restore { Some(restore_directive(role)) } else { None },"),
+            "restore 경유 launch-agent 가 지시를 넘기지 않는다(fresh 복원 지시 유실 = ③)");
+    }
+
+    /// ★(0.14.41 · U8 P0-M2) `reinject --check` 는 각성 핑이 **에이전트 큐에 회색 대기**면 그것을 'ACK 없음 =
+    /// 드리프트' 로 읽지 않는다(09-23 실측: 워커 +2회 · CEO +3회 전문 재주입 → 5분 뒤 ctx 64% 강제 clear).
+    /// 판정은 세션 기록(데몬 usage 수집기가 해소한 `usage.session_file`)으로 하고, 판정 불가·바쁨·ack 전용은
+    /// 재주입하지 않으며, 재주입은 좌석·세션당 멱등 키로 1회다. phoenix G2 단계는 ACK 전용 호출이다.
+    #[test]
+    fn u8_m2_reinject_check_does_not_reinject_a_queued_ping_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = strip_line_comments(refl_fn_body(src, "run_reinject"));
+        for anchor in [
+            "ping_fate_from_entry(",
+            "reinject_check_action(",
+            "reinject_check_claim(",
+            "ack_only",
+        ] {
+            assert!(body.contains(anchor), "run_reinject 배선 결손: {anchor}");
+        }
+        let decide = body.find("reinject_check_action(").expect("판정");
+        // ★(0.14.41-fix1 · REVIEW1 F7) 실패 시 소진 힌트로 감싸며 `compose_directive(&role_name)` 뒤의
+        //   `?` 가 `.map_err(...)?` 로 바뀌었다 — 앵커는 함수 호출 자체만 본다(뒤에 오는 처리 방식은
+        //   이 소스 핀의 관할이 아니다 · 행동은 u8_m2_run_reinject_wraps_both_failure_arms_with_claim_hint).
+        let compose = body.find("compose_directive(&role_name)").expect("전문 조립");
+        assert!(decide < compose, "핑 운명 판정이 전문 재주입보다 뒤다");
+        let claim = body.find("reinject_check_claim(").expect("멱등 키");
+        assert!(claim < compose, "멱등 키 확보가 전문 재주입보다 뒤다");
+        let clap = src.split("    Reinject {").nth(1).expect("Reinject 서브커맨드").split("},").next().unwrap();
+        assert!(clap.contains("ack_only: bool"), "--ack-only 플래그가 없다(phoenix G2 가 재주입 없는 ACK 확인을 못 한다)");
+        let phoenix = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack/bin/javis_phoenix.py"),
+        ).expect("javis_phoenix.py");
+        let g2 = phoenix.split("def stage_g2_ack(").nth(1).expect("stage_g2_ack").split("\ndef ").next().unwrap();
+        assert!(g2.contains("\"--ack-only\""), "phoenix G2 가 아직 재주입까지 하는 check 를 부른다");
+    }
+
+    /// 트랜스크립트 한 줄(Claude 2.1.27x 실측 스키마 — `queue-operation`/`attachment.queued_command`/
+    /// `user`/`assistant`) 생성기. 검체는 실제 줄 모양으로 판정기를 실행한다.
+    fn u8_line(kind: &str, text: &str) -> String {
+        match kind {
+            "enqueue" => json!({"type": "queue-operation", "operation": "enqueue",
+                                "content": format!("<pasted_content id=\"7\">\n{text}\n</pasted_content id=\"7\">")}),
+            "dequeue" => json!({"type": "queue-operation", "operation": "dequeue"}),
+            "absorbed" => json!({"type": "attachment", "attachment": {"type": "queued_command", "prompt": text}}),
+            "user" => json!({"type": "user", "message": {"role": "user", "content": text}}),
+            "user_blocks" => json!({"type": "user", "message": {"role": "user",
+                                    "content": [{"type": "text", "text": text}]}}),
+            "tool_result" => json!({"type": "user", "message": {"role": "user",
+                                    "content": [{"type": "tool_result", "content": text}]}}),
+            "assistant" => json!({"type": "assistant", "message": {"role": "assistant",
+                                  "content": [{"type": "text", "text": text}]}}),
+            "sidechain" => json!({"type": "assistant", "isSidechain": true,
+                                  "message": {"content": [{"type": "text", "text": text}]}}),
+            other => panic!("unknown kind {other}"),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn u8_m2_ping_fate_reads_the_agent_queue_before_calling_drift() {
+        let nonce = "4242123";
+        let ping = reinject_ping_text(nonce);
+        let other_ping = reinject_ping_text("999001");
+        let ack = format!("DIRECTIVE-ACK-{nonce}");
+        let l = |k: &str, t: &str| u8_line(k, t);
+        let table: Vec<(&str, Vec<String>, PingFate)> = vec![
+            // 09-23 실측 형태: 턴 중 핑 → enqueue(회색) → 화면 ACK 없음. 종전은 여기서 전문 재주입.
+            ("queued in agent", vec![l("user", "[RESUME] 이어가라"), l("assistant", "작업 중"), l("enqueue", &ping)],
+             PingFate::QueuedInAgent),
+            ("queued then dequeued and answered without ack is still busy",
+             vec![l("enqueue", &ping), l("dequeue", ""), l("user", &ping), l("assistant", "무슨 말인지")],
+             PingFate::QueuedInAgent),
+            ("absorbed mid-turn", vec![l("absorbed", &ping)], PingFate::QueuedInAgent),
+            ("ack in transcript", vec![l("user", &ping), l("assistant", &ack)], PingFate::Acked),
+            ("ack after queue", vec![l("enqueue", &ping), l("assistant", &format!("ok {ack}"))], PingFate::Acked),
+            ("idle prompt answered without ack = drift", vec![l("user", &ping), l("assistant", "안녕하세요")],
+             PingFate::ReceivedNoAck),
+            ("block content prompt", vec![l("user_blocks", &ping), l("assistant", "?")], PingFate::ReceivedNoAck),
+            ("prompt not yet answered", vec![l("user", &ping)], PingFate::ReceivedPending),
+            // 확장 사고: 사고 블록만 먼저 기록된 상태는 아직 답이 아니다(드리프트 오판 금지).
+            ("thinking-only is not an answer yet", vec![l("user", &ping), json!({"type": "assistant",
+                "message": {"content": [{"type": "thinking", "thinking": "출력 형식을 생각한다"}]}}).to_string()],
+             PingFate::ReceivedPending),
+            ("tool call is an answer", vec![l("user", &ping), json!({"type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}).to_string()],
+             PingFate::ReceivedNoAck),
+            ("subagent chatter is not a response", vec![l("user", &ping), l("sidechain", "sub")],
+             PingFate::ReceivedPending),
+            ("sidechain ack is not the seat's ack", vec![l("user", &ping), l("sidechain", &ack)],
+             PingFate::ReceivedPending),
+            ("tool_result echo of the ping is not receipt", vec![l("tool_result", &ping), l("assistant", "x")],
+             PingFate::NotSeen),
+            ("a different (older) ping is not this ping", vec![l("user", &other_ping), l("assistant", "x")],
+             PingFate::NotSeen),
+            ("nothing", vec![l("assistant", "x")], PingFate::NotSeen),
+            ("garbage and partial lines", vec!["{not json".into(), format!("{{\"type\":\"user\",\"x\":\"{nonce}")],
+             PingFate::NotSeen),
+        ];
+        for (name, lines, want) in table {
+            assert_eq!(classify_ping_fate(&lines, nonce), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn u8_m2_check_action_never_reinjects_unless_drift_is_proven() {
+        use ReinjectCheckAction as A;
+        let ok = |f: PingFate| -> Result<PingFate, String> { Ok(f) };
+        assert_eq!(reinject_check_action(&ok(PingFate::Acked), false), A::AckInTranscript);
+        assert_eq!(reinject_check_action(&ok(PingFate::Acked), true), A::AckInTranscript);
+        assert_eq!(reinject_check_action(&ok(PingFate::QueuedInAgent), false), A::Busy);
+        assert_eq!(reinject_check_action(&ok(PingFate::ReceivedNoAck), false), A::Reinject);
+        for f in [PingFate::ReceivedPending, PingFate::NotSeen] {
+            let label = f.label().to_string();
+            assert_eq!(reinject_check_action(&ok(f), false), A::Undetermined(label));
+        }
+        assert_eq!(
+            reinject_check_action(&Err("usage.session_file 부재".into()), false),
+            A::Undetermined("usage.session_file 부재".into()),
+            "판정 불가는 재주입하지 않는다"
+        );
+        // ack-only 는 드리프트가 확정돼도 재주입하지 않는다(phoenix G2).
+        for f in [PingFate::QueuedInAgent, PingFate::ReceivedNoAck, PingFate::ReceivedPending, PingFate::NotSeen] {
+            assert!(matches!(reinject_check_action(&ok(f), true), A::AckOnlyMiss(_)));
+        }
+        assert!(matches!(reinject_check_action(&Err("x".into()), true), A::AckOnlyMiss(_)));
+    }
+
+    #[test]
+    fn u8_m2_ping_fate_from_entry_reads_only_claude_transcripts_and_normalizes_lines() {
+        let td = std::env::temp_dir().join(format!("cys-u8-m2-{}", std::process::id()));
+        std::fs::create_dir_all(&td).unwrap();
+        let nonce = "5150777";
+        let path = td.join("s.jsonl");
+        // 앞에 긴 줄을 둬 꼬리 창의 첫 줄 절단을 태우고, CRLF(Windows 네이티브 JSONL)도 섞는다.
+        let filler = format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}", "x".repeat(300));
+        let body = format!("{filler}\n{}\r\n{}\r\n", u8_line("user", &reinject_ping_text(nonce)), u8_line("assistant", "hi"));
+        std::fs::write(&path, &body).unwrap();
+        let tail = read_session_tail_lines(&path, (body.len() - 10) as u64).unwrap();
+        assert!(tail.iter().all(|l| !l.ends_with('\r')), "CRLF 가 남았다: {tail:?}");
+        assert_eq!(tail.len(), 2, "잘린 첫 줄을 버리지 않았다: {tail:?}");
+        let p = path.to_string_lossy().into_owned();
+        for source in ["transcript", "transcript:heuristic", "statusline"] {
+            let entry = json!({"usage": {"source": source, "session_file": p}});
+            assert_eq!(ping_fate_from_entry(&entry, nonce).map(|(f, _)| f), Ok(PingFate::ReceivedNoAck), "{source}");
+        }
+        for entry in [
+            json!({"usage": {"source": "rollout", "session_file": p}}),
+            json!({"usage": null}),
+            json!({"usage": {"source": "transcript", "session_file": ""}}),
+            json!({"usage": {"source": "transcript", "session_file": td.join("missing.jsonl").to_string_lossy()}}),
+        ] {
+            assert!(ping_fate_from_entry(&entry, nonce).is_err(), "판정 불가가 사실로 접혔다: {entry}");
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    #[test]
+    fn u8_m2_check_reinject_claim_is_once_per_seat_and_session() {
+        let td = std::env::temp_dir().join(format!("cys-u8-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let now = std::time::SystemTime::now();
+        assert_eq!(reinject_check_claim(&td, 14, "/s/a.jsonl", now), Ok(true), "첫 재주입은 허용");
+        assert_eq!(reinject_check_claim(&td, 14, "/s/a.jsonl", now), Ok(false), "같은 좌석·세션 두 번째는 거부");
+        assert_eq!(reinject_check_claim(&td, 14, "/s/b.jsonl", now), Ok(true), "clear 뒤 새 세션은 새 키");
+        assert_eq!(reinject_check_claim(&td, 17, "/s/a.jsonl", now), Ok(true), "다른 좌석은 다른 키");
+        // 보존 기한이 지나면 표식이 치워진다(유계 — 살아 있는 세션에 1회 더 허용될 뿐).
+        let later = now + std::time::Duration::from_secs(REINJECT_CLAIM_TTL_SECS + 60);
+        assert_eq!(reinject_check_claim(&td, 14, "/s/a.jsonl", later), Ok(true));
+        // 기록 불가(디렉터리 자리가 파일)는 Err — 호출부가 판정 불가로 접는다(재주입 0).
+        let blocker = td.join("blocked");
+        std::fs::write(&blocker, "x").unwrap();
+        assert!(reinject_check_claim(&blocker, 14, "/s/a.jsonl", now).is_err());
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★(0.14.41-fix1 · REVIEW1 F7) 멱등 키를 태운 뒤 compose·inject 가 실패하면 그 세션이 check
+    /// 치유를 다시 못 받는다는 사실이 문면에 남아야 한다(키 삭제는 폭주 방향 안전판을 여는 쪽이라
+    /// 채택하지 않는다 — 리뷰가 지정한 두 옵션 중 더 안전한 쪽).
+    #[test]
+    fn u8_m2_claim_exhausted_hint_only_when_claimed() {
+        let plain = reinject_claim_exhausted_hint("cannot read WORKER_DIRECTIVE.md".into(), false);
+        assert_eq!(plain, "cannot read WORKER_DIRECTIVE.md", "미소비 실패는 문면을 바꾸지 않는다");
+        let hinted = reinject_claim_exhausted_hint("cannot read WORKER_DIRECTIVE.md".into(), true);
+        assert!(hinted.starts_with("cannot read WORKER_DIRECTIVE.md"), "원 오류를 보존해야 한다: {hinted}");
+        assert!(
+            hinted.contains("소진") && hinted.contains("TTL 7일") && hinted.contains("--check"),
+            "소진 문면이 세션 상태·TTL·대안 경로를 명시해야 한다: {hinted}"
+        );
+    }
+
+    /// `run_reinject` 의 compose·inject 두 실패 경로가 모두 `reinject_claim_exhausted_hint` 를
+    /// 거치는지(배선 핀) — 한쪽만 감싸면 그 경로에서만 소진 사실이 조용히 사라진다.
+    #[test]
+    fn u8_m2_run_reinject_wraps_both_failure_arms_with_claim_hint() {
+        let body = refl_fn_body(include_str!("cys.rs"), "run_reinject");
+        let compose_at = body.find("compose_directive(&role_name)\n")
+            .expect("compose_directive 호출 소실");
+        let inject_at = body.find("inject_text(sid, &directive)\n")
+            .expect("inject_text 호출 소실");
+        assert!(compose_at < inject_at, "compose 가 inject 보다 앞이어야 한다");
+        let hint_count = body.matches(".map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;").count();
+        assert_eq!(hint_count, 2, "compose·inject 양쪽 모두 소진 힌트로 감싸야 한다: {hint_count}건");
+    }
+
+    #[test]
+    fn u8_m2_ping_text_is_byte_stable_except_the_nonce() {
+        let t = reinject_ping_text("123");
+        assert_eq!(
+            t,
+            "지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 \
+             한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '123'"
+        );
+        assert!(!t.contains("DIRECTIVE-ACK-123"), "마커를 통째로 넣으면 자기-에코 오탐");
+        let n = reinject_ping_nonce();
+        assert!(n.chars().all(|c| c.is_ascii_digit()) && n.len() >= 4, "{n}");
+    }
+
+    /// ★(0.14.41 · U8 P0-M1) 한 제출 페이로드의 바이트 규약 — 채택 경로와 같은 `adoption_payload` 이고 훅 좌석은
+    /// RESUME 그대로다(바이트 불변). 합성 실패는 조용히 RESUME 만 보내지 않고 `Err` 로 올린다.
+    #[test]
+    fn u8_m1_cycle_reinject_payload_follows_the_adoption_contract() {
+        let mut calls = 0;
+        let got = cycle_reinject_payload(false, "[RESUME] 이어가라", &mut || { calls += 1; Ok("# 절대지침\n본문\n\n".into()) });
+        assert_eq!(got.as_deref(), Ok("# 절대지침\n본문\n\n[RESUME] 이어가라"));
+        assert_eq!(calls, 1);
+        let hooked = cycle_reinject_payload(true, "[RESUME] 이어가라 · 경로", &mut || panic!("훅 좌석은 합성 금지"));
+        assert_eq!(hooked.as_deref(), Ok("[RESUME] 이어가라 · 경로"));
+        assert_eq!(cycle_reinject_payload(false, "r", &mut || Err("역할 파일 없음".into())), Err("역할 파일 없음".into()));
+        // 채택 경로와 **같은 함수**(사본 금지) — 규약이 갈리면 여기서 드러난다.
+        assert_eq!(
+            cycle_reinject_payload(false, "[RESUME] x", &mut || Ok("D".into())).unwrap(),
+            adoption_payload("D", Some("[RESUME] x"))
+        );
     }
 
     #[test]
@@ -33532,18 +34284,35 @@ mod tests {
                 },
                 &mut |text| { sent.push(text.to_string()); Ok(()) },
             );
+            // ★(0.14.41 · U8 P0-M1) 디렉티브와 RESUME 은 **한 제출**이다(채택 경로 `adoption_payload` 규약).
+            //   종전 두 제출은 두 번째가 Claude 큐 선두에 끼어 턴 중에 접히지 않고, 뒤따르는 감독자 지시를
+            //   7~17분 막았다(반박 검증 M1 · 좌석 트랜스크립트 473건 전수).
             let expected = if hooks_inject {
-                vec!["[RESUME] 이어가기"]
+                vec!["[RESUME] 이어가기".to_string()]
             } else {
-                vec!["역할 디렉티브", "[RESUME] 이어가기"]
+                vec![adoption_payload("역할 디렉티브", Some("[RESUME] 이어가기"))]
             };
-            assert_eq!(sent, expected);
+            assert_eq!(sent, expected, "재주입 제출 수가 1이 아니다(두 제출 = 큐 선두 차단)");
             assert_eq!(cycle_agent_exit(&Err(error.clone())), 86);
             assert!(error.contains("clear 는 실효 확인됨(session_file 교체)"));
             assert!(error.contains(&reason));
-            assert!(error.contains("RESUME 1건 송신"));
-            assert!(error.contains(if hooks_inject { "디렉티브 생략(훅)" } else { "디렉티브 1건 송신" }));
-            assert!(error.contains("손으로 다시 clear 하지 마라 — 좌석에 [RESUME] 이 보이지 않으면 재주입만 하라"));
+            assert!(error.contains(if hooks_inject {
+                "RESUME 1건 송신 · 디렉티브 생략(훅)"
+            } else {
+                "디렉티브+RESUME 한 제출 1건 송신"
+            }), "{error}");
+            // ★(0.14.41-fix1 · REVIEW1 F4) [RESUME] 은 이제 한 제출로 합쳐져 화면에 안 보인다 — 처방
+            //   문면은 화면 가시성이 아니라 `cys status --json` 의 awakened_at/세션 파일로 확인하라고
+            //   안내해야 한다(종전 문면은 두 제출을 전제해 CSO 중복 재주입을 유발할 수 있었다).
+            assert!(error.contains("손으로 다시 clear 하지 마라"));
+            assert!(
+                error.contains("cys status --json") && error.contains("awakened_at"),
+                "rc86 처방이 화면 가시성이 아니라 status --json 확인을 안내해야 한다: {error}"
+            );
+            assert!(
+                !error.contains("좌석에 [RESUME] 이 보이지 않으면"),
+                "화면에서 [RESUME] 을 찾으라는 옛 처방이 남아 있다(한 제출 뒤에는 화면에 안 보인다): {error}"
+            );
         }
     }
 
@@ -33557,13 +34326,23 @@ mod tests {
                 &mut |text| { attempted.push(text.to_string()); Err("Return RPC 실패".into()) },
             );
             assert_eq!(cycle_agent_exit(&Err(error.clone())), 86, "주입 실패가 86 계약을 덮었다");
-            assert_eq!(attempted.last().map(String::as_str), Some("[RESUME] 이어가기"), "디렉티브 실패 뒤에도 RESUME 시도");
-            assert_eq!(attempted.len(), if compose_fails { 1 } else { 2 });
-            assert!(error.contains("RESUME 주입 실패(부분 송신 가능: Return RPC 실패)"));
+            assert_eq!(attempted.last().map(String::as_str), Some("[RESUME] 이어가기"), "한 제출 실패 뒤에도 RESUME 시도");
+            // ★(0.14.41 · U8 P0-M1) 첫 시도는 **한 제출**(디렉티브+RESUME)이다. 그것이 실패했을 때만
+            //   RESUME 단독 1회(최선노력 · 제출이 성립하지 않았으므로 두 제출 머리가 생기지 않는다).
+            if compose_fails {
+                assert_eq!(attempted, vec!["[RESUME] 이어가기".to_string()]);
+            } else {
+                assert_eq!(
+                    attempted,
+                    vec![adoption_payload("역할 디렉티브", Some("[RESUME] 이어가기")), "[RESUME] 이어가기".to_string()],
+                    "첫 시도가 한 제출이 아니다"
+                );
+            }
+            assert!(error.contains("RESUME 주입 실패(부분 송신 가능: Return RPC 실패)"), "{error}");
             if compose_fails {
                 assert!(error.contains("디렉티브 0건(합성 실패: 역할 파일 없음)"));
             } else {
-                assert!(error.contains("디렉티브 주입 실패(부분 송신 가능: Return RPC 실패)"));
+                assert!(error.contains("디렉티브+RESUME 한 제출 실패(부분 송신 가능: Return RPC 실패)"), "{error}");
             }
         }
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_cycle_agent"));
@@ -34264,8 +35043,10 @@ mod tests {
         assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
         let sent = body.find("\"text\": clear").expect("clear 송신 없음");
         assert!(!body[sent..].contains("Duration::from_secs(4)"), "clear 뒤 고정 4초 sleep 잔존");
-        let resume = body[sent..].find("let resume").map(|i| sent + i).expect("RESUME 없음");
-        assert!(!body[directive..resume].contains("Duration::from_secs(2))"), "재주입 사이 고정 2초 sleep 잔존");
+        // ★(0.14.41 · U8 P0-M1) 종전 축 "디렉티브와 RESUME 사이에 고정 2초 sleep 없음" 은 두 제출을 전제했다.
+        //   이제 둘은 **한 페이로드**라 '사이' 가 구조적으로 없다 — 재주입 지점이 한 제출 조립기를 통과하는지 잰다.
+        let payload = body[sent..].find("cycle_reinject_payload(").map(|i| sent + i).expect("한 제출 재주입 없음");
+        assert!(verdict < payload, "clear 실효 판정 전에 재주입된다");
         assert!(body.contains("hooks_inject_directive"), "SessionStart 훅 표지 배선 없음");
         // 데몬 typing_guard 거부를 초안 토큰으로 접는 배선은 이 함수 안에 있다.
         assert!(body.contains("CYCLE_HUMAN_DRAFT_TOKEN"), "typing_guard→초안 거부 배선 없음");
@@ -34624,12 +35405,15 @@ mod tests {
             drop(stop);
             let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
             assert_eq!(exit, 0, "실효 clear 뒤 CLI 재주입: 설정={settings:?}");
-            assert_eq!(d16_cycle_send_counts(&recorded), (1, 1, 1, 3),
-                "훅 미등록·판정 불능이면 디렉티브가 정확히 1회 주입돼야 한다");
+            // ★(0.14.41 · U8 P0-M1) authoritative 는 저장 지시 1 + **디렉티브+RESUME 한 제출** 1 = 2건이다
+            //   (종전 3건 = 디렉티브·RESUME 두 제출 — 두 번째가 Claude 큐 선두를 막았다 · 반박 M1).
+            assert_eq!(d16_cycle_send_counts(&recorded), (1, 1, 1, 2),
+                "훅 미등록·판정 불능이면 디렉티브가 정확히 1회 · RESUME 과 한 제출로 주입돼야 한다");
             let resume = recorded.iter().find_map(|(method, params)| {
                 (method == "surface.send_text").then(|| params["text"].as_str()).flatten()
                     .filter(|text| text.contains("[RESUME]"))
             }).expect("RESUME 송신");
+            assert!(resume.starts_with("\x1b[200~W"), "RESUME 이 디렉티브와 같은 제출에 실리지 않았다: {resume:?}");
             assert!(!resume.contains("역할 디렉티브가 화면에 보이지 않으면"),
                 "CLI가 주입한 사이클에는 훅 생략용 자연어 폴백을 붙이지 않는다");
         }
@@ -34719,7 +35503,223 @@ mod tests {
             vec!["S1", "S2"], true, true,
         );
         assert_eq!(exit, 0, "명시 clear 명령이 agents.json 부재를 우회해야 한다");
-        assert_eq!(d16_cycle_send_counts(&calls), (1, 1, 1, 3), "훅 미선언으로 축소하여 디렉티브도 직접 주입");
+        // ★(0.14.41 · U8 P0-M1) 디렉티브+RESUME 은 한 제출 — authoritative 는 저장 지시 1 + 재주입 1 = 2건.
+        assert_eq!(d16_cycle_send_counts(&calls), (1, 1, 1, 2), "훅 미선언으로 축소하여 디렉티브도 직접 주입(RESUME 과 한 제출)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ★(0.14.41-fix1 · U8 P0-M2 · REVIEW1 F2) run_reinject 행동 검체 — 종전에는 순수 함수
+    // (classify_ping_fate·reinject_check_action·reinject_check_claim)과 `run_reinject` 본문의
+    // **앵커 존재·순서** 소스 핀뿐이었다. Busy 팔 `return Ok(())` 제거 + `reinject_check_action`
+    // 호출부에서 ack_only 를 무시 + 멱등 소진 팔 `return` 제거를 동시에 한 뮤턴트가
+    // `cargo test --bin cys` 366/366 을 그대로 통과했다(r1-mut-M2-wiring.log) — 판정 결과가 실제로
+    // 재주입을 막는지는 아무것도 재지 않았기 때문이다. 아래는 리뷰가 지정한 배선(d16 계열 RPC 기록형
+    // 가짜 데몬 + `usage.session_file` 을 임시 트랜스크립트로)으로 그 배선 자체를 잰다.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 각성 핑 문안(`inject_text` 가 bracketed paste 로 감싼 것)에서 nonce 를 뽑는다 — 핑은
+    /// `... 'DIRECTIVE-ACK-' 그리고 '{nonce}'\x1b[201~` 로 끝나므로 마지막에서 두 번째 홑따옴표
+    /// 구간이 nonce 다(감싸는 ESC 시퀀스 유무와 무관 · 테스트 전용).
+    #[cfg(unix)]
+    fn extract_ping_nonce(text: &str) -> Option<String> {
+        let parts: Vec<&str> = text.split('\'').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        Some(parts[parts.len() - 2].to_string())
+    }
+
+    /// `run_reinject --check` 전용 가짜 데몬. 각성 핑(REINJECT_PING_HEAD 포함)의 `surface.send_text`
+    /// 를 보면 호출자가 준 `on_ping(nonce, 원문)` 으로 **실제 세션 기록 파일**(`session_path`)에
+    /// 시나리오별 JSONL 을 덧쓴다. `surface.list` 는 그 파일 경로를 `usage.session_file` 로 돌려주므로
+    /// `ping_fate_from_entry` 가 진짜로 그 파일을 열어 읽는다 — 순수 함수·소스 핀이 아니라 Busy·ack-only·
+    /// 멱등 소진·판정불가가 **실제로 전문 재주입을 막는지**(F2)를 잰다. `surface.wait_for` 는 항상
+    /// `matched=false`(화면 ACK 미관측 — 세션 기록 판독 분기를 강제한다).
+    #[cfg(unix)]
+    fn reinject_fake_daemon(
+        session_path: std::path::PathBuf,
+        on_ping: impl Fn(&str, &str) -> Option<String> + Send + 'static,
+    ) -> (std::path::PathBuf, D16DaemonCalls, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        let socket = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            ".d16r-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("가짜 소켓 bind");
+        let calls: D16DaemonCalls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let session_path_str = session_path.to_string_lossy().to_string();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut line = String::new();
+                if BufReader::new(&mut stream).read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                recorded.lock().unwrap_or_else(|e| e.into_inner())
+                    .push((method.clone(), req["params"].clone()));
+                if method == "surface.send_text" {
+                    if let Some(text) = req["params"]["text"].as_str() {
+                        if text.contains(REINJECT_PING_HEAD) {
+                            if let Some(nonce) = extract_ping_nonce(text) {
+                                if let Some(content) = on_ping(&nonce, text) {
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true).append(true).open(&session_path)
+                                    {
+                                        let _ = writeln!(f, "{content}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = match method.as_str() {
+                    "surface.list" => json!({"surfaces": [{
+                        "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                        "exited": false, "agent_alive": true, "awakened_at": 1.0,
+                        "usage": {"source": "statusline", "session_file": session_path_str}
+                    }]}),
+                    "surface.wait_for" => json!({"matched": false}),
+                    _ => json!({"ok": true}),
+                };
+                let response = json!({"id": req["id"], "ok": true, "result": result});
+                let _ = writeln!(stream, "{response}");
+            }
+        });
+        let stop_socket = socket.clone();
+        let stop = move || {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&stop_socket) {
+                let _ = writeln!(stream, "{}", json!({"id": 0, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_socket);
+        };
+        (socket, calls, stop)
+    }
+
+    /// 세션 기록에 `queue-operation enqueue` 로 핑을 흡수시킨다(에이전트 큐에 대기 중·바쁨 — F2-a).
+    #[cfg(unix)]
+    fn reinject_scenario_busy(_nonce: &str, text: &str) -> Option<String> {
+        Some(json!({"type": "queue-operation", "operation": "enqueue", "content": text}).to_string())
+    }
+
+    /// 세션 기록에 핑을 유휴 프롬프트로 수신시키고 그 뒤 ACK 없는 응답을 남긴다(드리프트 — F2-b·c).
+    #[cfg(unix)]
+    fn reinject_scenario_drift(_nonce: &str, text: &str) -> Option<String> {
+        Some(format!(
+            "{}\n{}",
+            json!({"type": "user", "message": {"content": text}}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "확인했다"}]}}),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn reinject_directive_sends(calls: &[(String, Value)]) -> usize {
+        calls.iter()
+            .filter(|(m, p)| m == "surface.send_text"
+                && p["text"].as_str().is_some_and(|t| t.starts_with("\x1b[200~W")))
+            .count()
+    }
+
+    #[cfg(unix)]
+    fn reinject_ping_sends(calls: &[(String, Value)]) -> usize {
+        calls.iter()
+            .filter(|(m, p)| m == "surface.send_text"
+                && p["text"].as_str().is_some_and(|t| t.contains(REINJECT_PING_HEAD)))
+            .count()
+    }
+
+    /// F2(a) — 핑이 에이전트 큐에 대기 중(Busy)이면 디렉티브 제출은 0 이어야 한다. 뮤턴트가 Busy 팔의
+    /// `return Ok(())` 를 지우고 58KB 전문 재주입으로 떨어뜨리면(09-23 폭주 그 자체) 이 검체가 RED 다.
+    #[cfg(unix)]
+    #[test]
+    fn u8_m2_run_reinject_busy_submits_zero_directives() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = D16CycleFixture::new();
+        let session_path = fixture.dir.join("session.jsonl");
+        let (socket, calls, stop) = reinject_fake_daemon(session_path, reinject_scenario_busy);
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        let exit = run_reinject(None, Some("surface:7".into()), true, 1, false);
+        drop(stop);
+        let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(exit, 0, "Busy 는 오류가 아니라 정상 보류로 접힌다");
+        assert_eq!(reinject_ping_sends(&recorded), 1, "각성 핑 자체는 1회 나가야 한다");
+        assert_eq!(reinject_directive_sends(&recorded), 0, "바쁜 좌석에 전문을 재주입하면 09-23 폭주가 되살아난다");
+    }
+
+    /// F2(b) — `--ack-only` 는 드리프트로 판정돼도 전문을 재주입하지 않는다(phoenix G2 ACK 전용화).
+    /// 뮤턴트가 호출부의 `reinject_check_action(&fate, ack_only)` 를 `(&fate, false)` 로 바꾸면
+    /// 이 검체가 RED 다(G2 가 재주입 자격을 다시 얻는다).
+    #[cfg(unix)]
+    #[test]
+    fn u8_m2_run_reinject_ack_only_never_submits_full_directive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = D16CycleFixture::new();
+        let session_path = fixture.dir.join("session.jsonl");
+        let (socket, calls, stop) = reinject_fake_daemon(session_path, reinject_scenario_drift);
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        let exit = run_reinject(None, Some("surface:7".into()), true, 1, true);
+        drop(stop);
+        let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(exit, 0);
+        assert_eq!(reinject_ping_sends(&recorded), 1);
+        assert_eq!(reinject_directive_sends(&recorded), 0, "ack-only 는 드리프트가 확정돼도 전문을 재주입하면 안 된다");
+    }
+
+    /// F2(c) — 드리프트 확정은 좌석·세션당 **정확히 1회**만 전문을 재주입한다(멱등 키 소진 뒤 0회).
+    /// 뮤턴트가 멱등 소진(`Ok(false)`) 팔의 `return` 을 지우면 두 번째 호출에서 누적치가 2가 되어
+    /// 이 검체가 RED 다(좌석·세션 1회 상한 무력화).
+    #[cfg(unix)]
+    #[test]
+    fn u8_m2_run_reinject_drift_reinjects_once_then_idempotent_zero() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = D16CycleFixture::new();
+        let session_path = fixture.dir.join("session.jsonl");
+        let (socket, calls, stop) = reinject_fake_daemon(session_path, reinject_scenario_drift);
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        let exit1 = run_reinject(None, Some("surface:7".into()), true, 1, false);
+        let after1 = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(exit1, 0);
+        assert_eq!(reinject_directive_sends(&after1), 1, "드리프트 첫 확정은 전문을 정확히 1회 재주입해야 한다");
+        let exit2 = run_reinject(None, Some("surface:7".into()), true, 1, false);
+        let after2 = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        drop(stop);
+        assert_eq!(exit2, 0);
+        assert_eq!(reinject_ping_sends(&after2), 2, "두 번째 호출도 각성 핑 자체는 나간다");
+        assert_eq!(reinject_directive_sends(&after2), 1, "같은 좌석·세션은 멱등 키 소진 뒤 전문을 다시 재주입하면 안 된다(누적 여전히 1)");
+    }
+
+    /// F2(d) — 판정 불가(세션 기록에 핑 흔적 없음)는 재주입하지 않는다(폭주 차단 · 보고만).
+    #[cfg(unix)]
+    #[test]
+    fn u8_m2_run_reinject_undetermined_submits_zero_directives() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = D16CycleFixture::new();
+        let session_path = fixture.dir.join("session.jsonl");
+        // 무관한 기존 기록만 있고 이번 핑의 nonce 는 어디에도 없다(NotSeen).
+        std::fs::write(&session_path, format!(
+            "{}\n", json!({"type": "user", "message": {"content": "이전 무관 프롬프트"}})
+        )).unwrap();
+        let (socket, calls, stop) = reinject_fake_daemon(session_path, |_nonce, _text| None);
+        let stop = D16DaemonStop(Some(Box::new(stop)));
+        std::env::set_var("CYS_SOCKET", &socket);
+        let exit = run_reinject(None, Some("surface:7".into()), true, 1, false);
+        drop(stop);
+        let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(exit, 0);
+        assert_eq!(reinject_directive_sends(&recorded), 0, "판정 불가는 재주입하지 않는다(폭주 차단)");
     }
 
     /// [T2] run_cycle_agent 배선 핀 — 'cycle complete'(성공 문면)는 Verified 성공 뒤에만 나오고,
@@ -34812,14 +35812,23 @@ mod tests {
             !rec.contains("inject_text(sid, recover_directive())?;"),
             "Ready 팔이 아직 보류를 `?` 로 흘린다 — rc 1 → escalate_reclaim(kill)"
         );
+        // ★(0.14.41 · U8 P0-M1) [RECOVER] 는 이제 디렉티브와 **한 제출**이라 주입·보류 접기가 주입 절반
+        //   (`inject_directive_after_ready`) 한 곳에 있다 — 종전 Ready 팔의 사본 접기(is_hold_error ·
+        //   GATE_ID_INJECT_HELD · gate_close_override_once)는 그 절반의 같은 배선으로 이사했다.
+        //   node-recover 는 지시를 넘기고(표식 이월 재료) 보류 판정을 전용 exit 로 낸다.
+        assert!(rec.contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
+        assert!(!strip_line_comments(rec).contains("inject_text("), "node-recover 가 두 번째 제출을 한다");
+        let half = refl_fn_body(src, "inject_directive_after_ready");
         for anchor in [
             "cys::inject_guard::is_hold_error(&e)",
             "GATE_ID_INJECT_HELD",
-            "Some(recover_directive()),",
-            "gate_close_override_once(),",
+            "followup,",
+            "directive_held,",
         ] {
-            assert!(rec.contains(anchor), "보류 접기 배선 결손: {anchor}");
+            assert!(half.contains(anchor), "주입 절반의 보류 접기 배선 결손: {anchor}");
         }
+        assert!(rec.contains("BootVerdict::GatePending { gate, tail } => {"),
+            "node-recover 가 보류 판정을 처방·전용 exit 로 가르지 않는다");
         // ③ⓑ 전처리 안전 거부가 머리표를 달고 전용 코드로 나간다.
         assert!(rec.contains("{RECOVER_REFUSED_TOKEN} agent"), "안전 거부에 머리표가 없다");
         assert!(rec.contains("EXIT_RECOVER_REFUSED"), "안전 거부가 전용 코드로 나가지 않는다");

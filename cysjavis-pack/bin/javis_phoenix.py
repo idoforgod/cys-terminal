@@ -344,13 +344,19 @@ _REINJECT_ACK_LINE_RE = re.compile(r"(?m)^디렉티브 생존 확인 \(ACK 수�
 _REINJECT_INJECTED_LINE_RE = re.compile(r"(?m)^reinjected \d+ bytes → surface:")
 _REINJECT_SKIP_LINE_RE = re.compile(r"(?m)check reinject skip")
 _REINJECT_NOACK_RE = re.compile(r"\[reinject\] ACK 없음")
+# ★U8 P0-M2(0.14.41): ACK 없음이 곧 드리프트가 아니다 — CLI 가 세션 기록으로 핑의 운명을 읽고 **재주입하지 않은**
+#   결과를 줄 머리 문면으로 낸다. 바쁨(핑이 에이전트 큐에 회색 대기) = `busy` · 판정 불가/좌석·세션 멱등 소진/ack 전용
+#   ACK 미수신 = `held`. 둘 다 F-1 인정 종류(ack·injected) 밖이다 — 주입하지 않은 것을 주입 증거로 세지 않는다.
+_REINJECT_BUSY_LINE_RE = re.compile(r"(?m)^재주입 보류\(핑 전달됨·대상 바쁨")
+_REINJECT_HELD_LINE_RE = re.compile(r"(?m)^재주입 (?:보류|생략)\(")
 
 
 def classify_reinject_result(rc, stdout, stderr):
     """`cys reinject --check` 결과 → 구조화 증거 종류(리뷰 R1 · R1b 강화). 판독은 CLI 의 **줄 단위** 문면만 본다 —
     부분 문자열(종전 `"ACK" in out`)은 role 이름(`… (BACKEND)`) 같은 임의 텍스트에 위조됐다(codex major).
     순서(fail-closed): rc≠0=fail → stderr 의 큐 전환(`--queued`)은 **어느 양성 종류보다 먼저** queued(배달 예약은
-    증거 아님) → ack 줄 ∧ `ACK 없음` 동반(한 호출에서 상호배제 · 모순 출력) = unknown → ack → injected → skip → unknown."""
+    증거 아님) → ack 줄 ∧ `ACK 없음` 동반(한 호출에서 상호배제 · 모순 출력) = unknown → ack → injected → skip →
+    busy → held → unknown(★U8 P0-M2: 재주입 보류 두 종류는 성공 증거가 아니다)."""
     out = stdout or ""
     err = stderr or ""
     if rc != 0:
@@ -366,6 +372,10 @@ def classify_reinject_result(rc, stdout, stderr):
         return "injected"
     if _REINJECT_SKIP_LINE_RE.search(out):
         return "skip"
+    if _REINJECT_BUSY_LINE_RE.search(out):
+        return "busy"
+    if _REINJECT_HELD_LINE_RE.search(out):
+        return "held"
     return "unknown"
 
 
@@ -2021,12 +2031,19 @@ def stage_g2_ack(socket, role, surface, stub):
     """G2 핸드셰이크 ack — 부활 노드가 원장 대조 핑에 응답하는지(M7). 응답 없으면
     타임아웃 → unverified 격하 모드로 전진(무한 보류 금지). stub은 응답자가 없으므로
     best-effort 로 시도만 하고 결과를 저널에 남긴다.
-    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(빈 셸은 ack 주체 없음)."""
+    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(빈 셸은 ack 주체 없음).
+    ★U8 P0-M2(0.14.41): **ACK 확인 전용**(`--ack-only`) — 어떤 결과에서도 전문을 재주입하지 않는다. 종전에는
+      stage_reinject 와 **같은 명령**이라, 핑이 Claude 큐에 회색 대기하면 두 단계가 각각 58KB 전문을 넣었다
+      (09-23 실측: 핑→전문→핑→전문 · 워커 +2회 · CEO +3회 → ctx 64% 강제 clear). 재주입 자격은 stage_reinject
+      한 곳뿐이고, 그것도 CLI 가 좌석·세션당 1회로 묶는다.
+      ACK 판정은 분류기의 줄 단위 `ack` 다 — 종전 `"각성" in stdout` 은 실제 ACK 줄("디렉티브 생존 확인 (ACK 수신)")을
+      인정하지 못해 G2 가 늘 degraded 였고 매 restore 마다 핑을 다시 쐈다. 구 cys(플래그 미지원 → clap rc 2)는
+      fail = ACK 아님으로 접히고 그 호출은 아무것도 주입하지 않는다(버전 스큐 안전)."""
     if _surface_agent_present(socket, surface) is False:
         return False, "g2 skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
-    r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "4",
+    r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "4", "--ack-only",
             socket=socket, timeout=10)
-    acked = (r.returncode == 0) and ("각성" in (r.stdout or "") or "awake" in (r.stdout or "").lower())
+    acked = classify_reinject_result(r.returncode, r.stdout, getattr(r, "stderr", "")) == "ack"
     return acked, "g2 ack=%s (%s)" % (acked, (r.stdout or r.stderr or "").strip()[:120])
 
 
