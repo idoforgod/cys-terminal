@@ -755,6 +755,8 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
   background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; font-size: 13px;
 }
 .dept-idle-btn:disabled { opacity: .5; cursor: default; }
+/* ★U2(0.14.41) 보류 중인 역할 칸(구멍) — [새 셸 열기]·[칸 비우기] 두 손잡이 사이 간격만 더한다(나머지는 dept-pending 재사용). */
+.role-slot .dept-idle-btn + .dept-idle-btn { margin-left: 8px; }
 @media (prefers-reduced-motion: reduce) {
   .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
 }

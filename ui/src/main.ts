@@ -71,6 +71,33 @@ import {
   scaleForPlatform,
   sameSocket,
 } from "./wsreconcile";
+// ★U2·U3(0.14.41 · WP-A1): 좌석 배치(대표 1/3)와 역할 자리 기억(재부팅 후 같은 칸 결속)의 순수부.
+//   여기서는 배선만 한다 — 판정은 seatlayout.ts 하나에 있다(seatlayout.test.ts·seatbind.test.ts 가 잠근다).
+import {
+  ROLE_SLOT_GRACE_MS,
+  adoptSeat,
+  anchorHeadSafe,
+  annotateRoles,
+  daemonIdentOf,
+  dropHole,
+  fillHole,
+  generationChanged,
+  holdPane,
+  holeSidsOf,
+  looksManual,
+  nextHoleSid,
+  nodeShown,
+  placeSeatSafe,
+  reserveDeadline,
+  restoreTree,
+  roleLayout,
+  roleSlotText,
+  seatPriority,
+  tidyHoles,
+  type DaemonIdent,
+  type LNode,
+  type RoleOf,
+} from "./seatlayout";
 import {
   RESET_PHRASE,
   resetPhraseMatches,
@@ -205,6 +232,9 @@ const T_STOP = winScaled(20_000);
 // 화면이 비어 있다(Windows 2배까지 겹치면 십수 분). 총량 데드라인을 넘기면 그 시점 상태로
 // 즉시 화면을 세우고 나머지는 3초 틱에 맡긴다 — '늦게라도 전부'보다 '지금 보이고 곧 채워짐'이 낫다.
 const START_BUDGET = winScaled(45_000);
+// ★U2(0.14.41): 주인이 아직 안 온 역할 칸(구멍)을 '복원을 기다리는 중'으로 보여 주는 기한(맥 240s · Windows 480s).
+// 실측 스폰 구간 90s(rc124)에 cysd 재시도 60s·1회 재스폰 90s 를 더한 값을 덮는다. 넘기면 **화면에서만** 접는다.
+const ROLE_SLOT_GRACE = winScaled(ROLE_SLOT_GRACE_MS);
 
 const rpcT = <T,>(pr: Promise<T>, ms: number): Promise<T> => {
   let t: ReturnType<typeof setTimeout> | undefined;
@@ -222,9 +252,10 @@ const listen = (name: string, handler: (e: { payload: unknown }) => void) =>
 
 // ---------- layout model (v2: multiple workspaces, splits with ratio) ----------
 
-type Node =
-  | { type: "split"; dir: "row" | "col"; ratio?: number; a: Node; b: Node }
-  | { type: "pane"; sid: number };
+// ★U2(0.14.41): pane 노드에 선택 필드 `role`(이 칸의 마지막 관측 역할 = 자리 기억 키)이 붙는다.
+//   sid 가 **음수**인 pane = 구멍(주인이 아직 안 온 기억 칸 · seatlayout.ts 머리말). 구버전 앱은 음수 sid 를
+//   죽은 sid 로 보고 버리므로 저장본은 하위 호환이다. 정의처는 seatlayout.ts(LNode) 하나다.
+type Node = LNode;
 
 interface Workspace {
   id: number;
@@ -252,6 +283,13 @@ interface Workspace {
   // idle 패널의 안내를 실제 동작('다시 닫아 재시도 / 지금 켜면 삭제 취소')으로 바꾸는 데만 쓴다.
   // 런타임 전용 — 다음 기동의 복원 루프는 묘비로 판정하므로 이 표식을 저장할 이유가 없다.
   stopFailed?: true;
+  // ★U3(0.14.41): 사용자가 이 탭의 배치를 손댔다(분할선 3px 이상 드래그 · pane 드래그 이동). 참이면 자동 배치가
+  //   **비율 리셋·재배치를 하지 않는다**(새 좌석은 그래도 대표 칸 밖으로 가서 대표 폭은 줄지 않는다). `정렬` 이
+  //   끈다. undefined = 구버전 저장본(기동 때 looksManual 로 1회 추정해 boolean 으로 이관). 저장된다.
+  layoutManual?: boolean;
+  // ★U2(0.14.41): 이 탭 트리의 sid 가 속한 데몬 세대(`started_at-pid`). 기동 때 지금 세대와 다르면 옛 sid 는
+  //   살아 보여도 전부 죽은 것으로 보고 **역할로만** 결속한다(sid 재사용 방어). undefined = 모름. 저장된다.
+  daemonEpoch?: string;
 }
 
 // 06: 워크스페이스 그룹 메타데이터. 진실원=localStorage(cys-layout-v2). 데몬은 모름(그룹=UI/solution 층).
@@ -277,6 +315,36 @@ let layoutLoaded = false;
 
 // pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
 const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
+
+// ★U2(0.14.41): 구멍(음수 sid 기억 칸)의 보류 기한(ms) — 키 = paneKey(구멍 sid, socket). **런타임 전용**이다
+// (저장하지 않는다 — 재기동하면 기동 복원이 데몬 나이로 다시 판정한다). 기한 안의 구멍은 스피너·손잡이로 보이고,
+// 지나면 화면에서만 접힌다(트리의 기억은 남는다).
+const holeUntil = new Map<string, number>();
+const holeShownFor =
+  (socket?: string) =>
+  (h: number): boolean =>
+    (holeUntil.get(paneKey(h, socket)) ?? 0) > Date.now();
+/** plain 셸(역할 없음) 배치용 역할 맵 — 새 sid 는 null, 나머지는 '모름'(칸의 역할 기억으로 대표를 알아본다). */
+const bareSeat =
+  (sid: number): RoleOf =>
+  (x) =>
+    x === sid ? null : undefined;
+
+// ★F3(0.14.41 · 리뷰1 minor): 사용자·전출이 **의도적으로** 닫는 sid — close_surface RPC 의 await 가
+// 끝나기 전에 데몬의 PTY reader(자식이 먼저 죽는 경로)가 surface.exited 를 먼저 밀어 넣을 수 있다.
+// 그 창에서 removeDeadPane 이 역할 칸을 구멍으로 보류하면, RPC 가 끝난 뒤의 로컬 정리(replaceNode)는
+// 이미 구멍(음수 sid)이 된 자리를 못 찾아 아무 일도 하지 않는다 — 사용자가 닫은 칸이 "복원을 기다리는
+// 중" 스피너로 최대 240/480s 남는다. invoke 직전에 표시해 두고, 그 사이의 exited 는 종전(closed)대로
+// 뗀다. 정리 누락에 대비한 안전망(15s)도 둔다 — 영구히 남아 새 surface 의 보류를 오판하지 않게.
+const closingSids = new Set<string>();
+function markClosing(sid: number, socket?: string): void {
+  const k = paneKey(sid, socket);
+  closingSids.add(k);
+  setTimeout(() => closingSids.delete(k), 15000);
+}
+function isClosingSid(sid: number, socket?: string): boolean {
+  return closingSids.has(paneKey(sid, socket));
+}
 
 interface PaneRuntime {
   sid: number;
@@ -2058,9 +2126,13 @@ function saveLayout() {
   );
 }
 
+// ★U2(0.14.41): **구멍(음수 sid)은 내보내지 않는다** — 닫기·포커스·유령 수렴·RPC·fit 경로가 전부 이 함수를
+// 거치므로, 구멍이 '살아 있는 창'으로 새어 나갈 길이 여기서 한 번에 닫힌다. 구멍은 seatlayout.ts 만 본다.
 function collectSids(node: Node | null, out: number[] = []): number[] {
   if (!node) return out;
-  if (node.type === "pane") out.push(node.sid);
+  if (node.type === "pane") {
+    if (node.sid > 0) out.push(node.sid);
+  }
   else {
     collectSids(node.a, out);
     collectSids(node.b, out);
@@ -2161,6 +2233,7 @@ async function refreshPaneTitles() {
   refreshing = true;
   let adoptedWs = false; // 이번 틱에서 워크스페이스/트리를 고쳤는가(render 필요 판정)
   const blockedTick: CwdBlockedEntry[] = []; // 이번 틱에 모든 소켓에서 모은 cwd_blocked
+  let roleMemoChanged = false; // ★U2: 칸의 역할 기억만 바뀌었는가(render 없이 저장만)
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
     // ★최후 방어선: 탭이 **하나도** 없으면(= 화면 전체 백지) 본부 탭을 즉시 되살린다.
@@ -2200,6 +2273,26 @@ async function refreshPaneTitles() {
         // 읽으면 복원이 끝나기 전에 트리를 통째로 지우고 그 공백을 디스크에 영속시킨다.
         // ★호출 계약: 이 소켓의 **전 워크스페이스 트리 합집합**을 한 번에 넘긴다(소켓당 1회).
         const knownIds = new Set(r.surfaces.map((s) => s.surface_id));
+        // ★U2·U3(0.14.41) 역할 맵 두 벌 — 배치용은 종료 좌석을 **null**(역할 없음)로 본다: 종료된 옛 master 가
+        //   대표로 한 번 더 세어져 대표 칸에 master 가 둘이 되던 반례(반박 U3 D4). 기억용은 종료 좌석을 '모름'
+        //   으로 둔다 — 종료 직전 칸의 역할 기억을 지우면 곧 이어질 구멍 보류가 역할을 잃는다.
+        const bySid = new Map(r.surfaces.map((s) => [s.surface_id, s] as const));
+        const roleOf: RoleOf = (x) => {
+          const s = bySid.get(x);
+          return s ? (s.exited ? null : s.role) : undefined;
+        };
+        const memoOf: RoleOf = (x) => {
+          const s = bySid.get(x);
+          return s && !s.exited ? s.role : undefined;
+        };
+        for (const w of workspaces) {
+          if ((w.socket ?? undefined) !== (sk ?? undefined)) continue;
+          try {
+            if (annotateRoles(w.tree, memoOf)) roleMemoChanged = true; // 바뀐 틱에만 저장(매 틱 쓰기 0)
+          } catch {
+            /* 기억만 못 할 뿐 — 수렴·입양은 계속된다 */
+          }
+        }
         const sockSids: number[] = [];
         for (const w of workspaces) {
           if ((w.socket ?? undefined) !== (sk ?? undefined) || !w.tree) continue;
@@ -2208,9 +2301,13 @@ async function refreshPaneTitles() {
         const step = advanceGhostStrikes(ghostStrike, sockSids, knownIds, (sid) => paneKey(sid, sk), `${sk ?? ""}#`);
         ghostStrike = step.next;
         for (const sid of step.evict) {
-          detachPane(sid, sk);
+          // ★U2: 역할을 기억한 칸은 떼지 않고 구멍으로 보류한다(데몬 재기동·로테이트 중 앱이 떠 있던 경우 —
+          //   새 세대의 같은 역할 창이 그 칸으로 돌아온다). 셸·일회용 칸은 종전대로 뗀다.
+          if (!holdRolePane(sid, sk, Date.now() + ROLE_SLOT_GRACE)) detachPane(sid, sk);
+          forgetDaemonEpoch(sk); // 유령 = 데몬 재기동 신호 — 저장된 세대를 '모름'으로
           adoptedWs = true;
         }
+        if (step.evict.length) reanchorAuto(sk, roleOf); // 유령이 빠진 자리의 쏠림을 편다(반박 U3 D7)
         for (const s of r.surfaces) {
           const rt = panes.get(paneKey(s.surface_id, sk));
           if (!rt) continue;
@@ -2222,9 +2319,9 @@ async function refreshPaneTitles() {
         // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
         // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
         // role 우선순위(master>cso>worker>reviewer) 정렬 — 부서 첫 입양 시 master가 첫 pane(좌측·focus)이 되도록.
-        const rolePri = (role: string | null): number =>
-          role === "master" ? 0 : role === "cso" ? 1 : role?.startsWith("worker") ? 2 : role?.startsWith("reviewer") ? 3 : 4;
-        for (const s of [...r.surfaces].sort((a, b) => rolePri(a.role) - rolePri(b.role))) {
+        // ★U2·U3(0.14.41): 순서 = seatPriority(대표 칸 술어와 같은 모듈) · 붙이는 곳 = adoptSeat(① 같은 역할
+        //   구멍 = 원래 칸에 결속 → ② 없으면 대표 1/3 규칙 · 대상 탭은 master 가 있는 탭 우선).
+        for (const s of [...r.surfaces].sort((a, b) => seatPriority(a.role) - seatPriority(b.role))) {
           if (s.exited || !s.role || panes.has(paneKey(s.surface_id, sk))) continue;
           // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
           // ★G4(2026-09-17 10라운드 · opus 9R minor): `!w.deleting` — **삭제 중**(stop 을 기다리는) 탭에도 입양
@@ -2232,19 +2329,57 @@ async function refreshPaneTitles() {
           //   남는다. 그 창에서 죽어 가는 부서의 잔여 role surface 를 입양하면, 탭이 곧 splice 될 때 삭제 경로는
           //   **stop 이전에 수집한 sid** 만 회수하므로(collectSids(ws.tree)) 방금 붙은 pane 런타임이 회수 대상에서
           //   빠진다 — WebSocket·xterm 이 화면 없이 살아남는다(입양 1건당 런타임 1건 누수).
-          const ws = workspaces.find(
-            (w) => !w.pending && !w.deleting && (w.socket ?? undefined) === (sk ?? undefined),
-          );
-          if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
+          const adoptable = () =>
+            workspaces.filter((w) => !w.pending && !w.deleting && (w.socket ?? undefined) === (sk ?? undefined));
+          const before = adoptable();
+          if (!before.length || before.some((w) => collectSids(w.tree).includes(s.surface_id))) continue;
           setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
-          ws.tree = ws.tree
-            ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
-            : { type: "pane", sid: s.surface_id };
+          // 계획은 makePane 의 await **뒤에** 짠다 — 그 사이 다른 경로(종료 이벤트·사용자)가 트리를 바꿨어도 옛 트리로
+          // 덮지 않게(종전 코드도 await 뒤의 ws.tree 에 붙였다). adoptSeat 는 전역 함수 — 어떤 실패도 종전 오른쪽 부착.
+          const cands = adoptable();
+          const plan = adoptSeat(cands, sk, s.surface_id, s.role, roleOf);
+          if (!plan) {
+            destroyPaneRuntime(s.surface_id, sk); // 그 사이 붙일 탭이 사라졌다 — 화면 밖 고아 런타임을 남기지 않는다
+            continue;
+          }
+          cands[plan.idx].tree = plan.tree;
+          if (plan.boundHole != null) holeUntil.delete(paneKey(plan.boundHole, sk));
           adopted = true;
+        }
+        // ★U2 구멍 위생 — 역할 하나에 칸 하나(산 칸이 있으면 그 역할 구멍 제거 · 중복 · 상한). 실패해도 입양은 끝났다.
+        try {
+          const same = workspaces.filter((w) => (w.socket ?? undefined) === (sk ?? undefined));
+          const tidy = tidyHoles(
+            same.map((w) => w.tree),
+            roleOf,
+          );
+          same.forEach((w, i) => {
+            if (w.tree !== tidy[i]) {
+              w.tree = tidy[i];
+              adoptedWs = true;
+            }
+          });
+        } catch {
+          /* 위생만 건너뛴다 */
         }
       } catch {
         /* 이 소켓만 이번 틱을 건너뛴다(다른 데몬의 입양은 계속된다) */
       }
+    }
+    // ★U2: 보류 기한이 지난 구멍은 **화면에서만** 접는다(기억은 트리에 남아 늦게 온 역할도 그 칸으로). 접히면서
+    //   생긴 쏠림은 비수동 탭에서 편다. 결속·위생으로 사라진 구멍의 기한은 먼저 치운다(헛 재렌더 방지).
+    pruneHoleUntil();
+    const nowMs = Date.now();
+    let expired = false;
+    for (const [k, until] of holeUntil) {
+      if (until <= nowMs) {
+        holeUntil.delete(k);
+        expired = true;
+      }
+    }
+    if (expired) {
+      reanchorAuto(null);
+      adoptedWs = true;
     }
     if (adopted || adoptedWs) {
       render();
@@ -2254,6 +2389,8 @@ async function refreshPaneTitles() {
       // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
       const aSids = collectSids(current()?.tree ?? null);
       if (aSids.length && (focusedSid == null || !aSids.includes(focusedSid))) setFocus(aSids[0]);
+    } else if (roleMemoChanged) {
+      saveLayout(); // ★U2: 역할 기억만 바뀐 틱 — 그리지 않고 저장만(layoutLoaded 게이트 통과)
     }
   } catch {
     /* 데몬 일시 미응답은 다음 틱에 */
@@ -2322,6 +2459,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       }, 2500);
       return;
     }
+    markClosing(sid, socket); // ★F3: RPC 대기 중 도착하는 exited 를 종전(closed)대로 처리한다
     await invoke("close_surface", { socket, surfaceId: sid }).catch(() => {});
     destroyPaneRuntime(sid, socket);
     const ws = current();
@@ -3151,9 +3289,9 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     let agentSid: number | null = null;
     // 기동 명령을 실제로 보냈는가 — 실패 롤백이 **런처 셸을 죽여도 되는지**의 유일한 근거다.
     let launchSent = false;
-    destWs.tree = destWs.tree
-      ? { type: "split", dir: "row", a: destWs.tree, b: { type: "pane", sid: newSid } }
-      : { type: "pane", sid: newSid };
+    // ★U3(0.14.41): 런처 셸도 대표 1/3 규칙으로 붙인다(대표 칸 밖 균등 몫 · 대표 없는 탭은 종전 규칙).
+    //   아래 보상 롤백(replaceNode(…, newSid, () => null))은 모양과 무관하게 그대로 동작한다.
+    destWs.tree = placeSeatSafe(destWs.tree, newSid, bareSeat(newSid), !!destWs.layoutManual);
     // ③ 이후 실패는 보상 트랜잭션 — 새 pane 회수+트리 복원으로 "원본 보존"을 거짓말이 아니게 한다.
     try {
       if (isAgent) {
@@ -3240,6 +3378,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         return;
       }
       // 셸 pane: 인계할 맥락이 없다 — 같은 경로의 새 셸이 만들어졌으므로 원본을 정리한다.
+      markClosing(sid, srcSock); // ★F3: 전출 원본 정리 — exited 경합이 구멍을 만들지 않게
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 보상 롤백: 런처 셸은 **기동 명령을 보내지 않았을 때만** 회수한다.
@@ -3249,6 +3388,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
       //   (성공 경로만 고쳤다면 같은 치명 경로가 catch 로 이사했을 뿐이다).
       //   런치를 보낸 뒤에는 셸을 남기고 사람에게 알린다 — 우리가 모르는 것을 죽이지 않는다.
       if (!launchSent) {
+        markClosing(newSid, destWs.socket); // ★F3
         await invoke("close_surface", { socket: destWs.socket, surfaceId: newSid }).catch(() => {});
         destroyPaneRuntime(newSid, destWs.socket);
         if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
@@ -3366,6 +3506,7 @@ async function awaitHandoffAck(
   if (verdict.close) {
     // ⑥ 인수 확인 + 좌석 수신 가능 재확인 뒤에만 원본 정리. 기록은 여기서 끝난다.
     try {
+      markClosing(sid, srcSock); // ★F3: 전출(핸드오프) 원본 정리
       await invoke("close_surface", { socket: srcSock, surfaceId: sid });
     } catch (e) {
       // 목적지는 인수했고 원본은 **열린 채**다 — 되돌릴 것이 없으므로 인수 대기로 남겨 재시도가
@@ -3406,8 +3547,14 @@ function movePane(sid: number, targetSid: number, side: DropSide) {
   if (!ws.tree || sid === targetSid) return;
   const sids = collectSids(ws.tree);
   if (!sids.includes(sid) || !sids.includes(targetSid)) return;
-  ws.tree = replaceNode(ws.tree, sid, () => null);
-  const moved: Node = { type: "pane", sid };
+  // ★U2: 옮기는 칸의 역할 기억을 함께 옮긴다(없어도 3초 틱이 다시 채우지만, 그 사이 종료되면 구멍 보류가 역할을 잃는다).
+  let movedRole: string | undefined;
+  ws.tree = replaceNode(ws.tree, sid, (old) => {
+    if (old.type === "pane" && old.role) movedRole = old.role;
+    return null;
+  });
+  const moved: Node = movedRole ? { type: "pane", sid, role: movedRole } : { type: "pane", sid };
+  ws.layoutManual = true; // ★U3: pane 드래그 이동 = 사용자가 손댄 탭(대표를 다른 곳으로 옮겨도 자동이 끌어오지 않는다)
   if (!ws.tree) {
     ws.tree = moved;
   } else {
@@ -3464,7 +3611,8 @@ function render() {
   root.innerHTML = "";
   const ws = current();
   const tree = ws?.tree;
-  if (tree) root.appendChild(renderNode(tree));
+  // ★U2(0.14.41): 트리가 있어도 **보이는 칸이 없으면**(기한 지난 구멍만) idle 패널로 — 구멍만 남은 탭이 백지가 되지 않게.
+  if (tree && nodeShown(tree, holeShownFor(ws?.socket))) root.appendChild(renderNode(tree));
   else if (ws?.pending) root.appendChild(renderDeptPending()); // WP-10: 부서 준비 중 빈 pane 스피너·안내
   else if (ws) root.appendChild(renderIdleWorkspace(ws)); // pane 0개 — 백지 대신 안내+손잡이
   renderWsTabs();
@@ -3566,7 +3714,8 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
         render();
       } else {
         const sid = await newSurface(null, ws.socket, T_NEW);
-        ws.tree = { type: "pane", sid };
+        // ★U2: 기한 지난 구멍(기억 칸)만 있던 탭이면 기억은 지우지 않고 셸을 곁에 붙인다(역할이 돌아오면 제자리로).
+        ws.tree = placeSeatSafe(ws.tree, sid, bareSeat(sid), !!ws.layoutManual);
         render();
         setFocus(sid);
       }
@@ -3582,8 +3731,64 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
   return host;
 }
 
+// ★U2(0.14.41): 주인이 아직 안 온 역할 칸(구멍)의 보류 표시 — 스피너 + 문구 + 손잡이 둘.
+// 복원이 **오지 않는** 경로(breaker·opt-out·phoenix 실패·agent 미상 skip·묘비)에서도 사용자가 이 칸에서 셸을 열거나
+// (복구용 `cys boot` 등) 칸을 비울 수 있다 — 스피너만 남는 칸은 오너 정의 ④(글자 0)와 같은 체감이다(반박 U2 major ⓐ).
+// 문구는 textContent 로만(역할 문자열은 데몬이 준 임의 문자열이다). 새 CSS 는 버튼 간격 한 줄뿐(.role-slot).
+function renderRoleSlot(node: { sid: number; role?: string }): HTMLElement {
+  const ws = current();
+  const holeSid = node.sid;
+  const host = document.createElement("div");
+  host.className = "pane dept-pending role-slot";
+  host.setAttribute("aria-busy", "true");
+  host.setAttribute("aria-live", "polite");
+  const box = document.createElement("div");
+  box.className = "dept-pending-box";
+  const spin = document.createElement("div");
+  spin.className = "dept-spinner";
+  spin.setAttribute("aria-hidden", "true");
+  const msg = document.createElement("div");
+  msg.className = "dept-pending-msg";
+  msg.textContent = roleSlotText(node.role);
+  const shellBtn = document.createElement("button");
+  shellBtn.className = "dept-idle-btn";
+  shellBtn.textContent = "새 셸 열기";
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "dept-idle-btn";
+  clearBtn.textContent = "칸 비우기";
+  shellBtn.addEventListener("click", async () => {
+    if (shellBtn.disabled || !ws || daemonActionBlocked()) return;
+    shellBtn.disabled = true;
+    clearBtn.disabled = true;
+    shellBtn.textContent = "여는 중…";
+    try {
+      const sid = await newSurface(null, ws.socket, T_NEW);
+      // 그 칸이 아직 구멍이면 그 자리에, 그새 역할이 돌아와 결속됐으면 대표 1/3 규칙으로 — 어느 쪽이든 셸은 화면에 붙는다.
+      ws.tree = fillHole(ws.tree, holeSid, sid) ?? placeSeatSafe(ws.tree, sid, bareSeat(sid), !!ws.layoutManual);
+      holeUntil.delete(paneKey(holeSid, ws.socket));
+      render();
+      setFocus(sid);
+    } catch (e) {
+      shellBtn.disabled = false;
+      clearBtn.disabled = false;
+      shellBtn.textContent = "다시 시도";
+      toast("watchdog", "셸을 열지 못했습니다", String(e));
+    }
+  });
+  clearBtn.addEventListener("click", () => {
+    if (clearBtn.disabled || !ws) return;
+    ws.tree = dropHole(ws.tree, holeSid); // 사용자가 기억을 지웠다 — 이 칸은 다시 보류되지 않는다
+    holeUntil.delete(paneKey(holeSid, ws.socket));
+    render();
+  });
+  box.append(spin, msg, shellBtn, clearBtn);
+  host.appendChild(box);
+  return host;
+}
+
 function renderNode(node: Node): HTMLElement {
   if (node.type === "pane") {
+    if (node.sid < 0) return renderRoleSlot(node); // ★U2: 보류 중인 구멍(보이는 구멍만 여기 온다)
     const rt = panes.get(paneKey(node.sid, current()?.socket));
     if (rt) return rt.el;
     const placeholder = document.createElement("div");
@@ -3591,6 +3796,11 @@ function renderNode(node: Node): HTMLElement {
     placeholder.textContent = `surface:${node.sid} (없음)`;
     return placeholder;
   }
+  // ★U2(0.14.41): 기한 지난 구멍 쪽은 **접는다**(형제가 그 몫을 갖는다 · 기억은 트리에 남는다). 이 split 은
+  //   보이는 것으로 판정돼 여기 왔으므로 적어도 한쪽은 보인다.
+  const vis = holeShownFor(current()?.socket);
+  if (!nodeShown(node.a, vis)) return renderNode(node.b);
+  if (!nodeShown(node.b, vis)) return renderNode(node.a);
   const div = document.createElement("div");
   div.className = `split ${node.dir}`;
   const aEl = renderNode(node.a);
@@ -3616,7 +3826,12 @@ function attachDividerDrag(
     down.preventDefault();
     divider.classList.add("dragging");
     const horizontal = node.dir === "row";
+    const origin = horizontal ? down.clientX : down.clientY;
+    let dragged = false;
     const move = (e: MouseEvent) => {
+      // ★U3(0.14.41): 3px 이상 **실제로** 움직였을 때만 '사용자가 손댄 탭'으로 본다 — mousedown 의 클래스 변경이
+      //   부르는 합성 mousemove(WebView2·WebKit)나 클릭만으로는 켜지지 않는다(반박 U3 D8).
+      if (!dragged && Math.abs((horizontal ? e.clientX : e.clientY) - origin) >= 3) dragged = true;
       const rect = container.getBoundingClientRect();
       const pos = horizontal ? e.clientX - rect.left : e.clientY - rect.top;
       const size = horizontal ? rect.width : rect.height;
@@ -3629,6 +3844,11 @@ function attachDividerDrag(
       divider.classList.remove("dragging");
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
+      if (dragged) {
+        // 이 탭은 이제 자동 배치가 비율을 리셋·재배치하지 않는다(대표 폭은 새 좌석으로 줄지 않는다). `정렬` 이 끈다.
+        const cw = current();
+        if (cw) cw.layoutManual = true;
+      }
       saveLayout();
       for (const sid of collectSids(node)) {
         const rt = panes.get(paneKey(sid, current()?.socket));
@@ -3784,50 +4004,13 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 }
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 3:1
-//   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
+// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다(규칙의 정의처 = seatlayout.ts roleLayout):
+//   · 왼쪽 끝 컬럼  = master(위) / cso·cso-N(아래), 세로 3:1 — ★U3(0.14.41): 폭은 pane 영역의 **1/3** 고정
+//   · 가운데        = worker·미분류 surface를 나머지 2/3 안에서 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
 //   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
-// 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
-// (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
+// ★U3: 정렬은 '표준 복귀'다 — 사용자가 끈 비율·수동 표식(layoutManual)을 초기화하고, 보류 중이던 빈 역할 칸(구멍)
+//   기억도 지운다(살아 있는 칸으로 새로 짠다). 정렬 뒤에도 divider 는 다시 끌 수 있다.
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
-function evenComb(nodes: Node[], dir: "row" | "col"): Node {
-  let acc = nodes[nodes.length - 1];
-  for (let i = nodes.length - 2; i >= 0; i--) {
-    acc = { type: "split", dir, ratio: 1 / (nodes.length - i), a: nodes[i], b: acc };
-  }
-  return acc;
-}
-
-function firstWithRole(sids: number[], roleOf: Map<number, string | null>, role: string): number | null {
-  for (const sid of sids) if (roleOf.get(sid) === role) return sid;
-  return null;
-}
-
-function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
-  const master = firstWithRole(sids, roleOf, "master");
-  const cso = firstWithRole(sids, roleOf, "cso");
-  const agy = firstWithRole(sids, roleOf, "reviewer-gemini"); // 안티그래피티
-  const codex = firstWithRole(sids, roleOf, "reviewer-codex");
-  const corners = new Set([master, cso, agy, codex].filter((x): x is number => x != null));
-  const middle = sids.filter((sid) => !corners.has(sid)); // worker·미분류 전부 가운데
-  const pane = (sid: number): Node => ({ type: "pane", sid });
-
-  const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 3:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 3 / 4, a: pane(master), b: pane(cso) });
-  else if (master != null) columns.push(pane(master));
-  else if (cso != null) columns.push(pane(cso));
-  // 가운데: worker·미분류 균등 컬럼
-  for (const sid of middle) columns.push(pane(sid));
-  // 오른쪽 끝: agy(위) / codex(아래) = 1:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (agy != null && codex != null) columns.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
-  else if (agy != null) columns.push(pane(agy));
-  else if (codex != null) columns.push(pane(codex));
-
-  return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
-}
-
 async function actionEqualize() {
   const ws = current();
   if (!ws?.tree) return;
@@ -3841,7 +4024,8 @@ async function actionEqualize() {
   } catch {
     /* 데몬 일시 미응답: role 없이 진행 → 전부 가운데 균등 */
   }
-  ws.tree = roleLayout(live, roleOf);
+  ws.tree = roleLayout(live, (s) => roleOf.get(s));
+  ws.layoutManual = false; // ★U3: 정렬 = 표준 복귀(이후 새 좌석은 대표 1/3 규칙으로 자동 배치)
   render(); // 새 트리로 DOM 재구성 + fitPane→resize_surface + saveLayout
 }
 
@@ -4091,6 +4275,7 @@ function buildTab(ws: Workspace): HTMLElement {
       }
       for (const sid of collectSids(ws.tree)) {
         // pane 개별 close 실패는 관용(묘비가 이미 부활 차단 — per-pane 토스트는 스팸).
+        markClosing(sid, ws.socket); // ★F3: 탭 삭제 — exited 경합이 구멍을 만들지 않게
         await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
         destroyPaneRuntime(sid, ws.socket);
       }
@@ -4377,6 +4562,7 @@ async function confirmDeleteGroup(g: GroupMeta) {
     const stopFailed: string[] = []; // ★D1: 종료 실패를 부서마다 토스트하지 않고 그룹 단위로 모아 1회
     for (const ws of members) {
       for (const sid of collectSids(ws.tree)) {
+        markClosing(sid, ws.socket); // ★F3: 그룹 삭제 — exited 경합이 구멍을 만들지 않게
         await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
         destroyPaneRuntime(sid, ws.socket);
       }
@@ -4667,9 +4853,9 @@ async function actionNew() {
   if (current()?.pending) return; // 부서 데몬 준비 중(빈 socket placeholder) — surface 생성 금지(기본 데몬 고아 차단)
   const sid = await newSurface(null, current().socket);
   const ws = current();
-  ws.tree = ws.tree
-    ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid } }
-    : { type: "pane", sid };
+  // ★U3(0.14.41): 대표가 있는 탭이면 대표 칸 밖(오른쪽 2/3)에 균등 몫으로 — 대표 1/3 유지. 대표 없는 탭은 종전 규칙
+  //   그대로(오른쪽 반반 · 반박 U3 D12). 새 셸은 역할 없음(null), 기존 칸은 역할 기억으로 대표를 알아본다.
+  ws.tree = placeSeatSafe(ws.tree, sid, bareSeat(sid), !!ws.layoutManual);
   render();
   setFocus(sid);
 }
@@ -4705,6 +4891,7 @@ async function actionClose() {
   const ws = current();
   if (focusedSid == null || !ws.tree) return;
   const sid = focusedSid;
+  markClosing(sid, ws.socket); // ★F3: exited 경합이 구멍을 만들지 않게
   await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
   destroyPaneRuntime(sid, ws.socket);
   ws.tree = replaceNode(ws.tree, sid, () => null);
@@ -4737,13 +4924,72 @@ function detachPane(sid: number, socket?: string): void {
     focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
 }
 
-function removeDeadPane(sid: number, socket?: string) {
+function removeDeadPane(sid: number, socket?: string, hold = false) {
   const sameSock = (w: Workspace) => (w.socket ?? undefined) === (socket ?? undefined);
   const inLayout = workspaces.some((w) => sameSock(w) && w.tree != null && collectSids(w.tree).includes(sid));
   if (!panes.has(paneKey(sid, socket)) && !inLayout) return; // 이미 정리됨
-  detachPane(sid, socket);
+  // ★U2(0.14.41): 종료(exited)·수거(reaped)된 **역할 칸**은 떼지 않고 구멍으로 보류한다 — 같은 역할의 새 창
+  //   (node-recover·phoenix·재부팅 복원)이 그 칸에 결속된다. 의도된 닫기(closed — 사용자·전출 원본·TTL)와
+  //   역할 기억이 없는 칸(셸)·일회용 좌석은 종전대로 뗀다. Windows 셧다운에서 자식이 먼저 죽어 exited 가
+  //   기억을 지우던 경로(반박 U2 §3-2)도 이것으로 닫힌다.
+  if (!(hold && holdRolePane(sid, socket, Date.now() + ROLE_SLOT_GRACE))) {
+    detachPane(sid, socket);
+    reanchorAuto(socket);
+  }
   render();
   if (focusedSid != null) setFocus(focusedSid);
+}
+
+// ★U2(0.14.41): 역할을 기억한 칸이 창을 잃으면 칸째 떼지 않고 **구멍**(음수 sid · 같은 자리·같은 비율)으로 남긴다.
+// 역할 기억이 없거나(셸) 일회용이면 false → 호출측이 종전대로 뗀다. 어떤 실패도 false(종전 경로)로 떨어진다.
+// until = 보류 기한(ms) — 그 동안은 스피너와 [새 셸 열기]/[칸 비우기] 손잡이가 보이고, 지나면 화면에서만 접힌다.
+function holdRolePane(sid: number, socket: string | undefined, until: number | null): boolean {
+  try {
+    const sameSock = (w: Workspace) => (w.socket ?? undefined) === (socket ?? undefined);
+    let held = false;
+    for (const ws of workspaces) {
+      if (!sameSock(ws) || !ws.tree) continue;
+      const hole = nextHoleSid(workspaces.map((w) => w.tree));
+      const next = holdPane(ws.tree, sid, hole);
+      if (!next) continue;
+      ws.tree = next;
+      held = true;
+      if (until != null) holeUntil.set(paneKey(hole, socket), until);
+    }
+    if (!held) return false;
+    destroyPaneRuntime(sid, socket);
+    nodeSig.delete(`${socket}#${sid}`);
+    if (focusedSid === sid && (current()?.socket ?? undefined) === (socket ?? undefined))
+      focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ★U3(0.14.41): 자동 경로의 제거(종료 이벤트·유령 수렴·보류 만료) 뒤 **비수동** 탭의 오른쪽 컬럼을 다시 균등으로
+// (맨 끝이 아닌 컬럼이 빠지면 한쪽으로 쏠리던 폭 · 반박 U3 D7). 대표 1/3 은 제거로 줄지 않는다(형제로 접힐 뿐).
+// 역할은 모르면 칸의 기억으로 본다. 실패하면 원 트리(anchorHeadSafe) — 화면을 막지 않는다.
+function reanchorAuto(socket: string | undefined | null, roleOf: RoleOf = () => undefined): void {
+  for (const w of workspaces) {
+    if (socket !== null && (w.socket ?? undefined) !== (socket ?? undefined)) continue;
+    if (w.layoutManual || !w.tree) continue;
+    w.tree = anchorHeadSafe(w.tree, roleOf);
+  }
+}
+
+// ★U2(0.14.41): 데몬이 재기동했다(유령 수렴) — 저장된 세대는 더는 이 트리의 sid 를 말하지 않는다. '모름'으로
+// 내려 두면 다음 기동이 생존 판정 + 역할 충돌 검사로 본다(같은 세대라고 오판해 옛 sid 를 믿지 않게).
+function forgetDaemonEpoch(socket: string | undefined): void {
+  for (const w of workspaces) if ((w.socket ?? undefined) === (socket ?? undefined)) w.daemonEpoch = undefined;
+}
+
+// ★U2(0.14.41): 트리에서 사라진 구멍의 보류 기한을 치운다(결속·위생·정렬·탭 닫기 뒤) — 남겨 두면 만료 때
+// 쓸데없는 재렌더가 한 번 돈다. 키의 sid 는 마지막 '#' 뒤다(소켓 경로에 '#' 이 있어도 안전).
+function pruneHoleUntil(): void {
+  const present = new Set<string>();
+  for (const w of workspaces) for (const h of holeSidsOf(w.tree)) present.add(paneKey(h, w.socket));
+  for (const k of [...holeUntil.keys()]) if (!present.has(k)) holeUntil.delete(k);
 }
 
 // ---------- 승인 Feed (Control Center 탭) ----------
@@ -6533,7 +6779,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:split-row", title: "가로 분할", keywords: "split row 분할", action: () => actionSplit("row") },
     { id: "act:split-col", title: "세로 분할", keywords: "split col 분할", action: () => actionSplit("col") },
     { id: "act:close", title: "패널 닫기", keywords: "close 닫기", action: () => actionClose() },
-    { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
+    { id: "act:equalize", title: "역할별 정렬 (대표 1/3)", keywords: "equalize 균등 정렬 layout 대표", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
     { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
     { id: "act:dept", title: "부서 워크스페이스 추가 (독립 부서장·전용 데몬)", keywords: "dept workspace 부서 부서장 master", action: () => { if (daemonActionBlocked()) return; void addDeptWorkspace(); } },
@@ -6883,6 +7129,7 @@ async function purgeDept(ws: Workspace) {
     toast("watchdog", "부서 완전 삭제 완료", `${nm} — 대화기억은 격리 보관(복구 가능)·재시작 부활 차단.`);
     // 프론트 pane·탭 정리(데몬은 이미 down — close_surface 실패는 관용).
     for (const sid of collectSids(ws.tree)) {
+      markClosing(sid, ws.socket); // ★F3
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
@@ -7557,7 +7804,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
     const sock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;
     if (event.socket_slug && !sock) return; // slug 명시됐는데 미해결 → 기본 데몬 폴백 금지(타부서 동일 sid 오제거 방지)
-    removeDeadPane(Number(sid), sock);
+    removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));
   }
 }
 
@@ -7697,8 +7944,12 @@ async function start() {
   // (A④) 3초 자가치유도 꺼진 채 남는다(A③). hang 이라 start() 의 catch 복구조차 돌지 않는다.
   // 상한을 넘겨도 **복원은 계속한다** — 기본 소켓은 아래 소켓별 조회에서 ok:false 로 떨어져
   // 기존 보존 경로를 타고, 살아 있는 부서 탭들은 정상 복원된다(USER-MANUAL 에 적은 계약 그대로).
+  // ★U2(0.14.41): 소켓별 데몬 세대(started_at+pid)·기동 시각 — **이미 부르는** daemon_status 응답에서만 읽는다(새 왕복 0).
+  //   세대가 저장본과 다르면 옛 sid 를 믿지 않고 역할로만 결속하고, 데몬이 젊을 때만 빈 역할 칸을 보류한다.
+  const identBySock = new Map<string | undefined, DaemonIdent>();
   try {
     const status = (await rpcT(invoke("daemon_status"), T_STATUS)) as Record<string, unknown>;
+    identBySock.set(undefined, daemonIdentOf(status));
     info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
   } catch {
     info.textContent = "데몬 응답 없음 — 화면은 계속 사용할 수 있습니다(연결되면 자동으로 붙습니다)";
@@ -8047,6 +8298,12 @@ async function start() {
   // 이제부터의 저장은 사용자의 배치를 덮는 것이 아니라 그 배치를 갱신하는 것이다.
   layoutLoaded = true;
   for (const ws of workspaces) ws.socket = ws.socket ?? undefined; // 하위호환 마이그레이션(기본 데몬)
+  // ★U3(0.14.41) 구버전 저장본 1회 이관: 수동 표식 필드가 없던 시절의 탭은 **비율로 추정**한다 — 자동값(미지정·1/k·
+  //   3/4·n/(n+1))만 있으면 자동 탭(기동 즉시 대표 1/3 로 고친다 · 반박 U3 D3), 사용자가 끈 비율이 하나라도 있으면
+  //   수동 탭(재배치하지 않는다). 한 번 정해지면 boolean 으로 저장돼 다시 추정하지 않는다. 병합(배치)보다 **먼저** 한다.
+  for (const ws of workspaces) {
+    if (typeof ws.layoutManual !== "boolean") ws.layoutManual = looksManual(ws.tree);
+  }
   // socket 1:1 수렴 + id 중복 제거(중복 탭 증식 차단) — 복원 적재 직후 단일 게이트.
   workspaces = normalizeWorkspaces(workspaces);
   // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
@@ -8212,7 +8469,8 @@ async function start() {
     let alive = false;
     let statusUnknown = false; // 타임아웃(무응답) — '죽었다'가 아니라 '모른다'
     try {
-      await rpcT(invoke("daemon_status", { socket: ws.socket }), T_STATUS);
+      const st = await rpcT(invoke("daemon_status", { socket: ws.socket }), T_STATUS);
+      identBySock.set(ws.socket, daemonIdentOf(st)); // ★U2: 생존 검사 응답에서 세대를 읽는다(새 왕복 0)
       alive = true;
     } catch (e) {
       statusUnknown = String(e).includes("rpc timeout");
@@ -8279,6 +8537,8 @@ async function start() {
       const info = (await rpcT(invoke("launch_dept_daemon", { name: launchName }), T_LAUNCH)) as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
       if (info.socket) ws.socket = info.socket; // 재-launch된 실제 socket 반영(이후 집계·prune·병합 정합)
+      // ★U2: 방금 띄운 데몬 — 기동 시각은 지금(빈 역할 칸 보류 대상), 세대는 모름(생존 판정 + 역할 충돌 검사로 본다).
+      identBySock.set(ws.socket, { epoch: null, startedAtMs: Date.now() });
     } catch (e) {
       // 데몬 확보 실패 — 등록된 ws는 빈 채 보존(저장본 삭제 금지).
       // ★C4-b(2026-09-17 3라운드): 종전 `catch {}` 는 cys-dept 의 stderr(소켓 경로 상한 등 sock_len_diag 사유)를
@@ -8344,26 +8604,67 @@ async function start() {
   const sockets = [...new Set(workspaces.map((w) => w.socket))];
   const liveBySock = new Map<
     string | undefined,
-    { ids: Set<number>; ok: boolean; list: { surface_id: number; title: string }[] }
+    {
+      ids: Set<number>;
+      ok: boolean;
+      list: { surface_id: number; title: string; role?: string | null }[];
+      // ★U2·U3: 산 좌석의 역할(데몬 surface.list 가 이미 보내는 필드 — 새 왕복 0)
+      roles: Map<number, string | null>;
+    }
   >();
   // ★전 소켓을 먼저 '판정 보류(ok:false)'로 시드한다 — 예산 소진으로 루프를 중단해도 항목이
   // **없는** 소켓이 생기지 않는다. 항목이 없으면 keepWorkspaceOnRestore 가 그 빈 트리 ws 를
   // 드롭해 버린다(= 이 판이 고치려던 바로 그 증상). '조회 안 함'과 '조회했는데 미응답'을
   // 구분하는 판정이라, 중단 시에는 후자로 떨어뜨리는 것이 옳다.
-  for (const sk of sockets) liveBySock.set(sk, { ids: new Set(), ok: false, list: [] });
+  for (const sk of sockets) liveBySock.set(sk, { ids: new Set(), ok: false, list: [], roles: new Map() });
   for (const sk of sockets) {
     if (Date.now() > restoreDeadline) break; // 예산 소진 — 나머지는 보류 상태 그대로 두고 화면을 먼저 세운다
     try {
       const r = (await rpcT(invoke("list_surfaces", { socket: sk }), T_LIST)) as {
-        surfaces: { surface_id: number; title: string; exited: boolean }[];
+        surfaces: { surface_id: number; title: string; role?: string | null; exited: boolean }[];
       };
       const liveList = r.surfaces.filter((s) => !s.exited);
-      liveBySock.set(sk, { ids: new Set(liveList.map((s) => s.surface_id)), ok: true, list: liveList });
+      liveBySock.set(sk, {
+        ids: new Set(liveList.map((s) => s.surface_id)),
+        ok: true,
+        list: liveList,
+        roles: new Map(liveList.map((s) => [s.surface_id, s.role ?? null] as [number, string | null])),
+      });
     } catch {
-      liveBySock.set(sk, { ids: new Set(), ok: false, list: [] });
+      liveBySock.set(sk, { ids: new Set(), ok: false, list: [], roles: new Map() });
     }
   }
 
+  // ★U2(0.14.41) 역할 결속 준비 — 아래 죽은 칸 제거(deadLiveSids) **앞**에서, 역할을 기억한 죽은 칸을 **구멍**
+  //   (음수 sid · 같은 자리·같은 비율)으로 바꾼다. 재부팅으로 데몬 세대가 바뀌었으면 옛 sid 는 살아 보여도 전부 죽은
+  //   것(sid 재사용 방어 · 반박 U2 §3-1), 세대를 모르면 생존 판정 + 기억 역할 충돌 검사로 본다. 데몬이 젊으면(기동 후
+  //   grace 미만) 새로 생긴 구멍을 기한까지 보류 표시하고, 늙었으면(앱을 늦게 켬) 곧바로 접는다(반박 U2 major ⓒ).
+  //   실패하면 그 탭은 종전 경로(아래 deadLiveSids)로 — 역할 기억만 잃는다.
+  const restoreNow = Date.now();
+  let holeSeq = nextHoleSid(workspaces.map((w) => w.tree));
+  for (const ws of workspaces) {
+    const lb = liveBySock.get(ws.socket);
+    if (!lb || !lb.ok) continue;
+    try {
+      const ident = identBySock.get(ws.socket);
+      const gen = generationChanged(ws.daemonEpoch, ident?.epoch ?? null);
+      const until = reserveDeadline(ident?.startedAtMs ?? null, restoreNow, ROLE_SLOT_GRACE);
+      const sock = ws.socket;
+      ws.tree = restoreTree(ws.tree, {
+        genChanged: gen === true,
+        isLive: (x) => lb.ids.has(x),
+        liveRole: (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined),
+        roleConflictIsDead: gen === null,
+        allocHole: () => {
+          const h = holeSeq--;
+          if (until !== null) holeUntil.set(paneKey(h, sock), until);
+          return h;
+        },
+      });
+    } catch {
+      /* 종전 경로 */
+    }
+  }
   // 죽은 pane 제거 — 데몬 미응답 소켓의 ws는 건드리지 않는다(일시 미가동=영구삭제 방지).
   const activeWsId = workspaces[activeWs]?.id;
   for (const ws of workspaces) {
@@ -8410,24 +8711,58 @@ async function start() {
   activeWs = restoredIdx >= 0 ? restoredIdx : Math.min(activeWs, workspaces.length - 1);
 
   // pane 런타임 생성 + 고아(레이아웃에 없는 살아있는 surface)는 같은 소켓 ws에 병합.
+  // ★U2·U3(0.14.41): 고아는 입양 우선순위(master 먼저) 순으로 ① 같은 역할 구멍(= 재부팅 전 그 칸)에 **결속** →
+  //   ② 없으면 대표 1/3 규칙(placeSeat). 붙일 탭은 master 가 있는 탭 우선(소켓의 첫 탭이 CEO 탭이 아닐 수 있다 ·
+  //   반박 U2 §3-3). adoptSeat 는 전역 함수 — 어떤 실패도 종전 오른쪽 부착으로 떨어진다(좌석은 반드시 붙는다).
   for (const sk of sockets) {
     const lb = liveBySock.get(sk);
     if (!lb || !lb.ok) continue;
-    const ws = workspaces.find((w) => (w.socket ?? undefined) === (sk ?? undefined));
+    const sockWs = () => workspaces.filter((w) => (w.socket ?? undefined) === (sk ?? undefined));
     // ★붙일 ws 가 없으면 pane 런타임도 만들지 않는다 — 종전에는 ws 없이도 makePane 이 불려
     // 화면 밖 고아 런타임(xterm·리스너)이 남았고, 그 런타임이 `panes.has` 게이트로 **같은 세션의
     // 재입양을 영구 차단**했다(실측 34개). 위 '존재 진실원 보강'으로 ws 는 늘 있지만, 이중 방어다.
-    if (!ws) continue;
-    for (const s of lb.list) {
+    if (!sockWs().length) continue;
+    const roleOf: RoleOf = (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined);
+    const ordered = [...lb.list].sort((a, b) => seatPriority(a.role) - seatPriority(b.role) || a.surface_id - b.surface_id);
+    for (const s of ordered) {
       if (startHaltedByReset(info)) return; // ★W-3-b(R3-M1): pane 을 붙이기 전마다 초기화 진행·완료를 다시 본다
       await makePane(s.surface_id, s.title, sk);
-      if (ws && !collectSids(ws.tree).includes(s.surface_id)) {
-        ws.tree = ws.tree
-          ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
-          : { type: "pane", sid: s.surface_id };
-        ws.autoCreated = undefined; // pane 이 붙었다 = 이제 '쓰는 탭'(다음 기동 상한 면제)
+      const cands = sockWs();
+      if (cands.some((w) => collectSids(w.tree).includes(s.surface_id))) continue;
+      const plan = adoptSeat(cands, sk, s.surface_id, s.role ?? null, roleOf);
+      if (!plan) {
+        destroyPaneRuntime(s.surface_id, sk); // 붙일 탭이 없다(전부 준비 중·삭제 중) — 고아 런타임을 남기지 않는다
+        continue;
       }
+      const ws = cands[plan.idx];
+      ws.tree = plan.tree;
+      if (plan.boundHole != null) holeUntil.delete(paneKey(plan.boundHole, sk));
+      ws.autoCreated = undefined; // pane 이 붙었다 = 이제 '쓰는 탭'(다음 기동 상한 면제)
     }
+    // ★U2 구멍 위생(역할 하나에 칸 하나 · 상한) — 실패해도 병합은 끝났다.
+    try {
+      const same = sockWs();
+      const tidy = tidyHoles(
+        same.map((w) => w.tree),
+        roleOf,
+      );
+      same.forEach((w, i) => (w.tree = tidy[i]));
+    } catch {
+      /* 위생만 건너뛴다 */
+    }
+    // ★U2: 이 소켓 트리의 양수 sid 는 이제 지금 세대의 것이다 — 다음 기동의 세대 비교 기준(모르면 undefined).
+    const ident = identBySock.get(sk);
+    for (const w of sockWs()) w.daemonEpoch = ident?.epoch ?? undefined;
+  }
+  pruneHoleUntil();
+  // ★U3 S5(0.14.41 · 반박 U3 D3·M5): 구버전 저장본(대표 1/4·1/8)을 **기동 즉시** 1/3 로 — 좌석이 늘지 않아도 약속이
+  //   눈에 보인다(업데이트 뒤 앱만 재시작하면 좌석이 늘지 않는다). 수동 탭은 건드리지 않는다. 실패하면 원 트리
+  //   (anchorHeadSafe) — 복원의 나머지 단계(빈 탭 충전·부서)를 막지 않는다.
+  for (const ws of workspaces) {
+    if (ws.layoutManual || !ws.tree) continue;
+    const lb = liveBySock.get(ws.socket);
+    const roles = lb && lb.ok ? lb.roles : null;
+    ws.tree = anchorHeadSafe(ws.tree, (x) => (roles && roles.has(x) ? roles.get(x) : undefined));
   }
   // ★W-2-d: newSurface 직전 — 초기화가 끝난 앱의 죽은 데몬에 surface 를 만들지 않는다.
   if (startHaltedByReset(info)) return;
@@ -8439,7 +8774,8 @@ async function start() {
     if (Date.now() > restoreDeadline) break;
     // ★대칭: 종전 `ws.socket == null` 제외 조항을 걷어냈다 — 본부 탭도 입양할 노드가 없으면
     // plain 셸로 채운다. 없으면 본부 탭이 빈 화면(tree:null)으로 남는다(신규 설치의 기본 모습과 동일).
-    if (ws.tree || liveBySock.get(ws.socket)?.ok !== true) continue;
+    // ★U2: '빈 탭' = 산 칸이 0 개(구멍만 남은 탭 포함 — 반박 U2 major ⓑ: 보류가 셸을 막지 않는다).
+    if (collectSids(ws.tree).length || liveBySock.get(ws.socket)?.ok !== true) continue;
     // ★W-3-b(R3-M1): 매 newSurface 앞에서 다시 본다 — 루프 앞 한 번의 확인으로는 루프 도중 끝난 초기화를 못 보고,
     // 그 뒤의 newSurface 는 죽은 데몬에 surface 를 요청해 빈 화면을 남긴다.
     if (startHaltedByReset(info)) return;
@@ -8447,12 +8783,12 @@ async function start() {
     // 실패하면 빈 탭으로 남고 3초 틱이 노드를 입양하거나 다음 기동이 재시도한다.
     try {
       const sid = await newSurface(null, ws.socket, T_NEW);
-      ws.tree = { type: "pane", sid };
+      ws.tree = placeSeatSafe(ws.tree, sid, bareSeat(sid), !!ws.layoutManual); // ★U2: 기억 칸(구멍)은 지우지 않고 곁에 붙인다
     } catch {
       /* 다음 틱·다음 기동에서 재시도 */
     }
   }
-  if (!current().tree) {
+  if (!collectSids(current().tree).length) {
     // 복원 시 current()가 미응답(ok===false) 부서 ws일 수 있다(필터의 ok===false 절로 보존·activeWs가 선택,
     // 충전 루프는 ok!==true라 스킵) — 죽은 부서 socket에 newSurface하면 backend가 reject해 복원이 깨진다.
     // 기본 데몬(socket undefined·상시 가용)으로 폴백해 빈 화면/미처리 rejection을 막는다(정상 경로 불변).
@@ -8462,7 +8798,8 @@ async function start() {
     // 둘 다 실패하면 **빈 탭으로 두고 진행한다**: 빈 탭은 백지보다 낫고, 3초 틱이 뒤를 받는다.
     if (startHaltedByReset(info)) return; // ★W-3-b(R3-M1): newSurface 앞 재확인
     try {
-      current().tree = { type: "pane", sid: await newSurface(null, current().socket, T_NEW) };
+      const nsid = await newSurface(null, current().socket, T_NEW);
+      current().tree = placeSeatSafe(current().tree, nsid, bareSeat(nsid), !!current().layoutManual);
     } catch {
       if (startHaltedByReset(info)) return; // ★W-3-b: 첫 시도가 실패하는 사이 초기화가 끝났을 수 있다
       // ★F2(8라운드): 기본 데몬 폴백은 **본부 탭에만** 적용한다. 부서 탭에 기본 데몬 셸을 붙이면 pane 키
@@ -8471,7 +8808,8 @@ async function start() {
       //   ('지금 켜기')이 받는다(백지가 아니다).
       if (!current().socket) {
         try {
-          current().tree = { type: "pane", sid: await newSurface(null, undefined, T_NEW) };
+          const hsid = await newSurface(null, undefined, T_NEW);
+          current().tree = placeSeatSafe(current().tree, hsid, bareSeat(hsid), !!current().layoutManual);
         } catch {
           /* 기본 데몬까지 실패 — 빈 탭으로 두고 render 로 진행한다(백지 금지) */
         }

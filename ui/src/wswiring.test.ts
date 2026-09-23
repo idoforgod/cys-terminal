@@ -631,7 +631,9 @@ describe("복원 보류 — 탭은 유지하고 트리만 비운다(F2)", () => 
   });
 
   it("★기본 데몬 폴백은 본부 탭에만 — 부서 탭에 붙인 셸은 pane 키가 어긋나 보이지 않는다", () => {
-    const i = code.indexOf("if (!current().tree) {");
+    // ★U2(0.14.41): 조건이 '트리 없음' 에서 '산 칸 0개' 로 넓어졌다(구멍만 남은 탭도 셸을 받는다 — 반박 U2 major ⓑ).
+    //   이 핀이 지키는 계약(부서 탭엔 기본 데몬 셸을 붙이지 않는다)은 그대로다.
+    const i = code.indexOf("if (!collectSids(current().tree).length) {");
     expect(i).toBeGreaterThan(0);
     const seg = code.slice(i, code.indexOf("\n  render();", i));
     expect(seg).toContain("newSurface(null, current().socket, T_NEW)");
@@ -835,5 +837,257 @@ describe("삭제 실패 탭 — 안내가 실제 동작과 같다(G5)", () => {
   it("★표식은 종료 실패 두 경로가 세우고, 켜기 성공이 내린다(삭제 취소 = 묘비 해소)", () => {
     expect((code.match(/ws\.stopFailed = true;/g) ?? []).length).toBe(2); // 탭 닫기 · 그룹 삭제
     expect(code).toContain("ws.stopFailed = undefined;");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// ★U2+U3(0.14.41 · WP-A1) — 좌석 배치는 seatlayout.ts **한 모듈**을 거친다.
+//   U3: 새 좌석을 트리 전체 오른쪽에 반반으로 붙여 대표 칸이 1/2→1/4→1/8 로 줄던 규칙을 없앤다.
+//   U2: 칸에 역할을 적어 두고, 재부팅으로 sid 가 바뀌어도 같은 역할의 새 창을 원래 칸에 결속한다.
+//   판정은 seatlayout.test.ts·seatbind.test.ts 가 잠그고, 여기서는 **배선**을 센다(순수 함수가 옳아도
+//   main.ts 가 부르지 않으면 화면은 그대로 틀린다 — 이 파일 머리말의 교훈).
+// ────────────────────────────────────────────────────────────────────────────
+describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seatlayout.ts)", () => {
+  // actionSplit 의 경합 폴백은 `dir` 변수라서 걸리지 않는다(사용자가 지정한 분할 방향 — 의도된 동작).
+  const LEGACY_APPEND = /type: "split", dir: "row", a: [\w.()]+, b: \{ type: "pane"/;
+
+  it("★옛 '오른쪽 반반 부착' 리터럴이 main.ts 코드에 0회(3초 입양·기동 병합·+New·전출 런처 셸 — 반박 U3 D9)", () => {
+    expect(LEGACY_APPEND.test(code)).toBe(false);
+    // 종전 규칙이 필요한 폴백은 seatlayout.ts 의 legacyAppend 한 곳에만 있다.
+    expect(code).toContain("placeSeatSafe(");
+  });
+
+  it("3초 입양 틱: 종료 좌석은 역할 맵에서 null(반박 U3 D4) · 결속 우선 입양(adoptSeat) · 입양 가드 유지", () => {
+    const i = code.indexOf("for (const s of [...r.surfaces].sort(");
+    expect(i).toBeGreaterThan(0);
+    const seg = code.slice(i, code.indexOf("adopted = true;", i));
+    expect(seg).toContain("seatPriority(");
+    expect(seg).toContain("adoptSeat(");
+    expect(seg).toContain("!w.pending && !w.deleting");
+    // ★배치용 역할 맵 **정의 자체**를 본다 — 같은 식이 역할 점(setRoleDot) 줄에도 있어 전역 검색은 공회전한다(돌연변이 M9 로 실증).
+    const a = code.indexOf("async function refreshPaneTitles(");
+    const r0 = code.indexOf("const roleOf: RoleOf = (x) => {", a);
+    expect(r0).toBeGreaterThan(a);
+    expect(code.slice(r0, code.indexOf("};", r0))).toContain("s.exited ? null : s.role");
+    expect(seg.indexOf("adoptSeat(cands, sk, s.surface_id, s.role, roleOf)")).toBeGreaterThan(0);
+  });
+
+  it("3초 틱: 역할 기억은 바뀐 틱에만 저장(annotateRoles) · 유령 집행은 역할 칸을 구멍으로(holdRolePane) · 구멍 위생(tidyHoles)", () => {
+    const a = code.indexOf("async function refreshPaneTitles(");
+    const seg = code.slice(a, code.indexOf("setInterval(refreshPaneTitles, 3000);", a));
+    expect(seg).toContain("annotateRoles(");
+    expect(seg).toContain("holdRolePane(sid, sk,");
+    expect(seg).toContain("tidyHoles(");
+    expect(seg).toContain("holeUntil.delete(");
+  });
+
+  it("★기동 복원: 역할 결속(restoreTree)이 죽은 칸 제거(deadLiveSids) **앞** · 병합은 adoptSeat · S5(anchorHeadSafe)는 병합 뒤·빈 탭 충전 앞", () => {
+    const s = restoreSlice();
+    const rt = s.indexOf("restoreTree(");
+    const dl = s.indexOf("deadLiveSids(");
+    expect(rt).toBeGreaterThan(0);
+    expect(dl).toBeGreaterThan(rt);
+    const merge = s.indexOf("adoptSeat(", dl);
+    const s5 = s.indexOf("anchorHeadSafe(", merge);
+    const fill = s.indexOf("newSurface(null, ws.socket, T_NEW)", s5);
+    expect(merge).toBeGreaterThan(dl);
+    expect(s5).toBeGreaterThan(merge);
+    expect(fill).toBeGreaterThan(s5);
+  });
+
+  it("기동: 데몬 세대는 **이미 부르는** daemon_status 응답에서 읽는다(새 왕복 0 · daemonIdentOf)", () => {
+    const s = startSlice();
+    expect(s).toContain("daemonIdentOf(");
+    expect((s.match(/invoke\("daemon_status"/g) ?? []).length).toBe(3); // 300ms 프로브 · 본부 · 부서 생존 — 늘면 red
+  });
+
+  // ★리뷰1 F1(major) — 아래는 전부 **정확한 식** 핀이다. "식별자가 어딘가에 있다"만 보는 핀은
+  // main.ts 배선의 조건·인자를 되돌려도 초록으로 남는다(review1-mutation-harness.py.txt W1-W26).
+  // 각 it 제목의 (W숫자)가 그 뮤테이션 이름 — 되돌리면 이 줄에서 바로 red.
+  it("★(W1) 빈 탭 충전 조건은 `collectSids(ws.tree).length`(구멍만 남은 탭도 셸을 받는다 · 반박 U2 major ⓑ)", () => {
+    const s = startSlice();
+    expect(s).toContain(
+      "if (collectSids(ws.tree).length || liveBySock.get(ws.socket)?.ok !== true) continue;",
+    );
+  });
+
+  it("★(W2) 세대는 이 소켓 트리에 실제로 저장된다(`w.daemonEpoch = ident?.epoch ?? undefined`)", () => {
+    const s = startSlice();
+    expect(s).toContain("for (const w of sockWs()) w.daemonEpoch = ident?.epoch ?? undefined;");
+  });
+
+  it("★(W3·W25·W26) 복원 restoreTree 호출의 세 인자가 정확하다(genChanged·liveRole·보류기한)", () => {
+    const s = startSlice();
+    expect(s).toContain("genChanged: gen === true,");
+    expect(s).toContain("liveRole: (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined),");
+    expect(s).toContain(
+      "const until = reserveDeadline(ident?.startedAtMs ?? null, restoreNow, ROLE_SLOT_GRACE);",
+    );
+  });
+
+  it("★(W4) 수동 표식 1회 추정 가드 — 이미 boolean 이면 다시 추정하지 않는다(매 기동 재추정 금지)", () => {
+    const s = startSlice();
+    expect(s).toContain(
+      'if (typeof ws.layoutManual !== "boolean") ws.layoutManual = looksManual(ws.tree);',
+    );
+  });
+
+  it("★(W8) 부서 생존 검사 응답에서도 세대를 기록한다(`identBySock.set(ws.socket, daemonIdentOf(st))`)", () => {
+    const s = startSlice();
+    expect(s).toContain("identBySock.set(ws.socket, daemonIdentOf(st));");
+  });
+
+  it("★(W13) 기동 병합 뒤 구멍 위생 결과를 실제로 대입한다(`same.forEach((w, i) => (w.tree = tidy[i]))`)", () => {
+    const s = startSlice();
+    expect(s).toContain("same.forEach((w, i) => (w.tree = tidy[i]));");
+  });
+
+  it("★(W20) S5(anchorHeadSafe) 루프는 수동 탭을 건드리지 않는다(`ws.layoutManual || !ws.tree` 가드)", () => {
+    const s = startSlice();
+    expect(s).toContain("if (ws.layoutManual || !ws.tree) continue;");
+  });
+
+  it("★(W23) 고아 입양 순서는 역할 우선(seatPriority) · sid 는 동률 보조키일 뿐이다", () => {
+    const s = startSlice();
+    expect(s).toContain(
+      "const ordered = [...lb.list].sort((a, b) => seatPriority(a.role) - seatPriority(b.role) || a.surface_id - b.surface_id);",
+    );
+  });
+
+  it("★(W24) +New 는 수동 표식을 무시하지 않는다(`!!ws.layoutManual` 을 placeSeatSafe 에 그대로 넘긴다)", () => {
+    const a = code.indexOf("async function actionNew() {");
+    expect(a).toBeGreaterThan(0);
+    const seg = code.slice(a, code.indexOf("\n}\n", a));
+    expect(seg).toContain("ws.tree = placeSeatSafe(ws.tree, sid, bareSeat(sid), !!ws.layoutManual);");
+  });
+
+  it("★(W6) 유령 수렴이 구멍으로 보류할 때도 런타임을 반드시 회수한다(holdRolePane 안의 destroyPaneRuntime)", () => {
+    const h = code.indexOf("function holdRolePane(");
+    expect(h).toBeGreaterThan(0);
+    const seg = code.slice(h, code.indexOf("\n}\n", h));
+    expect(seg).toContain("destroyPaneRuntime(sid, socket);");
+  });
+
+  it("★(W7) 렌더는 nodeShown 게이트를 거친다 — 기한 지난 구멍만 남으면 트리를 그대로 그리지 않는다", () => {
+    expect(code).toContain(
+      "if (tree && nodeShown(tree, holeShownFor(ws?.socket))) root.appendChild(renderNode(tree));",
+    );
+  });
+
+  it("★(W10) removeDeadPane 이 뗄 때는 유령 쏠림도 편다(detachPane 뒤 reanchorAuto — 반박 U3 D7)", () => {
+    const i = code.indexOf("function removeDeadPane(");
+    expect(i).toBeGreaterThan(0);
+    const seg = code.slice(i, code.indexOf("\n}\n", i));
+    expect(seg).toContain("detachPane(sid, socket);\n    reanchorAuto(socket);");
+  });
+
+  it("★(W16·W18·W19·W22) 3초 틱: 역할 기억은 memoOf(종료 직전 값 보존) · 유령 퇴거는 세대 잊기+재정렬 · 보류는 기한부", () => {
+    const a = code.indexOf("async function refreshPaneTitles(");
+    const seg = code.slice(a, code.indexOf("setInterval(refreshPaneTitles, 3000);", a));
+    expect(seg).toContain("annotateRoles(w.tree, memoOf)"); // roleOf(exited→null) 를 쓰면 종료 직전 기억이 지워진다
+    expect(seg).toContain(
+      "if (!holdRolePane(sid, sk, Date.now() + ROLE_SLOT_GRACE)) detachPane(sid, sk);",
+    ); // 기한 없이(null) 보류하면 영구 스피너
+    expect(seg).toContain("forgetDaemonEpoch(sk);"); // 유령 뒤엔 세대를 다시 '모름'으로(재사용 방어 재무장)
+    expect(seg).toContain("if (step.evict.length) reanchorAuto(sk, roleOf);"); // 퇴거 뒤 쏠림을 편다
+  });
+
+  it("★(W21) 보류 기한 만료 뒤 화면에서 접히며 생긴 쏠림도 편다(reanchorAuto(null))", () => {
+    const a = code.indexOf("async function refreshPaneTitles(");
+    const seg = code.slice(a, code.indexOf("setInterval(refreshPaneTitles, 3000);", a));
+    expect(seg).toContain("if (expired) {\n      reanchorAuto(null);");
+  });
+
+  it("★(F3·리뷰1 minor) 사용자·전출의 의도된 닫기는 exited 경합에도 보류(스피너)로 새지 않는다", () => {
+    // close_surface 를 부르는 8개 지점 전부 invoke 직전에 markClosing 을 부른다 — 하나라도 빠지면
+    // 그 경로만 레이스에 노출된다(RPC 응답을 기다리는 사이 daemon 의 exited 가 먼저 온다).
+    const closeCalls = [...code.matchAll(/invoke\("close_surface"/g)];
+    expect(closeCalls.length).toBe(8);
+    for (const m of closeCalls) {
+      const before = code.slice(Math.max(0, (m.index ?? 0) - 200), m.index);
+      expect(before).toContain("markClosing(");
+    }
+    expect(code).toContain(
+      'removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));',
+    );
+  });
+
+  it("수동 표식: 구버전 저장본 1회 추정(looksManual) · 3px 이상 분할선 드래그·pane 이동에서만 켜짐 · 정렬이 끈다", () => {
+    expect(code).toContain("looksManual(");
+    const d = code.indexOf("function attachDividerDrag(");
+    expect(d).toBeGreaterThan(0);
+    const dseg = code.slice(d, code.indexOf("\n}\n", d));
+    expect(dseg).toContain("layoutManual = true");
+    expect(/>= 3/.test(dseg)).toBe(true); // 클릭·합성 mousemove 로는 켜지지 않는다(반박 U3 D8)
+    // ★(W5) `layoutManual = true` 가 실제로 3px 게이트 **안**에 있다 — `if (dragged)` 를
+    // `if (true)` 로 되돌리면(클릭 한 번·합성 mousemove 로도 영구 수동) 이 줄만으로 잡는다.
+    expect(dseg).toContain("if (dragged) {");
+    const mv = code.slice(code.indexOf("function movePane("), code.indexOf("function setFocus("));
+    expect(mv).toContain("layoutManual = true");
+    const eq = code.slice(code.indexOf("async function actionEqualize("), code.indexOf("// ---------- workspace tabs"));
+    expect(eq).toContain("roleLayout(");
+    expect(eq).toContain("layoutManual = false");
+  });
+
+  it("정렬·빗질 정의는 seatlayout.ts 한 곳뿐(main.ts 이중 정의 금지 · 규칙이 다시 갈라지지 않게)", () => {
+    expect(code).not.toContain("function roleLayout(");
+    expect(code).not.toContain("function evenComb(");
+    expect(code).not.toContain("function firstWithRole(");
+    expect(code).not.toContain("const rolePri =");
+  });
+
+  it("종료 이벤트: exited·reaped 는 역할 칸을 구멍으로 보류 · closed(의도된 닫기·전출 원본)는 종전대로 뗀다", () => {
+    // ★F3(리뷰1 minor): closed 뿐 아니라 markClosing 으로 표시해 둔 sid(닫기 RPC 대기 중 도착한
+    // exited 경합)도 보류하지 않는다 — 정확한 이유는 아래 F3 전용 검체.
+    expect(code).toContain(
+      'removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));',
+    );
+  });
+
+  it("구멍(음수 sid)은 collectSids 에 나오지 않는다 — 닫기·포커스·RPC 경로가 구멍을 보지 않는다", () => {
+    const i = code.indexOf("function collectSids(");
+    expect(i).toBeGreaterThan(0);
+    const seg = code.slice(i, code.indexOf("\n}\n", i));
+    expect(seg).toContain("node.sid > 0");
+  });
+
+  it("렌더: 보이는 칸이 없으면(구멍만) idle 패널 · 보류 칸은 [새 셸 열기]/[칸 비우기] 손잡이(④ 백지 금지 · 반박 U2 major ⓐ)", () => {
+    expect(code).toContain("nodeShown(");
+    const i = code.indexOf("function renderRoleSlot(");
+    expect(i).toBeGreaterThan(0);
+    const seg = code.slice(i, code.indexOf("\n}\n", i));
+    expect(seg).toContain('"새 셸 열기"');
+    expect(seg).toContain('"칸 비우기"');
+    expect(seg).toContain("newSurface(null, ws.socket, T_NEW)");
+    expect(seg).toContain("roleSlotText(");
+  });
+
+  it("보류 기한은 winScaled(Windows ×2 = 480s) 한 곳", () => {
+    expect(code).toContain("const ROLE_SLOT_GRACE = winScaled(ROLE_SLOT_GRACE_MS)");
+  });
+});
+
+describe("seatlayout.ts — 순수 모듈 격리(import 0 · 부작용 식별자 0 · 구형 WKWebView 문법 0 · 최상위 부수효과 0)", () => {
+  const sl = readFileSync(new URL("./seatlayout.ts", import.meta.url), "utf-8");
+  // 주석과 문자열 리터럴을 걷어낸 코드 본문 — 설명문·문구가 핀을 깨거나 속이지 않게.
+  const body = stripComments(sl).replace(/`[^`]*`|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'/g, '""');
+
+  it("import 문이 없다 — invoke·Tauri·DOM 을 끌어올 경로 자체가 없다(문자열 대신 import 그래프로 핀 · 반박 U2 minor)", () => {
+    expect(/^\s*import\s/m.test(sl)).toBe(false);
+    expect(/\brequire\s*\(/.test(body)).toBe(false);
+  });
+  it("부작용·생성·전송 식별자 0(UI 는 claim·launch·newSurface·send 를 새로 부르지 않는다)", () => {
+    for (const id of ["invoke", "__TAURI__", "window", "document", "localStorage", "setTimeout", "setInterval", "fetch", "newSurface", "claim", "launch", "send"])
+      expect(new RegExp(`\\b${id}\\b`).test(body)).toBe(false);
+  });
+  it("구형 WKWebView 비호환 문법 0(코드 본문 — 주석의 설명문은 세지 않는다 · 문자열·정규식 리터럴은 센다)", () => {
+    const codeOnly = stripComments(sl);
+    for (const bad of ["(?<=", "(?<!", ".at(", "findLast", "structuredClone", "Object.hasOwn", "replaceAll("])
+      expect(codeOnly.includes(bad)).toBe(false);
+  });
+  it("최상위 문장은 선언뿐(export/const/function/type/interface) — 모듈 로드만으로 아무 일도 일어나지 않는다", () => {
+    const tops = sl.split("\n").filter((l) => /^[A-Za-z]/.test(l));
+    expect(tops.length).toBeGreaterThan(10);
+    for (const l of tops) expect(/^(export (const|function|type|interface) |const |function |type |interface )/.test(l)).toBe(true);
   });
 });
