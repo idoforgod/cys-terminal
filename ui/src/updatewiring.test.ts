@@ -29,7 +29,11 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
   it("★update-badge 를 쓰는 곳은 renderUpdateBadge 하나뿐", () => {
     const hits = code.split('"update-badge"').length - 1;
     expect(hits).toBe(1);
-    expect(fnBody("renderUpdateBadge")).toContain('"update-badge"');
+    const body = fnBody("renderUpdateBadge");
+    expect(body).toContain('"update-badge"');
+    // 리뷰1 F2(M-U7/M-U8 공허): hidden 대입 줄 자체를 핀 — 삭제되거나 `badge.hidden = false` 로
+    // 고정돼도(짝 규칙이 아무리 옳아도) 배지가 안 뜨거나 확인 전에도 보이는 회귀를 여기서 잡는다.
+    expect(body).toContain("badge.hidden = v.badge.hidden");
   });
 
   it("종전 이중 원천(updateAvailable · packUpdateAvailable 전역)이 되살아나지 않았다", () => {
@@ -47,8 +51,11 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
     const b = fnBody("refreshUpdateState");
     expect(b).toContain('invoke("check_update")');
     expect(b).toContain('invoke("check_pack_update")');
-    expect(b).toContain("binFromCheck(");
-    expect(b).toContain("packFromCheck(");
+    // 리뷰1 F2(M-U9 공허): 식별자 존재만으로는 `packFromCheck(updState.pack, {status:"none"}, now)`
+    // 처럼 packR 을 버리고 늘 '없음' 으로 고정해도 살아남는다. 실제로 이 확인의 결과(binR·packR)가
+    // 이전 상태(updState.bin·updState.pack)와 함께 들어가는지 인자까지 핀.
+    expect(b).toContain("binFromCheck(updState.bin, binR");
+    expect(b).toContain("packFromCheck(updState.pack, packR");
     expect(code.includes("packCheckFailed = true")).toBe(false);
   });
 
@@ -58,6 +65,9 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
     expect(b).toContain('rpcT(invoke("check_update"), T_UPD_CHECK)');
     expect(b).toContain('rpcT(invoke("check_pack_update"), T_UPD_CHECK)');
     expect(b).toContain("updRefreshInFlight = null"); // finally 에서 반드시 풀린다
+    // 리뷰1 F4: 본체·팩 확인을 동시에 띄운다 — 순차로 되돌리면(둘 다 멈춘 연결일 때) 최악
+    // 2×T_UPD_CHECK 를 기다리는 회귀가 되살아난다.
+    expect(b).toContain("Promise.all([binCheck(), packCheck()])");
   });
 
   it("Update 클릭 = 상태 창(R3) — 캐시로 본체 설치 창부터 여는 분기 금지", () => {
@@ -69,12 +79,28 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
   });
 
   it("no-op 팩 설치는 pack-uptodate 로 받는다(R5) · pack-updated 는 배지를 직접 만지지 않는다", () => {
-    expect(code.includes('listen("pack-uptodate"')).toBe(true);
+    const u = code.indexOf('listen("pack-uptodate"');
+    expect(u).toBeGreaterThan(0);
+    const upSeg = code.slice(u, code.indexOf("});", u));
+    // 리뷰1 F2(M-U6 공허): 리스너 실재만으로는 `packAfterUpToDate(` 를 `packAfterInstalled(` 로
+    // 바꿔치기해도(디스크를 못 읽은 no-op 까지 '최신'으로 접는다 — D3 무력화) 살아남는다. 이
+    // 세그먼트가 실제로 packAfterUpToDate 를 부르는지 핀.
+    expect(upSeg).toContain("packAfterUpToDate(");
+    expect(upSeg.includes("packAfterInstalled(")).toBe(false);
+
     const a = code.indexOf('listen("pack-updated"');
     expect(a).toBeGreaterThan(0);
     const seg = code.slice(a, code.indexOf("});", a));
     expect(seg.includes(".hidden")).toBe(false);
     expect(seg).toContain("packAfterInstalled(");
+  });
+
+  it("창 제목 색은 isLatest 일 때만 ok — 미확인·확인 중을 최신과 같은 초록으로 그리지 않는다(리뷰1 F3)", () => {
+    const b = fnBody("renderUpdatePanel");
+    // v.badge.tone 을 그대로 클래스에 쓰면(중립 '…' 상태의 tone 이 "ok") '확인 중…'이 초록으로
+    // 보인다 — isLatest 가 아닌 "ok" 톤은 muted 로 낮추는 분기가 있어야 한다.
+    expect(b).toContain('v.isLatest ? "ok"');
+    expect(b).toContain('v.badge.tone === "ok" ? "muted"');
   });
 
   it("폴링 주기·silent 불변식 유지 — 시작 1회 + 6시간(새 타이머 0) · silent 경로는 창을 열지 않는다", () => {

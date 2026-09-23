@@ -155,10 +155,15 @@ describe("deriveUpdateView — 대표 상태", () => {
     expect(v.silentToast?.title).toBe("⚠ 업데이트 있음");
   });
 
-  test("pro 채널 거부 → ! · 설치 버튼 없음(누르면 CLI 가 거부하던 경로 차단 · R7)", () => {
+  test("pro 채널 거부 → ! 지만 경보 아님(warn) · 설치 버튼 없음(누르면 CLI 가 거부하던 경로 차단 · R7) · '업데이트가 있지만' 금지(리뷰1 F1 회귀)", () => {
     const v = deriveUpdateView({ bin: BINS[1], pack: PACKS[4], checking: false }, T);
+    // ★F1: v0.14.40 에서 pro 사용자는 회색 중립을 봤다. 이 상태를 빨강 alert 로 되돌리는
+    // 뮤테이션(tone 만 alert 로 바꿔도)은 오너 재현 증상("배지는 뭔가 있다는데 눌러 보면 할 게
+    // 없다")을 되살린다 — 이 단언이 잡는다. 텍스트는 '막힘' 계열 기호 !을 유지하되 톤은 warn.
     expect(v.badge.text).toBe("!");
+    expect(v.badge.tone).toBe("warn");
     expect(v.actions).toEqual([]);
+    expect(v.headline).not.toContain("업데이트가 있지만");
     expect(v.rows[1].text).toContain("pro");
   });
 
