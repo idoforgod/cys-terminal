@@ -594,6 +594,8 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .modal .upd-headline.ok { color: var(--ok); }
 .modal .upd-headline.alert { color: var(--error); }
 .modal .upd-headline.warn { color: var(--warn); }
+/* 리뷰1 F3: 미확인·확인 중('아직 확인 전'·'확인 중…')은 '최신'(ok=초록)과 다른 색이어야 한다. */
+.modal .upd-headline.muted { color: #8b949e; }
 .upd-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; margin: 0 0 10px; font-size: 13px; line-height: 1.5; }
 .upd-row { display: contents; }
 .upd-k { color: #8b949e; white-space: nowrap; }

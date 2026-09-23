@@ -5514,18 +5514,24 @@ function refreshUpdateState(silent: boolean): Promise<void> {
     renderUpdateAll();
     const why = (e: unknown): string =>
       e instanceof Error && e.message === "rpc timeout" ? `응답 시간 초과(${Math.round(T_UPD_CHECK / 1000)}초)` : String(e);
-    let binR: CheckResult;
-    try {
-      binR = { ok: true, value: await rpcT(invoke("check_update"), T_UPD_CHECK) };
-    } catch (e) {
-      binR = { ok: false, error: why(e) };
-    }
-    let packR: CheckResult;
-    try {
-      packR = { ok: true, value: await rpcT(invoke("check_pack_update"), T_UPD_CHECK) };
-    } catch (e) {
-      packR = { ok: false, error: why(e) };
-    }
+    // 리뷰1 F4(선택 · 안전·저비용): 두 invoke 를 동시에 띄운다 — 순차면 둘 다 멈춘 연결일 때 최악
+    // 2×T_UPD_CHECK(윈도우 4×)를 기다렸다. 각자 독립 try/catch 로 실패를 삼키지 않는 것은 그대로다
+    // (단일 비행·확인마다 상한도 무변경 — updRefreshInFlight·rpcT 래핑 자체는 손대지 않는다).
+    const binCheck = async (): Promise<CheckResult> => {
+      try {
+        return { ok: true, value: await rpcT(invoke("check_update"), T_UPD_CHECK) };
+      } catch (e) {
+        return { ok: false, error: why(e) };
+      }
+    };
+    const packCheck = async (): Promise<CheckResult> => {
+      try {
+        return { ok: true, value: await rpcT(invoke("check_pack_update"), T_UPD_CHECK) };
+      } catch (e) {
+        return { ok: false, error: why(e) };
+      }
+    };
+    const [binR, packR] = await Promise.all([binCheck(), packCheck()]);
     const current = await updCurrentVersion();
     const now = Date.now();
     updState = {
@@ -5586,7 +5592,11 @@ function renderUpdatePanel() {
   const head = ov.querySelector(".upd-headline") as HTMLElement | null;
   if (head) {
     head.textContent = v.headline;
-    head.className = "upd-headline " + (v.isLatest ? "ok" : v.actions.length > 0 ? "alert" : v.badge.tone);
+    // 리뷰1 F3: 미확인·확인 중 상태의 badge.tone 은 "ok"(색 없음을 뜻하는 중립)이지만, isLatest 가
+    // 아닌데 "ok" 클래스를 그대로 쓰면 확인 전·확인 중 문구가 '최신'과 같은 초록으로 보인다.
+    // isLatest 일 때만 ok(초록) — 그 밖의 "ok" 톤(미확인·확인 중)은 muted(회색)로 낮춘다.
+    const cls = v.isLatest ? "ok" : v.actions.length > 0 ? "alert" : v.badge.tone === "ok" ? "muted" : v.badge.tone;
+    head.className = "upd-headline " + cls;
   }
   const rowsEl = ov.querySelector(".upd-rows") as HTMLElement | null;
   if (rowsEl) {
