@@ -134,6 +134,21 @@ describe("main.ts 배선 핀", () => {
     expect(f.indexOf("teamFlowBusy = false")).toBeGreaterThan(f.indexOf("finally"));
   });
 
+  // ★성찰 A(minor): teamFlowBusy 는 확인 창~생성 완료를 통으로 잠그지만, notifyTeamFlowBusy() 는
+  //   deptLaunchInFlight 로 "생성 중"과 "확인 창 대기"를 구분해 문구를 고른다(launchDept 만 그
+  //   표지를 세웠다). runTeamProposalFlow 의 생성 구간(addDeptWorkspace await)이 이 표지를 세우지
+  //   않으면, 그 구간에 ⌘K 를 누른 사용자에게 "생성 중"이 아니라 "열려 있는 창을 닫아 주세요"라는
+  //   틀린 안내가 나간다.
+  test("생성 구간(addDeptWorkspace await)은 deptLaunchInFlight 도 함께 세운다(진행 안내 오보 방지)", () => {
+    const f = fnBody("runTeamProposalFlow");
+    const set = f.indexOf("deptLaunchInFlight = true;");
+    const call = f.indexOf("addDeptWorkspace(");
+    const clr = f.indexOf("deptLaunchInFlight = false;");
+    expect(set).toBeGreaterThan(0);
+    expect(call).toBeGreaterThan(set); // 실제 생성 호출 전에 세운다
+    expect(clr).toBeGreaterThan(call); // 성공·실패 무관하게(finally) 되돌린다
+  });
+
   test("진행 중 가드는 openTeamCreateFlow/confirmAndCreateTeam 과 같은 모듈 변수를 공유한다(중복 확인 창 방지)", () => {
     // teamFlowBusy·notifyTeamFlowBusy·deptBtnEl 이 main.ts 안에 정확히 한 번만 선언돼 있어야
     // "공유"다(각 함수가 자기 사본을 따로 선언하면 재진입 가드가 갈라져 두 확인 창이 동시에 뜰 수 있다).

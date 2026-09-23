@@ -193,6 +193,13 @@ describe("loginItemsGuide — 로그인 항목 목록에 실제로 보이는 두
     expect(g).not.toContain("관련 항목");
     expect(g).toContain("누르면");
   });
+  // ★성찰 A(minor): 개발자 이름 줄이 macOS 버전마다 실제로 따로 뜨는지는 화면 표기 가설이다
+  //   (근거 phase1 U14 R8 · 매뉴얼도 헤지한다). 단정("모두 켜 주세요")이 아니라 '(보이면)' 헤지를
+  //   달아야 한다.
+  it("개발자 이름 줄은 '보이면' 으로 헤지한다(단정 금지)", () => {
+    const g = loginItemsGuide();
+    expect(g).toContain(`「${SIGNER_DISPLAY_NAME}」, 보이면`);
+  });
   it("클릭이 붙지 않는 곳(비-macOS)에서는 '누르면 열린다'고 말하지 않는다", () => {
     const g = loginItemsGuide(false);
     expect(g).not.toContain("누르면");

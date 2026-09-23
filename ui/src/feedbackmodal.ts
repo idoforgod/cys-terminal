@@ -409,7 +409,10 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
       `피드백 묶음을 만들었습니다 (번호 ${rep.id}).\n` +
       (mailErr
         ? `메일 앱을 열지 못했습니다(${mailErr}). 아래 주소로 직접 보내 주세요.`
-        : "메일 앱에 받는 주소·제목·내용을 채워 열었습니다. 확인하시고 메일에서 [보내기]를 눌러 주세요.");
+        // ★성찰 A(minor): 프로세스 기동(spawn) 성공만으로 "채워 열었습니다"라고 단정하지 않는다
+        //   — 메일 계정이 없는 맥(설정 마법사 단계)·기본 앱이 없는 윈도우에서는 창이 안 뜰 수
+        //   있는데 그때도 spawn 자체는 성공(mailErr=null)이라 거짓 확언이 된다.
+        : "메일 앱을 여는 중입니다. 새 메일 창이 보이지 않으면 아래 주소로 직접 보내 주세요.");
     q<HTMLElement>(".fb-done-addr").textContent = `받는 주소: ${rep.to}\n제목: ${rep.subject}`;
     const lines: string[] = [];
     if (files > 0) {

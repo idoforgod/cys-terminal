@@ -5121,11 +5121,18 @@ async function runTeamProposalFlow(item: FeedItem): Promise<void> {
       lockedDeptBtn = true;
     }
     let created: Workspace | null;
+    // ★성찰 A(minor): 생성 구간(addDeptWorkspace await)에도 deptLaunchInFlight 를 세운다 —
+    //   notifyTeamFlowBusy() 가 이 표지로 "생성 중"과 "확인 창 대기"를 구분한다(teamFlowBusy 만으로는
+    //   둘 다 true 라 구분이 안 된다). 세우지 않으면 이 구간에 ⌘K 「팀 직접 만들기」를 눌렀을 때
+    //   실제로는 생성 중인데 "열려 있는 창을 먼저 마치거나 닫아 주세요"라고 잘못 안내한다.
+    deptLaunchInFlight = true;
     try {
       created = await addDeptWorkspace(undefined, parsed.spec);
     } catch (e) {
       toast("health", "팀 만들기 실패 — 제안은 그대로 남아 있습니다", teamCreateErrorText(e));
       return;
+    } finally {
+      deptLaunchInFlight = false;
     }
     if (!created) {
       // ★REVIEW1 m5: 생성 도중 placeholder 탭을 닫아 새 데몬을 회수한 경우 — allow 를 보내지
