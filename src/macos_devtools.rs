@@ -639,11 +639,13 @@ mod tests {
     /// 못 찾는다(= 수리 전 버그의 실측 재현 — [`runtime_bin_dirs`](crate::runtime_bin_dirs) 가
     /// macOS 에서만 `Contents/Resources/runtime` 레이아웃을 스캔하므로 다른 호스트에선 애초에
     /// 둘 다 None 이다).
+    // ★컴파일 시점 가드(#[cfg(unix)]) — 런타임 `if !cfg!(unix) { return }` 은 본문의
+    //   std::os::unix·Permissions::from_mode 를 윈도우에서도 **컴파일**시켜 lib 테스트 빌드가
+    //   E0433/E0599 로 죽었다(windows-health run 35886871808 · 2026-09-23). 심링크·실행비트
+    //   의미론은 unix 전용이므로 윈도우에서는 검체 자체를 빼는 것이 맞다.
+    #[cfg(unix)]
     #[test]
     fn canonicalized_exe_parent_resolves_symlinked_launcher_to_bundled_python() {
-        if !cfg!(unix) {
-            return; // 심링크·실행비트 의미론은 unix 전용(윈도우 무접촉 계약 — 이 파일의 다른 unix 게이트 테스트와 동형).
-        }
         // canonicalize the scratch root itself — on macOS `$TMPDIR` lives under a symlink
         // (`/var` → `/private/var`), so comparing against a non-canonicalized `base` would fail
         // for the wrong reason (a *different* symlink than the one this test means to exercise).
