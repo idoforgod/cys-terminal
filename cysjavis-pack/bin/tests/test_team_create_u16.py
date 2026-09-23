@@ -89,6 +89,11 @@ def make_home(tmp):
     _write_exec(os.path.join(bindir, "cysd"),
                 '#!/bin/sh\necho "cysd spawn $CYS_SOCKET" >> "%(log)s"\n'
                 'mkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n' % {"log": log})
+    # seed_agents_account 소스(메인 팩 agents.json — env 맵 구조 · test_dept_name_guard 와 같은 픽스처)
+    pack = os.path.join(home, ".cys", "pack")
+    os.makedirs(pack, exist_ok=True)
+    with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
+        json.dump({"claude": {"cmd": "claude", "env": {"CLAUDE_CONFIG_DIR": "/base"}}}, f)
     return home, log
 
 
