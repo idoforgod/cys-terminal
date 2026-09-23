@@ -1,6 +1,7 @@
 [workspace]
 members = ["src-tauri"]
-# 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)는 워크스페이스 멤버가 아니라 path 의존이다.
+# 벤더링된 portable-pty(ConPTY pane 자식 생성)는 워크스페이스 멤버가 아니라 path 의존이다.
+#   ConPTY 자식에 CREATE_NO_WINDOW 금지 — 29행 참조.
 exclude = ["vendor/portable-pty"]
 
 [package]

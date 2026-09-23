@@ -5992,7 +5992,10 @@ mod spawn_policy_tests {
                     d += 1;
                 }
                 b';' if d == 0 => return k + 1,
-                b',' if d == 0 && !is_item => return k + 1,
+                // `let` 문장은 `;` 에서만 끝난다(위 문서 주석과 일치) — 깊이 0 쉼표로 끊으면
+                // `let r: Result<(), String> = …` 의 제네릭 쉼표에서 가둠 구간이 잘려 census 가
+                // 오탐한다(리뷰1 M1). `let f = |a, b| …` 의 클로저 인자 쉼표도 같은 이유로 보존한다.
+                b',' if d == 0 && !is_item && !is_let => return k + 1,
                 _ => {}
             }
             k += 1;
@@ -6073,7 +6076,12 @@ mod spawn_policy_tests {
             // `else if` 의 분기나 식 위치의 if 는 제외(문장 위치의 if 만).
             let before = skip_ws_back(b, if_at);
             let stmt_pos = before == 0 || matches!(b[before - 1], b';' | b'{' | b'}');
-            if stmt_pos && m[q + 1..then_end].trim_start().starts_with("return") {
+            let then_body = m[q + 1..then_end].trim_start();
+            // `return` 뒤가 식별자 바이트(`return_noop()` 같은 함수 호출)면 조기 반환이 아니다(리뷰1 M13).
+            let is_real_return = then_body.strip_prefix("return").is_some_and(|rest| {
+                rest.as_bytes().first().is_none_or(|c| !is_ident_byte(*c))
+            });
+            if stmt_pos && is_real_return {
                 if let Some((_bo, bc)) = enclosing_block(b, if_at) {
                     gates.push(CfgGate { start: then_end + 1, end: bc, pred: format!("not({eff})") });
                 }
@@ -6567,6 +6575,53 @@ mod spawn_policy_tests {
         out
     }
 
+    /// ★U5 m1(리뷰1): `Command` 별칭(`use … Command as X` · `type X = …Command`)을 금지한다.
+    /// census 의 바늘은 `Command::new(` 리터럴이라 별칭 뒤(`X::new(`)에 숨은 스폰은 보지 못한다
+    /// (리뷰1 M12 재현 — 별칭을 바늘에 추가하는 대신, 별칭 자체를 census 대상에서 금지해 닫는다).
+    fn forbidden_command_aliases(files: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, src) in files {
+            let m = mask_code(src);
+            let b = m.as_bytes();
+            // `use … Command as X` (import alias) — 온전한 단어 `Command` 뒤에 ` as ` 가 오면 별칭이다.
+            for (at, _) in m.match_indices("Command") {
+                if at > 0 && is_ident_byte(b[at - 1]) {
+                    continue; // `CommandBuilder` 등 접두 단어는 제외
+                }
+                let after = at + "Command".len();
+                if b.get(after).is_some_and(|c| is_ident_byte(*c)) {
+                    continue;
+                }
+                if m[after..].trim_start().starts_with("as ") {
+                    out.push(format!(
+                        "{name}:{} `Command as` 별칭 — census 바늘이 이 별칭 뒤 스폰을 보지 못한다",
+                        line_of(src, at)
+                    ));
+                }
+            }
+            // `type X = …Command;` (타입 별칭)
+            let mut from = 0usize;
+            while let Some(rel) = m[from..].find("type ") {
+                let at = from + rel;
+                from = at + 1;
+                if at > 0 && is_ident_byte(b[at - 1]) {
+                    continue;
+                }
+                let Some(semi_rel) = m[at..].find(';') else { continue };
+                let stmt = &m[at..at + semi_rel];
+                let Some(eq) = stmt.find('=') else { continue };
+                let rhs = stmt[eq + 1..].trim();
+                if rhs == "Command" || rhs.ends_with("::Command") {
+                    out.push(format!(
+                        "{name}:{} `type … = …Command` 별칭 — census 바늘이 이 별칭 뒤 스폰을 보지 못한다",
+                        line_of(src, at)
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// ★U5 핵심 핀: 콘솔 없는 cysd·cys-app(과 공용 lib)의 모든 `Command::new(` 는 창 정책을 걸었거나,
     /// 윈도우 프로덕션 빌드에서 도달 불가(cfg)거나, GUI 대상(explorer)이다.
     ///
@@ -6586,6 +6641,14 @@ mod spawn_policy_tests {
             assert!(names.contains(&must), "census 가 {must} 를 보지 못한다 — 시야가 먼 초록은 근거가 아니다");
         }
         assert!(!names.contains(&"src/bin/cys.rs"), "콘솔 CLI(cys.rs)가 대상에 섞였다 — ConsoleScoped 계약과 충돌");
+        let aliases = forbidden_command_aliases(&files);
+        assert!(
+            aliases.is_empty(),
+            "census 대상 파일에 `Command` 별칭이 있다 — census 바늘(`Command::new(`)이 별칭 뒤 스폰을 보지 \
+             못해 창 정책 누락이 조용히 통과한다(리뷰1 M12). `std::process::Command` 를 직접 쓰거나 \
+             hide_console/no_console 래퍼로 감싸라:\n{}",
+            aliases.join("\n")
+        );
         let sites = consoleless_census(&files);
         let bad: Vec<String> = sites
             .iter()
@@ -6717,6 +6780,46 @@ mod spawn_policy_tests {
              let out = std::process::Command::new(\"lsof\").output().ok()?;\n    None\n}\n",
         );
         assert!(is_violation(&i2[0]), "ⓘ 반환 없는 cfg! 블록 뒤를 가둠으로 오판: {i2:?}");
+        // …`return_noop()` 처럼 `return` 으로 시작하는 함수 **호출**은 조기 반환이 아니다(리뷰1 M13).
+        let i3 = census_of(
+            "fn f() {\n    if cfg!(windows) {\n        return_noop();\n    }\n    \
+             let out = std::process::Command::new(\"lsof\").output();\n}\n",
+        );
+        assert!(is_violation(&i3[0]), "ⓘ `return_noop()` 호출을 조기 반환으로 오인해 가둠 처리했다: {i3:?}");
+        // ⓣ 제네릭 반환형이 있는 타입 표기 `let` 문장의 cfg 가둠(리뷰1 M1 · WP-D open_privacy_settings 형태) —
+        // `Result<(), String>` 의 제네릭 쉼표를 문장 끝으로 오판하면 안 된다.
+        let t = census_of(
+            "fn f() {\n    #[cfg(target_os = \"macos\")]\n    let r: Result<(), String> = \
+             std::process::Command::new(\"/usr/bin/open\").arg(p).spawn().map(|_| ()).map_err(|e| e.to_string());\n}\n",
+        );
+        assert!(t.len() == 1 && matches!(t[0], SpawnVerdict::Gated(_)), "ⓣ 타입 표기 let 문장의 cfg 가둠: {t:?}");
+        // …클로저 인자 쉼표(`|a, b|`)도 같은 이유로 문장 끝으로 오판하면 안 된다.
+        let t2 = census_of(
+            "fn f() {\n    #[cfg(target_os = \"macos\")]\n    let r = {\n        let apply = |a, b| a + b;\n        \
+             std::process::Command::new(\"open\").arg(apply(1, 2).to_string()).spawn()\n    };\n}\n",
+        );
+        assert!(t2.len() == 1 && matches!(t2[0], SpawnVerdict::Gated(_)), "ⓣ 클로저 인자 쉼표의 cfg 가둠: {t2:?}");
+        // ── 별칭 금지(리뷰1 M12) — `Command as` 별칭 임포트·`type` 별칭은 census 대상 파일에서 금지된다.
+        let alias_import = forbidden_command_aliases(&[(
+            "<합성>".to_string(),
+            "use std::process::Command as TCmd;\nfn f() {\n    let _ = TCmd::new(\"cmd\").output();\n}\n"
+                .to_string(),
+        )]);
+        assert_eq!(alias_import.len(), 1, "`Command as` 별칭 임포트를 놓쳤다: {alias_import:?}");
+        let alias_type = forbidden_command_aliases(&[(
+            "<합성>".to_string(),
+            "type TCmd = std::process::Command;\nfn f() {\n    let _ = TCmd::new(\"cmd\").output();\n}\n"
+                .to_string(),
+        )]);
+        assert_eq!(alias_type.len(), 1, "`type … = …Command` 별칭을 놓쳤다: {alias_type:?}");
+        assert!(
+            forbidden_command_aliases(&[(
+                "<합성>".to_string(),
+                "fn f(cmd: &mut std::process::Command) { let _ = cmd; }\n".to_string()
+            )])
+            .is_empty(),
+            "`Command` 를 언급만 하는 정상 코드를 별칭으로 오판했다"
+        );
         // ⓙ `if cfg!(windows) {A} else {B}` — B 는 가둠, A 는 판정 대상(accounts.rs 형태)
         let j = census_of(
             "fn f() {\n    let fut = if cfg!(windows) {\n        tokio::process::Command::new(\"cmd\").args([\"/C\", c]).output()\n    \
@@ -6828,18 +6931,58 @@ mod spawn_policy_tests {
         }
     }
 
+    /// hex 토큰이 **creation-flag 문맥**에 있는가(리뷰1 m5) — ① `creation_flags(` 호출의 인자 안이거나
+    /// ② `const`/`static` 정의문의 좌변 이름에 `PROCESS`·`CONSOLE` 이 들어간 플래그 상수 선언 안.
+    /// 문맥 밖의 hex(예: `FILE_ATTRIBUTE_DIRECTORY = 0x00000010`)는 무관한 Win32 상수라 걸지 않는다.
+    fn hex_in_creation_flag_context(m: &str, at: usize) -> bool {
+        let b = m.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = m[from..].find("creation_flags(") {
+            let call_at = from + rel;
+            from = call_at + 1;
+            if call_at > 0 && is_ident_byte(b[call_at - 1]) {
+                continue;
+            }
+            let po = call_at + "creation_flags".len();
+            if let Some(pc) = match_fwd(b, po, b'(', b')') {
+                if po <= at && at < pc {
+                    return true;
+                }
+            }
+        }
+        let stmt_start = m[..at].rfind([';', '{', '}']).map_or(0, |p| p + 1);
+        let stmt_end = m[at..].find(';').map_or(m.len(), |p| at + p + 1);
+        let stmt = m[stmt_start..stmt_end].trim_start();
+        let is_flag_const = (stmt.starts_with("const ")
+            || stmt.starts_with("pub const ")
+            || stmt.starts_with("static ")
+            || stmt.starts_with("pub static "))
+            && (stmt.contains("PROCESS") || stmt.contains("CONSOLE"));
+        is_flag_const
+    }
+
     /// 콘솔을 **떼어 내는** 생성 flag(자손 전부가 번쩍이게 만든다)가 프로덕션에 0건인가 — 코드 안(주석·문자열
-    /// 제외)의 `DETACHED_PROCESS`·`CREATE_NEW_CONSOLE` 이름과 그 값의 hex 표기.
+    /// 제외)의 `DETACHED_PROCESS`·`CREATE_NEW_CONSOLE` 이름과, **creation-flag 문맥**의 그 값 hex 표기
+    /// (리뷰1 m5 — 문맥 없이 전역으로 걸면 무관한 미래 Win32 상수와 충돌한다).
     fn detaching_flag_hits(src: &str) -> Vec<String> {
         let m = mask_code(src);
         let gates = collect_cfg_gates(src, &m);
+        let hidden = |at: usize| gates.iter().any(|g| g.start <= at && at < g.end && g.pred.trim() == "test");
         let mut out = Vec::new();
-        for tok in ["DETACHED_PROCESS", "CREATE_NEW_CONSOLE", "0x0000_0008", "0x00000008", "0x0000_0010", "0x00000010"] {
+        for tok in ["DETACHED_PROCESS", "CREATE_NEW_CONSOLE"] {
             for (at, _) in m.match_indices(tok) {
-                if gates.iter().any(|g| g.start <= at && at < g.end && g.pred.trim() == "test") {
+                if hidden(at) {
                     continue;
                 }
                 out.push(format!("{}행 `{tok}`", line_of(src, at)));
+            }
+        }
+        for tok in ["0x0000_0008", "0x00000008", "0x0000_0010", "0x00000010"] {
+            for (at, _) in m.match_indices(tok) {
+                if hidden(at) || !hex_in_creation_flag_context(&m, at) {
+                    continue;
+                }
+                out.push(format!("{}행 `{tok}`(creation flag 문맥)", line_of(src, at)));
             }
         }
         out
@@ -6855,6 +6998,22 @@ mod spawn_policy_tests {
         assert_eq!(detaching_flag_hits("fn f(c: &mut C) { c.creation_flags(0x0000_0010); }\n").len(), 1);
         assert!(detaching_flag_hits("// DETACHED_PROCESS 는 금지\nconst S: &str = \"CREATE_NEW_CONSOLE\";\n").is_empty());
         assert!(detaching_flag_hits("#[cfg(test)]\nmod t {\n    const X: u32 = DETACHED_PROCESS;\n}\n").is_empty());
+        // 리뷰1 m5: PROCESS/CONSOLE 계열 상수 정의의 hex 는 문맥으로 잡는다 …
+        assert_eq!(
+            detaching_flag_hits("const HIDDEN_PROCESS_FLAG: u32 = 0x0000_0008;\n").len(),
+            1,
+            "PROCESS 계열 상수 정의 문맥의 hex 를 놓쳤다"
+        );
+        // …그러나 creation-flag 문맥도 PROCESS/CONSOLE 이름도 아닌 무관한 Win32 상수는 오탐하지 않는다
+        // (리뷰1 예시: FILE_ATTRIBUTE_DIRECTORY = 0x00000010).
+        assert!(
+            detaching_flag_hits("const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x00000010;\n").is_empty(),
+            "무관한 Win32 상수(FILE_ATTRIBUTE_DIRECTORY)를 콘솔 분리 flag 로 오판했다"
+        );
+        assert!(
+            detaching_flag_hits("fn f() { let flags = 0x0000_0008; let _ = flags; }\n").is_empty(),
+            "creation_flags(·PROCESS/CONSOLE 상수 어느 문맥도 아닌 bare hex 를 오판했다"
+        );
         let mut files = spawn_scan_files();
         files.extend(rs_files_under("src-tauri/src"));
         assert!(files.iter().any(|(n, _)| n == "src/bin/cys.rs"), "콘솔 CLI 도 이 금지의 대상이다(시야 확인)");
@@ -6920,6 +7079,19 @@ mod spawn_policy_tests {
         assert!(
             comment.contains("CREATE_NO_WINDOW 금지"),
             "Cargo.toml portable-pty 주석에 ConPTY 자식 CREATE_NO_WINDOW 금지 문구가 없다:\n{comment}"
+        );
+        // 리뷰1 m2: 바로 위 블록만 보면 다른 곳(예: 워크스페이스 `exclude` 옆 주석)에 같은 함정 문구가
+        // 남아도 놓친다 — Cargo.toml 전체 주석 줄에서 "flash 수정"·"flash 차단"·"CREATE_NO_WINDOW 추가"
+        // 를 금지한다(실제로 3행에 "flash 수정 패치"가 남아 있었다 — "flash 차단"만 보던 위 검사를 통과했다).
+        let stray: Vec<&str> = cargo
+            .lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("flash 수정") || l.contains("flash 차단") || l.contains("CREATE_NO_WINDOW 추가"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "Cargo.toml 주석에 ConPTY 'CREATE_NO_WINDOW 추가/flash 수정·차단' 함정 문구가 남아 있다 — \
+             검은 창을 쫓는 사람을 ④ 검은 pane 회귀로 이끈다: {stray:?}"
         );
     }
 }
