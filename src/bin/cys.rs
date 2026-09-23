@@ -14821,7 +14821,7 @@ fn run_claim_role(
                 if role == "master" {
                     eprintln!(
                         "[claim-role] 새 부서장을 세우려는 경우: 이 프로세스가 직접 GUI 로 부서를 만들 \
-                         수는 없다(U16/U17 이후 현실) — 기존 대표(master)에게 말로 부탁해 \
+                         수는 없다 — 기존 대표(master)에게 말로 부탁해 \
                          `cys team-propose --name … --purpose …` 로 제안하게 하거나, 오너가 GUI \
                          '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너의 앱 확인 창에서만 \
                          — 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
