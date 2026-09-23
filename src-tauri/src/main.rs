@@ -6465,6 +6465,35 @@ async fn install_pack_update(
     Ok(pack_version)
 }
 
+/// ★U4-B2③ 사이드카 결과 토큰의 3상 판독.
+/// `Measured` = 재주입을 실제로 돌고 센 결과 · `Skipped` = 재주입 자체를 못 했다(데몬 RPC 실패 등 —
+/// 디스크 팩만 바뀌고 라이브 노드는 옛 지침) · `Absent` = 토큰 없음(이미 최신 no-op 등 재주입 단계 미도달).
+#[derive(Debug, PartialEq)]
+enum ReinjectResult {
+    Measured { failed: u64, deferred: u64 },
+    Skipped { reason: String },
+    Absent,
+}
+
+/// RED 골격: 종전 의미(토큰이 있으면 수치 · 없으면 부재) — `reinject=skipped` 를 모른다.
+fn parse_reinject_result(stdout: &str) -> ReinjectResult {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(cys::pack::REINJECT_RESULT_PREFIX) {
+            let (mut failed, mut deferred) = (0u64, 0u64);
+            for tok in rest.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("failed=") {
+                    failed = v.parse().unwrap_or(0);
+                } else if let Some(v) = tok.strip_prefix("deferred=") {
+                    deferred = v.parse().unwrap_or(0);
+                }
+            }
+            return ReinjectResult::Measured { failed, deferred };
+        }
+    }
+    ReinjectResult::Absent
+}
+
 /// 사이드카(cys pack-update) stdout에서 `PACK_UPDATE_RESULT … failed=N deferred=N` 토큰을 파싱해
 /// (failed, deferred)를 돌려준다. 토큰 부재(구버전 사이드카·reinject 스킵 등)면 (0,0) — 보수적.
 /// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다.
@@ -8232,6 +8261,52 @@ mod tests {
         assert_eq!(
             parse_reinject_counts("PACK_UPDATE_RESULT pack_version=1.2.3 injected=0 skipped=0 deferred=2 failed=0"),
             (0, 2)
+        );
+    }
+
+    /// ★U4-B2③ 핀: 사이드카가 재주입을 **못 했다**고 적으면(`reinject=skipped`) 브리지는 그것을
+    /// 수치 (0,0) = '완전 성공'으로 읽지 않는다 — 3상 판독. 토큰 부재(이미 최신 no-op)는 종전대로 무경고.
+    #[test]
+    fn parse_reinject_result_distinguishes_skipped_from_success() {
+        assert_eq!(
+            parse_reinject_result(
+                "[pack-update] 팩 2.0.0 반영 완료\nPACK_UPDATE_RESULT pack_version=2.0.0 reinject=skipped reason=daemon_rpc_failed\n"
+            ),
+            ReinjectResult::Skipped { reason: "daemon_rpc_failed".into() }
+        );
+        assert_eq!(
+            parse_reinject_result("PACK_UPDATE_RESULT pack_version=2.0.0 injected=2 skipped=1 deferred=3 failed=4"),
+            ReinjectResult::Measured { failed: 4, deferred: 3 },
+            "노드 카운트 skipped=N 을 재주입 스킵으로 오독하면 안 된다"
+        );
+        assert_eq!(parse_reinject_result("[pack-update] 이미 최신 — 반영 0. no-op.\n"), ReinjectResult::Absent);
+        assert_eq!(parse_reinject_result(""), ReinjectResult::Absent);
+        // 사유 누락도 스킵이다(사유는 표시용일 뿐 판정 축이 아니다).
+        assert_eq!(
+            parse_reinject_result("PACK_UPDATE_RESULT pack_version=2.0.0 reinject=skipped"),
+            ReinjectResult::Skipped { reason: "unknown".into() }
+        );
+        // 기존 수치 판독기는 무회귀 — 스킵은 수치가 아니다(0,0).
+        assert_eq!(
+            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=2.0.0 reinject=skipped reason=daemon_rpc_failed"),
+            (0, 0)
+        );
+    }
+
+    /// ★U4-B2③ 소스 핀: 스킵이면 `update-warning` 을 띄우고 `pack-updated` 에 `reinject_skipped` 를
+    /// 실어 완료 토스트가 '재주입 완료'로 단정하지 않게 한다. 종료코드 판정(degraded/실패)은 무변경.
+    #[test]
+    fn install_pack_update_warns_on_reinject_skip_source_pin() {
+        let src = include_str!("main.rs");
+        let at = src.find("async fn install_pack_update(").expect("install_pack_update 소실");
+        let end = at + src[at..].find("\n}\n").expect("fn 끝");
+        let body = &src[at..end];
+        assert!(body.contains("parse_reinject_result(&stdout)"), "3상 판독을 쓰지 않는다");
+        assert!(body.contains("ReinjectResult::Skipped"), "스킵 갈래가 없다");
+        assert!(body.contains("\"reinject_skipped\""), "pack-updated 에 스킵 표식이 없다");
+        assert!(
+            body.contains("out.status.code() == Some(cys::pack::EXIT_REINJECT_DEGRADED)"),
+            "종료코드 판정이 바뀌었다(범위 밖)"
         );
     }
 

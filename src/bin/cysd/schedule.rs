@@ -1006,6 +1006,54 @@ fn mem_record(id: &str, ts: i64) {
     }
 }
 
+/// 잡 1회 발화의 **결과 종류**(U4-B2① — 드러내기 전용).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobResultKind {
+    Ok,
+    Skipped,
+    Queued,
+    Error,
+    Timeout,
+}
+
+/// 원장 항목 수 상한(코드로 박힌 상한).
+const JOB_RESULT_LEDGER_CAP: usize = 256;
+/// `last_detail` 절단 길이(문자 수).
+const JOB_RESULT_DETAIL_MAX_CHARS: usize = 200;
+
+#[derive(Clone, Debug, Default)]
+struct JobResultEntry {
+    last_result: Option<JobResultKind>,
+    last_result_at: i64,
+    last_ok_at: Option<i64>,
+    last_detail: String,
+    consecutive_non_ok: u64,
+    consecutive_failures: u64,
+}
+
+#[derive(Debug, Default)]
+struct JobResultLedger {
+    entries: HashMap<String, JobResultEntry>,
+}
+
+impl JobResultLedger {
+    fn record(&mut self, _id: &str, _kind: JobResultKind, _detail: &str, _now: i64) {
+        unimplemented!("U4-B2① RED — GREEN 커밋에서 구현")
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, id: &str) -> Option<&JobResultEntry> {
+        self.entries.get(id)
+    }
+}
+
+fn classify_fire_result(_result: &Result<String, String>) -> JobResultKind {
+    unimplemented!("U4-B2① RED — GREEN 커밋에서 구현")
+}
+
 /// 상태 저장 — **원자쓰기(tmp+rename)** 로 반쪽 파일을 남기지 않는다(ensure_builtin_jobs 관례와 동일).
 /// 종전 `fs::write` 는 create(성공)+write_all(실패) 사이에서 **0바이트 파일**을 남길 수 있었고,
 /// 그 파일은 다음 tick 에 파싱 실패→손상 격리→재시드 루프의 씨앗이 됐다.
@@ -4043,5 +4091,189 @@ exit 0
 
         // ④ 전역 버전은 이 이관으로 올라가지 않는다(범프 = 모든 builtin 통째 교체).
         assert_eq!(BUILTIN_JOBS_VERSION, 2, "표적 이관에 전역 버전을 올렸다(§B-5 위반)");
+    }
+
+}
+
+/// ★U4-B2①(0.14.41) 스케줄 잡 결과 원장 검체 — 메모리 전용 · 드러내기만.
+#[cfg(test)]
+mod b2_job_results {
+    use super::tests::test_daemon;
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ───────── U4-B2① 스케줄 잡 결과 원장(메모리 전용 · 드러내기만) ─────────
+
+    fn b2_unique(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "b2-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn job(time: Option<&str>, days: &[&str]) -> Job {
+        Job {
+            id: "t".into(),
+            time: time.map(|s| s.to_string()),
+            every_minutes: None,
+            at: None,
+            close_after_secs: None,
+            days: days.iter().map(|s| s.to_string()).collect(),
+            action: "push".into(),
+            to: None,
+            text: None,
+            text_command: None,
+            command: None,
+            if_absent: None,
+            fresh: false,
+            base_only: false,
+            via_queue: false,
+            launch: None,
+        }
+    }
+
+    fn b2_cmd_job(id: &str, cmd: &str) -> Job {
+        let mut j = job(None, &[]);
+        j.id = id.into();
+        j.action = "command".into();
+        j.command = Some(cmd.into());
+        j
+    }
+
+    /// ★U4-B2① 핀: 주기 잡이 매번 실패해도 `schedule list` 에는 '제때 발화'만 보였다
+    /// (`last_fired` 는 발화 **전** 기록 · 결과 필드 0). 결과 원장이 `status()`(= `schedule.status`
+    /// RPC = `cys schedule list`)로 드러나야 한다 — 실패 연속 계수 · 성공 재설정 · skip 구분.
+    /// ★개정 전 소스에서는 적색이다(`job_results` 키 부재).
+    #[tokio::test(flavor = "current_thread")]
+    async fn schedule_job_results_expose_failure_streak_and_reset() {
+        let daemon = test_daemon();
+        let id = b2_unique("fail");
+        for _ in 0..3 {
+            fire(Arc::clone(&daemon), b2_cmd_job(&id, "exit 3")).await;
+        }
+        let st = status(&daemon);
+        let r = &st["job_results"][id.as_str()];
+        assert_eq!(r["last_result"].as_str(), Some("error"), "{st}");
+        assert_eq!(r["consecutive_failures"].as_u64(), Some(3), "{r}");
+        assert_eq!(r["consecutive_non_ok"].as_u64(), Some(3), "{r}");
+        assert!(r["last_ok_at"].is_null(), "성공한 적이 없으면 null 이다(0 으로 위장 금지): {r}");
+        assert!(r["last_result_at"].as_i64().is_some(), "{r}");
+        assert!(
+            r["last_detail"].as_str().unwrap_or("").contains('3'),
+            "실패 사유(종료코드)가 남아야 한다: {r}"
+        );
+        // 성공 1회 → 두 연속 계수 재설정 + last_ok_at 기록(재무장).
+        fire(Arc::clone(&daemon), b2_cmd_job(&id, "exit 0")).await;
+        let st = status(&daemon);
+        let r = &st["job_results"][id.as_str()];
+        assert_eq!(r["last_result"].as_str(), Some("ok"), "{r}");
+        assert_eq!(r["consecutive_failures"].as_u64(), Some(0), "{r}");
+        assert_eq!(r["consecutive_non_ok"].as_u64(), Some(0), "{r}");
+        assert!(r["last_ok_at"].as_i64().is_some(), "{r}");
+        // skip(대상 역할 부재 · if_absent=skip)은 실패가 아니지만 ok 도 아니다(D2 — 거짓 OK 금지).
+        let sid = b2_unique("skip");
+        let mut p = job(None, &[]);
+        p.id = sid.clone();
+        p.to = Some("b2-nobody".into());
+        p.text = Some("[b2] x".into());
+        p.if_absent = Some("skip".into());
+        for _ in 0..2 {
+            fire(Arc::clone(&daemon), p.clone()).await;
+        }
+        let st = status(&daemon);
+        let r = &st["job_results"][sid.as_str()];
+        assert_eq!(r["last_result"].as_str(), Some("skipped"), "{r}");
+        assert_eq!(r["consecutive_non_ok"].as_u64(), Some(2), "{r}");
+        assert_eq!(r["consecutive_failures"].as_u64(), Some(0), "skip 은 실패로 세지 않는다: {r}");
+        assert!(r["last_ok_at"].is_null(), "{r}");
+    }
+
+    /// ★U4-B2① 핀: 결과 5분류 — `Ok` 팔이라도 적재(queued)·건너뜀(skipped)은 성공(ok)이 아니다
+    /// (반박 D2), 시간초과(timeout)는 오류(error)와 따로 센다(반박 D11 — formation 600s 오보 구분).
+    #[test]
+    fn classify_fire_result_five_kinds() {
+        use JobResultKind as K;
+        let ok = |s: &str| classify_fire_result(&Ok(s.to_string()));
+        let err = |s: &str| classify_fire_result(&Err(s.to_string()));
+        assert_eq!(ok("command exit=Some(0)"), K::Ok);
+        assert_eq!(ok("pushed to master (surface:3)"), K::Ok);
+        assert_eq!(ok("fresh-launched and pushed (surface:9)"), K::Ok);
+        assert_eq!(ok("queued to cso (surface:4)"), K::Queued);
+        assert_eq!(ok("fresh-launched and queued (surface:9)"), K::Queued);
+        assert_eq!(ok("skipped: role 'cso' absent (if_absent=skip)"), K::Skipped);
+        assert_eq!(err("command timed out (600s)"), K::Timeout);
+        assert_eq!(err("launch-agent timed out (180s)"), K::Timeout);
+        assert_eq!(err("text_command 30초 타임아웃"), K::Timeout);
+        assert_eq!(err("command 비정상 종료(Some(3)): boom"), K::Error);
+        assert_eq!(err("role 'x' absent (set if_absent=launch|skip)"), K::Error);
+    }
+
+    /// ★U4-B2① 소스 핀: 분류기가 읽는 문안은 **생산자의 문안 그대로**여야 한다 — 한쪽만 바뀌면
+    /// 적재가 성공으로(또는 시간초과가 오류로) 조용히 접힌다.
+    #[test]
+    fn classify_fire_result_matches_producer_wording() {
+        let src = include_str!("schedule.rs");
+        for needle in [
+            "format!(\"skipped: role '{to}' absent (if_absent=skip)\")",
+            "format!(\"{how} to {to} (surface:{sid})\")",
+            "format!(\"fresh-launched and {how} (surface:{sid})\")",
+            ".map(|_| \"queued\")",
+            "return Ok(\"pushed\");",
+            "\"command timed out (600s)\"",
+            "\"launch-agent timed out (180s)\"",
+            "\"text_command 30초 타임아웃\"",
+        ] {
+            assert!(src.contains(needle), "생산자 문안이 바뀌었다 — 분류기와 함께 고쳐라: {needle}");
+        }
+    }
+
+    /// ★U4-B2① 핀: 원장은 **상한이 있고**(오래된 항목부터 밀려남) 사유 문안은 절단된다.
+    #[test]
+    fn job_result_ledger_is_bounded_and_truncates_detail() {
+        let mut l = JobResultLedger::default();
+        for i in 0..(JOB_RESULT_LEDGER_CAP + 10) {
+            l.record(&format!("j{i}"), JobResultKind::Ok, "x", i as i64);
+        }
+        assert_eq!(l.len(), JOB_RESULT_LEDGER_CAP);
+        assert!(l.get("j0").is_none(), "가장 오래된 항목부터 밀려나야 한다");
+        assert!(l.get(&format!("j{}", JOB_RESULT_LEDGER_CAP + 9)).is_some());
+        // 이미 있는 id 의 갱신은 밀어내기를 일으키지 않는다.
+        let keep = format!("j{}", JOB_RESULT_LEDGER_CAP + 9);
+        l.record(&keep, JobResultKind::Error, &"가".repeat(1000), 10_000);
+        assert_eq!(l.len(), JOB_RESULT_LEDGER_CAP);
+        let e = l.get(&keep).unwrap();
+        assert_eq!(e.last_detail.chars().count(), JOB_RESULT_DETAIL_MAX_CHARS);
+        assert_eq!(e.consecutive_failures, 1);
+        assert_eq!(e.last_ok_at, Some((JOB_RESULT_LEDGER_CAP + 9) as i64), "직전 성공 시각 보존");
+    }
+
+    /// ★U4-B2① 소스 핀(반박 D1·설계 §3 B2①): 원장은 **메모리 전용**이다 — `schedule_state.json`
+    /// 에 두 번째 writer 가 생기면 고정 tmp 이름 경합으로 손상 격리→재시드 계급(앵커 ③)이 다시 열린다.
+    /// 그리고 원장은 **발화 판정에 쓰이지 않는다**(드러내기만 — 발화 억제·지연 0).
+    #[test]
+    fn job_result_ledger_is_memory_only_and_never_gates_firing() {
+        let src = include_str!("schedule.rs");
+        let at = src.find("impl JobResultLedger {").expect("원장 impl 소실");
+        let end = at + src[at..].find("\n}\n").expect("impl 끝");
+        let body = &src[at..end];
+        assert!(
+            !body.contains("std::fs") && !body.contains("save_state") && !body.contains("File::"),
+            "결과 원장이 디스크에 쓴다 — 메모리 전용 계약 위반"
+        );
+        let st = src.find("struct ScheduleState {").expect("ScheduleState 소실");
+        let st_end = st + src[st..].find("\n}\n").expect("struct 끝");
+        let st_body = &src[st..st_end];
+        assert!(
+            !st_body.contains("job_result") && !st_body.contains("consecutive"),
+            "영속 스키마에 결과 필드가 들어갔다(두 번째 writer 계급)"
+        );
+        let t = src.find("\nfn scheduler_tick(").expect("scheduler_tick 소실");
+        let t_end = t + 1 + src[t + 1..].find("\n}\n").expect("tick 끝");
+        assert!(
+            !src[t..t_end].contains("job_result"),
+            "발화 판정이 결과 원장을 읽는다 — 드러내기 전용 계약 위반(발화 억제 금지)"
+        );
     }
 }

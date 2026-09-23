@@ -6655,6 +6655,9 @@ struct DoctorCtx {
     /// `%LOCALAPPDATA%\cys`). `runtime-seal` 이 동봉 런타임 트리를 찾는 두 번째 후보다.
     /// 해소 실패면 None = 그 후보를 보지 않는다(추측 경로를 만들지 않는다).
     exe_dir: Option<std::path::PathBuf>,
+    /// ★U4-B2④ 각성 훅의 **실소비** config 폴더(`${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}` —
+    /// `cys::resolve_claude_config_dir()`). hook 진단의 1차 대조 표면이다.
+    consumed_config_dir: std::path::PathBuf,
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
@@ -7434,6 +7437,17 @@ fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     };
     drop(_guard); // 여기서 flock 해제 — 판정~삭제 전 구간을 보유했다.
     item
+}
+
+/// ★U4-B2⑦ 플랫폼 미해당 진단 항목 — RED 골격: 종전과 같은 Ok.
+#[cfg_attr(unix, allow(dead_code))]
+fn diag_platform_unsupported(name: &'static str, what: &str) -> DiagItem {
+    DiagItem {
+        name,
+        status: DiagStatus::Ok,
+        detail: format!("{what}은 unix 전용(skip)"),
+        action: String::new(),
+    }
 }
 
 #[cfg(not(unix))]
@@ -8711,6 +8725,7 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
         exe_dir: std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf())),
+        consumed_config_dir: std::path::PathBuf::from(cys::resolve_claude_config_dir()),
     };
     let items = run_doctor_diagnostics(&ctx, fix);
     let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
@@ -17148,9 +17163,41 @@ fn drain_verify_fanout(
     })
 }
 
+/// ★U4-B2②: drain --verify 에서 **도달하지 못한 데몬**의 두 갈래.
+/// `Down` = 연결(unix connect·Windows 파이프 open) 자체가 실패 — 데몬이 없다. PTY 자식은 데몬과 함께
+/// 죽으므로 저장할 대상이 없다 → 정보성 표기만(`all_saved` 무영향 · 반박 D5 경보 피로 방지).
+/// `Unresponsive` = 연결은 됐는데 `org.status` 가 상한 안에 쓸 수 있는 응답을 주지 않았다 — 데몬(과
+/// 그 노드들)은 살아 있을 수 있는데 저장 신호를 한 번도 못 받았다 → `all_saved=false`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnreachableKind {
+    Down,
+    Unresponsive,
+}
+
+impl UnreachableKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            UnreachableKind::Down => "down",
+            UnreachableKind::Unresponsive => "unresponsive",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnreachableDaemon {
+    dept: String,
+    display: String,
+    socket: std::path::PathBuf,
+    kind: UnreachableKind,
+    detail: String,
+}
+
+/// 보고서에 도달 불가 데몬을 싣는다(U4-B2②) — RED 골격: 아직 아무것도 하지 않는다.
+fn drain_verify_merge_unreachable(_report: &mut Value, _unreachable: &[UnreachableDaemon]) {}
+
 /// depts.json + 본부 소켓을 순회해 verify 대상(살아있는 AI 역할 노드)을 수집한다(run_fleet 소스 동형).
-/// 도달불가(다운) 부서·본부는 스킵(정상 정보). live_cwd는 org.status의 노드별 cd 추적값을 그대로 쓴다.
-fn drain_verify_targets() -> Vec<VerifyTarget> {
+/// live_cwd는 org.status의 노드별 cd 추적값을 그대로 쓴다.
+fn drain_verify_targets() -> (Vec<VerifyTarget>, Vec<UnreachableDaemon>) {
     let home = cys::home_dir().to_string_lossy().into_owned();
     let mut sockets: Vec<(std::path::PathBuf, String, String)> =
         vec![(socket_path(), "main".to_string(), "본부 · CEO".to_string())];
@@ -17173,14 +17220,18 @@ fn drain_verify_targets() -> Vec<VerifyTarget> {
             }
         }
     }
+    drain_verify_collect(sockets, std::time::Duration::from_secs(4))
+}
+
+/// 소켓 목록 → (verify 대상, 도달 불가 데몬). 상한을 인자로 받아 검체가 짧은 시계로 돈다(U4-B2②).
+fn drain_verify_collect(
+    sockets: Vec<(std::path::PathBuf, String, String)>,
+    timeout: std::time::Duration,
+) -> (Vec<VerifyTarget>, Vec<UnreachableDaemon>) {
+    let unreachable: Vec<UnreachableDaemon> = Vec::new();
     let mut targets = Vec::new();
     for (sock, dept, disp) in sockets {
-        let r = match request_on_timeout(
-            &sock,
-            "org.status",
-            json!({}),
-            std::time::Duration::from_secs(4),
-        ) {
+        let r = match request_on_timeout(&sock, "org.status", json!({}), timeout) {
             Ok(r) => r,
             Err(_) => continue, // 다운·전이 중 소켓 스킵(무해)
         };
@@ -17209,7 +17260,7 @@ fn drain_verify_targets() -> Vec<VerifyTarget> {
             });
         }
     }
-    targets
+    (targets, unreachable)
 }
 
 /// `cys drain --verify` 진입점 — 결정론 JSON을 stdout에, exit code로 전원 저장 여부를 반환한다
@@ -17226,9 +17277,11 @@ fn run_drain_verify(timeout: u64) -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let targets = drain_verify_targets();
+    let (targets, unreachable) = drain_verify_targets();
     let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(RealVerifyIo);
-    let report = drain_verify_fanout(io, targets, std::time::Duration::from_secs(timeout), now);
+    let mut report =
+        drain_verify_fanout(io, targets, std::time::Duration::from_secs(timeout), now);
+    drain_verify_merge_unreachable(&mut report, &unreachable);
     let all_saved = report["all_saved"].as_bool() == Some(true);
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
     if all_saved {
@@ -19033,6 +19086,14 @@ fn read_reinject_pending(
         })
         .unwrap_or_default();
     Ok(Some((ver, nodes)))
+}
+
+/// ★U4-B2③ reinject 스킵 사유 토큰 — 공백 없는 고정 키(브리지가 공백으로 자른다 · 외부 문자열 금지).
+const REINJECT_SKIP_REASON_RPC: &str = "daemon_rpc_failed";
+
+/// ★U4-B2③ 재주입 자체를 못 한 경우의 구조화 결과 줄 — RED 골격: 아직 빈 줄.
+fn pack_update_reinject_skipped_line(_pack_version: &str, _reason: &str) -> String {
+    String::new()
 }
 
 /// reinject 집계 → pack-update 종료코드. failed>0이면 EXIT_REINJECT_DEGRADED(디스크는 반영됐으나
@@ -27685,6 +27746,8 @@ mod tests {
             binary_version: env!("CARGO_PKG_VERSION").to_string(),
             app_bundle: None, // 기본은 번들 밖 = app-seal Skip(다른 doctor 테스트에 부작용 0)
             exe_dir: None,    // 기본은 설치 루트 미주입 = runtime-seal Skip(부작용 0)
+            // 기본은 실소비 폴더 = settings_paths[0] 의 폴더(같은 파일) — 기존 hook 검체의 의미 보존.
+            consumed_config_dir: base.to_path_buf(),
         }
     }
 
@@ -28024,12 +28087,9 @@ mod tests {
             .arg("--out")
             .arg(&manifest)
             .status();
-        match emitted {
-            Ok(s) if s.success() => {}
-            _ => {
-                let _ = std::fs::remove_dir_all(&base);
-                return; // python3 부재/실패 — 배선 절만 스킵(다른 갈래는 위에서 이미 봉인)
-            }
+        if !seal_wiring_emit_gate(&emitted) {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // python3 부재 — 배선 절만 스킵(다른 갈래는 위에서 이미 봉인)
         }
         let it = diag_runtime_seal(&ctx);
         assert_eq!(it.status, DiagStatus::Ok, "무결 트리는 Ok: {}", it.detail);
@@ -35126,6 +35186,305 @@ mod tests {
         assert!(!prod.contains(&old_form), "CTX 열이 자기보고만 읽는 옛 형태로 되돌아갔다");
         assert_eq!(prod.matches("ctx_cell(&s)").count(), 2,
                    "CTX 칸 산출은 run_status·run_fleet 두 곳뿐이고 둘 다 헬퍼를 써야 한다");
+    }
+
+    // ═══════════════ U4-B2 (0.14.41) 조용한 통과 드러내기 — Rust CLI 검체 ═══════════════
+
+    fn b2_tmp(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "cys-b2-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★U4-B2② 핀(반박 D5): 도달 불가 데몬을 두 갈래로 가른다 — 연결 실패(down)는 정보성 표기,
+    /// **연결 뒤 무응답(unresponsive)만** `all_saved=false`. 신선 기계(대상 0·도달 불가 0)는 종전대로 true.
+    /// ★개정 전 소스에서는 적색이다(도달 불가 데몬이 보고서 어디에도 없었다).
+    #[test]
+    fn drain_verify_unresponsive_daemon_is_not_all_saved() {
+        let fake = |dept: &str, kind: UnreachableKind| UnreachableDaemon {
+            dept: dept.into(),
+            display: format!("부서 {dept}"),
+            socket: std::path::PathBuf::from(format!("/tmp/{dept}.sock")),
+            kind,
+            detail: "e".into(),
+        };
+        let io = || -> std::sync::Arc<dyn VerifyIo + Send + Sync> {
+            std::sync::Arc::new(FakeVerifyIo::new())
+        };
+        let one = std::time::Duration::from_secs(1);
+        // ① 신선 기계 — 종전 핀 유지.
+        let mut r = drain_verify_fanout(io(), vec![], one, 100);
+        drain_verify_merge_unreachable(&mut r, &[]);
+        assert_eq!(r["all_saved"], json!(true), "{r}");
+        assert_eq!(r["unreachable"], json!([]), "{r}");
+        assert_eq!(r["summary"]["down"], json!(0), "{r}");
+        assert_eq!(r["summary"]["unresponsive"], json!(0), "{r}");
+        // ② down 만 — 저장할 자식이 없다: 정보성(all_saved 유지) · 그러나 목록에는 보인다.
+        let mut r = drain_verify_fanout(io(), vec![], one, 100);
+        drain_verify_merge_unreachable(&mut r, &[fake("gone", UnreachableKind::Down)]);
+        assert_eq!(r["all_saved"], json!(true), "down 은 저장 대상이 없다: {r}");
+        assert_eq!(r["summary"]["down"], json!(1), "{r}");
+        assert_eq!(r["unreachable"][0]["kind"], json!("down"), "{r}");
+        assert_eq!(r["unreachable"][0]["dept"], json!("gone"), "{r}");
+        // ③ unresponsive — 살아 있을 수 있는 노드가 저장 신호를 못 받았다 → all_saved=false.
+        let mut r = drain_verify_fanout(io(), vec![], one, 100);
+        drain_verify_merge_unreachable(
+            &mut r,
+            &[fake("gone", UnreachableKind::Down), fake("hung", UnreachableKind::Unresponsive)],
+        );
+        assert_eq!(r["all_saved"], json!(false), "무응답 데몬이 있는데 전원 저장으로 보고했다: {r}");
+        assert_eq!(r["summary"]["unresponsive"], json!(1), "{r}");
+        assert_eq!(r["summary"]["down"], json!(1), "{r}");
+        let u = &r["unreachable"][1];
+        assert_eq!(u["kind"], json!("unresponsive"), "{r}");
+        assert_eq!(u["department"], json!("부서 hung"), "{r}");
+        assert_eq!(u["socket"], json!("/tmp/hung.sock"), "{r}");
+        assert!(u["detail"].is_string(), "{r}");
+    }
+
+    /// ★U4-B2② 핀(실소켓): 없는 소켓 = down · accept 후 무응답 소켓 = unresponsive. 종전에는 둘 다
+    /// `Err(_) => continue` 로 목록에서 조용히 빠졌다. 상한 안에 끝나야 한다(무한 대기 금지).
+    #[cfg(unix)]
+    #[test]
+    fn drain_verify_collect_classifies_down_vs_unresponsive() {
+        use std::time::{Duration, Instant};
+        let dir = b2_tmp("dvc");
+        let missing = dir.join("absent.sock");
+        let hung = dir.join("hung.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&hung).unwrap();
+        let keep = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).filter_map(|s| s.ok()).collect();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+        let t0 = Instant::now();
+        let (targets, unr) = drain_verify_collect(
+            vec![
+                (missing.clone(), "gone".into(), "없는 부서".into()),
+                (hung.clone(), "hung".into(), "무응답 부서".into()),
+            ],
+            Duration::from_millis(400),
+        );
+        let elapsed = t0.elapsed();
+        assert!(elapsed < Duration::from_secs(3), "유계 종료 실패 — {elapsed:?}");
+        assert!(targets.is_empty());
+        assert_eq!(unr.len(), 2, "도달 불가 두 데몬이 모두 보고돼야 한다: {unr:?}");
+        let by = |d: &str| unr.iter().find(|u| u.dept == d).expect(d).kind;
+        assert_eq!(by("gone"), UnreachableKind::Down);
+        assert_eq!(by("hung"), UnreachableKind::Unresponsive);
+        let _ = keep.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★U4-B2③ 핀: 재주입 RPC 자체가 실패한 팔도 구조화 토큰을 낸다 — 종전에는 토큰이 없어 브리지가
+    /// (0,0) 으로 읽고 '완전 성공'을 띄웠다. 측정하지 않은 수치(failed=/deferred=)는 싣지 않는다.
+    /// 그리고 **종료코드는 불변**(Err 팔 = 0 또는 accepted-degraded) — 소스 핀.
+    #[test]
+    fn pack_update_reinject_skip_emits_result_token() {
+        let line = pack_update_reinject_skipped_line("2.0.0", REINJECT_SKIP_REASON_RPC);
+        assert!(line.starts_with(cys::pack::REINJECT_RESULT_PREFIX), "{line:?}");
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        assert!(toks.contains(&"pack_version=2.0.0"), "{line}");
+        assert!(toks.contains(&"reinject=skipped"), "{line}");
+        assert!(toks.contains(&"reason=daemon_rpc_failed"), "{line}");
+        assert!(
+            !toks.iter().any(|t| t.starts_with("failed=") || t.starts_with("deferred=")),
+            "재지 않은 수치를 0 으로 위장했다: {line}"
+        );
+        let src = include_str!("cys.rs");
+        let body = item_body(src, "\nfn run_pack_update(");
+        let at = body.find("reinject 스킵(데몬 점검 필요)").expect("Err 팔 문안 소실");
+        let arm = &body[at..at + body[at..].find("})();").expect("클로저 끝")];
+        assert!(
+            arm.contains("pack_update_reinject_skipped_line(&outcome.pack_version, REINJECT_SKIP_REASON_RPC)"),
+            "Err 팔이 결과 토큰을 찍지 않는다"
+        );
+        assert!(arm.contains("Ok(0)"), "Err 팔 종료코드(0)가 바뀌었다 — 무중단 정책 위반");
+        assert!(arm.contains("EXIT_ACCEPTED_DEGRADED"), "accepted-degraded 승격이 사라졌다");
+    }
+
+    /// ★U4-B2④ 핀: hook 진단의 1차 대조 표면은 **실소비 config 폴더**다. 종전에는 개인 프로필
+    /// (~/.claude*) 중 **하나만** 훅이 있어도 OK 였다 — cys 좌석이 실제로 읽는 폴더의 결손이 가려졌다.
+    /// 등급은 Warn(도구 소비처 0 · 부트 게이트 아님), 판독 불가는 판정 불가(Skip), --fix 는 실소비
+    /// 폴더에 쓰지 않는다(드러내기만 — 새 쓰기 표면 0 · 치유는 데몬 부팅 병합·init-pack 소관).
+    #[test]
+    fn doctor_hook_checks_consumed_config_dir_not_any_profile() {
+        let base = b2_tmp("hook");
+        let mut ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        let personal = base.join("personal").join("settings.json");
+        std::fs::create_dir_all(personal.parent().unwrap()).unwrap();
+        install_claude_hook(&personal.to_string_lossy(), &ctx.pack_dir).unwrap();
+        ctx.settings_paths = vec![personal.to_string_lossy().into_owned()];
+        let consumed = base.join("consumed");
+        ctx.consumed_config_dir = consumed.clone();
+        let consumed_settings = consumed.join("settings.json");
+
+        // ① 개인 프로필에만 훅 · 실소비 결손(파일 부재) → Ok 가 아니다.
+        let it = diag_hook(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains(&consumed.display().to_string()), "{}", it.detail);
+        // ①' --fix 도 실소비 폴더에 쓰지 않는다.
+        let it = diag_hook(&ctx, true);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(!consumed_settings.exists(), "--fix 가 실소비 폴더에 썼다(새 쓰기 표면)");
+
+        // ② 실소비 폴더 등록 → Ok.
+        std::fs::create_dir_all(&consumed).unwrap();
+        install_claude_hook(&consumed_settings.to_string_lossy(), &ctx.pack_dir).unwrap();
+        let it = diag_hook(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Ok, "{}", it.detail);
+
+        // ③ BOM 붙은 정상 settings(Windows 편집기) — 파싱 실패로 오판하지 않는다.
+        let body = std::fs::read_to_string(&consumed_settings).unwrap();
+        std::fs::write(&consumed_settings, format!("\u{feff}{body}")).unwrap();
+        let it = diag_hook(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Ok, "BOM 을 결손으로 오판: {}", it.detail);
+
+        // ④ 판독 불가(파싱 실패) → 판정 불가(Skip) — '결손'(Warn)으로도 '정상'(Ok)으로도 접지 않는다.
+        std::fs::write(&consumed_settings, "{not json").unwrap();
+        let it = diag_hook(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
+        assert!(it.detail.contains("판정 불가"), "{}", it.detail);
+        // ④' --fix 는 판독 불가 파일을 덮지 않는다(병합기 파싱 거부 계약).
+        let _ = diag_hook(&ctx, true);
+        assert_eq!(std::fs::read_to_string(&consumed_settings).unwrap(), "{not json");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★U4-B2⑤ 핀: pack-drift 가 매니페스트에 있는데 디스크에 **없는** 파일과 판독 불가 파일을
+    /// 세고 Warn 으로 올린다(종전: 부재는 무시 · 판독 불가 N 건이어도 Ok). Fail 미사용 계약 유지.
+    #[test]
+    fn doctor_pack_drift_counts_missing_and_unreadable() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = b2_tmp("drift");
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        let here = "here\n";
+        std::fs::write(ctx.pack_dir.join("here.md"), here).unwrap();
+        let write_manifest = |m: &Value| {
+            std::fs::write(
+                ctx.pack_dir.join(cys::pack::INSTALL_MANIFEST),
+                serde_json::to_string_pretty(m).unwrap(),
+            )
+            .unwrap();
+        };
+        // 대조군: 전부 실재·일치 → Ok.
+        write_manifest(&json!({ "here.md": cys::pack::content_hash_pub(here) }));
+        assert_eq!(diag_pack_drift(&ctx).status, DiagStatus::Ok);
+        // 누락 1건 → Warn + 계수 + 예시 경로.
+        write_manifest(&json!({
+            "here.md": cys::pack::content_hash_pub(here),
+            "hooks/gone.sh": cys::pack::content_hash_pub("x\n"),
+        }));
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("누락 1건"), "{}", it.detail);
+        assert!(it.detail.contains("hooks/gone.sh"), "{}", it.detail);
+        // 판독 불가(비 UTF-8) 1건 → Warn.
+        std::fs::write(ctx.pack_dir.join("bad.md"), [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
+        write_manifest(&json!({
+            "here.md": cys::pack::content_hash_pub(here),
+            "bad.md": cys::pack::content_hash_pub("y\n"),
+        }));
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains("판독 불가 1건"), "{}", it.detail);
+        assert_ne!(it.status, DiagStatus::Fail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★U4-B2⑥ 핀: `~/.cys` 목록을 못 읽으면 "0건 → OK" 가 아니라 Warn(판정 불능). 목록 자체가 없는
+    /// 경우(신선 기계 · NotFound)는 종전대로 해당 없음(Ok).
+    #[test]
+    fn doctor_state_base_unreadable_is_warn() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = b2_tmp("sbase");
+        let mut ctx = doctor_ctx_at(&base);
+        let not_dir = base.join("not-a-dir");
+        std::fs::write(&not_dir, "x").unwrap();
+        ctx.state_base = not_dir;
+        let a = diag_dept_awakening_seed(&ctx);
+        assert_eq!(a.status, DiagStatus::Warn, "{}", a.detail);
+        assert!(a.detail.contains("판정 불능"), "{}", a.detail);
+        let s = diag_staging_residue(&ctx, false);
+        assert_eq!(s.status, DiagStatus::Warn, "{}", s.detail);
+        assert!(s.detail.contains("판정 불능"), "{}", s.detail);
+        let s = diag_staging_residue(&ctx, true);
+        assert_eq!(s.status, DiagStatus::Warn, "--fix 도 판정 불능을 정리 완료로 적지 않는다");
+        // NotFound — 해당 없음(Ok) 유지.
+        ctx.state_base = base.join("absent");
+        assert_eq!(diag_dept_awakening_seed(&ctx).status, DiagStatus::Ok);
+        assert_eq!(diag_staging_residue(&ctx, false).status, DiagStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★U4-B2⑦ 핀: Windows doctor 의 `socket`·`startup-lock` 은 검사를 **하지 않은** 항목이다 —
+    /// Ok 가 아니라 Skip(판정 불가 · DiagStatus 계약). 종료코드는 Fail 만 세므로 무영향.
+    /// 배선 소스 핀(반박 D9): cfg(not(unix)) 실함수 두 개가 이 판정 함수를 실제로 부른다.
+    #[test]
+    fn doctor_platform_unsupported_items_are_skip() {
+        let s = diag_platform_unsupported("socket", "소켓 진단");
+        assert_eq!(s.status, DiagStatus::Skip, "{}", s.detail);
+        assert_eq!(s.name, "socket");
+        let l = diag_platform_unsupported("startup-lock", "락 진단");
+        assert_eq!(l.status, DiagStatus::Skip, "{}", l.detail);
+        assert!(l.detail.contains("판정 불가"), "{}", l.detail);
+        let src = include_str!("cys.rs");
+        let fn_only = |b: &'static str| -> &'static str {
+            &b[..b.find("\n}\n").map(|i| i + 2).unwrap_or(b.len())]
+        };
+        let sock = fn_only(item_body(src, "#[cfg(not(unix))]\nfn diag_orphan_socket("));
+        let lock = fn_only(item_body(src, "#[cfg(not(unix))]\nfn diag_stale_lock("));
+        assert!(sock.contains("diag_platform_unsupported(\"socket\""), "{sock}");
+        assert!(lock.contains("diag_platform_unsupported(\"startup-lock\""), "{lock}");
+        assert!(!sock.contains("DiagStatus::Ok") && !lock.contains("DiagStatus::Ok"));
+    }
+
+    /// ★U4-B2⑦ Windows 실함수 검체 — Windows 에서 `--bin cys` 를 돌리는 레인이 이 이름을 필터로 부르면
+    /// 실제 두 함수를 탄다(맥·리눅스에서는 컴파일되지 않는다 · 배선은 위 소스 핀이 전 OS 에서 진다).
+    #[cfg(not(unix))]
+    #[test]
+    fn doctor_platform_unsupported_windows_real_fns_are_skip() {
+        let base = b2_tmp("win");
+        let ctx = doctor_ctx_at(&base);
+        assert_eq!(diag_orphan_socket(&ctx, false).status, DiagStatus::Skip);
+        assert_eq!(diag_orphan_socket(&ctx, true).status, DiagStatus::Skip);
+        assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Skip);
+        assert_eq!(diag_stale_lock(&ctx, true).status, DiagStatus::Skip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★U4-B2⑧ runtime-seal 배선 검체의 emit 관문 — python3 **부재**(spawn 실패)만 스킵, 판독기
+    /// 도구가 **실행됐는데 비0** 이면 도구 회귀이므로 검체를 적색으로 만든다(종전: 둘 다 조용히 스킵).
+    fn seal_wiring_emit_gate(emitted: &std::io::Result<std::process::ExitStatus>) -> bool {
+        // RED 골격: 종전 의미(성공만 진행 · 나머지는 전부 스킵).
+        matches!(emitted, Ok(s) if s.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "javis_runtime_seal.py emit")]
+    fn diag_runtime_seal_wiring_emit_failure_is_red() {
+        use std::os::unix::process::ExitStatusExt;
+        let _ = seal_wiring_emit_gate(&Ok(std::process::ExitStatus::from_raw(2 << 8)));
+    }
+
+    #[test]
+    fn seal_wiring_emit_gate_skips_only_spawn_failure() {
+        let absent = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "python3"));
+        assert!(!seal_wiring_emit_gate(&absent), "python3 부재는 배선 절만 스킵");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(seal_wiring_emit_gate(&Ok(std::process::ExitStatus::from_raw(0))));
+        }
     }
 }
 
