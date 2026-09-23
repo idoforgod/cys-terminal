@@ -433,7 +433,7 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// 홈 경로 접두 → `~` (ASCII 대소문자 무시 — 윈도우 경로는 대소문자 무관). 뒤가 경로 끝(구분자·
-/// 문자열 끝·구분 문자)일 때만 바꾼다 — `/Users/cys` 가 남의 `/Users/cysx` 를 먹지 않게.
+/// 문자열 끝·구분 문자)일 때만 바꾼다 — 홈이 "/Users/user"면 남의 "/Users/userx"를 먹지 않는다.
 fn replace_home_ci(hay: &str, home: &str) -> String {
     if home.is_empty() {
         return hay.to_string();
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn ext_rules_match_ui() {
-        assert_eq!(allowed_ext_of("/Users/a/화면 기록.MOV").as_deref(), Some("mov"));
+        assert_eq!(allowed_ext_of("/Users/user/화면 기록.MOV").as_deref(), Some("mov"));
         assert_eq!(allowed_ext_of("C:\\Users\\홍길동\\Pictures\\shot.PNG").as_deref(), Some("png"));
         assert_eq!(allowed_ext_of(".hidden"), None);
         assert_eq!(allowed_ext_of("noext"), None);
@@ -1278,20 +1278,20 @@ mod tests {
     #[test]
     fn redaction_applies_to_parsed_values_on_both_platforms() {
         let mut v = json!({
-            "mac": "/Users/cys/Desktop/CYSjavis/x.log",
-            "other_user": "/Users/hong/Library",
+            "mac": "/Users/user/Desktop/CYSjavis/x.log",
+            "other_user": "/Users/youruser/Library",
             "win": "C:\\Users\\홍길동\\AppData\\Local\\cys\\boot-supervisor.log",
             "win_fwd": "c:/users/홍길동/AppData",
-            "d_drive": "D:\\Users\\kim\\work",
+            "d_drive": "D:\\Users\\runner\\work",
             "linux": "/home/alice/.cys",
             "tmp": "/private/var/folders/38/dn_9t23x39z56tzd_bx80pnh0000gn/T/cys-paste",
             "mail": "문의 someone.name+tag@example.co.kr 로",
             "nested": ["C:\\Users\\홍길동\\x"],
             "keep": "0.14.41 · macos aarch64",
         });
-        redact_value(&mut v, "/Users/cys");
+        redact_value(&mut v, "/Users/user");
         let s = serde_json::to_string(&v).unwrap();
-        for leak in ["cys/Desktop", "hong", "홍길동", "kim", "alice", "dn_9t23", "someone.name", "example.co.kr"] {
+        for leak in ["user/Desktop", "youruser", "홍길동", "runner", "alice", "dn_9t23", "someone.name", "example.co.kr"] {
             assert!(!s.contains(leak), "{leak} 가 새어 나갔다: {s}");
         }
         assert_eq!(v["mac"], "~/Desktop/CYSjavis/x.log", "홈 접두는 ~ 로(경로 모양 보존)");
@@ -1303,30 +1303,30 @@ mod tests {
         // 윈도우 홈 접두(대소문자·구분자 무관)
         assert_eq!(redact_text("c:/users/홍길동/x", "C:\\Users\\홍길동"), "~/x");
         // 접두 경계 — 홈 이름으로 시작하는 남의 폴더는 ~ 가 아니라 <user>
-        assert_eq!(redact_text("/Users/cysx/a", "/Users/cys"), "/Users/<user>/a");
-        assert_eq!(redact_text("/Users/cys", "/Users/cys/"), "~");
+        assert_eq!(redact_text("/Users/userx/a", "/Users/user"), "/Users/<user>/a");
+        assert_eq!(redact_text("/Users/user", "/Users/user/"), "~");
     }
 
     #[test]
     fn diag_is_deterministic_redacted_and_small() {
         let f = DiagFacts {
-            user_agent: "Mozilla/5.0 (Macintosh) /Users/cys/leak".into(),
+            user_agent: "Mozilla/5.0 (Macintosh) /Users/user/leak".into(),
             daemon: "응답함".into(),
             daemon_version: Some("0.14.41".into()),
             workspaces: 3,
             panes: 7,
         };
-        let a = build_diag(&f, "0.14.41", Some("0.14.41".into()), "/Users/cys");
-        let b = build_diag(&f, "0.14.41", Some("0.14.41".into()), "/Users/cys");
+        let a = build_diag(&f, "0.14.41", Some("0.14.41".into()), "/Users/user");
+        let b = build_diag(&f, "0.14.41", Some("0.14.41".into()), "/Users/user");
         assert_eq!(a, b, "미리보기 = 저장본(같은 입력 → 같은 바이트)");
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["workspaces"], 3);
         assert_eq!(v["panes"], 7);
         assert_eq!(v["os"], std::env::consts::OS);
-        assert!(!a.contains("/Users/cys"));
+        assert!(!a.contains("/Users/user"));
         assert!(v.get("created_at").is_none(), "시각은 manifest 에만");
         let huge = DiagFacts { user_agent: "x".repeat(5000), ..Default::default() };
-        let c = build_diag(&huge, "v", None, "/Users/cys");
+        let c = build_diag(&huge, "v", None, "/Users/user");
         assert!(c.len() < 1500, "문자열은 상한으로 자른다");
     }
 

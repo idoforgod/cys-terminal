@@ -328,6 +328,22 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
 - **킬스위치 `CYS_DEPT_FALLBACK=0`**: 위 자동 생성을 끄고 구계약(거부 rc=7 + 안내)으로
   되돌립니다(무배포 현장 롤백 채널). 예: `CYS_DEPT_FALLBACK=0` 을 셸 환경에 넣고 앱/데몬을
   재시작.
+- **★말로 팀 만들기 (v0.14.41 · 1차)**: 본부 대표(마스터·CEO)에게 "○○하는 팀 하나 만들어줘"라고
+  말하면, 대표가 팀 이름과 하는 일을 대화로 정한 뒤 **팀 만들기 제안** 1건을 올립니다
+  (`cys team-propose`). 제안은 Control Center 의 **'승인 Feed' 탭에 카드**로 뜹니다(창이 저절로
+  뜨지는 않습니다). 카드의 **[확인 창 열기]** 를 누르면 대표가 정한 이름·하는 일이 **원문 그대로**
+  보이고, **[만들기]** 를 눌러야 팀이 만들어집니다. [나중에]나 창 바깥을 누르면 제안은 그대로
+  남고, 만들지 않으려면 카드의 **[만들지 않기]** 를 누릅니다.
+  - 만들어진 팀의 모든 자리(팀장·팀원)는 켜질 때마다(/clear 뒤 포함) **팀 소개(참고 정보)** 로
+    팀 이름과 하는 일을 받습니다. 참고 정보라서 운영헌장·역할 지침보다 앞서지 않습니다.
+  - 이 팀은 지운 팀이 남긴 폴더(팩·기록·로그인 폴더)가 없는 **새 번호**를 받습니다 — 옛 팀의
+    기억·할 일이 새 팀으로 넘어오지 않습니다.
+  - **잠금(사고 방지 층)**: 제안은 본부 대표 자리에서만, 기다리는 제안은 1건, 24시간에 3건까지
+    받습니다. 제안을 만들지 말지는 **오너가 앱에서만** 정합니다 — 대표를 포함한 에이전트가 승인
+    Feed 에서 이 카드를 승인·거부해도 데몬이 거부합니다(대표는 자기 제안을 거두는 것만 가능).
+    원격 채널(Slack 등)로는 보내지 않습니다. 이 잠금은 에이전트의 실수·오해를 막는 장치이며,
+    같은 컴퓨터에서 고의로 우회하는 프로그램까지 막는 보안 경계는 아닙니다.
+  - 팀장(부서 대표)에게 부탁하면 "새 팀은 본부 대표 자리에서 만들 수 있습니다"라고 안내합니다.
 
 ### 4.5 입력
 
@@ -590,6 +606,8 @@ cys feed reply <request_id> allow                            # CLI로 응답 (UI
   결정을 반영.
 - pending이 오래 방치되면 `feed.item.aging` 이벤트로 재알림됩니다(기본 300초).
 - **자동 응답은 없습니다**(HITL). 요청한 노드가 스스로 승인하는 것도 데몬이 거부합니다.
+- **팀 만들기 제안**(`kind=team-create-request` · v0.14.41)은 Allow/Deny 대신 [확인 창 열기]·[만들지 않기]
+  카드로 보입니다. 이 항목은 오너 GUI 만 해소할 수 있습니다(§4.4).
 - UI: 승인 요청이 오면 배지·토스트·OS 알림이 뜨고, 30초 내 해소되지 않은(=사람 개입이
   필요한) 건만 Feed 탭으로 화면이 전환됩니다.
 
@@ -976,6 +994,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | 사이클·복구 | `cycle-agent` `node-recover` `restore` `reinject` `drain` | 컨텍스트 사이클·재기동·조직 복원·지침 재주입·업데이트 전 저장 신호(`drain --verify`=노드별 체크포인트 저장을 nonce 마커로 결정론 검증 후 JSON+exit code) |
 | 거버넌스 | `run` `ps` `kill` `add-health-rule` `health-rules` `pause` `resume` `gate-check` `queue` | scoped 실행·원장·강제 종료·헬스룰·kill-switch·큐 관리 |
 | 승인 | `feed` `approval` | 승인 요청함(push/list/reply)·HMAC signed-prefix 서명(check/sign) |
+| 팀 | `team-propose` | 말로 팀 만들기 제안 1건(본부 대표 전용 · `--name` + `--purpose`/`--purpose-file` · 만들기는 오너가 앱 확인 창에서 — §4.4) |
 | 팩·업데이트 | `init-pack` `pack-update` `pack-manifest` `license` `pack-repair-channel` `pack-downgrade-to-free` `persona` | 팩 설치·무중단 업데이트·매니페스트 방출·pro 라이선스·채널 복구·강등·페르소나 |
 | 데몬 | `daemon install/status/uninstall` | 상시 가동 등록·상태·해제 |
 | 기록·학습 | `recall` `attest` `learn` `skill` `cost-baseline` | 전사 검색·해시체인 증거·RSI 학습·스킬 라이브러리·비용 baseline |

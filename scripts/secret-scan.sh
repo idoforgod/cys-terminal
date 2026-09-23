@@ -68,8 +68,10 @@ dummy_user_re='/Users/('"$dummy_names"')(/|"|$)'
 # Windows 홈의 더미 판 — `C:\Users\x\…`·`C:\Users\x>`. 경계는 '이름 문자가 아닌 것'으로 본다
 # (뒤에 `\`·`>`·공백·따옴표 등 무엇이 오든 이름 자체가 더미면 통과).
 win_dummy_user_re='[A-Za-z]:\\+Users\\+('"$dummy_names"')([^A-Za-z0-9._-]|$)'
-# 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함)
-email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md)$'
+# 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함).
+# ★(0.14.41 · U6 통합) src-tauri/src/feedback.rs::FEEDBACK_TO 도 같은 공개 주소(README·SECURITY 와
+#   동일 문자열 — feedbackwiring.test.ts 가 두 문서와 대조)의 **단일 정의처**라 같은 예외를 받는다.
+email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md|src-tauri/src/feedback\.rs)$'
 email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@'
 # 개인 계정 핸들 denylist(맨몸) — /Users·.claude- 접두 없이 계정키·설정값으로 박힌 개인 핸들도 차단한다.
 # 넓은 패턴 대신 '알려진 개인 핸들'만 명시 등재해 제네릭 영어단어 오탐을 배제한다(deny-by-default 유지).

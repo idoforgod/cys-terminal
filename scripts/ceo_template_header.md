@@ -46,12 +46,12 @@ done
 ## [부서 수명주기 — CEO는 직접 집행하지 않는다 (단일소유 강제)]
 
 - **부서 생성·종료·회전·승격은 CEO가 직접 실행하지 않는다.** `cys-dept`의 lifecycle 동사(`launch`·`allocate`·`create`·`down`·`down-sock`·`rotate`·`reap`·`promote-ceo`)는 **CSO(`CYS_ROLE=cso`)와 GUI(오너 직접·role 없음) 전용**이며, CEO는 role=master 노드이므로 호출하면 단일소유 가드가 `exit 7`로 거부한다(다중주체 churn·빈 부서·중복·레이스 방지). 거부는 버그가 아니라 계약이다 — 우회(`CYS_ROLE` unset 등)는 금지.
-- 따라서 CEO의 정당한 경로는 둘뿐이다: ⓐ **GUI 부서 버튼**(오너가 직접 누르는 부서 생성·종료·정리) ⓑ **CSO 위임** — 필요를 판단해 CSO에게 요청한다.
+- 따라서 CEO의 정당한 경로는 셋이다: ⓐ **GUI 부서 버튼**(오너가 직접 누르는 부서 생성·종료·정리) ⓑ **말로 부탁 → 팀 제안**(새 팀 생성 전용 — 오너가 새 팀을 부탁했을 때만 본문 §4-A 절차: 제안 1건 → 오너가 앱 확인 창에서 [만들기]) ⓒ **CSO 위임**(정리·종료 요청).
   ```bash
-  # ⓑ CSO 위임 (CEO가 직접 cys-dept 를 실행하는 대신)
-  cys send --to cso "[부서요청] 새 부서 '<name>' 생성 요청 — 목적: <미션>. 자원 게이트 확인 후 집행하고 결과 보고."
-  cys send-key --to cso Return
+  # ⓑ 새 팀 — 오너가 말로 부탁했을 때만(본문 §4-A · 본부 대표 전용 · 만들기는 오너 확인 창)
+  cys team-propose --name "<팀 이름>" --purpose-file <하는 일을 적은 파일>
   ```
+- **새 부서 생성을 CSO에게 위임하지 않는다** — CSO 도구 게이트가 부서 생성 동사를 막아 그 경로로는 만들어지지 않는다(0.14.41 U16 조사 F1). 생성은 ⓐ 또는 ⓑ다.
 - **CEO가 직접 쓰는 `cys-dept`는 읽기 전용 동사뿐이다**: `cys-dept list`·`cys-dept sock <name>`(그리고 무변조인 `promote-if-pending --request-only`). 이 셋은 가드 면제이며 인벤토리·주소 해석에 쓴다.
 - **★이름이 닮은 두 reap 은 계약이 정반대다 — 혼동 금지.** ⓐ **좌석 회수** `cys reap-surface <surface>`(본문 §8 · 죽은 `exited=true` pane 잔재 회수)는 단일소유 가드와 **무관**하며 CEO 직접 집행이 계약대로 허용된다. ⓑ **부서 격리분 TTL 소거**(위 lifecycle 동사 목록의 `reap` — 폐역 부서 대화기억 trash 의 만료분 소거)는 부서 lifecycle 동사라 CEO가 직접 호출하면 가드가 `exit 7`로 거부한다(이 절 첫 항과 동일 계약 — 버그 아님). ⓑ의 정당한 경로도 위와 같이 둘뿐이다 — **GUI 부서 버튼**, 또는 **CSO 위임**: `cys send --to cso "[부서요청] 부서 격리분 정리 요청: <부서명>"` + `cys send-key --to cso Return`(상설 소관·TTL 규약은 CSO_DIRECTIVE §3-1). 격리분은 오너 데이터라 TTL 이전 임의 삭제는 어느 경로로도 금지다.
 - 새 부서가 뜰 때 **기존 부서의 데몬·surface·작업은 절대 건드리지 않는다** — 새 (socket 디렉토리, pack_dir) 쌍이 신규 생성될 뿐이다(집행 주체가 CSO·GUI여도 이 불변식은 동일).

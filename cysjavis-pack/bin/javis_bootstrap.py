@@ -1309,13 +1309,17 @@ class _Log:
         #      (CS-3 보고=실측). 'none(...)' 이면 비제로 exit·boot-last가 최종 증거다.
         # ★키는 STEP 상수다(리터럴 금지) — 라벨이 바뀌면 힌트가 조용히 안 붙는 드리프트를 차단한다.
         hint = {STEP.CLAIM_ROLE: "다른 pane이 이미 master입니다(조직당 master 1명). 새 부서장을 세우려면 "
-                                 "GUI ＋부서(부서 워크스페이스 추가)를 쓰거나, base 레인(unix)에서 오너가 "
-                                 "직접 타이핑한 선언(훅 발화)으로 재선언하세요 — 그 경로만 부서 자동 생성으로 "
+                                 "기존 대표(master)에게 말로 부탁해 `cys team-propose` 로 제안하게 하거나, "
+                                 "오너가 GUI '전문가용 › 팀 직접 만들기'로 직접 만들어야 합니다(U16/U17 이후 "
+                                 "현실 — 만들기는 오너 확인 창에서만). base 레인(unix)에서 오너가 직접 "
+                                 "타이핑한 선언(훅 발화)으로 재선언하세요 — 그 경로만 부서 자동 생성으로 "
                                  "이어집니다.",
                 STEP.DEPT_FB_GUARD: "부서 자동 생성의 전제(살아있는 master)가 확인되지 않아 만들지 "
                                     "않았습니다 — 역할 등록이 '신원 미확정'으로 거부됐을 가능성이 "
                                     "큽니다(세션 배선). `cys list` 의 role 열을 확인하고, pane 안에서 "
-                                    "재선언하세요. 새 부서가 목적이면 GUI ＋부서·`cys-dept allocate` 를 쓰세요.",
+                                    "재선언하세요. 새 부서가 목적이면 대표에게 말로 부탁해 "
+                                    "`cys team-propose` 로 제안하거나, 오너가 GUI '전문가용 › 팀 직접 "
+                                    "만들기'·`cys-dept allocate` 를 쓰세요.",
                 STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP 기본 8)·~/.cys/depts.json 을 확인하세요.",
                 STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — 그 부서 pane에서 claude 실행 후 '너는 마스터다' 선언(훅 자동 부트) 또는 부서 pane 안에서 cys launch-agent --role master --agent claude 로 재시도하세요.",
                 STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
@@ -1876,7 +1880,8 @@ def _dept_fallback(log, claim_out):
     if os.environ.get("CYS_DECL_ORIGIN") != "hook-human":
         log.step(STEP.DEPT_FB, 1, "선언 유래 미보증(CYS_DECL_ORIGIN≠hook-human — 직접 실행 경로) "
                                   "— 폴백 비적용(폭주 봉인 ⓑ). 부서 창설은 오너 타이핑 선언(훅 발화)"
-                                  "·GUI ＋부서·cys-dept allocate 로만.")
+                                  "·대표의 `cys team-propose`(오너 확인 창)·GUI '전문가용 › 팀 직접 "
+                                  "만들기'·cys-dept allocate 로만.")
         return None
     if not _is_base_socket():
         return None  # 부서 레인의 master 충돌은 부서 내부 문제 — 부서 안에 부서를 만들지 않는다
@@ -2051,8 +2056,10 @@ def _dept_fallback(log, claim_out):
             "새 부서 %(d)s 를 생성하고 부서장(claude)을 기동했습니다%(m)s. 팀 스폰 exit=%(b)s · "
             "생존 판정 exit=%(c)s(0=전원 생존·부서장 체인이 결손을 자가치유). 첫 부서 생성 시 기존 "
             "master 는 CEO 규약으로 자동 승격됩니다(cys-dept). 이 pane 은 역할 없는 일반 세션으로 "
-            "유지됩니다 — 부서장 대화는 부서 워크스페이스 pane(GUI 탭이 없으면 ＋부서 버튼의 부서 "
-            "선택에서 %(d)s 를 여세요) 또는 `CYS_SOCKET=%(s)s cys send --to master` 를 쓰세요."
+            "유지됩니다 — 부서장 대화는 부서 워크스페이스 pane(GUI 에 %(d)s 탭이 아직 없으면 앱을 "
+            "다시 시작하면 자동으로 나타납니다 — U16/U17 이후 새 부서는 대표의 `cys team-propose` "
+            "제안이나 오너의 GUI '전문가용 › 팀 직접 만들기'로도 만들 수 있습니다) 또는 "
+            "`CYS_SOCKET=%(s)s cys send --to master` 를 쓰세요."
             % {"d": name, "m": (" (%s)" % sref if sref else ""), "b": boot_exit,
                "c": check_exit, "s": sock})
     channel = _notify_loud("부서 자동 생성: %s (마스터 선언 폴백)" % name, note)
@@ -3280,8 +3287,10 @@ def _cmd_run_chain(log):
             if fb is not None:
                 return fb
             msg = ("이 surface는 master가 아님(claim 거부). 살아있는 master가 레지스트리에 존재한다 — "
-                   "선언을 중단하고 기존 master에 인계하라. 새 부서장을 세우려는 의도였다면: GUI "
-                   "＋부서(부서 워크스페이스 추가)를 쓰거나, base 레인 unix 에서 **오너가 직접 타이핑한** "
+                   "선언을 중단하고 기존 master에 인계하라. 새 부서장을 세우려는 의도였다면(U16/U17 "
+                   "이후 현실): 기존 대표(master)에게 말로 부탁해 `cys team-propose` 로 제안하게 "
+                   "하거나, 오너가 GUI '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너 "
+                   "확인 창에서만). base 레인 unix 에서 **오너가 직접 타이핑한** "
                    "선언(훅 발화 경로)으로 재선언하라 — 그 경로만 부서 자동 생성으로 이어진다"
                    "(직접 실행·기계 배달 선언은 폭주 봉인 ⓑ로 비적용).\n%s" % out)
             # ★ok=None(CS-2⑩): 정당거부는 '이 레인의 부트가 깨졌다'가 아니다 — 공유 boot-last 의

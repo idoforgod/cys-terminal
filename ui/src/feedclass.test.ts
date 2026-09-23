@@ -48,6 +48,15 @@ describe("classifyPendingFeed — pending 조작면 분류(패널·팔레트 공
     ).toBe("standard");
   });
 
+  // ★U16(0.14.41) 팀 만들기 제안: 일반 Allow 는 생성 없이 카드를 소각하는 기만 버튼이다 —
+  //  전용 분류로 내려 카드(확인 창 열기·만들지 않기)만 남기고 팔레트 승인 대상에서도 뺀다.
+  test("★team-create-request 는 'team-create' — 부가 신호와 무관", () => {
+    expect(classifyPendingFeed({ kind: "team-create-request", request_id: "tp-1" })).toBe("team-create");
+    expect(
+      classifyPendingFeed({ kind: "team-create-request", request_id: "tp-1", daemon_issued: false }),
+    ).toBe("team-create");
+  });
+
   test("특례 보존: ceo-promote-request 등 다른 kind 는 standard(Allow 경로 유지)", () => {
     expect(classifyPendingFeed({ kind: "ceo-promote-request", request_id: "r3" })).toBe("standard");
     expect(classifyPendingFeed({ kind: "learn_proposal", request_id: "r4" })).toBe("standard");
@@ -96,7 +105,12 @@ describe("feedCreatedToastTitle — 정보성 알림 vs 승인 요청", () => {
     const main = readFileSync(new URL("./main.ts", import.meta.url), "utf-8");
     const at = main.indexOf('if (name === "feed.item.created") {');
     expect(at).toBeGreaterThan(0);
-    const branch = main.slice(at, at + 400);
+    // ★통합(WP-E U16): team-create-request 특례 분기가 앞에 끼어들어 고정폭(400자) 창이
+    // feedCreatedToastTitle 호출을 놓쳤다 — teamproposal.test.ts 와 같은 경계(refreshFeed() 직전
+    // 까지 이 블록 전체)로 넓힌다(취지 불변: 분류 함수 사용 + 고정 리터럴 재도입 금지).
+    const end = main.indexOf("refreshFeed();", at);
+    expect(end).toBeGreaterThan(at);
+    const branch = main.slice(at, end);
     expect(branch).toContain("feedCreatedToastTitle(payload.kind)");
     expect(branch).not.toContain('"📥 승인 요청"');
   });

@@ -367,6 +367,19 @@ enum Command {
         #[command(subcommand)]
         action: FeedAction,
     },
+    /// 말로 팀 만들기(본부 대표 전용) — 오너와 정한 팀 이름·하는 일을 '팀 만들기 제안' 1건으로 올린다.
+    /// 만들기는 오너가 앱 확인 창에서만 한다(제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
+    TeamPropose {
+        /// 팀 이름(표시명 · 40자 이내 · 한글 가능)
+        #[arg(long)]
+        name: String,
+        /// 하는 일(2000자 이내 · 오너와 정한 문장 그대로)
+        #[arg(long, conflicts_with = "purpose_file")]
+        purpose: Option<String>,
+        /// 하는 일을 적은 UTF-8 파일(긴 문장·여러 줄은 이쪽을 쓴다)
+        #[arg(long)]
+        purpose_file: Option<std::path::PathBuf>,
+    },
     /// RSI 학습 루프 — 사람 직접 명령(제안 생성) 또는 현재 학습 라운드 상태 조회
     Learn {
         /// 학습 주제 (생략하고 --status면 상태 조회)
@@ -5066,6 +5079,9 @@ fn run(command: Command) -> i32 {
         }),
 
         Command::Feed { action } => return run_feed(action),
+        Command::TeamPropose { name, purpose, purpose_file } => {
+            return run_team_propose(&name, purpose, purpose_file)
+        }
 
         Command::Learn { topic, status } => {
             if status {
@@ -5118,6 +5134,81 @@ fn run(command: Command) -> i32 {
         Err(e) => {
             eprintln!("error: {e}");
             1
+        }
+    }
+}
+
+/// ★U16(0.14.41) `cys team-propose` — 팀 만들기 제안 1건 발행(대기 없음).
+///
+/// exit: 0=제안 등록 · 2=입력 형식(이름·하는 일·파일) · 3=데몬 거부(제안자·건수·형식) 또는 데몬 오류 ·
+///       4=데몬이 잠금을 모르는 구버전(제안을 스스로 거뒀다 — 앱 재시작으로 데몬을 갱신한 뒤 다시).
+/// 결과 확인의 진실원은 팀 명부(`~/.cys/depts.json` 의 `team_proposal_id`)다 — 피드 allow 는 보조 신호.
+fn run_team_propose(
+    name: &str,
+    purpose: Option<String>,
+    purpose_file: Option<std::path::PathBuf>,
+) -> i32 {
+    let raw = match (purpose, purpose_file) {
+        (Some(p), None) => p,
+        (None, Some(f)) => match std::fs::read(&f) {
+            Ok(b) => match String::from_utf8(b) {
+                Ok(t) => t.trim_start_matches('\u{feff}').to_string(),
+                Err(_) => {
+                    eprintln!("error: {} 이(가) UTF-8 텍스트가 아니다", f.display());
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: 하는 일 파일을 읽지 못했다({}): {e}", f.display());
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!("error: --purpose 또는 --purpose-file 중 하나로 하는 일을 적어라");
+            return 2;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let entropy = now.subsec_nanos() ^ std::process::id().rotate_left(16);
+    let id = cys::team_spec::new_id(now.as_secs(), entropy);
+    let spec = match cys::team_spec::build(&id, name, &raw) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let sid = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
+    match request("feed.push", cys::team_spec::push_params(&spec, sid)) {
+        // ★REVIEW1 m1(b): 판정은 lib 공용 순수 함수(team_gate_ok) — cysd team_gate_tests.rs 가
+        // 실제 데몬 응답 모양으로 이 함수를 대조하므로, 표지가 응답에서 빠지는 회귀는 거기서 잡힌다.
+        Ok(r) if cys::team_spec::team_gate_ok(&r) => {
+            println!("{}", spec.id);
+            println!("팀 만들기 제안 등록: '{}' ({})", spec.display, spec.id);
+            println!("오너에게 1줄로 알려라: \"제어 센터 승인 탭의 '팀 만들기 제안' 카드에서 [확인 창 열기] → [만들기]를 눌러 주세요.\"");
+            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 다시 말을 걸면 확인한다:");
+            println!("  만들어짐 = 팀 명부 ~/.cys/depts.json 에 team_proposal_id \"{}\" 가 있다", spec.id);
+            println!("  대기·결정 = `cys feed list` 의 {} 줄 (pending=대기 · decision=deny=오너가 만들지 않기로 함)", spec.id);
+            0
+        }
+        Ok(_) => {
+            // 잠금을 모르는 구 데몬 — 제안이 잠금 없이 올라갔다. 스스로 거둔다(발행 좌석의 결정은
+            // 구 데몬에서도 통과한다: 자기승인 가드는 allow 만 막는다).
+            let _ = request(
+                "feed.reply",
+                json!({"request_id": spec.id, "decision": cys::team_spec::SUPERSEDED}),
+            );
+            eprintln!(
+                "error: 이 데몬은 팀 제안 잠금을 모르는 구버전이다 — 제안({})을 거뒀다. 앱을 다시 시작해 데몬을 갱신한 뒤 다시 제안하라",
+                spec.id
+            );
+            4
+        }
+        Err(e) => {
+            eprintln!("error: 팀 만들기 제안이 거부됐다: {e}");
+            3
         }
     }
 }
@@ -14729,11 +14820,14 @@ fn run_claim_role(
                 // 안내가 없으면 선언 pane 의 에이전트가 출구 없이 인계 산문만 반복한다(현장 결함 3호).
                 if role == "master" {
                     eprintln!(
-                        "[claim-role] 새 부서장을 세우려는 경우: GUI '부서 워크스페이스 추가' 또는 \
-                         `cys-dept allocate` 로 독립 부서(전용 데몬·역할 공간)를 만들고 그 안에서 \
-                         선언하라. 부서 자동 생성은 **오너가 직접 타이핑한** 마스터 선언(훅 발화 \
-                         경로 · base 레인 unix)에서만 이어진다 — 직접 실행·기계 배달 선언은 폭주 \
-                         봉인으로 비적용이다."
+                        "[claim-role] 새 부서장을 세우려는 경우: 이 프로세스가 직접 GUI 로 부서를 만들 \
+                         수는 없다(U16/U17 이후 현실) — 기존 대표(master)에게 말로 부탁해 \
+                         `cys team-propose --name … --purpose …` 로 제안하게 하거나, 오너가 GUI \
+                         '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너의 앱 확인 창에서만 \
+                         — 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
+                         데몬·역할 공간)를 직접 만들고 그 안에서 선언하는 경로도 남아 있다. 부서 \
+                         자동 생성은 **오너가 직접 타이핑한** 마스터 선언(훅 발화 경로 · base 레인 \
+                         unix)에서만 이어진다 — 직접 실행·기계 배달 선언은 폭주 봉인으로 비적용이다."
                     );
                 }
                 7
@@ -37496,5 +37590,23 @@ mod u10_notice_lane {
         let m = rest.find("match receipt {").expect("영수증 분기");
         let arms = &rest[m..m + rest[m..].find("\n            }\n").expect("match 끝")];
         assert!(arms.contains("disarm()"), "영수증 수신 분기에서 해제하지 않는다");
+    }
+}
+
+// ★U16(0.14.41) 말로 팀 만들기 — `cys team-propose` 계약 핀(표면·검증). 데몬 잠금은
+// cysd team_gate_tests 가, 스키마·코덱 SOT 는 lib `cys::team_spec` 테스트가 잰다.
+#[cfg(test)]
+mod team_propose_tests {
+    use super::*;
+
+    #[test]
+    fn team_propose_subcommand_parses() {
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "영상편집팀", "--purpose", "유튜브 영상 편집"]);
+        assert!(c.is_ok(), "team-propose 하위 명령이 없다: {:?}", c.err().map(|e| e.to_string()));
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose-file", "/tmp/p.md"]);
+        assert!(c.is_ok(), "--purpose-file 이 없다");
+        // 둘 다 주면 거부(어느 쪽이 원문인지 모호).
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose", "a", "--purpose-file", "/tmp/p.md"]);
+        assert!(c.is_err(), "--purpose 와 --purpose-file 동시 지정이 통과했다");
     }
 }

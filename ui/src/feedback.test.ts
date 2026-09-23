@@ -32,7 +32,7 @@ const MB = 1024 * 1024;
 
 describe("첨부 형식", () => {
   it("확장자는 마지막 점 뒤 소문자 — 경로 구분자(맥 / · 윈도우 \\) 둘 다 인식", () => {
-    expect(extOf("/Users/a/Desktop/화면 기록.MOV")).toBe("mov");
+    expect(extOf("/Users/user/Desktop/화면 기록.MOV")).toBe("mov");
     expect(extOf("C:\\Users\\홍길동\\Pictures\\shot.PNG")).toBe("png");
     expect(extOf("archive.tar.gz")).toBe("gz");
     expect(extOf("noext")).toBe("");

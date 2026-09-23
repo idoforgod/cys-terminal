@@ -95,9 +95,12 @@ describe("전문가용 칸 — 버튼 위치·기본 접힘", () => {
 });
 
 describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", () => {
-  it("addDeptWorkspace 호출은 launchDept 안 1곳뿐", () => {
+  it("addDeptWorkspace 호출은 launchDept · runTeamProposalFlow 안 두 곳뿐(둘 다 확인 창을 지난 뒤에만)", () => {
+    // ★통합(WP-E U16): 말로 팀 만들기(runTeamProposalFlow)도 같은 addDeptWorkspace 를 재사용한다
+    // (새 생성 경로 0 — teamproposal.test.ts 가 invoke("allocate_dept_daemon" 호출 1곳을 핀). launchDept
+    // 는 카탈로그 선택 전용 인자 형태라 재사용하지 않고, 대신 재진입 가드(teamFlowBusy)를 공유한다.
     const where = enclosingFns("addDeptWorkspace(").filter((f) => f !== "addDeptWorkspace");
-    expect(where).toEqual(["launchDept"]);
+    expect([...new Set(where)].sort()).toEqual(["launchDept", "runTeamProposalFlow"]);
   });
   it("launchDept 호출은 확인 창 함수(와 exit 3 재확인 재귀)뿐 — 클릭 처리기·팔레트가 직접 부르지 않는다", () => {
     // 정의 줄 자신(`function launchDept(`)은 launchDept 로 세어진다 — 재귀(exit 3 재확인)와 같은 이름이라 합집합으로 본다.

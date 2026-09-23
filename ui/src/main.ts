@@ -49,6 +49,13 @@ import {
   feedCreatedToastTitle,
 } from "./feedclass";
 import {
+  parseTeamProposal,
+  buildTeamConfirm,
+  teamCardText,
+  teamCreateErrorText,
+  type TeamSpec,
+} from "./teamproposal";
+import {
   deptPlaceholderLabel,
   deptSlugOfSocket,
   pickDeptWorkspace,
@@ -4988,7 +4995,14 @@ async function addWorkspace(): Promise<Workspace> {
 // ① 표시 지연(안 C): 무거운 launch await(최대 ~12s) '전에' placeholder 탭을 즉시 render — 체감 지연 0.
 // ② 고아 방지(안 A): 빈 newSurface를 만들지 않는다. cys-dept가 띄우는 role=master surface가
 //    refreshPaneTitles 자동입양으로 '첫 pane'이 되게 한다(빈 셸 미생성 → 고아 0).
-async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
+// ★U16(0.14.41): teamSpec = 오너가 팀 제안 확인 창에서 [만들기]를 누른 팀(이름·하는 일). 새 생성 경로가
+//   아니라 같은 allocate_dept_daemon 에 인자 하나를 더한다(Tauri 가 feed 대조·검증 후 cys-dept allocate
+//   --team-spec-b64). 호출처는 runTeamProposalFlow 하나(teamproposal.test.ts 배선 핀).
+// ★REVIEW1 m5: 반환이 `null` 이면 "placeholder 탭이 생성 도중 닫혀 새 데몬을 회수했다"는 뜻
+// (아래 "탭 ×로 닫혔으면" 분기) — 팀이 안 만들어진 게 아니라 오너가 스스로 취소한 경우지만,
+// 호출측(runTeamProposalFlow)이 이 경우까지 성공("✅ 팀을 만들었습니다")으로 알리고 feed_reply
+// allow 를 보내면 사실과 다른 카드 소각이 된다.
+async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promise<Workspace | null> {
   // ★A4(성찰 확정): 이 경로는 **새 부서 cysd 를 spawn** 한다(allocate_dept_daemon→cys-dept launch) —
   // 리셋 진행/완료 중이면 격리 게이트를 Err 로 만들어 리셋을 반토막 내거나, 격리로 옮겨지는
   // ~/.cys·state 밑에 레지스트리를 재생성한다. 그래서 **모든 호출부가 daemonActionBlocked()로
@@ -5002,13 +5016,13 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
   activeWs = workspaces.length - 1;
   render();
   try {
-    const info = (await invoke("allocate_dept_daemon", { catalogKey })) as {
+    const info = (await invoke("allocate_dept_daemon", { catalogKey, teamSpec })) as {
       socket: string;
       socket_slug?: string;
       name: string;
       display_name?: string;
     };
-    ws.name = info.display_name ?? info.name; // ★표시명(create 카탈로그) 또는 부서 번호(레거시)
+    ws.name = info.display_name ?? info.name; // ★표시명(create 카탈로그·U16 팀 제안) 또는 부서 번호(레거시)
     if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
     // 멱등 합류 — 같은 부서 socket의 (이 placeholder가 아닌) 탭이 이미 있으면(연타·재호출이 같은 데몬을
     // 멱등 반환) placeholder를 폐기하고 기존 탭을 활성화한다. w !== ws 가드로 자기 자신과 오매칭 방지.
@@ -5020,7 +5034,10 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
       //   실패한 데몬은 등재된 채 살아 있으므로 다음 시작의 레지스트리 대조(missingKnownWorkspaces)가 탭으로 되살려
       //   보이게 한다(조용히 사라지는 경로가 아니다).
       if (!dup && info.socket) await invoke("stop_dept_daemon_by_socket", { socket: info.socket }).catch(() => {});
-      return dup ?? ws;
+      // ★REVIEW1 m5: dup(다른 탭이 같은 소켓을 이미 물고 있음)이면 그 탭을 진짜 결과로 돌려주고,
+      // 아니면(방금 만든 데몬을 여기서 회수했다) null 로 "회수됨"을 알린다 — 종전에는 지워진
+      // placeholder(ws)를 그대로 돌려줘 호출측이 성공과 구분할 수 없었다.
+      return dup ?? null;
     }
     if (dup) {
       const pi = workspaces.indexOf(ws);
@@ -5052,6 +5069,84 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
     if (ws.socket) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
     render();
     throw e;
+  }
+}
+
+// ★U16(0.14.41) 말로 팀 만들기 — 팀 제안 카드의 [확인 창 열기] 흐름(함수 경계 = 통합 교체 지점).
+// 순서 계약(teamproposal.test.ts 배선 핀): 재진입 가드(첫 await 앞) → 판독·확인 창(confirmModal) →
+//   기존 생성 경로(addDeptWorkspace — 새 생성 경로 0) → **생성 성공 뒤에만** feed_reply allow.
+//   [나중에]·창 바깥 = 아무것도 하지 않는다(제안 pending 유지 · 거부 아님 — 반박 M6).
+//   생성 실패 = 응답하지 않는다(카드 유지 · 다시 시도 가능 — cys-dept 가 같은 제안 id 를 멱등 처리해
+//   팀이 둘 생기지 않는다). 자동 팝업은 없다 — 이 함수의 호출처는 카드 버튼 하나다.
+// ★통합(WP-A2 U17): 재진입 가드·진행 중 버튼 잠금을 openTeamCreateFlow/confirmAndCreateTeam 과
+//   같은 모듈 변수(teamFlowBusy·deptBtnEl)로 공유한다 — 「팀 직접 만들기」 확인 창과 이 카드의 확인
+//   창이 동시에 뜨는 경합을 가드 하나로 원천 차단(가드 공유 = 확인 창 중복 원천 차단). 확인 창 내용
+//   (buildTeamConfirm)은 제안 고유 정보(이름·하는 일·발행자)라 buildDeptCreatePlan 과 합치지 않는다 —
+//   바깥 계약(순서·응답 시점·나중에의 뜻)은 그대로다.
+async function runTeamProposalFlow(item: FeedItem): Promise<void> {
+  if (teamFlowBusy) {
+    notifyTeamFlowBusy(); // 재진입 차단 — 첫 await 앞(확인 창 겹침·중복 생성 방지, WP-A2 공유 가드)
+    return;
+  }
+  teamFlowBusy = true;
+  let lockedDeptBtn = false;
+  try {
+    if (!started) {
+      toast("watchdog", "화면 복원 중입니다", "복원이 끝난 뒤 카드에서 다시 여세요(제안은 그대로 남아 있습니다).");
+      return;
+    }
+    if (daemonActionBlocked()) return;
+    const parsed = parseTeamProposal(item);
+    if (!parsed.ok) {
+      toast("health", "팀 제안을 열 수 없습니다", parsed.reason);
+      return;
+    }
+    let firstTeam: boolean | null = null;
+    try {
+      const reg = (await invoke("list_depts")) as { depts?: Record<string, unknown> };
+      firstTeam = Object.keys(reg.depts ?? {}).length === 0;
+    } catch {
+      firstTeam = null; // 명부 판독 실패 — 확인 창 문구를 조건형으로
+    }
+    const c = buildTeamConfirm(parsed.spec, { firstTeam });
+    const ok = await confirmModal(c.title, c.body, c.yesLabel, c.noLabel);
+    if (!ok) return; // 나중에 — 제안은 그대로 남는다(거부 아님)
+    if (daemonActionBlocked()) return; // 확인 창 대기 중 상태 변화 재검사
+    // ★통합: teamFlowBusy 가 확인 창부터 생성 완료까지를 통으로 잠그므로(공유 가드), 여기서 별도로
+    //   "다른 팀 만들기가 진행 중" 을 재확인할 필요가 없다(그 경합은 함수 첫 줄에서 이미 막힌다).
+    const btn = deptBtnEl();
+    if (btn) {
+      btn.disabled = true; // ＋부서 경로 버튼 표시 겸용(가드 본체는 공유 teamFlowBusy)
+      lockedDeptBtn = true;
+    }
+    let created: Workspace | null;
+    try {
+      created = await addDeptWorkspace(undefined, parsed.spec);
+    } catch (e) {
+      toast("health", "팀 만들기 실패 — 제안은 그대로 남아 있습니다", teamCreateErrorText(e));
+      return;
+    }
+    if (!created) {
+      // ★REVIEW1 m5: 생성 도중 placeholder 탭을 닫아 새 데몬을 회수한 경우 — allow 를 보내지
+      // 않는다(카드는 pending 유지). 다시 열면 addDeptWorkspace 의 멱등 경로가 같은 팀을 돌려준다.
+      toast("health", "팀 만들기 취소됨", "생성 중 탭을 닫아 되돌렸습니다 — 제안은 그대로 남아 있습니다(카드에서 다시 여세요).");
+      return;
+    }
+    try {
+      await invoke("feed_reply", { requestId: item.request_id, decision: "allow" });
+      toast("watchdog", "✅ 팀을 만들었습니다", `'${parsed.spec.display}' — 팀장 자리가 먼저 뜨고 팀원 자리는 이어서 채워집니다.`);
+    } catch (e) {
+      // 팀은 만들어졌다 — 제안 정리만 실패(카드 잔존). 다시 [만들기]를 눌러도 같은 팀을 돌려준다(멱등).
+      toast("health", "팀은 만들었으나 제안 정리 실패", feedReplyErrorText(e));
+    }
+  } finally {
+    if (lockedDeptBtn) {
+      const btn = deptBtnEl();
+      if (btn) btn.disabled = false;
+    }
+    teamFlowBusy = false;
+    refreshFeed();
+    refreshSidebarStatus();
   }
 }
 
@@ -5650,6 +5745,11 @@ function feedReplyErrorText(e: unknown): string {
   const s = String(e);
   if (s.includes("self_approval_denied"))
     return "자기승인 차단(§3.2) — 발행자와 같은 프로세스의 승인은 거부됩니다. 데몬이 구버전이면 업데이트 후 다시 시도하세요.";
+  // ★REVIEW1 m4: operator token 회전 경합(팩 재시작 등)에서 나는 코드 — Tauri 가 1회 재시도해도
+  // 좁은 창을 못 넘기면 여기로 온다. 팀 제안처럼 "앱에서만 처리할 수 있는 항목"이면 재클릭이
+  // 새 토큰으로 다시 붙는다(allocate 는 멱등이라 팀이 이미 만들어졌어도 다시 만들지 않는다).
+  if (s.includes("owner_gui_required"))
+    return "앱에서만 처리할 수 있는 항목입니다 — 다시 눌러 주세요(데몬 토큰이 막 바뀌었을 수 있습니다).";
   if (s.includes("not_found")) return "항목을 찾을 수 없습니다(만료·삭제되었을 수 있음).";
   if (s.includes("already resolved")) return "이미 처리된 항목입니다.";
   return `전송 오류: ${s}`;
@@ -5950,6 +6050,45 @@ async function refreshFeed() {
       dismiss.title = CYCLE_VERIFY_DISMISS_TITLE;
       wireFeedDismiss(dismiss, item.request_id);
       actions.append(dismiss);
+      el.append(note, actions);
+    } else if (item.status === "pending" && classifyPendingFeed(item) === "team-create") {
+      // ★U16(0.14.41) 팀 만들기 제안 카드 — 일반 Allow/Deny 를 두지 않는다(Allow 는 팀을 만들지 않고
+      //  항목만 소각하는 기만 버튼이 된다 · 근거는 feedclass.ts). [확인 창 열기] → 확인 창 [만들기] 만이
+      //  생성 경로이고, 거부는 이 카드의 [만들지 않기] 하나다(확인 창의 '나중에'는 거부가 아니다).
+      //  본문은 JSON 원문 대신 이름·하는 일 원문을 그대로 보인다.
+      const parsed = parseTeamProposal(item);
+      if (parsed.ok) body.textContent = teamCardText(parsed.spec);
+      const note = document.createElement("div");
+      note.className = "fi-meta";
+      note.textContent = parsed.ok
+        ? "본부 대표가 제안한 새 팀입니다 — [확인 창 열기]에서 내용을 확인하고 [만들기]를 눌러야 만들어집니다(자동으로 만들어지지 않습니다)."
+        : `제안 형식 오류(${parsed.reason}) — 만들 수 없습니다. [만들지 않기]로 정리하세요.`;
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const openBtn = document.createElement("button");
+      openBtn.className = "allow";
+      openBtn.textContent = "확인 창 열기";
+      openBtn.disabled = !parsed.ok;
+      openBtn.addEventListener("click", () => {
+        void runTeamProposalFlow(item);
+      });
+      const noBtn = document.createElement("button");
+      noBtn.className = "deny";
+      noBtn.textContent = "만들지 않기";
+      noBtn.addEventListener("click", async () => {
+        noBtn.disabled = true;
+        openBtn.disabled = true;
+        try {
+          await invoke("feed_reply", { requestId: item.request_id, decision: "deny" });
+          toast("feed", "팀 만들기 제안을 닫았습니다", item.title);
+        } catch (e) {
+          toast("health", "제안 닫기 실패", feedReplyErrorText(e));
+        } finally {
+          refreshFeed();
+          refreshSidebarStatus();
+        }
+      });
+      actions.append(openBtn, noBtn);
       el.append(note, actions);
     } else if (item.status === "pending") {
       const actions = document.createElement("div");
@@ -8021,8 +8160,11 @@ function onDaemonEvent(event: Record<string, unknown>) {
     toast("watchdog", `🐕 ${name}`, detail);
   } else if (category === "feed") {
     if (name === "feed.item.created") {
-      // ★U10(0.14.41): 정보성 kind(각성 훅·부트 실패·편성·CEO 알림 등)는 'ℹ 알림', 그 밖은 '📥 승인 요청'.
-      toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
+      // ★U16: 팀 만들기 제안은 확인 창을 자동으로 띄우지 않는다(포커스 탈취·취소 사고 · 반박 M6) — 안내만.
+      // ★U10(0.14.41): 그 밖의 kind는 정보성(각성 훅·부트 실패·편성·CEO 알림 등)이면 'ℹ 알림', 아니면 '📥 승인 요청'.
+      if (payload.kind === "team-create-request")
+        toast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
+      else toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
       // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.

@@ -425,6 +425,7 @@ usage(){
 usage: cys-dept <verb> ...
   cys-dept launch <name>                        부서 데몬 spawn+ACL 시드+등재 (name: ^[A-Za-z0-9][A-Za-z0-9_-]*$·최대 40자)
   cys-dept allocate                             lowest-unused dept-N 자동 발급·기동
+  cys-dept allocate --team-spec-b64 <b64>       오너 확인 창을 거친 팀 제안으로 발급(GUI 전용 · 이름·하는 일 → 팀 소개 TEAM.md)
   cys-dept create <catalog-key>                 카탈로그 기반 완전 자동 부서 생성
   cys-dept down <name> [--purge-state]          teardown(+state 격리)
   cys-dept down-sock <socket>                   socket 기준 teardown
@@ -1766,14 +1767,104 @@ launch_dept(){   # $1=name
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack acct=${acctdir:-none} cwd=$dept_cwd). 부서 수=$_dept_count"
 }
 
+# ── ★U16(0.14.41) 말로 팀 만들기 — `allocate --team-spec-b64 <b64>` 보조 2종 ──────────────────
+# 호출자: GUI(Tauri allocate_dept_daemon)가 오너의 확인 창 [만들기] 뒤에만 부른다. 단일소유 가드(위
+#   cysd_role_gate)는 그대로다 — 에이전트 좌석은 이 동사에 닿기 전에 exit 7.
+# 스키마 SOT = Rust `src/team_spec.rs`(데몬·Tauri 가 이미 검증했다). 여기는 **마지막 관문의 재검증**
+#   이며 한도·키·제어문자 규칙을 같게 둔다(test_team_create_u16.py C1 이 한도를 대조). 권위어 거부는
+#   Rust 쪽과 session-start.sh 주입 필터가 맡는다.
+# 한글(이름·하는 일)은 셸 변수·셸 인자로 들고 다니지 않는다 — URL-safe b64(ASCII)만 argv 로 넘기고
+#   python 한 프로세스 안에서 풀어 쓴다(반박 D9 · 윈도우 MSYS→네이티브 python 인자 경로 회피).
+team_spec_check(){  # $1=b64 — 0=정상 · 2=형식 위반(stderr 사유) · 부작용 0
+  python3 - "$1" <<'PY'
+import sys, json, base64, re, unicodedata
+b = sys.argv[1]
+def die(m):
+    sys.stderr.write("[cys-dept] allocate: 팀 제안 형식 오류 — %s\n" % m); sys.exit(2)
+if not re.fullmatch(r"[A-Za-z0-9_\-]{1,16384}={0,2}", b): die("b64 알파벳·길이(URL-safe)")
+try: raw = base64.urlsafe_b64decode(b.encode("ascii"))
+except Exception as e: die("b64 판독 실패: %s" % e)
+try: d = json.loads(raw.decode("utf-8"))
+except Exception as e: die("JSON 판독 실패: %s" % e)
+if not isinstance(d, dict) or sorted(d) != ["display", "id", "purpose", "v"]: die("키는 v·id·display·purpose 넷")
+if d.get("v") != 1 or isinstance(d.get("v"), bool): die("스키마 버전 1 아님")
+i, disp, purp = d.get("id"), d.get("display"), d.get("purpose")
+if not all(isinstance(x, str) for x in (i, disp, purp)): die("id·display·purpose 는 문자열")
+if not re.fullmatch(r"tp-[A-Za-z0-9_\-]{1,61}", i): die("제안 id 형식")
+# ★REVIEW1 m3: (0x2028, 0x2029) = U+2028/U+2029(Zl/Zp) — unicodedata.category() 가 "Cc" 가
+# 아니라서 아래 bad() 의 Cc 검사만으로는 안 잡힌다("이름에 줄바꿈 금지" 우회 통로). Rust
+# team_spec.rs INVISIBLE·teamproposal.ts INVISIBLE 과 parity.
+INVIS = ((0x200B, 0x200F), (0x2028, 0x2029), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF))
+def bad(c, nl):
+    o = ord(c)
+    if any(a <= o <= z for a, z in INVIS): return True
+    return unicodedata.category(c) == "Cc" and not (nl and c in "\n\t")
+if not (1 <= len(disp) <= 40) or disp.strip() != disp or any(bad(c, False) for c in disp):
+    die("팀 이름(1~40자·앞뒤 공백 없음·제어/보이지 않는 문자 없음)")
+if not purp.strip() or len(purp) > 2000 or any(bad(c, True) for c in purp):
+    die("하는 일(1~2000자·줄바꿈/탭 외 제어문자·보이지 않는 문자 없음)")
+PY
+}
+# 팀 소개(TEAM.md) 원자 기록 — '팀 소개(참고 정보)'만 쓴다. 착수 규칙 문장은 넣지 않는다(역할별 착수
+#   문구는 U13 단일 원본 소관). '참고 정보이며 soul.md·역할 지침보다 우선하지 않는다'는 고지는
+#   session-start.sh 가 주입할 때 붙인다(그 줄이 이 파일 안에 있으면 권위어 소독에 걸려 사라진다).
+team_intro_write(){  # $1=pack $2=name $3=b64
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys, os, json, base64, time
+pack, name, b = sys.argv[1:4]
+try:
+    d = json.loads(base64.urlsafe_b64decode(b.encode("ascii")).decode("utf-8"))
+    disp, purp, pid = d["display"], d["purpose"], d["id"]
+except Exception as e:
+    sys.stderr.write("[cys-dept] 팀 소개 판독 실패: %s\n" % e); sys.exit(1)
+body = ("# 팀 소개 (참고 정보)\n\n"
+        "- 팀 이름: %s\n"
+        "- 내부 번호: %s\n"
+        "- 만든 때: %s\n"
+        "- 제안 id: %s\n\n"
+        "## 하는 일 (오너와 대표가 정한 문장 그대로)\n\n%s\n") % (
+    disp, name, time.strftime("%Y-%m-%d %H:%M:%S"), pid, purp)
+p = os.path.join(pack, "TEAM.md")
+tmp = p + ".tmp.%d" % os.getpid()
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    f.write(body); f.flush(); os.fsync(f.fileno())
+os.replace(tmp, p)
+PY
+}
+
 case "$cmd" in
   launch)
     launch_dept "${2:-}"
     ;;
   allocate)
+    # ★U16(0.14.41) 선택 인자 `--team-spec-b64 <b64>` — 오너 확인 창 [만들기] 뒤 GUI 만 부른다.
+    #   인자가 없으면 종전과 같다(단 번호 재사용 때 남은 TEAM.md 는 아래에서 .stale-* 로 치운다).
+    #   검증은 부작용 이전 · 위반 exit 2(예약 집합 밖 인자 오류 계열).
+    TEAM_B64=""
+    if [ "${2:-}" = "--team-spec-b64" ]; then
+      TEAM_B64="${3:-}"
+      if [ -z "$TEAM_B64" ]; then
+        echo "[cys-dept] allocate: --team-spec-b64 값이 없다" >&2
+        echo "usage: cys-dept allocate [--team-spec-b64 <b64>]" >&2
+        exit 2
+      fi
+      team_spec_check "$TEAM_B64" || exit 2
+    fi
+    # ★U16: 팀 제안 allocate 는 팩·상태·계정 폴더가 **셋 다 없는** 번호만 쓴다 — 지운 팀의 번호를
+    #   다시 쓰면 옛 팀의 soul.md·SESSION_STATE·할 일·기억·계정 폴더가 통째로 따라온다(반박 M2/D4).
+    #   폴더를 치워 번호를 재사용하는 방식은 비가역이라 쓰지 않는다. 계정 base 는 예약 전에 해석해
+    #   접두만 argv 로 넘긴다(MSYS 가 경로 인자를 네이티브로 변환한다 — heredoc 본문·env 는 변환 안 됨).
+    _tp_pack=""; _tp_state=""; _tp_acct=""
+    if [ -n "$TEAM_B64" ]; then
+      _tp_base="$(resolve_default_base "${CYS_DEPT_DEFAULT_ACCOUNT:-default}")" || { echo "[cys-dept] allocate: 기본계정 base 해석 불가 — fail-closed" >&2; exit 5; }
+      [ -n "$_tp_base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값 — fail-closed" >&2; exit 5; }
+      _tp_pack="$(dept_pack X)"; _tp_pack="${_tp_pack%X}"
+      _tp_state="$(dept_logdir X)"; _tp_state="${_tp_state%X}"
+      _tp_acct="${_tp_base%/}-"
+    fi
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
     # 시나리오2: 레지스트리엔 빠졌어도 소켓을 점유 중인(죽어가는) 데몬 번호는 alive() probe로 skip.
-    name=$(reg_init; python3 - "$REG" <<'PY'
+    name=$(reg_init; python3 - "$REG" "$TEAM_B64" "$_tp_pack" "$_tp_state" "$_tp_acct" <<'PY'
 import json,sys,os,re,socket as S
 try:
     import fcntl
@@ -1786,6 +1877,9 @@ except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일
         except OSError: pass
     def _ulk(f): pass
 p=sys.argv[1]
+# ★U16: 팀 제안(선택) — 앞의 team_spec_check 가 이미 검증했다. 번호 회피용 폴더 접두 3종.
+team_b64=sys.argv[2] if len(sys.argv)>2 else ""
+pfx=[x for x in sys.argv[3:6] if x]
 lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p, encoding="utf-8-sig"))
@@ -1793,6 +1887,17 @@ try:
     except Exception as e:
         sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     depts=d.setdefault('depts',{})
+    spec=None
+    if team_b64:
+        import base64
+        try: spec=json.loads(base64.urlsafe_b64decode(team_b64.encode('ascii')).decode('utf-8'))
+        except Exception as e:
+            sys.stderr.write("[cys-dept] allocate: 팀 제안 판독 실패: %s\n"%e); sys.exit(2)
+        # 멱등(재시도·부분 성공 복구): 같은 제안으로 이미 등재된 팀이 있으면 새로 만들지 않는다.
+        for k,e in depts.items():
+            if isinstance(e,dict) and e.get('team_proposal_id')==spec['id']:
+                sys.stderr.write("[cys-dept] allocate: 같은 팀 제안(%s)으로 이미 만든 팀 %s — 새로 만들지 않는다(멱등)\n"%(spec['id'],k))
+                print("="+k); sys.exit(0)
     home=os.path.expanduser('~')
     # ★[2] hard cap(reserve flock 안 — 동시성·원자성 유지): 죽은(미reap) 등록은 빼고 ★살아있는 데몬만 카운트.
     # RC-6: AF_UNIX→cys ping(OS중립·named pipe 대응). os.path.exists는 named pipe에 False라 제거.
@@ -1811,11 +1916,17 @@ try:
         return (r"\\.\pipe\cys-dept-dept-%d"%n) if os.name=="nt" else f"{home}/.local/state/cys-dept-dept-{n}/cys.sock"
     def alive(n):  # 시나리오2: 레지스트리엔 빠졌어도 소켓 점유(죽어가는 데몬)면 그 번호 재사용 금지
         return _alive_sk(_dept_sk(n))
+    def _leftover(n):  # ★U16: 팀 제안이면 옛 팀 흔적(팩·상태·계정 폴더)이 남은 번호를 건너뛴다
+        return bool(spec) and any(os.path.exists(pf+"dept-%d"%n) for pf in pfx)
     N=1
-    while N in used or alive(N): N+=1
+    while N in used or alive(N) or _leftover(N): N+=1
     name=f"dept-{N}"
     depts[name]={'socket':_dept_sk(N),  # RC-6: OS별 소켓 규약(Windows named pipe·unix .sock)
                  'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master'}
+    if spec:  # ★U16: 표시명·하는 일 첫 줄(CEO 라우팅 근거)·제안 id(멱등 키)를 예약과 같은 원자 기록으로
+        depts[name]['display_name']=spec['display']
+        depts[name]['purpose']=next((l.strip() for l in spec['purpose'].splitlines() if l.strip()),'')[:200]
+        depts[name]['team_proposal_id']=spec['id']
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
@@ -1824,6 +1935,13 @@ finally: _ulk(lf)
 PY
 ) || exit $?   # ★cap 거부(exit 8)·예약 실패 코드 그대로 전파
     [ -n "$name" ] || { echo "[cys-dept] allocate: 번호 발급 실패" >&2; exit 1; }
+    # ★U16 멱등 재사용('=' 표지): 같은 제안으로 이미 만든 팀 — 예약·스폰·trap 없이 이름만 돌려준다.
+    case "$name" in
+      "="*) name="${name#=}"; name="${name%$'\r'}"
+            validate_dept_name "$name" "allocate"
+            echo "$name"   # stdout 마지막 줄 = 확정 이름(Tauri 파싱 계약) · 새 팀 0
+            exit 0 ;;
+    esac
     _dept_spawn_pid=""
     trap 'dept_creation_failed "$?" "$name" reserve' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
     # ★D3(i) 사후 assert: allocate name은 기계 생성(dept-N)이라 항상 정형이 정상 — 불변식 위반·
@@ -1858,6 +1976,19 @@ PY
     #   (`.` 같은 상대값을 그대로 두면 재기동 호출자의 cwd 에 좌우된다 · codex R4). 실패는 fail-open + WARN 1줄.
     reg_set_field "$name" cwd "$dept_cwd" || echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
+    # ★U16: 팀 소개(참고 정보) — 빈 셸·편성보다 먼저 기록해 첫 SessionStart 가 반드시 본다.
+    #   기록 실패 = 오너가 본 내용이 팀에 닿지 않는다 → fail-closed(스폰 전 · 위 trap 이 예약 회수 · exit 6=시드).
+    #   인자 없는 allocate 는 번호 재사용 때 옛 팀 소개가 새 팀에 주입되지 않게 .stale-<ts> 로 치운다
+    #   (비가역 삭제 금지 · 파일이 없으면 무동작 = 종전 바이트 동일 · 조사 F7).
+    if [ -n "$TEAM_B64" ]; then
+      team_intro_write "$pack" "$name" "$TEAM_B64" || { echo "[cys-dept] ERROR: $name 팀 소개(TEAM.md) 기록 실패 — fail-closed" >&2; exit 6; }
+    elif [ -f "$pack/TEAM.md" ]; then
+      if mv -f "$pack/TEAM.md" "$pack/TEAM.md.stale-$(date +%Y%m%d%H%M%S 2>/dev/null || echo old)" 2>/dev/null; then
+        echo "[cys-dept] $name: 옛 팀 소개(TEAM.md)를 .stale-* 로 치웠다(번호 재사용 — 새 팀에 주입 금지)" >&2
+      else
+        echo "[cys-dept] WARN: $name 옛 팀 소개(TEAM.md)를 치우지 못했다 — 새 팀에 옛 소개가 주입될 수 있다: $pack/TEAM.md" >&2
+      fi
+    fi
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용) — 티켓 발급 로그 문면 구분용
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0

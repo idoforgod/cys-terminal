@@ -6174,7 +6174,7 @@ class U7WindowsClaudeKeyForm(unittest.TestCase):
         K = pf.claude_key_nt
         for raw, want in ((r"C:\Users\x", "C:/Users/x"),
                           ("C:\\Users\\x\\", "C:/Users/x"),              # 꼬리 구분자
-                          (r"C:\Users\x\..\user", "C:/Users/user"),      # `..` 정규화(더미 이름 — secret-scan 규칙 1)
+                          (r"C:\Users\x\..\x", "C:/Users/x"),      # `..` 정규화(더미 이름 — 두 스캐너 교집합: secret-scan.sh dummy_names ∩ scan-pack-secrets.sh ph_re = "x")
                           (r"C:\Users\.\x", "C:/Users/x"),
                           (r"c:\users\x", "c:/users/x"),                 # 드라이브 대소문자 보존
                           ("C:\\", "C:/"),                               # 드라이브 루트

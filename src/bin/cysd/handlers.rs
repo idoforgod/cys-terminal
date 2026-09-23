@@ -6111,13 +6111,54 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // §3.2 자기승인 차단용 발행자 surface(자기승인 대조 + W3.6 back-pressure 키 + W3.2
             // 멱등 의미 키에 공용). resolve_caller_surface는 surfaces 락을 잡으므로 여기서 1회만.
             let publisher_surface = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            // ★U16(0.14.41) 팀 만들기 제안 잠금 — kind=team-create-request 만(다른 kind 는 바이트 무변경).
+            //   제안자(본부 레인 master 좌석)·wait 금지·본문 형식을 **부작용 이전**에 판정한다. 건수
+            //   (대기 1·24h 3)는 아래 항목 공개 임계영역 안에서 판정한다(동시 push 경합에서 상한이 새지
+            //   않게). 제목은 데몬이 정하고 tier 는 d 로 고정한다(원격 채널 미러 금지) · CEO 자동결재 제외.
+            //   ★정직한 한계: 사고 방지 층이다(cys::team_spec 머리말 — 같은 UID 고의 우회는 막지 못한다).
+            let team_proposal = kind == cys::team_spec::KIND;
+            let (title, tier) = if team_proposal {
+                let role = publisher_surface
+                    .and_then(|sid| daemon.get_surface(sid))
+                    .and_then(|s| s.role.lock().unwrap().clone());
+                if let Err(m) = cys::team_spec::publisher_ok(
+                    cys::is_dept_socket(&daemon.socket_path),
+                    role.as_deref(),
+                ) {
+                    return Reply::Single(err_response(&id, "forbidden", &m));
+                }
+                if wait {
+                    // F5: `--wait` 대기자가 끊기면(에이전트 도구 시간초과) 항목이 timeout 으로 닫혀
+                    //   오너의 카드가 사라진다. 제안은 올리고 끝낸다.
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "팀 만들기 제안은 --wait 로 올리지 않는다(도구 시간초과가 오너의 카드를 소각한다)",
+                    ));
+                }
+                let spec = match cys::team_spec::parse_body(&body) {
+                    Ok(s) => s,
+                    Err(m) => return Reply::Single(err_response(&id, "invalid_params", &m)),
+                };
+                if spec.id != request_id {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "팀 제안 본문의 id 와 request_id 가 다르다",
+                    ));
+                }
+                (cys::team_spec::title_for(&spec), Some("d".to_string()))
+            } else {
+                (title, tier)
+            };
             // W3.1 서버측 위험 파생 — 발행자 tier/kind 자기신고 무관, title·body 서술만으로.
             let risk = crate::approval_risk::derive_risk(&title, &body);
             // W3.2 자동결재 대상 = flag ON + risk=AutoEligible일 때만(fail-safe 기본 OFF).
             // + W4-A(결함7-e): 발행자 무명(publisher_surface=None — 고아화/setsid/pane 밖 발행)은
             //   CEO 자동결재 원천 제외(fail-closed: 발행 주체를 증명 못 하는 요청이 무검증 자동
             //   해소로 흐르지 않는다). 항목은 pending 유지 = HighRisk 취급(사람 결재 경로).
-            let auto_route = daemon.config.approve_auto_route
+            let auto_route = !team_proposal
+                && daemon.config.approve_auto_route
                 && risk == crate::approval_risk::RiskClass::AutoEligible
                 && publisher_surface.is_some();
             let item = FeedItem {
@@ -6152,6 +6193,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "invalid_params",
                         "duplicate request_id",
                     ));
+                }
+                // ★U16: 건수 잠금은 공개와 같은 임계영역 — 판정과 push 사이에 다른 push 가 끼지 못한다.
+                if team_proposal {
+                    if let Err(m) = cys::team_spec::admit(
+                        items.iter().map(|i| (i.kind.as_str(), i.status.as_str(), i.created_at)),
+                        crate::state::now_epoch(),
+                    ) {
+                        return Reply::Single(err_response(&id, "team_proposal_limit", &m));
+                    }
                 }
                 items.push(item.clone());
                 // 메모리 무한 누적 차단: 한도 초과 시 가장 오래된 종결 항목부터 퇴출
@@ -6200,7 +6250,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //  · AutoEligible → CEO 좌석 즉시 배달(멱등·좌석부재 escalation)
             //  · HumanOnly    → CEO 이행 불가 → 즉시 오너 escalation(결재의 한 형태, W3.8-①·멱등)
             //  · HighRisk     → v1 사람 결재 유지(현행 CC 경로 — 무개입)
-            if daemon.config.approve_auto_route {
+            if daemon.config.approve_auto_route && !team_proposal {
                 let over_pressure = record_approval_request(daemon, publisher_surface);
                 match risk {
                     crate::approval_risk::RiskClass::AutoEligible => {
@@ -6222,6 +6272,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             match rx {
+                // ★U16: `team_gate` = 이 데몬이 팀 제안 잠금을 집행했다는 표지 — `cys team-propose` 는
+                //   이 표지가 없는 응답(잠금 없는 구 데몬)을 받으면 제안을 스스로 거둔다(스큐 fail-closed).
+                None if team_proposal => Reply::Single(ok_response(
+                    &id,
+                    json!({"request_id": request_id, "status": "pending", "team_gate": 1}),
+                )),
                 None => Reply::Single(ok_response(
                     &id,
                     json!({"request_id": request_id, "status": "pending"}),
@@ -6245,7 +6301,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // M7: 해소는 단일 경로(resolve_feed_item)에 위임한다. 위임 전 precheck로 ①존재 여부
             // ②already-resolved를 구분(resolve_feed_item은 둘 다 None)하고, 자기승인 판정용 발행자
             // pid/pgid를 캡처한다.
-            let (pub_pid, pub_pgid, pub_sid) = {
+            let (pub_pid, pub_pgid, pub_sid, team_item) = {
                 let items = daemon.feed_items.lock().unwrap();
                 match items.iter().find(|i| i.request_id == request_id) {
                     None => {
@@ -6262,7 +6318,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "item already resolved",
                         ))
                     }
-                    Some(item) => (item.publisher_pid, item.publisher_pgid, item.publisher_surface),
+                    Some(item) => (
+                        item.publisher_pid,
+                        item.publisher_pgid,
+                        item.publisher_surface,
+                        item.kind == cys::team_spec::KIND,
+                    ),
                 }
             };
             // §3.2 표면정책 — 자기승인 차단(M4 pgid + MED-2 surface 격상): 발행자와 승인자가 pid·pgid·
@@ -6289,6 +6350,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .zip(daemon.operator_token.as_deref())
                 .map(|(t, d)| !d.is_empty() && t == d)
                 .unwrap_or(false);
+            // ★U16(0.14.41): 팀 만들기 제안은 오너 GUI(operator token)만 해소한다 — 예외는 발행 좌석
+            //   자신의 `superseded`(자기 제안 거두기) 하나. 아래 자기승인 가드는 `allow` 만 막아서,
+            //   대표가 승인 피드 구독 흐름에서 자기 제안에 deny·yes·자유문구를 보내면 오너가 보기 전에
+            //   카드가 소각됐다(반박 M3·D2). 판정 정의처 = cys::team_spec::reply_allowed.
+            if team_item
+                && !cys::team_spec::reply_allowed(&decision, operator_ok, caller_sid, pub_sid)
+            {
+                return Reply::Single(err_response(
+                    &id,
+                    "owner_gui_required",
+                    cys::team_spec::REPLY_DENIED,
+                ));
+            }
             if !operator_ok
                 && crate::state::is_self_approval(
                     pub_pid,

@@ -66,7 +66,7 @@ describe("계정 라벨 — 프로필명만, 이메일은 절대 라벨이 되�
     expect(accountShortLabel(acct({ provider: "codex", label: "OpenAI Codex" }))).toBe("Codex");
     expect(accountShortLabel(acct({ provider: "gemini", label: "Antigravity (agy)" }))).toBe("agy");
     for (const p of [[], [".cys/claude"], ["/weird/place"]])
-      expect(accountShortLabel(acct({ profiles: p, label: "leak@x.io" })).includes("@")).toBe(false);
+      expect(accountShortLabel(acct({ profiles: p, label: "leak@example.com" })).includes("@")).toBe(false);
   });
 });
 
@@ -256,18 +256,18 @@ describe("패널 모델 — 정직한 공백", () => {
     const a = acct({
       account_id: "acc-uuid-77",
       label: "",
-      profiles: ["C:\\Users\\bob\\.cys\\claude", "/Users/bob/.claude-2", "C:/Users/bob/.cys/claude"],
+      profiles: ["C:\\Users\\runner\\.cys\\claude", "/Users/runner/.claude-2", "C:/Users/runner/.cys/claude"],
       rate: [win("5h", 5)],
     });
     const red = buildUsageBarModel([a], NOW, ok, (s) => `#${s.length}`, true).primary!.tooltip;
-    expect(red.includes("bob")).toBe(false);
+    expect(red.includes("runner")).toBe(false);
     expect(red.includes("Users")).toBe(false);
     const folders = red.split("\n").find((l) => l.startsWith("설정 폴더:"))!;
     expect(folders).toBe("설정 폴더: .claude-2, .cys/claude"); // 가린 뒤에도 중복은 접는다
     // 라벨이 비면 account_id 가 신원 줄에 나온다 — 그것도 가림 함수를 거친다(CC 계정 섹션과 같은 규칙).
     expect(red.includes("acc-uuid-77")).toBe(false);
     const plain = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
-    expect(plain).toContain("C:/Users/bob/.cys/claude"); // 가림을 끄면 정규화한 원래 경로
+    expect(plain).toContain("C:/Users/runner/.cys/claude"); // 가림을 끄면 정규화한 원래 경로
     expect(plain).toContain("acc-uuid-77");
     // 다른 계정 줄의 툴팁도 같은 규칙.
     const other = acct({ account_id: "o2", profiles: ["/home/alice/.claude-9"], rate: [win("5h", 1)] });
@@ -277,9 +277,9 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(tips).toContain(".claude-9");
   });
   it("profileTail — 좌석·부서 폴더는 `.cys/<이름>`, 그 밖은 끝 이름", () => {
-    expect(profileTail("C:\\Users\\bob\\.cys\\claude")).toBe(".cys/claude");
-    expect(profileTail("/Users/bob/.cys/claude-sales/")).toBe(".cys/claude-sales");
-    expect(profileTail("/Users/bob/.claude-4")).toBe(".claude-4");
+    expect(profileTail("C:\\Users\\runner\\.cys\\claude")).toBe(".cys/claude");
+    expect(profileTail("/Users/runner/.cys/claude-sales/")).toBe(".cys/claude-sales");
+    expect(profileTail("/Users/runner/.claude-4")).toBe(".claude-4");
     expect(profileTail(".claude-1")).toBe(".claude-1");
     expect(profileTail("")).toBe("");
   });
