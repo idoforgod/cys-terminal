@@ -21885,6 +21885,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     "[pack-update] 이미 최신 — 반영 0 (remote {} ≤ 디스크). no-op.",
                     outcome.pack_version
                 );
+                println!("{}", cys::pack::pack_update_uptodate_line(&outcome.pack_version));
                 return Ok(0);
             }
             VersionGate::BinaryTooOld => {

@@ -231,7 +231,7 @@ describe("[hidden] 짝 규칙 — 실제 style.css · index.html · main.ts", ()
 
   it(".badge[hidden] 짝이 실제로 있다(Control Center 빨간 0 · Update ! 의 근본 원인)", () => {
     const pair = cssRules(CSS).find((r) => r.sel === ".badge[hidden]");
-    expect(pair).toBeDefined();
+    expect(pair === undefined).toBe(false);
     expect(displayOf(pair!.body)).toBe("none");
   });
 

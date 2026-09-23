@@ -52,9 +52,12 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
     expect(code.includes("packCheckFailed = true")).toBe(false);
   });
 
-  it("확인은 단일 비행(동시 클릭·폴링이 curl 을 겹쳐 띄우지 않는다)", () => {
+  it("확인은 단일 비행(동시 클릭·폴링이 curl 을 겹쳐 띄우지 않는다) + 확인마다 상한(멈춘 연결이 비행을 영구히 붙잡지 않게)", () => {
     const b = fnBody("refreshUpdateState");
     expect(b).toContain("updRefreshInFlight");
+    expect(b).toContain('rpcT(invoke("check_update"), T_UPD_CHECK)');
+    expect(b).toContain('rpcT(invoke("check_pack_update"), T_UPD_CHECK)');
+    expect(b).toContain("updRefreshInFlight = null"); // finally 에서 반드시 풀린다
   });
 
   it("Update 클릭 = 상태 창(R3) — 캐시로 본체 설치 창부터 여는 분기 금지", () => {

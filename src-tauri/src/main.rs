@@ -6128,27 +6128,32 @@ fn default_pack_manifest_url() -> String {
 }
 
 /// 무중단 팩 업데이트 가용성 확인(DESIGN §7-④ 3축 게이트) — 원격 pack-manifest.json만 경량
-/// 페치(curl)해 디스크 `.pack-version` 및 실행 바이너리 버전과 비교한다. ★pack.tar.gz·서명은
-/// 받지 않는다(폴링 비용 최소화) — 실제 다운로드·서명검증·원자적 반영·reinject는
+/// 페치(curl)해 디스크 `.pack-version`·`.pack-state.json` 및 실행 바이너리 버전과 비교한다.
+/// ★pack.tar.gz·서명은 받지 않는다(폴링 비용 최소화) — 실제 다운로드·서명검증·원자적 반영·reinject는
 /// install_pack_update(사이드카 cys pack-update)가 전담한다(불가침).
-/// 반환(★3상태 — UI가 'transient 장애'와 '확인된 no-update'를 구분해 fail-safe 상태보존):
-///   - Ok(Some({pack_version, manifest_url, min_binary_version, binary_too_old}))
-///       → 확인된 새 팩 있음. binary_too_old=false=무중단 가능(install_pack_update 경로) /
-///         true=min_binary_version > 실행 바이너리 = 무중단 거부, 바이너리(재시작) 경로 안내.
-///   - Ok(None)  → ① 정상 no-update(원격을 받아·파싱해 비교했고 디스크보다 새것이 아님) 또는
-///                 ② 미서명/필수필드 부재 manifest의 fail-closed 거부(보안 경계 — 받았으나 신뢰 불가,
-///                 설치 안 함). UI는 이때만 packUpdateAvailable을 해제한다(확인된 '새 팩 없음').
-///   - Err(..)   → ★일시 fetch 장애(spawn/join·curl 실행·HTTP 비정상). UI의 기존 catch가
-///                 packCheckFailed=true로 잡아 마지막 검증 상태를 보존하고 토스트는 띄우지 않는다
-///                 (silent 폴링). '확인된 no-update'와 섞지 않는 게 핵심 — 일시 장애로
-///                 packUpdateAvailable이 소거돼 배지가 사라지는 것을 막는다.
+/// 반환(★U9 · 0.14.41 계약 확장 — 종전 3상태의 Ok(None)을 **타입 있는 status** 로 쪼갰다):
+///   - Ok({status, pack_version, disk_version, min_binary_version, manifest_url, binary_too_old, reason?, detail?})
+///       status = available | none | binary-too-old | channel-refused | manifest-unreadable | disk-unknown
+///       · available      확인된 새 팩 · 무중단 가능(install_pack_update 경로)
+///       · none           원격을 받아·해석해 비교했고 디스크보다 새것이 아님 = **유일한 '팩 최신'**
+///       · binary-too-old min_binary_version > 실행 바이너리 = 무중단 거부, 본체 업데이트 안내
+///       · channel-refused pro 설치에 공개(free) 번들 — CLI 가 [pack-channel-refused] 로 거부할 것
+///       · manifest-unreadable 받았으나 해석 불가(필수 필드 부재·HTML 응답 등) — 설치 안 함(보안 경계
+///                        불변)이되 **'최신'이라 말하지 않는다**. ★의도적 계약 변경: 종전 Ok(None)
+///                        (codex R2 #1 "재시도해도 동일 = 확정 거부")은 '거부'로서는 옳았으나 UI 가 그것을
+///                        '확인된 새 팩 없음'으로 읽어 "최신 버전입니다"를 띄웠다(U9 R4).
+///       · disk-unknown   디스크 팩 상태 불명(reason: pack-version-missing | pack-version-unreadable |
+///                        pack-state-corrupt | pack-state-mismatch) — CLI 는 no-op 또는 typed 거부.
+///   - Err(..) → ★일시 fetch 장애(spawn/join·curl 실행·HTTP 비정상)만. UI 는 실패로 기록하고 직전 검증
+///               상태를 '직전 확인 기준'으로만 보존한다('최신' 단정 금지).
+/// 판정 순서는 CLI(cys.rs pack_update_from_dir)와 같다 — classify_pack_check 주석·파리티 테스트 참조.
 #[tauri::command]
-async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>, String> {
+async fn check_pack_update(manifest_url: Option<String>) -> Result<Value, String> {
     let url = manifest_url.unwrap_or_else(default_pack_manifest_url);
     // 경량 페치: manifest JSON만 stdout으로. blocking 풀에서 실행(install_pack_update curl 패턴 동형).
     let fetch_url = url.clone();
-    // ★transient 실패(spawn/join·curl 실행·HTTP 비정상)는 Err로 돌린다 — UI catch가 상태보존(silent).
-    //   Ok(None)으로 접으면 '확인된 no-update'와 구분 불가 → 일시 장애에 배지 소거(codex R2 #1).
+    // ★transient 실패(spawn/join·curl 실행·HTTP 비정상)는 Err로 돌린다 — UI 가 '실패'로 기록.
+    //   none 으로 접으면 '확인된 no-update'와 구분 불가 → 일시 장애에 '최신' 오표시(codex R2 #1).
     let joined = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("curl");
         cmd.args(["-fsSL", &fetch_url]);
@@ -6164,28 +6169,14 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
         Ok(Err(e)) => return Err(format!("curl 실행 실패: {e}")),
         Err(e) => return Err(format!("curl join 실패: {e}")),
     };
+    // 디스크 판독은 **읽기만** 한다(.pack-version · .pack-state.json) — 쓰기·자가치유는 CLI/부트 몫.
     let dir = cys::pack::pack_dir();
     let disk = std::fs::read_to_string(dir.join(".pack-version"));
     let state = cys::pack::read_pack_state(&dir);
-    match classify_pack_check(&out.stdout, disk, state, env!("CARGO_PKG_VERSION")) {
-        PackCheck::Available { version, min_binary, .. } => Ok(Some(json!({
-            "pack_version": version,
-            "min_binary_version": min_binary,
-            "manifest_url": url,
-            "binary_too_old": false,
-        }))),
-        PackCheck::BinaryTooOld { version, min_binary, .. } => Ok(Some(json!({
-            "pack_version": version,
-            "min_binary_version": min_binary,
-            "manifest_url": url,
-            "binary_too_old": true,
-        }))),
-        _ => Ok(None),
-    }
+    Ok(classify_pack_check(&out.stdout, disk, state, env!("CARGO_PKG_VERSION")).to_json(&url))
 }
 
-/// check_pack_update 의 판정 결과(fetch 이후 · 순수). U9(0.14.41) 추출 단계 — 이 커밋은 종전
-/// 의미를 그대로 옮긴다(RED 검체): 매니페스트 해석 실패·디스크 판독 실패를 전부 None 으로 접는다.
+/// check_pack_update 의 판정 결과(fetch 이후 · 순수 · 단위테스트 대상).
 #[derive(Debug, Clone, PartialEq)]
 enum PackCheck {
     Available { version: String, disk: String, min_binary: String },
@@ -6196,35 +6187,134 @@ enum PackCheck {
     DiskUnknown { reason: &'static str, detail: String, version: String },
 }
 
-/// 종전 check_pack_update 본문(fetch 이후) 그대로 — semver 만 비교하고 실패는 None.
+impl PackCheck {
+    fn to_json(&self, manifest_url: &str) -> Value {
+        match self {
+            PackCheck::Available { version, disk, min_binary } => json!({
+                "status": "available", "pack_version": version, "disk_version": disk,
+                "min_binary_version": min_binary, "manifest_url": manifest_url, "binary_too_old": false,
+            }),
+            PackCheck::None { version, disk } => json!({
+                "status": "none", "pack_version": version, "disk_version": disk,
+                "manifest_url": manifest_url,
+            }),
+            PackCheck::BinaryTooOld { version, disk, min_binary } => json!({
+                "status": "binary-too-old", "pack_version": version, "disk_version": disk,
+                "min_binary_version": min_binary, "manifest_url": manifest_url, "binary_too_old": true,
+            }),
+            PackCheck::ChannelRefused { version, disk } => json!({
+                "status": "channel-refused", "pack_version": version, "disk_version": disk,
+                "manifest_url": manifest_url, "reason": "pack-channel-refused",
+            }),
+            PackCheck::ManifestUnreadable { detail } => json!({
+                "status": "manifest-unreadable", "detail": detail, "manifest_url": manifest_url,
+            }),
+            PackCheck::DiskUnknown { reason, detail, version } => json!({
+                "status": "disk-unknown", "reason": reason, "detail": detail,
+                "pack_version": version, "manifest_url": manifest_url,
+            }),
+        }
+    }
+}
+
+/// 진단 문구 상한 — 원격 본문(HTML 등)이 그대로 창에 쏟아지지 않게 글자 수로 자른다(char 경계 안전).
+fn clip_detail(s: &str, max_chars: usize) -> String {
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// check_pack_update 판정(순수). ★순서는 CLI `pack_update_from_dir`(cys.rs)와 같다 — CLI 코드는
+/// 옮기지 않고(③ 자가치유 경로 리팩터 금지 · 반박 D2) lib 공개 부품(read_pack_state·
+/// remote_is_newer_tuple·parse_semver)과 기존 pack_binary_too_old 로 같은 순서를 밟는다:
+///   ① 매니페스트 해석(PackManifest serde · fail-closed)      실패 → manifest-unreadable
+///   ② .pack-state.json: 손상 → disk-unknown(pack-state-corrupt) · base≠.pack-version → (pack-state-mismatch)
+///   ③ 채널 전이: 디스크 pro ∧ 번들 free → channel-refused
+///   ④ (표시 정직화 · GUI 전용) .pack-version 부재/해석 불가 → disk-unknown · remote pack_version 해석
+///      불가 → manifest-unreadable. CLI 는 여기서 UpToDate(no-op)로 끝나므로 '설치 안 함'은 같고,
+///      GUI 만 그것을 '최신'이라 부르지 않는다(U9 R4 · 반박 D3).
+///   ⑤ (base semver, pro_revision) 튜플 strictly-newer 아님 → none
+///   ⑥ min_binary_version > 실행 바이너리 → binary-too-old
+///   ⑦ available
 fn classify_pack_check(
     manifest_bytes: &[u8],
     disk: std::io::Result<String>,
-    _state: cys::pack::PackStateRead,
+    state: cys::pack::PackStateRead,
     running: &str,
 ) -> PackCheck {
-    // 미서명/필수필드 부재 manifest = packsig PackManifest 역직렬화 fail-closed(거부) = 보안 경계.
-    //   받았으나 신뢰 불가 → '새 팩 없음'으로 취급(Ok(None), 설치 안 함).
     let manifest: cys::packsig::PackManifest = match serde_json::from_slice(manifest_bytes) {
         Ok(m) => m,
-        Err(_) => {
-            return PackCheck::None { version: String::new(), disk: String::new() };
+        Err(e) => {
+            return PackCheck::ManifestUnreadable { detail: clip_detail(&e.to_string(), 160) };
         }
     };
-    let disk = disk.map(|s| s.trim().to_string()).unwrap_or_default();
-    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야. ★여기서 false면 '확인된 no-update' = Ok(None).
-    if !cys::pack::remote_is_newer(&manifest.pack_version, &disk) {
-        return PackCheck::None { version: manifest.pack_version, disk };
+    let (disk_version, disk_err) = match disk {
+        Ok(s) => (s.trim().to_string(), None),
+        Err(e) => (String::new(), Some(e.kind())),
+    };
+    let (disk_channel, disk_rev) = match state {
+        cys::pack::PackStateRead::Absent => ("free".to_string(), 0u32),
+        cys::pack::PackStateRead::Corrupt(e) => {
+            return PackCheck::DiskUnknown {
+                reason: "pack-state-corrupt",
+                detail: clip_detail(&e, 160),
+                version: manifest.pack_version,
+            };
+        }
+        cys::pack::PackStateRead::Valid(st) => {
+            if st.base_version != disk_version {
+                return PackCheck::DiskUnknown {
+                    reason: "pack-state-mismatch",
+                    detail: clip_detail(
+                        &format!("state.base {:?} ≠ .pack-version {:?}", st.base_version, disk_version),
+                        160,
+                    ),
+                    version: manifest.pack_version,
+                };
+            }
+            (st.channel, st.pro_revision)
+        }
+    };
+    if disk_channel == "pro" && manifest.channel == "free" {
+        return PackCheck::ChannelRefused { version: manifest.pack_version, disk: disk_version };
     }
-    // 축2 호환 게이트: min_binary_version ≤ 실행 바이너리(env CARGO_PKG_VERSION = 단일 버전선).
+    if cys::pack::parse_semver(&disk_version).is_none() {
+        let reason = match disk_err {
+            Some(std::io::ErrorKind::NotFound) => "pack-version-missing",
+            _ => "pack-version-unreadable",
+        };
+        let detail = match disk_err {
+            Some(k) if k != std::io::ErrorKind::NotFound => format!("{k:?}"),
+            Some(_) => String::new(),
+            None => clip_detail(&format!("{disk_version:?}"), 60),
+        };
+        return PackCheck::DiskUnknown { reason, detail, version: manifest.pack_version };
+    }
+    if cys::pack::parse_semver(&manifest.pack_version).is_none() {
+        return PackCheck::ManifestUnreadable {
+            detail: clip_detail(&format!("pack_version 해석 불가: {:?}", manifest.pack_version), 160),
+        };
+    }
+    if !cys::pack::remote_is_newer_tuple(
+        (&manifest.pack_version, manifest.pro_revision),
+        (&disk_version, disk_rev),
+    ) {
+        return PackCheck::None { version: manifest.pack_version, disk: disk_version };
+    }
     if pack_binary_too_old(&manifest.min_binary_version, running) {
         return PackCheck::BinaryTooOld {
             version: manifest.pack_version,
-            disk,
+            disk: disk_version,
             min_binary: manifest.min_binary_version,
         };
     }
-    PackCheck::Available { version: manifest.pack_version, disk, min_binary: manifest.min_binary_version }
+    PackCheck::Available {
+        version: manifest.pack_version,
+        disk: disk_version,
+        min_binary: manifest.min_binary_version,
+    }
 }
 
 /// 무중단 호환 게이트(DESIGN §7-④ 축2) 순수 판정 — min_binary_version > 실행 바이너리면 true(무중단
@@ -6469,6 +6559,24 @@ async fn install_pack_update(
         );
         return Err(format!("pack-update 실패: {stderr}"));
     }
+    // ★U9(0.14.41): CLI 가 반영 없이 끝났으면(UpToDate · no-op · exit 0) "완료"라고 말하지 않는다.
+    //   종전에는 exit 0 이면 무조건 pack-updated → "✅ 팩 업데이트 완료"였다(보고서 R5). CLI UpToDate 는
+    //   디스크 판독 실패에서도 나오므로 uptodate_confirmed(disk_parse=ok ∧ disk ≥ remote)일 때만
+    //   '이미 적용됨', 아니면 '상태 불명'으로 보낸다. 토큰이 없으면(구 사이드카) 종전 경로 그대로.
+    if let Some(tok) = parse_pack_update_outcome(&stdout) {
+        if tok.gate == "up-to-date" {
+            let confirmed = uptodate_confirmed(&tok);
+            let _ = app.emit(
+                "pack-uptodate",
+                json!({
+                    "confirmed": confirmed,
+                    "disk_version": tok.disk,
+                    "remote_version": tok.remote,
+                }),
+            );
+            return Ok(tok.disk);
+        }
+    }
     // ★디스크 반영 성공(success 또는 degraded) — .pack-version을 읽어 새 팩 버전으로 브로드캐스트(§2-②/§7-③).
     //   read_board_catalog가 pack_dir의 정적 파일을 읽는 것과 동일 SOT(pack_dir).
     let pack_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
@@ -6502,6 +6610,56 @@ async fn install_pack_update(
         }),
     );
     Ok(pack_version)
+}
+
+/// `cys pack-update` 의 no-op 결과 줄(`PACK_UPDATE_OUTCOME …` · 계약 = cys::pack::PACK_UPDATE_OUTCOME_PREFIX).
+#[derive(Debug, Clone, PartialEq)]
+struct PackUpdateOutcomeToken {
+    gate: String,
+    remote: String,
+    disk: String,
+    disk_parse_ok: bool,
+}
+
+/// 사이드카 stdout 에서 결과 줄을 찾는다(줄마다 trim — CRLF 안전). 없으면 None(구 사이드카 = 종전 경로).
+/// gate 가 비어 있으면 형식 불명으로 보고 None(보수적 — 종전 경로).
+fn parse_pack_update_outcome(stdout: &str) -> Option<PackUpdateOutcomeToken> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix(cys::pack::PACK_UPDATE_OUTCOME_PREFIX) else { continue };
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            continue; // 접두사만 같은 다른 토큰(PACK_UPDATE_OUTCOMEX…) 배제
+        }
+        let mut t = PackUpdateOutcomeToken {
+            gate: String::new(),
+            remote: String::new(),
+            disk: String::new(),
+            disk_parse_ok: false,
+        };
+        for kv in rest.split_whitespace() {
+            match kv.split_once('=') {
+                Some(("gate", v)) => t.gate = v.to_string(),
+                Some(("remote", v)) => t.remote = v.to_string(),
+                Some(("disk", v)) => t.disk = v.to_string(),
+                Some(("disk_parse", v)) => t.disk_parse_ok = v == "ok",
+                _ => {}
+            }
+        }
+        return if t.gate.is_empty() { None } else { Some(t) };
+    }
+    None
+}
+
+/// "이미 적용됨"이라고 말해도 되는가 — disk_parse=ok ∧ 두 버전 모두 해석 ∧ disk ≥ remote.
+/// 그 밖(디스크 판독 실패·원격 해석 불가)은 '팩 상태 불명'(반박 D3 — 같은 종류의 거짓 안심 차단).
+fn uptodate_confirmed(t: &PackUpdateOutcomeToken) -> bool {
+    if t.gate != "up-to-date" || !t.disk_parse_ok {
+        return false;
+    }
+    match (cys::pack::parse_semver(&t.disk), cys::pack::parse_semver(&t.remote)) {
+        (Some(d), Some(r)) => d >= r,
+        _ => false,
+    }
 }
 
 /// 사이드카(cys pack-update) stdout에서 `PACK_UPDATE_RESULT … failed=N deferred=N` 토큰을 파싱해
@@ -8481,9 +8639,83 @@ mod tests {
         assert!(body.contains("\"pack-uptodate\""), "pack-uptodate emit 부재");
         let cli = include_str!("../../src/bin/cys.rs");
         let u = cli.find("VersionGate::UpToDate => {\n                println!(").expect("CLI UpToDate 분기");
-        let arm = &cli[u..u + 600];
+        let e = cli[u..].find("VersionGate::BinaryTooOld =>").map(|i| u + i).expect("CLI BinaryTooOld 분기");
+        let arm = &cli[u..e];
         assert!(arm.contains("pack_update_uptodate_line("), "CLI UpToDate 분기에 결과 토큰 줄 부재");
         assert!(arm.contains("return Ok(0);"), "CLI UpToDate 종료코드가 바뀌었다(0 유지 계약)");
+    }
+
+    #[test]
+    fn u9_parse_pack_update_outcome_token() {
+        // lib 가 만든 줄을 그대로 되읽는다(계약 왕복) — CRLF·앞뒤 사람용 줄 사이에서도.
+        let line = cys::pack::format_pack_update_outcome("up-to-date", "0.14.40", Some("0.14.40"));
+        let out = format!("[pack-update] 이미 최신 — 반영 0 (remote 0.14.40 ≤ 디스크). no-op.\r\n{line}\r\n");
+        let t = parse_pack_update_outcome(&out).expect("토큰");
+        assert_eq!(
+            t,
+            PackUpdateOutcomeToken {
+                gate: "up-to-date".into(),
+                remote: "0.14.40".into(),
+                disk: "0.14.40".into(),
+                disk_parse_ok: true
+            }
+        );
+        assert!(uptodate_confirmed(&t), "disk == remote · parse ok → 이미 적용됨");
+        // 디스크가 원격보다 앞섬(무중단으로 먼저 전진) → 이미 적용됨.
+        let ahead = cys::pack::format_pack_update_outcome("up-to-date", "0.14.40", Some("0.14.41"));
+        assert!(uptodate_confirmed(&parse_pack_update_outcome(&ahead).unwrap()));
+        // 디스크 판독 실패 → CLI 는 UpToDate 지만 '이미 적용됨' 금지(반박 D3).
+        for disk in [None, Some("garbage"), Some("")] {
+            let l = cys::pack::format_pack_update_outcome("up-to-date", "0.14.40", disk);
+            let t = parse_pack_update_outcome(&l).expect("토큰");
+            assert!(!uptodate_confirmed(&t), "{disk:?} → 거짓 안심");
+        }
+        // 원격 해석 불가(garbage) → '이미 적용됨' 금지.
+        let g = cys::pack::format_pack_update_outcome("up-to-date", "garbage", Some("0.14.40"));
+        assert!(!uptodate_confirmed(&parse_pack_update_outcome(&g).unwrap()));
+        // 토큰 부재(구 사이드카)·반영 경로의 RESULT 토큰만 있음 → None = 종전 pack-updated 경로.
+        assert_eq!(parse_pack_update_outcome("[pack-update] 팩 2.0.0 반영 완료\n"), None);
+        assert_eq!(
+            parse_pack_update_outcome("PACK_UPDATE_RESULT pack_version=2.0.0 injected=1 skipped=0 deferred=0 failed=0"),
+            None
+        );
+        assert_eq!(parse_pack_update_outcome("PACK_UPDATE_OUTCOMEX gate=up-to-date"), None);
+        assert_eq!(parse_pack_update_outcome("PACK_UPDATE_OUTCOME remote=1.0.0"), None, "gate 없음 = 형식 불명");
+    }
+
+    #[test]
+    fn u9_pack_check_json_status_contract() {
+        // UI(updatestate.ts packFromBackend)가 읽는 status 문자열 — 여기서 바뀌면 UI 는 '응답 형식 불명'이 된다.
+        let url = "https://example.invalid/pack-manifest.json";
+        let cases = [
+            (PackCheck::Available { version: "2".into(), disk: "1".into(), min_binary: "".into() }, "available"),
+            (PackCheck::None { version: "1".into(), disk: "1".into() }, "none"),
+            (PackCheck::BinaryTooOld { version: "2".into(), disk: "1".into(), min_binary: "9".into() }, "binary-too-old"),
+            (PackCheck::ChannelRefused { version: "2".into(), disk: "1".into() }, "channel-refused"),
+            (PackCheck::ManifestUnreadable { detail: "x".into() }, "manifest-unreadable"),
+            (
+                PackCheck::DiskUnknown { reason: "pack-version-missing", detail: "".into(), version: "1".into() },
+                "disk-unknown",
+            ),
+        ];
+        for (c, st) in cases {
+            let v = c.to_json(url);
+            assert_eq!(v["status"], st, "{c:?}");
+            assert_eq!(v["manifest_url"], url);
+        }
+        // UI 파서가 기대하는 핵심 필드.
+        let a = PackCheck::Available { version: "2".into(), disk: "1".into(), min_binary: "0.1".into() }.to_json(url);
+        assert_eq!(a["pack_version"], "2");
+        assert_eq!(a["disk_version"], "1");
+        assert_eq!(a["binary_too_old"], false);
+        let d = PackCheck::DiskUnknown { reason: "pack-state-corrupt", detail: "d".into(), version: "1".into() }
+            .to_json(url);
+        assert_eq!(d["reason"], "pack-state-corrupt");
+        // 진단 문구 상한(원격 HTML 이 창에 쏟아지지 않게) — 한글 char 경계 안전.
+        let long = "가".repeat(500);
+        let clipped = clip_detail(&long, 160);
+        assert_eq!(clipped.chars().count(), 161);
+        assert!(clipped.ends_with('…'));
     }
 
     // 회귀: windows 업데이트 핸드오프가 데몬을 taskkill /F로 하드킬하면 cysd의

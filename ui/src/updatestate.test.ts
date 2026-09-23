@@ -113,7 +113,7 @@ describe("deriveUpdateView — 대표 상태", () => {
     const v0 = deriveUpdateView(INITIAL_UPDATE_STATE, T);
     expect(v0.badge.hidden).toBe(true);
     const v1 = deriveUpdateView({ ...INITIAL_UPDATE_STATE, checking: true }, T);
-    expect(v1.badge).toMatchObject({ hidden: false, text: "…", tone: "ok" });
+    expect([v1.badge.hidden, v1.badge.text, v1.badge.tone]).toEqual([false, "…", "ok"]);
     expect(v1.headline).toContain("확인 중");
   });
 
@@ -122,7 +122,7 @@ describe("deriveUpdateView — 대표 상태", () => {
       { bin: BINS[1], pack: PACKS[1], checking: false },
       T,
     );
-    expect(v.badge).toMatchObject({ hidden: false, text: "✓", tone: "ok" });
+    expect([v.badge.hidden, v.badge.text, v.badge.tone]).toEqual([false, "✓", "ok"]);
     expect(v.headline).toContain("최신입니다");
     expect(v.rows[0].text).toContain("0.14.40");
     expect(v.rows[1].text).toContain("0.14.40");
