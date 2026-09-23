@@ -231,7 +231,7 @@ describe("세대(daemonEpoch) — 옛 sid 를 믿지 않는다(반박 U2 major �
     expect(generationChanged(5, "1-2")).toBeNull();
     expect(generationChanged("1-2", "1-2")).toBe(false);
     expect(generationChanged("1-2", "3-4")).toBe(true);
-    expect(daemonIdentOf({ started_at: 1790147949.358786, daemon_pid: 72876 })).toEqual({ epoch: "1790147949.358786-72876", startedAtMs: 1790147949358.786 });
+    expect(daemonIdentOf({ started_at: 1790147949.358786, daemon_pid: 72876 })).toEqual({ epoch: "1790147949.358786-72876", startedAtMs: 1790147949.358786 * 1000 });
     expect(daemonIdentOf({ started_at: 1790147949.5 })).toEqual({ epoch: null, startedAtMs: 1790147949500 });
     for (const j of [null, undefined, 3, "x", [], {}, { started_at: "1", daemon_pid: 1 }, { started_at: -1, daemon_pid: 2 }])
       expect(daemonIdentOf(j)).toEqual({ epoch: null, startedAtMs: null });

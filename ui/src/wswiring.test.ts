@@ -631,7 +631,9 @@ describe("복원 보류 — 탭은 유지하고 트리만 비운다(F2)", () => 
   });
 
   it("★기본 데몬 폴백은 본부 탭에만 — 부서 탭에 붙인 셸은 pane 키가 어긋나 보이지 않는다", () => {
-    const i = code.indexOf("if (!current().tree) {");
+    // ★U2(0.14.41): 조건이 '트리 없음' 에서 '산 칸 0개' 로 넓어졌다(구멍만 남은 탭도 셸을 받는다 — 반박 U2 major ⓑ).
+    //   이 핀이 지키는 계약(부서 탭엔 기본 데몬 셸을 붙이지 않는다)은 그대로다.
+    const i = code.indexOf("if (!collectSids(current().tree).length) {");
     expect(i).toBeGreaterThan(0);
     const seg = code.slice(i, code.indexOf("\n  render();", i));
     expect(seg).toContain("newSurface(null, current().socket, T_NEW)");
@@ -862,7 +864,12 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
     expect(seg).toContain("seatPriority(");
     expect(seg).toContain("adoptSeat(");
     expect(seg).toContain("!w.pending && !w.deleting");
-    expect(code).toContain("s.exited ? null : s.role");
+    // ★배치용 역할 맵 **정의 자체**를 본다 — 같은 식이 역할 점(setRoleDot) 줄에도 있어 전역 검색은 공회전한다(돌연변이 M9 로 실증).
+    const a = code.indexOf("async function refreshPaneTitles(");
+    const r0 = code.indexOf("const roleOf: RoleOf = (x) => {", a);
+    expect(r0).toBeGreaterThan(a);
+    expect(code.slice(r0, code.indexOf("};", r0))).toContain("s.exited ? null : s.role");
+    expect(seg.indexOf("adoptSeat(cands, sk, s.surface_id, s.role, roleOf)")).toBeGreaterThan(0);
   });
 
   it("3초 틱: 역할 기억은 바뀐 틱에만 저장(annotateRoles) · 유령 집행은 역할 칸을 구멍으로(holdRolePane) · 구멍 위생(tidyHoles)", () => {
@@ -900,7 +907,7 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
     expect(d).toBeGreaterThan(0);
     const dseg = code.slice(d, code.indexOf("\n}\n", d));
     expect(dseg).toContain("layoutManual = true");
-    expect(dseg).toMatch(/>= 3/); // 클릭·합성 mousemove 로는 켜지지 않는다(반박 U3 D8)
+    expect(/>= 3/.test(dseg)).toBe(true); // 클릭·합성 mousemove 로는 켜지지 않는다(반박 U3 D8)
     const mv = code.slice(code.indexOf("function movePane("), code.indexOf("function setFocus("));
     expect(mv).toContain("layoutManual = true");
     const eq = code.slice(code.indexOf("async function actionEqualize("), code.indexOf("// ---------- workspace tabs"));
@@ -955,8 +962,10 @@ describe("seatlayout.ts — 순수 모듈 격리(import 0 · 부작용 식별자
     for (const id of ["invoke", "__TAURI__", "window", "document", "localStorage", "setTimeout", "setInterval", "fetch", "newSurface", "claim", "launch", "send"])
       expect(new RegExp(`\\b${id}\\b`).test(body)).toBe(false);
   });
-  it("구형 WKWebView 비호환 문법 0", () => {
-    for (const bad of ["(?<=", "(?<!", ".at(", "findLast", "structuredClone", "Object.hasOwn", "replaceAll("]) expect(sl.includes(bad)).toBe(false);
+  it("구형 WKWebView 비호환 문법 0(코드 본문 — 주석의 설명문은 세지 않는다 · 문자열·정규식 리터럴은 센다)", () => {
+    const codeOnly = stripComments(sl);
+    for (const bad of ["(?<=", "(?<!", ".at(", "findLast", "structuredClone", "Object.hasOwn", "replaceAll("])
+      expect(codeOnly.includes(bad)).toBe(false);
   });
   it("최상위 문장은 선언뿐(export/const/function/type/interface) — 모듈 로드만으로 아무 일도 일어나지 않는다", () => {
     const tops = sl.split("\n").filter((l) => /^[A-Za-z]/.test(l));

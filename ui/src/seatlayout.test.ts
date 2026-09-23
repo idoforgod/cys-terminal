@@ -248,17 +248,21 @@ describe("수동 탭(layoutManual) — 재배치하지 않되 대표는 줄지 �
     expect(isAnchored(u, mapRole(role))).toBe(true);
     close((W(u, 1) as number) + (W(u, 50) as number), MASTER_FRAC);
   });
-  it("사용자가 master 를 오른쪽으로 옮긴 수동 탭 — 절반이 아니라 균등 몫으로만 준다", () => {
+  it("사용자가 master 를 오른쪽으로 옮긴 수동 탭 — 첫 좌석만 균등 몫(×3/4)으로 줄고 그 뒤로는 불변(절반 연쇄 없음)", () => {
+    // 루트 a 쪽에 master 가 없으면(사용자가 옮김) 첫 좌석은 루트에 균등 몫으로 붙는다. 그 순간부터 master 는
+    // 루트 a 쪽에 있으므로 이후 좌석은 root.b 로만 간다 — 설계서 §3 "새 좌석은 항상 root.b로(대표 폭 불변)".
     const role = new Map<number, string | null>([[1, "master"], [2, "worker"], [3, "worker-2"]]);
     let t: LNode = { type: "split", dir: "row", ratio: 0.5, a: { type: "pane", sid: 2 }, b: { type: "split", dir: "row", ratio: 0.5, a: { type: "pane", sid: 3 }, b: { type: "pane", sid: 1 } } };
-    let prev = W(t, 1) as number;
-    for (const s of [4, 5, 6]) {
+    const start = W(t, 1) as number;
+    role.set(4, "worker-4");
+    t = placeSeat(t, 4, mapRole(role), true);
+    close(W(t, 1), (start * 3) / 4); // 보이는 컬럼 3 → 새 컬럼 1/4
+    for (const s of [5, 6, 7]) {
       role.set(s, "worker-" + s);
-      const n = 2 + (s - 4) + 1; // 삽입 전 보이는 컬럼 수
       t = placeSeat(t, s, mapRole(role), true);
-      close(W(t, 1), (prev * n) / (n + 1));
-      prev = W(t, 1) as number;
+      close(W(t, 1), (start * 3) / 4);
     }
+    close(W(t, 2), 0.5 * 0.75); // 사용자가 둔 다른 컬럼 비율도 그대로
   });
 });
 
