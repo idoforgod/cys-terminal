@@ -40,6 +40,9 @@ pub mod packsig;
 pub mod overrides;
 pub mod todo_decl;
 pub mod todo_scan;
+/// ★U16(0.14.41) 말로 팀 만들기 — 팀 제안(feed kind `team-create-request`)의 스키마·검증·코덱·
+/// 데몬 잠금 정책 단일 정의처(cysd·cys CLI·cys-app 공용 · 사고 방지 층 — 머리말의 정직한 한계 참조).
+pub mod team_spec;
 pub mod wire;
 #[cfg(target_os = "macos")]
 pub mod launchd;

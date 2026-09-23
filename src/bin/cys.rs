@@ -363,6 +363,19 @@ enum Command {
         #[command(subcommand)]
         action: FeedAction,
     },
+    /// 말로 팀 만들기(본부 대표 전용) — 오너와 정한 팀 이름·하는 일을 '팀 만들기 제안' 1건으로 올린다.
+    /// 만들기는 오너가 앱 확인 창에서만 한다(제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
+    TeamPropose {
+        /// 팀 이름(표시명 · 40자 이내 · 한글 가능)
+        #[arg(long)]
+        name: String,
+        /// 하는 일(2000자 이내 · 오너와 정한 문장 그대로)
+        #[arg(long, conflicts_with = "purpose_file")]
+        purpose: Option<String>,
+        /// 하는 일을 적은 UTF-8 파일(긴 문장·여러 줄은 이쪽을 쓴다)
+        #[arg(long)]
+        purpose_file: Option<std::path::PathBuf>,
+    },
     /// RSI 학습 루프 — 사람 직접 명령(제안 생성) 또는 현재 학습 라운드 상태 조회
     Learn {
         /// 학습 주제 (생략하고 --status면 상태 조회)
@@ -5024,6 +5037,9 @@ fn run(command: Command) -> i32 {
         }),
 
         Command::Feed { action } => return run_feed(action),
+        Command::TeamPropose { name, purpose, purpose_file } => {
+            return run_team_propose(&name, purpose, purpose_file)
+        }
 
         Command::Learn { topic, status } => {
             if status {
@@ -5076,6 +5092,79 @@ fn run(command: Command) -> i32 {
         Err(e) => {
             eprintln!("error: {e}");
             1
+        }
+    }
+}
+
+/// ★U16(0.14.41) `cys team-propose` — 팀 만들기 제안 1건 발행(대기 없음).
+///
+/// exit: 0=제안 등록 · 2=입력 형식(이름·하는 일·파일) · 3=데몬 거부(제안자·건수·형식) 또는 데몬 오류 ·
+///       4=데몬이 잠금을 모르는 구버전(제안을 스스로 거뒀다 — 앱 재시작으로 데몬을 갱신한 뒤 다시).
+/// 결과 확인의 진실원은 팀 명부(`~/.cys/depts.json` 의 `team_proposal_id`)다 — 피드 allow 는 보조 신호.
+fn run_team_propose(
+    name: &str,
+    purpose: Option<String>,
+    purpose_file: Option<std::path::PathBuf>,
+) -> i32 {
+    let raw = match (purpose, purpose_file) {
+        (Some(p), None) => p,
+        (None, Some(f)) => match std::fs::read(&f) {
+            Ok(b) => match String::from_utf8(b) {
+                Ok(t) => t.trim_start_matches('\u{feff}').to_string(),
+                Err(_) => {
+                    eprintln!("error: {} 이(가) UTF-8 텍스트가 아니다", f.display());
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: 하는 일 파일을 읽지 못했다({}): {e}", f.display());
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!("error: --purpose 또는 --purpose-file 중 하나로 하는 일을 적어라");
+            return 2;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let entropy = now.subsec_nanos() ^ std::process::id().rotate_left(16);
+    let id = cys::team_spec::new_id(now.as_secs(), entropy);
+    let spec = match cys::team_spec::build(&id, name, &raw) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let sid = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
+    match request("feed.push", cys::team_spec::push_params(&spec, sid)) {
+        Ok(r) if r["team_gate"].as_u64() == Some(1) => {
+            println!("{}", spec.id);
+            println!("팀 만들기 제안 등록: '{}' ({})", spec.display, spec.id);
+            println!("오너에게 1줄로 알려라: \"제어 센터 승인 탭의 '팀 만들기 제안' 카드에서 [확인 창 열기] → [만들기]를 눌러 주세요.\"");
+            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 다시 말을 걸면 확인한다:");
+            println!("  만들어짐 = 팀 명부 ~/.cys/depts.json 에 team_proposal_id \"{}\" 가 있다", spec.id);
+            println!("  대기·결정 = `cys feed list` 의 {} 줄 (pending=대기 · decision=deny=오너가 만들지 않기로 함)", spec.id);
+            0
+        }
+        Ok(_) => {
+            // 잠금을 모르는 구 데몬 — 제안이 잠금 없이 올라갔다. 스스로 거둔다(발행 좌석의 결정은
+            // 구 데몬에서도 통과한다: 자기승인 가드는 allow 만 막는다).
+            let _ = request(
+                "feed.reply",
+                json!({"request_id": spec.id, "decision": cys::team_spec::SUPERSEDED}),
+            );
+            eprintln!(
+                "error: 이 데몬은 팀 제안 잠금을 모르는 구버전이다 — 제안({})을 거뒀다. 앱을 다시 시작해 데몬을 갱신한 뒤 다시 제안하라",
+                spec.id
+            );
+            4
+        }
+        Err(e) => {
+            eprintln!("error: 팀 만들기 제안이 거부됐다: {e}");
+            3
         }
     }
 }

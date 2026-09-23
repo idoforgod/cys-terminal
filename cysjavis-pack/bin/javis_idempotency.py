@@ -55,6 +55,8 @@ MUTATE_VERBS = frozenset({           # 상태 변경 — repair/실행 의도 �
     "skill", "persona", "schedule", "claim-role", "launch-agent", "boot",
     # ★(0.14.31 · CONTRACTS B-6) reclaim-role(WP-4 · 데몬 역할 재결합 RPC) 은 상태 변경.
     "reclaim-role",
+    # ★(0.14.41 · U16) team-propose — 승인 피드에 '팀 만들기 제안' 항목을 만든다(상태 변경).
+    "team-propose",
     # 'new-split' 부재 — 실제 cys CLI 에 없음(cmux 잔재·CLAUDE.md 치환표상 폐기 verb).
 })
 
