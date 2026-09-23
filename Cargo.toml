@@ -1,6 +1,7 @@
 [workspace]
 members = ["src-tauri"]
-# 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)는 워크스페이스 멤버가 아니라 path 의존이다.
+# 벤더링된 portable-pty(ConPTY pane 자식 생성)는 워크스페이스 멤버가 아니라 path 의존이다.
+#   ConPTY 자식에 CREATE_NO_WINDOW 금지 — 29행 참조.
 exclude = ["vendor/portable-pty"]
 
 [package]
@@ -26,7 +27,10 @@ path = "src/bin/cys.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# ★벤더링 + 패치: ConPTY 자식 생성에 CREATE_NO_WINDOW 추가(Win11 검은 창 flash 차단). vendor/portable-pty/ 참조.
+# ★벤더링: ConPTY 자식 생성 flag 는 upstream 0.9.0 과 같다(EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT).
+#   ConPTY 자식에 CREATE_NO_WINDOW 금지 — 056a2ea5 가 넣었다가 자식이 pseudoconsole 대신 숨은 콘솔에 붙어
+#   셸 출력이 pane 에 닿지 않는 검은 pane 이 되어 22ff28f6 에서 원복했다. 창 번쩍임(U5)은 콘솔 없는 cysd·cys-app 이
+#   띄우는 **비 ConPTY** 자식의 문제다(lib.rs census). 재추가는 spawn_policy_tests 가 막는다. vendor/portable-pty/ 참조.
 portable-pty = { path = "vendor/portable-pty" }
 vt100 = "0.15"
 clap = { version = "4", features = ["derive"] }

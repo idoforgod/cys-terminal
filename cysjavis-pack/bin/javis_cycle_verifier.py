@@ -87,6 +87,13 @@ except ImportError:  # Windows
 
     fcntl = _FcntlShim()
 
+# ★U5(0.14.41) — 캡처 호출 창 정책: verifier 는 **빈 dict**(창 정책 없음)이 정답이다.
+#   verifier 워처는 `cys new-surface` pane(ConPTY) 안에서 포그라운드로 돈다 — 그 자식은 pane 의
+#   콘솔을 물려받아 창이 뜨지 않고, ConPTY 쪽 자식에 CREATE_NO_WINDOW 를 거는 것은 금지다(검은 pane ·
+#   22ff28f6). 이 이름은 CONTRACT BLOCK 의 run() 이 쓰므로 **지우면 안 된다**(NameError → rc 127 →
+#   fail-closed). autopilot 은 pane 밖 1분 잡이라 nt 에서 NOWIN 을 건다(그쪽 주석 · H-WIN-13).
+_CAPTURE_SPAWN_KW = {}
+
 # ═══════════════════════ CONTRACT BLOCK v1 START ═══════════════════════
 # ★이 블록은 javis_cycle_autopilot.py / javis_cycle_verifier.py 에 **바이트 동일**하게 존재한다.
 # 한쪽만 고치면 양쪽 self-test 의 contract-parity 검사가 즉시 실패한다(이음매 드리프트 차단).
@@ -201,8 +208,9 @@ def new_cycle_id():
 def run(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     """subprocess 러너 — (rc, stdout, stderr). 예외도 rc!=0 로 정규화(fail-soft)."""
     try:
+        # 창 정책은 블록 밖 `_CAPTURE_SPAWN_KW`(파일별 정의 — autopilot=nt NOWIN · verifier=빈 dict).
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text)
+                           timeout=timeout, input=stdin_text, **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
         return 127, "", "runner error: %s" % e

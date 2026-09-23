@@ -128,7 +128,12 @@ jobs:
           #   훅 `_lib.sh` 에 들어갔다. 새 논리는 전부 `case $OSTYPE in darwin*` 안이라는 것 — Git Bash 실기에서
           #   CYS_PY 해소값이 종전 규칙(PATH 첫 python3→python→py)과 같고 셔임 분류·폴백 제거 조건이 거짓임 —
           #   을 이 레인만 실측할 수 있다(맥 러너의 msys 모의는 OSTYPE 주입일 뿐 플랫폼 증명이 아니다).
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
+          # ★H-WIN-16 편입(2026-09-23 · 0.14.41 U5 "1분마다 검은 창" · WP-B3, 통합 시 H-WIN-13→H-WIN-16
+          #   재번호 — H-WIN-13/14/15 가 이미 선점됨): 1분 builtin 잡 사슬(cycle-autopilot tick)의 캡처
+          #   호출에 CREATE_NO_WINDOW 를 걸었다. 그 대가로 **윈도우 실기에서** 실스폰 tick 이 gate-check
+          #   rc=0 으로 kill-switch 를 통과하고 status 파싱까지 가는지(② 무clear 방지) · stdin 왕복 · verifier
+          #   (pane 거주) 무 NOWIN 을 잰다. NOWIN 이 실제로 걸리는 플랫폼은 여기뿐이다(맥은 비-NOWIN 대조).
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-WIN-16,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
           #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은
