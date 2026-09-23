@@ -11225,8 +11225,75 @@ def h_meta_absent():
     need(not bare, "판별자 없이 파일 부재를 Skip 으로 접는 자리 %d곳(행 %s) — `_absent` 로 옮겨라"
          % (len(bare), bare))
     guarded = sum(1 for m in pat.finditer(runner) if not (a0 <= m.start() < a1))
+
+    # ★MC8b 방어(리뷰1 — 2026-09-23) — 위 `pat` 은 문면 4종에 묶여 있어 **다른 문장으로 쓴**
+    #   맨 raise Skip 은 애초에 매치가 안 되므로 bare 로도 안 걸린다(regex 가 못 보면 판정 자체가
+    #   없다). 문면이 아니라 **구조**로 다시 본다: 대상 파일 하나만 보는
+    #   `if not os.path.isfile(os.path.join(REPO_DIR, <target>)):` 블록의 **바로 다음 줄**이
+    #   Cargo.toml 중첩 가드이거나 `_absent(` 경유가 아니면 — 그 안 raise Skip 문면이 무엇이든 —
+    #   bare 다. (독립형 진입 가드 — Cargo.toml/`.git`/`_is_git_checkout()` 를 **자기 조건**으로
+    #   직접 쓰는 자리들은 대상이 리터럴이라 이 패턴에 안 걸린다 — 범위 밖: 판별자가 조건
+    #   자체이므로 문면과 무관하게 이미 안전하다.)
+    target_guard_re = re.compile(
+        r'if not os\.path\.isfile\(os\.path\.join\(REPO_DIR,\s*([A-Za-z_]\w*)\)\):[ \t]*\n'
+        r'[ \t]+(.*)\n')
+    bare2 = []
+    for m in target_guard_re.finditer(runner):
+        nxt = m.group(2).strip()
+        if nxt.startswith('if not os.path.isfile(os.path.join(REPO_DIR, "Cargo.toml")):'):
+            continue
+        if nxt.startswith("_absent("):
+            continue
+        bare2.append((runner.count("\n", 0, m.start()) + 1, m.group(1), nxt[:60]))
+    need(not bare2,
+         "대상 파일별 부재 판정 %d곳이 Cargo.toml 체크아웃 가드(또는 _absent())를 거치지 않는다 "
+         "— 문면과 무관하게 구조로 적발(MC8b 방어): %s" % (len(bare2), bare2))
+
+    # ★MC8c 방어(리뷰1) — `h_meta_read` 의 `if missing and _repo_checkout(): _absent(...)` 분기가
+    #   꺼져도(예: 조건이 항상 False 로 뭉개져도) 대상이 **전량** 없으면 그 아래 `if not sizes:`
+    #   분기가 대신 Fail 을 내 위장한다. 그래서 "대부분 있고 하나만 없는" 상태를 만들어야 두
+    #   분기가 갈린다 — `_CLAUDE_MD_COPIES`·directive 2종은 복제하지 않아 자연히 missing 에
+    #   들어가고, 러너가 스스로 수확하는 `_repo_file` 리터럴 호출(os.path.join 인자)의 대상은 전량
+    #   복제해 sizes 를 비우지 않는다. `REPO_DIR` 을 이 임시 트리로 잠깐 바꿔 `h_meta_read()` 를
+    #   **직접** 호출한다(데코레이터는 등록만 하고 실행을 감싸지 않는다 — raise 가 그대로 올라온다).
+    lits_e = re.findall(r"_repo_file\(os\.path\.join\(([^)]*)\)\)", runner)
+    rel_targets = []
+    for arg in lits_e:
+        parts = re.findall(r'"([^"]*)"', arg)
+        if parts:
+            rel_targets.append(os.path.join(*parts))
+    present = [rel for rel in dict.fromkeys(rel_targets)
+               if os.path.isfile(os.path.join(REPO_DIR, rel))]
+    need(present, "h_meta_read missing-분기 검체: 실 레포에 _repo_file 리터럴 대상이 하나도 없다"
+                  "(측정 불능 — 대상 목록 수확 정규식이 깨졌을 수 있다)")
+    global REPO_DIR
+    saved_repo_dir = REPO_DIR
+    try:
+        with tempfile.TemporaryDirectory() as tmp2:
+            open(os.path.join(tmp2, "Cargo.toml"), "w").close()
+            for rel in present:
+                src = os.path.join(REPO_DIR, rel)
+                dst = os.path.join(tmp2, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            REPO_DIR = tmp2
+            try:
+                h_meta_read()
+                raised = "none"
+            except Fail:
+                raised = "fail"
+            except Skip:
+                raised = "skip"
+    finally:
+        REPO_DIR = saved_repo_dir
+    need(raised == "fail",
+         "h_meta_read 가 부분 부재(체크아웃 모사 · _repo_file 리터럴 대상 전량 복제 · "
+         "CLAUDE.md/directive 2종만 누락)에서 Fail 을 내지 않았다(%s) — "
+         "missing→_absent 분기가 꺼졌다(MC8c 회귀)" % raised)
+
     return ("배포 팩 모사=Skip · 체크아웃 모사=Fail · _repo_file 경유 · 무조건-Skip 부재 문면 0"
-            "(Cargo.toml 선확인 자리 %d곳 유지)" % guarded)
+            "(Cargo.toml 선확인 자리 %d곳 유지 · 구조 가드 위반 0 · h_meta_read missing-분기 확인)"
+            % guarded)
 
 
 # ★등록 위치가 곧 실행 순서다 — 이 검체는 **맨 마지막**에 두어, 앞선 모든 검체가 실제로 읽은
