@@ -379,9 +379,15 @@ jobs:
       #     보고자가 뜻밖의 이유(파싱·러너 이상)로 죽어도 잡 판정이 **이 변경 전과 한 글자도 다르지 않게**
       #     — 즉 release windows-health-gate 가 새 차단원을 얻지 않게 — 한다. 그 경우에도 스텝 자체는 빨간
       #     스텝으로 런 페이지에 남는다(조용히 사라지지 않는다).
+      #   ★U4 C4 리뷰1 MINOR-2 수정(2026-09-23): `timeout-minutes: 2`. `continue-on-error` 는 스텝
+      #     **실패**만 흡수하고 **멈춤**은 흡수하지 않는다 — 판독자가 뜻밖에 걸리면 잡 상한(55분)까지
+      #     소비하고, 그러면 잡 자체가 failure 로 끝나 release windows-health-gate 가 BAD 가 된다(반박
+      #     §3-3 이 지적한 타임아웃 결합이 판독 스텝 쪽에 그대로 남는 경로). 이 판독 스텝은 파일 읽기·
+      #     문자열 가공뿐 입력 대기·네트워크가 없어 2분이면 넉넉하다.
       - name: cysd-win 결과 판독 (비차단 · annotation + STEP_SUMMARY · 절단 표지)
         if: always()
         continue-on-error: true
+        timeout-minutes: 2
         shell: bash
         env:
           CYSD_OUTCOME: ${{ steps.cysd_win.outcome }}
