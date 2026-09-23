@@ -102,12 +102,25 @@ def _git_show_old_template():
 
 def _blocked_verbs():
     """cys-dept 단일소유 가드가 막는 동사 집합 — 문서 목록이 아니라 **코드에서** 뽑는다
-    (H-DOC-3 과 동일 추출식 — 가드 형태가 바뀌면 여기가 fail-closed 로 적색)."""
+    (H-DOC-3 과 동일 추출식 — 가드 형태가 바뀌면 여기가 fail-closed 로 적색).
+
+    ★0.14.41 U16-A1: 종전에는 전부가 `launch|allocate|create|down|...|promote-ceo)` 한 줄이었다.
+    생성 동사(launch·allocate·create)와 종료·정리 동사(down 등)를 서로 다른 안내로 갈라 **두 줄**로
+    쪼개면서, 첫 동사가 `launch` 로 시작하는 줄 하나만 찾던 옛 정규식은 생성 동사 3개만 줍고
+    종료·정리 동사 5개를 놓쳤다(fail-closed 로 적색 — 발견 즉시 수리). 이제 가드 case 블록
+    (`case "$cmd" in` ~ 그 블록의 첫 `esac`) 안의 **모든** 동사-case 줄을 모아 합집합으로 본다 —
+    몇 줄로 나뉘든(생성/종료를 더 세분해도) 검증이 깨지지 않는다.
+    """
     src = _read_bytes(CYS_DEPT).decode("utf-8", "replace")
-    m = re.search(r"^\s*(launch\|[a-z|\-]+)\)\s*$", src, re.M)
-    if m is None:
+    block_m = re.search(r'case "\$cmd" in\n(.*?)\nesac\n', src, re.S)
+    if block_m is None:
+        raise AssertionError('cys-dept 단일소유 가드의 case "$cmd" in 블록을 찾지 못했다(가드 형태 변경?)')
+    lines = re.findall(r"^\s*([a-z][a-z|\-]*)\)\s*$", block_m.group(1), re.M)
+    if not lines:
         raise AssertionError("cys-dept 단일소유 가드의 동사 case 를 찾지 못했다(가드 형태 변경?)")
-    blocked = set(m.group(1).split("|"))
+    blocked = set()
+    for line in lines:
+        blocked.update(line.split("|"))
     if not {"launch", "allocate", "create", "down", "down-sock",
             "rotate", "reap", "promote-ceo"} <= blocked:
         raise AssertionError("가드 차단 집합이 예상보다 좁다: %s" % sorted(blocked))
