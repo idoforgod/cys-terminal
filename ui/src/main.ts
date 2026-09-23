@@ -109,7 +109,7 @@ import {
   type AlarmRecord,
 } from "./toastttl";
 // ★U6(0.14.41) 피드백 보내기 — 모달 층 판정(setFocus·드롭 가드)과 작성 창(의존성 주입 · 최상위 부수효과 0).
-import { modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
+import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
 import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
 
 declare global {
@@ -3345,7 +3345,35 @@ function setFocus(sid: number) {
   // 3초 틱의 자동 입양·surface.exited 가 여기를 부르면, 사용자가 모달 입력칸에 쓰던 글과 Enter 가
   // 뒤에 가려진 pane(주로 마스터) PTY 로 들어갔다. 표시(focused)·focusedSid 는 그대로 갱신한다.
   if (!modalLayerOpen(document)) panes.get(key)?.term.focus();
+  else deferPaneFocusUntilModalsClose();
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
+}
+
+// ★U6(0.14.41 · 리뷰1 minor #3): setFocus 가 모달 층 때문에 xterm 포커스를 건너뛰면, 모달이 전부
+// 닫힌 뒤 한 박자 지나 pane 포커스를 한 번 되살린다(사용자가 pane 을 다시 클릭하지 않게). 다른 칸이
+// 이미 포커스를 가졌으면 빼앗지 않는다. 호이스팅되는 함수 선언이고 절대 던지지 않는다(setFocus·3초
+// 틱 보호 — 편의 기능이 부팅 경로를 깨면 안 된다).
+function deferPaneFocusUntilModalsClose() {
+  try {
+    armDeferredPaneFocus({
+      layerOpen: () => modalLayerOpen(document),
+      focusLost: () => {
+        const a = document.activeElement;
+        return a == null || a === document.body;
+      },
+      restore: () => {
+        if (focusedSid != null) setFocus(focusedSid);
+      },
+      watch: (cb) => {
+        const mo = new MutationObserver(cb);
+        mo.observe(document.body, { childList: true });
+        return () => mo.disconnect();
+      },
+      later: (fn) => void setTimeout(fn, 0),
+    });
+  } catch {
+    /* 관찰자를 못 만들어도 pane 포커스 흐름은 계속된다 */
+  }
 }
 
 // 플랫폼별 단위(macOS·Linux=논리 px 그대로 · Windows=물리 px → /dpr) 환산은 droppoint.ts 단일 정의처.

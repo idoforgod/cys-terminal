@@ -29,8 +29,9 @@ import {
   submitBlockReason,
   validateAttachment,
 } from "./feedback";
+import { discardDraftAfter, makeEscHandler, makeFocusReclaimer, openBundleForMail, scopedListener } from "./feedbackflow";
 import { baseName } from "./ftdrop";
-import { modalLayerOpen, shouldReclaimFocus } from "./modalguard";
+import { isTopModalLayer, modalLayerOpen } from "./modalguard";
 
 /** 진단에 넣을 앱 안 경량 사실(키는 Rust DiagFacts 필드명 그대로). */
 export interface FeedbackFacts {
@@ -193,8 +194,6 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   const closed = new Promise<void>((r) => {
     resolveClose = r;
   });
-  const unlisteners: Array<() => void> = [];
-  let disposed = false;
 
   const setStatus = (msg: string, tone: "" | "ok" | "error" = "") => {
     status.textContent = msg;
@@ -350,17 +349,7 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
     if (closedFlag) return;
     closedFlag = true;
     // 묶음을 만들기 전에 닫으면 초안(첨부 사본)을 지운다 — 줄 선 첨부가 끝난 뒤에(Rust 잠금과 이중).
-    if (!done && draftP) {
-      const p = draftP;
-      chain = chain.then(async () => {
-        try {
-          const id = await p;
-          await deps.invoke("feedback_discard", { id });
-        } catch {
-          /* 초안이 없거나 이미 지워졌다 — 완전 초기화 인벤토리가 마지막 그물 */
-        }
-      });
-    }
+    chain = discardDraftAfter(chain, { draft: draftP, bundled: done }, deps.invoke);
     resolveClose();
   };
 
@@ -461,9 +450,7 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
       })) as BundleReport;
       report = rep;
       // 폴더를 먼저, 메일 창을 나중에 연다 — 나중에 뜬 창이 앞에 와서 사용자가 곧장 메일을 본다.
-      const hasFiles = rep.attachments.length > 0 || rep.include_diag;
-      const folderErr = hasFiles ? await tryInvoke("feedback_reveal", { id: rep.id }) : null;
-      const mailErr = await tryInvoke("feedback_open_mail", { id: rep.id });
+      const { folderErr, mailErr } = await openBundleForMail(rep, tryInvoke);
       submitting = false;
       showDone(rep, mailErr, folderErr);
     } catch (e) {
@@ -474,49 +461,16 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
     }
   };
 
-  const onKey = (e: KeyboardEvent) => {
-    if (e.isComposing || e.keyCode === 229) return; // IME 조합 중 Esc 는 조합 취소다
-    if (e.key !== "Escape") return;
-    e.preventDefault();
-    e.stopPropagation();
-    requestClose();
-  };
+  const onKey = makeEscHandler(() => isTopModalLayer(document, ov), requestClose);
 
-  const onFocusIn = (e: FocusEvent) => {
-    if (closedFlag) return;
-    // 포커스가 모달 층 밖(뒤 pane 의 xterm 등)으로 나가면 즉시 되찾는다 — 키 입력이 PTY 로 새지 않게.
-    if (shouldReclaimFocus(e.target)) (done ? closeBtn : desc).focus();
-  };
+  const onFocusIn = makeFocusReclaimer({ closed: () => closedFlag, home: () => (done ? closeBtn : desc) });
 
-  /** OS 드롭 구독 — 창이 떠 있는 동안만. 해제 전에 풀린 구독은 즉시 되돌린다. */
-  const sub = (name: string, h: (e: { payload: unknown }) => void) => {
-    deps
-      .listen(name, h)
-      .then((un) => {
-        if (disposed) {
-          try {
-            un();
-          } catch {
-            /* 이미 해제됨 */
-          }
-        } else unlisteners.push(un);
-      })
-      .catch(() => {
-        // 구독 실패 — 창이 떠 있는 동안 pane 드롭 리스너는 가드로 빠지므로 드롭은 무시된다.
-        // 조용히 두지 않는다: 다른 첨부 방법을 창 안에 알린다.
-        if (name === "tauri://drag-drop" && !closedFlag) {
-          setStatus(`끌어다 놓기를 쓸 수 없습니다 — [파일 고르기] 또는 ${pasteKey} 붙여넣기를 써 주세요.`, "error");
-        }
-      });
-  };
-  const unlistenAll = () => {
-    disposed = true;
-    for (const un of unlisteners.splice(0)) {
-      try {
-        un();
-      } catch {
-        /* 이미 해제됨 */
-      }
+  const listeners = scopedListener(deps.listen);
+  const onSubFail = (name: string) => {
+    // 구독 실패 — 창이 떠 있는 동안 pane 드롭 리스너는 가드로 빠지므로 드롭은 무시된다.
+    // 조용히 두지 않는다: 다른 첨부 방법을 창 안에 알린다.
+    if (name === "tauri://drag-drop" && !closedFlag) {
+      setStatus(`끌어다 놓기를 쓸 수 없습니다 — [파일 고르기] 또는 ${pasteKey} 붙여넣기를 써 주세요.`, "error");
     }
   };
 
@@ -597,23 +551,23 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
     window.addEventListener("keydown", onKey, true);
     document.addEventListener("focusin", onFocusIn, true);
     document.body.appendChild(ov);
-    sub("tauri://drag-enter", () => drop.classList.add("over"));
-    sub("tauri://drag-leave", () => drop.classList.remove("over"));
-    sub("tauri://drag-drop", (e) => {
+    listeners.sub("tauri://drag-enter", () => drop.classList.add("over"), onSubFail);
+    listeners.sub("tauri://drag-leave", () => drop.classList.remove("over"), onSubFail);
+    listeners.sub("tauri://drag-drop", (e) => {
       drop.classList.remove("over");
       if (closedFlag) return;
       // 좌표는 보지 않는다 — 창이 떠 있으면 어디에 놓든 첨부다(윈도우 드롭 좌표 오프셋 무관).
       const p = (e.payload ?? {}) as { paths?: unknown };
       const paths = Array.isArray(p.paths) ? p.paths.filter((x): x is string => typeof x === "string") : [];
       for (const path of paths) attachPath(path);
-    });
+    }, onSubFail);
     refresh();
     desc.focus();
     await closed;
   } finally {
     window.removeEventListener("keydown", onKey, true);
     document.removeEventListener("focusin", onFocusIn, true);
-    unlistenAll();
+    listeners.dispose();
     ov.remove();
     // 포커스 복귀는 한 박자 뒤 — 창을 닫은 그 키(Enter·Space)의 남은 이벤트가 pane 으로 가지 않게.
     // 그사이 다른 모달이 떴다면 setFocus 가드가 xterm 포커스를 막는다.

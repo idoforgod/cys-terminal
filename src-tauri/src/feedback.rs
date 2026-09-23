@@ -734,13 +734,18 @@ fn mailto_url(to: &str, subject: &str, body: &str) -> String {
 
 const TRUNC_NOTE: &str = "\n…(길어서 여기까지만 넣었습니다 — 전체 내용은 첨부 파일 description.txt 에 있습니다)";
 
-fn mail_footer(id: &str, app_version: &str, files: &[String]) -> String {
-    let mut f = format!(
-        "\n\n—\n묶음 번호: {id}\n앱: cys {} · {} {}",
-        clip(app_version, 32),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    );
+fn mail_footer(id: &str, app_version: &str, files: &[String], include_diag: bool) -> String {
+    let mut f = format!("\n\n—\n묶음 번호: {id}");
+    // ★리뷰1 minor #1: 개인정보 고지("진단 정보 함께 넣기…체크를 끄면 넣지 않습니다")와 본문을 맞춘다 —
+    // 진단 동의가 없으면 앱·OS·CPU 줄도 넣지 않는다(고지가 약속하지 않은 값을 몰래 담지 않는다).
+    if include_diag {
+        f.push_str(&format!(
+            "\n앱: cys {} · {} {}",
+            clip(app_version, 32),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+    }
     if !files.is_empty() {
         f.push_str(&format!(
             "\n첨부할 파일: {}\n→ 함께 열린 폴더({})에서 이 메일 창으로 끌어다 넣어 주세요.",
@@ -759,9 +764,10 @@ fn build_mailto(
     desc: &str,
     app_version: &str,
     files: &[String],
+    include_diag: bool,
     max: usize,
 ) -> (String, bool) {
-    let full = mailto_url(FEEDBACK_TO, subject, &format!("{desc}{}", mail_footer(id, app_version, files)));
+    let full = mailto_url(FEEDBACK_TO, subject, &format!("{desc}{}", mail_footer(id, app_version, files, include_diag)));
     if full.len() <= max {
         return (full, false);
     }
@@ -769,7 +775,7 @@ fn build_mailto(
     if !files2.iter().any(|f| f == DESC_FILE) {
         files2.insert(0, DESC_FILE.to_string());
     }
-    let footer = mail_footer(id, app_version, &files2);
+    let footer = mail_footer(id, app_version, &files2, include_diag);
     let chars: Vec<char> = desc.chars().collect();
     let fits = |k: usize| {
         let head: String = chars[..k].iter().collect();
@@ -860,7 +866,9 @@ fn mailto_for_bundle(root: &Path, id: &str, max: usize) -> Result<String, String
     let desc = std::fs::read_to_string(dir.join(DESC_FILE)).map_err(|e| format!("설명을 읽지 못했습니다: {e}"))?;
     let desc = desc.trim();
     let files = bundle_files(&dir)?;
-    let (url, _) = build_mailto(id, &subject_for(id, desc), desc, env!("CARGO_PKG_VERSION"), &files, max);
+    // diag.json 존재 = submit_in 이 쓴 최종 include_diag(제출 당시 동의 · 파일 쓰기 성공)의 그물.
+    let include_diag = dir.join(DIAG_FILE).exists();
+    let (url, _) = build_mailto(id, &subject_for(id, desc), desc, env!("CARGO_PKG_VERSION"), &files, include_diag, max);
     Ok(url)
 }
 
@@ -1246,7 +1254,7 @@ mod tests {
     fn mailto_is_encoded_bounded_and_truncates_with_notice() {
         let id = "fb-20260923-113456-ab12";
         let files = vec!["att-01.png".to_string(), DIAG_FILE.to_string()];
-        let (u, cut) = build_mailto(id, "[cys 피드백] 제목 & 기호?", "첫 줄\n둘째 줄 = 100%", "0.14.41", &files, 8000);
+        let (u, cut) = build_mailto(id, "[cys 피드백] 제목 & 기호?", "첫 줄\n둘째 줄 = 100%", "0.14.41", &files, true, 8000);
         assert!(!cut);
         assert!(u.starts_with(&format!("mailto:{FEEDBACK_TO}?subject=")));
         assert!(u.contains("&body="));
@@ -1257,13 +1265,13 @@ mod tests {
         assert!(u.contains("att-01.png"));
         // 긴 설명(한글 3,000자)은 윈도우 상한 안으로 줄이고 description.txt 를 안내한다
         let long = "가".repeat(3000);
-        let (u2, cut2) = build_mailto(id, "[cys 피드백] x", &long, "0.14.41", &files, 2000);
+        let (u2, cut2) = build_mailto(id, "[cys 피드백] x", &long, "0.14.41", &files, true, 2000);
         assert!(cut2);
         assert!(u2.len() <= 2000, "{}", u2.len());
         assert!(u2.contains("description.txt"));
         assert!(u2.contains(&pct("가가가")), "앞부분은 남는다");
         // 극단: 상한이 꼬리보다 작아도 최소형으로 떨어진다(패닉·빈 URL 금지)
-        let (u3, _) = build_mailto(id, "[cys 피드백] x", &long, "0.14.41", &files, 50);
+        let (u3, _) = build_mailto(id, "[cys 피드백] x", &long, "0.14.41", &files, true, 50);
         assert!(u3.starts_with("mailto:") && u3.contains(id));
     }
 
