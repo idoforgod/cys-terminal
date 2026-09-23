@@ -56,7 +56,7 @@ describe("전문가용 칸 — 버튼 위치·기본 접힘", () => {
   it("＋부서 버튼이 사이드바 머리줄에서 빠졌다(index.html 에 btn-ws-dept 없음 — 전문가용 칸이 JS 로 만든다)", () => {
     expect(html.includes("btn-ws-dept")).toBe(false);
     const head = html.split("\n").find((l) => l.includes('id="wsbar-head"'))!;
-    expect(head.includes("부서")).toBe(false);
+    expect(head.includes(">＋부서<")).toBe(false); // 버튼 글자(＋ 버튼 툴팁의 '부서장' 설명은 허용)
   });
   it("＋ 버튼 안내가 사라진 ＋부서를 가리키지 않고, 두 번째 선언 '거부' 오안내도 없다(반박 D9)", () => {
     const newBtn = html.split("\n").find((l) => l.includes('id="btn-ws-new"'))!;
@@ -109,7 +109,7 @@ describe("팀 생성 흐름 — 확인 창 1회를 우회하는 길이 없다", 
   });
   it("팔레트 act:dept 는 같은 흐름을 탄다(void addDeptWorkspace 로 실패를 삼키지 않는다 — F1)", () => {
     const line = code.split("\n").find((l) => l.includes('id: "act:dept"'));
-    expect(line).toBeDefined();
+    expect(line === undefined).toBe(false);
     const i = code.indexOf('id: "act:dept"');
     const seg = code.slice(i, code.indexOf("},", i) + 2);
     expect(seg).toContain("openTeamCreateFlow(");

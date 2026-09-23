@@ -104,11 +104,11 @@ describe("창 표기 — 임계 70/90 · 클램프 · 누락 · 리셋 지남", 
   });
   it("창이 없으면 0% 가 아니라 '—' (codex 는 5h 창이 없다)", () => {
     const v = windowView(acct({ provider: "codex", rate: [win("7d", 9)] }), "5h", NOW);
-    expect(v).toMatchObject({ pct: null, text: "—", state: "missing", sev: "" });
+    expect({ pct: v.pct, text: v.text, state: v.state, sev: v.sev }).toEqual({ pct: null, text: "—", state: "missing", sev: "" });
   });
   it("리셋 시각이 지났으면 옛 % 를 보여 주지 않는다(리셋 뒤 빨간 78% 오경보 차단)", () => {
     const v = windowView(acct({ rate: [win("5h", 78, NOW - 1)] }), "5h", NOW);
-    expect(v).toMatchObject({ pct: null, text: "리셋됨", state: "rolled", sev: "" });
+    expect({ pct: v.pct, text: v.text, state: v.state, sev: v.sev }).toEqual({ pct: null, text: "리셋됨", state: "rolled", sev: "" });
     expect(v.resetText).toBe("재관측 대기");
   });
   it("리셋 표기 — 5h 는 시:분, 7d 는 월/일", () => {

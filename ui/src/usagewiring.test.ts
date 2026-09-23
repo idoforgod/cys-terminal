@@ -157,8 +157,10 @@ describe("사용량 렌더 — 백지(④) 차단", () => {
 });
 
 describe("새 순수 모듈 — 구형 WKWebView 파싱 실패·최상위 부수효과 0(반박 D6)", () => {
+  // 블록 주석(/** … */)까지 걷는다 — 설명문이 금지 낱말을 언급해도 핀이 깨지지 않게(코드만 본다).
+  const stripAll = (s: string) => stripComments(s.replace(/\/\*[\s\S]*?\*\//g, ""));
   for (const mod of ["./usagebar.ts", "./deptcreate.ts"]) {
-    const m = stripComments(read(mod));
+    const m = stripAll(read(mod));
     it(`${mod}: 비호환 문법 0`, () => {
       for (const bad of ["(?<=", "(?<!", ".at(", "findLast", "structuredClone", "Object.hasOwn", "replaceAll("])
         expect({ 모듈: mod, 문법: bad, 있음: m.includes(bad) }).toEqual({ 모듈: mod, 문법: bad, 있음: false });
