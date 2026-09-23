@@ -6451,10 +6451,15 @@ async fn install_pack_update(
                 "pack_version": pack_version,
                 "reinject_skipped": true,
                 "reinject_skip_reason": reason,
+                // ★review1 m2 FIX: "다시 업데이트하면 재주입됩니다"는 사실과 다르다 — 같은 버전으로
+                // 다시 pack-update 하면 UpToDate no-op(§7-①)이라 재주입 단계 자체에 오지 않고, 이
+                // Err 팔은 pending 도 영속하지 않아(run_pack_update reinject 자체 실패 팔) "다음에
+                // 자동 재시도"도 성립하지 않는다. 실제 회복 경로는 데몬 재기동(재기동 시 격리 config
+                // 멱등 재병합) 또는 각 노드의 다음 /clear 때 최신 지침이 다시 주입되는 것뿐이다.
                 "message": format!(
                     "디스크 팩은 {pack_version} 로 갱신됐으나 라이브 노드 재주입을 하지 못했습니다(데몬 응답 없음: \
                      {reason}) — 떠 있는 노드는 이전 지침으로 동작 중입니다(라이브 무중단 유지, 재시작 안 함). \
-                     데몬 상태를 점검한 뒤 다시 업데이트하면 재주입됩니다."
+                     데몬 상태를 점검해 재기동하거나, 각 노드가 다음 /clear 때 새 지침을 받습니다."
                 ),
             }),
         );
@@ -6535,6 +6540,10 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
 /// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다.
 /// (U4-B2③) 3상 판독의 수치 투영 — 스킵·부재는 수치가 아니므로 (0,0). 스킵 여부는
 /// `parse_reinject_result` 가 따로 말한다(이 함수만 보고 '완전 성공'을 판정하지 마라).
+/// ★review1 m9 FIX: U4-B2③ 이후 프로덕션 호출부는 `parse_reinject_result` 로 옮겨갔고, 이 함수는
+/// 이제 회귀 핀(`parse_reinject_counts_reads_structured_token`)만 부른다 — 테스트 전용으로 이관해
+/// (윈도우뿐 아니라) **모든 플랫폼**의 비테스트 빌드에서 나던 dead_code 경고를 없앤다(거동 무변경).
+#[cfg(test)]
 fn parse_reinject_counts(stdout: &str) -> (u64, u64) {
     match parse_reinject_result(stdout) {
         ReinjectResult::Measured { failed, deferred } => (failed, deferred),
@@ -8322,6 +8331,14 @@ mod tests {
 
     /// ★U4-B2③ 소스 핀: 스킵이면 `update-warning` 을 띄우고 `pack-updated` 에 `reinject_skipped` 를
     /// 실어 완료 토스트가 '재주입 완료'로 단정하지 않게 한다. 종료코드 판정(degraded/실패)은 무변경.
+    ///
+    /// ★review1 M2 FIX #4(blocking): 종전 핀은 문자열 **존재**만 봤다 — `reinject_skipped` 필드명·
+    /// `ReinjectResult::Skipped` 변형명은 다른 줄(예: 6441행 `match &reinject { ... }`)에도 나타나므로,
+    /// 격리 사본 뮤테이션(review1 G4b)으로 ⓐ `reinject_skipped` 판정을 `matches!` 실계산 대신 고정값
+    /// `false` 로, ⓑ 스킵 갈래의 `update-warning` 이벤트명을 바꿔도 이 핀은 여전히 초록이었다(cys-app
+    /// 137/137 통과 — 공허 검체). 아래는 ⓐ `let reinject_skipped = matches!(...)` 가 고정값으로
+    /// 치환되지 않았는지, ⓑ `if let ReinjectResult::Skipped` 블록 **안에서** `update-warning` 이
+    /// 실제로 발화하는지를 블록 범위로 좁혀 확인한다.
     #[test]
     fn install_pack_update_warns_on_reinject_skip_source_pin() {
         let src = include_str!("main.rs");
@@ -8334,6 +8351,28 @@ mod tests {
         assert!(
             body.contains("out.status.code() == Some(cys::pack::EXIT_REINJECT_DEGRADED)"),
             "종료코드 판정이 바뀌었다(범위 밖)"
+        );
+        // ⓐ reinject_skipped 판정이 실계산(matches!)이다 — 고정값으로 위장되지 않았는지.
+        assert!(
+            body.contains("let reinject_skipped = matches!(reinject, ReinjectResult::Skipped { .. });"),
+            "reinject_skipped 판정이 matches! 실계산이 아니게 됐다(고정값 회귀 — review1 G4b)"
+        );
+        // ⓑ if let Skipped 블록 범위로 좁혀 update-warning 발화를 확인(review1 G4b 재현 방지).
+        let skip_at = body
+            .find("if let ReinjectResult::Skipped { reason } = &reinject {")
+            .expect("스킵 갈래 조건 소실");
+        let skip_end = body[skip_at..]
+            .find("} else if failed > 0")
+            .map(|i| skip_at + i)
+            .expect("스킵 갈래 끝(else if failed) 경계 소실");
+        let skip_block = &body[skip_at..skip_end];
+        assert!(
+            skip_block.contains("\"update-warning\""),
+            "스킵 갈래 블록 안에서 update-warning 이벤트가 사라졌다(review1 G4b 회귀)"
+        );
+        assert!(
+            skip_block.contains("\"reinject_skipped\": true"),
+            "스킵 갈래의 reinject_skipped 표식이 상수 true 가 아니게 바뀌었다"
         );
     }
 

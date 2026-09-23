@@ -1162,7 +1162,12 @@ fn classify_fire_result(result: &Result<String, String>) -> JobResultKind {
         }
         Err(_) => JobResultKind::Error,
         Ok(d) if d.starts_with("skipped:") => JobResultKind::Skipped,
-        Ok(d) if d.starts_with("queued ") || d.starts_with("fresh-launched and queued") => {
+        // ★review1 m7 FIX: 접두를 `"queued "`(공백 포함) 대신 `"queued"`(공백 없이)로 넓힌다 —
+        // WP-B4(별도 워크트리 `wp41-B4`)가 `deliver_push`에 `"queued(modal) to …"`를 추가하면,
+        // 통합 뒤 모달 우회 직접 push 결과 문안이 공백 없는 `queued(` 로 시작해 종전 `"queued "` 접두에
+        // 걸리지 않고 `Ok(_) => Ok` 로 새어(정상 큐 적재가 "성공"으로 오분류) CSO 표시를 왜곡한다.
+        // `"queued"` 로 넓혀도 그 뒤에 다른 생산자 문안이 없어 새 오분류가 생기지 않는다(아래 소스 핀).
+        Ok(d) if d.starts_with("queued") || d.starts_with("fresh-launched and queued") => {
             JobResultKind::Queued
         }
         Ok(_) => JobResultKind::Ok,
@@ -4331,6 +4336,10 @@ mod b2_job_results {
         assert_eq!(ok("fresh-launched and pushed (surface:9)"), K::Ok);
         assert_eq!(ok("queued to cso (surface:4)"), K::Queued);
         assert_eq!(ok("fresh-launched and queued (surface:9)"), K::Queued);
+        // ★review1 m7 FIX: WP-B4가 deliver_push에 도입 예정인 모달 우회 문안(별도 워크트리
+        // wp41-B4) — 공백 없이 "queued("로 이어진다. 좁은 "queued " 접두라면 여기서 Ok(성공)로
+        // 새어 CSO가 오독한다(통합 전 이 워크트리에서 선제 회귀 핀).
+        assert_eq!(ok("queued(modal) to cso (surface:4)"), K::Queued, "WP-B4 통합 대비 — queued(modal) 도 큐 적재다");
         assert_eq!(ok("skipped: role 'cso' absent (if_absent=skip)"), K::Skipped);
         assert_eq!(err("command timed out (600s)"), K::Timeout);
         assert_eq!(err("launch-agent timed out (180s)"), K::Timeout);
@@ -4351,6 +4360,7 @@ mod b2_job_results {
             "format!(\"{how} to {to} (surface:{sid})\")",
             "format!(\"fresh-launched and {how} (surface:{sid})\")",
             ".map(|_| \"queued\")",
+            "d.starts_with(\"queued\")",
             "return Ok(\"pushed\");",
             "\"command timed out (600s)\"",
             "\"launch-agent timed out (180s)\"",

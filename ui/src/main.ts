@@ -7591,7 +7591,16 @@ async function start() {
     // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
     const failed = p.reinject_failed ?? 0;
     const deferred = p.reinject_deferred ?? 0;
-    if (failed > 0 || deferred > 0 || p.reinject_skipped === true) {
+    if (p.reinject_skipped === true) {
+      // ★review1 m2 FIX: "다음 폴링에서 재시도"는 스킵 팔에는 거짓이다 — 재주입 RPC 자체가 실패한
+      // 경우 pending 을 영속하지 않아(run_pack_update Err 팔) 자동 재시도가 없다. 실제 회복은
+      // 데몬 점검·재기동 또는 각 노드의 다음 /clear 때 새 지침이 적용되는 것뿐이다.
+      toast(
+        "watchdog",
+        "✅ 팩 디스크 반영 완료",
+        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지(재시작 없음). 라이브 노드 재주입은 못 했습니다(데몬 응답 없음) — 데몬 점검 후 재기동하거나, 각 노드가 다음 /clear 때 새 지침을 받습니다.`,
+      );
+    } else if (failed > 0 || deferred > 0) {
       toast(
         "watchdog",
         "✅ 팩 디스크 반영 완료",

@@ -5398,7 +5398,11 @@ fn attach(sid: u64) -> Result<(), String> {
 /// 결과를 말하지 않는다 — 이 칸이 그 결과다(데몬 메모리 원장 · 재시작 이후분).
 ///   · `result=?`  — 데몬이 원장을 모른다(구버전 cysd) · 판정 불가
 ///   · `result=-`  — 이 데몬 기동 이후 발화 없음
-///   · `result=error FAILING×3` — 연속 실패(error|timeout) 3회
+///   · `result=error FAILING×3` — 연속 실패(error) 3회
+///   · `result=timeout TIMEOUT×2` — 연속 시간초과(timeout) 2회(★review1 m6 FIX: error 와 같은
+///     'FAILING' 딱지를 쓰면 CSO 가 진짜 실패로 오독한다 — formation-heartbeat 의 600s 만료는 코드
+///     스스로 "오보 가능성"이라 적는 갈래(반박 D11). 표기만 분리 — 집계 필드(consecutive_failures)는
+///     error|timeout 합산 그대로, ledger 구조·판정 로직 무변경).
 ///   · `result=skipped non_ok×5` — 실패는 아니지만 마지막 ok 이후 5회 일을 안 했다(적재·건너뜀 포함)
 ///   · `result=ok`
 fn schedule_result_cell(r: &Value, id: &str) -> String {
@@ -5412,7 +5416,8 @@ fn schedule_result_cell(r: &Value, id: &str) -> String {
     let fails = e["consecutive_failures"].as_u64().unwrap_or(0);
     let non_ok = e["consecutive_non_ok"].as_u64().unwrap_or(0);
     if fails > 0 {
-        format!("result={kind} FAILING×{fails}")
+        let label = if kind == "timeout" { "TIMEOUT" } else { "FAILING" };
+        format!("result={kind} {label}×{fails}")
     } else if non_ok > 0 {
         format!("result={kind} non_ok×{non_ok}")
     } else {
@@ -35483,8 +35488,9 @@ mod tests {
         d
     }
 
-    /// ★U4-B2① `cys schedule list` 결과 칸 — 구버전 데몬(원장 모름)=`?` · 발화 없음=`-` · 연속 실패는
-    /// `FAILING×N` · 실패는 아니지만 일을 안 한 연속은 `non_ok×N`. `last_fired` 칸은 그대로 둔다(CSO 판정 핀).
+    /// ★U4-B2① `cys schedule list` 결과 칸 — 구버전 데몬(원장 모름)=`?` · 발화 없음=`-` · 연속 실패
+    /// (error)는 `FAILING×N` · 연속 시간초과(timeout)는 `TIMEOUT×N`(★review1 m6 FIX — error 와
+    /// 딱지를 갈랐다) · 실패는 아니지만 일을 안 한 연속은 `non_ok×N`. `last_fired` 칸은 그대로 둔다(CSO 판정 핀).
     #[test]
     fn schedule_list_result_cell_shows_streaks() {
         assert_eq!(schedule_result_cell(&json!({"jobs": []}), "a"), "result=?");
@@ -35497,13 +35503,41 @@ mod tests {
         }});
         assert_eq!(schedule_result_cell(&r, "none"), "result=-");
         assert_eq!(schedule_result_cell(&r, "f"), "result=error FAILING×3");
-        assert_eq!(schedule_result_cell(&r, "t"), "result=timeout FAILING×1");
+        assert_eq!(schedule_result_cell(&r, "t"), "result=timeout TIMEOUT×1", "timeout 은 error 와 다른 딱지여야 한다(review1 m6)");
         assert_eq!(schedule_result_cell(&r, "s"), "result=skipped non_ok×5");
         assert_eq!(schedule_result_cell(&r, "q"), "result=queued non_ok×1");
         assert_eq!(schedule_result_cell(&r, "o"), "result=ok");
         // 줄 형식: last_fired 칸 뒤에 결과 칸이 **덧붙는다**(기존 칸 순서 불변).
         let src = include_str!("cys.rs");
         assert!(src.contains("\"{}\\t{} {}\\t{}\\t{}\\tlast_fired={}\\t{}\","));
+    }
+
+    /// ★U4-B2① 소스 핀(review1 M2 FIX #3 · blocking): 위 검체는 순수 함수 `schedule_result_cell`만
+    /// 잰다 — **진입점 `run_schedule`의 `ScheduleAction::List` 팔이 그 반환값을 실제로 찍는지**는 아무
+    /// 검체도 보지 않는다. 격리 사본 뮤테이션(review1 W3)으로 println! 의 `res` 인자를 빈 문자열로
+    /// 바꿔도(형식 문자열은 그대로) 전 스위트가 초록이었다(공허 검체 — ① list 노출이 조용히 빠져도
+    /// CI 가 모른다). 이 핀은 `res`가 `schedule_result_cell(&r, …)` 로 바인딩되고, 그 **변수 자체**가
+    /// println! 의 마지막 인자 자리에 그대로 있는지(리터럴로 치환되지 않았는지) 소스에서 본다.
+    #[test]
+    fn run_schedule_list_prints_result_cell_binding_source_pin() {
+        let src = include_str!("cys.rs");
+        let fn_body = refl_fn_body(src, "run_schedule");
+        let list_at = fn_body
+            .find("ScheduleAction::List =>")
+            .expect("List 팔이 사라졌다");
+        let list_end = fn_body[list_at..]
+            .find("ScheduleAction::Remove")
+            .map(|i| list_at + i)
+            .expect("Remove 팔이 사라졌다(List 팔 경계 산정 실패)");
+        let list_arm = &fn_body[list_at..list_end];
+        assert!(
+            list_arm.contains("let res = schedule_result_cell(&r, j[\"id\"]"),
+            "res 가 schedule_result_cell 로 바인딩되지 않는다"
+        );
+        assert!(
+            list_arm.contains("\n                    res,\n                );"),
+            "println! 의 마지막 인자가 res 변수가 아니게 바뀌었다(값이 빈 문자열/리터럴로 위장됐을 수 있다)"
+        );
     }
 
     /// ★U4-B2② 핀(반박 D5): 도달 불가 데몬을 두 갈래로 가른다 — 연결 실패(down)는 정보성 표기,
@@ -35586,6 +35620,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★U4-B2② 소스 핀(review1 M2 FIX #1 · blocking): 위 두 검체는 `drain_verify_merge_unreachable`·
+    /// `drain_verify_collect` 헬퍼만 직접 부른다 — **진입점 `run_drain_verify` 안의 배선**은 아무 검체도
+    /// 통과하지 않는다. 격리 사본 뮤테이션(review1 W1)으로 `run_drain_verify` 안의
+    /// `drain_verify_merge_unreachable(&mut report, &unreachable);` 호출을 통째로 지워 ②가 제품 경로에서
+    /// 사라졌는데도 전 스위트(368건 중 무관 10건 제외)가 초록이었다(공허 검체). 이 핀은 실행이 아니라
+    /// **소스에서 배선을 직접** 본다: 호출이 있는지, 그리고 `all_saved` 판독보다 **앞**인지(뒤에 있으면
+    /// `unreachable` 병합 전 값을 읽어 같은 결함).
+    #[test]
+    fn run_drain_verify_wires_merge_before_all_saved_read_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = strip_line_comments(refl_fn_body(src, "run_drain_verify"));
+        let merge_at = body
+            .find("drain_verify_merge_unreachable(&mut report, &unreachable);")
+            .expect("run_drain_verify 안에서 drain_verify_merge_unreachable 호출이 사라졌다(review1 W1 회귀)");
+        let read_at = body
+            .find("let all_saved = report[\"all_saved\"]")
+            .expect("all_saved 판독이 사라졌다");
+        assert!(
+            merge_at < read_at,
+            "unreachable 병합이 all_saved 판독보다 뒤에 있다 — 병합 전 값을 읽는다"
+        );
+    }
+
     /// ★U4-B2③ 핀: 재주입 RPC 자체가 실패한 팔도 구조화 토큰을 낸다 — 종전에는 토큰이 없어 브리지가
     /// (0,0) 으로 읽고 '완전 성공'을 띄웠다. 측정하지 않은 수치(failed=/deferred=)는 싣지 않는다.
     /// 그리고 **종료코드는 불변**(Err 팔 = 0 또는 accepted-degraded) — 소스 핀.
@@ -35611,6 +35668,25 @@ mod tests {
         );
         assert!(arm.contains("Ok(0)"), "Err 팔 종료코드(0)가 바뀌었다 — 무중단 정책 위반");
         assert!(arm.contains("EXIT_ACCEPTED_DEGRADED"), "accepted-degraded 승격이 사라졌다");
+    }
+
+    /// ★U4-B2④ 소스 핀(review1 M2 FIX #2 · blocking): 아래 검체는 `DoctorCtx`를 직접 구성해
+    /// `diag_hook`을 부른다 — **진입점 `run_doctor`가 실제로 그 필드를 무엇으로 채우는지**는 아무
+    /// 검체도 보지 않는다. 격리 사본 뮤테이션(review1 W2)으로 `run_doctor` 안의
+    /// `consumed_config_dir`를 실소비 폴더(`resolve_claude_config_dir()`) 대신 개인 프로필
+    /// (`~/.claude`)로 되돌려도 전 스위트가 초록이었다(공허 검체 — ④가 개인 프로필 대조로 회귀해도
+    /// CI 가 모른다). 이 핀은 실행이 아니라 **소스에서 배선을 직접** 본다.
+    #[test]
+    fn run_doctor_wires_consumed_config_dir_to_resolve_claude_config_dir_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "run_doctor");
+        assert!(
+            body.contains(
+                "consumed_config_dir: std::path::PathBuf::from(cys::resolve_claude_config_dir()),"
+            ),
+            "run_doctor 의 consumed_config_dir 가 실소비 폴더 해소기(resolve_claude_config_dir)로 \
+             배선돼 있지 않다(개인 프로필로 회귀했거나 소실됐다)"
+        );
     }
 
     /// ★U4-B2④ 핀: hook 진단의 1차 대조 표면은 **실소비 config 폴더**다. 종전에는 개인 프로필
