@@ -42,6 +42,15 @@ describe("classifyPendingFeed — pending 조작면 분류(패널·팔레트 공
     ).toBe("standard");
   });
 
+  // ★U16(0.14.41) 팀 만들기 제안: 일반 Allow 는 생성 없이 카드를 소각하는 기만 버튼이다 —
+  //  전용 분류로 내려 카드(확인 창 열기·만들지 않기)만 남기고 팔레트 승인 대상에서도 뺀다.
+  test("★team-create-request 는 'team-create' — 부가 신호와 무관", () => {
+    expect(classifyPendingFeed({ kind: "team-create-request", request_id: "tp-1" })).toBe("team-create");
+    expect(
+      classifyPendingFeed({ kind: "team-create-request", request_id: "tp-1", daemon_issued: false }),
+    ).toBe("team-create");
+  });
+
   test("특례 보존: ceo-promote-request 등 다른 kind 는 standard(Allow 경로 유지)", () => {
     expect(classifyPendingFeed({ kind: "ceo-promote-request", request_id: "r3" })).toBe("standard");
     expect(classifyPendingFeed({ kind: "learn_proposal", request_id: "r4" })).toBe("standard");

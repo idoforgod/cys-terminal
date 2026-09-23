@@ -35237,3 +35237,21 @@ mod d06_regression {
         }
     }
 }
+
+// ★U16(0.14.41) 말로 팀 만들기 — `cys team-propose` 계약 핀(표면·검증). 데몬 잠금은
+// cysd team_gate_tests 가, 스키마·코덱 SOT 는 lib `cys::team_spec` 테스트가 잰다.
+#[cfg(test)]
+mod team_propose_tests {
+    use super::*;
+
+    #[test]
+    fn team_propose_subcommand_parses() {
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "영상편집팀", "--purpose", "유튜브 영상 편집"]);
+        assert!(c.is_ok(), "team-propose 하위 명령이 없다: {:?}", c.err().map(|e| e.to_string()));
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose-file", "/tmp/p.md"]);
+        assert!(c.is_ok(), "--purpose-file 이 없다");
+        // 둘 다 주면 거부(어느 쪽이 원문인지 모호).
+        let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose", "a", "--purpose-file", "/tmp/p.md"]);
+        assert!(c.is_err(), "--purpose 와 --purpose-file 동시 지정이 통과했다");
+    }
+}
