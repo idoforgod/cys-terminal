@@ -321,6 +321,19 @@ RESOURCE_RECHECK_TOTAL_S = _env_capped_seconds(
 RESOURCE_RECHECK_INTERVAL_S = _env_capped_seconds(
     "CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S", RESOURCE_RECHECK_INTERVAL_CAP_S,
     RESOURCE_RECHECK_INTERVAL_FLOOR_S)
+
+
+def _recheck_rounds(total, interval):
+    """U11 재확인 최대 회차 수 = int(TOTAL/INTERVAL + 1e-9)(부동소수 함정 제거).
+
+    ★리뷰1(2026-09-23) MU13 방어: `+1e-9` 를 지우고 `//`(내림 나눗셈)로 바꿔도 테스트 값
+      1.5/0.5 는 딱 나누어떨어져(둘 다 3) 구분되지 않았다. 파이썬에서 `0.3/0.05` 는 부동소수
+      표현상 5.999999999999999 라 `int(0.3/0.05)`(=`//` 취지)는 **5** 가 나오지만, 실제 의도한
+      회차 수는 **6** 이다 — `+1e-9` 가 그 경계를 밀어 올린다. self-test 가 `(0.3, 0.05) == 6`
+      을 직접 단언해 이 상수를 핀한다(아래 `--self-test`)."""
+    if interval <= 0:
+        return 0
+    return int(total / interval + 1e-9)
 # 재확인 대상 축 — **fleet_cpu_ratio 단일**. 게이트의 CPU_GRACE_AXES 에는 load_ratio 도 있지만 그
 # 축은 0.14.31 부터 hard 가 없어(soft 전용) 여기 넣으면 사문 멤버가 된다. servers·nodes·context·
 # formation_budget 은 기다려도 풀리지 않는 개수/자기보고 축이라 3분을 버리지 않는다(즉시 exit 9).
@@ -2583,7 +2596,7 @@ def _resource_wait(py, gate, log, t0, first, sleeper=None, clock=None):
     sleeper = sleeper or time.sleep
     clock = clock or time.monotonic
     total, interval = RESOURCE_RECHECK_TOTAL_S, RESOURCE_RECHECK_INTERVAL_S
-    n_max = int(total / interval + 1e-9)
+    n_max = _recheck_rounds(total, interval)
     deadline = t0 + total
     cur = first
     trail = [_gate_fleet_value(first[1])]
@@ -3820,6 +3833,14 @@ def cmd_self_test():
             and RESOURCE_RECHECK_INTERVAL_S <= RESOURCE_RECHECK_INTERVAL_CAP_S \
             and RESOURCE_RECHECK_INTERVAL_S >= RESOURCE_RECHECK_INTERVAL_FLOOR_S, \
             "U11 재확인 예산이 오너 상한(180s·30s)/간격 하한을 벗어났다"
+        # ★리뷰1 MU13 방어: `_recheck_rounds` 의 `+1e-9` 부동소수 보정을 직접 핀한다.
+        #   `0.3/0.05` 는 파이썬에서 5.999999999999999 이므로 보정 없이 `//`(또는 `int()`)만
+        #   쓰면 5 가 나온다 — 의도한 값 6 과 다르다(테스트값 1.5/0.5 는 둘 다 3 이라 못 가른다).
+        assert _recheck_rounds(0.3, 0.05) == 6, \
+            "U11 재확인 회차 수 부동소수 함정 회귀(0.3/0.05 는 int()/// 로는 5 — +1e-9 보정 소실)"
+        assert _recheck_rounds(1.5, 0.5) == 3, "U11 재확인 회차 수(정수배 케이스) 회귀"
+        assert _recheck_rounds(180.0, 30.0) == 6, "U11 재확인 회차 수(기본 예산) 회귀"
+        assert _recheck_rounds(1.0, 0.0) == 0, "U11 재확인 회차 수: 간격 0 은 0 회차(0 나눗셈 방지)"
         # ★A13(W2): 미지 exit 의 fail-open 제거 — 'allow' 로 접히지 않고 타입으로 분리된다.
         assert _resource_gate_decision(3, None, None)[0] == "unknown-exit", \
             "미지 exit 이 여전히 allow 로 접힘(fail-open 잔존 — 판정불가↔allow 융합)"

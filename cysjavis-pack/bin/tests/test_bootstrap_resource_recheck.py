@@ -272,17 +272,35 @@ check("b7 result.resource_wait 기계 필드(checks·trail·outcome)",
 check("b8 result 종전 계약 유지(failed · failed_step=resource-gate · exit 9)",
       rig.result().get("state") == "failed" and rig.result().get("failed_step") == "resource-gate"
       and rig.result().get("exit") == 9, "result=%r" % rig.result())
-if len(calls) >= 2:
-    first = calls[0][1]
-    starts = [c[1] - first for c in calls]
-    # 절대 스케줄: k 번째 재측정 시작 ≈ k×INTERVAL(드리프트 없음 — '측정 뒤 INTERVAL 잠' 이면 밀린다)
-    drift = max(abs(s - k * INTERVAL) for k, s in enumerate(starts))
-    check("b9 절대 스케줄(t0+k×INTERVAL · 최대 편차 %.3fs < 0.2s)" % drift, drift < 0.2,
-          "starts=%r" % [round(s, 3) for s in starts])
 check("b10 대기 중 큐 전송(send) 0", rig.count("send") == 0, "cys calls=%r" % rig.cys_calls())
 # 재확인 회차(fleet 단독 hard)는 cys list 교차확인을 생략한다 — 최초 측정의 1회만 남는다.
 lists_b = rig.count("list")
 rig.cleanup()
+
+# ── (b9) 절대 스케줄 핀 — 게이트 소요를 주입해야 상대 스케줄(MU3)과 갈린다 ──────────
+# ★리뷰1(2026-09-23): 위 rig(gate_delay=0.0)는 게이트 호출이 사실상 즉시 끝나서, 절대
+#   스케줄(`due=t0+k×INTERVAL`)과 상대 스케줄(`due=now+INTERVAL`)의 드리프트가 실질적으로
+#   같아진다(둘 다 ≈k×INTERVAL) — 그래서 옛 b9(문턱 0.2s)는 MU3(상대 스케줄 치환)를 못
+#   잡았다(관측 드리프트 0.125s < 0.2s). 게이트 소요를 명시로 주입하면 갈린다: 절대 스케줄은
+#   그 소요를 다음 회차 대기에서 **상쇄**하지만(due 는 t0 로부터 고정), 상대 스케줄은 매
+#   회차 소요만큼 **누적**된다(회차 k 드리프트 ≈ k×게이트소요). 문턱을 게이트 소요에 비례시켜
+#   (0.5×게이트) 잡으면 정상 구현(드리프트≈스폰 지터)은 통과하고 MU3(드리프트≈k×게이트)는
+#   1회차부터 즉시 떨어진다.
+GATE_DELAY_B9 = 0.15
+rig9 = Rig([fleet_hard()], gate_delay=GATE_DELAY_B9).run()
+calls9 = rig9.gate_calls()
+if len(calls9) >= 2:
+    first9 = calls9[0][1]
+    starts9 = [c[1] - first9 for c in calls9]
+    drift9 = max(abs(s - k * INTERVAL) for k, s in enumerate(starts9))
+    thresh9 = 0.5 * GATE_DELAY_B9
+    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 최대 편차 %.3fs < %.3fs=0.5×게이트소요)"
+          % (GATE_DELAY_B9, drift9, thresh9), drift9 < thresh9,
+          "starts=%r" % [round(s, 3) for s in starts9])
+else:
+    check("b9 절대 스케줄(측정 불충분)", False, "calls=%d" % len(calls9))
+rig9.cleanup()
+
 rig0 = Rig([fleet_hard()], env_extra={"CYS_BOOT_RESOURCE_RECHECK_TOTAL_S": "0"}).run()
 check("b11 재확인 회차는 cys list 교차확인 생략(추가 호출 0)", lists_b == rig0.count("list"),
       "재확인 런 list=%d · 1회 런 list=%d" % (lists_b, rig0.count("list")))
