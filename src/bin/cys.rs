@@ -35217,7 +35217,11 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
-        let socket = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        // ★성찰 A(minor): CARGO_MANIFEST_DIR(체크아웃 경로) 기반이면 경로가 길 때 macOS 소켓 경로
+        //   상한(sockaddr_un.sun_path 104B)을 넘겨 bind 가 "이유 없이" 실패한다(체크아웃 위치가
+        //   길수록 흔함 — 워크트리 경로가 특히 그렇다). /tmp 는 항상 짧다(unix 전용 함수 — 이미
+        //   #[cfg(unix)]).
+        let socket = std::path::Path::new("/tmp").join(format!(
             ".d16-{}-{}.sock",
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
@@ -35638,7 +35642,10 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
-        let socket = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        // ★성찰 A(minor): 위 fake_daemon_with 와 동일 결함 — CARGO_MANIFEST_DIR 기반은 긴 체크아웃
+        //   경로에서 macOS 소켓 경로 상한(104B)을 넘겨 u8_m2·d16_e2e 검체가 이유 없이 FAIL 한다
+        //   (실측: 긴 경로 14 FAIL, 짧은 경로 0). /tmp 로 고정.
+        let socket = std::path::Path::new("/tmp").join(format!(
             ".d16r-{}-{}.sock",
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed),
