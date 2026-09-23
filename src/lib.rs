@@ -6703,7 +6703,7 @@ mod spawn_policy_tests {
         assert!(is_violation(&census_of(fake)[0]), "ⓗ 몸통에 정책이 없는 가짜 래퍼를 인정했다");
         let chained = "fn inner(cmd: &mut std::process::Command) {\n    cmd.spawn_policy(crate::ChildLifetime::Attached);\n}\n\
                        fn f() {\n    let apply = |cmd: &mut std::process::Command| {\n        cmd.env(\"A\", \"1\");\n        \
-                       inner(cmd);\n    };\n    let mut c = std::process::Command::new(\"py\");\n    apply(&mut c);\n    c.output();\n}\n";
+                       inner(cmd);\n    };\n    let mut c = std::process::Command::new(\"tool\");\n    apply(&mut c);\n    c.output();\n}\n";
         assert_eq!(census_of(chained), vec![SpawnVerdict::Policy("apply".into())], "ⓗ 래퍼를 부르는 클로저");
         // ⓘ 조기 반환 가둠: `if cfg!(windows) { return … }` 뒤는 윈도우 도달 불가(usage.rs lsof 형태)
         let i = census_of(

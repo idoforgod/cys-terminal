@@ -4364,6 +4364,66 @@ def _u5_capture_spreads(path):
     return spreads, bad
 
 
+# 팩 파이썬의 creationflags 사용 파일·개수 동결(주석 제외 코드 토큰 기준). 여기 없는 파일이 창 정책을 걸기
+# 시작하면 적색 — "파이썬 전역 NOWIN 금지"(설계 §3 U5)를 기계로 집행한다. 늘리려면 사유와 함께 여기서 올린다.
+_U5_PACK_CREATIONFLAGS = {
+    "javis_completion_guard.py": 1,    # CREATE_NEW_PROCESS_GROUP(창 정책 아님 · 트리 분리)
+    "javis_cycle_autopilot.py": 1,     # U5 캡처 전용 _CAPTURE_SPAWN_KW(nt NOWIN)
+    "javis_hud_bridge.py": 1,          # NOWIN(브리지 = cysd 가 숨겨 띄운 장수 프로세스 · 0.12.44~)
+    "javis_phoenix_win_smoke.py": 2,   # 윈도우 스모크 검체의 CREATE_NO_WINDOW
+}
+# 콘솔을 떼어 내거나 새로 여는 수단(자손이 매번 새 창을 받는다) — 팩 어디에도 0건이어야 한다.
+_U5_PACK_DETACH_PY = ("DETACHED_PROCESS", "CREATE_NEW_CONSOLE", "pythonw", "startfile", "0x00000008", "0x00000010")
+_U5_PACK_DETACH_SH = ("Start-Process", 'start ""', "//c start")
+
+
+def _u5_py_code(src):
+    """주석 토큰을 뺀 코드 문자열(문자열 리터럴은 남긴다 — dict 키 "creationflags" 도 사용이다)."""
+    import io
+    import tokenize
+    toks = tokenize.generate_tokens(io.StringIO(src).readline)
+    return " ".join(t.string for t in toks if t.type != tokenize.COMMENT)
+
+
+def _u5_pack_window_census():
+    """(creationflags 파일→개수, 위반 목록, 판독 파일 수) — bin/*.py · hooks/**/*.py(tests 제외) + 셸."""
+    import glob
+    counts, bad, n = {}, [], 0
+    pys = sorted(set(glob.glob(os.path.join(BIN_DIR, "*.py"))
+                     + glob.glob(os.path.join(HOOKS_DIR, "**", "*.py"), recursive=True)))
+    for f in pys:
+        if os.sep + "tests" + os.sep in f:
+            continue
+        try:
+            code = _u5_py_code(_read(f))
+        except Exception as e:                      # noqa: BLE001 — 판독 불능은 통과가 아니다
+            bad.append("%s 토큰화 실패(%s) — 측정 불능" % (os.path.basename(f), e))
+            continue
+        n += 1
+        c = code.count("creationflags")
+        if c:
+            counts[os.path.basename(f)] = c
+        for tok in _U5_PACK_DETACH_PY:
+            if tok in code:
+                bad.append("%s: `%s`" % (os.path.basename(f), tok))
+    shs = sorted(set(glob.glob(os.path.join(HOOKS_DIR, "**", "*.sh"), recursive=True)
+                     + [p for p in glob.glob(os.path.join(BIN_DIR, "*")) if not p.endswith(".py")]))
+    for f in shs:
+        if not os.path.isfile(f):
+            continue
+        try:
+            text = _read(f)
+        except Exception:                           # noqa: BLE001 — 바이너리 등은 셸이 아니다
+            continue
+        for ln in text.splitlines():
+            if ln.lstrip().startswith("#"):
+                continue
+            for tok in _U5_PACK_DETACH_SH:
+                if tok in ln:
+                    bad.append("%s: `%s` — %s" % (os.path.basename(f), tok, ln.strip()[:80]))
+    return counts, bad, n
+
+
 @specimen("H-WIN-13", "W6",
           "U5 1분 사슬 캡처 호출 창 정책 — NOWIN 은 캡처 전용 호출에만 · 실스폰 tick 이 gate-check rc=0 으로 "
           "킬스위치를 통과(② 무clear 방지)",
@@ -4452,9 +4512,21 @@ def h_win_13():
         rc2, out2, err2 = A.run_wakeup([PY, "-c", "print('ok-u5')"])
         need(rc2 == 0 and out2.strip() == "ok-u5", "run_wakeup 실스폰 실패: rc=%r out=%r err=%r" % (rc2, out2, err2[-200:]))
         hw = sorted(set(re.findall(r"hwnd=(-?\d+)", calls)))
+    # ⑤ 팩 전역 규율 — creationflags 사용 파일·개수 동결 + 콘솔 분리 수단 0건(파이썬 전역 NOWIN 금지 집행).
+    need(_u5_py_code("x = 1  # creationflags 는 주석\n").count("creationflags") == 0
+         and _u5_py_code("kw = {'creationflags': 8}\n").count("creationflags") == 1,
+         "계측 자기검증 실패: 주석/코드 구분이 틀렸다")
+    counts, pbad, npy = _u5_pack_window_census()
+    need(npy >= 50, "팩 파이썬 판독 %d개 — 시야가 먼 초록은 근거가 아니다" % npy)
+    need(not pbad, "팩 콘솔 분리 수단·판독 불능: %s" % pbad)
+    need(counts == _U5_PACK_CREATIONFLAGS,
+         "팩 creationflags 사용이 동결표를 벗어났다 — 실측 %s · 동결 %s. 창 정책은 콘솔 없는 부모가 낳는 **루트**"
+         "에만 건다(자손은 숨은 콘솔 상속). 새 사용이면 캡처 전용인지 확인하고 사유와 함께 동결표를 올려라"
+         % (counts, _U5_PACK_CREATIONFLAGS))
     return ("범위(캡처 run 2 · verifier 0 NOWIN) · 실스폰 tick result=%s(gate-check rc=0 통과) · stdin 왕복 · "
-            "run_wakeup · 플랫폼=%s NOWIN=%s · 자식 GetConsoleWindow=%s(참고)"
-            % (verdict.get("result"), os.name, bool(want), ",".join(hw) or "-"))
+            "run_wakeup · 플랫폼=%s NOWIN=%s · 자식 GetConsoleWindow=%s(참고) · 팩 creationflags 동결 %d파일"
+            "(판독 %d) · 분리 수단 0"
+            % (verdict.get("result"), os.name, bool(want), ",".join(hw) or "-", len(counts), npy))
 
 
 @specimen("H-PYSEAL-1", "W6",
