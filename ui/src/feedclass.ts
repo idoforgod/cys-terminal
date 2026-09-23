@@ -26,6 +26,11 @@
 //   기만 버튼이다(생성은 확인 창 [만들기] → addDeptWorkspace 뒤에만 일어난다). 그래서 Allow/Deny 를
 //   내리고 카드 전용 두 버튼([확인 창 열기]·[만들지 않기])만 둔다. 팔레트 'feed 승인'은 "standard" 만
 //   고르므로 이 분류는 자동으로 제외된다(같은 술어 공유).
+// ★성찰 B(minor): kind 리터럴은 teamproposal.ts TEAM_CREATE_KIND 가 정본이다(src/team_spec.rs
+//   KIND 와 대조하는 그 상수) — 여기·main.ts 에 사본 리터럴을 두면 kind 가 바뀔 때 여러 파일을
+//   같이 고쳐야 한다(샷건 서저리). import 로 단일화.
+import { TEAM_CREATE_KIND } from "./teamproposal";
+
 export type PendingFeedClass = "cycle-verify" | "daemon-detected" | "team-create" | "standard";
 
 export function classifyPendingFeed(i: {
@@ -37,7 +42,7 @@ export function classifyPendingFeed(i: {
   // daemon_issued 와 실제로 겹치지 않지만, 겹치더라도 '버튼을 내리는' 분류가 이기는
   // 순서가 안전 방향이다(오판이 Allow 를 살리는 쪽으로 나지 않게).
   if (i.kind === "cycle-verify") return "cycle-verify";
-  if (i.kind === "team-create-request") return "team-create";
+  if (i.kind === TEAM_CREATE_KIND) return "team-create";
   if (i.kind === "approval" && (i.daemon_issued ?? i.request_id.startsWith("daemon-")))
     return "daemon-detected";
   return "standard";

@@ -53,6 +53,7 @@ import {
   buildTeamConfirm,
   teamCardText,
   teamCreateErrorText,
+  TEAM_CREATE_KIND,
   type TeamSpec,
 } from "./teamproposal";
 import {
@@ -8162,7 +8163,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     if (name === "feed.item.created") {
       // ★U16: 팀 만들기 제안은 확인 창을 자동으로 띄우지 않는다(포커스 탈취·취소 사고 · 반박 M6) — 안내만.
       // ★U10(0.14.41): 그 밖의 kind는 정보성(각성 훅·부트 실패·편성·CEO 알림 등)이면 'ℹ 알림', 아니면 '📥 승인 요청'.
-      if (payload.kind === "team-create-request")
+      if (payload.kind === TEAM_CREATE_KIND)
         toast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
       else toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
