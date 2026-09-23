@@ -48,7 +48,7 @@ const CYS_BASE_EXACT: [&str; 27] = [
 
 /// ~/.cys 직하에서 격리하는 정확 이름(2차) — 배열 상수 길이 고정을 피하려 분리하지 않고
 /// 접두로 못 잡는 단건들을 이어 담는다.
-const CYS_BASE_EXACT2: [&str; 9] = [
+const CYS_BASE_EXACT2: [&str; 10] = [
     // ★(0.14.31 · 독립 재유도) TTL 승인 전용 저장소와 두 저장소의 **원자적 쓰기 잔재**.
     //   0.14.31 이 `expires_at` 레코드를 `approvals-ttl.json` 으로 분리했는데 인벤토리는
     //   `approvals.json` 하나였다 → 초기화 뒤에도 미만료 승인이 남는다(시크릿을 env 로 고정한
@@ -66,6 +66,10 @@ const CYS_BASE_EXACT2: [&str; 9] = [
     // transfer-<sid>-<ts>.md 에 세션 결정·리스크가 남는 대화 파생 흔적이다
     // (src-tauri/src/main.rs home_dir_path 폴백 · ui/src/main.ts 전출 경로).
     "transfers",
+    // ★U6(0.14.41 · 반박 D8): 피드백 묶음 `~/.cys/feedback/<id>/` — 설명·첨부(스크린샷·영상)·
+    // 진단의 **사용 흔적**이다(src-tauri/src/feedback.rs). 비밀이 찍힌 화면일 수 있어, 남기면
+    // "완전 초기화"를 한 사용자에게 스크린샷이 그대로 남는다. transfers 와 같은 등급.
+    "feedback",
 ];
 
 /// ~/.cys 직하에서 격리하는 접두. `pack-dept-<name>`(유령 `pack-dept---help` 포함),
@@ -2459,6 +2463,8 @@ mod tests {
         touch(&r.cys_base.join(".master-bootstrapped"), "x");
         touch(&r.cys_base.join(".master-bootstrapped-dept-1"), "x");
         mk(&r.cys_base.join("transfers"));
+        // ★U6(0.14.41): 피드백 묶음(설명·스크린샷·영상·진단 — 비밀이 찍힌 화면일 수 있다).
+        mk(&r.cys_base.join("feedback/fb-20260923-120000-ab12"));
         touch(&r.cys_base.join("apple-notary.env"), "SECRET");
         touch(&r.cys_base.join(crate::license::LICENSE_BASENAMES[0]), "{}");
         touch(&r.cys_base.join(crate::license::LICENSE_BASENAMES[1]), "sig");
@@ -2494,6 +2500,7 @@ mod tests {
             ".cys/.master-bootstrapped-dept-1",
             ".cys/state-generations",
             ".cys/transfers",
+            ".cys/feedback",
             ".local/state/cys",
             ".local/state/cys-dept-dept-1",
             "_round",

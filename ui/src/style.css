@@ -706,6 +706,65 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 /* 완전삭제 확인 입력의 불일치 실시간 힌트(modal-trust 계열 경고색·빈 상태 높이 예약) */
 .modal-hint { font-size: 11px; color: #f59e0b; margin: 6px 0 0; min-height: 14px; }
 
+/* ★U6(0.14.41) 피드백 보내기 — 사이드바 바닥 단추(#wsbar-feedback-slot 안 · 공용 칸 #wsbar-foot 의 배치·
+   높이 규칙은 A2 소유라 여기서 건드리지 않는다)와 작성 창. 창은 .modal-overlay 기본층(z 1000)을 그대로 쓴다
+   — 위에 뜨는 확인 창·자동 모달이 창 밑에 깔리지 않게(반박 D4). .feedback-overlay 에 z-index 를 주지 말 것. */
+#btn-feedback {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  width: calc(100% - 16px); margin: 6px 8px; padding: 6px 10px; border-radius: 7px;
+  border: 1px solid var(--border); background: transparent; color: #8b949e; cursor: pointer;
+  font-family: inherit; font-size: calc(12px * var(--wsbar-font, 1)); text-align: left;
+}
+#btn-feedback:hover { color: var(--text); background: #1c2128; }
+#btn-feedback svg { flex: none; width: calc(14px * var(--wsbar-font, 1)); height: calc(14px * var(--wsbar-font, 1)); }
+#btn-feedback span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.feedback-modal {
+  width: min(560px, calc(100vw - 32px)); max-width: 560px;
+  max-height: calc(100vh - 48px); overflow-y: auto;
+}
+/* 짝 규칙: 이 창 안에서 display 를 명시한 요소(.fb-confirm·.modal-btns 등)도 hidden 이면 사라진다. */
+.feedback-modal [hidden] { display: none !important; }
+.feedback-modal p { margin: 0 0 8px; font-size: 12px; line-height: 1.55; }
+.fb-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.fb-head h3 { margin: 0; }
+.fb-x, .fb-att-x {
+  background: none; border: none; color: #8b949e; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 6px;
+}
+.fb-x:hover, .fb-att-x:hover { color: var(--text); }
+.fb-desc { min-height: 110px; }
+.fb-drop { margin: 10px 0 6px; padding: 10px; border: 1px dashed rgba(255,255,255,.18); border-radius: 8px; }
+.fb-drop.over { border-color: var(--accent); background: rgba(47,129,247,.08); }
+.fb-drop-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: #94a3b8; }
+.fb-drop-hint { flex: 1; min-width: 180px; }
+.fb-btn {
+  padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--canvas-text); cursor: pointer; font-size: 12px; font-family: inherit;
+}
+.fb-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.fb-list li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.fb-att-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fb-att-size { flex: none; color: #8b949e; }
+.feedback-modal p.fb-tip, .feedback-modal p.fb-size-note { font-size: 11px; color: #94a3b8; }
+.feedback-modal p.fb-warn { font-size: 11px; color: #f59e0b; }
+.fb-diag-row { display: flex; align-items: flex-start; gap: 6px; font-size: 12px; margin: 4px 0 6px; }
+.fb-diag-pre {
+  max-height: 180px; overflow: auto; margin: 6px 0; padding: 8px; border-radius: 6px;
+  background: rgba(255,255,255,.04); font-size: 11px; white-space: pre-wrap; word-break: break-all;
+}
+.fb-privacy { margin: 8px 0; font-size: 11px; color: #94a3b8; }
+.fb-privacy summary { cursor: pointer; }
+.feedback-modal p.fb-privacy-body { margin: 6px 0 0; font-size: 11px; color: #94a3b8; }
+.fb-confirm {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; padding: 8px 10px;
+  border: 1px solid rgba(245,158,11,.30); border-radius: 6px; background: rgba(245,158,11,.06); font-size: 12px;
+}
+.fb-confirm span { flex: 1; min-width: 160px; }
+.feedback-modal p.fb-status { min-height: 16px; margin: 8px 0 0; }
+.fb-status.ok { color: var(--ok); }
+.fb-status.error { color: var(--error); }
+.fb-done-btns { flex-wrap: wrap; }
+.fb-copy-buf { position: absolute; left: -9999px; width: 1px; height: 1px; }
+
 /* 07 Command Palette (⌘K) — modal-overlay + ctx-menu 패턴 합성 */
 .palette-overlay {
   /* z 1600: #cc-panel(1500) 위 — modal/ctx-menu(1000)도 위. #drag-ghost(2000)는 pointer-events:none 일시 프리뷰라 무관. confirm은 close 후 호출. */

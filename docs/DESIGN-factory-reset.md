@@ -52,7 +52,7 @@ hostinger-ftp.env·license.json)까지 파괴한다.
 격리(Quarantine):
 - `~/.cys/`: pack, pack.prev, .pack-staging*, .pack-download, .pack-journal,
   .pack-accepted.json, .pack-apply.lock, .pack-reinject-pending.json, pack-dept-*,
-  claude, claude-*, state, state-generations, state-harness, _round, transfers,
+  claude, claude-*, state, state-generations, state-harness, _round, transfers, feedback,
   depts.json(+.lock), dept-catalog.json(+.lock), dept-missions, dept-snapshots,
   accounts.json, policy.json, profile.json, approvals.json, .approval-secret,
   .master-bootstrapped*, .gui-onboarded, .gui-onboard-attempts, .last-app-version, .pending-restore,

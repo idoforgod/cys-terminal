@@ -72,6 +72,15 @@ declare module "bun:test" {
     toThrow(expected?: unknown): void;
     /** 부정 체이닝 — `expect(x).not.toBe(y)`. */
     readonly not: Matchers;
+    /**
+     * Promise 체이닝 — `await expect(p).resolves.toBeUndefined()`(feedbackflow.test.ts M7 검체).
+     * 실제 쓰는 matcher 만: 여기서도 이 파일 전체의 최소 범위 계약을 따른다.
+     */
+    readonly resolves: PromiseMatchers;
+  }
+
+  interface PromiseMatchers {
+    toBeUndefined(): Promise<void>;
   }
 
   type TestBody = () => void | Promise<void>;
