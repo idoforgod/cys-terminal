@@ -6226,16 +6226,21 @@ fn clip_detail(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// check_pack_update 판정(순수). ★순서는 CLI `pack_update_from_dir`(cys.rs)와 같다 — CLI 코드는
-/// 옮기지 않고(③ 자가치유 경로 리팩터 금지 · 반박 D2) lib 공개 부품(read_pack_state·
-/// remote_is_newer_tuple·parse_semver)과 기존 pack_binary_too_old 로 같은 순서를 밟는다:
+/// check_pack_update 판정(순수). ★설치 경계(반영 순서)는 CLI `pack_update_from_dir`(cys.rs)와
+/// 같다 — CLI 코드는 옮기지 않고(③ 자가치유 경로 리팩터 금지 · 반박 D2) lib 공개 부품
+/// (read_pack_state·remote_is_newer_tuple·parse_semver)과 기존 pack_binary_too_old 로 같은
+/// 순서를 밟는다:
 ///   ① 매니페스트 해석(PackManifest serde · fail-closed)      실패 → manifest-unreadable
 ///   ② .pack-state.json: 손상 → disk-unknown(pack-state-corrupt) · base≠.pack-version → (pack-state-mismatch)
-///   ③ 채널 전이: 디스크 pro ∧ 번들 free → channel-refused
-///   ④ (표시 정직화 · GUI 전용) .pack-version 부재/해석 불가 → disk-unknown · remote pack_version 해석
+///   ③ (표시 정직화 · GUI 전용) .pack-version 부재/해석 불가 → disk-unknown · remote pack_version 해석
 ///      불가 → manifest-unreadable. CLI 는 여기서 UpToDate(no-op)로 끝나므로 '설치 안 함'은 같고,
 ///      GUI 만 그것을 '최신'이라 부르지 않는다(U9 R4 · 반박 D3).
-///   ⑤ (base semver, pro_revision) 튜플 strictly-newer 아님 → none
+///   ④ (base semver, pro_revision) 튜플 strictly-newer 아님 → none
+///   ⑤ 채널 전이: 디스크 pro ∧ 번들 free ∧ **공개 base 가 디스크 base 보다 strictly-newer** →
+///      channel-refused(★GUI 전용 재배치 — 리뷰1 F1). CLI 는 버전을 보지 않고 항상 거부하지만
+///      (③ 자가치유 리팩터 금지로 그 순서는 그대로 둔다 — 설치 경계 무변경, 눌러도 CLI 가 거부하는
+///      점은 같다), GUI 의 '표시'만 여기로 옮긴다: 공개 팩이 디스크(pro) 보다 새것이 아니면 ④에서
+///      이미 none 으로 끝나므로 pro 사용자에게 "업데이트가 있다"는 거짓 경보(오너 재현 증상)가 사라진다.
 ///   ⑥ min_binary_version > 실행 바이너리 → binary-too-old
 ///   ⑦ available
 fn classify_pack_check(
@@ -6277,9 +6282,6 @@ fn classify_pack_check(
             (st.channel, st.pro_revision)
         }
     };
-    if disk_channel == "pro" && manifest.channel == "free" {
-        return PackCheck::ChannelRefused { version: manifest.pack_version, disk: disk_version };
-    }
     if cys::pack::parse_semver(&disk_version).is_none() {
         let reason = match disk_err {
             Some(std::io::ErrorKind::NotFound) => "pack-version-missing",
@@ -6301,7 +6303,13 @@ fn classify_pack_check(
         (&manifest.pack_version, manifest.pro_revision),
         (&disk_version, disk_rev),
     ) {
+        // 공개 base 가 디스크(pro) base 보다 새것이 아니면 채널이 갈려도 '표시할 업데이트' 자체가
+        // 없다(리뷰1 F1) — pro 사용자에게 거짓 경보를 만들지 않는다. 설치 경계는 원래 여기서도
+        // none(설치 버튼 없음)이었으므로 행동은 무변경.
         return PackCheck::None { version: manifest.pack_version, disk: disk_version };
+    }
+    if disk_channel == "pro" && manifest.channel == "free" {
+        return PackCheck::ChannelRefused { version: manifest.pack_version, disk: disk_version };
     }
     if pack_binary_too_old(&manifest.min_binary_version, running) {
         return PackCheck::BinaryTooOld {
@@ -8548,7 +8556,10 @@ mod tests {
 
     #[test]
     fn u9_classify_follows_cli_state_and_channel_order() {
-        // CLI pack_update_from_dir 순서: state 손상 → base 불일치 → pro→free 거부 → 튜플 → min_binary.
+        // GUI 표시 순서(classify_pack_check): state 손상 → base 불일치 → 튜플 → (튜플이 newer 일 때만)
+        // pro→free 거부 → min_binary. CLI(cys.rs pack_update_from_dir)는 튜플을 보지 않고 pro→free 를
+        // 항상 먼저 거부한다(그 순서는 리팩터하지 않는다 — 반박 D2 · 설치 경계 무변경). GUI 만 '표시'를
+        // 튜플 뒤로 옮긴다(리뷰1 F1 — 그렇지 않으면 pro 사용자가 늘 거짓 경보를 본다).
         // 사유 이름은 CLI 의 typed 오류 태그와 같다(아래 소스 핀이 CLI 쪽 실존을 고정).
         let newer = u9_manifest("0.14.41", 0, "free", "0.14.31");
         let c = classify_pack_check(
@@ -8560,7 +8571,8 @@ mod tests {
         assert!(matches!(c, PackCheck::DiskUnknown { reason: "pack-state-corrupt", .. }), "{c:?}");
         let c = classify_pack_check(&newer, u9_disk("0.14.40"), u9_state("free", "0.14.39", 0), "0.14.40");
         assert!(matches!(c, PackCheck::DiskUnknown { reason: "pack-state-mismatch", .. }), "{c:?}");
-        // pro 설치 + 공개(free) 번들 → 채널 거부(설치 버튼을 띄우지 않는다 — 누르면 CLI 가 거부).
+        // pro 설치 + 공개(free) 번들 + 공개 base 가 pro base 보다 strictly-newer → 채널 거부
+        // (설치 버튼을 띄우지 않는다 — 누르면 CLI 가 거부).
         let c = classify_pack_check(&newer, u9_disk("0.14.40"), u9_state("pro", "0.14.40", 2), "0.14.40");
         assert!(matches!(c, PackCheck::ChannelRefused { .. }), "{c:?}");
         // 정상 free state(base 일치)는 종전처럼 판정된다.
@@ -8571,6 +8583,30 @@ mod tests {
         for tag in ["[pack-state-corrupt]", "[pack-state-mismatch]", "[pack-channel-refused]"] {
             assert!(cli.contains(tag), "CLI typed 태그 부재: {tag}");
         }
+    }
+
+    /// ★리뷰1 F1 회귀 핀: pro 설치 + 공개(free) base 가 **같거나 더 낮음** → 채널 거부(빨간 !) 금지.
+    /// 되돌리면(채널 거부를 튜플 앞으로 되돌리거나, 튜플 결과를 무시) RED — pro 사용자에게
+    /// v0.14.40 에서 있던 중립 표시가 사라지고 오너가 신고한 증상(경보만 뜨고 설치할 게 없음)이
+    /// 재현된다는 뜻이다.
+    #[test]
+    fn u9_channel_refused_only_when_public_base_strictly_newer_than_pro_disk() {
+        let running = "0.14.40";
+        // pro base 0.14.40 rev2 × 공개 0.14.40(같음) → None(경보 없음), ChannelRefused 아님.
+        let same = u9_manifest("0.14.40", 0, "free", "");
+        let c = classify_pack_check(&same, u9_disk("0.14.40"), u9_state("pro", "0.14.40", 2), running);
+        assert!(matches!(c, PackCheck::None { .. }), "same-base 인데 채널 거부로 경보: {c:?}");
+        // pro base 0.14.40 rev2 × 공개 0.14.39(더 낮음) → None.
+        let older = u9_manifest("0.14.39", 0, "free", "");
+        let c = classify_pack_check(&older, u9_disk("0.14.40"), u9_state("pro", "0.14.40", 2), running);
+        assert!(matches!(c, PackCheck::None { .. }), "older 공개인데 채널 거부로 경보: {c:?}");
+        // pro base 0.14.40 rev0(free→pro 갓 전환) × 공개 0.14.40(같음) → 그래도 None.
+        let c = classify_pack_check(&same, u9_disk("0.14.40"), u9_state("pro", "0.14.40", 0), running);
+        assert!(matches!(c, PackCheck::None { .. }), "rev0 pro 인데 채널 거부로 경보: {c:?}");
+        // 대조군: 공개가 진짜 더 새것(0.14.41)이면 여전히 채널 거부(설치 버튼 없음 — 설치 경계 무변경).
+        let strictly_newer = u9_manifest("0.14.41", 0, "free", "");
+        let c = classify_pack_check(&strictly_newer, u9_disk("0.14.40"), u9_state("pro", "0.14.40", 2), running);
+        assert!(matches!(c, PackCheck::ChannelRefused { .. }), "진짜 newer 인데 경보가 사라짐: {c:?}");
     }
 
     /// cys.rs 의 version_gates 단위테스트 행(assert_eq!(version_gates(…), VersionGate::X))을 소스에서
@@ -8637,6 +8673,11 @@ mod tests {
         let body = &src[a..b];
         assert!(body.contains("parse_pack_update_outcome("), "토큰 파싱 배선 부재");
         assert!(body.contains("\"pack-uptodate\""), "pack-uptodate emit 부재");
+        // 리뷰1 F2(MR1 공허): "pack-uptodate" emit 실재만으로는 `let confirmed = uptodate_confirmed(&tok)`
+        // 를 `let confirmed = true`로 고정해도(디스크 판독 실패에서도 '이미 적용됨'이라는 거짓 안심 —
+        // D3 무력화) 살아남는다. 계산식과, 그 결과가 실제로 confirmed 필드로 들어가는지 둘 다 핀.
+        assert!(body.contains("let confirmed = uptodate_confirmed(&tok)"), "confirmed 계산 배선 부재");
+        assert!(body.contains("\"confirmed\": confirmed"), "confirmed 필드 배선 부재");
         let cli = include_str!("../../src/bin/cys.rs");
         let u = cli.find("VersionGate::UpToDate => {\n                println!(").expect("CLI UpToDate 분기");
         let e = cli[u..].find("VersionGate::BinaryTooOld =>").map(|i| u + i).expect("CLI BinaryTooOld 분기");
