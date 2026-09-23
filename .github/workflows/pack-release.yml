@@ -76,7 +76,13 @@ jobs:
       # ★0.14.33 재발행에서도 **유지**(2026-09-11). 0.14.32 역시 발행되지 못했고(우분투 pack-artifacts
       #   의 리눅스 /proc 관측 비대칭) 0.14.33 이 그 재발행이다. 0.14.33 의 변경은 그 관측 갈래
       #   한 곳과 ci-branch 우분투 레인 신설뿐 — 새 CLI 표면 0 이므로 하한을 올릴 근거가 없다.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.31'
+      # ★0.14.41 상향(2026-09-23) — 근거는 release.yml PACK_MIN_BINARY 주석과 같다: 이 세대 팩이
+      #   `cys team-propose`(MASTER_DIRECTIVE.md:352·CEO_TEMPLATE.md:52·433)와
+      #   `cys reinject --check --ack-only`(javis_phoenix.py:2044)를 직접 지시하는데 둘 다
+      #   v0.14.40(126cfdd0)에는 없다(부재 실측: `TeamPropose` grep -c → 0, `ack_only` 실토큰 0,
+      #   설치본 `cys 0.14.40`에 `--help`만 써서 두 명령 모두 rc 2 확인). 두 값 동일 계약이므로
+      #   release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
+      PACK_MIN_BINARY_OVERRIDE: '0.14.41'
     steps:
       - uses: actions/checkout@v4
 

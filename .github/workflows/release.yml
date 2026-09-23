@@ -1069,7 +1069,18 @@ jobs:
       #   리눅스에서 처음 돌았다) 0.14.33 이 그 수리를 실은 재발행이다. 0.14.33 의 팩 변경은
       #   `javis_preflight.py` 의 그 관측 갈래 한 곳뿐이고 **새 CLI 표면은 0** 이라 상향 근거가
       #   없다(pack-release.yml PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서 같은 판단).
-      PACK_MIN_BINARY: '0.14.31'
+      # ★0.14.41 상향(2026-09-23 · 오너 18항목 U16 WP-E 통합 · master 결재). 이 세대 팩이
+      #   **0.14.41 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — MASTER_DIRECTIVE.md:352·
+      #   CEO_TEMPLATE.md:52·433(`cys team-propose --name … --purpose …`) · javis_phoenix.py:2044
+      #   (`cys reinject --check --ack-only`). 부재 실측(2026-09-23 · v0.14.40=126cfdd0 대조):
+      #   `git show 126cfdd0:src/bin/cys.rs | grep -c TeamPropose` → 0, `Reinject` 구조체에
+      #   `ack_only` 필드 부재(같은 트리 grep 은 무관한 `_only` 단어의 오탐 2건뿐, 실제
+      #   ack_only/ack-only 토큰 0). 설치본 `cys 0.14.40 team-propose --help` → rc 2
+      #   "unrecognized subcommand", `cys reinject --check --ack-only --help` → rc 2
+      #   "unexpected argument"(상태 변경 없음, --help 만 사용). ≤0.14.40 바이너리는 지시대로
+      #   실행하면 죽는다(기능 의존 — RELEASE.md 불변 규칙). pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서 동시 상향(두 값 동일 계약).
+      PACK_MIN_BINARY: '0.14.41'
     steps:
       - uses: actions/checkout@v4
 
