@@ -8058,10 +8058,20 @@ def h_doc_3():
     tmpl_rel = os.path.join("cysjavis-pack", "directives", "CEO_TEMPLATE.md")
     tmpl = _repo_file(tmpl_rel)
     dept = _read(os.path.join(BIN_DIR, "cys-dept"))
-    # ① 가드가 막는 동사 집합을 **코드에서** 뽑는다(문서에 적힌 목록을 신뢰하지 않는다)
-    m = re.search(r"^\s*(launch\|[a-z|\-]+)\)\s*$", dept, re.M)
-    need(m is not None, "cys-dept 단일소유 가드의 동사 case 를 찾지 못했다(가드 형태 변경?)")
-    blocked = set(m.group(1).split("|"))
+    # ① 가드가 막는 동사 집합을 **코드에서** 뽑는다(문서에 적힌 목록을 신뢰하지 않는다).
+    #    ★성찰 후속(U16-A1 회귀): 종전엔 전부가 `launch|allocate|create|down|...|promote-ceo)`
+    #    한 줄이었다. 생성 동사(launch·allocate·create)와 종료·정리 동사(down 등)를 서로 다른
+    #    안내로 갈라 두 줄로 쪼개면서, "launch 로 시작하는 줄 하나"만 찾던 옛 정규식이 생성 동사
+    #    3개만 줍고 종료·정리 동사를 놓쳤다(scripts/gen_ceo_template.py _blocked_verbs() 와 동일
+    #    결함·동일 수리). 가드 case 블록(`case "$cmd" in` ~ 그 블록의 첫 `esac`) 안의 **모든**
+    #    동사-case 줄을 모아 합집합으로 본다 — 몇 줄로 나뉘든 깨지지 않는다.
+    block_m = re.search(r'case "\$cmd" in\n(.*?)\nesac\n', dept, re.S)
+    need(block_m is not None, 'cys-dept 단일소유 가드의 case "$cmd" in 블록을 찾지 못했다(가드 형태 변경?)')
+    verb_lines = re.findall(r"^\s*([a-z][a-z|\-]*)\)\s*$", block_m.group(1), re.M)
+    need(bool(verb_lines), "cys-dept 단일소유 가드의 동사 case 를 찾지 못했다(가드 형태 변경?)")
+    blocked = set()
+    for line in verb_lines:
+        blocked.update(line.split("|"))
     need({"launch", "down", "create", "rotate"} <= blocked,
          "가드가 막는 집합이 예상보다 좁다(%s) — 검체 전제 재확인 필요" % sorted(blocked))
     need("CYS_ROLE" in dept and "exit 7" in dept, "가드 판정 재료(CYS_ROLE·exit 7) 부재")
