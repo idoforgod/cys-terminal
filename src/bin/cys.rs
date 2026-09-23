@@ -6331,29 +6331,14 @@ fn discover_claude_settings() -> Vec<String> {
         .collect()
 }
 
-/// Claude Code settings.json에 **소망 훅 집합**(SessionStart + UserPromptSubmit)을 등록한다.
-///
-/// ★W3 A9: 종전엔 SessionStart **하나만** 등록했다 — init-pack 을 거친 기계도 각성 훅
-/// (role-bootstrap → UserPromptSubmit)은 preflight C28 이 처음 도는 순간까지 미등록이었고,
-/// 그 C28 의 유일한 자동 트리거가 바로 그 미등록 훅이었다(닭·달걀). 이제 Rust 시드
-/// (`setup_isolated_config_dir`)·init-pack·개인 프로필 병합이 **같은 매니페스트**
-/// (`cys::pack::AWAKENING_HOOKS`)를 소비한다 — 소망상태는 한 곳에만 적힌다.
-///
-/// 멱등·백업·symlink·파싱 거부 규약은 `cys::pack::merge_desired_hooks` 계약에 위임한다
-/// (백업은 **실제 write 시에만** — 멱등 재실행이 정상 `.bak-cys` 를 클로버하지 않는다·RC-1 D2).
-/// ★T-0147-5(W3): launch-agent 가 기록한 config dir 의 settings.json 에 **각성 훅**이 없으면
-/// 기동 로그 경고 + 승인 Feed push 로 1분 내 원인을 가시화한다.
-///
-/// 왜: 노드는 정상 기동하지만 그 config 계급에 훅이 없으면 ①`/clear` 후 지침 재주입(SessionStart)과
-/// ②마스터 선언 부트 발화(UserPromptSubmit)가 **둘 다 사라진다**. 종전엔 어떤 채널에도 신호가 없어
-/// "떠 있는데 각성만 안 되는" 침묵 고장이었다(등록≠가동 갭 — A21 재검증).
-/// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다 —
-/// 같은 표면·같은 술어여야 두 채널의 보고가 갈리지 않는다.
-/// 비치명: 경고만 하고 부트는 계속한다(위경고 모드·부트 봉쇄 회귀 금지 — 금지 방향 ③ 정신).
 /// ★U10(0.14.41) 각성 훅 경고의 **기대 팩 = 이 소켓 레인의 팩**(순수 · 소켓·env 팩 주입형).
 ///
 /// 부서 소켓이면 그 부서 팩(`lane_pack_for_socket` — cys-dept `dept_pack` 과 같은 규칙), 그 밖(본부)
 /// 이면 env 팩(`pack_dir()`). 부서명을 유도하지 못하는 불량 부서 소켓은 env 팩으로 접는다(종전 거동).
+///
+/// ★리뷰1 m4: 이 doc 은 종전엔 `warn_if_awakening_hooks_missing` 의 doc 주석 **뒤**에 잘못 끼어들어
+/// (Rust doc 은 바로 다음 항목에 붙는다) 그 함수 자신이 무주석이 됐었다. 이 함수 고유의 결정 하나
+/// (기대 팩 선택)만 여기 남기고, 경고 함수의 doc 은 그 함수 바로 위로 되돌렸다.
 fn awakening_expected_pack(socket: &std::path::Path, env_pack: std::path::PathBuf) -> std::path::PathBuf {
     if cys::is_dept_socket(socket) {
         if let Some(lane) = cys::pack::lane_pack_for_socket(socket) {
@@ -6394,6 +6379,43 @@ fn note_lane_pack_mismatch(role: &str) {
     }
 }
 
+/// ★리뷰1 m1: `awakening_expected_pack`(기대 팩 선택) + `pack::awakening_hooks_missing_in`(누락 계산)을
+/// 하나로 묶는 순수 함수 — 이 결합(경고 함수의 실제 배선)이 되돌려지는 뮤테이션(예: 기대 팩을 계산만
+/// 하고 실제 판정은 `pack_dir()`로 되돌리는 것)을 행동 검체로 잡기 위해 존재한다. 디스크·소켓을
+/// 읽지 않는다(호출자가 이미 읽은 값만 받는다) · `warn_if_awakening_hooks_missing` 의 유일한 판정 경로.
+fn awakening_missing_for(
+    socket: &std::path::Path,
+    env_pack: std::path::PathBuf,
+    settings_root: &Value,
+    windows: bool,
+) -> (std::path::PathBuf, Vec<&'static str>) {
+    let pack = awakening_expected_pack(socket, env_pack);
+    let missing = cys::pack::awakening_hooks_missing_in(settings_root, &pack, windows);
+    (pack, missing)
+}
+
+/// Claude Code settings.json에 **소망 훅 집합**(SessionStart + UserPromptSubmit)을 등록한다.
+///
+/// ★W3 A9: 종전엔 SessionStart **하나만** 등록했다 — init-pack 을 거친 기계도 각성 훅
+/// (role-bootstrap → UserPromptSubmit)은 preflight C28 이 처음 도는 순간까지 미등록이었고,
+/// 그 C28 의 유일한 자동 트리거가 바로 그 미등록 훅이었다(닭·달걀). 이제 Rust 시드
+/// (`setup_isolated_config_dir`)·init-pack·개인 프로필 병합이 **같은 매니페스트**
+/// (`cys::pack::AWAKENING_HOOKS`)를 소비한다 — 소망상태는 한 곳에만 적힌다.
+///
+/// 멱등·백업·symlink·파싱 거부 규약은 `cys::pack::merge_desired_hooks` 계약에 위임한다
+/// (백업은 **실제 write 시에만** — 멱등 재실행이 정상 `.bak-cys` 를 클로버하지 않는다·RC-1 D2).
+/// ★T-0147-5(W3): launch-agent 가 기록한 config dir 의 settings.json 에 **각성 훅**이 없으면
+/// 기동 로그 경고 + 승인 Feed push 로 1분 내 원인을 가시화한다.
+///
+/// 왜: 노드는 정상 기동하지만 그 config 계급에 훅이 없으면 ①`/clear` 후 지침 재주입(SessionStart)과
+/// ②마스터 선언 부트 발화(UserPromptSubmit)가 **둘 다 사라진다**. 종전엔 어떤 채널에도 신호가 없어
+/// "떠 있는데 각성만 안 되는" 침묵 고장이었다(등록≠가동 갭 — A21 재검증).
+/// 판정은 preflight C28 의 FAIL 티어와 **같은 매니페스트**(`AWAKENING_HOOKS`)를 소비한다.
+/// ★리뷰1 m4 정정: "같은 표면·같은 술어여야"는 더 이상 맞지 않는다 — 매니페스트(훅 집합)는
+/// C28 과 같지만, **술어는 이번 U10 수정으로 갈라졌다**. 이 경고는 관측 전용이라 레인 팩 하나 +
+/// 표기 정규화(윈도우 `C:\`·`C:/`·`/c/` 동일시)로 완화했고, C28 과 `merge_desired_hooks` 등
+/// **집행 경로는 여전히 바이트 동등**을 엄격히 지킨다(설계가 승인한 의도적 분기 — U10 §3).
+/// 비치명: 경고만 하고 부트는 계속한다(위경고 모드·부트 봉쇄 회귀 금지 — 금지 방향 ③ 정신).
 fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: &str) {
     // claude 계열만 대상(agy·codex 는 Claude-config 노드가 아니다 — preflight discover 와 동일 규약).
     if !agent.starts_with("claude") {
@@ -6408,8 +6430,10 @@ fn warn_if_awakening_hooks_missing(config_dir: Option<&str>, role: &str, agent: 
     // ★U10(0.14.41): 기대값 = **이 소켓 레인의 팩 하나**(합집합 금지) · 비교 = 표기 정규화(관측 전용 —
     //   집행 경로의 바이트 동등은 무변경). 종전엔 CLI 의 `pack_dir()`(편성 경로에서는 본부 팩)로 부서 계정
     //   settings 를 대조해, 부서 팩 훅이 멀쩡히 등록된 부서 좌석마다 켤 때마다 hook-missing 오탐이 쌓였다.
-    let pack = awakening_expected_pack(&cys::socket_path(), cys::pack::pack_dir());
-    let missing: Vec<&str> = cys::pack::awakening_hooks_missing_in(&root, &pack, cfg!(windows));
+    //   ★리뷰1 m1: 기대 팩 선택과 누락 계산을 **잇는 선**(배선) 자체가 U10 오탐 제거의 실제 수정이라,
+    //   그 결합을 `awakening_missing_for` 순수 함수 하나로 뽑아 배선이 끊기는 뮤테이션을 행동으로 잡는다.
+    let (pack, missing) =
+        awakening_missing_for(&cys::socket_path(), cys::pack::pack_dir(), &root, cfg!(windows));
     if missing.is_empty() {
         return;
     }
@@ -35382,19 +35406,64 @@ mod u10_notice_lane {
         assert_eq!(awakening_expected_pack(&dept_unix, other_lane), want, "다른 부서 팩 = 레인 팩");
     }
 
-    /// 경고 판정부는 레인 팩 하나 + 표기 정규화 비교만 쓴다(바이트 비교·합집합 금지).
+    /// 경고 판정부는 레인 팩 하나 + 표기 정규화 비교만 쓴다(바이트 비교·합집합 금지) — **소스 존재만**
+    /// 보는 약한 핀(리뷰1 m1 지적: 이 조건을 지키면서도 실제 판정을 `pack_dir()` 로 되돌리는 뮤테이션이
+    /// 통과했다). 배선 자체의 강한 핀은 아래 `u10_warn_wiring_uses_lane_pack_end_to_end`(행동 검체).
     #[test]
     fn u10_warn_uses_lane_pack_only_source_pin() {
         let src = include_str!("cys.rs");
         let body = function_body(src, "\nfn warn_if_awakening_hooks_missing(");
-        assert!(body.contains("awakening_expected_pack("), "레인 팩 기대값 미사용");
-        assert!(body.contains("awakening_hooks_missing_in("), "정규화 판정 미사용");
+        assert!(body.contains("awakening_missing_for("), "레인 팩 결합 판정부(awakening_missing_for) 미사용");
         assert!(!body.contains("hook_registered_in("), "본부 팩 바이트 비교 경로가 남았다");
     }
 
-    /// ★회귀 핀(U10 반박 M1): 부서 편성(cys-dept → javis_formation → javis_boot_node → `cys launch-agent`)이
-    /// 싣는 env(부서 소켓 + 부서 팩)에서 launch-agent 의 주입 지침은 **부서 팩**에서 합성된다 — 본부 팩의
-    /// CEO 지침·MEMORY 가 부서 좌석에 새지 않는다.
+    /// ★리뷰1 m1 처방: `awakening_expected_pack`(기대 팩 선택)과 `awakening_hooks_missing_in`(누락 계산)을
+    /// **잇는 선**(`awakening_missing_for`)을 행동으로 잰다 — 소스 문자열 존재만 보는 위 핀은 그 결합
+    /// 자체가 끊기는 뮤테이션(예: 결합을 인라인하면서 판정 기준을 `pack_dir()` 로 되돌리는 것)을
+    /// 잡지 못했다.
+    ///   · 부서 소켓 + 본부 env 팩 + **부서 팩** 훅이 등록된 settings → 누락 0(레인 팩 기준 채택 확인).
+    ///   · 같은 조건에서 **본부 팩** 훅만 등록 → 누락 2(합집합으로 완화되지 않았음 확인 — U10 반박 DD1).
+    #[test]
+    fn u10_warn_wiring_uses_lane_pack_end_to_end() {
+        let home = dirs::home_dir().expect("home");
+        let dept_sock = home.join(".local/state/cys-dept-w1/cys.sock");
+        let dept_pack = home.join(".cys").join("pack-dept-w1");
+        let hub_pack = home.join(".cys").join("pack");
+        let settings_with = |registered: &std::path::Path| {
+            json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [{"type": "command",
+                        "command": cys::pack::hook_command_for(registered, "session-start.sh")}]}],
+                    "UserPromptSubmit": [{"hooks": [{"type": "command",
+                        "command": cys::pack::hook_command_for(registered, "role-bootstrap.sh")}]}]
+                }
+            })
+        };
+        let dept_settings = settings_with(&dept_pack);
+        let (pack1, missing1) =
+            awakening_missing_for(&dept_sock, hub_pack.clone(), &dept_settings, cfg!(windows));
+        assert_eq!(pack1, dept_pack, "기대 팩이 부서 팩으로 선택되지 않았다");
+        assert!(missing1.is_empty(), "부서 팩 훅이 등록됐는데 누락으로 잡혔다: {missing1:?}");
+
+        let hub_settings = settings_with(&hub_pack);
+        let (pack2, missing2) =
+            awakening_missing_for(&dept_sock, hub_pack.clone(), &hub_settings, cfg!(windows));
+        assert_eq!(pack2, dept_pack, "기대 팩 선택이 settings 내용에 흔들렸다");
+        assert_eq!(
+            missing2.len(),
+            2,
+            "본부 팩 훅만 등록됐는데 누락 0(뮤테이션 9 재발 — 판정이 pack_dir() 로 되돌아갔다): {missing2:?}"
+        );
+    }
+
+    /// ★기존 거동 고정 핀(U10 반박 M1 · 리뷰1 m3 재표기): env(CYS_SOCKET=부서 소켓 · CYS_PACK_DIR=부서 팩)를
+    /// **직접 주입**해 `boot_directive_for` 가 그 값을 존중하는지만 잰다 — RED 커밋(U10 변경 전)에서도
+    /// 통과하므로 U10 이 새로 만든 것(cys-dept → javis_formation → `_boot_node` 로 이어지는 env **상속**
+    /// 구간)은 재지 않는다. 그 상속 구간의 회귀 핀은
+    /// `cysjavis-pack/bin/tests/test_dept_notice_lane.py::FormationBootNodeEnvInheritance`
+    /// (cys-dept→javis_formation 홉) + `FormationLane.test_1_*`(편성→boot_node 홉)에 있다. 이 Rust 검체는
+    /// "env 가 이미 맞게 도착했다면 지침 합성은 그 env 를 그대로 존중한다"는 **다른**(여전히 유효한) 계약만
+    /// 지킨다.
     #[test]
     fn u10_dept_socket_launch_agent_composes_dept_pack_directive() {
         let _env = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

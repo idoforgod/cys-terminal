@@ -14,9 +14,14 @@ javis_formation.py 로 실 데몬·실 ~/.cys 무접촉 검증한다.
   2) CEO 알림 5종은 kind=ceo-notice — **기존 플래그** `--kind`(구 바이너리에도 있음 → 폴백 폭주 0) · 정적 전수.
   3) 'CEO 승격 보류(부트 필요)' dedupe — 동종 pending(구 kind=permission 포함)이 있으면 재발행 0.
   4) 승격 성공 → pending '보류/대기' 알림을 비허가 결정(ceo-promoted)으로 닫는다 · 무관 항목 무접촉 · allow 0.
+     (4d — 이미 승격된 기계에서도(md==ceo 상시 경로) 옛 더미가 닫힌다 · 리뷰1 M1)
+  5) (리뷰1 m3) 편성 → `_boot_node` → launch-agent 상속 구간 — javis_formation 이 **실제로 읽은**
+     CYS_PACK_DIR(부서 팩)이 `_boot_node` 가 스폰하는 javis_boot_node.py 자식의 env 에도 실린다
+     (FormationLane 의 1번은 cys-dept→javis_formation 홉만 잰다 — 그 다음 홉은 여기서 잰다).
 
     CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_dept_notice_lane.py
 """
+import importlib.util
 import json
 import os
 import re
@@ -26,6 +31,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(SELF)
@@ -181,6 +187,23 @@ class FormationLane(_Home):
         self.assertEqual(rec["pack"], "<unset>", "본부 kill-switch 중인데 부서 팩으로 전환했다(정지 우회): %s" % rec)
         self.assertIn("kill-switch", r.stderr)
 
+    def test_1d_lane_pack_only_when_socket_matches_dept_sock(self):
+        # ★리뷰1 m2: `formation_lane_pack` 의 "부서 소켓일 때만"([ "$2" = "$(dept_sock "$1")" ]) 대조를
+        #   재는 유일한 검체 — 지금 호출부 3곳(launch/allocate/create)은 전부 dept_sock 값을 그대로
+        #   넘겨 이 조건이 구조적으로 항상 참이다(뮤테이션으로 조건을 지워도 13/13 통과했었다). 함수를
+        #   `sock` 서브커맨드(부작용 없음)를 거쳐 source 해 **직접** 불러, 부서 소켓이 아닌 값을 준다.
+        self.install_dept_pack_bin()
+        script = (
+            'source "$CYS_DEPT_SCRIPT" sock probe-src >/dev/null 2>&1 || true\n'
+            'formation_lane_pack "$FLP_NAME" "$FLP_SOCK"\n'
+        )
+        env = self.env(CYS_DEPT_SCRIPT=DEPT, FLP_NAME=self.NAME, FLP_SOCK="/tmp/not-a-dept-socket")
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                           encoding="utf-8", env=env, cwd=self.tmp, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(r.stdout, "",
+                         "부서 소켓이 아닌 값을 줬는데도 팩을 실었다(env 가 바뀐다 — 소켓 대조 무력화): %r" % r.stdout)
+
 
 class FormationLaneWindows(FormationLane):
     WINDOWS_MOCK = True
@@ -266,6 +289,29 @@ class CeoNoticeRuntime(_Home):
         self.assertEqual(len(p), 1, self.call_lines())
         self.assertIn("--kind ceo-notice", p[0])
 
+    def test_4d_already_promoted_still_closes_legacy_pile(self):
+        # ★리뷰1 M1: md==ceo(이미 승격 완료) 분기는 launch_dept 가 켤 때마다(부서 기동마다) 지나는
+        #   **상시** 경로다 — test_4 의 '전이 성공' 분기(:1301)와 달리 이 분기는 종전에
+        #   ceo_notices_close 를 부르지 않아, 0.14.40 이하에서 승격까지 끝난 기계에 쌓인 옛
+        #   kind=permission '보류/대기' 더미(24h 만료 대상 아님)가 업그레이드 후에도 닫히는
+        #   경로 0개로 영구 잔존했다(반박 M2 지목 · 재현 probe_already_promoted.py).
+        _write(os.path.join(self.hq, "directives", "MASTER_DIRECTIVE.md"), self.CEO)  # 이미 승격됨
+        _write(os.path.join(self.hq, "directives", "MASTER_DIRECTIVE.md.pre-ceo"), self.MASTER)
+        _write(self.marker, "{}")
+        _write(self.pending,
+               "rid-a\t[pending]\tpermission\tCEO 승격 보류(부트 필요)\tdecision=-\n"
+               "rid-b\t[pending]\tpermission\tCEO 승격 대기\tdecision=-\n"
+               "rid-c\t[pending]\tceo-notice\tCEO 승격 보류(템플릿 상위집합 검사 실패)\tdecision=-\n"
+               "rid-x\t[pending]\tpermission\t다른 승인 요청\tdecision=-\n")
+        r = self.run_dept("promote-ceo")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        replies = [l for l in self.call_lines() if "feed reply" in l]
+        for rid in ("rid-a", "rid-b", "rid-c"):
+            self.assertIn("cys feed reply %s ceo-promoted" % rid, replies,
+                          "이미 승격된 상태(md==ceo)에서 옛 알림이 닫히지 않았다(M1 재발): %s" % replies)
+        self.assertFalse(any("rid-x" in l for l in replies), "무관 항목을 닫았다")
+        self.assertFalse(any(l.endswith(" allow") for l in replies), "자동 종결이 allow 를 썼다")
+
     def test_4c_close_is_fail_open_when_daemon_unreachable(self):
         # feed list 실패(데몬 미기동) → 닫기 생략 · 승격 자체는 완주(부서 흐름 불파괴)
         _write(os.path.join(self.bindir, "cys"),
@@ -278,6 +324,68 @@ class CeoNoticeRuntime(_Home):
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
         self.assertEqual(_read(os.path.join(self.hq, "directives", "MASTER_DIRECTIVE.md")), self.CEO)
         self.assertFalse(any("feed reply" in l for l in self.call_lines()))
+
+
+class FormationBootNodeEnvInheritance(unittest.TestCase):
+    """★리뷰1 m3: cys-dept → javis_formation 홉은 FormationLane.test_1(스텁 javis_formation.py 가
+    argv·env 만 기록) 이 잰다. 그 **안쪽**, 편성이 받은 CYS_PACK_DIR(부서 팩)을 `_boot_node` 가
+    다음 자식(javis_boot_node.py → `cys launch-agent`)에도 실제로 물려주는지는 지금까지 핀이
+    없었다(m3 지적 — 지침 합성 회귀 핀은 env 를 직접 주입해 이 상속 구간을 재지 않는다).
+    실 서브프로세스는 스폰하지 않는다 — `subprocess.run` 을 기록 스텁으로 바꿔 전달 argv·env 만 본다."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="u10-formation-env-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dept_pack = os.path.join(self.tmp, "pack-dept-w1")
+        _write(os.path.join(self.dept_pack, "bin", "javis_boot_node.py"), "# stub\n")
+        self._saved = {k: os.environ.get(k) for k in ("CYS_PACK_DIR", "CYS_FORMATION_EXTERNAL_ROLES")}
+        os.environ["CYS_PACK_DIR"] = self.dept_pack   # ★javis_formation.PACK_DIR 은 import 시점에 읽는다
+        os.environ.pop("CYS_FORMATION_EXTERNAL_ROLES", None)   # 밀폐 고정(test_formation.py 와 동일 규약)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _load_formation(self):
+        module_path = os.path.normpath(os.path.join(BIN, "javis_formation.py"))
+        spec = importlib.util.spec_from_file_location("javis_formation_u10_probe", module_path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+    def test_boot_node_passes_dept_pack_env_to_next_hop(self):
+        m = self._load_formation()
+        self.assertEqual(m.PACK_DIR, self.dept_pack,
+                         "javis_formation 이 편성 호출자가 실은 CYS_PACK_DIR(부서 팩)을 읽지 않았다")
+        calls = []
+
+        class _FakeResult:
+            returncode = 0
+            stdout = "{}"
+            stderr = ""
+
+        def _fake_run(argv, capture_output=True, text=True, timeout=None, env=None):
+            calls.append({"argv": list(argv), "env": dict(env or {})})
+            return _FakeResult()
+
+        # ★`m.subprocess` 는 stdlib 캐시상 전역 `subprocess` 모듈과 **같은 객체**다(재로드가 아니라
+        #   재바인딩) — 직접 대입(`m.subprocess.run = ...`)은 이 프로세스의 다른 모든 테스트가 쓰는
+        #   `subprocess.run` 까지 조용히 깨뜨린다. `mock.patch.object` 로 블록 종료 시 반드시 원복한다.
+        with mock.patch.object(m.subprocess, "run", _fake_run):
+            ok, detail = m._boot_node("cso", "/tmp/u10-probe.sock")
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(calls), 1, "boot_node 가 자식을 정확히 1회 스폰하지 않았다: %s" % calls)
+        argv, env = calls[0]["argv"], calls[0]["env"]
+        expect_node = os.path.join(self.dept_pack, "bin", "javis_boot_node.py")
+        self.assertEqual(argv[1], expect_node,
+                         "boot_node 가 부서 팩이 아닌 다른 팩의 javis_boot_node.py 를 불렀다: %s" % argv)
+        self.assertEqual(env.get("CYS_PACK_DIR"), self.dept_pack,
+                         "다음 홉(javis_boot_node.py → cys launch-agent) 의 env 에 부서 팩이 실리지 "
+                         "않았다(편성→boot_node 상속 끊김 — 부서 좌석이 본부 지침으로 뜬다)")
 
 
 if __name__ == "__main__":

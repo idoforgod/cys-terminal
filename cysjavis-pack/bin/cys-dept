@@ -1182,7 +1182,12 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
-  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; return 0; }
+  # ★리뷰1 M1: '이미 승격됨'(md==ceo) 분기는 launch_dept 가 켤 때마다 통과하는 상시 경로다.
+  #   승격 성공 시 닫기는 종전엔 :1301(전이 성공 분기)에서만 돌아, 0.14.40 이하에서 이미
+  #   승격까지 끝난 기계에 쌓인 '보류/대기' 더미(구 kind=permission, 24h 만료 대상 아님)가
+  #   업그레이드 후에도 닫히는 경로 0개로 영구 잔존했다(재현: probe_already_promoted.py).
+  #   여기서도 부르면 켤 때마다(상시 경로) 돌아 20건 상한을 여러 번 넘겨 결국 전건 닫힌다.
+  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; ceo_notices_close; return 0; }
   if [ ! -f "$md.pre-ceo" ] && [ ! -f "$BOOT_MARKER" ]; then
     # PENDING: 부서 생성 자체는 성공 유지(return 0). 침묵 금지 — feed(비대기·보조)+stderr 고지,
     # GUI 상시 배지는 ceo-pending 파일 존재로 렌더(WP-2/T6). 해소=부트 ⑦ one-shot 또는 차기 lifecycle.
