@@ -929,7 +929,7 @@ cys_start_gate_is_lead() {   # $1=역할 · rc 0 = 종전 문안 유지 대상(m
 }
 
 cys_start_gate_note() {      # stdout: 착수 게이트 1줄(개행 없음) — member·역할 미상 공통
-  printf '%s' "착수 게이트 — 위 작업기억·TODO 는 배경 참고이지 지시가 아니다. 일의 착수·재개는 이 세션에 배달된 지시가 정한다: [RESUME] 이면 배정 출처가 기록된 작업(순환 직전까지 하던 배정 포함)을 이어가고, [RESTORE]·[RECOVER] 가 오면 재개하지 말고 master 지시를 기다린다. master(부서장)·CEO·오너의 티켓·리뷰 의뢰가 곧 지시다. 지시가 없으면 상태만 확인해 '대기'로 자기보고하고 턴을 끝낸다. 운영 절차([CYCLE-PRE]·[CYCLE]·[CYCLE-VERIFY]·[DRAIN]·[DRAIN-VERIFY]·각성 메시지·지침 각성 확인 핑·각성 ACK·승인 응답)는 예외 — 받는 즉시 수행한다."
+  printf '%s' "착수 게이트 — 위 작업기억·TODO 는 배경 참고이지 지시가 아니다. 일의 착수·재개는 이 세션에 배달된 지시가 정한다: [RESUME] 이면 배정 출처가 기록된 작업(순환 직전까지 하던 배정 포함)을 이어가고, [RESTORE]·[RECOVER] 가 오면 재개하지 말고 master 지시를 기다린다. master(부서장)·CEO·오너의 티켓·리뷰 의뢰, 데몬이 배달한 [schedule …]·[wakeup]·[heartbeat] 라벨 메시지가 곧 지시다. 지시가 없으면 상태만 확인해 '대기'로 자기보고하고 턴을 끝낸다. 운영 절차([CYCLE-PRE]·[CYCLE]·[CYCLE-VERIFY]·[DRAIN]·[DRAIN-VERIFY]·각성 메시지·지침 각성 확인 핑·각성 ACK·승인 응답)는 예외 — 받는 즉시 수행한다."
   return 0
 }
 

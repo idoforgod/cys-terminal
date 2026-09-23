@@ -140,6 +140,14 @@ GATE_MARK = "착수 게이트"
 LIB = os.path.join(os.path.dirname(HOOK), "_lib.sh")
 REPO = os.path.normpath(os.path.join(SELF, "..", "..", ".."))
 BASE_REF = "126cfdd0"          # v0.14.40 — U13 이전 트리(lead 바이트 동일의 기준)
+# ★리뷰1 I-5: 12c 는 BASE_REF 와 **영구** 대조한다(만료 조건 없음). ci-branch job1 은 얕은
+#   체크아웃이라 `git show BASE_REF:...` 가 실패해 12c 가 SKIP 되고(§402 — 정직한 출력이지만
+#   그 레인에서는 집행되지 않는다), 로컬에서는 이후 lead(master·cso*) 출력을 **정당하게**
+#   바꾸는 모든 변경(통합 때 형제 WP 포함)에서 FAIL 한다.
+#   갱신 규칙: lead 출력을 의도적으로 바꾸면(즉 12a 의 LEGACY_CLEAR/LEGACY_STARTUP 문자열
+#   핀도 같이 고치는 변경이면) BASE_REF 를 그 변경이 들어간 커밋으로 올린다 — 문자열 핀(12a)
+#   과 바이트 대조(12c)가 같은 순간에 갱신돼야 한다. 통합 단계에서 형제 WP(C3·E 등)와
+#   교차 실행해 이 트리에서 SKIP 이 아니라 실제로 도는지 확인할 것(로컬 전용 집행 — 남은 문제).
 _STRIP = ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SOCKET", "CYS_BIN", "CYS_GATE_LANE_SOCKET", "CYS_SOUL",
           "CYS_ROLE_UID", "CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SOCKET",
           "AITERM_SOCKET", "CYS_ROOT", "CYS_STATE_DIR", "CYS_MISSION")
@@ -325,6 +333,21 @@ try:
     check("15d 문안이 착수 규칙 핵심을 싣는다([RESUME]·[RESTORE]·운영 절차 예외 [CYCLE]·[CYCLE-VERIFY]·[DRAIN])",
           all(t in NOTE for t in ("[RESUME]", "[RESTORE]", "[CYCLE]", "[CYCLE-VERIFY]", "[DRAIN]", "대기")),
           NOTE)
+    # ★리뷰1 I-2: 예외 목록은 이 9개 낱말 **전수**다 — 15d 가 그중 5개만 쟀다(MU9b 가 나머지
+    #   4개+DRAIN-VERIFY 를 지워도 전부 통과했다). 핑·ACK 가 빠지면 member 가 `reinject --check`·
+    #   부트 확인에 답하지 않아 ③자가치유·온보딩 회귀가 된다 — 전수로 넓힌다.
+    check("15d2 ★회귀 핀(리뷰1 I-2) — 예외 목록 나머지도 전수([CYCLE-PRE]·[DRAIN-VERIFY]·"
+          "지침 각성 확인 핑·각성 ACK·승인)",
+          all(t in NOTE for t in ("[CYCLE-PRE]", "[DRAIN-VERIFY]", "지침 각성 확인 핑",
+                                   "각성 ACK", "승인")),
+          NOTE)
+    # ★리뷰1 I-3: 설계 §3 U13 은 데몬 라벨 메시지([schedule …]/[wakeup]/[heartbeat])를 '지시'로
+    #   명시했다(WORKER §0·REVIEWER §1-2 에는 있다 — test_bootv2_doc_contract 는 그 두 문서만 잰다).
+    #   기존 설치는 지침 `.new` 미병합이면 이 훅 문안**만**을 규칙으로 받으므로, fresh 스케줄 좌석
+    #   (member 로 분류)이 그 정의를 놓치지 않게 여기도 싣고 핀으로 고정한다.
+    check("15d3 ★회귀 핀(리뷰1 I-3) — 데몬 라벨 메시지가 지시 열거에 있다"
+          "([schedule …]·[wakeup]·[heartbeat])",
+          all(t in NOTE for t in ("[schedule", "[wakeup]", "[heartbeat]")), NOTE)
     check("15e 문안 자체가 자율 착수 낱말을 싣지 않는다", all(w not in NOTE for w in SELF_START), NOTE)
     check("15f ★부트 체인 안전 — 운영 절차 예외에 '각성 메시지'가 있다"
           "(javis_boot_node.awaken_message '즉시 각성하라'가 착수 게이트에 막혀 신규 좌석"
