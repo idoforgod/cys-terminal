@@ -661,6 +661,88 @@ def h_secret_1():
             % (scanned, len(fired), len(_SECRET_PROBES), " ".join(fired)))
 
 
+@specimen("H-SECRET-2", "W0",
+          "발행 게이트 스캐너의 '대상 0건·판독 실패 = 초록' 폐쇄 — 비-git·--all 0건·부재 경로·grep 판독 실패 → exit 2",
+          ["U4-C4-⑤", "측정불능=통과", "CI-only-게이트"])
+def h_secret_2():
+    """H-SECRET-1 은 '규칙이 살아 있는가'(합성 양성 7종 FIRE)와 '산 트리 clean' 을 잰다. 이 검체는
+    그 반대편 — **스캐너가 아무것도 못 봤는데 clean 이라고 답하는 경로**를 잰다(U4 C4-⑤ · 2026-09-23).
+
+      ⓐ 비-git 작업 디렉터리 — 종전 `cd "$(git rev-parse …)" || exit 2` 가드는 **죽은 코드**였다:
+         `cd ""` 가 bash 에서 성공해, `--all` 이 `git ls-files` 실패 → 0건 → `✓ 스캔 대상 없음` exit 0.
+      ⓑ git 저장소인데 추적 파일 0건(`--all`) — 종전 `✓ 스캔 대상 없음` exit 0(형제 스캐너
+         `scan-pack-secrets.sh` 는 같은 상황에서 exit 2 — 비대칭).
+      ⓒ 명시 경로 모드의 **부재 경로** — 종전 `[ -f ] || continue` 로 조용히 건너뛰고 clean.
+      ⓓ **판독 실패**(grep rc=2 · 읽기 권한 없음) — 종전 `2>/dev/null … || true` 가 삼켜 clean.
+      ⓔ 양성 대조 — 읽을 수 있는 깨끗한 파일은 exit 0(모든 것에 2 를 내는 고장난 스캐너 배제).
+
+    ★임시 디렉터리는 저장소 밖(`tempfile`) · HOME 은 임시 경로로 격리(git 설정 무접촉) ·
+      `GIT_CEILING_DIRECTORIES` 로 상위 저장소 탐색을 막는다(임시 경로가 어떤 저장소 안이어도 비-git 이다).
+    ★ⓓ 는 권한으로 읽기 실패를 만든다 — Windows(chmod 무력)·root(권한 무시)에서는 만들 수 없으므로
+      그 축만 '이 플랫폼 측정 불가' 로 detail 에 **명시**하고 나머지 축은 그대로 판정한다."""
+    scan = os.path.join(REPO_DIR, "scripts", "secret-scan.sh")
+    if not os.path.isfile(scan):
+        if _is_git_checkout():
+            raise Fail("레포 체크아웃인데 발행 게이트 스캐너가 없다: %s" % scan)
+        raise Skip("레포 체크아웃이 아니다(배포 팩 실행) — 발행 게이트 스캐너 부재")
+    tmp = tempfile.mkdtemp(prefix="cys-secret-fc-")
+    notes = []
+    try:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        env = _base_env({"HOME": home, "GIT_CEILING_DIRECTORIES": tmp, "GIT_CONFIG_NOSYSTEM": "1"})
+
+        def _scan(cwd, *args):
+            return _run([BASH, scan] + list(args), cwd=cwd, env=env, timeout=120)
+
+        def _expect(label, r, want):
+            need(r.returncode == want,
+                 "%s: exit %d(기대 %d) — 스캐너가 못 본 것을 clean 으로 접었다\n%s"
+                 % (label, r.returncode, want, (r.stdout + r.stderr)[-800:]))
+            if want == 2:
+                need("✓" not in r.stdout,
+                     "%s: exit 2 인데 stdout 에 통과 표지(✓)가 남았다: %r" % (label, r.stdout[-300:]))
+            notes.append("%s→%d" % (label, r.returncode))
+
+        # ⓐ 비-git 작업 디렉터리
+        nogit = os.path.join(tmp, "nogit")
+        os.makedirs(nogit)
+        _expect("비-git --all", _scan(nogit, "--all"), 2)
+        _expect("비-git staged", _scan(nogit), 2)
+
+        # ⓑ 추적 파일 0건 git 저장소(--all)
+        empty = os.path.join(tmp, "emptyrepo")
+        os.makedirs(empty)
+        gi = _run(["git", "init", "-q", empty], env=env, timeout=60)
+        need(gi.returncode == 0, "전제 붕괴: 임시 git 저장소 생성 실패(rc=%d): %s"
+             % (gi.returncode, (gi.stdout + gi.stderr)[-300:]))
+        _expect("--all 0건", _scan(empty, "--all"), 2)
+
+        # ⓔ 양성 대조 + ⓒ 부재 경로(명시 경로 모드 · cwd = 저장소 루트 = 실사용 형태)
+        clean = os.path.join(tmp, "clean.txt")
+        with open(clean, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("nothing to see here\n")
+        _expect("양성 대조(깨끗한 파일)", _scan(REPO_DIR, clean), 0)
+        _expect("부재 경로", _scan(REPO_DIR, os.path.join(tmp, "no-such-file.txt")), 2)
+
+        # ⓓ 판독 실패(grep rc=2)
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            notes.append("판독 실패 축=이 플랫폼 측정 불가(%s)" % ("nt" if os.name == "nt" else "root"))
+        else:
+            locked = os.path.join(tmp, "locked.txt")
+            with open(locked, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("unreadable\n")
+            os.chmod(locked, 0)
+            try:
+                _expect("판독 실패(chmod 000)", _scan(REPO_DIR, locked), 2)
+            finally:
+                os.chmod(locked, 0o600)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    need(not os.path.isdir(tmp), "임시 디렉터리가 남았다: %s" % tmp)
+    return " · ".join(notes)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 0. 베이스라인 (결정론 회귀 — 재감사 부채 V3)
 # ═══════════════════════════════════════════════════════════════════════════
