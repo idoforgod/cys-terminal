@@ -124,6 +124,10 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-dot.working { background: var(--ok); }
 .ws-dot.idle { background: var(--warn); }
 .ws-dot.error { background: var(--error); }
+/* ★0.14.41(U12·U4-A5①) 회색 '미확인' — 신호 없음·3×주기 넘게 낡음(초록 금지) · ○ 빈 자리 — 역할 이름표만 남은 셸
+   (빨간 사망 점과 섞지 않는다 · 크기 불변을 위해 inset 테두리). 판정은 seatsig.ts. */
+.ws-dot.unknown { background: #6e7681; }
+.ws-dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--warn); }
 .ws-tab .ws-sub .sev-warn { color: var(--warn); }
 .ws-tab .ws-sub .sev-crit { color: var(--error); }
 .ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
@@ -326,6 +330,8 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .cc-dot.idle { background: #64748b; }
 .cc-dot.error { background: #ef4444; animation: cc-blink 1.4s infinite; }
 .cc-dot.offline { background: #1e293b; }
+/* ★0.14.41(U12 · 리뷰1 #2) CC Tasks 행의 빈 자리 — 사이드바 .ws-dot.hollow 와 같은 노란 테두리 원(빨간 사망 점과 섞지 않는다). */
+.cc-dot.hollow { background: transparent; box-shadow: inset 0 0 0 1.5px var(--warn); }
 @keyframes cc-blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 .cc-fleet-state { font-size: 12px; color: #94a3b8; min-width: 46px; }
 .cc-tbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 12px; }
@@ -395,11 +401,14 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .cc-alert-badge[hidden] { display: none; }
 .cc-alert-badge.warn { background: rgba(245,158,11,.18); color: #f59e0b; }
 .cc-alert-badge.crit { background: rgba(239,68,68,.2); color: #ef4444; animation: cc-blink 1.4s infinite; }
+/* ★0.14.41(U4-A5②) 경보 조회 불가(연속 3회 실패) — 경보 0 과 구분되는 회색. 판정은 probefail.ts. */
+.cc-alert-badge.unknown { background: rgba(110,118,129,.22); color: #8b949e; }
 .cc-alerts:empty { display: none; }
 .cc-alerts { display: flex; flex-direction: column; gap: 6px; }
 .cc-alert-row { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-radius: 10px; font-size: 13px;
   border: 1px solid rgba(245,158,11,.35); background: rgba(245,158,11,.08); color: #fcd34d; }
 .cc-alert-row.crit { border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.10); color: #fca5a5; }
+.cc-alert-row.unknown { border-color: rgba(110,118,129,.45); background: rgba(110,118,129,.10); color: #8b949e; }
 .cc-alert-icon { flex: none; }
 .cc-alert-msg { font-weight: 600; }
 /* E4 세션 타임라인 탭 */

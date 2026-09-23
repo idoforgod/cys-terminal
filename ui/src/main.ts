@@ -87,6 +87,20 @@ import {
 } from "./resetconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { pickCtx, isHotCtx } from "./ctxpick";
+import {
+  SIG_STALE_MS,
+  seatState,
+  isHollowSeat,
+  isUnregisteredRoleSeat,
+  hollowGraceScaled,
+  summarizeWsSigsSafe,
+  wsSubBits,
+  ceoActiveFromSigs,
+  taskSeatView,
+  taskSeatIsWorking,
+  type SeatSig,
+} from "./seatsig";
+import { makeAlertsTracker, readAlerts, makeFeedSwitchScheduler, type AlertsView } from "./probefail";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
@@ -344,6 +358,9 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
 
 // ---------- T6 Control Center (전용 풀 패널 — 네이티브 실시간 모니터링) ----------
 let ccOpen = false;
+// E6 경보 조회 연속 실패 계수기(★0.14.41 U4-A5② · 리뷰1 #1) — 계수·리셋·'조회 불가' 판정은 probefail.ts 한 벌.
+//   CC stale 배너의 ccFailStreak(대시보드 전용)와 별개 축이다. setCcOpen 보다 위에 둔다(첫 호출 전 초기화).
+const alertsTracker = makeAlertsTracker();
 let ccTimer: number | null = null;
 let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
@@ -632,6 +649,9 @@ function setCcOpen(open: boolean) {
     // 기본 탭(오피스) 정합: index.html 초기 hidden/active와 ccTab 상태를 열 때마다 동기화.
     // glance 밀도는 applyCcDensity→applyGlanceFace가 이미 면(live/tasks)을 강제했으므로 건드리지 않는다.
     if (ccDensity !== "glance") setCcTab(ccTab);
+    // ★0.14.41(리뷰1 #7): 닫혀 있던 동안 남은 경보 실패 계수를 푼다 — 다시 연 직후의 일시 실패 1회가 옛 계수와 합산돼
+    //   곧바로 '경보 조회 불가'가 뜨지 않게. 반드시 아래 refreshControlCenter() 보다 먼저.
+    alertsTracker.reset();
     refreshControlCenter();
     refreshHw();
     tickCc();
@@ -688,10 +708,14 @@ async function refreshControlCenter() {
     ccFailStreak++;
   }
   updateCcStale();
+  // ★0.14.41(U4-A5②): 경보 조회 실패·미측정 응답(alerts 비배열)을 '경보 0'으로 접지 않는다 — 연속 실패를 따로 세어
+  //   ALERTS_FAIL_LIMIT(3)회부터 회색 '경보 조회 불가' 배지. 그 전의 일시 실패는 직전 표시 유지(깜빡임 0).
+  //   조회·계수·판정은 probefail.ts(readAlerts·alertsTracker) — 여기는 그리기만 한다(배선 핀: probefail.test).
+  const alerts = await readAlerts(() => invoke("control_alerts"));
   try {
-    renderAlerts((await invoke("control_alerts")) as any);
+    renderAlerts(alertsTracker.step(alerts));
   } catch {
-    /* graceful */
+    /* graceful — 배지 DOM 부재 등 */
   }
   if (ccTab === "eff") refreshEfficiency();
   if (ccTab === "skills") refreshSkills();
@@ -719,20 +743,25 @@ function updateCcStale() {
   }
 }
 
-// E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
-function renderAlerts(a: any) {
-  const list: any[] = a?.alerts ?? [];
-  const crit = list.filter((x) => x.severity === "crit").length;
-  const badge = document.getElementById("cc-alertbadge")!;
-  badge.hidden = list.length === 0;
-  badge.textContent = list.length ? `⚠ ${list.length}` : "";
-  badge.className = "cc-alert-badge " + (crit > 0 ? "crit" : "warn");
-  document.getElementById("cc-alerts")!.innerHTML = list
-    .map(
-      (x) =>
-        `<div class="cc-alert-row ${x.severity === "crit" ? "crit" : "warn"}"><span class="cc-alert-icon">${x.severity === "crit" ? "🔴" : "🟠"}</span><span class="cc-alert-msg">${ccEsc(x.message ?? x.kind ?? "")}</span></div>`,
-    )
-    .join("");
+// E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강) · ★0.14.41 unknown(회색 '조회 불가').
+// 입력은 alertsTracker.step 이 낸 표시 값(판정은 probefail.ts) — 이 함수는 DOM 에 옮기기만 한다.
+function renderAlerts(v: AlertsView | null) {
+  if (!v) return; // 조회 실패가 아직 상한 미만 — 직전 표시 유지(0 으로 접지 않는다)
+  const badge = document.getElementById("cc-alertbadge");
+  if (badge) {
+    badge.hidden = v.hidden;
+    badge.textContent = v.text;
+    badge.className = "cc-alert-badge " + v.cls;
+    badge.title = v.title;
+  }
+  const strip = document.getElementById("cc-alerts");
+  if (strip)
+    strip.innerHTML = v.rows
+      .map(
+        (x) =>
+          `<div class="cc-alert-row ${x.sev}"><span class="cc-alert-icon">${x.icon}</span><span class="cc-alert-msg">${ccEsc(x.msg)}</span></div>`,
+      )
+      .join("");
 }
 
 async function refreshEfficiency() {
@@ -1021,11 +1050,9 @@ function renderTasks(fleet: any) {
       const deptKey = String(d.socket_slug ?? d.name ?? "");
       const surfaces: any[] = (d.surfaces ?? []).slice();
       surfaces.sort((a, b) => (a.surface_id ?? 0) - (b.surface_id ?? 0));
-      const working = surfaces.filter(
-        (s) =>
-          s.status?.state === "working" ||
-          (!s.status && !s.exited && (s.idle_secs ?? 999) <= 60),
-      ).length;
+      // ★0.14.41(U12 · 리뷰1 #2): '작업중' 계수도 행 판정과 같은 규칙 — 빈 자리·종료 좌석은 빼고, 자기보고는 신선할 때만.
+      const tNow = Date.now();
+      const working = surfaces.filter((s) => taskSeatIsWorking(s, taskSeatView(s, tNow, HOLLOW_GRACE_UI))).length;
       const deadBadge = d.error
         ? `<span class="cc-fail-badge crit">⚠ ${d.error === "timeout" ? "응답없음" : "도달불가"}</span>`
         : "";
@@ -1052,23 +1079,39 @@ function taskRow(s: any, deptKey: string): string {
   const color = CC_ROLE_COLOR[role] ?? "#64748b";
   const st = s.status; // 자기보고 {state, context_pct, task, age_secs} | null
   const selfReport = st != null;
+  // ★0.14.41(U12 · 리뷰1 #2): 사이드바와 같은 규칙 — 자기보고 state 는 신선할 때(≤600초)만 라벨·신뢰 배지로 쓰고,
+  //   이름표만 남은 빈 자리는 '빈 자리'로 그린다. 판정은 seatsig.ts taskSeatView(표시 전용).
+  const view = taskSeatView(s, Date.now(), HOLLOW_GRACE_UI);
+  const freshReport = view.report === "fresh";
   let cls: string, label: string;
-  if (s.exited) {
+  if (view.seat === "offline") {
     cls = "offline";
     label = "오프라인";
-  } else if (selfReport) {
+  } else if (view.seat === "hollow") {
+    cls = "hollow";
+    label = "빈 자리";
+  } else if (freshReport) {
     const m = CC_TASK_STATE[st.state] ?? { cls: "idle", label: String(st.state) };
     cls = m.cls;
     label = m.label;
   } else {
     const idle = s.idle_secs ?? 999;
     cls = idle > 60 ? "idle" : "working";
-    label = idle > 60 ? "대기" : "활동";
+    label = (idle > 60 ? "대기" : "활동") + (view.report === "stale" ? " (자기보고 낡음)" : "");
   }
-  const trust = selfReport
+  const trust = freshReport
     ? `<span class="cc-trust-badge self" title="노드가 cys set-status로 직접 보고한 상태">📍자기보고</span>`
-    : `<span class="cc-trust-badge derived" title="출력 활동에서 데몬이 추정한 상태(자기보고 없음)">⚙파생</span>`;
-  const task = selfReport && st.task ? String(st.task) : "(업무 미보고)";
+    : view.seat === "hollow"
+      ? `<span class="cc-trust-badge derived" title="역할 이름표는 있으나 에이전트 프로세스가 보이지 않습니다(데몬: 셸 아래 프로세스 0 · 에이전트 미관측)">⚙파생</span>`
+      : view.report === "stale"
+        ? `<span class="cc-trust-badge derived" title="자기보고가 낡았습니다(${typeof st.age_secs === "number" ? ccAge(st.age_secs) : "나이 미상"}) — 출력 활동에서 데몬이 추정한 상태">⚙파생</span>`
+        : `<span class="cc-trust-badge derived" title="출력 활동에서 데몬이 추정한 상태(자기보고 없음)">⚙파생</span>`;
+  const task =
+    selfReport && st.task
+      ? (freshReport ? "" : "(낡은 보고) ") + String(st.task)
+      : view.seat === "hollow"
+        ? "(빈 자리 — 에이전트 프로세스가 보이지 않습니다)"
+        : "(업무 미보고)";
   // ★WP6-2 — 막대 값은 pickCtx 한 벌(실측 usage.ctx_pct > 신선한 자기보고 · 결측 null). 종전에는 자기보고
   //   전용이라 실측이 있어도 자기보고가 없으면 막대가 비었고, 낡은 자기보고를 그대로 그렸다.
   //   자기보고(src === "self")일 때만 추정 표식(≈ + 툴팁)을 단다. 색상 임계 60/80 은 불변.
@@ -1883,8 +1926,14 @@ const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
-type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
+// ★0.14.41(U12·U4-A5①): 칸 모양은 seatsig.ts SeatSig — 빈 자리(hollow)·수신 시각(at, 성공 조회에서만)이 더해졌다.
+type NodeSig = SeatSig;
 const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
+// 신호 낡음 창(3×폴링 주기). 재부팅 직후 Windows 는 같은 조회가 더 걸리므로 그 축에서만 2배(winScaled 관례) —
+// 넘기면: 그 좌석은 회색 '미확인'(표시만 · 재기동·회수 판정과 무관).
+const SIG_STALE_MS_UI = winScaled(SIG_STALE_MS);
+// 빈 자리 유예(무출력 20초 · 좌석 나이 60초)도 같은 관례로 Windows 2배(리뷰1 #4 — 느린 셸 초기화의 거짓 '○빈자리' 차단).
+const HOLLOW_GRACE_UI = hollowGraceScaled(winScaled);
 let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 구동 — 이 값만 배지가 쓴다)
 // 같은 순회의 **소켓별** 대기 수. 배너("다른 워크스페이스에 N건")가 이 맵을 직접 읽는다.
 // ★왜 합계를 나누는가(성찰3 설계렌즈 minor): 종전 배너는 `pendingApprovals - pendingItems.length`
@@ -2199,6 +2248,8 @@ async function refreshPaneTitles() {
     }
     if (adopted || adoptedWs) {
       render();
+      // ★0.14.41(리뷰1 #6): 입양한 pane 의 신호를 다음 폴링까지 기다리지 않는다(회색 '?미확인' 깜빡임 차단 · in-flight 가드).
+      if (adopted) void refreshSidebarStatus().catch(() => {});
       // 자동입양으로 pane이 생긴 활성 ws에 유효 포커스가 없으면 그 첫 pane에 포커스(포커스 회수, 탈취 아님).
       // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
       const aSids = collectSids(current()?.tree ?? null);
@@ -3827,10 +3878,13 @@ async function refreshSidebarStatus() {
       for (const n of r.surfaces ?? [])
         nodeSig.set(`${sock}#${n.surface_id}`, {
           role: n.role,
-          state: n.status?.state ?? (n.idle_secs > 60 ? "idle" : "working"),
+          state: seatState(n), // ★U12 자기보고는 신선할 때만(종전은 나이 무관 — 낡은 working 이 영구 초록)
           ctx_pct: pickCtx(n).pct, // ★WP6-2 실측 > 신선한 자기보고 · 결측 null(종전은 자기보고 우선 = 정본 역순)
           idle_secs: n.idle_secs,
           agent_alive: n.agent_alive,
+          hollow: isHollowSeat(n, Date.now(), HOLLOW_GRACE_UI), // ★U12 이름표만 남은 빈 자리(표시 전용 — 파괴·재기동 판정에 쓰지 않는다)
+          unregistered: isUnregisteredRoleSeat(n), // ★U12(리뷰1 #3) 등록 에이전트 없는 역할 좌석 — 빈 자리 판정 제외 · 중립 표식만
+          at: Date.now(), // ★U4-A5① 성공 조회 시각 — 실패는 덮어쓰지 않으므로 3×주기 뒤 '미확인'이 된다
         });
     } catch {
       /* 부서 데몬 일시 부재 */
@@ -3924,24 +3978,21 @@ function buildTab(ws: Workspace): HTMLElement {
     sub.classList.add("ws-sub-pending");
   } else {
     // 노드 신호 집계(B3): 상태 dot + worst CTX% + idle + dead 카운트. pane 수·title 표시는 보존.
-    const sigs = sids
-      .map((id) => nodeSig.get(`${ws.socket}#${id}`))
-      .filter(Boolean) as NodeSig[];
-    const worst = sigs.reduce((acc, s) => Math.max(acc, s.ctx_pct ?? 0), 0);
-    const idleN = sigs.filter((s) => s.state === "idle" || s.idle_secs > 60).length;
-    const dead = sigs.filter((s) => s.agent_alive === false).length;
+    // ★0.14.41(U12·U4-A5①): 판정은 seatsig.ts 한 벌 — 신호 없음·낡음(>3×주기)은 회색 '미확인', 이름표만 남은
+    //   빈 자리는 ○, 초록은 신선한 신호가 전부 산 좌석일 때만. 판정 예외는 회색으로 접혀 탭 바를 멈추지 않는다.
+    const sum = summarizeWsSigsSafe(
+      sids.map((id) => nodeSig.get(`${ws.socket}#${id}`)),
+      Date.now(),
+      SIG_STALE_MS_UI,
+    );
     const dot = document.createElement("span");
-    dot.className = "ws-dot " + (dead ? "error" : idleN ? "idle" : "working");
+    dot.className = "ws-dot " + sum.dot;
     sub.appendChild(dot);
+    if (sum.title) sub.title = sum.title;
     const txt = document.createElement("span");
-    const bits = [`${sids.length} pane`];
-    if (firstTitle) bits.push(firstTitle);
-    if (worst >= 60) bits.push(`CTX ${worst}%`);
-    if (idleN) bits.push(`💤${idleN}`);
-    if (dead) bits.push(`❌${dead}`);
-    txt.textContent = bits.join(" · ");
-    if (worst >= 80) txt.className = "sev-crit";
-    else if (worst >= 60) txt.className = "sev-warn";
+    txt.textContent = wsSubBits(sum, firstTitle).join(" · ");
+    if (sum.worst >= 80) txt.className = "sev-crit";
+    else if (sum.worst >= 60) txt.className = "sev-warn";
     sub.appendChild(txt);
   }
   tab.append(titleRow, sub);
@@ -4600,6 +4651,9 @@ async function newSurface(cwd: string | null = null, socket?: string, timeoutMs?
   };
   await makePane(r.surface_id, "", socket); // 자동 제목 — 곧 refreshPaneTitles가 현재 경로로 채움
   refreshPaneTitles();
+  // ★0.14.41(U4-A5① · 리뷰1 #6): 새 pane 은 다음 10초 폴링까지 신호가 없어 탭 점이 회색 '?미확인 1'로 깜빡인다 —
+  //   생성 직후 1회 당겨 온다(소켓별 in-flight 가드가 겹친 조회를 막는다 · 결과를 기다리지 않는다 · 새 주기 0).
+  void refreshSidebarStatus().catch(() => {});
   return r.surface_id;
 }
 
@@ -4748,41 +4802,32 @@ function openFeed() {
 
 // 승인 자동 화면전환 유예: master/CEO가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
 // 유예 후에도 pending인 항목 = 사람 수동 승인 필요 → 그때만 승인 Feed 탭으로 전환.
-const FEED_SWITCH_GRACE_MS = 30_000; // 비대상(현행) 유예
-// W3.4: auto_route 항목은 CEO 심의형 turn이 90초 초과가 흔하므로 기본 유예를 90초로 둔다.
-const FEED_SWITCH_GRACE_AUTO_MS = 90_000;
-// approval.stalled(5분) 경로가 사람 소환을 담당하므로 그 전까지만 동적 연장한다(그 뒤엔 escalation).
-const FEED_SWITCH_MAX_MS = 300_000;
+// ★0.14.41(리뷰1 #1): 유예 상수(30초·90초·상한 300초)의 정의처는 probefail.ts 하나다(시뮬레이션이 실제 값으로 상한을 잰다).
 
 // W3.4: CEO 좌석이 살아서 생성 중(working·저idle)이면 결재 심의가 진행 중으로 본다 —
 // nodeSig(refreshSidebarStatus가 org_status에서 채움)를 재갱신한 뒤 판정한다.
 async function ceoIsActivelyGenerating(): Promise<boolean> {
   await refreshSidebarStatus().catch(() => {});
-  for (const sig of nodeSig.values()) {
-    if (sig.role === "ceo") {
-      const alive = sig.agent_alive !== false; // null(미상)은 살아있다고 본다
-      const working = sig.state === "working" || sig.idle_secs < 30;
-      return alive && working;
-    }
-  }
-  return false; // ceo 좌석 신호 부재 = 비활성 → 즉시 전환(사람 소환)
+  // ★0.14.41(U12): 빈 자리 CEO 는 '생성 중'이 아니다 · 낡은 신호(응답 없는 소켓·사라진 좌석)는 판정에 안 쓴다.
+  //   agent_alive=null 자체는 종전대로 '모름'(사망 아님 · M1). CEO 신호 부재·전부 낡음 = 비활성 → 즉시 전환(사람 소환).
+  //   판정 본체는 seatsig.ts ceoActiveFromSigs(리뷰1 #1 — 루프까지 순수 함수로 올려 bun test 가 잰다).
+  return ceoActiveFromSigs(nodeSig.values(), Date.now(), SIG_STALE_MS_UI);
 }
 
 // autoRoute=true면 90초 기본 + CEO 활성 시 wait timeout 내 동적 연장, 아니면 30초 고정.
-function scheduleFeedSwitchIfStillPending(requestId: string, autoRoute = false, elapsedMs = 0) {
-  if (!requestId) return;
-  const grace = autoRoute ? FEED_SWITCH_GRACE_AUTO_MS : FEED_SWITCH_GRACE_MS;
-  setTimeout(async () => {
-    const r = (await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null;
-    const item = r?.items.find((i) => i.request_id === requestId);
-    if (item?.status !== "pending") return; // 이미 결재됨 — 전환 없음
-    // auto_route: CEO가 살아서 생성 중이고 상한 이내면 유예 연장(전환 보류).
-    if (autoRoute && elapsedMs + grace < FEED_SWITCH_MAX_MS && (await ceoIsActivelyGenerating())) {
-      scheduleFeedSwitchIfStillPending(requestId, true, elapsedMs + grace);
-      return;
-    }
-    openFeed(); // 유예 후에도 pending + CEO 비활성/상한 → 사람 개입
-  }, grace);
+// ★0.14.41(U4-A5③): feed_list 조회 실패(null)는 '이미 결재됨'이 아니다 — FEED_LOOKUP_RETRY_MS 뒤 **1회만** 다시 보고
+//   그래도 실패면 승인 Feed 를 연다(보여 주는 쪽으로 실패). 요청당 타이머는 항상 1개.
+// ★리뷰1 #1: 재예약·재시도 상한·연장 조건은 전부 probefail.ts makeFeedSwitchScheduler 안에 있다 — 여기는 의존성만 꽂는다.
+//   (종전엔 main.ts 의 재예약 인자 한 글자(true→false)가 테스트 녹색인 채 무한 재조회를 열 수 있었다.)
+//   bun test 가 이 스케줄러를 가짜 타이머로 전수 시뮬레이션해 타이머 수(최악 8)·총 경과 상한을 잰다.
+const feedSwitchScheduler = makeFeedSwitchScheduler({
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  feedList: () => invoke("feed_list", { status: null }),
+  ceoActive: ceoIsActivelyGenerating,
+  open: openFeed,
+});
+function scheduleFeedSwitchIfStillPending(requestId: string, autoRoute = false): void {
+  feedSwitchScheduler(requestId, autoRoute);
 }
 
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
