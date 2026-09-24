@@ -382,6 +382,16 @@ describe("0.14.42 — 발견된 계정은 전부 한 줄씩(오너 제보: 클�
     const pre = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
     expect(pre.text).toContain("상태줄");
   });
+  it("fatal-fix W5: RPC 경로가 없는 플랫폼(agy_statusline_required)도 '상태줄 연결'을 가리킨다 — 포트 못 찾음이 아니다", () => {
+    const rows = live();
+    rows[5].source_error = "agy_statusline_required";
+    const agy = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(agy.text.startsWith("관측 실패")).toBe(true);
+    expect(agy.text).toContain("상태줄");
+    expect(agy.text).not.toContain("포트");
+    expect(agy.tooltip).toContain("agy_statusline_required");
+    expect(agy.tooltip).toContain("Windows");
+  });
   it("관측 경로 고장(source_error)은 '관측 전'과 구별된다 — agy 거부 코드 보존", () => {
     const rows = live();
     rows[5].source_error = "agy_http_403";
@@ -390,7 +400,7 @@ describe("0.14.42 — 발견된 계정은 전부 한 줄씩(오너 제보: 클�
     expect(agy.text.startsWith("관측 실패")).toBe(true);
     expect(agy.text).toContain("403");
     expect(agy.tooltip).toContain("agy_http_403");
-    for (const code of ["agy_unreachable", "agy_no_quota", "agy_no_port", "agy_no_process", "agy_csrf_required", "brand_new_code"]) {
+    for (const code of ["agy_unreachable", "agy_no_quota", "agy_no_port", "agy_no_process", "agy_csrf_required", "agy_statusline_required", "brand_new_code"]) {
       rows[5].source_error = code;
       const t = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
       expect({ code, 실패표기: t.text.startsWith("관측 실패") }).toEqual({ code, 실패표기: true });

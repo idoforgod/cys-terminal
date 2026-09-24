@@ -55,6 +55,39 @@ pub struct RateWindow {
     pub resets_at: Option<f64>, // unix epoch 초
 }
 
+/// 창 라벨(`5h`·`7d`·`300m` — [`window_label`] 규칙) → 창 길이(초). 모르는 라벨(`?` 등)은 None.
+/// 라벨은 좌석 보고가 실어 오는 임의 문자열일 수 있다 — 바이트 절단 대신 **마지막 글자**로 가른다(다바이트 라벨에서
+/// 문자 경계 panic 금지).
+pub fn window_secs(label: &str) -> Option<f64> {
+    let unit = label.chars().last()?;
+    let num = &label[..label.len() - unit.len_utf8()];
+    let n: f64 = num.parse::<u32>().ok().filter(|n| *n > 0)?.into();
+    match unit {
+        'd' => Some(n * 86400.0),
+        'h' => Some(n * 3600.0),
+        'm' => Some(n * 60.0),
+        _ => None,
+    }
+}
+
+/// 리셋 시각이 epoch 초로 보이는 하한(2001-09). 이보다 작은 값은 단위가 다른 원천(상대 초 등)이라 판단 근거로 쓰지 않는다.
+const RESET_EPOCH_FLOOR: f64 = 1.0e9;
+
+/// ★fatal-fix R3-2 · ROLE-3: 이 창 관측이 **아직 경보 근거인가**(순수 — 핀). 리셋 시각이 지난 창은 아니다 — UI 의
+/// '리셋됨' 규칙과 같다(종전에는 유휴 agy 좌석의 '100%'가 리셋 뒤에도 남아 30분마다 crit 로 다시 울렸다 · agy 상태줄은
+/// 상태가 바뀔 때만 불려 스스로 지워 주지 않는다). 리셋 시각이 없거나 epoch 초로 보이지 않으면, 관측 나이가 창 길이를
+/// 넘을 때만 뺀다(그 창은 리셋됐을 수밖에 없다) · 창 길이도 모르면 남긴다(지우는 쪽으로 오판하지 않는다).
+/// `observed_at` = 그 값을 관측한 시각(0 = 모름 → 나이 판정 없음).
+pub fn rate_window_live(w: &RateWindow, observed_at: f64, now: f64) -> bool {
+    match w.resets_at {
+        Some(r) if r.is_finite() && r >= RESET_EPOCH_FLOOR => r > now,
+        _ => match window_secs(&w.label) {
+            Some(len) if observed_at > 0.0 => now - observed_at <= len,
+            _ => true,
+        },
+    }
+}
+
 /// 관측 사용량 스냅샷 — Surface.observed_usage에 저장, surface.list/org.status로 노출
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ObservedUsage {
@@ -1392,6 +1425,9 @@ const AGY_CSRF_BACKOFF_SECS: f64 = 1800.0;
 fn agy_csrf_backoff_active(backoff: &HashMap<u32, f64>, pid: u32, now: f64) -> bool {
     backoff.get(&pid).is_some_and(|until| now < *until)
 }
+/// 이 플랫폼(Windows)에서는 언어 서버 RPC 경로가 성립하지 않는다 — 값은 agy 상태줄 훅으로만 받는다(UI: "agy 상태줄
+/// 연결 필요"). fatal-fix W5.
+pub const AGY_ERR_STATUSLINE_REQUIRED: &str = "agy_statusline_required";
 /// agy 좌석은 있는데 그 아래 agy 프로세스를 못 찾았다.
 const AGY_ERR_NO_PROCESS: &str = "agy_no_process";
 /// agy 는 찾았는데 물어볼 포트가 하나도 없다.
@@ -1603,48 +1639,74 @@ pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
         let mut csrf_backoff: HashMap<u32, f64> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(agy_poll_secs())).await;
-            let surfaces: Vec<Arc<Surface>> = {
-                daemon
-                    .surfaces
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .filter(|s| !s.exited.load(Ordering::Relaxed))
-                    .filter(|s| {
-                        s.agent_meta
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|(a, _)| a == "gemini")
-                            .unwrap_or(false)
-                    })
-                    .cloned()
-                    .collect()
-            };
-            let live: HashSet<u64> = surfaces.iter().map(|s| s.id).collect();
-            ports.retain(|sid, _| live.contains(sid));
-            let now = now_epoch();
-            csrf_backoff.retain(|_, until| *until > now);
-            // ★RC2-b: agy 상태줄 훅이 값을 보내고 있으면(계정의 최신 출처) 이 경로는 물러선다 — CSRF 로 막힌
-            //   RPC 를 계속 두드려 값 있는 행에 '관측 실패'를 덧씌우지 않는다(오래됨은 stale 표기가 따로 말한다).
-            if !surfaces.is_empty() && crate::accounts::agy_statusline_authoritative(&daemon) {
-                continue;
-            }
-            let mut any_ok = false;
-            let mut worst: Option<String> = None;
-            for s in &surfaces {
-                match collect_agy_for(&daemon, s, &mut ports, &mut csrf_backoff).await {
-                    Ok(()) => any_ok = true,
-                    Err(code) => keep_worse(&mut worst, code),
-                }
-            }
-            if surfaces.is_empty() {
-                crate::accounts::note_agy_error(&daemon, None);
-            } else if !any_ok {
-                crate::accounts::note_agy_error(&daemon, worst.as_deref());
-            }
+            agy_collector_tick(&daemon, &mut ports, &mut csrf_backoff, agy_rpc_supported()).await;
         }
     });
+}
+
+/// 이 플랫폼에서 agy 언어 서버 RPC 경로가 성립하는가 — Windows 는 포트를 찾을 길(lsof·agy 로그의 포트 줄)이 없다.
+fn agy_rpc_supported() -> bool {
+    !cfg!(windows)
+}
+
+/// 수집기 한 틱(시험 이음매 — `rpc_supported` 로 플랫폼을 주입한다).
+async fn agy_collector_tick(
+    daemon: &Arc<Daemon>,
+    ports: &mut HashMap<u64, u16>,
+    csrf_backoff: &mut HashMap<u32, f64>,
+    rpc_supported: bool,
+) {
+    let surfaces: Vec<Arc<Surface>> = {
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| !s.exited.load(Ordering::Relaxed))
+            .filter(|s| {
+                s.agent_meta
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(a, _)| a == "gemini")
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+    let live: HashSet<u64> = surfaces.iter().map(|s| s.id).collect();
+    ports.retain(|sid, _| live.contains(sid));
+    let now = now_epoch();
+    csrf_backoff.retain(|_, until| *until > now);
+    // ★fatal-fix R4-F1: 이 태스크는 async 문맥이다 — 전역 accounts **표준 뮤텍스를 기다리지 않는다**(try 판).
+    //   기다리면 tokio 워커가 붙잡히고, 그 워커가 IO 드라이버를 돌리던 것이면 데몬의 모든 소켓 요청(ping·GUI 입력·
+    //   훅)이 멈춘다(워커 1개 런타임은 영구 정지). 경합이면 이 틱을 건너뛴다 — 값은 다음 틱에 다시 적힌다.
+    if surfaces.is_empty() {
+        let _ = crate::accounts::try_note_agy_error(daemon, None);
+        return;
+    }
+    // ★RC2-b: agy 상태줄 훅이 값을 보내고 있으면(계정의 최신 출처) 이 경로는 물러선다 — CSRF 로 막힌
+    //   RPC 를 계속 두드려 값 있는 행에 '관측 실패'를 덧씌우지 않는다(오래됨은 stale 표기가 따로 말한다).
+    match crate::accounts::try_agy_statusline_authoritative(daemon) {
+        Some(false) => {}
+        Some(true) | None => return,
+    }
+    // ★fatal-fix W5: 언어 서버 포트를 찾을 길이 없는 플랫폼(Windows)은 프로브하지 않는다 — 값을 얻는 길(상태줄)을 적는다.
+    if !rpc_supported {
+        let _ = crate::accounts::try_note_agy_error(daemon, Some(AGY_ERR_STATUSLINE_REQUIRED));
+        return;
+    }
+    let mut any_ok = false;
+    let mut worst: Option<String> = None;
+    for s in &surfaces {
+        match collect_agy_for(daemon, s, ports, csrf_backoff).await {
+            Ok(()) => any_ok = true,
+            Err(code) => keep_worse(&mut worst, code),
+        }
+    }
+    if !any_ok {
+        let _ = crate::accounts::try_note_agy_error(daemon, worst.as_deref());
+    }
 }
 
 #[cfg(test)]
@@ -2375,5 +2437,112 @@ mod tests {
         assert!(!super::agy_csrf_backoff_active(&b, 61666, now + super::AGY_CSRF_BACKOFF_SECS), "창이 지나면 다시 묻는다");
         assert!(!super::agy_csrf_backoff_active(&b, 70000, now + 15.0), "새 pid(재기동·업데이트)는 즉시 묻는다");
         assert!(super::AGY_CSRF_BACKOFF_SECS >= 600.0, "백오프가 폴링 주기 수준으로 짧아졌다");
+    }
+
+    /// ★fatal-fix R3-2: 창 라벨 → 길이 · 경보 근거 판정(순수 핀). 라벨은 좌석 보고가 실어 오는 임의 문자열일 수
+    /// 있다 — 다바이트 라벨에서 문자 경계 panic 이 나면 워치독 틱이 죽는다(음성 대조).
+    #[test]
+    fn fatal_fix_rate_window_liveness_pins() {
+        assert_eq!(window_secs("5h"), Some(18_000.0));
+        assert_eq!(window_secs("7d"), Some(604_800.0));
+        assert_eq!(window_secs("300m"), Some(18_000.0));
+        for odd in ["?", "", "h", "0h", "가", "5시", "-5h", "5hh"] {
+            assert_eq!(window_secs(odd), None, "{odd:?}");
+        }
+        let now = 2_000_000_000.0;
+        let w = |label: &str, r: Option<f64>| RateWindow { label: label.into(), used_pct: 99.0, resets_at: r };
+        assert!(rate_window_live(&w("5h", Some(now + 1.0)), now - 10.0, now));
+        assert!(!rate_window_live(&w("5h", Some(now - 1.0)), now - 10.0, now), "리셋이 지났다");
+        assert!(!rate_window_live(&w("5h", Some(now)), now - 10.0, now), "리셋 시각 = 지금");
+        assert!(rate_window_live(&w("5h", None), now - 3600.0, now), "리셋 없음 · 창 안");
+        assert!(!rate_window_live(&w("5h", None), now - 18_001.0, now), "리셋 없음 · 창 길이 초과");
+        assert!(rate_window_live(&w("5h", Some(1200.0)), now - 60.0, now), "epoch 초가 아닌 리셋은 근거가 아니다");
+        assert!(!rate_window_live(&w("5h", Some(1200.0)), now - 18_001.0, now), "그때는 나이로 판정");
+        assert!(rate_window_live(&w("가", None), now - 1.0e9, now), "모르는 라벨은 남긴다(지우는 쪽 오판 금지)");
+        assert!(rate_window_live(&w("5h", Some(f64::NAN)), now - 60.0, now));
+        assert!(rate_window_live(&w("5h", None), 0.0, now), "관측 시각 모름 = 나이 판정 없음");
+    }
+
+    // ───────── fatal-fix (2026-09-24) — agy 수집기 틱(수정 전 적색) ─────────
+
+    fn tick_daemon(tag: &str) -> Arc<Daemon> {
+        let dir = std::env::temp_dir().join(format!("cys-agytick-{}-{}-{}", tag, std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        Daemon::new(dir.join("cysd.sock"))
+    }
+
+    fn add_agy_seat(d: &Arc<Daemon>) -> u64 {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("agy-tick".into()), 24, 80)
+            .expect("create surface");
+        *s.agent_meta.lock().unwrap() = Some(("gemini".into(), "agy".into()));
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.id
+    }
+
+    /// 다른 스레드가 `accounts` 락을 쥔 동안 수집기 한 틱을 **current_thread 런타임**에서 돌린다 — 끝났는가.
+    fn tick_finishes_while_accounts_lock_is_held(d: &Arc<Daemon>) -> bool {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                let _g = d.accounts.lock().unwrap();
+                let _ = held_tx.send(());
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                rt.block_on(async {
+                    let mut ports = HashMap::new();
+                    let mut backoff = HashMap::new();
+                    agy_collector_tick(&d, &mut ports, &mut backoff, true).await;
+                });
+                let _ = done_tx.send(());
+            });
+        }
+        let finished = done_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+        let _ = release_tx.send(());
+        let _ = holder.join();
+        finished
+    }
+
+    /// ★fatal-fix R4-F1: agy 수집기는 **모든 데몬에서** 15초마다 async 문맥에서 전역 `accounts` 표준 뮤텍스를 잡게
+    /// 됐다(좌석 있음 = `agy_statusline_authoritative` · 없음 = `note_agy_error(None)`). 그 락이 막히면 수집기가 tokio
+    /// 워커를 붙잡은 채 서고, 그 워커가 IO 드라이버를 돌리던 것이면 데몬의 **모든 소켓 요청**(ping·surface.list·GUI
+    /// 입력·훅)이 멈췄다(워커 1개 런타임은 영구 정지 · r4 G 단계 A/B 재현). 이제 두 호출은 락을 **기다리지 않는다**
+    /// (경합이면 그 틱을 건너뛴다 — 값은 다음 틱에 다시 적힌다).
+    #[test]
+    fn fatal_fix_agy_collector_tick_never_waits_on_the_accounts_lock() {
+        let d = tick_daemon("no-seat");
+        assert!(tick_finishes_while_accounts_lock_is_held(&d), "agy 좌석 없음: 수집기 틱이 accounts 락에서 멈췄다(런타임 정지)");
+        let d = tick_daemon("seat");
+        add_agy_seat(&d);
+        assert!(tick_finishes_while_accounts_lock_is_held(&d), "agy 좌석 있음: 수집기 틱이 accounts 락에서 멈췄다(런타임 정지)");
+    }
+
+    /// ★fatal-fix W5: Windows 에는 agy 언어 서버 포트를 찾을 길(lsof·agy 로그의 포트 줄)이 없다 — RPC 경로가 구조적으로
+    /// 불능인데 종전에는 영구 '관측 실패 · agy 포트 못 찾음/프로세스 없음'을 적어 값을 얻는 길(상태줄)을 가렸다.
+    /// 이제 그 플랫폼에서는 프로브하지 않고 '상태줄 연결 필요' 코드를 적는다(상태줄 값이 들어오면 종전처럼 물러선다).
+    #[test]
+    fn fatal_fix_agy_collector_points_to_the_statusline_where_rpc_cannot_work() {
+        let d = tick_daemon("win");
+        add_agy_seat(&d);
+        // 행 준비(부트 시드 대용 — 오류 코드는 이미 있는 행에만 싣는다)
+        crate::accounts::note_rate(&d, "gemini", "", &[RateWindow { label: "5h".into(), used_pct: 1.0, resets_at: None }], "agy-rpc", now_epoch());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut ports = HashMap::new();
+            let mut backoff = HashMap::new();
+            agy_collector_tick(&d, &mut ports, &mut backoff, false).await;
+        });
+        let rows = crate::accounts::local_json(&d, now_epoch());
+        let agy = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").cloned().unwrap();
+        assert_eq!(agy["source_error"], json!(AGY_ERR_STATUSLINE_REQUIRED), "{agy}");
     }
 }

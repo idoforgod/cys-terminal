@@ -93,6 +93,11 @@ pub struct AccountsState {
     /// cys 창 밖 보고의 빈도 상한 상태 — (정규화된 프로필 dir) → (마지막 수용 시각, 그때의 rate).
     /// 키 공간은 검증을 통과한 **알려진 프로필 dir** 뿐이라 크기가 유계다.
     outside_last: HashMap<PathBuf, (f64, Vec<RateWindow>)>,
+    /// ★fatal-fix R1-F1: 창 밖 보고의 **선상한** 상태 — (원문 session_file 의 프로필 접두) → 마지막 통과 시각.
+    /// 호출자 추적(프로세스 표 전체 스캔) **앞**에서 쓴다. 크기는 [`OUTSIDE_PRE_KEYS_MAX`] 로 유계다.
+    outside_pre: HashMap<String, f64>,
+    /// 선상한 전역 토큰 버킷 — (남은 토큰, 마지막 보충 시각). None = 가득.
+    outside_pre_bucket: Option<(f64, f64)>,
 }
 
 /// agy 상태줄 훅이 좌석 `usage.report` 로 보낸 값의 계정 출처 라벨.
@@ -107,6 +112,19 @@ pub const OUTSIDE_RATE_MAX_ENTRIES: usize = 4;
 const OUTSIDE_MIN_INTERVAL_SECS: f64 = 1.0;
 /// 창 밖 보고: 같은 프로필·같은 값이면 이 창 안의 반복을 버린다(초).
 const OUTSIDE_SAME_VALUE_SECS: f64 = 5.0;
+/// ★fatal-fix R1-F1: 선상한 전역 버킷 — 용량(건)·초당 보충(건). 호출자 추적 1회 ≈ 40ms CPU(프로세스 1,100개 · 릴리스
+/// sysinfo 실측)이므로 최악 약 0.12코어로 묶인다. 정상 부하(창 밖 프로필마다 초당 1건 이하 · CLI 가 같은 값을 60초
+/// 안에 다시 보내지 않는다)는 전부 지나간다.
+const OUTSIDE_PRE_BURST: f64 = 6.0;
+const OUTSIDE_PRE_REFILL_PER_SEC: f64 = 3.0;
+/// 선상한 키 수 상한 — 넘치면 만료분을 걷고, 그래도 넘치면 새 키를 버린다(메모리 유계).
+const OUTSIDE_PRE_KEYS_MAX: usize = 256;
+/// ★fatal-fix R1-F2: 같은 창 라벨의 두 관측이 **같은 리셋 창**인지 가르는 허용 오차(초). agy 는 리셋을
+/// `now + reset_in_seconds` 로 지어 보내 보고마다 몇 초씩 흔들린다. 서로 다른 창은 리셋이 최소 창 길이만큼 떨어진다.
+const SAME_WINDOW_TOLERANCE_SECS: f64 = 900.0;
+/// 같은 리셋 창의 최댓값을 **다시 확인 없이** 쥐는 시간(초) — 경보 리마인드 간격과 같다. 제공자가 창 중간에 사용률을
+/// 내려 주는 드문 경우(일괄 리셋 등)에 옛 최댓값이 7일 창 내내 crit 로 남지 않게 한다(최대 한 리마인드 간격).
+const PEAK_HOLD_SECS: f64 = 1800.0;
 
 /// 계정 경보 입력 한 건 — 창 밖이 아닌 출처의 마지막 신선 관측([`AccountsState::alert_inputs`]).
 #[derive(Clone, Debug, Default)]
@@ -118,6 +136,9 @@ struct AlertInput {
     /// 좌석이 다시 보고하면 원래 키가 REMIND 안에 재발화했다(fix-values-2 RV-SP-2 · F1 과 같은 증상).
     label: String,
     rate: Vec<RateWindow>,
+    /// ★fatal-fix R1-F2: 창 라벨 → 지금 쥐고 있는 값이 **마지막으로 확인된** 시각(그 값 이상을 보고한 관측). 같은 리셋 창의
+    /// 최댓값은 이 시각에서 [`PEAK_HOLD_SECS`] 까지만 쥔다 — 비면(복원분) `at` 으로 본다.
+    peak_at: HashMap<String, f64>,
 }
 
 /// 이 출처의 관측이 계정 경보 입력이 되는가 — 창 밖(표시용) 값만 아니다. ★이것은 검증되지 않은 창 밖 값이 경보를
@@ -140,8 +161,64 @@ fn note_alert_input(
     }
     let slot = st.alert_inputs.entry(key.clone()).or_default();
     if now >= slot.at {
-        *slot = AlertInput { at: now, label: label.to_string(), rate: rate.to_vec() };
+        let (merged, peak_at) = merge_alert_windows(&slot.rate, slot.at, &slot.peak_at, rate, now);
+        *slot = AlertInput { at: now, label: label.to_string(), rate: merged, peak_at };
     }
+}
+
+/// ★fatal-fix R1-F2: 경보 입력 병합(순수 — 핀). 창 목록은 새 관측의 것이되(종전처럼 새 관측에 없는 창은 버린다),
+/// 창마다 **같은 리셋 창**의 이전 값이 있으면 사용률은 둘 중 큰 쪽이다 — 한 리셋 창 안의 사용률은 줄지 않으므로 낮은
+/// 값은 낡은 관측이다(유휴 좌석의 옛 값 · 여러 좌석이 같은 계정을 번갈아 보고). 종전 최신 승자는 96↔79 를 오가며
+/// 경보 키를 한 틱 비활성으로 떨어뜨렸고, 워치독은 그 키를 재무장해 다음 틱에 다시 냈다(30분 리마인드 우회).
+/// 단 쥐고 있는 최댓값은 마지막 확인에서 [`PEAK_HOLD_SECS`] 까지만 쥔다(제공자가 창 중간에 값을 내린 경우의 상한).
+/// 새 관측의 리셋이 이전보다 **창 하나 이상 뒤**면 새 창이라 그 값이 이기고, **앞**이면 지난 창의 늦은 보고라 이전 값을
+/// 지킨다(단, 이전 값의 리셋이 관측 시각에서 창 길이 넘게 먼 미래면 믿지 않는다). 리셋 시각이 한쪽이라도 없으면 창을
+/// 가를 근거가 없으므로 종전대로 새 값이 이긴다. 반환: (창 목록, 창별 마지막 확인 시각).
+fn merge_alert_windows(
+    prev: &[RateWindow],
+    prev_at: f64,
+    prev_peak_at: &HashMap<String, f64>,
+    new: &[RateWindow],
+    now: f64,
+) -> (Vec<RateWindow>, HashMap<String, f64>) {
+    let mut peak_at = HashMap::new();
+    let merged = new
+        .iter()
+        .map(|n| {
+            let fresh = |peak_at: &mut HashMap<String, f64>| {
+                peak_at.insert(n.label.clone(), now);
+                n.clone()
+            };
+            let Some(p) = prev.iter().find(|p| p.label == n.label) else {
+                return fresh(&mut peak_at);
+            };
+            let (Some(pr), Some(nr)) = (p.resets_at, n.resets_at) else {
+                return fresh(&mut peak_at);
+            };
+            if !(pr.is_finite() && nr.is_finite()) {
+                return fresh(&mut peak_at);
+            }
+            let p_seen = prev_peak_at.get(&n.label).copied().unwrap_or(prev_at);
+            if (nr - pr).abs() <= SAME_WINDOW_TOLERANCE_SECS {
+                if n.used_pct >= p.used_pct || now - p_seen > PEAK_HOLD_SECS {
+                    let mut w = fresh(&mut peak_at);
+                    w.resets_at = Some(pr.max(nr));
+                    return w;
+                }
+                peak_at.insert(n.label.clone(), p_seen);
+                return RateWindow { label: n.label.clone(), used_pct: p.used_pct, resets_at: Some(pr.max(nr)) };
+            }
+            let prev_plausible = crate::usage::window_secs(&n.label)
+                .map_or(true, |len| pr <= prev_at + len + SAME_WINDOW_TOLERANCE_SECS);
+            if nr < pr && prev_plausible {
+                peak_at.insert(n.label.clone(), p_seen);
+                p.clone()
+            } else {
+                fresh(&mut peak_at)
+            }
+        })
+        .collect();
+    (merged, peak_at)
 }
 
 /// 창 밖 보고의 처리 결과(수용 또는 빈도 상한으로 버림). 거절은 `Err(사유 코드)`.
@@ -194,7 +271,7 @@ fn antigravity_profiles(home: &Path) -> Vec<String> {
 /// (보통 `<dir>/.claude.json` · `CLAUDE_CONFIG_DIR` 없이 띄운 기본 프로필 `~/.claude` 만 홈 직하
 /// `~/.claude.json`). 잡동사니 dir(.claude-worktrees·백업 등)은 파일 부재/uuid 부재로 None → 관측
 /// 미귀속(유령 계정 0). 자격증명(.credentials.json)은 읽지 않는다.
-/// (운영 경로는 홈을 명시하는 `claude_identity_at` 을 쓴다 — 이 얇은 판은 기존 검체용.)
+/// (운영 경로는 락 밖에서 판독하는 `claude_identity_unlocked` 를 쓴다 — 이 얇은 판은 기존 검체용.)
 #[cfg(test)]
 fn claude_identity(
     state: &mut AccountsState,
@@ -203,82 +280,139 @@ fn claude_identity(
     claude_identity_at(state, dirs::home_dir().as_deref(), dir)
 }
 
-/// 홈을 인자로 받는 시험 이음매. `home == None`(홈 불명)이면 종전 규칙(폴더 안 파일만).
-fn claude_identity_at(
-    state: &mut AccountsState,
-    home: Option<&Path>,
-    dir: &Path,
-) -> Option<(String, String, Option<String>)> {
+/// 신원 한 건 — (accountUuid, email, plan).
+type Ident = (String, String, Option<String>);
+
+/// 신원 파일 크기 상한(바이트). 넘으면 신원 불명(귀속 0) — 병적 입력(거대 파일)이 판독 시간·메모리를 밀지 못하게.
+/// 실제 `.claude.json` 은 수십 KB~수 MB 다(이 맥 실측 59,906바이트 · 대화 이력이 쌓인 사용자는 더 크다) — 넉넉히 둔다.
+const IDENTITY_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// ★fatal-fix R4-F2·F3: 신원 파일의 위치와 mtime — **메타데이터만** 본다(내용 무접촉 · accounts 락 밖에서 부른다).
+/// 일반 파일이 아니면(FIFO·장치·디렉터리) None — 그런 것은 **열지 않는다**: FIFO 는 여는 순간 쓰는 쪽이 올 때까지
+/// 막히고, 종전에는 그 open 이 전역 accounts 락 안이라 워치독(`alert_rates`)·부트 시드(bind 전)·모든 사용량 RPC 가
+/// 함께 섰다. 반환 None 은 '신원 불명'(관측 미귀속 · 유령 계정 0)과 같은 방향이다.
+fn identity_file_meta(home: Option<&Path>, dir: &Path) -> Option<(PathBuf, f64)> {
     let f = match home {
         Some(h) => cys::profile_gate::identity_config_file(h, dir),
         None => dir.join(".claude.json"),
     };
-    let mtime = std::fs::metadata(&f)
-        .and_then(|m| m.modified())
+    let md = std::fs::metadata(&f).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    let mtime = md
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs_f64())?;
-    // 캐시는 **읽은 파일** 기준 — 같은 dir 이라도 신원 파일이 바뀌면(명시 CLAUDE_CONFIG_DIR 로 폴더 안
-    // 파일이 새로 생김) 다시 읽는다.
-    if let Some(e) = state.ident_cache.get(dir) {
-        if e.mtime == mtime && e.file == f {
-            return e.ident.clone();
-        }
+    Some((f, mtime))
+}
+
+/// 신원 파일 판독·파싱 — **락 밖 전용**. 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이
+/// 없다)고, 연 뒤 fstat 으로 **일반 파일**인지 다시 확인한다(stat 과 open 사이에 FIFO 로 바뀌는 경쟁 차단).
+/// 크기 상한을 넘으면 읽지 않는다. 자격증명(.credentials.json)은 읽지 않는다.
+fn read_identity_file(f: &Path) -> Option<Ident> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
     }
-    let ident = std::fs::read_to_string(&f)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| {
-            let oa = v.get("oauthAccount")?;
-            let uuid = oa.get("accountUuid")?.as_str()?.to_string();
-            let email = oa
-                .get("emailAddress")
-                .and_then(|x| x.as_str())
-                .unwrap_or(&uuid)
-                .to_string();
-            // ★RC5: 키별로 문자열 판독을 먼저 한다 — `userRateLimitTier` 가 **null 값으로 존재**하면
-            //   `get` 이 Some(Null) 이라 종전 `or_else` 가 조직 등급으로 넘어가지 못했다(전 계정 plan 소실).
-            let plan = ["userRateLimitTier", "organizationRateLimitTier"]
-                .iter()
-                .find_map(|k| oa.get(*k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()))
-                .map(|s| s.to_string());
-            Some((uuid, email, plan))
-        });
+    let file = opts.open(f).ok()?;
+    let md = file.metadata().ok()?;
+    if !md.is_file() || md.len() > IDENTITY_FILE_MAX_BYTES {
+        return None;
+    }
+    let mut s = String::new();
+    file.take(IDENTITY_FILE_MAX_BYTES + 1).read_to_string(&mut s).ok()?;
+    if s.len() as u64 > IDENTITY_FILE_MAX_BYTES {
+        return None;
+    }
+    parse_identity(&s)
+}
+
+/// `.claude.json` 본문 → 신원(순수).
+fn parse_identity(s: &str) -> Option<Ident> {
+    let v = serde_json::from_str::<Value>(s).ok()?;
+    let oa = v.get("oauthAccount")?;
+    let uuid = oa.get("accountUuid")?.as_str()?.to_string();
+    let email = oa
+        .get("emailAddress")
+        .and_then(|x| x.as_str())
+        .unwrap_or(&uuid)
+        .to_string();
+    // ★RC5: 키별로 문자열 판독을 먼저 한다 — `userRateLimitTier` 가 **null 값으로 존재**하면
+    //   `get` 이 Some(Null) 이라 종전 `or_else` 가 조직 등급으로 넘어가지 못했다(전 계정 plan 소실).
+    let plan = ["userRateLimitTier", "organizationRateLimitTier"]
+        .iter()
+        .find_map(|k| oa.get(*k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()))
+        .map(|s| s.to_string());
+    Some((uuid, email, plan))
+}
+
+/// 캐시 조회(파일시스템 무접촉 — 락 안에서 불러도 된다). `Some(ident)` = 적중.
+/// 캐시는 **읽은 파일** 기준 — 같은 dir 이라도 신원 파일이 바뀌면(명시 CLAUDE_CONFIG_DIR 로 폴더 안 파일이 새로
+/// 생김) 다시 읽는다.
+fn ident_cached(state: &AccountsState, dir: &Path, f: &Path, mtime: f64) -> Option<Option<Ident>> {
     state
         .ident_cache
-        .insert(dir.to_path_buf(), IdentEntry { file: f, mtime, ident: ident.clone() });
+        .get(dir)
+        .filter(|e| e.mtime == mtime && e.file == f)
+        .map(|e| e.ident.clone())
+}
+
+fn ident_store(state: &mut AccountsState, dir: &Path, f: PathBuf, mtime: f64, ident: Option<Ident>) {
+    state.ident_cache.insert(dir.to_path_buf(), IdentEntry { file: f, mtime, ident });
+}
+
+/// 홈을 인자로 받는 시험 이음매. `home == None`(홈 불명)이면 종전 규칙(폴더 안 파일만).
+/// ★이 판은 `&mut AccountsState` 를 직접 받는다 — **데몬 락을 쥔 채 부르지 않는다**(파일 IO 가 있다). 운영 경로는
+/// [`claude_identity_unlocked`]·[`discover_at`] 을 쓴다(검체 전용).
+#[cfg(test)]
+fn claude_identity_at(state: &mut AccountsState, home: Option<&Path>, dir: &Path) -> Option<Ident> {
+    let (f, mtime) = identity_file_meta(home, dir)?;
+    if let Some(hit) = ident_cached(state, dir, &f, mtime) {
+        return hit;
+    }
+    let ident = read_identity_file(&f);
+    ident_store(state, dir, f, mtime, ident.clone());
     ident
 }
 
-/// agent + 세션 파일 → (키, 라벨, plan, 프로필 표기). claude는 신원 해석 실패 시 None(스킵).
-/// (운영 경로는 홈을 명시하는 `resolve_at` 을 쓴다 — `note_rate_at` 경유. 이 얇은 판은 기존 검체용.)
-#[cfg(test)]
-fn resolve(
-    state: &mut AccountsState,
-    agent: &str,
-    session_file: &str,
-) -> Option<(AccountKey, String, Option<String>, Option<String>)> {
-    resolve_at(state, dirs::home_dir().as_deref(), agent, session_file)
+/// ★fatal-fix R4-F2: 운영 경로의 신원 해석 — 캐시 조회·기록만 짧게 락 안에서 하고 **파일 IO 는 전부 락 밖**이다.
+fn claude_identity_unlocked(accounts: &std::sync::Mutex<AccountsState>, home: Option<&Path>, dir: &Path) -> Option<Ident> {
+    let (f, mtime) = identity_file_meta(home, dir)?;
+    let hit = {
+        let st = accounts.lock().unwrap();
+        ident_cached(&st, dir, &f, mtime)
+    };
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let ident = read_identity_file(&f);
+    ident_store(&mut accounts.lock().unwrap(), dir, f, mtime, ident.clone());
+    ident
 }
 
-/// 홈을 인자로 받는 시험 이음매.
-fn resolve_at(
-    state: &mut AccountsState,
-    home: Option<&Path>,
-    agent: &str,
-    session_file: &str,
-) -> Option<(AccountKey, String, Option<String>, Option<String>)> {
+/// 귀속 결과 — (키, 라벨, plan, 프로필 표기).
+type Resolution = (AccountKey, String, Option<String>, Option<String>);
+
+/// claude 프로필 dir + 신원 → 귀속 결과(순수).
+fn claude_resolution(home: Option<&Path>, dir: &Path, ident: Ident) -> Resolution {
+    let (uuid, email, plan) = ident;
+    (
+        AccountKey { provider: "claude".into(), account_id: uuid },
+        email,
+        plan,
+        Some(profile_short(home, dir)),
+    )
+}
+
+/// 단일 홈 provider(codex·agy) → 귀속 결과. 미지 agent → None. (agy 는 데이터 폴더 **존재**만 본다 — 메타데이터.)
+fn fixed_resolution(home: Option<&Path>, agent: &str) -> Option<Resolution> {
     match agent {
-        "claude" => {
-            let dir = profile_dir_from_session(session_file)?;
-            let (uuid, email, plan) = claude_identity_at(state, home, &dir)?;
-            Some((
-                AccountKey { provider: "claude".into(), account_id: uuid },
-                email,
-                plan,
-                Some(profile_short(home, &dir)),
-            ))
-        }
         "codex" => Some((
             AccountKey { provider: "codex".into(), account_id: "default".into() },
             "OpenAI Codex".into(),
@@ -293,6 +427,35 @@ fn resolve_at(
             home.and_then(|h| antigravity_profiles(h).into_iter().next()),
         )),
         _ => None,
+    }
+}
+
+/// agent + 세션 파일 → (키, 라벨, plan, 프로필 표기). claude는 신원 해석 실패 시 None(스킵).
+/// (운영 경로는 락 밖에서 해석하는 `note_rate_at` 을 쓴다 — 이 얇은 판은 기존 검체용.)
+#[cfg(test)]
+fn resolve(
+    state: &mut AccountsState,
+    agent: &str,
+    session_file: &str,
+) -> Option<(AccountKey, String, Option<String>, Option<String>)> {
+    resolve_at(state, dirs::home_dir().as_deref(), agent, session_file)
+}
+
+/// 홈을 인자로 받는 시험 이음매(검체 전용 — `&mut AccountsState` 를 직접 받는다).
+#[cfg(test)]
+fn resolve_at(
+    state: &mut AccountsState,
+    home: Option<&Path>,
+    agent: &str,
+    session_file: &str,
+) -> Option<Resolution> {
+    match agent {
+        "claude" => {
+            let dir = profile_dir_from_session(session_file)?;
+            let ident = claude_identity_at(state, home, &dir)?;
+            Some(claude_resolution(home, &dir, ident))
+        }
+        other => fixed_resolution(home, other),
     }
 }
 
@@ -311,6 +474,7 @@ pub fn note_rate(
 
 /// 홈을 인자로 받는 시험 이음매(동작은 `note_rate` 와 같다). 반환: 계정에 **귀속됐는가**
 /// (false = rate 가 비었거나 신원 불명 — 아무것도 쓰지 않았다).
+/// ★fatal-fix R4-F2: 신원 해석(파일 IO)은 accounts 락 **밖**에서 끝낸 뒤 락을 잡는다.
 fn note_rate_at(
     daemon: &Arc<Daemon>,
     home: Option<&Path>,
@@ -323,14 +487,51 @@ fn note_rate_at(
     if rate.is_empty() {
         return false;
     }
+    let resolved = match agent {
+        "claude" => profile_dir_from_session(session_file).and_then(|dir| {
+            claude_identity_unlocked(&daemon.accounts, home, &dir).map(|ident| claude_resolution(home, &dir, ident))
+        }),
+        other => fixed_resolution(home, other),
+    };
+    let Some(resolved) = resolved else {
+        return false; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
+    };
+    note_resolved(daemon, resolved, rate, source, now)
+}
+
+/// ★fatal-fix (a): claude 좌석 보고를 **좌석의 설정 폴더**(데몬이 그 좌석에 넣어 준 `CLAUDE_CONFIG_DIR`)로 귀속한다 —
+/// 호출자가 댄 transcript 경로로는 신원 파일을 고르지 않는다(호출자 경로로 파일시스템을 건드리지 않는다 · R4-F2 ③).
+/// 대조([`session_in_profile`])는 부른 쪽(handlers)이 먼저 끝낸다.
+pub fn note_rate_for_profile(daemon: &Arc<Daemon>, profile_dir: &Path, rate: &[RateWindow], source: &str, now: f64) -> bool {
+    note_rate_for_profile_at(daemon, dirs::home_dir().as_deref(), profile_dir, rate, source, now)
+}
+
+/// 홈을 인자로 받는 시험 이음매.
+fn note_rate_for_profile_at(
+    daemon: &Arc<Daemon>,
+    home: Option<&Path>,
+    profile_dir: &Path,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> bool {
+    if rate.is_empty() {
+        return false;
+    }
+    let Some(ident) = claude_identity_unlocked(&daemon.accounts, home, profile_dir) else {
+        return false;
+    };
+    note_resolved(daemon, claude_resolution(home, profile_dir, ident), rate, source, now)
+}
+
+/// 귀속이 정해진 관측을 계정 뷰·경보 입력·스냅샷에 싣는다(락 안은 메모리 연산뿐 · 파일 IO 없음).
+fn note_resolved(daemon: &Arc<Daemon>, resolved: Resolution, rate: &[RateWindow], source: &str, now: f64) -> bool {
+    let (key, label, plan, profile) = resolved;
     // 1) accounts 락 안에서 병합 + 영속 대상 수집 (analytics 락은 여기서 잡지 않는다 — 잠금 순서)
     let mut to_persist: Vec<(AccountKey, String, String, f64, Option<f64>)> = Vec::new();
     let mut do_prune = false;
     {
         let mut st = daemon.accounts.lock().unwrap();
-        let Some((key, label, plan, profile)) = resolve_at(&mut st, home, agent, session_file) else {
-            return false; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
-        };
         let view = st.views.entry(key.clone()).or_insert_with(|| AccountView {
             key: key.clone(),
             label: label.clone(),
@@ -411,9 +612,12 @@ fn note_rate_at(
 /// ③ ~/.cys/accounts.json 선언 계정 등록(미래 provider — adapter:"none"은 '관측 없음' 상주).
 pub fn seed_known(daemon: &Arc<Daemon>) {
     if let Some(home) = dirs::home_dir() {
+        // ★fatal-fix R4-F3: 발견(파일 IO)은 락 밖에서 끝내고, 락 안에서는 메모리에 싣기만 한다. 이 함수는 소켓 bind
+        //   **전에** 동기로 돈다 — 종전에는 신원 파일 하나가 막히면(FIFO 등) 락을 쥔 채 부트 체인 전체가 섰다.
+        let found = discover_at(&home);
         {
             let mut st = daemon.accounts.lock().unwrap();
-            seed_discovered(&mut st, &home);
+            apply_discovered(&mut st, &home, found);
         }
         // 선언 계정(~/.cys/accounts.json — pack 밖: pack 스윕/치유 사정권 회피)
         let decl = home.join(".cys/accounts.json");
@@ -518,16 +722,43 @@ fn restore_from_snapshots(daemon: &Arc<Daemon>, now: f64) {
     }
 }
 
-/// 부트 시드 ①(설치 흔적 스캔) — 홈을 인자로 받는 시험 이음매. 계정 **발견**만 한다(rate 없음).
-fn seed_discovered(st: &mut AccountsState, home: &Path) {
+/// 부트 시드 ①의 발견 결과(파일 IO 로 만든 것 — 락 밖에서 만든다).
+struct Discovered {
+    /// (프로필 dir, 신원 파일·mtime·신원) — 신원 파일이 일반 파일이 아니면 None(캐시에도 싣지 않는다).
+    claude: Vec<(PathBuf, Option<(PathBuf, f64, Option<Ident>)>)>,
+    codex: bool,
+    agy: Vec<String>,
+}
+
+/// 부트 시드 ①의 **IO 절반** — 설치 흔적을 훑고 신원 파일을 읽는다(락 밖 전용 · FIFO 등 일반 파일이 아닌 신원은
+/// 열지 않는다).
+fn discover_at(home: &Path) -> Discovered {
     // ★(U-17) 프로필 dir 열거 규칙은 **lib 정본 하나**다(`cys::profile_gate`). 종전엔 이
     //   함수 안에만 있었고, 인증 판정기가 같은 규칙을 재구현하면 두 벌이 갈린다(한쪽만
     //   새 부서 접두를 배우는 식) — 같은 목록을 두 소비처가 보게 한다.
     //   ★판정은 바뀌지 않는다: 정본 함수는 종전 두 루프와 **같은 이름 규칙·같은 순서**이며
     //   `is_dir()` 검사도 더하지 않는다(동작 동일성 유지 — 완화도 강화도 아니다).
-    let dirs_to_check: Vec<PathBuf> = cys::profile_gate::enumerate_profile_dirs(home);
-    for dir in dirs_to_check {
-        if let Some((uuid, email, plan)) = claude_identity_at(st, Some(home), &dir) {
+    let claude = cys::profile_gate::enumerate_profile_dirs(home)
+        .into_iter()
+        .map(|dir| {
+            let read = identity_file_meta(Some(home), &dir).map(|(f, mtime)| {
+                let ident = read_identity_file(&f);
+                (f, mtime, ident)
+            });
+            (dir, read)
+        })
+        .collect();
+    Discovered { claude, codex: home.join(".codex").is_dir(), agy: antigravity_profiles(home) }
+}
+
+/// 부트 시드 ①의 **메모리 절반**(락 안 · 파일 IO 없음).
+fn apply_discovered(st: &mut AccountsState, home: &Path, found: Discovered) {
+    for (dir, read) in found.claude {
+        let Some((f, mtime, ident)) = read else {
+            continue;
+        };
+        ident_store(st, &dir, f, mtime, ident.clone());
+        if let Some((uuid, email, plan)) = ident {
             let key = AccountKey { provider: "claude".into(), account_id: uuid };
             let short = profile_short(Some(home), &dir);
             let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
@@ -544,7 +775,7 @@ fn seed_discovered(st: &mut AccountsState, home: &Path) {
             v.profiles.insert(short);
         }
     }
-    if home.join(".codex").is_dir() {
+    if found.codex {
         st.views
             .entry(AccountKey { provider: "codex".into(), account_id: "default".into() })
             .or_insert_with(|| AccountView {
@@ -561,8 +792,7 @@ fn seed_discovered(st: &mut AccountsState, home: &Path) {
     }
     // ★RC1: agy 데이터 폴더(`~/.gemini/antigravity-cli`) — 종전엔 `~/.antigravity` 만 봐서 이 맥의
     //   antigravity 계정이 영영 시드되지 않았다. 구 경로는 호환으로 함께 본다. **존재만** 본다.
-    let agy = antigravity_profiles(home);
-    if !agy.is_empty() {
+    if !found.agy.is_empty() {
         let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
         let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
             key,
@@ -575,8 +805,15 @@ fn seed_discovered(st: &mut AccountsState, home: &Path) {
             adapter: true,
             source_error: None,
         });
-        v.profiles.extend(agy);
+        v.profiles.extend(found.agy);
     }
+}
+
+/// 부트 시드 ①(설치 흔적 스캔) — 홈을 인자로 받는 시험 이음매. 계정 **발견**만 한다(rate 없음).
+/// (운영 경로 `seed_known` 은 IO 절반을 락 밖에서 따로 부른다.)
+#[cfg(test)]
+fn seed_discovered(st: &mut AccountsState, home: &Path) {
+    apply_discovered(st, home, discover_at(home));
 }
 
 /// accounts.json의 adapter:"cmd" 계정 — 주기 실행해 rate JSON을 흡수하는 범용 풀 어댑터.
@@ -684,13 +921,32 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
 ///   · 행이 없으면 데이터 폴더가 **지금** 있을 때만 만든다(부트 뒤 설치된 agy = 늦은 시드 · 재시작해도 같은 행).
 ///   · 둘 다 아니면 버린다 — 흔적 없는 기계의 좌석 오류는 보일 계정이 없다.
 /// 이 규칙이면 오류 경로로 생긴 행은 전부 시드 근거를 가진 행이라, 좌석 0 에서 행을 지울 필요가 없다.
+/// (운영 경로 = async 수집기는 비대기 판 [`try_note_agy_error`] 을 쓴다 — 이 판은 검체용.)
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn note_agy_error(daemon: &Arc<Daemon>, err: Option<&str>) {
     note_agy_error_at(daemon, dirs::home_dir().as_deref(), err)
 }
 
 /// 홈을 인자로 받는 시험 이음매. `home == None`(홈 불명) = 근거 확인 불가 → 새 행을 만들지 않는다.
+#[cfg(test)]
 fn note_agy_error_at(daemon: &Arc<Daemon>, home: Option<&Path>, err: Option<&str>) {
+    // 데이터 폴더 존재 확인(메타데이터)은 락 밖에서 — 락 안은 메모리 연산뿐(R4-F2 와 같은 규율).
+    let profiles = agy_error_profiles(home, err);
     let mut st = daemon.accounts.lock().unwrap();
+    apply_agy_error(&mut st, err, profiles);
+}
+
+/// 오류로 행을 새로 만들 때의 근거(실재하는 agy 데이터 폴더) — 오류가 없으면 볼 필요가 없다.
+fn agy_error_profiles(home: Option<&Path>, err: Option<&str>) -> BTreeSet<String> {
+    match err {
+        Some(_) => home.map(|h| antigravity_profiles(h).into_iter().collect()).unwrap_or_default(),
+        None => BTreeSet::new(),
+    }
+}
+
+/// 락 안 절반(메모리 연산뿐).
+fn apply_agy_error(st: &mut AccountsState, err: Option<&str>, profiles: BTreeSet<String>) {
     let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
     match err {
         Some(code) => {
@@ -698,9 +954,6 @@ fn note_agy_error_at(daemon: &Arc<Daemon>, home: Option<&Path>, err: Option<&str
                 v.source_error = Some(code.to_string());
                 return;
             }
-            let profiles: BTreeSet<String> = home
-                .map(|h| antigravity_profiles(h).into_iter().collect())
-                .unwrap_or_default();
             if profiles.is_empty() {
                 return; // 흔적 0 — 유령 계정을 만들지 않는다
             }
@@ -729,10 +982,114 @@ fn note_agy_error_at(daemon: &Arc<Daemon>, home: Option<&Path>, err: Option<&str
 
 /// agy 상태줄 훅이 이 데몬에 값을 보낸 적이 있고 그것이 antigravity 계정의 최신 출처인가 — 참이면 RPC
 /// 수집기는 프로브를 멈춘다(CSRF 로 막힌 경로를 계속 두드려 값 있는 행에 '관측 실패'를 덧씌우지 않게).
+/// (운영 경로 = async 수집기는 비대기 판 [`try_agy_statusline_authoritative`] 을 쓴다 — 이 판은 검체용.)
+#[cfg(test)]
 pub fn agy_statusline_authoritative(daemon: &Arc<Daemon>) -> bool {
     let st = daemon.accounts.lock().unwrap();
     let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
     st.views.get(&key).is_some_and(|v| v.source == AGY_STATUSLINE_SOURCE)
+}
+
+/// accounts 락을 **기다리지 않고** 잡는다 — None = 경합. async 문맥(수집기) 전용: 표준 뮤텍스를 기다리면 tokio 워커가
+/// 붙잡히고, 그 워커가 IO 드라이버를 돌리던 것이면 데몬의 모든 소켓 요청이 멈춘다(fatal-fix R4-F1).
+fn try_accounts(daemon: &Daemon) -> Option<std::sync::MutexGuard<'_, AccountsState>> {
+    match daemon.accounts.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// [`agy_statusline_authoritative`] 의 비대기 판 — None = 락 경합(부른 쪽은 그 틱을 건너뛴다).
+pub fn try_agy_statusline_authoritative(daemon: &Arc<Daemon>) -> Option<bool> {
+    let st = try_accounts(daemon)?;
+    let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
+    Some(st.views.get(&key).is_some_and(|v| v.source == AGY_STATUSLINE_SOURCE))
+}
+
+/// [`note_agy_error`] 의 비대기 판 — 반환: 적었는가(false = 락 경합 · 다음 틱에 다시 적힌다).
+pub fn try_note_agy_error(daemon: &Arc<Daemon>, err: Option<&str>) -> bool {
+    let home = dirs::home_dir();
+    let profiles = agy_error_profiles(home.as_deref(), err);
+    let Some(mut st) = try_accounts(daemon) else {
+        return false;
+    };
+    apply_agy_error(&mut st, err, profiles);
+    true
+}
+
+/// ★fatal-fix R1-F1 · N3 · F5 · W4: 창 밖 보고의 **선상한** — 호출자 추적(새 pid 마다 프로세스 표 전체 스캔 · 호출당
+/// 약 40ms CPU)과 파일시스템 검사 **앞**에서 부른다(락 안은 메모리 연산뿐). 원문 session_file 의 프로필 접두마다
+/// [`OUTSIDE_MIN_INTERVAL_SECS`] 안의 재시도를 버리고, 전체로는 토큰 버킷([`OUTSIDE_PRE_BURST`]·
+/// [`OUTSIDE_PRE_REFILL_PER_SEC`])을 넘는 시도를 버린다. 통과 = 뒤의 비싼 검사로 간다. 버려진 보고는 아무것도 쓰지
+/// 않는다(표시용 값 한 건 — 다음 상태줄 호출이 다시 보낸다). 시계가 뒤로 가면 막지 않는다(근거 없음 = 통과).
+pub fn outside_prethrottle(daemon: &Arc<Daemon>, session_file: &str, now: f64) -> bool {
+    let key = profile_dir_from_session(session_file)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut st = daemon.accounts.lock().unwrap();
+    outside_prethrottle_in(&mut st, key, now)
+}
+
+fn outside_prethrottle_in(st: &mut AccountsState, key: String, now: f64) -> bool {
+    if let Some(t) = st.outside_pre.get(&key) {
+        if now >= *t && now - *t < OUTSIDE_MIN_INTERVAL_SECS {
+            return false;
+        }
+    }
+    let (tokens, last) = st.outside_pre_bucket.unwrap_or((OUTSIDE_PRE_BURST, now));
+    let tokens = (tokens + (now - last).max(0.0) * OUTSIDE_PRE_REFILL_PER_SEC).min(OUTSIDE_PRE_BURST);
+    if tokens < 1.0 {
+        st.outside_pre_bucket = Some((tokens, now));
+        return false;
+    }
+    if st.outside_pre.len() >= OUTSIDE_PRE_KEYS_MAX && !st.outside_pre.contains_key(&key) {
+        st.outside_pre.retain(|_, t| now >= *t && now - *t < OUTSIDE_MIN_INTERVAL_SECS);
+        if st.outside_pre.len() >= OUTSIDE_PRE_KEYS_MAX {
+            return false;
+        }
+    }
+    st.outside_pre_bucket = Some((tokens - 1.0, now));
+    st.outside_pre.insert(key, now);
+    true
+}
+
+/// ★fatal-fix (a) · W2: 좌석 보고의 transcript 가 **그 좌석 설정 폴더**(`<profile_dir>/projects/` 아래)의 것인가.
+/// 먼저 표기만 접어 비교하고(파일시스템 무접촉 · Windows 표기 4종 — `\`↔`/` · `\\?\` · MSYS `/c/` · 드라이브 대소 —
+/// [`crate::reclaim::norm_path_on`]), 다르면 **둘 다 실재할 때만** 정규화(심볼릭 링크·`/tmp`↔`/private/tmp`·Windows
+/// 실제 대소문자)로 한 번 더 본다. `profile_dir_from_session` 처럼 첫 `/projects/` 를 찾지 않는다 — 홈 경로 자체에
+/// `/projects/` 가 들어 있어도 오판하지 않는다. 락 밖에서 부른다.
+pub fn session_in_profile(session_file: &str, profile_dir: &str) -> bool {
+    session_in_profile_on(session_file, profile_dir, cfg!(windows)) || session_in_profile_fs(session_file, profile_dir)
+}
+
+/// 위의 **순수** 절반(플랫폼 의미론을 인자로 받는다 — Windows 표기 검체가 unix 에서도 돈다).
+pub fn session_in_profile_on(session_file: &str, profile_dir: &str, windows: bool) -> bool {
+    if session_file.trim().is_empty() || profile_dir.trim().is_empty() {
+        return false;
+    }
+    let s = crate::reclaim::norm_path_on(session_file, windows);
+    let c = crate::reclaim::norm_path_on(profile_dir, windows);
+    let prefix = if c.ends_with('/') { format!("{c}projects/") } else { format!("{c}/projects/") };
+    let Some(rest) = s.strip_prefix(&prefix) else {
+        return false;
+    };
+    !rest.is_empty() && !rest.split('/').any(|seg| seg == "..")
+}
+
+fn session_in_profile_fs(session_file: &str, profile_dir: &str) -> bool {
+    let p = Path::new(session_file);
+    if session_file.trim().is_empty() || profile_dir.trim().is_empty() || !p.is_absolute() {
+        return false;
+    }
+    let Ok(cs) = std::fs::canonicalize(p) else {
+        return false; // transcript 가 없으면 프로필 폴더는 건드리지도 않는다
+    };
+    let Ok(cc) = std::fs::canonicalize(profile_dir) else {
+        return false;
+    };
+    let projects = cc.join("projects");
+    cs.starts_with(&projects) && cs != projects
 }
 
 /// cys 창 밖 보고의 **모양** 검증(순수 — 파일시스템 무접촉). 통과하면 걸러진 rate 를 돌려준다.
@@ -955,7 +1312,10 @@ pub fn predict_exhaust(series: &[(f64, f64)], now: f64, resets_at: Option<f64>) 
 /// ★인증 경계가 아니다(fix-values-2 RV-SP-1 · 알려진 한계 · 오너 결정 대기): 좌석 경로 `usage.report` 는 pane 밖
 /// 호출자를 막지 않으므로, 같은 UID 프로세스는 좌석 번호 하나만 대고 **어느 계정이든** 여기 들어가는 값을 넣거나
 /// 덮을 수 있다(가짜 경보 · 진짜 경보 억제 둘 다). 위조 값은 좌석 출처로 스냅샷에 남아 재시작 뒤에도 복원된다.
+/// ★fatal-fix R3-2 · ROLE-3: 리셋 시각이 지난 창(리셋 시각이 없으면 창 길이보다 오래된 관측)은 싣지 않는다
+/// ([`crate::usage::rate_window_live`] — UI 의 '리셋됨'과 같은 규칙).
 pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
+    let now = crate::state::now_epoch();
     let st = daemon.accounts.lock().unwrap();
     let mut out = Vec::new();
     for input in st.alert_inputs.values() {
@@ -963,6 +1323,9 @@ pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
             continue;
         }
         for w in &input.rate {
+            if !crate::usage::rate_window_live(w, input.at, now) {
+                continue;
+            }
             out.push((input.label.clone(), w.label.clone(), w.used_pct));
         }
     }
@@ -1708,5 +2071,247 @@ mod tests {
             assert!(para.contains(needle), "창 밖 값 문단에 같은 UID 한계({needle})가 없다:\n{para}");
         }
         assert!(para.contains("80%·95%"), "계정 경보 기본 임계는 80%·95% 다(alerts.rs AlertConfig::default):\n{para}");
+    }
+
+    // ───────── fatal-fix (2026-09-24) — 치명위험 재검증 지적 수정(수정 전 적색) ─────────
+    // 픽스처는 전부 합성값(*@example.test · 임시 폴더)이다.
+
+    /// FIFO 를 만든다(유닉스 전용 검체 이음매).
+    #[cfg(unix)]
+    fn mkfifo(p: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: 널 종단 경로 · 반환값만 본다.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo 실패: {}", std::io::Error::last_os_error());
+    }
+
+    /// 막힌 FIFO 판독자를 풀어 준다(적색 단계에서 검체 스레드가 영원히 남지 않게) — 판독자가 없으면 아무 일도 없다.
+    #[cfg(unix)]
+    fn release_fifo(p: &Path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(p);
+    }
+
+    /// R4-F2: 신원 파일(`.claude.json`)이 FIFO 면 종전에는 `accounts` 락을 쥔 채 open 에서 영원히 멈췄다 — 그동안
+    /// 워치독의 `alert_rates` 가 같은 락에서 멈춰 큐 배달·데드맨이 전부 섰다. 이제 신원 판독은 락 밖이고 **일반 파일만**
+    /// 연다: FIFO 신원은 '신원 불명'(귀속 0)으로 곧바로 끝나고 락은 잠깐도 묶이지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn fatal_fix_fifo_identity_never_holds_the_accounts_lock() {
+        let dir = tmp("ff-fifo-daemon");
+        let home = tmp("ff-fifo-home");
+        write(&home.join(".claude-z/projects/-w/s.jsonl"), "{}\n");
+        let fifo = home.join(".claude-z/.claude.json");
+        mkfifo(&fifo);
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let sess = home.join(".claude-z/projects/-w/s.jsonl").to_string_lossy().into_owned();
+        let now = crate::state::now_epoch();
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (d, home) = (d.clone(), home.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 50.0, None)], "statusline", now));
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        {
+            let d = d.clone();
+            std::thread::spawn(move || {
+                let _ = tx2.send(alert_rates(&d));
+            });
+        }
+        let watchdog_side = rx2.recv_timeout(std::time::Duration::from_secs(3));
+        let reporter_side = rx.recv_timeout(std::time::Duration::from_secs(3));
+        release_fifo(&fifo);
+        assert!(watchdog_side.is_ok(), "FIFO 신원 판독이 accounts 락을 쥔 채 멈췄다(워치독 alert_rates 정지)");
+        assert_eq!(reporter_side, Ok(false), "FIFO 신원은 '신원 불명'으로 곧바로 끝나야 한다(귀속 0)");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★fatal-fix (a) · W2: 좌석 설정 폴더 대조는 **표기 차이만** 접는다(파일시스템 무접촉 순수 절반). 윈도우에서 데몬이
+    /// 기록하는 네이티브 `C:\Users\x\.cys\claude` 와 Claude 가 싣는 transcript 표기(역슬래시·정슬래시·MSYS `/c/`·
+    /// 확장 길이 `\\?\` · 드라이브 대소)가 같은 폴더로 읽혀야 한다 — 문자열 비교면 윈도우 전 좌석이 늘 불일치다.
+    /// 첫 `/projects/` 를 찾지 않는다(홈 경로에 `/projects/` 가 있어도 오판 없음) · `..` 는 거절 · 결측은 불일치.
+    #[test]
+    fn fatal_fix_session_in_profile_folds_notation_only() {
+        let cfg = r"C:\Users\x\.cys\claude";
+        for sf in [
+            r"C:\Users\x\.cys\claude\projects\C--Users-x-p\s.jsonl",
+            "C:/Users/x/.cys/claude/projects/C--Users-x-p/s.jsonl",
+            "/c/Users/x/.cys/claude/projects/C--Users-x-p/s.jsonl",
+            r"\\?\C:\Users\x\.cys\claude\projects\C--Users-x-p\s.jsonl",
+            r"c:\Users\x\.cys\claude\projects\C--Users-x-p\s.jsonl",
+        ] {
+            assert!(session_in_profile_on(sf, cfg, true), "윈도우 표기가 같은 좌석 폴더로 읽히지 않는다: {sf}");
+        }
+        assert!(session_in_profile_on(r"C:\Users\x\.cys\claude\projects\a\s.jsonl", r"C:\Users\x\.cys\claude\", true), "후행 구분자");
+        // 다른 폴더(접두만 같은 형제 폴더 포함)는 불일치
+        assert!(!session_in_profile_on(r"C:\Users\x\.cys\claude-2\projects\a\s.jsonl", cfg, true));
+        assert!(!session_in_profile_on(r"C:\Users\x\.claude-3\projects\a\s.jsonl", cfg, true));
+        assert!(!session_in_profile_on(r"C:\Users\x\.cys\claude\projects", cfg, true), "projects 폴더 자체");
+        assert!(!session_in_profile_on(r"C:\Users\x\.cys\claude\projects\..\..\.claude-3\projects\s.jsonl", cfg, true), "..");
+        // unix: 홈에 /projects/ 가 있어도 좌석 폴더 기준으로 판정한다(profile_dir_from_session 의 첫 마커 오판 없음)
+        assert!(session_in_profile_on("/home/projects/u/.cys/claude/projects/-w/s.jsonl", "/home/projects/u/.cys/claude", false));
+        assert!(!session_in_profile_on("/home/projects/u/.claude-3/projects/-w/s.jsonl", "/home/projects/u/.cys/claude", false));
+        // unix 는 대소문자·공백을 접지 않는다(다른 디렉터리를 같다고 말하지 않는다)
+        assert!(!session_in_profile_on("/Users/x/.CYS/claude/projects/-w/s.jsonl", "/Users/x/.cys/claude", false));
+        // 결측은 불일치(없는 값끼리 같다고 말하지 않는다)
+        assert!(!session_in_profile_on("", "", false));
+        assert!(!session_in_profile_on("/Users/x/.cys/claude/projects/-w/s.jsonl", " ", false));
+    }
+
+    /// ★fatal-fix (a): 표기가 달라도 **둘 다 실재하면** 정규화(심볼릭 링크)로 같은 폴더를 알아본다 — 운영 판(`session_in_profile`).
+    #[cfg(unix)]
+    #[test]
+    fn fatal_fix_session_in_profile_follows_symlinks_when_both_exist() {
+        let home = tmp("ff-sip");
+        write(&home.join("real/.cys/claude/projects/-w/s.jsonl"), "{}\n");
+        std::os::unix::fs::symlink(home.join("real"), home.join("link")).unwrap();
+        let via_link = home.join("link/.cys/claude/projects/-w/s.jsonl").to_string_lossy().into_owned();
+        let cfg = home.join("real/.cys/claude").to_string_lossy().into_owned();
+        assert!(session_in_profile(&via_link, &cfg), "심볼릭 링크 표기가 같은 좌석 폴더로 읽히지 않는다");
+        let missing = home.join("link/.cys/claude/projects/-w/none.jsonl").to_string_lossy().into_owned();
+        assert!(!session_in_profile(&missing, &cfg), "실재하지 않는 transcript 는 정규화 근거가 아니다");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// R4-F3: 부트 시드가 bind 전에 같은 판독을 한다 — FIFO 신원 하나가 부트 체인 전체를 세웠다. 이제 일반 파일만
+    /// 열므로 그 프로필만 건너뛰고(신원 불명) 나머지 계정은 그대로 시드된다.
+    #[cfg(unix)]
+    #[test]
+    fn fatal_fix_boot_seed_skips_a_fifo_identity_without_blocking() {
+        let home = tmp("ff-fifo-seed");
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-seed-ok","emailAddress":"ok@example.test"}}"#);
+        std::fs::create_dir_all(home.join(".claude-z")).unwrap();
+        let fifo = home.join(".claude-z/.claude.json");
+        mkfifo(&fifo);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let mut st = AccountsState::default();
+                seed_discovered(&mut st, &home);
+                let ids: Vec<String> = st.views.keys().map(|k| k.account_id.clone()).collect();
+                let _ = tx.send(ids);
+            });
+        }
+        let got = rx.recv_timeout(std::time::Duration::from_secs(3));
+        release_fifo(&fifo);
+        assert_eq!(got, Ok(vec!["u-seed-ok".to_string()]), "FIFO 신원이 부트 시드를 세웠다(bind 전 정지)");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// R1-F2: 같은 계정을 보는 좌석 둘이 **같은 리셋 창**의 서로 다른 시점 값을 번갈아 보내도(한쪽은 쉬고 있어 낡은
+    /// 값) 경보 입력은 그 창의 **최댓값**으로 남는다 — 창 안의 사용률은 줄지 않으므로 낮은 값은 낡은 관측이다.
+    /// 종전(최신 승자)은 96↔79 를 오가며 경보 키를 한 틱 비활성으로 떨어뜨려 재무장·재발화(REMIND 우회)했다.
+    /// 새 리셋 창(리셋 시각이 창 길이만큼 뒤)의 값은 곧바로 이긴다 · 지난 창의 늦은 보고는 새 창 값을 덮지 않는다.
+    #[test]
+    fn fatal_fix_alternating_same_window_reports_keep_the_max_and_do_not_refire() {
+        let dir = tmp("ff-alt-daemon");
+        let home = tmp("ff-alt-home");
+        let sess = outside_profile(&home, ".claude-3", "u-alt2", "alt2@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: HashMap<String, f64> = HashMap::new();
+        let key = "account_rate:alt2@example.test:5h";
+        let seq0 = d.bus.latest_seq();
+        let t0 = crate::state::now_epoch();
+        let r = t0 + 300.0; // 이 5h 창은 5분 뒤 리셋된다
+        for i in 0..6 {
+            let t = t0 + 23.0 * f64::from(i);
+            // 두 좌석이 번갈아 — 96%(바쁜 좌석) · 79%(쉬는 좌석 · 리셋 시각은 몇 초 흔들린다)
+            let (pct, jitter) = if i % 2 == 0 { (96.0, 0.0) } else { (79.0, 3.0) };
+            assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", pct, Some(r + jitter))], "statusline", t));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t + 1.0);
+        }
+        assert_eq!(account_alerts(&d, seq0, key), 1, "같은 창의 번갈이 보고가 REMIND 안에 경보를 다시 냈다");
+        assert_eq!(alert_rates(&d), vec![("alt2@example.test".to_string(), "5h".to_string(), 96.0)]);
+        // 최댓값은 마지막 확인에서 PEAK_HOLD_SECS 까지만 쥔다 — 그 뒤의 낮은 값(제공자가 창 중간에 내린 경우)은 이긴다.
+        {
+            let mut st = d.accounts.lock().unwrap();
+            let rate_now = [rw("5h", 50.0, Some(r))];
+            for input in st.alert_inputs.values_mut() {
+                input.peak_at.insert("5h".into(), t0 - PEAK_HOLD_SECS - 1.0);
+            }
+            let key = st.alert_inputs.keys().next().cloned().unwrap();
+            let label = st.alert_inputs[&key].label.clone();
+            note_alert_input(&mut st, &key, &label, &rate_now, "statusline", t0 + 130.0);
+        }
+        assert_eq!(alert_rates(&d), vec![("alt2@example.test".to_string(), "5h".to_string(), 50.0)], "쥔 최댓값이 확인 없이 무기한 남았다");
+        // 리셋 뒤 새 창(리셋 시각이 창 길이만큼 뒤)의 3% 는 곧바로 이긴다
+        let r2 = t0 + 400.0 + 5.0 * 3600.0 - 100.0;
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 3.0, Some(r2))], "statusline", t0 + 400.0));
+        assert_eq!(alert_rates(&d), vec![("alt2@example.test".to_string(), "5h".to_string(), 3.0)], "새 리셋 창 값이 이기지 못했다");
+        // 지난 창의 늦은 보고(쉬던 좌석이 옛 창의 99% 를 뒤늦게)는 새 창 값을 덮지 않는다
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 99.0, Some(r))], "statusline", t0 + 430.0));
+        assert_eq!(alert_rates(&d), vec![("alt2@example.test".to_string(), "5h".to_string(), 3.0)], "지난 창의 늦은 보고가 새 창을 덮었다");
+        // 결측형 음성 대조: 리셋 시각이 없는 보고끼리는 종전 그대로 최신 승자(창을 가를 근거가 없다)
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("7d", 50.0, None)], "statusline", t0 + 460.0));
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("7d", 40.0, None)], "statusline", t0 + 490.0));
+        assert_eq!(alert_rates(&d), vec![("alt2@example.test".to_string(), "7d".to_string(), 40.0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// R1-F2(agy 판): 여러 agy 좌석이 같은 계정의 다른 시점 쿼터를 번갈아 보내도 `account_rate:Antigravity (agy):5h`
+    /// 는 REMIND 안에 한 번만 난다(P4 재현 모양 · agy 는 리셋을 `now+reset_in_seconds` 로 지어 보내 몇 초씩 흔들린다).
+    #[test]
+    fn fatal_fix_alternating_agy_seats_do_not_refire_the_account_alert() {
+        let dir = tmp("ff-agy-alt");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: HashMap<String, f64> = HashMap::new();
+        let key = "account_rate:Antigravity (agy):5h";
+        let seq0 = d.bus.latest_seq();
+        let t0 = crate::state::now_epoch();
+        for i in 0..8 {
+            let t = t0 + 23.0 * f64::from(i);
+            let pct = if i % 2 == 0 { 96.0 } else { 79.0 };
+            note_rate(&d, "gemini", "", &[rw("5h", pct, Some(t + 4000.0 - 23.0 * f64::from(i) + f64::from(i % 3)))], AGY_STATUSLINE_SOURCE, t);
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t + 1.0);
+        }
+        assert_eq!(account_alerts(&d, seq0, key), 1, "agy 좌석 번갈이가 계정 경보를 REMIND 안에 다시 냈다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3-2 · ROLE-3: 리셋 시각이 지난 창은 경보 입력이 아니다(UI 의 '리셋됨' 규칙과 같다). 종전에는 유휴 agy 좌석의
+    /// '100%' 가 리셋 뒤에도 남아 30분마다 crit 로 다시 울렸다. 리셋 시각이 없는 창은 관측 나이가 창 길이를 넘을 때만
+    /// 뺀다(그 창은 리셋됐을 수밖에 없다). 리셋 시각이 epoch 초로 보이지 않으면(단위가 다른 원천) 빼는 근거로 쓰지 않는다.
+    #[test]
+    fn fatal_fix_windows_past_their_reset_are_not_alert_inputs() {
+        let dir = tmp("ff-reset-daemon");
+        let home = tmp("ff-reset-home");
+        let sess = outside_profile(&home, ".claude-3", "u-rst", "rst@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let now = crate::state::now_epoch();
+        // 5h 창은 리셋이 지났다 · 7d 창은 아직
+        assert!(note_rate_at(
+            &d, Some(&home), "claude", &sess,
+            &[rw("5h", 100.0, Some(now - 5.0)), rw("7d", 91.0, Some(now + 86400.0))],
+            "statusline", now - 60.0,
+        ));
+        assert_eq!(alert_rates(&d), vec![("rst@example.test".to_string(), "7d".to_string(), 91.0)], "리셋이 지난 창이 경보 입력에 남았다");
+        // agy 상태줄 값도 같다(유휴 좌석의 소진 값)
+        note_rate(&d, "gemini", "", &[rw("5h", 100.0, Some(now - 1.0))], AGY_STATUSLINE_SOURCE, now - 30.0);
+        assert!(
+            !alert_rates(&d).iter().any(|(l, _, _)| l == "Antigravity (agy)"),
+            "리셋이 지난 agy 창이 경보 입력에 남았다: {:?}", alert_rates(&d)
+        );
+        // 리셋 시각 없음: 5시간을 넘긴 5h 관측은 뺀다 · 그 안이면 남긴다
+        let d2 = crate::state::Daemon::new(dir.join("cysd2.sock"));
+        note_rate(&d2, "gemini", "", &[rw("5h", 99.0, None)], AGY_STATUSLINE_SOURCE, now - 6.0 * 3600.0);
+        assert!(alert_rates(&d2).is_empty(), "창 길이를 넘긴 리셋 없는 관측이 남았다");
+        note_rate(&d2, "gemini", "", &[rw("5h", 99.0, None)], AGY_STATUSLINE_SOURCE, now - 60.0);
+        assert_eq!(alert_rates(&d2).len(), 1, "신선한 리셋 없는 관측이 빠졌다(과잉 제거)");
+        // epoch 초로 보이지 않는 리셋(상대 초 등)은 빼는 근거가 아니다(지우는 쪽 오판 금지)
+        let d3 = crate::state::Daemon::new(dir.join("cysd3.sock"));
+        note_rate(&d3, "gemini", "", &[rw("5h", 99.0, Some(1200.0))], AGY_STATUSLINE_SOURCE, now - 60.0);
+        assert_eq!(alert_rates(&d3).len(), 1, "단위가 다른 리셋 값으로 경보 입력을 지웠다");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

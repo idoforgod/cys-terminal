@@ -7118,10 +7118,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // 소유 게이트 — usage.register와 동형: 발신 pane은 자기 surface에만 보고할 수 있다.
             // 없으면 워커가 타 pane의 ctx·rate 배지를 위조해 60% 사이클을 오발·억제할 수 있다.
-            // ★알려진 한계(fix-values-2 RV-SP-1 · 오너 결정 대기 — IMPL-values §7-4): 이 게이트는 **다른 좌석 안의**
-            //   호출자만 막는다. 호출자가 어느 pane 의 자손도 아니면(caller_sid None) 통과하고 session_file 도 검증하지
-            //   않으므로, 같은 UID 프로세스는 claude 좌석 번호 하나만 대고 어느 계정의 경보 입력이든 넣거나 덮을 수 있다
-            //   (검체 `usage_report_from_outside_any_pane_still_feeds_account_alerts` · 매뉴얼 사이드바 사용량 절에 고지).
+            // ★남은 한계(fatal-fix (a) 뒤 · RV-SP-1 축소판): 이 게이트는 **다른 좌석 안의** 호출자만 막는다. 호출자가 어느
+            //   pane 의 자손도 아니면(caller_sid None) 통과한다 — 윈도우 조상 체인(Claude→Git Bash→cys.exe)을 실측하기
+            //   전에는 조이지 않는다(끊기면 전 좌석 ctx 배지·60% 임계가 사라진다). 대신 계정 경보 입력은 아래에서 **좌석
+            //   설정 폴더의 프로필**로만 들어간다 — 같은 UID 프로세스가 좌석 번호를 대도 그 좌석이 쓰는 계정 값만 흔들 수
+            //   있다(검체 `usage_report_from_outside_any_pane_reaches_only_the_seat_profile_alerts` · 매뉴얼 고지).
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
             if let Some(cs) = caller_sid {
                 if cs != sid {
@@ -7182,16 +7183,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 updated_at: crate::state::now_epoch(),
             });
             // CC v2 WS-A: statusline은 claude rate의 유일한 생산자 — 계정 귀속(신선 생산분).
-            // session_file(=statusline stdin의 transcript_path)로 프로필 dir→accountUuid 해석.
+            // ★fatal-fix (a) · RV-SP-1 · R3-4 · W2 · ROLE-2: 계정 **경보 입력**은 transcript 가 **이 좌석의 설정 폴더**
+            //   (`claude_config_dir` — 데몬이 좌석에 넣어 준 `CLAUDE_CONFIG_DIR` · restore 좌석은 topology 원값)의
+            //   `projects/` 아래일 때만 싣고, 신원도 그 폴더에서 읽는다(호출자 경로로 신원 파일을 고르지 않는다).
+            //   다르면(다른 프로필 transcript — 위조 또는 좌석에서 직접 띄운 다른 프로필의 claude) 창 밖 입구와 같은 검증을
+            //   거친 **표시용** 값으로만 싣는다(경보 제외). ★보고 자체는 거절하지 않는다 — 위의 배지·session_file 과 아래의
+            //   usage.updated·context.threshold 는 종전 그대로다(거절하면 60% clear 사이클이 죽는다 · 실패 방향 = '계정
+            //   경보 누락'). 불일치는 이벤트를 내지 않는다. `config_dir_trusted` 는 요구하지 않는다(restore 좌석은 전부 false
+            //   라 재시작마다 경보 입력이 전멸한다). 설정 폴더 기록이 없는 좌석(구 topology 등)은 종전대로 transcript 로 귀속.
             if agent == "claude" && !rate.is_empty() {
-                crate::accounts::note_rate(
-                    daemon,
-                    "claude",
-                    &param_str(&params, "session_file").unwrap_or_default(),
-                    &rate,
-                    "statusline",
-                    crate::state::now_epoch(),
-                );
+                let session_file = param_str(&params, "session_file").unwrap_or_default();
+                let now = crate::state::now_epoch();
+                let cfg = surface.claude_config_dir.lock().unwrap().clone().filter(|c| !c.trim().is_empty());
+                match cfg {
+                    None => crate::accounts::note_rate(daemon, "claude", &session_file, &rate, "statusline", now),
+                    Some(c) if crate::accounts::session_in_profile(&session_file, &c) => {
+                        crate::accounts::note_rate_for_profile(daemon, std::path::Path::new(&c), &rate, "statusline", now);
+                    }
+                    Some(_) => {
+                        if crate::accounts::outside_prethrottle(daemon, &session_file, now) {
+                            let _ = crate::accounts::report_outside(daemon, &session_file, &rate, now);
+                        }
+                    }
+                }
             }
             // agy 상태줄 = agy 쿼터의 주 경로(언어 서버 RPC 는 CSRF 필수라 막혔다 — usage.rs 머리 주석).
             if agy_report && !rate.is_empty() {
@@ -7228,15 +7242,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── 0.14.42 RC4-b: cys 창 **밖** Claude 세션의 계정 전용 보고 ───
         // 창 밖 세션(외부 터미널)의 statusline 은 surface 가 없어 usage.report 로 올 수 없다(종전: CLI 가 조용히
         // 버렸다). 이 입구는 surface 계열을 전혀 건드리지 않고 `accounts::note_rate` 하나만 부른다 — 좌석 배지·
-        // usage.updated·context.threshold·analytics 이벤트·비용·배달 무접촉. 순서는 싼 검사 → 호출자 → 파일시스템:
-        //   ① 모양(절대·`..` 없음·.jsonl·길이 · rate 5h/7d·유한·원소 수) ② 호출자가 pane 안이면 거절(좌석은 자기
-        //   surface 의 usage.report 를 쓴다 — 소유 게이트 우회 샛길 차단) · 호출자 pid 미상도 거절(fail-closed)
+        // usage.updated·context.threshold·analytics 이벤트·비용·배달 무접촉. 순서는 싼 검사 → 선상한 → 호출자 → 파일시스템:
+        //   ① 모양(절대·`..` 없음·.jsonl·길이 · rate 5h/7d·유한·원소 수) ①-2 호출자 pid 미상 거절(fail-closed)
+        //   ①-3 ★선상한(fatal-fix R1-F1 — 프로필 접두당 1초 · 전역 토큰 버킷 · 호출자 스캔보다 먼저) ② 호출자가 pane
+        //   안이면 거절(좌석은 자기 surface 의 usage.report 를 쓴다 — 소유 게이트 우회 샛길 차단)
         //   ③ transcript 실재 + 알려진 프로필 dir 의 projects/ 아래 ④ 프로필당 빈도 상한 ⑤ 신원 귀속.
         // ★한계(문서화 · 오너 승인 2026-09-23): 같은 UID 의 pane 밖 프로세스는 실재하는 transcript 경로를 대고 값을
         //   보낼 수 있다(표시값 위조). 그래서 이 값은 **표시용**이고 계정 경보의 근거가 아니다(accounts::alert_rates) —
         //   값도 라벨(경보 키)도 경보에 닿지 않는다(fix-values-2 RV-SP-2). 단 이 구분은 인증 경계가 아니다: 좌석 경로
-        //   `usage.report` 가 pane 밖 호출자를 막지 않아, 같은 호출자가 좌석 번호만 대면 경보 입력에 닿는다(RV-SP-1 ·
-        //   위 usage.report 소유 게이트 주석). 거절도 이벤트를 내지 않는다(상태줄 빈도로 버스를 덮지 않게) — 응답 코드만.
+        //   `usage.report` 가 pane 밖 호출자를 막지 않아, 같은 호출자가 좌석 번호를 대면 **그 좌석 설정 폴더 계정의**
+        //   경보 입력에는 닿는다(fatal-fix (a) 뒤 남은 한계 · 위 usage.report 주석). 거절도 이벤트를 내지 않는다
+        //   (상태줄 빈도로 버스를 덮지 않게) — 응답 코드만.
         "usage.report_account" => {
             let raw_len = params.get("rate").and_then(|v| v.as_array()).map_or(0, |a| a.len());
             let session_file = param_str(&params, "session_file").unwrap_or_default();
@@ -7254,6 +7270,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "usage.report_account denied: caller pid unresolved (fail-closed)",
                 ));
             };
+            // ★fatal-fix R1-F1 · N3 · F5 · W4: 싼 선상한을 호출자 추적(새 pid 마다 프로세스 표 전체 스캔 · 호출당 약 40ms
+            //   CPU) **앞**에 둔다 — 종전에는 빈도 상한이 스캔 뒤라 버려질 보고도 매번 스캔을 돌렸다(8세션 무휴지 = 약 7.9코어).
+            //   버리면 아무것도 쓰지 않는다(표시용 값 한 건 · 다음 상태줄 호출이 다시 보낸다) · 이벤트 없음.
+            if !crate::accounts::outside_prethrottle(daemon, &session_file, now) {
+                return Reply::Single(ok_response(&id, json!({"accepted": false, "reason": "throttled"})));
+            }
             if let Some(cs) = resolve_caller_surface(daemon, pid) {
                 return Reply::Single(err_response(
                     &id,
@@ -16774,34 +16796,123 @@ mod tests {
         assert_eq!(usage_updated_count(&daemon, seat), 1);
     }
 
-    /// ★알려진 한계 박제(fix-values-2 RV-SP-1 · 오너 결정 대기 — IMPL-values §7-4): 좌석 경로 `usage.report` 의 소유
-    /// 게이트는 **다른 좌석 안의** 호출자만 막는다. 호출자가 어느 pane 의 자손도 아니면(조상 체인에 pane 없음) 통과한다
-    /// (`usage_report_anonymous_passes` 와 같은 게이트). 그래서 같은 UID 프로세스는 claude 좌석 번호 하나만 대고
-    /// **어느 계정이든** 계정 경보 입력을 넣거나(가짜 crit) 진짜 좌석 값을 덮을(억제) 수 있다. 경보/표시 분리
-    /// (`accounts::alert_inputs`)는 검증되지 않은 **창 밖** 값을 경보에서 빼는 정확성 조치이지 인증 경계가 아니다.
-    /// 매뉴얼 사이드바 사용량 절과 `accounts.rs` 머리 주석이 이 한계를 적는다(accounts 검체
-    /// `manual_states_that_alert_separation_is_not_an_auth_boundary`). 오너가 좌석 경로를 닫기로 결정하면 이 검체를
-    /// 뒤집고 매뉴얼 문단도 함께 고친다. 픽스처는 전부 합성값이다.
+    /// 합성 프로필 하나(신원 파일 + 필요하면 실재 transcript) — 세션 경로를 돌려준다. `with_transcript=false` 면
+    /// transcript 파일을 만들지 않는다(표시 전용 강등 경로가 실제 홈 폴더를 열거하지 않게 — 실재 검사에서 먼저 끝난다).
+    fn seat_profile(home: &std::path::Path, dir: &str, uuid: &str, email: &str, with_transcript: bool) -> String {
+        let d = home.join(dir);
+        std::fs::create_dir_all(d.join("projects/-w")).unwrap();
+        std::fs::write(
+            d.join(".claude.json"),
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{email}"}}}}"#),
+        )
+        .unwrap();
+        if with_transcript {
+            std::fs::write(d.join("projects/-w/s.jsonl"), "{}\n").unwrap();
+        }
+        d.join("projects/-w/s.jsonl").to_string_lossy().into_owned()
+    }
+
+    fn set_config_dir(daemon: &Arc<Daemon>, sid: u64, dir: &std::path::Path) {
+        *daemon.surfaces.lock().unwrap()[&sid].claude_config_dir.lock().unwrap() =
+            Some(dir.to_string_lossy().into_owned());
+    }
+
+    /// ★fatal-fix (a) · RV-SP-1 · R3-4 · W2 · ROLE-2: 좌석 보고의 transcript 가 **그 좌석의 설정 폴더
+    /// (`claude_config_dir` — 데몬이 좌석에 넣어 준 `CLAUDE_CONFIG_DIR`) 밖** 프로필이면 계정 경보 입력에 넣지 않는다.
+    /// 종전에는 pane 안 워커가 자기 좌석 번호로 다른 프로필 transcript 를 실어 **아무 계정의** 경보를 넣거나 덮었다.
+    /// ★그러나 보고를 통째로 거절하지 않는다: 좌석 배지(ctx)·usage.updated·context.threshold·session_file 은 종전
+    /// 그대로다 — 거절하면 60% clear 사이클이 죽는다(실패 방향은 '경보 누락'이지 'clear 누락'이 아니다).
+    /// 불일치는 이벤트를 내지 않는다(상태줄 빈도로 버스를 덮지 않는다). 픽스처는 전부 합성값이다.
     #[test]
-    fn usage_report_from_outside_any_pane_still_feeds_account_alerts() {
+    fn fatal_fix_seat_report_outside_its_config_dir_keeps_badge_and_threshold_but_not_account_alerts() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("worker-a1"));
+        set_agent(&daemon, seat, "claude", "claude");
+        let home = std::env::temp_dir().join(format!("cys-ffa-{}-{}", std::process::id(), seat));
+        let _ = std::fs::remove_dir_all(&home);
+        let own = seat_profile(&home, ".claude-3", "u-ffa-own", "own@example.test", true);
+        let foreign = seat_profile(&home, ".claude-8", "u-ffa-foreign", "foreign@example.test", false);
+        set_config_dir(&daemon, seat, &home.join(".claude-3"));
+        let pid = 994_401_u32;
+        bind_caller(&daemon, pid, seat);
+        let seq0 = daemon.bus.latest_seq();
+        let r = usage_report(
+            &daemon,
+            seat,
+            json!({"ctx_pct": 70, "session_file": foreign, "rate": [{"label": "5h", "used_pct": 97.0}]}),
+            Some(pid),
+        );
+        assert_eq!(r["ok"], json!(true), "불일치 보고를 통째로 거절했다(ctx·임계가 끊긴다): {r}");
+        let u = daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().clone().unwrap();
+        assert_eq!((u.ctx_pct, u.session_file.as_str()), (Some(70), foreign.as_str()), "좌석 배지·session_file 이 끊겼다");
+        assert_eq!(threshold_events(&daemon, seat).len(), 1, "60% 임계가 발화하지 않았다(무clear)");
+        let names: Vec<String> = daemon
+            .bus
+            .replay_after(seq0)
+            .iter()
+            .filter_map(|e| e["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names.iter().filter(|n| *n == "usage.updated").count(), 1, "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("denied")), "불일치가 거절 이벤트를 냈다: {names:?}");
+        assert!(
+            crate::accounts::alert_rates(&daemon).is_empty(),
+            "좌석 설정 폴더 밖 프로필이 계정 경보 입력이 됐다: {:?}",
+            crate::accounts::alert_rates(&daemon)
+        );
+        // 대조: 좌석 자기 프로필이면 종전처럼 경보 입력이 된다
+        let r = usage_report(&daemon, seat, json!({"ctx_pct": 71, "session_file": own, "rate": [{"label": "5h", "used_pct": 97.0}]}), Some(pid));
+        assert_eq!(r["ok"], json!(true));
+        assert_eq!(
+            crate::accounts::alert_rates(&daemon),
+            vec![("own@example.test".to_string(), "5h".to_string(), 97.0)],
+            "좌석 자기 프로필 보고가 경보 입력이 되지 않았다(회귀)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★fatal-fix (a) 회귀 대조: 데몬 재시작 뒤 **복원된 좌석**(`config_dir_trusted=false` — restore 가 topology 의
+    /// 값을 넘긴다)도 자기 설정 폴더 보고는 계정 경보 입력이 된다. '신뢰 좌석일 때만 귀속'으로 만들면 재시작마다
+    /// 좌석 경보 입력이 조용히 전멸한다(R3-4 ⓒ). 경로 표기 차이(후행 `/`)도 같은 폴더로 본다.
+    #[test]
+    fn fatal_fix_restored_seat_still_feeds_account_alerts_from_its_own_profile() {
+        let daemon = claim_daemon();
+        let home = std::env::temp_dir().join(format!("cys-ffr-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::remove_dir_all(&home);
+        let own = seat_profile(&home, ".cys/claude-dept-x", "u-ffr", "restored@example.test", true);
+        let cfg = format!("{}/", home.join(".cys/claude-dept-x").to_string_lossy());
+        let s = daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker-r1".into()), 24, 80, &[], Some(cfg))
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        assert!(!s.config_dir_trusted, "restore 모양 좌석이어야 한다(검체 전제)");
+        set_agent(&daemon, s.id, "claude", "claude");
+        let pid = 994_411_u32;
+        bind_caller(&daemon, pid, s.id);
+        let r = usage_report(&daemon, s.id, json!({"ctx_pct": 20, "session_file": own, "rate": [{"label": "5h", "used_pct": 91.0}]}), Some(pid));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        assert_eq!(
+            crate::accounts::alert_rates(&daemon),
+            vec![("restored@example.test".to_string(), "5h".to_string(), 91.0)],
+            "복원 좌석의 자기 프로필 보고가 경보 입력에서 빠졌다"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★fatal-fix (a) — 남은 한계 박제(RV-SP-1 축소판): 좌석 소유 게이트는 여전히 **다른 좌석 안의** 호출자만 막고,
+    /// pane 밖 호출자(조상 체인에 pane 없음)는 막지 않는다(윈도우 조상 체인 실측 전에는 조이지 않는다 — 끊기면 전 좌석
+    /// ctx 가 사라진다). 그러나 이제 좌석 보고가 경보 입력에 닿는 것은 **그 좌석의 설정 폴더 프로필**뿐이다 —
+    /// pane 에서 쓰지 않는 계정에 가짜 경보를 넣지 못한다. 좌석이 쓰는 계정의 값은 pane 밖 호출자가 여전히 덮을 수 있다
+    /// (같은 UID 전제 · 매뉴얼 사이드바 사용량 절 · accounts 검체 `manual_states_that_alert_separation_is_not_an_auth_boundary`).
+    #[test]
+    fn usage_report_from_outside_any_pane_reaches_only_the_seat_profile_alerts() {
         let daemon = claim_daemon();
         let seat = make_surface(&daemon, Some("worker-sp1"));
         set_agent(&daemon, seat, "claude", "claude");
         let home = std::env::temp_dir().join(format!("cys-sp1-{}-{}", std::process::id(), seat));
         let _ = std::fs::remove_dir_all(&home);
-        let profile = |n: &str, uuid: &str, email: &str| -> String {
-            let dir = home.join(format!(".claude-{n}"));
-            std::fs::create_dir_all(dir.join("projects/-w")).unwrap();
-            std::fs::write(
-                dir.join(".claude.json"),
-                format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{email}"}}}}"#),
-            )
-            .unwrap();
-            std::fs::write(dir.join("projects/-w/s.jsonl"), "{}\n").unwrap();
-            dir.join("projects/-w/s.jsonl").to_string_lossy().into_owned()
-        };
-        let never_in_a_pane = profile("8", "u-sp1-a", "forged@example.test");
-        let seat_account = profile("9", "u-sp1-b", "genuine@example.test");
+        let never_in_a_pane = seat_profile(&home, ".claude-8", "u-sp1-a", "forged@example.test", false);
+        let seat_account = seat_profile(&home, ".claude-9", "u-sp1-b", "genuine@example.test", true);
+        set_config_dir(&daemon, seat, &home.join(".claude-9"));
         let outside_pid = 994_341_u32;
         bind_outside_caller(&daemon, outside_pid);
         let seat_pid = 994_342_u32;
@@ -16809,21 +16920,113 @@ mod tests {
         let report = |sf: &str, pct: f64, pid: u32| {
             usage_report(&daemon, seat, json!({"session_file": sf, "rate": [{"label": "5h", "used_pct": pct}]}), Some(pid))
         };
-        // 가짜 경보 방향: pane 에서 한 번도 쓰지 않은 계정에 pane 밖 호출자가 97% 를 넣는다 → 경보 입력이 된다.
-        assert_eq!(report(&never_in_a_pane, 97.0, outside_pid)["ok"], json!(true));
-        // 억제 방향: 좌석 안 호출자의 진짜 97% 를 pane 밖 호출자의 5% 가 덮는다.
+        // 가짜 경보 방향: pane 에서 쓰지 않는 계정에 pane 밖 호출자가 97% 를 넣는다 → 이제 경보 입력이 아니다.
+        assert_eq!(report(&never_in_a_pane, 97.0, outside_pid)["ok"], json!(true), "보고 자체는 받는다(좌석 배지)");
+        assert!(crate::accounts::alert_rates(&daemon).is_empty(), "좌석 밖 프로필로 가짜 경보 입력이 들어갔다");
+        // 억제 방향(남은 한계): 좌석 안 호출자의 진짜 97% 를 pane 밖 호출자의 5% 가 덮는다 — 좌석 자기 프로필이라서.
         assert_eq!(report(&seat_account, 97.0, seat_pid)["ok"], json!(true));
         assert_eq!(report(&seat_account, 5.0, outside_pid)["ok"], json!(true));
         assert_eq!(
             crate::accounts::alert_rates(&daemon),
-            vec![
-                ("forged@example.test".to_string(), "5h".to_string(), 97.0),
-                ("genuine@example.test".to_string(), "5h".to_string(), 5.0),
-            ],
-            "좌석 경로의 같은 UID 한계가 바뀌었다 — 의도한 변경이면 이 검체를 뒤집고 USER-MANUAL.md 사이드바 사용량 절의 \
-             '인증 경계가 아닙니다' 문단과 accounts.rs 머리 주석을 함께 고쳐라"
+            vec![("genuine@example.test".to_string(), "5h".to_string(), 5.0)],
+            "남은 한계(좌석 자기 프로필 값은 pane 밖 호출자가 덮을 수 있다)가 바뀌었다 — 의도한 변경이면 이 검체와 \
+             USER-MANUAL.md 사이드바 사용량 절의 '인증 경계가 아닙니다' 문단을 함께 고쳐라"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★fatal-fix R1-F1 · N3 · F5 · W4: 창 밖 입구의 빈도 상한은 **호출자 추적(프로세스 표 전체 스캔 · 호출당
+    /// 약 40ms CPU) 앞**에서 먼저 걸린다. 종전에는 스캔 뒤에 걸려, 상한에 버려질 보고도 매번 스캔을 돌렸다.
+    /// 관측 방법: 새 pid 의 호출자 해석은 `caller_cache` 에 그 pid 를 남긴다 — 선상한에 걸린 호출은 남기지 않는다.
+    #[test]
+    fn fatal_fix_outside_prethrottle_runs_before_the_caller_scan() {
+        let daemon = claim_daemon();
+        let rate = json!([{"label": "5h", "used_pct": 33.0}]);
+        let params = json!({"session_file": outside_shape_ok(), "rate": rate});
+        let first = 994_501_u32;
+        bind_outside_caller(&daemon, first);
+        let r = usage_report_account(&daemon, params.clone(), Some(first));
+        assert_eq!(r["error"]["code"], json!("invalid_params"), "첫 호출은 선상한을 지나 실재 검사에서 걸린다: {r}");
+        let fresh = 994_502_u32; // caller_cache 에 없는 pid — 해석하려면 프로세스 표를 훑어야 한다
+        let r = usage_report_account(&daemon, params, Some(fresh));
+        assert!(
+            !daemon.caller_cache.lock().unwrap().contains_key(&fresh),
+            "상한에 걸릴 보고가 호출자 스캔(프로세스 표 전체)을 먼저 돌렸다"
+        );
+        assert_eq!(r["result"], json!({"accepted": false, "reason": "throttled"}), "{r}");
+        // 전역 상한: 서로 다른 프로필 접두로 흩뿌려도 한 순간에 스캔까지 가는 호출 수는 유계다
+        let mut passed = 0;
+        for i in 0..40u32 {
+            let pid = 994_600 + i;
+            bind_outside_caller(&daemon, pid);
+            let sf = std::env::temp_dir()
+                .join(format!("nonexistent-cys-test-home/.claude-p{i}/projects/-w/s.jsonl"))
+                .to_string_lossy()
+                .into_owned();
+            let r = usage_report_account(&daemon, json!({"session_file": sf, "rate": [{"label": "5h", "used_pct": 1.0}]}), Some(pid));
+            if r["error"]["code"] == json!("invalid_params") {
+                passed += 1;
+            }
+        }
+        assert!(passed <= 10, "전역 선상한이 없다 — 한 순간에 {passed}건이 호출자 스캔까지 갔다");
+        assert!(passed >= 3, "전역 선상한이 정상 다중 프로필 보고까지 막는다({passed}건)");
+    }
+
+    /// ★fatal-fix N1 · R3-2 · ROLE-3: 노드별 rate 경보(`rate_limit:<role>:<win>`)는 ① agy 좌석(agent gemini)을 싣지
+    /// 않는다 — agy 계정 하나의 쿼터가 좌석마다 키로 불어나 CSO 시간당 예산을 먹던 경로(좌석 3개 → 키 8개). 같은
+    /// 사실은 계정 축(`account_rate:Antigravity (agy)`)이 덮는다. ② 리셋 시각이 지난 창을 싣지 않는다(UI '리셋됨'과 같다).
+    #[test]
+    fn fatal_fix_node_rate_alerts_skip_agy_seats_and_reset_windows() {
+        let daemon = claim_daemon();
+        let now = crate::state::now_epoch();
+        let mut agy_seats = Vec::new();
+        for i in 0..3 {
+            let s = make_surface(&daemon, Some(&format!("agy-x{i}")));
+            set_agent(&daemon, s, "gemini", "agy");
+            let pid = 994_700 + i as u32;
+            bind_caller(&daemon, pid, s);
+            let rate = json!([{"label": "5h", "used_pct": 95.0, "resets_at": now + 3600.0},
+                              {"label": "7d", "used_pct": 95.0, "resets_at": now + 86400.0}]);
+            assert_eq!(usage_report(&daemon, s, json!({"rate": rate, "reporter": "agy"}), Some(pid))["ok"], json!(true));
+            agy_seats.push(s);
+        }
+        let claude_live = make_surface(&daemon, Some("worker-live"));
+        set_agent(&daemon, claude_live, "claude", "claude");
+        bind_caller(&daemon, 994_710, claude_live);
+        usage_report(&daemon, claude_live, json!({"rate": [{"label": "5h", "used_pct": 93.0, "resets_at": now + 600.0}]}), Some(994_710));
+        let claude_reset = make_surface(&daemon, Some("worker-reset"));
+        set_agent(&daemon, claude_reset, "claude", "claude");
+        bind_caller(&daemon, 994_711, claude_reset);
+        usage_report(&daemon, claude_reset, json!({"rate": [{"label": "5h", "used_pct": 99.0, "resets_at": now - 5.0}]}), Some(994_711));
+        let snap = crate::alerts::snapshot(&daemon, now);
+        assert_eq!(
+            snap.rates,
+            vec![("worker-live".to_string(), "5h".to_string(), 93.0)],
+            "노드 rate 경보 입력에 agy 좌석 또는 리셋이 지난 창이 실렸다"
+        );
+        // 경보 키: agy 계정 2개(5h·7d) + 살아 있는 claude 좌석 1개 — 좌석별 agy 키는 없다
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let seq0 = daemon.bus.latest_seq();
+        crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, now + 1.0);
+        let mut keys: Vec<String> = daemon
+            .bus
+            .replay_after(seq0)
+            .iter()
+            .filter(|e| e["name"].as_str().is_some_and(|n| n.starts_with("alert.")))
+            .filter_map(|e| e["payload"]["key"].as_str().map(str::to_string))
+            .filter(|k| k.starts_with("rate_limit:") || k.starts_with("account_rate:"))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "account_rate:Antigravity (agy):5h".to_string(),
+                "account_rate:Antigravity (agy):7d".to_string(),
+                "rate_limit:worker-live:5h".to_string(),
+            ],
+            "agy 좌석 쿼터가 좌석별 키로 불어났다(CSO 예산 잠식)"
+        );
     }
 
     /// ★불변식 박제 (절대지침 — 컨텍스트 60% 사이클의 결정론 트리거):

@@ -63,6 +63,11 @@ pub const ENV_ALERT_ROUTE: &str = "CYS_ALERT_ROUTE";
 pub const COOLDOWN_SECS: f64 = 300.0;
 /// 시간당 적재 상한(건) — 전 키 합산. 넘으면 **보류**(폐기 아님).
 pub const HOURLY_CAP: usize = 20;
+/// ★fatal-fix P1: **에지 1회 사실**([`RouteState::fold_rank`] > 0 — `context.threshold`·`surface.exited`·재생 갭)에만
+/// 더 얹어 주는 시간당 예약분(건). 일반 경보는 [`HOURLY_CAP`] 에서 멈추고, 에지 사실은 합산 `HOURLY_CAP + EDGE_RESERVE`
+/// 까지 간다 — 일반 경보 폭발이 상한을 채워도 master 의 `context.threshold`(master clear 의 유일한 개시 신호)가 보류되지
+/// 않는다. 합산 40 은 CSO 큐 보호선([`CSO_QUEUE_HEADROOM`] 50) 아래다.
+pub const EDGE_RESERVE: usize = 20;
 /// 상한 창(초).
 pub const WINDOW_SECS: f64 = 3600.0;
 /// 데몬 부트 유예(초) — 기동 폭풍(복원·재조정 이벤트)이 CSO 좌석을 덮지 않게.
@@ -1071,13 +1076,25 @@ pub fn decide(state: &RouteState, key: &AlertKey, ctx: &RouteCtx) -> Verdict {
             return Verdict::Hold(HoldReason::Cooldown);
         }
     }
-    if state.routed_1h(ctx.now) >= HOURLY_CAP {
+    // ★fatal-fix P1: 에지 1회 사실은 일반 경보가 채운 상한 위의 예약분([`EDGE_RESERVE`])까지 간다(계수는 합산 하나).
+    if state.routed_1h(ctx.now) >= hourly_cap_for(key) {
         return Verdict::Hold(HoldReason::HourlyCap);
     }
     if ctx.cso_queue_depth >= CSO_QUEUE_HEADROOM {
         return Verdict::Hold(HoldReason::QueueHeadroom);
     }
     Verdict::Route
+}
+
+/// ★fatal-fix P1(R2-noclear): 이 키의 시간당 상한. 에지 1회 사실([`RouteState::fold_rank`] > 0)만 예약분을 더 받는다.
+/// 계수(`routed_1h`)는 전 키 합산 하나라서, 일반 경보는 합산이 [`HOURLY_CAP`] 에 닿으면 멈추고 에지 사실은
+/// `HOURLY_CAP + EDGE_RESERVE` 에서 멈춘다(에지 사실이 먼저 쓴 몫도 일반 경보의 상한을 채운다 — 우선순위).
+pub fn hourly_cap_for(key: &AlertKey) -> usize {
+    if RouteState::fold_rank(key) > 0 {
+        HOURLY_CAP + EDGE_RESERVE
+    } else {
+        HOURLY_CAP
+    }
 }
 
 /// 제어문자 제거 · 공백 압축 · 문자경계 바이트 절단. 화면 원문이 그대로 pane 에 들어가는 것을
@@ -3123,9 +3140,13 @@ fn scan_batch(st: &RouteState) -> Vec<(AlertKey, PendingAlert)> {
 /// 도달 불가지만(단조 시각은 `Instant` 유래 · 복원분은 `0.0` · JSON 에 NaN 리터럴 없음)
 /// 비교자가 전순서가 아닌 채로 남아 있는 것 자체가 함정이라 여기서 닫는다. 도달 가능한
 /// 값에서는 `partial_cmp` 와 **완전히 같은 순서**다(NaN 과 ±0.0 부호에서만 갈린다).
+/// ★fatal-fix P1: **등급이 먼저**다(에지 1회 사실 → 나머지) — 그 안에서 나이순. 종전(나이만)은 부트 유예 종료 때 쌓인
+/// 오래된 일반 경보가 상한을 먼저 채워 master 의 `context.threshold` 가 한 시간 가까이 굶었다(E7 재현). 등급 안의
+/// 나이순은 그대로라 같은 등급끼리의 기아 봉인(`drill_new_arrivals_do_not_starve_a_retained_alert`)은 유지된다.
 fn scan_order(a: &(&AlertKey, &PendingAlert), b: &(&AlertKey, &PendingAlert)) -> std::cmp::Ordering {
-    a.1.first_mono
-        .total_cmp(&b.1.first_mono)
+    RouteState::fold_rank(b.0)
+        .cmp(&RouteState::fold_rank(a.0))
+        .then_with(|| a.1.first_mono.total_cmp(&b.1.first_mono))
         // 복원분끼리는 단조 축이 합성값이라 동률이 날 수 있다 — 그때는 epoch 순서가
         // 재기동 이전의 나이 순서를 지킨다(그 다음이 키 사전순 = 결정론).
         .then_with(|| a.1.first_seen.total_cmp(&b.1.first_seen))
@@ -3940,9 +3961,11 @@ mod drills {
             handle_event(&daemon, &ev("health.alert", Some(700 + i), json!({"rule": "fill"})), t0);
         }
         assert_eq!(depth(&daemon, cso), HOURLY_CAP);
-        // ② 에지 1회 경보 X 가 상한에 막혀 보류된다.
-        let x = ev("context.threshold", Some(42),
-                   json!({"role": "worker", "context_pct": 62, "threshold": 60}));
+        // ② 보류분 X 가 상한에 막혀 보류된다.
+        //   ★fatal-fix P1(2026-09-24): 에지 1회 사실(context.threshold)은 이제 일반 경보의 상한에 막히지 않는다
+        //   (예약분 [`EDGE_RESERVE`] — `drill_edge_facts_route_even_when_the_hourly_cap_is_full`). 그래서 이 검체의
+        //   보류분은 **일반 경보**로 바꿨다 — 검체가 지키는 것(신규 도착이 보류분을 굶기지 못한다)은 그대로다.
+        let x = ev("health.alert", Some(42), json!({"rule": "retained"}));
         handle_event(&daemon, &x, t0);
         assert_eq!(pending_len(&daemon), 1, "상한 초과분은 보관된다");
         // ③ 창이 지나간 **직후**, 재평가 틱보다 먼저 신규 20건이 들이닥친다.
@@ -3962,13 +3985,80 @@ mod drills {
             .collect();
         let after_window: Vec<&String> = texts.iter().skip(HOURLY_CAP).collect();
         assert!(
-            after_window.first().is_some_and(|t| t.contains("context.threshold")),
+            after_window.first().is_some_and(|t| t.contains("surface:42")),
             "신규 도착이 보류분보다 먼저 예산을 먹었다(기아): {after_window:?}"
         );
         assert!(
-            !daemon.alert_route.lock().unwrap().pending.contains_key(
-                &AlertKey::new("context.threshold", Some(42))),
-            "에지 1회 경보가 여전히 보류에 갇혀 있다"
+            !daemon
+                .alert_route
+                .lock()
+                .unwrap()
+                .pending
+                .keys()
+                .any(|k| k.name == "health.alert" && k.surface == Some(42)),
+            "보류분이 여전히 보류에 갇혀 있다"
+        );
+    }
+
+    /// ★fatal-fix P1(R2-noclear · E7 재현 모양): 일반 경보가 시간당 상한([`HOURLY_CAP`])을 **채운 뒤에도** 에지 1회
+    /// 사실(`context.threshold` · `surface.exited`)은 곧바로 CSO 큐에 적재된다. master clear 의 개시 신호는 CSO 가 받는
+    /// master 의 `context.threshold` 하나뿐이다(CSO 는 구독 금지 — 라우터가 유일한 수신 경로). 종전에는 전역 상한이
+    /// 나이순으로만 배차해, 부트 유예 종료 때 쌓인 경보 폭발이 상한을 채우면 master 임계 신호가 약 1시간 보류됐다
+    /// (그동안 master 는 60% 를 넘어 계속 쌓인다 — 무clear).
+    /// 실패 방향(폭주 봉인): 에지 사실도 무한이 아니다 — 예약분 [`EDGE_RESERVE`] 을 더한 상한에서 멈추고(보류), 일반
+    /// 경보는 여전히 [`HOURLY_CAP`] 에서 멈춘다. 쿨다운·큐 보호선도 그대로다.
+    #[test]
+    fn drill_edge_facts_route_even_when_the_hourly_cap_is_full() {
+        let daemon = drill_daemon("edge-cap");
+        let cso = seat(&daemon, "cso");
+        let t0 = after_grace(&daemon);
+        // ① 일반 경보가 상한을 채우고 두 건이 더 보류된다(부트 유예 종료 폭발).
+        for i in 0..(HOURLY_CAP as u64 + 2) {
+            handle_event(&daemon, &ev("health.alert", Some(700 + i), json!({"rule": "burst"})), t0);
+        }
+        assert_eq!(depth(&daemon, cso), HOURLY_CAP);
+        assert_eq!(pending_len(&daemon), 2);
+        // ② master 가 60% 를 넘었다 — 상한이 찼어도 곧바로 CSO 큐에 닿아야 한다.
+        let master = ev("context.threshold", Some(42),
+                        json!({"role": "master", "context_pct": 70, "threshold": 60}));
+        handle_event(&daemon, &master, t0);
+        let texts = |d: &Arc<Daemon>| -> Vec<String> {
+            d.get_surface(cso).unwrap().pending_queue.lock().unwrap().iter().map(|e| e.text.clone()).collect()
+        };
+        assert!(
+            texts(&daemon).iter().any(|t| t.contains("context.threshold") && t.contains("surface:42")),
+            "상한 포화 중 master 의 context.threshold 가 CSO 큐에 닿지 않았다(무clear 경로)"
+        );
+        assert!(
+            !daemon.alert_route.lock().unwrap().pending.keys().any(|k| k.name == "context.threshold"),
+            "에지 1회 사실이 상한 보류에 갇혔다"
+        );
+        // 좌석 종료 사실도 같다(에지 1회).
+        handle_event(&daemon, &ev("surface.exited", Some(43), json!({"role": "worker", "agent": "claude"})), t0);
+        assert!(texts(&daemon).iter().any(|t| t.contains("surface.exited")), "상한 포화 중 좌석 종료 사실이 보류됐다");
+        // 일반 경보는 여전히 상한에서 멈춘다(보류 2건 그대로 · 새 일반 경보도 보류).
+        handle_event(&daemon, &ev("health.alert", Some(799), json!({"rule": "late"})), t0);
+        let general_held = daemon
+            .alert_route
+            .lock()
+            .unwrap()
+            .pending
+            .keys()
+            .filter(|k| k.name == "health.alert")
+            .count();
+        assert_eq!(general_held, 3, "에지 예약분을 일반 경보가 가져갔다");
+        // ③ 에지 사실도 예약분까지만 — 넘치면 보류한다(폭주 봉인).
+        for i in 0..(EDGE_RESERVE as u64 + 5) {
+            handle_event(
+                &daemon,
+                &ev("context.threshold", Some(900 + i), json!({"role": "worker", "context_pct": 61, "threshold": 60})),
+                t0,
+            );
+        }
+        assert_eq!(depth(&daemon, cso), HOURLY_CAP + EDGE_RESERVE, "에지 예약분 상한이 새었다");
+        assert!(
+            daemon.alert_route.lock().unwrap().pending.keys().any(|k| k.name == "context.threshold"),
+            "예약분을 넘긴 에지 사실이 버려졌다(보류여야 한다)"
         );
     }
 
@@ -6949,9 +7039,14 @@ mod reflect_a13 {
             .map(|(k, p)| (k.clone(), p.clone()))
             .collect();
         v.sort_by(|a, b| {
-            a.1.first_mono
-                .partial_cmp(&b.1.first_mono)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            // ★fatal-fix P1: 등급(에지 1회 사실) 먼저 — 그 안에서 종전 나이순.
+            RouteState::fold_rank(&b.0)
+                .cmp(&RouteState::fold_rank(&a.0))
+                .then_with(|| {
+                    a.1.first_mono
+                        .partial_cmp(&b.1.first_mono)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| {
                     a.1.first_seen
                         .partial_cmp(&b.1.first_seen)
@@ -6981,8 +7076,14 @@ mod reflect_a13 {
                     1 => (n - i) as f64,             // 역순
                     _ => ((n - i) / 7) as f64 * 7.0, // 동률 무더기
                 };
+                // 등급이 섞인 정의역(fatal-fix P1 — 에지 1회 사실이 먼저 뽑혀야 한다)
+                let name = match i % 11 {
+                    0 => "context.threshold",
+                    5 => "surface.exited",
+                    _ => "health.alert",
+                };
                 st.pending.insert(
-                    AlertKey::with_detail("health.alert", Some(i as u64 % 13), Some(format!("r{i:04}"))),
+                    AlertKey::with_detail(name, Some(i as u64 % 13), Some(format!("r{i:04}"))),
                     // 10건에 1건은 인계 중 — 후보에서 빠져야 한다.
                     p(mono, 1_000.0 + (i % 5) as f64, i % 10 == 3),
                 );

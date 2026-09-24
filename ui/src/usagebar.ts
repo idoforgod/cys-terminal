@@ -301,6 +301,14 @@ function sourceErrorText(code: string): { short: string; detail: string } {
         "agy(1.2 이후) 언어 서버가 쿼터 조회에 CSRF 토큰을 요구합니다. cys 는 그 토큰을 읽지 않습니다 — " +
         "agy 설정의 상태줄(statusLine)을 cys 로 연결하면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
     };
+  // fatal-fix W5: RPC 경로가 구조적으로 없는 플랫폼(Windows — 언어 서버 포트를 찾을 길이 없다) — 값을 얻는 길을 가리킨다.
+  if (code === "agy_statusline_required")
+    return {
+      short: "agy 상태줄 연결 필요",
+      detail:
+        "이 컴퓨터(Windows)에서는 cys 가 agy 내부 서버에서 쿼터를 읽을 수 없습니다 — " +
+        "agy 설정의 상태줄(statusLine)을 cys 로 연결하면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
+    };
   if (code === "agy_no_quota") return { short: "agy 응답에 쿼터 없음", detail: "agy 가 답했지만 Gemini 쿼터 항목이 없습니다." };
   if (code === "agy_unreachable") return { short: "agy 응답 없음", detail: "agy 언어 서버 포트가 응답하지 않습니다." };
   if (code === "agy_no_port") return { short: "agy 포트 못 찾음", detail: "cys 창의 agy 가 연 포트를 찾지 못했습니다." };
