@@ -524,7 +524,7 @@ class T20FormationDoesNotHoldCallerPipes(Base):
     편성 결판 알림의 부서장 착석 지켜보기까지 더하면 최대 +10분) 호출자가 돌아오지 못했다 — 대표 턴이 그동안 붙들린다
     (회신 적체 · 오너 절대 규칙 '턴 안 장시간 대기 금지' 위반 · Bash 도구 제한시간 초과 = 거짓 실패 보고)."""
 
-    HOLD_S = 25
+    HOLD_S = 45   # 판정 문턱 = HOLD_S-5(40s) · 수정 전은 ≥HOLD_S+생성 시간 — 느린 CI 에서도 수정 후(생성 ~15s)와 갈린다
 
     def _stub(self):
         b = os.path.join(self.home, ".cys", "pack", "bin")
