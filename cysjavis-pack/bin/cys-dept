@@ -167,6 +167,27 @@ formation_lane_pack(){  # $1=name $2=sock
   fi
   return 0
 }
+# ★(0.14.42 fatal-fix X-R4-1) 대화 승인 토큰 경로의 **세션 분리**. 토큰 경로(`create --team-token`)는 이 스크립트가 대표의
+#   Claude Code Bash 도구 **안에서** 돈다 — 그 도구 셸의 프로세스 그룹에 남은 자식(`nohup … &` · `( … ) &`)은 도구 제한시간
+#   초과 → 백그라운드 전환 → 태스크 종료(TaskStop·세션 종료) 때 그룹째 죽는다(실측: nohup 자식도 사라짐). 부서 cysd 가
+#   죽으면 새 팀 pane 전멸(④) · 편성 자식이 죽으면 팀원 자리 0. 그래서 **토큰 경로에서만** 새 세션(setsid)에서 exec 한다
+#   (pid 불변 — `$!`·wait·회수 그대로). GUI·CSO 경로는 종전 그대로(바이트 동일 거동). Windows(MSYS)는 제외 — 대화 승인이
+#   열리지 않고(javis_teamtoken platform_gui_only) Windows 파이썬의 exec 는 새 프로세스라 `$!` 회수가 깨진다.
+#   새 세션 실패(이미 그룹 리더 등)는 무시하고 그대로 exec — 종전과 같은 그룹에 남을 뿐(새 실패 0).
+_CYS_SETSID_PY='import os, sys
+try:
+    os.setsid()
+except Exception:
+    pass
+os.execvp(sys.argv[1], sys.argv[1:])'
+_cys_detach_ok(){
+  [ "${_CYS_TT_OK:-}" = "1" ] || return 1
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) return 1 ;; esac
+  command -v python3 >/dev/null 2>&1
+}
+_cys_fm_python(){   # 편성 자식 python — 토큰 경로면 새 세션
+  if _cys_detach_ok; then python3 -c "$_CYS_SETSID_PY" python3 "$@"; else python3 "$@"; fi
+}
 formation_ensure_async(){
   local name="$1" sock="$2" cwd="${3:-}" fm log logdir lp lpnote
   fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
@@ -183,16 +204,16 @@ formation_ensure_async(){
   if [ -n "$lp" ]; then
     lpnote="팩=부서 팩($lp)"
     if [ -n "$cwd" ]; then
-      ( CYS_PACK_DIR="$lp" python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
     else
-      ( CYS_PACK_DIR="$lp" python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
     fi
   else
     lpnote="팩=종전 팩(${CYS_PACK_DIR:-$PACK_DEFAULT} — 부서 팩 $(dept_pack "$name") 설치 전 또는 호출자 팩 kill-switch)"
     if [ -n "$cwd" ]; then
-      ( python3 "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
     else
-      ( python3 "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
     fi
   fi
   disown 2>/dev/null || true
@@ -316,6 +337,28 @@ cleanup_owned_dept_spawn(){
   _dept_spawn_pid=""
 }
 
+# ★(0.14.42 fatal-fix R4-N1) 이번 호출이 방금 만든 부서의 생성 실패 회수(teardown). stdout 버림 · rc = down 결과.
+#   대화 승인 토큰 경로(`create --team-token` — 대표 master 좌석에서 돈다)는 자식 `"$0" down` 이 **단일소유 가드**(역할=master
+#   → exit 7)에 막혀 정리가 무음 실패했다(>/dev/null) — 고아 cysd 와 그 제안 id 에 묶인 등재가 남고, 이후 GUI [만들기]·재승인이
+#   allocate 멱등 재사용으로 **좌석 0 인 좀비 팀**을 '생성 성공'으로 받았다(첫 팀 온보딩 경로). 토큰 경로는 down 본체를
+#   **같은 프로세스 안**(서브셸)에서 부른다 — 역할 게이트를 다시 거치지 않는 이유는 이 프로세스가 이미 데몬 토큰 관문을
+#   통과해 **이 부서를 만든 주체**이기 때문이다(위조 가능한 argv/env 표식 없음: `_CYS_TT_OK` 는 진입 시 unset 되는 비상속 셸 변수).
+#   down 이 identify 로 못 죽인 이번 호출의 자식도 회수한다(cleanup_owned_dept_spawn — 살아 있을 때만).
+#   GUI·CSO 경로는 종전 그대로 `"$0" down`(바이트 동일 거동).
+dept_teardown_owned(){   # $1=name
+  if [ "${_CYS_TT_OK:-}" = "1" ]; then
+    local _dto_e=0 _dto_rc=0
+    case $- in *e*) _dto_e=1 ;; esac
+    set +e
+    ( set -e; down_dept down "$1" ) >/dev/null
+    _dto_rc=$?
+    cleanup_owned_dept_spawn
+    [ "$_dto_e" = 1 ] && set -e
+    return "$_dto_rc"
+  fi
+  "$0" down "$1" >/dev/null
+}
+
 # reserve=신규 예약만 회수, keep=기존 REUSE_DEAD 예약 보존, down=기동 후 종전 teardown.
 # 정리 자체가 rc 10을 만나도 owned PID는 회수하고 원본 레지스트리는 그대로 둔다.
 dept_creation_failed(){
@@ -323,7 +366,7 @@ dept_creation_failed(){
   if [ "$rc" = 10 ]; then cleanup_owned_dept_spawn; exit 10; fi
   case "$mode" in
     reserve) reg_remove "$name" || cleanup_rc=$? ;;
-    down) "$0" down "$name" >/dev/null || cleanup_rc=$? ;;
+    down) dept_teardown_owned "$name" || cleanup_rc=$? ;;
   esac
   if [ "$cleanup_rc" = 10 ]; then cleanup_owned_dept_spawn; exit 10; fi
   # ready 실패 등 스폰 직후의 실패도 예약 회수만으로 프로세스를 남기지 않는다.
@@ -1122,6 +1165,8 @@ PY
 #   빈 셸(agent=None)·조회불가는 skip(빈 zsh 오해석 각성핑 차단 — WP-11 정합). best-effort(부서 lifecycle 불파괴).
 ceo_reinject_master(){
   local why="${1:-directive}" has_agent
+  # ★fatal-fix R4-N2·F2: 대화 승인 토큰 경로(대표 자신의 Bash 도구 안)에서는 강제 재주입을 하지 않는다(승격·강등 공통).
+  if [ "${_CYS_TT_OK:-}" = "1" ]; then ceo_reinject_deferred "$why"; return 0; fi
   has_agent=$(env -u CYS_SOCKET "$CYS" status --json 2>/dev/null | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
@@ -1136,6 +1181,24 @@ sys.exit(3)' 2>/dev/null) || true
       || echo "[cys-dept] WARN: 원본 master 라이브 재주입($why) 미확정 — read-screen 점검" >&2
   else
     echo "[cys-dept] 원본 master 재주입($why) skip: 실 agent 없음(빈 셸)·조회불가 — 각성핑 미발사(WP-11 정합)" >&2
+  fi
+}
+# ★(0.14.42 fatal-fix R4-N2 · F2) 대화 승인 토큰 경로의 승격 재주입 **보류**.
+#   토큰 경로에서는 이 스크립트를 부른 것이 바로 원본 master(대표)의 Claude Code Bash 도구다 — 강제 재주입(`cys reinject
+#   --role master` → inject_text · authoritative · 바쁨 검사 없음)이 CEO 합성 지침 전문(약 165KB)을 **§4-A-2 ②~⑤ 를 집행
+#   중인 그 pane** 에 붙여 넣고 Return 을 보낸다(샌드박스 재현: 명령 시작 +24s 붙여넣기 · 명령 종료 전 제출). 대표가 그것을
+#   새 부트 지시로 읽어 ③~⑤(각성 지시·allow·첫 과제·보고)를 빠뜨리거나 부트를 다시 돌릴 수 있다(③ · R2 컨텍스트 급증).
+#   그래서 즉시 재주입하지 않고 **큐 배달 포인터 1줄**(`cys send --queued` — 대상이 조용해진 뒤 = 이 턴이 끝난 뒤 배달)을
+#   보내 대표가 절차를 마친 뒤 스스로 1회 재주입하게 한다. 포인터 배달 실패는 stderr 로 같은 처방을 남긴다(도구 출력 =
+#   대표가 읽는다). GUI 경로(오너 클릭 · 대표 대개 유휴)는 종전 그대로 즉시 재주입한다. 1회성(승격은 첫 팀 1회)이라 폭주 없음.
+ceo_reinject_deferred(){
+  local why="${1:-directive}" msg
+  msg="[지침 교체 · cys-dept] 이 좌석(대표)의 지침 파일이 바뀌었다($why). 대화 승인 절차(§4-A-2)를 마쳤으면 \`cys reinject --role master\` 를 1회 실행해 새 지침을 받는다 — 부트 재실행이 아니다(§0-A · 재주입은 이 1회뿐)."
+  echo "[cys-dept] 원본 master 재주입($why) 보류 — 대화 승인 경로(대표 턴 도중 강제 주입 금지): 이 턴을 마친 뒤 \`cys reinject --role master\` 1회" >&2
+  if env -u CYS_SOCKET "$CYS" send --queued --to master "$msg" >/dev/null 2>&1; then
+    echo "[cys-dept] 재주입 포인터 1줄을 큐 배달로 예약(대표가 조용해진 뒤)" >&2
+  else
+    echo "[cys-dept] WARN: 재주입 포인터 큐 배달 실패 — 대표는 이 턴을 마친 뒤 \`cys reinject --role master\` 를 직접 1회 실행하라" >&2
   fi
 }
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
@@ -1321,7 +1384,7 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   ceo_notices_close   # ★U10: 사유가 소멸한 '보류/대기' 알림을 닫는다(비허가 결정 · fail-open)
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
-  ceo_reinject_master "CEO 승격"
+  ceo_reinject_master "CEO 승격"   # ★fatal-fix R4-N2·F2: 대화 승인 경로면 함수 안에서 보류(큐 배달 포인터)
   if [ "$_auto" -eq 1 ]; then
     # ★자동 승격 직후 비대기 알림(제품 기본 정책). 승격 차단 금지(fail-open).
     #   ★리뷰어1 F4: 종전 `|| true`는 push 실패(데몬 미기동 등)를 삼켜 오너가 정체성 변경을 통지받지 못했다 →
@@ -2119,7 +2182,12 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
+      if _cys_detach_ok; then
+        # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      else
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      fi
       _dept_spawn_pid=$!
       ready "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
     fi
@@ -2129,7 +2197,7 @@ PY
     # ★Fix1' 계정격리: agents.json CLAUDE_CONFIG_DIR 을 fork dir로 치환(F1). 실패=비격리 → fail-closed teardown.
     if ! seed_agents_account "$pack" "$acctdir"; then
       echo "[cys-dept] ERROR: $name agents.json 계정시드 실패 — fail-closed: 부트 중단·teardown" >&2
-      "$0" down "$name" >/dev/null || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }; trap - EXIT; exit 6
+      dept_teardown_owned "$name" || { _rc=$?; [ "$_rc" != 10 ] || exit 10; }; trap - EXIT; exit 6   # ★fatal-fix R4-N1: 토큰 경로는 in-process
     fi
     # 시드 실패 뒤 down의 판독도 실패할 수 있다. 준비가 끝난 뒤 승격해 rc 10에 CEO 변경을 남기지 않는다.
     ceo_promote 1>&2   # 승격 메시지는 stderr — allocate stdout은 name만(파서 오염 차단)
@@ -2207,6 +2275,55 @@ PY
   team_token_settle failed "$_ttc_rc"
   echo "[cys-dept] 팀 생성 실패(exit $_ttc_rc) — 제안은 그대로 남아 있습니다. 토큰은 소비됐으므로 다시 만들려면 오너에게 다시 여쭙는다(새 질문 → 새 토큰)" >&2
   return "$_ttc_rc"
+}
+
+# ★(0.14.42 fatal-fix R4-N1) `down` 본체를 함수로 뗀다 — `down)` 갈래는 종전과 바이트 동일한 동작(이 함수 호출)이다.
+#   토큰 경로의 생성 실패 회수(dept_teardown_owned)가 역할 게이트를 다시 돌지 않고 **같은 프로세스 안**에서 부른다.
+#   인자는 스크립트 인자 모양 그대로다: $1=down · $2..=<name> [--purge-state].
+down_dept(){
+  # ★기능2 인자 파싱 하드닝: 플래그를 위치 무관 파싱하고 미지 플래그는 usage exit한다. 종전
+  # `name="${2:?}"; $3 무시`는 오순서(`down --purge-state dept-3`)에서 "--purge-state"를 부서명으로
+  # 흡수해 유령 부서를 down하는 무음 사고가 났다. 2인자 plain 호출(down <name>)은 거동 불변.
+  name=""; purge_state=0
+  shift  # "down" 제거
+  for _a in "$@"; do
+    case "$_a" in
+      --purge-state) purge_state=1 ;;
+      --*) echo "[cys-dept] down: 미지 플래그 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2 ;;
+      *) if [ -z "$name" ]; then name="$_a"; else echo "[cys-dept] down: 인자 과다 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2; fi ;;
+    esac
+  done
+  [ -n "$name" ] || { echo "usage: cys-dept down <name> [--purge-state]" >&2; exit 2; }
+  # ★P1: 판독 실패를 kill/묘비/CEO 강등 뒤에 발견하지 않는다(읽기만·실패 exit 10).
+  reg_count >/dev/null || exit $?
+  sock="$(dept_sock "$name")"
+  # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
+  # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
+  pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+  # orphan 방지(오너 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
+  if [ -n "${pid:-}" ]; then
+    graceful_kill "$pid"
+  fi
+  rm -f "$sock" "$sock.lock" 2>/dev/null || true
+  # ★R7(적대검증 W1): 묘비를 reg_remove **앞**에 — set -e 하에서 reg_remove 비0 종료
+  # (disk-full·권한)가 묘비를 스킵하면 '등재+미묘비' 부활 창. 의도-선기록 순서(GUI 제1행위)와
+  # 통일. dept_tombstone은 항상 0 반환(:49-58)이라 set -e 안전.
+  dept_tombstone "$name"
+  # ★G3 축1(결함2 치유층): 공용/개인 settings 의 이 부서 훅 잔존 정리 — 죽은 경로 훅은 매 Claude
+  # 세션 "No such file" 실패 벡터다. best-effort(dept_tombstone 규약과 동형 — 실패가 teardown 을
+  # 깨지 않는다 · 구 바이너리엔 없는 서브커맨드라 실패 허용). 제거 엔진은 hooks-prune 단일.
+  env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
+    || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
+  reg_remove "$name"
+  _dept_count="$(reg_count)" || exit $?
+  [ "$_dept_count" = "0" ] && ceo_demote || true
+  # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
+  # 묘비는 영구 존치(위 dept_tombstone) — purge는 재발견 경로(state dir)를 끊어 부활을 봉인한다.
+  if [ "$purge_state" = 1 ]; then
+    dept_purge_state "$name" || { echo "[cys-dept] $name state 격리 실패(위 사유·teardown은 완료)" >&2; exit 3; }
+  fi
+  _dept_count="$(reg_count)" || exit $?
+  echo "[cys-dept] $name 종료·정리 완료. 부서 수=$_dept_count"
 }
 
 case "$cmd" in
@@ -2410,49 +2527,7 @@ PY
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
-    # ★기능2 인자 파싱 하드닝: 플래그를 위치 무관 파싱하고 미지 플래그는 usage exit한다. 종전
-    # `name="${2:?}"; $3 무시`는 오순서(`down --purge-state dept-3`)에서 "--purge-state"를 부서명으로
-    # 흡수해 유령 부서를 down하는 무음 사고가 났다. 2인자 plain 호출(down <name>)은 거동 불변.
-    name=""; purge_state=0
-    shift  # "down" 제거
-    for _a in "$@"; do
-      case "$_a" in
-        --purge-state) purge_state=1 ;;
-        --*) echo "[cys-dept] down: 미지 플래그 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2 ;;
-        *) if [ -z "$name" ]; then name="$_a"; else echo "[cys-dept] down: 인자 과다 '"'"'$_a'"'"' (usage: cys-dept down <name> [--purge-state])" >&2; exit 2; fi ;;
-      esac
-    done
-    [ -n "$name" ] || { echo "usage: cys-dept down <name> [--purge-state]" >&2; exit 2; }
-    # ★P1: 판독 실패를 kill/묘비/CEO 강등 뒤에 발견하지 않는다(읽기만·실패 exit 10).
-    reg_count >/dev/null || exit $?
-    sock="$(dept_sock "$name")"
-    # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
-    # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
-    pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
-    # orphan 방지(오너 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
-    if [ -n "${pid:-}" ]; then
-      graceful_kill "$pid"
-    fi
-    rm -f "$sock" "$sock.lock" 2>/dev/null || true
-    # ★R7(적대검증 W1): 묘비를 reg_remove **앞**에 — set -e 하에서 reg_remove 비0 종료
-    # (disk-full·권한)가 묘비를 스킵하면 '등재+미묘비' 부활 창. 의도-선기록 순서(GUI 제1행위)와
-    # 통일. dept_tombstone은 항상 0 반환(:49-58)이라 set -e 안전.
-    dept_tombstone "$name"
-    # ★G3 축1(결함2 치유층): 공용/개인 settings 의 이 부서 훅 잔존 정리 — 죽은 경로 훅은 매 Claude
-    # 세션 "No such file" 실패 벡터다. best-effort(dept_tombstone 규약과 동형 — 실패가 teardown 을
-    # 깨지 않는다 · 구 바이너리엔 없는 서브커맨드라 실패 허용). 제거 엔진은 hooks-prune 단일.
-    env -u CYS_SOCKET "$CYS" hooks-prune --pack-dir "$(dept_pack "$name")" >/dev/null 2>&1 \
-      || echo "[cys-dept] WARN: $name 훅 잔존 정리 미확정(hooks-prune 실패/구 바이너리) — cys doctor 로 확인" >&2
-    reg_remove "$name"
-    _dept_count="$(reg_count)" || exit $?
-    [ "$_dept_count" = "0" ] && ceo_demote || true
-    # ★기능2: --purge-state면 기본 teardown 체인 뒤 state 디렉토리(transcripts.db) 격리(mv→trash).
-    # 묘비는 영구 존치(위 dept_tombstone) — purge는 재발견 경로(state dir)를 끊어 부활을 봉인한다.
-    if [ "$purge_state" = 1 ]; then
-      dept_purge_state "$name" || { echo "[cys-dept] $name state 격리 실패(위 사유·teardown은 완료)" >&2; exit 3; }
-    fi
-    _dept_count="$(reg_count)" || exit $?
-    echo "[cys-dept] $name 종료·정리 완료. 부서 수=$_dept_count"
+    down_dept "$@"
     ;;
   down-sock)
     # socket 기준 teardown — ws rename으로 name↔socket이 끊겨도 정확히 종료(레지스트리 역인덱스).

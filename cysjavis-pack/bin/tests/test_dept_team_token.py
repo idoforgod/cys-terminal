@@ -82,7 +82,8 @@ env | grep -q "%(token)s" && leak=yes
 printf 'cys %%s NA=%%s LEAK=%%s\n' "$*" "${CYS_NO_AUTOSTART-unset}" "$leak" >> "%(log)s"
 case "$1" in
   ping) [ -e "$CYS_SOCKET" ] && exit 0 || exit 1 ;;
-  status|identify) exit 1 ;;
+  status) [ -n "${STUB_STATUS_JSON-}" ] && { printf '%%s\n' "$STUB_STATUS_JSON"; exit 0; }; exit 1 ;;
+  identify) exit 1 ;;
   team-token)
     case "$2" in
       consume) printf '%%s\n' "${TT_CONSUME_OUT-}"; exit "${TT_CONSUME_RC:-1}" ;;
@@ -103,8 +104,9 @@ def make_home(tmp):
     os.makedirs(os.path.join(home, ".cys"), exist_ok=True)
     log = os.path.join(tmp, "calls.log")
     _write_exec(os.path.join(bindir, "cys"), MOCK_CYS % {"log": log, "token": TOKEN})
+    # 목 cysd — 스폰 사실과 **자기 프로세스 그룹**(fatal-fix X-R4-1: 토큰 경로는 새 세션)을 남긴다.
     _write_exec(os.path.join(bindir, "cysd"),
-                '#!/bin/sh\necho "cysd spawn $CYS_SOCKET" >> "%(log)s"\n'
+                '#!/bin/sh\necho "cysd spawn $CYS_SOCKET pgid=$(ps -o pgid= -p $$ | tr -d \' \') pid=$$" >> "%(log)s"\n'
                 'mkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n' % {"log": log})
     pack = os.path.join(home, ".cys", "pack")
     os.makedirs(pack, exist_ok=True)
@@ -123,7 +125,7 @@ def make_env(home, role="master"):
     for k in ("CYS_ROLE", "CYS_SOCKET", "CYS_PACK_DIR", "CYS_NO_AUTOSTART", "CYS_DEPT_ROTATE",
               "CYS_DEPT_CATALOG", "CYS_DEPT_DEFAULT_ACCOUNT", "CYS_PRIMARY_ACCOUNT", "CYS_DEPT_CWD",
               "CYS_DEPT_CAP", "CYS_SURFACE_ID", "TT_CONSUME_OUT", "TT_CONSUME_RC", "TT_INSPECT_OUT",
-              "TT_INSPECT_RC", "TT_SETTLE_OUT", "TT_SETTLE_RC"):
+              "TT_INSPECT_RC", "TT_SETTLE_OUT", "TT_SETTLE_RC", "STUB_STATUS_JSON"):
         env.pop(k, None)
     for k in list(env):
         if k.startswith("_CYS_TT_"):
@@ -369,6 +371,90 @@ class T14CsoSeat(Base):
                                      TT_CONSUME_OUT=refusal("token_unknown"), TT_CONSUME_RC=1)
         self.assertEqual(rc, 7, "CSO 좌석의 위조 토큰이 통과했다: rc=%s" % rc)
         self.assert_no_side_effects()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 치명위험 수정 핀(0.14.42 fatal-fix) — 각 핀은 수정 전 FAIL · 수정 후 PASS 로 확인했다.
+# ══════════════════════════════════════════════════════════════════════════════
+def _promotable(home):
+    """부트된 기계의 첫 팀(자동 CEO 승격 조건: 부트 표식 ∧ .pre-ceo 부재) + 실 agent 좌석을 흉내 낸다."""
+    cys_dir = os.path.join(home, ".cys")
+    d = os.path.join(cys_dir, "pack", "directives")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+        f.write("# MASTER\n\n본문\n")
+    with open(os.path.join(d, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
+        f.write("# CEO 머리글\n\n# MASTER\n\n본문\n")
+    with open(os.path.join(cys_dir, ".master-bootstrapped"), "w") as f:
+        f.write("ok\n")
+    return json.dumps({"surfaces": [{"id": 22, "role": "master", "agent": "claude", "exited": False}]})
+
+
+class T16TokenTeardownAfterSpawn(Base):
+    """R4-N1: 토큰 경로(master 좌석)에서 데몬 스폰 뒤 실패하면 정리 자식 `"$0" down` 이 단일소유 가드(exit 7)에 막혀
+    고아 등재가 남았다 — 이후 같은 제안의 GUI [만들기]·재승인이 멱등 재사용으로 **좌석 0 인 좀비 팀**을 '생성 성공'으로 받았다."""
+
+    def test_seed_failure_after_spawn_leaves_no_registry_entry(self):
+        with open(os.path.join(self.home, ".cys", "pack", "agents.json"), "w", encoding="utf-8") as f:
+            json.dump({"claude": {"cmd": "claude"}}, f)          # CLAUDE_CONFIG_DIR 없음 → 계정 시드 실패(스폰 뒤)
+        rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0)
+        self.assertEqual(rc, 6, "시드 실패 rc 가 6 이 아니다: rc=%s err=%s" % (rc, err[-800:]))
+        self.assertTrue(any(c.startswith("cysd spawn") for c in self.calls()), "전제: 데몬 스폰 뒤 실패여야 한다")
+        self.assertNotIn("부서 lifecycle mutation은 CSO/GUI 전용", err, "정리가 단일소유 가드에 막혔다(토큰 경로 in-process 정리 아님)")
+        self.assertEqual(read_reg(self.env), {}, "스폰 뒤 실패인데 등재가 남았다(좀비 팀 재사용 씨앗)")
+        settles = self.tt_calls("settle")
+        self.assertTrue(settles and "--outcome failed" in settles[-1], "실패 기록(settle failed)이 없다: %r" % settles)
+
+
+class T17TokenPromotionDeferred(Base):
+    """R4-N2 · F2: 첫 팀을 토큰 경로로 만들면 CEO 승격 재주입(강제 · 약 165KB)이 **명령을 실행 중인 대표 pane** 에 떨어졌다.
+    토큰 경로는 재주입을 미루고 큐 배달 포인터 1줄만 보낸다. GUI 경로(오너 클릭 · 대표 대개 유휴)는 종전 그대로 즉시 재주입."""
+
+    def test_token_path_defers_reinject_and_gui_path_keeps_it(self):
+        status = _promotable(self.home)
+        rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0,
+                                     STUB_STATUS_JSON=status)
+        self.assertEqual(rc, 0, "토큰 경로 생성 실패: rc=%s err=%s" % (rc, err[-800:]))
+        self.assertIn("CEO 승격", err, "전제: 승격이 일어나야 한다")
+        calls = self.calls()
+        self.assertFalse([c for c in calls if c.startswith("cys reinject")],
+                         "토큰 경로가 대표 pane 에 즉시 강제 재주입했다: %r" % [c for c in calls if "reinject" in c])
+        self.assertTrue([c for c in calls if c.startswith("cys send") and "--queued" in c and "reinject" in c],
+                        "재주입 포인터 큐 배달이 없다: %r" % [c for c in calls if c.startswith("cys send")])
+        # 대조 — GUI 경로(역할 없음 · allocate --team-spec-b64): 종전 그대로 즉시 재주입(바이트 동일 거동)
+        tmp2 = tempfile.mkdtemp(prefix="p5-dept-tt-gui-")
+        try:
+            home2, log2 = make_home(tmp2)
+            status2 = _promotable(home2)
+            env2 = make_env(home2, role=None)
+            env2["STUB_STATUS_JSON"] = status2
+            r = subprocess.run(["bash", DEPT, "allocate", "--team-spec-b64", spec_b64(good_spec())],
+                               capture_output=True, text=True, encoding="utf-8", env=env2, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            with open(log2, encoding="utf-8") as f:
+                calls2 = f.read().splitlines()
+            self.assertTrue([c for c in calls2 if c.startswith("cys reinject --role master")],
+                            "GUI 경로의 즉시 재주입이 사라졌다(회귀): %r" % calls2[-12:])
+            gui_spawn = [c for c in calls2 if c.startswith("cysd spawn")]
+            self.assertTrue(gui_spawn and ("pgid=%d " % os.getpgrp()) in gui_spawn[0],
+                            "GUI 경로 cysd 의 프로세스 그룹이 바뀌었다(종전 거동 유지 대상): %r" % gui_spawn)
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+
+class T18TokenDaemonDetached(Base):
+    """X-R4-1: 토큰 경로 cys-dept 는 대표의 Claude Code Bash 도구 안에서 돈다 — 도구 제한시간 초과 → 백그라운드 전환 →
+    태스크 종료 시 그 셸의 프로세스 그룹째 죽는다. 부서 cysd 는 호출자 그룹 밖(새 세션)에서 떠야 한다."""
+
+    def test_token_path_cysd_runs_in_its_own_session(self):
+        rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0)
+        self.assertEqual(rc, 0, err[-800:])
+        spawn = [c for c in self.calls() if c.startswith("cysd spawn")]
+        self.assertEqual(len(spawn), 1, spawn)
+        pg = [t for t in spawn[0].split() if t.startswith("pgid=")]
+        pid = [t for t in spawn[0].split() if t.startswith("pid=")]
+        self.assertTrue(pg and pid and pg[0][5:] == pid[0][4:] and pg[0][5:] != str(os.getpgrp()),
+                        "토큰 경로 cysd 가 호출자 프로세스 그룹에 남았다: %s (호출자 pgid=%d)" % (spawn[0], os.getpgrp()))
 
 
 if __name__ == "__main__":
