@@ -1,3 +1,19 @@
+/* ★층서(z-index) 토큰 표 — 문서 루트에 뜨는 층은 **여기 한 곳**에서 이름으로 정한다(2026-09-23 수리).
+   결함의 형태는 "두 값이 서로를 모른 채 따로 정해졌다"였다: 확인 창 1000·토스트 99 가 Control Center 1500
+   뒤에 깔려, 승인 Feed 카드의 [확인 창 열기]가 '무반응'으로 보였다(창은 열려 있었다). 새 층은 숫자를 새로
+   고르지 말고 이 표에서 **관계를 보고** 끼운다. 순서·참조는 stacking.test.ts 가 못박는다(값이 아니라 관계).
+   패널 자기 쌓임 맥락 안의 국소 순서(#cc-header·#cc-tabs 2 등)는 이 표의 대상이 아니다. */
+:root {
+  --z-pane-overlay:      5;  /* 작업 영역 안의 겹침 — 분할선 히트존(.divider)·사이드바 폭 핸들(#wsbar-drag) */
+  --z-ctx-menu:       1000;  /* 컨텍스트 메뉴·팝오버(#ctx-menu·#theme-pop) */
+  --z-drop-indicator: 1200;  /* 사이드바 순서 바꾸기 삽입선(pointer-events:none) */
+  --z-cc-panel:       1500;  /* Control Center 풀 패널(불투명 · 상단바 아래 전체 덮개) */
+  --z-palette:        1600;  /* ⌘K 팔레트 */
+  --z-modal:          1700;  /* 확인·입력·업데이트·피드백 창(.modal-overlay) — 모든 패널 위 */
+  --z-toast:          1800;  /* 안내·실패 토스트 — 확인 창보다도 위(확인 창이 떠 있으면 위로 비켜 선다 — #toasts 회피 규칙) */
+  --z-drop-hint:      1999;  /* pane 드롭 위치 힌트(pointer-events:none) — 고스트 바로 아래 */
+  --z-drag-ghost:     2000;  /* 드래그 미리보기(pointer-events:none · 일시) */
+}
 :root {
   --bg: #0d1117;
   --bar: #161b22;
@@ -74,7 +90,7 @@ html, body {
 }
 #wsbar-drag {
   flex: none; width: 5px; cursor: col-resize; margin-left: -2px;
-  background: transparent; z-index: 5;
+  background: transparent; z-index: var(--z-pane-overlay);
 }
 #wsbar-drag:hover, body.wsbar-resizing #wsbar-drag { background: rgba(88,166,255,.35); }
 body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select: none; }
@@ -259,12 +275,12 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-tab.ws-dragging, .ws-group.ws-dragging { opacity: .4; }
 .ws-drop-indicator {
   position: fixed; height: 2px; background: var(--accent);
-  border-radius: 1px; z-index: 1200; pointer-events: none; /* 히트테스트 방해 차단 */
+  border-radius: 1px; z-index: var(--z-drop-indicator); pointer-events: none; /* 히트테스트 방해 차단 */
 }
 body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: none; }
 
 #ctx-menu {
-  position: fixed; z-index: 1000; min-width: 120px;
+  position: fixed; z-index: var(--z-ctx-menu); min-width: 120px;
   background: var(--bar); border: 1px solid var(--border); border-radius: 6px;
   padding: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, .4);
   font-size: 12px;
@@ -277,7 +293,7 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 
 /* 배경 테마 팝오버 — btn-theme 하단. ctx-menu 톤(--bar/--border) 재사용. */
 #theme-pop {
-  position: fixed; z-index: 1000;
+  position: fixed; z-index: var(--z-ctx-menu);
   display: flex; flex-direction: column; gap: 8px;
   padding: 10px; min-width: 160px;
   background: var(--bar); border: 1px solid var(--border); border-radius: 8px;
@@ -316,7 +332,7 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
      거슬리지 않게. hover/drag 시 accent로 드러나 리사이즈 조작성 유지. (오너 2026-07-02: 완전
      비가시에서 한 단계 올림 — "아주 옅은 실선을 넣어서 시각적 구별은 가능하게") */
   flex: 0 0 1px; background: #151a21;
-  position: relative; z-index: 5;
+  position: relative; z-index: var(--z-pane-overlay);
 }
 /* 시각은 1px, 잡는 영역은 ±3px — 보이지 않는 히트존으로 리사이즈 조작성 보존 */
 .divider::before { content: ""; position: absolute; inset: 0; }
@@ -350,7 +366,7 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 
 /* ───────── T6 Control Center (전용 풀 패널 — 외장 Streamlit 대시보드의 네이티브 이식) ───────── */
 #cc-panel {
-  position: fixed; inset: 39px 0 0 0; z-index: 1500;
+  position: fixed; inset: 39px 0 0 0; z-index: var(--z-cc-panel);
   background: #0a0a0a; color: #e2e8f0; overflow-y: auto;
   font-family: -apple-system, "Pretendard Variable", system-ui, sans-serif;
 }
@@ -551,12 +567,12 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-title { cursor: grab; }
 
 #drag-ghost {
-  position: fixed; z-index: 2000; pointer-events: none;
+  position: fixed; z-index: var(--z-drag-ghost); pointer-events: none;
   padding: 3px 10px; font-size: 11px; border-radius: 6px;
   background: var(--accent); color: #fff; opacity: .9; white-space: nowrap;
 }
 #drop-hint {
-  position: fixed; z-index: 1999; pointer-events: none;
+  position: fixed; z-index: var(--z-drop-hint); pointer-events: none;
   background: rgba(47, 129, 247, .25); border: 2px solid var(--accent);
   border-radius: 4px;
 }
@@ -619,11 +635,22 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 /* ★T-0147-3: 높이 상한 없던 구 구현은 알람이 몰리면 화면 전체를 덮었다(무한 스택).
    상한 + 스크롤로 캔버스를 지키고, 넘친 이력은 Control Center 알람 탭에서 본다. */
 #toasts {
+  /* ★z var(--z-toast)(2026-09-23 수리): 안내·실패 토스트는 어떤 패널·확인 창보다 위다. 종전 99 는
+     #cc-panel(1500) 뒤라, Control Center 를 열어 둔 채 난 실패·안내가 전부 화면에서 사라졌다(알람 탭에는
+     남지만 사용자는 '아무 반응 없음'만 본다 — 팀 제안 카드 연타 때 busy 안내 6건이 그렇게 묻혔다). */
   position: fixed; right: 12px; bottom: 12px;
-  display: flex; flex-direction: column; gap: 8px; z-index: 99;
+  display: flex; flex-direction: column; gap: 8px; z-index: var(--z-toast);
   max-height: 60vh; overflow-y: auto; overflow-x: hidden;
   padding: 2px; scrollbar-width: thin;
 }
+/* ★토스트 회피(2026-09-23): 토스트는 확인 창 위라, 오른쪽 아래에 그대로 두면 창 폭이 약 1324px 보다 좁을 때
+   (확인 창 오른쪽 끝 W/2+230 > 토스트 왼쪽 끝 W−432) 확인 창 버튼을 덮어 [만들기] 클릭을 가로챈다.
+   확인 창이 떠 있는 동안은 위로 비켜 놓고 높이를 화면 가운데 위(50vh−16px)까지로 묶는다 — 확인 창은 세로
+   가운데 정렬이고 버튼 줄은 언제나 창의 아래쪽 절반, 곧 화면 가운데보다 아래에 있다(넘치면 목록이 스크롤).
+   두 규칙은 결과가 같다: :has() 를 못 읽는 WebView 는 main.ts(syncModalOpenClass)가 거는 body.modal-open 으로
+   같은 결과를 낸다. ★한 선택자 목록으로 합치지 말 것 — :has() 를 모르는 엔진은 목록 전체를 버린다. */
+body:has(.modal-overlay) #toasts { bottom: auto; top: 56px; max-height: calc(50vh - 72px); }
+body.modal-open #toasts { bottom: auto; top: 56px; max-height: calc(50vh - 72px); }
 .toast {
   position: relative;
   max-width: 420px; padding: 10px 28px 10px 12px; border-radius: 8px;
@@ -666,7 +693,10 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 
 /* 업데이트 확인 모달 */
 .modal-overlay {
-  position: fixed; inset: 0; z-index: 1000;
+  /* ★z var(--z-modal)(2026-09-23 수리): #cc-panel·.palette-overlay 위. 종전 1000 은 Control Center 패널
+     (불투명 · inset 39px 0 0 0) 뒤에 깔려, 승인 Feed 카드에서 연 확인 창이 화면에 보이지 않았다 = 클릭
+     무반응처럼 보이는 조용한 실패. 확인 창은 모든 패널 위가 계약이다(코드 쪽 짝: main.ts keepModalAboveOpenPanels). */
+  position: fixed; inset: 0; z-index: var(--z-modal);
   background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center;
 }
 .modal {
@@ -707,7 +737,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .modal-hint { font-size: 11px; color: #f59e0b; margin: 6px 0 0; min-height: 14px; }
 
 /* ★U6(0.14.41) 피드백 보내기 — 사이드바 바닥 단추(#wsbar-feedback-slot 안 · 공용 칸 #wsbar-foot 의 배치·
-   높이 규칙은 A2 소유라 여기서 건드리지 않는다)와 작성 창. 창은 .modal-overlay 기본층(z 1000)을 그대로 쓴다
+   높이 규칙은 A2 소유라 여기서 건드리지 않는다)와 작성 창. 창은 .modal-overlay 기본층(var(--z-modal))을 그대로 쓴다
    — 위에 뜨는 확인 창·자동 모달이 창 밑에 깔리지 않게(반박 D4). .feedback-overlay 에 z-index 를 주지 말 것. */
 #btn-feedback {
   display: flex; align-items: center; gap: 6px; min-width: 0;
@@ -767,8 +797,10 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 
 /* 07 Command Palette (⌘K) — modal-overlay + ctx-menu 패턴 합성 */
 .palette-overlay {
-  /* z 1600: #cc-panel(1500) 위 — modal/ctx-menu(1000)도 위. #drag-ghost(2000)는 pointer-events:none 일시 프리뷰라 무관. confirm은 close 후 호출. */
-  position: fixed; inset: 0; z-index: 1600;
+  /* var(--z-palette): #cc-panel·ctx-menu 위, 확인 창(.modal-overlay) 아래. #drag-ghost 는 pointer-events:none 일시 프리뷰라 무관.
+     (2026-09-23) 종전에는 확인 창(1000)이 팔레트 아래라 "confirm 은 팔레트 close 후 호출"로 피했지만 그 우회는 CC 패널을
+     덮지 못했다 — 이제 층서로 확인 창이 둘 다의 위다. 액션 실행 전에 팔레트를 닫는 것은 UX 로 유지한다. */
+  position: fixed; inset: 0; z-index: var(--z-palette);
   background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center;
 }
 .palette {
