@@ -128,6 +128,8 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 | `vibecoding/*.sh` | PostToolUse | 바이브코딩 넛지(옵트인) |
 
 훅이 아닌 파일: `_lib.sh`(프리루드 §2) · `cys-statusline.sh`(statusline 래퍼) ·
+`cys-agy-statusline.sh`(agy 상태줄 래퍼 — `~/.gemini/antigravity-cli/settings.json` 의 statusLine 명령 · 설치 때 칸이
+비었을 때만 자동 연결 · 계약은 `src/agy_statusline.rs`) ·
 `inject_gate.py`(주입 포이즌 게이트 — inject-context 가 부른다) · `test_pre_dispatch.sh`(회귀 하네스).
 
 ## 6. 훅이 안 도는 것 같을 때 보는 순서

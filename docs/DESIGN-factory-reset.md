@@ -89,6 +89,10 @@ hostinger-ftp.env·license.json)까지 파괴한다.
   원복. 변경 시에만 `.bak-factory-reset` 백업 후 write_atomic.
 - `~/.claude*/skills/<n>`: 대상이 `~/.cys/pack/skills` 인 **심링크만** 제거(실디렉토리
   불가침 — preflight 심링크 파밍의 역연산).
+- (0.14.42) `~/.gemini/antigravity-cli/settings.json`: cys 가 **자동으로 넣은** agy 상태줄 연결(명령 끝 표지
+  `--cys-autolink`)만 그 한 칸을 외과 제거한다(나머지 바이트 그대로 · 백업은 `<trash_dir>/settings-backups/
+  agy-antigravity-cli.settings.json`). 사용자가 직접 넣은 cys 연결은 `report_only` 안내만, 사용자 statusLine 은
+  무접촉(계약 `src/agy_statusline.rs`).
 
 정지·등록해제: launchd `com.cysjavis.cysd`(bootout+unload+plist 삭제 — 다음 앱 실행이
 register_if_absent 로 재등록 = 신규 설치 동등), Windows schtasks `cysd` 삭제, cysd 전

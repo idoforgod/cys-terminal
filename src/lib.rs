@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub mod action_catalog;
+/// agy(Antigravity CLI) 상태줄 자동 연결(0.14.42 · 오너 승인 2026-09-24) — 설정 칸이 비었거나 없을 때만 넣고,
+/// 사용자 설정은 덮지 않으며, 표지 달린 cys 연결만 뺀다. 윈도우는 자동 연결 끔(안내만).
+pub mod agy_statusline;
 pub mod factory_reset;
 /// 앱 번들 완본 검증 + 원자 교체 계약(ATOMIC-1) — 2026-08-01 "손상되었기 때문에 열 수 없습니다" 사고의
 /// 재발 차단. SEAL-1(아래 `ENV_PY_NO_BYTECODE`)이 **번들이 스스로 봉인을 깨는 것**을 막는다면,

@@ -1136,6 +1136,45 @@ pub fn merge_awakening_hooks_into_personal_profiles() -> Vec<(String, Vec<String
     out
 }
 
+/// ★0.14.42 agy(Antigravity CLI) 상태줄 자동 연결 — 설치·팩 병합 때 한 번 조정한다(계약 전문: `crate::agy_statusline`).
+///
+/// 개인 프로필 훅 병합([`merge_awakening_hooks_into_personal_profiles`])과 **같은 계층·같은 게이트**다:
+///  · 테스트 빌드 무동작 · `CYS_NO_PERSONAL_HOOK_MERGE=1`(E2E 하네스의 개인 설정 무접촉 약속) 무동작
+///  · **base 팩 전용** — 부서·임시·테스트 팩(`CYS_PACK_DIR` 지정)에서 도는 설치는 `~/.gemini` 를 건드리지 않는다
+///    (CONTRIBUTING: 팩 변수만 격리하고 HOME 을 두고 온 E2E 가 라이브 프로필에 죽은 훅을 쌓은 사고의 같은 방어).
+/// 노브가 꺼져 있으면(`CYS_AGY_STATUSLINE=0` · `~/.cys/agy-statusline-off`) cys 가 넣은(표지 달린) 연결만 뺀다.
+/// best-effort — 무엇이 실패해도 팩 설치는 유효하고 설정 파일은 그대로다(실패 방향 = 쓰지 않음 · 로그 1줄).
+pub fn reconcile_agy_statusline_at_install() {
+    use crate::agy_statusline as agy;
+    if cfg!(test) {
+        return; // 테스트 빌드는 실 HOME 을 절대 만지지 않는다
+    }
+    if std::env::var("CYS_NO_PERSONAL_HOOK_MERGE").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    let pack = pack_dir();
+    if pack != home_default_pack_dir() {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let settings = agy::settings_path_under(&home);
+    let record = pack.join(agy::RECORD_REL);
+    let off_file = home.join(".cys").join(agy::OFF_FILE);
+    let outcome = if agy::knob_off(crate::env_compat(agy::ENV_KNOB).as_deref(), off_file.exists()) {
+        agy::unlink(&settings, Some(&record), agy::Backup::Beside)
+    } else {
+        agy::ensure_linked(
+            &agy::Ctx { settings: &settings, pack_dir: &pack, record: &record, windows: cfg!(windows) },
+            false,
+        )
+    };
+    if let Some(line) = agy::describe(&outcome, &settings) {
+        eprintln!("[pack] agy 상태줄: {line}");
+    }
+}
+
 /// SessionStart hook 등록 명령을 OS별로 조립하는 **공용 함수**(RC-2 · 순수 함수·회귀 핀).
 /// Windows: 바닐라 셸(cmd/PowerShell)은 `.sh`를 인터프리터 없이 못 실행하고 "open with" 대화상자를
 ///   띄운다(anthropics/claude-code #21847·#24097). Claude Code가 Windows에서 찾는 인터프리터는
@@ -1320,6 +1359,12 @@ fn setup_isolated_config_dir(install_hooks: bool) {
         SeedOutcome::Disabled | SeedOutcome::NothingToDo => {}
         other => eprintln!("[pack] 첫기동 관문 시드: {other:?}"),
     }
+    // ★0.14.42 agy 상태줄 자동 연결(오너 승인 2026-09-24) — 첫기동 시드처럼 `install_hooks` 조기 return **위**다.
+    //   GUI 인앱 업데이트는 항상 `--no-install-hook` 으로 내려오므로 아래에 두면 업데이트로 올라온 사용자에게 영영
+    //   닿지 않는다(U-19 와 같은 도달성). 이것은 Claude 훅이 아니고, 그 플래그가 막으려는 두 가지(정상 `.bak-cys`
+    //   클로버 · 활성 프로필 재직렬화)를 하지 않는다: 칸이 비었을 때 **한 번** 외과 수술로 한 칸만 쓰고, 그 뒤로는
+    //   무동작이다(연결 기록). 자기 노브(`CYS_AGY_STATUSLINE=0` · `~/.cys/agy-statusline-off`)가 따로 있다.
+    reconcile_agy_statusline_at_install();
     if !install_hooks {
         // ★G3(--no-install-hook 일관성): 종전엔 이 플래그가 ~/.claude 대상만 막고 격리 config dir
         // 훅 병합(아래)은 그대로 돌았다 — 훅 억제를 요청한 운영자에게 훅이 몰래 등록되는 비일관.

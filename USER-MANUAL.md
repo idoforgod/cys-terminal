@@ -313,31 +313,64 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
     `관측 실패 · agy 상태줄 연결 필요` 가 나옵니다(cys 는 이 확인을 agy 한 개당 30분에 한 번만 합니다).
     Windows 에서는 cys 가 agy 내부 서버를 아예 찾을 수 없어(포트 조회 수단이 없습니다) 확인 없이 곧바로
     같은 `agy 상태줄 연결 필요` 를 보입니다 — 값은 상태줄로만 들어옵니다.
-    - 연결 방법(직접 한 번 · 이 설정은 이 컴퓨터의 **모든** agy 에 적용되므로 cys 가 대신 고치지 않습니다):
-      `~/.gemini/antigravity-cli/settings.json` 의 `statusLine` 을 아래처럼 바꿉니다. `stack_with_default`
-      를 켜 두면 agy 기본 상태줄은 그대로 보이고 그 아래에 `cys · 5h 12% · 7d 25%` 한 줄이 붙습니다.
+    - **자동 연결**(v0.14.42 · macOS·Linux): cys 를 설치하거나 업데이트할 때(팩을 반영할 때) `~/.gemini/antigravity-cli/settings.json`
+      의 `statusLine` 이 **비어 있거나 없으면** cys 가 연결을 넣습니다. agy 기본 상태줄은 그대로 보이고 그 아래에
+      `5h 12% · 7d 25% · cys` 한 줄이 붙습니다(`stack_with_default`). 이 설정은 이 컴퓨터의 **모든** agy 에 적용됩니다 —
+      cys 창 밖에서 쓴 agy 에도 그 한 줄이 보이지만, 값을 cys 로 보내는 것은 cys 창의 agy 좌석뿐입니다. 이미 떠 있는 agy 는
+      다시 켜야 적용될 수 있습니다. 넣는 모양(`<you>` 는 자기 사용자 폴더 이름):
       ```json
-      "statusLine": { "type": "command", "command": "sh ~/.cys/pack/hooks/cys-statusline.sh",
+      "statusLine": { "type": "command",
+                      "command": "sh /Users/<you>/.cys/pack/hooks/cys-agy-statusline.sh --cys-autolink",
                       "enabled": true, "stack_with_default": true }
       ```
-      Windows 는 `~` 가 펼쳐지지 않고 `sh` 가 보통 PATH 에 없으므로, 팩의 다른 훅과 같은 모양(Git Bash 의 `bash` +
-      정슬래시 전체 경로 + 따옴표)으로 적습니다. `<you>` 는 자기 사용자 폴더 이름입니다. **Windows 의 agy 상태줄은
-      아직 실제로 확인하지 못했습니다**(agy 가 이 명령을 어떤 셸로 부르는지 미확인 — 값이 안 들어올 수는 있어도
-      틀린 값이 들어오지는 않습니다).
+      끝의 `--cys-autolink` 는 "cys 가 넣었다"는 표지입니다. 되돌릴 때는 이 표지가 달린 연결만 뺍니다.
+      - 이럴 때는 **넣지 않고 알리기만** 합니다(설치 기록과 `cys doctor` 의 `agy-statusline` 항목): 직접 설정한 statusLine 이
+        이미 있을 때(덮지 않습니다) · 파일이 JSON 으로 읽히지 않거나 UTF-8 이 아닐 때 · 읽기 전용이거나 쓸 수 없을 때 · 심볼릭
+        링크일 때 · 팩 경로에 공백이나 따옴표가 있을 때 · 팩에 상태줄 래퍼 파일(`hooks/cys-agy-statusline.sh`)이 없을 때 ·
+        agy 가 설치돼 있지 않을 때(폴더를 새로 만들지 않습니다).
+      - 쓰기 전에 원본을 `settings.json.bak-cys` 로 남기고 `statusLine` 한 칸만 바꿉니다. 다른 설정 값·순서·들여쓰기·줄바꿈은
+        그대로입니다. 쓰기 직전에 파일을 다시 읽어 그 사이 agy 가 파일을 바꿨으면 이번에는 쓰지 않습니다.
+      - 한 번 연결한 뒤 agy 안에서 `/statusline delete` 로 지우면 cys 는 **다시 넣지 않습니다**. 다시 연결하려면 `cys doctor --fix`
+        를 실행합니다. agy 안에서 `/statusline off` 로 꺼 둔 연결도 그대로 둡니다(cys 가 켜지 않습니다).
+      - **끄기·되돌리기**: 환경변수 `CYS_AGY_STATUSLINE=0` 을 주거나 빈 파일 `~/.cys/agy-statusline-off` 를 만들면, 다음 설치·
+        업데이트 때(또는 곧바로 `cys doctor --fix` 로) cys 가 넣은 연결만 뺍니다. 직접 넣은 연결은 건드리지 않습니다. 앱(GUI)으로만
+        쓰는 경우 환경변수는 앱에 전달되지 않을 수 있으니 파일 쪽을 쓰세요. `cys factory-reset`(완전 초기화)도 cys 가 넣은 연결을
+        뺍니다(백업은 격리 폴더 안에 남습니다).
+      - cys 를 이전 버전으로 되돌릴 때는 먼저 위 방법으로 연결을 빼 두는 것이 깔끔합니다. 빼지 않아도 옛 cys 는 이 연결이 부르는
+        명령(`usage-report-stdin --agy`)을 알아듣지 못해 아무것도 보내지 않고 끝납니다. 팩까지 옛것으로 바뀌어 연결이 없는 파일을
+        부르게 되면 agy 는 화면에 상태줄 오류를 몇 번 보인 뒤 그 상태줄을 스스로 끕니다(macOS 판 agy 1.2.9 프로그램을 풀어 보면
+        실패 기록 함수가 `Statusline disabled after %d consecutive failures` 를 씁니다 — 실제 화면은 확인하지 못했습니다).
+      - agy(macOS 판 1.2.9)는 상태줄 명령을 `sh -c` 로 부르고 한 번에 **5초**까지 기다립니다(프로그램을 풀어 확인 · 공식 문서에는
+        없습니다). cys 연결 명령은 입력 판독 1초 + 보내기 0.4초 안에 끝나고 언제나 정상 종료(exit 0)합니다.
+    - **Windows 는 자동으로 연결하지 않습니다.** agy 가 이 명령을 어떤 셸로 부르는지 공식 문서에 없고, 공개된 사용자 보고끼리
+      어긋나기 때문입니다(명령 안의 따옴표가 글자 그대로 넘어가 경로가 깨졌다는 보고와, 공백 경로는 따옴표로 감싸라는 안내가 함께
+      있습니다). 위의 `sh -c` 는 macOS 판에서 확인한 것이고, Windows 판 agy 는 따로 만들어진 프로그램이라 이 컴퓨터에서 확인할 수
+      없습니다. Windows 판도 `sh -c` 로 부른다면 `sh` 가 PATH 에 있어야 합니다(Git for Windows 기본 설치는 `sh.exe` 가 든
+      `Git\bin`·`Git\usr\bin` 을 PATH 에 넣지 않습니다). 직접 연결하려면 `%USERPROFILE%\.gemini\antigravity-cli\settings.json` 에 아래처럼 적습니다 — Git Bash 의 `bash` +
+      정슬래시 전체 경로, **따옴표 없이**. 사용자 폴더 이름에 공백이 있으면 이 방법은 동작하지 않을 수 있고, `bash` 가 Git Bash 가
+      아니라 WSL 의 `bash.exe` 로 잡히는 컴퓨터도 있습니다. `cys doctor` 의 `agy-statusline` 항목이 이 컴퓨터에 맞는 명령을
+      보여 줍니다. Git Bash 가 없거나 PATH 에 잡히지 않으면 이 연결은 동작하지 않고, agy 가 상태줄 오류를 몇 번 보인 뒤 스스로
+      끕니다 — 그때는 agy 안에서 `/statusline delete` 로 지웁니다. **Windows 의 agy 상태줄은 아직 실제로 확인하지 못했습니다**(값이
+      안 들어올 수는 있어도 틀린 값이 들어오지는 않습니다).
       ```json
-      "statusLine": { "type": "command", "command": "bash \"C:/Users/<you>/.cys/pack/hooks/cys-statusline.sh\"",
+      "statusLine": { "type": "command", "command": "bash C:/Users/<you>/.cys/pack/hooks/cys-agy-statusline.sh",
                       "enabled": true, "stack_with_default": true }
       ```
+    - macOS·Linux 에서 직접 연결할 때(자동 연결을 끈 뒤 등)는 표지 없이 `"command": "sh ~/.cys/pack/hooks/cys-agy-statusline.sh"`
+      를 씁니다. 예전 안내대로 `cys-statusline.sh` 를 넣어 둔 연결도 cys 연결로 보고 그대로 둡니다.
     - agy 가 상태줄에 넘겨 주는 정보 가운데 **쿼터 숫자만**(Gemini 5시간·주간) cys 로 보냅니다. 이메일·대화
       기록 경로·작업 폴더 같은 나머지 정보는 보내지도 저장하지도 않습니다.
     - 다 쓴 쿼터는 `100%` 로 보입니다. agy 가 '사용 안 함(Disabled)'으로 표시한 쿼터는 사용량으로 치지 않습니다.
       agy 자신의 쿼터 화면도 그런 쿼터에는 막대를 그리지 않습니다. 남은 비율이 아예 실려 오지 않은 쿼터는
       값을 지어내지 않고 비워 둡니다.
     - 값은 **cys 창의 agy 좌석**에서 돈 agy 만 모입니다. cys 창 밖에서 쓴 agy 는 모이지 않습니다.
+      좌석마다 같은 값은 1분에 한 번만 보내고(값이 바뀌면 1초 뒤부터 다시 보냅니다), 보내기가 실패하면 10초 동안 쉽니다.
+      상태줄 명령은 입력을 1초 안에 받지 못하면 아무것도 하지 않고 끝납니다(agy 를 붙잡지 않습니다).
     - agy 는 상태가 바뀔 때마다 상태줄을 부르므로, 좌석이 한동안 쉬면 값이 오래돼 흐리게 보입니다.
       값이 한 번 들어온 뒤에는 cys 가 agy 내부 서버를 더 두드리지 않습니다.
     - 아직 실제 agy 에서 확인하지 못한 점: agy 가 상태줄 명령에 cys 좌석 번호(`CYS_SURFACE_ID`)를
-      넘겨 주는지. 넘겨 주지 않으면 값이 들어오지 않습니다(틀린 값이 들어오는 일은 없습니다). 그리고 쿼터를
+      넘겨 주는지(macOS 판 agy 1.2.9 는 프로그램상 자기 환경을 그대로 넘기게 되어 있습니다 — 실제 좌석에서 잰 것은 아닙니다).
+      넘겨 주지 않으면 값이 들어오지 않습니다(틀린 값이 들어오는 일은 없습니다). 그리고 쿼터를
       다 썼을 때 agy 가 남은 비율 `0` 을 실제로 실어 보내는지(agy 1.2.9 프로그램의 자료 구조로는 그렇게
       보내게 되어 있습니다). 실어 보내지 않으면 그 창은 `100%` 대신 빈칸으로 보입니다.
   - 갱신: 약 30초마다(앱이 켜진 직후 잠시는 쉬고), Control Center Live 탭이 열려 있으면 5초마다.
@@ -1145,6 +1178,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` | 60 (0=보호 off) | `cys doctor --fix` 의 staging 잔재 삭제 보호창(초) — 이 시간 안에 수정된 staging 은 지우지 않고, idle 을 **못 재는**(mtime 미상·미래) staging 도 지우지 않는다(0.14.36 · 출력에 "N건 측정불능 보호" 로 따로 보고). `0` 은 진행중 보호와 측정불능 보호를 **함께** 해제해 종전처럼 항상 삭제하는 탈출구. 무효 값(`off`·`-1`·빈 값 — 비음수 정수만 유효)은 stderr 경고 1줄 + 기본 60(보호 on) — 조용히 떨어지지 않는다 |
 | `CYS_TODO_DIRS` | — | todo 감시 추가 루트(콜론 구분) |
 | `CYS_NO_AUTOSTART` / `CYS_NO_AUTORESTORE` | — | 자동 기동/자동 복원 끄기 |
+| `CYS_AGY_STATUSLINE` | 켜짐 (`0`=끔 · `~/.cys/agy-statusline-off` 파일과 동등) | agy 상태줄 자동 연결(v0.14.42 · macOS·Linux · §4 사이드바 사용량 「Antigravity(agy) 값」). 설치·업데이트 때 읽습니다. 끄면 cys 가 넣은(표지 `--cys-autolink`) 연결만 빼고 다시 넣지 않습니다 — 직접 넣은 연결·사용자 설정은 건드리지 않습니다. `cys doctor --fix` 도 같은 판정을 씁니다 |
 | `CYS_OUTSIDE_USAGE` | 켜짐 (`0`=끔) | cys 창 밖(외부 터미널) Claude 세션의 사용량을 계정 줄로 보내기(v0.14.42 · §4 사이드바 사용량 「집계 범위」). 창 밖 세션 쪽 환경에서 읽습니다. 끄면 종전처럼 보내지 않습니다 |
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
