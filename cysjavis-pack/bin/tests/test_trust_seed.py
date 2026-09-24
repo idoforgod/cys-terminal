@@ -1938,6 +1938,15 @@ def _block(src, start_label, end_label):
         j = src.find("\n}\n", i)
         assert j > i, "launch_dept() 종결 부재"
         return src[i:j]
+    # ★0.14.42 R8: `allocate` 본체도 같은 이유로 함수(`allocate_dept(){ … }`)가 됐다 — `create --team-token` 이
+    #   토큰 관문(데몬 검증·소비) 통과 뒤 **같은 프로세스 안**에서 본체를 부른다(자식 `bash "$0" allocate` 는
+    #   단일소유 게이트를 다시 돌아 master 좌석에서 exit 7). 핀의 의도는 그대로 — 함수 본체를 본다.
+    if start_label == "allocate":
+        i = src.find("\nallocate_dept(){")
+        assert i > 0, "allocate_dept() 함수 부재(본체가 다시 case 갈래로 돌아갔는가)"
+        j = src.find("\n}\n", i)
+        assert j > i, "allocate_dept() 종결 부재"
+        return src[i:j]
     i = src.find("\n  %s)" % start_label)
     assert i > 0, start_label
     j = src.find("\n  %s)" % end_label, i)

@@ -9167,7 +9167,12 @@ def h_seed_4():
     #   **주입이 사라져서 붉은 것이 아니라 주소가 바뀌어서 붉었다**. 본문을 따라간다.
     lfi = src.find("\nlaunch_dept()")
     need(lfi > 0, "launch 본체 함수(launch_dept)를 못 찾았다")
-    lbody = src[lfi:src.find('\ncase "$cmd" in', lfi)]
+    # ★0.14.42 R8: 창의 끝을 '다음 `case "$cmd" in`' 이 아니라 **함수 자신의 닫는 `}`** 로 조인다 — 그 사이에
+    #   `allocate_dept()`(같은 CYS_ACCOUNT_DIR 주입 문자열을 가진 본체)가 들어와, 옛 경계로는 launch 가 주입을
+    #   잃어도 allocate 의 문자열로 초록이 되는 **공허한 통과**가 생긴다(창이 좁아지므로 계약은 강화된다).
+    lend = src.find("\n}\n", lfi)
+    need(lend > lfi, "launch_dept() 의 닫는 괄호를 못 찾았다")
+    lbody = src[lfi:lend]
     need('CYS_ACCOUNT_DIR="$acctdir"' in lbody, "launch 스폰에 CYS_ACCOUNT_DIR 주입이 없다(G3 재발)")
     need("resolve_lane_acctdir" in lbody, "launch 가 계정 dir 을 유도하지 않는다")
     need("verify_lane_account_seed" in lbody, "launch 가 계정격리 시드를 검증하지 않는다")
@@ -9205,10 +9210,20 @@ def h_seed_4():
          "rotate 가 launch 본체를 경유하지 않는다(복원 경로 결박 실패)")
     notes.append("rotate=launch 본체 경유(복원 상속)")
     # ⓒ allocate 가 account_dir 을 레지스트리에 기록한다(복원 SOT)
-    ai = src.find("\n  allocate)")
-    need("reg_set_field \"$name\" account_dir" in src[ai:src.find("\n  create)", ai)],
+    # ★0.14.42 R8 측정 축 교체 — 계약은 그대로다. allocate 본체도 `allocate_dept()` **함수**로 떼어냈다
+    #   (launch_dept 와 같은 이유 — `create --team-token` 이 토큰 관문 통과 뒤 같은 프로세스 안에서 본체를
+    #   부른다). 팔은 위임 한 줄이 됐으므로 **본문은 함수에서** 재고, 팔이 그 본체로 위임만 한다는 사실을
+    #   함께 잰다(두 벌 구현 금지 — 한쪽만 고쳐지는 사고). 주소가 바뀌었을 뿐 주입이 사라진 것이 아니다.
+    afi = src.find("\nallocate_dept(){")
+    need(afi > 0, "allocate 본체 함수(allocate_dept)를 못 찾았다")
+    aend = src.find("\n}\n", afi)
+    need(aend > afi, "allocate_dept() 의 닫는 괄호를 못 찾았다")
+    need("reg_set_field \"$name\" account_dir" in src[afi:aend],
          "allocate 가 account_dir 을 레지스트리에 기록하지 않는다(rotate 복원 근거 부재)")
-    notes.append("allocate=account_dir 기록")
+    ai = src.find("\n  allocate)")
+    need(ai > 0 and 'allocate_dept "$@"' in src[ai:src.find("\n  create)", ai)],
+         "allocate 팔이 본체 함수로 위임하지 않는다(본체가 두 벌이면 한쪽만 고쳐진다)")
+    notes.append("allocate=account_dir 기록(본체=allocate_dept)")
     # ⓓ 유도 3순위·시드 자기치유 실측(함수 블록만 로드 — 데몬·부서 무접촉)
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")

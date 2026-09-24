@@ -427,6 +427,7 @@ usage: cys-dept <verb> ...
   cys-dept allocate                             lowest-unused dept-N 자동 발급·기동
   cys-dept allocate --team-spec-b64 <b64>       오너 확인 창을 거친 팀 제안으로 발급(GUI 전용 · 이름·하는 일 → 팀 소개 TEAM.md)
   cys-dept create <catalog-key>                 카탈로그 기반 완전 자동 부서 생성
+  cys-dept create --team-token <토큰>            대화 승인 1회용 토큰으로 대기 팀 제안을 생성(데몬이 검증·소비 · 실패=7)
   cys-dept down <name> [--purge-state]          teardown(+state 격리)
   cys-dept down-sock <socket>                   socket 기준 teardown
   cys-dept rotate <name>                        버전 스큐 세대교체(재기동·폐기 아님)
@@ -1487,6 +1488,10 @@ _CYS_ROTATE_SELF=0
 #   unset 뒤의 대입은 **비상속 셸 변수**다 — 자식에게 넘겨야 하는 값은 스폰 지점에서 명시 전달한다
 #   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
 unset _CYS_ROTATE_ACCT
+# ★0.14.42 R8: 토큰 관문(team_token_gate)의 결과는 **이 셸의 비상속 변수**로만 create 갈래에 넘긴다.
+#   진입 시 전부 지운다(J6 과 같은 이유 — 외부에서 export 한 같은 이름이 '데몬 통과'로 읽히지 않게 ·
+#   `unset` 이라 export 속성까지 사라지고, 관문 안의 대입은 자식에게 가지 않는 셸 변수다).
+unset _CYS_TT_OK _CYS_TT_TOKEN _CYS_TT_PID _CYS_TT_B64 _CYS_TT_STATE _CYS_TT_NAME
 if [ "$cmd" = "launch" ] && [ "${3:-}" = "--rotate" ] && [ -n "${2:-}" ]; then
   if [ ! -e "$(dept_sock "${2:-}")" ] && [ -f "$REG" ]; then
     if _cys_rot_names="$(reg_names 2>/dev/null)"; then
@@ -1628,17 +1633,122 @@ cysd_role_gate() {   # $1=안내 문구 접두 $2=안내 문장(생략 시 CSO �
   esac
 }
 
+# ── ★0.14.42 R8(설계 §11 · §8-2 ①) 대화 승인 1회용 팀 생성 토큰 관문 ─────────────────────────────
+# `create --team-token <토큰>` 전용 **한 갈래**다. cys-dept 는 판정하지 않고 **데몬에 묻는다**(위 데몬 권위
+#   절의 "env 가 아니라 데몬이 신원의 정본이다" 태도 그대로): `cys team-token consume` → 데몬이 호출 좌석
+#   (커널 peer pid 조상 체인)과 제안의 현재 본문(데몬 메모리)으로 토큰을 검증하고 생성 단계 1회 소비를
+#   원장에 적는다(판정 정의처 = bin/javis_teamtoken.py · 데몬 다리 = cysd teamtoken.rs).
+#   통과(exit 0 · ok · consumed)일 때만 만들 명세(spec_b64 = 데몬이 준 현재 본문)를 비상속 셸 변수로
+#   create 갈래에 넘긴다. 그 밖(토큰 없음·위조·만료·재사용·다른 좌석·본문 변경·데몬 무응답 …)은 전부
+#   **종전 그대로 exit 7** — 데몬의 사유 코드와 오너 문구를 그대로 1줄로 보인다(무안내 거부 금지).
+#   예외 하나(멱등 재실행): 데몬 답이 token_consumed 이고, 데몬 조회(inspect)가 **이 좌석의 토큰**
+#   (same_seat)·생성 단계 이후 상태라고 말하고, 그 제안으로 만든 팀이 이미 등재돼 있으면 새로 만들지 않고
+#   그 팀을 보고한다(생성 0 · 인가가 아니라 기존 사실의 보고).
+#   ★정직한 한계(설계 §14-1): 같은 UID 로 원장을 직접 쓰는 위조는 막지 못한다 — 사고 방지 층이다.
+tt_fields(){   # stdin = JSON 1줄 · $@ = 키 → US(0x1f) 구분 1줄(판독 불가 = 빈 줄 · 항상 rc 0)
+  python3 -c '
+import json, sys
+try:
+    lines = sys.stdin.buffer.read().decode("utf-8", "replace").strip().splitlines()
+    d = json.loads(lines[-1])
+    if not isinstance(d, dict):
+        raise ValueError
+except Exception:
+    sys.stdout.write("\n"); sys.exit(0)
+def s(v):
+    if v is None: return ""
+    if isinstance(v, bool): return "true" if v else "false"
+    return " ".join(str(v).replace("\x1f", " ").split()) if isinstance(v, str) else str(v)
+sys.stdout.buffer.write(("\x1f".join(s(d.get(k)) for k in sys.argv[1:]) + "\n").encode("utf-8"))
+' "$@" 2>/dev/null || printf '\n'
+}
+reg_name_by_proposal(){   # $1=제안 id → stdout 부서 키(없으면 빈 줄) · 판독 실패는 빈 줄(원본 보존·보고는 호출부)
+  python3 - "$REG" "${1:-}" 2>/dev/null <<'PY' | tr -d '\r' || printf '\n'
+import json, sys
+p, pid = sys.argv[1:3]
+try:
+    d = json.load(open(p, encoding="utf-8-sig"))
+except Exception:
+    print(""); sys.exit(0)
+hit = [k for k, e in (d.get("depts") or {}).items()
+       if isinstance(e, dict) and pid and e.get("team_proposal_id") == pid]
+print(hit[0] if hit else "")
+PY
+}
+team_token_ask(){   # $1=동사(consume|inspect|settle) $2..=인자 → stdout 데몬 답 JSON · rc = CLI exit
+  # 묻는 행위가 데몬을 낳아서는 안 된다(_lib.sh cys_resolve_role 과 같은 규약 — 서브셸 안 명시 export).
+  ( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART; "$CYS" team-token "$@" 2>/dev/null )
+}
+team_token_settle(){   # $1=created|failed $2=부서명|exit 코드 — 결과 기록(allow 권한 무장/종결). 실패는 경고만.
+  _tts_rc=0
+  if [ "$1" = "created" ]; then
+    _tts_out="$(team_token_ask settle --token "$_CYS_TT_TOKEN" --outcome created --dept "$2")" || _tts_rc=$?
+  else
+    _tts_out="$(team_token_ask settle --token "$_CYS_TT_TOKEN" --outcome failed --code "$2")" || _tts_rc=$?
+  fi
+  [ "$_tts_rc" = "0" ] && return 0
+  IFS=$'\x1f' read -r _tts_code _tts_msg <<<"$(printf '%s' "$_tts_out" | tt_fields code message)"
+  echo "[cys-dept] WARN: 생성 결과 기록(settle $1) 실패 — ${_tts_code:-응답 없음}: ${_tts_msg:-데몬에 닿지 못했다}. 승인 카드 정리(allow)는 열리지 않는다(카드 잔존 = 안전 방향). 같은 명령을 다시 실행하면 기록을 재시도한다" >&2
+  return 0
+}
+team_token_gate(){   # $1=토큰 $2=여분 인자 수 — 통과 시 _CYS_TT_* 설정 후 return 0 · 그 밖 exit 7(인자 오류 2)
+  if [ "${2:-0}" != "0" ]; then
+    echo "[cys-dept] create --team-token: 인자가 너무 많다(토큰은 소비하지 않았다) — usage: cys-dept create --team-token <토큰>" >&2
+    exit 2
+  fi
+  _ttg_tok="${1:-}"; _ttg_rc=0
+  _ttg_out="$(team_token_ask consume --token "$_ttg_tok")" || _ttg_rc=$?
+  IFS=$'\x1f' read -r _ttg_ok _ttg_code _ttg_pid _ttg_b64 _ttg_msg <<<"$(printf '%s' "$_ttg_out" | tt_fields ok code proposal_id spec_b64 message)"
+  if [ "$_ttg_rc" = "0" ] && [ "$_ttg_ok" = "true" ] && [ "$_ttg_code" = "consumed" ] \
+     && [ -n "$_ttg_pid" ] && [ -n "$_ttg_b64" ]; then
+    _CYS_TT_OK=1; _CYS_TT_TOKEN="$_ttg_tok"; _CYS_TT_PID="$_ttg_pid"; _CYS_TT_B64="$_ttg_b64"
+    return 0
+  fi
+  if [ "$_ttg_code" = "token_consumed" ]; then
+    _tti_rc=0
+    _tti_out="$(team_token_ask inspect --token "$_ttg_tok")" || _tti_rc=$?
+    IFS=$'\x1f' read -r _tti_ok _tti_state _tti_pid _tti_same <<<"$(printf '%s' "$_tti_out" | tt_fields ok state proposal_id same_seat)"
+    if [ "$_tti_rc" = "0" ] && [ "$_tti_ok" = "true" ] && [ "$_tti_same" = "true" ] && [ -n "$_tti_pid" ]; then
+      case "$_tti_state" in
+        consumed|created|done)
+          _tti_name="$(reg_name_by_proposal "$_tti_pid")"
+          if [ -n "$_tti_name" ]; then
+            _CYS_TT_OK=again; _CYS_TT_TOKEN="$_ttg_tok"; _CYS_TT_PID="$_tti_pid"
+            _CYS_TT_STATE="$_tti_state"; _CYS_TT_NAME="$_tti_name"
+            return 0
+          fi ;;
+      esac
+    fi
+  fi
+  # ★CLI 스큐(2026-09-23 샌드박스 E2E 실측): 이 도구는 PATH 앞에 /usr/local/bin 을 붙이므로 `team-token` 동사가
+  #   없는 **구버전 cys** 를 부를 수 있다 — clap 사용 오류(exit 2 · 출력 0)다. 거부는 그대로(exit 7)이고,
+  #   '데몬에 닿지 못했다' 대신 원인과 처방을 말한다(무안내·오안내 거부 금지).
+  if [ -z "$_ttg_code" ] && [ "$_ttg_rc" = "2" ]; then
+    _ttg_code="cli_skew"
+    _ttg_msg="이 cys($CYS)가 team-token 동사를 모르는 구버전이다 — 데몬에 묻지 못했다. 앱(cys CLI)을 0.14.42 이상으로 갱신하라"
+  fi
+  echo "[cys-dept] ★단일소유 강제: 부서 생성(대화 승인 토큰 경로) 거부 — 데몬 판정 ${_ttg_code:-응답 없음}: ${_ttg_msg:-데몬에 닿지 못했다}. 토큰이 없거나 데몬 검증에 실패하면 만들지 않는다(오너가 직접 친 승인 발화로 훅이 발급한 토큰만 통과 · 토큰을 만들거나 고치지 않는다)." >&2
+  exit 7
+}
+
 # ★I5 수렴: env 절을 `cysd_role_gate` **안으로** 옮겼다(순서 역전). 종전에는 여기서 env 로 먼저
 #   죽어 데몬에게 묻지도 못했다 — 승계로 정당하게 CSO 가 된 좌석이 자기 env 를 고칠 수 없어
 #   (SessionStart 는 부모 env 를 못 고친다) lifecycle 경로를 **영구히** 못 썼다(판정관 T3g).
 #   게이트는 데몬 권위가 있으면 그것으로 결정하고, 없으면 `cysd_env_clause` 로 강등한다.
 case "$cmd" in
   launch|allocate|create)
+    # ★0.14.42 R8: `create --team-token` 은 역할 게이트 대신 **토큰 관문 하나만** 판정한다(위 주석). 역할이
+    #   무엇이든 데몬 검증 통과만이 통과다 — 실패는 역할과 무관하게 exit 7(역할로 새 허용 0 · 토큰 갈래 밖
+    #   동사·인자는 종전 게이트 그대로).
+    if [ "$cmd" = "create" ] && [ "${2:-}" = "--team-token" ]; then
+      team_token_gate "${3:-}" "$(( $# > 3 ? $# - 3 : 0 ))"
+    else
     # ★성찰 U16-A1(major): 생성 동사는 CSO 가 만들 수 없다(부서 생성 동사는 CSO 도구 게이트가 막는다
     #   — 0.14.41 U16 조사 F1). '종전 CSO에 요청하라' 안내는 대표에게 죽은 경로를 가리켰다.
     #   실제 생성 경로 둘(본부 대표 `cys team-propose` · 오너 GUI 전문가용 › 팀 직접 만들기)로 교체.
     cysd_role_gate "부서 생성은 CSO/GUI 전용" \
-      "cys team-propose(본부 대표) 또는 오너 GUI 전문가용 › 팀 직접 만들기를 이용하라." ;;
+      "cys team-propose(본부 대표) · 오너 GUI 전문가용 › 팀 직접 만들기 · 또는 오너 승인 발화로 발급된 토큰의 cys-dept create --team-token 을 이용하라."
+    fi ;;
   down|down-sock|rotate|reap|promote-ceo)
     # 종료·정리·회전·승격은 CSO 안내를 그대로 유지한다(생성과 달리 CSO 가 실제로 집행할 수 있다).
     cysd_role_gate "부서 lifecycle mutation은 CSO/GUI 전용" ;;
@@ -1779,8 +1889,10 @@ launch_dept(){   # $1=name
 }
 
 # ── ★U16(0.14.41) 말로 팀 만들기 — `allocate --team-spec-b64 <b64>` 보조 2종 ──────────────────
-# 호출자: GUI(Tauri allocate_dept_daemon)가 오너의 확인 창 [만들기] 뒤에만 부른다. 단일소유 가드(위
-#   cysd_role_gate)는 그대로다 — 에이전트 좌석은 이 동사에 닿기 전에 exit 7.
+# 호출자 둘: ①GUI(Tauri allocate_dept_daemon)가 오너의 확인 창 [만들기] 뒤 ②★0.14.42 `create --team-token`
+#   이 토큰 관문(데몬 검증·소비 — 오너가 대화에서 직접 친 승인 발화로 훅이 발급한 1회용 토큰) 통과 뒤 같은
+#   프로세스 안에서(`allocate_dept`). 단일소유 가드(위 cysd_role_gate)는 그대로다 — 에이전트 좌석은 토큰
+#   없이는 이 동사에 닿기 전에 exit 7.
 # 스키마 SOT = Rust `src/team_spec.rs`(데몬·Tauri 가 이미 검증했다). 여기는 **마지막 관문의 재검증**
 #   이며 한도·키·제어문자 규칙을 같게 둔다(test_team_create_u16.py C1 이 한도를 대조). 권위어 거부는
 #   Rust 쪽과 session-start.sh 주입 필터가 맡는다.
@@ -1843,11 +1955,13 @@ os.replace(tmp, p)
 PY
 }
 
-case "$cmd" in
-  launch)
-    launch_dept "${2:-}"
-    ;;
-  allocate)
+# ★0.14.42 R8: allocate **본체**를 함수로 뗀다 — `launch_dept` 와 같은 이유·같은 방식(성찰 P1 선례).
+#   `allocate)` 갈래는 종전과 바이트 동일한 동작(이 함수 호출)이다. `create --team-token` 은 토큰 관문(데몬
+#   검증·소비)을 통과한 뒤 **같은 프로세스 안**의 서브셸에서 이 함수를 불러 exit 를 rc 로 받는다 — 생성
+#   결과를 데몬에 기록(settle)해야 하기 때문이다(자식 `bash "$0" allocate` 는 단일소유 가드를 다시 돌아
+#   master 좌석에서 exit 7 로 죽는다 · 위조 가능한 env·argv 통과 표식은 만들지 않는다).
+#   인자는 스크립트 인자 모양 그대로다: $1=allocate · $2=--team-spec-b64 · $3=<b64>(선택).
+allocate_dept(){
     # ★U16(0.14.41) 선택 인자 `--team-spec-b64 <b64>` — 오너 확인 창 [만들기] 뒤 GUI 만 부른다.
     #   인자가 없으면 종전과 같다(단 번호 재사용 때 남은 TEAM.md 는 아래에서 .stale-* 로 치운다).
     #   검증은 부작용 이전 · 위반 exit 2(예약 집합 밖 인자 오류 계열).
@@ -2047,8 +2161,68 @@ PY
     formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir cwd=$dept_cwd)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
+}
+
+# ★0.14.42 R8(설계 §8-2 ①): 토큰 관문(위 가드의 team_token_gate) 통과 뒤 — 생성 1회 + 결과 기록(settle).
+#   결과 기록이 allow 권한을 무장한다(created) 또는 종결한다(failed) — P3 2단 권한. stdout 마지막 줄 계약은
+#   allocate 와 같다(확정 이름). 기록 실패는 경고만(생성 성공을 뒤집지 않는다 · 카드 잔존 = 안전 방향).
+team_token_create(){
+  if [ "${_CYS_TT_OK:-}" = "again" ]; then
+    # 멱등 재실행 — 새로 만들지 않는다. 결과 기록이 빠졌던 경우(consumed)만 기록을 다시 보낸다.
+    if [ "${_CYS_TT_STATE:-}" = "consumed" ]; then team_token_settle created "$_CYS_TT_NAME"; fi
+    echo "[cys-dept] 같은 승인(토큰)으로 이미 만든 팀 $_CYS_TT_NAME (제안 $_CYS_TT_PID) — 새로 만들지 않는다(멱등)" >&2
+    echo "$_CYS_TT_NAME"
+    return 0
+  fi
+  # 데몬이 준 명세가 그 제안의 것인가(방어) — 어긋나면 만들지 않는다. 토큰은 이미 소비됐으므로 실패로 기록한다.
+  _ttc_id="$(python3 - "$_CYS_TT_B64" 2>/dev/null <<'PY' | tr -d '\r' || true
+import base64, json, sys
+try:
+    d = json.loads(base64.urlsafe_b64decode(sys.argv[1].encode("ascii")).decode("utf-8"))
+    print(d.get("id", "") if isinstance(d, dict) else "")
+except Exception:
+    print("")
+PY
+)"
+  if [ "$_ttc_id" != "$_CYS_TT_PID" ]; then
+    echo "[cys-dept] ★단일소유 강제: 데몬 통과 응답의 명세(id=${_ttc_id:-판독 불가})가 제안($_CYS_TT_PID)과 다르다 — 만들지 않는다" >&2
+    team_token_settle failed 7
+    return 7
+  fi
+  # 서브셸 = 본체의 exit N 이 이 프로세스를 끝내지 않게(rotate→launch_dept 선례). `|| …` 로 받으면 서브셸
+  #   안의 errexit 가 꺼지므로(본체 의미가 바뀐다) set +e 로 감싸고 서브셸 안에서 set -e 를 다시 켠다.
+  set +e
+  ( set -e; allocate_dept allocate --team-spec-b64 "$_CYS_TT_B64" )
+  _ttc_rc=$?
+  set -e
+  if [ "$_ttc_rc" = "0" ]; then
+    _ttc_name="$(reg_name_by_proposal "$_CYS_TT_PID")"
+    if [ -n "$_ttc_name" ]; then
+      team_token_settle created "$_ttc_name"
+    else
+      echo "[cys-dept] WARN: 팀은 만들었으나 등재에서 제안($_CYS_TT_PID)의 팀을 찾지 못해 결과 기록(settle)을 못 했다 — 승인 카드 정리(allow)는 열리지 않는다(카드 잔존). depts.json 확인 뒤 같은 명령을 다시 실행하라" >&2
+    fi
+    return 0
+  fi
+  team_token_settle failed "$_ttc_rc"
+  echo "[cys-dept] 팀 생성 실패(exit $_ttc_rc) — 제안은 그대로 남아 있습니다. 토큰은 소비됐으므로 다시 만들려면 오너에게 다시 여쭙는다(새 질문 → 새 토큰)" >&2
+  return "$_ttc_rc"
+}
+
+case "$cmd" in
+  launch)
+    launch_dept "${2:-}"
+    ;;
+  allocate)
+    allocate_dept "$@"
     ;;
   create)
+    # ★0.14.42 R8: `create --team-token` — 위 가드의 토큰 관문(데몬 검증·소비)을 통과했을 때만 여기 온다
+    #   (관문 실패는 거기서 exit 7). 내부 표식은 진입 시 unset 이라 외부 env 로 이 분기를 열 수 없다.
+    if [ -n "${_CYS_TT_OK:-}" ]; then
+      team_token_create
+      exit $?
+    fi
     # ＋부서 자동화: 카탈로그 기반 완전 자동 부서 생성(부서명·계정·미션·각성). 레거시 allocate 무변경.
     key="${2:-}"
     # ★D3(i): 카탈로그 key도 동일 화이트리스트 — acctdir('-$key' 접미)·미션 경로($MISS/$key.md) 합성

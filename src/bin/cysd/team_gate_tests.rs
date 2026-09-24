@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 const KIND: &str = "team-create-request";
 
-fn tmp_daemon(tag: &str, dept_lane: bool) -> Arc<Daemon> {
+pub(crate) fn tmp_daemon(tag: &str, dept_lane: bool) -> Arc<Daemon> {
     crate::delivery::tests::isolate_state_dir_for_thread(tag);
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -56,7 +56,7 @@ fn tmp_daemon_auto_route_on(tag: &str, dept_lane: bool) -> Arc<Daemon> {
 }
 
 /// 역할을 가진 좌석 1개 + 그 좌석에 귀속되는 synthetic 발신 pid.
-fn seat(daemon: &Arc<Daemon>, role: &str, pid: u32) -> u64 {
+pub(crate) fn seat(daemon: &Arc<Daemon>, role: &str, pid: u32) -> u64 {
     let s = daemon
         .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
         .expect("create seat");
@@ -74,11 +74,11 @@ fn seat(daemon: &Arc<Daemon>, role: &str, pid: u32) -> u64 {
     s.id
 }
 
-fn body(id: &str, display: &str, purpose: &str) -> String {
+pub(crate) fn body(id: &str, display: &str, purpose: &str) -> String {
     json!({"v": 1, "id": id, "display": display, "purpose": purpose}).to_string()
 }
 
-fn push(daemon: &Arc<Daemon>, pid: Option<u32>, rid: &str, b: &str, extra: Value) -> Value {
+pub(crate) fn push(daemon: &Arc<Daemon>, pid: Option<u32>, rid: &str, b: &str, extra: Value) -> Value {
     let mut params = json!({"kind": KIND, "title": "t", "body": b, "request_id": rid,
                             "wait": false, "tier": "d"});
     if let (Some(o), Some(e)) = (params.as_object_mut(), extra.as_object()) {
