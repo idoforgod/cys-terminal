@@ -1429,11 +1429,39 @@ def suite_directive():
     step3 = next((ln for ln in blk.splitlines() if ln.startswith("  ③ ")), "")
     step1 = next((ln for ln in blk.splitlines() if ln.startswith("  ① ")), "")
     step5 = next((ln for ln in blk.splitlines() if ln.startswith("  ⑤ ")), "")
-    check("D", "D9 §4-A-2: ①②④⑤ 뒤 턴 종료 · ③ 은 비동기(이 턴에서 기다리지 않는다 · 다음에 깨어났을 때 1회 확인) · "
-               "'5노드 등장이 끝나면' 대기 문구 삭제 · 받는 쪽 규칙(reinject --check) · 재요청 1회 · 첫 과제는 빈 셸 금지",
-          "그 턴을 끝낸다" in blk and "이 턴에서 기다리지 않는다" in step3 and "다음에 깨어났을 때" in step3
-          and "5노드 등장이 끝나면" not in blk and "reinject --check --role" in blk and "**1회만** 요청" in blk
-          and "빈 셸에는 보내지 않는다" in step5 and "팀장과 팀원 4자리가 떴습니다" not in step5, step3[:160])
+    # ★(0.14.42 RE-R3-01 · RV-ROLE-1) ③ 은 **이벤트 구동**이다 — 편성 도구가 결판 때 부서장·대표에게 1회씩 알린다.
+    #   종전 '다음에 깨어났을 때 1회만 확인'은 편성보다 먼저 오는 깨어남(재주입 포인터·오너 답·하트비트)이 단 한 번뿐인
+    #   확인을 소진해 각성 지시·첫 과제가 영영 빠지는 공백이었다(음성 대조: 그 문구가 남아 있으면 FAIL).
+    check("D", "D9 §4-A-2: ①②④⑤ 뒤 턴 종료 · ③ 은 편성 도구 알림으로 구동(이 턴에서 기다리지 않는다 · '1회 확인' 상한 삭제) · "
+               "'5노드 등장이 끝나면' 대기 문구 삭제 · 받는 쪽 규칙(reinject --check) · 첫 과제는 이 턴에 보내지 않고 빈 셸 금지",
+          "그 턴을 끝낸다" in blk and "이 턴에서 기다리지 않는다" in step3 and "편성 도구" in step3
+          and "알림" in step3 and "1회만 한다" not in blk and "그 1회 확인에서" not in blk
+          and "다음에 깨어났을 때" not in blk
+          and "5노드 등장이 끝나면" not in blk and "reinject --check --role" in blk
+          and "빈 셸에는 보내지 않는다" in step5 and "첫 과제는 이 턴에 보내지 않는다" in step5
+          and "팀장과 팀원 4자리가 떴습니다" not in step5, step3[:160])
+    # ★(0.14.42 RV-ROLE-1 · RV-ROLE-2) 각성 지시 문안은 오너 원문 그대로 **편성 도구 상수**와 같아야 하고, 대표가 직접 보내지
+    #   않으며(편성 도구가 보낸다 — 지침 주입 뒤 · 첫 과제보다 먼저), ACK 수집은 부서장 몫이다.
+    try:
+        fm_spec = importlib.util.spec_from_file_location("javis_formation_d12", os.path.join(BIN, "javis_formation.py"))
+        fm = importlib.util.module_from_spec(fm_spec)
+        fm_spec.loader.exec_module(fm)
+        order = getattr(fm, "AWAKEN_ORDER", None)
+    except Exception as e:  # noqa: BLE001
+        order = None
+        check("D", "D12 편성 도구 모듈 로드", False, repr(e))
+    check("D", "D12 ③ 각성 지시 = 오너 원문(편성 도구 상수와 같은 글자) · 대표는 각성 지시를 직접 보내지 않는다 · "
+               "각성 ACK 수집은 부서장 몫 · 대표는 알림대로 첫 과제·오너 보고만",
+          bool(order) and order in blk and "각성 지시를 직접 보내지 않" in blk
+          and "각성 ACK 수집은 부서장 몫" in blk and "알림이 시키는 대로" in step3, repr(order))
+    # ★(0.14.42 RE-R3-01) 대표가 받는 알림 머리(`[편성 <라벨> — 팀 …]`)의 라벨 전부가 ③ 에 적혀 있어야 한다 — 도구가 새 라벨
+    #   (예: 부서장 착석 뒤 [편성 알림])을 보내는데 지침이 모르면 대표는 그 줄을 '이해 안 되는 말'로 읽는다(③ 축).
+    labels = getattr(fm, "_ONBOARD_LABEL", None) if order else None
+    pat = ("[편성 %s — 팀 <이름>(<팀 번호>)]" % "|".join(labels[k] for k in ("complete", "partial", "pending", "failed", "ready"))
+           if isinstance(labels, dict) else None)
+    check("D", "D13 ③ 알림 머리 라벨 = 편성 도구 라벨 전부(완료·부분·보류·실패·알림) · 부서장 빈 셸이면 앉은 뒤 · ACK 는 본부 CEO 로",
+          bool(pat) and pat in step3 and "빈 셸이면 앉은 뒤" in step3 and "env -u CYS_SOCKET cys send --queued --to master" in blk,
+          repr(pat))
     check("D", "D10 ① Bash 도구 timeout 600000·백그라운드 금지 · 첫 팀 CEO 지침은 이 턴에 주입되지 않고 턴 뒤 1회 재주입",
           "timeout 600000" in step1 and "백그라운드로 돌리거나" in step1 and "cys reinject --role master" in step1,
           step1[:200])

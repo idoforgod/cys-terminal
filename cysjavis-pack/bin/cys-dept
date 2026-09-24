@@ -188,11 +188,14 @@ _cys_detach_ok(){
 _cys_fm_python(){   # 편성 자식 python — 토큰 경로면 새 세션
   if _cys_detach_ok; then python3 -c "$_CYS_SETSID_PY" python3 "$@"; else python3 "$@"; fi
 }
+# ★(0.14.42 RE-R3-01 · RV-ROLE-1) 4번째 인자 = 팀 제안 명세(b64 · allocate --team-spec-b64 성공 꼬리만) — 있으면 편성 결판 알림을
+#   무장한다(`--onboard-dept <이름> --onboard-spec-b64 <명세>` → javis_formation ⑧: 결판 때 부서장 좌석에 오너 문언 각성 지시 ·
+#   대표 좌석에 편성 알림을 큐로 대상·단계당 1회). 빈 값(launch·rotate·카탈로그 create·제안 없는 allocate)은 종전 argv 그대로다.
 # ★(0.14.42 · 원래 있던 결함 수리) 리다이렉트는 **서브셸 바깥**에 둔다 — `( 편성 >>log 2>&1 || true ) &` 는 서브셸 자신이 호출자의
 #   stdout/stderr 파이프를 물려받아, 편성이 끝날 때까지(실편성 수 분 · 부서장 착석 지켜보기 +최대 10분) GUI 의 `output()`·대표의
 #   Bash 도구가 돌아오지 못했다(대표 턴 붙들림 = 회신 적체 · 도구 제한시간 초과 = 거짓 실패). stdin 도 끊는다(/dev/null).
 formation_ensure_async(){
-  local name="$1" sock="$2" cwd="${3:-}" fm log logdir lp lpnote
+  local name="$1" sock="$2" cwd="${3:-}" ob="${4:-}" fm log logdir lp lpnote
   fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
   if [ ! -f "$fm" ]; then
     echo "[cys-dept] WARN: $name 편성 ensure 생략(javis_formation.py 부재) — base 스케줄 심박이 후속 수렴" >&2
@@ -207,16 +210,16 @@ formation_ensure_async(){
   if [ -n "$lp" ]; then
     lpnote="팩=부서 팩($lp)"
     if [ -n "$cwd" ]; then
-      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json || true ) </dev/null >>"$log" 2>&1 &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json ${ob:+--onboard-dept "$name" --onboard-spec-b64 "$ob"} || true ) </dev/null >>"$log" 2>&1 &
     else
-      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --json || true ) </dev/null >>"$log" 2>&1 &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --json ${ob:+--onboard-dept "$name" --onboard-spec-b64 "$ob"} || true ) </dev/null >>"$log" 2>&1 &
     fi
   else
     lpnote="팩=종전 팩(${CYS_PACK_DIR:-$PACK_DEFAULT} — 부서 팩 $(dept_pack "$name") 설치 전 또는 호출자 팩 kill-switch)"
     if [ -n "$cwd" ]; then
-      ( _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json || true ) </dev/null >>"$log" 2>&1 &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json ${ob:+--onboard-dept "$name" --onboard-spec-b64 "$ob"} || true ) </dev/null >>"$log" 2>&1 &
     else
-      ( _cys_fm_python "$fm" ensure --socket "$sock" --json || true ) </dev/null >>"$log" 2>&1 &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --json ${ob:+--onboard-dept "$name" --onboard-spec-b64 "$ob"} || true ) </dev/null >>"$log" 2>&1 &
     fi
   fi
   disown 2>/dev/null || true
@@ -1196,7 +1199,7 @@ sys.exit(3)' 2>/dev/null) || true
 #   대표가 읽는다). GUI 경로(오너 클릭 · 대표 대개 유휴)는 종전 그대로 즉시 재주입한다. 1회성(승격은 첫 팀 1회)이라 폭주 없음.
 ceo_reinject_deferred(){
   local why="${1:-directive}" msg
-  msg="[지침 교체 · cys-dept] 이 좌석(대표)의 지침 파일이 바뀌었다($why). 대화 승인 절차(§4-A-2)를 마쳤으면 \`cys reinject --role master\` 를 1회 실행해 새 지침을 받는다 — 부트 재실행이 아니다(§0-A · 재주입은 이 1회뿐)."
+  msg="[지침 교체 · cys-dept] 이 좌석(대표)의 지침 파일이 바뀌었다($why). \`cys reinject --role master\` 를 1회 실행해 새 지침을 받는다 — 부트 재실행이 아니다(§0-A · 재주입은 이 1회뿐). 편성 결과는 편성 도구가 따로 알린다 — 이 포인터로 편성을 확인하지 않는다(§4-A-2 ③)."
   echo "[cys-dept] 원본 master 재주입($why) 보류 — 대화 승인 경로(대표 턴 도중 강제 주입 금지): 이 턴을 마친 뒤 \`cys reinject --role master\` 1회" >&2
   if env -u CYS_SOCKET "$CYS" send --queued --to master "$msg" >/dev/null 2>&1; then
     echo "[cys-dept] 재주입 포인터 1줄을 큐 배달로 예약(대표가 조용해진 뒤)" >&2
@@ -2229,7 +2232,7 @@ PY
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 번호 재사용으로 묘비명과 충돌 시 보호 재편입
-    formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
+    formation_ensure_async "$name" "$sock" "$dept_cwd" "$TEAM_B64"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd · ★0.14.42: 팀 제안이면 편성 결판 알림 무장
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir cwd=$dept_cwd)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
 }

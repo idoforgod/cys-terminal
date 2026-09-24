@@ -46,6 +46,8 @@ ensure(socket): ①cys gate-check(**fail-closed** — exit 0 에서만 진행 ·
 CLI:
   python3 javis_formation.py ensure --socket <S> [--cwd D] [--json] [--force-surface]
     --force-surface = 전이 없어도 현재 상태 1회 표면화(앱 부트 레인 전용 · 주기 잡 금지)
+    --onboard-dept <부서> --onboard-spec-b64 <명세> = ⑧ 편성 결판 알림 무장(cys-dept allocate --team-spec-b64 성공
+      꼬리 전용 · 부서장 각성 지시·대표 알림을 대상·단계당 1회 · 부서장 빈 자리면 유계 지켜보기)
   python3 javis_formation.py classify --installed claude,agy --live master,cso [--no-resource]
   python3 javis_formation.py self-test
 """
@@ -1017,6 +1019,462 @@ def _emit_evt(evt_type, fields):
     _run(argv, timeout=10)
 
 
+# ── ⑧ 편성 결판 알림(0.14.42 RE-R3-01 · RV-ROLE-1 · RV-ROLE-2) — 이벤트 구동 · 단계별 1회 ──
+# 왜: 대표(CEO)가 턴 안에서 편성을 기다리지 않게 바꾸자(50c6fc33) 편성 뒤의 일 — 부서장 '전원 지침 하달·각성' 지시
+#   (오너 ABSOLUTE ANCHOR) · 첫 과제 · 오너 1줄 보고 — 이 대표의 기억과 '다음 깨어남'의 우연에 매달렸다. 편성은 이 도구가
+#   판정하므로 결판(완결·부분·보류·실패)이 나는 **그 자리에서** ⓐ 새 팀 부서장 좌석에 오너 문언 각성 지시를 ⓑ 본부 대표
+#   좌석에 편성 알림을 `cys send --queued` 로 보낸다. 대표는 알림을 받아 결정·보고만 한다(각성 ACK 수집은 부서장 몫).
+# 무장(arm): `cys-dept allocate --team-spec-b64`(오너 확인 창 [만들기] · 대화 승인 토큰 생성 공통) 성공 꼬리가 ensure 에
+#   `--onboard-dept`·`--onboard-spec-b64` 를 넘긴다 → <상태 루트>/onboard/<소켓키>.json. 무장 없는 레인(기존 부서·launch·
+#   rotate·카탈로그 create·제안 없는 allocate)은 알림 0 — 업그레이드 뒤 기존 부서 전부에 알림이 쏟아지는 폭주(①)가 없다.
+# 1회성: 키 = 무장(부서·제안 id) × 대상(master·ceo) × 단계(complete·partial·pending·failed · 부서장 착석 뒤 ready). 보내기
+#   **전에** 선점을 기록(claim)하고 결과를 확정한다 — 데몬·앱 재기동 뒤의 ensure(심박 10분 · 부트 --force-surface)는 기록을
+#   보고 보내지 않는다. 전송 실패는 키당 ONBOARD_MAX_TRIES 회(다음 ensure = 심박)까지 · 선점 뒤 크래시는 미발송으로 남는다
+#   (최대 1회 — 중복보다 안전) · 시간 초과(미확정)도 재시도하지 않는다. 완결 알림까지 끝나면 무장을 닫는다(done) · TTL 지난
+#   무장과 팀 명부(depts.json)의 제안 id 와 어긋난 무장(지워진 뒤 같은 번호로 되살아난 팀)은 알림 없이 닫는다.
+# 순서(§2 지침 주입이 작업 티켓보다 선행): 부서장 좌석에 에이전트가 **앉아 있을 때만**(seat=occupied · agent 사망 아님)
+#   각성 지시를 넣는다 — 편성의 부트 주입(boot_node INJECT · 같은 큐)이 이미 앞에 있으므로 FIFO 가 지침 → 각성 지시를 보장하고,
+#   대표의 첫 과제는 이 알림 **뒤**에 오므로 그다음이다. 빈 셸이면 보류하고 대표 알림에 보류를 적는다(빈 셸 타이핑 금지).
+# 폭주 방지: 좌석별 큐(병합·상한·최소 간격·빈 좌석 보류)를 그대로 쓴다 — 대상·단계당 1건만 넣는다. kill-switch(paused)·
+#   싱글플라이트 미획득(inflight)은 ensure 가 이 함수에 닿기 전에 끝난다. 보낼 것이 남지 않은 무장은 좌석 관측(cys status)
+#   없이 바로 돌아간다(심박마다 부서당 RPC 1회도 늘리지 않는다).
+# 부서장 빈 셸(제품 기본 — 부서 생성은 팀장 자리를 빈 셸로 띄우고 claude 는 사람이 켠다): 결판 때 대표에게 보류와 오너 안내
+#   (팀장 창에서 claude 실행)를 알리고, **무장한 생성 꼬리 호출만** 부서장이 앉을 때까지 유계(ONBOARD_WATCH_S · 기본 600s =
+#   심박 주기)로 지켜보다 앉으면 곧바로 각성 지시 + 대표 [편성 알림](첫 과제)을 1회 보낸다. 창을 넘기면 심박이 이어받는다
+#   (같은 키라 중복 0). 심박·부트 호출은 기다리지 않는다(부서 순차 루프 · 600s 상한 보호).
+# 대표 주소: 본부 기본 소켓(env 에서 소켓 변수를 뺀다) — cys-dept 의 `env -u CYS_SOCKET` 대표 대상 호출(ceo_reinject_*)과 같은 규약.
+ONBOARD_TTL_S = 86400.0
+ONBOARD_MAX_TRIES = 3
+ONBOARD_WATCH_S = 600.0
+ONBOARD_WATCH_POLL_S = 10.0
+# 오너 원문(ABSOLUTE ANCHOR) — 글자 그대로. MASTER_DIRECTIVE §4-A-2 ③ 도 같은 글자다(test_teamtoken D12 대조).
+AWAKEN_ORDER = "CSO, Worker, 리뷰어 등 모든 노드 전원에게 각자의 지침을 하달하고, 전원 각성 절차를 진행하라."
+# §10 원문 — javis_teamtoken.OWNER_MESSAGES["formation_partial"] 과 같은 글자(test_formation 14a1 대조).
+FORMATION_PARTIAL_MSG = "팀은 만들었지만 자리 {n}개가 아직 뜨지 않았습니다 — 다시 채울까요?"
+LEADER_EMPTY_MSG = ("팀장 자리가 아직 비어 있습니다 — 새 팀의 팀장 창에서 claude 를 실행해 주시면 전원 각성과 첫 과제를 "
+                    "이어서 진행하겠습니다.")
+_ONBOARD_LABEL = {"complete": "완료", "partial": "부분", "pending": "보류", "failed": "실패", "ready": "알림"}
+_ONBOARD_SENT = ("sent", "unconfirmed")   # 미확정(시간 초과)은 들어갔을 수 있다 — 보낸 것으로 친다(중복·정체 둘 다 막는다)
+
+
+def _onboard_path(socket):
+    return os.path.join(_state_root(), "onboard", _sanitize_key(socket) + ".json")
+
+
+def _onboard_read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _onboard_clean(s, cap):
+    s = "".join(" " if (ord(c) < 32 or ord(c) == 127) else c for c in str(s or "")).strip()
+    return s if len(s) <= cap else s[:cap - 1] + "…"
+
+
+def onboard_arm(socket, dept, spec_b64, now=None):
+    """새 팀 편성 알림 무장 → 기록 경로(실패 None · 예외 없음). 같은 제안이면 기존 기록을 그대로 둔다(재실행이 1회성을
+    되돌리지 않는다). 명세는 cys-dept 가 넘긴 URL-safe b64 JSON(v·id·display·purpose — 데몬·cys-dept 가 이미 검증)."""
+    import base64
+    import re as _re
+    now = time.time() if now is None else now
+    try:
+        spec = json.loads(base64.urlsafe_b64decode(str(spec_b64).encode("ascii")).decode("utf-8"))
+        pid, disp = spec["id"], spec["display"]
+        if not (isinstance(pid, str) and isinstance(disp, str) and pid and disp):
+            raise ValueError("id·display")
+        if not _re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(dept or "")):
+            raise ValueError("부서명 형식")
+    except Exception as e:  # noqa: BLE001 — 무장 실패는 알림 0(생성·편성 불파괴)
+        sys.stderr.write("[formation] 편성 알림 무장 생략(명세 판독 실패: %s)\n" % e)
+        return None
+    path = _onboard_path(socket)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _state_write_lock(path):
+            cur = _onboard_read(path)
+            if cur and cur.get("proposal_id") == pid:
+                return path
+            _replace_state_obj(path, {
+                "_doc": "편성 결판 알림 무장(javis_formation ⑧) — 대상·단계당 1회 기록",
+                "v": 1, "dept": dept, "proposal_id": pid, "display": _onboard_clean(disp, 40),
+                "socket": socket or "", "armed_epoch": now, "sent": {}, "tries": {}, "task": False})
+        return path
+    except OSError as e:
+        sys.stderr.write("[formation] 편성 알림 무장 실패(%s) — 알림 0\n" % e)
+        return None
+
+
+def _onboard_update(path, fn):
+    """무장 기록 read-modify-write(짧은 쓰기 잠금 · 유계 2s). fn(rec) 가 반환한 값을 돌려준다 · 잠금·IO 실패는 None.
+    ★교체(os.replace)는 3회까지 다시 시도한다 — Windows 는 다른 프로세스(백신 검사 등)가 파일을 잠깐 열어 두면 교체가
+    PermissionError 로 실패한다. 발송 결과 확정(settle)이 그 한 번에 빠지면 '보냈는데 안 보낸 것'으로 남아 대표에게 틀린
+    안내가 간다."""
+    try:
+        with _state_write_lock(path):
+            rec = _onboard_read(path)
+            if not rec:
+                return None
+            out = fn(rec)
+            for i in range(3):
+                try:
+                    _replace_state_obj(path, rec)
+                    break
+                except OSError:
+                    if i == 2:
+                        raise
+                    time.sleep(0.2)
+            return out
+    except OSError:
+        return None
+
+
+def _onboard_claim(path, key):
+    """보내기 전 선점 — 이미 선점·발송·포기한 키는 False(1회성의 단일 근거)."""
+    def fn(rec):
+        sent = rec.setdefault("sent", {})
+        if rec.get("done") or key in sent:
+            return False
+        sent[key] = {"at": time.time(), "st": "claimed"}
+        return True
+    return _onboard_update(path, fn) is True
+
+
+def _onboard_settle(path, key, ok, task=False):
+    """발송 결과 확정 — True=sent · None=unconfirmed(시간 초과 — 큐에 들어갔을 수 있어 **다시 보내지 않는다**: 중복 배달
+    방지) · False=보내지 못함(시도 수를 올리고 한도 전이면 선점을 풀어 다음 ensure 가 다시 시도한다)."""
+    def fn(rec):
+        sent, tries = rec.setdefault("sent", {}), rec.setdefault("tries", {})
+        if ok is None:
+            sent[key] = {"at": time.time(), "st": "unconfirmed"}
+            if task:
+                rec["task"] = True   # 미확정도 '보낸 것'으로 친다 — 첫 과제 지시를 두 번 내지 않는다
+            sys.stderr.write("[formation] 편성 알림 %s 배달 미확정(시간 초과) — 중복 방지로 재시도하지 않는다\n" % key)
+            return None
+        if ok:
+            sent[key] = {"at": time.time(), "st": "sent"}
+            if task:
+                rec["task"] = True
+            return True
+        tries[key] = int(tries.get(key, 0) or 0) + 1
+        if tries[key] < ONBOARD_MAX_TRIES:
+            sent.pop(key, None)
+        else:
+            sent[key] = {"at": time.time(), "st": "abandoned"}
+            sys.stderr.write("[formation] 편성 알림 %s 전송 %d회 실패 — 포기(폭주 방지)\n" % (key, tries[key]))
+        return False
+    return _onboard_update(path, fn)
+
+
+def _cys_bytes(argv, env, timeout=15):
+    """`cys` 자식 실행 → (rc, stdout 문자열) · 시간 초과 None · 실행 불가 (127, "").
+    ★출력은 **바이트로 받아 UTF-8(replace)로** 푼다 — `_run` 의 text 모드는 로케일 코덱(한국어 Windows cp949)으로 풀어
+    한글 한 바이트에 UnicodeDecodeError → rc 127 로 접힌다. 알림 경로에서 그것은 '보내지 못함' 오판 → 재시도 → 중복 배달이다."""
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return None
+    except OSError:
+        return 127, ""
+    return r.returncode, (r.stdout or b"").decode("utf-8", "replace")
+
+
+def _onboard_status(socket):
+    """부서 레인 `cys status --json`(좌석·에이전트 관측) — 실패 None. 테스트 seam."""
+    env = dict(os.environ, CYS_NO_AUTOSTART="1")
+    if socket:
+        env["CYS_SOCKET"] = socket
+    r = _cys_bytes(["cys", "status", "--json"], env)
+    if not r or r[0] != 0:
+        return None
+    try:
+        obj = json.loads(r[1] or "{}")
+        return obj if isinstance(obj, dict) else None
+    except ValueError:
+        return None
+
+
+def _queue_push(socket, text):
+    """`cys send --queued --to master` 1건 → True(큐 수락) · False(보내지 못함 — 재시도 가능) · None(시간 초과 — 미확정).
+    socket=None 이면 본부 대표(기본 소켓). 테스트 seam.
+    발신 좌석 신원 env 는 뺀다(이 도구는 어느 좌석도 아니다) · 데몬을 새로 띄우지 않는다(CYS_NO_AUTOSTART)."""
+    env = dict(os.environ, CYS_NO_AUTOSTART="1")
+    for k in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET", "CYS_SURFACE_ID", "CYS_SURFACE_REF",
+              "CYS_SEAT_TOKEN", "CYS_ROLE"):
+        env.pop(k, None)
+    if socket:
+        env["CYS_SOCKET"] = socket
+    r = _cys_bytes(["cys", "send", "--queued", "--to", "master", text], env)
+    if r is None:
+        return None
+    if r[0] != 0:
+        sys.stderr.write("[formation] 편성 알림 큐 배달 실패(rc=%s)\n" % r[0])
+    return r[0] == 0
+
+
+def _onboard_registered(rec):
+    """무장이 아직 **그 팀**의 것인가 — 팀 명부(depts.json · cys-dept 와 같은 경로 규약)의 그 부서가 같은 제안 id 를 달고
+    있는가. True/False · 판독 불가 None(이번엔 보내지 않고 닫지도 않는다). 테스트 seam.
+    왜: 알림 전에 팀이 지워지고 같은 번호가 제안 없이 다시 만들어지면(또는 launch 로 되살아나면) 옛 팀 이름의 알림이 대표에게
+    간다(③ '이해 안 되는 말'). 제안 id 가 다르면 그 무장은 낡았다 — 알림 없이 닫는다.
+    ★경로: 쓰는 쪽(cys-dept `REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"`)과 같은 `$HOME` 을 먼저 본다 — Windows
+    파이썬의 `~` 는 USERPROFILE 이라 Git Bash `HOME` 과 갈리는 기계에서는 명부를 영영 못 읽어 알림이 0 이 된다(③)."""
+    env_reg = os.environ.get("CYS_DEPTS_JSON")
+    if env_reg:
+        cands = [env_reg]
+    else:
+        cands = [os.path.join(h, ".cys", "depts.json") for h in (os.environ.get("HOME"), os.path.expanduser("~")) if h]
+    d = None
+    for reg in dict.fromkeys(cands):
+        try:
+            with open(reg, encoding="utf-8-sig") as f:
+                d = json.load(f)
+            break
+        except (OSError, ValueError):
+            continue
+    if d is None:
+        return None
+    e = ((d or {}).get("depts") or {}).get(rec.get("dept")) if isinstance(d, dict) else None
+    return isinstance(e, dict) and e.get("team_proposal_id") == rec.get("proposal_id")
+
+
+def _onboard_stage(state):
+    """상태 → 알림 단계(결판만). inflight·paused·gate-unknown 은 결판이 아니다(None)."""
+    kind = state_kind(state or "")
+    sub = state.split(":", 1)[1] if ":" in (state or "") else ""
+    if kind == "complete":
+        return "complete"
+    if kind == "partial":
+        return None if sub in ("inflight", "paused", "gate-unknown") else "partial"
+    if kind in ("pending-cli", "pending-resource"):
+        return "pending"
+    if kind == "failed":
+        return "failed"
+    return None
+
+
+def _master_ready(status):
+    """부서장 좌석에 에이전트가 앉아 있는가 — agent 사망이면 False · seat=occupied 면 True · seat=empty(빈 셸)면 False ·
+    그 밖(unknown = 좌석 프로브 미도달 · 필드 없는 구 데몬)은 데몬이 에이전트 생존을 관측했을 때만 True(= 보류가 기본)."""
+    for s in (status or {}).get("surfaces") or []:
+        if s.get("role") == "master" and not s.get("exited"):
+            if s.get("agent_alive") is False:
+                return False
+            if s.get("seat") == "occupied":
+                return True
+            if s.get("seat") == "empty":
+                return False
+            return s.get("agent_alive") is True
+    return False
+
+
+def _onboard_sock_arg(socket, dept):
+    # 부서 소켓 경로를 그대로 싣는다 — Windows pane PATH 에 cys-dept 가 없어도 동작(WIN-1 선례) · 따옴표 든 경로만 해소형.
+    if socket and "'" not in socket:
+        return "'%s'" % socket
+    return '"$(cys-dept sock %s)"' % dept
+
+
+def _onboard_ceo_text(rec, stage, master_sent, task_done, missing, detail, socket):
+    """대표 알림 본문 — 이 알림 하나만 보고도 할 일(첫 과제 명령 · 오너 1줄)이 정해지게 쓴다(편성 재조회 불요)."""
+    head = "[편성 %s — 팀 %s(%s)] " % (_ONBOARD_LABEL.get(stage, stage), rec.get("display") or "?", rec.get("dept"))
+    task = ("첫 과제 1회 — cys --socket %s send --queued --to master \"[CEO 지시] <오너가 말한 첫 과제 · 없으면 팀 소개"
+            "(TEAM.md)·설계 SOT 정독 후 대기>\"" % _onboard_sock_arg(socket, rec.get("dept")))
+    tail = " 편성을 다시 조회하거나 기다리지 않는다(§4-A-2 ③)."
+    n = str(len(missing)) if missing is not None else "N"
+    if stage == "ready":
+        return (head + "부서장 자리에 에이전트가 앉아 편성 도구가 전원 각성 지시를 1회 보냈다(각성 ACK 수집은 부서장 몫). "
+                "이 알림에 1회만: ⓐ %s ⓑ 오너에게 1줄 보고.%s" % (task, tail))
+    if stage in ("pending", "failed"):
+        why = _onboard_clean(detail, 160) or "사유 미상"
+        if stage == "pending":
+            say = "오너에게 1줄로 보류 사유를 알린다(완료라 하지 않는다)"
+        elif missing == []:
+            say = "자리는 모두 있다 — 오너 보고는 다음 결과 알림 때 1회"
+        else:
+            cnt = "" if missing is not None else ("(N = `cys --socket %s list` 역할 열의 빈 자리 수 — 1회만 센다)"
+                                                  % _onboard_sock_arg(socket, rec.get("dept")))
+            say = "오너에게 1줄 「%s」%s" % (FORMATION_PARTIAL_MSG.replace("{n}", n), cnt)
+        return (head + "%s. 이 알림에 1회만: %s · 첫 과제는 아직 보내지 않는다(편성이 이어지면 결과 알림이 "
+                "1회 더 온다).%s" % (why, say, tail))
+    says = []
+    if stage == "partial":
+        seats = ("자리 %d개가 뜨지 않았다(%s). " % (len(missing), ", ".join(missing))) if missing is not None \
+            else "뜨지 않은 자리가 있다(좌석 관측 불가). "
+        says.append("「%s」" % FORMATION_PARTIAL_MSG.replace("{n}", n))
+    elif not master_sent:
+        seats = "팀원 자리는 모두 떴다. "
+    else:
+        seats = "5자리가 모두 떴다. " if not task_done else "남은 자리까지 모두 떴다. "
+    if not master_sent:
+        says.append("「%s」" % LEADER_EMPTY_MSG)
+        return (head + seats + "부서장 자리에 에이전트가 아직 없어 각성 지시·첫 과제는 보류했다(빈 셸에는 보내지 않는다 · "
+                "앉으면 편성 도구가 보내고 [편성 알림]이 1회 더 온다). 이 알림에 1회만: 오너에게 1줄 %s(완료라 하지 않는다).%s"
+                % (" ".join(says), tail))
+    say = ("오너에게 1줄 %s(완료라 하지 않는다)" % " ".join(says)) if says else "오너에게 1줄 보고"
+    if task_done:
+        return (head + seats + "편성 도구가 부서장에게 전원 각성 지시를 1회 더 보냈다. 첫 과제는 앞선 편성 알림에서 이미 "
+                "지시했다 — 다시 보내지 않는다. 이 알림에 1회만: %s.%s" % (say, tail))
+    return (head + seats + "편성 도구가 부서장에게 전원 각성 지시를 1회 보냈다(각성 ACK 수집·미각성 보고는 부서장 몫). "
+            "이 알림에 1회만: ⓐ %s ⓑ %s.%s" % (task, say, tail))
+
+
+def _onboard_awaken_text(stage):
+    # 오너 원문은 글자 그대로 한 덩어리로 싣고, 받는 법은 괄호 뒤에 따로 붙인다(원문을 고쳐 쓰지 않는다).
+    return ("[CEO 지시 · 편성 %s] %s (편성 도구가 CEO 대신 1회 보낸 지시 · 받는 법: MASTER_DIRECTIVE §4-A-2 ③ — "
+            "미각성 좌석만 cys reinject --check · 결과는 CEO 에게 1회 보고)"
+            % ("완료" if stage == "complete" else "부분", AWAKEN_ORDER))
+
+
+def _onboard_send(path, key, socket, text, task=False):
+    """선점 → 큐 1건 → 확정. 반환 = "sent" · "unconfirmed"(시간 초과) · "failed"(보내지 못함) · "skip"(이미 선점·발송·포기 —
+    이번 호출은 보내지 않았다)."""
+    if not _onboard_claim(path, key):
+        return "skip"
+    ok = _queue_push(socket, text)
+    _onboard_settle(path, key, ok, task=task)
+    return "sent" if ok else ("unconfirmed" if ok is None else "failed")
+
+
+def _onboard_st(rec, key):
+    return ((rec.get("sent") or {}).get(key) or {}).get("st")
+
+
+def _onboard_left(rec, stage, ext_master):
+    """이 단계에서 아직 보낼 것이 있는가 — 없으면 좌석 관측(cys status) 없이 끝낸다. 선점(claimed)·포기도 '끝난 것'이다."""
+    sent = rec.get("sent") or {}
+    if "ceo:" + stage not in sent:
+        return True
+    if stage not in ("complete", "partial"):
+        return False
+    if not ext_master and "master:" + stage not in sent:
+        return True
+    if rec.get("task") or "ceo:ready" in sent:
+        return False
+    # 남은 것은 [편성 알림](첫 과제) 하나 — 각성 지시가 실제로 나갔을 때만 보낼 수 있다.
+    return ext_master or any(_onboard_st(rec, k) in _ONBOARD_SENT for k in ("master:complete", "master:partial"))
+
+
+def _onboard_notify(socket, state, detail=""):
+    """편성 결판 알림 — 무장된 새 팀만 · 대상·단계당 1회. 어떤 실패도 예외로 올리지 않는다(편성 불파괴).
+    반환: "wait_master" = 이 단계의 부서장 각성 지시가 부서장 빈 자리로 보류 중(무장 호출의 지켜보기 대상) · 그 밖 None."""
+    try:
+        stage = _onboard_stage(state)
+        if stage is None:
+            return None
+        path = _onboard_path(socket)
+        rec = _onboard_read(path)
+        if not rec or rec.get("done"):
+            return None
+        now = time.time()
+        if now - float(rec.get("armed_epoch") or 0) > ONBOARD_TTL_S:
+            _onboard_update(path, lambda r: r.__setitem__("done", "expired"))
+            sys.stderr.write("[formation] 편성 알림 무장 만료(%s · %s) — 늦은 알림 없이 닫음\n"
+                             % (rec.get("dept"), rec.get("proposal_id")))
+            return None
+        required = effective_required_roles()
+        ext_master = "master" not in required
+        if not _onboard_left(rec, stage, ext_master):
+            return None
+        owned = _onboard_registered(rec)
+        if owned is None:
+            return None   # 팀 명부 판독 불가 — 이번엔 보류(다음 ensure 가 다시 본다)
+        if owned is False:
+            _onboard_update(path, lambda r: r.__setitem__("done", "stale"))
+            sys.stderr.write("[formation] 편성 알림 무장이 팀 명부와 어긋남(%s · %s) — 알림 없이 닫음\n"
+                             % (rec.get("dept"), rec.get("proposal_id")))
+            return None
+        status = _onboard_status(socket)
+        if status is None and stage in ("complete", "partial"):
+            # 좌석을 못 보면 부서장이 앉았는지 모른다 — '빈 자리' 로 알리면 틀린 안내다. 이번엔 보내지 않는다(다음 ensure).
+            sys.stderr.write("[formation] 편성 알림 보류 — 부서 좌석 관측 불가(cys status) · 다음 점검에서 다시 본다\n")
+            return None
+        missing = None
+        if status is not None:
+            live = _roster_from_status(status)
+            missing = [r for r in required if r not in live]
+        mkey = "master:" + stage
+        m_res = None
+        if stage in ("complete", "partial") and not ext_master and _master_ready(status):
+            m_res = _onboard_send(path, mkey, socket, _onboard_awaken_text(stage))
+        rec = _onboard_read(path) or rec
+        # 이번 호출의 결과를 먼저 믿는다(확정 기록이 교체 실패로 빠져도 대표 안내가 틀리지 않게) · 없으면 기록.
+        m_now = ext_master or m_res in _ONBOARD_SENT or _onboard_st(rec, mkey) in _ONBOARD_SENT
+        m_any = m_now or any(_onboard_st(rec, k) in _ONBOARD_SENT for k in ("master:complete", "master:partial"))
+        task_done = bool(rec.get("task"))
+        sent = rec.get("sent") or {}
+        ckey = "ceo:" + stage
+        if ckey not in sent:
+            text = _onboard_ceo_text(rec, stage, m_now, task_done, missing, detail, socket)
+            gives_task = stage in ("complete", "partial") and m_now and not task_done
+            _onboard_send(path, ckey, None, text, task=gives_task)
+        elif stage in ("complete", "partial") and m_any and not task_done and "ceo:ready" not in sent:
+            _onboard_send(path, "ceo:ready", None,
+                          _onboard_ceo_text(rec, "ready", True, False, missing, detail, socket), task=True)
+        rec = _onboard_read(path) or {}
+        settled = lambda k: _onboard_st(rec, k) in ("sent", "unconfirmed", "abandoned")   # noqa: E731
+        if stage == "complete" and settled("ceo:complete") and (ext_master or settled("master:complete")) \
+                and (rec.get("task") or settled("ceo:ready") or ext_master):
+            _onboard_update(path, lambda r: r.__setitem__("done", now))
+            return None
+        if stage in ("complete", "partial") and not ext_master and mkey not in (rec.get("sent") or {}) \
+                and not rec.get("done"):
+            return "wait_master"   # 이 단계의 각성 지시를 아직 보낼 수 있다(부서장 빈 자리로 보류 중)
+        return None
+    except Exception as e:  # noqa: BLE001 — 알림 실패가 편성 판정·기록을 깨지 않는다
+        sys.stderr.write("[formation] 편성 알림 처리 예외(무시): %s\n" % e)
+        return None
+
+
+def _onboard_wait_pending(socket, state):
+    """무장 기록상 이 단계의 부서장 각성 지시가 아직 보낼 수 있는 채로 남았는가(= 부서장 빈 자리로 보류) — 순수 판독."""
+    stage = _onboard_stage(state)
+    if stage not in ("complete", "partial") or "master" not in effective_required_roles():
+        return False
+    rec = _onboard_read(_onboard_path(socket))
+    return bool(rec) and not rec.get("done") and "master:" + stage not in (rec.get("sent") or {})
+
+
+def _onboard_watch_limits():
+    """지켜보기 창·간격(초) — env 로 줄이거나 끌 수 있다(0 = 끔 · 상한 3600 · 간격 1~60)."""
+    def num(name, dflt, lo, hi):
+        try:
+            v = float(os.environ.get(name, "") or dflt)
+        except ValueError:
+            v = dflt
+        return max(lo, min(hi, v))
+    return (num("CYS_ONBOARD_WATCH_S", ONBOARD_WATCH_S, 0.0, 3600.0),
+            num("CYS_ONBOARD_WATCH_POLL_S", ONBOARD_WATCH_POLL_S, 1.0, 60.0))
+
+
+def _onboard_watch(socket, state):
+    """무장한 생성 꼬리 호출 전용 — 결판 때 부서장 자리가 비어 각성 지시를 보류했으면, 부서장이 앉을 때까지 유계로 지켜보다
+    앉으면 그 자리에서 1회 보낸다(각성 지시 → 대표 [편성 알림]). 반환 = "sent" · "closed" · "paused" · "timeout" · "off".
+    폭주 방지: 간격마다 좌석 관측(cys status) 1회뿐 · 보내는 것은 _onboard_notify(선점 원장)라 심박과 겹쳐도 키당 1회 ·
+    kill-switch 가 서 있으면 보내지 않고 끝낸다(심박이 해제 뒤 이어받는다)."""
+    window, poll = _onboard_watch_limits()
+    if window <= 0:
+        return "off"
+    deadline = time.monotonic() + window
+    stage_state = state
+    while time.monotonic() + poll <= deadline:
+        time.sleep(poll)
+        rec = _onboard_read(_onboard_path(socket))
+        if not rec or rec.get("done"):
+            return "closed"
+        if not _master_ready(_onboard_status(socket)):
+            continue
+        if not gate_check():
+            return "paused"
+        stage_state = _read_state(socket) or stage_state
+        if _onboard_notify(socket, stage_state) != "wait_master":
+            return "sent"
+    return "timeout"
+
+
 def _surface(socket, prev_state, state, force=False, detail=None):
     """상태 표면화 — (1) UI 배너 수명 신호(feed --kind) (2) 음성/HUD EVT. kind 전이 또는 최초
     관측 시에만 발화(심박 스팸 억제·'전이 시' 계약). 전부 best-effort·부트 무해(R10).
@@ -1091,6 +1549,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
                       + _external_note())
             _write_state(socket, state, detail, live_now, attempts=attempts)
             _surface(socket, prev, state, force=force_surface)
+            _onboard_notify(socket, state, detail)   # ⑧ 편성 결판 알림(무장된 새 팀만 · 대상·단계당 1회 · 락 안)
             return state, detail
 
         # ④ 자원 게이트(complete 가 **아닐 때만** — 실제로 노드를 스폰하는 경로에서만 예산을 본다)
@@ -1106,6 +1565,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
                          gate=_gate_compact(gate_obj))
             _surface(socket, prev, state, force=force_surface,
                      detail=_resource_feed_body(gate_obj))
+            _onboard_notify(socket, state, detail)   # ⑧ 편성 결판 알림(무장된 새 팀만 · 대상·단계당 1회 · 락 안)
             return state, detail
 
         # CLI 전무 → pending-cli(빈 셸 유지·온보딩 보존)
@@ -1115,6 +1575,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
             detail = "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)" + _external_note()
             _write_state(socket, state, detail, live, attempts=attempts)
             _surface(socket, prev, state, force=force_surface)
+            _onboard_notify(socket, state, detail)   # ⑧ 편성 결판 알림(무장된 새 팀만 · 대상·단계당 1회 · 락 안)
             return state, detail
 
         # ⑤⑥ 설치된 CLI 기준 최대 편성. master 먼저(입양 경로) → CSO → 나머지.
@@ -1169,6 +1630,7 @@ def ensure(socket=None, cwd=None, force_surface=False):
                   "%s — 쿨다운/소진 원장에 따라 자동 재시도(소진 래치는 역할 생존 관측 또는 %.0fs 경과 시 "
                   "리셋) · 상태파일 held 키 참조" % (", ".join(held), FORMATION_ATTEMPT_RESET_S),
                   feed_kind_for_state(state))
+        _onboard_notify(socket, state, detail)   # ⑧ 편성 결판 알림(무장된 새 팀만 · 대상·단계당 1회 · 락 안)
         return state, detail
 
 
@@ -1492,11 +1954,17 @@ def _cmd_ensure(argv):
       schedule.error 표면화. held·pending 은 exit 0 이라 rc 로는 보이지 않는다(상태파일 held/gate 키가 흔적).
     """
     socket, cwd, as_json, force_surface = None, None, False, False
+    ob_dept, ob_b64 = None, None
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--socket" and i + 1 < len(argv):
             socket = argv[i + 1]; i += 2; continue
+        # ★⑧ 편성 결판 알림 무장(0.14.42) — cys-dept allocate --team-spec-b64 성공 꼬리만 넘긴다(심박·부트는 안 넘긴다).
+        if a == "--onboard-dept" and i + 1 < len(argv):
+            ob_dept = argv[i + 1]; i += 2; continue
+        if a == "--onboard-spec-b64" and i + 1 < len(argv):
+            ob_b64 = argv[i + 1]; i += 2; continue
         if a == "--cwd" and i + 1 < len(argv):
             cwd = argv[i + 1]; i += 2; continue
         if a == "--json":
@@ -1506,15 +1974,28 @@ def _cmd_ensure(argv):
         if a == "--force-surface":
             force_surface = True; i += 1; continue
         i += 1
+    if ob_dept and ob_b64:
+        onboard_arm(socket, ob_dept, ob_b64)   # 실패는 stderr 1줄 · 알림 0(편성은 그대로)
     try:
         state, detail = ensure(socket=socket, cwd=cwd, force_surface=force_surface)
     except Exception as e:  # 최후 graceful — 예외 스택 대신 명시 메시지
         state, detail = "failed:%s" % type(e).__name__, str(e)
         _touch_state(socket, "failed:%s — %s" % (type(e).__name__, str(e)[:200]))
+        _onboard_notify(socket, state, detail)   # ⑧ 실패도 결판이다(무장된 새 팀만 · 1회)
     summary = {"ok": state_kind(state) in ("complete", "partial"),
                "state": state, "kind": state_kind(state), "detail": detail,
                "socket": socket or ""}
     print(json.dumps(summary, ensure_ascii=False))
+    # ★⑧ 무장한 생성 꼬리 호출만: 부서장 빈 자리로 각성 지시를 보류했으면 앉을 때까지 유계로 지켜본다(심박·부트는 안 한다 —
+    #   무장 인자가 없다). 판정·기록·stdout 은 위에서 이미 끝났다 — 지켜보기는 exit 코드를 바꾸지 않는다.
+    if ob_dept and ob_b64:
+        try:
+            if _onboard_wait_pending(socket, state):
+                sys.stdout.flush()
+                sys.stderr.write("[formation] 부서장 자리 비어 각성 지시 보류 — 앉을 때까지 지켜본다(유계)\n")
+                sys.stderr.write("[formation] 지켜보기 종료: %s\n" % _onboard_watch(socket, state))
+        except Exception as e:  # noqa: BLE001 — 지켜보기 실패는 심박이 이어받는다
+            sys.stderr.write("[formation] 지켜보기 예외(무시 · 심박이 이어받음): %s\n" % e)
     # complete=0 / partial·pending=0(부트 무해·비블록) / failed=1(graceful 비0)
     return 1 if state_kind(state) == "failed" else 0
 
@@ -1544,13 +2025,15 @@ def main(argv):
     if cmd == "ensure":
         return _cmd_ensure(argv[2:])
     sys.stderr.write("usage: javis_formation.py ensure --socket <S> [--cwd D] [--json] "
-                     "[--force-surface] | "
+                     "[--force-surface] [--onboard-dept <부서> --onboard-spec-b64 <명세>] | "
                      "classify --installed a,b --live x,y [--no-resource] | self-test\n"
                      "env: CYS_FORMATION_EXTERNAL_ROLES=<role,role> "
                      "(외부 세션 담당 역할 — 로스터·좌석 생성에서 제외 · 기본 빈값=제외 0)\n"
                      "     CYS_FORMATION_IGNORE_GATE=1 "
                      "(gate-check **판정 불능**일 때만 fail-closed 해제 · 기본 미설정=보류 · "
-                     "paused(exit 4)·PAUSED 파일은 우회 불가)\n")
+                     "paused(exit 4)·PAUSED 파일은 우회 불가)\n"
+                     "     CYS_ONBOARD_WATCH_S=<초> CYS_ONBOARD_WATCH_POLL_S=<초> "
+                     "(--onboard-* 호출의 부서장 착석 지켜보기 창·간격 · 기본 600·10 · 0=끔)\n")
     return 2
 
 

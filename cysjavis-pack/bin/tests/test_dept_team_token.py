@@ -457,6 +457,66 @@ class T18TokenDaemonDetached(Base):
                         "토큰 경로 cysd 가 호출자 프로세스 그룹에 남았다: %s (호출자 pgid=%d)" % (spawn[0], os.getpgrp()))
 
 
+class T19OnboardArm(Base):
+    """RE-R3-01 · RV-ROLE-1: 편성 결판 알림(부서장 전원 각성 지시 · 대표 편성 알림)은 **팀 제안으로 새로 만든 팀**에만
+    무장한다 — 생성 꼬리의 편성 ensure 에 `--onboard-dept <이름> --onboard-spec-b64 <명세>` 를 넘긴다. 제안 없는
+    allocate(전문가용 직접 만들기)·launch·rotate 는 무장하지 않는다(기존 부서에 알림이 쏟아지는 폭주 차단)."""
+
+    STUB = ("#!/usr/bin/env python3\nimport json, os, sys\n"
+            "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fm-argv.jsonl'), 'a') as f:\n"
+            "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+
+    def _stub_formation(self, home):
+        b = os.path.join(home, ".cys", "pack", "bin")
+        os.makedirs(b, exist_ok=True)
+        _write_exec(os.path.join(b, "javis_formation.py"), self.STUB)
+        return os.path.join(b, "fm-argv.jsonl")
+
+    def _argv(self, log, n=1):
+        import time as _t
+        for _ in range(100):   # 편성은 백그라운드(disown) — 기록을 잠시 기다린다
+            try:
+                with open(log, encoding="utf-8") as f:
+                    rows = [json.loads(x) for x in f.read().splitlines() if x.strip()]
+                if len(rows) >= n:
+                    return rows
+            except (OSError, ValueError):
+                pass
+            _t.sleep(0.1)
+        return []
+
+    def test_token_create_arms_onboarding(self):
+        log = self._stub_formation(self.home)
+        rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0)
+        self.assertEqual(rc, 0, err[-800:])
+        rows = self._argv(log)
+        self.assertEqual(len(rows), 1, "편성 ensure 가 1회가 아니다: %r" % rows)
+        a = rows[0]
+        self.assertIn("ensure", a)
+        self.assertTrue("--onboard-dept" in a and a[a.index("--onboard-dept") + 1] == "dept-1",
+                        "토큰 경로 생성이 편성 알림을 무장하지 않았다: %r" % a)
+        self.assertTrue("--onboard-spec-b64" in a and a[a.index("--onboard-spec-b64") + 1] == spec_b64(good_spec()),
+                        "무장 명세가 데몬이 준 제안 명세와 다르다: %r" % a)
+
+    def test_gui_spec_allocate_arms_and_plain_allocate_does_not(self):
+        self.env = make_env(self.home, role=None)
+        log = self._stub_formation(self.home)
+        r = subprocess.run(["bash", DEPT, "allocate", "--team-spec-b64", spec_b64(good_spec())],
+                           capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        rows = self._argv(log)
+        self.assertTrue(rows and "--onboard-dept" in rows[0] and "--onboard-spec-b64" in rows[0],
+                        "GUI 확인 창 [만들기](제안 명세 allocate)가 편성 알림을 무장하지 않았다: %r" % rows)
+        r2 = subprocess.run(["bash", DEPT, "allocate"], capture_output=True, text=True, encoding="utf-8",
+                            env=self.env, timeout=120)
+        self.assertEqual(r2.returncode, 0, r2.stderr[-800:])
+        rows = self._argv(log, 2)
+        self.assertEqual(len(rows), 2, rows)
+        self.assertFalse([x for x in rows[1] if x.startswith("--onboard")],
+                         "제안 없는 allocate 가 편성 알림을 무장했다(대표에게 근거 없는 알림): %r" % rows[1])
+
+
+
 class T20FormationDoesNotHoldCallerPipes(Base):
     """편성은 백그라운드다 — 호출자의 stdout/stderr 파이프를 붙들면 안 된다(0.14.42 RE-R3-01 수정 중 발견 · 원래 있던 결함).
     GUI 는 `cys-dept allocate` 를 `Command::output()`(파이프 EOF 까지 대기)으로, 대표는 Bash 도구로 부른다. 종전
