@@ -36,6 +36,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -200,8 +201,20 @@ def new_token(now, feed=None, utter="그래 만들어", ledger=None):
     feed = FEED1 if feed is None else feed
     delivery([boot(now)] if ledger is None else ledger)
     a = tt.open_ask(PROPOSAL, now=now, feed_items=feed)
-    r = tt.issue(utter, now=now, feed_items=feed)
+    r = hissue(utter, now=now, feed_items=feed)
     return r.get("token"), a, r
+
+
+def hook_meta(ts, session="sess-test"):
+    """훅 목격 증거(테스트 전용 합성 — 판정 스위트의 기본 경로). 제품에서는 `javis_teamtoken._hook_witness` 가
+    런처가 **방금** 쓴 `<상태>/hook-input-<N>.json` 에서만 만든다 — 그 출처 확인은 H 스위트가 CLI 로 잰다."""
+    return {"via": "hook", "session_id": session, "hook_input": "hook-input-4242.json",
+            "hook_input_mtime": float(ts)}
+
+
+def hissue(prompt, now=None, **kw):
+    """UserPromptSubmit 훅이 부르는 발급(목격 증거 동봉). 증거 없는 직접 호출은 H 스위트가 따로 잰다."""
+    return tt.issue(prompt, now=now, meta=hook_meta(time.time() if now is None else now), **kw)
 
 
 def forged_token():
@@ -264,7 +277,7 @@ def suite_attack():
         delivery([boot(NOW)])
         a = tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)   # 질문은 정상 시점에 열렸다
         delivery(led(NOW))
-        r = tt.issue(utter, now=NOW, feed_items=feed)
+        r = hissue(utter, now=NOW, feed_items=feed)
         got = bool(r.get("token"))
         check("A", cid, a.get("ok") and got == expect and r.get("code") == code,
               "%s · 기대=%s/%s 실제=%s/%s · %s" % (name, "발급" if expect else "차단", code,
@@ -275,7 +288,7 @@ def suite_attack():
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
     delivery([boot(NOW), drec("그래 만들어", NOW - 3)])
-    r = tt.issue("그래 만들어", now=NOW, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW, feed_items=FEED1)
     check("A", "A1+ 기계가 짧은 긍정 원문을 배달", not r.get("token") and r.get("code") == "machine_origin",
           "code=%s" % r.get("code"))
 
@@ -347,7 +360,7 @@ def suite_fp():
         fresh()
         delivery([boot(NOW)])
         tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-        r = tt.issue(utter, now=NOW, feed_items=FEED1)
+        r = hissue(utter, now=NOW, feed_items=FEED1)
         got = bool(r.get("token"))
         want_codes = ("token_issued",) if expect else ("utterance_rejected", "utterance_ambiguous")
         check("F", cid, got == expect and r.get("code") in want_codes,
@@ -364,20 +377,20 @@ def suite_fp():
 def suite_ask():
     fresh()
     delivery([boot(NOW)])
-    r = tt.issue("그래 만들어", now=NOW, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW, feed_items=FEED1)
     check("G", "G1 질문 미개설이면 승인 발화도 차단",
           not r.get("token") and r.get("code") == "ask_not_open", r.get("code"))
     # G2 — ★만료와 미개설은 다른 코드·다른 문구(설계서 §10 끝 구현 주의)
     fresh()
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-    r = tt.issue("그래 만들어", now=NOW + tt.ASK_TTL_S + 1, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW + tt.ASK_TTL_S + 1, feed_items=FEED1)
     ok2 = (not r.get("token") and r.get("code") == "ask_expired"
            and r.get("message") == tt.OWNER_MESSAGES["ask_expired"]
            and r.get("message") != tt.OWNER_MESSAGES["ask_not_open"])
     check("G", "G2 질문 TTL(300s) 만료는 '만료'로 말한다", ok2,
           "code=%s msg=%s" % (r.get("code"), r.get("message")))
-    r = tt.issue("그래 만들어", now=NOW + tt.ASK_TTL_S + 2, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW + tt.ASK_TTL_S + 2, feed_items=FEED1)
     check("G", "G2+ 만료 고지는 1회 — 다음 발화는 미개설", r.get("code") == "ask_not_open"
           and not r.get("token"), r.get("code"))
     # G3 — 다른 제안에 열린 질문
@@ -385,7 +398,7 @@ def suite_ask():
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
     feed_swapped = [item(PROPOSAL, status="resolved"), item(OTHER_PROPOSAL)]
-    r = tt.issue("그래 만들어", now=NOW, feed_items=feed_swapped)
+    r = hissue("그래 만들어", now=NOW, feed_items=feed_swapped)
     ra = tt.open_ask(PROPOSAL, now=NOW, feed_items=feed_swapped)
     check("G", "G3 다른 제안에 열린 질문으로는 차단(발급·개설 모두)",
           not r.get("token") and r.get("code") == "proposal_not_pending"
@@ -396,7 +409,7 @@ def suite_ask():
     delivery([boot(NOW)])
     feed24 = [item(PROPOSAL, publisher=OTHER_SURFACE)]
     a24 = tt.open_ask(PROPOSAL, surface=OTHER_SURFACE, now=NOW, feed_items=feed24)
-    r = tt.issue("그래 만들어", surface=SURFACE, now=NOW, feed_items=feed24)
+    r = hissue("그래 만들어", surface=SURFACE, now=NOW, feed_items=feed24)
     a22 = tt.open_ask(PROPOSAL, surface=SURFACE, now=NOW, feed_items=feed24)
     check("G", "G4 다른 좌석에 열린 질문으로는 차단 · 발행 좌석 아닌 자리는 질문도 못 연다",
           a24.get("ok") and not r.get("token") and not a22.get("ok")
@@ -406,16 +419,16 @@ def suite_ask():
     fresh()
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-    r1 = tt.issue("그래 만들어", now=NOW, feed_items=FEED1)
-    r2 = tt.issue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    r1 = hissue("그래 만들어", now=NOW, feed_items=FEED1)
+    r2 = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
     check("G", "G5 한 질문은 한 번만 소비", bool(r1.get("token")) and not r2.get("token"),
           "1차=%s 2차=%s" % (r1.get("code"), r2.get("code")))
     # G6 — 질문이 열려 있어도 기계 배달은 차단 · 기계 발화는 질문을 소비하지 않는다
     fresh()
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-    r1 = tt.issue("[wakeup] 그래 만들어", now=NOW, feed_items=FEED1)
-    r2 = tt.issue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    r1 = hissue("[wakeup] 그래 만들어", now=NOW, feed_items=FEED1)
+    r2 = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
     check("G", "G6 질문이 열려 있어도 기계 배달은 차단(질문은 남는다)",
           not r1.get("token") and r1.get("code") == "machine_origin" and bool(r2.get("token")),
           "기계=%s 이어서 오너=%s" % (r1.get("code"), r2.get("code")))
@@ -423,8 +436,8 @@ def suite_ask():
     fresh()
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-    r1 = tt.issue("이름을 편집부로 바꿔줘", now=NOW, feed_items=FEED1)
-    r2 = tt.issue("응", now=NOW + 1, feed_items=FEED1)
+    r1 = hissue("이름을 편집부로 바꿔줘", now=NOW, feed_items=FEED1)
+    r2 = hissue("응", now=NOW + 1, feed_items=FEED1)
     check("G", "G7 사람의 비승인 답은 질문을 닫는다(뒤이은 '응'은 발급 안 됨)",
           not r1.get("token") and r1.get("code") == "utterance_ambiguous" and not r2.get("token"),
           "1차=%s 2차=%s" % (r1.get("code"), r2.get("code")))
@@ -432,7 +445,7 @@ def suite_ask():
     fresh()
     delivery([boot(NOW)])
     n0 = len(ledger_records())
-    r = tt.issue("오늘 회의 몇 시지", now=NOW, feed_items=FEED1)
+    r = hissue("오늘 회의 몇 시지", now=NOW, feed_items=FEED1)
     check("G", "G8 무질문 무관 발화 = 조용한 무동작(exit 3 · 원장 무기록)",
           r.get("exit") == tt.EXIT_NO_ASK and not r.get("token") and len(ledger_records()) == n0,
           "exit=%s code=%s" % (r.get("exit"), r.get("code")))
@@ -456,7 +469,9 @@ if op == "consume":
     r = tt.consume(os.environ["TT_TOKEN"], os.environ["TT_PROPOSAL"], os.environ["TT_SURFACE"],
                    os.environ["TT_BODY"], phase=os.environ["TT_PHASE"])
 elif op == "issue":
-    r = tt.issue(os.environ["TT_PROMPT"], feed_items=feed)
+    r = tt.issue(os.environ["TT_PROMPT"], feed_items=feed,
+                 meta={"via": "hook", "session_id": "sess-race", "hook_input": "hook-input-1.json",
+                       "hook_input_mtime": time.time()})
 else:
     r = {"ok": False, "code": "bad_op"}
 print(json.dumps({"ok": bool(r.get("ok")), "code": r.get("code"), "token": r.get("token")}))
@@ -637,7 +652,7 @@ def suite_missing():
     append_raw(json.dumps({"v": 1, "kind": "team-create-ask", "event": "ask_opened",
                            "ask_id": "1" * 16, "proposal_id": PROPOSAL, "surface": SURFACE,
                            "body_digest": "", "opened_at": NOW, "expires_at": NOW + 300}) + "\n")
-    r = tt.issue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
     check("M", "M6 본문해시 빈 질문 레코드 → 발급 거부(시제품의 건너뛰기 = fail-open 봉합)",
           not r.get("token") and r.get("code") == "ledger_corrupt", r.get("code"))
     fresh()
@@ -667,7 +682,7 @@ def suite_failclosed():
     t, _a, _r = new_token(NOW)
     append_raw("{이건 json 이 아니다}\n")
     r = tt.consume(t, PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 1)
-    r2 = tt.issue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    r2 = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
     check("C", "C1 손상 줄(개행 종료) → 소비·발급 모두 거부(exit 4)",
           not r.get("ok") and r.get("code") == "ledger_corrupt" and r.get("exit") == tt.EXIT_INTERNAL
           and not r2.get("token"), "%s/%s" % (r.get("code"), r2.get("code")))
@@ -711,7 +726,7 @@ def suite_failclosed():
         raise RuntimeError("판별 모듈 폭발(주입)")
     tt._mission = boom
     try:
-        r = tt.issue("그래 만들어", now=NOW, feed_items=FEED1)
+        r = hissue("그래 만들어", now=NOW, feed_items=FEED1)
     finally:
         tt._mission = orig
     check("C", "C4 판별 모듈 예외 → 발급 거부(internal_error · exit 4)",
@@ -783,11 +798,33 @@ def suite_status():
     check("S", "S1 무질문 → ask_not_open", s0.get("code") == "ask_not_open", s0.get("code"))
     check("S", "S2 질문 열림 · 답 없음 → awaiting_answer", s1.get("code") == "awaiting_answer",
           s1.get("code"))
-    check("S", "S3 질문 만료 · 발급 0 → approval_not_received(§10 행)",
-          s2.get("code") == "approval_not_received"
-          and s2.get("message") == tt.OWNER_MESSAGES["approval_not_received"], s2.get("code"))
+    # ★(리뷰 m2) 답 없이 만료된 질문은 ask_expired — "한 번 더 쳐 주세요"(approval_not_received)를 말하게 하면
+    #   질문이 이미 만료라 다시 쳐도 성공할 수 없다(설계 §7-3 ① 처방 ↔ ask 게이트 모순). 질문을 새로 열어야 한다.
+    check("S", "S3 질문이 답 없이 만료 · 발급 0 → ask_expired(질문을 새로 연다 — 디렉티브 절차 5 '3 부터 다시')",
+          s2.get("code") == "ask_expired"
+          and s2.get("message") == tt.OWNER_MESSAGES["ask_expired"], s2.get("code"))
+    # S3b 불변식 — status 가 '다시 쳐 주세요' 계열(awaiting_answer·approval_not_received)을 말하는 상태라면, 오너가
+    #     그 말대로 곧바로 다시 친 승인은 실제로 토큰이 된다(안내가 성공할 수 없는 행동을 시키지 않는다).
+    retype_codes = ("awaiting_answer", "approval_not_received")
+    broken = []
+    for label, t_status in (("TTL 안", NOW + 10), ("TTL 뒤", NOW + tt.ASK_TTL_S + 5)):
+        fresh()
+        delivery([boot(NOW)])
+        tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+        st = tt.status(now=t_status)
+        if st.get("code") in retype_codes:
+            rr = hissue("그래 만들어", now=t_status + 1, feed_items=FEED1)
+            if not rr.get("token"):
+                broken.append("%s: status=%s → 다시 친 승인=%s" % (label, st.get("code"), rr.get("code")))
+        elif st.get("code") not in ("ask_expired", "ask_not_open"):
+            broken.append("%s: status=%s(재개설 신호도 아님)" % (label, st.get("code")))
+    check("S", "S3b '다시 쳐 주세요'를 말하게 하는 status 에서는 다시 친 승인이 실제로 발급된다", not broken,
+          "; ".join(broken))
+    fresh()
+    delivery([boot(NOW)])
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
     tt.open_ask(PROPOSAL, now=NOW + 400, feed_items=FEED1)
-    r = tt.issue("그래 만들어", now=NOW + 401, feed_items=FEED1)
+    r = hissue("그래 만들어", now=NOW + 401, feed_items=FEED1)
     s3 = tt.status(now=NOW + 402)
     cnt = s3.get("counts") or {}
     check("S", "S4 발급 뒤 token_ready(토큰 동봉) · 계수 ask_opened=2 token_issued=1",
@@ -797,7 +834,7 @@ def suite_status():
     fresh()
     delivery([boot(NOW)])
     tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
-    tt.issue("음 글쎄", now=NOW + 1, feed_items=FEED1)
+    hissue("음 글쎄", now=NOW + 1, feed_items=FEED1)
     s4 = tt.status(now=NOW + 2)
     check("S", "S5 최근 질문이 거부로 닫힘 → 그 사유 코드를 그대로 보고",
           s4.get("code") == "utterance_ambiguous", s4.get("code"))
@@ -816,16 +853,41 @@ SECTION10 = {
     "ledger_unreadable": "승인을 확인할 근거 기록이 없어 만들지 않았습니다(안전 정지). 앱을 재시작한 뒤 다시 말씀해 주세요.",
     "no_pending": "지금 대기 중인 팀 제안이 없습니다 — 만들 팀을 먼저 정해 주세요.",
     "token_expired": "확인이 오래 걸려 승인이 만료됐습니다 — '만들어'라고 한 번만 더 말씀해 주세요.",
-    "token_consumed": "제안 내용이 그사이 바뀌어 만들지 않았습니다 — 바뀐 내용을 다시 확인해 주세요.",
     "token_body_mismatch": "제안 내용이 그사이 바뀌어 만들지 않았습니다 — 바뀐 내용을 다시 확인해 주세요.",
     "approval_not_received": "승인 말씀이 시스템에 닿지 않았습니다 — 한 번만 더 '만들어'라고 쳐 주세요(또는 화면 카드에서 [확인 창 열기] → [만들기]).",
     "boot_ticket_failed": "팀은 만들었지만 팀원 자리를 띄우는 티켓 발급에 실패했습니다 — 지금은 팀장만 깨어 있습니다.",
 }
 
 
+# ★(리뷰 m4·m5) §10 의 한 행이 뭉뚱그려 사실과 어긋나던 코드 — 전용 문구로 **분리**한 행.
+#   token_consumed: §10 행 "토큰 재사용·본문 변경" 이 둘을 묶어, 생성 실패 뒤 같은 토큰 재시도에도 "제안 내용이 그사이
+#     바뀌어"라고 말했다(본문은 그대로다). surface_not_publisher: 설계 밖 강화 코드가 ask_not_open 문구("'만들까요?'를
+#     다시 여쭙겠습니다")를 빌려, 좌석이 바뀐 뒤엔 영영 열 수 없는 질문을 다시 약속했다(순환).
+SPLIT_ROWS = {
+    "token_consumed": "이 승인은 이미 한 번 쓰였습니다 — 다시 만들려면 '만들까요?'를 한 번 더 여쭙겠습니다.",
+    "surface_not_publisher": ("제안을 올린 자리가 바뀌어 이 자리에서는 대화로 승인받을 수 없습니다 — 화면 카드에서 "
+                              "[확인 창 열기] → [만들기]로 만들거나, [만들지 않기] 뒤 다시 부탁해 주세요."),
+}
+
+
 def suite_words():
     for code, text in sorted(SECTION10.items()):
         check("W", "§10 원문 %s" % code, tt.owner_message(code) == text, tt.owner_message(code))
+    for code, text in sorted(SPLIT_ROWS.items()):
+        check("W", "분리 행 %s(§10 뭉친 행의 사실 어긋남 수리)" % code, tt.owner_message(code) == text,
+              tt.owner_message(code))
+    check("W", "재사용 ≠ 본문 변경 문구 · 좌석 불일치 ≠ 미개설 문구(되묻기 약속 없음)",
+          tt.owner_message("token_consumed") != tt.owner_message("token_body_mismatch")
+          and tt.owner_message("surface_not_publisher") != tt.owner_message("ask_not_open")
+          and "다시 여쭙겠습니다" not in tt.owner_message("surface_not_publisher"))
+    fresh()
+    t, _a, _r = new_token(NOW)
+    tt.consume(t, PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 1)
+    tt.settle(t, PROPOSAL, SURFACE, "failed", code=8, now=NOW + 2)
+    again = tt.consume(t, PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 3)
+    check("W", "생성 실패 뒤 같은 토큰 재시도 → token_consumed · '이미 한 번 쓰였습니다'(본문 변경이라 하지 않는다)",
+          again.get("code") == "token_consumed" and again.get("message") == SPLIT_ROWS["token_consumed"],
+          "%s | %s" % (again.get("code"), again.get("message")))
     check("W", "§10 원문 multiple_pending(2건)",
           tt.owner_message("multiple_pending", n=2)
           == "대기 중인 제안이 2건이라 어느 것인지 확실하지 않습니다 — 팀 이름을 한 번 말씀해 주세요.",
@@ -897,10 +959,9 @@ def suite_cli():
     rc, j, _o, e = cli(["ask", "--proposal", PROPOSAL])
     check("Y", "Y1 ask → exit 0 · ask_opened · 질문 문구", rc == 0 and j and j.get("code") == "ask_opened"
           and "만들어" in (j.get("message") or ""), "rc=%s %s %s" % (rc, j, e[-200:]))
-    rc, j, o, _e = cli(["issue"], stdin=json.dumps({"hook_event_name": "UserPromptSubmit",
-                                                    "prompt": "그래 만들어"}, ensure_ascii=False))
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file()])
     tok = (j or {}).get("token")
-    check("Y", "Y2 issue(stdin 훅 JSON) → exit 0 · 토큰 32hex", rc == 0 and tok and len(tok) == 32,
+    check("Y", "Y2 issue(런처가 쓴 훅 입력 파일) → exit 0 · 토큰 32hex", rc == 0 and tok and len(tok) == 32,
           "rc=%s %s" % (rc, o[:200]))
     b64 = base64.urlsafe_b64encode(body_of(PROPOSAL).encode("utf-8")).decode("ascii")
     rc, j, _o, _e = cli(["digest", "--body-b64", b64])
@@ -912,7 +973,7 @@ def suite_cli():
     rc3, j3, _o, _e = cli(["consume"] + base + ["--body-digest", BODY_D, "--phase", "create"])
     check("Y", "Y4 verify 0 · consume 0 · 재소비 1(token_consumed)",
           rc1 == 0 and rc2 == 0 and rc3 == 1 and (j3 or {}).get("code") == "token_consumed"
-          and (j3 or {}).get("message") == SECTION10["token_consumed"],
+          and (j3 or {}).get("message") == SPLIT_ROWS["token_consumed"],
           "%s/%s/%s %s" % (rc1, rc2, rc3, j3))
     rc4, j4, _o, _e = cli(["settle"] + base + ["--outcome", "created", "--dept", "dept-3"])
     rc5, j5, _o, _e = cli(["consume"] + base + ["--body-digest", BODY_D, "--phase", "allow"])
@@ -922,7 +983,7 @@ def suite_cli():
     rc, j, _o, _e = cli(["inspect", "--token", tok or ""])
     check("Y", "Y6 inspect → 결박·상태(done)", rc == 0 and j and j.get("state") == "done"
           and j.get("proposal_id") == PROPOSAL and j.get("surface") == SURFACE, str(j))
-    rc, j, o, _e = cli(["issue"], stdin=json.dumps({"prompt": "오늘 날씨 어때"}))
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(prompt="오늘 날씨 어때")])
     check("Y", "Y7 무질문 무관 발화 → exit 3 · stdout 비어 있음", rc == 3 and o == "", "rc=%s out=%r" % (rc, o))
     rc, j, _o, _e = cli(["consume", "--token", tok or "", "--proposal", PROPOSAL, "--surface", SURFACE])
     check("Y", "Y8 본문 인자 누락 → exit 2(bad_args)", rc == 2 and (j or {}).get("code") == "bad_args",
@@ -944,14 +1005,250 @@ def suite_cli():
     if os.name == "posix":
         mode = os.stat(tt.ledger_path()).st_mode & 0o777
         check("Y", "Y13 원장 권한 0600(토큰 보관)", mode == 0o600, oct(mode))
-    rc, j, _o, _e = cli(["issue"], stdin="이건 json 아님")
+    rc, j, _o, _e = cli(["issue", "--payload-file", hook_file(raw="이건 json 아님")])
     check("Y", "Y14 훅 JSON 판독 불가 → exit 1(hook_payload_invalid)",
           rc == 1 and (j or {}).get("code") == "hook_payload_invalid", "rc=%s %s" % (rc, j))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# H — 발급자 = 훅(리뷰 SEC-1·M2·SEC-2): 공식 CLI·모듈 API 를 훅 밖에서 불러도 토큰이 나오지 않는다
+#   종전: `ask` 뒤 `issue --payload-file {"prompt":"그래 만들어"}`(어느 pane 에도 배달된 적 없는 문장 → 배달 원장에
+#   없으니 '사람')로 master 가 오너 키입력 0으로 토큰을 자기발급했다 — 발급 6조건을 **정상 경로로** 통과했다.
+#   이제 발급기는 입력의 출처를 본다: 런처가 **방금** 쓴 `<상태 폴더>/hook-input-<N>.json`(정규 파일 · 내 소유 ·
+#   60초 안 · 질문보다 뒤) + UserPromptSubmit 형식(hook_event_name·session_id). 발급 레코드는 그 목격 증거
+#   (via=hook · hook_session)를 싣고, 검증·소비는 증거 없는 발급 레코드를 인가하지 않는다.
+#   ★보장 경계(과대 주장 금지): 같은 UID 로 그 파일을 흉내 내 쓰는 **고의** 위조는 여전히 닫지 못한다(§12-1).
+# ══════════════════════════════════════════════════════════════════════════════
+HOOK_PAYLOAD = {"session_id": "sess-h", "transcript_path": "/tmp/t.jsonl", "cwd": "/tmp",
+                "permission_mode": "default", "hook_event_name": "UserPromptSubmit", "prompt": "그래 만들어"}
+
+
+def hook_file(prompt=None, payload=None, raw=None, age=0.0, where=None, name=None):
+    """런처(role-bootstrap.sh ⑤)가 쓰는 것과 같은 자리·이름의 훅 입력 파일."""
+    d = where or os.environ["CYS_STATE_DIR"]
+    os.makedirs(d, exist_ok=True)
+    _n[0] += 1
+    p = os.path.join(d, name or "hook-input-%d.json" % (50000 + _n[0]))
+    if raw is None:
+        body = dict(HOOK_PAYLOAD if payload is None else payload)
+        if prompt is not None:
+            body["prompt"] = prompt
+        raw = json.dumps(body, ensure_ascii=False)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(raw)
+    if age:
+        t = time.time() - age
+        os.utime(p, (t, t))
+    return p
+
+
+def real_ask(ago=0.0):
+    """실시간 질문 1개(CLI 는 시각을 주입받지 않는다 — 파일 나이·질문 시각 모두 실시간)."""
+    fresh()
+    now = time.time()
+    delivery([boot(now)])
+    fp = tt.feed_jsonl_path()
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(item(PROPOSAL), ensure_ascii=False) + "\n")
+    return tt.open_ask(PROPOSAL, now=now - ago)
+
+
+def still_open():
+    return tt.status().get("code") == "awaiting_answer" and not events("token_issued")
+
+
+def suite_hook_only():
+    # H1 리뷰어 STEP B 그대로 — stdin 으로 부른 공식 CLI(훅 아님)
+    real_ask()
+    rc, j, o, _e = cli(["issue"], stdin=json.dumps({"prompt": "그래 만들어"}, ensure_ascii=False))
+    check("H", "H1 훅 밖 CLI(stdin) → 거부 not_hook_caller · 토큰 0 · 질문은 열린 채",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller" and not (j or {}).get("token") and still_open(),
+          "rc=%s %s" % (rc, o[:160]))
+    # H2 --payload-file 이 상태 폴더 밖(임의 파일) — 형식을 갖춰도 출처가 아니다
+    real_ask()
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(where=os.path.join(TMP, "elsewhere"))])
+    check("H", "H2 상태 폴더 밖의 --payload-file(형식 완비) → not_hook_caller · 토큰 0",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller" and still_open(), "rc=%s %s" % (rc, o[:160]))
+    real_ask()
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(name="payload.json")])
+    check("H", "H2b 상태 폴더 안이라도 런처 이름(hook-input-<N>.json)이 아니면 → not_hook_caller",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller" and still_open(), "rc=%s %s" % (rc, o[:160]))
+    # H3 제자리·제 이름이라도 UserPromptSubmit 형식이 아니면(리뷰어 페이로드 {"prompt":…} 그대로)
+    real_ask()
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(payload={"prompt": "그래 만들어"})])
+    check("H", "H3 hook_event_name·session_id 없는 페이로드 → 거부(hook_payload_invalid) · 토큰 0",
+          rc == 1 and (j or {}).get("code") == "hook_payload_invalid" and still_open(),
+          "rc=%s %s" % (rc, o[:160]))
+    # H4 정상 — 런처가 방금 쓴 파일 → 발급 · 발급 레코드에 목격 증거
+    real_ask()
+    hp = hook_file()
+    rc, j, o, _e = cli(["issue", "--payload-file", hp])
+    iss = events("token_issued")
+    check("H", "H4 런처가 방금 쓴 훅 입력 → 발급 · 레코드에 via=hook · hook_session · hook_input",
+          rc == 0 and (j or {}).get("token") and len(iss) == 1 and iss[0].get("via") == "hook"
+          and iss[0].get("hook_session") == "sess-h" and iss[0].get("hook_input") == os.path.basename(hp),
+          "rc=%s rec=%s" % (rc, iss[:1]))
+    # H5 오래된 훅 입력(재생) — 60초 창 밖
+    real_ask()
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(age=600)])
+    check("H", "H5 10분 묵은 훅 입력 파일 → not_hook_caller · 질문 유지",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller" and still_open(), "rc=%s %s" % (rc, o[:160]))
+    # H6 질문보다 먼저 쓰인 훅 입력(질문 전에 친 '만들어'의 재생) — 창 안이라도 답은 질문 뒤여야 한다
+    real_ask()
+    rc, j, o, _e = cli(["issue", "--payload-file", hook_file(age=30)])    # 60초 창 안 · 질문보다 30초 앞
+    check("H", "H6 질문보다 먼저 쓰인 훅 입력(재생) → not_hook_caller · 질문은 소비되지 않는다",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller" and still_open(), "rc=%s %s" % (rc, o[:160]))
+    # H7 심볼릭 링크(상태 폴더 안의 링크 → 밖의 파일) — posix 만
+    if os.name == "posix":
+        real_ask()
+        target = hook_file(where=os.path.join(TMP, "elsewhere2"))
+        link = os.path.join(os.environ["CYS_STATE_DIR"], "hook-input-777.json")
+        os.symlink(target, link)
+        rc, j, o, _e = cli(["issue", "--payload-file", link])
+        check("H", "H7 상태 폴더 안의 심볼릭 링크 → not_hook_caller",
+              rc == 1 and (j or {}).get("code") == "not_hook_caller" and still_open(), "rc=%s %s" % (rc, o[:160]))
+    # H8 모듈 API 직접 호출(목격 증거 없음) — 리뷰어 probe.py 의 issue_from_payload 도 같이
+    real_ask()
+    r = tt.issue("그래 만들어", feed_items=FEED1)
+    r2 = tt.issue_from_payload(json.dumps({"prompt": "그래 만들어"}), feed_items=FEED1)
+    r3 = tt.issue_from_payload(json.dumps(HOOK_PAYLOAD, ensure_ascii=False), feed_items=FEED1)
+    check("H", "H8 모듈 API(issue · issue_from_payload) 증거 없이 → 토큰 0 · 질문 유지",
+          not r.get("token") and r.get("code") == "not_hook_caller" and not r2.get("token")
+          and not r3.get("token") and r3.get("code") == "not_hook_caller" and still_open(),
+          "%s/%s/%s" % (r.get("code"), r2.get("code"), r3.get("code")))
+    # H9(리뷰 SEC-2) 목격 증거 없는 발급 레코드 — 검증·소비가 인가하지 않는다(흔적이 판정에 참여한다)
+    fresh()
+    tok = hashlib.md5(b"no-witness").hexdigest()
+    aid = tok[:16]
+    for rec in ({"v": 1, "kind": "team-create-ask", "event": "ask_opened", "ask_id": aid, "proposal_id": PROPOSAL,
+                 "surface": SURFACE, "body_digest": BODY_D, "opened_at": NOW, "expires_at": NOW + 300, "pid": 1},
+                {"v": 1, "kind": "team-create-ask", "event": "ask_closed", "ask_id": aid, "surface": SURFACE,
+                 "proposal_id": PROPOSAL, "why": "approved", "at": NOW},
+                {"v": 1, "kind": "team-create-token", "event": "token_issued", "token": tok,
+                 "proposal_id": PROPOSAL, "surface": SURFACE, "body_digest": BODY_D, "issued_at": NOW,
+                 "expires_at": NOW + 120, "consumed": False, "ask_id": aid, "pid": 1, "ppid": 1,
+                 "hook_session": None}):
+        append_raw(json.dumps(rec, ensure_ascii=False) + "\n")
+    v = tt.verify(tok, PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 1)
+    c = tt.consume(tok, PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 1)
+    check("H", "H9 목격 증거(via=hook·hook_session) 없는 발급 레코드 → verify·consume 거부(token_unknown)",
+          not v.get("ok") and not c.get("ok") and c.get("code") == "token_unknown"
+          and not events("consumed"), "%s/%s" % (v.get("code"), c.get("code")))
+    check("H", "H10 not_hook_caller 는 거부 코드 목록·오너 문구에 있다",
+          "not_hook_caller" in tt.REFUSAL_CODES and bool(tt.owner_message("not_hook_caller")))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# O — 열린 질문 표지(리뷰 F3): 훅 비용 게이트가 원장 mtime 이 아니라 '열린 질문 표지 파일'을 본다
+#   종전 게이트는 원장이 최근 10분 안에 움직였으면(거부 감사 레코드 포함) 모든 좌석의 모든 프롬프트가 발급기를
+#   띄웠고(맥 약 +130ms), 원장이 한 번 생긴 기계는 영구히 date+stat 2회(약 +8ms)를 냈다. 표지는 원장에서
+#   파생된 캐시다 — 답 없이 열린 질문(만료 뒤 고지 여유 300초 포함)이 있을 때만 있다.
+# ══════════════════════════════════════════════════════════════════════════════
+def suite_marker():
+    fresh()
+    delivery([boot(NOW)])
+    mp = tt.open_marker_path()
+    check("O", "O1 표지는 상태 폴더의 teamtoken-open-<레인>(런처 글롭 teamtoken-open-* 대상)",
+          os.path.dirname(mp) == os.environ["CYS_STATE_DIR"]
+          and os.path.basename(mp).startswith("teamtoken-open-"), mp)
+    a = tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    check("O", "O2 질문을 열면 표지가 생긴다", a.get("ok") and os.path.isfile(mp), a.get("code"))
+    r = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    check("O", "O3 승인으로 질문이 닫히면 표지가 사라진다(발급 뒤 평상시 비용 0)",
+          bool(r.get("token")) and not os.path.exists(mp), r.get("code"))
+    tt.consume(forged_token(), PROPOSAL, SURFACE, BODY_D, phase="create", now=NOW + 2)
+    check("O", "O4 감사 전용 레코드(consume_refused)는 표지를 만들지 않는다",
+          len(events("consume_refused")) == 1 and not os.path.exists(mp))
+    tt.open_ask(PROPOSAL, now=NOW + 10, feed_items=FEED1)
+    hissue("아직 만들지 마", now=NOW + 11, feed_items=FEED1)
+    check("O", "O5 사람의 거절 답으로 닫혀도 표지가 사라진다", not os.path.exists(mp))
+    tt.open_ask(PROPOSAL, now=NOW + 20, feed_items=FEED1)
+    hissue("오늘 할 일", surface=OTHER_SURFACE, now=NOW + 20 + tt.ASK_TTL_S + 10, feed_items=FEED1)
+    kept = os.path.exists(mp)
+    hissue("오늘 할 일", surface=OTHER_SURFACE,
+           now=NOW + 20 + tt.ASK_TTL_S + tt.ASK_NOTICE_GRACE_S + 10, feed_items=FEED1)
+    check("O", "O6 답 없이 만료된 질문: 고지 여유(300초) 안에는 표지 유지 · 지나면 어느 좌석의 호출이든 걷는다",
+          kept and not os.path.exists(mp), "여유 안 유지=%s" % kept)
+    tt.open_ask(PROPOSAL, now=NOW + 1000, feed_items=FEED1)
+    os.remove(mp)
+    s = tt.status(now=NOW + 1001)
+    check("O", "O7 status 는 표지를 원장에 맞춰 되살린다(파생 캐시 자가 치유)",
+          s.get("code") == "awaiting_answer" and os.path.isfile(mp), s.get("code"))
+    fresh()
+    delivery([boot(NOW)])
+    os.makedirs(tt.open_marker_path())            # 표지 자리를 막는다 → 표지를 쓸 수 없다
+    a = tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    check("O", "O8 표지를 쓸 수 없으면 질문을 열지 않는다(열어도 훅이 부르지 않는다 — 조용한 발급 0 방지)",
+          not a.get("ok") and not events("ask_opened"), a.get("code"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# D — 디렉티브 ↔ 도구 정합(리뷰 m1·m2·m4·m5·SEC-1): master 가 읽는 §4-A 문안이 이 모듈의 실제 출력과 맞는가
+#   디렉티브는 "문구의 정본은 도구 출력의 message — 고쳐 쓰지 말고 그대로" 라고 적는다. 표가 모듈과 갈리면
+#   master 는 두 정본 사이에서 틀린 쪽을 고를 수 있다 — 그래서 표의 코드→문구를 모듈 문구와 대조한다.
+# ══════════════════════════════════════════════════════════════════════════════
+DIRECTIVE = os.path.join(os.path.dirname(BIN), "directives", "MASTER_DIRECTIVE.md")
+
+
+def _directive():
+    with open(DIRECTIVE, encoding="utf-8") as f:
+        return f.read()
+
+
+def _message_table(text):
+    """§4-A '오너 안내 문구' 표 → [(code, 표 문구)]. ' / ' 짝 표기는 코드 묶음과 문구를 자리대로 짝짓는다."""
+    i = text.index("| 상황 | 코드 | 오너에게 할 말 |")
+    rows = []
+    for ln in text[i:].splitlines()[2:]:
+        if not ln.startswith("| "):
+            break
+        cells = [c.strip() for c in ln.strip().strip("|").split(" | ")]
+        groups = [g.strip() for g in cells[1].split(" / ")]
+        msgs = [cells[2]] if len(groups) == 1 else [m.strip() for m in cells[2].split(" / ")]
+        if len(msgs) != len(groups):
+            rows.append(("<짝 불일치>", ln))
+            continue
+        for g, m in zip(groups, msgs):
+            for code in re.findall(r"`([a-z_]+)`", g):
+                rows.append((code, m))
+    return rows
+
+
+def suite_directive():
+    text = _directive()
+    rows = _message_table(text)
+    bad_pair = [r for r in rows if r[0] == "<짝 불일치>"]
+    check("D", "D1 표의 ' / ' 짝 표기 — 코드 묶음 수 = 문구 수", not bad_pair, repr(bad_pair)[:200])
+    mism = []
+    for code, msg in rows:
+        raw = tt.OWNER_MESSAGES.get(code, "")
+        if not raw or "{" in raw:          # 자리표시(N건·{reason})는 표가 풀어 쓴다
+            continue
+        if not msg.endswith(raw):          # '(만들지 않고) ' 같은 표 쪽 머리말은 허용
+            mism.append("%s: 표=%r 모듈=%r" % (code, msg[:40], raw[:40]))
+    check("D", "D2 표의 코드→문구 = 모듈 OWNER_MESSAGES(재사용·자리 바뀜 분리 포함)", not mism, "; ".join(mism)[:400])
+    listed = {c for c, _m in rows}
+    missing = [c for c in tt.REFUSAL_CODES if c not in listed]
+    check("D", "D3 모듈 거부 코드 전량이 표에 있다(not_hook_caller 포함)", not missing, repr(missing))
+    step5 = next((ln for ln in text.splitlines() if "5. **승인이 닿지 않았을 때" in ln), "")
+    ok5 = (bool(step5) and "`approval_not_received` 면" not in step5
+           and "`awaiting_answer`·`approval_not_received`" not in step5
+           and re.search(r"`ask_expired`[^·]*면 3 부터 다시", step5) is not None)
+    check("D", "D4 절차 5: 답 없이 만료(ask_expired)는 '3 부터 다시' · '다시 쳐 주세요'는 질문이 열린 동안만",
+          ok5, step5[:200])
+    blk = text[text.index("- **4-A-2. 생성 집행(토큰 경로)**"):text.index("- **오너 안내 문구(1줄 + 다음 한 걸음)**")]
+    check("D", "D5 §4-A-2 ③ 편성 보류(formation-pending)·실패·미발행을 완료로 말하지 않는다 · ② 폴백은 편성 착수 뒤임을 적는다",
+          "`formation-pending`" in blk and "`formation-failed`" in blk and "미발행" in blk
+          and "편성이 ①에서 이미" in blk)
+    check("D", "D6 발급자 보장을 과대 주장하지 않는다('네가 만들 수 없다' 금지 · 고의 위조 한계 명시)",
+          "네가 만들 수 없" not in text and "고의 위조까지 막지는 못한다" in text)
+
+
 def main():
     for fn in (suite_attack, suite_life, suite_fp, suite_ask, suite_race, suite_transition,
-               suite_missing, suite_failclosed, suite_status, suite_words, suite_structure, suite_cli):
+               suite_missing, suite_failclosed, suite_status, suite_words, suite_structure, suite_cli,
+               suite_hook_only, suite_marker, suite_directive):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — 스위트 예외는 FAIL 로 계수한다(조용한 누락 금지)
@@ -960,7 +1257,8 @@ def main():
             check(fn.__name__, "예외", False, repr(e))
     print("\n===== 요약 =====")
     names = {"A": "공격", "L": "수명", "F": "오탐", "G": "ask", "K": "경합", "T": "상태전이",
-             "M": "결측형", "C": "fail-closed", "S": "관측", "W": "문구", "X": "구조", "Y": "CLI"}
+             "M": "결측형", "C": "fail-closed", "S": "관측", "W": "문구", "X": "구조", "Y": "CLI",
+             "H": "발급자=훅", "O": "질문 표지", "D": "디렉티브 정합"}
     total_fail = 0
     for k, rows in RESULTS.items():
         ok = sum(1 for _c, o, _d in rows if o)

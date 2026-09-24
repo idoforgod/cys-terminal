@@ -87,12 +87,28 @@ fn count(d: &Arc<Daemon>, event: &str, phase: Option<&str>) -> usize {
 }
 
 /// 훅이 쓰는 것과 같은 발급 3줄. `ttl` = 토큰 만료까지 남은 초(음수 = 이미 만료).
+/// ★(0.14.42 리뷰 SEC-2) 발급 레코드는 훅 목격 증거(`via:"hook"`·`hook_session`·`hook_input`)를 싣는다 — P3 판정기가
+///   증거 없는 발급 레코드를 인가하지 않으므로(아래 `p5_token_without_hook_witness_is_refused`) 픽스처도 훅 모양 그대로다.
 fn issue(d: &Arc<Daemon>, proposal: &str, surface: u64, dig: &str, token: &str, ttl: f64) {
+    issue_with(d, proposal, surface, dig, token, ttl, true);
+}
+
+fn issue_with(d: &Arc<Daemon>, proposal: &str, surface: u64, dig: &str, token: &str, ttl: f64, witnessed: bool) {
     let now = crate::state::now_epoch();
     // 질문 id 는 토큰의 **아래** 16자리 — 위 16자리는 작은 번호에서 전부 0 이라 질문 id 가 겹치고,
     // 겹치면 P3 판독기가 원장 손상(ledger_corrupt)으로 접는다(첫 구현에서 실제로 그렇게 접혔다).
     let ask = &token[16..];
     let s = surface.to_string();
+    let mut issued = json!({"v": 1, "kind": "team-create-token", "event": "token_issued", "token": token,
+                            "proposal_id": proposal, "surface": s, "body_digest": dig, "issued_at": now - 1.0,
+                            "expires_at": now + ttl, "consumed": false, "ask_id": ask, "pid": 1, "ppid": 1,
+                            "hook_session": null});
+    if witnessed {
+        issued["via"] = json!("hook");
+        issued["hook_session"] = json!("sess-p5");
+        issued["hook_input"] = json!("hook-input-1.json");
+        issued["hook_input_mtime"] = json!(now - 1.0);
+    }
     append(
         d,
         &[
@@ -101,10 +117,7 @@ fn issue(d: &Arc<Daemon>, proposal: &str, surface: u64, dig: &str, token: &str, 
                    "opened_at": now - 5.0, "expires_at": now + 295.0, "pid": 1}),
             json!({"v": 1, "kind": "team-create-ask", "event": "ask_closed", "ask_id": ask,
                    "surface": s, "proposal_id": proposal, "why": "approved", "at": now - 1.0}),
-            json!({"v": 1, "kind": "team-create-token", "event": "token_issued", "token": token,
-                   "proposal_id": proposal, "surface": s, "body_digest": dig, "issued_at": now - 1.0,
-                   "expires_at": now + ttl, "consumed": false, "ask_id": ask, "pid": 1, "ppid": 1,
-                   "hook_session": null}),
+            issued,
         ],
     );
 }
@@ -254,6 +267,23 @@ fn p5_forged_or_missing_token_refused_with_specific_codes() {
     );
     assert_eq!(status(&d, &rid).0, "pending", "거부됐는데 카드가 사라졌다");
     assert_eq!(count(&d, "consumed", None), 1, "거부 경로가 소비를 남겼다(픽스처의 create 1건만 있어야 한다)");
+}
+
+/// ★(0.14.42 리뷰 SEC-2) 발급 레코드의 훅 목격 증거가 **데몬 집행 경로의 인가 판정에 참여한다**. 종전엔
+/// pid·ppid·hook_session 이 쓰이기만 하고 어느 판정도 읽지 않아, 훅 밖에서 만든 토큰(공식 CLI `issue` 직접 호출 ·
+/// 모듈 API)이 소비 시점에 훅 발급 토큰과 구별되지 않았다. 증거 없는 발급 레코드는 생성·allow 둘 다 거부된다.
+#[test]
+fn p5_token_without_hook_witness_is_refused() {
+    let m = 720_020;
+    let (d, sid, rid, b) = proposal("tt-nowit", m);
+    let t = tok(20);
+    issue_with(&d, &rid, sid, &digest(&d, &b), &t, 120.0, false);
+    let c = rpc(&d, Some(m), "team.token.consume", json!({"team_token": t}));
+    assert_eq!(code(&c), "token_unknown", "훅 목격 증거 없는 발급 레코드로 생성 단계가 인가됐다: {c}");
+    assert_eq!(count(&d, "consumed", None), 0, "거부 경로가 소비를 남겼다");
+    let a = reply(&d, Some(m), &rid, "allow", Some(&t));
+    assert_eq!(code(&a), "token_unknown", "훅 목격 증거 없는 토큰으로 allow 가 통과했다: {a}");
+    assert_eq!(status(&d, &rid).0, "pending", "거부됐는데 카드가 사라졌다");
 }
 
 // ── 좌석 결박 = 커널 신원 ───────────────────────────────────────────────────

@@ -60,7 +60,8 @@ token_ok 로 허용한다. 토큰이 1회성이면 ①에서 소비된 토큰으
       why ∈ approved | answered_rejected | answered_ambiguous | expired | superseded | proposal_gone |
             multiple_pending | body_changed | feed_unreadable | proposal_body_invalid
   team-create-token token_issued {token(32hex), proposal_id, surface, body_digest, issued_at, expires_at,
-                                  consumed:false, ask_id, pid, ppid}
+                                  consumed:false, ask_id, pid, ppid, via:"hook", hook_session, hook_input,
+                                  hook_input_mtime}   ← 훅 목격 증거 — 검증·소비는 이것 없는 레코드를 인가하지 않는다
   team-create-token consumed    {token, phase:create|allow, proposal_id, surface, body_digest, consumed:true, at}
   team-create-token settled     {token, outcome:created|failed, dept?, code?, at, grant_expires_at?}
   team-create-audit issue_refused|consume_refused|settle_refused|ask_refused {code, detail, at, …}
@@ -69,15 +70,19 @@ token_ok 로 허용한다. 토큰이 1회성이면 ①에서 소비된 토큰으
 → ledger_corrupt. 예외: **개행 없는 마지막 조각**(찢긴 꼬리 = 완료되지 않은 쓰기)은 없었던 일로 보고,
 다음 append 가 개행 + torn_tail_sealed 로 봉인한다(봉인된 조각은 계속 무시된다 — 판정이 흔들리지 않는다).
 한 번에 두 레코드를 쓸 때는 **닫힘을 먼저** 쓴다(찢기면 토큰이 사라지는 쪽 = 안전 방향).
+열린 질문 표지 `<상태>/teamtoken-open-<lane>`(리뷰 F3): 원장에서 파생된 캐시 — 답 없이 열린 질문(만료 + 고지 여유
+ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비용 게이트가 셸 글롭 존재 검사로만 본다(외부
+명령 0). ask 가 먼저 세우고(못 세우면 질문을 열지 않는다) issue·status 가 원장에 맞춰 걷거나 되살린다.
 
 ## CLI (stdout = JSON 1줄 · 단 issue 의 exit 3 은 무출력)
   ask     --proposal <tp-id>                       # master · 좌석은 env(CYS_SURFACE_ID) — 인자로 바꿀 수 없다
-  issue   [--payload-file F]                        # ★UserPromptSubmit 훅 전용 · stdin = 훅 JSON {prompt,…}
+  issue   --payload-file F                          # ★UserPromptSubmit 훅 전용 — F = 런처가 **방금** 쓴
+                                                    #   <상태>/hook-input-<N>.json(출처 확인 · stdin 경로 없음)
   verify  --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
   consume --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
   settle  --token T --proposal P --surface S --outcome created|failed [--dept NAME] [--code N]
   inspect --token T                                 # 결박·상태 조회(인가 아님)
-  status  [--proposal P]                            # §7-3 관측 — 질문 열림·발급 0 = approval_not_received
+  status  [--proposal P]                            # §7-3 관측 — 답 대기 awaiting_answer · 답 없이 만료 ask_expired
   path | messages | digest (--body-b64 B | --body-file F)
 종료코드: 0 성공 · 1 거부(사유 코드) · 2 인자 오류(bad_args · argparse) · 3 issue 무동작(열린 질문 없음 등
   — 훅은 아무것도 출력하지 않는다) · 4 기반 고장(ledger_corrupt · lock_unavailable · internal_error).
@@ -86,8 +91,13 @@ token_ok 로 허용한다. 토큰이 1회성이면 ①에서 소비된 토큰으
 
 ## 보장 범위 (과대 주장 금지 · §12-1 · docs/THREAT-MODEL-mission-gate.md 와 같은 경계)
 닫는 것은 **평시 정상 동작 경로**다 — 에이전트의 실수·오해, 기계 push 오인, 재사용·재생·모호성·오탐.
-같은 UID 로 원장·배달 원장·feed 를 직접 쓰거나 `issue` 를 스스로 부르는 프로세스는 닫지 못한다
-(발급자는 훅뿐이라는 것은 규약 R4 이고, 원장은 위조의 **감사 흔적**이다 — 사전 차단이 아니다).
+발급자 = 훅(리뷰 SEC-1·M2·SEC-2 · 0.14.42 수정 라운드 1): 공식 CLI `issue`·모듈 API 를 훅 밖에서 부르면
+판정 없이 거부한다(not_hook_caller · 질문 무소비 · 감사 1줄) — 입력은 런처가 방금 쓴 상태 폴더의
+`hook-input-<N>.json`(정규 파일·내 소유·60초 안·질문보다 뒤) + UserPromptSubmit 형식이어야 하고, 발급 레코드의
+목격 증거(via=hook·hook_session)가 없으면 검증·소비가 인가하지 않는다. **그래도 같은 UID 로 그 입력 파일을
+흉내 내 쓰거나 원장·배달 원장·feed 를 직접 쓰는 고의 위조는 닫지 못한다** — 발급자는 훅뿐이라는 것은 규약 R4 와
+형식 가드이고, 원장은 위조의 **감사 흔적**이다(사전 차단이 아니다). 데몬이 발급을 목격·인증하는 근본 통제는
+제품 재설계 과제다(오너 결정 대기).
 """
 import argparse
 import base64
@@ -121,6 +131,12 @@ TOKEN_TTL_S = 120.0          # 승인 발화 → 생성 집행
 ALLOW_GRANT_TTL_S = 1800.0   # 생성 성공 → ⑦ allow(부트 티켓·편성·각성이 사이에 있다 · §8-2 단계 2~6)
 UTTER_MAX_CHARS = 20         # 정규화 후 승인 발화 길이 상한
 LOCK_TIMEOUT_S = 5.0         # 락 대기 상한 — 넘기면 거부(허용으로 새지 않는다)
+# ── 발급자 = 훅(리뷰 SEC-1·M2) — 훅 입력 파일의 출처 확인 ──
+HOOK_INPUT_MAX_AGE_S = 60.0  # 런처가 **방금** 쓴 입력만 — 묵은 파일의 재생 차단(정상 경로는 수백 ms)
+HOOK_INPUT_SKEW_S = 2.0      # 파일 시각 ↔ 질문 시각 비교의 여유(파일시스템 mtime 해상도·시계 오차)
+HOOK_INPUT_MAX_BYTES = 1024 * 1024
+# ── 열린 질문 표지(리뷰 F3) — 훅 비용 게이트가 보는 파생 캐시 ──
+ASK_NOTICE_GRACE_S = 300.0   # 답 없이 만료된 질문에 '확인 시간이 지나'(§10)를 1회 말해 줄 여유 — 그 뒤 표지를 걷는다
 LEDGER_MAX_BYTES = 8 * 1024 * 1024   # 이 이상은 판독 불가(자르지 않는다 — javis_mission 원장 판독과 같은 태도)
 FEED_MAX_BYTES = 64 * 1024 * 1024
 
@@ -142,6 +158,15 @@ _MSG_CHANGED = "제안 내용이 그사이 바뀌어 만들지 않았습니다 �
 _MSG_NOT_RECEIVED = ("승인 말씀이 시스템에 닿지 않았습니다 — 한 번만 더 '만들어'라고 쳐 주세요"
                      "(또는 화면 카드에서 [확인 창 열기] → [만들기]).")
 _MSG_NOT_OPEN = "지금은 승인 대기 상태가 아닙니다 — '만들까요?'를 다시 여쭙겠습니다."
+# ★(리뷰 m4) §10 행 "토큰 재사용·본문 변경"은 둘을 한 문구로 묶어, 생성 실패 뒤 같은 토큰 재시도에도 "제안 내용이
+#   그사이 바뀌어"라고 말했다(본문은 그대로였다) — 재사용은 전용 문구로 분리한다(본문 변경 쪽은 §10 원문 그대로).
+_MSG_REUSED = "이 승인은 이미 한 번 쓰였습니다 — 다시 만들려면 '만들까요?'를 한 번 더 여쭙겠습니다."
+# ★(리뷰 m5) 설계 밖 강화 코드 surface_not_publisher 가 ask_not_open 문구("다시 여쭙겠습니다")를 빌려, 좌석이 바뀐 뒤엔
+#   **영원히** 열 수 없는 질문을 다시 약속했다(순환). 이 좌석에서는 대화 승인이 불가하다는 사실과 화면 경로를 말한다
+#   (새 좌석은 옛 제안을 거둘 수도 없다 — superseded 는 발행 좌석 전용 · 대기 1건 잠금이라 다시 올리려면 오너의
+#   [만들지 않기]가 먼저다).
+_MSG_SEAT_MOVED = ("제안을 올린 자리가 바뀌어 이 자리에서는 대화로 승인받을 수 없습니다 — 화면 카드에서 "
+                   "[확인 창 열기] → [만들기]로 만들거나, [만들지 않기] 뒤 다시 부탁해 주세요.")
 
 OWNER_MESSAGES = {
     # ── §10 표 원문(글자 그대로) ──
@@ -156,8 +181,7 @@ OWNER_MESSAGES = {
     "multiple_pending": ("대기 중인 제안이 {n}건이라 어느 것인지 확실하지 않습니다 — "
                          "팀 이름을 한 번 말씀해 주세요."),
     "token_expired": "확인이 오래 걸려 승인이 만료됐습니다 — '만들어'라고 한 번만 더 말씀해 주세요.",
-    "token_consumed": _MSG_CHANGED,          # §10 행 "토큰 재사용·본문 변경"
-    "token_body_mismatch": _MSG_CHANGED,     # 〃
+    "token_body_mismatch": _MSG_CHANGED,     # §10 행 "토큰 재사용·본문 변경" 의 본문 변경 쪽
     "approval_not_received": _MSG_NOT_RECEIVED,
     "boot_ticket_failed": ("팀은 만들었지만 팀원 자리를 띄우는 티켓 발급에 실패했습니다 — "
                            "지금은 팀장만 깨어 있습니다."),
@@ -170,7 +194,9 @@ OWNER_MESSAGES = {
     "token_missing": _MSG_NOT_RECEIVED,
     "token_unknown": _MSG_NOT_RECEIVED,
     "token_surface_mismatch": _MSG_NOT_RECEIVED,
-    "surface_not_publisher": _MSG_NOT_OPEN,
+    # 훅 밖 발급 시도(직접 호출·출처 불명 입력) — 오너 쪽 사실은 "승인이 훅을 거쳐 닿지 않았다"이고, 회복 경로도
+    # 같다(오너가 한 번 더 치면 그 프롬프트의 훅이 판정한다).
+    "not_hook_caller": _MSG_NOT_RECEIVED,
     "surface_unknown": _MSG_SAFE_STOP,
     "proposal_publisher_unknown": _MSG_SAFE_STOP,
     "proposal_body_invalid": _MSG_SAFE_STOP,
@@ -182,6 +208,9 @@ OWNER_MESSAGES = {
     "bad_args": _MSG_SAFE_STOP,
     "not_consumed": _MSG_SAFE_STOP,
     "already_settled": _MSG_SAFE_STOP,
+    # ── 분리 행(§10 의 뭉친 행이 사실과 어긋나던 코드 · 리뷰 m4·m5) ──
+    "token_consumed": _MSG_REUSED,
+    "surface_not_publisher": _MSG_SEAT_MOVED,
     # ── 신설 행(2단 권한의 ⑦ allow 단계 — §10 에 해당 행이 없다) ──
     "grant_not_armed": "팀 생성이 확인되지 않아 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
     "grant_revoked": "팀 생성에 실패해 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
@@ -205,15 +234,17 @@ OWNER_MESSAGES = {
 SECTION10_CODES = frozenset([
     "ask_not_open", "ask_expired", "utterance_ambiguous", "utterance_rejected", "machine_origin",
     "ledger_absent", "ledger_unreadable", "no_pending", "multiple_pending", "token_expired",
-    "token_consumed", "token_body_mismatch", "approval_not_received", "boot_ticket_failed",
+    "token_body_mismatch", "approval_not_received", "boot_ticket_failed",
     "formation_partial", "create_failed"])
-NEW_ROW_CODES = frozenset(["grant_not_armed", "grant_revoked", "grant_expired"])
+# §10 밖의 행 — 신설(2단 권한 ⑦ allow) + 분리(§10 의 뭉친 행이 사실과 어긋나던 코드).
+NEW_ROW_CODES = frozenset(["grant_not_armed", "grant_revoked", "grant_expired",
+                           "token_consumed", "surface_not_publisher"])
 # 이 모듈이 **거부**로 돌려줄 수 있는 사유 코드 전량(P4 훅·P5 데몬이 그대로 쓴다).
 REFUSAL_CODES = (
     "ask_not_open", "ask_expired", "utterance_ambiguous", "utterance_rejected", "machine_origin",
     "ledger_absent", "ledger_unreadable", "no_pending", "multiple_pending", "proposal_not_pending",
     "body_changed", "surface_unknown", "surface_not_publisher", "proposal_publisher_unknown",
-    "proposal_body_invalid", "feed_unreadable", "hook_payload_invalid",
+    "proposal_body_invalid", "feed_unreadable", "hook_payload_invalid", "not_hook_caller",
     "token_missing", "token_unknown", "token_consumed", "token_expired", "token_proposal_mismatch",
     "token_surface_mismatch", "token_body_mismatch", "grant_not_armed", "grant_revoked",
     "grant_expired", "not_consumed", "already_settled",
@@ -359,6 +390,65 @@ def ledger_path():
     """이 레인의 토큰 원장 경로. 상태 루트·레인 키 규약은 javis_bootstrap 이 소유한다."""
     import javis_bootstrap
     return os.path.join(javis_bootstrap.state_dir(), "teamtoken-%s.jsonl" % javis_bootstrap.lane_key())
+
+
+def open_marker_path():
+    """이 레인의 **열린 질문 표지** 경로 — UserPromptSubmit 런처(role-bootstrap.sh ⑤-b)의 비용 게이트가
+    셸 글롭 `teamtoken-open-*` 존재 검사 하나(외부 명령 0)로 본다(리뷰 F3).
+
+    표지는 원장에서 **파생된 캐시**다(판정 근거가 아니다 — 판정은 언제나 원장 내용으로 한다). 있어야 할 때:
+    답 없이 열린 질문이 있고 그 만료 + ASK_NOTICE_GRACE_S 가 아직 지나지 않았다. 종전 게이트(원장 mtime 10분 창)는
+    거부 감사 레코드 한 줄에도 10분 동안 모든 좌석의 모든 프롬프트가 발급기를 띄웠고(맥 약 +130ms), 원장이 한 번
+    생긴 기계는 영구히 date·stat 2회(약 +8ms)를 냈다. 실패 방향: 표지를 쓸 수 없으면 질문을 열지 않는다(open_ask) ·
+    표지를 걷지 못하면 발급기가 한 번 더 불릴 뿐이다(비용 쪽 · 판정 불변) · 표지가 사라졌으면 status 가 되살린다."""
+    import javis_bootstrap
+    return os.path.join(javis_bootstrap.state_dir(), "teamtoken-open-%s" % javis_bootstrap.lane_key())
+
+
+def _live_asks(asks, now):
+    """표지를 세워 둘 질문 — 답 없이 열린 것 중 만료 + 고지 여유가 아직 남은 것."""
+    return [a for a in asks.values()
+            if a["closed"] is None and now <= float(a["rec"]["expires_at"]) + ASK_NOTICE_GRACE_S]
+
+
+def _write_marker(asks_live):
+    """표지 기록(원자 교체). 실패는 예외 — 부르는 쪽이 방향을 정한다(open_ask = 질문을 열지 않는다)."""
+    p = open_marker_path()
+    body = json.dumps({"v": SCHEMA_VERSION, "asks": sorted(a["rec"]["ask_id"] for a in asks_live),
+                       "until": max(float(a["rec"]["expires_at"]) for a in asks_live) + ASK_NOTICE_GRACE_S},
+                      sort_keys=True) + "\n"
+    # 임시 이름은 점(.)으로 시작한다 — 런처 글롭 `teamtoken-open-*` 에 걸리지 않게(찢긴 임시 파일이 표지로 읽히면 안 된다).
+    tmp = os.path.join(os.path.dirname(p), ".%s.%d.tmp" % (os.path.basename(p), os.getpid()))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _drop_marker():
+    try:
+        os.remove(open_marker_path())
+    except FileNotFoundError:
+        pass
+
+
+def _sync_marker(asks, now):
+    """표지를 원장 파생 상태에 맞춘다(best-effort — 캐시라 실패가 판정을 바꾸지 않는다)."""
+    try:
+        live = _live_asks(asks, now)
+        if live:
+            if not os.path.isfile(open_marker_path()):
+                _write_marker(live)
+        else:
+            _drop_marker()
+    except Exception:  # noqa: BLE001 — 캐시 동기화 실패는 비용 쪽으로만 샌다
+        pass
 
 
 def feed_jsonl_path():
@@ -768,6 +858,12 @@ def open_ask(proposal_id, surface=None, now=None, feed_items=None):
         rec = {"v": SCHEMA_VERSION, "kind": KIND_ASK, "event": "ask_opened", "ask_id": ask_id,
                "proposal_id": pid, "surface": surf, "body_digest": dig, "opened_at": now,
                "expires_at": now + ASK_TTL_S, "pid": os.getpid()}
+        # ★(리뷰 F3) 표지를 **먼저** 세운다 — 못 세우면 질문을 열지 않는다(예외 → internal_error · 원장 무기록).
+        #   질문만 열리고 표지가 없으면 훅 비용 게이트가 발급기를 부르지 않아 오너의 "만들어"가 조용히 발급 0 이 된다.
+        #   반대로 표지만 남는 경우(아래 append 실패)는 발급기가 한 번 더 불린 뒤 걷힌다(비용 쪽 · 판정 불변).
+        superseded = {c["ask_id"] for c in closes}
+        live = [a for aid, a in asks.items() if aid not in superseded] + [{"rec": rec, "closed": None}]
+        _write_marker(_live_asks({i: a for i, a in enumerate(live)}, now))
         _append(path, closes + [rec])
     return _result(True, "ask_opened", "질문 열림(TTL %ds)" % ASK_TTL_S, ask_id=ask_id,
                    proposal_id=pid, surface=surf, display=spec["display"], body_digest=dig,
@@ -804,6 +900,12 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
         # ★만료와 미개설을 구분한다(§10 끝 구현 주의) — 만료 고지는 1회, 질문은 여기서 닫힌다.
         return refuse("ask_expired", "질문 TTL %ds 경과(%.0fs 초과)" % (ASK_TTL_S, now - float(a["expires_at"])),
                       close_why="expired")
+    # ★(리뷰 SEC-1) 답은 질문 **뒤**에 쳐진 것이어야 한다 — 훅 입력 파일은 그 프롬프트의 훅이 도는 순간에 쓰이므로
+    #   정상 경로에서는 언제나 질문보다 뒤다. 앞이면 질문 전에 친 문장의 재생이다(질문은 소비하지 않는다).
+    wt = (meta or {}).get("hook_input_mtime")
+    if not _is_num(wt) or float(wt) < float(a["opened_at"]) - HOOK_INPUT_SKEW_S:
+        return refuse("not_hook_caller", "훅 입력이 질문보다 먼저 쓰였다(입력 %s · 질문 %.0f) — 질문 전 발화의 재생"
+                      % (wt, float(a["opened_at"])))
     m = _mission()
     deliv, lstatus, ldetail = m.read_delivery(now=now)
     if lstatus != m.LEDGER_OK:
@@ -846,10 +948,13 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
         # 닫힘을 먼저 쓴다 — 쓰기가 찢기면 토큰이 사라지는 쪽(안전 방향)이 되게.
         {"v": SCHEMA_VERSION, "kind": KIND_ASK, "event": "ask_closed", "ask_id": aid, "surface": surf,
          "proposal_id": pid, "why": "approved", "at": now},
+        # 목격 증거(via·hook_session·hook_input) — 검증·소비(_judge_token)가 이것 없는 발급 레코드를 인가하지 않는다.
         {"v": SCHEMA_VERSION, "kind": KIND_TOKEN, "event": "token_issued", "token": token,
          "proposal_id": pid, "surface": surf, "body_digest": cur, "issued_at": now,
          "expires_at": now + TOKEN_TTL_S, "consumed": False, "ask_id": aid,
-         "pid": os.getpid(), "ppid": os.getppid(), "hook_session": (meta or {}).get("session_id")},
+         "pid": os.getpid(), "ppid": os.getppid(), "via": "hook",
+         "hook_session": meta.get("session_id"), "hook_input": meta.get("hook_input"),
+         "hook_input_mtime": meta.get("hook_input_mtime")},
     ]
     return _result(True, "token_issued", vwhy, token=token, expires_at=now + TOKEN_TTL_S,
                    body_digest=cur, next="cys-dept create --team-token %s" % token, **base), recs
@@ -871,18 +976,37 @@ def _no_ask(prompt, surf, feed_items):
                    "`ask` 로 질문을 열어야 한다", surface=surf, proposal_id=mine[0].get("request_id"))
 
 
+def _is_hook_meta(meta):
+    """훅 목격 증거 — `_hook_witness` 가 런처의 입력 파일에서만 만든다(via=hook · 세션 · 입력 파일 시각)."""
+    return (isinstance(meta, dict) and meta.get("via") == "hook" and _is_str(meta.get("session_id"))
+            and _is_num(meta.get("hook_input_mtime")))
+
+
 def issue(prompt, surface=None, now=None, feed_items=None, meta=None):
     """UserPromptSubmit 훅 전용 발급. 결과 dict — ok 이면 token 동봉.
 
     매 프롬프트마다 불린다: 열린 질문이 없고 승인처럼 들리지도 않으면 **무기록·무출력**(exit 3).
     기반 고장(원장 손상·락)도 승인처럼 들리는 말이 아니면 조용히 접는다(발급은 어느 쪽이든 0).
+    ★(리뷰 SEC-1·M2) `meta` 에 훅 목격 증거(`_hook_witness` 산출)가 없으면 판정하지 않고 거부한다(not_hook_caller ·
+      exit 1 · 질문 무소비) — 모듈 API·CLI 를 훅 밖에서 부르는 **평시 실수 경로**를 닫는다. 같은 UID 가 증거를
+      흉내 내는 **고의** 위조는 닫지 못한다(모듈 머리말 '보장 범위').
     """
     prompt = prompt if isinstance(prompt, str) else ""
+    if not _is_hook_meta(meta):
+        return _refuse_unwitnessed("훅 목격 증거가 없는 호출은 판정하지 않는다(직접 호출은 규약 위반 · "
+                                   "원장 issue_refused 에 기록)", surface=surface, prompt=prompt)
     try:
         return _issue_impl(prompt, surface, _now(now), feed_items, meta)
     except (_LockFail, _Corrupt, Exception) as e:  # noqa: BLE001 — fail-closed
         code = ("lock_unavailable" if isinstance(e, _LockFail)
                 else "ledger_corrupt" if isinstance(e, _Corrupt) else "internal_error")
+        if isinstance(e, _Corrupt):
+            # 손상 원장은 발급이 불가능하다 — 표지를 걷어 매 프롬프트의 발급기 기동을 멈춘다(비용 쪽).
+            # 관측은 status(ledger_corrupt)가 한다 · 이 호출의 고지(승인 유사 발화면 판정 불가)는 그대로.
+            try:
+                _drop_marker()
+            except Exception:  # noqa: BLE001
+                pass
         loud = approval_verdict(prompt)[0] == "approve"
         return _result(False, code, "%s: %s" % (type(e).__name__, e),
                        exit_code=EXIT_INTERNAL if loud else EXIT_NO_ASK)
@@ -895,18 +1019,87 @@ def _issue_impl(prompt, surface, now, feed_items, meta):
     path = ledger_path()
     if os.path.exists(path):
         with _Locked(path):
-            asks, _t, _a = _derive(_load(path))
+            recs0 = _load(path)
+            asks, _t, _a = _derive(recs0)
             ask = _open_ask_for(asks, surf)
             if ask is not None:
                 res, recs = _judge(prompt, surf, now, feed_items, ask, meta)
                 if recs:
                     _append(path, recs)
+                    asks, _t, _a = _derive(recs0 + recs)
+                _sync_marker(asks, now)
                 return res
+            _sync_marker(asks, now)       # 다른 좌석의 만료 질문 표지도 여유가 지나면 여기서 걷힌다
+    else:
+        _sync_marker({}, now)             # 원장 없는 표지 = 잔재
     return _no_ask(prompt, surf, feed_items)
 
 
-def issue_from_payload(payload_text, now=None, feed_items=None):
-    """훅 stdin(JSON) → issue. `hook_event_name` 이 있으면 UserPromptSubmit 이어야 한다."""
+def _hook_witness(path, now=None):
+    """(목격 증거|None, 사유) — `--payload-file` 이 **이 레인의 UserPromptSubmit 런처가 방금 쓴 입력**인가.
+
+    런처(role-bootstrap.sh ⑤)는 훅 입력을 `<상태 폴더>/hook-input-<pid>.json` 에 받아 이 파일 경로를 넘긴다.
+    확인: 이름 형식 · 상태 폴더(javis_bootstrap.state_dir) 직속 · 심볼릭 링크 아님 · 정규 파일 · 내 소유(posix) ·
+    크기 상한 · 나이 ≤ HOOK_INPUT_MAX_AGE_S(재생 차단). 시각은 실시간(파일 mtime 과 같은 시계)이다.
+    ★보장 경계: 같은 UID 가 이 조건을 갖춘 파일을 **일부러** 써서 부르면 통과한다 — 막는 것은 공식 CLI·모듈 API 를
+      훅 밖에서 부르는 평시 실수 경로다(설계 §12-1 경계 · 원장은 그 위조의 감사 흔적).
+    """
+    if not isinstance(path, str) or not path:
+        return None, "훅 입력 파일 경로가 없다(stdin·인자 직접 호출은 훅이 아니다)"
+    name = os.path.basename(path)
+    if not re.fullmatch(r"hook-input-[0-9]+\.json", name):
+        return None, "훅 입력 파일 이름이 런처 형식(hook-input-<N>.json)이 아니다: %s" % name
+    try:
+        import javis_bootstrap
+        sdir = javis_bootstrap.state_dir()
+        if not os.path.samefile(os.path.dirname(os.path.abspath(path)), sdir):
+            return None, "훅 입력 파일이 상태 폴더(%s) 직속이 아니다: %s" % (sdir, path)
+        st = os.lstat(path)
+    except (OSError, ValueError) as e:
+        return None, "훅 입력 파일 확인 실패(%s): %s" % (e, path)
+    import stat as _stat
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        return None, "훅 입력이 정규 파일이 아니다(링크·특수 파일): %s" % path
+    if hasattr(os, "geteuid") and os.name == "posix" and st.st_uid != os.geteuid():
+        return None, "훅 입력 파일 소유자(uid %d)가 이 프로세스가 아니다" % st.st_uid
+    if st.st_size > HOOK_INPUT_MAX_BYTES:
+        return None, "훅 입력 파일이 상한 %d 바이트 초과" % HOOK_INPUT_MAX_BYTES
+    age = (time.time() if now is None else float(now)) - st.st_mtime
+    if age > HOOK_INPUT_MAX_AGE_S or age < -HOOK_INPUT_SKEW_S:
+        return None, "훅 입력 파일 나이 %.0fs — 런처가 방금 쓴 입력이 아니다(상한 %ds · 재생 차단)" % (
+            age, HOOK_INPUT_MAX_AGE_S)
+    return {"via": "hook", "hook_input": name, "hook_input_mtime": st.st_mtime}, ""
+
+
+def issue_from_hook_file(path, now=None, feed_items=None):
+    """훅 입력 파일(런처가 방금 쓴 것) → 출처 확인 → issue. 출처 불명 = not_hook_caller(판정 없음 · 질문 무소비)."""
+    witness, why = _hook_witness(path)
+    if witness is None:
+        return _refuse_unwitnessed(why)
+    try:
+        with open(path, "rb") as f:
+            text = f.read(HOOK_INPUT_MAX_BYTES + 1).decode("utf-8", "replace")
+    except OSError as e:
+        return _result(False, "hook_payload_invalid", "훅 입력 판독 실패(%s)" % e)
+    return issue_from_payload(text, now=now, feed_items=feed_items, witness=witness)
+
+
+def _refuse_unwitnessed(why, surface=None, prompt=None):
+    """훅 밖 발급 시도 — 판정하지 않고(질문 무소비) 거부 · 원장이 있으면 감사 1줄(best-effort · 원장을 새로 만들지 않는다)."""
+    surf = _env_surface() if surface is None else _surface_key(surface)
+    path = ledger_path()
+    if os.path.exists(path):
+        extra = {"surface": surf}
+        if isinstance(prompt, str):
+            extra["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        _audit(path, "issue_refused", "not_hook_caller", why, **extra)
+    return _result(False, "not_hook_caller", "발급은 UserPromptSubmit 훅만 한다 — %s" % why, surface=surf)
+
+
+def issue_from_payload(payload_text, now=None, feed_items=None, witness=None):
+    """훅 입력(JSON) → issue. UserPromptSubmit 형식(hook_event_name·session_id)이 **필수**다(리뷰 SEC-1 — 종전엔
+    hook_event_name 이 없어도 통과해 `{"prompt":"그래 만들어"}` 한 줄이 발급 입력이 됐다). `witness` 가 없으면
+    issue 가 not_hook_caller 로 거부한다(목격 증거는 issue_from_hook_file 만 만든다)."""
     try:
         obj = json.loads(payload_text)
     except (TypeError, ValueError) as e:
@@ -914,11 +1107,14 @@ def issue_from_payload(payload_text, now=None, feed_items=None):
     if not isinstance(obj, dict) or not isinstance(obj.get("prompt"), str):
         return _result(False, "hook_payload_invalid", "훅 JSON 에 문자열 prompt 가 없다")
     ev = obj.get("hook_event_name")
-    if ev is not None and ev != "UserPromptSubmit":
-        return _result(False, "hook_payload_invalid", "UserPromptSubmit 이 아닌 훅 사건(%r)" % (ev,))
+    if ev != "UserPromptSubmit":
+        return _result(False, "hook_payload_invalid", "UserPromptSubmit 훅 사건이 아니다(hook_event_name=%r)" % (ev,))
     sid = obj.get("session_id")
-    return issue(obj["prompt"], now=now, feed_items=feed_items,
-                 meta={"session_id": sid if isinstance(sid, str) else None})
+    if not _is_str(sid):
+        return _result(False, "hook_payload_invalid", "훅 입력에 session_id 가 없다")
+    meta = dict(witness or {})
+    meta["session_id"] = sid
+    return issue(obj["prompt"], now=now, feed_items=feed_items, meta=meta)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -949,6 +1145,12 @@ def _judge_token(t, pid, surf, digest, phase, now):
         return _result(False, "token_unknown", "원장에 없는 토큰 — 발급된 적 없다")
     iss, st = t["issued"], t["state"]
     ext = {"proposal_id": iss["proposal_id"], "surface": iss["surface"], "state": st, "phase": phase}
+    # ★(리뷰 SEC-2) 발급 레코드의 훅 목격 증거가 **인가 판정에 참여한다** — 종전엔 pid·ppid·hook_session 이 쓰이기만
+    #   하고 어느 판정도 읽지 않아(순수 사후 기록), 훅 밖에서 만든 토큰과 훅 발급 토큰이 소비 시점에 구별되지 않았다.
+    #   증거 없는 발급 레코드(모듈 API 직접 호출·옛 형식·증거 없이 끼워 넣은 줄)는 '발급된 적 없는 토큰'으로 본다.
+    if iss.get("via") != "hook" or not _is_str(iss.get("hook_session")):
+        return _result(False, "token_unknown", "훅 목격 증거(via=hook·hook_session) 없는 발급 레코드 — 인가하지 않는다",
+                       **ext)
     if phase == "create":
         if st != "issued":
             return _result(False, "token_consumed", "이미 소비된 토큰(상태 %s)" % st, **ext)
@@ -1090,6 +1292,10 @@ def status(surface=None, proposal_id=None, now=None):
     if os.path.exists(path):
         with _Locked(path):
             recs = _load(path)
+            asks, tokens, audits = _derive(recs)
+            _sync_marker(asks, now)        # 표지는 파생 캐시 — 관측 때 원장에 맞춰 되살리거나 걷는다(리뷰 F3)
+    else:
+        _sync_marker({}, now)
     asks, tokens, audits = _derive(recs)
     for r in recs:
         if r.get("surface") != surf:
@@ -1124,7 +1330,10 @@ def status(surface=None, proposal_id=None, now=None):
     elif ask is None:
         code = "ask_not_open"
     elif ask["closed"] is None:
-        code = "awaiting_answer" if now <= float(ask["rec"]["expires_at"]) else "approval_not_received"
+        # ★(리뷰 m2) 답 없이 만료된 질문은 ask_expired — 종전 approval_not_received("한 번만 더 쳐 주세요")는 질문이
+        #   이미 만료라 다시 쳐도 성공할 수 없었다(다시 친 답 = ask_expired). 질문을 새로 열어야 한다(디렉티브 절차 5
+        #   '3 부터 다시'). 승인이 닿지 않은 경우(§7-2 턴 도중 입력)는 TTL 안에서 awaiting_answer 로 잡힌다.
+        code = "awaiting_answer" if now <= float(ask["rec"]["expires_at"]) else "ask_expired"
     else:
         last = [r for r in audits if r.get("event") == "issue_refused"
                 and r.get("ask_id") == ask["rec"]["ask_id"]]
@@ -1168,7 +1377,7 @@ def _build_parser():
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("ask", help="질문 열기(master)")
     p.add_argument("--proposal", default="")
-    p = sub.add_parser("issue", help="훅 전용 발급(stdin = UserPromptSubmit JSON)")
+    p = sub.add_parser("issue", help="UserPromptSubmit 훅 전용 발급(런처가 방금 쓴 <상태>/hook-input-<N>.json · 직접 호출 거부)")
     p.add_argument("--payload-file", default=None)
     for name in ("verify", "consume"):
         p = sub.add_parser(name)
@@ -1210,18 +1419,11 @@ def _main(args):
     if cmd == "ask":
         return _emit(open_ask(args.proposal))
     if cmd == "issue":
-        try:
-            if args.payload_file:
-                with open(args.payload_file, "rb") as f:
-                    raw = f.read()
-            else:
-                raw = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read()
-            text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        except OSError as e:
-            return _emit(_result(False, "hook_payload_invalid", "훅 입력 판독 실패(%s)" % e))
-        res = issue_from_payload(text)
+        # ★(리뷰 SEC-1) stdin 입력 경로는 없다 — 발급 입력은 런처가 방금 쓴 훅 입력 파일(--payload-file)뿐이고, 그 출처를
+        #   _hook_witness 가 확인한다. stdin·임의 파일로 부르면 판정 없이 not_hook_caller(exit 1 · 질문 무소비).
+        res = issue_from_hook_file(args.payload_file)
         if res.get("exit") == EXIT_NO_ASK:
-            return EXIT_NO_ASK                  # 무출력 — 훅은 매 프롬프트마다 부른다
+            return EXIT_NO_ASK                  # 무출력 — 훅은 열린 질문이 있는 동안 매 프롬프트마다 부른다
         return _emit(res)
     if cmd in ("verify", "consume"):
         dig, bad = _body_arg(args)

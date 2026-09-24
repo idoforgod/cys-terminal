@@ -25,7 +25,8 @@ CYS_STATE_DIR 전부 임시 경로 + CYS_NO_PERSONAL_HOOK_MERGE=1 + CYS_NO_AUTOS
   P  수용 기준(§13 P4)  — 오너 입력 issued 1 · 기계 배달 issued 0 + issue_refused(machine_origin) 기록 ·
                           신 파이프라인이 처리완료(rc 6)로 본체를 건너뛰어도 · 구 CLI 로 본체가 돌아도 같다 ·
                           기계 배달은 질문을 소비하지 않는다(뒤이은 오너 승인 발급) · §14-6 거짓 음성 핀.
-  C  비용 게이트        — 토큰 원장 부재 = 인터프리터 0회 · 원장이 오래됨 = 0회 · 최근이면 발급기 1회.
+  C  비용 게이트        — 열린 질문 표지(teamtoken-open-*) 부재 = 인터프리터 0회(원장이 있어도 · 방금 움직였어도) ·
+                          표지가 있으면 발급기 1회 · 묵은 표지는 1회 뒤 걷힌다 · 게이트는 외부 명령 0(리뷰 F3).
   V  안내(§10)          — 거절·만료·다른 좌석·기계 비승인 발화의 고지 유무와 문구.
   O  stdout 계약        — 훅 stdout 은 JSON 1줄이거나 무출력: 본체 고지·런처 자체 고지와 겹치면 합치거나 뺀다.
   F  실패 정책          — 발급기 손상·행·부재에서도 exit 0 · 본체 진행 · 발급 0 · 유계 시간.
@@ -210,7 +211,7 @@ class Lab(object):
     def paths(self):
         return self.py("import json, javis_teamtoken as t, javis_mission as m\n"
                        "print(json.dumps({'ledger': t.ledger_path(), 'feed': t.feed_jsonl_path(),"
-                       " 'delivery': m.delivery_ledger_path()}))")
+                       " 'delivery': m.delivery_ledger_path(), 'marker': t.open_marker_path()}))")
 
     def seed(self, now=None, extra_delivery=()):
         """배달 원장(기동 표식 1줄 = 상태 ok) + feed(이 좌석이 올린 대기 제안 1건)."""
@@ -423,45 +424,44 @@ def suite_cost():
           "py=%r lines=%r body=%d" % (r.pycalls, r.lines, r.body_runs))
     check("C", "C-1b 원장 부재 경로는 원장을 만들지 않는다(무기록)", not lab.ledger_bytes(), "")
 
+    # ★(리뷰 F3) 종전 게이트는 원장 mtime 10분 창이었다 — 질문이 닫힌 뒤에도, 거부 감사 레코드 한 줄에도 10분 동안
+    #   모든 좌석의 모든 프롬프트가 발급기를 띄웠다(맥 약 +130ms). 이제 게이트는 '열린 질문 표지'만 본다.
     lab2 = Lab("c2")
     lab2.seed()
-    old = time.time() - 3600
-    lab2.ask(now=old)                            # 한 시간 전에 열린(이미 만료된) 질문
-    lp = lab2.paths()["ledger"]
-    os.utime(lp, (old, old))
-    snap = lab2.ledger_bytes()
-    r2 = lab2.hook(APPROVE, stub_rc=0)
-    check("C", "C-2 원장이 오래됨(최근 움직임 없음) → 인터프리터 0회 · 무출력 · 원장 무변경",
-          r2.returncode == 0 and not r2.pycalls and not r2.lines and lab2.ledger_bytes() == snap,
-          "py=%r lines=%r" % (r2.pycalls, r2.lines))
+    lab2.ask()
+    r2a = lab2.hook(APPROVE, stub_rc=0)          # 발급 → 질문 닫힘 → 표지 걷힘
+    r2b = lab2.hook("오늘 할 일 정리해줘", stub_rc=0)
+    check("C", "C-2 발급으로 질문이 닫힌 직후(원장은 방금 움직였다) → 다음 프롬프트는 인터프리터 0회",
+          len(lab2.events("token_issued")) == 1 and len(r2a.tt_calls) == 1 and not r2b.pycalls
+          and not os.path.exists(lab2.paths()["marker"]),
+          "issued=%d 1차=%r 2차=%r" % (len(lab2.events("token_issued")), r2a.tt_calls, r2b.pycalls))
+    lab2.py("import json, javis_teamtoken as t\n"
+            "print(json.dumps(t.consume('0' * 32, sys.argv[1], sys.argv[2], '0' * 64)))", PROPOSAL, SURFACE)
+    r2c = lab2.hook(APPROVE, stub_rc=0)
+    check("C", "C-2b 감사 전용 쓰기(consume_refused)가 원장을 방금 움직여도 → 인터프리터 0회 · 무출력",
+          len(lab2.events("consume_refused")) == 1 and not r2c.pycalls and not r2c.lines,
+          "py=%r lines=%r" % (r2c.pycalls, r2c.lines))
 
     lab3 = Lab("c3")
     lab3.seed()
     lab3.ask()
     snap3 = lab3.ledger_bytes()
     r3 = lab3.hook(APPROVE, surface=OTHER_SURFACE, stub_rc=0)
-    check("C", "C-3 최근 원장 + 이 좌석엔 질문 없음 → 발급기 1회 · 무출력 · 원장 무변경",
+    check("C", "C-3 열린 질문 표지 + 이 좌석엔 질문 없음 → 발급기 1회 · 무출력 · 원장 무변경",
           r3.returncode == 0 and len(r3.tt_calls) == 1 and not r3.lines and lab3.ledger_bytes() == snap3,
           "tt=%r lines=%r" % (r3.tt_calls, r3.lines))
     r3b = lab3.hook("오늘 할 일 정리해줘", stub_rc=0)
     check("C", "C-4 질문이 열린 좌석의 평문 답도 판정은 1회(발급기 1회)", len(r3b.tt_calls) == 1, r3b.pycalls)
 
-    # C-5 게이트의 mtime 판독 두 갈래 — macOS(BSD `stat -f %m`)는 위에서 쟀다. GNU(`stat -c %Y`)를 흉내
-    #     내는 스텁으로 리눅스 갈래도 같은 결론(오래된 원장 → 0회)인지 잰다.
-    gnu = ('#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = %%Y ]; then\n'
-           '  exec "%s" -c "import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))" "$3"\nfi\n'
-           'echo "stat: cannot read file system information" >&2\nexit 1\n' % PY)
-    for tag, stub_body, want in (("C-5 GNU stat 갈래 — 오래된 원장 → 발급기 0회", gnu, 0),
-                                 ("C-6 mtime 판독 불가(쓰레기 출력) → 실패 방향은 '발급기를 부른다'(1회)"
-                                  " · 그래도 발급 0", "#!/bin/sh\necho garbage\nexit 0\n", 1)):
-        labx = Lab("c5-%d" % want)
-        w(os.path.join(labx.stub, "stat"), stub_body, 0o755)
-        labx.seed()
-        labx.ask(now=old)
-        os.utime(labx.paths()["ledger"], (old, old))
-        rx = labx.hook(APPROVE, stub_rc=0)
-        check("C", tag, rx.returncode == 0 and len(rx.tt_calls) == want
-              and not labx.events("token_issued"), "tt=%r" % rx.tt_calls)
+    old = time.time() - 3600
+    lab5 = Lab("c5")
+    lab5.seed()
+    lab5.ask(now=old)                            # 한 시간 전에 열린 채 답이 없는 질문 — 표지가 묵었다
+    r5a = lab5.hook(APPROVE, stub_rc=0)
+    r5b = lab5.hook(APPROVE, stub_rc=0)
+    check("C", "C-5 묵은 표지(만료 + 고지 여유 지남) → 1회 부른 뒤 걷힌다 → 다음은 0회 · 발급 0",
+          len(r5a.tt_calls) == 1 and not r5b.pycalls and not os.path.exists(lab5.paths()["marker"])
+          and not lab5.events("token_issued"), "1차=%r 2차=%r" % (r5a.tt_calls, r5b.pycalls))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -588,8 +588,9 @@ def _hang_module(binp):
 def suite_failure():
     lab = Lab("f1", bin_mut=_break_module)
     lab.seed()
-    # 원장을 손으로 최근 시각에 둔다(깨진 모듈로는 ask 를 열 수 없다) — 내용이 아니라 '최근'만 필요하다.
+    # 열린 질문 표지를 손으로 세운다(깨진 모듈로는 ask 를 열 수 없다) — 게이트는 표지 존재만 본다.
     w(lab.paths()["ledger"], "")
+    w(lab.paths()["marker"], "{}\n")
     r = lab.hook(APPROVE, stub_rc=0)
     check("F", "F-1 발급기 손상 → exit 0 · 본체 진행 · 발급 0 · stdout JSON 1줄 이하",
           r.returncode == 0 and r.body_runs == 1 and one_json_line(r) and not lab.events("token_issued"),
@@ -600,6 +601,7 @@ def suite_failure():
     lab2 = Lab("f2", bin_mut=_hang_module)
     lab2.seed()
     w(lab2.paths()["ledger"], "")
+    w(lab2.paths()["marker"], "{}\n")
     r2 = lab2.hook(APPROVE, stub_rc=0, timeout=120)
     check("F", "F-2 발급기 행 → 유계 시간 안에 exit 0 · 본체 진행(프롬프트 먹통 없음)",
           r2.returncode == 0 and r2.body_runs == 1 and r2.elapsed < 20 and one_json_line(r2),
@@ -670,6 +672,13 @@ def suite_structure():
           0 <= ia < ib, "issuer@%d delegate@%d" % (ia, ib))
     check("S", "S-8 런처 비주석 줄에 python 글자 없음(pyseal census ⓒ(i) 소비 훅 판정 밖 유지)",
           "python" not in body)
+    # ★(리뷰 F3) 비용 게이트는 셸 글롭 존재 검사 하나다 — 매 프롬프트 외부 명령(date·stat) 0.
+    gi = body.find("_cys_tt_open()")
+    ge = body.find("\n}", gi)
+    gate = body[gi:ge] if 0 <= gi < ge else ""
+    check("S", "S-10 비용 게이트 = 열린 질문 표지(teamtoken-open-*) 글롭 존재 검사 · 외부 명령(date·stat) 0",
+          bool(gate) and "teamtoken-open-" in gate and "date" not in gate and "stat " not in gate
+          and "CYS_TT_WINDOW_S" not in body, gate[:200])
     for shbin in ("sh", "dash", "bash"):
         if shutil.which(shbin) is None:
             print("SKIP S-9 %s 부재" % shbin)
