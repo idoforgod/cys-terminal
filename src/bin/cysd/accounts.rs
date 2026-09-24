@@ -532,27 +532,49 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
 /// agy 관측 경로(agy-rpc)의 고장 코드를 antigravity 계정 행에 싣는다(`None` = 지움).
 /// 수집기가 한 틱을 통째로 본 뒤 부른다 — 그 틱에 한 좌석이라도 성공했으면 부르지 않는다(성공은
 /// note_rate 가 지운다). agy 좌석이 하나도 없으면 `None` 으로 옛 오류를 지운다(좌석이 없는 것은 고장이 아니다).
-/// 오류가 왔는데 계정 행이 없으면 만든다 — cys 창에 agy 좌석이 떠 있다는 것 자체가 그 계정의 흔적이다.
+///
+/// ★행을 만드는 근거는 **시드와 같은 것**(agy 데이터 폴더 실재)뿐이다(fix-round-1 F1). 좌석의 `agent_meta ==
+/// "gemini"` 는 계정의 흔적이 아니다 — cys 런처는 readiness 전에 meta 를 달므로 agy 미설치·agy 가 끝나 셸만 남은
+/// 좌석·agents.json 에서 gemini 를 다른 CLI 로 바꾼 좌석도 gemini 좌석이고, 그 좌석의 `agy_no_process` 로 행을
+/// 만들면 좌석이 닫힌 뒤 '관측 전' 유령 계정이 데몬 재시작까지 남는다. 그래서:
+///   · 행이 있으면(부트 시드 · 신선 관측 · 선언) 오류만 싣는다 — 폴더 유무와 무관.
+///   · 행이 없으면 데이터 폴더가 **지금** 있을 때만 만든다(부트 뒤 설치된 agy = 늦은 시드 · 재시작해도 같은 행).
+///   · 둘 다 아니면 버린다 — 흔적 없는 기계의 좌석 오류는 보일 계정이 없다.
+/// 이 규칙이면 오류 경로로 생긴 행은 전부 시드 근거를 가진 행이라, 좌석 0 에서 행을 지울 필요가 없다.
 pub fn note_agy_error(daemon: &Arc<Daemon>, err: Option<&str>) {
+    note_agy_error_at(daemon, dirs::home_dir().as_deref(), err)
+}
+
+/// 홈을 인자로 받는 시험 이음매. `home == None`(홈 불명) = 근거 확인 불가 → 새 행을 만들지 않는다.
+fn note_agy_error_at(daemon: &Arc<Daemon>, home: Option<&Path>, err: Option<&str>) {
     let mut st = daemon.accounts.lock().unwrap();
     let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
     match err {
         Some(code) => {
-            let profiles: BTreeSet<String> = dirs::home_dir()
-                .map(|h| antigravity_profiles(&h).into_iter().collect())
+            if let Some(v) = st.views.get_mut(&key) {
+                v.source_error = Some(code.to_string());
+                return;
+            }
+            let profiles: BTreeSet<String> = home
+                .map(|h| antigravity_profiles(h).into_iter().collect())
                 .unwrap_or_default();
-            let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
-                key,
-                label: "Antigravity (agy)".into(),
-                plan: None,
-                profiles,
-                rate: Vec::new(),
-                updated_at: 0.0,
-                source: String::new(),
-                adapter: true,
-                source_error: None,
-            });
-            v.source_error = Some(code.to_string());
+            if profiles.is_empty() {
+                return; // 흔적 0 — 유령 계정을 만들지 않는다
+            }
+            st.views.insert(
+                key.clone(),
+                AccountView {
+                    key,
+                    label: "Antigravity (agy)".into(),
+                    plan: None,
+                    profiles,
+                    rate: Vec::new(),
+                    updated_at: 0.0,
+                    source: String::new(),
+                    adapter: true,
+                    source_error: Some(code.to_string()),
+                },
+            );
         }
         None => {
             if let Some(v) = st.views.get_mut(&key) {
@@ -881,11 +903,14 @@ mod tests {
     }
 
     /// RC2(정직 표기): 관측 경로 고장은 '관측 전'과 구별돼 행에 실리고, 신선 관측이 오면 지워진다.
+    /// (가짜 홈에 agy 데이터 폴더를 둔다 — 행 생성 근거. 라이브 홈에 기대면 폴더 없는 CI 에서 결과가 갈린다.)
     #[test]
     fn source_error_is_exposed_until_a_fresh_observation_clears_it() {
         let dir = tmp("daemon-srcerr");
+        let home = tmp("home-srcerr");
+        std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
         let d = crate::state::Daemon::new(dir.join("cysd.sock"));
-        note_agy_error(&d, Some("agy_http_403"));
+        note_agy_error_at(&d, Some(&home), Some("agy_http_403"));
         let now = crate::state::now_epoch();
         let rows = local_json(&d, now);
         let row = rows
@@ -902,11 +927,90 @@ mod tests {
         assert!(row["source_error"].is_null(), "신선 관측 뒤에도 오류가 남았다: {row}");
         assert_eq!(row["source"], "agy-rpc");
         // 오류 해제(None) — 좌석이 사라지면 옛 오류를 남기지 않는다
-        note_agy_error(&d, Some("agy_unreachable"));
-        note_agy_error(&d, None);
+        note_agy_error_at(&d, Some(&home), Some("agy_unreachable"));
+        note_agy_error_at(&d, Some(&home), None);
         let rows = local_json(&d, now);
         let row = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").unwrap();
         assert!(row["source_error"].is_null());
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn agy_rows(d: &Arc<Daemon>) -> Vec<Value> {
+        let now = crate::state::now_epoch();
+        local_json(d, now)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["provider"] == "antigravity")
+            .cloned()
+            .collect()
+    }
+
+    /// fix-round-1 F1(음성 대조): agy 흔적이 전혀 없는 홈 + agy 없는 gemini 좌석(agy 미설치·agy 가 끝나 셸만 남음·
+    /// agents.json 의 gemini 를 다른 CLI 로 바꿈) → 수집기 오류가 **유령 Antigravity 계정 행을 만들지 않는다**.
+    /// 수정 전: `note_agy_error(Some)` 가 행을 만들고, 좌석이 닫히면 오류만 지워 '관측 전' 유령이 재시작까지 남았다.
+    #[test]
+    fn agy_error_without_any_agy_trace_creates_no_account_row() {
+        let dir = tmp("daemon-noghost");
+        let home = tmp("home-noghost"); // 빈 홈 — ~/.gemini/antigravity-cli · ~/.antigravity 없음
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        for code in ["agy_no_process", "agy_no_port", "agy_unreachable", "agy_http_401", "agy_no_quota"] {
+            note_agy_error_at(&d, Some(&home), Some(code));
+            let rows = agy_rows(&d);
+            assert!(rows.is_empty(), "흔적 없는 홈에서 오류 {code} 가 antigravity 행을 만들었다: {rows:?}");
+        }
+        // 좌석이 0이 된 뒤(None)에도 행이 없다 — '관측 전' 유령으로 남지 않는다
+        note_agy_error_at(&d, Some(&home), None);
+        assert!(agy_rows(&d).is_empty());
+        // 홈을 모를 때도 만들지 않는다(근거 없음 = 행 없음)
+        note_agy_error_at(&d, None, Some("agy_no_process"));
+        assert!(agy_rows(&d).is_empty());
+        assert!(local_json(&d, crate::state::now_epoch()).as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// fix-round-1 F1(양성 대조): 행 생성의 근거는 **시드와 같은 것**(agy 데이터 폴더 실재)이다 — 부트 뒤에 설치된
+    /// agy(늦은 시드)는 오류 틱에 행이 생기고 실제 폴더가 적힌다. 좌석이 0 이 되면 오류만 지우고 행은 남는다
+    /// (폴더가 있으니 데몬을 재시작해도 시드되는 행 — 재시작 전후가 같다).
+    #[test]
+    fn agy_error_creates_row_only_on_the_seed_evidence() {
+        let dir = tmp("daemon-lateseed");
+        let home = tmp("home-lateseed");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        note_agy_error_at(&d, Some(&home), Some("agy_no_process"));
+        assert!(agy_rows(&d).is_empty(), "폴더가 생기기 전");
+        write(&home.join(".gemini/antigravity-cli/antigravity-oauth-token"), "dummy-not-a-token");
+        note_agy_error_at(&d, Some(&home), Some("agy_no_process"));
+        let rows = agy_rows(&d);
+        assert_eq!(rows.len(), 1, "데이터 폴더가 생긴 뒤에는 행이 있어야 한다: {rows:?}");
+        assert_eq!(rows[0]["source_error"], "agy_no_process");
+        assert_eq!(rows[0]["profiles"], json!([".gemini/antigravity-cli"]));
+        assert!(rows[0]["updated_at"].is_null(), "값은 지어내지 않는다");
+        note_agy_error_at(&d, Some(&home), None);
+        let rows = agy_rows(&d);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0]["source_error"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// fix-round-1 F1(주석만): 이미 있는 행(신선 관측으로 생긴 행 포함)에는 폴더가 없어도 오류가 실린다 —
+    /// 행을 만드는 것만 근거를 요구하고, 있는 행의 경로 고장 표기는 막지 않는다.
+    #[test]
+    fn agy_error_annotates_an_existing_row_without_the_data_dir() {
+        let dir = tmp("daemon-annotate");
+        let home = tmp("home-annotate");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let now = crate::state::now_epoch();
+        note_rate(&d, "gemini", "", &[RateWindow { label: "5h".into(), used_pct: 7.0, resets_at: None }], "agy-rpc", now);
+        note_agy_error_at(&d, Some(&home), Some("agy_http_403"));
+        let rows = agy_rows(&d);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source_error"], "agy_http_403");
+        assert_eq!(rows[0]["source"], "agy-rpc", "관측값·출처는 그대로");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
