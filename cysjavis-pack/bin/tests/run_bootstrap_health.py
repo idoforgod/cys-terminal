@@ -8048,6 +8048,22 @@ def h_doc_2():
     return "파생=%s · required 에 master 부재 · 훅 리터럴 0 · 계측검증=%s" % (note[:48], calib)
 
 
+# ★0.14.42 대화 승인 토큰 갈래 — cys-dept 단일소유 가드의 `create --team-token` 분기 표지(코드가 면제의 근거).
+_HDOC3_TOKEN_BRANCH_RE = re.compile(r'\[ "\$cmd" = "create" \] && \[ "\$\{2:-\}" = "--team-token" \]')
+
+
+def _hdoc3_used_verbs(text, dept_src):
+    """문서가 **호출 형태로** 지시하는 cys-dept 동사 집합(`cys-dept <verb>`).
+
+    ★0.14.42: 가드 코드에 `create --team-token` 토큰 관문 갈래가 있으면 그 **정확한 호출형**
+    (`cys-dept create --team-token`)만 뺀다 — 그 형태는 역할이 아니라 토큰 관문(데몬 검증)이 판정하므로
+    문서가 그것을 지시해도 가드와 모순이 아니다. 갈래가 코드에서 사라지면 면제도 함께 사라진다.
+    scripts/gen_ceo_template.py `_used_verbs()` 와 같은 규칙이다(두 곳이 갈리면 한쪽만 적색이 된다)."""
+    if _HDOC3_TOKEN_BRANCH_RE.search(dept_src or ""):
+        text = re.sub(r"cys-dept\s+create\s+--team-token\b", "", text)
+    return set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", text))
+
+
 @specimen("H-DOC-3", "W4", "CEO_TEMPLATE 동사 ⊆ cys-dept 가드 허용 집합(지시-집행 통일)", ["G6"])
 def h_doc_3():
     """G6(RC6): CEO_TEMPLATE 가 CEO 에게 `cys-dept launch/down` **직접 호출**을 지시했는데,
@@ -8076,7 +8092,19 @@ def h_doc_3():
          "가드가 막는 집합이 예상보다 좁다(%s) — 검체 전제 재확인 필요" % sorted(blocked))
     need("CYS_ROLE" in dept and "exit 7" in dept, "가드 판정 재료(CYS_ROLE·exit 7) 부재")
     # ② 문서가 **호출 형태로** 지시하는 동사(`cys-dept <verb>`)를 뽑는다
-    used = set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", tmpl))
+    used = _hdoc3_used_verbs(tmpl, dept)
+    # ②′ 합성 표본(계측 타당성 · 0.14.42 대화 승인 토큰 갈래): 가드에 `create --team-token` 토큰 관문 갈래가
+    #    있으면 그 **정확한 호출형**은 역할과 무관하게 토큰 관문(데몬 검증)이 판정한다 — 문서가 그 형태를
+    #    지시해도 가드와 모순이 아니다. 토큰 없는 `create` 는 여전히 적색이어야 하고, 가드에서 그 갈래가
+    #    사라지면 면제도 함께 사라져야 한다(면제의 근거는 문서가 아니라 코드다).
+    tok_form = "`cys-dept create --team-token <토큰>`"
+    need(not (_hdoc3_used_verbs(tok_form, dept) & blocked),
+         "합성 표본: 토큰 관문 갈래가 있는 가드에서 `cys-dept create --team-token` 호출형이 차단 동사로 잡혔다")
+    need("create" in _hdoc3_used_verbs("`cys-dept create dept-9`", dept),
+         "합성 표본: 토큰 없는 `cys-dept create` 호출형이 차단 동사로 잡히지 않는다(면제가 넓다)")
+    dept_wo_branch = _HDOC3_TOKEN_BRANCH_RE.sub("false", dept)
+    need(dept_wo_branch != dept and "create" in _hdoc3_used_verbs(tok_form, dept_wo_branch),
+         "합성 표본: 가드에서 토큰 관문 갈래를 지운 변조본에서도 토큰 호출형이 면제된다(면제가 코드에 결박되지 않았다)")
     illegal = sorted(used & blocked)
     need(not illegal,
          "CEO_TEMPLATE 가 가드가 거부하는 동사를 직접 호출하도록 지시한다: %s "

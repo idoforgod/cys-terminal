@@ -37,9 +37,18 @@ When upgrading `wry` in `Cargo.lock` (currently 0.55.1), rerun `ui/e2e/dragdrop_
   instructing them would contradict its own enforcement; both the H-DOC-3 health
   specimen and `gen_ceo_template.py --check` fail on it. Prose mentions of a bare
   verb (`launch`) are fine — just don't prefix it with `cys-dept `.
+  The one exception is `cys-dept create --team-token <token>` (MASTER §4-A-2): the
+  guard judges that exact form by the daemon-verified conversational-approval token
+  instead of the role, so both checkers exempt it **only while** the guard code still
+  has the `[ "$cmd" = "create" ] && [ "${2:-}" = "--team-token" ]` branch. A bare
+  `cys-dept create` stays red.
 - After resynthesis, run the part-cap pin locally:
   `cargo test --bin cysd deployed_ceo` (CEO synthesized payload must fit the
-  delivery part cap with 4x headroom).
+  delivery part cap with 4x headroom). A unit is one **unique non-empty line** of
+  the composed text, so joining a wrapped bullet into one line frees units. Measured
+  2026-09-23 (0.14.42 branch, after the §4-A-2 edit): 998 of 1000 units — any net
+  new line in MASTER or the CEO fragment must be offset, or the cap/headroom
+  changed with a reviewed decision.
 
 ## Test isolation — pack sandbox (W0)
 
