@@ -15,6 +15,8 @@
 //!   [`report_outside`])로 들어온다(source "statusline-outside"). 좌석·배지·이벤트·임계는 건드리지 않고
 //!   `note_rate` 하나만 부른다. 이 값은 **표시용**이다 — 같은 UID 의 아무 프로세스나 보낼 수 있으므로
 //!   계정 경보(`alert_rates`)의 근거로 쓰지 않는다(오너 승인 2026-09-23 "표시용 값 · 위조 한계 문서화").
+//!   ★fix-values-1: 경보 입력은 표시 승자와 **따로** 보관한다(`AccountsState::alert_inputs` — 창 밖이 아닌 출처의
+//!   마지막 관측). 창 밖 값은 경보 입력을 만들지도 지우지도 않는다(억제·재발화 둘 다 차단).
 //! - ★0.14.42 RC2-b: agy 값의 주 경로는 agy 상태줄 훅(좌석 `usage.report` · source "agy-statusline")이다.
 //! - 병합 = 창 벡터 통째 최신 승자(같은 계정 풀은 최신 관측이 진실).
 //!
@@ -68,6 +70,11 @@ pub struct AccountsState {
     views: HashMap<AccountKey, AccountView>,
     ident_cache: HashMap<PathBuf, IdentEntry>,
     last_persisted: HashMap<(AccountKey, String), f64>, // (key, 창 라벨) → 마지막 기록 pct
+    /// 계정 경보 입력 — 계정별 **창 밖이 아닌** 출처(좌석 statusline·rollout·agy·어댑터)의 마지막 신선 관측
+    /// (관측 시각, rate). 표시 승자(`AccountView.rate` — 창 벡터 통째 최신 승자)와 **분리**한다(fix-values-1 SP-1·F1):
+    /// 표시 승자에 경보 제외를 걸면 창 밖 보고 한 건이 좌석이 본 값을 경보에서 통째로 지우고(억제), 좌석 보고가
+    /// 다시 최신이 되면 check_alerts 가 재무장된 키를 곧바로 다시 발화한다(30분 리마인드 우회 · 깜빡임).
+    alert_inputs: HashMap<AccountKey, (f64, Vec<RateWindow>)>,
     last_prune: f64,
     /// cys 창 밖 보고의 빈도 상한 상태 — (정규화된 프로필 dir) → (마지막 수용 시각, 그때의 rate).
     /// 키 공간은 검증을 통과한 **알려진 프로필 dir** 뿐이라 크기가 유계다.
@@ -86,6 +93,22 @@ pub const OUTSIDE_RATE_MAX_ENTRIES: usize = 4;
 const OUTSIDE_MIN_INTERVAL_SECS: f64 = 1.0;
 /// 창 밖 보고: 같은 프로필·같은 값이면 이 창 안의 반복을 버린다(초).
 const OUTSIDE_SAME_VALUE_SECS: f64 = 5.0;
+
+/// 이 출처의 관측이 계정 경보 입력이 되는가 — 창 밖(표시용 · 같은 UID 위조 가능) 값만 아니다.
+fn feeds_alerts(source: &str) -> bool {
+    source != OUTSIDE_SOURCE
+}
+
+/// 경보 입력 갱신(창 밖이 아닌 출처만 · 경보 입력끼리 최신 승자). 호출자가 accounts 락을 잡고 있다.
+fn note_alert_input(st: &mut AccountsState, key: &AccountKey, rate: &[RateWindow], source: &str, now: f64) {
+    if !feeds_alerts(source) || rate.is_empty() {
+        return;
+    }
+    let slot = st.alert_inputs.entry(key.clone()).or_insert((0.0, Vec::new()));
+    if now >= slot.0 {
+        *slot = (now, rate.to_vec());
+    }
+}
 
 /// 창 밖 보고의 처리 결과(수용 또는 빈도 상한으로 버림). 거절은 `Err(사유 코드)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +315,7 @@ fn note_rate_at(
         if let Some(p) = profile {
             view.profiles.insert(p);
         }
-        // 최신 승자 — note는 신선 생산분만 받으므로 timestamp 비교로 충분
+        // 최신 승자 — note는 신선 생산분만 받으므로 timestamp 비교로 충분(표시용 · 출처 무관)
         if now >= view.updated_at {
             view.rate = rate.to_vec();
             view.updated_at = now;
@@ -300,6 +323,8 @@ fn note_rate_at(
         }
         // 신선 관측이 왔다 = 그 경로는 지금 동작한다 — 경로 고장 표기를 지운다.
         view.source_error = None;
+        // 경보 입력은 따로 — 창 밖 값은 여기 들어오지 않고, 들어와 있던 좌석 값을 지우지도 않는다.
+        note_alert_input(&mut st, &key, rate, source, now);
         for w in rate {
             let pk = (key.clone(), w.label.clone());
             let prev = st.last_persisted.get(&pk).copied();
@@ -379,16 +404,37 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
             }
         }
     }
+    restore_from_snapshots(daemon, crate::state::now_epoch());
+}
+
+/// 부트 시드 ② — analytics 마지막 스냅샷으로 계정 뷰를 예열한다(홈 무접촉 · 시험 이음매).
+/// 경보 입력도 같은 스냅샷으로 예열한다(종전과 같다). ⚠스냅샷에는 아직 출처가 없어 창 밖 값도 경보 입력으로
+/// 복원된다(IMPL-values §7-6) — 다음 커밋이 출처 열로 닫는다.
+fn restore_from_snapshots(daemon: &Arc<Daemon>, now: f64) {
     // 마지막 스냅샷으로 예열 — updated_at은 스냅샷 시각 그대로(신선한 척 금지)
     let rows = {
         let guard = daemon.analytics.lock().unwrap();
         guard.as_ref().map(|conn| {
-            crate::analytics::last_rate_snapshots(
-                conn,
-                crate::state::now_epoch() - BOOT_RESTORE_SECS,
-            )
+            crate::analytics::last_rate_snapshots(conn, now - BOOT_RESTORE_SECS)
         })
     };
+    let alert_rows = rows.clone().unwrap_or_default();
+    // 경보 입력 복원 — (계정)별로 창을 모아 한 번에 싣는다. 이미 라이브 경보 입력이 있으면 덮지 않는다(신선 관측 우선).
+    let mut restored: HashMap<AccountKey, (f64, Vec<RateWindow>)> = HashMap::new();
+    for (ts, provider, account, _label, win, pct, resets) in alert_rows {
+        let slot = restored
+            .entry(AccountKey { provider, account_id: account })
+            .or_insert((0.0, Vec::new()));
+        slot.0 = slot.0.max(ts);
+        slot.1.push(RateWindow { label: win, used_pct: pct, resets_at: resets });
+    }
+    if !restored.is_empty() {
+        let mut st = daemon.accounts.lock().unwrap();
+        for (key, (ts, mut rate)) in restored {
+            rate.sort_by_key(|w| u8::from(w.label != "5h"));
+            st.alert_inputs.entry(key).or_insert((ts, rate));
+        }
+    }
     if let Some(rows) = rows {
         let mut st = daemon.accounts.lock().unwrap();
         for (ts, provider, account, label, win, pct, resets) in rows {
@@ -556,7 +602,7 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
     let key = AccountKey { provider: provider.into(), account_id: "default".into() };
     let label = st.views.get(&key).map(|v| v.label.clone()).unwrap_or_else(|| provider.into());
     let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
-        key,
+        key: key.clone(),
         label,
         plan: None,
         profiles: BTreeSet::new(),
@@ -572,6 +618,7 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
         v.source = source.into();
         v.adapter = true;
     }
+    note_alert_input(&mut st, &key, rate, source, now);
 }
 
 /// agy 관측 경로(agy-rpc)의 고장 코드를 antigravity 계정 행에 싣는다(`None` = 지움).
@@ -849,20 +896,21 @@ pub fn predict_exhaust(series: &[(f64, f64)], now: f64, resets_at: Option<f64>) 
     }
 }
 
-/// alerts용 스냅샷: (라벨, 창, pct) — 관측된 계정만.
+/// alerts용 스냅샷: (라벨, 창, pct) — 경보 입력([`AccountsState::alert_inputs`])이 있는 계정만.
+/// 창 밖(표시용) 값은 경보 근거가 아니다 — 같은 UID 의 아무 프로세스나 보낼 수 있다(위조 한계). 그래서 경보는
+/// 같은 계정의 **창 밖이 아닌 관측 중 가장 최근 값**으로 판정한다 — 창 밖 값이 더 최신이어도 그 값이 남는다
+/// (표시 숫자와 다를 수 있다). 창 밖 값만 있는 계정은 경보 입력이 없다.
 pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
     let st = daemon.accounts.lock().unwrap();
     let mut out = Vec::new();
-    for v in st.views.values() {
-        if v.updated_at == 0.0 {
+    for (key, (t, rate)) in &st.alert_inputs {
+        if *t == 0.0 {
             continue;
         }
-        // 창 밖(표시용) 값은 경보 근거가 아니다 — 같은 UID 의 아무 프로세스나 보낼 수 있다(위조 한계).
-        // 같은 계정이라도 좌석 보고가 최신이면 그 값으로 평가된다.
-        if v.source == OUTSIDE_SOURCE {
-            continue;
-        }
-        for w in &v.rate {
+        let Some(v) = st.views.get(key) else {
+            continue; // 뷰 없는 경보 입력은 만들어지지 않는다(note 가 뷰를 먼저 만든다) — 방어
+        };
+        for w in rate {
             out.push((v.label.clone(), w.label.clone(), w.used_pct));
         }
     }
@@ -1368,5 +1416,112 @@ mod tests {
         note_rate(&d, "gemini", "", &[rw("5h", 2.0, None)], AGY_STATUSLINE_SOURCE, now + 1.0);
         assert!(agy_statusline_authoritative(&d), "상태줄 값이 들어왔는데 수집기가 물러서지 않는다");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────── fix-values-1 SP-1·F1 — 경보 입력은 표시 승자와 따로 둔다(수정 전 적색) ─────────
+    // 종전: 창 밖 값의 경보 제외가 계정 뷰의 **최신 출처**에 걸려 있었고 note_rate 는 뷰를 통째로 최신 보고로 덮었다.
+    // 그래서 창 밖 보고 한 건이 그 계정을 경보 입력에서 통째로 뺐고(억제), 좌석 보고가 다시 최신이 되면
+    // check_alerts 가 지워진 키를 새 경보로 곧바로 다시 냈다(30분 리마인드 우회). 픽스처는 전부 합성값이다.
+
+    /// 합성 프로필 하나(신원 + 실재 transcript)를 만들고 그 세션 경로를 돌려준다.
+    fn outside_profile(home: &Path, dir: &str, uuid: &str, email: &str) -> String {
+        write(
+            &home.join(format!("{dir}/.claude.json")),
+            &format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{email}"}}}}"#),
+        );
+        write(&home.join(format!("{dir}/projects/-w/s.jsonl")), "{}\n");
+        home.join(format!("{dir}/projects/-w/s.jsonl")).to_string_lossy().into_owned()
+    }
+
+    /// 버스에 실린 계정 경보 중 이 키의 건수.
+    fn account_alerts(d: &Arc<Daemon>, seq0: u64, key: &str) -> usize {
+        d.bus
+            .replay_after(seq0)
+            .iter()
+            .filter(|e| e["name"] == "alert.account_rate" && e["payload"]["key"] == key)
+            .count()
+    }
+
+    /// ① 좌석 97% 뒤에 창 밖 5% 가 와도 경보 입력에는 좌석 97% 가 남는다(표시는 창 밖 5% — 최신 승자 그대로).
+    #[test]
+    fn alert_input_keeps_the_seat_value_when_an_outside_report_is_newer() {
+        let dir = tmp("daemon-alert-keep");
+        let home = tmp("home-alert-keep");
+        let sess = outside_profile(&home, ".claude-3", "u-keep", "keep@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let t0 = crate::state::now_epoch();
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 97.0, None)], "statusline", t0));
+        assert_eq!(report_outside_at(&d, Some(&home), &sess, &[rw("5h", 5.0, None)], t0 + 1.0), Ok(OutsideOutcome::Accepted));
+        let row = claude_rows(&d).into_iter().find(|r| r["account_id"] == "u-keep").unwrap();
+        assert_eq!((row["source"].clone(), row["rate"][0]["used_pct"].clone()), (json!(OUTSIDE_SOURCE), json!(5.0)), "표시는 최신 승자");
+        assert_eq!(
+            alert_rates(&d),
+            vec![("keep@example.test".to_string(), "5h".to_string(), 97.0)],
+            "창 밖 보고 한 건이 좌석이 본 97% 를 경보 입력에서 지웠다"
+        );
+        // 좌석이 새 값을 보내면 경보 입력도 그 값으로 바뀐다(좌석 관측끼리는 최신 승자)
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 40.0, None)], "statusline", t0 + 2.0));
+        assert_eq!(alert_rates(&d), vec![("keep@example.test".to_string(), "5h".to_string(), 40.0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ② 좌석 → 창 밖 → 좌석 을 check_alerts 표본(30초) 사이에 번갈아 넣어도 REMIND 안에서 재발화하지 않는다.
+    /// REMIND 가 지나면 한 번 더 낸다(리마인드 자체는 살아 있다 — 음성 대조).
+    #[test]
+    fn alternating_seat_and_outside_reports_do_not_refire_within_remind() {
+        let dir = tmp("daemon-alert-alt");
+        let home = tmp("home-alert-alt");
+        let sess = outside_profile(&home, ".claude-3", "u-alt", "alt@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: HashMap<String, f64> = HashMap::new();
+        let key = "account_rate:alt@example.test:5h";
+        let seq0 = d.bus.latest_seq();
+        let t0 = crate::state::now_epoch();
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 97.0, None)], "statusline", t0));
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+        assert_eq!(account_alerts(&d, seq0, key), 1, "좌석 97% 가 경보를 내지 않았다");
+        for i in 0..4 {
+            let base = t0 + 60.0 * f64::from(i) + 10.0;
+            let r = report_outside_at(&d, Some(&home), &sess, &[rw("5h", 5.0 + f64::from(i), None)], base);
+            assert_eq!(r, Ok(OutsideOutcome::Accepted));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, base + 20.0); // 창 밖이 최신인 표본
+            assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 97.0, None)], "statusline", base + 30.0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, base + 50.0); // 좌석이 최신인 표본
+        }
+        assert_eq!(account_alerts(&d, seq0, key), 1, "REMIND 안에서 같은 키가 다시 발화했다(깜빡임)");
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0 + crate::governance::ALERT_REMIND_SECS);
+        assert_eq!(account_alerts(&d, seq0, key), 2, "REMIND 뒤 리마인드가 사라졌다");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ③ 표본마다 창 밖 보고가 최신이어도(좌석 직후 창 밖) 좌석이 본 97% 는 계정 경보를 낸다 — 억제 방향 음성 대조.
+    /// 창 밖 값만 있는 계정은 여전히 경보 입력이 아니다(표시용 불변).
+    #[test]
+    fn outside_latest_at_every_tick_does_not_hide_the_seat_alert() {
+        let dir = tmp("daemon-alert-supp");
+        let home = tmp("home-alert-supp");
+        let sess = outside_profile(&home, ".claude-3", "u-sup", "sup@example.test");
+        let only_out = outside_profile(&home, ".claude-4", "u-oo", "oo@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: HashMap<String, f64> = HashMap::new();
+        let seq0 = d.bus.latest_seq();
+        let t0 = crate::state::now_epoch();
+        for i in 0..4 {
+            let base = t0 + 30.0 * f64::from(i);
+            assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 97.0, None)], "statusline", base));
+            let r = report_outside_at(&d, Some(&home), &sess, &[rw("5h", 97.0 + f64::from(i) * 0.1, None)], base + 1.0);
+            assert_eq!(r, Ok(OutsideOutcome::Accepted));
+            let r = report_outside_at(&d, Some(&home), &only_out, &[rw("5h", 99.0 - f64::from(i), None)], base + 1.0);
+            assert_eq!(r, Ok(OutsideOutcome::Accepted));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, base + 2.0);
+        }
+        assert_eq!(account_alerts(&d, seq0, "account_rate:sup@example.test:5h"), 1, "좌석 97% 계정 경보가 억제됐다");
+        assert_eq!(account_alerts(&d, seq0, "account_rate:oo@example.test:5h"), 0, "창 밖 값만으로 경보가 났다");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

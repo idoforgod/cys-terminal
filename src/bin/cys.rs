@@ -17002,6 +17002,14 @@ fn is_agy_statusline(v: &Value) -> bool {
 /// reset_time(RFC3339), reset_in_seconds}`. `gemini-` 버킷만(3p 제외) · `-5h`→5h · `-weekly`→7d(claude/codex 배지와
 /// 라벨 통일) · 모르는 창은 버린다 · remaining_fraction 이 없으면 **결측**(0 으로 지어내지 않는다) · 같은 창으로
 /// 모이는 버킷이 여럿이면 더 많이 쓴 쪽(묶인 한도).
+///
+/// ★필드 의미(fix-values-1 F2 · agy 1.2.9 바이너리의 Go 타입 정보로 확인 — 실행·통신 없이 읽음):
+///   · 상태줄 버킷 `types.StatusLineQuotaBucket` 의 `RemainingFraction` 은 `*float32` 다. omitempty 는 **nil 만** 생략하므로
+///     소진 버킷(남은 비율 0)은 `"remaining_fraction":0` 으로 온다 → 여기서 100% 가 된다. 원천 proto(`QuotaSummaryBucket`)
+///     에서도 분수·양은 `oneof remaining` 이라 0 이 실린다. 즉 분수가 **없는** 버킷은 '소진'이 아니라 양 기반이거나
+///     정보가 없는 버킷이다 — 그래서 결측으로 둔다.
+///   · 같은 구조체의 `Disabled bool`(`"disabled":true`)은 agy 자신이 진행 막대 없이 'Disabled' 로만 그리는 버킷이다 —
+///     사용량이 아니므로 분수가 실려 와도 버린다(버리면 결측 · 지어낸 100% 로 경보가 나는 쪽을 막는다).
 fn agy_quota_windows(v: &Value, now: f64) -> Vec<(&'static str, f64, Option<f64>)> {
     let mut out: Vec<(&'static str, f64, Option<f64>)> = Vec::new();
     let Some(q) = v.get("quota").and_then(|x| x.as_object()) else {
@@ -17018,6 +17026,9 @@ fn agy_quota_windows(v: &Value, now: f64) -> Vec<(&'static str, f64, Option<f64>
         } else {
             continue;
         };
+        if b.get("disabled").and_then(|x| x.as_bool()) == Some(true) {
+            continue; // 사용 안 함 버킷 — 사용량이 아니다(위 ★)
+        }
         let Some(frac) = b.get("remaining_fraction").and_then(|x| x.as_f64()).filter(|f| f.is_finite()) else {
             continue;
         };
@@ -26536,6 +26547,46 @@ mod tests {
         assert_eq!(line, "cys · 5h 12% · 7d 25%");
         assert!(!line.contains("someone"));
         assert_eq!(agy_statusline_human_line(&json!({"quota": {}})), "cys");
+    }
+
+    /// fix-values-1 F2: 소진 = `"remaining_fraction":0` → **100%** 로 보인다(0 은 결측이 아니다). agy 1.2.9 바이너리의
+    /// 타입 정보로 확인한 상태줄 버킷(`types.StatusLineQuotaBucket`)의 `RemainingFraction` 은 `*float32` 다 — omitempty 는
+    /// nil 만 생략하므로 소진 버킷은 필드를 가진 채 0 으로 온다. 분수가 없는 버킷(양 기반·정보 없음)은 결측으로 두고
+    /// 100% 로 지어내지 않는다. `disabled:true` 버킷은 agy 자신도 진행 막대 없이 'Disabled' 로만 그리는 상태라
+    /// 사용량으로 치지 않는다(분수가 실려 와도).
+    #[test]
+    fn agy_statusline_exhausted_is_100_and_disabled_buckets_are_not_usage() {
+        let now = 2_000_000_000.0;
+        let exhausted = json!({"product": "antigravity", "quota": {
+            "gemini-5h": {"remaining_fraction": 0, "reset_in_seconds": 1200},
+            "gemini-weekly": {"remaining_fraction": 0.4, "reset_in_seconds": 300000}}});
+        assert_eq!(
+            agy_statusline_to_report_params(&exhausted, now)["rate"],
+            json!([{"label": "5h", "used_pct": 100.0, "resets_at": now + 1200.0},
+                   {"label": "7d", "used_pct": 60.0, "resets_at": now + 300000.0}]),
+            "소진 창이 빠졌다"
+        );
+        assert_eq!(agy_statusline_human_line(&exhausted), "cys · 5h 100% · 7d 60%");
+        // 분수 생략 모양(리뷰 V2b) → 그 창은 결측(지어내지 않는다) · 나머지 창은 그대로
+        let omitted = json!({"quota": {"gemini-5h": {"reset_in_seconds": 1200},
+            "gemini-weekly": {"remaining_fraction": 0.4}}});
+        assert_eq!(agy_statusline_to_report_params(&omitted, now)["rate"], json!([{"label": "7d", "used_pct": 60.0}]));
+        // disabled 버킷은 분수가 있어도 사용량이 아니다 · disabled:false 는 평소대로
+        let disabled = json!({"quota": {
+            "gemini-5h": {"remaining_fraction": 0, "reset_in_seconds": 1200, "disabled": true},
+            "gemini-weekly": {"remaining_fraction": 0.4, "disabled": false}}});
+        assert_eq!(
+            agy_statusline_to_report_params(&disabled, now)["rate"],
+            json!([{"label": "7d", "used_pct": 60.0}]),
+            "사용 안 함(disabled) 버킷이 100% 사용으로 읽혔다"
+        );
+        assert_eq!(agy_statusline_human_line(&disabled), "cys · 7d 60%");
+        let all_disabled = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.1, "disabled": true}}});
+        assert_eq!(agy_statusline_to_report_params(&all_disabled, now)["rate"], json!([]));
+        // 결측형 음성 대조: disabled 가 bool 이 아니면(null·문자열) 판정 근거가 아니다 — 평소대로 읽는다
+        let odd = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.5, "disabled": null},
+            "gemini-weekly": {"remaining_fraction": 0.5, "disabled": "true"}}});
+        assert_eq!(agy_statusline_to_report_params(&odd, now)["rate"].as_array().unwrap().len(), 2);
     }
 
     /// RC4-b: 창 밖 보고 파라미터는 `{session_file, rate}` **둘뿐** — rate 가 비었거나 transcript 가 없거나 너무 길면
