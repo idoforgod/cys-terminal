@@ -518,7 +518,7 @@ def suite_race():
     fresh()
     delivery([boot(time.time())])
     tt.open_ask(PROPOSAL, feed_items=FEED1)
-    outs = race("issue", 6, {"TT_PROMPT": "그래 만들어", "TT_HOOK_NAME": "hook-input-%d.json"})
+    outs = race("issue", 6, {"TT_PROMPT": "그래 만들어", "TT_HOOK_NAME": "hook-input-" + SURFACE + "-%d.json"})
     toks = [o for o in outs if o.get("token")]
     check("K", "K2 동시 issue 6 중 토큰 1(질문 1회 소비 · 원장 token_issued 1줄)",
           len(toks) == 1 and len(events("token_issued")) == 1,
@@ -792,10 +792,11 @@ def suite_failclosed():
     r = tt.issue_from_hook_file(hook_file(raw="{깨진 json"), now=NOW, feed_items=FEED1)
     r2 = tt.issue_from_hook_file(hook_file(payload={"hook_event_name": "Stop", "session_id": "s",
                                                     "prompt": "그래 만들어"}), now=NOW, feed_items=FEED1)
-    check("C", "C10 훅 페이로드 판독 불가·다른 사건 → 거부",
-          r.get("code") == "hook_payload_invalid" and r2.get("code") == "hook_payload_invalid"
-          and not events("token_issued"),
-          "%s/%s" % (r.get("code"), r2.get("code")))
+    aud = [a.get("code") for a in events("issue_refused")]
+    check("C", "C10 훅 페이로드 판독 불가·다른 사건 → 거부(출력 not_hook_caller 한 모양 · 원장엔 hook_payload_invalid)",
+          r.get("code") == "not_hook_caller" and r2.get("code") == "not_hook_caller"
+          and aud.count("hook_payload_invalid") == 2 and not events("token_issued"),
+          "%s/%s 감사=%s" % (r.get("code"), r2.get("code"), aud))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1019,8 +1020,9 @@ def suite_cli():
         mode = os.stat(tt.ledger_path()).st_mode & 0o777
         check("Y", "Y13 원장 권한 0600(토큰 보관)", mode == 0o600, oct(mode))
     rc, j, _o, _e = cli(["issue", "--payload-file", hook_file(raw="이건 json 아님")])
-    check("Y", "Y14 훅 JSON 판독 불가 → exit 1(hook_payload_invalid)",
-          rc == 1 and (j or {}).get("code") == "hook_payload_invalid", "rc=%s %s" % (rc, j))
+    check("Y", "Y14 훅 JSON 판독 불가 → exit 1(not_hook_caller 한 모양 · 구체 사유는 원장 감사 줄)",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller"
+          and (events("issue_refused") or [{}])[-1].get("code") == "hook_payload_invalid", "rc=%s %s" % (rc, j))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1037,11 +1039,12 @@ HOOK_PAYLOAD = {"session_id": "sess-h", "transcript_path": "/tmp/t.jsonl", "cwd"
 
 
 def hook_file(prompt=None, payload=None, raw=None, age=0.0, where=None, name=None):
-    """런처(role-bootstrap.sh ⑤)가 쓰는 것과 같은 자리·이름의 훅 입력 파일."""
+    """런처(role-bootstrap.sh ⑤)가 쓰는 것과 같은 자리·이름의 훅 입력 파일 — 이름에 부르는 좌석(env)을 싣는다
+    (`hook-input-<좌석>-<pid>.json` · 리뷰 RR1-SEC-B 좌석 결박)."""
     d = where or os.environ["CYS_STATE_DIR"]
     os.makedirs(d, exist_ok=True)
     _n[0] += 1
-    p = os.path.join(d, name or "hook-input-%d.json" % (50000 + _n[0]))
+    p = os.path.join(d, name or "hook-input-%s-%d.json" % (os.environ.get("CYS_SURFACE_ID", SURFACE), 50000 + _n[0]))
     if raw is None:
         body = dict(HOOK_PAYLOAD if payload is None else payload)
         if prompt is not None:
@@ -1090,8 +1093,9 @@ def suite_hook_only():
     # H3 제자리·제 이름이라도 UserPromptSubmit 형식이 아니면(리뷰어 페이로드 {"prompt":…} 그대로)
     real_ask()
     rc, j, o, _e = cli(["issue", "--payload-file", hook_file(payload={"prompt": "그래 만들어"})])
-    check("H", "H3 hook_event_name·session_id 없는 페이로드 → 거부(hook_payload_invalid) · 토큰 0",
-          rc == 1 and (j or {}).get("code") == "hook_payload_invalid" and still_open(),
+    check("H", "H3 hook_event_name·session_id 없는 페이로드 → 거부(not_hook_caller · 원장엔 hook_payload_invalid) · 토큰 0",
+          rc == 1 and (j or {}).get("code") == "not_hook_caller"
+          and (events("issue_refused") or [{}])[-1].get("code") == "hook_payload_invalid" and still_open(),
           "rc=%s %s" % (rc, o[:160]))
     # H4 정상 — 런처가 방금 쓴 파일 → 발급 · 발급 레코드에 목격 증거
     real_ask()
@@ -1116,7 +1120,7 @@ def suite_hook_only():
     if os.name == "posix":
         real_ask()
         target = hook_file(where=os.path.join(TMP, "elsewhere2"))
-        link = os.path.join(os.environ["CYS_STATE_DIR"], "hook-input-777.json")
+        link = os.path.join(os.environ["CYS_STATE_DIR"], "hook-input-%s-777.json" % SURFACE)
         os.symlink(target, link)
         rc, j, o, _e = cli(["issue", "--payload-file", link])
         check("H", "H7 상태 폴더 안의 심볼릭 링크 → not_hook_caller",
@@ -1169,6 +1173,69 @@ def suite_hook_only():
           and not events("consumed"), "%s/%s" % (v.get("code"), c.get("code")))
     check("H", "H10 not_hook_caller 는 거부 코드 목록·오너 문구에 있다",
           "not_hook_caller" in tt.REFUSAL_CODES and bool(tt.owner_message("not_hook_caller")))
+    # ── H11~H13(리뷰 RR1-SEC-B) 거부 출력이 우회 길을 가르쳤다 ──
+    #   종전 공식 CLI 는 거부마다 **다음 미충족 조건**을 말했다(경로 없음 → 이름 형식 hook-input-<N>.json → 상태 폴더
+    #   절대경로 → hook_event_name → session_id). 오류만 보고 고쳐 재시도하는 에이전트가 6번째 호출에 오너 키입력 0 으로
+    #   token_issued 에 닿았다(설계 §12-1 이 범위에 넣은 '에이전트의 실수·오해'). 형식 결함 거부 2단계는 감사 줄도 없었다.
+    #   이제: 훅 밖 거부는 **한 모양**(코드·문구·detail·exit 동일 · 조건을 말하지 않는다) · 구체 사유는 원장 감사 줄에만.
+    real_ask()
+    sd = os.environ["CYS_STATE_DIR"]
+    ladder = [
+        ("stdin(경로 없음)", ["issue"], json.dumps({"prompt": "그래 만들어"}, ensure_ascii=False)),
+        ("임의 이름", ["issue", "--payload-file", hook_file(where=os.path.join(TMP, "ladder-x"), name="x.json")], None),
+        ("상태 폴더 밖", ["issue", "--payload-file", hook_file(where=os.path.join(TMP, "ladder-o"))], None),
+        ("hook_event_name 없음", ["issue", "--payload-file", hook_file(payload={"prompt": "그래 만들어"})], None),
+        ("session_id 없음", ["issue", "--payload-file",
+                            hook_file(payload={"prompt": "그래 만들어", "hook_event_name": "UserPromptSubmit"})], None),
+        ("JSON 아님", ["issue", "--payload-file", hook_file(raw="이건 json 아님")], None),
+        ("묵은 입력(600초)", ["issue", "--payload-file", hook_file(age=600)], None),
+        ("질문보다 앞(30초)", ["issue", "--payload-file", hook_file(age=30)], None),
+        ("다른 좌석 이름", ["issue", "--payload-file", hook_file(name="hook-input-%s-%d.json" % (OTHER_SURFACE, 4242))],
+         None),
+    ]
+    shapes, leaks, rows = set(), [], []
+    forbidden = ("hook-input", "hook_event_name", "session_id", "UserPromptSubmit", sd, TMP)
+    for label, args, stdin in ladder:
+        rc, j, o, _e = cli(args, stdin=stdin)
+        j = j or {}
+        shapes.add((rc, j.get("code"), j.get("detail"), j.get("message"), bool(j.get("token"))))
+        rows.append("%s:%s/%s" % (label, rc, j.get("code")))
+        blob = (j.get("detail") or "") + " " + (j.get("message") or "")
+        leaks += ["%s→%r" % (label, f) for f in forbidden if f and f in blob]
+    rc_h, _j, help_out, _e = cli(["issue", "--help"])
+    leaks += ["issue --help→%r" % f for f in ("hook-input", "<상태>") if f in help_out]
+    one = next(iter(shapes)) if len(shapes) == 1 else None
+    check("H", "H11 훅 밖 거부 사다리 9단 → 한 모양(exit 1 · not_hook_caller · 같은 detail·문구 · 토큰 0) · "
+               "조건 열거 0(hook-input·상태 폴더·hook_event_name·session_id 미노출) · 질문 유지",
+          one is not None and one[0] == 1 and one[1] == "not_hook_caller" and not one[4] and not leaks
+          and still_open(),
+          "모양 %d개 %s · 누설 %s" % (len(shapes), rows, leaks[:4]))
+    # H12 형식 결함 거부도 감사 1줄(구체 사유는 원장에만) — 종전: hook_payload_invalid 2단계는 흔적 0
+    real_ask()
+    audit_rows = []
+    for payload, raw in (({"prompt": "그래 만들어"}, None),
+                         ({"prompt": "그래 만들어", "hook_event_name": "UserPromptSubmit"}, None),
+                         (None, "이건 json 아님")):
+        n0 = len(events("issue_refused"))
+        cli(["issue", "--payload-file", hook_file(payload=payload, raw=raw)])
+        new = events("issue_refused")[n0:]
+        audit_rows.append((len(new), (new[0].get("code"), new[0].get("detail", "")[:40]) if new else None))
+    check("H", "H12 형식 결함(hook_event_name 없음·session_id 없음·JSON 아님) 거부마다 감사 1줄 · 원장엔 구체 사유 "
+               "(code=hook_payload_invalid) · 질문 유지",
+          all(n == 1 and a and a[0] == "hook_payload_invalid" and a[1] for n, a in audit_rows) and still_open(),
+          repr(audit_rows))
+    # H13 좌석 결박 — 런처는 입력 파일 이름에 좌석을 싣고(hook-input-<좌석>-<pid>.json), 발급기는 이름의 좌석 = 부르는
+    #   좌석(env)을 요구한다. 종전: 다른 좌석에서 오너가 60초 안에 친 진짜 '응' 입력 파일을 master 가 자기 질문에 재생할 수 있었다.
+    real_ask()
+    other = cli(["issue", "--payload-file", hook_file(name="hook-input-%s-%d.json" % (OTHER_SURFACE, 777))])
+    unbound = cli(["issue", "--payload-file", hook_file(name="hook-input-%d.json" % 778)])
+    still = still_open()
+    own = cli(["issue", "--payload-file", hook_file(name="hook-input-%s-%d.json" % (SURFACE, 779))])
+    check("H", "H13 다른 좌석 이름·좌석 없는 옛 이름의 훅 입력 → not_hook_caller · 질문 유지 · 제 좌석 이름은 발급",
+          (other[1] or {}).get("code") == "not_hook_caller" and (unbound[1] or {}).get("code") == "not_hook_caller"
+          and still and own[0] == 0 and bool((own[1] or {}).get("token")),
+          "다른 좌석=%s 옛 이름=%s 유지=%s 제 좌석=%s" % ((other[1] or {}).get("code"), (unbound[1] or {}).get("code"),
+                                                   still, (own[1] or {}).get("code")))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1275,6 +1342,11 @@ def suite_directive():
           and "편성이 ①에서 이미" in blk)
     check("D", "D6 발급자 보장을 과대 주장하지 않는다('네가 만들 수 없다' 금지 · 고의 위조 한계 명시)",
           "네가 만들 수 없" not in text and "고의 위조까지 막지는 못한다" in text)
+    check("D", "D7(RR1-SEC-B) '직접 호출은 출처 확인으로 거부·기록된다'는 단정 금지 — 형식대로 흉내 낸 입력은 통과하고 "
+               "via=hook 으로 남는다고 적는다 · not_hook_caller 재시도 금지 · 출력 안 하는 hook_payload_invalid 는 표에서 뺀다",
+          "출처 확인으로 거부·기록된다" not in text and "형식을 충실히 흉내 낸 입력 파일은 통과" in text
+          and "via=hook" in text and "`not_hook_caller` 거부를 보고 입력을 고쳐 다시 부르는 것" in text
+          and "`hook_payload_invalid`" not in text and "hook_payload_invalid" in tt.AUDIT_ONLY_CODES)
 
 
 def main():

@@ -77,7 +77,7 @@ ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비�
 ## CLI (stdout = JSON 1줄 · 단 issue 의 exit 3 은 무출력)
   ask     --proposal <tp-id>                       # master · 좌석은 env(CYS_SURFACE_ID) — 인자로 바꿀 수 없다
   issue   --payload-file F                          # ★UserPromptSubmit 훅 전용 — F = 런처가 **방금** 쓴
-                                                    #   <상태>/hook-input-<N>.json(출처 확인 · stdin 경로 없음)
+                                                    #   <상태>/hook-input-<좌석>-<pid>.json(출처·좌석 확인 · stdin 경로 없음)
   verify  --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
   consume --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
   settle  --token T --proposal P --surface S --outcome created|failed [--dept NAME] [--code N]
@@ -93,13 +93,16 @@ ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비�
 닫는 것은 **평시 정상 동작 경로**다 — 에이전트의 실수·오해, 기계 push 오인, 재사용·재생·모호성·오탐.
 발급자 = 훅(리뷰 SEC-1·M2·SEC-2 · 0.14.42 수정 라운드 1 · RR1-SEC-A 라운드 2): **공개 발급 입구는
 `issue_from_hook_file` 하나**(공식 CLI `issue --payload-file` 이 이것을 부른다)이고, 목격 증거는 그 안에서 상태 폴더의
-실제 훅 입력 파일로만 만든다 — 런처가 방금 쓴 `hook-input-<N>.json`(정규 파일·내 소유·실시계 60초 안·질문보다 뒤) +
+실제 훅 입력 파일로만 만든다 — 런처가 방금 쓴 `hook-input-<좌석>-<pid>.json`(이름의 좌석 = 부르는 좌석·정규 파일·내 소유·실시계 60초 안·질문보다 뒤) +
 UserPromptSubmit 형식. 공개 모듈 API `issue()`·`issue_from_payload()` 는 호출자가 내민 증거 dict(meta·witness)를
 **읽지 않고** 판정 없이 거부한다(not_hook_caller · 질문 무소비 · 감사 1줄 — 종전엔 dict 모양만 봐서 파일·훅·오너
-키입력 없이 via=hook 토큰이 나왔다). 발급 레코드의 목격 증거(via=hook·hook_session)가 없으면 검증·소비가 인가하지
-않는다. **남는 우회는 고의 위조뿐이다** — 비공개 함수(`_issue_witnessed` 등)를 직접 부르는 것, 같은 UID 로 훅 입력
+키입력 없이 via=hook 토큰이 나왔다). 훅 밖 거부는 출처·좌석·형식·재생 어느 조건이든 **한 모양**(not_hook_caller ·
+같은 detail — RR1-SEC-B: 조건을 하나씩 말하면 오류를 보고 고쳐 재시도하는 루프가 토큰에 닿는다)이고 구체 사유는 원장
+감사 줄(issue_refused · code=not_hook_caller|hook_payload_invalid)에만 남는다. 발급 레코드의 목격 증거(via=hook·
+hook_session)가 없으면 검증·소비가 인가하지 않는다. **남는 우회는 고의 위조뿐이다** — 비공개 함수(`_issue_witnessed` 등)를 직접 부르는 것, 같은 UID 로 훅 입력
 파일을 형식대로 흉내 내 쓰는 것, 원장·배달 원장·feed 를 직접 쓰는 것(§12-1 경계). 발급자는 훅뿐이라는 것은 규약 R4 와
-형식 가드이고, 원장은 위조의 **감사 흔적**이다(사전 차단이 아니다 — 흉내 낸 입력으로 난 발급도 via=hook 으로 남는다).
+형식 가드이고, 원장은 실패한 시도의 **감사 흔적**이다(사전 차단도 위조 판별도 아니다 — 흉내 낸 입력으로 난 발급은
+진짜 훅 발급과 같은 via=hook 으로 남는다).
 데몬이 발급을 목격·인증하는 근본 통제는 제품 재설계 과제다(오너 결정 대기).
 """
 import argparse
@@ -170,6 +173,14 @@ _MSG_REUSED = "이 승인은 이미 한 번 쓰였습니다 — 다시 만들려
 #   [만들지 않기]가 먼저다).
 _MSG_SEAT_MOVED = ("제안을 올린 자리가 바뀌어 이 자리에서는 대화로 승인받을 수 없습니다 — 화면 카드에서 "
                    "[확인 창 열기] → [만들기]로 만들거나, [만들지 않기] 뒤 다시 부탁해 주세요.")
+# ★(리뷰 RR1-SEC-B) 훅 밖 발급 시도의 **단일** 거부 detail — 어느 조건에서 막혔는지 말하지 않는다. 종전엔 거부마다
+#   다음 미충족 조건(경로·이름 형식·상태 폴더 절대경로·hook_event_name·session_id)을 말해, 오류만 보고 고쳐 재시도하는
+#   에이전트가 6번째 호출에 오너 키입력 0 으로 토큰에 닿았다. 구체 사유는 원장 감사 줄(issue_refused)에만 남는다.
+#   출처 확인·형식 판독·'질문보다 앞' 재생 거부가 모두 이 한 모양(not_hook_caller · 같은 문구)으로 나간다.
+#   정상 훅 경로에서 이 거부가 나도(시계 어긋남 등) 다음 한 걸음은 같다 — 오너가 한 번 더 치면 그 프롬프트의 훅이 판정한다.
+_HOOK_ONLY_DETAIL = ("훅 입력으로 확인되지 않아 판정하지 않았다(발급 0 · 질문은 열린 채) — 이 명령은 훅 전용이다. "
+                     "직접 호출·손으로 만든 입력은 규약 위반이며 원장에 기록된다. 재시도하지 말고 오너에게 승인을 "
+                     "한 번 더 직접 쳐 달라고 하라.")
 
 OWNER_MESSAGES = {
     # ── §10 표 원문(글자 그대로) ──
@@ -204,7 +215,6 @@ OWNER_MESSAGES = {
     "proposal_publisher_unknown": _MSG_SAFE_STOP,
     "proposal_body_invalid": _MSG_SAFE_STOP,
     "feed_unreadable": _MSG_SAFE_STOP,
-    "hook_payload_invalid": _MSG_SAFE_STOP,
     "ledger_corrupt": _MSG_SAFE_STOP,
     "lock_unavailable": _MSG_SAFE_STOP,
     "internal_error": _MSG_SAFE_STOP,
@@ -247,12 +257,15 @@ REFUSAL_CODES = (
     "ask_not_open", "ask_expired", "utterance_ambiguous", "utterance_rejected", "machine_origin",
     "ledger_absent", "ledger_unreadable", "no_pending", "multiple_pending", "proposal_not_pending",
     "body_changed", "surface_unknown", "surface_not_publisher", "proposal_publisher_unknown",
-    "proposal_body_invalid", "feed_unreadable", "hook_payload_invalid", "not_hook_caller",
+    "proposal_body_invalid", "feed_unreadable", "not_hook_caller",
     "token_missing", "token_unknown", "token_consumed", "token_expired", "token_proposal_mismatch",
     "token_surface_mismatch", "token_body_mismatch", "grant_not_armed", "grant_revoked",
     "grant_expired", "not_consumed", "already_settled",
     "bad_args", "ledger_corrupt", "lock_unavailable", "internal_error",
 )
+# 원장 감사 줄(issue_refused)의 code 로만 쓰는 사유 — 출력은 언제나 not_hook_caller 한 모양이다(리뷰 RR1-SEC-B:
+#   출력 코드가 갈리면 '출처 확인은 통과했고 이제 형식' 이라는 단계 신호가 된다).
+AUDIT_ONLY_CODES = ("hook_payload_invalid",)
 # 다른 부품(P5·P7)이 오너에게 보일 §10 행 — 문구 단일 출처라 여기 둔다(이 모듈은 돌려주지 않는다).
 EXTERNAL_CODES = ("boot_ticket_failed", "formation_partial", "create_failed", "approval_not_received")
 _INTERNAL_CODES = frozenset(["ledger_corrupt", "lock_unavailable", "internal_error"])
@@ -888,7 +901,8 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
     psha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     base = {"ask_id": aid, "proposal_id": pid, "surface": surf}
 
-    def refuse(code, detail, close_why=None, n=2):
+    def refuse(code, detail, close_why=None, n=2, shown=None):
+        """shown = 호출자에게 보일 detail(없으면 detail) — 감사 줄에는 언제나 구체 사유(detail)를 남긴다."""
         recs = []
         if close_why:
             recs.append({"v": SCHEMA_VERSION, "kind": KIND_ASK, "event": "ask_closed", "ask_id": aid,
@@ -897,7 +911,7 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
                      "detail": (detail or "")[:300], "at": now, "ask_id": aid, "proposal_id": pid,
                      "surface": surf, "prompt_sha256": psha, "prompt_chars": len(prompt),
                      "ask_closed": bool(close_why)})
-        return _result(False, code, detail, n=n, ask_closed=bool(close_why), **base), recs
+        return _result(False, code, shown or detail, n=n, ask_closed=bool(close_why), **base), recs
 
     if now > float(a["expires_at"]):
         # ★만료와 미개설을 구분한다(§10 끝 구현 주의) — 만료 고지는 1회, 질문은 여기서 닫힌다.
@@ -911,7 +925,7 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
     typed_at = now - float(age) if _is_num(age) else None
     if typed_at is None or typed_at < float(a["opened_at"]) - HOOK_INPUT_SKEW_S:
         return refuse("not_hook_caller", "훅 입력이 질문보다 먼저 쓰였다(입력 %s · 질문 %.0f) — 질문 전 발화의 재생"
-                      % (typed_at, float(a["opened_at"])))
+                      % (typed_at, float(a["opened_at"])), shown=_HOOK_ONLY_DETAIL)
     m = _mission()
     deliv, lstatus, ldetail = m.read_delivery(now=now)
     if lstatus != m.LEDGER_OK:
@@ -1057,9 +1071,11 @@ def _issue_impl(prompt, surface, now, feed_items, meta):
 def _hook_witness(path, t_real=None):
     """(목격 증거|None, 사유) — `--payload-file` 이 **이 레인의 UserPromptSubmit 런처가 방금 쓴 입력**인가.
 
-    런처(role-bootstrap.sh ⑤)는 훅 입력을 `<상태 폴더>/hook-input-<pid>.json` 에 받아 이 파일 경로를 넘긴다.
-    확인: 이름 형식 · 상태 폴더(javis_bootstrap.state_dir) 직속 · 심볼릭 링크 아님 · 정규 파일 · 내 소유(posix) ·
-    크기 상한 · 나이 ≤ HOOK_INPUT_MAX_AGE_S(재생 차단). 나이는 **실시계**(파일 mtime 과 같은 시계)로 잰다 —
+    런처(role-bootstrap.sh ⑤)는 훅 입력을 `<상태 폴더>/hook-input-<좌석>-<pid>.json` 에 받아 이 파일 경로를 넘긴다.
+    확인: 이름 형식 · **이름의 좌석 = 부르는 좌석(env)**(리뷰 RR1-SEC-B 좌석 결박 — 종전엔 다른 좌석에서 오너가 60초 안에
+    친 진짜 '응' 입력을 이 좌석의 질문에 재생할 수 있었다: 런처는 레인마다 최근 20개를 남긴다) · 상태 폴더
+    (javis_bootstrap.state_dir) 직속 · 심볼릭 링크 아님 · 정규 파일 · 내 소유(posix) · 크기 상한 ·
+    나이 ≤ HOOK_INPUT_MAX_AGE_S(재생 차단). 나이는 **실시계**(파일 mtime 과 같은 시계)로 잰다 —
     모듈 API 의 now 주입(시험 이음매)으로 묵은·미래 파일을 '방금 쓴 입력'으로 만들 수 없다.
     ★보장 경계: 같은 UID 가 이 조건을 갖춘 파일을 **일부러** 써서 부르면 통과한다 — 막는 것은 공식 CLI·공개 모듈
       API 를 훅 밖에서 부르는 평시 실수 경로다(설계 §12-1 경계 · 원장은 그 위조의 감사 흔적).
@@ -1067,8 +1083,12 @@ def _hook_witness(path, t_real=None):
     if not isinstance(path, str) or not path:
         return None, "훅 입력 파일 경로가 없다(stdin·인자 직접 호출은 훅이 아니다)"
     name = os.path.basename(path)
-    if not re.fullmatch(r"hook-input-[0-9]+\.json", name):
-        return None, "훅 입력 파일 이름이 런처 형식(hook-input-<N>.json)이 아니다: %s" % name
+    m = re.fullmatch(r"hook-input-([0-9]+)-[0-9]+\.json", name)
+    if m is None:
+        return None, "훅 입력 파일 이름이 런처 형식(hook-input-<좌석>-<pid>.json)이 아니다: %s" % name
+    surf = _env_surface()
+    if not surf or m.group(1) != surf:
+        return None, "훅 입력 파일의 좌석(%s)이 부르는 좌석(%s)이 아니다 — 다른 좌석 입력의 재생" % (m.group(1), surf or "미상")
     try:
         import javis_bootstrap
         sdir = javis_bootstrap.state_dir()
@@ -1107,20 +1127,25 @@ def issue_from_hook_file(path, now=None, feed_items=None):
         with open(path, "rb") as f:
             text = f.read(HOOK_INPUT_MAX_BYTES + 1).decode("utf-8", "replace")
     except OSError as e:
-        return _result(False, "hook_payload_invalid", "훅 입력 판독 실패(%s)" % e)
+        return _refuse_unwitnessed("훅 입력 판독 실패(%s)" % e, code="hook_payload_invalid")
     return _issue_from_payload(text, witness, now=t_real if now is None else now, feed_items=feed_items)
 
 
-def _refuse_unwitnessed(why, surface=None, prompt=None):
-    """훅 밖 발급 시도 — 판정하지 않고(질문 무소비) 거부 · 원장이 있으면 감사 1줄(best-effort · 원장을 새로 만들지 않는다)."""
+def _refuse_unwitnessed(why, surface=None, prompt=None, code="not_hook_caller"):
+    """훅 밖 발급 시도 — 판정하지 않고(질문 무소비) 거부 · 원장이 있으면 감사 1줄(best-effort · 원장을 새로 만들지 않는다).
+
+    ★(리뷰 RR1-SEC-B) 출력은 **한 모양**이다(not_hook_caller · `_HOOK_ONLY_DETAIL` · 같은 오너 문구) — 어느 조건에서
+      막혔는지(`why`)는 원장 감사 줄에만 남긴다. `code` 는 감사 줄의 사유 분류(not_hook_caller = 출처 · 호출자 증거 ·
+      hook_payload_invalid = 제자리 파일의 형식 결함 — 종전엔 이 둘째 부류가 감사 줄 없이 사라졌다).
+    """
     surf = _env_surface() if surface is None else _surface_key(surface)
     path = ledger_path()
     if os.path.exists(path):
         extra = {"surface": surf}
         if isinstance(prompt, str):
             extra["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        _audit(path, "issue_refused", "not_hook_caller", why, **extra)
-    return _result(False, "not_hook_caller", "발급은 UserPromptSubmit 훅만 한다 — %s" % why, surface=surf)
+        _audit(path, "issue_refused", code, why, **extra)
+    return _result(False, "not_hook_caller", _HOOK_ONLY_DETAIL, surface=surf)
 
 
 def issue_from_payload(payload_text, now=None, feed_items=None, witness=None):
@@ -1144,15 +1169,16 @@ def _issue_from_payload(payload_text, witness, now=None, feed_items=None):
     try:
         obj = json.loads(payload_text)
     except (TypeError, ValueError) as e:
-        return _result(False, "hook_payload_invalid", "훅 JSON 판독 실패(%s)" % e)
+        return _refuse_unwitnessed("훅 JSON 판독 실패(%s)" % e, code="hook_payload_invalid")
     if not isinstance(obj, dict) or not isinstance(obj.get("prompt"), str):
-        return _result(False, "hook_payload_invalid", "훅 JSON 에 문자열 prompt 가 없다")
+        return _refuse_unwitnessed("훅 JSON 에 문자열 prompt 가 없다", code="hook_payload_invalid")
     ev = obj.get("hook_event_name")
     if ev != "UserPromptSubmit":
-        return _result(False, "hook_payload_invalid", "UserPromptSubmit 훅 사건이 아니다(hook_event_name=%r)" % (ev,))
+        return _refuse_unwitnessed("UserPromptSubmit 훅 사건이 아니다(hook_event_name=%r)" % (ev,),
+                                   prompt=obj["prompt"], code="hook_payload_invalid")
     sid = obj.get("session_id")
     if not _is_str(sid):
-        return _result(False, "hook_payload_invalid", "훅 입력에 session_id 가 없다")
+        return _refuse_unwitnessed("훅 입력에 session_id 가 없다", prompt=obj["prompt"], code="hook_payload_invalid")
     meta = dict(witness or {})
     meta["session_id"] = sid
     return _issue_witnessed(obj["prompt"], meta, now=now, feed_items=feed_items)
@@ -1418,7 +1444,7 @@ def _build_parser():
     sub = ap.add_subparsers(dest="cmd")
     p = sub.add_parser("ask", help="질문 열기(master)")
     p.add_argument("--proposal", default="")
-    p = sub.add_parser("issue", help="UserPromptSubmit 훅 전용 발급(런처가 방금 쓴 <상태>/hook-input-<N>.json · 직접 호출 거부)")
+    p = sub.add_parser("issue", help="훅 전용 발급(직접 호출은 판정 없이 거부·기록된다)")
     p.add_argument("--payload-file", default=None)
     for name in ("verify", "consume"):
         p = sub.add_parser(name)

@@ -133,7 +133,7 @@ exit 0
 class Lab(object):
     """런처·프리루드·발급기·(스텁|실) 본체·bin 사본을 갖춘 격리 실험실 1개."""
 
-    def __init__(self, name, body="stub", issuer=True, bin_mut=None):
+    def __init__(self, name, body="stub", issuer=True, bin_mut=None, launcher_mut=None):
         self.d = os.path.join(ROOT, name)
         self.pack = os.path.join(self.d, "pack")
         self.hooks = os.path.join(self.pack, "hooks")
@@ -143,7 +143,10 @@ class Lab(object):
         for p in (self.hooks, self.stub, self.state, self.run_dir, os.path.join(self.d, "home"),
                   os.path.join(self.d, "config"), os.path.join(self.d, "captures")):
             os.makedirs(p, exist_ok=True)
-        shutil.copy(LAUNCHER, os.path.join(self.hooks, "role-bootstrap.sh"))
+        if launcher_mut is None:
+            shutil.copy(LAUNCHER, os.path.join(self.hooks, "role-bootstrap.sh"))
+        else:
+            w(os.path.join(self.hooks, "role-bootstrap.sh"), launcher_mut(rd(LAUNCHER)), 0o755)
         shutil.copy(PRELUDE, os.path.join(self.hooks, "_lib.sh"))
         if issuer and os.path.isfile(ISSUER):
             shutil.copy(ISSUER, os.path.join(self.hooks, "teamtoken-issue.sh"))
@@ -410,6 +413,26 @@ def suite_acceptance():
           and ("--team-token %s" % iss4[0]["token"]) in (ctx_of(r4b.lines[0]) or ""),
           "issued=%d lines=%r" % (len(iss4), r4b.lines))
     _ = r4a
+
+    # P4-5(리뷰 RR1-SEC-B 좌석 결박) 런처는 입력 파일 이름에 좌석을 싣고 발급기는 그 좌석 = 부르는 좌석을 요구한다.
+    #   ⓐ GUI 기동 좌석 표기(`surface:22`)에서도 오너 승인은 발급된다(런처가 콜론 앞을 걷는다 · 발급기는 숫자부로 흡수).
+    lab5 = Lab("p5")
+    lab5.seed()
+    lab5.ask()
+    lab5.hook(APPROVE, surface="surface:%s" % SURFACE, stub_rc=0)
+    check("P", "P4-5a 좌석 표기 surface:N 인 pane 의 오너 승인도 발급 1(이름 좌석 = 숫자부)",
+          len(lab5.events("token_issued")) == 1, [x.get("code") for x in lab5.events("issue_refused")])
+    #   ⓑ 음성 대조: 이름에서 좌석을 뺀 옛 런처(`hook-input-$$.json`)면 같은 오너 승인이 발급 0 — 결박이 실제로 하중을 진다.
+    old_in = 'IN="$STATE/hook-input-$_CYS_IN_SEAT-$$.json"'
+    lab6 = Lab("p6", launcher_mut=lambda src: src.replace(old_in, 'IN="$STATE/hook-input-$$.json"'))
+    lab6.seed()
+    lab6.ask()
+    lab6.hook(APPROVE, stub_rc=0)
+    ref6 = lab6.events("issue_refused")
+    check("P", "P4-5b 음성 대조: 좌석 없는 옛 이름을 쓰는 런처 → 발급 0 · not_hook_caller 감사 1줄 · 질문 유지",
+          old_in in rd(LAUNCHER) and len(lab6.events("token_issued")) == 0 and len(ref6) == 1
+          and ref6[0].get("code") == "not_hook_caller" and lab6.status().get("code") == "awaiting_answer",
+          [x.get("code") for x in ref6])
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -124,7 +124,15 @@ if ! mkdir -p "$STATE" 2>/dev/null; then
 fi
 
 # ── ⑤ 훅 입력을 파일로 받는다(본체는 stdin 대신 이 파일을 읽는다) ───────────────────────
-IN="$STATE/hook-input-$$.json"
+# ★(0.14.42 리뷰 RR1-SEC-B) 이름에 **좌석**을 싣는다 — 대화 승인 발급기(⑤-b · javis_teamtoken.py issue)는 이름의
+#   좌석이 부르는 좌석(env)과 같아야 판정한다(다른 좌석에서 오너가 친 진짜 승인 입력을 이 좌석의 질문에 재생하는 길을
+#   막는다 · 아래 GC 가 최근 20개를 남긴다). 좌석 표기는 `12`·`surface:12` 둘이다(javis_bootstrap.my_surface_key 가
+#   숫자부로 흡수) — 셸 확장만으로(외부 명령 0) 콜론 앞을 걷고, 숫자가 아니면 `x`(발급기가 이름 형식 위반으로 거부 =
+#   발급 0 · fail-closed). 부트 본체·신 파이프라인은 경로만 받고 이름을 해석하지 않는다.
+_CYS_IN_SEAT="${CYS_SURFACE_ID:-${AITERM_SURFACE_ID:-}}"
+_CYS_IN_SEAT="${_CYS_IN_SEAT##*:}"
+case "$_CYS_IN_SEAT" in ''|*[!0-9]*) _CYS_IN_SEAT=x ;; esac
+IN="$STATE/hook-input-$_CYS_IN_SEAT-$$.json"
 if ! cat > "$IN" 2>/dev/null; then
   rm -f "$IN" 2>/dev/null
   _cys_note "[cys-hook] 훅 입력 저장 실패 — 부트 미발화"
