@@ -298,7 +298,7 @@ jobs:
                    test_dept_schedule_seed \
                    test_lane_redirect \
                    test_dept_notice_lane test_team_create_u16 \
-                   test_teamtoken; do
+                   test_teamtoken test_teamtoken_hook; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="
