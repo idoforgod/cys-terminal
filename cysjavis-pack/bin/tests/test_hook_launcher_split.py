@@ -395,11 +395,14 @@ if [ "${P%/*}" != "$P" ]; then printf 'OK|%s\n' "${P%/*}"; else printf 'EMPTY|\n
     w(os.path.join(hooks, "role-bootstrap-legacy.sh"), STUB_BODY, 0o755)
     w(os.path.join(binp, "cys"), stub_cys(supports_input=False), 0o755)
     os.makedirs(state, exist_ok=True)
+    # ★(0.14.42 fatal-fix R1-02 재핀) GC 는 이름 끝 숫자(런처 pid)가 **살아 있으면** 건너뛴다(동시 훅의 입력 보호) — 잔재 픽스처는
+    #   반드시 죽은 pid 여야 핀의 의도(비정상 종료 잔재의 유계 정리)를 잰다. 종전 이름(`hook-input-9NN.json`)은 이 맥에서 pid
+    #   904·923·933 이 실제로 살아 있어 환경 의존이 된다 — pid_max(리눅스 4194304 · 맥 99998) 밖 값으로 결정론화.
     for i in range(40):
-        w(os.path.join(state, "hook-input-9%02d.json" % i), "{}")
+        w(os.path.join(state, "hook-input-9%02d-49999%02d.json" % (i, i)), "{}")
     run(hooks, env)
     left = [n for n in os.listdir(state) if n.startswith("hook-input-")]
-    check("GC-1 잔재 입력 파일이 유계로 정리된다(40 → ≤20)", len(left) <= 20, str(len(left)))
+    check("GC-1 잔재 입력 파일(죽은 pid)이 유계로 정리된다(40 → ≤20)", len(left) <= 20, str(len(left)))
 
     # ───────── ★음성 대조 1: 능력 프로브를 떼면 구 CLI 에서 부트가 무음 사망한다 ─────────
     mut_hooks = os.path.join(root, "mut1", "hooks")

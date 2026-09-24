@@ -72,13 +72,15 @@ token_ok 로 허용한다. 토큰이 1회성이면 ①에서 소비된 토큰으
 → ledger_corrupt. 예외: **개행 없는 마지막 조각**(찢긴 꼬리 = 완료되지 않은 쓰기)은 없었던 일로 보고,
 다음 append 가 개행 + torn_tail_sealed 로 봉인한다(봉인된 조각은 계속 무시된다 — 판정이 흔들리지 않는다).
 한 번에 두 레코드를 쓸 때는 **닫힘을 먼저** 쓴다(찢기면 토큰이 사라지는 쪽 = 안전 방향).
-열린 질문 표지 `<상태>/teamtoken-open-<lane>`(리뷰 F3): 원장에서 파생된 캐시 — 답 없이 열린 질문(만료 + 고지 여유
-ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비용 게이트가 셸 글롭 존재 검사로만 본다(외부
-명령 0). ask 가 먼저 세우고(못 세우면 질문을 열지 않는다) issue·status 가 원장에 맞춰 걷거나 되살린다.
+열린 질문 표지 `<상태>/teamtoken-open-<lane>-s<좌석>`(리뷰 F3 · fatal-fix R3-F2 좌석 단위): 원장에서 파생된 캐시 — 그 좌석에
+답 없이 열린 질문(만료 + 고지 여유 ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비용 게이트가 셸 글롭
+`teamtoken-open-*-s<이 좌석>` 존재 검사로만 본다(외부 명령 0 · 질문을 연 좌석만 발급기를 띄운다). ask 가 먼저 세우고(못 세우면
+질문을 열지 않는다) issue·status 가 원장에 맞춰 걷거나 되살린다 · 다른 레인·옛 형식 표지는 자기 until 이 지나면 걷는다.
 
 ## CLI (stdout = JSON 1줄 · 단 issue 의 exit 3 은 무출력)
   ask     --proposal <tp-id>                       # master · 좌석은 env(CYS_SURFACE_ID) — 인자로 바꿀 수 없다
                                                     #   라이브 지침에 §4-A-2 가 없으면 directive_stale(질문·표지 0)
+                                                    #   Windows 면 platform_gui_only(질문·표지 0 · 화면 경로)
   issue   --payload-file F                          # ★UserPromptSubmit 훅 전용 — F = 런처가 **방금** 쓴
                                                     #   <상태>/hook-input-<좌석>-<pid>.json(출처·좌석 확인 · stdin 경로 없음)
   verify  --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
@@ -192,6 +194,9 @@ _HOOK_ONLY_DETAIL = ("훅 입력으로 확인되지 않아 판정하지 않았�
 #   지침이 갱신되기 전에는 몇 번을 물어도 대화로 만들 수 없다).
 _MSG_DIRECTIVE_STALE = ("이 컴퓨터의 대표 지침이 아직 대화 승인 이전 판이라 대화로는 만들 수 없습니다 — Control Center → "
                         "승인 Feed 카드의 [확인 창 열기] → [만들기]로 만들어 주세요.")
+# ★(0.14.42 fatal-fix WIN-1·F3) Windows 는 대화 승인 질문을 열지 않는다(화면 경로만) — 되묻기 약속 없음.
+_MSG_PLATFORM_GUI_ONLY = ("이 컴퓨터(Windows)에서는 아직 대화로 팀을 만들 수 없습니다 — Control Center → 승인 Feed 카드의 "
+                          "[확인 창 열기] → [만들기]로 만들어 주세요.")
 
 OWNER_MESSAGES = {
     # ── §10 표 원문(글자 그대로) ──
@@ -237,6 +242,8 @@ OWNER_MESSAGES = {
     "surface_not_publisher": _MSG_SEAT_MOVED,
     # ── 신설 행(리뷰 N1 — 라이브 지침이 대화 승인 이전 판) ──
     "directive_stale": _MSG_DIRECTIVE_STALE,
+    # ── 신설 행(fatal-fix WIN-1·F3 — Windows 는 화면 경로만) ──
+    "platform_gui_only": _MSG_PLATFORM_GUI_ONLY,
     # ── 신설 행(2단 권한의 ⑦ allow 단계 — §10 에 해당 행이 없다) ──
     "grant_not_armed": "팀 생성이 확인되지 않아 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
     "grant_revoked": "팀 생성에 실패해 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
@@ -264,12 +271,13 @@ SECTION10_CODES = frozenset([
     "formation_partial", "create_failed"])
 # §10 밖의 행 — 신설(2단 권한 ⑦ allow) + 분리(§10 의 뭉친 행이 사실과 어긋나던 코드).
 NEW_ROW_CODES = frozenset(["grant_not_armed", "grant_revoked", "grant_expired",
-                           "token_consumed", "surface_not_publisher", "directive_stale"])
+                           "token_consumed", "surface_not_publisher", "directive_stale", "platform_gui_only"])
 # 이 모듈이 **거부**로 돌려줄 수 있는 사유 코드 전량(P4 훅·P5 데몬이 그대로 쓴다).
 REFUSAL_CODES = (
     "ask_not_open", "ask_expired", "utterance_ambiguous", "utterance_rejected", "machine_origin",
     "ledger_absent", "ledger_unreadable", "no_pending", "multiple_pending", "proposal_not_pending",
-    "body_changed", "surface_unknown", "surface_not_publisher", "directive_stale", "proposal_publisher_unknown",
+    "body_changed", "surface_unknown", "surface_not_publisher", "directive_stale", "platform_gui_only",
+    "proposal_publisher_unknown",
     "proposal_body_invalid", "feed_unreadable", "not_hook_caller",
     "token_missing", "token_unknown", "token_consumed", "token_expired", "token_proposal_mismatch",
     "token_surface_mismatch", "token_body_mismatch", "grant_not_armed", "grant_revoked",
@@ -454,17 +462,54 @@ def directive_supports_chat_approval():
     return True, ""
 
 
-def open_marker_path():
-    """이 레인의 **열린 질문 표지** 경로 — UserPromptSubmit 런처(role-bootstrap.sh ⑤-b)의 비용 게이트가
-    셸 글롭 `teamtoken-open-*` 존재 검사 하나(외부 명령 0)로 본다(리뷰 F3).
+def _is_windows():
+    """Windows(네이티브 파이썬 nt · MSYS/Cygwin 파이썬)인가 — 시험 이음매(모듈 속성이라 검체가 바꿔 끼운다)."""
+    return os.name == "nt" or sys.platform.startswith(("win", "cygwin", "msys"))
+
+
+def platform_supports_chat_approval():
+    """(bool, 사유) — 이 플랫폼에서 대화 승인 질문을 열어도 되는가(0.14.42 fatal-fix WIN-1·F3).
+
+    ★Windows 는 **아직 아니다**(실기 검증 전 · 설치파일 신중 앵커): ⓐ pane PATH 에 `cys-dept` 가 없어(런타임 bin 목록에 팩
+    bin 부재 · preflight C11b 도 nt 에서 SKIP) §4-A-2 ① 이 매번 127 로 실패하고 토큰만 만료된다 — 대표는 '생성 실패 → 새 질문'을
+    되풀이한다 ⓑ CEO 좌석(base cysd 의 PTY 자손)이 띄운 부서 cysd 는 base cysd 의 KILL_ON_JOB_CLOSE Job 을 상속해, base 데몬이
+    끝나면 새 팀의 데몬·pane 이 함께 죽는다(전 pane 사망 ④). 에이전트발 부서 자동 생성 폴백이 Windows 를 막아 둔 선례
+    (javis_bootstrap `os.name == "nt"` → 자동 스폰 금지)와 같은 결정이다. 실패 방향: 질문을 열지 않는다 → 화면 경로(GUI 가
+    Job 밖에서 `bash <팩>/bin/cys-dept` 전체 경로로 부른다) — 허용 쪽으로 새지 않는다. 표지가 생기지 않으므로 Windows 에서는
+    UserPromptSubmit ⑤-b 발급기도 뜨지 않는다(Git Bash·python 냉시작 비용 0)."""
+    if _is_windows():
+        return False, ("Windows 는 대화 승인 생성 경로를 열지 않는다(cys-dept 가 pane PATH 에 없고 부서 데몬이 base cysd Job 을 "
+                       "상속 — 실기 검증 전) · 화면 경로만")
+    return True, ""
+
+
+# ★(0.14.42 fatal-fix R3-F2·R1-04) 열린 질문 표지는 **좌석** 단위다: `teamtoken-open-<레인>-s<좌석>`.
+_MARKER_PREFIX = "teamtoken-open-"
+
+
+def _lane_marker_prefix():
+    import javis_bootstrap
+    return "%s%s-s" % (_MARKER_PREFIX, javis_bootstrap.lane_key())
+
+
+def open_marker_path(surface=None):
+    """**열린 질문 표지** 경로(이 레인·이 좌석) — UserPromptSubmit 런처(role-bootstrap.sh ⑤-b)의 비용 게이트가
+    셸 글롭 `teamtoken-open-*-s<좌석>` 존재 검사 하나(외부 명령 0)로 본다(리뷰 F3 · fatal-fix R3-F2).
 
     표지는 원장에서 **파생된 캐시**다(판정 근거가 아니다 — 판정은 언제나 원장 내용으로 한다). 있어야 할 때:
-    답 없이 열린 질문이 있고 그 만료 + ASK_NOTICE_GRACE_S 가 아직 지나지 않았다. 종전 게이트(원장 mtime 10분 창)는
-    거부 감사 레코드 한 줄에도 10분 동안 모든 좌석의 모든 프롬프트가 발급기를 띄웠고(맥 약 +130ms), 원장이 한 번
-    생긴 기계는 영구히 date·stat 2회(약 +8ms)를 냈다. 실패 방향: 표지를 쓸 수 없으면 질문을 열지 않는다(open_ask) ·
-    표지를 걷지 못하면 발급기가 한 번 더 불릴 뿐이다(비용 쪽 · 판정 불변) · 표지가 사라졌으면 status 가 되살린다."""
+    그 좌석에 답 없이 열린 질문이 있고 그 만료 + ASK_NOTICE_GRACE_S 가 아직 지나지 않았다.
+    ★좌석 단위인 이유(fatal-fix R3-F2 · R1-01 · R2-1 · WIN-3): 종전 레인 표지 + 전 레인 글롭은 질문 창(최대 600초) 동안
+      **모든 레인의 모든 좌석**(워커·리뷰어·CSO·부서 좌석)의 매 프롬프트에 sh + 인터프리터 1~2회를 붙였다. 그 노출면이
+      곧 런처 GC 경합(동시 훅 20개 초과 → 입력 소실 → 엉뚱한 고지)과 발급기 고장 시 전 좌석 잡음의 크기였다. 질문을 열 수
+      있는 좌석은 제안을 올린 대표 좌석 하나다 — 그 좌석만 발급기를 띄우면 된다. 좌석 표기는 `_env_surface()`(=
+      `javis_bootstrap.my_surface_key` 숫자부) 이고 런처의 `hook-input-<좌석>-<pid>.json` 좌석과 같은 규약이다(발급기의
+      좌석 결박이 이미 둘의 일치를 요구한다 — 새 일치 조건을 만들지 않는다). 다른 레인의 같은 번호 좌석이 글롭에 걸리는
+      것은 상위집합이라 안전하다(비용 쪽 · 판정 불변).
+    실패 방향: 표지를 쓸 수 없으면 질문을 열지 않는다(open_ask) · 표지를 걷지 못하면 발급기가 한 번 더 불릴 뿐이다
+    (비용 쪽 · 판정 불변) · 표지가 사라졌으면 status 가 되살린다."""
     import javis_bootstrap
-    return os.path.join(javis_bootstrap.state_dir(), "teamtoken-open-%s" % javis_bootstrap.lane_key())
+    surf = _env_surface() if surface is None else _surface_key(surface)
+    return os.path.join(javis_bootstrap.state_dir(), "%s%s" % (_lane_marker_prefix(), surf or "x"))
 
 
 def _live_asks(asks, now):
@@ -473,11 +518,17 @@ def _live_asks(asks, now):
             if a["closed"] is None and now <= float(a["rec"]["expires_at"]) + ASK_NOTICE_GRACE_S]
 
 
-def _write_marker(asks_live):
-    """표지 기록(원자 교체). 실패는 예외 — 부르는 쪽이 방향을 정한다(open_ask = 질문을 열지 않는다)."""
-    p = open_marker_path()
-    body = json.dumps({"v": SCHEMA_VERSION, "asks": sorted(a["rec"]["ask_id"] for a in asks_live),
-                       "until": max(float(a["rec"]["expires_at"]) for a in asks_live) + ASK_NOTICE_GRACE_S},
+def _by_seat(asks_live):
+    out = {}
+    for a in asks_live:
+        out.setdefault(a["rec"]["surface"], []).append(a)
+    return out
+
+
+def _write_marker_file(p, group):
+    """표지 1개 기록(원자 교체). 실패는 예외 — 부르는 쪽이 방향을 정한다(open_ask = 질문을 열지 않는다)."""
+    body = json.dumps({"v": SCHEMA_VERSION, "asks": sorted(a["rec"]["ask_id"] for a in group),
+                       "until": max(float(a["rec"]["expires_at"]) for a in group) + ASK_NOTICE_GRACE_S},
                       sort_keys=True) + "\n"
     # 임시 이름은 점(.)으로 시작한다 — 런처 글롭 `teamtoken-open-*` 에 걸리지 않게(찢긴 임시 파일이 표지로 읽히면 안 된다).
     tmp = os.path.join(os.path.dirname(p), ".%s.%d.tmp" % (os.path.basename(p), os.getpid()))
@@ -493,22 +544,93 @@ def _write_marker(asks_live):
         raise
 
 
-def _drop_marker():
+def _write_marker(asks_live):
+    """열린 질문이 있는 좌석마다 표지 1개(원자 교체). 실패는 예외(open_ask = 질문을 열지 않는다)."""
+    for surf, group in _by_seat(asks_live).items():
+        _write_marker_file(open_marker_path(surf), group)
+
+
+def _marker_names():
+    import javis_bootstrap
+    sd = javis_bootstrap.state_dir()
     try:
-        os.remove(open_marker_path())
-    except FileNotFoundError:
+        names = os.listdir(sd)
+    except OSError:
+        return sd, []
+    return sd, [n for n in names if n.startswith(_MARKER_PREFIX)]
+
+
+def _drop_marker():
+    """이 레인의 표지 전부(좌석 표지 + 옛 레인 표지)를 걷는다."""
+    import javis_bootstrap
+    sd, names = _marker_names()
+    pfx = _lane_marker_prefix()
+    legacy = _MARKER_PREFIX + javis_bootstrap.lane_key()
+    for n in names:
+        seat = n[len(pfx):] if n.startswith(pfx) else ""
+        if n == legacy or seat.isdigit() or seat == "x":
+            try:
+                os.remove(os.path.join(sd, n))
+            except FileNotFoundError:
+                pass
+
+
+def _sweep_foreign_marker(p, now):
+    """다른 레인(또는 옛 형식) 표지 — 그 레인의 원장은 여기서 읽지 않는다. 표지의 until 이 지났으면 걷는다
+    (판독 불가면 mtime + 질문 TTL + 고지 여유). ★(fatal-fix R1-04 · WIN-3) 종전엔 표지를 걷는 주체가 **자기 레인**의
+    발급기뿐이라, 조용한 레인에 남은 표지·레인 키가 바뀐 옛 표지·개발 산출 표지가 그 기계의 모든 좌석에 발급기를
+    무기한 띄웠다. 걷는 조건은 표지 자신이 선언한 만료뿐이다 — 살아 있는 질문의 표지는 건드리지 않는다(until 은 그 레인
+    질문들의 만료 + 고지 여유의 최댓값)."""
+    until = None
+    try:
+        with open(p, "rb") as f:
+            d = json.loads(f.read(4096).decode("utf-8"))
+        u = d.get("until") if isinstance(d, dict) else None
+        if _is_num(u):
+            until = float(u)
+    except (OSError, ValueError):
+        pass
+    try:
+        if until is not None:
+            if until < now:
+                os.remove(p)
+        elif os.path.getmtime(p) + ASK_TTL_S + ASK_NOTICE_GRACE_S < time.time():
+            os.remove(p)
+    except OSError:
         pass
 
 
 def _sync_marker(asks, now):
-    """표지를 원장 파생 상태에 맞춘다(best-effort — 캐시라 실패가 판정을 바꾸지 않는다)."""
+    """표지를 원장 파생 상태에 맞춘다(best-effort — 캐시라 실패가 판정을 바꾸지 않는다).
+
+    이 레인: 열린 질문이 있는 좌석마다 표지를 두고(없으면 세우고) 나머지 좌석 표지·옛 레인 표지는 걷는다.
+    다른 레인·옛 형식: 표지가 선언한 until 이 지났으면 걷는다(`_sweep_foreign_marker`)."""
     try:
-        live = _live_asks(asks, now)
-        if live:
-            if not os.path.isfile(open_marker_path()):
-                _write_marker(live)
-        else:
-            _drop_marker()
+        import javis_bootstrap
+        want = _by_seat(_live_asks(asks, now))
+        for surf, group in want.items():
+            p = open_marker_path(surf)
+            if not os.path.isfile(p):
+                _write_marker_file(p, group)
+        sd, names = _marker_names()
+        pfx = _lane_marker_prefix()
+        legacy = _MARKER_PREFIX + javis_bootstrap.lane_key()
+        for n in names:
+            p = os.path.join(sd, n)
+            seat = n[len(pfx):] if n.startswith(pfx) else None
+            if seat is not None and (seat.isdigit() or seat == "x"):
+                if seat not in want:
+                    try:
+                        os.remove(p)
+                    except FileNotFoundError:
+                        pass
+            elif n == legacy:
+                try:
+                    os.remove(p)       # 옛 레인 표지 — 좌석 글롭은 보지 않는다(쓸모없는 잔재)
+                except FileNotFoundError:
+                    pass
+            else:
+                _sweep_foreign_marker(p, now)
     except Exception:  # noqa: BLE001 — 캐시 동기화 실패는 비용 쪽으로만 샌다
         pass
 
@@ -881,7 +1003,11 @@ def open_ask(proposal_id, surface=None, now=None, feed_items=None):
         _audit(path, "ask_refused", code, detail, proposal_id=pid, surface=surf)
         return _result(False, code, detail, n=n, proposal_id=pid, surface=surf)
 
-    # ★(리뷰 N1) 라이브 지침 판 게이트 — 가장 먼저 본다(질문도 표지도 만들지 않는다 · 감사 1줄만).
+    # ★(fatal-fix WIN-1·F3) 플랫폼 게이트 — Windows 는 질문을 열지 않는다(화면 경로 · 질문·표지 0 · 감사 1줄만).
+    pok, pwhy = platform_supports_chat_approval()
+    if not pok:
+        return refuse("platform_gui_only", pwhy)
+    # ★(리뷰 N1) 라이브 지침 판 게이트 — 질문도 표지도 만들지 않는다(감사 1줄만).
     #   team-propose 출력은 지침 판을 모른 채 이 명령을 지시한다 — 대화 승인 이전 판 좌석에서는 여기서 화면 경로로 돌린다.
     dok, dwhy = directive_supports_chat_approval()
     if not dok:
@@ -945,29 +1071,41 @@ def _open_ask_for(asks, surf):
     return max(cand, key=lambda a: a["idx"]) if cand else None
 
 
-def _judge(prompt, surf, now, feed_items, ask, meta):
-    """열린 질문에 대한 판정 → (결과, append 할 레코드). 락 안에서 불린다."""
+def _judge(prompt, surf, now, feed_items, ask, meta, audits=()):
+    """열린 질문에 대한 판정 → (결과, append 할 레코드). 락 안에서 불린다.
+
+    ★(fatal-fix R3-F1 · R1-03 · R2-2) 판정 순서: 출처(재생 · 배달 원장 · 기계 유래 · harness) **먼저**, 질문 TTL 만료는
+      **사람의 발화에만** 본다. 종전엔 만료 검사가 맨 앞이라, 답 없이 만료된 질문이 있는 좌석에 처음 닿은 기계 배달
+      ([CYCLE]·heartbeat·wakeup·워커 보고)을 '오너의 답'으로 세어 질문을 닫고 "질문은 이 답으로 닫혔다 — 오너에게:
+      「확인 시간이 지나 다시 여쭙습니다 — 이 내용으로 만들까요?」" 를 그 자가치유 프롬프트에 실었다. 디렉티브 절차 5
+      ('ask_expired 면 3 부터 다시')와 맞물려 오너 부재 중 기계 push 주기마다 재질문·재개장이 돌 수 있었고(①),
+      정작 늦게 친 오너의 '만들어'에는 표지가 걷혀 아무 말도 없었다(③). 기계 발화는 만료와 무관하게 질문을 닫지 않는다.
+    ★(fatal-fix R1-06) 질문을 닫지 않는 거부(기계 유래·배달 원장 부재/손상)가 **승인처럼 들리지 않으면** 같은 질문·같은
+      사유의 감사 줄이 이미 있을 때 더 쓰지 않는다(질문 1개당 사유별 1줄) — 질문이 열린 동안 master 에 오는 모든 기계
+      push 가 한 줄씩 쌓여 원장 상한(8MB)에 닿으면 대화 승인이 영구 ledger_corrupt 로 죽는다. 승인처럼 들리는 거부는
+      매번 남긴다(§13 P4 '기계 배달 승인 문장 → 원장에 사유')."""
     a = ask["rec"]
     aid, pid = a["ask_id"], a["proposal_id"]
     psha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     base = {"ask_id": aid, "proposal_id": pid, "surface": surf}
+    approvalish = approval_verdict(prompt)[0] == "approve"
 
     def refuse(code, detail, close_why=None, n=2, shown=None):
-        """shown = 호출자에게 보일 detail(없으면 detail) — 감사 줄에는 언제나 구체 사유(detail)를 남긴다."""
+        """shown = 호출자에게 보일 detail(없으면 detail) — 감사 줄에는 구체 사유(detail)를 남긴다."""
         recs = []
         if close_why:
             recs.append({"v": SCHEMA_VERSION, "kind": KIND_ASK, "event": "ask_closed", "ask_id": aid,
                          "surface": surf, "proposal_id": pid, "why": close_why, "at": now})
-        recs.append({"v": SCHEMA_VERSION, "kind": KIND_AUDIT, "event": "issue_refused", "code": code,
-                     "detail": (detail or "")[:300], "at": now, "ask_id": aid, "proposal_id": pid,
-                     "surface": surf, "prompt_sha256": psha, "prompt_chars": len(prompt),
-                     "ask_closed": bool(close_why)})
+        dup = (not close_why and not approvalish
+               and any(r.get("event") == "issue_refused" and r.get("ask_id") == aid and r.get("code") == code
+                       for r in audits))
+        if not dup:
+            recs.append({"v": SCHEMA_VERSION, "kind": KIND_AUDIT, "event": "issue_refused", "code": code,
+                         "detail": (detail or "")[:300], "at": now, "ask_id": aid, "proposal_id": pid,
+                         "surface": surf, "prompt_sha256": psha, "prompt_chars": len(prompt),
+                         "ask_closed": bool(close_why)})
         return _result(False, code, shown or detail, n=n, ask_closed=bool(close_why), **base), recs
 
-    if now > float(a["expires_at"]):
-        # ★만료와 미개설을 구분한다(§10 끝 구현 주의) — 만료 고지는 1회, 질문은 여기서 닫힌다.
-        return refuse("ask_expired", "질문 TTL %ds 경과(%.0fs 초과)" % (ASK_TTL_S, now - float(a["expires_at"])),
-                      close_why="expired")
     # ★(리뷰 SEC-1) 답은 질문 **뒤**에 쳐진 것이어야 한다 — 훅 입력 파일은 그 프롬프트의 훅이 도는 순간에 쓰이므로
     #   정상 경로에서는 언제나 질문보다 뒤다. 앞이면 질문 전에 친 문장의 재생이다(질문은 소비하지 않는다).
     #   입력 시각 = now − (실시계로 잰 파일 나이). 운영(now 미주입)에서는 파일 mtime 그 자체다(issue_from_hook_file 이
@@ -988,6 +1126,11 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
     is_harness, hwhy = m.harness_origin(prompt)
     if is_harness:
         return refuse("machine_origin", "harness 내부 알림 — %s" % hwhy)
+    # ── 여기부터 '사람의 발화' ──
+    if now > float(a["expires_at"]):
+        # ★만료와 미개설을 구분한다(§10 끝 구현 주의) — 만료 고지는 1회(사람의 첫 발화), 질문은 여기서 닫힌다.
+        return refuse("ask_expired", "질문 TTL %ds 경과(%.0fs 초과)" % (ASK_TTL_S, now - float(a["expires_at"])),
+                      close_why="expired")
     # ── 여기부터 '사람의 답' — 승인이든 아니든 이 답이 질문을 1회 소비한다 ──
     verdict, vwhy = approval_verdict(prompt)
     if verdict == "reject":
@@ -1031,11 +1174,19 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
                    body_digest=cur, next="cys-dept create --team-token %s" % token, **base), recs
 
 
-def _no_ask(prompt, surf, feed_items):
-    """열린 질문이 없다. 승인처럼 들리는 말 + 이 좌석이 올린 대기 제안이 있을 때만 알린다(그 밖 무출력)."""
+def _no_ask(prompt, surf, feed_items, tokens=None, now=None):
+    """열린 질문이 없다. 승인처럼 들리는 말 + 이 좌석이 올린 대기 제안이 있을 때만 알린다(그 밖 무출력).
+
+    ★(fatal-fix R1-07) 이 좌석이 **방금**(토큰 TTL 안) 토큰을 받았으면 조용히 접는다 — 오너가 승인을 거의 동시에 여러 번
+      제출하면 첫 발급이 질문을 닫은 뒤 나머지가 여기로 와 'ask_not_open — 먼저 ask 로 질문을 연 뒤 다시 여쭤라' 를
+      실었다. 발급 고지와 모순되는 지시가 master 에 들어가 재질문(표지 재개장)을 불렀다."""
     verdict, _w = approval_verdict(prompt)
     quiet = _result(False, "ask_not_open", "열린 질문 없음", exit_code=EXIT_NO_ASK, surface=surf)
     if verdict != "approve":
+        return quiet
+    if tokens and now is not None and any(
+            t["issued"]["surface"] == surf and now - float(t["issued"]["issued_at"]) <= TOKEN_TTL_S
+            for t in tokens.values()):
         return quiet
     items, _e = _feed(feed_items)
     if items is None:
@@ -1101,13 +1252,14 @@ def _issue_impl(prompt, surface, now, feed_items, meta):
     if not surf:
         return _result(False, "surface_unknown", "좌석 미상 — 판정하지 않는다", exit_code=EXIT_NO_ASK)
     path = ledger_path()
+    tokens = None
     if os.path.exists(path):
         with _Locked(path):
             recs0 = _load(path)
-            asks, _t, _a = _derive(recs0)
+            asks, tokens, audits = _derive(recs0)
             ask = _open_ask_for(asks, surf)
             if ask is not None:
-                res, recs = _judge(prompt, surf, now, feed_items, ask, meta)
+                res, recs = _judge(prompt, surf, now, feed_items, ask, meta, audits)
                 if recs:
                     _append(path, recs)
                     asks, _t, _a = _derive(recs0 + recs)
@@ -1116,7 +1268,7 @@ def _issue_impl(prompt, surface, now, feed_items, meta):
             _sync_marker(asks, now)       # 다른 좌석의 만료 질문 표지도 여유가 지나면 여기서 걷힌다
     else:
         _sync_marker({}, now)             # 원장 없는 표지 = 잔재
-    return _no_ask(prompt, surf, feed_items)
+    return _no_ask(prompt, surf, feed_items, tokens=tokens, now=now)
 
 
 def _hook_witness(path, t_real=None):
@@ -1483,6 +1635,17 @@ def _body_arg(args):
     return dig, None
 
 
+def _payload_approval_like(path):
+    """훅 입력 파일의 prompt 가 승인처럼 들리는가 — 판독 불가는 False(고지 대상 아님 · 발급은 어느 쪽이든 0)."""
+    try:
+        with open(path, "rb") as f:
+            obj = json.loads(f.read(HOOK_INPUT_MAX_BYTES + 1).decode("utf-8", "replace"))
+        p = obj.get("prompt") if isinstance(obj, dict) else None
+        return isinstance(p, str) and approval_verdict(p)[0] == "approve"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _emit(res):
     sys.stdout.write(json.dumps(res, ensure_ascii=False, sort_keys=True) + "\n")
     sys.stdout.flush()
@@ -1539,7 +1702,17 @@ def _main(args):
     if cmd == "issue":
         # ★(리뷰 SEC-1) stdin 입력 경로는 없다 — 발급 입력은 런처가 방금 쓴 훅 입력 파일(--payload-file)뿐이고, 그 출처를
         #   _hook_witness 가 확인한다. stdin·임의 파일로 부르면 판정 없이 not_hook_caller(exit 1 · 질문 무소비).
-        res = issue_from_hook_file(args.payload_file)
+        # ★(fatal-fix R1-05 · R3-F4) 판정 입구 밖의 예외(형제 모듈 import 실패 — 팩 갱신 도중 등)는 main 의 포괄 처리가
+        #   발화와 무관하게 internal_error(exit 4)로 접었고, 고지 스크립트는 그것을 **모든 좌석의 모든 프롬프트**에
+        #   '앱을 재시작한 뒤 다시 말씀해 주세요'로 실었다. 발급은 어느 쪽이든 0 이다 — 승인처럼 들리지 않으면 무출력(exit 3).
+        try:
+            res = issue_from_hook_file(args.payload_file)
+        except Exception as e:  # noqa: BLE001 — fail-closed(발급 0) · 고지 여부만 가른다
+            if _payload_approval_like(args.payload_file):
+                return _emit(_result(False, "internal_error", "%s: %s" % (type(e).__name__, e)))
+            sys.stderr.write("[javis_teamtoken] issue: 기반 고장(%s) — 승인처럼 들리지 않는 발화라 무출력(발급 0)\n"
+                             % type(e).__name__)
+            return EXIT_NO_ASK
         if res.get("exit") == EXIT_NO_ASK:
             return EXIT_NO_ASK                  # 무출력 — 훅은 열린 질문이 있는 동안 매 프롬프트마다 부른다
         return _emit(res)

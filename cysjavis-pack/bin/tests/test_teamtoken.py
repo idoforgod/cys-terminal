@@ -1424,6 +1424,22 @@ def suite_directive():
     anchor = getattr(tt, "DIRECTIVE_ANCHOR", None)
     check("D", "D8(N1) 출하 지침(MASTER·CEO_TEMPLATE)이 ask 게이트 앵커를 품는다 — 없으면 전 기계에서 대화 승인이 조용히 닫힌다",
           bool(anchor) and anchor in text and anchor in ceo_text, repr(anchor))
+    # ★(fatal-fix F1 · ROLE-01 · ROLE-1 · R3-O1 · R4-N5 · F4 · F6 · X-R4-1 · R4-N2) 대표가 턴 안에서 편성·각성을 기다리지
+    #   않는다(회신 적체 방지) · ① 도구 제한시간 · 각성 지시 받는 쪽 규칙 · 재요청 1회 · 첫 팀 지침 교체는 턴 뒤.
+    step3 = next((ln for ln in blk.splitlines() if ln.startswith("  ③ ")), "")
+    step1 = next((ln for ln in blk.splitlines() if ln.startswith("  ① ")), "")
+    step5 = next((ln for ln in blk.splitlines() if ln.startswith("  ⑤ ")), "")
+    check("D", "D9 §4-A-2: ①②④⑤ 뒤 턴 종료 · ③ 은 비동기(이 턴에서 기다리지 않는다 · 다음에 깨어났을 때 1회 확인) · "
+               "'5노드 등장이 끝나면' 대기 문구 삭제 · 받는 쪽 규칙(reinject --check) · 재요청 1회 · 첫 과제는 빈 셸 금지",
+          "그 턴을 끝낸다" in blk and "이 턴에서 기다리지 않는다" in step3 and "다음에 깨어났을 때" in step3
+          and "5노드 등장이 끝나면" not in blk and "reinject --check --role" in blk and "**1회만** 요청" in blk
+          and "빈 셸에는 보내지 않는다" in step5 and "팀장과 팀원 4자리가 떴습니다" not in step5, step3[:160])
+    check("D", "D10 ① Bash 도구 timeout 600000·백그라운드 금지 · 첫 팀 CEO 지침은 이 턴에 주입되지 않고 턴 뒤 1회 재주입",
+          "timeout 600000" in step1 and "백그라운드로 돌리거나" in step1 and "cys reinject --role master" in step1,
+          step1[:200])
+    ceo_head = ceo_text[:ceo_text.index("# [본문 — 표준 MASTER 운영 계약 전문]")]
+    check("D", "D11(F5) CEO 합성 서문이 토큰 생성 예외를 반영한다('집행은 CSO·GUI 경유' 단독 문구 아님)",
+          "(집행은 CSO·GUI 경유)" not in ceo_head and "§4-A-2 대화 승인 토큰 예외" in ceo_head)
     check("D", "D7(RR1-SEC-B) '직접 호출은 출처 확인으로 거부·기록된다'는 단정 금지 — 형식대로 흉내 낸 입력은 통과하고 "
                "via=hook 으로 남는다고 적는다 · not_hook_caller 재시도 금지 · 출력 안 하는 hook_payload_invalid 는 표에서 뺀다",
           "출처 확인으로 거부·기록된다" not in text and "형식을 충실히 흉내 낸 입력 파일은 통과" in text
@@ -1431,10 +1447,132 @@ def suite_directive():
           and "`hook_payload_invalid`" not in text and "hook_payload_invalid" in tt.AUDIT_ONLY_CODES)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Z — 치명위험 수정 핀(0.14.42 fatal-fix · 오너 특별 주의 ①~④) — 각 핀은 수정 전 FAIL · 수정 후 PASS 로 확인했다.
+# ══════════════════════════════════════════════════════════════════════════════
+def _bin_copy(mut_name, mut):
+    """저장소 bin 사본 1벌(검체용) — `mut(path)` 로 파일 하나를 망가뜨린다."""
+    d = os.path.join(TMP, "bin-" + mut_name)
+    if not os.path.isdir(d):
+        shutil.copytree(BIN, d, ignore=shutil.ignore_patterns("tests", "__pycache__", "*.pyc"))
+        mut(d)
+    return d
+
+
+def suite_fatal_fix():
+    # Z1(R3-F1 · R1-03 · R2-2) 답 없이 만료된 질문에 기계 배달([CYCLE]·wakeup)이 먼저 닿아도 질문을 닫지 않고
+    #    고지 사유(ask_expired)를 쓰지 않는다 — 만료 고지는 **사람**의 다음 발화에 1회 남는다.
+    fresh()
+    delivery([boot(NOW)])
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    t_exp = NOW + tt.ASK_TTL_S + 5
+    r1 = hissue("[CYCLE] 사이클 인계 — 다음 액션 확인", now=t_exp, feed_items=FEED1)
+    closed1 = events("ask_closed")
+    check("Z", "Z1a 만료 질문 + 기계 배달 → machine_origin · 질문 무소비(ask_closed 0) · 만료 고지 사유 없음",
+          r1.get("code") == "machine_origin" and not r1.get("ask_closed") and not closed1,
+          "code=%s closed=%r" % (r1.get("code"), [c.get("why") for c in closed1]))
+    r2 = hissue("그래 만들어", now=t_exp + 20, feed_items=FEED1)
+    closed2 = events("ask_closed")
+    check("Z", "Z1b 이어진 오너 '그래 만들어' → ask_expired 1회(만료로 닫힘 · 발급 0)",
+          r2.get("code") == "ask_expired" and r2.get("ask_closed") and not r2.get("token")
+          and [c.get("why") for c in closed2] == ["expired"], "code=%s" % r2.get("code"))
+
+    # Z2(R1-06) 질문이 열린 동안 master 좌석에 오는 비승인 기계 push 는 질문 1개당 감사 1줄로 묶는다(원장 무한 증가 차단)
+    #    — 승인처럼 들리는 기계 배달은 매번 남는다(P4 수용 기준 '원장에 사유').
+    fresh()
+    delivery([boot(NOW), drec("그래 만들어", NOW + 40)])
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    for i in range(30):
+        hissue("[wakeup] 주기 점검 %d" % i, now=NOW + 1 + i, feed_items=FEED1)
+    nonapp = [r for r in events("issue_refused") if r.get("code") == "machine_origin"]
+    hissue("그래 만들어", now=NOW + 41, feed_items=FEED1)
+    hissue("그래 만들어", now=NOW + 42, feed_items=FEED1)
+    allm = [r for r in events("issue_refused") if r.get("code") == "machine_origin"]
+    check("Z", "Z2 비승인 기계 push 30회 → 감사 1줄 · 승인 유사 기계 배달 2회 → 각 1줄 · 질문 유지",
+          len(nonapp) == 1 and len(allm) == 3 and tt.status(now=NOW + 43).get("code") == "awaiting_answer",
+          "비승인=%d 전체=%d" % (len(nonapp), len(allm)))
+
+    # Z3(R1-07) 같은 좌석이 방금(토큰 TTL 안) 토큰을 받았으면 뒤이은 승인 발화는 무출력(exit 3) — 발급 고지와 모순되는
+    #    'ask_not_open — 먼저 ask 로 질문을 열어라' 를 싣지 않는다. TTL 이 지나면 종전대로 알린다.
+    fresh()
+    delivery([boot(NOW)])
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    r1 = hissue("그래 만들어", now=NOW + 1, feed_items=FEED1)
+    r2 = hissue("응 만들어", now=NOW + 2, feed_items=FEED1)
+    r3 = hissue("응 만들어", now=NOW + 1 + tt.TOKEN_TTL_S + 5, feed_items=FEED1)
+    check("Z", "Z3 발급 직후 같은 좌석 승인 발화 → exit 3 무출력 · TTL 뒤에는 ask_not_open(exit 1)",
+          bool(r1.get("token")) and r2.get("exit") == tt.EXIT_NO_ASK and not r2.get("token")
+          and r3.get("code") == "ask_not_open" and r3.get("exit") == tt.EXIT_REFUSED,
+          "2차=%s/%s 3차=%s/%s" % (r2.get("code"), r2.get("exit"), r3.get("code"), r3.get("exit")))
+
+    # Z4(R1-04 · WIN-3) 다른 레인·옛 형식 표지도 until(없으면 mtime + 질문 TTL + 고지 여유)이 지나면 걷는다.
+    sd = fresh()
+    delivery([boot(NOW)])
+    mk = lambda n, body, age=0.0: (open(os.path.join(sd, n), "w").write(body),
+                                   os.utime(os.path.join(sd, n), (time.time() - age,) * 2) if age else None)
+    mk("teamtoken-open-otherlane-s9", json.dumps({"v": 1, "asks": ["a"], "until": NOW - 10}))
+    mk("teamtoken-open-otherlane2-s9", json.dumps({"v": 1, "asks": ["b"], "until": NOW + 500}))
+    mk("teamtoken-open-legacylane", "garbage", age=3600)
+    mk("teamtoken-open-freshgarbage", "garbage")
+    hissue("오늘 할 일", now=NOW, feed_items=FEED1)
+    left = sorted(n for n in os.listdir(sd) if n.startswith("teamtoken-open-"))
+    check("Z", "Z4 타 레인 표지: until 지남·판독 불가+묵음은 걷고 · until 남음·방금 쓴 것은 둔다",
+          left == ["teamtoken-open-freshgarbage", "teamtoken-open-otherlane2-s9"], repr(left))
+
+    # Z5(WIN-1 · F3) Windows(os.name nt · msys/cygwin)에서는 대화 승인 질문을 열지 않는다 — cys-dept 가 pane PATH 에 없고
+    #    부서 데몬이 base cysd Job 에 묶인다(실기 검증 전). 화면 경로 코드(platform_gui_only)로 거부 · 질문·표지 0.
+    fresh()
+    delivery([boot(NOW)])
+    saved = getattr(tt, "_is_windows", None)
+    try:
+        tt._is_windows = lambda: True
+        a = tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    finally:
+        if saved is not None:
+            tt._is_windows = saved
+    left = [n for n in os.listdir(os.environ["CYS_STATE_DIR"]) if n.startswith("teamtoken-open-")]
+    check("Z", "Z5 Windows → ask 거부 platform_gui_only(화면 경로 문구) · 질문 0 · 표지 0",
+          saved is not None and not a.get("ok") and a.get("code") == "platform_gui_only"
+          and "[만들기]" in (a.get("message") or "") and not events("ask_opened") and not left,
+          "code=%s left=%r" % (a.get("code"), left))
+    check("Z", "Z5b platform_gui_only 는 거부 코드·신설 행", "platform_gui_only" in tt.REFUSAL_CODES
+          and "platform_gui_only" in tt.NEW_ROW_CODES)
+
+    # Z6(R3-F2 · R1-01 노출면) 표지는 **좌석** 단위다 — 런처 글롭이 질문을 연 좌석에서만 발급기를 띄우게.
+    fresh()
+    delivery([boot(NOW)])
+    try:
+        p22, p24 = tt.open_marker_path(SURFACE), tt.open_marker_path(OTHER_SURFACE)
+    except TypeError as e:
+        p22 = p24 = "TypeError:%s" % e
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    check("Z", "Z6 표지 이름 = teamtoken-open-<레인>-s<좌석> · 질문 좌석(22)만 있고 24 는 없다",
+          p22.endswith("-s" + SURFACE) and p24.endswith("-s" + OTHER_SURFACE)
+          and os.path.isfile(p22) and not os.path.exists(p24), "%s | %s" % (p22, p24))
+
+    # Z7(R1-05 · R3-F4) 발급기 기반 고장(javis_bootstrap import 실패)도 비승인 발화면 무출력(exit 3) — 승인 유사면 exit 4.
+    def _break_boot(d):
+        p = os.path.join(d, "javis_bootstrap.py")
+        with open(p, encoding="utf-8") as f:
+            src = f.read()
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("raise ImportError('fatal-fix Z7')\n" + src)
+    bb = _bin_copy("brokenboot", _break_boot)
+    fresh()
+    outs = []
+    for prompt in ("[wakeup] 주기 점검", "그래 만들어"):
+        hp = hook_file(prompt=prompt)
+        r = subprocess.run([PY, "-B", os.path.join(bb, "javis_teamtoken.py"), "issue", "--payload-file", hp],
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
+        outs.append((r.returncode, r.stdout.strip()))
+    check("Z", "Z7 기반 고장 × 비승인 발화 → exit 3 무출력 · × 승인 유사 발화 → exit 4 internal_error(고지 대상)",
+          outs[0] == (3, "") and outs[1][0] == 4 and '"internal_error"' in outs[1][1], repr(outs)[:300])
+
+
 def main():
     for fn in (suite_attack, suite_life, suite_fp, suite_ask, suite_race, suite_transition,
                suite_missing, suite_failclosed, suite_status, suite_words, suite_structure, suite_cli,
-               suite_hook_only, suite_directive_gate, suite_marker, suite_directive):
+               suite_hook_only, suite_directive_gate, suite_marker, suite_directive, suite_fatal_fix):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — 스위트 예외는 FAIL 로 계수한다(조용한 누락 금지)
@@ -1444,7 +1582,8 @@ def main():
     print("\n===== 요약 =====")
     names = {"A": "공격", "L": "수명", "F": "오탐", "G": "ask", "K": "경합", "T": "상태전이",
              "M": "결측형", "C": "fail-closed", "S": "관측", "W": "문구", "X": "구조", "Y": "CLI",
-             "H": "발급자=훅", "N": "지침 판 게이트", "O": "질문 표지", "D": "디렉티브 정합"}
+             "H": "발급자=훅", "N": "지침 판 게이트", "O": "질문 표지", "D": "디렉티브 정합",
+             "Z": "치명위험 수정"}
     total_fail = 0
     for k, rows in RESULTS.items():
         ok = sum(1 for _c, o, _d in rows if o)

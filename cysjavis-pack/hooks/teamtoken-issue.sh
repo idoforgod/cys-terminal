@@ -2,9 +2,9 @@
 # teamtoken-issue.sh — 대화 승인 1회용 팀 생성 토큰의 **훅 쪽 발급 배선** (0.14.42 · 설계 §6-4·§11 R11·§13 P4)
 #
 # ★이 파일은 settings.json 에 등록하는 훅이 아니다. UserPromptSubmit 런처(`role-bootstrap.sh` ⑤-b)가
-#   **열린 질문 표지**(`<상태>/teamtoken-open-<레인>`)가 있을 때만 부른다 — "열린 질문이 없으면 공짜"라는 비용
+#   **이 좌석의 열린 질문 표지**(`<상태>/teamtoken-open-<레인>-s<좌석>` · fatal-fix R3-F2)가 있을 때만 부른다 — "열린 질문이 없으면 공짜"라는 비용
 #   게이트는 런처가 소유한다(인터프리터를 띄우기 전에 셸 글롭 하나로 거른다 · 리뷰 F3). 여기까지 왔다는 것은
-#   이 레인 어딘가에 답을 기다리는(또는 막 만료돼 고지 여유 안의) 질문(ask)이 있다는 뜻이다.
+#   이 좌석에 답을 기다리는(또는 막 만료돼 고지 여유 안의) 질문(ask)이 있다는 뜻이다(다른 레인의 같은 번호 좌석은 상위집합).
 #   ★발급기는 입력의 출처를 본다(리뷰 SEC-1·RR1-SEC-B): 넘기는 $1 은 런처가 **방금** 쓴 `<상태>/hook-input-<좌석>-<pid>.json`
 #   (이름의 좌석 = 이 좌석)이어야 한다 — 다른 파일·stdin 으로 부르면 판정 없이 not_hook_caller 다(직접 호출 = 규약 위반 ·
 #   감사 기록 · 거부 문구는 어느 조건에서 막혔는지 말하지 않는다 — 구체 사유는 원장에만).
@@ -34,20 +34,26 @@
 #        발급 좌석·그 제안 id·그 본문 sha256·TTL 120초·1회 소비에 결박돼 있어, 다른 좌석·다른 제안·
 #        바뀐 본문·재사용·만료 어느 쪽으로도 쓸 수 없다(설계 §6-5 · 검증·소비는 데몬 쪽 P5).
 #   ② 거부(rc 1)  : 사유 코드 + 오너에게 할 §10 문구 1줄 + "토큰 없음 → 만들지 마라".
-#      질문을 **닫은** 거부(사람의 답 · 만료)와 열린 질문 없는 승인 발화(ask_not_open)는 언제나 알린다.
-#      질문을 닫지 않은 거부(기계 배달 · 배달 원장 부재/손상)는 **승인처럼 들리는 발화일 때만** 알린다 —
-#      질문이 열린 동안 master 좌석에 들어오는 모든 기계 push 마다 "시스템이 보낸 메시지"를 말하게
-#      하면 그 자체가 잡음 폭주다. 거부 사실은 어느 쪽이든 원장(issue_refused)에 남는다.
-#   ③ 기반 고장(rc 4 — 모듈이 이미 '승인처럼 들리는 발화'일 때만 4 를 낸다) : 판정 불가 고지.
-#   ④ 결과 없음(시간 초과·해석 불가 출력) : 승인처럼 들리거나 그것조차 판정 불가일 때만 판정 불가 고지.
+#      질문을 **닫은** 거부(사람의 답 · 만료 — 만료는 사람 발화에서만 닫힌다)와 열린 질문 없는 승인 발화(ask_not_open)는
+#      언제나 알린다. 질문을 닫지 않은 거부(기계 배달 · 배달 원장 부재/손상 · 입력 확인 실패)는 모듈이 **승인처럼 들린다고
+#      판정한 발화일 때만** 알린다(판정 불가 = 알리지 않는다 · fatal-fix R1-01) — 질문이 열린 동안 master 좌석에 들어오는
+#      모든 기계 push 마다 "시스템이 보낸 메시지"를 말하게 하면 그 자체가 잡음 폭주다. 거부 사실은 원장(issue_refused)에 남는다.
+#   ③ 기반 고장(rc 2·4) : 모듈이 승인처럼 들린다고 판정한 발화일 때만 알린다(fatal-fix R1-05 · R3-F4).
+#   ④ 결과 없음(시간 초과·해석 불가 출력·모듈 import 불가) : 승인처럼 들리거나(모듈 판정) 모듈 없이도 승인일 수 있는
+#      모양(기계 라벨 없는 짧은 발화)일 때만 판정 불가 고지(fatal-fix R2-1). 모듈을 쓸 수 없으면 until 이 지난 표지를 여기서 걷는다.
 #   무동작(rc 3 · 열린 질문 없음 등)은 아무것도 쓰지 않는다 — 고지 파일 자체가 생기지 않는다.
 #   고지 본문에서 인용부호·역슬래시·제어문자를 걷어 낸다: 런처의 발행기는 셸 printf 라 그것들을 실을 수
 #   없다(`role-bootstrap.sh` ③ · `_static_ctx` 와 같은 문안 규율).
 set +e
 
-. "$(dirname "$0")/_lib.sh" 2>/dev/null \
-  || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
-  || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(teamtoken-issue)" >&2; exit 0; }
+# ★(fatal-fix WIN-5) 프리루드는 **읽기 가능 여부를 먼저 보고** 소스한다 — `.` 는 POSIX 특수 내장이라 대상이 없으면
+#   비대화형 sh 가 그 자리에서 종료한다(`. a || . b || {…}` 의 `||` 로도 못 막는다: /bin/sh rc 1·dash rc 2 무음 실측).
+#   런처가 이 파일을 `sh` 로 부르므로 종전 사슬은 _lib.sh 부재 시 '훅 강등' 고지 없이 조용히 죽었다(발급 0 = fail-closed 이나 무음).
+#   런처 ①-b 와 같은 규율이다(2단 해소 순서 불변 · 형제 → 레인 팩).
+_TT_LIB="$(dirname "$0")/_lib.sh"
+[ -r "$_TT_LIB" ] || _TT_LIB="${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh"
+[ -r "$_TT_LIB" ] || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(teamtoken-issue)" >&2; exit 0; }
+. "$_TT_LIB" 2>/dev/null || { echo "[cys-hook] _lib.sh 판독 실패 — 훅 강등(teamtoken-issue)" >&2; exit 0; }
 command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 
 TT_IN="${1:-}"
@@ -83,6 +89,16 @@ TT_RC=$?
 [ "$TT_RC" = "3" ] && exit 0
 
 # ── ② 고지 본문 1줄(판정 결과의 서술 — 판정을 다시 하지 않는다) ─────────────────────────────
+# ★(fatal-fix R1-01·R1-05·R3-F4·R2-1) 고지 정책 — **모듈이 승인처럼 들린다고 판정한 발화에만** 거부·기반 고장을 알린다.
+#   종전엔 판독 불가(None: 입력 파일 소실·모듈 import 실패)를 '시끄럽게'로 읽었고(rc 1) rc 2·4 는 발화와 무관하게 알렸다 —
+#   질문이 열린 동안 워커·리뷰어·부서 좌석이 받은 평범한 기계 push([wakeup]·[report_gate]·[CYCLE])에 "규약 위반 · 오너에게
+#   다시 쳐 달라 · 앱을 재시작" 같은 엉뚱한 지시가 붙었다(③ '이해 안 되는 말'의 씨앗 · 옮기면 ①). 이제:
+#     · 질문을 닫은 거부(사람의 답 · 만료)와 ask_not_open(모듈이 승인 유사 + 이 좌석 제안일 때만 냄) → 알린다.
+#     · 그 밖의 거부(rc 1 · 기계 유래 · 배달 원장 · 입력 확인 실패)와 rc 2·4 → approval_like() is True 일 때만.
+#     · 결과 없음(시간 초과·해석 불가 · 모듈 import 불가) → maybe_approval()(모듈 판정 또는 '승인일 수 있는 모양') 일 때만.
+#   ★모듈을 쓸 수 없으면(tt 없음 · 결과 없음) 표지를 걷는 주체가 없어진다 — 여기서 until 이 지난 표지를 걷는다(R2-1 영구 반복 차단).
+# ★(fatal-fix WIN-2) 발급기 출력은 ensure_ascii=False 인 한글 UTF-8 이다 — stdin 을 로케일 인코딩(한국어 윈도우 cp949 ·
+#   LC_ALL=ko_KR.eucKR)으로 읽으면 UnicodeDecodeError 로 발급 고지가 사라진다. 바이트로 읽어 UTF-8 로 푼다.
 CYS_TT_NOTE_PY='import json, os, re, sys, time
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -90,9 +106,14 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 rc_raw, note_p, payload_p, bindir, deadline = sys.argv[1:6]
+marker_dir = sys.argv[6] if len(sys.argv) > 6 else ""
 rc = int(rc_raw) if rc_raw.isdigit() else -1
 res = None
-for ln in reversed(sys.stdin.read().splitlines()):
+try:
+    _raw_in = sys.stdin.buffer.read().decode("utf-8", "replace")
+except Exception:
+    _raw_in = ""
+for ln in reversed(_raw_in.splitlines()):
     ln = ln.strip()
     if ln.startswith("{"):
         try:
@@ -110,19 +131,78 @@ except BaseException:
     tt = None
 
 
-def approval_like():
-    """True/False = 승인처럼 들리는가 · None = 판정 불가(모듈·입력 판독 실패)."""
-    if tt is None:
-        return None
+def prompt_text():
     try:
         with open(payload_p, "rb") as f:
             obj = json.loads(f.read().decode("utf-8", "replace"))
         p = obj.get("prompt") if isinstance(obj, dict) else None
-        if not isinstance(p, str):
-            return None
+        return p if isinstance(p, str) else None
+    except BaseException:
+        return None
+
+
+def approval_like():
+    """True/False = 승인처럼 들리는가(모듈 판정) · None = 판정 불가(모듈·입력 판독 실패)."""
+    if tt is None:
+        return None
+    p = prompt_text()
+    if p is None:
+        return None
+    try:
         return tt.approval_verdict(p)[0] == "approve"
     except BaseException:
         return None
+
+
+def maybe_approval():
+    """판정 불가 고지용 — 모듈이 판정하면 그 답 · 못 하면 승인일 수 있는 모양(기계 라벨 [..] 로 시작하지 않는 짧은 발화).
+    승인 화이트리스트 원소는 어느 것도 [ 로 시작하지 않고 길이 상한이 짧다 — 사본이 아니라 그 필요조건이다."""
+    al = approval_like()
+    if al is not None:
+        return al
+    p = prompt_text()
+    if p is None:
+        return False
+    s = p.strip()
+    return bool(s) and not s.startswith("[") and len(s) <= 200
+
+
+def sweep_markers():
+    """모듈 없이 until 이 지난 열린 질문 표지를 걷는다(판독 불가면 mtime + 질문 TTL + 고지 여유)."""
+    if not marker_dir:
+        return
+    grace = 600.0
+    if tt is not None:
+        try:
+            grace = float(tt.ASK_TTL_S) + float(tt.ASK_NOTICE_GRACE_S)
+        except Exception:
+            grace = 600.0
+    now = time.time()
+    try:
+        names = os.listdir(marker_dir)
+    except OSError:
+        return
+    for n in names:
+        if not n.startswith("teamtoken-open-"):
+            continue
+        p = os.path.join(marker_dir, n)
+        until = None
+        try:
+            with open(p, "rb") as f:
+                d = json.loads(f.read(4096).decode("utf-8"))
+            u = d.get("until") if isinstance(d, dict) else None
+            if isinstance(u, (int, float)) and not isinstance(u, bool):
+                until = float(u)
+        except Exception:
+            until = None
+        try:
+            if until is not None:
+                if until < now:
+                    os.remove(p)
+            elif os.path.getmtime(p) + grace < now:
+                os.remove(p)
+        except OSError:
+            pass
 
 
 def clean(s, cap=400):
@@ -139,6 +219,8 @@ def hhmmss(ts):
         return "?"
 
 
+if tt is None or res is None or rc not in (0, 1):
+    sweep_markers()
 note = ""
 kind = "refused"
 code = (res or {}).get("code") or ""
@@ -148,38 +230,52 @@ if rc == 0 and res and res.get("ok") and code == "token_issued" and res.get("tok
     ttl = int(getattr(tt, "TOKEN_TTL_S", 120)) if tt is not None else 120
     note = ("[팀 만들기 대화 승인 - 1회용 생성 토큰 발급] 오너가 이 좌석에서 직접 친 승인으로 확인됐다"
             "(배달 원장 대조: 기계 배달 아님). token=%s · 제안 %s · 유효 %d초(만료 %s) · 1회용. "
-            "다음: %s — 이후 순서는 MASTER_DIRECTIVE §4-A-2(생성 → 부트 티켓 → 편성·각성 → 생성 성공 "
-            "뒤에만 feed reply allow). 이 토큰은 이 좌석·이 제안·지금 본문에만 한 번 유효하다(다른 제안·"
+            "다음: %s — 이후 순서는 MASTER_DIRECTIVE §4-A-2(생성 → 부트 티켓 확인 → 생성 성공 뒤 feed reply allow "
+            "→ 첫 과제·오너 1줄 보고로 턴 종료). 편성·각성은 비동기라 이 턴에서 기다리지 않는다(sleep·반복 조회 금지). "
+            "이 토큰은 이 좌석·이 제안·지금 본문에만 한 번 유효하다(다른 제안·"
             "다른 좌석·본문 변경·재사용·만료는 거부된다). 토큰 문자열은 명령 인자로만 쓰고 오너 보고문·"
             "다른 좌석 전달문에 싣지 마라."
             % (tok, res.get("proposal_id") or "?", ttl, hhmmss(res.get("expires_at")),
                res.get("next") or ("cys-dept create --team-token %s" % tok)))
 elif res and rc in (1, 2, 4):
     closed = bool(res.get("ask_closed"))
-    loud = closed or code == "ask_not_open" or rc != 1
-    if not loud:
-        al = approval_like()
-        loud = al is not False
+    if closed or code == "ask_not_open":
+        loud = True
+    else:
+        loud = approval_like() is True
     if loud:
-        if closed:
+        if closed and code == "ask_expired":
+            state = "질문(ask)은 만료로 닫혔다 — 다시 승인받으려면 ask 부터 다시 연다"
+        elif closed:
             state = "질문(ask)은 이 답으로 닫혔다 — 다시 승인받으려면 ask 부터 다시 연다"
         elif code == "ask_not_open":
             state = ("열린 질문(ask)이 없다 — 먼저 javis_teamtoken.py ask --proposal %s 로 질문을 연 뒤 "
                      "다시 여쭤라" % (res.get("proposal_id") or "<제안 id>"))
+        elif code == "machine_origin":
+            state = "질문(ask)은 열린 채 남아 있다 — 이 발화는 기계 배달로 판정됐다(오너 답으로 세지 않았다)"
+        elif code == "not_hook_caller":
+            state = "질문(ask)은 열린 채 남아 있다 — 이 프롬프트의 훅 입력을 확인하지 못해 판정하지 않았다"
         elif rc == 1:
             state = "질문(ask)은 열린 채 남아 있다(이 발화는 오너 답으로 세지 않았다)"
         else:
             state = "발급기 기반 고장(fail-closed)"
-        note = ("[팀 만들기 대화 승인 - 토큰 미발급 · %s] %s. 오너에게 1줄로: 「%s」 토큰이 없으므로 "
+        owner = res.get("message") or ""
+        if code == "machine_origin":
+            say = ("오너가 방금 직접 친 말일 때만 오너에게 1줄로: 「%s」 — 오너가 치지 않았다면(에이전트·시스템 push) "
+                   "오너에게 아무 말도 하지 말고 질문을 연 채 기다려라." % owner)
+        else:
+            say = "오너에게 1줄로: 「%s」" % owner
+        why = ("훅 입력 확인 실패(경합·시계 — 구체 사유는 원장 issue_refused)" if code == "not_hook_caller"
+               else clean(res.get("detail"), 160))
+        note = ("[팀 만들기 대화 승인 - 토큰 미발급 · %s] %s. %s 토큰이 없으므로 "
                 "cys-dept create 를 부르지 마라(우회 금지). 근거: %s · 상태 확인: javis_teamtoken.py status"
-                % (code or "?", state, res.get("message") or "", clean(res.get("detail"), 160)))
+                % (code or "?", state, say, why))
     else:
-        sys.stderr.write("[cys-hook] teamtoken-issue: 거부(%s) — 승인처럼 들리지 않는 발화라 고지 생략"
-                         "(원장 issue_refused 에 기록됨)\n" % code)
+        sys.stderr.write("[cys-hook] teamtoken-issue: 거부(%s · rc=%s) — 승인처럼 들리지 않는(또는 판정 불가) 발화라 "
+                         "고지 생략(원장 issue_refused 에 기록됨)\n" % (code, rc_raw))
 else:
     kind = "unjudged"
-    al = approval_like()
-    if al is not False:
+    if maybe_approval():
         why = ("데드라인 %s초 안에 끝나지 않았다" % deadline) if rc == 124 else \
               ("판독 가능한 결과 없이 끝났다(rc=%s)" % rc_raw)
         tail = ""
@@ -191,10 +287,17 @@ else:
         note = ("[팀 만들기 대화 승인 - 판정 불가] 발급기(javis_teamtoken.py issue)가 %s. 이 발화에 토큰이 "
                 "발급됐는지 확정할 수 없다 — javis_teamtoken.py status 로 확인하고 token_ready 가 아니면 "
                 "만들지 마라.%s" % (why, tail))
+    else:
+        sys.stderr.write("[cys-hook] teamtoken-issue: 판정 불가(rc=%s) — 승인일 수 없는 발화라 고지 생략(발급 0)\n"
+                         % rc_raw)
 if note:
     with open(note_p, "w", encoding="utf-8", newline="\n") as f:
         f.write(kind + "\n" + clean(note, 1200) + "\n")'
-printf '%s' "$TT_OUT" | cys_timeout_run "$CYS_TT_NOTE_TIMEOUT_S" "$CYS_PY" -c "$CYS_TT_NOTE_PY" \
-  "$TT_RC" "$(cys_native_path "$TT_NOTE")" "$TT_IN_N" "$(cys_native_path "${TT_MOD%/*}")" "$CYS_TT_ISSUE_TIMEOUT_S"
+# ★(fatal-fix WIN-2) `-X utf8`: 비-UTF-8 로케일(LC_ALL=ko_KR.eucKR 등)에서 파이썬은 `-c` 프로그램 **텍스트 자체**를 로케일
+#   인코딩으로 푼다 — 한글이 든 이 프로그램이 SyntaxError 로 죽어 발급 고지가 통째로 사라졌다(실측). UTF-8 모드는 argv·stdin 을
+#   UTF-8 로 푼다(파이썬 ≥3.7 · 번들 3.12 포함).
+printf '%s' "$TT_OUT" | cys_timeout_run "$CYS_TT_NOTE_TIMEOUT_S" "$CYS_PY" -X utf8 -c "$CYS_TT_NOTE_PY" \
+  "$TT_RC" "$(cys_native_path "$TT_NOTE")" "$TT_IN_N" "$(cys_native_path "${TT_MOD%/*}")" "$CYS_TT_ISSUE_TIMEOUT_S" \
+  "$(cys_native_path "${TT_IN%/*}")"
 echo "[cys-hook] teamtoken-issue: 발급 판정 rc=$TT_RC(0=발급 1=거부 4=기반 고장 124=시간 초과)" >&2
 exit 0

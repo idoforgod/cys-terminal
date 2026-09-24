@@ -298,7 +298,8 @@ class Lab(object):
         env = self.env(surface=surface, STUB_NEWCLI="1" if newcli else "0", STUB_RC=stub_rc, **extra)
         t0 = time.time()
         r = subprocess.run([shell, os.path.join(self.hooks, "role-bootstrap.sh")], input=payload,
-                           capture_output=True, text=True, encoding="utf-8", env=env, timeout=timeout)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
+                           timeout=timeout)
         r.elapsed = time.time() - t0
         r.lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
         r.body_runs = rd(self.mark).count("BODY-RAN")
@@ -474,8 +475,9 @@ def suite_cost():
     lab3.ask()
     snap3 = lab3.ledger_bytes()
     r3 = lab3.hook(APPROVE, surface=OTHER_SURFACE, stub_rc=0)
-    check("C", "C-3 열린 질문 표지 + 이 좌석엔 질문 없음 → 발급기 1회 · 무출력 · 원장 무변경",
-          r3.returncode == 0 and len(r3.tt_calls) == 1 and not r3.lines and lab3.ledger_bytes() == snap3,
+    # ★(fatal-fix R3-F2) 표지는 좌석 단위 — 다른 좌석의 질문 표지는 이 좌석의 발급기를 띄우지 않는다(종전: 1회).
+    check("C", "C-3 다른 좌석(22)의 열린 질문 표지 + 이 좌석(24)엔 질문 없음 → 발급기 0회 · 무출력 · 원장 무변경",
+          r3.returncode == 0 and not r3.tt_calls and not r3.lines and lab3.ledger_bytes() == snap3,
           "tt=%r lines=%r" % (r3.tt_calls, r3.lines))
     r3b = lab3.hook("오늘 할 일 정리해줘", stub_rc=0)
     check("C", "C-4 질문이 열린 좌석의 평문 답도 판정은 1회(발급기 1회)", len(r3b.tt_calls) == 1, r3b.pycalls)
@@ -717,9 +719,186 @@ def suite_structure():
             check("S", "S-9 %s -n %s" % (shbin, os.path.basename(p)), rr.returncode == 0, rr.stderr[-200:])
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Z — 치명위험 수정 핀(0.14.42 fatal-fix · 오너 특별 주의 ①~④) — 각 핀은 수정 전 FAIL · 수정 후 PASS 로 확인했다.
+# ══════════════════════════════════════════════════════════════════════════════
+def _break_bootstrap(binp):
+    p = os.path.join(binp, "javis_bootstrap.py")
+    w(p, "raise ImportError('fatal-fix ZH-3')\n" + rd(p))
+
+
+def _race_input(binp):
+    """런처 GC 가 동시 진행 중인 다른 좌석의 입력을 지운 상황의 모사 — 발급기가 판정 직전에 제 입력 파일을 잃는다."""
+    p = os.path.join(binp, "javis_teamtoken.py")
+    patch = ("\n_zh_orig = issue_from_hook_file\n"
+             "def issue_from_hook_file(path, now=None, feed_items=None):\n"
+             "    try:\n        os.remove(path)\n    except OSError:\n        pass\n"
+             "    return _zh_orig(path, now=now, feed_items=feed_items)\n")
+    src = rd(p)
+    w(p, src.replace('\nif __name__ == "__main__":', patch + '\nif __name__ == "__main__":'))
+
+
+def suite_fatal_fix():
+    # ZH-1(R1-02 · R1-01 ⓑ) 런처 GC 는 **살아 있는 런처 pid** 의 입력 파일을 지우지 않는다(동시 훅 20개 초과 경합) —
+    #   죽은 pid 의 파일은 종전대로 최근 20개 밖이면 지우고, 살아 있어도 200개를 넘으면 지운다(유계).
+    lab = Lab("zh1")
+    lab.seed()
+    sleeper = subprocess.Popen(["sleep", "120"])
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    try:
+        old = time.time() - 30
+        for i in range(30):
+            for seat, pid in ((100 + i, sleeper.pid), (300 + i, dead.pid)):
+                p = os.path.join(lab.state, "hook-input-%d-%d.json" % (seat, pid))
+                w(p, "{}")
+                os.utime(p, (old + i * 0.01,) * 2)
+        lab.hook("오늘 할 일 정리해줘", stub_rc=0)
+        names = [n for n in os.listdir(lab.state) if n.startswith("hook-input-")]
+        live = [n for n in names if n.endswith("-%d.json" % sleeper.pid)]
+        gone = [n for n in names if n.endswith("-%d.json" % dead.pid)]
+        check("Z", "ZH-1a GC: 살아 있는 pid 입력 30개 전부 보존 · 죽은 pid 입력은 최근 20개 밖이면 삭제",
+              len(live) == 30 and len(gone) <= 20, "live=%d dead=%d" % (len(live), len(gone)))
+        for i in range(30, 230):
+            p = os.path.join(lab.state, "hook-input-%d-%d.json" % (100 + i, sleeper.pid))
+            w(p, "{}")
+            os.utime(p, (old + i * 0.01,) * 2)
+        lab.hook("오늘 할 일 정리해줘", stub_rc=0)
+        n2 = len([n for n in os.listdir(lab.state) if n.startswith("hook-input-")])
+        check("Z", "ZH-1b GC 상한: 살아 있는 pid 라도 200개를 넘으면 지운다(무한 누적 0)", n2 <= 200, n2)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+    # ZH-2(R1-01 ⓐ) 입력을 잃은 거부(not_hook_caller · 승인 유사 판정 불가)는 기계 push 에 고지를 붙이지 않는다 —
+    #   원장의 not_hook_caller 감사는 남되, 워커·master 에게 '규약 위반·오너에게 다시 쳐 달라'를 말하지 않는다.
+    lab2 = Lab("zh2", bin_mut=_race_input)
+    lab2.seed()
+    lab2.ask()
+    r2 = lab2.hook("[wakeup] 주기 점검", stub_rc=6)
+    check("Z", "ZH-2 입력 소실 거부(not_hook_caller) × 기계 push → 고지 0 · 발급 0",
+          not r2.lines and not lab2.events("token_issued")
+          and any(x.get("code") == "not_hook_caller" for x in lab2.events("issue_refused")),
+          "lines=%r" % r2.lines)
+
+    # ZH-3(R1-05 · R3-F4) 발급기 기반 고장(javis_bootstrap import 실패) × 비승인 프롬프트 → 고지 0 · 승인 유사면 고지 1.
+    lab3 = Lab("zh3", bin_mut=_break_bootstrap)
+    lab3.seed()
+    lab3.ask()                                   # 온전한 공유 사본으로 질문을 연다(표지 있음)
+    r3a = lab3.hook("[report_gate] 보고 기한 도래", stub_rc=6)
+    r3b = lab3.hook(APPROVE, stub_rc=0)
+    check("Z", "ZH-3 기반 고장 × 비승인 → 고지 0 · × 승인 유사 → 고지 1(조용히 접히지 않음)",
+          not r3a.lines and len(r3b.lines) == 1 and not lab3.events("token_issued"),
+          "비승인=%r 승인=%r" % (r3a.lines, [ln[:120] for ln in r3b.lines]))
+
+    # ZH-4(R2-1) 발급기 모듈 import 불가 × 비승인 기계 프롬프트 → 고지 0 · until 지난 표지는 모듈 없이도 걷는다.
+    lab4 = Lab("zh4", bin_mut=_break_module)
+    lab4.seed()
+    w(lab4.paths()["ledger"], "")
+    w(lab4.paths()["marker"], json.dumps({"v": 1, "asks": ["x"], "until": time.time() - 5}) + "\n")
+    r4 = lab4.hook("[CYCLE] 사이클 인계", stub_rc=6)
+    check("Z", "ZH-4 모듈 손상 × [CYCLE] → 고지 0 · until 지난 표지 제거(영구 반복 차단)",
+          not r4.lines and not os.path.exists(lab4.paths()["marker"]), "lines=%r marker=%s"
+          % (r4.lines, os.path.exists(lab4.paths()["marker"])))
+
+    # ZH-5(R3-F2 · WIN-3) 표지는 질문을 연 좌석 것만 본다 — 다른 좌석(워커·리뷰어 등)의 프롬프트는 발급기 0회.
+    lab5 = Lab("zh5")
+    lab5.seed()
+    lab5.ask()
+    r5 = lab5.hook("[wakeup] 주기 점검", surface=OTHER_SURFACE, stub_rc=6)
+    check("Z", "ZH-5 질문 좌석(22) 표지 × 다른 좌석(24) 프롬프트 → 인터프리터 0회", not r5.pycalls, r5.pycalls)
+
+    # ZH-6(R3-F7) 롤백 축(CYS_BOOT_GATES=0)에서는 ⑤-b 를 건너뛴다(부트 예산 30s 초과 방지 · 기능 끄기 수단).
+    lab6 = Lab("zh6")
+    lab6.seed()
+    lab6.ask()
+    r6 = lab6.hook(APPROVE, stub_rc=0, CYS_BOOT_GATES="0")
+    check("Z", "ZH-6 CYS_BOOT_GATES=0 → 발급기 0회 · 발급 0", not r6.tt_calls and not lab6.events("token_issued"),
+          r6.pycalls)
+
+    # ZH-7(WIN-2) 비-UTF-8 로케일(한국어 cp949·EUC-KR 상당 · PYTHONUTF8 없음)에서도 발급 고지가 사라지지 않는다 — 고지 스크립트는
+    #   `-X utf8` 로 뜬다(파이썬은 `-c` 프로그램 텍스트·stdin 을 로케일로 푼다 → 한글 프로그램 SyntaxError 로 고지 소실 실측).
+    #   ★발급기(teamtoken-issue.sh)를 **직접** 부른다: 런처(role-bootstrap.sh)는 bash 가 EUC-KR 로케일에서 한글 주석을 파싱하지
+    #   못해 이미 v0.14.41 부터 그 로케일에서 죽는다(기존 위험 · 보고서 기록) — 이 핀은 고지 스크립트 층만 잰다.
+    loc = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split() \
+        if shutil.which("locale") else []
+    #   ★셸은 dash(바이트 그대로)로 부른다 — bash 는 EUC-KR 로케일에서 한글 인자를 **셸 함수**(`cys_timeout_run` 등)로 넘길 때
+    #   첫 비정상 멀티바이트에서 잘라 버린다(실측: 8445B → 1156B · dash 는 온전) — 그 bash 결함은 이 수정 범위 밖 기존 위험이다.
+    eu = next((x for x in loc if x.lower() in ("ko_kr.euckr", "ko_kr.euc-kr")), None)
+    if eu is None or shutil.which("dash") is None:
+        print("SKIP ZH-7 EUC-KR 로케일 또는 dash 부재")
+    else:
+        lab7 = Lab("zh7")
+        lab7.seed()
+        lab7.ask()
+        inp7 = os.path.join(lab7.state, "hook-input-%s-%d.json" % (SURFACE, 42424))
+        w(inp7, json.dumps({"session_id": "sess-zh7", "transcript_path": "/tmp/t.jsonl", "cwd": lab7.d,
+                            "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+                            "prompt": APPROVE}, ensure_ascii=False))
+        note7 = os.path.join(lab7.d, "zh7-note.txt")
+        # CYS_PY = 실 인터프리터(운영과 같다) — 검체의 계수 래퍼(pylog)는 /bin/sh(맥=bash) 스크립트라 그 "$@" 가 같은 bash 결함을 탄다.
+        env7 = lab7.env(LC_ALL=eu, LANG=eu, PYTHONUTF8=None, PYTHONIOENCODING=None, CYS_PY=PY)
+        r7 = subprocess.run(["dash", os.path.join(lab7.hooks, "teamtoken-issue.sh"), inp7, note7],
+                            capture_output=True, env=env7, timeout=60)
+        iss7 = lab7.events("token_issued")
+        body7 = rd(note7)
+        check("Z", "ZH-7 LC_ALL=%s(PYTHONUTF8 없음) → 발급 1 · 발급 고지 파일(issued + 토큰 동봉)" % eu,
+              len(iss7) == 1 and body7.startswith("issued\n")
+              and ("--team-token %s" % iss7[0]["token"]) in body7,
+              "issued=%d note=%r err=%r" % (len(iss7), body7[:80], r7.stderr.decode("utf-8", "replace")[-240:]))
+
+    # ZH-8(WIN-5) 프리루드 부재 → 발급기는 sh 에서도 '훅 강등' 1줄을 남기고 exit 0(무음 사망 금지).
+    d8 = os.path.join(ROOT, "zh8", "hooks")
+    os.makedirs(d8, exist_ok=True)
+    shutil.copy(ISSUER, os.path.join(d8, "teamtoken-issue.sh"))
+    inp = os.path.join(ROOT, "zh8", "in.json")
+    w(inp, "{}")
+    env8 = {"PATH": os.environ.get("PATH", ""), "HOME": os.path.join(ROOT, "zh8"),
+            "CYS_PACK_DIR": os.path.join(ROOT, "zh8", "nowhere")}
+    r8 = subprocess.run(["sh", os.path.join(d8, "teamtoken-issue.sh"), inp, os.path.join(ROOT, "zh8", "note")],
+                        capture_output=True, text=True, env=env8, timeout=30)
+    check("Z", "ZH-8 _lib.sh 부재 × sh → exit 0 · stderr '_lib.sh 소실'", r8.returncode == 0
+          and "_lib.sh 소실" in r8.stderr, "rc=%s err=%r" % (r8.returncode, r8.stderr[-200:]))
+
+    # ZH-9(R3-F5) 승인처럼 들리는 기계 배달의 고지는 '오너가 직접 친 말일 때만' 오너 문구를 전하라고 한정한다.
+    lab9 = Lab("zh9")
+    lab9.seed()
+    lab9.ask()
+    lab9.deliver(APPROVE)
+    r9 = lab9.hook(APPROVE, stub_rc=6)
+    ctx9 = ctx_of(r9.lines[0]) if r9.lines else ""
+    check("Z", "ZH-9 기계 배달 '그래 만들어' 고지 = §10 문구 + '오너가 치지 않았다면 오너에게 전하지 마라' 한정",
+          MSG_MACHINE in (ctx9 or "") and "오너가 치지 않았다면" in (ctx9 or ""), (ctx9 or "")[:300])
+
+    # ZH-10(R1-03 · R3-F1 훅 경로) 만료 질문 + 기계 push → 고지 0 · 질문 무소비, 이어진 오너 승인 → 만료 고지 1회
+    #    ('만료로 닫혔다' — 기계 push 를 오너 답으로 귀속하지 않는다), 그 뒤 기계 push → 무출력.
+    lab10 = Lab("zh10")
+    lab10.seed()
+    lab10.ask(now=time.time() - 400)
+    wake = "[wakeup] 다음 액션 확인"
+    lab10.deliver(wake)
+    r10a = lab10.hook(wake, stub_rc=6)
+    r10b = lab10.hook(APPROVE, stub_rc=0)
+    r10c = lab10.hook(wake, stub_rc=6)
+    ctx10 = ctx_of(r10b.lines[0]) if r10b.lines else ""
+    check("Z", "ZH-10 만료+기계 push 고지 0 → 오너 승인에 ask_expired 1회('만료로 닫혔다') → 이후 무출력",
+          not r10a.lines and "ask_expired" in (ctx10 or "") and MSG_ASK_EXPIRED in (ctx10 or "")
+          and "만료로 닫혔다" in (ctx10 or "") and not r10c.lines,
+          "a=%r b=%r c=%r" % (r10a.lines, (ctx10 or "")[:160], r10c.lines))
+
+    # ZH-11(F1 · ROLE) 발급 고지는 CEO 에게 편성·각성을 **이 턴에서 기다리라고** 하지 않는다.
+    lab11 = Lab("zh11")
+    lab11.seed()
+    lab11.ask()
+    r11 = lab11.hook(APPROVE, stub_rc=0)
+    ctx11 = ctx_of(r11.lines[0]) if r11.lines else ""
+    check("Z", "ZH-11 발급 고지: '편성·각성 → … allow' 순서 삭제 · '이 턴에서 기다리지 않는다' 명시",
+          "편성·각성 → 생성 성공" not in (ctx11 or "") and "기다리지 않는다" in (ctx11 or ""), (ctx11 or "")[:300])
+
+
 def main():
     for fn in (suite_structure, suite_acceptance, suite_cost, suite_voice, suite_stdout, suite_failure,
-               suite_real_body):
+               suite_real_body, suite_fatal_fix):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — 스위트 예외는 FAIL 로 센다(조용한 누락 금지)
