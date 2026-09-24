@@ -205,16 +205,22 @@ def new_token(now, feed=None, utter="그래 만들어", ledger=None):
     return r.get("token"), a, r
 
 
-def hook_meta(ts, session="sess-test"):
-    """훅 목격 증거(테스트 전용 합성 — 판정 스위트의 기본 경로). 제품에서는 `javis_teamtoken._hook_witness` 가
-    런처가 **방금** 쓴 `<상태>/hook-input-<N>.json` 에서만 만든다 — 그 출처 확인은 H 스위트가 CLI 로 잰다."""
-    return {"via": "hook", "session_id": session, "hook_input": "hook-input-4242.json",
-            "hook_input_mtime": float(ts)}
-
-
-def hissue(prompt, now=None, **kw):
-    """UserPromptSubmit 훅이 부르는 발급(목격 증거 동봉). 증거 없는 직접 호출은 H 스위트가 따로 잰다."""
-    return tt.issue(prompt, now=now, meta=hook_meta(time.time() if now is None else now), **kw)
+def hissue(prompt, now=None, surface=None, feed_items=None, session="sess-test"):
+    """UserPromptSubmit 훅이 부르는 발급 — ★(리뷰 RR1-SEC-A) 판정 스위트의 기본 경로도 **실제 훅 입력 파일**을 거친다
+    (종전: 합성 증거 dict 를 `tt.issue(meta=…)` 에 넣었다 — 바로 그 입구가 위조 통로였는데 스위트가 그것을 기본으로
+    써서 어느 핀도 잡지 못했다). 런처가 쓰는 자리·이름에 방금 쓴 파일 → 공개 입구 `issue_from_hook_file`.
+    `now` 는 판정 시각(모듈 API 시험 이음매)이고 파일 나이는 모듈이 실시계로 잰다. `surface` 는 그 좌석의 env 로 부른다."""
+    saved = os.environ.get("CYS_SURFACE_ID")
+    if surface is not None:
+        os.environ["CYS_SURFACE_ID"] = str(surface)
+    try:
+        p = hook_file(prompt=prompt, payload=dict(HOOK_PAYLOAD, session_id=session))
+        return tt.issue_from_hook_file(p, now=now, feed_items=feed_items)
+    finally:
+        if saved is None:
+            os.environ.pop("CYS_SURFACE_ID", None)
+        else:
+            os.environ["CYS_SURFACE_ID"] = saved
 
 
 def forged_token():
@@ -469,9 +475,12 @@ if op == "consume":
     r = tt.consume(os.environ["TT_TOKEN"], os.environ["TT_PROPOSAL"], os.environ["TT_SURFACE"],
                    os.environ["TT_BODY"], phase=os.environ["TT_PHASE"])
 elif op == "issue":
-    r = tt.issue(os.environ["TT_PROMPT"], feed_items=feed,
-                 meta={"via": "hook", "session_id": "sess-race", "hook_input": "hook-input-1.json",
-                       "hook_input_mtime": time.time()})
+    # 프로세스마다 런처가 쓰는 자리·이름의 훅 입력 파일 1개(RR1-SEC-A — 합성 증거 dict 입구는 없다)
+    hp = os.path.join(os.environ["CYS_STATE_DIR"], os.environ["TT_HOOK_NAME"] % os.getpid())
+    with open(hp, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"session_id": "sess-race", "hook_event_name": "UserPromptSubmit",
+                            "prompt": os.environ["TT_PROMPT"]}, ensure_ascii=False))
+    r = tt.issue_from_hook_file(hp, feed_items=feed)
 else:
     r = {"ok": False, "code": "bad_op"}
 print(json.dumps({"ok": bool(r.get("ok")), "code": r.get("code"), "token": r.get("token")}))
@@ -509,7 +518,7 @@ def suite_race():
     fresh()
     delivery([boot(time.time())])
     tt.open_ask(PROPOSAL, feed_items=FEED1)
-    outs = race("issue", 6, {"TT_PROMPT": "그래 만들어"})
+    outs = race("issue", 6, {"TT_PROMPT": "그래 만들어", "TT_HOOK_NAME": "hook-input-%d.json"})
     toks = [o for o in outs if o.get("token")]
     check("K", "K2 동시 issue 6 중 토큰 1(질문 1회 소비 · 원장 token_issued 1줄)",
           len(toks) == 1 and len(events("token_issued")) == 1,
@@ -776,12 +785,16 @@ def suite_failclosed():
     finally:
         tt.LEDGER_MAX_BYTES = saved
     check("C", "C9 원장 상한 초과 → ledger_corrupt", r.get("code") == "ledger_corrupt", r.get("code"))
-    # 훅 페이로드 결함
-    r = tt.issue_from_payload("{깨진 json", now=NOW, feed_items=FEED1)
-    r2 = tt.issue_from_payload(json.dumps({"hook_event_name": "Stop", "prompt": "그래 만들어"}),
-                               now=NOW, feed_items=FEED1)
+    # 훅 페이로드 결함 — 제자리·제 이름의 실제 훅 입력 파일(출처 확인은 통과)인데 내용이 훅 형식이 아니다
+    fresh()
+    delivery([boot(NOW)])
+    tt.open_ask(PROPOSAL, now=NOW, feed_items=FEED1)
+    r = tt.issue_from_hook_file(hook_file(raw="{깨진 json"), now=NOW, feed_items=FEED1)
+    r2 = tt.issue_from_hook_file(hook_file(payload={"hook_event_name": "Stop", "session_id": "s",
+                                                    "prompt": "그래 만들어"}), now=NOW, feed_items=FEED1)
     check("C", "C10 훅 페이로드 판독 불가·다른 사건 → 거부",
-          r.get("code") == "hook_payload_invalid" and r2.get("code") == "hook_payload_invalid",
+          r.get("code") == "hook_payload_invalid" and r2.get("code") == "hook_payload_invalid"
+          and not events("token_issued"),
           "%s/%s" % (r.get("code"), r2.get("code")))
 
 
@@ -1117,6 +1130,25 @@ def suite_hook_only():
           not r.get("token") and r.get("code") == "not_hook_caller" and not r2.get("token")
           and not r3.get("token") and r3.get("code") == "not_hook_caller" and still_open(),
           "%s/%s/%s" % (r.get("code"), r2.get("code"), r3.get("code")))
+    # H8b(리뷰 RR1-SEC-A) 호출자가 **증거 dict 를 내밀면** — 종전 `issue(meta={via:hook,…})` 는 모양만 봐서 파일도 훅도
+    #   오너 키입력도 없이 토큰을 냈고(원장엔 via=hook 로 거짓 기록), 데몬 consume 이 그 토큰을 받았다. 공개 API 는
+    #   호출자가 내민 증거를 믿지 않는다 — 실재하는 훅 입력 파일 이름을 대도(모양 완비) 마찬가지다.
+    real_ask()
+    n0 = len(events("issue_refused"))
+    real = hook_file()                                   # 상태 폴더에 실재하는 형식 완비 입력(이름만 빌린다)
+    forged = [
+        tt.issue("만들어", meta={"via": "hook", "session_id": "forged", "hook_input_mtime": time.time()}),
+        tt.issue("만들어", meta={"via": "hook", "session_id": "forged", "hook_input": os.path.basename(real),
+                                "hook_input_mtime": os.stat(real).st_mtime, "hook_input_age": 0.0}),
+        tt.issue_from_payload(json.dumps(HOOK_PAYLOAD, ensure_ascii=False),
+                              witness={"via": "hook", "hook_input_mtime": time.time()}),
+    ]
+    audit_new = events("issue_refused")[n0:]
+    check("H", "H8b 공개 API 에 합성 증거(meta·witness dict) → not_hook_caller · 토큰 0 · 호출마다 감사 1줄 · 질문 유지",
+          all(not f.get("token") and f.get("code") == "not_hook_caller" for f in forged)
+          and len(audit_new) == len(forged) and all(a.get("code") == "not_hook_caller" for a in audit_new)
+          and still_open() and not events("token_issued"),
+          "codes=%s 감사=%d" % ([f.get("code") for f in forged], len(audit_new)))
     # H9(리뷰 SEC-2) 목격 증거 없는 발급 레코드 — 검증·소비가 인가하지 않는다(흔적이 판정에 참여한다)
     fresh()
     tok = hashlib.md5(b"no-witness").hexdigest()

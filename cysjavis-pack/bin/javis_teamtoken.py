@@ -91,13 +91,16 @@ ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비�
 
 ## 보장 범위 (과대 주장 금지 · §12-1 · docs/THREAT-MODEL-mission-gate.md 와 같은 경계)
 닫는 것은 **평시 정상 동작 경로**다 — 에이전트의 실수·오해, 기계 push 오인, 재사용·재생·모호성·오탐.
-발급자 = 훅(리뷰 SEC-1·M2·SEC-2 · 0.14.42 수정 라운드 1): 공식 CLI `issue`·모듈 API 를 훅 밖에서 부르면
-판정 없이 거부한다(not_hook_caller · 질문 무소비 · 감사 1줄) — 입력은 런처가 방금 쓴 상태 폴더의
-`hook-input-<N>.json`(정규 파일·내 소유·60초 안·질문보다 뒤) + UserPromptSubmit 형식이어야 하고, 발급 레코드의
-목격 증거(via=hook·hook_session)가 없으면 검증·소비가 인가하지 않는다. **그래도 같은 UID 로 그 입력 파일을
-흉내 내 쓰거나 원장·배달 원장·feed 를 직접 쓰는 고의 위조는 닫지 못한다** — 발급자는 훅뿐이라는 것은 규약 R4 와
-형식 가드이고, 원장은 위조의 **감사 흔적**이다(사전 차단이 아니다). 데몬이 발급을 목격·인증하는 근본 통제는
-제품 재설계 과제다(오너 결정 대기).
+발급자 = 훅(리뷰 SEC-1·M2·SEC-2 · 0.14.42 수정 라운드 1 · RR1-SEC-A 라운드 2): **공개 발급 입구는
+`issue_from_hook_file` 하나**(공식 CLI `issue --payload-file` 이 이것을 부른다)이고, 목격 증거는 그 안에서 상태 폴더의
+실제 훅 입력 파일로만 만든다 — 런처가 방금 쓴 `hook-input-<N>.json`(정규 파일·내 소유·실시계 60초 안·질문보다 뒤) +
+UserPromptSubmit 형식. 공개 모듈 API `issue()`·`issue_from_payload()` 는 호출자가 내민 증거 dict(meta·witness)를
+**읽지 않고** 판정 없이 거부한다(not_hook_caller · 질문 무소비 · 감사 1줄 — 종전엔 dict 모양만 봐서 파일·훅·오너
+키입력 없이 via=hook 토큰이 나왔다). 발급 레코드의 목격 증거(via=hook·hook_session)가 없으면 검증·소비가 인가하지
+않는다. **남는 우회는 고의 위조뿐이다** — 비공개 함수(`_issue_witnessed` 등)를 직접 부르는 것, 같은 UID 로 훅 입력
+파일을 형식대로 흉내 내 쓰는 것, 원장·배달 원장·feed 를 직접 쓰는 것(§12-1 경계). 발급자는 훅뿐이라는 것은 규약 R4 와
+형식 가드이고, 원장은 위조의 **감사 흔적**이다(사전 차단이 아니다 — 흉내 낸 입력으로 난 발급도 via=hook 으로 남는다).
+데몬이 발급을 목격·인증하는 근본 통제는 제품 재설계 과제다(오너 결정 대기).
 """
 import argparse
 import base64
@@ -902,10 +905,13 @@ def _judge(prompt, surf, now, feed_items, ask, meta):
                       close_why="expired")
     # ★(리뷰 SEC-1) 답은 질문 **뒤**에 쳐진 것이어야 한다 — 훅 입력 파일은 그 프롬프트의 훅이 도는 순간에 쓰이므로
     #   정상 경로에서는 언제나 질문보다 뒤다. 앞이면 질문 전에 친 문장의 재생이다(질문은 소비하지 않는다).
-    wt = (meta or {}).get("hook_input_mtime")
-    if not _is_num(wt) or float(wt) < float(a["opened_at"]) - HOOK_INPUT_SKEW_S:
+    #   입력 시각 = now − (실시계로 잰 파일 나이). 운영(now 미주입)에서는 파일 mtime 그 자체다(issue_from_hook_file 이
+    #   같은 실시각을 나이와 now 양쪽에 쓴다) — 모듈 API 의 now 주입(시험 이음매)에서도 같은 시간축으로 비교된다.
+    age = (meta or {}).get("hook_input_age")
+    typed_at = now - float(age) if _is_num(age) else None
+    if typed_at is None or typed_at < float(a["opened_at"]) - HOOK_INPUT_SKEW_S:
         return refuse("not_hook_caller", "훅 입력이 질문보다 먼저 쓰였다(입력 %s · 질문 %.0f) — 질문 전 발화의 재생"
-                      % (wt, float(a["opened_at"])))
+                      % (typed_at, float(a["opened_at"])))
     m = _mission()
     deliv, lstatus, ldetail = m.read_delivery(now=now)
     if lstatus != m.LEDGER_OK:
@@ -977,26 +983,39 @@ def _no_ask(prompt, surf, feed_items):
 
 
 def _is_hook_meta(meta):
-    """훅 목격 증거 — `_hook_witness` 가 런처의 입력 파일에서만 만든다(via=hook · 세션 · 입력 파일 시각)."""
+    """훅 목격 증거의 모양 — 비공개 판정 입구의 방어 한 겹일 뿐이다(증거의 **출처**는 모양이 아니라 만든 자리다:
+    `_hook_witness` 가 상태 폴더의 실제 훅 입력 파일에서만 만든다 · 공개 입구는 호출자가 내민 dict 를 받지 않는다)."""
     return (isinstance(meta, dict) and meta.get("via") == "hook" and _is_str(meta.get("session_id"))
-            and _is_num(meta.get("hook_input_mtime")))
+            and _is_num(meta.get("hook_input_mtime")) and _is_num(meta.get("hook_input_age")))
 
 
 def issue(prompt, surface=None, now=None, feed_items=None, meta=None):
-    """UserPromptSubmit 훅 전용 발급. 결과 dict — ok 이면 token 동봉.
+    """공개 모듈 API 의 옛 발급 입구 — **판정하지 않고 거부한다**(not_hook_caller · exit 1 · 질문 무소비 · 감사 1줄).
+
+    ★(리뷰 RR1-SEC-A) 종전 이 입구는 `meta` 의 **모양**(via=hook·session_id·시각)만 봤다 — dict 리터럴 하나로 파일도
+      훅도 오너 키입력도 없이 토큰이 나왔고, 원장엔 via=hook(거짓 훅 증언)으로 남아 데몬 consume 이 그대로 받았다.
+      호출자가 내민 증거는 증거가 아니다: 목격 증거는 공개 발급 입구 `issue_from_hook_file` 이 상태 폴더의 실제 훅
+      입력 파일에서만 만들고(`_hook_witness`), 판정은 비공개 `_issue_witnessed` 가 그 증거로만 한다. 여기서는 `meta` 를
+      읽지 않는다(실재 파일 이름을 대도 같다 — 이름을 빌린 증거로 다른 문장을 판정받는 길이 생기지 않게).
+    """
+    prompt = prompt if isinstance(prompt, str) else ""
+    return _refuse_unwitnessed("모듈 API issue() 직접 호출 — 호출자가 내민 증거(meta)는 증거가 아니다",
+                               surface=surface, prompt=prompt)
+
+
+def _issue_witnessed(prompt, witness, surface=None, now=None, feed_items=None):
+    """(비공개) 훅 목격 증거를 가진 발급 판정. 결과 dict — ok 이면 token 동봉.
 
     매 프롬프트마다 불린다: 열린 질문이 없고 승인처럼 들리지도 않으면 **무기록·무출력**(exit 3).
     기반 고장(원장 손상·락)도 승인처럼 들리는 말이 아니면 조용히 접는다(발급은 어느 쪽이든 0).
-    ★(리뷰 SEC-1·M2) `meta` 에 훅 목격 증거(`_hook_witness` 산출)가 없으면 판정하지 않고 거부한다(not_hook_caller ·
-      exit 1 · 질문 무소비) — 모듈 API·CLI 를 훅 밖에서 부르는 **평시 실수 경로**를 닫는다. 같은 UID 가 증거를
-      흉내 내는 **고의** 위조는 닫지 못한다(모듈 머리말 '보장 범위').
+    `witness` 는 `issue_from_hook_file` → `_hook_witness` 산출물만 들어온다(공개 입구는 호출자 dict 를 받지 않는다).
+    이 함수를 직접 부르는 것은 **고의 위조**다 — 모듈 머리말 '보장 범위'가 닫지 못한다고 적은 경계 쪽이다.
     """
     prompt = prompt if isinstance(prompt, str) else ""
-    if not _is_hook_meta(meta):
-        return _refuse_unwitnessed("훅 목격 증거가 없는 호출은 판정하지 않는다(직접 호출은 규약 위반 · "
-                                   "원장 issue_refused 에 기록)", surface=surface, prompt=prompt)
+    if not _is_hook_meta(witness):
+        return _refuse_unwitnessed("훅 목격 증거가 없는 판정 요청(비공개 입구)", surface=surface, prompt=prompt)
     try:
-        return _issue_impl(prompt, surface, _now(now), feed_items, meta)
+        return _issue_impl(prompt, surface, _now(now), feed_items, witness)
     except (_LockFail, _Corrupt, Exception) as e:  # noqa: BLE001 — fail-closed
         code = ("lock_unavailable" if isinstance(e, _LockFail)
                 else "ledger_corrupt" if isinstance(e, _Corrupt) else "internal_error")
@@ -1035,14 +1054,15 @@ def _issue_impl(prompt, surface, now, feed_items, meta):
     return _no_ask(prompt, surf, feed_items)
 
 
-def _hook_witness(path, now=None):
+def _hook_witness(path, t_real=None):
     """(목격 증거|None, 사유) — `--payload-file` 이 **이 레인의 UserPromptSubmit 런처가 방금 쓴 입력**인가.
 
     런처(role-bootstrap.sh ⑤)는 훅 입력을 `<상태 폴더>/hook-input-<pid>.json` 에 받아 이 파일 경로를 넘긴다.
     확인: 이름 형식 · 상태 폴더(javis_bootstrap.state_dir) 직속 · 심볼릭 링크 아님 · 정규 파일 · 내 소유(posix) ·
-    크기 상한 · 나이 ≤ HOOK_INPUT_MAX_AGE_S(재생 차단). 시각은 실시간(파일 mtime 과 같은 시계)이다.
-    ★보장 경계: 같은 UID 가 이 조건을 갖춘 파일을 **일부러** 써서 부르면 통과한다 — 막는 것은 공식 CLI·모듈 API 를
-      훅 밖에서 부르는 평시 실수 경로다(설계 §12-1 경계 · 원장은 그 위조의 감사 흔적).
+    크기 상한 · 나이 ≤ HOOK_INPUT_MAX_AGE_S(재생 차단). 나이는 **실시계**(파일 mtime 과 같은 시계)로 잰다 —
+    모듈 API 의 now 주입(시험 이음매)으로 묵은·미래 파일을 '방금 쓴 입력'으로 만들 수 없다.
+    ★보장 경계: 같은 UID 가 이 조건을 갖춘 파일을 **일부러** 써서 부르면 통과한다 — 막는 것은 공식 CLI·공개 모듈
+      API 를 훅 밖에서 부르는 평시 실수 경로다(설계 §12-1 경계 · 원장은 그 위조의 감사 흔적).
     """
     if not isinstance(path, str) or not path:
         return None, "훅 입력 파일 경로가 없다(stdin·인자 직접 호출은 훅이 아니다)"
@@ -1064,16 +1084,23 @@ def _hook_witness(path, now=None):
         return None, "훅 입력 파일 소유자(uid %d)가 이 프로세스가 아니다" % st.st_uid
     if st.st_size > HOOK_INPUT_MAX_BYTES:
         return None, "훅 입력 파일이 상한 %d 바이트 초과" % HOOK_INPUT_MAX_BYTES
-    age = (time.time() if now is None else float(now)) - st.st_mtime
+    age = (time.time() if t_real is None else float(t_real)) - st.st_mtime
     if age > HOOK_INPUT_MAX_AGE_S or age < -HOOK_INPUT_SKEW_S:
         return None, "훅 입력 파일 나이 %.0fs — 런처가 방금 쓴 입력이 아니다(상한 %ds · 재생 차단)" % (
             age, HOOK_INPUT_MAX_AGE_S)
-    return {"via": "hook", "hook_input": name, "hook_input_mtime": st.st_mtime}, ""
+    return {"via": "hook", "hook_input": name, "hook_input_mtime": st.st_mtime, "hook_input_age": age}, ""
 
 
 def issue_from_hook_file(path, now=None, feed_items=None):
-    """훅 입력 파일(런처가 방금 쓴 것) → 출처 확인 → issue. 출처 불명 = not_hook_caller(판정 없음 · 질문 무소비)."""
-    witness, why = _hook_witness(path)
+    """**공개 발급 입구(유일)** — 훅 입력 파일(런처가 방금 쓴 것) → 출처 확인 → 판정. 출처 불명 = not_hook_caller
+    (판정 없음 · 질문 무소비 · 감사 1줄). 공식 CLI `issue --payload-file` 이 이것을 부른다.
+
+    `now` 는 모듈 API 의 시험 이음매다(CLI 는 시각을 주입받지 않는다 — X4): 판정 시각에만 쓰이고, 출처 확인(파일
+    나이)은 언제나 실시계다. 운영(now 미주입)에서는 같은 실시각을 나이와 판정에 함께 써서, 판정의 '입력 시각'이
+    파일 mtime 과 정확히 같다(`_judge` 의 질문-뒤 검사).
+    """
+    t_real = time.time()
+    witness, why = _hook_witness(path, t_real)
     if witness is None:
         return _refuse_unwitnessed(why)
     try:
@@ -1081,7 +1108,7 @@ def issue_from_hook_file(path, now=None, feed_items=None):
             text = f.read(HOOK_INPUT_MAX_BYTES + 1).decode("utf-8", "replace")
     except OSError as e:
         return _result(False, "hook_payload_invalid", "훅 입력 판독 실패(%s)" % e)
-    return issue_from_payload(text, now=now, feed_items=feed_items, witness=witness)
+    return _issue_from_payload(text, witness, now=t_real if now is None else now, feed_items=feed_items)
 
 
 def _refuse_unwitnessed(why, surface=None, prompt=None):
@@ -1097,9 +1124,23 @@ def _refuse_unwitnessed(why, surface=None, prompt=None):
 
 
 def issue_from_payload(payload_text, now=None, feed_items=None, witness=None):
-    """훅 입력(JSON) → issue. UserPromptSubmit 형식(hook_event_name·session_id)이 **필수**다(리뷰 SEC-1 — 종전엔
-    hook_event_name 이 없어도 통과해 `{"prompt":"그래 만들어"}` 한 줄이 발급 입력이 됐다). `witness` 가 없으면
-    issue 가 not_hook_caller 로 거부한다(목격 증거는 issue_from_hook_file 만 만든다)."""
+    """공개 모듈 API 의 옛 입구 — `issue()` 와 같다: 호출자가 내민 `witness` 를 믿지 않고 **판정 없이 거부**한다
+    (not_hook_caller · 감사 1줄 · 리뷰 RR1-SEC-A). 훅 입력의 형식 판독은 `issue_from_hook_file` 안에서만 한다."""
+    prompt = None
+    try:
+        obj = json.loads(payload_text)
+        if isinstance(obj, dict) and isinstance(obj.get("prompt"), str):
+            prompt = obj["prompt"]
+    except (TypeError, ValueError):
+        pass
+    return _refuse_unwitnessed("모듈 API issue_from_payload() 직접 호출 — 호출자가 내민 증거(witness)는 증거가 아니다",
+                               prompt=prompt)
+
+
+def _issue_from_payload(payload_text, witness, now=None, feed_items=None):
+    """(비공개) 훅 입력(JSON) → 판정. UserPromptSubmit 형식(hook_event_name·session_id)이 **필수**다(리뷰 SEC-1 — 종전엔
+    hook_event_name 이 없어도 통과해 `{"prompt":"그래 만들어"}` 한 줄이 발급 입력이 됐다). `witness` 는
+    `issue_from_hook_file` 이 방금 만든 것만 들어온다."""
     try:
         obj = json.loads(payload_text)
     except (TypeError, ValueError) as e:
@@ -1114,7 +1155,7 @@ def issue_from_payload(payload_text, now=None, feed_items=None, witness=None):
         return _result(False, "hook_payload_invalid", "훅 입력에 session_id 가 없다")
     meta = dict(witness or {})
     meta["session_id"] = sid
-    return issue(obj["prompt"], now=now, feed_items=feed_items, meta=meta)
+    return _issue_witnessed(obj["prompt"], meta, now=now, feed_items=feed_items)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
