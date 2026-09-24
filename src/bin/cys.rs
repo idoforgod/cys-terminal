@@ -368,7 +368,8 @@ enum Command {
         action: FeedAction,
     },
     /// 말로 팀 만들기(본부 대표 전용) — 오너와 정한 팀 이름·하는 일을 '팀 만들기 제안' 1건으로 올린다.
-    /// 만들기는 오너가 앱 확인 창에서만 한다(제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
+    /// 만들기는 오너 승인으로만 — 대화 승인(질문 `javis_teamtoken.py ask` → 오너가 직접 친 짧은 승인에 훅이 준 1회용 토큰)
+    /// 또는 앱 확인 창 [만들기](제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
     TeamPropose {
         /// 팀 이름(표시명 · 40자 이내 · 한글 가능)
         #[arg(long)]
@@ -5227,8 +5228,14 @@ fn run_team_propose(
         Ok(r) if cys::team_spec::team_gate_ok(&r) => {
             println!("{}", spec.id);
             println!("팀 만들기 제안 등록: '{}' ({})", spec.display, spec.id);
-            println!("오너에게 1줄로 알려라: \"제어 센터 승인 탭의 '팀 만들기 제안' 카드에서 [확인 창 열기] → [만들기]를 눌러 주세요.\"");
-            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 다시 말을 걸면 확인한다:");
+            // ★0.14.42(리뷰 F4·M1): 다음 한 걸음은 MASTER §4-A 절차 3(대화 승인 질문)이다 — 도구 출력은 디렉티브보다
+            //   먼저 읽히므로 여기서 화면 경로만 지시하면 질문이 열리지 않고 오너의 "만들어"가 ask_not_open 이 된다.
+            println!(
+                "다음(MASTER §4-A 절차 3): 이 좌석에서 대화 승인 질문을 연다 — python3 \"${{CYS_PACK_DIR:-$HOME/.cys/pack}}/bin/javis_teamtoken.py\" ask --proposal {}",
+                spec.id
+            );
+            println!("  exit 0 이면 출력 message(\"이 내용으로 만들까요? …\")를 오너에게 그대로 1줄로 말한다. exit 0 이 아니면 그 message 를 1줄로 전하고 화면 경로(제어 센터 승인 탭 '팀 만들기 제안' 카드의 [확인 창 열기] → [만들기])를 안내한다.");
+            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 승인하면 그 프롬프트의 훅 고지(1회용 토큰)로만 §4-A-2 를 집행한다. 오너가 다시 말을 걸면 확인한다:");
             println!("  만들어짐 = 팀 명부 ~/.cys/depts.json 에 team_proposal_id \"{}\" 가 있다", spec.id);
             println!("  대기·결정 = `cys feed list` 의 {} 줄 (pending=대기 · decision=deny=오너가 만들지 않기로 함)", spec.id);
             0
@@ -14902,8 +14909,9 @@ fn run_claim_role(
                         "[claim-role] 새 부서장을 세우려는 경우: 이 프로세스가 직접 GUI 로 부서를 만들 \
                          수는 없다 — 기존 대표(master)에게 말로 부탁해 \
                          `cys team-propose --name … --purpose …` 로 제안하게 하거나, 오너가 GUI \
-                         '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너의 앱 확인 창에서만 \
-                         — 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
+                         '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너 승인이 있어야 \
+                         생긴다 — 제안은 오너의 대화 승인 1회용 토큰 또는 앱 확인 창, 직접 만들기는 앱 확인 \
+                         창 · 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
                          데몬·역할 공간)를 직접 만들고 그 안에서 선언하는 경로도 남아 있다. 부서 \
                          자동 생성은 **오너가 직접 타이핑한** 마스터 선언(훅 발화 경로 · base 레인 \
                          unix)에서만 이어진다 — 직접 실행·기계 배달 선언은 폭주 봉인으로 비적용이다."
@@ -37694,6 +37702,29 @@ mod team_propose_tests {
         // 둘 다 주면 거부(어느 쪽이 원문인지 모호).
         let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose", "a", "--purpose-file", "/tmp/p.md"]);
         assert!(c.is_err(), "--purpose 와 --purpose-file 동시 지정이 통과했다");
+    }
+
+    /// ★0.14.42(리뷰 F4·M1) 제안 직후의 **도구 출력**이 MASTER §4-A 절차 3(대화 승인 질문 `ask`)을 가리킨다 — 소스 핀.
+    ///
+    /// 【왜】 규약상 도구 출력이 디렉티브보다 먼저 읽힌다. 종전 출력은 "오너에게 1줄로 알려라: … [확인 창 열기] →
+    /// [만들기]를 눌러 주세요" 로 화면 경로만 지시해, master 가 그대로 따르면 질문이 열리지 않고 오너의 "만들어"는
+    /// ask_not_open 이 됐다(대화 승인 경로 전체가 소리 없이 우회). 같은 계열의 '확인 창에서만' 문구 4곳(clap 도움말 ·
+    /// claim-role 안내 · javis_bootstrap 힌트 2)도 이제 사실이 아니다 — 제안은 대화 승인 토큰으로도 만들어진다.
+    #[test]
+    fn team_propose_output_points_to_conversation_ask_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let i = prod.find("\nfn run_team_propose(").expect("run_team_propose 가 사라졌다");
+        let body = &prod[i..i + prod[i..].find("\n}\n").expect("run_team_propose 의 끝")];
+        let ask = body.find("javis_teamtoken.py").expect("제안 직후 출력이 대화 승인 질문(javis_teamtoken.py ask)을 가리키지 않는다");
+        assert!(body[ask..].contains("ask --proposal {}"), "ask 호출형에 제안 id 가 실리지 않는다");
+        let gui = body.find("[확인 창 열기] → [만들기]").expect("화면 경로(대안) 안내가 사라졌다");
+        assert!(ask < gui, "화면 경로가 대화 승인 질문보다 먼저 지시된다 — 도구 출력이 §4-A 절차 3 을 뒤집는다");
+        assert!(!body.contains("를 눌러 주세요"), "화면 경로만 지시하는 옛 1줄 안내가 남아 있다");
+        let boot = include_str!("../../cysjavis-pack/bin/javis_bootstrap.py");
+        for (name, text) in [("cys.rs", prod), ("javis_bootstrap.py", boot)] {
+            assert!(!text.contains("확인 창에서만"), "{name}: '확인 창에서만' — 대화 승인 토큰 경로가 생긴 뒤로 사실이 아니다");
+        }
     }
 }
 
