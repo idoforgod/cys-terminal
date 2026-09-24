@@ -7150,6 +7150,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .as_ref()
                 .map(|(a, _)| a.clone())
                 .unwrap_or_else(|| "claude".into());
+            // ★0.14.42 RC2-b: agy(Antigravity) 상태줄 훅의 보고(`reporter:"agy"` — cys.rs 가 agy 페이로드에서 쿼터만
+            //   골라 싣는다). **agy 좌석(agent gemini)에서 온 것만** 받는다 — 두 신호(좌석 메타 + 보고자)가 모두 agy 일
+            //   때만 antigravity 계정에 귀속하고, 어긋나면 배지·계정을 건드리지 않고 거절한다(오귀속 대신 결측).
+            let agy_report = param_str(&params, "reporter").as_deref() == Some("agy");
+            if agy_report && agent != "gemini" {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    &format!("agy statusline report on a non-agy seat (agent {agent})"),
+                ));
+            }
+            // agy 는 상태가 바뀔 때마다 상태줄을 부른다 — 같은 값의 반복은 usage.updated 를 내지 않는다(이벤트 폭주
+            // 금지 · agy-rpc 경로의 update_agy_usage 와 같은 규칙). claude 보고는 종전 그대로 매번 발행한다.
+            let agy_unchanged = agy_report
+                && surface.observed_usage.lock().unwrap().as_ref().is_some_and(|p| {
+                    p.rate == rate && p.source == "statusline" && p.ctx_pct == ctx_pct
+                });
             *surface.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
                 agent: agent.clone(),
                 ctx_tokens,
@@ -7172,6 +7189,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     crate::state::now_epoch(),
                 );
             }
+            // agy 상태줄 = agy 쿼터의 주 경로(언어 서버 RPC 는 CSRF 필수라 막혔다 — usage.rs 머리 주석).
+            if agy_report && !rate.is_empty() {
+                crate::accounts::note_rate(
+                    daemon,
+                    "gemini",
+                    "",
+                    &rate,
+                    crate::accounts::AGY_STATUSLINE_SOURCE,
+                    crate::state::now_epoch(),
+                );
+            }
+            if agy_unchanged {
+                return Reply::Single(ok_response(&id, json!({"surface_id": sid})));
+            }
             let role = surface.role.lock().unwrap().clone();
             daemon.bus.publish(
                 "usage.updated",
@@ -7188,6 +7219,51 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 maybe_fire_context_threshold(daemon, &surface, pct, "statusline", Some(&agent));
             }
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
+        }
+
+        // ─── 0.14.42 RC4-b: cys 창 **밖** Claude 세션의 계정 전용 보고 ───
+        // 창 밖 세션(외부 터미널)의 statusline 은 surface 가 없어 usage.report 로 올 수 없다(종전: CLI 가 조용히
+        // 버렸다). 이 입구는 surface 계열을 전혀 건드리지 않고 `accounts::note_rate` 하나만 부른다 — 좌석 배지·
+        // usage.updated·context.threshold·analytics 이벤트·비용·배달 무접촉. 순서는 싼 검사 → 호출자 → 파일시스템:
+        //   ① 모양(절대·`..` 없음·.jsonl·길이 · rate 5h/7d·유한·원소 수) ② 호출자가 pane 안이면 거절(좌석은 자기
+        //   surface 의 usage.report 를 쓴다 — 소유 게이트 우회 샛길 차단) · 호출자 pid 미상도 거절(fail-closed)
+        //   ③ transcript 실재 + 알려진 프로필 dir 의 projects/ 아래 ④ 프로필당 빈도 상한 ⑤ 신원 귀속.
+        // ★한계(문서화 · 오너 승인 2026-09-23): 같은 UID 의 pane 밖 프로세스는 실재하는 transcript 경로를 대고 값을
+        //   보낼 수 있다(표시값 위조). 그래서 이 값은 **표시용**이고 계정 경보의 근거가 아니다(accounts::alert_rates).
+        //   거절도 이벤트를 내지 않는다(상태줄 빈도로 버스를 덮지 않게) — 응답 코드만.
+        "usage.report_account" => {
+            let raw_len = params.get("rate").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+            let session_file = param_str(&params, "session_file").unwrap_or_default();
+            let now = crate::state::now_epoch();
+            let rate = match crate::accounts::outside_shape(&session_file, parse_report_rate(&params), raw_len, now) {
+                Ok(r) => r,
+                Err(code) => {
+                    return Reply::Single(err_response(&id, "invalid_params", &format!("usage.report_account: {code}")))
+                }
+            };
+            let Some(pid) = caller_pid else {
+                return Reply::Single(err_response(
+                    &id,
+                    "usage_denied",
+                    "usage.report_account denied: caller pid unresolved (fail-closed)",
+                ));
+            };
+            if let Some(cs) = resolve_caller_surface(daemon, pid) {
+                return Reply::Single(err_response(
+                    &id,
+                    "usage_denied",
+                    &format!("usage.report_account denied: caller is inside surface {cs} — seats report via usage.report"),
+                ));
+            }
+            match crate::accounts::report_outside(daemon, &session_file, &rate, now) {
+                Ok(crate::accounts::OutsideOutcome::Accepted) => {
+                    Reply::Single(ok_response(&id, json!({"accepted": true})))
+                }
+                Ok(crate::accounts::OutsideOutcome::Throttled) => {
+                    Reply::Single(ok_response(&id, json!({"accepted": false, "reason": "throttled"})))
+                }
+                Err(code) => Reply::Single(err_response(&id, "invalid_params", &format!("usage.report_account: {code}"))),
+            }
         }
 
         // ─── T7 E1-4: 툴·스킬·에이전트 호출 이벤트 캡처 (PreToolUse/PostToolUse hook → events) ───
@@ -16541,6 +16617,155 @@ mod tests {
                     && e["surface_id"].as_u64() == Some(sid)
             })
             .collect()
+    }
+
+    // ───────── 0.14.42 RC2-b · RC4-b — agy 상태줄 값 · cys 창 밖 계정 전용 보고(수정 전 적색) ─────────
+
+    fn usage_report_account(daemon: &Arc<Daemon>, params: Value, caller_pid: Option<u32>) -> Value {
+        let req = Request { id: json!(1), method: "usage.report_account".into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// 창 밖이 아닌 호출자(pane 안 프로세스 = cys 창 좌석)를 음성으로 박는다 — 좌석은 자기 surface 의
+    /// usage.report 를 써야 한다(좌석 경로의 소유 게이트·배지·임계를 우회하는 샛길 차단).
+    fn bind_outside_caller(daemon: &Arc<Daemon>, pid: u32) {
+        daemon.caller_cache.lock().unwrap().insert(
+            pid,
+            crate::state::CallerCacheEntry::new(
+                None,
+                crate::state::now_epoch(),
+                None,
+                daemon.caller_gen.load(Ordering::Relaxed),
+            ),
+        );
+    }
+
+    /// 모양은 맞지만(플랫폼 절대경로·.jsonl) 실재하지 않는 transcript — 모양 검사를 넘어 다음 관문에서 걸리게.
+    fn outside_shape_ok() -> String {
+        std::env::temp_dir()
+            .join("nonexistent-cys-test-home/.claude-3/projects/-w/s.jsonl")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// RC4-b ①: pane 안 호출자는 계정 전용 입구를 쓸 수 없다 · 호출자 pid 를 모르면 거절(fail-closed).
+    /// 어느 쪽도 이벤트·계정·좌석을 건드리지 않는다.
+    #[test]
+    fn usage_report_account_refuses_pane_and_unresolved_callers() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("worker-1"));
+        let seat_pid = 994_301_u32;
+        bind_caller(&daemon, seat_pid, seat);
+        let seq0 = daemon.bus.latest_seq();
+        let params = json!({"session_file": outside_shape_ok(), "rate": [{"label": "5h", "used_pct": 33.0}]});
+        let r = usage_report_account(&daemon, params.clone(), Some(seat_pid));
+        assert_eq!(r["ok"], json!(false), "pane 호출자가 창 밖 입구를 통과했다: {r}");
+        assert_eq!(r["error"]["code"], json!("usage_denied"), "{r}");
+        let r = usage_report_account(&daemon, params, None);
+        assert_eq!(r["error"]["code"], json!("usage_denied"), "호출자 미상이 통과했다: {r}");
+        assert_eq!(daemon.bus.latest_seq(), seq0, "거절이 이벤트를 발행했다(폭주 경로 무접촉)");
+        assert!(daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().is_none());
+        assert!(crate::accounts::local_json(&daemon, crate::state::now_epoch()).as_array().unwrap().is_empty());
+    }
+
+    /// RC4-b ②: 모양이 틀린 보고(상대경로·`..`·비 jsonl·크기 초과 rate·빈 rate)는 창 밖 호출자여도 거절 —
+    /// 실재하지 않는 경로도 거절이고, 어느 경우도 좌석 배지·이벤트를 건드리지 않는다.
+    #[test]
+    fn usage_report_account_validates_before_touching_anything() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("worker-1"));
+        let pid = 994_311_u32;
+        bind_outside_caller(&daemon, pid);
+        let seq0 = daemon.bus.latest_seq();
+        let five = json!([{"label": "5h", "used_pct": 33.0}]);
+        let too_many = json!([
+            {"label": "5h", "used_pct": 1.0}, {"label": "7d", "used_pct": 1.0},
+            {"label": "5h", "used_pct": 1.0}, {"label": "7d", "used_pct": 1.0},
+            {"label": "5h", "used_pct": 1.0}
+        ]);
+        for (sf, rate) in [
+            (json!("relative/.claude-3/projects/-w/s.jsonl"), five.clone()),
+            (json!("/x/.claude-3/projects/-w/../../s.jsonl"), five.clone()),
+            (json!("/x/.claude-3/projects/-w/s.txt"), five.clone()),
+            (Value::Null, five.clone()),
+            (json!(outside_shape_ok()), json!([])),
+            (json!(outside_shape_ok()), too_many),
+            // 모양은 맞지만 실재하지 않는 파일 — 아무것도 증명하지 못한다
+            (json!(outside_shape_ok()), five.clone()),
+        ] {
+            let r = usage_report_account(&daemon, json!({"session_file": sf, "rate": rate}), Some(pid));
+            assert_eq!(r["ok"], json!(false), "기형 보고가 통과했다: sf={sf} rate={rate} → {r}");
+            assert_eq!(r["error"]["code"], json!("invalid_params"), "{r}");
+        }
+        assert_eq!(daemon.bus.latest_seq(), seq0, "창 밖 입구가 이벤트를 발행했다");
+        assert!(daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().is_none());
+        assert!(crate::accounts::local_json(&daemon, crate::state::now_epoch()).as_array().unwrap().is_empty());
+    }
+
+    fn set_agent(daemon: &Arc<Daemon>, sid: u64, agent: &str, bin: &str) {
+        *daemon.surfaces.lock().unwrap()[&sid].agent_meta.lock().unwrap() = Some((agent.into(), bin.into()));
+    }
+
+    fn usage_updated_count(daemon: &Arc<Daemon>, sid: u64) -> usize {
+        daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["name"].as_str() == Some("usage.updated") && e["surface_id"].as_u64() == Some(sid))
+            .count()
+    }
+
+    /// RC2-b ①: agy 좌석(agent gemini)의 상태줄 보고(reporter "agy")는 antigravity 계정에 귀속된다
+    /// (source "agy-statusline") · 좌석 배지에 쿼터만(ctx 없음 → 임계 무발화) · 같은 값의 반복은 usage.updated 를
+    /// 더 내지 않는다(agy 는 상태가 바뀔 때마다 상태줄을 부른다 — 이벤트 폭주 금지).
+    #[test]
+    fn usage_report_agy_statusline_attributes_antigravity_on_gemini_seats() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("agy-1"));
+        set_agent(&daemon, seat, "gemini", "agy");
+        let pid = 994_321_u32;
+        bind_caller(&daemon, pid, seat);
+        let rate = json!([{"label": "5h", "used_pct": 12.0, "resets_at": 4102444800.0}, {"label": "7d", "used_pct": 25.0}]);
+        let r = usage_report(&daemon, seat, json!({"rate": rate, "reporter": "agy"}), Some(pid));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let rows = crate::accounts::local_json(&daemon, crate::state::now_epoch());
+        let agy = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["provider"] == "antigravity")
+            .cloned()
+            .expect("agy 상태줄 값이 antigravity 계정에 귀속되지 않았다");
+        assert_eq!(agy["source"], json!("agy-statusline"));
+        assert_eq!(agy["rate"][0]["used_pct"], json!(12.0));
+        let u = daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().clone().unwrap();
+        assert_eq!((u.agent.as_str(), u.ctx_pct, u.rate.len()), ("gemini", None, 2));
+        assert_eq!(usage_updated_count(&daemon, seat), 1);
+        usage_report(&daemon, seat, json!({"rate": rate, "reporter": "agy"}), Some(pid));
+        assert_eq!(usage_updated_count(&daemon, seat), 1, "같은 값의 반복이 이벤트를 또 냈다");
+        assert!(threshold_events(&daemon, seat).is_empty());
+    }
+
+    /// RC2-b ②: agy 상태줄 보고는 agy 좌석에서만 — claude 좌석이 reporter "agy" 를 달고 오면 거절(배지·계정 무변경).
+    /// 반대로 claude 좌석의 평범한 보고(reporter 없음)는 종전 그대로다(좌석 경로 무회귀 대조).
+    #[test]
+    fn usage_report_agy_statusline_is_refused_on_non_agy_seats() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("worker-9"));
+        set_agent(&daemon, seat, "claude", "claude");
+        let pid = 994_331_u32;
+        bind_caller(&daemon, pid, seat);
+        let r = usage_report(&daemon, seat, json!({"rate": [{"label": "5h", "used_pct": 50.0}], "reporter": "agy"}), Some(pid));
+        assert_eq!(r["ok"], json!(false), "claude 좌석의 agy 보고가 통과했다: {r}");
+        assert_eq!(r["error"]["code"], json!("invalid_params"));
+        assert!(daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().is_none());
+        assert!(crate::accounts::local_json(&daemon, crate::state::now_epoch()).as_array().unwrap().is_empty());
+        let r = usage_report(&daemon, seat, json!({"ctx_pct": 10, "rate": []}), Some(pid));
+        assert_eq!(r["ok"], json!(true), "claude 좌석의 평범한 보고가 막혔다: {r}");
+        assert_eq!(usage_updated_count(&daemon, seat), 1);
     }
 
     /// ★불변식 박제 (절대지침 — 컨텍스트 60% 사이클의 결정론 트리거):

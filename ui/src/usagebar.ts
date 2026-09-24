@@ -16,6 +16,8 @@
 //     종전엔 관측 전 계정을 "관측 없음 N개" 한 줄로 접고 이름은 툴팁에만 두어, cys 창 밖에서 쓰는 Claude
 //     계정·agy 계정이 화면에서 사라졌다. 관측 전 행은 흐리게 "관측 전 · 사유", 관측 경로가 고장이면
 //     "관측 실패 · 사유"(source_error) — 값(%)은 지어내지 않는다. 라벨·🔒 가림 규칙은 관측 행과 같다.
+//   · ★(0.14.42 RC4-b · RC2-b) 값의 새 출처 둘: cys 창 밖 Claude 세션(source "statusline-outside" — 표시용·경보
+//     제외)과 agy 상태줄 훅(source "agy-statusline"). 둘 다 라이브 관측이며 툴팁 출처 줄은 사람 말로 적는다.
 //
 // ★이 모듈의 불변식(usagewiring.test.ts 가 핀으로 고정):
 //   · 최상위 부수효과 0 — 선언(export/const/function/type)만. localStorage·document·window·타이머 접근 0.
@@ -270,10 +272,19 @@ export interface UsageFetchState {
   okAtSec: number | null; // 마지막 성공 시각(epoch 초)
 }
 
-/** 집계 범위 고지 — 외부 터미널(cys 창 밖) 세션은 계정에 집계되지 않는다(statusline 보고가 cys 창 좌석에만
- *  귀속된다). 0.14.42: 기본 `claude`(~/.claude — 신원 ~/.claude.json)는 이제 cys 창 안이면 집계된다. */
+/** 집계 범위 고지. 0.14.42: 기본 `claude`(~/.claude — 신원 ~/.claude.json)도 모이고(RC3), 외부 터미널(cys 창 밖)
+ *  Claude 세션도 그 프로필의 상태줄이 cys 로 연결돼 있으면 계정 전용 입구(`usage.report_account`)로 모인다(RC4-b).
+ *  창 밖 값은 **표시용**이다 — 같은 UID 의 프로세스가 보낼 수 있어 계정 경보의 근거로 쓰지 않는다(데몬 alert_rates). */
 export const USAGE_SCOPE_NOTE =
-  "집계 범위: cys 창 안에서 돈 세션만 계정에 모입니다(기본 ~/.claude 포함) — 외부 터미널 세션은 빠집니다.";
+  "집계 범위: cys 창 안 세션과, 상태줄이 cys 로 연결된 외부 터미널(cys 창 밖) Claude 세션이 계정에 모입니다" +
+  " — 창 밖 값은 표시용(경보 제외)이고, 명명 규칙 밖 설정 폴더·창 밖 agy 세션은 집계 대상이 아닙니다.";
+
+/** 관측 출처(source) → 툴팁용 사람 말. 모르는 출처는 원문 그대로(정직). */
+function sourceLabel(src: unknown): string {
+  if (src === "statusline-outside") return "cys 창 밖 상태줄";
+  if (src === "agy-statusline") return "agy 상태줄";
+  return typeof src === "string" && src ? src : "?";
+}
 
 /** 관측 경로 고장 코드(accounts.rs source_error) → 짧은 사유·자세한 설명. 모르는 코드도 '고장'으로 정직하게. */
 function sourceErrorText(code: string): { short: string; detail: string } {
@@ -282,6 +293,13 @@ function sourceErrorText(code: string): { short: string; detail: string } {
     return {
       short: `agy 조회 거부(HTTP ${http[1]})`,
       detail: `agy 언어 서버가 쿼터 조회를 거부했습니다(HTTP ${http[1]}).`,
+    };
+  if (code === "agy_csrf_required")
+    return {
+      short: "agy 상태줄 연결 필요",
+      detail:
+        "agy(1.2 이후) 언어 서버가 쿼터 조회에 CSRF 토큰을 요구합니다. cys 는 그 토큰을 읽지 않습니다 — " +
+        "agy 설정의 상태줄(statusLine)을 cys 로 연결하면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
     };
   if (code === "agy_no_quota") return { short: "agy 응답에 쿼터 없음", detail: "agy 가 답했지만 Gemini 쿼터 항목이 없습니다." };
   if (code === "agy_unreachable") return { short: "agy 응답 없음", detail: "agy 언어 서버 포트가 응답하지 않습니다." };
@@ -301,12 +319,18 @@ export function unobservedStatus(a: AcctRow): { text: string; detail: string } {
     return { text: "관측 어댑터 없음", detail: "이 계정은 관측 어댑터 없이 선언됐습니다(~/.cys/accounts.json)." };
   const p = typeof a.provider === "string" ? a.provider : "";
   if (p === "antigravity" || p === "gemini")
-    return { text: "관측 전 · cys 창 agy 에서 조회", detail: "cys 창의 agy 좌석에서 쿼터를 읽어 오면 값이 들어옵니다." };
+    return {
+      text: "관측 전 · agy 상태줄 연결 후",
+      detail:
+        "cys 창의 agy 좌석에서 agy 상태줄(statusLine)이 cys 로 연결돼 있으면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
+    };
   if (p === "codex")
     return { text: "관측 전 · cys 창 codex 응답 후", detail: "cys 창의 codex 좌석이 응답하면 값이 들어옵니다." };
   return {
-    text: "관측 전 · cys 창에서 쓰면 표시",
-    detail: "이 계정으로 cys 창 안에서 에이전트가 응답하면 값이 들어옵니다. 외부 터미널(cys 밖) 세션은 집계되지 않습니다.",
+    text: "관측 전 · Claude 응답 후 표시",
+    detail:
+      "이 계정으로 Claude 가 응답하면 값이 들어옵니다 — cys 창 안이든 외부 터미널(cys 창 밖)이든, 그 프로필의 상태줄이 " +
+      "cys 로 연결돼 있으면 모입니다(cys 설치가 연결합니다). 명명 규칙 밖 설정 폴더(CLAUDE_CONFIG_DIR)의 세션은 모이지 않습니다.",
   };
 }
 const PROVIDER_ORDER = ["claude", "codex", "antigravity"];
@@ -332,7 +356,7 @@ function tooltipFor(
   const profs = hidePaths ? normalizeProfiles(normalizeProfiles(a.profiles).map(profileTail)) : normalizeProfiles(a.profiles);
   if (profs.length) lines.push(`설정 폴더: ${profs.join(", ")}`);
   const u = finiteNum(a.updated_at);
-  if (u !== null && u > 0) lines.push(`관측: ${String(a.source || "?")} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
+  if (u !== null && u > 0) lines.push(`관측: ${sourceLabel(a.source)} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
   for (const v of views) lines.push(`${v.label}: ${v.text}${v.resetText ? ` · ${v.resetText}` : ""}`);
   if (note) lines.push(note);
   // 관측된 행이라도 그 경로가 지금 고장이면 적는다(값은 마지막 관측 그대로 — 오래됨 표기가 따로 붙는다).

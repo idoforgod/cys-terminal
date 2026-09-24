@@ -238,7 +238,7 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
 그 안에서 스크롤됩니다).
 
 - **사용량**: 계정별 **5시간·7일 한도 사용률**을 Control Center 를 열지 않고 봅니다. 맨 위는 **주 계정**
-  (cys 창에서 지금 쓰이고 있는 계정 가운데 5시간 사용률이 가장 높은 계정) — 사용률·게이지·리셋 시각,
+  (지금 쓰이고 있는 계정 가운데 5시간 사용률이 가장 높은 계정) — 사용률·게이지·리셋 시각,
   "이 속도면 HH:MM 소진" 예측이 나옵니다. 그 아래에 **이 컴퓨터에서 찾은 나머지 계정이 전부 한 줄씩**
   나옵니다(v0.14.42) — 값이 들어온 계정이 먼저, 아직 값이 없는 계정이 그다음입니다. 머리줄을 누르면 한 줄
   요약(`5h 78% · 7d 31%`)으로 접힙니다.
@@ -251,9 +251,9 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
       agy 는 폴더 하나에 계정 하나입니다. 로그인 파일은 있는지만 보고 내용은 읽지 않습니다.
     - 직접 선언한 계정: `~/.cys/accounts.json`.
   - **값이 아직 없는 계정**: 흐린 글씨로 `관측 전 · (이유)` 가 나옵니다. 0% 로 적지 않습니다. 대표적인 이유는
-    "그 계정을 cys 창 밖(외부 터미널)에서만 쓰고 있다" 입니다 — 값은 cys 창 안에서 에이전트가 응답할 때만
-    들어옵니다. 값을 읽어 오는 길 자체가 고장났으면 `관측 실패 · (이유)`(예: `agy 조회 거부(HTTP 403)`)로
-    구별해 보여 줍니다. 마우스를 올리면 자세한 설명과 오류 코드가 나옵니다.
+    "앱(데몬)이 켜진 뒤 그 계정으로 아직 응답한 적이 없다" 입니다. 값을 읽어 오는 길 자체가 고장났으면
+    `관측 실패 · (이유)`(예: `agy 상태줄 연결 필요`)로 구별해 보여 줍니다. 마우스를 올리면 자세한 설명과
+    오류 코드가 나옵니다.
   - 주 계정 밖의 줄은 8개까지 보이고, 더 많으면 `외 N개 — Control Center > Live` 로 접힙니다.
   - 표시 규칙: 70% 이상 주황·90% 이상 빨강, 100%를 넘으면 `100%+`, 그 창의 기록이 없으면 `—`(0%가
     아닙니다), 리셋 시각이 지난 값은 숨기고 "리셋됨"으로, 30분 넘게 새 관측이 없거나 지난 기록이면 흐리게.
@@ -264,11 +264,40 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
     식별자로 만들어 쓰고 있다면, 화면 공유·녹화 중 사이드바에 그 이름이 상시 노출됩니다(툴팁이
     아니라 본문 라벨). 개인 식별자가 드러나지 않길 원하면 계정 폴더 이름을 일반적인 값
     (`claude-1`·`claude-work` 등)으로 바꿔 쓰세요.
-  - **집계 범위**: cys 창 안에서 돈 세션의 사용량만 계정에 모입니다. v0.14.42 부터 기본 `claude`
-    (`~/.claude`)로 띄운 세션도 cys 창 안이면 집계됩니다. 외부 터미널 세션은 여전히 집계되지 않습니다
-    (그 계정은 줄은 보이지만 `관측 전` 으로 남습니다).
-  - Antigravity 값: agy 가 쿼터를 알려 주는 길이 아직 확인 중입니다. 값이 안 들어오면 줄에 그 이유
-    (`관측 실패 · …`)가 그대로 나옵니다.
+  - **집계 범위**(v0.14.42): cys 창 안에서 돈 세션에 더해, **cys 창 밖(외부 터미널)에서 쓴 Claude 세션도**
+    그 계정 줄에 모입니다. 기본 `claude`(`~/.claude`)로 띄운 세션도 포함입니다. 조건과 한계는 이렇습니다.
+    - 그 프로필의 Claude 상태줄(statusLine)이 cys 로 연결돼 있어야 합니다. cys 설치 점검(preflight C32)이
+      찾은 Claude 프로필마다 연결해 두므로(원래 쓰던 상태줄 명령이 있으면 그 명령을 이어서 그대로 실행합니다)
+      보통은 따로 할 일이 없습니다. 연결 뒤 상태줄 설정을 cys 가 아닌 명령으로 직접 바꾼 프로필은 모이지 않습니다.
+    - 창 밖 세션 값은 **데몬이 떠 있을 때만** 들어옵니다. 창 밖 보고는 데몬을 새로 띄우지 않고, 0.4초 안에
+      닿지 않으면 그 한 번은 버립니다 — 상태줄이 늦어지지 않게 하기 위해서입니다. 다음 응답 때 다시 보냅니다.
+    - 값은 앱의 기본(본부) 데몬으로 갑니다. 사이드바는 본부와 부서 데몬을 합쳐 보이므로 그대로 보입니다.
+    - **창 밖 값은 표시용입니다.** 같은 사용자 계정으로 도는 프로그램이면 무엇이든 이 값을 보낼 수 있기
+      때문에(실제로 있는 대화 기록 파일 경로만 대면 됩니다), 이 값은 계정 한도 경보(90%·95% 알림)의 근거로
+      쓰지 않습니다. 같은 계정이라도 cys 창 좌석이 보낸 값이 최신이면 그 값으로 경보가 판정됩니다.
+      툴팁의 `관측:` 줄에 `cys 창 밖 상태줄` 로 출처가 표시됩니다.
+    - 모이지 않는 경우: 대화 기록이 실제로 없는 경로 · 이름 규칙(`~/.claude`·`~/.claude-<이름>`·
+      `~/.cys/claude*`) 밖의 설정 폴더(`CLAUDE_CONFIG_DIR` 을 다른 곳으로 지정한 세션) · cys 창 안인데
+      좌석 번호(`CYS_SURFACE_ID`)가 없는 프로세스(좌석은 자기 좌석 경로로만 보고합니다).
+    - 끄려면 환경변수 `CYS_OUTSIDE_USAGE=0`(창 밖 세션 쪽에 설정 · §16).
+  - **Antigravity(agy) 값**: agy 1.2 부터 agy 내부 서버가 쿼터 조회에 보안 토큰(CSRF)을 요구합니다
+    (2026-09-23 확인). cys 는 그 토큰을 읽지 않습니다 — 쿼터만이 아니라 agy 의 로컬 기능 전체를 여는
+    열쇠이기 때문입니다. 대신 **agy 공식 상태줄 기능**으로 값을 받습니다. 연결 전에는 줄에
+    `관측 실패 · agy 상태줄 연결 필요` 가 나옵니다(cys 는 이 확인을 agy 한 개당 30분에 한 번만 합니다).
+    - 연결 방법(직접 한 번 · 이 설정은 이 컴퓨터의 **모든** agy 에 적용되므로 cys 가 대신 고치지 않습니다):
+      `~/.gemini/antigravity-cli/settings.json` 의 `statusLine` 을 아래처럼 바꿉니다. `stack_with_default`
+      를 켜 두면 agy 기본 상태줄은 그대로 보이고 그 아래에 `cys · 5h 12% · 7d 25%` 한 줄이 붙습니다.
+      ```json
+      "statusLine": { "type": "command", "command": "sh ~/.cys/pack/hooks/cys-statusline.sh",
+                      "enabled": true, "stack_with_default": true }
+      ```
+    - agy 가 상태줄에 넘겨 주는 정보 가운데 **쿼터 숫자만**(Gemini 5시간·주간) cys 로 보냅니다. 이메일·대화
+      기록 경로·작업 폴더 같은 나머지 정보는 보내지도 저장하지도 않습니다.
+    - 값은 **cys 창의 agy 좌석**에서 돈 agy 만 모입니다. cys 창 밖에서 쓴 agy 는 모이지 않습니다.
+    - agy 는 상태가 바뀔 때마다 상태줄을 부르므로, 좌석이 한동안 쉬면 값이 오래돼 흐리게 보입니다.
+      값이 한 번 들어온 뒤에는 cys 가 agy 내부 서버를 더 두드리지 않습니다.
+    - 아직 실제 agy 에서 확인하지 못한 점: agy 가 상태줄 명령에 cys 좌석 번호(`CYS_SURFACE_ID`)를
+      넘겨 주는지. 넘겨 주지 않으면 값이 들어오지 않습니다(틀린 값이 들어오는 일은 없습니다).
   - 갱신: 약 30초마다(앱이 켜진 직후 잠시는 쉬고), Control Center Live 탭이 열려 있으면 5초마다.
 - **전문가용** (기본 접힘): 누르면 펼쳐지며 **팀 직접 만들기**가 들어 있습니다(§4.4). 펼침 상태는 앱이
   켜져 있는 동안만 기억합니다.
@@ -1067,6 +1096,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` | 60 (0=보호 off) | `cys doctor --fix` 의 staging 잔재 삭제 보호창(초) — 이 시간 안에 수정된 staging 은 지우지 않고, idle 을 **못 재는**(mtime 미상·미래) staging 도 지우지 않는다(0.14.36 · 출력에 "N건 측정불능 보호" 로 따로 보고). `0` 은 진행중 보호와 측정불능 보호를 **함께** 해제해 종전처럼 항상 삭제하는 탈출구. 무효 값(`off`·`-1`·빈 값 — 비음수 정수만 유효)은 stderr 경고 1줄 + 기본 60(보호 on) — 조용히 떨어지지 않는다 |
 | `CYS_TODO_DIRS` | — | todo 감시 추가 루트(콜론 구분) |
 | `CYS_NO_AUTOSTART` / `CYS_NO_AUTORESTORE` | — | 자동 기동/자동 복원 끄기 |
+| `CYS_OUTSIDE_USAGE` | 켜짐 (`0`=끔) | cys 창 밖(외부 터미널) Claude 세션의 사용량을 계정 줄로 보내기(v0.14.42 · §4 사이드바 사용량 「집계 범위」). 창 밖 세션 쪽 환경에서 읽습니다. 끄면 종전처럼 보내지 않습니다 |
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
@@ -1144,7 +1174,7 @@ queue.list / clear / deliver
 recall.search   attest.pin / verify   approval.check / sign
 learn.propose / status / history
 schedule.status / run_now
-usage.register / report / event
+usage.register / report / report_account / event / accounts
 org.status
 control.dashboard / hw / analytics / cost_baseline / skills / weekly / alerts /
         sessions / session_detail / session_star
@@ -1174,6 +1204,14 @@ channel.* (bridge.exited·auth.denied·registered·message·outbound.<ch>·lockd
 daemon.started/stopping   acl.denied   context.threshold   status.changed   task.changed
 todo.updated   approval.request   approval.stalled   master.deadman   master.idle   osc.notify
 ```
+
+v0.14.42 가산분(additive):
+- `usage.report_account` {session_file, rate} — cys 창 **밖** Claude 세션의 계정 전용 보고(좌석 배지·이벤트·임계
+  무접촉). 호출자가 pane 안이거나 미상이면 `usage_denied` · 모양·경로 불통과는 `invalid_params` · 응답
+  `{accepted:true}` 또는 빈도 상한 `{accepted:false, reason:"throttled"}`. 이벤트를 내지 않는다
+- `usage.report` 에 `reporter:"agy"`(agy 상태줄 훅) — agy 좌석(agent gemini)에서만 받는다(아니면 `invalid_params`)
+- `usage.accounts` 행: `source` 값 `statusline-outside`(창 밖 · 표시용 · 경보 제외)·`agy-statusline` 추가 ·
+  `source_error` 코드 `agy_csrf_required` 추가
 
 v0.14.22 가산분(전부 additive — 기존 소비자 무해):
 - `queue.rehomed` {role, count, queue_entry_ids, reordered} — WAL 복원 항목의 같은 role 생존

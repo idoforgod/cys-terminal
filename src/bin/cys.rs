@@ -16964,6 +16964,112 @@ fn statusline_human_line(v: &Value) -> String {
     parts.join(" · ")
 }
 
+/// ★0.14.42 RC4-b: cys 창 **밖** Claude 세션의 계정 전용 보고 RPC 이름(데몬 arm 과 핀으로 묶는다).
+const USAGE_REPORT_ACCOUNT_METHOD: &str = "usage.report_account";
+/// 상태줄 경로의 새 push(창 밖 Claude · agy 좌석)의 **총예산**(연결 포함 · 밀리초). 정상 왕복은 5–6ms(2026-09-23
+/// 실측) — 데몬 부재·무응답이어도 상태줄이 이 이상 늦지 않는다(종전 좌석 경로의 무응답 실측 40.05초).
+const STATUSLINE_PUSH_BUDGET_MS: u64 = 400;
+/// 창 밖 보고를 보낼 stdin 상한(바이트) — 실제 상태줄 JSON 은 수 KB 다.
+const OUTSIDE_STDIN_MAX: usize = 1024 * 1024;
+/// 창 밖 보고의 `session_file` 길이 상한(바이트) — 데몬(`accounts::OUTSIDE_SESSION_FILE_MAX`)과 같은 값.
+const OUTSIDE_SESSION_FILE_MAX: usize = 1024;
+
+/// 롤백 노브 `CYS_OUTSIDE_USAGE=0` — 창 밖 보고를 끈다(코드 되돌림 없이 종전 거동). 순수 판정부.
+fn outside_usage_enabled_with(raw: Option<&str>) -> bool {
+    raw.map(str::trim) != Some("0")
+}
+
+/// statusline JSON → 창 밖 계정 보고 파라미터 `{session_file, rate}` — **그 둘만** 싣는다(ctx·모델·cwd 등은
+/// 좌석 배지용이라 창 밖 입구에는 필요 없다). 보낼 것이 없으면 None(rate 비었음·transcript 없음·길이 초과).
+fn outside_account_params(v: &Value) -> Option<Value> {
+    // 좌석 경로와 **같은 추출기**를 쓴다(rate·transcript 해석이 두 벌로 갈리지 않게) — 그중 둘만 옮긴다.
+    let full = statusline_to_report_params(v);
+    let rate = full.get("rate").filter(|r| r.as_array().is_some_and(|a| !a.is_empty()))?;
+    let session_file = full
+        .get("session_file")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= OUTSIDE_SESSION_FILE_MAX)?;
+    Some(json!({"rate": rate, "session_file": session_file}))
+}
+
+/// agy(Antigravity CLI) 상태줄 stdin 인가 — 공식 문서의 `"product":"antigravity"` 또는 claude 에 없는 `quota` 맵.
+fn is_agy_statusline(v: &Value) -> bool {
+    v.get("product").and_then(|x| x.as_str()) == Some("antigravity")
+        || (v.get("quota").is_some_and(|q| q.is_object()) && v.get("rate_limits").is_none())
+}
+
+/// agy 쿼터 맵 → `[(창, 사용률, 리셋 epoch?)]`(5h 먼저). 문서 스키마: `quota.<bucket id>.{remaining_fraction,
+/// reset_time(RFC3339), reset_in_seconds}`. `gemini-` 버킷만(3p 제외) · `-5h`→5h · `-weekly`→7d(claude/codex 배지와
+/// 라벨 통일) · 모르는 창은 버린다 · remaining_fraction 이 없으면 **결측**(0 으로 지어내지 않는다) · 같은 창으로
+/// 모이는 버킷이 여럿이면 더 많이 쓴 쪽(묶인 한도).
+fn agy_quota_windows(v: &Value, now: f64) -> Vec<(&'static str, f64, Option<f64>)> {
+    let mut out: Vec<(&'static str, f64, Option<f64>)> = Vec::new();
+    let Some(q) = v.get("quota").and_then(|x| x.as_object()) else {
+        return out;
+    };
+    for (id, b) in q {
+        if !id.starts_with("gemini-") {
+            continue;
+        }
+        let label = if id.ends_with("-5h") {
+            "5h"
+        } else if id.ends_with("-weekly") {
+            "7d"
+        } else {
+            continue;
+        };
+        let Some(frac) = b.get("remaining_fraction").and_then(|x| x.as_f64()).filter(|f| f.is_finite()) else {
+            continue;
+        };
+        let used = ((1.0 - frac) * 100.0).clamp(0.0, 100.0);
+        let resets = b
+            .get("reset_time")
+            .and_then(|x| x.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp() as f64)
+            .or_else(|| {
+                b.get("reset_in_seconds")
+                    .and_then(|x| x.as_f64())
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+                    .map(|s| now + s)
+            });
+        match out.iter_mut().find(|w| w.0 == label) {
+            Some(w) if used > w.1 => *w = (label, used, resets),
+            Some(_) => {}
+            None => out.push((label, used, resets)),
+        }
+    }
+    out.sort_by_key(|w| u8::from(w.0 != "5h"));
+    out
+}
+
+/// agy 상태줄 stdin → usage.report 파라미터 `{rate, reporter:"agy"}`(surface 제외 · 순수 — 핀).
+fn agy_statusline_to_report_params(v: &Value, now: f64) -> Value {
+    // ★쿼터 숫자만 싣는다 — 페이로드의 email(계정 식별자)·transcript_path·cwd·ctx 는 한 글자도 옮기지 않는다
+    //   (ctx 를 실으면 agy 좌석에 context.threshold 가 새로 무장되고 session_file 은 재주입 판정이 읽는다 —
+    //   둘 다 이 작업의 범위 밖 거동 변경이다).
+    let rate: Vec<Value> = agy_quota_windows(v, now)
+        .into_iter()
+        .map(|(label, used, resets)| {
+            let mut w = json!({"label": label, "used_pct": used});
+            if let Some(r) = resets {
+                w["resets_at"] = json!(r);
+            }
+            w
+        })
+        .collect();
+    json!({"rate": rate, "reporter": "agy"})
+}
+
+/// agy 상태줄에 쌓아 보일 사람용 한 줄(`cys · 5h n% · 7d n%`) — 쿼터 숫자만(이메일·경로 등 비노출).
+fn agy_statusline_human_line(v: &Value) -> String {
+    let mut parts = vec!["cys".to_string()];
+    for (label, used, _) in agy_quota_windows(v, 0.0) {
+        parts.push(format!("{label} {used:.0}%"));
+    }
+    parts.join(" · ")
+}
+
 /// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
 /// (quiet가 아니면) 사람용 statusline 한 줄을 stdout으로 출력한다.
 /// ★불변: statusline 경로는 **절대 claude를 막지 않는다** — 빈 입력·파싱 실패·surface 미해결·
@@ -16976,14 +17082,57 @@ fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&buf) else {
         return 0;
     };
-    // push (surface 미해결·데몬 부재는 조용히 스킵 — 사람용 줄은 여전히 출력한다)
-    if let Ok(sid) = target_surface(surface, &None) {
-        let mut params = statusline_to_report_params(&v);
-        params["surface_id"] = json!(sid);
-        let _ = request("usage.report", params);
-    }
-    if !quiet {
-        println!("{}", statusline_human_line(&v));
+    // 0.14.42 새 두 경로(agy 상태줄 · cys 창 밖 Claude)는 사람용 줄을 **먼저** 내고, push 는 아래 한 곳에서
+    // autostart 없는 총예산 왕복으로만 보낸다(데몬 부재·무응답이어도 상태줄이 STATUSLINE_PUSH_BUDGET_MS 이상
+    // 늦지 않는다 · 데몬을 되살리지 않는다). 결과는 버린다 — 상태줄은 절대 에이전트를 막지 않는다.
+    let push: Option<(&str, Value)> = if is_agy_statusline(&v) {
+        // ★RC2-b: agy 상태줄 — 좌석(cys 창 agy)에서만 보낸다. 창 밖 agy 는 보내지 않는다(오너 승인 범위 =
+        //   창 밖 **Claude** 세션). 데몬은 좌석이 agy(gemini)인지 다시 확인한다.
+        if !quiet {
+            println!("{}", agy_statusline_human_line(&v));
+        }
+        let mut params = agy_statusline_to_report_params(&v, unix_now() as f64);
+        match target_surface(surface, &None) {
+            Ok(sid) if params["rate"].as_array().is_some_and(|a| !a.is_empty()) => {
+                params["surface_id"] = json!(sid);
+                Some(("usage.report", params))
+            }
+            _ => None,
+        }
+    } else {
+        match target_surface(surface, &None) {
+            // cys 창 좌석(claude) — 종전 경로 그대로(push 후 사람용 줄).
+            Ok(sid) => {
+                let mut params = statusline_to_report_params(&v);
+                params["surface_id"] = json!(sid);
+                let _ = request("usage.report", params);
+                if !quiet {
+                    println!("{}", statusline_human_line(&v));
+                }
+                None
+            }
+            // ★RC4-b: cys 창 밖(surface 없음) Claude 세션 — 계정 전용 보고. `--surface` 를 잘못 준 경우는 종전처럼
+            //   조용히 건너뛴다(창 밖이 아니라 호출 오류다).
+            Err(_) => {
+                if !quiet {
+                    println!("{}", statusline_human_line(&v));
+                }
+                let enabled = surface.is_none()
+                    && outside_usage_enabled_with(cys::env_compat("CYS_OUTSIDE_USAGE").as_deref())
+                    && buf.len() <= OUTSIDE_STDIN_MAX;
+                enabled
+                    .then(|| outside_account_params(&v))
+                    .flatten()
+                    .map(|p| (USAGE_REPORT_ACCOUNT_METHOD, p))
+            }
+        }
+    };
+    if let Some((method, params)) = push {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // 소켓은 socket_path() 그대로(창 밖 세션 = 기본 소켓 = 본부 · CYS_SOCKET 이 있으면 그것 — 격리 하네스 유지).
+        // 예산을 넘긴 왕복 스레드는 버린다 — 이 프로세스가 곧 끝나므로 함께 사라진다(누적 없음).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STATUSLINE_PUSH_BUDGET_MS);
+        let _ = request_on_before(&socket_path(), method, params, deadline);
     }
     0
 }
@@ -26300,6 +26449,149 @@ mod tests {
         assert_eq!(statusline_human_line(&v), "Opus 4.8 · CTX 42% · 5h 41% · 7d 12%");
         let v2 = json!({"context_window": {"used_percentage": 8.0}});
         assert_eq!(statusline_human_line(&v2), "claude · CTX 8%");
+    }
+
+    // ───────── 0.14.42 RC2-b · RC4-b — agy 상태줄 · cys 창 밖 계정 보고(수정 전 적색) ─────────
+    // 픽스처는 전부 합성값(someone@example.test · /Users/x/…) — 실계정 식별자 금지.
+
+    /// agy 공식 상태줄 문서(https://antigravity.google/docs/cli/statusline/)의 페이로드 모양 — 값만 합성.
+    fn agy_payload() -> Value {
+        json!({
+            "cwd": "/Users/x/p", "session_id": "0000", "conversation_id": "0000",
+            "transcript_path": "/Users/x/.gemini/antigravity/brain/0000/.system_generated/logs/transcript.jsonl",
+            "model": {"id": "Gemini 3.5 Flash (High)", "display_name": "Gemini 3.5 Flash (High)"},
+            "version": "1.2.9",
+            "context_window": {"context_window_size": 1048576, "used_percentage": 14.24,
+                "current_usage": {"input_tokens": 63382, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 20857}},
+            "product": "antigravity",
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.88, "reset_time": "2099-01-01T00:00:00Z", "reset_in_seconds": 5},
+                "gemini-weekly": {"remaining_fraction": 0.75, "reset_in_seconds": 600},
+                "3p-5h": {"remaining_fraction": 0.10, "reset_in_seconds": 60}
+            },
+            "agent_state": "idle", "plan_tier": "Pro",
+            "email": "someone@example.test"
+        })
+    }
+
+    /// RC2-b: agy 상태줄은 문서화된 필드(`product`·`quota`)로 알아본다 — claude 상태줄은 agy 로 오인하지 않는다.
+    #[test]
+    fn agy_statusline_is_detected_by_documented_fields() {
+        assert!(is_agy_statusline(&agy_payload()));
+        let mut no_product = agy_payload();
+        no_product.as_object_mut().unwrap().remove("product");
+        assert!(is_agy_statusline(&no_product), "quota 맵만 있어도 agy(claude 에는 없는 키)");
+        let claude = json!({
+            "transcript_path": "/Users/x/.claude-3/projects/-a/s.jsonl",
+            "context_window": {"used_percentage": 12.0},
+            "rate_limits": {"five_hour": {"used_percentage": 33.0}}
+        });
+        assert!(!is_agy_statusline(&claude));
+        assert!(!is_agy_statusline(&json!({"context_window": {"used_percentage": 1.0}})), "rate 없는 claude");
+        // 결측형 음성 대조: quota 가 맵이 아니면 agy 가 아니다
+        assert!(!is_agy_statusline(&json!({"quota": null})));
+        assert!(!is_agy_statusline(&json!({"quota": "x"})));
+    }
+
+    /// RC2-b: 쿼터 맵 → rate. `gemini-` 버킷만(3p 제외 — RPC 파서의 Gemini 그룹 필터와 같은 뜻) · `-5h`→5h ·
+    /// `-weekly`→7d · used=(1-remaining_fraction)×100 · 리셋은 reset_time, 없으면 now+reset_in_seconds ·
+    /// remaining_fraction 이 없으면 그 창은 **결측**(0 이 아니다). ★이메일·transcript·ctx 는 한 글자도 싣지 않는다.
+    #[test]
+    fn agy_statusline_quota_maps_to_rate_and_forwards_nothing_else() {
+        let now = 2_000_000_000.0;
+        let p = agy_statusline_to_report_params(&agy_payload(), now);
+        assert_eq!(p["reporter"], json!("agy"));
+        let rate = p["rate"].as_array().expect("rate 배열");
+        assert_eq!(rate.len(), 2, "{p}");
+        assert_eq!(rate[0]["label"], json!("5h"));
+        assert!((rate[0]["used_pct"].as_f64().unwrap() - 12.0).abs() < 1e-9);
+        assert_eq!(rate[0]["resets_at"].as_f64(), Some(4_070_908_800.0), "reset_time 우선");
+        assert_eq!(rate[1]["label"], json!("7d"));
+        assert!((rate[1]["used_pct"].as_f64().unwrap() - 25.0).abs() < 1e-9);
+        assert_eq!(rate[1]["resets_at"].as_f64(), Some(now + 600.0), "reset_time 없으면 now+reset_in_seconds");
+        let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["rate", "reporter"], "rate·reporter 외의 키가 실렸다: {p}");
+        let wire = p.to_string();
+        for leak in ["someone", "example.test", "transcript", "brain", "session", "ctx", "Pro"] {
+            assert!(!wire.contains(leak), "상태줄 원문 '{leak}' 이 데몬으로 새어 나간다: {wire}");
+        }
+        // 결측형: remaining_fraction 없음(remaining_amount 만) → 그 창 없음 · 전부 없으면 빈 rate
+        let amt = json!({"product": "antigravity", "quota": {"gemini-5h": {"remaining_amount": 3, "reset_in_seconds": 5}}});
+        assert_eq!(agy_statusline_to_report_params(&amt, now)["rate"], json!([]));
+        // 같은 창으로 모이는 버킷이 둘이면 더 많이 쓴 쪽(묶인 한도)을 보인다
+        let two = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.9}, "gemini-pro-5h": {"remaining_fraction": 0.4}}});
+        let r = agy_statusline_to_report_params(&two, now);
+        assert_eq!(r["rate"].as_array().unwrap().len(), 1);
+        assert!((r["rate"][0]["used_pct"].as_f64().unwrap() - 60.0).abs() < 1e-9);
+        // 범위 밖 분수는 잘라 0..100(지어낸 음수·초과 금지) · 모르는 창(daily 등)은 버린다
+        let odd = json!({"quota": {"gemini-5h": {"remaining_fraction": 1.5}, "gemini-daily": {"remaining_fraction": 0.2}}});
+        let r = agy_statusline_to_report_params(&odd, now);
+        assert_eq!(r["rate"], json!([{"label": "5h", "used_pct": 0.0}]));
+    }
+
+    /// RC2-b: agy 상태줄에 쌓아 보일 한 줄 — 쿼터 숫자만. 이메일·모델 원문을 찍지 않는다.
+    #[test]
+    fn agy_statusline_human_line_shows_quota_only() {
+        let line = agy_statusline_human_line(&agy_payload());
+        assert_eq!(line, "cys · 5h 12% · 7d 25%");
+        assert!(!line.contains("someone"));
+        assert_eq!(agy_statusline_human_line(&json!({"quota": {}})), "cys");
+    }
+
+    /// RC4-b: 창 밖 보고 파라미터는 `{session_file, rate}` **둘뿐** — rate 가 비었거나 transcript 가 없거나 너무 길면
+    /// 보내지 않는다(데몬이 할 일이 없는 왕복 0).
+    #[test]
+    fn outside_account_params_carry_only_rate_and_session_file() {
+        let v = json!({
+            "session_id": "0000", "cwd": "/Users/x",
+            "transcript_path": "/Users/x/.claude-3/projects/-a/0000.jsonl",
+            "model": {"display_name": "Opus"},
+            "context_window": {"used_percentage": 12.0, "context_window_size": 200000},
+            "rate_limits": {"five_hour": {"used_percentage": 33.0, "resets_at": 1790000000},
+                            "seven_day": {"used_percentage": 44.0}}
+        });
+        let p = outside_account_params(&v).expect("보낼 것이 있는데 None");
+        let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["rate", "session_file"], "{p}");
+        assert_eq!(p["session_file"], json!("/Users/x/.claude-3/projects/-a/0000.jsonl"));
+        assert_eq!(p["rate"].as_array().unwrap().len(), 2);
+        let mut no_rate = v.clone();
+        no_rate.as_object_mut().unwrap().remove("rate_limits");
+        assert!(outside_account_params(&no_rate).is_none(), "rate 없음(무료·첫 응답 전) → 보내지 않는다");
+        let mut no_tx = v.clone();
+        no_tx.as_object_mut().unwrap().remove("transcript_path");
+        assert!(outside_account_params(&no_tx).is_none(), "transcript 없음 → 귀속 불가 → 보내지 않는다");
+        let mut long = v.clone();
+        long["transcript_path"] = json!(format!("/Users/x/.claude-3/projects/-a/{}.jsonl", "a".repeat(1100)));
+        assert!(outside_account_params(&long).is_none(), "길이 상한");
+    }
+
+    /// RC4-b 롤백 노브: `CYS_OUTSIDE_USAGE=0` 이면 창 밖 보고를 보내지 않는다(그 밖 값·부재는 켬).
+    #[test]
+    fn outside_usage_kill_switch() {
+        assert!(outside_usage_enabled_with(None));
+        assert!(outside_usage_enabled_with(Some("1")));
+        assert!(!outside_usage_enabled_with(Some("0")));
+        assert!(!outside_usage_enabled_with(Some(" 0 ")));
+    }
+
+    /// RC4-b: 새 RPC 이름이 **양쪽에** 실재한다(클라이언트 상수 · 데몬 arm) — 이름이 갈리면 모든 창 밖 보고가
+    /// method_not_found 로 조용히 사라진다. 그리고 새 두 경로(창 밖 · agy 좌석)는 **autostart 없는 총예산** 왕복
+    /// (`request_on_before`)만 쓴다 · 종전 claude 좌석 경로(`request("usage.report"`)는 그대로 한 번.
+    #[test]
+    fn usage_report_account_rpc_exists_on_both_sides_and_is_bounded() {
+        assert_eq!(USAGE_REPORT_ACCOUNT_METHOD, "usage.report_account");
+        let daemon = strip_line_comments(include_str!("cysd/handlers.rs"));
+        assert!(
+            daemon.contains(&format!("\"{USAGE_REPORT_ACCOUNT_METHOD}\" =>")),
+            "데몬에 {USAGE_REPORT_ACCOUNT_METHOD} arm 이 없다"
+        );
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_usage_report_stdin"));
+        assert!(body.contains("USAGE_REPORT_ACCOUNT_METHOD"), "창 밖 분기가 상수로 부르지 않는다");
+        assert_eq!(body.matches("request_on_before(").count(), 1, "새 경로는 공용 유계 push 하나로만 보낸다:\n{body}");
+        assert_eq!(body.matches("request(\"usage.report\", params)").count(), 1, "claude 좌석 경로가 바뀌었다");
+        assert!(!body.contains("AUTOSTART"), "autostart 전역을 건드리지 않는다(request_on_before 는 원래 무 autostart)");
+        assert!(STATUSLINE_PUSH_BUDGET_MS <= 500, "상태줄 총예산이 커졌다");
     }
 
     /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.

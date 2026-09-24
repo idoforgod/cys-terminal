@@ -1177,16 +1177,19 @@ pub fn claude_project_component(cwd: &str) -> String {
 }
 
 // ───────────────────────── T5 Phase 2-B: agy(Antigravity) 쿼터 ─────────────────────────
-// agy는 토큰·쿼터를 평문 로컬 파일에 안 남긴다 — 실행 중 프로세스의 로컬 LS RPC(HTTPS,
-// self-signed, 127.0.0.1 무인증)로만 노출된다(2026-06-17 라이브 프로브 실측). 포트는 매
-// 실행 변동 → lsof로 발견·probe로 검증·캐시. 파일 tail 수집기와 분리된 저빈도 비동기
-// 태스크(async curl — tokio 워커 미블로킹). HTTP 클라이언트 의존성을 더하지 않으려 curl
-// 셸아웃을 쓴다(codex의 lsof 셸아웃과 동형). 실패·미설치는 graceful(배지 없음 유지).
-// ★0.14.42(2026-09-23 RCA RC2): 이 경로는 한 번도 값을 내지 못했다. (a) lsof 에 `-a` 가 없어 남의 포트를
-// 두드렸고(수리: -a + agy 로그의 언어 서버 포트), (b) 맞는 포트였을 때도 값이 없었다 — agy 1.1.24 바이너리에
-// `missing CSRF token`·`x-codeium-csrf-token` 문자열이 있어 CSRF 요구가 유력하나 **미확정**(라이브 프로브는
-// 오너 승인 사안). 그래서 실패를 삼키지 않고 종류별 코드(agy_http_<코드> 등)를 계정 행 source_error 로 올린다
-// — 설치 뒤 화면의 코드가 곧 (b) 의 판정 근거가 된다.
+// agy는 토큰·쿼터를 평문 로컬 파일에 안 남긴다 — 실행 중 프로세스의 로컬 LS RPC(HTTPS, self-signed)로만
+// 노출된다. 포트는 매 실행 변동 → agy 로그의 언어 서버 줄(없으면 lsof)로 발견·probe로 검증·캐시. 파일 tail
+// 수집기와 분리된 저빈도 비동기 태스크(async curl — tokio 워커 미블로킹). HTTP 클라이언트 의존성을 더하지
+// 않으려 curl 셸아웃을 쓴다(codex의 lsof 셸아웃과 동형). 실패·미설치는 graceful(배지 없음 유지).
+// ★0.14.42(2026-09-23): 2026-06-17 첫 실측 때는 127.0.0.1 무인증이었으나 **지금은 CSRF 필수로 확정**됐다
+//   (오너 승인 라이브 프로브 3회 · 22:11–22:15 PDT · 언어 서버 1.2.9: 헤더 없는 이 요청 → HTTP 401
+//   `{"code":"unauthenticated","message":"missing CSRF token"}` · `x-codeium-csrf-token` 에 틀린 값 → `invalid CSRF
+//   token` · 평문 HTTP 포트도 401). 토큰은 agy 인자·환경변수 어디에도 없다(언어 서버가 agy 프로세스 안에서 돈다).
+//   cys 는 토큰을 찾아 읽지 않는다(그 토큰은 쿼터만이 아니라 로컬 agy API 전체를 연다 · 오너 승인 밖).
+//   → 값의 **주 경로는 agy 공식 상태줄(statusLine) 훅**이다(cys.rs `agy_statusline_to_report_params` →
+//   usage.report · 계정 source "agy-statusline"). 이 RPC 경로는 진단용으로 남되, CSRF 거절은 전용 코드
+//   `agy_csrf_required` 로 분류하고 agy pid 마다 [`AGY_CSRF_BACKOFF_SECS`] 동안 다시 두드리지 않는다(종전: 좌석마다
+//   15초마다 같은 401). 상태줄 값이 한 번 들어오면 수집기는 프로브를 멈춘다(`accounts::agy_statusline_authoritative`).
 
 const AGY_SVC: &str = "exa.language_server_pb.LanguageServerService";
 
@@ -1324,8 +1327,11 @@ async fn agy_ls_port_from_log(pid: u32) -> Option<u16> {
 pub enum AgyProbe {
     /// 200 + Gemini 쿼터 그룹.
     Ok(Vec<RateWindow>),
-    /// 언어 서버가 HTTP 로 답했지만 성공이 아니다(예: 401/403 — CSRF 요구 가설). 코드 보존.
+    /// 언어 서버가 HTTP 로 답했지만 성공이 아니다(CSRF 가 아닌 거절). 코드 보존.
     Http(u16),
+    /// 언어 서버가 CSRF 토큰을 요구하며 거절했다(4xx + 본문 "CSRF token" · 2026-09-23 실측 401). 결정론적 거절이라
+    /// 같은 agy 에 다시 물어도 같은 답이다 → 백오프 대상.
+    CsrfRequired,
     /// 200 인데 Gemini 쿼터가 없다(스키마 드리프트).
     NoQuota,
     /// 연결·TLS·시간 초과 — 그 포트에 언어 서버가 없다.
@@ -1349,6 +1355,11 @@ fn classify_agy_probe(curl_ok: bool, stdout: &[u8]) -> AgyProbe {
         return AgyProbe::Unreachable; // curl "000" = HTTP 응답 자체가 없다
     }
     if code != 200 {
+        // ★0.14.42 RC2-b: CSRF 거절(4xx + 본문 "CSRF token" — 실측 원문 `missing CSRF token`·`invalid CSRF token`)은
+        //   전용 분류다. 판별은 본문 문구가 한다(코드는 401 실측이나 403 으로 바뀌어도 뜻은 같다). 5xx 는 서버 오류.
+        if (400..500).contains(&code) && body.to_ascii_lowercase().contains("csrf token") {
+            return AgyProbe::CsrfRequired;
+        }
         return AgyProbe::Http(code);
     }
     let Ok(v) = serde_json::from_str::<Value>(body) else {
@@ -1367,9 +1378,19 @@ fn agy_error_code(p: &AgyProbe) -> Option<String> {
     match p {
         AgyProbe::Ok(_) => None,
         AgyProbe::Http(c) => Some(format!("agy_http_{c}")),
+        AgyProbe::CsrfRequired => Some(AGY_ERR_CSRF.into()),
         AgyProbe::NoQuota => Some("agy_no_quota".into()),
         AgyProbe::Unreachable => Some("agy_unreachable".into()),
     }
+}
+/// 언어 서버가 CSRF 토큰을 요구한다(agy 1.2.x) — 값은 agy 상태줄 훅으로만 받을 수 있다(UI: "agy 상태줄 연결 필요").
+pub const AGY_ERR_CSRF: &str = "agy_csrf_required";
+/// CSRF 거절을 받은 agy pid 를 다시 두드리지 않는 시간(초). agy 가 재기동(=새 pid · 업데이트 포함)하면 즉시 다시 묻는다.
+const AGY_CSRF_BACKOFF_SECS: f64 = 1800.0;
+
+/// 이 agy pid 가 CSRF 백오프 중인가(순수 — 핀).
+fn agy_csrf_backoff_active(backoff: &HashMap<u32, f64>, pid: u32, now: f64) -> bool {
+    backoff.get(&pid).is_some_and(|until| now < *until)
 }
 /// agy 좌석은 있는데 그 아래 agy 프로세스를 못 찾았다.
 const AGY_ERR_NO_PROCESS: &str = "agy_no_process";
@@ -1379,7 +1400,9 @@ const AGY_ERR_NO_PORT: &str = "agy_no_port";
 /// 한 틱에 좌석·포트마다 실패 이유가 다르면 **가장 멀리 간** 실패를 적는다 — 언어 서버가 직접 답한 거부가
 /// 가장 구체적인 사실이다.
 fn agy_error_rank(code: &str) -> u8 {
-    if code.starts_with("agy_http_") || code == "agy_no_quota" {
+    if code == AGY_ERR_CSRF {
+        5 // 거절 사유까지 안다 — 값을 얻는 길(상태줄 훅)을 가리키는 가장 구체적인 사실
+    } else if code.starts_with("agy_http_") || code == "agy_no_quota" {
         4
     } else if code == "agy_unreachable" {
         3
@@ -1510,6 +1533,7 @@ async fn collect_agy_for(
     daemon: &Arc<Daemon>,
     s: &Arc<Surface>,
     ports: &mut HashMap<u64, u16>,
+    csrf_backoff: &mut HashMap<u32, f64>,
 ) -> Result<(), String> {
     let mut best: Option<String> = None;
     if let Some(p) = ports.get(&s.id).copied() {
@@ -1530,6 +1554,11 @@ async fn collect_agy_for(
     let Some(pid) = agy_pid else {
         return Err(best.unwrap_or_else(|| AGY_ERR_NO_PROCESS.into()));
     };
+    // ★RC2-b: 이 agy 가 CSRF 로 거절한 지 얼마 안 됐다 — lsof·로그 읽기·curl 없이 같은 사실을 다시 적는다.
+    if agy_csrf_backoff_active(csrf_backoff, pid, now_epoch()) {
+        keep_worse(&mut best, AGY_ERR_CSRF.into());
+        return Err(best.unwrap_or_else(|| AGY_ERR_CSRF.into()));
+    }
     let log_port = agy_ls_port_from_log(pid).await;
     let mut candidates: Vec<u16> = log_port.into_iter().collect();
     for p in agy_listen_ports(pid).await {
@@ -1547,13 +1576,17 @@ async fn collect_agy_for(
             update_agy_usage(daemon, s, rate);
             return Ok(());
         }
-        let reached_ls = matches!(r, AgyProbe::Http(_) | AgyProbe::NoQuota);
+        let csrf = r == AgyProbe::CsrfRequired;
+        if csrf {
+            csrf_backoff.insert(pid, now_epoch() + AGY_CSRF_BACKOFF_SECS);
+        }
+        let reached_ls = matches!(r, AgyProbe::Http(_) | AgyProbe::NoQuota | AgyProbe::CsrfRequired);
         if let Some(c) = agy_error_code(&r) {
             keep_worse(&mut best, c);
         }
         // agy 가 스스로 적은 언어 서버 포트가 HTTP 로 답했다 = 언어 서버는 찾았다. 나머지 포트(같은 agy 의 다른
-        // 리스너)를 더 두드려도 쿼터 서비스가 아니다 — 소음만 늘린다.
-        if reached_ls && Some(port) == log_port {
+        // 리스너)를 더 두드려도 쿼터 서비스가 아니다 — 소음만 늘린다. CSRF 거절은 어느 포트에서 왔든 언어 서버다.
+        if reached_ls && (Some(port) == log_port || csrf) {
             break;
         }
     }
@@ -1566,6 +1599,8 @@ async fn collect_agy_for(
 pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
         let mut ports: HashMap<u64, u16> = HashMap::new();
+        // agy pid → CSRF 백오프 만료 시각(RC2-b). 만료분은 틱마다 걷는다(크기 = 30분 안에 본 agy 수).
+        let mut csrf_backoff: HashMap<u32, f64> = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(agy_poll_secs())).await;
             let surfaces: Vec<Arc<Surface>> = {
@@ -1588,10 +1623,17 @@ pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
             };
             let live: HashSet<u64> = surfaces.iter().map(|s| s.id).collect();
             ports.retain(|sid, _| live.contains(sid));
+            let now = now_epoch();
+            csrf_backoff.retain(|_, until| *until > now);
+            // ★RC2-b: agy 상태줄 훅이 값을 보내고 있으면(계정의 최신 출처) 이 경로는 물러선다 — CSRF 로 막힌
+            //   RPC 를 계속 두드려 값 있는 행에 '관측 실패'를 덧씌우지 않는다(오래됨은 stale 표기가 따로 말한다).
+            if !surfaces.is_empty() && crate::accounts::agy_statusline_authoritative(&daemon) {
+                continue;
+            }
             let mut any_ok = false;
             let mut worst: Option<String> = None;
             for s in &surfaces {
-                match collect_agy_for(&daemon, s, &mut ports).await {
+                match collect_agy_for(&daemon, s, &mut ports, &mut csrf_backoff).await {
                     Ok(()) => any_ok = true,
                     Err(code) => keep_worse(&mut worst, code),
                 }
@@ -2279,8 +2321,9 @@ mod tests {
             super::AgyProbe::Ok(r) => assert_eq!(r[0].label, "5h"),
             other => panic!("정상 응답을 분류하지 못했다: {other:?}"),
         }
+        // CSRF 가 아닌 거절은 코드를 보존한다(CSRF 거절은 아래 전용 검체 — 0.14.42 RC2-b 에서 분리)
         assert_eq!(
-            super::classify_agy_probe(true, b"{\"code\":\"unauthenticated\",\"message\":\"missing CSRF token\"}\n401"),
+            super::classify_agy_probe(true, b"{\"code\":\"unauthenticated\",\"message\":\"token expired\"}\n401"),
             super::AgyProbe::Http(401)
         );
         assert_eq!(super::classify_agy_probe(true, b"{}\n200"), super::AgyProbe::NoQuota);
@@ -2292,5 +2335,45 @@ mod tests {
         assert_eq!(super::agy_error_code(&super::AgyProbe::NoQuota).as_deref(), Some("agy_no_quota"));
         assert_eq!(super::agy_error_code(&super::AgyProbe::Unreachable).as_deref(), Some("agy_unreachable"));
         assert_eq!(super::agy_error_code(&super::AgyProbe::Ok(vec![])), None);
+    }
+
+    /// ★0.14.42 RC2-b(수정 전 적색): agy 1.2.9 언어 서버의 CSRF 거절(2026-09-23 22:11–22:15 오너 승인 라이브 프로브 실측
+    /// 원문 그대로 — 헤더 없음 = `missing` · 틀린 값 = `invalid` · 평문 HTTP 포트도 같은 401)은 **전용 코드**다.
+    /// 종전엔 `agy_http_401` 로만 보여 "무엇을 해야 값이 들어오나"(상태줄 연결)가 화면에서 드러나지 않았다.
+    #[test]
+    fn agy_csrf_rejection_is_its_own_code_and_outranks_the_rest() {
+        for body in [
+            &b"{\"code\":\"unauthenticated\",\"message\":\"missing CSRF token\"}\n401"[..],
+            &b"{\"code\":\"unauthenticated\",\"message\":\"invalid CSRF token\"}\n401"[..],
+        ] {
+            assert_eq!(super::classify_agy_probe(true, body), super::AgyProbe::CsrfRequired, "{}", String::from_utf8_lossy(body));
+        }
+        assert_eq!(super::agy_error_code(&super::AgyProbe::CsrfRequired).as_deref(), Some("agy_csrf_required"));
+        // 200 본문에 CSRF 라는 글자가 있어도 거절이 아니다(성공 판정은 코드가 한다)
+        assert_eq!(super::classify_agy_probe(true, b"{\"note\":\"CSRF token\"}\n200"), super::AgyProbe::NoQuota);
+        // 5xx 는 CSRF 거절이 아니다(서버 오류) — 코드 보존
+        assert_eq!(super::classify_agy_probe(true, b"CSRF token store down\n503"), super::AgyProbe::Http(503));
+        // 한 틱에 여러 실패가 섞이면 CSRF 가 가장 구체적인 사실이다(값을 얻는 길이 무엇인지 알려 주므로)
+        for other in ["agy_http_401", "agy_no_quota", "agy_unreachable", "agy_no_port", "agy_no_process"] {
+            assert!(
+                super::agy_error_rank(super::AGY_ERR_CSRF) > super::agy_error_rank(other),
+                "CSRF 가 {other} 보다 낮게 매겨졌다"
+            );
+        }
+    }
+
+    /// ★0.14.42 RC2-b(수정 전 적색): CSRF 거절은 결정론적이다 — 같은 agy pid 는 백오프 동안 다시 두드리지 않는다
+    /// (종전: 좌석마다 15초마다 같은 401). 창이 지나거나 agy 가 재기동(새 pid)하면 다시 묻는다.
+    #[test]
+    fn agy_csrf_backoff_is_per_pid_and_expires() {
+        let mut b: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+        let now = 1_000_000.0;
+        assert!(!super::agy_csrf_backoff_active(&b, 61666, now), "기록 없음 = 묻는다");
+        b.insert(61666, now + super::AGY_CSRF_BACKOFF_SECS);
+        assert!(super::agy_csrf_backoff_active(&b, 61666, now + 15.0), "15초 뒤 같은 pid 를 다시 두드린다");
+        assert!(super::agy_csrf_backoff_active(&b, 61666, now + super::AGY_CSRF_BACKOFF_SECS - 1.0));
+        assert!(!super::agy_csrf_backoff_active(&b, 61666, now + super::AGY_CSRF_BACKOFF_SECS), "창이 지나면 다시 묻는다");
+        assert!(!super::agy_csrf_backoff_active(&b, 70000, now + 15.0), "새 pid(재기동·업데이트)는 즉시 묻는다");
+        assert!(super::AGY_CSRF_BACKOFF_SECS >= 600.0, "백오프가 폴링 주기 수준으로 짧아졌다");
     }
 }

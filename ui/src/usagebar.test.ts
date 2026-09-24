@@ -284,10 +284,18 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(profileTail(".claude-1")).toBe(".claude-1");
     expect(profileTail("")).toBe("");
   });
-  it("툴팁은 집계 범위를 정직하게 적는다(기본 claude·외부 터미널은 빠진다 — 반박 §5-8)", () => {
+  it("툴팁은 집계 범위를 정직하게 적는다(0.14.42 RC4-b: 외부 터미널 Claude 세션도 모인다 · 표시용 · 한계)", () => {
     const a = acct({ rate: [win("5h", 5)] });
     const t = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
     expect(t).toContain("외부 터미널");
+    expect(t).not.toContain("빠집니다"); // 수정 전 문구 — 이제 거짓이다
+    expect(t).toContain("표시용"); // 창 밖 값은 경보 근거가 아니다
+  });
+  it("창 밖 세션 값(source statusline-outside)은 라이브 관측이고 툴팁에 출처가 사람 말로 드러난다", () => {
+    const a = acct({ source: "statusline-outside", rate: [win("5h", 40)] });
+    expect(isLiveAccount(a)).toBe(true);
+    const t = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
+    expect(t).toContain("관측: cys 창 밖 상태줄"); // 출처 줄 자체가 사람 말(고지 문구에 기대지 않는다)
   });
   it("나머지 관측 계정은 한 줄씩 · 주 계정 제외 · 상한 초과분은 개수", () => {
     const many = Array.from({ length: USAGE_OTHERS_MAX + 3 }, (_, i) =>
@@ -358,7 +366,21 @@ describe("0.14.42 — 발견된 계정은 전부 한 줄씩(오너 제보: 클�
     expect(c4.dim).toBe(true);
     expect(c4.text.startsWith("관측 전")).toBe(true);
     expect(c4.text.includes("%")).toBe(false);
-    expect(c4.tooltip).toContain("외부 터미널"); // 왜 비었는지 — cys 밖 세션은 집계되지 않는다
+    expect(c4.tooltip).toContain("외부 터미널"); // 왜 비었는지 — 창 밖 세션도 상태줄이 cys 로 연결돼 있어야 모인다
+    expect(c4.tooltip).not.toContain("집계되지 않습니다"); // 수정 전 문구(0.14.42 RC4-b 로 거짓이 됨)
+    expect(c4.text).not.toContain("cys 창에서"); // 창 안에서만 들어온다는 사유는 더 이상 참이 아니다
+  });
+  it("agy CSRF 거절(agy_csrf_required)은 '무엇을 하면 값이 들어오나'(상태줄 연결)를 말한다", () => {
+    const rows = live();
+    rows[5].source_error = "agy_csrf_required";
+    const agy = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(agy.text.startsWith("관측 실패")).toBe(true);
+    expect(agy.text).toContain("상태줄");
+    expect(agy.tooltip).toContain("CSRF");
+    expect(agy.tooltip).toContain("agy_csrf_required");
+    rows[5].source_error = null; // 결측형 — 관측 전 사유도 상태줄 경로를 가리킨다
+    const pre = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(pre.text).toContain("상태줄");
   });
   it("관측 경로 고장(source_error)은 '관측 전'과 구별된다 — agy 거부 코드 보존", () => {
     const rows = live();
@@ -368,7 +390,7 @@ describe("0.14.42 — 발견된 계정은 전부 한 줄씩(오너 제보: 클�
     expect(agy.text.startsWith("관측 실패")).toBe(true);
     expect(agy.text).toContain("403");
     expect(agy.tooltip).toContain("agy_http_403");
-    for (const code of ["agy_unreachable", "agy_no_quota", "agy_no_port", "agy_no_process", "brand_new_code"]) {
+    for (const code of ["agy_unreachable", "agy_no_quota", "agy_no_port", "agy_no_process", "agy_csrf_required", "brand_new_code"]) {
       rows[5].source_error = code;
       const t = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
       expect({ code, 실패표기: t.text.startsWith("관측 실패") }).toEqual({ code, 실패표기: true });

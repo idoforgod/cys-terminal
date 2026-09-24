@@ -11,6 +11,11 @@
 //! - claude rate의 유일한 생산자는 statusline(usage.report)이다 — usage.rs claude transcript
 //!   분기는 rate를 **이월**하며 updated_at을 현재로 갱신하므로, 여기(note_rate)에는
 //!   **신선 생산된 rate만** 넘긴다(이월분 수용 시 stale이 최신으로 둔갑).
+//!   ★0.14.42 RC4-b: cys 창 **밖** Claude 세션의 statusline 도 계정 전용 입구(`usage.report_account` →
+//!   [`report_outside`])로 들어온다(source "statusline-outside"). 좌석·배지·이벤트·임계는 건드리지 않고
+//!   `note_rate` 하나만 부른다. 이 값은 **표시용**이다 — 같은 UID 의 아무 프로세스나 보낼 수 있으므로
+//!   계정 경보(`alert_rates`)의 근거로 쓰지 않는다(오너 승인 2026-09-23 "표시용 값 · 위조 한계 문서화").
+//! - ★0.14.42 RC2-b: agy 값의 주 경로는 agy 상태줄 훅(좌석 `usage.report` · source "agy-statusline")이다.
 //! - 병합 = 창 벡터 통째 최신 승자(같은 계정 풀은 최신 관측이 진실).
 //!
 //! 잠금 순서 불변식: accounts → (해제) → analytics. 역순 금지(교착).
@@ -64,6 +69,29 @@ pub struct AccountsState {
     ident_cache: HashMap<PathBuf, IdentEntry>,
     last_persisted: HashMap<(AccountKey, String), f64>, // (key, 창 라벨) → 마지막 기록 pct
     last_prune: f64,
+    /// cys 창 밖 보고의 빈도 상한 상태 — (정규화된 프로필 dir) → (마지막 수용 시각, 그때의 rate).
+    /// 키 공간은 검증을 통과한 **알려진 프로필 dir** 뿐이라 크기가 유계다.
+    outside_last: HashMap<PathBuf, (f64, Vec<RateWindow>)>,
+}
+
+/// agy 상태줄 훅이 좌석 `usage.report` 로 보낸 값의 계정 출처 라벨.
+pub const AGY_STATUSLINE_SOURCE: &str = "agy-statusline";
+/// cys 창 밖 Claude 세션(`usage.report_account`)이 보낸 값의 계정 출처 라벨 — 표시용(경보 제외).
+pub const OUTSIDE_SOURCE: &str = "statusline-outside";
+/// 창 밖 보고 `session_file` 길이 상한(바이트).
+const OUTSIDE_SESSION_FILE_MAX: usize = 1024;
+/// 창 밖 보고 rate 배열 원소 상한(5h·7d 둘 + 여유) — 넘으면 통째 거절.
+pub const OUTSIDE_RATE_MAX_ENTRIES: usize = 4;
+/// 창 밖 보고: 같은 프로필의 수용 간격 하한(초) — 값이 바뀌어도 이보다 잦으면 버린다.
+const OUTSIDE_MIN_INTERVAL_SECS: f64 = 1.0;
+/// 창 밖 보고: 같은 프로필·같은 값이면 이 창 안의 반복을 버린다(초).
+const OUTSIDE_SAME_VALUE_SECS: f64 = 5.0;
+
+/// 창 밖 보고의 처리 결과(수용 또는 빈도 상한으로 버림). 거절은 `Err(사유 코드)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutsideOutcome {
+    Accepted,
+    Throttled,
 }
 
 /// 세션 파일 경로 → 프로필 dir (`…/<profile>/projects/<munged>/<sess>.jsonl`의 profile 부분).
@@ -166,6 +194,8 @@ fn claude_identity_at(
 }
 
 /// agent + 세션 파일 → (키, 라벨, plan, 프로필 표기). claude는 신원 해석 실패 시 None(스킵).
+/// (운영 경로는 홈을 명시하는 `resolve_at` 을 쓴다 — `note_rate_at` 경유. 이 얇은 판은 기존 검체용.)
+#[cfg(test)]
 fn resolve(
     state: &mut AccountsState,
     agent: &str,
@@ -219,16 +249,30 @@ pub fn note_rate(
     source: &str,
     now: f64,
 ) {
+    note_rate_at(daemon, dirs::home_dir().as_deref(), agent, session_file, rate, source, now);
+}
+
+/// 홈을 인자로 받는 시험 이음매(동작은 `note_rate` 와 같다). 반환: 계정에 **귀속됐는가**
+/// (false = rate 가 비었거나 신원 불명 — 아무것도 쓰지 않았다).
+fn note_rate_at(
+    daemon: &Arc<Daemon>,
+    home: Option<&Path>,
+    agent: &str,
+    session_file: &str,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> bool {
     if rate.is_empty() {
-        return;
+        return false;
     }
     // 1) accounts 락 안에서 병합 + 영속 대상 수집 (analytics 락은 여기서 잡지 않는다 — 잠금 순서)
     let mut to_persist: Vec<(AccountKey, String, String, f64, Option<f64>)> = Vec::new();
     let mut do_prune = false;
     {
         let mut st = daemon.accounts.lock().unwrap();
-        let Some((key, label, plan, profile)) = resolve(&mut st, agent, session_file) else {
-            return; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
+        let Some((key, label, plan, profile)) = resolve_at(&mut st, home, agent, session_file) else {
+            return false; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
         };
         let view = st.views.entry(key.clone()).or_insert_with(|| AccountView {
             key: key.clone(),
@@ -277,7 +321,7 @@ pub fn note_rate(
     }
     // 2) analytics 영속 (accounts 락 해제 후)
     if to_persist.is_empty() && !do_prune {
-        return;
+        return true;
     }
     let guard = daemon.analytics.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
@@ -290,6 +334,7 @@ pub fn note_rate(
             crate::analytics::prune_rate_snapshots(conn, now - SNAPSHOT_RETAIN_SECS);
         }
     }
+    true
 }
 
 /// 부트 시드 — ① 알려진 프로필 dir 스캔으로 계정 **발견**(관측 전에도 3계정이 다 보이게),
@@ -584,6 +629,128 @@ fn note_agy_error_at(daemon: &Arc<Daemon>, home: Option<&Path>, err: Option<&str
     }
 }
 
+/// agy 상태줄 훅이 이 데몬에 값을 보낸 적이 있고 그것이 antigravity 계정의 최신 출처인가 — 참이면 RPC
+/// 수집기는 프로브를 멈춘다(CSRF 로 막힌 경로를 계속 두드려 값 있는 행에 '관측 실패'를 덧씌우지 않게).
+pub fn agy_statusline_authoritative(daemon: &Arc<Daemon>) -> bool {
+    let st = daemon.accounts.lock().unwrap();
+    let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
+    st.views.get(&key).is_some_and(|v| v.source == AGY_STATUSLINE_SOURCE)
+}
+
+/// cys 창 밖 보고의 **모양** 검증(순수 — 파일시스템 무접촉). 통과하면 걸러진 rate 를 돌려준다.
+/// `raw_len` = 요청의 rate 배열 원소 수(파싱 전) — 크기 상한은 파싱 전에 건다.
+pub fn outside_shape(
+    session_file: &str,
+    rate: Vec<RateWindow>,
+    raw_len: usize,
+    now: f64,
+) -> Result<Vec<RateWindow>, &'static str> {
+    // 경로: usage.register 와 같은 규칙(절대 · `..` 없음 · .jsonl) + 길이 상한.
+    let p = Path::new(session_file);
+    if session_file.is_empty()
+        || session_file.len() > OUTSIDE_SESSION_FILE_MAX
+        || !p.is_absolute()
+        || p.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        || p.extension().and_then(|e| e.to_str()) != Some("jsonl")
+    {
+        return Err("session_file_invalid");
+    }
+    if raw_len > OUTSIDE_RATE_MAX_ENTRIES {
+        return Err("rate_invalid");
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for w in rate {
+        if !seen.insert(w.label.clone()) {
+            return Err("rate_invalid"); // 같은 창 두 번 = 기형 — 어느 쪽이 참인지 고르지 않는다
+        }
+        // 창별로 거른다(불량 창만 버림): 5h·7d 만 · 유한 0..=1000(100 초과는 UI 가 '100%+' 로 정직 표기) ·
+        // 리셋 시각은 있으면 [now-1일, now+8일] 안.
+        let label_ok = w.label == "5h" || w.label == "7d";
+        let pct_ok = w.used_pct.is_finite() && (0.0..=1000.0).contains(&w.used_pct);
+        let reset_ok = w
+            .resets_at
+            .is_none_or(|r| r.is_finite() && r >= now - 86400.0 && r <= now + 8.0 * 86400.0);
+        if label_ok && pct_ok && reset_ok {
+            out.push(w);
+        }
+    }
+    if out.is_empty() {
+        Err("rate_invalid")
+    } else {
+        Ok(out)
+    }
+}
+
+/// cys 창 밖 Claude 세션의 계정 전용 보고 — 호출자 검사(pane 아님)는 **부른 쪽**(handlers)이 먼저 끝낸다.
+pub fn report_outside(
+    daemon: &Arc<Daemon>,
+    session_file: &str,
+    rate: &[RateWindow],
+    now: f64,
+) -> Result<OutsideOutcome, &'static str> {
+    report_outside_at(daemon, dirs::home_dir().as_deref(), session_file, rate, now)
+}
+
+/// 홈을 인자로 받는 시험 이음매.
+///
+/// 검증(전부 거절 = 귀속 0 · fail-closed):
+///   ① transcript 가 **실재하는 파일**이다(정규화 = 심볼릭 링크를 풀어 실제 위치로 판정).
+///   ② 그 실제 위치가 **알려진 프로필 dir**(`profile_gate::enumerate_profile_dirs` — 계정 발견과 같은 목록)의
+///      `<dir>/projects/` 아래다. 명명 규칙 밖 `CLAUDE_CONFIG_DIR` 세션은 귀속되지 않는다(한계 · 문서화).
+///   ③ 귀속 표기 경로(열거된 dir 기준)가 `profile_dir_from_session` 으로 **같은 dir** 로 되돌아간다
+///      (홈 경로 자체에 `/projects/` 가 든 기계에서 다른 dir 로 오귀속되는 것을 막는다).
+///   ④ 빈도 상한(프로필 dir 단위): [`OUTSIDE_MIN_INTERVAL_SECS`] 하한 · 같은 값은 [`OUTSIDE_SAME_VALUE_SECS`].
+///   ⑤ 그 프로필의 신원(`.claude.json` oauthAccount)이 읽힌다 — 아니면 `identity_unresolved`.
+/// 쓰는 것은 `note_rate`(계정 뷰 + rate 스냅샷) 하나뿐이다 — 좌석·배지·이벤트·임계·비용 무접촉.
+fn report_outside_at(
+    daemon: &Arc<Daemon>,
+    home: Option<&Path>,
+    session_file: &str,
+    rate: &[RateWindow],
+    now: f64,
+) -> Result<OutsideOutcome, &'static str> {
+    let home = home.ok_or("home_unknown")?;
+    // ① 실재 — 먼저 한다(없는 경로면 홈 폴더 열거조차 하지 않는다).
+    let canon = std::fs::canonicalize(session_file).map_err(|_| "session_file_missing")?;
+    if !canon.is_file() || canon.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Err("session_file_missing");
+    }
+    // ② 알려진 프로필 dir 의 projects/ 아래(정규화끼리 비교 — 홈이 심볼릭 링크를 지나도 같게 판정)
+    let (dir, canon_dir) = cys::profile_gate::enumerate_profile_dirs(home)
+        .into_iter()
+        .find_map(|d| {
+            let cd = std::fs::canonicalize(&d).ok()?;
+            let projects = cd.join("projects");
+            (canon.starts_with(&projects) && canon != projects).then_some((d, cd))
+        })
+        .ok_or("session_file_outside_profiles")?;
+    // ③ 귀속은 열거된(홈 기준) dir 로 표기한다 — 신원 규칙(기본 ~/.claude → 홈 직하)과 프로필 표기가 홈 기준이다.
+    let rel = canon.strip_prefix(&canon_dir).map_err(|_| "session_file_outside_profiles")?;
+    let attributed = dir.join(rel);
+    let attributed = attributed.to_string_lossy().into_owned();
+    if profile_dir_from_session(&attributed).as_deref() != Some(dir.as_path()) {
+        return Err("session_file_ambiguous");
+    }
+    // ④ 빈도 상한 — 확인과 기록을 한 임계영역에서(동시 보고 둘이 함께 통과하지 않게).
+    {
+        let mut st = daemon.accounts.lock().unwrap();
+        if let Some((t, last)) = st.outside_last.get(&canon_dir) {
+            let dt = now - *t;
+            if dt < OUTSIDE_MIN_INTERVAL_SECS || (dt < OUTSIDE_SAME_VALUE_SECS && last.as_slice() == rate) {
+                return Ok(OutsideOutcome::Throttled);
+            }
+        }
+        st.outside_last.insert(canon_dir, (now, rate.to_vec()));
+    }
+    // ⑤ 귀속 — note_rate 하나뿐
+    if note_rate_at(daemon, Some(home), "claude", &attributed, rate, OUTSIDE_SOURCE, now) {
+        Ok(OutsideOutcome::Accepted)
+    } else {
+        Err("identity_unresolved")
+    }
+}
+
 /// 소진 예측 최소 표본 수·스팬(초) — 미달 시 예측 미표시(표본 2개 기울기의 황당 예측 차단).
 const PREDICT_MIN_POINTS: usize = 3;
 const PREDICT_MIN_SPAN_SECS: f64 = 600.0;
@@ -688,6 +855,11 @@ pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
     let mut out = Vec::new();
     for v in st.views.values() {
         if v.updated_at == 0.0 {
+            continue;
+        }
+        // 창 밖(표시용) 값은 경보 근거가 아니다 — 같은 UID 의 아무 프로세스나 보낼 수 있다(위조 한계).
+        // 같은 계정이라도 좌석 보고가 최신이면 그 값으로 평가된다.
+        if v.source == OUTSIDE_SOURCE {
             continue;
         }
         for w in &v.rate {
@@ -1012,5 +1184,189 @@ mod tests {
         assert_eq!(rows[0]["source"], "agy-rpc", "관측값·출처는 그대로");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ───────── 0.14.42 RC4-b — cys 창 밖 Claude 세션의 계정 전용 보고(수정 전 적색) ─────────
+    // 픽스처는 전부 합성값이다(u-out·o@example.test 등) — 실계정 식별자 금지.
+
+    fn rw(label: &str, pct: f64, resets: Option<f64>) -> RateWindow {
+        RateWindow { label: label.into(), used_pct: pct, resets_at: resets }
+    }
+
+    fn claude_rows(d: &Arc<Daemon>) -> Vec<Value> {
+        local_json(d, crate::state::now_epoch())
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["provider"] == "claude")
+            .cloned()
+            .collect()
+    }
+
+    /// 모양 검증(파일시스템 무접촉): 경로는 절대·`..` 없음·`.jsonl`·길이 상한 · rate 는 5h/7d 만·중복 없음·
+    /// 유한 0..=1000(100 초과는 자르지 않는다 — UI 가 100%+ 로 표기)·리셋 시각은 [now-1일, now+8일] · 원소 수 상한.
+    #[test]
+    fn outside_shape_rejects_malformed_reports() {
+        let now = 1_800_000_000.0;
+        let ok_rate = || vec![rw("5h", 33.0, Some(now + 3600.0)), rw("7d", 44.0, Some(now + 86400.0))];
+        let good_path = std::env::temp_dir().join("x/.claude-3/projects/-w/s.jsonl"); // 플랫폼 절대경로
+        let good = good_path.to_str().unwrap();
+        assert_eq!(outside_shape(good, ok_rate(), 2, now).unwrap().len(), 2);
+        for bad in [
+            "",
+            "relative/.claude-3/projects/-w/s.jsonl",
+            "/Users/x/.claude-3/projects/-w/../../../etc/s.jsonl",
+            "/Users/x/.claude-3/projects/-w/s.txt",
+            "/Users/x/.claude-3/projects/-w/s.jsonl.bak",
+        ] {
+            assert_eq!(outside_shape(bad, ok_rate(), 2, now), Err("session_file_invalid"), "{bad:?}");
+        }
+        let long = good_path.with_file_name(format!("{}.jsonl", "a".repeat(1100)));
+        assert_eq!(outside_shape(long.to_str().unwrap(), ok_rate(), 2, now), Err("session_file_invalid"), "길이 상한");
+        // 크기 상한: 파싱 전 원소 수
+        assert_eq!(outside_shape(good, ok_rate(), OUTSIDE_RATE_MAX_ENTRIES + 1, now), Err("rate_invalid"));
+        // 중복 라벨 = 기형(통째 거절)
+        assert_eq!(outside_shape(good, vec![rw("5h", 1.0, None), rw("5h", 2.0, None)], 2, now), Err("rate_invalid"));
+        // 모르는 창·비유한·음수·과대·리셋 범위 밖 = 그 창만 버림 → 남는 게 없으면 거절(결측형 음성 대조)
+        for w in [
+            rw("1m", 10.0, None),
+            rw("5h", f64::NAN, None),
+            rw("5h", f64::INFINITY, None),
+            rw("5h", -1.0, None),
+            rw("5h", 1000.5, None),
+            rw("5h", 10.0, Some(now - 2.0 * 86400.0)),
+            rw("5h", 10.0, Some(now + 9.0 * 86400.0)),
+            rw("5h", 10.0, Some(f64::NAN)),
+        ] {
+            assert_eq!(outside_shape(good, vec![w.clone()], 1, now), Err("rate_invalid"), "{w:?}");
+        }
+        assert_eq!(outside_shape(good, vec![], 0, now), Err("rate_invalid"), "빈 rate");
+        let kept = outside_shape(good, vec![rw("5h", 120.0, None), rw("1m", 3.0, None)], 2, now).unwrap();
+        assert_eq!(kept, vec![rw("5h", 120.0, None)], "100 초과는 자르지 않고 모르는 창만 버린다");
+    }
+
+    /// 실재하는 transcript + 알려진 프로필 dir → 그 프로필 신원의 계정에 귀속(source statusline-outside).
+    /// 좌석·배지·이벤트는 건드리지 않는다(버스 seq 불변).
+    #[test]
+    fn outside_report_attributes_a_real_transcript_in_a_known_profile() {
+        let dir = tmp("daemon-out-ok");
+        let home = tmp("home-out-ok");
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-out","emailAddress":"o@example.test"}}"#);
+        write(&home.join(".claude-3/projects/-w/s.jsonl"), "{}\n");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let seq0 = d.bus.latest_seq();
+        let now = crate::state::now_epoch();
+        let sess = home.join(".claude-3/projects/-w/s.jsonl");
+        let got = report_outside_at(&d, Some(&home), &sess.to_string_lossy(), &[rw("5h", 33.0, None), rw("7d", 44.0, None)], now);
+        assert_eq!(got, Ok(OutsideOutcome::Accepted), "창 밖 보고가 귀속되지 않았다");
+        let rows = claude_rows(&d);
+        let row = rows.iter().find(|r| r["account_id"] == "u-out").expect("계정 행 없음");
+        assert_eq!(row["source"], OUTSIDE_SOURCE);
+        assert_eq!(row["rate"][0]["used_pct"], json!(33.0));
+        assert_eq!(row["profiles"], json!([".claude-3"]), "프로필 표기는 홈 상대(정규화 경로 아님)");
+        assert_eq!(d.bus.latest_seq(), seq0, "창 밖 보고가 이벤트를 발행했다");
+        assert!(d.surfaces.lock().unwrap().is_empty());
+        // 기본 프로필(~/.claude — 신원은 홈 직하 ~/.claude.json · RC3 규칙)도 같은 입구로 귀속된다
+        write(&home.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"u-def","emailAddress":"d@example.test"}}"#);
+        write(&home.join(".claude/projects/-w/t.jsonl"), "{}\n");
+        let t = home.join(".claude/projects/-w/t.jsonl");
+        assert_eq!(report_outside_at(&d, Some(&home), &t.to_string_lossy(), &[rw("5h", 5.0, None)], now), Ok(OutsideOutcome::Accepted));
+        assert!(claude_rows(&d).iter().any(|r| r["account_id"] == "u-def" && r["profiles"] == json!([".claude"])));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 경로가 아무것도 증명하지 못하면 귀속하지 않는다(fail-closed · 유령 계정 0): 파일 부재 · 알려진 프로필 밖 ·
+    /// 프로필 안이지만 projects/ 밖 · 밖을 가리키는 심볼릭 링크 · 신원 없는 프로필 · 홈 불명.
+    #[test]
+    fn outside_report_rejects_paths_that_prove_nothing() {
+        let dir = tmp("daemon-out-bad");
+        let home = tmp("home-out-bad");
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-3"}}"#);
+        write(&home.join("elsewhere/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-else"}}"#);
+        write(&home.join("elsewhere/projects/-w/s.jsonl"), "{}\n");
+        write(&home.join(".claude-3/stray.jsonl"), "{}\n");
+        std::fs::create_dir_all(home.join(".claude-5/projects/-w")).unwrap();
+        write(&home.join(".claude-5/projects/-w/s.jsonl"), "{}\n"); // 신원(.claude.json) 없는 프로필
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let now = crate::state::now_epoch();
+        let r = [rw("5h", 50.0, None)];
+        let p = |rel: &str| home.join(rel).to_string_lossy().into_owned();
+        assert_eq!(report_outside_at(&d, Some(&home), &p(".claude-3/projects/-w/nope.jsonl"), &r, now), Err("session_file_missing"));
+        assert_eq!(report_outside_at(&d, Some(&home), &p("elsewhere/projects/-w/s.jsonl"), &r, now), Err("session_file_outside_profiles"));
+        assert_eq!(report_outside_at(&d, Some(&home), &p(".claude-3/stray.jsonl"), &r, now), Err("session_file_outside_profiles"));
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(home.join(".claude-3/projects/-l")).unwrap();
+            std::os::unix::fs::symlink(home.join("elsewhere/projects/-w/s.jsonl"), home.join(".claude-3/projects/-l/s.jsonl")).unwrap();
+            assert_eq!(
+                report_outside_at(&d, Some(&home), &p(".claude-3/projects/-l/s.jsonl"), &r, now),
+                Err("session_file_outside_profiles"),
+                "밖을 가리키는 링크는 정규화 경로로 판정한다"
+            );
+        }
+        assert_eq!(report_outside_at(&d, Some(&home), &p(".claude-5/projects/-w/s.jsonl"), &r, now), Err("identity_unresolved"));
+        assert_eq!(report_outside_at(&d, None, &p(".claude-3/projects/-w/nope.jsonl"), &r, now), Err("home_unknown"));
+        assert!(claude_rows(&d).is_empty(), "거절된 보고가 계정 행을 만들었다: {:?}", claude_rows(&d));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 빈도 상한(프로필 dir 단위): 1초 안의 재보고는 값이 달라도 버리고, 같은 값은 5초 안에서 버린다.
+    #[test]
+    fn outside_report_is_rate_limited_per_profile() {
+        let dir = tmp("daemon-out-rl");
+        let home = tmp("home-out-rl");
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-rl"}}"#);
+        write(&home.join(".claude-3/projects/-w/s.jsonl"), "{}\n");
+        write(&home.join(".claude-3/projects/-w/t.jsonl"), "{}\n"); // 같은 프로필의 다른 세션
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let s = home.join(".claude-3/projects/-w/s.jsonl").to_string_lossy().into_owned();
+        let t = home.join(".claude-3/projects/-w/t.jsonl").to_string_lossy().into_owned();
+        let t0 = crate::state::now_epoch();
+        let a = [rw("5h", 10.0, None)];
+        let b = [rw("5h", 11.0, None)];
+        assert_eq!(report_outside_at(&d, Some(&home), &s, &a, t0), Ok(OutsideOutcome::Accepted));
+        assert_eq!(report_outside_at(&d, Some(&home), &t, &b, t0 + 0.5), Ok(OutsideOutcome::Throttled), "1초 하한(다른 세션·다른 값이어도)");
+        assert_eq!(report_outside_at(&d, Some(&home), &s, &a, t0 + 2.0), Ok(OutsideOutcome::Throttled), "같은 값 5초");
+        assert_eq!(report_outside_at(&d, Some(&home), &s, &b, t0 + 2.0), Ok(OutsideOutcome::Accepted), "값이 바뀌면 1초 뒤 수용");
+        assert_eq!(report_outside_at(&d, Some(&home), &s, &b, t0 + 7.5), Ok(OutsideOutcome::Accepted), "같은 값도 5초 뒤 수용");
+        let row = claude_rows(&d).into_iter().find(|r| r["account_id"] == "u-rl").unwrap();
+        assert_eq!(row["rate"][0]["used_pct"], json!(11.0));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 창 밖 값은 **표시용** — 계정 경보의 근거가 아니다(위조 가능 · 오너 승인 범위). 같은 계정이라도 좌석 보고가
+    /// 최신이면 경보 대상이다.
+    #[test]
+    fn outside_values_are_display_only_not_alert_inputs() {
+        let dir = tmp("daemon-out-alert");
+        let home = tmp("home-out-alert");
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-al","emailAddress":"al@example.test"}}"#);
+        write(&home.join(".claude-3/projects/-w/s.jsonl"), "{}\n");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let now = crate::state::now_epoch();
+        let sess = home.join(".claude-3/projects/-w/s.jsonl").to_string_lossy().into_owned();
+        assert_eq!(report_outside_at(&d, Some(&home), &sess, &[rw("5h", 97.0, None)], now), Ok(OutsideOutcome::Accepted));
+        assert!(alert_rates(&d).is_empty(), "창 밖(표시용) 값이 경보 입력이 됐다: {:?}", alert_rates(&d));
+        assert!(note_rate_at(&d, Some(&home), "claude", &sess, &[rw("5h", 97.0, None)], "statusline", now + 1.0));
+        assert_eq!(alert_rates(&d), vec![("al@example.test".to_string(), "5h".to_string(), 97.0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RC2-b: agy 상태줄 값이 antigravity 계정의 최신 출처면 RPC 수집기는 물러선다(참) — RPC 값·관측 전·행 없음은 거짓.
+    #[test]
+    fn agy_statusline_becomes_the_authoritative_source() {
+        let dir = tmp("daemon-agy-auth");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        assert!(!agy_statusline_authoritative(&d), "행 없음");
+        let now = crate::state::now_epoch();
+        note_rate(&d, "gemini", "", &[rw("5h", 1.0, None)], "agy-rpc", now);
+        assert!(!agy_statusline_authoritative(&d), "RPC 값");
+        note_rate(&d, "gemini", "", &[rw("5h", 2.0, None)], AGY_STATUSLINE_SOURCE, now + 1.0);
+        assert!(agy_statusline_authoritative(&d), "상태줄 값이 들어왔는데 수집기가 물러서지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
