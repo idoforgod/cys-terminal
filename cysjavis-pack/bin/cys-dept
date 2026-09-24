@@ -188,6 +188,9 @@ _cys_detach_ok(){
 _cys_fm_python(){   # 편성 자식 python — 토큰 경로면 새 세션
   if _cys_detach_ok; then python3 -c "$_CYS_SETSID_PY" python3 "$@"; else python3 "$@"; fi
 }
+# ★(0.14.42 · 원래 있던 결함 수리) 리다이렉트는 **서브셸 바깥**에 둔다 — `( 편성 >>log 2>&1 || true ) &` 는 서브셸 자신이 호출자의
+#   stdout/stderr 파이프를 물려받아, 편성이 끝날 때까지(실편성 수 분 · 부서장 착석 지켜보기 +최대 10분) GUI 의 `output()`·대표의
+#   Bash 도구가 돌아오지 못했다(대표 턴 붙들림 = 회신 적체 · 도구 제한시간 초과 = 거짓 실패). stdin 도 끊는다(/dev/null).
 formation_ensure_async(){
   local name="$1" sock="$2" cwd="${3:-}" fm log logdir lp lpnote
   fm="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py"
@@ -204,16 +207,16 @@ formation_ensure_async(){
   if [ -n "$lp" ]; then
     lpnote="팩=부서 팩($lp)"
     if [ -n "$cwd" ]; then
-      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json || true ) </dev/null >>"$log" 2>&1 &
     else
-      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+      ( CYS_PACK_DIR="$lp" _cys_fm_python "$fm" ensure --socket "$sock" --json || true ) </dev/null >>"$log" 2>&1 &
     fi
   else
     lpnote="팩=종전 팩(${CYS_PACK_DIR:-$PACK_DEFAULT} — 부서 팩 $(dept_pack "$name") 설치 전 또는 호출자 팩 kill-switch)"
     if [ -n "$cwd" ]; then
-      ( _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json >>"$log" 2>&1 || true ) &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --cwd "$cwd" --json || true ) </dev/null >>"$log" 2>&1 &
     else
-      ( _cys_fm_python "$fm" ensure --socket "$sock" --json >>"$log" 2>&1 || true ) &
+      ( _cys_fm_python "$fm" ensure --socket "$sock" --json || true ) </dev/null >>"$log" 2>&1 &
     fi
   fi
   disown 2>/dev/null || true

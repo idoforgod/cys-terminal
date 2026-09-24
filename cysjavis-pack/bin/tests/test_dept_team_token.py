@@ -457,6 +457,65 @@ class T18TokenDaemonDetached(Base):
                         "토큰 경로 cysd 가 호출자 프로세스 그룹에 남았다: %s (호출자 pgid=%d)" % (spawn[0], os.getpgrp()))
 
 
+class T20FormationDoesNotHoldCallerPipes(Base):
+    """편성은 백그라운드다 — 호출자의 stdout/stderr 파이프를 붙들면 안 된다(0.14.42 RE-R3-01 수정 중 발견 · 원래 있던 결함).
+    GUI 는 `cys-dept allocate` 를 `Command::output()`(파이프 EOF 까지 대기)으로, 대표는 Bash 도구로 부른다. 종전
+    `( 편성 >>log 2>&1 || true ) &` 는 **서브셸 자신**이 호출자의 파이프를 물려받아 편성이 끝날 때까지(실편성 수 분 ·
+    편성 결판 알림의 부서장 착석 지켜보기까지 더하면 최대 +10분) 호출자가 돌아오지 못했다 — 대표 턴이 그동안 붙들린다
+    (회신 적체 · 오너 절대 규칙 '턴 안 장시간 대기 금지' 위반 · Bash 도구 제한시간 초과 = 거짓 실패 보고)."""
+
+    HOLD_S = 25
+
+    def _stub(self):
+        b = os.path.join(self.home, ".cys", "pack", "bin")
+        os.makedirs(b, exist_ok=True)
+        pidf = os.path.join(b, "fm.pid")
+        _write_exec(os.path.join(b, "javis_formation.py"),
+                    "#!/usr/bin/env python3\nimport os, time\n"
+                    "open(%r, 'w').write(str(os.getpid()))\ntime.sleep(%d)\n" % (pidf, self.HOLD_S))
+        return pidf
+
+    def _reap(self, pidf):
+        import signal
+        import time as _t
+        for _ in range(50):
+            if os.path.exists(pidf):
+                break
+            _t.sleep(0.1)
+        try:
+            with open(pidf) as f:
+                os.kill(int(f.read().strip()), signal.SIGTERM)   # 이 검체가 띄운 스텁 1개만(pid 지정)
+        except (OSError, ValueError):
+            pass
+
+    def _timed(self, argv, env):
+        import time as _t
+        t0 = _t.time()
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", env=env, timeout=120)
+        return r, _t.time() - t0
+
+    def test_gui_allocate_returns_while_formation_runs(self):
+        self.env = make_env(self.home, role=None)
+        pidf = self._stub()
+        try:
+            r, el = self._timed(["bash", DEPT, "allocate", "--team-spec-b64", spec_b64(good_spec())], self.env)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            self.assertLess(el, self.HOLD_S - 5,
+                            "GUI 경로 allocate 가 백그라운드 편성이 끝날 때까지 호출자 파이프에 붙들렸다(%.1fs)" % el)
+        finally:
+            self._reap(pidf)
+
+    def test_token_create_returns_while_formation_runs(self):
+        pidf = self._stub()
+        try:
+            env = dict(self.env, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC="0")
+            r, el = self._timed(["bash", DEPT, "create", "--team-token", TOKEN], env)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            self.assertLess(el, self.HOLD_S - 5,
+                            "대표 Bash 도구의 create 가 백그라운드 편성이 끝날 때까지 붙들렸다(%.1fs)" % el)
+        finally:
+            self._reap(pidf)
+
 if __name__ == "__main__":
     if not os.environ.get("CYS_PACK_DIR"):
         sys.stderr.write("CYS_PACK_DIR 를 격리 경로로 지정하고 실행하라(라이브 팩 무접촉): "
