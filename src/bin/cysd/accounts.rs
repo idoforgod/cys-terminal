@@ -3,6 +3,11 @@
 //! 핵심 사실(실측 2026-07-16):
 //! - 계정 식별자 = 프로필 dir이 아니라 `<dir>/.claude.json`의 `oauthAccount.accountUuid`.
 //!   프로필 dir은 계정에 N:1이다(~/.claude·~/.claude-work·~/.cys/claude* 가 같은 계정인 식).
+//!   ★예외(0.14.42): `CLAUDE_CONFIG_DIR` 없이 띄운 기본 프로필 `~/.claude` 의 신원은 홈 직하
+//!   `~/.claude.json` 이다 — 위치 규칙 정본은 `cys::profile_gate::identity_config_file`.
+//! - 발견 대상(부트 시드): claude 프로필 dir 전부 · `~/.codex` · agy 데이터 폴더
+//!   `~/.gemini/antigravity-cli`(구 `~/.antigravity` 호환) · `~/.cys/accounts.json` 선언 계정.
+//!   관측이 없어도 행은 있다(updated_at null) — 화면은 관측 전 계정도 한 줄씩 보인다.
 //! - claude rate의 유일한 생산자는 statusline(usage.report)이다 — usage.rs claude transcript
 //!   분기는 rate를 **이월**하며 updated_at을 현재로 갱신하므로, 여기(note_rate)에는
 //!   **신선 생산된 rate만** 넘긴다(이월분 수용 시 stale이 최신으로 둔갑).
@@ -42,9 +47,13 @@ pub struct AccountView {
     pub updated_at: f64, // 0.0 = 관측 전(발견만)
     pub source: String,  // "statusline" | "rollout" | "agy-rpc" | "adapter:<p>" | "snapshot"(부트 복원)
     pub adapter: bool,   // false = 관측 어댑터 없음(accounts.json adapter:"none" 선언 계정)
+    /// 관측 경로 고장 코드(예: "agy_http_403") — '관측 전'과 '경로가 고장나 못 읽음'을 구별한다.
+    /// 신선 관측(note_rate)이 오면 지워진다. 지금은 agy-rpc 경로만 채운다(다른 경로는 데몬이 실패를 못 본다).
+    pub source_error: Option<String>,
 }
 
 struct IdentEntry {
+    file: PathBuf, // 실제로 읽은 신원 파일 — 기본 프로필은 폴더 밖(홈 직하)일 수 있다
     mtime: f64,
     ident: Option<(String, String, Option<String>)>, // (accountUuid, email, plan)
 }
@@ -69,29 +78,65 @@ pub fn profile_dir_from_session(path: &str) -> Option<PathBuf> {
 }
 
 /// 프로필 dir의 홈 상대 표기 (라벨·중복 제거용 — 계정 식별에는 쓰지 않는다)
-fn profile_short(dir: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = dir.strip_prefix(&home) {
+fn profile_short(home: Option<&Path>, dir: &Path) -> String {
+    if let Some(home) = home {
+        if let Ok(rel) = dir.strip_prefix(home) {
             return rel.to_string_lossy().into_owned();
         }
     }
     dir.to_string_lossy().into_owned()
 }
 
-/// `<dir>/.claude.json` → oauthAccount 신원. 잡동사니 dir(.claude-worktrees·백업 등)은
-/// 파일 부재/uuid 부재로 None → 관측 미귀속(유령 계정 0). 자격증명(.credentials.json)은 읽지 않는다.
+/// agy(Antigravity CLI) 데이터 폴더(홈 상대). agy 는 신원을 이 폴더의 토큰 파일 하나
+/// (`antigravity-oauth-token`)로 든다 — 2026-09-23 실측: 라이브 agy 3개 모두 이 파일을 열고 있고,
+/// agy 1.1.24 바이너리에 `antigravity-cli/settings.json`·`-oauth-token` 문자열이 있다. 종전 시드가 보던
+/// `~/.antigravity` 는 이 맥에 없다(→ antigravity 계정이 영영 시드되지 않았다 · RCA RC1).
+const AGY_DATA_DIR: &str = ".gemini/antigravity-cli";
+/// 구 경로 — 종전 시드 기준. 호환으로 남긴다(있으면 같은 계정의 프로필로 함께 적는다).
+const AGY_LEGACY_DIR: &str = ".antigravity";
+
+/// 실제로 존재하는 agy 데이터 폴더(홈 상대 표기) — **존재만** 본다(토큰 내용은 읽지 않는다).
+/// agy 는 데이터 폴더당 계정 1개다(토큰 파일 1개 · 계정 전환 없음 — RCA 1-3) → account_id 는 "default".
+fn antigravity_profiles(home: &Path) -> Vec<String> {
+    [AGY_DATA_DIR, AGY_LEGACY_DIR]
+        .iter()
+        .filter(|rel| home.join(rel).is_dir())
+        .map(|rel| rel.to_string())
+        .collect()
+}
+
+/// 프로필 dir → oauthAccount 신원. 신원 파일 위치는 `cys::profile_gate::identity_config_file` 정본을 따른다
+/// (보통 `<dir>/.claude.json` · `CLAUDE_CONFIG_DIR` 없이 띄운 기본 프로필 `~/.claude` 만 홈 직하
+/// `~/.claude.json`). 잡동사니 dir(.claude-worktrees·백업 등)은 파일 부재/uuid 부재로 None → 관측
+/// 미귀속(유령 계정 0). 자격증명(.credentials.json)은 읽지 않는다.
+/// (운영 경로는 홈을 명시하는 `claude_identity_at` 을 쓴다 — 이 얇은 판은 기존 검체용.)
+#[cfg(test)]
 fn claude_identity(
     state: &mut AccountsState,
     dir: &Path,
 ) -> Option<(String, String, Option<String>)> {
-    let f = dir.join(".claude.json");
+    claude_identity_at(state, dirs::home_dir().as_deref(), dir)
+}
+
+/// 홈을 인자로 받는 시험 이음매. `home == None`(홈 불명)이면 종전 규칙(폴더 안 파일만).
+fn claude_identity_at(
+    state: &mut AccountsState,
+    home: Option<&Path>,
+    dir: &Path,
+) -> Option<(String, String, Option<String>)> {
+    let f = match home {
+        Some(h) => cys::profile_gate::identity_config_file(h, dir),
+        None => dir.join(".claude.json"),
+    };
     let mtime = std::fs::metadata(&f)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs_f64())?;
+    // 캐시는 **읽은 파일** 기준 — 같은 dir 이라도 신원 파일이 바뀌면(명시 CLAUDE_CONFIG_DIR 로 폴더 안
+    // 파일이 새로 생김) 다시 읽는다.
     if let Some(e) = state.ident_cache.get(dir) {
-        if e.mtime == mtime {
+        if e.mtime == mtime && e.file == f {
             return e.ident.clone();
         }
     }
@@ -106,16 +151,17 @@ fn claude_identity(
                 .and_then(|x| x.as_str())
                 .unwrap_or(&uuid)
                 .to_string();
-            let plan = oa
-                .get("userRateLimitTier")
-                .or_else(|| oa.get("organizationRateLimitTier"))
-                .and_then(|x| x.as_str())
+            // ★RC5: 키별로 문자열 판독을 먼저 한다 — `userRateLimitTier` 가 **null 값으로 존재**하면
+            //   `get` 이 Some(Null) 이라 종전 `or_else` 가 조직 등급으로 넘어가지 못했다(전 계정 plan 소실).
+            let plan = ["userRateLimitTier", "organizationRateLimitTier"]
+                .iter()
+                .find_map(|k| oa.get(*k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()))
                 .map(|s| s.to_string());
             Some((uuid, email, plan))
         });
     state
         .ident_cache
-        .insert(dir.to_path_buf(), IdentEntry { mtime, ident: ident.clone() });
+        .insert(dir.to_path_buf(), IdentEntry { file: f, mtime, ident: ident.clone() });
     ident
 }
 
@@ -125,15 +171,25 @@ fn resolve(
     agent: &str,
     session_file: &str,
 ) -> Option<(AccountKey, String, Option<String>, Option<String>)> {
+    resolve_at(state, dirs::home_dir().as_deref(), agent, session_file)
+}
+
+/// 홈을 인자로 받는 시험 이음매.
+fn resolve_at(
+    state: &mut AccountsState,
+    home: Option<&Path>,
+    agent: &str,
+    session_file: &str,
+) -> Option<(AccountKey, String, Option<String>, Option<String>)> {
     match agent {
         "claude" => {
             let dir = profile_dir_from_session(session_file)?;
-            let (uuid, email, plan) = claude_identity(state, &dir)?;
+            let (uuid, email, plan) = claude_identity_at(state, home, &dir)?;
             Some((
                 AccountKey { provider: "claude".into(), account_id: uuid },
                 email,
                 plan,
-                Some(profile_short(&dir)),
+                Some(profile_short(home, &dir)),
             ))
         }
         "codex" => Some((
@@ -146,7 +202,8 @@ fn resolve(
             AccountKey { provider: "antigravity".into(), account_id: "default".into() },
             "Antigravity (agy)".into(),
             None,
-            Some(".antigravity".into()),
+            // 실제로 있는 데이터 폴더를 적는다(없으면 표기 없음 — 지어내지 않는다)
+            home.and_then(|h| antigravity_profiles(h).into_iter().next()),
         )),
         _ => None,
     }
@@ -182,6 +239,7 @@ pub fn note_rate(
             updated_at: 0.0,
             source: String::new(),
             adapter: true,
+            source_error: None,
         });
         view.label = label;
         if plan.is_some() {
@@ -196,6 +254,8 @@ pub fn note_rate(
             view.updated_at = now;
             view.source = source.into();
         }
+        // 신선 관측이 왔다 = 그 경로는 지금 동작한다 — 경로 고장 표기를 지운다.
+        view.source_error = None;
         for w in rate {
             let pk = (key.clone(), w.label.clone());
             let prev = st.last_persisted.get(&pk).copied();
@@ -237,65 +297,9 @@ pub fn note_rate(
 /// ③ ~/.cys/accounts.json 선언 계정 등록(미래 provider — adapter:"none"은 '관측 없음' 상주).
 pub fn seed_known(daemon: &Arc<Daemon>) {
     if let Some(home) = dirs::home_dir() {
-        // ★(U-17) 프로필 dir 열거 규칙은 **lib 정본 하나**다(`cys::profile_gate`). 종전엔 이
-        //   함수 안에만 있었고, 인증 판정기가 같은 규칙을 재구현하면 두 벌이 갈린다(한쪽만
-        //   새 부서 접두를 배우는 식) — 같은 목록을 두 소비처가 보게 한다.
-        //   ★판정은 바뀌지 않는다: 정본 함수는 종전 두 루프와 **같은 이름 규칙·같은 순서**이며
-        //   `is_dir()` 검사도 더하지 않는다(동작 동일성 유지 — 완화도 강화도 아니다).
-        let dirs_to_check: Vec<PathBuf> = cys::profile_gate::enumerate_profile_dirs(&home);
         {
             let mut st = daemon.accounts.lock().unwrap();
-            for dir in dirs_to_check {
-                if let Some((uuid, email, plan)) = claude_identity(&mut st, &dir) {
-                    let key = AccountKey { provider: "claude".into(), account_id: uuid };
-                    let short = profile_short(&dir);
-                    let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
-                        key,
-                        label: email.clone(),
-                        plan: plan.clone(),
-                        profiles: BTreeSet::new(),
-                        rate: Vec::new(),
-                        updated_at: 0.0,
-                        source: String::new(),
-                        adapter: true,
-                    });
-                    v.profiles.insert(short);
-                }
-            }
-            if home.join(".codex").is_dir() {
-                st.views
-                    .entry(AccountKey { provider: "codex".into(), account_id: "default".into() })
-                    .or_insert_with(|| AccountView {
-                        key: AccountKey { provider: "codex".into(), account_id: "default".into() },
-                        label: "OpenAI Codex".into(),
-                        plan: None,
-                        profiles: BTreeSet::from([".codex".to_string()]),
-                        rate: Vec::new(),
-                        updated_at: 0.0,
-                        source: String::new(),
-                        adapter: true,
-                    });
-            }
-            if home.join(".antigravity").is_dir() {
-                st.views
-                    .entry(AccountKey {
-                        provider: "antigravity".into(),
-                        account_id: "default".into(),
-                    })
-                    .or_insert_with(|| AccountView {
-                        key: AccountKey {
-                            provider: "antigravity".into(),
-                            account_id: "default".into(),
-                        },
-                        label: "Antigravity (agy)".into(),
-                        plan: None,
-                        profiles: BTreeSet::from([".antigravity".to_string()]),
-                        rate: Vec::new(),
-                        updated_at: 0.0,
-                        source: String::new(),
-                        adapter: true,
-                    });
-            }
+            seed_discovered(&mut st, &home);
         }
         // 선언 계정(~/.cys/accounts.json — pack 밖: pack 스윕/치유 사정권 회피)
         let decl = home.join(".cys/accounts.json");
@@ -324,6 +328,7 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
                         updated_at: 0.0,
                         source: String::new(),
                         adapter,
+                        source_error: None,
                     });
                 }
             }
@@ -352,6 +357,7 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
                 updated_at: 0.0,
                 source: String::new(),
                 adapter: true,
+                source_error: None,
             });
             // 라이브 관측 전(발견만·또는 스냅샷 예열 중)에만 덮는다 — 신선 관측 우선.
             let seeded = v.source.is_empty() || v.source == "snapshot";
@@ -368,6 +374,67 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
                 }
             }
         }
+    }
+}
+
+/// 부트 시드 ①(설치 흔적 스캔) — 홈을 인자로 받는 시험 이음매. 계정 **발견**만 한다(rate 없음).
+fn seed_discovered(st: &mut AccountsState, home: &Path) {
+    // ★(U-17) 프로필 dir 열거 규칙은 **lib 정본 하나**다(`cys::profile_gate`). 종전엔 이
+    //   함수 안에만 있었고, 인증 판정기가 같은 규칙을 재구현하면 두 벌이 갈린다(한쪽만
+    //   새 부서 접두를 배우는 식) — 같은 목록을 두 소비처가 보게 한다.
+    //   ★판정은 바뀌지 않는다: 정본 함수는 종전 두 루프와 **같은 이름 규칙·같은 순서**이며
+    //   `is_dir()` 검사도 더하지 않는다(동작 동일성 유지 — 완화도 강화도 아니다).
+    let dirs_to_check: Vec<PathBuf> = cys::profile_gate::enumerate_profile_dirs(home);
+    for dir in dirs_to_check {
+        if let Some((uuid, email, plan)) = claude_identity_at(st, Some(home), &dir) {
+            let key = AccountKey { provider: "claude".into(), account_id: uuid };
+            let short = profile_short(Some(home), &dir);
+            let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
+                key,
+                label: email.clone(),
+                plan: plan.clone(),
+                profiles: BTreeSet::new(),
+                rate: Vec::new(),
+                updated_at: 0.0,
+                source: String::new(),
+                adapter: true,
+                source_error: None,
+            });
+            v.profiles.insert(short);
+        }
+    }
+    if home.join(".codex").is_dir() {
+        st.views
+            .entry(AccountKey { provider: "codex".into(), account_id: "default".into() })
+            .or_insert_with(|| AccountView {
+                key: AccountKey { provider: "codex".into(), account_id: "default".into() },
+                label: "OpenAI Codex".into(),
+                plan: None,
+                profiles: BTreeSet::from([".codex".to_string()]),
+                rate: Vec::new(),
+                updated_at: 0.0,
+                source: String::new(),
+                adapter: true,
+                source_error: None,
+            });
+    }
+    // ★RC1: agy 데이터 폴더(`~/.gemini/antigravity-cli`) — 종전엔 `~/.antigravity` 만 봐서 이 맥의
+    //   antigravity 계정이 영영 시드되지 않았다. 구 경로는 호환으로 함께 본다. **존재만** 본다.
+    let agy = antigravity_profiles(home);
+    if !agy.is_empty() {
+        let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
+        let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
+            key,
+            label: "Antigravity (agy)".into(),
+            plan: None,
+            profiles: BTreeSet::new(),
+            rate: Vec::new(),
+            updated_at: 0.0,
+            source: String::new(),
+            adapter: true,
+            source_error: None,
+        });
+        v.profiles.extend(agy);
     }
 }
 
@@ -452,12 +519,46 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
         updated_at: 0.0,
         source: String::new(),
         adapter: true,
+        source_error: None,
     });
     if now >= v.updated_at {
         v.rate = rate.to_vec();
         v.updated_at = now;
         v.source = source.into();
         v.adapter = true;
+    }
+}
+
+/// agy 관측 경로(agy-rpc)의 고장 코드를 antigravity 계정 행에 싣는다(`None` = 지움).
+/// 수집기가 한 틱을 통째로 본 뒤 부른다 — 그 틱에 한 좌석이라도 성공했으면 부르지 않는다(성공은
+/// note_rate 가 지운다). agy 좌석이 하나도 없으면 `None` 으로 옛 오류를 지운다(좌석이 없는 것은 고장이 아니다).
+/// 오류가 왔는데 계정 행이 없으면 만든다 — cys 창에 agy 좌석이 떠 있다는 것 자체가 그 계정의 흔적이다.
+pub fn note_agy_error(daemon: &Arc<Daemon>, err: Option<&str>) {
+    let mut st = daemon.accounts.lock().unwrap();
+    let key = AccountKey { provider: "antigravity".into(), account_id: "default".into() };
+    match err {
+        Some(code) => {
+            let profiles: BTreeSet<String> = dirs::home_dir()
+                .map(|h| antigravity_profiles(&h).into_iter().collect())
+                .unwrap_or_default();
+            let v = st.views.entry(key.clone()).or_insert_with(|| AccountView {
+                key,
+                label: "Antigravity (agy)".into(),
+                plan: None,
+                profiles,
+                rate: Vec::new(),
+                updated_at: 0.0,
+                source: String::new(),
+                adapter: true,
+                source_error: None,
+            });
+            v.source_error = Some(code.to_string());
+        }
+        None => {
+            if let Some(v) = st.views.get_mut(&key) {
+                v.source_error = None;
+            }
+        }
     }
 }
 
@@ -490,6 +591,8 @@ pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
                     "stale_secs": if v.updated_at > 0.0 { json!((now - v.updated_at).max(0.0)) } else { Value::Null },
                     "source": v.source,
                     "adapter": v.adapter,
+                    // null = 경로 고장 없음(관측 전이거나 정상). 값 = 그 경로가 지금 고장(예: agy_http_403).
+                    "source_error": v.source_error,
                 })
             })
             .collect()
@@ -659,5 +762,151 @@ mod tests {
         assert!(resolve(&mut st, "mystery", "").is_none());
         // claude인데 신원 해석 불가 → None(스킵 — 유령 계정 금지)
         assert!(resolve(&mut st, "claude", "/nonexist/projects/x/s.jsonl").is_none());
+    }
+
+    // ───────── 0.14.42 계정 누락 수리 — 재현 검체(수정 전 적색) ─────────
+
+    fn write(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    const ID_NULL_TIER: &str = r#"{"oauthAccount":{"accountUuid":"u-home","emailAddress":"h@x.y","userRateLimitTier":null,"organizationRateLimitTier":"default_claude_max_20x"}}"#;
+
+    /// RC5: `userRateLimitTier` 가 **null 값으로 존재**하면 조직 등급으로 넘어가야 한다(결측형 음성 대조).
+    #[test]
+    fn plan_falls_back_to_org_tier_when_user_tier_is_null() {
+        let dir = tmp("nulltier");
+        write(&dir.join(".claude.json"), ID_NULL_TIER);
+        let mut st = AccountsState::default();
+        let got = claude_identity(&mut st, &dir).unwrap();
+        assert_eq!(got.2.as_deref(), Some("default_claude_max_20x"), "null 사용자 등급이 조직 등급을 가렸다");
+        // 키 자체가 없을 때도 같다(부재형) · 사용자 등급이 값이면 그것이 이긴다(값형)
+        let d2 = tmp("notier");
+        write(&d2.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"u2","organizationRateLimitTier":"org"}}"#);
+        assert_eq!(claude_identity(&mut st, &d2).unwrap().2.as_deref(), Some("org"));
+        let d3 = tmp("usertier");
+        write(&d3.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"u3","userRateLimitTier":"max_5x","organizationRateLimitTier":"org"}}"#);
+        assert_eq!(claude_identity(&mut st, &d3).unwrap().2.as_deref(), Some("max_5x"));
+        // 둘 다 null → None(없는 값을 지어내지 않는다)
+        let d4 = tmp("bothnull");
+        write(&d4.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"u4","userRateLimitTier":null,"organizationRateLimitTier":null}}"#);
+        assert_eq!(claude_identity(&mut st, &d4).unwrap().2, None);
+    }
+
+    /// RC3: `CLAUDE_CONFIG_DIR` 없이 띄운 기본 프로필 `~/.claude` 의 신원은 **홈 직하 `~/.claude.json`** 이다
+    /// (Claude Code: `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`). 기본 프로필만 그렇다.
+    #[test]
+    fn default_profile_identity_reads_home_level_claude_json() {
+        let home = tmp("home-default");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        write(&home.join(".claude.json"), ID_NULL_TIER);
+        let mut st = AccountsState::default();
+        let got = claude_identity_at(&mut st, Some(&home), &home.join(".claude"));
+        assert_eq!(got.as_ref().map(|g| g.0.as_str()), Some("u-home"), "기본 프로필 신원을 못 읽었다");
+        // 기본 프로필이 아닌 폴더는 홈 직하로 넘어가지 않는다(다른 계정을 주워 오지 않는다)
+        std::fs::create_dir_all(home.join(".claude-9")).unwrap();
+        assert!(claude_identity_at(&mut st, Some(&home), &home.join(".claude-9")).is_none());
+        let other = tmp("elsewhere");
+        assert!(claude_identity_at(&mut st, Some(&home), &other.join(".claude")).is_none());
+        // 명시 CLAUDE_CONFIG_DIR=~/.claude 로 생긴 `<dir>/.claude.json` 이 있으면 그것이 이긴다
+        // (캐시는 **읽은 파일** 기준 — 같은 dir 이라도 파일이 바뀌면 다시 읽는다).
+        write(&home.join(".claude/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-explicit"}}"#);
+        assert_eq!(claude_identity_at(&mut st, Some(&home), &home.join(".claude")).unwrap().0, "u-explicit");
+        // 홈을 모르면 종전 규칙(폴더 안 파일만)
+        let lone = tmp("lone");
+        std::fs::create_dir_all(lone.join(".claude")).unwrap();
+        write(&lone.join(".claude.json"), ID_NULL_TIER);
+        assert!(claude_identity_at(&mut st, None, &lone.join(".claude")).is_none());
+    }
+
+    /// RC3(관측): 기본 프로필 세션(`~/.claude/projects/…`)의 statusline 보고가 계정에 귀속된다.
+    #[test]
+    fn default_profile_session_is_attributed() {
+        let home = tmp("home-attr");
+        std::fs::create_dir_all(home.join(".claude/projects/-w")).unwrap();
+        write(&home.join(".claude.json"), ID_NULL_TIER);
+        let mut st = AccountsState::default();
+        let sess = home.join(".claude/projects/-w/s.jsonl");
+        let got = resolve_at(&mut st, Some(&home), "claude", &sess.to_string_lossy());
+        let (k, _, plan, prof) = got.expect("기본 프로필 세션이 어느 계정에도 귀속되지 않았다");
+        assert_eq!((k.provider.as_str(), k.account_id.as_str()), ("claude", "u-home"));
+        assert_eq!(plan.as_deref(), Some("default_claude_max_20x"));
+        assert_eq!(prof.as_deref(), Some(".claude"));
+    }
+
+    /// RC1+RC3(발견): 가짜 홈의 설치 흔적만으로 **모든** 계정이 시드된다 —
+    /// 기본 프로필(`~/.claude.json`)·Antigravity(`~/.gemini/antigravity-cli`)·구 경로(`~/.antigravity`) 호환.
+    #[test]
+    fn seed_discovers_default_profile_and_antigravity_data_dir() {
+        let home = tmp("home-seed");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        write(&home.join(".claude.json"), ID_NULL_TIER);
+        write(&home.join(".claude-3/.claude.json"), r#"{"oauthAccount":{"accountUuid":"u-3","emailAddress":"c@x.y"}}"#);
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        // agy 는 이 파일 하나로 신원을 든다 — **존재만** 본다(내용은 읽지 않는다: 더미 문자열)
+        write(&home.join(".gemini/antigravity-cli/antigravity-oauth-token"), "dummy-not-a-token");
+        let mut st = AccountsState::default();
+        seed_discovered(&mut st, &home);
+        let key = |p: &str, a: &str| AccountKey { provider: p.into(), account_id: a.into() };
+        let def = st.views.get(&key("claude", "u-home")).expect("기본 프로필 계정이 시드되지 않았다(RC3)");
+        assert!(def.profiles.contains(".claude"), "profiles={:?}", def.profiles);
+        assert!(st.views.contains_key(&key("claude", "u-3")));
+        assert!(st.views.contains_key(&key("codex", "default")));
+        let agy = st.views.get(&key("antigravity", "default")).expect("antigravity 가 시드되지 않았다(RC1)");
+        assert!(agy.profiles.contains(".gemini/antigravity-cli"), "profiles={:?}", agy.profiles);
+        assert_eq!(agy.updated_at, 0.0, "발견만 — 관측 전");
+        // 구 경로 호환: `~/.antigravity` 만 있어도 시드된다
+        let old = tmp("home-legacy");
+        std::fs::create_dir_all(old.join(".antigravity")).unwrap();
+        let mut st2 = AccountsState::default();
+        seed_discovered(&mut st2, &old);
+        assert!(st2.views[&key("antigravity", "default")].profiles.contains(".antigravity"));
+        // 음성 대조(부재형): 흔적이 하나도 없으면 antigravity 도 없다(유령 계정 0)
+        let bare = tmp("home-bare");
+        let mut st3 = AccountsState::default();
+        seed_discovered(&mut st3, &bare);
+        assert!(!st3.views.contains_key(&key("antigravity", "default")));
+        assert!(st3.views.is_empty(), "빈 홈에서 계정이 생겼다: {:?}", st3.views.keys().collect::<Vec<_>>());
+    }
+
+    /// RC1(관측 표기): agy 관측의 프로필 표기는 실제 데이터 폴더다.
+    #[test]
+    fn antigravity_observation_labels_the_real_data_dir() {
+        let home = tmp("home-agy-obs");
+        std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        let mut st = AccountsState::default();
+        let (k, _, _, prof) = resolve_at(&mut st, Some(&home), "gemini", "").unwrap();
+        assert_eq!(k.provider, "antigravity");
+        assert_eq!(prof.as_deref(), Some(".gemini/antigravity-cli"));
+    }
+
+    /// RC2(정직 표기): 관측 경로 고장은 '관측 전'과 구별돼 행에 실리고, 신선 관측이 오면 지워진다.
+    #[test]
+    fn source_error_is_exposed_until_a_fresh_observation_clears_it() {
+        let dir = tmp("daemon-srcerr");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        note_agy_error(&d, Some("agy_http_403"));
+        let now = crate::state::now_epoch();
+        let rows = local_json(&d, now);
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["provider"] == "antigravity")
+            .expect("관측 경로 오류가 난 antigravity 계정이 행으로 나오지 않는다");
+        assert_eq!(row["source_error"], "agy_http_403");
+        assert!(row["updated_at"].is_null());
+        note_rate(&d, "gemini", "", &[RateWindow { label: "5h".into(), used_pct: 10.0, resets_at: None }], "agy-rpc", now);
+        let rows = local_json(&d, now);
+        let row = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").unwrap();
+        assert!(row["source_error"].is_null(), "신선 관측 뒤에도 오류가 남았다: {row}");
+        assert_eq!(row["source"], "agy-rpc");
+        // 오류 해제(None) — 좌석이 사라지면 옛 오류를 남기지 않는다
+        note_agy_error(&d, Some("agy_unreachable"));
+        note_agy_error(&d, None);
+        let rows = local_json(&d, now);
+        let row = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").unwrap();
+        assert!(row["source_error"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

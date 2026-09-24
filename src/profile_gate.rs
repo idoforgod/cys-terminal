@@ -114,7 +114,8 @@ pub enum ProfileRoot {
 /// 같은 규칙을 재구현하면 두 벌이 갈린다(한쪽만 새 부서 접두를 배우는 식). 규칙은 여기 하나다.
 ///
 /// ★**디렉터리 여부를 보지 않는다** — `seed_known` 종전 동작과 바이트 동일한 판정을 유지하기
-/// 위해서다(이름만 맞으면 후보에 넣고, 실제 판별은 `<dir>/.claude.json` 읽기가 한다).
+/// 위해서다(이름만 맞으면 후보에 넣고, 실제 판별은 신원 파일 읽기가 한다 — 관측은
+/// [`identity_config_file`](기본 프로필만 홈 직하), 인증 판정은 [`read_config`](`<dir>/.claude.json`)).
 /// 여기에 `is_dir()` 을 더하는 것은 완화가 아니라 **동작 변경**이므로 별도 단위에서 다룬다.
 pub fn is_profile_dir_name(root: ProfileRoot, name: &str) -> bool {
     match root {
@@ -143,6 +144,36 @@ pub fn enumerate_profile_dirs(home: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// ★**관측용** 신원 파일(`oauthAccount` 가 사는 `.claude.json`) 위치 — "이 세션은 어느 계정인가".
+/// 소비처: `cysd/accounts.rs`(계정 발견·statusline 귀속). 규칙은 여기 하나다.
+///
+/// Claude Code 는 전역 설정을 `join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")` 에 둔다(2.1.281
+/// 바이너리 실측 · prod 접미 ""). 그래서 `CLAUDE_CONFIG_DIR` **없이** 띄운 기본 프로필 `~/.claude` 의
+/// 신원은 폴더 안이 아니라 **홈 직하 `~/.claude.json`** 이다(이 맥 실측: `~/.claude/.claude.json` 부재 ·
+/// `~/.claude.json` 수정 시각 = `~/.claude` 최신 대화 기록). 명시 `CLAUDE_CONFIG_DIR=<dir>` 세션은
+/// `<dir>/.claude.json` 이다 — `~/.claude` 를 명시로 띄운 적이 있어 폴더 안 파일이 **있으면 그것이 이긴다**.
+/// 기본 프로필이 아닌 폴더는 홈 직하로 넘어가지 않는다(다른 계정의 신원을 주워 오지 않는다).
+///
+/// ★**인증 판정기([`read_config`])는 이 규칙을 쓰지 않는다 — 의도된 차이다.** 판정기의 질문은 "cys 가 이
+/// 폴더로 좌석을 만들면 관문 앞에 서는가" 이고, cys 좌석은 늘 `CLAUDE_CONFIG_DIR` 를 **명시**해 띄운다.
+/// 명시 좌석이 읽는 것은 `<dir>/.claude.json` 과 **경로해시** Keychain(`Claude Code-credentials-<sha256[:8]>`)
+/// 이며, 홈 직하 파일과 무접미 Keychain 은 env 없는 기본 실행만의 것이다. 판정기가 홈 직하로 넘어가면
+/// 관문 앞 좌석을 통과로 접는다(fail-open). 열거 규칙([`enumerate_profile_dirs`])도 그대로다.
+/// 이 함수는 쓰기를 하지 않는다(존재 확인만).
+pub fn identity_config_file(home: &Path, profile_dir: &Path) -> PathBuf {
+    let inside = profile_dir.join(".claude.json");
+    let inside_exists = inside.is_file();
+    identity_config_file_from(home, profile_dir, inside_exists)
+}
+
+/// 위 규칙의 **순수** 절반(IO 없음).
+pub fn identity_config_file_from(home: &Path, profile_dir: &Path, inside_exists: bool) -> PathBuf {
+    if !inside_exists && profile_dir == home.join(".claude") {
+        return home.join(".claude.json");
+    }
+    profile_dir.join(".claude.json")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1113,5 +1144,49 @@ mod tests {
             "판정기가 프로필 dir 에 파일을 만들었다"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0.14.42 RC3: **관측**(이 세션은 어느 계정인가)의 신원 파일 규칙 — `CLAUDE_CONFIG_DIR` 없이 띄운
+    /// 기본 프로필 `~/.claude` 만 홈 직하 `~/.claude.json` 이다(Claude Code 2.1.281 실측:
+    /// `join(process.env.CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`).
+    ///
+    /// ★그리고 **인증 판정기(`read_config`)는 바뀌지 않는다** — cys 좌석은 늘 `CLAUDE_CONFIG_DIR` 를
+    /// 명시해 띄우므로, 그 좌석이 읽는 것은 `<dir>/.claude.json` 과 경로해시 Keychain 이다. 기본
+    /// 프로필의 홈 직하 파일로 좌석을 판정하면 관문 앞 좌석을 통과로 접는다(fail-open). 이 검체는 두
+    /// 규칙이 **의도적으로 다르다**는 것을 함께 박제한다.
+    #[test]
+    fn identity_file_rule_for_observation_and_the_gate_stays_strict() {
+        let base = std::env::temp_dir()
+            .join(format!("cys-pg-identfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".claude")).unwrap();
+        std::fs::create_dir_all(base.join(".claude-2")).unwrap();
+        std::fs::write(base.join(".claude.json"), CFG_SUBSCRIPTION_CLAIM).unwrap();
+        // 관측 규칙: 기본 프로필은 홈 직하로
+        assert_eq!(identity_config_file(&base, &base.join(".claude")), base.join(".claude.json"));
+        // 기본 프로필이 아니면 폴더 안 파일(없어도 그 경로 — 다른 계정을 주워 오지 않는다)
+        assert_eq!(
+            identity_config_file(&base, &base.join(".claude-2")),
+            base.join(".claude-2").join(".claude.json")
+        );
+        // 명시 CLAUDE_CONFIG_DIR=~/.claude 로 생긴 폴더 안 파일이 있으면 그것이 이긴다
+        std::fs::write(base.join(".claude").join(".claude.json"), "{}").unwrap();
+        assert_eq!(
+            identity_config_file(&base, &base.join(".claude")),
+            base.join(".claude").join(".claude.json")
+        );
+        std::fs::remove_file(base.join(".claude").join(".claude.json")).unwrap();
+        // ★인증 판정기는 홈 직하로 넘어가지 않는다 — 관문 앞(Absent) 그대로(fail-closed 방향 유지)
+        assert_eq!(read_config(&base.join(".claude")), ConfigEvidence::Absent);
+        let (_, v) = profile_auth_report(&base.join(".claude"), None);
+        assert_eq!(v.class, AuthClass::OnboardingPending);
+        // 열거 집합도 그대로다(`.claude.json` 은 프로필 dir 이 아니다)
+        let mut names: Vec<String> = enumerate_profile_dirs(&base)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![".claude".to_string(), ".claude-2".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

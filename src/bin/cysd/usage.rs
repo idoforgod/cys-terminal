@@ -1182,6 +1182,11 @@ pub fn claude_project_component(cwd: &str) -> String {
 // 실행 변동 → lsof로 발견·probe로 검증·캐시. 파일 tail 수집기와 분리된 저빈도 비동기
 // 태스크(async curl — tokio 워커 미블로킹). HTTP 클라이언트 의존성을 더하지 않으려 curl
 // 셸아웃을 쓴다(codex의 lsof 셸아웃과 동형). 실패·미설치는 graceful(배지 없음 유지).
+// ★0.14.42(2026-09-23 RCA RC2): 이 경로는 한 번도 값을 내지 못했다. (a) lsof 에 `-a` 가 없어 남의 포트를
+// 두드렸고(수리: -a + agy 로그의 언어 서버 포트), (b) 맞는 포트였을 때도 값이 없었다 — agy 1.1.24 바이너리에
+// `missing CSRF token`·`x-codeium-csrf-token` 문자열이 있어 CSRF 요구가 유력하나 **미확정**(라이브 프로브는
+// 오너 승인 사안). 그래서 실패를 삼키지 않고 종류별 코드(agy_http_<코드> 등)를 계정 행 source_error 로 올린다
+// — 설치 뒤 화면의 코드가 곧 (b) 의 판정 근거가 된다.
 
 const AGY_SVC: &str = "exa.language_server_pb.LanguageServerService";
 
@@ -1229,6 +1234,168 @@ pub fn parse_agy_quota(v: &Value) -> Vec<RateWindow> {
     out
 }
 
+/// agy 가 LISTEN 하는 TCP 포트를 묻는 lsof 인자(순수 — 핀 테스트).
+///
+/// ★`-a` 필수(0.14.42 RC2-a): lsof 는 선택 조건(`-p`·`-i`)을 기본 **OR** 로 합친다. 종전 인자에는 `-a` 가
+/// 없어 "이 pid 의 파일 **또는** 기계 전체의 LISTEN 소켓"이 나왔고, 12개 상한과 겹쳐 각 데몬이 자기 agy 가
+/// 아니라 Discord·aside-daemon·pid 가 가장 작은 (다른 부서의) agy 포트를 두드렸다(2026-09-23 실측).
+fn agy_lsof_listen_args(pid: u32) -> Vec<String> {
+    let pid = pid.to_string();
+    ["-nP", "-a", "-p", pid.as_str(), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// agy 가 연 파일 목록을 묻는 lsof 인자 — 자기 로그 파일을 찾는다(선택 조건이 하나라 OR 문제는 없다).
+fn agy_lsof_files_args(pid: u32) -> Vec<String> {
+    let pid = pid.to_string();
+    ["-nP", "-a", "-p", pid.as_str(), "-Fn"].iter().map(|s| s.to_string()).collect()
+}
+
+/// agy 로그의 언어 서버 줄 머리말(agy 1.1.x `server.go`). 2026-09-23 실측: 로그 4개 모두 첫 ~300바이트에
+/// `… Language server listening on random port at <N> for HTTPS (gRPC)` 와 바로 아래 `<N+1> for HTTP` 가 있다.
+const AGY_LS_LINE: &str = "Language server listening on random port at ";
+/// 로그에서 읽는 머리 상한 — 줄이 첫머리에 있으므로 수 MB 로그 전체를 15초마다 읽지 않는다.
+const AGY_LOG_HEAD_BYTES: u64 = 16 * 1024;
+
+/// agy 로그 본문 → 언어 서버 **HTTPS** 포트(순수 — 핀). 줄이 여럿이면(재기동) 마지막 것. HTTP 줄·숫자 아님·
+/// u16 범위 밖은 버린다(추측 금지).
+pub fn parse_agy_ls_https_port(log_text: &str) -> Option<u16> {
+    let mut last = None;
+    for line in log_text.lines() {
+        let Some(i) = line.find(AGY_LS_LINE) else {
+            continue;
+        };
+        let rest = &line[i + AGY_LS_LINE.len()..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let (num, tail) = rest.split_at(end);
+        let proto = tail
+            .trim_start()
+            .strip_prefix("for ")
+            .and_then(|t| t.split_whitespace().next())
+            .unwrap_or("");
+        if proto != "HTTPS" {
+            continue;
+        }
+        if let Ok(p) = num.parse::<u16>() {
+            if p > 0 {
+                last = Some(p);
+            }
+        }
+    }
+    last
+}
+
+/// `lsof -Fn` 출력 → agy 자신의 로그 파일(`…/antigravity-cli/log/cli-*.log`). 토큰 파일·심볼릭 `cli.log`
+/// (`log/` 밖)는 고르지 않는다. 순수 — 핀.
+fn agy_log_path_from_lsof(lsof_fn: &str) -> Option<PathBuf> {
+    lsof_fn
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .filter(|n| n.contains("/antigravity-cli/log/") && n.ends_with(".log"))
+        .last()
+        .map(PathBuf::from)
+}
+
+/// agy 가 연 로그에서 언어 서버 HTTPS 포트를 읽는다 — 포트를 **추측하지 않고** agy 가 스스로 적은 값을 쓴다.
+async fn agy_ls_port_from_log(pid: u32) -> Option<u16> {
+    if cfg!(windows) {
+        return None; // lsof 부재(agy_listen_ports 와 같은 이유 · 스폰 0)
+    }
+    let out = tokio::process::Command::new("lsof")
+        .args(agy_lsof_files_args(pid))
+        .output()
+        .await
+        .ok()?;
+    let path = agy_log_path_from_lsof(&String::from_utf8_lossy(&out.stdout))?;
+    let mut head = Vec::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(AGY_LOG_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    parse_agy_ls_https_port(&String::from_utf8_lossy(&head))
+}
+
+/// 한 포트 프로브의 분류 결과. 실패도 **종류별로** 남긴다 — 종전엔 전부 조용히 None 이라 "경로 고장"과
+/// "아직 관측 전"이 화면에서 구별되지 않았다(0.14.42 RC2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgyProbe {
+    /// 200 + Gemini 쿼터 그룹.
+    Ok(Vec<RateWindow>),
+    /// 언어 서버가 HTTP 로 답했지만 성공이 아니다(예: 401/403 — CSRF 요구 가설). 코드 보존.
+    Http(u16),
+    /// 200 인데 Gemini 쿼터가 없다(스키마 드리프트).
+    NoQuota,
+    /// 연결·TLS·시간 초과 — 그 포트에 언어 서버가 없다.
+    Unreachable,
+}
+
+/// curl 결과 → 분류(순수 — 핀). stdout 은 `본문 + "\n" + HTTP 코드`(`-w "\n%{http_code}"`) 형태다.
+fn classify_agy_probe(curl_ok: bool, stdout: &[u8]) -> AgyProbe {
+    if !curl_ok {
+        return AgyProbe::Unreachable;
+    }
+    let text = String::from_utf8_lossy(stdout);
+    let Some(nl) = text.rfind('\n') else {
+        return AgyProbe::Unreachable;
+    };
+    let (body, code) = (&text[..nl], text[nl + 1..].trim());
+    let Ok(code) = code.parse::<u16>() else {
+        return AgyProbe::Unreachable;
+    };
+    if code == 0 {
+        return AgyProbe::Unreachable; // curl "000" = HTTP 응답 자체가 없다
+    }
+    if code != 200 {
+        return AgyProbe::Http(code);
+    }
+    let Ok(v) = serde_json::from_str::<Value>(body) else {
+        return AgyProbe::NoQuota;
+    };
+    let rate = parse_agy_quota(&v);
+    if rate.is_empty() {
+        AgyProbe::NoQuota
+    } else {
+        AgyProbe::Ok(rate)
+    }
+}
+
+/// 계정 행 `source_error` 코드(안정 문자열 — UI 가 사람 말로 옮긴다). 성공은 코드 없음.
+fn agy_error_code(p: &AgyProbe) -> Option<String> {
+    match p {
+        AgyProbe::Ok(_) => None,
+        AgyProbe::Http(c) => Some(format!("agy_http_{c}")),
+        AgyProbe::NoQuota => Some("agy_no_quota".into()),
+        AgyProbe::Unreachable => Some("agy_unreachable".into()),
+    }
+}
+/// agy 좌석은 있는데 그 아래 agy 프로세스를 못 찾았다.
+const AGY_ERR_NO_PROCESS: &str = "agy_no_process";
+/// agy 는 찾았는데 물어볼 포트가 하나도 없다.
+const AGY_ERR_NO_PORT: &str = "agy_no_port";
+
+/// 한 틱에 좌석·포트마다 실패 이유가 다르면 **가장 멀리 간** 실패를 적는다 — 언어 서버가 직접 답한 거부가
+/// 가장 구체적인 사실이다.
+fn agy_error_rank(code: &str) -> u8 {
+    if code.starts_with("agy_http_") || code == "agy_no_quota" {
+        4
+    } else if code == "agy_unreachable" {
+        3
+    } else if code == AGY_ERR_NO_PORT {
+        2
+    } else {
+        1
+    }
+}
+
+fn keep_worse(best: &mut Option<String>, code: String) {
+    if best.as_deref().map_or(true, |b| agy_error_rank(&code) > agy_error_rank(b)) {
+        *best = Some(code);
+    }
+}
+
 /// agy 프로세스가 LISTEN하는 127.0.0.1/localhost 포트 목록 (lsof — codex 패턴 동형, 와일드카드 제외).
 ///
 /// ★U5(0.14.41): Windows 는 **스폰 0** 으로 조기 반환한다 — lsof 가 없어 원래도 빈 목록이었고
@@ -1239,7 +1406,7 @@ async fn agy_listen_ports(pid: u32) -> Vec<u16> {
         return Vec::new();
     }
     let Ok(out) = tokio::process::Command::new("lsof")
-        .args(["-nP", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN", "-Fn"])
+        .args(agy_lsof_listen_args(pid))
         .output()
         .await
     else {
@@ -1264,8 +1431,8 @@ async fn agy_listen_ports(pid: u32) -> Vec<u16> {
 }
 
 /// 한 포트로 RetrieveUserQuotaSummary 프로브 (async curl -sk, self-signed 수용·2s 타임아웃).
-/// 성공 시 Gemini 쿼터 RateWindow, 아니면 None(잘못된 포트·실패).
-async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
+/// 결과는 분류해 돌려준다(성공·거부 코드·쿼터 없음·도달 불가) — 실패를 삼키지 않는다.
+async fn agy_quota_probe(port: u16) -> AgyProbe {
     use crate::state::HideConsole;
     let url = format!("https://127.0.0.1:{port}/{AGY_SVC}/RetrieveUserQuotaSummary");
     let fut = tokio::process::Command::new("curl")
@@ -1281,6 +1448,9 @@ async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
             "connect-protocol-version: 1",
             "--data",
             "{}",
+            // 본문 뒤에 HTTP 코드를 한 줄 덧붙인다 — 거부(401/403 등)를 '도달 불가'와 구별하려고(RC2).
+            "-w",
+            "\n%{http_code}",
             // R-CLI-3(부차): URL이 고정 localhost(포트 숫자)라 실위험은 없으나 동형 패턴 방어심층 —
             // `--` 옵션 종결자로 URL을 위치 인자로 강제한다.
             "--",
@@ -1289,19 +1459,9 @@ async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
         // Windows: 주기 프로브가 콘솔 창을 반복 플래시하지 않게(콘솔 없는 cysd의 콘솔 자식).
         .hide_console()
         .output();
-    let out = tokio::time::timeout(Duration::from_secs(3), fut)
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let rate = parse_agy_quota(&v);
-    if rate.is_empty() {
-        None
-    } else {
-        Some(rate)
+    match tokio::time::timeout(Duration::from_secs(3), fut).await {
+        Ok(Ok(out)) => classify_agy_probe(out.status.success(), &out.stdout),
+        _ => AgyProbe::Unreachable,
     }
 }
 
@@ -1344,31 +1504,65 @@ fn update_agy_usage(daemon: &Arc<Daemon>, s: &Arc<Surface>, rate: Vec<RateWindow
     }
 }
 
-/// 한 agy surface의 쿼터 수집 — 캐시 포트 우선, 실패 시 lsof 재발견·probe. 전부 실패면 graceful.
-async fn collect_agy_for(daemon: &Arc<Daemon>, s: &Arc<Surface>, ports: &mut HashMap<u64, u16>) {
-    let mut candidates: Vec<u16> = Vec::new();
-    if let Some(p) = ports.get(&s.id) {
-        candidates.push(*p);
-    }
-    let (agy_pid, _) = find_agent_descendant(s.pid, "agy");
-    if let Some(pid) = agy_pid {
-        for p in agy_listen_ports(pid).await {
-            if !candidates.contains(&p) {
-                candidates.push(p);
+/// 한 agy surface의 쿼터 수집. 순서: ① 직전 성공 포트(캐시) → ② agy 가 연 로그의 언어 서버 HTTPS 포트(결정론)
+/// → ③ 폴백: 이 agy 가 LISTEN 하는 localhost 포트(`-a` 로 AND · 상한 12). 실패면 가장 구체적인 오류 코드.
+async fn collect_agy_for(
+    daemon: &Arc<Daemon>,
+    s: &Arc<Surface>,
+    ports: &mut HashMap<u64, u16>,
+) -> Result<(), String> {
+    let mut best: Option<String> = None;
+    if let Some(p) = ports.get(&s.id).copied() {
+        match agy_quota_probe(p).await {
+            AgyProbe::Ok(rate) => {
+                update_agy_usage(daemon, s, rate);
+                return Ok(());
+            }
+            other => {
+                ports.remove(&s.id); // 캐시 무효화 — 아래에서 재발견
+                if let Some(c) = agy_error_code(&other) {
+                    keep_worse(&mut best, c);
+                }
             }
         }
     }
-    for port in candidates {
-        if let Some(rate) = agy_quota_probe(port).await {
-            ports.insert(s.id, port);
-            update_agy_usage(daemon, s, rate);
-            return;
+    let (agy_pid, _) = find_agent_descendant(s.pid, "agy");
+    let Some(pid) = agy_pid else {
+        return Err(best.unwrap_or_else(|| AGY_ERR_NO_PROCESS.into()));
+    };
+    let log_port = agy_ls_port_from_log(pid).await;
+    let mut candidates: Vec<u16> = log_port.into_iter().collect();
+    for p in agy_listen_ports(pid).await {
+        if !candidates.contains(&p) {
+            candidates.push(p);
         }
     }
-    ports.remove(&s.id); // 캐시 무효화 — 다음 틱에 재발견 (배지는 갱신 안 함 = 정직)
+    if candidates.is_empty() {
+        return Err(best.unwrap_or_else(|| AGY_ERR_NO_PORT.into()));
+    }
+    for port in candidates {
+        let r = agy_quota_probe(port).await;
+        if let AgyProbe::Ok(rate) = r {
+            ports.insert(s.id, port);
+            update_agy_usage(daemon, s, rate);
+            return Ok(());
+        }
+        let reached_ls = matches!(r, AgyProbe::Http(_) | AgyProbe::NoQuota);
+        if let Some(c) = agy_error_code(&r) {
+            keep_worse(&mut best, c);
+        }
+        // agy 가 스스로 적은 언어 서버 포트가 HTTP 로 답했다 = 언어 서버는 찾았다. 나머지 포트(같은 agy 의 다른
+        // 리스너)를 더 두드려도 쿼터 서비스가 아니다 — 소음만 늘린다.
+        if reached_ls && Some(port) == log_port {
+            break;
+        }
+    }
+    Err(best.unwrap_or_else(|| "agy_unreachable".into()))
 }
 
 /// agy(Antigravity) 쿼터 수집기 — 파일 tail과 분리된 저빈도 비동기 태스크.
+/// 틱마다 결과를 계정 행에 정직하게 남긴다: 한 좌석이라도 성공 → (note_rate 가 오류를 지움) · 전부 실패 →
+/// 가장 구체적인 오류 코드 · agy 좌석 0 → 오류 지움(좌석이 없는 것은 고장이 아니다).
 pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
         let mut ports: HashMap<u64, u16> = HashMap::new();
@@ -1394,8 +1588,18 @@ pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
             };
             let live: HashSet<u64> = surfaces.iter().map(|s| s.id).collect();
             ports.retain(|sid, _| live.contains(sid));
-            for s in surfaces {
-                collect_agy_for(&daemon, &s, &mut ports).await;
+            let mut any_ok = false;
+            let mut worst: Option<String> = None;
+            for s in &surfaces {
+                match collect_agy_for(&daemon, s, &mut ports).await {
+                    Ok(()) => any_ok = true,
+                    Err(code) => keep_worse(&mut worst, code),
+                }
+            }
+            if surfaces.is_empty() {
+                crate::accounts::note_agy_error(&daemon, None);
+            } else if !any_ok {
+                crate::accounts::note_agy_error(&daemon, worst.as_deref());
             }
         }
     });
@@ -2013,5 +2217,80 @@ mod tests {
         assert_eq!(c.sessions.len(), 1, "세션도 리셋");
         assert!((c.today_cost_usd - 0.2).abs() < 1e-9, "비용도 리셋");
         assert_eq!(c.model_tokens.len(), 1, "모델믹스도 리셋");
+    }
+
+    // ───────── 0.14.42 RC2 — agy 관측 경로 재현 검체(수정 전 적색) ─────────
+
+    /// RC2-a: lsof 는 선택 조건을 기본 **OR** 로 합친다. `-a` 가 없으면 "이 pid 의 파일 **또는** 기계 전체의
+    /// LISTEN 소켓"이 나와 남의 포트(Discord·다른 부서의 agy)를 두드린다(2026-09-23 실측).
+    #[test]
+    fn agy_lsof_args_and_the_pid_with_the_listen_filter() {
+        let a = super::agy_lsof_listen_args(61666);
+        assert!(a.iter().any(|x| x == "-a"), "lsof 선택 조건이 OR 로 묶인다(-a 부재): {a:?}");
+        let i = a.iter().position(|x| x == "-p").expect("-p");
+        assert_eq!(a[i + 1], "61666");
+        for need in ["-iTCP", "-sTCP:LISTEN", "-Fn"] {
+            assert!(a.iter().any(|x| x == need), "{need} 부재: {a:?}");
+        }
+    }
+
+    /// RC2-a: agy 언어 서버 포트는 agy 가 연 로그의 첫머리에 결정론으로 적힌다(2026-09-23 실측 4개 로그 모두
+    /// 273바이트 지점). HTTPS 줄만 — 바로 아래 HTTP 줄(포트+1)을 고르면 안 된다.
+    #[test]
+    fn agy_ls_https_port_is_read_from_the_log_line() {
+        let head = "Log file created at: 2026/09/23 12:30:08\n\
+            I0923 12:30:08.268390      25 server.go:625] Language server listening on random port at 65193 for HTTPS\n\
+            I0923 12:30:08.268654      25 server.go:633] Language server listening on random port at 65194 for HTTP\n";
+        assert_eq!(super::parse_agy_ls_https_port(head), Some(65193));
+        // HTTP 줄만 있으면 없다(추측 금지) · 빈 입력·숫자 아님도 없다
+        assert_eq!(
+            super::parse_agy_ls_https_port("x] Language server listening on random port at 65194 for HTTP\n"),
+            None
+        );
+        assert_eq!(super::parse_agy_ls_https_port(""), None);
+        assert_eq!(
+            super::parse_agy_ls_https_port("Language server listening on random port at 99999999 for HTTPS"),
+            None
+        );
+        // 재기동으로 줄이 둘이면 마지막(현재) 포트
+        let two = "Language server listening on random port at 1111 for HTTPS\n\
+                   Language server listening on random port at 2222 for HTTPS\n";
+        assert_eq!(super::parse_agy_ls_https_port(two), Some(2222));
+    }
+
+    /// RC2-a: `lsof -a -p <agy> -Fn` 출력에서 agy 자신의 로그 파일을 고른다(토큰 파일·심볼릭 cli.log 아님).
+    #[test]
+    fn agy_log_path_is_picked_from_lsof_names() {
+        let out = "p61666\nfcwd\nn/Users/x\nf3\nn/Users/x/.gemini/antigravity-cli/antigravity-oauth-token\n\
+                   f5\nn/Users/x/.gemini/antigravity-cli/log/cli-20260923_123008.log\nf6\nn127.0.0.1:65193\n";
+        assert_eq!(
+            super::agy_log_path_from_lsof(out),
+            Some(PathBuf::from("/Users/x/.gemini/antigravity-cli/log/cli-20260923_123008.log"))
+        );
+        assert_eq!(super::agy_log_path_from_lsof("p1\nn/Users/x/.gemini/antigravity-cli/cli.log\n"), None);
+        assert_eq!(super::agy_log_path_from_lsof(""), None);
+    }
+
+    /// RC2-b(정직 표기): 프로브 결과를 '경로 고장' 종류별로 분류한다 — 거부(HTTP 코드 보존)·쿼터 없음·도달 불가.
+    #[test]
+    fn agy_probe_outcomes_are_classified_not_swallowed() {
+        let quota = r#"{"response":{"groups":[{"displayName":"Gemini Models","buckets":[{"window":"5h","remainingFraction":0.5}]}]}}"#;
+        match super::classify_agy_probe(true, format!("{quota}\n200").as_bytes()) {
+            super::AgyProbe::Ok(r) => assert_eq!(r[0].label, "5h"),
+            other => panic!("정상 응답을 분류하지 못했다: {other:?}"),
+        }
+        assert_eq!(
+            super::classify_agy_probe(true, b"{\"code\":\"unauthenticated\",\"message\":\"missing CSRF token\"}\n401"),
+            super::AgyProbe::Http(401)
+        );
+        assert_eq!(super::classify_agy_probe(true, b"{}\n200"), super::AgyProbe::NoQuota);
+        assert_eq!(super::classify_agy_probe(false, b""), super::AgyProbe::Unreachable);
+        assert_eq!(super::classify_agy_probe(true, b"\n000"), super::AgyProbe::Unreachable);
+        assert_eq!(super::classify_agy_probe(true, b"garbage"), super::AgyProbe::Unreachable);
+        // 오류 코드(계정 행 source_error) — 성공은 코드 없음
+        assert_eq!(super::agy_error_code(&super::AgyProbe::Http(403)).as_deref(), Some("agy_http_403"));
+        assert_eq!(super::agy_error_code(&super::AgyProbe::NoQuota).as_deref(), Some("agy_no_quota"));
+        assert_eq!(super::agy_error_code(&super::AgyProbe::Unreachable).as_deref(), Some("agy_unreachable"));
+        assert_eq!(super::agy_error_code(&super::AgyProbe::Ok(vec![])), None);
     }
 }
