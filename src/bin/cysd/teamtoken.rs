@@ -35,7 +35,6 @@ use crate::state::Daemon;
 use base64::Engine as _;
 use cys::{err_response, ok_response, SpawnPolicy as _};
 use serde_json::{json, Value};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,6 +42,15 @@ use std::time::{Duration, Instant};
 /// 자식 한 번의 수명 상한 — 원장 락 대기 상한(`LOCK_TIMEOUT_S` = 5초)의 세 배. 넘기면 죽이고 거부한다.
 /// (CLI 의 RPC 무진행 상한 40초 안에 allow 경로의 두 번 호출이 들어간다.)
 const CHILD_TIMEOUT: Duration = Duration::from_secs(15);
+/// ★(0.14.42 fatal-fix R4-N3) 오너 문구 조회(`messages` — 원장 락을 잡지 않는다)의 수명 상한. 거부 1건의 최악 경로가
+/// inspect 15 + consume 15 + 문구 15 = 45초로 CLI 무진행 상한(40초)을 넘어, CLI 가 daemon_unreachable 로 포기한 뒤
+/// 데몬이 뒤늦게 토큰을 소비할 수 있었다(생성 없이 소진). 문구 조회는 짧게 묶는다(15 + 15 + 5 = 35초).
+const MESSAGES_TIMEOUT: Duration = Duration::from_secs(5);
+/// ★(0.14.42 fatal-fix R3-F3 · R4-N3) 자식 출력 한 벌의 보관 상한 — 넘는 바이트는 **읽어서 버린다**(파이프가 차서
+/// 자식이 쓰기에서 막히지 않게). 실모듈의 가장 큰 출력(`messages`)은 약 7.5KB 다.
+const OUTPUT_CAP: usize = 256 * 1024;
+/// 자식 종료 뒤 판독 스레드를 기다리는 상한 — 손자가 파이프를 물고 있어도 요청 스레드를 무기한 붙들지 않는다.
+const DRAIN_JOIN: Duration = Duration::from_secs(2);
 
 /// 사유 코드 글자 규칙 — 자식이 내놓은 코드를 응답 코드로 실어도 되는 모양(`[a-z_]{1,48}`).
 fn code_shape_ok(c: &str) -> bool {
@@ -145,6 +153,40 @@ fn internal(detail: String) -> Verdict {
 ///   빌드에서는 실 HOME 대신 격리 루트) · 좌석 env 는 지운다(좌석은 `--surface` 인자로만 — 데몬이
 ///   커널 신원으로 정한 값).
 fn run(socket: &Path, args: &[String], expected: &str) -> Verdict {
+    run_with(socket, args, expected, CHILD_TIMEOUT)
+}
+
+/// ★(0.14.42 fatal-fix R3-F3 · R4-N3) 파이프 판독 스레드 — 자식이 **도는 동안** 출력을 비운다(상한 `OUTPUT_CAP` 까지 보관 ·
+/// 나머지는 읽어서 버림). 종전 `run` 은 자식이 끝난 **뒤에야** 읽어, 파이프 용량(Windows 익명 파이프는 수 KB · 맥·리눅스 64KB)을
+/// 넘게 쓰는 자식이 쓰기에서 막혀 15초 뒤 kill 되고 internal_error 로 접혔다(거부마다 +15초 · 오너 문구 소실 · 사유는
+/// '원장 락 경합?'으로 오보). 스레드 생성 실패는 빈 출력으로 접는다(판정 = 인가 없음 · fail-closed).
+fn drain<R: std::io::Read + Send + 'static>(mut r: R) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new().name("cysd-teamtoken-drain".into()).spawn(move || {
+        let mut kept: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = OUTPUT_CAP.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(kept);
+    });
+    rx
+}
+
+fn drained(rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>) -> String {
+    let bytes = rx.and_then(|r| r.recv_timeout(DRAIN_JOIN).ok()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn run_with(socket: &Path, args: &[String], expected: &str, timeout: Duration) -> Verdict {
     let script = script_path();
     if !script.is_file() {
         return internal(format!("토큰 모듈 부재: {} — 팩이 0.14.42 미만일 수 있다", script.display()));
@@ -167,7 +209,10 @@ fn run(socket: &Path, args: &[String], expected: &str) -> Verdict {
         Ok(c) => c,
         Err(e) => return internal(format!("토큰 모듈 실행 실패({e})")),
     };
-    let deadline = Instant::now() + CHILD_TIMEOUT;
+    // 도는 동안 비운다(위 `drain`) — 끝난 뒤 읽으면 파이프가 찬 자식이 영영 끝나지 않는다.
+    let out_rx = child.stdout.take().map(drain);
+    let err_rx = child.stderr.take().map(drain);
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
@@ -175,7 +220,11 @@ fn run(socket: &Path, args: &[String], expected: &str) -> Verdict {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return internal(format!("토큰 모듈이 {}초 안에 끝나지 않았다(원장 락 경합?)", CHILD_TIMEOUT.as_secs()));
+                let detail = format!("토큰 모듈이 {}초 안에 끝나지 않았다(원장 락 경합 또는 인터프리터 지연)", timeout.as_secs());
+                // ★(fatal-fix R4-N3) 시간 초과 갈래도 데몬 로그에 1줄 — 종전엔 무기록이었다.
+                let tail: String = drained(err_rx).chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+                eprintln!("cysd: team.token {expected} 판정 불가 — {detail} / stderr: {tail}");
+                return internal(detail);
             }
             Err(e) => {
                 let _ = child.kill();
@@ -184,16 +233,10 @@ fn run(socket: &Path, args: &[String], expected: &str) -> Verdict {
             }
         }
     };
-    let mut out = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        let _ = so.read_to_string(&mut out);
-    }
+    let out = drained(out_rx);
     let v = judge(status.code(), &out, expected);
     if !v.authorized && v.code == "internal_error" {
-        let mut err = String::new();
-        if let Some(mut se) = child.stderr.take() {
-            let _ = se.read_to_string(&mut err);
-        }
+        let err = drained(err_rx);
         let tail: String = err.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
         eprintln!("cysd: team.token {expected} 판정 불가 — {} / stderr: {tail}", v.detail);
     }
@@ -208,7 +251,7 @@ fn arg(k: &str, v: &str) -> String {
 /// P3 오너 문구(단일 출처)에서 사유 코드의 1줄을 꺼낸다 — 데몬이 스스로 판정한 거부(좌석 미상·제안
 /// 부재·토큰 모양)에도 같은 문구를 싣기 위해서다. 조회 실패는 빈 문자열(기술 사유는 따로 실린다).
 fn owner_text(socket: &Path, code: &str) -> String {
-    let v = run(socket, &["messages".to_string()], "messages");
+    let v = run_with(socket, &["messages".to_string()], "messages", MESSAGES_TIMEOUT);
     if !v.authorized {
         return String::new();
     }
@@ -480,6 +523,30 @@ pub(crate) mod tests {
         assert_eq!(arg("dept", "-x"), "--dept=-x");
         let a = allow_args("verify", "t", "tp-1", 3, "{}");
         assert!(a.iter().skip(1).all(|s| s.starts_with("--") && s.contains('=')), "{a:?}");
+    }
+
+    /// ★(0.14.42 fatal-fix R3-F3 · R4-N3) 파이프 용량을 넘게 쓰는 자식도 막히지 않는다 — 종전 `run` 은 자식이 끝난 뒤에야
+    /// 읽어서, stderr 300KB 를 쓰는 자식이 쓰기에서 막혀 15초 뒤 kill · internal_error 로 접혔다(수정 전 실측: 15.0s · 적색).
+    #[test]
+    fn chatty_child_does_not_deadlock_on_full_pipes() {
+        crate::delivery::tests::isolate_state_dir_for_thread("tt-chatty");
+        let dir = std::env::temp_dir().join(format!("cys-tt-chatty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("javis_teamtoken.py");
+        std::fs::write(
+            &script,
+            "import sys\nsys.stderr.write('x' * 300000)\nsys.stderr.flush()\nsys.stdout.write('y' * 200000 + '\\n')\n\
+             print('{\"ok\": true, \"code\": \"inspected\", \"message\": \"\", \"detail\": \"\", \"exit\": 0}')\n",
+        )
+        .unwrap();
+        SCRIPT_OVERRIDE.with(|c| *c.borrow_mut() = Some(script.clone()));
+        let t0 = Instant::now();
+        let v = run(Path::new("/tmp/cys-tt-chatty.sock"), &["inspect".into()], "inspected");
+        let took = t0.elapsed();
+        SCRIPT_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(took < Duration::from_secs(10), "파이프가 찬 자식이 막혔다: {took:?} · {} {}", v.code, v.detail);
+        assert!(v.authorized, "큰 출력 뒤 마지막 줄 JSON 판정 실패: {} {}", v.code, v.detail);
     }
 
     /// 스크립트 부재(구 팩) = 인가 없음(internal_error) — 토큰 경로가 조용히 열리지 않는다.
