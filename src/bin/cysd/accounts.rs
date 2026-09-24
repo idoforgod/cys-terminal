@@ -2073,6 +2073,20 @@ mod tests {
         assert!(para.contains("80%·95%"), "계정 경보 기본 임계는 80%·95% 다(alerts.rs AlertConfig::default):\n{para}");
     }
 
+    /// ★fatal-fix W6: 매뉴얼의 agy 상태줄 연결 예시는 POSIX(`sh ~/…`) 하나뿐이었다 — 윈도우는 `~` 가 펼쳐지지 않고 `sh` 가
+    /// 보통 PATH 에 없다. 팩의 윈도우 훅 규약(`bash "C:/…"` 정슬래시 + 따옴표 — javis_preflight `_cys_hook_cmd`)과 같은
+    /// 모양의 예시와 '윈도우 미검증' 고지가 있어야 한다. (W5) 윈도우에서 곧바로 '상태줄 연결 필요'가 보이는 이유도 적는다.
+    #[test]
+    fn manual_gives_a_windows_agy_statusline_example() {
+        let manual = include_str!("../../../USER-MANUAL.md");
+        let start = manual.find("**Antigravity(agy) 값**").expect("agy 값 문단");
+        let end = manual[start..].find("- 갱신: 약 30초마다").map_or(manual.len(), |i| start + i);
+        let para = &manual[start..end];
+        assert!(para.contains(r#"bash \"C:/Users/<you>/.cys/pack/hooks/cys-statusline.sh\""#), "윈도우 예시가 없다:\n{para}");
+        assert!(para.contains("아직 실제로 확인하지 못했습니다"), "윈도우 미검증 고지가 없다");
+        assert!(para.contains("Windows 에서는 cys 가 agy 내부 서버를 아예 찾을 수 없어"), "W5 고지가 없다");
+    }
+
     // ───────── fatal-fix (2026-09-24) — 치명위험 재검증 지적 수정(수정 전 적색) ─────────
     // 픽스처는 전부 합성값(*@example.test · 임시 폴더)이다.
 
