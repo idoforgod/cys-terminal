@@ -6069,12 +6069,15 @@ async function refreshFeed() {
       //  본문은 JSON 원문 대신 이름·하는 일 원문을 그대로 보인다.
       // ★R10(2026-09-23): 안내문은 대화 승인 경로(오너가 대화에서 '만들어' → 훅이 발급한 1회용 토큰으로 master 가
       //  집행)를 먼저 적고, 이 카드는 화면 경로로 남는다 — 카드의 버튼·생성 경로·거부 경로는 그대로다.
+      // ★(0.14.42 리뷰 m6) 대화 경로는 **대표가 먼저 질문(ask)을 연 경우에만** 열린다. 이미 CEO 로 승격된 기계는
+      //  MASTER_DIRECTIVE 가 사용자 소유라 신본 지침이 .new 로만 도착해(pack-merge 전) 대표가 묻지 않는다 — 그래서
+      //  '대표가 여쭈면'을 조건으로 적는다(무조건 "말씀하시면 바로 만듭니다"는 그 기계에서 거짓).
       const parsed = parseTeamProposal(item);
       if (parsed.ok) body.textContent = teamCardText(parsed.spec);
       const note = document.createElement("div");
       note.className = "fi-meta";
       note.textContent = parsed.ok
-        ? "본부 대표가 제안한 새 팀입니다 — 주인님이 대화에서 '만들어'라고 말씀하시면 바로 만듭니다. 화면에서 직접 하시려면 [확인 창 열기] → [만들기]."
+        ? "본부 대표가 제안한 새 팀입니다 — 대표가 대화에서 '만들까요?'라고 여쭈면 '만들어'라고 답해 주시면 바로 만듭니다. 화면에서 직접 하시려면 [확인 창 열기] → [만들기]."
         : `제안 형식 오류(${parsed.reason}) — 만들 수 없습니다. [만들지 않기]로 정리하세요.`;
       const actions = document.createElement("div");
       actions.className = "fi-actions";
@@ -7299,6 +7302,9 @@ function keepModalAboveOpenPanels(ov: HTMLElement): void {
 //   (입력·업데이트·피드백 창 — 전부 .modal-overlay)은 아래 관찰자가 body 직계 자식의 증감으로 따른다.
 function syncModalOpenClass(): void {
   document.body.classList.toggle("modal-open", document.querySelector(".modal-overlay") != null);
+  // ★(0.14.42 리뷰 F2) 확인 창(.confirm-overlay) 밖의 창이 떠 있으면 토스트를 창 밑으로 — 위쪽 조작부(닫기 ×·입력칸)
+  //   클릭 가로채기 방지. 같은 DOM 존재 판정이다(style.css `body:has(.modal-overlay:not(.confirm-overlay))` 의 폴백).
+  document.body.classList.toggle("toast-under-modal", document.querySelector(".modal-overlay:not(.confirm-overlay)") != null);
 }
 try {
   new MutationObserver(syncModalOpenClass).observe(document.body, { childList: true });
@@ -7318,7 +7324,8 @@ function confirmModal(
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
-    ov.className = "modal-overlay";
+    // .confirm-overlay = 토스트가 위에 머무는 유일한 창(본문 + 아래 버튼 줄 — style.css §5-3 회피가 지키는 모양).
+    ov.className = "modal-overlay confirm-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3><p style="white-space:pre-wrap;max-height:52vh;overflow-y:auto"></p>` +
       `<div class="modal-btns"><button class="modal-no"></button>` +

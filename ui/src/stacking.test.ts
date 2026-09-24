@@ -118,6 +118,7 @@ describe("층서 토큰 표(§5-1) — :root 한 곳 정의 · 선택자는 토�
     "--z-drop-indicator",
     "--z-cc-panel",
     "--z-palette",
+    "--z-toast-under-modal",
     "--z-modal",
     "--z-toast",
     "--z-drop-hint",
@@ -194,8 +195,27 @@ describe("토스트 회피(§5-3) — 확인 창이 떠 있으면 토스트를 �
 
   test(":has() 규칙과 폴백(body.modal-open) 규칙은 **따로** 선언한다 — 한 선택자 목록에 섞으면 :has() 를 못 읽는 엔진이 규칙 전체를 버린다", () => {
     const mixed = RULES.filter(
-      (r) => r.sels.some((s) => s.includes(":has(")) && r.sels.some((s) => s.includes("body.modal-open")),
+      (r) =>
+        r.sels.some((s) => s.includes(":has(")) &&
+        r.sels.some((s) => s.includes("body.modal-open") || s.includes("body.toast-under-modal")),
     ).map((r) => r.sels.join(", "));
     expect(mixed).toEqual([]);
   });
+
+  // ★(0.14.42 리뷰 F2) 위의 회피는 창의 **아래쪽 절반**(확인 창 버튼 줄)만 지킨다. 피드백·입력·업데이트 창처럼
+  //   위쪽에 조작부(닫기 ×·입력칸)가 있는 키 큰 창은 좁은 창에서 토스트(z 위)가 그 조작부를 덮어 클릭을
+  //   가로챘다(headless Chrome 1024×700: elementFromPoint(.fb-x) → .toast.feed). 확인 창(confirmModal ·
+  //   .confirm-overlay — 본문 + 아래 버튼 줄뿐)이 아닌 창이 떠 있으면 토스트는 그 창 **밑**(Control Center 위)이다.
+  //   feedbackmodal.ts 의 안전 계약 "결과·오류는 창 안에 보인다(토스트는 창 밑)" 과 같은 방향이다.
+  for (const sel of ["body:has(.modal-overlay:not(.confirm-overlay)) #toasts", "body.toast-under-modal #toasts"]) {
+    test(`${sel} — 확인 창 밖의 창이 떠 있으면 토스트는 그 창 밑 · Control Center 위(클릭 가로채기 0 · 실패 안내는 계속 보인다)`, () => {
+      const rs = exact(sel);
+      expect(rs.length).toBeGreaterThan(0);
+      const z = resolveZ(declOf(rs.map((r) => r.body).join(";"), "z-index"));
+      expect(z).not.toBeNull();
+      expect(z!).toBeLessThan(zOf(".modal-overlay")!);
+      expect(z!).toBeGreaterThan(zOf("#cc-panel")!);
+      expect(z!).toBeGreaterThan(zOf(".palette-overlay")!);
+    });
+  }
 });

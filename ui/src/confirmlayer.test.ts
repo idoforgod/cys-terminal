@@ -77,6 +77,20 @@ describe("body.modal-open — 토스트 회피(§5-3)의 폴백 표지", () => {
   test("확인 창 밖의 창(입력·업데이트·피드백 창 — 전부 .modal-overlay)도 같은 표지를 따르게 body 직계 자식을 지켜본다", () => {
     expect(CODE).toContain("new MutationObserver(syncModalOpenClass).observe(document.body, { childList: true })");
   });
+
+  // ★(0.14.42 리뷰 F2) 키 큰 창 위의 토스트 클릭 가로채기 — 확인 창이 **아닌** 창이 떠 있으면 토스트를 창 밑으로.
+  //   CSS 쪽 관계는 stacking.test.ts 가, 여기는 그 선택자가 기대는 표지(.confirm-overlay · body.toast-under-modal)를 본다.
+  test("confirmModal 의 오버레이는 .confirm-overlay 표지를 단다(토스트가 위에 머무는 유일한 창 — 본문 + 아래 버튼 줄)", () => {
+    const f = fnBody("confirmModal");
+    expect(f).toContain('ov.className = "modal-overlay confirm-overlay";');
+  });
+
+  test("syncModalOpenClass 는 확인 창 밖의 창 존재로 body.toast-under-modal 을 켜고 끈다(:has() 폴백 · 계수 없음)", () => {
+    const s = fnBody("syncModalOpenClass");
+    expect(s).toContain(
+      'classList.toggle("toast-under-modal", document.querySelector(".modal-overlay:not(.confirm-overlay)") != null)',
+    );
+  });
 });
 
 describe("팀 제안 카드 — 안내문(R10)·무음 경로 0(§5-4)", () => {
@@ -88,10 +102,21 @@ describe("팀 제안 카드 — 안내문(R10)·무음 경로 0(§5-4)", () => {
 
   test("안내문이 대화 승인 경로를 먼저 적고, 화면 경로([확인 창 열기] → [만들기])를 뒤에 적는다", () => {
     const seg = card();
-    const talk = seg.indexOf("대화에서 '만들어'라고 말씀하시면 바로 만듭니다");
+    const talk = seg.indexOf("'만들어'라고 답해 주시면 바로 만듭니다");
     const gui = seg.indexOf("화면에서 직접 하시려면 [확인 창 열기] → [만들기]");
     expect(talk).toBeGreaterThan(0);
     expect(gui).toBeGreaterThan(talk);
+  });
+
+  // ★(0.14.42 리뷰 m6) 카드는 UI 갱신과 함께 모든 설치에 즉시 뜨지만, 이미 CEO 로 승격된 기계는 MASTER_DIRECTIVE 가
+  //   사용자 소유라 신본 지침이 .new 로만 도착한다(pack-merge 전까지 대표는 질문(ask)을 열지 않는다). 그래서 대화
+  //   경로는 **대표가 먼저 여쭌 경우**로 조건을 걸어 적는다 — 무조건 "말씀하시면 바로 만듭니다"는 그 기계에서 거짓이다.
+  test("대화 경로 안내는 대표의 질문('만들까요?')을 조건으로 건다 — 지침이 옛 판인 기계에서도 거짓이 되지 않게", () => {
+    const seg = strip(card()); // 주석 속 인용(옛 문구)은 안내문이 아니다
+    const cond = seg.indexOf("'만들까요?'라고 여쭈면");
+    expect(cond).toBeGreaterThan(0);
+    expect(cond).toBeLessThan(seg.indexOf("'만들어'라고 답해 주시면 바로 만듭니다"));
+    expect(seg).not.toContain("말씀하시면 바로 만듭니다");
   });
 
   test("카드 버튼은 흐름의 예외를 삼키지 않는다 — 거부된 약속(Promise)은 토스트로 보인다", () => {

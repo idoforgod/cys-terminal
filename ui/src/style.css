@@ -9,6 +9,7 @@
   --z-drop-indicator: 1200;  /* 사이드바 순서 바꾸기 삽입선(pointer-events:none) */
   --z-cc-panel:       1500;  /* Control Center 풀 패널(불투명 · 상단바 아래 전체 덮개) */
   --z-palette:        1600;  /* ⌘K 팔레트 */
+  --z-toast-under-modal: 1650; /* 확인 창 밖의 창(입력·업데이트·피드백 — 위쪽에 조작부)이 떠 있는 동안의 토스트 — 그 창 밑·Control Center 위 */
   --z-modal:          1700;  /* 확인·입력·업데이트·피드백 창(.modal-overlay) — 모든 패널 위 */
   --z-toast:          1800;  /* 안내·실패 토스트 — 확인 창보다도 위(확인 창이 떠 있으면 위로 비켜 선다 — #toasts 회피 규칙) */
   --z-drop-hint:      1999;  /* pane 드롭 위치 힌트(pointer-events:none) — 고스트 바로 아래 */
@@ -651,6 +652,14 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
    같은 결과를 낸다. ★한 선택자 목록으로 합치지 말 것 — :has() 를 모르는 엔진은 목록 전체를 버린다. */
 body:has(.modal-overlay) #toasts { bottom: auto; top: 56px; max-height: calc(50vh - 72px); }
 body.modal-open #toasts { bottom: auto; top: 56px; max-height: calc(50vh - 72px); }
+/* ★(0.14.42 리뷰 F2) 위 회피는 창의 아래쪽 절반만 지킨다 — 피드백·입력·업데이트·삭제 확인 창처럼 **위쪽**에 조작부
+   (닫기 ×·입력칸)가 있는 창은 좁은 창(1024×700 실측)에서 토스트가 그 조작부를 덮어 클릭을 가로챘다. 그래서 위에
+   남는 것은 확인 창(confirmModal · .confirm-overlay — 본문 + 아래 버튼 줄뿐)일 때뿐이고, 그 밖의 창이 하나라도
+   떠 있으면 토스트는 창 **밑**(Control Center 위)으로 내려 어둡게 비친다(feedbackmodal.ts "토스트는 창 밑" 계약과
+   같은 방향 · 창이 닫히면 제자리). 폴백 표지 body.toast-under-modal 은 main.ts syncModalOpenClass 가 건다 — 역시
+   한 선택자 목록으로 합치지 말 것. */
+body:has(.modal-overlay:not(.confirm-overlay)) #toasts { z-index: var(--z-toast-under-modal); }
+body.toast-under-modal #toasts { z-index: var(--z-toast-under-modal); }
 .toast {
   position: relative;
   max-width: 420px; padding: 10px 28px 10px 12px; border-radius: 8px;
