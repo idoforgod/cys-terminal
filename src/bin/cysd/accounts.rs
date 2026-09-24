@@ -16,7 +16,8 @@
 //!   `note_rate` 하나만 부른다. 이 값은 **표시용**이다 — 같은 UID 의 아무 프로세스나 보낼 수 있으므로
 //!   계정 경보(`alert_rates`)의 근거로 쓰지 않는다(오너 승인 2026-09-23 "표시용 값 · 위조 한계 문서화").
 //!   ★fix-values-1: 경보 입력은 표시 승자와 **따로** 보관한다(`AccountsState::alert_inputs` — 창 밖이 아닌 출처의
-//!   마지막 관측). 창 밖 값은 경보 입력을 만들지도 지우지도 않는다(억제·재발화 둘 다 차단).
+//!   마지막 관측). 창 밖 값은 경보 입력을 만들지도 지우지도 않는다(억제·재발화 둘 다 차단). 스냅샷에도 출처를
+//!   실어 재시작 뒤 복원도 같은 규칙을 따른다.
 //! - ★0.14.42 RC2-b: agy 값의 주 경로는 agy 상태줄 훅(좌석 `usage.report` · source "agy-statusline")이다.
 //! - 병합 = 창 벡터 통째 최신 승자(같은 계정 풀은 최신 관측이 진실).
 //!
@@ -69,7 +70,10 @@ struct IdentEntry {
 pub struct AccountsState {
     views: HashMap<AccountKey, AccountView>,
     ident_cache: HashMap<PathBuf, IdentEntry>,
-    last_persisted: HashMap<(AccountKey, String), f64>, // (key, 창 라벨) → 마지막 기록 pct
+    last_persisted: HashMap<(AccountKey, String), f64>, // (key, 창 라벨) → 마지막 기록 pct(출처 무관)
+    /// 같은 키의 마지막 기록 pct 중 **경보 입력 출처**([`feeds_alerts`])의 것 — 창 밖 값과 좌석 값이 1%p 안으로
+    /// 번갈아 와도 좌석 쪽 최신 값이 스냅샷에 남게 한다(재시작 뒤 경보 입력 복원의 정확도).
+    last_persisted_alert: HashMap<(AccountKey, String), f64>,
     /// 계정 경보 입력 — 계정별 **창 밖이 아닌** 출처(좌석 statusline·rollout·agy·어댑터)의 마지막 신선 관측
     /// (관측 시각, rate). 표시 승자(`AccountView.rate` — 창 벡터 통째 최신 승자)와 **분리**한다(fix-values-1 SP-1·F1):
     /// 표시 승자에 경보 제외를 걸면 창 밖 보고 한 건이 좌석이 본 값을 경보에서 통째로 지우고(억제), 좌석 보고가
@@ -325,11 +329,20 @@ fn note_rate_at(
         view.source_error = None;
         // 경보 입력은 따로 — 창 밖 값은 여기 들어오지 않고, 들어와 있던 좌석 값을 지우지도 않는다.
         note_alert_input(&mut st, &key, rate, source, now);
+        // 스냅샷 스로틀은 두 기준 중 하나라도 1%p 이상 움직이면 기록한다: ① 출처 무관 마지막 기록(표시 복원이
+        // 고르는 최신 행) ② 경보 입력 출처의 마지막 기록(경보 복원이 고르는 최신 행). ①만 보면 창 밖 값 바로 뒤에
+        // 1%p 안으로 붙어 온 좌석 값이 버려져 재시작 뒤 경보 입력이 그보다 옛 좌석 값으로 복원된다.
+        let alert_src = feeds_alerts(source);
         for w in rate {
             let pk = (key.clone(), w.label.clone());
-            let prev = st.last_persisted.get(&pk).copied();
-            if prev.map_or(true, |p| (w.used_pct - p).abs() >= SNAPSHOT_MIN_DELTA_PCT) {
-                st.last_persisted.insert(pk, w.used_pct);
+            let moved = |prev: Option<f64>| prev.map_or(true, |p| (w.used_pct - p).abs() >= SNAPSHOT_MIN_DELTA_PCT);
+            let due = moved(st.last_persisted.get(&pk).copied())
+                || (alert_src && moved(st.last_persisted_alert.get(&pk).copied()));
+            if due {
+                st.last_persisted.insert(pk.clone(), w.used_pct);
+                if alert_src {
+                    st.last_persisted_alert.insert(pk, w.used_pct);
+                }
                 to_persist.push((
                     key.clone(),
                     st.views[&key].label.clone(),
@@ -352,7 +365,7 @@ fn note_rate_at(
     if let Some(conn) = guard.as_ref() {
         for (key, label, win, pct, resets) in &to_persist {
             crate::analytics::record_rate_snapshot(
-                conn, now, &key.provider, &key.account_id, label, win, *pct, *resets,
+                conn, now, &key.provider, &key.account_id, label, win, *pct, *resets, source,
             );
         }
         if do_prune {
@@ -408,17 +421,21 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
 }
 
 /// 부트 시드 ② — analytics 마지막 스냅샷으로 계정 뷰를 예열한다(홈 무접촉 · 시험 이음매).
-/// 경보 입력도 같은 스냅샷으로 예열한다(종전과 같다). ⚠스냅샷에는 아직 출처가 없어 창 밖 값도 경보 입력으로
-/// 복원된다(IMPL-values §7-6) — 다음 커밋이 출처 열로 닫는다.
+/// 표시는 (계정,창)별 마지막 스냅샷(출처 무관), **경보 입력은 창 밖이 아닌 출처의 마지막 스냅샷만**으로 복원한다
+/// (fix-values-1 SP-1 · 종전엔 재시작 한 번이 창 밖 값을 경보 입력으로 들였다). 출처 열이 생기기 전의 구 행은
+/// 창 밖 값이 없던 시절의 것이라 경보 입력으로 친다(`analytics::last_rate_snapshots`).
 fn restore_from_snapshots(daemon: &Arc<Daemon>, now: f64) {
     // 마지막 스냅샷으로 예열 — updated_at은 스냅샷 시각 그대로(신선한 척 금지)
-    let rows = {
+    let (rows, alert_rows) = {
         let guard = daemon.analytics.lock().unwrap();
-        guard.as_ref().map(|conn| {
-            crate::analytics::last_rate_snapshots(conn, now - BOOT_RESTORE_SECS)
-        })
+        match guard.as_ref() {
+            Some(conn) => (
+                Some(crate::analytics::last_rate_snapshots(conn, now - BOOT_RESTORE_SECS, None)),
+                crate::analytics::last_rate_snapshots(conn, now - BOOT_RESTORE_SECS, Some(OUTSIDE_SOURCE)),
+            ),
+            None => (None, Vec::new()),
+        }
     };
-    let alert_rows = rows.clone().unwrap_or_default();
     // 경보 입력 복원 — (계정)별로 창을 모아 한 번에 싣는다. 이미 라이브 경보 입력이 있으면 덮지 않는다(신선 관측 우선).
     let mut restored: HashMap<AccountKey, (f64, Vec<RateWindow>)> = HashMap::new();
     for (ts, provider, account, _label, win, pct, resets) in alert_rows {
@@ -1521,6 +1538,44 @@ mod tests {
         }
         assert_eq!(account_alerts(&d, seq0, "account_rate:sup@example.test:5h"), 1, "좌석 97% 계정 경보가 억제됐다");
         assert_eq!(account_alerts(&d, seq0, "account_rate:oo@example.test:5h"), 0, "창 밖 값만으로 경보가 났다");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ④ 데몬 재시작 뒤 스냅샷 복원: 표시는 마지막 스냅샷(창 밖이어도) · 경보 입력은 창 밖이 아닌 출처의 마지막
+    /// 스냅샷만. 창 밖 값만 있는 계정은 복원 뒤에도 경보 입력이 아니다. 좌석 값이 창 밖 값과 1%p 안으로 붙어
+    /// 와도(스냅샷 스로틀) 좌석 쪽 최신 값이 기록된다.
+    #[test]
+    fn snapshot_restore_keeps_outside_values_out_of_alert_inputs() {
+        let dir = tmp("daemon-alert-restore");
+        let home = tmp("home-alert-restore");
+        let sess = outside_profile(&home, ".claude-3", "u-rs", "rs@example.test");
+        let only_out = outside_profile(&home, ".claude-4", "u-ro", "ro@example.test");
+        let sock = dir.join("cysd.sock");
+        let t0 = crate::state::now_epoch();
+        {
+            let d1 = crate::state::Daemon::new(sock.clone());
+            let seat = |pct: f64, t: f64| {
+                assert!(note_rate_at(&d1, Some(&home), "claude", &sess, &[rw("5h", pct, None)], "statusline", t));
+            };
+            seat(50.0, t0);
+            assert_eq!(report_outside_at(&d1, Some(&home), &sess, &[rw("5h", 97.0, None)], t0 + 2.0), Ok(OutsideOutcome::Accepted));
+            seat(97.3, t0 + 4.0); // 직전 기록(창 밖 97)과 0.3%p — 종전 스로틀은 이 좌석 값을 버렸다
+            assert_eq!(report_outside_at(&d1, Some(&home), &sess, &[rw("5h", 5.0, None)], t0 + 6.0), Ok(OutsideOutcome::Accepted));
+            assert_eq!(report_outside_at(&d1, Some(&home), &only_out, &[rw("5h", 96.0, None)], t0 + 8.0), Ok(OutsideOutcome::Accepted));
+        }
+        let d2 = crate::state::Daemon::new(sock);
+        restore_from_snapshots(&d2, t0 + 10.0);
+        let rows = claude_rows(&d2);
+        let rs = rows.iter().find(|r| r["account_id"] == "u-rs").expect("복원 행");
+        assert_eq!(rs["rate"][0]["used_pct"], json!(5.0), "표시 복원은 마지막 스냅샷(창 밖 5%)");
+        assert_eq!(rs["source"], "snapshot");
+        assert!(rows.iter().any(|r| r["account_id"] == "u-ro"), "창 밖 값만 있는 계정도 표시는 복원된다");
+        assert_eq!(
+            alert_rates(&d2),
+            vec![("rs@example.test".to_string(), "5h".to_string(), 97.3)],
+            "재시작 뒤 경보 입력에 창 밖 값이 들어왔거나 좌석 값이 사라졌다"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
     }

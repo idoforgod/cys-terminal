@@ -77,12 +77,18 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
          CREATE INDEX IF NOT EXISTS ix_skill_runs_started ON skill_runs(started_at);",
     )
     .ok()?;
+    // fix-values-1 SP-1: rate_snapshots 에 출처 열(additive). 신규·구 DB 모두 이 ALTER 한 길로 붙는다 — 이미 있으면
+    // 에러(duplicate column)를 `let _` 로 흡수해 멱등(channels.rs outbound 마이그레이션과 같은 방식). 구 cysd 는
+    // 열 이름을 지정해 INSERT/SELECT 하므로 이 열을 무시한다(NULL). 출처 NULL = 이 열 이전의 행.
+    let _ = conn.execute("ALTER TABLE rate_snapshots ADD COLUMN source TEXT", []);
     Some(conn)
 }
 
 // ── CC v2 WS-A: rate_snapshots ──
 
 /// 계정 rate 스냅샷 1행 적재 — 스로틀·prune 판단은 호출부(accounts.rs). 실패 무해.
+/// `source` = 그 관측의 계정 출처 라벨(accounts `AccountView.source` 와 같은 어휘) — 부트 복원이 경보 입력을
+/// 창 밖(표시용) 값 없이 복원하는 근거다.
 pub fn record_rate_snapshot(
     conn: &Connection,
     ts: f64,
@@ -92,11 +98,12 @@ pub fn record_rate_snapshot(
     win: &str,
     used_pct: f64,
     resets_at: Option<f64>,
+    source: &str,
 ) {
     let _ = conn.execute(
-        "INSERT INTO rate_snapshots(ts, provider, account, label, win, used_pct, resets_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        rusqlite::params![ts, provider, account, label, win, used_pct, resets_at],
+        "INSERT INTO rate_snapshots(ts, provider, account, label, win, used_pct, resets_at, source)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![ts, provider, account, label, win, used_pct, resets_at, source],
     );
 }
 
@@ -106,19 +113,23 @@ pub fn prune_rate_snapshots(conn: &Connection, before_ts: f64) {
 }
 
 /// (provider,account,win)별 **최신** 스냅샷 — 부트 예열용. since 이후만.
+/// `exclude_source` 가 있으면 그 출처의 행을 **빼고** 최신을 고른다(경보 입력 복원 — 창 밖 값 제외).
+/// 출처가 NULL 인 구 행(출처 열 이전 · 창 밖 값이 없던 시절)은 빼지 않는다.
 /// 반환: (ts, provider, account, label, win, used_pct, resets_at)
 pub fn last_rate_snapshots(
     conn: &Connection,
     since: f64,
+    exclude_source: Option<&str>,
 ) -> Vec<(f64, String, String, String, String, f64, Option<f64>)> {
     let mut out = Vec::new();
     let Ok(mut stmt) = conn.prepare(
         "SELECT ts, provider, account, label, win, used_pct, resets_at FROM rate_snapshots
-         WHERE ts >= ?1 GROUP BY provider, account, win HAVING ts = MAX(ts)",
+         WHERE ts >= ?1 AND (?2 IS NULL OR source IS NULL OR source <> ?2)
+         GROUP BY provider, account, win HAVING ts = MAX(ts)",
     ) else {
         return out;
     };
-    let rows = stmt.query_map([since], |r| {
+    let rows = stmt.query_map(rusqlite::params![since, exclude_source], |r| {
         Ok((
             r.get::<_, f64>(0)?,
             r.get::<_, String>(1)?,
@@ -1961,12 +1972,12 @@ mod tests {
     fn rate_snapshots_record_last_and_prune() {
         let (_socket, conn) = open_change_db("ratesnap");
         // 같은 (계정,창)에 시계열 3점 + 다른 창 1점
-        record_rate_snapshot(&conn, 100.0, "claude", "u1", "a@b.c", "5h", 10.0, Some(500.0));
-        record_rate_snapshot(&conn, 200.0, "claude", "u1", "a@b.c", "5h", 20.0, Some(500.0));
-        record_rate_snapshot(&conn, 300.0, "claude", "u1", "a@b.c", "5h", 30.0, Some(500.0));
-        record_rate_snapshot(&conn, 250.0, "claude", "u1", "a@b.c", "7d", 5.0, None);
+        record_rate_snapshot(&conn, 100.0, "claude", "u1", "a@b.c", "5h", 10.0, Some(500.0), "statusline");
+        record_rate_snapshot(&conn, 200.0, "claude", "u1", "a@b.c", "5h", 20.0, Some(500.0), "statusline");
+        record_rate_snapshot(&conn, 300.0, "claude", "u1", "a@b.c", "5h", 30.0, Some(500.0), "statusline");
+        record_rate_snapshot(&conn, 250.0, "claude", "u1", "a@b.c", "7d", 5.0, None, "statusline");
         // last: (u1,5h)=ts300, (u1,7d)=ts250 — 창별 최신 1행씩
-        let last = last_rate_snapshots(&conn, 0.0);
+        let last = last_rate_snapshots(&conn, 0.0, None);
         assert_eq!(last.len(), 2);
         let five = last.iter().find(|r| r.4 == "5h").unwrap();
         assert_eq!((five.0, five.5), (300.0, 30.0));
@@ -1976,6 +1987,48 @@ mod tests {
         // prune: ts<250 삭제 → 5h는 300 한 점, 7d 250 한 점
         prune_rate_snapshots(&conn, 250.0);
         assert_eq!(rate_series(&conn, "claude", "u1", "5h", 0.0), vec![(300.0, 30.0)]);
+    }
+
+    /// fix-values-1 SP-1: 스냅샷에 출처를 싣는다 — 출처 열이 없던 구 DB 에도 열이 붙고(멱등), 구 행(출처 NULL ·
+    /// 0.14.42 전에는 창 밖 값이 없었다)은 신뢰 행으로 남으며, `exclude_source` 로 창 밖 행을 빼고 최신을 고른다.
+    #[test]
+    fn rate_snapshots_carry_source_and_old_dbs_are_migrated() {
+        let dir = std::env::temp_dir().join(format!("cys-cl-{}-ratesrc", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("cys.sock");
+        let sd = state_dir(&socket);
+        std::fs::create_dir_all(&sd).unwrap();
+        {
+            // 0.14.41 까지의 스키마(출처 열 없음) + 구 행 1개
+            let old = Connection::open(sd.join("analytics.db")).unwrap();
+            old.execute_batch(
+                "CREATE TABLE rate_snapshots(ts REAL, provider TEXT, account TEXT, label TEXT,
+                    win TEXT, used_pct REAL, resets_at REAL);
+                 INSERT INTO rate_snapshots VALUES(100.0,'claude','u1','a@b.c','5h',90.0,NULL);",
+            )
+            .unwrap();
+        }
+        let conn = open(&socket).expect("구 DB 열기");
+        record_rate_snapshot(&conn, 200.0, "claude", "u1", "a@b.c", "5h", 5.0, None, "statusline-outside");
+        record_rate_snapshot(&conn, 150.0, "claude", "u2", "b@b.c", "5h", 40.0, None, "statusline");
+        let pick = |ex: Option<&str>| {
+            let mut v: Vec<(String, f64, f64)> =
+                last_rate_snapshots(&conn, 0.0, ex).into_iter().map(|r| (r.2, r.0, r.5)).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        assert_eq!(pick(None), vec![("u1".into(), 200.0, 5.0), ("u2".into(), 150.0, 40.0)], "표시 복원 = 출처 무관 최신");
+        assert_eq!(
+            pick(Some("statusline-outside")),
+            vec![("u1".into(), 100.0, 90.0), ("u2".into(), 150.0, 40.0)],
+            "경보 복원 = 창 밖 행을 뺀 최신(구 NULL 행은 신뢰)"
+        );
+        drop(conn);
+        let again = open(&socket).expect("두 번째 열기(마이그레이션 멱등)");
+        assert_eq!(last_rate_snapshots(&again, 0.0, Some("statusline-outside")).len(), 2);
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── CC v2 WS-B: skill_runs 상태 전이 ──
