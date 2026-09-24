@@ -162,6 +162,10 @@ class Lab(object):
             if bin_mut is not None:
                 bin_mut(binp)
         self.bin = binp
+        # 라이브 지침(리뷰 N1) — `ask` 는 이 좌석이 읽는 지침이 대화 승인 판(§4-A-2)일 때만 질문을 연다.
+        os.makedirs(os.path.join(self.pack, "directives"), exist_ok=True)
+        shutil.copy(os.path.join(PACK, "directives", "MASTER_DIRECTIVE.md"),
+                    os.path.join(self.pack, "directives", "MASTER_DIRECTIVE.md"))
         w(os.path.join(self.stub, "cys"), STUB_CYS, 0o755)
         # 인터프리터 계수 래퍼 — 발급 경로가 python 을 몇 번 띄웠는지 실측한다.
         self.pylog = os.path.join(self.d, "py.log")

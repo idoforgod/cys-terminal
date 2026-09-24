@@ -70,8 +70,31 @@ os.environ["CYS_SOCKET"] = SOCK
 os.environ["CYS_SURFACE_ID"] = SURFACE
 os.environ["CYS_STATE_DIR"] = os.path.join(TMP, "state-boot")
 for _k in ("AITERM_SURFACE_ID", "AITERM_SOCKET", "CYS_MISSION", "CYS_DELIVERY_WINDOW_S",
-           "CYS_MISSION_TTL_S", "CYS_LOCK_BACKEND"):
+           "CYS_MISSION_TTL_S", "CYS_LOCK_BACKEND", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR"):
     os.environ.pop(_k, None)
+# 라이브 팩(리뷰 N1): `ask` 는 이 좌석이 읽는 라이브 지침(<팩>/directives/MASTER_DIRECTIVE.md)이 대화 승인 판(§4-A-2)일
+#   때만 질문을 연다 — 스위트 기본 팩에는 저장소의 현행 지침을 둔다(N 스위트가 구판·결측으로 바꿔 잰다).
+SHIPPED_DIRECTIVE = os.path.join(os.path.dirname(BIN), "directives", "MASTER_DIRECTIVE.md")
+
+
+def live_pack(text=None, name="pack"):
+    """라이브 팩 1개를 만들어 CYS_PACK_DIR 로 건다. text=None 이면 지침 파일을 두지 않는다(결측)."""
+    d = os.path.join(TMP, name)
+    os.makedirs(os.path.join(d, "directives"), exist_ok=True)
+    md = os.path.join(d, "directives", "MASTER_DIRECTIVE.md")
+    if text is None:
+        if os.path.exists(md):
+            os.remove(md)
+    else:
+        with open(md, "w", encoding="utf-8") as f:
+            f.write(text)
+    os.environ["CYS_PACK_DIR"] = d
+    return d
+
+
+with open(SHIPPED_DIRECTIVE, encoding="utf-8") as _f:
+    SHIPPED_TEXT = _f.read()
+BASE_PACK = live_pack(SHIPPED_TEXT)
 
 RESULTS = {}      # suite -> [(id, ok, detail)]
 
@@ -1239,6 +1262,59 @@ def suite_hook_only():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# N — 라이브 지침 판 게이트(리뷰 N1): 대화 승인 이전 판 지침을 읽는 좌석은 질문을 열지 않는다
+#   이미 CEO 로 승격된 기계는 MASTER_DIRECTIVE.md 가 사용자 소유라 팩 갱신이 신본을 .new 로만 병치한다(src/pack.rs
+#   Keep{new_pending}). 그 좌석은 v0.14.41 CEO 사본("만들지 말지는 오너가 앱 확인 창에서만" · §4-A-2 없음 · 부서 생성
+#   동사 호출 금지)을 읽는데, team-propose 출력은 무조건 `ask` 를 지시했고 ask 는 질문을 열어 "바로 만들겠습니다"를
+#   약속했다 — 오너가 답하면 대표는 제 지침을 어기거나(§4-A-2 없이 생성) 방금 한 약속을 어긴다. 게이트: 라이브 지침에
+#   §4-A-2 앵커가 없으면 ask 는 질문·표지 없이 directive_stale(화면 경로 문구)로 거부한다.
+# ══════════════════════════════════════════════════════════════════════════════
+def _old_ceo_copy():
+    """v0.14.41 릴리스의 CEO 사본(cecf4c57) — git 이 없거나 얕은 클론이면 None(합성 구판으로 대신 잰다)."""
+    try:
+        r = subprocess.run(["git", "-C", os.path.dirname(BIN), "show",
+                            "cecf4c57:cysjavis-pack/directives/CEO_TEMPLATE.md"],
+                           capture_output=True, timeout=60)
+        return r.stdout.decode("utf-8") if r.returncode == 0 and r.stdout else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def suite_directive_gate():
+    anchor = getattr(tt, "DIRECTIVE_ANCHOR", "4-A-2. 생성 집행(토큰 경로)")
+    cases = []
+    old = _old_ceo_copy()
+    if old is not None:
+        cases.append(("N1 승격 기계의 구 CEO 사본(cecf4c57 · §4-A-2 없음)", old))
+    else:
+        print("SKIP N1 git 사본 없음(cecf4c57) — N2 합성 구판으로 같은 계약을 잰다")
+    cases.append(("N2 현행 지침에서 §4-A-2 앵커만 뺀 합성 구판", SHIPPED_TEXT.replace(anchor, "4-A-X. (구판)")))
+    cases.append(("N3 라이브 지침 결측(판독 불가 = 대화 승인 닫힘 · fail-closed)", None))
+    for i, (label, text) in enumerate(cases):
+        live_pack(text, name="pack-n%d" % i)
+        a = real_ask()                                   # 모듈 API 입구
+        rc, j, o, _e = cli(["ask", "--proposal", PROPOSAL])    # 공식 CLI 입구(team-propose 출력이 지시하는 명령)
+        j = j or {}
+        markers = [n for n in os.listdir(os.environ["CYS_STATE_DIR"]) if n.startswith("teamtoken-open-")]
+        r = hissue("그래 만들어", feed_items=FEED1)
+        check("N", label + " → ask exit≠0 · directive_stale · 화면 경로 문구 · 질문·표지 0 · 이어진 승인 발급 0",
+              not a.get("ok") and rc == 1 and j.get("code") == "directive_stale"
+              and "[확인 창 열기]" in (j.get("message") or "") and not markers and not events("ask_opened")
+              and not r.get("token"),
+              "모듈=%s CLI rc=%s code=%s 표지=%s 발급=%s" % (a.get("code"), rc, j.get("code"), markers, r.get("code")))
+    live_pack(SHIPPED_TEXT, name="pack-n-new")
+    a = real_ask()
+    rc, j, _o, _e = cli(["ask", "--proposal", PROPOSAL])
+    check("N", "N4 대화 승인 판 지침(§4-A-2 있음) → ask_opened(양성 대조)",
+          a.get("ok") and rc == 0 and (j or {}).get("code") == "ask_opened", "%s/%s" % (a.get("code"), rc))
+    msg = tt.owner_message("directive_stale")
+    check("N", "N5 directive_stale 는 거부 코드·신설 행 · 문구는 화면 경로(되묻기 약속 없음)",
+          "directive_stale" in tt.REFUSAL_CODES and "directive_stale" in tt.NEW_ROW_CODES
+          and "[확인 창 열기]" in msg and "여쭙" not in msg, msg)
+    os.environ["CYS_PACK_DIR"] = BASE_PACK
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # O — 열린 질문 표지(리뷰 F3): 훅 비용 게이트가 원장 mtime 이 아니라 '열린 질문 표지 파일'을 본다
 #   종전 게이트는 원장이 최근 10분 안에 움직였으면(거부 감사 레코드 포함) 모든 좌석의 모든 프롬프트가 발급기를
 #   띄웠고(맥 약 +130ms), 원장이 한 번 생긴 기계는 영구히 date+stat 2회(약 +8ms)를 냈다. 표지는 원장에서
@@ -1342,6 +1418,12 @@ def suite_directive():
           and "편성이 ①에서 이미" in blk)
     check("D", "D6 발급자 보장을 과대 주장하지 않는다('네가 만들 수 없다' 금지 · 고의 위조 한계 명시)",
           "네가 만들 수 없" not in text and "고의 위조까지 막지는 못한다" in text)
+    ceo = os.path.join(os.path.dirname(DIRECTIVE), "CEO_TEMPLATE.md")
+    with open(ceo, encoding="utf-8") as f:
+        ceo_text = f.read()
+    anchor = getattr(tt, "DIRECTIVE_ANCHOR", None)
+    check("D", "D8(N1) 출하 지침(MASTER·CEO_TEMPLATE)이 ask 게이트 앵커를 품는다 — 없으면 전 기계에서 대화 승인이 조용히 닫힌다",
+          bool(anchor) and anchor in text and anchor in ceo_text, repr(anchor))
     check("D", "D7(RR1-SEC-B) '직접 호출은 출처 확인으로 거부·기록된다'는 단정 금지 — 형식대로 흉내 낸 입력은 통과하고 "
                "via=hook 으로 남는다고 적는다 · not_hook_caller 재시도 금지 · 출력 안 하는 hook_payload_invalid 는 표에서 뺀다",
           "출처 확인으로 거부·기록된다" not in text and "형식을 충실히 흉내 낸 입력 파일은 통과" in text
@@ -1352,7 +1434,7 @@ def suite_directive():
 def main():
     for fn in (suite_attack, suite_life, suite_fp, suite_ask, suite_race, suite_transition,
                suite_missing, suite_failclosed, suite_status, suite_words, suite_structure, suite_cli,
-               suite_hook_only, suite_marker, suite_directive):
+               suite_hook_only, suite_directive_gate, suite_marker, suite_directive):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 — 스위트 예외는 FAIL 로 계수한다(조용한 누락 금지)
@@ -1362,7 +1444,7 @@ def main():
     print("\n===== 요약 =====")
     names = {"A": "공격", "L": "수명", "F": "오탐", "G": "ask", "K": "경합", "T": "상태전이",
              "M": "결측형", "C": "fail-closed", "S": "관측", "W": "문구", "X": "구조", "Y": "CLI",
-             "H": "발급자=훅", "O": "질문 표지", "D": "디렉티브 정합"}
+             "H": "발급자=훅", "N": "지침 판 게이트", "O": "질문 표지", "D": "디렉티브 정합"}
     total_fail = 0
     for k, rows in RESULTS.items():
         ok = sum(1 for _c, o, _d in rows if o)

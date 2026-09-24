@@ -13,7 +13,9 @@ r"""javis_teamtoken — **대화 승인 → 1회용 팀 생성 토큰**의 단�
   ⓐ ask 게이트 — master 가 `ask` 로 '질문 열림' 레코드를 먼저 연다(좌석·제안 id·본문 sha256·TTL 300s).
      열린 질문이 없으면 어떤 발화도 승인으로 읽지 않는다. 한 질문은 **사람의 첫 답 1회**로 소비된다
      (승인이든 아니든 — 다른 질문에 대한 '응'이 팀을 만들지 않게). 기계 발화는 질문을 소비하지 않는다.
-     ★추가 결박(설계서 밖 · 강화 방향): 질문은 **그 제안을 발행한 좌석**에서만 열 수 있다.
+     ★추가 결박(설계서 밖 · 강화 방향): 질문은 **그 제안을 발행한 좌석**에서만 열 수 있고, 그 좌석이 읽는 **라이브
+     지침이 대화 승인 판**(§4-A-2 앵커)일 때만 연다(리뷰 N1 — 승격 기계의 구 CEO 지침은 '확인 창에서만'이라 질문을
+     열면 대표가 제 지침과 제 약속 중 하나를 어긴다 · 아니면 directive_stale = 화면 경로).
   ⓑ 전문 일치 — 정규화(NFC·앞뒤 공백·끝 문장부호·끝 존칭 어미 1회·내부 공백 제거·소문자) 뒤
      짧은 긍정 화이트리스트와 **통째로 같을 때만** 승인. 부분 문자열 매칭을 쓰지 않는다. 길이 상한 20자.
   ⓒ 거부 신호 선검사 — 부정어·의문형·조건/예시 표현이 원문(또는 공백 제거형)에 있으면 승인 아님.
@@ -76,6 +78,7 @@ ASK_NOTICE_GRACE_S 안)이 있을 때만 있다. UserPromptSubmit 런처의 비�
 
 ## CLI (stdout = JSON 1줄 · 단 issue 의 exit 3 은 무출력)
   ask     --proposal <tp-id>                       # master · 좌석은 env(CYS_SURFACE_ID) — 인자로 바꿀 수 없다
+                                                    #   라이브 지침에 §4-A-2 가 없으면 directive_stale(질문·표지 0)
   issue   --payload-file F                          # ★UserPromptSubmit 훅 전용 — F = 런처가 **방금** 쓴
                                                     #   <상태>/hook-input-<좌석>-<pid>.json(출처·좌석 확인 · stdin 경로 없음)
   verify  --token T --proposal P --surface S (--body-digest D | --body-b64 B) [--phase create|allow]
@@ -143,6 +146,9 @@ HOOK_INPUT_SKEW_S = 2.0      # 파일 시각 ↔ 질문 시각 비교의 여유(
 HOOK_INPUT_MAX_BYTES = 1024 * 1024
 # ── 열린 질문 표지(리뷰 F3) — 훅 비용 게이트가 보는 파생 캐시 ──
 ASK_NOTICE_GRACE_S = 300.0   # 답 없이 만료된 질문에 '확인 시간이 지나'(§10)를 1회 말해 줄 여유 — 그 뒤 표지를 걷는다
+# ── 라이브 지침 판 게이트(리뷰 N1) — ask 는 이 좌석이 읽는 지침이 대화 승인 판일 때만 질문을 연다 ──
+DIRECTIVE_ANCHOR = "4-A-2. 생성 집행(토큰 경로)"   # MASTER_DIRECTIVE §4-A-2 제목(CEO_TEMPLATE 은 MASTER 전문을 품는다)
+DIRECTIVE_MAX_BYTES = 4 * 1024 * 1024
 LEDGER_MAX_BYTES = 8 * 1024 * 1024   # 이 이상은 판독 불가(자르지 않는다 — javis_mission 원장 판독과 같은 태도)
 FEED_MAX_BYTES = 64 * 1024 * 1024
 
@@ -181,6 +187,11 @@ _MSG_SEAT_MOVED = ("제안을 올린 자리가 바뀌어 이 자리에서는 대
 _HOOK_ONLY_DETAIL = ("훅 입력으로 확인되지 않아 판정하지 않았다(발급 0 · 질문은 열린 채) — 이 명령은 훅 전용이다. "
                      "직접 호출·손으로 만든 입력은 규약 위반이며 원장에 기록된다. 재시도하지 말고 오너에게 승인을 "
                      "한 번 더 직접 쳐 달라고 하라.")
+
+# ★(리뷰 N1) 대화 승인 이전 판 지침을 읽는 좌석 — 질문을 열지 않고 화면 경로를 말한다(되묻기 약속 없음: 이 좌석은
+#   지침이 갱신되기 전에는 몇 번을 물어도 대화로 만들 수 없다).
+_MSG_DIRECTIVE_STALE = ("이 컴퓨터의 대표 지침이 아직 대화 승인 이전 판이라 대화로는 만들 수 없습니다 — Control Center → "
+                        "승인 Feed 카드의 [확인 창 열기] → [만들기]로 만들어 주세요.")
 
 OWNER_MESSAGES = {
     # ── §10 표 원문(글자 그대로) ──
@@ -224,6 +235,8 @@ OWNER_MESSAGES = {
     # ── 분리 행(§10 의 뭉친 행이 사실과 어긋나던 코드 · 리뷰 m4·m5) ──
     "token_consumed": _MSG_REUSED,
     "surface_not_publisher": _MSG_SEAT_MOVED,
+    # ── 신설 행(리뷰 N1 — 라이브 지침이 대화 승인 이전 판) ──
+    "directive_stale": _MSG_DIRECTIVE_STALE,
     # ── 신설 행(2단 권한의 ⑦ allow 단계 — §10 에 해당 행이 없다) ──
     "grant_not_armed": "팀 생성이 확인되지 않아 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
     "grant_revoked": "팀 생성에 실패해 승인 카드를 그대로 두었습니다 — 제안은 그대로 남아 있습니다.",
@@ -251,12 +264,12 @@ SECTION10_CODES = frozenset([
     "formation_partial", "create_failed"])
 # §10 밖의 행 — 신설(2단 권한 ⑦ allow) + 분리(§10 의 뭉친 행이 사실과 어긋나던 코드).
 NEW_ROW_CODES = frozenset(["grant_not_armed", "grant_revoked", "grant_expired",
-                           "token_consumed", "surface_not_publisher"])
+                           "token_consumed", "surface_not_publisher", "directive_stale"])
 # 이 모듈이 **거부**로 돌려줄 수 있는 사유 코드 전량(P4 훅·P5 데몬이 그대로 쓴다).
 REFUSAL_CODES = (
     "ask_not_open", "ask_expired", "utterance_ambiguous", "utterance_rejected", "machine_origin",
     "ledger_absent", "ledger_unreadable", "no_pending", "multiple_pending", "proposal_not_pending",
-    "body_changed", "surface_unknown", "surface_not_publisher", "proposal_publisher_unknown",
+    "body_changed", "surface_unknown", "surface_not_publisher", "directive_stale", "proposal_publisher_unknown",
     "proposal_body_invalid", "feed_unreadable", "not_hook_caller",
     "token_missing", "token_unknown", "token_consumed", "token_expired", "token_proposal_mismatch",
     "token_surface_mismatch", "token_body_mismatch", "grant_not_armed", "grant_revoked",
@@ -406,6 +419,39 @@ def ledger_path():
     """이 레인의 토큰 원장 경로. 상태 루트·레인 키 규약은 javis_bootstrap 이 소유한다."""
     import javis_bootstrap
     return os.path.join(javis_bootstrap.state_dir(), "teamtoken-%s.jsonl" % javis_bootstrap.lane_key())
+
+
+def live_directive_path():
+    """이 좌석이 읽는 **라이브** 지침 — `<팩>/directives/MASTER_DIRECTIVE.md`(리뷰 N1). 팩 경로 env 키 목록·순서와 홈
+    기본값은 javis_bootstrap 이 소유한다(PACK_DIR_ENV_KEYS · CYS_DIR — 사본 금지). CEO 로 승격된 기계에서도 이 파일이
+    대표 좌석의 지침이다(승격이 CEO_TEMPLATE 을 이 자리에 쓰고, 그 뒤로는 사용자 소유라 팩 갱신이 신본을 .new 로만 둔다)."""
+    import javis_bootstrap
+    pack = next((os.environ[k] for k in javis_bootstrap.PACK_DIR_ENV_KEYS if os.environ.get(k)),
+                os.path.join(javis_bootstrap.CYS_DIR, "pack"))
+    return os.path.join(pack, "directives", "MASTER_DIRECTIVE.md")
+
+
+def directive_supports_chat_approval():
+    """(bool, 사유) — 라이브 지침에 §4-A-2(대화 승인 토큰 집행 절차)가 있는가.
+
+    ★(리뷰 N1) 없으면 그 좌석의 대표는 "만들지 말지는 오너가 앱 확인 창에서만 정한다 · 부서 생성 동사 호출 금지"(v0.14.41
+      사본)를 읽는다. 그런 좌석에 질문을 열어 "바로 만들겠습니다"를 약속하게 하면, 오너가 답한 뒤 대표는 제 지침을 어기거나
+      (§4-A-2 없이 생성 — 카드가 pending 으로 남을 수 있다) 방금 한 약속을 어긴다. 실패 방향: 판독 불가·결측·상한 초과도
+      '지원 안 함'이다(대화 승인이 닫히고 화면 경로가 남는다 — 허용 쪽으로 새지 않는다).
+    """
+    p = live_directive_path()
+    try:
+        size = os.path.getsize(p)
+        if size > DIRECTIVE_MAX_BYTES:
+            return False, "라이브 지침이 상한 %d 바이트 초과: %s" % (DIRECTIVE_MAX_BYTES, p)
+        with open(p, "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return False, "라이브 지침 판독 불가(%s): %s" % (e, p)
+    if DIRECTIVE_ANCHOR not in text:
+        return False, ("라이브 지침에 §4-A-2(%s)가 없다 — 대화 승인 이전 판(승격 기계는 신본이 .new 로만 병치된다 · "
+                       "pack-merge 뒤 열린다): %s" % (DIRECTIVE_ANCHOR, p))
+    return True, ""
 
 
 def open_marker_path():
@@ -835,6 +881,11 @@ def open_ask(proposal_id, surface=None, now=None, feed_items=None):
         _audit(path, "ask_refused", code, detail, proposal_id=pid, surface=surf)
         return _result(False, code, detail, n=n, proposal_id=pid, surface=surf)
 
+    # ★(리뷰 N1) 라이브 지침 판 게이트 — 가장 먼저 본다(질문도 표지도 만들지 않는다 · 감사 1줄만).
+    #   team-propose 출력은 지침 판을 모른 채 이 명령을 지시한다 — 대화 승인 이전 판 좌석에서는 여기서 화면 경로로 돌린다.
+    dok, dwhy = directive_supports_chat_approval()
+    if not dok:
+        return refuse("directive_stale", dwhy)
     # 원장 선검사 — 층1 근거가 없으면 발급이 불가능하므로 질문부터 열지 않는다(§14-2 가용성 대가).
     m = _mission()
     _deliv, lstatus, ldetail = m.read_delivery(now=now)
