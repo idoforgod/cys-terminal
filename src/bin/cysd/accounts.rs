@@ -18,6 +18,15 @@
 //!   ★fix-values-1: 경보 입력은 표시 승자와 **따로** 보관한다(`AccountsState::alert_inputs` — 창 밖이 아닌 출처의
 //!   마지막 관측). 창 밖 값은 경보 입력을 만들지도 지우지도 않는다(억제·재발화 둘 다 차단). 스냅샷에도 출처를
 //!   실어 재시작 뒤 복원도 같은 규칙을 따른다.
+//!   ★fix-values-2 RV-SP-2: 경보 입력은 그 관측의 **라벨**도 싣는다(경보 키 `account_rate:{label}:{win}` · 문구).
+//!   창 밖 보고는 표시 라벨만 바꾸고 경보 키는 바꾸지 못한다.
+//!   ★fix-values-2 RV-SP-1 — **이 분리는 인증 경계가 아니다**(알려진 한계 · 오너 결정 대기 · IMPL-values §7-4).
+//!   분리는 검증되지 않은 창 밖 값이 경보를 흔들지 않게 하는 정확성 조치다. 좌석 경로 `usage.report` 의 소유
+//!   게이트는 **다른 좌석 안의** 호출자만 막고 pane 밖 호출자(조상 체인에 pane 없음)는 통과시키며, session_file 도
+//!   검증하지 않는다. 그래서 같은 UID 프로세스는 claude 좌석 번호 하나만 대고 **어느 계정이든** 경보 입력을
+//!   넣거나(가짜 crit) 덮을(진짜 좌석 경보 억제) 수 있고, 그 값은 좌석 출처로 스냅샷에 남아 재시작 뒤 7일
+//!   ([`BOOT_RESTORE_SECS`])까지 복원된다. 검체 `handlers::usage_report_from_outside_any_pane_still_feeds_account_alerts`
+//!   가 이 동작을, `manual_states_that_alert_separation_is_not_an_auth_boundary` 가 매뉴얼 고지를 박제한다.
 //! - ★0.14.42 RC2-b: agy 값의 주 경로는 agy 상태줄 훅(좌석 `usage.report` · source "agy-statusline")이다.
 //! - 병합 = 창 벡터 통째 최신 승자(같은 계정 풀은 최신 관측이 진실).
 //!
@@ -74,11 +83,12 @@ pub struct AccountsState {
     /// 같은 키의 마지막 기록 pct 중 **경보 입력 출처**([`feeds_alerts`])의 것 — 창 밖 값과 좌석 값이 1%p 안으로
     /// 번갈아 와도 좌석 쪽 최신 값이 스냅샷에 남게 한다(재시작 뒤 경보 입력 복원의 정확도).
     last_persisted_alert: HashMap<(AccountKey, String), f64>,
-    /// 계정 경보 입력 — 계정별 **창 밖이 아닌** 출처(좌석 statusline·rollout·agy·어댑터)의 마지막 신선 관측
-    /// (관측 시각, rate). 표시 승자(`AccountView.rate` — 창 벡터 통째 최신 승자)와 **분리**한다(fix-values-1 SP-1·F1):
+    /// 계정 경보 입력 — 계정별 **창 밖이 아닌** 출처(좌석 statusline·rollout·agy·어댑터)의 마지막 신선 관측.
+    /// 표시 승자(`AccountView.rate` — 창 벡터 통째 최신 승자)와 **분리**한다(fix-values-1 SP-1·F1):
     /// 표시 승자에 경보 제외를 걸면 창 밖 보고 한 건이 좌석이 본 값을 경보에서 통째로 지우고(억제), 좌석 보고가
     /// 다시 최신이 되면 check_alerts 가 재무장된 키를 곧바로 다시 발화한다(30분 리마인드 우회 · 깜빡임).
-    alert_inputs: HashMap<AccountKey, (f64, Vec<RateWindow>)>,
+    /// 라벨도 여기 싣는다([`AlertInput::label`] · fix-values-2 RV-SP-2).
+    alert_inputs: HashMap<AccountKey, AlertInput>,
     last_prune: f64,
     /// cys 창 밖 보고의 빈도 상한 상태 — (정규화된 프로필 dir) → (마지막 수용 시각, 그때의 rate).
     /// 키 공간은 검증을 통과한 **알려진 프로필 dir** 뿐이라 크기가 유계다.
@@ -98,19 +108,39 @@ const OUTSIDE_MIN_INTERVAL_SECS: f64 = 1.0;
 /// 창 밖 보고: 같은 프로필·같은 값이면 이 창 안의 반복을 버린다(초).
 const OUTSIDE_SAME_VALUE_SECS: f64 = 5.0;
 
-/// 이 출처의 관측이 계정 경보 입력이 되는가 — 창 밖(표시용 · 같은 UID 위조 가능) 값만 아니다.
+/// 계정 경보 입력 한 건 — 창 밖이 아닌 출처의 마지막 신선 관측([`AccountsState::alert_inputs`]).
+#[derive(Clone, Debug, Default)]
+struct AlertInput {
+    /// 관측 시각(0.0 = 없음).
+    at: f64,
+    /// 그 관측이 해석한 계정 라벨 — 경보 키(`account_rate:{label}:{win}`)와 경보 문구가 이것을 쓴다. 뷰 라벨(표시 승자)을
+    /// 쓰면 같은 accountUuid 에 다른 emailAddress 를 가진 프로필의 **창 밖** 보고 한 건이 키를 갈아 끼워, 새 키로 발화하고
+    /// 좌석이 다시 보고하면 원래 키가 REMIND 안에 재발화했다(fix-values-2 RV-SP-2 · F1 과 같은 증상).
+    label: String,
+    rate: Vec<RateWindow>,
+}
+
+/// 이 출처의 관측이 계정 경보 입력이 되는가 — 창 밖(표시용) 값만 아니다. ★이것은 검증되지 않은 창 밖 값이 경보를
+/// 흔들지 않게 하는 **정확성** 조치다 — 인증 경계가 아니다(좌석 경로도 같은 UID 위조가 가능하다 · 모듈 머리 주석).
 fn feeds_alerts(source: &str) -> bool {
     source != OUTSIDE_SOURCE
 }
 
-/// 경보 입력 갱신(창 밖이 아닌 출처만 · 경보 입력끼리 최신 승자). 호출자가 accounts 락을 잡고 있다.
-fn note_alert_input(st: &mut AccountsState, key: &AccountKey, rate: &[RateWindow], source: &str, now: f64) {
+/// 경보 입력 갱신(창 밖이 아닌 출처만 · 경보 입력끼리 최신 승자 — 값·라벨을 함께 바꾼다). 호출자가 accounts 락을 잡고 있다.
+fn note_alert_input(
+    st: &mut AccountsState,
+    key: &AccountKey,
+    label: &str,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) {
     if !feeds_alerts(source) || rate.is_empty() {
         return;
     }
-    let slot = st.alert_inputs.entry(key.clone()).or_insert((0.0, Vec::new()));
-    if now >= slot.0 {
-        *slot = (now, rate.to_vec());
+    let slot = st.alert_inputs.entry(key.clone()).or_default();
+    if now >= slot.at {
+        *slot = AlertInput { at: now, label: label.to_string(), rate: rate.to_vec() };
     }
 }
 
@@ -312,7 +342,8 @@ fn note_rate_at(
             adapter: true,
             source_error: None,
         });
-        view.label = label;
+        // 표시 라벨은 최신 승자(출처 무관 · 표시 규칙 무변경). 경보 라벨은 아래 경보 입력에 따로 싣는다(RV-SP-2).
+        view.label = label.clone();
         if plan.is_some() {
             view.plan = plan;
         }
@@ -327,8 +358,8 @@ fn note_rate_at(
         }
         // 신선 관측이 왔다 = 그 경로는 지금 동작한다 — 경로 고장 표기를 지운다.
         view.source_error = None;
-        // 경보 입력은 따로 — 창 밖 값은 여기 들어오지 않고, 들어와 있던 좌석 값을 지우지도 않는다.
-        note_alert_input(&mut st, &key, rate, source, now);
+        // 경보 입력은 따로 — 창 밖 값은 여기 들어오지 않고, 들어와 있던 좌석 값·라벨을 지우거나 바꾸지도 않는다.
+        note_alert_input(&mut st, &key, &label, rate, source, now);
         // 스냅샷 스로틀은 두 기준 중 하나라도 1%p 이상 움직이면 기록한다: ① 출처 무관 마지막 기록(표시 복원이
         // 고르는 최신 행) ② 경보 입력 출처의 마지막 기록(경보 복원이 고르는 최신 행). ①만 보면 창 밖 값 바로 뒤에
         // 1%p 안으로 붙어 온 좌석 값이 버려져 재시작 뒤 경보 입력이 그보다 옛 좌석 값으로 복원된다.
@@ -437,19 +468,21 @@ fn restore_from_snapshots(daemon: &Arc<Daemon>, now: f64) {
         }
     };
     // 경보 입력 복원 — (계정)별로 창을 모아 한 번에 싣는다. 이미 라이브 경보 입력이 있으면 덮지 않는다(신선 관측 우선).
-    let mut restored: HashMap<AccountKey, (f64, Vec<RateWindow>)> = HashMap::new();
-    for (ts, provider, account, _label, win, pct, resets) in alert_rows {
-        let slot = restored
-            .entry(AccountKey { provider, account_id: account })
-            .or_insert((0.0, Vec::new()));
-        slot.0 = slot.0.max(ts);
-        slot.1.push(RateWindow { label: win, used_pct: pct, resets_at: resets });
+    // 경보 라벨은 그 행들(창 밖 제외) 중 가장 최근 행의 라벨 — 표시 복원의 라벨(창 밖 행일 수 있다)을 쓰지 않는다(RV-SP-2).
+    let mut restored: HashMap<AccountKey, AlertInput> = HashMap::new();
+    for (ts, provider, account, label, win, pct, resets) in alert_rows {
+        let slot = restored.entry(AccountKey { provider, account_id: account }).or_default();
+        if ts >= slot.at {
+            slot.at = ts;
+            slot.label = label;
+        }
+        slot.rate.push(RateWindow { label: win, used_pct: pct, resets_at: resets });
     }
     if !restored.is_empty() {
         let mut st = daemon.accounts.lock().unwrap();
-        for (key, (ts, mut rate)) in restored {
-            rate.sort_by_key(|w| u8::from(w.label != "5h"));
-            st.alert_inputs.entry(key).or_insert((ts, rate));
+        for (key, mut input) in restored {
+            input.rate.sort_by_key(|w| u8::from(w.label != "5h"));
+            st.alert_inputs.entry(key).or_insert(input);
         }
     }
     if let Some(rows) = rows {
@@ -635,7 +668,8 @@ fn note_custom(daemon: &Arc<Daemon>, provider: &str, rate: &[RateWindow], source
         v.source = source.into();
         v.adapter = true;
     }
-    note_alert_input(&mut st, &key, rate, source, now);
+    let label = v.label.clone();
+    note_alert_input(&mut st, &key, &label, rate, source, now);
 }
 
 /// agy 관측 경로(agy-rpc)의 고장 코드를 antigravity 계정 행에 싣는다(`None` = 지움).
@@ -914,21 +948,22 @@ pub fn predict_exhaust(series: &[(f64, f64)], now: f64, resets_at: Option<f64>) 
 }
 
 /// alerts용 스냅샷: (라벨, 창, pct) — 경보 입력([`AccountsState::alert_inputs`])이 있는 계정만.
-/// 창 밖(표시용) 값은 경보 근거가 아니다 — 같은 UID 의 아무 프로세스나 보낼 수 있다(위조 한계). 그래서 경보는
+/// 창 밖(표시용) 값은 경보 근거가 아니다 — 검증되지 않은 값이 경보를 흔들지 않게 하려는 것이다. 그래서 경보는
 /// 같은 계정의 **창 밖이 아닌 관측 중 가장 최근 값**으로 판정한다 — 창 밖 값이 더 최신이어도 그 값이 남는다
-/// (표시 숫자와 다를 수 있다). 창 밖 값만 있는 계정은 경보 입력이 없다.
+/// (표시 숫자와 다를 수 있다). 창 밖 값만 있는 계정은 경보 입력이 없다. 라벨(=경보 키의 일부)도 그 관측의 라벨이다
+/// — 뷰 라벨(표시 승자)은 창 밖 보고가 바꿀 수 있다(fix-values-2 RV-SP-2).
+/// ★인증 경계가 아니다(fix-values-2 RV-SP-1 · 알려진 한계 · 오너 결정 대기): 좌석 경로 `usage.report` 는 pane 밖
+/// 호출자를 막지 않으므로, 같은 UID 프로세스는 좌석 번호 하나만 대고 **어느 계정이든** 여기 들어가는 값을 넣거나
+/// 덮을 수 있다(가짜 경보 · 진짜 경보 억제 둘 다). 위조 값은 좌석 출처로 스냅샷에 남아 재시작 뒤에도 복원된다.
 pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
     let st = daemon.accounts.lock().unwrap();
     let mut out = Vec::new();
-    for (key, (t, rate)) in &st.alert_inputs {
-        if *t == 0.0 {
+    for input in st.alert_inputs.values() {
+        if input.at == 0.0 {
             continue;
         }
-        let Some(v) = st.views.get(key) else {
-            continue; // 뷰 없는 경보 입력은 만들어지지 않는다(note 가 뷰를 먼저 만든다) — 방어
-        };
-        for w in rate {
-            out.push((v.label.clone(), w.label.clone(), w.used_pct));
+        for w in &input.rate {
+            out.push((input.label.clone(), w.label.clone(), w.used_pct));
         }
     }
     out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
@@ -1578,5 +1613,100 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ───────── fix-values-2 RV-SP-2 — 창 밖 보고는 **라벨**로도 경보에 닿지 않는다(수정 전 적색) ─────────
+    // 종전: 경보 값은 alert_inputs 에서 읽었지만 라벨은 뷰(표시 승자)에서 읽었다. 경보 키는 `account_rate:{label}:{win}`
+    // 이라, 같은 accountUuid 에 다른 emailAddress 를 가진 프로필의 창 밖 보고 한 건이 키를 갈아 끼웠다 — 새 키로 곧바로
+    // 발화하고, 좌석이 다시 보고하면 원래 키가 REMIND 안에 재발화했다(F1 과 같은 증상). 픽스처는 전부 합성값이다.
+
+    /// ⑤ 좌석 97 → 경보 1 → 같은 uuid·다른 이메일 프로필의 창 밖 보고 → 30초 표본 둘 → 좌석 97 → 표본.
+    /// 기대: REMIND 안 계정 경보 합계 1건, 키는 좌석 라벨 하나. 표시 라벨은 최신 승자 그대로(표시 규칙 무변경 · 대조).
+    #[test]
+    fn outside_report_label_does_not_rekey_or_refire_account_alerts() {
+        let dir = tmp("daemon-alert-label");
+        let home = tmp("home-alert-label");
+        let seat_sess = outside_profile(&home, ".claude-3", "u-lbl", "seat@example.test");
+        let other_sess = outside_profile(&home, ".claude-7", "u-lbl", "zz@example.test");
+        let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let cfg = crate::alerts::AlertConfig::default();
+        let mut fired: HashMap<String, f64> = HashMap::new();
+        let seat_key = "account_rate:seat@example.test:5h";
+        let seq0 = d.bus.latest_seq();
+        let t0 = crate::state::now_epoch();
+        assert!(note_rate_at(&d, Some(&home), "claude", &seat_sess, &[rw("5h", 97.0, None)], "statusline", t0));
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+        assert_eq!(account_alerts(&d, seq0, seat_key), 1, "좌석 97% 가 경보를 내지 않았다");
+        assert_eq!(
+            report_outside_at(&d, Some(&home), &other_sess, &[rw("5h", 3.0, None)], t0 + 5.0),
+            Ok(OutsideOutcome::Accepted)
+        );
+        let row = claude_rows(&d).into_iter().find(|r| r["account_id"] == "u-lbl").unwrap();
+        assert_eq!(row["label"], json!("zz@example.test"), "표시 라벨은 최신 승자(표시 규칙은 바꾸지 않는다)");
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 31.0);
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 61.0);
+        assert!(note_rate_at(&d, Some(&home), "claude", &seat_sess, &[rw("5h", 97.0, None)], "statusline", t0 + 70.0));
+        crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 91.0);
+        let keys: Vec<String> = d
+            .bus
+            .replay_after(seq0)
+            .iter()
+            .filter(|e| e["name"] == "alert.account_rate")
+            .map(|e| e["payload"]["key"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![seat_key.to_string()],
+            "창 밖 보고가 경보 키를 갈아 끼워 REMIND 안에 새로 발화·재발화했다"
+        );
+        assert_eq!(
+            alert_rates(&d),
+            vec![("seat@example.test".to_string(), "5h".to_string(), 97.0)],
+            "경보 라벨이 창 밖 보고의 라벨로 바뀌었다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ⑥ 재시작 복원도 경보 라벨을 **경보 입력 출처의 스냅샷 행**에서 가져온다 — 창 밖 행의 라벨이 마지막이어도.
+    #[test]
+    fn snapshot_restore_takes_the_alert_label_from_seat_rows() {
+        let dir = tmp("daemon-alert-label-rs");
+        let home = tmp("home-alert-label-rs");
+        let seat_sess = outside_profile(&home, ".claude-3", "u-lrs", "seat2@example.test");
+        let other_sess = outside_profile(&home, ".claude-7", "u-lrs", "zz2@example.test");
+        let sock = dir.join("cysd.sock");
+        let t0 = crate::state::now_epoch();
+        {
+            let d1 = crate::state::Daemon::new(sock.clone());
+            assert!(note_rate_at(&d1, Some(&home), "claude", &seat_sess, &[rw("5h", 97.0, None)], "statusline", t0));
+            assert_eq!(
+                report_outside_at(&d1, Some(&home), &other_sess, &[rw("5h", 3.0, None)], t0 + 2.0),
+                Ok(OutsideOutcome::Accepted)
+            );
+        }
+        let d2 = crate::state::Daemon::new(sock);
+        restore_from_snapshots(&d2, t0 + 10.0);
+        assert_eq!(alert_rates(&d2), vec![("seat2@example.test".to_string(), "5h".to_string(), 97.0)]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ───────── fix-values-2 RV-SP-1 — 문서 계약: 경보/표시 분리는 인증 경계가 아니다 ─────────
+    // 종전 매뉴얼은 "같은 UID 프로그램이 보낼 수 있어서 창 밖 값을 경보에서 뺀다 · 경보는 좌석 값으로 판정"만 적어,
+    // 좌석 값은 위조되지 않는 것처럼 읽혔다. 실제로는 좌석 경로 `usage.report` 가 pane 밖 호출자를 막지 않는다
+    // (handlers 검체 `usage_report_from_outside_any_pane_still_feeds_account_alerts` 가 그 동작을 박제한다).
+    /// 매뉴얼의 사이드바 사용량 절이 이 한계(좌석 경로로도 경보 값을 넣거나 덮을 수 있다)를 적고 있어야 한다.
+    #[test]
+    fn manual_states_that_alert_separation_is_not_an_auth_boundary() {
+        let manual = include_str!("../../../USER-MANUAL.md");
+        let start = manual.find("**창 밖 값은 표시용입니다.**").expect("사이드바 사용량 절의 창 밖 값 문단");
+        let end = manual[start..].find("- 모이지 않는 경우:").map_or(manual.len(), |i| start + i);
+        // 줄바꿈 위치와 무관하게 보도록 공백을 하나로 접는다.
+        let para = manual[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        for needle in ["인증 경계가 아닙니다", "usage.report", "좌석 번호", "가짜", "나지 않게"] {
+            assert!(para.contains(needle), "창 밖 값 문단에 같은 UID 한계({needle})가 없다:\n{para}");
+        }
+        assert!(para.contains("80%·95%"), "계정 경보 기본 임계는 80%·95% 다(alerts.rs AlertConfig::default):\n{para}");
     }
 }

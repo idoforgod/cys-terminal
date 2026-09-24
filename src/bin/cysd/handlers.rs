@@ -7118,6 +7118,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // 소유 게이트 — usage.register와 동형: 발신 pane은 자기 surface에만 보고할 수 있다.
             // 없으면 워커가 타 pane의 ctx·rate 배지를 위조해 60% 사이클을 오발·억제할 수 있다.
+            // ★알려진 한계(fix-values-2 RV-SP-1 · 오너 결정 대기 — IMPL-values §7-4): 이 게이트는 **다른 좌석 안의**
+            //   호출자만 막는다. 호출자가 어느 pane 의 자손도 아니면(caller_sid None) 통과하고 session_file 도 검증하지
+            //   않으므로, 같은 UID 프로세스는 claude 좌석 번호 하나만 대고 어느 계정의 경보 입력이든 넣거나 덮을 수 있다
+            //   (검체 `usage_report_from_outside_any_pane_still_feeds_account_alerts` · 매뉴얼 사이드바 사용량 절에 고지).
             let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
             if let Some(cs) = caller_sid {
                 if cs != sid {
@@ -7229,8 +7233,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         //   surface 의 usage.report 를 쓴다 — 소유 게이트 우회 샛길 차단) · 호출자 pid 미상도 거절(fail-closed)
         //   ③ transcript 실재 + 알려진 프로필 dir 의 projects/ 아래 ④ 프로필당 빈도 상한 ⑤ 신원 귀속.
         // ★한계(문서화 · 오너 승인 2026-09-23): 같은 UID 의 pane 밖 프로세스는 실재하는 transcript 경로를 대고 값을
-        //   보낼 수 있다(표시값 위조). 그래서 이 값은 **표시용**이고 계정 경보의 근거가 아니다(accounts::alert_rates).
-        //   거절도 이벤트를 내지 않는다(상태줄 빈도로 버스를 덮지 않게) — 응답 코드만.
+        //   보낼 수 있다(표시값 위조). 그래서 이 값은 **표시용**이고 계정 경보의 근거가 아니다(accounts::alert_rates) —
+        //   값도 라벨(경보 키)도 경보에 닿지 않는다(fix-values-2 RV-SP-2). 단 이 구분은 인증 경계가 아니다: 좌석 경로
+        //   `usage.report` 가 pane 밖 호출자를 막지 않아, 같은 호출자가 좌석 번호만 대면 경보 입력에 닿는다(RV-SP-1 ·
+        //   위 usage.report 소유 게이트 주석). 거절도 이벤트를 내지 않는다(상태줄 빈도로 버스를 덮지 않게) — 응답 코드만.
         "usage.report_account" => {
             let raw_len = params.get("rate").and_then(|v| v.as_array()).map_or(0, |a| a.len());
             let session_file = param_str(&params, "session_file").unwrap_or_default();
@@ -16766,6 +16772,58 @@ mod tests {
         let r = usage_report(&daemon, seat, json!({"ctx_pct": 10, "rate": []}), Some(pid));
         assert_eq!(r["ok"], json!(true), "claude 좌석의 평범한 보고가 막혔다: {r}");
         assert_eq!(usage_updated_count(&daemon, seat), 1);
+    }
+
+    /// ★알려진 한계 박제(fix-values-2 RV-SP-1 · 오너 결정 대기 — IMPL-values §7-4): 좌석 경로 `usage.report` 의 소유
+    /// 게이트는 **다른 좌석 안의** 호출자만 막는다. 호출자가 어느 pane 의 자손도 아니면(조상 체인에 pane 없음) 통과한다
+    /// (`usage_report_anonymous_passes` 와 같은 게이트). 그래서 같은 UID 프로세스는 claude 좌석 번호 하나만 대고
+    /// **어느 계정이든** 계정 경보 입력을 넣거나(가짜 crit) 진짜 좌석 값을 덮을(억제) 수 있다. 경보/표시 분리
+    /// (`accounts::alert_inputs`)는 검증되지 않은 **창 밖** 값을 경보에서 빼는 정확성 조치이지 인증 경계가 아니다.
+    /// 매뉴얼 사이드바 사용량 절과 `accounts.rs` 머리 주석이 이 한계를 적는다(accounts 검체
+    /// `manual_states_that_alert_separation_is_not_an_auth_boundary`). 오너가 좌석 경로를 닫기로 결정하면 이 검체를
+    /// 뒤집고 매뉴얼 문단도 함께 고친다. 픽스처는 전부 합성값이다.
+    #[test]
+    fn usage_report_from_outside_any_pane_still_feeds_account_alerts() {
+        let daemon = claim_daemon();
+        let seat = make_surface(&daemon, Some("worker-sp1"));
+        set_agent(&daemon, seat, "claude", "claude");
+        let home = std::env::temp_dir().join(format!("cys-sp1-{}-{}", std::process::id(), seat));
+        let _ = std::fs::remove_dir_all(&home);
+        let profile = |n: &str, uuid: &str, email: &str| -> String {
+            let dir = home.join(format!(".claude-{n}"));
+            std::fs::create_dir_all(dir.join("projects/-w")).unwrap();
+            std::fs::write(
+                dir.join(".claude.json"),
+                format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{email}"}}}}"#),
+            )
+            .unwrap();
+            std::fs::write(dir.join("projects/-w/s.jsonl"), "{}\n").unwrap();
+            dir.join("projects/-w/s.jsonl").to_string_lossy().into_owned()
+        };
+        let never_in_a_pane = profile("8", "u-sp1-a", "forged@example.test");
+        let seat_account = profile("9", "u-sp1-b", "genuine@example.test");
+        let outside_pid = 994_341_u32;
+        bind_outside_caller(&daemon, outside_pid);
+        let seat_pid = 994_342_u32;
+        bind_caller(&daemon, seat_pid, seat);
+        let report = |sf: &str, pct: f64, pid: u32| {
+            usage_report(&daemon, seat, json!({"session_file": sf, "rate": [{"label": "5h", "used_pct": pct}]}), Some(pid))
+        };
+        // 가짜 경보 방향: pane 에서 한 번도 쓰지 않은 계정에 pane 밖 호출자가 97% 를 넣는다 → 경보 입력이 된다.
+        assert_eq!(report(&never_in_a_pane, 97.0, outside_pid)["ok"], json!(true));
+        // 억제 방향: 좌석 안 호출자의 진짜 97% 를 pane 밖 호출자의 5% 가 덮는다.
+        assert_eq!(report(&seat_account, 97.0, seat_pid)["ok"], json!(true));
+        assert_eq!(report(&seat_account, 5.0, outside_pid)["ok"], json!(true));
+        assert_eq!(
+            crate::accounts::alert_rates(&daemon),
+            vec![
+                ("forged@example.test".to_string(), "5h".to_string(), 97.0),
+                ("genuine@example.test".to_string(), "5h".to_string(), 5.0),
+            ],
+            "좌석 경로의 같은 UID 한계가 바뀌었다 — 의도한 변경이면 이 검체를 뒤집고 USER-MANUAL.md 사이드바 사용량 절의 \
+             '인증 경계가 아닙니다' 문단과 accounts.rs 머리 주석을 함께 고쳐라"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// ★불변식 박제 (절대지침 — 컨텍스트 60% 사이클의 결정론 트리거):
