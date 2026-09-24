@@ -16973,6 +16973,110 @@ const STATUSLINE_PUSH_BUDGET_MS: u64 = 400;
 const OUTSIDE_STDIN_MAX: usize = 1024 * 1024;
 /// 창 밖 보고의 `session_file` 길이 상한(바이트) — 데몬(`accounts::OUTSIDE_SESSION_FILE_MAX`)과 같은 값.
 const OUTSIDE_SESSION_FILE_MAX: usize = 1024;
+/// ★fatal-fix (b) · F4 · R3-3 · W1: claude **좌석** 상태줄 push 의 총예산(연결 포함 · 밀리초). 종전 좌석 경로는
+/// `request()`(무진행 상한 40초 · 연결 실패 시 autostart — 윈도우는 파이프 busy 재시도까지 겹쳐 최악 약 205초 · 호출마다
+/// 형제 cysd 스폰)였고, 데몬이 멈추면 상태줄마다 cys 가 40초씩 살아 쌓였다. 좌석 보고는 ctx(60% 임계 신호)를 싣는
+/// 만큼 창 밖(0.4초)보다 넉넉히 둔다 — 정상 왕복 5–6ms · 데몬 쪽 호출자 추적 약 45ms(디버그). 윈도우는 실측 전이라
+/// 2초(W4). 예산을 넘겨도 요청이 이미 쓰였으면 데몬은 재개 뒤 그 보고를 반영한다(떠난 호출자도 받는다 — T3c) ·
+/// 못 쓰였으면 수집기의 transcript 폴백이 60초 안에 ctx 를 채운다(usage.rs STATUSLINE_FRESH_SECS).
+const SEAT_STATUSLINE_PUSH_BUDGET_MS: u64 = if cfg!(windows) { 2000 } else { 1000 };
+/// ★fatal-fix R3-1: 창 밖 push 의 CLI 자기 상한 — 같은 값은 이 주기(초) 안에 다시 보내지 않는다.
+const OUTSIDE_RESEND_SECS: f64 = 60.0;
+/// 값이 바뀌어도 이 간격(초) 안에는 보내지 않는다(데몬 선상한과 같은 값).
+const OUTSIDE_MIN_RESEND_SECS: f64 = 1.0;
+/// 직전 push 가 실패했으면(데몬 부재·정지·거절) 이만큼(초) 물러선다.
+const OUTSIDE_FAIL_BACKOFF_SECS: f64 = 10.0;
+
+/// 창 밖 push 기록(프로필별 작은 파일) — 마지막 시도 시각·보낸 값의 서명·성공 여부.
+#[derive(Debug, Clone, PartialEq)]
+struct OutsideStamp {
+    t: f64,
+    sig: String,
+    ok: bool,
+}
+
+/// ★fatal-fix R3-1: 지금 창 밖 push 를 보낼 때인가(순수 — 핀). 판정 근거가 없으면(첫 호출·손상·시계 역행) 보낸다 —
+/// 실패 방향은 종전 거동(매번 보냄)이다. 데몬이 멈춘 동안 창 밖 세션의 연결이 accept 대기열(128)을 채워 모든
+/// 클라이언트가 ECONNREFUSED 를 받던 경로(wedge 를 '데몬 없음'으로 오판 → 자동 기동 경쟁 → 데드맨)의 공급원을 줄인다.
+fn outside_push_due(prev: Option<&OutsideStamp>, sig: &str, now: f64) -> bool {
+    let Some(p) = prev else {
+        return true;
+    };
+    if !p.t.is_finite() || now < p.t {
+        return true;
+    }
+    let dt = now - p.t;
+    if !p.ok {
+        return dt >= OUTSIDE_FAIL_BACKOFF_SECS;
+    }
+    if dt < OUTSIDE_MIN_RESEND_SECS {
+        return false;
+    }
+    p.sig != sig || dt >= OUTSIDE_RESEND_SECS
+}
+
+/// 기록 파일 위치(순수) — 프로필(대화 기록 경로의 `/projects/` 앞)마다 하나. 같은 프로필의 세션들은 기록을 나눈다.
+fn outside_stamp_path_in(dir: &std::path::Path, session_file: &str) -> std::path::PathBuf {
+    let norm = session_file.replace('\\', "/");
+    let key = norm.find("/projects/").map_or(norm.as_str(), |i| &norm[..i]);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    dir.join(format!("{h:016x}.json"))
+}
+
+/// 운영 기록 폴더 — 사용자별 임시 폴더 아래. 남이 만든 폴더(유닉스 소유자 불일치)면 기록을 쓰지 않는다(None → 매번 보냄).
+fn outside_stamp_path(session_file: &str) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    let dir = {
+        // SAFETY: getuid 는 실패하지 않는다.
+        let uid = unsafe { libc::getuid() };
+        let d = std::env::temp_dir().join(format!("cys-outside-usage-{uid}"));
+        if let Ok(md) = std::fs::symlink_metadata(&d) {
+            use std::os::unix::fs::MetadataExt;
+            if !md.is_dir() || md.uid() != uid {
+                return None;
+            }
+        }
+        d
+    };
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("cys-outside-usage");
+    Some(outside_stamp_path_in(&dir, session_file))
+}
+
+fn read_outside_stamp(path: &std::path::Path) -> Option<OutsideStamp> {
+    let mut s = String::new();
+    std::fs::File::open(path).ok()?.take(4096).read_to_string(&mut s).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    Some(OutsideStamp {
+        t: v.get("t")?.as_f64()?,
+        sig: v.get("sig")?.as_str()?.to_string(),
+        ok: v.get("ok")?.as_bool()?,
+    })
+}
+
+/// 기록 쓰기 — 임시 파일 + 이름 바꾸기(동시 세션이 반쯤 쓴 파일을 읽지 않게). 실패는 무시(다음엔 그냥 보낸다).
+fn write_outside_stamp(path: &std::path::Path, stamp: &OutsideStamp) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = dir.join(format!(".{}.{}.tmp", std::process::id(), path.file_name().and_then(|n| n.to_str()).unwrap_or("s")));
+    let body = json!({"t": stamp.t, "sig": stamp.sig, "ok": stamp.ok}).to_string();
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
 
 /// 롤백 노브 `CYS_OUTSIDE_USAGE=0` — 창 밖 보고를 끈다(코드 되돌림 없이 종전 거동). 순수 판정부.
 fn outside_usage_enabled_with(raw: Option<&str>) -> bool {
@@ -16992,10 +17096,25 @@ fn outside_account_params(v: &Value) -> Option<Value> {
     Some(json!({"rate": rate, "session_file": session_file}))
 }
 
-/// agy(Antigravity CLI) 상태줄 stdin 인가 — 공식 문서의 `"product":"antigravity"` 또는 claude 에 없는 `quota` 맵.
+/// agy(Antigravity CLI) 상태줄 stdin 인가 — 공식 문서의 `"product":"antigravity"` 가 정본이다.
+/// 보조 갈래(`product` 가 없는 구 agy 호환)는 **좁게** 둔다(fatal-fix N2 · R3-6): `quota` 맵에 `gemini-` 버킷이 실제로
+/// 있고 · `rate_limits` 가 없고 · 대화 기록이 claude 모양(`…/projects/…`)이 아닐 때만. 종전(쿼터 맵 ∧ rate_limits 부재)은
+/// 필드 이름 `quota` 하나만 겹쳐도 claude 좌석(API 키·Bedrock·첫 응답 전 = rate_limits 없음)을 agy 로 오판했고, 데몬이
+/// 그 보고를 'non-agy seat' 로 거절해 그 좌석의 ctx·60% 임계가 전부 끊겼다(경보 없는 영구 무clear).
+/// 실패 방향: product 없는 낯선 페이로드는 claude 경로로 간다(v0.14.41 과 같은 거동 — 막히는 쪽이 아니다).
 fn is_agy_statusline(v: &Value) -> bool {
-    v.get("product").and_then(|x| x.as_str()) == Some("antigravity")
-        || (v.get("quota").is_some_and(|q| q.is_object()) && v.get("rate_limits").is_none())
+    if v.get("product").and_then(|x| x.as_str()) == Some("antigravity") {
+        return true;
+    }
+    let gemini_buckets = v
+        .get("quota")
+        .and_then(|q| q.as_object())
+        .is_some_and(|q| q.keys().any(|k| k.starts_with("gemini-")));
+    let claude_transcript = v
+        .get("transcript_path")
+        .and_then(|x| x.as_str())
+        .is_some_and(|t| t.replace('\\', "/").contains("/projects/"));
+    gemini_buckets && v.get("rate_limits").is_none() && !claude_transcript
 }
 
 /// agy 쿼터 맵 → `[(창, 사용률, 리셋 epoch?)]`(5h 먼저). 문서 스키마: `quota.<bucket id>.{remaining_fraction,
@@ -17085,7 +17204,18 @@ fn agy_statusline_human_line(v: &Value) -> String {
 /// (quiet가 아니면) 사람용 statusline 한 줄을 stdout으로 출력한다.
 /// ★불변: statusline 경로는 **절대 claude를 막지 않는다** — 빈 입력·파싱 실패·surface 미해결·
 /// 데몬 부재 전부 exit 0으로 무해하게 흘린다.
+/// ★fatal-fix (b) · F4 · R3-3 · W1 · W3: 세 경로(claude 좌석 · agy 좌석 · cys 창 밖) **모두** push 는 아래 한 곳의
+/// autostart 없는 **총예산** 왕복(`request_on_before`)으로만 보낸다 — 데몬이 없거나 멈춰도 상태줄이 예산 이상 늦지 않고,
+/// 상태줄이 데몬을 되살리지 않는다(좌석은 데몬과 함께 죽으므로 상태줄 autostart 에 기대는 복구 경로는 없다).
+/// 그리고 push 가 사람용 줄보다 **먼저**다: Claude Code 는 상태줄 프로세스가 끝난 뒤 stdout 을 쓰므로 선출력은 표시를
+/// 앞당기지 못하고, 닫힌 stdout(SIGPIPE·윈도우 println! panic)이 push 를 죽이게만 한다. 출력 오류는 무시한다.
 fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
+    // 닫힌 stdout 에 쓰다 SIGPIPE 로 죽지 않게(이 하위명령 한정) — 쓰기 오류는 아래에서 무시한다.
+    #[cfg(unix)]
+    // SAFETY: 이 프로세스의 SIGPIPE 처분만 바꾼다(스레드 생성 전 · 반환값 무시).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
         return 0;
@@ -17093,57 +17223,63 @@ fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&buf) else {
         return 0;
     };
-    // 0.14.42 새 두 경로(agy 상태줄 · cys 창 밖 Claude)는 사람용 줄을 **먼저** 내고, push 는 아래 한 곳에서
-    // autostart 없는 총예산 왕복으로만 보낸다(데몬 부재·무응답이어도 상태줄이 STATUSLINE_PUSH_BUDGET_MS 이상
-    // 늦지 않는다 · 데몬을 되살리지 않는다). 결과는 버린다 — 상태줄은 절대 에이전트를 막지 않는다.
-    let push: Option<(&str, Value)> = if is_agy_statusline(&v) {
+    // (사람용 줄, push = (method, params, 총예산 ms), 창 밖 기록 = (파일, 값 서명))
+    type Push = (&'static str, Value, u64);
+    let (line, push, stamp): (String, Option<Push>, Option<(std::path::PathBuf, String)>) = if is_agy_statusline(&v) {
         // ★RC2-b: agy 상태줄 — 좌석(cys 창 agy)에서만 보낸다. 창 밖 agy 는 보내지 않는다(오너 승인 범위 =
         //   창 밖 **Claude** 세션). 데몬은 좌석이 agy(gemini)인지 다시 확인한다.
-        if !quiet {
-            println!("{}", agy_statusline_human_line(&v));
-        }
         let mut params = agy_statusline_to_report_params(&v, unix_now() as f64);
-        match target_surface(surface, &None) {
+        let push = match target_surface(surface, &None) {
             Ok(sid) if params["rate"].as_array().is_some_and(|a| !a.is_empty()) => {
                 params["surface_id"] = json!(sid);
-                Some(("usage.report", params))
+                Some(("usage.report", params, STATUSLINE_PUSH_BUDGET_MS))
             }
             _ => None,
-        }
+        };
+        (agy_statusline_human_line(&v), push, None)
     } else {
         match target_surface(surface, &None) {
-            // cys 창 좌석(claude) — 종전 경로 그대로(push 후 사람용 줄).
+            // cys 창 좌석(claude) — ctx·rate 배지 + 60% 임계 신호. 좌석 예산은 창 밖보다 넉넉하다.
             Ok(sid) => {
                 let mut params = statusline_to_report_params(&v);
                 params["surface_id"] = json!(sid);
-                let _ = request("usage.report", params);
-                if !quiet {
-                    println!("{}", statusline_human_line(&v));
-                }
-                None
+                (statusline_human_line(&v), Some(("usage.report", params, SEAT_STATUSLINE_PUSH_BUDGET_MS)), None)
             }
             // ★RC4-b: cys 창 밖(surface 없음) Claude 세션 — 계정 전용 보고. `--surface` 를 잘못 준 경우는 종전처럼
-            //   조용히 건너뛴다(창 밖이 아니라 호출 오류다).
+            //   조용히 건너뛴다(창 밖이 아니라 호출 오류다). ★fatal-fix R3-1: 같은 값 60초·최소 1초·실패 뒤 10초는 CLI 가
+            //   스스로 건너뛴다(프로필별 기록 파일 · 기록을 못 읽거나 못 쓰면 종전처럼 보낸다).
             Err(_) => {
-                if !quiet {
-                    println!("{}", statusline_human_line(&v));
-                }
                 let enabled = surface.is_none()
                     && outside_usage_enabled_with(cys::env_compat("CYS_OUTSIDE_USAGE").as_deref())
                     && buf.len() <= OUTSIDE_STDIN_MAX;
-                enabled
-                    .then(|| outside_account_params(&v))
-                    .flatten()
-                    .map(|p| (USAGE_REPORT_ACCOUNT_METHOD, p))
+                let mut stamp = None;
+                let push = enabled.then(|| outside_account_params(&v)).flatten().and_then(|p| {
+                    let sig = p["rate"].to_string();
+                    let path = p["session_file"].as_str().and_then(outside_stamp_path);
+                    let prev = path.as_deref().and_then(read_outside_stamp);
+                    if !outside_push_due(prev.as_ref(), &sig, now_secs_f64()) {
+                        return None;
+                    }
+                    stamp = path.map(|x| (x, sig));
+                    Some((USAGE_REPORT_ACCOUNT_METHOD, p, STATUSLINE_PUSH_BUDGET_MS))
+                });
+                (statusline_human_line(&v), push, stamp)
             }
         }
     };
-    if let Some((method, params)) = push {
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        // 소켓은 socket_path() 그대로(창 밖 세션 = 기본 소켓 = 본부 · CYS_SOCKET 이 있으면 그것 — 격리 하네스 유지).
+    if let Some((method, params, budget_ms)) = push {
+        // 소켓은 socket_path() 그대로(좌석 = pane 의 CYS_SOCKET · 창 밖 세션 = 기본 소켓 = 본부 — 격리 하네스 유지).
         // 예산을 넘긴 왕복 스레드는 버린다 — 이 프로세스가 곧 끝나므로 함께 사라진다(누적 없음).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STATUSLINE_PUSH_BUDGET_MS);
-        let _ = request_on_before(&socket_path(), method, params, deadline);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        let ok = request_on_before(&socket_path(), method, params, deadline).is_ok();
+        if let Some((path, sig)) = stamp {
+            write_outside_stamp(&path, &OutsideStamp { t: now_secs_f64(), sig, ok });
+        }
+    }
+    if !quiet {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     }
     0
 }
@@ -26627,8 +26763,13 @@ mod tests {
     }
 
     /// RC4-b: 새 RPC 이름이 **양쪽에** 실재한다(클라이언트 상수 · 데몬 arm) — 이름이 갈리면 모든 창 밖 보고가
-    /// method_not_found 로 조용히 사라진다. 그리고 새 두 경로(창 밖 · agy 좌석)는 **autostart 없는 총예산** 왕복
-    /// (`request_on_before`)만 쓴다 · 종전 claude 좌석 경로(`request("usage.report"`)는 그대로 한 번.
+    /// method_not_found 로 조용히 사라진다.
+    /// ★fatal-fix (b) · F4 · R3-3 · W1 · W3: **세 경로 모두**(claude 좌석 · 창 밖 · agy 좌석) autostart 없는 총예산 왕복
+    /// (`request_on_before`) 하나로만 보낸다. 종전 claude 좌석 경로는 `request("usage.report")`(무진행 상한 40초 ·
+    /// 연결 실패 시 autostart — 윈도우 최악 약 205초 · 호출마다 형제 cysd 스폰)였고, 데몬이 멈추면 상태줄마다 cys 가
+    /// 40초씩 살아 쌓였다. 그리고 push 가 사람용 줄보다 **먼저**다 — 닫힌 stdout(SIGPIPE·윈도우 println! panic)이 push 를
+    /// 죽이지 못한다(Claude Code 는 상태줄 프로세스가 끝난 뒤에 stdout 을 쓰므로 선출력은 표시를 앞당기지 못한다).
+    /// 사람용 줄은 쓰기 오류를 무시하는 `writeln!` 이다(`println!` 은 닫힌 stdout 에서 panic 한다).
     #[test]
     fn usage_report_account_rpc_exists_on_both_sides_and_is_bounded() {
         assert_eq!(USAGE_REPORT_ACCOUNT_METHOD, "usage.report_account");
@@ -26639,10 +26780,71 @@ mod tests {
         );
         let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_usage_report_stdin"));
         assert!(body.contains("USAGE_REPORT_ACCOUNT_METHOD"), "창 밖 분기가 상수로 부르지 않는다");
-        assert_eq!(body.matches("request_on_before(").count(), 1, "새 경로는 공용 유계 push 하나로만 보낸다:\n{body}");
-        assert_eq!(body.matches("request(\"usage.report\", params)").count(), 1, "claude 좌석 경로가 바뀌었다");
+        assert_eq!(body.matches("request_on_before(").count(), 1, "세 경로는 공용 유계 push 하나로만 보낸다:\n{body}");
+        assert_eq!(body.matches("request(").count(), 0, "autostart·40초 경로(request)가 남았다:\n{body}");
         assert!(!body.contains("AUTOSTART"), "autostart 전역을 건드리지 않는다(request_on_before 는 원래 무 autostart)");
+        assert!(!body.contains("println!"), "닫힌 stdout 에서 panic 하는 println! 을 쓴다:\n{body}");
+        let push_at = body.find("request_on_before(").unwrap();
+        let print_at = body.find("writeln!").expect("사람용 줄 출력");
+        assert!(push_at < print_at, "사람용 줄이 push 보다 먼저다(닫힌 stdout 이 push 를 죽인다):\n{body}");
         assert!(STATUSLINE_PUSH_BUDGET_MS <= 500, "상태줄 총예산이 커졌다");
+        assert!(
+            (500..=2000).contains(&SEAT_STATUSLINE_PUSH_BUDGET_MS),
+            "좌석 예산은 ctx 보고(60% 임계 신호)를 싣는 만큼 창 밖보다 넉넉하되 2초를 넘지 않는다"
+        );
+    }
+
+    /// ★fatal-fix N2 · R3-6: agy 판별의 보조 갈래가 claude 페이로드를 agy 로 오판하면 그 좌석은 데몬이 'non-agy seat'
+    /// 로 거절해 ctx·usage.updated·context.threshold 가 **전부 0**이 된다(경보 없는 영구 무clear). rate_limits 는 API 키·
+    /// Bedrock 세션과 첫 응답 전에 없으므로, 필드 이름 `quota` 하나만 겹쳐도 발현한다. 그래서 보조 갈래는 **gemini 버킷이
+    /// 실제로 있는** 쿼터 맵 + rate_limits 부재 + claude 대화 기록 모양(`/projects/`)이 아닐 때로 좁힌다.
+    #[test]
+    fn fatal_fix_claude_payload_with_an_unfamiliar_quota_stays_on_the_claude_path() {
+        let claude_tx = "/Users/x/.claude-3/projects/-a/s.jsonl";
+        for quota in [json!({}), json!({"requests": {"remaining_fraction": 0.5}}), json!({"gemini-5h": {"remaining_fraction": 0.5}})] {
+            let v = json!({"transcript_path": claude_tx, "context_window": {"used_percentage": 70.0}, "quota": quota});
+            assert!(!is_agy_statusline(&v), "낯선 quota 를 가진 claude 페이로드가 agy 로 오판됐다: {v}");
+        }
+        // 대화 기록이 없는 claude(첫 응답 전) + 빈 quota 도 claude
+        assert!(!is_agy_statusline(&json!({"context_window": {"used_percentage": 1.0}, "quota": {}})));
+        // 호환: product 가 없는 구 agy 도 gemini 버킷 + agy 대화 기록 모양이면 agy
+        let mut old_agy = agy_payload();
+        old_agy.as_object_mut().unwrap().remove("product");
+        assert!(is_agy_statusline(&old_agy));
+        // product 가 antigravity 면 무조건 agy(공식 문서 필드)
+        assert!(is_agy_statusline(&json!({"product": "antigravity"})));
+    }
+
+    /// ★fatal-fix R3-1: 창 밖 push 는 CLI 가 스스로 줄인다 — 같은 값은 [`OUTSIDE_RESEND_SECS`] 안에 다시 보내지 않고,
+    /// 값이 바뀌어도 [`OUTSIDE_MIN_RESEND_SECS`] 안에는 보내지 않으며, 직전 push 가 실패했으면(데몬 부재·정지)
+    /// [`OUTSIDE_FAIL_BACKOFF_SECS`] 동안 물러선다. 데몬이 멈춘 동안 창 밖 세션의 연결이 accept 대기열(128)을 채워
+    /// 모든 클라이언트가 ECONNREFUSED 를 받던 경로(wedge 를 '데몬 없음'으로 오판 → 자동 기동 경쟁)의 공급원을 줄인다.
+    /// 판정 근거가 없으면(첫 호출·손상된 기록·시계 역행) 보낸다 — 실패 방향은 종전 거동이다.
+    #[test]
+    fn fatal_fix_outside_push_is_throttled_by_the_cli_stamp() {
+        let now = 2_000_000.0;
+        let st = |t: f64, sig: &str, ok: bool| OutsideStamp { t, sig: sig.to_string(), ok };
+        assert!(outside_push_due(None, "5h:33|7d:44", now), "첫 호출");
+        assert!(!outside_push_due(Some(&st(now - 10.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "같은 값 재전송");
+        assert!(outside_push_due(Some(&st(now - OUTSIDE_RESEND_SECS - 1.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "같은 값도 주기마다");
+        assert!(!outside_push_due(Some(&st(now - 0.2, "5h:33", true)), "5h:34", now), "값이 바뀌어도 최소 간격");
+        assert!(outside_push_due(Some(&st(now - 2.0, "5h:33", true)), "5h:34", now), "값이 바뀌면 곧 보낸다");
+        assert!(!outside_push_due(Some(&st(now - 2.0, "5h:33", false)), "5h:34", now), "실패 직후 물러선다");
+        assert!(outside_push_due(Some(&st(now - OUTSIDE_FAIL_BACKOFF_SECS - 1.0, "5h:33", false)), "5h:34", now));
+        assert!(outside_push_due(Some(&st(now + 100.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "시계 역행 = 근거 없음");
+        // 기록 파일: 프로필별 · 손상 내성
+        let dir = std::env::temp_dir().join(format!("cys-outside-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = outside_stamp_path_in(&dir, "/Users/x/.claude-3/projects/-a/s.jsonl");
+        let b = outside_stamp_path_in(&dir, "/Users/x/.claude-4/projects/-a/s.jsonl");
+        assert_ne!(a, b, "프로필마다 따로");
+        assert_eq!(a, outside_stamp_path_in(&dir, "/Users/x/.claude-3/projects/-b/t.jsonl"), "같은 프로필의 다른 세션은 같은 기록");
+        assert!(read_outside_stamp(&a).is_none());
+        write_outside_stamp(&a, &st(now, "5h:1", true));
+        assert_eq!(read_outside_stamp(&a).map(|s| (s.sig, s.ok)), Some(("5h:1".to_string(), true)), "쓰기 후 되읽기");
+        std::fs::write(&a, "garbage").unwrap();
+        assert!(read_outside_stamp(&a).is_none(), "손상된 기록은 근거가 아니다");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.
