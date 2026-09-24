@@ -4310,15 +4310,44 @@ async fn usage_accounts_all() -> Result<Value, String> {
             }
         }
     }
+    let resps = fanout_usage_accounts(targets, Duration::from_secs(2)).await;
+    Ok(json!({"accounts": merge_account_rows(&resps)}))
+}
+
+/// 소켓마다 `usage.accounts` 를 **동시에** 묻는다(소켓당 상한은 그대로 · 0.14.42 RC6).
+/// 종전엔 순차라 무응답 부서 N개가 N×2초만큼 전체를 늦췄고, JS 상한(T_ACCT)을 넘기면 부분 성공까지 버려져
+/// 그 부서에서만 관측되는 계정이 '관측 없음'으로 떨어졌다. 결과 순서는 targets 순서(본부 먼저) 그대로다.
+/// 실패·시간 초과 소켓은 건너뛴다(종전과 같음 — 병합은 받은 것만).
+async fn fanout_usage_accounts(
+    targets: Vec<std::path::PathBuf>,
+    per_socket: std::time::Duration,
+) -> Vec<Value> {
+    let handles: Vec<_> = targets
+        .into_iter()
+        .map(|sock| {
+            tauri::async_runtime::spawn(async move {
+                tokio::time::timeout(per_socket, rpc_oneshot(&sock, "usage.accounts", json!({})))
+                    .await
+            })
+        })
+        .collect();
+    let mut out = Vec::new();
+    for h in handles {
+        if let Ok(Ok(Ok(resp))) = h.await {
+            out.push(resp);
+        }
+    }
+    out
+}
+
+/// usage_accounts_all 병합(순수 — 핀). 키 (provider, account_id) · updated_at 큰 쪽 승 · profiles 합집합.
+/// ★source_error(관측 경로 고장 코드): 승자가 **관측 전**(updated_at 없음)이고 자기 오류가 없으면 다른 데몬의
+/// 오류를 이어받는다 — 본부(좌석 없음 · 오류 없음)가 먼저 오면 부서 agy 의 거부 코드가 묻혔다. 관측된 승자에는
+/// 남의 오류를 덧씌우지 않는다.
+fn merge_account_rows(resps: &[Value]) -> Vec<Value> {
     let mut merged: std::collections::HashMap<(String, String), Value> =
         std::collections::HashMap::new();
-    for sock in targets {
-        let call = tokio::time::timeout(
-            Duration::from_secs(2),
-            rpc_oneshot(&sock, "usage.accounts", json!({})),
-        )
-        .await;
-        let Ok(Ok(resp)) = call else { continue };
+    for resp in resps {
         for a in resp["accounts"].as_array().into_iter().flatten() {
             let key = (
                 a["provider"].as_str().unwrap_or("").to_string(),
@@ -4341,10 +4370,20 @@ async fn usage_accounts_all() -> Result<Value, String> {
                         .collect();
                     profs.sort();
                     profs.dedup();
+                    let carried = [cur["source_error"].clone(), a["source_error"].clone()]
+                        .into_iter()
+                        .find(|e| e.as_str().map_or(false, |t| !t.is_empty()));
                     if new_ts > cur_ts {
                         *cur = a.clone();
                     }
                     cur["profiles"] = json!(profs);
+                    let unobserved = cur["updated_at"].as_f64().map_or(true, |t| t <= 0.0);
+                    let own_err = cur["source_error"].as_str().map_or(false, |t| !t.is_empty());
+                    if unobserved && !own_err {
+                        if let Some(e) = carried {
+                            cur["source_error"] = e;
+                        }
+                    }
                 }
             }
         }
@@ -4354,7 +4393,7 @@ async fn usage_accounts_all() -> Result<Value, String> {
         (x["provider"].as_str().unwrap_or(""), x["label"].as_str().unwrap_or(""))
             .cmp(&(y["provider"].as_str().unwrap_or(""), y["label"].as_str().unwrap_or("")))
     });
-    Ok(json!({"accounts": accounts}))
+    accounts
 }
 
 /// D5/SB-6: 산출물 회수 결정론 위치(~/.cys/_round/skill-out) — make_ticket output_format과 정합.
@@ -9380,6 +9419,93 @@ mod tests {
             assert!(hung.is_err(), "무응답 소켓은 timeout(Elapsed)이어야 한다");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 0.14.42 사용량 계정 병합·fan-out 재현 검체(수정 전 적색) ──────────────
+
+    /// 관측 경로 오류(source_error)는 **아직 관측되지 않은** 계정 행에서 어느 데몬이 냈든 살아남는다 —
+    /// 본부(오류 없음)와 부서(agy 거부)가 같은 antigravity 행을 내면 부서의 오류가 먼저 온 본부 행에 묻혔다.
+    #[test]
+    fn merge_account_rows_carries_source_error_for_unobserved_rows() {
+        let hq = json!({"accounts": [
+            {"provider": "antigravity", "account_id": "default", "label": "Antigravity (agy)",
+             "profiles": [".gemini/antigravity-cli"], "rate": [], "updated_at": null, "source": "", "source_error": null}
+        ]});
+        let dept = json!({"accounts": [
+            {"provider": "antigravity", "account_id": "default", "label": "Antigravity (agy)",
+             "profiles": [".gemini/antigravity-cli"], "rate": [], "updated_at": null, "source": "", "source_error": "agy_http_403"}
+        ]});
+        let m = merge_account_rows(&[hq.clone(), dept.clone()]);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0]["source_error"], "agy_http_403", "부서가 낸 경로 오류가 병합에서 사라졌다: {}", m[0]);
+        // 순서를 바꿔도 같다
+        assert_eq!(merge_account_rows(&[dept.clone(), hq.clone()])[0]["source_error"], "agy_http_403");
+        // 한 데몬이라도 신선 관측을 냈으면 그 행이 이기고, 남의 오류를 덧씌우지 않는다
+        let seen = json!({"accounts": [
+            {"provider": "antigravity", "account_id": "default", "label": "Antigravity (agy)",
+             "profiles": [".gemini/antigravity-cli"], "rate": [{"label": "5h", "used_pct": 10.0, "resets_at": null}],
+             "updated_at": 1000.0, "source": "agy-rpc", "source_error": null}
+        ]});
+        let m = merge_account_rows(&[dept.clone(), seen.clone()]);
+        assert_eq!(m[0]["source"], "agy-rpc");
+        assert!(m[0]["source_error"].is_null(), "관측된 행에 남의 오류가 붙었다: {}", m[0]);
+        // 서로 다른 계정은 접히지 않는다(키 = provider + account_id)
+        let two = json!({"accounts": [
+            {"provider": "claude", "account_id": "u-1", "label": "a", "profiles": [".claude-1"], "updated_at": null},
+            {"provider": "claude", "account_id": "u-2", "label": "b", "profiles": [".claude-2"], "updated_at": null}
+        ]});
+        assert_eq!(merge_account_rows(&[two]).len(), 2);
+    }
+
+    /// 부서 fan-out 은 소켓마다 상한을 두되 **동시에** 묻는다 — 순차면 무응답 부서 N개가 N×상한만큼 전체를 늦춘다.
+    #[cfg(unix)]
+    #[test]
+    fn usage_fanout_asks_every_socket_concurrently() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cys-acct-fanout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok_sock = dir.join("ok.sock");
+        let hung: Vec<std::path::PathBuf> = (0..3).map(|i| dir.join(format!("hang{i}.sock"))).collect();
+        let elapsed = tauri::async_runtime::block_on(async {
+            let ok = UnixListener::bind(&ok_sock).unwrap();
+            tauri::async_runtime::spawn(async move {
+                if let Ok((mut s, _)) = ok.accept().await {
+                    let (r, mut w) = s.split();
+                    let mut br = BufReader::new(r);
+                    let mut l = String::new();
+                    let _ = br.read_line(&mut l).await;
+                    let _ = w
+                        .write_all(b"{\"ok\":true,\"result\":{\"accounts\":[{\"provider\":\"codex\",\"account_id\":\"default\"}]}}\n")
+                        .await;
+                    let _ = w.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            });
+            for h in &hung {
+                let l = UnixListener::bind(h).unwrap();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok((_s, _)) = l.accept().await {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // bind 안정화
+            let mut targets = hung.clone();
+            targets.push(ok_sock.clone());
+            let t0 = std::time::Instant::now();
+            let resps = fanout_usage_accounts(targets, std::time::Duration::from_millis(400)).await;
+            let el = t0.elapsed();
+            assert_eq!(resps.len(), 1, "응답한 소켓의 결과만 남는다");
+            assert_eq!(resps[0]["accounts"][0]["provider"], "codex");
+            el
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "무응답 3개가 순차로 상한을 누적했다: {elapsed:?} (병렬이면 ≈400ms, 순차면 ≥1200ms)"
+        );
     }
 
     // ── CLI PATH 설치 헬퍼 ──────────────────────────────────────────

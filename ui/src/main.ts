@@ -586,6 +586,9 @@ function renderAccounts() {
         .join("");
       const badges: string[] = [];
       if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 없음</span>`);
+      // 0.14.42: 관측 경로 고장(예: agy_http_401)은 '관측 없음'과 구별해 코드째 보인다(사이드바와 같은 source_error).
+      if (typeof a.source_error === "string" && a.source_error)
+        badges.push(`<span class="cc-acct-badge warn">관측 실패 ${ccEsc(a.source_error)}</span>`);
       if (a.adapter === false) badges.push(`<span class="cc-acct-badge">관측 어댑터 없음</span>`);
       const stale = Number(a.stale_secs);
       if (Number.isFinite(stale) && stale > 120) badges.push(`<span class="cc-acct-badge">${Math.round(stale / 60)}분 전 관측</span>`);
@@ -4144,8 +4147,8 @@ async function refreshSidebarStatus() {
 // ★표시 전용: 에이전트 입력 경로(send·queue·send-key)·statusline 파서·nodeSig 폴백을 만들지 않는다(설계 금지).
 const ACCT_FLIGHT_KEY = "acct:all"; // claimFlight 키 — 기존 `list:`·`org:` 키와 겹치지 않는다
 // 넘기면: 이번 회차 사용량 조회를 JS 쪽에서 포기 — 직전 값 유지·실패 1회 계상(3회 연속이면 '데몬 응답 없음').
-//   Rust usage_accounts_all 은 소켓마다 2초 상한으로 **순차** 순회하므로 부서가 여럿이면 합이 T_LIST(8초)를
-//   넘을 수 있다(그러면 부분 성공 결과를 버린다) — 그래서 따로 넉넉히 잡는다. in-flight 는 원 호출이 실제로
+//   Rust usage_accounts_all 은 0.14.42 부터 소켓마다 2초 상한으로 **동시에** 묻는다(종전 순차 — 부서가 여럿이면
+//   합이 커져 부분 성공 결과까지 버렸다). 상한은 여유로 그대로 둔다. in-flight 는 원 호출이 실제로
 //   끝날 때 풀리므로(releaseFlightWhenSettled) 여기서 포기해도 같은 데몬에 요청이 쌓이지 않는다.
 const T_ACCT = winScaled(20_000); // 넘기면: 위 주석 — 값 유지·실패 계상(재시도는 다음 틱)
 // 복원 완료를 처음 본 뒤 이 시간 동안은 사이드바 경로로 조회하지 않는다 — Windows 기동 직후의 named pipe
@@ -4302,7 +4305,8 @@ function renderUsageBar(): void {
     if (model.others.length || model.moreCount) {
       const box = el("usage-others", "");
       for (const o of model.others) {
-        const row = el("usage-other" + (o.dim ? " dim" : ""), "", o.tooltip);
+        // 관측 전 계정도 한 줄씩(0.14.42 — 개수로 접지 않는다). 값 대신 "관측 전·관측 실패 · 사유".
+        const row = el("usage-other" + (o.dim ? " dim" : "") + (o.unobserved ? " unobs" : ""), "", o.tooltip);
         const lab = document.createElement("span");
         lab.className = "usage-other-lab";
         lab.textContent = o.label;
@@ -4315,7 +4319,6 @@ function renderUsageBar(): void {
       if (model.moreCount) box.appendChild(el("usage-more", `외 ${model.moreCount}개 — Control Center > Live`));
       kids.push(box);
     }
-    if (model.unobservedCount) kids.push(el("usage-unobs", `관측 없음 ${model.unobservedCount}개`, model.unobservedTooltip));
     if (model.footer) kids.push(el("usage-foot", model.footer));
     body.replaceChildren(...kids);
     usageBodySig = sig; // 다 그린 뒤에만 기록 — 중간에 던지면 다음 호출이 다시 그린다
