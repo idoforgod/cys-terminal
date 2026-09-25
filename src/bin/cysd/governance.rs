@@ -5058,6 +5058,362 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
     obs_modal_foreground(&obs)
 }
 
+// ═══════════ ★(0.14.42 · 설계 H0) 게이트 없는 데몬 내부 주입자의 공용 하드축 판정 ═══════════
+//
+// 【무엇이 문제였나】 데몬 안에서 스스로 PTY 에 글을 쓰는 생산자 일곱 곳은 큐 게이트를 거치지 않는다
+// (`guard: None` · 소스 핀 `h7_guard_none_producers_allowlist`). 그래서 승인 창·초안·사이클 창에 본문과
+// CR 이 그대로 떨어졌다(S41 사고 80/90). 큐로 옮기면 안전하다는 전제는 틀렸다 — 마커 좌석의 큐는 관측
+// 불능이면 TTL 까지 선다(§8 "정적은 스케줄이 아니라 증거"). 그래서 생산자는 **제자리**에 두고, 주입 직전
+// 이 판정 하나를 거친다.
+//
+// 【판정의 원칙 — 양성 관측만】 보류 근거는 **지금 양성으로 관측된** 하드 축뿐이다. 관측 불능(마커 미정의·
+// 커서행 미관측·SEAT Unknown·`pending_input_bytes` 단독)은 보류 근거가 아니다 → 호출부는 종전 직접 주입으로
+// 떨어진다. UI 가 깨져 판정이 불능이 되어도 스케줄 하트비트·wakeup 의 생명선은 끊기지 않는다(③).
+//   · `pending_input_bytes` 를 넣지 않는 이유: 이 계수는 stale 이 될 수 있고(Backspace·순수 Esc 가산 ·
+//     D-02 보류), 그 리셋은 화면이 관측될 때만 돈다(`maybe_reset_stale_pending_input`). 계수 단독을 근거로
+//     쓰면 UI 파손 때 영구 보류다.
+//   · 시간 기반 면제(ceiling)는 두지 않는다(§8-3: 새 신호로 게이트를 면제하지 않는다).
+//
+// 【처분은 생산자마다 다르다】 이 판정은 사실만 돌려준다. 보류(채널)·큐 우회(스케줄)·escalation(CEO)·생략
+// (감독자·승계)은 호출부가 정한다.
+//
+// 【실패 방향】 관측 패닉은 `ProbeFailed` 로 접힌다(데몬 생존 · 이벤트 `machine_inject.probe_failed` 1건).
+// 생산자는 그것을 자기 실패 방향(보류 또는 종전)으로 처리한다.
+
+/// 기계 주입 하드축 판정 결과(첫 적중). 순서는 [`machine_hold_verdict`] doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineHold {
+    /// kill-switch(`daemon.paused`).
+    Paused,
+    /// 좌석이 사이클(`/clear`~RESUME) 창이다 — `agent_status.state=="quiescing"` ∧ 나이 < 상한.
+    Quiescing,
+    /// **양성 부재 증거**만(에이전트 종료 관측 ∨ SEAT Empty). Unknown(Windows 미도달 포함)은 아니다.
+    ShellOnly,
+    /// 사람 입력 흔적이 생산자가 준 창 안이다.
+    HumanActive,
+    /// 질문·선택 창이 화면 전경이다(U8 P1 · 큐 게이트 ②와 같은 술어).
+    Modal,
+    /// 커서행 마커 뒤에 미제출 글자가 **화면에서** 보인다(D-12 Text 화면 축과 같은 식).
+    Draft,
+    /// 관측 중 패닉 — 판정 불능(생산자별 실패 방향으로 처리).
+    ProbeFailed,
+}
+
+impl MachineHold {
+    /// 이벤트·결과 문자열의 축 이름(노브 `CYS_MACHINE_INJECT_HOLD_AXES` 의 토큰과 같다).
+    pub(crate) fn axis(self) -> &'static str {
+        match self {
+            Self::Paused => "pause",
+            Self::Quiescing => "quiescing",
+            Self::ShellOnly => "shell",
+            Self::HumanActive => "human",
+            Self::Modal => "modal",
+            Self::Draft => "draft",
+            Self::ProbeFailed => "probe_failed",
+        }
+    }
+}
+
+/// 판정이 볼 축(생산자가 고른다) — 전역 노브 마스크와 AND 된다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct MachineHoldAxes {
+    pub(crate) pause: bool,
+    pub(crate) quiescing: bool,
+    pub(crate) shell: bool,
+    pub(crate) human: bool,
+    pub(crate) modal: bool,
+    pub(crate) draft: bool,
+    /// 사람 입력 창(초) — `human` 축이 켜졌을 때만 쓴다. 0 = human 축 무발화.
+    pub(crate) human_window_secs: u64,
+}
+
+impl MachineHoldAxes {
+    /// 축 전부 끔.
+    pub(crate) const NONE: Self = Self {
+        pause: false,
+        quiescing: false,
+        shell: false,
+        human: false,
+        modal: false,
+        draft: false,
+        human_window_secs: 0,
+    };
+
+    /// 마스크(전역 노브)와 AND — 창 값은 생산자 것을 유지한다.
+    pub(crate) fn masked(self, mask: Self) -> Self {
+        Self {
+            pause: self.pause && mask.pause,
+            quiescing: self.quiescing && mask.quiescing,
+            shell: self.shell && mask.shell,
+            human: self.human && mask.human,
+            modal: self.modal && mask.modal,
+            draft: self.draft && mask.draft,
+            human_window_secs: self.human_window_secs,
+        }
+    }
+}
+
+/// 순수 판정의 입력 — 호출부(IO 래퍼)가 관측해 넘긴 값만.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct MachineHoldInput {
+    pub(crate) paused: bool,
+    /// `agent_status.state=="quiescing"` 이면 그 상태의 나이(초, `now − updated_at`). 아니면 `None`.
+    pub(crate) quiescing_age_secs: Option<f64>,
+    /// quiescing 보류 상한(초) — [`queue_quiesce_hold_secs`]. 0 = 축 끔.
+    pub(crate) quiesce_hold_secs: u64,
+    /// 양성 부재 증거(에이전트 종료 관측 ∨ SEAT Empty).
+    pub(crate) shell_evidence: bool,
+    /// 마지막 사람 입력 뒤 경과(초). 흔적 없음 = `None`.
+    pub(crate) human_idle_secs: Option<u64>,
+    pub(crate) modal: bool,
+    pub(crate) draft: bool,
+}
+
+/// ★H0 **순수 판정** — 첫 적중을 돌려준다. 순서(고정):
+/// `Paused → Quiescing → ShellOnly → HumanActive → Modal → Draft`.
+/// 앞의 싼 축(메모리 원자값)이 먼저이고 화면 관측이 필요한 두 축이 끝이다 — IO 래퍼는 싼 축이 적중하면
+/// 화면을 보지 않는다(같은 판정을 두 번 부르는 것은 이 순서 덕분에 결과가 같다).
+pub(crate) fn machine_hold_verdict(i: &MachineHoldInput, ax: &MachineHoldAxes) -> Option<MachineHold> {
+    if ax.pause && i.paused {
+        return Some(MachineHold::Paused);
+    }
+    if ax.quiescing && quiesce_hold_active(i.quiescing_age_secs, i.quiesce_hold_secs) {
+        return Some(MachineHold::Quiescing);
+    }
+    if ax.shell && i.shell_evidence {
+        return Some(MachineHold::ShellOnly);
+    }
+    if ax.human
+        && ax.human_window_secs > 0
+        && i.human_idle_secs.is_some_and(|idle| idle < ax.human_window_secs)
+    {
+        return Some(MachineHold::HumanActive);
+    }
+    if ax.modal && i.modal {
+        return Some(MachineHold::Modal);
+    }
+    if ax.draft && i.draft {
+        return Some(MachineHold::Draft);
+    }
+    None
+}
+
+/// quiescing 이 **아직 보류 근거인가**(순수) — 상한 안이면 참. 상한을 넘긴 quiescing 은 근거가 아니다
+/// (사이클은 `inject_text` 가 돌아오면 곧바로 해제한다 · 오래 남은 quiescing 은 고아다). 시계가 뒤로 뛴
+/// 음수 나이는 절댓값으로 본다 — 상한을 넘는 역행이면 풀린다(실패 방향 = 종전 동작).
+pub(crate) fn quiesce_hold_active(age_secs: Option<f64>, hold_secs: u64) -> bool {
+    hold_secs > 0 && age_secs.is_some_and(|a| a.is_finite() && a.abs() < hold_secs as f64)
+}
+
+/// quiescing 보류 상한 기본(초).
+pub(crate) const QUEUE_QUIESCE_HOLD_DEFAULT_SECS: u64 = 600;
+
+/// ★H1·H0 quiescing 보류 상한(`CYS_QUEUE_QUIESCE_HOLD_SECS` · 기본 600 · 0 = 축 끔). 큐 틱 게이트(H1)와
+/// 스케줄·CEO·감독자의 quiescing 축이 같은 값을 쓴다. 채널의 `deliverable_master` quiescing 판정(종전
+/// 무기한)은 이 노브와 무관하다.
+pub(crate) fn queue_quiesce_hold_secs() -> u64 {
+    h_knob("CYS_QUEUE_QUIESCE_HOLD_SECS")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(QUEUE_QUIESCE_HOLD_DEFAULT_SECS)
+}
+
+/// 설계 H 가 판정을 거는 생산자 다섯(노브 `CYS_MACHINE_INJECT_HOLD` 의 토큰).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineInjector {
+    Schedule,
+    Channel,
+    Ceo,
+    Supervisor,
+    Takeover,
+}
+
+impl MachineInjector {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::Channel => "channel",
+            Self::Ceo => "ceo",
+            Self::Supervisor => "supervisor",
+            Self::Takeover => "takeover",
+        }
+    }
+}
+
+/// `CYS_MACHINE_INJECT_HOLD` 해석(순수): 미설정·빈 값·`1`·`all`·`on` = 전부 · `0`·`off` = 전부 끔(HEAD 동작) ·
+/// 쉼표 목록 = 그 생산자만. 목록의 미지 토큰은 무시한다(그 생산자는 꺼진다 = 종전 동작 방향).
+pub(crate) fn machine_hold_enabled_from(raw: Option<&str>, p: MachineInjector) -> bool {
+    let v = raw.map(str::trim).unwrap_or("");
+    if v.is_empty() || v == "1" || v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("on") {
+        return true;
+    }
+    if v == "0" || v.eq_ignore_ascii_case("off") {
+        return false;
+    }
+    v.split(',').any(|t| t.trim().eq_ignore_ascii_case(p.name()))
+}
+
+/// 이 생산자에 H 판정이 켜져 있는가(데몬 env · 호출마다 읽는다 — 재기동하면 적용되는 노브와 같은 값).
+pub(crate) fn machine_hold_enabled(p: MachineInjector) -> bool {
+    machine_hold_enabled_from(h_knob("CYS_MACHINE_INJECT_HOLD").as_deref(), p)
+}
+
+/// 축 마스크 기본값 — unix 는 전 축, Windows 는 `draft` 를 뺀다(ConPTY 커서·플레이스홀더에서 화면 입력줄
+/// 판정이 가장 약하다 · 실측 전까지 끈다). bool 인자라 양 OS 검체가 어느 호스트에서든 돈다.
+pub(crate) fn hold_axes_default(windows: bool) -> MachineHoldAxes {
+    MachineHoldAxes {
+        pause: true,
+        quiescing: true,
+        shell: true,
+        human: true,
+        modal: true,
+        draft: !windows,
+        human_window_secs: 0,
+    }
+}
+
+/// `CYS_MACHINE_INJECT_HOLD_AXES` 해석(순수): 미설정·빈 값 = [`hold_axes_default`] · `0`·`off`·`none` = 전부 끔 ·
+/// `all` = 전 축(Windows 의 draft 포함 — 명시 opt-in) · 쉼표 목록 = 그 축만. 미지 토큰은 무시한다.
+pub(crate) fn hold_axes_mask_from(raw: Option<&str>, windows: bool) -> MachineHoldAxes {
+    let v = raw.map(str::trim).unwrap_or("");
+    if v.is_empty() {
+        return hold_axes_default(windows);
+    }
+    if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+        return MachineHoldAxes::NONE;
+    }
+    if v.eq_ignore_ascii_case("all") {
+        return hold_axes_default(false);
+    }
+    let mut m = MachineHoldAxes::NONE;
+    for t in v.split(',').map(|t| t.trim().to_ascii_lowercase()) {
+        match t.as_str() {
+            "pause" => m.pause = true,
+            "quiescing" => m.quiescing = true,
+            "shell" => m.shell = true,
+            "human" => m.human = true,
+            "modal" => m.modal = true,
+            "draft" => m.draft = true,
+            _ => {}
+        }
+    }
+    m
+}
+
+/// H 노브 읽기 — 검체는 스레드 로컬 덮개로 값을 주입한다(env 는 프로세스 전역이라 병렬 검체끼리 샌다).
+/// 프로덕션 빌드의 덮개는 항상 `None` 이다(아래 `not(test)` 판 · 검체판은 이 파일 테스트 영역에 있다 —
+/// 여기에 테스트 속성을 두면 이 파일의 '프로덕션 영역' 소스 핀 앵커가 앞당겨진다).
+fn h_knob(key: &str) -> Option<String> {
+    if let Some(v) = h_knob_test_override(key) {
+        return Some(v);
+    }
+    std::env::var(key).ok()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn h_knob_test_override(_key: &str) -> Option<String> {
+    None
+}
+
+/// 화면에서 **양성 관측된** 초안인가(순수) — 커서행 마커 뒤·커서 앞에 글자가 있고 선택기 행이 아니다.
+/// D-12 Text 화면 축(`draft_gate_verdict` 의 `ScreenOccupied`)과 같은 식이며 계수(`pending_input_bytes`)는
+/// 보지 않는다(H0 원칙). 커서행 미관측(`line == None`)은 초안이 아니다(관측 불능 ≠ 양성).
+fn obs_draft_observed(obs: &PromptObs) -> bool {
+    !obs.selector_row
+        && obs.line.as_ref().is_some_and(|(before, after)| {
+            input_line_state(
+                0,
+                Some(PromptLine { before_cursor: before, at_or_after_cursor: after }),
+            ) == InputLine::Occupied
+        })
+}
+
+/// ★H0 **IO 래퍼** — 좌석을 한 번 관측해 [`machine_hold_verdict`] 를 돌린다. 축은 생산자가 고르고 전역 노브
+/// (`CYS_MACHINE_INJECT_HOLD_AXES`)와 AND 된다.
+///
+/// 락: surfaces 맵 락을 쥐지 않는다(호출부가 넘긴 `Arc<Surface>` 로 관측). 잡는 것은 리프 락뿐이다 —
+/// `agent_status`·`last_human_input`·`agent_meta`·파서(`observe_prompt`). 화면 관측은 싼 축이 적중하지 않고
+/// modal·draft 축이 켜진 마커 좌석에서만 1회다(마커 없는 좌석은 두 축 모두 거짓 = 관측 불능 ≠ 양성).
+pub(crate) fn machine_direct_hold(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    want: MachineHoldAxes,
+) -> Option<MachineHold> {
+    let mask = hold_axes_mask_from(h_knob("CYS_MACHINE_INJECT_HOLD_AXES").as_deref(), cfg!(windows));
+    machine_direct_hold_masked(daemon, s, want, mask)
+}
+
+/// [`machine_direct_hold`] 의 마스크 주입판 — 검체가 Windows 기본 마스크를 어느 호스트에서든 잰다.
+pub(crate) fn machine_direct_hold_masked(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    want: MachineHoldAxes,
+    mask: MachineHoldAxes,
+) -> Option<MachineHold> {
+    let axes = want.masked(mask);
+    let probe =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| machine_hold_probe(daemon, s, &axes)));
+    match probe {
+        Ok(v) => v,
+        Err(_) => {
+            // 보고도 격리한다(watchdog 틱 패닉 보고와 같은 규율) — 보고의 패닉이 생산자를 죽이면 안 된다.
+            let d = Arc::clone(daemon);
+            let sid = s.id;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                d.bus.publish(
+                    "machine_inject.probe_failed",
+                    "system",
+                    Some(sid),
+                    json!({"surface_id": sid,
+                           "note": "기계 주입 직전 좌석 관측이 패닉했다 — 판정 불능(ProbeFailed). \
+                                    생산자별 실패 방향(보류·종전 동작)으로 처리한다"}),
+                );
+            }));
+            Some(MachineHold::ProbeFailed)
+        }
+    }
+}
+
+fn machine_hold_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    axes: &MachineHoldAxes,
+) -> Option<MachineHold> {
+    let quiescing_age_secs = s
+        .agent_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|st| st.state == "quiescing")
+        .map(|st| now_epoch() - st.updated_at);
+    let mut input = MachineHoldInput {
+        paused: daemon.paused.load(Ordering::Relaxed),
+        quiescing_age_secs,
+        quiesce_hold_secs: queue_quiesce_hold_secs(),
+        shell_evidence: s.agent_exit_notified.load(Ordering::Relaxed)
+            || SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty,
+        human_idle_secs: s
+            .last_human_input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|t| t.elapsed().as_secs()),
+        modal: false,
+        draft: false,
+    };
+    if let Some(h) = machine_hold_verdict(&input, axes) {
+        return Some(h);
+    }
+    if axes.modal || axes.draft {
+        let adapters = load_adapter_defs();
+        if let Some((markers, _)) = surface_prompt_marker(s, &adapters) {
+            let obs = observe_prompt(s, &markers);
+            input.modal = obs_modal_foreground(&obs);
+            input.draft = obs_draft_observed(&obs);
+        }
+    }
+    machine_hold_verdict(&input, axes)
+}
+
 /// ★(0.14.42 · A2-F1 · 리뷰 RF1-GATE-NARROW) 짝 Return 흡수 **좁힘 전용** 술어 — 좌석에 승인·선택이 살아
 /// 있고, 그 창이 **첫기동 관문이 아닌가**.
 ///
@@ -20697,5 +21053,539 @@ mod merge_residue_tests {
             this[j..j + 400].contains("ready_marker"),
             "데몬 폴백이 사라졌다 — 그 삭제는 배달을 **여는** 방향이다(R6 기각 근거 · 실측)"
         );
+    }
+}
+
+// ═══════════ ★(0.14.42 · 설계 H) 검체 전용 H 노브 덮개 + H0·H7 검체 ═══════════
+// 덮개는 스레드 로컬이다 — env 는 프로세스 전역이라 병렬 검체끼리 새고(한 검체가 `CYS_MACHINE_INJECT_HOLD=0`
+// 을 켠 순간 다른 생산자 검체가 HEAD 동작을 본다), 생산자 호출은 전부 검체 스레드에서 동기로 돈다.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static H_KNOB_TEST: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn h_knob_test_override(key: &str) -> Option<String> {
+    H_KNOB_TEST.with(|m| m.borrow().get(key).cloned())
+}
+
+/// 검체 전용 — 이 스레드의 H 노브를 덮고 Drop 에서 원복한다(패닉 포함).
+#[cfg(test)]
+pub(crate) struct HKnobGuard {
+    prev: Vec<(String, Option<String>)>,
+}
+
+#[cfg(test)]
+impl HKnobGuard {
+    pub(crate) fn set(vars: &[(&str, &str)]) -> Self {
+        let prev = vars
+            .iter()
+            .map(|(k, v)| {
+                let old = H_KNOB_TEST.with(|m| m.borrow_mut().insert(k.to_string(), v.to_string()));
+                (k.to_string(), old)
+            })
+            .collect();
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HKnobGuard {
+    fn drop(&mut self) {
+        for (k, old) in self.prev.drain(..).rev() {
+            H_KNOB_TEST.with(|m| {
+                let mut m = m.borrow_mut();
+                match old {
+                    Some(v) => m.insert(k, v),
+                    None => m.remove(&k),
+                };
+            });
+        }
+    }
+}
+
+/// 검체 공용(H 생산자 검체들이 함께 쓴다) — 좌석 화면을 **이 문면**으로 다시 그린다. 커서는 문면 끝에 남는다
+/// (마지막 줄에 개행을 두지 않으면 커서가 그 행의 글자 뒤다 = 프롬프트 행의 커서).
+#[cfg(test)]
+pub(crate) fn h_paint(s: &Arc<crate::state::Surface>, screen: &str) {
+    let body = screen.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+    p.process(b"\x1b[2J\x1b[H");
+    p.process(body.as_bytes());
+}
+
+/// 검체 공용 — 유휴 claude composer(괘선 + `❯ ` · 커서는 마커 뒤).
+#[cfg(test)]
+pub(crate) const H_IDLE_SCREEN: &str = "● 작업 로그 한 줄\n────────────────────\n❯ ";
+/// 검체 공용 — 사람이 쓰다 둔 초안(커서는 초안 글자 뒤).
+#[cfg(test)]
+pub(crate) const H_DRAFT_SCREEN: &str = "● 작업 로그 한 줄\n────────────────────\n❯ 오너가 쓰다 둔 초안";
+
+/// 검체 공용 — 원장(배달 선기록) 레코드 중 이 origin 의 수.
+#[cfg(test)]
+pub(crate) fn h_ledger_count(daemon: &Arc<Daemon>, origin: &str) -> usize {
+    std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|r| r["origin"] == json!(origin))
+        .count()
+}
+
+#[cfg(test)]
+mod h_machine_hold_tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AO;
+
+    fn h_daemon(tag: &str) -> Arc<Daemon> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, AO::Relaxed);
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-h0-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_epoch() as u64,
+            n
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        Daemon::new(dir.join("cysd.sock"))
+    }
+
+    fn claude_seat(daemon: &Arc<Daemon>) -> Arc<crate::state::Surface> {
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(std::time::Duration::from_millis(300)); // 셸 초기 출력 안정화
+        s
+    }
+
+    fn all_axes(human_window_secs: u64) -> MachineHoldAxes {
+        MachineHoldAxes { human_window_secs, ..hold_axes_default(false) }
+    }
+
+    /// [H0 순수] 전 조합 진리표 — 첫 적중 순서 고정 · 마스크에서 끈 축은 무발화.
+    #[test]
+    fn h0_hold_verdict_truth_table() {
+        let order = [
+            MachineHold::Paused,
+            MachineHold::Quiescing,
+            MachineHold::ShellOnly,
+            MachineHold::HumanActive,
+            MachineHold::Modal,
+            MachineHold::Draft,
+        ];
+        for bits in 0u32..64 {
+            let on = |i: u32| bits & (1 << i) != 0;
+            let input = MachineHoldInput {
+                paused: on(0),
+                quiescing_age_secs: on(1).then_some(10.0),
+                quiesce_hold_secs: 600,
+                shell_evidence: on(2),
+                human_idle_secs: on(3).then_some(5),
+                modal: on(4),
+                draft: on(5),
+            };
+            let expect = (0..6).find(|&i| on(i)).map(|i| order[i as usize]);
+            assert_eq!(machine_hold_verdict(&input, &all_axes(30)), expect, "bits={bits:06b}");
+            // 한 축씩 끈 마스크 — 그 축은 절대 적중하지 않고, 나머지 순서는 그대로다.
+            for off in 0..6u32 {
+                let mut ax = all_axes(30);
+                match off {
+                    0 => ax.pause = false,
+                    1 => ax.quiescing = false,
+                    2 => ax.shell = false,
+                    3 => ax.human = false,
+                    4 => ax.modal = false,
+                    _ => ax.draft = false,
+                }
+                let expect = (0..6).filter(|&i| i != off).find(|&i| on(i)).map(|i| order[i as usize]);
+                assert_eq!(machine_hold_verdict(&input, &ax), expect, "bits={bits:06b} off={off}");
+            }
+        }
+        // 사람 입력 창 — 창 밖(30s 이상)이면 무발화 · 창 0 이면 축 무발화.
+        let mut i = MachineHoldInput { human_idle_secs: Some(30), ..Default::default() };
+        assert_eq!(machine_hold_verdict(&i, &all_axes(30)), None, "창 경계(30s)는 창 밖이다");
+        i.human_idle_secs = Some(29);
+        assert_eq!(machine_hold_verdict(&i, &all_axes(30)), Some(MachineHold::HumanActive));
+        assert_eq!(machine_hold_verdict(&i, &all_axes(0)), None, "창 0 = human 축 무발화");
+        // 전 축 끔 = 어떤 입력에서도 None(노브 0 의 순수 정의).
+        let loud = MachineHoldInput {
+            paused: true,
+            quiescing_age_secs: Some(1.0),
+            quiesce_hold_secs: 600,
+            shell_evidence: true,
+            human_idle_secs: Some(0),
+            modal: true,
+            draft: true,
+        };
+        assert_eq!(machine_hold_verdict(&loud, &MachineHoldAxes::NONE), None);
+        // 축 이름(이벤트·결과 문자열의 어휘) 고정.
+        let names: Vec<&str> = order.iter().map(|h| h.axis()).collect();
+        assert_eq!(names, ["pause", "quiescing", "shell", "human", "modal", "draft"]);
+        assert_eq!(MachineHold::ProbeFailed.axis(), "probe_failed");
+    }
+
+    /// [H0 음성 · 검토 5] `pending_input_bytes` 단독은 보류 근거가 아니다 — 화면 파손(커서행 미관측)에서도,
+    /// 빈 composer 에서도 None. draft 는 **화면 양성 관측**만 본다.
+    #[test]
+    fn h0_stale_pending_alone_never_holds() {
+        let d = h_daemon("h0-stale");
+        let s = claude_seat(&d);
+        s.pending_input_bytes.store(5, AO::Relaxed);
+        // ① 파손 화면: 커서행에 마커가 없다(line = None) — 관측 불능 ≠ 양성.
+        h_paint(&s, "\x1b[?25l깨진 렌더 ▒▒▒ 조각\n아무 프롬프트도 없는 행");
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), None, "계수 5 + 파손 화면 → 보류 근거 없음");
+        // ② 빈 composer(line = Some("")) — 계수 5 여도 초안이 아니다.
+        h_paint(&s, H_IDLE_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), None, "계수 5 + 빈 ❯ → 보류 근거 없음");
+        // 대조: 화면에 초안이 **보이면** Draft(같은 계수).
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft));
+        // 결측형 대조: 마커 없는 좌석(agent_meta 없음)은 초안 화면이어도 판정 불능 → None.
+        *s.agent_meta.lock().unwrap() = None;
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), None, "마커 미정의 좌석은 modal·draft 무발화");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H0 음성] SEAT Unknown(Windows 미도달 포함) ∧ meta 없음은 셸 단독이 아니다 — 양성 부재 증거만.
+    #[test]
+    fn h0_unknown_seat_is_not_shell_only() {
+        let d = h_daemon("h0-seat");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        let shell_only = MachineHoldAxes { shell: true, ..MachineHoldAxes::NONE };
+        s.seat_cache.store(SeatState::Unknown.as_u8(), AO::Relaxed);
+        assert_eq!(machine_direct_hold(&d, &s, shell_only), None, "Unknown ∧ meta None ≠ 셸 단독");
+        s.seat_cache.store(SeatState::Occupied.as_u8(), AO::Relaxed);
+        assert_eq!(machine_direct_hold(&d, &s, shell_only), None);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AO::Relaxed);
+        assert_eq!(machine_direct_hold(&d, &s, shell_only), Some(MachineHold::ShellOnly), "SEAT Empty = 양성");
+        s.seat_cache.store(SeatState::Unknown.as_u8(), AO::Relaxed);
+        s.agent_exit_notified.store(true, AO::Relaxed);
+        assert_eq!(machine_direct_hold(&d, &s, shell_only), Some(MachineHold::ShellOnly), "종료 관측 = 양성");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H0] quiescing 상한 — 599s 보류 · 700s 무시 · 노브 0 무시 · 시계 역행은 절댓값.
+    #[test]
+    fn h0_quiescing_stale_bound() {
+        assert!(quiesce_hold_active(Some(599.0), 600));
+        assert!(!quiesce_hold_active(Some(700.0), 600));
+        assert!(!quiesce_hold_active(Some(10.0), 0), "노브 0 = 축 끔");
+        assert!(!quiesce_hold_active(None, 600), "결측(quiescing 아님)은 보류가 아니다");
+        assert!(quiesce_hold_active(Some(-10.0), 600), "작은 역행은 상한 안");
+        assert!(!quiesce_hold_active(Some(-700.0), 600), "상한을 넘는 역행은 풀린다(종전 동작)");
+        assert!(!quiesce_hold_active(Some(f64::NAN), 600), "NaN 은 보류 근거가 아니다");
+        let d = h_daemon("h0-quiesce");
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        let q_only = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
+        let set_q = |age: f64| {
+            *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+                state: "quiescing".into(),
+                context_pct: None,
+                task: None,
+                updated_at: now_epoch() - age,
+            });
+        };
+        set_q(599.0);
+        assert_eq!(machine_direct_hold(&d, &s, q_only), Some(MachineHold::Quiescing));
+        set_q(700.0);
+        assert_eq!(machine_direct_hold(&d, &s, q_only), None, "600s 를 넘긴 quiescing 은 무시");
+        set_q(10.0);
+        {
+            let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "0")]);
+            assert_eq!(machine_direct_hold(&d, &s, q_only), None, "노브 0 → 축 끔");
+        }
+        assert_eq!(machine_direct_hold(&d, &s, q_only), Some(MachineHold::Quiescing), "덮개 원복");
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "working".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch(),
+        });
+        assert_eq!(machine_direct_hold(&d, &s, q_only), None, "quiescing 아님");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H0] 축 기본값(OS별) · 노브 해석(축 목록 · 0/off · 생산자 목록).
+    #[test]
+    fn h0_axes_default_by_platform() {
+        assert!(hold_axes_default(false).draft, "unix 기본에는 draft 가 있다");
+        assert!(!hold_axes_default(true).draft, "Windows 기본에는 draft 가 없다(ConPTY 입력줄 판정 약함)");
+        for w in [false, true] {
+            let d = hold_axes_default(w);
+            assert!(d.pause && d.quiescing && d.shell && d.human && d.modal, "나머지 축은 양 OS 공통");
+            assert_eq!(hold_axes_mask_from(None, w), d);
+            assert_eq!(hold_axes_mask_from(Some("  "), w), d);
+            for off in ["0", "off", "OFF", "none"] {
+                assert_eq!(hold_axes_mask_from(Some(off), w), MachineHoldAxes::NONE, "{off}");
+            }
+            assert!(hold_axes_mask_from(Some("all"), w).draft, "all = 명시 opt-in(Windows draft 포함)");
+        }
+        let m = hold_axes_mask_from(Some("pause, quiescing,modal,bogus"), false);
+        assert_eq!(
+            (m.pause, m.quiescing, m.shell, m.human, m.modal, m.draft),
+            (true, true, false, false, true, false),
+            "목록 = 그 축만 · 미지 토큰 무시"
+        );
+        use MachineInjector::*;
+        const ALL: [MachineInjector; 5] = [Schedule, Channel, Ceo, Supervisor, Takeover];
+        for p in ALL {
+            for on in [None, Some(""), Some("1"), Some("all"), Some("ALL"), Some("on")] {
+                assert!(machine_hold_enabled_from(on, p), "{on:?} → {} 켜짐", p.name());
+            }
+            for off in [Some("0"), Some("off"), Some("Off")] {
+                assert!(!machine_hold_enabled_from(off, p), "{off:?} → {} 꺼짐", p.name());
+            }
+        }
+        let list = Some("schedule, ceo");
+        assert!(machine_hold_enabled_from(list, Schedule));
+        assert!(machine_hold_enabled_from(list, Ceo));
+        assert!(!machine_hold_enabled_from(list, Channel), "목록 밖 = HEAD 동작");
+        assert!(!machine_hold_enabled_from(list, Supervisor));
+        assert!(!machine_hold_enabled_from(list, Takeover));
+        assert!(!machine_hold_enabled_from(Some("bogus"), Channel), "미지 토큰만 = 전부 HEAD");
+        let names: Vec<&str> = ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(names, ["schedule", "channel", "ceo", "supervisor", "takeover"]);
+        // 노브 경유(덮개) — 실제 읽기 함수가 해석기와 같은 값을 낸다.
+        let _k = HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "channel")]);
+        assert!(machine_hold_enabled(Channel));
+        assert!(!machine_hold_enabled(Schedule));
+    }
+
+    /// [H0 H-WIN] ConPTY 전사 형상(CRLF · 콘솔 폭 우측 패딩 · 커서행 뒤 고스트)으로 파생한 문면 — 유휴 → None ·
+    /// 승인 모달 → Modal · 플레이스홀더 고스트 → None. Windows 기본 마스크에서는 초안도 무발화(draft 축 끔).
+    #[test]
+    fn h0_conpty_fixtures() {
+        let d = h_daemon("h0-conpty");
+        let s = claude_seat(&d);
+        let pad = |l: &str, w: usize| format!("{l}{}", " ".repeat(w.saturating_sub(l.chars().count())));
+        let unix = hold_axes_default(false);
+        let win = hold_axes_default(true);
+        let want = all_axes(30);
+        // ① 유휴 — CRLF 전사.
+        let idle_crlf = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT.trim_end_matches('\n').to_string();
+        // ② 유휴 — 우측 패딩(콘솔 셀 채움) 뒤 커서를 마커 뒤로(CUP) 되돌린 전사.
+        let idle_padded = format!("{}\n{}\x1b[2;3H", pad("────────────────────", 79), pad("❯ ", 79));
+        // ③ 승인 모달 — CRLF.
+        let modal_crlf = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.to_string();
+        // ④ 승인 모달 — 우측 패딩(79열).
+        let modal_padded: String = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT
+            .lines()
+            .map(|l| pad(l, 79))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // ⑤ 플레이스홀더 고스트 — 커서는 마커 바로 뒤, 고스트 제안은 커서 **뒤**에 그려진다.
+        let ghost = "────────────────────\n❯ Try \"refactor the parser\"\x1b[2;3H".to_string();
+        let specimens: Vec<(&str, String, Option<MachineHold>)> = vec![
+            ("CRLF 유휴", idle_crlf, None),
+            ("우측 패딩 유휴", idle_padded, None),
+            ("CRLF 승인 모달", modal_crlf, Some(MachineHold::Modal)),
+            ("우측 패딩 승인 모달", modal_padded, Some(MachineHold::Modal)),
+            ("플레이스홀더 고스트", ghost, None),
+        ];
+        assert_eq!(specimens.len(), 5, "H-WIN 문면 5종");
+        for (label, screen, expect) in &specimens {
+            h_paint(&s, screen);
+            for (os, mask) in [("unix", unix), ("windows", win)] {
+                assert_eq!(
+                    machine_direct_hold_masked(&d, &s, want, mask),
+                    *expect,
+                    "{label} ({os} 마스크):\n{screen:?}"
+                );
+            }
+        }
+        // 초안 — unix 마스크는 Draft, Windows 기본 마스크는 무발화(종전 직접 주입).
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, unix), Some(MachineHold::Draft));
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, win), None, "Windows 기본: draft 축 끔");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H0] 관측 패닉 → ProbeFailed + `machine_inject.probe_failed` 1건 · 데몬 생존(다른 좌석 판정 정상).
+    #[test]
+    fn h0_probe_panic_is_probe_failed() {
+        let d = h_daemon("h0-panic");
+        let s = claude_seat(&d);
+        h_paint(&s, H_IDLE_SCREEN);
+        // agent_meta 락을 독살한다 — 관측(`surface_prompt_marker`)이 그 락에서 패닉한다(실제 패닉 경로).
+        {
+            let s2 = s.clone();
+            let _ = std::thread::spawn(move || {
+                let _g = s2.agent_meta.lock().unwrap();
+                panic!("h0 검체: agent_meta 독살");
+            })
+            .join();
+        }
+        assert!(s.agent_meta.is_poisoned(), "전제: 락이 독살됐다");
+        let count = |d: &Arc<Daemon>| {
+            d.bus.tail(200).iter().filter(|ev| ev["name"] == "machine_inject.probe_failed").count()
+        };
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::ProbeFailed));
+        assert_eq!(count(&d), 1, "probe_failed 이벤트 정확히 1건");
+        // 싼 축이 먼저 적중하면 화면을 보지 않는다 → 패닉 경로를 밟지 않는다.
+        d.paused.store(true, AO::Relaxed);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Paused));
+        d.paused.store(false, AO::Relaxed);
+        assert_eq!(count(&d), 1);
+        // 데몬 생존 — 다른 좌석의 판정은 정상이다.
+        let t = claude_seat(&d);
+        h_paint(&t, H_IDLE_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &t, all_axes(30)), None);
+        s.agent_meta.clear_poison();
+        let _ = s.child.lock().unwrap().kill();
+        let _ = t.child.lock().unwrap().kill();
+    }
+
+    // ─── H7 소스 핀 ───────────────────────────────────────────────────────────
+
+    /// `//` 줄주석 제거(판정 대상에서 설명문을 뺀다 · 문자열 리터럴 안의 `//` 는 이 파일들의 guard 줄에 없다).
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 프로덕션 영역 — **테스트 모듈 블록**(`#[cfg(test)]` 다음이 `mod 이름 {`)을 전부 들어낸 나머지.
+    /// 파일 중간의 테스트 모듈(state.rs·alert_route.rs·main.rs 에 있다) 뒤에도 프로덕션 코드가 있으므로 앞에서
+    /// 자르지 않는다. 블록 끝은 rustfmt 규약의 **0열 `}`** 이다(모듈 안 항목은 들여쓰기돼 있다).
+    fn production(src: &str) -> String {
+        let mut out = String::new();
+        let mut rest = src;
+        loop {
+            let Some(i) = rest.find("#[cfg(test)]") else {
+                out.push_str(rest);
+                return out;
+            };
+            let after = &rest[i + "#[cfg(test)]".len()..];
+            // 뒤따르는 속성 줄(`#[allow(..)]`·`#[path = ..]`)은 건너뛰고 항목 머리를 본다.
+            let mut t = after.trim_start();
+            while t.starts_with("#[") {
+                t = t.split_once('\n').map(|(_, r)| r.trim_start()).unwrap_or("");
+            }
+            if t.starts_with("mod ") && t.lines().next().is_some_and(|l| l.trim_end().ends_with('{')) {
+                out.push_str(&rest[..i]);
+                let body_start = rest.len() - t.len();
+                match rest[body_start..].find("\n}") {
+                    Some(e) => rest = &rest[body_start + e + 2..],
+                    None => return out,
+                }
+            } else {
+                out.push_str(&rest[..i + "#[cfg(test)]".len()]);
+                rest = after;
+            }
+        }
+    }
+
+    /// `guard: None` 을 담은 **생산 함수** 이름 집합(각 출현의 가장 가까운 앞 `fn 이름(`).
+    fn guard_none_producers(file: &str, src: &str) -> std::collections::BTreeSet<String> {
+        let code = strip_line_comments(&production(src));
+        let mut out = std::collections::BTreeSet::new();
+        let mut from = 0;
+        while let Some(i) = code[from..].find("guard: None") {
+            let at = from + i;
+            let head = &code[..at];
+            let fn_at = head.rfind("fn ").expect("guard: None 앞에 fn 이 없다");
+            let name: String = head[fn_at + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            out.insert(format!("{file}::{name}"));
+            from = at + 1;
+        }
+        out
+    }
+
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} 소실"));
+        let rest = &src[at..];
+        let end = rest[1..].find("\nfn ").or_else(|| rest[1..].find("\npub")).map(|e| e + 1).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 데몬 소스 전량(프로덕션 영역에서 `guard: None` 생산자를 찾는 대상).
+    fn daemon_sources() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("alert_route", include_str!("alert_route.rs")),
+            ("analytics", include_str!("analytics.rs")),
+            ("approval", include_str!("approval.rs")),
+            ("boot_supervisor", include_str!("boot_supervisor.rs")),
+            ("channels", include_str!("channels.rs")),
+            ("delivery", include_str!("delivery.rs")),
+            ("governance", include_str!("governance.rs")),
+            ("handlers", include_str!("handlers.rs")),
+            ("main", include_str!("main.rs")),
+            ("recall", include_str!("recall.rs")),
+            ("reclaim", include_str!("reclaim.rs")),
+            ("schedule", include_str!("schedule.rs")),
+            ("state", include_str!("state.rs")),
+            ("usage", include_str!("usage.rs")),
+        ]
+    }
+
+    /// ★H7 — 게이트 없는(`guard: None`) 데몬 내부 주입 생산자는 **허용목록 7개**뿐이다. 새 생산자가 생기면
+    /// 적색이다(검토자 대안 (a)). 판정을 거는 생산자(설계 H2~H5)는 판정 호출이 주입보다 **앞**이어야 한다.
+    #[test]
+    fn h7_guard_none_producers_allowlist() {
+        // 소스 파일 목록 자체가 낡지 않았는가 — 디렉터리의 .rs 가 전부 위 목록(또는 검체 전용 파일)에 있다.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let listed: std::collections::BTreeSet<String> =
+            daemon_sources().iter().map(|(f, _)| format!("{f}.rs")).collect();
+        for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+            let name = e.expect("항목").file_name().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") || listed.contains(&name) {
+                continue;
+            }
+            let src = std::fs::read_to_string(dir.join(&name)).expect("소스 읽기");
+            assert!(
+                !strip_line_comments(&production(&src)).contains("guard: None"),
+                "{name}: 목록 밖 파일에 guard: None 생산자가 있다 — daemon_sources 에 넣고 허용목록을 판정하라"
+            );
+        }
+        let mut found = std::collections::BTreeSet::new();
+        for (f, src) in daemon_sources() {
+            found.extend(guard_none_producers(f, src));
+        }
+        let allow: std::collections::BTreeSet<String> = [
+            "channels::inject_master",
+            "schedule::inject_on",
+            "handlers::deliver_to_ceo",
+            "boot_supervisor::notify_no_spawn",
+            "handlers::announce_seat_takeover",
+            "handlers::npm_prefix_pane_notice_req",
+            "handlers::send_text_write_req",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            found, allow,
+            "게이트 없는 기계 주입 생산자 집합이 바뀌었다 — 새 생산자는 설계 H 판정(machine_direct_hold)을 \
+             거치거나 허용목록 사유를 적어야 한다"
+        );
+        // 판정 → 주입 순서(설계 H2~H5 에서 켠다): (파일, 판정이 사는 함수, 판정 토큰, 주입 토큰).
+        let order: [(&str, &str, &str, &str, &str); 0] = [];
+        for (f, src, body_fn, gate, inject) in order {
+            let code = strip_line_comments(&production(src));
+            let body = fn_body(&code, body_fn);
+            let g = body.find(gate).unwrap_or_else(|| panic!("{f}::{body_fn}: 판정 `{gate}` 소실"));
+            let i = body.find(inject).unwrap_or_else(|| panic!("{f}::{body_fn}: 주입 `{inject}` 소실"));
+            assert!(g < i, "{f}::{body_fn}: 판정이 주입 뒤로 갔다");
+        }
+        // 탐지기 생존 증명 — 합성 변조본에 가짜 생산자를 심으면 적발한다(주석 속 guard 는 무시).
+        let fake = "fn legit() {}\nfn sneaky_producer(x: u8) {\n    let _ = WriteReq::Inject { text, cr_delay_ms: 0, clear_first: false, guard: None };\n}\n// fn commented() { guard: None }\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = X { guard: None }; }\n}\nfn after_tests() {}\n";
+        let got = guard_none_producers("fake", fake);
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
     }
 }
