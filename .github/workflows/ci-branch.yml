@@ -819,6 +819,10 @@ jobs:
           #     (WP6-6 부트 유예 내용 앵커 · ⑧ 은 AF_UNIX 부재 시 자체 SKIP) · test_ctx_divergence
           #     (WP6-3 괴리 임계). 실측 2026-09-15 · macOS arm64 · python 3.14.7 · 루프와 같은 env
           #     (CYS_PACK_DIR 임시 + 격리 HOME/CYS_STATE_DIR) · 4종 전건 rc=0 · 합계 약 4s.
+          #   ★R3-2(0.14.42) 1종 추가 등재 — test_phoenix_r32_restore_budget(phoenix `cys restore` 상한 =
+          #     기동 단위 수 비례 · 행 의심 90 · 롤백 노브 · cys.rs 구조 핀). stdlib·데몬 불요 밀폐 검체라
+          #     ALLOWED `test_phoenix_` 글롭 면제(release 전용)에 맡기지 않고 3완전 레인에 이름으로 싣는다.
+          #     실측 2026-09-25 · macOS arm64 · python 3.9.6·3.14.7 · CYS_PACK_DIR 임시 · rc=0 · 약 2s.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -844,6 +848,7 @@ jobs:
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
+                   test_phoenix_r32_restore_budget \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \
@@ -1469,6 +1474,7 @@ jobs:
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
+                   test_phoenix_r32_restore_budget \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \

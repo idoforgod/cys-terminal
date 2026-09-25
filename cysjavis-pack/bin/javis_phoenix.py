@@ -46,6 +46,7 @@ import argparse
 import atexit
 import glob
 import json
+import math
 import os
 import re
 import shutil
@@ -53,6 +54,7 @@ import signal
 import subprocess
 import sys
 sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
+import threading
 import time
 
 HOME = os.path.expanduser("~")
@@ -1822,12 +1824,187 @@ def rollback_proposal(socket):
 
 # ------------------------------------------------------------------ spawn 백엔드
 
-def spawn_production(socket, pending_roles, include_master=False):
-    """실 프리미티브 재사용: cys restore 로 죽은 역할 일괄 재기동(세션핀 resume 경로)."""
+# ★R3-2(0.14.42 · S27b H5 4/8 유실): `cys restore` 외부 상한을 **기동 단위 수 비례**로 파생한다.
+#   `cys restore`(cys.rs run_restore)는 죽은 역할을 **순차**로 세운다. 종전 고정 90s 는 로스터 크기를 모르는
+#   외부 상한(javis_budget 가 없애 온 '외부 < 내부 최악치' 역전의 마지막 사본)이라, 좌석 8 · 기동 15s 에서
+#   역할당 ~23s × 8 ≈ 184s 인 일을 90s 에 잘랐다(5번째 역할은 부트 도중 SIGKILL — 반쪽 좌석). 잘린 역할은
+#   뒤의 완결성 재시도가 되살리지 못하고(재시도의 `cys restore` 는 이미 침식된 topology 를 읽는다) 독약
+#   강등(fresh)으로 대화를 잃었다. 값의 소유자는 javis_budget.cys_restore_outer_s(단위) 다.
+_BUDGET_MOD = None
+RESTORE_TIMEOUT_FLOOR_S = 90        # 종전 고정 상한 = 하한 · 결손/행 의심/롤백의 귀착점(산식 사본 없음)
+RESTORE_TIMEOUT_KNOB_ENV = "PHOENIX_RESTORE_TIMEOUT_S"
+RESTORE_TIMEOUT_KNOB_FILE = "phoenix-restore-timeout-s"     # ~/.cys/ 아래 · 정수 초 한 줄
+SPAWN_HEARTBEAT_FALLBACK_S = 20     # javis_budget HEARTBEAT_INTERVAL_S 결손 시
+
+
+def _budget_mod():
+    """형제 javis_budget 로드·캐시(★R3-2). _snap_mod 와 같은 경로 가드. 실패(팩 결손·스큐)는 None —
+    새 크래시 지점 금지(호출부는 종전 90 으로 귀착). 제품 경로에서는 결손이 없다: cysd 는 PACK_ALL 의 bin/
+    전체를 임베드 추출하고, 디스크 폴백은 그 closure 전체의 해시를 검증한다(main.rs disk_fallback_verify)."""
+    global _BUDGET_MOD
+    if _BUDGET_MOD is None:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import javis_budget as _b
+            _BUDGET_MOD = _b
+        except Exception:
+            _BUDGET_MOD = False
+    return _BUDGET_MOD or None
+
+
+def _restore_timeout_knob():
+    """롤백 노브 판독 → (값|None, 출처|None). env(비어 있지 않으면 env 만) → 없으면 파일 ~/.cys/<KNOB_FILE>.
+    ★파일을 두는 이유: cysd 가 띄우는 phoenix 는 데몬 env 를 상속하는데, 데몬 env 를 바꾸는 길이 기동
+      경로마다 다르고(launchd plist 는 cys 가 stale 판정 시 PATH 만 담아 통째로 다시 쓴다 · 앱 직접 기동 ·
+      Windows 작업 스케줄러는 작업별 env 가 없다) 전부 **데몬 재기동**(= 전 pane 사망 · 치명위험 ④)을 요구한다.
+      파일은 다음 phoenix 실행이 곧바로 읽는다 — 재기동 0 · 기동 경로 무관 · Windows 동일.
+    유효 = 유한 양수. 비수치·inf·nan·0·음수는 (None, 출처) — 노브 없음으로 접는다(크래시 0)."""
+    raw = os.environ.get(RESTORE_TIMEOUT_KNOB_ENV)
+    src = "env " + RESTORE_TIMEOUT_KNOB_ENV
+    if raw is None or not str(raw).strip():
+        path = os.path.join(HOME, ".cys", RESTORE_TIMEOUT_KNOB_FILE)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                raw = f.read(64)
+        except (OSError, ValueError):
+            return None, None
+        src = "file " + path
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError, OverflowError):
+        return None, src
+    if not math.isfinite(v) or v <= 0:
+        return None, src
+    return v, src
+
+
+def restore_spawn_timeout_s(units, hang_suspected=False):
+    """`cys restore` 서브프로세스 상한(초)과 사유 → (초, 사유). 우선순위:
+    ① 행 의심(이번 실행의 앞선 `cys restore` 가 상한에 걸려 rc=124) → 종전 90. 파생 상한은 단위 최악치 합 +
+       마진이라 그것을 넘겼다는 것은 정상 진행이 아니라 멈춤이다(cys `request()` 는 읽기 상한이 없어 데몬
+       핸들러가 멈추면 끝없이 기다린다). 같은 상한을 재시도마다 다시 주면 멈춤 꼬리만 몇 배가 된다.
+    ② 노브(env > 파일) → [90, 파생] 로 clamp. 노브는 **종전 쪽으로 당기기만** 한다(90 = 정확히 종전 거동 ·
+       90 미만은 부트 도중 SIGKILL = 반쪽 좌석을 되들이므로 받지 않는다 · 늘리기는 CYS_BUDGET_* leaf 가 맡는다).
+    ③ 파생 javis_budget.cys_restore_outer_s(단위) — 하한 90. 모듈 결손·스큐·비유한 값이면 종전 90."""
+    floor = RESTORE_TIMEOUT_FLOOR_S
+    derived, why = floor, "javis_budget 결손·스큐 — 종전 %ds" % floor
+    b = _budget_mod()
+    if b is not None:
+        try:
+            d = float(b.cys_restore_outer_s(max(1, int(units or 0))))
+            if math.isfinite(d):
+                derived, why = max(floor, int(math.ceil(d))), "파생(javis_budget.cys_restore_outer_s)"
+        except Exception:
+            pass
+    if hang_suspected:
+        return floor, "행 의심(앞선 회차 rc=124) — 종전 %ds" % floor
+    knob, src = _restore_timeout_knob()
+    if knob is not None:
+        v = max(floor, min(int(knob), derived))
+        return v, "노브(%s=%g → [%d, %d] clamp)" % (src, knob, floor, derived)
+    return derived, why
+
+
+def restore_workload_units(topo, live_view, include_master=False):
+    """`cys restore` 1회가 실제로 치를 **기동 단위** 수(★R3-2) — cys.rs run_restore 의 선별을 같은 재료로 센다.
+    재료: topology.json entries(= system.topology.saved 의 원천 · handlers.rs load_topology 가 이 파일을 읽는다)
+    + 현재 생존 관측(role → 좌석 행). 건너뜀(Rust 와 같은 판정): 묘비 · master(비 include) · 생존(비어 있지 않은
+    좌석) · agent 미상. 남은 항목마다 1단위, 그 역할에 빈 좌석이 있으면 +1(좌석 내 재연결 실패 → fresh 폴백 =
+    락·기동 2회). ★phoenix 의 target_roles 로 세지 않는 이유: `cys restore` 에는 --roles 필터가 없다(명시
+    `phoenix restore --roles X` 여도 죽은 역할 전부를 세운다) · 저널 dedup 도 모른다 · ephemeral 필터도 없다.
+    과대 방향(안전)만 남긴다 — Windows 의 env 미주입 빈 좌석(in-seat 생략)도 +1 로 센다."""
+    tombs = set(t for t in (topo.get("tombstones") or []) if isinstance(t, str))
+    units = 0
+    for e in topo.get("entries") or []:
+        if not isinstance(e, dict):
+            continue
+        role = e.get("role")
+        if not isinstance(role, str) or not role:
+            continue
+        if role in tombs:
+            continue
+        if role == "master" and not include_master:
+            continue
+        rows = [s for s in (live_view.get(role) or []) if isinstance(s, dict) and not s.get("exited")]
+        if any(s.get("seat") != "empty" for s in rows):
+            continue                      # Rust live = seat != "empty"(키 부재 포함) — 이미 가동 중
+        if not isinstance(e.get("agent"), str):
+            continue                      # Rust: agent 미상 — 건너뜀
+        units += 1
+        if any(s.get("seat") == "empty" for s in rows):
+            units += 1                    # in-seat 시도 + fresh 폴백
+    return units
+
+
+def _restore_units_now(socket, live_view, include_master=False, roster=None, tombstones=None):
+    """지금 `cys restore` 를 부르면 치를 단위 수. topology.json 판독이 예외로 실패하면 desired 로스터로 센다
+    (desired ⊇ saved 라 과대 방향). 부재·손상은 Rust 도 빈 목록으로 읽으므로 그대로 0 이다(= 하한 90)."""
+    topo = None
+    try:
+        topo = read_topology(socket)
+    except Exception:
+        topo = None
+    if not isinstance(topo, dict) or not isinstance(topo.get("entries"), list):
+        topo = {"entries": [dict(e if isinstance(e, dict) else {}, role=r) for r, e in (roster or {}).items()],
+                "tombstones": sorted(t for t in (tombstones or []) if isinstance(t, str))}
+    try:
+        return restore_workload_units(topo, live_view or {}, include_master)
+    except Exception:
+        return len(topo.get("entries") or [])
+
+
+def _spawn_heartbeat(budget_s, what):
+    """`cys restore` 대기 중 진행 하트비트(★R3-2 · javis_budget 불변식 3). 상한을 단위 수에 비례해 늘리면
+    phoenix-restore.log 의 무출력 창도 같이 늘어난다(`cys()` 는 출력을 끝나고서야 돌려준다). 그 창을 주기 1줄로
+    상쇄한다 — 로그 전용 · 판정·스폰 경로 무접촉. 시작 실패는 무시(하트비트 없이 종전처럼 기다린다). 반환 = stop()."""
+    b = _budget_mod()
+    interval = SPAWN_HEARTBEAT_FALLBACK_S
+    if b is not None:
+        try:
+            interval = max(1.0, float(b.leaf("HEARTBEAT_INTERVAL_S")))
+        except Exception:
+            interval = SPAWN_HEARTBEAT_FALLBACK_S
+    ev = threading.Event()
+    t0 = time.monotonic()
+
+    def _beat():
+        while not ev.wait(interval):
+            try:
+                log("spawn 진행 중: %s 경과 %ds / 상한 %ds" % (what, int(time.monotonic() - t0), budget_s))
+            except Exception:
+                return
+
+    th = threading.Thread(target=_beat, name="phoenix-spawn-heartbeat", daemon=True)
+    try:
+        th.start()
+    except Exception:
+        return lambda: None
+
+    def stop():
+        ev.set()
+        try:
+            th.join(timeout=2.0)
+        except Exception:
+            pass
+    return stop
+
+
+def spawn_production(socket, pending_roles, include_master=False, units=None, hang_suspected=False):
+    """실 프리미티브 재사용: cys restore 로 죽은 역할 일괄 재기동(세션핀 resume 경로).
+    ★R3-2: `units` = 이 `cys restore` 가 치를 기동 단위 수(호출부가 restore_workload_units 로 센다 · None 이면
+    pending 길이). 상한은 restore_spawn_timeout_s 가 정한다."""
     args = ["restore"]
     if include_master:
         args.append("--include-master")
-    r = cys(*args, socket=socket, timeout=90)
+    n = len(pending_roles) if units is None else units
+    budget, why = restore_spawn_timeout_s(n, hang_suspected=hang_suspected)
+    log("spawn 예산: cys restore %d단위 → 상한 %ds · %s (종전 고정 %ds)"
+        % (int(n or 0), budget, why, RESTORE_TIMEOUT_FLOOR_S))
+    stop_beat = _spawn_heartbeat(budget, "cys restore")
+    try:
+        r = cys(*args, socket=socket, timeout=budget)
+    finally:
+        stop_beat()
     # ★F-1(리뷰 R3 · codex major): **실제 기동 모드가 phoenix 에 닿는 유일한 채널.** `out` 은 800자로 잘리므로
     #   자르기 **전** 세 스트림 전량에서 관측 줄을 뽑는다(예상 mirror 가 틀려도 관측이 승격한다 · 새 배선 0).
     #   ★리뷰 R3b: 세 번째가 `stderr_raw` 다 — 타임아웃이면 `stderr` 는 "TIMEOUT %ss" 로 대체되므로 그 자리에만
@@ -1835,6 +2012,7 @@ def spawn_production(socket, pending_roles, include_master=False):
     streams = "%s\n%s\n%s" % (r.stdout or "", getattr(r, "stderr", "") or "",
                                getattr(r, "stderr_raw", "") or "")
     return {"backend": "production(cys restore)", "rc": r.returncode,
+            "timeout_s": budget, "units": n,
             "out": (r.stdout or r.stderr or "").strip()[:800],
             "fresh_observed": sorted(cli_fresh_roles(streams))}
 
@@ -2395,6 +2573,10 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     #    stub: 역할별 재시도. 스폰 후 settle·회차별 backoff 증가로 동시 경합(부활 폭풍)을 완화한다. ──
     need = [r for r in pending if not stage_done(j, r, "spawn") and r not in role_surface]
     attempt = 0
+    # ★R3-2: `cys restore` 상한의 재료 — 회차마다 직전 생존 관측으로 단위 수를 다시 센다(재시도 회차는 침식된
+    #   topology 를 읽으므로 단위가 준다). 한 번이라도 상한에 걸리면(rc=124) 이후 회차는 종전 90s(행 의심).
+    _units_view = live
+    _restore_hang = False
     while need and attempt <= SPAWN_RETRIES:
         if stub:
             still = []
@@ -2431,13 +2613,19 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 #   (unknown). 미상은 뒤의 topology 축이 verified 를 내지 못하게 하는 제약이다 —
                 #   결측은 값이 아니다(미상을 '재개했다' 로 읽으면 거짓 verified 가 된다).
                 resume_mode[role] = resume_arg_effect("claude")[0]
-            res = spawn_production(socket, need, include_master=include_master)
+            # ★R3-2: 상한 = `cys restore` 가 **실제로** 세울 단위 수(topology.json + 생존 관측 · run_restore 와 같은
+            #   선별) — phoenix 의 need/target 이 아니다(`cys restore` 에는 --roles 필터가 없다).
+            _units = _restore_units_now(socket, _units_view, include_master, entries, _tombstones)
+            res = spawn_production(socket, need, include_master=include_master,
+                                   units=_units, hang_suspected=_restore_hang)
+            _restore_hang = _restore_hang or res.get("rc") == 124
             # 관측은 회차를 넘어 누적한다 — 1회차에 fresh 로 뜬 역할이 2회차에야 살아 있는 것으로 관측될 수 있다.
             fresh_observed.update(res.get("fresh_observed") or [])
             jevent(j, "*", "spawn", "ok" if res["rc"] == 0 else "fail",
                    "attempt %d · %s" % (attempt, json.dumps(res, ensure_ascii=False)))
             time.sleep(SPAWN_SETTLE)  # surface 등장 정착 대기(readiness 경합 완화)
             live2 = live_role_surfaces(socket)
+            _units_view = live2
             still = []
             for role in need:
                 alive = [s for s in live2.get(role, []) if not s["exited"]]
