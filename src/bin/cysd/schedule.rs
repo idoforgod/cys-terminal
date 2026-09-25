@@ -26,6 +26,14 @@ pub(crate) const LEGACY_ACTIONS: &[&str] = &["push", "command"];
 /// `via_queue` 적재의 활성 큐 상한 — 기존 enqueue 3경로와 **같은 100**(경보와 달리 보호선을
 /// 따로 두지 않는다: 시간당 1회 발화라 적체 축이 아니다).
 const SCHEDULE_QUEUE_CAP: usize = 100;
+/// ★(0.14.42 · 설계 H2) 직접 push 의 **하드축 우회 적재** 보호선(전체 깊이) — CSO 경보 보호선
+/// ([`crate::alert_route::CSO_QUEUE_HEADROOM`] = 50)과 같은 선례다. 활성 큐 상한(100)의 나머지 50칸은 CLI
+/// `send --queued`·`send-key --queued` 몫이다(부트 각성문 `javis_boot_node` --queued 4회 · javis_wakeup drain ·
+/// report_gate · inject_text 타이핑 폴백 — 이 신호들이 우회 적재에 밀려 queue_full 이 되면 ③ 이다).
+/// 넘으면 Err(queue_full) → schedule.error(종전 실패 방향). 노브를 끄면(HEAD) 종전 U8 P1 상한 100 이다.
+const SCHEDULE_FALLBACK_HEADROOM: usize = 50;
+/// ★(0.14.42 · 설계 H2) 틱의 pause 확인과 push 사이에 kill-switch 가 켜졌다 — via_queue 의 `Frozen` 과 같은 규약(ⓒ).
+const SCHEDULE_FROZEN_ERR: &str = "delivery_frozen: kill-switch paused between tick and push";
 /// 예정 시각보다 이만큼 늦게 발견하면 발화하지 않고 missed 처리 (데몬 다운 후 재시작 등)
 const MISS_WINDOW_SECS: i64 = 600;
 /// 반복(time) + fresh 조합에서 close_after_secs 미설정 시 적용하는 기본 TTL.
@@ -1793,19 +1801,81 @@ fn deliver_push(
         //   ★정직한 한계: PTY 쓰기까지 락을 쥘 수는 없으므로(원장 I/O·writer 채널) 검증
         //   **직후**의 인계는 여전히 지나간다. 큐 경유 경로도 삽입 이후에는 같은 성질이다.
         let surface = resolve_push_target(daemon, sid, role_guard)?;
-        // ★(0.14.41 · U8 P1) 질문·선택 창(모달)이 전경이면 **직접 주입하지 않고** 좌석 큐로 우회한다.
-        //   종전 이 분기는 게이트가 전혀 없어(`guard: None`) 하트비트·wakeup 문안이 오너의 AskUserQuestion·
-        //   권한 창에 타이핑됐고, 동봉 CR 이 기본 선택지를 눌렀다(조사 RC4 · 반박 §4 P1). 판정 술어는 큐 배달
-        //   게이트 ②와 같아서 적재된 항목은 모달이 닫힌 뒤 배달된다(새 폭주 경로 0 — 1발화 = 큐 1항목 ·
-        //   같은 잡 발신은 병합 · 좌석 큐 상한 `SCHEDULE_QUEUE_CAP`). 모달이 아니면 종전과 byte-identical.
-        //   맨 셸·마커 미정의 좌석은 판정이 `false` 라 종전 직접 주입 그대로다.
-        if crate::governance::seat_modal_foreground(&surface) {
-            return enqueue_schedule_push(daemon, job, sid, text, role_guard).map(|_| "queued(modal)");
+        // ★(0.14.42 · 설계 H2 · U8 P1 확장) 주입 직전 **양성 관측된 하드축**만 본다(공용 판정 H0).
+        //   · pause(틱 확인과 push 사이의 늦은 kill-switch · ⓒ) → Err(delivery_frozen) — 주입도 적재도 없다.
+        //   · 모달(종전 U8 P1)·quiescing(사이클 창)·사람 입력 30s·화면 초안 → 좌석 큐로 **우회**한다. 큐 게이트가
+        //     같은 술어로 그 축이 풀린 뒤 배달한다(quiescing 창은 H1 이 붙잡는다). 1발화 = 큐 1항목 · 같은 잡
+        //     발신은 병합 · 보호선 [`SCHEDULE_FALLBACK_HEADROOM`](50) · 주기 잡 TTL ≤ 주기(대기 1회분).
+        //   · 관측 불능(마커 미정의·커서행 미관측·alt 파손·계수 단독)과 판정 패닉은 **종전 직접 주입**이다 — UI 가
+        //     깨져도 하트비트·wakeup·자기 예약 wake 의 생명선이 끊기지 않는다(③). 시간 면제(ceiling)는 없다(§8-3).
+        //   · busy(작업 중)는 막지 않는다(잔여) — §8 안에서 막는 유일한 방법이 큐 보류이고 그것이 ③ 을 만든다.
+        //   · 셸 단독 축은 넣지 않는다(대상 선택의 `seat_is_agent_backed` 가 이미 본다).
+        //   · ★(리뷰 F1 · RR1-F1-XSOCK · ③) 기계 소유로 입증된 초안(CLI 기계 send 의 Return 누락 잔여 — 검증 좌석 · 교차 소켓
+        //     자기신고 · 익명 command 잡 · 데몬 자신의 붙여넣기)은 초안 축이
+        //     아니다(H0 `draft_machine_owned`) — 종전(pre-H)처럼 직접 주입해 잔여를 병합 제출한다. 큐는 입력줄 점유를
+        //     스스로 비우지 않아, 우회하면 푸는 주체 없이 heartbeat·wakeup 이 무기한 침묵한다.
+        //   · fresh 잡은 pause 재확인과 기존 모달만 본다(새 축 없음 · 회수 타이머 의미 무변경).
+        //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
+        if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
+            use crate::governance::MachineHold as H;
+            match crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh)) {
+                Some(H::Paused) => return Err(SCHEDULE_FROZEN_ERR.to_string()),
+                Some(h @ (H::Modal | H::Quiescing | H::HumanActive | H::Draft)) => {
+                    let label = match h {
+                        H::Modal => "queued(modal)",
+                        H::Quiescing => "queued(gate:quiescing)",
+                        H::HumanActive => "queued(gate:human)",
+                        _ => "queued(gate:draft)",
+                    };
+                    return enqueue_schedule_push(
+                        daemon,
+                        job,
+                        sid,
+                        text,
+                        role_guard,
+                        SCHEDULE_FALLBACK_HEADROOM,
+                        schedule_divert_ttl_secs(job),
+                    )
+                    .map(|_| label);
+                }
+                Some(H::ShellOnly | H::ProbeFailed) | None => {}
+            }
+        } else if crate::governance::seat_modal_foreground(&surface) {
+            // ★(0.14.41 · U8 P1 · 노브로 복원한 종전 경로) 모달 전경이면 좌석 큐로 우회(상한 100 · 데몬 기본 TTL).
+            return enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None)
+                .map(|_| "queued(modal)");
         }
         inject_on(daemon, &surface, text)?;
         return Ok("pushed");
     }
-    enqueue_schedule_push(daemon, job, sid, text, role_guard).map(|_| "queued")
+    enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None).map(|_| "queued")
+}
+
+/// ★(0.14.42 · 설계 H2) 스케줄 직접 push 가 보는 하드축. 사람 입력 창은 큐 배달 게이트와 같은 값
+/// (`CYS_QUEUE_HUMAN_QUIET_SECS` · 기본 30s). fresh 잡은 pause·모달만(갓 띄운 좌석 · 새 축 없음).
+fn schedule_hold_axes(fresh: bool) -> crate::governance::MachineHoldAxes {
+    use crate::governance::MachineHoldAxes;
+    if fresh {
+        return MachineHoldAxes { pause: true, modal: true, ..MachineHoldAxes::NONE };
+    }
+    MachineHoldAxes {
+        pause: true,
+        quiescing: true,
+        human: true,
+        modal: true,
+        draft: true,
+        human_window_secs: crate::governance::queue_human_quiet_secs(),
+        ..MachineHoldAxes::NONE
+    }
+}
+
+/// ★(0.14.42 · 설계 H2) 하드축 우회 항목의 TTL — 주기 잡은 `min(주기, 데몬 기본)` 이라 대기가 1회분으로 묶인다
+/// (다음 회차가 새 문안으로 다시 적재하고, 만료분은 만료 큐로 간다). 원샷(at)·일일(time) 잡은 `None`(데몬 기본 6h).
+/// 운영자가 데몬 TTL 을 껐으면(0) 그 선택을 따른다(`None` = 상속). 주기 0(비활성 잡의 run-now)은 원샷과 같다.
+fn schedule_divert_ttl_secs(job: &Job) -> Option<u64> {
+    let period = job.every_minutes.filter(|m| *m > 0)?.saturating_mul(60);
+    let base = crate::state::queue_ttl_default_secs();
+    (base > 0).then(|| period.min(base))
 }
 
 /// 스케줄 발화의 **좌석 큐 적재** 한 벌 — 큐 경유 잡과 모달 우회(U8 P1)가 같은 인자·같은 동결 규약을 쓴다.
@@ -1815,6 +1885,8 @@ fn enqueue_schedule_push(
     sid: u64,
     text: &str,
     role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+    cap: usize,
+    ttl_secs: Option<u64>,
 ) -> Result<(), String> {
     crate::alert_route::enqueue_into_seat(
         daemon,
@@ -1826,13 +1898,14 @@ fn enqueue_schedule_push(
         //   발화가 보이지 않았다. surface ref 형식이 아니므로 `from_label` 로 간다(§8 준수).
         Some(format!("{SCHEDULE_QUEUE_ORIGIN}:{}", job.id)),
         SCHEDULE_QUEUE_ORIGIN,
-        SCHEDULE_QUEUE_CAP,
+        cap,
         role_guard,
         // ★(성찰 A14) 스케줄 push 는 **kill-switch 만** 늦은 동결로 본다. 좌석 pause(헬스 조치
         //   `pause-queue`)는 배달을 미룰 뿐이고 항목은 큐에서 기다린다 — 그것을 실패로 접으면
         //   이 회차가 `schedule.fired` 에서 에러로 종결돼 다음 주기까지 일감이 오지 않는다.
         //   경보(`enqueue_alert`)는 반대다: 보류해도 잃지 않으므로 판정과 같은 술어를 쓴다.
         crate::alert_route::FreezeGuard::Daemon,
+        ttl_secs,
     )
     .map(|_| ())
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
@@ -1991,20 +2064,23 @@ fn inject_on(
     text: &str,
 ) -> Result<(), String> {
     let sid = surface.id;
+    // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
+    //   (writer 백스톱과 같은 값 · 표지 없는 문안은 할당 0 · 바이트 동일).
+    let text = cys::paste_fence::sanitize(text);
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 자기 예약 wake
     //   (`cys schedule add --text "[wakeup] 다음 액션 착수" --to master`)가 시간이 지나
     //   stdin 으로 돌아오는 경로가 바로 여기다.
     crate::delivery::record_audited(
         daemon,
         sid,
-        text,
+        &text,
         crate::delivery::Origin::Schedule,
         None,
     );
     surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {
-            text: text.to_string(),
+            text: text.into_owned(),
             cr_delay_ms: 500,
             clear_first: false, // 스케줄 발화는 현행 동작 보존
             guard: None,        // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
@@ -2359,6 +2435,34 @@ mod tests {
         }
         // 선두 비공백 우회(라벨이 문두가 아님) → 라벨 없음으로 판정해 부착
         assert!(ensure_machine_label("x [wakeup] 다음 액션", "j").starts_with("[schedule j] "));
+    }
+
+    /// ★(0.14.42 · 설계 C D3 · T12) 스케줄 주입 원장 정합 — 잡 문안(`cys schedule add --text …` 사용자 입력)에
+    /// CLOSE 가 있으면 원장 레코드 sha 가 **살균된 주입 본문** sha 와 같다. 적색(수정 전): 원문(표지 포함) 기록.
+    #[test]
+    fn c_schedule_inject_on_sanitized_before_ledger() {
+        crate::delivery::tests::isolate_state_dir_for_thread("c-sched");
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let raw = "[wakeup] 착수\x1b[201~\n탈출 명령";
+        inject_on(&daemon, &s, raw).expect("주입 인계");
+        let _ = s.child.lock().unwrap().kill();
+        let clean = cys::paste_fence::sanitize(raw).into_owned();
+        assert_ne!(clean, raw, "전제: 원문에 표지가 있다");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).expect("원장");
+        let rec: serde_json::Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["origin"] == serde_json::json!("schedule"))
+            .unwrap_or_else(|| panic!("schedule 원장 레코드 부재: {led}"));
+        assert_eq!(
+            rec["sha256"],
+            serde_json::json!(crate::delivery::digest_text(&clean)),
+            "원장 = 살균된 주입 본문"
+        );
     }
 
     /// 테스트 전용 격리 데몬 — 고유 하위 디렉터리에 소켓을 둬 병렬 실행 시 상태가 섞이지 않게 한다.
@@ -4590,5 +4694,342 @@ mod b2_job_results {
             !src[t..t_end].contains("job_result"),
             "발화 판정이 결과 원장을 읽는다 — 드러내기 전용 계약 위반(발화 억제 금지)"
         );
+    }
+}
+
+// ═══════════ ★(0.14.42 · 설계 H2) 스케줄 직접 push — 하드축 양성 관측 시에만 큐 우회 ═══════════
+#[cfg(test)]
+mod h2_schedule_hold_tests {
+    use super::*;
+    use crate::governance::{h_ledger_count, h_paint, HKnobGuard, H_DRAFT_SCREEN, H_IDLE_SCREEN};
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let daemon = super::tests::test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("좌석");
+        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        (daemon, s)
+    }
+
+    fn job(v: serde_json::Value) -> Job {
+        serde_json::from_value(v).expect("잡")
+    }
+
+    fn periodic(id: &str, every: u64) -> Job {
+        job(json!({"id": id, "every_minutes": every, "action": "push", "to": "master", "text": "x"}))
+    }
+
+    fn queue(s: &Arc<crate::state::Surface>) -> Vec<crate::state::QueueEntry> {
+        s.pending_queue.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn done(s: &Arc<crate::state::Surface>) {
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// 직접 주입 뒤 writer(본문 → 500ms → CR)와 PTY 에코가 끝나기를 기다린다 — 다음 화면을 그리기 전에.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(900));
+    }
+
+    /// [H2] 마커 좌석 화면에 초안이 **양성 관측**되면 직접 주입하지 않고 좌석 큐로 우회한다.
+    /// RED(HEAD): "pushed" + 주입(원장 schedule 1).
+    #[test]
+    fn h2_role_push_diverts_on_observed_draft() {
+        let (d, s) = rig("h2-draft");
+        h_paint(&s, H_DRAFT_SCREEN);
+        let j = periodic("heartbeat-5m", 5);
+        let got = deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None);
+        assert_eq!(got, Ok("queued(gate:draft)"), "초안 위에 직접 주입했다(초안 병합)");
+        assert_eq!(h_ledger_count(&d, "schedule"), 0, "원장 schedule 기록 = 직접 주입이 있었다");
+        let q = queue(&s);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].origin, "schedule");
+        assert_eq!(q[0].from.as_deref(), Some("schedule:heartbeat-5m"));
+        assert_eq!(q[0].ttl_secs, Some(300), "주기 잡 우회 항목 TTL = 주기");
+        assert_eq!(classify_fire_result(&Ok("queued(gate:draft) to master".into())), JobResultKind::Queued);
+        done(&s);
+    }
+
+    /// [H2] 사람 입력 10s 전 → queued(gate:human) · quiescing → queued(gate:quiescing)(이후 틱은 H1 이 보류한다).
+    /// RED(HEAD): pushed.
+    #[test]
+    fn h2_role_push_diverts_on_human_30s_and_quiescing() {
+        let (d, s) = rig("h2-human");
+        h_paint(&s, H_IDLE_SCREEN);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        let j = periodic("hb", 5);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] a", None), Ok("queued(gate:human)"));
+        *s.last_human_input.lock().unwrap() = None;
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch(),
+        });
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] b", None), Ok("queued(gate:quiescing)"));
+        assert_eq!(h_ledger_count(&d, "schedule"), 0, "창 안 직접 주입 0");
+        assert_eq!(queue(&s).len(), 2);
+        // 사람 흔적이 30s 를 넘겼고 quiescing 이 풀리면 종전 직접 주입.
+        *s.agent_status.lock().unwrap() = None;
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] c", None), Ok("pushed"));
+        assert_eq!(h_ledger_count(&d, "schedule"), 1);
+        done(&s);
+    }
+
+    /// [H2 ⓒ] 틱(pause 확인)과 push 사이에 kill-switch 가 켜지면 Err(delivery_frozen) — 주입 0 · 큐 0.
+    /// via_queue 의 Frozen 과 같은 규약. RED(HEAD): pushed.
+    #[test]
+    fn h2_pause_between_tick_and_push_is_error() {
+        let (d, s) = rig("h2-pause");
+        h_paint(&s, H_IDLE_SCREEN);
+        d.paused.store(true, Ordering::Relaxed);
+        let err = deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] x", None)
+            .expect_err("pause 중에 직접 주입했다(kill-switch 구멍 ⓒ)");
+        assert!(err.starts_with("delivery_frozen"), "{err}");
+        assert_eq!(classify_fire_result(&Err(err)), JobResultKind::Error);
+        assert_eq!(h_ledger_count(&d, "schedule"), 0);
+        assert!(queue(&s).is_empty());
+        // fresh 잡도 pause 를 다시 본다.
+        let fresh = job(json!({"id": "f", "action": "push", "to": "master", "text": "x", "fresh": true,
+                               "launch": {"role": "worker", "agent": "claude"}}));
+        assert!(deliver_push(&d, &fresh, s.id, "[schedule f] x", None).is_err());
+        d.paused.store(false, Ordering::Relaxed);
+        done(&s);
+    }
+
+    /// [H2 생명선 · 음성 · ③ 가드] 관측 불능 좌석은 종전 직접 주입 그대로다 — 마커 없음 · 프롬프트 미관측 ·
+    /// alt-screen 파손 · pending=5 ∧ 커서행 미관측. 전후 GREEN.
+    #[test]
+    fn h2_unobservable_seat_stays_direct() {
+        let (d, s) = rig("h2-lifeline");
+        let j = periodic("hb", 1);
+        let mut n = 0;
+        let mut expect_direct = |label: &str| {
+            n += 1;
+            assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 생명선", None), Ok("pushed"), "{label}");
+            assert_eq!(h_ledger_count(&d, "schedule"), n, "{label}: 직접 주입 원장");
+            assert!(queue(&s).is_empty(), "{label}: 큐로 우회했다(관측 불능은 보류 근거가 아니다)");
+            settle();
+        };
+        // ① 마커 없는 좌석(어댑터 미등록 = 맨 셸 등급).
+        *s.agent_meta.lock().unwrap() = None;
+        h_paint(&s, H_DRAFT_SCREEN);
+        expect_direct("마커 없음");
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        // ② prompt_unknown — 커서행에 마커가 없다.
+        h_paint(&s, "● 출력만 있는 화면\n다른 행");
+        expect_direct("prompt_unknown");
+        // ③ alt-screen 파손 — 전체화면 쓰레기.
+        s.alt_screen.store(true, Ordering::Relaxed);
+        h_paint(&s, "▒▒▒ 깨진 전체화면 ▒▒▒");
+        expect_direct("alt-screen 파손");
+        s.alt_screen.store(false, Ordering::Relaxed);
+        // ④ stale 계수 단독(pending=5 ∧ line None).
+        s.pending_input_bytes.store(5, Ordering::Relaxed);
+        h_paint(&s, "● 렌더 잔상");
+        expect_direct("pending=5 ∧ line None");
+        done(&s);
+    }
+
+    /// ★(리뷰 F1 · ③) 워커가 `cys send` 뒤 Return 을 잊어 master 입력줄에 **기계 잔여**(검증 발신자 본문 · owner 세대
+    /// 일치)가 남았다 — 스케줄 직접 push 는 큐로 우회하지 않고 종전처럼 직접 주입한다. 큐는 입력줄 점유를 스스로 풀지
+    /// 않아 우회 항목이 TTL 까지 서고 다음 회차도 같은 길을 간다(heartbeat·wakeup 무기한 침묵). 병합 제출이 유일한
+    /// 자가치유 경로다(pre-H 동작). 음성 대조: 같은 화면이 사람 초안이면 종전대로 우회. RED(HEAD): queued(gate:draft).
+    #[test]
+    fn h2_machine_residue_stays_direct() {
+        let (d, s) = rig("h2-residue");
+        s.apply_pending_input(b"WORKER-REPORT residue text", crate::governance::InputOrigin::Machine);
+        s.mark_pending_owner(9);
+        h_paint(&s, "● 작업 로그 한 줄\n────────────────────\n❯ WORKER-REPORT residue text");
+        let j = periodic("heartbeat-5m", 5);
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+            Ok("pushed"),
+            "기계 잔여 위에서 큐로 우회했다 — 푸는 주체 없는 보류(③ 자가치유 전멸)"
+        );
+        assert_eq!(h_ledger_count(&d, "schedule"), 1, "직접 주입 원장");
+        assert!(queue(&s).is_empty(), "우회 항목이 남았다");
+        // 앞 주입의 붙여넣기 창(본문 → 500ms → CR)과 렌더 settle 이 지나도록 기다린다.
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        s.clear_pending_input();
+        s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), crate::governance::InputOrigin::Human);
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None), Ok("queued(gate:draft)"), "사람 초안은 종전대로 우회");
+        assert_eq!(h_ledger_count(&d, "schedule"), 1);
+        done(&s);
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED · ③) **좌석 밖** 발신자의 Return 누락 잔여 — 교차 소켓 CEO·부서장(자기신고
+    /// from · Claimed)과 데몬 command 잡 push_line(from 없음) — 위에서도 스케줄 직접 push 는 큐로 우회하지 않는다(pre-H 병합
+    /// 제출이 유일한 자가치유). 잔여는 실제 핸들러(`dispatch` · peer pid 결측)로 만든다. 음성 대조: GUI 모양 삽입(human +
+    /// machine_origin + 오너 토큰) 잔여는 종전대로 우회. RED(HEAD f1b1a7e8): Claimed·익명 모두 queued(gate:draft).
+    #[test]
+    fn h2_cross_socket_residue_stays_direct() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, s) = rig("h2-xsock");
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let j = periodic("heartbeat-5m", 5);
+        let leave = |body: &str, extra: serde_json::Value| {
+            s.clear_pending_input();
+            *s.last_human_input.lock().unwrap() = None;
+            h_paint(&s, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, s.id, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *s.last_human_input.lock().unwrap() = None;
+            h_paint(&s, &crate::governance::h_residue_screen(body));
+        };
+        for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
+            leave(&format!("XSOCK-{label} residue"), extra);
+            assert_eq!(
+                deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+                Ok("pushed"),
+                "{label}: 좌석 밖 발신자의 잔여 위에서 큐로 우회했다 — input_pending 무기한(③ 자가치유 전멸)"
+            );
+            assert!(queue(&s).is_empty(), "{label}: 우회 항목이 남았다");
+            // 앞 주입의 붙여넣기 창(본문 → 500ms → CR)과 렌더 settle 이 지나도록 기다린다.
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+        }
+        assert_eq!(h_ledger_count(&d, "schedule"), 2, "직접 주입 원장 2");
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = 종전대로 우회.
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+            Ok("queued(gate:draft)"),
+            "GUI 삽입을 기계 잔여로 봤다"
+        );
+        assert_eq!(h_ledger_count(&d, "schedule"), 2);
+        done(&s);
+    }
+
+    /// [H2 잔여 핀] busy(작업 중) 좌석은 막지 않는다 — §8 안에서 막는 유일한 방법(큐 보류)이 ③ 위험을 만든다.
+    #[test]
+    fn h2_busy_seat_stays_direct() {
+        let (d, s) = rig("h2-busy");
+        h_paint(&s, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
+        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] busy", None), Ok("pushed"));
+        assert_eq!(h_ledger_count(&d, "schedule"), 1);
+        done(&s);
+    }
+
+    /// [H2 검토 1] 우회 적재는 보호선 50(전체 깊이)까지만 — 51번째 우회는 Err(queue_full) → schedule.error.
+    /// 그 상태에서도 CLI `send --queued`·`send-key Return --queued` 는 수락된다(CLI 몫 50칸 보존).
+    /// RED(HEAD): 모달 우회가 100 까지 차지한다.
+    #[test]
+    fn h2_fallback_headroom_keeps_cli_room() {
+        let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (d, s) = rig("h2-headroom");
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        for i in 0..50 {
+            let j = periodic(&format!("hb-{i}"), 5);
+            assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 모달 우회", None), Ok("queued(modal)"), "#{i}");
+        }
+        assert_eq!(queue(&s).len(), 50);
+        let err = deliver_push(&d, &periodic("hb-50", 5), s.id, "[heartbeat] 51", None)
+            .expect_err("우회 적재가 보호선 50 을 넘었다(CLI --queued 몫 잠식)");
+        assert!(err.contains("queue_full"), "{err}");
+        assert_eq!(classify_fire_result(&Err(err)), JobResultKind::Error);
+        let rpc = |method: &str, params: serde_json::Value| -> serde_json::Value {
+            match crate::handlers::dispatch(&d, cys::Request { id: json!(1), method: method.into(), params }, None) {
+                crate::handlers::Reply::Single(v) => v,
+                _ => panic!("single reply"),
+            }
+        };
+        let r = rpc("surface.send_text", json!({"surface_id": s.id, "text": "워커 보고", "queued": true}));
+        assert_eq!(r["ok"], json!(true), "CLI send --queued 가 거절됐다: {r}");
+        let r = rpc("surface.send_key", json!({"surface_id": s.id, "key": "Return", "queued": true}));
+        assert_eq!(r["ok"], json!(true), "CLI send-key --queued 가 거절됐다: {r}");
+        assert_eq!(queue(&s).len(), 52);
+        // 노브 0(HEAD) — 종전 U8 P1 상한 100(무회귀 핀).
+        {
+            let _k = HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "0")]);
+            assert_eq!(deliver_push(&d, &periodic("hb-x", 5), s.id, "[heartbeat] HEAD", None), Ok("queued(modal)"));
+        }
+        done(&s);
+    }
+
+    /// [H2] 주기 잡 우회 항목 TTL = min(주기, 데몬 기본) · 원샷(at·time)은 None(데몬 기본 6h). 만료분은 만료 큐로 가고
+    /// 다음 회차는 새 항목으로 다시 적재된다(대기가 1회분으로 묶인다).
+    #[test]
+    fn h2_periodic_ttl_le_period_oneshot_default() {
+        let (d, s) = rig("h2-ttl");
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(deliver_push(&d, &periodic("p5", 5), s.id, "[heartbeat] 1회차", None), Ok("queued(gate:draft)"));
+        assert_eq!(deliver_push(&d, &periodic("p999", 999), s.id, "[heartbeat] 긴 주기", None), Ok("queued(gate:draft)"));
+        let at = job(json!({"id": "wake", "at": 1_900_000_000i64, "action": "push", "to": "master", "text": "x"}));
+        assert_eq!(deliver_push(&d, &at, s.id, "[wakeup] 원샷", None), Ok("queued(gate:draft)"));
+        let daily = job(json!({"id": "daily", "time": "09:00", "action": "push", "to": "master", "text": "x"}));
+        assert_eq!(deliver_push(&d, &daily, s.id, "[schedule daily] 일일", None), Ok("queued(gate:draft)"));
+        let q = queue(&s);
+        let ttl: Vec<Option<u64>> = q.iter().map(|e| e.ttl_secs).collect();
+        assert_eq!(ttl, vec![Some(300), Some(6 * 3600), None, None], "주기 TTL ≤ 주기 · 원샷·일일 = 데몬 기본");
+        // 1회차가 주기를 넘기면 만료 큐로 간다(활성 머리에 두지 않는다).
+        s.pending_queue.lock().unwrap()[0].enqueued_at = now_epoch() - 301.0;
+        crate::governance::queue_expiry_pass(&d);
+        let q = queue(&s);
+        assert_eq!(q.len(), 3, "주기를 넘긴 우회 항목이 활성 큐에 남았다");
+        assert!(s.expired_queue.lock().unwrap().iter().any(|e| e.from.as_deref() == Some("schedule:p5")));
+        // 다음 회차는 새 문안으로 새 항목.
+        assert_eq!(deliver_push(&d, &periodic("p5", 5), s.id, "[heartbeat] 2회차", None), Ok("queued(gate:draft)"));
+        assert_eq!(queue(&s).last().map(|e| e.text.clone()), Some("[heartbeat] 2회차".into()));
+        done(&s);
+    }
+
+    /// [H2 ③ 재기동 뒤 처리] 우회 항목은 WAL 에 영속된다 — 데몬이 재기동하면 같은 역할 좌석으로 재홈되고
+    /// TTL·발신 라벨·경로 태그가 그대로 살아 있다(유실 0 · 스키마 변경 0 · ttl_secs 는 WP-5 필드).
+    #[test]
+    fn h2_diverted_item_survives_daemon_restart() {
+        let (d, s) = rig("h2-restart");
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(deliver_push(&d, &periodic("hb-r", 5), s.id, "[heartbeat] 재기동 전", None), Ok("queued(gate:draft)"));
+        assert!(d.queue_wal_durable(), "WAL 영속 실패");
+        let id = queue(&s)[0].id.clone();
+        done(&s);
+        // 같은 소켓 경로로 새 데몬(재기동) — 복원분을 새 master 좌석으로 재홈.
+        let d2 = Daemon::new(d.socket_path.clone());
+        let m2 = d2
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("새 master 좌석");
+        d2.roles.lock().unwrap().insert("master".into(), m2.id);
+        d2.surfaces.lock().unwrap().insert(m2.id, m2.clone());
+        assert!(d2.rehome_restored_queue() >= 1, "복원분이 재홈되지 않았다");
+        let q2 = queue(&m2);
+        let e = q2.iter().find(|e| e.id == id).expect("재기동 뒤 우회 항목이 사라졌다");
+        assert_eq!(e.ttl_secs, Some(300), "TTL 이 복원에서 사라졌다");
+        assert_eq!(e.origin, "schedule");
+        assert_eq!(e.from.as_deref(), Some("schedule:hb-r"));
+        assert_eq!(e.text, "[heartbeat] 재기동 전");
+        let _ = m2.child.lock().unwrap().kill();
+    }
+
+    /// [노브] CYS_MACHINE_INJECT_HOLD=0 · 목록에서 schedule 제외 → HEAD 동작(초안 위 직접 주입 · 모달 우회 TTL 없음).
+    #[test]
+    fn h2_knob_off_is_head_identical() {
+        let (d, s) = rig("h2-knob");
+        let j = periodic("hb", 5);
+        for knob in ["0", "channel,ceo,supervisor,takeover"] {
+            let _k = HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", knob)]);
+            h_paint(&s, H_DRAFT_SCREEN);
+            assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] HEAD", None), Ok("pushed"), "{knob}");
+            settle();
+            h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+            assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] HEAD 모달", None), Ok("queued(modal)"), "{knob}");
+            let last = queue(&s).last().cloned().expect("모달 우회 항목");
+            assert_eq!(last.ttl_secs, None, "{knob}: HEAD 모달 우회는 TTL 을 싣지 않는다(데몬 기본 6h)");
+            d.paused.store(true, Ordering::Relaxed);
+            h_paint(&s, H_IDLE_SCREEN);
+            assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] HEAD pause", None), Ok("pushed"), "{knob}: HEAD 는 pause 를 여기서 보지 않았다");
+            d.paused.store(false, Ordering::Relaxed);
+            settle();
+        }
+        done(&s);
     }
 }

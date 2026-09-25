@@ -976,6 +976,99 @@ pub struct InjectReservation {
     pub guard: Arc<InjectGuard>,
 }
 
+/// ★(0.14.42 · A2) 짝 Return 흡수 표의 종류 — 발급 사유가 곧 흡수 응답의 `absorb_kind` 다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnTicketKind {
+    /// 발신자의 `cys send` 본문이 큐로 **자동 전환**됐다(큐 Inject 가 CR 까지 제출한다) — 그 항목 id.
+    Pair { entry_id: String },
+    /// 남의 Return 이 이 발신자의 기계 본문을 **이미 제출했다**(가로채기 연쇄 차단용).
+    Compensation,
+}
+
+/// ★(0.14.42 · B) 짝 Return 흡수 표의 **키** — 발신자 신원 등급(설계 B · A2 표 구조 재사용).
+///
+/// 검증 신원(커널 peer pid → 이 데몬의 좌석)이 있으면 **그것만** 쓴다(`Verified`). 없을 때만 CLI 가 싣는
+/// 자기신고 `from`(CYS_SURFACE_ID)을 `Claimed` 로 쓴다 — 교차 소켓 발신자(HQ CEO → 부서장 등)는 이 데몬의
+/// 좌석이 아니라 검증 신원이 없기 때문이다. 두 변형은 **서로 다른 키**다: `Verified(n)` 과 `Claimed(n)` 은
+/// 서로의 표를 만들거나 쓰거나 지우지 않는다(로컬 좌석 n 과 원격 자기신고 n 의 우연한 번호 충돌 차단).
+/// 결측은 값이 아니다 — 키가 `None` 인 호출자는 발급·흡수·소거를 모두 건너뛴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairKey {
+    /// 커널 peer pid 로 해석된 로컬 좌석 id.
+    Verified(u64),
+    /// 검증 신원이 없는 호출자의 자기신고 좌석 id(다른 데몬의 번호일 수 있다).
+    Claimed(u64),
+}
+
+impl PairKey {
+    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다).
+    pub fn sid(self) -> u64 {
+        match self {
+            PairKey::Verified(x) | PairKey::Claimed(x) => x,
+        }
+    }
+
+    pub fn is_verified(self) -> bool {
+        matches!(self, PairKey::Verified(_))
+    }
+}
+
+/// ★(0.14.42 · B) 좌석당 흡수 표 상한 — `Claimed` 키는 식별 불가 호출자의 자기신고라 번호 공간이
+/// 열려 있다(검증 키는 좌석 수로 유계). 발급 때 만료 정리 뒤에도 넘치면 가장 오래된 표부터 퇴출한다.
+/// 퇴출된 표의 결과는 '흡수 안 됨'(종전 0.14.41 쓰기)이라 안전 방향이다.
+pub const RETURN_TICKETS_CAP: usize = 64;
+
+/// ★(0.14.42 · A2) 대상 좌석·발신자당 1장 · 1회용 흡수 표(휘발 — 영속·관측 채널 비대상).
+/// 흡수는 쓰기 1회를 **억제**만 한다(새 쓰기·적재 0). 표는 흡수 판정의 입력일 뿐이다.
+#[derive(Debug, Clone)]
+pub struct ReturnTicket {
+    pub kind: ReturnTicketKind,
+    /// 발급 시각(단조) — 나이 판정·CAS 소비의 식별자를 겸한다.
+    pub issued: Instant,
+}
+
+/// ★(0.14.42 · 설계 H 리뷰 F2·F3) writer 의 **Inject arm 진행 표식** — 이 좌석 화면 composer 의 글자가 데몬 자신의
+/// 붙여넣기일 수 있는 창(붙여넣기~CR 을 쓰는 중 ∨ 끝난 지 얼마 안 됨)을 판정자가 읽는다.
+///
+/// 【왜】 Inject 는 본문을 쓴 뒤 `cr_delay_ms`(400~500ms)가 지나야 CR 을 쓴다. 그 사이 다른 생산자가 H0 초안 축을
+/// 보면 **우리 자신의 붙여넣기**를 초안으로 오인한다 — CEO 자동결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게
+/// escalation 되던 결함(리뷰 F2 · 0.05~0.4s 간격 12/12). writer 는 단일 소비자라 뒤 Inject 가 앞 Inject 의 글자와
+/// 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 그래서 이 창의 화면 초안은 보류 근거가 아니다.
+///
+/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end). 읽기 = H0 판정·채널 배달 간격.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at` 은 leaf.
+#[derive(Debug, Default)]
+pub struct InjectTrack {
+    /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
+    active: AtomicBool,
+    /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
+    done_at: Mutex<Option<Instant>>,
+}
+
+impl InjectTrack {
+    /// writer 전용 — Inject arm 의 첫 바이트 앞.
+    pub(crate) fn begin(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// writer 전용 — Inject arm 의 마지막 바이트(CR) 뒤. `done_at` 을 먼저 찍고 `active` 를 내린다
+    /// (`active == false` 를 본 판정자는 새 `done_at` 을 본다).
+    pub(crate) fn end(&self) {
+        *self.done_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
+    pub(crate) fn busy_within(&self, within: std::time::Duration) -> bool {
+        self.active.load(Ordering::Acquire)
+            || self
+                .done_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|t| t.elapsed() < within)
+    }
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -1004,6 +1097,13 @@ pub enum WriteReq {
     /// Claude CLI 가 paste 로 삼켜 미제출" — src-tauri/src/main.rs:489). Anthropic 자체 주입
     /// 코드는 bracketed paste 뒤 `\r` 을 10ms 지연 별도 전송하고, 이 저장소의 큐 경로
     /// (`Inject`)는 이미 cr_delay_ms(400)를 둔다 — 직접 경로에만 간격이 없었다.
+    ///
+    /// ★정정(0.14.42 · 설계 C D6 · 벤치 S49 = 실제 claude 2.1.281 TUI · 각 조건 10회): 위 2.1.239 의 s_r=800
+    /// 서술은 현행과 맞지 않는다. 한 번 쓰기에 CR 을 동봉한 울타리 없는 키런은 48자 10/10 제출 · 64·799·801·
+    /// 4000자 0/10 제출(삼킴)이라 **동봉 문턱은 49~63자**다. 분리 CR 은 τ=0 에서도 10/10(키런·울타리 둘 다),
+    /// 울타리 + CR 은 동봉·τ 0/10/50/150/400ms 전부 10/10, 801·4000자 울타리도 10/10 이다. 조각 사이 인위 간격
+    /// 300/400ms 조건의 울타리 없는 1200자는 조건마다 9/10 온전(2/20 앞 1022자 소실) · 울타리 20/20 온전이다.
+    /// 실경로 S20 ko1200 은 울타리 없이 200/200 온전했다. 이 변형(DataAfter)의 계약은 무변경이다.
     ///
     /// 왜 writer 에서 자는가: writer 는 **단일 소비자**라 여기서 sleep 하면 뒤따르는 WriteReq
     /// 는 그동안 채널에 머문다 = 순서가 구조적으로 보존된다(Inject 의 cr_delay_ms 와 같은
@@ -1217,6 +1317,16 @@ pub struct Surface {
     /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
     /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
     pub input_gate: std::sync::Mutex<()>,
+    /// ★(0.14.42 · A2) 짝 Return 흡수 표 — 발신자 키([`PairKey`] · B) → 표(대상·발신자당 1장 · 덮어쓰기 ·
+    /// 상한 [`RETURN_TICKETS_CAP`]).
+    ///
+    /// 발급: `surface.send_text` queued 팔(`absorb_return` · 발신자 키 있음(검증 ∨ 자기신고 — B) · ttl>0 ·
+    /// 끝 CR/LF 아님) 과 `surface.send_key` 쓰기 뒤 정산(남의 기계 본문을 제출했을 때 그 주인에게 보상 표 —
+    /// 주인은 검증 신원만: `Surface::pending_owner`).
+    /// 소거: 직접 send 성공(D2) · send_key 쓰기 뒤 정산(D4) · 흡수 소비(CAS) · 발급 때 만료 정리.
+    /// **락 계약: 단독 leaf** — 다른 락을 쥔 채 잡지 않고(`input_gate`·`pending_queue` 안 금지),
+    /// 이 락을 쥔 채 다른 락도 잡지 않는다. poison 은 `into_inner` 로 넘긴다(HashMap 연산뿐).
+    pub return_tickets: Mutex<HashMap<PairKey, ReturnTicket>>,
     /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
@@ -1254,6 +1364,8 @@ pub struct Surface {
     pub pending_input_stale: Mutex<Option<(u64, u64, Instant)>>,
     /// T4-17 에코 제외: 마지막 원격 주입 시각 (주입 직후 에코 라인은 룰 매칭 제외)
     pub last_injected: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · 설계 H 리뷰 F2·F3) writer 의 Inject arm 진행 표식 — [`InjectTrack`] doc. writer 스레드와 공유한다.
+    pub inject_track: Arc<InjectTrack>,
     /// ★좌석 점유 캐시(SEAT-1): watchdog 틱이 커널 사실(자손 프로세스 유무)로 갱신하는 단일 SOT.
     /// 0=Unknown(미판정·프로브 실패) 1=Occupied(자손 존재=쓰이는 중) 2=Empty(셸 단독=빈 좌석).
     /// **왜 캐시인가**: 판정 재료(전 프로세스 표)는 watchdog이 이미 매 틱 refresh 한다 — RPC 경로가
@@ -1372,6 +1484,11 @@ pub struct Surface {
     /// org.status **양쪽 동일 키**(`alt_screen` — 동형성 핀 handlers.rs) + launch-agent 의
     /// mac claude fullscreen WARN(D5 env 방어층 우회 관측). additive bool — 구 소비자 무영향.
     pub alt_screen: AtomicBool,
+    /// ★(0.14.42 · 설계 C D5′) 이 pane 의 앱이 지금 **괄호 붙여넣기 모드(DECSET 2004)** 를 켜 두었는가.
+    /// 단일 write path = reader 스레드의 [`mirror_screen_modes`](파서 락 임계영역 안 · `alt_screen` 과 같은 자리).
+    /// 소비 = 직접 경로 울타리 판정(handlers `direct_fence_mode` 의 마지막 클로저) — 핸들러가 파서 락을 새로
+    /// 잡지 않게 하는 원자 미러다. 파서 패닉 재초기화 시 fresh 파서의 false 가 들어가 원문(종전)으로 폴백한다.
+    pub bracketed_paste: AtomicBool,
     /// ★(U-10) **좌석 제4 등급** `gate_pending` — 프로세스는 살아 있으나 **첫기동 관문**
     /// (테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)에 갇혀 **입력을 받을 수
     /// 없는** 좌석. `None` = 이 축에 대해 말할 것이 없음(= 종전 판정) · `Some(_)` = 보류.
@@ -1511,6 +1628,85 @@ impl Surface {
     pub fn clear_pending_input(&self) {
         *self.pending_input.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.set_pending_input(0);
+    }
+
+    /// ★(0.14.42 · A2 D0) 방금 적용한 기계 본문의 **검증** 소유자를 지금 세대로 각인한다
+    /// ([`Surface::mark_pending_input_owner`] 의 `Verified` 판).
+    pub fn mark_pending_owner(&self, sender: u64) {
+        self.mark_pending_input_owner(crate::governance::InputOwner::Verified(sender));
+    }
+
+    /// ★(0.14.42 · A2 D0 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 방금 적용한 기계 본문의 소유자(발신자 등급)를
+    /// **지금 세대**로 각인한다. 호출 규약: `input_gate` 안, `apply_pending_input` 직후(그 사이 다른 변이가 없어야
+    /// 세대가 맞다). pending_input leaf 만 잡는다 — 'input_gate 안에서는 pending_input leaf 만' 계약 그대로다.
+    pub fn mark_pending_input_owner(&self, owner: crate::governance::InputOwner) {
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.owner = Some((owner, self.input_gen.load(Ordering::Acquire)));
+    }
+
+    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **유효한 검증** 소유자 — 각인 세대가 현재 세대와 같고 등급이 `Verified`
+    /// 일 때만 Some. 소비자는 짝 Return 흡수의 보상 표 판정이다(보상 표의 주인은 검증 신원뿐 · 설계 B 무변경 —
+    /// `Claimed`·`Unattributed` 각인은 여기서 결측이다). 그 뒤 어떤 변이(제출·사람 키·다른 키·큐 Inject·stale
+    /// 리셋)든 세대를 올리므로 결측이 된다(결측은 값이 아니다 — 소유자 불명은 어떤 표도 만들거나 유지하지 않는다).
+    pub fn pending_owner(&self) -> Option<u64> {
+        match self.pending_input_owner()? {
+            crate::governance::InputOwner::Verified(sid) => Some(sid),
+            _ => None,
+        }
+    }
+
+    /// ★(0.14.42 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 입력줄 본문의 **유효한** 소유자(전 등급) — 각인 세대가
+    /// 현재 세대와 같을 때만 Some. 소비자는 H0 기계 잔여 귀속(`governance::draft_machine_owned`) 하나다.
+    pub fn pending_input_owner(&self) -> Option<crate::governance::InputOwner> {
+        let st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.owner
+            .filter(|&(_, gen)| gen == self.input_gen.load(Ordering::Acquire))
+            .map(|(owner, _)| owner)
+    }
+
+    /// ★(0.14.42 · A2) 흡수 표 발급(덮어쓰기) — 발급 때마다 만료분(나이 ≥ ttl)을 정리한다.
+    /// ★(B) 정리 뒤에도 [`RETURN_TICKETS_CAP`] 을 넘으면 가장 오래된 표부터 퇴출한다(방금 넣은 표는 가장
+    /// 새것이라 남는다). 단독 leaf 락(다른 락을 쥔 채 부르지 않는다).
+    pub fn issue_return_ticket(&self, sender: PairKey, kind: ReturnTicketKind, ttl: std::time::Duration) {
+        let now = Instant::now();
+        let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, t| now.saturating_duration_since(t.issued) < ttl);
+        m.insert(sender, ReturnTicket { kind, issued: now });
+        while m.len() > RETURN_TICKETS_CAP {
+            let Some(oldest) = m
+                .iter()
+                .filter(|(k, _)| **k != sender)
+                .min_by_key(|(_, t)| t.issued)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            m.remove(&oldest);
+        }
+    }
+
+    /// 발신자의 표 사본(판정 재료) — 없으면 None.
+    pub fn peek_return_ticket(&self, sender: PairKey) -> Option<ReturnTicket> {
+        self.return_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sender)
+            .cloned()
+    }
+
+    /// 표 소비 CAS — 발급 시각이 `issued` 와 같을 때만 꺼낸다(그 사이 재발급·소비된 표는 건드리지 않는다).
+    pub fn take_return_ticket(&self, sender: PairKey, issued: Instant) -> Option<ReturnTicket> {
+        let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        if m.get(&sender).is_some_and(|t| t.issued == issued) {
+            m.remove(&sender)
+        } else {
+            None
+        }
+    }
+
+    /// 발신자의 표 소거(없으면 무동작).
+    pub fn clear_return_ticket(&self, sender: PairKey) {
+        self.return_tickets.lock().unwrap_or_else(|e| e.into_inner()).remove(&sender);
     }
 
     /// ★(U-10) `gate_pending` 축의 **유일한 직렬화 지점**. `surface.list`·`org.status`·
@@ -5092,10 +5288,12 @@ impl Daemon {
         // 좀비 writer 스레드와 그 fd를 즉시 회수한다.
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReq>(128);
         let writer_stop = Arc::new(AtomicBool::new(false));
+        let inject_track = Arc::new(InjectTrack::default());
         {
             let writer = writer;
             let stop = Arc::clone(&writer_stop);
-            std::thread::spawn(move || run_writer_loop(writer, write_rx, stop));
+            let track = Arc::clone(&inject_track);
+            std::thread::spawn(move || run_writer_loop_tracked(writer, write_rx, stop, Some(track)));
         }
 
         let surface = Arc::new(Surface {
@@ -5185,6 +5383,8 @@ impl Daemon {
             pending_input: Mutex::new(Default::default()),
             input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
+            // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).
+            return_tickets: Mutex::new(HashMap::new()),
             queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
@@ -5194,6 +5394,7 @@ impl Daemon {
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
+            inject_track,
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
             agent_session_id: Mutex::new(None),
@@ -5217,6 +5418,7 @@ impl Daemon {
             directive_verified: Mutex::new(None),
             // (W4 · D5) 신생 pane 은 primary screen 에서 출발 — 첫 청크 반영 시 reader 가 갱신.
             alt_screen: AtomicBool::new(false),
+            bracketed_paste: AtomicBool::new(false),
             // ★(U-10) 관문 보류는 항상 None 으로 시작한다 — 생성 시점엔 관문 관측 자체가 없다.
             //   restore 하이드레이션도 하지 않는다(필드 doc 의 A1 라이브락 사유).
             gate_pending: Mutex::new(None),
@@ -5365,8 +5567,8 @@ impl Daemon {
                             // (W4 · D5) alt_screen 관측 — 파서 락 임계영역 안에서 스냅샷을 떠
                             // 청크 반영과 원자 정합. 패닉 재초기화 경로도 fresh 파서의 false 를
                             // 그대로 반영한다(별도 분기 불요 — 화면 스냅샷 소실과 동일 의미론).
-                            surf.alt_screen
-                                .store(parser.screen().alternate_screen(), Ordering::Relaxed);
+                            // ★(0.14.42 · 설계 C D5′) 괄호 붙여넣기 모드(2004)도 같은 자리·같은 규칙.
+                            mirror_screen_modes(&surf, parser.screen());
                             // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
                             // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);
@@ -5869,6 +6071,14 @@ pub(crate) fn cr_gap_delay_ms(
     (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
 }
 
+/// ★(0.14.42 · 설계 C D5′) 화면 모드 미러 — reader 가 **파서 락 임계영역 안**에서 청크 반영 직후 부른다.
+/// `alt_screen`(W4 · D5)과 `bracketed_paste`(2004 · 직접 경로 울타리 판정) 두 원자를 같은 스냅샷에서 쓴다.
+/// 패닉 재초기화 뒤에는 fresh 파서의 false 가 들어간다(울타리 판정은 원문 = 종전 쪽으로 접힌다).
+pub(crate) fn mirror_screen_modes(surf: &Surface, screen: &vt100::Screen) {
+    surf.alt_screen.store(screen.alternate_screen(), Ordering::Relaxed);
+    surf.bracketed_paste.store(screen.bracketed_paste(), Ordering::Relaxed);
+}
+
 /// `WriteReq::Inject` 의 바이트 시퀀스 — (선정리 Ctrl-U → settle) → bracketed paste → cr_delay →
 /// CR. 종전 arm 본문 그대로이며, 인계 가드(`InjectGuard`)를 arm 머리에 넣기 위해 함수로만 뺐다
 /// (한 arm = 원자 · 다른 WriteReq 끼어듦 없음이라는 계약은 호출부가 그대로 지킨다).
@@ -5886,7 +6096,11 @@ fn inject_write<W: Write>(
         writer.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(clear_settle_ms()));
     }
-    writer.write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
+    // ★(0.14.42 · 설계 C D2) 백스톱 — Inject 생산자 전부(큐 다이제스트·clear_first·CEO·스케줄·채널·부트 통보·
+    //   승계 고지 등)를 한 곳에서 덮는다. 본문 안 표지(`ESC[201~`·C1 형)와 끝 미완성 이스케이프가 봉투를 조기에
+    //   닫아 뒤 글자가 키 입력(줄바꿈=제출 · ESC=취소)이 되던 결함을 막는다. 표지가 없고 끝이 완결인 본문은
+    //   종전 `format!("\x1b[200~{text}\x1b[201~")` 과 **바이트가 같다**(`/clear` 포함 — 무clear 무변경).
+    writer.write_all(cys::paste_fence::wrap(text).as_bytes())?;
     writer.flush()?;
     std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms));
     writer.write_all(b"\r")?;
@@ -5899,10 +6113,25 @@ fn inject_write<W: Write>(
 /// ★B2′ writer 로컬 상태 `last_program_write`: 이 루프가 **실제로** 프로그램 본문을 PTY 에
 /// 쓴 마지막 시각. 최소 간격의 기준점은 반드시 이 값이어야 한다(핸들러의 enqueue 시각이
 /// 기준이면 writer 적체 구간에서 간격이 0 으로 붕괴한다 — codex 감사 R1).
+// 프로덕션 좌석은 표식판([`run_writer_loop_tracked`])을 쓴다 — 이 판은 검체(delivery race 실증·writer 누수 가드) 전용이다.
+// `#[cfg(test)]` 가 아니라 allow 인 이유: 이 파일의 '프로덕션 영역' 소스 핀 앵커(첫 `#[cfg(test)]`)를 앞당기지 않는다.
+#[allow(dead_code)]
 pub(crate) fn run_writer_loop<W: Write>(
+    writer: W,
+    write_rx: std::sync::mpsc::Receiver<WriteReq>,
+    stop: Arc<AtomicBool>,
+) {
+    run_writer_loop_tracked(writer, write_rx, stop, None)
+}
+
+/// [`run_writer_loop`] 에 Inject arm 진행 표식([`InjectTrack`])을 붙인 판 — 프로덕션 좌석이 쓴다. 표식은 arm 의
+/// 첫 바이트 앞에서 세우고 마지막 바이트(CR) 뒤에 내린다(인계 가드가 포기한 요청은 세우지 않는다 = 한 바이트도 안 씀).
+/// 바이트·순서·지연은 [`run_writer_loop`] 와 같다(표식은 원자·leaf 락 쓰기뿐).
+pub(crate) fn run_writer_loop_tracked<W: Write>(
     mut writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
     stop: Arc<AtomicBool>,
+    track: Option<Arc<InjectTrack>>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut last_program_write: Option<std::time::Instant> = None;
@@ -5966,7 +6195,15 @@ pub(crate) fn run_writer_loop<W: Write>(
                 if guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
                     continue;
                 }
-                inject_write(&mut writer, &text, cr_delay_ms, clear_first)
+                // ★(0.14.42 · 설계 H 리뷰 F2·F3) 붙여넣기~CR 창을 판정자에게 알린다(InjectTrack doc).
+                if let Some(t) = &track {
+                    t.begin();
+                }
+                let r = inject_write(&mut writer, &text, cr_delay_ms, clear_first);
+                if let Some(t) = &track {
+                    t.end();
+                }
+                r
             }
             // ★B2″(agy 감사 R2-①): Inject 는 기준점을 **찍지 않는다**. 이 arm 은 자체
             // cr_delay_ms(기본 400)를 두고 본문→CR 까지 원자로 보내므로, 뒤따라 오는 제출
@@ -6947,6 +7184,96 @@ mod tests {
                 .is_ok(),
             "모든 sender drop 시 writer 루프가 종료돼야 한다"
         );
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ · T9) 화면 모드 미러 — ① 헬퍼: 2004h → true · 2004l → false · 1049 전환에도
+    /// 유지 · alt_screen 동시 미러 ② 파서 패닉 재초기화 뒤 false ③ 실제 reader: 좌석이 `ESC[?2004h` 를 찍으면
+    /// 2 초 안에 `surface.bracketed_paste` 가 true.
+    #[test]
+    fn c_mirror_screen_modes_tracks_bracketed_paste() {
+        let dir = std::env::temp_dir().join(format!("cys-c-mirror-{}-{}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("printf '\\033[?2004h'; sleep 30".into()), None, None, 24, 80)
+            .expect("surface");
+        // ③ 실제 reader(2 s 폴링).
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < dl && !s.bracketed_paste.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(s.bracketed_paste.load(Ordering::Relaxed), "reader 가 2004h 를 미러해야 한다");
+        let _ = s.child.lock().unwrap().kill();
+        // ① 헬퍼 직접.
+        let mut p = vt100::Parser::new(24, 80, SCROLLBACK_LINES);
+        p.process(b"\x1b[?2004h");
+        mirror_screen_modes(&s, p.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed));
+        assert!(!s.alt_screen.load(Ordering::Relaxed));
+        p.process(b"\x1b[?1049h");
+        mirror_screen_modes(&s, p.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed), "1049 전환에도 2004 유지");
+        assert!(s.alt_screen.load(Ordering::Relaxed), "alt_screen 동시 미러");
+        p.process(b"\x1b[?2004l");
+        mirror_screen_modes(&s, p.screen());
+        assert!(!s.bracketed_paste.load(Ordering::Relaxed), "2004l → false");
+        // ② 패닉 재초기화 뒤 false(fresh 파서).
+        let mut q = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        process_chunk_isolated(&mut q, b"\x1b[?2004h", 0);
+        mirror_screen_modes(&s, q.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed));
+        process_chunk_isolated(&mut q, b"\x1b[1;25H", 0);
+        process_chunk_isolated(&mut q, "\u{ac00}".as_bytes(), 0);
+        q.set_size(10, 25);
+        let (_, panicked) = process_chunk_isolated(&mut q, b"\x1b[1;25Ha", 0);
+        assert!(panicked, "전제: row.rs:89 패닉 재현");
+        mirror_screen_modes(&s, q.screen());
+        assert!(!s.bracketed_paste.load(Ordering::Relaxed), "재초기화 → false → 원문(종전) 폴백");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.42 · 설계 C D2 · T2/T3) Inject 백스톱 — 본문 안 CLOSE(`ESC[201~`)·C1 CLOSE·끝 미완성
+    /// 이스케이프가 봉투를 조기에 닫지 않는다. 적색(수정 전): CLOSE 2개(본문 것이 봉투를 먼저 닫는다).
+    /// 회귀 핀(전후 녹색): 표지 없는 본문은 종전 바이트 그대로(`/clear` 와 같은 꼴).
+    #[test]
+    fn c_inject_backstop_sanitizes_fence_markers_in_body() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let run = |text: &str| -> Vec<u8> {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = sync_channel::<WriteReq>(2);
+            let stop = Arc::new(AtomicBool::new(false));
+            let w = SharedBuf(Arc::clone(&buf));
+            let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+            tx.send(WriteReq::Inject { text: text.into(), cr_delay_ms: 0, clear_first: false, guard: None })
+                .unwrap();
+            drop(tx);
+            handle.join().ok();
+            let out = buf.lock().unwrap().clone();
+            out
+        };
+        let count = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).filter(|w| *w == needle).count();
+        // T3 회귀 핀: 표지 없는 본문 = 종전 바이트.
+        assert_eq!(run("hi"), b"\x1b[200~hi\x1b[201~\r".to_vec());
+        assert_eq!(run("/clear"), b"\x1b[200~/clear\x1b[201~\r".to_vec());
+        // T2 적색→녹색: 본문 안 CLOSE · C1 CLOSE · 끝 미완성 이스케이프.
+        for body in ["M1\x1b[201~M2\nM3", "X1\u{9b}201~X2\nX3", "tail\x1b[1"] {
+            let out = run(body);
+            assert_eq!(count(&out, b"\x1b[200~"), 1, "OPEN 1개: {body:?} → {:?}", String::from_utf8_lossy(&out));
+            assert_eq!(count(&out, b"\x1b[201~"), 1, "CLOSE 1개(본문 것이 봉투를 먼저 닫으면 2개): {body:?}");
+            assert_eq!(count(&out, "\u{9b}201~".as_bytes()), 0, "C1 CLOSE 0: {body:?}");
+            assert!(out.ends_with(b"\x1b[201~\r"), "CLOSE 는 제출 CR 바로 앞 하나뿐: {body:?}");
+        }
+        assert_eq!(run("tail\x1b[1"), b"\x1b[200~tail\x1b[201~\r".to_vec(), "끝 미완성 이스케이프 절단");
     }
 
     /// 불변식 박제: clear_first Inject은 한 writer arm에서 Ctrl-U(선정리)→bracketed paste→CR을

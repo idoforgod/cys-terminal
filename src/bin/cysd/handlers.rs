@@ -534,16 +534,33 @@ fn migrate_seat_queue(
 /// npm 축을 고칠 때 형제로 보고해 master 가 범위에 넣었다).
 /// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
 fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
-    daemon.bus.publish(
-        "role.takeover",
-        "system",
-        Some(prev_sid),
-        json!({"role": role, "prev_surface": prev_sid, "path": path,
-               "reason": "empty seat (no descendant process, no agent meta, no recent input)"}),
-    );
-    let Some(s) = daemon.get_surface(prev_sid) else {
+    let surface = daemon.get_surface(prev_sid);
+    // ★(0.14.42 · 설계 H6) 구 좌석에 **미제출 입력**이 있으면 pane 줄(원장 + 주입)을 생략한다 — 이벤트는 유지.
+    //   `seat_claimable` 은 사람 입력 30s 만 보고 계수는 보지 않는다. 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고
+    //   CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#` 은 주석이 아니다 — 아래 '실행돼도 no-op' 전제의 반례).
+    //   문안·접두·cr 120·cfg 는 무변경이다. 노브에서 takeover 를 빼면 종전 동작(이벤트 키도 종전 그대로).
+    let hold_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Takeover);
+    let pending = surface
+        .as_ref()
+        .map(|s| s.pending_input_bytes.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let skip_pane = hold_on && pending > 0;
+    let mut payload = json!({"role": role, "prev_surface": prev_sid, "path": path,
+                             "reason": "empty seat (no descendant process, no agent meta, no recent input)"});
+    if hold_on {
+        payload["pane_notice"] = json!(match (&surface, skip_pane) {
+            (None, _) => "skipped_surface_gone",
+            (Some(_), true) => "skipped_pending_input",
+            (Some(_), false) => "sent",
+        });
+    }
+    daemon.bus.publish("role.takeover", "system", Some(prev_sid), payload);
+    let Some(s) = surface else {
         return;
     };
+    if skip_pane {
+        return;
+    }
     // 렌더 입력은 **그 좌석이 실제로 돌리는 셸**(`Surface::cmd`)이다 — `CYS_SHELL` 로 어느 OS
     // 에서든 바뀌므로 `cfg!` 로 가르면 틀린다(npm 축과 같은 규율).
     let text = seat_takeover_notice(role, &s.cmd);
@@ -2307,6 +2324,12 @@ fn draft_gate_denied_response(
 /// 왜 150 인가 — 근거 넷을 모두 넘는 가장 작은 값 계열로 잡았다:
 ///   ① Claude Code 2.1.239 입력 훅(`dln`): 800자 초과 키런은 붙여넣기로 처리하고(s_r=800),
 ///      붙여넣기 처리 중 도착한 Return 은 보류 후 재생하지만 이미지 경로 분기에서는 **폐기**한다.
+///      ★정정(0.14.42 · 설계 C D6 · 벤치 S49 = 실제 claude 2.1.281 · 조건마다 10회): s_r=800 은 현행과 맞지
+///      않는다. CR 동봉 문턱은 **49~63자**다(키런+CR 한 번 쓰기 48자 10/10 제출 · 64자 이상 0/10). 분리 CR 은
+///      τ=0 에서도 10/10 제출되고, 울타리는 동봉·분리 모두 10/10 이다. 조각 소실(울타리 없는 1200자 2/20 앞
+///      1022자)은 조각 사이 인위 간격 300/400ms 조건에서만 나왔고, 실경로 S20 ko1200 은 200/200 온전했다.
+///      따라서 150 은 S49 로 필요가 입증된 값이 아니라 **미측정 TUI·구버전을 위한 여유분**이다. 값은 그대로 두며,
+///      인하는 별도 결재 사항이다(직접 경로 울타리 D5′ 는 이 간격을 그대로 탄다 — Fenced 도 Program 기준점).
 ///   ② 이 저장소 자체 e2e 실측: "raw `\r` 동봉은 Claude CLI 가 paste 로 삼켜 미제출"
 ///      (src-tauri/src/main.rs:489).
 ///   ③ Anthropic 자체 주입 코드는 bracketed paste 뒤 `\r` 을 **10ms 지연** 별도 전송한다.
@@ -2340,6 +2363,473 @@ fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
     (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
 }
 
+/// ★(0.14.42 · A2) 짝 Return 흡수 표의 수명(초) — `CYS_RETURN_ABSORB_SECS`, 기본 30.
+/// **0 = 발급·흡수·보상 전부 끔**(롤백 노브 — send/send-key 가 종전 동작으로 완전히 돌아간다).
+///
+/// 기본값 근거는 비대칭이다: TTL 밖으로 샌 짝 Return 은 **조용한** 오승인(대화상자 기본 선택지 확정 ·
+/// 벤치 S22)이 되고, TTL 안의 의도적 Return 이 흡수되면 `ABSORBED` 로 **명시 통지**되어 재전송 1회로
+/// 회복된다. 운영 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_expired` 의 `ticket_age_ms`.
+fn return_absorb_ttl_secs() -> u64 {
+    std::env::var("CYS_RETURN_ABSORB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+
+/// ★(0.14.42 · A2-F1) **승인 창 좁힘의 반사 창** — `CYS_RETURN_ABSORB_REFLEX_MS`, 기본 2000.
+///
+/// 대상 좌석에 승인이 살아 있으면(모달 전경 ∨ 승인 feed — 첫기동 관문 제외 · governance
+/// `seat_approval_live`) 흡수는 표 나이가 이 창 **안**인 Return 에만 적용된다. 그보다 늦은 Return 은
+/// 쓴다 — master 의 Return 이 화면 승인의 유일한 수단이라(governance `draft_gate_modal_verdict` doc ·
+/// U8-P1 불변식) 삼키면 워커가 hang 한다. 첫기동 관문 좌석은 이 창을 쓰지 않고 TTL 흡수를 유지한다
+/// (관문의 맨 Return 은 `No, exit`·`Yes, try it` 을 누른다 — RF1-GATE-NARROW).
+///
+/// 기본값 근거(시간 축의 두 무리): 짝 Return 은 같은 셸 체인·스크립트(`push_line`·hud 브리지 ·
+/// `cys send … && cys send-key … Return`)에서 오면 프로세스 기동 한 번 뒤에 온다(샌드박스 실측 ·
+/// 커밋 본문). `read-screen` 으로 창을 확인한 뒤의 승인은 LLM 도구 호출 왕복이 최소 두 번 끼므로
+/// 그보다 늦다. `0` = 승인이 살아 있으면 흡수하지 않음(종전 0.14.41 과 같은 통과).
+/// 운영 재조정 근거: `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`.
+fn return_absorb_reflex() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CYS_RETURN_ABSORB_REFLEX_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+    )
+}
+
+/// ★(0.14.42 · B2) 요청의 자기신고 `from` 해석 — 배달 원장(`record_audited`) from 해석과 **같은 규칙**의 단일
+/// 정의처(JSON 정수 · `"surface:N"` · `"N"`). 그 밖(결측·null·빈 문자열·음수·임의 문자열)은 `None` 이다 — 결측은
+/// 값이 아니다(`"inject(typing_guard fallback)"` 같은 사람용 표기는 번호가 아니다).
+fn claimed_from_sid(params: &Value) -> Option<u64> {
+    let from = params.get("from")?;
+    from.as_u64().or_else(|| {
+        from.as_str()
+            .and_then(|s| s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok())
+    })
+}
+
+/// ★(0.14.42 · B2) 짝 Return 흡수 표의 발신자 키(순수) — 검증 신원이 있으면 **그것만**(`Verified` · 요청의 from
+/// 은 보지 않는다 = 로컬 좌석은 무엇을 자기신고해도 남의 표를 열거나 쓰지 못한다), 없을 때만 자기신고
+/// (`Claimed`). `claimed` 클로저는 검증 신원이 없을 때만 부른다.
+fn pair_key(
+    verified_from: Option<u64>,
+    claimed: impl FnOnce() -> Option<u64>,
+) -> Option<crate::state::PairKey> {
+    match verified_from {
+        Some(v) => Some(crate::state::PairKey::Verified(v)),
+        None => claimed().map(crate::state::PairKey::Claimed),
+    }
+}
+
+/// ★(0.14.42 · B2) 요청 단위 발신자 키 — [`pair_key`] 에 자기신고 규칙을 붙인다: 오너·오퍼레이터 토큰을 실은
+/// pane 무귀속 호출자(GUI 등급 · `caller_is_owner`)는 `Claimed` 를 쓰지 않는다(사람·GUI 경로 무접촉 — 그 경로는
+/// `absorb_return`·`pair_return` 을 싣지 않지만 토큰 등급을 한 번 더 막는다). 비용: 토큰 비교 1회(메모리).
+fn request_pair_key(
+    daemon: &Daemon,
+    verified_from: Option<u64>,
+    params: &Value,
+) -> Option<crate::state::PairKey> {
+    pair_key(verified_from, || {
+        if caller_is_owner(daemon, params, None) {
+            None
+        } else {
+            claimed_from_sid(params)
+        }
+    })
+}
+
+/// ★(0.14.42 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 직접 send 가 남긴 기계 본문(결과 count>0)의 **소유자 등급**
+/// (순수) — H0 기계 잔여 귀속(`governance::draft_machine_owned`)의 재료. `None` = 각인하지 않는다(종전 Draft 유지).
+///
+/// ```text
+/// 검증 신원 있음                                   → Verified(v)   (종전 F1 규칙 그대로 · 보상 표의 주인)
+/// 검증 신원 없음 ∧ (human ∨ machine_origin)          → None          (GUI 경로 · 사람 자기신고 — 오너 클릭의 의도)
+/// 검증 신원 없음 ∧ 오너·오퍼레이터 토큰 호출자        → None          (GUI 등급 · `request_pair_key` 와 같은 배제)
+/// 검증 신원 없음 ∧ 자기신고 from 있음                 → Claimed(n)    (교차 소켓 CEO·부서장)
+/// 검증 신원 없음 ∧ from 없음                         → Unattributed  (데몬 command 잡 push_line · 좌석 밖 스크립트)
+/// ```
+///
+/// 【왜 넓히나】 팩이 정한 조직 경로(CEO_TEMPLATE — CEO→부서장 · 부서장→CEO 소켓 master · 전부서 공지 fan-out)는 전부
+/// 교차 소켓 `send` + `send-key Return` 쌍이고, 수신 데몬에서 발신자는 검증 신원이 없다. Return 이 빠지면 owner 없는
+/// 잔여가 Draft 로 남아 H2(스케줄 → 큐 input_pending 무기한)·H3(채널 무기한 보류)·H4(CEO 결재 전부 escalation)가
+/// 멈췄다(③). pre-H 는 첫 직접 push 가 잔여를 병합 제출해 스스로 풀렸다.
+/// 【권한이 늘지 않는다】 각인은 H0 초안 축의 **귀속**에만 쓰인다. 이 발신자들은 이미 `send-key Return` 으로 자기 본문을
+/// 제출할 수 있다. 보상 표(`ticket_after_key_write`)는 종전대로 `Verified` 만 본다(`Surface::pending_owner`).
+/// 【사람 의도는 보존】 사람 바이트가 한 바이트라도 섞이면 세대가 올라 각인이 결측이 되고(`human>0` 이기도 하다) 종전 Draft 다.
+/// 클로저는 검증 신원이 없을 때만 부른다(토큰 비교 1회 · 메모리).
+fn residue_owner(
+    verified_from: Option<u64>,
+    human: bool,
+    machine_origin: bool,
+    owner_token_caller: impl FnOnce() -> bool,
+    claimed: impl FnOnce() -> Option<u64>,
+) -> Option<crate::governance::InputOwner> {
+    use crate::governance::InputOwner;
+    if let Some(v) = verified_from {
+        return Some(InputOwner::Verified(v));
+    }
+    if human || machine_origin || owner_token_caller() {
+        return None;
+    }
+    Some(claimed().map_or(InputOwner::Unattributed, InputOwner::Claimed))
+}
+
+/// ★(0.14.42 · A2) 흡수 자격 미달 사유 — `absorb_miss` 응답 키의 값.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsorbMiss {
+    /// TTL 노브 0.
+    Disabled,
+    /// 요청에 `pair_return:true` 가 없다(원시 RPC · inject_text · cycle 3분할 · 다중 키).
+    NotPaired,
+    /// 키 이름이 Return/Enter 가 아니다(C-m 같은 별칭 포함 — 이름 축).
+    NotSubmitKey,
+    /// authoritative 파라미터(launch-agent·reinject 등 권위 경로)는 구조적으로 대상 밖.
+    Authoritative,
+    /// 발신자 키 없음 — 검증 신원도, 쓸 수 있는 자기신고 `from`(B · `request_pair_key`)도 없다(결측은 값이 아니다).
+    Unverified,
+    /// 이 발신자의 표가 없다.
+    NoTicket,
+    /// 표 나이 ≥ TTL.
+    Expired,
+    /// ★(A2-F1) 대상 좌석에 승인이 살아 있고(모달 전경 ∨ 승인 feed · 첫기동 관문 아님) 표 나이 ≥ 반사
+    /// 창 — 이 Return 은 창을 누르려는 것으로 본다(흡수하면 워커 hang).
+    ApprovalLive,
+}
+
+impl AbsorbMiss {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbsorbMiss::Disabled => "disabled",
+            AbsorbMiss::NotPaired => "not_paired",
+            AbsorbMiss::NotSubmitKey => "not_submit_key",
+            AbsorbMiss::Authoritative => "authoritative",
+            AbsorbMiss::Unverified => "unverified",
+            AbsorbMiss::NoTicket => "no_ticket",
+            AbsorbMiss::Expired => "expired",
+            AbsorbMiss::ApprovalLive => "approval_live",
+        }
+    }
+}
+
+/// ★(0.14.42 · A2) 흡수 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsorbVerdict {
+    /// 쓰지 않는다(표를 CAS 로 소비하고 흡수 응답).
+    Absorb,
+    /// 기계 본문(pending>0 ∧ human==0) 위의 Return — **누구 것이든 종전처럼 통과**(구조 경로 보존).
+    PassThrough,
+    /// 자격 미달 — 종전 동작 그대로.
+    Miss(AbsorbMiss),
+}
+
+/// ★(0.14.42 · A2 D3) 짝 Return 흡수 **순수 판정** — IO 없음 · 1차(ACL 직후)와 `input_gate` 안
+/// 2차 재확인이 같은 함수를 쓴다.
+///
+/// 원칙 한 줄: **흡수는 기계 본문을 제출하지 않을 Return 에만** 적용한다. 대상은 queued Return ·
+/// 빈 줄(pending==0) · 사람 초안 위(human>0) 셋이다. 기계 본문 위 Return 은 누구 것이든 통과한다 —
+/// 계수(`PendingInputState`)는 줄 위 본문이 **자기 것인지** 판정의 근거가 못 되므로(소유자 축은
+/// 세대가 바뀌면 결측), 자기 본문의 짝 Return 을 삼키는 사고와 죽은 발신자 본문의 구조 경로 소실을
+/// 둘 다 이 한 규칙으로 막는다. queued Return 은 계수된 본문을 제출한 적이 없으므로(큐 배달은 줄이
+/// 빌 때만 나간다 · RC2) 흡수해도 잃는 구조가 없다.
+#[allow(clippy::too_many_arguments)]
+fn return_absorb_verdict(
+    ttl_secs: u64,
+    pair_return: bool,
+    key: &str,
+    authoritative_param: bool,
+    caller: Option<crate::state::PairKey>,
+    ticket_age: Option<std::time::Duration>,
+    queued: bool,
+    pending: u64,
+    human: u64,
+) -> AbsorbVerdict {
+    if ttl_secs == 0 {
+        return AbsorbVerdict::Miss(AbsorbMiss::Disabled);
+    }
+    if !pair_return {
+        return AbsorbVerdict::Miss(AbsorbMiss::NotPaired);
+    }
+    if !matches!(key, "Return" | "Enter") {
+        return AbsorbVerdict::Miss(AbsorbMiss::NotSubmitKey);
+    }
+    if authoritative_param {
+        return AbsorbVerdict::Miss(AbsorbMiss::Authoritative);
+    }
+    if caller.is_none() {
+        return AbsorbVerdict::Miss(AbsorbMiss::Unverified);
+    }
+    let Some(age) = ticket_age else {
+        return AbsorbVerdict::Miss(AbsorbMiss::NoTicket);
+    };
+    if age >= std::time::Duration::from_secs(ttl_secs) {
+        return AbsorbVerdict::Miss(AbsorbMiss::Expired);
+    }
+    if queued {
+        return AbsorbVerdict::Absorb;
+    }
+    if pending > 0 && human == 0 {
+        AbsorbVerdict::PassThrough
+    } else {
+        AbsorbVerdict::Absorb
+    }
+}
+
+/// ★(0.14.42 · A2-F1) **승인 창 좁힘**(순수 · 관측은 클로저) — `return_absorb_verdict` 가 `Absorb` 여도
+/// 표 나이 ≥ `reflex` 이고 대상 좌석에 승인이 살아 있으면 `Miss(ApprovalLive)` 로 바꾼다(= 종전처럼 쓴다).
+///
+/// 【왜】 표는 큐 전환 **사유와 무관하게** 발급되고 TTL(30초) 동안 같은 발신자(좌석 안 모든 프로세스)의
+/// 첫 단일 Return 을 삼켰다. 모달 전환 때 CLI 가 "짝 Return 을 보내지 마라" 라고 안내하므로, 안내를 따른
+/// 발신자에게는 표가 남고 **그다음 의도적 승인 Return** 이 쓰기 0 · rc 0 으로 사라졌다(리뷰 A2-F1 ·
+/// 샌드박스 r1b: 5.6초 뒤 Return → ABSORBED · 도달 b''). 이는 "SubmitKey 는 무변경 — master 의 Return 이
+/// 유일한 승인 수단(막으면 워커 hang)" 불변식(governance `draft_gate_modal_verdict`)과 정면 충돌한다.
+///
+/// 【범위】 승인이 살아 있을 때만 시간 축으로 가른다: 반사 창 안 = 짝 Return(흡수), 밖 = 창을 누르려는
+/// Return(쓴다). 승인 창에서의 S22 오승인 방지는 **같은 셸 체인·스크립트의 반사 창(기본 2초) 안 짝 Return 에
+/// 한해서만** 남는다. LLM 이 도구 호출을 따로 해서 늦게 보내는 짝 Return 은 승인 창을 누른다(설계상 수용 —
+/// CLI 가 모달 전환 때 '보내지 마라' 로 막는다). 승인이 없는 좌석과 **첫기동 관문 좌석**은 종전 A2 범위(TTL)
+/// 그대로다. 관문은 승인이 아니다(governance `seat_approval_live` · RF1-GATE-NARROW).
+/// 관측(`approval_live`)은 **Absorb ∧ 나이 ≥ reflex** 일 때만 부른다 — 대부분의 흡수(반사 창 안)는
+/// 화면·feed 를 읽지 않는다(성능 · 락 계약: 호출자는 input_gate 밖에서 관측한다).
+/// 실패 방향: 관측 불능(마커 미정의·어댑터 미등록)은 `false` → 종전 A2 흡수 + ABSORBED 통지(재전송 회복).
+fn narrow_absorb_for_approval(
+    verdict: AbsorbVerdict,
+    ticket_age: Option<std::time::Duration>,
+    reflex: std::time::Duration,
+    approval_live: impl FnOnce() -> bool,
+) -> AbsorbVerdict {
+    match (verdict, ticket_age) {
+        (AbsorbVerdict::Absorb, Some(age)) if age >= reflex && approval_live() => {
+            AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive)
+        }
+        _ => verdict,
+    }
+}
+
+/// ★(0.14.42 · A2 D4) send_key 쓰기 뒤 발신자 표 정산.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TicketSettle {
+    /// 자기 기계 본문을 제출했다 — 같은 창 형제 프로세스가 보낼 짝 Return 을 위해 유지.
+    Keep,
+    /// 발신자 표 소거.
+    Clear,
+    /// 남(O)의 기계 본문을 제출했다 — 발신자 표 소거 + O 에게 보상 표(이미 불필요해진 O 의 짝 Return 흡수).
+    ClearAndCompensate(u64),
+}
+
+/// ★(0.14.42 · A2 D4) 쓰기 뒤 정산 **순수 판정**. 재료는 `input_gate` 안 `try_write` 직전 스냅샷이다.
+/// 비제출 키(Down·Tab·Esc·C-u …)와 빈 줄·사람 초안 위 제출은 언제나 소거한다 — 그래서
+/// `send-key Down Return`·선택지 조작 뒤의 Return 은 절대 흡수되지 않는다.
+/// 소유자 결측(세대 불일치)은 값이 아니다 — 보상도 유지도 없이 소거한다.
+/// ★(B) 소유자는 검증 신원뿐이다(`Surface::pending_owner` — Claimed·익명 각인은 여기서 결측) — `Claimed` 발신자는 소유자와 같을 수 없으므로
+/// 기계 본문 제출은 언제나 '남의 본문'(보상) 또는 결측(소거)이다. 보상 표는 `Verified(o)` 로 발급한다.
+fn ticket_after_key_write(
+    caller: crate::state::PairKey,
+    owner: Option<u64>,
+    pending_before: u64,
+    human_before: u64,
+    key_submits: bool,
+) -> TicketSettle {
+    if key_submits && pending_before > 0 && human_before == 0 {
+        match owner {
+            Some(o) if caller == crate::state::PairKey::Verified(o) => TicketSettle::Keep,
+            Some(o) => TicketSettle::ClearAndCompensate(o),
+            None => TicketSettle::Clear,
+        }
+    } else {
+        TicketSettle::Clear
+    }
+}
+
+/// ★(0.14.42 · A2) 흡수 응답·이벤트의 단일 조립처. 호출 규약: 어떤 좌석 락도 쥐지 않은 채 부른다
+/// (여기서 `pending_queue` 를 잠깐 잡아 본문 상태·깊이를 읽는다 — 표는 이미 CAS 로 꺼낸 뒤다).
+fn return_absorbed_response(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    id: &Value,
+    key: &str,
+    caller: crate::state::PairKey,
+    ticket: &crate::state::ReturnTicket,
+) -> Value {
+    let ticket_age_ms = ticket.issued.elapsed().as_millis() as u64;
+    let (kind, entry_id) = match &ticket.kind {
+        crate::state::ReturnTicketKind::Pair { entry_id } => ("pair", Some(entry_id.clone())),
+        crate::state::ReturnTicketKind::Compensation => ("compensation", None),
+    };
+    let (depth, in_queue) = {
+        let q = surface.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let in_queue = entry_id.as_deref().is_some_and(|want| q.iter().any(|e| e.id == want));
+        (q.len(), in_queue)
+    };
+    // 본문 상태 — pair: 큐에 있으면 queued(배달이 CR 까지 제출) · 없으면 not_queued(이미 배달됐거나
+    // 처분됨) · compensation: 남의 Return 이 이미 제출했다(submitted).
+    let body_state = match (kind, in_queue) {
+        ("compensation", _) => "submitted",
+        (_, true) => "queued",
+        _ => "not_queued",
+    };
+    daemon.bus.publish(
+        "queue.return_absorbed",
+        "queue",
+        Some(surface.id),
+        json!({
+            "surface_ref": cys::surface_ref(surface.id),
+            "from": cys::surface_ref(caller.sid()),
+            // ★(B) 키 등급 — false = 교차 소켓 등 검증 신원 없는 자기신고(Claimed). 추가형 키.
+            "from_verified": caller.is_verified(),
+            "absorb_kind": kind,
+            "queue_entry_id": entry_id,
+            "body_state": body_state,
+            "depth": depth,
+            "ticket_age_ms": ticket_age_ms,
+        }),
+    );
+    ok_response(
+        id,
+        json!({"surface_id": surface.id, "key": key, "sent": false, "absorbed": true,
+               "absorb_kind": kind, "queue_entry_id": entry_id, "body_state": body_state,
+               "depth": depth, "ticket_age_ms": ticket_age_ms}),
+    )
+}
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 울타리의 **본문 크기 문턱**(UTF-8 바이트). 관측된 PTY 조각이 1022 B 이므로
+/// 두 번 이상 읽혀 조각 사이 간격이 생길 수 있는 본문만 덮는다(S49 d_k1200 인위 간격 300/400 ms: 울타리 없이
+/// 2/20 앞부분 소실 · 울타리 0/40). 그 아래(사이클 PRENOTICE 146 B · 1줄 escalate · 짧은 쌍)는 종전 바이트다.
+const DIRECT_FENCE_MIN_BYTES: usize = 1000;
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 울타리를 거는 어댑터 — S49 로 실측한 Claude 만. codex·gemini(agy)·grok·
+/// 사용자 정의 어댑터는 실측 뒤 별도 결재로 넣는다(상수 1곳이 최소 면적).
+const DIRECT_FENCE_ADAPTERS: [&str; 1] = ["claude"];
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 쓰기 형태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectFence {
+    /// v0.14.41 바이트 그대로(`Program(text)`).
+    Raw,
+    /// `OPEN + 머리 + CLOSE + 꼬리` — 머리 = 끝 제출 꼬리 앞 본문, 꼬리 = CR 을 담은 끝 `[\r\n]*`(없으면 빈 것).
+    Fenced,
+}
+
+/// 직접 경로 울타리 판정의 **싼 순수 입력**(자기신고 포함 — 전부 원문(종전) 쪽으로만 접힌다).
+#[derive(Debug, Clone, Copy)]
+struct DirectFenceFlags {
+    /// 요청의 `human`(자기신고) — GUI 키 입력·machine_origin 문안이 여기서 빠진다.
+    human: bool,
+    /// 요청의 `authoritative`(자기신고) — 기동 명령줄·사전 울타리 inject_text.
+    authoritative: bool,
+    /// clear_first 는 원자 Inject 로 따로 나간다.
+    clear_first: bool,
+    /// `cfg!(unix)` — Windows 직접 경로는 무변경.
+    platform_ok: bool,
+}
+
+/// 끝 제출 꼬리 분리(순수): 본문 끝의 `[\r\n]*` 연속이 **CR 을 담고 있으면** 그것을 꼬리로 떼어 낸다(자동 제출
+/// 의도 — `본문\r` 관례). CR 이 없는 끝 LF 는 본문의 일부다(봉투 안에 남는다). 반환 (머리, 꼬리).
+fn split_submit_tail(text: &str) -> (&str, &str) {
+    let head_len = text.trim_end_matches(['\r', '\n']).len();
+    let tail = &text[head_len..];
+    if tail.contains('\r') {
+        (&text[..head_len], tail)
+    } else {
+        (text, "")
+    }
+}
+
+/// 끝이 이미지 경로 확장자인가(ASCII 대소문자 무시 · 끝 공백·따옴표 제거 뒤) — Claude 는 붙여넣은 이미지 경로를
+/// 첨부로 바꿀 수 있어 울타리를 걸지 않는다(설계 C 지적 2·16).
+fn ends_with_image_ext(s: &str) -> bool {
+    let t = s.trim_end_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
+    let lower = t.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
+/// ★(0.14.42 · 설계 C D5′ + S34 CRLF) 직접 경로 울타리 판정(순수 · 관측은 클로저).
+///
+/// 대상 둘(나머지는 전부 `Raw` = v0.14.41 바이트):
+///   ① **안쪽 CR 본문**(S34 CRLF 결함) — 머리에 CR 이 있으면 크기와 무관하게 봉투를 건다. 종전에는 CR 마다
+///      TUI 가 제출해 한 본문이 제출 여러 개로 쪼개졌다(미니 S34 cli_pair crlf 10/10 · 벤치 S34 10/10). 큐 경로는
+///      이미 봉투 안에 싣고 있었다(같은 본문 · 같은 의미). 끝 CR 꼬리(자동 제출)는 봉투 **밖**에 그대로 둔다 —
+///      S49: 울타리 + CR 은 τ=0 에서도 제출된다. 셸 좌석은 아래 좌석 술어로 빠진다(셸 의미 = 줄마다 실행 보존).
+///   ② **1000 B 이상 평문**(설계 D5′) — CR 없는 여러 줄 평문. 조각 간격이 벌어지는 부하 조건의 앞부분 소실 방어.
+/// 공통 제외: 사람·권위·clear_first·비유닉스 · 평문 아님(\t \n \r 외 C0 · DEL · C1 — ESC 가 든 본문은 종전 원문) ·
+/// `!` 접두(Claude bash 모드) · 이미지 경로 끝 · 좌석 술어 실패 · 킬 스위치 · 2004 꺼짐.
+/// 단락 순서 고정: 싼 순수 조건 → 본문 스캔 → 클로저(락·시스템콜·원자 읽기)는 뒤에, 앞 조건이 실패하면 호출 0.
+fn direct_fence_mode(
+    text: &str,
+    flags: DirectFenceFlags,
+    seat_ok: impl FnOnce() -> bool,
+    disabled: impl FnOnce() -> bool,
+    bp: impl FnOnce() -> bool,
+) -> DirectFence {
+    if flags.human || flags.authoritative || flags.clear_first || !flags.platform_ok {
+        return DirectFence::Raw;
+    }
+    let (head, _tail) = split_submit_tail(text);
+    let interior_cr = head.contains('\r');
+    let big_plain = text.len() >= DIRECT_FENCE_MIN_BYTES && !text.contains('\r');
+    if !(interior_cr || big_plain) {
+        return DirectFence::Raw;
+    }
+    if !text.chars().all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r')) {
+        return DirectFence::Raw;
+    }
+    if head.trim_start().starts_with('!') || ends_with_image_ext(head) {
+        return DirectFence::Raw;
+    }
+    if !seat_ok() || disabled() || !bp() {
+        return DirectFence::Raw;
+    }
+    DirectFence::Fenced
+}
+
+/// ★(0.14.42 · 설계 C D5′) 좌석 술어 — claude 어댑터 ∧ 에이전트 좌석(`seat_is_agent_backed`: 미종료·meta·
+/// 미통지·SEAT≠Empty) ∧ 에이전트 생존 관측(`agent_seen`). `agent_meta` 가드는 이름 판정 직후 놓는다 — 가드를 쥔
+/// 채 `seat_is_agent_backed` 를 부르면 같은 Mutex 재진입으로 데드락이다.
+fn direct_fence_seat_ok(surface: &Arc<crate::state::Surface>) -> bool {
+    let adapter_ok = {
+        let meta = surface.agent_meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.as_ref().is_some_and(|(a, _)| DIRECT_FENCE_ADAPTERS.contains(&a.as_str()))
+    };
+    adapter_ok
+        && crate::alert_route::seat_is_agent_backed(surface)
+        && surface.agent_seen.load(Ordering::Relaxed)
+}
+
+/// ★(0.14.42 · 설계 C D5′) 킬 스위치 — env `CYS_DIRECT_PASTE_FENCE` 가 0/false/off 이거나, 데몬 상태 디렉터리
+/// (`state::state_dir(socket)` — 레인 격리 · `~/.cys` 하드코딩 아님)에 `direct-paste-fence-off` 가 있으면 끈다.
+/// 파일 판정: 있음 → 끔 · 없음(NotFound) → 켬 · 그 밖의 오류 → 끔. 실패 방향은 v0.14.41 바이트다.
+/// 재기동 없이 즉시 적용되고, 판정 순서상 울타리 후보 본문을 claude 좌석에 보낼 때만 stat 한다.
+fn direct_fence_disabled(daemon: &Daemon) -> bool {
+    if let Ok(v) = std::env::var("CYS_DIRECT_PASTE_FENCE") {
+        if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off") {
+            return true;
+        }
+    }
+    let path = crate::state::state_dir(&daemon.socket_path).join("direct-paste-fence-off");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로가 PTY 에 쓰는 바이트 — `Raw` 는 원문, `Fenced` 는 lib 봉투(`wrap(머리)`) +
+/// 꼬리. 판정이 평문만 통과시키므로 살균은 항등이다(방어적으로 lib 봉투를 쓴다). 계수(`apply_pending_input`)도
+/// 이 바이트로 한다 — 봉투 안 LF 는 제출이 아니므로 계수가 본문 전량이 된다(큐 연접 방지 쪽으로 보수적).
+fn direct_fence_bytes(text: &str, fence: DirectFence) -> std::borrow::Cow<'_, [u8]> {
+    match fence {
+        DirectFence::Raw => std::borrow::Cow::Borrowed(text.as_bytes()),
+        DirectFence::Fenced => {
+            let (head, tail) = split_submit_tail(text);
+            let mut v = cys::paste_fence::wrap(head).into_bytes();
+            v.extend_from_slice(tail.as_bytes());
+            std::borrow::Cow::Owned(v)
+        }
+    }
+}
+
 /// ★B2′ `surface.send_text` 의 쓰기 변형 선택(순수) — 세 갈래를 한 곳에 모아 테스트 가능하게.
 ///
 ///   · clear_first  → `Inject`(Ctrl-U 선정리 → paste → CR, 원자)
@@ -2354,6 +2844,7 @@ fn send_text_write_req(
     text: &str,
     clear_first: bool,
     human_verified: bool,
+    fence: DirectFence,
 ) -> crate::state::WriteReq {
     if clear_first {
         crate::state::WriteReq::Inject {
@@ -2365,7 +2856,9 @@ fn send_text_write_req(
     } else if human_verified {
         crate::state::WriteReq::Data(text.as_bytes().to_vec())
     } else {
-        crate::state::WriteReq::Program(text.as_bytes().to_vec())
+        // ★(0.14.42 · 설계 C D5′) Fenced 도 Program(최소 간격 기준점)이다 — 뒤따르는 send-key Return 은 종전처럼
+        //   SubmitAfterGap 150ms(S49: 울타리 + 분리 CR 은 모든 τ 에서 제출). Raw 는 종전 바이트.
+        crate::state::WriteReq::Program(direct_fence_bytes(text, fence).into_owned())
     }
 }
 
@@ -2787,6 +3280,9 @@ fn auto_route_idem_window_secs() -> f64 {
 enum CeoDelivery {
     Delivered,
     SeatEmpty,
+    /// ★(0.14.42 · 설계 H4) 좌석은 있으나 하드축(모달·화면 초안·사이클·kill-switch)이 양성 관측됐다 — 사유를 싣고
+    /// 즉시 escalation 한다(큐 미사용: 요청자 대기 120s 라 큐 보류는 곧 조용한 만료다).
+    Held(&'static str),
 }
 
 /// W3.2 멱등 게이트: 이 항목의 의미 키가 최근 창 안에 이미 처리됐으면 false(중복 억제),
@@ -2820,6 +3316,7 @@ fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over
     match deliver_to_ceo(daemon, item, over_pressure) {
         CeoDelivery::Delivered => {}
         CeoDelivery::SeatEmpty => escalate_no_ceo(daemon, item, "ceo_seat_empty"),
+        CeoDelivery::Held(reason) => escalate_no_ceo(daemon, item, reason),
     }
 }
 
@@ -2859,7 +3356,31 @@ fn deliver_to_ceo(
     {
         return CeoDelivery::SeatEmpty;
     }
-    let text = build_ceo_injection(item, over_pressure);
+    // ★(0.14.42 · 설계 H4) 원장 선기록 **앞**에서 CEO 좌석의 하드축을 본다(공용 판정 H0). 축: kill-switch(ⓓ — 종전
+    //   이 경로는 pause 를 보지 않았다) · 사이클(quiescing) · 모달 · 화면 초안. 사람 입력 축은 넣지 않는다 — 위의
+    //   typing 가드(3s)가 종전대로 본다. busy 는 막지 않는다(요청자 대기 120s — 턴 경계까지 미루면 만료가 곧
+    //   escalation). 보류는 전부 **즉시 사람에게**(approval.stalled{reason} → UI openFeed · 사유로 분기하지 않는다).
+    //   판정 패닉(ProbeFailed)도 escalation 이다(실패 방향 = 사람). 노브에서 ceo 를 빼면 종전 동작.
+    //   ★(리뷰 F2 · RR1-F1-XSOCK) 초안 축은 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤 settle 안)와 CLI 기계 send 잔여
+    //   (검증 좌석 · 교차 소켓 부서장 자기신고 · 익명)를 초안으로
+    //   보지 않는다(H0 `draft_machine_owned`) — 0.5s 안 연속 결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게 가던 결함.
+    if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Ceo) {
+        use crate::governance::{MachineHold as H, MachineHoldAxes};
+        let axes = MachineHoldAxes { pause: true, quiescing: true, modal: true, draft: true, ..MachineHoldAxes::NONE };
+        if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
+            return CeoDelivery::Held(match h {
+                H::Paused => "delivery_frozen",
+                H::Quiescing => "ceo_seat_cycling",
+                H::Modal => "ceo_seat_modal",
+                H::Draft => "ceo_seat_draft",
+                H::ProbeFailed => "ceo_probe_failed",
+                H::ShellOnly | H::HumanActive => "ceo_seat_busy_human",
+            });
+        }
+    }
+    // ★(0.14.42 · 설계 C D3) title·body 는 발행자가 통제한다(inert 데이터 칸) — 원장 선기록 앞에서 살균해
+    //   원장과 주입 본문을 맞춘다(writer 백스톱과 같은 값).
+    let text = cys::paste_fence::sanitize_owned(build_ceo_injection(item, over_pressure));
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). CEO 자동 라우팅은 100% 기계 유래다.
     crate::delivery::record_audited(
         daemon,
@@ -4374,6 +4895,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // ★(0.14.42 · 설계 C D3) clear_first 는 원자 Inject(울타리)로 나간다 — 원장 선기록과 주입이 **같은
+            //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
+            //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
+            let text = if clear_first { cys::paste_fence::sanitize_owned(text) } else { text };
             // followup 모드: 대상이 조용해질 때 배달자(watchdog 틱)가 순서대로 주입
             if params
                 .get("queued")
@@ -4420,11 +4945,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let durable = daemon.queue_wal_durable();
                 // ★G1(W2-B): 응답에 queue_entry_id 가산(queued/depth 불변) — 발신자가
                 // 이후 queue.list·배달/폐기 이벤트를 조인하는 조준점.
-                return Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": sid, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id, "durable": durable}),
-                ));
+                let mut result = json!({"surface_id": sid, "queued": true, "depth": depth,
+                                        "queue_entry_id": entry.id, "durable": durable});
+                // ★(0.14.42 · A2 D1) 짝 Return 흡수 표 발급 — `cys send` 의 **자동 전환**(폴백 r2)만
+                //   `absorb_return:true` 를 싣는다(명시 `--queued` 는 싣지 않으므로 표 없음 — 의도적
+                //   Return 을 삼키지 않는다). 큐 Inject 가 CR 까지 제출하므로 뒤따르는 관례적 짝
+                //   Return 은 불필요하다 — 그 1회를 데몬이 흡수해 맨 CR·빈 큐 항목·거짓 queue_full 을 없앤다.
+                //   조건: 발신자 키 있음(결측은 값이 아니다) · ttl>0 · 끝이 CR/LF 아님(자동 제출 본문은
+                //   짝 Return 이 오지 않는다 — 여러 줄 본문은 중간 LF 가 있어도 짝 Return 이 온다).
+                //   ★(B) 키 = 검증 신원 우선, 없을 때만 자기신고 from(Claimed · 교차 소켓 CEO 등 — `request_pair_key`).
+                //   큐 락을 놓은 뒤·응답 전에 기록한다(표 락은 단독 leaf).
+                let absorb_return = params
+                    .get("absorb_return")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if absorb_return {
+                    let ttl = return_absorb_ttl_secs();
+                    let issued = match request_pair_key(daemon, verified_from, &params) {
+                        Some(x) if ttl > 0 && !text.ends_with(['\r', '\n']) => {
+                            surface.issue_return_ticket(
+                                x,
+                                crate::state::ReturnTicketKind::Pair { entry_id: entry.id.clone() },
+                                std::time::Duration::from_secs(ttl),
+                            );
+                            true
+                        }
+                        _ => false,
+                    };
+                    result["return_absorb"] = json!(issued);
+                    result["return_absorb_secs"] = json!(ttl);
+                    // ★(A2-F1) 승인이 살아 있는 좌석에서의 흡수 범위(반사 창) — CLI 안내가 실제 범위를
+                    //   말하게 한다(추가형 · 요청 시만).
+                    result["return_absorb_reflex_ms"] =
+                        json!(return_absorb_reflex().as_millis() as u64);
+                }
+                return Reply::Single(ok_response(&id, result));
             }
             let machine_origin = params
                 .get("machine_origin")
@@ -4528,14 +5083,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 );
             }
             if !human_verified {
-                let from_sid = verified_from.or_else(|| {
-                    params
-                        .get("from")
-                        .and_then(|v| v.as_u64())
-                        .or_else(|| params.get("from").and_then(|v| v.as_str()).and_then(|s| {
-                            s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
-                        }))
-                });
+                // ★(B2) 자기신고 from 해석은 `claimed_from_sid` 단일 정의처(짝 Return 표의 Claimed 키와 같은 규칙 ·
+                //   의미 동일 치환 — u64 · "surface:N" · "N").
+                let from_sid = verified_from.or_else(|| claimed_from_sid(&params));
                 crate::delivery::record_audited(
                     daemon,
                     sid,
@@ -4555,7 +5105,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // text 유실)이 구조적으로 불가능하다.
             // ★B2′: 비-clear_first 본문은 human_verified 여부로 Data/Program 이 갈린다 —
             //   Program 만 writer 의 최소 간격 기준점을 찍는다(send_text_write_req doc 참조).
-            let write_req = send_text_write_req(&text, clear_first, human_verified);
+            // ★(0.14.42 · 설계 C D5′ + S34 CRLF) 직접 경로 울타리 — 원장 선기록 뒤·input_gate 밖에서 판정한다
+            //   (agent_meta 는 leaf 로 잠깐 · 파서 락 0 — 2004 는 reader 미러 원자 · 킬 스위치 stat 은 후보일 때만).
+            //   gate_kind·draft_gate·타이핑 가드·원장·input_injected 는 원문 기준 그대로다(더 보수적).
+            let fence = direct_fence_mode(
+                &text,
+                DirectFenceFlags { human, authoritative, clear_first, platform_ok: cfg!(unix) },
+                || direct_fence_seat_ok(&surface),
+                || direct_fence_disabled(daemon),
+                || surface.bracketed_paste.load(Ordering::Relaxed),
+            );
+            let write_req = send_text_write_req(&text, clear_first, human_verified, fence);
+            // ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 기계 잔여 소유자 등급 — 게이트 밖에서 미리 푼다(순수 · 토큰 비교뿐).
+            let owner_if_residue = residue_owner(
+                verified_from,
+                human,
+                machine_origin,
+                || caller_is_owner(daemon, &params, None),
+                || claimed_from_sid(&params),
+            );
             // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
@@ -4612,10 +5180,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     } else {
                         crate::governance::InputOrigin::Machine
                     };
-                    surface.apply_pending_input(text.as_bytes(), origin);
+                    // ★(설계 C D5′) 계수는 실제로 쓴 바이트로(봉투 안 LF 는 제출 아님 · Raw 는 원문 그대로).
+                    let next = surface.apply_pending_input(&direct_fence_bytes(&text, fence), origin);
+                    // ★(0.14.42 · A2 D0) 기계 본문의 소유자 각인 — 결과 count>0 일 때만.
+                    //   pending_input leaf 만 잡는다(게이트 안 락 계약 그대로). 이후 변이는 세대를 올려
+                    //   각인을 자동 무효화한다(Surface::pending_input_owner).
+                    //   ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 검증 발신자만이 아니라 좌석 밖 CLI 기계 send(교차 소켓
+                    //   자기신고 · 익명)도 각인한다 — 등급 규칙은 `residue_owner`(GUI·사람 자기신고·오너 토큰은 제외).
+                    if origin == crate::governance::InputOrigin::Machine && next.count > 0 {
+                        if let Some(o) = owner_if_residue {
+                            surface.mark_pending_input_owner(o);
+                        }
+                    }
                 }
             }
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
+            // ★(0.14.42 · A2 D2) 직접 send 가 성공했으면 이 발신자의 짝 Return 표는 끝났다 — 뒤따르는
+            //   Return 은 이 새 본문을 제출해야 한다(clear_first 포함). 표 락은 단독 leaf(게이트 밖).
+            //   ★(B) 키는 발급과 같은 규칙(`request_pair_key`) — Claimed 발신자의 직접 성공도 자기 표만 지운다
+            //   (Verified(n) 과 Claimed(n) 은 서로를 지우지 않는다).
+            if let Some(x) = request_pair_key(daemon, verified_from, &params) {
+                surface.clear_return_ticket(x);
+            }
             if !human_verified {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
@@ -4712,16 +5298,118 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
+            // ★(0.14.42 · A2 D3) 짝 Return 흡수 판정 — ACL 뒤(발신자는 자기 짝 Return 만 억제할 수
+            //   있다) · queued 팔·타이핑 가드·D-12 **앞**. 흡수는 쓰기 1회를 억제만 한다(새 쓰기·적재 0).
+            //   `pair_return` 은 신 CLI 의 단일 `send-key Return|Enter` 만 싣는다 — inject_text·cycle
+            //   3분할·authoritative Return·launch-agent 는 싣지 않는 원시 요청이라 구조적으로 대상 밖이다.
+            //   선형화 근거: 흡수 시점의 원자 읽기에서 줄이 비어 있었다면 종전 'bare CR 을 그 시점에
+            //   쓴다' 에서 CR 만 빠진 것과 같다(그래서 여기서는 input_gate 를 잡지 않는다). 기계 본문
+            //   위(PassThrough)는 종전 경로를 타고, 게이트 안에서 같은 순수 함수로 재확인한다.
+            let queued_param = params
+                .get("queued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let authoritative_param = params
+                .get("authoritative")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let pair_return = params
+                .get("pair_return")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let absorb_ttl = return_absorb_ttl_secs();
+            let absorb_reflex = return_absorb_reflex();
+            // ★(0.14.42 · B) 발신자 키 — 검증 신원 우선, 없을 때만 자기신고 from(Claimed · 신 CLI 는 비큐
+            //   send-key 에 from 을 싣는다). 흡수 판정·게이트 안 재확인·쓰기 뒤 정산이 모두 이 키 하나를 쓴다.
+            let caller_key = request_pair_key(daemon, verified_from, &params);
+            // (verdict, 판정에 쓴 표의 발급 시각) — pair_return 없는 요청은 표·계수를 읽지 않는다.
+            let mut absorb: Option<(AbsorbVerdict, Option<std::time::Instant>)> = None;
+            if pair_return {
+                let ticket = caller_key.and_then(|x| surface.peek_return_ticket(x));
+                let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                let human = surface
+                    .pending_input
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .human
+                    .min(pending);
+                let ticket_age = ticket.as_ref().map(|t| t.issued.elapsed());
+                let verdict = return_absorb_verdict(
+                    absorb_ttl,
+                    pair_return,
+                    &key,
+                    authoritative_param,
+                    caller_key,
+                    ticket_age,
+                    queued_param,
+                    pending,
+                    human,
+                );
+                // ★(0.14.42 · A2-F1) 승인 창 좁힘 — 대상에 승인이 살아 있으면(모달 전경 ∨ 승인 feed ·
+                //   첫기동 관문 제외 — RF1) 흡수는 반사 창 안의 짝 Return 에만. 그보다 늦은 Return 은 창을
+                //   누르려는 것으로 보고 종전 경로로 쓴다(삼키면 워커 hang · U8-P1 불변식). 관측은 Absorb ∧
+                //   나이 ≥ 반사 창일 때만 1회 — input_gate 밖(락 계약).
+                let verdict = narrow_absorb_for_approval(verdict, ticket_age, absorb_reflex, || {
+                    governance::seat_approval_live(daemon, &surface)
+                });
+                let issued = ticket.as_ref().map(|t| t.issued);
+                match (verdict, caller_key, issued) {
+                    (AbsorbVerdict::Absorb, Some(x), Some(at)) => {
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            return Reply::Single(return_absorbed_response(
+                                daemon, &surface, &id, &key, x, &t,
+                            ));
+                        }
+                        // CAS 실패(그 사이 소비·재발급) — 종전 경로.
+                        absorb = Some((AbsorbVerdict::Miss(AbsorbMiss::NoTicket), None));
+                    }
+                    (AbsorbVerdict::Miss(AbsorbMiss::Expired), Some(x), Some(at)) => {
+                        // 만료 표는 여기서 정리한다(1회 통지). 원장 Outcome 으로는 잴 수 없던 축 —
+                        // LLM 짝 Return 지연 분포(TTL 조정 근거).
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            daemon.bus.publish(
+                                "queue.return_absorb_expired",
+                                "queue",
+                                Some(sid),
+                                json!({
+                                    "surface_ref": cys::surface_ref(sid),
+                                    "from": cys::surface_ref(x.sid()),
+                                    "from_verified": x.is_verified(),
+                                    "ticket_age_ms": t.issued.elapsed().as_millis() as u64,
+                                    "ttl_secs": absorb_ttl,
+                                }),
+                            );
+                        }
+                        absorb = Some((verdict, None));
+                    }
+                    (AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive), Some(x), Some(at)) => {
+                        // 승인 창 좁힘으로 흡수하지 않은 사실(1회 통지) — 반사 창 재조정 근거(흡수 쪽
+                        // `queue.return_absorbed` 와 같은 `ticket_age_ms` 축). 표는 건드리지 않는다 —
+                        // 쓰기 뒤 정산(D4)이 소거하고, 쓰기 전 거부면 종전처럼 남는다.
+                        daemon.bus.publish(
+                            "queue.return_absorb_bypassed",
+                            "queue",
+                            Some(sid),
+                            json!({
+                                "surface_ref": cys::surface_ref(sid),
+                                "from": cys::surface_ref(x.sid()),
+                                "from_verified": x.is_verified(),
+                                "reason": AbsorbMiss::ApprovalLive.as_str(),
+                                "ticket_age_ms": at.elapsed().as_millis() as u64,
+                                "reflex_ms": absorb_reflex.as_millis() as u64,
+                            }),
+                        );
+                        absorb = Some((verdict, issued));
+                    }
+                    _ => absorb = Some((verdict, issued)),
+                }
+            }
             // queued Return: 대상이 조용해질 때 배달자가 CR을 주입한다(빈 텍스트 Inject =
             // bracketed-paste 빈 본문 + CR). 타이핑 가드 에러가 "use --queued"를 안내하는데
             // send-key만 그 경로가 없던 CLI 비대칭이 노드 보고 채널을 막았다(2026-06-12 실측
             // — codex가 "unexpected argument '--queued'"에 부딪혀 Return 배달 불가).
             // Return/Enter 한정: 다른 키는 텍스트 큐(String)에 실을 수 없다.
-            if params
-                .get("queued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            if queued_param {
                 if !matches!(key.as_str(), "Return" | "Enter") {
                     return Reply::Single(err_response(
                         &id,
@@ -4764,18 +5452,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 daemon.persist_queue_state();
                 // ★(0.14.31 · 리뷰 R2 · codex major) `durable` 은 send_text queued 응답에만 있었다 —
                 //   같은 계약의 send-key queued 도 사실을 실어야 클라이언트가 내구 실패를 안다.
-                return Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id, "durable": daemon.queue_wal_durable()}),
-                ));
+                let mut result = json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
+                                        "queue_entry_id": entry.id, "durable": daemon.queue_wal_durable()});
+                // ★(0.14.42 · A2) 흡수를 요청했는데 흡수되지 않은 사실(사유)을 싣는다 — pair_return 요청 시만.
+                if let Some((verdict, _)) = absorb {
+                    result["absorbed"] = json!(false);
+                    if let AbsorbVerdict::Miss(why) = verdict {
+                        result["absorb_miss"] = json!(why.as_str());
+                    }
+                }
+                return Reply::Single(ok_response(&id, result));
             }
             // 권위 주입(send_text와 동일 근거)은 타이핑 가드를 면제 — launch-agent/reinject가
             // 디렉티브 주입 후 보내는 제출 Return이 사람-입력 잔향에 막히지 않게 한다.
-            let authoritative = params
-                .get("authoritative")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let authoritative = authoritative_param;
             let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
             if !exempt {
                 let guard = typing_guard_secs();
@@ -4840,11 +5530,68 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
             };
+            // ★(0.14.42 · A2) 게이트 안 흡수 재확인 대상 — 1차가 PassThrough(기계 본문 위)였던 요청만.
+            let mut absorb_recheck = match absorb {
+                Some((AbsorbVerdict::PassThrough, Some(at))) => caller_key.map(|x| (x, at)),
+                _ => None,
+            };
+            // ★(0.14.42 · A2-F1) 재확인의 승인 관측은 **게이트 밖 1회** — 게이트 안에서는 pending_input
+            //   leaf 만 잡는다(파서·feed·agent_meta 락 금지). 재확인 대상(PassThrough — 기계 본문 위 짝
+            //   Return)일 때만 관측한다. 화면 축의 관측 지연은 D-12 화면 축과 같은 구조적 한계(밖의 1회).
+            let recheck_approval_live =
+                absorb_recheck.is_some() && governance::seat_approval_live(daemon, &surface);
+            // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산 재료 — 게이트 안 `try_write` 직전 스냅샷(pending_input leaf).
+            let key_submits = key_bytes.iter().any(|b| matches!(b, b'\r' | b'\n'));
+            let mut settle_snapshot: Option<(u64, u64, Option<u64>)> = None;
+            let mut write_req = Some(write_req);
             // ★(0.14.31 · WP-5 · codex Q4) send_text 와 같은 임계영역 규약 — writer 인계와 계수
             //   갱신을 `input_gate` 하나로 묶는다(종전엔 락 없이 갱신해 큐 배달의 0 쓰기와 교차하면
             //   lost update 가 났다). 락 순서 계약: input_gate 안에서는 pending_input leaf 만 잡는다.
-            {
+            // ★(0.14.42 · A2) 이 블록은 최대 2회 돈다 — 게이트 안 재확인이 흡수로 바뀌면 게이트를 놓고
+            //   표를 CAS 로 꺼낸다(표 락은 단독 leaf 라 게이트 안에서 잡지 않는다). CAS 가 실패하면
+            //   (그 사이 형제 프로세스가 소비·재발급) 재확인 없이 게이트를 다시 잡고 종전 경로로 간다.
+            loop {
                 let _gate = surface.input_gate.lock().unwrap();
+                // ★(0.14.42 · A2) 게이트 안 재확인 — 1차 판정 뒤 쓰기 전에 pending 이 0 이 됐거나
+                //   (다른 Return·큐 Inject 가 줄을 비웠다) 사람 초안이 생겼으면, 이 Return 은 더는
+                //   기계 본문을 제출하지 않는다 = 이 경쟁 창의 맨 CR 도 흡수 대상이다.
+                //   ★검체 없음 고지: 1차와 **같은 순수 함수**라 결정론 검체로 구별되지 않는다(아래 D-12
+                //   2차 검사와 같은 형식 — 경합 시임 없이는 고정 불가). 지워도 스위트는 초록이다.
+                if let Some((x, at)) = absorb_recheck {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface
+                        .pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .human
+                        .min(pending);
+                    let age2 = at.elapsed();
+                    let v2 = return_absorb_verdict(
+                        absorb_ttl,
+                        pair_return,
+                        &key,
+                        authoritative_param,
+                        caller_key,
+                        Some(age2),
+                        false,
+                        pending,
+                        human,
+                    );
+                    // ★(A2-F1) 경쟁 창에서 줄이 비었어도 승인이 살아 있고 반사 창 밖이면 흡수하지 않는다.
+                    let v2 = narrow_absorb_for_approval(v2, Some(age2), absorb_reflex, || {
+                        recheck_approval_live
+                    });
+                    if v2 == AbsorbVerdict::Absorb {
+                        drop(_gate);
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            return Reply::Single(return_absorbed_response(
+                                daemon, &surface, &id, &key, x, &t,
+                            ));
+                        }
+                        absorb_recheck = None;
+                        continue;
+                    }
+                }
                 // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
                 // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
                 // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
@@ -4864,18 +5611,55 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 }
-                if let Some(err) = try_write(&surface, write_req, &id) {
+                if caller_key.is_some() {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface
+                        .pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .human
+                        .min(pending);
+                    settle_snapshot = Some((pending, human, surface.pending_owner()));
+                }
+                let req = write_req.take().expect("write_req 는 쓰기 직전 1회만 꺼낸다");
+                if let Some(err) = try_write(&surface, req, &id) {
                     return Reply::Single(err);
                 }
                 // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
                 //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
                 //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
                 surface.apply_pending_input(&key_bytes, crate::governance::InputOrigin::Machine);
+                break;
             }
-            Reply::Single(ok_response(
-                &id,
-                json!({"surface_id": sid, "key": key, "sent": true}),
-            ))
+            // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산(게이트 밖 · 표 락 단독 leaf). 효과: ① 비제출 키(Down·
+            //   숫자·C-u …)와 빈 줄·사람 초안 위 제출은 발신자 표를 소거한다 — 선택지 조작 뒤 Return 은
+            //   절대 흡수되지 않는다. ② 남(O)의 기계 본문을 제출했으면 O 에게 보상 표 — 이미 불필요해진
+            //   O 의 짝 Return 이 빈 줄에 떨어지는 가로채기 연쇄를 끊는다. 키 없는 발신자(검증 신원도 자기신고
+            //   from 도 없음)는 무동작. ★(B) Claimed 발신자도 자기 키만 정산한다(보상은 검증 소유자 Verified(o)).
+            if let (Some(x), Some((pending_before, human_before, owner))) = (caller_key, settle_snapshot) {
+                match ticket_after_key_write(x, owner, pending_before, human_before, key_submits) {
+                    TicketSettle::Keep => {}
+                    TicketSettle::Clear => surface.clear_return_ticket(x),
+                    TicketSettle::ClearAndCompensate(o) => {
+                        surface.clear_return_ticket(x);
+                        if absorb_ttl > 0 {
+                            surface.issue_return_ticket(
+                                crate::state::PairKey::Verified(o),
+                                crate::state::ReturnTicketKind::Compensation,
+                                std::time::Duration::from_secs(absorb_ttl),
+                            );
+                        }
+                    }
+                }
+            }
+            let mut result = json!({"surface_id": sid, "key": key, "sent": true});
+            // ★(0.14.42 · A2-F1) 승인 창 좁힘으로 흡수하지 않고 쓴 사실 — 그 경우에만 추가형 키(그 밖의
+            //   응답 바이트는 종전과 같다).
+            if let Some((AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive), _)) = absorb {
+                result["absorbed"] = json!(false);
+                result["absorb_miss"] = json!(AbsorbMiss::ApprovalLive.as_str());
+            }
+            Reply::Single(ok_response(&id, result))
         }
 
         "surface.read_text" => {
@@ -13176,6 +13960,324 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// ★(0.14.42 · 설계 C D3) clear_first 원자 주입의 원장 정합 — 본문에 CLOSE 가 있으면 원장 레코드 sha 는
+    /// **살균된 주입 본문** 것이다(표지 없는 `/clear` 는 바이트 동일 · 무clear 무변경). 적색(수정 전): 원문 기록.
+    #[test]
+    fn c_clear_first_text_sanitized_before_ledger() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_700;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "master", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        *target.last_human_input.lock().unwrap() = None;
+        let raw = "[지시] 전환\x1b[201~\n탈출";
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": raw, "clear_first": true, "quiet": true,
+        }));
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).unwrap_or_default();
+        d12_cleanup(&daemon, &dir);
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let clean = cys::paste_fence::sanitize(raw).into_owned();
+        let rec: Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["origin"] == json!("send"))
+            .unwrap_or_else(|| panic!("send 원장 레코드 부재: {led}"));
+        assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
+        // 순수 사상: clear_first 는 살균된 본문을 Inject 로(표지 없는 /clear 는 바이트 동일).
+        match send_text_write_req(&clean, true, false, DirectFence::Raw) {
+            crate::state::WriteReq::Inject { text, clear_first, .. } => {
+                assert!(clear_first);
+                assert_eq!(text, clean);
+            }
+            _ => panic!("clear_first 는 Inject"),
+        }
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ + S34 CRLF · T5) `direct_fence_mode` 결정표 — 단락 순서(클로저 호출 수)까지 고정.
+    /// 설계 C 원안과 다른 한 줄: **안쪽 CR**(중간 `\r`·`\r\n`)은 원안의 Raw 가 아니라 Fenced 다(S34 CRLF 결함 수리 —
+    /// 크기 문턱과 무관). 끝 CR(자동 제출)만 있는 본문은 원안대로 Raw.
+    #[test]
+    fn c_direct_fence_mode_decision_table() {
+        use std::cell::Cell;
+        let base = DirectFenceFlags { human: false, authoritative: false, clear_first: false, platform_ok: true };
+        let calls = Cell::new([0u32; 3]);
+        let bump = |i: usize| {
+            let mut c = calls.get();
+            c[i] += 1;
+            calls.set(c);
+        };
+        let mode = |t: &str, f: DirectFenceFlags, seat: bool, dis: bool, bp: bool| {
+            direct_fence_mode(t, f, || { bump(0); seat }, || { bump(1); dis }, || { bump(2); bp })
+        };
+        let m = |t: &str| mode(t, base, true, false, true);
+        use DirectFence::*;
+        let a = |n: usize| "a".repeat(n);
+        assert_eq!(m(&a(999)), Raw, "999B 문턱 아래");
+        assert_eq!(m(&a(1000)), Fenced, "1000B 경계");
+        assert_eq!(m(&"가".repeat(333)), Raw, "한글 333자 = 999B");
+        assert_eq!(m(&"가".repeat(334)), Fenced, "한글 334자 = 1002B");
+        let ml: String = (0..1200).map(|i| if i % 50 == 49 { '\n' } else { 'b' }).collect();
+        assert_eq!(m(&ml), Fenced, "1200B 여러 줄");
+        assert_eq!(m(&format!("{}\t{}", a(600), a(600))), Fenced, "탭 허용");
+        assert_eq!(m(&format!("{}\r", a(1200))), Raw, "끝 CR(자동 제출)만 — 원안대로 Raw");
+        assert_eq!(m(&format!("{}\r\n", a(1200))), Raw, "끝 CRLF 꼬리만 — Raw");
+        // ★S34 CRLF: 안쪽 CR 은 크기와 무관하게 Fenced.
+        assert_eq!(m("~C1~\r\n~C2~\r\n~C3~"), Fenced, "S34 CRLF 본문");
+        assert_eq!(m("a\rb"), Fenced, "안쪽 홑 CR");
+        assert_eq!(m("a\r\nb\r"), Fenced, "안쪽 CRLF + 끝 CR");
+        assert_eq!(m(&format!("{}\r{}", a(600), a(600))), Fenced, "큰 본문 안쪽 CR");
+        assert_eq!(m("text\r"), Raw, "짧은 자동 제출");
+        assert_eq!(m("text\n"), Raw, "짧은 끝 LF");
+        assert_eq!(m("짧은 본문"), Raw);
+        for bad in ["\x1b", "\u{0}", "\u{3}", "\u{15}", "\u{7f}", "\u{9b}"] {
+            assert_eq!(m(&format!("{}{bad}{}", a(600), a(600))), Raw, "제어 글자 {bad:?} → Raw");
+            assert_eq!(m(&format!("x\r\ny{bad}")), Raw, "안쪽 CR 이어도 제어 글자 {bad:?} → Raw");
+        }
+        assert_eq!(m(&format!("!{}", a(1200))), Raw, "bash 모드 접두");
+        assert_eq!(m(&format!("  !{}", a(1200))), Raw);
+        assert_eq!(m("!ls\r\npwd"), Raw, "안쪽 CR 이어도 ! 접두 → Raw");
+        for img in [".png", ".JPG", "shot.jpeg\"", ".webp  "] {
+            assert_eq!(m(&format!("{}{img}", a(1200))), Raw, "이미지 끝 {img:?}");
+        }
+        for ok in [".pngx", ".md"] {
+            assert_eq!(m(&format!("{}{ok}", a(1200))), Fenced, "{ok:?}");
+        }
+        // 단락 순서: 싼 플래그 실패 → 클로저 호출 0.
+        calls.set([0; 3]);
+        for f in [
+            DirectFenceFlags { human: true, ..base },
+            DirectFenceFlags { authoritative: true, ..base },
+            DirectFenceFlags { clear_first: true, ..base },
+            DirectFenceFlags { platform_ok: false, ..base },
+        ] {
+            assert_eq!(mode(&a(1200), f, true, false, true), Raw);
+        }
+        assert_eq!(mode(&a(10), base, true, false, true), Raw, "문턱 미달 · 안쪽 CR 없음");
+        assert_eq!(calls.get(), [0, 0, 0], "싼 조건 실패 시 클로저 호출 0");
+        assert_eq!(mode(&a(1200), base, false, false, true), Raw);
+        assert_eq!(calls.get(), [1, 0, 0], "좌석 실패 → disabled·bp 호출 0");
+        calls.set([0; 3]);
+        assert_eq!(mode(&a(1200), base, true, true, true), Raw);
+        assert_eq!(calls.get(), [1, 1, 0], "킬 스위치 → bp 호출 0");
+        calls.set([0; 3]);
+        assert_eq!(mode(&a(1200), base, true, false, false), Raw, "2004 꺼짐");
+        assert_eq!(calls.get(), [1, 1, 1]);
+        // 꼬리 분리.
+        assert_eq!(split_submit_tail("a\r\nb\r"), ("a\r\nb", "\r"));
+        assert_eq!(split_submit_tail("a\r\nb\n"), ("a\r\nb\n", ""), "CR 없는 끝 LF 는 본문");
+        assert_eq!(split_submit_tail("a\r\n"), ("a", "\r\n"));
+        assert_eq!(split_submit_tail(""), ("", ""));
+    }
+
+    /// ★(설계 C D5′ · T6) 쓰기 사상 — Raw → Program(원바이트) · Fenced → Program(봉투 + 꼬리) · clear_first → Inject ·
+    /// human_verified → Data(fence 무관). 직접 경로에서 Inject 는 clear_first 뿐이고 SubmitAfterGap 은 없다.
+    #[test]
+    fn c_send_text_write_req_fence_mapping() {
+        use crate::state::WriteReq;
+        let bytes = |r: WriteReq| match r {
+            WriteReq::Program(b) => ("program", b),
+            WriteReq::Data(b) => ("data", b),
+            WriteReq::Inject { text, .. } => ("inject", text.into_bytes()),
+            _ => ("other", Vec::new()),
+        };
+        assert_eq!(bytes(send_text_write_req("x\r\ny", false, false, DirectFence::Raw)), ("program", b"x\r\ny".to_vec()));
+        assert_eq!(
+            bytes(send_text_write_req("x\r\ny", false, false, DirectFence::Fenced)),
+            ("program", b"\x1b[200~x\r\ny\x1b[201~".to_vec())
+        );
+        assert_eq!(
+            bytes(send_text_write_req("x\r\ny\r", false, false, DirectFence::Fenced)),
+            ("program", b"\x1b[200~x\r\ny\x1b[201~\r".to_vec()),
+            "끝 CR 꼬리는 봉투 밖"
+        );
+        assert_eq!(bytes(send_text_write_req("h", false, true, DirectFence::Fenced)), ("data", b"h".to_vec()));
+        assert_eq!(bytes(send_text_write_req("/clear", true, false, DirectFence::Fenced)).0, "inject");
+    }
+
+    /// ★(설계 C D5′ · T7) 계수 정합 — `direct_fence_bytes` 로 `pending_input_step` 을 구동한다. Fenced 는 봉투 안 LF 를
+    /// 제출로 치지 않아 전량 계수(끝 LF 본문의 종전 과소계수 0 도 고친다) · Raw 는 마지막 LF 뒤 바이트 수.
+    #[test]
+    fn c_direct_fence_pending_accounting() {
+        use crate::governance::{pending_input_step, InputOrigin, PendingInputState};
+        let run = |b: &[u8]| {
+            pending_input_step(&PendingInputState::default(), b, InputOrigin::Machine, std::time::Instant::now()).count
+        };
+        let body: String = (0..1200).map(|i| if i % 100 == 99 { '\n' } else { 'c' }).collect();
+        assert_eq!(run(&direct_fence_bytes(&body, DirectFence::Fenced)), 1200, "봉투 안 LF 무리셋 — 전량");
+        assert_eq!(run(&direct_fence_bytes(&body, DirectFence::Raw)), 0, "Raw: 끝 LF 로 종전 계수 0(과소계수)");
+        let body2 = "a\nbbb";
+        assert_eq!(run(&direct_fence_bytes(body2, DirectFence::Raw)), 3, "Raw: 마지막 LF 뒤");
+        assert_eq!(run(&direct_fence_bytes("x\r\ny\r", DirectFence::Fenced)), 0, "끝 CR 꼬리 = 제출");
+        assert!(run(&direct_fence_bytes("x\r\ny", DirectFence::Fenced)) > 0, "안쪽 CR 은 봉투 안 — 미제출");
+    }
+
+    /// ★(설계 C D5′ · T8) 좌석 술어 — 실제 Surface. claude + agent_seen 만 참. 가드 재진입 데드락이 있으면 멈춘다.
+    #[test]
+    fn c_direct_fence_seat_ok_truth_table() {
+        let dir = std::env::temp_dir().join(format!("cys-c-seat-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("surface");
+        let set = |agent: Option<&str>, seen: bool, notified: bool, seat: u8| {
+            *s.agent_meta.lock().unwrap() = agent.map(|a| (a.to_string(), a.to_string()));
+            s.agent_seen.store(seen, Ordering::Relaxed);
+            s.agent_exit_notified.store(notified, Ordering::Relaxed);
+            s.seat_cache.store(seat, Ordering::Relaxed);
+        };
+        set(Some("claude"), true, false, 1);
+        assert!(direct_fence_seat_ok(&s), "claude + 생존 관측");
+        for (agent, seen, notified, seat, why) in [
+            (Some("codex"), true, false, 1u8, "codex"),
+            (Some("gemini"), true, false, 1, "gemini"),
+            (Some("grok"), true, false, 1, "grok"),
+            (None, true, false, 1, "meta 없음(셸)"),
+            (Some("claude"), false, false, 1, "생존 미관측"),
+            (Some("claude"), true, true, 1, "종료 통지"),
+            (Some("claude"), true, false, 2, "SEAT=Empty"),
+        ] {
+            set(agent, seen, notified, seat);
+            assert!(!direct_fence_seat_ok(&s), "{why}");
+        }
+        set(Some("claude"), true, false, 1);
+        s.exited.store(true, Ordering::Relaxed);
+        assert!(!direct_fence_seat_ok(&s), "exited");
+        let _ = s.child.lock().unwrap().kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ + S34 CRLF · T10) 직접 경로 울타리 — **실 PTY 행동** 검체(수정 전 적색).
+    /// 좌석 = 2004 를 켜고 raw 모드 `cat` 이 받은 바이트를 파일로 떨군다(claude 어댑터 · 에이전트 생존 관측).
+    ///   ⓐ 평문 1200B → 정확히 봉투(OPEN+본문+CLOSE) · 계수 = 봉투 안 본문 전량(LF 무리셋)
+    ///   ⓑ 60B → 원문(문턱) · ⓒ S34 CRLF 본문(짧아도) → 봉투(제출 1회 — 종전 CR 마다 제출 3개)
+    ///   ⓓ 안쪽 CRLF + 끝 CR(자동 제출) → OPEN 머리 CLOSE + 끝 CR · ⓔ 짧은 `본문\r` → 원문(종전 자동 제출)
+    ///   ⓕ 1200B + 끝 CR → 원문 · ⓖ human → 원문 · ⓗ `!` 접두 → 원문 · ⓘ codex 어댑터 → 원문
+    ///   ⓙ 킬 스위치 파일 → 원문 · ⓚ 뒤따르는 send_key Return → 봉투 뒤 CR 1개
+    #[test]
+    fn c_direct_fence_dispatch_behavior() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c-direct-fence", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_720;
+        let _sender = v7_pane(&daemon, "master", pid);
+        let out = dir.join("rx.bin");
+        let cmd = format!("printf '\\033[?2004h'; stty raw -echo; exec cat > '{}'", out.display());
+        let t = daemon
+            .create_surface(None, Some(cmd), None, Some("worker-1".into()), 24, 200)
+            .expect("surface");
+        daemon.surfaces.lock().unwrap().insert(t.id, t.clone());
+        *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        t.agent_seen.store(true, Ordering::Relaxed);
+        let wait = |secs: f64, f: &dyn Fn() -> bool| {
+            let dl = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+            while std::time::Instant::now() < dl {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            f()
+        };
+        assert!(wait(5.0, &|| out.exists() && t.parser.lock().unwrap().screen().bracketed_paste()), "좌석 준비(2004h)");
+        std::thread::sleep(std::time::Duration::from_millis(300)); // reader 가 모드를 반영할 여유
+        let flen = || std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let send = |text: &str, extra: Value| -> (Value, Vec<u8>) {
+            t.clear_pending_input();
+            *t.last_human_input.lock().unwrap() = None;
+            let off = flen();
+            let mut p = json!({"surface_id": t.id, "text": text, "queued": false, "quiet": true});
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            let resp = d12_rpc(&daemon, pid, "surface.send_text", p);
+            // 쓰기가 멈출 때까지(최대 3 s) 기다린다.
+            let mut last = off;
+            let mut stable = 0;
+            let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < dl {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let now = flen();
+                if now > off && now == last {
+                    stable += 1;
+                    if stable >= 5 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
+                last = now;
+            }
+            let all = std::fs::read(&out).unwrap_or_default();
+            (resp, all[off as usize..].to_vec())
+        };
+        let fence = |s: &str| format!("\x1b[200~{s}\x1b[201~").into_bytes();
+        let short = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b);
+            let n = t.chars().count();
+            let head: String = t.chars().take(40).collect();
+            let tail: String = t.chars().skip(n.saturating_sub(20)).collect();
+            format!("{n}자 {head:?}…{tail:?}")
+        };
+        macro_rules! eqb {
+            ($got:expr, $want:expr, $msg:expr) => {{
+                let (g, w): (Vec<u8>, Vec<u8>) = ($got.to_vec(), $want.to_vec());
+                assert!(g == w, "{}: got {} / want {}", $msg, short(&g), short(&w));
+            }};
+        }
+        let big: String = (0..1200).map(|i| if i % 100 == 99 { '\n' } else { 'a' }).collect();
+        // ⓐ
+        let (r, got) = send(&big, json!({}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        eqb!(got, fence(&big), "1200B 평문은 봉투");
+        assert_eq!(t.pending_input_bytes.load(Ordering::Relaxed), 1200, "봉투 안 LF 는 제출이 아니다 — 전량 계수");
+        // ⓑ
+        let (_, got) = send("짧은 본문 60바이트 이하", json!({}));
+        eqb!(got, "짧은 본문 60바이트 이하".as_bytes(), "문턱 아래는 원문");
+        // ⓒ S34 CRLF
+        let crlf = "M|r|H|B|0|1|0|~C1.1~\r\n~C2.1~\r\n~C3.1~";
+        let (_, got) = send(crlf, json!({}));
+        eqb!(got, fence(crlf), "안쪽 CR 본문은 봉투(제출 1회)");
+        // ⓓ 안쪽 CRLF + 끝 CR
+        let (_, got) = send("a\r\nb\r", json!({}));
+        eqb!(got, b"\x1b[200~a\r\nb\x1b[201~\r", "머리만 봉투 · 끝 CR 은 자동 제출");
+        assert_eq!(t.pending_input_bytes.load(Ordering::Relaxed), 0, "끝 CR 로 제출 — 계수 0");
+        // ⓔ 짧은 자동 제출
+        let (_, got) = send("text\r", json!({}));
+        eqb!(got, b"text\r", "짧은 자동 제출");
+        // ⓕ 1200B + 끝 CR
+        let big_cr = format!("{big}\r");
+        let (_, got) = send(&big_cr, json!({}));
+        eqb!(got, big_cr.as_bytes(), "본문+CR 은 종전 그대로");
+        // ⓖ human
+        let (_, got) = send(&big, json!({"human": true}));
+        eqb!(got, big.as_bytes(), "사람 경로는 원문");
+        // ⓗ '!' 접두
+        let bang = format!("!{}", &big[1..]);
+        let (_, got) = send(&bang, json!({}));
+        eqb!(got, bang.as_bytes(), "bash 모드 접두는 원문");
+        // ⓘ codex 어댑터
+        *t.agent_meta.lock().unwrap() = Some(("codex".into(), "codex".into()));
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, big.as_bytes(), "claude 외 어댑터는 원문");
+        *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        // ⓙ 킬 스위치 파일(데몬 상태 디렉터리 — 이 검체의 임시 디렉터리)
+        let off_file = crate::state::state_dir(&daemon.socket_path).join("direct-paste-fence-off");
+        std::fs::write(&off_file, b"").unwrap();
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, big.as_bytes(), "킬 스위치 파일이면 원문");
+        std::fs::remove_file(&off_file).unwrap();
+        // ⓚ 봉투 뒤 send_key Return
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, fence(&big), "봉투(Return 전)");
+        let off = flen();
+        let k = d12_rpc(&daemon, pid, "surface.send_key", json!({"surface_id": t.id, "key": "Return"}));
+        assert_eq!(k["ok"], json!(true), "{k}");
+        assert!(wait(3.0, &|| flen() > off), "Return 도달");
+        let all = std::fs::read(&out).unwrap_or_default();
+        assert_eq!(&all[off as usize..], b"\r", "봉투 뒤 CR 1개");
+        d12_cleanup(&daemon, &dir);
+    }
+
     #[test]
     fn d12_direct_send_text_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -13731,6 +14833,197 @@ mod tests {
         }
     }
 
+    // ── ★A2(0.14.42) 짝 Return 흡수 순수 판정 표 — RPC 검체는 return_absorb_tests.rs ──
+
+    /// `return_absorb_verdict` 전 분기. 게이트 안 재확인은 1차와 **같은 순수 함수**라 결정론 경합
+    /// 검체가 없다(D-12 2차 검사의 '검체 없음 고지'와 같은 형식) — 그 대신 이 표가 함수 자체를 고정한다.
+    #[test]
+    fn a2_return_absorb_verdict_table() {
+        use std::time::Duration;
+        let s = |x: u64| Duration::from_secs(x);
+        let young = Some(s(1));
+        // ★(B) 발신자 인자는 키(`PairKey`)다 — 표의 `Some(7)` = 검증 좌석 7. 등급과 무관하게 판정은 같다.
+        let v = |ttl, pair, key: &str, auth, from: Option<u64>, age, queued, pending, human| {
+            let caller = from.map(crate::state::PairKey::Verified);
+            let claimed = from.map(crate::state::PairKey::Claimed);
+            let a = return_absorb_verdict(ttl, pair, key, auth, caller, age, queued, pending, human);
+            assert_eq!(
+                a,
+                return_absorb_verdict(ttl, pair, key, auth, claimed, age, queued, pending, human),
+                "판정은 키 등급과 무관하다(등급은 표를 나누기만 한다)"
+            );
+            a
+        };
+        use AbsorbMiss::*;
+        use AbsorbVerdict::*;
+        assert_eq!(v(0, true, "Return", false, Some(7), young, false, 0, 0), Miss(Disabled));
+        assert_eq!(v(30, false, "Return", false, Some(7), young, false, 0, 0), Miss(NotPaired));
+        assert_eq!(v(30, true, "C-m", false, Some(7), young, false, 0, 0), Miss(NotSubmitKey));
+        assert_eq!(v(30, true, "Down", false, Some(7), young, false, 0, 0), Miss(NotSubmitKey));
+        assert_eq!(v(30, true, "Return", true, Some(7), young, false, 0, 0), Miss(Authoritative));
+        assert_eq!(v(30, true, "Return", false, None, young, false, 0, 0), Miss(Unverified));
+        assert_eq!(v(30, true, "Return", false, Some(7), None, false, 0, 0), Miss(NoTicket));
+        assert_eq!(v(30, true, "Return", false, Some(7), Some(s(30)), false, 0, 0), Miss(Expired));
+        assert_eq!(v(30, true, "Return", false, Some(7), Some(s(31)), true, 0, 0), Miss(Expired));
+        // 자격 있음 — queued 는 무조건 흡수(계수된 본문을 제출한 적이 없다 · RC2).
+        assert_eq!(v(30, true, "Return", false, Some(7), young, true, 9, 0), Absorb);
+        assert_eq!(v(30, true, "Enter", false, Some(7), young, true, 0, 0), Absorb);
+        // 기계 본문 위 = 누구 것이든 통과(구조 경로 보존 · 자기 본문 흡수 사고 차단).
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 5, 0), PassThrough);
+        // 빈 줄 · 사람 초안 위 = 흡수.
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 0, 0), Absorb);
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 5, 2), Absorb);
+    }
+
+    /// `ticket_after_key_write` 전 분기 — own keep / other compensate / 결측 clear / 비제출 키 clear /
+    /// 빈 줄 clear / 사람 초안 clear.
+    #[test]
+    fn a2_ticket_after_key_write_table() {
+        use crate::state::PairKey::{Claimed, Verified};
+        use TicketSettle::*;
+        assert_eq!(ticket_after_key_write(Verified(7), Some(7), 5, 0, true), Keep);
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 0, true), ClearAndCompensate(9));
+        assert_eq!(ticket_after_key_write(Verified(7), None, 5, 0, true), Clear, "소유자 결측은 값이 아니다");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 0, false), Clear, "비제출 키는 보상 없음");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(7), 5, 0, false), Clear, "비제출 키는 자기 표도 소거");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 0, 0, true), Clear, "빈 줄 제출은 남의 본문 제출 아님");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 2, true), Clear, "사람 초안 위 제출은 보상 없음");
+        // ★(B) 자기신고 발신자는 검증 소유자와 같을 수 없다 — 같은 번호라도 '남의 본문'(보상 = 검증 소유자).
+        assert_eq!(ticket_after_key_write(Claimed(7), Some(7), 5, 0, true), ClearAndCompensate(7));
+        assert_eq!(ticket_after_key_write(Claimed(7), None, 5, 0, true), Clear);
+        assert_eq!(ticket_after_key_write(Claimed(7), Some(9), 5, 0, false), Clear);
+    }
+
+    /// ★(0.14.42 · B2) 자기신고 from 해석·키 규칙 진리표(결측형 포함 — 결측은 값이 아니다).
+    /// `claimed_from_sid` 는 배달 원장의 종전 from 해석과 **같은 규칙**이어야 한다(치환 전 식을 여기 그대로 두고 대조).
+    #[test]
+    fn b_claimed_from_sid_and_pair_key_table() {
+        use crate::state::PairKey::{Claimed, Verified};
+        let legacy = |params: &Value| -> Option<u64> {
+            params
+                .get("from")
+                .and_then(|v| v.as_u64())
+                .or_else(|| params.get("from").and_then(|v| v.as_str()).and_then(|s| {
+                    s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
+                }))
+        };
+        let cases = [
+            (json!({}), None),
+            (json!({"from": null}), None),
+            (json!({"from": ""}), None),
+            (json!({"from": "inject(typing_guard fallback)"}), None),
+            (json!({"from": -3}), None),
+            (json!({"from": 1.5}), None),
+            (json!({"from": true}), None),
+            (json!({"from": "surface:"}), None),
+            (json!({"from": "surface:7"}), Some(7)),
+            (json!({"from": "7"}), Some(7)),
+            (json!({"from": 7}), Some(7)),
+            (json!({"from": 0}), Some(0)),
+        ];
+        for (p, want) in cases {
+            assert_eq!(claimed_from_sid(&p), want, "{p}");
+            assert_eq!(claimed_from_sid(&p), legacy(&p), "원장 종전 해석과 동일해야 한다: {p}");
+        }
+        // 키 규칙: 검증 신원이 있으면 그것만(클로저 호출 0) · 없을 때만 자기신고.
+        let calls = std::cell::Cell::new(0u32);
+        let claim = |v: Option<u64>| {
+            let c = &calls;
+            move || {
+                c.set(c.get() + 1);
+                v
+            }
+        };
+        assert_eq!(pair_key(Some(3), claim(Some(9))), Some(Verified(3)));
+        assert_eq!(calls.get(), 0, "검증 신원이 있으면 자기신고를 보지 않는다");
+        assert_eq!(pair_key(None, claim(Some(7))), Some(Claimed(7)));
+        assert_eq!(pair_key(None, claim(None)), None, "결측은 값이 아니다");
+        assert_eq!(calls.get(), 2);
+        assert_ne!(Verified(3), Claimed(3), "같은 번호라도 다른 키");
+        assert_eq!(Claimed(7).sid(), 7);
+        assert!(!Claimed(7).is_verified() && Verified(7).is_verified());
+    }
+
+    /// 프로덕션 구간 소스 핀: 흡수 판정은 ACL **뒤**·queued 팔 **앞**이고, 표 락은 input_gate 안에서
+    /// 잡지 않는다(단독 leaf 계약) — 재확인 흡수는 게이트를 놓은 **뒤** CAS 한다.
+    #[test]
+    fn a2_absorb_order_and_leaf_lock_source_pin() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let acl = arm.find("check_send_acl(daemon, caller_pid, &surface, &params)").expect("ACL");
+        let verdict = arm.find("let verdict = return_absorb_verdict(").expect("1차 판정");
+        let queued = arm.find("if queued_param {").expect("queued 팔");
+        let guard = arm.find("let guard = typing_guard_secs();").expect("타이핑 가드");
+        assert!(acl < verdict && verdict < queued && queued < guard, "순서: ACL → 흡수 판정 → queued 팔 → 타이핑 가드");
+        let recheck = arm.find("if v2 == AbsorbVerdict::Absorb {").expect("게이트 안 재확인");
+        let after = &arm[recheck..];
+        let drop_at = after.find("drop(_gate);").expect("게이트 해제");
+        let take_at = after.find("surface.take_return_ticket(x, at)").expect("CAS");
+        assert!(drop_at < take_at, "표 CAS 는 게이트를 놓은 뒤 — 표 락은 input_gate 안에서 잡지 않는다");
+    }
+
+    /// ★A2-F1 `narrow_absorb_for_approval` 전 분기 — 승인이 살아 있고 나이 ≥ 반사 창이면 Absorb → Miss.
+    /// 관측 클로저는 **Absorb ∧ 나이 ≥ 반사 창** 일 때만 불린다(반사 창 안 흡수는 화면·feed 무관측).
+    #[test]
+    fn a2f1_narrow_absorb_for_approval_table() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let reflex = ms(2000);
+        let calls = Cell::new(0u32);
+        let live = |v: bool| {
+            let c = &calls;
+            move || {
+                c.set(c.get() + 1);
+                v
+            }
+        };
+        use AbsorbMiss::*;
+        use AbsorbVerdict::*;
+        // 반사 창 밖 · 승인 살아 있음 → 쓴다(워커 hang 금지).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(5600)), reflex, live(true)), Miss(ApprovalLive));
+        // 경계: 나이 == 반사 창 은 밖이다.
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(2000)), reflex, live(true)), Miss(ApprovalLive));
+        // 반사 창 밖 · 승인 없음 → 종전 흡수(A2 범위 보존).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(5600)), reflex, live(false)), Absorb);
+        assert_eq!(calls.get(), 3);
+        // 반사 창 안 → 흡수 · 관측 0(성능 · 락 계약).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(1999)), reflex, live(true)), Absorb);
+        // Absorb 가 아닌 판정은 그대로 · 관측 0.
+        assert_eq!(narrow_absorb_for_approval(PassThrough, Some(ms(9000)), reflex, live(true)), PassThrough);
+        assert_eq!(narrow_absorb_for_approval(Miss(Expired), Some(ms(40_000)), reflex, live(true)), Miss(Expired));
+        assert_eq!(narrow_absorb_for_approval(Miss(NoTicket), None, reflex, live(true)), Miss(NoTicket));
+        // 표 나이 결측은 값이 아니다 — Absorb 라도 좁히지 않는다(Absorb 는 표가 있어야만 나온다 · 방어).
+        assert_eq!(narrow_absorb_for_approval(Absorb, None, reflex, live(true)), Absorb);
+        assert_eq!(calls.get(), 3, "반사 창 안·비흡수·결측은 관측하지 않는다");
+        // 반사 창 0 = 승인이 살아 있으면 갓 발급된 표도 좁힌다.
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(0)), ms(0), live(true)), Miss(ApprovalLive));
+        assert_eq!(AbsorbMiss::ApprovalLive.as_str(), "approval_live");
+    }
+
+    /// ★A2-F1 소스 핀 — 좁힘은 **1차 판정과 게이트 안 재확인 둘 다**에 걸린다(한쪽만이면 경쟁 창의 승인
+    /// Return 이 삼켜진다). 재확인용 승인 관측은 `input_gate` 를 잡기 **전**에 1회 — 게이트 안에서는
+    /// pending_input leaf 만 잡는다는 락 계약(파서·feed·agent_meta 락 금지).
+    #[test]
+    fn a2f1_narrowing_on_both_verdicts_and_observed_outside_gate_source_pin() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let first = arm.find("let verdict = return_absorb_verdict(").expect("1차 판정");
+        let narrow1 = arm.find("let verdict = narrow_absorb_for_approval(").expect("1차 좁힘");
+        let obs = arm.find("let recheck_approval_live =").expect("재확인 승인 관측(게이트 밖)");
+        let gate = arm.find("let _gate = surface.input_gate.lock().unwrap();").expect("게이트");
+        let v2 = arm.find("let v2 = return_absorb_verdict(").expect("재확인 판정");
+        let narrow2 = arm.find("let v2 = narrow_absorb_for_approval(").expect("재확인 좁힘");
+        assert!(first < narrow1, "1차: 판정 → 좁힘");
+        assert!(obs < gate && gate < v2 && v2 < narrow2, "재확인: 관측(게이트 밖) → 게이트 → 판정 → 좁힘");
+        let in_gate = &arm[gate..narrow2];
+        assert!(!in_gate.contains("seat_approval_live("), "게이트 안에서 승인 관측 금지(락 계약)");
+    }
+
     #[test]
     fn d12_send_key_return_passes_after_own_direct_send() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -14068,7 +15361,7 @@ mod tests {
         use crate::state::WriteReq;
 
         // ① 사람이 친 키(operator token 검증 통과) → Data. 기준점을 찍지 않는다.
-        match send_text_write_req("hello", false, true) {
+        match send_text_write_req("hello", false, true, DirectFence::Raw) {
             WriteReq::Data(b) => assert_eq!(b, b"hello".to_vec(), "사람 경로 바이트가 변형됐다"),
             other => panic!(
                 "human_verified 인데 Data 가 아니다 — 사람 타이핑 뒤 Enter 까지 늦어진다 ({})",
@@ -14076,7 +15369,7 @@ mod tests {
             ),
         }
         // ② 프로그램 주입 → Program. 바이트는 ① 과 동일해야 한다(변형 금지).
-        match send_text_write_req("hello", false, false) {
+        match send_text_write_req("hello", false, false, DirectFence::Raw) {
             WriteReq::Program(b) => assert_eq!(b, b"hello".to_vec(), "프로그램 경로 바이트가 변형됐다"),
             other => panic!(
                 "프로그램 주입인데 Program 이 아니다 — 최소 간격 기준점이 안 찍힌다 ({})",
@@ -14085,7 +15378,7 @@ mod tests {
         }
         // ③ clear_first 는 human 여부와 무관하게 원자 Inject(종전 동작 불변 · cr_delay 400).
         for human_verified in [false, true] {
-            match send_text_write_req("hi", true, human_verified) {
+            match send_text_write_req("hi", true, human_verified, DirectFence::Fenced) {
                 WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
                     assert_eq!(text, "hi");
                     assert_eq!(cr_delay_ms, 400, "큐/원자 주입의 CR 지연 규약이 바뀌었다");
@@ -14097,7 +15390,7 @@ mod tests {
         // ④ send_text 는 어떤 조합에서도 SubmitAfterGap 을 만들지 않는다(제출 키 전용 변형).
         for (cf, hv) in [(false, false), (false, true), (true, false), (true, true)] {
             assert!(
-                !matches!(send_text_write_req("x", cf, hv), WriteReq::SubmitAfterGap { .. }),
+                !matches!(send_text_write_req("x", cf, hv, DirectFence::Raw), WriteReq::SubmitAfterGap { .. }),
                 "send_text 가 SubmitAfterGap 을 만들었다(clear_first={cf}, human_verified={hv}) — \
                  본문에 제출 간격이 붙으면 본문 자체가 늦게 들어간다"
             );
@@ -14826,6 +16119,41 @@ mod tests {
             raw.contains(prefix.trim_end()),
             "원장에 남은 승계 고지에 주석 접두가 없다 — pane 에 들어간 줄도 명령이 된다: {raw}"
         );
+    }
+
+    /// ★(0.14.42 · 설계 H6) 승계 고지 1줄 보강 — 구 좌석에 미제출 입력(`pending_input_bytes>0`)이 있으면 pane 줄
+    /// (원장 + 주입)을 생략하고 `role.takeover{pane_notice}` 로 사실만 남긴다. `seat_claimable` 은 사람 입력 30s 만 보고
+    /// 계수는 보지 않아서, 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고 CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#`
+    /// 은 주석이 아니다). RED(HEAD): 주입(원장 1).
+    #[test]
+    fn h6_takeover_notice_skipped_on_pending_input() {
+        let daemon = isolated_daemon();
+        let takeover_ev = |d: &Arc<Daemon>, sid: u64| -> Value {
+            d.bus
+                .tail(100)
+                .into_iter()
+                .rev()
+                .find(|e| e["name"] == json!("role.takeover") && e["payload"]["prev_surface"] == json!(sid))
+                .expect("role.takeover 이벤트 부재")
+        };
+        // ① 미제출 입력 5바이트 — pane 줄 생략 · 이벤트는 유지.
+        let sid = make_surface(&daemon, None);
+        daemon.get_surface(sid).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
+        announce_seat_takeover(&daemon, sid, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 0, "초안 위에 승계 고지를 주입했다");
+        assert_eq!(takeover_ev(&daemon, sid)["payload"]["pane_notice"], json!("skipped_pending_input"));
+        // ② 계수 0 — 종전 그대로 고지(문안·cr 120 무변경은 seat_takeover_notice_reaches_… 가 잰다).
+        let sid2 = make_surface(&daemon, None);
+        announce_seat_takeover(&daemon, sid2, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 1);
+        assert_eq!(takeover_ev(&daemon, sid2)["payload"]["pane_notice"], json!("sent"));
+        // ③ 노브에서 takeover 를 빼면 HEAD 동작(계수와 무관하게 주입 · pane_notice 키 없음).
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,ceo,supervisor")]);
+        let sid3 = make_surface(&daemon, None);
+        daemon.get_surface(sid3).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
+        announce_seat_takeover(&daemon, sid3, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 2);
+        assert!(takeover_ev(&daemon, sid3)["payload"].get("pane_notice").is_none(), "HEAD 이벤트에 키가 붙었다");
     }
 
     /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
@@ -20344,6 +21672,322 @@ mod tests {
         );
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.42 · 설계 C D3 · T12) CEO 주입 원장 정합 — 발행자가 통제하는 title·body(inert 데이터 칸)에
+    /// CLOSE 가 있으면 원장 레코드 sha 가 **살균된 주입 본문**의 sha 와 같고 원문 sha 와 다르다(표지가 원장·
+    /// 주입 어디에도 남지 않는다). 적색(수정 전): 원장에 원문(표지 포함)이 기록됐다.
+    #[test]
+    fn c_ceo_injection_sanitized_before_ledger() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-c-ceo-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::delivery::tests::isolate_state_dir_for_thread("c-ceo");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let ceo = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed);
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+        let item = crate::state::FeedItem {
+            request_id: "c12".into(),
+            kind: "approval".into(),
+            title: "t\x1b[201~탈출".into(),
+            body: "b\u{9b}201~x\ny".into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        };
+        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Delivered));
+        let _ = ceo.child.lock().unwrap().kill();
+        let raw = build_ceo_injection(&item, false);
+        let clean = cys::paste_fence::sanitize(&raw).into_owned();
+        assert_ne!(raw, clean, "전제: 원문에 표지가 있다");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).expect("원장");
+        let rec: Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["origin"] == json!("feed"))
+            .unwrap_or_else(|| panic!("feed 원장 레코드 부재: {led}"));
+        assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ═══════════ ★(0.14.42 · 설계 H4) CEO 자동결재: 하드축 → 즉시 escalation(큐 미사용) ═══════════
+
+    fn h4_rig(tag: &str, cmd: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-h4-{tag}-{}-{}-{n}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let ceo = daemon
+            .create_surface(None, Some(cmd.into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed); // Occupied
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+        (daemon, ceo)
+    }
+
+    fn h4_item(rid: &str, title: &str, body: &str) -> crate::state::FeedItem {
+        crate::state::FeedItem {
+            request_id: rid.into(),
+            kind: "permission".into(),
+            title: title.into(),
+            body: body.into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        }
+    }
+
+    fn h4_events(d: &Arc<Daemon>, name: &str) -> Vec<Value> {
+        d.bus.tail(300).into_iter().filter(|ev| ev["name"] == json!(name)).collect()
+    }
+
+    /// [H4] CEO 좌석에 모달·화면 초안·kill-switch(ⓓ)·사이클(quiescing)이 양성 관측되면 주입하지 않고 즉시 사람에게
+    /// 넘긴다(approval.stalled{reason}) — 요청자 대기가 120s 라 큐 보류는 곧 조용한 만료다. RED(HEAD): 주입.
+    #[test]
+    fn h4_ceo_hard_axes_escalate() {
+        let (d, ceo) = h4_rig("h4-axes", "sleep 30");
+        let cases: [(&str, &str); 4] = [
+            ("ceo_seat_modal", "modal"),
+            ("ceo_seat_draft", "draft"),
+            ("delivery_frozen", "pause"),
+            ("ceo_seat_cycling", "quiescing"),
+        ];
+        for (i, (reason, how)) in cases.iter().enumerate() {
+            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+            match *how {
+                "modal" => crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT),
+                "draft" => crate::governance::h_paint(&ceo, crate::governance::H_DRAFT_SCREEN),
+                "pause" => d.paused.store(true, Ordering::Relaxed),
+                _ => {
+                    *ceo.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+                        state: "quiescing".into(),
+                        context_pct: None,
+                        task: None,
+                        updated_at: crate::state::now_epoch(),
+                    })
+                }
+            }
+            let item = h4_item(&format!("h4-{i}"), &format!("RSI 학습 추천 h4 {i}"), "x");
+            route_auto_approval(&d, &item, false);
+            d.paused.store(false, Ordering::Relaxed);
+            *ceo.agent_status.lock().unwrap() = None;
+            let stalled: Vec<Value> = h4_events(&d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(item.request_id))
+                .collect();
+            assert_eq!(stalled.len(), 1, "{how}: escalation 이 없다(주입했다)");
+            assert_eq!(stalled[0]["payload"]["reason"], json!(reason), "{how}");
+        }
+        assert!(h4_events(&d, "feed.auto_routed").is_empty(), "하드축 좌석에 자동 라우팅했다");
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 0, "하드축 좌석에 주입(원장)했다");
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// [H4 핀] busy CEO 에는 종전대로 즉시 주입한다(턴 경계까지 미루면 120s 만료가 곧 escalation).
+    #[test]
+    fn h4_ceo_busy_injects() {
+        let (d, ceo) = h4_rig("h4-busy", "sleep 30");
+        crate::governance::h_paint(&ceo, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
+        let item = h4_item("h4-busy", "RSI 학습 추천 busy", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 1);
+        assert_eq!(h4_events(&d, "feed.auto_routed").len(), 1);
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 F2) 0.1s 간격 AutoEligible 결재 2건 — 둘째 건이 **첫 건의 붙여넣기**(본문 → 500ms → CR)를 초안으로
+    /// 오인해 사람에게 escalation 되면 안 된다(멱등 키가 판정 전에 기록돼 30s 재발행도 억제 = 되돌릴 수 없다).
+    /// writer 는 단일 소비자라 둘째 붙여넣기는 첫 CR 뒤에 쓰인다(섞이지 않는다). 화면은 composer 에 첫 건 글자가
+    /// 보이는 상태를 그린다. 음성 대조: 붙여넣기 창·settle 이 지난 뒤 같은 화면 초안은 종전대로 escalation.
+    /// RED(HEAD): 둘째 건 approval.stalled{ceo_seat_draft}.
+    #[test]
+    fn h4_burst_second_approval_not_held_by_own_paste() {
+        let (d, ceo) = h4_rig("h4-burst", "sleep 30");
+        let own_paste = "● 작업 로그 한 줄\n────────────────────\n❯ [cys 결재 요청] RSI 학습 추천 burstA";
+        let stalled_for = |d: &Arc<Daemon>, rid: &str| -> Vec<Value> {
+            h4_events(d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(rid))
+                .collect()
+        };
+        let a = h4_item("h4-burst-a", "RSI 학습 추천 burstA", "x");
+        let b = h4_item("h4-burst-b", "RSI 학습 추천 burstB", "y");
+        route_auto_approval(&d, &a, false);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        crate::governance::h_paint(&ceo, own_paste);
+        route_auto_approval(&d, &b, false);
+        assert!(stalled_for(&d, "h4-burst-b").is_empty(), "둘째 결재가 첫 건 붙여넣기에 걸려 사람에게 갔다(F2)");
+        assert_eq!(h4_events(&d, "feed.auto_routed").len(), 2, "두 결재 모두 CEO 로");
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 2);
+        // 음성 대조 — 두 arm(각 500ms)과 settle 이 지난 뒤의 화면 초안은 종전대로 사람에게.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 500 + 600));
+        crate::governance::h_paint(&ceo, own_paste);
+        let c = h4_item("h4-burst-c", "RSI 학습 추천 burstC", "z");
+        route_auto_approval(&d, &c, false);
+        let sc = stalled_for(&d, "h4-burst-c");
+        assert_eq!(sc.len(), 1, "settle 뒤 화면 초안을 놓쳤다");
+        assert_eq!(sc[0]["payload"]["reason"], json!("ceo_seat_draft"));
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) CEO 좌석 입력줄에 **좌석 밖** 발신자의 Return 누락 잔여 — 부서장→CEO 소켓
+    /// master(CEO_TEMPLATE:33 · 자기신고 from = Claimed)·익명 CLI(from 없음) — 가 있어도 AutoEligible 결재는 CEO 로 간다
+    /// (pre-H 처럼 잔여 뒤에 병합 제출). 종전에는 매 결재가 ceo_seat_draft 로 사람에게 갔다. 음성 대조: GUI 모양 삽입(오너
+    /// 클릭 · human + machine_origin + 오너 토큰)은 종전대로 escalation. RED(HEAD f1b1a7e8): approval.stalled{ceo_seat_draft}.
+    #[test]
+    fn h4_cross_socket_residue_routes_to_ceo() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, ceo) = h4_rig("h4-xsock", "sleep 30");
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let stalled_for = |d: &Arc<Daemon>, rid: &str| -> Vec<Value> {
+            h4_events(d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(rid))
+                .collect()
+        };
+        let leave = |body: &str, extra: Value| {
+            ceo.clear_pending_input();
+            *ceo.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, ceo.id, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *ceo.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&ceo, &crate::governance::h_residue_screen(body));
+        };
+        for (i, (label, extra)) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))].into_iter().enumerate() {
+            leave(&format!("[부서A] REPORT {label} residue"), extra);
+            let item = h4_item(&format!("h4-xsock-{i}"), &format!("RSI 학습 추천 xsock {label}"), "x");
+            route_auto_approval(&d, &item, false);
+            assert!(
+                stalled_for(&d, &item.request_id).is_empty(),
+                "{label}: 좌석 밖 발신자의 잔여에 걸려 결재가 사람에게 갔다(ceo_seat_draft)"
+            );
+            assert_eq!(h4_events(&d, "feed.auto_routed").len(), i + 1, "{label}: CEO 로 가지 않았다");
+            // 붙여넣기 창(본문 → 500ms → CR) + settle 이 지나도록 기다린다(다음 판정이 우리 붙여넣기로 면제되지 않게).
+            std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 700));
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 2);
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = 종전대로 escalation.
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        let item = h4_item("h4-xsock-gui", "RSI 학습 추천 xsock gui", "x");
+        route_auto_approval(&d, &item, false);
+        let sc = stalled_for(&d, "h4-xsock-gui");
+        assert_eq!(sc.len(), 1, "GUI 삽입을 기계 잔여로 봤다(주입했다)");
+        assert_eq!(sc[0]["payload"]["reason"], json!("ceo_seat_draft"));
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// [순수 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED] `residue_owner` 진리표 — 검증 신원 우선(종전 규칙 · human·토큰과 무관),
+    /// 검증 신원이 없으면 GUI 경로(human ∨ machine_origin ∨ 오너 토큰)는 각인 없음, 그 밖 CLI 는 자기신고 from → Claimed ·
+    /// 결측 → Unattributed. 검증 신원이 있으면 클로저를 부르지 않는다(토큰·from 을 보지 않는다 — 로컬 좌석은 무엇을
+    /// 자기신고해도 Verified).
+    #[test]
+    fn residue_owner_truth_table() {
+        use crate::governance::InputOwner as O;
+        let never_tok = || -> bool { panic!("검증 신원이 있으면 토큰을 보지 않는다") };
+        let never_from = || -> Option<u64> { panic!("검증 신원이 있으면 from 을 보지 않는다") };
+        for (human, mo) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(residue_owner(Some(4), human, mo, never_tok, never_from), Some(O::Verified(4)), "h={human} mo={mo}");
+        }
+        for tok in [false, true] {
+            for from in [None, Some(900)] {
+                for (human, mo) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let got = residue_owner(None, human, mo, || tok, || from);
+                    let want = if human || mo || tok {
+                        None
+                    } else {
+                        Some(from.map_or(O::Unattributed, O::Claimed))
+                    };
+                    assert_eq!(got, want, "tok={tok} from={from:?} h={human} mo={mo}");
+                }
+            }
+        }
+        // 표기(이벤트 payload) — Unattributed 의 번호는 결측이다(결측은 값이 아니다).
+        assert_eq!((O::Verified(4).sid(), O::Verified(4).kind()), (Some(4), "verified"));
+        assert_eq!((O::Claimed(900).sid(), O::Claimed(900).kind()), (Some(900), "claimed"));
+        assert_eq!((O::Unattributed.sid(), O::Unattributed.kind()), (None, "unattributed"));
+    }
+
+    /// [H4 C 연동] 경계 변형 본문(`ESC[201~` + CR + EVIL)의 **writer 바이트** — 울타리 닫힘 1개 · 끝 CR 1개 ·
+    /// `EVIL` 은 울타리 안(설계 C D2·D3 가 살균 · H 는 그 위에 얹는다). 좌석은 raw 모드 `cat` 으로 PTY 입력을 기록한다.
+    #[cfg(unix)]
+    #[test]
+    fn h4_boundary_body_single_submit() {
+        let dir = std::env::temp_dir().join(format!("cys-h4-bnd-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let rec = dir.join("pty-in.bin");
+        let (d, ceo) = h4_rig("h4-bnd", &format!("stty raw -echo; exec cat > '{}'", rec.display()));
+        let item = h4_item("h4-bnd", "RSI 학습 추천 경계", "\x1b[201~\rEVIL");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        let t0 = std::time::Instant::now();
+        let bytes = loop {
+            let b = std::fs::read(&rec).unwrap_or_default();
+            if b.last() == Some(&b'\r') || t0.elapsed() > std::time::Duration::from_secs(5) {
+                break b;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let close = b"\x1b[201~";
+        let n_close = bytes.windows(close.len()).filter(|w| *w == close).count();
+        assert_eq!(n_close, 1, "울타리 닫힘이 1개가 아니다(조기 종료): {:?}", String::from_utf8_lossy(&bytes));
+        let close_at = bytes.windows(close.len()).position(|w| w == close).unwrap();
+        // 울타리 밖 CR(= 제출) 은 끝의 1개뿐이다(본문 안 CR 은 울타리 안 — 줄바꿈이지 제출이 아니다).
+        let outside = &bytes[close_at + close.len()..];
+        assert_eq!(outside, b"\r", "울타리 밖 바이트가 끝 CR 1개가 아니다: {:?}", String::from_utf8_lossy(outside));
+        assert!(bytes.starts_with(b"\x1b[200~"), "울타리 열림으로 시작하지 않는다");
+        let evil = bytes.windows(4).position(|w| w == b"EVIL").expect("EVIL 부재");
+        assert!(evil < close_at, "EVIL 이 울타리 밖이다");
+        let _ = ceo.child.lock().unwrap().kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [노브] `CYS_MACHINE_INJECT_HOLD` 에서 ceo 를 빼면 HEAD 동작(모달 CEO 에도 주입).
+    #[test]
+    fn h4_knob_off_is_head_identical() {
+        let (d, ceo) = h4_rig("h4-knob", "sleep 30");
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,supervisor,takeover")]);
+        crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let item = h4_item("h4-knob", "RSI 학습 추천 knob", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered), "노브로 끈 CEO 가 보류했다");
+        let _ = ceo.child.lock().unwrap().kill();
     }
 
     /// 정상(Delivered): CEO 좌석 점유(agent+seat=occupied) → auto-eligible 즉시 배달(feed.auto_routed)

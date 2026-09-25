@@ -34,6 +34,9 @@ pub mod license;
 pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
+/// 괄호 붙여넣기 울타리 살균·봉투(0.14.42 · 설계 C D1) — 본문 안 `ESC[201~`(C1 형 포함)·끝 미완성
+/// 이스케이프가 봉투를 조기에 닫는 결함의 단일 정의처(cysd 주입 writer·큐 다이제스트·CLI inject_text 공용).
+pub mod paste_fence;
 /// 프로필 인증 전제 판정기(U-17) — "이 프로필로 좌석을 만들면 로그인 관문 앞에 서는가".
 /// 시드(U-19)는 로그인 화면을 **지우므로** 판정이 시드보다 먼저 있어야 한다. 판정은 순수함수
 /// 하나(`profile_gate::classify`)가 소유하고, `auth_class` 8값 중 `unknown` 은 **통과가 아니다**.

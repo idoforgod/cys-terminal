@@ -42,7 +42,31 @@ fn channel_retain_secs() -> f64 {
 const LOOP_WINDOW_SECS: f64 = 60.0;
 const LOOP_LIMIT: u64 = 20;
 /// inbox un-acked 재배달 TTL(초) — injected 후 10분 미-ack면 재주입(§2.2).
+/// ★(0.14.42 · 설계 H3) 재배달 자체는 기본 **꺼짐**이다([`redeliver_max`] = 0 · 메시지 1건 = 주입 1회).
+/// ack 는 배선된 호출자가 CLI 하나뿐이고 팩은 0 이라, 종전 계약(at-least-once)은 실제로 10분마다 끝없는
+/// 재주입이었다(① 재주입 스톰). 노브로 켜면 이 TTL 이 재배달 간격이다.
 const INBOX_REDELIVER_TTL_SECS: f64 = 600.0;
+/// ★(0.14.42 · 설계 H3) 재배달 상한(회) — `CYS_CHANNEL_REDELIVER_MAX` · 기본 0(재배달 없음). 계수는 기존
+/// `redelivered INTEGER` 열이다(스키마 변경 0 · 구 데몬은 이 값을 플래그로 읽는다 — 봉투 표기에만 쓴다).
+fn redeliver_max() -> i64 {
+    crate::governance::h_knob("CYS_CHANNEL_REDELIVER_MAX")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0)
+}
+/// ★(0.14.42 · 설계 H3) 재배달 대상의 접수 나이 상한(초) — `CYS_CHANNEL_REDELIVER_MAX_AGE_SECS` · 기본 3600.
+fn redeliver_max_age_secs() -> f64 {
+    crate::governance::h_knob("CYS_CHANNEL_REDELIVER_MAX_AGE_SECS")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(3600.0)
+}
+/// ★(0.14.42 · 설계 H3) 이 나이(초) 이상 늦게 주입되는 행은 봉투에 지연 표기를 붙인다(미만은 byte-identical).
+const INBOX_LAG_MARK_SECS: f64 = 600.0;
+/// ★(0.14.42 · 설계 H3) 장기 보류 가시화 주기(초) — 가장 오래된 new 행의 나이가 이 배수 경계를 넘는 sweep 에서 1건.
+const INBOX_STALLED_EVERY_SECS: f64 = 600.0;
+/// ★(0.14.42 · 설계 H3) inbox 상태 기록 실패 이벤트 쿨다운(초).
+const INBOX_WRITE_FAILED_COOLDOWN_SECS: f64 = 300.0;
 /// 브리지 사망 후 재스폰 기본 백오프(초) — 1회성 사망의 즉시 회생 속도.
 const RESPAWN_BACKOFF_SECS: f64 = 5.0;
 /// ★재스폰 최소 생존 임계(초) — 스폰 **성공** 후 이 시간을 못 채우고 죽은 브리지는 '성공'이
@@ -374,7 +398,40 @@ fn sanitize_inbound_text(s: &str) -> String {
 }
 
 /// 봉투 문자열: `[CH:<channel>|<sender>|<HH:MM>|#<inbox_id>] <text>` (+재배달 표기).
+/// ★(0.14.42 · 설계 H3) 배달 경로는 [`envelope_at`] 을 쓴다 — 이 판(지연 표기 없음 = 종전 봉투)은 살균·봉투 계약
+/// 검체와 '600s 미만 byte-identical' 대조의 기준이다(`redeliver_due` 와 같은 계약 문서화 선례).
+#[allow(dead_code)]
 fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bool, text: &str) -> String {
+    envelope_at(channel, sender, ts, inbox_id, redelivered, text, None)
+}
+
+/// ★(0.14.42 · 설계 H3) 지연 표기(순수) — 주입 시각 − 접수 시각 ≥ [`INBOX_LAG_MARK_SECS`] 이면
+/// ` (지연 N분 · 접수 MM-DD HH:MM)`. 봉투의 `%H:%M` 만으로는 어제 지시가 방금 온 것처럼 읽힌다.
+fn inbox_lag_mark(created_ts: f64, now: f64) -> Option<String> {
+    use chrono::TimeZone;
+    let lag = now - created_ts;
+    if !(lag >= INBOX_LAG_MARK_SECS) {
+        return None; // 미만·NaN 은 표기 없음(byte-identical)
+    }
+    let mins = (lag / 60.0).floor();
+    let at = chrono::Local
+        .timestamp_opt(created_ts as i64, 0)
+        .single()
+        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "--".into());
+    Some(format!(" (지연 {mins}분 · 접수 {at})"))
+}
+
+/// 봉투 + (주입 시각 `lag_now` 가 있으면) 지연 표기. `lag_now = None` 은 종전 봉투 그대로다.
+fn envelope_at(
+    channel: &str,
+    sender: &str,
+    ts: f64,
+    inbox_id: i64,
+    redelivered: bool,
+    text: &str,
+    lag_now: Option<f64>,
+) -> String {
     // C1: 채널에서 온 미신뢰 text·channel·sender를 봉투에 넣기 직전 동일 불변식으로 살균한다
     // (ESC/C0/C1/LS/PS 유입 0). text만 살균하고 channel·sender는 미살균이면 같은 봉투에
     // 제어시퀀스가 보간되는 경계 붕괴가 난다(LOW-1 감사). sender는 char 단위 truncate 전에 살균한다.
@@ -396,7 +453,8 @@ fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bo
             .unwrap_or_else(|| "--:--".into())
     };
     let mark = if redelivered { " (재배달)" } else { "" };
-    format!("[CH:{channel}|{short}|{hhmm}|#{inbox_id}]{mark} {text}")
+    let lag = lag_now.and_then(|now| inbox_lag_mark(ts, now)).unwrap_or_default();
+    format!("[CH:{channel}|{short}|{hhmm}|#{inbox_id}]{mark}{lag} {text}")
 }
 
 fn p_str(params: &Value, key: &str) -> Option<String> {
@@ -1177,15 +1235,17 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
     }
 
     // 즉시 배달 시도(master 가용+비-quiescing이면 주입, 아니면 queued 유지).
-    let delivered = deliver_new_inbox(daemon, conn);
-    let action = if delivered.contains(&inbox_id) { "delivered" } else { "queued" };
+    let res = deliver_new_inbox_with(daemon, conn);
+    let action = if res.delivered.contains(&inbox_id) { "delivered" } else { "queued" };
     let evt = if action == "delivered" { "channel.message" } else { "channel.message.queued" };
-    daemon.bus.publish(
-        evt,
-        "channel",
-        None,
-        json!({"channel": channel, "inbox_id": inbox_id, "sender_id": sender_id}),
-    );
+    let mut payload = json!({"channel": channel, "inbox_id": inbox_id, "sender_id": sender_id});
+    // ★(0.14.42 · 설계 H3) 보류 사유(가산 키) — 모달·초안·사람 입력·셸 단독·master 부재 등.
+    if action == "queued" {
+        if let (Some(h), Some(obj)) = (res.hold, payload.as_object_mut()) {
+            obj.insert("hold_reason".into(), json!(h.reason()));
+        }
+    }
+    daemon.bus.publish(evt, "channel", None, payload);
     ok_response(id, json!({"action": action, "inbox_id": inbox_id}))
 }
 
@@ -1438,23 +1498,125 @@ fn deliverable_master(daemon: &Arc<Daemon>) -> Option<u64> {
     Some(sid)
 }
 
-/// master stdin에 봉투를 주입(bracketed paste + Return). schedule.rs inject와 동형.
-/// MED-3: `try_send` **직전에** paused·exited·quiescing을 재확인한다. 루프 상단 게이트
-/// (deliverable_master)는 최초 판정일 뿐이라, 매 주입 직전 재확인으로 mid-loop quiescing set
-/// (cycle-agent가 /clear 진입 직전 quiescing을 set하는 창)을 봉합한다(잔여 나노초 창은 self-heal —
-/// 배달 불가면 false 반환→호출부 break로 남은 행은 queued 유지). deliverable_master(daemon)==Some(sid)로
-/// sid 일치까지 확인해 master surface가 루프 중 교체된 경우도 방어한다.
-fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
-    if deliverable_master(daemon) != Some(sid) {
-        return false; // 주입 직전 재확인 실패(paused/exited/quiescing/surface 교체) → 보류(queued).
+/// ★(0.14.42 · 설계 H3) inbox 배달이 멈춘 사유 — 행은 `new` 로 남는다(영속 보류 버퍼 · 15s sweep 재시도 · FIFO 보존).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxHold {
+    /// master 부재·pause·quiescing(종전 무기한)·exited·루프 중 교체 — `deliverable_master` 재확인 실패.
+    Unavailable,
+    /// 양성 관측된 하드축(셸 단독·사람 입력 30s·모달·화면 초안) 또는 판정 불능(`ProbeFailed` — 보류 방향).
+    Gate(crate::governance::MachineHold),
+    /// 상태 기록(UPDATE)이 실패했다 — 주입하지 않는다(기록 선행 · 재주입 루프 차단).
+    WriteFailed,
+    /// writer 채널 포화·닫힘 — 기록을 되돌리고 멈춘다.
+    WriterBusy,
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 배달 간격 — 이 루프가 이미 1행을 주입했거나, master 좌석 writer 가 데몬
+    /// Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐다. 다음 행은 간격 뒤 **새 판정**으로 나간다
+    /// (후속 배달 루프 [`schedule_paced_followup`] · 없으면 15s sweep).
+    Paced,
+}
+
+impl InboxHold {
+    fn reason(self) -> &'static str {
+        match self {
+            InboxHold::Unavailable => "master_unavailable",
+            InboxHold::Gate(h) => h.axis(),
+            InboxHold::WriteFailed => "write_failed",
+            InboxHold::WriterBusy => "writer_busy",
+            InboxHold::Paced => "paced",
+        }
     }
-    let Some(surface) = daemon.get_surface(sid) else {
-        return false;
+}
+
+/// ★(0.14.42 · 설계 H3) 채널이 보는 하드축 — pause·quiescing 은 `deliverable_master` 가 종전대로(무기한) 본다.
+/// busy(작업 중)는 막지 않는다(원격 steer · C0 p95<10s). 사람 입력 창은 큐 게이트와 같은 값(기본 30s).
+///
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 초안 축은 **행마다** 본다. 83d67185 는 같은 루프 두 번째 행부터 초안 축을
+/// 뺐다(우리 자신의 붙여넣기에 걸려 1행/15s 로 새던 현상 · 드릴 D4). 그 대신 한 루프가 보류 행 전부를 µs 간격으로
+/// 판정해 writer 에 쏟았고, k번째 행의 판정→CR 이 k×(붙여넣기+500ms)로 낡았다(앞 행이 띄운 창에 뒤 행 CR — S41 HG1).
+/// 이제 한 루프는 1행만 주입하고([`deliver_new_inbox_with`] 간격), 자기 붙여넣기는 H0 의 기계 소유 귀속
+/// (`governance::draft_machine_owned` — writer Inject 진행 표식)이 초안에서 뺀다 — 생산자 공통 규칙이다.
+fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
+    crate::governance::MachineHoldAxes {
+        shell: true,
+        human: true,
+        modal: true,
+        draft: true,
+        human_window_secs: crate::governance::queue_human_quiet_secs(),
+        ..crate::governance::MachineHoldAxes::NONE
+    }
+}
+
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 채널 행 사이 최소 간격(ms) — master 좌석 writer 의 **마지막 데몬 Inject 가
+/// 끝난(CR 기록) 뒤** 이만큼 지나야 다음 행을 판정한다. 앞 행을 받은 에이전트가 권한·질문 창을 띄울 틈을 판정 앞에
+/// 둔다(판정은 그 뒤 화면을 본다). 20행 백로그 ≈ 20×(붙여넣기+500ms+1s) ≈ 30s(종전 1행/15s 스로틀 ≈ 5분 ·
+/// 83d67185 의 일괄 ≈ 10s). 판정→CR 500ms 창(직접 주입 공통 잔여)은 행마다 남는다.
+const CHANNEL_ROW_GAP_MS: u64 = 1000;
+
+/// master 좌석 writer 가 데몬 Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐는가(자기·타 생산자 무관).
+fn master_inject_settling(surface: &crate::state::Surface) -> bool {
+    surface
+        .inject_track
+        .busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS))
+}
+
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격으로 멈춘 배달의 **후속 루프 1회**를 예약한다 — 데몬(소켓)당 대기 중
+/// 예약은 최대 1개(중복 예약 무시). 후속 루프도 같은 판정·간격을 거치므로 행마다 새로 판정되고, 남은 행이 있으면
+/// 다시 예약한다(행이 유한하므로 유계 · 보류(하드축)면 예약하지 않고 15s sweep 이 이어받는다). tokio 런타임 밖
+/// (동기 검체)에서는 예약하지 않는다(sweep 이 이어받는다 = 종전 동작 방향).
+fn schedule_paced_followup(daemon: &Arc<Daemon>) {
+    static ARMED: OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
     };
+    let key = daemon.socket_path.clone();
+    {
+        let mut g = ARMED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if !g.insert(key.clone()) {
+            return;
+        }
+    }
+    let d = Arc::clone(daemon);
+    rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS / 2)).await;
+        ARMED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        // 부서 데몬도 인바운드 즉시 시도(ingest)와 같은 배달만 한다 — sweep 의 재배달·재스폰은 돌리지 않는다.
+        let mut guard = d.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = guard.as_mut() {
+            let _ = deliver_new_inbox_with(&d, conn);
+        }
+    });
+}
+
+/// ★(0.14.42 · 설계 H3) **주입 직전 재확인**(MED-3 봉합 유지 · 행마다) — `deliverable_master(daemon)==Some(sid)`
+/// (paused·exited·quiescing·surface 교체) 뒤 공용 하드축 판정. 보류면 행을 `new` 로 두고 멈춘다(FIFO).
+/// 판정 패닉(`ProbeFailed`)도 보류다(채널의 실패 방향 = 지연 · `channel.message.stalled` 로 보인다).
+/// 노브 `CYS_MACHINE_INJECT_HOLD` 에서 channel 을 빼면 종전 재확인만 한다.
+fn master_hold(daemon: &Arc<Daemon>, sid: u64) -> Result<Arc<crate::state::Surface>, InboxHold> {
+    if deliverable_master(daemon) != Some(sid) {
+        return Err(InboxHold::Unavailable);
+    }
+    let surface = daemon.get_surface(sid).ok_or(InboxHold::Unavailable)?;
+    if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel) {
+        let axes = channel_hold_axes();
+        if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
+            return Err(InboxHold::Gate(h));
+        }
+    }
+    Ok(surface)
+}
+
+/// master stdin에 봉투를 주입(bracketed paste + Return). schedule.rs inject와 동형.
+/// ★(0.14.42 · 설계 H3) 판정([`master_hold`])과 상태 기록은 호출부가 **먼저** 끝낸 뒤 부른다 — 이 함수는
+/// 원장 선기록(delivery.rs 불변식 ①)과 writer 인계만 한다. 반환 = 인계 성공.
+fn inject_master_confirmed(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Surface>, envelope: &str) -> bool {
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
     crate::delivery::record_audited(
         daemon,
-        sid,
+        surface.id,
         envelope,
         crate::delivery::Origin::Channel,
         None,
@@ -1465,22 +1627,71 @@ fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
             text: envelope.to_string(),
             cr_delay_ms: 500,
             clear_first: false,
-            guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+            guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작 · 판정은 master_hold 가 앞에서 했다)
         })
         .is_ok()
 }
 
+/// ★(0.14.42 · 설계 H3) 상태 기록 실패 통지 — 데몬(소켓)별 쿨다운 [`INBOX_WRITE_FAILED_COOLDOWN_SECS`].
+/// 실패 방향 = 보류(주입하지 않는다). 디스크가 회복되면 다음 sweep 이 그대로 배달한다.
+fn note_inbox_write_failed(daemon: &Arc<Daemon>, inbox_id: i64, detail: String) {
+    static LAST: OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, f64>>> = OnceLock::new();
+    let now = now();
+    {
+        let mut g = LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let key = daemon.socket_path.clone();
+        if g.get(&key).is_some_and(|t| now - *t < INBOX_WRITE_FAILED_COOLDOWN_SECS) {
+            return;
+        }
+        g.insert(key, now);
+    }
+    daemon.bus.publish(
+        "channel.inbox.write_failed",
+        "channel",
+        None,
+        json!({"inbox_id": inbox_id, "detail": detail,
+               "note": "inbox 상태 기록이 실패해 주입하지 않았다(기록 선행 — 재주입 루프 차단). 행은 new 로 남아 \
+                        다음 sweep 에서 다시 시도한다"}),
+    );
+}
+
+/// ★(0.14.42 · 설계 H3) 장기 보류 가시화 판정(순수·상태 없음) — 가장 오래된 new 행의 나이가
+/// [`INBOX_STALLED_EVERY_SECS`] 배수 경계를 넘은 **첫 sweep** 에서만 참(`age % 600 < sweep 간격`) = 10분에 1건.
+fn inbox_stalled_due(age_secs: f64, sweep_interval_secs: f64) -> bool {
+    age_secs >= INBOX_STALLED_EVERY_SECS && (age_secs % INBOX_STALLED_EVERY_SECS) < sweep_interval_secs
+}
+
+/// 배달 결과 — 배달된 inbox_id 들과 멈춘 사유(있으면).
+#[derive(Default)]
+struct InboxDelivery {
+    delivered: Vec<i64>,
+    hold: Option<InboxHold>,
+}
+
 /// state=new inbox 항목을 단조 id 순서로 배달(master 가용+비-quiescing일 때만). 배달된 inbox_id들 반환.
 fn deliver_new_inbox(daemon: &Arc<Daemon>, conn: &Connection) -> Vec<i64> {
-    let mut delivered = Vec::new();
+    deliver_new_inbox_with(daemon, conn).delivered
+}
+
+/// ★(0.14.42 · 설계 H3) 행마다 ① 하드축 재확인 → ② **상태 기록 선행**(`UPDATE … WHERE state='new'` 영향 1행일 때만)
+/// → ③ 주입. 종전(주입 → `let _ = UPDATE`)은 UPDATE 가 실패하면 행이 new 로 남아 15s sweep 마다 재주입했다.
+/// 기록 실패 = 주입 안 함(보류) · 인계 실패 = 기록을 되돌리고(최선노력) 멈춘다.
+///
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) **루프당 1행** — ⓪ 이 루프가 이미 1행을 주입했거나 master writer 가 데몬
+/// Inject 를 쓰는 중·끝난 지 [`CHANNEL_ROW_GAP_MS`] 안이면 `Paced` 로 멈추고 후속 루프를 예약한다. 그래서 k번째 행의
+/// 판정은 앞 행 CR + 간격 **뒤**의 화면을 본다(종전: 1번 행 쓰기 전 µs 간격 판정 · writer 에 백로그 일괄 인계).
+/// 노브에서 channel 을 빼면 간격도 없다(HEAD 동작).
+fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDelivery {
+    let mut out = InboxDelivery::default();
     let Some(sid) = deliverable_master(daemon) else {
-        return delivered; // master 부재/quiescing → 적재만(queued).
+        out.hold = Some(InboxHold::Unavailable);
+        return out; // master 부재/quiescing → 적재만(queued).
     };
     let rows: Vec<(i64, String, String, f64)> = {
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, channel, sender_id, created_ts FROM inbox WHERE state='new' ORDER BY id",
         ) else {
-            return delivered;
+            return out;
         };
         let mapped = stmt.query_map([], |r| {
             Ok((
@@ -1492,65 +1703,168 @@ fn deliver_new_inbox(daemon: &Arc<Daemon>, conn: &Connection) -> Vec<i64> {
         });
         match mapped {
             Ok(m) => m.flatten().collect(),
-            Err(_) => return delivered,
+            Err(_) => return out,
         }
     };
+    let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     for (inbox_id, channel, sender_id, created_ts) in rows {
+        // ⓪ 간격(루프당 1행 · 앞 Inject 의 붙여넣기~CR + 간격 뒤에만 판정) — 노브 on 일 때만.
+        if lag_on
+            && (!out.delivered.is_empty()
+                || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s)))
+        {
+            out.hold = Some(InboxHold::Paced);
+            break;
+        }
+        // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달·초안 봉합).
+        let surface = match master_hold(daemon, sid) {
+            Ok(s) => s,
+            Err(h) => {
+                out.hold = Some(h);
+                break; // 행은 new — 다음 sweep 에서 재시도(순서 보존).
+            }
+        };
         let text: String = conn
             .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
             .unwrap_or_default();
-        let env = envelope(&channel, &sender_id, created_ts, inbox_id, false, &text);
-        if inject_master(daemon, sid, &env) {
-            let _ = conn.execute(
-                "UPDATE inbox SET state='injected', injected_ts=?2 WHERE id=?1",
-                params![inbox_id, now()],
-            );
-            delivered.push(inbox_id);
+        let now = now();
+        // ② 기록 선행 — 영향 행이 정확히 1 이 아니면 주입하지 않는다.
+        match conn.execute(
+            "UPDATE inbox SET state='injected', injected_ts=?2 WHERE id=?1 AND state='new'",
+            params![inbox_id, now],
+        ) {
+            Ok(1) => {}
+            other => {
+                note_inbox_write_failed(daemon, inbox_id, format!("{other:?}"));
+                out.hold = Some(InboxHold::WriteFailed);
+                break;
+            }
+        }
+        let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, false, &text, lag_on.then_some(now));
+        // ③ 주입.
+        if inject_master_confirmed(daemon, &surface, &env) {
+            out.delivered.push(inbox_id);
         } else {
+            // 인계 실패(채널 정체) — 기록을 되돌린다(최선노력). 되돌림까지 실패하는 이중 결함이면 그 행은
+            // injected 로 남는다(재배달 기본 0 이라 재주입되지 않는다 · 잔여 · 원장에 선기록은 남는다).
+            let _ = conn.execute(
+                "UPDATE inbox SET state='new', injected_ts=NULL WHERE id=?1 AND state='injected'",
+                [inbox_id],
+            );
+            out.hold = Some(InboxHold::WriterBusy);
             break; // 주입 채널 정체 — 다음 sweep에서 재시도(순서 보존).
         }
     }
-    delivered
+    if out.hold == Some(InboxHold::Paced) {
+        schedule_paced_followup(daemon);
+    }
+    out
 }
 
 /// un-acked 재배달 sweep(§2.2): injected 후 TTL 초과 미-ack 항목을 재주입(`(재배달)` 표기).
+/// ★(0.14.42 · 설계 H3) 기본 **꺼짐**([`redeliver_max`] = 0). 켜면 `redelivered < N ∧ 접수 < MAX_AGE` 행만,
+/// 같은 순서(하드축 재확인 → 기록 선행(redelivered+1) → 주입)로 한다. 보류면 멈춘다.
 fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
+    let max = redeliver_max();
+    if max <= 0 {
+        return 0;
+    }
     let Some(sid) = deliverable_master(daemon) else {
         return 0;
     };
     let now = now();
-    let rows: Vec<(i64, String, String, f64)> = conn
+    let rows: Vec<(i64, String, String, f64, i64, f64)> = conn
         .prepare(
-            "SELECT id, channel, sender_id, created_ts FROM inbox
-             WHERE state='injected' AND injected_ts IS NOT NULL AND (?1 - injected_ts) >= ?2 ORDER BY id",
+            "SELECT id, channel, sender_id, created_ts, redelivered, injected_ts FROM inbox
+             WHERE state='injected' AND injected_ts IS NOT NULL AND (?1 - injected_ts) >= ?2
+               AND redelivered < ?3 AND (?1 - created_ts) < ?4 ORDER BY id",
         )
         .and_then(|mut stmt| {
-            stmt.query_map(params![now, INBOX_REDELIVER_TTL_SECS], |r| {
+            stmt.query_map(params![now, INBOX_REDELIVER_TTL_SECS, max, redeliver_max_age_secs()], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     r.get::<_, f64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, f64>(5)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap_or_default();
+    let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     let mut n = 0;
-    for (inbox_id, channel, sender_id, created_ts) in rows {
+    for (inbox_id, channel, sender_id, created_ts, redelivered, injected_ts) in rows {
+        // ★(리뷰 F1-H3-batch-flush-stale-verdict) 신규 배달과 같은 간격(루프당 1행 · 앞 Inject + 간격 뒤) — 노브 on 일 때만.
+        //   재배달은 sweep(15s)마다 1행씩 나간다(기본 꺼짐 노브 · 후속 루프는 예약하지 않는다).
+        if lag_on && (n > 0 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s))) {
+            break;
+        }
+        let Ok(surface) = master_hold(daemon, sid) else {
+            break;
+        };
         let text: String = conn
             .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
             .unwrap_or_default();
-        let env = envelope(&channel, &sender_id, created_ts, inbox_id, true, &text);
-        if inject_master(daemon, sid, &env) {
-            let _ = conn.execute(
-                "UPDATE inbox SET injected_ts=?2, redelivered=1 WHERE id=?1",
-                params![inbox_id, now],
-            );
+        match conn.execute(
+            "UPDATE inbox SET injected_ts=?2, redelivered=redelivered+1
+             WHERE id=?1 AND state='injected' AND redelivered=?3",
+            params![inbox_id, now, redelivered],
+        ) {
+            Ok(1) => {}
+            other => {
+                note_inbox_write_failed(daemon, inbox_id, format!("{other:?}"));
+                break;
+            }
+        }
+        let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, true, &text, lag_on.then_some(now));
+        if inject_master_confirmed(daemon, &surface, &env) {
             n += 1;
+        } else {
+            let _ = conn.execute(
+                "UPDATE inbox SET injected_ts=?2, redelivered=?3 WHERE id=?1",
+                params![inbox_id, injected_ts, redelivered],
+            );
+            break;
         }
     }
     n
+}
+
+/// ★(0.14.42 · 설계 H3) 보류된 sweep 의 장기 보류 가시화 — 가장 오래된 new 행 기준(상태 없음 · 10분에 1건).
+/// kill-switch pause 는 의도된 동결이라 내지 않는다.
+fn note_inbox_stalled(daemon: &Arc<Daemon>, conn: &Connection, hold: InboxHold, now: f64) {
+    if daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let oldest: Option<(i64, f64)> = conn
+        .query_row(
+            "SELECT id, created_ts FROM inbox WHERE state='new' ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((inbox_id, created_ts)) = oldest else {
+        return;
+    };
+    let age = now - created_ts;
+    if !inbox_stalled_due(age, SWEEP_INTERVAL_SECS as f64) {
+        return;
+    }
+    let pending: i64 = conn
+        .query_row("SELECT COUNT(*) FROM inbox WHERE state='new'", [], |r| r.get(0))
+        .unwrap_or(0);
+    daemon.bus.publish(
+        "channel.message.stalled",
+        "channel",
+        None,
+        json!({"inbox_id": inbox_id, "age_secs": age.round(), "reason": hold.reason(), "pending": pending,
+               "note": "오너 채널 지시가 master 좌석의 하드축(모달·초안·사람 입력·셸 단독·사이클 등) 때문에 보류 중이다 \
+                        — 축이 풀리면 순서대로 나간다(원격으로 치울 수단은 없다)"}),
+    );
 }
 
 // ── channel.ack ──────────────────────────────────────────────────────────────
@@ -2172,7 +2486,10 @@ fn sweep_once(daemon: &Arc<Daemon>) {
     prune_loopwin(conn, now);
     prune_retention(conn, now, channel_retain_secs()); // M5: 종결 원장 보존기간 프룬.
     // new 배달 → un-acked 재배달(순서: 신규 우선, 그 다음 재배달).
-    deliver_new_inbox(daemon, conn);
+    let res = deliver_new_inbox_with(daemon, conn);
+    if let Some(h) = res.hold {
+        note_inbox_stalled(daemon, conn, h, now);
+    }
     redeliver_unacked(daemon, conn);
     respawn_dead_bridges(daemon, conn);
 }
@@ -2915,21 +3232,36 @@ mod tests {
         crate::governance::kill_group_or_pid(pid as u32, pid as i32);
     }
 
+    /// ★(0.14.42 · 설계 H3 · C0 §2.2 계약 변경 — 재핀) 종전 핀 `inbox_delivered_then_redelivered_when_unacked`
+    /// 는 "injected 뒤 10분 미-ack 면 재주입" 을 박았다. ack 는 배선된 호출자가 CLI 하나뿐이고 팩은 0 이라 실제로는
+    /// **10분마다 끝없이** 재주입했다(① 재주입 스톰). 이제 기본은 재배달 0(메시지 1건 = 주입 1회)이고, 노브
+    /// `CYS_CHANNEL_REDELIVER_MAX=N` 이면 N 회 · 접수 1h(`CYS_CHANNEL_REDELIVER_MAX_AGE_SECS`) 안에서만 재배달한다.
+    /// 계수는 기존 `redelivered INTEGER` 열을 쓴다(스키마 변경 0).
     #[cfg(unix)]
     #[test]
-    fn inbox_delivered_then_redelivered_when_unacked() {
+    fn inbox_redelivery_off_by_default_capped_when_enabled() {
         let d = tmp_daemon("redeliver");
         seed_registered(&d, "slack", "t");
         call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
         // 비-quiescing master surface(agent_status None → quiescing 아님).
         let surface = d
-            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .create_surface(None, Some("stty -echo; exec sleep 30".into()), None, Some("master".into()), 24, 80)
             .expect("surface");
         d.roles.lock().unwrap().insert("master".into(), surface.id);
         // 인바운드 → 즉시 배달(delivered·state=injected).
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
         assert_eq!(r["result"]["action"], json!("delivered"), "master 가용 시 즉시 배달: {r}");
         let inbox_id = r["result"]["inbox_id"].as_i64().unwrap();
+        let age_injected = |conn: &Connection, secs: f64| {
+            conn.execute(
+                "UPDATE inbox SET injected_ts=?2 WHERE id=?1",
+                params![inbox_id, now() - secs],
+            )
+            .unwrap();
+        };
+        let redel = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT redelivered FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0)).unwrap()
+        };
         {
             let g = d.channels.lock().unwrap();
             let conn = g.as_ref().unwrap();
@@ -2937,18 +3269,33 @@ mod tests {
                 .query_row("SELECT state FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
                 .unwrap();
             assert_eq!(st, "injected");
-            // injected_ts를 TTL 초과 과거로 → 재배달 sweep 대상.
+            // ① 기본(노브 없음) — 700s·7200s 가 지나도 재배달 0.
+            for secs in [INBOX_REDELIVER_TTL_SECS + 100.0, 7200.0] {
+                age_injected(conn, secs);
+                assert_eq!(redeliver_unacked(&d, conn), 0, "기본 재배달이 살아 있다({secs}s)");
+            }
+            assert_eq!(redel(conn), 0);
+            // ② 노브 2 — 두 번까지 재배달하고 세 번째는 0. 계수는 redelivered 열.
+            let _k = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
+            // ★(리뷰 F1-H3) 재배달도 간격(앞 Inject + CHANNEL_ROW_GAP_MS)을 지킨다 — 앞 주입의 붙여넣기~CR 뒤를 기다린다.
+            let gap = || std::thread::sleep(std::time::Duration::from_millis(500 + CHANNEL_ROW_GAP_MS + 400));
+            for want in [1, 2] {
+                gap();
+                age_injected(conn, INBOX_REDELIVER_TTL_SECS + 10.0);
+                assert_eq!(redeliver_unacked(&d, conn), 1, "노브 2 인데 {want}회차 재배달이 없다");
+                assert_eq!(redel(conn), want, "재배달 계수");
+            }
+            gap();
+            age_injected(conn, INBOX_REDELIVER_TTL_SECS + 10.0);
+            assert_eq!(redeliver_unacked(&d, conn), 0, "상한 2 를 넘어 재배달했다");
+            // ③ 접수 1h 를 넘긴 항목은 계수가 남아도 재배달하지 않는다.
             conn.execute(
-                "UPDATE inbox SET injected_ts=?2 WHERE id=?1",
-                params![inbox_id, now() - INBOX_REDELIVER_TTL_SECS - 10.0],
+                "INSERT INTO inbox(channel, sender_id, text, state, redelivered, created_ts, injected_ts)
+                 VALUES('slack','U1','old','injected',0,?1,?2)",
+                params![now() - 3700.0, now() - INBOX_REDELIVER_TTL_SECS - 10.0],
             )
             .unwrap();
-            let n = redeliver_unacked(&d, conn);
-            assert_eq!(n, 1, "TTL 초과 un-acked 항목이 재배달돼야 한다");
-            let redel: i64 = conn
-                .query_row("SELECT redelivered FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
-                .unwrap();
-            assert_eq!(redel, 1, "재배달 표기(redelivered=1)");
+            assert_eq!(redeliver_unacked(&d, conn), 0, "접수 1h 초과 항목을 재배달했다");
         }
         // 정리: master surface의 sleep 30 회수.
         let _ = crate::governance::close_surface(&d, surface.id, crate::governance::CloseCause::Reap);
@@ -3035,7 +3382,8 @@ mod tests {
         d.roles.lock().unwrap().insert("master".into(), sid);
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
-        assert!(inject_master(&d, sid, "[test] hi"), "비-quiescing master엔 주입 성공");
+        let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
+        assert!(inject_master_confirmed(&d, &s1, "[test] hi"), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "quiescing".into(),
@@ -3044,7 +3392,11 @@ mod tests {
             updated_at: now(),
         });
         assert_eq!(deliverable_master(&d), None, "quiescing master는 배달 불가");
-        assert!(!inject_master(&d, sid, "[test] hi2"), "quiescing surface엔 주입 보류(false)");
+        assert_eq!(
+            master_hold(&d, sid).err(),
+            Some(InboxHold::Unavailable),
+            "quiescing surface엔 주입 직전 재확인이 보류를 돌려준다(주입 0)"
+        );
         let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
     }
 
@@ -3654,5 +4006,439 @@ mod tests {
         let r = call(&d, "inbound", interaction_params("slack", "U1", "feedOTHER", &nonce, "allow"), own_pid());
         assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
         assert_eq!(r["result"]["reason"], json!("nonce_feed_mismatch"), "타 feed 결박 nonce는 mismatch");
+    }
+
+    // ═══════════ ★(0.14.42 · 설계 H3) 채널 inbox → master: 하드축 보류 · 기록 선행 · 재배달 기본 0 · 지연 표기 ═══════════
+
+    #[cfg(unix)]
+    fn h3_rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let d = tmp_daemon(tag);
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let m = h3_master(&d);
+        (d, m)
+    }
+
+    /// 에코 없는 master 좌석(주입 본문이 화면을 더럽히지 않게) — claude 마커 · 유휴 composer.
+    #[cfg(unix)]
+    fn h3_master(d: &Arc<Daemon>) -> Arc<crate::state::Surface> {
+        let m = d
+            .create_surface(None, Some("stty -echo; exec sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("master");
+        d.roles.lock().unwrap().insert("master".into(), m.id);
+        *m.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        m
+    }
+
+    #[cfg(unix)]
+    fn h3_state(d: &Arc<Daemon>, id: i64) -> String {
+        let g = d.channels.lock().unwrap();
+        g.as_ref()
+            .unwrap()
+            .query_row("SELECT state FROM inbox WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn h3_queued_reason(d: &Arc<Daemon>, id: i64) -> Option<String> {
+        d.bus
+            .tail(200)
+            .into_iter()
+            .find(|ev| ev["name"] == "channel.message.queued" && ev["payload"]["inbox_id"] == json!(id))
+            .and_then(|ev| ev["payload"]["hold_reason"].as_str().map(str::to_string))
+    }
+
+    #[cfg(unix)]
+    fn h3_seed(d: &Arc<Daemon>, text: &str, created_ts: f64) -> i64 {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        conn.execute(
+            "INSERT INTO inbox(channel, sender_id, text, state, created_ts) VALUES('slack','U1',?1,'new',?2)",
+            params![text, created_ts],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[cfg(unix)]
+    fn h3_done(m: &Arc<crate::state::Surface>) {
+        let _ = m.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격(루프당 1행 · 앞 Inject + [`CHANNEL_ROW_GAP_MS`])을 지키며 배달
+    /// 루프를 돌아 `want` 행이 나갈 때까지 기다린다(상한 20s) — 나간 순서를 돌려준다. 동기 검체라 후속 루프 예약은
+    /// 없고(런타임 밖) 여기서 루프를 다시 부른다. 루프당 1행 상한을 매번 단언한다.
+    #[cfg(unix)]
+    fn h3_drain(d: &Arc<Daemon>, want: usize) -> Vec<i64> {
+        let mut got = Vec::new();
+        let t0 = std::time::Instant::now();
+        while got.len() < want && t0.elapsed() < std::time::Duration::from_secs(20) {
+            let r = {
+                let mut g = d.channels.lock().unwrap();
+                deliver_new_inbox_with(d, g.as_mut().unwrap())
+            };
+            assert!(r.delivered.len() <= 1, "루프당 1행 상한 위반: {:?}", r.delivered);
+            got.extend(r.delivered);
+            if got.len() < want {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        got
+    }
+
+    /// [H3] master 좌석에 모달·화면 초안·사람 입력(30s 안)이 양성 관측되면 inbox 행을 new 로 두고 주입하지 않는다
+    /// (행 = 영속 보류 버퍼 · 15s sweep 재시도). 인바운드 즉시 시도의 `channel.message.queued` 에 hold_reason 가산.
+    /// RED(HEAD): 즉시 injected.
+    #[cfg(unix)]
+    #[test]
+    fn h3_modal_draft_human_master_holds_row_new() {
+        let (d, m) = h3_rig("h3-hold");
+        let cases: [(&str, &str); 3] = [
+            ("modal", cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT),
+            ("draft", crate::governance::H_DRAFT_SCREEN),
+            ("human", crate::governance::H_IDLE_SCREEN),
+        ];
+        for (i, (reason, screen)) in cases.iter().enumerate() {
+            crate::governance::h_paint(&m, screen);
+            *m.last_human_input.lock().unwrap() = (*reason == "human")
+                .then(|| std::time::Instant::now() - std::time::Duration::from_secs(10));
+            let r = call(&d, "inbound", inbound_params("slack", "U1", &format!("slack:h{i}"), "지시", "user"), own_pid());
+            assert_eq!(r["result"]["action"], json!("queued"), "{reason}: 하드축 좌석에 즉시 주입했다: {r}");
+            let id = r["result"]["inbox_id"].as_i64().unwrap();
+            assert_eq!(h3_state(&d, id), "new", "{reason}: 행이 new 가 아니다");
+            assert_eq!(h3_queued_reason(&d, id).as_deref(), Some(*reason), "{reason}: hold_reason");
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0, "보류인데 주입(원장)이 있었다");
+        h3_done(&m);
+    }
+
+    /// [H3 ⓑ] 셸 단독 master(양성 부재 증거 — SEAT Empty)는 보류한다. SEAT Unknown(Windows 미도달)은 종전 즉시 주입.
+    #[cfg(unix)]
+    #[test]
+    fn h3_shell_only_master_holds() {
+        let (d, m) = h3_rig("h3-shell");
+        m.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:s1", "셸에 치면 안 됨", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("queued"), "셸 단독 master 에 주입했다: {r}");
+        let id = r["result"]["inbox_id"].as_i64().unwrap();
+        assert_eq!(h3_queued_reason(&d, id).as_deref(), Some("shell"));
+        m.seat_cache.store(crate::governance::SeatState::Unknown.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:s2", "Unknown 은 종전", "user"), own_pid());
+        let id2 = r["result"]["inbox_id"].as_i64().unwrap();
+        assert_eq!(h3_state(&d, id), "injected", "Unknown 좌석은 보류 근거가 아니다 — FIFO 앞 행이 이 시도에서 나갔다: {r}");
+        // ★(리뷰 F1-H3) 루프당 1행 — 새 행은 앞 행 Inject + 간격 뒤 새 판정으로 나간다(paced).
+        assert_eq!(r["result"]["action"], json!("queued"), "한 루프가 두 행을 쏟았다: {r}");
+        assert_eq!(h3_queued_reason(&d, id2).as_deref(), Some("paced"));
+        assert_eq!(h3_drain(&d, 1), vec![id2], "간격 뒤 종전 즉시 주입");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2);
+        h3_done(&m);
+    }
+
+    /// [H3 steer 핀] busy(작업 중) master 에는 종전대로 즉시 주입한다(원격 steer · C0 p95<10s). 전후 GREEN.
+    #[cfg(unix)]
+    #[test]
+    fn h3_busy_master_injects_immediately() {
+        let (d, m) = h3_rig("h3-busy");
+        crate::governance::h_paint(&m, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:b1", "steer", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("delivered"), "busy master 즉시 주입(steer): {r}");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1);
+        h3_done(&m);
+    }
+
+    /// [H3] 보류된 3행은 축이 풀리면 id 순서대로 각 1회 주입된다(FIFO 보존 · 중복 0).
+    #[cfg(unix)]
+    #[test]
+    fn h3_held_rows_flush_in_order_after_clear() {
+        let (d, m) = h3_rig("h3-flush");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let r = call(&d, "inbound", inbound_params("slack", "U1", &format!("slack:f{i}"), &format!("m{i}"), "user"), own_pid());
+            ids.push(r["result"]["inbox_id"].as_i64().unwrap());
+        }
+        assert!(ids.iter().all(|id| h3_state(&d, *id) == "new"), "모달 중 보류");
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let delivered = h3_drain(&d, 3);
+        assert_eq!(delivered, ids, "id 순서대로 배달");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "각 1회");
+        {
+            let mut g = d.channels.lock().unwrap();
+            assert!(deliver_new_inbox(&d, g.as_mut().unwrap()).is_empty(), "재주입이 있었다");
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3);
+        h3_done(&m);
+    }
+
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict · S41 HG1) 보류됐던 행을 한 루프에서 한꺼번에 쏟지 않는다 — 한 배달
+    /// 루프는 **1행**만 주입하고, 다음 행은 앞 행의 붙여넣기~CR 과 간격이 지난 뒤 **새 판정**으로 나간다. 그래서 앞 행이
+    /// 띄운 권한·질문 창(플러시 도중 창 발생)은 뒤 행의 판정이 본다 — 뒤 행의 붙여넣기·CR 이 그 창에 떨어지지 않는다
+    /// (종전 83d67185: 판정은 1번 행 쓰기 전 µs 간격 · k번째 행의 판정→CR 이 k×(붙여넣기+500ms)).
+    /// RED(HEAD): 첫 루프가 3행을 모두 주입.
+    #[cfg(unix)]
+    #[test]
+    fn h3_flush_rejudges_each_row_after_own_paste_settles() {
+        let (d, m) = h3_rig("h3-pace");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let r = call(&d, "inbound", inbound_params("slack", "U1", &format!("slack:p{i}"), &format!("p{i}"), "user"), own_pid());
+            ids.push(r["result"]["inbox_id"].as_i64().unwrap());
+        }
+        assert!(ids.iter().all(|id| h3_state(&d, *id) == "new"), "전제: 모달 중 보류");
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let r1 = pass(&d);
+        assert_eq!(r1.delivered, vec![ids[0]], "한 배달 루프가 보류 행을 한꺼번에 쏟았다(뒤 행 판정이 낡는다)");
+        assert_eq!(h3_state(&d, ids[1]), "new");
+        // 앞 행의 붙여넣기·CR 이 끝나기 전의 루프는 다음 행을 판정조차 하지 않는다(간격).
+        assert!(pass(&d).delivered.is_empty(), "앞 행 붙여넣기 창 안에서 다음 행을 주입했다");
+        // 앞 행이 새 창을 띄웠다(플러시 도중 창 발생) — 간격이 지난 뒤의 새 판정이 그 창을 본다.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 1000 + 600));
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let r2 = pass(&d);
+        assert!(r2.delivered.is_empty(), "플러시 도중 뜬 창 위에 뒤 행을 주입했다(S41 HG1)");
+        assert_eq!(r2.hold, Some(InboxHold::Gate(crate::governance::MachineHold::Modal)));
+        assert_eq!(h3_state(&d, ids[1]), "new");
+        assert_eq!(h3_state(&d, ids[2]), "new");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1, "창 뒤 주입 0");
+        // 창이 닫히면 나머지가 순서대로 1행씩 나간다(중복 0).
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let mut rest = Vec::new();
+        let t0 = std::time::Instant::now();
+        while rest.len() < 2 && t0.elapsed() < std::time::Duration::from_secs(15) {
+            let r = pass(&d);
+            assert!(r.delivered.len() <= 1, "루프당 1행 상한 위반: {:?}", r.delivered);
+            rest.extend(r.delivered);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(rest, vec![ids[1], ids[2]], "나머지 FIFO");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "각 1회");
+        h3_done(&m);
+    }
+
+    /// [H3 검토 3 · ① 폭주] 상태 기록(UPDATE)이 실패하면 주입하지 않는다 — 기록 선행. 종전(주입 → `let _ = UPDATE`)은
+    /// UPDATE 가 실패하면 행이 new 로 남아 **15s sweep 마다 재주입**했다. 트리거로 RAISE(FAIL) 를 심는다.
+    /// RED(HEAD): sweep 마다 재주입(원장 10).
+    #[cfg(unix)]
+    #[test]
+    fn h3_update_failure_never_injects() {
+        let (d, m) = h3_rig("h3-updfail");
+        {
+            let g = d.channels.lock().unwrap();
+            g.as_ref()
+                .unwrap()
+                .execute_batch("CREATE TRIGGER h3_fail BEFORE UPDATE ON inbox BEGIN SELECT RAISE(FAIL, 'h3 disk'); END;")
+                .unwrap();
+        }
+        let id = h3_seed(&d, "기록 실패 행", now());
+        for _ in 0..10 {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox(&d, g.as_mut().unwrap());
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0, "기록 실패인데 주입했다(재주입 루프)");
+        let wf = d.bus.tail(300).iter().filter(|ev| ev["name"] == "channel.inbox.write_failed").count();
+        assert!(wf <= 1, "write_failed 쿨다운 위반: {wf}");
+        assert_eq!(h3_state(&d, id), "new");
+        {
+            let g = d.channels.lock().unwrap();
+            g.as_ref().unwrap().execute_batch("DROP TRIGGER h3_fail;").unwrap();
+        }
+        {
+            let mut g = d.channels.lock().unwrap();
+            assert_eq!(deliver_new_inbox(&d, g.as_mut().unwrap()), vec![id]);
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1, "트리거 제거 뒤 정확히 1회");
+        assert_eq!(h3_state(&d, id), "injected");
+        h3_done(&m);
+    }
+
+    /// [H3] 늦게 도착한 지시는 봉투에 `(지연 N분 · 접수 MM-DD HH:MM)` 를 붙인다(봉투 %H:%M 만으로는 어제 지시가
+    /// 방금 온 것처럼 읽힌다). 600s 미만은 봉투가 종전과 byte-identical. RED(HEAD): 지연 표기 없음.
+    #[cfg(unix)]
+    #[test]
+    fn h3_lag_mark_only_when_late() {
+        use chrono::TimeZone;
+        let (d, m) = h3_rig("h3-lag");
+        let created = now() - 700.0;
+        let late = h3_seed(&d, "늦은 지시", created);
+        let fresh_ts = now();
+        let fresh = h3_seed(&d, "새 지시", fresh_ts);
+        assert_eq!(h3_drain(&d, 2), vec![late, fresh]);
+        let local = |ts: f64, f: &str| chrono::Local.timestamp_opt(ts as i64, 0).single().unwrap().format(f).to_string();
+        let want_late = format!(
+            "[CH:slack|U1|{}|#{late}] (지연 11분 · 접수 {}) 늦은 지시",
+            local(created, "%H:%M"),
+            local(created, "%m-%d %H:%M")
+        );
+        let want_fresh = envelope("slack", "U1", fresh_ts, fresh, false, "새 지시");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path)).unwrap();
+        let shas: Vec<String> = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|r| r["origin"] == json!("channel"))
+            .map(|r| r["sha256"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(shas, vec![crate::delivery::digest_text(&want_late), crate::delivery::digest_text(&want_fresh)],
+            "늦은 봉투는 지연 표기 · 새 봉투는 종전 byte-identical");
+        h3_done(&m);
+    }
+
+    /// [H3] 보류가 길어지면 sweep 이 `channel.message.stalled` 로 보인다(600s 경계마다 1건 · 상태 없음).
+    #[cfg(unix)]
+    #[test]
+    fn h3_stalled_event_once_per_600s() {
+        let (d, m) = h3_rig("h3-stalled");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let id = h3_seed(&d, "오래 보류된 지시", now() - 605.0);
+        let stalled = |d: &Arc<Daemon>| {
+            d.bus.tail(300).into_iter().filter(|ev| ev["name"] == "channel.message.stalled").collect::<Vec<_>>()
+        };
+        sweep_once(&d);
+        let evs = stalled(&d);
+        assert_eq!(evs.len(), 1, "600s 경계를 넘긴 보류가 보이지 않는다");
+        assert_eq!(evs[0]["payload"]["inbox_id"], json!(id));
+        assert_eq!(evs[0]["payload"]["reason"], json!("modal"));
+        assert_eq!(h3_state(&d, id), "new");
+        // 경계 밖(300s)은 조용하다.
+        let d2 = h3_rig("h3-stalled2");
+        crate::governance::h_paint(&d2.1, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        h3_seed(&d2.0, "보류 5분", now() - 300.0);
+        sweep_once(&d2.0);
+        assert!(stalled(&d2.0).is_empty(), "경계 밖에서 stalled 를 냈다");
+        h3_done(&m);
+        h3_done(&d2.1);
+    }
+
+    /// [H3 순수] 장기 보류 가시화 — 15s sweep 로 보류가 1300s 이어지는 동안 정확히 2회(600s·1200s 경계) ·
+    /// 지연 표기는 600s 이상에서만(미만·NaN 은 없음 = byte-identical).
+    #[test]
+    fn h3_stalled_due_and_lag_mark_pure() {
+        let fired = (0..=1300).step_by(15).filter(|age| inbox_stalled_due(*age as f64, 15.0)).count();
+        assert_eq!(fired, 2, "1300s 보류 동안 stalled 는 정확히 2회");
+        for phase in [0.0, 3.7, 11.2, 14.9] {
+            let n = (0..=90).map(|k| phase + 15.0 * k as f64).filter(|a| inbox_stalled_due(*a, 15.0)).count();
+            assert_eq!(n, 2, "위상 {phase}: 경계마다 1회");
+        }
+        assert!(inbox_lag_mark(1000.0, 1000.0 + 599.9).is_none());
+        assert!(inbox_lag_mark(1000.0, f64::NAN).is_none());
+        let m = inbox_lag_mark(1000.0, 1000.0 + 700.0).expect("700s 는 표기");
+        assert!(m.starts_with(" (지연 11분 · 접수 "), "{m}");
+        assert_eq!(envelope("s", "u", 1000.0, 1, false, "t"), envelope_at("s", "u", 1000.0, 1, false, "t", Some(1100.0)));
+    }
+
+    /// [H3 · 리뷰 F1-H3] 초안 축은 행마다 본다(루프 한정 예외 폐지). 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤
+    /// settle 안)는 H0 기계 소유 귀속이 초안에서 뺀다 — 생산자 공통. settle 뒤 같은 화면 초안은 다시 Draft · 모달은 언제나 본다.
+    #[cfg(unix)]
+    #[test]
+    fn h3_own_paste_in_flight_is_not_a_draft() {
+        let a = channel_hold_axes();
+        assert_eq!((a.shell, a.human, a.modal, a.draft), (true, true, true, true), "행마다 전 축");
+        let (d, m) = h3_rig("h3-own-paste");
+        let sid = m.id;
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        assert_eq!(master_hold(&d, sid).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)));
+        m.write_tx
+            .send(crate::state::WriteReq::Inject {
+                text: "앞 행 붙여넣기".into(),
+                cr_delay_ms: 900,
+                clear_first: false,
+                guard: None,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(master_hold(&d, sid).is_ok(), "우리 자신의 붙여넣기(쓰는 중)를 초안으로 봤다");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        assert_eq!(
+            master_hold(&d, sid).err(),
+            Some(InboxHold::Gate(crate::governance::MachineHold::Modal)),
+            "모달 축은 붙여넣기 중에도 본다"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(900 + 500 + 600));
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        assert_eq!(master_hold(&d, sid).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)), "settle 뒤 초안");
+        h3_done(&m);
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED · ③) master 입력줄에 **좌석 밖** 발신자(교차 소켓 CEO·부서장 = 자기신고 from ·
+    /// 데몬 command 잡 = from 없음)의 Return 누락 잔여가 있어도 오너 채널 행은 보류되지 않는다 — 그 잔여를 치울 원격
+    /// 수단이 없어 행이 무기한 draft 보류된다. 실제로 행이 배달(병합 제출)되는지까지 본다. 음성 대조: GUI 모양 삽입
+    /// (human + machine_origin + 오너 토큰)은 종전대로 Draft. RED(HEAD f1b1a7e8): Err(Gate(Draft)) · 행 new 유지.
+    #[cfg(unix)]
+    #[test]
+    fn h3_cross_socket_residue_does_not_hold_row() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, m) = h3_rig("h3-xsock");
+        let sid = m.id;
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let leave = |body: &str, extra: Value| {
+            m.clear_pending_input();
+            *m.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, sid, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *m.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&m, &crate::governance::h_residue_screen(body));
+        };
+        for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
+            leave(&format!("XSOCK-{label} residue"), extra);
+            assert!(master_hold(&d, sid).is_ok(), "{label}: 좌석 밖 발신자의 잔여를 초안으로 봤다 — 채널 행 무기한 보류(③)");
+        }
+        let id = h3_seed(&d, "오너 원격 지시", now());
+        assert_eq!(h3_drain(&d, 1), vec![id], "잔여 위에서 채널 행이 나가지 않았다");
+        assert_eq!(h3_state(&d, id), "injected");
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = Draft. 앞 행의 붙여넣기 창·settle 이 지난 뒤 본다.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 1100));
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        assert_eq!(
+            master_hold(&d, sid).err(),
+            Some(InboxHold::Gate(crate::governance::MachineHold::Draft)),
+            "GUI 삽입을 기계 잔여로 봤다"
+        );
+        h3_done(&m);
+    }
+
+    /// [H3 ③ 재기동 뒤 처리] 보류된 행은 channels.db 에 영속된다 — 데몬이 재기동해도 새 master 가 유휴가 되면 FIFO 로 나간다.
+    #[cfg(unix)]
+    #[test]
+    fn h3_held_rows_survive_daemon_restart() {
+        let (d, m) = h3_rig("h3-restart");
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        let a = call(&d, "inbound", inbound_params("slack", "U1", "slack:r1", "재기동 전 1", "user"), own_pid());
+        let b = call(&d, "inbound", inbound_params("slack", "U1", "slack:r2", "재기동 전 2", "user"), own_pid());
+        let ids = vec![a["result"]["inbox_id"].as_i64().unwrap(), b["result"]["inbox_id"].as_i64().unwrap()];
+        assert!(ids.iter().all(|id| h3_state(&d, *id) == "new"));
+        h3_done(&m);
+        let d2 = Daemon::new(d.socket_path.clone());
+        let m2 = h3_master(&d2);
+        let delivered = h3_drain(&d2, 2);
+        assert_eq!(delivered, ids, "재기동 뒤 보류 행이 FIFO 로 나가지 않았다");
+        h3_done(&m2);
+    }
+
+    /// [노브] `CYS_MACHINE_INJECT_HOLD` 에서 channel 을 빼면 HEAD 동작(모달 master 에도 즉시 주입 · 지연 표기 없음).
+    #[cfg(unix)]
+    #[test]
+    fn h3_knob_off_is_head_identical() {
+        let (d, m) = h3_rig("h3-knob");
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,ceo,supervisor,takeover")]);
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:k1", "HEAD", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("delivered"), "노브로 끈 채널이 보류했다: {r}");
+        let created = now() - 700.0;
+        let late = h3_seed(&d, "늦은 HEAD", created);
+        {
+            let mut g = d.channels.lock().unwrap();
+            assert_eq!(deliver_new_inbox(&d, g.as_mut().unwrap()), vec![late]);
+        }
+        let want = envelope("slack", "U1", created, late, false, "늦은 HEAD");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path)).unwrap();
+        assert!(led.contains(&crate::delivery::digest_text(&want)), "노브 0 봉투가 HEAD 와 다르다");
+        h3_done(&m);
     }
 }

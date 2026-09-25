@@ -1693,6 +1693,7 @@ pub fn enqueue_into_seat(
     cap: usize,
     role_guard: Option<RoleGuard<'_>>,
     freeze_guard: FreezeGuard,
+    ttl_secs: Option<u64>,
 ) -> Result<(String, usize), EnqueueErr> {
     let (entry, depth) = {
         let surfaces = daemon.surfaces.lock().unwrap();
@@ -1732,9 +1733,11 @@ pub fn enqueue_into_seat(
         if q.len() >= cap {
             return Err(EnqueueErr::QueueFull);
         }
-        // TTL 은 **명시하지 않는다**(`None`) — 데몬 기본(`CYS_QUEUE_TTL_SECS` · 기본 6h)을 그대로
-        // 상속한다. 여기서 6h 를 박으면 운영자가 조정한 TTL 을 이 경로만 무시하는 새 예외축이 생긴다.
-        let entry = daemon.next_queue_entry(text, from, origin);
+        // TTL 은 호출자가 명시할 때만 싣는다. `None` 이면 데몬 기본(`CYS_QUEUE_TTL_SECS` · 기본 6h)을 그대로
+        // 상속한다 — 여기서 6h 를 박으면 운영자가 조정한 TTL 을 이 경로만 무시하는 새 예외축이 생긴다.
+        // ★(0.14.42 · 설계 H2) 명시하는 호출자는 스케줄 하드축 우회 하나다(주기 잡 TTL ≤ 주기 · 대기를 1회분으로).
+        let mut entry = daemon.next_queue_entry(text, from, origin);
+        entry.ttl_secs = ttl_secs;
         q.push_back(entry.clone());
         (entry, q.len())
     };
@@ -1768,6 +1771,7 @@ pub fn enqueue_alert(
         CSO_QUEUE_HEADROOM,
         Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
         FreezeGuard::DaemonAndSeat,
+        None,
     )
 }
 
@@ -4872,6 +4876,7 @@ mod drills {
             50,
             Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
             FreezeGuard::Daemon,
+            None,
         )
         .expect("좌석 pause 를 스케줄 push 의 실패로 접었다(일감이 다음 주기까지 사라진다)");
         assert_eq!(depth, 1, "스케줄 push 가 큐에 들어가지 않았다");
@@ -4888,6 +4893,7 @@ mod drills {
                 50,
                 Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
                 FreezeGuard::Daemon,
+                None,
             )
             .expect_err("kill-switch 가 스케줄 push 를 막지 못한다"),
             EnqueueErr::Frozen

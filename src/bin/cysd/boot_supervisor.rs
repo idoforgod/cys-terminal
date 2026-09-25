@@ -2058,6 +2058,33 @@ fn notify_no_spawn(
     if let Some(sid) = it.surface_id {
         if let Some(s) = daemon.get_surface(sid) {
             if !s.exited.load(Ordering::Relaxed) {
+                // ★(0.14.42 · 설계 H5) pane 줄 앞에서 선언 좌석의 하드축을 **1회** 본다(공용 판정 H0). 축: pause ·
+                //   quiescing · 사람 입력 30s · 모달 · 화면 초안. 보류면 원장 기록과 주입을 **모두** 하지 않고 사실만
+                //   남긴다(`pane_notice_skipped` · 인텐트 래치가 이미 있어 1회). feed 는 위에서 무조건 나갔다 — 잃는 것은
+                //   pane 한 줄뿐이다. 큐는 쓰지 않는다(주 청중이 Windows 다 — ConPTY 판정 Unknown 이면 큐에서 무음 만료될
+                //   수 있었다). Windows 기본 마스크는 draft 를 끈다(모달 오탐이면 통보 줄만 빠진다 · feed 유지).
+                //   부트 체인 본체(dispatch_one → launch-agent)는 무변경이다. 노브에서 supervisor 를 빼면 종전 동작.
+                if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Supervisor) {
+                    let axes = crate::governance::MachineHoldAxes {
+                        pause: true,
+                        quiescing: true,
+                        human: true,
+                        modal: true,
+                        draft: true,
+                        human_window_secs: crate::governance::queue_human_quiet_secs(),
+                        ..crate::governance::MachineHoldAxes::NONE
+                    };
+                    if let Some(h) = crate::governance::machine_direct_hold(daemon, &s, axes) {
+                        publish(
+                            daemon,
+                            "boot_supervisor.pane_notice_skipped",
+                            json!({"intent": it.id, "reason": h.axis(), "surface_id": sid, "why": why,
+                                   "note": "선언 좌석이 하드축(모달·초안·사람 입력·사이클·pause)이라 pane 통보 줄을 생략했다 \
+                                            — feed(bootstrap-fail)는 이미 남았다"}),
+                        );
+                        return;
+                    }
+                }
                 // ★원장 선기록이 주입보다 앞(delivery.rs 불변식 ① — dispatch_one 과 같은 순서).
                 crate::delivery::record_audited(
                     daemon,
@@ -5920,5 +5947,92 @@ mod tests {
             destructive_hits(&commented).is_empty(),
             "주석 문장을 위반으로 읽었다 — 다음 사람이 설명을 지우거나 핀을 완화하게 된다"
         );
+    }
+
+    // ═══════════ ★(0.14.42 · 설계 H5) 부트 감독자 무스폰 통보 — 하드축이면 pane 줄만 생략(feed 는 무조건) ═══════════
+
+    fn h5_seat(d: &Arc<Daemon>, screen: &str) -> Arc<crate::state::Surface> {
+        let s = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("선언 좌석");
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        crate::governance::h_paint(&s, screen);
+        s
+    }
+
+    fn h5_feed_fails(d: &Arc<Daemon>) -> usize {
+        d.feed_items.lock().unwrap().iter().filter(|i| i.kind == "bootstrap-fail").count()
+    }
+
+    fn h5_skipped(d: &Arc<Daemon>) -> Vec<serde_json::Value> {
+        d.bus
+            .tail(200)
+            .into_iter()
+            .filter(|ev| ev["name"] == serde_json::json!("boot_supervisor.pane_notice_skipped"))
+            .collect()
+    }
+
+    /// [H5] 선언 좌석이 승인 창이면 통보의 pane 줄(원장 기록 + 주입)을 모두 생략하고 `pane_notice_skipped{intent,reason}`
+    /// 를 낸다 — feed 는 그 앞에서 무조건 나간다. 인텐트 래치로 1회. RED(HEAD): 모달에 주입(원장 1).
+    #[test]
+    fn h5_notice_skipped_on_modal_pane() {
+        let d = tmp_daemon("h5-modal");
+        let s = h5_seat(&d, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut it = intent("h5-modal-1");
+        it.surface_id = Some(s.id);
+        let mut st = SupState::default();
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        notify_no_spawn(&d, &mut st, &it, "schema_mismatch", &mut budget);
+        notify_no_spawn(&d, &mut st, &it, "schema_mismatch", &mut budget); // 래치 — 두 번째는 무동작
+        assert_eq!(h5_feed_fails(&d), 1, "feed 통보는 무조건 1건");
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 0, "모달 좌석에 통보를 주입했다");
+        let sk = h5_skipped(&d);
+        assert_eq!(sk.len(), 1, "pane_notice_skipped 는 인텐트당 1회");
+        assert_eq!(sk[0]["payload"]["intent"], serde_json::json!("h5-modal-1"));
+        assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("modal"));
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H5 핀] 유휴 좌석(ConPTY 전사 형상 포함)에는 통보가 종전 바이트 그대로 나간다(원장 = 종전 문안).
+    #[test]
+    fn h5_clean_pane_bytes_identical() {
+        let d = tmp_daemon("h5-clean");
+        let conpty_idle = "────────────────────                                                           \r\n❯                                                                              \x1b[2;3H";
+        for (i, screen) in [crate::governance::H_IDLE_SCREEN, conpty_idle].iter().enumerate() {
+            let s = h5_seat(&d, screen);
+            let mut it = intent(&format!("h5-clean-{i}"));
+            it.surface_id = Some(s.id);
+            let mut st = SupState::default();
+            let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+            notify_no_spawn(&d, &mut st, &it, "schema_mismatch", &mut budget);
+            let want = format!(
+                "[cys-supervisor] 팀이 이 선언으로 뜨지 않았다(intent={} why=schema_mismatch) — {}. 재선언이 재개 신호다. 근거: boot-supervisor.log · boot-last",
+                it.id,
+                no_spawn_reason("schema_mismatch")
+            );
+            let led = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path)).unwrap_or_default();
+            assert!(led.contains(&crate::delivery::digest_text(&want)), "#{i}: 통보 문안이 종전과 다르다");
+            assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), i + 1, "#{i}: 유휴 좌석에 통보가 나가지 않았다");
+            let _ = s.child.lock().unwrap().kill();
+        }
+        assert!(h5_skipped(&d).is_empty());
+    }
+
+    /// [노브] `CYS_MACHINE_INJECT_HOLD` 에서 supervisor 를 빼면 HEAD 동작(모달 좌석에도 통보 주입).
+    #[test]
+    fn h5_knob_off_is_head_identical() {
+        let d = tmp_daemon("h5-knob");
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,ceo,takeover")]);
+        let s = h5_seat(&d, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut it = intent("h5-knob-1");
+        it.surface_id = Some(s.id);
+        let mut st = SupState::default();
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        notify_no_spawn(&d, &mut st, &it, "schema_mismatch", &mut budget);
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 1);
+        assert!(h5_skipped(&d).is_empty());
+        let _ = s.child.lock().unwrap().kill();
     }
 }
