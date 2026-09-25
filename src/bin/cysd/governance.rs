@@ -5310,7 +5310,7 @@ pub(crate) fn hold_axes_mask_from(raw: Option<&str>, windows: bool) -> MachineHo
 /// H 노브 읽기 — 검체는 스레드 로컬 덮개로 값을 주입한다(env 는 프로세스 전역이라 병렬 검체끼리 샌다).
 /// 프로덕션 빌드의 덮개는 항상 `None` 이다(아래 `not(test)` 판 · 검체판은 이 파일 테스트 영역에 있다 —
 /// 여기에 테스트 속성을 두면 이 파일의 '프로덕션 영역' 소스 핀 앵커가 앞당겨진다).
-fn h_knob(key: &str) -> Option<String> {
+pub(crate) fn h_knob(key: &str) -> Option<String> {
     if let Some(v) = h_knob_test_override(key) {
         return Some(v);
     }
@@ -21606,7 +21606,7 @@ mod h_machine_hold_tests {
             found.extend(guard_none_producers(f, src));
         }
         let allow: std::collections::BTreeSet<String> = [
-            "channels::inject_master",
+            "channels::inject_master_confirmed",
             "schedule::inject_on",
             "handlers::deliver_to_ceo",
             "boot_supervisor::notify_no_spawn",
@@ -21626,6 +21626,12 @@ mod h_machine_hold_tests {
         let order: Vec<(&str, &str, &str, &str, &str)> = vec![
             // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
             ("schedule", include_str!("schedule.rs"), "deliver_push", "machine_direct_hold(", "inject_on(daemon, &surface, text)"),
+            // H3 — 채널 inbox: 하드축 재확인(master_hold) → 기록 선행(UPDATE) → 주입.
+            ("channels", include_str!("channels.rs"), "master_hold", "deliverable_master(daemon) != Some(sid)", "machine_direct_hold("),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "master_hold(", "SET state='injected'"),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "SET state='injected'", "inject_master_confirmed("),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "master_hold(", "redelivered=redelivered+1"),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "redelivered=redelivered+1", "inject_master_confirmed("),
         ];
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
