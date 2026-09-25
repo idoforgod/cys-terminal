@@ -12,6 +12,12 @@
 //     사이드바는 늘 화면에 떠 있어 화면 공유·스크린샷에 그대로 찍힌다(반박 D2).
 //   · 100% 초과는 "100%+", 창이 없으면 0% 가 아니라 "—", 리셋 시각이 지났으면 옛 % 를 숨긴다(리셋 뒤에도
 //     빨간 78% 가 남는 오경보 차단), 오래된 값은 흐리게, 조회가 3회 연속 실패하면 "데몬 응답 없음".
+//   · ★(0.14.42 · 오너 제보 "모든 AI 계정이 나타나지 않는다") 발견된 계정은 **관측이 없어도 한 줄씩** 보인다.
+//     종전엔 관측 전 계정을 "관측 없음 N개" 한 줄로 접고 이름은 툴팁에만 두어, cys 창 밖에서 쓰는 Claude
+//     계정·agy 계정이 화면에서 사라졌다. 관측 전 행은 흐리게 "관측 전 · 사유", 관측 경로가 고장이면
+//     "관측 실패 · 사유"(source_error) — 값(%)은 지어내지 않는다. 라벨·🔒 가림 규칙은 관측 행과 같다.
+//   · ★(0.14.42 RC4-b · RC2-b) 값의 새 출처 둘: cys 창 밖 Claude 세션(source "statusline-outside" — 표시용·경보
+//     제외)과 agy 상태줄 훅(source "agy-statusline"). 둘 다 라이브 관측이며 툴팁 출처 줄은 사람 말로 적는다.
 //
 // ★이 모듈의 불변식(usagewiring.test.ts 가 핀으로 고정):
 //   · 최상위 부수효과 0 — 선언(export/const/function/type)만. localStorage·document·window·타이머 접근 0.
@@ -38,6 +44,7 @@ export interface AcctRow {
   source?: string; // "statusline" | "rollout" | "agy-rpc" | "adapter:<p>" | "snapshot"(부트 예열)
   adapter?: boolean;
   exhaust_at?: number | null; // 신선한 5h 창의 선형 소진 예측(epoch 초)
+  source_error?: string | null; // 관측 경로 고장 코드(예: "agy_http_403") · null = 고장 없음(0.14.42)
 }
 
 export const USAGE_WARN_PCT = 70; // pane 헤더 배지·CC 계정 섹션과 같은 선(main.ts sevClass(…, 70, 90))
@@ -50,8 +57,10 @@ export const USAGE_STALE_SECS = 30 * 60;
 export const USAGE_WINDOWS = ["5h", "7d"];
 /** 연속 실패가 이 횟수에 닿으면 "데몬 응답 없음" — CC 의 ccFailStreak(3틱)과 같은 선. */
 export const USAGE_FAIL_STREAK_WARN = 3;
-/** 주 계정 밖의 관측 계정은 이 수까지만 한 줄씩 — 넘치면 "외 N개"(꼬리 높이 상한). */
-export const USAGE_OTHERS_MAX = 4;
+/** 주 계정 밖의 계정(관측·관측 전 모두)은 이 수까지만 한 줄씩 — 넘치면 "외 N개"(꼬리 높이 상한).
+ *  0.14.42: 4 → 8. 한 사용자의 실사용 계정(2026-09-23 실측: Claude 4 + Codex + Antigravity = 6)이 전부
+ *  보여야 한다. 꼬리는 자체 스크롤(#wsbar-foot max-height)이라 줄이 늘어도 탭 목록을 밀지 않는다. */
+export const USAGE_OTHERS_MAX = 8;
 
 const p2 = (x: number): string => String(x).padStart(2, "0");
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
@@ -106,6 +115,7 @@ export function providerLabel(provider: unknown): string {
   if (p === "claude") return "Claude";
   if (p === "codex") return "Codex";
   if (p === "gemini") return "agy";
+  if (p === "antigravity") return "Antigravity"; // 데몬의 실제 provider 키(accounts.rs) — 오너가 부르는 이름
   return p || "계정";
 }
 
@@ -233,6 +243,8 @@ export interface UsageLine {
   text: string;
   tooltip: string;
   dim: boolean;
+  /** 한 번도 관측되지 않은 계정의 줄(값 없음 — "관측 전·관측 실패·어댑터 없음"). */
+  unobserved: boolean;
 }
 export interface UsagePrimary {
   label: string;
@@ -247,8 +259,8 @@ export interface UsageBarModel {
   primary: UsagePrimary | null;
   others: UsageLine[];
   moreCount: number;
+  /** 관측 전 계정 수(그 계정들도 others 에 한 줄씩 있다 — 개수로 접지 않는다). */
   unobservedCount: number;
-  unobservedTooltip: string;
   /** 주 계정이 없을 때 본문 대신 보일 한 줄(빈 문자열이면 없음). */
   message: string;
   /** 조회 연속 실패 경고(빈 문자열이면 없음) — 값은 지우지 않고 기준 시각을 밝힌다. */
@@ -260,9 +272,80 @@ export interface UsageFetchState {
   okAtSec: number | null; // 마지막 성공 시각(epoch 초)
 }
 
-/** 집계 범위 고지 — 반박 §5-8: 기본 `claude`(~/.claude)와 외부 터미널 세션은 계정에 집계되지 않는다. */
+/** 집계 범위 고지. 0.14.42: 기본 `claude`(~/.claude — 신원 ~/.claude.json)도 모이고(RC3), 외부 터미널(cys 창 밖)
+ *  Claude 세션도 그 프로필의 상태줄이 cys 로 연결돼 있으면 계정 전용 입구(`usage.report_account`)로 모인다(RC4-b).
+ *  창 밖 값은 **표시용**이다 — 같은 UID 의 프로세스가 보낼 수 있어 계정 경보의 근거로 쓰지 않는다(데몬 alert_rates). */
 export const USAGE_SCOPE_NOTE =
-  "집계 범위: cys 창 안에서 계정 전용 설정 폴더(CLAUDE_CONFIG_DIR)로 띄운 세션만 계정에 모입니다 — 기본 claude·외부 터미널 세션은 빠집니다.";
+  "집계 범위: cys 창 안 세션과, 상태줄이 cys 로 연결된 외부 터미널(cys 창 밖) Claude 세션이 계정에 모입니다" +
+  " — 창 밖 값은 표시용(경보 제외)이고, 명명 규칙 밖 설정 폴더·창 밖 agy 세션은 집계 대상이 아닙니다.";
+
+/** 관측 출처(source) → 툴팁용 사람 말. 모르는 출처는 원문 그대로(정직). */
+function sourceLabel(src: unknown): string {
+  if (src === "statusline-outside") return "cys 창 밖 상태줄";
+  if (src === "agy-statusline") return "agy 상태줄";
+  return typeof src === "string" && src ? src : "?";
+}
+
+/** 관측 경로 고장 코드(accounts.rs source_error) → 짧은 사유·자세한 설명. 모르는 코드도 '고장'으로 정직하게. */
+function sourceErrorText(code: string): { short: string; detail: string } {
+  const http = /^agy_http_(\d+)$/.exec(code);
+  if (http)
+    return {
+      short: `agy 조회 거부(HTTP ${http[1]})`,
+      detail: `agy 언어 서버가 쿼터 조회를 거부했습니다(HTTP ${http[1]}).`,
+    };
+  if (code === "agy_csrf_required")
+    return {
+      short: "agy 상태줄 연결 필요",
+      detail:
+        "agy(1.2 이후) 언어 서버가 쿼터 조회에 CSRF 토큰을 요구합니다. cys 는 그 토큰을 읽지 않습니다 — " +
+        "agy 설정의 상태줄(statusLine)을 cys 로 연결하면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
+    };
+  // fatal-fix W5: RPC 경로가 구조적으로 없는 플랫폼(Windows — 언어 서버 포트를 찾을 길이 없다) — 값을 얻는 길을 가리킨다.
+  if (code === "agy_statusline_required")
+    return {
+      short: "agy 상태줄 연결 필요",
+      detail:
+        "이 컴퓨터(Windows)에서는 cys 가 agy 내부 서버에서 쿼터를 읽을 수 없습니다 — " +
+        "agy 설정의 상태줄(statusLine)을 cys 로 연결하면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
+    };
+  if (code === "agy_no_quota") return { short: "agy 응답에 쿼터 없음", detail: "agy 가 답했지만 Gemini 쿼터 항목이 없습니다." };
+  if (code === "agy_unreachable") return { short: "agy 응답 없음", detail: "agy 언어 서버 포트가 응답하지 않습니다." };
+  if (code === "agy_no_port") return { short: "agy 포트 못 찾음", detail: "cys 창의 agy 가 연 포트를 찾지 못했습니다." };
+  if (code === "agy_no_process") return { short: "agy 프로세스 없음", detail: "agy 좌석 아래에서 agy 프로세스를 찾지 못했습니다." };
+  return { short: "관측 경로 오류", detail: "관측 경로가 오류를 보고했습니다." };
+}
+
+/** 관측 전 계정 줄의 표기 — 상태 머리말 + 짧은 사유(줄) · 자세한 설명(툴팁). 값(%)은 만들지 않는다. */
+export function unobservedStatus(a: AcctRow): { text: string; detail: string } {
+  const err = typeof a.source_error === "string" ? a.source_error.trim() : "";
+  if (err) {
+    const t = sourceErrorText(err);
+    return { text: `관측 실패 · ${t.short}`, detail: `${t.detail} (코드 ${err})` };
+  }
+  if (a.adapter === false)
+    return { text: "관측 어댑터 없음", detail: "이 계정은 관측 어댑터 없이 선언됐습니다(~/.cys/accounts.json)." };
+  const p = typeof a.provider === "string" ? a.provider : "";
+  if (p === "antigravity" || p === "gemini")
+    return {
+      text: "관측 전 · agy 상태줄 연결 후",
+      detail:
+        "cys 창의 agy 좌석에서 agy 상태줄(statusLine)이 cys 로 연결돼 있으면 값이 들어옵니다(사용 설명서 「사이드바 바닥: 사용량」).",
+    };
+  if (p === "codex")
+    return { text: "관측 전 · cys 창 codex 응답 후", detail: "cys 창의 codex 좌석이 응답하면 값이 들어옵니다." };
+  return {
+    text: "관측 전 · Claude 응답 후 표시",
+    detail:
+      "이 계정으로 Claude 가 응답하면 값이 들어옵니다 — cys 창 안이든 외부 터미널(cys 창 밖)이든, 그 프로필의 상태줄이 " +
+      "cys 로 연결돼 있으면 모입니다(cys 설치가 연결합니다). 명명 규칙 밖 설정 폴더(CLAUDE_CONFIG_DIR)의 세션은 모이지 않습니다.",
+  };
+}
+const PROVIDER_ORDER = ["claude", "codex", "antigravity"];
+const providerRank = (a: AcctRow): number => {
+  const i = PROVIDER_ORDER.indexOf(typeof a.provider === "string" ? a.provider : "");
+  return i < 0 ? PROVIDER_ORDER.length : i;
+};
 
 function tooltipFor(
   a: AcctRow,
@@ -270,6 +353,7 @@ function tooltipFor(
   fr: Freshness,
   redactEmail: (s: string) => string,
   hidePaths: boolean,
+  note = "",
 ): string {
   const lines: string[] = [];
   // 신원 줄 — 라벨(이메일)이 비면 account_id 가 나오므로 그것도 가림 함수를 거친다(CC 계정 섹션과 같은 규칙).
@@ -280,8 +364,12 @@ function tooltipFor(
   const profs = hidePaths ? normalizeProfiles(normalizeProfiles(a.profiles).map(profileTail)) : normalizeProfiles(a.profiles);
   if (profs.length) lines.push(`설정 폴더: ${profs.join(", ")}`);
   const u = finiteNum(a.updated_at);
-  if (u !== null && u > 0) lines.push(`관측: ${String(a.source || "?")} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
+  if (u !== null && u > 0) lines.push(`관측: ${sourceLabel(a.source)} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
   for (const v of views) lines.push(`${v.label}: ${v.text}${v.resetText ? ` · ${v.resetText}` : ""}`);
+  if (note) lines.push(note);
+  // 관측된 행이라도 그 경로가 지금 고장이면 적는다(값은 마지막 관측 그대로 — 오래됨 표기가 따로 붙는다).
+  const err = typeof a.source_error === "string" ? a.source_error.trim() : "";
+  if (err && isObserved(a)) lines.push(`관측 경로 오류: ${sourceErrorText(err).detail} (코드 ${err})`);
   lines.push(USAGE_SCOPE_NOTE);
   return lines.join("\n");
 }
@@ -308,7 +396,6 @@ export function buildUsageBarModel(
     others: [],
     moreCount: 0,
     unobservedCount: 0,
-    unobservedTooltip: "",
     message: "",
     footer,
   };
@@ -333,17 +420,29 @@ export function buildUsageBarModel(
     if ((count.get(l) ?? 0) > 1) labels.set(a, `${l} ·${tag4(acctKey(a))}`);
   }
 
-  const unobserved = list.filter((a) => !isObserved(a));
-  const unobservedTooltip = unobserved.length
-    ? `아직 관측되지 않은 계정: ${unobserved.map((a) => labels.get(a)).join(", ")}\n${USAGE_SCOPE_NOTE}`
-    : "";
+  // 관측 전 계정 — 개수로 접지 않고 한 줄씩(0.14.42). 제공자 순(claude·codex·antigravity) → 라벨 순(결정론).
+  const unobserved = list
+    .filter((a) => !isObserved(a))
+    .sort((x, y) => providerRank(x) - providerRank(y) || (labels.get(x)! < labels.get(y)! ? -1 : labels.get(x)! > labels.get(y)! ? 1 : 0));
+  const unobservedLines: UsageLine[] = unobserved.map((a) => {
+    const v = USAGE_WINDOWS.map((l) => windowView(a, l, nowSec));
+    const st = unobservedStatus(a);
+    return {
+      label: labels.get(a)!,
+      text: st.text,
+      tooltip: tooltipFor(a, v, freshness(a, nowSec), redactEmail, hidePaths, st.detail),
+      dim: true,
+      unobserved: true,
+    };
+  });
   const primaryAcct = pickPrimaryAccount(list, nowSec);
   if (!primaryAcct) {
     return {
       ...empty,
       headline: "관측 없음",
+      others: unobservedLines.slice(0, USAGE_OTHERS_MAX),
+      moreCount: Math.max(0, unobservedLines.length - USAGE_OTHERS_MAX),
       unobservedCount: unobserved.length,
-      unobservedTooltip,
       message: "아직 관측된 사용량 없음 — 에이전트 첫 응답 후 표시",
     };
   }
@@ -366,7 +465,7 @@ export function buildUsageBarModel(
       if (dl) return dl;
       return (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
     });
-  const others: UsageLine[] = rest.slice(0, USAGE_OTHERS_MAX).map((a) => {
+  const observedLines: UsageLine[] = rest.map((a) => {
     const v = USAGE_WINDOWS.map((l) => windowView(a, l, nowSec));
     const f = freshness(a, nowSec);
     const txt = v.map((w) => `${w.label} ${w.text}`).join(" · ");
@@ -375,16 +474,18 @@ export function buildUsageBarModel(
       text: f.note && f.level !== "fresh" ? `${txt} (${f.note})` : txt,
       tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
       dim: f.level === "stale",
+      unobserved: false,
     };
   });
+  // 관측 행이 먼저 — 상한이 관측값을 밀어내지 않는다. "외 N개"는 관측·관측 전 구분 없이 같은 규칙.
+  const all = observedLines.concat(unobservedLines);
 
   return {
     headline: pv.map((w) => `${w.label} ${w.text}`).join(" · "),
     primary,
-    others,
-    moreCount: Math.max(0, rest.length - USAGE_OTHERS_MAX),
+    others: all.slice(0, USAGE_OTHERS_MAX),
+    moreCount: Math.max(0, all.length - USAGE_OTHERS_MAX),
     unobservedCount: unobserved.length,
-    unobservedTooltip,
     message: "",
     footer,
   };

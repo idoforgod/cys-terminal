@@ -223,7 +223,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #wsbar-usage .crit { color: var(--error); }
 #wsbar-usage .usage-gauge-fill.warn { background: var(--warn); }
 #wsbar-usage .usage-gauge-fill.crit { background: var(--error); }
-#wsbar-usage .usage-note, #wsbar-usage .usage-msg, #wsbar-usage .usage-unobs, #wsbar-usage .usage-more {
+#wsbar-usage .usage-note, #wsbar-usage .usage-msg, #wsbar-usage .usage-more {
   margin-top: 3px; color: #8b949e; overflow-wrap: anywhere;
 }
 #wsbar-usage .usage-exhaust { margin-top: 3px; color: var(--warn); overflow-wrap: anywhere; }
@@ -236,6 +236,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #wsbar-usage .dim { opacity: .55; }
+#wsbar-usage .usage-other.unobs .usage-other-txt { font-style: italic; } /* 관측 전·관측 실패 줄 — 값이 아니라 상태 */
 /* U17 전문가용 칸 — 토글(기본 접힘) + 본문(팀 직접 만들기). 본문은 hidden 으로 접는다. */
 #wsbar-expert { font-size: calc(11px * var(--wsbar-font, 1)); border-top: 1px solid var(--hairline); padding-top: 2px; }
 #btn-expert-toggle .expert-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

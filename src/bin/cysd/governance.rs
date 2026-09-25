@@ -1229,11 +1229,22 @@ fn check_role_deadman(daemon: &Arc<Daemon>, tracker: &mut DeadmanTracker) {
 /// fired 맵에 없는 키만 발행(첫 교차)하고, 해소된 키는 retain으로 제거해 재무장한다(다음 교차 시
 /// 재발화). 지속 조건은 30분 디바운스로 재격상(master가 놓치지 않게). ★자동응답 금지 — 이벤트만.
 fn check_alerts(daemon: &Arc<Daemon>, fired: &mut HashMap<String, f64>) {
-    const REMIND_SECS: f64 = 1800.0;
-    let cfg = crate::alerts::AlertConfig::load();
-    let now = now_epoch();
+    check_alerts_with(daemon, fired, &crate::alerts::AlertConfig::load(), now_epoch());
+}
+
+/// 키별 리마인드 간격(초) — 활성으로 **남아 있는** 키는 이 간격마다 한 번만 다시 발행한다.
+pub(crate) const ALERT_REMIND_SECS: f64 = 1800.0;
+
+/// `check_alerts` 의 시험 이음매 — 설정과 시각을 인자로 받는다(동작은 같다 · 라이브 팩 설정 무의존 검체용).
+pub(crate) fn check_alerts_with(
+    daemon: &Arc<Daemon>,
+    fired: &mut HashMap<String, f64>,
+    cfg: &crate::alerts::AlertConfig,
+    now: f64,
+) {
+    const REMIND_SECS: f64 = ALERT_REMIND_SECS;
     let snap = crate::alerts::snapshot(daemon, now);
-    let active = crate::alerts::evaluate(&snap, &cfg);
+    let active = crate::alerts::evaluate(&snap, cfg);
     let active_keys: std::collections::HashSet<String> =
         active.iter().map(|a| a.key.clone()).collect();
     for a in &active {

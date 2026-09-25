@@ -128,9 +128,11 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 | `vibecoding/*.sh` | PostToolUse | 바이브코딩 넛지(옵트인) |
 
 훅이 아닌 파일: `_lib.sh`(프리루드 §2) · `cys-statusline.sh`(statusline 래퍼) ·
+`cys-agy-statusline.sh`(agy 상태줄 래퍼 — `~/.gemini/antigravity-cli/settings.json` 의 statusLine 명령 · 설치 때 칸이
+비었을 때만 자동 연결 · 계약은 `src/agy_statusline.rs`) ·
 `inject_gate.py`(주입 포이즌 게이트 — inject-context 가 부른다) · `test_pre_dispatch.sh`(회귀 하네스) ·
-`teamtoken-issue.sh`(대화 승인 1회용 팀 생성 토큰 발급 — `role-bootstrap.sh` 런처가 토큰 원장이 최근
-10분 안에 움직였을 때만 부른다 · 등록하지 않는다).
+`teamtoken-issue.sh`(대화 승인 1회용 팀 생성 토큰 발급 — `role-bootstrap.sh` 런처가 **이 좌석의 열린 질문 표지**
+`teamtoken-open-<레인>-s<좌석>` 가 있을 때만 부른다 · 등록하지 않는다).
 
 ## 6. 훅이 안 도는 것 같을 때 보는 순서
 

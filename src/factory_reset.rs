@@ -332,6 +332,9 @@ pub struct ResetPlan {
     pub strip_settings: Vec<PathBuf>,
     /// pack 스킬 심링크를 제거할 개인 프로필 skills/ 디렉토리 목록.
     pub strip_skill_dirs: Vec<PathBuf>,
+    /// ★0.14.42 cys 가 **자동으로 넣은**(표지 달린) agy 상태줄 연결을 뺄 agy settings.json — 없으면 None.
+    /// 사용자가 직접 넣은 cys 연결·사용자 statusLine 은 대상이 아니다(`report_only` 안내만 · agy_statusline 계약).
+    pub strip_agy_statusline: Option<PathBuf>,
     pub temp_sweep: Vec<PathBuf>,
     /// launchd plist(존재 시에만 등록 해제 수행 — 테스트 temp 홈에선 자연히 스킵).
     pub launchd_plist: Option<PathBuf>,
@@ -701,6 +704,33 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
         }
     }
 
+    // ── ★0.14.42 agy 상태줄 연결(외과 제거 — cys 가 넣은 표지 달린 연결만) ──
+    //   초기화 뒤에는 팩이 사라지므로 그 연결은 없는 파일을 부른다. 사용자가 직접 넣은 cys 연결은 우리가 만든 것이
+    //   아니라 지우지 않고 알린다(agy 는 연속 실패한 상태줄을 스스로 끈다 — 해가 아니라 소음이다).
+    let strip_agy_statusline = {
+        use crate::agy_statusline::{inspect, settings_path_under, Slot};
+        let p = settings_path_under(&roots.home);
+        match inspect(&p) {
+            Ok(Some(Slot::OursAuto { .. })) => Some(p),
+            Ok(Some(Slot::CysManual { .. })) => {
+                report_only.push(format!(
+                    "{} 의 statusLine 에 직접 넣은 cys 연결이 있습니다 — 초기화 뒤에는 없는 팩 파일을 부릅니다. \
+                     agy 안에서 `/statusline delete` 로 지우세요(자동 수정하지 않음)",
+                    p.display()
+                ));
+                None
+            }
+            Err(e) => {
+                report_only.push(format!(
+                    "{} 를 판독하지 못해 agy 상태줄의 cys 연결 여부를 확인하지 못했습니다({e}) — 자동 수정하지 않음",
+                    p.display()
+                ));
+                None
+            }
+            _ => None,
+        }
+    };
+
     // ── $TMPDIR 캐시 소거 대상 ──
     let mut temp_sweep = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&roots.temp) {
@@ -853,6 +883,7 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
         report_only,
         strip_settings,
         strip_skill_dirs,
+        strip_agy_statusline,
         temp_sweep,
         launchd_plist,
         purge_license: opts.purge_license,
@@ -1664,6 +1695,20 @@ pub fn execute_quarantine(
                 format!(
                     "훅 제거 실패(파일 무변경): {e} — 이 파일을 열어 `.cys/pack` 를 가리키는 \
                      hooks 항목과 statusLine 을 직접 지우세요(안 지우면 매 세션 훅 오류)"
+                ),
+            )),
+        }
+    }
+    if let Some(s) = &plan.strip_agy_statusline {
+        use crate::agy_statusline::{unlink, Backup, Outcome};
+        progress("strip", &format!("{} cys 가 넣은 agy 상태줄 연결 제거", s.display()));
+        match unlink(s, None, Backup::Dir(&backup_dir)) {
+            Outcome::Unlinked => stripped.push(format!("{}: agy statusLine(cys 자동 연결)", s.display())),
+            Outcome::NothingToUnlink(_) => {}
+            other => failed.push((
+                s.clone(),
+                format!(
+                    "agy 상태줄 연결 제거 실패(파일 무변경): {other:?} — agy 안에서 `/statusline delete` 로 지우세요"
                 ),
             )),
         }
@@ -2679,6 +2724,47 @@ mod tests {
         let rep2 = execute_quarantine(&plan, &r, &not_cysd, &no_daemon, &mut noop).unwrap();
         assert!(rep2.ok());
         assert!(rep2.moved.is_empty());
+    }
+
+    /// ★0.14.42 agy 상태줄 자동 연결의 제거 경로(완전 초기화) — cys 가 넣은(표지 달린) 연결만 빼고 나머지 키는 그대로,
+    /// 백업은 격리 폴더 안에 둔다. 사용자가 직접 넣은 cys 연결·사용자 statusLine 은 건드리지 않는다(직접 넣은 cys 연결은 안내).
+    #[test]
+    fn agy_statusline_autolink_is_stripped_but_user_links_are_only_reported() {
+        let td = test_home("agy");
+        let r = seed_practice_tree(&td);
+        let settings = crate::agy_statusline::settings_path_under(&td);
+        let ours = "{\n  \"enableTerminalSandbox\": false,\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"sh /Users/x/.cys/pack/hooks/cys-agy-statusline.sh --cys-autolink\",\n    \"enabled\": true,\n    \"stack_with_default\": true\n  },\n  \"trustedWorkspaces\": []\n}\n";
+        touch(&settings, ours);
+        let opts = ResetOptions { purge_license: false, purge_local: false, purge_round: false };
+        let plan = build_plan(&r, &opts);
+        assert_eq!(plan.strip_agy_statusline.as_deref(), Some(settings.as_path()));
+        let not_cysd = |_p: u32| false;
+        let no_daemon = || false;
+        let mut noop = |_p: &str, _d: &str| {};
+        let rep = execute_quarantine(&plan, &r, &not_cysd, &no_daemon, &mut noop).unwrap();
+        assert!(rep.ok(), "{:?}", rep.failed);
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "{\n  \"enableTerminalSandbox\": false,\n  \"trustedWorkspaces\": []\n}\n",
+            "cys 연결 한 칸만 빠져야 한다"
+        );
+        assert!(plan.trash_dir.join("settings-backups/agy-antigravity-cli.settings.json").is_file(), "백업은 격리 폴더 안");
+        assert!(!settings.with_file_name("settings.json.bak-cys").exists(), "agy 폴더에 새 백업을 늘리지 않는다");
+        // 직접 넣은 cys 연결 = 안내만 · 사용자 statusLine = 무언급
+        let td2 = test_home("agy-manual");
+        let r2 = seed_practice_tree(&td2);
+        let s2 = crate::agy_statusline::settings_path_under(&td2);
+        let manual = "{\"statusLine\": {\"type\": \"command\", \"command\": \"sh ~/.cys/pack/hooks/cys-agy-statusline.sh\"}}";
+        touch(&s2, manual);
+        let plan2 = build_plan(&r2, &opts);
+        assert!(plan2.strip_agy_statusline.is_none());
+        assert!(plan2.report_only.iter().any(|m| m.contains("/statusline delete")), "{:?}", plan2.report_only);
+        let _ = execute_quarantine(&plan2, &r2, &not_cysd, &no_daemon, &mut noop).unwrap();
+        assert_eq!(std::fs::read_to_string(&s2).unwrap(), manual);
+        touch(&s2, "{\"statusLine\": {\"command\": \"~/mine.sh\"}}");
+        let plan3 = build_plan(&r2, &opts);
+        assert!(plan3.strip_agy_statusline.is_none());
+        assert!(!plan3.report_only.iter().any(|m| m.contains("statusLine")));
     }
 
     #[test]

@@ -126,6 +126,11 @@ enum Command {
         /// push만 하고 사람용 statusline 한 줄을 출력하지 않는다 (기존 statusline 체인 보존 시).
         #[arg(long)]
         quiet: bool,
+        /// ★0.14.42 agy(Antigravity) 상태줄 전용(`hooks/cys-agy-statusline.sh` — 자동 연결 표적). 페이로드 판별 없이
+        /// agy 경로(쿼터만)로만 보내고, stdin 판독에도 예산을 둔다. 이 플래그를 모르는 옛 cys 는 인자 오류로 끝난다
+        /// (옛 경로로 새지 않는다 — 스크립트 머리 주석).
+        #[arg(long)]
+        agy: bool,
     },
     /// T7 E1-4: PreToolUse/PostToolUse hook stdin을 읽어 usage.event로 push (cys-hook.sh 전용 plumbing)
     UsageEventStdin {
@@ -4377,8 +4382,8 @@ fn run(command: Command) -> i32 {
             })
         }
 
-        Command::UsageReportStdin { surface, quiet } => {
-            return run_usage_report_stdin(&surface, quiet)
+        Command::UsageReportStdin { surface, quiet, agy } => {
+            return run_usage_report_stdin(&surface, quiet, agy)
         }
 
         Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
@@ -7025,6 +7030,9 @@ struct DoctorCtx {
     /// ★U4-B2④ 각성 훅의 **실소비** config 폴더(`${CYS_ACCOUNT_DIR:-$HOME/.cys/claude}` —
     /// `cys::resolve_claude_config_dir()`). hook 진단의 1차 대조 표면이다.
     consumed_config_dir: std::path::PathBuf,
+    /// ★0.14.42 agy 상태줄 점검의 홈(`~/.gemini/antigravity-cli/settings.json` 의 기준). None = 점검 안 함(Skip) —
+    /// 테스트 기본값이다(실 홈의 agy 설정을 진단·수리하지 않는다).
+    agy_home: Option<std::path::PathBuf>,
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
@@ -7732,6 +7740,105 @@ fn diag_config_dir_target(ctx: &DoctorCtx) -> DiagItem {
                      ~/.cys/pack 으로 되돌린 뒤 그 두 명령 중 하나를 실행하라 — 자동 수리 대상 아님."
                 .into(),
         },
+    }
+}
+
+/// ★0.14.42 agy(Antigravity CLI) 상태줄 연결 점검 — 계약 전문은 `cys::agy_statusline`.
+///
+/// 진단은 읽기 전용이다. `--fix` 는 **base 팩**(`~/.cys/pack`)에서만 설치 경로와 같은 조정을 하되 '연결한 적 있음' 기록을
+/// 무시한다(사람이 부른 수리 = 다시 연결 의사) — 그래도 **사용자 statusLine 은 덮지 않고**, 윈도우는 쓰지 않으며, 노브가
+/// 꺼져 있으면 cys 가 넣은 연결만 뺀다. 부서·임시 팩 레인의 doctor 는 개인 설정을 만지지 않는다(설치 경로와 같은 게이트).
+fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    use cys::agy_statusline as agy;
+    let item = |status, detail: String, action: String| DiagItem { name: "agy-statusline", status, detail, action };
+    let Some(home) = ctx.agy_home.as_deref() else {
+        return item(DiagStatus::Skip, "홈 폴더를 알 수 없다 — 점검하지 않았다".into(), String::new());
+    };
+    let settings = agy::settings_path_under(home);
+    if !settings.parent().is_some_and(|d| d.is_dir()) {
+        return item(DiagStatus::Skip, "agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님".into(), String::new());
+    }
+    let cys_base = home.join(".cys");
+    let base_pack = ctx.pack_dir == cys_base.join("pack");
+    let off = agy::knob_off(cys::env_compat(agy::ENV_KNOB).as_deref(), cys_base.join(agy::OFF_FILE).exists());
+    let record = ctx.pack_dir.join(agy::RECORD_REL);
+    let mut done = String::new();
+    if fix && base_pack {
+        let o = if off {
+            agy::unlink(&settings, Some(&record), agy::Backup::Beside)
+        } else {
+            agy::ensure_linked(
+                &agy::Ctx { settings: &settings, pack_dir: &ctx.pack_dir, record: &record, windows: cfg!(windows) },
+                true,
+            )
+        };
+        done = agy::describe(&o, &settings).map(|l| format!("--fix: {l}")).unwrap_or_default();
+    }
+    let with_done = |a: String| if done.is_empty() { a } else if a.is_empty() { done.clone() } else { format!("{done} · {a}") };
+    let fix_hint = if base_pack {
+        "`cys doctor --fix`".to_string()
+    } else {
+        format!("base 팩(~/.cys/pack)의 `cys doctor --fix` — 이 레인({})은 개인 설정을 고치지 않는다", ctx.pack_dir.display())
+    };
+    let manual = "사용 설명서 §4 사용량「Antigravity(agy) 값」";
+    let slot = match agy::inspect(&settings) {
+        Ok(s) => s,
+        Err(e) => {
+            return item(
+                DiagStatus::Warn,
+                format!("{} 를 건드리지 않는다 — {e} · agy 쿼터 값은 들어오지 않는다", settings.display()),
+                with_done(format!("파일을 고친 뒤 {fix_hint} · {manual}")),
+            )
+        }
+    };
+    use agy::Slot;
+    let disabled_note = |en: &Option<bool>| {
+        if *en == Some(false) {
+            " — agy 안에서 꺼 둠(`/statusline enable` 로 켠다 · cys 는 켜지 않는다)"
+        } else {
+            ""
+        }
+    };
+    match (slot, off) {
+        (Some(Slot::OursAuto { .. }), true) => item(
+            DiagStatus::Warn,
+            format!("되돌리기 노브({}=0 또는 ~/.cys/{})가 켜졌는데 cys 가 넣은 연결이 남아 있다", agy::ENV_KNOB, agy::OFF_FILE),
+            with_done(format!("{fix_hint} 로 제거(다음 설치·업데이트 때도 제거된다)")),
+        ),
+        (Some(Slot::OursAuto { enabled }), false) => item(
+            DiagStatus::Ok,
+            format!("cys 가 자동으로 연결함{}", disabled_note(&enabled)),
+            with_done(String::new()),
+        ),
+        (Some(Slot::CysManual { enabled }), _) => item(
+            DiagStatus::Ok,
+            format!("직접 넣은 cys 연결{} (되돌리기 노브는 cys 가 넣은 연결만 뺀다)", disabled_note(&enabled)),
+            with_done(String::new()),
+        ),
+        (Some(Slot::User), _) => item(
+            DiagStatus::Warn,
+            format!("{} 에 사용자 statusLine 이 있다 — 덮지 않는다 · agy 쿼터 값은 들어오지 않는다", settings.display()),
+            with_done(format!("cys 값을 받으려면 {manual} 을 보고 직접 바꾼다")),
+        ),
+        (_, true) => item(DiagStatus::Ok, "꺼짐(되돌리기 노브) — 연결 없음".into(), with_done(String::new())),
+        (_, false) if cfg!(windows) => item(
+            DiagStatus::Skip,
+            "윈도우는 자동 연결하지 않는다(agy 가 상태줄 명령을 어떤 셸로 부르는지 미확인 — 측정 불능은 통과가 아니다)".into(),
+            with_done(match agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, false) {
+                Some(c) => format!("직접 연결: statusLine command = `{c}` ({manual})"),
+                None => format!("팩 경로에 공백 등이 있어 붙여 넣을 명령을 만들 수 없다 — {manual}"),
+            }),
+        ),
+        (_, false) if record.exists() => item(
+            DiagStatus::Warn,
+            "전에 cys 가 연결했던 statusLine 이 비어 있다(agy 의 /statusline delete 등) — 설치는 다시 넣지 않는다".into(),
+            with_done(format!("다시 연결: {fix_hint}")),
+        ),
+        (_, false) => item(
+            DiagStatus::Warn,
+            "아직 연결되지 않았다 — agy 쿼터 값은 들어오지 않는다".into(),
+            with_done(format!("{fix_hint} (다음 설치·업데이트 때도 자동으로 연결된다)")),
+        ),
     }
 }
 
@@ -8847,6 +8954,8 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_dept_awakening_seed(ctx),
         // ★(M5) 이 레인 자신의 '설치 표적 ≠ 실소비 SOT' — 위 두 항목이 못 보는 축.
         diag_config_dir_target(ctx),
+        // ★0.14.42 agy 상태줄 자동 연결(사용자 설정 불가침 · --fix 는 비었을 때만 연결 · base 팩 전용).
+        diag_agy_statusline(ctx, fix),
         diag_orphan_socket(ctx, fix),
         diag_stale_lock(ctx, fix),
         diag_staging_residue(ctx, fix),
@@ -8891,6 +9000,7 @@ fn factory_reset_plan_json(plan: &cys::factory_reset::ResetPlan) -> Value {
         })).collect::<Vec<_>>(),
         "strip_settings": plan.strip_settings.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "strip_skill_dirs": plan.strip_skill_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "strip_agy_statusline": plan.strip_agy_statusline.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "temp_sweep_count": plan.temp_sweep.len(),
         "report_only": plan.report_only,
         "purge_license": plan.purge_license,
@@ -9069,6 +9179,9 @@ fn run_factory_reset(
         }
         for s in &plan.strip_skill_dirs {
             println!("  해제  {}  (pack 스킬 심링크 제거)", s.display());
+        }
+        if let Some(s) = &plan.strip_agy_statusline {
+            println!("  해제  {}  (cys 가 넣은 agy 상태줄 연결 제거)", s.display());
         }
         if !plan.temp_sweep.is_empty() {
             println!("  소거  임시 캐시 {}건 ($TMPDIR)", plan.temp_sweep.len());
@@ -9265,6 +9378,7 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf())),
         consumed_config_dir: std::path::PathBuf::from(cys::resolve_claude_config_dir()),
+        agy_home: dirs::home_dir(),
     };
     let items = run_doctor_diagnostics(&ctx, fix);
     let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
@@ -17051,26 +17165,408 @@ fn statusline_human_line(v: &Value) -> String {
     parts.join(" · ")
 }
 
+/// ★0.14.42 RC4-b: cys 창 **밖** Claude 세션의 계정 전용 보고 RPC 이름(데몬 arm 과 핀으로 묶는다).
+const USAGE_REPORT_ACCOUNT_METHOD: &str = "usage.report_account";
+/// 상태줄 경로의 새 push(창 밖 Claude · agy 좌석)의 **총예산**(연결 포함 · 밀리초). 정상 왕복은 5–6ms(2026-09-23
+/// 실측) — 데몬 부재·무응답이어도 상태줄이 이 이상 늦지 않는다(종전 좌석 경로의 무응답 실측 40.05초).
+const STATUSLINE_PUSH_BUDGET_MS: u64 = 400;
+/// 창 밖 보고를 보낼 stdin 상한(바이트) — 실제 상태줄 JSON 은 수 KB 다.
+const OUTSIDE_STDIN_MAX: usize = 1024 * 1024;
+/// 창 밖 보고의 `session_file` 길이 상한(바이트) — 데몬(`accounts::OUTSIDE_SESSION_FILE_MAX`)과 같은 값.
+const OUTSIDE_SESSION_FILE_MAX: usize = 1024;
+/// ★fatal-fix (b) · F4 · R3-3 · W1: claude **좌석** 상태줄 push 의 총예산(연결 포함 · 밀리초). 종전 좌석 경로는
+/// `request()`(무진행 상한 40초 · 연결 실패 시 autostart — 윈도우는 파이프 busy 재시도까지 겹쳐 최악 약 205초 · 호출마다
+/// 형제 cysd 스폰)였고, 데몬이 멈추면 상태줄마다 cys 가 40초씩 살아 쌓였다. 좌석 보고는 ctx(60% 임계 신호)를 싣는
+/// 만큼 창 밖(0.4초)보다 넉넉히 둔다 — 정상 왕복 5–6ms · 데몬 쪽 호출자 추적 약 45ms(디버그). 윈도우는 실측 전이라
+/// 2초(W4). 예산을 넘겨도 요청이 이미 쓰였으면 데몬은 재개 뒤 그 보고를 반영한다(떠난 호출자도 받는다 — T3c) ·
+/// 못 쓰였으면 수집기의 transcript 폴백이 60초 안에 ctx 를 채운다(usage.rs STATUSLINE_FRESH_SECS).
+const SEAT_STATUSLINE_PUSH_BUDGET_MS: u64 = if cfg!(windows) { 2000 } else { 1000 };
+/// ★fatal-fix R3-1: 창 밖 push 의 CLI 자기 상한 — 같은 값은 이 주기(초) 안에 다시 보내지 않는다.
+const OUTSIDE_RESEND_SECS: f64 = 60.0;
+/// 값이 바뀌어도 이 간격(초) 안에는 보내지 않는다(데몬 선상한과 같은 값).
+const OUTSIDE_MIN_RESEND_SECS: f64 = 1.0;
+/// 직전 push 가 실패했으면(데몬 부재·정지·거절) 이만큼(초) 물러선다.
+const OUTSIDE_FAIL_BACKOFF_SECS: f64 = 10.0;
+
+/// 창 밖 push 기록(프로필별 작은 파일) — 마지막 시도 시각·보낸 값의 서명·성공 여부.
+#[derive(Debug, Clone, PartialEq)]
+struct OutsideStamp {
+    t: f64,
+    sig: String,
+    ok: bool,
+}
+
+/// ★fatal-fix R3-1: 지금 창 밖 push 를 보낼 때인가(순수 — 핀). 판정 근거가 없으면(첫 호출·손상·시계 역행) 보낸다 —
+/// 실패 방향은 종전 거동(매번 보냄)이다. 데몬이 멈춘 동안 창 밖 세션의 연결이 accept 대기열(128)을 채워 모든
+/// 클라이언트가 ECONNREFUSED 를 받던 경로(wedge 를 '데몬 없음'으로 오판 → 자동 기동 경쟁 → 데드맨)의 공급원을 줄인다.
+fn outside_push_due(prev: Option<&OutsideStamp>, sig: &str, now: f64) -> bool {
+    let Some(p) = prev else {
+        return true;
+    };
+    if !p.t.is_finite() || now < p.t {
+        return true;
+    }
+    let dt = now - p.t;
+    if !p.ok {
+        return dt >= OUTSIDE_FAIL_BACKOFF_SECS;
+    }
+    if dt < OUTSIDE_MIN_RESEND_SECS {
+        return false;
+    }
+    p.sig != sig || dt >= OUTSIDE_RESEND_SECS
+}
+
+/// 기록 파일 위치(순수) — 프로필(대화 기록 경로의 `/projects/` 앞)마다 하나. 같은 프로필의 세션들은 기록을 나눈다.
+fn outside_stamp_path_in(dir: &std::path::Path, session_file: &str) -> std::path::PathBuf {
+    let norm = session_file.replace('\\', "/");
+    let key = norm.find("/projects/").map_or(norm.as_str(), |i| &norm[..i]);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    dir.join(format!("{h:016x}.json"))
+}
+
+/// 운영 기록 폴더 — 사용자별 임시 폴더 아래. 남이 만든 폴더(유닉스 소유자 불일치)면 기록을 쓰지 않는다(None → 매번 보냄).
+fn outside_stamp_path(session_file: &str) -> Option<std::path::PathBuf> {
+    usage_stamp_dir().map(|dir| outside_stamp_path_in(&dir, session_file))
+}
+
+/// 상태줄 push 기록 폴더(창 밖 · agy 좌석 공용) — 위 `outside_stamp_path` 의 폴더 규약 그대로.
+fn usage_stamp_dir() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    let dir = {
+        // SAFETY: getuid 는 실패하지 않는다.
+        let uid = unsafe { libc::getuid() };
+        let d = std::env::temp_dir().join(format!("cys-outside-usage-{uid}"));
+        if let Ok(md) = std::fs::symlink_metadata(&d) {
+            use std::os::unix::fs::MetadataExt;
+            if !md.is_dir() || md.uid() != uid {
+                return None;
+            }
+        }
+        d
+    };
+    #[cfg(not(unix))]
+    let dir = std::env::temp_dir().join("cys-outside-usage");
+    Some(dir)
+}
+
+/// ★0.14.42 agy 자동 연결: agy 좌석 push 기록 파일(순수) — (소켓, 좌석)마다 하나. 좌석 번호는 데몬마다 따로 매겨지므로
+/// (본부·부서 데몬) 소켓 경로를 열쇠에 넣는다 — 다른 데몬의 같은 번호 좌석이 서로의 push 를 눌러 버리지 않게.
+fn agy_stamp_path_in(dir: &std::path::Path, socket: &std::path::Path, sid: u64) -> std::path::PathBuf {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in socket.to_string_lossy().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    dir.join(format!("agy-{h:016x}-{sid}.json"))
+}
+
+/// agy 쿼터 push 의 값 서명(순수) — 창 이름과 사용률(0.1% 단위)만. 리셋 시각은 넣지 않는다: `reset_in_seconds` 로
+/// 계산한 값은 부를 때마다 몇 초씩 달라져, 넣으면 '같은 값 1분 1회' 상한이 매초 1회로 무너진다(창이 리셋되면
+/// 사용률이 바뀌므로 서명도 바뀐다).
+fn agy_rate_sig(rate: &Value) -> String {
+    rate.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|w| {
+                    format!(
+                        "{}:{:.1}",
+                        w.get("label").and_then(|x| x.as_str()).unwrap_or("?"),
+                        w.get("used_pct").and_then(|x| x.as_f64()).unwrap_or(-1.0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default()
+}
+
+/// ★0.14.42 agy 자동 연결: agy 상태줄 stdin 판독 예산(밀리초) — agy 가 입력을 닫지 않아도 상태줄이 이 이상 걸리지 않는다.
+const AGY_STDIN_BUDGET_MS: u64 = 1000;
+
+/// stdin 을 예산 안에서 끝까지 읽는다(상한 `max` 바이트). 예산 초과·상한 초과·읽기 오류 = None(아무것도 하지 않고 끝낸다).
+/// 예산을 넘긴 판독 스레드는 버린다 — 이 프로세스가 곧 끝나므로 함께 사라진다(누적 없음).
+fn read_stdin_within(budget: std::time::Duration, max: usize) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let r = std::io::stdin().lock().take(max as u64 + 1).read_to_string(&mut s);
+        let _ = tx.send(r.ok().map(|_| s));
+    });
+    match rx.recv_timeout(budget) {
+        Ok(Some(s)) if s.len() <= max => Some(s),
+        _ => None,
+    }
+}
+
+fn read_outside_stamp(path: &std::path::Path) -> Option<OutsideStamp> {
+    let mut s = String::new();
+    std::fs::File::open(path).ok()?.take(4096).read_to_string(&mut s).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    Some(OutsideStamp {
+        t: v.get("t")?.as_f64()?,
+        sig: v.get("sig")?.as_str()?.to_string(),
+        ok: v.get("ok")?.as_bool()?,
+    })
+}
+
+/// 기록 쓰기 — 임시 파일 + 이름 바꾸기(동시 세션이 반쯤 쓴 파일을 읽지 않게). 실패는 무시(다음엔 그냥 보낸다).
+fn write_outside_stamp(path: &std::path::Path, stamp: &OutsideStamp) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = dir.join(format!(".{}.{}.tmp", std::process::id(), path.file_name().and_then(|n| n.to_str()).unwrap_or("s")));
+    let body = json!({"t": stamp.t, "sig": stamp.sig, "ok": stamp.ok}).to_string();
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn now_secs_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// 롤백 노브 `CYS_OUTSIDE_USAGE=0` — 창 밖 보고를 끈다(코드 되돌림 없이 종전 거동). 순수 판정부.
+fn outside_usage_enabled_with(raw: Option<&str>) -> bool {
+    raw.map(str::trim) != Some("0")
+}
+
+/// statusline JSON → 창 밖 계정 보고 파라미터 `{session_file, rate}` — **그 둘만** 싣는다(ctx·모델·cwd 등은
+/// 좌석 배지용이라 창 밖 입구에는 필요 없다). 보낼 것이 없으면 None(rate 비었음·transcript 없음·길이 초과).
+fn outside_account_params(v: &Value) -> Option<Value> {
+    // 좌석 경로와 **같은 추출기**를 쓴다(rate·transcript 해석이 두 벌로 갈리지 않게) — 그중 둘만 옮긴다.
+    let full = statusline_to_report_params(v);
+    let rate = full.get("rate").filter(|r| r.as_array().is_some_and(|a| !a.is_empty()))?;
+    let session_file = full
+        .get("session_file")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= OUTSIDE_SESSION_FILE_MAX)?;
+    Some(json!({"rate": rate, "session_file": session_file}))
+}
+
+/// agy(Antigravity CLI) 상태줄 stdin 인가 — 공식 문서의 `"product":"antigravity"` 가 정본이다.
+/// 보조 갈래(`product` 가 없는 구 agy 호환)는 **좁게** 둔다(fatal-fix N2 · R3-6): `quota` 맵에 `gemini-` 버킷이 실제로
+/// 있고 · `rate_limits` 가 없고 · 대화 기록이 claude 모양(`…/projects/…`)이 아닐 때만. 종전(쿼터 맵 ∧ rate_limits 부재)은
+/// 필드 이름 `quota` 하나만 겹쳐도 claude 좌석(API 키·Bedrock·첫 응답 전 = rate_limits 없음)을 agy 로 오판했고, 데몬이
+/// 그 보고를 'non-agy seat' 로 거절해 그 좌석의 ctx·60% 임계가 전부 끊겼다(경보 없는 영구 무clear).
+/// 실패 방향: product 없는 낯선 페이로드는 claude 경로로 간다(v0.14.41 과 같은 거동 — 막히는 쪽이 아니다).
+fn is_agy_statusline(v: &Value) -> bool {
+    if v.get("product").and_then(|x| x.as_str()) == Some("antigravity") {
+        return true;
+    }
+    let gemini_buckets = v
+        .get("quota")
+        .and_then(|q| q.as_object())
+        .is_some_and(|q| q.keys().any(|k| k.starts_with("gemini-")));
+    let claude_transcript = v
+        .get("transcript_path")
+        .and_then(|x| x.as_str())
+        .is_some_and(|t| t.replace('\\', "/").contains("/projects/"));
+    gemini_buckets && v.get("rate_limits").is_none() && !claude_transcript
+}
+
+/// agy 쿼터 맵 → `[(창, 사용률, 리셋 epoch?)]`(5h 먼저). 문서 스키마: `quota.<bucket id>.{remaining_fraction,
+/// reset_time(RFC3339), reset_in_seconds}`. `gemini-` 버킷만(3p 제외) · `-5h`→5h · `-weekly`→7d(claude/codex 배지와
+/// 라벨 통일) · 모르는 창은 버린다 · remaining_fraction 이 없으면 **결측**(0 으로 지어내지 않는다) · 같은 창으로
+/// 모이는 버킷이 여럿이면 더 많이 쓴 쪽(묶인 한도).
+///
+/// ★필드 의미(fix-values-1 F2 · agy 1.2.9 바이너리의 Go 타입 정보로 확인 — 실행·통신 없이 읽음):
+///   · 상태줄 버킷 `types.StatusLineQuotaBucket` 의 `RemainingFraction` 은 `*float32` 다. omitempty 는 **nil 만** 생략하므로
+///     소진 버킷(남은 비율 0)은 `"remaining_fraction":0` 으로 온다 → 여기서 100% 가 된다. 원천 proto(`QuotaSummaryBucket`)
+///     에서도 분수·양은 `oneof remaining` 이라 0 이 실린다. 즉 분수가 **없는** 버킷은 '소진'이 아니라 양 기반이거나
+///     정보가 없는 버킷이다 — 그래서 결측으로 둔다.
+///   · 같은 구조체의 `Disabled bool`(`"disabled":true`)은 agy 자신이 진행 막대 없이 'Disabled' 로만 그리는 버킷이다 —
+///     사용량이 아니므로 분수가 실려 와도 버린다(버리면 결측 · 지어낸 100% 로 경보가 나는 쪽을 막는다).
+fn agy_quota_windows(v: &Value, now: f64) -> Vec<(&'static str, f64, Option<f64>)> {
+    let mut out: Vec<(&'static str, f64, Option<f64>)> = Vec::new();
+    let Some(q) = v.get("quota").and_then(|x| x.as_object()) else {
+        return out;
+    };
+    for (id, b) in q {
+        if !id.starts_with("gemini-") {
+            continue;
+        }
+        let label = if id.ends_with("-5h") {
+            "5h"
+        } else if id.ends_with("-weekly") {
+            "7d"
+        } else {
+            continue;
+        };
+        if b.get("disabled").and_then(|x| x.as_bool()) == Some(true) {
+            continue; // 사용 안 함 버킷 — 사용량이 아니다(위 ★)
+        }
+        let Some(frac) = b.get("remaining_fraction").and_then(|x| x.as_f64()).filter(|f| f.is_finite()) else {
+            continue;
+        };
+        let used = ((1.0 - frac) * 100.0).clamp(0.0, 100.0);
+        let resets = b
+            .get("reset_time")
+            .and_then(|x| x.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp() as f64)
+            .or_else(|| {
+                b.get("reset_in_seconds")
+                    .and_then(|x| x.as_f64())
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+                    .map(|s| now + s)
+            });
+        match out.iter_mut().find(|w| w.0 == label) {
+            Some(w) if used > w.1 => *w = (label, used, resets),
+            Some(_) => {}
+            None => out.push((label, used, resets)),
+        }
+    }
+    out.sort_by_key(|w| u8::from(w.0 != "5h"));
+    out
+}
+
+/// agy 상태줄 stdin → usage.report 파라미터 `{rate, reporter:"agy"}`(surface 제외 · 순수 — 핀).
+fn agy_statusline_to_report_params(v: &Value, now: f64) -> Value {
+    // ★쿼터 숫자만 싣는다 — 페이로드의 email(계정 식별자)·transcript_path·cwd·ctx 는 한 글자도 옮기지 않는다
+    //   (ctx 를 실으면 agy 좌석에 context.threshold 가 새로 무장되고 session_file 은 재주입 판정이 읽는다 —
+    //   둘 다 이 작업의 범위 밖 거동 변경이다).
+    let rate: Vec<Value> = agy_quota_windows(v, now)
+        .into_iter()
+        .map(|(label, used, resets)| {
+            let mut w = json!({"label": label, "used_pct": used});
+            if let Some(r) = resets {
+                w["resets_at"] = json!(r);
+            }
+            w
+        })
+        .collect();
+    json!({"rate": rate, "reporter": "agy"})
+}
+
+/// agy 상태줄에 쌓아 보일 사람용 한 줄(`5h n% · 7d n% · cys`) — 쿼터 숫자만(이메일·경로 등 비노출).
+///
+/// ★0.14.42 agy 자동 연결(재개): `cys` 표지를 **끝**에 둔다. 자동 연결 뒤 이 줄은 모든 agy 좌석 화면의 맨 아래(agy 기본
+/// 줄 아래 · `stack_with_default`)에 오고, 부트 준비 판정의 꼬리 술어(`screen_tail_is_shell_prompt_on` — 마지막 비공백
+/// 줄이 `% $ # ❯` 로 끝나면 셸 프롬프트)는 `…25%` 로 끝나는 줄을 zsh 프롬프트로 읽는다(그러면 agy 좌석의 '화면 마커 +
+/// 시간 폴백'·관문 재관측 폴백이 닫힌다). 핀: `agy_statusline_line_never_looks_like_a_shell_prompt_at_the_screen_tail`.
+fn agy_statusline_human_line(v: &Value) -> String {
+    let mut parts: Vec<String> = agy_quota_windows(v, 0.0)
+        .into_iter()
+        .map(|(label, used, _)| format!("{label} {used:.0}%"))
+        .collect();
+    parts.push("cys".to_string());
+    parts.join(" · ")
+}
+
 /// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
 /// (quiet가 아니면) 사람용 statusline 한 줄을 stdout으로 출력한다.
 /// ★불변: statusline 경로는 **절대 claude를 막지 않는다** — 빈 입력·파싱 실패·surface 미해결·
 /// 데몬 부재 전부 exit 0으로 무해하게 흘린다.
-fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+/// ★fatal-fix (b) · F4 · R3-3 · W1 · W3: 세 경로(claude 좌석 · agy 좌석 · cys 창 밖) **모두** push 는 아래 한 곳의
+/// autostart 없는 **총예산** 왕복(`request_on_before`)으로만 보낸다 — 데몬이 없거나 멈춰도 상태줄이 예산 이상 늦지 않고,
+/// 상태줄이 데몬을 되살리지 않는다(좌석은 데몬과 함께 죽으므로 상태줄 autostart 에 기대는 복구 경로는 없다).
+/// 그리고 push 가 사람용 줄보다 **먼저**다: Claude Code 는 상태줄 프로세스가 끝난 뒤 stdout 을 쓰므로 선출력은 표시를
+/// 앞당기지 못하고, 닫힌 stdout(SIGPIPE·윈도우 println! panic)이 push 를 죽이게만 한다. 출력 오류는 무시한다.
+fn run_usage_report_stdin(surface: &Option<String>, quiet: bool, agy_only: bool) -> i32 {
+    // 닫힌 stdout 에 쓰다 SIGPIPE 로 죽지 않게(이 하위명령 한정) — 쓰기 오류는 아래에서 무시한다.
+    #[cfg(unix)]
+    // SAFETY: 이 프로세스의 SIGPIPE 처분만 바꾼다(스레드 생성 전 · 반환값 무시).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    // ★0.14.42 agy 자동 연결(`--agy` · cys-agy-statusline.sh): 판독에도 예산을 둔다(총예산 = 판독 1초 + push 0.4초).
+    let buf = if agy_only {
+        match read_stdin_within(std::time::Duration::from_millis(AGY_STDIN_BUDGET_MS), OUTSIDE_STDIN_MAX) {
+            Some(b) => b,
+            None => return 0,
+        }
+    } else {
+        let mut buf = String::new();
+        if std::io::stdin().read_to_string(&mut buf).is_err() {
+            return 0;
+        }
+        buf
+    };
+    if buf.trim().is_empty() {
         return 0;
     }
     let Ok(v) = serde_json::from_str::<Value>(&buf) else {
         return 0;
     };
-    // push (surface 미해결·데몬 부재는 조용히 스킵 — 사람용 줄은 여전히 출력한다)
-    if let Ok(sid) = target_surface(surface, &None) {
-        let mut params = statusline_to_report_params(&v);
-        params["surface_id"] = json!(sid);
-        let _ = request("usage.report", params);
+    // (사람용 줄, push = (method, params, 총예산 ms), push 기록 = (파일, 값 서명))
+    type Push = (&'static str, Value, u64);
+    let (line, push, stamp): (String, Option<Push>, Option<(std::path::PathBuf, String)>) = if agy_only
+        || is_agy_statusline(&v)
+    {
+        // ★RC2-b: agy 상태줄 — 좌석(cys 창 agy)에서만 보낸다. 창 밖 agy 는 보내지 않는다(오너 승인 범위 =
+        //   창 밖 **Claude** 세션). 데몬은 좌석이 agy(gemini)인지 다시 확인한다.
+        // ★0.14.42 agy 자동 연결: `--agy` 면 페이로드 판별을 건너뛴다(agy 페이로드를 claude 로 오판해 agy 좌석에 ctx·
+        //   60% 임계를 무장하는 갈래 차단). 자동 연결 뒤에는 모든 agy 좌석이 상태 변화마다 이 경로를 부르므로 창 밖 push 와
+        //   같은 CLI 자기 상한을 건다 — 같은 값 1분 1회 · 최소 1초 · 실패 뒤 10초(데몬 쪽 호출자 추적은 호출당 수십 ms 다).
+        let mut params = agy_statusline_to_report_params(&v, unix_now() as f64);
+        let mut stamp = None;
+        let push = match target_surface(surface, &None) {
+            Ok(sid) if params["rate"].as_array().is_some_and(|a| !a.is_empty()) => {
+                let sig = agy_rate_sig(&params["rate"]);
+                let path = usage_stamp_dir().map(|d| agy_stamp_path_in(&d, &socket_path(), sid));
+                let prev = path.as_deref().and_then(read_outside_stamp);
+                if outside_push_due(prev.as_ref(), &sig, now_secs_f64()) {
+                    stamp = path.map(|x| (x, sig));
+                    params["surface_id"] = json!(sid);
+                    Some(("usage.report", params, STATUSLINE_PUSH_BUDGET_MS))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        (agy_statusline_human_line(&v), push, stamp)
+    } else {
+        match target_surface(surface, &None) {
+            // cys 창 좌석(claude) — ctx·rate 배지 + 60% 임계 신호. 좌석 예산은 창 밖보다 넉넉하다.
+            Ok(sid) => {
+                let mut params = statusline_to_report_params(&v);
+                params["surface_id"] = json!(sid);
+                (statusline_human_line(&v), Some(("usage.report", params, SEAT_STATUSLINE_PUSH_BUDGET_MS)), None)
+            }
+            // ★RC4-b: cys 창 밖(surface 없음) Claude 세션 — 계정 전용 보고. `--surface` 를 잘못 준 경우는 종전처럼
+            //   조용히 건너뛴다(창 밖이 아니라 호출 오류다). ★fatal-fix R3-1: 같은 값 60초·최소 1초·실패 뒤 10초는 CLI 가
+            //   스스로 건너뛴다(프로필별 기록 파일 · 기록을 못 읽거나 못 쓰면 종전처럼 보낸다).
+            Err(_) => {
+                let enabled = surface.is_none()
+                    && outside_usage_enabled_with(cys::env_compat("CYS_OUTSIDE_USAGE").as_deref())
+                    && buf.len() <= OUTSIDE_STDIN_MAX;
+                let mut stamp = None;
+                let push = enabled.then(|| outside_account_params(&v)).flatten().and_then(|p| {
+                    let sig = p["rate"].to_string();
+                    let path = p["session_file"].as_str().and_then(outside_stamp_path);
+                    let prev = path.as_deref().and_then(read_outside_stamp);
+                    if !outside_push_due(prev.as_ref(), &sig, now_secs_f64()) {
+                        return None;
+                    }
+                    stamp = path.map(|x| (x, sig));
+                    Some((USAGE_REPORT_ACCOUNT_METHOD, p, STATUSLINE_PUSH_BUDGET_MS))
+                });
+                (statusline_human_line(&v), push, stamp)
+            }
+        }
+    };
+    if let Some((method, params, budget_ms)) = push {
+        // 소켓은 socket_path() 그대로(좌석 = pane 의 CYS_SOCKET · 창 밖 세션 = 기본 소켓 = 본부 — 격리 하네스 유지).
+        // 예산을 넘긴 왕복 스레드는 버린다 — 이 프로세스가 곧 끝나므로 함께 사라진다(누적 없음).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        let ok = request_on_before(&socket_path(), method, params, deadline).is_ok();
+        if let Some((path, sig)) = stamp {
+            write_outside_stamp(&path, &OutsideStamp { t: now_secs_f64(), sig, ok });
+        }
     }
     if !quiet {
-        println!("{}", statusline_human_line(&v));
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
     }
     0
 }
@@ -26389,6 +26885,336 @@ mod tests {
         assert_eq!(statusline_human_line(&v2), "claude · CTX 8%");
     }
 
+    // ───────── 0.14.42 RC2-b · RC4-b — agy 상태줄 · cys 창 밖 계정 보고(수정 전 적색) ─────────
+    // 픽스처는 전부 합성값(someone@example.test · /Users/x/…) — 실계정 식별자 금지.
+
+    /// agy 공식 상태줄 문서(https://antigravity.google/docs/cli/statusline/)의 페이로드 모양 — 값만 합성.
+    fn agy_payload() -> Value {
+        json!({
+            "cwd": "/Users/x/p", "session_id": "0000", "conversation_id": "0000",
+            "transcript_path": "/Users/x/.gemini/antigravity/brain/0000/.system_generated/logs/transcript.jsonl",
+            "model": {"id": "Gemini 3.5 Flash (High)", "display_name": "Gemini 3.5 Flash (High)"},
+            "version": "1.2.9",
+            "context_window": {"context_window_size": 1048576, "used_percentage": 14.24,
+                "current_usage": {"input_tokens": 63382, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 20857}},
+            "product": "antigravity",
+            "quota": {
+                "gemini-5h": {"remaining_fraction": 0.88, "reset_time": "2099-01-01T00:00:00Z", "reset_in_seconds": 5},
+                "gemini-weekly": {"remaining_fraction": 0.75, "reset_in_seconds": 600},
+                "3p-5h": {"remaining_fraction": 0.10, "reset_in_seconds": 60}
+            },
+            "agent_state": "idle", "plan_tier": "Pro",
+            "email": "someone@example.test"
+        })
+    }
+
+    /// RC2-b: agy 상태줄은 문서화된 필드(`product`·`quota`)로 알아본다 — claude 상태줄은 agy 로 오인하지 않는다.
+    #[test]
+    fn agy_statusline_is_detected_by_documented_fields() {
+        assert!(is_agy_statusline(&agy_payload()));
+        let mut no_product = agy_payload();
+        no_product.as_object_mut().unwrap().remove("product");
+        assert!(is_agy_statusline(&no_product), "quota 맵만 있어도 agy(claude 에는 없는 키)");
+        let claude = json!({
+            "transcript_path": "/Users/x/.claude-3/projects/-a/s.jsonl",
+            "context_window": {"used_percentage": 12.0},
+            "rate_limits": {"five_hour": {"used_percentage": 33.0}}
+        });
+        assert!(!is_agy_statusline(&claude));
+        assert!(!is_agy_statusline(&json!({"context_window": {"used_percentage": 1.0}})), "rate 없는 claude");
+        // 결측형 음성 대조: quota 가 맵이 아니면 agy 가 아니다
+        assert!(!is_agy_statusline(&json!({"quota": null})));
+        assert!(!is_agy_statusline(&json!({"quota": "x"})));
+    }
+
+    /// RC2-b: 쿼터 맵 → rate. `gemini-` 버킷만(3p 제외 — RPC 파서의 Gemini 그룹 필터와 같은 뜻) · `-5h`→5h ·
+    /// `-weekly`→7d · used=(1-remaining_fraction)×100 · 리셋은 reset_time, 없으면 now+reset_in_seconds ·
+    /// remaining_fraction 이 없으면 그 창은 **결측**(0 이 아니다). ★이메일·transcript·ctx 는 한 글자도 싣지 않는다.
+    #[test]
+    fn agy_statusline_quota_maps_to_rate_and_forwards_nothing_else() {
+        let now = 2_000_000_000.0;
+        let p = agy_statusline_to_report_params(&agy_payload(), now);
+        assert_eq!(p["reporter"], json!("agy"));
+        let rate = p["rate"].as_array().expect("rate 배열");
+        assert_eq!(rate.len(), 2, "{p}");
+        assert_eq!(rate[0]["label"], json!("5h"));
+        assert!((rate[0]["used_pct"].as_f64().unwrap() - 12.0).abs() < 1e-9);
+        assert_eq!(rate[0]["resets_at"].as_f64(), Some(4_070_908_800.0), "reset_time 우선");
+        assert_eq!(rate[1]["label"], json!("7d"));
+        assert!((rate[1]["used_pct"].as_f64().unwrap() - 25.0).abs() < 1e-9);
+        assert_eq!(rate[1]["resets_at"].as_f64(), Some(now + 600.0), "reset_time 없으면 now+reset_in_seconds");
+        let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["rate", "reporter"], "rate·reporter 외의 키가 실렸다: {p}");
+        let wire = p.to_string();
+        for leak in ["someone", "example.test", "transcript", "brain", "session", "ctx", "Pro"] {
+            assert!(!wire.contains(leak), "상태줄 원문 '{leak}' 이 데몬으로 새어 나간다: {wire}");
+        }
+        // 결측형: remaining_fraction 없음(remaining_amount 만) → 그 창 없음 · 전부 없으면 빈 rate
+        let amt = json!({"product": "antigravity", "quota": {"gemini-5h": {"remaining_amount": 3, "reset_in_seconds": 5}}});
+        assert_eq!(agy_statusline_to_report_params(&amt, now)["rate"], json!([]));
+        // 같은 창으로 모이는 버킷이 둘이면 더 많이 쓴 쪽(묶인 한도)을 보인다
+        let two = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.9}, "gemini-pro-5h": {"remaining_fraction": 0.4}}});
+        let r = agy_statusline_to_report_params(&two, now);
+        assert_eq!(r["rate"].as_array().unwrap().len(), 1);
+        assert!((r["rate"][0]["used_pct"].as_f64().unwrap() - 60.0).abs() < 1e-9);
+        // 범위 밖 분수는 잘라 0..100(지어낸 음수·초과 금지) · 모르는 창(daily 등)은 버린다
+        let odd = json!({"quota": {"gemini-5h": {"remaining_fraction": 1.5}, "gemini-daily": {"remaining_fraction": 0.2}}});
+        let r = agy_statusline_to_report_params(&odd, now);
+        assert_eq!(r["rate"], json!([{"label": "5h", "used_pct": 0.0}]));
+    }
+
+    /// RC2-b: agy 상태줄에 쌓아 보일 한 줄 — 쿼터 숫자만. 이메일·모델 원문을 찍지 않는다.
+    #[test]
+    fn agy_statusline_human_line_shows_quota_only() {
+        let line = agy_statusline_human_line(&agy_payload());
+        assert_eq!(line, "5h 12% · 7d 25% · cys");
+        assert!(!line.contains("someone"));
+        assert_eq!(agy_statusline_human_line(&json!({"quota": {}})), "cys");
+    }
+
+    /// ★0.14.42 agy 자동 연결(재개 · 부트 체인 ③ 잠재 위험): 자동 연결 뒤에는 **모든 agy 좌석** 화면의 맨 아래
+    /// (`stack_with_default` = agy 기본 줄 아래)에 이 줄이 붙는다. 부트 준비 판정의 꼬리 술어
+    /// (`screen_tail_is_shell_prompt_on` — 마지막 비공백 줄이 `% $ # ❯` 로 끝나면 셸 프롬프트)가 이 줄을 zsh 프롬프트로
+    /// 읽으면 agy 좌석의 '화면 마커 + 시간 폴백'·관문 재관측 폴백이 닫힌다. 그래서 사람용 줄은 **프롬프트 종결자로 끝나지
+    /// 않는다** — 그리고 붙은 뒤에도 gemini 유휴 composer 판정(강한 증거)·맨 셸 아님 판정이 그대로여야 한다.
+    #[test]
+    fn agy_statusline_line_never_looks_like_a_shell_prompt_at_the_screen_tail() {
+        let mut shapes = vec![agy_payload(), json!({"quota": {}})];
+        let mut exhausted = agy_payload();
+        exhausted["quota"]["gemini-5h"]["remaining_fraction"] = json!(0.0);
+        shapes.push(exhausted);
+        let mut only7d = agy_payload();
+        only7d["quota"]["gemini-5h"]["disabled"] = json!(true);
+        shapes.push(only7d);
+        for p in &shapes {
+            let line = agy_statusline_human_line(p);
+            for win in [false, true] {
+                assert!(!screen_tail_is_shell_prompt_on(&line, win), "셸 프롬프트로 읽힌다(win={win}): {line:?}");
+            }
+            // 실측 gemini 유휴 화면(readiness 검체와 같은 모양) + agy 기본 줄 아래에 쌓인 cys 줄
+            let screen = format!(
+                "  각성 확인 완료.\n────────────────────────\n>\n────────────────────────\n\
+                 ? for shortcuts                     Gemini 3.8 Flash · hig\n{line}\n"
+            );
+            assert!(!screen_tail_is_shell_prompt_on(&screen, false), "꼬리 술어가 뒤집혔다: {screen:?}");
+            assert!(!screen_is_bare_shell_on(&screen, false), "맨 셸로 읽힌다: {screen:?}");
+            assert!(cys::readiness::composer_edit_region_empty(&screen, ">", None), "유휴 composer 판정이 깨졌다: {screen:?}");
+        }
+    }
+
+    /// ★0.14.42 agy 자동 연결: 연결 명령(`hooks/cys-agy-statusline.sh`)이 부르는 `usage-report-stdin --agy` 가 파싱된다 ·
+    /// 스크립트는 그 플래그로만 부르고 항상 exit 0 · 옛 cys 가 모르는 플래그라 다운그레이드 때 옛 경로로 새지 않는다.
+    #[test]
+    fn agy_autolink_cli_flag_and_wrapper_contract() {
+        use clap::Parser;
+        match Cli::try_parse_from(["cys", "usage-report-stdin", "--agy"]).map(|c| c.command) {
+            Ok(Command::UsageReportStdin { agy, quiet, surface }) => {
+                assert!(agy && !quiet && surface.is_none());
+            }
+            Ok(_) => panic!("다른 명령으로 파싱됐다"),
+            Err(e) => panic!("--agy 가 파싱되지 않는다: {e}"),
+        }
+        let sh = include_str!("../../cysjavis-pack/hooks/cys-agy-statusline.sh");
+        let code: Vec<&str> = sh.lines().filter(|l| !l.trim_start().starts_with('#')).collect();
+        let code = code.join("\n");
+        assert!(code.contains("cys usage-report-stdin --agy"), "{code}");
+        assert!(code.trim_end().ends_with("exit 0"), "상태줄 명령은 항상 exit 0 이어야 한다:\n{code}");
+        assert!(!code.contains("python"), "상태줄 래퍼는 외부 의존이 없어야 한다");
+        assert!(!sh.contains('\r'), "CRLF 로 출하되면 sh 가 죽는다");
+        // 자동 연결이 넣는 명령이 바로 이 스크립트를 가리킨다(파일 이름 한 곳 · 표지 끝 토큰)
+        let cmd = cys::agy_statusline::link_command_for("/Users/x/.cys/pack", false, true).unwrap();
+        assert!(cmd.contains(&format!("/hooks/{}", cys::agy_statusline::SCRIPT)) && cmd.ends_with(cys::agy_statusline::MARKER));
+        assert_eq!(cys::agy_statusline::SCRIPT, "cys-agy-statusline.sh");
+    }
+
+    /// ★0.14.42 agy 자동 연결: 자동 연결 뒤에는 모든 agy 좌석이 상태 변화마다 push 한다 — 값 서명에 리셋 시각을 넣으면
+    /// (reset_in_seconds 기반은 부를 때마다 바뀐다) '같은 값 1분 1회' 상한이 매초 1회로 무너진다. 기록 파일은 (소켓, 좌석)
+    /// 마다 따로다(본부·부서 데몬의 같은 번호 좌석이 서로를 누르지 않게).
+    #[test]
+    fn agy_push_is_throttled_per_socket_and_seat() {
+        let a = agy_statusline_to_report_params(&agy_payload(), 1_000.0);
+        let b = agy_statusline_to_report_params(&agy_payload(), 1_007.0);
+        assert_ne!(a["rate"], b["rate"], "전제: reset_in_seconds 기반 리셋 시각은 부를 때마다 달라진다");
+        assert_eq!(agy_rate_sig(&a["rate"]), agy_rate_sig(&b["rate"]), "같은 사용률인데 서명이 다르다");
+        assert_eq!(agy_rate_sig(&a["rate"]), "5h:12.0|7d:25.0");
+        let mut used = agy_payload();
+        used["quota"]["gemini-5h"]["remaining_fraction"] = json!(0.5);
+        assert_ne!(agy_rate_sig(&agy_statusline_to_report_params(&used, 1_000.0)["rate"]), agy_rate_sig(&a["rate"]));
+        assert_eq!(agy_rate_sig(&json!([])), "");
+        let d = std::path::Path::new("/tmp/stamps");
+        let base = agy_stamp_path_in(d, std::path::Path::new("/s/cys.sock"), 5);
+        assert_eq!(base, agy_stamp_path_in(d, std::path::Path::new("/s/cys.sock"), 5), "결정론");
+        assert_ne!(base, agy_stamp_path_in(d, std::path::Path::new("/s/cys-dept-a.sock"), 5), "다른 데몬");
+        assert_ne!(base, agy_stamp_path_in(d, std::path::Path::new("/s/cys.sock"), 6), "다른 좌석");
+        assert!(base.starts_with(d));
+        // 상한 판정 자체는 창 밖 push 와 같은 함수(outside_push_due)다 — 같은 값 재전송은 1분 안에 없다
+        let st = OutsideStamp { t: 100.0, sig: agy_rate_sig(&a["rate"]), ok: true };
+        assert!(!outside_push_due(Some(&st), &agy_rate_sig(&b["rate"]), 130.0));
+        assert!(outside_push_due(Some(&st), &agy_rate_sig(&b["rate"]), 100.0 + OUTSIDE_RESEND_SECS));
+    }
+
+    /// fix-values-1 F2: 소진 = `"remaining_fraction":0` → **100%** 로 보인다(0 은 결측이 아니다). agy 1.2.9 바이너리의
+    /// 타입 정보로 확인한 상태줄 버킷(`types.StatusLineQuotaBucket`)의 `RemainingFraction` 은 `*float32` 다 — omitempty 는
+    /// nil 만 생략하므로 소진 버킷은 필드를 가진 채 0 으로 온다. 분수가 없는 버킷(양 기반·정보 없음)은 결측으로 두고
+    /// 100% 로 지어내지 않는다. `disabled:true` 버킷은 agy 자신도 진행 막대 없이 'Disabled' 로만 그리는 상태라
+    /// 사용량으로 치지 않는다(분수가 실려 와도).
+    #[test]
+    fn agy_statusline_exhausted_is_100_and_disabled_buckets_are_not_usage() {
+        let now = 2_000_000_000.0;
+        let exhausted = json!({"product": "antigravity", "quota": {
+            "gemini-5h": {"remaining_fraction": 0, "reset_in_seconds": 1200},
+            "gemini-weekly": {"remaining_fraction": 0.4, "reset_in_seconds": 300000}}});
+        assert_eq!(
+            agy_statusline_to_report_params(&exhausted, now)["rate"],
+            json!([{"label": "5h", "used_pct": 100.0, "resets_at": now + 1200.0},
+                   {"label": "7d", "used_pct": 60.0, "resets_at": now + 300000.0}]),
+            "소진 창이 빠졌다"
+        );
+        assert_eq!(agy_statusline_human_line(&exhausted), "5h 100% · 7d 60% · cys");
+        // 분수 생략 모양(리뷰 V2b) → 그 창은 결측(지어내지 않는다) · 나머지 창은 그대로
+        let omitted = json!({"quota": {"gemini-5h": {"reset_in_seconds": 1200},
+            "gemini-weekly": {"remaining_fraction": 0.4}}});
+        assert_eq!(agy_statusline_to_report_params(&omitted, now)["rate"], json!([{"label": "7d", "used_pct": 60.0}]));
+        // disabled 버킷은 분수가 있어도 사용량이 아니다 · disabled:false 는 평소대로
+        let disabled = json!({"quota": {
+            "gemini-5h": {"remaining_fraction": 0, "reset_in_seconds": 1200, "disabled": true},
+            "gemini-weekly": {"remaining_fraction": 0.4, "disabled": false}}});
+        assert_eq!(
+            agy_statusline_to_report_params(&disabled, now)["rate"],
+            json!([{"label": "7d", "used_pct": 60.0}]),
+            "사용 안 함(disabled) 버킷이 100% 사용으로 읽혔다"
+        );
+        assert_eq!(agy_statusline_human_line(&disabled), "7d 60% · cys");
+        let all_disabled = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.1, "disabled": true}}});
+        assert_eq!(agy_statusline_to_report_params(&all_disabled, now)["rate"], json!([]));
+        // 결측형 음성 대조: disabled 가 bool 이 아니면(null·문자열) 판정 근거가 아니다 — 평소대로 읽는다
+        let odd = json!({"quota": {"gemini-5h": {"remaining_fraction": 0.5, "disabled": null},
+            "gemini-weekly": {"remaining_fraction": 0.5, "disabled": "true"}}});
+        assert_eq!(agy_statusline_to_report_params(&odd, now)["rate"].as_array().unwrap().len(), 2);
+    }
+
+    /// RC4-b: 창 밖 보고 파라미터는 `{session_file, rate}` **둘뿐** — rate 가 비었거나 transcript 가 없거나 너무 길면
+    /// 보내지 않는다(데몬이 할 일이 없는 왕복 0).
+    #[test]
+    fn outside_account_params_carry_only_rate_and_session_file() {
+        let v = json!({
+            "session_id": "0000", "cwd": "/Users/x",
+            "transcript_path": "/Users/x/.claude-3/projects/-a/0000.jsonl",
+            "model": {"display_name": "Opus"},
+            "context_window": {"used_percentage": 12.0, "context_window_size": 200000},
+            "rate_limits": {"five_hour": {"used_percentage": 33.0, "resets_at": 1790000000},
+                            "seven_day": {"used_percentage": 44.0}}
+        });
+        let p = outside_account_params(&v).expect("보낼 것이 있는데 None");
+        let keys: Vec<&String> = p.as_object().unwrap().keys().collect();
+        assert_eq!(keys, vec!["rate", "session_file"], "{p}");
+        assert_eq!(p["session_file"], json!("/Users/x/.claude-3/projects/-a/0000.jsonl"));
+        assert_eq!(p["rate"].as_array().unwrap().len(), 2);
+        let mut no_rate = v.clone();
+        no_rate.as_object_mut().unwrap().remove("rate_limits");
+        assert!(outside_account_params(&no_rate).is_none(), "rate 없음(무료·첫 응답 전) → 보내지 않는다");
+        let mut no_tx = v.clone();
+        no_tx.as_object_mut().unwrap().remove("transcript_path");
+        assert!(outside_account_params(&no_tx).is_none(), "transcript 없음 → 귀속 불가 → 보내지 않는다");
+        let mut long = v.clone();
+        long["transcript_path"] = json!(format!("/Users/x/.claude-3/projects/-a/{}.jsonl", "a".repeat(1100)));
+        assert!(outside_account_params(&long).is_none(), "길이 상한");
+    }
+
+    /// RC4-b 롤백 노브: `CYS_OUTSIDE_USAGE=0` 이면 창 밖 보고를 보내지 않는다(그 밖 값·부재는 켬).
+    #[test]
+    fn outside_usage_kill_switch() {
+        assert!(outside_usage_enabled_with(None));
+        assert!(outside_usage_enabled_with(Some("1")));
+        assert!(!outside_usage_enabled_with(Some("0")));
+        assert!(!outside_usage_enabled_with(Some(" 0 ")));
+    }
+
+    /// RC4-b: 새 RPC 이름이 **양쪽에** 실재한다(클라이언트 상수 · 데몬 arm) — 이름이 갈리면 모든 창 밖 보고가
+    /// method_not_found 로 조용히 사라진다.
+    /// ★fatal-fix (b) · F4 · R3-3 · W1 · W3: **세 경로 모두**(claude 좌석 · 창 밖 · agy 좌석) autostart 없는 총예산 왕복
+    /// (`request_on_before`) 하나로만 보낸다. 종전 claude 좌석 경로는 `request("usage.report")`(무진행 상한 40초 ·
+    /// 연결 실패 시 autostart — 윈도우 최악 약 205초 · 호출마다 형제 cysd 스폰)였고, 데몬이 멈추면 상태줄마다 cys 가
+    /// 40초씩 살아 쌓였다. 그리고 push 가 사람용 줄보다 **먼저**다 — 닫힌 stdout(SIGPIPE·윈도우 println! panic)이 push 를
+    /// 죽이지 못한다(Claude Code 는 상태줄 프로세스가 끝난 뒤에 stdout 을 쓰므로 선출력은 표시를 앞당기지 못한다).
+    /// 사람용 줄은 쓰기 오류를 무시하는 `writeln!` 이다(`println!` 은 닫힌 stdout 에서 panic 한다).
+    #[test]
+    fn usage_report_account_rpc_exists_on_both_sides_and_is_bounded() {
+        assert_eq!(USAGE_REPORT_ACCOUNT_METHOD, "usage.report_account");
+        let daemon = strip_line_comments(include_str!("cysd/handlers.rs"));
+        assert!(
+            daemon.contains(&format!("\"{USAGE_REPORT_ACCOUNT_METHOD}\" =>")),
+            "데몬에 {USAGE_REPORT_ACCOUNT_METHOD} arm 이 없다"
+        );
+        let body = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "run_usage_report_stdin"));
+        assert!(body.contains("USAGE_REPORT_ACCOUNT_METHOD"), "창 밖 분기가 상수로 부르지 않는다");
+        assert_eq!(body.matches("request_on_before(").count(), 1, "세 경로는 공용 유계 push 하나로만 보낸다:\n{body}");
+        assert_eq!(body.matches("request(").count(), 0, "autostart·40초 경로(request)가 남았다:\n{body}");
+        assert!(!body.contains("AUTOSTART"), "autostart 전역을 건드리지 않는다(request_on_before 는 원래 무 autostart)");
+        assert!(!body.contains("println!"), "닫힌 stdout 에서 panic 하는 println! 을 쓴다:\n{body}");
+        let push_at = body.find("request_on_before(").unwrap();
+        let print_at = body.find("writeln!").expect("사람용 줄 출력");
+        assert!(push_at < print_at, "사람용 줄이 push 보다 먼저다(닫힌 stdout 이 push 를 죽인다):\n{body}");
+        assert!(STATUSLINE_PUSH_BUDGET_MS <= 500, "상태줄 총예산이 커졌다");
+        assert!(
+            (500..=2000).contains(&SEAT_STATUSLINE_PUSH_BUDGET_MS),
+            "좌석 예산은 ctx 보고(60% 임계 신호)를 싣는 만큼 창 밖보다 넉넉하되 2초를 넘지 않는다"
+        );
+    }
+
+    /// ★fatal-fix N2 · R3-6: agy 판별의 보조 갈래가 claude 페이로드를 agy 로 오판하면 그 좌석은 데몬이 'non-agy seat'
+    /// 로 거절해 ctx·usage.updated·context.threshold 가 **전부 0**이 된다(경보 없는 영구 무clear). rate_limits 는 API 키·
+    /// Bedrock 세션과 첫 응답 전에 없으므로, 필드 이름 `quota` 하나만 겹쳐도 발현한다. 그래서 보조 갈래는 **gemini 버킷이
+    /// 실제로 있는** 쿼터 맵 + rate_limits 부재 + claude 대화 기록 모양(`/projects/`)이 아닐 때로 좁힌다.
+    #[test]
+    fn fatal_fix_claude_payload_with_an_unfamiliar_quota_stays_on_the_claude_path() {
+        let claude_tx = "/Users/x/.claude-3/projects/-a/s.jsonl";
+        for quota in [json!({}), json!({"requests": {"remaining_fraction": 0.5}}), json!({"gemini-5h": {"remaining_fraction": 0.5}})] {
+            let v = json!({"transcript_path": claude_tx, "context_window": {"used_percentage": 70.0}, "quota": quota});
+            assert!(!is_agy_statusline(&v), "낯선 quota 를 가진 claude 페이로드가 agy 로 오판됐다: {v}");
+        }
+        // 대화 기록이 없는 claude(첫 응답 전) + 빈 quota 도 claude
+        assert!(!is_agy_statusline(&json!({"context_window": {"used_percentage": 1.0}, "quota": {}})));
+        // 호환: product 가 없는 구 agy 도 gemini 버킷 + agy 대화 기록 모양이면 agy
+        let mut old_agy = agy_payload();
+        old_agy.as_object_mut().unwrap().remove("product");
+        assert!(is_agy_statusline(&old_agy));
+        // product 가 antigravity 면 무조건 agy(공식 문서 필드)
+        assert!(is_agy_statusline(&json!({"product": "antigravity"})));
+    }
+
+    /// ★fatal-fix R3-1: 창 밖 push 는 CLI 가 스스로 줄인다 — 같은 값은 [`OUTSIDE_RESEND_SECS`] 안에 다시 보내지 않고,
+    /// 값이 바뀌어도 [`OUTSIDE_MIN_RESEND_SECS`] 안에는 보내지 않으며, 직전 push 가 실패했으면(데몬 부재·정지)
+    /// [`OUTSIDE_FAIL_BACKOFF_SECS`] 동안 물러선다. 데몬이 멈춘 동안 창 밖 세션의 연결이 accept 대기열(128)을 채워
+    /// 모든 클라이언트가 ECONNREFUSED 를 받던 경로(wedge 를 '데몬 없음'으로 오판 → 자동 기동 경쟁)의 공급원을 줄인다.
+    /// 판정 근거가 없으면(첫 호출·손상된 기록·시계 역행) 보낸다 — 실패 방향은 종전 거동이다.
+    #[test]
+    fn fatal_fix_outside_push_is_throttled_by_the_cli_stamp() {
+        let now = 2_000_000.0;
+        let st = |t: f64, sig: &str, ok: bool| OutsideStamp { t, sig: sig.to_string(), ok };
+        assert!(outside_push_due(None, "5h:33|7d:44", now), "첫 호출");
+        assert!(!outside_push_due(Some(&st(now - 10.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "같은 값 재전송");
+        assert!(outside_push_due(Some(&st(now - OUTSIDE_RESEND_SECS - 1.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "같은 값도 주기마다");
+        assert!(!outside_push_due(Some(&st(now - 0.2, "5h:33", true)), "5h:34", now), "값이 바뀌어도 최소 간격");
+        assert!(outside_push_due(Some(&st(now - 2.0, "5h:33", true)), "5h:34", now), "값이 바뀌면 곧 보낸다");
+        assert!(!outside_push_due(Some(&st(now - 2.0, "5h:33", false)), "5h:34", now), "실패 직후 물러선다");
+        assert!(outside_push_due(Some(&st(now - OUTSIDE_FAIL_BACKOFF_SECS - 1.0, "5h:33", false)), "5h:34", now));
+        assert!(outside_push_due(Some(&st(now + 100.0, "5h:33|7d:44", true)), "5h:33|7d:44", now), "시계 역행 = 근거 없음");
+        // 기록 파일: 프로필별 · 손상 내성
+        let dir = std::env::temp_dir().join(format!("cys-outside-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = outside_stamp_path_in(&dir, "/Users/x/.claude-3/projects/-a/s.jsonl");
+        let b = outside_stamp_path_in(&dir, "/Users/x/.claude-4/projects/-a/s.jsonl");
+        assert_ne!(a, b, "프로필마다 따로");
+        assert_eq!(a, outside_stamp_path_in(&dir, "/Users/x/.claude-3/projects/-b/t.jsonl"), "같은 프로필의 다른 세션은 같은 기록");
+        assert!(read_outside_stamp(&a).is_none());
+        write_outside_stamp(&a, &st(now, "5h:1", true));
+        assert_eq!(read_outside_stamp(&a).map(|s| (s.sig, s.ok)), Some(("5h:1".to_string(), true)), "쓰기 후 되읽기");
+        std::fs::write(&a, "garbage").unwrap();
+        assert!(read_outside_stamp(&a).is_none(), "손상된 기록은 근거가 아니다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.
     #[test]
     fn hook_event_params_mapping() {
@@ -28907,6 +29733,7 @@ mod tests {
             exe_dir: None,    // 기본은 설치 루트 미주입 = runtime-seal Skip(부작용 0)
             // 기본은 실소비 폴더 = settings_paths[0] 의 폴더(같은 파일) — 기존 hook 검체의 의미 보존.
             consumed_config_dir: base.to_path_buf(),
+            agy_home: None, // 기본은 agy 점검 Skip(다른 doctor 테스트에 부작용 0)
         }
     }
 
@@ -29791,6 +30618,70 @@ mod tests {
         assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
         // _env drop → 이전 값 복원.
+    }
+
+    /// ★0.14.42 agy 상태줄 자동 연결 — doctor 는 가짜 홈에서만 본다(기본 ctx 는 Skip). 사용자 설정은 --fix 로도 덮지
+    /// 않고, 부서·임시 팩 레인의 --fix 는 개인 설정을 만지지 않으며, 끔 파일이 있으면 cys 가 넣은 연결만 뺀다.
+    #[test]
+    fn doctor_agy_statusline_reports_and_fixes_only_in_the_fake_home() {
+        use cys::agy_statusline as agy;
+        let base = std::env::temp_dir().join(format!("cys-doc-agy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let settings = agy::settings_path_under(&home);
+        let by = |ctx: &DoctorCtx, fix: bool| {
+            run_doctor_diagnostics(ctx, fix).into_iter().find(|i| i.name == "agy-statusline").expect("진단 목록에 없다")
+        };
+        // 기본 ctx(홈 미주입) = Skip — 실 홈의 agy 를 보지 않는다
+        assert_eq!(by(&doctor_ctx_at(&base), true).status, DiagStatus::Skip);
+        let mut ctx = doctor_ctx_at(&base);
+        ctx.agy_home = Some(home.clone());
+        ctx.pack_dir = home.join(".cys").join("pack");
+        // agy 미설치 = Skip · 아무것도 만들지 않는다
+        assert_eq!(by(&ctx, true).status, DiagStatus::Skip);
+        assert!(!settings.parent().unwrap().exists());
+        // agy 기본형 = 미연결 Warn → --fix 로 연결 → Ok (설치된 팩처럼 래퍼를 둔다 — 없으면 연결하지 않는다)
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let wrapper = ctx.pack_dir.join("hooks").join(agy::SCRIPT);
+        std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        let dflt = "{\n  \"statusLine\": {\n    \"type\": \"\",\n    \"command\": \"\",\n    \"enabled\": false\n  }\n}\n";
+        std::fs::write(&settings, dflt).unwrap();
+        let it = by(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), dflt, "진단만으로는 쓰지 않는다");
+        // 부서·임시 팩 레인의 --fix 는 개인 설정 무접촉
+        let mut lane = doctor_ctx_at(&base);
+        lane.agy_home = Some(home.clone());
+        let it = by(&lane, true);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), dflt, "base 팩이 아닌 레인이 개인 설정을 고쳤다");
+        assert!(it.action.contains("base 팩"), "{}", it.action);
+        if cfg!(windows) {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // 윈도우는 자동 연결 안 함 — 아래 쓰기 시나리오는 유닉스 전용
+        }
+        let it = by(&ctx, true);
+        assert_eq!(it.status, DiagStatus::Ok, "{} / {}", it.detail, it.action);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(agy::command_is_ours_auto(v["statusLine"]["command"].as_str().unwrap()), "{v}");
+        assert_eq!(v["statusLine"]["stack_with_default"], json!(true));
+        // 사용자 설정은 --fix 로도 덮지 않는다
+        let user = "{\"statusLine\": {\"type\": \"command\", \"command\": \"~/mine.sh\"}}";
+        std::fs::write(&settings, user).unwrap();
+        let it = by(&ctx, true);
+        assert_eq!(it.status, DiagStatus::Warn);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), user);
+        // 끔 파일 → --fix 가 cys 가 넣은 연결만 뺀다
+        std::fs::write(&settings, dflt).unwrap();
+        assert_eq!(by(&ctx, true).status, DiagStatus::Ok);
+        std::fs::create_dir_all(home.join(".cys")).unwrap();
+        std::fs::write(home.join(".cys").join(agy::OFF_FILE), "").unwrap();
+        assert_eq!(by(&ctx, false).status, DiagStatus::Warn, "노브가 꺼졌는데 연결이 남은 상태");
+        let it = by(&ctx, true);
+        assert_eq!(it.status, DiagStatus::Ok, "{}", it.detail);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v.get("statusLine").is_none(), "{v}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ───────────────────────── W1: 계정 dir 영속 + resume 재현 ─────────────────────────

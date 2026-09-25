@@ -387,7 +387,17 @@ pub fn snapshot(daemon: &Arc<Daemon>, now: f64) -> Snapshot {
             }
             let role = s.role.lock().unwrap().clone().unwrap_or_else(|| "?".into());
             if let Some(u) = s.observed_usage.lock().unwrap().as_ref() {
+                // ★fatal-fix N1: agy 좌석(agent gemini)의 쿼터는 **계정 하나**의 사실이다 — 좌석마다 싣으면 좌석 N개가 같은
+                //   쿼터로 키 2N개를 만들어 CSO 시간당 경보 예산을 잠식했다(좌석 3개 → 키 8개). 같은 사실은 계정 축
+                //   (`account_rate:Antigravity (agy)`)이 덮는다. 좌석 배지 표시는 그대로다(경보 입력에서만 뺀다).
+                if u.agent == "gemini" {
+                    continue;
+                }
                 for w in &u.rate {
+                    // ★fatal-fix R3-2: 리셋이 지난 창은 경보 근거가 아니다(UI '리셋됨'과 같은 규칙).
+                    if !crate::usage::rate_window_live(w, u.updated_at, now) {
+                        continue;
+                    }
                     rates.push((role.clone(), w.label.clone(), w.used_pct));
                 }
             }

@@ -211,14 +211,15 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(m.primary).toBeNull();
     expect(m.message).toContain("아직 관측된 사용량 없음");
   });
-  it("전부 관측 전이면 개수만(목록은 툴팁)", () => {
+  it("전부 관측 전이어도 계정마다 한 줄씩 이름이 보인다(개수·툴팁으로 숨기지 않는다 — 0.14.42 RC4)", () => {
     const m = buildUsageBarModel(
       [acct({ updated_at: null, profiles: [".claude-1"] }), acct({ updated_at: null, profiles: [".claude-2"] })],
       NOW, ok, noRedact,
     );
     expect(m.primary).toBeNull();
     expect(m.unobservedCount).toBe(2);
-    expect(m.unobservedTooltip).toContain("claude-1");
+    expect(m.others.map((o) => o.label).sort()).toEqual(["claude-1", "claude-2"]);
+    expect(m.others.every((o) => o.unobserved && o.dim && o.text.startsWith("관측 전"))).toBe(true);
     expect(m.message).toContain("아직 관측된 사용량 없음");
   });
   it("3회 연속 실패면 값은 유지하고 '데몬 응답 없음 — HH:MM 기준 값'", () => {
@@ -283,10 +284,18 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(profileTail(".claude-1")).toBe(".claude-1");
     expect(profileTail("")).toBe("");
   });
-  it("툴팁은 집계 범위를 정직하게 적는다(기본 claude·외부 터미널은 빠진다 — 반박 §5-8)", () => {
+  it("툴팁은 집계 범위를 정직하게 적는다(0.14.42 RC4-b: 외부 터미널 Claude 세션도 모인다 · 표시용 · 한계)", () => {
     const a = acct({ rate: [win("5h", 5)] });
     const t = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
     expect(t).toContain("외부 터미널");
+    expect(t).not.toContain("빠집니다"); // 수정 전 문구 — 이제 거짓이다
+    expect(t).toContain("표시용"); // 창 밖 값은 경보 근거가 아니다
+  });
+  it("창 밖 세션 값(source statusline-outside)은 라이브 관측이고 툴팁에 출처가 사람 말로 드러난다", () => {
+    const a = acct({ source: "statusline-outside", rate: [win("5h", 40)] });
+    expect(isLiveAccount(a)).toBe(true);
+    const t = buildUsageBarModel([a], NOW, ok, noRedact).primary!.tooltip;
+    expect(t).toContain("관측: cys 창 밖 상태줄"); // 출처 줄 자체가 사람 말(고지 문구에 기대지 않는다)
   });
   it("나머지 관측 계정은 한 줄씩 · 주 계정 제외 · 상한 초과분은 개수", () => {
     const many = Array.from({ length: USAGE_OTHERS_MAX + 3 }, (_, i) =>
@@ -320,6 +329,108 @@ describe("패널 모델 — 정직한 공백", () => {
     expect(() => buildUsageBarModel(null as unknown as AcctRow[], NOW, ok, noRedact)).not.toThrow();
     expect(() => buildUsageBarModel([null, 3, "x"] as unknown as AcctRow[], NOW, ok, noRedact)).not.toThrow();
     expect(() => buildUsageBarModel([acct({ rate: null as unknown as [] , profiles: null as unknown as [] })], NOW, ok, noRedact)).not.toThrow();
+  });
+});
+
+describe("0.14.42 — 발견된 계정은 전부 한 줄씩(오너 제보: 클로드 일부·antigravity 가 안 보임)", () => {
+  const ok = { everOk: true, failStreak: 0, okAtSec: NOW };
+  // 합성 픽스처 — 계정 id·사용률·폴더 배치 모두 지어낸 값이다(실제 계정 식별자·실사용 값·실제 폴더 대응을 싣지 않는다).
+  // 모양만 재현: 관측된 Claude 2계정(여러 폴더·좌석·부서 폴더 공유) + 관측된 Codex + 관측 전 Claude 2계정
+  // (그중 하나는 기본 프로필 ~/.claude 포함) + RC1 수리로 생기는 관측 전 antigravity 행.
+  const live = () => [
+    acct({ account_id: "acct-a", profiles: [".claude-2", ".cys/claude-default-dept-1"], rate: [win("5h", 30), win("7d", 20)] }),
+    acct({ account_id: "acct-b", profiles: [".claude-1", ".cys/claude", ".cys/claude-default-dept-2"], rate: [win("5h", 10), win("7d", 60)] }),
+    acct({ provider: "codex", account_id: "default", label: "OpenAI Codex", profiles: [".codex"], source: "rollout", updated_at: NOW - 600, rate: [win("7d", 15)] }),
+    acct({ account_id: "acct-c", profiles: [".claude-4"], updated_at: null, stale_secs: null, source: "", rate: [] }),
+    acct({ account_id: "acct-d", profiles: [".claude", ".claude-3"], updated_at: null, stale_secs: null, source: "", rate: [] }),
+    acct({ provider: "antigravity", account_id: "default", label: "Antigravity (agy)", profiles: [".gemini/antigravity-cli"], updated_at: null, stale_secs: null, source: "", rate: [] }),
+  ];
+  it("★재현: 관측 없는 Claude 2계정·Antigravity 도 이름이 행으로 나온다(수정 전: '관측 없음 2개' 한 줄 + 툴팁)", () => {
+    const m = buildUsageBarModel(live(), NOW, ok, noRedact);
+    const shown = [m.primary!.label, ...m.others.map((o) => o.label)];
+    for (const want of ["claude-2", "claude-1", "Codex", "claude-4", "claude", "Antigravity"])
+      expect({ 계정: want, 보임: shown.includes(want) }).toEqual({ 계정: want, 보임: true });
+    expect(m.moreCount).toBe(0); // 6계정은 상한 안에 다 들어간다
+    expect(shown.length).toBe(6);
+  });
+  it("관측된 계정이 관측 전 계정보다 먼저 — 상한이 관측값을 밀어내지 않는다", () => {
+    const m = buildUsageBarModel(live(), NOW, ok, noRedact);
+    const firstUnobs = m.others.findIndex((o) => o.unobserved);
+    const lastObs = m.others.map((o) => !o.unobserved).lastIndexOf(true);
+    expect(firstUnobs).toBeGreaterThan(lastObs);
+  });
+  it("관측 전 행: 흐리게 · '관측 전 · <짧은 사유>' · 값(%)을 지어내지 않는다", () => {
+    const m = buildUsageBarModel(live(), NOW, ok, noRedact);
+    const c4 = m.others.find((o) => o.label === "claude-4")!;
+    expect(c4.unobserved).toBe(true);
+    expect(c4.dim).toBe(true);
+    expect(c4.text.startsWith("관측 전")).toBe(true);
+    expect(c4.text.includes("%")).toBe(false);
+    expect(c4.tooltip).toContain("외부 터미널"); // 왜 비었는지 — 창 밖 세션도 상태줄이 cys 로 연결돼 있어야 모인다
+    expect(c4.tooltip).not.toContain("집계되지 않습니다"); // 수정 전 문구(0.14.42 RC4-b 로 거짓이 됨)
+    expect(c4.text).not.toContain("cys 창에서"); // 창 안에서만 들어온다는 사유는 더 이상 참이 아니다
+  });
+  it("agy CSRF 거절(agy_csrf_required)은 '무엇을 하면 값이 들어오나'(상태줄 연결)를 말한다", () => {
+    const rows = live();
+    rows[5].source_error = "agy_csrf_required";
+    const agy = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(agy.text.startsWith("관측 실패")).toBe(true);
+    expect(agy.text).toContain("상태줄");
+    expect(agy.tooltip).toContain("CSRF");
+    expect(agy.tooltip).toContain("agy_csrf_required");
+    rows[5].source_error = null; // 결측형 — 관측 전 사유도 상태줄 경로를 가리킨다
+    const pre = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(pre.text).toContain("상태줄");
+  });
+  it("fatal-fix W5: RPC 경로가 없는 플랫폼(agy_statusline_required)도 '상태줄 연결'을 가리킨다 — 포트 못 찾음이 아니다", () => {
+    const rows = live();
+    rows[5].source_error = "agy_statusline_required";
+    const agy = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+    expect(agy.text.startsWith("관측 실패")).toBe(true);
+    expect(agy.text).toContain("상태줄");
+    expect(agy.text).not.toContain("포트");
+    expect(agy.tooltip).toContain("agy_statusline_required");
+    expect(agy.tooltip).toContain("Windows");
+  });
+  it("관측 경로 고장(source_error)은 '관측 전'과 구별된다 — agy 거부 코드 보존", () => {
+    const rows = live();
+    rows[5].source_error = "agy_http_403";
+    const m = buildUsageBarModel(rows, NOW, ok, noRedact);
+    const agy = m.others.find((o) => o.label === "Antigravity")!;
+    expect(agy.text.startsWith("관측 실패")).toBe(true);
+    expect(agy.text).toContain("403");
+    expect(agy.tooltip).toContain("agy_http_403");
+    for (const code of ["agy_unreachable", "agy_no_quota", "agy_no_port", "agy_no_process", "agy_csrf_required", "agy_statusline_required", "brand_new_code"]) {
+      rows[5].source_error = code;
+      const t = buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!;
+      expect({ code, 실패표기: t.text.startsWith("관측 실패") }).toEqual({ code, 실패표기: true });
+    }
+    rows[5].source_error = null; // 결측형 — 오류 없음이면 '관측 전'
+    expect(buildUsageBarModel(rows, NOW, ok, noRedact).others.find((o) => o.label === "Antigravity")!.text.startsWith("관측 전")).toBe(true);
+  });
+  it("관측 어댑터 없는 선언 계정(adapter:false)은 그 사실을 적는다", () => {
+    const m = buildUsageBarModel([acct({ provider: "grok", account_id: "default", label: "grok", updated_at: null, source: "", adapter: false })], NOW, ok, noRedact);
+    expect(m.others[0].text).toContain("어댑터 없음");
+  });
+  it("🔒 가림은 관측 전 행 툴팁에도 그대로(이메일·절대경로 비노출) · 라벨에 이메일 없음", () => {
+    const rows = [acct({ account_id: "zz", label: "hidden@corp.example", profiles: ["/Users/runner/.claude-7"], updated_at: null, source: "" })];
+    const m = buildUsageBarModel(rows, NOW, ok, (s) => `#${s.length}`, true);
+    const row = m.others[0];
+    expect(row.label).toBe("claude-7");
+    expect(row.tooltip.includes("hidden@corp.example")).toBe(false);
+    expect(row.tooltip.includes("runner")).toBe(false);
+    expect(row.tooltip).toContain("#19");
+  });
+  it("Antigravity 제공자 라벨 — 프로필(.gemini/antigravity-cli)은 Claude 규칙에 걸리지 않는다", () => {
+    expect(accountShortLabel(acct({ provider: "antigravity", profiles: [".gemini/antigravity-cli"], label: "Antigravity (agy)" }))).toBe("Antigravity");
+  });
+  it("상한은 관측·관측 전 구분 없이 같은 '외 N개' 규칙", () => {
+    const many = Array.from({ length: USAGE_OTHERS_MAX + 4 }, (_, i) =>
+      acct({ account_id: `u${i}`, profiles: [`.claude-${i}`], updated_at: i === 0 ? NOW - 5 : null, source: i === 0 ? "statusline" : "", rate: i === 0 ? [win("5h", 5)] : [] }),
+    );
+    const m = buildUsageBarModel(many, NOW, ok, noRedact);
+    expect(m.others.length).toBe(USAGE_OTHERS_MAX);
+    expect(m.moreCount).toBe(3);
   });
 });
 
