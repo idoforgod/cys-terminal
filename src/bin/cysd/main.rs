@@ -30,6 +30,7 @@ mod schedule;
 mod severity;
 mod skillrun;
 mod state;
+mod teamtoken;
 mod undo;
 mod usage;
 // ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).
@@ -5821,3 +5822,7 @@ mod cysd_args_tests {
 // 호출이 안 보여 H-TICK-ALIVE가 오탐 실패한다.
 #[cfg(test)]
 mod team_gate_tests;
+
+// ★0.14.42 P5 대화 승인 1회용 팀 생성 토큰 — 데몬 집행 핀(테스트 전용 · 파일 끝 규약은 위 U16 과 같다).
+#[cfg(test)]
+mod team_token_tests;

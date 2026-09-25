@@ -128,7 +128,9 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 | `vibecoding/*.sh` | PostToolUse | 바이브코딩 넛지(옵트인) |
 
 훅이 아닌 파일: `_lib.sh`(프리루드 §2) · `cys-statusline.sh`(statusline 래퍼) ·
-`inject_gate.py`(주입 포이즌 게이트 — inject-context 가 부른다) · `test_pre_dispatch.sh`(회귀 하네스).
+`inject_gate.py`(주입 포이즌 게이트 — inject-context 가 부른다) · `test_pre_dispatch.sh`(회귀 하네스) ·
+`teamtoken-issue.sh`(대화 승인 1회용 팀 생성 토큰 발급 — `role-bootstrap.sh` 런처가 토큰 원장이 최근
+10분 안에 움직였을 때만 부른다 · 등록하지 않는다).
 
 ## 6. 훅이 안 도는 것 같을 때 보는 순서
 

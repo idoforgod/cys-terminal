@@ -9,6 +9,7 @@
   reap|promote-ceo)를 `cys-dept <동사>` **호출형**(백틱 안이라도)으로 적으면 지시-집행 통일
   검체 H-DOC-3(run_bootstrap_health.py)와 본 --check 가 동시에 적색이 된다 — 산문으로 언급할
   때는 동사 단독 백틱(`launch`)까지만 쓰고 `cys-dept` 를 앞에 붙이지 마라.
+  (예외 하나: 가드 코드에 토큰 관문 갈래가 있는 동안의 `cys-dept create --team-token <토큰>` — 아래 ④.)
 
 합성(빌드타임 변환 금지 — repo 커밋 산출물):
     [scripts/ceo_template_header.md — CEO 머리글+합성 서문 fragment(비출하)]
@@ -35,6 +36,7 @@
      `--` 를 넣으면 전부서 방송이 전 함대에서 항상 실패한다 · R3 critical).
   ④ H-DOC-3 동일 규칙: cys-dept 단일소유 가드 case 에서 차단 동사 집합을 코드로 뽑아,
      합성본이 호출형(`cys-dept <동사>`)으로 지시하는 동사 집합과 교집합 0 을 단언.
+     (0.14.42: 가드에 토큰 관문 갈래가 코드로 있으면 `cys-dept create --team-token` 호출형만 면제 — _used_verbs)
   ⑤ fan-out 스니펫 실행 스모크: fragment 의 방송 루프를 스텁 cys-dept/cys 로 격리 실행해
      전 부서(2개 스텁)에 send+send-key 가 실제 도달함을 단언(라이브 데몬 무접촉).
 """
@@ -125,6 +127,22 @@ def _blocked_verbs():
             "rotate", "reap", "promote-ceo"} <= blocked:
         raise AssertionError("가드 차단 집합이 예상보다 좁다: %s" % sorted(blocked))
     return blocked
+
+
+# ★0.14.42 대화 승인 토큰 갈래 — cys-dept 단일소유 가드의 `create --team-token` 분기 표지(코드가 면제의 근거).
+TOKEN_CREATE_BRANCH_RE = re.compile(r'\[ "\$cmd" = "create" \] && \[ "\$\{2:-\}" = "--team-token" \]')
+
+
+def _used_verbs(text):
+    """합성본이 **호출 형태로** 지시하는 cys-dept 동사 집합(`cys-dept <verb>`).
+
+    ★0.14.42: 가드에 `create --team-token` 토큰 관문 갈래가 **코드로** 있으면 그 정확한 호출형만 뺀다 —
+    그 형태는 역할이 아니라 토큰 관문(데몬 검증)이 판정하므로 지시해도 가드와 모순이 아니다(본문 §4-A-2).
+    토큰 없는 `cys-dept create` 는 여전히 위반이고, 갈래가 코드에서 사라지면 면제도 사라진다.
+    run_bootstrap_health.py H-DOC-3 `_hdoc3_used_verbs()` 와 같은 규칙이다."""
+    if TOKEN_CREATE_BRANCH_RE.search(_read_bytes(CYS_DEPT).decode("utf-8", "replace")):
+        text = re.sub(r"cys-dept\s+create\s+--team-token\b", "", text)
+    return set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", text))
 
 
 def _fanout_snippet(frag_text):
@@ -229,7 +247,7 @@ def check():
     # ④ H-DOC-3 동일 규칙: 호출형 지시 동사 ⊆ 가드 허용 집합
     try:
         blocked = _blocked_verbs()
-        used = set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", composed_text))
+        used = _used_verbs(composed_text)
         if not used:
             problems.append("합성본에 cys-dept 사용 예 0건 — 추출기 파손 의심(fail-closed)")
         illegal = sorted(used & blocked)

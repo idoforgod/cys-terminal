@@ -148,6 +148,9 @@ def main():
     # 9~11. ★ensure 판정 순서·표면화 계약(2026-07-26 배너 불멸 수리 회귀 핀).
     ensure_order_gate(m)
 
+    # 14. ★편성 결판 알림(0.14.42 RE-R3-01 · RV-ROLE-1 · RV-ROLE-2) — 이벤트 구동·단계별 1회·재기동 재발화 0.
+    onboard_gate(m)
+
     print("\n=== %d/%d PASS (fails: %s) ===" % (_total[0] - len(fails), _total[0], fails))
     return 0 if not fails else 1
 
@@ -359,6 +362,714 @@ def ensure_order_gate(m):
             os.environ.pop("CYS_STATE_DIR", None)
         else:
             os.environ["CYS_STATE_DIR"] = saved_state
+        shutil.rmtree(td, ignore_errors=True)
+
+
+# ── 14. ★편성 결판 알림(0.14.42 RE-R3-01 · RV-ROLE-1 · RV-ROLE-2) ──
+#   배경: 대표(CEO)가 턴 안에서 편성을 기다리지 않게 바꾼 뒤(50c6fc33), 편성 완료 후의 일(부서장 전원 각성 지시 =
+#   오너 ABSOLUTE ANCHOR · 첫 과제 · 오너 1줄 보고)이 대표의 기억과 '다음 깨어남'의 우연에 매달렸다. 편성 도구가
+#   결판(완결·부분·보류·실패)을 이미 판정하므로 **그 자리에서** 부서장·대표 좌석에 큐로 단계별 1회 알린다.
+#   핀: ①무장(arm)된 새 팀만 ②대상·단계당 정확히 1회 ③재기동(새 프로세스·--force-surface) 뒤 재발화 0 ④부서장 좌석에
+#   에이전트가 없으면 각성 지시 보류(빈 셸 금지 · 지침보다 먼저 가지 않게) ⑤전송 실패는 유계 재시도 ⑥늦은 알림 금지(TTL).
+def _status(roles, master_seat="occupied", master_alive=True):
+    surfs = []
+    for i, r in enumerate(sorted(roles)):
+        s = {"surface_id": i + 1, "role": r, "exited": False, "agent": "claude", "agent_alive": True,
+             "seat": "occupied"}
+        if r == "master":
+            s["seat"] = master_seat
+            s["agent_alive"] = master_alive
+            if master_seat == "empty":
+                s["agent"] = None
+                s["agent_alive"] = None
+        surfs.append(s)
+    return {"surfaces": surfs}
+
+
+def _spec_b64(pid="tp-1790300000-ab12", display="일반저술출판부"):
+    import base64
+    import json as _j
+    return base64.urlsafe_b64encode(_j.dumps({"v": 1, "id": pid, "display": display,
+                                              "purpose": "책을 쓴다."}, ensure_ascii=False)
+                                    .encode("utf-8")).decode("ascii")
+
+
+def _onboard_harness(m, live, installed, resource_ok, status):
+    """ensure 외부 접촉 스텁(_ensure_harness) + 알림 seam 2개(_onboard_status · _queue_push) 스텁.
+    반환 (pushes, box): pushes = [(socket|None, text)] · box["status"]/box["ok"] 로 도중에 바꾼다."""
+    feeds = _ensure_harness(m, live, installed, resource_ok)
+    pushes = []
+    box = {"status": status, "ok": True}
+    m._onboard_status = lambda socket: box["status"]
+    m._queue_push = lambda socket, text: (pushes.append((socket, text)) or box["ok"])
+    m._onboard_registered = lambda rec: True   # 팀 명부 대조는 14m 이 실물로 잰다
+    return pushes, box, feeds
+
+
+def onboard_gate(m):
+    import shutil
+    import tempfile
+    need = ("onboard_arm", "_onboard_notify", "_onboard_status", "_queue_push", "AWAKEN_ORDER",
+            "FORMATION_PARTIAL_MSG", "_onboard_path")
+    if not all(hasattr(m, n) for n in need):
+        check("14 편성 결판 알림 API(onboard_arm·_onboard_notify·seam)", False,
+              "미구현: %r" % [n for n in need if not hasattr(m, n)])
+        return
+    saved = {k: getattr(m, k, None) for k in   # 없는 이름(구판)은 None — 개별 핀이 FAIL 로 센다(스위트 중단 아님)
+             ("gate_check", "_installed_clis", "_live_roles", "_resource_ok", "_boot_node",
+              "_ensure_master_seat", "_feed", "_emit_evt", "_onboard_status", "_queue_push", "ensure",
+              "_onboard_registered", "_onboard_watch_limits", "_onboard_settle", "_replace_state_obj")}
+    saved_state = os.environ.get("CYS_STATE_DIR")
+    saved_watch = os.environ.get("CYS_ONBOARD_WATCH_S")
+    os.environ["CYS_ONBOARD_WATCH_S"] = "0"   # 기본은 지켜보기 끔 — (r)~(t) 만 짧은 창으로 켠다
+    td = tempfile.mkdtemp(prefix="fmob-")
+    os.environ["CYS_STATE_DIR"] = td
+    all_clis = {"claude", "agy", "codex"}
+    import io as _io0
+    import contextlib as _ctx0
+    # 오너 원문(ABSOLUTE ANCHOR) — 모듈 상수가 글자 그대로여야 한다.
+    owner = "CSO, Worker, 리뷰어 등 모든 노드 전원에게 각자의 지침을 하달하고, 전원 각성 절차를 진행하라."
+    try:
+        check("14a0 부서장 각성 지시 문안 = 오너 원문 그대로", m.AWAKEN_ORDER == owner, repr(m.AWAKEN_ORDER))
+        # §10 문구 단일 출처 대조(javis_teamtoken.OWNER_MESSAGES['formation_partial'])
+        tt_path = os.path.normpath(os.path.join(SELF, "..", "javis_teamtoken.py"))
+        spec = importlib.util.spec_from_file_location("javis_teamtoken_fm", tt_path)
+        tt = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tt)
+        check("14a1 부분 편성 오너 문구 = §10 원문(javis_teamtoken formation_partial)",
+              m.FORMATION_PARTIAL_MSG == tt.OWNER_MESSAGES["formation_partial"],
+              "%r != %r" % (m.FORMATION_PARTIAL_MSG, tt.OWNER_MESSAGES["formation_partial"]))
+
+        # (a) 무장 + 완결(부서장 에이전트 있음) → 부서장 1 · 대표 1 · 부서장이 먼저.
+        S = "/tmp/ob-a/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        check("14a2 무장 기록 생성", bool(m.onboard_arm(S, "dept-1", _spec_b64())) and os.path.isfile(m._onboard_path(S)))
+        m.ensure(socket=S)
+        to_master = [p for p in pushes if p[0] == S]
+        to_ceo = [p for p in pushes if p[0] is None]
+        check("14a3 완결 → 부서장 좌석 정확히 1회 · 오너 원문 포함",
+              len(to_master) == 1 and owner in to_master[0][1] and to_master[0][1].startswith("["),
+              "pushes=%r" % pushes)
+        check("14a4 완결 → 대표 좌석 정확히 1회 · 편성 완료 라벨 · 첫 과제 명령(부서 소켓 결박) · 오너 1줄 보고",
+              len(to_ceo) == 1 and to_ceo[0][1].startswith("[편성 완료") and "첫 과제" in to_ceo[0][1]
+              and S in to_ceo[0][1] and "오너" in to_ceo[0][1] and "일반저술출판부" in to_ceo[0][1],
+              "ceo=%r" % to_ceo)
+        check("14a5 부서장 지시가 대표 알림보다 먼저(각성 → 첫 과제 순서)",
+              len(pushes) == 2 and pushes[0][0] == S, "pushes=%r" % pushes)
+        # (b) 같은 레인 반복 ensure(심박 10분 흉내) → 추가 0.
+        for _ in range(5):
+            m.ensure(socket=S)
+        m.ensure(socket=S, force_surface=True)
+        check("14b 반복 ensure·--force-surface 6회 → 추가 배달 0(단계당 1회)", len(pushes) == 2, "pushes=%r" % pushes)
+        # (c) 재기동 흉내 — 새 프로세스(새 모듈 인스턴스)가 같은 상태 루트로 부트·심박 ensure → 재발화 0.
+        m2 = load()
+        p2, _b2, _f2 = _onboard_harness(m2, REQUIRED, all_clis, True, _status(REQUIRED))
+        m2.ensure(socket=S, force_surface=True)
+        m2.ensure(socket=S)
+        m2._onboard_notify(S, "complete", "직접 호출")
+        check("14c 재기동 뒤(새 프로세스 · 부트 --force-surface · 심박 · 직접 발행) 재배달 0", p2 == [], "p2=%r" % p2)
+
+        # (d) 무장 없는 부서(기존 부서·rotate·launch) → 알림 0 — 업그레이드 뒤 기존 부서 전부에 쏟아지는 폭주 차단.
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        m.ensure(socket="/tmp/ob-d/cys.sock")
+        m._onboard_notify("/tmp/ob-d/cys.sock", "complete", "")
+        check("14d 무장 없는 부서 완결 → 알림 0", pushes == [], "pushes=%r" % pushes)
+
+        # (e) 부분(워커 미기동 · 부서장 있음) → 부서장 1 + 대표(§10 문구·첫 과제) 1 → 뒤에 완결 → 부서장 1 + 대표 1(첫 과제 재지시 금지) → 이후 0.
+        S = "/tmp/ob-e/cys.sock"
+        part = REQUIRED - {"worker"}
+        pushes, box, _f = _onboard_harness(m, part, all_clis, True, _status(part))
+        m.onboard_arm(S, "dept-2", _spec_b64("tp-1790300000-e"))
+        m._boot_node = lambda role, socket, cwd=None, timeout=200: (False, "stub-fail")
+        m.ensure(socket=S)
+        ceo = [p[1] for p in pushes if p[0] is None]
+        mst = [p[1] for p in pushes if p[0] == S]
+        check("14e1 부분 → 부서장 1 · 대표 1(§10 부분 문구 자리 1개 · 첫 과제 지시)",
+              len(mst) == 1 and len(ceo) == 1 and ceo[0].startswith("[편성 부분")
+              and m.FORMATION_PARTIAL_MSG.replace("{n}", "1") in ceo[0] and "첫 과제" in ceo[0],
+              "pushes=%r" % pushes)
+        m._live_roles = lambda socket=None, require_live_agent=True: set(REQUIRED)
+        box["status"] = _status(REQUIRED)
+        m.ensure(socket=S)
+        ceo = [p[1] for p in pushes if p[0] is None]
+        mst = [p[1] for p in pushes if p[0] == S]
+        check("14e2 부분 → 완결 전이 → 부서장 +1 · 대표 +1(첫 과제는 이미 지시 — 다시 보내지 않는다)",
+              len(mst) == 2 and len(ceo) == 2 and ceo[1].startswith("[편성 완료")
+              and "다시 보내지 않는다" in ceo[1] and "--to master \"[CEO 지시]" not in ceo[1], "pushes=%r" % pushes)
+        for _ in range(3):
+            m.ensure(socket=S)
+        check("14e3 완결 알림 뒤 무장 종결 — 추가 0", len(pushes) == 4, "pushes=%r" % pushes)
+
+        # (f) 완결인데 부서장 좌석에 에이전트 없음(빈 셸) → 부서장 0(빈 셸·지침 역순 금지) · 대표 1(보류 명시)
+        #     → 부서장 에이전트가 앉은 뒤 ensure → 부서장 1 + 대표 추가 1(첫 과제) → 이후 0.
+        S = "/tmp/ob-f/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED, master_seat="empty"))
+        m.onboard_arm(S, "dept-3", _spec_b64("tp-1790300000-f"))
+        m.ensure(socket=S)
+        check("14f1 부서장 빈 셸 → 각성 지시 보류 · 대표 알림 1(보류 명시 · 첫 과제 명령 없음)",
+              [p for p in pushes if p[0] == S] == [] and len(pushes) == 1 and "보류" in pushes[0][1]
+              and "--to master \"[CEO 지시]" not in pushes[0][1], "pushes=%r" % pushes)
+        box["status"] = _status(REQUIRED)
+        m.ensure(socket=S)
+        m.ensure(socket=S)
+        mst = [p[1] for p in pushes if p[0] == S]
+        ceo = [p[1] for p in pushes if p[0] is None]
+        check("14f2 부서장 착석 뒤 → 부서장 1 · 대표 +1(첫 과제) · 이후 0",
+              len(mst) == 1 and len(ceo) == 2 and "첫 과제" in ceo[1] and "--to master" in ceo[1]
+              and ceo[1].startswith("[편성 알림 — 팀") and "완료라 하지 않는다" in ceo[0], "pushes=%r" % pushes)
+
+        # (g) 전송 실패(데몬 무응답) → 대상·단계당 최대 ONBOARD_MAX_TRIES 회 시도 후 포기(폭주 0).
+        S = "/tmp/ob-g/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        box["ok"] = False
+        m.onboard_arm(S, "dept-4", _spec_b64("tp-1790300000-g"))
+        for _ in range(10):
+            m.ensure(socket=S)
+        mst = [p for p in pushes if p[0] == S]
+        ceo = [p for p in pushes if p[0] is None]
+        check("14g 전송 실패 10회 ensure → 대상별 시도 = ONBOARD_MAX_TRIES(유계)",
+              len(mst) == m.ONBOARD_MAX_TRIES and len(ceo) == m.ONBOARD_MAX_TRIES,
+              "master=%d ceo=%d max=%d" % (len(mst), len(ceo), m.ONBOARD_MAX_TRIES))
+
+        # (g2) 시간 초과(미확정 — 큐에 들어갔을 수 있다) → 재시도 0(중복 배달 차단) · 첫 과제 지시도 1회로 친다.
+        S = "/tmp/ob-g2/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        box["ok"] = None
+        m.onboard_arm(S, "dept-4b", _spec_b64("tp-1790300000-g2"))
+        with _ctx0.redirect_stderr(_io0.StringIO()):
+            for _ in range(5):
+                m.ensure(socket=S)
+        check("14g2 시간 초과(미확정) → 대상별 1회로 끝(재시도 0 · 중복 배달 차단)",
+              len([p for p in pushes if p[0] == S]) == 1 and len([p for p in pushes if p[0] is None]) == 1,
+              "pushes=%r" % pushes)
+        # (g3) 부서장 좌석 판정 — unknown 좌석은 데몬이 에이전트 생존을 관측했을 때만 · empty 는 언제나 보류.
+        mr = m._master_ready
+        check("14g3 부서장 좌석 판정(occupied=예 · empty=아니오 · unknown+생존관측=예 · unknown+미관측=아니오 · 사망=아니오)",
+              mr(_status(REQUIRED)) is True and mr(_status(REQUIRED, master_seat="empty")) is False
+              and mr({"surfaces": [{"role": "master", "seat": "unknown", "agent_alive": True}]}) is True
+              and mr({"surfaces": [{"role": "master", "seat": "unknown", "agent_alive": None}]}) is False
+              and mr({"surfaces": [{"role": "master", "seat": "occupied", "agent_alive": False}]}) is False
+              and mr({"surfaces": [{"role": "master", "agent_alive": True}]}) is True and mr(None) is False)
+
+        # (g4) 알림 경로의 자식 출력은 바이트로 받아 UTF-8(replace)로 푼다 — 로케일 코덱(한국어 Windows cp949) 해석 예외가
+        #      rc 127 '보내지 못함' 오판 → 재시도 → 중복 배달로 번지지 않게. 한글 + 깨진 바이트 출력에도 rc 를 그대로 돌려준다.
+        rb = m._cys_bytes([sys.executable, "-c",
+                           "import sys; sys.stdout.buffer.write('QUEUED 한글'.encode('utf-8') + b'\\xff\\xfe'); sys.exit(0)"],
+                          dict(os.environ))
+        check("14g4 알림 자식 출력 판독이 로케일 코덱에 무관(한글·깨진 바이트 → rc 0 그대로 · 예외 0)",
+              isinstance(rb, tuple) and rb[0] == 0 and "QUEUED" in rb[1], repr(rb))
+
+        # (h) TTL 지난 무장 → 알림 0(늦은 알림 금지).
+        S = "/tmp/ob-h/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        import time as _t
+        m.onboard_arm(S, "dept-5", _spec_b64("tp-1790300000-h"), now=_t.time() - m.ONBOARD_TTL_S - 5)
+        m.ensure(socket=S)
+        check("14h TTL 지난 무장 → 알림 0", pushes == [], "pushes=%r" % pushes)
+
+        # (i) 보류(자원 hard) → 대표 1(보류 · 첫 과제 없음) · 부서장 0 → 완결 → 부서장 1 + 대표 1(첫 과제).
+        S = "/tmp/ob-i/cys.sock"
+        pushes, box, _f = _onboard_harness(m, {"master"}, all_clis, False, _status({"master"}))
+        m.onboard_arm(S, "dept-6", _spec_b64("tp-1790300000-i"))
+        m.ensure(socket=S)
+        check("14i1 보류 → 대표 1(편성 보류 · 첫 과제 명령 없음) · 부서장 0",
+              len(pushes) == 1 and pushes[0][0] is None and pushes[0][1].startswith("[편성 보류")
+              and "--to master \"[CEO 지시]" not in pushes[0][1], "pushes=%r" % pushes)
+        m._live_roles = lambda socket=None, require_live_agent=True: set(REQUIRED)
+        box["status"] = _status(REQUIRED)
+        m.ensure(socket=S)
+        check("14i2 보류 → 완결 → 부서장 1 · 대표 +1(첫 과제)",
+              len([p for p in pushes if p[0] == S]) == 1 and len(pushes) == 3 and "첫 과제" in pushes[2][1],
+              "pushes=%r" % pushes)
+
+        # (j) 편성 예외(failed) → 대표 1(실패 · 첫 과제 없음) · 부서장 0.
+        S = "/tmp/ob-j/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        m.onboard_arm(S, "dept-7", _spec_b64("tp-1790300000-j"))
+
+        def _boom(socket=None, cwd=None, force_surface=False):
+            raise RuntimeError("stub")
+        m.ensure = _boom
+        import io as _io
+        import contextlib as _ctx
+        with _ctx.redirect_stdout(_io.StringIO()):
+            m._cmd_ensure(["--socket", S, "--json"])
+        m.ensure = saved["ensure"]
+        check("14j 편성 예외(failed) → 대표 1(편성 실패 · 첫 과제 명령 없음) · 부서장 0",
+              len(pushes) == 1 and pushes[0][0] is None and pushes[0][1].startswith("[편성 실패")
+              and "--to master \"[CEO 지시]" not in pushes[0][1], "pushes=%r" % pushes)
+
+        # (k) CLI 배선 — ensure --onboard-dept/--onboard-spec-b64 가 무장한다 · 같은 제안 재무장은 1회성을 되돌리지 않는다.
+        S = "/tmp/ob-k/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        args = ["--socket", S, "--onboard-dept", "dept-8", "--onboard-spec-b64",
+                _spec_b64("tp-1790300000-k"), "--json"]
+        with _ctx.redirect_stdout(_io.StringIO()):
+            m._cmd_ensure(args)
+            m._cmd_ensure(args)
+        check("14k CLI --onboard-* 무장 → 완결 알림 대상별 1회 · 같은 제안 재실행 추가 0",
+              len([p for p in pushes if p[0] == S]) == 1 and len([p for p in pushes if p[0] is None]) == 1,
+              "pushes=%r" % pushes)
+        # (m) 팀 명부 대조(실물) — 알림 전에 팀이 지워지고 같은 번호가 제안 없이 되살아나면 옛 팀 알림 0 · 무장 닫힘.
+        #     명부 판독 불가면 보내지도 닫지도 않는다(다음 ensure 가 다시 본다).
+        S = "/tmp/ob-m/cys.sock"
+        pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+        m._onboard_registered = saved["_onboard_registered"]
+        reg = os.path.join(td, "depts.json")
+        saved_reg = os.environ.get("CYS_DEPTS_JSON")
+        os.environ["CYS_DEPTS_JSON"] = reg
+        try:
+            m.onboard_arm(S, "dept-10", _spec_b64("tp-1790300000-m"))
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)                                   # 명부 없음(판독 불가) → 보류
+            held_ok = pushes == [] and not (m._onboard_read(m._onboard_path(S)) or {}).get("done")
+            import json as _j
+            with open(reg, "w", encoding="utf-8") as f:
+                _j.dump({"depts": {"dept-10": {"socket": S}}}, f)   # 제안 없이 되살아난 같은 번호
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+            stale_ok = pushes == [] and (m._onboard_read(m._onboard_path(S)) or {}).get("done") == "stale"
+            S2 = "/tmp/ob-m2/cys.sock"
+            m.onboard_arm(S2, "dept-11", _spec_b64("tp-1790300000-m2"))
+            with open(reg, "w", encoding="utf-8") as f:
+                _j.dump({"depts": {"dept-11": {"socket": S2, "team_proposal_id": "tp-1790300000-m2"}}}, f)
+            m.ensure(socket=S2)
+            owned_ok = len(pushes) == 2
+        finally:
+            if saved_reg is None:
+                os.environ.pop("CYS_DEPTS_JSON", None)
+            else:
+                os.environ["CYS_DEPTS_JSON"] = saved_reg
+        check("14m 팀 명부 대조 — 판독 불가=보류(닫지 않음) · 제안 id 불일치=알림 0·무장 닫힘 · 일치=대상별 1회",
+              held_ok and stale_ok and owned_ok, "held=%s stale=%s owned=%s pushes=%r" % (held_ok, stale_ok, owned_ok, pushes))
+
+        # (n) 좌석 관측 불가(cys status 실패) 중 결판 → 이번엔 0건(부서장 '빈 자리' 오안내 금지) · 무장 유지 → 관측되면 대상별 1회.
+        try:
+            S = "/tmp/ob-n/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, None)
+            m.onboard_arm(S, "dept-12", _spec_b64("tp-1790300000-n"))
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+            n_held = pushes == [] and not (m._onboard_read(m._onboard_path(S)) or {}).get("sent")
+            box["status"] = _status(REQUIRED)
+            m.ensure(socket=S)
+            check("14n 좌석 관측 불가 → 0건·무장 유지(오안내 금지) → 관측 복구 뒤 부서장 1 · 대표 1",
+                  n_held and len([p for p in pushes if p[0] == S]) == 1 and len([p for p in pushes if p[0] is None]) == 1
+                  and "보류" not in pushes[-1][1], "held=%s pushes=%r" % (n_held, pushes))
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14n 사례 예외", False, repr(e))
+
+        # (o) 부서장 빈 셸 보류 알림은 오너가 할 일(팀장 창에서 claude 실행)을 말한다 — '빈 자리' 만 말하고 멈추면 흐름이 선다.
+        try:
+            S = "/tmp/ob-o/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED, master_seat="empty"))
+            m.onboard_arm(S, "dept-13", _spec_b64("tp-1790300000-o"))
+            m.ensure(socket=S)
+            check("14o 부서장 빈 셸 보류 알림 = 오너 안내(팀장 창에서 claude 실행) 포함 · [편성 알림] 예고",
+                  len(pushes) == 1 and m.LEADER_EMPTY_MSG in pushes[0][1] and "claude" in pushes[0][1]
+                  and "[편성 알림]" in pushes[0][1], "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14o 사례 예외", False, repr(e))
+
+        # (p) 실패 결판의 N 은 도구가 센다(대표가 list 로 다시 세지 않는다) · 자리가 다 있으면 오너 보고를 미룬다.
+        try:
+            S = "/tmp/ob-p/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED - {"worker"}, all_clis, True, _status(REQUIRED - {"worker"}))
+            m.onboard_arm(S, "dept-14", _spec_b64("tp-1790300000-p"))
+            m._onboard_notify(S, "failed:RuntimeError", "stub")
+            p1 = list(pushes)
+            S2 = "/tmp/ob-p2/cys.sock"
+            box["status"] = _status(REQUIRED)
+            m.onboard_arm(S2, "dept-15", _spec_b64("tp-1790300000-p2"))
+            m._onboard_notify(S2, "failed:RuntimeError", "stub")
+            check("14p 실패 결판 — 빈 자리 수를 도구가 채운다(§10 문구 N=1 · list 재조회 지시 없음) · 자리 다 있으면 보고 미룸",
+                  len(p1) == 1 and m.FORMATION_PARTIAL_MSG.replace("{n}", "1") in p1[0][1] and "list` 역할 열" not in p1[0][1]
+                  and len(pushes) == 2 and "자리는 모두 있다" in pushes[1][1], "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14p 사례 예외", False, repr(e))
+
+        # (q) 보낼 것이 남지 않은 무장(영구 부분 편성 등)은 좌석 관측(cys status) 없이 끝난다 — 심박마다 RPC 증가 0.
+        try:
+            S = "/tmp/ob-q/cys.sock"
+            part = REQUIRED - {"reviewer-codex"}
+            pushes, box, _f = _onboard_harness(m, part, all_clis, True, _status(part))
+            m._boot_node = lambda role, socket, cwd=None, timeout=200: (False, "stub-fail")
+            calls = []
+            m._onboard_status = lambda socket: (calls.append(socket) or box["status"])
+            m.onboard_arm(S, "dept-16", _spec_b64("tp-1790300000-q"))
+            m.ensure(socket=S)
+            first = len(calls)
+            for _ in range(4):
+                m.ensure(socket=S)
+            check("14q 부분 편성 알림을 다 보낸 뒤 반복 ensure 4회 → 좌석 관측 추가 0 · 알림 추가 0",
+                  first == 1 and len(calls) == first and len(pushes) == 2, "calls=%d pushes=%r" % (len(calls), pushes))
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14q 사례 예외", False, repr(e))
+
+        # (r) 무장한 생성 꼬리 호출: 부서장 빈 셸로 보류 → 유계 지켜보기 중 착석 → 부서장 1 · 대표 [편성 알림] 1(첫 과제) → 끝.
+        try:
+            S = "/tmp/ob-r/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED, master_seat="empty"))
+            seat_after = [3]
+            polls = []
+
+            def _seat_later(socket):
+                polls.append(socket)
+                if len(polls) > seat_after[0]:
+                    return _status(REQUIRED)
+                return _status(REQUIRED, master_seat="empty")
+            m._onboard_status = _seat_later
+            m._onboard_watch_limits = lambda: (5.0, 0.01)
+            args = ["--socket", S, "--onboard-dept", "dept-17", "--onboard-spec-b64", _spec_b64("tp-1790300000-r"), "--json"]
+            with _ctx.redirect_stdout(_io.StringIO()), _ctx.redirect_stderr(_io.StringIO()) as er:
+                m._cmd_ensure(args)
+            mst = [p[1] for p in pushes if p[0] == S]
+            ceo = [p[1] for p in pushes if p[0] is None]
+            check("14r 지켜보기: 빈 셸 보류 → 착석 감지 → 부서장 1 · 대표 2(보류 → [편성 알림] 첫 과제) · 무장 종결",
+                  len(mst) == 1 and len(ceo) == 2 and ceo[1].startswith("[편성 알림 — 팀") and "첫 과제" in ceo[1]
+                  and (m._onboard_read(m._onboard_path(S)) or {}).get("done") and "지켜보기 종료: sent" in er.getvalue(),
+                  "pushes=%r err=%r" % (pushes, er.getvalue()[-300:]))
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14r 사례 예외", False, repr(e))
+
+        # (s) 지켜보기 중 kill-switch → 보내지 않고 끝(심박이 해제 뒤 이어받음).
+        try:
+            S = "/tmp/ob-s/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED, master_seat="empty"))
+            m.onboard_arm(S, "dept-18", _spec_b64("tp-1790300000-s"))
+            m.ensure(socket=S)
+            box["status"] = _status(REQUIRED)
+            m.gate_check = lambda: False
+            m._onboard_watch_limits = lambda: (5.0, 0.01)
+            res_s = m._onboard_watch(S, "complete")
+            m.gate_check = lambda: True
+            check("14s 지켜보기 중 kill-switch → 'paused' · 부서장 0 · 대표 추가 0",
+                  res_s == "paused" and len(pushes) == 1 and pushes[0][0] is None, "res=%r pushes=%r" % (res_s, pushes))
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14s 사례 예외", False, repr(e))
+
+        # (t) 지켜보기 창 만료 → 'timeout' · 보낸 것 0 · 관측 횟수 유계(창/간격) · 무장은 남아 심박이 이어받는다.
+        try:
+            S = "/tmp/ob-t/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED, master_seat="empty"))
+            m.onboard_arm(S, "dept-19", _spec_b64("tp-1790300000-t"))
+            m.ensure(socket=S)
+            tcalls = []
+            m._onboard_status = lambda socket: (tcalls.append(1) or box["status"])
+            m._onboard_watch_limits = lambda: (0.3, 0.05)
+            res_t = m._onboard_watch(S, "complete")
+            check("14t 지켜보기 창 만료 → timeout · 추가 발송 0 · 관측 ≤ 창/간격 · 무장 유지(심박 인계)",
+                  res_t == "timeout" and len(pushes) == 1 and 1 <= len(tcalls) <= 6
+                  and not (m._onboard_read(m._onboard_path(S)) or {}).get("done"),
+                  "res=%r calls=%d pushes=%r" % (res_t, len(tcalls), pushes))
+            m._onboard_watch_limits = saved["_onboard_watch_limits"]
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14t 사례 예외", False, repr(e))
+
+        # (u) TTL 은 팀 명부 판독보다 먼저 본다 — 명부가 계속 깨져 있어도 늦은 무장은 만료로 닫힌다(영구 잔류 0).
+        try:
+            S = "/tmp/ob-u/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            m._onboard_registered = lambda rec: None
+            m.onboard_arm(S, "dept-20", _spec_b64("tp-1790300000-u"), now=_t.time() - m.ONBOARD_TTL_S - 5)
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+            check("14u 명부 판독 불가 + TTL 초과 → 만료로 닫힘 · 알림 0",
+                  pushes == [] and (m._onboard_read(m._onboard_path(S)) or {}).get("done") == "expired", "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14u 사례 예외", False, repr(e))
+
+        # (v) 발송 확정 기록이 빠져도(교체 실패 등) 이번 호출의 결과를 믿는다 — 부서장 지시가 나갔는데 대표에게 '보류'라 하지 않는다.
+        try:
+            S = "/tmp/ob-v/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            m._onboard_settle = lambda path, key, ok, task=False: None
+            m.onboard_arm(S, "dept-21", _spec_b64("tp-1790300000-v"))
+            m.ensure(socket=S)
+            m._onboard_settle = saved["_onboard_settle"]
+            ceo = [p[1] for p in pushes if p[0] is None]
+            check("14v 확정 기록 유실에도 대표 알림은 '각성 지시 보냄 + 첫 과제'(보류 오안내 0)",
+                  len([p for p in pushes if p[0] == S]) == 1 and len(ceo) == 1 and "보류" not in ceo[0] and "첫 과제" in ceo[0],
+                  "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001 — 사례별 예외는 그 사례의 FAIL 로 센다(구판 대조용)
+            check("14v 사례 예외", False, repr(e))
+
+        # ── R1-F1(0.14.42 리뷰) 첫 과제 지시 1회성 ──
+        #   결함: 대표 알림이 첫 과제를 실었다는 표지가 발송 **뒤 확정**에만 기록됐다. 그 알림이 선점(claimed)만 된 채 확정 전이거나
+        #   확정 기록이 빠지면, 다음 호출의 [편성 알림](ceo:ready)이 그것을 '첫 과제 미지시'로 읽고 첫 과제를 한 번 더 지시했다.
+        #   또 부서장 키가 다른 호출에 선점돼 발송 중이면, 경쟁에서 진 호출이 대표에게 '팀장 자리가 비어 있다'(오안내)를 보냈다.
+        task_cmd = "--to master \"[CEO 지시]"
+
+        def _task_ceo(ps):
+            return [t for s, t in ps if s is None and task_cmd in t]
+
+        def _other_caller(ps, status):
+            """같은 원장 파일을 보는 **다른 호출자**(지켜보기·심박) — 새 모듈 인스턴스라 메모리 상태를 공유하지 않는다."""
+            o = load()
+            o._onboard_status = lambda socket: status
+            o._onboard_registered = lambda rec: True
+            o._queue_push = lambda socket, text: (ps.append((socket, text)) or True)
+            return o
+
+        # (v2) 14v 후속: 확정 기록이 빠진 채 심박 ensure 가 이어져도 첫 과제를 담은 대표 알림은 정확히 1.
+        try:
+            S = "/tmp/ob-v/cys.sock"
+            with _ctx.redirect_stderr(_io.StringIO()):
+                for _ in range(3):
+                    m.ensure(socket=S)
+            check("14v2 확정 기록 유실 뒤 심박 ensure 3회 → 첫 과제 담은 대표 알림 정확히 1 · 부서장 1 · 대표 1",
+                  len(_task_ceo(pushes)) == 1 and len([p for p in pushes if p[0] == S]) == 1
+                  and len([p for p in pushes if p[0] is None]) == 1, "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001
+            check("14v2 사례 예외", False, repr(e))
+
+        # (x) 첫 과제를 담은 대표 알림의 확정 기록 교체만 3연속 실패(Windows 백신 잠금 흉내 — os.replace PermissionError)
+        #     → 그 키는 선점(claimed)으로 남는다 → 뒤이은 심박 ensure 3회에서 첫 과제를 다시 지시하지 않는다.
+        #     기본 레인 · 외부 부서장 레인(CYS_FORMATION_EXTERNAL_ROLES=master) 둘 다.
+        for ext in ("", "master"):
+            tag = "ext" if ext else "base"
+            try:
+                if ext:
+                    os.environ["CYS_FORMATION_EXTERNAL_ROLES"] = ext
+                S = "/tmp/ob-x-%s/cys.sock" % tag
+                live = (REQUIRED - {"master"}) if ext else REQUIRED
+                pushes, box, _f = _onboard_harness(m, live, all_clis, True, _status(REQUIRED))
+                m.onboard_arm(S, "dept-23", _spec_b64("tp-1790300000-x" + tag))
+                real_rep, left = saved["_replace_state_obj"], [3]
+
+                def _flaky(path, obj, _real=real_rep, _left=left, _d=os.sep + "onboard" + os.sep):
+                    ent = (obj or {}).get("sent") or {}
+                    if _d in path and _left[0] > 0 and any(
+                            k.startswith("ceo:") and (v or {}).get("st") == "sent" for k, v in ent.items()):
+                        _left[0] -= 1
+                        raise PermissionError(13, "모의 백신 잠금")
+                    return _real(path, obj)
+                m._replace_state_obj = _flaky
+                with _ctx.redirect_stderr(_io.StringIO()):
+                    m.ensure(socket=S)            # 생성 꼬리 ensure — 대표 알림의 확정 기록만 빠진다
+                    m._replace_state_obj = real_rep
+                    n1 = len(_task_ceo(pushes))
+                    for _ in range(3):            # 뒤이은 심박
+                        m.ensure(socket=S)
+                n_m = len([p for p in pushes if p[0] == S])
+                check("14x-%s 첫 과제 대표 알림의 확정 기록 유실(교체 3연속 실패) 뒤 심박 3회 → 첫 과제 지시 정확히 1 · 대표 1 · 부서장 %d"
+                      % (tag, 0 if ext else 1),
+                      left[0] == 0 and n1 == 1 and len(_task_ceo(pushes)) == 1
+                      and len([p for p in pushes if p[0] is None]) == 1 and n_m == (0 if ext else 1),
+                      "n1=%d left=%d pushes=%r" % (n1, left[0], pushes))
+            except Exception as e:  # noqa: BLE001
+                check("14x-%s 사례 예외" % tag, False, repr(e))
+            finally:
+                os.environ.pop("CYS_FORMATION_EXTERNAL_ROLES", None)
+                m._replace_state_obj = saved["_replace_state_obj"]
+
+        # (y) 교차(결정론 · 두 호출자): 한 호출이 첫 과제를 담은 대표 알림을 큐에 넣는 **도중**(선점 뒤·확정 전)에 다른 호출
+        #     (지켜보기·심박 — 새 모듈 인스턴스 · 같은 원장 파일)이 끼어든다 → 끼어든 호출은 보내지 않는다 · 첫 과제 지시 정확히 1.
+        try:
+            S = "/tmp/ob-y/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            m.onboard_arm(S, "dept-24", _spec_b64("tp-1790300000-y"))
+            other, inner = _other_caller(pushes, _status(REQUIRED)), []
+
+            def _qp_y(socket, text):
+                pushes.append((socket, text))
+                if socket is None and not inner:
+                    with _ctx.redirect_stderr(_io.StringIO()):
+                        inner.append(other._onboard_notify(S, "complete", "지켜보기"))
+                return True
+            m._queue_push = _qp_y
+            m._onboard_notify(S, "complete", "심박")
+            check("14y 첫 과제 대표 알림 선점~확정 사이에 다른 호출이 끼어듦 → 끼어든 호출 발송 0 · 첫 과제 지시 정확히 1 · "
+                  "부서장 1 · 대표 1",
+                  len(inner) == 1 and len(_task_ceo(pushes)) == 1 and len([p for p in pushes if p[0] == S]) == 1
+                  and len([p for p in pushes if p[0] is None]) == 1, "inner=%r pushes=%r" % (inner, pushes))
+        except Exception as e:  # noqa: BLE001
+            check("14y 사례 예외", False, repr(e))
+
+        # (z) 교차(결정론 · 두 호출자): 부서장 각성 지시를 다른 호출이 선점해 보내는 **도중**에 끼어든 호출은 대표에게
+        #     '팀장 자리가 비어 있다'(오안내)를 보내지 않고 물러난다 — 대표 알림(첫 과제)은 선점한 호출이 이어서 1회 보낸다.
+        try:
+            S = "/tmp/ob-z/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            m.onboard_arm(S, "dept-25", _spec_b64("tp-1790300000-z"))
+            other, inner = _other_caller(pushes, _status(REQUIRED)), []
+
+            def _qp_z(socket, text):
+                pushes.append((socket, text))
+                if socket == S and not inner:
+                    with _ctx.redirect_stderr(_io.StringIO()):
+                        inner.append(other._onboard_notify(S, "complete", "지켜보기"))
+                return True
+            m._queue_push = _qp_z
+            m._onboard_notify(S, "complete", "심박")
+            ceo = [t for s, t in pushes if s is None]
+            check("14z 부서장 각성 지시 발송 중 끼어든 호출 → 끼어든 호출 발송 0 · 대표 1(첫 과제) · '팀장 자리 비어 있음' 오안내 0 · "
+                  "부서장 1",
+                  len(inner) == 1 and len(ceo) == 1 and len(_task_ceo(pushes)) == 1
+                  and not [t for t in ceo if m.LEADER_EMPTY_MSG in t or "보류" in t]
+                  and len([p for p in pushes if p[0] == S]) == 1, "inner=%r pushes=%r" % (inner, pushes))
+        except Exception as e:  # noqa: BLE001
+            check("14z 사례 예외", False, repr(e))
+
+        # (z1·z2) 부서장 키가 선점(claimed)으로 남았는데 보내던 호출이 없다(발송 도중 종료) — 선점 직후(아직 발송 중일 수 있는 창
+        #     ONBOARD_CLAIM_STALE_S 안)에는 물러나고(발송 0 · 무장 유지), 창이 지나면 '미확정'으로 보고 대표 알림(첫 과제)을
+        #     1회 보낸다(영구 침묵 0 · 부서장 재발송 0 · 오안내 0).
+        try:
+            S = "/tmp/ob-z1/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            path = m.onboard_arm(S, "dept-26", _spec_b64("tp-1790300000-z1"))
+            m._onboard_update(path, lambda r: r["sent"].__setitem__("master:complete", {"at": _t.time(), "st": "claimed"}))
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+            r1 = m._onboard_read(path) or {}
+            ok1 = pushes == [] and not r1.get("done") and "ceo:complete" not in (r1.get("sent") or {})
+            check("14z1 부서장 키 선점 직후(발송 중일 수 있음) → 끼어든 호출 발송 0 · 무장 유지", ok1,
+                  "pushes=%r rec=%r" % (pushes, r1))
+            stale = float(getattr(m, "ONBOARD_CLAIM_STALE_S", 120.0))
+            m._onboard_update(path, lambda r: r["sent"]["master:complete"].__setitem__("at", _t.time() - stale - 5))
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+                m.ensure(socket=S)
+            ceo = [t for s, t in pushes if s is None]
+            check("14z2 선점 창이 지난 부서장 키(발송 도중 종료) → 부서장 재발송 0 · 대표 1(첫 과제 · 오안내 0) · 이후 0",
+                  [p for p in pushes if p[0] == S] == [] and len(ceo) == 1 and len(_task_ceo(pushes)) == 1
+                  and m.LEADER_EMPTY_MSG not in ceo[0], "pushes=%r" % pushes)
+        except Exception as e:  # noqa: BLE001
+            check("14z1·z2 사례 예외", False, repr(e))
+
+        # (z3) 부서장이 앉아 있는데 부서장 키 선점 기록 자체가 실패(Windows 교체 잠금 3연속) → 이번엔 대표에게 '팀장 자리가 비어
+        #     있다'(오안내)를 보내지 않는다(발송 0) → 잠금이 풀린 다음 ensure 에서 부서장 1 · 대표 1(첫 과제).
+        try:
+            S = "/tmp/ob-z3/cys.sock"
+            pushes, box, _f = _onboard_harness(m, REQUIRED, all_clis, True, _status(REQUIRED))
+            m.onboard_arm(S, "dept-28", _spec_b64("tp-1790300000-z3"))
+            real_rep, left = saved["_replace_state_obj"], [3]
+
+            def _lock_claim(path, obj, _real=real_rep, _left=left, _d=os.sep + "onboard" + os.sep):
+                ent = ((obj or {}).get("sent") or {}).get("master:complete") or {}
+                if _d in path and _left[0] > 0 and ent.get("st") == "claimed":
+                    _left[0] -= 1
+                    raise PermissionError(13, "모의 백신 잠금")
+                return _real(path, obj)
+            m._replace_state_obj = _lock_claim
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+            m._replace_state_obj = real_rep
+            first = list(pushes)
+            with _ctx.redirect_stderr(_io.StringIO()):
+                m.ensure(socket=S)
+                m.ensure(socket=S)
+            ceo = [t for s, t in pushes if s is None]
+            check("14z3 부서장 키 선점 기록 실패(교체 잠금) → 그 회차 발송 0(빈 자리 오안내 0) → 다음 ensure 부서장 1 · 대표 1(첫 과제)",
+                  left[0] == 0 and first == [] and len([p for p in pushes if p[0] == S]) == 1 and len(ceo) == 1
+                  and len(_task_ceo(pushes)) == 1 and m.LEADER_EMPTY_MSG not in ceo[0],
+                  "left=%d first=%r pushes=%r" % (left[0], first, pushes))
+        except Exception as e:  # noqa: BLE001
+            check("14z3 사례 예외", False, repr(e))
+        finally:
+            m._replace_state_obj = saved["_replace_state_obj"]
+
+        # (y2) 실제 다중 프로세스(POSIX fork · 실파일 잠금): 호출자 6개가 같은 무장에 동시에 결판 알림 → 부서장 1 · 대표 1 ·
+        #      첫 과제 1 · 오안내 0. fork 가 없는 플랫폼(Windows)은 (y)(z) 결정론 교차 핀이 같은 경로를 잰다.
+        import multiprocessing as _mp
+        if "fork" in _mp.get_all_start_methods():
+            try:
+                S = "/tmp/ob-y2/cys.sock"
+                m.onboard_arm(S, "dept-27", _spec_b64("tp-1790300000-y2"))
+                logp = os.path.join(td, "y2-pushes.log")
+
+                def _y2_worker(barrier):
+                    code = 0
+                    try:
+                        o = load()
+                        o._onboard_status = lambda socket: _status(REQUIRED)
+                        o._onboard_registered = lambda rec: True
+
+                        def _qp(socket, text):
+                            _t.sleep(0.05)   # cys send 왕복 흉내 — 선점~확정 창을 넓힌다
+                            with open(logp, "a", encoding="utf-8") as f:
+                                f.write("%s\t%s\n" % ("M" if socket else "C", text.replace("\n", " ")))
+                            return True
+                        o._queue_push = _qp
+                        barrier.wait(30)
+                        with _ctx.redirect_stderr(_io.StringIO()):
+                            o._onboard_notify(S, "complete", "동시")
+                    except BaseException:  # noqa: BLE001 — 자식 실패는 exit 코드로 부모에 알린다
+                        code = 3
+                    os._exit(code)
+                mpc = _mp.get_context("fork")
+                bar = mpc.Barrier(6)
+                procs = [mpc.Process(target=_y2_worker, args=(bar,)) for _ in range(6)]
+                for p in procs:
+                    p.start()
+                for p in procs:
+                    p.join(90)
+                hung = [p for p in procs if p.is_alive()]
+                for p in hung:
+                    p.terminate()   # 이 테스트가 띄운 자식만(핸들로) — 패턴 kill 아님
+                lines = []
+                if os.path.exists(logp):
+                    with open(logp, encoding="utf-8") as f:
+                        lines = f.read().splitlines()
+                ceo = [ln for ln in lines if ln.startswith("C")]
+                check("14y2 6 프로세스 동시 결판 알림(실파일 잠금) → 부서장 1 · 대표 1 · 첫 과제 1 · 오안내 0",
+                      not hung and all(p.exitcode == 0 for p in procs)
+                      and len([ln for ln in lines if ln.startswith("M")]) == 1 and len(ceo) == 1
+                      and task_cmd in ceo[0] and m.LEADER_EMPTY_MSG not in ceo[0],
+                      "hung=%d codes=%r lines=%r" % (len(hung), [p.exitcode for p in procs], [ln[:90] for ln in lines]))
+            except Exception as e:  # noqa: BLE001
+                check("14y2 사례 예외", False, repr(e))
+        else:
+            print("SKIP 14y2 (fork 없음 — (y)(z) 결정론 교차 핀이 같은 경로를 잰다)")
+
+        # (w) 팀 명부 경로 = 쓰는 쪽(cys-dept `$HOME/.cys/depts.json`)과 같은 HOME 우선 — Windows 파이썬 `~`(USERPROFILE)가
+        #     Git Bash HOME 과 갈려도 명부를 읽는다(못 읽으면 알림 0 = ③).
+        try:
+            import json as _jw
+            reg_fn = saved["_onboard_registered"]
+            hw = os.path.join(td, "home-w")
+            os.makedirs(os.path.join(hw, ".cys"), exist_ok=True)
+            with open(os.path.join(hw, ".cys", "depts.json"), "w", encoding="utf-8") as f:
+                _jw.dump({"depts": {"dept-22": {"team_proposal_id": "tp-1790300000-w"}}}, f)
+            sv_home, sv_reg, sv_exp = os.environ.get("HOME"), os.environ.pop("CYS_DEPTS_JSON", None), m.os.path.expanduser
+            os.environ["HOME"] = hw
+            m.os.path.expanduser = lambda p: p.replace("~", os.path.join(td, "userprofile-w"), 1)
+            try:
+                w_ok = reg_fn({"dept": "dept-22", "proposal_id": "tp-1790300000-w"}) is True
+                w_neg = reg_fn({"dept": "dept-22", "proposal_id": "tp-other"}) is False
+            finally:
+                m.os.path.expanduser = sv_exp
+                if sv_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = sv_home
+                if sv_reg is not None:
+                    os.environ["CYS_DEPTS_JSON"] = sv_reg
+            check("14w 팀 명부는 HOME(cys-dept 규약) 우선 — ~ 가 다른 곳을 가리켜도 판독 · 제안 id 대조 유지",
+                  w_ok and w_neg, "ok=%s neg=%s" % (w_ok, w_neg))
+        except Exception as e:  # noqa: BLE001
+            check("14w 사례 예외", False, repr(e))
+
+        # (l) 손상 명세 → 무장 0 · 예외 0.
+        with _ctx.redirect_stderr(_io.StringIO()):
+            r = m.onboard_arm("/tmp/ob-l/cys.sock", "dept-9", "!!!not-b64")
+        check("14l 손상 명세 → 무장 0(예외 없이)", not r and not os.path.exists(m._onboard_path("/tmp/ob-l/cys.sock")))
+    except Exception as e:  # noqa: BLE001 — 스위트 예외는 FAIL 로 센다
+        import traceback
+        traceback.print_exc()
+        check("14 편성 결판 알림 스위트 예외", False, repr(e))
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                setattr(m, k, v)
+        if saved_state is None:
+            os.environ.pop("CYS_STATE_DIR", None)
+        else:
+            os.environ["CYS_STATE_DIR"] = saved_state
+        if saved_watch is None:
+            os.environ.pop("CYS_ONBOARD_WATCH_S", None)
+        else:
+            os.environ["CYS_ONBOARD_WATCH_S"] = saved_watch
         shutil.rmtree(td, ignore_errors=True)
 
 

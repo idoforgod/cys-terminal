@@ -3370,6 +3370,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
     if let Some(sub) = req.method.strip_prefix("channel.") {
         return crate::channels::handle(daemon, sub, &params, &id, caller_pid);
     }
+    // ★0.14.42 P5(설계 §6-5·§11 R8): 대화 승인 1회용 팀 생성 토큰 — `team.token.*` 은 teamtoken 모듈이
+    //   전담한다(channel.* 과 같은 단일 위임). `cys-dept create --team-token` 이 **데몬에 묻는 곳**이다.
+    //   좌석은 여기서 커널 peer pid 의 조상 체인으로 도출해 넘긴다(env·인자 자기신고 불신).
+    if let Some(sub) = req.method.strip_prefix("team.token.") {
+        let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+        return crate::teamtoken::handle(daemon, sub, &params, &id, caller_sid);
+    }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),
 
@@ -6301,7 +6308,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // M7: 해소는 단일 경로(resolve_feed_item)에 위임한다. 위임 전 precheck로 ①존재 여부
             // ②already-resolved를 구분(resolve_feed_item은 둘 다 None)하고, 자기승인 판정용 발행자
             // pid/pgid를 캡처한다.
-            let (pub_pid, pub_pgid, pub_sid, team_item) = {
+            // ★0.14.42 R7: 팀 제안이면 **현재 본문**도 함께 캡처한다(토큰 본문 결박 대조 · 데몬 메모리가 정본).
+            let (pub_pid, pub_pgid, pub_sid, team_item, team_body) = {
                 let items = daemon.feed_items.lock().unwrap();
                 match items.iter().find(|i| i.request_id == request_id) {
                     None => {
@@ -6318,12 +6326,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "item already resolved",
                         ))
                     }
-                    Some(item) => (
-                        item.publisher_pid,
-                        item.publisher_pgid,
-                        item.publisher_surface,
-                        item.kind == cys::team_spec::KIND,
-                    ),
+                    Some(item) => {
+                        let team = item.kind == cys::team_spec::KIND;
+                        (
+                            item.publisher_pid,
+                            item.publisher_pgid,
+                            item.publisher_surface,
+                            team,
+                            if team { item.body.clone() } else { String::new() },
+                        )
+                    }
                 }
             };
             // §3.2 표면정책 — 자기승인 차단(M4 pgid + MED-2 surface 격상): 발행자와 승인자가 pid·pgid·
@@ -6350,12 +6362,35 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .zip(daemon.operator_token.as_deref())
                 .map(|(t, d)| !d.is_empty() && t == d)
                 .unwrap_or(false);
+            // ★0.14.42 R7(설계 §11): 대화 승인 **1회용 생성 토큰** — `allow` 전용 · 데몬이 검증한다.
+            //   `team_token` 인자가 실려 왔을 때만 토큰 경로를 시도한다(없으면 아래 종전 판정 그대로 =
+            //   owner_gui_required). 검증 실패는 뭉뚱그리지 않고 P3 사유 코드를 그대로 돌려준다(무안내
+            //   거부 금지): token_missing·token_unknown·token_consumed·token_expired·
+            //   token_proposal_mismatch·token_surface_mismatch·token_body_mismatch·grant_not_armed·
+            //   grant_revoked·grant_expired·surface_unknown·ledger_corrupt ….
+            //   결박 대조의 두 사실은 데몬 것이다: 좌석 = 위 caller_sid(커널 peer pid 조상 체인) ·
+            //   본문 = 이 항목의 **현재** 본문. 순서(P3 2단 권한): verify(비소비) → 해소 → 해소
+            //   **성공 뒤에만** consume(allow 권한 닫기 — 해소 실패면 권한 TTL 안에서 재시도 가능).
+            let team_token = if team_item && decision == "allow" && !operator_ok {
+                crate::teamtoken::token_param(&params)
+            } else {
+                None
+            };
+            let token_ok = match team_token.as_deref() {
+                Some(t) => {
+                    match crate::teamtoken::verify_allow(daemon, &request_id, &team_body, caller_sid, t) {
+                        Ok(()) => true,
+                        Err(r) => return Reply::Single(err_response(&id, &r.code, &r.message)),
+                    }
+                }
+                None => false,
+            };
             // ★U16(0.14.41): 팀 만들기 제안은 오너 GUI(operator token)만 해소한다 — 예외는 발행 좌석
-            //   자신의 `superseded`(자기 제안 거두기) 하나. 아래 자기승인 가드는 `allow` 만 막아서,
-            //   대표가 승인 피드 구독 흐름에서 자기 제안에 deny·yes·자유문구를 보내면 오너가 보기 전에
-            //   카드가 소각됐다(반박 M3·D2). 판정 정의처 = cys::team_spec::reply_allowed.
+            //   자신의 `superseded`(자기 제안 거두기) 하나(+ 0.14.42 위 토큰의 `allow`). 아래 자기승인
+            //   가드는 `allow` 만 막아서, 대표가 승인 피드 구독 흐름에서 자기 제안에 deny·yes·자유문구를
+            //   보내면 오너가 보기 전에 카드가 소각됐다(반박 M3·D2). 판정 정의처 = cys::team_spec::reply_allowed.
             if team_item
-                && !cys::team_spec::reply_allowed(&decision, operator_ok, caller_sid, pub_sid)
+                && !cys::team_spec::reply_allowed(&decision, operator_ok, token_ok, caller_sid, pub_sid)
             {
                 return Reply::Single(err_response(
                     &id,
@@ -6363,7 +6398,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     cys::team_spec::REPLY_DENIED,
                 ));
             }
+            // ★0.14.42: 토큰 검증을 통과한 팀 제안 allow 는 자기승인 가드를 건너뛴다 — 발행 좌석(대표)
+            //   자신의 allow 지만 토큰이 곧 **오너 승인 발화의 증거**다(HITL 이 이미 일어났다 · operator
+            //   token 면제와 같은 성격). 면제 범위는 team_item ∧ decision=="allow" ∧ 데몬 검증 통과뿐이다
+            //   (token_ok 는 그 셋이 참일 때만 참이 된다 — 위 계산).
             if !operator_ok
+                && !token_ok
                 && crate::state::is_self_approval(
                     pub_pid,
                     pub_pgid,
@@ -6412,10 +6452,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     {
                         record_approval_deny(daemon, pub_sid);
                     }
-                    Reply::Single(ok_response(
-                        &id,
-                        json!({"request_id": request_id, "decision": decision}),
-                    ))
+                    let mut result = json!({"request_id": request_id, "decision": decision});
+                    // ★0.14.42 R7: 해소 성공 뒤에만 allow 권한을 닫는다(1회). 닫기 실패는 해소를 되돌리지
+                    //   않는다 — 두 번째 해소는 위 precheck 가 `item already resolved` 로 막는다(멱등).
+                    if let (true, Some(t)) = (token_ok, team_token.as_deref()) {
+                        let c = crate::teamtoken::consume_allow(daemon, &request_id, &team_body, caller_sid, t);
+                        if !c.authorized {
+                            eprintln!(
+                                "cysd: feed.reply {request_id} — allow 는 해소됐으나 토큰 allow 권한 닫기 실패({}: {})",
+                                c.code, c.detail
+                            );
+                        }
+                        result["team_token"] = json!({"consumed": c.authorized, "code": c.code});
+                    }
+                    Reply::Single(ok_response(&id, result))
                 }
                 // precheck 후 동시 해소(레이스)로 pending이 사라짐 — 이미 해소로 보고.
                 None => Reply::Single(err_response(&id, "invalid_params", "item already resolved")),

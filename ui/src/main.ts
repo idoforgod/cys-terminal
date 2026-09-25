@@ -5111,7 +5111,10 @@ async function runTeamProposalFlow(item: FeedItem): Promise<void> {
     }
     const c = buildTeamConfirm(parsed.spec, { firstTeam });
     const ok = await confirmModal(c.title, c.body, c.yesLabel, c.noLabel);
-    if (!ok) return; // 나중에 — 제안은 그대로 남는다(거부 아님)
+    // ★(2026-09-23 §5-4) 이 함수에서 토스트 없이 끝나는 경로는 아래 한 줄뿐이고 **의도된** 것이다 — 사용자가 확인
+    //   창을 [나중에]·바깥 클릭으로 스스로 닫았다(창이 사라지는 것이 가시 효과 · 제안은 pending 그대로). 그 밖의
+    //   종료는 전부 토스트·busy 안내 뒤다(daemonActionBlocked 도 스스로 토스트를 낸다 — confirmlayer.test.ts 가 못박는다).
+    if (!ok) return; // 의도된 무음: 나중에 — 제안은 그대로 남는다(거부 아님)
     if (daemonActionBlocked()) return; // 확인 창 대기 중 상태 변화 재검사
     // ★통합: teamFlowBusy 가 확인 창부터 생성 완료까지를 통으로 잠그므로(공유 가드), 여기서 별도로
     //   "다른 팀 만들기가 진행 중" 을 재확인할 필요가 없다(그 경합은 함수 첫 줄에서 이미 막힌다).
@@ -6064,12 +6067,17 @@ async function refreshFeed() {
       //  항목만 소각하는 기만 버튼이 된다 · 근거는 feedclass.ts). [확인 창 열기] → 확인 창 [만들기] 만이
       //  생성 경로이고, 거부는 이 카드의 [만들지 않기] 하나다(확인 창의 '나중에'는 거부가 아니다).
       //  본문은 JSON 원문 대신 이름·하는 일 원문을 그대로 보인다.
+      // ★R10(2026-09-23): 안내문은 대화 승인 경로(오너가 대화에서 '만들어' → 훅이 발급한 1회용 토큰으로 master 가
+      //  집행)를 먼저 적고, 이 카드는 화면 경로로 남는다 — 카드의 버튼·생성 경로·거부 경로는 그대로다.
+      // ★(0.14.42 리뷰 m6) 대화 경로는 **대표가 먼저 질문(ask)을 연 경우에만** 열린다. 이미 CEO 로 승격된 기계는
+      //  MASTER_DIRECTIVE 가 사용자 소유라 신본 지침이 .new 로만 도착해(pack-merge 전) 대표가 묻지 않는다 — 그래서
+      //  '대표가 여쭈면'을 조건으로 적는다(무조건 "말씀하시면 바로 만듭니다"는 그 기계에서 거짓).
       const parsed = parseTeamProposal(item);
       if (parsed.ok) body.textContent = teamCardText(parsed.spec);
       const note = document.createElement("div");
       note.className = "fi-meta";
       note.textContent = parsed.ok
-        ? "본부 대표가 제안한 새 팀입니다 — [확인 창 열기]에서 내용을 확인하고 [만들기]를 눌러야 만들어집니다(자동으로 만들어지지 않습니다)."
+        ? "본부 대표가 제안한 새 팀입니다 — 대표가 대화에서 '만들까요?'라고 여쭈면 '만들어'라고 답해 주시면 바로 만듭니다. 화면에서 직접 하시려면 [확인 창 열기] → [만들기]."
         : `제안 형식 오류(${parsed.reason}) — 만들 수 없습니다. [만들지 않기]로 정리하세요.`;
       const actions = document.createElement("div");
       actions.className = "fi-actions";
@@ -6078,7 +6086,11 @@ async function refreshFeed() {
       openBtn.textContent = "확인 창 열기";
       openBtn.disabled = !parsed.ok;
       openBtn.addEventListener("click", () => {
-        void runTeamProposalFlow(item);
+        // ★(2026-09-23 §5-4) 무음 경로 0 — 종전 `void` 는 흐름의 예상 밖 예외(거부된 약속)를 삼켜, 누른 결과가
+        //   화면에 아무것도 남지 않을 수 있었다. 정상 분기는 흐름 안에서 저마다 가시 효과를 낸다.
+        runTeamProposalFlow(item).catch((e) =>
+          toast("health", "팀 만들기 확인 창을 열지 못했습니다 — 제안은 그대로 남아 있습니다", String(e)),
+        );
       });
       const noBtn = document.createElement("button");
       noBtn.className = "deny";
@@ -7210,7 +7222,10 @@ async function openPalette() {
     });
   };
   const run = async (it: PaletteItem) => {
-    close(); // confirm 모달(z 1000)이 팔레트(z 1600) 아래로 가려지지 않게 먼저 닫음
+    // 액션 전에 팔레트를 먼저 닫는다(UX). ★(2026-09-23) 종전 이유였던 "confirm 모달(z 1000)이 팔레트(z 1600)
+    // 아래로 가려짐"은 층서로 풀렸다 — 확인 창(var(--z-modal))은 팔레트·CC 패널 둘 다의 위다(stacking.test.ts).
+    // 이 닫기는 팔레트만 닫고 CC 패널은 그대로 두었으므로, 그 우회로는 CC 를 연 채 부른 확인 창을 지키지 못했다.
+    close();
     if (it.confirm && !(await confirmModal(it.confirm.title, it.confirm.body))) return;
     // ★(0.14.39 · 적대 major ②ⓑ) 액션의 무음 실패 금지 — 종전에는 이 await 가 감싸이지 않아
     //   어떤 팔레트 액션이든 실패가 unhandled rejection 으로 사라졌다. 자기 오류를 스스로
@@ -7255,6 +7270,48 @@ async function openPalette() {
   input.focus();
 }
 
+// ★(2026-09-23 · 팀 제안 확인 창 무반응) 층서 관계의 **코드 쪽 짝**(§5-4) — 확인 창은 열린 패널 위에 뜬다.
+//   사건: 승인 Feed 카드(Control Center 패널 안)에서 연 확인 창이 패널(z 1500) 뒤(z 1000)에 깔려 '무반응'으로
+//   보였다. 층서는 이제 style.css 토큰 표(--z-modal > --z-palette > --z-cc-panel)가 정하고 stacking.test.ts 가
+//   관계로 못박는다 — 평시에는 이 함수가 아무것도 바꾸지 않는다. 이 함수는 그 표가 훗날 어긋나도(새 패널을 확인
+//   창보다 높게 올린 경우 · 토큰 오타로 z-index 가 auto 로 떨어진 경우) 확인 창이 **조용히** 뒤에 깔리지 않게 하는
+//   마지막 방어다. 숫자를 코드에 다시 적지 않는다: 계산된 값끼리 비교해 지금 열린 패널 중 같거나 높은 층이 있으면
+//   확인 창을 그 위로 한 칸 올린다. 패널은 닫지 않는다(사용자가 보던 카드·문맥을 잃지 않게). 판정이 던지면 표의
+//   층서를 그대로 쓴다(종전 동작).
+const OPEN_PANEL_SELECTOR = "#cc-panel, .palette-overlay";
+function keepModalAboveOpenPanels(ov: HTMLElement): void {
+  try {
+    const own = parseInt(getComputedStyle(ov).zIndex, 10); // "auto"(토큰 해석 실패) = NaN → 어떤 패널보다도 낮다고 본다
+    let highest = -Infinity;
+    for (const p of document.querySelectorAll<HTMLElement>(OPEN_PANEL_SELECTOR)) {
+      const cs = getComputedStyle(p);
+      if (cs.display === "none") continue; // 닫힌 패널([hidden])은 관계 밖
+      const z = parseInt(cs.zIndex, 10);
+      if (Number.isFinite(z)) highest = Math.max(highest, z);
+    }
+    if (highest > -Infinity && !(own > highest)) ov.style.zIndex = String(highest + 1);
+  } catch {
+    /* 판정 실패 — 토큰 표의 층서를 그대로 쓴다 */
+  }
+}
+
+// ★(2026-09-23) §5-3 토스트 회피의 **폴백 표지** — style.css 의 `body:has(.modal-overlay) #toasts` 를 못 읽는
+//   WebView 에서도 같은 결과가 나게 body.modal-open 을 건다. 판정은 DOM 존재로만 한다(modalguard.ts 와 같은 원칙
+//   — 별도 계수·플래그가 꼬여 표지가 영영 남는 고착을 구조적으로 없앤다): .modal-overlay 가 하나라도 떠 있으면
+//   켜고, 없으면 끈다. confirmModal 은 열고 닫을 때 직접 부르고(약속이 풀리기 전에 표지가 맞다), 그 밖의 창
+//   (입력·업데이트·피드백 창 — 전부 .modal-overlay)은 아래 관찰자가 body 직계 자식의 증감으로 따른다.
+function syncModalOpenClass(): void {
+  document.body.classList.toggle("modal-open", document.querySelector(".modal-overlay") != null);
+  // ★(0.14.42 리뷰 F2) 확인 창(.confirm-overlay) 밖의 창이 떠 있으면 토스트를 창 밑으로 — 위쪽 조작부(닫기 ×·입력칸)
+  //   클릭 가로채기 방지. 같은 DOM 존재 판정이다(style.css `body:has(.modal-overlay:not(.confirm-overlay))` 의 폴백).
+  document.body.classList.toggle("toast-under-modal", document.querySelector(".modal-overlay:not(.confirm-overlay)") != null);
+}
+try {
+  new MutationObserver(syncModalOpenClass).observe(document.body, { childList: true });
+} catch {
+  /* 관찰자 없음 — :has() 규칙과 confirmModal 의 직접 호출이 남는다 */
+}
+
 // ★확인 버튼 라벨 매개변수화(오너 2026-07-15 실보고): 업데이트 창용 "설치" 하드코딩이 모든
 // 확인 창에 노출(완전 삭제 창의 확인 버튼이 "설치"로 표시). 호출부가 동작 동사를 지정한다.
 /// `noLabel` — 거절 버튼 라벨(기본 "아니오"). 완료 보고형 모달에서 "아니오"는 의미가 어긋나
@@ -7267,7 +7324,8 @@ function confirmModal(
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
-    ov.className = "modal-overlay";
+    // .confirm-overlay = 토스트가 위에 머무는 유일한 창(본문 + 아래 버튼 줄 — style.css §5-3 회피가 지키는 모양).
+    ov.className = "modal-overlay confirm-overlay";
     ov.innerHTML =
       `<div class="modal"><h3></h3><p style="white-space:pre-wrap;max-height:52vh;overflow-y:auto"></p>` +
       `<div class="modal-btns"><button class="modal-no"></button>` +
@@ -7278,6 +7336,7 @@ function confirmModal(
     (ov.querySelector(".modal-no") as HTMLElement).textContent = noLabel;
     const done = (v: boolean) => {
       ov.remove();
+      syncModalOpenClass(); // 떼어 낸 뒤 — 다른 창이 아직 떠 있으면 표지는 켜진 채 남는다
       resolve(v);
     };
     ov.querySelector(".modal-yes")!.addEventListener("click", () => done(true));
@@ -7286,6 +7345,10 @@ function confirmModal(
       if (e.target === ov) done(false);
     });
     document.body.appendChild(ov);
+    // ★(2026-09-23 · 팀 제안 확인 창 무반응) 붙인 직후 두 가지를 맞춘다 — ①열린 패널과의 층 관계(표가 어긋나도
+    //   뒤에 깔리지 않게) ②토스트 회피 폴백 표지(body.modal-open). 근거는 두 함수 머리말.
+    keepModalAboveOpenPanels(ov);
+    syncModalOpenClass();
     // ★(MINOR-7 · 9R) 포커스를 **모달 안으로** 옮긴다.
     //
     // 오버레이(.modal-overlay · position:fixed·inset:0)는 **마우스만** 가린다. 이 줄이 없으면

@@ -76,8 +76,35 @@ command -v cys_lane_guard >/dev/null 2>&1 || _cys_lane_guard
 # ── ③ 고지 발행기 — 셸 printf 전용(외부 명령 0) ──────────────────────────────────────────
 # 본체의 발행기와 **같은 형상**이어야 한다: 줄 선두가 `{"hookSpecificOutput"` 여야 소비자
 # (검체·모델)가 그 줄을 집는다. printf 라 인용부호·역슬래시·개행은 실을 수 없다.
+# ★(0.14.42 P4) 대화 승인 발급 고지(`_CYS_TT_NOTE` · ⑤-b)가 대기 중이면 **같은 줄에 합친다** —
+#   발급 고지가 생겨도 stdout 계약(JSON 1줄 또는 무출력)은 그대로다. 대기 고지가 없으면 출력은
+#   종전과 바이트 동일하다. 발급 고지 본문은 발급기가 인용부호·역슬래시·제어문자를 이미 걷어 냈다.
+_CYS_TT_NOTE=""
 _cys_note() {
-  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$1"
+  _cn_msg="${1:-}"
+  if [ -n "$_CYS_TT_NOTE" ]; then
+    if [ -n "$_cn_msg" ]; then _cn_msg="$_cn_msg / $_CYS_TT_NOTE"; else _cn_msg="$_CYS_TT_NOTE"; fi
+    _CYS_TT_NOTE=""
+  fi
+  printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"%s"}}\n' "$_cn_msg"
+}
+# 대기 중인 발급 고지만 단독으로 낸다 — 런처가 자기 고지 없이 떠나는 갈래(처리완료·억제의 EXIT 트랩 ·
+# 본체 exec 직전).
+_cys_tt_flush() {
+  [ -n "$_CYS_TT_NOTE" ] || return 0
+  _cys_note ""
+}
+
+# ── ③-b 경로 헬퍼 — 디렉터리 부분(구분자 정규화 선행) ─────────────────────────────────────
+# 정의만 여기로 올렸다(⑤-b 발급기 해소가 ⑥ 위임보다 **앞**에서 쓴다). 왜 백슬래시를 먼저 바꾸는지와
+# 해소 순서는 ⑦ 의 주석이 정본이다(IG-11 2차 · Windows 백슬래시 절대경로).
+_cys_dirpart() {
+  [ -n "${1:-}" ] || return 1
+  _cdp=$(printf '%s' "$1" | tr '\\' '/')
+  case "$_cdp" in
+    */*) printf '%s' "${_cdp%/*}" ;;
+    *)   return 1 ;;
+  esac
 }
 
 # ── ④ 상태 경로 2벌(T2-1) — sh 명령용과 네이티브 인자용을 분리한다 ──────────────────────
@@ -97,7 +124,15 @@ if ! mkdir -p "$STATE" 2>/dev/null; then
 fi
 
 # ── ⑤ 훅 입력을 파일로 받는다(본체는 stdin 대신 이 파일을 읽는다) ───────────────────────
-IN="$STATE/hook-input-$$.json"
+# ★(0.14.42 리뷰 RR1-SEC-B) 이름에 **좌석**을 싣는다 — 대화 승인 발급기(⑤-b · javis_teamtoken.py issue)는 이름의
+#   좌석이 부르는 좌석(env)과 같아야 판정한다(다른 좌석에서 오너가 친 진짜 승인 입력을 이 좌석의 질문에 재생하는 길을
+#   막는다 · 아래 GC 가 최근 20개를 남긴다). 좌석 표기는 `12`·`surface:12` 둘이다(javis_bootstrap.my_surface_key 가
+#   숫자부로 흡수) — 셸 확장만으로(외부 명령 0) 콜론 앞을 걷고, 숫자가 아니면 `x`(발급기가 이름 형식 위반으로 거부 =
+#   발급 0 · fail-closed). 부트 본체·신 파이프라인은 경로만 받고 이름을 해석하지 않는다.
+_CYS_IN_SEAT="${CYS_SURFACE_ID:-${AITERM_SURFACE_ID:-}}"
+_CYS_IN_SEAT="${_CYS_IN_SEAT##*:}"
+case "$_CYS_IN_SEAT" in ''|*[!0-9]*) _CYS_IN_SEAT=x ;; esac
+IN="$STATE/hook-input-$_CYS_IN_SEAT-$$.json"
 if ! cat > "$IN" 2>/dev/null; then
   rm -f "$IN" 2>/dev/null
   _cys_note "[cys-hook] 훅 입력 저장 실패 — 부트 미발화"
@@ -106,9 +141,89 @@ fi
 
 # 유계 GC(T3-4 정신) — 비정상 종료로 남은 입력 파일이 무한 누적되지 않게 최신 20개만 남긴다.
 # 파이프 while 을 쓰는 이유: 경로에 공백이 있어도 단어분리로 깨지지 않는다.
+# ★(fatal-fix R1-02 · R1-01 ⓑ) 상태 폴더는 **전 레인·전 좌석이 함께 쓴다**. 종전 GC 는 동시 훅이 20개를 넘으면(정각 정렬
+#   방송·스케줄 · 좌석 최대 약 45) **다른 좌석이 아직 처리 중인** 입력을 지웠다 — 그 좌석의 본체는 stdin 이 이미 소진돼
+#   INPUT 이 빈 채 무음 exit 0(부트 선언 감지·오너 임무 기록·기계 유래 처리 무음 누락), 발급기는 not_hook_caller(v0.14.41 부터).
+#   이름의 끝 숫자는 그 입력을 쓴 런처의 pid 다(`$$` — 본체 exec 도 같은 pid 를 쓴다): **살아 있으면 건너뛴다**
+#   (`kill -0` 은 셸 내장 · 외부 명령 0). 상한: 최신 200개 밖은 살아 있어도 지운다(pid 재사용·판정 이상이 무한 누적이 되지
+#   않게). 실패 방향: kill -0 이 늘 실패하면 종전 거동(삭제) · 늘 성공하면 200개 상한 — 어느 쪽도 새 무한 누적 없음.
+_cys_gc_n=20
 ls -1t "$STATE"/hook-input-*.json 2>/dev/null | tail -n +21 | while IFS= read -r _old; do
+  _cys_gc_n=$((_cys_gc_n + 1))
+  if [ "$_cys_gc_n" -le 200 ]; then
+    _cys_gc_p="${_old##*-}"
+    _cys_gc_p="${_cys_gc_p%.json}"
+    case "$_cys_gc_p" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$_cys_gc_p" 2>/dev/null && continue ;;
+    esac
+  fi
   rm -f "$_old" 2>/dev/null
 done
+
+# ── ⑤-b 대화 승인 1회용 팀 생성 토큰 발급(0.14.42 · 설계 §6-4·§6-6·§7-3·§11 R11·§13 P4) ────────
+# 오너가 master 의 질문("이 내용으로 만들까요?")에 이 좌석에서 직접 "만들어"라고 치면, 그 프롬프트에서
+# 1회용 토큰을 발급한다. 판정·발급은 `bin/javis_teamtoken.py issue` 가 단일 소유하고(배달 원장 대조로
+# 오너 실키 입력을 가린다 — 기계 배달엔 발급하지 않는다), 인터프리터가 필요한 호출은 프리루드 소비
+# 파일 `teamtoken-issue.sh` 가 한다(이 런처는 프리루드 규약 심볼을 쓰지 않는다 — 자기완결 계약).
+# ★자리가 여기인 이유: 아래 ⑥ 은 기계 유래 프롬프트를 처리완료(rc 6)로 닫아 본체를 건너뛴다. 발급
+#   호출이 본체에 있으면 바로 그 경로(기계 배달된 "그래 만들어")에서 거부 사유가 원장에 남지 않는다.
+#   모든 프롬프트가 지나는 한 점은 여기다.
+# ★비용 게이트(매 프롬프트 공통 — 인터프리터를 띄우기 **전**에 거른다 · 리뷰 F3 개정):
+#   **이 좌석의 열린 질문 표지**(`teamtoken-open-<레인>-s<좌석>` · 발급기 모듈이 원장에서 파생해 세우고 걷는 캐시)가
+#   없다 = 이 좌석에 답을 기다리는 질문이 없다 → 셸 글롭 존재 검사 1회로 끝(외부 명령 0). 레인 키 규약을 여기 복사하지
+#   않는다 — 레인 자리의 `*` 는 상위집합이라 안전하다. 표지는 질문(ask)이 열릴 때 **먼저** 세워지고(못 세우면 질문이
+#   열리지 않는다), 답·만료로 닫히면 걷힌다. 답 없이 만료된 질문은 고지 여유(300초) 동안 남아 "확인 시간이 지나
+#   다시 여쭙습니다"(§10)를 한 번 말해 주고, 그 뒤 첫 호출이 걷는다(묵은 표지 = 발급기 1회 뒤 0회).
+#   종전(원장 mtime 10분 창)은 질문이 닫힌 뒤에도 · 거부 감사 레코드 한 줄에도 10분 동안 모든 좌석의 모든
+#   프롬프트가 발급기를 띄웠고(맥 약 +130ms), 원장이 한 번 생긴 기계는 영구히 date·stat 2회(약 +8ms)를 냈다.
+#   그 대가로 '질문 없이 승인처럼 들리는 말'의 ask_not_open 고지는 질문이 열린 동안에만 난다 — 그 밖은
+#   master 의 `javis_teamtoken.py status` 가 보인다(§7-3 · 디렉티브 §4-A 절차 5).
+#   ★게이트의 실패 방향: 표지를 잘못 걸러도 발급 0(= fail-closed)일 뿐 허용이 되지 못한다 — 판정은 언제나
+#     발급기가 원장 내용으로 한다. 표지가 사라졌으면 status 가 원장에 맞춰 되살린다.
+# ★실패 정책(이 런처와 같다): 발급기가 없거나 죽거나 늦어도 프롬프트 제출은 막지 않는다 — 발급기는
+#   전경에서 돌되 stdio 를 이 훅에서 끊고(`</dev/null >/dev/null` · stderr 는 진단용으로 통과) 자기
+#   데드라인(인터프리터 호출 6s + 고지 3s)으로 유계다. 결과는 고지 파일 1줄로만 돌아온다(파이프 점유 0).
+#   ★(fatal-fix R3-F2 · R1-01 · R2-1 · WIN-3) 표지는 **좌석** 단위다(`teamtoken-open-<레인>-s<좌석>`) — 글롭은 이 좌석의
+#     표지만 본다. 질문을 열 수 있는 좌석은 제안을 올린 대표 좌석 하나라, 종전 전 레인 글롭은 질문 창 동안 워커·리뷰어·
+#     CSO·부서 좌석 전부에 인터프리터 1~2회를 붙였다(런처 GC 경합과 발급기 고장 잡음의 노출면). 좌석 표기는 ⑤ 의 입력 파일
+#     이름과 같다(`_CYS_IN_SEAT` — 발급기의 좌석 결박이 이미 둘의 일치를 요구한다). 다른 레인의 같은 번호 좌석은 상위집합.
+#   ★(fatal-fix R3-F7) 롤백 축(`CYS_BOOT_GATES=0` — 본체가 소비하는 기존 노브를 **읽기만** 한다)에서는 건너뛴다: 롤백 축의
+#     훅 시한은 하네스 기본(30s)이라 본체 예산(27s)에 ⑤-b(최대 약 9.5s)가 더해지면 부트 고지가 무음 취소된다 · 사고 순간
+#     대화 승인을 끄는 수단이기도 하다(발급 0 = fail-closed · 화면 경로는 그대로).
+_cys_tt_open() {
+  [ "${CYS_BOOT_GATES:-1}" = "0" ] && return 1
+  for _tt_f in "$STATE"/teamtoken-open-*-s"$_CYS_IN_SEAT"; do
+    [ -f "$_tt_f" ] && return 0
+  done
+  return 1
+}
+if _cys_tt_open; then
+  _TTH=""
+  for _tt_d in "$(_cys_dirpart "${BASH_SOURCE:-}")" "$(_cys_dirpart "${0:-}")" \
+               "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks"; do
+    if [ -n "$_tt_d" ] && [ -f "$_tt_d/teamtoken-issue.sh" ]; then
+      _TTH="$_tt_d/teamtoken-issue.sh"
+      break
+    fi
+  done
+  if [ -n "$_TTH" ]; then
+    _TTN="$STATE/teamtoken-note-$$.txt"
+    rm -f "$_TTN" 2>/dev/null
+    sh "$_TTH" "$IN" "$_TTN" </dev/null >/dev/null
+    _CYS_TT_KIND=""
+    if [ -s "$_TTN" ]; then
+      { IFS= read -r _CYS_TT_KIND; IFS= read -r _CYS_TT_NOTE; } < "$_TTN" || :
+    fi
+    rm -f "$_TTN" 2>/dev/null
+    # 고지가 대기 중이면 이 런처의 **모든 exit** 가 그것을 내게 한다(처리완료·억제 갈래는 자기 고지가
+    # 없다). 자기 고지가 있는 갈래는 `_cys_note` 가 이미 합쳐 비웠으므로 트랩은 아무것도 안 한다.
+    # exec(본체 위임)는 EXIT 트랩을 태우지 않는다 — 그 갈래는 ⑦ 이 exec 직전에 명시로 낸다.
+    [ -n "$_CYS_TT_NOTE" ] && trap '_cys_tt_flush' EXIT
+  else
+    echo "[cys-hook] role-bootstrap: 대화 승인 발급기(hooks/teamtoken-issue.sh) 부재 — 이 발화는 승인 판정 없이 지나간다(발급 0 · 팩 재설치로 복구)" >&2
+  fi
+fi
 
 # ── ⑥ 신 파이프라인 위임(능력 프로브 선행) ──────────────────────────────────────────────
 CYS_HOOK_INPUT_DEADLINE_S="${CYS_HOOK_INPUT_DEADLINE_S:-8}"
@@ -137,6 +252,7 @@ if command -v cys >/dev/null 2>&1 \
     RC="$(cat "$RCF" 2>/dev/null)"
     rm -f "$RCF" 2>/dev/null
     # 6=처리완료 · 3=억제. **이 둘만** 본체를 건너뛴다(0 은 proceed 라 본체로 간다).
+    # (⑤-b 의 발급 고지는 이 갈래에서 EXIT 트랩이 단독으로 낸다 — 이 줄은 음성 대조 MUT-1 의 앵커다.)
     case "$RC" in
       6|3) rm -f "$IN" 2>/dev/null; exit 0 ;;
     esac
@@ -167,14 +283,7 @@ fi
 #   (로컬↔CI 갈림의 정체가 이것이다).
 #   Git Bash 는 슬래시 경로를 그대로 받으므로 **백슬래시를 슬래시로 바꾼 뒤** 자른다.
 #   드라이브 문자(`C:`)는 건드리지 않는다 — 정규화는 구분자에만 적용된다.
-_cys_dirpart() {
-  [ -n "${1:-}" ] || return 1
-  _cdp=$(printf '%s' "$1" | tr '\\' '/')
-  case "$_cdp" in
-    */*) printf '%s' "${_cdp%/*}" ;;
-    *)   return 1 ;;
-  esac
-}
+#   (그 함수 `_cys_dirpart` 의 정의는 ③-b 에 있다 — ⑤-b 가 먼저 쓰기 때문에 위로 올렸다.)
 _LEGACY=""
 _BD=$(_cys_dirpart "${BASH_SOURCE:-}") || _BD=""
 if [ -n "$_BD" ] && [ -f "$_BD/role-bootstrap-legacy.sh" ]; then
@@ -201,4 +310,24 @@ fi
 #   쓰면 /bin/sh 가 dash 인 배포판(대부분의 리눅스)에서 본체가 통째로 죽는다.
 _CYS_SH=sh
 command -v bash >/dev/null 2>&1 && _CYS_SH=bash
+# ★⑤-b 발급 고지는 exec **전에** 낸다 — exec 뒤에는 이 런처가 아무것도 쓸 수 없다. 단 본체가 자기
+#   고지를 낼 수 있는 입력(마스터 토큰 보유 — 본체의 고지는 전부 선언 감지 또는 `_maybe_declaration`
+#   술어 뒤에서만 나간다)이면 두 줄이 될 수 있으므로 **거부·판정 불가 고지는** 싣지 않는다(거부 사실은
+#   원장 issue_refused 에 남는다). 술어는 본체 `_maybe_declaration` 과 같이 훅 입력 **전문**을 보되 그
+#   상위집합이다(감지기의 영문 선언은 대소문자 무시 · JSON \u 이스케이프 16진 대소문자 혼용까지) — 좁으면
+#   두 줄이 새고, 넓으면 거부 고지 하나를 더 잃을 뿐이다.
+#   ★발급 고지(토큰)는 빼지 않는다: 승인 발화는 화이트리스트 전문 일치라 선언일 수 없어 본체의 선언
+#   고지와 겹치지 않는다. 전문 술어가 cwd·transcript_path 의 'master' 글자에 걸린다는 이유로 토큰을
+#   버리면 그런 폴더의 오너는 대화 승인이 영영 안 된다(겹침이 남는 곳은 본체가 판정 불가 강등 고지를
+#   내는 고장 상태뿐이다 — 설계 보고서 잔여 위험에 적었다).
+if [ -n "$_CYS_TT_NOTE" ]; then
+  if [ "${_CYS_TT_KIND:-}" != "issued" ]; then
+    case "$(cat "$IN" 2>/dev/null)" in
+      *마스터*|*[Mm][Aa][Ss][Tt][Ee][Rr]*|*'\u'[bB]9[cC]8'\u'[cC]2[aA]4'\u'[dD]130*)
+        echo "[cys-hook] role-bootstrap: 대화 승인 거부 고지 생략(마스터 토큰 입력 — 본체 고지와 두 줄 방지 · 원장 issue_refused 에 기록됨): $_CYS_TT_NOTE" >&2
+        _CYS_TT_NOTE="" ;;
+    esac
+  fi
+  _cys_tt_flush
+fi
 exec "$_CYS_SH" "$_LEGACY" "$IN"

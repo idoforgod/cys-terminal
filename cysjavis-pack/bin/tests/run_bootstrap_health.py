@@ -8048,6 +8048,22 @@ def h_doc_2():
     return "파생=%s · required 에 master 부재 · 훅 리터럴 0 · 계측검증=%s" % (note[:48], calib)
 
 
+# ★0.14.42 대화 승인 토큰 갈래 — cys-dept 단일소유 가드의 `create --team-token` 분기 표지(코드가 면제의 근거).
+_HDOC3_TOKEN_BRANCH_RE = re.compile(r'\[ "\$cmd" = "create" \] && \[ "\$\{2:-\}" = "--team-token" \]')
+
+
+def _hdoc3_used_verbs(text, dept_src):
+    """문서가 **호출 형태로** 지시하는 cys-dept 동사 집합(`cys-dept <verb>`).
+
+    ★0.14.42: 가드 코드에 `create --team-token` 토큰 관문 갈래가 있으면 그 **정확한 호출형**
+    (`cys-dept create --team-token`)만 뺀다 — 그 형태는 역할이 아니라 토큰 관문(데몬 검증)이 판정하므로
+    문서가 그것을 지시해도 가드와 모순이 아니다. 갈래가 코드에서 사라지면 면제도 함께 사라진다.
+    scripts/gen_ceo_template.py `_used_verbs()` 와 같은 규칙이다(두 곳이 갈리면 한쪽만 적색이 된다)."""
+    if _HDOC3_TOKEN_BRANCH_RE.search(dept_src or ""):
+        text = re.sub(r"cys-dept\s+create\s+--team-token\b", "", text)
+    return set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", text))
+
+
 @specimen("H-DOC-3", "W4", "CEO_TEMPLATE 동사 ⊆ cys-dept 가드 허용 집합(지시-집행 통일)", ["G6"])
 def h_doc_3():
     """G6(RC6): CEO_TEMPLATE 가 CEO 에게 `cys-dept launch/down` **직접 호출**을 지시했는데,
@@ -8076,7 +8092,19 @@ def h_doc_3():
          "가드가 막는 집합이 예상보다 좁다(%s) — 검체 전제 재확인 필요" % sorted(blocked))
     need("CYS_ROLE" in dept and "exit 7" in dept, "가드 판정 재료(CYS_ROLE·exit 7) 부재")
     # ② 문서가 **호출 형태로** 지시하는 동사(`cys-dept <verb>`)를 뽑는다
-    used = set(re.findall(r"cys-dept\s+([a-z][a-z\-]*)", tmpl))
+    used = _hdoc3_used_verbs(tmpl, dept)
+    # ②′ 합성 표본(계측 타당성 · 0.14.42 대화 승인 토큰 갈래): 가드에 `create --team-token` 토큰 관문 갈래가
+    #    있으면 그 **정확한 호출형**은 역할과 무관하게 토큰 관문(데몬 검증)이 판정한다 — 문서가 그 형태를
+    #    지시해도 가드와 모순이 아니다. 토큰 없는 `create` 는 여전히 적색이어야 하고, 가드에서 그 갈래가
+    #    사라지면 면제도 함께 사라져야 한다(면제의 근거는 문서가 아니라 코드다).
+    tok_form = "`cys-dept create --team-token <토큰>`"
+    need(not (_hdoc3_used_verbs(tok_form, dept) & blocked),
+         "합성 표본: 토큰 관문 갈래가 있는 가드에서 `cys-dept create --team-token` 호출형이 차단 동사로 잡혔다")
+    need("create" in _hdoc3_used_verbs("`cys-dept create dept-9`", dept),
+         "합성 표본: 토큰 없는 `cys-dept create` 호출형이 차단 동사로 잡히지 않는다(면제가 넓다)")
+    dept_wo_branch = _HDOC3_TOKEN_BRANCH_RE.sub("false", dept)
+    need(dept_wo_branch != dept and "create" in _hdoc3_used_verbs(tok_form, dept_wo_branch),
+         "합성 표본: 가드에서 토큰 관문 갈래를 지운 변조본에서도 토큰 호출형이 면제된다(면제가 코드에 결박되지 않았다)")
     illegal = sorted(used & blocked)
     need(not illegal,
          "CEO_TEMPLATE 가 가드가 거부하는 동사를 직접 호출하도록 지시한다: %s "
@@ -9167,7 +9195,12 @@ def h_seed_4():
     #   **주입이 사라져서 붉은 것이 아니라 주소가 바뀌어서 붉었다**. 본문을 따라간다.
     lfi = src.find("\nlaunch_dept()")
     need(lfi > 0, "launch 본체 함수(launch_dept)를 못 찾았다")
-    lbody = src[lfi:src.find('\ncase "$cmd" in', lfi)]
+    # ★0.14.42 R8: 창의 끝을 '다음 `case "$cmd" in`' 이 아니라 **함수 자신의 닫는 `}`** 로 조인다 — 그 사이에
+    #   `allocate_dept()`(같은 CYS_ACCOUNT_DIR 주입 문자열을 가진 본체)가 들어와, 옛 경계로는 launch 가 주입을
+    #   잃어도 allocate 의 문자열로 초록이 되는 **공허한 통과**가 생긴다(창이 좁아지므로 계약은 강화된다).
+    lend = src.find("\n}\n", lfi)
+    need(lend > lfi, "launch_dept() 의 닫는 괄호를 못 찾았다")
+    lbody = src[lfi:lend]
     need('CYS_ACCOUNT_DIR="$acctdir"' in lbody, "launch 스폰에 CYS_ACCOUNT_DIR 주입이 없다(G3 재발)")
     need("resolve_lane_acctdir" in lbody, "launch 가 계정 dir 을 유도하지 않는다")
     need("verify_lane_account_seed" in lbody, "launch 가 계정격리 시드를 검증하지 않는다")
@@ -9205,10 +9238,20 @@ def h_seed_4():
          "rotate 가 launch 본체를 경유하지 않는다(복원 경로 결박 실패)")
     notes.append("rotate=launch 본체 경유(복원 상속)")
     # ⓒ allocate 가 account_dir 을 레지스트리에 기록한다(복원 SOT)
-    ai = src.find("\n  allocate)")
-    need("reg_set_field \"$name\" account_dir" in src[ai:src.find("\n  create)", ai)],
+    # ★0.14.42 R8 측정 축 교체 — 계약은 그대로다. allocate 본체도 `allocate_dept()` **함수**로 떼어냈다
+    #   (launch_dept 와 같은 이유 — `create --team-token` 이 토큰 관문 통과 뒤 같은 프로세스 안에서 본체를
+    #   부른다). 팔은 위임 한 줄이 됐으므로 **본문은 함수에서** 재고, 팔이 그 본체로 위임만 한다는 사실을
+    #   함께 잰다(두 벌 구현 금지 — 한쪽만 고쳐지는 사고). 주소가 바뀌었을 뿐 주입이 사라진 것이 아니다.
+    afi = src.find("\nallocate_dept(){")
+    need(afi > 0, "allocate 본체 함수(allocate_dept)를 못 찾았다")
+    aend = src.find("\n}\n", afi)
+    need(aend > afi, "allocate_dept() 의 닫는 괄호를 못 찾았다")
+    need("reg_set_field \"$name\" account_dir" in src[afi:aend],
          "allocate 가 account_dir 을 레지스트리에 기록하지 않는다(rotate 복원 근거 부재)")
-    notes.append("allocate=account_dir 기록")
+    ai = src.find("\n  allocate)")
+    need(ai > 0 and 'allocate_dept "$@"' in src[ai:src.find("\n  create)", ai)],
+         "allocate 팔이 본체 함수로 위임하지 않는다(본체가 두 벌이면 한쪽만 고쳐진다)")
+    notes.append("allocate=account_dir 기록(본체=allocate_dept)")
     # ⓓ 유도 3순위·시드 자기치유 실측(함수 블록만 로드 — 데몬·부서 무접촉)
     with tempfile.TemporaryDirectory() as tmp:
         home = os.path.join(tmp, "home")

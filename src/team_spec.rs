@@ -12,6 +12,7 @@
 //!   ① 제안자 = 본부(base) 레인의 master 좌석(데몬이 커널 peer pid 로 각인한 발행 좌석의 역할) — [`publisher_ok`]
 //!   ② 같은 kind 대기 [`PENDING_MAX`]건 · [`WINDOW_SECS`] 안 [`PER_WINDOW_MAX`]건 — [`admit`]
 //!   ③ 해소 = operator token(GUI)만 · 예외는 발행 좌석 자신의 [`SUPERSEDED`] — [`reply_allowed`]
+//!      ★0.14.42: 그리고 오너 승인 발화로 발급된 **1회용 생성 토큰의 `allow`**(데몬 검증 · allow 전용)
 //!   ④ tier 는 데몬이 d 로 고정(원격 채널 미러 금지) · `wait` 금지 · CEO 자동결재 제외.
 //!
 //! ★정직한 한계: 이 잠금은 **사고 방지 층**이다 — 에이전트의 오해·실수, 대표가 승인 피드 구독
@@ -313,18 +314,34 @@ where
 }
 
 /// ③ 해소 판정 — operator token(GUI) 이면 어떤 결정이든, 아니면 발행 좌석 자신의
-/// `superseded` 만.
+/// `superseded` 만, 그리고 ★0.14.42 **1회용 생성 토큰의 `allow`**.
+///
+/// `token_ok` = 데몬이 검증한 **1회용 생성 토큰**(오너 승인 발화에서 훅이 발급 · 제안 id·좌석·
+/// 본문해시 결박 · 생성 성공 기록(settle created) 뒤에만 무장되는 allow 권한 — 판정 정의처는
+/// `cysjavis-pack/bin/javis_teamtoken.py`, 데몬 다리는 `cysd/teamtoken.rs`). 토큰 경로는 `allow`
+/// 에만 쓰인다 — 거부(deny)는 여전히 오너 GUI 또는 발행 좌석의 `superseded` 뿐이다(에이전트가
+/// 오너 제안을 소각하지 못하게 · 설계 §14-8).
 pub fn reply_allowed(
     decision: &str,
     operator_ok: bool,
+    token_ok: bool,
     caller_sid: Option<u64>,
     publisher_sid: Option<u64>,
 ) -> bool {
-    operator_ok || (decision == SUPERSEDED && caller_sid.is_some() && caller_sid == publisher_sid)
+    operator_ok
+        || (decision == "allow" && token_ok)
+        || (decision == SUPERSEDED && caller_sid.is_some() && caller_sid == publisher_sid)
+}
+
+/// 1회용 생성 토큰의 **모양** — 32자 소문자 hex(`javis_teamtoken.py` `_HEX32` 와 같은 규칙).
+/// 모양만 본다(발급 여부는 원장이 정한다) — 모양 밖 값은 원장을 열어 볼 필요도 없이 미발급이고,
+/// 파이썬 argv 에 옵션 모양(`-…`)이 실리는 일도 여기서 막힌다.
+pub fn team_token_shape_ok(t: &str) -> bool {
+    t.len() == 32 && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// 해소 거부 문구(에이전트에게 보인다 — 합법 경로를 함께 적는다).
-pub const REPLY_DENIED: &str = "팀 만들기 제안은 결정 대상이 아니다 — 오너가 앱의 확인 창에서만 만들거나 만들지 않기로 정한다(operator token). 제안한 대표 자리는 `superseded` 로 자기 제안을 거둘 수만 있다";
+pub const REPLY_DENIED: &str = "팀 만들기 제안은 결정 대상이 아니다 — 오너가 앱의 확인 창에서 정하거나(operator token), 오너가 직접 친 승인 발화로 발급된 1회용 토큰으로만 집행된다(`allow` 전용 · 생성 성공 뒤 `cys feed reply <id> allow --team-token <토큰>`). 제안한 대표 자리는 `superseded` 로 자기 제안을 거둘 수만 있다";
 
 /// Tauri 가 생성 직전에 대조한다: base 데몬 `feed.list` 결과에서 같은 id 의 항목이 아직
 /// pending 이고 kind·본문이 오너가 본 spec 과 같은가(확인 창이 떠 있는 동안 제안이 거둬지거나
@@ -432,13 +449,13 @@ mod tests {
         let old: Vec<(&str, &str, f64)> = three.iter().map(|(k, s, t)| (*k, *s, *t - WINDOW_SECS)).collect();
         assert!(admit(old, now).is_ok(), "24시간 밖은 계수 제외");
 
-        assert!(reply_allowed("allow", true, None, Some(3)));
-        assert!(reply_allowed("deny", true, None, Some(3)));
-        assert!(reply_allowed(SUPERSEDED, false, Some(3), Some(3)));
-        assert!(!reply_allowed(SUPERSEDED, false, Some(4), Some(3)), "다른 좌석의 superseded");
-        assert!(!reply_allowed(SUPERSEDED, false, None, None), "발행 좌석 미상 — 무귀속 호출자");
+        assert!(reply_allowed("allow", true, false, None, Some(3)));
+        assert!(reply_allowed("deny", true, false, None, Some(3)));
+        assert!(reply_allowed(SUPERSEDED, false, false, Some(3), Some(3)));
+        assert!(!reply_allowed(SUPERSEDED, false, false, Some(4), Some(3)), "다른 좌석의 superseded");
+        assert!(!reply_allowed(SUPERSEDED, false, false, None, None), "발행 좌석 미상 — 무귀속 호출자");
         for d in ["allow", "deny", "yes", "approve", "dismissed"] {
-            assert!(!reply_allowed(d, false, Some(3), Some(3)), "발행자의 {d}");
+            assert!(!reply_allowed(d, false, false, Some(3), Some(3)), "발행자의 {d}");
         }
 
         assert!(publisher_ok(false, Some("master")).is_ok());
@@ -446,6 +463,79 @@ mod tests {
         assert!(publisher_ok(false, Some("worker")).is_err());
         assert!(publisher_ok(false, Some("cso")).is_err());
         assert!(publisher_ok(false, None).is_err());
+    }
+
+    /// ★0.14.42 R6 진리표 — 결정 11종 × operator 2 × token 2 × 호출 좌석 3 × 발행 좌석 2 = 264 조합 전수.
+    /// 기대값은 구현식(`||` 사슬)과 **다른 모양**(match 표)으로 적는다 — 같은 식을 두 번 쓰면 무엇도 재지
+    /// 않는다. 요점 셋: ① 토큰은 `allow` 에만 쓰인다(대소문자·공백 변형 불인정) ② 토큰은 거부(deny)·
+    /// 다른 좌석의 superseded 를 열지 않는다(에이전트가 오너 제안을 소각하지 못하게) ③ 종전 두 갈래
+    /// (operator · 발행 좌석 superseded)는 토큰 유무와 무관하게 그대로다.
+    #[test]
+    fn reply_allowed_truth_table_all_combinations() {
+        let decisions = [
+            "allow", "deny", SUPERSEDED, "yes", "approve", "dismissed", "", "Allow", "ALLOW", "allow ",
+            "superseded ",
+        ];
+        let callers = [None, Some(3u64), Some(4u64)];
+        let publishers = [None, Some(3u64)];
+        let (mut n, mut allowed) = (0usize, 0usize);
+        for d in decisions {
+            for operator_ok in [false, true] {
+                for token_ok in [false, true] {
+                    for caller in callers {
+                        for publisher in publishers {
+                            let want = match (operator_ok, d, token_ok) {
+                                (true, _, _) => true,
+                                (false, "allow", tok) => tok,
+                                (false, "superseded", _) => matches!((caller, publisher), (Some(c), Some(p)) if c == p),
+                                _ => false,
+                            };
+                            let got = reply_allowed(d, operator_ok, token_ok, caller, publisher);
+                            assert_eq!(
+                                got, want,
+                                "reply_allowed({d:?}, operator_ok={operator_ok}, token_ok={token_ok}, caller={caller:?}, publisher={publisher:?})"
+                            );
+                            n += 1;
+                            allowed += usize::from(got);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(n, 264, "조합 수가 설계와 다르다");
+        // 허용 조합 수 = operator 132 + (operator 거짓 · allow · token) 6 + (operator 거짓 · superseded ·
+        // 같은 좌석 3·3) 2(token 2가지) — 기대식이 공허하게 늘 참/거짓이 아님을 수로 확인한다.
+        assert_eq!(allowed, 132 + 6 + 2, "허용 조합 수가 다르다(기대식 공허 의심)");
+        // 대표 조합 — 읽는 사람을 위한 명시 행.
+        assert!(reply_allowed("allow", false, true, Some(3), Some(3)), "발행 좌석(대표)의 토큰 allow = 대화 승인 경로");
+        assert!(!reply_allowed("allow", false, false, Some(3), Some(3)), "토큰 없는 발행자의 allow");
+        assert!(!reply_allowed("deny", false, true, Some(3), Some(3)), "토큰으로 deny(소각) 금지");
+        assert!(!reply_allowed(SUPERSEDED, false, true, Some(4), Some(3)), "토큰이 다른 좌석의 superseded 를 열면 안 된다");
+        assert!(!reply_allowed("Allow", false, true, Some(3), Some(3)), "결정 어휘는 정확히 'allow' 만");
+    }
+
+    #[test]
+    fn team_token_shape_is_32_lower_hex() {
+        assert!(team_token_shape_ok(&"0123456789abcdef".repeat(2)));
+        let bads: Vec<String> = vec![
+            String::new(),
+            "0123456789abcdef".into(),        // 16자
+            "0123456789ABCDEF".repeat(2),     // 대문자
+            format!("{}g", "0".repeat(31)),   // hex 밖
+            "0".repeat(33),                   // 33자
+            format!("-{}", "0".repeat(31)),   // 옵션 모양(argv 주입)
+            format!("{} ", "0".repeat(31)),   // 공백
+        ];
+        for bad in &bads {
+            assert!(!team_token_shape_ok(bad), "형식 밖 토큰 통과: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn reply_denied_names_both_legal_paths() {
+        assert!(REPLY_DENIED.contains("확인 창"), "GUI 경로 안내 누락");
+        assert!(REPLY_DENIED.contains("1회용 토큰"), "대화 승인 토큰 경로 안내 누락(R6)");
+        assert!(REPLY_DENIED.contains("superseded"), "발행 좌석의 거두기 안내 누락");
     }
 
     #[test]

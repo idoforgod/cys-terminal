@@ -368,7 +368,8 @@ enum Command {
         action: FeedAction,
     },
     /// 말로 팀 만들기(본부 대표 전용) — 오너와 정한 팀 이름·하는 일을 '팀 만들기 제안' 1건으로 올린다.
-    /// 만들기는 오너가 앱 확인 창에서만 한다(제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
+    /// 만들기는 오너 승인으로만 — 대화 승인(질문 `javis_teamtoken.py ask` → 오너가 직접 친 짧은 승인에 훅이 준 1회용 토큰)
+    /// 또는 앱 확인 창 [만들기](제안자·건수·해소 권한은 데몬이 잠근다 — 사고 방지 층).
     TeamPropose {
         /// 팀 이름(표시명 · 40자 이내 · 한글 가능)
         #[arg(long)]
@@ -379,6 +380,12 @@ enum Command {
         /// 하는 일을 적은 UTF-8 파일(긴 문장·여러 줄은 이쪽을 쓴다)
         #[arg(long)]
         purpose_file: Option<std::path::PathBuf>,
+    },
+    /// ★0.14.42 대화 승인 1회용 팀 생성 토큰 — `cys-dept create --team-token` 전용 내부 동사(도움말 비노출)
+    #[command(hide = true)]
+    TeamToken {
+        #[command(subcommand)]
+        action: TeamTokenAction,
     },
     /// RSI 학습 루프 — 사람 직접 명령(제안 생성) 또는 현재 학습 라운드 상태 조회
     Learn {
@@ -2102,6 +2109,39 @@ enum FeedAction {
         /// 결재 사유(W3.3 감사 기록용). 한글·공백은 셸에서 단일 인용으로 감싼다.
         #[arg(long)]
         reason: Option<String>,
+        /// ★0.14.42 팀 만들기 제안의 `allow` 전용 — 오너 승인 발화로 발급된 1회용 생성 토큰.
+        /// 데몬이 검증한다(생성 성공 기록 뒤에만 유효 · 좌석·제안·본문 결박). 없으면 종전과 같다.
+        #[arg(long = "team-token", allow_hyphen_values = true)]
+        team_token: Option<String>,
+    },
+}
+
+/// ★0.14.42(설계 §11 R8) `cys team-token` — `cys-dept create --team-token` 이 **데몬에 묻는** 내부 동사.
+/// 판정은 전부 데몬이 한다(좌석 = 커널 peer 신원 · 원장 검증·소비 = 팩 javis_teamtoken). 이 CLI 는
+/// 판정하지 않고 데몬 답을 stdout JSON 1줄로 옮길 뿐이다 — exit 0 = 데몬 통과 · 1 = 데몬 거부(사유
+/// 코드 보존) · 3 = 데몬에 닿지 못함. **0 이 아닌 모든 값은 인가 없음**이다.
+#[derive(Subcommand)]
+enum TeamTokenAction {
+    /// 생성 단계 1회 소비 — 통과 시 만들 명세(spec_b64 = 데몬 메모리의 현재 제안 본문)를 돌려준다
+    Consume {
+        #[arg(long, allow_hyphen_values = true)]
+        token: String,
+    },
+    /// 생성 결과 기록 — created(--dept 필수)만 allow 권한을 무장한다 · failed 는 종결
+    Settle {
+        #[arg(long, allow_hyphen_values = true)]
+        token: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        dept: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        code: Option<i64>,
+    },
+    /// 조회(인가 아님) — 상태·제안 id·호출 좌석이 토큰 좌석과 같은가
+    Inspect {
+        #[arg(long, allow_hyphen_values = true)]
+        token: String,
     },
 }
 
@@ -5082,6 +5122,7 @@ fn run(command: Command) -> i32 {
         Command::TeamPropose { name, purpose, purpose_file } => {
             return run_team_propose(&name, purpose, purpose_file)
         }
+        Command::TeamToken { action } => return run_team_token(action),
 
         Command::Learn { topic, status } => {
             if status {
@@ -5187,8 +5228,14 @@ fn run_team_propose(
         Ok(r) if cys::team_spec::team_gate_ok(&r) => {
             println!("{}", spec.id);
             println!("팀 만들기 제안 등록: '{}' ({})", spec.display, spec.id);
-            println!("오너에게 1줄로 알려라: \"제어 센터 승인 탭의 '팀 만들기 제안' 카드에서 [확인 창 열기] → [만들기]를 눌러 주세요.\"");
-            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 다시 말을 걸면 확인한다:");
+            // ★0.14.42(리뷰 F4·M1): 다음 한 걸음은 MASTER §4-A 절차 3(대화 승인 질문)이다 — 도구 출력은 디렉티브보다
+            //   먼저 읽히므로 여기서 화면 경로만 지시하면 질문이 열리지 않고 오너의 "만들어"가 ask_not_open 이 된다.
+            println!(
+                "다음(MASTER §4-A 절차 3): 이 좌석에서 대화 승인 질문을 연다 — python3 \"${{CYS_PACK_DIR:-$HOME/.cys/pack}}/bin/javis_teamtoken.py\" ask --proposal {}",
+                spec.id
+            );
+            println!("  exit 0 이면 출력 message(\"이 내용으로 만들까요? …\")를 오너에게 그대로 1줄로 말한다. exit 0 이 아니면 그 message 를 1줄로 전하고 화면 경로(제어 센터 승인 탭 '팀 만들기 제안' 카드의 [확인 창 열기] → [만들기])를 안내한다.");
+            println!("기다리지 마라(대기 루프·재시도·재제안 금지). 오너가 승인하면 그 프롬프트의 훅 고지(1회용 토큰)로만 §4-A-2 를 집행한다. 오너가 다시 말을 걸면 확인한다:");
             println!("  만들어짐 = 팀 명부 ~/.cys/depts.json 에 team_proposal_id \"{}\" 가 있다", spec.id);
             println!("  대기·결정 = `cys feed list` 의 {} 줄 (pending=대기 · decision=deny=오너가 만들지 않기로 함)", spec.id);
             0
@@ -5260,13 +5307,14 @@ fn run_feed(action: FeedAction) -> i32 {
             }
             0
         }),
-        FeedAction::Reply { request_id, decision, reason } => {
+        FeedAction::Reply { request_id, decision, reason, team_token } => {
             // reason은 Some일 때만 실어 보낸다(None=키 부재 → 데몬에서 null 처리).
-            request(
-                "feed.reply",
-                json!({"request_id": request_id, "decision": decision, "reason": reason}),
-            )
-            .map(|_| {
+            let mut params = json!({"request_id": request_id, "decision": decision, "reason": reason});
+            // ★0.14.42: 토큰은 준 경우에만 키를 싣는다 — 키 부재 = 토큰 경로 미시도(데몬 종전 판정 그대로).
+            if let Some(t) = team_token {
+                params["team_token"] = json!(t);
+            }
+            request("feed.reply", params).map(|_| {
                 println!("OK");
                 0
             })
@@ -5278,6 +5326,44 @@ fn run_feed(action: FeedAction) -> i32 {
             eprintln!("error: {e}");
             1
         }
+    }
+}
+
+/// ★0.14.42 `cys team-token …` — 데몬 답을 stdout JSON 1줄 + exit 로 옮긴다(판정 0 — 데몬이 한다).
+fn run_team_token(action: TeamTokenAction) -> i32 {
+    let (method, params) = match action {
+        TeamTokenAction::Consume { token } => ("team.token.consume", json!({"team_token": token})),
+        TeamTokenAction::Inspect { token } => ("team.token.inspect", json!({"team_token": token})),
+        TeamTokenAction::Settle { token, outcome, dept, code } => (
+            "team.token.settle",
+            json!({"team_token": token, "outcome": outcome, "dept": dept, "code": code}),
+        ),
+    };
+    let (out, rc) = team_token_outcome(request(method, params));
+    println!("{out}");
+    rc
+}
+
+/// 응답 → (stdout JSON, exit). 거부는 `rpc_roundtrip` 의 `"<code>: <message>"` 문자열이다 — 사유 코드를
+/// 되짚어 보존한다(cys-dept 가 오너에게 그 코드·문구를 그대로 전한다). 코드 모양(`[a-z_]+`)이 아니면
+/// 데몬의 판정이 아니라 연결 실패다 → `daemon_unreachable`(exit 3). 어느 쪽이든 비0 = 인가 없음.
+fn team_token_outcome(r: Result<Value, String>) -> (Value, i32) {
+    match r {
+        Ok(v) => {
+            let mut out = json!({"ok": true});
+            if let (Some(o), Some(src)) = (out.as_object_mut(), v.as_object()) {
+                for (k, val) in src {
+                    o.insert(k.clone(), val.clone());
+                }
+            }
+            (out, 0)
+        }
+        Err(e) => match e.split_once(": ") {
+            Some((c, m)) if !c.is_empty() && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
+                (json!({"ok": false, "code": c, "message": m}), 1)
+            }
+            _ => (json!({"ok": false, "code": "daemon_unreachable", "message": e}), 3),
+        },
     }
 }
 
@@ -14823,8 +14909,9 @@ fn run_claim_role(
                         "[claim-role] 새 부서장을 세우려는 경우: 이 프로세스가 직접 GUI 로 부서를 만들 \
                          수는 없다 — 기존 대표(master)에게 말로 부탁해 \
                          `cys team-propose --name … --purpose …` 로 제안하게 하거나, 오너가 GUI \
-                         '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너의 앱 확인 창에서만 \
-                         — 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
+                         '전문가용 › 팀 직접 만들기'로 직접 만들어야 한다(둘 다 오너 승인이 있어야 \
+                         생긴다 — 제안은 오너의 대화 승인 1회용 토큰 또는 앱 확인 창, 직접 만들기는 앱 확인 \
+                         창 · 만들기는 자동 진행되지 않는다). `cys-dept allocate` 로 독립 부서(전용 \
                          데몬·역할 공간)를 직접 만들고 그 안에서 선언하는 경로도 남아 있다. 부서 \
                          자동 생성은 **오너가 직접 타이핑한** 마스터 선언(훅 발화 경로 · base 레인 \
                          unix)에서만 이어진다 — 직접 실행·기계 배달 선언은 폭주 봉인으로 비적용이다."
@@ -37615,5 +37702,90 @@ mod team_propose_tests {
         // 둘 다 주면 거부(어느 쪽이 원문인지 모호).
         let c = Cli::try_parse_from(["cys", "team-propose", "--name", "팀", "--purpose", "a", "--purpose-file", "/tmp/p.md"]);
         assert!(c.is_err(), "--purpose 와 --purpose-file 동시 지정이 통과했다");
+    }
+
+    /// ★0.14.42(리뷰 F4·M1) 제안 직후의 **도구 출력**이 MASTER §4-A 절차 3(대화 승인 질문 `ask`)을 가리킨다 — 소스 핀.
+    ///
+    /// 【왜】 규약상 도구 출력이 디렉티브보다 먼저 읽힌다. 종전 출력은 "오너에게 1줄로 알려라: … [확인 창 열기] →
+    /// [만들기]를 눌러 주세요" 로 화면 경로만 지시해, master 가 그대로 따르면 질문이 열리지 않고 오너의 "만들어"는
+    /// ask_not_open 이 됐다(대화 승인 경로 전체가 소리 없이 우회). 같은 계열의 '확인 창에서만' 문구 4곳(clap 도움말 ·
+    /// claim-role 안내 · javis_bootstrap 힌트 2)도 이제 사실이 아니다 — 제안은 대화 승인 토큰으로도 만들어진다.
+    #[test]
+    fn team_propose_output_points_to_conversation_ask_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let i = prod.find("\nfn run_team_propose(").expect("run_team_propose 가 사라졌다");
+        let body = &prod[i..i + prod[i..].find("\n}\n").expect("run_team_propose 의 끝")];
+        let ask = body.find("javis_teamtoken.py").expect("제안 직후 출력이 대화 승인 질문(javis_teamtoken.py ask)을 가리키지 않는다");
+        assert!(body[ask..].contains("ask --proposal {}"), "ask 호출형에 제안 id 가 실리지 않는다");
+        let gui = body.find("[확인 창 열기] → [만들기]").expect("화면 경로(대안) 안내가 사라졌다");
+        assert!(ask < gui, "화면 경로가 대화 승인 질문보다 먼저 지시된다 — 도구 출력이 §4-A 절차 3 을 뒤집는다");
+        assert!(!body.contains("를 눌러 주세요"), "화면 경로만 지시하는 옛 1줄 안내가 남아 있다");
+        let boot = include_str!("../../cysjavis-pack/bin/javis_bootstrap.py");
+        for (name, text) in [("cys.rs", prod), ("javis_bootstrap.py", boot)] {
+            assert!(!text.contains("확인 창에서만"), "{name}: '확인 창에서만' — 대화 승인 토큰 경로가 생긴 뒤로 사실이 아니다");
+        }
+    }
+}
+
+// ★0.14.42 P5(설계 §11 R7·R8) 대화 승인 1회용 팀 생성 토큰 — CLI 배선 핀. 판정은 데몬(cysd
+// team_token_tests)이, 진리표는 lib `cys::team_spec` 이 잰다. 여기는 **표면**만: 인자가 데몬 RPC 로
+// 그대로 실리는가 · 거부 사유 코드가 stdout JSON 에 보존되는가 · 내부 동사가 도움말에 숨는가.
+#[cfg(test)]
+mod team_token_cli_tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn feed_reply_carries_optional_team_token() {
+        let c = Cli::try_parse_from(["cys", "feed", "reply", "tp-1-00ab", "allow", "--team-token", "0123"])
+            .expect("feed reply --team-token 이 없다");
+        match c.command {
+            Command::Feed { action: FeedAction::Reply { team_token, .. } } => {
+                assert_eq!(team_token.as_deref(), Some("0123"));
+            }
+            _ => panic!("feed reply 파싱 실패"),
+        }
+        // 없으면 None — 종전 호출형(`cys feed reply <id> allow`) 그대로.
+        let c = Cli::try_parse_from(["cys", "feed", "reply", "tp-1-00ab", "allow"]).expect("종전 호출형");
+        match c.command {
+            Command::Feed { action: FeedAction::Reply { team_token, .. } } => assert!(team_token.is_none()),
+            _ => panic!("feed reply 파싱 실패"),
+        }
+    }
+
+    #[test]
+    fn team_token_subcommands_parse_and_stay_hidden() {
+        for argv in [
+            vec!["cys", "team-token", "consume", "--token", "0123"],
+            vec!["cys", "team-token", "inspect", "--token", "0123"],
+            vec!["cys", "team-token", "settle", "--token", "0123", "--outcome", "created", "--dept", "dept-3"],
+            vec!["cys", "team-token", "settle", "--token", "0123", "--outcome", "failed", "--code", "8"],
+            // 위조값이 '-' 로 시작해도 사용 오류로 새지 않고 데몬까지 가서 거부 코드를 받는다.
+            vec!["cys", "team-token", "consume", "--token", "-x"],
+        ] {
+            assert!(Cli::try_parse_from(argv.clone()).is_ok(), "파싱 실패: {argv:?}");
+        }
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("team-token"), "내부 동사(team-token)가 도움말에 노출됐다");
+    }
+
+    #[test]
+    fn team_token_outcome_keeps_daemon_refusal_code() {
+        let (v, rc) = team_token_outcome(Ok(json!({"code": "consumed", "proposal_id": "tp-1", "spec_b64": "eyJ9"})));
+        assert_eq!(rc, 0);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["proposal_id"], json!("tp-1"));
+        assert_eq!(v["spec_b64"], json!("eyJ9"));
+        // rpc_roundtrip 의 거부 문자열("<code>: <message>") — 사유 코드를 그대로 보존(인가 없음 = 비0).
+        let (v, rc) = team_token_outcome(Err("token_unknown: 승인 말씀이 시스템에 닿지 않았습니다 (원장에 없는 토큰)".into()));
+        assert_eq!(rc, 1);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["code"], json!("token_unknown"));
+        assert!(v["message"].as_str().unwrap().contains("원장에 없는 토큰"));
+        // 데몬에 닿지 못함 — 사유 코드 모양이 아니다 → daemon_unreachable(인가 없음).
+        let (v, rc) = team_token_outcome(Err("cannot connect to cysd at /x/cys.sock: No such file or directory (os error 2)".into()));
+        assert_eq!(rc, 3);
+        assert_eq!(v["code"], json!("daemon_unreachable"));
     }
 }

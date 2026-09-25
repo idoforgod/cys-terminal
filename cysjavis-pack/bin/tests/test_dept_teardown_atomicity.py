@@ -131,10 +131,12 @@ check("W3 helper rotate 가드", '[ "${_CYS_ROTATE_SELF:-}" = "1" ] && return 0'
 check("W3b ★상속 env 표식 부활 금지", "CYS_DEPT_ROTATE=1 bash" not in src)
 check("W3c ★게이트가 상속 env 를 다시 읽지 않는다",
       '[ "${CYS_DEPT_ROTATE:-}" = "1" ]' not in src)
-# ★이미 샌 라이브 값 회수 — 네 곳의 cysd 스폰 전부가 그 변수를 벗긴다.
-check("W3d ★cysd 스폰 4곳 모두 CYS_DEPT_ROTATE 를 벗긴다",
-      src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE") == 4,
-      "count=%d" % src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE"))
+# ★이미 샌 라이브 값 회수 — cysd 스폰 전부가 그 변수를 벗긴다.
+#   (0.14.42 fatal-fix X-R4-1 재핀: 토큰 경로 allocate 의 새 세션 스폰 줄이 하나 늘어 5곳 — 스폰 줄 수와 벗기기 수가 같아야 한다)
+_spawn_lines = [l for l in src.splitlines() if 'nohup' in l and '"$CYSD"' in l and not l.lstrip().startswith("#")]
+check("W3d ★cysd 스폰 전부(5곳) CYS_DEPT_ROTATE 를 벗긴다",
+      src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE") == len(_spawn_lines) == 5,
+      "count=%d spawn=%d" % (src.count("-u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE"), len(_spawn_lines)))
 check("W4 helper --remove", "--dept --remove" in src)
 check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
 # ★D-IMPL-2 대칭 핀: phoenix 묘비와 데몬 묘비는 set/remove가 항상 쌍으로 — 한쪽만 있으면
@@ -165,6 +167,10 @@ def precedes(block, first, second):
 
 # ★R7(적대검증 W1): down/down-sock 모두 묘비가 reg_remove보다 선행(set -e abort 시 등재+미묘비 창 봉쇄)
 _down = case_arm(src, "down")
+# (0.14.42 fatal-fix R4-N1 재핀) `down)` 갈래는 본체 함수 `down_dept` 를 부른다 — 토큰 경로 생성 실패 회수가 같은 본체를
+#   프로세스 안에서 부르기 위해 뗐다. 갈래가 위임하면 함수 본문에서 같은 순서를 잰다(핀 의도 불변).
+if 'down_dept "$@"' in _down:
+    _down = src.split("\ndown_dept(){", 1)[1].split("\n}\n", 1)[0]
 check("W8 down: 묘비 선기록", precedes(_down, 'dept_tombstone "$name"', 'reg_remove "$name"'))
 _ds = case_arm(src, "down-sock")
 check("W9 down-sock: 묘비 선기록(실행문 정박 — 주석 오매치 방지)",

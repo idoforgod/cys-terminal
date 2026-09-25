@@ -1938,6 +1938,15 @@ def _block(src, start_label, end_label):
         j = src.find("\n}\n", i)
         assert j > i, "launch_dept() 종결 부재"
         return src[i:j]
+    # ★0.14.42 R8: `allocate` 본체도 같은 이유로 함수(`allocate_dept(){ … }`)가 됐다 — `create --team-token` 이
+    #   토큰 관문(데몬 검증·소비) 통과 뒤 **같은 프로세스 안**에서 본체를 부른다(자식 `bash "$0" allocate` 는
+    #   단일소유 게이트를 다시 돌아 master 좌석에서 exit 7). 핀의 의도는 그대로 — 함수 본체를 본다.
+    if start_label == "allocate":
+        i = src.find("\nallocate_dept(){")
+        assert i > 0, "allocate_dept() 함수 부재(본체가 다시 case 갈래로 돌아갔는가)"
+        j = src.find("\n}\n", i)
+        assert j > i, "allocate_dept() 종결 부재"
+        return src[i:j]
     i = src.find("\n  %s)" % start_label)
     assert i > 0, start_label
     j = src.find("\n  %s)" % end_label, i)
@@ -2181,8 +2190,12 @@ class DeptWiringStatic(unittest.TestCase):
         self.assertIn("cys-dept cwd <name>", usage.stdout + usage.stderr)
 
     def test_6c_daemon_lines_env_u_prefix(self):
-        lines = [l for l in self.src.splitlines() if 'nohup "$CYSD"' in l]
-        self.assertEqual(len(lines), 4, lines)
+        # ★(0.14.42 fatal-fix X-R4-1) 토큰 경로 allocate 는 새 세션(setsid 셈)으로 띄우는 줄이 하나 더 있다 —
+        #   `nohup python3 -c "$_CYS_SETSID_PY" "$CYSD"`. 같은 좌석 env 벗기기 계약을 지는지 함께 잰다(주석 줄 제외).
+        lines = [l for l in self.src.splitlines()
+                 if 'nohup' in l and '"$CYSD"' in l and not l.lstrip().startswith("#")]
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(len([l for l in lines if '_CYS_SETSID_PY' in l]), 1, lines)
         for l in lines:
             # ★재핀(0.14.31 P6 R1 · 항목 추가): 핀의 의도("좌석 env 를 벗기고 데몬을 스폰한다")는
             #   그대로이고 벗기는 **목록이 늘었다**. `CYS_DEPT_ROTATE` 는 rotate 재귀 표식으로
