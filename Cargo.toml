@@ -35,7 +35,12 @@ portable-pty = { path = "vendor/portable-pty" }
 vt100 = "0.15"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
-sysinfo = "0.33"
+# ★FATAL-1(0.14.42 WP-transport 리뷰): 기본 feature 의 `multithread`(rayon 전역 풀)를 끈다 — 나머지 기본
+#   feature(component·disk·network·system·user)는 그대로다(윈도우 `windows` 크레이트 feature 집합 무변).
+#   multithread 는 요청마다 rayon 작업을 전역 풀에 넣고, join 대기 중인 워커가 **다른 요청의** 작업을 훔쳐
+#   같은 스택에 중첩 실행한다 — 동시 surface.list ≈350 에서 2MiB 워커 스택이 넘쳐 cysd 가 SIGABRT(전 pane 사망,
+#   debug 실측 rc=-6). 호출 스레드에서 순차로 돌면 중첩 자체가 없다. 핀: cysd `fatal1_admission_tests`.
+sysinfo = { version = "0.33", default-features = false, features = ["component", "disk", "network", "system", "user"] }
 strip-ansi-escapes = "0.2"
 dirs = "6"
 libc = "0.2"

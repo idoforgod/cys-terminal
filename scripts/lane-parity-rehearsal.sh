@@ -149,6 +149,23 @@ UNREGISTERED_OK = {n: _BASELINE for n in (
     "test_org_audit", "test_pack_syntax_warnings", "test_preflight_nlm_pin", "test_preflight_phase1_checks",
     "test_release_verify", "test_seat_revival", "test_verify_gate", "test_vibecheck", "test_viberoute",
 )}
+# ★E(0.14.42 WP-transport · cysd RLIMIT_NOFILE 자체 상향) — 로컬 수용 검체. 기준선 격차가 아니라
+#   **설계상 CI 밖**이다: debug cysd 바이너리 빌드·실데몬·동시 소켓 320개·soft 256 기동 셸 재현이
+#   필요한데 ci-branch 에는 `cargo build` 가 0건이고(cargo test --bin cysd 는 하네스만 만든다)
+#   pack-release 는 cys 만 빌드한다. 판정의 CI 몫(한도 상향·자식 상속·never-lower·롤백 두 채널)은
+#   fdlimit.rs 자식 프로세스 검체 C1 이 `cargo test --bin cysd`(ci-branch macOS · release)에서
+#   매 푸시 잰다 — 이 파일이 덧붙이는 것은 소켓 EMFILE 실연뿐이다.
+UNREGISTERED_OK["test_cysd_nofile_e2e"] = (
+    "E(0.14.42) 로컬 수용 검체 — debug cysd 빌드·실데몬·소켓 320·soft 256 재현 필요(ci-branch 에 "
+    "cargo build 0건 · pack-release 는 cys 만 빌드) · CI 몫은 fdlimit.rs C1 이 cargo test --bin cysd 에서 잰다")
+# ★FATAL-1(0.14.42 WP-transport 리뷰 · E 의 대체 장치) — 로컬 수용 검체. 위 E 검체와 같은 사유로 **설계상
+#   CI 밖**이다: debug cysd 빌드·실데몬·soft 256 기동 셸·동시 영속 연결 500·10s 폭주가 필요하다. 판정의 CI 몫
+#   (sysinfo 가 rayon 에 의존하지 않음 · dispatch 가 입장 게이트를 거침 · 게이트가 동시 실행을 상한 안으로
+#   묶고 거절하지 않음 · ping 면제)은 cysd `fatal1_admission_tests` 가 cargo test --bin cysd 에서 매 푸시 잰다.
+UNREGISTERED_OK["test_cysd_dispatch_storm_e2e"] = (
+    "FATAL-1(0.14.42) 로컬 수용 검체 — debug cysd 빌드·실데몬·soft 256·동시 영속 연결 500·10s 폭주 필요"
+    "(ci-branch 에 cargo build 0건 · pack-release 는 cys 만 빌드) · CI 몫은 cysd fatal1_admission_tests 가 "
+    "cargo test --bin cysd 에서 잰다")
 
 SB, SE = "LANE-GATE-SELF-BEGIN", "LANE-GATE-SELF-END"
 
