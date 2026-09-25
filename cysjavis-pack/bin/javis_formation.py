@@ -1032,6 +1032,12 @@ def _emit_evt(evt_type, fields):
 #   보고 보내지 않는다. 전송 실패는 키당 ONBOARD_MAX_TRIES 회(다음 ensure = 심박)까지 · 선점 뒤 크래시는 미발송으로 남는다
 #   (최대 1회 — 중복보다 안전) · 시간 초과(미확정)도 재시도하지 않는다. 완결 알림까지 끝나면 무장을 닫는다(done) · TTL 지난
 #   무장과 팀 명부(depts.json)의 제안 id 와 어긋난 무장(지워진 뒤 같은 번호로 되살아난 팀)은 알림 없이 닫는다.
+# 첫 과제 1회(R1-F1): 대표 알림이 첫 과제를 싣는다는 표지(task)는 **선점과 같은 잠금 안에서** 그 키에 싣는다 — 확정(settle)
+#   뒤에만 적으면, 선점만 된 채 발송 중(다른 호출과 겹침)이거나 확정 기록이 빠진(Windows 백신 잠금 · 쓰기 잠금 초과 · 발송 뒤
+#   종료) 동안 [편성 알림](ceo:ready)이 첫 과제를 한 번 더 지시한다. 표지는 보내지 못해 선점을 풀 때만 함께 지워진다.
+#   부서장 키가 **다른 호출에 선점돼 발송 중**(선점 뒤 ONBOARD_CLAIM_STALE_S 안)이면 이번 호출은 대표 알림을 보내지 않고
+#   물러난다 — 선점한 호출이 이어서 보낸다('팀장 자리가 비어 있다' 오안내 0). 그 창이 지나도 확정이 없으면(보내던 호출이
+#   끝났다) 미확정(unconfirmed)과 같이 '나갔을 수 있다'로 보고 대표 알림을 잇는다(영구 침묵 0 · 부서장 키는 다시 보내지 않는다).
 # 순서(§2 지침 주입이 작업 티켓보다 선행): 부서장 좌석에 에이전트가 **앉아 있을 때만**(seat=occupied · agent 사망 아님)
 #   각성 지시를 넣는다 — 편성의 부트 주입(boot_node INJECT · 같은 큐)이 이미 앞에 있으므로 FIFO 가 지침 → 각성 지시를 보장하고,
 #   대표의 첫 과제는 이 알림 **뒤**에 오므로 그다음이다. 빈 셸이면 보류하고 대표 알림에 보류를 적는다(빈 셸 타이핑 금지).
@@ -1047,6 +1053,10 @@ ONBOARD_TTL_S = 86400.0
 ONBOARD_MAX_TRIES = 3
 ONBOARD_WATCH_S = 600.0
 ONBOARD_WATCH_POLL_S = 10.0
+# 선점(claimed) 뒤 '아직 보내는 중일 수 있는' 창(초). 선점한 호출의 발송 1건은 `cys send` 15s 상한 + 확정 쓰기(잠금 2s ·
+# 교체 재시도 0.4s)로 끝나므로 넉넉히 잡는다. 이 창 안의 부서장 선점은 '발송 중'(다른 호출은 물러난다) · 창 밖은 '미확정'.
+# 창을 잘못 짚어도(시계 역행 등) 첫 과제 중복은 생기지 않는다 — 첫 과제 1회는 task 표지가 지킨다.
+ONBOARD_CLAIM_STALE_S = 120.0
 # 오너 원문(ABSOLUTE ANCHOR) — 글자 그대로. MASTER_DIRECTIVE §4-A-2 ③ 도 같은 글자다(test_teamtoken D12 대조).
 AWAKEN_ORDER = "CSO, Worker, 리뷰어 등 모든 노드 전원에게 각자의 지침을 하달하고, 전원 각성 절차를 진행하라."
 # §10 원문 — javis_teamtoken.OWNER_MESSAGES["formation_partial"] 과 같은 글자(test_formation 14a1 대조).
@@ -1132,31 +1142,38 @@ def _onboard_update(path, fn):
         return None
 
 
-def _onboard_claim(path, key):
-    """보내기 전 선점 — 이미 선점·발송·포기한 키는 False(1회성의 단일 근거)."""
+def _onboard_claim(path, key, task=False):
+    """보내기 전 선점 — 이미 선점·발송·포기한 키는 False(1회성의 단일 근거).
+    task=True(첫 과제를 싣는 대표 알림)면 표지를 **선점과 같은 잠금 안에서** 그 키에 싣는다(R1-F1 — 확정 전·확정 유실에도
+    다른 호출이 첫 과제를 다시 지시하지 않게)."""
     def fn(rec):
         sent = rec.setdefault("sent", {})
         if rec.get("done") or key in sent:
             return False
         sent[key] = {"at": time.time(), "st": "claimed"}
+        if task:
+            sent[key]["task"] = True
         return True
     return _onboard_update(path, fn) is True
 
 
 def _onboard_settle(path, key, ok, task=False):
     """발송 결과 확정 — True=sent · None=unconfirmed(시간 초과 — 큐에 들어갔을 수 있어 **다시 보내지 않는다**: 중복 배달
-    방지) · False=보내지 못함(시도 수를 올리고 한도 전이면 선점을 풀어 다음 ensure 가 다시 시도한다)."""
+    방지) · False=보내지 못함(시도 수를 올리고 한도 전이면 선점을 풀어 다음 ensure 가 다시 시도한다).
+    첫 과제 표지(task)는 보낸 것·미확정이면 그 키에 남기고, 보내지 못했으면 선점과 함께 지운다(포기도 '안 보냄')."""
     def fn(rec):
         sent, tries = rec.setdefault("sent", {}), rec.setdefault("tries", {})
         if ok is None:
             sent[key] = {"at": time.time(), "st": "unconfirmed"}
             if task:
+                sent[key]["task"] = True
                 rec["task"] = True   # 미확정도 '보낸 것'으로 친다 — 첫 과제 지시를 두 번 내지 않는다
             sys.stderr.write("[formation] 편성 알림 %s 배달 미확정(시간 초과) — 중복 방지로 재시도하지 않는다\n" % key)
             return None
         if ok:
             sent[key] = {"at": time.time(), "st": "sent"}
             if task:
+                sent[key]["task"] = True
                 rec["task"] = True
             return True
         tries[key] = int(tries.get(key, 0) or 0) + 1
@@ -1332,7 +1349,7 @@ def _onboard_awaken_text(stage):
 def _onboard_send(path, key, socket, text, task=False):
     """선점 → 큐 1건 → 확정. 반환 = "sent" · "unconfirmed"(시간 초과) · "failed"(보내지 못함) · "skip"(이미 선점·발송·포기 —
     이번 호출은 보내지 않았다)."""
-    if not _onboard_claim(path, key):
+    if not _onboard_claim(path, key, task=task):
         return "skip"
     ok = _queue_push(socket, text)
     _onboard_settle(path, key, ok, task=task)
@@ -1341,6 +1358,37 @@ def _onboard_send(path, key, socket, text, task=False):
 
 def _onboard_st(rec, key):
     return ((rec.get("sent") or {}).get(key) or {}).get("st")
+
+
+def _onboard_task_given(rec):
+    """첫 과제를 이미 지시했(거나 지시하는 중이)는가 — 확정 표지(rec.task) 또는 첫 과제 표지를 단 대표 키가 선점·발송·미확정.
+    선점(claimed)도 친다: 다른 호출이 보내는 중이거나, 보냈는데 확정 기록이 빠졌거나, 보내다 끝났다(최대 1회 — 중복보다 안전)."""
+    if rec.get("task"):
+        return True
+    for k, v in (rec.get("sent") or {}).items():
+        if k.startswith("ceo:") and isinstance(v, dict) and v.get("task") \
+                and v.get("st") in ("claimed",) + _ONBOARD_SENT:
+            return True
+    return False
+
+
+def _onboard_inflight(rec, key, now=None):
+    """그 키가 선점(claimed)된 지 ONBOARD_CLAIM_STALE_S 안인가 = 선점한 호출이 아직 보내는 중일 수 있다."""
+    ent = (rec.get("sent") or {}).get(key) or {}
+    if not isinstance(ent, dict) or ent.get("st") != "claimed":
+        return False
+    try:
+        age = (time.time() if now is None else now) - float(ent.get("at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age < ONBOARD_CLAIM_STALE_S
+
+
+def _onboard_master_out(rec, key, now=None):
+    """부서장 각성 지시가 나갔(을 수 있)는가 — 발송·미확정, 또는 발송 창이 지나도 확정이 없는 선점(보내던 호출이 끝났다 —
+    미확정과 같이 친다). 발송 중인 선점은 아니다(선점한 호출이 이어서 대표에게 알린다)."""
+    st = _onboard_st(rec, key)
+    return st in _ONBOARD_SENT or (st == "claimed" and not _onboard_inflight(rec, key, now))
 
 
 def _onboard_left(rec, stage, ext_master):
@@ -1352,10 +1400,10 @@ def _onboard_left(rec, stage, ext_master):
         return False
     if not ext_master and "master:" + stage not in sent:
         return True
-    if rec.get("task") or "ceo:ready" in sent:
+    if _onboard_task_given(rec) or "ceo:ready" in sent:
         return False
     # 남은 것은 [편성 알림](첫 과제) 하나 — 각성 지시가 실제로 나갔을 때만 보낼 수 있다.
-    return ext_master or any(_onboard_st(rec, k) in _ONBOARD_SENT for k in ("master:complete", "master:partial"))
+    return ext_master or any(_onboard_master_out(rec, k) for k in ("master:complete", "master:partial"))
 
 
 def _onboard_notify(socket, state, detail=""):
@@ -1401,10 +1449,21 @@ def _onboard_notify(socket, state, detail=""):
         if stage in ("complete", "partial") and not ext_master and _master_ready(status):
             m_res = _onboard_send(path, mkey, socket, _onboard_awaken_text(stage))
         rec = _onboard_read(path) or rec
+        if stage in ("complete", "partial") and not ext_master and m_res in (None, "skip"):
+            if _onboard_inflight(rec, mkey):
+                # 부서장 각성 지시를 다른 호출이 선점해 보내는 중 — 여기서 대표에게 알리면 '팀장 자리가 비어 있다'(오안내)가
+                # 나간다. 선점한 호출이 확정 뒤 대표 알림을 이어서 보낸다(끝나 버렸으면 창이 지난 뒤 다음 ensure 가 잇는다).
+                sys.stderr.write("[formation] 편성 알림 — 부서장 각성 지시를 다른 호출이 보내는 중 · 대표 알림은 그쪽이 잇는다\n")
+                return None
+            if m_res == "skip" and mkey not in (rec.get("sent") or {}) and not rec.get("done"):
+                # 부서장이 앉아 있는데 선점 기록을 못 남겼다(쓰기 잠금 초과 · Windows 교체 잠금) — 대표에게 '빈 자리'로 알리지
+                # 않고 이번엔 보내지 않는다(지켜보기는 다음 간격에 · 그 밖은 다음 ensure 가 다시 본다 — 키가 비어 있어 보낼 수 있다).
+                sys.stderr.write("[formation] 편성 알림 보류 — 선점 기록 실패 · 다음 점검에서 다시 본다\n")
+                return "wait_master"
         # 이번 호출의 결과를 먼저 믿는다(확정 기록이 교체 실패로 빠져도 대표 안내가 틀리지 않게) · 없으면 기록.
-        m_now = ext_master or m_res in _ONBOARD_SENT or _onboard_st(rec, mkey) in _ONBOARD_SENT
-        m_any = m_now or any(_onboard_st(rec, k) in _ONBOARD_SENT for k in ("master:complete", "master:partial"))
-        task_done = bool(rec.get("task"))
+        m_now = ext_master or m_res in _ONBOARD_SENT or _onboard_master_out(rec, mkey)
+        m_any = m_now or any(_onboard_master_out(rec, k) for k in ("master:complete", "master:partial"))
+        task_done = _onboard_task_given(rec)
         sent = rec.get("sent") or {}
         ckey = "ceo:" + stage
         if ckey not in sent:
