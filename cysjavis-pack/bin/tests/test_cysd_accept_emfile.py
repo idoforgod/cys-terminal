@@ -14,6 +14,7 @@ fd 가 고갈되면(EMFILE) macOS accept 는 대기 연결 1개를 꺼내 **버�
   ① 유휴 연결을 하나씩 붙잡으며 첫 EOF 가 나는 K 를 찾는다(L+64 까지 EOF 없으면 FAIL — 고갈 미도달)
   ② 8 스레드 재접속 폭주 3s(connect→ping→recv 결과 분류)
   ③ 200 동시 connect 버스트
+  ③' 배출 속도 — backlog 미만(100) 동시 connect(각자 ping 1회)가 전부 판정(EOF·응답)나기까지의 시간
   ④ 붙잡은 연결을 모두 닫고 1s 안에 ping OK
   ⑤ 종료 전 생존 확인
   ⑥ stderr 를 ①직전~④직후 오프셋으로 잘라 `^accept (error|recovered):` 줄 수 · 경과 W
@@ -23,16 +24,33 @@ fd 가 고갈되면(EMFILE) macOS accept 는 대기 연결 1개를 꺼내 **버�
   (b) gate 'accept error' ≥1 · 'accept recovered' ≥1 · 총 줄 ≤ 2·(⌊W⌋+1)+⌊W/60⌋
   (c) gate 폭주 중 클라이언트 EOF ≥ 100(오류가 실제로 났다 — 줄 0 을 통과로 읽지 않는다)
   (d) 두 모드 모두 데몬 생존
-  (e) 버스트 거절: gate 0 = PASS · gate>0 ∧ legacy=0 = FAIL(새 거절 경로 = ④ 증폭 회귀) · 둘 다 >0 = SKIP
+  (e) 버스트 거절: gate 가 최대 3회 버스트 중 한 번이라도 0 = PASS · 3회 모두 >0 = FAIL(legacy 무관 · SKIP 없음)
   (f) gate 폭주 중 ECONNREFUSED 0
   (g) 해제 뒤 1s 안에 ping OK
+  (h) gate 배출: ①거절 0 · timeout 0 ②EOF ≥ N/2(고갈 유지 — 미달은 판정 불능 = FAIL) ∧ 소요 < EOF×backoff/2
+
+★(e)·(h) 가 절대 판정인 이유(CS-1 · 리뷰 변이 MUT-A): 종전 (e) 는 legacy 대비 상대 판정이라 두 모드가
+모두 거절하면 SKIP 으로 떨어졌다. legacy 는 오류마다 로그를 써서 배출이 느려 버스트를 자주 거절한다
+(초록 로그 legacy=30) — 그래서 macOS 에서 EMFILE 마다 10ms 재우는 변이체(gate=69~73)가 3회 중 1회 rc=0 으로
+통과했다. 이제 (e) 는 gate 만 본다. 다만 200 동시 버스트는 정상 구현도 데몬이 그 몇 ms 동안 스케줄되지
+못하면 넘친다(03:42 · load1 14.6 에서 수정 트리 gate=49 · legacy=22 실측) — 그래서 최대 3회 중 최솟값으로
+판정한다. 재우는 구현은 배출이 초당 100 이라 버스트마다 넘침 ≈ 200−backlog 를 그대로 거절하고, 버스트
+사이 0.3s 로는 큐도 비지 않으므로 재시도가 변이체를 구해 주지 않는다. (h) 는 부하와 무관한 **구조적
+하한**이다: 소비형 errno 마다 재우는 구현은 EOF 1건마다 backoff(10ms) 이상을 쓰므로 소요 ≥ EOF×10ms 이고,
+판정선은 그 절반이다.
+(f) 는 8 스레드가 각자 응답을 기다려 backlog 를 못 채우므로 이 변이를 원리적으로 못 잡는다(보조 단언).
+실측(2026-09-25 PDT · debug · load1 14~23): 수정 트리(d9d59e85 빌드) 03:44~03:46 3회 모두 rc=0 — gate 버스트
+[0]·[0]·[0](같은 회차 legacy [35, 47, 32] 도 있었다) · 배출 EOF 95~98 에 5.1~20.0ms(판정선 475~490ms).
+MUT-A 변이체 03:46~03:47 2회 모두 rc=1 — (e) gate [69, 117, 121]·[69, 122, 125](재시도할수록 큐가 차 거절이
+는다) · (h) 배출 거절 25·28 · EOF 25·24 · 540·522ms.
 
 수정 전 바이너리는 (b) 가 실패해야 한다(줄 ≈ 오류 수 ≫ 상한, 회복 줄 없음) — CYS_TEST_CYSD 로 지정.
 
 ## 미측정 범위(정직)
 sys.platform != 'darwin' 이면 SKIP — Linux 는 EMFILE 에도 연결이 큐에 남는 다른 커널 경로이고
 cysd 비배포다. listener_fatal errno 의 핫스핀 제거는 어떤 테스트로도 실연하지 않는다(단위 핀만).
-부팅 불가·환경 분리 불가는 SKIP(통과 아님), 거절 회귀만 FAIL.
+부팅 불가는 SKIP(통과 아님). 버스트 거절·배출 지연·배출 판정 불능은 FAIL(종전의 '환경 분리 불가 SKIP' 은
+CS-1 에서 폐지 — 그 SKIP 이 변이체를 초록으로 흘렸다).
 
 ## 격리
 HOME·CYS_SOCKET·CYS_STATE_DIR·CYS_PACK_DIR·CYS_CONFIG_DIR·CYS_PACK_CAPTURES_DIR 스크래치,
@@ -62,6 +80,9 @@ REPO = os.path.dirname(PACK)
 fails = []
 skips = []
 LINE_RE = re.compile(r"^accept (error|recovered):", re.M)
+N_DRAIN = 100                 # backlog(somaxconn 128) 미만 — 큐 넘침 거절 없이 배출 속도만 잰다
+BURST_TRIES = 3               # (e) 버스트 재시도 상한 — 정상 구현의 부하 순간 거절(실측 gate=49)을 흡수
+BACKOFF_MS = 10.0             # main.rs UNIX_ACCEPT_ERROR_BACKOFF — 재우는 구현의 EOF 1건당 하한
 
 
 def check(name, cond, detail=""):
@@ -288,33 +309,82 @@ def run_mode(cysd, gate_off):
         for t in ts:
             t.join(timeout=10)
         res["flood"] = dict(counts)
-        # ③ 200 동시 connect 버스트.
-        burst = {"refused": 0, "connected": 0, "other": 0}
-        barrier = threading.Barrier(200)
+        # ③ 200 동시 connect 버스트 — 최대 BURST_TRIES 회, 거절 0 이 나오면 멈춘다(판정은 최솟값).
+        tries = []
+        for _try in range(BURST_TRIES):
+            if tries:
+                time.sleep(0.3)                          # 직전 버스트 잔여 연결이 판정나도록
+            burst = {"refused": 0, "connected": 0, "other": 0}
+            barrier = threading.Barrier(200)
 
-        def burst_one():
+            def burst_one():
+                s = socket.socket(socket.AF_UNIX)
+                s.settimeout(2.0)
+                try:
+                    barrier.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    pass
+                try:
+                    s.connect(sb.sock)
+                    k2 = "connected"
+                except OSError as e:
+                    k2 = "refused" if e.errno == errno.ECONNREFUSED else "other"
+                finally:
+                    s.close()
+                with lock:
+                    burst[k2] += 1
+
+            bts = [threading.Thread(target=burst_one) for _ in range(200)]
+            for t in bts:
+                t.start()
+            for t in bts:
+                t.join(timeout=10)
+            tries.append(burst["refused"])
+            if burst["refused"] == 0:
+                break
+        res["burst"] = dict(burst)
+        res["burst_tries"] = tries
+        # ③' 배출 속도 — 앞 단계 잔여 연결이 판정나도록 잠시 둔 뒤, backlog 미만 동시 connect.
+        time.sleep(0.3)
+        drain = {}
+        done_at = []
+        barrier2 = threading.Barrier(N_DRAIN + 1)
+
+        def drain_one():
             s = socket.socket(socket.AF_UNIX)
-            s.settimeout(2.0)
+            s.settimeout(5.0)
             try:
-                barrier.wait(timeout=5)
+                barrier2.wait(timeout=5)
             except threading.BrokenBarrierError:
                 pass
             try:
                 s.connect(sb.sock)
-                k2 = "connected"
+                try:
+                    s.sendall(_req("system.ping"))
+                except OSError:
+                    pass                                 # 이미 버려진 연결 — 아래 recv 가 eof 로 판정
+                r = _recv_line(s, time.time() + 5.0)
             except OSError as e:
-                k2 = "refused" if e.errno == errno.ECONNREFUSED else "other"
+                r = "refused" if e.errno == errno.ECONNREFUSED else "other"
             finally:
                 s.close()
+            t = time.time()
             with lock:
-                burst[k2] += 1
+                drain[r] = drain.get(r, 0) + 1
+                done_at.append(t)
 
-        bts = [threading.Thread(target=burst_one) for _ in range(200)]
-        for t in bts:
+        dts = [threading.Thread(target=drain_one) for _ in range(N_DRAIN)]
+        for t in dts:
             t.start()
-        for t in bts:
-            t.join(timeout=10)
-        res["burst"] = dict(burst)
+        try:
+            barrier2.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+        d0 = time.time()
+        for t in dts:
+            t.join(timeout=15)
+        res["drain"] = dict(drain)
+        res["drain_ms"] = round((max(done_at) - d0) * 1000.0, 1) if done_at else None
         # ④ 해제 → 1s 안에 ping OK.
         for s in held:
             s.close()
@@ -387,15 +457,20 @@ def main():
           "error=%d recovered=%d total=%d" % (gate["lines_error"], gate["lines_recovered"], gate["lines"]))
     check("(c) gate 폭주 중 클라이언트 EOF ≥ 100", gate["flood"]["eof"] >= 100, repr(gate["flood"]))
     check("(d) 두 모드 데몬 생존", legacy["alive"] and gate["alive"])
-    gr, lr = gate["burst"]["refused"], legacy["burst"]["refused"]
-    if gr == 0:
-        check("(e) 버스트 거절 gate=0", True, "legacy=%d" % lr)
-    elif lr == 0:
-        check("(e) 버스트 거절 — gate 만 거절(새 거절 경로 = ④ 증폭 회귀)", False, "gate=%d legacy=0" % gr)
-    else:
-        skip("(e) 버스트 거절", "두 모드 모두 거절(gate=%d legacy=%d) — 환경 분리 불가" % (gr, lr))
+    gt, lt = gate["burst_tries"], legacy["burst_tries"]
+    check("(e) 버스트 거절 — gate %d회 안에 0(절대 판정 · legacy 는 참고)" % BURST_TRIES,
+          min(gt) == 0, "gate=%r legacy=%r" % (gt, lt))
     check("(f) gate 폭주 중 ECONNREFUSED 0", gate["flood"].get("refused", 0) == 0, repr(gate["flood"]))
     check("(g) 해제 뒤 1s 안 ping OK", gate["release_ping_ok"] and legacy["release_ping_ok"])
+    gd, gms = gate["drain"], gate["drain_ms"]
+    g_eof = gd.get("eof", 0)
+    print("배출 관측: gate %r %sms · legacy %r %sms" % (gd, gms, legacy["drain"], legacy["drain_ms"]))
+    check("(h-1) gate 배출 중 거절 0 · timeout 0(backlog 미만 동시 connect)",
+          gd.get("refused", 0) == 0 and gd.get("timeout", 0) == 0, repr(gd))
+    line = g_eof * BACKOFF_MS / 2.0
+    check("(h-2) gate 배출 EOF ≥ %d(판정 가능) · 소요 %sms < EOF %d × %.0fms / 2 = %.0fms(재우는 구현의 하한 %.0fms)"
+          % (N_DRAIN // 2, gms, g_eof, BACKOFF_MS, line, g_eof * BACKOFF_MS),
+          g_eof >= N_DRAIN // 2 and gms is not None and gms < line, repr(gd))
     hits = legacy["trip_hits"] + gate["trip_hits"]
     print("트립와이어 적중 %d%s" % (len(hits), (" — " + repr(hits[:3])) if hits else ""))
     if fails:

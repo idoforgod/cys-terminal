@@ -1501,6 +1501,20 @@ fn accept_error_retry_delay(raw: Option<i32>, self_limiting_os: bool) -> std::ti
     }
 }
 
+/// accept 루프 Err arm 의 재시도 지연 — **실상수 배선의 단일 지점**(★CS-1 · 리뷰 변이 MUT-A).
+/// 게이트 켬 = `accept_error_retry_delay(raw, ACCEPT_ERROR_SELF_LIMITING_OS)`, 끔(롤백 노브) = 즉시 재시도.
+/// 종전에는 이 결정이 루프 본문에 인라인이라 인자를 상수 `false` 로 바꾼 변이(macOS 에서 EMFILE 마다
+/// 10ms sleep → backlog 배출이 초당 100 으로 묶여 ECONNREFUSED·자동 기동 연쇄 = ④ 경로)가 단위 검체
+/// 12건을 모두 통과했다. 이제 T13 이 실상수로 이 함수를 재고 T12 가 루프의 호출 문자열을 핀한다.
+#[cfg(unix)]
+fn accept_err_arm_delay(gate_on: bool, raw: Option<i32>) -> std::time::Duration {
+    if gate_on {
+        accept_error_retry_delay(raw, ACCEPT_ERROR_SELF_LIMITING_OS)
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
 /// 표본 로그 게이트(순수 · 시각 주입). 산술 패닉 없음 — u64 는 saturating, 시간은
 /// saturating_duration_since(시계 역행 허용), Instant+Duration 연산을 쓰지 않는다.
 /// 줄 수 상한(임의 구간 W): 2·(⌊W/1s⌋+1) + ⌊W/60s⌋.
@@ -1654,11 +1668,7 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
             }
             Err(e) => {
                 // 로그 쓰기 실패는 무시한다(`eprintln!` 은 실패 시 패닉 → 이 루프는 main 태스크 → 데몬 사망).
-                let delay = if gate_on {
-                    accept_error_retry_delay(e.raw_os_error(), ACCEPT_ERROR_SELF_LIMITING_OS)
-                } else {
-                    std::time::Duration::ZERO
-                };
+                let delay = accept_err_arm_delay(gate_on, e.raw_os_error());
                 if !gate_on {
                     let _ = writeln!(std::io::stderr(), "accept error: {e}");
                 } else if let Some(AcceptLogLine::Error { streak, suppressed }) =
@@ -4022,6 +4032,36 @@ mod unix_accept_error_gate_tests {
         }
     }
 
+    /// T13 — ★CS-1: Err arm 지연을 **실상수**(`ACCEPT_ERROR_SELF_LIMITING_OS`)로 잰다. 순수 함수 검체(T2~T4)는
+    /// 인자를 주입하므로 호출부 배선이 상수 `false` 로 바뀌어도 초록이었다(리뷰 변이 MUT-A · 12/12 통과).
+    /// macOS: 게이트 켬 + 소비형·미분류 errno = 즉시 재시도(0) · listener_fatal = 백오프. 비macOS: 게이트 켬 =
+    /// 모든 errno 백오프. 롤백 노브(게이트 끔) = 어느 OS 든 즉시 재시도(종전 정책).
+    #[test]
+    fn err_arm_delay_uses_real_os_constant() {
+        let consuming = [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::EINTR,
+            9999,
+        ];
+        for e in consuming {
+            let want = if cfg!(target_os = "macos") { Duration::ZERO } else { UNIX_ACCEPT_ERROR_BACKOFF };
+            assert_eq!(
+                accept_err_arm_delay(true, Some(e)),
+                want,
+                "errno {e}: macOS 에서 재우면 backlog 배출이 1/backoff 로 묶여 ECONNREFUSED → 자동 기동 → \
+                 sibling → 데드맨 회수(④) 경로가 열린다"
+            );
+            assert_eq!(accept_err_arm_delay(false, Some(e)), Duration::ZERO, "errno {e}: 노브 끔 = 종전 즉시 재시도");
+        }
+        for raw in [Some(libc::EBADF), Some(libc::ENOTSOCK), Some(libc::EINVAL), Some(libc::EOPNOTSUPP), None] {
+            assert_eq!(accept_err_arm_delay(true, raw), UNIX_ACCEPT_ERROR_BACKOFF, "raw={raw:?}: listener_fatal 은 백오프");
+        }
+    }
+
     /// T12 — unix accept 루프 본문 소스핀: 루프 안에 exit·panic·eprintln·unwrap·expect 가 없고
     /// 분류 지연·sleep·게이트 on_error/on_success 가 있다. 노브 판독은 루프 **앞**(1회).
     #[test]
@@ -4048,13 +4088,28 @@ mod unix_accept_error_gate_tests {
             assert!(!body.contains(banned), "accept 루프 안에 `{banned}` — main 태스크 패닉·종료 = 전 pane 사망");
         }
         for needed in [
-            concat!("accept_error_retry_", "delay("),
+            concat!("accept_err_arm_", "delay("),
             concat!("tokio::time::", "sleep("),
             concat!("on_", "error("),
             concat!("on_", "success("),
         ] {
             assert!(body.contains(needed), "accept 루프에 `{needed}` 가 없다");
         }
+        // ★CS-1(리뷰 변이 MUT-A): Err arm 의 지연 결정은 **실상수를 쓰는 헬퍼 한 곳**을 거친다.
+        //   종전 핀은 부분 문자열 `accept_error_retry_delay(` 의 존재만 봐서, 호출부 인자를 상수
+        //   `false` 로 바꾼 변이(macOS 에서 EMFILE 마다 10ms sleep = 금지된 거동)가 초록이었다.
+        let call = concat!("accept_err_arm_delay(", "gate_on, e.raw_os_error())");
+        assert!(body.contains(call), "accept 루프 Err arm 이 `{call}` 를 거치지 않는다");
+        assert!(
+            !body.contains(concat!("accept_error_retry_", "delay(")),
+            "accept 루프가 분류 함수를 직접 부른다 — 인자(자기 제한 OS 여부)가 핀 밖으로 샌다"
+        );
+        let helper_sig = concat!("fn accept_err_arm_", "delay(gate_on: bool, raw: Option<i32>)");
+        let h_at = src.find(helper_sig).expect("Err arm 지연 헬퍼 시그니처");
+        let h_end = src[h_at..].find("\n}").expect("헬퍼 끝") + h_at;
+        let helper = &src[h_at..h_end];
+        let wired = concat!("accept_error_retry_delay(raw, ", "ACCEPT_ERROR_SELF_LIMITING_OS)");
+        assert!(helper.contains(wired), "헬퍼가 실상수 `ACCEPT_ERROR_SELF_LIMITING_OS` 로 분류하지 않는다");
     }
 }
 
