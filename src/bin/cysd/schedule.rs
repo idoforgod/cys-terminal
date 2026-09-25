@@ -1810,6 +1810,9 @@ fn deliver_push(
         //     깨져도 하트비트·wakeup·자기 예약 wake 의 생명선이 끊기지 않는다(③). 시간 면제(ceiling)는 없다(§8-3).
         //   · busy(작업 중)는 막지 않는다(잔여) — §8 안에서 막는 유일한 방법이 큐 보류이고 그것이 ③ 을 만든다.
         //   · 셸 단독 축은 넣지 않는다(대상 선택의 `seat_is_agent_backed` 가 이미 본다).
+        //   · ★(리뷰 F1 · ③) 기계 소유로 입증된 초안(검증 발신자의 Return 누락 잔여 · 데몬 자신의 붙여넣기)은 초안 축이
+        //     아니다(H0 `draft_machine_owned`) — 종전(pre-H)처럼 직접 주입해 잔여를 병합 제출한다. 큐는 입력줄 점유를
+        //     스스로 비우지 않아, 우회하면 푸는 주체 없이 heartbeat·wakeup 이 무기한 침묵한다.
         //   · fresh 잡은 pause 재확인과 기존 모달만 본다(새 축 없음 · 회수 타이머 의미 무변경).
         //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
         if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
@@ -4833,6 +4836,34 @@ mod h2_schedule_hold_tests {
         s.pending_input_bytes.store(5, Ordering::Relaxed);
         h_paint(&s, "● 렌더 잔상");
         expect_direct("pending=5 ∧ line None");
+        done(&s);
+    }
+
+    /// ★(리뷰 F1 · ③) 워커가 `cys send` 뒤 Return 을 잊어 master 입력줄에 **기계 잔여**(검증 발신자 본문 · owner 세대
+    /// 일치)가 남았다 — 스케줄 직접 push 는 큐로 우회하지 않고 종전처럼 직접 주입한다. 큐는 입력줄 점유를 스스로 풀지
+    /// 않아 우회 항목이 TTL 까지 서고 다음 회차도 같은 길을 간다(heartbeat·wakeup 무기한 침묵). 병합 제출이 유일한
+    /// 자가치유 경로다(pre-H 동작). 음성 대조: 같은 화면이 사람 초안이면 종전대로 우회. RED(HEAD): queued(gate:draft).
+    #[test]
+    fn h2_machine_residue_stays_direct() {
+        let (d, s) = rig("h2-residue");
+        s.apply_pending_input(b"WORKER-REPORT residue text", crate::governance::InputOrigin::Machine);
+        s.mark_pending_owner(9);
+        h_paint(&s, "● 작업 로그 한 줄\n────────────────────\n❯ WORKER-REPORT residue text");
+        let j = periodic("heartbeat-5m", 5);
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+            Ok("pushed"),
+            "기계 잔여 위에서 큐로 우회했다 — 푸는 주체 없는 보류(③ 자가치유 전멸)"
+        );
+        assert_eq!(h_ledger_count(&d, "schedule"), 1, "직접 주입 원장");
+        assert!(queue(&s).is_empty(), "우회 항목이 남았다");
+        // 앞 주입의 붙여넣기 창(본문 → 500ms → CR)과 렌더 settle 이 지나도록 기다린다.
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        s.clear_pending_input();
+        s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), crate::governance::InputOrigin::Human);
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None), Ok("queued(gate:draft)"), "사람 초안은 종전대로 우회");
+        assert_eq!(h_ledger_count(&d, "schedule"), 1);
         done(&s);
     }
 

@@ -1027,6 +1027,48 @@ pub struct ReturnTicket {
     pub issued: Instant,
 }
 
+/// ★(0.14.42 · 설계 H 리뷰 F2·F3) writer 의 **Inject arm 진행 표식** — 이 좌석 화면 composer 의 글자가 데몬 자신의
+/// 붙여넣기일 수 있는 창(붙여넣기~CR 을 쓰는 중 ∨ 끝난 지 얼마 안 됨)을 판정자가 읽는다.
+///
+/// 【왜】 Inject 는 본문을 쓴 뒤 `cr_delay_ms`(400~500ms)가 지나야 CR 을 쓴다. 그 사이 다른 생산자가 H0 초안 축을
+/// 보면 **우리 자신의 붙여넣기**를 초안으로 오인한다 — CEO 자동결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게
+/// escalation 되던 결함(리뷰 F2 · 0.05~0.4s 간격 12/12). writer 는 단일 소비자라 뒤 Inject 가 앞 Inject 의 글자와
+/// 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 그래서 이 창의 화면 초안은 보류 근거가 아니다.
+///
+/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end). 읽기 = H0 판정·채널 배달 간격.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at` 은 leaf.
+#[derive(Debug, Default)]
+pub struct InjectTrack {
+    /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
+    active: AtomicBool,
+    /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
+    done_at: Mutex<Option<Instant>>,
+}
+
+impl InjectTrack {
+    /// writer 전용 — Inject arm 의 첫 바이트 앞.
+    pub(crate) fn begin(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// writer 전용 — Inject arm 의 마지막 바이트(CR) 뒤. `done_at` 을 먼저 찍고 `active` 를 내린다
+    /// (`active == false` 를 본 판정자는 새 `done_at` 을 본다).
+    pub(crate) fn end(&self) {
+        *self.done_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
+    pub(crate) fn busy_within(&self, within: std::time::Duration) -> bool {
+        self.active.load(Ordering::Acquire)
+            || self
+                .done_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|t| t.elapsed() < within)
+    }
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -1322,6 +1364,8 @@ pub struct Surface {
     pub pending_input_stale: Mutex<Option<(u64, u64, Instant)>>,
     /// T4-17 에코 제외: 마지막 원격 주입 시각 (주입 직후 에코 라인은 룰 매칭 제외)
     pub last_injected: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · 설계 H 리뷰 F2·F3) writer 의 Inject arm 진행 표식 — [`InjectTrack`] doc. writer 스레드와 공유한다.
+    pub inject_track: Arc<InjectTrack>,
     /// ★좌석 점유 캐시(SEAT-1): watchdog 틱이 커널 사실(자손 프로세스 유무)로 갱신하는 단일 SOT.
     /// 0=Unknown(미판정·프로브 실패) 1=Occupied(자손 존재=쓰이는 중) 2=Empty(셸 단독=빈 좌석).
     /// **왜 캐시인가**: 판정 재료(전 프로세스 표)는 watchdog이 이미 매 틱 refresh 한다 — RPC 경로가
@@ -4822,10 +4866,12 @@ impl Daemon {
         // 좀비 writer 스레드와 그 fd를 즉시 회수한다.
         let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReq>(128);
         let writer_stop = Arc::new(AtomicBool::new(false));
+        let inject_track = Arc::new(InjectTrack::default());
         {
             let writer = writer;
             let stop = Arc::clone(&writer_stop);
-            std::thread::spawn(move || run_writer_loop(writer, write_rx, stop));
+            let track = Arc::clone(&inject_track);
+            std::thread::spawn(move || run_writer_loop_tracked(writer, write_rx, stop, Some(track)));
         }
 
         let surface = Arc::new(Surface {
@@ -4926,6 +4972,7 @@ impl Daemon {
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
+            inject_track,
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
             agent_session_id: Mutex::new(None),
@@ -5645,9 +5692,21 @@ fn inject_write<W: Write>(
 /// 쓴 마지막 시각. 최소 간격의 기준점은 반드시 이 값이어야 한다(핸들러의 enqueue 시각이
 /// 기준이면 writer 적체 구간에서 간격이 0 으로 붕괴한다 — codex 감사 R1).
 pub(crate) fn run_writer_loop<W: Write>(
+    writer: W,
+    write_rx: std::sync::mpsc::Receiver<WriteReq>,
+    stop: Arc<AtomicBool>,
+) {
+    run_writer_loop_tracked(writer, write_rx, stop, None)
+}
+
+/// [`run_writer_loop`] 에 Inject arm 진행 표식([`InjectTrack`])을 붙인 판 — 프로덕션 좌석이 쓴다. 표식은 arm 의
+/// 첫 바이트 앞에서 세우고 마지막 바이트(CR) 뒤에 내린다(인계 가드가 포기한 요청은 세우지 않는다 = 한 바이트도 안 씀).
+/// 바이트·순서·지연은 [`run_writer_loop`] 와 같다(표식은 원자·leaf 락 쓰기뿐).
+pub(crate) fn run_writer_loop_tracked<W: Write>(
     mut writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
     stop: Arc<AtomicBool>,
+    track: Option<Arc<InjectTrack>>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     let mut last_program_write: Option<std::time::Instant> = None;
@@ -5711,7 +5770,15 @@ pub(crate) fn run_writer_loop<W: Write>(
                 if guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
                     continue;
                 }
-                inject_write(&mut writer, &text, cr_delay_ms, clear_first)
+                // ★(0.14.42 · 설계 H 리뷰 F2·F3) 붙여넣기~CR 창을 판정자에게 알린다(InjectTrack doc).
+                if let Some(t) = &track {
+                    t.begin();
+                }
+                let r = inject_write(&mut writer, &text, cr_delay_ms, clear_first);
+                if let Some(t) = &track {
+                    t.end();
+                }
+                r
             }
             // ★B2″(agy 감사 R2-①): Inject 는 기준점을 **찍지 않는다**. 이 arm 은 자체
             // cr_delay_ms(기본 400)를 두고 본문→CR 까지 원자로 보내므로, 뒤따라 오는 제출

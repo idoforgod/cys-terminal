@@ -5101,7 +5101,8 @@ pub(crate) enum MachineHold {
     HumanActive,
     /// 질문·선택 창이 화면 전경이다(U8 P1 · 큐 게이트 ②와 같은 술어).
     Modal,
-    /// 커서행 마커 뒤에 미제출 글자가 **화면에서** 보인다(D-12 Text 화면 축과 같은 식).
+    /// 커서행 마커 뒤에 미제출 글자가 **화면에서** 보인다(D-12 Text 화면 축과 같은 식). 기계 소유로 입증된 초안
+    /// (데몬 자신의 붙여넣기 · 검증 발신자의 Return 누락 잔여 — [`draft_machine_owned`])은 제외한다(리뷰 F1·F2).
     Draft,
     /// 관측 중 패닉 — 판정 불능(생산자별 실패 방향으로 처리).
     ProbeFailed,
@@ -5416,10 +5417,86 @@ fn machine_hold_probe(
         if let Some((markers, _)) = surface_prompt_marker(s, &adapters) {
             let obs = observe_prompt(s, &markers);
             input.modal = obs_modal_foreground(&obs);
-            input.draft = obs_draft_observed(&obs);
+            // ★(리뷰 F1·F2) 화면 초안이 기계 소유로 **입증**되면 초안 축의 보류 근거가 아니다([`draft_machine_owned`]).
+            //   모달이 먼저 적중하면 초안 축은 판정에 쓰이지 않는다(순서 고정) — 귀속·가시화도 하지 않는다.
+            input.draft = axes.draft
+                && !(axes.modal && input.modal)
+                && obs_draft_observed(&obs)
+                && match draft_machine_owned(s) {
+                    None => true,
+                    Some(MachineDraft::OwnPaste) => false,
+                    Some(MachineDraft::MachineResidue { owner }) => {
+                        note_machine_residue(daemon, s, owner);
+                        false
+                    }
+                };
         }
     }
     machine_hold_verdict(&input, axes)
+}
+
+/// ★(0.14.42 · 설계 H 리뷰 F2) 데몬 자신의 Inject 가 끝난(CR 기록) 뒤 composer 가 비워지기까지의 렌더 여유(ms).
+/// 이 안의 화면 초안은 우리 붙여넣기의 잔상이다.
+pub(crate) const OWN_PASTE_SETTLE_MS: u64 = 500;
+
+/// 화면 초안의 기계 소유 증거 — [`draft_machine_owned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachineDraft {
+    /// writer 가 이 좌석에 데몬 Inject(붙여넣기 → cr_delay → CR)를 쓰는 중이거나 끝난 지 [`OWN_PASTE_SETTLE_MS`] 안이다.
+    OwnPaste,
+    /// 입력줄 본문이 검증 발신자(`owner` 좌석)의 직접 send 본문 **그대로**다 — owner 각인 세대 일치 ∧ 사람 바이트 0.
+    MachineResidue { owner: u64 },
+}
+
+/// ★(0.14.42 · 설계 H 리뷰 F1·F2) 화면 초안이 **기계 소유로 입증되는가**. 입증되면 H0 초안 축의 보류 근거가 아니다.
+///
+/// 【왜】 설계 H 는 "초안 = 사람이 푼다"를 전제했다(③ 분석). 기계가 남긴 초안에는 푸는 주체가 없다.
+///   · 기계 잔여(F1): 워커가 `cys send` 뒤 Return 을 잊음·두 도구 호출 사이 턴 종료·Return 이 타이핑 가드에 막혀
+///     `--queued` 로 잔여 뒤에 적재됨. 큐는 입력줄 점유를 스스로 비우지 않고(`input_pending` 무기한), 스케줄 우회
+///     항목은 TTL 까지 선다 — heartbeat·wakeup 무기한 침묵(③). pre-H 는 스케줄 직접 push 가 잔여를 병합 제출해 다음
+///     주기에 스스로 풀렸다. 그 동작으로 되돌린다(사람 손이 닿은 줄은 제외).
+///   · 자기 붙여넣기(F2): Inject 는 본문을 쓰고 cr_delay 뒤 CR 을 쓴다. 그 창에 다른 생산자가 초안 축을 보면 우리 글자를
+///     초안으로 오인한다(CEO 둘째 결재 escalation). writer 는 단일 소비자라 뒤 Inject 는 앞 CR 뒤에 쓰인다.
+///
+/// 【입증의 정의 — 좁게】 계수 0 인 화면 초안(출처 불명 · S41 가짜 에이전트 초안 · 재기동 휘발)·사람 바이트가 섞인 줄·
+/// owner 결측 기계 바이트(GUI machine_origin 경로 삽입 · 교차 소켓 자기신고 발신자)는 입증이 아니다 → 종전 Draft.
+/// 사람이 자기 뒤에 치면 입력 세대가 올라 owner 가 결측이 된다(Surface::pending_owner). 사람 입력 창·타이핑 가드는
+/// 생산자 축으로 따로 본다.
+///
+/// 락: `pending_input` leaf 두 번(owner·human) — 원자 스냅숏이 아니다. 그 사이 사람 키가 오면 다음 판정이 본다.
+pub(crate) fn draft_machine_owned(s: &crate::state::Surface) -> Option<MachineDraft> {
+    if s
+        .inject_track
+        .busy_within(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS))
+    {
+        return Some(MachineDraft::OwnPaste);
+    }
+    let owner = s.pending_owner()?;
+    let human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    (human == 0).then_some(MachineDraft::MachineResidue { owner })
+}
+
+/// 기계 잔여를 초안 축에서 뺀 사실의 가시화 — `machine_inject.machine_residue` 를 (좌석, 입력 세대)마다 1건.
+/// 생산자는 이어서 종전(pre-H)처럼 잔여 뒤에 주입하므로 잔여가 **병합 제출**된다. 판정 불능이어도 주입은 막지 않는다.
+fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: u64) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(std::path::PathBuf, u64), u64>>> =
+        std::sync::OnceLock::new();
+    let gen = s.input_gen.load(Ordering::Acquire);
+    {
+        let mut m = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if m.insert((daemon.socket_path.clone(), s.id), gen) == Some(gen) {
+            return;
+        }
+    }
+    let pending = s.pending_input_bytes.load(Ordering::Relaxed);
+    daemon.bus.publish(
+        "machine_inject.machine_residue",
+        "system",
+        Some(s.id),
+        json!({"surface_id": s.id, "owner": owner, "pending_bytes": pending,
+               "note": "입력줄에 검증 발신자의 미제출 기계 본문(Return 누락 잔여)이 있다 — 초안 보류 근거가 아니다. \
+                        데몬 주입이 종전처럼 그 뒤에 이어 붙어 함께 제출된다(푸는 주체 없는 무기한 보류 차단)"}),
+    );
 }
 
 /// ★(0.14.42 · A2-F1 · 리뷰 RF1-GATE-NARROW) 짝 Return 흡수 **좁힘 전용** 술어 — 좌석에 승인·선택이 살아
@@ -21491,6 +21568,90 @@ mod h_machine_hold_tests {
         s.agent_meta.clear_poison();
         let _ = s.child.lock().unwrap().kill();
         let _ = t.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 F1 · ③) 화면 초안이 **검증 발신자의 직접 send 본문 그대로**(owner 세대 일치 ∧ 사람 바이트 0)이면 기계
+    /// 잔여다 — 초안 축의 보류 근거가 아니다. 워커가 `cys send` 뒤 Return 을 잊거나 두 도구 호출 사이에 턴이 끝나면
+    /// 이 잔여를 푸는 주체가 없다(큐는 입력줄 점유를 스스로 비우지 않는다 · 사람은 없을 수 있다). 사람 초안·출처 불명
+    /// 초안(계수 0 · 화면만 = S41 가짜 에이전트 초안)·잔여 뒤 사람 키·owner 없는 기계 바이트는 종전대로 Draft.
+    /// RED(HEAD): ① 이 Draft.
+    #[test]
+    fn h0_machine_residue_is_not_a_draft() {
+        let d = h_daemon("h0-residue");
+        let s = claude_seat(&d);
+        let residue = "● 작업 로그 한 줄\n────────────────────\n❯ WORKER-REPORT residue text";
+        // ① 기계 잔여 — 워커(좌석 7)의 직접 send 본문이 각인 세대 그대로 남았다.
+        s.apply_pending_input(b"WORKER-REPORT residue text", InputOrigin::Machine);
+        s.mark_pending_owner(7);
+        assert_eq!(s.pending_owner(), Some(7), "전제: owner 각인");
+        h_paint(&s, residue);
+        assert_eq!(
+            machine_direct_hold(&d, &s, all_axes(30)),
+            None,
+            "기계 잔여를 초안으로 봤다 — 푸는 주체가 없어 스케줄·채널이 영구 보류된다(③)"
+        );
+        // 가시화 — (좌석, 입력 세대)마다 1건(같은 잔여를 다시 판정해도 늘지 않는다).
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), None);
+        let residue_ev: Vec<Value> =
+            d.bus.tail(200).into_iter().filter(|ev| ev["name"] == "machine_inject.machine_residue").collect();
+        assert_eq!(residue_ev.len(), 1, "machine_residue 이벤트는 세대당 1건");
+        assert_eq!(residue_ev[0]["payload"]["owner"], json!(7));
+        // 모달 축은 잔여와 무관하게 본다.
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Modal));
+        // ② 잔여 뒤 사람 키 1바이트 — 세대가 올라 owner 가 결측이 된다 → 사람 손이 닿은 줄 = Draft.
+        s.apply_pending_input(b"x", InputOrigin::Human);
+        h_paint(&s, residue);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "사람 키가 섞인 줄을 기계 잔여로 봤다");
+        // ③ 사람 초안(계수 human>0).
+        s.clear_pending_input();
+        s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), InputOrigin::Human);
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft));
+        // ④ 출처 불명(계수 0 · 화면만 — S41 가짜 에이전트 초안 · 재기동 휘발) → 종전 Draft.
+        s.clear_pending_input();
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft));
+        // ⑤ 기계 바이트지만 owner 결측(GUI machine_origin 경로 삽입 · 교차 소켓 자기신고 발신자) → 입증 없음 = Draft.
+        s.clear_pending_input();
+        s.apply_pending_input(b"WORKER-REPORT residue text", InputOrigin::Machine);
+        assert_eq!(s.pending_owner(), None);
+        h_paint(&s, residue);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "결측 owner 를 기계 잔여로 봤다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 F2) writer 가 **데몬 자신의 Inject**(붙여넣기 → cr_delay → CR)를 쓰는 중이면 composer 의 글자는 우리
+    /// 붙여넣기다 — 초안 축의 보류 근거가 아니다(뒤 Inject 는 writer 직렬이라 앞 CR 뒤에 쓰인다). arm 이 끝나고 settle 이
+    /// 지나면 같은 화면 초안은 다시 Draft 다. 모달 축은 in-flight 여도 본다. RED(HEAD): in-flight 중 Draft.
+    #[test]
+    fn h0_own_inject_in_flight_is_not_a_draft() {
+        let d = h_daemon("h0-own-inject");
+        let s = claude_seat(&d);
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "전제: 초안 화면");
+        s.write_tx
+            .send(crate::state::WriteReq::Inject {
+                text: "앞 결재 붙여넣기".into(),
+                cr_delay_ms: 900,
+                clear_first: false,
+                guard: None,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(
+            machine_direct_hold(&d, &s, all_axes(30)),
+            None,
+            "우리 자신의 붙여넣기(쓰는 중)를 초안으로 봤다 — CEO 둘째 결재 escalation(F2)"
+        );
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Modal), "모달은 in-flight 여도 본다");
+        // arm(900ms) + settle 이 지난 뒤 — 같은 화면 초안은 종전대로 Draft.
+        std::thread::sleep(std::time::Duration::from_millis(900 + 500 + 600));
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "settle 뒤에도 초안을 놓쳤다");
+        let _ = s.child.lock().unwrap().kill();
     }
 
     /// [H0 마이크로벤치 · 수동] 주입 직전 판정 1회의 비용(디버그 빌드) — 화면 관측 경로(유휴 claude 좌석 · 전 축)와

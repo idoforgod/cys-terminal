@@ -3270,6 +3270,8 @@ fn deliver_to_ceo(
     //   typing 가드(3s)가 종전대로 본다. busy 는 막지 않는다(요청자 대기 120s — 턴 경계까지 미루면 만료가 곧
     //   escalation). 보류는 전부 **즉시 사람에게**(approval.stalled{reason} → UI openFeed · 사유로 분기하지 않는다).
     //   판정 패닉(ProbeFailed)도 escalation 이다(실패 방향 = 사람). 노브에서 ceo 를 빼면 종전 동작.
+    //   ★(리뷰 F2) 초안 축은 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤 settle 안)와 검증 발신자 잔여를 초안으로
+    //   보지 않는다(H0 `draft_machine_owned`) — 0.5s 안 연속 결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게 가던 결함.
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Ceo) {
         use crate::governance::{MachineHold as H, MachineHoldAxes};
         let axes = MachineHoldAxes { pause: true, quiescing: true, modal: true, draft: true, ..MachineHoldAxes::NONE };
@@ -20957,6 +20959,41 @@ mod tests {
         assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
         assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 1);
         assert_eq!(h4_events(&d, "feed.auto_routed").len(), 1);
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 F2) 0.1s 간격 AutoEligible 결재 2건 — 둘째 건이 **첫 건의 붙여넣기**(본문 → 500ms → CR)를 초안으로
+    /// 오인해 사람에게 escalation 되면 안 된다(멱등 키가 판정 전에 기록돼 30s 재발행도 억제 = 되돌릴 수 없다).
+    /// writer 는 단일 소비자라 둘째 붙여넣기는 첫 CR 뒤에 쓰인다(섞이지 않는다). 화면은 composer 에 첫 건 글자가
+    /// 보이는 상태를 그린다. 음성 대조: 붙여넣기 창·settle 이 지난 뒤 같은 화면 초안은 종전대로 escalation.
+    /// RED(HEAD): 둘째 건 approval.stalled{ceo_seat_draft}.
+    #[test]
+    fn h4_burst_second_approval_not_held_by_own_paste() {
+        let (d, ceo) = h4_rig("h4-burst", "sleep 30");
+        let own_paste = "● 작업 로그 한 줄\n────────────────────\n❯ [cys 결재 요청] RSI 학습 추천 burstA";
+        let stalled_for = |d: &Arc<Daemon>, rid: &str| -> Vec<Value> {
+            h4_events(d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(rid))
+                .collect()
+        };
+        let a = h4_item("h4-burst-a", "RSI 학습 추천 burstA", "x");
+        let b = h4_item("h4-burst-b", "RSI 학습 추천 burstB", "y");
+        route_auto_approval(&d, &a, false);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        crate::governance::h_paint(&ceo, own_paste);
+        route_auto_approval(&d, &b, false);
+        assert!(stalled_for(&d, "h4-burst-b").is_empty(), "둘째 결재가 첫 건 붙여넣기에 걸려 사람에게 갔다(F2)");
+        assert_eq!(h4_events(&d, "feed.auto_routed").len(), 2, "두 결재 모두 CEO 로");
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 2);
+        // 음성 대조 — 두 arm(각 500ms)과 settle 이 지난 뒤의 화면 초안은 종전대로 사람에게.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 500 + 600));
+        crate::governance::h_paint(&ceo, own_paste);
+        let c = h4_item("h4-burst-c", "RSI 학습 추천 burstC", "z");
+        route_auto_approval(&d, &c, false);
+        let sc = stalled_for(&d, "h4-burst-c");
+        assert_eq!(sc.len(), 1, "settle 뒤 화면 초안을 놓쳤다");
+        assert_eq!(sc[0]["payload"]["reason"], json!("ceo_seat_draft"));
         let _ = ceo.child.lock().unwrap().kill();
     }
 
