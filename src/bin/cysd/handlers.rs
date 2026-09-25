@@ -1556,7 +1556,12 @@ fn find_surface_by_seat_token(daemon: &Daemon, token: &str) -> Option<u64> {
 /// 조상 체인 워크 **공유 코어** — (해석된 소속 surface, caller start_time). 캐시 무접촉.
 /// resolve_caller_surface(캐시 판독→워크→기록)와 probe_caller_surface_uncached(워크만)가
 /// 공유한다 — 워크 규칙이 두 벌로 갈리면 모순 거부권의 '신선 재해석'이 본 해석과 다른
-/// 규칙을 보게 되므로 단일 소유가 계약이다.
+/// 규칙을 보게 되므로 단일 소유가 계약이다(규칙 자체는 `walk_ancestry_with` 한 벌이 소유한다 —
+/// 범위는 resolve/probe 이고, `caller_in_restore_root` 의 사본은 무변경·후속 흡수 후보다).
+///
+/// ★(D-1b · 0.14.42) 판독기만 OS 별로 다르다: macOS 는 pid 단위 경량 판독(`proc_brief` · 조상
+/// 깊이만큼의 syscall), 그 밖의 OS 와 노브 `CYS_PROC_PROBE_FAST=0` 은 종전 sysinfo 전체 표 판독.
+/// pid_to_sid 스냅샷을 먼저 뜨는 순서는 종전과 같다(gen_at_snapshot 선캡처 계약).
 fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Option<u64>) {
     let pid_to_sid: std::collections::HashMap<u32, u64> = daemon
         .surfaces
@@ -1565,29 +1570,75 @@ fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Optio
         .values()
         .map(|s| (s.pid, s.id))
         .collect();
+    #[cfg(target_os = "macos")]
+    {
+        if crate::state::proc_probe_fast_enabled() {
+            return walk_fast_with(&pid_to_sid, caller_pid, crate::state::proc_brief);
+        }
+    }
+    walk_legacy(&pid_to_sid, caller_pid)
+}
+
+/// 워크 **규칙**의 단일 정의(순수 · 전 OS) — 매 홉 pid_to_sid 선검사 · 최대 32홉 · 자기부모
+/// 절단 · parent ≤ 1(launchd/init·커널) 절단. 판독기(`parent_of`)만 주입받는다.
+fn walk_ancestry_with(
+    pid_to_sid: &std::collections::HashMap<u32, u64>,
+    caller_pid: u32,
+    mut parent_of: impl FnMut(u32) -> Option<u32>,
+) -> Option<u64> {
+    let mut cur = caller_pid;
+    for _ in 0..32 {
+        if let Some(sid) = pid_to_sid.get(&cur) {
+            return Some(*sid);
+        }
+        match parent_of(cur) {
+            Some(parent) if parent != cur && parent > 1 => cur = parent,
+            _ => break,
+        }
+    }
+    None
+}
+
+/// 종전 판독기(전 OS) — sysinfo 전체 표 1회 + 코어. caller_start 는 그 표의 호출자 start_time.
+fn walk_legacy(
+    pid_to_sid: &std::collections::HashMap<u32, u64>,
+    caller_pid: u32,
+) -> (Option<u64>, Option<u64>) {
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let caller_start = sys
         .process(sysinfo::Pid::from_u32(caller_pid))
         .map(|p| p.start_time());
-    let mut cur = caller_pid;
-    let mut found = None;
-    for _ in 0..32 {
-        if let Some(sid) = pid_to_sid.get(&cur) {
-            found = Some(*sid);
-            break;
-        }
-        match sys
-            .process(sysinfo::Pid::from_u32(cur))
+    let found = walk_ancestry_with(pid_to_sid, caller_pid, |cur| {
+        sys.process(sysinfo::Pid::from_u32(cur))
             .and_then(|p| p.parent())
-        {
-            Some(parent) if parent.as_u32() != cur && parent.as_u32() > 1 => {
-                cur = parent.as_u32();
-            }
-            _ => break,
-        }
-    }
+            .map(|p| p.as_u32())
+    });
     (found, caller_start)
+}
+
+/// macOS 경량 판독기 워크 — 판독 횟수 = max(깊이, 1).
+///
+/// 호출자 brief 는 **선검사보다 먼저 무조건 1회** 판독한다: 호출자가 곧 surface 루트여도
+/// caller_start 가 Some(실제 start) 로 기록돼 legacy 와 같고, 캐시 항목이 start_time=None('60초
+/// 무조건 신뢰')으로 새지 않는다. 코어의 parent_of 는 cur==호출자이면 이미 읽은 brief 를 재사용하고
+/// 아니면 reader 를 1회 부른다. 조상 pid ≤ 1 은 코어가 절단하므로 판독하지 않는다.
+/// reader 주입이 유일한 계수 seam 이다.
+#[cfg(target_os = "macos")]
+fn walk_fast_with(
+    pid_to_sid: &std::collections::HashMap<u32, u64>,
+    caller_pid: u32,
+    mut reader: impl FnMut(u32) -> Option<crate::state::ProcBrief>,
+) -> (Option<u64>, Option<u64>) {
+    let caller_brief = reader(caller_pid);
+    let found = walk_ancestry_with(pid_to_sid, caller_pid, |cur| {
+        if cur == caller_pid {
+            caller_brief.and_then(|b| b.parent)
+        } else {
+            reader(cur).and_then(|b| b.parent)
+        }
+    });
+    (found, caller_brief.map(|b| b.start_time))
 }
 
 /// ★결함#6-b(2026-08-22 실사고) — ACL `from` 신원 등급 **`owner`** 의 단일 정의처.
@@ -14924,6 +14975,193 @@ mod tests {
             panic!("expected single reply");
         };
         resp
+    }
+
+    /// ★(D-1b · T2) 워크 규칙 공유 코어 `walk_ancestry_with` 가 종전 루프(cecf4c57 handlers.rs
+    /// :1575-1589 의 축자 사본 = 오라클)와 **모든 모양에서** 같은 답을 낸다 — 전 OS 순수 검체.
+    /// 경우: 호출자가 곧 루트 · 깊이 0..40 전수(32홉 경계) · 자기부모 · parent 0·1 · parent 부재 ·
+    /// 루트 도달 불가 · 순환 A→B→A(32 유계) · 호출자는 맵에 있으나 parent 판독 None.
+    #[test]
+    fn walk_ancestry_core_matches_legacy_loop() {
+        use std::collections::HashMap;
+        // 오라클: 종전 루프의 축자 사본(판독기만 합성 parent 맵으로 바꿨다).
+        fn oracle(pid_to_sid: &HashMap<u32, u64>, caller_pid: u32, parents: &HashMap<u32, u32>) -> Option<u64> {
+            let mut cur = caller_pid;
+            let mut found = None;
+            for _ in 0..32 {
+                if let Some(sid) = pid_to_sid.get(&cur) {
+                    found = Some(*sid);
+                    break;
+                }
+                match parents.get(&cur).copied() {
+                    Some(parent) if parent != cur && parent > 1 => {
+                        cur = parent;
+                    }
+                    _ => break,
+                }
+            }
+            found
+        }
+        let check = |label: &str, map: &HashMap<u32, u64>, caller: u32, parents: &HashMap<u32, u32>| {
+            let got = walk_ancestry_with(map, caller, |p| parents.get(&p).copied());
+            let want = oracle(map, caller, parents);
+            assert_eq!(got, want, "[{label}] 코어가 종전 루프와 다르다 (caller={caller})");
+            got
+        };
+        let mut hits = 0;
+        // 깊이 0..40 전수 — 사슬 1000 ← 1001 ← … , 루트(sid 9)는 깊이 d 에 있다.
+        for d in 0..=40u32 {
+            let parents: HashMap<u32, u32> = (0..60u32).map(|i| (1000 + i, 1000 + i + 1)).collect();
+            let map: HashMap<u32, u64> = [(1000 + d, 9u64)].into_iter().collect();
+            if check(&format!("depth {d}"), &map, 1000, &parents).is_some() {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 32, "깊이 0..31 만 찾고 32 이상은 못 찾아야 한다(32홉 경계)");
+        let empty: HashMap<u32, u32> = HashMap::new();
+        let root_self: HashMap<u32, u64> = [(500, 5)].into_iter().collect();
+        assert_eq!(check("caller is root", &root_self, 500, &empty), Some(5));
+        assert_eq!(check("caller in map, parent None", &root_self, 500, &empty), Some(5));
+        let selfp: HashMap<u32, u32> = [(700, 700)].into_iter().collect();
+        assert_eq!(check("self-parent", &root_self, 700, &selfp), None);
+        for top in [0u32, 1] {
+            let p: HashMap<u32, u32> = [(800, 801), (801, top)].into_iter().collect();
+            let m: HashMap<u32, u64> = [(top, 3)].into_iter().collect();
+            assert_eq!(check(&format!("parent {top}"), &m, 800, &p), None, "pid≤1 조상은 절단");
+        }
+        let missing: HashMap<u32, u32> = [(900, 901)].into_iter().collect();
+        assert_eq!(check("parent missing", &root_self, 900, &missing), None);
+        let unreachable: HashMap<u32, u32> = (0..10u32).map(|i| (2000 + i, 2000 + i + 1)).collect();
+        assert_eq!(check("unreachable", &root_self, 2000, &unreachable), None);
+        let cycle: HashMap<u32, u32> = [(3000, 3001), (3001, 3000)].into_iter().collect();
+        let calls = std::cell::Cell::new(0u32);
+        let got = walk_ancestry_with(&root_self, 3000, |p| {
+            calls.set(calls.get() + 1);
+            cycle.get(&p).copied()
+        });
+        assert_eq!(got, oracle(&root_self, 3000, &cycle), "[cycle] 코어가 종전 루프와 다르다");
+        assert!(calls.get() <= 32, "순환이 32홉으로 유계가 아니다: {}", calls.get());
+    }
+
+    /// ★(D-1b · T3) fast 워크의 판독 횟수 == max(깊이, 1) — **정확값**('≤' 아님). 조상 pid≤1 은
+    /// 판독기에 전달되지 않는다. seam 은 reader 클로저 주입 하나다(프로덕션에 테스트 cfg 없음).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fast_walk_read_count_is_max_depth_1() {
+        use crate::state::ProcBrief;
+        use std::collections::HashMap;
+        for d in 0..=31u32 {
+            let map: HashMap<u32, u64> = [(5000 + d, 77u64)].into_iter().collect();
+            let reads = std::cell::Cell::new(0u32);
+            let (found, start) = walk_fast_with(&map, 5000, |p| {
+                reads.set(reads.get() + 1);
+                Some(ProcBrief { parent: Some(p + 1), start_time: 1234 })
+            });
+            assert_eq!(found, Some(77), "깊이 {d} 루트를 못 찾았다");
+            assert_eq!(start, Some(1234), "caller_start 가 기록되지 않았다");
+            assert_eq!(reads.get(), d.max(1), "깊이 {d}: 판독 횟수 != max(깊이,1)");
+        }
+        // 외부 호출자 — 사슬 끝의 parent 가 1·0 이면 그 pid 는 판독하지 않는다.
+        for top in [0u32, 1] {
+            let map: HashMap<u32, u64> = HashMap::new();
+            let seen = std::cell::RefCell::new(Vec::new());
+            let (found, _) = walk_fast_with(&map, 6000, |p| {
+                seen.borrow_mut().push(p);
+                let parent = if p < 6003 { p + 1 } else { top };
+                Some(ProcBrief { parent: (parent != 0).then_some(parent), start_time: 1 })
+            });
+            assert_eq!(found, None);
+            assert_eq!(*seen.borrow(), vec![6000, 6001, 6002, 6003], "판독 순서·횟수(top={top})");
+            assert!(seen.borrow().iter().all(|&p| p > 1), "pid≤1 이 판독기에 전달됐다");
+        }
+    }
+
+    /// 테스트 자식 청소 — pid 지정 SIGKILL(+자기 자식이면 waitpid 회수). 패턴 kill 금지.
+    #[cfg(target_os = "macos")]
+    struct KillPids(Vec<(u32, bool)>);
+    #[cfg(target_os = "macos")]
+    impl Drop for KillPids {
+        fn drop(&mut self) {
+            for &(pid, reap) in &self.0 {
+                // SAFETY: 이 검체가 띄운 pid 에만 신호를 보낸다. waitpid 는 자기 자식에만 쓴다.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    if reap {
+                        let mut st: libc::c_int = 0;
+                        libc::waitpid(pid as libc::pid_t, &mut st, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// ★(D-1b · T6) 호출자가 곧 surface 루트(선검사 적중)여도 호출자 brief 를 **1회** 판독해
+    /// caller_start 를 Some(실제 start) 로 기록한다 — legacy 와 같고, CallerCacheEntry.start_time=None
+    /// → '60초 무조건 신뢰' 경로로 새지 않는다. 판독을 미루는 구현(적중 시 0회)은 여기서 red 다.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caller_in_map_still_records_caller_start() {
+        use std::collections::HashMap;
+        let child = std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
+        let pid = child.id();
+        std::mem::forget(child);
+        let _guard = KillPids(vec![(pid, true)]);
+        let map: HashMap<u32, u64> = [(pid, 41u64)].into_iter().collect();
+        let reads = std::cell::Cell::new(0u32);
+        let fast = walk_fast_with(&map, pid, |p| {
+            reads.set(reads.get() + 1);
+            crate::state::proc_brief(p)
+        });
+        let legacy = walk_legacy(&map, pid);
+        assert_eq!(reads.get(), 1, "선검사 적중에서도 판독은 정확히 1회여야 한다");
+        assert_eq!(fast.0, Some(41));
+        assert!(fast.1.is_some_and(|s| s > 0), "caller_start 가 Some(실제 start) 가 아니다: {fast:?}");
+        assert_eq!(fast, legacy, "fast 와 legacy 가 다르다");
+        // 합성: reader 가 호출자에 None → (Some(sid), None) — legacy 의미와 같다.
+        let synth = walk_fast_with(&map, pid, |_| None);
+        assert_eq!(synth, (Some(41), None));
+    }
+
+    /// ★(D-1b · T4) 실제 트리(sh → sleep 손자)에서 fast 와 legacy 워크가 found·caller_start 모두 같다.
+    /// 외부(테스트 자신)는 양쪽 모두 None. 전역 env 무접촉(두 워크를 직접 부른다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fast_and_legacy_walks_agree_on_real_tree() {
+        use std::collections::HashMap;
+        let sh = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & wait"])
+            .spawn()
+            .expect("spawn sh");
+        let sh_pid = sh.id();
+        std::mem::forget(sh);
+        let mut guard = KillPids(vec![(sh_pid, true)]);
+        // 손자(sleep) 찾기 — 유계 폴링 5s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let grandchild = loop {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if let Some((pid, _)) = sys
+                .processes()
+                .iter()
+                .find(|(_, p)| p.parent().map(|x| x.as_u32()) == Some(sh_pid))
+            {
+                break pid.as_u32();
+            }
+            assert!(std::time::Instant::now() < deadline, "5s 안에 sh 의 손자(sleep)가 보이지 않았다");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        guard.0.insert(0, (grandchild, false)); // 손자 먼저 kill(고아 sleep 30s 방지)
+        let map: HashMap<u32, u64> = [(sh_pid, 42u64)].into_iter().collect();
+        let fast = walk_fast_with(&map, grandchild, crate::state::proc_brief);
+        let legacy = walk_legacy(&map, grandchild);
+        assert_eq!(fast.0, Some(42), "fast 가 손자의 소속을 못 찾았다: {fast:?}");
+        assert!(fast.1.is_some_and(|s| s > 0));
+        assert_eq!(fast, legacy, "실제 트리에서 fast 와 legacy 가 다르다");
+        let me = std::process::id();
+        let ext_fast = walk_fast_with(&map, me, crate::state::proc_brief);
+        let ext_legacy = walk_legacy(&map, me);
+        assert_eq!(ext_fast.0, None, "외부(테스트 자신)가 surface 에 귀속됐다");
+        assert_eq!(ext_fast, ext_legacy, "외부 호출자에서 fast 와 legacy 가 다르다");
     }
 
     /// 발견(pid 재사용 → 신원 오인): resolve_caller_surface의 60초 caller_cache는 pid만으로

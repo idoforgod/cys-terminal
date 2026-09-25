@@ -2888,6 +2888,359 @@ pub(crate) fn peer_start_time(pid: u32) -> Option<u64> {
     sys.process(p).map(|proc| proc.start_time())
 }
 
+/// ★(D-1a · 0.14.42 WP-transport) 호출자 신원 워크용 **pid 단위 경량 판독** — macOS 전용.
+///
+/// 종전 워크는 새 pid 요청마다 `sysinfo::System::new() + refresh_processes(All)` 로 **전 프로세스
+/// 표**를 읽었다(proc_listallpids 3회 + rayon 병렬 전 pid × 여러 syscall · 실측 CPU 41~58ms/회).
+/// 워크가 실제로 쓰는 값은 ≤32개 pid 의 parent·start_time 뿐이고 둘 다 `PROC_PIDTBSDINFO` 한 번
+/// (`pbi_ppid`·`pbi_start_tvsec`)에서 나온다. 그래서 조상 깊이만큼만 pid 단위 syscall 을 부른다.
+///
+/// 존재 판정식은 sysinfo 0.33.1 `create_new_process`(macos/process.rs:349-392)와 **같다**
+/// (`decide_brief` · 8칸 진리표 검체가 박제). Windows·Linux 는 legacy(sysinfo) 경로 그대로다.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcBrief {
+    /// 부모 pid — `pbi_ppid == 0` 이면 None(sysinfo `get_parent` 와 같다). 타 사용자(bsd 판독
+    /// 불가) 프로세스도 None.
+    pub(crate) parent: Option<u32>,
+    /// `pbi_start_tvsec`(epoch 초) — pid 재사용 식별자. 타 사용자 프로세스는 0(sysinfo 와 같다).
+    pub(crate) start_time: u64,
+}
+
+/// 존재·필드 **순수 판정**(sysinfo `create_new_process` 와 같은 식).
+/// · bsd=Some: pidpath 성공 ∨ KERN_PROCARGS2 성공이면 존재, 아니면 부재(좀비·권한 없음).
+/// · bsd=None(타 사용자·권한 없음): pidpath 성공이면 존재(parent None · start 0), 아니면 부재.
+///   이 분기에서는 KERN_PROCARGS2 를 부르지 않는다(sysinfo 도 부르지 않는다).
+/// OR 의 평가 순서는 sysinfo(procargs2 먼저)와 다르다 — pidpath 가 더 싸서 먼저 본다. 값은
+/// 교환법칙으로 같고, 차이는 µs 단위 판독 시각뿐이다(스냅샷 경주와 같은 부류).
+#[cfg(target_os = "macos")]
+pub(crate) fn decide_brief(
+    bsd: Option<(u32, u64)>,
+    pidpath_ok: bool,
+    procargs2_ok: impl FnOnce() -> bool,
+) -> Option<ProcBrief> {
+    match bsd {
+        Some((ppid, start_time)) => {
+            if pidpath_ok || procargs2_ok() {
+                Some(ProcBrief { parent: (ppid != 0).then_some(ppid), start_time })
+            } else {
+                None
+            }
+        }
+        None => pidpath_ok.then_some(ProcBrief { parent: None, start_time: 0 }),
+    }
+}
+
+/// pid 하나의 (parent, start_time) — 부재·좀비·판독 불가는 None. syscall 은 최대 4회
+/// (bsdinfo 1 · pidpath 1 · pidpath 실패 시에만 KERN_PROCARGS2 크기·본문 2).
+/// unwrap·인덱싱·락·스레드 없음. 음수로 캐스트되는 pid 는 syscall 실패 → None.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_brief(pid: u32) -> Option<ProcBrief> {
+    let cpid = pid as libc::c_int;
+    // ① PROC_PIDTBSDINFO — 0 초기화한 proc_bsdinfo 에 **정확한 크기**를 넘기고, 반환값이 그 크기일
+    //    때만 유효(sysinfo get_bsd_info 와 같다).
+    // SAFETY: proc_bsdinfo 는 정수·c_char 배열뿐이라 0 비트 패턴이 유효하다. 커널은 buffersize
+    // (= 구조체 크기) 이하만 쓴다. 포인터는 이 스택 지역 변수를 가리키고 호출 동안 살아 있다.
+    let bsd = unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(
+            cpid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            size,
+        );
+        (n == size).then_some((info.pbi_ppid, info.pbi_start_tvsec))
+    };
+    // ② proc_pidpath — 고정 스택 버퍼(PROC_PIDPATHINFO_MAXSIZE=4096), 반환 >0 이면 성공.
+    let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: 버퍼 길이를 그대로 bufsize 로 넘긴다 — 커널은 그 이하만 쓴다. 내용은 읽지 않는다.
+    let pidpath_ok = unsafe {
+        libc::proc_pidpath(cpid, path.as_mut_ptr() as *mut libc::c_void, path.len() as u32) > 0
+    };
+    decide_brief(bsd, pidpath_ok, || procargs2_ok(cpid))
+}
+
+/// ③ KERN_PROCARGS2 폴백(bsd=Some ∧ pidpath 실패일 때만 호출된다) — 크기 조회 뒤 **커널이 알려준
+/// 크기**의 0 초기화 힙 버퍼(len=sz, set_len 없음)로 본문을 조회하고, 성공 ∧ sz>0 이면 true.
+/// 버퍼 내용은 읽지 않는다(sysinfo get_process_infos 의 성공 조건과 같다).
+#[cfg(target_os = "macos")]
+fn procargs2_ok(cpid: libc::c_int) -> bool {
+    let mut mib: [libc::c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, cpid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: oldp=null 크기 조회 — 커널은 size 에만 쓴다. 이어 len==size 인 Vec 을 넘기고
+    // oldlenp 에 같은 size 를 준다 — 커널은 그 이하만 쓰고 실제 길이를 size 에 돌려준다.
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == -1
+        {
+            return false;
+        }
+        let mut buf = vec![0u8; size];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == -1
+        {
+            return false;
+        }
+    }
+    size > 0
+}
+
+/// 노브(순수) — `CYS_PROC_PROBE_FAST` 값이 정확히 "0" 일 때만 legacy(sysinfo) 판독으로 돌아간다.
+/// ''·'false'·'off' 는 fast 를 유지한다(끄는 값은 하나뿐 — reap_exited_enabled 관례).
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_probe_fast_enabled_from(v: Option<&str>) -> bool {
+    v.map_or(true, |v| v != "0")
+}
+
+/// 노브 판독 — 호출할 때마다 env 를 읽는다(하우스 관례). 실행 중 데몬의 env 를 바꿀 수단은 없으므로
+/// 운영 의미는 **기동 때 정해지는 선택**이다(적용 = cysd 재기동).
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_probe_fast_enabled() -> bool {
+    proc_probe_fast_enabled_from(std::env::var("CYS_PROC_PROBE_FAST").ok().as_deref())
+}
+
+/// ★(D-1a 검체) pid 단위 경량 판독 `proc_brief` 가 sysinfo(legacy) 와 **같은 존재·필드 판정**을
+/// 내는지 잰다. macOS 전용(fast 판독기가 macOS 에만 있다) — 모듈 전체를 안쪽 cfg 로 가둔다.
+#[cfg(test)]
+mod proc_brief_tests {
+    #![cfg(target_os = "macos")]
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+
+    /// sysinfo 0.33.1 `create_new_process`(macos/process.rs:349-392)의 존재·필드 식 **사본 오라클**.
+    /// bsd=Some → procargs2 ∨ pidpath 면 존재(parent=ppid≠0, start=pbi_start_tvsec),
+    /// bsd=None → pidpath 면 존재(parent None · start 0), 아니면 부재.
+    fn sysinfo_model(bsd: Option<(u32, u64)>, pidpath: bool, procargs2: bool) -> Option<ProcBrief> {
+        match bsd {
+            None => {
+                if pidpath {
+                    Some(ProcBrief { parent: None, start_time: 0 })
+                } else {
+                    None
+                }
+            }
+            Some((ppid, st)) => {
+                if procargs2 || pidpath {
+                    Some(ProcBrief {
+                        parent: if ppid == 0 { None } else { Some(ppid) },
+                        start_time: st,
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// T7 — (bsd None/Some)×(pidpath)×(procargs2) 8칸 전부가 오라클과 같다. bsd=None 이면
+    /// procargs2 클로저를 **부르지 않는다**(타 사용자 프로세스에 KERN_PROCARGS2 를 치지 않음).
+    #[test]
+    fn decide_brief_matches_sysinfo_model_8_cells() {
+        let mut cells = 0;
+        for bsd in [None, Some((42u32, 1_700_000_123u64)), Some((0u32, 1_700_000_456u64))] {
+            for pidpath in [false, true] {
+                for procargs2 in [false, true] {
+                    let calls = Cell::new(0u32);
+                    let got = decide_brief(bsd, pidpath, || {
+                        calls.set(calls.get() + 1);
+                        procargs2
+                    });
+                    let want = sysinfo_model(bsd, pidpath, procargs2);
+                    assert_eq!(
+                        got, want,
+                        "진리표 불일치: bsd={bsd:?} pidpath={pidpath} procargs2={procargs2}"
+                    );
+                    if bsd.is_none() {
+                        assert_eq!(calls.get(), 0, "bsd=None 인데 KERN_PROCARGS2 를 불렀다");
+                    }
+                    if bsd.is_some() && pidpath {
+                        assert_eq!(calls.get(), 0, "pidpath 성공인데 procargs2 폴백을 불렀다(비용 회귀)");
+                    }
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 12, "칸 수(8칸 + ppid=0 변형 4칸)");
+        // 명시 단언 두 칸(검토 지적 1)
+        assert_eq!(decide_brief(None, false, || true), None, "(bsd None·pidpath 실패·procargs2 성공)=None");
+        assert_eq!(
+            decide_brief(Some((7, 99)), false, || true),
+            Some(ProcBrief { parent: Some(7), start_time: 99 }),
+            "(bsd Some·pidpath 실패·procargs2 성공)=Some"
+        );
+    }
+
+    /// T5 — 노브 진리표. 끄는 값은 "0" 하나뿐이다(''·'false'·'off' 는 fast 유지). 전역 env 무접촉.
+    #[test]
+    fn proc_probe_fast_enabled_from_truth_table() {
+        for (v, want) in [
+            (None, true),
+            (Some("1"), true),
+            (Some("0"), false),
+            (Some(""), true),
+            (Some("false"), true),
+            (Some("off"), true),
+        ] {
+            assert_eq!(proc_probe_fast_enabled_from(v), want, "CYS_PROC_PROBE_FAST={v:?}");
+        }
+    }
+
+    fn legacy_snapshot() -> sysinfo::System {
+        for _ in 0..5 {
+            let mut s = sysinfo::System::new();
+            s.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            // get_proc_list None(두 번째 proc_listallpids 가 추정치 이상)이면 표 전체가 빈다 — 공허 통과 금지.
+            if !s.processes().is_empty() {
+                return s;
+            }
+        }
+        panic!("legacy(sysinfo All) 스냅샷이 5회 연속 비었다 — 비교 불가(red)");
+    }
+
+    fn legacy_brief(sys: &sysinfo::System, pid: u32) -> Option<ProcBrief> {
+        sys.process(sysinfo::Pid::from_u32(pid)).map(|p| ProcBrief {
+            parent: p.parent().map(|x| x.as_u32()),
+            start_time: p.start_time(),
+        })
+    }
+
+    /// sysinfo `ProcessesToUpdate::Some` 단일 pid 판독 — 캐시 히트 가드가 쓰던 경로의 사본.
+    fn sysinfo_some_brief(pid: u32) -> Option<ProcBrief> {
+        let mut sys = sysinfo::System::new();
+        let p = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+        legacy_brief(&sys, pid)
+    }
+
+    #[derive(Default, Debug)]
+    struct Tally {
+        some_real: usize,
+        some_zero: usize,
+        none_none: usize,
+        mismatched: Vec<u32>,
+        self_in_real: bool,
+    }
+
+    fn compare(pids: &BTreeSet<u32>, snap: &sysinfo::System, reader: impl Fn(u32) -> Option<ProcBrief>) -> Tally {
+        let me = std::process::id();
+        let mut t = Tally::default();
+        for &pid in pids {
+            let fast = reader(pid);
+            let legacy = legacy_brief(snap, pid);
+            match (fast, legacy) {
+                (Some(a), Some(b)) if a == b => {
+                    if a.start_time == 0 {
+                        t.some_zero += 1;
+                    } else {
+                        t.some_real += 1;
+                        if pid == me {
+                            t.self_in_real = true;
+                        }
+                    }
+                }
+                (None, None) => t.none_none += 1,
+                _ => t.mismatched.push(pid),
+            }
+        }
+        t
+    }
+
+    /// T1 — 실측 차분 게이트. 대상 = sysinfo All 스냅샷의 전 pid + 0..99999 의 97 간격 부재 표본 + 자기 pid.
+    /// 일치를 Some==Some(실제 start)·Some==Some(start 0)·None==None 으로 **나눠** 센다(결측은 값이 아니다).
+    /// 1차 불일치는 새 스냅샷으로 재관측해 경주(생성·종료)를 배제하고, **안정 불일치 0** 이어야 한다.
+    #[test]
+    fn proc_brief_equals_sysinfo_for_every_pid() {
+        let snap = legacy_snapshot();
+        let me = std::process::id();
+        let mut pids: BTreeSet<u32> = snap.processes().keys().map(|p| p.as_u32()).collect();
+        pids.extend((0..99_999u32).step_by(97));
+        pids.insert(me);
+
+        let t = compare(&pids, &snap, proc_brief);
+        assert!(t.some_real > 0, "Some==Some(실제 start) 가 0건 — 공허한 통과: {t:?}");
+        assert!(t.self_in_real, "자기 pid 가 Some==Some(실제 start) 에 없다: {t:?}");
+
+        // 음성 대조 — '항상 None' 판독기에 같은 비교기를 돌리면 반드시 불일치가 나와야 한다.
+        let neg = compare(&pids, &snap, |_| None);
+        assert!(!neg.mismatched.is_empty(), "음성 대조(항상 None)가 불일치 0 — 비교기가 무력하다");
+
+        // 재관측 2회 — 두 번 다 불일치인 pid 만 안정 불일치로 센다(경주 배제).
+        let mut stable: BTreeSet<u32> = t.mismatched.iter().copied().collect();
+        for _ in 0..2 {
+            if stable.is_empty() {
+                break;
+            }
+            let snap2 = legacy_snapshot();
+            let again = compare(&stable, &snap2, proc_brief);
+            stable = again.mismatched.into_iter().collect();
+        }
+        let detail: Vec<(u32, Option<ProcBrief>, Option<ProcBrief>)> = stable
+            .iter()
+            .map(|&p| (p, proc_brief(p), legacy_brief(&legacy_snapshot(), p)))
+            .collect();
+        eprintln!(
+            "T1 계수: pid {} · Some==Some(실제 start) {} · Some==Some(start 0) {} · None==None {} · 1차 불일치 {} · 안정 불일치 {}",
+            pids.len(),
+            t.some_real,
+            t.some_zero,
+            t.none_none,
+            t.mismatched.len(),
+            stable.len()
+        );
+        assert!(stable.is_empty(), "proc_brief 와 sysinfo 가 안정적으로 어긋난다: {detail:?}");
+    }
+
+    /// T1z — 좀비는 두 판독기 모두에서 같게(이 맥에서는 부재 None) 보인다. waitid(WNOWAIT) 로 종료를
+    /// **확정**한 뒤(회수하지 않은 채) 판독하고, 판독 뒤 waitpid(WNOHANG)==pid 로 '판독 시점에 좀비였음'
+    /// 을 확인하며 회수한다. 고정 sleep·SZOMB 폴링을 쓰지 않는다(이 맥의 좀비는 raw bsd 가 None 이라
+    /// SZOMB 폴링은 영영 성립하지 않는다).
+    #[test]
+    fn zombie_is_absent_in_both_readers() {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id();
+        std::mem::forget(child); // std Child 의 wait 를 쓰지 않는다 — 회수는 아래 waitpid 가 한다.
+        // SAFETY: siginfo_t 는 정수 필드뿐이라 0 초기화가 유효하다. waitid 는 이 프로세스의 자식 pid 에만
+        // 쓰며 WNOWAIT 라 회수하지 않는다(좀비 유지).
+        let rc = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        assert_eq!(rc, 0, "waitid(WEXITED|WNOWAIT) 실패 — 종료 확정 불가");
+
+        let fast = proc_brief(pid);
+        let all = legacy_brief(&legacy_snapshot(), pid);
+        let some = sysinfo_some_brief(pid);
+
+        // SAFETY: 자식 pid 1개를 WNOHANG 으로 회수한다(블록 없음).
+        let reaped = unsafe {
+            let mut st: libc::c_int = 0;
+            libc::waitpid(pid as libc::pid_t, &mut st, libc::WNOHANG)
+        };
+        assert_eq!(reaped as u32, pid, "판독 시점에 좀비가 아니었다(남이 회수) — 검체 무효");
+        eprintln!("T1z 좀비 판독: fast={fast:?} all={all:?} some={some:?}");
+        assert_eq!(fast, all, "좀비: fast 와 sysinfo All 이 다르다");
+        assert_eq!(fast, some, "좀비: fast 와 sysinfo Some 이 다르다");
+    }
+}
+
 /// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
 /// output_tokens는 메시지당 가산이라 누적 모호성이 없다. 수집기가 새 어시스턴트 메시지마다 적재.
 #[derive(Default)]
