@@ -1433,6 +1433,11 @@ pub struct Surface {
     /// org.status **양쪽 동일 키**(`alt_screen` — 동형성 핀 handlers.rs) + launch-agent 의
     /// mac claude fullscreen WARN(D5 env 방어층 우회 관측). additive bool — 구 소비자 무영향.
     pub alt_screen: AtomicBool,
+    /// ★(0.14.42 · 설계 C D5′) 이 pane 의 앱이 지금 **괄호 붙여넣기 모드(DECSET 2004)** 를 켜 두었는가.
+    /// 단일 write path = reader 스레드의 [`mirror_screen_modes`](파서 락 임계영역 안 · `alt_screen` 과 같은 자리).
+    /// 소비 = 직접 경로 울타리 판정(handlers `direct_fence_mode` 의 마지막 클로저) — 핸들러가 파서 락을 새로
+    /// 잡지 않게 하는 원자 미러다. 파서 패닉 재초기화 시 fresh 파서의 false 가 들어가 원문(종전)으로 폴백한다.
+    pub bracketed_paste: AtomicBool,
     /// ★(U-10) **좌석 제4 등급** `gate_pending` — 프로세스는 살아 있으나 **첫기동 관문**
     /// (테마 → 로그인방식 → OAuth → 폴더신뢰 → 면책 → 새기능안내)에 갇혀 **입력을 받을 수
     /// 없는** 좌석. `None` = 이 축에 대해 말할 것이 없음(= 종전 판정) · `Some(_)` = 보류.
@@ -4937,6 +4942,7 @@ impl Daemon {
             directive_verified: Mutex::new(None),
             // (W4 · D5) 신생 pane 은 primary screen 에서 출발 — 첫 청크 반영 시 reader 가 갱신.
             alt_screen: AtomicBool::new(false),
+            bracketed_paste: AtomicBool::new(false),
             // ★(U-10) 관문 보류는 항상 None 으로 시작한다 — 생성 시점엔 관문 관측 자체가 없다.
             //   restore 하이드레이션도 하지 않는다(필드 doc 의 A1 라이브락 사유).
             gate_pending: Mutex::new(None),
@@ -5085,8 +5091,8 @@ impl Daemon {
                             // (W4 · D5) alt_screen 관측 — 파서 락 임계영역 안에서 스냅샷을 떠
                             // 청크 반영과 원자 정합. 패닉 재초기화 경로도 fresh 파서의 false 를
                             // 그대로 반영한다(별도 분기 불요 — 화면 스냅샷 소실과 동일 의미론).
-                            surf.alt_screen
-                                .store(parser.screen().alternate_screen(), Ordering::Relaxed);
+                            // ★(0.14.42 · 설계 C D5′) 괄호 붙여넣기 모드(2004)도 같은 자리·같은 규칙.
+                            mirror_screen_modes(&surf, parser.screen());
                             // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
                             // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);
@@ -5587,6 +5593,14 @@ pub(crate) fn cr_gap_delay_ms(
     let elapsed_ms = since_last_program?.as_millis();
     let gap = u128::from(min_gap_ms);
     (elapsed_ms < gap).then(|| (gap - elapsed_ms) as u64)
+}
+
+/// ★(0.14.42 · 설계 C D5′) 화면 모드 미러 — reader 가 **파서 락 임계영역 안**에서 청크 반영 직후 부른다.
+/// `alt_screen`(W4 · D5)과 `bracketed_paste`(2004 · 직접 경로 울타리 판정) 두 원자를 같은 스냅샷에서 쓴다.
+/// 패닉 재초기화 뒤에는 fresh 파서의 false 가 들어간다(울타리 판정은 원문 = 종전 쪽으로 접힌다).
+pub(crate) fn mirror_screen_modes(surf: &Surface, screen: &vt100::Screen) {
+    surf.alt_screen.store(screen.alternate_screen(), Ordering::Relaxed);
+    surf.bracketed_paste.store(screen.bracketed_paste(), Ordering::Relaxed);
 }
 
 /// `WriteReq::Inject` 의 바이트 시퀀스 — (선정리 Ctrl-U → settle) → bracketed paste → cr_delay →
@@ -6671,6 +6685,52 @@ mod tests {
                 .is_ok(),
             "모든 sender drop 시 writer 루프가 종료돼야 한다"
         );
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ · T9) 화면 모드 미러 — ① 헬퍼: 2004h → true · 2004l → false · 1049 전환에도
+    /// 유지 · alt_screen 동시 미러 ② 파서 패닉 재초기화 뒤 false ③ 실제 reader: 좌석이 `ESC[?2004h` 를 찍으면
+    /// 2 초 안에 `surface.bracketed_paste` 가 true.
+    #[test]
+    fn c_mirror_screen_modes_tracks_bracketed_paste() {
+        let dir = std::env::temp_dir().join(format!("cys-c-mirror-{}-{}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("printf '\\033[?2004h'; sleep 30".into()), None, None, 24, 80)
+            .expect("surface");
+        // ③ 실제 reader(2 s 폴링).
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < dl && !s.bracketed_paste.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(s.bracketed_paste.load(Ordering::Relaxed), "reader 가 2004h 를 미러해야 한다");
+        let _ = s.child.lock().unwrap().kill();
+        // ① 헬퍼 직접.
+        let mut p = vt100::Parser::new(24, 80, SCROLLBACK_LINES);
+        p.process(b"\x1b[?2004h");
+        mirror_screen_modes(&s, p.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed));
+        assert!(!s.alt_screen.load(Ordering::Relaxed));
+        p.process(b"\x1b[?1049h");
+        mirror_screen_modes(&s, p.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed), "1049 전환에도 2004 유지");
+        assert!(s.alt_screen.load(Ordering::Relaxed), "alt_screen 동시 미러");
+        p.process(b"\x1b[?2004l");
+        mirror_screen_modes(&s, p.screen());
+        assert!(!s.bracketed_paste.load(Ordering::Relaxed), "2004l → false");
+        // ② 패닉 재초기화 뒤 false(fresh 파서).
+        let mut q = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        process_chunk_isolated(&mut q, b"\x1b[?2004h", 0);
+        mirror_screen_modes(&s, q.screen());
+        assert!(s.bracketed_paste.load(Ordering::Relaxed));
+        process_chunk_isolated(&mut q, b"\x1b[1;25H", 0);
+        process_chunk_isolated(&mut q, "\u{ac00}".as_bytes(), 0);
+        q.set_size(10, 25);
+        let (_, panicked) = process_chunk_isolated(&mut q, b"\x1b[1;25Ha", 0);
+        assert!(panicked, "전제: row.rs:89 패닉 재현");
+        mirror_screen_modes(&s, q.screen());
+        assert!(!s.bracketed_paste.load(Ordering::Relaxed), "재초기화 → false → 원문(종전) 폴백");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★(0.14.42 · 설계 C D2 · T2/T3) Inject 백스톱 — 본문 안 CLOSE(`ESC[201~`)·C1 CLOSE·끝 미완성

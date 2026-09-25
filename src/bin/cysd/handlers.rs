@@ -2578,6 +2578,144 @@ fn return_absorbed_response(
     )
 }
 
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 울타리의 **본문 크기 문턱**(UTF-8 바이트). 관측된 PTY 조각이 1022 B 이므로
+/// 두 번 이상 읽혀 조각 사이 간격이 생길 수 있는 본문만 덮는다(S49 d_k1200 인위 간격 300/400 ms: 울타리 없이
+/// 2/20 앞부분 소실 · 울타리 0/40). 그 아래(사이클 PRENOTICE 146 B · 1줄 escalate · 짧은 쌍)는 종전 바이트다.
+const DIRECT_FENCE_MIN_BYTES: usize = 1000;
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 울타리를 거는 어댑터 — S49 로 실측한 Claude 만. codex·gemini(agy)·grok·
+/// 사용자 정의 어댑터는 실측 뒤 별도 결재로 넣는다(상수 1곳이 최소 면적).
+const DIRECT_FENCE_ADAPTERS: [&str; 1] = ["claude"];
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로 쓰기 형태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectFence {
+    /// v0.14.41 바이트 그대로(`Program(text)`).
+    Raw,
+    /// `OPEN + 머리 + CLOSE + 꼬리` — 머리 = 끝 제출 꼬리 앞 본문, 꼬리 = CR 을 담은 끝 `[\r\n]*`(없으면 빈 것).
+    Fenced,
+}
+
+/// 직접 경로 울타리 판정의 **싼 순수 입력**(자기신고 포함 — 전부 원문(종전) 쪽으로만 접힌다).
+#[derive(Debug, Clone, Copy)]
+struct DirectFenceFlags {
+    /// 요청의 `human`(자기신고) — GUI 키 입력·machine_origin 문안이 여기서 빠진다.
+    human: bool,
+    /// 요청의 `authoritative`(자기신고) — 기동 명령줄·사전 울타리 inject_text.
+    authoritative: bool,
+    /// clear_first 는 원자 Inject 로 따로 나간다.
+    clear_first: bool,
+    /// `cfg!(unix)` — Windows 직접 경로는 무변경.
+    platform_ok: bool,
+}
+
+/// 끝 제출 꼬리 분리(순수): 본문 끝의 `[\r\n]*` 연속이 **CR 을 담고 있으면** 그것을 꼬리로 떼어 낸다(자동 제출
+/// 의도 — `본문\r` 관례). CR 이 없는 끝 LF 는 본문의 일부다(봉투 안에 남는다). 반환 (머리, 꼬리).
+fn split_submit_tail(text: &str) -> (&str, &str) {
+    let head_len = text.trim_end_matches(['\r', '\n']).len();
+    let tail = &text[head_len..];
+    if tail.contains('\r') {
+        (&text[..head_len], tail)
+    } else {
+        (text, "")
+    }
+}
+
+/// 끝이 이미지 경로 확장자인가(ASCII 대소문자 무시 · 끝 공백·따옴표 제거 뒤) — Claude 는 붙여넣은 이미지 경로를
+/// 첨부로 바꿀 수 있어 울타리를 걸지 않는다(설계 C 지적 2·16).
+fn ends_with_image_ext(s: &str) -> bool {
+    let t = s.trim_end_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'');
+    let lower = t.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
+/// ★(0.14.42 · 설계 C D5′ + S34 CRLF) 직접 경로 울타리 판정(순수 · 관측은 클로저).
+///
+/// 대상 둘(나머지는 전부 `Raw` = v0.14.41 바이트):
+///   ① **안쪽 CR 본문**(S34 CRLF 결함) — 머리에 CR 이 있으면 크기와 무관하게 봉투를 건다. 종전에는 CR 마다
+///      TUI 가 제출해 한 본문이 제출 여러 개로 쪼개졌다(미니 S34 cli_pair crlf 10/10 · 벤치 S34 10/10). 큐 경로는
+///      이미 봉투 안에 싣고 있었다(같은 본문 · 같은 의미). 끝 CR 꼬리(자동 제출)는 봉투 **밖**에 그대로 둔다 —
+///      S49: 울타리 + CR 은 τ=0 에서도 제출된다. 셸 좌석은 아래 좌석 술어로 빠진다(셸 의미 = 줄마다 실행 보존).
+///   ② **1000 B 이상 평문**(설계 D5′) — CR 없는 여러 줄 평문. 조각 간격이 벌어지는 부하 조건의 앞부분 소실 방어.
+/// 공통 제외: 사람·권위·clear_first·비유닉스 · 평문 아님(\t \n \r 외 C0 · DEL · C1 — ESC 가 든 본문은 종전 원문) ·
+/// `!` 접두(Claude bash 모드) · 이미지 경로 끝 · 좌석 술어 실패 · 킬 스위치 · 2004 꺼짐.
+/// 단락 순서 고정: 싼 순수 조건 → 본문 스캔 → 클로저(락·시스템콜·원자 읽기)는 뒤에, 앞 조건이 실패하면 호출 0.
+fn direct_fence_mode(
+    text: &str,
+    flags: DirectFenceFlags,
+    seat_ok: impl FnOnce() -> bool,
+    disabled: impl FnOnce() -> bool,
+    bp: impl FnOnce() -> bool,
+) -> DirectFence {
+    if flags.human || flags.authoritative || flags.clear_first || !flags.platform_ok {
+        return DirectFence::Raw;
+    }
+    let (head, _tail) = split_submit_tail(text);
+    let interior_cr = head.contains('\r');
+    let big_plain = text.len() >= DIRECT_FENCE_MIN_BYTES && !text.contains('\r');
+    if !(interior_cr || big_plain) {
+        return DirectFence::Raw;
+    }
+    if !text.chars().all(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r')) {
+        return DirectFence::Raw;
+    }
+    if head.trim_start().starts_with('!') || ends_with_image_ext(head) {
+        return DirectFence::Raw;
+    }
+    if !seat_ok() || disabled() || !bp() {
+        return DirectFence::Raw;
+    }
+    DirectFence::Fenced
+}
+
+/// ★(0.14.42 · 설계 C D5′) 좌석 술어 — claude 어댑터 ∧ 에이전트 좌석(`seat_is_agent_backed`: 미종료·meta·
+/// 미통지·SEAT≠Empty) ∧ 에이전트 생존 관측(`agent_seen`). `agent_meta` 가드는 이름 판정 직후 놓는다 — 가드를 쥔
+/// 채 `seat_is_agent_backed` 를 부르면 같은 Mutex 재진입으로 데드락이다.
+fn direct_fence_seat_ok(surface: &Arc<crate::state::Surface>) -> bool {
+    let adapter_ok = {
+        let meta = surface.agent_meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.as_ref().is_some_and(|(a, _)| DIRECT_FENCE_ADAPTERS.contains(&a.as_str()))
+    };
+    adapter_ok
+        && crate::alert_route::seat_is_agent_backed(surface)
+        && surface.agent_seen.load(Ordering::Relaxed)
+}
+
+/// ★(0.14.42 · 설계 C D5′) 킬 스위치 — env `CYS_DIRECT_PASTE_FENCE` 가 0/false/off 이거나, 데몬 상태 디렉터리
+/// (`state::state_dir(socket)` — 레인 격리 · `~/.cys` 하드코딩 아님)에 `direct-paste-fence-off` 가 있으면 끈다.
+/// 파일 판정: 있음 → 끔 · 없음(NotFound) → 켬 · 그 밖의 오류 → 끔. 실패 방향은 v0.14.41 바이트다.
+/// 재기동 없이 즉시 적용되고, 판정 순서상 울타리 후보 본문을 claude 좌석에 보낼 때만 stat 한다.
+fn direct_fence_disabled(daemon: &Daemon) -> bool {
+    if let Ok(v) = std::env::var("CYS_DIRECT_PASTE_FENCE") {
+        if matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off") {
+            return true;
+        }
+    }
+    let path = crate::state::state_dir(&daemon.socket_path).join("direct-paste-fence-off");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// ★(0.14.42 · 설계 C D5′) 직접 경로가 PTY 에 쓰는 바이트 — `Raw` 는 원문, `Fenced` 는 lib 봉투(`wrap(머리)`) +
+/// 꼬리. 판정이 평문만 통과시키므로 살균은 항등이다(방어적으로 lib 봉투를 쓴다). 계수(`apply_pending_input`)도
+/// 이 바이트로 한다 — 봉투 안 LF 는 제출이 아니므로 계수가 본문 전량이 된다(큐 연접 방지 쪽으로 보수적).
+fn direct_fence_bytes(text: &str, fence: DirectFence) -> std::borrow::Cow<'_, [u8]> {
+    match fence {
+        DirectFence::Raw => std::borrow::Cow::Borrowed(text.as_bytes()),
+        DirectFence::Fenced => {
+            let (head, tail) = split_submit_tail(text);
+            let mut v = cys::paste_fence::wrap(head).into_bytes();
+            v.extend_from_slice(tail.as_bytes());
+            std::borrow::Cow::Owned(v)
+        }
+    }
+}
+
 /// ★B2′ `surface.send_text` 의 쓰기 변형 선택(순수) — 세 갈래를 한 곳에 모아 테스트 가능하게.
 ///
 ///   · clear_first  → `Inject`(Ctrl-U 선정리 → paste → CR, 원자)
@@ -2592,6 +2730,7 @@ fn send_text_write_req(
     text: &str,
     clear_first: bool,
     human_verified: bool,
+    fence: DirectFence,
 ) -> crate::state::WriteReq {
     if clear_first {
         crate::state::WriteReq::Inject {
@@ -2603,7 +2742,9 @@ fn send_text_write_req(
     } else if human_verified {
         crate::state::WriteReq::Data(text.as_bytes().to_vec())
     } else {
-        crate::state::WriteReq::Program(text.as_bytes().to_vec())
+        // ★(0.14.42 · 설계 C D5′) Fenced 도 Program(최소 간격 기준점)이다 — 뒤따르는 send-key Return 은 종전처럼
+        //   SubmitAfterGap 150ms(S49: 울타리 + 분리 CR 은 모든 τ 에서 제출). Raw 는 종전 바이트.
+        crate::state::WriteReq::Program(direct_fence_bytes(text, fence).into_owned())
     }
 }
 
@@ -4817,7 +4958,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // text 유실)이 구조적으로 불가능하다.
             // ★B2′: 비-clear_first 본문은 human_verified 여부로 Data/Program 이 갈린다 —
             //   Program 만 writer 의 최소 간격 기준점을 찍는다(send_text_write_req doc 참조).
-            let write_req = send_text_write_req(&text, clear_first, human_verified);
+            // ★(0.14.42 · 설계 C D5′ + S34 CRLF) 직접 경로 울타리 — 원장 선기록 뒤·input_gate 밖에서 판정한다
+            //   (agent_meta 는 leaf 로 잠깐 · 파서 락 0 — 2004 는 reader 미러 원자 · 킬 스위치 stat 은 후보일 때만).
+            //   gate_kind·draft_gate·타이핑 가드·원장·input_injected 는 원문 기준 그대로다(더 보수적).
+            let fence = direct_fence_mode(
+                &text,
+                DirectFenceFlags { human, authoritative, clear_first, platform_ok: cfg!(unix) },
+                || direct_fence_seat_ok(&surface),
+                || direct_fence_disabled(daemon),
+                || surface.bracketed_paste.load(Ordering::Relaxed),
+            );
+            let write_req = send_text_write_req(&text, clear_first, human_verified, fence);
             // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
@@ -4874,7 +5025,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     } else {
                         crate::governance::InputOrigin::Machine
                     };
-                    let next = surface.apply_pending_input(text.as_bytes(), origin);
+                    // ★(설계 C D5′) 계수는 실제로 쓴 바이트로(봉투 안 LF 는 제출 아님 · Raw 는 원문 그대로).
+                    let next = surface.apply_pending_input(&direct_fence_bytes(&text, fence), origin);
                     // ★(0.14.42 · A2 D0) 기계 본문의 소유자 각인 — 검증 발신자 · 결과 count>0 일 때만.
                     //   pending_input leaf 만 잡는다(게이트 안 락 계약 그대로). 이후 변이는 세대를 올려
                     //   각인을 자동 무효화한다(Surface::pending_owner).
@@ -13511,13 +13663,296 @@ mod tests {
             .unwrap_or_else(|| panic!("send 원장 레코드 부재: {led}"));
         assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
         // 순수 사상: clear_first 는 살균된 본문을 Inject 로(표지 없는 /clear 는 바이트 동일).
-        match send_text_write_req(&clean, true, false) {
+        match send_text_write_req(&clean, true, false, DirectFence::Raw) {
             crate::state::WriteReq::Inject { text, clear_first, .. } => {
                 assert!(clear_first);
                 assert_eq!(text, clean);
             }
             _ => panic!("clear_first 는 Inject"),
         }
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ + S34 CRLF · T5) `direct_fence_mode` 결정표 — 단락 순서(클로저 호출 수)까지 고정.
+    /// 설계 C 원안과 다른 한 줄: **안쪽 CR**(중간 `\r`·`\r\n`)은 원안의 Raw 가 아니라 Fenced 다(S34 CRLF 결함 수리 —
+    /// 크기 문턱과 무관). 끝 CR(자동 제출)만 있는 본문은 원안대로 Raw.
+    #[test]
+    fn c_direct_fence_mode_decision_table() {
+        use std::cell::Cell;
+        let base = DirectFenceFlags { human: false, authoritative: false, clear_first: false, platform_ok: true };
+        let calls = Cell::new([0u32; 3]);
+        let bump = |i: usize| {
+            let mut c = calls.get();
+            c[i] += 1;
+            calls.set(c);
+        };
+        let mode = |t: &str, f: DirectFenceFlags, seat: bool, dis: bool, bp: bool| {
+            direct_fence_mode(t, f, || { bump(0); seat }, || { bump(1); dis }, || { bump(2); bp })
+        };
+        let m = |t: &str| mode(t, base, true, false, true);
+        use DirectFence::*;
+        let a = |n: usize| "a".repeat(n);
+        assert_eq!(m(&a(999)), Raw, "999B 문턱 아래");
+        assert_eq!(m(&a(1000)), Fenced, "1000B 경계");
+        assert_eq!(m(&"가".repeat(333)), Raw, "한글 333자 = 999B");
+        assert_eq!(m(&"가".repeat(334)), Fenced, "한글 334자 = 1002B");
+        let ml: String = (0..1200).map(|i| if i % 50 == 49 { '\n' } else { 'b' }).collect();
+        assert_eq!(m(&ml), Fenced, "1200B 여러 줄");
+        assert_eq!(m(&format!("{}\t{}", a(600), a(600))), Fenced, "탭 허용");
+        assert_eq!(m(&format!("{}\r", a(1200))), Raw, "끝 CR(자동 제출)만 — 원안대로 Raw");
+        assert_eq!(m(&format!("{}\r\n", a(1200))), Raw, "끝 CRLF 꼬리만 — Raw");
+        // ★S34 CRLF: 안쪽 CR 은 크기와 무관하게 Fenced.
+        assert_eq!(m("~C1~\r\n~C2~\r\n~C3~"), Fenced, "S34 CRLF 본문");
+        assert_eq!(m("a\rb"), Fenced, "안쪽 홑 CR");
+        assert_eq!(m("a\r\nb\r"), Fenced, "안쪽 CRLF + 끝 CR");
+        assert_eq!(m(&format!("{}\r{}", a(600), a(600))), Fenced, "큰 본문 안쪽 CR");
+        assert_eq!(m("text\r"), Raw, "짧은 자동 제출");
+        assert_eq!(m("text\n"), Raw, "짧은 끝 LF");
+        assert_eq!(m("짧은 본문"), Raw);
+        for bad in ["\x1b", "\u{0}", "\u{3}", "\u{15}", "\u{7f}", "\u{9b}"] {
+            assert_eq!(m(&format!("{}{bad}{}", a(600), a(600))), Raw, "제어 글자 {bad:?} → Raw");
+            assert_eq!(m(&format!("x\r\ny{bad}")), Raw, "안쪽 CR 이어도 제어 글자 {bad:?} → Raw");
+        }
+        assert_eq!(m(&format!("!{}", a(1200))), Raw, "bash 모드 접두");
+        assert_eq!(m(&format!("  !{}", a(1200))), Raw);
+        assert_eq!(m("!ls\r\npwd"), Raw, "안쪽 CR 이어도 ! 접두 → Raw");
+        for img in [".png", ".JPG", "shot.jpeg\"", ".webp  "] {
+            assert_eq!(m(&format!("{}{img}", a(1200))), Raw, "이미지 끝 {img:?}");
+        }
+        for ok in [".pngx", ".md"] {
+            assert_eq!(m(&format!("{}{ok}", a(1200))), Fenced, "{ok:?}");
+        }
+        // 단락 순서: 싼 플래그 실패 → 클로저 호출 0.
+        calls.set([0; 3]);
+        for f in [
+            DirectFenceFlags { human: true, ..base },
+            DirectFenceFlags { authoritative: true, ..base },
+            DirectFenceFlags { clear_first: true, ..base },
+            DirectFenceFlags { platform_ok: false, ..base },
+        ] {
+            assert_eq!(mode(&a(1200), f, true, false, true), Raw);
+        }
+        assert_eq!(mode(&a(10), base, true, false, true), Raw, "문턱 미달 · 안쪽 CR 없음");
+        assert_eq!(calls.get(), [0, 0, 0], "싼 조건 실패 시 클로저 호출 0");
+        assert_eq!(mode(&a(1200), base, false, false, true), Raw);
+        assert_eq!(calls.get(), [1, 0, 0], "좌석 실패 → disabled·bp 호출 0");
+        calls.set([0; 3]);
+        assert_eq!(mode(&a(1200), base, true, true, true), Raw);
+        assert_eq!(calls.get(), [1, 1, 0], "킬 스위치 → bp 호출 0");
+        calls.set([0; 3]);
+        assert_eq!(mode(&a(1200), base, true, false, false), Raw, "2004 꺼짐");
+        assert_eq!(calls.get(), [1, 1, 1]);
+        // 꼬리 분리.
+        assert_eq!(split_submit_tail("a\r\nb\r"), ("a\r\nb", "\r"));
+        assert_eq!(split_submit_tail("a\r\nb\n"), ("a\r\nb\n", ""), "CR 없는 끝 LF 는 본문");
+        assert_eq!(split_submit_tail("a\r\n"), ("a", "\r\n"));
+        assert_eq!(split_submit_tail(""), ("", ""));
+    }
+
+    /// ★(설계 C D5′ · T6) 쓰기 사상 — Raw → Program(원바이트) · Fenced → Program(봉투 + 꼬리) · clear_first → Inject ·
+    /// human_verified → Data(fence 무관). 직접 경로에서 Inject 는 clear_first 뿐이고 SubmitAfterGap 은 없다.
+    #[test]
+    fn c_send_text_write_req_fence_mapping() {
+        use crate::state::WriteReq;
+        let bytes = |r: WriteReq| match r {
+            WriteReq::Program(b) => ("program", b),
+            WriteReq::Data(b) => ("data", b),
+            WriteReq::Inject { text, .. } => ("inject", text.into_bytes()),
+            _ => ("other", Vec::new()),
+        };
+        assert_eq!(bytes(send_text_write_req("x\r\ny", false, false, DirectFence::Raw)), ("program", b"x\r\ny".to_vec()));
+        assert_eq!(
+            bytes(send_text_write_req("x\r\ny", false, false, DirectFence::Fenced)),
+            ("program", b"\x1b[200~x\r\ny\x1b[201~".to_vec())
+        );
+        assert_eq!(
+            bytes(send_text_write_req("x\r\ny\r", false, false, DirectFence::Fenced)),
+            ("program", b"\x1b[200~x\r\ny\x1b[201~\r".to_vec()),
+            "끝 CR 꼬리는 봉투 밖"
+        );
+        assert_eq!(bytes(send_text_write_req("h", false, true, DirectFence::Fenced)), ("data", b"h".to_vec()));
+        assert_eq!(bytes(send_text_write_req("/clear", true, false, DirectFence::Fenced)).0, "inject");
+    }
+
+    /// ★(설계 C D5′ · T7) 계수 정합 — `direct_fence_bytes` 로 `pending_input_step` 을 구동한다. Fenced 는 봉투 안 LF 를
+    /// 제출로 치지 않아 전량 계수(끝 LF 본문의 종전 과소계수 0 도 고친다) · Raw 는 마지막 LF 뒤 바이트 수.
+    #[test]
+    fn c_direct_fence_pending_accounting() {
+        use crate::governance::{pending_input_step, InputOrigin, PendingInputState};
+        let run = |b: &[u8]| {
+            pending_input_step(&PendingInputState::default(), b, InputOrigin::Machine, std::time::Instant::now()).count
+        };
+        let body: String = (0..1200).map(|i| if i % 100 == 99 { '\n' } else { 'c' }).collect();
+        assert_eq!(run(&direct_fence_bytes(&body, DirectFence::Fenced)), 1200, "봉투 안 LF 무리셋 — 전량");
+        assert_eq!(run(&direct_fence_bytes(&body, DirectFence::Raw)), 0, "Raw: 끝 LF 로 종전 계수 0(과소계수)");
+        let body2 = "a\nbbb";
+        assert_eq!(run(&direct_fence_bytes(body2, DirectFence::Raw)), 3, "Raw: 마지막 LF 뒤");
+        assert_eq!(run(&direct_fence_bytes("x\r\ny\r", DirectFence::Fenced)), 0, "끝 CR 꼬리 = 제출");
+        assert!(run(&direct_fence_bytes("x\r\ny", DirectFence::Fenced)) > 0, "안쪽 CR 은 봉투 안 — 미제출");
+    }
+
+    /// ★(설계 C D5′ · T8) 좌석 술어 — 실제 Surface. claude + agent_seen 만 참. 가드 재진입 데드락이 있으면 멈춘다.
+    #[test]
+    fn c_direct_fence_seat_ok_truth_table() {
+        let dir = std::env::temp_dir().join(format!("cys-c-seat-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("surface");
+        let set = |agent: Option<&str>, seen: bool, notified: bool, seat: u8| {
+            *s.agent_meta.lock().unwrap() = agent.map(|a| (a.to_string(), a.to_string()));
+            s.agent_seen.store(seen, Ordering::Relaxed);
+            s.agent_exit_notified.store(notified, Ordering::Relaxed);
+            s.seat_cache.store(seat, Ordering::Relaxed);
+        };
+        set(Some("claude"), true, false, 1);
+        assert!(direct_fence_seat_ok(&s), "claude + 생존 관측");
+        for (agent, seen, notified, seat, why) in [
+            (Some("codex"), true, false, 1u8, "codex"),
+            (Some("gemini"), true, false, 1, "gemini"),
+            (Some("grok"), true, false, 1, "grok"),
+            (None, true, false, 1, "meta 없음(셸)"),
+            (Some("claude"), false, false, 1, "생존 미관측"),
+            (Some("claude"), true, true, 1, "종료 통지"),
+            (Some("claude"), true, false, 2, "SEAT=Empty"),
+        ] {
+            set(agent, seen, notified, seat);
+            assert!(!direct_fence_seat_ok(&s), "{why}");
+        }
+        set(Some("claude"), true, false, 1);
+        s.exited.store(true, Ordering::Relaxed);
+        assert!(!direct_fence_seat_ok(&s), "exited");
+        let _ = s.child.lock().unwrap().kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.42 · 설계 C D5′ + S34 CRLF · T10) 직접 경로 울타리 — **실 PTY 행동** 검체(수정 전 적색).
+    /// 좌석 = 2004 를 켜고 raw 모드 `cat` 이 받은 바이트를 파일로 떨군다(claude 어댑터 · 에이전트 생존 관측).
+    ///   ⓐ 평문 1200B → 정확히 봉투(OPEN+본문+CLOSE) · 계수 = 봉투 안 본문 전량(LF 무리셋)
+    ///   ⓑ 60B → 원문(문턱) · ⓒ S34 CRLF 본문(짧아도) → 봉투(제출 1회 — 종전 CR 마다 제출 3개)
+    ///   ⓓ 안쪽 CRLF + 끝 CR(자동 제출) → OPEN 머리 CLOSE + 끝 CR · ⓔ 짧은 `본문\r` → 원문(종전 자동 제출)
+    ///   ⓕ 1200B + 끝 CR → 원문 · ⓖ human → 원문 · ⓗ `!` 접두 → 원문 · ⓘ codex 어댑터 → 원문
+    ///   ⓙ 킬 스위치 파일 → 원문 · ⓚ 뒤따르는 send_key Return → 봉투 뒤 CR 1개
+    #[test]
+    fn c_direct_fence_dispatch_behavior() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c-direct-fence", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_720;
+        let _sender = v7_pane(&daemon, "master", pid);
+        let out = dir.join("rx.bin");
+        let cmd = format!("printf '\\033[?2004h'; stty raw -echo; exec cat > '{}'", out.display());
+        let t = daemon
+            .create_surface(None, Some(cmd), None, Some("worker-1".into()), 24, 200)
+            .expect("surface");
+        daemon.surfaces.lock().unwrap().insert(t.id, t.clone());
+        *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        t.agent_seen.store(true, Ordering::Relaxed);
+        let wait = |secs: f64, f: &dyn Fn() -> bool| {
+            let dl = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+            while std::time::Instant::now() < dl {
+                if f() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            f()
+        };
+        assert!(wait(5.0, &|| out.exists() && t.parser.lock().unwrap().screen().bracketed_paste()), "좌석 준비(2004h)");
+        std::thread::sleep(std::time::Duration::from_millis(300)); // reader 가 모드를 반영할 여유
+        let flen = || std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let send = |text: &str, extra: Value| -> (Value, Vec<u8>) {
+            t.clear_pending_input();
+            *t.last_human_input.lock().unwrap() = None;
+            let off = flen();
+            let mut p = json!({"surface_id": t.id, "text": text, "queued": false, "quiet": true});
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            let resp = d12_rpc(&daemon, pid, "surface.send_text", p);
+            // 쓰기가 멈출 때까지(최대 3 s) 기다린다.
+            let mut last = off;
+            let mut stable = 0;
+            let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < dl {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let now = flen();
+                if now > off && now == last {
+                    stable += 1;
+                    if stable >= 5 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
+                last = now;
+            }
+            let all = std::fs::read(&out).unwrap_or_default();
+            (resp, all[off as usize..].to_vec())
+        };
+        let fence = |s: &str| format!("\x1b[200~{s}\x1b[201~").into_bytes();
+        let short = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b);
+            let n = t.chars().count();
+            let head: String = t.chars().take(40).collect();
+            let tail: String = t.chars().skip(n.saturating_sub(20)).collect();
+            format!("{n}자 {head:?}…{tail:?}")
+        };
+        macro_rules! eqb {
+            ($got:expr, $want:expr, $msg:expr) => {{
+                let (g, w): (Vec<u8>, Vec<u8>) = ($got.to_vec(), $want.to_vec());
+                assert!(g == w, "{}: got {} / want {}", $msg, short(&g), short(&w));
+            }};
+        }
+        let big: String = (0..1200).map(|i| if i % 100 == 99 { '\n' } else { 'a' }).collect();
+        // ⓐ
+        let (r, got) = send(&big, json!({}));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        eqb!(got, fence(&big), "1200B 평문은 봉투");
+        assert_eq!(t.pending_input_bytes.load(Ordering::Relaxed), 1200, "봉투 안 LF 는 제출이 아니다 — 전량 계수");
+        // ⓑ
+        let (_, got) = send("짧은 본문 60바이트 이하", json!({}));
+        eqb!(got, "짧은 본문 60바이트 이하".as_bytes(), "문턱 아래는 원문");
+        // ⓒ S34 CRLF
+        let crlf = "M|r|H|B|0|1|0|~C1.1~\r\n~C2.1~\r\n~C3.1~";
+        let (_, got) = send(crlf, json!({}));
+        eqb!(got, fence(crlf), "안쪽 CR 본문은 봉투(제출 1회)");
+        // ⓓ 안쪽 CRLF + 끝 CR
+        let (_, got) = send("a\r\nb\r", json!({}));
+        eqb!(got, b"\x1b[200~a\r\nb\x1b[201~\r", "머리만 봉투 · 끝 CR 은 자동 제출");
+        assert_eq!(t.pending_input_bytes.load(Ordering::Relaxed), 0, "끝 CR 로 제출 — 계수 0");
+        // ⓔ 짧은 자동 제출
+        let (_, got) = send("text\r", json!({}));
+        eqb!(got, b"text\r", "짧은 자동 제출");
+        // ⓕ 1200B + 끝 CR
+        let big_cr = format!("{big}\r");
+        let (_, got) = send(&big_cr, json!({}));
+        eqb!(got, big_cr.as_bytes(), "본문+CR 은 종전 그대로");
+        // ⓖ human
+        let (_, got) = send(&big, json!({"human": true}));
+        eqb!(got, big.as_bytes(), "사람 경로는 원문");
+        // ⓗ '!' 접두
+        let bang = format!("!{}", &big[1..]);
+        let (_, got) = send(&bang, json!({}));
+        eqb!(got, bang.as_bytes(), "bash 모드 접두는 원문");
+        // ⓘ codex 어댑터
+        *t.agent_meta.lock().unwrap() = Some(("codex".into(), "codex".into()));
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, big.as_bytes(), "claude 외 어댑터는 원문");
+        *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        // ⓙ 킬 스위치 파일(데몬 상태 디렉터리 — 이 검체의 임시 디렉터리)
+        let off_file = crate::state::state_dir(&daemon.socket_path).join("direct-paste-fence-off");
+        std::fs::write(&off_file, b"").unwrap();
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, big.as_bytes(), "킬 스위치 파일이면 원문");
+        std::fs::remove_file(&off_file).unwrap();
+        // ⓚ 봉투 뒤 send_key Return
+        let (_, got) = send(&big, json!({}));
+        eqb!(got, fence(&big), "봉투(Return 전)");
+        let off = flen();
+        let k = d12_rpc(&daemon, pid, "surface.send_key", json!({"surface_id": t.id, "key": "Return"}));
+        assert_eq!(k["ok"], json!(true), "{k}");
+        assert!(wait(3.0, &|| flen() > off), "Return 도달");
+        let all = std::fs::read(&out).unwrap_or_default();
+        assert_eq!(&all[off as usize..], b"\r", "봉투 뒤 CR 1개");
+        d12_cleanup(&daemon, &dir);
     }
 
     #[test]
@@ -14603,7 +15038,7 @@ mod tests {
         use crate::state::WriteReq;
 
         // ① 사람이 친 키(operator token 검증 통과) → Data. 기준점을 찍지 않는다.
-        match send_text_write_req("hello", false, true) {
+        match send_text_write_req("hello", false, true, DirectFence::Raw) {
             WriteReq::Data(b) => assert_eq!(b, b"hello".to_vec(), "사람 경로 바이트가 변형됐다"),
             other => panic!(
                 "human_verified 인데 Data 가 아니다 — 사람 타이핑 뒤 Enter 까지 늦어진다 ({})",
@@ -14611,7 +15046,7 @@ mod tests {
             ),
         }
         // ② 프로그램 주입 → Program. 바이트는 ① 과 동일해야 한다(변형 금지).
-        match send_text_write_req("hello", false, false) {
+        match send_text_write_req("hello", false, false, DirectFence::Raw) {
             WriteReq::Program(b) => assert_eq!(b, b"hello".to_vec(), "프로그램 경로 바이트가 변형됐다"),
             other => panic!(
                 "프로그램 주입인데 Program 이 아니다 — 최소 간격 기준점이 안 찍힌다 ({})",
@@ -14620,7 +15055,7 @@ mod tests {
         }
         // ③ clear_first 는 human 여부와 무관하게 원자 Inject(종전 동작 불변 · cr_delay 400).
         for human_verified in [false, true] {
-            match send_text_write_req("hi", true, human_verified) {
+            match send_text_write_req("hi", true, human_verified, DirectFence::Fenced) {
                 WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
                     assert_eq!(text, "hi");
                     assert_eq!(cr_delay_ms, 400, "큐/원자 주입의 CR 지연 규약이 바뀌었다");
@@ -14632,7 +15067,7 @@ mod tests {
         // ④ send_text 는 어떤 조합에서도 SubmitAfterGap 을 만들지 않는다(제출 키 전용 변형).
         for (cf, hv) in [(false, false), (false, true), (true, false), (true, true)] {
             assert!(
-                !matches!(send_text_write_req("x", cf, hv), WriteReq::SubmitAfterGap { .. }),
+                !matches!(send_text_write_req("x", cf, hv, DirectFence::Raw), WriteReq::SubmitAfterGap { .. }),
                 "send_text 가 SubmitAfterGap 을 만들었다(clear_first={cf}, human_verified={hv}) — \
                  본문에 제출 간격이 붙으면 본문 자체가 늦게 들어간다"
             );
