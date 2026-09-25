@@ -583,6 +583,26 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
   나갑니다(0.14.42 · 종전의 `[큐 다이제스트 N건 …]` 빈 문안 제출 제거). 빈 구분 항목이 줄면서
   **본문끼리 한 다이제스트로 묶이는 일이 전보다 잦아집니다**(수신자는 `[큐 다이제스트 …]` 단위를
   더 자주 받습니다). 병합 전체를 끄려면 `CYS_QUEUE_DIGEST_MAX_ITEMS=1`.
+- **데몬이 스스로 넣는 글의 안전 판정(0.14.42 · H)**: 스케줄 push(하트비트·wakeup)·채널 inbox(오너 원격 지시)·
+  CEO 자동결재 요청·부트 감독자 무스폰 통보·좌석 승계 고지는 큐를 거치지 않고 좌석에 바로 씁니다. 이제 쓰기
+  직전에 **지금 화면에서 확실히 보이는 것만** 봅니다 — 질문·권한 창(모달), 입력줄에 남은 초안, 사람이 방금(30초
+  안) 친 흔적, 사이클 창(`/clear`~RESUME · quiescing), kill-switch(pause). 이런 좌석에는 본문과 Enter 를 쓰지
+  않습니다. 대신 경로마다 정해진 처분을 합니다.
+  - 스케줄: 그 좌석 큐로 돌립니다(`schedule list` 의 `result=queued` · 결과 문자열 `queued(gate:draft)` 등). 창이 닫히거나
+    초안이 비면 큐가 배달합니다. 틱과 push 사이에 pause 가 켜지면 `delivery_frozen` 오류로 끝납니다.
+  - 채널: 메시지를 inbox 에 그대로 두고 15초마다 다시 시도합니다(순서 보존). 오래 막히면 10분마다
+    `channel.message.stalled` 이벤트가 납니다.
+  - CEO 자동결재: 즉시 사람에게 넘깁니다(`approval.stalled` · Feed 가 열립니다).
+  - 부트 감독자 통보·좌석 승계 고지: 그 pane 한 줄만 생략합니다(Feed·이벤트는 그대로 남습니다).
+  - **관측이 안 되는 화면**(프롬프트가 안 보이는 깨진 화면, 어댑터 표지가 없는 셸 등)은 막지 않고 종전대로 씁니다.
+    화면이 깨져도 하트비트·wakeup 이 끊기지 않게 하려는 것입니다. **작업 중(busy)** 인 좌석에도 종전대로 씁니다
+    (실행 중 조향 · 알려진 잔여).
+  - 끄기: `CYS_MACHINE_INJECT_HOLD=0`(데몬 env · 다섯 경로 모두 종전 동작) · 경로별은 목록으로
+    (`schedule,channel,ceo,supervisor,takeover` 중 켤 것만). 축별은 `CYS_MACHINE_INJECT_HOLD_AXES`. §16 참조.
+- **사이클 창의 큐 보류(0.14.42 · H1)**: 좌석이 quiescing(`/clear`~RESUME) 동안에는 `--queued` 항목을 틱이 배달하지
+  않습니다(최대 600초 · `CYS_QUEUE_QUIESCE_HOLD_SECS`). 사이클이 RESUME 을 넣고 표시를 풀면 곧바로 나갑니다.
+  600초를 넘긴 표시는 해제 누락으로 보고 무시하며 `queue.quiesce_stale` 을 한 번 냅니다. `cys queue deliver`
+  (운영자 강제 배달)와 직접 `send` 는 이 보류를 받지 않습니다.
 
 ### 5.4 관제·이벤트
 
@@ -758,6 +778,11 @@ cys schedule list / remove <id> / run <id>
   기록)이지 성공 여부가 아닙니다 — 두 칸을 함께 봐야 "제때 돌았는데 매번 실패"를 구분합니다. 결과
   기록은 데몬 메모리에만 있어 데몬을 다시 켜면 비고(`result=-`), 구버전 데몬이면 `result=?`(판정
   불가)로 보입니다.
+- **직접 push 의 화면 판정(0.14.42 · H2)**: 큐를 쓰지 않는 push 잡(하트비트·wakeup 등)은 대상 좌석에 질문 창·초안·
+  사람 입력(30초)·사이클 창이 **보이면** 그 좌석 큐로 돌리고(`result=queued`), 창이 닫히면 큐가 배달합니다.
+  돌린 항목은 큐의 절반(50칸)까지만 쓰고(나머지 50칸은 `send --queued` 몫 — 넘치면 `result=error` · `queue_full`),
+  주기 잡은 **주기만큼만** 기다립니다(그다음 회차가 새 문안으로 다시 들어가고 지난 것은 만료 큐로 갑니다). 화면을
+  판정할 수 없는 좌석과 작업 중 좌석에는 종전대로 바로 씁니다.
 
 ---
 
@@ -1014,6 +1039,19 @@ cys channel --json <액션>   # start·stop·register·inbound·outbound·receip
 (`allow-remote-approve`) · 즉시 잠금(`lockdown`) · 발신 내용의 모양 기반 redact(토큰·홈
 경로 차단) · 중복/루프 억제 내장.
 
+**master 로 들어오는 인바운드(0.14.42 · H3)**:
+- master 좌석에 질문 창·초안·사람 입력(30초)이 보이거나 셸만 남아 있으면 메시지를 inbox 에 두고(`channel.message.queued`
+  의 `hold_reason`) 15초 뒤 다시 시도합니다. 순서는 그대로 지켜집니다. 오래 막히면 10분마다 `channel.message.stalled`
+  {inbox_id, age_secs, reason} 이 납니다. 원격에서 master 의 초안을 치울 수단은 없습니다 — 좌석에서 비워야 풀립니다.
+- master 가 작업 중(busy)이면 종전대로 즉시 들어갑니다(원격 조향).
+- **재배달은 기본 꺼짐**입니다 — 메시지 1건은 1번만 주입됩니다. 종전에는 ack 가 없으면 10분마다 끝없이 다시
+  넣었습니다. 필요하면 `CYS_CHANNEL_REDELIVER_MAX=N`(최대 N회) · `CYS_CHANNEL_REDELIVER_MAX_AGE_SECS`(기본 3600 —
+  접수 1시간이 지난 것은 재배달하지 않음)로 켭니다.
+- 10분 이상 늦게 들어가는 메시지에는 봉투 뒤에 `(지연 N분 · 접수 MM-DD HH:MM)` 가 붙습니다(어제 지시가 방금 온 것처럼
+  읽히지 않게). 10분 미만은 종전 봉투 그대로입니다.
+- inbox 상태를 디스크에 적지 못하면 주입하지 않습니다(`channel.inbox.write_failed` · 5분에 1번). 종전에는 이 경우 15초마다
+  같은 메시지를 다시 넣었습니다.
+
 ---
 
 ## 14. 기록·증거 (recall / attest)
@@ -1072,6 +1110,11 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
 | `CYS_RETURN_ABSORB_SECS` | 30 (0=off) | 짝 Return 흡수 창(0.14.42 · §5.3) — `send` 가 큐로 자동 전환된 뒤 같은 발신자의 첫 단일 `send-key Return` 1회를 쓰지 않고 흡수하는 시간. `0` 은 발급·흡수·보상 전부 끔(종전 동작). 흡수·만료는 `queue.return_absorbed`·`queue.return_absorb_expired` 이벤트의 `ticket_age_ms` 로 관측 |
 | `CYS_RETURN_ABSORB_REFLEX_MS` | 2000 | 승인이 살아 있는 좌석의 흡수 반사 창(0.14.42 · A2-F1 · §5.3) — 대상에 질문·권한 창(모달)이 전경이거나 승인 feed 가 대기 중이면, 표 나이가 이 값 **이상**인 Return 은 흡수하지 않고 쓴다(창을 누른다 · 워커 hang 방지). `0` = 승인이 살아 있으면 흡수 안 함. **첫기동 관문 창은 예외** — 이 노브와 무관하게 `CYS_RETURN_ABSORB_SECS` 안 첫 Return 을 흡수한다(맨 Return 이 `No, exit` 등을 누른다 · RF1). 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`(샌드박스 실측 같은 셸 체인 짝 Return: p50 551ms · 최대 777ms) |
+| `CYS_MACHINE_INJECT_HOLD` | 전부 | 데몬 내부 주입의 화면 판정(0.14.42 · H · §5.3) — 미설정·`1`·`all` = 다섯 경로 전부 · `0`·`off` = 전부 종전 동작 · 목록(`schedule,channel,ceo,supervisor,takeover`) = 그 경로만. 재기동하면 적용 |
+| `CYS_MACHINE_INJECT_HOLD_AXES` | unix 전 축 · Windows draft 제외 | 판정 축(`pause,quiescing,shell,human,modal,draft`) — 빼면 그 축을 안 본다. `all` = 전 축(Windows draft 포함 · 명시 선택). Windows 기본에서 초안 축을 끈 이유는 ConPTY 입력줄 판정이 가장 약해서다(실측 전까지) |
+| `CYS_QUEUE_QUIESCE_HOLD_SECS` | 600 (0=off) | 사이클 창(quiescing) 보류 상한(0.14.42 · H1) — 큐 틱 배달과 스케줄·CEO·감독자의 quiescing 축이 쓴다. 넘긴 표시는 무시하고 `queue.quiesce_stale` 1회. 채널의 quiescing 보류(종전 무기한)는 이 값과 무관 |
+| `CYS_CHANNEL_REDELIVER_MAX` | 0 | 채널 inbox 미-ack 재배달 횟수 상한(0.14.42 · H3 · §13). 0 = 재배달 없음(메시지 1건 = 주입 1회) |
+| `CYS_CHANNEL_REDELIVER_MAX_AGE_SECS` | 3600 | 재배달 대상의 접수 나이 상한 — 크게 두면 종전(무한 재배달)에 가까워진다 |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보. quiet 는 **1 미만 설정을 1로 승격**(0초 강제주입 봉인 — overdue 단계와 같은 하한). 이 노브는 **언제 배달할지**만 조정한다 — alt-screen 의 약한 레이아웃 증거가 요구하는 '출력 정적' 은 판정부 상수 3초(`readiness::BOOT_VALVE_QUIET_SECS`)이고 이 노브로 바뀌지 않는다 |
@@ -1215,6 +1258,19 @@ v0.14.22 가산분(전부 additive — 기존 소비자 무해):
 - 기존 이벤트 가산 필드: queue 계열에 `queue_entry_id`/`queue_entry_ids`·`seq`·`enqueued_at`,
   `queue.dropped`(exited 예외 경유 시) `cleared_by`/`via:"exited_reclaim"`,
   `feed.item.resolved`에 `resolver_surface`(해소자 각인 — cycle 영수증 검증이 소비)
+
+v0.14.42 가산분(설계 H · 전부 additive):
+- `machine_inject.probe_failed` {surface_id} — 데몬 내부 주입 직전 화면 관측이 실패(패닉)했다. 경로별 실패 방향으로
+  처리된다(채널 = 보류 · CEO = 사람에게 · 스케줄·감독자 = 종전 동작)
+- `queue.quiesce_stale` {surface_id, age_secs, hold_secs} — 600초를 넘긴 quiescing 표시를 무시하고 배달했다((좌석, 표시 시각)당 1회)
+- 큐 `blocked_by` 어휘에 `quiescing(사이클 진행 중 · /clear~RESUME 창)` 추가
+- `channel.message.queued` 에 `hold_reason`(modal·draft·human·shell·master_unavailable·write_failed·writer_busy)
+- `channel.message.stalled` {inbox_id, age_secs, reason, pending} — 오래 보류된 채널 지시(10분 경계마다 1건)
+- `channel.inbox.write_failed` {inbox_id, detail} — inbox 상태 기록 실패로 주입하지 않았다(5분 쿨다운)
+- `approval.stalled` 의 `reason` 에 `delivery_frozen`·`ceo_seat_cycling`·`ceo_seat_modal`·`ceo_seat_draft`·`ceo_probe_failed`
+- `boot_supervisor.pane_notice_skipped` {intent, reason, surface_id, why} — 무스폰 통보의 pane 줄 생략(Feed 는 나감)
+- `role.takeover` 에 `pane_notice`("sent"·"skipped_pending_input"·"skipped_surface_gone")
+- 스케줄 발화 결과 문자열: `queued(gate:quiescing|human|draft)` · `delivery_frozen: kill-switch paused between tick and push`
 
 ---
 

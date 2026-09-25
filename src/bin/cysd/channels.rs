@@ -398,6 +398,9 @@ fn sanitize_inbound_text(s: &str) -> String {
 }
 
 /// 봉투 문자열: `[CH:<channel>|<sender>|<HH:MM>|#<inbox_id>] <text>` (+재배달 표기).
+/// ★(0.14.42 · 설계 H3) 배달 경로는 [`envelope_at`] 을 쓴다 — 이 판(지연 표기 없음 = 종전 봉투)은 살균·봉투 계약
+/// 검체와 '600s 미만 byte-identical' 대조의 기준이다(`redeliver_due` 와 같은 계약 문서화 선례).
+#[allow(dead_code)]
 fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bool, text: &str) -> String {
     envelope_at(channel, sender, ts, inbox_id, redelivered, text, None)
 }

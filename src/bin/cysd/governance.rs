@@ -21493,6 +21493,43 @@ mod h_machine_hold_tests {
         let _ = t.child.lock().unwrap().kill();
     }
 
+    /// [H0 마이크로벤치 · 수동] 주입 직전 판정 1회의 비용(디버그 빌드) — 화면 관측 경로(유휴 claude 좌석 · 전 축)와
+    /// 싼 축 조기 반환(pause) 경로. 시간 단언은 두지 않는다(부하 요동) — `--ignored --nocapture` 로 수치만 본다.
+    #[test]
+    #[ignore]
+    fn h0_probe_cost_microbench() {
+        let d = h_daemon("h0-bench");
+        let s = claude_seat(&d);
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT);
+        let run = |n: usize| -> Vec<f64> {
+            (0..n)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let _ = machine_direct_hold(&d, &s, all_axes(30));
+                    t.elapsed().as_secs_f64() * 1e6
+                })
+                .collect()
+        };
+        let stat = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = v.len();
+            (v.iter().sum::<f64>() / n as f64, v[n / 2], v[(n * 95) / 100], v[n - 1])
+        };
+        let _ = run(20); // 예열
+        let (mean, p50, p95, max) = stat(run(500));
+        eprintln!("h0 bench 화면 관측 경로(전 축 · 유휴 좌석) n=500: mean {mean:.1}µs p50 {p50:.1}µs p95 {p95:.1}µs max {max:.1}µs");
+        d.paused.store(true, AO::Relaxed);
+        let (mean2, p502, p952, max2) = stat(run(500));
+        d.paused.store(false, AO::Relaxed);
+        eprintln!("h0 bench 싼 축 조기 반환(pause) n=500: mean {mean2:.1}µs p50 {p502:.1}µs p95 {p952:.1}µs max {max2:.1}µs");
+        let t = std::time::Instant::now();
+        for _ in 0..200 {
+            let _ = load_adapter_defs();
+        }
+        eprintln!("h0 bench load_adapter_defs n=200: mean {:.1}µs", t.elapsed().as_secs_f64() * 1e6 / 200.0);
+        let _ = s.child.lock().unwrap().kill();
+    }
+
     // ─── H7 소스 핀 ───────────────────────────────────────────────────────────
 
     /// `//` 줄주석 제거(판정 대상에서 설명문을 뺀다 · 문자열 리터럴 안의 `//` 는 이 파일들의 guard 줄에 없다).
