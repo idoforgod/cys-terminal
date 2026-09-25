@@ -3172,6 +3172,9 @@ fn auto_route_idem_window_secs() -> f64 {
 enum CeoDelivery {
     Delivered,
     SeatEmpty,
+    /// ★(0.14.42 · 설계 H4) 좌석은 있으나 하드축(모달·화면 초안·사이클·kill-switch)이 양성 관측됐다 — 사유를 싣고
+    /// 즉시 escalation 한다(큐 미사용: 요청자 대기 120s 라 큐 보류는 곧 조용한 만료다).
+    Held(&'static str),
 }
 
 /// W3.2 멱등 게이트: 이 항목의 의미 키가 최근 창 안에 이미 처리됐으면 false(중복 억제),
@@ -3205,6 +3208,7 @@ fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over
     match deliver_to_ceo(daemon, item, over_pressure) {
         CeoDelivery::Delivered => {}
         CeoDelivery::SeatEmpty => escalate_no_ceo(daemon, item, "ceo_seat_empty"),
+        CeoDelivery::Held(reason) => escalate_no_ceo(daemon, item, reason),
     }
 }
 
@@ -3243,6 +3247,25 @@ fn deliver_to_ceo(
             .unwrap_or(false)
     {
         return CeoDelivery::SeatEmpty;
+    }
+    // ★(0.14.42 · 설계 H4) 원장 선기록 **앞**에서 CEO 좌석의 하드축을 본다(공용 판정 H0). 축: kill-switch(ⓓ — 종전
+    //   이 경로는 pause 를 보지 않았다) · 사이클(quiescing) · 모달 · 화면 초안. 사람 입력 축은 넣지 않는다 — 위의
+    //   typing 가드(3s)가 종전대로 본다. busy 는 막지 않는다(요청자 대기 120s — 턴 경계까지 미루면 만료가 곧
+    //   escalation). 보류는 전부 **즉시 사람에게**(approval.stalled{reason} → UI openFeed · 사유로 분기하지 않는다).
+    //   판정 패닉(ProbeFailed)도 escalation 이다(실패 방향 = 사람). 노브에서 ceo 를 빼면 종전 동작.
+    if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Ceo) {
+        use crate::governance::{MachineHold as H, MachineHoldAxes};
+        let axes = MachineHoldAxes { pause: true, quiescing: true, modal: true, draft: true, ..MachineHoldAxes::NONE };
+        if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
+            return CeoDelivery::Held(match h {
+                H::Paused => "delivery_frozen",
+                H::Quiescing => "ceo_seat_cycling",
+                H::Modal => "ceo_seat_modal",
+                H::Draft => "ceo_seat_draft",
+                H::ProbeFailed => "ceo_probe_failed",
+                H::ShellOnly | H::HumanActive => "ceo_seat_busy_human",
+            });
+        }
     }
     // ★(0.14.42 · 설계 C D3) title·body 는 발행자가 통제한다(inert 데이터 칸) — 원장 선기록 앞에서 살균해
     //   원장과 주입 본문을 맞춘다(writer 백스톱과 같은 값).
@@ -20778,6 +20801,155 @@ mod tests {
             .unwrap_or_else(|| panic!("feed 원장 레코드 부재: {led}"));
         assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ═══════════ ★(0.14.42 · 설계 H4) CEO 자동결재: 하드축 → 즉시 escalation(큐 미사용) ═══════════
+
+    fn h4_rig(tag: &str, cmd: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-h4-{tag}-{}-{}-{n}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let ceo = daemon
+            .create_surface(None, Some(cmd.into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed); // Occupied
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+        (daemon, ceo)
+    }
+
+    fn h4_item(rid: &str, title: &str, body: &str) -> crate::state::FeedItem {
+        crate::state::FeedItem {
+            request_id: rid.into(),
+            kind: "permission".into(),
+            title: title.into(),
+            body: body.into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        }
+    }
+
+    fn h4_events(d: &Arc<Daemon>, name: &str) -> Vec<Value> {
+        d.bus.tail(300).into_iter().filter(|ev| ev["name"] == json!(name)).collect()
+    }
+
+    /// [H4] CEO 좌석에 모달·화면 초안·kill-switch(ⓓ)·사이클(quiescing)이 양성 관측되면 주입하지 않고 즉시 사람에게
+    /// 넘긴다(approval.stalled{reason}) — 요청자 대기가 120s 라 큐 보류는 곧 조용한 만료다. RED(HEAD): 주입.
+    #[test]
+    fn h4_ceo_hard_axes_escalate() {
+        let (d, ceo) = h4_rig("h4-axes", "stty -echo; exec sleep 30");
+        let cases: [(&str, &str); 4] = [
+            ("ceo_seat_modal", "modal"),
+            ("ceo_seat_draft", "draft"),
+            ("delivery_frozen", "pause"),
+            ("ceo_seat_cycling", "quiescing"),
+        ];
+        for (i, (reason, how)) in cases.iter().enumerate() {
+            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+            match *how {
+                "modal" => crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT),
+                "draft" => crate::governance::h_paint(&ceo, crate::governance::H_DRAFT_SCREEN),
+                "pause" => d.paused.store(true, Ordering::Relaxed),
+                _ => {
+                    *ceo.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+                        state: "quiescing".into(),
+                        context_pct: None,
+                        task: None,
+                        updated_at: crate::state::now_epoch(),
+                    })
+                }
+            }
+            let item = h4_item(&format!("h4-{i}"), &format!("RSI 학습 추천 h4 {i}"), "x");
+            route_auto_approval(&d, &item, false);
+            d.paused.store(false, Ordering::Relaxed);
+            *ceo.agent_status.lock().unwrap() = None;
+            let stalled: Vec<Value> = h4_events(&d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(item.request_id))
+                .collect();
+            assert_eq!(stalled.len(), 1, "{how}: escalation 이 없다(주입했다)");
+            assert_eq!(stalled[0]["payload"]["reason"], json!(reason), "{how}");
+        }
+        assert!(h4_events(&d, "feed.auto_routed").is_empty(), "하드축 좌석에 자동 라우팅했다");
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 0, "하드축 좌석에 주입(원장)했다");
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// [H4 핀] busy CEO 에는 종전대로 즉시 주입한다(턴 경계까지 미루면 120s 만료가 곧 escalation).
+    #[test]
+    fn h4_ceo_busy_injects() {
+        let (d, ceo) = h4_rig("h4-busy", "stty -echo; exec sleep 30");
+        crate::governance::h_paint(&ceo, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
+        let item = h4_item("h4-busy", "RSI 학습 추천 busy", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 1);
+        assert_eq!(h4_events(&d, "feed.auto_routed").len(), 1);
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// [H4 C 연동] 경계 변형 본문(`ESC[201~` + CR + EVIL)의 **writer 바이트** — 울타리 닫힘 1개 · 끝 CR 1개 ·
+    /// `EVIL` 은 울타리 안(설계 C D2·D3 가 살균 · H 는 그 위에 얹는다). 좌석은 raw 모드 `cat` 으로 PTY 입력을 기록한다.
+    #[cfg(unix)]
+    #[test]
+    fn h4_boundary_body_single_submit() {
+        let dir = std::env::temp_dir().join(format!("cys-h4-bnd-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let rec = dir.join("pty-in.bin");
+        let (d, ceo) = h4_rig("h4-bnd", &format!("stty raw -echo; exec cat > '{}'", rec.display()));
+        let item = h4_item("h4-bnd", "RSI 학습 추천 경계", "\x1b[201~\rEVIL");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        let t0 = std::time::Instant::now();
+        let bytes = loop {
+            let b = std::fs::read(&rec).unwrap_or_default();
+            if b.last() == Some(&b'\r') || t0.elapsed() > std::time::Duration::from_secs(5) {
+                break b;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let close = b"\x1b[201~";
+        let n_close = bytes.windows(close.len()).filter(|w| *w == close).count();
+        assert_eq!(n_close, 1, "울타리 닫힘이 1개가 아니다(조기 종료): {:?}", String::from_utf8_lossy(&bytes));
+        let close_at = bytes.windows(close.len()).position(|w| w == close).unwrap();
+        // 울타리 밖 CR(= 제출) 은 끝의 1개뿐이다(본문 안 CR 은 울타리 안 — 줄바꿈이지 제출이 아니다).
+        let outside = &bytes[close_at + close.len()..];
+        assert_eq!(outside, b"\r", "울타리 밖 바이트가 끝 CR 1개가 아니다: {:?}", String::from_utf8_lossy(outside));
+        assert!(bytes.starts_with(b"\x1b[200~"), "울타리 열림으로 시작하지 않는다");
+        let evil = bytes.windows(4).position(|w| w == b"EVIL").expect("EVIL 부재");
+        assert!(evil < close_at, "EVIL 이 울타리 밖이다");
+        let _ = ceo.child.lock().unwrap().kill();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [노브] `CYS_MACHINE_INJECT_HOLD` 에서 ceo 를 빼면 HEAD 동작(모달 CEO 에도 주입).
+    #[test]
+    fn h4_knob_off_is_head_identical() {
+        let (d, ceo) = h4_rig("h4-knob", "stty -echo; exec sleep 30");
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,supervisor,takeover")]);
+        crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let item = h4_item("h4-knob", "RSI 학습 추천 knob", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered), "노브로 끈 CEO 가 보류했다");
+        let _ = ceo.child.lock().unwrap().kill();
     }
 
     /// 정상(Delivered): CEO 좌석 점유(agent+seat=occupied) → auto-eligible 즉시 배달(feed.auto_routed)

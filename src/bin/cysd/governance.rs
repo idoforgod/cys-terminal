@@ -21170,14 +21170,15 @@ pub(crate) const H_IDLE_SCREEN: &str = "● 작업 로그 한 줄\n────�
 #[cfg(test)]
 pub(crate) const H_DRAFT_SCREEN: &str = "● 작업 로그 한 줄\n────────────────────\n❯ 오너가 쓰다 둔 초안";
 
-/// 검체 공용 — 원장(배달 선기록) 레코드 중 이 origin 의 수.
+/// 검체 공용 — 원장(배달 선기록) **전문** 레코드 중 이 origin 의 수 = 주입 시도 수. 여러 줄 본문의 제출 단위
+/// 조각 레코드(`part` 키 · R6)는 세지 않는다.
 #[cfg(test)]
 pub(crate) fn h_ledger_count(daemon: &Arc<Daemon>, origin: &str) -> usize {
     std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|r| r["origin"] == json!(origin))
+        .filter(|r| r["origin"] == json!(origin) && r.get("part").is_none())
         .count()
 }
 
@@ -21632,6 +21633,9 @@ mod h_machine_hold_tests {
             ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "SET state='injected'", "inject_master_confirmed("),
             ("channels", include_str!("channels.rs"), "redeliver_unacked", "master_hold(", "redelivered=redelivered+1"),
             ("channels", include_str!("channels.rs"), "redeliver_unacked", "redelivered=redelivered+1", "inject_master_confirmed("),
+            // H4 — CEO 자동결재: 하드축 판정이 원장 선기록·주입보다 앞.
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "record_audited("),
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Inject"),
         ];
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
