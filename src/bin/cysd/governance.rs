@@ -2634,6 +2634,15 @@ fn check_launch_flags(
 /// json! 조립하므로 '조립에 추가하지 않는 한' 배제가 기본값이다 — 아래 조립에 seat_token 을
 /// 추가하는 변경은 계약 위반(회귀 핀 `seat_token_never_persisted_or_listed` 가 적색으로 잡는다).
 pub fn persist_topology(daemon: &Arc<Daemon>) {
+    // ★R3-1c(0.14.42 · 현행 라이브 결함): 스냅샷→rev→원자 쓰기 전체를 직렬화한다. 동시 호출은 같은 임시 파일
+    //   (`.topology.json.tmp`)의 같은 inode 를 나눠 써, 이미 교체된 topology.json 을 제자리에서 덮거나 찢는다
+    //   (검체 r3_1c — 락 없는 8 스레드에서 읽기 7-20% 파싱 실패). 오늘도 일어난다: master·cso 좌석은 SessionStart
+    //   마다 claim-role → persist, 부트 폭풍은 N 좌석 동시 claim, watchdog·close·reinject 도 각자 persist 한다.
+    //   찢어지면 load_topology 가 격리 후 [] 로 폴백해 복원 대상·묘비가 사라진다. 순서 역전(옛 스냅샷이 나중에
+    //   rename 되어 새 상태를 덮음)도 같은 락이 닫는다. 락은 **데몬 소유 필드**(`Daemon::topology_write`).
+    //   호출자는 이 함수 안에서 잡는 락(surfaces·좌석 필드·묘비)을 쥔 채 부르지 않는다(쥐면 이미 자기 교착) —
+    //   맨 바깥 락 하나를 더해도 새 교착 순환이 생기지 않는다. poison 은 무시한다(쓰기 누락 대신 계속 쓴다).
+    let _topology_write = daemon.topology_write.lock().unwrap_or_else(|e| e.into_inner());
     let entries: Vec<serde_json::Value> = daemon
         .surfaces
         .lock()

@@ -16834,6 +16834,61 @@ mod tests {
         );
     }
 
+    /// ★R3-1c(0.14.42 · 현행 라이브 결함): 동시 `persist_topology` 는 같은 임시 파일(`.topology.json.tmp`)을 나눠
+    /// 써서 **찢어진 JSON** 을 원자 교체로 올릴 수 있다(짧은 스냅샷이 긴 스냅샷 위에 덮여 꼬리가 남는다). 찢어지면
+    /// `load_topology` 가 격리 후 빈 배열로 폴백해 복원 대상 전원·묘비가 사라진다. 동시 persist 는 오늘도 난다
+    /// (master·cso SessionStart 의 claim-role · 부트 폭풍의 동시 claim · watchdog·close·reinject).
+    /// 반복 수 8×50 — 락 없는 기준 코드에서 적색 검출이 남는 최소 규모(설계 실측 3/3 RED).
+    #[test]
+    fn r3_1c_concurrent_persist_never_tears_topology() {
+        let daemon = isolated_daemon();
+        let a = make_surface(&daemon, Some("worker-1"));
+        let _b = make_surface(&daemon, Some("worker-2"));
+        let sa = daemon.surfaces.lock().unwrap()[&a].clone();
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 스냅샷 길이를 흔든다 — 긴 스냅샷 위에 짧은 스냅샷이 겹쳐 쓰이면 꼬리가 남아 파싱이 깨진다.
+        let flipper = {
+            let (sa, stop) = (sa.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let long = "x".repeat(20_000);
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    *sa.title.lock().unwrap() = if i % 2 == 0 { long.clone() } else { "s".into() };
+                    i += 1;
+                }
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let d = daemon.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        crate::governance::persist_topology(&d);
+                    }
+                })
+            })
+            .collect();
+        let mut torn = 0usize;
+        let mut reads = 0usize;
+        while writers.iter().any(|w| !w.is_finished()) {
+            if let Ok(t) = std::fs::read_to_string(dir.join("topology.json")) {
+                reads += 1;
+                if serde_json::from_str::<Value>(&t).is_err() {
+                    torn += 1;
+                }
+            }
+        }
+        // 작성 스레드가 패닉해도 흔들개를 먼저 세운다(패닉 전파 전에 멈추지 않으면 계속 돈다).
+        let joined: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        assert!(joined.iter().all(|j| j.is_ok()), "persist_topology 작성 스레드가 패닉했다");
+        let fin = std::fs::read_to_string(dir.join("topology.json")).unwrap_or_default();
+        let fin_ok = serde_json::from_str::<Value>(&fin).is_ok();
+        assert!(torn == 0 && fin_ok, "찢어진 topology.json 관측 {torn}/{reads} 회 · 최종 파싱 {fin_ok}");
+    }
+
     /// 경로 위생: 상대경로·비 .jsonl은 거부 — 수집기가 임의 파일을 tail하는 입력을 차단.
     #[test]
     fn usage_register_validates_path_shape() {
