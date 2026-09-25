@@ -1462,9 +1462,13 @@ fn npm_prefix_polluted_field(verdict: &cys::NpmPrefixVerdict) -> bool {
 /// T1-3 발신자 소속 surface 해석: peer pid의 조상 체인에서 surface 루트 pid를 찾는다.
 /// (cys CLI 프로세스는 pane 셸의 자손이므로 조상 추적으로 소속 pane이 확정된다)
 fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
+    // ★(D-3 · 0.14.42) 히트 판독은 **복사 한 문장** — 락 가드는 임시값이라 이 문장 끝에서 풀린다.
+    // 아래 음성 세대·TTL·start_time 비교는 락 밖에서 한다(판정식 무변경). 종전에는 start_time
+    // 재판독(syscall)을 전역 caller_cache 락 안에서 해 캐시 히트끼리 직렬화됐다. 복사 시점이
+    // 선형화 지점이다 — 동시 insert·remove 와 겹쳐도 '복사 직후 히트가 끝난 경우'와 관측이 같다.
+    let hit = daemon.caller_cache.lock().unwrap().get(&caller_pid).copied();
     {
-        let cache = daemon.caller_cache.lock().unwrap();
-        if let Some(entry) = cache.get(&caller_pid) {
+        if let Some(entry) = hit {
             // (P0-2) 음성 세대 무효화: 음성(sid=None) 항목은 각인 세대 ≠ 현재 세대이면 TTL
             // 잔여와 무관하게 재해석한다(fall through) — '외부'로 판정된 직후 그 pid의 pane이
             // 등록되면(등록·claim 성공이 caller_gen을 올림) 음성이 60s 고착되지 않는다.
@@ -15181,6 +15185,33 @@ mod tests {
         let ext_legacy = walk_legacy(&map, me);
         assert_eq!(ext_fast.0, None, "외부(테스트 자신)가 surface 에 귀속됐다");
         assert_eq!(ext_fast, ext_legacy, "외부 호출자에서 fast 와 legacy 가 다르다");
+    }
+
+    /// ★(D-3 · T10) 캐시 히트 경로는 caller_cache 락을 **복사 한 문장**으로만 쥔다 — start_time
+    /// 재판독(peer_start_time)은 락 밖이다. 락 안 판독은 히트끼리 직렬화해 처리량 천장(S05 inject_small
+    /// 평탄 약 6.5k rps 의 지문)을 만든다. 판정식은 무변경이고 이 핀은 락 점유 범위만 박제한다.
+    #[test]
+    fn resolve_hit_path_releases_cache_lock_before_start_probe() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let start = prod
+            .find("fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {")
+            .expect("resolve_caller_surface 시그니처 소실");
+        let end = start + prod[start..].find("\n}\n").expect("resolve_caller_surface 끝");
+        let body = &prod[start..end];
+        let copy_stmt = "let hit = daemon.caller_cache.lock().unwrap().get(&caller_pid).copied();";
+        let copy_at = body.find(copy_stmt).expect("히트 판독이 복사-해제 한 문장이 아니다");
+        let probe_at = body.find("peer_start_time(caller_pid)").expect("start_time 재판독 소실");
+        assert!(copy_at < probe_at, "start_time 재판독이 복사 문장보다 앞에 있다");
+        assert!(
+            !body.contains("let cache = daemon.caller_cache.lock()"),
+            "히트 경로가 락 가드를 변수로 쥔다 — 비교가 락 안으로 되돌아왔다"
+        );
+        assert_eq!(
+            body[..probe_at].matches("caller_cache.lock()").count(),
+            1,
+            "start_time 재판독 전에 caller_cache 락 획득이 한 번이 아니다"
+        );
     }
 
     /// 발견(pid 재사용 → 신원 오인): resolve_caller_surface의 60초 caller_cache는 pid만으로
