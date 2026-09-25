@@ -1524,12 +1524,19 @@ impl InboxHold {
 
 /// ★(0.14.42 · 설계 H3) 채널이 보는 하드축 — pause·quiescing 은 `deliverable_master` 가 종전대로(무기한) 본다.
 /// busy(작업 중)는 막지 않는다(원격 steer · C0 p95<10s). 사람 입력 창은 큐 게이트와 같은 값(기본 30s).
-fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
+///
+/// `own_paste_in_flight` = **같은 배달 루프에서 방금 앞 행을 주입했다**. 그때 화면 composer 에 보이는 글자는 사람
+/// 초안이 아니라 그 행의 붙여넣기(본문 → 500ms → CR)다 — writer 가 Inject 를 하나씩 직렬로 처리하므로 다음 행이
+/// 그 글자와 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 이때 초안 축을 보면 우리 자신의 붙여넣기에 걸려
+/// 보류된 행이 sweep(15s)마다 1행씩만 나간다(샌드박스 드릴 D4 실측: 20행 FIFO 가 180s). 그래서 루프 안 두 번째
+/// 행부터는 초안 축만 뺀다 — 사람 초안은 루프 **시작** 판정이 이미 봤다(µs 사이에 사람이 새로 칠 수 없다).
+/// 모달·사람 입력·셸 단독 축은 행마다 그대로 본다.
+fn channel_hold_axes(own_paste_in_flight: bool) -> crate::governance::MachineHoldAxes {
     crate::governance::MachineHoldAxes {
         shell: true,
         human: true,
         modal: true,
-        draft: true,
+        draft: !own_paste_in_flight,
         human_window_secs: crate::governance::queue_human_quiet_secs(),
         ..crate::governance::MachineHoldAxes::NONE
     }
@@ -1539,13 +1546,18 @@ fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
 /// (paused·exited·quiescing·surface 교체) 뒤 공용 하드축 판정. 보류면 행을 `new` 로 두고 멈춘다(FIFO).
 /// 판정 패닉(`ProbeFailed`)도 보류다(채널의 실패 방향 = 지연 · `channel.message.stalled` 로 보인다).
 /// 노브 `CYS_MACHINE_INJECT_HOLD` 에서 channel 을 빼면 종전 재확인만 한다.
-fn master_hold(daemon: &Arc<Daemon>, sid: u64) -> Result<Arc<crate::state::Surface>, InboxHold> {
+fn master_hold(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    own_paste_in_flight: bool,
+) -> Result<Arc<crate::state::Surface>, InboxHold> {
     if deliverable_master(daemon) != Some(sid) {
         return Err(InboxHold::Unavailable);
     }
     let surface = daemon.get_surface(sid).ok_or(InboxHold::Unavailable)?;
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel) {
-        if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, channel_hold_axes()) {
+        let axes = channel_hold_axes(own_paste_in_flight);
+        if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
             return Err(InboxHold::Gate(h));
         }
     }
@@ -1646,8 +1658,8 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
     };
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     for (inbox_id, channel, sender_id, created_ts) in rows {
-        // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달·초안 봉합).
-        let surface = match master_hold(daemon, sid) {
+        // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달 봉합 · 초안 축은 루프 첫 주입 전까지만).
+        let surface = match master_hold(daemon, sid, !out.delivered.is_empty()) {
             Ok(s) => s,
             Err(h) => {
                 out.hold = Some(h);
@@ -1723,7 +1735,7 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     let mut n = 0;
     for (inbox_id, channel, sender_id, created_ts, redelivered, injected_ts) in rows {
-        let Ok(surface) = master_hold(daemon, sid) else {
+        let Ok(surface) = master_hold(daemon, sid, n > 0) else {
             break;
         };
         let text: String = conn
@@ -3300,7 +3312,7 @@ mod tests {
         d.roles.lock().unwrap().insert("master".into(), sid);
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
-        let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
+        let s1 = master_hold(&d, sid, false).expect("비-quiescing master 는 주입 직전 재확인 통과");
         assert!(inject_master_confirmed(&d, &s1, "[test] hi"), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
@@ -3311,7 +3323,7 @@ mod tests {
         });
         assert_eq!(deliverable_master(&d), None, "quiescing master는 배달 불가");
         assert_eq!(
-            master_hold(&d, sid).err(),
+            master_hold(&d, sid, false).err(),
             Some(InboxHold::Unavailable),
             "quiescing surface엔 주입 직전 재확인이 보류를 돌려준다(주입 0)"
         );
@@ -4179,6 +4191,29 @@ mod tests {
         let m = inbox_lag_mark(1000.0, 1000.0 + 700.0).expect("700s 는 표기");
         assert!(m.starts_with(" (지연 11분 · 접수 "), "{m}");
         assert_eq!(envelope("s", "u", 1000.0, 1, false, "t"), envelope_at("s", "u", 1000.0, 1, false, "t", Some(1100.0)));
+    }
+
+    /// [H3] 같은 배달 루프에서 앞 행을 주입한 뒤에는 초안 축만 뺀다(우리 자신의 붙여넣기에 걸려 1행/15s 로 새지
+    /// 않게 · 드릴 D4). 모달·사람 입력·셸 단독 축은 행마다 그대로다 — 모달 화면이면 두 번째 행도 보류된다.
+    #[cfg(unix)]
+    #[test]
+    fn h3_own_paste_in_flight_skips_only_the_draft_axis() {
+        let a0 = channel_hold_axes(false);
+        let a1 = channel_hold_axes(true);
+        assert!(a0.draft && !a1.draft, "루프 첫 주입 전에는 초안 축 · 뒤에는 뺀다");
+        assert_eq!((a1.shell, a1.human, a1.modal), (true, true, true), "나머지 축은 행마다 그대로");
+        let (d, m) = h3_rig("h3-own-paste");
+        let sid = m.id;
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        assert_eq!(master_hold(&d, sid, false).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)));
+        assert!(master_hold(&d, sid, true).is_ok(), "앞 행 주입 뒤의 composer 글자에 걸렸다");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        assert_eq!(
+            master_hold(&d, sid, true).err(),
+            Some(InboxHold::Gate(crate::governance::MachineHold::Modal)),
+            "모달 축은 루프 안에서도 행마다 본다"
+        );
+        h3_done(&m);
     }
 
     /// [H3 ③ 재기동 뒤 처리] 보류된 행은 channels.db 에 영속된다 — 데몬이 재기동해도 새 master 가 유휴가 되면 FIFO 로 나간다.
