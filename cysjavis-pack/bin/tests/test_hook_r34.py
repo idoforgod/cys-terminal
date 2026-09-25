@@ -354,6 +354,24 @@ try:
 
 
     # ─── [C3 절 경계] ───
+    # ═════════ [C3] GC 게이트 — 20개 이하에서 ls/tail 을 띄우지 않는다(동치) ═════════
+    #   잔재 픽스처의 pid 는 pid_max(리눅스 4194304 · 맥 99998) 밖 값 — 살아 있는 pid 를 건너뛰는 GC 와 결정론으로 맞물린다.
+    for tag, msys in (("", False), (" (msys 모사 · 게이트는 Windows 갈래에도 적용)", True)):
+        d, hooks, binp, state, env = lab(root, "gc2" + ("w" if msys else ""), wrap=("ls", "tail"), msys=msys)
+        os.makedirs(state, exist_ok=True)
+        for i in range(5):
+            w(os.path.join(state, "hook-input-9%02d-49999%02d.json" % (i, i)), "{}")
+        run(hooks, env, STUB_RC=3)
+        tl = rd(os.path.join(d, "tool.log"))
+        check("GC-2 20개 이하 → ls/tail 미기동(동치 · 외부 명령 0)" + tag, "ls " not in tl and "tail " not in tl,
+              repr(tl[:200]))
+        for i in range(40):
+            w(os.path.join(state, "hook-input-8%02d-49998%02d.json" % (i, i)), "{}")
+        run(hooks, env, STUB_RC=3)
+        left = [n for n in os.listdir(state) if n.startswith("hook-input-") and n.endswith(".json")]
+        check("GC-3 20개 초과 → 종전 GC 가 돈다(≤20)" + tag, len(left) <= 20 and "ls " in rd(os.path.join(d, "tool.log")),
+              str(len(left)))
+
 
     # ─── [C4 절 경계] ───
 
