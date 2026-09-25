@@ -534,16 +534,33 @@ fn migrate_seat_queue(
 /// npm 축을 고칠 때 형제로 보고해 master 가 범위에 넣었다).
 /// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
 fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
-    daemon.bus.publish(
-        "role.takeover",
-        "system",
-        Some(prev_sid),
-        json!({"role": role, "prev_surface": prev_sid, "path": path,
-               "reason": "empty seat (no descendant process, no agent meta, no recent input)"}),
-    );
-    let Some(s) = daemon.get_surface(prev_sid) else {
+    let surface = daemon.get_surface(prev_sid);
+    // ★(0.14.42 · 설계 H6) 구 좌석에 **미제출 입력**이 있으면 pane 줄(원장 + 주입)을 생략한다 — 이벤트는 유지.
+    //   `seat_claimable` 은 사람 입력 30s 만 보고 계수는 보지 않는다. 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고
+    //   CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#` 은 주석이 아니다 — 아래 '실행돼도 no-op' 전제의 반례).
+    //   문안·접두·cr 120·cfg 는 무변경이다. 노브에서 takeover 를 빼면 종전 동작(이벤트 키도 종전 그대로).
+    let hold_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Takeover);
+    let pending = surface
+        .as_ref()
+        .map(|s| s.pending_input_bytes.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let skip_pane = hold_on && pending > 0;
+    let mut payload = json!({"role": role, "prev_surface": prev_sid, "path": path,
+                             "reason": "empty seat (no descendant process, no agent meta, no recent input)"});
+    if hold_on {
+        payload["pane_notice"] = json!(match (&surface, skip_pane) {
+            (None, _) => "skipped_surface_gone",
+            (Some(_), true) => "skipped_pending_input",
+            (Some(_), false) => "sent",
+        });
+    }
+    daemon.bus.publish("role.takeover", "system", Some(prev_sid), payload);
+    let Some(s) = surface else {
         return;
     };
+    if skip_pane {
+        return;
+    }
     // 렌더 입력은 **그 좌석이 실제로 돌리는 셸**(`Surface::cmd`)이다 — `CYS_SHELL` 로 어느 OS
     // 에서든 바뀌므로 `cfg!` 로 가르면 틀린다(npm 축과 같은 규율).
     let text = seat_takeover_notice(role, &s.cmd);
@@ -15825,6 +15842,41 @@ mod tests {
             raw.contains(prefix.trim_end()),
             "원장에 남은 승계 고지에 주석 접두가 없다 — pane 에 들어간 줄도 명령이 된다: {raw}"
         );
+    }
+
+    /// ★(0.14.42 · 설계 H6) 승계 고지 1줄 보강 — 구 좌석에 미제출 입력(`pending_input_bytes>0`)이 있으면 pane 줄
+    /// (원장 + 주입)을 생략하고 `role.takeover{pane_notice}` 로 사실만 남긴다. `seat_claimable` 은 사람 입력 30s 만 보고
+    /// 계수는 보지 않아서, 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고 CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#`
+    /// 은 주석이 아니다). RED(HEAD): 주입(원장 1).
+    #[test]
+    fn h6_takeover_notice_skipped_on_pending_input() {
+        let daemon = isolated_daemon();
+        let takeover_ev = |d: &Arc<Daemon>, sid: u64| -> Value {
+            d.bus
+                .tail(100)
+                .into_iter()
+                .rev()
+                .find(|e| e["name"] == json!("role.takeover") && e["payload"]["prev_surface"] == json!(sid))
+                .expect("role.takeover 이벤트 부재")
+        };
+        // ① 미제출 입력 5바이트 — pane 줄 생략 · 이벤트는 유지.
+        let sid = make_surface(&daemon, None);
+        daemon.get_surface(sid).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
+        announce_seat_takeover(&daemon, sid, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 0, "초안 위에 승계 고지를 주입했다");
+        assert_eq!(takeover_ev(&daemon, sid)["payload"]["pane_notice"], json!("skipped_pending_input"));
+        // ② 계수 0 — 종전 그대로 고지(문안·cr 120 무변경은 seat_takeover_notice_reaches_… 가 잰다).
+        let sid2 = make_surface(&daemon, None);
+        announce_seat_takeover(&daemon, sid2, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 1);
+        assert_eq!(takeover_ev(&daemon, sid2)["payload"]["pane_notice"], json!("sent"));
+        // ③ 노브에서 takeover 를 빼면 HEAD 동작(계수와 무관하게 주입 · pane_notice 키 없음).
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,ceo,supervisor")]);
+        let sid3 = make_surface(&daemon, None);
+        daemon.get_surface(sid3).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
+        announce_seat_takeover(&daemon, sid3, "master", "claim_role");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 2);
+        assert!(takeover_ev(&daemon, sid3)["payload"].get("pane_notice").is_none(), "HEAD 이벤트에 키가 붙었다");
     }
 
     /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
