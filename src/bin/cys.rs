@@ -2312,10 +2312,55 @@ fn format_absorbed_line(r: &serde_json::Value, tag: &str) -> String {
 /// 흡수 통지 — stdout 결론 1줄 + stderr 재전송 안내(의도적 Return 이었다면 한 번 더 보내면 통과한다).
 fn report_return_absorbed(r: &serde_json::Value, tag: &str) {
     println!("{}", format_absorbed_line(r, tag));
-    eprintln!(
-        "[send-key] ⚠ Return 을 보내지 않았다(흡수) — 화면(승인·선택 창)을 누르려던 것이면 한 번 더 \
-         보내라 · 다음 Return 은 흡수되지 않는다(사이에 새 큐 전환이 없으면)"
-    );
+    eprintln!("{}", absorbed_stderr_line());
+}
+
+/// ★(A2-F1) 흡수 stderr 안내(순수) — 재전송은 **조건부**다. 무조건 "한 번 더 보내라" 로 읽히면 짝 Return 을
+/// 보낸 LLM 이 그대로 재전송해 S22 오승인(창 기본 선택지 확정)을 되살린다. 짝 Return 이었다면 다시 보내지
+/// 않고, 창을 누르려던 것이면 화면을 확인한 뒤에만 보낸다.
+fn absorbed_stderr_line() -> &'static str {
+    "[send-key] ⚠ Return 을 보내지 않았다(흡수) — 방금 `cys send` 본문의 짝 Return 이었다면 다시 보내지 \
+     마라(본문은 큐 배달이 CR 까지 제출한다). 승인·선택 창을 누르려던 것이면 `cys read-screen` 으로 창을 \
+     확인한 뒤 한 번 더 보내라 · 다음 Return 은 흡수되지 않는다(사이에 새 큐 전환이 없으면)"
+}
+
+/// 반사 창(ms)을 사람이 읽는 초로(순수) — 정수 초면 소수점 없이.
+fn absorb_reflex_secs_text(ms: u64) -> String {
+    if ms % 1000 == 0 {
+        format!("{}", ms / 1000)
+    } else {
+        format!("{:.1}", ms as f64 / 1000.0)
+    }
+}
+
+/// ★(A2-F1) 모달 전환 폴백의 보조 안전망 문구(순수) — 주 경고('보내지 마라')를 약화하지 않는다.
+/// `reflex_ms` 가 있으면(좁힘을 아는 데몬) 창이 떠 있는 동안의 실제 흡수 범위(반사 창)와 그 뒤 Return 이
+/// 창을 누른다는 사실을 말한다. 없으면(A2 초판 데몬) 종전 문구 그대로(없는 범위를 약속하지 않는다).
+fn modal_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
+    match reflex_ms {
+        Some(ms) => format!(
+            "[send] (보조 안전망: 창이 떠 있는 동안 데몬은 {}초 안의 반사 Return 1회만 흡수한다 — 그래도 \
+             보내지 마라. 그보다 늦은 Return 은 흡수되지 않고 창을 누른다(승인하려던 것이면 `cys read-screen` \
+             으로 창을 확인한 뒤 보내라))",
+            absorb_reflex_secs_text(ms)
+        ),
+        None => format!(
+            "[send] (보조 안전망: 데몬이 {ttl_secs}초 안의 첫 Return 1회를 흡수한다 — \
+             그래도 보내지 마라. 그 뒤 Return 은 창을 누른다)"
+        ),
+    }
+}
+
+/// ★(A2-F1) 비모달 전환(타이핑 가드·초안) 폴백의 흡수 안내(순수).
+fn plain_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
+    match reflex_ms {
+        Some(ms) => format!(
+            "[send] 뒤따르는 send-key Return 은 불필요 — {ttl_secs}초 안 첫 1회는 흡수된다(대상에 승인·선택 \
+             창이 떠 있으면 {}초 안의 반사 Return 만 흡수되고, 그 뒤 Return 은 창을 누른다)",
+            absorb_reflex_secs_text(ms)
+        ),
+        None => format!("[send] 뒤따르는 send-key Return 은 불필요 — {ttl_secs}초 안 첫 1회는 흡수된다"),
+    }
 }
 
 /// ★B3 `cys send` 본문의 큐 1회 전환 판정(순수) — send-key 와 같은 근거·같은 보수성.
@@ -4248,6 +4293,9 @@ fn run(command: Command) -> i32 {
                             // 구 데몬은 키가 없다(None) → 종전 안내만(보조 문구 없음 · 하위호환).
                             let absorb_secs = (r2["return_absorb"].as_bool() == Some(true))
                                 .then(|| r2["return_absorb_secs"].as_u64().unwrap_or(0));
+                            // ★(A2-F1) 승인이 살아 있는 좌석에서의 흡수 범위(반사 창 ms) — 없으면(A2 초판
+                            //   데몬) 반사 창 문구를 싣지 않는다(없는 범위를 약속하지 않는다).
+                            let absorb_reflex_ms = r2["return_absorb_reflex_ms"].as_u64();
                             eprintln!(
                                 "[send] 사람 입력 감지 — 본문을 큐로 전환(QUEUED depth {depth}) surface={}",
                                 surface_ref(sid)
@@ -4269,15 +4317,10 @@ fn run(command: Command) -> i32 {
                                 // ★(0.14.42 · A2 C1) 흡수는 **보조** 안전망이다 — 주 문구('보내지 마라')를
                                 //   약화하지 않는다(1회용·TTL 한정이라 두 번째 Return 은 창을 누른다).
                                 if let Some(n) = absorb_secs {
-                                    eprintln!(
-                                        "[send] (보조 안전망: 데몬이 {n}초 안의 첫 Return 1회를 흡수한다 — \
-                                         그래도 보내지 마라. 그 뒤 Return 은 창을 누른다)"
-                                    );
+                                    eprintln!("{}", modal_absorb_aux_line(n, absorb_reflex_ms));
                                 }
                             } else if let Some(n) = absorb_secs {
-                                eprintln!(
-                                    "[send] 뒤따르는 send-key Return 은 불필요 — {n}초 안 첫 1회는 흡수된다"
-                                );
+                                eprintln!("{}", plain_absorb_aux_line(n, absorb_reflex_ms));
                             }
                             warn_if_daemon_paused();
                             println!("QUEUED (depth {depth}){}{tag}", queue_durable_suffix(&r2));
@@ -26949,9 +26992,48 @@ mod tests {
             .split("} else if let Some(n) = absorb_secs {")
             .next()
             .expect("모달 분기 끝");
-        assert!(modal.matches("보내지 마라").count() >= 2, "모달 두 분기 모두 '보내지 마라': {modal}");
+        assert!(modal.contains("보내지 마라"), "모달 주 경고 '보내지 마라': {modal}");
         let aux = &modal[modal.find("if let Some(n) = absorb_secs {").expect("보조 안전망 분기")..];
-        assert!(aux.contains("그래도 보내지 마라"), "보조 안전망 문구가 주 경고를 약화한다: {aux}");
+        // ★(A2-F1) 보조 문구는 순수 함수로 옮겼다 — 배선(모달 분기가 그 함수를 부른다)과 출력(두 판 모두
+        //   '그래도 보내지 마라')을 함께 핀한다.
+        assert!(aux.contains("modal_absorb_aux_line(n, absorb_reflex_ms)"), "보조 안전망 배선: {aux}");
+        for reflex in [Some(2000), None] {
+            let line = modal_absorb_aux_line(30, reflex);
+            assert!(line.contains("그래도 보내지 마라"), "보조 안전망 문구가 주 경고를 약화한다: {line}");
+        }
+        assert!(
+            body.contains("plain_absorb_aux_line(n, absorb_reflex_ms)"),
+            "비모달 분기 배선: {body}"
+        );
+    }
+
+    /// ★A2-F1 안내 문구 핀 — ① 반사 창을 아는 데몬이면 모달·비모달 안내가 **실제 흡수 범위**(창이 떠 있으면
+    /// 반사 창 안만 · 그 뒤 Return 은 창을 누른다)를 말한다 ② 구 데몬(키 없음)이면 종전 문구 그대로 ③ 흡수
+    /// stderr 는 재전송을 **조건부**로 말한다(짝 Return 이었다면 다시 보내지 않는다 — S22 역방향 차단).
+    #[test]
+    fn a2f1_absorb_guidance_states_reflex_scope_and_conditional_resend() {
+        let m = modal_absorb_aux_line(30, Some(2000));
+        assert!(m.contains("2초 안의 반사 Return 1회만"), "{m}");
+        assert!(m.contains("창을 누른다") && m.contains("cys read-screen"), "{m}");
+        assert!(!m.contains("30초"), "창이 떠 있는 동안 TTL 30초를 흡수 범위로 약속하면 안 된다: {m}");
+        let m_old = modal_absorb_aux_line(30, None);
+        assert!(m_old.contains("30초 안의 첫 Return 1회"), "구 데몬 판은 종전 문구: {m_old}");
+        let p = plain_absorb_aux_line(30, Some(1500));
+        assert!(p.contains("30초 안 첫 1회") && p.contains("1.5초 안의 반사 Return 만"), "{p}");
+        assert_eq!(
+            plain_absorb_aux_line(30, None),
+            "[send] 뒤따르는 send-key Return 은 불필요 — 30초 안 첫 1회는 흡수된다",
+            "구 데몬 판은 종전 문구 바이트 동일"
+        );
+        let e = absorbed_stderr_line();
+        assert!(e.contains("짝 Return 이었다면 다시 보내지") && e.contains("cys read-screen"), "{e}");
+        assert!(e.contains("한 번 더 보내라"), "의도적 승인의 회복 경로는 남는다: {e}");
+        // 배선: 흡수 통지는 이 순수 문구를 쓴다 · 폴백 r2 는 반사 창 키를 읽는다.
+        let src = include_str!("cys.rs");
+        let rep = src.split("fn report_return_absorbed(").nth(1).expect("report_return_absorbed");
+        let rep = rep.split("\n}\n").next().unwrap();
+        assert!(rep.contains("absorbed_stderr_line()"), "{rep}");
+        assert!(src.contains("r2[\"return_absorb_reflex_ms\"].as_u64()"), "폴백 r2 가 반사 창 키를 읽지 않는다");
     }
 
     /// ★(0.14.42 · A2 C1) 명시 `--queued`(첫 요청)는 흡수 표를 요청하지 않는다 — 의도적 Return 보존.

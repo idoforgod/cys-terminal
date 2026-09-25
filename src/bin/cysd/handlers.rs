@@ -2298,6 +2298,26 @@ fn return_absorb_ttl_secs() -> u64 {
         .unwrap_or(30)
 }
 
+/// ★(0.14.42 · A2-F1) **승인 창 좁힘의 반사 창** — `CYS_RETURN_ABSORB_REFLEX_MS`, 기본 2000.
+///
+/// 대상 좌석에 승인이 살아 있으면(모달 전경 ∨ 승인·관문 feed) 흡수는 표 나이가 이 창 **안**인
+/// Return 에만 적용된다. 그보다 늦은 Return 은 쓴다 — master 의 Return 이 화면 승인의 유일한
+/// 수단이라(governance `draft_gate_modal_verdict` doc · U8-P1 불변식) 삼키면 워커가 hang 한다.
+///
+/// 기본값 근거(시간 축의 두 무리): 짝 Return 은 같은 셸 체인·스크립트(`push_line`·hud 브리지 ·
+/// `cys send … && cys send-key … Return`)에서 오면 프로세스 기동 한 번 뒤에 온다(샌드박스 실측 ·
+/// 커밋 본문). `read-screen` 으로 창을 확인한 뒤의 승인은 LLM 도구 호출 왕복이 최소 두 번 끼므로
+/// 그보다 늦다. `0` = 승인이 살아 있으면 흡수하지 않음(종전 0.14.41 과 같은 통과).
+/// 운영 재조정 근거: `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`.
+fn return_absorb_reflex() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("CYS_RETURN_ABSORB_REFLEX_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+    )
+}
+
 /// ★(0.14.42 · A2) 흡수 자격 미달 사유 — `absorb_miss` 응답 키의 값.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AbsorbMiss {
@@ -2315,6 +2335,9 @@ enum AbsorbMiss {
     NoTicket,
     /// 표 나이 ≥ TTL.
     Expired,
+    /// ★(A2-F1) 대상 좌석에 승인이 살아 있고(모달 전경 ∨ 승인·관문 feed) 표 나이 ≥ 반사 창 —
+    /// 이 Return 은 창을 누르려는 것으로 본다(흡수하면 워커 hang).
+    ApprovalLive,
 }
 
 impl AbsorbMiss {
@@ -2327,6 +2350,7 @@ impl AbsorbMiss {
             AbsorbMiss::Unverified => "unverified",
             AbsorbMiss::NoTicket => "no_ticket",
             AbsorbMiss::Expired => "expired",
+            AbsorbMiss::ApprovalLive => "approval_live",
         }
     }
 }
@@ -2391,6 +2415,34 @@ fn return_absorb_verdict(
         AbsorbVerdict::PassThrough
     } else {
         AbsorbVerdict::Absorb
+    }
+}
+
+/// ★(0.14.42 · A2-F1) **승인 창 좁힘**(순수 · 관측은 클로저) — `return_absorb_verdict` 가 `Absorb` 여도
+/// 표 나이 ≥ `reflex` 이고 대상 좌석에 승인이 살아 있으면 `Miss(ApprovalLive)` 로 바꾼다(= 종전처럼 쓴다).
+///
+/// 【왜】 표는 큐 전환 **사유와 무관하게** 발급되고 TTL(30초) 동안 같은 발신자(좌석 안 모든 프로세스)의
+/// 첫 단일 Return 을 삼켰다. 모달 전환 때 CLI 가 "짝 Return 을 보내지 마라" 라고 안내하므로, 안내를 따른
+/// 발신자에게는 표가 남고 **그다음 의도적 승인 Return** 이 쓰기 0 · rc 0 으로 사라졌다(리뷰 A2-F1 ·
+/// 샌드박스 r1b: 5.6초 뒤 Return → ABSORBED · 도달 b''). 이는 "SubmitKey 는 무변경 — master 의 Return 이
+/// 유일한 승인 수단(막으면 워커 hang)" 불변식(governance `draft_gate_modal_verdict`)과 정면 충돌한다.
+///
+/// 【범위】 승인이 살아 있을 때만 시간 축으로 가른다: 반사 창 안 = 짝 Return(같은 체인 · S22 오승인
+/// 방지 유지), 밖 = 창을 누르려는 Return(쓴다). 승인이 없는 좌석은 종전 A2 범위(TTL) 그대로다.
+/// 관측(`approval_live`)은 **Absorb ∧ 나이 ≥ reflex** 일 때만 부른다 — 대부분의 흡수(반사 창 안)는
+/// 화면·feed 를 읽지 않는다(성능 · 락 계약: 호출자는 input_gate 밖에서 관측한다).
+/// 실패 방향: 관측 불능(마커 미정의·어댑터 미등록)은 `false` → 종전 A2 흡수 + ABSORBED 통지(재전송 회복).
+fn narrow_absorb_for_approval(
+    verdict: AbsorbVerdict,
+    ticket_age: Option<std::time::Duration>,
+    reflex: std::time::Duration,
+    approval_live: impl FnOnce() -> bool,
+) -> AbsorbVerdict {
+    match (verdict, ticket_age) {
+        (AbsorbVerdict::Absorb, Some(age)) if age >= reflex && approval_live() => {
+            AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive)
+        }
+        _ => verdict,
     }
 }
 
@@ -4577,6 +4629,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     };
                     result["return_absorb"] = json!(issued);
                     result["return_absorb_secs"] = json!(ttl);
+                    // ★(A2-F1) 승인이 살아 있는 좌석에서의 흡수 범위(반사 창) — CLI 안내가 실제 범위를
+                    //   말하게 한다(추가형 · 요청 시만).
+                    result["return_absorb_reflex_ms"] =
+                        json!(return_absorb_reflex().as_millis() as u64);
                 }
                 return Reply::Single(ok_response(&id, result));
             }
@@ -4899,6 +4955,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let absorb_ttl = return_absorb_ttl_secs();
+            let absorb_reflex = return_absorb_reflex();
             // (verdict, 판정에 쓴 표의 발급 시각) — pair_return 없는 요청은 표·계수를 읽지 않는다.
             let mut absorb: Option<(AbsorbVerdict, Option<std::time::Instant>)> = None;
             if pair_return {
@@ -4910,17 +4967,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .unwrap_or_else(|e| e.into_inner())
                     .human
                     .min(pending);
+                let ticket_age = ticket.as_ref().map(|t| t.issued.elapsed());
                 let verdict = return_absorb_verdict(
                     absorb_ttl,
                     pair_return,
                     &key,
                     authoritative_param,
                     verified_from,
-                    ticket.as_ref().map(|t| t.issued.elapsed()),
+                    ticket_age,
                     queued_param,
                     pending,
                     human,
                 );
+                // ★(0.14.42 · A2-F1) 승인 창 좁힘 — 대상에 승인이 살아 있으면(모달 전경 ∨ 승인·관문
+                //   feed) 흡수는 반사 창 안의 짝 Return 에만. 그보다 늦은 Return 은 창을 누르려는 것으로
+                //   보고 종전 경로로 쓴다(삼키면 워커 hang · U8-P1 불변식). 관측은 Absorb ∧ 나이 ≥ 반사
+                //   창일 때만 1회 — input_gate 밖(락 계약).
+                let verdict = narrow_absorb_for_approval(verdict, ticket_age, absorb_reflex, || {
+                    governance::seat_approval_live(daemon, &surface)
+                });
                 let issued = ticket.as_ref().map(|t| t.issued);
                 match (verdict, verified_from, issued) {
                     (AbsorbVerdict::Absorb, Some(x), Some(at)) => {
@@ -4949,6 +5014,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             );
                         }
                         absorb = Some((verdict, None));
+                    }
+                    (AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive), Some(x), Some(at)) => {
+                        // 승인 창 좁힘으로 흡수하지 않은 사실(1회 통지) — 반사 창 재조정 근거(흡수 쪽
+                        // `queue.return_absorbed` 와 같은 `ticket_age_ms` 축). 표는 건드리지 않는다 —
+                        // 쓰기 뒤 정산(D4)이 소거하고, 쓰기 전 거부면 종전처럼 남는다.
+                        daemon.bus.publish(
+                            "queue.return_absorb_bypassed",
+                            "queue",
+                            Some(sid),
+                            json!({
+                                "surface_ref": cys::surface_ref(sid),
+                                "from": cys::surface_ref(x),
+                                "reason": AbsorbMiss::ApprovalLive.as_str(),
+                                "ticket_age_ms": at.elapsed().as_millis() as u64,
+                                "reflex_ms": absorb_reflex.as_millis() as u64,
+                            }),
+                        );
+                        absorb = Some((verdict, issued));
                     }
                     _ => absorb = Some((verdict, issued)),
                 }
@@ -5084,6 +5167,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Some((AbsorbVerdict::PassThrough, Some(at))) => verified_from.map(|x| (x, at)),
                 _ => None,
             };
+            // ★(0.14.42 · A2-F1) 재확인의 승인 관측은 **게이트 밖 1회** — 게이트 안에서는 pending_input
+            //   leaf 만 잡는다(파서·feed·agent_meta 락 금지). 재확인 대상(PassThrough — 기계 본문 위 짝
+            //   Return)일 때만 관측한다. 화면 축의 관측 지연은 D-12 화면 축과 같은 구조적 한계(밖의 1회).
+            let recheck_approval_live =
+                absorb_recheck.is_some() && governance::seat_approval_live(daemon, &surface);
             // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산 재료 — 게이트 안 `try_write` 직전 스냅샷(pending_input leaf).
             let key_submits = key_bytes.iter().any(|b| matches!(b, b'\r' | b'\n'));
             let mut settle_snapshot: Option<(u64, u64, Option<u64>)> = None;
@@ -5109,17 +5197,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .unwrap_or_else(|e| e.into_inner())
                         .human
                         .min(pending);
+                    let age2 = at.elapsed();
                     let v2 = return_absorb_verdict(
                         absorb_ttl,
                         pair_return,
                         &key,
                         authoritative_param,
                         verified_from,
-                        Some(at.elapsed()),
+                        Some(age2),
                         false,
                         pending,
                         human,
                     );
+                    // ★(A2-F1) 경쟁 창에서 줄이 비었어도 승인이 살아 있고 반사 창 밖이면 흡수하지 않는다.
+                    let v2 = narrow_absorb_for_approval(v2, Some(age2), absorb_reflex, || {
+                        recheck_approval_live
+                    });
                     if v2 == AbsorbVerdict::Absorb {
                         drop(_gate);
                         if let Some(t) = surface.take_return_ticket(x, at) {
@@ -5190,10 +5283,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            Reply::Single(ok_response(
-                &id,
-                json!({"surface_id": sid, "key": key, "sent": true}),
-            ))
+            let mut result = json!({"surface_id": sid, "key": key, "sent": true});
+            // ★(0.14.42 · A2-F1) 승인 창 좁힘으로 흡수하지 않고 쓴 사실 — 그 경우에만 추가형 키(그 밖의
+            //   응답 바이트는 종전과 같다).
+            if let Some((AbsorbVerdict::Miss(AbsorbMiss::ApprovalLive), _)) = absorb {
+                result["absorbed"] = json!(false);
+                result["absorb_miss"] = json!(AbsorbMiss::ApprovalLive.as_str());
+            }
+            Reply::Single(ok_response(&id, result))
         }
 
         "surface.read_text" => {
@@ -13948,6 +14045,66 @@ mod tests {
         let drop_at = after.find("drop(_gate);").expect("게이트 해제");
         let take_at = after.find("surface.take_return_ticket(x, at)").expect("CAS");
         assert!(drop_at < take_at, "표 CAS 는 게이트를 놓은 뒤 — 표 락은 input_gate 안에서 잡지 않는다");
+    }
+
+    /// ★A2-F1 `narrow_absorb_for_approval` 전 분기 — 승인이 살아 있고 나이 ≥ 반사 창이면 Absorb → Miss.
+    /// 관측 클로저는 **Absorb ∧ 나이 ≥ 반사 창** 일 때만 불린다(반사 창 안 흡수는 화면·feed 무관측).
+    #[test]
+    fn a2f1_narrow_absorb_for_approval_table() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let reflex = ms(2000);
+        let calls = Cell::new(0u32);
+        let live = |v: bool| {
+            let c = &calls;
+            move || {
+                c.set(c.get() + 1);
+                v
+            }
+        };
+        use AbsorbMiss::*;
+        use AbsorbVerdict::*;
+        // 반사 창 밖 · 승인 살아 있음 → 쓴다(워커 hang 금지).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(5600)), reflex, live(true)), Miss(ApprovalLive));
+        // 경계: 나이 == 반사 창 은 밖이다.
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(2000)), reflex, live(true)), Miss(ApprovalLive));
+        // 반사 창 밖 · 승인 없음 → 종전 흡수(A2 범위 보존).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(5600)), reflex, live(false)), Absorb);
+        assert_eq!(calls.get(), 3);
+        // 반사 창 안 → 흡수 · 관측 0(성능 · 락 계약).
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(1999)), reflex, live(true)), Absorb);
+        // Absorb 가 아닌 판정은 그대로 · 관측 0.
+        assert_eq!(narrow_absorb_for_approval(PassThrough, Some(ms(9000)), reflex, live(true)), PassThrough);
+        assert_eq!(narrow_absorb_for_approval(Miss(Expired), Some(ms(40_000)), reflex, live(true)), Miss(Expired));
+        assert_eq!(narrow_absorb_for_approval(Miss(NoTicket), None, reflex, live(true)), Miss(NoTicket));
+        // 표 나이 결측은 값이 아니다 — Absorb 라도 좁히지 않는다(Absorb 는 표가 있어야만 나온다 · 방어).
+        assert_eq!(narrow_absorb_for_approval(Absorb, None, reflex, live(true)), Absorb);
+        assert_eq!(calls.get(), 3, "반사 창 안·비흡수·결측은 관측하지 않는다");
+        // 반사 창 0 = 승인이 살아 있으면 갓 발급된 표도 좁힌다.
+        assert_eq!(narrow_absorb_for_approval(Absorb, Some(ms(0)), ms(0), live(true)), Miss(ApprovalLive));
+        assert_eq!(AbsorbMiss::ApprovalLive.as_str(), "approval_live");
+    }
+
+    /// ★A2-F1 소스 핀 — 좁힘은 **1차 판정과 게이트 안 재확인 둘 다**에 걸린다(한쪽만이면 경쟁 창의 승인
+    /// Return 이 삼켜진다). 재확인용 승인 관측은 `input_gate` 를 잡기 **전**에 1회 — 게이트 안에서는
+    /// pending_input leaf 만 잡는다는 락 계약(파서·feed·agent_meta 락 금지).
+    #[test]
+    fn a2f1_narrowing_on_both_verdicts_and_observed_outside_gate_source_pin() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let first = arm.find("let verdict = return_absorb_verdict(").expect("1차 판정");
+        let narrow1 = arm.find("let verdict = narrow_absorb_for_approval(").expect("1차 좁힘");
+        let obs = arm.find("let recheck_approval_live =").expect("재확인 승인 관측(게이트 밖)");
+        let gate = arm.find("let _gate = surface.input_gate.lock().unwrap();").expect("게이트");
+        let v2 = arm.find("let v2 = return_absorb_verdict(").expect("재확인 판정");
+        let narrow2 = arm.find("let v2 = narrow_absorb_for_approval(").expect("재확인 좁힘");
+        assert!(first < narrow1, "1차: 판정 → 좁힘");
+        assert!(obs < gate && gate < v2 && v2 < narrow2, "재확인: 관측(게이트 밖) → 게이트 → 판정 → 좁힘");
+        let in_gate = &arm[gate..narrow2];
+        assert!(!in_gate.contains("seat_approval_live("), "게이트 안에서 승인 관측 금지(락 계약)");
     }
 
     #[test]

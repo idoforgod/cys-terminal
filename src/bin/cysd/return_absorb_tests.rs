@@ -36,6 +36,7 @@ impl Drop for Fx {
         }
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         std::env::remove_var("CYS_RETURN_ABSORB_SECS");
+        std::env::remove_var("CYS_RETURN_ABSORB_REFLEX_MS");
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -55,6 +56,7 @@ fn fx(tag: &str) -> Fx {
     std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
     std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
     std::env::remove_var("CYS_RETURN_ABSORB_SECS");
+    std::env::remove_var("CYS_RETURN_ABSORB_REFLEX_MS");
     let daemon = Daemon::new(dir.join("cysd.sock"));
     Fx { daemon, dir, _g: g }
 }
@@ -654,4 +656,190 @@ fn a2_issue_prunes_expired_tickets() {
     let at = t.peek_return_ticket(9).unwrap().issued;
     assert!(t.take_return_ticket(9, at).is_some());
     assert!(t.peek_return_ticket(9).is_none());
+}
+
+// ─────────────── A2-F1 — 승인이 살아 있으면 흡수는 반사 창 안으로만(워커 hang 금지) ───────────────
+//
+// 리뷰 A2-F1(major): 표는 큐 전환 사유와 무관하게 발급되고 TTL(30초) 동안 같은 발신자의 첫 단일 Return 을
+// 삼켰다. 모달 전환 때 CLI 는 "짝 Return 을 보내지 마라" 라고 안내한다 — 안내를 따르면 표가 남아 **그다음
+// 의도적 승인 Return** 이 쓰기 0 · rc 0 으로 사라진다(샌드박스 r1b: 5.6초 뒤 Return → ABSORBED · 도달 b'').
+// 불변식(governance `draft_gate_modal_verdict` doc · U8-P1): SubmitKey 는 무변경 — master 의 Return 이
+// 화면 승인의 유일한 수단이다(막으면 워커 hang). 아래 검체가 그 불변식의 회귀 핀이다.
+
+/// 좌석을 **권한 창(모달) 전경**으로 만든다 — U8-P1 검체와 같은 실 claude 권한 프롬프트 픽스처.
+fn paint_modal(t: &Arc<Surface>) {
+    *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+    let mut parser = t.parser.lock().unwrap();
+    parser.process(b"\x1b[2J\x1b[H");
+    parser.process(modal.as_bytes());
+}
+
+/// 모달 전경 좌석으로의 `cys send` 폴백 — 직접 전송이 `[draft_gate:modal]` 로 거부된 뒤 큐 전환(표 발급).
+fn send_fallback_modal(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text: &str) -> Value {
+    let first = direct(fx, pid, t, text);
+    let msg = first["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("[draft_gate:modal]"), "전제: 모달 전경 거부로 전환돼야 한다: {first}");
+    send_fallback_after_denial(fx, pid, t, text)
+}
+
+fn send_fallback_after_denial(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text: &str) -> Value {
+    let r2 = rpc(fx, pid, "surface.send_text", json!({
+        "surface_id": t.id, "text": text, "queued": true, "absorb_return": true, "quiet": true,
+    }));
+    assert_eq!(r2["ok"], json!(true), "큐 전환은 성공해야 한다: {r2}");
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "표 발급: {r2}");
+    r2
+}
+
+/// 발신자 표를 `ms` 만큼 늙힌다 — 벽시계 대기 없이 결정론(r1b 재현 나이 5.6초 등).
+fn age_ticket(t: &Arc<Surface>, sender: u64, ms: u64) {
+    let mut m = t.return_tickets.lock().unwrap();
+    let tk = m.get_mut(&sender).expect("늙힐 표가 있어야 한다");
+    tk.issued = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(ms))
+        .expect("단조 시계");
+}
+
+/// 데몬 발행 승인 feed(화면 어휘가 아니라 feed 사실) — `approval_or_gate_pending` 의 승인 축.
+fn push_daemon_approval(fx: &Fx, sid: u64, n: u32) {
+    fx.daemon.feed_items.lock().unwrap().push(crate::state::FeedItem {
+        request_id: format!("{}a2f1-approval-{n}", crate::state::DAEMON_REQ_PREFIX),
+        kind: "approval".into(),
+        title: "Allow execution".into(),
+        body: "Allow execution of `cargo test`?".into(),
+        surface_id: Some(sid),
+        status: "pending".into(),
+        decision: None,
+        created_at: crate::state::now_epoch(),
+        resolved_at: None,
+        tier: None,
+        publisher_pid: None,
+        publisher_pgid: None,
+        publisher_surface: None,
+        risk_class: None,
+        auto_route: false,
+        resolver_surface: None,
+        resolver_pid: None,
+    });
+}
+
+/// ★A2-F1 핵심 재현(r1b 의 모달 판): master X → 리뷰어 R(권한 창 전경) `send` 가 모달로 큐 전환 → X 는
+/// 안내대로 짝 Return 을 보내지 않음 → 5.6초 뒤 X 가 read-screen 후 **승인 Return** → **쓰기 1회**.
+/// 종전(629ebd51): ABSORBED · 쓰기 0 · rc 0 — 창은 그대로, 본문은 모달 뒤에 묶여 워커 hang.
+#[test]
+fn a2f1_modal_approval_return_beyond_reflex_is_written_once() {
+    let fx = fx("f1-modal");
+    let t = pane(&fx, "reviewer-1", P + 300);
+    let x = pane(&fx, "master", P + 301);
+    paint_modal(&t);
+    send_fallback_modal(&fx, Some(P + 301), &t, "[지시] 리뷰 착수");
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 301), &t);
+    let after = counts(&t);
+
+    assert_sent(&resp);
+    assert_eq!(resp["result"]["absorb_miss"], json!("approval_live"), "사유: {resp}");
+    assert!(after.2 > before.2, "승인 Return 은 PTY 에 써야 한다(세대 증가 = 쓰기): {before:?} → {after:?}");
+    assert_eq!(qlen(&t), 1, "본문은 큐에 그대로(모달이 닫힌 뒤 CR 포함 배달)");
+    assert_eq!(bus_count(&fx, "queue.return_absorbed"), 0, "흡수 이벤트 0");
+    let ev = bus_last(&fx, "queue.return_absorb_bypassed").expect("우회 이벤트(반사 창 재조정 근거)");
+    assert_eq!(ev["payload"]["reason"], json!("approval_live"), "{ev}");
+    assert!(ev["payload"]["ticket_age_ms"].as_u64().unwrap_or(0) >= 5_600, "{ev}");
+    assert_eq!(ev["payload"]["reflex_ms"], json!(2000), "{ev}");
+    assert_eq!(ticket_of(&t, x.id), None, "쓴 뒤 정산이 표를 소거(빈 줄 위 제출)");
+}
+
+/// 대조(S22 방지 유지): 같은 모달 좌석이라도 반사 창 **안**의 짝 Return(같은 셸 체인)은 흡수 — 쓰기 0.
+#[test]
+fn a2f1_modal_pair_return_inside_reflex_still_absorbed() {
+    let fx = fx("f1-reflex");
+    // 반사 창을 넉넉히(25초) — 부하가 큰 러너에서 픽스처 준비가 기본 2초를 넘겨 대조가 흔들리지 않게.
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000");
+    let t = pane(&fx, "reviewer-1", P + 310);
+    let _x = pane(&fx, "master", P + 311);
+    paint_modal(&t);
+    send_fallback_modal(&fx, Some(P + 311), &t, "[지시] 리뷰 착수");
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 311), &t);
+    assert_absorbed(&resp, "pair", "queued");
+    assert_eq!(counts(&t), before, "반사 창 안 짝 Return 은 창을 누르지 않는다(쓰기 0)");
+    assert_eq!(bus_count(&fx, "queue.return_absorb_bypassed"), 0);
+}
+
+/// 노브: `CYS_RETURN_ABSORB_REFLEX_MS=0` 이면 승인이 살아 있는 좌석에서는 갓 발급된 표도 흡수하지 않는다.
+#[test]
+fn a2f1_reflex_zero_never_absorbs_while_approval_live() {
+    let fx = fx("f1-reflex0");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "0");
+    let t = pane(&fx, "reviewer-1", P + 320);
+    let _x = pane(&fx, "master", P + 321);
+    paint_modal(&t);
+    send_fallback_modal(&fx, Some(P + 321), &t, "[지시] 리뷰 착수");
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 321), &t);
+    assert_sent(&resp);
+    assert!(counts(&t).2 > before.2, "쓰기 1회");
+}
+
+/// 승인 feed 축(화면 모달 서명 없음): 타이핑 가드로 전환된 뒤 승인 feed 가 걸린 좌석에 반사 창 밖 Return
+/// → 쓰기 1회. queued 짝 Return(CLI 폴백 r2)도 흡수하지 않고 종전처럼 적재한다(absorb_miss=approval_live).
+#[test]
+fn a2f1_feed_approval_return_beyond_reflex_is_not_absorbed() {
+    let fx = fx("f1-feed");
+    let t = pane(&fx, "worker-1", P + 330);
+    let x = pane(&fx, "master", P + 331);
+    typing_on(&t);
+    send_fallback(&fx, Some(P + 331), &t, "[지시] 본문");
+    typing_off(&t);
+    push_daemon_approval(&fx, t.id, 1);
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 331), &t);
+    assert_sent(&resp);
+    assert_eq!(resp["result"]["absorb_miss"], json!("approval_live"), "{resp}");
+    assert!(counts(&t).2 > before.2, "쓰기 1회");
+
+    // queued 변형 — 새 전환(표 재발급) 뒤 반사 창 밖 queued 짝 Return.
+    typing_on(&t);
+    send_fallback(&fx, Some(P + 331), &t, "[지시] 본문2");
+    age_ticket(&t, x.id, 5_600);
+    let q0 = qlen(&t);
+    let r = rpc(&fx, Some(P + 331), "surface.send_key", json!({
+        "surface_id": t.id, "key": "Return", "queued": true, "pair_return": true,
+    }));
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["result"]["queued"], json!(true), "종전 적재: {r}");
+    assert_eq!(r["result"]["absorbed"], json!(false), "{r}");
+    assert_eq!(r["result"]["absorb_miss"], json!("approval_live"), "{r}");
+    assert_eq!(qlen(&t), q0 + 1);
+}
+
+/// 대조(A2 범위 보존): 승인이 **없는** 좌석은 반사 창 밖(5.6초)이어도 TTL 안이면 종전처럼 흡수한다 —
+/// 좁힘은 승인이 살아 있을 때만이다(빈 줄 맨 CR · 빈 큐 항목 방지 불변).
+#[test]
+fn a2f1_no_approval_keeps_ttl_absorb() {
+    let fx = fx("f1-noappr");
+    let t = pane(&fx, "worker-1", P + 340);
+    let x = pane(&fx, "master", P + 341);
+    typing_on(&t);
+    send_fallback(&fx, Some(P + 341), &t, "[보고] 완료");
+    typing_off(&t);
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 341), &t);
+    assert_absorbed(&resp, "pair", "queued");
+    assert_eq!(counts(&t), before);
+    assert_eq!(bus_count(&fx, "queue.return_absorb_bypassed"), 0);
+    // 해소된(pending 아님) 승인 feed 는 승인이 아니다 — 결측·과거는 값이 아니다.
+    typing_on(&t);
+    send_fallback(&fx, Some(P + 341), &t, "[보고] 완료2");
+    typing_off(&t);
+    push_daemon_approval(&fx, t.id, 2);
+    for it in fx.daemon.feed_items.lock().unwrap().iter_mut() {
+        it.status = "resolved".into();
+    }
+    age_ticket(&t, x.id, 5_600);
+    assert_absorbed(&pair_return(&fx, Some(P + 341), &t), "pair", "queued");
 }

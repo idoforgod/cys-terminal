@@ -550,8 +550,14 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
   떨어지면 쓰레기 Enter 나 대화상자 기본 선택지 확정이 되므로, 데몬이 **같은 발신자의 첫 Return
   1회**(기본 30초 안)를 쓰지 않고 흡수합니다. 이때 `send-key` 는 rc 0 으로
   `ABSORBED (Return 미전송 · …)` 를 출력하고 stderr 에 재전송 안내를 남깁니다.
-  - 흡수는 **1장·1회용**입니다. 승인·선택 창을 정말 누르려던 Return 이었다면 **한 번 더
-    보내면 통과**합니다(사이에 새 큐 전환이 없으면).
+  - 흡수는 **1장·1회용**입니다. 승인·선택 창을 정말 누르려던 Return 이었다면 `cys read-screen` 으로
+    창을 확인한 뒤 **한 번 더 보내면 통과**합니다(사이에 새 큐 전환이 없으면). 방금 보낸 `send` 의
+    짝 Return 이었다면 다시 보내지 마세요 — 본문은 큐 배달이 CR 까지 제출합니다.
+  - **승인·선택 창이 떠 있는 좌석**(질문·권한 창이 화면 전경 · 또는 승인·관문 대기 feed)에서는
+    흡수가 큐 전환 직후 **반사 창(기본 2초) 안의 짝 Return** 에만 적용됩니다. 그보다 늦은 Return 은
+    흡수되지 않고 창을 누릅니다 — master 의 Return 이 화면 승인의 유일한 수단이라, 승인 Return 을
+    삼키면 워커가 멈추기 때문입니다(0.14.42 · A2-F1). 이때 `queue.return_absorb_bypassed`
+    이벤트가 `ticket_age_ms` 와 함께 남습니다.
   - 입력줄에 **기계 본문**이 남아 있으면 Return 은 누구 것이든 흡수되지 않고 종전처럼 제출합니다.
     `send-key Down Return` 같은 다중 키, `C-m` 같은 별칭, 명시 `send --queued` 뒤의 Return 은
     흡수 대상이 아닙니다.
@@ -1051,6 +1057,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_IDLE_SECONDS` | 300 | idle 감지 |
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
 | `CYS_RETURN_ABSORB_SECS` | 30 (0=off) | 짝 Return 흡수 창(0.14.42 · §5.3) — `send` 가 큐로 자동 전환된 뒤 같은 발신자의 첫 단일 `send-key Return` 1회를 쓰지 않고 흡수하는 시간. `0` 은 발급·흡수·보상 전부 끔(종전 동작). 흡수·만료는 `queue.return_absorbed`·`queue.return_absorb_expired` 이벤트의 `ticket_age_ms` 로 관측 |
+| `CYS_RETURN_ABSORB_REFLEX_MS` | 2000 | 승인이 살아 있는 좌석의 흡수 반사 창(0.14.42 · A2-F1 · §5.3) — 대상에 질문·권한 창(모달)이 전경이거나 승인·관문 feed 가 대기 중이면, 표 나이가 이 값 **이상**인 Return 은 흡수하지 않고 쓴다(창을 누른다 · 워커 hang 방지). `0` = 승인이 살아 있으면 흡수 안 함. 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`(샌드박스 실측 같은 셸 체인 짝 Return: p50 551ms · 최대 777ms) |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보. quiet 는 **1 미만 설정을 1로 승격**(0초 강제주입 봉인 — overdue 단계와 같은 하한). 이 노브는 **언제 배달할지**만 조정한다 — alt-screen 의 약한 레이아웃 증거가 요구하는 '출력 정적' 은 판정부 상수 3초(`readiness::BOOT_VALVE_QUIET_SECS`)이고 이 노브로 바뀌지 않는다 |

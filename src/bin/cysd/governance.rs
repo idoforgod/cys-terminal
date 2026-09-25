@@ -5030,7 +5030,9 @@ impl DraftGateDenied {
 /// `--queued` 로 1회 넘긴다 — 큐 배달 게이트(`prompt_gate_verdict` ②)가 **같은 술어**로 모달이 닫힌 뒤 배달한다.
 ///
 /// 【범위 — 좁게】 Text 만이다. SubmitKey(`send-key Return`)는 **무변경**: 화면 감지 승인은 대기자가 없어
-/// feed allow 가 효과가 없고 master 의 Return 이 유일한 승인 수단이다(막으면 워커 hang). ClearFirst 는
+/// feed allow 가 효과가 없고 master 의 Return 이 유일한 승인 수단이다(막으면 워커 hang). (0.14.42 A2 짝
+/// Return 흡수도 이 불변식을 따른다 — 승인이 살아 있는 좌석에서는 큐 전환 직후 반사 창 안의 짝 Return 만
+/// 흡수하고 그 뒤 Return 은 쓴다: handlers `narrow_absorb_for_approval` · [`seat_approval_live`] · A2-F1.) ClearFirst 는
 /// cycle-agent `/clear` 의 원자 경로라 모달 축을 걸면 ② 무clear 가 된다(cycle 은 자체 유휴 관측이 관문·모달을
 /// 이미 본다). CancelKey 는 사람 초안만 막는 축 그대로다. feed 기반 승인 축은 쓰지 않는다(15초 주기라 낡을 수
 /// 있다 · X2) — **지금 화면**의 서명만 본다.
@@ -5052,6 +5054,21 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
     };
     let obs = observe_prompt(s, &markers);
     obs_modal_foreground(&obs)
+}
+
+/// ★(0.14.42 · A2-F1) 좌석에 **승인·선택이 살아 있는가** — 승인·관문 feed(`approval_or_gate_pending`)
+/// ∨ 화면 모달 전경(`seat_modal_foreground`). 큐 배달 게이트 ①②와 **같은 두 술어**다(판정 분리 없음).
+///
+/// 소비자: 짝 Return 흡수의 승인 창 좁힘(handlers `narrow_absorb_for_approval`) 하나 — 이 술어가 참이면
+/// 반사 창 밖 Return 은 흡수하지 않고 쓴다(master 의 Return 이 화면 승인의 유일한 수단 · 위
+/// `draft_gate_modal_verdict` doc 의 SubmitKey 무변경 불변식).
+/// 실패 방향: 관측 불능(마커 미정의·어댑터 미등록 좌석 · 맨 셸)은 `false` → 흡수는 종전 A2 범위로 남고
+/// ABSORBED 통지 + 재전송 1회로 회복된다. 죽은 좌석의 모달 잔상 같은 거짓 양성은 `true` → 종전(0.14.41)
+/// 처럼 Return 을 쓴다(셸의 빈 줄 — hang 방향이 아니다).
+/// 싼 축(feed 메모리 순회)을 먼저 본다. 락: feed_items leaf → 파서·agent_meta leaf — `input_gate` 안에서
+/// 부르지 않는다(게이트 안은 pending_input leaf 만).
+pub(crate) fn seat_approval_live(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> bool {
+    approval_or_gate_pending(daemon, s.id) || seat_modal_foreground(s)
 }
 
 fn obs_modal_foreground(obs: &PromptObs) -> bool {
