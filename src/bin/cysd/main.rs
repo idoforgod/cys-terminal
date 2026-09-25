@@ -1456,8 +1456,150 @@ fn shutdown_cleanup(daemon: &Arc<Daemon>, reason: &str) {
     let _ = std::fs::remove_file(&daemon.socket_path);
 }
 
+/// ★F / G-01 rev2(0.14.42 WP-transport) unix accept 오류 분류·표본 로그.
+///
+/// 종전 Err arm 은 `eprintln!("accept error: {e}")` 한 줄뿐이었다 — 분류·sleep·카운터가 없었다.
+/// · macOS 에서 fd 고갈(EMFILE)은 accept 가 대기 연결 1개를 꺼내 **버린다**(실측: EMFILE×5 → EAGAIN,
+///   클라이언트 5/5 EOF, backlog 잔류 0). 즉시 재시도해도 오류 수는 도착 수를 넘지 않는 자기 제한
+///   루프라 핫스핀이 아니다. 여기서 sleep 하면 backlog 배출이 초당 1/backoff 로 묶여 ECONNREFUSED 가
+///   생기고(200 버스트 거절 55 실측) CLI 자동 기동·sibling 스폰·데드맨 회수(④) 경로가 새로 열린다 →
+///   **macOS 는 연결을 소비하는 errno 에 sleep 하지 않는다**(배출 속도 종전과 같음).
+/// · listener 가 쓸 수 없는 상태의 errno(EBADF·ENOTSOCK·EINVAL·EOPNOTSUPP·errno 없음)는 같은 오류가
+///   끝없이 반복되는 진짜 핫스핀이다 — 어느 OS 든 짧게 잔다(배출은 원래 0 이라 클라이언트 결과 불변).
+/// · 비macOS(Linux: EMFILE 에도 연결이 큐에 남아 스핀)는 모든 오류에 짧게 잔다.
+/// · EAGAIN/EWOULDBLOCK 은 tokio 가 WouldBlock 으로 흡수(clear_readiness)해 여기 도달하지 않는다.
+/// · 오류마다 쓰던 로그는 **표본화**한다(연속열 시작·errno 변경 ≥1s, 그 외 60s, 회복 1줄, 억제 건수
+///   병기) — 무회전 stderr 가 디스크를 채우면 `eprintln!` 이 패닉하고(실측 rc=101) 이 루프는 main
+///   태스크라 곧 데몬 사망(전 pane)이다. 쓰기는 실패를 무시하는 `writeln!` 이다.
+#[cfg(unix)]
+const UNIX_ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+/// 연결을 소비하는 errno 가 자기 제한인 OS(= sleep 하지 않는 OS). 테스트는 두 분기를 모두 주입해 잰다.
+#[cfg(unix)]
+const ACCEPT_ERROR_SELF_LIMITING_OS: bool = cfg!(target_os = "macos");
+/// 표본 로그: 연속열 시작·errno 변경은 직전 줄에서 이만큼 지나야 기록한다.
+#[cfg(unix)]
+const ACCEPT_LOG_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+/// 표본 로그: 실패가 이어지는 동안 적어도 이 간격마다 1줄(지금도 실패 중인가를 읽을 수 있게).
+#[cfg(unix)]
+const ACCEPT_LOG_MAX_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// accept 오류 뒤 재시도 전 지연(순수). 실패 방향: **미분류 errno 는 즉시 재시도**(종전 거동)로
+/// 접는다 — 소비형 errno 를 잘못 재우면 ECONNREFUSED·자동 기동 연쇄가 새로 생기기 때문이다(대가:
+/// 반복형 미분류 errno 는 종전처럼 스핀하되 로그는 표본화된다).
+#[cfg(unix)]
+fn accept_error_retry_delay(raw: Option<i32>, self_limiting_os: bool) -> std::time::Duration {
+    let listener_fatal = match raw {
+        None => true,
+        Some(e) => {
+            e == libc::EBADF || e == libc::ENOTSOCK || e == libc::EINVAL || e == libc::EOPNOTSUPP
+        }
+    };
+    if self_limiting_os && !listener_fatal {
+        std::time::Duration::ZERO
+    } else {
+        UNIX_ACCEPT_ERROR_BACKOFF
+    }
+}
+
+/// 표본 로그 게이트(순수 · 시각 주입). 산술 패닉 없음 — u64 는 saturating, 시간은
+/// saturating_duration_since(시계 역행 허용), Instant+Duration 연산을 쓰지 않는다.
+/// 줄 수 상한(임의 구간 W): 2·(⌊W/1s⌋+1) + ⌊W/60s⌋.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct AcceptLogGate {
+    streak: u64,
+    streak_started: Option<std::time::Instant>,
+    announced: bool,
+    notice: bool,
+    last_errno: Option<i32>,
+    last_line: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptLogLine {
+    /// 연속 `streak` 번째 오류 · 직전 기록 이후 억제 `suppressed` 건.
+    Error { streak: u64, suppressed: u64 },
+    /// 연속 `errors` 건 오류 뒤 첫 수락 · 연속열 경과 · 직전 기록 이후 억제 건.
+    Recovered { errors: u64, elapsed: std::time::Duration, suppressed: u64 },
+}
+
+#[cfg(unix)]
+impl AcceptLogGate {
+    fn on_error(&mut self, raw: Option<i32>, now: std::time::Instant) -> Option<AcceptLogLine> {
+        self.streak = self.streak.saturating_add(1);
+        if self.streak == 1 {
+            self.streak_started = Some(now);
+            self.announced = false;
+            self.notice = true;
+        }
+        if raw != self.last_errno {
+            self.notice = true; // 기록될 때까지 유지(sticky)
+        }
+        self.last_errno = raw;
+        let write = match self.last_line {
+            None => true,
+            Some(t) => {
+                let d = now.saturating_duration_since(t);
+                d >= ACCEPT_LOG_MAX_GAP || (self.notice && d >= ACCEPT_LOG_MIN_GAP)
+            }
+        };
+        if !write {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        let line = AcceptLogLine::Error { streak: self.streak, suppressed: self.suppressed };
+        self.suppressed = 0;
+        self.announced = true;
+        self.notice = false;
+        self.last_line = Some(now);
+        Some(line)
+    }
+
+    fn streak_open(&self) -> bool {
+        self.streak > 0
+    }
+
+    /// 연속열을 닫는다. 기록된(announced) 연속열만 회복 1줄 — 기록되지 않은 연속열의 오류는 이미
+    /// 억제 건수에 들어 있어 다음 줄로 이월된다.
+    fn on_success(&mut self, now: std::time::Instant) -> Option<AcceptLogLine> {
+        if self.streak == 0 {
+            return None;
+        }
+        let errors = self.streak;
+        let elapsed = self
+            .streak_started
+            .map_or(std::time::Duration::ZERO, |t| now.saturating_duration_since(t));
+        self.streak = 0;
+        self.streak_started = None;
+        if !self.announced {
+            return None;
+        }
+        self.announced = false;
+        let line = AcceptLogLine::Recovered { errors, elapsed, suppressed: self.suppressed };
+        self.suppressed = 0;
+        self.last_line = Some(now);
+        Some(line)
+    }
+}
+
+/// 롤백 노브 판정(순수) — 값이 u64 로 0 이면(`0`·` 0 `·`00`) 종전 정책, 그 밖(미설정 포함)은 게이트 켬.
+/// 불리언이라 노브로 sleep 을 늘려 ④ 증폭 경로를 다시 여는 것이 구조적으로 불가능하다.
+#[cfg(unix)]
+fn parse_accept_error_gate(raw: Option<&str>) -> bool {
+    !matches!(raw.map(|v| v.trim().parse::<u64>()), Some(Ok(0)))
+}
+
+/// `CYS_ACCEPT_ERROR_GATE` — accept 루프 진입 때 1회 읽는다(데몬 env 는 수명 동안 불변).
+#[cfg(unix)]
+fn accept_error_gate_enabled() -> bool {
+    parse_accept_error_gate(cys::env_compat("CYS_ACCEPT_ERROR_GATE").as_deref())
+}
+
 #[cfg(unix)]
 async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     // ★W1: startup 락 획득·heartbeat spawn·상태 디렉터리 선생성은 부트 부수효과보다 먼저 실행돼야
     // 하므로 main()으로 전진했다(경쟁 패자가 부수효과 실행 전 즉사). 락 파일 핸들은 main 스코프에서
@@ -1486,9 +1628,23 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     //   (한쪽만 배선되던 미배선 결함 봉인). state_dir 은 함수 내부에서 canonical 매핑으로 재계산.
     post_listen_boot(socket_path, &daemon);
 
+    // ★F / G-01 rev2: 오류 분류·표본 로그. 노브는 여기서 1회(0 = 종전 정책: 즉시 재시도·매 오류 로그).
+    let gate_on = accept_error_gate_enabled();
+    let mut log_gate = AcceptLogGate::default();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                if gate_on && log_gate.streak_open() {
+                    if let Some(AcceptLogLine::Recovered { errors, elapsed, suppressed }) =
+                        log_gate.on_success(std::time::Instant::now())
+                    {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "accept recovered: 연속 {errors}건 오류 뒤 수락 재개 ({}ms · 억제 {suppressed}건)",
+                            elapsed.as_millis()
+                        );
+                    }
+                }
                 // T1-3 발신자 신원: 커널이 보증하는 peer pid (자기신고 from의 검증 토대)
                 let caller_pid = peer_pid(&stream);
                 let daemon = Arc::clone(&daemon);
@@ -1496,7 +1652,28 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
                     handle_connection(daemon, Box::new(stream) as Stream, caller_pid).await;
                 });
             }
-            Err(e) => eprintln!("accept error: {e}"),
+            Err(e) => {
+                // 로그 쓰기 실패는 무시한다(`eprintln!` 은 실패 시 패닉 → 이 루프는 main 태스크 → 데몬 사망).
+                let delay = if gate_on {
+                    accept_error_retry_delay(e.raw_os_error(), ACCEPT_ERROR_SELF_LIMITING_OS)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                if !gate_on {
+                    let _ = writeln!(std::io::stderr(), "accept error: {e}");
+                } else if let Some(AcceptLogLine::Error { streak, suppressed }) =
+                    log_gate.on_error(e.raw_os_error(), std::time::Instant::now())
+                {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "accept error: {e} (연속 {streak}건째 · 직전 기록 이후 억제 {suppressed}건 · {}ms 후 재시도 · 표본: 연속열 시작·errno 변경 ≥1s, 그 외 60s)",
+                        delay.as_millis()
+                    );
+                }
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
     }
 }
@@ -2331,7 +2508,7 @@ fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
 /// 100% CPU로 spin하지 않도록 두는 backoff. mio `ConnectNamedPipe`는 정상 대기는
 /// WouldBlock(→tokio가 await)으로, 진짜 OS 오류는 즉시 Err로 반환하므로(connecting 플래그도
 /// 즉시 해제 → self-throttle 없음), 오류 분기는 ①로그 ②인스턴스 재생성 ③이 짧은 sleep로
-/// 회생해야 Unix arm(accept err→다음 await)·tokio 표준 루프(?로 전파)와 대칭이 된다.
+/// 회생해야 Unix arm(errno 분류 뒤 즉시 재시도 또는 짧은 sleep, UNIX_ACCEPT_ERROR_BACKOFF)·tokio 표준 루프(?로 전파)와 대칭이 된다.
 /// (Windows arm은 이 호스트에서 컴파일/실행 불가하므로, 정책 값을 모듈 최상위로 빼
 ///  비-Windows 테스트가 'spin 방지=non-zero backoff' 불변을 박제하게 한다.)
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -2496,7 +2673,7 @@ async fn pipe_listener(
             Err(e) => {
                 // connect()가 즉시 Err를 반환하면(broken 핸들 등) 같은 인스턴스에 곧장
                 // 재시도해도 같은 Err가 무한 반복돼 100% CPU spin이 된다(mio가 connecting
-                // 플래그를 즉시 해제해 self-throttle도 없음). Unix arm(accept err→다음 await)·
+                // 플래그를 즉시 해제해 self-throttle도 없음). Unix arm(errno 분류 뒤 즉시 재시도 또는 짧은 sleep, UNIX_ACCEPT_ERROR_BACKOFF)·
                 // tokio 표준 루프(?로 전파)와 대칭이 되도록: ①로그 ②인스턴스 재생성 ③짧은 backoff.
                 eprintln!("accept error: {e}");
                 server = recreate_pipe_instance(&pipe_name).await;
@@ -3580,6 +3757,252 @@ mod pipe_security_tests {
             "listener pool must be ≥2, else concurrent connects hit ERROR_PIPE_BUSY(231) \
              in the accept→recreate window: {pool}"
         );
+    }
+}
+
+/// ★F / G-01 rev2 — unix accept 오류 분류(재시도 지연)·표본 로그 게이트·롤백 노브·루프 소스핀.
+#[cfg(all(test, unix))]
+mod unix_accept_error_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// T1 — 백오프는 0 < b ≤ 20ms. 0 이면 Linux·listener_fatal 스핀, 크면 불필요한 지연.
+    #[test]
+    fn accept_error_backoff_small_nonzero() {
+        assert!(UNIX_ACCEPT_ERROR_BACKOFF > Duration::ZERO);
+        assert!(UNIX_ACCEPT_ERROR_BACKOFF <= Duration::from_millis(20));
+    }
+
+    /// T2 — macOS(자기 제한 OS)에서 연결을 **소비하는** errno 와 미분류 errno 는 즉시 재시도.
+    #[test]
+    fn macos_self_limiting_errnos_retry_immediately() {
+        assert_eq!(ACCEPT_ERROR_SELF_LIMITING_OS, cfg!(target_os = "macos"));
+        // EAGAIN/EWOULDBLOCK 은 tokio 가 흡수해(WouldBlock → clear_readiness) 여기 도달하지 않는다 —
+        // 도달하더라도 즉시 재시도(종전 흐름)여야 한다.
+        for e in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ECONNABORTED,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::EINTR,
+            libc::EAGAIN,
+            9999,
+        ] {
+            assert_eq!(
+                accept_error_retry_delay(Some(e), true),
+                Duration::ZERO,
+                "errno {e}: 재우면 backlog 배출이 1/backoff 로 묶여 ECONNREFUSED → 자동 기동 → \
+                 sibling → 데드맨 회수(④) 경로가 새로 열린다"
+            );
+        }
+    }
+
+    /// T3 — listener 가 쓸 수 없는 상태의 errno(+ errno 없음)는 어느 OS 든 백오프.
+    #[test]
+    fn listener_fatal_errnos_back_off_on_every_os() {
+        for self_limiting in [true, false] {
+            for raw in [
+                Some(libc::EBADF),
+                Some(libc::ENOTSOCK),
+                Some(libc::EINVAL),
+                Some(libc::EOPNOTSUPP),
+                None,
+            ] {
+                assert_eq!(
+                    accept_error_retry_delay(raw, self_limiting),
+                    UNIX_ACCEPT_ERROR_BACKOFF,
+                    "raw={raw:?} self_limiting={self_limiting}: 쓸 수 없는 listener 는 스핀을 막아야 한다"
+                );
+            }
+        }
+    }
+
+    /// T4 — 비macOS(자기 제한 아님)는 모든 errno 백오프(Linux EMFILE 은 연결이 큐에 남아 스핀한다).
+    #[test]
+    fn non_macos_all_errnos_back_off() {
+        for e in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, 9999] {
+            assert_eq!(accept_error_retry_delay(Some(e), false), UNIX_ACCEPT_ERROR_BACKOFF, "errno {e}");
+        }
+    }
+
+    fn err_line(streak: u64, suppressed: u64) -> Option<AcceptLogLine> {
+        Some(AcceptLogLine::Error { streak, suppressed })
+    }
+
+    /// T5 — 같은 순간 1000회: 첫 줄 1개(streak 1 · 억제 0)뿐, 나머지 999 는 억제로 센다.
+    #[test]
+    fn log_gate_first_error_then_silent() {
+        let mut g = AcceptLogGate::default();
+        let t0 = Instant::now();
+        let mut lines = Vec::new();
+        for _ in 0..1000 {
+            if let Some(l) = g.on_error(Some(libc::EMFILE), t0) {
+                lines.push(l);
+            }
+        }
+        assert_eq!(lines, vec![AcceptLogLine::Error { streak: 1, suppressed: 0 }]);
+        assert_eq!(g.suppressed, 999);
+    }
+
+    /// T6 — 성공 없이 같은 errno 를 1s 간격으로 181회: t=0·60·120·180 에 4줄, 뒤 3줄은 억제 59.
+    #[test]
+    fn log_gate_floor_every_60s() {
+        let mut g = AcceptLogGate::default();
+        let t0 = Instant::now();
+        let mut lines = Vec::new();
+        for i in 0..=180u64 {
+            if let Some(l) = g.on_error(Some(libc::EMFILE), t0 + Duration::from_secs(i)) {
+                lines.push((i, l));
+            }
+        }
+        assert_eq!(
+            lines,
+            vec![
+                (0, AcceptLogLine::Error { streak: 1, suppressed: 0 }),
+                (60, AcceptLogLine::Error { streak: 61, suppressed: 59 }),
+                (120, AcceptLogLine::Error { streak: 121, suppressed: 59 }),
+                (180, AcceptLogLine::Error { streak: 181, suppressed: 59 }),
+            ]
+        );
+    }
+
+    /// T7 — errno 변경은 notice 로 **유지**되어 1s 가 지나면 기록된다.
+    #[test]
+    fn log_gate_errno_change_sticky() {
+        let mut g = AcceptLogGate::default();
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(0)), err_line(1, 0));
+        assert_eq!(g.on_error(Some(libc::ENFILE), ms(500)), None, "errno 변경이어도 1s 안은 억제");
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(900)), None);
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(1000)), err_line(4, 2), "notice 가 유지돼 1s 에 기록");
+        assert_eq!(g.on_error(Some(libc::ENFILE), ms(30_000)), err_line(5, 0), "errno 변경 ≥1s → 즉시 기록");
+    }
+
+    /// T8 — 오류 뒤 성공 = 회복 1줄 · 오류 없는 성공 = 없음 · 0.999s 안 1000회 번갈아 = 정확히 2줄 ·
+    /// 10s 100Hz 번갈아 = 상한 2·(10+1) 이하.
+    #[test]
+    fn log_gate_recovery_pairs_and_bound() {
+        let t0 = Instant::now();
+        let mut g = AcceptLogGate::default();
+        assert!(!g.streak_open());
+        assert_eq!(g.on_success(t0), None, "오류 없는 성공은 줄이 없다");
+        assert_eq!(g.on_error(Some(libc::EMFILE), t0), err_line(1, 0));
+        assert!(g.streak_open());
+        assert_eq!(
+            g.on_success(t0 + Duration::from_millis(250)),
+            Some(AcceptLogLine::Recovered { errors: 1, elapsed: Duration::from_millis(250), suppressed: 0 })
+        );
+        assert!(!g.streak_open());
+
+        let mut g = AcceptLogGate::default();
+        let mut n = 0;
+        for i in 0..1000u64 {
+            let t = t0 + Duration::from_micros(i * 999);
+            if i % 2 == 0 {
+                n += g.on_error(Some(libc::EMFILE), t).is_some() as usize;
+            } else {
+                n += g.on_success(t).is_some() as usize;
+            }
+        }
+        assert_eq!(n, 2, "0.999s 안 번갈아 1000회는 오류 1줄 + 회복 1줄");
+
+        let mut g = AcceptLogGate::default();
+        let mut n = 0;
+        for i in 0..1000u64 {
+            let t = t0 + Duration::from_millis(i * 10);
+            if i % 2 == 0 {
+                n += g.on_error(Some(libc::EMFILE), t).is_some() as usize;
+            } else {
+                n += g.on_success(t).is_some() as usize;
+            }
+        }
+        assert!(n <= 2 * (10 + 1), "10s 100Hz 번갈아 {n} 줄 — 상한 2·(⌊W⌋+1)+⌊W/60⌋ 위반");
+        assert!(n >= 2, "기록이 아예 없다 — 게이트가 진단을 지운다");
+    }
+
+    /// T9 — 기록되지 않은(announced 아님) 연속열은 회복 줄이 없고, 그 억제 건수는 다음 줄로 이월된다.
+    #[test]
+    fn log_gate_unannounced_streak_carries_suppressed() {
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        let mut g = AcceptLogGate::default();
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(0)), err_line(1, 0));
+        assert!(g.on_success(ms(100)).is_some(), "announced 연속열의 회복 줄");
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(200)), None, "직전 줄 1s 안 — 억제");
+        assert_eq!(g.on_success(ms(300)), None, "announced 아닌 연속열은 회복 줄이 없다");
+        assert_eq!(g.on_error(Some(libc::EMFILE), ms(2000)), err_line(1, 1), "억제 1건이 다음 줄로 이월");
+    }
+
+    /// T10 — u64 포화·시계 역행에서도 패닉 없음(debug 빌드 산술 검사 포함).
+    #[test]
+    fn log_gate_saturates_and_tolerates_clock_skew() {
+        let now = Instant::now();
+        let mut g = AcceptLogGate {
+            streak: u64::MAX - 1,
+            suppressed: u64::MAX,
+            last_line: Some(now),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let _ = g.on_error(Some(libc::EMFILE), now);
+        }
+        assert_eq!(g.streak, u64::MAX);
+        assert_eq!(g.suppressed, u64::MAX);
+        // 시계 역행: now < last_line
+        let mut g = AcceptLogGate { last_line: Some(now + Duration::from_secs(5)), ..Default::default() };
+        let _ = g.on_error(Some(libc::EMFILE), now);
+        let _ = g.on_error(Some(libc::ENFILE), now);
+        let _ = g.on_success(now);
+        let mut g = AcceptLogGate { streak: 3, streak_started: Some(now + Duration::from_secs(9)), announced: true, ..Default::default() };
+        assert!(matches!(g.on_success(now), Some(AcceptLogLine::Recovered { elapsed, .. }) if elapsed == Duration::ZERO));
+    }
+
+    /// T11 — 롤백 노브 진리표: '0' 계열(u64 로 0)만 종전 정책, 나머지는 게이트 켬.
+    #[test]
+    fn parse_accept_error_gate_truth_table() {
+        for v in [None, Some("1"), Some("abc"), Some("-1"), Some("")] {
+            assert!(parse_accept_error_gate(v), "{v:?} 는 게이트 켬");
+        }
+        for v in ["0", " 0 ", "00"] {
+            assert!(!parse_accept_error_gate(Some(v)), "{v:?} 는 종전 정책");
+        }
+    }
+
+    /// T12 — unix accept 루프 본문 소스핀: 루프 안에 exit·panic·eprintln·unwrap·expect 가 없고
+    /// 분류 지연·sleep·게이트 on_error/on_success 가 있다. 노브 판독은 루프 **앞**(1회).
+    #[test]
+    fn unix_accept_loop_body_pinned() {
+        let src = include_str!("main.rs");
+        let sig = concat!("async fn accept_loop(daemon: Arc<Daemon>, ", "socket_path: &std::path::Path) {");
+        let start = src.find(sig).expect("unix accept_loop 시그니처");
+        let rest = &src[start..];
+        let loop_at = rest.find("\n    loop {").expect("accept 루프");
+        let head = &rest[..loop_at];
+        let end = rest[loop_at..].find("\n}").expect("함수 끝") + loop_at;
+        let body = &rest[loop_at..end];
+        assert!(
+            head.contains(concat!("accept_error_gate_", "enabled()")),
+            "노브 판독이 루프 앞에 없다(연결마다 읽거나 누락)"
+        );
+        for banned in [
+            concat!("process::", "exit"),
+            concat!("panic", "!("),
+            concat!("eprint", "ln!("),
+            concat!(".unw", "rap()"),
+            concat!(".exp", "ect("),
+        ] {
+            assert!(!body.contains(banned), "accept 루프 안에 `{banned}` — main 태스크 패닉·종료 = 전 pane 사망");
+        }
+        for needed in [
+            concat!("accept_error_retry_", "delay("),
+            concat!("tokio::time::", "sleep("),
+            concat!("on_", "error("),
+            concat!("on_", "success("),
+        ] {
+            assert!(body.contains(needed), "accept 루프에 `{needed}` 가 없다");
+        }
     }
 }
 
