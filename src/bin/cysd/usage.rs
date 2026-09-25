@@ -933,6 +933,148 @@ pub(crate) fn extract_session_id(agent: &str, path: &Path) -> Option<String> {
     }
 }
 
+/// ★R3-1 검체 이음매(테스트 전용) — 계통 판독(`clear_lineage_depth`) 결과를 **이 스레드에서만** 대체한다.
+/// 켜지 않으면(None) 실제 판독이다. 검체의 발신 pid 는 합성값이라 실제 조상 사슬이 없기 때문이다.
+/// (이음매를 governance.rs 가 아니라 여기에 두는 이유: governance·handlers 의 소스핀은 첫 cfg(test) 속성을
+/// 프로덕션 경계로 쓴다 — 그 파일 프로덕션 구간에 속성을 두면 경계가 당겨져 기존 핀이 조용히 약해진다.)
+#[cfg(test)]
+pub(crate) mod clear_lineage_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(v: Option<Option<usize>>) {
+        OVERRIDE.with(|c| c.set(v));
+    }
+    pub(crate) fn get() -> Option<Option<usize>> {
+        OVERRIDE.with(|c| c.get())
+    }
+}
+
+/// ★R3-1 검체 이음매(테스트 전용) — 킬스위치 env(`CYS_CLEAR_REPIN`) 값을 **이 스레드에서만** 대체한다.
+/// 프로세스 env 는 병렬 검체끼리 공유되므로 set_var 로 켜고 끄면 다른 검체를 흔든다.
+#[cfg(test)]
+pub(crate) mod clear_repin_env_seam {
+    use std::cell::RefCell;
+    thread_local! {
+        static OVERRIDE: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set(v: Option<Option<String>>) {
+        OVERRIDE.with(|c| *c.borrow_mut() = v);
+    }
+    pub(crate) fn get() -> Option<Option<String>> {
+        OVERRIDE.with(|c| c.borrow().clone())
+    }
+}
+
+/// ★R3-1 계통 판독 진입점 — 실제 판독은 `governance::caller_agent_depth`(조건·None 의미는 그 doc).
+pub(crate) fn clear_lineage_depth(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<usize> {
+    #[cfg(test)]
+    if let Some(v) = clear_lineage_seam::get() {
+        return v;
+    }
+    crate::governance::caller_agent_depth(root_pid, caller_pid, agent_bin)
+}
+
+/// ★R3-1(0.14.42): /clear 뒤 resume 핀 교체 판정(순수 — 핀).
+///
+/// 핀(`agent_session_id`)은 수집기가 **1회만** 잡는다(is_none 가드 — mtime 흔들림·같은 cwd 동시세션 오핀 방어).
+/// 그래서 /clear 로 새 세션 B 가 생겨도 핀은 옛 대화 A 에 남고, 재기동 복원은 비운 컨텍스트 A 를 되살린다
+/// (S27b H2 5/5 · 치명 ② 방향). 교체는 **명시 신호**로만 한다: SessionStart 훅이 `source=clear` 로 보낸 등록 중
+/// **좌석 최상위 에이전트의 것으로 증명된 것**. mtime·휴리스틱으로는 바꾸지 않는다(가드의 존재 이유가 그대로 남는다).
+///
+/// 받는 것은 `clear` 하나다. 뺀 것과 이유:
+///   · compact 는 세션 id 를 바꾸지 않는다(compact_boundary 앞뒤 sessionId 동일). 받아도 얻는 것이 없다.
+///   · resume 은 중첩 `claude -p --resume X` 가 startup 없이 바로 낸다 — 연속성(ⓐ)이 걸러 주지 못하는 모양이다.
+///   · startup(수동 재시작)·codex 좌석은 따라가지 않는다(종전과 같음).
+///
+/// ★clear 도 그 자체로는 좌석 최상위 신호가 **아니다**(2026-09-25 실측 · CC 2.1.282 · HOME 샌드박스):
+///   `claude -p "/clear"` 한 번이 SessionStart 를 **startup(N) → clear(B')** 두 번 낸다(startup 훅이 끝난 뒤
+///   clear 훅이 시작 · 둘 다 새 session_id·transcript_path · B'.jsonl 즉시 생성). 좌석 Bash 도구의 자식은
+///   CYS_SURFACE_ID·cwd 를 물려받으므로 caller 결박만으로는 헬퍼 세션 B' 가 핀이 된다. 그래서 두 겹을 건다:
+///   ⓐ **연속성**(순수 · 싸다): 핀이 있으면 **이 등록 바로 앞의 등록 stem 이 현재 핀**이어야 한다. 좌석 자신의
+///      /clear 는 자기 startup·resume(A) 또는 앞선 clear 가 등록한 값에서 이어지고, 중첩 `-p` 는 자기 startup(N)
+///      등록이 먼저 온다. 핀이 없으면(수집기 첫 틱 전) 비교 대상이 없으니 받는다 — 수집기가 다음 틱에 등록
+///      경로로 잡을 값과 같다. 직전 등록이 **없는데** 핀이 있으면 증명 불가 → 거부(결측은 값이 아니다).
+///   ⓑ **계통**(프로세스 표 · 비싸서 맨 끝): 발신에서 좌석 루트까지 조상 사슬에 에이전트 실행이 **정확히
+///      하나**(= 좌석의 claude)여야 한다. 2 이상 = 중첩 → `nested_agent`. 0·판독 불가(윈도우 조상 단절·argv
+///      미관측) → `lineage_unverified`.
+/// 실패 방향: 어느 조건이든 어긋나면 **핀 유지 = 종전 동작**(재개는 옛 대화). 한 번 거부된 뒤에는 등록이 새 값으로
+/// 넘어가 있으므로 같은 좌석의 다음 clear 도 `discontinuous` 로 거부된다 — 좌석이 다시 resume/startup 등록을
+/// 낼 때(재기동)까지 종전 동작이 이어진다(거부가 새 교체를 부르는 방향은 없다).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clear_repin_verdict(
+    source: Option<&str>,
+    caller_bound: bool,
+    agent: Option<&str>,
+    current: Option<&str>,
+    prev_registered: Option<&Path>,
+    transcript: &Path,
+    held_by_other_seat: impl FnOnce(&str) -> bool,
+    lineage_agent_depth: impl FnOnce() -> Option<usize>,
+) -> Result<String, &'static str> {
+    if source != Some("clear") {
+        return Err("not_clear");
+    }
+    if agent != Some("claude") {
+        return Err("not_claude");
+    }
+    // 좌석 결박: 발신이 **이 좌석의 자손**으로 해석될 때만(익명·좌석 밖 호출은 위조와 구별할 수 없다).
+    if !caller_bound {
+        return Err("caller_unbound");
+    }
+    let Some(sid) = extract_session_id("claude", transcript) else {
+        return Err("bad_session_id");
+    };
+    // 복원은 id 를 `--resume {session_id}` 로 기동 문자열에 인라인한다 — 셸 메타문자가 든 stem 을 핀으로
+    // 들이지 않는다(claude 세션 id = UUID).
+    if !is_plausible_session_id(&sid) {
+        return Err("bad_session_id");
+    }
+    if current == Some(sid.as_str()) {
+        return Err("unchanged");
+    }
+    // ⓐ 연속성 — None 은 값이 아니다: 핀(Some) 과 직전 등록(None) 을 같다고 보지 않는다.
+    if let Some(cur) = current {
+        let prev = prev_registered.and_then(|p| extract_session_id("claude", p));
+        if prev.as_deref() != Some(cur) {
+            return Err("discontinuous");
+        }
+    }
+    // 다른 좌석이 이미 쥔 세션이면 교체하지 않는다(두 좌석이 한 대화로 복원되는 분열 방지).
+    if held_by_other_seat(&sid) {
+        return Err("held_by_other_seat");
+    }
+    // ⓑ 계통 — 프로세스 표를 읽으므로 싼 조건을 모두 지난 뒤에만 부른다.
+    match lineage_agent_depth() {
+        Some(1) => Ok(sid),
+        Some(0) | None => Err("lineage_unverified"),
+        Some(_) => Err("nested_agent"),
+    }
+}
+
+/// 세션 id 형태(1..=128자 · ASCII 영숫자·`-`·`_`). claude 는 UUID 다.
+pub(crate) fn is_plausible_session_id(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// ★R3-1 롤백 ①: 데몬 env `CYS_CLEAR_REPIN=0` 이면 clear 재핀 블록 **전체**를 건너뛴다 — 판정·계통 판독·
+/// persist·이벤트가 모두 0 이고 등록 자체는 종전대로다(= v0.14.41 동작). 그 밖 값·부재는 켜짐(엄격 `"0"` 비교).
+/// 매 clear 등록마다 읽는다(데몬 env 는 재시작 없이는 바뀌지 않는다 — 롤백 순서는 설계서: 훅 되돌리기가 1순위).
+pub(crate) fn clear_repin_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = clear_repin_env_seam::get() {
+        return clear_repin_enabled_from(v.as_deref());
+    }
+    clear_repin_enabled_from(std::env::var("CYS_CLEAR_REPIN").ok().as_deref())
+}
+
+/// 순수 코어(진리표 대상).
+pub(crate) fn clear_repin_enabled_from(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
 /// (4a) 세션 발견 + id 추출 묶음 진입점 — discover_session_file로 PathBuf를 얻어 extract_session_id.
 /// stash 경로(collect_for)는 이미 발견한 path에 extract_session_id를 직접 적용하므로 현재 미소비.
 /// 재발견 없이 id만 필요한 외부 호출(전용 RPC 등) 대비 진입점.
@@ -2544,5 +2686,95 @@ mod tests {
         let rows = crate::accounts::local_json(&d, now_epoch());
         let agy = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").cloned().unwrap();
         assert_eq!(agy["source_error"], json!(AGY_ERR_STATUSLINE_REQUIRED), "{agy}");
+    }
+}
+
+/// ★R3-1: /clear 재핀 판정·킬스위치·세션 id 형태의 순수 검체(프로덕션 무접촉 — 이음매 불요).
+#[cfg(test)]
+mod r3_1_verdict_tests {
+    use super::{clear_repin_enabled_from, clear_repin_verdict, is_plausible_session_id};
+    use std::path::Path;
+
+    const A: &str = "11111111-1111-4111-8111-111111111111";
+    const B: &str = "22222222-2222-4222-8222-222222222222";
+    const N: &str = "44444444-4444-4444-8444-444444444444";
+
+    fn p(stem: &str) -> String {
+        format!("/Users/x/.claude/projects/-p/{stem}.jsonl")
+    }
+
+    /// 판정 전 분기 — (source, bound, agent, current, prev, transcript, held, depth) → 기대.
+    #[test]
+    fn r3_1_verdict_table() {
+        let (pa, pb, pn) = (p(A), p(B), p(N));
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(Option<&str>, bool, Option<&str>, Option<&str>, Option<&str>, &str, bool, Option<usize>, Result<&str, &str>)> = vec![
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, false, Some(1), Ok(B)),
+            (Some("startup"), true, Some("claude"), Some(A), Some(&pa), &pb, false, Some(1), Err("not_clear")),
+            (None, true, Some("claude"), Some(A), Some(&pa), &pb, false, Some(1), Err("not_clear")),
+            (Some("clear"), true, Some("codex"), Some(A), Some(&pa), &pb, false, Some(1), Err("not_claude")),
+            (Some("clear"), true, None, Some(A), Some(&pa), &pb, false, Some(1), Err("not_claude")),
+            (Some("clear"), false, Some("claude"), Some(A), Some(&pa), &pb, false, Some(1), Err("caller_unbound")),
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), "/x/a;touch pwn.jsonl", false, Some(1), Err("bad_session_id")),
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pa, false, Some(1), Err("unchanged")),
+            // ⓐ 연속성: 직전 등록 N(중첩 startup) ≠ 핀 A · 직전 등록 결측 ≠ 핀 A
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pn), &pb, false, Some(1), Err("discontinuous")),
+            (Some("clear"), true, Some("claude"), Some(A), None, &pb, false, Some(1), Err("discontinuous")),
+            // 핀 결측이면 연속성 비교 대상 없음 → 다음 조건으로
+            (Some("clear"), true, Some("claude"), None, None, &pb, false, Some(1), Ok(B)),
+            (Some("clear"), true, Some("claude"), None, Some(&pn), &pb, false, Some(1), Ok(B)),
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, true, Some(1), Err("held_by_other_seat")),
+            // ⓑ 계통
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, false, Some(2), Err("nested_agent")),
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, false, Some(0), Err("lineage_unverified")),
+            (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, false, None, Err("lineage_unverified")),
+        ];
+        for (i, (src, bound, agent, cur, prev, tr, held, depth, want)) in rows.into_iter().enumerate() {
+            let got = clear_repin_verdict(src, bound, agent, cur, prev.map(Path::new), Path::new(tr), |_| held, || depth);
+            assert_eq!(got.as_deref().map_err(|e| *e), want, "행 {i}");
+        }
+    }
+
+    /// 계통 판독(비쌈)은 싼 조건이 전부 통과한 뒤에만 불린다 — 거부 경로에서 프로세스 표를 읽지 않는다.
+    #[test]
+    fn r3_1_verdict_lineage_is_last_and_lazy() {
+        let (pa, pb, pn) = (p(A), p(B), p(N));
+        let called = std::cell::Cell::new(0u32);
+        let bump = || {
+            called.set(called.get() + 1);
+            Some(1)
+        };
+        let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pn)),
+            Path::new(&pb), |_| false, bump);
+        assert_eq!(called.get(), 0, "연속성 거부 뒤에도 계통을 판독했다");
+        let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)),
+            Path::new(&pb), |_| true, bump);
+        assert_eq!(called.get(), 0, "타 좌석 보유 거부 뒤에도 계통을 판독했다");
+        let _ = clear_repin_verdict(Some("clear"), false, Some("claude"), Some(A), Some(Path::new(&pa)),
+            Path::new(&pb), |_| false, bump);
+        assert_eq!(called.get(), 0, "좌석 결박 거부 뒤에도 계통을 판독했다");
+        let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)),
+            Path::new(&pb), |_| false, bump);
+        assert_eq!(called.get(), 1, "모든 싼 조건을 지났는데 계통 판독이 정확히 1회가 아니다");
+    }
+
+    #[test]
+    fn r3_1_kill_switch_truth_table() {
+        for (v, on) in [(None, true), (Some("1"), true), (Some(""), true), (Some("0"), false),
+                        (Some(" 0"), true), (Some("00"), true), (Some("false"), true)] {
+            assert_eq!(clear_repin_enabled_from(v), on, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn r3_1_plausible_session_id_bounds() {
+        assert!(!is_plausible_session_id(""));
+        assert!(is_plausible_session_id(&"a".repeat(128)));
+        assert!(!is_plausible_session_id(&"a".repeat(129)));
+        assert!(is_plausible_session_id(A));
+        assert!(is_plausible_session_id("x_y-Z9"));
+        for bad in ["a b", "a;b", "a$b", "a`b", "a/b", "한글", "a\nb", "a.b"] {
+            assert!(!is_plausible_session_id(bad), "{bad:?}");
+        }
     }
 }

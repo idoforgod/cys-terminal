@@ -1200,6 +1200,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_DOCTOR_STAGING_MIN_IDLE_SECS` | 60 (0=보호 off) | `cys doctor --fix` 의 staging 잔재 삭제 보호창(초) — 이 시간 안에 수정된 staging 은 지우지 않고, idle 을 **못 재는**(mtime 미상·미래) staging 도 지우지 않는다(0.14.36 · 출력에 "N건 측정불능 보호" 로 따로 보고). `0` 은 진행중 보호와 측정불능 보호를 **함께** 해제해 종전처럼 항상 삭제하는 탈출구. 무효 값(`off`·`-1`·빈 값 — 비음수 정수만 유효)은 stderr 경고 1줄 + 기본 60(보호 on) — 조용히 떨어지지 않는다 |
 | `CYS_TODO_DIRS` | — | todo 감시 추가 루트(콜론 구분) |
 | `CYS_NO_AUTOSTART` / `CYS_NO_AUTORESTORE` | — | 자동 기동/자동 복원 끄기 |
+| `CYS_CLEAR_REPIN` | 켜짐 (`0`=끔) | /clear 뒤 resume 핀 교체(v0.14.42 · 데몬 env) — 좌석 최상위 claude 의 `/clear` 가 증명되면 재기동 복원이 비운 뒤의 새 대화로 재개합니다. `0` 이면 종전처럼 옛 대화로 재개합니다(판정·이벤트·영속 모두 없음). 데몬 env 라 데몬을 재시작해야 반영됩니다 |
 | `CYS_AGY_STATUSLINE` | 켜짐 (`0`=끔 · `~/.cys/agy-statusline-off` 파일과 동등) | agy 상태줄 자동 연결(v0.14.42 · macOS·Linux · §4 사이드바 사용량 「Antigravity(agy) 값」). 설치·업데이트 때 읽습니다. 끄면 cys 가 넣은(표지 `--cys-autolink`) 연결만 빼고 다시 넣지 않습니다 — 직접 넣은 연결·사용자 설정은 건드리지 않습니다. `cys doctor --fix` 도 같은 판정을 씁니다 |
 | `CYS_OUTSIDE_USAGE` | 켜짐 (`0`=끔) | cys 창 밖(외부 터미널) Claude 세션의 사용량을 계정 줄로 보내기(v0.14.42 · §4 사이드바 사용량 「집계 범위」). 창 밖 세션 쪽 환경에서 읽습니다. 끄면 종전처럼 보내지 않습니다 |
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
@@ -1305,6 +1306,14 @@ role.claimed/claim_denied   worker.limit_denied
   └ claim_denied payload: reason·current_holder(보유자 있음) 또는 error_code=claim_caller_unresolved
     |claim_not_owner + reason=identity(발신 pane 미식별·소유 불일치 — 보유자 유무와 무관)
 usage.session_registered/updated/register_denied/report_denied/tick_panic
+usage.session_repinned/session_repin_skipped   (★0.14.42 · /clear 뒤 resume 핀 교체)
+  └ repinned payload: from·to·source=clear·persisted(역할 좌석이면 topology.json 즉시 영속 — 재기동이 비운 뒤의 대화로 재개)
+  └ repin_skipped payload: reason·pin·prev·transcript — reason = not_claude|caller_unbound|bad_session_id|
+    discontinuous(직전 등록≠현재 핀 · 좌석 안 중첩 claude 흔적)|held_by_other_seat|nested_agent|
+    lineage_unverified(조상 사슬 판독 불가 · 윈도우 등)|raced. /clear 1회당 최대 1건. 거부되면 핀은 그대로다(종전 동작 —
+    재기동은 옛 대화로 재개). 발신 좌석을 못 푸는 환경(윈도우 Git Bash 조상 단절 등)에서는 /clear 마다
+    caller_unbound·lineage_unverified 가 1건씩 나간다 — 오류가 아니라 "종전 동작 유지"의 기록이다.
+    데몬 env CYS_CLEAR_REPIN=0 이면 둘 다 나가지 않는다.
 channel.* (bridge.exited·auth.denied·registered·message·outbound.<ch>·lockdown·… 15종)
 daemon.started/stopping   acl.denied   context.threshold   status.changed   task.changed
 todo.updated   approval.request   approval.stalled   master.deadman   master.idle   osc.notify

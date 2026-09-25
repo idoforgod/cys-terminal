@@ -3598,6 +3598,72 @@ fn argv_snapshot(pids: &[u32]) -> HashMap<u32, String> {
     out
 }
 
+/// ★R3-1 계통 검사: 발신 프로세스(`caller_pid` — 훅이 부른 cys)에서 좌석 루트(`root_pid` = surface.pid)까지
+/// 조상 사슬에 **에이전트 실행이 몇 개** 있는가. 좌석 최상위 claude 의 훅이면 정확히 1 이고, 좌석 Bash 도구
+/// 아래에서 띄운 `claude -p` 의 훅이면 2 이상이다(좌석 claude → 도구 셸 → 중첩 claude → 훅 → cys).
+///
+/// None = 판정 불가 — 32홉 안에 루트에 닿지 않음(윈도우 MSYS 조상 단절 등)·사슬 중 argv 미관측(숨은 에이전트를
+/// 배제할 수 없다 · `CmdSource::NameFallback` 을 부정 근거로 쓰지 않는 규약과 같다). 호출자는 None 을 **거부**로
+/// 읽는다(실패 방향 = 종전 동작).
+///
+/// 비용: 프로세스 표 1회 + 사슬 argv(≤32 pid). 드문 경로(좌석 /clear 1회당 1번, 앞선 싼 조건을 모두 지난 뒤)에서만
+/// 부르고, 락을 쥐지 않은 채 부른다. OS 공통 sysinfo 판독(판독 규칙은 `walk_legacy` 와 같은 표) — cfg 분기 없음.
+/// 검체 이음매는 이 파일이 아니라 `usage::clear_lineage_depth` 에 있다(이 파일의 소스핀은 첫 cfg(test) 속성을
+/// 프로덕션 경계로 쓴다 — 프로덕션 구간에 그 속성을 두면 경계가 당겨져 기존 소스핀이 조용히 약해진다).
+pub(crate) fn caller_agent_depth(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<usize> {
+    if agent_bin.is_empty() {
+        return None;
+    }
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let chain = ancestor_chain_to_root(caller_pid, root_pid, |cur| {
+        sys.process(Pid::from_u32(cur))
+            .and_then(|p| p.parent())
+            .map(|p| p.as_u32())
+    })?;
+    let argv = argv_snapshot(&chain);
+    let cmds: Vec<Option<String>> = chain.iter().map(|p| argv.get(p).cloned()).collect();
+    agent_depth_in_chain(&cmds, agent_bin)
+}
+
+/// 순수: `caller` 의 조상을 `root` 까지 모은다(caller 제외 · root 포함). 워크 규칙은 `walk_ancestry_with` 와
+/// 같다 — 최대 32홉 · 자기부모 절단 · parent ≤ 1 절단. 루트에 닿지 못하면 None.
+pub(crate) fn ancestor_chain_to_root(
+    caller: u32,
+    root: u32,
+    mut parent_of: impl FnMut(u32) -> Option<u32>,
+) -> Option<Vec<u32>> {
+    if caller == root {
+        return None; // 루트 자신의 호출은 훅 사슬이 아니다
+    }
+    let mut out = Vec::new();
+    let mut cur = caller;
+    for _ in 0..32 {
+        let parent = parent_of(cur)?;
+        if parent == cur || parent <= 1 {
+            return None;
+        }
+        out.push(parent);
+        if parent == root {
+            return Some(out);
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// 순수: 사슬 argv 중 에이전트 실행(`cmdline_matches_agent_exec` — 등록 전용 엄격 매처) 개수. argv 가 하나라도
+/// 없으면 None. 훅 셸(`sh …/hooks/session-start.sh`)·데이터 경로 인자(`…/claude/projects/x.jsonl`)는 세지 않는다.
+pub(crate) fn agent_depth_in_chain(cmds: &[Option<String>], agent_bin: &str) -> Option<usize> {
+    let mut n = 0usize;
+    for c in cmds {
+        if cmdline_matches_agent_exec(c.as_deref()?, agent_bin) {
+            n += 1;
+        }
+    }
+    Some(n)
+}
+
 // ── 관측 기반 에이전트 등록 (2026-08 · 현장 결함 2호: claim-role 전용 pane 부활 불가) ──
 //
 // 문제: `cys claim-role` 로만 역할을 쥔 pane(사람이 직접 CLI 를 띄운 좌석)은 agent_meta 가
@@ -20460,5 +20526,105 @@ mod merge_residue_tests {
             this[j..j + 400].contains("ready_marker"),
             "데몬 폴백이 사라졌다 — 그 삭제는 배달을 **여는** 방향이다(R6 기각 근거 · 실측)"
         );
+    }
+}
+
+#[cfg(test)]
+mod r3_1_lineage_tests {
+    use super::{agent_depth_in_chain, ancestor_chain_to_root};
+    use std::collections::HashMap;
+
+    #[test]
+    fn r3_1_chain_walk_table() {
+        let tree: HashMap<u32, u32> = [(10, 9), (9, 8), (8, 5), (5, 2), (2, 1)].into_iter().collect();
+        let po = |p: u32| tree.get(&p).copied();
+        assert_eq!(ancestor_chain_to_root(10, 5, po), Some(vec![9, 8, 5]));
+        assert_eq!(ancestor_chain_to_root(9, 8, po), Some(vec![8]));
+        assert_eq!(ancestor_chain_to_root(10, 7, po), None, "루트가 조상이 아니다");
+        assert_eq!(ancestor_chain_to_root(5, 5, po), None, "루트 자신");
+        assert_eq!(ancestor_chain_to_root(42, 5, po), None, "부모 미관측");
+        let cyc: HashMap<u32, u32> = [(10, 9), (9, 10)].into_iter().collect();
+        assert_eq!(ancestor_chain_to_root(10, 5, |p| cyc.get(&p).copied()), None, "순환");
+        assert_eq!(ancestor_chain_to_root(10, 5, |p| Some(p)), None, "자기부모");
+        // 33홉 사슬(루트가 33번째) → 32홉 상한에서 None, 32번째면 닿는다
+        assert_eq!(ancestor_chain_to_root(1000, 1000 - 33, |p| Some(p - 1)), None);
+        assert_eq!(ancestor_chain_to_root(1000, 1000 - 32, |p| Some(p - 1)).map(|v| v.len()), Some(32));
+    }
+
+    #[test]
+    fn r3_1_agent_depth_table() {
+        let s = |v: &str| Some(v.to_string());
+        let hook = s("sh /Users/x/.cys/pack/hooks/session-start.sh");
+        let wrap = s("python3 -c import os 10 cys usage-register --transcript /Users/x/.cys/claude/projects/-p/b.jsonl --source clear");
+        let top = s("claude --dangerously-skip-permissions --resume 298c0478-c5f4-4867-989d-a7cac849ae39");
+        let root = s("/bin/zsh -l");
+        // 좌석 최상위: 훅 → 래퍼 → claude → 루트 셸 = 1
+        assert_eq!(agent_depth_in_chain(&[wrap.clone(), hook.clone(), top.clone(), root.clone()], "claude"), Some(1));
+        // 중첩: 훅 → claude -p → 도구 셸 → 좌석 claude → 루트 = 2
+        let nested = s("/Users/x/.local/bin/claude -p /clear");
+        let tool = s("/bin/zsh -c source /Users/x/.claude-3/shell-snapshots/snapshot.sh && eval 'claude -p \"/clear\"'");
+        assert_eq!(agent_depth_in_chain(&[hook.clone(), nested, tool, top.clone(), root.clone()], "claude"), Some(2));
+        // npm 설치(node …/claude-code/cli.js)도 에이전트로 센다
+        let npm = s("node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js -p /clear");
+        assert_eq!(agent_depth_in_chain(&[hook.clone(), npm, top.clone(), root.clone()], "claude"), Some(2));
+        // argv 미관측이 하나라도 있으면 판정 불가
+        assert_eq!(agent_depth_in_chain(&[hook.clone(), None, top.clone(), root.clone()], "claude"), None);
+        // 에이전트 없음 = 0(= 거부)
+        assert_eq!(agent_depth_in_chain(&[hook.clone(), root.clone()], "claude"), Some(0));
+        // ★한계(연속성 ⓐ 가 맡는다): 버전 파일 경로로 직접 띄운 중첩(basename 2.1.282)은 세지 못한다
+        let versioned = s("/Users/x/.local/share/claude/versions/2.1.282 -p /clear");
+        assert_eq!(agent_depth_in_chain(&[hook, versioned, top, root], "claude"), Some(1));
+    }
+
+    /// 실제 프로세스 사슬(unix): 루트 셸 → `claude`(이름만 claude 인 셸 스크립트) → 훅 셸 → sleep(발신 대역).
+    /// 중첩은 claude 를 한 겹 더 두고, 평면은 claude 가 없다. sysinfo 조상·argv 판독이 0·1·2 를 내는지 본다.
+    #[cfg(unix)]
+    #[test]
+    fn r3_1_caller_agent_depth_counts_real_ancestry() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("cys-r31-lineage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
+        // 쓴 파일을 직접 exec 하지 않는다(모두 `/bin/sh <파일>`) — 병렬 검체의 fork 가 쓰기 fd 를 잠깐 물고 있을 때
+        // 나는 ETXTBSY 경주를 원천 차단한다. argv 모양은 shebang 실행과 같다(`/bin/sh …/claude …`).
+        w("claude", "\"$@\"\nexit 0\n");
+        w("leaf.sh", "sleep 30\nexit 0\n");
+        w("flat.sh", "/bin/sh \"$D/leaf.sh\"\nexit 0\n");
+        w("top.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/leaf.sh\"\nexit 0\n");
+        w("mid.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/leaf.sh\"\nexit 0\n");
+        w("nest.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/mid.sh\"\nexit 0\n");
+        for (entry, want) in [("flat.sh", Some(0usize)), ("top.sh", Some(1)), ("nest.sh", Some(2))] {
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(dir.join(entry))
+                .env("D", &dir)
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let root = child.id();
+            let mut caller = None;
+            for _ in 0..100 {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                caller = super::descendant_pids(&sys, root).into_iter().find(|p| {
+                    sys.process(sysinfo::Pid::from_u32(*p))
+                        .is_some_and(|pr| pr.name().to_string_lossy() == "sleep")
+                });
+                if caller.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let got = caller.and_then(|c| super::caller_agent_depth(root, c, "claude"));
+            let stray = caller.and_then(|c| super::caller_agent_depth(1, c, "claude"));
+            unsafe {
+                libc::kill(-(root as i32), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            assert!(caller.is_some(), "{entry}: sleep 자손을 못 찾았다");
+            assert_eq!(got, want, "{entry}");
+            assert_eq!(stray, None, "{entry}: 루트가 아닌 pid(1)까지는 사슬이 닿지 않아야 한다");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
