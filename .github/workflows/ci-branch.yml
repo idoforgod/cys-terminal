@@ -823,6 +823,12 @@ jobs:
           #     기동 단위 수 비례 · 행 의심 90 · 롤백 노브 · cys.rs 구조 핀). stdlib·데몬 불요 밀폐 검체라
           #     ALLOWED `test_phoenix_` 글롭 면제(release 전용)에 맡기지 않고 3완전 레인에 이름으로 싣는다.
           #     실측 2026-09-25 · macOS arm64 · python 3.9.6·3.14.7 · CYS_PACK_DIR 임시 · rc=0 · 약 2s.
+          #   ★R3-4(0.14.42) 1종 추가 등재 — test_hook_r34(프롬프트 훅 ⑥ 완료 감지·능력 프로브 양성 캐시·입력 GC 게이트 ·
+          #     도구 훅 빠른 길). 임시 디렉터리·스텁 cys·호출 기록 래퍼만 쓰는 밀폐 검체다(데몬 불요 · 라이브 무접촉).
+          #     test_hook_launcher_split 옆 5곳(ci-branch mac·ubuntu · pack-release · release 2곳)에 싣는다. Windows 레인은
+          #     없다 — 검체의 (msys) 행은 가짜 cygpath 모사일 뿐 플랫폼 증명이 아니다.
+          #     실측 2026-09-25 15:56 PDT · macOS arm64 · python 3.14.7 · 격리 HOME · CYS_PACK_DIR 임시 · 최종(C4) 검체
+          #     39행 rc=0 · 약 12s(시한 행이 느린 자식 4s 를 1s 시한으로 자르는 lab 들이 대부분을 쓴다).
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -830,7 +836,7 @@ jobs:
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
                    test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
-                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_hook_r34 test_mission_origin_parity \
                    test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
                    test_pyseal_negative_specimen \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
@@ -1455,7 +1461,7 @@ jobs:
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
                    test_runtime_seal test_preflight_c80_runtime_seal test_runtime_manifest_parity \
-                   test_check_ack_addr_gate test_hook_launcher_split test_mission_origin_parity \
+                   test_check_ack_addr_gate test_hook_launcher_split test_hook_r34 test_mission_origin_parity \
                    test_bootlast_golden_lock_parity test_bootv2_doc_contract test_pyseal_census \
                    test_pyseal_negative_specimen \
                    test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root test_cysd_accept_emfile \
