@@ -5691,6 +5691,9 @@ fn inject_write<W: Write>(
 /// ★B2′ writer 로컬 상태 `last_program_write`: 이 루프가 **실제로** 프로그램 본문을 PTY 에
 /// 쓴 마지막 시각. 최소 간격의 기준점은 반드시 이 값이어야 한다(핸들러의 enqueue 시각이
 /// 기준이면 writer 적체 구간에서 간격이 0 으로 붕괴한다 — codex 감사 R1).
+// 프로덕션 좌석은 표식판([`run_writer_loop_tracked`])을 쓴다 — 이 판은 검체(delivery race 실증·writer 누수 가드) 전용이다.
+// `#[cfg(test)]` 가 아니라 allow 인 이유: 이 파일의 '프로덕션 영역' 소스 핀 앵커(첫 `#[cfg(test)]`)를 앞당기지 않는다.
+#[allow(dead_code)]
 pub(crate) fn run_writer_loop<W: Write>(
     writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
