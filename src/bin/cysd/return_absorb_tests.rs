@@ -564,7 +564,11 @@ fn a2_cycle_three_split_with_active_ticket() {
 // ─────────────────────────── ticket_observation — 표 직접 관측 ───────────────────────────
 
 fn ticket_of(t: &Arc<Surface>, sender: u64) -> Option<crate::state::ReturnTicketKind> {
-    t.return_tickets.lock().unwrap().get(&sender).map(|x| x.kind.clone())
+    t.return_tickets
+        .lock()
+        .unwrap()
+        .get(&crate::state::PairKey::Verified(sender))
+        .map(|x| x.kind.clone())
 }
 
 /// 표 수명 주기: 발급(Pair{entry_id}) → 자기 본문 제출은 유지 → 비제출 키 소거 → 직접 send 소거(D2)
@@ -638,8 +642,9 @@ fn a2_issue_prunes_expired_tickets() {
     let fx = fx("prune");
     let t = pane(&fx, "worker-1", P + 220);
     let ttl = std::time::Duration::from_secs(30);
+    let v = crate::state::PairKey::Verified;
     for sender in 1..=5u64 {
-        t.issue_return_ticket(sender, crate::state::ReturnTicketKind::Compensation, ttl);
+        t.issue_return_ticket(v(sender), crate::state::ReturnTicketKind::Compensation, ttl);
     }
     // 1..=5 를 전부 만료 나이로 되돌린다.
     let old = std::time::Instant::now()
@@ -648,14 +653,56 @@ fn a2_issue_prunes_expired_tickets() {
     for tk in t.return_tickets.lock().unwrap().values_mut() {
         tk.issued = old;
     }
-    t.issue_return_ticket(9, crate::state::ReturnTicketKind::Compensation, ttl);
-    let keys: Vec<u64> = t.return_tickets.lock().unwrap().keys().copied().collect();
-    assert_eq!(keys, vec![9], "발급 때 만료분 정리");
+    t.issue_return_ticket(v(9), crate::state::ReturnTicketKind::Compensation, ttl);
+    let keys: Vec<crate::state::PairKey> = t.return_tickets.lock().unwrap().keys().copied().collect();
+    assert_eq!(keys, vec![v(9)], "발급 때 만료분 정리");
     // CAS: 발급 시각이 다르면 꺼내지 않는다.
-    assert!(t.take_return_ticket(9, old).is_none());
-    let at = t.peek_return_ticket(9).unwrap().issued;
-    assert!(t.take_return_ticket(9, at).is_some());
-    assert!(t.peek_return_ticket(9).is_none());
+    assert!(t.take_return_ticket(v(9), old).is_none());
+    let at = t.peek_return_ticket(v(9)).unwrap().issued;
+    assert!(t.take_return_ticket(v(9), at).is_some());
+    assert!(t.peek_return_ticket(v(9)).is_none());
+}
+
+/// ★(B) 좌석당 상한: 서로 다른 Claimed 100장을 발급해도 64장 이하 · 가장 새 표는 남는다(퇴출은 가장 오래된 것부터).
+/// Claimed 번호 공간은 식별 불가 호출자의 자기신고라 열려 있다 — 상한이 없으면 표가 무한히 자란다.
+#[test]
+fn b_ticket_map_capped_newest_kept() {
+    let fx = fx("b-cap");
+    let t = pane(&fx, "worker-1", P + 760);
+    let ttl = std::time::Duration::from_secs(30);
+    let c = crate::state::PairKey::Claimed;
+    for n in 0..100u64 {
+        t.issue_return_ticket(c(10_000 + n), crate::state::ReturnTicketKind::Compensation, ttl);
+    }
+    let m = t.return_tickets.lock().unwrap();
+    assert!(m.len() <= crate::state::RETURN_TICKETS_CAP, "상한: {}", m.len());
+    assert_eq!(m.len(), crate::state::RETURN_TICKETS_CAP);
+    assert!(m.contains_key(&c(10_099)), "가장 새 표는 남는다");
+    assert!(!m.contains_key(&c(10_000)), "가장 오래된 표부터 퇴출");
+}
+
+/// ★(B) 표 1장에 두 스레드가 동시에 CAS 소비 — 정확히 1개만 꺼낸다(1회성).
+#[test]
+fn b_concurrent_take_exactly_one() {
+    let fx = fx("b-race");
+    let t = pane(&fx, "worker-1", P + 770);
+    let key = crate::state::PairKey::Claimed(CEO_FROM);
+    for _ in 0..50 {
+        t.issue_return_ticket(key, crate::state::ReturnTicketKind::Compensation, std::time::Duration::from_secs(30));
+        let at = t.peek_return_ticket(key).unwrap().issued;
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                let (t, b) = (t.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    t.take_return_ticket(key, at).is_some()
+                })
+            })
+            .collect();
+        let got: usize = hs.into_iter().map(|h| h.join().unwrap() as usize).sum();
+        assert_eq!(got, 1, "정확히 1회 소비");
+    }
 }
 
 // ─────────────── A2-F1 — 승인이 살아 있으면 흡수는 반사 창 안으로만(워커 hang 금지) ───────────────
@@ -695,7 +742,7 @@ fn send_fallback_after_denial(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text:
 /// 발신자 표를 `ms` 만큼 늙힌다 — 벽시계 대기 없이 결정론(r1b 재현 나이 5.6초 등).
 fn age_ticket(t: &Arc<Surface>, sender: u64, ms: u64) {
     let mut m = t.return_tickets.lock().unwrap();
-    let tk = m.get_mut(&sender).expect("늙힐 표가 있어야 한다");
+    let tk = m.get_mut(&crate::state::PairKey::Verified(sender)).expect("늙힐 표가 있어야 한다");
     tk.issued = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_millis(ms))
         .expect("단조 시계");
@@ -1089,4 +1136,194 @@ fn rf1_seat_approval_live_truth_table() {
     }
     push_daemon_approval(&fx, bare.id, 2);
     assert!(!live(&bare), "마커 없는 좌석도 관문 화면이면 false");
+}
+
+// ─────── ★B(0.14.42) 교차 소켓 Claimed 키 — 검증 신원이 없을 때만 자기신고 `from` 으로 표를 연다 ───────
+//
+// 설계 B(design-B-final · A2 표 구조 재사용): A2 표는 **검증 신원**(커널 peer pid → 이 데몬의 좌석)만 키로 썼다.
+// 교차 소켓 발신자(HQ 의 CEO 가 `cys --socket <부서>.sock send --to master …` + `send-key … Return`)는 이 데몬의
+// 좌석이 아니라 검증 신원이 없다 → 모달 거부 → 큐 폴백 → 짝 Return 이 **그대로 써져** 부서장의 질문·권한 창을
+// 눌렀다(샌드박스 미니 S22 · 좌석 밖 발신 + CYS_SURFACE_ID=900: A2 트리 20/30 · 09-21 CEO→부서장 사례와 같은 모양).
+// B 는 검증 신원이 **없을 때만** CLI 가 싣는 자기신고 `from` 을 `Claimed` 키로 쓴다. 검증 신원이 있으면 그것만
+// 쓴다(로컬 좌석은 from 을 무엇으로 싣든 Verified). Verified(n) 과 Claimed(n) 은 서로 다른 키다.
+// 오너 토큰을 실은(pane 무귀속) 호출자는 Claimed 를 만들지도 쓰지도 않는다.
+
+/// 이 데몬에는 없는 번호 — 다른 데몬(HQ)의 CEO 좌석 id(자기신고 from).
+const CEO_FROM: u64 = 900;
+
+fn direct_from(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text: &str, extra: Value) -> Value {
+    let mut p = json!({"surface_id": t.id, "text": text, "queued": false, "quiet": true});
+    for (k, v) in extra.as_object().expect("extra 는 객체") {
+        p[k] = v.clone();
+    }
+    rpc(fx, pid, "surface.send_text", p)
+}
+
+/// `cys send` 폴백(신 CLI) — 직접 전송이 타이핑 가드·초안 게이트로 거부되면 `queued:true` + `absorb_return:true`
+/// 로 1회 재요청한다. CLI 는 두 요청 모두에 `from`(CYS_SURFACE_ID)을 싣는다.
+fn fallback_from(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text: &str, extra: Value) -> Value {
+    let first = direct_from(fx, pid, t, text, extra.clone());
+    assert_eq!(first["ok"], json!(false), "전제: 직접 전송이 거부돼야 폴백이 일어난다: {first}");
+    let msg = first["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains(cys::MSG_TYPING_GUARD), "전제: 폴백 대상 거부(타이핑 가드 문구): {first}");
+    let mut p = json!({"surface_id": t.id, "text": text, "queued": true, "absorb_return": true, "quiet": true});
+    for (k, v) in extra.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    let r2 = rpc(fx, pid, "surface.send_text", p);
+    assert_eq!(r2["ok"], json!(true), "큐 전환은 성공해야 한다: {r2}");
+    r2
+}
+
+/// 신 CLI 의 단일 `send-key Return` — 비큐 요청에 `from`(B5) 을 싣는다.
+fn pair_return_from(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, extra: Value) -> Value {
+    let mut p = json!({"surface_id": t.id, "key": "Return", "queued": false, "pair_return": true});
+    for (k, v) in extra.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    rpc(fx, pid, "surface.send_key", p)
+}
+
+/// ★B 핵심 재현(적색): 교차 소켓 CEO(검증 불가 pid + from=900) → 부서장(권한 창 전경) `send` 가 모달로 큐 전환
+/// → 같은 셸 체인의 짝 Return → **흡수(쓰기 0)**. 종전(A2): 표 미발급(unverified) → Return 이 써져 창을 눌렀다.
+#[test]
+fn b_claimed_cross_socket_modal_pair_return_absorbed() {
+    let fx = fx("b-claimed");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000"); // 부하 러너에서도 '반사 창 안' 전제 고정
+    let t = pane(&fx, "master", P + 700);
+    paint_modal(&t);
+    let first = direct_from(&fx, None, &t, "[CEO 지시] 착수", json!({"from": CEO_FROM}));
+    assert!(
+        first["error"]["message"].as_str().unwrap_or("").contains("[draft_gate:modal]"),
+        "전제: 모달 전경 거부: {first}"
+    );
+    let r2 = fallback_from(&fx, None, &t, "[CEO 지시] 착수", json!({"from": CEO_FROM}));
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "교차 소켓 자기신고 from 으로 표 발급: {r2}");
+    // 대조 ①: from 없는 요청(구 CLI send-key)은 표를 쓰지 못한다 — 종전처럼 쓴다.
+    // 대조 ②: 다른 자기신고(901)도 쓰지 못한다.
+    // (둘 다 쓰기를 만들므로 CEO 의 흡수 검사 **뒤**에 본다 — 쓰기가 창을 닫는 좌석 모형은 없지만 순서를 고정.)
+    let before = counts(&t);
+    let resp = pair_return_from(&fx, None, &t, json!({"from": CEO_FROM}));
+    assert_absorbed(&resp, "pair", "queued");
+    assert_eq!(counts(&t), before, "쓰기 0 — 창의 기본 선택지를 누르지 않는다");
+    assert_eq!(qlen(&t), 1, "본문은 큐에 그대로(창이 닫힌 뒤 CR 포함 배달)");
+    let ev = bus_last(&fx, "queue.return_absorbed").expect("흡수 이벤트");
+    assert_eq!(ev["payload"]["from"], json!(cys::surface_ref(CEO_FROM)), "{ev}");
+    assert_eq!(ev["payload"]["from_verified"], json!(false), "자기신고 키임을 싣는다: {ev}");
+    // 1회용: 같은 자기신고의 두 번째 Return 은 쓴다(재전송 안내가 참).
+    assert_sent(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM})));
+    // 새 전환 뒤 대조 ①②(쓰인 CR 의 PTY 에코가 화면을 밀었을 수 있다 — 창을 다시 그린다).
+    paint_modal(&t);
+    let _ = fallback_from(&fx, None, &t, "[CEO 지시] 2", json!({"from": CEO_FROM}));
+    assert_sent(&pair_return_from(&fx, None, &t, json!({})));
+    assert_sent(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM + 1})));
+    assert_absorbed(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM})), "pair", "queued");
+}
+
+/// Verified(n) 과 Claimed(n) 은 서로 다른 키다(B 지적 2·11): 교차 소켓이 로컬 좌석 P 의 번호를 자기신고해도
+/// ③ P 의 Return(Verified) 을 흡수하지 않고 ② P 의 직접 send 성공이 Claimed(P) 를 지우지 않는다.
+#[test]
+fn b_claimed_and_verified_are_separate_namespaces() {
+    let fx = fx("b-ns");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000");
+    let t = pane(&fx, "worker-1", P + 710);
+    let p = pane(&fx, "worker-2", P + 711);
+    typing_on(&t);
+    let r2 = fallback_from(&fx, None, &t, "외부 본문", json!({"from": p.id}));
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "Claimed(p) 발급: {r2}");
+    typing_off(&t);
+    // ③ 로컬 P 의 Return 은 흡수되지 않는다(Verified(p) 표 없음).
+    assert_sent(&pair_return(&fx, Some(P + 711), &t));
+    // ② 로컬 P 의 직접 send 성공은 Claimed(p) 를 지우지 않는다(D2 는 자기 키만 소거).
+    assert_eq!(direct(&fx, Some(P + 711), &t, "P 본문")["ok"], json!(true));
+    assert_sent(&pair_return(&fx, Some(P + 711), &t));
+    assert_eq!(counts(&t).0, 0, "P 본문 제출");
+    // Claimed(p) 는 남아 있다 — 식별 불가 from=p 의 짝 Return 은 흡수.
+    assert_absorbed(&pair_return_from(&fx, None, &t, json!({"from": p.id})), "pair", "queued");
+}
+
+/// 스푸핑(대조 · 수정 전후 모두 녹색): 로컬 좌석 Q 가 from=CEO 를 실어도 **Verified(q)** 만 연다 —
+/// 식별 불가 from=CEO 의 Return 은 그 표를 쓰지 못한다.
+#[test]
+fn b_local_pane_spoofed_from_arms_verified_only() {
+    let fx = fx("b-spoof");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000");
+    let t = pane(&fx, "worker-1", P + 720);
+    let _q = pane(&fx, "worker-2", P + 721);
+    typing_on(&t);
+    let r2 = fallback_from(&fx, Some(P + 721), &t, "Q 본문", json!({"from": CEO_FROM}));
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "{r2}");
+    typing_off(&t);
+    assert_sent(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM})));
+    assert_absorbed(&pair_return(&fx, Some(P + 721), &t), "pair", "queued");
+}
+
+/// 오너 토큰(pane 무귀속 GUI 등급) 호출자는 from 을 실어도 Claimed 를 만들지도 쓰지도 않는다(대조 · 전후 녹색).
+#[test]
+fn b_owner_token_caller_never_claims() {
+    let fx = fx("b-owner");
+    let tok = fx.daemon.operator_token.clone().expect("데몬 토큰");
+    let t = pane(&fx, "worker-1", P + 730);
+    typing_on(&t);
+    let r2 = fallback_from(&fx, None, &t, "오너 문안", json!({"from": CEO_FROM, "owner_token": tok}));
+    assert_eq!(r2["result"]["return_absorb"], json!(false), "오너 토큰 호출자는 Claimed 발급 0: {r2}");
+    typing_off(&t);
+    assert_sent(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM, "owner_token": tok})));
+}
+
+/// 결측형(대조 · 전후 녹색): from 이 결측·null·빈 문자열·숫자 아닌 문자열이면 Claimed 도 없다.
+#[test]
+fn b_missing_or_garbage_from_never_claims() {
+    let fx = fx("b-missing");
+    let t = pane(&fx, "worker-1", P + 740);
+    for (i, extra) in [
+        json!({}),
+        json!({"from": null}),
+        json!({"from": ""}),
+        json!({"from": "inject(typing_guard fallback)"}),
+        json!({"from": -3}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        typing_on(&t);
+        let r2 = fallback_from(&fx, None, &t, &format!("본문{i}"), extra.clone());
+        assert_eq!(r2["result"]["return_absorb"], json!(false), "결측은 값이 아니다({extra}): {r2}");
+        typing_off(&t);
+        assert_sent(&pair_return_from(&fx, None, &t, extra));
+    }
+}
+
+/// B ⓒ(적색): 같은 자기신고 발신자의 직접 send 성공은 Claimed 표를 끝낸다 — 뒤따르는 Return 은 새 본문을
+/// 제출해야 한다(흡수 금지). 비제출 키(Down)도 Claimed 표를 지운다(D4 정산 — 선택지 조작 뒤 Return 비흡수).
+#[test]
+fn b_claimed_ticket_cleared_by_direct_success_and_non_submit_key() {
+    let fx = fx("b-clear");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000");
+    let t = pane(&fx, "worker-1", P + 750);
+    let ceo = json!({"from": CEO_FROM});
+    typing_on(&t);
+    let r2 = fallback_from(&fx, None, &t, "본문", ceo.clone());
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "{r2}");
+    typing_off(&t);
+    assert_eq!(direct_from(&fx, None, &t, "새 본문", ceo.clone())["ok"], json!(true));
+    let r = pair_return_from(&fx, None, &t, ceo.clone());
+    assert_sent(&r);
+    assert_eq!(counts(&t).0, 0, "새 본문 제출(흡수 금지)");
+    // 비제출 키.
+    typing_on(&t);
+    let r2 = fallback_from(&fx, None, &t, "본문2", ceo.clone());
+    assert_eq!(r2["result"]["return_absorb"], json!(true), "{r2}");
+    typing_off(&t);
+    let mut down = json!({"surface_id": t.id, "key": "Down"});
+    down["from"] = json!(CEO_FROM);
+    assert_eq!(rpc(&fx, None, "surface.send_key", down)["ok"], json!(true));
+    assert_sent(&pair_return_from(&fx, None, &t, ceo.clone()));
+    // 노브 0 이면 Claimed 도 발급 0.
+    std::env::set_var("CYS_RETURN_ABSORB_SECS", "0");
+    typing_on(&t);
+    let r2 = fallback_from(&fx, None, &t, "본문3", ceo.clone());
+    assert_eq!(r2["result"]["return_absorb"], json!(false), "{r2}");
+    typing_off(&t);
+    assert_sent(&pair_return_from(&fx, None, &t, ceo));
 }

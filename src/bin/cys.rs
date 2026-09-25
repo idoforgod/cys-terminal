@@ -2294,6 +2294,26 @@ fn send_key_pair_return(keys: &[String]) -> bool {
     keys.len() == 1 && matches!(keys[0].as_str(), "Return" | "Enter")
 }
 
+/// ★(0.14.42 · B5) `cys send-key` 요청 파라미터(순수). **비큐 요청에만** 자기신고 `from`(CYS_SURFACE_ID —
+/// `cys send` 와 같은 해석)을 싣는다. 데몬은 검증 신원(커널 peer pid → 좌석)이 **없을 때만** 이 from 을 짝 Return
+/// 흡수 표의 `Claimed` 키로 쓴다 — 교차 소켓 발신자(HQ CEO 가 `cys --socket <부서>.sock send … ; send-key … Return`)
+/// 의 짝 Return 이 부서장의 질문·권한 창을 누르던 경로를 닫는다. 로컬 좌석의 from 은 데몬이 무시한다(검증 우선).
+/// 명시 `--queued` 는 종전 바이트 그대로다(from 없음 — queue.enqueued 페이로드 from=null 유지). 구 데몬은
+/// send_key 의 from 을 읽지 않는다(ACL 은 커널 pid·토큰만 본다) — 가산적이다.
+fn send_key_request_params(
+    sid: u64,
+    key: &str,
+    queued: bool,
+    pair: bool,
+    from: Option<u64>,
+) -> serde_json::Value {
+    let mut p = json!({"surface_id": sid, "key": key, "queued": queued, "pair_return": pair});
+    if let (false, Some(f)) = (queued, from) {
+        p["from"] = json!(f);
+    }
+    p
+}
+
 /// ★(0.14.42 · A2 C2) 흡수 응답의 stdout 한 줄(순수) — `OK`·`QUEUED` 로 시작하지 않는다(첫 줄만 읽는
 /// 소비 스크립트가 직접 제출·적재로 오독하지 않게). 본문 상태별 문구 셋 · 다중 대상 접미 `tag`.
 fn format_absorbed_line(r: &serde_json::Value, tag: &str) -> String {
@@ -4361,6 +4381,8 @@ fn run(command: Command) -> i32 {
                     }
                 }
                 let multi = sids.len() > 1;
+                // ★(0.14.42 · B5) 자기신고 from — `cys send` 와 같은 해석(교차 소켓 Claimed 키의 재료 · 비큐 요청만).
+                let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 // ★(0.14.42 · A2 C2) 짝 Return 표식 — 단일 `Return|Enter` 만(다중 키·별칭은 원시 요청).
                 //   데몬은 이 발신자의 `cys send` 가 방금 큐로 자동 전환됐을 때만 이 Return 1회를
                 //   흡수한다(쓰기 0). 기계 본문 위 Return 은 표식이 있어도 종전처럼 제출된다.
@@ -4377,7 +4399,7 @@ fn run(command: Command) -> i32 {
                     for key in &keys {
                         let r = match request(
                             "surface.send_key",
-                            json!({"surface_id": sid, "key": key, "queued": queued, "pair_return": pair}),
+                            send_key_request_params(sid, key, queued, pair, from),
                         ) {
                             Ok(r) => r,
                             // ★B3: 제출 Return 이 타이핑 가드에 막히면 소실시키지 않고 큐로
@@ -27083,12 +27105,48 @@ mod tests {
         assert!(!send_key_pair_return(&k(&["Down", "Return"])), "선택지 조작 뒤 Return 은 대상 밖");
         assert!(!send_key_pair_return(&k(&["Return", "Return"])));
         assert!(!send_key_pair_return(&k(&[])));
-        // 배선 핀: 첫 요청과 폴백 r2 모두 pair_return 을 싣는다.
+        // 배선 핀: 첫 요청과 폴백 r2 모두 pair_return 을 싣는다(★B5: 첫 요청은 `send_key_request_params` 헬퍼).
         let src = include_str!("cys.rs");
         let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
         let arm = arm.split("Command::SetStatus").next().unwrap();
-        assert_eq!(arm.matches("\"pair_return\": pair").count(), 2, "첫 요청·폴백 r2 둘 다");
+        assert_eq!(arm.matches("\"pair_return\": pair").count(), 1, "폴백 r2(인라인)");
+        assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청(헬퍼)");
+        assert_eq!(send_key_request_params(1, "Return", false, true, None)["pair_return"], json!(true));
         assert!(arm.contains("!any_absorbed") && arm.contains("!sid_absorbed"), "흡수 시 OK 억제");
+    }
+
+    /// ★(0.14.42 · B5) `send-key` 요청 파라미터(순수) — **비큐 요청에만** 자기신고 from(CYS_SURFACE_ID)을 싣는다.
+    /// 데몬은 검증 신원이 없을 때만 그 from 을 짝 Return 표의 Claimed 키로 쓴다(교차 소켓 CEO → 부서장).
+    /// 명시 `--queued`·폴백 r2 는 종전 바이트 그대로다(queue.enqueued 페이로드 from=null 유지).
+    #[test]
+    fn b_send_key_request_params_from_only_when_not_queued() {
+        let ser = |v: &serde_json::Value| serde_json::to_string(v).unwrap();
+        // 명시 --queued: from 이 있어도 종전 바이트(from 없음).
+        let legacy_q = json!({"surface_id": 5, "key": "Return", "queued": true, "pair_return": true});
+        assert_eq!(ser(&send_key_request_params(5, "Return", true, true, Some(900))), ser(&legacy_q));
+        // 비큐 + from → from(정수) 추가 · 나머지 키 불변.
+        let p = send_key_request_params(5, "Return", false, true, Some(900));
+        assert_eq!(p["from"], json!(900));
+        assert_eq!(p["surface_id"], json!(5));
+        assert_eq!(p["key"], json!("Return"));
+        assert_eq!(p["queued"], json!(false));
+        assert_eq!(p["pair_return"], json!(true));
+        // 비큐 + from 결측 → 종전 바이트(결측은 값이 아니다 — null 도 싣지 않는다).
+        let legacy = json!({"surface_id": 5, "key": "Down", "queued": false, "pair_return": false});
+        assert_eq!(ser(&send_key_request_params(5, "Down", false, false, None)), ser(&legacy));
+        // 배선 핀: 첫 요청은 헬퍼(from 포함) · 폴백 r2 는 종전 인라인(from 없음) · from 은 Send 와 같은 해석.
+        let src = include_str!("cys.rs");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = arm.split("Command::SetStatus").next().unwrap();
+        assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청은 헬퍼 경유");
+        assert!(
+            arm.contains("let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));"),
+            "from 해석은 cys send 와 같은 규칙"
+        );
+        let r2 = arm.split("Err(e) if should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
+        let r2 = &r2[..r2.find(")?;").expect("r2 끝")];
+        assert!(r2.contains("\"queued\": true, \"pair_return\": pair}"), "폴백 r2 종전 바이트: {r2}");
+        assert!(!r2.contains("from"), "폴백 r2 에 from 금지(종전 페이로드 유지): {r2}");
     }
 
     /// ★(0.14.42 · A2 C2) ABSORBED 포맷터 — OK·QUEUED 로 시작하지 않고, 본문 상태 3문구 · 다중 대상 접미.

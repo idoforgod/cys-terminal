@@ -2320,6 +2320,47 @@ fn return_absorb_reflex() -> std::time::Duration {
     )
 }
 
+/// ★(0.14.42 · B2) 요청의 자기신고 `from` 해석 — 배달 원장(`record_audited`) from 해석과 **같은 규칙**의 단일
+/// 정의처(JSON 정수 · `"surface:N"` · `"N"`). 그 밖(결측·null·빈 문자열·음수·임의 문자열)은 `None` 이다 — 결측은
+/// 값이 아니다(`"inject(typing_guard fallback)"` 같은 사람용 표기는 번호가 아니다).
+fn claimed_from_sid(params: &Value) -> Option<u64> {
+    let from = params.get("from")?;
+    from.as_u64().or_else(|| {
+        from.as_str()
+            .and_then(|s| s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok())
+    })
+}
+
+/// ★(0.14.42 · B2) 짝 Return 흡수 표의 발신자 키(순수) — 검증 신원이 있으면 **그것만**(`Verified` · 요청의 from
+/// 은 보지 않는다 = 로컬 좌석은 무엇을 자기신고해도 남의 표를 열거나 쓰지 못한다), 없을 때만 자기신고
+/// (`Claimed`). `claimed` 클로저는 검증 신원이 없을 때만 부른다.
+fn pair_key(
+    verified_from: Option<u64>,
+    claimed: impl FnOnce() -> Option<u64>,
+) -> Option<crate::state::PairKey> {
+    match verified_from {
+        Some(v) => Some(crate::state::PairKey::Verified(v)),
+        None => claimed().map(crate::state::PairKey::Claimed),
+    }
+}
+
+/// ★(0.14.42 · B2) 요청 단위 발신자 키 — [`pair_key`] 에 자기신고 규칙을 붙인다: 오너·오퍼레이터 토큰을 실은
+/// pane 무귀속 호출자(GUI 등급 · `caller_is_owner`)는 `Claimed` 를 쓰지 않는다(사람·GUI 경로 무접촉 — 그 경로는
+/// `absorb_return`·`pair_return` 을 싣지 않지만 토큰 등급을 한 번 더 막는다). 비용: 토큰 비교 1회(메모리).
+fn request_pair_key(
+    daemon: &Daemon,
+    verified_from: Option<u64>,
+    params: &Value,
+) -> Option<crate::state::PairKey> {
+    pair_key(verified_from, || {
+        if caller_is_owner(daemon, params, None) {
+            None
+        } else {
+            claimed_from_sid(params)
+        }
+    })
+}
+
 /// ★(0.14.42 · A2) 흡수 자격 미달 사유 — `absorb_miss` 응답 키의 값.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AbsorbMiss {
@@ -2331,7 +2372,7 @@ enum AbsorbMiss {
     NotSubmitKey,
     /// authoritative 파라미터(launch-agent·reinject 등 권위 경로)는 구조적으로 대상 밖.
     Authoritative,
-    /// 발신자 신원 미해석(결측은 값이 아니다).
+    /// 발신자 키 없음 — 검증 신원도, 쓸 수 있는 자기신고 `from`(B · `request_pair_key`)도 없다(결측은 값이 아니다).
     Unverified,
     /// 이 발신자의 표가 없다.
     NoTicket,
@@ -2383,7 +2424,7 @@ fn return_absorb_verdict(
     pair_return: bool,
     key: &str,
     authoritative_param: bool,
-    verified_from: Option<u64>,
+    caller: Option<crate::state::PairKey>,
     ticket_age: Option<std::time::Duration>,
     queued: bool,
     pending: u64,
@@ -2401,7 +2442,7 @@ fn return_absorb_verdict(
     if authoritative_param {
         return AbsorbVerdict::Miss(AbsorbMiss::Authoritative);
     }
-    if verified_from.is_none() {
+    if caller.is_none() {
         return AbsorbVerdict::Miss(AbsorbMiss::Unverified);
     }
     let Some(age) = ticket_age else {
@@ -2466,8 +2507,10 @@ enum TicketSettle {
 /// 비제출 키(Down·Tab·Esc·C-u …)와 빈 줄·사람 초안 위 제출은 언제나 소거한다 — 그래서
 /// `send-key Down Return`·선택지 조작 뒤의 Return 은 절대 흡수되지 않는다.
 /// 소유자 결측(세대 불일치)은 값이 아니다 — 보상도 유지도 없이 소거한다.
+/// ★(B) 소유자는 검증 신원뿐이다(`PendingInputState.owner`) — `Claimed` 발신자는 소유자와 같을 수 없으므로
+/// 기계 본문 제출은 언제나 '남의 본문'(보상) 또는 결측(소거)이다. 보상 표는 `Verified(o)` 로 발급한다.
 fn ticket_after_key_write(
-    caller: u64,
+    caller: crate::state::PairKey,
     owner: Option<u64>,
     pending_before: u64,
     human_before: u64,
@@ -2475,7 +2518,7 @@ fn ticket_after_key_write(
 ) -> TicketSettle {
     if key_submits && pending_before > 0 && human_before == 0 {
         match owner {
-            Some(o) if o == caller => TicketSettle::Keep,
+            Some(o) if caller == crate::state::PairKey::Verified(o) => TicketSettle::Keep,
             Some(o) => TicketSettle::ClearAndCompensate(o),
             None => TicketSettle::Clear,
         }
@@ -2491,7 +2534,7 @@ fn return_absorbed_response(
     surface: &crate::state::Surface,
     id: &Value,
     key: &str,
-    caller: u64,
+    caller: crate::state::PairKey,
     ticket: &crate::state::ReturnTicket,
 ) -> Value {
     let ticket_age_ms = ticket.issued.elapsed().as_millis() as u64;
@@ -2517,7 +2560,9 @@ fn return_absorbed_response(
         Some(surface.id),
         json!({
             "surface_ref": cys::surface_ref(surface.id),
-            "from": cys::surface_ref(caller),
+            "from": cys::surface_ref(caller.sid()),
+            // ★(B) 키 등급 — false = 교차 소켓 등 검증 신원 없는 자기신고(Claimed). 추가형 키.
+            "from_verified": caller.is_verified(),
             "absorb_kind": kind,
             "queue_entry_id": entry_id,
             "body_state": body_state,
@@ -4612,8 +4657,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 //   `absorb_return:true` 를 싣는다(명시 `--queued` 는 싣지 않으므로 표 없음 — 의도적
                 //   Return 을 삼키지 않는다). 큐 Inject 가 CR 까지 제출하므로 뒤따르는 관례적 짝
                 //   Return 은 불필요하다 — 그 1회를 데몬이 흡수해 맨 CR·빈 큐 항목·거짓 queue_full 을 없앤다.
-                //   조건: 검증 발신자(결측은 값이 아니다) · ttl>0 · 끝이 CR/LF 아님(자동 제출 본문은
+                //   조건: 발신자 키 있음(결측은 값이 아니다) · ttl>0 · 끝이 CR/LF 아님(자동 제출 본문은
                 //   짝 Return 이 오지 않는다 — 여러 줄 본문은 중간 LF 가 있어도 짝 Return 이 온다).
+                //   ★(B) 키 = 검증 신원 우선, 없을 때만 자기신고 from(Claimed · 교차 소켓 CEO 등 — `request_pair_key`).
                 //   큐 락을 놓은 뒤·응답 전에 기록한다(표 락은 단독 leaf).
                 let absorb_return = params
                     .get("absorb_return")
@@ -4621,7 +4667,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .unwrap_or(false);
                 if absorb_return {
                     let ttl = return_absorb_ttl_secs();
-                    let issued = match verified_from {
+                    let issued = match request_pair_key(daemon, verified_from, &params) {
                         Some(x) if ttl > 0 && !text.ends_with(['\r', '\n']) => {
                             surface.issue_return_ticket(
                                 x,
@@ -4743,14 +4789,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 );
             }
             if !human_verified {
-                let from_sid = verified_from.or_else(|| {
-                    params
-                        .get("from")
-                        .and_then(|v| v.as_u64())
-                        .or_else(|| params.get("from").and_then(|v| v.as_str()).and_then(|s| {
-                            s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
-                        }))
-                });
+                // ★(B2) 자기신고 from 해석은 `claimed_from_sid` 단일 정의처(짝 Return 표의 Claimed 키와 같은 규칙 ·
+                //   의미 동일 치환 — u64 · "surface:N" · "N").
+                let from_sid = verified_from.or_else(|| claimed_from_sid(&params));
                 crate::delivery::record_audited(
                     daemon,
                     sid,
@@ -4841,7 +4882,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
             // ★(0.14.42 · A2 D2) 직접 send 가 성공했으면 이 발신자의 짝 Return 표는 끝났다 — 뒤따르는
             //   Return 은 이 새 본문을 제출해야 한다(clear_first 포함). 표 락은 단독 leaf(게이트 밖).
-            if let Some(x) = verified_from {
+            //   ★(B) 키는 발급과 같은 규칙(`request_pair_key`) — Claimed 발신자의 직접 성공도 자기 표만 지운다
+            //   (Verified(n) 과 Claimed(n) 은 서로를 지우지 않는다).
+            if let Some(x) = request_pair_key(daemon, verified_from, &params) {
                 surface.clear_return_ticket(x);
             }
             if !human_verified {
@@ -4961,10 +5004,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .unwrap_or(false);
             let absorb_ttl = return_absorb_ttl_secs();
             let absorb_reflex = return_absorb_reflex();
+            // ★(0.14.42 · B) 발신자 키 — 검증 신원 우선, 없을 때만 자기신고 from(Claimed · 신 CLI 는 비큐
+            //   send-key 에 from 을 싣는다). 흡수 판정·게이트 안 재확인·쓰기 뒤 정산이 모두 이 키 하나를 쓴다.
+            let caller_key = request_pair_key(daemon, verified_from, &params);
             // (verdict, 판정에 쓴 표의 발급 시각) — pair_return 없는 요청은 표·계수를 읽지 않는다.
             let mut absorb: Option<(AbsorbVerdict, Option<std::time::Instant>)> = None;
             if pair_return {
-                let ticket = verified_from.and_then(|x| surface.peek_return_ticket(x));
+                let ticket = caller_key.and_then(|x| surface.peek_return_ticket(x));
                 let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
                 let human = surface
                     .pending_input
@@ -4978,7 +5024,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     pair_return,
                     &key,
                     authoritative_param,
-                    verified_from,
+                    caller_key,
                     ticket_age,
                     queued_param,
                     pending,
@@ -4992,7 +5038,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     governance::seat_approval_live(daemon, &surface)
                 });
                 let issued = ticket.as_ref().map(|t| t.issued);
-                match (verdict, verified_from, issued) {
+                match (verdict, caller_key, issued) {
                     (AbsorbVerdict::Absorb, Some(x), Some(at)) => {
                         if let Some(t) = surface.take_return_ticket(x, at) {
                             return Reply::Single(return_absorbed_response(
@@ -5012,7 +5058,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                 Some(sid),
                                 json!({
                                     "surface_ref": cys::surface_ref(sid),
-                                    "from": cys::surface_ref(x),
+                                    "from": cys::surface_ref(x.sid()),
+                                    "from_verified": x.is_verified(),
                                     "ticket_age_ms": t.issued.elapsed().as_millis() as u64,
                                     "ttl_secs": absorb_ttl,
                                 }),
@@ -5030,7 +5077,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             Some(sid),
                             json!({
                                 "surface_ref": cys::surface_ref(sid),
-                                "from": cys::surface_ref(x),
+                                "from": cys::surface_ref(x.sid()),
+                                "from_verified": x.is_verified(),
                                 "reason": AbsorbMiss::ApprovalLive.as_str(),
                                 "ticket_age_ms": at.elapsed().as_millis() as u64,
                                 "reflex_ms": absorb_reflex.as_millis() as u64,
@@ -5169,7 +5217,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // ★(0.14.42 · A2) 게이트 안 흡수 재확인 대상 — 1차가 PassThrough(기계 본문 위)였던 요청만.
             let mut absorb_recheck = match absorb {
-                Some((AbsorbVerdict::PassThrough, Some(at))) => verified_from.map(|x| (x, at)),
+                Some((AbsorbVerdict::PassThrough, Some(at))) => caller_key.map(|x| (x, at)),
                 _ => None,
             };
             // ★(0.14.42 · A2-F1) 재확인의 승인 관측은 **게이트 밖 1회** — 게이트 안에서는 pending_input
@@ -5208,7 +5256,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         pair_return,
                         &key,
                         authoritative_param,
-                        verified_from,
+                        caller_key,
                         Some(age2),
                         false,
                         pending,
@@ -5248,7 +5296,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 }
-                if verified_from.is_some() {
+                if caller_key.is_some() {
                     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
                     let human = surface
                         .pending_input
@@ -5271,8 +5319,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산(게이트 밖 · 표 락 단독 leaf). 효과: ① 비제출 키(Down·
             //   숫자·C-u …)와 빈 줄·사람 초안 위 제출은 발신자 표를 소거한다 — 선택지 조작 뒤 Return 은
             //   절대 흡수되지 않는다. ② 남(O)의 기계 본문을 제출했으면 O 에게 보상 표 — 이미 불필요해진
-            //   O 의 짝 Return 이 빈 줄에 떨어지는 가로채기 연쇄를 끊는다. 미검증 발신자는 무동작.
-            if let (Some(x), Some((pending_before, human_before, owner))) = (verified_from, settle_snapshot) {
+            //   O 의 짝 Return 이 빈 줄에 떨어지는 가로채기 연쇄를 끊는다. 키 없는 발신자(검증 신원도 자기신고
+            //   from 도 없음)는 무동작. ★(B) Claimed 발신자도 자기 키만 정산한다(보상은 검증 소유자 Verified(o)).
+            if let (Some(x), Some((pending_before, human_before, owner))) = (caller_key, settle_snapshot) {
                 match ticket_after_key_write(x, owner, pending_before, human_before, key_submits) {
                     TicketSettle::Keep => {}
                     TicketSettle::Clear => surface.clear_return_ticket(x),
@@ -5280,7 +5329,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         surface.clear_return_ticket(x);
                         if absorb_ttl > 0 {
                             surface.issue_return_ticket(
-                                o,
+                                crate::state::PairKey::Verified(o),
                                 crate::state::ReturnTicketKind::Compensation,
                                 std::time::Duration::from_secs(absorb_ttl),
                             );
@@ -13994,8 +14043,17 @@ mod tests {
         use std::time::Duration;
         let s = |x: u64| Duration::from_secs(x);
         let young = Some(s(1));
-        let v = |ttl, pair, key: &str, auth, from, age, queued, pending, human| {
-            return_absorb_verdict(ttl, pair, key, auth, from, age, queued, pending, human)
+        // ★(B) 발신자 인자는 키(`PairKey`)다 — 표의 `Some(7)` = 검증 좌석 7. 등급과 무관하게 판정은 같다.
+        let v = |ttl, pair, key: &str, auth, from: Option<u64>, age, queued, pending, human| {
+            let caller = from.map(crate::state::PairKey::Verified);
+            let claimed = from.map(crate::state::PairKey::Claimed);
+            let a = return_absorb_verdict(ttl, pair, key, auth, caller, age, queued, pending, human);
+            assert_eq!(
+                a,
+                return_absorb_verdict(ttl, pair, key, auth, claimed, age, queued, pending, human),
+                "판정은 키 등급과 무관하다(등급은 표를 나누기만 한다)"
+            );
+            a
         };
         use AbsorbMiss::*;
         use AbsorbVerdict::*;
@@ -14022,14 +14080,69 @@ mod tests {
     /// 빈 줄 clear / 사람 초안 clear.
     #[test]
     fn a2_ticket_after_key_write_table() {
+        use crate::state::PairKey::{Claimed, Verified};
         use TicketSettle::*;
-        assert_eq!(ticket_after_key_write(7, Some(7), 5, 0, true), Keep);
-        assert_eq!(ticket_after_key_write(7, Some(9), 5, 0, true), ClearAndCompensate(9));
-        assert_eq!(ticket_after_key_write(7, None, 5, 0, true), Clear, "소유자 결측은 값이 아니다");
-        assert_eq!(ticket_after_key_write(7, Some(9), 5, 0, false), Clear, "비제출 키는 보상 없음");
-        assert_eq!(ticket_after_key_write(7, Some(7), 5, 0, false), Clear, "비제출 키는 자기 표도 소거");
-        assert_eq!(ticket_after_key_write(7, Some(9), 0, 0, true), Clear, "빈 줄 제출은 남의 본문 제출 아님");
-        assert_eq!(ticket_after_key_write(7, Some(9), 5, 2, true), Clear, "사람 초안 위 제출은 보상 없음");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(7), 5, 0, true), Keep);
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 0, true), ClearAndCompensate(9));
+        assert_eq!(ticket_after_key_write(Verified(7), None, 5, 0, true), Clear, "소유자 결측은 값이 아니다");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 0, false), Clear, "비제출 키는 보상 없음");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(7), 5, 0, false), Clear, "비제출 키는 자기 표도 소거");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 0, 0, true), Clear, "빈 줄 제출은 남의 본문 제출 아님");
+        assert_eq!(ticket_after_key_write(Verified(7), Some(9), 5, 2, true), Clear, "사람 초안 위 제출은 보상 없음");
+        // ★(B) 자기신고 발신자는 검증 소유자와 같을 수 없다 — 같은 번호라도 '남의 본문'(보상 = 검증 소유자).
+        assert_eq!(ticket_after_key_write(Claimed(7), Some(7), 5, 0, true), ClearAndCompensate(7));
+        assert_eq!(ticket_after_key_write(Claimed(7), None, 5, 0, true), Clear);
+        assert_eq!(ticket_after_key_write(Claimed(7), Some(9), 5, 0, false), Clear);
+    }
+
+    /// ★(0.14.42 · B2) 자기신고 from 해석·키 규칙 진리표(결측형 포함 — 결측은 값이 아니다).
+    /// `claimed_from_sid` 는 배달 원장의 종전 from 해석과 **같은 규칙**이어야 한다(치환 전 식을 여기 그대로 두고 대조).
+    #[test]
+    fn b_claimed_from_sid_and_pair_key_table() {
+        use crate::state::PairKey::{Claimed, Verified};
+        let legacy = |params: &Value| -> Option<u64> {
+            params
+                .get("from")
+                .and_then(|v| v.as_u64())
+                .or_else(|| params.get("from").and_then(|v| v.as_str()).and_then(|s| {
+                    s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok()
+                }))
+        };
+        let cases = [
+            (json!({}), None),
+            (json!({"from": null}), None),
+            (json!({"from": ""}), None),
+            (json!({"from": "inject(typing_guard fallback)"}), None),
+            (json!({"from": -3}), None),
+            (json!({"from": 1.5}), None),
+            (json!({"from": true}), None),
+            (json!({"from": "surface:"}), None),
+            (json!({"from": "surface:7"}), Some(7)),
+            (json!({"from": "7"}), Some(7)),
+            (json!({"from": 7}), Some(7)),
+            (json!({"from": 0}), Some(0)),
+        ];
+        for (p, want) in cases {
+            assert_eq!(claimed_from_sid(&p), want, "{p}");
+            assert_eq!(claimed_from_sid(&p), legacy(&p), "원장 종전 해석과 동일해야 한다: {p}");
+        }
+        // 키 규칙: 검증 신원이 있으면 그것만(클로저 호출 0) · 없을 때만 자기신고.
+        let calls = std::cell::Cell::new(0u32);
+        let claim = |v: Option<u64>| {
+            let c = &calls;
+            move || {
+                c.set(c.get() + 1);
+                v
+            }
+        };
+        assert_eq!(pair_key(Some(3), claim(Some(9))), Some(Verified(3)));
+        assert_eq!(calls.get(), 0, "검증 신원이 있으면 자기신고를 보지 않는다");
+        assert_eq!(pair_key(None, claim(Some(7))), Some(Claimed(7)));
+        assert_eq!(pair_key(None, claim(None)), None, "결측은 값이 아니다");
+        assert_eq!(calls.get(), 2);
+        assert_ne!(Verified(3), Claimed(3), "같은 번호라도 다른 키");
+        assert_eq!(Claimed(7).sid(), 7);
+        assert!(!Claimed(7).is_verified() && Verified(7).is_verified());
     }
 
     /// 프로덕션 구간 소스 핀: 흡수 판정은 ACL **뒤**·queued 팔 **앞**이고, 표 락은 input_gate 안에서

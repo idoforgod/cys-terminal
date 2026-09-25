@@ -985,6 +985,39 @@ pub enum ReturnTicketKind {
     Compensation,
 }
 
+/// ★(0.14.42 · B) 짝 Return 흡수 표의 **키** — 발신자 신원 등급(설계 B · A2 표 구조 재사용).
+///
+/// 검증 신원(커널 peer pid → 이 데몬의 좌석)이 있으면 **그것만** 쓴다(`Verified`). 없을 때만 CLI 가 싣는
+/// 자기신고 `from`(CYS_SURFACE_ID)을 `Claimed` 로 쓴다 — 교차 소켓 발신자(HQ CEO → 부서장 등)는 이 데몬의
+/// 좌석이 아니라 검증 신원이 없기 때문이다. 두 변형은 **서로 다른 키**다: `Verified(n)` 과 `Claimed(n)` 은
+/// 서로의 표를 만들거나 쓰거나 지우지 않는다(로컬 좌석 n 과 원격 자기신고 n 의 우연한 번호 충돌 차단).
+/// 결측은 값이 아니다 — 키가 `None` 인 호출자는 발급·흡수·소거를 모두 건너뛴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairKey {
+    /// 커널 peer pid 로 해석된 로컬 좌석 id.
+    Verified(u64),
+    /// 검증 신원이 없는 호출자의 자기신고 좌석 id(다른 데몬의 번호일 수 있다).
+    Claimed(u64),
+}
+
+impl PairKey {
+    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다).
+    pub fn sid(self) -> u64 {
+        match self {
+            PairKey::Verified(x) | PairKey::Claimed(x) => x,
+        }
+    }
+
+    pub fn is_verified(self) -> bool {
+        matches!(self, PairKey::Verified(_))
+    }
+}
+
+/// ★(0.14.42 · B) 좌석당 흡수 표 상한 — `Claimed` 키는 식별 불가 호출자의 자기신고라 번호 공간이
+/// 열려 있다(검증 키는 좌석 수로 유계). 발급 때 만료 정리 뒤에도 넘치면 가장 오래된 표부터 퇴출한다.
+/// 퇴출된 표의 결과는 '흡수 안 됨'(종전 0.14.41 쓰기)이라 안전 방향이다.
+pub const RETURN_TICKETS_CAP: usize = 64;
+
 /// ★(0.14.42 · A2) 대상 좌석·발신자당 1장 · 1회용 흡수 표(휘발 — 영속·관측 채널 비대상).
 /// 흡수는 쓰기 1회를 **억제**만 한다(새 쓰기·적재 0). 표는 흡수 판정의 입력일 뿐이다.
 #[derive(Debug, Clone)]
@@ -1235,14 +1268,16 @@ pub struct Surface {
     /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
     /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
     pub input_gate: std::sync::Mutex<()>,
-    /// ★(0.14.42 · A2) 짝 Return 흡수 표 — 발신 surface id → 표(대상·발신자당 1장 · 덮어쓰기).
+    /// ★(0.14.42 · A2) 짝 Return 흡수 표 — 발신자 키([`PairKey`] · B) → 표(대상·발신자당 1장 · 덮어쓰기 ·
+    /// 상한 [`RETURN_TICKETS_CAP`]).
     ///
-    /// 발급: `surface.send_text` queued 팔(`absorb_return` · 검증 발신자 · ttl>0 · 끝 CR/LF 아님) 과
-    /// `surface.send_key` 쓰기 뒤 정산(남의 기계 본문을 제출했을 때 그 주인에게 보상 표).
+    /// 발급: `surface.send_text` queued 팔(`absorb_return` · 발신자 키 있음(검증 ∨ 자기신고 — B) · ttl>0 ·
+    /// 끝 CR/LF 아님) 과 `surface.send_key` 쓰기 뒤 정산(남의 기계 본문을 제출했을 때 그 주인에게 보상 표 —
+    /// 주인은 검증 신원만: `PendingInputState.owner`).
     /// 소거: 직접 send 성공(D2) · send_key 쓰기 뒤 정산(D4) · 흡수 소비(CAS) · 발급 때 만료 정리.
     /// **락 계약: 단독 leaf** — 다른 락을 쥔 채 잡지 않고(`input_gate`·`pending_queue` 안 금지),
     /// 이 락을 쥔 채 다른 락도 잡지 않는다. poison 은 `into_inner` 로 넘긴다(HashMap 연산뿐).
-    pub return_tickets: Mutex<HashMap<u64, ReturnTicket>>,
+    pub return_tickets: Mutex<HashMap<PairKey, ReturnTicket>>,
     /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
@@ -1558,16 +1593,28 @@ impl Surface {
     }
 
     /// ★(0.14.42 · A2) 흡수 표 발급(덮어쓰기) — 발급 때마다 만료분(나이 ≥ ttl)을 정리한다.
-    /// 단독 leaf 락(다른 락을 쥔 채 부르지 않는다).
-    pub fn issue_return_ticket(&self, sender: u64, kind: ReturnTicketKind, ttl: std::time::Duration) {
+    /// ★(B) 정리 뒤에도 [`RETURN_TICKETS_CAP`] 을 넘으면 가장 오래된 표부터 퇴출한다(방금 넣은 표는 가장
+    /// 새것이라 남는다). 단독 leaf 락(다른 락을 쥔 채 부르지 않는다).
+    pub fn issue_return_ticket(&self, sender: PairKey, kind: ReturnTicketKind, ttl: std::time::Duration) {
         let now = Instant::now();
         let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, t| now.saturating_duration_since(t.issued) < ttl);
         m.insert(sender, ReturnTicket { kind, issued: now });
+        while m.len() > RETURN_TICKETS_CAP {
+            let Some(oldest) = m
+                .iter()
+                .filter(|(k, _)| **k != sender)
+                .min_by_key(|(_, t)| t.issued)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            m.remove(&oldest);
+        }
     }
 
     /// 발신자의 표 사본(판정 재료) — 없으면 None.
-    pub fn peek_return_ticket(&self, sender: u64) -> Option<ReturnTicket> {
+    pub fn peek_return_ticket(&self, sender: PairKey) -> Option<ReturnTicket> {
         self.return_tickets
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1576,7 +1623,7 @@ impl Surface {
     }
 
     /// 표 소비 CAS — 발급 시각이 `issued` 와 같을 때만 꺼낸다(그 사이 재발급·소비된 표는 건드리지 않는다).
-    pub fn take_return_ticket(&self, sender: u64, issued: Instant) -> Option<ReturnTicket> {
+    pub fn take_return_ticket(&self, sender: PairKey, issued: Instant) -> Option<ReturnTicket> {
         let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
         if m.get(&sender).is_some_and(|t| t.issued == issued) {
             m.remove(&sender)
@@ -1586,7 +1633,7 @@ impl Surface {
     }
 
     /// 발신자의 표 소거(없으면 무동작).
-    pub fn clear_return_ticket(&self, sender: u64) {
+    pub fn clear_return_ticket(&self, sender: PairKey) {
         self.return_tickets.lock().unwrap_or_else(|e| e.into_inner()).remove(&sender);
     }
 

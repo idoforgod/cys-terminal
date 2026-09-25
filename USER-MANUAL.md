@@ -566,6 +566,12 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
     Return 1회)를 그대로 유지합니다(0.14.42 · RF1). 관문은 **라벨로 확인**하고 통과 선택지
     (`Yes, I trust this folder`·`Yes, I accept`·`Not now`) 위로 방향키로 옮긴 뒤 Return 하세요 — 방향키는
     흡수 표를 지우므로 그 뒤 Return 은 흡수되지 않습니다(선택지 순서는 Claude 버전마다 다릅니다).
+  - **교차 소켓 발신자**(`cys --socket <부서>.sock send … ; cys --socket <부서>.sock send-key … Return` 처럼
+    다른 데몬의 좌석에서 보내는 CEO 등)도 같은 흡수를 받습니다(0.14.42 · B). 받는 데몬은 그 발신자를 자기
+    좌석으로 확인할 수 없으므로, 새 CLI 가 `send`·`send-key`(명시 `--queued` 제외)에 싣는 자기신고
+    `from`(발신 좌석의 `CYS_SURFACE_ID`)을 **확인된 신원이 없을 때만** 흡수 표의 키로 씁니다. 같은 번호라도
+    이 데몬의 좌석(확인된 신원)과는 서로 다른 표입니다. `CYS_SURFACE_ID` 가 없는 발신자(launchd 스크립트
+    등)와 구 CLI 의 `send-key` 는 대상이 아닙니다. 흡수 이벤트의 `from_verified:false` 가 이 경우를 표시합니다.
   - 입력줄에 **기계 본문**이 남아 있으면 Return 은 누구 것이든 흡수되지 않고 종전처럼 제출합니다.
     `send-key Down Return` 같은 다중 키, `C-m` 같은 별칭, 명시 `send --queued` 뒤의 Return 은
     흡수 대상이 아닙니다.
