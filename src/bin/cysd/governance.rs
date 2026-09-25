@@ -21636,6 +21636,10 @@ mod h_machine_hold_tests {
             // H4 — CEO 자동결재: 하드축 판정이 원장 선기록·주입보다 앞.
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "record_audited("),
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Inject"),
+            // H5 — 부트 감독자 무스폰 통보: 하드축 판정이 원장 선기록·주입보다 앞(feed 는 그보다 앞 · 무조건).
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "push_feed_notification(", "machine_direct_hold("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "machine_direct_hold(", "record_audited("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "machine_direct_hold(", "write_tx.try_send("),
         ];
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
