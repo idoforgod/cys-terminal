@@ -4573,7 +4573,7 @@ const QUEUE_ALERT_COOLDOWN_SECS: f64 = 300.0;
 /// quiet(출력 기준)만으로는 배달이 나가 미완성 입력에 이어붙거나(텍스트) 그대로 제출(Return)
 /// 한다 — send_text 가드가 명명한 '최악 경로'의 재현(적대 검증 R1). 사람 흔적이 식은 뒤에만
 /// 배달한다(CYS_QUEUE_HUMAN_QUIET_SECS로 조정).
-fn queue_human_quiet_secs() -> u64 {
+pub(crate) fn queue_human_quiet_secs() -> u64 {
     std::env::var("CYS_QUEUE_HUMAN_QUIET_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -21623,7 +21623,10 @@ mod h_machine_hold_tests {
              거치거나 허용목록 사유를 적어야 한다"
         );
         // 판정 → 주입 순서(설계 H2~H5 에서 켠다): (파일, 판정이 사는 함수, 판정 토큰, 주입 토큰).
-        let order: [(&str, &str, &str, &str, &str); 0] = [];
+        let order: Vec<(&str, &str, &str, &str, &str)> = vec![
+            // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
+            ("schedule", include_str!("schedule.rs"), "deliver_push", "machine_direct_hold(", "inject_on(daemon, &surface, text)"),
+        ];
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
             let body = fn_body(&code, body_fn);
@@ -21752,6 +21755,49 @@ mod h1_queue_quiesce_tests {
         let got = force_deliver_entry(&d, &s, None, false).expect("강제 배달이 quiescing 에 막혔다");
         assert_eq!(got.entry.id, e.id);
         assert!(s.pending_queue.lock().unwrap().is_empty());
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H2 ③ STARVE] 스케줄 하드축 우회 항목(origin schedule · TTL ≤ 주기)이 그 축(화면 초안)에 오래 막히면 기존
+    /// 기아 경보(`queue.starved`)가 그대로 보인다 — 우회는 조용한 적체가 아니다. 축이 풀리면 배달된다.
+    #[test]
+    fn h2_diverted_item_starve_visible_then_delivered() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "1"), ("CYS_QUEUE_MAX_WAIT_SECS", "0")]);
+        let (d, s) = rig("h2-starve");
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        let (_, depth0) = crate::alert_route::enqueue_into_seat(
+            &d,
+            s.id,
+            "[heartbeat] 초안에 막힌 우회분".into(),
+            Some("schedule:hb".into()),
+            "schedule",
+            50,
+            None,
+            crate::alert_route::FreezeGuard::Daemon,
+            Some(300),
+        )
+        .expect("우회 적재");
+        assert_eq!(depth0, 1);
+        std::thread::sleep(std::time::Duration::from_millis(1300)); // uptime 클램프 대기 ≥ 1s
+        h_paint(&s, H_DRAFT_SCREEN);
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "초안 위에 배달했다");
+        let ev = d
+            .bus
+            .tail(100)
+            .into_iter()
+            .find(|ev| ev["name"] == "queue.starved")
+            .expect("우회 항목의 기아가 보이지 않는다(STARVE)");
+        assert_eq!(ev["payload"]["blocked_by"], json!(BLOCKED_INPUT_PENDING), "{ev}");
+        // 사람이 초안을 비우면(빈 composer · 정적) 배달된다.
+        h_paint(&s, H_IDLE_SCREEN);
+        *s.last_output.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(4);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "축이 풀렸는데 배달되지 않았다");
         let _ = s.child.lock().unwrap().kill();
     }
 
