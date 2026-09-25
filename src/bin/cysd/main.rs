@@ -21,6 +21,8 @@ mod cwd_probe;
 mod deadman;
 mod delivery;
 mod events;
+// ★E(0.14.42) fd soft 한도 자체 상향 — 모듈은 파일 단위 unix 게이트(윈도우에서는 빈 모듈).
+mod fdlimit;
 mod governance;
 mod handlers;
 mod hwmon;
@@ -1218,6 +1220,17 @@ async fn async_main() {
         }
         lock
     };
+
+    // ★E(0.14.42 WP-transport) fd soft 한도 자체 상향(RLIMIT_NOFILE → min(8192, hard,
+    // kern.maxfilesperproc) · never-lower · hard 불변). 위치 계약: 시작 락 획득 **뒤**(패자는 위에서
+    // 이미 exit — 패자 부수효과는 종전대로 mkdir/chmod 뿐, crashloop 로그 dedupe 보존)이고, pack
+    // 복구·Daemon::new·리스너·모든 pane/자식 스폰보다 **앞**이다(자식이 올린 soft 를 상속).
+    // 실패는 경고 한 줄 뒤 상속값으로 계속(부트 중단 0). 롤백: ~/.cys/nofile-raise-off · CYS_NOFILE_RAISE=0.
+    #[cfg(unix)]
+    {
+        let fd_limit = fdlimit::raise();
+        eprintln!("{}", fdlimit::log_line(&fd_limit));
+    }
 
     // windows: named pipe first-instance 선점 = 데몬 싱글턴 가드. 조기에 first 인스턴스를 만들어
     // accept_loop 로 넘겨 재사용한다(probe-후-close-재open 레이스 없이 그대로 리스너 풀에 편입).
@@ -5801,6 +5814,25 @@ mod cysd_args_tests {
         assert!(parse < daemon, "인자 판정이 데몬 기동보다 늦다");
         assert!(body.contains("std::process::exit(2)"), "잘못된 인자의 종료 코드 2 누락");
         assert!(body.contains("std::process::exit(0)"), "조회 인자의 종료 코드 0 누락");
+    }
+
+    /// ★E(0.14.42) P1 — fd 한도 상향의 **위치 계약**: 시작 락 획득 뒤(패자 무부수효과·dedupe 보존),
+    /// pack 저널 복구·Daemon::new 앞(모든 pane·자식·리스너가 올린 soft 를 상속).
+    #[test]
+    fn fd_limit_raise_is_wired_after_startup_lock_before_boot_side_effects_source_pin() {
+        let src = include_str!("main.rs");
+        let after = src
+            .split_once("\nasync fn async_main() {")
+            .expect("async_main 함수 앵커")
+            .1;
+        let body = &after[..after.find("\n}\n").expect("async_main 끝")];
+        let raise = body.find("fdlimit::raise()").expect("fd 한도 상향 배선 누락");
+        let lock = body.find("acquire_startup_lock(").expect("시작 락 앵커");
+        let journal = body.find("recover_pack_journal").expect("pack 저널 복구 앵커");
+        let daemon = body.find("Daemon::new(").expect("Daemon::new 앵커");
+        assert!(lock < raise, "fd 한도 상향이 시작 락보다 앞이다 — 락 패자에게 부수효과가 생긴다");
+        assert!(raise < journal && raise < daemon, "fd 한도 상향이 부트 부수효과보다 늦다");
+        assert_eq!(body.matches("fdlimit::raise()").count(), 1, "상향 호출은 정확히 1곳");
     }
 
     #[test]
