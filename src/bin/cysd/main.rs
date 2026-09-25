@@ -2837,6 +2837,55 @@ fn parse_first_line_cap(raw: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// ★FATAL-1(0.14.42 WP-transport 리뷰 · G-09 의 dispatch 몫) — 동시에 **실행 중인** dispatch 상한.
+///
+/// 【무엇을 대체하나】 launchd·GUI 기동의 soft 256 은 연결 수를 묶어 동시 dispatch 를 약 240 으로
+/// 막는 **사실상의 입장 상한**이었다. E(fd soft 자체 상향)가 그것을 없앴고, 그 뒤 상한은 tokio 블로킹
+/// 풀 기본 512 뿐이었다 — 동시 surface.list ≈350 에서 데몬이 SIGABRT(전 pane 사망)했다(리뷰 실측).
+/// 근본 원인(sysinfo rayon 중첩 스틸)은 Cargo.toml 에서 끊었고, 이 상한은 **명시적 입장 제어**로 그
+/// 자리를 잇는다.
+///
+/// 【값 128】 ① 종전 사실상 상한은 **연결 수**(≈240 · 유휴 영속 연결·이벤트 스트림·attach·pty fd 까지
+/// 셌다)였고 넘친 연결은 EOF/EPIPE 로 버려졌다. 이 상한은 **실행 중인 dispatch 수**만 묶고 넘친 요청은
+/// 기다리게 한다 — 이벤트 스트림·attach·FeedWait 대기는 dispatch 가 끝난 뒤라 허가를 쥐지 않는다.
+/// ② 블로킹 풀 512 의 1/4 — RPC 폭주가 풀을 포화시켜 다른 블로킹 작업을 굶기지 않는다. ③ 리뷰가 관측한
+/// 가장 낮은 크래시 동시 수(rayon 이 살아 있던 legacy 신원 워크 K=200)보다 낮다 — 참고치이며, 이 상한
+/// 단독으로 크래시를 막는다고 증명하지는 않았다(근본 차단은 multithread 제거다). ④ 정상 운용(좌석
+/// 수십·훅 호출 ms 단위)은 이 수에 닿지 않는다 — 닿아도 **거절이 아니라 대기**다.
+///
+/// 【실패 방향】 초과분은 FIFO 로 **기다린다**(typed busy 응답 없음) — 거절은 클라이언트 재시도·자동
+/// 기동·sibling 스폰(④ 증폭) 경로를 새로 연다. 세마포어는 닫지 않으므로 `acquire` 실패는 도달 불가이고,
+/// 도달하더라도 **허가 없이 진행**(fail-open = 종전 거동)한다 — 게이트 고장이 전 RPC 불통이 되면 안 된다.
+const DISPATCH_INFLIGHT_MAX: usize = 128;
+static DISPATCH_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DISPATCH_INFLIGHT_MAX);
+
+/// 입장 면제 — 생존 프로브(`system.ping`) 하나뿐. 핸들러가 즉답(`"pong"`)이라 블로킹 스레드를
+/// 마이크로초만 쓴다. 폭주 중에도 데드맨 `probe_holder`·CLI 생존 확인이 줄 뒤에 서지 않게 해
+/// '살아 있는데 hung 으로 오판 → 회수'(④) 경로를 막는다. 판정은 정확 일치(대소문자·공백 변형 불인정).
+fn dispatch_admission_exempt(method: &str) -> bool {
+    method == "system.ping"
+}
+
+/// 동기 작업 `f` 를 블로킹 풀에서 돌리되, 면제가 아니면 `gate` 허가를 쥔 **동안만** 돌린다.
+/// 허가는 블로킹 클로저 안으로 옮겨져 그 작업이 끝나는 순간 풀린다 — 기다리던 연결 태스크가 도중에
+/// 사라져도 허가가 작업보다 먼저 풀리지 않는다(상한이 새지 않는다).
+async fn run_admitted<T, F>(
+    gate: &'static tokio::sync::Semaphore,
+    exempt: bool,
+    f: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = if exempt { None } else { gate.acquire().await.ok() };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+}
+
 async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Option<u32>) {
     handle_connection_capped(daemon, stream, caller_pid, first_line_idle_timeout()).await
 }
@@ -2909,7 +2958,10 @@ async fn handle_connection_capped(
             // ★(성찰 A15) `req` 는 클로저로 **이동**한다 — 패닉 응답이 그 id 를 잃으면 클라이언트는
             //   어느 요청이 실패했는지 모른다(파이프라인 호출자는 응답을 id 로 짝짓는다). 미리 복사.
             let req_id = req.id.clone();
-            match tokio::task::spawn_blocking(move || handlers::dispatch(&d, req, caller_pid)).await
+            // ★FATAL-1: 입장 게이트 — 동시 실행 dispatch ≤ DISPATCH_INFLIGHT_MAX(초과분은 대기 · 거절 없음).
+            let exempt = dispatch_admission_exempt(&req.method);
+            match run_admitted(&DISPATCH_GATE, exempt, move || handlers::dispatch(&d, req, caller_pid))
+                .await
             {
                 Ok(r) => r,
                 // 블로킹 태스크 패닉 — 커넥션을 조용히 끊지 않고 사실을 답한다(종전에는 프로세스
@@ -4003,6 +4055,139 @@ mod unix_accept_error_gate_tests {
         ] {
             assert!(body.contains(needed), "accept 루프에 `{needed}` 가 없다");
         }
+    }
+}
+
+/// ★FATAL-1(0.14.42 WP-transport 리뷰) — E 가 없앤 '사실상의 입장 상한'(soft 256)의 대체 장치 2겹.
+///   (b) 근본: sysinfo `multithread`(rayon 전역 풀) 제거 — 요청마다 rayon 작업이 전역 풀에 들어가
+///       join 대기 중인 워커가 다른 요청의 작업을 훔쳐 같은 스택에 중첩 실행하다 2MiB 워커 스택이
+///       넘쳐 데몬이 SIGABRT(전 pane 사망)했다. 호출 스레드에서 순차로 돌면 중첩 자체가 없다.
+///   (a) 상한: dispatch 동시 실행을 `DISPATCH_INFLIGHT_MAX` 로 묶는다(초과분은 거절이 아니라 대기).
+#[cfg(test)]
+mod fatal1_admission_tests {
+    use super::*;
+
+    /// (b) 선언 핀 — Cargo.toml 이 sysinfo 기본 feature 를 끄고 multithread 를 켜지 않으며,
+    /// 해석된 그래프(Cargo.lock)의 sysinfo 가 rayon 에 의존하지 않는다(다른 크레이트의 feature
+    /// 통합으로 되살아나도 여기서 적색). 실패 방향: 판독 실패(항목 부재)는 계측 무효 = 적색.
+    #[test]
+    fn sysinfo_has_no_rayon_multithread() {
+        let toml = include_str!("../../../Cargo.toml");
+        let decl = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("sysinfo ") || l.trim_start().starts_with("sysinfo="))
+            .expect("Cargo.toml 에 sysinfo 선언이 없다 — 계측 무효");
+        assert!(
+            decl.contains("default-features = false"),
+            "sysinfo 기본 feature(= multithread 포함)가 켜져 있다: {decl}"
+        );
+        assert!(!decl.contains("multithread"), "sysinfo multithread 를 명시로 켰다: {decl}");
+        let lock = include_str!("../../../Cargo.lock");
+        let blocks: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|b| b.contains("\nname = \"sysinfo\"\n"))
+            .collect();
+        assert!(!blocks.is_empty(), "Cargo.lock 에 sysinfo 항목이 없다 — 계측 무효");
+        for b in blocks {
+            assert!(
+                !b.contains("\"rayon\""),
+                "해석된 sysinfo 가 rayon 에 의존한다(multithread 부활 — 중첩 스틸 스택 오버플로 경로): {b}"
+            );
+        }
+    }
+
+    /// (a) 배선 핀 — 연결 핸들러의 dispatch 는 입장 게이트를 거친다(직접 spawn_blocking 금지).
+    #[test]
+    fn dispatch_goes_through_admission_gate() {
+        let src = include_str!("main.rs");
+        let sig = concat!("async fn handle_connection_", "capped(");
+        let at = src.find(sig).expect("handle_connection_capped 시그니처");
+        let end = src[at..].find("\n}\n").expect("함수 끝") + at;
+        let body = &src[at..end];
+        assert!(
+            body.contains(concat!("run_admitted(&DISPATCH_", "GATE, exempt,")),
+            "dispatch 가 입장 게이트(DISPATCH_GATE)를 거치지 않는다"
+        );
+        assert!(
+            !body.contains(concat!("spawn_blocking(move || ", "handlers::dispatch")),
+            "게이트 밖 직접 spawn_blocking(dispatch) 이 남아 있다"
+        );
+    }
+
+    /// (a) 값 핀 — 상한은 정상 운용을 조르지 않을 만큼 크고(≥32), 블로킹 풀(tokio 기본 512)의 절반
+    /// 이하라 RPC 폭주가 풀을 포화시키지 못한다. 면제는 `system.ping` 정확 일치 하나뿐.
+    #[test]
+    fn admission_cap_bounds_and_exemption_truth_table() {
+        assert!((32..=256).contains(&DISPATCH_INFLIGHT_MAX), "상한 {DISPATCH_INFLIGHT_MAX}");
+        assert!(dispatch_admission_exempt("system.ping"));
+        for m in ["surface.list", "org.status", "surface.reap", "system.ping ", "System.ping", "", "system.pingx"] {
+            assert!(!dispatch_admission_exempt(m), "{m:?} 는 면제가 아니다");
+        }
+    }
+
+    fn leak_gate(n: usize) -> &'static tokio::sync::Semaphore {
+        Box::leak(Box::new(tokio::sync::Semaphore::new(n)))
+    }
+
+    /// (a) 거동 — 상한의 10배를 한꺼번에 넣어도 동시 실행은 상한을 넘지 않고(허가는 블로킹 작업이 끝날
+    /// 때까지 쥔다), 상한까지는 실제로 병렬이며(직렬화로 조이지 않는다), 전부 완료된다(거절 0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_gate_bounds_concurrency_without_rejecting() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const CAP: usize = 4;
+        const N: usize = CAP * 10;
+        let gate = leak_gate(CAP);
+        let now = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        for i in 0..N {
+            let (now, peak) = (Arc::clone(&now), Arc::clone(&peak));
+            hs.push(tokio::spawn(async move {
+                run_admitted(gate, false, move || {
+                    let cur = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(cur, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    i
+                })
+                .await
+            }));
+        }
+        let mut done = 0;
+        for h in hs {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(30), h)
+                .await
+                .expect("게이트 대기가 끝나지 않는다(교착)")
+                .expect("연결 태스크 패닉");
+            assert!(r.is_ok(), "블로킹 작업 실패");
+            done += 1;
+        }
+        assert_eq!(done, N, "거절·유실 없이 전부 완료");
+        let p = peak.load(Ordering::SeqCst);
+        assert!(p <= CAP, "동시 실행 {p} > 상한 {CAP}");
+        assert!(p >= 2, "동시 실행 최대 {p} — 상한 안에서도 직렬화됐다");
+        assert_eq!(gate.available_permits(), CAP, "허가 누수");
+    }
+
+    /// (a) 거동 — 허가가 모두 잡힌 동안: 면제(`system.ping`)는 즉시 돌고, 비면제는 **거절되지 않고**
+    /// 기다리다 허가가 풀리면 돈다(typed busy 없음 · 우회 없음).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_gate_lets_ping_through_and_queues_others() {
+        let gate = leak_gate(2);
+        let held = gate.acquire_many(2).await.expect("세마포어는 닫히지 않는다");
+        let pinged = tokio::time::timeout(std::time::Duration::from_secs(5), run_admitted(gate, true, || 7u8))
+            .await
+            .expect("포화 중 면제(ping)가 줄 뒤에 섰다");
+        assert_eq!(pinged.expect("블로킹 작업"), 7);
+        let queued = tokio::spawn(run_admitted(gate, false, || 8u8));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!queued.is_finished(), "포화 중 비면제가 게이트를 우회했다");
+        drop(held);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+            .await
+            .expect("허가 반환 뒤에도 대기가 풀리지 않는다")
+            .expect("태스크");
+        assert_eq!(r.expect("블로킹 작업"), 8);
     }
 }
 
