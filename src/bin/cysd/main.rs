@@ -2848,6 +2848,75 @@ fn parse_first_line_cap(raw: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// ★R3-5(S09 (c) · P2-final G-03 ①) **단발 응답 프레임**의 무진행 쓰기 상한(초).
+///
+/// 【고친 것】 `write_line` 은 `write_all(..).await; flush().await` 로 **시간 무계**였다. 요청 1줄을 보내고
+/// 응답을 읽지 않는 클라이언트(멈춘·SIGSTOP 된·교착한 프로세스)가 있으면 커널 송신 버퍼(unix 8 KB)가 찬 뒤
+/// 연결 태스크가 영구히 쓰기에서 기다린다 — 태스크·fd·응답 버퍼가 클라이언트가 닫을 때까지 회수되지 않는다
+/// (S09 (c): 64 연결 60 s 해제 0).
+///
+/// 【축 = 무진행(idle)이지 총 기한이 아니다】 커널이 **이 시간 동안 한 바이트도 받지 않을 때만** 끊는다.
+/// 느리지만 읽고 있는 소비자(큰 read_text 를 느린 파이프로 받는 경우)는 몇 분이 걸려도 끊지 않는다.
+/// 클라이언트 `RpcDeadline`(cys.rs)과 모양(진행마다 재장전)은 같지만 **방향이 반대**다 — 그쪽은 '서버가 안
+/// 보내는' 무진행, 이쪽은 '클라이언트가 안 읽는' 무진행을 잰다. 한 연결에서 두 조건은 동시에 성립하지 않으므로
+/// 두 상수 사이에 대소 제약은 없다(서로 핀하지 않는다).
+///
+/// 【값 30】 ① 값은 "정상 클라이언트가 응답 **도중** N 초 넘게 읽지 않는 경로가 있는가" 하나로 정한다 —
+/// 트리 안의 소비자(cys CLI `read_frame_line` · GUI `rpc_once` · 팩 `javis_report_gate`/`deploy_gate` ·
+/// deadman `probe_holder`)는 요청을 쓴 직후 응답을 끝까지 읽는다. 그런 경로는 없다.
+/// ② 문제 연결의 해제 시한은 첫 줄 상한([`FIRST_LINE_IDLE_SECS`] = 60 s · S09 (c) 창도 60 s)과 **한 계약**이다.
+/// 무수신 연결의 해제 시각 = dispatch 완료 + 버퍼 채움 + 이 상한이므로 dispatch·채움 여유를 ≥ 10 s 남겨야
+/// 60 s 안에 든다(검체 `write_stall_default_leaves_release_margin` 이 핀). 30 이면 여유 30 s — 부하로
+/// dispatch 가 늘어나도 창을 넘지 않는 여유를 **구조적으로** 둔다. ③ 비교(S09 실측): herdr 무수신 절단
+/// 9–10 s · cmux-tui 3–4 s — 우리는 정상 판독자 보호 쪽으로 여유를 더 둔다.
+///
+/// 【범위 = 단발 응답만】 `events.stream`·`surface.attach` 스트림은 면제다(클라이언트 `RPC_STREAMING_METHODS`
+/// 면제와 대칭). attach 를 끊으면 GUI 가 재attach 없이 `[surface exited]` 를 그린다(G-08) — 좌석이 살아
+/// 있는데 pane 이 죽어 보인다. ★알려진 잔여: **전혀 읽지 않는** 스트림 소비자는 `run_event_stream`·
+/// `run_attach` 의 쓰기에서 영구히 멈춘다 — 그동안 `rx.recv()` 가 다시 poll 되지 않으므로 Lagged·
+/// slow_consumer 분기에도 닿지 않고, 그 태스크·fd 는 소비자가 닫을 때까지 남는다. 버스·PTY 는 막히지
+/// 않고(tokio broadcast 는 송신자를 막지 않는다) 메모리 영향은 실측상 작다(무수신 attach 16개: fd 만 증가 ·
+/// RSS 는 소비자 0 대조군과 같음). 스트림 쪽 회수는 GUI 재attach 가 생긴 뒤의 별도 과제다.
+///
+/// 【플랫폼】 unix(macOS·Linux): 위 그대로. Windows: 같은 코드가 컴파일된다(cfg(windows) 변경 0). mio
+/// `NamedPipe::write` 는 쓰기 1건을 내부 버퍼로 통째로 받아 즉시 완료하므로 **단발·비파이프라인** 응답의
+/// 거동 변화는 0 이다. 다만 앞선 overlapped write 가 끝나지 않았으면 다음 쓰기가 WouldBlock 이라, 요청을
+/// 여러 개 보내고 읽지 않는 클라이언트는 두 번째 응답에서 종전의 영구 대기 대신 이 상한에 절단된다(무해).
+/// 거꾸로 요청 1개·큰 응답을 읽지 않는 연결은 mio 내부 버퍼와 파이프 인스턴스를 여전히 클라이언트 수명
+/// 동안 쥔다 — 이 상한은 그것을 풀지 않는다(S09 (c) 열위 해소는 **unix 한정**).
+///
+/// 【실패 방향】 상한 만료 = 그 연결만 닫는다(부분 프레임이 이미 나갔으므로 오류 줄을 덧쓰지 않는다 —
+/// 덧쓰면 두 프레임이 한 줄로 붙는다). macOS: 상대는 개행 없는 꼬리 뒤 EOF 를 본다. Linux: 서버 수신 큐에
+/// 읽지 않은 바이트가 남아 있으면(파이프라이닝 · 절단 탐지용 프로브 바이트) 커널이 EOF 대신 ECONNRESET 을
+/// 줄 수 있다. cys CLI 는 `RpcIoFail::Eof`(ECONNRESET 이면 `Io`) — 자동 재시도 없음 · '비멱등 명령은 재시도
+/// 전 상태 확인' 문안. GUI 풀은 파싱 오류 뒤 다음 호출의 BeforeSend 재연결. 데몬·다른 연결·좌석 무접촉.
+/// 롤백: `CYS_CONN_WRITE_STALL_SECS=0`(개정 전 무한 대기).
+const WRITE_STALL_SECS: u64 = 30;
+
+/// 노브 **하한**(초). 양수 1~9 는 여기로 접는다 — 부하 높은 호스트에서 잠깐 스케줄되지 못한 정상 판독자가
+/// 잘리면 `cys status --json` 등이 Eof 를 받아 orchestra check·부트 readiness 가 흔들린다. `0`(해제)은 그대로다.
+const WRITE_STALL_MIN_SECS: u64 = 10;
+
+/// 노브 상한(초 · 1일) — 첫 줄 상한과 같은 이유(거대값 → Instant 가산 오버플로 경로 차단 · 0 이 곧 무제한).
+const WRITE_STALL_MAX_SECS: u64 = 86_400;
+
+/// 롤백 스위치 — `CYS_CONN_WRITE_STALL_SECS=0` 이면 해제, 양수면 그 값(초 · [10, 86400] 로 클램프),
+/// 그 밖(비숫자·음수·빈 값)은 기본값.
+fn write_stall_timeout() -> Option<std::time::Duration> {
+    parse_write_stall_cap(cys::env_compat("CYS_CONN_WRITE_STALL_SECS").as_deref())
+}
+
+/// 순수 판정부(env 무접촉 · 진리표가 박제). 불변식: 반환값은 언제나 `Instant` 에 더할 수 있다.
+fn parse_write_stall_cap(raw: Option<&str>) -> Option<std::time::Duration> {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(v) => Some(std::time::Duration::from_secs(
+            v.clamp(WRITE_STALL_MIN_SECS, WRITE_STALL_MAX_SECS),
+        )),
+        None => Some(std::time::Duration::from_secs(WRITE_STALL_SECS)),
+    }
+}
+
 /// ★FATAL-1(0.14.42 WP-transport 리뷰 · G-09 의 dispatch 몫) — 동시에 **실행 중인** dispatch 상한.
 ///
 /// 【무엇을 대체하나】 launchd·GUI 기동의 soft 256 은 연결 수를 묶어 동시 dispatch 를 약 240 으로
@@ -2898,7 +2967,14 @@ where
 }
 
 async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Option<u32>) {
-    handle_connection_capped(daemon, stream, caller_pid, first_line_idle_timeout()).await
+    handle_connection_capped(
+        daemon,
+        stream,
+        caller_pid,
+        first_line_idle_timeout(),
+        write_stall_timeout(),
+    )
+    .await
 }
 
 /// `handle_connection` 의 본체 — 첫 줄 상한을 인자로 받는다(테스트가 짧은 상한으로 실제 경로를
@@ -2908,6 +2984,7 @@ async fn handle_connection_capped(
     stream: Stream,
     caller_pid: Option<u32>,
     first_line_cap: Option<std::time::Duration>,
+    write_stall_cap: Option<std::time::Duration>,
 ) {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -2952,7 +3029,8 @@ async fn handle_connection_capped(
             Err(e) => {
                 let resp =
                     cys::err_response(&serde_json::Value::Null, "parse_error", &e.to_string());
-                if write_line(&mut write_half, &resp).await.is_err() {
+                if let Err(e) = write_reply_line(&mut write_half, resp, write_stall_cap).await {
+                    note_write_stall(&e);
                     return;
                 }
                 continue;
@@ -2986,7 +3064,8 @@ async fn handle_connection_capped(
         };
         match dispatched {
             Reply::Single(resp) => {
-                if write_line(&mut write_half, &resp).await.is_err() {
+                if let Err(e) = write_reply_line(&mut write_half, resp, write_stall_cap).await {
+                    note_write_stall(&e);
                     return;
                 }
             }
@@ -3089,7 +3168,8 @@ async fn handle_connection_capped(
                         }
                     }
                 };
-                if write_line(&mut write_half, &resp).await.is_err() {
+                if let Err(e) = write_reply_line(&mut write_half, resp, write_stall_cap).await {
+                    note_write_stall(&e);
                     return;
                 }
             }
@@ -3156,7 +3236,8 @@ async fn handle_connection_capped(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 };
-                if write_line(&mut write_half, &resp).await.is_err() {
+                if let Err(e) = write_reply_line(&mut write_half, resp, write_stall_cap).await {
+                    note_write_stall(&e);
                     return;
                 }
             }
@@ -3177,15 +3258,13 @@ fn abi_severity(e: &cys::wire::AbiError) -> severity::Severity {
     }
 }
 
-async fn write_line<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    value: &serde_json::Value,
-) -> std::io::Result<()> {
+/// 응답 `Value` → 전송 프레임(개행 포함) — 응답 상한·ABI 자기검증을 거친다(종전 `write_line` 앞부분 그대로).
+fn frame_line(value: &serde_json::Value) -> String {
     // T4-5A(==T5-6 strand-3, ONE guard): 단일 RPC 응답 바이트 상한. cap 초과 시 fail-loud
     // 트렁케이트 sentinel로 치환(컨텍스트/메모리 폭주 차단). 직교 가드 — watchdog와 별개 책임.
     let capped = cys::wire::cap_response(value);
     let value: &serde_json::Value = capped.as_ref().unwrap_or(value);
-    let line = match cys::wire::frame_response(value) {
+    match cys::wire::frame_response(value) {
         Ok(framed) => framed,
         Err(e) => {
             let sev = abi_severity(&e);
@@ -3198,9 +3277,77 @@ async fn write_line<W: AsyncWrite + Unpin>(
             body.push('\n');
             body
         }
-    };
+    }
+}
+
+/// 한 줄 쓰기(무기한) — 스트림(`events.stream`·`surface.attach`) 전용. 단발 응답은 [`write_reply_line`].
+async fn write_line<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    value: &serde_json::Value,
+) -> std::io::Result<()> {
+    let line = frame_line(value);
     w.write_all(line.as_bytes()).await?;
     w.flush().await
+}
+
+/// ★R3-5 단발 응답 한 프레임 쓰기 — `stall` 동안 커널이 **한 바이트도** 받지 않으면 `TimedOut`.
+/// 진행(부분 쓰기)이 있을 때마다 상한을 새로 건다(무진행 축 — [`WRITE_STALL_SECS`] 주석).
+/// `value` 를 **소유**로 받아 프레임을 만든 즉시 버린다 — 멈춘 연결이 응답 `Value` 와 프레임 문자열을
+/// 둘 다 쥐지 않게(멈춘 연결당 점유가 프레임 하나로 준다).
+/// `None` = 종전 `write_line` 과 바이트·거동 동일(롤백). 만료 뒤 호출자는 **아무것도 더 쓰지 않고** 닫는다.
+async fn write_reply_line<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    value: serde_json::Value,
+    stall: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    let line = frame_line(&value);
+    drop(value);
+    let Some(stall) = stall else {
+        w.write_all(line.as_bytes()).await?;
+        return w.flush().await;
+    };
+    let total = line.len();
+    let mut rest = line.as_bytes();
+    let stalled = |sent: usize| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("write stalled {}s ({sent}/{total} bytes sent)", stall.as_secs()),
+        )
+    };
+    while !rest.is_empty() {
+        let n = match tokio::time::timeout(stall, w.write(rest)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(stalled(total - rest.len())),
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        rest = &rest[n..];
+    }
+    match tokio::time::timeout(stall, w.flush()).await {
+        Ok(r) => r,
+        Err(_) => Err(stalled(total)),
+    }
+}
+
+/// 쓰기 상한으로 닫은 연결의 흔적 — 처음 3회와 그 뒤 2의 거듭제곱 번째만 남긴다(로그 폭주 차단).
+/// 상한 만료(`TimedOut`) 외의 쓰기 실패(EPIPE 등 = 상대가 먼저 닫음)는 종전대로 조용히 끝낸다.
+/// 로그 쓰기 실패는 무시한다(`eprintln!` 은 stderr 쓰기 실패(EPIPE·ENOSPC) 시 패닉 — accept 루프와 같은
+/// 관례. 이 경로는 상대가 유발하므로 디스크가 찬 호스트에서 패닉을 만들지 않는다).
+static WRITE_STALL_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn note_write_stall(e: &std::io::Error) {
+    use std::io::Write as _;
+    if e.kind() != std::io::ErrorKind::TimedOut {
+        return;
+    }
+    let n = WRITE_STALL_CLOSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_power_of_two() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[cysd] write-stall: 응답을 읽지 않는 연결을 닫았다 — {e} · 누적 {n}회 \
+             (해제 CYS_CONN_WRITE_STALL_SECS=0)"
+        );
+    }
 }
 
 /// Push channel: replay missed events, then forward live events until the client disconnects.
@@ -4891,6 +5038,7 @@ mod first_line_idle_tests {
             server,
             None,
             Some(Duration::from_millis(300)),
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         // 클라이언트를 살려 둔 채(= EOF 를 주지 않는다) 아무것도 쓰지 않는다.
         let finished = tokio::time::timeout(Duration::from_secs(5), conn).await;
@@ -4915,6 +5063,7 @@ mod first_line_idle_tests {
             server,
             None,
             None, // 상한 해제 = 개정 전 거동
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         let still_running = tokio::time::timeout(Duration::from_millis(700), conn).await;
         assert!(
@@ -4939,6 +5088,7 @@ mod first_line_idle_tests {
             server,
             None,
             Some(Duration::from_millis(200)),
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         let mut client = BufReader::new(client);
         let ping = b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n";
@@ -4986,6 +5136,7 @@ mod first_line_idle_tests {
             server,
             None,
             Some(Duration::from_millis(300)),
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         let mut client = client;
         // 개행 1바이트만 보내고 침묵한다(EOF 도 주지 않는다).
@@ -5014,6 +5165,7 @@ mod first_line_idle_tests {
             server,
             None,
             Some(Duration::from_millis(400)),
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         let mut client = client;
         // 상한(400ms)보다 짧은 주기로 빈 줄을 흘린다 — 상대 상한이면 영원히 살아남는다.
@@ -5052,6 +5204,7 @@ mod first_line_idle_tests {
             server,
             None,
             Some(Duration::from_millis(600)),
+            None, // 쓰기 무진행 상한 해제 — 첫 줄 축만 시험
         ));
         let mut client = BufReader::new(client);
         let ping = b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n";
@@ -5075,6 +5228,348 @@ mod first_line_idle_tests {
             .expect("두 번째 응답이 오지 않았다 — 첫 줄 상한이 확립 연결까지 끊었다")
             .unwrap();
         assert!(got > 0 && second.contains("\"ok\":true"), "유휴 뒤 왕복 실패: {second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// ★R3-5(S09 (c) · P2-final G-03 ①) 단발 응답의 **무진행 쓰기 상한** 검체.
+/// 적색(개정 전 = 쓰기 무기한): `non_reading_client_connection_is_reclaimed`(Reply::Single) ·
+/// `non_reading_client_of_parse_errors_is_reclaimed`(parse_error) · `single_reply_sites_all_carry_the_write_stall`
+/// (4곳 전수 소스 핀 — FeedWait·WaitFor 는 좌석·승인 대기가 있어야 거동 재현이 되므로 소스로 박제한다).
+/// 비회귀: 느리지만 진행하는 소비자·스트림 면제·확립 연결 유휴(첫 줄 검체가 이미 박제).
+#[cfg(test)]
+mod write_stall_tests {
+    use super::{
+        handle_connection_capped, parse_write_stall_cap, Stream, FIRST_LINE_IDLE_SECS,
+        WRITE_STALL_MAX_SECS, WRITE_STALL_MIN_SECS, WRITE_STALL_SECS,
+    };
+    use crate::state::Daemon;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    const PING: &[u8] = b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n";
+
+    fn temp_daemon(tag: &str) -> (std::path::PathBuf, Arc<Daemon>) {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-r35-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = Daemon::new(dir.join("cysd.sock"));
+        (dir, d)
+    }
+
+    /// 응답을 읽지 않는 클라이언트를 흉내 낸다 — `line` 을 서버가 막을 때까지 되풀이해 쓰고
+    /// 읽기 쪽은 건드리지 않는다. 쓰기 절반은 반환해 EOF 를 주지 않는다(소유권 유지).
+    fn pump_without_reading(
+        wr: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        line: &'static [u8],
+    ) -> tokio::task::JoinHandle<tokio::io::WriteHalf<tokio::io::DuplexStream>> {
+        tokio::spawn(async move {
+            let mut wr = wr;
+            for _ in 0..100_000 {
+                if wr.write_all(line).await.is_err() {
+                    break; // 서버가 닫았다
+                }
+            }
+            wr
+        })
+    }
+
+    /// 회수 뒤 상대가 본 바이트 = 완결 프레임들 + (있으면) 개행 없는 꼬리. 꼬리는 같은 응답의 접두여야
+    /// 한다(상한 뒤 아무것도 덧쓰지 않는다 = 두 프레임이 한 줄로 붙지 않는다). 완결 프레임 목록을 돌려준다.
+    fn frames_then_prefix_tail(all: &[u8]) -> Vec<serde_json::Value> {
+        let text = String::from_utf8_lossy(all).into_owned();
+        let mut parts: Vec<&str> = text.split('\n').collect();
+        let tail = parts.pop().unwrap_or("");
+        assert!(!parts.is_empty(), "버퍼를 채운 완결 응답이 하나도 없다 — 계측 무효");
+        assert!(
+            parts[0].starts_with(tail),
+            "개행 없는 꼬리가 같은 응답의 접두가 아니다(상한 뒤 덧쓰기): {tail:?}"
+        );
+        parts
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("완결 프레임이 JSON 이 아니다"))
+            .collect()
+    }
+
+    /// 롤백 노브 진리표(순수 판정부 · env 무접촉).
+    #[test]
+    fn write_stall_cap_rollback_knob() {
+        let dflt = Some(Duration::from_secs(WRITE_STALL_SECS));
+        assert_eq!(parse_write_stall_cap(None), dflt);
+        assert_eq!(parse_write_stall_cap(Some("0")), None, "0 = 해제(개정 전 무한 대기)");
+        assert_eq!(parse_write_stall_cap(Some(" 17 ")), Some(Duration::from_secs(17)));
+        // 하한: 양수 1~9 는 10 으로 접는다(부하 호스트에서 정상 판독자 오절단 차단). 10 은 그대로.
+        for low in ["1", "5", "9", " 10 "] {
+            assert_eq!(
+                parse_write_stall_cap(Some(low)),
+                Some(Duration::from_secs(WRITE_STALL_MIN_SECS)),
+                "{low:?} → 하한"
+            );
+        }
+        for bad in ["nope", "-5", "", " ", "1.5", "99999999999999999999999"] {
+            assert_eq!(parse_write_stall_cap(Some(bad)), dflt, "{bad:?} → 기본값");
+        }
+        for giant in ["86401", "18446744073709551615"] {
+            let got = parse_write_stall_cap(Some(giant));
+            assert_eq!(got, Some(Duration::from_secs(WRITE_STALL_MAX_SECS)), "{giant} 클램프");
+            // 불변식: 반환값은 Instant 에 더할 수 있다(오버플로 패닉 도달 불가).
+            let _ = tokio::time::Instant::now() + got.unwrap();
+        }
+    }
+
+    /// 값 핀 — 문제 연결의 해제 시한은 하나다. 무수신 연결의 해제 시각(= dispatch 완료 + 버퍼 채움 + 이 상한)이
+    /// 무언 연결의 해제 시한(첫 줄 상한 60 s · S09 (c) 창)을 넘지 않도록 dispatch·채움 여유 ≥ 10 s 를 남긴다.
+    /// 그리고 하한(10) ≤ 기본값 ≤ 상한. (클라이언트 무진행 상한과는 방향이 반대라 결합하지 않는다.)
+    #[test]
+    fn write_stall_default_leaves_release_margin() {
+        const DISPATCH_FILL_MARGIN_SECS: u64 = 10;
+        assert!(
+            (..=FIRST_LINE_IDLE_SECS).contains(&(WRITE_STALL_SECS + DISPATCH_FILL_MARGIN_SECS)),
+            "쓰기 상한 {WRITE_STALL_SECS}s + 여유 {DISPATCH_FILL_MARGIN_SECS}s > 해제 시한 {FIRST_LINE_IDLE_SECS}s"
+        );
+        assert!(
+            (WRITE_STALL_MIN_SECS..=WRITE_STALL_MAX_SECS).contains(&WRITE_STALL_SECS),
+            "기본값 {WRITE_STALL_SECS} 이 [하한, 상한] 밖"
+        );
+        assert!((10..=WRITE_STALL_SECS).contains(&WRITE_STALL_MIN_SECS), "하한 {WRITE_STALL_MIN_SECS}");
+    }
+
+    /// ★적색 검체(S09 (c) 축소판 · Reply::Single): 요청만 쓰고 응답을 읽지 않는 클라이언트 — 버퍼가 찬 뒤
+    /// 상한 안에 연결이 회수되고, 상대는 완결 프레임들 + (있으면) 개행 없는 꼬리 뒤 EOF 를 본다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_reading_client_connection_is_reclaimed() {
+        let (dir, daemon) = temp_daemon("noread");
+        let (client, server) = tokio::io::duplex(1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None,
+            Some(Duration::from_millis(300)),
+        ));
+        let (mut rd, wr) = tokio::io::split(client);
+        let pump = pump_without_reading(wr, PING);
+        let finished = tokio::time::timeout(Duration::from_secs(10), conn).await;
+        assert!(
+            finished.is_ok(),
+            "응답을 읽지 않는 연결이 회수되지 않았다(단발 응답 쓰기 무기한 — S09 (c))"
+        );
+        let mut all = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), rd.read_to_end(&mut all))
+            .await
+            .expect("회수 뒤 EOF 가 오지 않았다")
+            .unwrap();
+        for v in frames_then_prefix_tail(&all) {
+            assert_eq!(v["ok"], json!(true), "완결 프레임: {v}");
+        }
+        pump.abort();
+        let _ = pump.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★적색 검체(parse_error 경로): 비JSON 줄만 흘리고 응답을 읽지 않는 클라이언트 — 줄마다 parse_error
+    /// 응답이 나가고, 버퍼가 차면 그 쓰기도 상한 안에 연결을 회수한다(dispatch 를 거치지 않는 쓰기 자리).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_reading_client_of_parse_errors_is_reclaimed() {
+        let (dir, daemon) = temp_daemon("noread-parse");
+        let (client, server) = tokio::io::duplex(1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None,
+            Some(Duration::from_millis(300)),
+        ));
+        let (mut rd, wr) = tokio::io::split(client);
+        let pump = pump_without_reading(wr, b"not-json\n");
+        let finished = tokio::time::timeout(Duration::from_secs(10), conn).await;
+        assert!(
+            finished.is_ok(),
+            "비JSON 줄에 대한 parse_error 응답을 읽지 않는 연결이 회수되지 않았다(parse_error 쓰기 무기한)"
+        );
+        let mut all = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), rd.read_to_end(&mut all))
+            .await
+            .expect("회수 뒤 EOF 가 오지 않았다")
+            .unwrap();
+        for v in frames_then_prefix_tail(&all) {
+            assert_eq!(v["error"]["code"], json!("parse_error"), "완결 프레임: {v}");
+        }
+        pump.abort();
+        let _ = pump.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★계측 타당성(negation): 상한을 끄면(노브 0 = 개정 전) 같은 연결이 회수되지 않는다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_reading_client_persists_without_the_cap_instrument_validity() {
+        let (dir, daemon) = temp_daemon("noread-nocap");
+        let (client, server) = tokio::io::duplex(1024);
+        let server: Stream = Box::new(server);
+        let conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None,
+            None,
+        ));
+        let (_rd, wr) = tokio::io::split(client);
+        let pump = pump_without_reading(wr, PING);
+        let still = tokio::time::timeout(Duration::from_millis(1500), conn).await;
+        assert!(still.is_err(), "상한이 없는데도 회수됐다 — 위 적색 검체가 상한을 시험하지 못한다");
+        pump.abort();
+        let _ = pump.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★비회귀(핵심 안전): **느리지만 읽고 있는** 소비자는 끊지 않는다 — 상한은 총 기한이 아니라
+    /// 무진행 기한이다. 한 프레임을 상한(300ms)의 수 배에 걸쳐 4바이트씩 읽어도 완결 수신되고,
+    /// 연결은 다음 요청도 받는다. (총 기한으로 구현하면 적색 — 변이로 확인.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_but_progressing_reader_is_not_cut() {
+        let (dir, daemon) = temp_daemon("slowread");
+        let cap = Duration::from_millis(300);
+        let (client, server) = tokio::io::duplex(16);
+        let server: Stream = Box::new(server);
+        let _conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None,
+            Some(cap),
+        ));
+        let (mut rd, mut wr) = tokio::io::split(client);
+        wr.write_all(PING).await.unwrap();
+        let t0 = Instant::now();
+        let mut line = Vec::new();
+        let mut b = [0u8; 4];
+        loop {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let n = tokio::time::timeout(Duration::from_secs(5), rd.read(&mut b))
+                .await
+                .expect("읽기 정체")
+                .unwrap();
+            assert!(n > 0, "느린 소비자가 EOF 를 받았다(진행 중 절단): {:?}", String::from_utf8_lossy(&line));
+            line.extend_from_slice(&b[..n]);
+            if line.ends_with(b"\n") {
+                break;
+            }
+        }
+        let took = t0.elapsed();
+        assert!(took >= cap * 2, "프레임이 상한의 2배보다 빨리 끝났다({took:?}) — 계측 무효");
+        let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        // 연결은 살아 있다 — 두 번째 왕복.
+        wr.write_all(PING).await.unwrap();
+        let mut rd = BufReader::new(rd);
+        let mut second = String::new();
+        tokio::time::timeout(Duration::from_secs(5), rd.read_line(&mut second))
+            .await
+            .expect("두 번째 응답 없음")
+            .unwrap();
+        assert!(second.contains("\"ok\":true"), "두 번째 왕복 실패: {second}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 함수 본문 구간(시그니처 ~ 열 0 의 닫는 괄호) — 소스 핀 공용. `marker` 가 구간 안에 있어야 한다
+    /// (경계를 잘못 잘랐으면 계측 무효로 적색 — 조용한 통과 차단).
+    fn fn_body<'a>(src: &'a str, sig: &str, marker: &str) -> &'a str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("{sig} 시그니처 — 계측 무효"));
+        let end = src[at..].find("\n}\n").expect("함수 끝") + at;
+        let body = &src[at..end];
+        assert!(body.contains(marker), "{sig} 구간에 {marker} 가 없다 — 함수 경계 계측 무효");
+        body
+    }
+
+    /// ★배선 핀(4곳 전수): 단발 응답 쓰기(parse_error · Single · FeedWait · WaitFor)는 전부 상한을 거친다.
+    /// 한 곳이라도 무기한 `write_line` 으로 되돌리면 적색(거동 검체는 parse_error·Single 두 곳만 싸게 재현된다).
+    #[test]
+    fn single_reply_sites_all_carry_the_write_stall() {
+        let src = include_str!("main.rs");
+        let body = fn_body(src, concat!("async fn handle_connection_", "capped("), "Reply::WaitFor {");
+        for arm in ["\"parse_error\"", "Reply::Single(resp)", "Reply::FeedWait {", "Reply::WaitFor {"] {
+            assert!(body.contains(arm), "{arm} 가 본문에 없다 — 계측 무효");
+        }
+        assert_eq!(
+            body.matches(concat!("write_line(&mut ", "write_half")).count(),
+            0,
+            "단발 응답 자리에 무기한 write_line 이 남아 있다"
+        );
+        assert_eq!(
+            body.matches(concat!("write_reply_", "line(")).count(),
+            4,
+            "단발 응답 쓰기 자리 4곳(parse_error·Single·FeedWait·WaitFor)이 모두 상한을 거치지 않는다"
+        );
+    }
+
+    /// ★스트림 면제 소스 핀(attach 는 좌석이 있어야 거동 시험이 되므로 소스로 박제한다):
+    /// `run_attach`·`run_event_stream` 본문은 단발 응답용 상한 쓰기를 쓰지 않는다. attach 를 끊으면 GUI 가
+    /// 재attach 없이 `[surface exited]` 를 그린다(G-08 · src-tauri `start_surface_stream`) — 이 핀을 풀려면
+    /// GUI 재attach 가 먼저다. (쓰기 상한과 무관한 timeout 은 막지 않는다 — 금지어는 하나뿐이다.)
+    #[test]
+    fn stream_paths_do_not_carry_the_write_stall() {
+        let src = include_str!("main.rs");
+        for (sig, marker) in [
+            (concat!("async fn run_", "attach<"), "contents_formatted"),
+            (concat!("async fn run_", "event_stream<"), "slow_consumer"),
+        ] {
+            let body = fn_body(src, sig, marker);
+            assert!(
+                !body.contains(concat!("write_reply", "_line")),
+                "{sig} 본문에 write_reply_line — 스트림 면제 위반"
+            );
+        }
+    }
+
+    /// ★스트림 면제 핀: `events.stream` 은 무진행 상한을 받지 않는다(클라이언트 `RPC_STREAMING_METHODS`
+    /// 면제와 대칭). replay 로 버퍼를 넘치게 한 뒤 상한의 수 배를 읽지 않아도 연결은 살아 있고, 다시 읽으면
+    /// 온전한 프레임이 이어진다.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_stream_is_exempt_from_write_stall() {
+        let (dir, daemon) = temp_daemon("evexempt");
+        for i in 0..300 {
+            daemon.bus.publish("r35.test", "test", None, json!({"i": i, "pad": "x".repeat(80)}));
+        }
+        let (client, server) = tokio::io::duplex(256);
+        let server: Stream = Box::new(server);
+        let mut conn = tokio::spawn(handle_connection_capped(
+            Arc::clone(&daemon),
+            server,
+            None,
+            None,
+            Some(Duration::from_millis(200)),
+        ));
+        let (rd, mut wr) = tokio::io::split(client);
+        wr.write_all(b"{\"id\":1,\"method\":\"events.stream\",\"params\":{\"after_seq\":0}}\n")
+            .await
+            .unwrap();
+        let still = tokio::time::timeout(Duration::from_millis(1200), &mut conn).await;
+        assert!(still.is_err(), "읽지 않는 events.stream 구독이 쓰기 상한으로 끊겼다(스트림 면제 위반)");
+        let mut rd = BufReader::new(rd);
+        let mut n_events = 0;
+        for _ in 0..50 {
+            let mut l = String::new();
+            tokio::time::timeout(Duration::from_secs(5), rd.read_line(&mut l))
+                .await
+                .expect("재개 뒤 프레임 없음")
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(l.trim()).expect("프레임 훼손");
+            if v["type"] == json!("event") {
+                n_events += 1;
+            }
+        }
+        assert!(n_events > 0, "replay 이벤트가 오지 않았다 — 계측 무효");
+        conn.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
