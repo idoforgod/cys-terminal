@@ -20910,7 +20910,7 @@ mod tests {
     /// 넘긴다(approval.stalled{reason}) — 요청자 대기가 120s 라 큐 보류는 곧 조용한 만료다. RED(HEAD): 주입.
     #[test]
     fn h4_ceo_hard_axes_escalate() {
-        let (d, ceo) = h4_rig("h4-axes", "stty -echo; exec sleep 30");
+        let (d, ceo) = h4_rig("h4-axes", "sleep 30");
         let cases: [(&str, &str); 4] = [
             ("ceo_seat_modal", "modal"),
             ("ceo_seat_draft", "draft"),
@@ -20951,7 +20951,7 @@ mod tests {
     /// [H4 핀] busy CEO 에는 종전대로 즉시 주입한다(턴 경계까지 미루면 120s 만료가 곧 escalation).
     #[test]
     fn h4_ceo_busy_injects() {
-        let (d, ceo) = h4_rig("h4-busy", "stty -echo; exec sleep 30");
+        let (d, ceo) = h4_rig("h4-busy", "sleep 30");
         crate::governance::h_paint(&ceo, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
         let item = h4_item("h4-busy", "RSI 학습 추천 busy", "x");
         assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
@@ -20996,7 +20996,7 @@ mod tests {
     /// [노브] `CYS_MACHINE_INJECT_HOLD` 에서 ceo 를 빼면 HEAD 동작(모달 CEO 에도 주입).
     #[test]
     fn h4_knob_off_is_head_identical() {
-        let (d, ceo) = h4_rig("h4-knob", "stty -echo; exec sleep 30");
+        let (d, ceo) = h4_rig("h4-knob", "sleep 30");
         let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,supervisor,takeover")]);
         crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         let item = h4_item("h4-knob", "RSI 학습 추천 knob", "x");

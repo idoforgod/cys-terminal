@@ -3928,6 +3928,7 @@ mod tests {
 
     // ═══════════ ★(0.14.42 · 설계 H3) 채널 inbox → master: 하드축 보류 · 기록 선행 · 재배달 기본 0 · 지연 표기 ═══════════
 
+    #[cfg(unix)]
     fn h3_rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
         let d = tmp_daemon(tag);
         seed_registered(&d, "slack", "t");
@@ -3937,6 +3938,7 @@ mod tests {
     }
 
     /// 에코 없는 master 좌석(주입 본문이 화면을 더럽히지 않게) — claude 마커 · 유휴 composer.
+    #[cfg(unix)]
     fn h3_master(d: &Arc<Daemon>) -> Arc<crate::state::Surface> {
         let m = d
             .create_surface(None, Some("stty -echo; exec sleep 30".into()), None, Some("master".into()), 24, 80)
@@ -3948,6 +3950,7 @@ mod tests {
         m
     }
 
+    #[cfg(unix)]
     fn h3_state(d: &Arc<Daemon>, id: i64) -> String {
         let g = d.channels.lock().unwrap();
         g.as_ref()
@@ -3956,6 +3959,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn h3_queued_reason(d: &Arc<Daemon>, id: i64) -> Option<String> {
         d.bus
             .tail(200)
@@ -3964,6 +3968,7 @@ mod tests {
             .and_then(|ev| ev["payload"]["hold_reason"].as_str().map(str::to_string))
     }
 
+    #[cfg(unix)]
     fn h3_seed(d: &Arc<Daemon>, text: &str, created_ts: f64) -> i64 {
         let g = d.channels.lock().unwrap();
         let conn = g.as_ref().unwrap();
@@ -3975,6 +3980,7 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    #[cfg(unix)]
     fn h3_done(m: &Arc<crate::state::Surface>) {
         let _ = m.child.lock().unwrap().kill();
     }

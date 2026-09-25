@@ -5953,7 +5953,7 @@ mod tests {
 
     fn h5_seat(d: &Arc<Daemon>, screen: &str) -> Arc<crate::state::Surface> {
         let s = d
-            .create_surface(None, Some("stty -echo; exec sleep 30".into()), None, Some("master".into()), 24, 80)
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
             .expect("선언 좌석");
         *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
         d.surfaces.lock().unwrap().insert(s.id, s.clone());
