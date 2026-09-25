@@ -2285,6 +2285,197 @@ fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
     (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
 }
 
+/// ★(0.14.42 · A2) 짝 Return 흡수 표의 수명(초) — `CYS_RETURN_ABSORB_SECS`, 기본 30.
+/// **0 = 발급·흡수·보상 전부 끔**(롤백 노브 — send/send-key 가 종전 동작으로 완전히 돌아간다).
+///
+/// 기본값 근거는 비대칭이다: TTL 밖으로 샌 짝 Return 은 **조용한** 오승인(대화상자 기본 선택지 확정 ·
+/// 벤치 S22)이 되고, TTL 안의 의도적 Return 이 흡수되면 `ABSORBED` 로 **명시 통지**되어 재전송 1회로
+/// 회복된다. 운영 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_expired` 의 `ticket_age_ms`.
+fn return_absorb_ttl_secs() -> u64 {
+    std::env::var("CYS_RETURN_ABSORB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+}
+
+/// ★(0.14.42 · A2) 흡수 자격 미달 사유 — `absorb_miss` 응답 키의 값.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsorbMiss {
+    /// TTL 노브 0.
+    Disabled,
+    /// 요청에 `pair_return:true` 가 없다(원시 RPC · inject_text · cycle 3분할 · 다중 키).
+    NotPaired,
+    /// 키 이름이 Return/Enter 가 아니다(C-m 같은 별칭 포함 — 이름 축).
+    NotSubmitKey,
+    /// authoritative 파라미터(launch-agent·reinject 등 권위 경로)는 구조적으로 대상 밖.
+    Authoritative,
+    /// 발신자 신원 미해석(결측은 값이 아니다).
+    Unverified,
+    /// 이 발신자의 표가 없다.
+    NoTicket,
+    /// 표 나이 ≥ TTL.
+    Expired,
+}
+
+impl AbsorbMiss {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbsorbMiss::Disabled => "disabled",
+            AbsorbMiss::NotPaired => "not_paired",
+            AbsorbMiss::NotSubmitKey => "not_submit_key",
+            AbsorbMiss::Authoritative => "authoritative",
+            AbsorbMiss::Unverified => "unverified",
+            AbsorbMiss::NoTicket => "no_ticket",
+            AbsorbMiss::Expired => "expired",
+        }
+    }
+}
+
+/// ★(0.14.42 · A2) 흡수 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsorbVerdict {
+    /// 쓰지 않는다(표를 CAS 로 소비하고 흡수 응답).
+    Absorb,
+    /// 기계 본문(pending>0 ∧ human==0) 위의 Return — **누구 것이든 종전처럼 통과**(구조 경로 보존).
+    PassThrough,
+    /// 자격 미달 — 종전 동작 그대로.
+    Miss(AbsorbMiss),
+}
+
+/// ★(0.14.42 · A2 D3) 짝 Return 흡수 **순수 판정** — IO 없음 · 1차(ACL 직후)와 `input_gate` 안
+/// 2차 재확인이 같은 함수를 쓴다.
+///
+/// 원칙 한 줄: **흡수는 기계 본문을 제출하지 않을 Return 에만** 적용한다. 대상은 queued Return ·
+/// 빈 줄(pending==0) · 사람 초안 위(human>0) 셋이다. 기계 본문 위 Return 은 누구 것이든 통과한다 —
+/// 계수(`PendingInputState`)는 줄 위 본문이 **자기 것인지** 판정의 근거가 못 되므로(소유자 축은
+/// 세대가 바뀌면 결측), 자기 본문의 짝 Return 을 삼키는 사고와 죽은 발신자 본문의 구조 경로 소실을
+/// 둘 다 이 한 규칙으로 막는다. queued Return 은 계수된 본문을 제출한 적이 없으므로(큐 배달은 줄이
+/// 빌 때만 나간다 · RC2) 흡수해도 잃는 구조가 없다.
+#[allow(clippy::too_many_arguments)]
+fn return_absorb_verdict(
+    ttl_secs: u64,
+    pair_return: bool,
+    key: &str,
+    authoritative_param: bool,
+    verified_from: Option<u64>,
+    ticket_age: Option<std::time::Duration>,
+    queued: bool,
+    pending: u64,
+    human: u64,
+) -> AbsorbVerdict {
+    if ttl_secs == 0 {
+        return AbsorbVerdict::Miss(AbsorbMiss::Disabled);
+    }
+    if !pair_return {
+        return AbsorbVerdict::Miss(AbsorbMiss::NotPaired);
+    }
+    if !matches!(key, "Return" | "Enter") {
+        return AbsorbVerdict::Miss(AbsorbMiss::NotSubmitKey);
+    }
+    if authoritative_param {
+        return AbsorbVerdict::Miss(AbsorbMiss::Authoritative);
+    }
+    if verified_from.is_none() {
+        return AbsorbVerdict::Miss(AbsorbMiss::Unverified);
+    }
+    let Some(age) = ticket_age else {
+        return AbsorbVerdict::Miss(AbsorbMiss::NoTicket);
+    };
+    if age >= std::time::Duration::from_secs(ttl_secs) {
+        return AbsorbVerdict::Miss(AbsorbMiss::Expired);
+    }
+    if queued {
+        return AbsorbVerdict::Absorb;
+    }
+    if pending > 0 && human == 0 {
+        AbsorbVerdict::PassThrough
+    } else {
+        AbsorbVerdict::Absorb
+    }
+}
+
+/// ★(0.14.42 · A2 D4) send_key 쓰기 뒤 발신자 표 정산.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TicketSettle {
+    /// 자기 기계 본문을 제출했다 — 같은 창 형제 프로세스가 보낼 짝 Return 을 위해 유지.
+    Keep,
+    /// 발신자 표 소거.
+    Clear,
+    /// 남(O)의 기계 본문을 제출했다 — 발신자 표 소거 + O 에게 보상 표(이미 불필요해진 O 의 짝 Return 흡수).
+    ClearAndCompensate(u64),
+}
+
+/// ★(0.14.42 · A2 D4) 쓰기 뒤 정산 **순수 판정**. 재료는 `input_gate` 안 `try_write` 직전 스냅샷이다.
+/// 비제출 키(Down·Tab·Esc·C-u …)와 빈 줄·사람 초안 위 제출은 언제나 소거한다 — 그래서
+/// `send-key Down Return`·선택지 조작 뒤의 Return 은 절대 흡수되지 않는다.
+/// 소유자 결측(세대 불일치)은 값이 아니다 — 보상도 유지도 없이 소거한다.
+fn ticket_after_key_write(
+    caller: u64,
+    owner: Option<u64>,
+    pending_before: u64,
+    human_before: u64,
+    key_submits: bool,
+) -> TicketSettle {
+    if key_submits && pending_before > 0 && human_before == 0 {
+        match owner {
+            Some(o) if o == caller => TicketSettle::Keep,
+            Some(o) => TicketSettle::ClearAndCompensate(o),
+            None => TicketSettle::Clear,
+        }
+    } else {
+        TicketSettle::Clear
+    }
+}
+
+/// ★(0.14.42 · A2) 흡수 응답·이벤트의 단일 조립처. 호출 규약: 어떤 좌석 락도 쥐지 않은 채 부른다
+/// (여기서 `pending_queue` 를 잠깐 잡아 본문 상태·깊이를 읽는다 — 표는 이미 CAS 로 꺼낸 뒤다).
+fn return_absorbed_response(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    id: &Value,
+    key: &str,
+    caller: u64,
+    ticket: &crate::state::ReturnTicket,
+) -> Value {
+    let ticket_age_ms = ticket.issued.elapsed().as_millis() as u64;
+    let (kind, entry_id) = match &ticket.kind {
+        crate::state::ReturnTicketKind::Pair { entry_id } => ("pair", Some(entry_id.clone())),
+        crate::state::ReturnTicketKind::Compensation => ("compensation", None),
+    };
+    let (depth, in_queue) = {
+        let q = surface.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let in_queue = entry_id.as_deref().is_some_and(|want| q.iter().any(|e| e.id == want));
+        (q.len(), in_queue)
+    };
+    // 본문 상태 — pair: 큐에 있으면 queued(배달이 CR 까지 제출) · 없으면 not_queued(이미 배달됐거나
+    // 처분됨) · compensation: 남의 Return 이 이미 제출했다(submitted).
+    let body_state = match (kind, in_queue) {
+        ("compensation", _) => "submitted",
+        (_, true) => "queued",
+        _ => "not_queued",
+    };
+    daemon.bus.publish(
+        "queue.return_absorbed",
+        "queue",
+        Some(surface.id),
+        json!({
+            "surface_ref": cys::surface_ref(surface.id),
+            "from": cys::surface_ref(caller),
+            "absorb_kind": kind,
+            "queue_entry_id": entry_id,
+            "body_state": body_state,
+            "depth": depth,
+            "ticket_age_ms": ticket_age_ms,
+        }),
+    );
+    ok_response(
+        id,
+        json!({"surface_id": surface.id, "key": key, "sent": false, "absorbed": true,
+               "absorb_kind": kind, "queue_entry_id": entry_id, "body_state": body_state,
+               "depth": depth, "ticket_age_ms": ticket_age_ms}),
+    )
+}
+
 /// ★B2′ `surface.send_text` 의 쓰기 변형 선택(순수) — 세 갈래를 한 곳에 모아 테스트 가능하게.
 ///
 ///   · clear_first  → `Inject`(Ctrl-U 선정리 → paste → CR, 원자)
@@ -4358,11 +4549,36 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let durable = daemon.queue_wal_durable();
                 // ★G1(W2-B): 응답에 queue_entry_id 가산(queued/depth 불변) — 발신자가
                 // 이후 queue.list·배달/폐기 이벤트를 조인하는 조준점.
-                return Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": sid, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id, "durable": durable}),
-                ));
+                let mut result = json!({"surface_id": sid, "queued": true, "depth": depth,
+                                        "queue_entry_id": entry.id, "durable": durable});
+                // ★(0.14.42 · A2 D1) 짝 Return 흡수 표 발급 — `cys send` 의 **자동 전환**(폴백 r2)만
+                //   `absorb_return:true` 를 싣는다(명시 `--queued` 는 싣지 않으므로 표 없음 — 의도적
+                //   Return 을 삼키지 않는다). 큐 Inject 가 CR 까지 제출하므로 뒤따르는 관례적 짝
+                //   Return 은 불필요하다 — 그 1회를 데몬이 흡수해 맨 CR·빈 큐 항목·거짓 queue_full 을 없앤다.
+                //   조건: 검증 발신자(결측은 값이 아니다) · ttl>0 · 끝이 CR/LF 아님(자동 제출 본문은
+                //   짝 Return 이 오지 않는다 — 여러 줄 본문은 중간 LF 가 있어도 짝 Return 이 온다).
+                //   큐 락을 놓은 뒤·응답 전에 기록한다(표 락은 단독 leaf).
+                let absorb_return = params
+                    .get("absorb_return")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if absorb_return {
+                    let ttl = return_absorb_ttl_secs();
+                    let issued = match verified_from {
+                        Some(x) if ttl > 0 && !text.ends_with(['\r', '\n']) => {
+                            surface.issue_return_ticket(
+                                x,
+                                crate::state::ReturnTicketKind::Pair { entry_id: entry.id.clone() },
+                                std::time::Duration::from_secs(ttl),
+                            );
+                            true
+                        }
+                        _ => false,
+                    };
+                    result["return_absorb"] = json!(issued);
+                    result["return_absorb_secs"] = json!(ttl);
+                }
+                return Reply::Single(ok_response(&id, result));
             }
             let machine_origin = params
                 .get("machine_origin")
@@ -4550,10 +4766,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     } else {
                         crate::governance::InputOrigin::Machine
                     };
-                    surface.apply_pending_input(text.as_bytes(), origin);
+                    let next = surface.apply_pending_input(text.as_bytes(), origin);
+                    // ★(0.14.42 · A2 D0) 기계 본문의 소유자 각인 — 검증 발신자 · 결과 count>0 일 때만.
+                    //   pending_input leaf 만 잡는다(게이트 안 락 계약 그대로). 이후 변이는 세대를 올려
+                    //   각인을 자동 무효화한다(Surface::pending_owner).
+                    if origin == crate::governance::InputOrigin::Machine && next.count > 0 {
+                        if let Some(x) = verified_from {
+                            surface.mark_pending_owner(x);
+                        }
+                    }
                 }
             }
             drop(_gate); // 여기까지가 임계영역 — 이후 이벤트·에코창 갱신은 게이트 밖이다.
+            // ★(0.14.42 · A2 D2) 직접 send 가 성공했으면 이 발신자의 짝 Return 표는 끝났다 — 뒤따르는
+            //   Return 은 이 새 본문을 제출해야 한다(clear_first 포함). 표 락은 단독 leaf(게이트 밖).
+            if let Some(x) = verified_from {
+                surface.clear_return_ticket(x);
+            }
             if !human_verified {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
@@ -4650,16 +4879,86 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
+            // ★(0.14.42 · A2 D3) 짝 Return 흡수 판정 — ACL 뒤(발신자는 자기 짝 Return 만 억제할 수
+            //   있다) · queued 팔·타이핑 가드·D-12 **앞**. 흡수는 쓰기 1회를 억제만 한다(새 쓰기·적재 0).
+            //   `pair_return` 은 신 CLI 의 단일 `send-key Return|Enter` 만 싣는다 — inject_text·cycle
+            //   3분할·authoritative Return·launch-agent 는 싣지 않는 원시 요청이라 구조적으로 대상 밖이다.
+            //   선형화 근거: 흡수 시점의 원자 읽기에서 줄이 비어 있었다면 종전 'bare CR 을 그 시점에
+            //   쓴다' 에서 CR 만 빠진 것과 같다(그래서 여기서는 input_gate 를 잡지 않는다). 기계 본문
+            //   위(PassThrough)는 종전 경로를 타고, 게이트 안에서 같은 순수 함수로 재확인한다.
+            let queued_param = params
+                .get("queued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let authoritative_param = params
+                .get("authoritative")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let pair_return = params
+                .get("pair_return")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let absorb_ttl = return_absorb_ttl_secs();
+            // (verdict, 판정에 쓴 표의 발급 시각) — pair_return 없는 요청은 표·계수를 읽지 않는다.
+            let mut absorb: Option<(AbsorbVerdict, Option<std::time::Instant>)> = None;
+            if pair_return {
+                let ticket = verified_from.and_then(|x| surface.peek_return_ticket(x));
+                let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                let human = surface
+                    .pending_input
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .human
+                    .min(pending);
+                let verdict = return_absorb_verdict(
+                    absorb_ttl,
+                    pair_return,
+                    &key,
+                    authoritative_param,
+                    verified_from,
+                    ticket.as_ref().map(|t| t.issued.elapsed()),
+                    queued_param,
+                    pending,
+                    human,
+                );
+                let issued = ticket.as_ref().map(|t| t.issued);
+                match (verdict, verified_from, issued) {
+                    (AbsorbVerdict::Absorb, Some(x), Some(at)) => {
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            return Reply::Single(return_absorbed_response(
+                                daemon, &surface, &id, &key, x, &t,
+                            ));
+                        }
+                        // CAS 실패(그 사이 소비·재발급) — 종전 경로.
+                        absorb = Some((AbsorbVerdict::Miss(AbsorbMiss::NoTicket), None));
+                    }
+                    (AbsorbVerdict::Miss(AbsorbMiss::Expired), Some(x), Some(at)) => {
+                        // 만료 표는 여기서 정리한다(1회 통지). 원장 Outcome 으로는 잴 수 없던 축 —
+                        // LLM 짝 Return 지연 분포(TTL 조정 근거).
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            daemon.bus.publish(
+                                "queue.return_absorb_expired",
+                                "queue",
+                                Some(sid),
+                                json!({
+                                    "surface_ref": cys::surface_ref(sid),
+                                    "from": cys::surface_ref(x),
+                                    "ticket_age_ms": t.issued.elapsed().as_millis() as u64,
+                                    "ttl_secs": absorb_ttl,
+                                }),
+                            );
+                        }
+                        absorb = Some((verdict, None));
+                    }
+                    _ => absorb = Some((verdict, issued)),
+                }
+            }
             // queued Return: 대상이 조용해질 때 배달자가 CR을 주입한다(빈 텍스트 Inject =
             // bracketed-paste 빈 본문 + CR). 타이핑 가드 에러가 "use --queued"를 안내하는데
             // send-key만 그 경로가 없던 CLI 비대칭이 노드 보고 채널을 막았다(2026-06-12 실측
             // — codex가 "unexpected argument '--queued'"에 부딪혀 Return 배달 불가).
             // Return/Enter 한정: 다른 키는 텍스트 큐(String)에 실을 수 없다.
-            if params
-                .get("queued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            if queued_param {
                 if !matches!(key.as_str(), "Return" | "Enter") {
                     return Reply::Single(err_response(
                         &id,
@@ -4702,18 +5001,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 daemon.persist_queue_state();
                 // ★(0.14.31 · 리뷰 R2 · codex major) `durable` 은 send_text queued 응답에만 있었다 —
                 //   같은 계약의 send-key queued 도 사실을 실어야 클라이언트가 내구 실패를 안다.
-                return Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
-                           "queue_entry_id": entry.id, "durable": daemon.queue_wal_durable()}),
-                ));
+                let mut result = json!({"surface_id": sid, "key": key, "queued": true, "depth": depth,
+                                        "queue_entry_id": entry.id, "durable": daemon.queue_wal_durable()});
+                // ★(0.14.42 · A2) 흡수를 요청했는데 흡수되지 않은 사실(사유)을 싣는다 — pair_return 요청 시만.
+                if let Some((verdict, _)) = absorb {
+                    result["absorbed"] = json!(false);
+                    if let AbsorbVerdict::Miss(why) = verdict {
+                        result["absorb_miss"] = json!(why.as_str());
+                    }
+                }
+                return Reply::Single(ok_response(&id, result));
             }
             // 권위 주입(send_text와 동일 근거)은 타이핑 가드를 면제 — launch-agent/reinject가
             // 디렉티브 주입 후 보내는 제출 Return이 사람-입력 잔향에 막히지 않게 한다.
-            let authoritative = params
-                .get("authoritative")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let authoritative = authoritative_param;
             let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
             if !exempt {
                 let guard = typing_guard_secs();
@@ -4778,11 +5079,58 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
                 None => crate::state::WriteReq::Data(bytes),
             };
+            // ★(0.14.42 · A2) 게이트 안 흡수 재확인 대상 — 1차가 PassThrough(기계 본문 위)였던 요청만.
+            let mut absorb_recheck = match absorb {
+                Some((AbsorbVerdict::PassThrough, Some(at))) => verified_from.map(|x| (x, at)),
+                _ => None,
+            };
+            // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산 재료 — 게이트 안 `try_write` 직전 스냅샷(pending_input leaf).
+            let key_submits = key_bytes.iter().any(|b| matches!(b, b'\r' | b'\n'));
+            let mut settle_snapshot: Option<(u64, u64, Option<u64>)> = None;
+            let mut write_req = Some(write_req);
             // ★(0.14.31 · WP-5 · codex Q4) send_text 와 같은 임계영역 규약 — writer 인계와 계수
             //   갱신을 `input_gate` 하나로 묶는다(종전엔 락 없이 갱신해 큐 배달의 0 쓰기와 교차하면
             //   lost update 가 났다). 락 순서 계약: input_gate 안에서는 pending_input leaf 만 잡는다.
-            {
+            // ★(0.14.42 · A2) 이 블록은 최대 2회 돈다 — 게이트 안 재확인이 흡수로 바뀌면 게이트를 놓고
+            //   표를 CAS 로 꺼낸다(표 락은 단독 leaf 라 게이트 안에서 잡지 않는다). CAS 가 실패하면
+            //   (그 사이 형제 프로세스가 소비·재발급) 재확인 없이 게이트를 다시 잡고 종전 경로로 간다.
+            loop {
                 let _gate = surface.input_gate.lock().unwrap();
+                // ★(0.14.42 · A2) 게이트 안 재확인 — 1차 판정 뒤 쓰기 전에 pending 이 0 이 됐거나
+                //   (다른 Return·큐 Inject 가 줄을 비웠다) 사람 초안이 생겼으면, 이 Return 은 더는
+                //   기계 본문을 제출하지 않는다 = 이 경쟁 창의 맨 CR 도 흡수 대상이다.
+                //   ★검체 없음 고지: 1차와 **같은 순수 함수**라 결정론 검체로 구별되지 않는다(아래 D-12
+                //   2차 검사와 같은 형식 — 경합 시임 없이는 고정 불가). 지워도 스위트는 초록이다.
+                if let Some((x, at)) = absorb_recheck {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface
+                        .pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .human
+                        .min(pending);
+                    let v2 = return_absorb_verdict(
+                        absorb_ttl,
+                        pair_return,
+                        &key,
+                        authoritative_param,
+                        verified_from,
+                        Some(at.elapsed()),
+                        false,
+                        pending,
+                        human,
+                    );
+                    if v2 == AbsorbVerdict::Absorb {
+                        drop(_gate);
+                        if let Some(t) = surface.take_return_ticket(x, at) {
+                            return Reply::Single(return_absorbed_response(
+                                daemon, &surface, &id, &key, x, &t,
+                            ));
+                        }
+                        absorb_recheck = None;
+                        continue;
+                    }
+                }
                 // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
                 // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
                 // 직렬화된다. 화면 축은 관측 지연이 있어 밖의 1회로 둔다
@@ -4802,13 +5150,45 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         ));
                     }
                 }
-                if let Some(err) = try_write(&surface, write_req, &id) {
+                if verified_from.is_some() {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface
+                        .pending_input
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .human
+                        .min(pending);
+                    settle_snapshot = Some((pending, human, surface.pending_owner()));
+                }
+                let req = write_req.take().expect("write_req 는 쓰기 직전 1회만 꺼낸다");
+                if let Some(err) = try_write(&surface, req, &id) {
                     return Reply::Single(err);
                 }
                 // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
                 //   취소라 계수가 0 으로 돌아가고, 그 밖의 키는 누적된다(화살표 등 ESC 시퀀스가 몇
                 //   바이트 더해지는 것은 '비어 있지 않다' 는 판정만 강화하므로 안전한 방향이다).
                 surface.apply_pending_input(&key_bytes, crate::governance::InputOrigin::Machine);
+                break;
+            }
+            // ★(0.14.42 · A2 D4) 쓰기 뒤 표 정산(게이트 밖 · 표 락 단독 leaf). 효과: ① 비제출 키(Down·
+            //   숫자·C-u …)와 빈 줄·사람 초안 위 제출은 발신자 표를 소거한다 — 선택지 조작 뒤 Return 은
+            //   절대 흡수되지 않는다. ② 남(O)의 기계 본문을 제출했으면 O 에게 보상 표 — 이미 불필요해진
+            //   O 의 짝 Return 이 빈 줄에 떨어지는 가로채기 연쇄를 끊는다. 미검증 발신자는 무동작.
+            if let (Some(x), Some((pending_before, human_before, owner))) = (verified_from, settle_snapshot) {
+                match ticket_after_key_write(x, owner, pending_before, human_before, key_submits) {
+                    TicketSettle::Keep => {}
+                    TicketSettle::Clear => surface.clear_return_ticket(x),
+                    TicketSettle::ClearAndCompensate(o) => {
+                        surface.clear_return_ticket(x);
+                        if absorb_ttl > 0 {
+                            surface.issue_return_ticket(
+                                o,
+                                crate::state::ReturnTicketKind::Compensation,
+                                std::time::Duration::from_secs(absorb_ttl),
+                            );
+                        }
+                    }
+                }
             }
             Reply::Single(ok_response(
                 &id,
@@ -13501,6 +13881,73 @@ mod tests {
         for (key, resp) in observations {
             assert_eq!(resp["ok"], json!(true), "key={key:?}: 사람 초안이 있어도 탐색 허용: {resp}");
         }
+    }
+
+    // ── ★A2(0.14.42) 짝 Return 흡수 순수 판정 표 — RPC 검체는 return_absorb_tests.rs ──
+
+    /// `return_absorb_verdict` 전 분기. 게이트 안 재확인은 1차와 **같은 순수 함수**라 결정론 경합
+    /// 검체가 없다(D-12 2차 검사의 '검체 없음 고지'와 같은 형식) — 그 대신 이 표가 함수 자체를 고정한다.
+    #[test]
+    fn a2_return_absorb_verdict_table() {
+        use std::time::Duration;
+        let s = |x: u64| Duration::from_secs(x);
+        let young = Some(s(1));
+        let v = |ttl, pair, key: &str, auth, from, age, queued, pending, human| {
+            return_absorb_verdict(ttl, pair, key, auth, from, age, queued, pending, human)
+        };
+        use AbsorbMiss::*;
+        use AbsorbVerdict::*;
+        assert_eq!(v(0, true, "Return", false, Some(7), young, false, 0, 0), Miss(Disabled));
+        assert_eq!(v(30, false, "Return", false, Some(7), young, false, 0, 0), Miss(NotPaired));
+        assert_eq!(v(30, true, "C-m", false, Some(7), young, false, 0, 0), Miss(NotSubmitKey));
+        assert_eq!(v(30, true, "Down", false, Some(7), young, false, 0, 0), Miss(NotSubmitKey));
+        assert_eq!(v(30, true, "Return", true, Some(7), young, false, 0, 0), Miss(Authoritative));
+        assert_eq!(v(30, true, "Return", false, None, young, false, 0, 0), Miss(Unverified));
+        assert_eq!(v(30, true, "Return", false, Some(7), None, false, 0, 0), Miss(NoTicket));
+        assert_eq!(v(30, true, "Return", false, Some(7), Some(s(30)), false, 0, 0), Miss(Expired));
+        assert_eq!(v(30, true, "Return", false, Some(7), Some(s(31)), true, 0, 0), Miss(Expired));
+        // 자격 있음 — queued 는 무조건 흡수(계수된 본문을 제출한 적이 없다 · RC2).
+        assert_eq!(v(30, true, "Return", false, Some(7), young, true, 9, 0), Absorb);
+        assert_eq!(v(30, true, "Enter", false, Some(7), young, true, 0, 0), Absorb);
+        // 기계 본문 위 = 누구 것이든 통과(구조 경로 보존 · 자기 본문 흡수 사고 차단).
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 5, 0), PassThrough);
+        // 빈 줄 · 사람 초안 위 = 흡수.
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 0, 0), Absorb);
+        assert_eq!(v(30, true, "Return", false, Some(7), young, false, 5, 2), Absorb);
+    }
+
+    /// `ticket_after_key_write` 전 분기 — own keep / other compensate / 결측 clear / 비제출 키 clear /
+    /// 빈 줄 clear / 사람 초안 clear.
+    #[test]
+    fn a2_ticket_after_key_write_table() {
+        use TicketSettle::*;
+        assert_eq!(ticket_after_key_write(7, Some(7), 5, 0, true), Keep);
+        assert_eq!(ticket_after_key_write(7, Some(9), 5, 0, true), ClearAndCompensate(9));
+        assert_eq!(ticket_after_key_write(7, None, 5, 0, true), Clear, "소유자 결측은 값이 아니다");
+        assert_eq!(ticket_after_key_write(7, Some(9), 5, 0, false), Clear, "비제출 키는 보상 없음");
+        assert_eq!(ticket_after_key_write(7, Some(7), 5, 0, false), Clear, "비제출 키는 자기 표도 소거");
+        assert_eq!(ticket_after_key_write(7, Some(9), 0, 0, true), Clear, "빈 줄 제출은 남의 본문 제출 아님");
+        assert_eq!(ticket_after_key_write(7, Some(9), 5, 2, true), Clear, "사람 초안 위 제출은 보상 없음");
+    }
+
+    /// 프로덕션 구간 소스 핀: 흡수 판정은 ACL **뒤**·queued 팔 **앞**이고, 표 락은 input_gate 안에서
+    /// 잡지 않는다(단독 leaf 계약) — 재확인 흡수는 게이트를 놓은 **뒤** CAS 한다.
+    #[test]
+    fn a2_absorb_order_and_leaf_lock_source_pin() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let acl = arm.find("check_send_acl(daemon, caller_pid, &surface, &params)").expect("ACL");
+        let verdict = arm.find("let verdict = return_absorb_verdict(").expect("1차 판정");
+        let queued = arm.find("if queued_param {").expect("queued 팔");
+        let guard = arm.find("let guard = typing_guard_secs();").expect("타이핑 가드");
+        assert!(acl < verdict && verdict < queued && queued < guard, "순서: ACL → 흡수 판정 → queued 팔 → 타이핑 가드");
+        let recheck = arm.find("if v2 == AbsorbVerdict::Absorb {").expect("게이트 안 재확인");
+        let after = &arm[recheck..];
+        let drop_at = after.find("drop(_gate);").expect("게이트 해제");
+        let take_at = after.find("surface.take_return_ticket(x, at)").expect("CAS");
+        assert!(drop_at < take_at, "표 CAS 는 게이트를 놓은 뒤 — 표 락은 input_gate 안에서 잡지 않는다");
     }
 
     #[test]

@@ -976,6 +976,24 @@ pub struct InjectReservation {
     pub guard: Arc<InjectGuard>,
 }
 
+/// ★(0.14.42 · A2) 짝 Return 흡수 표의 종류 — 발급 사유가 곧 흡수 응답의 `absorb_kind` 다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnTicketKind {
+    /// 발신자의 `cys send` 본문이 큐로 **자동 전환**됐다(큐 Inject 가 CR 까지 제출한다) — 그 항목 id.
+    Pair { entry_id: String },
+    /// 남의 Return 이 이 발신자의 기계 본문을 **이미 제출했다**(가로채기 연쇄 차단용).
+    Compensation,
+}
+
+/// ★(0.14.42 · A2) 대상 좌석·발신자당 1장 · 1회용 흡수 표(휘발 — 영속·관측 채널 비대상).
+/// 흡수는 쓰기 1회를 **억제**만 한다(새 쓰기·적재 0). 표는 흡수 판정의 입력일 뿐이다.
+#[derive(Debug, Clone)]
+pub struct ReturnTicket {
+    pub kind: ReturnTicketKind,
+    /// 발급 시각(단조) — 나이 판정·CAS 소비의 식별자를 겸한다.
+    pub issued: Instant,
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -1217,6 +1235,14 @@ pub struct Surface {
     /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
     /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
     pub input_gate: std::sync::Mutex<()>,
+    /// ★(0.14.42 · A2) 짝 Return 흡수 표 — 발신 surface id → 표(대상·발신자당 1장 · 덮어쓰기).
+    ///
+    /// 발급: `surface.send_text` queued 팔(`absorb_return` · 검증 발신자 · ttl>0 · 끝 CR/LF 아님) 과
+    /// `surface.send_key` 쓰기 뒤 정산(남의 기계 본문을 제출했을 때 그 주인에게 보상 표).
+    /// 소거: 직접 send 성공(D2) · send_key 쓰기 뒤 정산(D4) · 흡수 소비(CAS) · 발급 때 만료 정리.
+    /// **락 계약: 단독 leaf** — 다른 락을 쥔 채 잡지 않고(`input_gate`·`pending_queue` 안 금지),
+    /// 이 락을 쥔 채 다른 락도 잡지 않는다. poison 은 `into_inner` 로 넘긴다(HashMap 연산뿐).
+    pub return_tickets: Mutex<HashMap<u64, ReturnTicket>>,
     /// ★B1(0.14.30): 큐 배달이 **마지막으로 막힌 사유와 시각**(reason, epoch). 배달 성공 시
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
@@ -1511,6 +1537,57 @@ impl Surface {
     pub fn clear_pending_input(&self) {
         *self.pending_input.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.set_pending_input(0);
+    }
+
+    /// ★(0.14.42 · A2 D0) 방금 적용한 기계 본문의 소유자를 **지금 세대**로 각인한다.
+    /// 호출 규약: `input_gate` 안, `apply_pending_input` 직후(그 사이 다른 변이가 없어야 세대가 맞다).
+    /// pending_input leaf 만 잡는다 — 'input_gate 안에서는 pending_input leaf 만' 계약 그대로다.
+    pub fn mark_pending_owner(&self, sender: u64) {
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.owner = Some((sender, self.input_gen.load(Ordering::Acquire)));
+    }
+
+    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **유효한** 소유자 — 각인 세대가 현재 세대와 같을 때만 Some.
+    /// 그 뒤 어떤 변이(제출·사람 키·다른 키·큐 Inject·stale 리셋)든 세대를 올리므로 결측이 된다
+    /// (결측은 값이 아니다 — 소유자 불명은 어떤 표도 만들거나 유지하지 않는다).
+    pub fn pending_owner(&self) -> Option<u64> {
+        let st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.owner
+            .filter(|&(_, gen)| gen == self.input_gen.load(Ordering::Acquire))
+            .map(|(sid, _)| sid)
+    }
+
+    /// ★(0.14.42 · A2) 흡수 표 발급(덮어쓰기) — 발급 때마다 만료분(나이 ≥ ttl)을 정리한다.
+    /// 단독 leaf 락(다른 락을 쥔 채 부르지 않는다).
+    pub fn issue_return_ticket(&self, sender: u64, kind: ReturnTicketKind, ttl: std::time::Duration) {
+        let now = Instant::now();
+        let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        m.retain(|_, t| now.saturating_duration_since(t.issued) < ttl);
+        m.insert(sender, ReturnTicket { kind, issued: now });
+    }
+
+    /// 발신자의 표 사본(판정 재료) — 없으면 None.
+    pub fn peek_return_ticket(&self, sender: u64) -> Option<ReturnTicket> {
+        self.return_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sender)
+            .cloned()
+    }
+
+    /// 표 소비 CAS — 발급 시각이 `issued` 와 같을 때만 꺼낸다(그 사이 재발급·소비된 표는 건드리지 않는다).
+    pub fn take_return_ticket(&self, sender: u64, issued: Instant) -> Option<ReturnTicket> {
+        let mut m = self.return_tickets.lock().unwrap_or_else(|e| e.into_inner());
+        if m.get(&sender).is_some_and(|t| t.issued == issued) {
+            m.remove(&sender)
+        } else {
+            None
+        }
+    }
+
+    /// 발신자의 표 소거(없으면 무동작).
+    pub fn clear_return_ticket(&self, sender: u64) {
+        self.return_tickets.lock().unwrap_or_else(|e| e.into_inner()).remove(&sender);
     }
 
     /// ★(U-10) `gate_pending` 축의 **유일한 직렬화 지점**. `surface.list`·`org.status`·
@@ -4779,6 +4856,8 @@ impl Daemon {
             pending_input: Mutex::new(Default::default()),
             input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
+            // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).
+            return_tickets: Mutex::new(HashMap::new()),
             queue_blocked: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),

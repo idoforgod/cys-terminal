@@ -544,6 +544,25 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
 - 기본 send = **steer**(즉시 주입 — 실행 중 조향). `--queued` = **followup**(대상이 3초
   이상 조용할 때 한 틱에 한 건씩 배달).
 - **타이핑 가드**: 사람이 방금 타이핑 중인 pane에는 기계 주입이 거부됩니다(기본 3초).
+- **자동 큐 전환과 짝 Return 흡수(0.14.42)**: 기본 `send` 가 타이핑 가드·초안 게이트에 막히면
+  CLI 가 본문을 `--queued` 로 1회 전환합니다(`QUEUED` 출력). 큐 배달은 **CR 까지 포함**해 제출하므로
+  뒤따르는 관례적 `send-key Return` 은 필요 없습니다. 그 Return 이 빈 줄·사람 초안·질문 창에
+  떨어지면 쓰레기 Enter 나 대화상자 기본 선택지 확정이 되므로, 데몬이 **같은 발신자의 첫 Return
+  1회**(기본 30초 안)를 쓰지 않고 흡수합니다. 이때 `send-key` 는 rc 0 으로
+  `ABSORBED (Return 미전송 · …)` 를 출력하고 stderr 에 재전송 안내를 남깁니다.
+  - 흡수는 **1장·1회용**입니다. 승인·선택 창을 정말 누르려던 Return 이었다면 **한 번 더
+    보내면 통과**합니다(사이에 새 큐 전환이 없으면).
+  - 입력줄에 **기계 본문**이 남아 있으면 Return 은 누구 것이든 흡수되지 않고 종전처럼 제출합니다.
+    `send-key Down Return` 같은 다중 키, `C-m` 같은 별칭, 명시 `send --queued` 뒤의 Return 은
+    흡수 대상이 아닙니다.
+  - 질문·선택 창(모달) 때문에 전환됐다는 경고가 나오면 여전히 **Return 을 보내지 마세요** —
+    흡수는 보조 안전망일 뿐입니다.
+  - 끄기: `CYS_RETURN_ABSORB_SECS=0`(데몬 env · 종전 동작으로 완전 복귀).
+- **같은 발신자의 연속 큐 항목 병합**: 같은 발신자가 연달아 큐에 쌓은 항목은 한 번에 배달되고
+  (다이제스트), 병합 구간이 전부 빈 Return 항목이면 다이제스트 문안 대신 **빈 Enter 1회**만
+  나갑니다(0.14.42 · 종전의 `[큐 다이제스트 N건 …]` 빈 문안 제출 제거). 빈 구분 항목이 줄면서
+  **본문끼리 한 다이제스트로 묶이는 일이 전보다 잦아집니다**(수신자는 `[큐 다이제스트 …]` 단위를
+  더 자주 받습니다). 병합 전체를 끄려면 `CYS_QUEUE_DIGEST_MAX_ITEMS=1`.
 
 ### 5.4 관제·이벤트
 
@@ -1031,6 +1050,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_AUTOKILL_DUP` | 0 | 중복 프로세스 자동 kill (opt-in · `scope=surface`만) |
 | `CYS_IDLE_SECONDS` | 300 | idle 감지 |
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
+| `CYS_RETURN_ABSORB_SECS` | 30 (0=off) | 짝 Return 흡수 창(0.14.42 · §5.3) — `send` 가 큐로 자동 전환된 뒤 같은 발신자의 첫 단일 `send-key Return` 1회를 쓰지 않고 흡수하는 시간. `0` 은 발급·흡수·보상 전부 끔(종전 동작). 흡수·만료는 `queue.return_absorbed`·`queue.return_absorb_expired` 이벤트의 `ticket_age_ms` 로 관측 |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보. quiet 는 **1 미만 설정을 1로 승격**(0초 강제주입 봉인 — overdue 단계와 같은 하한). 이 노브는 **언제 배달할지**만 조정한다 — alt-screen 의 약한 레이아웃 증거가 요구하는 '출력 정적' 은 판정부 상수 3초(`readiness::BOOT_VALVE_QUIET_SECS`)이고 이 노브로 바뀌지 않는다 |

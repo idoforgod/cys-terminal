@@ -5821,3 +5821,8 @@ mod cysd_args_tests {
 // 호출이 안 보여 H-TICK-ALIVE가 오탐 실패한다.
 #[cfg(test)]
 mod team_gate_tests;
+
+// ★A2(0.14.42 · WP-delivery) 짝 Return 흡수 RPC 회귀 핀 — 테스트 전용 모듈(프로덕션 코드 0).
+// team_gate_tests 와 같은 이유로 파일 맨 끝에 둔다(부트스트랩 건강성 러너의 첫 #[cfg(test)] 앵커).
+#[cfg(test)]
+mod return_absorb_tests;

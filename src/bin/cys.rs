@@ -2287,6 +2287,37 @@ fn should_queue_fallback_send_key(queued: bool, key: &str, err: &str) -> bool {
     !queued && matches!(key, "Return" | "Enter") && is_typing_guard_err(err)
 }
 
+/// ★(0.14.42 · A2 C2) `cys send-key` 가 요청에 `pair_return:true` 를 싣는가(순수) — 키가 **정확히
+/// 하나**이고 이름이 Return|Enter 일 때만. `send-key Down Return` 같은 다중 키·`C-m` 별칭은 원시 요청이다
+/// (선택지 조작 뒤의 Return 은 흡수 대상이 아니다). 이름 축은 `should_queue_fallback_send_key` 와 같다.
+fn send_key_pair_return(keys: &[String]) -> bool {
+    keys.len() == 1 && matches!(keys[0].as_str(), "Return" | "Enter")
+}
+
+/// ★(0.14.42 · A2 C2) 흡수 응답의 stdout 한 줄(순수) — `OK`·`QUEUED` 로 시작하지 않는다(첫 줄만 읽는
+/// 소비 스크립트가 직접 제출·적재로 오독하지 않게). 본문 상태별 문구 셋 · 다중 대상 접미 `tag`.
+fn format_absorbed_line(r: &serde_json::Value, tag: &str) -> String {
+    let age = r["ticket_age_ms"].as_u64().unwrap_or(0);
+    let body = match r["body_state"].as_str() {
+        Some("queued") => format!(
+            "본문은 큐에서 CR 포함 자동 제출 대기({})",
+            r["queue_entry_id"].as_str().unwrap_or("?")
+        ),
+        Some("submitted") => "본문은 이미 다른 발신자의 Return 으로 제출됨".to_string(),
+        _ => "본문은 큐를 떠났다(배달은 CR 포함)".to_string(),
+    };
+    format!("ABSORBED (Return 미전송 · {body} · 표 나이 {age}ms){tag}")
+}
+
+/// 흡수 통지 — stdout 결론 1줄 + stderr 재전송 안내(의도적 Return 이었다면 한 번 더 보내면 통과한다).
+fn report_return_absorbed(r: &serde_json::Value, tag: &str) {
+    println!("{}", format_absorbed_line(r, tag));
+    eprintln!(
+        "[send-key] ⚠ Return 을 보내지 않았다(흡수) — 화면(승인·선택 창)을 누르려던 것이면 한 번 더 \
+         보내라 · 다음 Return 은 흡수되지 않는다(사이에 새 큐 전환이 없으면)"
+    );
+}
+
 /// ★B3 `cys send` 본문의 큐 1회 전환 판정(순수) — send-key 와 같은 근거·같은 보수성.
 ///
 /// `clear_first` 를 제외하는 이유: 원자 clear+paste+submit 은 **직접 전달 전용**이고 데몬이
@@ -4205,11 +4236,18 @@ fn run(command: Command) -> i32 {
                         //     `cys send-key Return` 은 빈 프롬프트의 Enter 라 무해하다.
                         //   재시도는 정확히 1회다(반복하면 중복 주입).
                         Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {
+                            // ★(0.14.42 · A2 C1) 자동 전환(이 폴백)만 `absorb_return:true` 를 싣는다 —
+                            //   데몬이 이 발신자의 **뒤따르는 짝 Return 1회**(TTL 안)를 흡수해 맨 CR·빈 큐
+                            //   항목·거짓 queue_full 을 없앤다. 명시 `--queued` 는 싣지 않는다(의도적 Return 보존).
                             let r2 = request(
                                 "surface.send_text",
-                                json!({"surface_id": sid, "text": body, "from": from, "queued": true}),
+                                json!({"surface_id": sid, "text": body, "from": from, "queued": true,
+                                       "absorb_return": true}),
                             )?;
                             let depth = r2["depth"].as_u64().unwrap_or(0);
+                            // 구 데몬은 키가 없다(None) → 종전 안내만(보조 문구 없음 · 하위호환).
+                            let absorb_secs = (r2["return_absorb"].as_bool() == Some(true))
+                                .then(|| r2["return_absorb_secs"].as_u64().unwrap_or(0));
                             eprintln!(
                                 "[send] 사람 입력 감지 — 본문을 큐로 전환(QUEUED depth {depth}) surface={}",
                                 surface_ref(sid)
@@ -4227,6 +4265,18 @@ fn run(command: Command) -> i32 {
                                      큐 배달이 이미 CR 을 포함하므로 모달이 닫힌 뒤 자동 제출된다 — 추가 Return 은 \
                                      불필요하다.",
                                     surface_ref(sid)
+                                );
+                                // ★(0.14.42 · A2 C1) 흡수는 **보조** 안전망이다 — 주 문구('보내지 마라')를
+                                //   약화하지 않는다(1회용·TTL 한정이라 두 번째 Return 은 창을 누른다).
+                                if let Some(n) = absorb_secs {
+                                    eprintln!(
+                                        "[send] (보조 안전망: 데몬이 {n}초 안의 첫 Return 1회를 흡수한다 — \
+                                         그래도 보내지 마라. 그 뒤 Return 은 창을 누른다)"
+                                    );
+                                }
+                            } else if let Some(n) = absorb_secs {
+                                eprintln!(
+                                    "[send] 뒤따르는 send-key Return 은 불필요 — {n}초 안 첫 1회는 흡수된다"
                                 );
                             }
                             warn_if_daemon_paused();
@@ -4259,15 +4309,23 @@ fn run(command: Command) -> i32 {
                     }
                 }
                 let multi = sids.len() > 1;
+                // ★(0.14.42 · A2 C2) 짝 Return 표식 — 단일 `Return|Enter` 만(다중 키·별칭은 원시 요청).
+                //   데몬은 이 발신자의 `cys send` 가 방금 큐로 자동 전환됐을 때만 이 Return 1회를
+                //   흡수한다(쓰기 0). 기계 본문 위 Return 은 표식이 있어도 종전처럼 제출된다.
+                let pair = send_key_pair_return(&keys);
                 // ★B3: 큐로 전환된 키가 하나라도 있으면 이 실행의 결론은 "QUEUED" 다 —
                 //   뒤에 "OK" 를 덧붙이면 첫 줄만 읽는 소비 스크립트가 직접 제출로 오독한다.
                 let mut any_fallback = false;
+                // ★(0.14.42 · A2) 흡수도 같다 — 'OK' 를 덧붙이면 직접 제출로 오독한다(rc 는 0).
+                let mut any_absorbed = false;
                 for sid in sids {
                     let mut sid_fallback = false;
+                    let mut sid_absorbed = false;
+                    let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     for key in &keys {
                         let r = match request(
                             "surface.send_key",
-                            json!({"surface_id": sid, "key": key, "queued": queued}),
+                            json!({"surface_id": sid, "key": key, "queued": queued, "pair_return": pair}),
                         ) {
                             Ok(r) => r,
                             // ★B3: 제출 Return 이 타이핑 가드에 막히면 소실시키지 않고 큐로
@@ -4277,8 +4335,14 @@ fn run(command: Command) -> i32 {
                             Err(e) if should_queue_fallback_send_key(queued, key, &e) => {
                                 let r2 = request(
                                     "surface.send_key",
-                                    json!({"surface_id": sid, "key": key, "queued": true}),
+                                    json!({"surface_id": sid, "key": key, "queued": true, "pair_return": pair}),
                                 )?;
+                                if r2["absorbed"].as_bool() == Some(true) {
+                                    report_return_absorbed(&r2, &tag);
+                                    sid_absorbed = true;
+                                    any_absorbed = true;
+                                    continue;
+                                }
                                 let depth = r2["depth"].as_u64().unwrap_or(0);
                                 eprintln!(
                                     "[send-key] 사람 입력 감지 — Return 을 큐로 전환(QUEUED depth {depth}) surface={}",
@@ -4292,6 +4356,12 @@ fn run(command: Command) -> i32 {
                             }
                             Err(e) => return Err(e),
                         };
+                        if r["absorbed"].as_bool() == Some(true) {
+                            report_return_absorbed(&r, &tag);
+                            sid_absorbed = true;
+                            any_absorbed = true;
+                            continue;
+                        }
                         if queued {
                             match r["depth"].as_u64() {
                                 Some(d) => {
@@ -4306,11 +4376,11 @@ fn run(command: Command) -> i32 {
                             }
                         }
                     }
-                    if multi && !sid_fallback {
+                    if multi && !sid_fallback && !sid_absorbed {
                         println!("OK → surface:{sid}");
                     }
                 }
-                if !multi && !queued && !any_fallback {
+                if !multi && !queued && !any_fallback && !any_absorbed {
                     println!("OK");
                 }
                 Ok(())
@@ -26869,6 +26939,72 @@ mod tests {
             body.contains("send-key") && body.contains("보내지 마라"),
             "모달 경고가 뒤따르는 send-key Return 을 보내지 말라고 안내하지 않는다"
         );
+        // ★(0.14.42 · A2 C1) 자동 전환은 흡수 표를 요청한다 · 모달 분기는 흡수 안내가 붙어도 주 문구를
+        //   약화하지 않는다 — 두 분기(주 경고 · 보조 안전망) 모두 '보내지 마라'(거짓 안심 차단).
+        assert!(body.contains("\"absorb_return\": true"), "폴백 r2 가 absorb_return 을 싣지 않는다");
+        let modal = body
+            .split("if is_modal_draft_gate_err(&e) {")
+            .nth(1)
+            .expect("모달 분기")
+            .split("} else if let Some(n) = absorb_secs {")
+            .next()
+            .expect("모달 분기 끝");
+        assert!(modal.matches("보내지 마라").count() >= 2, "모달 두 분기 모두 '보내지 마라': {modal}");
+        let aux = &modal[modal.find("if let Some(n) = absorb_secs {").expect("보조 안전망 분기")..];
+        assert!(aux.contains("그래도 보내지 마라"), "보조 안전망 문구가 주 경고를 약화한다: {aux}");
+    }
+
+    /// ★(0.14.42 · A2 C1) 명시 `--queued`(첫 요청)는 흡수 표를 요청하지 않는다 — 의도적 Return 보존.
+    #[test]
+    fn a2_explicit_queued_send_does_not_request_absorb() {
+        let src = include_str!("cys.rs");
+        let arm = src.split("Command::Send { surface, to, queued, clear_first, stdin, file, text } => {")
+            .nth(1)
+            .expect("Command::Send arm");
+        let first = arm
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .next()
+            .unwrap();
+        assert!(first.contains("\"queued\": queued"), "첫 요청 소스 앵커");
+        assert!(!first.contains("absorb_return"), "명시 --queued 경로가 흡수 표를 요청한다");
+    }
+
+    /// ★(0.14.42 · A2 C2) pair_return 은 단일 Return|Enter 에만.
+    #[test]
+    fn a2_pair_return_only_for_single_return_or_enter() {
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(send_key_pair_return(&k(&["Return"])));
+        assert!(send_key_pair_return(&k(&["Enter"])));
+        assert!(!send_key_pair_return(&k(&["C-m"])), "별칭은 원시 요청");
+        assert!(!send_key_pair_return(&k(&["Down", "Return"])), "선택지 조작 뒤 Return 은 대상 밖");
+        assert!(!send_key_pair_return(&k(&["Return", "Return"])));
+        assert!(!send_key_pair_return(&k(&[])));
+        // 배선 핀: 첫 요청과 폴백 r2 모두 pair_return 을 싣는다.
+        let src = include_str!("cys.rs");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = arm.split("Command::SetStatus").next().unwrap();
+        assert_eq!(arm.matches("\"pair_return\": pair").count(), 2, "첫 요청·폴백 r2 둘 다");
+        assert!(arm.contains("!any_absorbed") && arm.contains("!sid_absorbed"), "흡수 시 OK 억제");
+    }
+
+    /// ★(0.14.42 · A2 C2) ABSORBED 포맷터 — OK·QUEUED 로 시작하지 않고, 본문 상태 3문구 · 다중 대상 접미.
+    #[test]
+    fn a2_absorbed_formatter_three_states_and_tag() {
+        let q = json!({"absorbed": true, "body_state": "queued", "queue_entry_id": "q-7", "ticket_age_ms": 120});
+        let s = json!({"absorbed": true, "body_state": "submitted", "ticket_age_ms": 5});
+        let n = json!({"absorbed": true, "body_state": "not_queued", "ticket_age_ms": 9});
+        let lq = format_absorbed_line(&q, "");
+        let ls = format_absorbed_line(&s, "");
+        let ln = format_absorbed_line(&n, " → surface:4");
+        for l in [&lq, &ls, &ln] {
+            assert!(l.starts_with("ABSORBED ("), "접두: {l}");
+            assert!(!l.starts_with("OK") && !l.starts_with("QUEUED"), "오독 접두: {l}");
+            assert!(l.contains("Return 미전송"), "{l}");
+        }
+        assert!(lq.contains("q-7") && lq.contains("자동 제출 대기"), "{lq}");
+        assert!(ls.contains("이미") && ls.contains("제출됨"), "{ls}");
+        assert!(ln.contains("큐를 떠났다") && ln.ends_with(" → surface:4"), "{ln}");
+        assert!(lq != ls && ls != ln && lq != ln, "세 문구는 서로 달라야 한다");
     }
 
     #[test]

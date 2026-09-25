@@ -5187,6 +5187,14 @@ pub(crate) struct PendingInputState {
     pub paste_opened_at: Option<std::time::Instant>,
     /// 청크 끝이 봉투 표식의 접두로 끝났을 때 다음 호출로 이월하는 ≤5 바이트.
     pub tail: Vec<u8>,
+    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **소유자** — (검증된 발신 surface id, 기록 직후의 `input_gen`).
+    /// 기록처는 단 하나: `surface.send_text` 직접 경로가 `input_gate` 안에서 기계 본문(검증 발신자 ·
+    /// 결과 count>0)을 적용한 직후다(`Surface::mark_pending_owner`).
+    /// **유효 조건 = 세대 일치**: 이후의 모든 변이(CR 제출·사람 키·다른 키·큐 Inject 의
+    /// `set_pending_input(0)`·stale 리셋)는 세대를 올리므로 owner 는 자동으로 결측이 된다
+    /// (`Surface::pending_owner`). `pending_input_step` 은 이 필드를 **복사만** 하고 읽지 않으며,
+    /// `clear_pending_input` 은 Default 로 비운다. 소비자는 짝 Return 흡수의 보상 표 판정 하나뿐이다.
+    pub owner: Option<(u64, u64)>,
 }
 
 /// 입력 바이트의 출처 — 사람(GUI 자기신고 human=true · !machine_origin) / 기계(그 밖 전부 · send_key 전부).
@@ -6114,9 +6122,19 @@ pub(crate) fn plan_queue_merge(
 
 /// 다이제스트 본문 렌더(순수) — 각 항목 원문을 **그대로** 담고 번호만 덧댄다(바이트 보존 =
 /// 원장 sha 전수 대조가 성립하는 조건). 1건이면 원문 그대로 반환한다(종전 배달과 바이트 동일).
+///
+/// ★(0.14.42 · A2 D5 · RC4) **전부 빈 항목**(같은 발신자의 queued `send-key Return` N건)이면 빈
+/// 문자열이다 — 종전에는 `"[큐 다이제스트 2건 …]\n[1/2] \n[2/2] \n"` 문안이 Inject 로 **제출**됐다
+/// (수신 에이전트가 받는 쓰레기 턴). 빈 결과는 단건 빈 항목과 같은 경로(빈 붙여넣기+CR 1회 ·
+/// 원장 Blank)다. `plan_queue_merge` 는 무변경이라 병합 강도(건수·문자 상한·연속·같은 발신자·같은
+/// origin)는 그대로다 — 병합 id 전량이 여전히 한 배달 슬롯에서 빠진다. 섞인 구간은 바이트 동일.
+/// `deliver_head_locked` 코드는 무접촉이고, 이 피호출자의 출력만 전부-빈 병합에서 바뀐다.
 pub(crate) fn render_queue_digest(from: Option<&str>, texts: &[String]) -> String {
     if texts.len() <= 1 {
         return texts.first().cloned().unwrap_or_default();
+    }
+    if texts.iter().all(|t| t.is_empty()) {
+        return String::new();
     }
     let who = from.unwrap_or("unknown");
     let mut out = format!("[큐 다이제스트 {}건 · 발신 {}]\n", texts.len(), who);
@@ -12328,6 +12346,7 @@ mod tests {
             in_paste: true,
             paste_opened_at: Some(now),
             tail: vec![0x1b],
+            ..Default::default()
         };
         // TTL 만료 뒤 CR: 봉투가 먼저 닫히고(하한 2 복귀) 이월 ESC + CR 은 제출이다.
         let expired = super::pending_input_step(
@@ -16301,16 +16320,24 @@ mod tests {
     fn b1_merge_never_mixes_send_and_send_key() {
         let froms = vec![Some("A".into()), Some("A".into())];
         let origins = vec!["send".to_string(), "send-key".to_string()];
+        // ★A2(0.14.42): 입력값을 실제 값으로 — send-key 항목의 본문은 빈 문자열이라 chars 는 0 이다
+        //   (종전 [1,1] 은 현실에 없는 입력이었다). 양성 대조 [0,1] 은 섞인 문자 수를 그대로 잰다.
         assert_eq!(
-            plan_queue_merge(&froms, &origins, &[1, 1], 5, 4000),
+            plan_queue_merge(&froms, &origins, &[0, 0], 5, 4000),
             vec![0],
             "origin 이 다르면 병합 금지 — Return 이 본문에 섞인다"
         );
-        // 양성 대조: 같은 origin 이면 병합된다.
         assert_eq!(
-            plan_queue_merge(&froms, &vec!["send-key".to_string(); 2], &[1, 1], 5, 4000),
+            plan_queue_merge(&froms, &origins, &[0, 1], 5, 4000),
+            vec![0],
+            "문자 수와 무관하게 origin 이 다르면 병합 금지"
+        );
+        // 양성 대조: 같은 origin 이면 병합된다(렌더는 빈 문자열 — 병합 강도 불변).
+        assert_eq!(
+            plan_queue_merge(&froms, &vec!["send-key".to_string(); 2], &[0, 0], 5, 4000),
             vec![0, 1]
         );
+        assert_eq!(render_queue_digest(Some("A"), &[String::new(), String::new()]), "");
     }
 
     /// ★R1-major-4: 문자 상한은 **최종 렌더 결과**를 기준으로 센다. 원문 합만 세면 머리말·번호
@@ -16381,6 +16408,76 @@ mod tests {
         let one = vec!["[보고] 단건".to_string()];
         assert_eq!(render_queue_digest(Some("surface:19"), &one), "[보고] 단건");
         assert_eq!(render_queue_digest(None, &[]), "");
+    }
+
+    /// ★A2(0.14.42 · D5 · RC4) 전부 빈 병합(같은 발신자 send-key N건)은 다이제스트 **문안**이 아니라
+    /// 빈 본문이다 — 종전 `"[큐 다이제스트 2건 …]\n[1/2] \n[2/2] \n"` 이 Inject 로 제출됐다(쓰레기 문안).
+    /// 섞인 구간(빈 항목 + 본문)은 종전과 **바이트 동일**하다(sha 대조 계약 유지).
+    #[test]
+    fn a2_render_all_empty_digest_is_empty() {
+        assert_eq!(render_queue_digest(Some("surface:9"), &[String::new(), String::new()]), "");
+        assert_eq!(render_queue_digest(None, &vec![String::new(); 5]), "");
+        let mixed = vec![String::new(), "a".to_string()];
+        assert_eq!(
+            render_queue_digest(Some("A"), &mixed),
+            "[큐 다이제스트 2건 · 발신 A]\n[1/2] \n[2/2] a\n",
+            "빈 항목이 섞인 본문 구간 렌더는 종전과 바이트 동일"
+        );
+    }
+
+    /// ★A2 병합 강도 핀: 같은 발신자 빈 send-key 10건 버스트의 배달 슬롯은 ceil(10/5)=2 —
+    /// 빈 항목을 병합에서 빼는(vec![0] 식) 약화는 10슬롯이 된다(폭주 완충 약화 회귀 대조).
+    #[test]
+    fn a2_send_key_burst_merge_strength_unchanged() {
+        let mut froms = vec![Some("surface:9".to_string()); 10];
+        let mut origins = vec!["send-key".to_string(); 10];
+        let mut chars = vec![0usize; 10];
+        let mut slots = 0;
+        while !froms.is_empty() {
+            let n = plan_queue_merge(&froms, &origins, &chars, 5, 4000).len();
+            assert!(n > 0, "머리는 항상 포함");
+            slots += 1;
+            froms.drain(..n);
+            origins.drain(..n);
+            chars.drain(..n);
+        }
+        assert_eq!(slots, 2, "같은 발신자 빈 send-key 10건 = 슬롯 2(병합 강도 불변)");
+    }
+
+    /// ★A2 배달 통합: 같은 발신자 send-key 2건 → 배달 1회 · 본문 "" · 병합 id 2 · 큐 0
+    /// (종전: `[큐 다이제스트 2건` 문안 제출). deliver_head_locked 코드는 무접촉 — 피호출자 렌더만 바뀐다.
+    #[test]
+    fn a2_same_sender_blank_send_keys_deliver_as_single_blank_inject() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("a2-blank");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_DIGEST_MAX_ITEMS", "5"),
+            ("CYS_QUEUE_DIGEST_MAX_CHARS", "4000"),
+        ]);
+        let daemon = drill_daemon("a2-blank");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        for _ in 0..2 {
+            let e = daemon.next_queue_entry(String::new(), Some("surface:9".into()), "send-key");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        let mut delivered = None;
+        for _ in 0..40 {
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            if delivered.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let d = delivered.expect("배달 1회");
+        let qlen = s.pending_queue.lock().unwrap().len();
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(d.body, "", "전부 빈 병합은 빈 Inject 1회(다이제스트 문안 금지)");
+        assert_eq!(d.merged_ids.len(), 2, "병합 id 전량이 한 슬롯에서 빠진다(병합 강도 불변)");
+        assert_eq!(qlen, 0);
     }
 
     /// 배달 경로 통합: 같은 발신자 3건이 **한 턴**으로 나가고 큐가 비며, 원장에 부분별 사실이
