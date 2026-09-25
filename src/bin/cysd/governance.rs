@@ -5032,7 +5032,9 @@ impl DraftGateDenied {
 /// 【범위 — 좁게】 Text 만이다. SubmitKey(`send-key Return`)는 **무변경**: 화면 감지 승인은 대기자가 없어
 /// feed allow 가 효과가 없고 master 의 Return 이 유일한 승인 수단이다(막으면 워커 hang). (0.14.42 A2 짝
 /// Return 흡수도 이 불변식을 따른다 — 승인이 살아 있는 좌석에서는 큐 전환 직후 반사 창 안의 짝 Return 만
-/// 흡수하고 그 뒤 Return 은 쓴다: handlers `narrow_absorb_for_approval` · [`seat_approval_live`] · A2-F1.) ClearFirst 는
+/// 흡수하고 그 뒤 Return 은 쓴다: handlers `narrow_absorb_for_approval` · [`seat_approval_live`] · A2-F1.
+/// 첫기동 관문 창은 승인이 아니다 — 맨 Return 이 기본 선택지 `No, exit`·`Yes, try it` 을 눌러 비가역이므로
+/// TTL 흡수를 유지한다: RF1-GATE-NARROW.) ClearFirst 는
 /// cycle-agent `/clear` 의 원자 경로라 모달 축을 걸면 ② 무clear 가 된다(cycle 은 자체 유휴 관측이 관문·모달을
 /// 이미 본다). CancelKey 는 사람 초안만 막는 축 그대로다. feed 기반 승인 축은 쓰지 않는다(15초 주기라 낡을 수
 /// 있다 · X2) — **지금 화면**의 서명만 본다.
@@ -5056,19 +5058,97 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
     obs_modal_foreground(&obs)
 }
 
-/// ★(0.14.42 · A2-F1) 좌석에 **승인·선택이 살아 있는가** — 승인·관문 feed(`approval_or_gate_pending`)
-/// ∨ 화면 모달 전경(`seat_modal_foreground`). 큐 배달 게이트 ①②와 **같은 두 술어**다(판정 분리 없음).
+/// ★(0.14.42 · A2-F1 · 리뷰 RF1-GATE-NARROW) 짝 Return 흡수 **좁힘 전용** 술어 — 좌석에 승인·선택이 살아
+/// 있고, 그 창이 **첫기동 관문이 아닌가**.
 ///
-/// 소비자: 짝 Return 흡수의 승인 창 좁힘(handlers `narrow_absorb_for_approval`) 하나 — 이 술어가 참이면
+/// ```text
+/// seat_approval_live = ¬관문 증거 ∧ (승인 feed(kind=="approval") ∨ 화면 모달 전경)
+/// 관문 증거          = 관문 feed(GATE_FEED_KIND) pending ∨ 지금 화면이 first_run_gates::identify 로 관문
+/// ```
+///
+/// 소비자: 짝 Return 흡수의 승인 창 좁힘(handlers `narrow_absorb_for_approval`) 하나다. 이 술어가 참이면
 /// 반사 창 밖 Return 은 흡수하지 않고 쓴다(master 의 Return 이 화면 승인의 유일한 수단 · 위
 /// `draft_gate_modal_verdict` doc 의 SubmitKey 무변경 불변식).
-/// 실패 방향: 관측 불능(마커 미정의·어댑터 미등록 좌석 · 맨 셸)은 `false` → 흡수는 종전 A2 범위로 남고
-/// ABSORBED 통지 + 재전송 1회로 회복된다. 죽은 좌석의 모달 잔상 같은 거짓 양성은 `true` → 종전(0.14.41)
-/// 처럼 Return 을 쓴다(셸의 빈 줄 — hang 방향이 아니다).
-/// 싼 축(feed 메모리 순회)을 먼저 본다. 락: feed_items leaf → 파서·agent_meta leaf — `input_gate` 안에서
-/// 부르지 않는다(게이트 안은 pending_input leaf 만).
+///
+/// 【큐 배달 게이트와 술어를 일부러 나눈다 — 쓰는 방향이 반대다】 큐 배달 게이트 ①②와 writer 안전 탐침
+/// (`approval_or_gate_pending` ∨ 모달)은 참이면 **막는다**(보류). 그쪽에서는 관문을 포함하는 것이 안전
+/// 방향이다. 이 술어는 참이면 **쓴다**. 여기서 관문을 포함하면 치명 방향이 된다. 면책(bypass-disclaimer)과
+/// 2.1.261+ 폴더신뢰는 기본 포커스가 `No, exit` 이라 Return 한 발이 rc 1 좌석 사망이다. fullscreen 안내는
+/// 기본 포커스가 `Yes, try it` 이라 관측 전제가 붕괴한다. 셋 다 `AbsenceCost::Fatal` 이고 되돌릴 수 없다.
+/// 치명 관문에서 맨 Return 은 정답 조작이 아니다. 정답은 방향키(또는 `2`)로 통과 선택지 라벨에 커서를 옮긴
+/// 뒤 Return 이고, 비제출 키는 D4 정산(`ticket_after_key_write`)이 표를 먼저 지운다. 그래서 관문을 좁힘에서
+/// 빼도 잃는 정당한 Return 이 없다(기본 포커스가 통과 선택지인 관문 — 2.1.241 폴더신뢰 `Yes, I trust this
+/// folder`·theme — 의 맨 Return 은 TTL 안이면 1회 흡수되고 재전송 1회로 통과한다. 가역이다).
+/// 0.14.42 초판(03af1684)은 게이트와 **같은 술어**를 썼다. 그 결과 관문 좌석에서 A2 의 TTL 흡수 보호가 반사 창
+/// 2초로 줄었고, 늦게 오는 짝 Return 이 관문의 기본 선택지를 눌렀다(리뷰 RF1-GATE-NARROW · 샌드박스 gsa).
+///
+/// 【관문 증거가 승인 feed 보다 앞선다】 claude `approval_patterns.trust-prompt` 는 폴더신뢰 구 문면과 겹친다
+/// (문서화된 1건 · `approval_patterns_union_excludes_first_run_gate_corpus`). 그래서 관문 화면이 승인
+/// feed(kind=approval)를 낳을 수 있다. `승인 feed ∨ (모달 ∧ ¬관문)` 식은 이 경로로 샌다.
+///
+/// 【코퍼스】 해소본(`gate_envelope` → `resolve_with` · 스캐너와 같은 입력)과 코드 정본(`builtin`)을 **둘 다**
+/// 본다. 어느 한쪽이라도 식별하면 관문이다. 봉투가 같은 id 로 문면을 바꿔도 정본 문면은 계속 잡힌다.
+/// 어댑터 선언 여부와 생애 창은 보지 않는다. 거짓 양성이 가역 방향이라 넓게 잡는 것이 맞다(아래).
+///
+/// 실패 방향:
+///   · 관문 증거 **참 양성**(관문 창) → `false` → A2 TTL 흡수가 유지된다. 이 술어가 지키는 치명 방향이다.
+///   · 관문 증거 **거짓 양성**(본문에 실린 관문 문면 · 스캐너 feed 가 한 주기(≤15초) 늦게 종결) → `false` →
+///     진짜 승인 창의 늦은 Return 이 1회 흡수된다. ABSORBED 통지 + 재전송 1회로 회복된다(가역).
+///   · 관문 증거 **거짓 음성**(코퍼스 밖 새 관문 문면 · 스캐너 주기 전) → 모달이면 `true` → 0.14.41 처럼
+///     Return 을 쓴다. 잔여 위험이며 코퍼스가 SOT 다(`first_run_gates` 에 관문을 등재하면 닫힌다).
+///   · 승인·모달 관측 불능(마커 미정의·어댑터 미등록 · 맨 셸) → `false` → 종전 A2 흡수 + ABSORBED 통지.
+///   · 승인·모달 거짓 양성(죽은 좌석의 모달 잔상) → `true` → 종전(0.14.41)처럼 Return 을 쓴다(셸의 빈 줄 —
+///     hang 방향이 아니다).
+///
+/// 비용: 호출은 드물다(흡수 판정이 Absorb ∧ 표 나이 ≥ 반사 창일 때, 그리고 게이트 밖 재확인 1회). 싼 축
+/// (feed 메모리 순회)을 먼저 보고, 승인·모달이 없으면 코퍼스를 해소하지 않는다. 락: feed_items leaf →
+/// 파서·agent_meta leaf. `input_gate` 안에서 부르지 않는다(게이트 안은 pending_input leaf 만).
 pub(crate) fn seat_approval_live(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> bool {
-    approval_or_gate_pending(daemon, s.id) || seat_modal_foreground(s)
+    // ① 관문 feed 는 승인 증거가 아니라 **거부 증거**다.
+    if !pending_gate_items(daemon, s.id).is_empty() {
+        return false;
+    }
+    let approval_feed = !daemon.pending_daemon_approvals(s.id).is_empty();
+    // ② 화면 1회 관측. 마커 좌석은 `observe_prompt`(모달 판정과 같은 프레임), 마커 없는 좌석은 원시 화면이다.
+    let adapters = load_adapter_defs();
+    let (screen, modal) = match surface_prompt_marker(s, &adapters) {
+        Some((markers, _)) => {
+            let obs = observe_prompt(s, &markers);
+            let modal = obs_modal_foreground(&obs);
+            (obs.screen, modal)
+        }
+        None => {
+            if !approval_feed {
+                return false;
+            }
+            let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+            (p.screen().contents(), false)
+        }
+    };
+    if !(approval_feed || modal) {
+        return false;
+    }
+    // ③ 관문 화면이면 좁히지 않는다(치명 방향 차단).
+    let agent = s
+        .agent_meta
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|(a, _)| a);
+    !screen_is_first_run_gate(&adapters, agent.as_deref(), &screen)
+}
+
+/// 화면이 첫기동 관문인가 — 해소본 ∨ 코드 정본(위 【코퍼스】). 순수(입력은 인자뿐 · env 는 override 스위치 1지점).
+fn screen_is_first_run_gate(
+    adapters: &(serde_json::Value, serde_json::Value),
+    agent: Option<&str>,
+    screen: &str,
+) -> bool {
+    let envelope = agent.and_then(|a| gate_envelope(&adapters.0, &adapters.1, a));
+    let resolved =
+        cys::first_run_gates::resolve_with(envelope, cys::first_run_gates::override_enabled());
+    cys::first_run_gates::identify(&resolved.gates, screen).is_some()
+        || cys::first_run_gates::identify(&cys::first_run_gates::builtin(), screen).is_some()
 }
 
 fn obs_modal_foreground(obs: &PromptObs) -> bool {
@@ -5726,6 +5806,9 @@ pub(crate) fn prompt_gate_verdict(i: &PromptGateInput) -> PromptGate {
 /// 승인·관문 대기 — 관문 feed(`pending_gate_items`) ∨ 승인 feed(`Daemon::pending_daemon_approvals`).
 /// 승인 feed 는 화면에서 패턴이 사라지면 데몬이 `stale-cleared` 로 자동 종결하므로(check_approvals
 /// L3) 영구 보류가 되지 않는다(codex 설계 검토 Q3).
+/// ★이 술어는 참이면 **막는** 소비처(큐 배달 게이트·writer 탐침·마커 없는 게이트) 전용이다. 참이면 **쓰는**
+/// 짝 Return 흡수 좁힘은 이 술어를 쓰지 않는다. 관문 feed 를 승인으로 세면 관문 기본 선택지를 누르는 치명
+/// 방향이 되기 때문이다([`seat_approval_live`] · RF1-GATE-NARROW).
 fn approval_or_gate_pending(daemon: &Arc<Daemon>, sid: u64) -> bool {
     !pending_gate_items(daemon, sid).is_empty() || !daemon.pending_daemon_approvals(sid).is_empty()
 }

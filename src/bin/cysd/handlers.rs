@@ -2300,9 +2300,11 @@ fn return_absorb_ttl_secs() -> u64 {
 
 /// ★(0.14.42 · A2-F1) **승인 창 좁힘의 반사 창** — `CYS_RETURN_ABSORB_REFLEX_MS`, 기본 2000.
 ///
-/// 대상 좌석에 승인이 살아 있으면(모달 전경 ∨ 승인·관문 feed) 흡수는 표 나이가 이 창 **안**인
-/// Return 에만 적용된다. 그보다 늦은 Return 은 쓴다 — master 의 Return 이 화면 승인의 유일한
-/// 수단이라(governance `draft_gate_modal_verdict` doc · U8-P1 불변식) 삼키면 워커가 hang 한다.
+/// 대상 좌석에 승인이 살아 있으면(모달 전경 ∨ 승인 feed — 첫기동 관문 제외 · governance
+/// `seat_approval_live`) 흡수는 표 나이가 이 창 **안**인 Return 에만 적용된다. 그보다 늦은 Return 은
+/// 쓴다 — master 의 Return 이 화면 승인의 유일한 수단이라(governance `draft_gate_modal_verdict` doc ·
+/// U8-P1 불변식) 삼키면 워커가 hang 한다. 첫기동 관문 좌석은 이 창을 쓰지 않고 TTL 흡수를 유지한다
+/// (관문의 맨 Return 은 `No, exit`·`Yes, try it` 을 누른다 — RF1-GATE-NARROW).
 ///
 /// 기본값 근거(시간 축의 두 무리): 짝 Return 은 같은 셸 체인·스크립트(`push_line`·hud 브리지 ·
 /// `cys send … && cys send-key … Return`)에서 오면 프로세스 기동 한 번 뒤에 온다(샌드박스 실측 ·
@@ -2335,8 +2337,8 @@ enum AbsorbMiss {
     NoTicket,
     /// 표 나이 ≥ TTL.
     Expired,
-    /// ★(A2-F1) 대상 좌석에 승인이 살아 있고(모달 전경 ∨ 승인·관문 feed) 표 나이 ≥ 반사 창 —
-    /// 이 Return 은 창을 누르려는 것으로 본다(흡수하면 워커 hang).
+    /// ★(A2-F1) 대상 좌석에 승인이 살아 있고(모달 전경 ∨ 승인 feed · 첫기동 관문 아님) 표 나이 ≥ 반사
+    /// 창 — 이 Return 은 창을 누르려는 것으로 본다(흡수하면 워커 hang).
     ApprovalLive,
 }
 
@@ -2427,8 +2429,11 @@ fn return_absorb_verdict(
 /// 샌드박스 r1b: 5.6초 뒤 Return → ABSORBED · 도달 b''). 이는 "SubmitKey 는 무변경 — master 의 Return 이
 /// 유일한 승인 수단(막으면 워커 hang)" 불변식(governance `draft_gate_modal_verdict`)과 정면 충돌한다.
 ///
-/// 【범위】 승인이 살아 있을 때만 시간 축으로 가른다: 반사 창 안 = 짝 Return(같은 체인 · S22 오승인
-/// 방지 유지), 밖 = 창을 누르려는 Return(쓴다). 승인이 없는 좌석은 종전 A2 범위(TTL) 그대로다.
+/// 【범위】 승인이 살아 있을 때만 시간 축으로 가른다: 반사 창 안 = 짝 Return(흡수), 밖 = 창을 누르려는
+/// Return(쓴다). 승인 창에서의 S22 오승인 방지는 **같은 셸 체인·스크립트의 반사 창(기본 2초) 안 짝 Return 에
+/// 한해서만** 남는다. LLM 이 도구 호출을 따로 해서 늦게 보내는 짝 Return 은 승인 창을 누른다(설계상 수용 —
+/// CLI 가 모달 전환 때 '보내지 마라' 로 막는다). 승인이 없는 좌석과 **첫기동 관문 좌석**은 종전 A2 범위(TTL)
+/// 그대로다. 관문은 승인이 아니다(governance `seat_approval_live` · RF1-GATE-NARROW).
 /// 관측(`approval_live`)은 **Absorb ∧ 나이 ≥ reflex** 일 때만 부른다 — 대부분의 흡수(반사 창 안)는
 /// 화면·feed 를 읽지 않는다(성능 · 락 계약: 호출자는 input_gate 밖에서 관측한다).
 /// 실패 방향: 관측 불능(마커 미정의·어댑터 미등록)은 `false` → 종전 A2 흡수 + ABSORBED 통지(재전송 회복).
@@ -4979,10 +4984,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     pending,
                     human,
                 );
-                // ★(0.14.42 · A2-F1) 승인 창 좁힘 — 대상에 승인이 살아 있으면(모달 전경 ∨ 승인·관문
-                //   feed) 흡수는 반사 창 안의 짝 Return 에만. 그보다 늦은 Return 은 창을 누르려는 것으로
-                //   보고 종전 경로로 쓴다(삼키면 워커 hang · U8-P1 불변식). 관측은 Absorb ∧ 나이 ≥ 반사
-                //   창일 때만 1회 — input_gate 밖(락 계약).
+                // ★(0.14.42 · A2-F1) 승인 창 좁힘 — 대상에 승인이 살아 있으면(모달 전경 ∨ 승인 feed ·
+                //   첫기동 관문 제외 — RF1) 흡수는 반사 창 안의 짝 Return 에만. 그보다 늦은 Return 은 창을
+                //   누르려는 것으로 보고 종전 경로로 쓴다(삼키면 워커 hang · U8-P1 불변식). 관측은 Absorb ∧
+                //   나이 ≥ 반사 창일 때만 1회 — input_gate 밖(락 계약).
                 let verdict = narrow_absorb_for_approval(verdict, ticket_age, absorb_reflex, || {
                     governance::seat_approval_live(daemon, &surface)
                 });

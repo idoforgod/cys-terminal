@@ -553,11 +553,19 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
   - 흡수는 **1장·1회용**입니다. 승인·선택 창을 정말 누르려던 Return 이었다면 `cys read-screen` 으로
     창을 확인한 뒤 **한 번 더 보내면 통과**합니다(사이에 새 큐 전환이 없으면). 방금 보낸 `send` 의
     짝 Return 이었다면 다시 보내지 마세요 — 본문은 큐 배달이 CR 까지 제출합니다.
-  - **승인·선택 창이 떠 있는 좌석**(질문·권한 창이 화면 전경 · 또는 승인·관문 대기 feed)에서는
+  - **승인·선택 창이 떠 있는 좌석**(질문·권한 창이 화면 전경 · 또는 승인 대기 feed)에서는
     흡수가 큐 전환 직후 **반사 창(기본 2초) 안의 짝 Return** 에만 적용됩니다. 그보다 늦은 Return 은
     흡수되지 않고 창을 누릅니다 — master 의 Return 이 화면 승인의 유일한 수단이라, 승인 Return 을
     삼키면 워커가 멈추기 때문입니다(0.14.42 · A2-F1). 이때 `queue.return_absorb_bypassed`
-    이벤트가 `ticket_age_ms` 와 함께 남습니다.
+    이벤트가 `ticket_age_ms` 와 함께 남습니다. 승인 창에서 오승인(S22)을 막아 주는 것은 같은 셸
+    체인·스크립트에서 반사 창 안에 오는 짝 Return 뿐입니다 — 따로 늦게 보내는 짝 Return 은 창을 누르므로
+    모달 전환 안내대로 **보내지 마세요**.
+  - **첫기동 관문 창**(폴더신뢰·Bypass 면책·신기능 안내 등 — 화면이 관문 코퍼스와 일치하거나 관문 감지
+    feed 가 대기 중)은 위 반사 창 규칙의 **예외**입니다. 관문에서 맨 Return 은 기본 선택지(`No, exit` =
+    노드 종료 · `Yes, try it` = fullscreen 렌더러 전환)를 누르므로, 흡수는 종전 범위(기본 30초 안 첫
+    Return 1회)를 그대로 유지합니다(0.14.42 · RF1). 관문은 **라벨로 확인**하고 통과 선택지
+    (`Yes, I trust this folder`·`Yes, I accept`·`Not now`) 위로 방향키로 옮긴 뒤 Return 하세요 — 방향키는
+    흡수 표를 지우므로 그 뒤 Return 은 흡수되지 않습니다(선택지 순서는 Claude 버전마다 다릅니다).
   - 입력줄에 **기계 본문**이 남아 있으면 Return 은 누구 것이든 흡수되지 않고 종전처럼 제출합니다.
     `send-key Down Return` 같은 다중 키, `C-m` 같은 별칭, 명시 `send --queued` 뒤의 Return 은
     흡수 대상이 아닙니다.
@@ -1057,7 +1065,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_IDLE_SECONDS` | 300 | idle 감지 |
 | `CYS_TYPING_GUARD_SECS` | 3 (0=off) | 사람 타이핑 보호 |
 | `CYS_RETURN_ABSORB_SECS` | 30 (0=off) | 짝 Return 흡수 창(0.14.42 · §5.3) — `send` 가 큐로 자동 전환된 뒤 같은 발신자의 첫 단일 `send-key Return` 1회를 쓰지 않고 흡수하는 시간. `0` 은 발급·흡수·보상 전부 끔(종전 동작). 흡수·만료는 `queue.return_absorbed`·`queue.return_absorb_expired` 이벤트의 `ticket_age_ms` 로 관측 |
-| `CYS_RETURN_ABSORB_REFLEX_MS` | 2000 | 승인이 살아 있는 좌석의 흡수 반사 창(0.14.42 · A2-F1 · §5.3) — 대상에 질문·권한 창(모달)이 전경이거나 승인·관문 feed 가 대기 중이면, 표 나이가 이 값 **이상**인 Return 은 흡수하지 않고 쓴다(창을 누른다 · 워커 hang 방지). `0` = 승인이 살아 있으면 흡수 안 함. 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`(샌드박스 실측 같은 셸 체인 짝 Return: p50 551ms · 최대 777ms) |
+| `CYS_RETURN_ABSORB_REFLEX_MS` | 2000 | 승인이 살아 있는 좌석의 흡수 반사 창(0.14.42 · A2-F1 · §5.3) — 대상에 질문·권한 창(모달)이 전경이거나 승인 feed 가 대기 중이면, 표 나이가 이 값 **이상**인 Return 은 흡수하지 않고 쓴다(창을 누른다 · 워커 hang 방지). `0` = 승인이 살아 있으면 흡수 안 함. **첫기동 관문 창은 예외** — 이 노브와 무관하게 `CYS_RETURN_ABSORB_SECS` 안 첫 Return 을 흡수한다(맨 Return 이 `No, exit` 등을 누른다 · RF1). 재조정 근거는 `queue.return_absorbed`·`queue.return_absorb_bypassed` 의 `ticket_age_ms`(샌드박스 실측 같은 셸 체인 짝 Return: p50 551ms · 최대 777ms) |
 | `CYS_CONTEXT_THRESHOLD_PCT` | 60 | 컨텍스트 통보 임계 |
 | `CYS_MAX_ACTIVE_WORKERS` | 8 | 워커 동시 상한 |
 | `CYS_QUEUE_QUIET_SECS` / `CYS_QUEUE_DEPTH_ALERT` | 3 / 5 | followup 배달 조건·큐 깊이 경보. quiet 는 **1 미만 설정을 1로 승격**(0초 강제주입 봉인 — overdue 단계와 같은 하한). 이 노브는 **언제 배달할지**만 조정한다 — alt-screen 의 약한 레이아웃 증거가 요구하는 '출력 정적' 은 판정부 상수 3초(`readiness::BOOT_VALVE_QUIET_SECS`)이고 이 노브로 바뀌지 않는다 |

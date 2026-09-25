@@ -843,3 +843,250 @@ fn a2f1_no_approval_keeps_ttl_absorb() {
     age_ticket(&t, x.id, 5_600);
     assert_absorbed(&pair_return(&fx, Some(P + 341), &t), "pair", "queued");
 }
+
+// ─────── RF1-GATE-NARROW — 첫기동 관문은 좁힘에서 뺀다(A2 TTL 흡수 유지 · 온보딩 치명 방향 차단) ───────
+//
+// 리뷰 RF1-GATE-NARROW(major · 샌드박스 gsa 재현): A2-F1 의 좁힘 술어(`seat_approval_live` =
+// 승인·관문 feed ∨ 모달 전경)는 첫기동 관문도 "승인이 살아 있다" 로 읽었다. 관문 좌석으로의 `send` 가
+// `[draft_gate:modal]` 로 큐 전환된 뒤 반사 창(2초) 밖에 오는 짝 Return(LLM 이 도구 호출을 따로 해서 늦게
+// 오는 관례적 Return)이 흡수되지 않고 PTY 에 써져 **관문의 기본 선택지**를 눌렀다 — 면책·2.1.261+
+// 폴더신뢰는 `No, exit`(rc 1 좌석 사망), fullscreen 안내는 `Yes, try it`(관측 전제 붕괴). 둘 다
+// `AbsenceCost::Fatal`. 치명 관문에서 맨 Return 은 정답 조작이 아니다(정답 = 방향키로 통과 선택지 라벨에
+// 옮긴 뒤 Return — 비제출 키는 D4 정산이 표를 먼저 지운다) → 좁힘이 살려 주는 정당한 Return 이 없고 치명
+// Return 만 통과시켰다.
+// 아래 검체가 "관문 좌석은 A2 TTL 흡수 그대로" 의 회귀 핀이다(A2 629ebd51 의 보호 복원).
+
+/// 좌석 화면을 `screen` 으로 칠한다(claude 어댑터 — 마커·모달 판정이 붙는 좌석).
+fn paint_screen(t: &Arc<Surface>, screen: &str) {
+    *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    let s = screen.replace('\n', "\r\n");
+    let mut parser = t.parser.lock().unwrap();
+    parser.process(b"\x1b[2J\x1b[H");
+    parser.process(s.as_bytes());
+}
+
+/// 2.1.261+ 폴더신뢰 창(선택지 순서 `No, exit` 먼저 · 기본 포커스 `No, exit` — cys.rs
+/// `GATE_DEFAULT_FOCUS_WARNING` · first_run_gates `default_index` doc 의 H-2 실측 사실). 문면·위젯은 코퍼스
+/// `folder-trust` 의 needle·서명 그대로이고 선택지 **순서만** 뒤집은 합성 화면이다.
+const FOLDER_TRUST_NO_EXIT_FIRST: &str = "Accessing workspace: <cwd>\n\
+    Quick safety check: Is this a project you created or one you trust?\n\
+    ❯ 1. No, exit\n\
+    \x20 2. Yes, I trust this folder\n\
+    Enter to confirm · Esc to cancel\n";
+
+/// 데몬 발행 **관문** feed(`GATE_FEED_KIND`) — 스캐너가 관문을 격상한 사실.
+fn push_gate_feed(fx: &Fx, sid: u64, n: u32) {
+    fx.daemon.feed_items.lock().unwrap().push(crate::state::FeedItem {
+        request_id: format!("{}rf1-gate-{n}", crate::state::DAEMON_REQ_PREFIX),
+        kind: crate::governance::GATE_FEED_KIND.into(),
+        title: "claude 첫기동 관문 감지".into(),
+        body: "[관문감지] id=bypass-disclaimer".into(),
+        surface_id: Some(sid),
+        status: "pending".into(),
+        decision: None,
+        created_at: crate::state::now_epoch(),
+        resolved_at: None,
+        tier: None,
+        publisher_pid: None,
+        publisher_pgid: None,
+        publisher_surface: None,
+        risk_class: None,
+        auto_route: false,
+        resolver_surface: None,
+        resolver_pid: None,
+    });
+}
+
+/// 관문 좌석 공통 재현: X `send`(모달 전환 · 큐 · 표) → 5.6초 뒤 X 의 단일 짝 Return → **흡수 · 쓰기 0**.
+/// A2-F1(03af1684) 에서는 `absorb_miss=approval_live` · 쓰기 1회(= 관문 기본 선택지 확정)였다.
+fn assert_gate_late_pair_return_absorbed(tag: &str, pid: u32, screen: &str) {
+    let fx = fx(tag);
+    let t = pane(&fx, "worker-1", pid);
+    let x = pane(&fx, "master", pid + 1);
+    paint_screen(&t, screen);
+    assert!(
+        cys::first_run_gates::identify(&cys::first_run_gates::builtin(), &t.parser.lock().unwrap().screen().contents())
+            .is_some(),
+        "전제: 좌석 화면이 코퍼스 관문이어야 한다({tag})"
+    );
+    send_fallback_modal(&fx, Some(pid + 1), &t, "[보고] 각성 완료");
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(pid + 1), &t);
+    assert_absorbed(&resp, "pair", "queued");
+    assert_eq!(counts(&t), before, "관문 좌석의 늦은 짝 Return 은 기본 선택지를 누르지 않는다(쓰기 0) — {tag}");
+    assert_eq!(qlen(&t), 1, "본문은 큐에 그대로(관문이 닫힌 뒤 배달)");
+    assert_eq!(bus_count(&fx, "queue.return_absorb_bypassed"), 0, "좁힘 우회 0 — {tag}");
+    assert_eq!(bus_count(&fx, "queue.return_absorbed"), 1, "흡수 이벤트 1건 — {tag}");
+}
+
+/// ★RF1 핵심(gsa 재현 · 면책 창 · 기본 포커스 `No, exit` = rc 1 좌석 사망).
+#[test]
+fn rf1_gate_disclaimer_late_pair_return_absorbed_zero_write() {
+    assert_gate_late_pair_return_absorbed(
+        "rf1-disc",
+        P + 400,
+        cys::first_run_gates::fixtures::TRUST_ECHO_THEN_DISCLAIMER,
+    );
+}
+
+/// ★RF1 fullscreen 안내(기본 포커스 `Yes, try it` = 대체 화면·마우스 보고 → 관측 전제 붕괴).
+#[test]
+fn rf1_gate_fullscreen_late_pair_return_absorbed_zero_write() {
+    assert_gate_late_pair_return_absorbed(
+        "rf1-full",
+        P + 410,
+        cys::first_run_gates::fixtures::FEATURE_FULLSCREEN,
+    );
+}
+
+/// ★RF1 2.1.261+ 폴더신뢰(선택지 `No, exit` 먼저 · 기본 포커스 `No, exit`).
+#[test]
+fn rf1_gate_folder_trust_no_exit_first_late_pair_return_absorbed_zero_write() {
+    assert_gate_late_pair_return_absorbed("rf1-trust", P + 420, FOLDER_TRUST_NO_EXIT_FIRST);
+}
+
+/// ★RF1 관문 증거는 승인 feed 보다 앞선다 — claude `approval_patterns.trust-prompt` 가 폴더신뢰 구 문면과
+/// 겹치므로(문서화된 1건) 관문 화면이 **승인 feed(kind=approval)** 를 낳을 수 있다. 관문 화면 + 승인 feed +
+/// 관문 feed 가 함께 걸려도 늦은 짝 Return 은 흡수된다. 반사 창 0(= "승인이 살아 있으면 흡수 안 함")에서도
+/// 관문은 승인이 아니므로 흡수된다.
+#[test]
+fn rf1_gate_veto_beats_approval_feed_and_reflex_zero() {
+    let fx = fx("rf1-veto");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "0");
+    let t = pane(&fx, "worker-1", P + 430);
+    let x = pane(&fx, "master", P + 431);
+    paint_screen(&t, cys::first_run_gates::fixtures::TRUST_ECHO_THEN_DISCLAIMER);
+    send_fallback_modal(&fx, Some(P + 431), &t, "[보고] 각성 완료");
+    push_daemon_approval(&fx, t.id, 1);
+    push_gate_feed(&fx, t.id, 1);
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 431), &t);
+    assert_absorbed(&resp, "pair", "queued");
+    assert_eq!(counts(&t), before, "관문 화면 위 Return 은 승인 feed 가 있어도 쓰지 않는다");
+    assert_eq!(bus_count(&fx, "queue.return_absorb_bypassed"), 0);
+
+    // 관문 화면 + 승인 feed 만(관문 feed 는 아직 스캐너 주기 전) — 화면 식별이 단독으로 막는다.
+    fx.daemon.feed_items.lock().unwrap().retain(|i| i.kind != crate::governance::GATE_FEED_KIND);
+    send_fallback_modal(&fx, Some(P + 431), &t, "[보고] 각성 완료2");
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    assert_absorbed(&pair_return(&fx, Some(P + 431), &t), "pair", "queued");
+    assert_eq!(counts(&t), before, "화면 관문 식별 단독으로도 쓰기 0");
+
+    // queued 짝 Return(CLI 폴백 r2)도 관문 좌석에서는 흡수(종전 A2) — 적재 0.
+    send_fallback_modal(&fx, Some(P + 431), &t, "[보고] 각성 완료3");
+    age_ticket(&t, x.id, 5_600);
+    let q0 = qlen(&t);
+    let r = rpc(&fx, Some(P + 431), "surface.send_key", json!({
+        "surface_id": t.id, "key": "Return", "queued": true, "pair_return": true,
+    }));
+    assert_eq!(r["ok"], json!(true), "{r}");
+    assert_eq!(r["result"]["absorbed"], json!(true), "관문 좌석 queued 짝 Return 흡수: {r}");
+    assert_eq!(qlen(&t), q0, "빈 Return 큐 항목 0(관문이 닫힌 뒤 맨 CR 이 배달되지 않는다)");
+}
+
+/// ★RF1 관문 feed 는 **거부 증거**다(승인 증거가 아니다) — 화면이 비관문 권한 창이어도 관문 feed 가
+/// pending 이면 좁히지 않는다. 실패 방향: 스캐너 feed 가 한 주기(≤15초) 늦게 종결되는 사이의 진짜 승인
+/// Return 이 1회 흡수된다 → ABSORBED 통지 + 재전송 1회로 회복(가역). 반대로 관문을 승인으로 세면 치명(비가역).
+#[test]
+fn rf1_gate_feed_is_veto_not_approval() {
+    let fx = fx("rf1-gfeed");
+    let t = pane(&fx, "worker-1", P + 440);
+    let x = pane(&fx, "master", P + 441);
+    paint_modal(&t);
+    send_fallback_modal(&fx, Some(P + 441), &t, "[지시] 리뷰 착수");
+    push_gate_feed(&fx, t.id, 1);
+    age_ticket(&t, x.id, 5_600);
+    let before = counts(&t);
+    assert_absorbed(&pair_return(&fx, Some(P + 441), &t), "pair", "queued");
+    assert_eq!(counts(&t), before);
+    // 재전송 1회로 회복(흡수는 1장·1회용) — 가역 방향의 증명.
+    let again = pair_return(&fx, Some(P + 441), &t);
+    assert_sent(&again);
+    assert!(counts(&t).2 > before.2, "재전송은 쓴다(회복 경로)");
+}
+
+/// ★RF1 관문 feed 만(화면은 비모달 · 승인 feed 없음) — 승인으로 세지 않는다: 종전 A2 흡수.
+/// (A2-F1 초판은 `approval_or_gate_pending` 으로 관문 feed 를 승인으로 세어 반사 창 밖 Return 을 썼다.)
+#[test]
+fn rf1_gate_feed_alone_is_not_approval() {
+    let fx2 = fx("rf1-gfeed2");
+    let t2 = pane(&fx2, "worker-1", P + 442);
+    let x2 = pane(&fx2, "master", P + 443);
+    typing_on(&t2);
+    send_fallback(&fx2, Some(P + 443), &t2, "[보고] 완료");
+    typing_off(&t2);
+    push_gate_feed(&fx2, t2.id, 2);
+    age_ticket(&t2, x2.id, 5_600);
+    let before2 = counts(&t2);
+    assert_absorbed(&pair_return(&fx2, Some(P + 443), &t2), "pair", "queued");
+    assert_eq!(counts(&t2), before2);
+    assert_eq!(bus_count(&fx2, "queue.return_absorb_bypassed"), 0);
+}
+
+/// ★RF1 정답 조작은 잃지 않는다 — 관문에서 `send-key Down` 뒤 `send-key Return`: Down(비제출 키)의 쓰기 뒤
+/// D4 정산이 표를 지우므로 이어지는 Return 은 흡수되지 않고 쓴다(기본 포커스가 아니라 옮겨 간 선택지).
+#[test]
+fn rf1_gate_down_then_return_is_written() {
+    let fx = fx("rf1-down");
+    let t = pane(&fx, "worker-1", P + 450);
+    let x = pane(&fx, "master", P + 451);
+    paint_screen(&t, cys::first_run_gates::fixtures::TRUST_ECHO_THEN_DISCLAIMER);
+    send_fallback_modal(&fx, Some(P + 451), &t, "[보고] 각성 완료");
+    age_ticket(&t, x.id, 5_600);
+    let down = rpc(&fx, Some(P + 451), "surface.send_key", json!({
+        "surface_id": t.id, "key": "Down", "queued": false,
+    }));
+    assert_eq!(down["ok"], json!(true), "{down}");
+    assert_eq!(ticket_of(&t, x.id), None, "비제출 키 쓰기 뒤 표 소거(D4)");
+    let before = counts(&t);
+    let resp = pair_return(&fx, Some(P + 451), &t);
+    assert_sent(&resp);
+    assert!(counts(&t).2 > before.2, "Down 뒤 Return 은 쓴다(쓰기 1회)");
+}
+
+/// ★RF1 대조(A2-F1 보존): 비관문 권한 창(모달)은 여전히 좁힌다 — 반사 창 밖 승인 Return 은 쓴다.
+/// 술어 직접 핀 — `seat_approval_live` 진리표(관문 화면·관문 feed 는 false · 권한 창·승인 feed 는 true).
+#[test]
+fn rf1_seat_approval_live_truth_table() {
+    use cys::first_run_gates::fixtures as fxs;
+    let fx = fx("rf1-table");
+    let t = pane(&fx, "worker-1", P + 460);
+    let live = |t: &Arc<Surface>| crate::governance::seat_approval_live(&fx.daemon, t);
+    // 권한 창(비관문 모달) → true(A2-F1 좁힘 유지).
+    paint_screen(&t, fxs::LIVE_PERMISSION_PROMPT);
+    assert!(live(&t), "권한 창은 승인이 살아 있다");
+    // 관문 화면 3종 → false.
+    for (id, s) in [
+        ("disclaimer", fxs::TRUST_ECHO_THEN_DISCLAIMER),
+        ("fullscreen", fxs::FEATURE_FULLSCREEN),
+        ("trust-261", FOLDER_TRUST_NO_EXIT_FIRST),
+        ("trust-241", fxs::FOLDER_TRUST),
+        ("theme", fxs::THEME),
+    ] {
+        paint_screen(&t, s);
+        assert!(!live(&t), "첫기동 관문({id})은 좁힘의 '승인'이 아니다");
+    }
+    // 관문 화면 + 승인 feed → false(관문 증거 우선).
+    paint_screen(&t, fxs::TRUST_ECHO_THEN_DISCLAIMER);
+    push_daemon_approval(&fx, t.id, 1);
+    assert!(!live(&t), "관문 화면 위 승인 feed 는 좁힘 근거가 아니다");
+    // 비관문 빈 화면 + 승인 feed → true(승인 feed 축 유지).
+    paint_screen(&t, fxs::READY_SHELL);
+    assert!(live(&t), "승인 feed 는 승인이 살아 있다");
+    // + 관문 feed → false(거부 증거).
+    push_gate_feed(&fx, t.id, 1);
+    assert!(!live(&t), "관문 feed 는 거부 증거");
+    // 어댑터 미등록 좌석(맨 셸)의 관문 문면 + 승인 feed → false(원시 화면으로도 관문을 본다).
+    let bare = pane(&fx, "worker-2", P + 461);
+    {
+        let s = fxs::TRUST_ECHO_THEN_DISCLAIMER.replace('\n', "\r\n");
+        let mut p = bare.parser.lock().unwrap();
+        p.process(b"\x1b[2J\x1b[H");
+        p.process(s.as_bytes());
+    }
+    push_daemon_approval(&fx, bare.id, 2);
+    assert!(!live(&bare), "마커 없는 좌석도 관문 화면이면 false");
+}

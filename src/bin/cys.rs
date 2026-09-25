@@ -2318,10 +2318,15 @@ fn report_return_absorbed(r: &serde_json::Value, tag: &str) {
 /// ★(A2-F1) 흡수 stderr 안내(순수) — 재전송은 **조건부**다. 무조건 "한 번 더 보내라" 로 읽히면 짝 Return 을
 /// 보낸 LLM 이 그대로 재전송해 S22 오승인(창 기본 선택지 확정)을 되살린다. 짝 Return 이었다면 다시 보내지
 /// 않고, 창을 누르려던 것이면 화면을 확인한 뒤에만 보낸다.
+/// ★(RF1-GATE-NARROW) 재전송 안내가 **첫기동 관문 창**에서 치명 조작이 되지 않게 한 줄을 붙인다 — 데몬은 관문
+/// 좌석에서 TTL 흡수를 유지하므로(governance `seat_approval_live`) 이 통지가 관문 위에서 뜰 수 있고, 거기서
+/// "한 번 더 보내라" 를 그대로 따르면 맨 Return 이 기본 선택지(`No, exit` = 노드 종료)를 누른다.
 fn absorbed_stderr_line() -> &'static str {
     "[send-key] ⚠ Return 을 보내지 않았다(흡수) — 방금 `cys send` 본문의 짝 Return 이었다면 다시 보내지 \
      마라(본문은 큐 배달이 CR 까지 제출한다). 승인·선택 창을 누르려던 것이면 `cys read-screen` 으로 창을 \
-     확인한 뒤 한 번 더 보내라 · 다음 Return 은 흡수되지 않는다(사이에 새 큐 전환이 없으면)"
+     확인한 뒤 한 번 더 보내라 · 다음 Return 은 흡수되지 않는다(사이에 새 큐 전환이 없으면). 단 첫기동 관문 \
+     창(폴더신뢰·면책·신기능 안내)이면 맨 Return 을 다시 보내지 마라 — 기본 선택지가 `No, exit`(노드 종료)· \
+     `Yes, try it` 이다(라벨로 확인하고 방향키로 통과 선택지에 옮긴 뒤 Return)"
 }
 
 /// 반사 창(ms)을 사람이 읽는 초로(순수) — 정수 초면 소수점 없이.
@@ -2336,12 +2341,16 @@ fn absorb_reflex_secs_text(ms: u64) -> String {
 /// ★(A2-F1) 모달 전환 폴백의 보조 안전망 문구(순수) — 주 경고('보내지 마라')를 약화하지 않는다.
 /// `reflex_ms` 가 있으면(좁힘을 아는 데몬) 창이 떠 있는 동안의 실제 흡수 범위(반사 창)와 그 뒤 Return 이
 /// 창을 누른다는 사실을 말한다. 없으면(A2 초판 데몬) 종전 문구 그대로(없는 범위를 약속하지 않는다).
+/// ★(RF1-GATE-NARROW) 첫기동 관문 창은 반사 창 좁힘의 예외다 — 데몬은 관문 좌석에서 TTL 안 첫 Return 을
+/// 늦어도 흡수한다(맨 Return 이 `No, exit` 등 기본 선택지를 누른다). 문구가 그 예외를 말하지 않으면
+/// '늦은 Return 은 창을 누른다' 가 관문 좌석에서 거짓이 된다.
 fn modal_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
     match reflex_ms {
         Some(ms) => format!(
             "[send] (보조 안전망: 창이 떠 있는 동안 데몬은 {}초 안의 반사 Return 1회만 흡수한다 — 그래도 \
              보내지 마라. 그보다 늦은 Return 은 흡수되지 않고 창을 누른다(승인하려던 것이면 `cys read-screen` \
-             으로 창을 확인한 뒤 보내라))",
+             으로 창을 확인한 뒤 보내라). 단 첫기동 관문 창(폴더신뢰·면책·신기능 안내)은 맨 Return 이 \
+             `No, exit` 등 기본 선택지를 누르므로 {ttl_secs}초 안 첫 Return 을 늦어도 흡수한다)",
             absorb_reflex_secs_text(ms)
         ),
         None => format!(
@@ -2356,7 +2365,7 @@ fn plain_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
     match reflex_ms {
         Some(ms) => format!(
             "[send] 뒤따르는 send-key Return 은 불필요 — {ttl_secs}초 안 첫 1회는 흡수된다(대상에 승인·선택 \
-             창이 떠 있으면 {}초 안의 반사 Return 만 흡수되고, 그 뒤 Return 은 창을 누른다)",
+             창이 떠 있으면 {}초 안의 반사 Return 만 흡수되고, 그 뒤 Return 은 창을 누른다 · 첫기동 관문 창 제외)",
             absorb_reflex_secs_text(ms)
         ),
         None => format!("[send] 뒤따르는 send-key Return 은 불필요 — {ttl_secs}초 안 첫 1회는 흡수된다"),
@@ -27015,11 +27024,19 @@ mod tests {
         let m = modal_absorb_aux_line(30, Some(2000));
         assert!(m.contains("2초 안의 반사 Return 1회만"), "{m}");
         assert!(m.contains("창을 누른다") && m.contains("cys read-screen"), "{m}");
-        assert!(!m.contains("30초"), "창이 떠 있는 동안 TTL 30초를 흡수 범위로 약속하면 안 된다: {m}");
+        // 승인 창의 흡수 범위로 TTL 30초를 약속하면 안 된다 — 30초는 **첫기동 관문 예외** 절에만 나온다.
+        let (approval_part, gate_part) = m.split_once("단 첫기동 관문 창").expect("관문 예외 절(RF1)");
+        assert!(!approval_part.contains("30초"), "창이 떠 있는 동안 TTL 30초를 흡수 범위로 약속하면 안 된다: {m}");
+        // ★RF1-GATE-NARROW: 관문 좌석은 TTL 흡수 유지 — 문구가 그 예외를 말한다.
+        assert!(
+            gate_part.contains("30초 안 첫 Return 을 늦어도 흡수") && gate_part.contains("No, exit"),
+            "관문 예외 절: {m}"
+        );
         let m_old = modal_absorb_aux_line(30, None);
         assert!(m_old.contains("30초 안의 첫 Return 1회"), "구 데몬 판은 종전 문구: {m_old}");
         let p = plain_absorb_aux_line(30, Some(1500));
         assert!(p.contains("30초 안 첫 1회") && p.contains("1.5초 안의 반사 Return 만"), "{p}");
+        assert!(p.contains("첫기동 관문 창 제외"), "비모달 판도 관문 예외를 말한다(RF1): {p}");
         assert_eq!(
             plain_absorb_aux_line(30, None),
             "[send] 뒤따르는 send-key Return 은 불필요 — 30초 안 첫 1회는 흡수된다",
@@ -27028,6 +27045,11 @@ mod tests {
         let e = absorbed_stderr_line();
         assert!(e.contains("짝 Return 이었다면 다시 보내지") && e.contains("cys read-screen"), "{e}");
         assert!(e.contains("한 번 더 보내라"), "의도적 승인의 회복 경로는 남는다: {e}");
+        // ★RF1: 재전송 안내는 첫기동 관문 창에서 맨 Return 재전송을 금한다(기본 선택지 `No, exit` = 노드 종료).
+        assert!(
+            e.contains("첫기동 관문") && e.contains("맨 Return 을 다시 보내지 마라") && e.contains("No, exit"),
+            "관문 재전송 경고: {e}"
+        );
         // 배선: 흡수 통지는 이 순수 문구를 쓴다 · 폴백 r2 는 반사 창 키를 읽는다.
         let src = include_str!("cys.rs");
         let rep = src.split("fn report_return_absorbed(").nth(1).expect("report_return_absorbed");
