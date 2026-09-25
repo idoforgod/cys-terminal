@@ -374,6 +374,75 @@ try:
 
 
     # ─── [C4 절 경계] ───
+    # ═════════ [C4] 도구 훅(cys-hook.sh) 빠른 길 — 오버레이 없으면 stdin 을 cys 로 직행 · 실패 시 cat 이 소진 ·
+    #   오버레이 있으면 종전 · 항상 exit 0 · stdout 0 ═════════
+    def run_stream(hooks, env, data, **extra):
+        """입력을 직접 흘려 쓰기 쪽 EPIPE 를 관측한다(subprocess.run 의 communicate 는 EPIPE 를 삼켜 못 본다)."""
+        e = dict(env)
+        e.update({k: str(v) for k, v in extra.items()})
+        p = subprocess.Popen(["sh", os.path.join(hooks, "cys-hook.sh")], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=e)
+        epipe = False
+        try:
+            p.stdin.write(data)
+            p.stdin.close()
+        except BrokenPipeError:
+            epipe = True
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+        out = p.stdout.read()
+        return p.wait(timeout=90), out, epipe
+
+    ev = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "true"},
+                     "tool_response": {"exit_code": 0}})
+    big = (ev + "\n") * 20000          # 약 2.4MB — 파이프 버퍼(64KB)를 크게 넘는다
+    if not REAL_MSYS:
+        d, hooks, binp, state, env = lab(root, "ch1", wrap=("sed", "head", "cat"))
+        r, el = run(hooks, env, script="cys-hook.sh", payload=ev)
+        tl = rd(os.path.join(d, "tool.log"))
+        check("CH-0 exit 0 · stdout 0", r.returncode == 0 and r.stdout == "", repr((r.returncode, r.stdout[:80])))
+        check("CH-1 사용량 이벤트 정확히 1건 · 본문 바이트 동일",
+              rd(os.path.join(d, "cys.log")).count("USAGE-EVT") == 1 and rd(os.path.join(d, "cys.log.stdin")) == ev,
+              repr(rd(os.path.join(d, "cys.log.stdin"))[:80]))
+        check("CH-2 오버레이 없음 → sed/head/cat 미기동", not any(x in tl for x in ("sed ", "head ", "cat ")), repr(tl))
+        # cys 가 입력을 읽지 않고 실패(기동 중 사망 · 구 바이너리 인자 오류) → `|| cat` 이 남은 입력을 소진한다
+        d, hooks, binp, state, env = lab(root, "ch6", wrap=())
+        rc, out, epipe = run_stream(hooks, env, big.encode("utf-8"), STUB_USAGE="fail")
+        check("CH-6 cys 가 읽지 않고 실패 → 남은 입력 소진(쓰기 쪽 EPIPE 없음) · exit 0 · stdout 0",
+              not epipe and rc == 0 and out == b"" and "USAGE-FAIL" in rd(os.path.join(d, "cys.log")),
+              repr((epipe, rc, out[:60])))
+    # 오버레이 있음 → 종전 경로 · 오버레이가 입력을 받는다
+    d, hooks, binp, state, env = lab(root, "ch3")
+    ov = os.path.join(d, "home", ".cys", "local", "hooks", "PostToolUse.d")
+    w(os.path.join(ov, "a.sh"), '#!/bin/sh\ncat > "$MARK.ov"\n', 0o755)
+    r, el = run(hooks, env, script="cys-hook.sh", payload=ev)
+    check("CH-3 오버레이 있으면 종전 경로 — 오버레이가 입력 전문을 받는다 · 사용량 1건",
+          rd(os.path.join(d, "mark.ov")) == ev and rd(os.path.join(d, "cys.log")).count("USAGE-EVT") == 1
+          and r.returncode == 0 and r.stdout == "", repr((rd(os.path.join(d, "mark.ov"))[:60], r.returncode)))
+    # 다른 이벤트의 오버레이만 있어도 종전 경로(상위집합) — PostToolUse 입력은 Stop.d 로 가지 않는다
+    d, hooks, binp, state, env = lab(root, "ch4")
+    ov = os.path.join(d, "home", ".cys", "local", "hooks", "Stop.d")
+    w(os.path.join(ov, "a.sh"), '#!/bin/sh\ncat > "$MARK.ov"\n', 0o755)
+    r, el = run(hooks, env, script="cys-hook.sh", payload=ev)
+    check("CH-4 타 이벤트 오버레이는 실행되지 않는다(이벤트 격리 불변)",
+          not os.path.exists(os.path.join(d, "mark.ov")) and rd(os.path.join(d, "cys.log")).count("USAGE-EVT") == 1,
+          repr(os.listdir(d)))
+    # cys 부재 → exit 0 · stdin 소진
+    d, hooks, binp, state, env = lab(root, "ch5", wrap=())
+    os.remove(os.path.join(binp, "cys"))
+    env5 = dict(env, PATH=binp + os.pathsep + "/usr/bin:/bin")
+    rc, out, epipe = run_stream(hooks, env5, big.encode("utf-8"))
+    check("CH-5 cys 부재 → exit 0 · stdout 0 · 입력 소진(EPIPE 없음)", rc == 0 and out == b"" and not epipe,
+          repr((rc, out[:60], epipe)))
+    # Windows 모사 → 종전 경로(sed 추출 유지)
+    d, hooks, binp, state, env = lab(root, "chw", wrap=("sed",), msys=True)
+    r, el = run(hooks, env, script="cys-hook.sh", payload=ev)
+    check("CH-W (msys) 종전 경로(sed 추출 유지) · 사용량 1건 · exit 0 · stdout 0",
+          "sed " in rd(os.path.join(d, "tool.log")) and rd(os.path.join(d, "cys.log")).count("USAGE-EVT") == 1
+          and r.returncode == 0 and r.stdout == "", repr(rd(os.path.join(d, "tool.log"))[:120]))
+
 
 finally:
     shutil.rmtree(root, ignore_errors=True)
