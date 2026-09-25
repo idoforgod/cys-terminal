@@ -1322,7 +1322,7 @@ pub struct Surface {
     ///
     /// 발급: `surface.send_text` queued 팔(`absorb_return` · 발신자 키 있음(검증 ∨ 자기신고 — B) · ttl>0 ·
     /// 끝 CR/LF 아님) 과 `surface.send_key` 쓰기 뒤 정산(남의 기계 본문을 제출했을 때 그 주인에게 보상 표 —
-    /// 주인은 검증 신원만: `PendingInputState.owner`).
+    /// 주인은 검증 신원만: `Surface::pending_owner`).
     /// 소거: 직접 send 성공(D2) · send_key 쓰기 뒤 정산(D4) · 흡수 소비(CAS) · 발급 때 만료 정리.
     /// **락 계약: 단독 leaf** — 다른 락을 쥔 채 잡지 않고(`input_gate`·`pending_queue` 안 금지),
     /// 이 락을 쥔 채 다른 락도 잡지 않는다. poison 은 `into_inner` 로 넘긴다(HashMap 연산뿐).
@@ -1630,22 +1630,38 @@ impl Surface {
         self.set_pending_input(0);
     }
 
-    /// ★(0.14.42 · A2 D0) 방금 적용한 기계 본문의 소유자를 **지금 세대**로 각인한다.
-    /// 호출 규약: `input_gate` 안, `apply_pending_input` 직후(그 사이 다른 변이가 없어야 세대가 맞다).
-    /// pending_input leaf 만 잡는다 — 'input_gate 안에서는 pending_input leaf 만' 계약 그대로다.
+    /// ★(0.14.42 · A2 D0) 방금 적용한 기계 본문의 **검증** 소유자를 지금 세대로 각인한다
+    /// ([`Surface::mark_pending_input_owner`] 의 `Verified` 판).
     pub fn mark_pending_owner(&self, sender: u64) {
-        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
-        st.owner = Some((sender, self.input_gen.load(Ordering::Acquire)));
+        self.mark_pending_input_owner(crate::governance::InputOwner::Verified(sender));
     }
 
-    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **유효한** 소유자 — 각인 세대가 현재 세대와 같을 때만 Some.
-    /// 그 뒤 어떤 변이(제출·사람 키·다른 키·큐 Inject·stale 리셋)든 세대를 올리므로 결측이 된다
-    /// (결측은 값이 아니다 — 소유자 불명은 어떤 표도 만들거나 유지하지 않는다).
+    /// ★(0.14.42 · A2 D0 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 방금 적용한 기계 본문의 소유자(발신자 등급)를
+    /// **지금 세대**로 각인한다. 호출 규약: `input_gate` 안, `apply_pending_input` 직후(그 사이 다른 변이가 없어야
+    /// 세대가 맞다). pending_input leaf 만 잡는다 — 'input_gate 안에서는 pending_input leaf 만' 계약 그대로다.
+    pub fn mark_pending_input_owner(&self, owner: crate::governance::InputOwner) {
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.owner = Some((owner, self.input_gen.load(Ordering::Acquire)));
+    }
+
+    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **유효한 검증** 소유자 — 각인 세대가 현재 세대와 같고 등급이 `Verified`
+    /// 일 때만 Some. 소비자는 짝 Return 흡수의 보상 표 판정이다(보상 표의 주인은 검증 신원뿐 · 설계 B 무변경 —
+    /// `Claimed`·`Unattributed` 각인은 여기서 결측이다). 그 뒤 어떤 변이(제출·사람 키·다른 키·큐 Inject·stale
+    /// 리셋)든 세대를 올리므로 결측이 된다(결측은 값이 아니다 — 소유자 불명은 어떤 표도 만들거나 유지하지 않는다).
     pub fn pending_owner(&self) -> Option<u64> {
+        match self.pending_input_owner()? {
+            crate::governance::InputOwner::Verified(sid) => Some(sid),
+            _ => None,
+        }
+    }
+
+    /// ★(0.14.42 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 입력줄 본문의 **유효한** 소유자(전 등급) — 각인 세대가
+    /// 현재 세대와 같을 때만 Some. 소비자는 H0 기계 잔여 귀속(`governance::draft_machine_owned`) 하나다.
+    pub fn pending_input_owner(&self) -> Option<crate::governance::InputOwner> {
         let st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.owner
             .filter(|&(_, gen)| gen == self.input_gen.load(Ordering::Acquire))
-            .map(|(sid, _)| sid)
+            .map(|(owner, _)| owner)
     }
 
     /// ★(0.14.42 · A2) 흡수 표 발급(덮어쓰기) — 발급 때마다 만료분(나이 ≥ ttl)을 정리한다.

@@ -1810,7 +1810,8 @@ fn deliver_push(
         //     깨져도 하트비트·wakeup·자기 예약 wake 의 생명선이 끊기지 않는다(③). 시간 면제(ceiling)는 없다(§8-3).
         //   · busy(작업 중)는 막지 않는다(잔여) — §8 안에서 막는 유일한 방법이 큐 보류이고 그것이 ③ 을 만든다.
         //   · 셸 단독 축은 넣지 않는다(대상 선택의 `seat_is_agent_backed` 가 이미 본다).
-        //   · ★(리뷰 F1 · ③) 기계 소유로 입증된 초안(검증 발신자의 Return 누락 잔여 · 데몬 자신의 붙여넣기)은 초안 축이
+        //   · ★(리뷰 F1 · RR1-F1-XSOCK · ③) 기계 소유로 입증된 초안(CLI 기계 send 의 Return 누락 잔여 — 검증 좌석 · 교차 소켓
+        //     자기신고 · 익명 command 잡 · 데몬 자신의 붙여넣기)은 초안 축이
         //     아니다(H0 `draft_machine_owned`) — 종전(pre-H)처럼 직접 주입해 잔여를 병합 제출한다. 큐는 입력줄 점유를
         //     스스로 비우지 않아, 우회하면 푸는 주체 없이 heartbeat·wakeup 이 무기한 침묵한다.
         //   · fresh 잡은 pause 재확인과 기존 모달만 본다(새 축 없음 · 회수 타이머 의미 무변경).
@@ -4864,6 +4865,48 @@ mod h2_schedule_hold_tests {
         h_paint(&s, H_DRAFT_SCREEN);
         assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None), Ok("queued(gate:draft)"), "사람 초안은 종전대로 우회");
         assert_eq!(h_ledger_count(&d, "schedule"), 1);
+        done(&s);
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED · ③) **좌석 밖** 발신자의 Return 누락 잔여 — 교차 소켓 CEO·부서장(자기신고
+    /// from · Claimed)과 데몬 command 잡 push_line(from 없음) — 위에서도 스케줄 직접 push 는 큐로 우회하지 않는다(pre-H 병합
+    /// 제출이 유일한 자가치유). 잔여는 실제 핸들러(`dispatch` · peer pid 결측)로 만든다. 음성 대조: GUI 모양 삽입(human +
+    /// machine_origin + 오너 토큰) 잔여는 종전대로 우회. RED(HEAD f1b1a7e8): Claimed·익명 모두 queued(gate:draft).
+    #[test]
+    fn h2_cross_socket_residue_stays_direct() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, s) = rig("h2-xsock");
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let j = periodic("heartbeat-5m", 5);
+        let leave = |body: &str, extra: serde_json::Value| {
+            s.clear_pending_input();
+            *s.last_human_input.lock().unwrap() = None;
+            h_paint(&s, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, s.id, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *s.last_human_input.lock().unwrap() = None;
+            h_paint(&s, &crate::governance::h_residue_screen(body));
+        };
+        for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
+            leave(&format!("XSOCK-{label} residue"), extra);
+            assert_eq!(
+                deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+                Ok("pushed"),
+                "{label}: 좌석 밖 발신자의 잔여 위에서 큐로 우회했다 — input_pending 무기한(③ 자가치유 전멸)"
+            );
+            assert!(queue(&s).is_empty(), "{label}: 우회 항목이 남았다");
+            // 앞 주입의 붙여넣기 창(본문 → 500ms → CR)과 렌더 settle 이 지나도록 기다린다.
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+        }
+        assert_eq!(h_ledger_count(&d, "schedule"), 2, "직접 주입 원장 2");
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = 종전대로 우회.
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+            Ok("queued(gate:draft)"),
+            "GUI 삽입을 기계 잔여로 봤다"
+        );
+        assert_eq!(h_ledger_count(&d, "schedule"), 2);
         done(&s);
     }
 

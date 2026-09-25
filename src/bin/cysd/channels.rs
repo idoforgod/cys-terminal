@@ -4365,6 +4365,44 @@ mod tests {
         h3_done(&m);
     }
 
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED · ③) master 입력줄에 **좌석 밖** 발신자(교차 소켓 CEO·부서장 = 자기신고 from ·
+    /// 데몬 command 잡 = from 없음)의 Return 누락 잔여가 있어도 오너 채널 행은 보류되지 않는다 — 그 잔여를 치울 원격
+    /// 수단이 없어 행이 무기한 draft 보류된다. 실제로 행이 배달(병합 제출)되는지까지 본다. 음성 대조: GUI 모양 삽입
+    /// (human + machine_origin + 오너 토큰)은 종전대로 Draft. RED(HEAD f1b1a7e8): Err(Gate(Draft)) · 행 new 유지.
+    #[cfg(unix)]
+    #[test]
+    fn h3_cross_socket_residue_does_not_hold_row() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, m) = h3_rig("h3-xsock");
+        let sid = m.id;
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let leave = |body: &str, extra: Value| {
+            m.clear_pending_input();
+            *m.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, sid, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *m.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&m, &crate::governance::h_residue_screen(body));
+        };
+        for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
+            leave(&format!("XSOCK-{label} residue"), extra);
+            assert!(master_hold(&d, sid).is_ok(), "{label}: 좌석 밖 발신자의 잔여를 초안으로 봤다 — 채널 행 무기한 보류(③)");
+        }
+        let id = h3_seed(&d, "오너 원격 지시", now());
+        assert_eq!(h3_drain(&d, 1), vec![id], "잔여 위에서 채널 행이 나가지 않았다");
+        assert_eq!(h3_state(&d, id), "injected");
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = Draft. 앞 행의 붙여넣기 창·settle 이 지난 뒤 본다.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 1100));
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        assert_eq!(
+            master_hold(&d, sid).err(),
+            Some(InboxHold::Gate(crate::governance::MachineHold::Draft)),
+            "GUI 삽입을 기계 잔여로 봤다"
+        );
+        h3_done(&m);
+    }
+
     /// [H3 ③ 재기동 뒤 처리] 보류된 행은 channels.db 에 영속된다 — 데몬이 재기동해도 새 master 가 유휴가 되면 FIFO 로 나간다.
     #[cfg(unix)]
     #[test]

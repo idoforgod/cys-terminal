@@ -2384,6 +2384,42 @@ fn request_pair_key(
     })
 }
 
+/// ★(0.14.42 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 직접 send 가 남긴 기계 본문(결과 count>0)의 **소유자 등급**
+/// (순수) — H0 기계 잔여 귀속(`governance::draft_machine_owned`)의 재료. `None` = 각인하지 않는다(종전 Draft 유지).
+///
+/// ```text
+/// 검증 신원 있음                                   → Verified(v)   (종전 F1 규칙 그대로 · 보상 표의 주인)
+/// 검증 신원 없음 ∧ (human ∨ machine_origin)          → None          (GUI 경로 · 사람 자기신고 — 오너 클릭의 의도)
+/// 검증 신원 없음 ∧ 오너·오퍼레이터 토큰 호출자        → None          (GUI 등급 · `request_pair_key` 와 같은 배제)
+/// 검증 신원 없음 ∧ 자기신고 from 있음                 → Claimed(n)    (교차 소켓 CEO·부서장)
+/// 검증 신원 없음 ∧ from 없음                         → Unattributed  (데몬 command 잡 push_line · 좌석 밖 스크립트)
+/// ```
+///
+/// 【왜 넓히나】 팩이 정한 조직 경로(CEO_TEMPLATE — CEO→부서장 · 부서장→CEO 소켓 master · 전부서 공지 fan-out)는 전부
+/// 교차 소켓 `send` + `send-key Return` 쌍이고, 수신 데몬에서 발신자는 검증 신원이 없다. Return 이 빠지면 owner 없는
+/// 잔여가 Draft 로 남아 H2(스케줄 → 큐 input_pending 무기한)·H3(채널 무기한 보류)·H4(CEO 결재 전부 escalation)가
+/// 멈췄다(③). pre-H 는 첫 직접 push 가 잔여를 병합 제출해 스스로 풀렸다.
+/// 【권한이 늘지 않는다】 각인은 H0 초안 축의 **귀속**에만 쓰인다. 이 발신자들은 이미 `send-key Return` 으로 자기 본문을
+/// 제출할 수 있다. 보상 표(`ticket_after_key_write`)는 종전대로 `Verified` 만 본다(`Surface::pending_owner`).
+/// 【사람 의도는 보존】 사람 바이트가 한 바이트라도 섞이면 세대가 올라 각인이 결측이 되고(`human>0` 이기도 하다) 종전 Draft 다.
+/// 클로저는 검증 신원이 없을 때만 부른다(토큰 비교 1회 · 메모리).
+fn residue_owner(
+    verified_from: Option<u64>,
+    human: bool,
+    machine_origin: bool,
+    owner_token_caller: impl FnOnce() -> bool,
+    claimed: impl FnOnce() -> Option<u64>,
+) -> Option<crate::governance::InputOwner> {
+    use crate::governance::InputOwner;
+    if let Some(v) = verified_from {
+        return Some(InputOwner::Verified(v));
+    }
+    if human || machine_origin || owner_token_caller() {
+        return None;
+    }
+    Some(claimed().map_or(InputOwner::Unattributed, InputOwner::Claimed))
+}
+
 /// ★(0.14.42 · A2) 흡수 자격 미달 사유 — `absorb_miss` 응답 키의 값.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AbsorbMiss {
@@ -2530,7 +2566,7 @@ enum TicketSettle {
 /// 비제출 키(Down·Tab·Esc·C-u …)와 빈 줄·사람 초안 위 제출은 언제나 소거한다 — 그래서
 /// `send-key Down Return`·선택지 조작 뒤의 Return 은 절대 흡수되지 않는다.
 /// 소유자 결측(세대 불일치)은 값이 아니다 — 보상도 유지도 없이 소거한다.
-/// ★(B) 소유자는 검증 신원뿐이다(`PendingInputState.owner`) — `Claimed` 발신자는 소유자와 같을 수 없으므로
+/// ★(B) 소유자는 검증 신원뿐이다(`Surface::pending_owner` — Claimed·익명 각인은 여기서 결측) — `Claimed` 발신자는 소유자와 같을 수 없으므로
 /// 기계 본문 제출은 언제나 '남의 본문'(보상) 또는 결측(소거)이다. 보상 표는 `Verified(o)` 로 발급한다.
 fn ticket_after_key_write(
     caller: crate::state::PairKey,
@@ -3270,7 +3306,8 @@ fn deliver_to_ceo(
     //   typing 가드(3s)가 종전대로 본다. busy 는 막지 않는다(요청자 대기 120s — 턴 경계까지 미루면 만료가 곧
     //   escalation). 보류는 전부 **즉시 사람에게**(approval.stalled{reason} → UI openFeed · 사유로 분기하지 않는다).
     //   판정 패닉(ProbeFailed)도 escalation 이다(실패 방향 = 사람). 노브에서 ceo 를 빼면 종전 동작.
-    //   ★(리뷰 F2) 초안 축은 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤 settle 안)와 검증 발신자 잔여를 초안으로
+    //   ★(리뷰 F2 · RR1-F1-XSOCK) 초안 축은 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤 settle 안)와 CLI 기계 send 잔여
+    //   (검증 좌석 · 교차 소켓 부서장 자기신고 · 익명)를 초안으로
     //   보지 않는다(H0 `draft_machine_owned`) — 0.5s 안 연속 결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게 가던 결함.
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Ceo) {
         use crate::governance::{MachineHold as H, MachineHoldAxes};
@@ -5017,6 +5054,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 || surface.bracketed_paste.load(Ordering::Relaxed),
             );
             let write_req = send_text_write_req(&text, clear_first, human_verified, fence);
+            // ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 기계 잔여 소유자 등급 — 게이트 밖에서 미리 푼다(순수 · 토큰 비교뿐).
+            let owner_if_residue = residue_owner(
+                verified_from,
+                human,
+                machine_origin,
+                || caller_is_owner(daemon, &params, None),
+                || claimed_from_sid(&params),
+            );
             // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
@@ -5075,12 +5120,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     };
                     // ★(설계 C D5′) 계수는 실제로 쓴 바이트로(봉투 안 LF 는 제출 아님 · Raw 는 원문 그대로).
                     let next = surface.apply_pending_input(&direct_fence_bytes(&text, fence), origin);
-                    // ★(0.14.42 · A2 D0) 기계 본문의 소유자 각인 — 검증 발신자 · 결과 count>0 일 때만.
+                    // ★(0.14.42 · A2 D0) 기계 본문의 소유자 각인 — 결과 count>0 일 때만.
                     //   pending_input leaf 만 잡는다(게이트 안 락 계약 그대로). 이후 변이는 세대를 올려
-                    //   각인을 자동 무효화한다(Surface::pending_owner).
+                    //   각인을 자동 무효화한다(Surface::pending_input_owner).
+                    //   ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 검증 발신자만이 아니라 좌석 밖 CLI 기계 send(교차 소켓
+                    //   자기신고 · 익명)도 각인한다 — 등급 규칙은 `residue_owner`(GUI·사람 자기신고·오너 토큰은 제외).
                     if origin == crate::governance::InputOrigin::Machine && next.count > 0 {
-                        if let Some(x) = verified_from {
-                            surface.mark_pending_owner(x);
+                        if let Some(o) = owner_if_residue {
+                            surface.mark_pending_input_owner(o);
                         }
                     }
                 }
@@ -20995,6 +21042,84 @@ mod tests {
         assert_eq!(sc.len(), 1, "settle 뒤 화면 초안을 놓쳤다");
         assert_eq!(sc[0]["payload"]["reason"], json!("ceo_seat_draft"));
         let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) CEO 좌석 입력줄에 **좌석 밖** 발신자의 Return 누락 잔여 — 부서장→CEO 소켓
+    /// master(CEO_TEMPLATE:33 · 자기신고 from = Claimed)·익명 CLI(from 없음) — 가 있어도 AutoEligible 결재는 CEO 로 간다
+    /// (pre-H 처럼 잔여 뒤에 병합 제출). 종전에는 매 결재가 ceo_seat_draft 로 사람에게 갔다. 음성 대조: GUI 모양 삽입(오너
+    /// 클릭 · human + machine_origin + 오너 토큰)은 종전대로 escalation. RED(HEAD f1b1a7e8): approval.stalled{ceo_seat_draft}.
+    #[test]
+    fn h4_cross_socket_residue_routes_to_ceo() {
+        let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let (d, ceo) = h4_rig("h4-xsock", "sleep 30");
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let stalled_for = |d: &Arc<Daemon>, rid: &str| -> Vec<Value> {
+            h4_events(d, "approval.stalled")
+                .into_iter()
+                .filter(|ev| ev["payload"]["request_id"] == json!(rid))
+                .collect()
+        };
+        let leave = |body: &str, extra: Value| {
+            ceo.clear_pending_input();
+            *ceo.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, ceo.id, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *ceo.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&ceo, &crate::governance::h_residue_screen(body));
+        };
+        for (i, (label, extra)) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))].into_iter().enumerate() {
+            leave(&format!("[부서A] REPORT {label} residue"), extra);
+            let item = h4_item(&format!("h4-xsock-{i}"), &format!("RSI 학습 추천 xsock {label}"), "x");
+            route_auto_approval(&d, &item, false);
+            assert!(
+                stalled_for(&d, &item.request_id).is_empty(),
+                "{label}: 좌석 밖 발신자의 잔여에 걸려 결재가 사람에게 갔다(ceo_seat_draft)"
+            );
+            assert_eq!(h4_events(&d, "feed.auto_routed").len(), i + 1, "{label}: CEO 로 가지 않았다");
+            // 붙여넣기 창(본문 → 500ms → CR) + settle 이 지나도록 기다린다(다음 판정이 우리 붙여넣기로 면제되지 않게).
+            std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 700));
+        }
+        assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 2);
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = 종전대로 escalation.
+        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        let item = h4_item("h4-xsock-gui", "RSI 학습 추천 xsock gui", "x");
+        route_auto_approval(&d, &item, false);
+        let sc = stalled_for(&d, "h4-xsock-gui");
+        assert_eq!(sc.len(), 1, "GUI 삽입을 기계 잔여로 봤다(주입했다)");
+        assert_eq!(sc[0]["payload"]["reason"], json!("ceo_seat_draft"));
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// [순수 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED] `residue_owner` 진리표 — 검증 신원 우선(종전 규칙 · human·토큰과 무관),
+    /// 검증 신원이 없으면 GUI 경로(human ∨ machine_origin ∨ 오너 토큰)는 각인 없음, 그 밖 CLI 는 자기신고 from → Claimed ·
+    /// 결측 → Unattributed. 검증 신원이 있으면 클로저를 부르지 않는다(토큰·from 을 보지 않는다 — 로컬 좌석은 무엇을
+    /// 자기신고해도 Verified).
+    #[test]
+    fn residue_owner_truth_table() {
+        use crate::governance::InputOwner as O;
+        let never_tok = || -> bool { panic!("검증 신원이 있으면 토큰을 보지 않는다") };
+        let never_from = || -> Option<u64> { panic!("검증 신원이 있으면 from 을 보지 않는다") };
+        for (human, mo) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(residue_owner(Some(4), human, mo, never_tok, never_from), Some(O::Verified(4)), "h={human} mo={mo}");
+        }
+        for tok in [false, true] {
+            for from in [None, Some(900)] {
+                for (human, mo) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let got = residue_owner(None, human, mo, || tok, || from);
+                    let want = if human || mo || tok {
+                        None
+                    } else {
+                        Some(from.map_or(O::Unattributed, O::Claimed))
+                    };
+                    assert_eq!(got, want, "tok={tok} from={from:?} h={human} mo={mo}");
+                }
+            }
+        }
+        // 표기(이벤트 payload) — Unattributed 의 번호는 결측이다(결측은 값이 아니다).
+        assert_eq!((O::Verified(4).sid(), O::Verified(4).kind()), (Some(4), "verified"));
+        assert_eq!((O::Claimed(900).sid(), O::Claimed(900).kind()), (Some(900), "claimed"));
+        assert_eq!((O::Unattributed.sid(), O::Unattributed.kind()), (None, "unattributed"));
     }
 
     /// [H4 C 연동] 경계 변형 본문(`ESC[201~` + CR + EVIL)의 **writer 바이트** — 울타리 닫힘 1개 · 끝 CR 1개 ·

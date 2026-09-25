@@ -5444,8 +5444,9 @@ pub(crate) const OWN_PASTE_SETTLE_MS: u64 = 500;
 pub(crate) enum MachineDraft {
     /// writer 가 이 좌석에 데몬 Inject(붙여넣기 → cr_delay → CR)를 쓰는 중이거나 끝난 지 [`OWN_PASTE_SETTLE_MS`] 안이다.
     OwnPaste,
-    /// 입력줄 본문이 검증 발신자(`owner` 좌석)의 직접 send 본문 **그대로**다 — owner 각인 세대 일치 ∧ 사람 바이트 0.
-    MachineResidue { owner: u64 },
+    /// 입력줄 본문이 CLI 기계 send(`owner` 등급 — 검증 좌석 · 교차 소켓 자기신고 · 익명)의 본문 **그대로**다 —
+    /// owner 각인 세대 일치 ∧ 사람 바이트 0.
+    MachineResidue { owner: InputOwner },
 }
 
 /// ★(0.14.42 · 설계 H 리뷰 F1·F2) 화면 초안이 **기계 소유로 입증되는가**. 입증되면 H0 초안 축의 보류 근거가 아니다.
@@ -5459,9 +5460,15 @@ pub(crate) enum MachineDraft {
 ///     초안으로 오인한다(CEO 둘째 결재 escalation). writer 는 단일 소비자라 뒤 Inject 는 앞 CR 뒤에 쓰인다.
 ///
 /// 【입증의 정의 — 좁게】 계수 0 인 화면 초안(출처 불명 · S41 가짜 에이전트 초안 · 재기동 휘발)·사람 바이트가 섞인 줄·
-/// owner 결측 기계 바이트(GUI machine_origin 경로 삽입 · 교차 소켓 자기신고 발신자)는 입증이 아니다 → 종전 Draft.
-/// 사람이 자기 뒤에 치면 입력 세대가 올라 owner 가 결측이 된다(Surface::pending_owner). 사람 입력 창·타이핑 가드는
+/// owner 결측 기계 바이트(GUI 경로 삽입 = 사람 자기신고 `human` ∨ `machine_origin` ∨ 오너 토큰 — 오너 클릭의 의도)는
+/// 입증이 아니다 → 종전 Draft. owner 등급은 검증 좌석뿐 아니라 교차 소켓 자기신고(`Claimed`)·익명 CLI(`Unattributed`)도
+/// 포함한다(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED — 조직 경로가 교차 소켓 send+send-key 쌍이다 · handlers `residue_owner`).
+/// 사람이 자기 뒤에 치면 입력 세대가 올라 owner 가 결측이 된다(Surface::pending_input_owner). 사람 입력 창·타이핑 가드는
 /// 생산자 축으로 따로 본다.
+///
+/// 【잔여 나이 문턱을 두지 않는다】 진행 중인 send→Return 쌍 사이에 생산자가 오면 pre-H(0.14.41)처럼 병합 제출되고
+/// 뒤늦은 짝 Return 은 빈 줄에 떨어진다. 문턱(N초 동안은 Draft)을 두면 그 창에서 H2 는 큐로 돌려 다음 직접 push(최대
+/// 1주기)까지 막히고, H4 는 사람에게 escalation 한다 — pre-H 에 없던 보류를 새로 만든다(③ · 결재 escalation).
 ///
 /// 락: `pending_input` leaf 두 번(owner·human) — 원자 스냅숏이 아니다. 그 사이 사람 키가 오면 다음 판정이 본다.
 pub(crate) fn draft_machine_owned(s: &crate::state::Surface) -> Option<MachineDraft> {
@@ -5471,14 +5478,14 @@ pub(crate) fn draft_machine_owned(s: &crate::state::Surface) -> Option<MachineDr
     {
         return Some(MachineDraft::OwnPaste);
     }
-    let owner = s.pending_owner()?;
+    let owner = s.pending_input_owner()?;
     let human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
     (human == 0).then_some(MachineDraft::MachineResidue { owner })
 }
 
 /// 기계 잔여를 초안 축에서 뺀 사실의 가시화 — `machine_inject.machine_residue` 를 (좌석, 입력 세대)마다 1건.
 /// 생산자는 이어서 종전(pre-H)처럼 잔여 뒤에 주입하므로 잔여가 **병합 제출**된다. 판정 불능이어도 주입은 막지 않는다.
-fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: u64) {
+fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: InputOwner) {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(std::path::PathBuf, u64), u64>>> =
         std::sync::OnceLock::new();
     let gen = s.input_gen.load(Ordering::Acquire);
@@ -5493,8 +5500,10 @@ fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: 
         "machine_inject.machine_residue",
         "system",
         Some(s.id),
-        json!({"surface_id": s.id, "owner": owner, "pending_bytes": pending,
-               "note": "입력줄에 검증 발신자의 미제출 기계 본문(Return 누락 잔여)이 있다 — 초안 보류 근거가 아니다. \
+        // `owner` = 좌석 번호(Unattributed 는 null) · `owner_kind` = 등급(verified·claimed·unattributed — claimed 번호는
+        //   다른 데몬의 것일 수 있다). 추가형 키.
+        json!({"surface_id": s.id, "owner": owner.sid(), "owner_kind": owner.kind(), "pending_bytes": pending,
+               "note": "입력줄에 CLI 기계 send 의 미제출 본문(Return 누락 잔여)이 있다 — 초안 보류 근거가 아니다. \
                         데몬 주입이 종전처럼 그 뒤에 이어 붙어 함께 제출된다(푸는 주체 없는 무기한 보류 차단)"}),
     );
 }
@@ -5725,14 +5734,52 @@ pub(crate) struct PendingInputState {
     pub paste_opened_at: Option<std::time::Instant>,
     /// 청크 끝이 봉투 표식의 접두로 끝났을 때 다음 호출로 이월하는 ≤5 바이트.
     pub tail: Vec<u8>,
-    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **소유자** — (검증된 발신 surface id, 기록 직후의 `input_gen`).
-    /// 기록처는 단 하나: `surface.send_text` 직접 경로가 `input_gate` 안에서 기계 본문(검증 발신자 ·
-    /// 결과 count>0)을 적용한 직후다(`Surface::mark_pending_owner`).
+    /// ★(0.14.42 · A2 D0) 입력줄 본문의 **소유자** — (발신자 등급 [`InputOwner`], 기록 직후의 `input_gen`).
+    /// 기록처는 단 하나: `surface.send_text` 직접 경로가 `input_gate` 안에서 기계 본문(결과 count>0)을 적용한
+    /// 직후다(`Surface::mark_pending_input_owner` · 등급 규칙은 handlers `residue_owner`).
     /// **유효 조건 = 세대 일치**: 이후의 모든 변이(CR 제출·사람 키·다른 키·큐 Inject 의
     /// `set_pending_input(0)`·stale 리셋)는 세대를 올리므로 owner 는 자동으로 결측이 된다
-    /// (`Surface::pending_owner`). `pending_input_step` 은 이 필드를 **복사만** 하고 읽지 않으며,
-    /// `clear_pending_input` 은 Default 로 비운다. 소비자는 짝 Return 흡수의 보상 표 판정 하나뿐이다.
-    pub owner: Option<(u64, u64)>,
+    /// (`Surface::pending_input_owner`). `pending_input_step` 은 이 필드를 **복사만** 하고 읽지 않으며,
+    /// `clear_pending_input` 은 Default 로 비운다.
+    /// 소비자 둘: ① 짝 Return 흡수의 보상 표 판정 — **Verified 만** 본다(`Surface::pending_owner` · 설계 B 무변경)
+    /// ② H0 기계 잔여 귀속 — 전 등급을 본다([`draft_machine_owned`] · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED).
+    pub owner: Option<(InputOwner, u64)>,
+}
+
+/// ★(0.14.42 · 리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED) 입력줄 기계 본문의 **발신자 등급** — owner 각인의 값.
+///
+/// 【왜 등급이 셋인가】 F1 첫 수정은 검증 발신자(이 데몬의 좌석)의 잔여만 각인했다. 그런데 팩이 정한 조직 경로는
+/// 교차 소켓 2단계(`cys --socket <x>.sock send …` + `send-key … Return` · CEO→부서장 · 부서장→CEO · 공지 fan-out)이고,
+/// 데몬 command 잡(`javis_cycle_autopilot` push_line)도 좌석 밖 발신이다. 이 발신자들은 수신 데몬에서 검증 신원이 없어
+/// Return 이 빠지면 owner 없는 기계 잔여가 남았고, H0 은 그것을 사람 초안(Draft)으로 봐 스케줄·채널·CEO 결재를 무기한
+/// 보류했다(③). 등급은 **귀속**만 가른다 — 보상 표(짝 Return 흡수)는 종전대로 `Verified` 만 주인으로 본다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputOwner {
+    /// 커널 peer pid 로 해석된 이 데몬의 좌석 id(검증).
+    Verified(u64),
+    /// 검증 신원 없는 CLI 호출자의 자기신고 `from`(CYS_SURFACE_ID) — 다른 데몬의 번호일 수 있다.
+    Claimed(u64),
+    /// 검증 신원도 자기신고도 없는 CLI 기계 send(데몬 command 잡 · 좌석 밖 스크립트).
+    Unattributed,
+}
+
+impl InputOwner {
+    /// 이벤트 표기용 좌석 번호(`Unattributed` 는 결측 — 결측은 값이 아니다).
+    pub(crate) fn sid(self) -> Option<u64> {
+        match self {
+            InputOwner::Verified(x) | InputOwner::Claimed(x) => Some(x),
+            InputOwner::Unattributed => None,
+        }
+    }
+
+    /// 이벤트 표기용 등급 이름.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            InputOwner::Verified(_) => "verified",
+            InputOwner::Claimed(_) => "claimed",
+            InputOwner::Unattributed => "unattributed",
+        }
+    }
 }
 
 /// 입력 바이트의 출처 — 사람(GUI 자기신고 human=true · !machine_origin) / 기계(그 밖 전부 · send_key 전부).
@@ -21240,6 +21287,74 @@ pub(crate) fn h_paint(s: &Arc<crate::state::Surface>, screen: &str) {
     p.process(body.as_bytes());
 }
 
+/// 검체 공용 — 좌석 밖 호출 검체의 **팩 격리 보유자**. `PACK_ENV_LOCK` 을 검체 전 구간 쥐고 `CYS_PACK_DIR` 을 전부 허용
+/// ACL 의 임시 팩으로 둔다(라이브 팩 무접촉 · Drop 에서 종전 값 복원 · 임시 폴더 삭제). **좌석을 만들기 전에** 잡는다 —
+/// 같은 락을 검체 전 구간 쥐는 다른 묶음(return_absorb 등) 뒤에서 기다리는 동안 `sleep 30` 좌석이 끝나 버리면
+/// `process_exited` 로 검체 전제가 무너진다(전체 실행 실측).
+#[cfg(test)]
+pub(crate) struct HOutsidePack {
+    _g: std::sync::MutexGuard<'static, ()>,
+    dir: std::path::PathBuf,
+    prev: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl HOutsidePack {
+    pub(crate) fn new() -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "cys-h-outside-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).expect("acl.json");
+        let prev = std::env::var_os(cys::pack::ENV_PACK_DIR);
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+        HOutsidePack { _g: g, dir, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HOutsidePack {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(p) => std::env::set_var(cys::pack::ENV_PACK_DIR, p),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// 검체 공용 — `surface.send_text` 직접 요청을 **좌석 밖 호출자**(커널 peer pid 결측)로 보낸다. 교차 소켓 CEO·부서장
+/// (`from` 자기신고)·데몬 command 잡(from 없음)·GUI(토큰 · human · machine_origin) 모양을 `extra` 로 싣는다. 실제
+/// 핸들러(`dispatch`)를 지나므로 owner 각인까지 운영 경로 그대로다. 팩 격리는 호출자가 쥔 [`HOutsidePack`] 이 한다.
+/// 응답이 ok 가 아니면 패닉(검체 전제 — 잔여가 남아야 한다).
+#[cfg(test)]
+pub(crate) fn h_send_outside(_pack: &HOutsidePack, daemon: &Arc<Daemon>, sid: u64, text: &str, extra: Value) -> Value {
+    let mut params = json!({"surface_id": sid, "text": text, "queued": false, "quiet": true});
+    for (k, v) in extra.as_object().expect("extra 는 객체") {
+        params[k] = v.clone();
+    }
+    let reply = crate::handlers::dispatch(
+        daemon,
+        cys::Request { id: json!(1), method: "surface.send_text".into(), params },
+        None,
+    );
+    let crate::handlers::Reply::Single(v) = reply else {
+        panic!("single reply 기대");
+    };
+    assert_eq!(v["ok"], json!(true), "전제: 좌석 밖 직접 send 가 통과해야 잔여가 남는다: {v}");
+    v
+}
+
+/// 검체 공용 — 입력줄에 `body` 가 남은 claude composer 화면.
+#[cfg(test)]
+pub(crate) fn h_residue_screen(body: &str) -> String {
+    format!("● 작업 로그 한 줄\n────────────────────\n❯ {body}")
+}
+
 /// 검체 공용 — 유휴 claude composer(괘선 + `❯ ` · 커서는 마커 뒤).
 #[cfg(test)]
 pub(crate) const H_IDLE_SCREEN: &str = "● 작업 로그 한 줄\n────────────────────\n❯ ";
@@ -21612,12 +21727,74 @@ mod h_machine_hold_tests {
         s.clear_pending_input();
         h_paint(&s, H_DRAFT_SCREEN);
         assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft));
-        // ⑤ 기계 바이트지만 owner 결측(GUI machine_origin 경로 삽입 · 교차 소켓 자기신고 발신자) → 입증 없음 = Draft.
+        // ⑤ 기계 바이트지만 owner 결측(각인 없는 기계 바이트 — GUI machine_origin 경로 삽입 등) → 입증 없음 = Draft.
+        //   (교차 소켓 자기신고·익명 CLI 발신자는 이제 각인된다 — `h0_cross_socket_residue_is_not_a_draft`.)
         s.clear_pending_input();
         s.apply_pending_input(b"WORKER-REPORT residue text", InputOrigin::Machine);
         assert_eq!(s.pending_owner(), None);
         h_paint(&s, residue);
         assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "결측 owner 를 기계 잔여로 봤다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(리뷰 RR1-F1-XSOCK · RV1-CS-F1-CLAIMED · ③) **좌석 밖** CLI 발신자의 직접 send 가 Return 없이 남긴 잔여도 기계
+    /// 잔여다. 교차 소켓 CEO·부서장(자기신고 from = Claimed)과 데몬 command 잡 push_line(from 없음 = Unattributed)은 수신
+    /// 데몬에서 검증 신원이 없을 뿐 사람 초안이 아니다. 팩 조직 경로(CEO_TEMPLATE send+send-key 쌍)가 이 모양이라, 각인이
+    /// 없으면 H2·H3·H4 가 무기한 보류된다. 실제 핸들러(`dispatch` · peer pid 결측)를 지난다.
+    /// 음성 대조(수정 전후 모두 Draft): GUI 모양 삽입(human + machine_origin + 오너 토큰) · 오너 토큰 호출자 · 잔여 뒤 사람 키.
+    /// 보상 표의 주인(`pending_owner` · 검증 전용)은 Claimed·익명 각인에서 결측 그대로다(설계 B 무변경).
+    /// RED(HEAD f1b1a7e8): Claimed·익명 잔여가 Draft · machine_residue 이벤트 0.
+    #[test]
+    fn h0_cross_socket_residue_is_not_a_draft() {
+        let pack = HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
+        let d = h_daemon("h0-xsock");
+        let s = claude_seat(&d);
+        let tok = d.operator_token.clone().expect("데몬 토큰");
+        let residue_ev = |d: &Arc<Daemon>| -> Vec<Value> {
+            d.bus.tail(300).into_iter().filter(|ev| ev["name"] == "machine_inject.machine_residue").collect()
+        };
+        // 좌석 밖 직접 send → 화면에 그 본문이 입력줄에 남은 모습(에코가 가라앉은 뒤 다시 그린다).
+        let leave = |s: &Arc<crate::state::Surface>, body: &str, extra: Value| {
+            s.clear_pending_input();
+            *s.last_human_input.lock().unwrap() = None;
+            h_paint(s, H_IDLE_SCREEN);
+            h_send_outside(&pack, &d, s.id, body, extra);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            *s.last_human_input.lock().unwrap() = None; // GUI 모양(human)의 타이핑 시각은 초안 축만 보려고 지운다
+            h_paint(s, &h_residue_screen(body));
+        };
+        // ① 교차 소켓 자기신고(Claimed) — CEO(HQ 좌석 900) → 이 데몬 master · Return 누락.
+        leave(&s, "CEO-XSOCK residue", json!({"from": 900}));
+        assert!(s.pending_input_bytes.load(AO::Relaxed) > 0, "전제: 계수된 잔여");
+        assert_eq!(
+            machine_direct_hold(&d, &s, all_axes(30)),
+            None,
+            "교차 소켓 발신자의 잔여를 초안으로 봤다 — 스케줄·채널·CEO 결재가 무기한 보류된다(③)"
+        );
+        assert_eq!(s.pending_owner(), None, "보상 표 주인은 검증 신원뿐(설계 B 무변경)");
+        let ev = residue_ev(&d);
+        assert_eq!(ev.len(), 1, "machine_residue 1건: {ev:?}");
+        assert_eq!(ev[0]["payload"]["owner"], json!(900));
+        assert_eq!(ev[0]["payload"]["owner_kind"], json!("claimed"));
+        // 잔여 뒤 사람 키 1바이트 → 세대가 올라 각인 결측 = Draft(사람 손이 닿은 줄).
+        s.apply_pending_input(b"x", InputOrigin::Human);
+        h_paint(&s, &h_residue_screen("CEO-XSOCK residuex"));
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "사람 키가 섞인 줄을 기계 잔여로 봤다");
+        // ② 익명(from 없음 — 데몬 command 잡의 push_line 모양).
+        leave(&s, "AUTOPILOT residue", json!({}));
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), None, "익명 CLI 잔여를 초안으로 봤다(③)");
+        let ev = residue_ev(&d);
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        assert_eq!(ev[1]["payload"]["owner"], Value::Null);
+        assert_eq!(ev[1]["payload"]["owner_kind"], json!("unattributed"));
+        // ③ 음성 대조 — GUI 모양 삽입(오너 클릭 · human + machine_origin + 오너 토큰): 사람 의도 = Draft.
+        leave(&s, "GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        assert!(s.pending_input_bytes.load(AO::Relaxed) > 0, "전제: 계수된 삽입");
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "GUI 삽입을 기계 잔여로 봤다");
+        // ④ 음성 대조 — 오너 토큰 호출자(pane 무귀속 GUI 등급)는 human=false · from 을 실어도 각인하지 않는다.
+        leave(&s, "OWNER-TOKEN text", json!({"from": 900, "owner_token": tok}));
+        assert_eq!(machine_direct_hold(&d, &s, all_axes(30)), Some(MachineHold::Draft), "오너 토큰 호출자를 기계 잔여로 봤다");
+        assert_eq!(residue_ev(&d).len(), 2, "음성 대조에서 machine_residue 가 났다");
         let _ = s.child.lock().unwrap().kill();
     }
 
