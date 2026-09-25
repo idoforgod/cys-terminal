@@ -2960,7 +2960,9 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
 fn inject_text(sid: u64, text: &str) -> Result<(), String> {
     // ★U-14 관문 가드 ①(붙여넣기 직전). 이 한 줄이 `inject_text` 를 부르는 모든 경로를 덮는다.
     gate_guard_check(sid, "디렉티브 주입")?;
-    let wrapped = format!("\x1b[200~{text}\x1b[201~");
+    // ★(0.14.42 · 설계 C D4) 봉투는 lib 단일 정의처 — 본문 안 표지·끝 미완성 이스케이프를 살균한다(표지 없는
+    //   디렉티브는 종전 바이트 그대로). 큐 폴백은 원문을 보내고, 그 원문은 데몬 다이제스트 살균(D3)이 덮는다.
+    let wrapped = cys::paste_fence::wrap(text);
     // authoritative: 디렉티브·과업 주입은 타이핑 가드를 면제한다 — 막 기동한 에이전트
     // pane에 사람 미완성 입력이 없고, GUI 활성 pane의 사람-입력 잔향이 주입을 영구
     // 차단하던 경로(human is typing 무한)를 끊는다. ACL은 데몬에서 그대로 집행된다.
@@ -17477,7 +17479,8 @@ fn inject_text_on(
     //   구멍을 남기면 그 구멍이 다음 사고의 자리가 된다(이 저장소에서 살아남는 결함은 전부
     //   이음매에 있다). 관측 실패는 종전대로 전송(fail-open) — 아래 헬퍼의 doc 참조.
     gate_guard_check_on(socket, sid, timeout, "디렉티브 주입(부서)")?;
-    let wrapped = format!("\x1b[200~{text}\x1b[201~");
+    // ★(0.14.42 · 설계 C D4) `inject_text` 와 같은 lib 봉투(단일 정의처).
+    let wrapped = cys::paste_fence::wrap(text);
     request_on_timeout(
         socket,
         "surface.send_text",
@@ -27113,6 +27116,27 @@ mod tests {
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청(헬퍼)");
         assert_eq!(send_key_request_params(1, "Return", false, true, None)["pair_return"], json!(true));
         assert!(arm.contains("!any_absorbed") && arm.contains("!sid_absorbed"), "흡수 시 OK 억제");
+    }
+
+    /// ★(0.14.42 · 설계 C D4 · T11) CLI 디렉티브 주입의 봉투는 lib `paste_fence::wrap` 단일 정의처를 쓴다 —
+    /// 본문(디렉티브 파일·과업 문안) 안 CLOSE 가 봉투를 조기에 닫지 않는다. 비테스트 코드에 손수 만든
+    /// `format!("\x1b[200~{text}…")` 봉투가 남으면 적색.
+    #[test]
+    fn c_inject_text_paths_use_lib_paste_fence_wrap() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+        assert!(
+            !prod.contains("format!(\"\\x1b[200~{text}"),
+            "손수 만든 울타리 봉투가 남았다 — cys::paste_fence::wrap 을 써라"
+        );
+        for f in ["fn inject_text(", "fn inject_text_on("] {
+            let body = prod.split(f).nth(1).unwrap_or_else(|| panic!("{f} 소실"));
+            let body = &body[..body.find("\n}\n").expect("함수 끝")];
+            assert!(body.contains("cys::paste_fence::wrap(text)"), "{f} 가 lib wrap 을 거치지 않는다");
+        }
+        // 표지 없는 본문은 종전 바이트 그대로(기존 starts_with("\x1b[200~W") 검체의 전제).
+        assert_eq!(cys::paste_fence::wrap("W 지침"), "\x1b[200~W 지침\x1b[201~");
+        assert_eq!(cys::paste_fence::wrap("a\x1b[201~b"), "\x1b[200~ab\x1b[201~");
     }
 
     /// ★(0.14.42 · B5) `send-key` 요청 파라미터(순수) — **비큐 요청에만** 자기신고 from(CYS_SURFACE_ID)을 싣는다.

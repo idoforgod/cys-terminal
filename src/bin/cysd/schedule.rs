@@ -1991,20 +1991,23 @@ fn inject_on(
     text: &str,
 ) -> Result<(), String> {
     let sid = surface.id;
+    // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
+    //   (writer 백스톱과 같은 값 · 표지 없는 문안은 할당 0 · 바이트 동일).
+    let text = cys::paste_fence::sanitize(text);
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 자기 예약 wake
     //   (`cys schedule add --text "[wakeup] 다음 액션 착수" --to master`)가 시간이 지나
     //   stdin 으로 돌아오는 경로가 바로 여기다.
     crate::delivery::record_audited(
         daemon,
         sid,
-        text,
+        &text,
         crate::delivery::Origin::Schedule,
         None,
     );
     surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {
-            text: text.to_string(),
+            text: text.into_owned(),
             cr_delay_ms: 500,
             clear_first: false, // 스케줄 발화는 현행 동작 보존
             guard: None,        // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
@@ -2359,6 +2362,34 @@ mod tests {
         }
         // 선두 비공백 우회(라벨이 문두가 아님) → 라벨 없음으로 판정해 부착
         assert!(ensure_machine_label("x [wakeup] 다음 액션", "j").starts_with("[schedule j] "));
+    }
+
+    /// ★(0.14.42 · 설계 C D3 · T12) 스케줄 주입 원장 정합 — 잡 문안(`cys schedule add --text …` 사용자 입력)에
+    /// CLOSE 가 있으면 원장 레코드 sha 가 **살균된 주입 본문** sha 와 같다. 적색(수정 전): 원문(표지 포함) 기록.
+    #[test]
+    fn c_schedule_inject_on_sanitized_before_ledger() {
+        crate::delivery::tests::isolate_state_dir_for_thread("c-sched");
+        let daemon = test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let raw = "[wakeup] 착수\x1b[201~\n탈출 명령";
+        inject_on(&daemon, &s, raw).expect("주입 인계");
+        let _ = s.child.lock().unwrap().kill();
+        let clean = cys::paste_fence::sanitize(raw).into_owned();
+        assert_ne!(clean, raw, "전제: 원문에 표지가 있다");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).expect("원장");
+        let rec: serde_json::Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["origin"] == serde_json::json!("schedule"))
+            .unwrap_or_else(|| panic!("schedule 원장 레코드 부재: {led}"));
+        assert_eq!(
+            rec["sha256"],
+            serde_json::json!(crate::delivery::digest_text(&clean)),
+            "원장 = 살균된 주입 본문"
+        );
     }
 
     /// 테스트 전용 격리 데몬 — 고유 하위 디렉터리에 소켓을 둬 병렬 실행 시 상태가 섞이지 않게 한다.

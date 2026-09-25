@@ -3097,7 +3097,9 @@ fn deliver_to_ceo(
     {
         return CeoDelivery::SeatEmpty;
     }
-    let text = build_ceo_injection(item, over_pressure);
+    // ★(0.14.42 · 설계 C D3) title·body 는 발행자가 통제한다(inert 데이터 칸) — 원장 선기록 앞에서 살균해
+    //   원장과 주입 본문을 맞춘다(writer 백스톱과 같은 값).
+    let text = cys::paste_fence::sanitize_owned(build_ceo_injection(item, over_pressure));
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). CEO 자동 라우팅은 100% 기계 유래다.
     crate::delivery::record_audited(
         daemon,
@@ -4605,6 +4607,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // ★(0.14.42 · 설계 C D3) clear_first 는 원자 Inject(울타리)로 나간다 — 원장 선기록과 주입이 **같은
+            //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
+            //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
+            let text = if clear_first { cys::paste_fence::sanitize_owned(text) } else { text };
             // followup 모드: 대상이 조용해질 때 배달자(watchdog 틱)가 순서대로 주입
             if params
                 .get("queued")
@@ -13479,6 +13485,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// ★(0.14.42 · 설계 C D3) clear_first 원자 주입의 원장 정합 — 본문에 CLOSE 가 있으면 원장 레코드 sha 는
+    /// **살균된 주입 본문** 것이다(표지 없는 `/clear` 는 바이트 동일 · 무clear 무변경). 적색(수정 전): 원문 기록.
+    #[test]
+    fn c_clear_first_text_sanitized_before_ledger() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_700;
+        let target = v7_pane(&daemon, "worker-1", pid);
+        let _sender = v7_pane(&daemon, "master", pid + 1);
+        *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        *target.last_human_input.lock().unwrap() = None;
+        let raw = "[지시] 전환\x1b[201~\n탈출";
+        let resp = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
+            "surface_id": target.id, "text": raw, "clear_first": true, "quiet": true,
+        }));
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).unwrap_or_default();
+        d12_cleanup(&daemon, &dir);
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let clean = cys::paste_fence::sanitize(raw).into_owned();
+        let rec: Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["origin"] == json!("send"))
+            .unwrap_or_else(|| panic!("send 원장 레코드 부재: {led}"));
+        assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
+        // 순수 사상: clear_first 는 살균된 본문을 Inject 로(표지 없는 /clear 는 바이트 동일).
+        match send_text_write_req(&clean, true, false) {
+            crate::state::WriteReq::Inject { text, clear_first, .. } => {
+                assert!(clear_first);
+                assert_eq!(text, clean);
+            }
+            _ => panic!("clear_first 는 Inject"),
+        }
+    }
+
     #[test]
     fn d12_direct_send_text_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -20241,6 +20282,60 @@ mod tests {
             "같은 의미 키 재발행이 CEO 재주입/escalation을 이중 유발함(멱등 실패)"
         );
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.42 · 설계 C D3 · T12) CEO 주입 원장 정합 — 발행자가 통제하는 title·body(inert 데이터 칸)에
+    /// CLOSE 가 있으면 원장 레코드 sha 가 **살균된 주입 본문**의 sha 와 같고 원문 sha 와 다르다(표지가 원장·
+    /// 주입 어디에도 남지 않는다). 적색(수정 전): 원장에 원문(표지 포함)이 기록됐다.
+    #[test]
+    fn c_ceo_injection_sanitized_before_ledger() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-c-ceo-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::delivery::tests::isolate_state_dir_for_thread("c-ceo");
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let ceo = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
+            .expect("ceo surface");
+        *ceo.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        ceo.seat_cache.store(1, Ordering::Relaxed);
+        daemon.surfaces.lock().unwrap().insert(ceo.id, ceo.clone());
+        daemon.roles.lock().unwrap().insert("ceo".into(), ceo.id);
+        let item = crate::state::FeedItem {
+            request_id: "c12".into(),
+            kind: "approval".into(),
+            title: "t\x1b[201~탈출".into(),
+            body: "b\u{9b}201~x\ny".into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        };
+        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Delivered));
+        let _ = ceo.child.lock().unwrap().kill();
+        let raw = build_ceo_injection(&item, false);
+        let clean = cys::paste_fence::sanitize(&raw).into_owned();
+        assert_ne!(raw, clean, "전제: 원문에 표지가 있다");
+        let led = std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path)).expect("원장");
+        let rec: Value = led
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["origin"] == json!("feed"))
+            .unwrap_or_else(|| panic!("feed 원장 레코드 부재: {led}"));
+        assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

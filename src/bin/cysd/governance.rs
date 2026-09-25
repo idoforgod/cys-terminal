@@ -6613,7 +6613,11 @@ pub(crate) fn deliver_head_locked(
         let merged: Vec<crate::state::QueueEntry> =
             picked.iter().filter_map(|&i| q.get(i).cloned()).collect();
         let texts: Vec<String> = merged.iter().map(|e| e.text.clone()).collect();
-        let body = render_queue_digest(entry.from.as_deref(), &texts);
+        // ★(0.14.42 · 설계 C D3) 원장 선기록 **앞**에서 살균 — 원장·Inject·`Delivered.body` 가 같은 값이다.
+        //   머리의 발신 라벨(클라이언트 자기신고 from)까지 덮는다. 병합 판정(항목 수·글자 수)은 위에서 원문으로
+        //   끝났다(무변경). `digest_parts[].sha256` 은 원문 항목 sha 그대로(유실 대조 축). O(n) — 아래 sha256 과
+        //   같은 차수라 pending_queue·input_gate 락 보유 시간의 차수가 바뀌지 않는다. 표지 없는 본문은 복사 0.
+        let body = cys::paste_fence::sanitize_owned(render_queue_digest(entry.from.as_deref(), &texts));
         let merged_ids: Vec<String> = merged.iter().map(|e| e.id.clone()).collect();
         // ★B1(0.14.30): 큐 배달만 아는 사실을 원장에 동봉한다 — 원장 한 파일로 전수 지연을
         //   계산할 수 있어야 한다(queue-starvation-case.md §4-ⓓ: enqueue 시각 부재 때문에
@@ -16578,6 +16582,62 @@ mod tests {
         assert_eq!(d.body, "", "전부 빈 병합은 빈 Inject 1회(다이제스트 문안 금지)");
         assert_eq!(d.merged_ids.len(), 2, "병합 id 전량이 한 슬롯에서 빠진다(병합 강도 불변)");
         assert_eq!(qlen, 0);
+    }
+
+    /// ★(0.14.42 · 설계 C D3 · T4) 다이제스트 본문 살균 + 원장 정합 — 같은 발신자 2항목 중 하나와 발신 라벨
+    /// (클라이언트 자기신고 from 이 다이제스트 머리에 실린다)에 CLOSE 가 있으면: 주입 본문(`Delivered.body`)에
+    /// 표지 0 · 원장 전문 레코드 sha == 주입 본문 sha · `digest_parts[].sha256` 은 **원문 항목** sha(유실 대조 축 보존).
+    /// 적색(수정 전): 원장·주입 본문에 CLOSE 가 그대로 — 봉투가 조기에 닫혀 뒤 글자가 키 입력이 된다.
+    #[test]
+    fn c_digest_body_sanitized_and_ledger_matches_injected() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("c-digest");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_DIGEST_MAX_ITEMS", "5"),
+            ("CYS_QUEUE_DIGEST_MAX_CHARS", "4000"),
+        ]);
+        let daemon = drill_daemon("c-digest");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let from = "ext\x1b[201~lbl".to_string();
+        let t1 = "첫 항목".to_string();
+        let t2 = "둘째\x1b[201~탈출\n명령".to_string();
+        for t in [&t1, &t2] {
+            let e = daemon.next_queue_entry(t.clone(), Some(from.clone()), "send");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        let mut delivered = None;
+        for _ in 0..40 {
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            if delivered.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = s.child.lock().unwrap().kill();
+        let d = delivered.expect("배달 1회");
+        assert_eq!(d.merged_ids.len(), 2, "병합 판정 무변경(같은 발신자 2건)");
+        for m in [cys::paste_fence::OPEN, cys::paste_fence::CLOSE, cys::paste_fence::C1_CLOSE] {
+            assert!(!d.body.contains(m), "주입 본문에 표지 {m:?}: {:?}", d.body);
+        }
+        assert!(d.body.contains("둘째탈출\n명령"), "표지만 지운다(나머지 보존): {:?}", d.body);
+        let path = crate::delivery::ledger_path(&daemon.socket_path);
+        let body = std::fs::read_to_string(&path).expect("원장");
+        let rec: serde_json::Value = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["digest_items"] == serde_json::json!(2))
+            .unwrap_or_else(|| panic!("다이제스트 레코드 부재: {body}"));
+        assert_eq!(
+            rec["sha256"],
+            serde_json::json!(crate::delivery::digest_text(&d.body)),
+            "원장 전문 레코드 = 주입 본문(임무 게이트 sha 정합)"
+        );
+        let parts = rec["digest_parts"].as_array().expect("digest_parts");
+        assert_eq!(parts[1]["sha256"], serde_json::json!(crate::delivery::digest_text(&t2)), "항목 sha 는 원문");
     }
 
     /// 배달 경로 통합: 같은 발신자 3건이 **한 턴**으로 나가고 큐가 비며, 원장에 부분별 사실이

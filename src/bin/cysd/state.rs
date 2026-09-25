@@ -5606,7 +5606,11 @@ fn inject_write<W: Write>(
         writer.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(clear_settle_ms()));
     }
-    writer.write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes())?;
+    // ★(0.14.42 · 설계 C D2) 백스톱 — Inject 생산자 전부(큐 다이제스트·clear_first·CEO·스케줄·채널·부트 통보·
+    //   승계 고지 등)를 한 곳에서 덮는다. 본문 안 표지(`ESC[201~`·C1 형)와 끝 미완성 이스케이프가 봉투를 조기에
+    //   닫아 뒤 글자가 키 입력(줄바꿈=제출 · ESC=취소)이 되던 결함을 막는다. 표지가 없고 끝이 완결인 본문은
+    //   종전 `format!("\x1b[200~{text}\x1b[201~")` 과 **바이트가 같다**(`/clear` 포함 — 무clear 무변경).
+    writer.write_all(cys::paste_fence::wrap(text).as_bytes())?;
     writer.flush()?;
     std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms));
     writer.write_all(b"\r")?;
@@ -6667,6 +6671,50 @@ mod tests {
                 .is_ok(),
             "모든 sender drop 시 writer 루프가 종료돼야 한다"
         );
+    }
+
+    /// ★(0.14.42 · 설계 C D2 · T2/T3) Inject 백스톱 — 본문 안 CLOSE(`ESC[201~`)·C1 CLOSE·끝 미완성
+    /// 이스케이프가 봉투를 조기에 닫지 않는다. 적색(수정 전): CLOSE 2개(본문 것이 봉투를 먼저 닫는다).
+    /// 회귀 핀(전후 녹색): 표지 없는 본문은 종전 바이트 그대로(`/clear` 와 같은 꼴).
+    #[test]
+    fn c_inject_backstop_sanitizes_fence_markers_in_body() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let run = |text: &str| -> Vec<u8> {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = sync_channel::<WriteReq>(2);
+            let stop = Arc::new(AtomicBool::new(false));
+            let w = SharedBuf(Arc::clone(&buf));
+            let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+            tx.send(WriteReq::Inject { text: text.into(), cr_delay_ms: 0, clear_first: false, guard: None })
+                .unwrap();
+            drop(tx);
+            handle.join().ok();
+            let out = buf.lock().unwrap().clone();
+            out
+        };
+        let count = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).filter(|w| *w == needle).count();
+        // T3 회귀 핀: 표지 없는 본문 = 종전 바이트.
+        assert_eq!(run("hi"), b"\x1b[200~hi\x1b[201~\r".to_vec());
+        assert_eq!(run("/clear"), b"\x1b[200~/clear\x1b[201~\r".to_vec());
+        // T2 적색→녹색: 본문 안 CLOSE · C1 CLOSE · 끝 미완성 이스케이프.
+        for body in ["M1\x1b[201~M2\nM3", "X1\u{9b}201~X2\nX3", "tail\x1b[1"] {
+            let out = run(body);
+            assert_eq!(count(&out, b"\x1b[200~"), 1, "OPEN 1개: {body:?} → {:?}", String::from_utf8_lossy(&out));
+            assert_eq!(count(&out, b"\x1b[201~"), 1, "CLOSE 1개(본문 것이 봉투를 먼저 닫으면 2개): {body:?}");
+            assert_eq!(count(&out, "\u{9b}201~".as_bytes()), 0, "C1 CLOSE 0: {body:?}");
+            assert!(out.ends_with(b"\x1b[201~\r"), "CLOSE 는 제출 CR 바로 앞 하나뿐: {body:?}");
+        }
+        assert_eq!(run("tail\x1b[1"), b"\x1b[200~tail\x1b[201~\r".to_vec(), "끝 미완성 이스케이프 절단");
     }
 
     /// 불변식 박제: clear_first Inject은 한 writer arm에서 Ctrl-U(선정리)→bracketed paste→CR을
