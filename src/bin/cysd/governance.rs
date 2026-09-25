@@ -157,6 +157,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         // ★G1(W2-D): 기아 경보(queue.starved) 전용 쿨다운 — depth_high 맵과 별도 축.
         let mut queue_starve_alerted: HashMap<u64, f64> = HashMap::new();
+        // ★(0.14.42 · 설계 H1) quiescing 상한 초과 통지 래치 — (좌석 → 통지한 updated_at). 같은 규율(태스크 로컬).
+        let mut queue_quiesce_stale: HashMap<u64, f64> = HashMap::new();
         // ★G2(W3-A): role 데드맨 상태 — watchdog 태스크 로컬(단일 writer). 구 단일 f64
         // 디바운스에서 role별 {misses·last_ok·death/idle 디바운스·좌석 점유 관측} 맵으로 승격.
         let mut deadman = DeadmanTracker::default();
@@ -196,7 +198,12 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
-                deliver_queued(&daemon, &mut queue_depth_alerted, &mut queue_starve_alerted);
+                deliver_queued(
+                    &daemon,
+                    &mut queue_depth_alerted,
+                    &mut queue_starve_alerted,
+                    &mut queue_quiesce_stale,
+                );
                 reap_orphan_ledger(&daemon, &sys);
                 reap_exited_surfaces(&daemon);
                 reap_zombie_surfaces(&daemon, &sys, &mut zombie_miss);
@@ -237,6 +244,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 );
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 queue_starve_alerted.retain(|sid, _| live_surface_ids.contains(sid));
+                queue_quiesce_stale.retain(|sid, _| live_surface_ids.contains(sid));
                 // ★(U-16) 관문 스캔의 좌석 키 맵도 같은 규약으로 솎는다.
                 scan_caches.prune_surfaces(&live_surface_ids);
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
@@ -6100,6 +6108,10 @@ pub(crate) const BLOCKED_PROMPT_UNKNOWN: &str = "prompt_unknown(프롬프트 경
 pub(crate) const BLOCKED_PROMPT_NOT_READY: &str = "prompt_not_ready(프롬프트 경계 미도달)";
 pub(crate) const BLOCKED_ALT_SCREEN: &str = "alt_screen(전체화면 · 프롬프트 레이아웃 미확인)";
 pub(crate) const BLOCKED_INTERVAL: &str = "delivery_interval(배달 최소 간격)";
+/// ★(0.14.42 · 설계 H1) 좌석이 사이클 창(`/clear`~RESUME · `agent_status.state=="quiescing"`)이다 — 큐 **틱**
+/// 배달을 상한([`queue_quiesce_hold_secs`] · 기본 600s) 안에서만 보류한다. 운영자 강제 배달(`queue.deliver`)과
+/// 직접 send 는 이 사유로 막히지 않는다.
+pub(crate) const BLOCKED_QUIESCING: &str = "quiescing(사이클 진행 중 · /clear~RESUME 창)";
 /// ★(0.14.31 · triage 2026-09-08 · #7 의 값싼 부분) 이 틱의 인계 결판 예산이 바닥났다 —
 /// **원장 선기록·writer 인계를 시작하기 전에** 건너뛴다. 종전에는 예산이 0 이어도 좌석마다
 /// 선기록(fsync 동반)과 `try_send` 가 먼저 돌고 `settle` 단계에서야 예산을 봤다 = 영수증 없는
@@ -8884,6 +8896,7 @@ fn deliver_queued(
     daemon: &Arc<Daemon>,
     depth_alerted: &mut HashMap<u64, f64>,
     starve_alerted: &mut HashMap<u64, f64>,
+    quiesce_stale: &mut HashMap<u64, f64>,
 ) {
     // ★(0.14.31 · 리뷰 R2 · codex major) 이 틱 전체의 인계 결판 예산을 세운다(RAII).
     let _settle_budget = TickSettleBudget::begin();
@@ -8929,6 +8942,8 @@ fn deliver_queued(
     let max_wait = queue_max_wait_secs();
     let overdue_quiet = queue_overdue_quiet_secs();
     let base_min_interval = queue_min_interval_secs();
+    // ★(0.14.42 · 설계 H1) quiescing 보류 상한 — 틱당 1회(판정 재료 고정).
+    let quiesce_hold = queue_quiesce_hold_secs();
     // ★B1(0.14.30): 어댑터 정의는 **틱당 1회**만 읽는다(좌석마다 읽으면 같은 틱 안에서 판정이
     //   갈린다 — check_approvals 의 env 1회 로드 규약과 동형). 큐가 전부 비면 아래 루프가
     //   먼저 continue 하므로 평시 비용은 0 이다(지연 로드).
@@ -9013,6 +9028,39 @@ fn deliver_queued(
         {
             block("empty_seat(좌석에 에이전트 미연결)");
             continue;
+        }
+        // ★(0.14.42 · 설계 H1) 사이클 창(quiescing) 동안 큐 **틱** 배달을 보류한다.
+        //   【왜】 cycle-agent 는 `/clear` 직전에 quiescing 을 켜고 RESUME 주입(`inject_text`)이 돌아오면 곧바로
+        //   끈다(cys.rs cycle). 그 창에서 큐 항목이 나가면 지침 없는 새 세션에 떨어진다(ⓕ). 스케줄 push 가
+        //   quiescing 을 보고 큐로 우회해도(H2) 이 게이트가 없으면 그 항목이 창 안에서 바로 나간다.
+        //   【상한】 [`queue_quiesce_hold_secs`](기본 600s) 를 넘긴 quiescing 은 고아다(해제 실패) — 무시하고 배달하며
+        //   `queue.quiesce_stale` 을 (좌석, updated_at) 쌍마다 1회 낸다. 교착은 없다: cycle 은 `inject_text` 가
+        //   돌아오면 대기 없이 해제하고, 타이핑 폴백으로 `--queued` 가 된 RESUME 도 해제 뒤 FIFO 로 나간다.
+        //   【범위】 틱만이다. 운영자 강제 배달(`force_deliver_entry`)·직접 send 는 무변경(운영자 권한 · ② 무clear 방지).
+        //   【부분 봉합】 에이전트 `set-status` 가 quiescing 을 덮어쓰면 일찍 풀린다 — 그때는 종전 동작이다.
+        let quiescing_since = s
+            .agent_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|st| st.state == "quiescing")
+            .map(|st| st.updated_at);
+        if let Some(since) = quiescing_since {
+            let age = now_epoch() - since;
+            if quiesce_hold_active(Some(age), quiesce_hold) {
+                block(BLOCKED_QUIESCING);
+                continue;
+            }
+            if quiesce_hold > 0 && quiesce_stale.get(&s.id) != Some(&since) {
+                quiesce_stale.insert(s.id, since);
+                daemon.bus.publish(
+                    "queue.quiesce_stale",
+                    "queue",
+                    Some(s.id),
+                    json!({"surface_id": s.id, "age_secs": age.round(), "hold_secs": quiesce_hold,
+                           "note": "quiescing 이 보류 상한을 넘겼다(사이클 해제 누락 의심) — 무시하고 배달한다"}),
+                );
+            }
         }
         // ★(0.14.31 · WP-5) surface 당 배달 최소 간격 — 프롬프트 관측보다 **앞**(직전 배달의 에코·
         //   처리 화면을 초안·바쁨으로 오라벨하지 않는다). 선판정은 사유 라벨용 · 권위는 임계영역.
@@ -13073,7 +13121,7 @@ mod tests {
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)"
@@ -13096,7 +13144,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -13131,7 +13179,7 @@ mod tests {
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "커서 뒤 제안문을 입력으로 오판하면 배달이 영구 보류된다(2026-09-03 13:27~15:37 실사고)"
@@ -13154,7 +13202,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
     }
 
@@ -13173,7 +13221,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -13200,7 +13248,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -13337,7 +13385,7 @@ mod tests {
 
     fn tick(daemon: &Arc<Daemon>) {
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(daemon, &mut depth, &mut starve);
+        deliver_queued(daemon, &mut depth, &mut starve, &mut HashMap::new());
     }
 
     fn blocked_reason(s: &Arc<crate::state::Surface>) -> String {
@@ -17025,7 +17073,7 @@ mod tests {
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -17070,7 +17118,7 @@ mod tests {
         *s.last_human_input.lock().unwrap() = None;
         let want_id = s.pending_queue.lock().unwrap().front().unwrap().id.clone();
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(s.pending_queue.lock().unwrap().is_empty(), "배달 전제 미충족");
         let path = crate::delivery::ledger_path(&daemon.socket_path);
         let body = std::fs::read_to_string(&path).expect("배달 원장 파일");
@@ -17119,7 +17167,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(10);
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         let blocked = s.queue_blocked.lock().unwrap().clone();
         assert!(
             blocked
@@ -17129,7 +17177,7 @@ mod tests {
         );
         // 입력줄을 비우면 같은 좌석이 배달되고 사유는 사라진다.
         paint_prompt(&s, "", "");
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(s.pending_queue.lock().unwrap().is_empty(), "해소 후 배달 실패");
         assert!(
             s.queue_blocked.lock().unwrap().is_none(),
@@ -17289,7 +17337,7 @@ mod tests {
         *s.last_human_input.lock().unwrap() = None;
         let mut depth = HashMap::new();
         let mut starve = HashMap::new();
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -17301,7 +17349,7 @@ mod tests {
         );
         *s.last_output.lock().unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(4);
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "quiet 3s+ 는 현행대로 배달"
@@ -17357,7 +17405,7 @@ mod tests {
         *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
         let mut depth = HashMap::new();
         let mut starve = HashMap::new();
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
@@ -17367,7 +17415,7 @@ mod tests {
         *s.last_human_input.lock().unwrap() = None;
         *s.last_output.lock().unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(2);
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "overdue 단계: 완화 quiet(1s)로 제한 배달"
@@ -17418,7 +17466,7 @@ mod tests {
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         let mut depth = HashMap::new();
         let mut starve = HashMap::new();
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(starved_count(&daemon), 1, "임계 도달 막힘 → queue.starved 1회");
         let ev = daemon
             .bus
@@ -17435,14 +17483,14 @@ mod tests {
         );
         // 막힘 지속 → 쿨다운 내 재발행 억제.
         *s.last_output.lock().unwrap() = std::time::Instant::now();
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert_eq!(starved_count(&daemon), 1, "쿨다운(5분) 내 재발행 억제");
         assert!(starve.contains_key(&s.id));
         // 막힘 해제 → 배달 → 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보 가능).
         *s.last_output.lock().unwrap() =
             std::time::Instant::now() - std::time::Duration::from_secs(4);
         *s.last_human_input.lock().unwrap() = None;
-        deliver_queued(&daemon, &mut depth, &mut starve);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(s.pending_queue.lock().unwrap().is_empty(), "막힘 해제 후 정상 배달");
         assert!(
             !starve.contains_key(&s.id),
@@ -21587,5 +21635,147 @@ mod h_machine_hold_tests {
         let fake = "fn legit() {}\nfn sneaky_producer(x: u8) {\n    let _ = WriteReq::Inject { text, cr_delay_ms: 0, clear_first: false, guard: None };\n}\n// fn commented() { guard: None }\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = X { guard: None }; }\n}\nfn after_tests() {}\n";
         let got = guard_none_producers("fake", fake);
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod h1_queue_quiesce_tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AO;
+
+    fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, AO::Relaxed);
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-h1-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_epoch() as u64,
+            n
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("좌석");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        std::thread::sleep(std::time::Duration::from_millis(600)); // 초기 셸 출력 안정화
+        (daemon, s)
+    }
+
+    fn set_state(s: &Arc<crate::state::Surface>, state: &str, age: f64) {
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: state.into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch() - age,
+        });
+    }
+
+    /// 마커 없는 좌석의 quiet 규칙(3s)을 통과하는 출력 정적 · 사람 흔적 없음. 직전 배달의 writer(본문 → 500ms →
+    /// CR)와 그 에코가 끝난 뒤에 찍는다(에코가 스탬프를 덮으면 busy 로 보류된다).
+    fn quiet(s: &Arc<crate::state::Surface>) {
+        let t0 = std::time::Instant::now();
+        while s.pending_input_bytes.load(AO::Relaxed) > 0 && t0.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        *s.last_output.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(4);
+        *s.last_human_input.lock().unwrap() = None;
+    }
+
+    fn events(d: &Arc<Daemon>, name: &str) -> usize {
+        d.bus.tail(300).iter().filter(|ev| ev["name"] == name).count()
+    }
+
+    /// [H1] quiescing 이면 틱 배달 보류(BLOCKED_QUIESCING · 인계 0) → 해제 뒤 다음 틱 배달.
+    /// 700s 묵은 quiescing 은 무시하고 배달하며 `queue.quiesce_stale` 은 (좌석, updated_at) 마다 정확히 1회.
+    /// 노브 0 이면 축이 꺼진다. RED(HEAD): quiescing 중에도 배달한다.
+    #[test]
+    fn h1_quiescing_blocks_tick_then_releases() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "0"), ("CYS_QUEUE_MIN_INTERVAL_SECS", "0")]);
+        let (d, s) = rig("h1-block");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("사이클 창 안 항목".into(), None, "test"));
+        set_state(&s, "quiescing", 1.0);
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "quiescing 중 틱 배달이 나갔다");
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().map(|(w, _)| w.clone()), Some(BLOCKED_QUIESCING.to_string()));
+        assert_eq!(h_ledger_count(&d, "queue"), 0, "인계(원장 선기록)가 없어야 한다");
+        // 해제(cycle 이 inject_text 반환 뒤 끈다) → 다음 틱 배달.
+        set_state(&s, "working", 0.0);
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "해제 뒤 배달되지 않았다");
+        assert_eq!(h_ledger_count(&d, "queue"), 1);
+        std::thread::sleep(std::time::Duration::from_millis(900)); // writer: 본문 → 500ms → CR
+        // 700s 묵은 quiescing(고아) → 무시하고 배달 + quiesce_stale 1회.
+        // 발신자를 갈라 병합(같은 발신자 연속 ≤5)을 피한다 — 틱마다 1건씩 나가야 stale 1회를 잴 수 있다.
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("고아 창 1".into(), Some("h1:a".into()), "test"));
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("고아 창 2".into(), Some("h1:b".into()), "test"));
+        set_state(&s, "quiescing", 700.0);
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "상한을 넘긴 quiescing 은 보류 근거가 아니다");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty());
+        assert_eq!(events(&d, "queue.quiesce_stale"), 1, "quiesce_stale 은 (좌석, updated_at) 쌍마다 1회");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        // 노브 0 → 축 끔(신선한 quiescing 이어도 배달 · stale 통지 없음).
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("노브 0".into(), None, "test"));
+        set_state(&s, "quiescing", 1.0);
+        quiet(&s);
+        {
+            let _k = HKnobGuard::set(&[("CYS_QUEUE_QUIESCE_HOLD_SECS", "0")]);
+            deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        }
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "노브 0 인데 보류했다");
+        assert_eq!(events(&d, "queue.quiesce_stale"), 1, "노브 0 은 stale 통지 대상이 아니다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H1] 운영자 강제 배달(`queue.deliver` 본체)은 quiescing 중에도 배달한다 — 운영자 권한 · 무변경.
+    #[test]
+    fn h1_force_deliver_unaffected() {
+        let (d, s) = rig("h1-force");
+        let e = d.next_queue_entry("운영자 강제".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e.clone());
+        set_state(&s, "quiescing", 1.0);
+        quiet(&s);
+        let got = force_deliver_entry(&d, &s, None, false).expect("강제 배달이 quiescing 에 막혔다");
+        assert_eq!(got.entry.id, e.id);
+        assert!(s.pending_queue.lock().unwrap().is_empty());
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// [H1 교착 음성] cycle 순서 재현 — quiescing set → RESUME `--queued` 적재(타이핑 폴백) → quiescing 해제 →
+    /// 다음 틱에 RESUME 정확히 1회 배달(해제가 inject_text 반환 뒤 대기 0 이므로 교착이 없다).
+    #[test]
+    fn h1_resume_fallback_not_deadlocked() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (d, s) = rig("h1-resume");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        set_state(&s, "quiescing", 0.0);
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("[RESUME] 이어서".into(), None, "send"));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "창 안에서는 보류");
+        set_state(&s, "working", 0.0); // cycle 해제
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "해제 뒤 RESUME 이 나가지 않았다(교착)");
+        let delivered = d.bus.tail(100).iter().filter(|ev| ev["name"] == "queue.delivered").count();
+        assert_eq!(delivered, 1, "RESUME 정확히 1회");
+        let _ = s.child.lock().unwrap().kill();
     }
 }
