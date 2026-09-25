@@ -92,11 +92,6 @@ pub fn decide_gate(env: Option<&str>, marker: bool) -> Option<DisabledBy> {
     }
 }
 
-/// `decide_gate` 의 불리언 형(켬 = true).
-pub fn raise_enabled(env: Option<&str>, marker: bool) -> bool {
-    decide_gate(env, marker).is_none()
-}
-
 /// 상향 시도의 결과 — 모든 칸이 로그 한 줄로 남는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -214,6 +209,11 @@ mod tests {
     use std::cell::Cell;
 
     const INF: rlim_t = libc::RLIM_INFINITY;
+
+    /// `decide_gate` 의 불리언 형(켬 = true) — 진리표 검체 전용(프로덕션은 `raise` 가 decide_gate 를 직접 쓴다).
+    fn raise_enabled(env: Option<&str>, marker: bool) -> bool {
+        decide_gate(env, marker).is_none()
+    }
 
     /// U1 — soft_target 진리표(sys_cap 축 포함). never-lower · hard 불변 · clamp.
     #[test]
