@@ -2257,6 +2257,57 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// ★(0.14.42 · R3-3) 정착 증명 창(ms). 기계 제출 스탬프가 이 창 안이면 화면 점유 거부에 증명을 붙인다.
+/// 근거: 스탬프 뒤 CR 은 writer 가 `cr_min_gap_ms`(150) 이내(+writer 적체)에 쓰고, CLI 정착 예산은 ≤360ms 다.
+/// 창이 지나면 증명이 붙지 않아 CLI 는 종전대로 곧바로 큐로 간다(실패 방향 = v0.14.41).
+const SEND_SETTLE_WINDOW_MS: u64 = 1000;
+
+/// ★(0.14.42 · R3-3) 화면 점유 거부에 **정착 증명**을 붙이는가(순수).
+///
+/// 참 = Text ∧ ScreenOccupied ∧ unix ∧ 기계 제출 뒤 `age_ms` ≤ 창 ∧ 끔 아님. 뜻: 커서행 점유자는 방금 기계
+/// Return 이 제출한 줄의 렌더 잔상이다(그 CR 은 writer FIFO 에서 다음 본문보다 먼저 쓰인다). 증명이 없는
+/// 점유(복원 초안·TUI 내부 초안 = 진짜 점유)에는 붙지 않아 CLI 재시도가 0회다 — 맹목 재표본이 D-12 화면 축
+/// fail-open 노출을 표본 수에 비례해 키우던 경로(실측 14.7%→31.3%→51.3%)를 구조적으로 닫는다.
+/// Text 만 증명한다(SubmitKey·ClearFirst·CancelKey 무변경 · clear_first 는 재시도하지 않는다 = 무clear 무관).
+/// `platform_ok` = `cfg!(unix)` — 윈도우 응답 바이트는 v0.14.41 과 같다. 비싼 판정(`disabled` = 센티널
+/// stat)은 **맨 뒤**라 앞 조건이 거짓이면 호출하지 않는다(드문 거부 경로에서도 stat 0회).
+fn send_settle_tag_applies(
+    kind: DirectSendKind,
+    why: DraftGateDenied,
+    platform_ok: bool,
+    age_ms: Option<u64>,
+    disabled: impl FnOnce() -> bool,
+) -> bool {
+    platform_ok
+        && kind == DirectSendKind::Text
+        && why == DraftGateDenied::ScreenOccupied
+        && age_ms.is_some_and(|a| a <= SEND_SETTLE_WINDOW_MS)
+        && !disabled()
+}
+
+/// ★(0.14.42 · R3-3) 정착 증명 킬 스위치(A2 `direct_fence_disabled` 와 같은 형태). 끔 = env `CYS_SEND_SETTLE`
+/// 이 0/false/off ∨ `state_dir(socket)/send-settle-off` 가 있음 ∨ NotFound 가 아닌 stat 오류(판정 불가 →
+/// 끔 = v0.14.41 동작). 거부마다 stat 하므로 센티널은 **재기동 없이** 다음 거부부터 먹고, 지우면 복귀한다.
+/// 주 데몬·부서 데몬은 각자 자기 state_dir 을 본다.
+fn send_settle_disabled(daemon: &Daemon) -> bool {
+    send_settle_disabled_at(
+        std::env::var("CYS_SEND_SETTLE").ok().as_deref(),
+        &crate::state::state_dir(&daemon.socket_path).join("send-settle-off"),
+    )
+}
+
+/// [`send_settle_disabled`] 의 순수 경로 판정(env 값·센티널 경로 주입 — 검체 시임).
+fn send_settle_disabled_at(env: Option<&str>, sentinel: &std::path::Path) -> bool {
+    if cys::send_settle_env_off(env) {
+        return true;
+    }
+    match std::fs::symlink_metadata(sentinel) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 /// D-12 거부 관측·응답의 단일 경로. leaf 락을 놓은 뒤 이벤트를 1건 발행한다.
 fn draft_gate_denied_response(
     daemon: &Daemon,
@@ -2269,6 +2320,10 @@ fn draft_gate_denied_response(
 ) -> Value {
     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
+    // ★(0.14.42 · R3-3) 정착 증명 — 원자 load 1회 + (참 경로에서만) 센티널 stat 1회. 판정(`why`)은 바꾸지 않는다.
+    let settling = send_settle_tag_applies(kind, why, cfg!(unix), surface.machine_submit_age_ms(), || {
+        send_settle_disabled(daemon)
+    });
     daemon.bus.publish(
         "queue.draft_gate_denied",
         "queue",
@@ -2285,6 +2340,8 @@ fn draft_gate_denied_response(
             "pending_input_bytes": pending,
             "pending_input_human_bytes": human,
             "from": verified_from.map(cys::surface_ref),
+            // 가산 키(R3-3) — 이 거부에 정착 증명을 붙였는가. 구 데몬 이벤트에는 없다(결측 ≠ false).
+            "settling": settling,
         }),
     );
     // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다(Text/SubmitKey/ClearFirst 접두 보존).
@@ -2294,6 +2351,11 @@ fn draft_gate_denied_response(
         _ => cys::MSG_TYPING_GUARD,
     };
     let mut message = format!("{base} [{}:{}]", cys::DRAFT_GATE_TAG, why.as_str());
+    // ★(0.14.42 · R3-3) 증명이 있을 때만 접미 1개 — 없으면 응답 바이트가 v0.14.41 과 같다.
+    if settling {
+        message.push(' ');
+        message.push_str(cys::SEND_SETTLE_TAG);
+    }
     if let Some(hint) = hint {
         message.push(' ');
         message.push_str(hint);
@@ -14040,7 +14102,257 @@ mod tests {
                 "pending_input_bytes": 11,
                 "pending_input_human_bytes": 11,
                 "from": cys::surface_ref(sender.id),
+                // ★(0.14.42 · R3-3) 가산 키 — 사람 초안·Text 외 kind 는 정착 증명 대상이 아니다.
+                "settling": false,
             }));
+        }
+    }
+
+    // ── ★(0.14.42 · R3-3) 정착 증명(T5·T6) ─────────────────────────────────────────────
+
+    /// T5 — 부착 판정 진리표(순수). 참 = Text ∧ ScreenOccupied ∧ unix ∧ age ≤ 1000 ∧ 끔 아님.
+    /// 앞 조건이 거짓이면 비싼 판정(킬 스위치 stat)은 **호출 0회**.
+    #[test]
+    fn r33_send_settle_tag_applies_truth_table() {
+        use crate::governance::{DirectSendKind as K, DraftGateDenied as W};
+        let calls = std::cell::Cell::new(0u32);
+        let dis = |v: bool| {
+            let c = &calls;
+            move || {
+                c.set(c.get() + 1);
+                v
+            }
+        };
+        assert_eq!(SEND_SETTLE_WINDOW_MS, 1000);
+        for age in [0, 1, 999, 1000] {
+            assert!(send_settle_tag_applies(K::Text, W::ScreenOccupied, true, Some(age), dis(false)), "age {age}");
+        }
+        assert_eq!(calls.replace(0), 4, "참 경로에서만 킬 스위치를 본다");
+        let falses: Vec<(&str, K, W, bool, Option<u64>)> = vec![
+            ("age 1001", K::Text, W::ScreenOccupied, true, Some(1001)),
+            ("age None(결측)", K::Text, W::ScreenOccupied, true, None),
+            ("SubmitKey", K::SubmitKey, W::ScreenOccupied, true, Some(0)),
+            ("ClearFirst", K::ClearFirst, W::ScreenOccupied, true, Some(0)),
+            ("CancelKey", K::CancelKey, W::ScreenOccupied, true, Some(0)),
+            ("PendingInput", K::Text, W::PendingInput { bytes: 3 }, true, Some(0)),
+            ("HumanDraft", K::Text, W::HumanDraft { bytes: 3 }, true, Some(0)),
+            ("Modal", K::Text, W::Modal, true, Some(0)),
+            ("platform_ok=false(윈도우)", K::Text, W::ScreenOccupied, false, Some(0)),
+        ];
+        for (name, kind, why, platform_ok, age) in falses {
+            assert!(!send_settle_tag_applies(kind, why, platform_ok, age, dis(false)), "{name}");
+        }
+        assert_eq!(calls.get(), 0, "앞 조건이 거짓이면 disabled 클로저는 호출 0회");
+        assert!(!send_settle_tag_applies(K::Text, W::ScreenOccupied, true, Some(0), dis(true)), "끔");
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// T5 — 킬 스위치(순수 경로 판정): env 0/false/off · 센티널 있음 · NotFound 아닌 stat 오류 → 끔, 부재 → 켬.
+    #[test]
+    fn r33_send_settle_kill_switch() {
+        let dir = std::env::temp_dir().join(format!("cys-r33-ks-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("send-settle-off");
+        assert!(!send_settle_disabled_at(None, &sentinel), "부재 → 켬");
+        assert!(!send_settle_disabled_at(Some("1"), &sentinel), "env 1 → 켬");
+        assert!(!send_settle_disabled_at(Some(""), &sentinel), "env 빈 값 → 켬");
+        for v in ["0", "false", "off", " OFF "] {
+            assert!(send_settle_disabled_at(Some(v), &sentinel), "env {v:?} → 끔");
+        }
+        std::fs::write(&sentinel, b"").unwrap();
+        assert!(send_settle_disabled_at(None, &sentinel), "센티널 → 끔");
+        std::fs::remove_file(&sentinel).unwrap();
+        assert!(!send_settle_disabled_at(None, &sentinel), "센티널 제거 → 복귀(재기동 불필요)");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let denied = send_settle_disabled_at(None, &locked.join("send-settle-off"));
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(denied, "stat 권한 오류 → 끔(실패 방향 = v0.14.41)");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn r33_paint_prompt(s: &Arc<crate::state::Surface>, line: &str) {
+        let mut parser = s.parser.lock().unwrap();
+        parser.process(b"\x1b[2J\x1b[H");
+        parser.process(line.as_bytes());
+        parser.process(format!("\x1b[1;{}H", line.chars().count() + 1).as_bytes());
+    }
+
+    fn r33_stamp_machine_submit(s: &Arc<crate::state::Surface>) {
+        let _gate = s.input_gate.lock().unwrap();
+        s.apply_pending_input(b"M|1|AAAA", crate::governance::InputOrigin::Machine);
+        s.apply_pending_input(b"\r", crate::governance::InputOrigin::Machine);
+    }
+
+    /// T5 — 응답·이벤트(실제 dispatch). 증명 없음 → 문면이 v0.14.41 과 **바이트 동일** · 증명 → 기존 문면 +
+    /// ` [settle:recent_submit]` · 이벤트는 `settling` 키만 가산. 센티널은 재기동 없이 끄고 지우면 복귀한다.
+    /// SubmitKey·계수 초안·창 밖(1.2초) 점유에는 증명이 붙지 않는다.
+    #[test]
+    fn r33_draft_gate_response_carries_settle_tag_only_when_proven() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        let (daemon, dir) = daemon_with_acl("r33-settle", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_700;
+        let sender = v7_pane(&daemon, "worker-2", pid);
+        let base = format!("{} [{}:screen_occupied]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
+        let sentinel = crate::state::state_dir(&daemon.socket_path).join("send-settle-off");
+        type Prep<'a> = &'a dyn Fn(&Arc<crate::state::Surface>);
+        let mut obs: Vec<(&str, Value, Vec<Value>)> = Vec::new();
+        let mut run = |name: &'static str, offset: u32, stamp: bool, prep: Prep, method: &str, extra: Value| {
+            // 각각 새 pane: 직전 send 의 비동기 PTY 에코가 다음 화면 픽스처를 덮지 않는다.
+            let target = v7_pane(&daemon, "worker-1", pid + offset);
+            *target.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *target.last_human_input.lock().unwrap() = None;
+            if stamp {
+                r33_stamp_machine_submit(&target);
+            }
+            prep(&target);
+            r33_paint_prompt(&target, "❯ M|1|AAAA");
+            let mut params = json!({"surface_id": target.id, "quiet": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let seq = daemon.bus.replay_after(0).last().map(|e| e["seq"].as_u64().unwrap()).unwrap_or(0);
+            let resp = d12_rpc(&daemon, pid, method, params);
+            let events: Vec<Value> = daemon.bus.replay_after(seq).into_iter()
+                .filter(|e| e["name"] == "queue.draft_gate_denied").map(|e| e["payload"].clone()).collect();
+            obs.push((name, resp, events));
+        };
+        let text = json!({"text": "M|2|BBBB", "human": false, "queued": false});
+        run("증명 없음(정적 초안)", 1, false, &|_| {}, "surface.send_text", text.clone());
+        run("증명(방금 기계 제출)", 2, true, &|_| {}, "surface.send_text", text.clone());
+        run("센티널 끔", 3, true, &|_| std::fs::write(&sentinel, b"").unwrap(), "surface.send_text", text.clone());
+        run("센티널 제거 → 복귀", 4, true, &|_| std::fs::remove_file(&sentinel).unwrap(), "surface.send_text", text.clone());
+        run("SubmitKey 는 증명 밖", 5, true, &|_| {}, "surface.send_key", json!({"key": "Return"}));
+        run("계수 초안(PendingInput)", 6, true, &|t| {
+            let _gate = t.input_gate.lock().unwrap();
+            t.apply_pending_input(b"xyz", crate::governance::InputOrigin::Machine);
+        }, "surface.send_text", text.clone());
+        // 창 밖: 스탬프를 1.2초 전으로 당긴다(단조 기준점이 그보다 젊으면 먼저 기다린다).
+        let now = crate::state::settle_mono_ms();
+        if now < 1_300 {
+            std::thread::sleep(std::time::Duration::from_millis(1_300 - now));
+        }
+        run("창 밖(1.2초)", 7, false, &|t| {
+            t.machine_submit_ms.store(crate::state::settle_mono_ms() - 1_200, Ordering::Relaxed);
+        }, "surface.send_text", text.clone());
+        drop(run);
+        d12_cleanup(&daemon, &dir);
+        let _ = sender;
+
+        let msg = |r: &Value| r["error"]["message"].as_str().unwrap_or_default().to_string();
+        let (_, r, ev) = &obs[0];
+        d12_assert_denied(r, "screen_occupied");
+        assert_eq!(msg(r), base, "증명 없음 → v0.14.41 문면 바이트 동일");
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["settling"], json!(false));
+        let (_, r, ev) = &obs[1];
+        d12_assert_denied(r, "screen_occupied");
+        assert_eq!(msg(r), format!("{base} {}", cys::SEND_SETTLE_TAG), "증명 → 접미 1개");
+        assert_eq!(ev.len(), 1, "거부 이벤트는 요청당 1건 그대로");
+        assert_eq!(ev[0]["settling"], json!(true));
+        let mut expect_keys: Vec<&str> = ev[0].as_object().unwrap().keys().map(String::as_str).collect();
+        expect_keys.sort_unstable();
+        assert_eq!(
+            expect_keys,
+            ["from", "kind", "pending_input_bytes", "pending_input_human_bytes", "reason", "settling", "surface_ref"],
+            "이벤트는 settling 키만 가산"
+        );
+        let (_, r, ev) = &obs[2];
+        assert_eq!(msg(r), base, "센티널 → 증명 끔");
+        assert_eq!(ev[0]["settling"], json!(false));
+        let (_, r, ev) = &obs[3];
+        assert_eq!(msg(r), format!("{base} {}", cys::SEND_SETTLE_TAG), "센티널 제거 → 재기동 없이 복귀");
+        assert_eq!(ev[0]["settling"], json!(true));
+        let (_, r, ev) = &obs[4];
+        d12_assert_denied(r, "screen_occupied");
+        assert!(!msg(r).contains(cys::SEND_SETTLE_TAG), "SubmitKey 에는 증명 없음: {}", msg(r));
+        assert_eq!(ev[0]["kind"], json!("submit_key"));
+        assert_eq!(ev[0]["settling"], json!(false));
+        let (_, r, ev) = &obs[5];
+        d12_assert_denied(r, "pending_input");
+        assert!(!msg(r).contains(cys::SEND_SETTLE_TAG), "계수 초안에는 증명 없음: {}", msg(r));
+        assert_eq!(ev[0]["settling"], json!(false));
+        let (_, r, ev) = &obs[6];
+        d12_assert_denied(r, "screen_occupied");
+        assert_eq!(msg(r), base, "창 밖 점유 → 증명 없음");
+        assert_eq!(ev[0]["settling"], json!(false));
+    }
+
+    /// T5 배선 — 실제 핸들러 쌍(`send_text` 기계 본문 → `send_key Return`)이 스탬프를 찍고, 사람 경로(GUI
+    /// `human:true`)의 본문+CR 과 빈 줄 Return 은 찍지 않는다.
+    #[test]
+    fn r33_handler_pair_stamps_machine_submit_but_not_human_keys() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("r33-stamp-wiring", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_720;
+        let _sender = v7_pane(&daemon, "worker-2", pid);
+        let machine = v7_pane(&daemon, "worker-1", pid + 1);
+        let human = v7_pane(&daemon, "worker-3", pid + 2);
+        let empty = v7_pane(&daemon, "worker-4", pid + 3);
+        for t in [&machine, &human, &empty] {
+            *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+            *t.last_human_input.lock().unwrap() = None;
+        }
+        let sent = d12_rpc(&daemon, pid, "surface.send_text", json!({
+            "surface_id": machine.id, "text": "M|1|AAAA", "human": false, "queued": false, "quiet": true,
+        }));
+        let before = machine.machine_submit_age_ms();
+        let after_return = v7_send_key(&daemon, machine.id, pid, "Return");
+        let machine_age = machine.machine_submit_age_ms();
+        v7_send_human(&daemon, human.id, pid + 2, "owner");
+        v7_send_human(&daemon, human.id, pid + 2, "\r");
+        let human_age = human.machine_submit_age_ms();
+        v7_send_key(&daemon, empty.id, pid, "Return");
+        let empty_age = empty.machine_submit_age_ms();
+        d12_cleanup(&daemon, &dir);
+
+        assert_eq!(sent["ok"], json!(true), "전제: 기계 본문 직접 전송: {sent}");
+        assert_eq!(before, None, "본문만으로는 제출이 아니다");
+        assert_eq!(after_return, 0);
+        assert!(machine_age.is_some_and(|a| a <= 1_000), "기계 Return 제출 → 스탬프: {machine_age:?}");
+        assert_eq!(human_age, None, "사람 키의 제출은 증명 근거가 아니다");
+        assert_eq!(empty_age, None, "빈 줄 Return 은 줄을 제출하지 않았다");
+    }
+
+    /// T6 불변식 핀 — '정착 재시도 = 쓰기 0' 의 근거. ScreenOccupied 는 1차 `draft_gate`(원장·쓰기보다 앞)에서만
+    /// 나오고, `input_gate` 안 2차 재확인은 `line=None` 이라 화면 축을 만들 수 없다. 누가 2차 검사에 화면 축을
+    /// 넣거나 원장·쓰기를 게이트 앞으로 옮기면 적색이다(앵커는 6371f8bd · 83d67185 양쪽에 있다).
+    #[test]
+    fn r33_t6_screen_occupied_denial_precedes_ledger_and_write() {
+        use crate::governance::{draft_gate_verdict, DirectSendKind as K, DraftGateDenied as W};
+        let src = include_str!("handlers.rs");
+        let arm = src
+            .split(concat!("        \"surface.send_text\"", " => {"))
+            .nth(1)
+            .expect("send_text 팔")
+            .split(concat!("        \"surface.send_key\"", " => {"))
+            .next()
+            .unwrap();
+        let gate = arm.find("governance::draft_gate(daemon, &surface, kind)").expect("1차 게이트");
+        let ledger = arm.find("crate::delivery::record_audited(").expect("원장 기록");
+        let write = arm.find("try_write(&surface, write_req, &id)").expect("PTY 쓰기 인계");
+        assert!(gate < ledger && ledger < write, "순서: 1차 게이트 < 원장 < 쓰기");
+        let recheck = &arm[ledger..write];
+        assert!(
+            recheck.contains("governance::draft_gate_verdict(") && recheck.contains("None, false, false"),
+            "2차 재확인은 line=None(화면 축 없음)이어야 한다"
+        );
+        for kind in [K::Text, K::SubmitKey, K::ClearFirst, K::CancelKey] {
+            for (pending, human) in [(0, 0), (3, 0), (3, 3)] {
+                for selector_row in [false, true] {
+                    for approval in [false, true] {
+                        assert_ne!(
+                            draft_gate_verdict(kind, pending, human, None, selector_row, approval),
+                            Some(W::ScreenOccupied),
+                            "{kind:?} p={pending} h={human} sel={selector_row} appr={approval}: line=None 에서 화면 점유"
+                        );
+                    }
+                }
+            }
         }
     }
 

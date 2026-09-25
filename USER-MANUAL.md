@@ -1203,6 +1203,7 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_CLEAR_REPIN` | 켜짐 (`0`=끔) | /clear 뒤 resume 핀 교체(v0.14.42 · 데몬 env) — 좌석 최상위 claude 의 `/clear` 가 증명되면 재기동 복원이 비운 뒤의 새 대화로 재개합니다. `0` 이면 종전처럼 옛 대화로 재개합니다(판정·이벤트·영속 모두 없음). 데몬 env 라 데몬을 재시작해야 반영됩니다 |
 | `CYS_AGY_STATUSLINE` | 켜짐 (`0`=끔 · `~/.cys/agy-statusline-off` 파일과 동등) | agy 상태줄 자동 연결(v0.14.42 · macOS·Linux · §4 사이드바 사용량 「Antigravity(agy) 값」). 설치·업데이트 때 읽습니다. 끄면 cys 가 넣은(표지 `--cys-autolink`) 연결만 빼고 다시 넣지 않습니다 — 직접 넣은 연결·사용자 설정은 건드리지 않습니다. `cys doctor --fix` 도 같은 판정을 씁니다 |
 | `CYS_OUTSIDE_USAGE` | 켜짐 (`0`=끔) | cys 창 밖(외부 터미널) Claude 세션의 사용량을 계정 줄로 보내기(v0.14.42 · §4 사이드바 사용량 「집계 범위」). 창 밖 세션 쪽 환경에서 읽습니다. 끄면 종전처럼 보내지 않습니다 |
+| `CYS_SEND_SETTLE` | 켜짐 (`0`/`false`/`off`=끔 · 데몬 상태 폴더의 `send-settle-off` 파일과 동등) | 같은 발신자가 `send`+`send-key Return` 을 연달아 보낼 때의 **정착 재시도**(v0.14.42 · macOS·Linux). 앞 본문이 막 제출됐는데 그 줄이 아직 화면에 남아 다음 `send` 가 `[draft_gate:screen_occupied]` 로 거부되면, 데몬은 "이 좌석에서 1초 안에 기계 Return 이 줄을 제출했다"고 **증명할 때만** 응답 끝에 ` [settle:recent_submit]` 를 붙이고, `cys send` 는 그때만 150ms·150ms(+흩뿌림 ≤30ms · 최대 360ms · 최대 3회) 뒤 같은 본문을 다시 보냅니다(거부된 요청은 한 글자도 쓰지 않았으므로 중복 주입이 없습니다). 증명이 없는 점유(진짜 초안)·계수된 초안·질문 창·연결 오류는 재시도 0회로 종전처럼 곧바로 `--queued` 1회 전환합니다. 대상 큐에 먼저 온 항목이 있으면 순서를 지키려고 재시도하지 않습니다. 다중 대상·`--queued`·`--clear-first` 에는 적용되지 않습니다. **라이브 롤백**: `touch <상태폴더>/send-settle-off`(주 데몬 `~/.local/state/cys/` · 부서 데몬은 각자의 소켓 폴더) — 데몬 재시작 없이 다음 거부부터 꺼지고(이미 떠 있는 좌석의 CLI 포함), 파일을 지우면 복귀합니다. 데몬 env `CYS_SEND_SETTLE=0` 은 데몬을 재시작해야 반영되고, CLI 쪽 env 는 그 프로세스 하나만 끄는 시험용입니다(이미 떠 있는 좌석에는 닿지 않습니다). 증명이 붙으면 `send` 1건당 `queue.draft_gate_denied` 가 최대 2건 더 나옵니다(`settling:true`). stderr 문구: `[send] 입력줄 정착 대기 Nms(재시도 k회) 뒤에도 점유`(예산 소진 → 큐 전환) · `[send] 대상 큐에 선행 항목 — 순서 보존을 위해 정착 재시도 없이 큐로 전환`. Windows 는 요청·응답이 종전과 같습니다. 신·구 CLI·데몬이 섞여 있으면 어느 쪽이든 종전 동작입니다 |
 | `CYS_APPROVAL_SECRET_B64` | 자동 생성 | 승인 서명 시크릿 오버라이드 |
 | `CYS_CHANNEL_RETAIN_DAYS` / `CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS` | 7 / 30 | 채널 보존·발신 타임아웃 |
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
@@ -1326,6 +1327,9 @@ v0.14.42 가산분(additive):
 - `usage.report` 에 `reporter:"agy"`(agy 상태줄 훅) — agy 좌석(agent gemini)에서만 받는다(아니면 `invalid_params`)
 - `usage.accounts` 행: `source` 값 `statusline-outside`(창 밖 · 표시용 · 경보 제외)·`agy-statusline` 추가 ·
   `source_error` 코드 `agy_csrf_required` 추가
+- `queue.draft_gate_denied` 에 `settling`(bool) — 이 거부에 정착 증명(`[settle:recent_submit]` · `CYS_SEND_SETTLE`)을
+  붙였는가. 본문(`text`)의 화면 점유 거부가 기계 제출 1초 안일 때만 `true` 이고, 그 밖(다른 kind·다른 사유·창 밖·끔·
+  Windows)은 `false` 다. 구 데몬 이벤트에는 키가 없다(결측은 `false` 가 아니라 '모름')
 
 v0.14.22 가산분(전부 additive — 기존 소비자 무해):
 - `queue.rehomed` {role, count, queue_entry_ids, reordered} — WAL 복원 항목의 같은 role 생존
