@@ -1509,6 +1509,10 @@ enum InboxHold {
     WriteFailed,
     /// writer 채널 포화·닫힘 — 기록을 되돌리고 멈춘다.
     WriterBusy,
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 배달 간격 — 이 루프가 이미 1행을 주입했거나, master 좌석 writer 가 데몬
+    /// Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐다. 다음 행은 간격 뒤 **새 판정**으로 나간다
+    /// (후속 배달 루프 [`schedule_paced_followup`] · 없으면 15s sweep).
+    Paced,
 }
 
 impl InboxHold {
@@ -1518,6 +1522,7 @@ impl InboxHold {
             InboxHold::Gate(h) => h.axis(),
             InboxHold::WriteFailed => "write_failed",
             InboxHold::WriterBusy => "writer_busy",
+            InboxHold::Paced => "paced",
         }
     }
 }
@@ -1525,38 +1530,78 @@ impl InboxHold {
 /// ★(0.14.42 · 설계 H3) 채널이 보는 하드축 — pause·quiescing 은 `deliverable_master` 가 종전대로(무기한) 본다.
 /// busy(작업 중)는 막지 않는다(원격 steer · C0 p95<10s). 사람 입력 창은 큐 게이트와 같은 값(기본 30s).
 ///
-/// `own_paste_in_flight` = **같은 배달 루프에서 방금 앞 행을 주입했다**. 그때 화면 composer 에 보이는 글자는 사람
-/// 초안이 아니라 그 행의 붙여넣기(본문 → 500ms → CR)다 — writer 가 Inject 를 하나씩 직렬로 처리하므로 다음 행이
-/// 그 글자와 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 이때 초안 축을 보면 우리 자신의 붙여넣기에 걸려
-/// 보류된 행이 sweep(15s)마다 1행씩만 나간다(샌드박스 드릴 D4 실측: 20행 FIFO 가 180s). 그래서 루프 안 두 번째
-/// 행부터는 초안 축만 뺀다 — 사람 초안은 루프 **시작** 판정이 이미 봤다(µs 사이에 사람이 새로 칠 수 없다).
-/// 모달·사람 입력·셸 단독 축은 행마다 그대로 본다.
-fn channel_hold_axes(own_paste_in_flight: bool) -> crate::governance::MachineHoldAxes {
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 초안 축은 **행마다** 본다. 83d67185 는 같은 루프 두 번째 행부터 초안 축을
+/// 뺐다(우리 자신의 붙여넣기에 걸려 1행/15s 로 새던 현상 · 드릴 D4). 그 대신 한 루프가 보류 행 전부를 µs 간격으로
+/// 판정해 writer 에 쏟았고, k번째 행의 판정→CR 이 k×(붙여넣기+500ms)로 낡았다(앞 행이 띄운 창에 뒤 행 CR — S41 HG1).
+/// 이제 한 루프는 1행만 주입하고([`deliver_new_inbox_with`] 간격), 자기 붙여넣기는 H0 의 기계 소유 귀속
+/// (`governance::draft_machine_owned` — writer Inject 진행 표식)이 초안에서 뺀다 — 생산자 공통 규칙이다.
+fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
     crate::governance::MachineHoldAxes {
         shell: true,
         human: true,
         modal: true,
-        draft: !own_paste_in_flight,
+        draft: true,
         human_window_secs: crate::governance::queue_human_quiet_secs(),
         ..crate::governance::MachineHoldAxes::NONE
     }
+}
+
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 채널 행 사이 최소 간격(ms) — master 좌석 writer 의 **마지막 데몬 Inject 가
+/// 끝난(CR 기록) 뒤** 이만큼 지나야 다음 행을 판정한다. 앞 행을 받은 에이전트가 권한·질문 창을 띄울 틈을 판정 앞에
+/// 둔다(판정은 그 뒤 화면을 본다). 20행 백로그 ≈ 20×(붙여넣기+500ms+1s) ≈ 30s(종전 1행/15s 스로틀 ≈ 5분 ·
+/// 83d67185 의 일괄 ≈ 10s). 판정→CR 500ms 창(직접 주입 공통 잔여)은 행마다 남는다.
+const CHANNEL_ROW_GAP_MS: u64 = 1000;
+
+/// master 좌석 writer 가 데몬 Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐는가(자기·타 생산자 무관).
+fn master_inject_settling(surface: &crate::state::Surface) -> bool {
+    surface
+        .inject_track
+        .busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS))
+}
+
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격으로 멈춘 배달의 **후속 루프 1회**를 예약한다 — 데몬(소켓)당 대기 중
+/// 예약은 최대 1개(중복 예약 무시). 후속 루프도 같은 판정·간격을 거치므로 행마다 새로 판정되고, 남은 행이 있으면
+/// 다시 예약한다(행이 유한하므로 유계 · 보류(하드축)면 예약하지 않고 15s sweep 이 이어받는다). tokio 런타임 밖
+/// (동기 검체)에서는 예약하지 않는다(sweep 이 이어받는다 = 종전 동작 방향).
+fn schedule_paced_followup(daemon: &Arc<Daemon>) {
+    static ARMED: OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> = OnceLock::new();
+    let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let key = daemon.socket_path.clone();
+    {
+        let mut g = ARMED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if !g.insert(key.clone()) {
+            return;
+        }
+    }
+    let d = Arc::clone(daemon);
+    rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS / 2)).await;
+        ARMED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        // 부서 데몬도 인바운드 즉시 시도(ingest)와 같은 배달만 한다 — sweep 의 재배달·재스폰은 돌리지 않는다.
+        let mut guard = d.channels.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = guard.as_mut() {
+            let _ = deliver_new_inbox_with(&d, conn);
+        }
+    });
 }
 
 /// ★(0.14.42 · 설계 H3) **주입 직전 재확인**(MED-3 봉합 유지 · 행마다) — `deliverable_master(daemon)==Some(sid)`
 /// (paused·exited·quiescing·surface 교체) 뒤 공용 하드축 판정. 보류면 행을 `new` 로 두고 멈춘다(FIFO).
 /// 판정 패닉(`ProbeFailed`)도 보류다(채널의 실패 방향 = 지연 · `channel.message.stalled` 로 보인다).
 /// 노브 `CYS_MACHINE_INJECT_HOLD` 에서 channel 을 빼면 종전 재확인만 한다.
-fn master_hold(
-    daemon: &Arc<Daemon>,
-    sid: u64,
-    own_paste_in_flight: bool,
-) -> Result<Arc<crate::state::Surface>, InboxHold> {
+fn master_hold(daemon: &Arc<Daemon>, sid: u64) -> Result<Arc<crate::state::Surface>, InboxHold> {
     if deliverable_master(daemon) != Some(sid) {
         return Err(InboxHold::Unavailable);
     }
     let surface = daemon.get_surface(sid).ok_or(InboxHold::Unavailable)?;
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel) {
-        let axes = channel_hold_axes(own_paste_in_flight);
+        let axes = channel_hold_axes();
         if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
             return Err(InboxHold::Gate(h));
         }
@@ -1631,6 +1676,11 @@ fn deliver_new_inbox(daemon: &Arc<Daemon>, conn: &Connection) -> Vec<i64> {
 /// ★(0.14.42 · 설계 H3) 행마다 ① 하드축 재확인 → ② **상태 기록 선행**(`UPDATE … WHERE state='new'` 영향 1행일 때만)
 /// → ③ 주입. 종전(주입 → `let _ = UPDATE`)은 UPDATE 가 실패하면 행이 new 로 남아 15s sweep 마다 재주입했다.
 /// 기록 실패 = 주입 안 함(보류) · 인계 실패 = 기록을 되돌리고(최선노력) 멈춘다.
+///
+/// ★(리뷰 F1-H3-batch-flush-stale-verdict) **루프당 1행** — ⓪ 이 루프가 이미 1행을 주입했거나 master writer 가 데몬
+/// Inject 를 쓰는 중·끝난 지 [`CHANNEL_ROW_GAP_MS`] 안이면 `Paced` 로 멈추고 후속 루프를 예약한다. 그래서 k번째 행의
+/// 판정은 앞 행 CR + 간격 **뒤**의 화면을 본다(종전: 1번 행 쓰기 전 µs 간격 판정 · writer 에 백로그 일괄 인계).
+/// 노브에서 channel 을 빼면 간격도 없다(HEAD 동작).
 fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDelivery {
     let mut out = InboxDelivery::default();
     let Some(sid) = deliverable_master(daemon) else {
@@ -1658,8 +1708,16 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
     };
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     for (inbox_id, channel, sender_id, created_ts) in rows {
-        // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달 봉합 · 초안 축은 루프 첫 주입 전까지만).
-        let surface = match master_hold(daemon, sid, !out.delivered.is_empty()) {
+        // ⓪ 간격(루프당 1행 · 앞 Inject 의 붙여넣기~CR + 간격 뒤에만 판정) — 노브 on 일 때만.
+        if lag_on
+            && (!out.delivered.is_empty()
+                || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s)))
+        {
+            out.hold = Some(InboxHold::Paced);
+            break;
+        }
+        // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달·초안 봉합).
+        let surface = match master_hold(daemon, sid) {
             Ok(s) => s,
             Err(h) => {
                 out.hold = Some(h);
@@ -1696,6 +1754,9 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             out.hold = Some(InboxHold::WriterBusy);
             break; // 주입 채널 정체 — 다음 sweep에서 재시도(순서 보존).
         }
+    }
+    if out.hold == Some(InboxHold::Paced) {
+        schedule_paced_followup(daemon);
     }
     out
 }
@@ -1735,7 +1796,12 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     let mut n = 0;
     for (inbox_id, channel, sender_id, created_ts, redelivered, injected_ts) in rows {
-        let Ok(surface) = master_hold(daemon, sid, n > 0) else {
+        // ★(리뷰 F1-H3-batch-flush-stale-verdict) 신규 배달과 같은 간격(루프당 1행 · 앞 Inject + 간격 뒤) — 노브 on 일 때만.
+        //   재배달은 sweep(15s)마다 1행씩 나간다(기본 꺼짐 노브 · 후속 루프는 예약하지 않는다).
+        if lag_on && (n > 0 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s))) {
+            break;
+        }
+        let Ok(surface) = master_hold(daemon, sid) else {
             break;
         };
         let text: String = conn
@@ -3211,11 +3277,15 @@ mod tests {
             assert_eq!(redel(conn), 0);
             // ② 노브 2 — 두 번까지 재배달하고 세 번째는 0. 계수는 redelivered 열.
             let _k = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
+            // ★(리뷰 F1-H3) 재배달도 간격(앞 Inject + CHANNEL_ROW_GAP_MS)을 지킨다 — 앞 주입의 붙여넣기~CR 뒤를 기다린다.
+            let gap = || std::thread::sleep(std::time::Duration::from_millis(500 + CHANNEL_ROW_GAP_MS + 400));
             for want in [1, 2] {
+                gap();
                 age_injected(conn, INBOX_REDELIVER_TTL_SECS + 10.0);
                 assert_eq!(redeliver_unacked(&d, conn), 1, "노브 2 인데 {want}회차 재배달이 없다");
                 assert_eq!(redel(conn), want, "재배달 계수");
             }
+            gap();
             age_injected(conn, INBOX_REDELIVER_TTL_SECS + 10.0);
             assert_eq!(redeliver_unacked(&d, conn), 0, "상한 2 를 넘어 재배달했다");
             // ③ 접수 1h 를 넘긴 항목은 계수가 남아도 재배달하지 않는다.
@@ -3312,7 +3382,7 @@ mod tests {
         d.roles.lock().unwrap().insert("master".into(), sid);
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
-        let s1 = master_hold(&d, sid, false).expect("비-quiescing master 는 주입 직전 재확인 통과");
+        let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
         assert!(inject_master_confirmed(&d, &s1, "[test] hi"), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
@@ -3323,7 +3393,7 @@ mod tests {
         });
         assert_eq!(deliverable_master(&d), None, "quiescing master는 배달 불가");
         assert_eq!(
-            master_hold(&d, sid, false).err(),
+            master_hold(&d, sid).err(),
             Some(InboxHold::Unavailable),
             "quiescing surface엔 주입 직전 재확인이 보류를 돌려준다(주입 0)"
         );
@@ -3997,6 +4067,27 @@ mod tests {
         let _ = m.child.lock().unwrap().kill();
     }
 
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격(루프당 1행 · 앞 Inject + [`CHANNEL_ROW_GAP_MS`])을 지키며 배달
+    /// 루프를 돌아 `want` 행이 나갈 때까지 기다린다(상한 20s) — 나간 순서를 돌려준다. 동기 검체라 후속 루프 예약은
+    /// 없고(런타임 밖) 여기서 루프를 다시 부른다. 루프당 1행 상한을 매번 단언한다.
+    #[cfg(unix)]
+    fn h3_drain(d: &Arc<Daemon>, want: usize) -> Vec<i64> {
+        let mut got = Vec::new();
+        let t0 = std::time::Instant::now();
+        while got.len() < want && t0.elapsed() < std::time::Duration::from_secs(20) {
+            let r = {
+                let mut g = d.channels.lock().unwrap();
+                deliver_new_inbox_with(d, g.as_mut().unwrap())
+            };
+            assert!(r.delivered.len() <= 1, "루프당 1행 상한 위반: {:?}", r.delivered);
+            got.extend(r.delivered);
+            if got.len() < want {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        got
+    }
+
     /// [H3] master 좌석에 모달·화면 초안·사람 입력(30s 안)이 양성 관측되면 inbox 행을 new 로 두고 주입하지 않는다
     /// (행 = 영속 보류 버퍼 · 15s sweep 재시도). 인바운드 즉시 시도의 `channel.message.queued` 에 hold_reason 가산.
     /// RED(HEAD): 즉시 injected.
@@ -4035,8 +4126,12 @@ mod tests {
         assert_eq!(h3_queued_reason(&d, id).as_deref(), Some("shell"));
         m.seat_cache.store(crate::governance::SeatState::Unknown.as_u8(), std::sync::atomic::Ordering::Relaxed);
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:s2", "Unknown 은 종전", "user"), own_pid());
-        assert_eq!(r["result"]["action"], json!("delivered"), "Unknown 좌석은 보류 근거가 아니다(종전 즉시 주입): {r}");
-        assert_eq!(h3_state(&d, id), "injected", "FIFO — 앞 행도 같은 시도에서 먼저 나갔다");
+        let id2 = r["result"]["inbox_id"].as_i64().unwrap();
+        assert_eq!(h3_state(&d, id), "injected", "Unknown 좌석은 보류 근거가 아니다 — FIFO 앞 행이 이 시도에서 나갔다: {r}");
+        // ★(리뷰 F1-H3) 루프당 1행 — 새 행은 앞 행 Inject + 간격 뒤 새 판정으로 나간다(paced).
+        assert_eq!(r["result"]["action"], json!("queued"), "한 루프가 두 행을 쏟았다: {r}");
+        assert_eq!(h3_queued_reason(&d, id2).as_deref(), Some("paced"));
+        assert_eq!(h3_drain(&d, 1), vec![id2], "간격 뒤 종전 즉시 주입");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2);
         h3_done(&m);
     }
@@ -4066,10 +4161,7 @@ mod tests {
         }
         assert!(ids.iter().all(|id| h3_state(&d, *id) == "new"), "모달 중 보류");
         crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
-        let delivered = {
-            let mut g = d.channels.lock().unwrap();
-            deliver_new_inbox(&d, g.as_mut().unwrap())
-        };
+        let delivered = h3_drain(&d, 3);
         assert_eq!(delivered, ids, "id 순서대로 배달");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "각 1회");
         {
@@ -4077,6 +4169,56 @@ mod tests {
             assert!(deliver_new_inbox(&d, g.as_mut().unwrap()).is_empty(), "재주입이 있었다");
         }
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3);
+        h3_done(&m);
+    }
+
+    /// ★(리뷰 F1-H3-batch-flush-stale-verdict · S41 HG1) 보류됐던 행을 한 루프에서 한꺼번에 쏟지 않는다 — 한 배달
+    /// 루프는 **1행**만 주입하고, 다음 행은 앞 행의 붙여넣기~CR 과 간격이 지난 뒤 **새 판정**으로 나간다. 그래서 앞 행이
+    /// 띄운 권한·질문 창(플러시 도중 창 발생)은 뒤 행의 판정이 본다 — 뒤 행의 붙여넣기·CR 이 그 창에 떨어지지 않는다
+    /// (종전 83d67185: 판정은 1번 행 쓰기 전 µs 간격 · k번째 행의 판정→CR 이 k×(붙여넣기+500ms)).
+    /// RED(HEAD): 첫 루프가 3행을 모두 주입.
+    #[cfg(unix)]
+    #[test]
+    fn h3_flush_rejudges_each_row_after_own_paste_settles() {
+        let (d, m) = h3_rig("h3-pace");
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let r = call(&d, "inbound", inbound_params("slack", "U1", &format!("slack:p{i}"), &format!("p{i}"), "user"), own_pid());
+            ids.push(r["result"]["inbox_id"].as_i64().unwrap());
+        }
+        assert!(ids.iter().all(|id| h3_state(&d, *id) == "new"), "전제: 모달 중 보류");
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let r1 = pass(&d);
+        assert_eq!(r1.delivered, vec![ids[0]], "한 배달 루프가 보류 행을 한꺼번에 쏟았다(뒤 행 판정이 낡는다)");
+        assert_eq!(h3_state(&d, ids[1]), "new");
+        // 앞 행의 붙여넣기·CR 이 끝나기 전의 루프는 다음 행을 판정조차 하지 않는다(간격).
+        assert!(pass(&d).delivered.is_empty(), "앞 행 붙여넣기 창 안에서 다음 행을 주입했다");
+        // 앞 행이 새 창을 띄웠다(플러시 도중 창 발생) — 간격이 지난 뒤의 새 판정이 그 창을 본다.
+        std::thread::sleep(std::time::Duration::from_millis(500 + 1000 + 600));
+        crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let r2 = pass(&d);
+        assert!(r2.delivered.is_empty(), "플러시 도중 뜬 창 위에 뒤 행을 주입했다(S41 HG1)");
+        assert_eq!(r2.hold, Some(InboxHold::Gate(crate::governance::MachineHold::Modal)));
+        assert_eq!(h3_state(&d, ids[1]), "new");
+        assert_eq!(h3_state(&d, ids[2]), "new");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1, "창 뒤 주입 0");
+        // 창이 닫히면 나머지가 순서대로 1행씩 나간다(중복 0).
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let mut rest = Vec::new();
+        let t0 = std::time::Instant::now();
+        while rest.len() < 2 && t0.elapsed() < std::time::Duration::from_secs(15) {
+            let r = pass(&d);
+            assert!(r.delivered.len() <= 1, "루프당 1행 상한 위반: {:?}", r.delivered);
+            rest.extend(r.delivered);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(rest, vec![ids[1], ids[2]], "나머지 FIFO");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "각 1회");
         h3_done(&m);
     }
 
@@ -4127,10 +4269,7 @@ mod tests {
         let late = h3_seed(&d, "늦은 지시", created);
         let fresh_ts = now();
         let fresh = h3_seed(&d, "새 지시", fresh_ts);
-        {
-            let mut g = d.channels.lock().unwrap();
-            assert_eq!(deliver_new_inbox(&d, g.as_mut().unwrap()), vec![late, fresh]);
-        }
+        assert_eq!(h3_drain(&d, 2), vec![late, fresh]);
         let local = |ts: f64, f: &str| chrono::Local.timestamp_opt(ts as i64, 0).single().unwrap().format(f).to_string();
         let want_late = format!(
             "[CH:slack|U1|{}|#{late}] (지연 11분 · 접수 {}) 늦은 지시",
@@ -4193,26 +4332,36 @@ mod tests {
         assert_eq!(envelope("s", "u", 1000.0, 1, false, "t"), envelope_at("s", "u", 1000.0, 1, false, "t", Some(1100.0)));
     }
 
-    /// [H3] 같은 배달 루프에서 앞 행을 주입한 뒤에는 초안 축만 뺀다(우리 자신의 붙여넣기에 걸려 1행/15s 로 새지
-    /// 않게 · 드릴 D4). 모달·사람 입력·셸 단독 축은 행마다 그대로다 — 모달 화면이면 두 번째 행도 보류된다.
+    /// [H3 · 리뷰 F1-H3] 초안 축은 행마다 본다(루프 한정 예외 폐지). 데몬 자신의 붙여넣기(writer Inject 진행 중 · 끝난 뒤
+    /// settle 안)는 H0 기계 소유 귀속이 초안에서 뺀다 — 생산자 공통. settle 뒤 같은 화면 초안은 다시 Draft · 모달은 언제나 본다.
     #[cfg(unix)]
     #[test]
-    fn h3_own_paste_in_flight_skips_only_the_draft_axis() {
-        let a0 = channel_hold_axes(false);
-        let a1 = channel_hold_axes(true);
-        assert!(a0.draft && !a1.draft, "루프 첫 주입 전에는 초안 축 · 뒤에는 뺀다");
-        assert_eq!((a1.shell, a1.human, a1.modal), (true, true, true), "나머지 축은 행마다 그대로");
+    fn h3_own_paste_in_flight_is_not_a_draft() {
+        let a = channel_hold_axes();
+        assert_eq!((a.shell, a.human, a.modal, a.draft), (true, true, true, true), "행마다 전 축");
         let (d, m) = h3_rig("h3-own-paste");
         let sid = m.id;
         crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
-        assert_eq!(master_hold(&d, sid, false).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)));
-        assert!(master_hold(&d, sid, true).is_ok(), "앞 행 주입 뒤의 composer 글자에 걸렸다");
+        assert_eq!(master_hold(&d, sid).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)));
+        m.write_tx
+            .send(crate::state::WriteReq::Inject {
+                text: "앞 행 붙여넣기".into(),
+                cr_delay_ms: 900,
+                clear_first: false,
+                guard: None,
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(master_hold(&d, sid).is_ok(), "우리 자신의 붙여넣기(쓰는 중)를 초안으로 봤다");
         crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         assert_eq!(
-            master_hold(&d, sid, true).err(),
+            master_hold(&d, sid).err(),
             Some(InboxHold::Gate(crate::governance::MachineHold::Modal)),
-            "모달 축은 루프 안에서도 행마다 본다"
+            "모달 축은 붙여넣기 중에도 본다"
         );
+        std::thread::sleep(std::time::Duration::from_millis(900 + 500 + 600));
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        assert_eq!(master_hold(&d, sid).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Draft)), "settle 뒤 초안");
         h3_done(&m);
     }
 
@@ -4229,10 +4378,7 @@ mod tests {
         h3_done(&m);
         let d2 = Daemon::new(d.socket_path.clone());
         let m2 = h3_master(&d2);
-        let delivered = {
-            let mut g = d2.channels.lock().unwrap();
-            deliver_new_inbox(&d2, g.as_mut().unwrap())
-        };
+        let delivered = h3_drain(&d2, 2);
         assert_eq!(delivered, ids, "재기동 뒤 보류 행이 FIFO 로 나가지 않았다");
         h3_done(&m2);
     }

@@ -1048,6 +1048,10 @@ cys channel --json <액션>   # start·stop·register·inbound·outbound·receip
 - master 좌석에 질문 창·초안·사람 입력(30초)이 보이거나 셸만 남아 있으면 메시지를 inbox 에 두고(`channel.message.queued`
   의 `hold_reason`) 15초 뒤 다시 시도합니다. 순서는 그대로 지켜집니다. 오래 막히면 10분마다 `channel.message.stalled`
   {inbox_id, age_secs, reason} 이 납니다. 원격에서 master 의 초안을 치울 수단은 없습니다 — 좌석에서 비워야 풀립니다.
+- 쌓였던 메시지는 **한 번에 한 건씩** 나갑니다. 앞 메시지의 Enter 가 들어가고 1초가 지난 뒤에 다음 메시지를
+  새로 판정하므로, 앞 메시지 때문에 뜬 권한·질문 창 위에 뒤 메시지가 떨어지지 않습니다(`hold_reason: "paced"` 는
+  이 간격 대기입니다 · 20건이면 약 30초). 판정한 뒤 Enter 까지의 0.5초 사이에 새로 뜨는 창은 여전히 막지
+  못합니다(모든 직접 주입에 공통인 알려진 잔여).
 - master 가 작업 중(busy)이면 종전대로 즉시 들어갑니다(원격 조향).
 - **재배달은 기본 꺼짐**입니다 — 메시지 1건은 1번만 주입됩니다. 종전에는 ack 가 없으면 10분마다 끝없이 다시
   넣었습니다. 필요하면 `CYS_CHANNEL_REDELIVER_MAX=N`(최대 N회) · `CYS_CHANNEL_REDELIVER_MAX_AGE_SECS`(기본 3600 —
