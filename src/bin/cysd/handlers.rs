@@ -11909,27 +11909,46 @@ mod tests {
     /// (c) 순수 판정부 `creator_matches` 의 **fail-closed 계약**을 합성 시계로 고정한다.
     /// A5(pid 재사용 = start_time 불일치)·A6(관측실패 None, 기록 시점/판정 시점 양쪽)·
     /// 원장 부재·pid 불일치·TTL 경과가 전부 거부여야 한다. `Some(a) == Some(b)` 만 허용이다.
+    ///
+    /// ★(D-2 · T9) start_time 판독기 두 벌([legacy(sysinfo), fast(proc_brief · macOS)])로 같은
+    /// 계약을 돌린다 — lookup 주입 구조라 전역 env 없이 두 판독기를 모두 잰다.
     #[test]
     fn creator_matches_is_fail_closed_on_reuse_missing_start_time_and_ttl() {
+        for (label, reader) in start_time_readers() {
+            eprintln!("[T9] creator_matches reader={label}");
+            creator_matches_fail_closed_with(reader);
+        }
+    }
+
+    /// T9 판독기 목록 — legacy 는 전 OS, fast 는 macOS 에만 있다.
+    fn start_time_readers() -> Vec<(&'static str, fn(u32) -> Option<u64>)> {
+        #[allow(unused_mut)]
+        let mut v: Vec<(&'static str, fn(u32) -> Option<u64>)> =
+            vec![("legacy", crate::state::peer_start_time_legacy)];
+        #[cfg(target_os = "macos")]
+        v.push(("fast", crate::state::peer_start_time_fast));
+        v
+    }
+
+    fn creator_matches_fail_closed_with(peer_start_time: fn(u32) -> Option<u64>) {
         let self_pid = std::process::id();
-        let real_start =
-            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        let real_start = peer_start_time(self_pid).expect("self process must be visible");
         let now = 1_000_000.0_f64;
         let fresh = Some((self_pid, Some(real_start), now - 10.0));
 
         // allow: 같은 pid · start_time 일치 · TTL 이내 (면제 메커니즘이 실제로 성립한다)
         assert!(
-            creator_matches(fresh, self_pid, now, crate::state::peer_start_time),
+            creator_matches(fresh, self_pid, now, peer_start_time),
             "정상 창작자가 거부됐다 — 면제가 성립하지 않는다"
         );
         // 원장 부재 = 창작 사실 없음(부재는 무증명)
         assert!(
-            !creator_matches(None, self_pid, now, crate::state::peer_start_time),
+            !creator_matches(None, self_pid, now, peer_start_time),
             "원장 부재가 통과했다"
         );
         // pid 불일치 = 남이 만든 좌석
         assert!(
-            !creator_matches(fresh, self_pid + 1, now, crate::state::peer_start_time),
+            !creator_matches(fresh, self_pid + 1, now, peer_start_time),
             "다른 pid 가 창작자로 통과했다"
         );
         // A5: 현재 start_time 이 기록값과 다르다(OS 가 같은 pid 를 재할당)
@@ -11948,7 +11967,7 @@ mod tests {
                 Some((self_pid, None, now - 10.0)),
                 self_pid,
                 now,
-                crate::state::peer_start_time
+                peer_start_time
             ),
             "기록 시점 start_time 부재가 통과했다 (A6' fail-closed)"
         );
@@ -11958,7 +11977,7 @@ mod tests {
                 Some((self_pid, Some(real_start), now - crate::state::CREATE_CALLER_TTL_SECS)),
                 self_pid,
                 now,
-                crate::state::peer_start_time
+                peer_start_time
             ),
             "TTL 만료 항목이 통과했다"
         );
@@ -11972,7 +11991,7 @@ mod tests {
                 )),
                 self_pid,
                 now,
-                crate::state::peer_start_time
+                peer_start_time
             ),
             "TTL 직전인데 거부됐다 — launch-agent 의 readiness 대기(수 분)를 못 버틴다"
         );
@@ -20356,14 +20375,21 @@ mod tests {
     /// self 프로세스를 root 로 등록하고 start_time lookup 을 주입해 관측실패·불일치 경로를 시간의존 없이 단정.
     #[test]
     fn restore_root_gate_unit_fail_closed() {
+        for (label, reader) in start_time_readers() {
+            eprintln!("[T9] restore_root_gate_unit_fail_closed reader={label}");
+            restore_root_gate_unit_fail_closed_with(reader);
+        }
+    }
+
+    fn restore_root_gate_unit_fail_closed_with(peer_start_time: fn(u32) -> Option<u64>) {
         let daemon = claim_daemon();
         let self_pid = std::process::id();
         let real_start =
-            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+            peer_start_time(self_pid).expect("self process must be visible");
 
         // A7(복원 미진행): restore_roots 빔 → 어떤 caller 도 deny.
         assert!(
-            !caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            !caller_in_restore_root(&daemon, self_pid, peer_start_time),
             "빈 restore_roots 에서 면제됐다 (A7)"
         );
 
@@ -20371,7 +20397,7 @@ mod tests {
 
         // allow(hop0): 등록 pid 본인 + start_time 일치 → allow(면제 메커니즘 성립).
         assert!(
-            caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            caller_in_restore_root(&daemon, self_pid, peer_start_time),
             "등록 pid + start_time 일치인데 면제되지 않았다"
         );
         // A6(관측실패): 현재 start_time None → deny(Some==Some 아님).
@@ -20390,14 +20416,21 @@ mod tests {
     /// 비고 자손 authoritative 는 deny. RAII 수명이 면제 창의 유일 경계임을 고정한다.
     #[test]
     fn restore_root_gate_denies_after_guard_drop() {
+        for (label, reader) in start_time_readers() {
+            eprintln!("[T9] restore_root_gate_denies_after_guard_drop reader={label}");
+            restore_root_gate_denies_after_guard_drop_with(reader);
+        }
+    }
+
+    fn restore_root_gate_denies_after_guard_drop_with(peer_start_time: fn(u32) -> Option<u64>) {
         let daemon = claim_daemon();
         let self_pid = std::process::id();
         let real_start =
-            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+            peer_start_time(self_pid).expect("self process must be visible");
         {
             let _g = crate::state::RestoreRootGuard::new(daemon.clone(), self_pid, real_start);
             assert!(
-                caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+                caller_in_restore_root(&daemon, self_pid, peer_start_time),
                 "guard 살아있는 동안 자손 면제가 안 됐다"
             );
         }
@@ -20407,7 +20440,7 @@ mod tests {
             "guard drop 후 restore_roots 가 비지 않았다"
         );
         assert!(
-            !caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            !caller_in_restore_root(&daemon, self_pid, peer_start_time),
             "guard drop 후 잔존 자손이 면제됐다 (A7)"
         );
     }
@@ -20417,10 +20450,17 @@ mod tests {
     /// 시간의존이 아니라 sysinfo 프로세스표 반영 대기(관측 게이트)다.
     #[test]
     fn restore_root_gate_allows_real_descendant() {
+        for (label, reader) in start_time_readers() {
+            eprintln!("[T9] restore_root_gate_allows_real_descendant reader={label}");
+            restore_root_gate_allows_real_descendant_with(reader);
+        }
+    }
+
+    fn restore_root_gate_allows_real_descendant_with(peer_start_time: fn(u32) -> Option<u64>) {
         let daemon = claim_daemon();
         let self_pid = std::process::id();
         let real_start =
-            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+            peer_start_time(self_pid).expect("self process must be visible");
         daemon.restore_roots.lock().unwrap().push((self_pid, real_start));
 
         let mut child = std::process::Command::new("sleep")
@@ -20431,14 +20471,14 @@ mod tests {
         // sysinfo 가 자식+부모연결을 반영할 때까지 대기(관측 창).
         let mut visible = false;
         for _ in 0..100 {
-            if crate::state::peer_start_time(child_pid).is_some() {
+            if peer_start_time(child_pid).is_some() {
                 visible = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let allowed =
-            caller_in_restore_root(&daemon, child_pid, crate::state::peer_start_time);
+            caller_in_restore_root(&daemon, child_pid, peer_start_time);
         let _ = child.kill();
         let _ = child.wait(); // 좀비 0
         assert!(visible, "sleep 자식이 프로세스표에 보이지 않았다(관측 실패)");

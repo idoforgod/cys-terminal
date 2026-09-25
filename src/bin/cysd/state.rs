@@ -2881,11 +2881,34 @@ impl Drop for RestoreRootGuard {
 
 /// 단일 pid의 현재 start_time(초)만 조회 — pid 재사용 식별(캐시 히트·restore-root 재검증)용
 /// 경량 lookup. (T6에서 handlers.rs→state.rs로 이동해 게이트·caller_cache가 단일 구현을 공유한다.)
+///
+/// ★(D-2 · 0.14.42) macOS 는 pid 단위 경량 판독(`peer_start_time_fast` — PROC_PIDTBSDINFO 1회),
+/// 그 밖의 OS 와 노브 `CYS_PROC_PROBE_FAST=0` 은 종전 sysinfo 판독(`peer_start_time_legacy`).
+/// 기록 쪽(워크·auto-restore restore_root 등록·record_create_caller)과 비교 쪽(캐시 히트 가드·
+/// creator_matches·restore-root 게이트)이 한 데몬 수명 안에서 **같은 판독기**를 쓴다(노브는
+/// 기동 때 고정). 두 판독기의 값은 같은 커널 필드(pbi_start_tvsec)다.
 pub(crate) fn peer_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        if proc_probe_fast_enabled() {
+            return peer_start_time_fast(pid);
+        }
+    }
+    peer_start_time_legacy(pid)
+}
+
+/// 종전 판독기(전 OS) — sysinfo `ProcessesToUpdate::Some` 단일 pid 새로고침.
+pub(crate) fn peer_start_time_legacy(pid: u32) -> Option<u64> {
     let mut sys = sysinfo::System::new();
     let p = sysinfo::Pid::from_u32(pid);
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
     sys.process(p).map(|proc| proc.start_time())
+}
+
+/// macOS 경량 판독기 — `proc_brief` 의 start_time(부재·좀비 = None, 타 사용자 = Some(0) · legacy 와 같다).
+#[cfg(target_os = "macos")]
+pub(crate) fn peer_start_time_fast(pid: u32) -> Option<u64> {
+    proc_brief(pid).map(|b| b.start_time)
 }
 
 /// ★(D-1a · 0.14.42 WP-transport) 호출자 신원 워크용 **pid 단위 경량 판독** — macOS 전용.
@@ -3203,6 +3226,36 @@ mod proc_brief_tests {
             stable.len()
         );
         assert!(stable.is_empty(), "proc_brief 와 sysinfo 가 안정적으로 어긋난다: {detail:?}");
+    }
+
+    /// T8(D-2) — spawn 직후(sleep 없이) 즉시 판독해도 fast·legacy 모두 Some 이고 값이 같다.
+    /// main.rs auto-restore 의 restore_root 등록(sleep 없는 3회 재시도)과 등가인 조건이다 — fast 는
+    /// proc_listallpids 에 기대지 않고, Command::spawn 이 반환될 때 자식은 이미 커널에 있다.
+    #[test]
+    fn spawn_immediate_start_time_is_some() {
+        struct Reap(u32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: 이 검체가 띄운 자식 pid 에만 SIGKILL 후 회수한다(패턴 kill 없음).
+                unsafe {
+                    libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+                    let mut st: libc::c_int = 0;
+                    libc::waitpid(self.0 as libc::pid_t, &mut st, 0);
+                }
+            }
+        }
+        for i in 0..20 {
+            let child = std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
+            let pid = child.id();
+            std::mem::forget(child);
+            let _reap = Reap(pid);
+            let fast = peer_start_time_fast(pid);
+            let legacy = peer_start_time_legacy(pid);
+            let routed = peer_start_time(pid);
+            assert!(fast.is_some_and(|s| s > 0), "#{i}: spawn 직후 fast 판독이 None/0: {fast:?}");
+            assert_eq!(fast, legacy, "#{i}: spawn 직후 fast 와 legacy 가 다르다");
+            assert_eq!(routed, fast, "#{i}: 공개 경로(peer_start_time)가 판독기 값과 다르다");
+        }
     }
 
     /// T1z — 좀비는 두 판독기 모두에서 같게(이 맥에서는 부재 None) 보인다. waitid(WNOWAIT) 로 종료를
