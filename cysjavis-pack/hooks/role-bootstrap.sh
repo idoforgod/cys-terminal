@@ -292,8 +292,34 @@ else
 #     읽지 않게 한다(정상 갈래는 자식의 `>` 가 절단하므로 이 줄 없이도 이번 값이다).
 #   실패 방향: sleep 이 소수 초를 모르면 1초 폴링(종전과 같은 회계) · 자식이 rc 없이 죽으면 종전처럼 T2-2 고지(본체 0 —
 #     절반 처리됐을 수 있는 선언을 본체가 다시 하지 않는다) · 빈 RC 를 남기고 죽으면 종전처럼 본체(`*)`).
-if command -v cys >/dev/null 2>&1 \
-   && cys hook user-prompt-submit --help 2>/dev/null | grep -q -- '--input'; then
+# ★(0.14.42 R3-4 · C2) 능력 프로브 **양성 캐시** — 프롬프트마다 `cys --help | grep`(맥 실측 약 5~8ms · 외부 프로세스 2)를
+#   띄우지 않는다. 키 = 해소된 cys 절대경로(캐시 파일 내용 전문 일치) + mtime(캐시 파일이 바이너리보다 **새것**이어야 적중 ·
+#   `-nt` 는 셸 내장). 적중 경로의 비용은 `$(command -v cys)` 서브셸 1개뿐이다(외부 명령 0).
+#   ★mtime 키의 한계(정직 표기): 같은 경로의 **제자리 교체**(개발 빌드 · cp)만 무효화한다. 설치기·압축 해제는 빌드 시각
+#     mtime 을 보존하는 일이 흔해(새 바이너리가 캐시보다 '오래된' 것이 된다) 앱 업데이트에서는 캐시가 계속 적중한다.
+#     그래서 안전성은 mtime 이 아니라 다음 둘에서 나온다 —
+#     ① **양성만 적는다**: 캐시가 틀릴 수 있는 방향은 "위임 시도" 하나뿐이고, `--input` 을 모르는 CLI 는 rc 2 → 아래 `*)`
+#        로 본체가 돈다(종전 폴백 그대로 · 무음 사망 없음 — 건너뛰기는 여전히 rc 6·3 뿐 · 검체 PC-4).
+#     ② 음성(구 CLI)은 적지 않는다 — 구 CLI 는 매번 프로브한다(종전 거동 · PC-5).
+#   이 갈래(맥·리눅스)에서만 쓴다 — Windows 갈래는 종전 프로브 그대로다. 새 노브는 만들지 않는다(머리 주석 계약).
+#   캐시 파일(`$STATE/hook-probe-input.ok`)을 지우면 다음 프롬프트가 다시 프로브한다(끄는 스위치는 아니다 — 다시 생긴다).
+_cys_probe_input() {
+  _cpi_b="$(command -v cys 2>/dev/null)" || return 1
+  _cpi_c="$STATE/hook-probe-input.ok"
+  case "$_cpi_b" in
+    /*)
+      if [ -f "$_cpi_c" ] && [ "$_cpi_c" -nt "$_cpi_b" ]; then
+        _cpi_l=""
+        IFS= read -r _cpi_l 2>/dev/null < "$_cpi_c" || :
+        [ "$_cpi_l" = "$_cpi_b" ] && return 0
+      fi ;;
+    *) _cpi_c="" ;;
+  esac
+  cys hook user-prompt-submit --help 2>/dev/null | grep -q -- '--input' || return 1
+  [ -n "$_cpi_c" ] && { printf '%s\n' "$_cpi_b" > "$_cpi_c"; } 2>/dev/null
+  return 0
+}
+if _cys_probe_input; then
   RCF="$IN.rc"
   [ -e "$RCF" ] && rm -f "$RCF" 2>/dev/null
   # 자식은 진입 즉시 stdio 를 끊는다 — 자식이 훅 stdout 파이프를 쥐면 사람의 프롬프트 제출이

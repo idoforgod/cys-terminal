@@ -296,6 +296,62 @@ try:
           NOTE in r.stdout and body_count(d) == 0 and el < 3.0 and r.returncode == 0, "%.2fs %r" % (el, r.stdout[:80]))
 
     # ─── [C2 절 경계] ───
+    # ═════════ [C2] 능력 프로브 양성 캐시 — 양성만 · 경로+mtime 키 · 낡은 양성은 rc2 → 본체(fail-safe) · Windows 무캐시 ═════════
+    past = time.time() - 3600
+    if not REAL_MSYS:
+        d, hooks, binp, state, env = lab(root, "pc1", wrap=())
+        os.utime(os.path.join(binp, "cys"), (past, past))
+        run(hooks, env, STUB_RC=3)
+        run(hooks, env, STUB_RC=3)
+        log = rd(os.path.join(d, "cys.log"))
+        check("PC-1 같은 cys 로 두 번 → 프로브 1회 · 위임 2회", log.count("--help") == 1 and log.count("--input") == 2,
+              repr(log))
+        # mtime 무효화 — **제자리 교체**(개발 빌드·cp: 바이너리 mtime 이 캐시보다 새로워짐) 모사.
+        #   ★설치기·압축 해제는 빌드 시각 mtime 을 보존하는 일이 흔해 이 무효화가 서지 않는다(새 바이너리가 캐시보다
+        #   '오래된' 것이 된다). 그 경우의 안전은 PC-4(낡은 양성 → rc2 → 본체)가 진다 — 이 행은 그 반대 조건만 잰다.
+        fut = time.time() + 5
+        os.utime(os.path.join(binp, "cys"), (fut, fut))
+        run(hooks, env, STUB_RC=3)
+        check("PC-2 바이너리 mtime 이 캐시보다 새로우면 재프로브(제자리 교체 모사)",
+              rd(os.path.join(d, "cys.log")).count("--help") == 2, repr(rd(os.path.join(d, "cys.log"))))
+        # 경로 키: 다른 경로의 cys(더 오래된 mtime)는 캐시를 쓰지 않는다
+        bin2 = os.path.join(d, "bin2")
+        w(os.path.join(bin2, "cys"), STUB_CYS, 0o755)
+        os.utime(os.path.join(bin2, "cys"), (past, past))
+        env2 = dict(env, PATH=bin2 + os.pathsep + env["PATH"])
+        open(os.path.join(d, "cys.log"), "w").close()
+        run(hooks, env2, STUB_RC=3)
+        check("PC-3 cys 경로가 바뀌면 재프로브(경로 키)", rd(os.path.join(d, "cys.log")).count("--help") == 1,
+              repr(rd(os.path.join(d, "cys.log"))))
+        # 낡은 양성(fail-safe) = **앱 업데이트가 mtime 을 보존한 경우 그대로**: 캐시 적중 상태에서 같은 경로의 CLI 가
+        #   `--input` 을 모르는 것으로 바뀌었는데 mtime 은 캐시보다 오래됨 → 위임 시도 rc2 → 본체 정확히 1회.
+        d, hooks, binp, state, env = lab(root, "pc4", wrap=())
+        os.utime(os.path.join(binp, "cys"), (past, past))
+        run(hooks, env, STUB_RC=3)          # 양성 캐시 기록
+        open(os.path.join(d, "mark"), "w").close()
+        open(os.path.join(d, "cys.log"), "w").close()
+        r, el = run(hooks, env, STUB_HELP_INPUT=0)
+        log = rd(os.path.join(d, "cys.log"))
+        check("PC-4 낡은 양성 캐시(mtime 보존 업데이트 모사) → 프로브 생략 · 위임 시도 rc2 → 본체 정확히 1회 · exit 0",
+              log.count("--help") == 0 and log.count("--input") == 1 and body_count(d) == 1 and r.returncode == 0,
+              repr((log, body_count(d), r.returncode)))
+        # 음성은 적지 않는다: 구 CLI 는 매번 프로브 · 위임 0
+        d, hooks, binp, state, env = lab(root, "pc5", wrap=())
+        os.utime(os.path.join(binp, "cys"), (past, past))   # 캐시가 '더 새것' 이 되는 조건 — 음성을 적었다면 여기서 적중한다
+        run(hooks, env, STUB_HELP_INPUT=0)
+        run(hooks, env, STUB_HELP_INPUT=0)
+        log = rd(os.path.join(d, "cys.log"))
+        check("PC-5 구 CLI 는 캐시 없이 매번 프로브 · --input 위임 0 · 본체 2회",
+              log.count("--help") == 2 and "--input" not in log and body_count(d) == 2, repr(log))
+    # Windows 모사: 캐시를 쓰지도 읽지도 않는다(종전 ⑥ 그대로)
+    d, hooks, binp, state, env = lab(root, "pcw", wrap=(), msys=True)
+    os.utime(os.path.join(binp, "cys"), (past, past))
+    run(hooks, env, STUB_RC=3)
+    run(hooks, env, STUB_RC=3)
+    log = rd(os.path.join(d, "cys.log"))
+    check("PC-W (msys) 매번 프로브 · 캐시 파일 무생성", log.count("--help") == 2
+          and not os.path.exists(os.path.join(state, "hook-probe-input.ok")), repr(log))
+
 
     # ─── [C3 절 경계] ───
 
