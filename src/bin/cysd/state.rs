@@ -1043,6 +1043,57 @@ pub struct InjectTrack {
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
     done_at: Mutex<Option<Instant>>,
+    /// ★(R3SH-1) 마지막 **기계 본문**(데몬 Inject · CLI 기계 send) — 제출 CR 뒤에도 남는다. [`MachineBody`] doc.
+    last_body: Mutex<Option<MachineBody>>,
+}
+
+/// ★(0.14.42 · R3SH-1) 좌석 입력줄에 마지막으로 쓴 **기계 본문**의 기록 — H0 기계 잔여 입증의 둘째 근거.
+///
+/// 【왜】 owner 각인([`Surface::pending_input_owner`])은 입력 **세대**에 묶인다. 기계가 CR 까지 보냈는데 TUI 가 제출하지
+/// 않으면(자동완성·슬래시 팝업이 Enter 를 먹음 · 부하 중 CR 유실 · 큐 Inject 의 CR 삼킴) CR 이 계수를 0 으로 되돌리며 세대를
+/// 올려 각인이 결측이 된다 — 그 잔여는 "출처 불명 화면 초안"이 되어 H0 가 사람 초안(Draft)으로 봤고, H2 우회·큐
+/// `input_pending` 이 heartbeat·wakeup·report_gate 를 무기한 멈췄다(③ · pre-H 는 첫 heartbeat 병합 제출로 스스로 풀렸다).
+/// 이 기록은 세대와 무관하게 남아, 화면 입력줄이 **그 본문으로만** 설명되고 그 뒤 사람 손이 닿지 않았음을 입증한다.
+///
+/// 쓰기 = writer Inject arm(데몬 자신 · `owner` 없음)과 핸들러 CLI 기계 send(잔여 귀속 등급이 있을 때만 — GUI 삽입·사람
+/// 자기신고는 기록하지 않는다). 휘발(재기동 = 빈 채 출발 = 종전 판정).
+#[derive(Debug, Clone)]
+pub struct MachineBody {
+    /// 정규화 본문(제어문자 → 공백 · 공백 압축 · 양끝 정리 · 뒤쪽 [`MACHINE_BODY_KEEP_CHARS`] 자).
+    pub norm: String,
+    /// CLI 기계 send 의 발신자 등급(데몬 Inject 는 결측).
+    pub owner: Option<crate::governance::InputOwner>,
+    /// 기록 단조 시각 — 이보다 **뒤의** 사람 입력은 잔여 입증을 깬다.
+    pub at: Instant,
+}
+
+/// 기계 본문 기록이 보존하는 뒤쪽 글자 수 — 화면 커서행은 본문의 꼬리만 보인다(긴 본문은 연속행이라 관측 불능).
+pub const MACHINE_BODY_KEEP_CHARS: usize = 4096;
+
+/// 화면·본문 대조용 정규화 — 괄호붙여넣기 표식 제거 · 제어문자 → 공백 · 공백 압축 · 양끝 정리.
+pub fn normalize_input_text(s: &str) -> String {
+    let s = s.replace("\x1b[200~", " ").replace("\x1b[201~", " ");
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for ch in s.chars() {
+        let c = if ch.is_control() { ' ' } else { ch };
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    let t = out.trim_end();
+    let n = t.chars().count();
+    if n > MACHINE_BODY_KEEP_CHARS {
+        t.chars().skip(n - MACHINE_BODY_KEEP_CHARS).collect()
+    } else {
+        t.to_string()
+    }
 }
 
 impl InjectTrack {
@@ -1056,6 +1107,18 @@ impl InjectTrack {
     pub(crate) fn end(&self) {
         *self.done_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         self.active.store(false, Ordering::Release);
+    }
+
+    /// ★(R3SH-1) 기계 본문 기록 — writer Inject arm(첫 바이트 앞)과 핸들러 CLI 기계 send 가 부른다.
+    pub(crate) fn note_body(&self, text: &str, owner: Option<crate::governance::InputOwner>) {
+        let norm = normalize_input_text(text);
+        *self.last_body.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(MachineBody { norm, owner, at: Instant::now() });
+    }
+
+    /// ★(R3SH-1) 마지막 기계 본문 기록(없으면 None).
+    pub(crate) fn last_body(&self) -> Option<MachineBody> {
+        self.last_body.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
@@ -6357,7 +6420,9 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                     continue;
                 }
                 // ★(0.14.42 · 설계 H 리뷰 F2·F3) 붙여넣기~CR 창을 판정자에게 알린다(InjectTrack doc).
+                // ★(R3SH-1) 본문도 기록한다 — CR 이 삼켜져 남은 잔여가 데몬 자신의 것임을 입증하는 근거(MachineBody doc).
                 if let Some(t) = &track {
+                    t.note_body(&text, None);
                     t.begin();
                 }
                 let r = inject_write(&mut writer, &text, cr_delay_ms, clear_first);

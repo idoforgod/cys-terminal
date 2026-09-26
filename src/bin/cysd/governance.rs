@@ -4891,7 +4891,7 @@ fn queue_overdue_quiet_secs() -> u64 {
 /// ★(0.14.31 · 성찰 Q14) 이 첫 줄은 종전에 "기본 0 = 비활성(활성 권장값 600)" 이었다 —
 /// 아래 상수와 정반대라 운영자가 "우리 함대는 기아 경보가 꺼져 있다" 고 읽었다.
 /// 경보는 발행뿐 — 자동 조치 없음(hint 문구 계약 = state.rs).
-fn queue_starve_alert_secs() -> u64 {
+pub(crate) fn queue_starve_alert_secs() -> u64 {
     std::env::var("CYS_QUEUE_STARVE_ALERT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -5539,11 +5539,15 @@ fn machine_hold_probe(
             input.draft = axes.draft
                 && !(axes.modal && input.modal)
                 && obs_draft_observed(&obs)
-                && match draft_machine_owned(s) {
+                && match draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str())) {
                     None => true,
                     Some(MachineDraft::OwnPaste) => false,
                     Some(MachineDraft::MachineResidue { owner }) => {
-                        note_machine_residue(daemon, s, owner);
+                        note_machine_residue(daemon, s, owner, "owner_gen");
+                        false
+                    }
+                    Some(MachineDraft::SubmittedResidue { owner }) => {
+                        note_machine_residue_opt(daemon, s, owner, "submitted_body");
                         false
                     }
                 };
@@ -5564,6 +5568,10 @@ pub(crate) enum MachineDraft {
     /// 입력줄 본문이 CLI 기계 send(`owner` 등급 — 검증 좌석 · 교차 소켓 자기신고 · 익명)의 본문 **그대로**다 —
     /// owner 각인 세대 일치 ∧ 사람 바이트 0.
     MachineResidue { owner: InputOwner },
+    /// ★(R3SH-1) 기계가 CR 까지 보냈는데 TUI 가 제출하지 않은 잔여 — 화면 입력줄(커서 앞)이 마지막 기계 본문
+    /// ([`crate::state::MachineBody`] · 데몬 Inject 면 `owner` 결측)의 꼬리로 **완전히** 설명되고 ∧ 그 뒤 사람 입력이 없고
+    /// ∧ 사람 바이트 0. owner 세대는 CR 이 올려 결측이 되므로 이 갈래가 따로 입증한다.
+    SubmittedResidue { owner: Option<InputOwner> },
 }
 
 /// ★(0.14.42 · 설계 H 리뷰 F1·F2) 화면 초안이 **기계 소유로 입증되는가**. 입증되면 H0 초안 축의 보류 근거가 아니다.
@@ -5588,21 +5596,49 @@ pub(crate) enum MachineDraft {
 /// 1주기)까지 막히고, H4 는 사람에게 escalation 한다 — pre-H 에 없던 보류를 새로 만든다(③ · 결재 escalation).
 ///
 /// 락: `pending_input` leaf 두 번(owner·human) — 원자 스냅숏이 아니다. 그 사이 사람 키가 오면 다음 판정이 본다.
-pub(crate) fn draft_machine_owned(s: &crate::state::Surface) -> Option<MachineDraft> {
+pub(crate) fn draft_machine_owned(s: &crate::state::Surface, screen_before: Option<&str>) -> Option<MachineDraft> {
     if s
         .inject_track
         .busy_within(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS))
     {
         return Some(MachineDraft::OwnPaste);
     }
-    let owner = s.pending_input_owner()?;
     let human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
-    (human == 0).then_some(MachineDraft::MachineResidue { owner })
+    if human != 0 {
+        return None;
+    }
+    if let Some(owner) = s.pending_input_owner() {
+        return Some(MachineDraft::MachineResidue { owner });
+    }
+    // ★(R3SH-1) 제출 CR 이 삼켜진 잔여 — owner 세대는 이미 결측이다. 마지막 기계 본문으로 **완전히** 설명되는
+    //   입력줄만 입증으로 본다(사람 글자가 한 자라도 앞에 섞였으면 꼬리 일치가 아니다 · 그 뒤 사람 입력이 있었으면 아니다).
+    let screen = crate::state::normalize_input_text(screen_before?);
+    if screen.is_empty() {
+        return None;
+    }
+    let body = s.inject_track.last_body()?;
+    let human_after = s
+        .last_human_input
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|t| t > body.at);
+    (!human_after && body.norm.ends_with(&screen)).then_some(MachineDraft::SubmittedResidue { owner: body.owner })
 }
 
 /// 기계 잔여를 초안 축에서 뺀 사실의 가시화 — `machine_inject.machine_residue` 를 (좌석, 입력 세대)마다 1건.
 /// 생산자는 이어서 종전(pre-H)처럼 잔여 뒤에 주입하므로 잔여가 **병합 제출**된다. 판정 불능이어도 주입은 막지 않는다.
-fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: InputOwner) {
+fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: InputOwner, basis: &'static str) {
+    note_machine_residue_opt(daemon, s, Some(owner), basis)
+}
+
+/// [`note_machine_residue`] 의 등급 결측판 — ★(R3SH-1) 데몬 자신의 Inject 잔여(`owner` 없음)도 같은 이벤트로 드러낸다.
+/// `basis` = 입증 근거(`owner_gen` = 각인 세대 일치 · `submitted_body` = CR 뒤 마지막 기계 본문 꼬리 일치).
+fn note_machine_residue_opt(
+    daemon: &Arc<Daemon>,
+    s: &crate::state::Surface,
+    owner: Option<InputOwner>,
+    basis: &'static str,
+) {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(std::path::PathBuf, u64), u64>>> =
         std::sync::OnceLock::new();
     let gen = s.input_gen.load(Ordering::Acquire);
@@ -5619,7 +5655,8 @@ fn note_machine_residue(daemon: &Arc<Daemon>, s: &crate::state::Surface, owner: 
         Some(s.id),
         // `owner` = 좌석 번호(Unattributed 는 null) · `owner_kind` = 등급(verified·claimed·unattributed — claimed 번호는
         //   다른 데몬의 것일 수 있다). 추가형 키.
-        json!({"surface_id": s.id, "owner": owner.sid(), "owner_kind": owner.kind(), "pending_bytes": pending,
+        json!({"surface_id": s.id, "owner": owner.and_then(|o| o.sid()),
+               "owner_kind": owner.map(|o| o.kind()).unwrap_or("daemon"), "basis": basis, "pending_bytes": pending,
                "note": "입력줄에 CLI 기계 send 의 미제출 본문(Return 누락 잔여)이 있다 — 초안 보류 근거가 아니다. \
                         데몬 주입이 종전처럼 그 뒤에 이어 붙어 함께 제출된다(푸는 주체 없는 무기한 보류 차단)"}),
     );

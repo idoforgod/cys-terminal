@@ -34,6 +34,11 @@ const SCHEDULE_QUEUE_CAP: usize = 100;
 const SCHEDULE_FALLBACK_HEADROOM: usize = 50;
 /// ★(0.14.42 · 설계 H2) 틱의 pause 확인과 push 사이에 kill-switch 가 켜졌다 — via_queue 의 `Frozen` 과 같은 규약(ⓒ).
 const SCHEDULE_FROZEN_ERR: &str = "delivery_frozen: kill-switch paused between tick and push";
+/// ★(0.14.42 · R3SH-1) 입증 못 한 **기계 모양** 초안(사람 바이트 0) 위에서 같은 주기 잡이 같은 입력 세대로 사람 입력
+/// 없이 이 횟수를 넘겨 연속 우회되면, 다음 회차는 종전(pre-H)처럼 직접 주입해 잔여를 병합 제출한다(푸는 주체 없는 무기한
+/// 보류 차단 · 유계). 2 = 두 회차까지는 초안을 지키고 세 번째에 푼다(5분 잡이면 10분 · 1분 잡이면 2분).
+/// 사람 바이트가 있는 초안(오너가 GUI 로 친 글자)은 이 폴백 대상이 아니다 — R3SH-2(오너 결재 대기)의 가시화만 받는다.
+const SCHEDULE_DRAFT_DIVERT_MAX: u32 = 2;
 /// 예정 시각보다 이만큼 늦게 발견하면 발화하지 않고 missed 처리 (데몬 다운 후 재시작 등)
 const MISS_WINDOW_SECS: i64 = 600;
 /// 반복(time) + fresh 조합에서 close_after_secs 미설정 시 적용하는 기본 TTL.
@@ -1475,6 +1480,47 @@ fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
     }
 }
 
+/// ★(0.14.42 · R3SH-5 ②) 동결로 끝난 원샷 잡을 파일에 되돌린다(`at + 1`). 같은 id 가 이미 있으면(사람이 다시 넣음) 손대지
+/// 않는다. 원샷이 아니면 무동작. 실패는 이벤트로 드러낸다(침묵 금지).
+fn requeue_oneshot_after_frozen(daemon: &Arc<Daemon>, job: &Job) {
+    requeue_oneshot_after_frozen_at(daemon, &schedule_path(), job)
+}
+
+fn requeue_oneshot_after_frozen_at(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job) {
+    let Some(at) = job.at else { return };
+    if job.every_minutes.is_some_and(|m| m > 0) {
+        return;
+    }
+    let mut back = job.clone();
+    back.at = Some(at.saturating_add(1));
+    let ok = (|| {
+        let _lock = ScheduleFileLock::acquire(path)?;
+        let mut root: serde_json::Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_else(|| json!({"jobs": []}));
+        if !root["jobs"].is_array() {
+            root["jobs"] = json!([]);
+        }
+        let arr = root["jobs"].as_array_mut()?;
+        if arr.iter().any(|j| j["id"].as_str() == Some(back.id.as_str())) {
+            return Some(true);
+        }
+        arr.push(serde_json::to_value(&back).ok()?);
+        canonicalize_stored_queue_actions(arr);
+        write_schedule_atomic(path, &root).then_some(true)
+    })()
+    .unwrap_or(false);
+    daemon.bus.publish(
+        "schedule.oneshot_requeued",
+        "schedule",
+        None,
+        json!({"job_id": job.id, "at": back.at, "ok": ok,
+               "note": if ok { "kill-switch 경합으로 동결된 원샷을 파일에 되돌렸다 — 해제 뒤 다음 틱이 다시 발화한다" }
+                       else { "동결된 원샷을 파일에 되돌리지 못했다(잠금·쓰기 실패) — 이 wake 는 다시 오지 않는다 · 수동 재등록 필요" }}),
+    );
+}
+
 /// 즉시 발화 (CLI `schedule run-now` — 검증용, last_fired 갱신 없음)
 pub fn run_now(daemon: &Arc<Daemon>, job_id: &str) -> Result<(), String> {
     // T4-15 kill-switch: pause 중에는 즉발도 동결 — scheduler_tick과 동일한 게이트.
@@ -1525,6 +1571,13 @@ async fn fire(daemon: Arc<Daemon>, job: Job) {
         "command" => fire_command(&daemon, &job).await,
         other => Err(format!("unknown action '{other}'")),
     };
+    // ★(0.14.42 · R3SH-5 ②) 틱의 pause 확인과 push 사이에 kill-switch 가 켜져 원샷(`at`)이 동결로 끝났다 — 그 잡은 틱이
+    //   이미 파일에서 지웠으므로 여기서 끝내면 pause 를 풀어도 되살아나지 않는다(자기 예약 wake 유실). 파일에 되돌려
+    //   해제 뒤 다음 틱이 다시 발화하게 한다(at+1 — 틱의 메모리 기록 `last_fired ≥ at` 을 넘기기 위한 1초).
+    //   pause 로 덮인 원샷의 종전 규약(해제 뒤 발화 · MISS_WINDOW 넘으면 missed)과 같아진다.
+    if matches!(&result, Err(e) if e == SCHEDULE_FROZEN_ERR) {
+        requeue_oneshot_after_frozen(&daemon, &job);
+    }
     // ★U4-B2① 결과 원장(메모리 전용) — 이벤트 발행과 독립으로 남는다(이벤트는 흘러가 사라진다).
     let kind = classify_fire_result(&result);
     match &result {
@@ -1818,8 +1871,19 @@ fn deliver_push(
         //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
         if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
             use crate::governance::MachineHold as H;
-            match crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh)) {
+            let hold = crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh));
+            // ★(R3SH-1 · R3SH-2) 초안 우회 추적 — 초안이 아닌 판정은 이 잡의 연속 기록을 끊는다.
+            let draft_step = match hold {
+                Some(H::Draft) => Some(draft_divert_step(daemon, &surface, job)),
+                _ => {
+                    draft_divert_reset(daemon, sid, &job.id);
+                    None
+                }
+            };
+            match hold {
                 Some(H::Paused) => return Err(SCHEDULE_FROZEN_ERR.to_string()),
+                // ★(R3SH-1) 입증 못 한 기계 모양 초안 위에서 연속 우회 상한을 넘겼다 — 종전(pre-H) 직접 주입(유계 폴백).
+                Some(H::Draft) if draft_step == Some(DraftStep::Fallback) => {}
                 Some(h @ (H::Modal | H::Quiescing | H::HumanActive | H::Draft)) => {
                     let label = match h {
                         H::Modal => "queued(modal)",
@@ -1827,7 +1891,7 @@ fn deliver_push(
                         H::HumanActive => "queued(gate:human)",
                         _ => "queued(gate:draft)",
                     };
-                    return enqueue_schedule_push(
+                    let enqueued = enqueue_schedule_divert(
                         daemon,
                         job,
                         sid,
@@ -1835,8 +1899,11 @@ fn deliver_push(
                         role_guard,
                         SCHEDULE_FALLBACK_HEADROOM,
                         schedule_divert_ttl_secs(job),
-                    )
-                    .map(|_| label);
+                    )?;
+                    if h == H::Draft {
+                        draft_divert_note_starved(daemon, &surface, job);
+                    }
+                    return Ok(if enqueued { label } else { "queued(dedup)" });
                 }
                 Some(H::ShellOnly | H::ProbeFailed) | None => {}
             }
@@ -1873,9 +1940,166 @@ fn schedule_hold_axes(fresh: bool) -> crate::governance::MachineHoldAxes {
 /// (다음 회차가 새 문안으로 다시 적재하고, 만료분은 만료 큐로 간다). 원샷(at)·일일(time) 잡은 `None`(데몬 기본 6h).
 /// 운영자가 데몬 TTL 을 껐으면(0) 그 선택을 따른다(`None` = 상속). 주기 0(비활성 잡의 run-now)은 원샷과 같다.
 fn schedule_divert_ttl_secs(job: &Job) -> Option<u64> {
+    // ★(0.14.42 · R3SH-5 ①) 자기 예약 원샷 wake(`at`)는 발화 시점에 파일에서 지워져 **다시 오지 않는다** — 우회 항목이
+    //   데몬 기본 TTL(6h)로 만료되면 그 wake 는 조용히 사라진다(오너 밤샘 부재 = 초안 보류 6h 초과). 만료 없음(0)으로
+    //   두고 초안이 풀리면 배달한다. 같은 잡의 대기는 1회분이라(R1-F3 적재 중복 제거) 쌓이지 않는다.
+    if job.at.is_some() && job.every_minutes.filter(|m| *m > 0).is_none() {
+        return Some(0);
+    }
     let period = job.every_minutes.filter(|m| *m > 0)?.saturating_mul(60);
     let base = crate::state::queue_ttl_default_secs();
     (base > 0).then(|| period.min(base))
+}
+
+/// ★(0.14.42 · R1-F3) 하드축 우회 적재 — **같은 잡의 미배달 항목이 이미 이 좌석 큐에 있으면 새로 싣지 않는다**
+/// (`Ok(false)`). 반환 `Ok(true)` = 적재함.
+///
+/// 【왜】 주기 잡 TTL 을 주기로 묶어도(대기 1회분) 다음 회차 발화가 만료 패스보다 먼저 오면 같은 잡의 옛 항목과 새 항목이
+/// 함께 산다(적재 시점 중복 제거 없음). 한 좌석을 겨누는 주기 잡이 26개를 넘으면 전체 깊이 보호선 50 을 넘겨 회차마다
+/// `schedule.error(queue_full)`·`queue.depth_high` 가 났다(S1 실측). 같은 잡 발신의 병합은 배달 때 다이제스트로만 일어났다.
+/// 옛 항목을 남기는 이유: 치환(삭제 + 새 적재)은 인계 예약·묘비·원장 규약을 모두 다시 지나야 하는 새 삭제 경로다 — 남는
+/// 항목은 제 TTL(≤ 주기)로 만료되고 다음 회차가 새 문안으로 다시 싣는다(최대 1주기 낡음 · 유실 0).
+fn enqueue_schedule_divert(
+    daemon: &Arc<Daemon>,
+    job: &Job,
+    sid: u64,
+    text: &str,
+    role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+    cap: usize,
+    ttl_secs: Option<u64>,
+) -> Result<bool, String> {
+    let from = format!("{SCHEDULE_QUEUE_ORIGIN}:{}", job.id);
+    if let Some(s) = daemon.get_surface(sid) {
+        let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.iter().any(|e| e.from.as_deref() == Some(from.as_str())) {
+            return Ok(false);
+        }
+    }
+    enqueue_schedule_push(daemon, job, sid, text, role_guard, cap, ttl_secs).map(|_| true)
+}
+
+/// ★(R3SH-1) 초안 우회 추적의 판정.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftStep {
+    /// 초안을 지킨다(큐 우회).
+    Divert,
+    /// 연속 우회 상한을 넘긴 기계 모양 초안 — 직접 주입(pre-H).
+    Fallback,
+}
+
+/// (데몬 소켓, 좌석, 잡) → 연속 초안 우회 기록. 휘발(재기동 = 새로 센다 = 보수 방향).
+#[derive(Debug, Clone)]
+struct DraftDivert {
+    /// 기록을 시작한 입력 세대 — 입력줄이 변하면(제출·사람 키·주입) 새 기록이다.
+    gen: u64,
+    count: u32,
+    since: std::time::Instant,
+    fallback_noted: bool,
+    starved_noted: bool,
+}
+
+type DraftDivertKey = (std::path::PathBuf, u64, String);
+
+fn draft_diverts() -> &'static std::sync::Mutex<HashMap<DraftDivertKey, DraftDivert>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<HashMap<DraftDivertKey, DraftDivert>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn draft_divert_reset(daemon: &Arc<Daemon>, sid: u64, job_id: &str) {
+    let mut m = draft_diverts().lock().unwrap_or_else(|e| e.into_inner());
+    m.remove(&(daemon.socket_path.clone(), sid, job_id.to_string()));
+}
+
+/// ★(R3SH-1) 초안 판정 1회를 기록하고 이번 회차의 처리를 고른다.
+///
+/// 폴백 조건(전부): 주기 잡 ∧ 사람 바이트 0(GUI 로 친 오너 글자가 아님) ∧ 같은 입력 세대 ∧ 기록 시작 뒤 사람 입력 없음 ∧
+/// 연속 [`SCHEDULE_DRAFT_DIVERT_MAX`] 회 초과. 원샷은 폴백하지 않는다(만료 없는 우회 항목으로 기다린다 — R3SH-5).
+/// 실패 방향: 입력줄이 변하거나 사람이 손대면 기록이 새로 시작된다(보류 쪽) · 폴백은 pre-H 동작(병합 제출)이지 새 거동이 아니다.
+fn draft_divert_step(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Surface>, job: &Job) -> DraftStep {
+    let gen = surface.input_gen.load(std::sync::atomic::Ordering::Acquire);
+    let human_bytes = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let last_human = *surface.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+    let periodic = job.every_minutes.is_some_and(|m| m > 0);
+    let key = (daemon.socket_path.clone(), surface.id, job.id.clone());
+    let (count, first_fallback) = {
+        let mut m = draft_diverts().lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let rec = m.entry(key).or_insert(DraftDivert {
+            gen,
+            count: 0,
+            since: now,
+            fallback_noted: false,
+            starved_noted: false,
+        });
+        let touched = last_human.is_some_and(|t| t > rec.since);
+        if rec.gen != gen || touched {
+            *rec = DraftDivert { gen, count: 0, since: now, fallback_noted: false, starved_noted: false };
+        }
+        rec.count = rec.count.saturating_add(1);
+        let fallback = periodic && human_bytes == 0 && rec.count > SCHEDULE_DRAFT_DIVERT_MAX;
+        let first = fallback && !rec.fallback_noted;
+        if fallback {
+            rec.fallback_noted = true;
+        }
+        (if fallback { Some(rec.count) } else { None }, first)
+    };
+    let Some(n) = count else {
+        return DraftStep::Divert;
+    };
+    if first_fallback {
+        daemon.bus.publish(
+            "schedule.draft_fallback",
+            "schedule",
+            Some(surface.id),
+            json!({"job_id": job.id, "surface_id": surface.id, "consecutive_diverts": n - 1,
+                   "note": "입력줄의 초안이 사람 입력 없이 같은 채로 연속 우회 상한을 넘겼다(사람 바이트 0 — 기계 잔여로 추정) — \
+                            종전(pre-H)처럼 직접 주입해 병합 제출한다(heartbeat·wakeup 무기한 침묵 차단)"}),
+        );
+    }
+    DraftStep::Fallback
+}
+
+/// ★(0.14.42 · R3SH-2 (c)) 초안 우회가 기아 임계(`CYS_QUEUE_STARVE_ALERT_SECS` · 기본 600s) 이상 이어지면 `queue.starved` 를
+/// 보류 에피소드(같은 입력 세대)마다 1회 낸다. 우회 항목은 TTL ≤ 주기(5분)로 만료·재적재되므로 머리 나이 기준의 틱 경보가
+/// 영영 나지 않았다 — 오너가 초안을 남기고 자리를 비운 동안 주기 신호 전체가 멈춘 사실이 보이지 않았다. 발행뿐(자동 조치 없음).
+fn draft_divert_note_starved(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Surface>, job: &Job) {
+    let threshold = crate::governance::queue_starve_alert_secs();
+    if threshold == 0 {
+        return;
+    }
+    let waited = {
+        let mut m = draft_diverts().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rec) = m.get_mut(&(daemon.socket_path.clone(), surface.id, job.id.clone())) else {
+            return;
+        };
+        let waited = rec.since.elapsed().as_secs();
+        if rec.starved_noted || waited < threshold {
+            return;
+        }
+        rec.starved_noted = true;
+        waited
+    };
+    let (head, depth) = {
+        let q = surface.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+        match q.front().cloned() {
+            Some(h) => (h, q.len()),
+            None => return,
+        }
+    };
+    let role = surface.role.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    daemon.bus.publish(
+        "queue.starved",
+        "queue",
+        Some(surface.id),
+        crate::state::queue_starved_payload(
+            &cys::surface_ref(surface.id),
+            role,
+            &head,
+            waited,
+            depth,
+            &format!("schedule_divert(gate:draft · job {})", job.id),
+        ),
+    );
 }
 
 /// 스케줄 발화의 **좌석 큐 적재** 한 벌 — 큐 경유 잡과 모달 우회(U8 P1)가 같은 인자·같은 동결 규약을 쓴다.
@@ -4774,7 +4998,9 @@ mod h2_schedule_hold_tests {
             task: None,
             updated_at: now_epoch(),
         });
-        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] b", None), Ok("queued(gate:quiescing)"));
+        // ★(R1-F3) 같은 잡은 대기 1회분이라(적재 중복 제거) 둘째 축은 다른 잡으로 잰다.
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] b", None), Ok("queued(dedup)"));
+        assert_eq!(deliver_push(&d, &periodic("hb2", 5), s.id, "[heartbeat] b", None), Ok("queued(gate:quiescing)"));
         assert_eq!(h_ledger_count(&d, "schedule"), 0, "창 안 직접 주입 0");
         assert_eq!(queue(&s).len(), 2);
         // 사람 흔적이 30s 를 넘겼고 quiescing 이 풀리면 종전 직접 주입.
@@ -4910,6 +5136,201 @@ mod h2_schedule_hold_tests {
         done(&s);
     }
 
+    fn events(d: &Arc<Daemon>, name: &str) -> Vec<serde_json::Value> {
+        d.bus.tail(5000).into_iter().filter(|e| e["name"] == name).collect()
+    }
+
+    /// ★(R3SH-1 · S1 모양) 기계가 본문과 **CR 까지** 보냈는데 TUI 가 그 Return 을 먹어 입력줄에 잔여가 남았다 — CR 이
+    /// 계수·세대를 되돌려 owner 각인이 결측이 된 상태다. 그래도 H2 는 큐로 우회하지 않고 종전(pre-H)처럼 직접 주입해 잔여를
+    /// 병합 제출한다(마지막 기계 본문의 꼬리로 입력줄이 완전히 설명됨 ∧ 그 뒤 사람 입력 없음 ∧ 사람 바이트 0).
+    /// 음성 대조: 같은 잔여 뒤에 사람이 한 글자라도 치면(입력 시각이 기록보다 뒤) 종전대로 우회.
+    /// RED(HEAD 1b614e47): queued(gate:draft) — heartbeat·wakeup 무기한 정체(③).
+    #[test]
+    fn h2_swallowed_return_residue_stays_direct() {
+        let pack = crate::governance::HOutsidePack::new();
+        let (d, s) = rig("h2-swallowed");
+        let body = "WORKER-REPORT swallowed-return body";
+        h_paint(&s, H_IDLE_SCREEN);
+        crate::governance::h_send_outside(&pack, &d, s.id, body, json!({}));
+        // 짝 Return(CR) — 데몬은 제출로 계상한다(계수 0 · 세대 +1 → owner 결측).
+        let r = match crate::handlers::dispatch(
+            &d,
+            cys::Request { id: json!(2), method: "surface.send_key".into(),
+                           params: json!({"surface_id": s.id, "key": "Return"}) },
+            None,
+        ) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        };
+        assert_eq!(r["ok"], json!(true), "전제: Return 이 쓰여야 한다: {r}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "전제: CR 뒤 계수 0");
+        assert!(s.pending_input_owner().is_none(), "전제: CR 뒤 owner 결측");
+        // TUI 가 Enter 를 먹었다 — 입력줄에 본문이 그대로 남았다.
+        *s.last_human_input.lock().unwrap() = None;
+        h_paint(&s, &crate::governance::h_residue_screen(body));
+        let j = periodic("hb-5m", 5);
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None),
+            Ok("pushed"),
+            "CR 이 삼켜진 기계 잔여 위에서 큐로 우회했다 — 푸는 주체 없는 무기한 보류(③)"
+        );
+        assert!(queue(&s).is_empty(), "우회 항목이 남았다");
+        assert!(
+            events(&d, "machine_inject.machine_residue").iter().any(|e| e["payload"]["basis"] == "submitted_body"),
+            "잔여 귀속이 드러나지 않았다"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        // 음성 대조 — 같은 잔여에 사람 손이 닿았다(입력 시각이 기계 기록보다 뒤).
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        h_paint(&s, &crate::governance::h_residue_screen(body));
+        assert_eq!(
+            deliver_push(&d, &periodic("hb-other", 5), s.id, "[heartbeat] 5분 보고", None),
+            Ok("queued(gate:draft)"),
+            "사람이 손댄 뒤의 입력줄을 기계 잔여로 봤다"
+        );
+        done(&s);
+    }
+
+    /// ★(R3SH-1 · S2 모양) 큐가 배달한 데몬 Inject 의 CR 이 삼켜졌다(데몬 자신의 붙여넣기 잔여 · owner 없음) — 붙여넣기 창
+    /// (500ms)이 지난 뒤에도 H2 는 직접 주입한다. 음성 대조: 입력줄에 기계 본문 **앞에** 다른 글자가 섞였으면(꼬리 일치 아님) 우회.
+    #[test]
+    fn h2_swallowed_inject_residue_stays_direct() {
+        let (d, s) = rig("h2-inject-residue");
+        let body = "[RESUME] 이전 세션 복원 — TODO 를 읽고 이어서 진행";
+        s.write_tx
+            .send(crate::state::WriteReq::Inject { text: body.into(), cr_delay_ms: 50, clear_first: false, guard: None })
+            .expect("writer");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        s.set_pending_input(0); // 큐 Inject 경로와 같다(제출로 계상).
+        *s.last_human_input.lock().unwrap() = None;
+        h_paint(&s, &crate::governance::h_residue_screen(body));
+        assert_eq!(
+            deliver_push(&d, &periodic("hb-inject", 5), s.id, "[heartbeat] 5분 보고", None),
+            Ok("pushed"),
+            "데몬 Inject 잔여 위에서 큐로 우회했다(③)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        // 음성 대조 — 입력줄이 기계 본문으로 **완전히** 설명되지 않는다(앞에 다른 글자).
+        s.write_tx
+            .send(crate::state::WriteReq::Inject { text: body.into(), cr_delay_ms: 50, clear_first: false, guard: None })
+            .expect("writer");
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        s.set_pending_input(0);
+        h_paint(&s, &crate::governance::h_residue_screen(&format!("오너 메모 {body}")));
+        assert_eq!(
+            deliver_push(&d, &periodic("hb-inject-2", 5), s.id, "[heartbeat] 5분 보고", None),
+            Ok("queued(gate:draft)"),
+            "기계 본문으로 설명되지 않는 입력줄을 잔여로 봤다"
+        );
+        done(&s);
+    }
+
+    /// ★(R3SH-1 유계 폴백) 입증하지 못한 **기계 모양** 초안(사람 바이트 0 · 출처 불명 — 예: 붙여넣기 자리표시 `[Pasted text #1]`
+    /// 가 남은 composer)이 같은 입력 세대로 사람 입력 없이 이어지면, 같은 주기 잡은 두 회차까지만 우회하고 세 번째 회차에
+    /// 종전(pre-H)처럼 직접 주입한다(`schedule.draft_fallback` 1회). 음성 대조: 사람 바이트가 있는 초안(오너가 친 글자)은
+    /// 몇 회차가 지나도 폴백하지 않는다(R3SH-2 — 오너 결재 대기 · 가시화만).
+    #[test]
+    fn h2_unproven_machine_draft_falls_back_after_bounded_diverts() {
+        let (d, s) = rig("h2-fallback");
+        h_paint(&s, &crate::governance::h_residue_screen("[Pasted text #1 +12 lines]"));
+        *s.last_human_input.lock().unwrap() = None;
+        let j = periodic("hb-fb", 1);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 1", None), Ok("queued(gate:draft)"));
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 2", None), Ok("queued(dedup)"), "같은 잡 대기는 1회분");
+        assert_eq!(
+            deliver_push(&d, &j, s.id, "[heartbeat] 3", None),
+            Ok("pushed"),
+            "입증 못 한 기계 모양 초안 위에서 무기한 우회한다(③ — 유계 폴백 부재)"
+        );
+        assert_eq!(events(&d, "schedule.draft_fallback").len(), 1, "폴백 사실이 드러나지 않았다");
+        std::thread::sleep(std::time::Duration::from_millis(1600));
+        // 음성 대조 — 사람이 친 초안(사람 바이트 > 0).
+        s.clear_pending_input();
+        s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), crate::governance::InputOrigin::Human);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+        h_paint(&s, H_DRAFT_SCREEN);
+        let jh = periodic("hb-human", 1);
+        for n in 0..5 {
+            let r = deliver_push(&d, &jh, s.id, "[heartbeat] h", None);
+            assert!(matches!(r, Ok("queued(gate:draft)") | Ok("queued(dedup)")), "#{n}: 오너 초안 위에 직접 주입했다: {r:?}");
+        }
+        done(&s);
+    }
+
+    /// ★(R1-F3) 같은 잡의 우회 항목은 좌석 큐에 **1건만** 선다 — 주기 경계 발화가 만료 패스보다 먼저 와도 공존하지 않는다.
+    /// 주기 잡 30개 × 2회차 = 깊이 30(보호선 50 미만 · schedule.error 0). RED(HEAD): 2회차 20건 적재 후 10건 queue_full.
+    #[test]
+    fn h2_same_job_divert_is_one_pending_entry() {
+        let (d, s) = rig("h2-dedup");
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        for round in 0..2 {
+            for i in 0..30 {
+                let r = deliver_push(&d, &periodic(&format!("hb-{i}"), 1), s.id, "[heartbeat] 모달", None);
+                assert!(r.is_ok(), "회차 {round} 잡 {i}: {r:?}");
+            }
+        }
+        let q = queue(&s);
+        assert_eq!(q.len(), 30, "같은 잡의 우회 항목이 공존한다(대기 1회분 불변식 위반)");
+        let mut froms: Vec<_> = q.iter().filter_map(|e| e.from.clone()).collect();
+        froms.sort();
+        froms.dedup();
+        assert_eq!(froms.len(), 30);
+        done(&s);
+    }
+
+    /// ★(R3SH-2 (c)) 초안 우회가 기아 임계(기본 600s) 이상 이어지면 `queue.starved` 를 보류 에피소드마다 1회 낸다 —
+    /// 우회 항목은 TTL ≤ 주기로 만료·재적재되므로 틱의 머리 나이 경보가 영영 나지 않았다(오너 부재 중 무음 정지).
+    #[test]
+    fn h2_long_draft_hold_is_visible_as_starved() {
+        let (d, s) = rig("h2-starved");
+        s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), crate::governance::InputOrigin::Human);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(900));
+        h_paint(&s, H_DRAFT_SCREEN);
+        let j = periodic("hb-starve", 5);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 1", None), Ok("queued(gate:draft)"));
+        assert!(events(&d, "queue.starved").is_empty(), "임계 전에 기아 경보가 났다");
+        // 보류가 임계를 넘겼다(기록 시작 시각을 과거로).
+        {
+            let mut m = draft_diverts().lock().unwrap();
+            let rec = m.get_mut(&(d.socket_path.clone(), s.id, "hb-starve".to_string())).expect("추적 기록");
+            rec.since = std::time::Instant::now() - std::time::Duration::from_secs(700);
+        }
+        s.pending_queue.lock().unwrap().clear();
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 2", None), Ok("queued(gate:draft)"));
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 3", None), Ok("queued(dedup)"));
+        let st = events(&d, "queue.starved");
+        assert_eq!(st.len(), 1, "초안 우회 장기 보류가 기아로 드러나지 않았다(또는 중복): {st:?}");
+        assert!(st[0]["payload"]["blocked_by"].as_str().unwrap_or("").contains("gate:draft"));
+        done(&s);
+    }
+
+    /// ★(R3SH-5 ②) 틱의 pause 확인과 push 사이에 동결로 끝난 원샷은 파일에 되돌려진다(at+1 · 해제 뒤 재발화).
+    #[test]
+    fn frozen_oneshot_is_requeued_to_file() {
+        let (d, s) = rig("h2-oneshot-requeue");
+        let dir = std::env::temp_dir().join(format!("cys-oneshot-requeue-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("schedule.json");
+        std::fs::write(&path, r#"{"jobs": [{"id": "other", "every_minutes": 5, "action": "push", "to": "master", "text": "x"}]}"#)
+            .unwrap();
+        let wake = job(json!({"id": "wake-1", "at": 1_900_000_000i64, "action": "push", "to": "master", "text": "[wakeup] 다음"}));
+        requeue_oneshot_after_frozen_at(&d, &path, &wake);
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let back = root["jobs"].as_array().unwrap().iter().find(|j| j["id"] == "wake-1").cloned().expect("되돌린 원샷");
+        assert_eq!(back["at"], json!(1_900_000_001i64));
+        assert!(root["jobs"].as_array().unwrap().iter().any(|j| j["id"] == "other"), "다른 잡을 잃었다");
+        // 멱등 — 같은 id 가 있으면 다시 넣지 않는다.
+        requeue_oneshot_after_frozen_at(&d, &path, &wake);
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["jobs"].as_array().unwrap().iter().filter(|j| j["id"] == "wake-1").count(), 1);
+        // 주기 잡은 대상이 아니다.
+        requeue_oneshot_after_frozen_at(&d, &path, &periodic("p", 5));
+        assert!(!root["jobs"].as_array().unwrap().iter().any(|j| j["id"] == "p"));
+        let _ = std::fs::remove_dir_all(&dir);
+        done(&s);
+    }
+
     /// [H2 잔여 핀] busy(작업 중) 좌석은 막지 않는다 — §8 안에서 막는 유일한 방법(큐 보류)이 ③ 위험을 만든다.
     #[test]
     fn h2_busy_seat_stays_direct() {
@@ -4956,7 +5377,7 @@ mod h2_schedule_hold_tests {
         done(&s);
     }
 
-    /// [H2] 주기 잡 우회 항목 TTL = min(주기, 데몬 기본) · 원샷(at·time)은 None(데몬 기본 6h). 만료분은 만료 큐로 가고
+    /// [H2] 주기 잡 우회 항목 TTL = min(주기, 데몬 기본) · 원샷(at)은 Some(0)(만료 없음 · R3SH-5) · 일일(time)은 None(데몬 기본 6h). 만료분은 만료 큐로 가고
     /// 다음 회차는 새 항목으로 다시 적재된다(대기가 1회분으로 묶인다).
     #[test]
     fn h2_periodic_ttl_le_period_oneshot_default() {
@@ -4970,7 +5391,8 @@ mod h2_schedule_hold_tests {
         assert_eq!(deliver_push(&d, &daily, s.id, "[schedule daily] 일일", None), Ok("queued(gate:draft)"));
         let q = queue(&s);
         let ttl: Vec<Option<u64>> = q.iter().map(|e| e.ttl_secs).collect();
-        assert_eq!(ttl, vec![Some(300), Some(6 * 3600), None, None], "주기 TTL ≤ 주기 · 원샷·일일 = 데몬 기본");
+        // ★(R3SH-5 ①) 원샷(at)은 만료 없음(0) — 발화 뒤 파일에서 지워져 다시 오지 않는 wake 가 6h 뒤 조용히 사라지지 않게.
+        assert_eq!(ttl, vec![Some(300), Some(6 * 3600), Some(0), None], "주기 TTL ≤ 주기 · 원샷 = 만료 없음 · 일일 = 데몬 기본");
         // 1회차가 주기를 넘기면 만료 큐로 간다(활성 머리에 두지 않는다).
         s.pending_queue.lock().unwrap()[0].enqueued_at = now_epoch() - 301.0;
         crate::governance::queue_expiry_pass(&d);

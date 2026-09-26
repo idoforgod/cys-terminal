@@ -5216,6 +5216,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     if origin == crate::governance::InputOrigin::Machine && next.count > 0 {
                         if let Some(o) = owner_if_residue {
                             surface.mark_pending_input_owner(o);
+                            // ★(R3SH-1) 세대와 무관하게 남는 기계 본문 기록 — 뒤따른 Return 이 TUI 에 삼켜져 잔여가 남아도
+                            //   H0 가 그것을 기계 소유로 입증한다(state::MachineBody doc). 귀속 등급이 있을 때만(GUI 삽입 제외).
+                            surface.inject_track.note_body(&text, Some(o));
                         }
                     }
                 }
