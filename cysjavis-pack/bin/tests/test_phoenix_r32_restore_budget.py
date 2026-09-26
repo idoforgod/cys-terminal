@@ -16,6 +16,7 @@
 """
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -355,6 +356,111 @@ def t_rust_pins():
           and 'dir.join("topology.json")' in ld and '["entries"]' in ld)
 
 
+# ── ⑨ 진행 기반 행 판정(리뷰 F1·W4) — 무출력 창이 상한을 넘으면 첫 회차라도 끊는다 ─────────────────
+#   결함: 첫 회차 상한이 단위 수에 선형(45단위 ≈ 3078s)이고 절대 캡이 없다. `cys restore` 가 멈추면(request() 는 읽기
+#   상한이 없다) phoenix 가 공유 restore.lease 를 쥔 채 그만큼 기다리고, 그동안 cysd role.reclaim_auto 는 하드 Defer
+#   (그 창에 뜬 좌석은 결합 0 = external:N). 절대 캡은 큰 로스터의 정상 진행을 다시 자른다(R3-2 가 고친 유실).
+#   그래서 **진행**을 본다: run_restore 는 역할마다 기동 전에 한 줄을 찍으므로 정상 진행의 무출력 창은 기동 1단위
+#   최악치를 넘지 않는다. 무출력 상한(= max(종전 90, 단위 최악치 + 마진))을 넘기면 행으로 보고 끊는다(rc 124 →
+#   이후 회차는 종전 90). 이 절은 실제 자식 프로세스(가짜 cys)로 잰다 — 시계는 상한을 1.5s 로 줄인 값이다.
+FAKE_CYS = r'''import os, sys, time
+mode = os.environ.get("R32_FAKE_MODE", "")
+if mode == "hang":
+    print("· w1: claude 재기동…", flush=True)
+    time.sleep(30)
+elif mode == "progress":
+    for i in range(6):
+        print("· w%d: claude 재기동…" % (i + 1), flush=True)
+        time.sleep(0.4)
+    print("restore 완료", flush=True)
+elif mode == "stderr_progress":
+    for i in range(6):
+        sys.stderr.write("[launch-agent] w%d 진행\n" % (i + 1))
+        sys.stderr.flush()
+        time.sleep(0.4)
+sys.exit(0)
+'''
+
+
+def t_stall():
+    td = tempfile.mkdtemp(prefix="r32-stall-")
+    saved = (m.CYS, m._BUDGET_MOD, getattr(m, "restore_stall_window_s", None), m.log)
+    had_mode = os.environ.get("R32_FAKE_MODE")
+    try:
+        fake = os.path.join(td, "cys")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write("#!%s\n" % sys.executable + FAKE_CYS)
+        os.chmod(fake, 0o755)
+        m.CYS = fake
+        m.log = lambda s: None
+        # 상한 200s(파생 대역 · 하한 90 위) · 무출력 상한 1.5s — 행이면 1.5s 근처에서 끊고, 종전 코드는 가짜 cys 가
+        #   스스로 끝나는 30s 까지(실제 행이라면 상한 전액) 기다린다.
+        m._BUDGET_MOD = SimpleNamespace(cys_restore_outer_s=lambda n: 200, cys_restore_stall_s=lambda: 1.5)
+        m.restore_stall_window_s = lambda: (1.5, "검체")
+
+        def go(mode):
+            os.environ["R32_FAKE_MODE"] = mode
+            t0 = time.monotonic()
+            res = m.spawn_production(os.path.join(td, "s.sock"), ["w1"], units=8)
+            return res, time.monotonic() - t0
+
+        res, el = go("hang")
+        check("⑨ 멈춘 `cys restore`(한 줄 뒤 무출력) → 무출력 상한에서 끊는다(%.1fs < 8s · 종전은 상한 전액)" % el,
+              el < 8.0 and res["rc"] == 124)
+        check("⑨ 끊긴 회차는 rc 124 로 보고된다(호출부가 이후 회차를 종전 90 으로 내린다) · 행 표시",
+              res.get("rc") == 124 and res.get("stalled") is True)
+        check("⑨ 끊기 전 출력은 보존된다(관측 채널 무손실)", "재기동" in (res.get("out") or ""))
+        res, el = go("progress")
+        check("⑨ 줄이 이어지는 정상 진행(0.4s 간격 · 총 2.4s > 무출력 상한 1.5s)은 끊지 않는다(rc 0 · %.1fs)" % el,
+              res["rc"] == 0 and el >= 2.3 and not res.get("stalled"))
+        res, el = go("stderr_progress")
+        check("⑨ stderr 로만 이어지는 진행도 진행이다(rc 0 · %.1fs)" % el, res["rc"] == 0 and not res.get("stalled"))
+        check("⑨ 무출력 상한은 `cys restore` 한 호출 동안만 켜진다(뒤따르는 cys() 무영향)",
+              getattr(m, "_CYS_STALL_S", "absent") is None)
+    finally:
+        m.CYS, m._BUDGET_MOD, rs, m.log = saved
+        if rs is not None:
+            m.restore_stall_window_s = rs
+        if had_mode is None:
+            os.environ.pop("R32_FAKE_MODE", None)
+        else:
+            os.environ["R32_FAKE_MODE"] = had_mode
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_stall_window():
+    b = B.cys_restore_stall_s() if hasattr(B, "cys_restore_stall_s") else None
+    check("⑨ 무출력 상한 = max(종전 90, 기동 1단위 최악치 + 마진) — 정상 진행의 최대 무출력 창(1단위)보다 크다",
+          b is not None and b >= 90 and b >= B.restore_unit_worst_s()
+          and b == max(90, int(math.ceil(B.restore_unit_worst_s() + B._margin(B.restore_unit_worst_s())))))
+    w = m.restore_stall_window_s()[0] if hasattr(m, "restore_stall_window_s") else None
+    check("⑨ phoenix 무출력 상한 == javis_budget 파생값", w == b)
+    saved = m._BUDGET_MOD
+    try:
+        m._BUDGET_MOD = False
+        check("⑨ javis_budget 결손 → 무출력 상한 종전 90",
+              hasattr(m, "restore_stall_window_s") and m.restore_stall_window_s()[0] == 90)
+        m._BUDGET_MOD = SimpleNamespace(cys_restore_stall_s=lambda: float("nan"))
+        check("⑨ 비유한 파생값 → 종전 90(무크래시)",
+              hasattr(m, "restore_stall_window_s") and m.restore_stall_window_s()[0] == 90)
+    finally:
+        m._BUDGET_MOD = saved
+    # 롤백 노브(90)면 상한 == 무출력 상한 → 무출력 판정은 닿지 않는다(= 종전 거동 그대로)
+    home0 = m.HOME
+    td = tempfile.mkdtemp(prefix="r32-stallknob-")
+    try:
+        m.HOME = td
+        os.environ["PHOENIX_RESTORE_TIMEOUT_S"] = "90"
+        try:
+            check("⑨ 롤백 노브 90 → 상한 90 ≤ 무출력 상한(무출력 판정 무발동 = 종전 거동)",
+                  m.restore_spawn_timeout_s(45)[0] == 90 and (w is None or w >= 90))
+        finally:
+            del os.environ["PHOENIX_RESTORE_TIMEOUT_S"]
+    finally:
+        m.HOME = home0
+        shutil.rmtree(td, ignore_errors=True)
+
+
 # ── ⑧ 소스·예산 핀 ──────────────────────────────────────────────────────────
 def t_source_pins():
     src = open(PH, encoding="utf-8").read()
@@ -364,6 +470,12 @@ def t_source_pins():
           "_restore_units_now(socket, _units_view, include_master, entries, _tombstones)" in src
           and "hang_suspected=_restore_hang" in src
           and '_restore_hang = _restore_hang or res.get("rc") == 124' in src)
+    check("⑧ spawn_production 이 `cys restore` 한 호출 동안만 무출력 상한을 켜고 finally 에서 되돌린다(리뷰 F1)",
+          "restore_stall_window_s()" in body and "_CYS_STALL_S = stall" in body
+          and "_CYS_STALL_S = prev_stall" in body)
+    cbody = src[src.index("def cys(*args, socket=None, timeout=25):"):src.index("def get_boot_epoch(")]
+    check("⑧ cys() 는 무출력 상한이 상한보다 작을 때만 진행 감시 실행기를 쓴다(그 밖 호출·1단위는 종전 경로)",
+          "_run_capture_progress(cmd, env, timeout, stall)" in cbody and "stall < timeout" in cbody)
     labels = [p[0] for p in B.parity_pairs()]
     check("⑧ javis_budget 파리티에 restore 참조 쌍", any("cys restore" in x for x in labels))
     d = B.table()["derived"]
@@ -382,7 +494,7 @@ def main():
     m.HOME = iso_home
     try:
         for t in (t_units, t_budget, t_knob, t_budget_missing, t_spawn_and_heartbeat, t_run_restore,
-                  t_rust_pins, t_source_pins):
+                  t_rust_pins, t_source_pins, t_stall_window, t_stall):
             try:
                 t()
             except Exception as e:  # 검체 자체의 예외도 적색으로 센다(조용한 통과 금지)

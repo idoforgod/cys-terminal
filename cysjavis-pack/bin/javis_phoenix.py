@@ -911,6 +911,83 @@ def _decode_captured(b):
     return b or ""
 
 
+def _run_capture_progress(cmd, env, timeout, stall_s, poll_s=1.0):
+    """★리뷰 F1·W4(0.14.42): `_run_capture` 에 **진행 감시**를 더한 실행기 — 상한(timeout) 안이라도 stdout·stderr 가
+    stall_s 초 동안 한 바이트도 늘지 않으면 행으로 보고 끊는다(rc 124 · `stalled=True`). 임시파일 캡처라 파이프 EOF
+    문제가 없고(_run_capture 와 같은 이유) 크기(fstat)만 본다 — 스레드 0 · 외부 명령 0 · 판독 1초 간격.
+    종료 문안은 플랫폼별 종전 경로와 같다: unix 는 타임아웃이면 stderr 를 "TIMEOUT …" 으로 대체(subprocess.run 경로),
+    Windows 는 캡처된 stderr 가 있으면 그대로(_run_capture 경로). 원문은 stderr_raw 로 보존한다."""
+    import tempfile
+    of = tempfile.TemporaryFile()
+    ef = tempfile.TemporaryFile()
+    r = _CapR()
+    r.stalled = False
+
+    def _size():
+        try:
+            return os.fstat(of.fileno()).st_size + os.fstat(ef.fileno()).st_size
+        except Exception:
+            return -1          # 판독 불가 = 진행으로 본다(행 판정은 증명될 때만 · 상한은 그대로 선다)
+
+    try:
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        except (FileNotFoundError, OSError) as e:
+            r.returncode = 127
+            r.stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
+            return r
+        t0 = time.monotonic()
+        last_t, last_n = t0, 0
+        exited = False
+        while True:
+            left = timeout - (time.monotonic() - t0)
+            if left <= 0:
+                break
+            try:
+                p.wait(timeout=max(0.01, min(poll_s, left)))
+                exited = True
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            n, now = _size(), time.monotonic()
+            if n != last_n or n < 0:
+                last_t, last_n = now, n
+            elif now - last_t >= stall_s:
+                r.stalled = True
+                break
+        if exited:
+            r.returncode = p.returncode
+        else:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
+            r.returncode = 124
+        of.seek(0)
+        ef.seek(0)
+        r.stdout = of.read().decode("utf-8", "replace")
+        se = ef.read().decode("utf-8", "replace")
+        r.stderr_raw = se
+        if r.returncode == 124 and (not IS_WINDOWS or not se):
+            r.stderr = "TIMEOUT %ss" % timeout + (" (무출력 %ss — 행 의심)" % stall_s if r.stalled else "")
+        else:
+            r.stderr = se
+    finally:
+        of.close()
+        ef.close()
+    return r
+
+
+# ★리뷰 F1·W4: cys() 무출력 상한(초). spawn_production 이 `cys restore` **한 호출 동안만** 켜고 finally 에서 되돌린다 —
+#   그 밖의 cys() 호출(상태 조회·재주입·저널)은 이 값을 보지 않는다(None). 호출 인자로 넘기지 않는 이유: 검체들이 cys()
+#   를 고정 서명(`*args, socket, timeout`)의 대역으로 갈아 끼운다 — 새 키워드를 넘기면 그 대역들이 TypeError 로 죽는다.
+_CYS_STALL_S = None
+
+
 def cys(*args, socket=None, timeout=25):
     cmd = [CYS]
     if socket:
@@ -918,6 +995,11 @@ def cys(*args, socket=None, timeout=25):
     cmd += [str(a) for a in args]
     env = dict(os.environ)
     env.pop("AITERM_SOCKET", None)
+    # ★리뷰 F1·W4: 무출력 상한이 켜져 있고 상한보다 작을 때만 진행 감시 실행기(두 플랫폼 공통 · 임시파일 캡처).
+    #   상한 이상이면(1단위 · 롤백 노브 90) 무출력 판정이 닿을 수 없으므로 종전 경로 그대로다.
+    stall = _CYS_STALL_S
+    if stall is not None and stall < timeout:
+        return _run_capture_progress(cmd, env, timeout, stall)
     # ★Windows: 임시파일 캡처(_run_capture)로 detached cysd 파이프 상속 hang 회피. mac 은 기존 경로 유지(무회귀).
     if IS_WINDOWS:
         return _run_capture(cmd, env, timeout)
@@ -1905,6 +1987,24 @@ def restore_spawn_timeout_s(units, hang_suspected=False):
     return derived, why
 
 
+def restore_stall_window_s():
+    """★리뷰 F1·W4(0.14.42): `cys restore` **무출력 상한**(초)과 사유 → (초, 사유). 값의 소유자는
+    javis_budget.cys_restore_stall_s(= max(종전 90, 기동 1단위 최악치 + 마진) · 근거는 그 doc). 첫 회차 상한이 단위 수에
+    선형이라(절대 캡 없음) `cys restore` 가 멈추면 공유 restore.lease 를 쥔 채 그 전액을 기다렸다 — 이 창 동안 cysd
+    role.reclaim_auto 는 하드 Defer 다. 이제 무출력이 이 값을 넘으면 첫 회차라도 끊고(rc 124) 이후 회차는 종전 90 이다.
+    모듈 결손·스큐·비유한 값이면 종전 90(= 상한 하한과 같아 1단위에서는 무발동)."""
+    floor = RESTORE_TIMEOUT_FLOOR_S
+    b = _budget_mod()
+    if b is not None:
+        try:
+            v = float(b.cys_restore_stall_s())
+            if math.isfinite(v):
+                return max(floor, int(math.ceil(v))), "파생(javis_budget.cys_restore_stall_s)"
+        except Exception:
+            pass
+    return floor, "javis_budget 결손·스큐 — 종전 %ds" % floor
+
+
 def restore_workload_units(topo, live_view, include_master=False):
     """`cys restore` 1회가 실제로 치를 **기동 단위** 수(★R3-2) — cys.rs run_restore 의 선별을 같은 재료로 센다.
     재료: topology.json entries(= system.topology.saved 의 원천 · handlers.rs load_topology 가 이 파일을 읽는다)
@@ -1998,13 +2098,23 @@ def spawn_production(socket, pending_roles, include_master=False, units=None, ha
         args.append("--include-master")
     n = len(pending_roles) if units is None else units
     budget, why = restore_spawn_timeout_s(n, hang_suspected=hang_suspected)
-    log("spawn 예산: cys restore %d단위 → 상한 %ds · %s (종전 고정 %ds)"
-        % (int(n or 0), budget, why, RESTORE_TIMEOUT_FLOOR_S))
+    # ★리뷰 F1·W4: 진행 기반 행 판정 — 무출력이 이 값을 넘으면 첫 회차라도 끊는다(상한 < 이 값이면 무발동 = 종전).
+    stall, stall_why = restore_stall_window_s()
+    log("spawn 예산: cys restore %d단위 → 상한 %ds · %s (종전 고정 %ds) · 무출력 상한 %ds(%s)"
+        % (int(n or 0), budget, why, RESTORE_TIMEOUT_FLOOR_S, stall, stall_why))
+    global _CYS_STALL_S
+    prev_stall = _CYS_STALL_S
+    _CYS_STALL_S = stall
     stop_beat = _spawn_heartbeat(budget, "cys restore")
     try:
         r = cys(*args, socket=socket, timeout=budget)
     finally:
+        _CYS_STALL_S = prev_stall
         stop_beat()
+    stalled = bool(getattr(r, "stalled", False))
+    if stalled:
+        log("spawn: cys restore 무출력 %ds — 행 의심으로 끊음(rc 124 · 이후 회차 종전 %ds) · 공유 lease 보유 창을 줄인다"
+            % (stall, RESTORE_TIMEOUT_FLOOR_S))
     # ★F-1(리뷰 R3 · codex major): **실제 기동 모드가 phoenix 에 닿는 유일한 채널.** `out` 은 800자로 잘리므로
     #   자르기 **전** 세 스트림 전량에서 관측 줄을 뽑는다(예상 mirror 가 틀려도 관측이 승격한다 · 새 배선 0).
     #   ★리뷰 R3b: 세 번째가 `stderr_raw` 다 — 타임아웃이면 `stderr` 는 "TIMEOUT %ss" 로 대체되므로 그 자리에만
@@ -2012,7 +2122,7 @@ def spawn_production(socket, pending_roles, include_master=False, units=None, ha
     streams = "%s\n%s\n%s" % (r.stdout or "", getattr(r, "stderr", "") or "",
                                getattr(r, "stderr_raw", "") or "")
     return {"backend": "production(cys restore)", "rc": r.returncode,
-            "timeout_s": budget, "units": n,
+            "timeout_s": budget, "units": n, "stall_s": stall, "stalled": stalled,
             "out": (r.stdout or r.stderr or "").strip()[:800],
             "fresh_observed": sorted(cli_fresh_roles(streams))}
 

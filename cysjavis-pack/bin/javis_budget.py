@@ -245,6 +245,19 @@ def cys_restore_outer_s(units):
     return int(math.ceil(max(RESTORE_OUTER_FLOOR_S, inner + _margin(inner))))
 
 
+def cys_restore_stall_s():
+    """★리뷰 F1·W4(0.14.42): phoenix 가 `cys restore` 에 씌우는 **무출력 상한**(초) — 진행 기반 행 판정.
+    cys_restore_outer_s 는 단위 수에 선형이고 절대 캡이 없다(45단위 ≈ 3078s). `cys restore` 가 멈추면(request() 는
+    읽기 상한이 없다) phoenix 는 공유 restore.lease 를 쥔 채 그만큼 기다리고, 그동안 cysd role.reclaim_auto 는 하드
+    Defer 다. 절대 캡은 큰 로스터의 정상 진행을 다시 자른다(R3-2 가 고친 유실). 그래서 **진행**을 본다:
+    run_restore(cys.rs)는 역할마다 기동 **전에** 한 줄을 찍는다(`· {role}: … 좌석 내 재연결…` · `… 재기동…` ·
+    폴백 줄) — 정상 진행의 무출력 창은 기동 1단위 최악치(락 대기 + 기동 1회)를 넘지 않는다.
+    = max(종전 90, 단위 최악치 + 마진). 하한이 종전 고정 상한이라 **한 창이 받는 시간은 종전 실행 전체가 받던
+    시간 이상**이다(현 leaf 에서 단위 57s + 마진 20 = 77 → 90)."""
+    unit = restore_unit_worst_s()
+    return int(math.ceil(max(RESTORE_OUTER_FLOOR_S, unit + _margin(unit))))
+
+
 def cys_boot_inner_worst_s():
     return _leaf("PLAN_ROLE_COUNT") * launch_per_node_worst_s()
 
@@ -346,6 +359,7 @@ def table():
             "RESTORE_OUTER_FLOOR_S": RESTORE_OUTER_FLOOR_S,
             "CYS_RESTORE_OUTER_REF_S": cys_restore_outer_s(RESTORE_REF_UNITS),
             "RESTORE_REF_UNITS": RESTORE_REF_UNITS,
+            "RESTORE_STALL_S": cys_restore_stall_s(),
             "PING_RETRY_WORST_S": ping_retry_worst_s(),
             "CHECK_WINDOW_S": check_window_s(),
             "CHECK_INNER_WORST_S": check_inner_worst_s(),
@@ -486,6 +500,9 @@ def self_test():
         # ⑤-b ★R3-2: `cys restore` 외부 상한 — 하한은 종전 90 이상(정당한 leaf 상향이면 1단위도 90 을 넘을 수
         #   있으므로 '==' 가 아니라 '>='), 단위 수에서 파생되며(참조 > 1), 단위 최악치가 Rust 구조 항을 모두 진다.
         assert cys_restore_outer_s(1) >= RESTORE_OUTER_FLOOR_S, "restore 하한이 종전 90 미만(부트 도중 절단 회귀)"
+        # ⑤-c ★리뷰 F1: 무출력 상한은 정상 진행의 최대 무출력 창(기동 1단위)보다 크고, 하한이 종전 90 이다.
+        assert cys_restore_stall_s() >= max(RESTORE_OUTER_FLOOR_S, restore_unit_worst_s()), \
+            "restore 무출력 상한이 1단위 최악치·종전 90 미만(정상 진행을 행으로 오판해 자른다)"
         assert cys_restore_outer_s(RESTORE_REF_UNITS) > cys_restore_outer_s(1), \
             "restore 상한이 단위 수에서 파생되지 않는다(고정 상한 회귀)"
         assert abs(restore_unit_worst_s() - restore_boot_once_worst_s() - launch_lock_wait_max_s()) < 1e-9 \
