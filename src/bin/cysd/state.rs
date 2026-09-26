@@ -1207,10 +1207,6 @@ pub struct Surface {
     /// 마다 +1. stale 리셋 판정이 "같은 바이트 수" 가 아니라 "같은 세대" 를 본다: 옛 초안을 제출하고
     /// 같은 길이의 새 초안을 친 ABA 를 바이트 수는 구분하지 못한다(codex 설계 검토 Q4).
     pub input_gen: AtomicU64,
-    /// ★(0.14.42 · R3-3) 기계 출처 CR/LF 가 줄을 비우며 제출한 마지막 단조 시각(ms · 0 = 없음). 쓰기 =
-    /// [`Surface::apply_pending_input`] 끝의 원자 store 1회(input_gate 락 계약 무변경) · 읽기 = handlers
-    /// `draft_gate_denied_response` 의 정착 증명([`Surface::machine_submit_age_ms`]).
-    pub machine_submit_ms: AtomicU64,
     /// ★R1-blocking-2 입력줄 게이트 — **직접 write 경로와 큐 Inject 경로의 상호배제**.
     ///
     /// 왜 필요한가(codex 감사 실측): `surface.send_text` 는 writer 에 Program 을 넣은 **뒤**
@@ -1431,32 +1427,6 @@ pub struct GatePending {
     pub followup: Option<String>,
 }
 
-/// ★(0.14.42 · R3-3) 정착 증명의 단조 시계(ms) — 프로세스 기준점(`OnceLock<Instant>`) 경과 + 1.
-/// 0 은 `Surface::machine_submit_ms` 의 '없음' 표지라 피한다(결측은 값이 아니다). 벽시계를 쓰지 않는
-/// 이유: 시계 보정·NTP 도약이 증명 창(1초)을 거짓으로 열거나 닫지 않게 한다.
-pub(crate) fn settle_mono_ms() -> u64 {
-    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    (EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64).saturating_add(1)
-}
-
-/// ★(0.14.42 · R3-3) 정착 증명 스탬프 조건(순수) — 이 청크가 **기계 CR/LF 로 줄을 비운 제출**인가.
-///
-/// 참 = 기계 출처 ∧ 적용 뒤 계수 0 ∧ 청크에 CR/LF ∧ (직전 계수 > 0 ∨ 청크에 CR/LF 밖 바이트).
-/// 사람 키(Human)·빈 줄 CR(직전 0 · CR/LF 만)·C-u/C-c 취소(CR/LF 없음)는 거짓이고, 붙여넣기 봉투 안
-/// CR 은 계수에 가산되므로(`pending_input_step`) 적용 뒤 계수가 0 이 아니어서 거짓이다.
-/// 계수 의미는 바꾸지 않는다 — 스탬프는 가산 관측이다.
-pub(crate) fn machine_submit_stamps(
-    origin: crate::governance::InputOrigin,
-    prev_count: u64,
-    next_count: u64,
-    chunk: &[u8],
-) -> bool {
-    origin == crate::governance::InputOrigin::Machine
-        && next_count == 0
-        && chunk.iter().any(|b| matches!(b, b'\r' | b'\n'))
-        && (prev_count > 0 || chunk.iter().any(|b| !matches!(b, b'\r' | b'\n')))
-}
-
 impl Surface {
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계를 **취소**한다(처분자 전용).
     ///
@@ -1516,15 +1486,6 @@ impl Surface {
         self.input_gen.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// ★(0.14.42 · R3-3) 마지막 기계 제출([`machine_submit_stamps`]) 이후 경과(ms). 스탬프가 없으면 `None`
-    /// (결측을 0ms 로 접지 않는다 — 0ms 는 '방금 제출' 이라는 가장 강한 증명이다).
-    pub fn machine_submit_age_ms(&self) -> Option<u64> {
-        match self.machine_submit_ms.load(Ordering::Relaxed) {
-            0 => None,
-            t => Some(settle_mono_ms().saturating_sub(t)),
-        }
-    }
-
     /// 청크 1개를 상태기계에 적용하고 미러·세대를 갱신한다. 새 상태를 돌려준다.
     /// 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
     /// governance 배달 임계영역 · stale 리셋).
@@ -1535,18 +1496,12 @@ impl Surface {
     ) -> crate::governance::PendingInputState {
         let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
-        let prev_count = st.count;
         // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — human 은 D-12 Return 게이트 축이라 stale 하면 자기 본문 제출이 거부된다.
         st.human = st.human.min(st.count);
         let next = crate::governance::pending_input_step(&st, chunk, origin, std::time::Instant::now());
         *st = next.clone();
         drop(st);
         self.set_pending_input(next.count);
-        // ★(0.14.42 · R3-3) 정착 증명 스탬프 — 원자 store 1회뿐이라 'input_gate 안에서는 pending_input
-        //   leaf 만' 락 계약이 그대로다. 소비자는 handlers `draft_gate_denied_response` 하나다.
-        if machine_submit_stamps(origin, prev_count, next.count, chunk) {
-            self.machine_submit_ms.store(settle_mono_ms(), Ordering::Relaxed);
-        }
         next
     }
 
@@ -5401,8 +5356,6 @@ impl Daemon {
             config_dir_trusted,
             pack_reinject: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
-            // ★(0.14.42 · R3-3) 정착 증명 스탬프는 휘발 — 신생·재기동 좌석은 '없음'(0)으로 출발한다.
-            machine_submit_ms: AtomicU64::new(0),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
@@ -8809,63 +8762,6 @@ mod tests {
         crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose)
             .expect("surface 종료 및 자식 프로세스 회수");
         std::fs::remove_dir_all(sock.parent().unwrap()).expect("테스트 상태 디렉터리 정리");
-    }
-
-    /// ★(0.14.42 · R3-3 · T5 스탬프) 정착 증명 스탬프는 **기계 CR/LF 가 줄을 비운 제출**에만 찍힌다.
-    /// 사람 키·빈 줄 CR·C-u 취소·붙여넣기 봉투 안 CR 은 찍지 않는다(결측 = None · 0 은 '없음').
-    #[test]
-    fn r33_machine_submit_stamp_only_on_machine_cr_that_empties_a_line() {
-        use crate::governance::InputOrigin::{Human, Machine};
-
-        let sock = isolated_sock("r33-stamp");
-        let daemon = Daemon::new(sock.clone());
-        let s = daemon
-            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
-            .expect("surface 생성");
-        assert_eq!(s.machine_submit_age_ms(), None, "생성 직후 결측(0 = 없음)");
-        type Chunks<'a> = &'a [(&'a [u8], crate::governance::InputOrigin)];
-        let cases: &[(&str, Chunks, bool)] = &[
-            ("Machine abc → Machine CR", &[(b"abc", Machine), (b"\r", Machine)], true),
-            ("한 청크 abc\\r", &[(b"abc\r", Machine)], true),
-            ("한 청크 abc\\n", &[(b"abc\n", Machine)], true),
-            ("Human abc → Human CR", &[(b"abc", Human), (b"\r", Human)], false),
-            ("Machine CR 단독(빈 줄)", &[(b"\r", Machine)], false),
-            ("Machine abc → C-u", &[(b"abc", Machine), (b"\x15", Machine)], false),
-            ("봉투 안 CR", &[(b"\x1b[200~a\rb\x1b[201~", Machine)], false),
-            ("abc 뒤 봉투 안 CR", &[(b"abc", Machine), (b"\x1b[200~\r\x1b[201~", Machine)], false),
-            ("Machine abc(미제출)", &[(b"abc", Machine)], false),
-        ];
-        let mut got = Vec::new();
-        for (name, chunks, _) in cases {
-            {
-                let _gate = s.input_gate.lock().unwrap_or_else(|e| e.into_inner());
-                s.clear_pending_input();
-                s.machine_submit_ms.store(0, Ordering::Relaxed);
-                for (chunk, origin) in chunks.iter() {
-                    s.apply_pending_input(chunk, *origin);
-                }
-            }
-            got.push((name.to_string(), s.machine_submit_age_ms()));
-        }
-        crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose)
-            .expect("surface 종료 및 자식 프로세스 회수");
-        std::fs::remove_dir_all(sock.parent().unwrap()).expect("테스트 상태 디렉터리 정리");
-        for ((name, age), (_, _, expect)) in got.iter().zip(cases.iter()) {
-            if *expect {
-                // 설계 T5 는 ≤50ms 로 적었다 — 부하 걸린 병렬 러너의 선점 여유로 500ms 상한을 둔다(요점은 Some = 방금 찍힘).
-                assert!(age.is_some_and(|a| a <= 500), "{name}: 스탬프 기대(age ≤ 500ms) — got {age:?}");
-            } else {
-                assert_eq!(*age, None, "{name}: 스탬프 금지");
-            }
-        }
-        // 순수 술어 — 계수 전이와 청크 모양만 본다(cfg 무관).
-        assert!(machine_submit_stamps(Machine, 3, 0, b"\r"));
-        assert!(machine_submit_stamps(Machine, 0, 0, b"x\r"));
-        assert!(!machine_submit_stamps(Machine, 0, 0, b"\r"), "빈 줄 CR");
-        assert!(!machine_submit_stamps(Machine, 0, 0, b"\r\n"), "CR/LF 만");
-        assert!(!machine_submit_stamps(Machine, 3, 1, b"\ry"), "제출 뒤 새 잔여가 남으면 비움이 아니다");
-        assert!(!machine_submit_stamps(Human, 3, 0, b"\r"), "사람 키");
-        assert!(!machine_submit_stamps(Machine, 3, 0, b"\x15"), "취소는 제출이 아니다");
     }
 
     fn sample_feed_item(id: &str, body: String) -> FeedItem {

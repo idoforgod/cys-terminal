@@ -651,17 +651,6 @@ pub const ERR_TYPING_GUARD: &str = "typing_guard";
 pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or use --queued";
 /// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
 pub const DRAFT_GATE_TAG: &str = "draft_gate";
-/// ★(0.14.42 · R3-3) 화면 점유 거부의 **정착 증명** 표지 — 데몬이 `[draft_gate:screen_occupied]` 뒤에 붙인다.
-/// 뜻: 그 좌석에서 정착 창(1초) 안에 기계 CR 이 계수된 줄을 제출했다 = 커서행 점유자는 방금 제출된 줄의
-/// 렌더 잔상이다. `cys send` 는 이 표지가 있을 때만 짧게(≤360ms) 재시도하고, 없으면 종전대로 곧바로 큐로 간다.
-/// 기존 소비자(`is_typing_guard_err`·rc79 접기·UI restartplan)는 contains 판정이라 접두는 무변경이다.
-pub const SEND_SETTLE_TAG: &str = "[settle:recent_submit]";
-
-/// ★(0.14.42 · R3-3) `CYS_SEND_SETTLE` 끔 판정(순수 · 데몬·CLI 단일 정의처) — `0`·`false`·`off`(대소문자·
-/// 앞뒤 공백 무시)만 끈다. 결측·빈 값·그 밖의 값은 켬(기본값)이다.
-pub fn send_settle_env_off(v: Option<&str>) -> bool {
-    v.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-}
 /// D-12 CancelKey(원시 Ctrl-U/Ctrl-C) 거부 문구 — `MSG_TYPING_GUARD` 와 달리 `--queued` 를
 /// 안내하지 않는다: 취소 키는 텍스트 큐에 실을 수 없어(send_key queued 는 Return/Enter 한정)
 /// 그 처방은 존재하지 않는 경로를 가리킨다(수정 라운드 3 · 감사 minor). 코드는 `ERR_TYPING_GUARD` 를 유지한다.
