@@ -577,6 +577,7 @@ impl RouteState {
     /// 큐 WAL 에 들어간 뒤에 예산을 쓰면 그 사이의 크래시가 "적재는 됐는데 예산은 안 쓴" 상태를
     /// 남겨 같은 실제 한 시간에 상한을 넘긴다. 반대 순서의 크래시는 "쓰지 않은 예산 1건 소모" 로
     /// **보수적**이다(막는 방향).
+    #[cfg(test)]
     pub fn reserve_admission(&mut self, key: &AlertKey, mono: f64) -> Option<f64> {
         self.reserve_admission_as(key, mono, false)
     }
@@ -596,6 +597,7 @@ impl RouteState {
 
     /// 예약 되돌리기 — **적재가 실패했을 때만**(디스크에 예약이 이미 내구화됐다면 그 세대에서는
     /// 한 칸을 손해 보고 지나간다: 보수적인 쪽이다).
+    #[cfg(test)]
     pub fn rollback_admission(&mut self, key: &AlertKey, prev: Option<f64>, mono: f64) {
         self.rollback_admission_as(key, prev, mono, false)
     }

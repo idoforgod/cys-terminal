@@ -1498,6 +1498,9 @@ const AGY_LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// agy lsof 실행(시간 상한 · 초과면 자식 kill · 실패·초과 = None → 호출부의 '포트 없음' 폴백).
 async fn agy_lsof_output(args: Vec<String>) -> Option<std::process::Output> {
+    if cfg!(windows) {
+        return None; // lsof 부재(호출부와 같은 이유 · 스폰 0 — 콘솔 창 정책 대상 밖)
+    }
     let fut = tokio::process::Command::new("lsof").args(args).kill_on_drop(true).output();
     tokio::time::timeout(AGY_LSOF_TIMEOUT, fut).await.ok()?.ok()
 }

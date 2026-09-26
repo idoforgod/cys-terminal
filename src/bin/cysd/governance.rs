@@ -22183,7 +22183,9 @@ mod h_machine_hold_tests {
             "channels::inject_master_confirmed",
             "schedule::inject_on",
             "handlers::deliver_to_ceo",
-            "boot_supervisor::notify_no_spawn",
+            // ★(R3SH-3) 통보 줄 쓰기가 즉시·미룬 재시도 공용 `pane_notice_line` 으로 모였다 — 두 호출자가 모두 그 앞에서
+            //   `pane_notice_hold`(H0) 를 판정한다(아래 순서 핀).
+            "boot_supervisor::pane_notice_line",
             "handlers::announce_seat_takeover",
             "handlers::npm_prefix_pane_notice_req",
             "handlers::send_text_write_req",
@@ -22210,9 +22212,13 @@ mod h_machine_hold_tests {
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "record_audited("),
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Inject"),
             // H5 — 부트 감독자 무스폰 통보: 하드축 판정이 원장 선기록·주입보다 앞(feed 는 그보다 앞 · 무조건).
-            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "push_feed_notification(", "machine_direct_hold("),
-            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "machine_direct_hold(", "record_audited("),
-            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "machine_direct_hold(", "write_tx.try_send("),
+            //   ★(R3SH-3) 판정은 `pane_notice_hold`(H0) · 쓰기는 `pane_notice_line`(원장 선기록 → 주입) — 즉시 경로와 미룬
+            //   재시도 경로 모두 판정이 쓰기보다 앞이다.
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "push_feed_notification(", "pane_notice_hold("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "pane_notice_hold(", "pane_notice_line("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "retry_deferred_pane_notices", "pane_notice_hold(", "pane_notice_line("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_hold", "machine_hold_enabled(", "machine_direct_hold("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_line", "record_audited(", "write_tx.try_send("),
         ];
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));

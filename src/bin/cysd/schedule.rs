@@ -1943,7 +1943,8 @@ fn schedule_divert_ttl_secs(job: &Job) -> Option<u64> {
     // ★(0.14.42 · R3SH-5 ①) 자기 예약 원샷 wake(`at`)는 발화 시점에 파일에서 지워져 **다시 오지 않는다** — 우회 항목이
     //   데몬 기본 TTL(6h)로 만료되면 그 wake 는 조용히 사라진다(오너 밤샘 부재 = 초안 보류 6h 초과). 만료 없음(0)으로
     //   두고 초안이 풀리면 배달한다. 같은 잡의 대기는 1회분이라(R1-F3 적재 중복 제거) 쌓이지 않는다.
-    if job.at.is_some() && job.every_minutes.filter(|m| *m > 0).is_none() {
+    //   fresh 원샷은 제외한다 — 회수 타이머가 미처분 항목을 기다리므로 만료 없는 항목이면 갓 띄운 좌석이 영영 회수되지 않는다.
+    if job.at.is_some() && !job.fresh && job.every_minutes.filter(|m| *m > 0).is_none() {
         return Some(0);
     }
     let period = job.every_minutes.filter(|m| *m > 0)?.saturating_mul(60);
