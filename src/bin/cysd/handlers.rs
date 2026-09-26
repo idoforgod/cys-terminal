@@ -7237,6 +7237,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   새 세션으로 바꾸고 즉시 영속한다(판정 `usage::clear_repin_verdict` — 조건·실패 방향은 그 doc).
             //   킬스위치 `CYS_CLEAR_REPIN=0` 이면 이 블록 전체가 없다(판정·계통 판독·persist·이벤트 0). 그 밖은 무변경.
             //   /clear 1회당 늘어나는 것: 이벤트 최대 1건 · persist 최대 1회(핀이 실제로 바뀔 때만) · 계통 판독 최대 1회.
+            //   ★(리뷰 F3) 비 clear 등록(startup·resume·compact)도 연속성 기준 갱신에 계통 판독을 1회 쓴다(좌석 자손 발신 ·
+            //   claude 좌석 · 킬스위치 켜짐일 때만) — 실측(2026-09-26 · 샌드박스 · 좌석 안 발신 20회) 등록 왕복 p50
+            //   release 약 20ms(판독 없는 debug 종전 6.2ms). SessionStart 1회당 1번이고 블로킹 풀에서 락 없이 돈다.
             let source = param_str(&params, "source");
             let repin_on = crate::usage::clear_repin_enabled();
             let meta = surface.agent_meta.lock().unwrap().clone();
