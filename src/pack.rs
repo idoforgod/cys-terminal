@@ -91,20 +91,28 @@ pub fn embedded_pack_hash() -> String {
 /// 메모 본체 — 첫 호출 때만 계산해 프로세스 수명 동안 보관한 값의 참조. 기동 때 미리 계산하지
 /// 않는다(부트 체인에 비용을 얹지 않는다). 동시에 여러 스레드가 첫 호출을 하면 한 스레드만
 /// 계산하고 나머지는 그 결과를 기다린다(`OnceLock`).
+///
+/// ★(0.14.42 통합 검증) `PACK_ALL` 은 `const` 라 참조하는 코드 생성 단위마다 팩 전체가 따로 실릴 수 있다.
+/// 해시 루프를 `get_or_init` 의 제네릭 클로저 안에 두면 release 바이너리에 팩 사본이 하나 더 생긴다(실측 +≈11MB ·
+/// 핀 `embedded_pack_hash_memo_closure_does_not_touch_pack_all`). 그래서 참조는 이 비제네릭 본체에서 뜨고 클로저는
+/// 슬라이스만 받는다 — 값·메모 동작은 그대로다.
 fn embedded_pack_hash_ref() -> &'static str {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        for (rel, content) in PACK_ALL.iter() {
-            h.update(rel.as_bytes());
-            h.update(b"\0");
-            h.update(content.as_bytes());
-            h.update(b"\0");
-        }
-        format!("{:x}", h.finalize())
-    })
-    .as_str()
+    let items: &'static [(&'static str, &'static str)] = PACK_ALL;
+    HASH.get_or_init(|| pack_items_sha256(items)).as_str()
+}
+
+/// 임베드 팩 해시 계산부(rel\0content\0 스트리밍 SHA-256) — `embedded_pack_hash_ref` 의 메모 안에서만 부른다.
+fn pack_items_sha256(items: &[(&str, &str)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (rel, content) in items {
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        h.update(content.as_bytes());
+        h.update(b"\0");
+    }
+    format!("{:x}", h.finalize())
 }
 
 /// ★팩 경로 env 키의 **우선순위 목록 정본**(W14 S19 · 2026-07-26).
@@ -4531,6 +4539,26 @@ mod tests {
             best * 10 < oracle_cost,
             "embedded_pack_hash 가 호출마다 재계산된다: 5회 중 최소 {best:?} · 오라클 1회 {oracle_cost:?} (해시 입력 {bytes} B)"
         );
+    }
+
+    /// ★(0.14.42 통합 검증) 임베드 팩 **사본 수** 핀. `PACK_ALL` 은 build.rs 가 만든 `const` 라 그것을 참조하는
+    /// 코드 생성 단위(CGU)마다 팩 전체(≈10MB 문자열)가 따로 실릴 수 있다. 메모 해시 루프를 `OnceLock::get_or_init`
+    /// 의 제네릭 클로저 안에 두면 그 단형화가 다른 CGU 로 가서 release 바이너리에 팩 사본이 하나 더 생겼다
+    /// (실측 2026-09-26 · a02aa79c 전후 release `cys` 30,183,808 → 41,148,624 B · 팩 문장 출현 2 → 3회 · cysd 도 +11MB).
+    /// 그래서 `PACK_ALL` 참조는 비제네릭 메모 본체에서 한 번 뜨고, 클로저에는 슬라이스만 넘긴다 — 그 **모양**을 핀한다.
+    /// (사본 수 자체는 release 산출물 측정으로만 보인다 — 이 핀은 그 회귀를 되부르는 소스 모양을 막는다.)
+    #[test]
+    fn embedded_pack_hash_memo_closure_does_not_touch_pack_all() {
+        let src = include_str!("pack.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("테스트 모듈 경계")];
+        let i = prod.find("fn embedded_pack_hash_ref()").expect("메모 본체 소실");
+        let body = &prod[i..i + prod[i..].find("\n}\n").expect("메모 본체 끝")];
+        let c = body.find(".get_or_init(").expect("OnceLock 메모 소실");
+        assert!(
+            !body[c..].contains("PACK_ALL"),
+            "메모 클로저가 PACK_ALL 을 직접 참조한다 — release 바이너리에 임베드 팩 사본이 하나 더 실린다(+≈11MB/바이너리)"
+        );
+        assert!(body[..c].contains("PACK_ALL"), "메모 본체가 PACK_ALL 을 비제네릭 위치에서 참조하지 않는다");
     }
 
     // ── ★U10(0.14.41) 각성 훅 경고 — 레인 팩 단독 기대값 · 표기 정규화(관측 전용) ─────────────
