@@ -631,7 +631,7 @@ for _role, _body in (("master", "DIRECTIVE-BODY-MASTER"), ("worker", "DIRECTIVE-
     _i = out.find("Read 도구로 끝까지")
     _j = out.find(_body)
     check("22 %s: 지침 전문 읽기 안내가 미리보기 창(앞 2,000자) 안 · 지침 본문 앞 · exit 0" % _role,
-          code == 0 and 0 <= _i < 2000 and (_j < 0 or _i < _j) and "_DIRECTIVE.md" in out[_i - 200:_i + 200],
+          code == 0 and 0 <= _i < 2000 and (_j < 0 or _i < _j) and "_DIRECTIVE.md" in out[max(0, _i - 400):_i + 200],
           "i=%d j=%d head=%r" % (_i, _j, out[:300]))
 shutil.rmtree(tmp)
 

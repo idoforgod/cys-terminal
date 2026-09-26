@@ -262,8 +262,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   **전부** 충족되면 master 가 ack 를 보내지 못해도 §2 대로 집행한다 — ①데몬이 발화한
   `context.threshold`(60%) 수신 ②안전지점 확인(master 가 게이트·커밋 중간이 아님 · 오너 실시간 입력
   중 아님 · AUTOPILOT_PAUSED 아님) ③저장 상태의 **독립 검증**(checksum 대조·최신 mtime — master 의
-  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker` **1콜**(Bash 도구
-  timeout 600000 · 전경 — 도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다)
+  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker` **1콜**
   ★검증자에 ★너 자신(cso)을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중
   블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82
   verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼
@@ -271,6 +270,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   (`--force-no-verify` 금지 · 키를 손으로 치지 않는다). 넷 중 **하나라도 결측·판정 불능**이면 이 경계가
   아니라 ④의 보류이고, 낡음(미저장 위험)은 clear 금지 + 오너 escalation 이다(§2 무응답 정책 그대로 ·
   결측은 값이 아니다).
+  ④의 1콜은 Bash 도구 timeout 600000 · 전경으로 실행한다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다).
   **③이 증명하는 것의 범위**: checksum·mtime 은 **저장된 파일의 상태**만 증명한다 — master 의 메모리
   작업·입력줄 초안·진행 중 도구 호출까지 저장됐다는 증거가 아니다. 그러므로 ③의 뜻은 '미저장 작업
   없음의 증명' 이 아니라 **'저장 기준선이 신선함'** 이고, 대조가 불일치하거나 읽을 수 없으면 **신선
