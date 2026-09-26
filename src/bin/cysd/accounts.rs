@@ -1158,6 +1158,26 @@ pub fn report_outside(
 ///   ④ 빈도 상한(프로필 dir 단위): [`OUTSIDE_MIN_INTERVAL_SECS`] 하한 · 같은 값은 [`OUTSIDE_SAME_VALUE_SECS`].
 ///   ⑤ 그 프로필의 신원(`.claude.json` oauthAccount)이 읽힌다 — 아니면 `identity_unresolved`.
 /// 쓰는 것은 `note_rate`(계정 뷰 + rate 스냅샷) 하나뿐이다 — 좌석·배지·이벤트·임계·비용 무접촉.
+/// ★(R4-01) `raw` 가 `root` 의 **진하위** 경로인가(어휘적 · 파일시스템 무접촉). Windows 는 대소문자·구분자·`\\?\` 접두를
+/// 가리지 않는다(훅이 넘기는 드라이브 문자 대소문자가 열거 경로와 달라도 같은 폴더다 — 판정이 좁아지면 정상 보고가 거절된다).
+fn path_strictly_under(raw: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let norm = |p: &Path| {
+            let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
+            s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+        };
+        let r = norm(root);
+        let r = r.trim_end_matches('\\');
+        let x = norm(raw);
+        x.len() > r.len() + 1 && x.starts_with(r) && x.as_bytes()[r.len()] == b'\\'
+    }
+    #[cfg(not(windows))]
+    {
+        raw.starts_with(root) && raw != root
+    }
+}
+
 fn report_outside_at(
     daemon: &Arc<Daemon>,
     home: Option<&Path>,
@@ -1166,7 +1186,26 @@ fn report_outside_at(
     now: f64,
 ) -> Result<OutsideOutcome, &'static str> {
     let home = home.ok_or("home_unknown")?;
-    // ① 실재 — 먼저 한다(없는 경로면 홈 폴더 열거조차 하지 않는다).
+    // ⓪ ★(0.14.42 · R4-01) **파일시스템을 건드리기 전에** 문자열로 먼저 거른다 — 호출자가 준 경로가 알려진 프로필 dir 의
+    //   `projects/` 아래(어휘적 · `..` 없음)가 아니면 거절한다. 종전 첫 동작이 호출자 경로의 `canonicalize` 라, 무인증 RPC 가
+    //   `/net/<host>/…`(autofs NFS 마운트)·응답 없는 SMB/NFS 경로를 주면 핸들러가 stat 에서 무기한 멈췄다 — 그런 핸들러
+    //   128개가 입장 게이트 허가를 쥐면 ping 을 뺀 전 RPC(GUI 키 입력·훅·CLI)가 영구 대기한다(④ 관측 사각).
+    //   프로필 dir 의 정규화(홈 아래 로컬 경로)는 호출자 경로와 무관하므로 후보에 함께 넣는다(심볼릭 링크 홈 호환).
+    let raw = Path::new(session_file);
+    if !raw.is_absolute() || raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("session_file_outside_profiles");
+    }
+    let lexically_inside = cys::profile_gate::enumerate_profile_dirs(home).into_iter().any(|d| {
+        let mut roots = vec![d.join("projects")];
+        if let Ok(cd) = std::fs::canonicalize(&d) {
+            roots.push(cd.join("projects"));
+        }
+        roots.iter().any(|r| path_strictly_under(raw, r))
+    });
+    if !lexically_inside {
+        return Err("session_file_outside_profiles");
+    }
+    // ① 실재 — 어휘 검사를 지난 경로만(프로필 dir 아래라 로컬 홈이다).
     let canon = std::fs::canonicalize(session_file).map_err(|_| "session_file_missing")?;
     if !canon.is_file() || canon.extension().and_then(|e| e.to_str()) != Some("jsonl") {
         return Err("session_file_missing");
@@ -1770,6 +1809,20 @@ mod tests {
         }
         assert_eq!(report_outside_at(&d, Some(&home), &p(".claude-5/projects/-w/s.jsonl"), &r, now), Err("identity_unresolved"));
         assert_eq!(report_outside_at(&d, None, &p(".claude-3/projects/-w/nope.jsonl"), &r, now), Err("home_unknown"));
+        // ★(R4-01) 프로필 밖 경로는 **파일시스템을 건드리기 전에** 거절한다 — 없는 경로라도 `missing` 이 아니라
+        //   `outside_profiles`(= canonicalize 에 닿지 않았다). `..` 로 프로필 밖을 가리키는 어휘 우회도 같은 판정.
+        //   RED(HEAD 1b614e47): 첫 경로가 canonicalize 실패로 session_file_missing.
+        assert_eq!(
+            report_outside_at(&d, Some(&home), "/net/cys-unreachable-host/projects/-w/s.jsonl", &r, now),
+            Err("session_file_outside_profiles"),
+            "프로필 밖 경로를 파일시스템으로 먼저 확인했다(응답 없는 마운트면 무기한 대기)"
+        );
+        assert_eq!(
+            report_outside_at(&d, Some(&home), &p(".claude-3/projects/../../elsewhere/projects/-w/s.jsonl"), &r, now),
+            Err("session_file_outside_profiles"),
+            "`..` 어휘 우회"
+        );
+        assert_eq!(report_outside_at(&d, Some(&home), "relative/projects/s.jsonl", &r, now), Err("session_file_outside_profiles"));
         assert!(claude_rows(&d).is_empty(), "거절된 보고가 계정 행을 만들었다: {:?}", claude_rows(&d));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);

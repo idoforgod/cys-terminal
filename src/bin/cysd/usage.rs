@@ -1475,9 +1475,12 @@ pub fn parse_agy_quota(v: &Value) -> Vec<RateWindow> {
 /// ★`-a` 필수(0.14.42 RC2-a): lsof 는 선택 조건(`-p`·`-i`)을 기본 **OR** 로 합친다. 종전 인자에는 `-a` 가
 /// 없어 "이 pid 의 파일 **또는** 기계 전체의 LISTEN 소켓"이 나왔고, 12개 상한과 겹쳐 각 데몬이 자기 agy 가
 /// 아니라 Discord·aside-daemon·pid 가 가장 작은 (다른 부서의) agy 포트를 두드렸다(2026-09-23 실측).
+/// ★(0.14.42 · R4-03) `-b`(stat·lstat·readlink 처럼 막힐 수 있는 커널 호출 회피)·`-w`(그로 인한 경고 억제) — agy 가 멈춘
+/// 네트워크 마운트의 파일을 쥐고 있어도 lsof 가 stat 에서 서지 않는다(이 맥 실측: -b -w 유무로 -Fn 출력 동일). 호출부는 따로
+/// [`AGY_LSOF_TIMEOUT`] 로 감싼다.
 fn agy_lsof_listen_args(pid: u32) -> Vec<String> {
     let pid = pid.to_string();
-    ["-nP", "-a", "-p", pid.as_str(), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+    ["-b", "-w", "-nP", "-a", "-p", pid.as_str(), "-iTCP", "-sTCP:LISTEN", "-Fn"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -1486,7 +1489,17 @@ fn agy_lsof_listen_args(pid: u32) -> Vec<String> {
 /// agy 가 연 파일 목록을 묻는 lsof 인자 — 자기 로그 파일을 찾는다(선택 조건이 하나라 OR 문제는 없다).
 fn agy_lsof_files_args(pid: u32) -> Vec<String> {
     let pid = pid.to_string();
-    ["-nP", "-a", "-p", pid.as_str(), "-Fn"].iter().map(|s| s.to_string()).collect()
+    ["-b", "-w", "-nP", "-a", "-p", pid.as_str(), "-Fn"].iter().map(|s| s.to_string()).collect()
+}
+
+/// ★(0.14.42 · R4-03) agy lsof 한 번의 시간 상한 — 같은 파일의 curl 프로브(3s)와 같은 규율. 수집기 루프는 틱 하나가 끝나야
+/// 다음 틱으로 가므로, 상한 없는 await 하나가 멈추면 agy 쿼터 관측 전체가 조용히 끊긴다.
+const AGY_LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// agy lsof 실행(시간 상한 · 초과면 자식 kill · 실패·초과 = None → 호출부의 '포트 없음' 폴백).
+async fn agy_lsof_output(args: Vec<String>) -> Option<std::process::Output> {
+    let fut = tokio::process::Command::new("lsof").args(args).kill_on_drop(true).output();
+    tokio::time::timeout(AGY_LSOF_TIMEOUT, fut).await.ok()?.ok()
 }
 
 /// agy 로그의 언어 서버 줄 머리말(agy 1.1.x `server.go`). 2026-09-23 실측: 로그 4개 모두 첫 ~300바이트에
@@ -1539,11 +1552,7 @@ async fn agy_ls_port_from_log(pid: u32) -> Option<u16> {
     if cfg!(windows) {
         return None; // lsof 부재(agy_listen_ports 와 같은 이유 · 스폰 0)
     }
-    let out = tokio::process::Command::new("lsof")
-        .args(agy_lsof_files_args(pid))
-        .output()
-        .await
-        .ok()?;
+    let out = agy_lsof_output(agy_lsof_files_args(pid)).await?;
     let path = agy_log_path_from_lsof(&String::from_utf8_lossy(&out.stdout))?;
     let mut head = Vec::new();
     std::fs::File::open(&path)
@@ -1664,11 +1673,7 @@ async fn agy_listen_ports(pid: u32) -> Vec<u16> {
     if cfg!(windows) {
         return Vec::new();
     }
-    let Ok(out) = tokio::process::Command::new("lsof")
-        .args(agy_lsof_listen_args(pid))
-        .output()
-        .await
-    else {
+    let Some(out) = agy_lsof_output(agy_lsof_listen_args(pid)).await else {
         return Vec::new();
     };
     let mut ports = Vec::new();
@@ -2536,6 +2541,20 @@ mod tests {
         for need in ["-iTCP", "-sTCP:LISTEN", "-Fn"] {
             assert!(a.iter().any(|x| x == need), "{need} 부재: {a:?}");
         }
+        // ★(R4-03) 두 호출 모두 비차단(-b)·경고 억제(-w) — 멈춘 네트워크 마운트에서 stat 대기 금지.
+        for args in [super::agy_lsof_listen_args(61666), super::agy_lsof_files_args(61666)] {
+            assert!(args.iter().any(|x| x == "-b") && args.iter().any(|x| x == "-w"), "비차단 인자 부재: {args:?}");
+        }
+    }
+
+    /// ★(R4-03) agy lsof 는 시간 상한 안에서만 기다린다 — 상한 없는 `.output().await` 가 남으면 수집기 태스크가 영구 정지한다.
+    #[test]
+    fn agy_lsof_calls_are_time_bounded() {
+        let src = include_str!("usage.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests").expect("테스트 앵커")];
+        assert_eq!(body.matches("Command::new(\"lsof\").args(args).kill_on_drop(true)").count(), 1);
+        assert!(body.contains("tokio::time::timeout(AGY_LSOF_TIMEOUT, fut)"), "agy lsof 시간 상한 소실");
+        assert_eq!(body.matches("agy_lsof_output(").count(), 3, "agy lsof 호출이 상한 래퍼를 우회한다");
     }
 
     /// RC2-a: agy 언어 서버 포트는 agy 가 연 로그의 첫머리에 결정론으로 적힌다(2026-09-23 실측 4개 로그 모두

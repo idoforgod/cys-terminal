@@ -1661,7 +1661,14 @@ fn walk_legacy(
     caller_pid: u32,
 ) -> (Option<u64>, Option<u64>) {
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    // ★(0.14.42 · R4-05) 쓰는 것은 parent·start_time 뿐(둘 다 기본 판독) — 프로세스마다 memory·cpu·disk·exe 까지 읽던
+    //   `refresh_processes` 를 `nothing()` 으로 낮춘다. FATAL-1 (b) 로 rayon 병렬이 꺼져 이 전체 스캔이 순차가 된 Windows·
+    //   Linux(와 macOS 롤백 노브)에서 caller_cache 미스마다 치르는 비용을 줄인다(결과 불변 — 핀 legacy_walk_light_refresh_…).
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
     let caller_start = sys
         .process(sysinfo::Pid::from_u32(caller_pid))
         .map(|p| p.start_time());
@@ -16874,6 +16881,26 @@ mod tests {
         // 합성: reader 가 호출자에 None → (Some(sid), None) — legacy 의미와 같다.
         let synth = walk_fast_with(&map, pid, |_| None);
         assert_eq!(synth, (Some(41), None));
+    }
+
+    /// ★(R4-05) legacy 워크의 경량 갱신(`ProcessRefreshKind::nothing()`)도 쓰는 두 값(parent · start_time)을 전체 갱신과
+    /// **같게** 준다 — 전 OS(Windows CI 포함)에서 돈다. 이 값이 빠지면 신원 워크가 조용히 외부(None)로 접힌다.
+    #[test]
+    fn legacy_walk_light_refresh_keeps_parent_and_start_time() {
+        let me = sysinfo::Pid::from_u32(std::process::id());
+        let mut full = sysinfo::System::new();
+        full.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let mut light = sysinfo::System::new();
+        light.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing(),
+        );
+        let (f, l) = (full.process(me).expect("전체 갱신에 자기 자신"), light.process(me).expect("경량 갱신에 자기 자신"));
+        assert!(l.parent().is_some(), "경량 갱신이 parent 를 주지 않는다");
+        assert_eq!(f.parent(), l.parent(), "parent 가 다르다");
+        assert_eq!(f.start_time(), l.start_time(), "start_time 이 다르다");
+        assert!(l.start_time() > 0);
     }
 
     /// ★(D-1b · T4) 실제 트리(sh → sleep 손자)에서 fast 와 legacy 워크가 found·caller_start 모두 같다.

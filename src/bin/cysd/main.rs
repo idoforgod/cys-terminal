@@ -1384,6 +1384,8 @@ async fn async_main() {
     // 불사조 복원 프로토콜의 "채널 재조정" 단계. 그 다음 주기 sweep(재배달·타임아웃·재스폰) 등록.
     channels::reconcile(&daemon);
     channels::spawn_channel_sweep(Arc::clone(&daemon));
+    // ★(0.14.42 · R4-01) 입장 게이트 포화 관측 — ping·하트비트가 초록인 채 전 RPC 가 서는 사각을 이벤트·feed 로 드러낸다.
+    spawn_dispatch_gate_watch(Arc::clone(&daemon));
     // 셧다운 경로: 원장은 메모리 전용이라 데몬이 죽으면 scoped 프로세스를 아무도 회수하지
     // 못한다 — SIGTERM/SIGINT 때 scoped 그룹을 전부 정리한 뒤 종료한다.
     #[cfg(unix)]
@@ -2939,6 +2941,61 @@ fn parse_write_stall_cap(raw: Option<&str>) -> Option<std::time::Duration> {
 const DISPATCH_INFLIGHT_MAX: usize = 128;
 static DISPATCH_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(DISPATCH_INFLIGHT_MAX);
 
+/// ★(0.14.42 · R4-01) 게이트 포화 관측 주기(초)와 경보 문턱(연속 포화 초).
+const DISPATCH_GATE_WATCH_SECS: u64 = 5;
+const DISPATCH_GATE_SATURATED_ALERT_SECS: u64 = 30;
+
+/// ★(0.14.42 · R4-01) 포화 판정(순수) — 틱마다 `available == 0` 이면 연속 포화 초를 늘리고, 아니면 0. 반환 `(새 연속 초, 이번에
+/// 경보를 낼 것인가, 이번에 회복을 알릴 것인가)`. 경보는 문턱을 **처음** 넘은 틱에 1회, 회복은 경보 뒤 첫 비포화 틱에 1회.
+fn dispatch_gate_watch_step(saturated_secs: u64, alerted: bool, available: usize, tick_secs: u64) -> (u64, bool, bool) {
+    if available == 0 {
+        let next = saturated_secs.saturating_add(tick_secs);
+        (next, !alerted && next >= DISPATCH_GATE_SATURATED_ALERT_SECS, false)
+    } else {
+        (0, false, alerted)
+    }
+}
+
+/// ★(0.14.42 · R4-01) 입장 게이트([`DISPATCH_INFLIGHT_MAX`]) 포화 관측 태스크. 무기한 멈춘 핸들러가 허가를 전부 쥐면 ping 을 뺀
+/// 모든 RPC(GUI 키 입력·훅·CLI)가 대기하는데, ping·하트비트·데드맨은 초록이라 자동 회복도 진단도 되지 않았다(④ 관측 사각).
+/// 연속 [`DISPATCH_GATE_SATURATED_ALERT_SECS`] 포화면 `dispatch.saturated` 이벤트 + feed(kind=`error` — 정보성 알림 kind · 승인 요청으로 보이지 않게) 1회, 풀리면
+/// `dispatch.recovered` 1회. 발행뿐(자동 조치 없음 — 회수는 운영자 판단).
+fn spawn_dispatch_gate_watch(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(DISPATCH_GATE_WATCH_SECS));
+        let (mut sat, mut alerted) = (0u64, false);
+        loop {
+            tick.tick().await;
+            let available = DISPATCH_GATE.available_permits();
+            let (next, alert, recovered) = dispatch_gate_watch_step(sat, alerted, available, DISPATCH_GATE_WATCH_SECS);
+            sat = next;
+            if alert {
+                alerted = true;
+                let body = format!(
+                    "데몬 RPC 입장 게이트가 {next}초째 포화(동시 실행 {DISPATCH_INFLIGHT_MAX}건 전부 점유)다 — ping 은 응답하지만 \
+                     키 입력·훅·CLI 요청이 대기 중이다. 멈춘 요청(느린 파일시스템 경로 등)을 의심하라."
+                );
+                daemon.bus.publish(
+                    "dispatch.saturated",
+                    "system",
+                    None,
+                    serde_json::json!({"inflight_max": DISPATCH_INFLIGHT_MAX, "saturated_secs": next, "note": body}),
+                );
+                daemon.push_feed_notification("error", "데몬 요청 처리 포화", &body, None);
+            }
+            if recovered {
+                alerted = false;
+                daemon.bus.publish(
+                    "dispatch.recovered",
+                    "system",
+                    None,
+                    serde_json::json!({"inflight_max": DISPATCH_INFLIGHT_MAX, "available": available}),
+                );
+            }
+        }
+    });
+}
+
 /// 입장 면제 — 생존 프로브(`system.ping`) 하나뿐. 핸들러가 즉답(`"pong"`)이라 블로킹 스레드를
 /// 마이크로초만 쓴다. 폭주 중에도 데드맨 `probe_holder`·CLI 생존 확인이 줄 뒤에 서지 않게 해
 /// '살아 있는데 hung 으로 오판 → 회수'(④) 경로를 막는다. 판정은 정확 일치(대소문자·공백 변형 불인정).
@@ -4326,6 +4383,32 @@ mod fatal1_admission_tests {
         for m in ["surface.list", "org.status", "surface.reap", "system.ping ", "System.ping", "", "system.pingx"] {
             assert!(!dispatch_admission_exempt(m), "{m:?} 는 면제가 아니다");
         }
+    }
+
+    /// ★(R4-01) 게이트 포화 관측 판정 — 연속 포화가 문턱(30s)에 처음 닿은 틱에 경보 1회 · 계속 포화면 재경보 없음 ·
+    /// 풀리면 회복 1회 · 포화가 끊기면 계수 0. 배선은 부트 경로에 1곳(소스 핀).
+    #[test]
+    fn dispatch_gate_watch_alerts_once_then_recovers() {
+        let t = DISPATCH_GATE_WATCH_SECS;
+        let (mut sat, mut alerted) = (0u64, false);
+        let mut alerts = 0;
+        for _ in 0..(DISPATCH_GATE_SATURATED_ALERT_SECS / t + 5) {
+            let (n, a, r) = dispatch_gate_watch_step(sat, alerted, 0, t);
+            sat = n;
+            assert!(!r);
+            if a {
+                alerts += 1;
+                alerted = true;
+            }
+        }
+        assert_eq!(alerts, 1, "포화 경보는 에피소드당 1회");
+        let (n, a, r) = dispatch_gate_watch_step(sat, alerted, 3, t);
+        assert_eq!((n, a, r), (0, false, true), "풀리면 회복 1회 · 계수 0");
+        let (n, a, _) = dispatch_gate_watch_step(0, false, 0, t);
+        assert!(!a && n == t, "짧은 포화는 경보가 아니다");
+        let src = include_str!("main.rs");
+        let body = &src[..src.find("#[cfg(test)]").expect("테스트 앵커")];
+        assert_eq!(body.matches("spawn_dispatch_gate_watch(Arc::clone(&daemon));").count(), 1, "포화 관측 태스크 배선 소실");
     }
 
     fn leak_gate(n: usize) -> &'static tokio::sync::Semaphore {
