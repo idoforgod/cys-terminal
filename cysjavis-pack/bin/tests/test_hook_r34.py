@@ -276,6 +276,51 @@ try:
               body_count(d) == 1 and NOTE not in r.stdout and r.returncode == 0,
               "%.2fs body=%d %r" % (el, body_count(d), r.stdout[:100]))
 
+        # ───────── NZ: **끝난 자식을 스스로 회수하지 않는 셸**(리뷰 F4) ─────────
+        #   완료 신호가 `kill -0` 실패라, 셸이 끝난 백그라운드 자식을 회수하지 않으면 좀비에 `kill -0` 이 계속 성공한다
+        #   → 매 프롬프트가 시한까지 기다린 뒤 T2-2 로 빠져 rc0(proceed) 본문을 건너뛴다(종전 RCF 존재 판정은 면역).
+        #   후보: sleep 을 포크하지 않고(NOFORK) SIGCHLD 로도 회수하지 않는 셸(예: FEATURE_SH_NOFORK busybox ash) —
+        #   이 머신에 없어 **모형**으로 잰다: bash + BASH_ENV 로 `kill -0` 을 '회수 전까지 성공(좀비)' 으로, 명시 회수
+        #   내장(`jobs`·`wait`)을 '회수' 로 바꾼다. 런처는 RCF 에 값이 찬 뒤 비차단 회수(`jobs`)를 불러야 이 모형을
+        #   지난다. `wait` 는 쓰지 않는다 — 늦은 기록자(RCF-4)가 값을 채운 채 이번 자식이 살아 있으면 무상한 대기다.
+        bash_bin = shutil.which("bash")
+        if bash_bin:
+            def run_nz(name, **extra):
+                d, hooks, binp, state, env = lab(root, name, wrap=())
+                zd = os.path.join(d, "zombie")
+                os.makedirs(zd)
+                model = os.path.join(d, "no-reap-model.sh")
+                w(model, 'kill() {\n'
+                         '  if [ "$1" = -0 ]; then\n'
+                         '    command kill -0 "$2" 2>/dev/null && return 0\n'
+                         '    [ -e "$NZ_DIR/reaped" ] && return 1\n'
+                         '    return 0\n'
+                         '  fi\n'
+                         '  command kill "$@"\n'
+                         '}\n'
+                         'jobs() { command jobs "$@"; : > "$NZ_DIR/reaped"; }\n'
+                         'wait() { command wait "$@"; _nz_r=$?; : > "$NZ_DIR/reaped"; return $_nz_r; }\n')
+                e = dict(env, BASH_ENV=model, NZ_DIR=zd)
+                e.update({k: str(v) for k, v in extra.items()})
+                t0 = time.monotonic()
+                r = subprocess.run([bash_bin, os.path.join(hooks, "role-bootstrap.sh")], input='{"prompt":"hello"}',
+                                   capture_output=True, text=True, timeout=90, env=e)
+                return d, r, time.monotonic() - t0
+            d, r, el = run_nz("nz1", STUB_RC=0, CYS_HOOK_INPUT_DEADLINE_S=3)
+            check("NZ-1 비회수 셸 모형 · 즉시 끝난 자식 rc0 → 본문 정확히 1회 · 지연 고지 없음 · 시한(3s) 전 종료",
+                  body_count(d) == 1 and NOTE not in r.stdout and r.returncode == 0 and el < 2.0,
+                  "%.2fs body=%d %r" % (el, body_count(d), r.stdout[:100]))
+            d, r, el = run_nz("nz2", STUB_RC=6, CYS_HOOK_INPUT_DEADLINE_S=3)
+            check("NZ-2 비회수 셸 모형 · rc6 → 본문 0 · 고지 없음 · 시한 전 종료",
+                  body_count(d) == 0 and NOTE not in r.stdout and r.returncode == 0 and el < 2.0,
+                  "%.2fs body=%d %r" % (el, body_count(d), r.stdout[:100]))
+            d, r, el = run_nz("nz3", STUB_RC=6, STUB_PRE="slow", STUB_SLOW=4, CYS_HOOK_INPUT_DEADLINE_S=1)
+            check("NZ-3 비회수 셸 모형 · 느린 자식(4s) → 시한(1s)에 지연 고지 · 본문 0(회수 호출이 시한을 늘리지 않는다)",
+                  NOTE in r.stdout and body_count(d) == 0 and el < 3.0 and r.returncode == 0,
+                  "%.2fs %r" % (el, r.stdout[:100]))
+        else:
+            print("SKIP NZ 비회수 셸 모형 — bash 부재(검사 수에 넣지 않음)")
+
         # ───────── DL-1: 데드라인 초과 = 비동기 계속(T2-2) — 1/100초 회계에서도 시한 유지 ─────────
         d, hooks, binp, state, env = lab(root, "dl1", wrap=())
         r, el = run(hooks, env, STUB_PRE="slow", STUB_SLOW=4, STUB_RC=6, CYS_HOOK_INPUT_DEADLINE_S=1)

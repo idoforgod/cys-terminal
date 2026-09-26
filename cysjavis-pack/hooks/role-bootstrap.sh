@@ -345,6 +345,16 @@ if _cys_probe_input; then
   _t=1
   while [ "$_i" -lt "$_lim" ]; do
     kill -0 "$_bg" 2>/dev/null || break
+    # ★(리뷰 F4) RCF 에 값이 찼으면(자식의 마지막 명령이 끝남) **비차단 회수**(`jobs` · 셸 내장 · 외부 명령 0)를
+    #   부르고 다시 본다. 끝난 자식을 스스로 회수하지 않는 셸(sleep 을 포크하지 않고 SIGCHLD 로도 거두지 않는 셸 —
+    #   예: NOFORK busybox ash)에서는 좀비에 `kill -0` 이 계속 성공해 매 프롬프트가 시한까지 기다린 뒤 T2-2 로
+    #   빠진다(rc0 본문 누락). `wait` 를 쓰지 않는 이유: 늦은 기록자(RCF-4)가 값을 채운 채 이번 자식이 살아
+    #   있으면 무상한 대기가 된다 — `jobs` 는 끝난 자식만 거두고 산 자식은 기다리지 않는다(시한 불변 · 검체 NZ-3).
+    #   회수·자식 신호 처리가 되는 셸(bash·dash·zsh·ksh93 — 실측 1틱)에서는 이 줄에 닿기 전에 위 `kill -0` 이 끝낸다.
+    if [ -s "$RCF" ]; then
+      jobs >/dev/null 2>&1
+      kill -0 "$_bg" 2>/dev/null || break
+    fi
     case "$_t" in
       1) sleep 0.01 2>/dev/null ;;
       2) sleep 0.02 2>/dev/null ;;
