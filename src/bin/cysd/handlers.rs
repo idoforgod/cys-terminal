@@ -453,6 +453,49 @@ pub fn agent_alive_tri(has_meta: bool, seen: bool, exit_notified: bool) -> Optio
     Some(!exit_notified)
 }
 
+/// ★(0.14.42 · perf R3-6) 좌석 셸 pid 들의 **지금** 작업 디렉터리(`live_cwd`) — surface.list · org.status ·
+/// 좌석 회수 호출자 축의 **단일 관측**이다(사본 금지: 셋이 갈리면 GUI 제목 · 진행% · 회수 판정이
+/// 서로 다른 사실을 본다 — 핀 `live_cwd_goes_through_single_helper`).
+///
+/// 판독기만 OS·노브별로 다르다(`walk_caller_ancestry` 와 같은 모양 · 같은 노브):
+/// · macOS 기본: pid 마다 `state::proc_cwd`(PROC_PIDVNODEPATHINFO 1회 — libproc 직접 호출은 state.rs 한
+///   곳에 모은다). 종전 sysinfo 경로는 cwd 하나를 얻으려고 호출마다 전 프로세스 표와 좌석 argv·env
+///   전체를 읽었다.
+/// · 그 밖의 OS 와 노브 `CYS_PROC_PROBE_FAST=0`: 종전 sysinfo 경로 **그대로**(`live_cwds_legacy`).
+/// 실패 방향: 못 읽은 pid 는 결과에 없다 → 소비자는 `live_cwd: null`('모름')로 접는다(종전과 같다).
+/// 블로킹 syscall 이므로 **어떤 락도 쥐지 않고** 부른다.
+fn live_cwds(pids: &[u32]) -> std::collections::HashMap<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::state::proc_probe_fast_enabled() {
+            return pids
+                .iter()
+                .filter_map(|&p| crate::state::proc_cwd(p).map(|c| (p, c)))
+                .collect();
+        }
+    }
+    live_cwds_legacy(pids)
+}
+
+/// 종전 판독기(전 OS) — sysinfo `ProcessesToUpdate::Some` + cwd 만 명시 조회(cd 추적 = Always).
+fn live_cwds_legacy(pids: &[u32]) -> std::collections::HashMap<u32, String> {
+    let sp: Vec<sysinfo::Pid> = pids.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+    let mut sys = sysinfo::System::new();
+    // 기본 refresh_processes는 cwd를 갱신하지 않는다 — cwd만 명시 조회 (cd 추적 = Always)
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&sp),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+    );
+    pids.iter()
+        .filter_map(|&p| {
+            sys.process(sysinfo::Pid::from_u32(p))
+                .and_then(|x| x.cwd())
+                .map(|c| (p, c.display().to_string()))
+        })
+        .collect()
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -1023,17 +1066,9 @@ fn reclaim_auto(
     let (caller_known_cwds, caller_live_cwd): (Vec<String>, Option<String>) = caller_seat
         .as_ref()
         .map(|s| {
-            let pid = sysinfo::Pid::from_u32(s.pid);
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&[pid]),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
-            let live = sys
-                .process(pid)
-                .and_then(|p| p.cwd())
-                .map(|p| p.display().to_string())
+            // 관측은 surface.list 와 같은 단일 경로(live_cwds)다.
+            let live = live_cwds(&[s.pid])
+                .remove(&s.pid)
                 .filter(|c| !c.trim().is_empty());
             let mut known = vec![s.cwd.clone()];
             if let Some(l) = live.clone() {
@@ -4208,22 +4243,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 
         "surface.list" => {
             // 살아있는 셸 pid의 현재 작업 디렉토리 — UI pane 제목용 (cd 따라 변함)
-            // sysinfo 블로킹 syscall 동안 surfaces 락을 쥐지 않는다 (전 연산 일시정지 방지)
-            let pids: Vec<sysinfo::Pid> = daemon
+            // 블로킹 syscall 동안 surfaces 락을 쥐지 않는다 (전 연산 일시정지 방지) — 관측은 live_cwds 단일 경로.
+            let pids: Vec<u32> = daemon
                 .surfaces
                 .lock()
                 .unwrap()
                 .values()
                 .filter(|s| !s.exited.load(Ordering::Relaxed))
-                .map(|s| sysinfo::Pid::from_u32(s.pid))
+                .map(|s| s.pid)
                 .collect();
-            let mut sys = sysinfo::System::new();
-            // 기본 refresh_processes는 cwd를 갱신하지 않는다 — cwd만 명시 조회 (cd 추적 = Always)
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&pids),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
+            let live = live_cwds(&pids);
             // ★생성자 원장 스냅샷은 **surfaces 락을 잡기 전에** 뜬다 — `create_owner` 는 리프
             //   락이고 그 규약은 "surfaces/roles 를 쥔 채 잡지 않는다"이다(§creator_rollback_ok).
             //   락 순서 계약을 조회 편의로 어기지 않는다(AB-BA 는 한 번 생기면 무음으로 굳는다).
@@ -4232,10 +4261,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
-                    let live_cwd = sys
-                        .process(sysinfo::Pid::from_u32(s.pid))
-                        .and_then(|p| p.cwd())
-                        .map(|p| p.display().to_string());
+                    let live_cwd = live.get(&s.pid).cloned();
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
                     // ★M1: 산출은 3값 순수 술어 `agent_alive_tri` 하나가 소유한다(사본 금지 —
                     //   surface.list 와 org.status 가 갈리면 소비부가 좌석마다 다른 사실을 본다).
@@ -7635,30 +7661,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T1-2 통합 관제 보드: read-screen 폴링 없이 1콜로 전 노드 상황 파악 ───
         "org.status" => {
             let now = crate::state::now_epoch();
-            // live_cwd(cd 추적): surfaces 락 밖에서 sysinfo 조회 — surface.list와 동일 패턴.
+            // live_cwd(cd 추적): surfaces 락 밖에서 조회 — surface.list와 같은 단일 관측(live_cwds).
             // 워커가 워크플로우 폴더 밖으로 cd해도 진행% 산출(javis_report)이 실제 _round를 찾게 한다.
-            let pids: Vec<sysinfo::Pid> = daemon
+            let pids: Vec<u32> = daemon
                 .surfaces
                 .lock()
                 .unwrap()
                 .values()
                 .filter(|s| !s.exited.load(Ordering::Relaxed))
-                .map(|s| sysinfo::Pid::from_u32(s.pid))
+                .map(|s| s.pid)
                 .collect();
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&pids),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
+            let live = live_cwds(&pids);
             let surfaces = daemon.surfaces.lock().unwrap();
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
-                    let live_cwd = sys
-                        .process(sysinfo::Pid::from_u32(s.pid))
-                        .and_then(|p| p.cwd())
-                        .map(|p| p.display().to_string());
+                    let live_cwd = live.get(&s.pid).cloned();
                     let status = s.agent_status.lock().unwrap().clone().map(|st| {
                         json!({"state": st.state, "context_pct": st.context_pct,
                                "task": st.task, "age_secs": (now - st.updated_at).max(0.0) as u64})
@@ -9341,6 +9359,116 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
+    /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트
+    ///   모듈 앞)의 sysinfo cwd 조회(`.with_cwd(`)는 `live_cwds_legacy` 한 곳뿐이어야 한다. 둘 이상이면
+    ///   사본이 생긴 것이다(셋이 갈리면 GUI 제목 · 진행% · 회수 판정이 서로 다른 사실을 본다).
+    /// ② macOS 경량 판독은 기존 노브(`CYS_PROC_PROBE_FAST`)를 **같이** 탄다 — 노브를 꺼도 cwd 만 새
+    ///   경로에 남으면 롤백이 두 갈래가 된다.
+    /// ③ libproc 직접 호출은 state.rs 한 곳에 모인다 — handlers.rs 운영 구간에는 없다.
+    #[test]
+    fn live_cwd_goes_through_single_helper() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let n = prod.matches(".with_cwd(").count();
+        assert_eq!(n, 1, "운영 코드의 sysinfo cwd 조회가 {n}곳 — live_cwds_legacy 한 곳만 허용");
+        let calls = prod.matches("live_cwds(&").count();
+        assert!(calls >= 3, "live_cwds 호출부(surface.list · org.status · 회수 호출자 축)가 {calls}곳뿐이다");
+        let head = &prod[prod.find("\nfn live_cwds(").expect("live_cwds 소실")..];
+        let body = &head[..head.find("\n}\n").expect("live_cwds 본문 경계 소실")];
+        assert!(
+            body.contains("crate::state::proc_probe_fast_enabled()")
+                && body.contains("crate::state::proc_cwd")
+                && body.contains("live_cwds_legacy(pids)"),
+            "live_cwds 가 노브(CYS_PROC_PROBE_FAST)를 거쳐 경량/종전 판독을 고르지 않는다 — 롤백이 두 갈래가 된다"
+        );
+        assert!(!prod.contains("libc::proc_pidinfo"), "handlers.rs 운영 구간에 libproc 직접 호출이 생겼다");
+        let state = include_str!("state.rs");
+        assert_eq!(
+            state.matches("libc::PROC_PIDVNODEPATHINFO").count(),
+            1,
+            "cwd 판독(proc_cwd)은 state.rs 한 곳이다"
+        );
+    }
+
+    /// ★(0.14.42 · perf R3-6) **결과 불변 핀** — `live_cwds` 는 종전 sysinfo 관측(System::new +
+    /// refresh_processes_specifics(Some, cwd Always))과 **같은 맵**을 낸다. 살아 있는 자식(서로 다른
+    /// cwd) · 거둔 자식(죽은 pid) · pid 1 · pid_max 밖의 pid 를 섞는다. 살아 있는 자식 셋이 모두
+    /// 잡혀야 한다(둘 다 빈 맵이면 공허한 초록이다). 오라클은 살아 있는 자식 셋을 모두 담을 때까지
+    /// 최대 5회 다시 뜬다 — sysinfo get_proc_list 가 None 이면 표 전체가 비어 무고한 적색이 나기
+    /// 때문이다(state.rs legacy_snapshot 과 같은 이유). 5회 모두 놓치면 비교 불가로 적색이다.
+    #[cfg(unix)]
+    #[test]
+    fn live_cwds_equals_sysinfo_observation() {
+        let base = std::env::temp_dir().join(format!("cys-r36-livecwd-{}", std::process::id()));
+        let mut kids = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..3 {
+            let d = base.join(format!("seat-{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            want.push(std::fs::canonicalize(&d).unwrap());
+            kids.push(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .current_dir(&d)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let live: Vec<u32> = kids.iter().map(|k| k.id()).collect();
+        let mut pids = live.clone();
+        pids.extend([dead_pid, 1, 4_000_000]);
+        let oracle: std::collections::HashMap<u32, String> = {
+            let sp: Vec<sysinfo::Pid> = pids.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+            let mut found = None;
+            for _ in 0..5 {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&sp),
+                    false,
+                    sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+                );
+                let m: std::collections::HashMap<u32, String> = pids
+                    .iter()
+                    .filter_map(|&p| {
+                        sys.process(sysinfo::Pid::from_u32(p))
+                            .and_then(|x| x.cwd())
+                            .map(|c| (p, c.display().to_string()))
+                    })
+                    .collect();
+                if live.iter().all(|p| m.contains_key(p)) {
+                    found = Some(m);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                for k in kids.iter_mut() {
+                    let _ = k.kill();
+                    let _ = k.wait();
+                }
+                panic!("sysinfo 오라클이 5회 연속 살아 있는 자식을 놓쳤다 — 비교 불가(red)")
+            })
+        };
+        let got = live_cwds(&pids);
+        for k in kids.iter_mut() {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(got, oracle, "live_cwds 가 종전 sysinfo 관측과 갈렸다");
+        for (i, pid) in live.iter().enumerate() {
+            assert_eq!(
+                got.get(pid).map(std::path::PathBuf::from),
+                Some(want[i].clone()),
+                "살아 있는 좌석 {i} 의 cwd 를 못 잡았다(공허한 초록 방지)"
+            );
+        }
+        assert!(!got.contains_key(&dead_pid) && !got.contains_key(&4_000_000));
+    }
 
     /// ★(U-22) `hook.decide` 판정 **진리표** — A3 반전 allowlist 를 완전 열거로 못박는다.
     ///

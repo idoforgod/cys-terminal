@@ -3072,8 +3072,58 @@ fn procargs2_ok(cpid: libc::c_int) -> bool {
     size > 0
 }
 
+/// ★(perf R3-6 · 0.14.42) pid 하나의 **지금** 작업 디렉터리 — macOS 전용 pid 단위 경량 판독(`proc_brief` 와
+/// 같은 계열 · 같은 노브). surface.list · org.status · 좌석 회수 호출자 축의 `live_cwd` 가 이것을 쓴다
+/// (handlers.rs `live_cwds`).
+///
+/// sysinfo 0.33.1 의 cwd 조회(`get_cwd_root` → `convert_node_path_info` → `cstr_to_rust_with_size`,
+/// macos/process.rs:430-465 · unix/utils.rs:10-35)와 **같은 syscall · 같은 변환**이다:
+/// `PROC_PIDVNODEPATHINFO` 반환 < 1 이면 None · `pvi_cdir` 의 `vst_dev == 0` 이면 None ·
+/// `vip_path`(MAXPATHLEN 바이트) 안에서 첫 NUL 까지 · UTF-8 이 아니면 None.
+/// 다른 점은 전 프로세스 표(`proc_listallpids`)와 좌석 argv·env 전체(`KERN_PROCARGS2`)를 읽지 않는다는
+/// 것이다. 그래서 두 번째 `proc_listallpids` 가 추정치 이상을 채우면 표 전체가 비던 sysinfo 경합
+/// (get_proc_list None → 전 좌석 cwd 결측)도 없다.
+/// 실패 방향: 부재 · 좀비 · 타 사용자 · 비 UTF-8 은 None('모름') — sysinfo 와 같은 방향이다.
+/// unwrap·인덱싱·락·스레드 없음. i32 를 넘는 pid 는 `try_from` 실패 → None.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_cwd(pid: u32) -> Option<String> {
+    let cpid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: proc_vnodepathinfo 는 정수·c_char 배열뿐이라 0 비트 패턴이 유효하다. 커널은 buffersize
+    // (= 구조체 크기) 이하만 쓴다. 포인터는 이 스택 지역 변수를 가리키고 호출 동안 살아 있다.
+    let vpi = unsafe {
+        let mut vpi: libc::proc_vnodepathinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(
+            cpid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut vpi as *mut libc::proc_vnodepathinfo as *mut libc::c_void,
+            size,
+        );
+        if n < 1 {
+            return None;
+        }
+        vpi
+    };
+    let node = &vpi.pvi_cdir;
+    if node.vip_vi.vi_stat.vst_dev == 0 {
+        return None;
+    }
+    // libc 는 MAXPATHLEN(1024) 경로를 `[[c_char; 32]; 32]` 로 선언한다 — 평탄화해 첫 NUL 까지.
+    let raw: Vec<u8> = node
+        .vip_path
+        .iter()
+        .flatten()
+        .map(|c| *c as u8)
+        .take_while(|b| *b != 0)
+        .collect();
+    String::from_utf8(raw).ok()
+}
+
 /// 노브(순수) — `CYS_PROC_PROBE_FAST` 값이 정확히 "0" 일 때만 legacy(sysinfo) 판독으로 돌아간다.
 /// ''·'false'·'off' 는 fast 를 유지한다(끄는 값은 하나뿐 — reap_exited_enabled 관례).
+/// 범위(macOS 경량 판독 전부 · 한 손잡이): 호출자 신원 워크(`proc_brief`) · start_time 판독
+/// (`peer_start_time`) · 좌석 셸 cwd(`proc_cwd` — perf R3-6). 끄면 셋 다 종전 sysinfo 경로로 돌아간다.
 #[cfg(target_os = "macos")]
 pub(crate) fn proc_probe_fast_enabled_from(v: Option<&str>) -> bool {
     v.map_or(true, |v| v != "0")
@@ -3276,6 +3326,103 @@ mod proc_brief_tests {
             stable.len()
         );
         assert!(stable.is_empty(), "proc_brief 와 sysinfo 가 안정적으로 어긋난다: {detail:?}");
+    }
+
+    /// sysinfo `ProcessesToUpdate::Some` + cwd(Always) 관측 — surface.list 가 쓰던 경로의 **사본 오라클**.
+    /// `must` 의 pid 가 전부 잡힐 때까지 최대 5회 다시 뜬다. get_proc_list 가 None(두 번째
+    /// proc_listallpids 가 추정치 이상)이면 표 전체가 비어 무고한 적색이 나기 때문이다(legacy_snapshot 과
+    /// 같은 이유). 5회 모두 놓치면 비교 불가로 적색이다 — 빈 오라클로 통과하는 길은 없다.
+    fn sysinfo_cwd_oracle(pids: &[u32], must: &[u32]) -> std::collections::HashMap<u32, String> {
+        let sp: Vec<sysinfo::Pid> = pids.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+        for _ in 0..5 {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&sp),
+                false,
+                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+            );
+            let m: std::collections::HashMap<u32, String> = pids
+                .iter()
+                .filter_map(|&p| {
+                    sys.process(sysinfo::Pid::from_u32(p))
+                        .and_then(|x| x.cwd())
+                        .map(|c| (p, c.display().to_string()))
+                })
+                .collect();
+            if must.iter().all(|p| m.contains_key(p)) {
+                return m;
+            }
+        }
+        panic!("sysinfo cwd 오라클이 5회 연속 살아 있는 자식을 놓쳤다 — 비교 불가(red)");
+    }
+
+    /// T9(perf R3-6) — `proc_cwd` 가 sysinfo cwd 관측과 **pid 마다 같은 값**을 낸다. 살아 있는 자식 셋
+    /// (서로 다른 cwd) · 거둔 자식(부재) · pid 0·1(커널·launchd — 판독 불가) · pid_max 밖 ·
+    /// i32 를 넘는 pid 를 섞는다. Some==Some 과 None==None 을 **나눠** 센다(결측은 값이 아니다).
+    /// 자식 셋은 반드시 Some==Some 이어야 하고, 음성 대조('항상 None' 판독기)는 반드시 어긋나야 한다.
+    #[test]
+    fn proc_cwd_equals_sysinfo_cwd() {
+        struct Kids(Vec<std::process::Child>);
+        impl Drop for Kids {
+            fn drop(&mut self) {
+                for k in self.0.iter_mut() {
+                    let _ = k.kill();
+                    let _ = k.wait();
+                }
+            }
+        }
+        let base = std::env::temp_dir().join(format!("cys-r36-proccwd-{}", std::process::id()));
+        let mut kids = Kids(Vec::new());
+        let mut want = Vec::new();
+        for i in 0..3 {
+            let d = base.join(format!("seat-{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            want.push(std::fs::canonicalize(&d).unwrap());
+            kids.0.push(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .current_dir(&d)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let live: Vec<u32> = kids.0.iter().map(|k| k.id()).collect();
+        let mut pids = live.clone();
+        pids.extend([dead_pid, 0, 1, 4_000_000, u32::MAX]);
+        let oracle = sysinfo_cwd_oracle(&pids, &live);
+        let got: std::collections::HashMap<u32, String> =
+            pids.iter().filter_map(|&p| proc_cwd(p).map(|c| (p, c))).collect();
+        drop(kids);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (mut some_eq, mut none_eq, mut bad) = (0usize, 0usize, Vec::new());
+        for &p in &pids {
+            match (got.get(&p), oracle.get(&p)) {
+                (Some(a), Some(b)) if a == b => some_eq += 1,
+                (None, None) => none_eq += 1,
+                (a, b) => bad.push((p, a.cloned(), b.cloned())),
+            }
+        }
+        eprintln!("T9 계수: pid {} · Some==Some {some_eq} · None==None {none_eq} · 불일치 {}", pids.len(), bad.len());
+        assert!(bad.is_empty(), "proc_cwd 와 sysinfo cwd 가 갈렸다: {bad:?}");
+        for (i, p) in live.iter().enumerate() {
+            assert_eq!(
+                got.get(p).map(std::path::PathBuf::from),
+                Some(want[i].clone()),
+                "살아 있는 자식 {i} 의 cwd 를 못 잡았다(공허한 초록 방지)"
+            );
+        }
+        // pid 0·1 은 실행 권한(root 여부)에 따라 판독 가능성이 달라서 오라클 일치로만 본다.
+        // 있을 수 없는 pid(pid_max 밖 · i32 초과)와 거둔 자식은 값이 없어야 한다.
+        for p in [dead_pid, 4_000_000, u32::MAX] {
+            assert!(!got.contains_key(&p), "있을 수 없는 pid {p} 에 값이 나왔다");
+        }
+        // 음성 대조 — '항상 None' 판독기는 같은 비교기에서 반드시 어긋난다(자식 셋 이상).
+        let neg = pids.iter().filter(|p| oracle.contains_key(p)).count();
+        assert!(neg >= 3, "음성 대조가 무력하다(오라클 Some {neg}건)");
     }
 
     /// T8(D-2) — spawn 직후(sleep 없이) 즉시 판독해도 fast·legacy 모두 Some 이고 값이 같다.
