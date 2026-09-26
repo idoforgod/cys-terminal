@@ -95,15 +95,23 @@ def lab(root, name):
     return d, os.path.join(pack, "hooks", "session-start.sh"), env
 
 
-def run(root, tag, sh, payload, mode="ok"):
+def run(root, tag, sh, payload, mode="ok", crlf=False):
     d, hook, env = lab(root, tag)
     env["STUB_MODE"] = mode
+    if crlf:
+        # ★(WIN-1) 네이티브 Windows python 의 파이프 CRLF 모사 — 출력 줄 끝마다 \r 을 붙이는 래퍼를 CYS_PY 로(프리루드가 존중한다).
+        w = os.path.join(d, "bin", "pywin")
+        with io.open(w, "w", encoding="utf-8", newline="\n") as f:
+            f.write('#!/bin/sh\n"%s" "$@" | sed "s/$/$(printf \'\\r\')/"\n' % sys.executable)
+        os.chmod(w, 0o755)
+        env["CYS_PY"] = w
     t0 = time.monotonic()
     r = subprocess.run([sh, hook], input=payload, capture_output=True, text=True, env=env, timeout=90)
     dt = time.monotonic() - t0
     try:
-        with io.open(os.path.join(d, "reg.log"), encoding="utf-8") as f:
-            calls = f.read().splitlines()
+        # newline="" — CR 이 인자에 섞였으면 그대로 보이게(splitlines 는 \r 을 줄 경계로 먹는다).
+        with io.open(os.path.join(d, "reg.log"), encoding="utf-8", newline="") as f:
+            calls = [c for c in f.read().split("\n") if c]
     except OSError:
         calls = []
     return r.returncode, calls, dt
@@ -136,9 +144,9 @@ try:
         t = "[%s] " % sname
         k = [0]
 
-        def R(payload, mode="ok"):
+        def R(payload, mode="ok", crlf=False):
             k[0] += 1
-            return run(root, "%s-%d" % (sname, k[0]), sh, payload, mode)
+            return run(root, "%s-%d" % (sname, k[0]), sh, payload, mode, crlf)
 
         rc, calls, _ = R(line({"source": "clear", "transcript_path": P}))
         check(t + "SS-1 clear → `--source clear` 정확히 1회 · 경로 전문 · CYS_NO_AUTOSTART=1",
@@ -173,6 +181,14 @@ try:
         check(t + "SS-9 경로에 `|` 가 있어도 첫 `|` 뒤 전부가 경로(clear)", rc == 0 and calls == [CL(P_PIPE)], repr(calls))
         rc, calls, _ = R(line({"source": "startup", "transcript_path": P_PIPE}))
         check(t + "SS-9b 경로에 `|` 가 있어도 경로 보존(종전 호출)", rc == 0 and calls == [LEG(P_PIPE)], repr(calls))
+        # ★(WIN-1) 네이티브 Windows python 의 파이프 CRLF — 경로 꼬리에 CR 이 붙지 않고 null 경로는 여전히 호출 0.
+        #   RED(HEAD 1b614e47): `--transcript <경로>\r --source clear` · null 이면 `--transcript \r --source clear`.
+        rc, calls, _ = R(line({"source": "clear", "transcript_path": P}), crlf=True)
+        check(t + "SS-10 CRLF python + clear → 경로에 CR 없음(정확히 1회)", rc == 0 and calls == [CL()], repr(calls))
+        rc, calls, _ = R(line({"source": "clear", "transcript_path": None}), crlf=True)
+        check(t + "SS-10b CRLF python + null 경로 → 호출 0", rc == 0 and calls == [], repr(calls))
+        rc, calls, _ = R(line({"source": "startup", "transcript_path": P}), crlf=True)
+        check(t + "SS-10c CRLF python + startup → 종전 호출 · CR 없음", rc == 0 and calls == [LEG()], repr(calls))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 

@@ -18424,17 +18424,13 @@ mod tests {
         let own_pid = 993_201_u32;
         bind_caller(&daemon, own_pid, own);
 
-        let resp = usage_register(
-            &daemon,
-            own,
-            "/Users/x/.claude/projects/-p/abc.jsonl",
-            Some(own_pid),
-        );
+        let path = os_abs("/Users/x/.claude/projects/-p/abc.jsonl");
+        let resp = usage_register(&daemon, own, &path, Some(own_pid));
         assert_eq!(resp["ok"], json!(true), "자기 등록이 막혔다 (응답: {resp})");
         assert_eq!(
             daemon.surfaces.lock().unwrap()[&own]
                 .registered_transcript.lock().unwrap().as_deref(),
-            Some("/Users/x/.claude/projects/-p/abc.jsonl")
+            Some(path.as_str())
         );
     }
 
@@ -18473,7 +18469,26 @@ mod tests {
     }
 
     fn r3_1_path(stem: &str) -> String {
-        format!("/Users/x/.claude/projects/-p/{stem}.jsonl")
+        os_abs(&format!("/Users/x/.claude/projects/-p/{stem}.jsonl"))
+    }
+
+    /// ★(WIN-3) 검체 경로를 **이 OS 의 절대경로**로 — Windows `Path::is_absolute` 는 드라이브 접두가 있어야 참이다
+    /// (`\Users\x` 는 아니다). 종전 리터럴 `/Users/x/…` 는 Windows 에서 usage.register 가 invalid_params 로 거절해,
+    /// `ok==true` 를 보는 행은 결정적 적색 · '핀 불변' 을 보는 행은 거절 덕의 공허한 초록이었다(windows-health 전량 레인).
+    fn os_abs(unix: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", unix.replace('/', "\\"))
+        } else {
+            unix.to_string()
+        }
+    }
+
+    /// ★(WIN-3) 검체 경로 헬퍼가 **이 OS** 에서 절대경로다(Windows CI 레인이 이 핀으로 헬퍼 퇴행을 잡는다).
+    #[test]
+    fn r3_1_test_paths_are_absolute_on_this_os() {
+        for p in [r3_1_path(R3_A), os_abs("/Users/x/.claude/projects/-p/abc.jsonl")] {
+            assert!(std::path::Path::new(&p).is_absolute(), "{p:?} 는 이 OS 의 절대경로가 아니다");
+        }
     }
 
     /// 이 검체 스레드가 구독한 뒤 발행된 repin 계열 이벤트 (이름, reason) 목록.
@@ -18510,7 +18525,7 @@ mod tests {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_101);
         let mut rx = daemon.bus.subscribe();
-        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let b = r3_1_path(R3_B);
         let resp = usage_register_src(&daemon, own, &b, Some("clear"), Some(994_101));
         assert_eq!(resp["ok"], json!(true), "{resp}");
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "메모리 핀이 옛 대화에 남았다");
@@ -18569,7 +18584,7 @@ mod tests {
     fn r3_1_non_clear_sources_keep_pin() {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_201);
-        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let b = r3_1_path(R3_B);
         for src in [None, Some("startup"), Some("resume"), Some("compact"), Some("CLEAR"), Some("")] {
             let resp = usage_register_src(&daemon, own, &b, src, Some(994_201));
             assert_eq!(resp["ok"], json!(true), "{src:?}: {resp}");
@@ -18583,7 +18598,7 @@ mod tests {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_301);
         let other = r3_1_seat(&daemon, "worker-2", "33333333-3333-4333-8333-333333333333", 994_302);
-        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let b = r3_1_path(R3_B);
         let anon = usage_register_src(&daemon, own, &b, Some("clear"), None);
         assert_eq!(anon["ok"], json!(true), "익명 등록 자체는 종전대로 통과: {anon}");
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "좌석 밖 발신이 핀을 바꿨다");
@@ -18599,11 +18614,12 @@ mod tests {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_401);
         let _other = r3_1_seat(&daemon, "worker-2", R3_B, 994_402);
-        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let b = r3_1_path(R3_B);
         let _ = usage_register_src(&daemon, own, &b, Some("clear"), Some(994_401));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "남의 좌석 세션을 핀으로 가져왔다");
         for bad in ["/Users/x/.claude/projects/-p/a;touch pwn.jsonl", "/Users/x/.claude/projects/-p/a b.jsonl"] {
-            let _ = usage_register_src(&daemon, own, bad, Some("clear"), Some(994_401));
+            let bad = os_abs(bad);
+            let _ = usage_register_src(&daemon, own, &bad, Some("clear"), Some(994_401));
             assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "{bad:?} 가 핀이 됐다");
         }
     }

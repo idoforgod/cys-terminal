@@ -59,6 +59,9 @@ if [ ! -t 0 ] && command -v cys >/dev/null 2>&1 && [ -n "$CYS_PY" ]; then
   #     요청 실패(데몬 오류·거부·데몬 부재)는 rc 1, 타임아웃은 124 — 그때 다시 부르면 같은 대기를 한 번 더 할 뿐이다.
   #     rc 2 의 다른 원천(autostart 거절 · EXIT_AUTOSTART_REFUSED)은 즉시 끝나므로 재호출도 즉시 끝난다.
   #   · rc 는 호출 바로 다음 줄에서 한 번만 읽는다(사이에 낀 명령이 `$?` 의 주인이 된다).
+  #   ★(0.14.42 · WIN-1) 말미 `tr -d '\r'` — 네이티브 Windows python 은 파이프에도 \r\n 을 쓴다(inject-context.sh:27
+  #   규약 · 실기 run 31404860883). 없으면 경로 꼬리에 CR 이 붙어 데몬이 invalid_params 로 거부하고(재핀 도달 0), null 경로도
+  #   빈 값이 아니라 "\r" 이 되어 호출 0 계약이 깨진다. 판정 rc 를 쓰지 않는 줄이라 rc 규율과 무관하다.
   SS=$("$CYS_PY" -c 'import sys,json
 try:
     d=json.loads(sys.stdin.readline())
@@ -66,7 +69,7 @@ try:
     s=s if s in ("startup","resume","clear","compact") else ""
     print(s+"|"+str(d.get("transcript_path") or ""))
 except Exception:
-    print("")' 2>/dev/null)
+    print("")' 2>/dev/null | tr -d '\r')
   SS_SRC=${SS%%|*}
   TP=${SS#*|}
   if [ -n "$TP" ]; then
