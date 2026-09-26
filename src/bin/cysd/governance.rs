@@ -716,6 +716,9 @@ fn check_agent_death(
         if s.agent_exit_notified.swap(true, Ordering::Relaxed) {
             continue; // 이미 통지
         }
+        // ★(R3SH-4) 에이전트가 죽었다 — 그 에이전트의 사이클 창 표지는 더 붙잡을 것이 없다(다음에 앉는 에이전트의 각성 지시를
+        //   막지 않게 지금 푼다).
+        release_quiescing(daemon, &s, "agent_exited");
         let role = s.role.lock().unwrap().clone();
         daemon.bus.publish(
             "agent.exited",
@@ -5500,18 +5503,64 @@ pub(crate) fn machine_direct_hold_masked(
     }
 }
 
-fn machine_hold_probe(
-    daemon: &Arc<Daemon>,
-    s: &Arc<crate::state::Surface>,
-    axes: &MachineHoldAxes,
-) -> Option<MachineHold> {
-    let quiescing_age_secs = s
+/// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 의 **실효** 판독 — 지금 quiescing 이면 그 시작 epoch, 아니면 None.
+///
+/// 세운 호출자(`Surface::quiesce_owner` — cycle-agent 의 peer pid)가 해제 없이 죽었으면(SIGTERM·Bash 도구 시한 kill·
+/// SIGKILL) **여기서 곧바로 푼다**. 종전에는 상한([`queue_quiesce_hold_secs`] 600s)까지 그 좌석의 큐 틱 배달·H0 경로
+/// (스케줄 push 우회·CEO 자동결재·감독자·승계 pane 줄)·채널 inbox 가 멈췄고, 그 좌석은 RESUME 도 지침도 없는 clear 직후
+/// 상태로 방치됐다. 소비자 셋(H0 · H1 큐 틱 · 채널 `deliverable_master`)이 모두 이 함수를 지난다(판정 한 곳).
+/// 실패 방향: pid 미상(peer pid 결측)·표지가 다른 세대(그 뒤 다시 세움)면 종전대로 상한만 — 살아 있는 사이클 창을 풀지 않는다.
+/// pid 재사용(수 분 안)은 푸는 쪽이 아니라 **늦게 푸는** 쪽으로만 틀린다(종전 상한과 같다).
+pub(crate) fn effective_quiescing_since(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<f64> {
+    let since = s
         .agent_status
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|st| st.state == "quiescing")
-        .map(|st| now_epoch() - st.updated_at);
+        .map(|st| st.updated_at)?;
+    let owner = *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((pid, at)) = owner {
+        if at == since && !crate::state::pid_alive(pid) && release_quiescing(daemon, s, "owner_exited") {
+            return None;
+        }
+    }
+    Some(since)
+}
+
+/// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 해제(아직 quiescing 일 때만 — 그 사이 자기보고가 있었으면 불간섭 · `surface.quiesce
+/// off` 와 같은 전이). 해제했으면 true 와 `surface.quiescing{quiescing:false, reason}` 1건. 소유자 기록은 언제나 지운다.
+pub(crate) fn release_quiescing(daemon: &Arc<Daemon>, s: &crate::state::Surface, reason: &str) -> bool {
+    let owner = s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let released = {
+        let mut cur = s.agent_status.lock().unwrap_or_else(|e| e.into_inner());
+        match cur.as_mut() {
+            Some(st) if st.state == "quiescing" => {
+                st.state = "working".into();
+                st.updated_at = now_epoch();
+                true
+            }
+            _ => false,
+        }
+    };
+    if released {
+        daemon.bus.publish(
+            "surface.quiescing",
+            "channel",
+            Some(s.id),
+            json!({"surface_id": s.id, "quiescing": false, "reason": reason, "owner_pid": owner.map(|(p, _)| p),
+                   "note": "사이클 창 표지를 데몬이 풀었다(세운 호출자 사망 · 에이전트 종료·재기동) — 큐·주기 신호가 곧바로 재개된다"}),
+        );
+    }
+    released
+}
+
+fn machine_hold_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    axes: &MachineHoldAxes,
+) -> Option<MachineHold> {
+    let quiescing_age_secs = effective_quiescing_since(daemon, s).map(|since| now_epoch() - since);
     let mut input = MachineHoldInput {
         paused: daemon.paused.load(Ordering::Relaxed),
         quiescing_age_secs,
@@ -9316,13 +9365,8 @@ fn deliver_queued(
         //   돌아오면 대기 없이 해제하고, 타이핑 폴백으로 `--queued` 가 된 RESUME 도 해제 뒤 FIFO 로 나간다.
         //   【범위】 틱만이다. 운영자 강제 배달(`force_deliver_entry`)·직접 send 는 무변경(운영자 권한 · ② 무clear 방지).
         //   【부분 봉합】 에이전트 `set-status` 가 quiescing 을 덮어쓰면 일찍 풀린다 — 그때는 종전 동작이다.
-        let quiescing_since = s
-            .agent_status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .filter(|st| st.state == "quiescing")
-            .map(|st| st.updated_at);
+        // ★(R2NC-F3) 세운 cycle-agent 가 죽었으면 여기서 곧바로 풀린다(상한 600s 를 기다리지 않는다).
+        let quiescing_since = effective_quiescing_since(daemon, &s);
         if let Some(since) = quiescing_since {
             let age = now_epoch() - since;
             if quiesce_hold_active(Some(age), quiesce_hold) {
@@ -22233,6 +22277,78 @@ mod h1_queue_quiesce_tests {
 
     fn events(d: &Arc<Daemon>, name: &str) -> usize {
         d.bus.tail(300).iter().filter(|ev| ev["name"] == name).count()
+    }
+
+    fn dead_pid() -> u32 {
+        let mut c = std::process::Command::new("true").spawn().expect("자식");
+        let pid = c.id();
+        let _ = c.wait();
+        assert!(!crate::state::pid_alive(pid), "전제: 거둔 자식 pid 는 죽어 있다");
+        pid
+    }
+
+    fn rpc(d: &Arc<Daemon>, method: &str, params: serde_json::Value, caller_pid: Option<u32>) -> serde_json::Value {
+        match crate::handlers::dispatch(d, cys::Request { id: json!(1), method: method.into(), params }, caller_pid) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        }
+    }
+
+    /// ★(R2NC-F3) cycle-agent 가 /clear~RESUME 창에서 죽으면(SIGTERM rc=143 · Bash 시한 kill) 해제 호출이 오지 않는다 —
+    /// 데몬은 quiescing 을 세운 호출자(peer pid)의 사망을 보고 **곧바로** 푼다(큐 틱·H0·채널 재개). 살아 있는 호출자의
+    /// 창은 그대로 붙잡는다(음성 대조). RED(HEAD 1b614e47): 상한 600s 까지 BLOCKED_QUIESCING.
+    #[cfg(unix)]
+    #[test]
+    fn h1_orphan_quiescing_releases_when_owner_dies() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "0"), ("CYS_QUEUE_MIN_INTERVAL_SECS", "0")]);
+        let (d, s) = rig("h1-orphan");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        // ① 살아 있는 호출자(이 검체 프로세스)가 세운 창 — 붙잡는다.
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(std::process::id()));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("창 안 항목".into(), None, "test"));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "살아 있는 사이클 창을 풀었다");
+        // ② 죽은 호출자가 세운 창(cycle-agent SIGTERM) — 다음 틱에 곧바로 풀고 배달한다.
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(dead_pid()));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "세운 호출자가 죽었는데 사이클 창이 큐를 붙잡는다(③ · 최대 600s)");
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("working"),
+            "고아 quiescing 이 해제되지 않았다"
+        );
+        assert!(
+            d.bus.tail(300).iter().any(|e| e["name"] == "surface.quiescing" && e["payload"]["reason"] == "owner_exited"),
+            "고아 해제 사실이 드러나지 않았다"
+        );
+        // ③ H0 도 같은 판정(스케줄 push·CEO 자동결재 경로).
+        let _ = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(dead_pid()));
+        let axes = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
+        assert_eq!(machine_direct_hold_masked(&d, &s, axes, axes), None, "H0 가 죽은 호출자의 창을 붙잡았다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(R3SH-4) 같은 좌석에 새 에이전트가 앉으면(launch-agent `surface.set_meta`) 앞 에이전트의 사이클 창 표지를 푼다 —
+    /// 남겨 두면 새 에이전트의 각성 지시(`send --queued`)가 최대 600s 막혀 injected_unverified('계속 실패')가 된다.
+    #[test]
+    fn h1_relaunch_on_seat_releases_stale_quiescing() {
+        let (d, s) = rig("h1-relaunch");
+        set_state(&s, "quiescing", 5.0);
+        let r = rpc(&d, "surface.set_meta", json!({"surface_id": s.id, "agent": "claude", "agent_bin": "claude"}), None);
+        assert_eq!(r["ok"], json!(true), "{r}");
+        assert_ne!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("quiescing"),
+            "새 에이전트가 앉았는데 앞 에이전트의 사이클 창 표지가 남았다"
+        );
+        let _ = s.child.lock().unwrap().kill();
     }
 
     /// [H1] quiescing 이면 틱 배달 보류(BLOCKED_QUIESCING · 인계 0) → 해제 뒤 다음 틱 배달.

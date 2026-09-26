@@ -1485,13 +1485,8 @@ fn deliverable_master(daemon: &Arc<Daemon>) -> Option<u64> {
         return None;
     }
     // quiescing 게이트(S5): 자기보고 상태가 quiescing이면 주입 보류.
-    let quiescing = surface
-        .agent_status
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.state == "quiescing")
-        .unwrap_or(false);
+    // ★(R2NC-F3) 실효 판독 — 세운 cycle-agent 가 죽었으면 여기서 풀린다(H0·H1 과 같은 함수).
+    let quiescing = crate::governance::effective_quiescing_since(daemon, &surface).is_some();
     if quiescing {
         return None;
     }

@@ -1350,6 +1350,10 @@ pub struct Surface {
     pub pending_queue: Mutex<std::collections::VecDeque<QueueEntry>>,
     /// T1-1 자기보고 상태 (`status.set` RPC)
     pub agent_status: Mutex<Option<AgentStatus>>,
+    /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 을 세운 호출자 `(peer pid, 그때의 updated_at)` — cycle-agent 가 /clear~RESUME
+    /// 창에서 죽으면(SIGTERM·Bash 도구 시한·SIGKILL) 해제 호출이 영영 오지 않는다. 데몬이 이 pid 의 사망을 보면 즉시 푼다
+    /// (`governance::effective_quiescing_since`). 휘발 · pid 미상(peer pid 결측)이면 None = 종전 상한(600s)만.
+    pub quiesce_owner: Mutex<Option<(u32, f64)>>,
     /// T2-5 에이전트 메타: launch-agent가 등록한 (agent 이름, 실행 바이너리)
     pub agent_meta: Mutex<Option<(String, String)>>,
     /// T2-5 사망 감지 상태머신: 자식 트리에서 agent 바이너리를 처음 본 뒤 사라지면 발화
@@ -5588,6 +5592,7 @@ impl Daemon {
             last_recall_line: Mutex::new(String::new()),
             pending_queue: Mutex::new(std::collections::VecDeque::new()),
             agent_status: Mutex::new(None),
+            quiesce_owner: Mutex::new(None),
             // ★SEAT-1: 신생 좌석은 Unknown(0)에서 출발한다 — 첫 watchdog 틱이 커널 사실로 확정한다.
             // Unknown의 소비 규약은 "현행 동작 유지"다(§소비처: 큐=배달·승계=거부) — 판정 미도달이
             // 새로운 실패를 만들지 않는다.

@@ -9011,6 +9011,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             *surface.agent_meta.lock().unwrap() = Some((agent.clone(), agent_bin));
             surface.agent_seen.store(false, Ordering::Relaxed);
             surface.agent_exit_notified.store(false, Ordering::Relaxed);
+            // ★(R3SH-4) 새 에이전트가 이 좌석에 앉는다 — 앞 에이전트의 사이클 창 표지(quiescing)는 이 에이전트의 것이 아니다.
+            //   남겨 두면 H1 이 새 에이전트의 각성 지시(`send --queued`)까지 최대 600s 막는다(injected_unverified → '계속 실패').
+            crate::governance::release_quiescing(daemon, &surface, "agent_relaunched");
             crate::governance::persist_topology(daemon);
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "agent": agent})))
         }
@@ -9047,12 +9050,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .map(|s| (s.context_pct, s.task.clone()))
                     .unwrap_or((None, None));
                 if on {
+                    let at = crate::state::now_epoch();
                     *cur = Some(crate::state::AgentStatus {
                         state: "quiescing".into(),
                         context_pct,
                         task,
-                        updated_at: crate::state::now_epoch(),
+                        updated_at: at,
                     });
+                    // ★(R2NC-F3) 세운 호출자를 기록한다 — 그 프로세스가 해제 없이 죽으면 데몬이 곧바로 푼다.
+                    *surface.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) = caller_pid.map(|p| (p, at));
                 } else if cur.as_ref().map(|s| s.state == "quiescing").unwrap_or(false) {
                     // 아직 quiescing일 때만 해제(그 사이 master 자기보고가 있었으면 불간섭).
                     *cur = Some(crate::state::AgentStatus {
