@@ -942,12 +942,21 @@ pub(crate) mod clear_lineage_seam {
     use std::cell::Cell;
     thread_local! {
         static OVERRIDE: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+        // ★리뷰 F2/F3: 훅 기원 대체값. None(기본) = 참 — 깊이 이음매만 켠 종전 검체들이 '좌석 최상위 claude 의 훅' 을
+        //   뜻하도록 둔다. 훅 기원 거부를 보는 검체만 Some(false) 로 바꾼다.
+        static HOOK: Cell<Option<bool>> = const { Cell::new(None) };
     }
     pub(crate) fn set(v: Option<Option<usize>>) {
         OVERRIDE.with(|c| c.set(v));
     }
     pub(crate) fn get() -> Option<Option<usize>> {
         OVERRIDE.with(|c| c.get())
+    }
+    pub(crate) fn set_hook(v: Option<bool>) {
+        HOOK.with(|c| c.set(v));
+    }
+    pub(crate) fn hook() -> bool {
+        HOOK.with(|c| c.get()).unwrap_or(true)
     }
 }
 
@@ -967,13 +976,50 @@ pub(crate) mod clear_repin_env_seam {
     }
 }
 
-/// ★R3-1 계통 판독 진입점 — 실제 판독은 `governance::caller_agent_depth`(조건·None 의미는 그 doc).
-pub(crate) fn clear_lineage_depth(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<usize> {
+/// ★R3-1 계통 판독 진입점 → (에이전트 개수, SessionStart 훅 기원) — 실제 판독은 `governance::caller_lineage`
+/// (조건·None 의미는 그 doc).
+pub(crate) fn clear_lineage(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<(usize, bool)> {
     #[cfg(test)]
     if let Some(v) = clear_lineage_seam::get() {
-        return v;
+        return v.map(|d| (d, clear_lineage_seam::hook()));
     }
-    crate::governance::caller_agent_depth(root_pid, caller_pid, agent_bin)
+    crate::governance::caller_lineage(root_pid, caller_pid, agent_bin)
+}
+
+/// ★리뷰 F3(0.14.42): 이 등록이 **좌석 최상위 claude 의 SessionStart 훅이 아니라고 증명**되는가 — /clear 연속성 기준
+/// (`Surface::repin_anchor`)을 옮기지 않을 등록. 증명 = 판독 성공 **그리고** (에이전트 2개 이상 = 중첩 헬퍼 · 에이전트
+/// 1개인데 훅 밖 = 도구 셸의 직접 호출). 판독 불가(None · 윈도우 등)와 에이전트 0개(매처가 좌석 에이전트를 못 본다 —
+/// 이 좌석의 /clear 는 어차피 lineage_unverified 다)는 증명이 아니다 → 종전처럼 옮긴다.
+pub(crate) fn lineage_proves_not_top_hook(lineage: Option<(usize, bool)>) -> bool {
+    matches!(lineage, Some((d, hook)) if d >= 2 || (d == 1 && !hook))
+}
+
+/// ★리뷰 F2(0.14.42): /clear 재핀 대상 transcript 가 **새 세션**인가. /clear 는 새 session id 를 만든다 — SessionStart:clear
+/// 훅 시점에 그 파일은 아직 없거나(실 CC 2.1.282 `-p /clear` 실측: 훅 시점 부재 · 끝난 뒤 2345 B · 줄 6개) 방금 생긴
+/// 작은 파일이다. 오래됐거나 큰 파일(가득 찬 옛 대화)로의 재핀은 재기동을 그 대화로 끌고 가 치명 ② 로 직행한다 —
+/// 좌석 안 아무 프로세스가 `cys usage-register --transcript <옛 대화> --source clear` 를 불러도 다른 관문은 모두 지난다.
+/// 참 = 부재(NotFound) · 또는 일반 파일이면서 크기 ≤ `CLEAR_FRESH_MAX_BYTES` 이고 생성 시각을 읽을 수 있으면
+/// `CLEAR_FRESH_MAX_AGE` 안. 생성 시각을 못 읽는 파일시스템은 크기만 본다. 그 밖(판독 오류·디렉터리·미래 생성 시각이
+/// 아닌 오래된 파일)은 거짓 = 재핀 거부(종전 동작).
+pub(crate) const CLEAR_FRESH_MAX_BYTES: u64 = 256 * 1024;
+pub(crate) const CLEAR_FRESH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+pub(crate) fn clear_transcript_fresh(path: &Path, now: std::time::SystemTime) -> bool {
+    let md = match std::fs::metadata(path) {
+        Ok(md) => md,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !md.is_file() || md.len() > CLEAR_FRESH_MAX_BYTES {
+        return false;
+    }
+    match md.created() {
+        // 미래 생성 시각(시계 조정)은 '오래됨' 증거가 아니다 → 크기 판정만 남긴다.
+        Ok(born) => match now.duration_since(born) {
+            Ok(age) => age <= CLEAR_FRESH_MAX_AGE,
+            Err(_) => true,
+        },
+        Err(_) => true,
+    }
 }
 
 /// ★R3-1(0.14.42): /clear 뒤 resume 핀 교체 판정(순수 — 핀).
@@ -992,16 +1038,22 @@ pub(crate) fn clear_lineage_depth(root_pid: u32, caller_pid: u32, agent_bin: &st
 ///   `claude -p "/clear"` 한 번이 SessionStart 를 **startup(N) → clear(B')** 두 번 낸다(startup 훅이 끝난 뒤
 ///   clear 훅이 시작 · 둘 다 새 session_id·transcript_path · B'.jsonl 즉시 생성). 좌석 Bash 도구의 자식은
 ///   CYS_SURFACE_ID·cwd 를 물려받으므로 caller 결박만으로는 헬퍼 세션 B' 가 핀이 된다. 그래서 두 겹을 건다:
-///   ⓐ **연속성**(순수 · 싸다): 핀이 있으면 **이 등록 바로 앞의 등록 stem 이 현재 핀**이어야 한다. 좌석 자신의
-///      /clear 는 자기 startup·resume(A) 또는 앞선 clear 가 등록한 값에서 이어지고, 중첩 `-p` 는 자기 startup(N)
-///      등록이 먼저 온다. 핀이 없으면(수집기 첫 틱 전) 비교 대상이 없으니 받는다 — 수집기가 다음 틱에 등록
-///      경로로 잡을 값과 같다. 직전 등록이 **없는데** 핀이 있으면 증명 불가 → 거부(결측은 값이 아니다).
+///   ⓐ **연속성**(순수 · 싸다): 핀이 있으면 **연속성 기준(직전 등록 — 단 좌석 최상위 훅이 아니라고 증명된 등록은
+///      건너뛴 것 · `Surface::repin_anchor`) stem 이 현재 핀**이어야 한다. 좌석 자신의 /clear 는 자기 startup·resume(A)
+///      또는 앞선 clear 가 등록한 값에서 이어지고, 중첩 `-p` 는 자기 startup(N) 등록이 먼저 온다. 핀이 없으면(수집기
+///      첫 틱 전) 비교 대상이 없으니 받는다 — 수집기가 다음 틱에 등록 경로로 잡을 값과 같다. 기준이 **없는데** 핀이
+///      있으면 증명 불가 → 거부(결측은 값이 아니다).
+///   ⓒ **새 세션**(파일 메타 1회 · 리뷰 F2): 대상 transcript 가 없거나 방금 생긴 작은 파일이어야 한다
+///      (`clear_transcript_fresh`) — 가득 찬 옛 대화로의 재핀은 재기동을 치명 ② 로 끌고 간다 → `not_fresh_session`.
 ///   ⓑ **계통**(프로세스 표 · 비싸서 맨 끝): 발신에서 좌석 루트까지 조상 사슬에 에이전트 실행이 **정확히
-///      하나**(= 좌석의 claude)여야 한다. 2 이상 = 중첩 → `nested_agent`. 0·판독 불가(윈도우 조상 단절·argv
-///      미관측) → `lineage_unverified`.
-/// 실패 방향: 어느 조건이든 어긋나면 **핀 유지 = 종전 동작**(재개는 옛 대화). 한 번 거부된 뒤에는 등록이 새 값으로
-/// 넘어가 있으므로 같은 좌석의 다음 clear 도 `discontinuous` 로 거부된다 — 좌석이 다시 resume/startup 등록을
-/// 낼 때(재기동)까지 종전 동작이 이어진다(거부가 새 교체를 부르는 방향은 없다).
+///      하나**(= 좌석의 claude)이고 **그 아래에 SessionStart 훅(`session-start.sh`) 실행**이 있어야 한다. 2 이상 = 중첩 →
+///      `nested_agent`. 1 인데 훅 밖(좌석 Bash 도구 셸의 직접 호출 등) → `not_hook_origin`. 0·판독 불가(윈도우 조상
+///      단절·argv 미관측) → `lineage_unverified`.
+/// 증명 범위(정직 표기): ⓑ 는 argv 문자열 판정이다 — 같은 사용자가 훅 스크립트를 가짜 입력으로 직접 돌리면 지난다.
+/// 그 경로로 들일 수 있는 것은 ⓒ 를 지나는 대화(없거나 방금 생긴 작은 파일)뿐이다.
+/// 실패 방향: 어느 조건이든 어긋나면 **핀 유지 = 종전 동작**(재개는 옛 대화). 좌석 최상위 훅이 아니라고 증명되지 않은
+/// 거부(ⓐ·ⓒ·판독 불가 등) 뒤에는 기준이 새 값으로 넘어가 있으므로 같은 좌석의 다음 clear 도 `discontinuous` 로
+/// 거부된다 — 좌석이 다시 resume/startup 등록을 낼 때(재기동)까지 종전 동작이 이어진다(거부가 새 교체를 부르는 방향은 없다).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clear_repin_verdict(
     source: Option<&str>,
@@ -1011,7 +1063,8 @@ pub(crate) fn clear_repin_verdict(
     prev_registered: Option<&Path>,
     transcript: &Path,
     held_by_other_seat: impl FnOnce(&str) -> bool,
-    lineage_agent_depth: impl FnOnce() -> Option<usize>,
+    transcript_fresh: impl FnOnce() -> bool,
+    lineage: impl FnOnce() -> Option<(usize, bool)>,
 ) -> Result<String, &'static str> {
     if source != Some("clear") {
         return Err("not_clear");
@@ -1045,10 +1098,15 @@ pub(crate) fn clear_repin_verdict(
     if held_by_other_seat(&sid) {
         return Err("held_by_other_seat");
     }
+    // ⓒ 새 세션 — /clear 는 새 session id 를 만든다. 오래됐거나 큰 파일(옛 대화)이면 받지 않는다.
+    if !transcript_fresh() {
+        return Err("not_fresh_session");
+    }
     // ⓑ 계통 — 프로세스 표를 읽으므로 싼 조건을 모두 지난 뒤에만 부른다.
-    match lineage_agent_depth() {
-        Some(1) => Ok(sid),
-        Some(0) | None => Err("lineage_unverified"),
+    match lineage() {
+        Some((1, true)) => Ok(sid),
+        Some((1, false)) => Err("not_hook_origin"),
+        Some((0, _)) | None => Err("lineage_unverified"),
         Some(_) => Err("nested_agent"),
     }
 }
@@ -2692,7 +2750,10 @@ mod tests {
 /// ★R3-1: /clear 재핀 판정·킬스위치·세션 id 형태의 순수 검체(프로덕션 무접촉 — 이음매 불요).
 #[cfg(test)]
 mod r3_1_verdict_tests {
-    use super::{clear_repin_enabled_from, clear_repin_verdict, is_plausible_session_id};
+    use super::{
+        clear_repin_enabled_from, clear_repin_verdict, clear_transcript_fresh, is_plausible_session_id,
+        lineage_proves_not_top_hook, CLEAR_FRESH_MAX_AGE, CLEAR_FRESH_MAX_BYTES,
+    };
     use std::path::Path;
 
     const A: &str = "11111111-1111-4111-8111-111111111111";
@@ -2704,6 +2765,7 @@ mod r3_1_verdict_tests {
     }
 
     /// 판정 전 분기 — (source, bound, agent, current, prev, transcript, held, depth) → 기대.
+    /// 새 세션(ⓒ)은 참 · 훅 기원은 참으로 둔다(각각의 거부는 아래 전용 행이 본다).
     #[test]
     fn r3_1_verdict_table() {
         let (pa, pb, pn) = (p(A), p(B), p(N));
@@ -2730,9 +2792,79 @@ mod r3_1_verdict_tests {
             (Some("clear"), true, Some("claude"), Some(A), Some(&pa), &pb, false, None, Err("lineage_unverified")),
         ];
         for (i, (src, bound, agent, cur, prev, tr, held, depth, want)) in rows.into_iter().enumerate() {
-            let got = clear_repin_verdict(src, bound, agent, cur, prev.map(Path::new), Path::new(tr), |_| held, || depth);
+            let got = clear_repin_verdict(src, bound, agent, cur, prev.map(Path::new), Path::new(tr), |_| held,
+                || true, || depth.map(|d| (d, true)));
             assert_eq!(got.as_deref().map_err(|e| *e), want, "행 {i}");
         }
+    }
+
+    /// ★리뷰 F2: ⓒ 새 세션 · ⓑ 훅 기원 — 다른 관문을 모두 지난 등록에서 각각 단독으로 거부한다.
+    #[test]
+    fn r3_1_verdict_fresh_and_hook_origin() {
+        let (pa, pb) = (p(A), p(B));
+        let v = |fresh: bool, lin: Option<(usize, bool)>| {
+            clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)), Path::new(&pb),
+                |_| false, || fresh, || lin)
+        };
+        assert_eq!(v(true, Some((1, true))), Ok(B.to_string()));
+        assert_eq!(v(false, Some((1, true))), Err("not_fresh_session"), "옛 대화(오래됨·큼)로 재핀했다");
+        assert_eq!(v(true, Some((1, false))), Err("not_hook_origin"), "훅 밖(도구 셸) 직접 호출로 재핀했다");
+        assert_eq!(v(true, Some((2, true))), Err("nested_agent"));
+        assert_eq!(v(true, Some((0, true))), Err("lineage_unverified"));
+        assert_eq!(v(true, None), Err("lineage_unverified"));
+        // 새 세션 판정은 계통보다 먼저 — 옛 대화면 프로세스 표를 읽지 않는다.
+        let called = std::cell::Cell::new(0u32);
+        let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)), Path::new(&pb),
+            |_| false, || false, || { called.set(called.get() + 1); Some((1, true)) });
+        assert_eq!(called.get(), 0, "새 세션 거부 뒤에도 계통을 판독했다");
+    }
+
+    /// ★리뷰 F3: 연속성 기준을 옮기지 않을 등록 = 좌석 최상위 훅이 아니라고 **증명**된 것만.
+    #[test]
+    fn r3_1_not_top_hook_truth_table() {
+        for (lin, want) in [
+            (Some((1usize, true)), false),
+            (Some((1, false)), true),
+            (Some((2, true)), true),
+            (Some((3, false)), true),
+            (Some((0, false)), false),
+            (Some((0, true)), false),
+            (None, false),
+        ] {
+            assert_eq!(lineage_proves_not_top_hook(lin), want, "{lin:?}");
+        }
+    }
+
+    /// ★리뷰 F2: 새 세션 증거 — 부재 · 방금 생긴 작은 파일만 참. 큰 파일 · 디렉터리 · 오래된 파일은 거짓.
+    #[test]
+    fn r3_1_transcript_fresh_table() {
+        let dir = std::env::temp_dir().join(format!("cys-r31-fresh-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        let absent = dir.join("33333333-3333-4333-8333-333333333333.jsonl");
+        assert!(clear_transcript_fresh(&absent, now), "부재(훅 시점의 정상 모양)를 거부했다");
+        let small = dir.join("small.jsonl");
+        std::fs::write(&small, vec![b'x'; 2345]).unwrap();
+        assert!(clear_transcript_fresh(&small, now), "방금 생긴 작은 파일(실측 2345 B)을 거부했다");
+        let edge = dir.join("edge.jsonl");
+        std::fs::write(&edge, vec![b'x'; CLEAR_FRESH_MAX_BYTES as usize]).unwrap();
+        assert!(clear_transcript_fresh(&edge, now), "상한과 같은 크기를 거부했다");
+        let big = dir.join("big.jsonl");
+        std::fs::write(&big, vec![b'x'; CLEAR_FRESH_MAX_BYTES as usize + 1]).unwrap();
+        assert!(!clear_transcript_fresh(&big, now), "큰 파일(옛 대화)을 새 세션으로 읽었다");
+        let sub = dir.join("sub.jsonl");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(!clear_transcript_fresh(&sub, now), "디렉터리를 새 세션으로 읽었다");
+        // 오래됨: 생성 시각을 읽을 수 있는 파일시스템에서만 판정한다(못 읽으면 크기만 — 그 갈래는 위 행들이 본다).
+        if std::fs::metadata(&small).and_then(|m| m.created()).is_ok() {
+            let later = now + CLEAR_FRESH_MAX_AGE + std::time::Duration::from_secs(5);
+            assert!(!clear_transcript_fresh(&small, later), "생성 {}s 넘은 파일을 새 세션으로 읽었다",
+                CLEAR_FRESH_MAX_AGE.as_secs());
+            let earlier = now - std::time::Duration::from_secs(3600);
+            assert!(clear_transcript_fresh(&small, earlier), "미래 생성 시각(시계 조정)을 '오래됨' 으로 읽었다");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 계통 판독(비쌈)은 싼 조건이 전부 통과한 뒤에만 불린다 — 거부 경로에서 프로세스 표를 읽지 않는다.
@@ -2742,19 +2874,19 @@ mod r3_1_verdict_tests {
         let called = std::cell::Cell::new(0u32);
         let bump = || {
             called.set(called.get() + 1);
-            Some(1)
+            Some((1, true))
         };
         let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pn)),
-            Path::new(&pb), |_| false, bump);
+            Path::new(&pb), |_| false, || true, bump);
         assert_eq!(called.get(), 0, "연속성 거부 뒤에도 계통을 판독했다");
         let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)),
-            Path::new(&pb), |_| true, bump);
+            Path::new(&pb), |_| true, || true, bump);
         assert_eq!(called.get(), 0, "타 좌석 보유 거부 뒤에도 계통을 판독했다");
         let _ = clear_repin_verdict(Some("clear"), false, Some("claude"), Some(A), Some(Path::new(&pa)),
-            Path::new(&pb), |_| false, bump);
+            Path::new(&pb), |_| false, || true, bump);
         assert_eq!(called.get(), 0, "좌석 결박 거부 뒤에도 계통을 판독했다");
         let _ = clear_repin_verdict(Some("clear"), true, Some("claude"), Some(A), Some(Path::new(&pa)),
-            Path::new(&pb), |_| false, bump);
+            Path::new(&pb), |_| false, || true, bump);
         assert_eq!(called.get(), 1, "모든 싼 조건을 지났는데 계통 판독이 정확히 1회가 아니다");
     }
 

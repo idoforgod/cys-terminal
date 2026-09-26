@@ -1285,6 +1285,13 @@ pub struct Surface {
     pub observed_usage: Mutex<Option<crate::usage::ObservedUsage>>,
     /// T5 세션 트랜스크립트 등록 (`usage.register` — SessionStart hook의 결정론 매핑)
     pub registered_transcript: Mutex<Option<String>>,
+    /// ★R3-1(0.14.42 · 리뷰 F3) /clear 재핀 연속성(ⓐ)의 기준 — 마지막 등록 중 **좌석 최상위 claude 의 훅이 아니라고
+    /// 증명된 것**(조상 사슬에 에이전트 2개 이상 = 중첩 헬퍼, 또는 에이전트 1개인데 SessionStart 훅 밖 = 도구 셸의 직접
+    /// 호출)을 건너뛴 등록 경로. `registered_transcript`(사용량 귀속 · 종전 그대로 매 등록 덮어씀)와 달리 좌석 안
+    /// `claude -p` 헬퍼의 startup 등록이 이 값을 옮기지 못한다 — 종전엔 헬퍼가 한 번만 돌아도 좌석의 진짜 /clear 가
+    /// `discontinuous` 로 거부돼 재기동 때까지 재핀이 꺼졌다. None 이면 판정은 직전 `registered_transcript` 로 읽는다
+    /// (종전 의미). 판독 불가(윈도우 등)·비 claude 좌석·익명 발신·킬스위치 꺼짐은 종전처럼 매 등록이 옮긴다. 영속 비대상.
+    pub repin_anchor: Mutex<Option<String>>,
     /// (4) resume 핀용 agent transcript session_id — analytics.rs의 회계 session_id와 무관(별개 개념).
     /// usage 수집기가 transcript 발견 시 1회 stash(is_none 가드)·topology에 영속해 정확한 세션 재개.
     pub agent_session_id: Mutex<Option<String>>,
@@ -5349,6 +5356,7 @@ impl Daemon {
             last_injected: Mutex::new(None),
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
+            repin_anchor: Mutex::new(None),
             agent_session_id: Mutex::new(None),
             // (W1) restore가 넘긴 원값이 있으면 그대로 고정(재해소 금지 — 데몬 env 변동 시 오염 방지),
             // 없으면(신규 기동) 이 데몬 프로세스 env로 결정론 해소(pane 셸이 실제 해소할 값과 일치).

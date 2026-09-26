@@ -7238,22 +7238,35 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   킬스위치 `CYS_CLEAR_REPIN=0` 이면 이 블록 전체가 없다(판정·계통 판독·persist·이벤트 0). 그 밖은 무변경.
             //   /clear 1회당 늘어나는 것: 이벤트 최대 1건 · persist 최대 1회(핀이 실제로 바뀔 때만) · 계통 판독 최대 1회.
             let source = param_str(&params, "source");
-            if source.as_deref() == Some("clear") && crate::usage::clear_repin_enabled() {
-                let meta = surface.agent_meta.lock().unwrap().clone();
-                let agent = meta.as_ref().map(|(a, _)| a.clone());
-                let agent_bin = meta
-                    .as_ref()
-                    .map(|(_, b)| b.rsplit(['/', '\\']).next().unwrap_or(b).to_string())
-                    .unwrap_or_default();
+            let repin_on = crate::usage::clear_repin_enabled();
+            let meta = surface.agent_meta.lock().unwrap().clone();
+            let agent = meta.as_ref().map(|(a, _)| a.clone());
+            let agent_bin = meta
+                .as_ref()
+                .map(|(_, b)| b.rsplit(['/', '\\']).next().unwrap_or(b).to_string())
+                .unwrap_or_default();
+            // ★리뷰 F3: 연속성 기준(ⓐ) = 직전 등록 — 단 좌석 최상위 훅이 아니라고 **증명된** 등록(좌석 안 `claude -p`
+            //   헬퍼의 startup · 도구 셸의 직접 호출)은 건너뛴 값(`repin_anchor`). 기준이 아직 없으면 직전 등록(종전 의미).
+            let prev_anchor = surface.repin_anchor.lock().unwrap().clone().or_else(|| prev_registered.clone());
+            // 계통 판독은 락 밖 · 등록 1회당 최대 1번(판정·기준 갱신이 같은 값을 나눠 쓴다).
+            let root_pid = surface.pid;
+            let lineage_memo: std::cell::OnceCell<Option<(usize, bool)>> = std::cell::OnceCell::new();
+            let lineage = || {
+                *lineage_memo.get_or_init(|| {
+                    caller_pid.and_then(|cp| crate::usage::clear_lineage(root_pid, cp, &agent_bin))
+                })
+            };
+            if source.as_deref() == Some("clear") && repin_on {
                 let current = surface.agent_session_id.lock().unwrap().clone();
-                let prev_stem = prev_registered
+                let prev_stem = prev_anchor
                     .as_deref()
                     .and_then(|p| crate::usage::extract_session_id("claude", std::path::Path::new(p)));
                 // 락 순서: surfaces → 좌석 필드(persist_topology 와 같다). 이 좌석의 락은 쥐고 있지 않다(위 값은 복사본).
+                // ★리뷰 F2/F3: 끝난(exited) 좌석이 쥔 세션도 그 좌석의 것이다 — /clear 가 만드는 새 세션 id 는 어느 좌석의
+                //   것과도 같을 수 없으므로 정상 경로에서는 늘 거짓이고, 막는 것은 남의(끝난 좌석의) 대화를 가져오는 경로뿐이다.
                 let held_by_other = |cand: &str| {
                     daemon.surfaces.lock().unwrap().values().any(|o| {
                         o.id != sid
-                            && !o.exited.load(Ordering::Relaxed)
                             && (o.agent_session_id.lock().unwrap().as_deref() == Some(cand)
                                 || o.registered_transcript.lock().unwrap().as_deref().is_some_and(|p| {
                                     std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
@@ -7261,19 +7274,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                 }))
                     })
                 };
-                // 계통 판독은 락 밖 — 프로세스 표 1회라 판정의 맨 끝에서만 불린다.
-                let root_pid = surface.pid;
-                let lineage = || {
-                    caller_pid.and_then(|cp| crate::usage::clear_lineage_depth(root_pid, cp, &agent_bin))
-                };
+                let fresh = || crate::usage::clear_transcript_fresh(&pb, std::time::SystemTime::now());
                 match crate::usage::clear_repin_verdict(
                     source.as_deref(),
                     caller_sid == Some(sid),
                     agent.as_deref(),
                     current.as_deref(),
-                    prev_registered.as_deref().map(std::path::Path::new),
+                    prev_anchor.as_deref().map(std::path::Path::new),
                     &pb,
                     held_by_other,
+                    fresh,
                     lineage,
                 ) {
                     Ok(new_sid) => {
@@ -7320,6 +7330,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ),
                 }
             }
+            // ★리뷰 F3: 연속성 기준 갱신 — 좌석 최상위 훅이 아니라고 증명된 등록(이 좌석 자손 발신 · claude 좌석 ·
+            //   킬스위치 켜짐일 때만 판독)은 기준을 옮기지 않는다. 그 밖(판독 불가·익명·비 claude·꺼짐)은 종전처럼 옮긴다.
+            //   사용량 귀속(`registered_transcript`)은 위에서 종전대로 이미 덮었다 — 이 줄은 재핀 판정 기준만 다룬다.
+            let not_top = repin_on
+                && agent.as_deref() == Some("claude")
+                && caller_sid == Some(sid)
+                && crate::usage::lineage_proves_not_top_hook(lineage());
+            *surface.repin_anchor.lock().unwrap() = if not_top { prev_anchor } else { Some(path.clone()) };
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 
@@ -17317,6 +17335,7 @@ mod tests {
         ] {
             *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
             *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            *s.repin_anchor.lock().unwrap() = None;
             crate::usage::clear_lineage_seam::set(Some(depth));
             let mut rx = daemon.bus.subscribe();
             let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_801));
@@ -17351,10 +17370,212 @@ mod tests {
         for on in [None, Some("1".to_string()), Some(String::new())] {
             *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
             *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            *s.repin_anchor.lock().unwrap() = None;
             crate::usage::clear_repin_env_seam::set(Some(on.clone()));
             let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_901));
             assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "env={on:?} 는 켜짐이어야 한다");
         }
+    }
+
+    /// ★리뷰 F2(R-M1 변이 생존 보완): pid 는 있는데 **어느 좌석에도 결박되지 않은** 발신(좌석 밖 프로세스 · 합성
+    /// pid)은 계통 이음매가 1(속은 상태)이어도 핀을 못 바꾼다 — `caller_sid == Some(sid)` 배선을 이 행이 진다.
+    /// 종전 검체는 익명(pid 없음) 행뿐이라 계통 클로저가 None → lineage_unverified 로 먼저 막혀 배선 변이가 살았다.
+    #[test]
+    fn r3_1_clear_rejects_unbound_caller_with_pid() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_311);
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let mut rx = daemon.bus.subscribe();
+        let resp = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_399));
+        assert_eq!(resp["ok"], json!(true), "결박 없는 발신의 등록 자체는 종전대로 통과: {resp}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "좌석에 결박되지 않은 발신이 핀을 바꿨다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("caller_unbound".to_string()))]
+        );
+    }
+
+    /// ★리뷰 F2: 새 세션 증거 — 좌석 안 아무 프로세스가 `--source clear` 로 **가득 찬 옛 대화**(큰 파일)를 등록해도
+    /// 다른 관문(결박·연속성·계통 1·훅 기원)을 모두 지난 상태에서 핀은 옛 대화로 바뀌지 않는다(not_fresh_session).
+    #[test]
+    fn r3_1_clear_rejects_old_full_conversation() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_321);
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let dir = std::env::temp_dir().join(format!("cys-r31-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(format!("{R3_B}.jsonl"));
+        std::fs::write(&old, vec![b'x'; crate::usage::CLEAR_FRESH_MAX_BYTES as usize + 1]).unwrap();
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, old.to_str().unwrap(), Some("clear"), Some(994_321));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "옛 대화(큰 파일)로 재핀했다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("not_fresh_session".to_string()))]
+        );
+        // 대조: 같은 자리의 방금 생긴 작은 파일(실 CC 모양)은 받는다.
+        std::fs::write(&old, b"{}\n").unwrap();
+        *daemon.surfaces.lock().unwrap()[&own].repin_anchor.lock().unwrap() = Some(r3_1_path(R3_A));
+        let _ = usage_register_src(&daemon, own, old.to_str().unwrap(), Some("clear"), Some(994_321));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "방금 생긴 작은 transcript 를 거부했다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★리뷰 F2/F3: 훅 기원 — 계통 1(좌석 claude 아래)이어도 SessionStart 훅 밖(좌석 Bash 도구 셸의 직접 호출)이면
+    /// 거부(not_hook_origin)하고, 그 등록은 연속성 기준도 옮기지 않는다 — 뒤따르는 좌석 자신의 /clear 는 재핀된다.
+    #[test]
+    fn r3_1_tool_shell_direct_clear_is_rejected_and_does_not_break_chain() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_331);
+        let mut rx = daemon.bus.subscribe();
+        crate::usage::clear_lineage_seam::set_hook(Some(false));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("clear"), Some(994_331));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "도구 셸 직접 호출이 핀을 바꿨다");
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_331));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "직접 호출 뒤 좌석 자신의 /clear 가 끊겼다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![
+                ("usage.session_repin_skipped".to_string(), Some("not_hook_origin".to_string())),
+                ("usage.session_repinned".to_string(), None),
+            ]
+        );
+    }
+
+    /// ★리뷰 F3: 좌석 안 `claude -p` 헬퍼(계통 2)의 **startup** 등록은 사용량 귀속은 종전대로 덮지만 연속성 기준은
+    /// 옮기지 않는다 — 수정 전: 헬퍼 1회 뒤 좌석 자신의 /clear 가 discontinuous 로 거부돼 재기동 때까지 재핀이 꺼졌다.
+    #[test]
+    fn r3_1_nested_helper_startup_does_not_disable_seat_clear() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_341);
+        let mut rx = daemon.bus.subscribe();
+        crate::usage::clear_lineage_seam::set(Some(Some(2)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("startup"), Some(994_341));
+        assert_eq!(
+            daemon.surfaces.lock().unwrap()[&own].registered_transcript.lock().unwrap().as_deref(),
+            Some(r3_1_path(R3_N).as_str()),
+            "사용량 귀속(registered_transcript)은 종전대로 매 등록 덮어야 한다(이 수정의 범위 밖)"
+        );
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_341));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "헬퍼 startup 뒤 좌석 자신의 /clear 가 거부됐다");
+        assert_eq!(r3_1_topology_pin(&daemon, "worker-1").as_deref(), Some(R3_B));
+        assert_eq!(r3_1_repin_events(&mut rx), vec![("usage.session_repinned".to_string(), None)]);
+        // 판독 불가(None · 윈도우 등) 등록은 종전처럼 기준을 옮긴다 — 뒤 clear 는 discontinuous(종전 동작).
+        crate::usage::clear_lineage_seam::set(Some(None));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("startup"), Some(994_341));
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_C), Some("clear"), Some(994_341));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "판독 불가 등록 뒤에는 종전 동작(핀 유지)이어야 한다");
+    }
+
+    /// ★리뷰 F3: 끝난(exited) 좌석이 쥔 세션도 가져오지 않는다 — /clear 의 새 세션 id 는 어느 좌석과도 같을 수 없다.
+    #[test]
+    fn r3_1_clear_rejects_session_held_by_exited_seat() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_351);
+        let other = r3_1_seat(&daemon, "worker-2", R3_B, 994_352);
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        daemon.surfaces.lock().unwrap()[&other].exited.store(true, Ordering::Relaxed);
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_351));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "끝난 좌석의 대화를 핀으로 가져왔다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("held_by_other_seat".to_string()))]
+        );
+    }
+
+    /// ★리뷰 F2(R-M5·배선 변이 보완): 계통 이음매를 **끄고** 실제 프로세스 사슬로 판정한다 — surface.pid 는 실제 PTY
+    /// 자식이고 발신은 그 아래 `sleep`. agent_meta 의 bin 은 **전체 경로**로 두어 basename 파생까지 실제로 태운다.
+    /// 좌석 claude → hooks/session-start.sh → sleep = 재핀 · 훅 없음 = not_hook_origin · claude 두 겹 = nested_agent.
+    /// 인자 순서(root·caller)를 뒤바꾸거나 basename 파생을 빼는 변이는 이 행에서 lineage_unverified 로 적색이 된다.
+    #[cfg(unix)]
+    #[test]
+    fn r3_1_real_lineage_without_seam() {
+        let dir = std::env::temp_dir().join(format!("cys-r31-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        let w = |name: &str, body: String| std::fs::write(dir.join(name), body).unwrap();
+        w("claude", "\"$@\"\nexit 0\n".to_string());
+        w("hooks/session-start.sh", "sleep 30\nexit 0\n".to_string());
+        w("leaf.sh", "sleep 30\nexit 0\n".to_string());
+        w("top_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/hooks/session-start.sh'\nexit 0\n"));
+        w("top_tool.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/leaf.sh'\nexit 0\n"));
+        w("mid_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/hooks/session-start.sh'\nexit 0\n"));
+        w("nest_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/mid_hook.sh'\nexit 0\n"));
+        let daemon = isolated_daemon();
+        crate::usage::clear_repin_env_seam::set(Some(None));
+        for (i, (entry, want)) in [
+            ("top_hook.sh", None),
+            ("top_tool.sh", Some("not_hook_origin")),
+            ("nest_hook.sh", Some("nested_agent")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = daemon
+                .create_surface(None, Some(format!("/bin/sh '{d}/{entry}'")), None, Some(format!("worker-{}", i + 1)), 24, 80)
+                .expect("create surface");
+            daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+            let mut caller = None;
+            for _ in 0..200 {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let mut stack = vec![s.pid];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(p) = stack.pop() {
+                    if !seen.insert(p) {
+                        continue;
+                    }
+                    for (cp, pr) in sys.processes() {
+                        if pr.parent().map(|x| x.as_u32()) == Some(p) {
+                            if pr.name().to_string_lossy() == "sleep" {
+                                caller = Some(cp.as_u32());
+                            }
+                            stack.push(cp.as_u32());
+                        }
+                    }
+                }
+                if caller.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let caller = caller.unwrap_or_else(|| panic!("{entry}: sleep 자손을 못 찾았다"));
+            crate::usage::clear_lineage_seam::set(None);
+            crate::usage::clear_lineage_seam::set_hook(None);
+            *s.agent_meta.lock().unwrap() = Some(("claude".into(), format!("{d}/claude")));
+            *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
+            *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            bind_caller(&daemon, caller, s.id);
+            let mut rx = daemon.bus.subscribe();
+            let stems = [
+                "77777777-7777-4777-8777-777777777771",
+                "77777777-7777-4777-8777-777777777772",
+                "77777777-7777-4777-8777-777777777773",
+            ];
+            let b = format!("{d}/{}.jsonl", stems[i]);
+            let _ = usage_register_src(&daemon, s.id, &b, Some("clear"), Some(caller));
+            let ev = r3_1_repin_events(&mut rx);
+            unsafe {
+                libc::kill(-(s.pid as i32), libc::SIGKILL);
+            }
+            match want {
+                None => {
+                    assert_ne!(r3_1_pin(&daemon, s.id).as_deref(), Some(R3_A), "{entry}: 실제 좌석 훅 사슬인데 재핀하지 않았다 {ev:?}");
+                    assert_eq!(ev, vec![("usage.session_repinned".to_string(), None)], "{entry}");
+                }
+                Some(reason) => {
+                    assert_eq!(r3_1_pin(&daemon, s.id).as_deref(), Some(R3_A), "{entry}: 재핀했다 {ev:?}");
+                    assert_eq!(ev, vec![("usage.session_repin_skipped".to_string(), Some(reason.to_string()))], "{entry}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★R3-1c(0.14.42 · 현행 라이브 결함): 동시 `persist_topology` 는 같은 임시 파일(`.topology.json.tmp`)을 나눠

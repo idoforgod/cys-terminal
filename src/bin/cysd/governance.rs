@@ -3606,11 +3606,16 @@ fn argv_snapshot(pids: &[u32]) -> HashMap<u32, String> {
 /// 배제할 수 없다 · `CmdSource::NameFallback` 을 부정 근거로 쓰지 않는 규약과 같다). 호출자는 None 을 **거부**로
 /// 읽는다(실패 방향 = 종전 동작).
 ///
-/// 비용: 프로세스 표 1회 + 사슬 argv(≤32 pid). 드문 경로(좌석 /clear 1회당 1번, 앞선 싼 조건을 모두 지난 뒤)에서만
-/// 부르고, 락을 쥐지 않은 채 부른다. OS 공통 sysinfo 판독(판독 규칙은 `walk_legacy` 와 같은 표) — cfg 분기 없음.
-/// 검체 이음매는 이 파일이 아니라 `usage::clear_lineage_depth` 에 있다(이 파일의 소스핀은 첫 cfg(test) 속성을
+/// ★(0.14.42 · 리뷰 F2/F3) 같은 판독 한 번으로 **SessionStart 훅 기원**도 함께 낸다 → `(에이전트 개수, 훅 기원)`.
+/// 훅 기원 = 발신 쪽에서 첫 에이전트 **아래**(발신에 더 가까운 쪽)에 `session-start.sh` 를 실행하는 조상이 있다
+/// (`hook_origin_in_chain`). 에이전트 1개만으로는 '좌석 claude 의 SessionStart 훅' 을 증명하지 못한다 — 좌석 Bash 도구
+/// 셸에서 직접 부른 `cys usage-register … --source clear` 도 사슬 모양(도구 셸 → 좌석 claude → 루트)이 같다.
+///
+/// 비용: 프로세스 표 1회 + 사슬 argv(≤32 pid). 드문 경로(좌석 SessionStart 등록 1회당 최대 1번)에서만 부르고, 락을
+/// 쥐지 않은 채 부른다. OS 공통 sysinfo 판독(판독 규칙은 `walk_legacy` 와 같은 표) — cfg 분기 없음.
+/// 검체 이음매는 이 파일이 아니라 `usage::clear_lineage` 에 있다(이 파일의 소스핀은 첫 cfg(test) 속성을
 /// 프로덕션 경계로 쓴다 — 프로덕션 구간에 그 속성을 두면 경계가 당겨져 기존 소스핀이 조용히 약해진다).
-pub(crate) fn caller_agent_depth(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<usize> {
+pub(crate) fn caller_lineage(root_pid: u32, caller_pid: u32, agent_bin: &str) -> Option<(usize, bool)> {
     if agent_bin.is_empty() {
         return None;
     }
@@ -3623,7 +3628,33 @@ pub(crate) fn caller_agent_depth(root_pid: u32, caller_pid: u32, agent_bin: &str
     })?;
     let argv = argv_snapshot(&chain);
     let cmds: Vec<Option<String>> = chain.iter().map(|p| argv.get(p).cloned()).collect();
-    agent_depth_in_chain(&cmds, agent_bin)
+    Some((agent_depth_in_chain(&cmds, agent_bin)?, hook_origin_in_chain(&cmds, agent_bin)?))
+}
+
+/// SessionStart 훅 스크립트의 basename — 팩이 등록하는 훅 명령(`sh <팩>/hooks/session-start.sh` · 레인 위임은 같은
+/// 이름으로 exec)과 같은 글자다(pack.rs `hook_command_for(.., "session-start.sh")`).
+pub(crate) const SESSION_START_HOOK_SCRIPT: &str = "session-start.sh";
+
+/// 순수: 사슬(발신의 부모 → 루트 순) 중 **첫 에이전트 실행보다 앞**(발신 쪽)에 argv 토큰 basename 이 정확히
+/// `session-start.sh` 인 조상이 있는가. 첫 에이전트가 없으면 false. 앞 구간 argv 가 하나라도 없으면 None(판정 불가 —
+/// 숨은 훅을 배제할 수 없다). 한계(정직 표기): argv 문자열 판정이라 같은 사용자가 훅을 가짜 입력으로 직접 돌리면
+/// 통과한다 — 그 경로의 해악(가득 찬 옛 대화로 재개)은 새 세션 증거(`usage::clear_transcript_fresh`)가 막는다.
+pub(crate) fn hook_origin_in_chain(cmds: &[Option<String>], agent_bin: &str) -> Option<bool> {
+    for c in cmds {
+        let c = c.as_deref()?;
+        if cmdline_matches_agent_exec(c, agent_bin) {
+            return Some(false);
+        }
+        if c.split_whitespace()
+            .any(|tok| tok.rsplit(['/', '\\']).next() == Some(SESSION_START_HOOK_SCRIPT))
+        {
+            // 훅 뒤(루트 쪽)에 에이전트가 정확히 있는지는 agent_depth_in_chain 이 따로 센다.
+            return Some(cmds.iter().any(|x| {
+                x.as_deref().is_some_and(|x| cmdline_matches_agent_exec(x, agent_bin))
+            }));
+        }
+    }
+    Some(false)
 }
 
 /// 순수: `caller` 의 조상을 `root` 까지 모은다(caller 제외 · root 포함). 워크 규칙은 `walk_ancestry_with` 와
@@ -20531,7 +20562,7 @@ mod merge_residue_tests {
 
 #[cfg(test)]
 mod r3_1_lineage_tests {
-    use super::{agent_depth_in_chain, ancestor_chain_to_root};
+    use super::{agent_depth_in_chain, ancestor_chain_to_root, hook_origin_in_chain};
     use std::collections::HashMap;
 
     #[test]
@@ -20576,6 +20607,37 @@ mod r3_1_lineage_tests {
         assert_eq!(agent_depth_in_chain(&[hook, versioned, top, root], "claude"), Some(1));
     }
 
+    /// ★리뷰 F2/F3: 훅 기원 — 첫 에이전트 **아래**(발신 쪽)에 `session-start.sh` 실행이 있어야 참.
+    /// 좌석 Bash 도구 셸의 직접 호출(`zsh -c … cys usage-register … --source clear`)은 사슬 모양이 같아도 거짓이다.
+    #[test]
+    fn r3_1_hook_origin_table() {
+        let s = |v: &str| Some(v.to_string());
+        let hook = s("sh /Users/x/.cys/pack/hooks/session-start.sh");
+        let lane = s("/bin/sh /Users/x/.cys/pack-dept-d1/hooks/session-start.sh");
+        let wrap = s("python3 -c import os 10 cys usage-register --transcript /Users/x/.cys/claude/projects/-p/b.jsonl --source clear");
+        let top = s("claude --dangerously-skip-permissions --resume 298c0478-c5f4-4867-989d-a7cac849ae39");
+        let root = s("/bin/zsh -l");
+        let tool = s("/bin/zsh -c source /Users/x/.claude-3/shell-snapshots/snapshot.sh && eval 'cys usage-register --transcript /Users/x/.claude/projects/-p/a.jsonl --source clear'");
+        let o = |c: &[Option<String>]| hook_origin_in_chain(c, "claude");
+        // 좌석 최상위 훅(래퍼·서브셸 포함)·레인 위임 훅 = 참
+        assert_eq!(o(&[wrap.clone(), hook.clone(), hook.clone(), top.clone(), root.clone()]), Some(true));
+        assert_eq!(o(&[lane.clone(), top.clone(), root.clone()]), Some(true));
+        // 도구 셸 직접 호출 = 거짓(훅 없음)
+        assert_eq!(o(&[tool.clone(), top.clone(), root.clone()]), Some(false));
+        // 훅이 에이전트보다 **위**(루트 쪽)에 있으면 이 에이전트의 훅이 아니다 = 거짓
+        assert_eq!(o(&[tool.clone(), top.clone(), hook.clone(), root.clone()]), Some(false));
+        // 에이전트 없음 = 거짓(훅만 있어도)
+        assert_eq!(o(&[hook.clone(), root.clone()]), Some(false));
+        // 데이터 경로 인자 속 이름(`…/session-start.sh.bak`·`…/session-start.shx`)은 훅 실행이 아니다
+        let data = s("cat /Users/x/.cys/pack/hooks/session-start.sh.bak");
+        assert_eq!(o(&[data, top.clone(), root.clone()]), Some(false));
+        // 첫 에이전트 앞 구간 argv 미관측 = 판정 불가
+        assert_eq!(o(&[None, top.clone(), root.clone()]), None);
+        // 첫 에이전트 뒤(루트 쪽) argv 미관측은 훅 판정에 쓰지 않는다(개수 판정이 None 을 낸다)
+        assert_eq!(o(&[hook.clone(), top.clone(), None]), Some(true));
+        assert_eq!(agent_depth_in_chain(&[hook, top, None], "claude"), None);
+    }
+
     /// 실제 프로세스 사슬(unix): 루트 셸 → `claude`(이름만 claude 인 셸 스크립트) → 훅 셸 → sleep(발신 대역).
     /// 중첩은 claude 를 한 겹 더 두고, 평면은 claude 가 없다. sysinfo 조상·argv 판독이 0·1·2 를 내는지 본다.
     #[cfg(unix)]
@@ -20594,7 +20656,19 @@ mod r3_1_lineage_tests {
         w("top.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/leaf.sh\"\nexit 0\n");
         w("mid.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/leaf.sh\"\nexit 0\n");
         w("nest.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/mid.sh\"\nexit 0\n");
-        for (entry, want) in [("flat.sh", Some(0usize)), ("top.sh", Some(1)), ("nest.sh", Some(2))] {
+        // ★리뷰 F2/F3: 훅 기원 — 좌석 claude 아래 `hooks/session-start.sh` 셸이 발신의 조상이면 참.
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        w("hooks/session-start.sh", "sleep 30\nexit 0\n");
+        w("top_hook.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/hooks/session-start.sh\"\nexit 0\n");
+        w("mid_hook.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/hooks/session-start.sh\"\nexit 0\n");
+        w("nest_hook.sh", "/bin/sh \"$D/claude\" /bin/sh \"$D/mid_hook.sh\"\nexit 0\n");
+        for (entry, want) in [
+            ("flat.sh", Some((0usize, false))),
+            ("top.sh", Some((1, false))),
+            ("nest.sh", Some((2, false))),
+            ("top_hook.sh", Some((1, true))),
+            ("nest_hook.sh", Some((2, true))),
+        ] {
             let mut child = std::process::Command::new("/bin/sh")
                 .arg(dir.join(entry))
                 .env("D", &dir)
@@ -20615,8 +20689,8 @@ mod r3_1_lineage_tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            let got = caller.and_then(|c| super::caller_agent_depth(root, c, "claude"));
-            let stray = caller.and_then(|c| super::caller_agent_depth(1, c, "claude"));
+            let got = caller.and_then(|c| super::caller_lineage(root, c, "claude"));
+            let stray = caller.and_then(|c| super::caller_lineage(1, c, "claude"));
             unsafe {
                 libc::kill(-(root as i32), libc::SIGKILL);
             }
