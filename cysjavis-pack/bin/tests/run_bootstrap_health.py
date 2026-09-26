@@ -13685,13 +13685,18 @@ def _u23_bound_violations(sup, delivery):
     #   unknown_action·unknown_decl_origin 은 버스 이벤트만 낸 채 사라졌는데, frontdoor note 가
     #   모델에게 '스폰 실패 소진 시 통보한다'고 약속한 뒤 훅이 exit 0 한 경로에서 그 침묵은
     #   그대로 '선언했는데 무반응'이다(R2 정적 적대검증 must_fix).
+    # ★(0.14.42 · R3SH-3) 통보 줄 쓰기(원장 선기록 → 주입)는 즉시 경로와 미룬 재시도 경로가 공유하는 `pane_notice_line` 한 곳으로
+    #   모였다 — 지정 지점은 여전히 2곳(dispatch_one·pane_notice_line)이고, notify_no_spawn 은 그 함수를 부른다.
     if c.count("crate::delivery::Origin::Supervisor") != 2:
-        v.append("감독자 원장 유래 지정 지점이 정확히 2곳(dispatch_one·notify_no_spawn)이 아니다")
+        v.append("감독자 원장 유래 지정 지점이 정확히 2곳(dispatch_one·pane_notice_line)이 아니다")
     ni = c.find("fn notify_no_spawn(")
+    pi = c.find("fn pane_notice_line(")
     if ni < 0:
         v.append("무스폰 loud 통보 지점(notify_no_spawn)이 없다 — 조용한 포기(청중 0) 회귀")
+    elif pi < 0 or "pane_notice_line(daemon" not in c[ni:ni + c[ni:].find("\n}\n")]:
+        v.append("무스폰 통보가 통보 줄 쓰기(pane_notice_line)를 거치지 않는다 — 원장 선기록 불변식 우회")
     else:
-        nbody = c[ni:]
+        nbody = c[pi:pi + c[pi:].find("\n}\n")]
         nrec, ninj = nbody.find("record_audited("), nbody.find("write_tx.try_send(")
         if nrec < 0 or ninj < 0 or nrec > ninj:
             v.append("무스폰 통보의 원장 기록이 주입보다 앞이 아니다 — 기계 push 오너 임무 오인 창")
