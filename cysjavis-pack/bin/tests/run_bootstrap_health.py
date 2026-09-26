@@ -11344,6 +11344,55 @@ def h_ready_13():
     return " · ".join(notes) + " · 계측검증=%s" % calib
 
 
+# cys.rs 의 **본** 테스트 모듈 경계. 파일 앞쪽에도 `#[cfg(test)]` 항목(테스트 전용 함수)이 있어
+#   `_rs_prod`(첫 `#[cfg(test)]` 에서 절단)를 쓰면 프로덕션 절반이 잘린다 — 그래서 모듈 경계로 자른다.
+_KC_TEST_MOD = "#[cfg(test)]\nmod tests"
+
+
+def _kc_prod(cli):
+    """readiness 합본(`_SCAN_JOIN` 이음)의 조각마다 본 테스트 모듈 앞만 남기고 `//` 줄주석을 걷는다.
+    테스트는 봉투 바이트를 기대값 문자열로 들고 있는 것이 정상이고, 주석은 부르는 것이 아니다."""
+    return _rs_prod_lines("\n".join(p.split(_KC_TEST_MOD, 1)[0] for p in (cli or "").split(_SCAN_JOIN)))
+
+
+def _kc_inject_prod(cli, text):
+    """합성 변조본 제조 — 프로덕션 영역(본 테스트 모듈 앞)에 `text` 를 끼운다. 테스트 모듈 뒤에 붙이면
+    판정 대상 밖이라 '못 잡았다' 가 판정기 고장이 아니라 변조본 제조 오류가 된다(오보 방지)."""
+    cli = cli or ""
+    i = cli.find(_KC_TEST_MOD)
+    return (cli[:i] + text + "\n" + cli[i:]) if i >= 0 else (cli + "\n" + text + "\n")
+
+
+def _killchain_envelope_violations(cli, ibody, obody):
+    """H-KILLCHAIN-1 ⓒ 판정기 — bracketed paste 봉투를 만드는 곳은 **가드 달린 두 헬퍼뿐**이다.
+
+    ★(0.14.42 · 설계 C D4 핀 이사) 봉투를 만드는 길이 둘이다 — 손수(`format!("\\x1b[200~…")`) ·
+    lib(`cys::paste_fence::wrap` = 본문 CLOSE 살균 + 봉투). 한쪽만 세면 다른 쪽으로 새 헬퍼가 그물을 빠져나간다:
+      ⓐ 손수 만든 봉투 리터럴(`[200~`) 0 — 살균 없는 봉투이자 가드 밖 헬퍼의 전형
+      ⓑ `use …::paste_fence` 별칭 import 0 — 맨 `wrap(` 호출은 ⓒ 계수를 우회한다
+      ⓒ lib wrap 호출 정확히 2 — inject_text·inject_text_on(가드 달린 두 헬퍼)
+      ⓓ 그 2곳이 실제로 두 헬퍼 **본문 안**이다(`ibody`·`obody` = 호출부 슬라이스)
+    """
+    v = []
+    prod = _kc_prod(cli)
+    hand = prod.count("[200~")
+    if hand:
+        v.append("손수 만든 bracketed paste 봉투가 %d곳이다 — lib `cys::paste_fence::wrap`(CLOSE 살균) 밖이다"
+                 "(본문 안 CLOSE 가 봉투를 조기에 닫는다 · 가드 없는 새 헬퍼면 그물 밖)" % hand)
+    alias = re.findall(r"\buse\s+(?:cys|crate)::paste_fence\b", prod)
+    if alias:
+        v.append("paste_fence 를 별칭 import 했다(%d곳) — 맨 `wrap(` 호출은 봉투 지점 계수를 우회한다"
+                 % len(alias))
+    lib = len(re.findall(r"\bpaste_fence::wrap\(", prod))
+    if lib != 2:
+        v.append("bracketed paste 를 스스로 씌우는 주입 헬퍼가 %d개다(기대 2 = inject_text·inject_text_on) "
+                 "— 새 헬퍼는 그물 밖이다. 가드를 붙이고 이 수를 함께 갱신하라" % lib)
+    for name, body in (("inject_text", ibody), ("inject_text_on", obody)):
+        if "cys::paste_fence::wrap(text)" not in (body or ""):
+            v.append("%s 가 봉투를 lib wrap 으로 만들지 않는다 — 봉투가 가드 달린 헬퍼 밖에서 만들어진다" % name)
+    return v
+
+
 @specimen("H-KILLCHAIN-1", "W6",
           "★주입 봉인 + 신뢰 Return 경화 — 킬체인(신뢰→면책) Return 1발·면책 미접촉",
           ["U-14", "U-15"])
@@ -11414,11 +11463,34 @@ def h_killchain_1():
          "부서 소켓 주입 경로가 가드를 우회한다 — 그물에 구멍이 남았다")
     # 호출부는 늘어나도 좋다(그물이 안쪽에 있으므로 자동으로 덮인다). 다만 **가드 없는 새 주입
     # 헬퍼**가 생기면 그물 밖이므로 적색으로 만든다: paste 래핑을 스스로 하는 함수 전수 검사.
-    wrappers = re.findall(r'let wrapped = format!\("\\x1b\[200~', cli)
-    need(len(wrappers) == 2,
-         "bracketed paste 를 스스로 씌우는 주입 헬퍼가 %d개다(기대 2 = inject_text·inject_text_on) "
-         "— 새 헬퍼는 그물 밖이다. 가드를 붙이고 이 수를 함께 갱신하라" % len(wrappers))
-    notes.append("그물 1지점(주입 헬퍼 2종 × 전송 2지점)")
+    # ── ★핀 이사(0.14.42 · 설계 C D4 · T11 — 러너 헤더 '핀 이사 계약' ①④) ──────────────────────
+    # 【원인 규명 먼저】 헬퍼가 사라진 것이 아니라 **봉투 생성이 lib 단일 정의처로 옮겨졌다**.
+    #   종전 두 헬퍼는 각자 `let wrapped = format!("\x1b[200~{text}\x1b[201~")` 로 봉투를 손수 만들었고,
+    #   본문 안의 CLOSE 가 봉투를 조기에 닫아 나머지를 타이핑된 키 입력으로 흘렸다. 설계 C D4 가 그것을
+    #   `cys::paste_fence::wrap(text)`(살균 + 봉투)로 바꿨다 — Rust 동형 핀
+    #   `c_inject_text_paths_use_lib_paste_fence_wrap` 은 함께 이사했고 러너만 낡아 있었다(계수 0 = 계측기 지연).
+    # 【축은 무변】 "봉투를 만드는 곳 = 가드 달린 두 헬퍼뿐". 봉투를 만드는 길이 둘(손수·lib)이 됐으므로
+    #   둘 다 센다 — 판정기 `_killchain_envelope_violations` 머리말 참조.
+    ev = _killchain_envelope_violations(cli, ibody, obody)
+    need(not ev, "주입 봉투 그물 위반 %d건: %s" % (len(ev), " / ".join(ev)))
+    # 계측 타당성(합성 변조본) — 새 헬퍼·손수 봉투·별칭 import·헬퍼 이탈이 **각각** 적색이어야
+    #   이사이지 삭제가 아니다(트리가 위반 0 이라 초록인 것과 판정기 고장을 가른다).
+    kc_mutants = [
+        ("lib wrap 을 쓰는 새 헬퍼",
+         _kc_inject_prod(cli, "fn m(t: &str) -> String { cys::paste_fence::wrap(t) }"), ibody, obody),
+        ("손수 봉투 복귀",
+         _kc_inject_prod(cli, r'fn m(t: &str) -> String { format!("\x1b[200~{t}\x1b[201~") }'),
+         ibody, obody),
+        ("별칭 import(계수 우회)", _kc_inject_prod(cli, "use cys::paste_fence::wrap;"), ibody, obody),
+        ("inject_text 가 lib wrap 을 떠남", cli,
+         ibody.replace("cys::paste_fence::wrap(text)", "text.to_string()"), obody),
+        ("inject_text_on 이 lib wrap 을 떠남", cli, ibody,
+         obody.replace("cys::paste_fence::wrap(text)", "text.to_string()")),
+    ]
+    kc_blind = [lbl for lbl, c, i_, o_ in kc_mutants if not _killchain_envelope_violations(c, i_, o_)]
+    need(not kc_blind, "봉투 그물 합성 변조본을 못 잡았다(판정기 고장): %s" % ", ".join(kc_blind))
+    notes.append("그물 1지점(주입 헬퍼 2종 × 전송 2지점 · 봉투=lib wrap 2곳 · 변조 %d종 적발)"
+                 % len(kc_mutants))
 
     # ⓓ ★생애 창 상한 — 치명위험 ①(작업 중 노드 영구 차단·오탐 폭주) 차단
     # ── ★핀 이사(U-28 · 2026-08-24 · 러너 헤더 '핀 이사 계약' ①④) ────────────────────────
@@ -13488,9 +13560,17 @@ def _u23_tick_violations(sup, main_rs, gov):
             if not async_sleep:
                 v.append("watchdog 의 유일한 .await 가 sleep 이 아니다")
         # ⑤ 틱 4단 순서 불변식(감독자가 이 순서를 흔들지 않았다).
+        # ★핀 이사(0.14.42 · 설계 H3 — 러너 헤더 '핀 이사 계약' ①④): 앵커는 `이름(` 뒤 공백·줄바꿈을
+        #   허용한다. H3 가 deliver_queued 에 넷째 인자(queue_quiesce_stale)를 더하자 rustfmt 가 인자를
+        #   줄마다 쪼갰고(`deliver_queued(\n    &daemon,`) 순서는 그대로인데 한 줄 리터럴 앵커만 -1 이 됐다
+        #   — H-KILLCHAIN-1 ⓔ(통합 2026-09-10)와 같은 계급(rustfmt 줄바꿈 결박)이다. 축(4단 순서 ·
+        #   각 호출의 실재 · 첫 인자 &daemon)은 무변이고, 줄바꿈 형태의 순서 역전은 변조본이 따로 잰다.
         order = ["refresh_seat_cache(&daemon", "deliver_queued(&daemon",
                  "check_agent_death(&daemon", "check_role_deadman(&daemon"]
-        idx = [body.find(x) for x in order]
+        idx = []
+        for x in order:
+            m = re.search(r"\b%s\(\s*&daemon\b" % re.escape(x.split("(", 1)[0]), body)
+            idx.append(m.start() if m else -1)
         if any(i < 0 for i in idx) or idx != sorted(idx):
             v.append("watchdog 틱 4단 순서 불변식이 깨졌다: %s" % list(zip(order, idx)))
     # ⑥ 기동 지점은 main.rs 정확히 1곳.
@@ -13687,9 +13767,22 @@ def h_tick_alive():
         ("watchdog 4단 순서 뒤집기", sup, main_rs,
          gov.replace("refresh_seat_cache(&daemon, &sys);", "let _ = 0;", 1)),
     ]
+    # ★(0.14.42 핀 이사 판별력) 줄바꿈 형태의 deliver_queued 호출을 데드맨 뒤로 옮기면 적색이어야 한다 —
+    #   앵커를 공백 허용으로 넓힌 것이 순서 축을 무디게 하지 않았다는 증거다.
+    dq = re.search(r"\bdeliver_queued\(\s*&daemon\b[^;]*\);", gov)
+    need(dq is not None, "계측 무효: watchdog 틱의 deliver_queued(&daemon …) 호출을 찾지 못했다")
+    moved = (gov[:dq.start()] + gov[dq.end():]).replace(
+        "check_role_deadman(&daemon, &mut deadman);",
+        "check_role_deadman(&daemon, &mut deadman);\n" + dq.group(0), 1)
+    mutants.append(("deliver_queued(줄바꿈 형태)를 데드맨 뒤로", sup, main_rs, moved))
     blind = [lbl for lbl, s, m, g in mutants if not _u23_tick_violations(s, m, g)]
     need(not blind, "합성 변조본을 못 잡았다(탐지기 고장): %s" % ", ".join(blind))
-    return "틱 계약 위반 0 · %s · 합성 변조 %d종 전건 적발" % (calib, len(mutants))
+    # 허용 대조 — 같은 호출을 한 줄·여러 줄 어느 형태로 써도 위반이 아니다(rustfmt 결박 해제의 증거).
+    one_line = gov[:dq.start()] + re.sub(r"\s+", " ", dq.group(0)).replace("( ", "(").replace(", )", ")") \
+        + gov[dq.end():]
+    fp = _u23_tick_violations(sup, main_rs, one_line)
+    need(not fp, "허용 대조 실패 — 한 줄 형태의 같은 호출을 위반으로 읽는다: %s" % " / ".join(fp))
+    return "틱 계약 위반 0 · %s · 합성 변조 %d종 전건 적발 · 줄바꿈 허용 대조 통과" % (calib, len(mutants))
 
 
 @specimen("H-BOOT-SUP-1", "W6",
