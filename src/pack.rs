@@ -77,16 +77,34 @@ pub fn build_id() -> &'static str {
 
 /// 임베드 팩 매니페스트 해시 — PACK_ALL(rel+content, build.rs 가 이미 정렬)을 sha256 스트리밍 해시.
 /// 같은 소스로 빌드된 cys·cysd 는 동일 값(둘 다 동일 PACK_ALL 임베드). 팩 내용이 다르면 값이 갈린다.
+///
+/// ★(0.14.42 · perf R3-6) **프로세스당 1회** 계산하고 재사용한다(`embedded_pack_hash_ref`). 입력 PACK_ALL 은
+/// 컴파일 타임 상수라 값이 프로세스 수명 동안 바뀔 수 없다(결과 불변). 종전에는 org.status 가 불릴
+/// 때마다 임베드 팩 전체를 소프트웨어 SHA-256 으로 다시 해시했다(aarch64 는 sha2 `asm` 피처 없이
+/// 가속이 꺼진다). 실측 수치와 측정 시각·기준 sha 는 이 변경의 커밋 메시지에 있다 — 팩 크기가
+/// 바뀌면 낡는 수치를 코드에 두지 않는다. 새 프로세스마다 한 번은 계산하므로 `cys phoenix-identity`
+/// 같은 1회성 CLI 경로의 비용은 그대로다. 핀: `embedded_pack_hash_is_memoized_and_unchanged`.
 pub fn embedded_pack_hash() -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    for (rel, content) in PACK_ALL.iter() {
-        h.update(rel.as_bytes());
-        h.update(b"\0");
-        h.update(content.as_bytes());
-        h.update(b"\0");
-    }
-    format!("{:x}", h.finalize())
+    embedded_pack_hash_ref().to_owned()
+}
+
+/// 메모 본체 — 첫 호출 때만 계산해 프로세스 수명 동안 보관한 값의 참조. 기동 때 미리 계산하지
+/// 않는다(부트 체인에 비용을 얹지 않는다). 동시에 여러 스레드가 첫 호출을 하면 한 스레드만
+/// 계산하고 나머지는 그 결과를 기다린다(`OnceLock`).
+fn embedded_pack_hash_ref() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for (rel, content) in PACK_ALL.iter() {
+            h.update(rel.as_bytes());
+            h.update(b"\0");
+            h.update(content.as_bytes());
+            h.update(b"\0");
+        }
+        format!("{:x}", h.finalize())
+    })
+    .as_str()
 }
 
 /// ★팩 경로 env 키의 **우선순위 목록 정본**(W14 S19 · 2026-07-26).
@@ -4471,6 +4489,49 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(0.14.42 · perf R3-6) 임베드 팩 해시 **메모 핀**. PACK_ALL 은 컴파일 타임 상수라 값이 프로세스 수명
+    /// 동안 바뀌지 않는다.
+    /// ① 값: 종전 계산(여기 오라클)과 같다.
+    /// ② 결정론: 두 번 받은 참조가 **같은 버퍼**다(`ptr::eq`). 호출마다 다시 계산하면 새 `String` 이라
+    ///   주소가 갈린다. 부하·SHA 가속 유무와 무관하게 판별된다.
+    /// ③ 보조(수정 전 적색 증거용): 공개 함수 5회 중 최소 소요가 오라클 계산 소요의 1/10 미만이다.
+    ///   절대 임계(ms)를 두지 않는다 — SHA 가속이 켜지거나 팩이 작아져도 비율은 판별력을 잃지 않는다.
+    /// 운영 구간에 `#[cfg(test)]` 계수기를 두지 않는 이유: 소스 핀들이 `find("#[cfg(test)]")` 로
+    /// 운영 구간을 자른다.
+    #[test]
+    fn embedded_pack_hash_is_memoized_and_unchanged() {
+        use sha2::{Digest, Sha256};
+        let t = std::time::Instant::now();
+        let mut h = Sha256::new();
+        let mut bytes = 0usize;
+        for (rel, content) in PACK_ALL.iter() {
+            h.update(rel.as_bytes());
+            h.update(b"\0");
+            h.update(content.as_bytes());
+            h.update(b"\0");
+            bytes += rel.len() + content.len() + 2;
+        }
+        let oracle = format!("{:x}", h.finalize());
+        let oracle_cost = t.elapsed();
+        assert!(bytes > 0, "PACK_ALL 이 비었다 — 비교가 공허하다");
+        assert_eq!(embedded_pack_hash(), oracle, "임베드 팩 해시 값이 종전 계산과 갈렸다");
+        let a = embedded_pack_hash_ref();
+        let b = embedded_pack_hash_ref();
+        assert_eq!(a, oracle.as_str());
+        assert!(std::ptr::eq(a, b), "embedded_pack_hash_ref 가 호출마다 새 값을 만든다(메모 아님)");
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let v = embedded_pack_hash();
+            best = best.min(t.elapsed());
+            assert_eq!(v, oracle);
+        }
+        assert!(
+            best * 10 < oracle_cost,
+            "embedded_pack_hash 가 호출마다 재계산된다: 5회 중 최소 {best:?} · 오라클 1회 {oracle_cost:?} (해시 입력 {bytes} B)"
+        );
+    }
 
     // ── ★U10(0.14.41) 각성 훅 경고 — 레인 팩 단독 기대값 · 표기 정규화(관측 전용) ─────────────
     fn u10_settings(cmds: &[(&str, &str)]) -> serde_json::Value {
