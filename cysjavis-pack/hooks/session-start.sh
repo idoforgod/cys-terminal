@@ -527,6 +527,12 @@ if [ ! -s "$D" ]; then
   exit 0
 fi
 echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
+# ★(0.14.42 · R2NC-F2) Claude Code 는 1만 자를 넘는 훅 출력을 파일로 빼고 모델에게 **앞부분 미리보기(약 2천 자)만** 준다
+#   (라이브 transcript 실측: 10,485자 이상 SessionStart 출력은 clear 29/29 · resume 6/6 · startup 26/26 파일행). 역할 지침은
+#   전부 그보다 길다 — 이 줄은 미리보기 안(머리)에 있어야 하므로 지침 **앞**에 둔다. cycle-agent 는 clear 뒤 전문을 직접 붙여
+#   넣으므로(cys.rs hook_directive_fits_inline) 이 줄은 수동 /clear·compact·resume 에서 좌석이 지침 없이 앉지 않게 하는 몫이다.
+#   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
+printf '■ 이 출력이 길어 앞부분 미리보기만 보이면(나머지는 파일로 빠짐) 역할 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구

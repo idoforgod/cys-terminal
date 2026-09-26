@@ -13232,9 +13232,16 @@ fn apply_resume_suffix(cmd: &mut String, resolved: Option<&str>) -> bool {
 /// 0.14.41 U8 P0-M1 — 보류 좌석은 데몬 표식의 `followup` 으로 이월돼 채택이 같은 한 제출을 싣는다).
 fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, String> {
     if effective_resume {
+        // ★(0.14.42 · R2NC-F1) '이미 보유 중' 을 **단정하지 않는다** — R3-1 은 /clear 뒤 세션으로 resume 핀을 옮기는데, 수동
+        //   /clear·compact 뒤 세션에는 지침 전문이 들어간 적이 없을 수 있다(훅 출력 1만 자 상한 → 미리보기만). 거짓 고지를 받은
+        //   모델은 지침 없이 앉는다(③). 지침이 컨텍스트에 없으면 파일을 먼저 끝까지 읽게 한다(경로는 합성기가 읽는 팩 실경로).
+        let path = cys::pack::role_directive_path(role)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<팩>/directives/<역할>_DIRECTIVE.md".into());
         Ok(format!(
-            "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침은 이미 보유 중이니 \
-             재숙지만 하고, _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
+            "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침 전문이 이 대화에 있으면 재숙지만 하고, \
+             없거나 앞부분만 보이면 `{path}` 와 soul.md 를 Read 도구로 끝까지 먼저 읽어라. 그다음 \
+             _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
         ))
     } else {
         compose_directive(role)
@@ -19232,6 +19239,34 @@ fn session_start_hook_registered(settings_root: Option<&Value>) -> Option<bool> 
     Some(exact || relocated)
 }
 
+/// ★(0.14.42 · R2NC-F1·F2) 훅 출력으로 지침을 넣을 수 있는 합성 지침의 최대 글자 수. Claude Code 는 훅 stdout 이 1만 자를
+/// 넘으면 파일로 빼고 앞부분 미리보기(약 2천 자)만 모델에게 준다 — 라이브 transcript 실측: 10,485자 이상은 전부 파일행,
+/// 8,010자 이하는 원문 그대로. 훅은 지침 앞뒤로 머리줄·soul.md·기억 색인을 더 싣으므로 여유를 두어 8,000 으로 잡는다.
+const HOOK_DIRECTIVE_INLINE_MAX_CHARS: usize = 8_000;
+
+/// 합성 지침이 훅 출력 인라인에 드는가(순수) — 넘으면 cycle-agent 가 전문을 직접 붙여 넣는다.
+fn hook_directive_fits_inline(directive: &str) -> bool {
+    directive.chars().count() <= HOOK_DIRECTIVE_INLINE_MAX_CHARS
+}
+
+/// ★(0.14.42 · R2NC-F1·F2) 이 역할의 합성 지침을 훅 출력이 **전문으로** 실어 나를 수 있는가 — 인라인 상한을 넘으면 false
+/// (+ stderr 1줄 · cycle-agent 는 CLI 가 전문을 붙여 넣는다). 합성 실패(판정 불능)는 true = 종전 훅 경로(훅은 파일을 직접 cat 하고
+/// RESUME 포인터가 뒤를 받친다). 측정용 합성일 뿐 주입이 아니다(재주입은 clear 실효 판정 뒤 — d16 순서 핀).
+fn hook_can_carry_directive(role: &str) -> bool {
+    match compose_directive(role) {
+        Ok(d) if !hook_directive_fits_inline(&d) => {
+            eprintln!(
+                "[cycle] hooks_inject_directive 강등 — 합성 지침 {}자가 훅 출력 인라인 상한({}자)을 넘는다 · \
+                 훅 출력은 파일로 빠져 모델이 전문을 받지 못한다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다",
+                d.chars().count(),
+                HOOK_DIRECTIVE_INLINE_MAX_CHARS
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 /// 선언(agents.json) · 실설정 관측 · **레인 가드 조기 종료 표식**을 합쳐 이 사이클의 실효 hooks_inject 를 정한다.
 ///
 /// ★(0.14.39 · 부트체인 major ⓑ · 성찰2 major ⑥) 등록은 **실행 관측이 아니다**. `cys_lane_guard` 는
@@ -19440,6 +19475,13 @@ fn run_cycle_agent(
             .then(|| cys::pack::lane_guard_tripped(&cys::pack::pack_dir()))
             .flatten();
         let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());
+        // ★(0.14.42 · R2NC-F1·F2) 훅 경로는 **출력이 인라인에 드는 크기일 때만** 지침 주입으로 인정한다. Claude Code 는
+        //   1만 자를 넘는 훅 출력을 파일로 빼고 모델에게 앞부분 미리보기만 준다(라이브 transcript: clear 29/29 파일행) —
+        //   역할 지침은 전부 그보다 길어 clear 뒤 새 세션에 지침 전문이 **한 번도 들어가지 않았다**(RESUME 만). 그 세션을
+        //   R3-1 이 resume 핀으로 옮기면 재기동이 '지침 이미 보유' 짧은 가드만 주는 거짓 고지가 된다(③ 지침 없는 좌석).
+        //   크기를 넘으면 이 사이클은 CLI 가 전문+RESUME 을 한 제출로 붙여 넣는다(adoption_payload · 비훅 경로와 같은 규약).
+        //   합성 실패(판정 불능)는 종전대로 훅 경로다(훅은 파일을 직접 cat 한다 · RESUME 포인터가 뒤를 받친다).
+        let hooks_inject = hooks_inject && hook_can_carry_directive(&role_name);
         if declared_hooks_inject && !hooks_inject {
             if let Some(trip) = lane_trip.as_ref() {
                 eprintln!("[cycle] 경고: hooks_inject_directive 선언 강등 — 레인 가드 조기 종료 표식(reason={} script={}) — 훅이 무발화 종료했을 수 있다 · 표식은 레인당 1개라 script 는 마지막 기록자일 뿐이며 판정에 쓰지 않는다 · 이번 사이클은 CLI가 디렉티브를 직접 주입한다", trip.reason, trip.script);
@@ -34990,6 +35032,42 @@ mod tests {
         }
     }
 
+    /// ★(R2NC-F1·F2) 훅 출력이 인라인에 들지 않는 지침(= 출하 역할 지침 전부)은 cycle-agent 가 전문을 직접 붙여 넣는다 —
+    /// 훅은 1만 자 초과 출력을 파일로 빼 모델에게 미리보기만 준다. 경계 진리표 + 출하 지침 실측 + 배선 소스 핀.
+    /// RED(HEAD 1b614e47): 강등이 없어 claude 좌석 사이클은 RESUME 만 보냈다(지침 전문 0회).
+    #[test]
+    fn cycle_pastes_directive_when_hook_output_would_be_persisted() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(hook_directive_fits_inline(&"가".repeat(HOOK_DIRECTIVE_INLINE_MAX_CHARS)));
+        assert!(!hook_directive_fits_inline(&"가".repeat(HOOK_DIRECTIVE_INLINE_MAX_CHARS + 1)));
+        // 출하 역할 지침 4종은 전부 상한을 넘는다(= 훅 경로로는 전문이 들어가지 않는다).
+        let repo_pack = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
+        for f in ["MASTER_DIRECTIVE.md", "WORKER_DIRECTIVE.md", "CSO_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md"] {
+            let text = std::fs::read_to_string(repo_pack.join("directives").join(f)).expect("출하 지침");
+            assert!(!hook_directive_fits_inline(&text), "{f} 가 훅 인라인 상한 안이다 — 전제 재확인 필요");
+        }
+        let src = include_str!("cys.rs");
+        let body = refl_fn_body(src, "run_cycle_agent");
+        let eff = body.find("let hooks_inject = effective_hooks_inject(").expect("실효 판정");
+        let dem = body.find("let hooks_inject = hooks_inject && hook_can_carry_directive(&role_name);").expect("인라인 상한 강등 배선 소실");
+        let helper = refl_fn_body(src, "hook_can_carry_directive");
+        assert!(helper.contains("Ok(d) if !hook_directive_fits_inline(&d) =>") && helper.contains("_ => true,"),
+            "강등 판정: 상한 초과만 false · 판정 불능은 종전 훅 경로");
+        let fallback = body.find("cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject)").expect("재주입 조립");
+        assert!(eff < dem && dem < fallback, "강등이 실효 판정 뒤·재주입 조립 앞에 있어야 한다");
+    }
+
+    /// ★(R2NC-F1) resume 가드는 '절대지침 이미 보유' 를 단정하지 않는다 — /clear 로 옮긴 핀의 세션엔 지침 전문이 없을 수 있다.
+    /// 지침이 없거나 앞부분만 보이면 지침 파일을 끝까지 먼저 읽게 한다(경로 실재).
+    #[test]
+    fn resume_guard_does_not_claim_the_directive_is_held() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let g = boot_directive_for("master", true).expect("가드");
+        assert!(g.starts_with("[RESUME]") && g.contains("역할=master"), "{g}");
+        assert!(!g.contains("이미 보유 중이니"), "거짓 고지(지침 이미 보유)가 남았다: {g}");
+        assert!(g.contains("MASTER_DIRECTIVE.md") && g.contains("끝까지"), "지침 파일 읽기 안내가 없다: {g}");
+    }
+
     /// 훅 발화 가능성 진리표: 실재하는 팩 훅만 인정하고 최근 레인 가드 무발화는 CLI 주입으로 강등한다.
     #[test]
     fn hooks_inject_directive_demotes_when_the_hook_cannot_actually_fire() {
@@ -35244,7 +35322,13 @@ mod tests {
         assert!(compact.contains("session_start_hook_registered(hook_settings.as_ref().ok())"));
         let effective = "let hooks_inject = effective_hooks_inject(declared_hooks_inject, observed, lane_trip.as_ref());";
         let effective_at = compact.find(effective).expect("선언·실설정·레인 가드 관측을 합친 실효값 확정");
-        assert_eq!(compact.matches("let hooks_inject =").count(), 1, "실효값을 정적 선언으로 다시 덮지 않는다");
+        // ★(0.14.42 · R2NC-F1·F2) 두 번째 바인딩은 **강등 전용 AND**(훅 출력 인라인 상한)뿐이다 — 정적 선언으로 되살리지 않는다.
+        assert_eq!(compact.matches("let hooks_inject =").count(), 2, "실효값을 정적 선언으로 다시 덮지 않는다");
+        assert_eq!(
+            compact.matches("let hooks_inject = hooks_inject && hook_can_carry_directive(&role_name);").count(),
+            1,
+            "두 번째 바인딩은 인라인 상한 강등(AND)이어야 한다"
+        );
         assert!(compact.find("session_start_hook_registered(").unwrap() < effective_at);
         assert!(compact.find("lane_guard_tripped(").unwrap() < effective_at);
         for consumer in [

@@ -621,5 +621,19 @@ code, out5, _ = run_hook(env_e, role="worker")
 check("21i 빈 값이면 고지 0줄", "고지(작업 폴더)" not in out5)
 shutil.rmtree(tmp)
 
+# ★(0.14.42 · R2NC-F2) Claude Code 는 1만 자 넘는 훅 출력을 파일로 빼고 앞부분(약 2천 자) 미리보기만 모델에게 준다 — 역할 지침은
+#   전부 그보다 길다. 그래서 '앞부분만 보이면 지침 전문을 Read 로 끝까지 읽어라' 줄이 **미리보기 창 안(머리)** 에, 지침 본문 **앞**에
+#   있어야 한다(수동 /clear·compact·resume 에서 좌석이 지침 없이 앉지 않게). RED(HEAD 1b614e47): 그 줄이 없다.
+tmp = tempfile.mkdtemp(prefix="hook-t22-")
+env = setup(tmp, "ok")
+for _role, _body in (("master", "DIRECTIVE-BODY-MASTER"), ("worker", "DIRECTIVE-BODY-WORKER")):
+    code, out, _ = run_hook(env, role=_role)
+    _i = out.find("Read 도구로 끝까지")
+    _j = out.find(_body)
+    check("22 %s: 지침 전문 읽기 안내가 미리보기 창(앞 2,000자) 안 · 지침 본문 앞 · exit 0" % _role,
+          code == 0 and 0 <= _i < 2000 and (_j < 0 or _i < _j) and "_DIRECTIVE.md" in out[_i - 200:_i + 200],
+          "i=%d j=%d head=%r" % (_i, _j, out[:300]))
+shutil.rmtree(tmp)
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)
