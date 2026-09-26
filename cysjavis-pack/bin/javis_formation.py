@@ -1274,17 +1274,21 @@ def _onboard_stage(state):
 
 
 def _master_ready(status):
-    """부서장 좌석에 에이전트가 앉아 있는가 — agent 사망이면 False · seat=occupied 면 True · seat=empty(빈 셸)면 False ·
-    그 밖(unknown = 좌석 프로브 미도달 · 필드 없는 구 데몬)은 데몬이 에이전트 생존을 관측했을 때만 True(= 보류가 기본)."""
+    """부서장 좌석에 에이전트가 앉아 있는가 — **데몬이 에이전트를 관측했을 때만** True(보류가 기본).
+
+    agent 사망이면 False · seat=empty(빈 셸)면 False · 그 밖은 `agent_alive is True`(launch-agent 등록 에이전트의 생존 관측)
+    ∨ `seat_agent is True`(등록 없는 좌석의 기지 에이전트 엄격 관측 — 수동으로 띄운 claude) 일 때만 True.
+    ★(0.14.42 · ROLE-A) `seat:"occupied"` 단독으로는 True 가 아니다 — 데몬의 occupied 는 '셸 이외 자손이 하나라도 있다'
+    (스크립트·sleep·빌드·`claude update`)라서, 팀장 빈 셸이 비에이전트 명령을 도는 순간 오너 원문 각성 지시가 셸에 타이핑돼
+    오류로 버려지고(bash syntax error · zsh bad pattern) 1회성 키로 영구 소실됐다(샌드박스 실측). 보류된 지시는 감시 루프·
+    심박 ensure 가 잇는다. `seat_agent` 필드가 없는 구 데몬은 agent_alive 만 본다(보류 쪽)."""
     for s in (status or {}).get("surfaces") or []:
         if s.get("role") == "master" and not s.get("exited"):
             if s.get("agent_alive") is False:
                 return False
-            if s.get("seat") == "occupied":
-                return True
             if s.get("seat") == "empty":
                 return False
-            return s.get("agent_alive") is True
+            return s.get("agent_alive") is True or s.get("seat_agent") is True
     return False
 
 
@@ -1341,8 +1345,12 @@ def _onboard_ceo_text(rec, stage, master_sent, task_done, missing, detail, socke
 
 def _onboard_awaken_text(stage):
     # 오너 원문은 글자 그대로 한 덩어리로 싣고, 받는 법은 괄호 뒤에 따로 붙인다(원문을 고쳐 쓰지 않는다).
+    # ★(0.14.42 · ROLE-C · ROLE-D) 받는 법에 좌석당 대기 상한(6초)과 '빈 자리는 기동하지 않는다'를 함께 싣는다 — 기본 30초
+    #   전경 대기가 좌석마다 직렬로 쌓여 부서장 턴을 묶었고(회신 큐 적체), check 종합 줄의 `cys boot` 처방을 따르면 §0-A 가 금한
+    #   부트 재실행이 되며 오너가 정할 재충원을 건너뛴다.
     return ("[CEO 지시 · 편성 %s] %s (편성 도구가 CEO 대신 1회 보낸 지시 · 받는 법: MASTER_DIRECTIVE §4-A-2 ③ — "
-            "미각성 좌석만 cys reinject --check · 결과는 CEO 에게 1회 보고)"
+            "미각성 좌석만 cys reinject --check --role <역할> --timeout 6 · 빈 자리는 깨우거나 기동하지 않고 이름만 · "
+            "결과는 CEO 에게 1회 보고)"
             % ("완료" if stage == "complete" else "부분", AWAKEN_ORDER))
 
 
@@ -1529,6 +1537,10 @@ def _onboard_watch(socket, state):
         if not gate_check():
             return "paused"
         stage_state = _read_state(socket) or stage_state
+        # ★(ROLE-B) 기록된 상태가 결판이 아니면(보류·진행 중 — 해제 뒤 심박 ensure 가 아직 새로 적지 않았다) 옛 결판으로
+        #   알리지 않고 다음 간격에 다시 본다(유계 창 안). 종전엔 여기서 옛 값으로 알림을 보냈다.
+        if _onboard_stage(stage_state) is None:
+            continue
         if _onboard_notify(socket, stage_state) != "wait_master":
             return "sent"
     return "timeout"
@@ -1571,8 +1583,11 @@ def ensure(socket=None, cwd=None, force_surface=False):
         state = classify(installed=installed, live=live, resource_ok=True)
         # exit 4·PAUSED 파일 = 확정 정지(paused) / 그 외 = 판정 불능(gate-unknown) — 상태 문자열로 구분.
         hold = "paused" if getattr(gate, "code", 4) == 4 else "gate-unknown"
-        if state == "complete":
-            state = "partial:" + hold  # 보류 중엔 complete 로 승격하지 않음
+        # ★(0.14.42 · ROLE-B) 보류 갈래는 classify 결과와 **무관하게** `partial:<hold>` 로 적는다. 종전엔 complete 만 바꿔
+        #   `partial:booting` 같은 관측값이 그대로 남았고, 편성 알림 무장(`_onboard_wait_pending`)과 지켜보기가 그것을 '부분 결판'
+        #   으로 읽어 — 편성을 한 번도 돌리지 않았는데 — 해제 뒤 '[편성 부분] 자리 N개가 뜨지 않았다 · 다시 채울까요?' 를
+        #   대표·오너에게 보냈다(샌드박스 실측 · formation.log 에 paused 한 줄뿐). 보류는 결판이 아니다(`_onboard_stage` → None).
+        state = "partial:" + hold
         # ★자기잠금 방지: 무엇에 막혔는지를 상태파일 detail 과 stdout(_cmd_ensure JSON)에 남긴다.
         detail = (getattr(gate, "reason", "")
                   or "kill-switch(paused) — 편성 보류(gate-check 존중)") + _external_note()

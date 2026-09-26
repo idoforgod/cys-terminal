@@ -8481,6 +8481,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             s.seat_cache.load(Ordering::Relaxed),
                         )
                         .as_str(),
+                        // ★(0.14.42 · ROLE-A) 등록(meta) 없는 좌석에서 **기지 에이전트 엄격 관측**(refresh_seat_cache 의
+                        //   seat_agent_cache — cmdline 엄격 매처)이 잡혔는가. `seat:"occupied"` 는 셸 이외 자손이 하나라도
+                        //   있으면 참이라(스크립트·sleep·빌드) 에이전트 착석의 증거가 아니다 — 수동으로 띄운 claude 를
+                        //   가려내는 소비자(편성 각성 지시 `_master_ready`)가 이 값을 본다. 추가형 키(구 소비자 무영향).
+                        "seat_agent": s.seat_agent_cache.load(Ordering::Relaxed),
                         "status": status,
                         // ★(W2 · B6/B14) 각성 래치·주입 검증 상태 — org.status(대시보드)는 팩 부트
                         // 체인이 소비하는 정본 status 채널이다(javis_boot_node.cys_status →

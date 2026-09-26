@@ -544,12 +544,21 @@ def onboard_gate(m):
               "pushes=%r" % pushes)
         # (g3) 부서장 좌석 판정 — unknown 좌석은 데몬이 에이전트 생존을 관측했을 때만 · empty 는 언제나 보류.
         mr = m._master_ready
-        check("14g3 부서장 좌석 판정(occupied=예 · empty=아니오 · unknown+생존관측=예 · unknown+미관측=아니오 · 사망=아니오)",
+        check("14g3 부서장 좌석 판정(occupied+생존관측=예 · empty=아니오 · unknown+생존관측=예 · unknown+미관측=아니오 · 사망=아니오)",
               mr(_status(REQUIRED)) is True and mr(_status(REQUIRED, master_seat="empty")) is False
               and mr({"surfaces": [{"role": "master", "seat": "unknown", "agent_alive": True}]}) is True
               and mr({"surfaces": [{"role": "master", "seat": "unknown", "agent_alive": None}]}) is False
               and mr({"surfaces": [{"role": "master", "seat": "occupied", "agent_alive": False}]}) is False
               and mr({"surfaces": [{"role": "master", "agent_alive": True}]}) is True and mr(None) is False)
+        # ★(ROLE-A) 좌석 점유(셸 이외 자손 — 스크립트·sleep·빌드)만으로는 착석이 아니다: 에이전트 미관측이면 보류.
+        #   수동으로 띄운 claude(등록 없음)는 데몬의 엄격 관측 `seat_agent` 로 인정한다. RED(HEAD 1b614e47): 첫 행이 True.
+        check("14g3b occupied + 에이전트 미관측 → 아니오(빈 셸에 각성 지시 금지) · occupied + seat_agent 관측 → 예",
+              mr({"surfaces": [{"role": "master", "seat": "occupied", "agent": None, "agent_alive": None}]}) is False
+              and mr({"surfaces": [{"role": "master", "seat": "occupied", "agent": None, "agent_alive": None,
+                                    "seat_agent": False}]}) is False
+              and mr({"surfaces": [{"role": "master", "seat": "occupied", "agent": None, "agent_alive": None,
+                                    "seat_agent": True}]}) is True
+              and mr({"surfaces": [{"role": "master", "seat": "empty", "seat_agent": True}]}) is False)
 
         # (g4) 알림 경로의 자식 출력은 바이트로 받아 UTF-8(replace)로 푼다 — 로케일 코덱(한국어 Windows cp949) 해석 예외가
         #      rc 127 '보내지 못함' 오판 → 재시도 → 중복 배달로 번지지 않게. 한글 + 깨진 바이트 출력에도 rc 를 그대로 돌려준다.
@@ -1049,6 +1058,32 @@ def onboard_gate(m):
                   w_ok and w_neg, "ok=%s neg=%s" % (w_ok, w_neg))
         except Exception as e:  # noqa: BLE001
             check("14w 사례 예외", False, repr(e))
+
+        # (pb) ★ROLE-B: kill-switch(paused) 중 생성 꼬리 호출 — 보류 기록은 관측 결판과 무관하게 `partial:paused` 이고, 무장
+        #   지켜보기를 시작하지 않으며 알림 0. 해제 뒤 지켜보기도 옛 보류 기록을 결판으로 읽지 않는다(편성이 돌지도 않았는데
+        #   '[편성 부분] 자리 N개가 뜨지 않았다 · 다시 채울까요?' 를 대표·오너에게 보내던 결함). RED(HEAD 1b614e47): 상태가
+        #   관측값(partial:booting 류)이라 지켜보기가 시작되고, 해제 뒤 그 값으로 [편성 부분] 이 나간다.
+        try:
+            S = "/tmp/ob-pb/cys.sock"
+            part = {"master", "worker"}
+            pushes, box, _f = _onboard_harness(m, part, all_clis, True, _status(part))
+            m.gate_check = lambda: False
+            m._onboard_watch_limits = lambda: (0.3, 0.05)
+            args = ["--socket", S, "--onboard-dept", "dept-pb", "--onboard-spec-b64", _spec_b64("tp-1790300000-pb"), "--json"]
+            with _ctx.redirect_stdout(_io.StringIO()), _ctx.redirect_stderr(_io.StringIO()) as er:
+                m._cmd_ensure(args)
+            st = m._read_state(S)
+            check("14pb1 pause 중 ensure → 상태 partial:paused · 지켜보기 시작 0 · 알림 0",
+                  st == "partial:paused" and pushes == [] and "지켜본다" not in er.getvalue(),
+                  "state=%r pushes=%r err=%r" % (st, pushes, er.getvalue()[-200:]))
+            m.gate_check = lambda: True
+            res_pb = m._onboard_watch(S, "partial:paused")
+            check("14pb2 해제 뒤 지켜보기 → 보류 기록을 결판으로 읽지 않는다(알림 0 · 창 만료)",
+                  res_pb == "timeout" and pushes == [], "res=%r pushes=%r" % (res_pb, pushes))
+            m._onboard_watch_limits = saved["_onboard_watch_limits"]
+            m.gate_check = lambda: True
+        except Exception as e:  # noqa: BLE001
+            check("14pb 사례 예외", False, repr(e))
 
         # (l) 손상 명세 → 무장 0 · 예외 0.
         with _ctx.redirect_stderr(_io.StringIO()):

@@ -1438,6 +1438,8 @@ def suite_directive():
           and "알림" in step3 and "1회만 한다" not in blk and "그 1회 확인에서" not in blk
           and "다음에 깨어났을 때" not in blk
           and "5노드 등장이 끝나면" not in blk and "reinject --check --role" in blk
+          # ★(ROLE-C · ROLE-D) 좌석당 ACK 대기 상한 · 빈 자리 기동 금지(check 의 `cys boot` 처방을 따르지 않는다).
+          and "--timeout 6" in blk and "깨우지도 기동하지도 않는다" in blk
           and "빈 셸에는 보내지 않는다" in step5 and "첫 과제는 이 턴에 보내지 않는다" in step5
           and "팀장과 팀원 4자리가 떴습니다" not in step5, step3[:160])
     # ★(0.14.42 RV-ROLE-1 · RV-ROLE-2) 각성 지시 문안은 오너 원문 그대로 **편성 도구 상수**와 같아야 하고, 대표가 직접 보내지
