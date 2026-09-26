@@ -1923,6 +1923,10 @@ struct SupState {
     /// 재사용(넘치면 새 키에 침묵 — 유계가 통보보다 앞이다. 다만 그 침묵은 아래
     /// `notify_capped_reported` 로 **1회 가청화**한다 — R2 note).
     no_spawn_notified: std::collections::HashSet<String>,
+    /// ★(0.14.42 · R3SH-3) 순간 축(사람 입력 30s · quiescing · pause)에 걸려 **미룬** pane 통보 줄 — 다음 틱들이 다시 본다
+    /// (유계 [`MAX_DEFERRED_PANE_NOTICES`] · 수명 [`PANE_NOTICE_DEFER_SECS`]). 종전에는 래치를 먼저 세운 뒤 한 번 보고
+    /// 보류면 버려, 선언 직후 사람 입력 창에 한 번 걸린 인텐트의 pane 통보가 영구히 사라졌다(frontdoor 약속 파기).
+    deferred_pane: Vec<DeferredPaneNotice>,
     /// (R2 note) 통보 래치 상한 도달을 이미 알렸는가 — 1회성(`budget_pressure_reported` 동형).
     notify_capped_reported: bool,
     /// (B3-2R ④ⓓ) 전역 상한 정지 통보 래치 — 감독자 수명 1회.
@@ -2002,6 +2006,100 @@ fn no_spawn_reason(why: &str) -> &'static str {
     }
 }
 
+/// ★(0.14.42 · R3SH-3) 미룬 pane 통보 줄 1건.
+struct DeferredPaneNotice {
+    intent: String,
+    sid: u64,
+    why: String,
+    text: String,
+    until: std::time::Instant,
+}
+
+/// ★(R3SH-3) 미룬 pane 통보의 수명(초) — 인텐트 수명(30분) 안에서 사람 입력·사이클 창이 풀리기를 기다리는 몫.
+const PANE_NOTICE_DEFER_SECS: u64 = 600;
+/// ★(R3SH-3) 미룬 pane 통보 상한 — 넘치면 종전처럼 생략(feed 는 이미 남았다 · 유계가 통보보다 앞).
+const MAX_DEFERRED_PANE_NOTICES: usize = 16;
+
+/// ★(R3SH-3) pane 통보 줄의 하드축 판정(공용 H0 · 노브에서 supervisor 를 빼면 None = 종전 동작).
+fn pane_notice_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<crate::governance::MachineHold> {
+    if !crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Supervisor) {
+        return None;
+    }
+    let axes = crate::governance::MachineHoldAxes {
+        pause: true,
+        quiescing: true,
+        human: true,
+        modal: true,
+        draft: true,
+        human_window_secs: crate::governance::queue_human_quiet_secs(),
+        ..crate::governance::MachineHoldAxes::NONE
+    };
+    crate::governance::machine_direct_hold(daemon, s, axes)
+}
+
+/// ★(R3SH-3) 순간 축인가 — 기다리면 스스로 풀린다(사람 입력 창 · 사이클 창 · kill-switch 해제). 모달·초안은 주입하지 않는
+/// 것이 설계 H5 의 목적이라 미루지 않고 생략한다.
+fn pane_hold_is_transient(h: crate::governance::MachineHold) -> bool {
+    use crate::governance::MachineHold as H;
+    matches!(h, H::HumanActive | H::Quiescing | H::Paused)
+}
+
+/// pane 통보 줄 1건 쓰기 — ★원장 선기록이 주입보다 앞(delivery.rs 불변식 ① — dispatch_one 과 같은 순서).
+fn pane_notice_line(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, text: String) {
+    crate::delivery::record_audited(daemon, s.id, &text, crate::delivery::Origin::Supervisor, None);
+    // try_send: 채널 포화면 조용히 포기 — 통보는 best-effort 이고 feed·이벤트가
+    // 이미 사실을 남겼다(고지 실패가 유계를 흔들면 안 된다).
+    let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
+        text,
+        cr_delay_ms: 120,
+        clear_first: false,
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+    });
+}
+
+/// ★(0.14.42 · R3SH-3) 미룬 pane 통보를 이번 틱에 다시 본다 — 순간 축이 풀렸으면 쓰고, 여전히 순간 축이면 수명 안에서
+/// 계속 미루고, 모달·초안이 되었거나 수명이 지났거나 좌석이 사라졌으면 생략 사실을 남긴다. 틱 pane 예산을 같이 쓴다.
+fn retry_deferred_pane_notices(daemon: &Arc<Daemon>, st: &mut SupState, pane_budget: &mut usize) {
+    if st.deferred_pane.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    for d in std::mem::take(&mut st.deferred_pane) {
+        let live = daemon.get_surface(d.sid).filter(|s| !s.exited.load(Ordering::Relaxed));
+        let Some(s) = live else {
+            publish(
+                daemon,
+                "boot_supervisor.pane_notice_skipped",
+                json!({"intent": d.intent, "reason": "surface_gone", "surface_id": d.sid, "why": d.why,
+                       "note": "미뤄 둔 pane 통보 줄의 좌석이 사라졌다 — feed(bootstrap-fail)는 이미 남았다"}),
+            );
+            continue;
+        };
+        match pane_notice_hold(daemon, &s) {
+            None if *pane_budget > 0 => {
+                *pane_budget -= 1;
+                publish(
+                    daemon,
+                    "boot_supervisor.pane_notice_delivered_late",
+                    json!({"intent": d.intent, "surface_id": d.sid, "why": d.why}),
+                );
+                pane_notice_line(daemon, &s, d.text);
+            }
+            None => st.deferred_pane.push(d),
+            Some(h) if pane_hold_is_transient(h) && now < d.until => st.deferred_pane.push(d),
+            Some(h) => {
+                let reason = if pane_hold_is_transient(h) { "defer_expired" } else { h.axis() };
+                publish(
+                    daemon,
+                    "boot_supervisor.pane_notice_skipped",
+                    json!({"intent": d.intent, "reason": reason, "surface_id": d.sid, "why": d.why,
+                           "note": "미뤄 둔 pane 통보 줄을 끝내 쓰지 못했다(모달·초안이거나 수명 초과) — feed(bootstrap-fail)는 이미 남았다"}),
+                );
+            }
+        }
+    }
+}
+
 /// (P2 · 오너 결정 ⑧c → ★R2 확장) **무스폰 loud 종착** — "버스 이벤트만"은 마스터가 아직
 /// 태어나지 않은 시점의 방송이라 청중이 0 인 조용한 포기다(WDSI 좀비 18회의 교훈: 정지 조건 +
 /// **가시성**). 채널 3개: ①기존 버스 이벤트(호출부의 `dispatch_failed`/`intent_retired` —
@@ -2064,43 +2162,39 @@ fn notify_no_spawn(
                 //   pane 한 줄뿐이다. 큐는 쓰지 않는다(주 청중이 Windows 다 — ConPTY 판정 Unknown 이면 큐에서 무음 만료될
                 //   수 있었다). Windows 기본 마스크는 draft 를 끈다(모달 오탐이면 통보 줄만 빠진다 · feed 유지).
                 //   부트 체인 본체(dispatch_one → launch-agent)는 무변경이다. 노브에서 supervisor 를 빼면 종전 동작.
-                if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Supervisor) {
-                    let axes = crate::governance::MachineHoldAxes {
-                        pause: true,
-                        quiescing: true,
-                        human: true,
-                        modal: true,
-                        draft: true,
-                        human_window_secs: crate::governance::queue_human_quiet_secs(),
-                        ..crate::governance::MachineHoldAxes::NONE
-                    };
-                    if let Some(h) = crate::governance::machine_direct_hold(daemon, &s, axes) {
+                //   ★(0.14.42 · R3SH-3) 순간 축(사람 입력 30s · quiescing · pause)은 **생략하지 않고 미룬다** — 인텐트 래치가
+                //   이미 서 있어 여기서 버리면 영구 소실이다(선언 프롬프트 직후의 즉시 실패는 사람 입력 창과 겹치기 쉽다).
+                //   다음 틱들이 [`retry_deferred_pane_notices`] 로 다시 본다(유계 · 수명 10분). 모달·초안은 종전대로 생략.
+                if let Some(h) = pane_notice_hold(daemon, &s) {
+                    if pane_hold_is_transient(h) && st.deferred_pane.len() < MAX_DEFERRED_PANE_NOTICES {
+                        st.deferred_pane.push(DeferredPaneNotice {
+                            intent: it.id.clone(),
+                            sid,
+                            why: why.to_string(),
+                            text,
+                            until: std::time::Instant::now()
+                                + std::time::Duration::from_secs(PANE_NOTICE_DEFER_SECS),
+                        });
                         publish(
                             daemon,
-                            "boot_supervisor.pane_notice_skipped",
+                            "boot_supervisor.pane_notice_deferred",
                             json!({"intent": it.id, "reason": h.axis(), "surface_id": sid, "why": why,
-                                   "note": "선언 좌석이 하드축(모달·초안·사람 입력·사이클·pause)이라 pane 통보 줄을 생략했다 \
-                                            — feed(bootstrap-fail)는 이미 남았다"}),
+                                   "defer_secs": PANE_NOTICE_DEFER_SECS,
+                                   "note": "선언 좌석이 순간 축(사람 입력·사이클·pause)이라 pane 통보 줄을 미뤘다 — 풀리면 쓴다 \
+                                            · feed(bootstrap-fail)는 이미 남았다"}),
                         );
                         return;
                     }
+                    publish(
+                        daemon,
+                        "boot_supervisor.pane_notice_skipped",
+                        json!({"intent": it.id, "reason": h.axis(), "surface_id": sid, "why": why,
+                               "note": "선언 좌석이 하드축(모달·초안 — 또는 미룸 상한 초과)이라 pane 통보 줄을 생략했다 \
+                                        — feed(bootstrap-fail)는 이미 남았다"}),
+                    );
+                    return;
                 }
-                // ★원장 선기록이 주입보다 앞(delivery.rs 불변식 ① — dispatch_one 과 같은 순서).
-                crate::delivery::record_audited(
-                    daemon,
-                    sid,
-                    &text,
-                    crate::delivery::Origin::Supervisor,
-                    None,
-                );
-                // try_send: 채널 포화면 조용히 포기 — 통보는 best-effort 이고 feed·이벤트가
-                // 이미 사실을 남겼다(고지 실패가 유계를 흔들면 안 된다).
-                let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
-                    text,
-                    cr_delay_ms: 120,
-                    clear_first: false,
-                    guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
-                });
+                pane_notice_line(daemon, &s, text);
             }
         }
     }
@@ -2469,6 +2563,8 @@ fn tick_in(
     //   주입 홍수를 맞는 것을 막는다. feed·이벤트는 이 예산과 무관하게 나가고, 폐기(삭제)도
     //   무관하게 계속한다 — 잘리는 것은 홍수 채널 하나뿐이다.
     let mut pane_notices = MAX_RETIRE_NOTIFY_PER_TICK;
+    // ★(R3SH-3) 앞 틱들에서 순간 축으로 미룬 pane 통보를 먼저 본다(같은 틱 예산).
+    retry_deferred_pane_notices(daemon, st, &mut pane_notices);
     for it in &scan.intents {
         // ★재스냅샷은 디스패치 예산 **앞**이다: 스위치를 내린 사람은 즉시 롤백을 기대하는데,
         //   예산에 걸려 뒤로 밀리면 그 기대가 틱 수만큼 늦어진다. 스캔 상한(64)이 이미 유계다.
@@ -5767,13 +5863,14 @@ mod tests {
         //   도 pane 주입 전에 같은 유래(Origin::Supervisor)로 원장 선기록해야 하므로 지정 지점이
         //   dispatch_one + notify_no_spawn **정확히 2곳**이 됐다. 여전히 닫힌 집합 단언이다 —
         //   제3 지점 유입은 이 핀이 계속 적색으로 잡는다(구현 갈라짐 차단 목적 불변).
+        // ★(R3SH-3) 통보 줄 쓰기는 `pane_notice_line` 하나로 모였다(즉시·미룬 재시도 공용) — 지정 지점은 여전히 2곳.
         assert_eq!(
             prod.matches("crate::delivery::Origin::Supervisor").count(),
             2,
-            "감독자 원장 유래 지정 지점은 정확히 2곳(dispatch_one·notify_no_spawn)이어야 한다"
+            "감독자 원장 유래 지정 지점은 정확히 2곳(dispatch_one·pane_notice_line)이어야 한다"
         );
-        // notify_no_spawn 쪽도 순서 불변식이 같다 — 원장 기록이 주입(try_send)보다 앞.
-        let nat = prod.find("fn notify_no_spawn(").expect("notify_no_spawn 소실");
+        // 통보 줄 쪽도 순서 불변식이 같다 — 원장 기록이 주입(try_send)보다 앞.
+        let nat = prod.find("fn pane_notice_line(").expect("pane_notice_line 소실");
         let nbody = &prod[nat..];
         let nrec = nbody.find("record_audited(").expect("소진 통보 원장 기록 지점 소실");
         let ninj = nbody.find("write_tx.try_send(").expect("소진 통보 주입 지점 소실");
@@ -5993,6 +6090,54 @@ mod tests {
         assert_eq!(sk[0]["payload"]["intent"], serde_json::json!("h5-modal-1"));
         assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("modal"));
         let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(R3SH-3) 선언 직후 사람 입력 창(30s)에 **한 번** 걸린 인텐트의 pane 통보는 사라지지 않는다 — 미뤘다가 창이 풀린 틱에
+    /// 1회 쓴다(`pane_notice_deferred` → `pane_notice_delivered_late`). 모달이 되면 생략. RED(HEAD 1b614e47): 래치가 먼저 서서
+    /// 두 번째 호출은 무동작 · 원장 0 영구.
+    #[test]
+    fn h5_transient_hold_defers_then_delivers_pane_notice() {
+        let d = tmp_daemon("h5-defer");
+        let s = h5_seat(&d, crate::governance::H_IDLE_SCREEN);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let mut it = intent("h5-defer-1");
+        it.surface_id = Some(s.id);
+        let mut st = SupState::default();
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        notify_no_spawn(&d, &mut st, &it, "claim_stale", &mut budget);
+        assert_eq!(h5_feed_fails(&d), 1, "feed 통보는 무조건 1건");
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 0, "사람 입력 창에 통보를 주입했다");
+        assert_eq!(st.deferred_pane.len(), 1, "순간 축에 걸린 pane 통보를 미루지 않고 버렸다(영구 소실)");
+        // 다음 틱 — 아직 창 안이면 계속 미룬다.
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&d, &mut st, &mut budget);
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 0);
+        assert_eq!(st.deferred_pane.len(), 1);
+        // 사람 입력 창이 지났다 — 1회 쓴다.
+        *s.last_human_input.lock().unwrap() = None;
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&d, &mut st, &mut budget);
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 1, "창이 풀렸는데 통보가 나가지 않았다");
+        assert!(st.deferred_pane.is_empty());
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&d, &mut st, &mut budget);
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 1, "통보가 중복됐다");
+        // 음성 대조 — 미룬 사이 모달이 떴으면 쓰지 않고 생략.
+        let s2 = h5_seat(&d, crate::governance::H_IDLE_SCREEN);
+        *s2.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let mut it2 = intent("h5-defer-2");
+        it2.surface_id = Some(s2.id);
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        notify_no_spawn(&d, &mut st, &it2, "claim_stale", &mut budget);
+        *s2.last_human_input.lock().unwrap() = None;
+        crate::governance::h_paint(&s2, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&d, &mut st, &mut budget);
+        assert_eq!(crate::governance::h_ledger_count(&d, "supervisor"), 1, "모달 좌석에 미룬 통보를 주입했다");
+        assert!(st.deferred_pane.is_empty());
+        assert!(h5_skipped(&d).iter().any(|e| e["payload"]["intent"] == "h5-defer-2"), "생략 사실이 드러나지 않았다");
+        let _ = s.child.lock().unwrap().kill();
+        let _ = s2.child.lock().unwrap().kill();
     }
 
     /// [H5 핀] 유휴 좌석(ConPTY 전사 형상 포함)에는 통보가 종전 바이트 그대로 나간다(원장 = 종전 문안).
