@@ -91,7 +91,7 @@ def lab(root, name):
             env.pop(k, None)
     env.update({"CYS_PACK_DIR": pack, "CYS_SURFACE_ID": "3", "HOME": os.path.join(d, "home"),
                 "CYS_STATE_DIR": os.path.join(d, "state"), "REGLOG": os.path.join(d, "reg.log"),
-                "PYTHONDONTWRITEBYTECODE": "1", "PATH": binp + os.pathsep + env.get("PATH", "")})
+                "PATH": binp + os.pathsep + env.get("PATH", "")})
     return d, os.path.join(pack, "hooks", "session-start.sh"), env
 
 
